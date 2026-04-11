@@ -1,0 +1,120 @@
+nohup: ignoring input
+=== Recall Test Configuration ===
+  data:        /data/xjs/random_dataset/1024dim1M
+  output:      /data/xjs/index/dvstor_index/1024dim1M
+  queries:     /data/xjs/random_dataset/1024dim1M/queries/query-test.fbin
+  groundtruth: /data/xjs/random_dataset/1024dim1M/queries/groundtruth-test.bin
+  R=32 alpha=1.2 threads=0
+
+reading dataset "/data/xjs/random_dataset/1024dim1M/base.fbin" (dim=1024, vectors=1000000/1000000)
+Reading dataset 37% (372736/1000000) elapsed 0s
+Reading dataset 76% (765952/1000000) elapsed 0s
+Reading dataset 100% (1000000/1000000) elapsed 0s done
+output prefix: "/data/xjs/index/dvstor_index/1024dim1M"
+memory nodes: 1
+threads: 112
+R=32 beam_width=128 alpha=1.2 rabitq_bits=1
+GPU: device 0 (112 streams)
+computing medoid...
+medoid: node 315473
+initializing random R-regular graph (degree=32)...
+note: using alpha=1.0 for construction (config alpha=1.2 stored in metadata)
+Building Vamana graph 0% (4828/1000000) elapsed 15s
+Building Vamana graph 1% (14431/1000000) elapsed 30s
+Building Vamana graph 2% (25724/1000000) elapsed 45s
+Building Vamana graph 3% (37468/1000000) elapsed 1m0s
+Building Vamana graph 4% (49848/1000000) elapsed 1m15s
+Building Vamana graph 5% (50055/1000000) elapsed 1m15s
+Building Vamana graph 6% (63126/1000000) elapsed 1m30s
+Building Vamana graph 7% (77576/1000000) elapsed 1m45s
+Building Vamana graph 9% (94892/1000000) elapsed 2m0s
+Building Vamana graph 10% (100013/1000000) elapsed 2m4s
+Building Vamana graph 12% (123622/1000000) elapsed 2m19s
+Building Vamana graph 14% (148427/1000000) elapsed 2m34s
+Building Vamana graph 15% (150088/1000000) elapsed 2m35s
+Building Vamana graph 17% (174286/1000000) elapsed 2m50s
+Building Vamana graph 19% (198047/1000000) elapsed 3m5s
+Building Vamana graph 20% (200017/1000000) elapsed 3m6s
+Building Vamana graph 22% (223510/1000000) elapsed 3m21s
+Building Vamana graph 24% (246758/1000000) elapsed 3m36s
+Building Vamana graph 25% (250237/1000000) elapsed 3m38s
+Building Vamana graph 27% (273063/1000000) elapsed 3m53s
+Building Vamana graph 29% (295595/1000000) elapsed 4m8s
+Building Vamana graph 30% (300053/1000000) elapsed 4m11s
+Building Vamana graph 32% (322143/1000000) elapsed 4m26s
+Building Vamana graph 34% (343988/1000000) elapsed 4m41s
+Building Vamana graph 35% (350137/1000000) elapsed 4m45s
+Building Vamana graph 37% (371664/1000000) elapsed 5m0s
+Building Vamana graph 39% (392834/1000000) elapsed 5m15s
+Building Vamana graph 40% (400178/1000000) elapsed 5m21s
+Building Vamana graph 42% (420961/1000000) elapsed 5m36s
+Building Vamana graph 44% (441546/1000000) elapsed 5m51s
+Building Vamana graph 45% (450003/1000000) elapsed 5m57s
+Building Vamana graph 47% (470229/1000000) elapsed 6m12s
+Building Vamana graph 49% (490246/1000000) elapsed 6m27s
+Building Vamana graph 50% (500173/1000000) elapsed 6m34s
+Building Vamana graph 51% (519863/1000000) elapsed 6m49s
+Building Vamana graph 53% (539322/1000000) elapsed 7m4s
+Building Vamana graph 55% (550203/1000000) elapsed 7m13s
+Building Vamana graph 56% (569247/1000000) elapsed 7m28s
+Building Vamana graph 58% (588121/1000000) elapsed 7m43s
+Building Vamana graph 60% (600009/1000000) elapsed 7m52s
+Building Vamana graph 61% (618622/1000000) elapsed 8m7s
+Building Vamana graph 63% (637062/1000000) elapsed 8m22s
+Building Vamana graph 65% (650174/1000000) elapsed 8m33s
+Building Vamana graph 66% (668361/1000000) elapsed 8m48s
+Building Vamana graph 68% (686366/1000000) elapsed 9m3s
+Building Vamana graph 70% (700045/1000000) elapsed 9m15s
+Building Vamana graph 71% (717807/1000000) elapsed 9m30s
+Building Vamana graph 73% (735442/1000000) elapsed 9m45s
+Building Vamana graph 75% (750280/1000000) elapsed 9m57s
+Building Vamana graph 76% (767637/1000000) elapsed 10m12s
+Building Vamana graph 78% (784878/1000000) elapsed 10m27s
+Building Vamana graph 80% (800227/1000000) elapsed 10m41s
+Building Vamana graph 81% (817203/1000000) elapsed 10m56s
+Building Vamana graph 83% (834082/1000000) elapsed 11m11s
+Building Vamana graph 85% (850001/1000000) elapsed 11m25s
+Building Vamana graph 86% (866633/1000000) elapsed 11m40s
+Building Vamana graph 88% (883135/1000000) elapsed 11m55s
+Building Vamana graph 89% (899541/1000000) elapsed 12m10s
+Building Vamana graph 90% (900088/1000000) elapsed 12m11s
+Building Vamana graph 91% (916338/1000000) elapsed 12m26s
+Building Vamana graph 93% (932530/1000000) elapsed 12m41s
+Building Vamana graph 94% (948618/1000000) elapsed 12m56s
+Building Vamana graph 95% (950215/1000000) elapsed 12m57s
+Building Vamana graph 96% (966203/1000000) elapsed 13m12s
+Building Vamana graph 98% (982078/1000000) elapsed 13m27s
+Building Vamana graph 99% (997865/1000000) elapsed 13m42s
+Building Vamana graph 100% (1000000/1000000) elapsed 13m44s done
+graph stats: avg_degree=29.0098 max=32 min=8
+in-memory recall@10 (sample 200): 0.9
+
+=== Recall Test ===
+queries: 1000 x 1024
+ground truth: 1000 queries x top-10
+recall@1 = 0.9890 (989/1000)
+recall@5 = 0.9962 (4981/5000)
+recall@10 = 0.9954 (9954/10000)
+=== End Recall Test ===
+
+generating rotation matrix (dim=1024)...
+computing centroid...
+Quantizing vectors (RaBitQ) 12% (128450/1000000) elapsed 0s
+Quantizing vectors (RaBitQ) 25% (259904/1000000) elapsed 0s
+Quantizing vectors (RaBitQ) 38% (386309/1000000) elapsed 0s
+Quantizing vectors (RaBitQ) 51% (510440/1000000) elapsed 1s
+Quantizing vectors (RaBitQ) 63% (632175/1000000) elapsed 1s
+Quantizing vectors (RaBitQ) 75% (754134/1000000) elapsed 1s
+Quantizing vectors (RaBitQ) 87% (877880/1000000) elapsed 1s
+Quantizing vectors (RaBitQ) 99% (999996/1000000) elapsed 2s
+Quantizing vectors (RaBitQ) 100% (1000000/1000000) elapsed 2s done
+Exporting Vamana shards 8% (80924/1000001) elapsed 2s
+Exporting Vamana shards 19% (195093/1000001) elapsed 2s
+Exporting Vamana shards 40% (408120/1000001) elapsed 2s
+Exporting Vamana shards 70% (707144/1000001) elapsed 3s
+Exporting Vamana shards 82% (828148/1000001) elapsed 3s
+Exporting Vamana shards 94% (949888/1000001) elapsed 3s
+Exporting Vamana shards 99% (1000000/1000001) elapsed 3s
+Exporting Vamana shards 100% (1000001/1000001) elapsed 6s
+Exporting Vamana shards 100% (1000001/1000001) elapsed 7s done
+offline build finished in 917.0492 seconds
