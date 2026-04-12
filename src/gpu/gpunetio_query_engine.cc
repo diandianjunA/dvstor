@@ -28,6 +28,8 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -101,6 +103,50 @@ std::string hex_u64(uint64_t value) {
   std::ostringstream out;
   out << "0x" << std::hex << value;
   return out.str();
+}
+
+std::string uppercase(std::string value) {
+  for (char& c : value) {
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
+  return value;
+}
+
+const char* nic_handler_name(const doca_gpu_dev_verbs_nic_handler handler) {
+  switch (handler) {
+    case DOCA_GPUNETIO_VERBS_NIC_HANDLER_AUTO:
+      return "AUTO";
+    case DOCA_GPUNETIO_VERBS_NIC_HANDLER_CPU_PROXY:
+      return "CPU_PROXY";
+    case DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_DB:
+      return "GPU_SM_DB";
+    case DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_BF:
+      return "GPU_SM_BF";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+doca_gpu_dev_verbs_nic_handler nic_handler_from_env() {
+  const char* raw = std::getenv("DVSTOR_GPUNETIO_HANDLER");
+  if (raw == nullptr || raw[0] == '\0') {
+    return DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_DB;
+  }
+  const std::string value = uppercase(raw);
+  if (value == "AUTO") {
+    return DOCA_GPUNETIO_VERBS_NIC_HANDLER_AUTO;
+  }
+  if (value == "GPU_SM_DB" || value == "SM_DB") {
+    return DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_DB;
+  }
+  if (value == "GPU_SM_BF" || value == "SM_BF") {
+    return DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_BF;
+  }
+  if (value == "CPU_PROXY") {
+    return DOCA_GPUNETIO_VERBS_NIC_HANDLER_CPU_PROXY;
+  }
+  throw std::runtime_error("invalid DVSTOR_GPUNETIO_HANDLER=" + std::string(raw) +
+                           " (expected AUTO, GPU_SM_DB, GPU_SM_BF, or CPU_PROXY)");
 }
 
 void exchange_qp_info(Context& channel_context, QueuePair& channel_qp, const QPInfo& local_info, QPInfo& remote_info) {
@@ -215,6 +261,7 @@ struct GpuNetioQueryPool::Resource {
     check_cuda("cudaSetDevice", cudaSetDevice(static_cast<int>(config.gpu_device)));
     check_cuda("cudaFree(0)", cudaFree(nullptr));
     const char* gpu_pci = gpu_pci_address(config.gpu_device, pci_bus_id);
+    const doca_gpu_dev_verbs_nic_handler nic_handler = nic_handler_from_env();
 
     doca_devinfo* devinfo = find_doca_devinfo(ibdev_name);
     check_doca("doca_verbs_context_create",
@@ -321,12 +368,6 @@ struct GpuNetioQueryPool::Resource {
       check_doca("doca_verbs_qp_create", doca_verbs_qp_create(verbs_context, qp_init, &qp));
       qp_modify_to_init(qp);
 
-      const QPInfo local_info{context.get_lid(), doca_verbs_qp_get_qpn(qp)};
-      QPInfo remote_info{};
-      exchange_qp_info(context, *cm.server_qps[server], local_info, remote_info);
-      qp_modify_to_rtr(verbs_context, qp, remote_info);
-      qp_modify_to_rts(qp);
-
       send_cqs.push_back(send_cq);
       recv_cqs.push_back(recv_cq);
       qps.push_back(qp);
@@ -334,11 +375,15 @@ struct GpuNetioQueryPool::Resource {
                  doca_gpu_mem_alloc(
                    gpu, kGpuQpUmemBytes, kGpuPageSize, DOCA_GPU_MEM_TYPE_GPU_CPU, &gpu_qp_umem, &gpu_qp_umem_cpu));
       (void)gpu_qp_umem_cpu;
+      std::cerr << "[STATUS]: exporting GPUNetIO QP resource=" << resource_id
+                << " server=" << server << " qpn=" << doca_verbs_qp_get_qpn(qp)
+                << " gpu_pci=" << gpu_pci << " ibdev=" << ibdev_name
+                << " handler=" << nic_handler_name(nic_handler) << std::endl;
       check_doca("doca_gpu_verbs_export_qp",
                  doca_gpu_verbs_export_qp(gpu,
                                          dev,
                                          qp,
-                                         DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_DB,
+                                         nic_handler,
                                          gpu_qp_umem,
                                          send_cq,
                                          recv_cq,
@@ -349,6 +394,13 @@ struct GpuNetioQueryPool::Resource {
                  doca_gpu_verbs_cpu_proxy_enabled(gpu_qp, &cpu_proxy_enabled));
       std::cerr << "[STATUS]: GPUNetIO QP " << server << " cpu_proxy="
                 << static_cast<unsigned>(cpu_proxy_enabled) << std::endl;
+
+      const QPInfo local_info{context.get_lid(), doca_verbs_qp_get_qpn(qp)};
+      QPInfo remote_info{};
+      exchange_qp_info(context, *cm.server_qps[server], local_info, remote_info);
+      qp_modify_to_rtr(verbs_context, qp, remote_info);
+      qp_modify_to_rts(qp);
+
       gpu_qps.push_back(gpu_qp);
       gpu_qp_umems.push_back(gpu_qp_umem);
       gpu_qp_devices_host.push_back(gpu_qp_dev);
