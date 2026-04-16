@@ -93,7 +93,7 @@ private:
       "data-path, M, and ef-construction.")(
       "server-index-file",
       po::value<filepath_t>(&server_index_file),
-      "Path to a local SHINE index shard file that a memory node should load during startup.")(
+      "Path to a local DVSTOR index shard file that a memory node should load during startup.")(
       "threads,t", po::value<u32>(&num_threads), "Number of threads per compute node.")(
       "coroutines,C", po::value<u32>(&num_coroutines)->default_value(4), "Number of coroutines per compute thread.")(
       "disable-thread-pinning,p",

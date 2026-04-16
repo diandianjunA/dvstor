@@ -1,8 +1,8 @@
 #!/bin/bash
 # =============================================================================
-# SHINE Offline Index Builder
+# DVSTOR Offline Index Builder
 # =============================================================================
-# 使用 hnswlib 离线构图，并导出为 SHINE 可直接加载的 shard 文件。
+# 使用 hnswlib 离线构图，并导出为 DVSTOR 可直接加载的 shard 文件。
 #
 # 用法:
 #   ./build_offline_index.sh [选项...]
@@ -24,7 +24,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BINARY="$PROJECT_DIR/build/shine_offline_builder"
+BINARY="$PROJECT_DIR/build/vamana_offline_builder"
 
 DATA_PATH="${DATA_PATH:-/data/xjs/random_dataset/1024dim1M}"
 OUTPUT_PREFIX="${OUTPUT_PREFIX:-./index}"
@@ -90,7 +90,7 @@ if [[ "$IP_DIST" == true ]]; then
     args+=(--ip-dist)
 fi
 
-echo "[SHINE Offline Builder] 参数:"
+echo "[DVSTOR Offline Builder] 参数:"
 echo "  数据路径:     $DATA_PATH"
 if [[ -n "$OUTPUT_PREFIX" ]]; then
     echo "  输出前缀:     $OUTPUT_PREFIX"

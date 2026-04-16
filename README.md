@@ -1,4 +1,4 @@
-# SHINE GPU: Disaggregated GPU Vamana Index
+# DVSTOR: Disaggregated GPU Vamana Index
 
 Implementation of a GPU-accelerated Vamana index for memory disaggregation.
 This repository is used as a storage-compute disaggregated GPU vector-search baseline.
@@ -29,8 +29,7 @@ apt-get -y install g++ libboost-all-dev libibverbs1 libibverbs-dev numactl cmake
 
 ### Cluster Nodes Configuration
 
-Adjust the IP addresses of the cluster nodes accordingly in `rdma-library/library/utils.cc`:
-https://frosch.cosy.sbg.ac.at/mwidmoser/shine-hnsw-index/-/blob/main/rdma-library/library/utils.cc?ref_type=heads#L14-L23
+Adjust the IP addresses of the cluster nodes accordingly in `rdma-library/library/utils.cc`.
 
 ### Compilation
 
@@ -43,8 +42,15 @@ make
 ```
 
 This produces these main binaries:
-- `build/shine`: online memory/compute node service
-- `build/vamana_offline_builder`: offline Vamana builder that exports SHINE GPU shard files plus RaBitQ artifacts
+- `build/dvstor`: online memory/compute node service
+- `build/dvstor_memory_node`: memory-node-only service
+- `build/vamana_offline_builder`: offline Vamana builder that exports DVSTOR shard files plus RaBitQ artifacts
+
+Storage nodes may not have GPUs. For storage-node-only deployment, build just the memory-node binary:
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDVSTOR_STORAGE_NODE_ONLY=ON
+cmake --build build -j
+```
 
 ## Download the Data
 
@@ -95,7 +101,7 @@ The script writes JSON/TXT reports under `reports/breakdown/` and prints key met
 
 ## Offline Build And Online Load
 
-The project supports building a Vamana graph offline and exporting it into SHINE GPU's native
+The project supports building a Vamana graph offline and exporting it into DVSTOR's native
 memory-node shard format. The offline build also emits RaBitQ search artifacts used by the online
 GPU query path.
 
@@ -109,7 +115,7 @@ Build an offline index:
   --beam-width-construction 128 \
   --alpha 1.2 \
   --rabitq-bits 4 \
-  --output-prefix /path/to/index/shine_index
+  --output-prefix /path/to/index/dvstor_index
 ```
 
 The offline builder has only one beam-width knob, and it is the construction/search width used
@@ -118,20 +124,20 @@ while building the Vamana graph. It is separate from the online service's `beam-
 
 This writes files like:
 ```text
-/path/to/index/shine_index_node1_of2.dat
-/path/to/index/shine_index_node2_of2.dat
-/path/to/index/shine_index.meta.json
-/path/to/index/shine_index.rotation.bin
+/path/to/index/dvstor_index_node1_of2.dat
+/path/to/index/dvstor_index_node2_of2.dat
+/path/to/index/dvstor_index.meta.json
+/path/to/index/dvstor_index.rotation.bin
 ```
 
 Then start each memory node with its local shard:
 ```bash
-./scripts/start_memory_node.sh --index-file /path/to/index/shine_index_node1_of2.dat
+./scripts/start_memory_node.sh --index-file /path/to/index/dvstor_index_node1_of2.dat
 ```
 
 Or let the compute-node initiator trigger startup loading on all memory nodes:
 ```bash
-./scripts/start_compute_node.sh --load-index --index-prefix /path/to/index/shine_index
+./scripts/start_compute_node.sh --load-index --index-prefix /path/to/index/dvstor_index
 ```
 
 In both cases, the online cluster reuses the offline-built graph directly instead of rebuilding it through RDMA.
@@ -156,18 +162,18 @@ Example: five memory nodes on one host with online load:
   --data-path /path/to/dataset-or-dir \
   --memory-nodes 5 \
   --threads 32 \
-  --output-prefix /tmp/shine_index
+  --output-prefix /tmp/dvstor_index
 
-./scripts/start_memory_node.sh --port 1234 --index-file /tmp/shine_index_node1_of5.dat
-./scripts/start_memory_node.sh --port 1235 --index-file /tmp/shine_index_node2_of5.dat
-./scripts/start_memory_node.sh --port 1236 --index-file /tmp/shine_index_node3_of5.dat
-./scripts/start_memory_node.sh --port 1237 --index-file /tmp/shine_index_node4_of5.dat
-./scripts/start_memory_node.sh --port 1238 --index-file /tmp/shine_index_node5_of5.dat
+./scripts/start_memory_node.sh --port 1234 --index-file /tmp/dvstor_index_node1_of5.dat
+./scripts/start_memory_node.sh --port 1235 --index-file /tmp/dvstor_index_node2_of5.dat
+./scripts/start_memory_node.sh --port 1236 --index-file /tmp/dvstor_index_node3_of5.dat
+./scripts/start_memory_node.sh --port 1237 --index-file /tmp/dvstor_index_node4_of5.dat
+./scripts/start_memory_node.sh --port 1238 --index-file /tmp/dvstor_index_node5_of5.dat
 
 ./scripts/start_compute_node.sh \
   --servers 127.0.0.1:1234 127.0.0.1:1235 127.0.0.1:1236 127.0.0.1:1237 127.0.0.1:1238 \
   --load-index \
-  --index-prefix /tmp/shine_index \
+  --index-prefix /tmp/dvstor_index \
   --dim 128 \
   --threads 16 \
   --coroutines 16 \

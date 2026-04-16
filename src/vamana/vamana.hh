@@ -8,7 +8,7 @@
  *  - RobustPrune (alpha-based diversity pruning instead of HNSW heuristic)
  *  - Exact L2 distances for search (GPU-accelerated)
  *  - Full-precision L2 distances for insert/prune (GPU-accelerated)
- *  - Coroutine-based RDMA overlap (from SHINE)
+ *  - Coroutine-based RDMA overlap (from DVSTOR baseline)
  */
 
 #include <algorithm>

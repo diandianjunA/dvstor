@@ -1,4 +1,4 @@
-#include "shine_index.h"
+#include "dvstor_index.h"
 
 #include <algorithm>
 #include <cctype>
@@ -80,7 +80,7 @@ std::vector<char*> make_argv(std::vector<std::string>& args) {
 
 }  // namespace
 
-ShineIndex::ShineIndex(const std::string& service_config_path) {
+DvstorIndex::DvstorIndex(const std::string& service_config_path) {
   auto args = build_service_argv(service_config_path);
   auto argv = make_argv(args);
   configuration::IndexConfiguration config(static_cast<int>(argv.size()), argv.data());
@@ -93,17 +93,17 @@ ShineIndex::ShineIndex(const std::string& service_config_path) {
   }
 }
 
-ShineIndex::~ShineIndex() = default;
+DvstorIndex::~DvstorIndex() = default;
 
-void ShineIndex::build(const std::vector<float>& vecs, const std::vector<uint32_t>& ids) {
+void DvstorIndex::build(const std::vector<float>& vecs, const std::vector<uint32_t>& ids) {
   insert_count(vecs, ids);
 }
 
-void ShineIndex::insert(const std::vector<float>& vectors, const std::vector<uint32_t>& ids) {
+void DvstorIndex::insert(const std::vector<float>& vectors, const std::vector<uint32_t>& ids) {
   insert_count(vectors, ids);
 }
 
-size_t ShineIndex::insert_count(const std::vector<float>& vectors, const std::vector<uint32_t>& ids) {
+size_t DvstorIndex::insert_count(const std::vector<float>& vectors, const std::vector<uint32_t>& ids) {
   if (ids.empty()) {
     return 0;
   }
@@ -141,7 +141,7 @@ size_t ShineIndex::insert_count(const std::vector<float>& vectors, const std::ve
   return inserted_total;
 }
 
-void ShineIndex::search(const std::vector<float>& query,
+void DvstorIndex::search(const std::vector<float>& query,
                         size_t top_k,
                         std::vector<uint32_t>& ids,
                         std::vector<float>& distances) const {
@@ -160,7 +160,7 @@ void ShineIndex::search(const std::vector<float>& query,
   distances.assign(ids.size(), 0.0f);
 }
 
-void ShineIndex::load(const std::string& index_path) {
+void DvstorIndex::load(const std::string& index_path) {
   str error_message;
   const bool ok = ip_distance_ ? ip_service_->load_index(index_path, &error_message)
                                : l2_service_->load_index(index_path, &error_message);
@@ -169,7 +169,7 @@ void ShineIndex::load(const std::string& index_path) {
   }
 }
 
-void ShineIndex::save(const std::string& index_path) {
+void DvstorIndex::save(const std::string& index_path) {
   str error_message;
   const bool ok = ip_distance_ ? ip_service_->store_index(index_path, &error_message)
                                : l2_service_->store_index(index_path, &error_message);
@@ -178,18 +178,18 @@ void ShineIndex::save(const std::string& index_path) {
   }
 }
 
-std::string ShineIndex::getIndexType() const {
-  return "Shine";
+std::string DvstorIndex::getIndexType() const {
+  return "Dvstor";
 }
 
-size_t ShineIndex::dimension() const {
+size_t DvstorIndex::dimension() const {
   return ip_distance_ ? ip_service_->config().dim : l2_service_->config().dim;
 }
 
-std::vector<std::string> ShineIndex::build_service_argv(const std::string& service_config_path) {
+std::vector<std::string> DvstorIndex::build_service_argv(const std::string& service_config_path) {
   const auto config = read_config(service_config_path);
   std::vector<std::string> args;
-  args.emplace_back("shine_index_smoke_test");
+  args.emplace_back("dvstor_index_smoke_test");
 
   static const std::vector<std::string> multi_keys = {"servers", "clients"};
   static const std::vector<std::string> flag_keys = {

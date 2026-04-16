@@ -7,10 +7,10 @@
 #include "common/distance.hh"
 #include "service/compute_service.hh"
 
-class ShineIndex {
+class DvstorIndex {
 public:
-  explicit ShineIndex(const std::string& service_config_path);
-  ~ShineIndex();
+  explicit DvstorIndex(const std::string& service_config_path);
+  ~DvstorIndex();
 
   void build(const std::vector<float>& vecs, const std::vector<uint32_t>& ids);
   void insert(const std::vector<float>& vectors, const std::vector<uint32_t>& ids);

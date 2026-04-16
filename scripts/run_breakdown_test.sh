@@ -1,8 +1,8 @@
 #!/bin/bash
 # =============================================================================
-# SHINE Breakdown Benchmark Runner
+# DVSTOR Breakdown Benchmark Runner
 # =============================================================================
-# 运行 SHINE breakdown benchmark（配置驱动）。
+# 运行 DVSTOR breakdown benchmark（配置驱动）。
 # 所有优化开关（如 gpudirect-rdma、gpu-cache、后续新增优化）都从 service-config 读取。
 # 默认执行 50% 读 / 50% 写 mixed 场景，并在结束后打印吞吐与延迟摘要。
 # 时间模式默认采用 drain 语义：到达截止时间后不再发新请求，并等待已启动请求完成；
@@ -41,7 +41,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BINARY="$PROJECT_DIR/build/shine_breakdown_benchmark"
+BINARY="$PROJECT_DIR/build/dvstor_breakdown_benchmark"
 
 SERVICE_CONFIG="${SERVICE_CONFIG:-$PROJECT_DIR/test/config/local_same_host_5mn.ini}"
 WORKLOAD="${WORKLOAD:-mixed}"
@@ -131,7 +131,7 @@ if [[ -n "$QUERY_FILE" ]]; then
     ARGS+=(--query-file "$QUERY_FILE")
 fi
 
-echo "[SHINE Breakdown] 运行参数:"
+echo "[DVSTOR Breakdown] 运行参数:"
 echo "  配置文件:       $SERVICE_CONFIG"
 echo "  负载模式:       $WORKLOAD"
 echo "  读比例:         $READ_RATIO"
@@ -191,7 +191,7 @@ i = get(doc, "insert_breakdown", "latency", default={})
 def ns_to_ms(x):
     return float(x) / 1_000_000.0
 
-print("\n[SHINE Breakdown] 关键指标")
+print("\n[DVSTOR Breakdown] 关键指标")
 if measure_seconds:
     print(f"  throughput: {throughput:.2f} ops/s (total={total_ops}, duration={measure_seconds}s)")
 if reads or writes:
@@ -212,5 +212,5 @@ if i:
     )
 PY
 else
-    echo "[SHINE Breakdown] 未检测到 python3，跳过关键指标摘要打印。"
+    echo "[DVSTOR Breakdown] 未检测到 python3，跳过关键指标摘要打印。"
 fi

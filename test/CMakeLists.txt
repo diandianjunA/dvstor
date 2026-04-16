@@ -1,13 +1,13 @@
-add_executable(ShineIndexSmokeTest
+add_executable(DvstorIndexSmokeTest
     src/main.cpp
-    src/shine_index.cpp
+    src/dvstor_index.cpp
 )
 
-target_include_directories(ShineIndexSmokeTest PRIVATE
+target_include_directories(DvstorIndexSmokeTest PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
 )
 
-target_link_libraries(ShineIndexSmokeTest PRIVATE
-    shine_runtime
+target_link_libraries(DvstorIndexSmokeTest PRIVATE
+    dvstor_runtime
 )

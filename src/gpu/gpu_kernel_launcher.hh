@@ -3,7 +3,7 @@
 /**
  * GPU kernel launcher declarations.
  * These are host-callable functions that stage data and launch CUDA kernels.
- * Compiled by the host compiler (not nvcc), linked against shine_gpu_kernels.
+ * Compiled by the host compiler (not nvcc), linked against dvstor_gpu_kernels.
  */
 
 #include <cstdint>

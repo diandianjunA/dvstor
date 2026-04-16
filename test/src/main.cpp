@@ -1,4 +1,4 @@
-#include "shine_index.h"
+#include "dvstor_index.h"
 
 #include <algorithm>
 #include <barrier>
@@ -74,7 +74,7 @@ void require_contains(const std::vector<uint32_t>& ids, uint32_t expected, const
   }
 }
 
-void run_smoke_test(ShineIndex& index, const std::string& index_prefix, uint32_t base_id, bool test_reload) {
+void run_smoke_test(DvstorIndex& index, const std::string& index_prefix, uint32_t base_id, bool test_reload) {
   const size_t dim = index.dimension();
   const size_t num_vectors = std::min<size_t>(32, std::max<size_t>(8, dim));
   const size_t smoke_top_k = num_vectors;
@@ -127,7 +127,7 @@ void run_smoke_test(ShineIndex& index, const std::string& index_prefix, uint32_t
   std::cout << "  prefix:  " << index_prefix << std::endl;
 }
 
-void run_concurrent_insert_test(ShineIndex& index,
+void run_concurrent_insert_test(DvstorIndex& index,
                                 size_t thread_count,
                                 size_t vectors_per_thread,
                                 uint32_t base_id) {
@@ -287,7 +287,7 @@ struct ReadWriteThreadResult {
   std::string error;
 };
 
-void run_concurrent_read_write_test(ShineIndex& index, uint32_t base_id) {
+void run_concurrent_read_write_test(DvstorIndex& index, uint32_t base_id) {
   const size_t dim = index.dimension();
   const size_t base_count = 128;
   const size_t writers = 2;
@@ -461,7 +461,7 @@ void run_concurrent_read_write_test(ShineIndex& index, uint32_t base_id) {
   std::cout << "[rw] passed" << std::endl;
 }
 
-void run_recall_test(ShineIndex& index, uint32_t base_id) {
+void run_recall_test(DvstorIndex& index, uint32_t base_id) {
   const size_t dim = index.dimension();
   const size_t num_vectors = 256;
   const size_t K = 10;
@@ -560,12 +560,12 @@ int main(int argc, char* argv[]) {
       static_cast<uint32_t>((static_cast<uint64_t>(getpid()) * 4099ull) ^ static_cast<uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count()));
     const std::string index_prefix =
-      argc >= 3 ? argv[2] : "/tmp/shine_index_smoke_" + std::to_string(static_cast<long long>(getpid()));
+      argc >= 3 ? argv[2] : "/tmp/dvstor_index_smoke_" + std::to_string(static_cast<long long>(getpid()));
     const size_t concurrent_threads = argc >= 4 ? static_cast<size_t>(std::stoul(argv[3])) : 8;
     const size_t vectors_per_thread = argc >= 5 ? static_cast<size_t>(std::stoul(argv[4])) : 64;
     const bool test_reload = argc >= 6 ? std::stoi(argv[5]) != 0 : false;
 
-    ShineIndex index(service_config);
+    DvstorIndex index(service_config);
     std::cout << "index type: " << index.getIndexType() << std::endl;
     std::cout << "dimension:  " << index.dimension() << std::endl;
     std::cout << "id base:    " << unique_base << std::endl;
@@ -574,11 +574,11 @@ int main(int argc, char* argv[]) {
     run_concurrent_read_write_test(index, unique_base + 200000u);
     run_recall_test(index, unique_base + 300000u);
 
-    std::cout << "ShineIndex tests passed" << std::endl;
+    std::cout << "DvstorIndex tests passed" << std::endl;
     return EXIT_SUCCESS;
 
   } catch (const std::exception& e) {
-    std::cerr << "ShineIndex test failed: " << e.what() << std::endl;
+    std::cerr << "DvstorIndex test failed: " << e.what() << std::endl;
     return EXIT_FAILURE;
   }
 }

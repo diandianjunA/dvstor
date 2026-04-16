@@ -1,8 +1,8 @@
 #!/bin/bash
 # =============================================================================
-# SHINE Memory Node Launcher
+# DVSTOR Memory Node Launcher
 # =============================================================================
-# 启动 SHINE 内存节点（服务模式）。
+# 启动 DVSTOR 内存节点（服务模式）。
 # 支持前台/后台运行，提供 start/stop/status/restart 操作。
 #
 # 用法:
@@ -40,7 +40,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BINARY="$PROJECT_DIR/build/shine"
+PRIMARY_BINARY="$PROJECT_DIR/build/dvstor_memory_node"
+FALLBACK_BINARY="$PROJECT_DIR/build/dvstor"
+BINARY="$PRIMARY_BINARY"
+if [[ ! -x "$BINARY" && -x "$FALLBACK_BINARY" ]]; then
+    BINARY="$FALLBACK_BINARY"
+fi
 LOG_DIR="$PROJECT_DIR/logs"
 
 # ---- 默认参数（可通过环境变量覆盖） ----
@@ -100,12 +105,12 @@ get_pid() {
 do_status() {
     local pid
     if pid=$(get_pid); then
-        echo "[SHINE Memory Node] 运行中 (PID: $pid)"
+        echo "[DVSTOR Memory Node] 运行中 (PID: $pid)"
         echo "  日志文件: $LOG_FILE"
         echo "  PID 文件: $PID_FILE"
         return 0
     else
-        echo "[SHINE Memory Node] 未运行"
+        echo "[DVSTOR Memory Node] 未运行"
         return 1
     fi
 }
@@ -113,37 +118,39 @@ do_status() {
 do_stop() {
     local pid
     if pid=$(get_pid); then
-        echo "[SHINE Memory Node] 正在停止 (PID: $pid) ..."
+        echo "[DVSTOR Memory Node] 正在停止 (PID: $pid) ..."
         kill "$pid"
         # 等待进程退出，最多 10 秒
         for i in $(seq 1 10); do
             if ! kill -0 "$pid" 2>/dev/null; then
                 rm -f "$PID_FILE"
-                echo "[SHINE Memory Node] 已停止"
+                echo "[DVSTOR Memory Node] 已停止"
                 return 0
             fi
             sleep 1
         done
-        echo "[SHINE Memory Node] 进程未响应，强制终止 ..."
+        echo "[DVSTOR Memory Node] 进程未响应，强制终止 ..."
         kill -9 "$pid" 2>/dev/null
         rm -f "$PID_FILE"
-        echo "[SHINE Memory Node] 已强制停止"
+        echo "[DVSTOR Memory Node] 已强制停止"
     else
-        echo "[SHINE Memory Node] 未运行"
+        echo "[DVSTOR Memory Node] 未运行"
     fi
 }
 
 do_start() {
     # 检查是否已在运行
     if pid=$(get_pid); then
-        echo "[SHINE Memory Node] 已在运行 (PID: $pid)，如需重启请使用 restart 命令"
+        echo "[DVSTOR Memory Node] 已在运行 (PID: $pid)，如需重启请使用 restart 命令"
         exit 1
     fi
 
     # 检查二进制文件
     if [[ ! -x "$BINARY" ]]; then
-        echo "错误: 找不到可执行文件 $BINARY"
-        echo "请先编译项目: cd $PROJECT_DIR && mkdir -p build && cd build && cmake .. && make"
+        echo "错误: 找不到可执行文件 $PRIMARY_BINARY 或 $FALLBACK_BINARY"
+        echo "可选编译方式:"
+        echo "  仅存储节点: cmake -S $PROJECT_DIR -B $PROJECT_DIR/build -DDVSTOR_STORAGE_NODE_ONLY=ON -DCMAKE_BUILD_TYPE=Release && cmake --build $PROJECT_DIR/build -j"
+        echo "  全量构建:   cmake -S $PROJECT_DIR -B $PROJECT_DIR/build -DCMAKE_BUILD_TYPE=Release && cmake --build $PROJECT_DIR/build -j"
         exit 1
     fi
 
@@ -161,7 +168,7 @@ do_start() {
 
     args+=("${EXTRA_ARGS[@]}")
 
-    echo "[SHINE Memory Node] 启动参数:"
+    echo "[DVSTOR Memory Node] 启动参数:"
     echo "  RDMA 端口:    $PORT"
     echo "  客户端数:     $NUM_CLIENTS"
     echo "  内存(GB):     $MN_MEMORY"
@@ -184,7 +191,7 @@ do_start() {
         # 短暂等待，检查进程是否立即退出
         sleep 1
         if kill -0 "$pid" 2>/dev/null; then
-            echo "[SHINE Memory Node] 已启动 (PID: $pid)"
+            echo "[DVSTOR Memory Node] 已启动 (PID: $pid)"
             echo ""
             echo "常用操作:"
             echo "  查看状态:  $0 status"
