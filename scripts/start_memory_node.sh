@@ -1,8 +1,8 @@
 #!/bin/bash
 # =============================================================================
-# DVSTOR Memory Node Launcher
+# SHINE Memory Node Launcher
 # =============================================================================
-# 启动 DVSTOR 内存节点（服务模式）。
+# 启动 SHINE 内存节点（服务模式）。
 # 支持前台/后台运行，提供 start/stop/status/restart 操作。
 #
 # 用法:
@@ -40,15 +40,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-if [[ -n "${DVSTOR_MEMORY_NODE_BINARY:-}" ]]; then
-    BINARY="$DVSTOR_MEMORY_NODE_BINARY"
-elif [[ -x "$PROJECT_DIR/build/dvstor_memory_node" ]]; then
-    BINARY="$PROJECT_DIR/build/dvstor_memory_node"
-elif [[ -x "$PROJECT_DIR/build-storage/dvstor_memory_node" ]]; then
-    BINARY="$PROJECT_DIR/build-storage/dvstor_memory_node"
-else
-    BINARY="$PROJECT_DIR/build/dvstor"
-fi
+BINARY="$PROJECT_DIR/build/shine"
 LOG_DIR="$PROJECT_DIR/logs"
 
 # ---- 默认参数（可通过环境变量覆盖） ----
@@ -108,12 +100,12 @@ get_pid() {
 do_status() {
     local pid
     if pid=$(get_pid); then
-        echo "[DVSTOR Memory Node] 运行中 (PID: $pid)"
+        echo "[SHINE Memory Node] 运行中 (PID: $pid)"
         echo "  日志文件: $LOG_FILE"
         echo "  PID 文件: $PID_FILE"
         return 0
     else
-        echo "[DVSTOR Memory Node] 未运行"
+        echo "[SHINE Memory Node] 未运行"
         return 1
     fi
 }
@@ -121,30 +113,30 @@ do_status() {
 do_stop() {
     local pid
     if pid=$(get_pid); then
-        echo "[DVSTOR Memory Node] 正在停止 (PID: $pid) ..."
+        echo "[SHINE Memory Node] 正在停止 (PID: $pid) ..."
         kill "$pid"
         # 等待进程退出，最多 10 秒
         for i in $(seq 1 10); do
             if ! kill -0 "$pid" 2>/dev/null; then
                 rm -f "$PID_FILE"
-                echo "[DVSTOR Memory Node] 已停止"
+                echo "[SHINE Memory Node] 已停止"
                 return 0
             fi
             sleep 1
         done
-        echo "[DVSTOR Memory Node] 进程未响应，强制终止 ..."
+        echo "[SHINE Memory Node] 进程未响应，强制终止 ..."
         kill -9 "$pid" 2>/dev/null
         rm -f "$PID_FILE"
-        echo "[DVSTOR Memory Node] 已强制停止"
+        echo "[SHINE Memory Node] 已强制停止"
     else
-        echo "[DVSTOR Memory Node] 未运行"
+        echo "[SHINE Memory Node] 未运行"
     fi
 }
 
 do_start() {
     # 检查是否已在运行
     if pid=$(get_pid); then
-        echo "[DVSTOR Memory Node] 已在运行 (PID: $pid)，如需重启请使用 restart 命令"
+        echo "[SHINE Memory Node] 已在运行 (PID: $pid)，如需重启请使用 restart 命令"
         exit 1
     fi
 
@@ -169,7 +161,7 @@ do_start() {
 
     args+=("${EXTRA_ARGS[@]}")
 
-    echo "[DVSTOR Memory Node] 启动参数:"
+    echo "[SHINE Memory Node] 启动参数:"
     echo "  RDMA 端口:    $PORT"
     echo "  客户端数:     $NUM_CLIENTS"
     echo "  内存(GB):     $MN_MEMORY"
@@ -192,7 +184,7 @@ do_start() {
         # 短暂等待，检查进程是否立即退出
         sleep 1
         if kill -0 "$pid" 2>/dev/null; then
-            echo "[DVSTOR Memory Node] 已启动 (PID: $pid)"
+            echo "[SHINE Memory Node] 已启动 (PID: $pid)"
             echo ""
             echo "常用操作:"
             echo "  查看状态:  $0 status"

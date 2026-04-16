@@ -72,8 +72,6 @@ public:
     context_.receive();
 
     num_compute_threads_ = p.num_threads;
-    const bool use_gpunetio_query = p.use_gpunetio_query;
-    const u32 gpunetio_query_qps = p.gpunetio_query_qps;
     allocate_memory();
 
     // free-ptr is initialized to 16 (points to first free address in the buffer)
@@ -111,19 +109,6 @@ public:
 
     // notify compute nodes that we are ready
     cm_.synchronize();
-
-    if (use_gpunetio_query) {
-      print_status("connect GPUNetIO query QPs of compute threads");
-      const u32 qps_per_node = std::min<u32>(gpunetio_query_qps, MAX_GPUNETIO_QUERY_QPS);
-      gpunetio_qps_.reserve(num_clients_ * qps_per_node);
-
-      for (QP& client_qp : cm_.client_qps) {
-        for (u32 thread_id = 0; thread_id < qps_per_node; ++thread_id) {
-          auto& qp = gpunetio_qps_.emplace_back(std::make_unique<DetachedQP>(context_));
-          qp->connect(context_, context_.get_lid(), client_qp);
-        }
-      }
-    }
 
     // handle startup command (load/store/noop from CN init)
     print_status("waiting for commands from compute node...");
@@ -435,7 +420,6 @@ private:
 
   HugePage<byte_t> index_buffer_;
   MemoryRegion index_region_;
-  vec<u_ptr<DetachedQP>> gpunetio_qps_;
   const u64 mn_memory_bytes_;
   timing::Timing timing_;
 };

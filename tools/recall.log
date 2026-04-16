@@ -1,7 +1,7 @@
 nohup: ignoring input
 === Recall Test Configuration ===
   data:        /data/xjs/random_dataset/1024dim1M
-  output:      /data/xjs/index/dvstor_index/1024dim1M
+  output:      /data/xjs/index/shine_gpu_index/1024dim1M
   queries:     /data/xjs/random_dataset/1024dim1M/queries/query-test.fbin
   groundtruth: /data/xjs/random_dataset/1024dim1M/queries/groundtruth-test.bin
   R=32 alpha=1.2 threads=0
@@ -10,7 +10,7 @@ reading dataset "/data/xjs/random_dataset/1024dim1M/base.fbin" (dim=1024, vector
 Reading dataset 37% (372736/1000000) elapsed 0s
 Reading dataset 76% (765952/1000000) elapsed 0s
 Reading dataset 100% (1000000/1000000) elapsed 0s done
-output prefix: "/data/xjs/index/dvstor_index/1024dim1M"
+output prefix: "/data/xjs/index/shine_gpu_index/1024dim1M"
 memory nodes: 1
 threads: 112
 R=32 beam_width=128 alpha=1.2 rabitq_bits=1

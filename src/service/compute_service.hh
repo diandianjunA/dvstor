@@ -14,7 +14,6 @@
 
 #include "common/configuration.hh"
 #include "common/core_assignment.hh"
-#include "gpu/gpunetio_query_engine.hh"
 #include "http/vamana_service_scheduler.hh"
 #include "memory_node.hh"
 #include "service/breakdown.hh"
@@ -162,7 +161,6 @@ private:
 
   std::unique_ptr<vamana::Vamana<Distance>> vamana_;
   std::unique_ptr<WorkerPool> worker_pool_;
-  std::unique_ptr<gpu::GpuNetioQueryPool> gpunetio_query_pool_;
   ServiceProfile service_profile_{};
   bool rabitq_artifacts_ready_{false};
   service::InsertQueue insert_queue_;

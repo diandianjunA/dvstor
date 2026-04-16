@@ -4,8 +4,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include <cstdlib>
-#include <cstring>
 #include <iostream>
 
 #include "queue_pair.hh"
@@ -20,22 +18,10 @@ Context::Context(Configuration& config,
 
   lib_assert(num_devices > 0, "No InfiniBand devices found");
   lib_assert(device_list != nullptr, "Device list is null");
-  const char* requested_device = std::getenv("DVSTOR_IBDEV");
-  if (requested_device != nullptr && requested_device[0] != '\0') {
-    for (i32 i = 0; i < num_devices; ++i) {
-      if (std::strcmp(ibv_get_device_name(device_list[i]), requested_device) == 0) {
-        device_ = device_list[i];
-        break;
-      }
-    }
-    lib_assert(device_ != nullptr,
-               "InfiniBand device named by DVSTOR_IBDEV was not found: " +
-                 std::string(requested_device));
-  } else {
-    lib_assert(0 <= device_idx && device_idx < num_devices,
-               "Device " + std::to_string(device_idx) + " not found");
-    device_ = device_list[device_idx];
-  }
+  lib_assert(0 <= device_idx && device_idx < num_devices,
+             "Device " + std::to_string(device_idx) + " not found");
+
+  device_ = device_list[device_idx];
 
   std::cerr << num_devices << " device(s) found" << std::endl;
   std::cerr << "Selected device: " << ibv_get_device_name(device_) << std::endl;

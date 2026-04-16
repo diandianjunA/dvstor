@@ -2,8 +2,10 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <infiniband/verbs.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #define CUDA_CHECK(call)                                                      \
     do {                                                                       \
@@ -35,7 +37,9 @@ GpuBufferManager::~GpuBufferManager() {
 
 void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
                             uint32_t max_batch, uint32_t max_R,
-                            uint32_t rabitq_bits) {
+                            uint32_t rabitq_bits,
+                            ibv_pd* rdma_pd,
+                            bool enable_gpudirect_rdma) {
     num_coroutines_ = num_coroutines;
     dim_ = dim;
     max_batch_ = max_batch;
@@ -43,6 +47,13 @@ void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
     rabitq_bits_ = rabitq_bits;
     rabitq_vec_size_ = (rabitq_bits * dim + 7) / 8 + 2 * sizeof(float);
     rabitq_ready_ = false;
+    gpudirect_rdma_enabled_ = false;
+    gpudirect_candidate_ready_ = false;
+    gpudirect_rabitq_ready_ = false;
+    const bool try_gpudirect_rdma = enable_gpudirect_rdma && rdma_pd != nullptr;
+    const size_t candidate_bytes = static_cast<size_t>(max_batch) * dim * sizeof(float);
+    const size_t rabitq_bytes = static_cast<size_t>(max_batch) * rabitq_vec_size_;
+    ibv_pd* pd = try_gpudirect_rdma ? rdma_pd : nullptr;
 
     states_ = new CoroutineGpuState[num_coroutines];
     CUBLAS_CHECK(cublasCreate(&cublas_handle_));
@@ -76,6 +87,64 @@ void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
         CUDA_CHECK(cudaMalloc(&s.d_pruned_indices, max_R * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&s.d_pruned_count, sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&s.d_query_factor, 3 * sizeof(float)));  // RabitqQueryFactor
+
+    }
+
+    if (try_gpudirect_rdma) {
+        bool candidate_success = true;
+        for (uint32_t i = 0; i < num_coroutines; ++i) {
+            auto& s = states_[i];
+            s.d_candidate_vecs_mr = ibv_reg_mr(pd, s.d_candidate_vecs, candidate_bytes, IBV_ACCESS_LOCAL_WRITE);
+            if (!s.d_candidate_vecs_mr) {
+                candidate_success = false;
+                continue;
+            }
+            s.d_candidate_vecs_lkey = s.d_candidate_vecs_mr->lkey;
+            s.d_candidate_vecs_rdma_registered = true;
+        }
+        if (!candidate_success) {
+            for (uint32_t i = 0; i < num_coroutines; ++i) {
+                auto& s = states_[i];
+                if (s.d_candidate_vecs_mr) {
+                    ibv_dereg_mr(s.d_candidate_vecs_mr);
+                    s.d_candidate_vecs_mr = nullptr;
+                }
+                s.d_candidate_vecs_lkey = 0;
+                s.d_candidate_vecs_rdma_registered = false;
+            }
+        } else {
+            gpudirect_candidate_ready_ = true;
+        }
+
+        bool rabitq_success = true;
+        for (uint32_t i = 0; i < num_coroutines; ++i) {
+            auto& s = states_[i];
+            s.d_rabitq_vecs_mr = ibv_reg_mr(pd, s.d_rabitq_vecs, rabitq_bytes, IBV_ACCESS_LOCAL_WRITE);
+            if (!s.d_rabitq_vecs_mr) {
+                rabitq_success = false;
+                continue;
+            }
+            s.d_rabitq_vecs_lkey = s.d_rabitq_vecs_mr->lkey;
+            s.d_rabitq_vecs_rdma_registered = true;
+        }
+        if (!rabitq_success) {
+            for (uint32_t i = 0; i < num_coroutines; ++i) {
+                auto& s = states_[i];
+                if (s.d_rabitq_vecs_mr) {
+                    ibv_dereg_mr(s.d_rabitq_vecs_mr);
+                    s.d_rabitq_vecs_mr = nullptr;
+                }
+                s.d_rabitq_vecs_lkey = 0;
+                s.d_rabitq_vecs_rdma_registered = false;
+            }
+        } else {
+            gpudirect_rabitq_ready_ = true;
+        }
+
+        gpudirect_rdma_enabled_ = gpudirect_candidate_ready_ || gpudirect_rabitq_ready_;
+        if (gpudirect_rdma_enabled_) {
+            std::fprintf(stderr, "[GPUDirect RDMA] enabled for %u coroutine GPU staging buffers\n", num_coroutines);
+        }
     }
 
     // Allocate and initialize default rotation matrix (identity) and zero centroid
@@ -115,6 +184,8 @@ void GpuBufferManager::destroy() {
         if (s.d_pruned_indices) cudaFree(s.d_pruned_indices);
         if (s.d_pruned_count) cudaFree(s.d_pruned_count);
         if (s.d_query_factor) cudaFree(s.d_query_factor);
+        if (s.d_candidate_vecs_mr) ibv_dereg_mr(s.d_candidate_vecs_mr);
+        if (s.d_rabitq_vecs_mr) ibv_dereg_mr(s.d_rabitq_vecs_mr);
 
         // Pinned host buffers
         if (s.h_query) cudaFreeHost(s.h_query);
@@ -141,6 +212,9 @@ void GpuBufferManager::destroy() {
     states_ = nullptr;
     cublas_handle_ = nullptr;
     rabitq_ready_ = false;
+    gpudirect_rdma_enabled_ = false;
+    gpudirect_candidate_ready_ = false;
+    gpudirect_rabitq_ready_ = false;
     initialized_ = false;
 }
 

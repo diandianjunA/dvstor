@@ -6,7 +6,6 @@
 #include <iostream>
 #include <library/configuration.hh>
 
-#include "common/constants.hh"
 #include "index_path.hh"
 #include "types.hh"
 
@@ -17,8 +16,6 @@ struct Parameters {
   u32 num_threads{};
   bool use_cache{};
   bool routing{};
-  bool use_gpunetio_query{};
-  u32 gpunetio_query_qps{};
 };
 
 class IndexConfiguration : public Configuration {
@@ -41,7 +38,10 @@ public:
   u32 rabitq_bits{};      // bits per dimension for RaBitQ quantization
   u32 k{};
   u32 gpu_device{};       // CUDA device ID
+  bool gpudirect_rdma{};  // Enable GPUDirect RDMA (read vectors directly into GPU buffers)
   str search_mode{"exact_gpu"};
+  bool use_gpu_cache{};       // --gpu-cache: enable GPU-side vector cache
+  u32 gpu_cache_size_mb{0};   // --gpu-cache-size-mb: 0 = auto (50% free GPU mem)
   u32 insert_workers{};
   u32 query_workers{};
   u32 insert_coroutines{};
@@ -93,7 +93,7 @@ private:
       "data-path, M, and ef-construction.")(
       "server-index-file",
       po::value<filepath_t>(&server_index_file),
-      "Path to a local DVSTOR index shard file that a memory node should load during startup.")(
+      "Path to a local SHINE index shard file that a memory node should load during startup.")(
       "threads,t", po::value<u32>(&num_threads), "Number of threads per compute node.")(
       "coroutines,C", po::value<u32>(&num_coroutines)->default_value(4), "Number of coroutines per compute thread.")(
       "disable-thread-pinning,p",
@@ -127,7 +127,7 @@ private:
       "rabitq-bits", po::value<u32>(&rabitq_bits)->default_value(1),
       "Bits per dimension for RaBitQ quantization (1, 2, 4, or 8).")(
       "search-mode", po::value<str>(&search_mode)->default_value(search_mode),
-      "Search mode for the query path: exact_gpu, rabitq_gpu, or gpunetio_exact_gpu.")(
+      "Search mode for the query path: exact_gpu or rabitq_gpu.")(
       "insert-workers", po::value<u32>(&insert_workers)->default_value(0),
       "Dedicated insert worker threads. 0 keeps the built-in split.")(
       "query-workers", po::value<u32>(&query_workers)->default_value(0),
@@ -137,6 +137,12 @@ private:
       "query-coroutines", po::value<u32>(&query_coroutines)->default_value(0),
       "Coroutines per query worker. 0 uses the built-in query default.")(
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
+      "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
+      "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
+      "gpu-cache", po::bool_switch(&use_gpu_cache)->default_value(false),
+      "Enable GPU-side vector cache for beam search.")(
+      "gpu-cache-size-mb", po::value<u32>(&gpu_cache_size_mb)->default_value(0),
+      "GPU memory for vector cache in MB. 0 = auto (50% of free GPU memory).")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
       "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
@@ -165,26 +171,9 @@ private:
       exit_with_help_message(argv);
     }
 
-    if (search_mode != "exact_gpu" && search_mode != "rabitq_gpu" && search_mode != "gpunetio_exact_gpu") {
-      std::cerr << "[ERROR]: --search-mode must be exact_gpu, rabitq_gpu, or gpunetio_exact_gpu" << std::endl;
+    if (search_mode != "exact_gpu" && search_mode != "rabitq_gpu") {
+      std::cerr << "[ERROR]: --search-mode must be exact_gpu or rabitq_gpu" << std::endl;
       exit_with_help_message(argv);
-    }
-
-    if (use_gpunetio_search()) {
-      if (use_cache) {
-        std::cerr << "[ERROR]: gpunetio_exact_gpu requires --cache to be disabled" << std::endl;
-        exit_with_help_message(argv);
-      }
-
-      if (query_workers > MAX_QPS) {
-        std::cerr << "[ERROR]: gpunetio_exact_gpu supports at most " << MAX_QPS << " query workers" << std::endl;
-        exit_with_help_message(argv);
-      }
-
-      if (query_coroutines != 0 && query_coroutines != 1) {
-        std::cerr << "[ERROR]: gpunetio_exact_gpu requires --query-coroutines to be 1" << std::endl;
-        exit_with_help_message(argv);
-      }
     }
 
     if (rabitq_bits != 1 && rabitq_bits != 2 && rabitq_bits != 4 && rabitq_bits != 8) {
@@ -221,7 +210,6 @@ public:
   }
 
   bool use_rabitq_search() const { return search_mode == "rabitq_gpu"; }
-  bool use_gpunetio_search() const { return search_mode == "gpunetio_exact_gpu"; }
 
   friend std::ostream& operator<<(std::ostream& os, const IndexConfiguration& config) {
     os << static_cast<const Configuration&>(config);
@@ -257,6 +245,12 @@ public:
       os << std::setw(width) << "insert coroutines: " << config.insert_coroutines << std::endl;
       os << std::setw(width) << "query coroutines: " << config.query_coroutines << std::endl;
       os << std::setw(width) << "GPU device: " << config.gpu_device << std::endl;
+      os << std::setw(width) << "GPUDirect RDMA: " << (config.gpudirect_rdma ? "true" : "false") << std::endl;
+      os << std::setw(width) << "GPU cache: " << (config.use_gpu_cache ? "true" : "false") << std::endl;
+      if (config.use_gpu_cache) {
+        os << std::setw(width) << "GPU cache size (MB): "
+           << (config.gpu_cache_size_mb > 0 ? std::to_string(config.gpu_cache_size_mb) : "auto") << std::endl;
+      }
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {
       os << std::left << std::setfill(' ');

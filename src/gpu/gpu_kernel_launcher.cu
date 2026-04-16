@@ -67,6 +67,26 @@ void launch_batch_l2_distances(cudaStream_t stream, cudaEvent_t event,
     CUDA_CHECK(cudaEventRecord(event, stream));
 }
 
+void launch_batch_indexed_l2_distances(cudaStream_t stream, cudaEvent_t event,
+                                       const float* d_query, const float* d_candidates_base,
+                                       const uint32_t* d_slot_indices,
+                                       float* d_distances,
+                                       uint32_t n_candidates, uint32_t dim) {
+    if (n_candidates == 0) {
+        CUDA_CHECK(cudaEventRecord(event, stream));
+        return;
+    }
+
+    uint32_t total_threads = n_candidates * TILE_SIZE;
+    uint32_t num_blocks = (total_threads + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    gpu_kernels::batch_indexed_l2_squared_distance_kernel<TILE_SIZE>
+        <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+            d_query, d_candidates_base, d_slot_indices, d_distances, n_candidates, dim);
+
+    CUDA_CHECK(cudaEventRecord(event, stream));
+}
+
 // =============================================================================
 // Batch RaBitQ Distance
 // =============================================================================
@@ -110,6 +130,46 @@ void launch_batch_rabitq_distances(cudaStream_t stream, cudaEvent_t event,
                 d_distances, n_candidates, dim);
     } else {
         fprintf(stderr, "Unsupported bits_per_dim: %u\n", bits_per_dim);
+        abort();
+    }
+
+    CUDA_CHECK(cudaEventRecord(event, stream));
+}
+
+void launch_batch_indexed_rabitq_distances(cudaStream_t stream, cudaEvent_t event,
+                                           const float* d_rot_query,
+                                           const void* d_query_factor,
+                                           const void* d_rabitq_base,
+                                           const uint32_t* d_slot_indices,
+                                           float* d_distances,
+                                           uint32_t n_candidates, uint32_t dim,
+                                           uint32_t bits_per_dim,
+                                           uint32_t vec_stride) {
+    if (n_candidates == 0) {
+        CUDA_CHECK(cudaEventRecord(event, stream));
+        return;
+    }
+
+    uint32_t total_threads = n_candidates * TILE_SIZE;
+    uint32_t num_blocks = (total_threads + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    auto* qfactor = static_cast<const gpu_kernels::RabitqQueryFactor*>(d_query_factor);
+    auto* base = static_cast<const uint8_t*>(d_rabitq_base);
+
+    if (bits_per_dim == 1) {
+        gpu_kernels::batch_indexed_rabitq_distance_kernel<TILE_SIZE, 1>
+            <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+                d_rot_query, qfactor, base, d_slot_indices, d_distances, n_candidates, dim, vec_stride);
+    } else if (bits_per_dim == 2) {
+        gpu_kernels::batch_indexed_rabitq_distance_kernel<TILE_SIZE, 2>
+            <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+                d_rot_query, qfactor, base, d_slot_indices, d_distances, n_candidates, dim, vec_stride);
+    } else if (bits_per_dim == 4) {
+        gpu_kernels::batch_indexed_rabitq_distance_kernel<TILE_SIZE, 4>
+            <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+                d_rot_query, qfactor, base, d_slot_indices, d_distances, n_candidates, dim, vec_stride);
+    } else {
+        fprintf(stderr, "Unsupported indexed bits_per_dim: %u\n", bits_per_dim);
         abort();
     }
 

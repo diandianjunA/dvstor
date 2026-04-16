@@ -10,7 +10,7 @@ BINARY="$PROJECT_DIR/build/vamana_offline_builder"
 
 # Defaults for 1024dim-1M dataset
 DATA_PATH="${DATA_PATH:-/data/xjs/random_dataset/1024dim1M}"
-OUTPUT_PREFIX="${OUTPUT_PREFIX:-/data/xjs/index/dvstor_index/1024dim1M}"
+OUTPUT_PREFIX="${OUTPUT_PREFIX:-/data/xjs/index/shine_gpu_index/1024dim1M}"
 QUERY_PATH="${QUERY_PATH:-${DATA_PATH}/queries/query-test.fbin}"
 GT_PATH="${GT_PATH:-${DATA_PATH}/queries/groundtruth-test.bin}"
 R="${R:-32}"

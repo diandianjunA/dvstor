@@ -1,8 +1,10 @@
 #!/bin/bash
 # =============================================================================
-# DVSTOR Breakdown Benchmark Runner
+# SHINE Breakdown Benchmark Runner
 # =============================================================================
-# 运行 DVSTOR breakdown benchmark，默认执行 50% 读 / 50% 写的 mixed 场景。
+# 运行 SHINE breakdown benchmark（配置驱动）。
+# 所有优化开关（如 gpudirect-rdma、gpu-cache、后续新增优化）都从 service-config 读取。
+# 默认执行 50% 读 / 50% 写 mixed 场景，并在结束后打印吞吐与延迟摘要。
 # 时间模式默认采用 drain 语义：到达截止时间后不再发新请求，并等待已启动请求完成；
 # 同时 benchmark 会根据已观测到的单次调用耗时，避免在窗口尾部再启动明显会拖很久的新调用。
 # 该脚本不会启动 memory node，请先用 start_memory_node.sh 或现有部署方式启动服务端。
@@ -39,7 +41,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BINARY="$PROJECT_DIR/build/dvstor_breakdown_benchmark"
+BINARY="$PROJECT_DIR/build/shine_breakdown_benchmark"
 
 SERVICE_CONFIG="${SERVICE_CONFIG:-$PROJECT_DIR/test/config/local_same_host_5mn.ini}"
 WORKLOAD="${WORKLOAD:-mixed}"
@@ -129,7 +131,7 @@ if [[ -n "$QUERY_FILE" ]]; then
     ARGS+=(--query-file "$QUERY_FILE")
 fi
 
-echo "[DVSTOR Breakdown] 运行参数:"
+echo "[SHINE Breakdown] 运行参数:"
 echo "  配置文件:       $SERVICE_CONFIG"
 echo "  负载模式:       $WORKLOAD"
 echo "  读比例:         $READ_RATIO"
@@ -153,4 +155,62 @@ echo "  JSON 报告:      $JSON_REPORT"
 echo "  文本报告:       $TEXT_REPORT"
 echo ""
 
-exec "$BINARY" "${ARGS[@]}"
+"$BINARY" "${ARGS[@]}"
+
+if command -v python3 >/dev/null 2>&1; then
+    python3 - "$JSON_REPORT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+report_path = Path(sys.argv[1])
+with report_path.open("r", encoding="utf-8") as f:
+    doc = json.load(f)
+
+def get(d, *keys, default=0):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+mode = get(doc, "meta", "run_mode", default="")
+measure_seconds = get(doc, "meta", "measure_seconds", default=0)
+if mode != "time":
+    measure_seconds = 0
+
+reads = get(doc, "meta", "measure_mixed", "completed_reads", default=0)
+writes = get(doc, "meta", "measure_mixed", "completed_writes", default=0)
+total_ops = reads + writes
+throughput = (total_ops / measure_seconds) if measure_seconds else 0.0
+
+q = get(doc, "query_breakdown", "latency", default={})
+i = get(doc, "insert_breakdown", "latency", default={})
+
+def ns_to_ms(x):
+    return float(x) / 1_000_000.0
+
+print("\n[SHINE Breakdown] 关键指标")
+if measure_seconds:
+    print(f"  throughput: {throughput:.2f} ops/s (total={total_ops}, duration={measure_seconds}s)")
+if reads or writes:
+    print(f"  mixed completed: reads={reads}, writes={writes}")
+if q:
+    print(
+        "  query latency(ms): "
+        f"mean={ns_to_ms(get(q, 'mean_end_to_end_ns')):.4f}, "
+        f"p95={ns_to_ms(get(q, 'p95_end_to_end_ns')):.4f}, "
+        f"p99={ns_to_ms(get(q, 'p99_end_to_end_ns')):.4f}"
+    )
+if i:
+    print(
+        "  insert latency(ms): "
+        f"mean={ns_to_ms(get(i, 'mean_end_to_end_ns')):.4f}, "
+        f"p95={ns_to_ms(get(i, 'p95_end_to_end_ns')):.4f}, "
+        f"p99={ns_to_ms(get(i, 'p99_end_to_end_ns')):.4f}"
+    )
+PY
+else
+    echo "[SHINE Breakdown] 未检测到 python3，跳过关键指标摘要打印。"
+fi

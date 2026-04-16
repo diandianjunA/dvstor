@@ -14,6 +14,18 @@
 
 namespace rdma::vamana {
 
+struct VectorBatchReadResult {
+    vec<byte_t*> host_buffers;
+    bool direct_to_gpu{false};
+};
+
+struct BatchReadDestination {
+    u64 local_addr{};
+    u32 lkey{};
+    byte_t* host_buffer{nullptr};
+    bool gpu_destination{false};
+};
+
 inline void track_total_rdma_read(const u_ptr<ComputeThread>& thread, size_t bytes) {
     thread->stats.rdma_reads_in_bytes += bytes;
     if (thread->is_query_worker()) {
@@ -219,27 +231,55 @@ inline auto read_rabitq_vector(RemotePtr node_rptr, const u_ptr<ComputeThread>& 
     return awaitable{local_buffer, rabitq_size, thread};
 }
 
+struct RabitqBatchReadResult {
+    vec<byte_t*> host_buffers;
+    bool direct_to_gpu{false};
+};
+
 /**
  * Batch read RaBitQ vectors for multiple nodes.
  * Posts multiple RDMA reads, one co_await for all.
- * Returns a vector of (buffer, size) pairs.
+ * Returns host buffers unless a GPU buffer + lkey is provided.
  */
-inline auto batch_read_rabitq(const vec<RemotePtr>& node_rptrs, const u_ptr<ComputeThread>& thread) {
+inline auto batch_read_rabitq(const vec<RemotePtr>& node_rptrs,
+                              const u_ptr<ComputeThread>& thread,
+                              const vec<BatchReadDestination>* destinations = nullptr,
+                              void* gpu_buffer = nullptr,
+                              u32 gpu_lkey = 0) {
     const size_t rabitq_size = VamanaNode::RABITQ_SIZE;
-    vec<byte_t*> buffers;
-    buffers.reserve(node_rptrs.size());
+    const bool using_destinations = destinations != nullptr && !destinations->empty();
+    const bool direct_to_gpu = using_destinations || (gpu_buffer != nullptr && gpu_lkey != 0);
+    vec<byte_t*> host_buffers;
+    host_buffers.reserve(node_rptrs.size());
 
-    for (const auto& rptr : node_rptrs) {
-        byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(rabitq_size);
-        buffers.push_back(local_buffer);
+    for (size_t i = 0; i < node_rptrs.size(); ++i) {
+        const auto& rptr = node_rptrs[i];
+        u64 local_addr;
+        u32 lkey;
+        if (using_destinations) {
+            const auto& dst = (*destinations)[i];
+            local_addr = dst.local_addr;
+            lkey = dst.gpu_destination ? dst.lkey : thread->ctx->get_lkey();
+            if (dst.host_buffer) {
+                host_buffers.push_back(dst.host_buffer);
+            }
+        } else if (direct_to_gpu) {
+            local_addr = reinterpret_cast<u64>(gpu_buffer) + i * rabitq_size;
+            lkey = gpu_lkey;
+        } else {
+            byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(rabitq_size);
+            host_buffers.push_back(local_buffer);
+            local_addr = reinterpret_cast<u64>(local_buffer);
+            lkey = thread->ctx->get_lkey();
+        }
 
         track_rabitq_rdma_read(thread, rabitq_size);
         thread->track_post();
 
         const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
-        qp->post_send(reinterpret_cast<u64>(local_buffer),
+        qp->post_send(local_addr,
                       rabitq_size,
-                      thread->ctx->get_lkey(),
+                      lkey,
                       IBV_WR_RDMA_READ,
                       true,
                       false,
@@ -250,36 +290,66 @@ inline auto batch_read_rabitq(const vec<RemotePtr>& node_rptrs, const u_ptr<Comp
     }
 
     struct awaitable {
-        vec<byte_t*> buffers;
+        RabitqBatchReadResult result;
 
         static bool await_ready() { return false; }
         static void await_suspend(std::coroutine_handle<>) {}
-        vec<byte_t*> await_resume() { return std::move(buffers); }
+        RabitqBatchReadResult await_resume() { return std::move(result); }
     };
 
-    return awaitable{std::move(buffers)};
+    return awaitable{RabitqBatchReadResult{std::move(host_buffers), direct_to_gpu}};
+}
+
+inline auto batch_read_rabitq(const vec<RemotePtr>& node_rptrs,
+                              const u_ptr<ComputeThread>& thread,
+                              void* gpu_buffer,
+                              u32 gpu_lkey) {
+    return batch_read_rabitq(node_rptrs, thread, nullptr, gpu_buffer, gpu_lkey);
 }
 
 /**
  * Batch read full vectors (float components) for multiple nodes.
  * Used during insert for RobustPrune which needs full-precision vectors.
  */
-inline auto batch_read_vectors(const vec<RemotePtr>& node_rptrs, const u_ptr<ComputeThread>& thread) {
+inline auto batch_read_vectors(const vec<RemotePtr>& node_rptrs,
+                               const u_ptr<ComputeThread>& thread,
+                               const vec<BatchReadDestination>* destinations = nullptr,
+                               float* gpu_buffer = nullptr,
+                               u32 gpu_lkey = 0) {
     const size_t vec_size = VamanaNode::DIM * sizeof(element_t);
-    vec<byte_t*> buffers;
-    buffers.reserve(node_rptrs.size());
+    const bool using_destinations = destinations != nullptr && !destinations->empty();
+    const bool direct_to_gpu = using_destinations || (gpu_buffer != nullptr && gpu_lkey != 0);
+    vec<byte_t*> host_buffers;
+    host_buffers.reserve(node_rptrs.size());
 
-    for (const auto& rptr : node_rptrs) {
-        byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(vec_size);
-        buffers.push_back(local_buffer);
+    for (size_t i = 0; i < node_rptrs.size(); ++i) {
+        const auto& rptr = node_rptrs[i];
+        u64 local_addr;
+        u32 lkey;
+        if (using_destinations) {
+            const auto& dst = (*destinations)[i];
+            local_addr = dst.local_addr;
+            lkey = dst.gpu_destination ? dst.lkey : thread->ctx->get_lkey();
+            if (dst.host_buffer) {
+                host_buffers.push_back(dst.host_buffer);
+            }
+        } else if (direct_to_gpu) {
+            local_addr = reinterpret_cast<u64>(gpu_buffer) + i * vec_size;
+            lkey = gpu_lkey;
+        } else {
+            byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(vec_size);
+            host_buffers.push_back(local_buffer);
+            local_addr = reinterpret_cast<u64>(local_buffer);
+            lkey = thread->ctx->get_lkey();
+        }
 
         track_vector_rdma_read(thread, vec_size);
         thread->track_post();
 
         const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
-        qp->post_send(reinterpret_cast<u64>(local_buffer),
+        qp->post_send(local_addr,
                       vec_size,
-                      thread->ctx->get_lkey(),
+                      lkey,
                       IBV_WR_RDMA_READ,
                       true,
                       false,
@@ -290,14 +360,21 @@ inline auto batch_read_vectors(const vec<RemotePtr>& node_rptrs, const u_ptr<Com
     }
 
     struct awaitable {
-        vec<byte_t*> buffers;
+        VectorBatchReadResult result;
 
         static bool await_ready() { return false; }
         static void await_suspend(std::coroutine_handle<>) {}
-        vec<byte_t*> await_resume() { return std::move(buffers); }
+        VectorBatchReadResult await_resume() { return std::move(result); }
     };
 
-    return awaitable{std::move(buffers)};
+    return awaitable{VectorBatchReadResult{std::move(host_buffers), direct_to_gpu}};
+}
+
+inline auto batch_read_vectors(const vec<RemotePtr>& node_rptrs,
+                               const u_ptr<ComputeThread>& thread,
+                               float* gpu_buffer,
+                               u32 gpu_lkey) {
+    return batch_read_vectors(node_rptrs, thread, nullptr, gpu_buffer, gpu_lkey);
 }
 
 /**

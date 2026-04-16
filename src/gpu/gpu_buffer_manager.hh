@@ -21,6 +21,9 @@
 #include <cstdlib>
 #include <cstring>
 
+struct ibv_mr;
+struct ibv_pd;
+
 // Forward-declare CUDA types for host headers
 struct CUstream_st;
 struct CUevent_st;
@@ -56,6 +59,12 @@ struct CoroutineGpuState {
     float*    d_distances{nullptr};
     uint32_t* d_pruned_indices{nullptr};
     uint32_t* d_pruned_count{nullptr};
+    ibv_mr*   d_candidate_vecs_mr{nullptr};  // optional GPUDirect RDMA MR for d_candidate_vecs
+    uint32_t  d_candidate_vecs_lkey{0};
+    bool      d_candidate_vecs_rdma_registered{false};
+    ibv_mr*   d_rabitq_vecs_mr{nullptr};
+    uint32_t  d_rabitq_vecs_lkey{0};
+    bool      d_rabitq_vecs_rdma_registered{false};
 
     // RaBitQ query factor (device, 3 floats)
     void*     d_query_factor{nullptr};
@@ -82,7 +91,9 @@ public:
      * @param rabitq_bits     Bits per dimension for RaBitQ
      */
     void init(uint32_t num_coroutines, uint32_t dim, uint32_t max_batch,
-              uint32_t max_R, uint32_t rabitq_bits);
+              uint32_t max_R, uint32_t rabitq_bits,
+              ibv_pd* rdma_pd = nullptr,
+              bool enable_gpudirect_rdma = false);
 
     /**
      * Release all GPU resources.
@@ -135,6 +146,8 @@ public:
     uint32_t rabitq_vec_size() const { return rabitq_vec_size_; }
     bool initialized() const { return initialized_; }
     bool rabitq_ready() const { return rabitq_ready_; }
+    bool gpudirect_candidate_ready() const { return gpudirect_candidate_ready_; }
+    bool gpudirect_rabitq_ready() const { return gpudirect_rabitq_ready_; }
 
 private:
     CoroutineGpuState* states_{nullptr};
@@ -151,6 +164,9 @@ private:
     double t_const_{0.0};
     cublasHandle_t cublas_handle_{nullptr};
     bool rabitq_ready_{false};
+    bool gpudirect_rdma_enabled_{false};
+    bool gpudirect_candidate_ready_{false};
+    bool gpudirect_rabitq_ready_{false};
 
     bool initialized_{false};
 };

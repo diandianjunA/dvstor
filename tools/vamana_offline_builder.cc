@@ -1,8 +1,8 @@
 /**
- * Offline Vamana index builder for DVSTOR.
+ * Offline Vamana index builder for SHINE.
  *
  * Builds a Vamana graph on CPU, computes RaBitQ quantization,
- * and serializes to DVSTOR memory node shard format with fixed-size VamanaNode records.
+ * and serializes to SHINE memory node shard format with fixed-size VamanaNode records.
  *
  * Steps:
  *   1. Read dataset from file
@@ -10,7 +10,7 @@
  *   3. Generate random orthogonal matrix P (Eigen QR)
  *   4. Build Vamana graph: greedy insert with beam search + RobustPrune
  *   5. Quantize all vectors using RaBitQ
- *   6. Serialize to DVSTOR VamanaNode shard format
+ *   6. Serialize to SHINE VamanaNode shard format
  */
 
 #include <algorithm>

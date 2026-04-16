@@ -3,7 +3,7 @@
 /**
  * GPU kernel launcher declarations.
  * These are host-callable functions that stage data and launch CUDA kernels.
- * Compiled by the host compiler (not nvcc), linked against dvstor_gpu_kernels.
+ * Compiled by the host compiler (not nvcc), linked against shine_gpu_kernels.
  */
 
 #include <cstdint>
@@ -36,6 +36,12 @@ void launch_batch_l2_distances(cudaStream_t stream, cudaEvent_t event,
                                float* d_distances,
                                uint32_t n_candidates, uint32_t dim);
 
+void launch_batch_indexed_l2_distances(cudaStream_t stream, cudaEvent_t event,
+                                       const float* d_query, const float* d_candidates_base,
+                                       const uint32_t* d_slot_indices,
+                                       float* d_distances,
+                                       uint32_t n_candidates, uint32_t dim);
+
 /**
  * Compute batch RaBitQ approximate distances.
  * Uses precomputed query factors and quantized data vectors.
@@ -57,6 +63,16 @@ void launch_batch_rabitq_distances(cudaStream_t stream, cudaEvent_t event,
                                    float* d_distances,
                                    uint32_t n_candidates, uint32_t dim,
                                    uint32_t bits_per_dim);
+
+void launch_batch_indexed_rabitq_distances(cudaStream_t stream, cudaEvent_t event,
+                                           const float* d_rot_query,
+                                           const void* d_query_factor,
+                                           const void* d_rabitq_base,
+                                           const uint32_t* d_slot_indices,
+                                           float* d_distances,
+                                           uint32_t n_candidates, uint32_t dim,
+                                           uint32_t bits_per_dim,
+                                           uint32_t vec_stride);
 
 /**
  * GPU RobustPrune: select up to R neighbors from sorted candidates.
