@@ -39,7 +39,8 @@ void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
                             uint32_t max_batch, uint32_t max_R,
                             uint32_t rabitq_bits,
                             ibv_pd* rdma_pd,
-                            bool enable_gpudirect_rdma) {
+                            bool enable_gpudirect_rdma,
+                            size_t gpu_rabitq_cache_bytes) {
     num_coroutines_ = num_coroutines;
     dim_ = dim;
     max_batch_ = max_batch;
@@ -72,6 +73,8 @@ void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
         CUDA_CHECK(cudaMallocHost(&s.h_candidate_vecs, max_batch * dim * sizeof(float)));
         CUDA_CHECK(cudaMallocHost(&s.h_candidate_dists, max_batch * sizeof(float)));
         CUDA_CHECK(cudaMallocHost(&s.h_candidate_order, max_batch * sizeof(uint32_t)));
+        CUDA_CHECK(cudaHostAlloc(&s.h_cache_slot_ids, max_batch * sizeof(uint32_t), cudaHostAllocMapped));
+        CUDA_CHECK(cudaHostGetDevicePointer(&s.d_cache_slot_ids, s.h_cache_slot_ids, 0));
         CUDA_CHECK(cudaMallocHost(&s.h_distances, max_batch * sizeof(float)));
         CUDA_CHECK(cudaMallocHost(&s.h_pruned_indices, max_R * sizeof(uint32_t)));
         CUDA_CHECK(cudaMallocHost(&s.h_pruned_count, sizeof(uint32_t)));
@@ -147,6 +150,12 @@ void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
         }
     }
 
+    if (gpudirect_rabitq_ready_ && gpu_rabitq_cache_bytes > 0) {
+        if (!rabitq_cache_.init(gpu_rabitq_cache_bytes, rabitq_vec_size_, pd)) {
+            std::fprintf(stderr, "[GPU RaBitQ cache] disabled; falling back to staging buffers\n");
+        }
+    }
+
     // Allocate and initialize default rotation matrix (identity) and zero centroid
     // These will be overwritten when an index is loaded.
     {
@@ -194,6 +203,7 @@ void GpuBufferManager::destroy() {
         if (s.h_candidate_vecs) cudaFreeHost(s.h_candidate_vecs);
         if (s.h_candidate_dists) cudaFreeHost(s.h_candidate_dists);
         if (s.h_candidate_order) cudaFreeHost(s.h_candidate_order);
+        if (s.h_cache_slot_ids) cudaFreeHost(s.h_cache_slot_ids);
         if (s.h_distances) cudaFreeHost(s.h_distances);
         if (s.h_pruned_indices) cudaFreeHost(s.h_pruned_indices);
         if (s.h_pruned_count) cudaFreeHost(s.h_pruned_count);
@@ -207,6 +217,7 @@ void GpuBufferManager::destroy() {
     if (d_rotation_mat_) cudaFree(d_rotation_mat_);
     if (d_centroid_) cudaFree(d_centroid_);
     if (cublas_handle_) cublasDestroy(cublas_handle_);
+    rabitq_cache_.destroy();
 
     delete[] states_;
     states_ = nullptr;

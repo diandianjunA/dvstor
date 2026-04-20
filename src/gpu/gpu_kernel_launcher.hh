@@ -36,12 +36,6 @@ void launch_batch_l2_distances(cudaStream_t stream, cudaEvent_t event,
                                float* d_distances,
                                uint32_t n_candidates, uint32_t dim);
 
-void launch_batch_indexed_l2_distances(cudaStream_t stream, cudaEvent_t event,
-                                       const float* d_query, const float* d_candidates_base,
-                                       const uint32_t* d_slot_indices,
-                                       float* d_distances,
-                                       uint32_t n_candidates, uint32_t dim);
-
 /**
  * Compute batch RaBitQ approximate distances.
  * Uses precomputed query factors and quantized data vectors.
@@ -64,15 +58,22 @@ void launch_batch_rabitq_distances(cudaStream_t stream, cudaEvent_t event,
                                    uint32_t n_candidates, uint32_t dim,
                                    uint32_t bits_per_dim);
 
-void launch_batch_indexed_rabitq_distances(cudaStream_t stream, cudaEvent_t event,
-                                           const float* d_rot_query,
-                                           const void* d_query_factor,
-                                           const void* d_rabitq_base,
-                                           const uint32_t* d_slot_indices,
-                                           float* d_distances,
-                                           uint32_t n_candidates, uint32_t dim,
-                                           uint32_t bits_per_dim,
-                                           uint32_t vec_stride);
+void launch_batch_cached_rabitq_distances(cudaStream_t stream, cudaEvent_t event,
+                                          const float* d_rot_query,
+                                          const void* d_query_factor,
+                                          const void* d_rabitq_base,
+                                          const uint32_t* d_slot_ids,
+                                          float* d_distances,
+                                          uint32_t n_candidates, uint32_t dim,
+                                          uint32_t bits_per_dim,
+                                          uint32_t vec_stride);
+
+void launch_gather_cached_rabitq(cudaStream_t stream,
+                                 const void* d_rabitq_base,
+                                 const uint32_t* d_slot_ids,
+                                 void* d_out,
+                                 uint32_t n_candidates,
+                                 uint32_t vec_stride);
 
 /**
  * GPU RobustPrune: select up to R neighbors from sorted candidates.

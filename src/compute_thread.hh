@@ -5,10 +5,10 @@
 #include <random>
 
 #include "buffer_allocator.hh"
+#include "cache/neighbor_cache.hh"
 #include "common/statistics.hh"
 #include "coroutine.hh"
 #include "gpu/gpu_buffer_manager.hh"
-#include "gpu/gpu_vector_cache.hh"
 #include "service/breakdown.hh"
 #include "shared_context.hh"
 
@@ -119,7 +119,7 @@ public:
   vec<std::atomic<i32>> gpu_post_balances;  // per coroutine (GPU)
 
   gpu::GpuBufferManager gpu_buffers;  // CUDA streams, events, staging buffers
-  gpu::GpuVectorCache gpu_vector_cache;  // GPU-resident vector cache for beam search
+  cache::NeighborCache neighbor_cache;  // CPU-side query neighbor-list cache
 
   statistics::ThreadStatistics stats{};
 

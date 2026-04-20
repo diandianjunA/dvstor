@@ -285,23 +285,16 @@ struct ThreadCounterDelta {
   u64 overflow_prunes{};
   u64 cache_hits{};
   u64 cache_misses{};
-  u64 gpu_cache_vec_all_hit_batches{};
-  u64 gpu_cache_vec_mixed_batches{};
-  u64 gpu_cache_vec_all_miss_batches{};
-  u64 gpu_cache_rabitq_all_hit_batches{};
-  u64 gpu_cache_rabitq_mixed_batches{};
-  u64 gpu_cache_rabitq_all_miss_batches{};
-  u64 gpu_cache_vec_hit_items{};
-  u64 gpu_cache_vec_miss_to_cache_items{};
-  u64 gpu_cache_vec_miss_to_staging_items{};
-  u64 gpu_cache_rabitq_hit_items{};
-  u64 gpu_cache_rabitq_miss_to_cache_items{};
-  u64 gpu_cache_rabitq_miss_to_staging_items{};
-  u64 query_rdma_to_cache_bytes{};
   u64 query_rdma_to_staging_bytes{};
   u64 query_host_staging_fallback_bytes{};
-  u64 query_cache_insert_d2d_bytes{};
-  u64 query_cache_gather_d2d_bytes{};
+  u64 neighbor_cache_hits{};
+  u64 neighbor_cache_misses{};
+  u64 gpu_rabitq_cache_hits{};
+  u64 gpu_rabitq_cache_misses{};
+  u64 gpu_rabitq_cache_fills{};
+  u64 gpu_rabitq_cache_fill_bytes{};
+  u64 gpu_rabitq_cache_duplicate_fills{};
+  u64 gpu_rabitq_cache_fallback_batches{};
 };
 
 
@@ -325,23 +318,18 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
     out.visited_neighborlists = end.visited_neighborlists - start.visited_neighborlists;
     out.cache_hits = end.cache_hits - start.cache_hits;
     out.cache_misses = end.cache_misses - start.cache_misses;
-    out.gpu_cache_vec_all_hit_batches = end.gpu_cache_vec_all_hit_batches - start.gpu_cache_vec_all_hit_batches;
-    out.gpu_cache_vec_mixed_batches = end.gpu_cache_vec_mixed_batches - start.gpu_cache_vec_mixed_batches;
-    out.gpu_cache_vec_all_miss_batches = end.gpu_cache_vec_all_miss_batches - start.gpu_cache_vec_all_miss_batches;
-    out.gpu_cache_rabitq_all_hit_batches = end.gpu_cache_rabitq_all_hit_batches - start.gpu_cache_rabitq_all_hit_batches;
-    out.gpu_cache_rabitq_mixed_batches = end.gpu_cache_rabitq_mixed_batches - start.gpu_cache_rabitq_mixed_batches;
-    out.gpu_cache_rabitq_all_miss_batches = end.gpu_cache_rabitq_all_miss_batches - start.gpu_cache_rabitq_all_miss_batches;
-    out.gpu_cache_vec_hit_items = end.gpu_cache_vec_hit_items - start.gpu_cache_vec_hit_items;
-    out.gpu_cache_vec_miss_to_cache_items = end.gpu_cache_vec_miss_to_cache_items - start.gpu_cache_vec_miss_to_cache_items;
-    out.gpu_cache_vec_miss_to_staging_items = end.gpu_cache_vec_miss_to_staging_items - start.gpu_cache_vec_miss_to_staging_items;
-    out.gpu_cache_rabitq_hit_items = end.gpu_cache_rabitq_hit_items - start.gpu_cache_rabitq_hit_items;
-    out.gpu_cache_rabitq_miss_to_cache_items = end.gpu_cache_rabitq_miss_to_cache_items - start.gpu_cache_rabitq_miss_to_cache_items;
-    out.gpu_cache_rabitq_miss_to_staging_items = end.gpu_cache_rabitq_miss_to_staging_items - start.gpu_cache_rabitq_miss_to_staging_items;
-    out.query_rdma_to_cache_bytes = end.query_rdma_to_cache_bytes - start.query_rdma_to_cache_bytes;
     out.query_rdma_to_staging_bytes = end.query_rdma_to_staging_bytes - start.query_rdma_to_staging_bytes;
     out.query_host_staging_fallback_bytes = end.query_host_staging_fallback_bytes - start.query_host_staging_fallback_bytes;
-    out.query_cache_insert_d2d_bytes = end.query_cache_insert_d2d_bytes - start.query_cache_insert_d2d_bytes;
-    out.query_cache_gather_d2d_bytes = end.query_cache_gather_d2d_bytes - start.query_cache_gather_d2d_bytes;
+    out.neighbor_cache_hits = end.neighbor_cache_hits - start.neighbor_cache_hits;
+    out.neighbor_cache_misses = end.neighbor_cache_misses - start.neighbor_cache_misses;
+    out.gpu_rabitq_cache_hits = end.gpu_rabitq_cache_hits - start.gpu_rabitq_cache_hits;
+    out.gpu_rabitq_cache_misses = end.gpu_rabitq_cache_misses - start.gpu_rabitq_cache_misses;
+    out.gpu_rabitq_cache_fills = end.gpu_rabitq_cache_fills - start.gpu_rabitq_cache_fills;
+    out.gpu_rabitq_cache_fill_bytes = end.gpu_rabitq_cache_fill_bytes - start.gpu_rabitq_cache_fill_bytes;
+    out.gpu_rabitq_cache_duplicate_fills =
+      end.gpu_rabitq_cache_duplicate_fills - start.gpu_rabitq_cache_duplicate_fills;
+    out.gpu_rabitq_cache_fallback_batches =
+      end.gpu_rabitq_cache_fallback_batches - start.gpu_rabitq_cache_fallback_batches;
     return out;
   }
 
@@ -492,23 +480,16 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.overflow_prunes += delta.overflow_prunes;
   aggregate.counters.cache_hits += delta.cache_hits;
   aggregate.counters.cache_misses += delta.cache_misses;
-  aggregate.counters.gpu_cache_vec_all_hit_batches += delta.gpu_cache_vec_all_hit_batches;
-  aggregate.counters.gpu_cache_vec_mixed_batches += delta.gpu_cache_vec_mixed_batches;
-  aggregate.counters.gpu_cache_vec_all_miss_batches += delta.gpu_cache_vec_all_miss_batches;
-  aggregate.counters.gpu_cache_rabitq_all_hit_batches += delta.gpu_cache_rabitq_all_hit_batches;
-  aggregate.counters.gpu_cache_rabitq_mixed_batches += delta.gpu_cache_rabitq_mixed_batches;
-  aggregate.counters.gpu_cache_rabitq_all_miss_batches += delta.gpu_cache_rabitq_all_miss_batches;
-  aggregate.counters.gpu_cache_vec_hit_items += delta.gpu_cache_vec_hit_items;
-  aggregate.counters.gpu_cache_vec_miss_to_cache_items += delta.gpu_cache_vec_miss_to_cache_items;
-  aggregate.counters.gpu_cache_vec_miss_to_staging_items += delta.gpu_cache_vec_miss_to_staging_items;
-  aggregate.counters.gpu_cache_rabitq_hit_items += delta.gpu_cache_rabitq_hit_items;
-  aggregate.counters.gpu_cache_rabitq_miss_to_cache_items += delta.gpu_cache_rabitq_miss_to_cache_items;
-  aggregate.counters.gpu_cache_rabitq_miss_to_staging_items += delta.gpu_cache_rabitq_miss_to_staging_items;
-  aggregate.counters.query_rdma_to_cache_bytes += delta.query_rdma_to_cache_bytes;
   aggregate.counters.query_rdma_to_staging_bytes += delta.query_rdma_to_staging_bytes;
   aggregate.counters.query_host_staging_fallback_bytes += delta.query_host_staging_fallback_bytes;
-  aggregate.counters.query_cache_insert_d2d_bytes += delta.query_cache_insert_d2d_bytes;
-  aggregate.counters.query_cache_gather_d2d_bytes += delta.query_cache_gather_d2d_bytes;
+  aggregate.counters.neighbor_cache_hits += delta.neighbor_cache_hits;
+  aggregate.counters.neighbor_cache_misses += delta.neighbor_cache_misses;
+  aggregate.counters.gpu_rabitq_cache_hits += delta.gpu_rabitq_cache_hits;
+  aggregate.counters.gpu_rabitq_cache_misses += delta.gpu_rabitq_cache_misses;
+  aggregate.counters.gpu_rabitq_cache_fills += delta.gpu_rabitq_cache_fills;
+  aggregate.counters.gpu_rabitq_cache_fill_bytes += delta.gpu_rabitq_cache_fill_bytes;
+  aggregate.counters.gpu_rabitq_cache_duplicate_fills += delta.gpu_rabitq_cache_duplicate_fills;
+  aggregate.counters.gpu_rabitq_cache_fallback_batches += delta.gpu_rabitq_cache_fallback_batches;
   aggregate.lock_attempts += sample.lock_attempts;
   aggregate.lock_retries += sample.lock_retries;
   aggregate.cas_failures += sample.cas_failures;
@@ -594,23 +575,16 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"overflow_prunes", aggregate.counters.overflow_prunes},
     {"cache_hits", aggregate.counters.cache_hits},
     {"cache_misses", aggregate.counters.cache_misses},
-    {"gpu_cache_vec_all_hit_batches", aggregate.counters.gpu_cache_vec_all_hit_batches},
-    {"gpu_cache_vec_mixed_batches", aggregate.counters.gpu_cache_vec_mixed_batches},
-    {"gpu_cache_vec_all_miss_batches", aggregate.counters.gpu_cache_vec_all_miss_batches},
-    {"gpu_cache_rabitq_all_hit_batches", aggregate.counters.gpu_cache_rabitq_all_hit_batches},
-    {"gpu_cache_rabitq_mixed_batches", aggregate.counters.gpu_cache_rabitq_mixed_batches},
-    {"gpu_cache_rabitq_all_miss_batches", aggregate.counters.gpu_cache_rabitq_all_miss_batches},
-    {"gpu_cache_vec_hit_items", aggregate.counters.gpu_cache_vec_hit_items},
-    {"gpu_cache_vec_miss_to_cache_items", aggregate.counters.gpu_cache_vec_miss_to_cache_items},
-    {"gpu_cache_vec_miss_to_staging_items", aggregate.counters.gpu_cache_vec_miss_to_staging_items},
-    {"gpu_cache_rabitq_hit_items", aggregate.counters.gpu_cache_rabitq_hit_items},
-    {"gpu_cache_rabitq_miss_to_cache_items", aggregate.counters.gpu_cache_rabitq_miss_to_cache_items},
-    {"gpu_cache_rabitq_miss_to_staging_items", aggregate.counters.gpu_cache_rabitq_miss_to_staging_items},
-    {"query_rdma_to_cache_bytes", aggregate.counters.query_rdma_to_cache_bytes},
     {"query_rdma_to_staging_bytes", aggregate.counters.query_rdma_to_staging_bytes},
     {"query_host_staging_fallback_bytes", aggregate.counters.query_host_staging_fallback_bytes},
-    {"query_cache_insert_d2d_bytes", aggregate.counters.query_cache_insert_d2d_bytes},
-    {"query_cache_gather_d2d_bytes", aggregate.counters.query_cache_gather_d2d_bytes},
+    {"neighbor_cache_hits", aggregate.counters.neighbor_cache_hits},
+    {"neighbor_cache_misses", aggregate.counters.neighbor_cache_misses},
+    {"gpu_rabitq_cache_hits", aggregate.counters.gpu_rabitq_cache_hits},
+    {"gpu_rabitq_cache_misses", aggregate.counters.gpu_rabitq_cache_misses},
+    {"gpu_rabitq_cache_fills", aggregate.counters.gpu_rabitq_cache_fills},
+    {"gpu_rabitq_cache_fill_bytes", aggregate.counters.gpu_rabitq_cache_fill_bytes},
+    {"gpu_rabitq_cache_duplicate_fills", aggregate.counters.gpu_rabitq_cache_duplicate_fills},
+    {"gpu_rabitq_cache_fallback_batches", aggregate.counters.gpu_rabitq_cache_fallback_batches},
     {"lock_attempts", aggregate.lock_attempts},
     {"lock_retries", aggregate.lock_retries},
     {"cas_failures", aggregate.cas_failures},

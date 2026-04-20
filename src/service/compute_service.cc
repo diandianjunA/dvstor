@@ -65,8 +65,7 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   // Construct Vamana index
   vamana_ = std::make_unique<vamana::Vamana<Distance>>(
     config_.R, config_.beam_width, config_.beam_width_construction,
-    config_.alpha, config_.k, config_.rabitq_bits, config_.dim, config_.use_cache, config_.use_rabitq_search(),
-    config_.use_gpu_cache);
+    config_.alpha, config_.k, config_.rabitq_bits, config_.dim, config_.use_cache, config_.use_rabitq_search());
 
   const size_t estimated_index_size = config_.max_vectors * VamanaNode::total_size();
   const size_t cache_size = static_cast<f32>(estimated_index_size) / 100. * config_.cache_size_ratio;
@@ -92,50 +91,30 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   const u32 search_batch =
       config_.use_rabitq_search() ? (config_.beam_width + kRabitqSearchBeamSlack) : config_.beam_width;
   const u32 max_batch = std::max(search_batch, config_.beam_width_construction);
-  for (auto& thread : compute_threads()) {
+  const u64 neighbor_cache_total_bytes = static_cast<u64>(config_.neighbor_cache_mb) * 1024ull * 1024ull;
+  const u64 gpu_rabitq_cache_total_bytes = static_cast<u64>(config_.gpu_rabitq_cache_mb) * 1024ull * 1024ull;
+  const u64 neighbor_cache_bytes_per_query_worker =
+    service_profile_.query_workers == 0 ? 0 : neighbor_cache_total_bytes / service_profile_.query_workers;
+  const u64 gpu_rabitq_cache_bytes_per_query_worker =
+    service_profile_.query_workers == 0 ? 0 : gpu_rabitq_cache_total_bytes / service_profile_.query_workers;
+  for (u32 tid = 0; tid < compute_threads().size(); ++tid) {
+    auto& thread = compute_threads()[tid];
+    const bool query_worker = tid >= service_profile_.insert_workers;
+    if (query_worker && neighbor_cache_bytes_per_query_worker > 0) {
+      thread->neighbor_cache.init(neighbor_cache_bytes_per_query_worker);
+      print_status("neighbor cache worker " + std::to_string(tid) +
+                   ": slots=" + std::to_string(thread->neighbor_cache.slot_count()));
+    }
     thread->gpu_buffers.init(config_.num_coroutines,
                              config_.dim,
                              max_batch,
                              config_.R,
                              config_.rabitq_bits,
                              thread->ctx->context.get_protection_domain(),
-                             config_.gpudirect_rdma);
+                             config_.gpudirect_rdma,
+                             query_worker && config_.use_rabitq_search() ? gpu_rabitq_cache_bytes_per_query_worker : 0);
   }
   cm_.synchronize();
-
-  // Initialize GPU vector cache (after GPU buffers are ready)
-  if (config_.use_gpu_cache) {
-    size_t gpu_cache_bytes;
-    if (config_.gpu_cache_size_mb > 0) {
-      gpu_cache_bytes = static_cast<size_t>(config_.gpu_cache_size_mb) * 1024 * 1024;
-    } else {
-      // Auto: query free GPU memory, use 50%
-      size_t free_mem = 0, total_mem = 0;
-      cudaMemGetInfo(&free_mem, &total_mem);
-      gpu_cache_bytes = free_mem / 2;
-    }
-
-    const size_t vec_bytes = config_.dim * sizeof(float);
-    const size_t rabitq_bytes = VamanaNode::RABITQ_SIZE;
-    const u32 vec_capacity = static_cast<u32>((gpu_cache_bytes * 3 / 10) / vec_bytes);
-    const u32 rabitq_capacity = static_cast<u32>((gpu_cache_bytes * 7 / 10) / rabitq_bytes);
-
-    bool vec_rdma_registered = true;
-    bool rabitq_rdma_registered = true;
-    for (auto& thread : compute_threads()) {
-      thread->gpu_vector_cache.init(vec_capacity, rabitq_capacity,
-                                     config_.dim, VamanaNode::RABITQ_SIZE,
-                                     thread->ctx->context.get_protection_domain(),
-                                     config_.gpudirect_rdma);
-      vec_rdma_registered = vec_rdma_registered && thread->gpu_vector_cache.vec_rdma_registered();
-      rabitq_rdma_registered = rabitq_rdma_registered && thread->gpu_vector_cache.rabitq_rdma_registered();
-    }
-    print_status("GPU cache: vec_slots=" + std::to_string(vec_capacity) +
-                 ", rabitq_slots=" + std::to_string(rabitq_capacity) +
-                 " (" + std::to_string(gpu_cache_bytes / (1024 * 1024)) + " MB per thread), gpudirect_vec_cache=" +
-                 (vec_rdma_registered ? "on" : "off") + ", gpudirect_rabitq_cache=" +
-                 (rabitq_rdma_registered ? "on" : "off"));
-  }
 
   wait_for_load_or_store();
   synchronize_clients_after_startup();
@@ -164,7 +143,6 @@ ComputeService<Distance>::~ComputeService() {
   stop_workers();
   shutdown_remote_if_requested();
   for (auto& thread : compute_threads()) {
-    thread->gpu_vector_cache.destroy();
     thread->gpu_buffers.destroy();
   }
   gpu::gpu_shutdown();

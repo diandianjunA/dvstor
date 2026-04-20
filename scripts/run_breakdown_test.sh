@@ -3,7 +3,7 @@
 # DVSTOR Breakdown Benchmark Runner
 # =============================================================================
 # 运行 DVSTOR breakdown benchmark（配置驱动）。
-# 所有优化开关（如 gpudirect-rdma、gpu-cache、后续新增优化）都从 service-config 读取。
+# 所有优化开关（如 gpudirect-rdma、后续新增优化）都从 service-config 读取。
 # 默认执行 50% 读 / 50% 写 mixed 场景，并在结束后打印吞吐与延迟摘要。
 # 时间模式默认采用 drain 语义：到达截止时间后不再发新请求，并等待已启动请求完成；
 # 同时 benchmark 会根据已观测到的单次调用耗时，避免在窗口尾部再启动明显会拖很久的新调用。
@@ -13,7 +13,7 @@
 #   ./run_breakdown_test.sh [选项...]
 #
 # 选项:
-#   -c, --service-config <path>   Compute 侧配置文件（默认: test/config/local_same_host_5mn.ini）
+#   -c, --service-config <path>   Compute 侧配置文件（默认: test/config/remote_singe_cn.ini）
 #   -w, --workload <mode>         负载模式: mixed/query/insert/both（默认: mixed）
 #       --read-ratio <ratio>      mixed 模式下读比例（默认: 0.5）
 #       --client-threads <n>      前台压测线程数（默认: 4）
@@ -43,10 +43,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY="$PROJECT_DIR/build/dvstor_breakdown_benchmark"
 
-SERVICE_CONFIG="${SERVICE_CONFIG:-$PROJECT_DIR/test/config/local_same_host_5mn.ini}"
+SERVICE_CONFIG="${SERVICE_CONFIG:-$PROJECT_DIR/test/config/remote_singe_cn.ini}"
 WORKLOAD="${WORKLOAD:-mixed}"
 READ_RATIO="${READ_RATIO:-0.5}"
-CLIENT_THREADS="${CLIENT_THREADS:-4}"
+CLIENT_THREADS="${CLIENT_THREADS:-16}"
 WARMUP_SECONDS="${WARMUP_SECONDS:-30}"
 MEASURE_SECONDS="${MEASURE_SECONDS:-60}"
 WARMUP_OPS="${WARMUP_OPS:-}"
@@ -131,8 +131,33 @@ if [[ -n "$QUERY_FILE" ]]; then
     ARGS+=(--query-file "$QUERY_FILE")
 fi
 
+get_ini_value() {
+    local key="$1"
+    awk -F'=' -v k="$key" '
+        {
+            line=$0
+            sub(/[;#].*$/, "", line)
+            gsub(/^[ \t]+|[ \t]+$/, "", line)
+            if (line == "") next
+            split(line, kv, "=")
+            kk=kv[1]
+            vv=substr(line, index(line, "=")+1)
+            gsub(/^[ \t]+|[ \t]+$/, "", kk)
+            gsub(/^[ \t]+|[ \t]+$/, "", vv)
+            if (kk == k) val=vv
+        }
+        END { if (val != "") print val }
+    ' "$SERVICE_CONFIG"
+}
+
 echo "[DVSTOR Breakdown] 运行参数:"
 echo "  配置文件:       $SERVICE_CONFIG"
+echo "  search-mode:    $(get_ini_value search-mode || true)"
+echo "  load-index:     $(get_ini_value load-index || true)"
+echo "  index-prefix:   $(get_ini_value index-prefix || true)"
+echo "  gpudirect-rdma: $(get_ini_value gpudirect-rdma || true)"
+echo "  neighbor-cache: $(get_ini_value neighbor-cache-mb || true) MB"
+echo "  gpu-rabitq-cache: $(get_ini_value gpu-rabitq-cache-mb || true) MB"
 echo "  负载模式:       $WORKLOAD"
 echo "  读比例:         $READ_RATIO"
 echo "  前台线程数:     $CLIENT_THREADS"

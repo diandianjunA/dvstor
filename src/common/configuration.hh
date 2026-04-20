@@ -39,9 +39,9 @@ public:
   u32 k{};
   u32 gpu_device{};       // CUDA device ID
   bool gpudirect_rdma{};  // Enable GPUDirect RDMA (read vectors directly into GPU buffers)
+  u32 neighbor_cache_mb{0};
+  u32 gpu_rabitq_cache_mb{0};
   str search_mode{"exact_gpu"};
-  bool use_gpu_cache{};       // --gpu-cache: enable GPU-side vector cache
-  u32 gpu_cache_size_mb{0};   // --gpu-cache-size-mb: 0 = auto (50% free GPU mem)
   u32 insert_workers{};
   u32 query_workers{};
   u32 insert_coroutines{};
@@ -139,10 +139,10 @@ private:
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
-      "gpu-cache", po::bool_switch(&use_gpu_cache)->default_value(false),
-      "Enable GPU-side vector cache for beam search.")(
-      "gpu-cache-size-mb", po::value<u32>(&gpu_cache_size_mb)->default_value(0),
-      "GPU memory for vector cache in MB. 0 = auto (50% of free GPU memory).")(
+      "neighbor-cache-mb", po::value<u32>(&neighbor_cache_mb)->default_value(0),
+      "CPU neighbor-list cache size per compute node in MB. 0 disables it.")(
+      "gpu-rabitq-cache-mb", po::value<u32>(&gpu_rabitq_cache_mb)->default_value(0),
+      "GPU RaBitQ cache size per compute node in MB. 0 disables it.")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
       "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
@@ -246,11 +246,8 @@ public:
       os << std::setw(width) << "query coroutines: " << config.query_coroutines << std::endl;
       os << std::setw(width) << "GPU device: " << config.gpu_device << std::endl;
       os << std::setw(width) << "GPUDirect RDMA: " << (config.gpudirect_rdma ? "true" : "false") << std::endl;
-      os << std::setw(width) << "GPU cache: " << (config.use_gpu_cache ? "true" : "false") << std::endl;
-      if (config.use_gpu_cache) {
-        os << std::setw(width) << "GPU cache size (MB): "
-           << (config.gpu_cache_size_mb > 0 ? std::to_string(config.gpu_cache_size_mb) : "auto") << std::endl;
-      }
+      os << std::setw(width) << "neighbor cache (MB): " << config.neighbor_cache_mb << std::endl;
+      os << std::setw(width) << "GPU RaBitQ cache (MB): " << config.gpu_rabitq_cache_mb << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {
       os << std::left << std::setfill(' ');

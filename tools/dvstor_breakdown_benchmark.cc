@@ -118,7 +118,7 @@ std::vector<std::string> build_service_argv(const std::string& service_config_pa
   static const std::vector<std::string> multi_keys = {"servers", "clients"};
   static const std::vector<std::string> flag_keys = {
     "initiator", "cache", "routing", "load-index", "store-index", "disable-thread-pinning", "no-recall", "ip-dist",
-    "gpudirect-rdma", "gpu-cache"};
+    "gpudirect-rdma"};
 
   for (const auto& [key, value] : config) {
     const std::string option = "--" + key;

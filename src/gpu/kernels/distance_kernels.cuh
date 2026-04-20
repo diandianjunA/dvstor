@@ -11,6 +11,24 @@ namespace cg = cooperative_groups;
 
 namespace gpu_kernels {
 
+__global__ void gather_cached_rabitq_kernel(
+    const uint8_t* __restrict__ rabitq_base,
+    const uint32_t* __restrict__ slot_ids,
+    uint8_t* __restrict__ out,
+    uint32_t n_candidates,
+    uint32_t vec_stride)
+{
+    const uint32_t item = blockIdx.x;
+    if (item >= n_candidates) return;
+
+    const uint32_t slot = slot_ids[item];
+    const uint8_t* src = rabitq_base + static_cast<size_t>(slot) * vec_stride;
+    uint8_t* dst = out + static_cast<size_t>(item) * vec_stride;
+    for (uint32_t byte = threadIdx.x; byte < vec_stride; byte += blockDim.x) {
+        dst[byte] = src[byte];
+    }
+}
+
 // =============================================================================
 // Batch L2 Squared Distance Kernel
 // Adapted from Jasper's euclidean_distance_no_sqrt_chunked
@@ -61,55 +79,6 @@ __global__ void batch_l2_squared_distance_kernel(
         distances[tile_id] = total;
     }
 }
-
-template <uint32_t TILE_SIZE>
-__global__ void batch_indexed_l2_squared_distance_kernel(
-    const float* __restrict__ query,
-    const float* __restrict__ candidates_base,
-    const uint32_t* __restrict__ slot_indices,
-    float* __restrict__ distances,
-    uint32_t n_candidates,
-    uint32_t dim)
-{
-    auto block = cg::this_thread_block();
-    auto tile = cg::tiled_partition<TILE_SIZE>(block);
-
-    uint32_t tile_id = (blockIdx.x * blockDim.x + threadIdx.x) / TILE_SIZE;
-    if (tile_id >= n_candidates) return;
-
-    const uint32_t slot = slot_indices[tile_id];
-    const float* cand_vec = candidates_base + static_cast<size_t>(slot) * dim;
-
-    const uint4* q_ptr = reinterpret_cast<const uint4*>(query);
-    const uint4* c_ptr = reinterpret_cast<const uint4*>(cand_vec);
-    const uint32_t n_float_per_uint4 = 4;
-    const uint32_t n_uint4 = dim / n_float_per_uint4;
-
-    float local_sum = 0.0f;
-    for (uint32_t i = tile.thread_rank(); i < n_uint4; i += TILE_SIZE) {
-        uint4 q_data = q_ptr[i];
-        uint4 c_data = c_ptr[i];
-
-        float* q_f = reinterpret_cast<float*>(&q_data);
-        float* c_f = reinterpret_cast<float*>(&c_data);
-        for (int k = 0; k < 4; ++k) {
-            const float diff = q_f[k] - c_f[k];
-            local_sum += diff * diff;
-        }
-    }
-
-    uint32_t base = n_uint4 * n_float_per_uint4;
-    for (uint32_t i = base + tile.thread_rank(); i < dim; i += TILE_SIZE) {
-        const float diff = query[i] - cand_vec[i];
-        local_sum += diff * diff;
-    }
-
-    float total = cg::reduce(tile, local_sum, cg::plus<float>());
-    if (tile.thread_rank() == 0) {
-        distances[tile_id] = total;
-    }
-}
-
 
 // =============================================================================
 // RaBitQ Approximate Distance Kernel
@@ -168,11 +137,11 @@ __global__ void batch_rabitq_distance_kernel(
 }
 
 template <uint32_t TILE_SIZE, uint32_t BITS_PER_DIM>
-__global__ void batch_indexed_rabitq_distance_kernel(
+__global__ void batch_cached_rabitq_distance_kernel(
     const float* __restrict__ rot_query,
     const RabitqQueryFactor* __restrict__ qfactor,
     const uint8_t* __restrict__ rabitq_base,
-    const uint32_t* __restrict__ slot_indices,
+    const uint32_t* __restrict__ slot_ids,
     float* __restrict__ distances,
     uint32_t n_candidates,
     uint32_t dim,
@@ -184,7 +153,7 @@ __global__ void batch_indexed_rabitq_distance_kernel(
     uint32_t tile_id = (blockIdx.x * blockDim.x + threadIdx.x) / TILE_SIZE;
     if (tile_id >= n_candidates) return;
 
-    const uint32_t slot = slot_indices[tile_id];
+    const uint32_t slot = slot_ids[tile_id];
     const uint32_t packed_bytes = (BITS_PER_DIM * dim + 7) / 8;
     const uint8_t* vec_data = rabitq_base + static_cast<size_t>(slot) * vec_stride;
     float data_add = *reinterpret_cast<const float*>(vec_data + packed_bytes);
@@ -210,7 +179,6 @@ __global__ void batch_indexed_rabitq_distance_kernel(
         distances[tile_id] = data_add + qfactor->add + data_rescale * (dot + qfactor->k1xSumq * k1_factor);
     }
 }
-
 
 // Specialized 8-bit RaBitQ distance using char4 loads (from Jasper)
 template <uint32_t TILE_SIZE>
@@ -253,6 +221,48 @@ __global__ void batch_rabitq_8bit_distance_kernel(
         float dist = data_add + qfactor->add + data_rescale *
             (dot + qfactor->k1xSumq * static_cast<float>((1 << 8) - 1));
         distances[tile_id] = dist;
+    }
+}
+
+template <uint32_t TILE_SIZE>
+__global__ void batch_cached_rabitq_8bit_distance_kernel(
+    const float* __restrict__ rot_query,
+    const RabitqQueryFactor* __restrict__ qfactor,
+    const uint8_t* __restrict__ rabitq_base,
+    const uint32_t* __restrict__ slot_ids,
+    float* __restrict__ distances,
+    uint32_t n_candidates,
+    uint32_t dim,
+    uint32_t vec_stride)
+{
+    auto block = cg::this_thread_block();
+    auto tile = cg::tiled_partition<TILE_SIZE>(block);
+
+    uint32_t tile_id = (blockIdx.x * blockDim.x + threadIdx.x) / TILE_SIZE;
+    if (tile_id >= n_candidates) return;
+
+    const uint32_t slot = slot_ids[tile_id];
+    const uint8_t* vec_data = rabitq_base + static_cast<size_t>(slot) * vec_stride;
+    float data_add = *reinterpret_cast<const float*>(vec_data + dim);
+    float data_rescale = *reinterpret_cast<const float*>(vec_data + dim + sizeof(float));
+
+    const char4* data_ptr = reinterpret_cast<const char4*>(vec_data);
+    const float4* query_ptr = reinterpret_cast<const float4*>(rot_query);
+
+    float dot_tmp = 0.0f;
+    for (uint32_t i = tile.thread_rank(); i < dim / 4; i += TILE_SIZE) {
+        float4 q = query_ptr[i];
+        char4 d = data_ptr[i];
+        dot_tmp += static_cast<float>(static_cast<uint8_t>(d.x)) * q.x +
+                   static_cast<float>(static_cast<uint8_t>(d.y)) * q.y +
+                   static_cast<float>(static_cast<uint8_t>(d.z)) * q.z +
+                   static_cast<float>(static_cast<uint8_t>(d.w)) * q.w;
+    }
+
+    float dot = cg::reduce(tile, dot_tmp, cg::plus<float>());
+    if (tile.thread_rank() == 0) {
+        distances[tile_id] = data_add + qfactor->add + data_rescale *
+            (dot + qfactor->k1xSumq * static_cast<float>((1 << 8) - 1));
     }
 }
 

@@ -21,6 +21,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "gpu/gpu_rabitq_cache.hh"
+
 struct ibv_mr;
 struct ibv_pd;
 
@@ -45,6 +47,7 @@ struct CoroutineGpuState {
     float*    h_candidate_vecs{nullptr}; // [max_batch * dim] for prune
     float*    h_candidate_dists{nullptr};// [max_batch]
     uint32_t* h_candidate_order{nullptr};// [max_batch]
+    uint32_t* h_cache_slot_ids{nullptr}; // [max_batch], mapped pinned host memory
     float*    h_distances{nullptr};      // [max_batch]
     uint32_t* h_pruned_indices{nullptr}; // [R]
     uint32_t* h_pruned_count{nullptr};   // [1]
@@ -56,6 +59,7 @@ struct CoroutineGpuState {
     float*    d_candidate_vecs{nullptr};
     float*    d_candidate_dists{nullptr};
     uint32_t* d_candidate_order{nullptr};
+    uint32_t* d_cache_slot_ids{nullptr}; // device alias of h_cache_slot_ids
     float*    d_distances{nullptr};
     uint32_t* d_pruned_indices{nullptr};
     uint32_t* d_pruned_count{nullptr};
@@ -93,7 +97,8 @@ public:
     void init(uint32_t num_coroutines, uint32_t dim, uint32_t max_batch,
               uint32_t max_R, uint32_t rabitq_bits,
               ibv_pd* rdma_pd = nullptr,
-              bool enable_gpudirect_rdma = false);
+              bool enable_gpudirect_rdma = false,
+              size_t gpu_rabitq_cache_bytes = 0);
 
     /**
      * Release all GPU resources.
@@ -148,6 +153,8 @@ public:
     bool rabitq_ready() const { return rabitq_ready_; }
     bool gpudirect_candidate_ready() const { return gpudirect_candidate_ready_; }
     bool gpudirect_rabitq_ready() const { return gpudirect_rabitq_ready_; }
+    GpuRabitqCache& rabitq_cache() { return rabitq_cache_; }
+    const GpuRabitqCache& rabitq_cache() const { return rabitq_cache_; }
 
 private:
     CoroutineGpuState* states_{nullptr};
@@ -167,6 +174,7 @@ private:
     bool gpudirect_rdma_enabled_{false};
     bool gpudirect_candidate_ready_{false};
     bool gpudirect_rabitq_ready_{false};
+    GpuRabitqCache rabitq_cache_;
 
     bool initialized_{false};
 };

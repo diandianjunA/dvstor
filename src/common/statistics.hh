@@ -85,33 +85,8 @@ struct CNStatistics {
   size_t query_rabitq_kernels{};
   size_t query_exact_reranks{};
 
-  size_t query_cache_hits{};
-  size_t query_cache_misses{};
-
-  size_t gpu_cache_vec_hits{};
-  size_t gpu_cache_vec_misses{};
-  size_t gpu_cache_rabitq_hits{};
-  size_t gpu_cache_rabitq_misses{};
-
-  size_t gpu_cache_vec_all_hit_batches{};
-  size_t gpu_cache_vec_mixed_batches{};
-  size_t gpu_cache_vec_all_miss_batches{};
-  size_t gpu_cache_rabitq_all_hit_batches{};
-  size_t gpu_cache_rabitq_mixed_batches{};
-  size_t gpu_cache_rabitq_all_miss_batches{};
-
-  size_t gpu_cache_vec_hit_items{};
-  size_t gpu_cache_vec_miss_to_cache_items{};
-  size_t gpu_cache_vec_miss_to_staging_items{};
-  size_t gpu_cache_rabitq_hit_items{};
-  size_t gpu_cache_rabitq_miss_to_cache_items{};
-  size_t gpu_cache_rabitq_miss_to_staging_items{};
-
-  size_t query_rdma_to_cache_bytes{};
   size_t query_rdma_to_staging_bytes{};
   size_t query_host_staging_fallback_bytes{};
-  size_t query_cache_insert_d2d_bytes{};
-  size_t query_cache_gather_d2d_bytes{};
 
   size_t query_visited_nodes{};
   size_t query_visited_nodes_l0{};
@@ -161,29 +136,8 @@ struct CNStatistics {
     query_d2h_bytes += other.query_d2h_bytes;
     query_rabitq_kernels += other.query_rabitq_kernels;
     query_exact_reranks += other.query_exact_reranks;
-    query_cache_hits += other.query_cache_hits;
-    query_cache_misses += other.query_cache_misses;
-    gpu_cache_vec_hits += other.gpu_cache_vec_hits;
-    gpu_cache_vec_misses += other.gpu_cache_vec_misses;
-    gpu_cache_rabitq_hits += other.gpu_cache_rabitq_hits;
-    gpu_cache_rabitq_misses += other.gpu_cache_rabitq_misses;
-    gpu_cache_vec_all_hit_batches += other.gpu_cache_vec_all_hit_batches;
-    gpu_cache_vec_mixed_batches += other.gpu_cache_vec_mixed_batches;
-    gpu_cache_vec_all_miss_batches += other.gpu_cache_vec_all_miss_batches;
-    gpu_cache_rabitq_all_hit_batches += other.gpu_cache_rabitq_all_hit_batches;
-    gpu_cache_rabitq_mixed_batches += other.gpu_cache_rabitq_mixed_batches;
-    gpu_cache_rabitq_all_miss_batches += other.gpu_cache_rabitq_all_miss_batches;
-    gpu_cache_vec_hit_items += other.gpu_cache_vec_hit_items;
-    gpu_cache_vec_miss_to_cache_items += other.gpu_cache_vec_miss_to_cache_items;
-    gpu_cache_vec_miss_to_staging_items += other.gpu_cache_vec_miss_to_staging_items;
-    gpu_cache_rabitq_hit_items += other.gpu_cache_rabitq_hit_items;
-    gpu_cache_rabitq_miss_to_cache_items += other.gpu_cache_rabitq_miss_to_cache_items;
-    gpu_cache_rabitq_miss_to_staging_items += other.gpu_cache_rabitq_miss_to_staging_items;
-    query_rdma_to_cache_bytes += other.query_rdma_to_cache_bytes;
     query_rdma_to_staging_bytes += other.query_rdma_to_staging_bytes;
     query_host_staging_fallback_bytes += other.query_host_staging_fallback_bytes;
-    query_cache_insert_d2d_bytes += other.query_cache_insert_d2d_bytes;
-    query_cache_gather_d2d_bytes += other.query_cache_gather_d2d_bytes;
     query_visited_nodes += other.query_visited_nodes;
     query_visited_nodes_l0 += other.query_visited_nodes_l0;
     query_visited_neighborlists += other.query_visited_neighborlists;
@@ -192,7 +146,6 @@ struct CNStatistics {
   void convert(Statistics& statistics) const {
     const str build_group = "build";
     const str query_group = "queries";
-    const str cache_group = "cache";
 
     statistics.add_nested_static_stat(build_group, "dist_comps", build_distcomps);
     statistics.add_nested_static_stat(build_group, "rdma_reads_in_bytes", build_rdma_reads);
@@ -227,30 +180,6 @@ struct CNStatistics {
     statistics.add_nested_static_stat(query_group, "visited_neighborlists", query_visited_neighborlists);
     statistics.add_nested_static_stat(query_group, "processed", processed_queries);
     statistics.add_nested_static_stat(query_group, "queue_wait_ns", query_queue_wait_ns);
-
-    statistics.add_nested_static_stat(cache_group, "hits_total", query_cache_hits);
-    statistics.add_nested_static_stat(cache_group, "misses_total", query_cache_misses);
-    statistics.add_nested_static_stat(cache_group, "gpu_vec_hits", gpu_cache_vec_hits);
-    statistics.add_nested_static_stat(cache_group, "gpu_vec_misses", gpu_cache_vec_misses);
-    statistics.add_nested_static_stat(cache_group, "gpu_rabitq_hits", gpu_cache_rabitq_hits);
-    statistics.add_nested_static_stat(cache_group, "gpu_rabitq_misses", gpu_cache_rabitq_misses);
-    statistics.add_nested_static_stat(cache_group, "gpu_vec_all_hit_batches", gpu_cache_vec_all_hit_batches);
-    statistics.add_nested_static_stat(cache_group, "gpu_vec_mixed_batches", gpu_cache_vec_mixed_batches);
-    statistics.add_nested_static_stat(cache_group, "gpu_vec_all_miss_batches", gpu_cache_vec_all_miss_batches);
-    statistics.add_nested_static_stat(cache_group, "gpu_rabitq_all_hit_batches", gpu_cache_rabitq_all_hit_batches);
-    statistics.add_nested_static_stat(cache_group, "gpu_rabitq_mixed_batches", gpu_cache_rabitq_mixed_batches);
-    statistics.add_nested_static_stat(cache_group, "gpu_rabitq_all_miss_batches", gpu_cache_rabitq_all_miss_batches);
-    statistics.add_nested_static_stat(cache_group, "gpu_vec_hit_items", gpu_cache_vec_hit_items);
-    statistics.add_nested_static_stat(cache_group, "gpu_vec_miss_to_cache_items", gpu_cache_vec_miss_to_cache_items);
-    statistics.add_nested_static_stat(cache_group, "gpu_vec_miss_to_staging_items", gpu_cache_vec_miss_to_staging_items);
-    statistics.add_nested_static_stat(cache_group, "gpu_rabitq_hit_items", gpu_cache_rabitq_hit_items);
-    statistics.add_nested_static_stat(cache_group, "gpu_rabitq_miss_to_cache_items", gpu_cache_rabitq_miss_to_cache_items);
-    statistics.add_nested_static_stat(cache_group, "gpu_rabitq_miss_to_staging_items", gpu_cache_rabitq_miss_to_staging_items);
-    statistics.add_nested_static_stat(cache_group, "query_rdma_to_cache_bytes", query_rdma_to_cache_bytes);
-    statistics.add_nested_static_stat(cache_group, "query_rdma_to_staging_bytes", query_rdma_to_staging_bytes);
-    statistics.add_nested_static_stat(cache_group, "query_host_staging_fallback_bytes", query_host_staging_fallback_bytes);
-    statistics.add_nested_static_stat(cache_group, "query_cache_insert_d2d_bytes", query_cache_insert_d2d_bytes);
-    statistics.add_nested_static_stat(cache_group, "query_cache_gather_d2d_bytes", query_cache_gather_d2d_bytes);
 
     statistics.add_static_stat("actual_total_local_buffer_size", local_allocation_size);
   }
@@ -296,30 +225,16 @@ struct ThreadStatistics {
   size_t cache_hits{0};
   size_t cache_misses{0};
 
-  size_t gpu_cache_vec_hits{0};
-  size_t gpu_cache_vec_misses{0};
-  size_t gpu_cache_rabitq_hits{0};
-  size_t gpu_cache_rabitq_misses{0};
-
-  size_t gpu_cache_vec_all_hit_batches{0};
-  size_t gpu_cache_vec_mixed_batches{0};
-  size_t gpu_cache_vec_all_miss_batches{0};
-  size_t gpu_cache_rabitq_all_hit_batches{0};
-  size_t gpu_cache_rabitq_mixed_batches{0};
-  size_t gpu_cache_rabitq_all_miss_batches{0};
-
-  size_t gpu_cache_vec_hit_items{0};
-  size_t gpu_cache_vec_miss_to_cache_items{0};
-  size_t gpu_cache_vec_miss_to_staging_items{0};
-  size_t gpu_cache_rabitq_hit_items{0};
-  size_t gpu_cache_rabitq_miss_to_cache_items{0};
-  size_t gpu_cache_rabitq_miss_to_staging_items{0};
-
-  size_t query_rdma_to_cache_bytes{0};
   size_t query_rdma_to_staging_bytes{0};
   size_t query_host_staging_fallback_bytes{0};
-  size_t query_cache_insert_d2d_bytes{0};
-  size_t query_cache_gather_d2d_bytes{0};
+  size_t neighbor_cache_hits{0};
+  size_t neighbor_cache_misses{0};
+  size_t gpu_rabitq_cache_hits{0};
+  size_t gpu_rabitq_cache_misses{0};
+  size_t gpu_rabitq_cache_fills{0};
+  size_t gpu_rabitq_cache_fill_bytes{0};
+  size_t gpu_rabitq_cache_duplicate_fills{0};
+  size_t gpu_rabitq_cache_fallback_batches{0};
 
   void inc_visited_nodes(u32 level) {
     if (level > 0) {

@@ -1,0 +1,16 @@
+insert breakdown
+  count: 5236
+  latency_ms: mean=91.51 p50=85.5405 p95=126.19 p99=145.804
+  top_categories:
+    gpu_ns: 334250 ms (69.7628%)
+    rdma_ns: 73202 ms (15.2783%)
+    transfer_ns: 58908.2 ms (12.295%)
+    cpu_ns: 12763.8 ms (2.66398%)
+query breakdown
+  count: 26305
+  latency_ms: mean=18.1811 p50=16.9184 p95=27.717 p99=34.3709
+  top_categories:
+    gpu_ns: 233255 ms (48.7824%)
+    transfer_ns: 97749.3 ms (20.4431%)
+    rdma_ns: 94680 ms (19.8012%)
+    cpu_ns: 52469.4 ms (10.9733%)
