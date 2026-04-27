@@ -1152,3 +1152,156 @@ pairing: 1131 -- 1129
 allocated ALIGNED MEM (no hugepage) at 104955584693824 with buffer size 128
 [STATUS]: storage-owner insert runtime enabled on shard 0
 Receive request failed: status=1 (local length error), opcode=0, vendor_err=215, wr_id=0
+[ERROR]: option '--insert-execution' cannot be specified more than once
+Try /home/xjs/experiment/dvstor/build/dvstor_memory_node --help
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1234
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 1136 -- 1135
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 140499180585024 with buffer size 53687091200
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 1141 -- 1140
+pairing: 1149 -- 1145
+pairing: 1153 -- 1150
+pairing: 1156 -- 1155
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node1_of5.dat
+allocated ALIGNED MEM (no hugepage) at 94663844105280 with buffer size 4224
+[STATUS]: storage-owner insert runtime enabled on shard 0
+storage peer context is not initialized
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1234
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 1161 -- 1160
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 131953206493248 with buffer size 53687091200
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 1166 -- 1165
+pairing: 1172 -- 1170
+pairing: 1177 -- 1175
+pairing: 1181 -- 1180
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node1_of5.dat
+allocated ALIGNED MEM (no hugepage) at 102224451554368 with buffer size 4224
+[STATUS]: storage-owner insert runtime enabled on shard 0
+storage peer context is not initialized
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1234
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 1186 -- 1185
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 124677456396352 with buffer size 53687091200
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 1191 -- 1190
+pairing: 1197 -- 1195
+pairing: 1202 -- 1200
+pairing: 1206 -- 1205
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node1_of5.dat
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 1211 -- 1213
+pairing: 1216 -- 1212
+pairing: 1219 -- 1214
+pairing: 1221 -- 1215
+allocated ALIGNED MEM (no hugepage) at 124677378801728 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 99619755481408 with buffer size 4224
+[STATUS]: storage-owner insert runtime enabled on shard 0
+Send request failed: status=10 (remote access error), opcode=0, vendor_err=136, wr_id=0
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1234
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/1024dim50M_node1_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 1231 -- 1210
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 134328772198464 with buffer size 53687091200
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node1_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 1237 -- 1215
+pairing: 1242 -- 1220
+pairing: 1247 -- 1225
+pairing: 1252 -- 1230
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node1_of5.dat
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 1256 -- 1258
+pairing: 1261 -- 1259
+pairing: 1264 -- 1257
+pairing: 1265 -- 1260
+allocated ALIGNED MEM (no hugepage) at 134328694603840 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 100019622381312 with buffer size 4224
+[STATUS]: storage-owner insert runtime enabled on shard 0
+Send request failed: status=10 (remote access error), opcode=0, vendor_err=136, wr_id=0

@@ -30,3 +30,152 @@ pairing: 1135 -- 1132
 [STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node4_of5.dat
 allocated ALIGNED MEM (no hugepage) at 100050820576832 with buffer size 128
 [STATUS]: storage-owner insert runtime enabled on shard 3
+[ERROR]: option '--insert-execution' cannot be specified more than once
+Try /home/xjs/experiment/dvstor/build/dvstor_memory_node --help
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1237
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 1139 -- 1138
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 124879993045056 with buffer size 53687091200
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 1145 -- 1143
+pairing: 1147 -- 1148
+pairing: 1152 -- 1153
+pairing: 1159 -- 1158
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node4_of5.dat
+allocated ALIGNED MEM (no hugepage) at 95745762053184 with buffer size 4224
+[STATUS]: storage-owner insert runtime enabled on shard 3
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1237
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 1164 -- 1163
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 135506696339520 with buffer size 53687091200
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 1169 -- 1168
+pairing: 1174 -- 1173
+pairing: 1179 -- 1178
+pairing: 1184 -- 1183
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node4_of5.dat
+allocated ALIGNED MEM (no hugepage) at 99048076143680 with buffer size 4224
+[STATUS]: storage-owner insert runtime enabled on shard 3
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1237
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 1189 -- 1188
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 130830512947264 with buffer size 53687091200
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 1194 -- 1193
+pairing: 1199 -- 1198
+pairing: 1205 -- 1203
+pairing: 1209 -- 1208
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node4_of5.dat
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 1214 -- 1219
+pairing: 1220 -- 1225
+pairing: 1229 -- 1227
+pairing: 1230 -- 1228
+allocated ALIGNED MEM (no hugepage) at 130830435352640 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 106198784571712 with buffer size 4224
+[STATUS]: storage-owner insert runtime enabled on shard 3
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1237
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/1024dim50M_node4_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 1234 -- 1213
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 140413283336256 with buffer size 53687091200
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node4_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 1239 -- 1218
+pairing: 1244 -- 1223
+pairing: 1248 -- 1228
+pairing: 1254 -- 1233
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node4_of5.dat
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 1259 -- 1261
+pairing: 1263 -- 1262
+pairing: 1268 -- 1271
+pairing: 1273 -- 1275
+allocated ALIGNED MEM (no hugepage) at 140413205741632 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 98755456608000 with buffer size 4224
+[STATUS]: storage-owner insert runtime enabled on shard 3
