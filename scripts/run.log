@@ -16,8 +16,8 @@ nohup: ignoring input
   测量时长:       60s
   操作粒度:       single_vector
   Query 文件:     synthetic
-  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260427_211421.json
-  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260427_211421.txt
+  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260427_211909.json
+  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260427_211909.txt
 
 ============================================================
                         CLIENT
@@ -71,3 +71,136 @@ interleaved policy
 client id: 0
 number of clients: 1
 connect to server 192.168.6.202:1234
+pairing: 1135 -- 1136
+connect to server 192.168.6.202:1235
+pairing: 1136 -- 1137
+connect to server 192.168.6.202:1236
+pairing: 1137 -- 1138
+connect to server 192.168.6.202:1237
+pairing: 1138 -- 1139
+connect to server 192.168.6.202:1238
+pairing: 1139 -- 1140
+[STATUS]: pinned main thread to core 28
+[STATUS]: receive access tokens of remote memory regions
+[STATUS]: search mode: rabitq_gpu, cache=on
+[STATUS]: max cache size: 12859999846
+allocated ALIGNED MEM (no hugepage) at 140163674009664 with buffer size 53687091200
+num cache buckets: 2499999
+allocate cache entries hugepage of size 99999960
+allocated ALIGNED MEM (no hugepage) at 140163574005824 with buffer size 99999960
+1 device(s) found
+Selected device: mlx5_0
+Selected port state: 4, lid: 1
+pairing: 1140 -- 1141
+pairing: 1141 -- 1143
+pairing: 1142 -- 1144
+pairing: 1143 -- 1145
+pairing: 1144 -- 1142
+1 device(s) found
+Selected device: mlx5_0
+Selected port state: 4, lid: 1
+pairing: 1145 -- 1149
+pairing: 1146 -- 1146
+pairing: 1147 -- 1148
+pairing: 1148 -- 1147
+pairing: 1149 -- 1150
+1 device(s) found
+Selected device: mlx5_0
+Selected port state: 4, lid: 1
+pairing: 1150 -- 1153
+pairing: 1151 -- 1151
+pairing: 1152 -- 1155
+pairing: 1153 -- 1152
+pairing: 1154 -- 1154
+1 device(s) found
+Selected device: mlx5_0
+Selected port state: 4, lid: 1
+pairing: 1155 -- 1156
+pairing: 1156 -- 1158
+pairing: 1157 -- 1157
+pairing: 1158 -- 1159
+pairing: 1159 -- 1160
+[STATUS]: neighbor cache worker 0: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 1: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 2: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 3: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 4: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 5: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 6: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 7: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 8: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 9: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 10: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 11: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 12: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 13: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 14: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 15: slots=64403
+[GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: loaded RaBitQ artifacts from /data/xjs/index/shine_gpu_index/1024dim50M (dim=1024, bits=4)
+[STATUS]: starting 16 service worker threads (Vamana)
+[STATUS]: worker split: inserts=0, queries=16 | coroutines: insert=0, query=4
+[STATUS]: pinned worker 0 to core 0
+[STATUS]: pinned worker 1 to core 29
+[STATUS]: pinned worker 2 to core 1
+[STATUS]: pinned worker 3 to core 30
+[STATUS]: pinned worker 4 to core 2
+[STATUS]: pinned worker 5 to core 31
+[STATUS]: pinned worker 6 to core 3
+[STATUS]: pinned worker 7 to core 32
+[STATUS]: pinned worker 8 to core 4
+[STATUS]: pinned worker 9 to core 33
+[STATUS]: pinned worker 10 to core 5
+[STATUS]: pinned worker 11 to core 34
+[STATUS]: pinned worker 12 to core 6
+[STATUS]: pinned worker 13 to core 35
+[STATUS]: pinned worker 14 to core 7
+[STATUS]: pinned worker 15 to core 36
+[breakdown] preparing workload: bootstrap_count=4096, workload=mixed
+[breakdown] bootstrap vectors ready
+[breakdown] query data ready: count=65536
+[breakdown] effective insert start id=50010000
+[breakdown] starting warmup mixed
+[breakdown][warmup-mixed] progress elapsed=5.02095s/30s, completed=1278 ops, rate=254.533 ops/s
+Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=1
+Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=12884901889
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=1
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=12884901890
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=12884901889
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=12884901889
+Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=12884901890
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=1
+free(): corrupted unsorted chunks
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=8589934592
+./run_breakdown_test.sh: line 206: 1441353 Aborted                 (core dumped) "$BINARY" "${ARGS[@]}"
