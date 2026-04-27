@@ -128,7 +128,7 @@ std::vector<std::string> build_service_argv(const std::string& service_config_pa
   std::vector<std::string> args;
   args.emplace_back("dvstor_breakdown_benchmark");
 
-  static const std::vector<std::string> multi_keys = {"servers", "clients"};
+  static const std::vector<std::string> multi_keys = {"servers", "clients", "storage-peers"};
   static const std::vector<std::string> flag_keys = {
     "initiator", "cache", "routing", "load-index", "store-index", "disable-thread-pinning", "no-recall", "ip-dist",
     "gpudirect-rdma"};

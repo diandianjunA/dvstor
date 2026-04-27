@@ -1,6 +1,6 @@
 nohup: ignoring input
 [DVSTOR Breakdown] 运行参数:
-  配置文件:       /home/xjs/experiment/dvstor/test/config/test/gpucache.ini
+  配置文件:       /home/xjs/experiment/dvstor/test/config/test/storage_owner_gpucache.ini
   search-mode:    rabitq_gpu
   load-index:     true
   index-prefix:   /data/xjs/index/shine_gpu_index/1024dim50M
@@ -16,8 +16,8 @@ nohup: ignoring input
   测量时长:       60s
   操作粒度:       single_vector
   Query 文件:     synthetic
-  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260427_162926.json
-  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260427_162926.txt
+  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260427_175347.json
+  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260427_175347.txt
 
 ============================================================
                         CLIENT
@@ -47,11 +47,14 @@ R (max degree):               64
 beam width (search):          32
 beam width (construction):    400
 alpha:                        1.2
+insert execution:             storage_owner
+storage id:                   0
+storage peers:                [192.168.6.202:2234, 192.168.6.202:2235, 192.168.6.202:2236, 192.168.6.202:2237, 192.168.6.202:2238, ]
 RaBitQ bits:                  4
 search mode:                  rabitq_gpu
-insert workers:               8
-query workers:                8
-insert coroutines:            16
+insert workers:               0
+query workers:                16
+insert coroutines:            0
 query coroutines:             4
 GPU device:                   0
 GPUDirect RDMA:               true
@@ -68,90 +71,106 @@ interleaved policy
 client id: 0
 number of clients: 1
 connect to server 192.168.6.202:1234
-pairing: 1084 -- 1086
+pairing: 1109 -- 1111
 connect to server 192.168.6.202:1235
-pairing: 1085 -- 1087
+pairing: 1110 -- 1112
 connect to server 192.168.6.202:1236
-pairing: 1086 -- 1088
+pairing: 1111 -- 1113
 connect to server 192.168.6.202:1237
-pairing: 1087 -- 1089
+pairing: 1112 -- 1114
 connect to server 192.168.6.202:1238
-pairing: 1088 -- 1090
+pairing: 1113 -- 1115
 [STATUS]: pinned main thread to core 28
 [STATUS]: receive access tokens of remote memory regions
 [STATUS]: search mode: rabitq_gpu, cache=on
 [STATUS]: max cache size: 12859999846
-allocated ALIGNED MEM (no hugepage) at 140516733743168 with buffer size 53687091200
+allocated ALIGNED MEM (no hugepage) at 139632104697920 with buffer size 53687091200
 num cache buckets: 2499999
 allocate cache entries hugepage of size 99999960
-allocated ALIGNED MEM (no hugepage) at 140516573737024 with buffer size 99999960
+allocated ALIGNED MEM (no hugepage) at 139631944691776 with buffer size 99999960
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1089 -- 1091
-pairing: 1090 -- 1092
-pairing: 1091 -- 1093
-pairing: 1092 -- 1095
-pairing: 1093 -- 1094
+pairing: 1114 -- 1116
+pairing: 1115 -- 1117
+pairing: 1116 -- 1120
+pairing: 1117 -- 1118
+pairing: 1118 -- 1119
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1094 -- 1097
-pairing: 1095 -- 1096
-pairing: 1096 -- 1099
-pairing: 1097 -- 1098
-pairing: 1098 -- 1100
+pairing: 1119 -- 1123
+pairing: 1120 -- 1121
+pairing: 1121 -- 1122
+pairing: 1122 -- 1124
+pairing: 1123 -- 1125
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1099 -- 1102
-pairing: 1100 -- 1103
-pairing: 1101 -- 1101
-pairing: 1102 -- 1104
-pairing: 1103 -- 1105
+pairing: 1124 -- 1126
+pairing: 1125 -- 1127
+pairing: 1126 -- 1128
+pairing: 1127 -- 1129
+pairing: 1128 -- 1130
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1104 -- 1106
-pairing: 1105 -- 1107
-pairing: 1106 -- 1109
-pairing: 1107 -- 1108
-pairing: 1108 -- 1110
+pairing: 1129 -- 1131
+pairing: 1130 -- 1133
+pairing: 1131 -- 1132
+pairing: 1132 -- 1135
+pairing: 1133 -- 1134
+[STATUS]: neighbor cache worker 0: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 1: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 2: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 3: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 4: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 5: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 6: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 7: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
-[STATUS]: neighbor cache worker 8: slots=128807
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 8: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
-[GPU RaBitQ cache] enabled: slots=4129776 stride=520 bytes=2147483520
-[STATUS]: neighbor cache worker 9: slots=128807
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 9: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
-[GPU RaBitQ cache] enabled: slots=4129776 stride=520 bytes=2147483520
-[STATUS]: neighbor cache worker 10: slots=128807
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 10: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
-[GPU RaBitQ cache] enabled: slots=4129776 stride=520 bytes=2147483520
-[STATUS]: neighbor cache worker 11: slots=128807
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 11: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
-[GPU RaBitQ cache] enabled: slots=4129776 stride=520 bytes=2147483520
-[STATUS]: neighbor cache worker 12: slots=128807
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 12: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
-[GPU RaBitQ cache] enabled: slots=4129776 stride=520 bytes=2147483520
-[STATUS]: neighbor cache worker 13: slots=128807
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 13: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
-[GPU RaBitQ cache] enabled: slots=4129776 stride=520 bytes=2147483520
-[STATUS]: neighbor cache worker 14: slots=128807
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 14: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
-[GPU RaBitQ cache] enabled: slots=4129776 stride=520 bytes=2147483520
-[STATUS]: neighbor cache worker 15: slots=128807
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
+[STATUS]: neighbor cache worker 15: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
-[GPU RaBitQ cache] enabled: slots=4129776 stride=520 bytes=2147483520
+[GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
 [STATUS]: loaded RaBitQ artifacts from /data/xjs/index/shine_gpu_index/1024dim50M (dim=1024, bits=4)
 [STATUS]: starting 16 service worker threads (Vamana)
-[STATUS]: worker split: inserts=8, queries=8 | coroutines: insert=16, query=4
+[STATUS]: worker split: inserts=0, queries=16 | coroutines: insert=0, query=4
 [STATUS]: pinned worker 0 to core 0
 [STATUS]: pinned worker 1 to core 29
 [STATUS]: pinned worker 2 to core 1
@@ -173,68 +192,6 @@ pairing: 1108 -- 1110
 [breakdown] query data ready: count=65536
 [breakdown] effective insert start id=50010000
 [breakdown] starting warmup mixed
-[breakdown][warmup-mixed] progress elapsed=5.01457s/30s, completed=1957 ops, rate=390.263 ops/s
-[breakdown][warmup-mixed] progress elapsed=10.0147s/30s, completed=4143 ops, rate=413.691 ops/s
-[breakdown][warmup-mixed] progress elapsed=15.0148s/30s, completed=6413 ops, rate=427.111 ops/s
-[breakdown][warmup-mixed] progress elapsed=20.015s/30s, completed=8659 ops, rate=432.626 ops/s
-[breakdown][warmup-mixed] progress elapsed=25.0151s/30s, completed=10909 ops, rate=436.097 ops/s
-[breakdown][warmup-mixed] progress elapsed=30.0152s/30s, completed=13163 ops, rate=438.544 ops/s
-[breakdown][warmup-mixed] done elapsed=30.0153s/30s, completed=13163 ops, avg_rate=438.543 ops/s
-[breakdown] starting measure phase
-[breakdown][measure-mixed] progress elapsed=5.00907s/60s, completed=2257 ops, rate=450.583 ops/s
-[breakdown][measure-mixed] progress elapsed=10.0092s/60s, completed=4540 ops, rate=453.583 ops/s
-[breakdown][measure-mixed] progress elapsed=15.0093s/60s, completed=6795 ops, rate=452.718 ops/s
-[breakdown][measure-mixed] progress elapsed=20.0095s/60s, completed=9030 ops, rate=451.287 ops/s
-[breakdown][measure-mixed] progress elapsed=25.0096s/60s, completed=11283 ops, rate=451.147 ops/s
-[breakdown][measure-mixed] progress elapsed=30.0097s/60s, completed=13513 ops, rate=450.287 ops/s
-[breakdown][measure-mixed] progress elapsed=35.0099s/60s, completed=15746 ops, rate=449.759 ops/s
-[breakdown][measure-mixed] progress elapsed=40.01s/60s, completed=17961 ops, rate=448.913 ops/s
-[breakdown][measure-mixed] progress elapsed=45.0101s/60s, completed=20153 ops, rate=447.744 ops/s
-[breakdown][measure-mixed] progress elapsed=50.0103s/60s, completed=22336 ops, rate=446.628 ops/s
-[breakdown][measure-mixed] progress elapsed=55.0104s/60s, completed=24503 ops, rate=445.425 ops/s
-[breakdown][measure-mixed] progress elapsed=60.0105s/60s, completed=26680 ops, rate=444.589 ops/s
-[breakdown][measure-mixed] done elapsed=60.0106s/60s, completed=26680 ops, avg_rate=444.588 ops/s
-[breakdown][measure-mixed] reads issued/completed=25014/25014, writes issued/completed=1666/1666
-throughput
-  duration_seconds: 60
-  total_ops_per_sec: 444.667 (ops=26680)
-  query_ops_per_sec: 416.9 (ops=25014)
-  insert_ops_per_sec: 27.7667 (ops=1666)
-insert breakdown
-  count: 1666
-  latency_ms: mean=287.121 p50=300.742 p95=405.246 p99=469.992
-  top_categories:
-    gpu_ns: 393950 ms (82.3579%)
-    rdma_ns: 40946.8 ms (8.56021%)
-    transfer_ns: 36915 ms (7.71733%)
-    cpu_ns: 6527.12 ms (1.36454%)
-query breakdown
-  count: 25014
-  latency_ms: mean=19.1138 p50=17.2826 p95=31.2849 p99=39.9504
-  top_categories:
-    gpu_ns: 289102 ms (60.4739%)
-    transfer_ns: 122204 ms (25.5625%)
-    cpu_ns: 40543.5 ms (8.48083%)
-    rdma_ns: 26211.2 ms (5.48282%)
-cache histogram
-  size: 0 | freq: 2445812
-  size: 1 | freq: 53614
-  size: 2 | freq: 573
-total entries: 54760
-cooling table histogram
-  size: 0 | freq: 41667
-  size: 1 | freq: 0
-  size: 2 | freq: 0
-  size: 3 | freq: 0
-  size: 4 | freq: 0
-  size: 5 | freq: 0
-  size: 6 | freq: 0
-CT total entries: 0
-
-[DVSTOR Breakdown] 关键指标
-  throughput: 444.67 ops/s (total=26680, duration=60s)
-  query throughput: 416.90 ops/s (count=25014)
-  insert throughput: 27.77 ops/s (count=1666)
-  mixed completed: reads=25014, writes=1666
-  query latency(ms): mean=19.1138, p95=31.2849, p99=39.9504
-  insert latency(ms): mean=287.1205, p95=405.2459, p99=469.9922
+Send request failed: status=9 (remote invalid request error), opcode=0, vendor_err=138, wr_id=0
+realloc(): invalid old size
+./run_breakdown_test.sh: line 206: 1337950 Aborted                 (core dumped) "$BINARY" "${ARGS[@]}"
