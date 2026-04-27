@@ -175,3 +175,51 @@ pairing: 1405 -- 1404
 allocated ALIGNED MEM (no hugepage) at 124528678142016 with buffer size 67108864
 allocated ALIGNED MEM (no hugepage) at 104324243957504 with buffer size 4224
 [STATUS]: storage-owner insert runtime enabled on shard 1
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1235
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/1024dim50M_node2_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 1412 -- 1311
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 127540651884608 with buffer size 53687091200
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node2_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 1417 -- 1316
+pairing: 1421 -- 1321
+pairing: 1427 -- 1326
+pairing: 1432 -- 1331
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node2_of5.dat
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 1437 -- 1436
+pairing: 1439 -- 1443
+pairing: 1444 -- 1447
+pairing: 1449 -- 1450
+[storage-peer][token] self_shard=1 local_base=127540651884608 local_rkey=1582080 local_bytes=53687091200
+[storage-peer][token] self_shard=1 peer_shard=0 remote_base=135157711372352 remote_rkey=1581312
+[storage-peer][token] self_shard=1 peer_shard=2 remote_base=137670189645888 remote_rkey=1581056
+[storage-peer][token] self_shard=1 peer_shard=3 remote_base=135407668822080 remote_rkey=1582566
+[storage-peer][token] self_shard=1 peer_shard=4 remote_base=137666389606464 remote_rkey=1582592
+allocated ALIGNED MEM (no hugepage) at 127540574289984 with buffer size 67108864
+[storage-peer][read] self_shard=1 target_shard=0 remote_base=135157711372352 rkey=1581312 offset=0 bytes=16
+Send request failed: status=5 (Work Request Flushed Error), opcode=0, vendor_err=244, wr_id=0
