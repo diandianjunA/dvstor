@@ -29,7 +29,6 @@ if [[ "$ENABLE_STORAGE_OWNER" == "1" ]]; then
   # shellcheck disable=SC2206
   STORAGE_PEER_ARGS=( $STORAGE_PEERS )
   ARGS+=(
-    --insert-execution storage_owner
     --storage-id "$STORAGE_ID"
     --storage-peers "${STORAGE_PEER_ARGS[@]}"
     --dim "$DIM"
