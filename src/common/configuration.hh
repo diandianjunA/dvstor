@@ -49,6 +49,8 @@ public:
   u32 query_coroutines{};
   u32 storage_id{0};
   vec<str> storage_peers;
+  u32 storage_owner_batch_max{16};
+  u32 storage_owner_batch_wait_us{250};
 
   // Legacy aliases for compatibility
   u32& ef_search = beam_width;
@@ -146,6 +148,10 @@ private:
       "Storage-node id used by storage_owner insert execution.")(
       "storage-peers", po::value<vec<str>>(&storage_peers)->multitoken(),
       "Ordered list of storage-peer endpoints used for storage_owner insert execution.")(
+      "storage-owner-batch-max", po::value<u32>(&storage_owner_batch_max)->default_value(storage_owner_batch_max),
+      "Maximum number of inserts grouped into one storage_owner batch.")(
+      "storage-owner-batch-wait-us", po::value<u32>(&storage_owner_batch_wait_us)->default_value(storage_owner_batch_wait_us),
+      "Maximum micro-batch wait in microseconds for storage_owner inserts.")(
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
@@ -217,6 +223,10 @@ private:
                   << std::endl;
         exit_with_help_message(argv);
       }
+      if (storage_owner_batch_max == 0) {
+        std::cerr << "[ERROR]: --storage-owner-batch-max must be > 0" << std::endl;
+        exit_with_help_message(argv);
+      }
       if (storage_peers.size() != num_server_nodes()) {
         std::cerr << "[ERROR]: --storage-peers must list exactly one endpoint per storage node when "
                      "--insert-execution=storage_owner"
@@ -271,6 +281,8 @@ public:
       os << std::setw(width) << "insert execution: " << config.insert_execution << std::endl;
       if (!config.storage_peers.empty()) {
         os << std::setw(width) << "storage id: " << config.storage_id << std::endl;
+        os << std::setw(width) << "storage batch max: " << config.storage_owner_batch_max << std::endl;
+        os << std::setw(width) << "storage batch wait(us): " << config.storage_owner_batch_wait_us << std::endl;
         os << std::setw(width) << "storage peers: " << "[";
         for (const str& node : config.storage_peers) {
           os << node << ", ";

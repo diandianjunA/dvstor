@@ -113,8 +113,8 @@ private:
   void pause_workers();
   void resume_workers();
   vec<node_t> search_local(const vec<element_t>& query, u32 k);
-  bool insert_via_storage_owner(const InsertItem& item,
-                                const std::shared_ptr<service::breakdown::Sample>& sample);
+  size_t insert_via_storage_owner(const vec<InsertItem>& batch,
+                                  const vec<std::shared_ptr<service::breakdown::Sample>>& samples);
   bool routing_enabled() const;
   size_t rpc_message_size() const;
   vec<element_t> compute_local_routing_centroid() const;

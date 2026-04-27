@@ -16,8 +16,8 @@ nohup: ignoring input
   测量时长:       60s
   操作粒度:       single_vector
   Query 文件:     synthetic
-  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260427_223722.json
-  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260427_223722.txt
+  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260427_225248.json
+  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260427_225248.txt
 
 ============================================================
                         CLIENT
@@ -71,55 +71,55 @@ interleaved policy
 client id: 0
 number of clients: 1
 connect to server 192.168.6.202:1234
-pairing: 1310 -- 1411
+pairing: 1335 -- 1456
 connect to server 192.168.6.202:1235
-pairing: 1311 -- 1412
+pairing: 1336 -- 1457
 connect to server 192.168.6.202:1236
-pairing: 1312 -- 1413
+pairing: 1337 -- 1458
 connect to server 192.168.6.202:1237
-pairing: 1313 -- 1414
+pairing: 1338 -- 1459
 connect to server 192.168.6.202:1238
-pairing: 1314 -- 1415
+pairing: 1339 -- 1460
 [STATUS]: pinned main thread to core 28
 [STATUS]: receive access tokens of remote memory regions
 [STATUS]: search mode: rabitq_gpu, cache=on
 [STATUS]: max cache size: 12859999846
-allocated ALIGNED MEM (no hugepage) at 139643378987072 with buffer size 53687091200
+allocated ALIGNED MEM (no hugepage) at 140176022040640 with buffer size 53687091200
 num cache buckets: 2499999
 allocate cache entries hugepage of size 99999960
-allocated ALIGNED MEM (no hugepage) at 139643218980928 with buffer size 99999960
+allocated ALIGNED MEM (no hugepage) at 140175922036800 with buffer size 99999960
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1315 -- 1416
-pairing: 1316 -- 1417
-pairing: 1317 -- 1418
-pairing: 1318 -- 1419
-pairing: 1319 -- 1420
+pairing: 1340 -- 1461
+pairing: 1341 -- 1462
+pairing: 1342 -- 1463
+pairing: 1343 -- 1464
+pairing: 1344 -- 1465
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1320 -- 1422
-pairing: 1321 -- 1421
-pairing: 1322 -- 1423
-pairing: 1323 -- 1425
-pairing: 1324 -- 1424
+pairing: 1345 -- 1468
+pairing: 1346 -- 1467
+pairing: 1347 -- 1466
+pairing: 1348 -- 1469
+pairing: 1349 -- 1470
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1325 -- 1426
-pairing: 1326 -- 1427
-pairing: 1327 -- 1430
-pairing: 1328 -- 1428
-pairing: 1329 -- 1429
+pairing: 1350 -- 1471
+pairing: 1351 -- 1472
+pairing: 1352 -- 1473
+pairing: 1353 -- 1475
+pairing: 1354 -- 1474
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1330 -- 1431
-pairing: 1331 -- 1432
-pairing: 1332 -- 1433
-pairing: 1333 -- 1435
-pairing: 1334 -- 1434
+pairing: 1355 -- 1477
+pairing: 1356 -- 1476
+pairing: 1357 -- 1479
+pairing: 1358 -- 1478
+pairing: 1359 -- 1480
 [STATUS]: neighbor cache worker 0: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
 [GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
@@ -192,26 +192,69 @@ pairing: 1334 -- 1434
 [breakdown] query data ready: count=65536
 [breakdown] effective insert start id=50010000
 [breakdown] starting warmup mixed
-[breakdown][warmup-mixed] progress elapsed=5.01479s/30s, completed=1552 ops, rate=309.484 ops/s
-Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=4294967296
-Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=8589934593
-Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=4294967296
-Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=2
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=4294967296
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=4294967296
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=8589934593
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=4294967296
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=4294967296
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=2
+[breakdown][warmup-mixed] progress elapsed=5.01394s/30s, completed=2407 ops, rate=480.061 ops/s
+[breakdown][warmup-mixed] progress elapsed=10.0141s/30s, completed=5115 ops, rate=510.78 ops/s
+[breakdown][warmup-mixed] progress elapsed=15.0142s/30s, completed=7818 ops, rate=520.706 ops/s
+[breakdown][warmup-mixed] progress elapsed=20.0144s/30s, completed=10542 ops, rate=526.722 ops/s
+[breakdown][warmup-mixed] progress elapsed=25.0145s/30s, completed=13276 ops, rate=530.732 ops/s
+[breakdown][warmup-mixed] progress elapsed=30.0146s/30s, completed=15965 ops, rate=531.907 ops/s
+[breakdown][warmup-mixed] done elapsed=30.0148s/30s, completed=15965 ops, avg_rate=531.904 ops/s
+[breakdown] starting measure phase
+[breakdown][measure-mixed] progress elapsed=5.01099s/60s, completed=2742 ops, rate=547.197 ops/s
+[breakdown][measure-mixed] progress elapsed=10.0111s/60s, completed=5525 ops, rate=551.886 ops/s
+[breakdown][measure-mixed] progress elapsed=15.0113s/60s, completed=8280 ops, rate=551.586 ops/s
+[breakdown][measure-mixed] progress elapsed=20.0114s/60s, completed=11072 ops, rate=553.285 ops/s
+[breakdown][measure-mixed] progress elapsed=25.0115s/60s, completed=13828 ops, rate=552.865 ops/s
+[breakdown][measure-mixed] progress elapsed=30.0117s/60s, completed=16599 ops, rate=553.085 ops/s
+[breakdown][measure-mixed] progress elapsed=35.0118s/60s, completed=19365 ops, rate=553.099 ops/s
+[breakdown][measure-mixed] progress elapsed=40.0119s/60s, completed=22154 ops, rate=553.685 ops/s
+[breakdown][measure-mixed] progress elapsed=45.0121s/60s, completed=24958 ops, rate=554.473 ops/s
+[breakdown][measure-mixed] progress elapsed=50.0122s/60s, completed=27783 ops, rate=555.524 ops/s
+[breakdown][measure-mixed] progress elapsed=55.0123s/60s, completed=30545 ops, rate=555.239 ops/s
+[breakdown][measure-mixed] progress elapsed=60.0125s/60s, completed=33299 ops, rate=554.868 ops/s
+[breakdown][measure-mixed] done elapsed=60.0126s/60s, completed=33299 ops, avg_rate=554.867 ops/s
+[breakdown][measure-mixed] reads issued/completed=32825/32825, writes issued/completed=474/474
+throughput
+  duration_seconds: 60
+  total_ops_per_sec: 554.983 (ops=33299)
+  query_ops_per_sec: 547.083 (ops=32825)
+  insert_ops_per_sec: 7.9 (ops=474)
+insert breakdown
+  count: 474
+  latency_ms: mean=999.517 p50=958.871 p95=1673.37 p99=2003.64
+  top_categories:
+    cpu_ns: 473771 ms (100%)
+    gpu_ns: 0 ms (0%)
+    rdma_ns: 0 ms (0%)
+    transfer_ns: 0 ms (0%)
+query breakdown
+  count: 32825
+  latency_ms: mean=14.3847 p50=13.3179 p95=22.8434 p99=28.1486
+  top_categories:
+    gpu_ns: 274884 ms (58.226%)
+    transfer_ns: 83988.3 ms (17.7904%)
+    cpu_ns: 68639.1 ms (14.5391%)
+    rdma_ns: 44587.6 ms (9.44454%)
+cache histogram
+  size: 0 | freq: 2433489
+  size: 1 | freq: 65667
+  size: 2 | freq: 841
+  size: 3 | freq: 2
+total entries: 67355
+cooling table histogram
+  size: 0 | freq: 41667
+  size: 1 | freq: 0
+  size: 2 | freq: 0
+  size: 3 | freq: 0
+  size: 4 | freq: 0
+  size: 5 | freq: 0
+  size: 6 | freq: 0
+CT total entries: 0
 
-[breakdown] fatal signal, backtrace:
-/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0x176ca)[0x5560f71186ca]
-/usr/lib/x86_64-linux-gnu/libc.so.6(+0x42520)[0x7f0e24c2d520]
-/usr/lib/x86_64-linux-gnu/libc.so.6(+0x453fc)[0x7f0e24c303fc]
-/usr/lib/x86_64-linux-gnu/libc.so.6(on_exit+0x0)[0x7f0e24c30610]
-/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0xa3459)[0x5560f71a4459]
-/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0x80e78)[0x5560f7181e78]
-/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0x821a3)[0x5560f71831a3]
-/home/xjs/anaconda3/lib/libstdc++.so.6(+0xd828c)[0x7f0e24eeb28c]
-/usr/lib/x86_64-linux-gnu/libc.so.6(+0x94b43)[0x7f0e24c7fb43]
-/usr/lib/x86_64-linux-gnu/libc.so.6(+0x126a00)[0x7f0e24d11a00]
+[DVSTOR Breakdown] 关键指标
+  throughput: 554.98 ops/s (total=33299, duration=60s)
+  query throughput: 547.08 ops/s (count=32825)
+  insert throughput: 7.90 ops/s (count=474)
+  mixed completed: reads=32825, writes=474
+  query latency(ms): mean=14.3847, p95=22.8434, p99=28.1486
+  insert latency(ms): mean=999.5171, p95=1673.3725, p99=2003.6379

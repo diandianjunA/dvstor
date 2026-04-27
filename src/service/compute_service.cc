@@ -151,7 +151,8 @@ ComputeService<Distance>::~ComputeService() {
 template <class Distance>
 size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
   if (config_.use_storage_owner_insert()) {
-    size_t inserted = 0;
+    vec<std::shared_ptr<service::breakdown::Sample>> samples;
+    samples.reserve(batch.size());
     for (const auto& item : batch) {
       if (item.values.size() != config_.dim) {
         throw std::invalid_argument("insert dimension mismatch");
@@ -164,11 +165,11 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
         sample->enqueued_at = now;
         sample->mark_started(now, now, statistics::ThreadStatistics{});
       }
+      samples.push_back(sample);
+    }
 
-      const bool ok = insert_via_storage_owner(item, sample);
-      if (ok) {
-        ++inserted;
-      }
+    const size_t inserted = insert_via_storage_owner(batch, samples);
+    for (const auto& sample : samples) {
       if (sample && sample->finished_flag) {
         std::lock_guard<std::mutex> lock(breakdown_mutex_);
         completed_insert_samples_.push_back(*sample);
@@ -224,50 +225,82 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
 }
 
 template <class Distance>
-bool ComputeService<Distance>::insert_via_storage_owner(
-    const InsertItem& item,
-    const std::shared_ptr<service::breakdown::Sample>& sample) {
+size_t ComputeService<Distance>::insert_via_storage_owner(
+    const vec<InsertItem>& batch,
+    const vec<std::shared_ptr<service::breakdown::Sample>>& samples) {
   std::lock_guard<std::mutex> lock(storage_insert_rpc_mutex_);
 
-  const u32 owner_storage = num_servers_ == 0 ? 0 : static_cast<u32>(item.id % num_servers_);
-  const u64 request_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
-
-  service::storage_owner::InsertRequest request{};
-  request.dim = config_.dim;
-  request.id = item.id;
-  request.owner_storage = owner_storage;
-  request.source_client = cm_.client_id;
-  request.request_id = request_id;
-
-  const size_t request_size = service::storage_owner::request_bytes(config_.dim);
-  vec<byte_t> request_buffer(request_size);
-  std::memcpy(request_buffer.data(), &request, sizeof(request));
-  std::memcpy(request_buffer.data() + sizeof(request),
-              item.values.data(),
-              static_cast<size_t>(config_.dim) * sizeof(element_t));
-
-  LocalMemoryRegion request_region{context_, request_buffer.data(), request_buffer.size()};
-  service::storage_owner::InsertResponse response{};
-  LocalMemoryRegion response_region{context_, &response, sizeof(response)};
-
-  auto& qp = *cm_.server_qps[owner_storage];
-  qp.post_receive(response_region);
-  qp.post_send(request_region,
-               static_cast<u32>(request_buffer.size()),
-               IBV_WR_SEND,
-               true,
-               nullptr,
-               0,
-               0);
-  context_.poll_send_cq_until_completion();
-  context_.receive();
-
-  if (sample) {
-    sample->mark_finished(std::chrono::steady_clock::now(), statistics::ThreadStatistics{});
+  size_t inserted = 0;
+  vec<vec<size_t>> owner_indices(std::max<u32>(1, num_servers_));
+  for (size_t i = 0; i < batch.size(); ++i) {
+    const u32 owner_storage = num_servers_ == 0 ? 0 : static_cast<u32>(batch[i].id % num_servers_);
+    owner_indices[owner_storage].push_back(i);
   }
-  return response.magic == service::storage_owner::kInsertMagic &&
-         response.request_id == request_id &&
-         response.status == static_cast<u32>(service::storage_owner::InsertStatus::ok);
+
+  for (u32 owner_storage = 0; owner_storage < owner_indices.size(); ++owner_storage) {
+    auto& indices = owner_indices[owner_storage];
+    for (size_t begin = 0; begin < indices.size(); begin += config_.storage_owner_batch_max) {
+      const u32 item_count = static_cast<u32>(std::min<size_t>(indices.size() - begin, config_.storage_owner_batch_max));
+      const u64 batch_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
+      const size_t request_size = service::storage_owner::insert_batch_request_bytes(item_count, config_.dim);
+      const size_t response_size = service::storage_owner::insert_batch_response_bytes(item_count);
+      vec<byte_t> request_buffer(request_size);
+      vec<byte_t> response_buffer(response_size);
+
+      auto* request = reinterpret_cast<service::storage_owner::InsertBatchRequestHeader*>(request_buffer.data());
+      request->dim = config_.dim;
+      request->owner_storage = owner_storage;
+      request->source_client = cm_.client_id;
+      request->item_count = item_count;
+      request->batch_id = batch_id;
+
+      node_t* ids = service::storage_owner::request_ids(request_buffer.data());
+      element_t* vectors = service::storage_owner::request_vectors(request_buffer.data(), item_count);
+      for (u32 i = 0; i < item_count; ++i) {
+        const size_t batch_idx = indices[begin + i];
+        ids[i] = batch[batch_idx].id;
+        std::memcpy(vectors + static_cast<size_t>(i) * config_.dim,
+                    batch[batch_idx].values.data(),
+                    static_cast<size_t>(config_.dim) * sizeof(element_t));
+      }
+
+      LocalMemoryRegion request_region{context_, request_buffer.data(), request_buffer.size()};
+      LocalMemoryRegion response_region{context_, response_buffer.data(), response_buffer.size()};
+
+      auto& qp = *cm_.server_qps[owner_storage];
+      qp.post_receive(response_region, static_cast<u32>(response_size));
+      qp.post_send(request_region,
+                   static_cast<u32>(request_size),
+                   IBV_WR_SEND,
+                   true,
+                   nullptr,
+                   0,
+                   0);
+      context_.poll_send_cq_until_completion();
+      context_.receive();
+
+      const auto* response =
+        reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(response_buffer.data());
+      const u32* statuses = service::storage_owner::response_statuses(response_buffer.data());
+      const bool response_ok = response->magic == service::storage_owner::kInsertMagic &&
+                               response->owner_storage == owner_storage &&
+                               response->batch_id == batch_id &&
+                               response->item_count == item_count;
+      const auto finished_at = std::chrono::steady_clock::now();
+      for (u32 i = 0; i < item_count; ++i) {
+        const size_t batch_idx = indices[begin + i];
+        const bool ok = response_ok &&
+                        statuses[i] == static_cast<u32>(service::storage_owner::InsertStatus::ok);
+        inserted += ok ? 1u : 0u;
+        const auto& sample = samples[batch_idx];
+        if (sample) {
+          sample->mark_finished(finished_at, statistics::ThreadStatistics{});
+        }
+      }
+    }
+  }
+
+  return inserted;
 }
 
 template <class Distance>

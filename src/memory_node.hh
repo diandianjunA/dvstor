@@ -140,7 +140,7 @@ public:
         load_rabitq_artifacts(config);
       }
       setup_storage_peers(config);
-      setup_insert_runtime();
+      setup_insert_runtime(config);
       service_storage_owner_inserts(config);
 
     } else {
@@ -176,6 +176,13 @@ private:
     std::unique_ptr<LocalMemoryRegion> region;
     size_t request_bytes{};
     size_t response_offset{};
+  };
+
+  struct PeerRpcRuntimeState {
+    HugePage<byte_t> buffer;
+    std::unique_ptr<LocalMemoryRegion> region;
+    size_t message_bytes{};
+    size_t recv_region_bytes{};
   };
 
   void allocate_memory() {
@@ -371,6 +378,8 @@ private:
     peer_scratch_region_ =
       std::make_unique<LocalMemoryRegion>(*peer_context_, peer_scratch_buffer_.get_full_buffer(), scratch_bytes);
 
+    setup_peer_rpc_runtime(config);
+
     for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
       if (peer_id == storage_id_) continue;
       u64 header_words[2]{};
@@ -382,14 +391,176 @@ private:
     }
   }
 
-  void setup_insert_runtime() {
-    insert_runtime_.request_bytes = align_up(service::storage_owner::request_bytes(VamanaNode::DIM));
-    const size_t response_bytes = align_up(sizeof(service::storage_owner::InsertResponse));
+  void setup_peer_rpc_runtime(const Configuration& config) {
+    if (!peer_context_ || num_storage_nodes_ <= 1) {
+      return;
+    }
+
+    peer_rpc_runtime_.message_bytes = align_up(
+      std::max(service::storage_owner::reverse_update_request_bytes(config.R * config.storage_owner_batch_max),
+               service::storage_owner::reverse_update_response_bytes()));
+    peer_rpc_runtime_.recv_region_bytes = peer_rpc_runtime_.message_bytes * num_storage_nodes_;
+    const size_t send_region_bytes = peer_rpc_runtime_.message_bytes * num_storage_nodes_;
+    peer_rpc_runtime_.buffer.allocate(peer_rpc_runtime_.recv_region_bytes + send_region_bytes);
+    peer_rpc_runtime_.buffer.touch_memory();
+    peer_rpc_runtime_.region = std::make_unique<LocalMemoryRegion>(
+      *peer_context_, peer_rpc_runtime_.buffer.get_full_buffer(), peer_rpc_runtime_.buffer.buffer_size);
+
+    for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
+      if (peer_id == storage_id_) continue;
+      peer_qps_[peer_id]->post_receive(
+        *peer_rpc_runtime_.region,
+        static_cast<u32>(peer_rpc_runtime_.message_bytes),
+        peer_id,
+        static_cast<u64>(peer_id) * peer_rpc_runtime_.message_bytes);
+    }
+  }
+
+  void setup_insert_runtime(const Configuration& config) {
+    insert_runtime_.request_bytes =
+      align_up(service::storage_owner::insert_batch_request_bytes(config.storage_owner_batch_max, VamanaNode::DIM));
+    const size_t response_bytes =
+      align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max));
     insert_runtime_.response_offset = insert_runtime_.request_bytes * num_clients_;
     insert_runtime_.buffer.allocate(insert_runtime_.response_offset + response_bytes * num_clients_);
     insert_runtime_.buffer.touch_memory();
     insert_runtime_.region = std::make_unique<LocalMemoryRegion>(
       context_, insert_runtime_.buffer.get_full_buffer(), insert_runtime_.buffer.buffer_size);
+  }
+
+  void repost_peer_rpc_receive(u32 peer_id) {
+    if (!peer_context_ || peer_id == storage_id_) {
+      return;
+    }
+    peer_qps_[peer_id]->post_receive(
+      *peer_rpc_runtime_.region,
+      static_cast<u32>(peer_rpc_runtime_.message_bytes),
+      peer_id,
+      static_cast<u64>(peer_id) * peer_rpc_runtime_.message_bytes);
+  }
+
+  void send_peer_rpc_message(u32 peer_id, const void* payload, size_t bytes) {
+    lib_assert(peer_context_ != nullptr, "peer context not initialized");
+    lib_assert(bytes <= peer_rpc_runtime_.message_bytes, "peer rpc message too large");
+    const size_t offset = peer_rpc_runtime_.recv_region_bytes + static_cast<size_t>(peer_id) * peer_rpc_runtime_.message_bytes;
+    std::memcpy(peer_rpc_runtime_.buffer.get_full_buffer() + offset, payload, bytes);
+    peer_qps_[peer_id]->post_send(
+      *peer_rpc_runtime_.region,
+      static_cast<u32>(bytes),
+      IBV_WR_SEND,
+      true,
+      nullptr,
+      0,
+      offset);
+    peer_context_->poll_send_cq_until_completion();
+  }
+
+  bool handle_peer_reverse_update_request(u32 source_shard,
+                                          const service::storage_owner::PeerRpcHeader& header,
+                                          const service::storage_owner::ReverseUpdateOp* ops,
+                                          const Configuration& config) {
+    std::unordered_map<u64, vec<RemotePtr>> grouped;
+    grouped.reserve(header.item_count);
+    for (u32 i = 0; i < header.item_count; ++i) {
+      const RemotePtr target{ops[i].target_raw};
+      const RemotePtr candidate{ops[i].candidate_raw};
+      lib_assert(local_shard(target.memory_node()), "reverse-update target routed to wrong shard");
+      grouped[target.raw_address].push_back(candidate);
+    }
+
+    bool success = true;
+    for (const auto& [target_raw, candidates] : grouped) {
+      success &= apply_local_reverse_update(RemotePtr{target_raw}, candidates, config);
+    }
+
+    service::storage_owner::PeerRpcHeader response{};
+    response.type = static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response);
+    response.source_shard = storage_id_;
+    response.item_count = header.item_count;
+    response.request_id = header.request_id;
+    response.status = static_cast<u32>(success ? service::storage_owner::InsertStatus::ok
+                                               : service::storage_owner::InsertStatus::failed);
+    send_peer_rpc_message(source_shard, &response, sizeof(response));
+    return success;
+  }
+
+  bool pump_peer_rpcs(const Configuration& config, bool wait_for_event = false) {
+    if (!peer_context_) {
+      return false;
+    }
+
+    bool progressed = false;
+    vec<ibv_wc> recv_wcs(std::max<i32>(1, peer_context_->get_config().max_recv_queue_wr));
+    do {
+      const i32 num_received =
+        peer_context_->poll_recv_cq(recv_wcs.data(), static_cast<i32>(recv_wcs.size()));
+      if (num_received <= 0) {
+        break;
+      }
+      progressed = true;
+      for (i32 i = 0; i < num_received; ++i) {
+        const u32 peer_id = static_cast<u32>(recv_wcs[i].wr_id);
+        const size_t offset = static_cast<size_t>(peer_id) * peer_rpc_runtime_.message_bytes;
+        const byte_t* payload = peer_rpc_runtime_.buffer.get_full_buffer() + offset;
+        const auto* header = reinterpret_cast<const service::storage_owner::PeerRpcHeader*>(payload);
+        if (header->magic != service::storage_owner::kPeerRpcMagic) {
+          repost_peer_rpc_receive(peer_id);
+          continue;
+        }
+
+        if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_request)) {
+          const auto* ops = service::storage_owner::reverse_update_ops(payload);
+          handle_peer_reverse_update_request(peer_id, *header, ops, config);
+        } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response)) {
+          peer_rpc_responses_[header->request_id] = *header;
+        }
+
+        repost_peer_rpc_receive(peer_id);
+      }
+    } while (wait_for_event);
+
+    return progressed;
+  }
+
+  bool wait_for_peer_reverse_update_response(u64 request_id, const Configuration& config) {
+    for (;;) {
+      const auto it = peer_rpc_responses_.find(request_id);
+      if (it != peer_rpc_responses_.end()) {
+        const bool success = it->second.status == static_cast<u32>(service::storage_owner::InsertStatus::ok);
+        peer_rpc_responses_.erase(it);
+        return success;
+      }
+      if (!pump_peer_rpcs(config, false)) {
+        std::this_thread::yield();
+      }
+    }
+  }
+
+  bool send_reverse_update_batch(u32 target_shard,
+                                 const vec<service::storage_owner::ReverseUpdateOp>& ops,
+                                 const Configuration& config) {
+    if (ops.empty()) {
+      return true;
+    }
+
+    const u32 max_items = std::max<u32>(1, config.R * config.storage_owner_batch_max);
+    for (size_t begin = 0; begin < ops.size(); begin += max_items) {
+      const u32 item_count = static_cast<u32>(std::min<size_t>(ops.size() - begin, max_items));
+      const size_t bytes = service::storage_owner::reverse_update_request_bytes(item_count);
+      vec<byte_t> message(bytes);
+      auto* header = reinterpret_cast<service::storage_owner::PeerRpcHeader*>(message.data());
+      header->type = static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_request);
+      header->source_shard = storage_id_;
+      header->item_count = item_count;
+      header->request_id = next_peer_request_id_++;
+      auto* payload_ops = service::storage_owner::reverse_update_ops(message.data());
+      std::memcpy(payload_ops, ops.data() + begin, static_cast<size_t>(item_count) * sizeof(service::storage_owner::ReverseUpdateOp));
+      send_peer_rpc_message(target_shard, message.data(), bytes);
+      if (!wait_for_peer_reverse_update_response(header->request_id, config)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   void service_storage_owner_inserts(const Configuration& config) {
@@ -405,9 +576,12 @@ private:
     }
 
     for (;;) {
+      bool progressed = pump_peer_rpcs(config, false);
       const i32 num_received = context_.poll_recv_cq(recv_wcs.data(), static_cast<i32>(recv_wcs.size()));
       if (num_received == 0) {
-        std::this_thread::yield();
+        if (!progressed) {
+          std::this_thread::yield();
+        }
         continue;
       }
 
@@ -417,24 +591,24 @@ private:
         const byte_t* payload = insert_runtime_.buffer.get_full_buffer() + offset;
         const size_t bytes = recv_wcs[i].byte_len;
 
-        const bool success = handle_storage_insert_request(client_id, payload, bytes, config);
+        (void)handle_storage_insert_request(client_id, payload, bytes, config);
 
-        auto* response_ptr = reinterpret_cast<service::storage_owner::InsertResponse*>(
+        auto* response_ptr = reinterpret_cast<service::storage_owner::InsertBatchResponseHeader*>(
           insert_runtime_.buffer.get_full_buffer() + insert_runtime_.response_offset +
-          static_cast<size_t>(client_id) * align_up(sizeof(service::storage_owner::InsertResponse)));
-        response_ptr->magic = service::storage_owner::kInsertMagic;
-        response_ptr->status = static_cast<u32>(success ? service::storage_owner::InsertStatus::ok
-                                                        : service::storage_owner::InsertStatus::failed);
+          static_cast<size_t>(client_id) *
+            align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max)));
+        const u32 response_items = response_ptr->item_count;
 
         cm_.client_qps[client_id]->post_send(
           *insert_runtime_.region,
-          static_cast<u32>(sizeof(service::storage_owner::InsertResponse)),
+          static_cast<u32>(service::storage_owner::insert_batch_response_bytes(response_items)),
           IBV_WR_SEND,
           true,
           nullptr,
           0,
           insert_runtime_.response_offset +
-            static_cast<size_t>(client_id) * align_up(sizeof(service::storage_owner::InsertResponse)));
+            static_cast<size_t>(client_id) *
+              align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max)));
         context_.poll_send_cq_until_completion();
 
         cm_.client_qps[client_id]->post_receive(
@@ -448,28 +622,41 @@ private:
 
   bool handle_storage_insert_request(u32 client_id, const byte_t* payload, size_t bytes, const Configuration& config) {
     (void)client_id;
-    if (bytes < sizeof(service::storage_owner::InsertRequest)) {
+    if (bytes < sizeof(service::storage_owner::InsertBatchRequestHeader)) {
       return false;
     }
 
-    service::storage_owner::InsertRequest request{};
-    std::memcpy(&request, payload, sizeof(request));
-    if (request.magic != service::storage_owner::kInsertMagic ||
-        request.dim != config.dim ||
-        request.owner_storage != storage_id_ ||
-        bytes < service::storage_owner::request_bytes(config.dim)) {
+    const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(payload);
+    if (request->magic != service::storage_owner::kInsertMagic ||
+        request->dim != config.dim ||
+        request->owner_storage != storage_id_ ||
+        request->item_count == 0 ||
+        request->item_count > config.storage_owner_batch_max ||
+        bytes < service::storage_owner::insert_batch_request_bytes(request->item_count, config.dim)) {
       return false;
     }
 
-    auto* response_ptr = reinterpret_cast<service::storage_owner::InsertResponse*>(
+    auto* response_ptr = reinterpret_cast<service::storage_owner::InsertBatchResponseHeader*>(
       insert_runtime_.buffer.get_full_buffer() + insert_runtime_.response_offset +
-      static_cast<size_t>(client_id) * align_up(sizeof(service::storage_owner::InsertResponse)));
-    response_ptr->id = request.id;
+      static_cast<size_t>(client_id) *
+        align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max)));
+    response_ptr->magic = service::storage_owner::kInsertMagic;
     response_ptr->owner_storage = storage_id_;
-    response_ptr->request_id = request.request_id;
+    response_ptr->item_count = request->item_count;
+    response_ptr->batch_id = request->batch_id;
+    u32* statuses = service::storage_owner::response_statuses(response_ptr);
 
-    const auto* components = reinterpret_cast<const element_t*>(payload + sizeof(request));
-    return execute_storage_owner_insert(request.id, span<const element_t>{components, config.dim}, config);
+    const node_t* ids = service::storage_owner::request_ids(payload);
+    const element_t* vectors = service::storage_owner::request_vectors(payload, request->item_count);
+    bool all_ok = true;
+    for (u32 i = 0; i < request->item_count; ++i) {
+      const auto vec_span = span<const element_t>{vectors + static_cast<size_t>(i) * config.dim, config.dim};
+      const bool ok = execute_storage_owner_insert(ids[i], vec_span, config);
+      statuses[i] = static_cast<u32>(ok ? service::storage_owner::InsertStatus::ok
+                                        : service::storage_owner::InsertStatus::failed);
+      all_ok &= ok;
+    }
+    return all_ok;
   }
 
   RemotePtr allocate_local_node() {
@@ -996,6 +1183,60 @@ private:
     return {original == header, original};
   }
 
+  bool apply_local_reverse_update(RemotePtr target_ptr,
+                                  const vec<RemotePtr>& candidate_ptrs,
+                                  const Configuration& config) {
+    lib_assert(local_shard(target_ptr.memory_node()), "target reverse update must be local");
+    if (candidate_ptrs.empty()) {
+      return true;
+    }
+
+    lock_node(target_ptr);
+    vec<RemotePtr> updated_neighbors;
+    {
+      NodeSnapshot target_snapshot;
+      read_node_snapshot(target_ptr, target_snapshot);
+      vec<RemotePtr> current_neighbors = read_neighbor_list(target_ptr);
+      vec<RemotePtr> filtered_candidates;
+      filtered_candidates.reserve(candidate_ptrs.size());
+      for (const RemotePtr& candidate_ptr : candidate_ptrs) {
+        if (candidate_ptr.is_null()) {
+          continue;
+        }
+        bool already_present = false;
+        for (const RemotePtr& existing : current_neighbors) {
+          if (existing == candidate_ptr) {
+            already_present = true;
+            break;
+          }
+        }
+        if (!already_present &&
+            std::find(filtered_candidates.begin(), filtered_candidates.end(), candidate_ptr) == filtered_candidates.end()) {
+          filtered_candidates.push_back(candidate_ptr);
+        }
+      }
+
+      if (filtered_candidates.empty()) {
+        unlock_node(target_ptr);
+        return true;
+      }
+
+      if (current_neighbors.size() + filtered_candidates.size() <= config.R) {
+        current_neighbors.insert(current_neighbors.end(), filtered_candidates.begin(), filtered_candidates.end());
+        updated_neighbors = std::move(current_neighbors);
+      } else {
+        vec<RemotePtr> prune_candidates = current_neighbors;
+        prune_candidates.insert(prune_candidates.end(), filtered_candidates.begin(), filtered_candidates.end());
+        hashset_t<RemotePtr> skip{target_ptr};
+        updated_neighbors = robust_prune_cpu(target_snapshot.components, prune_candidates, skip, config);
+      }
+    }
+
+    write_neighbor_list(target_ptr, updated_neighbors);
+    unlock_node(target_ptr);
+    return true;
+  }
+
   bool execute_storage_owner_insert(node_t id, const span<const element_t> components, const Configuration& config) {
     RemotePtr medoid_ptr = read_global_medoid();
     const vec<byte_t> rabitq_data = quantize_rabitq_cpu(components, config);
@@ -1017,38 +1258,23 @@ private:
     const RemotePtr new_ptr = allocate_local_node();
     write_new_node(new_ptr, id, components, rabitq_data, selected_neighbors);
 
+    std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
     for (const RemotePtr& neighbor_ptr : selected_neighbors) {
-      lock_node(neighbor_ptr);
-      vec<RemotePtr> updated_neighbors;
-      {
-        NodeSnapshot neighbor_snapshot;
-        read_node_snapshot(neighbor_ptr, neighbor_snapshot);
-        vec<RemotePtr> current_neighbors = read_neighbor_list(neighbor_ptr);
-        bool already_present = false;
-        for (const RemotePtr& existing : current_neighbors) {
-          if (existing == new_ptr) {
-            already_present = true;
-            break;
-          }
+      if (local_shard(neighbor_ptr.memory_node())) {
+        vec<RemotePtr> singleton{new_ptr};
+        if (!apply_local_reverse_update(neighbor_ptr, singleton, config)) {
+          return false;
         }
-        if (already_present) {
-          unlock_node(neighbor_ptr);
-          continue;
-        }
-
-        if (current_neighbors.size() < config.R) {
-          current_neighbors.push_back(new_ptr);
-          updated_neighbors = std::move(current_neighbors);
-        } else {
-          vec<RemotePtr> prune_candidates = current_neighbors;
-          prune_candidates.push_back(new_ptr);
-          hashset_t<RemotePtr> skip{neighbor_ptr};
-          updated_neighbors = robust_prune_cpu(neighbor_snapshot.components, prune_candidates, skip, config);
-        }
+      } else {
+        remote_updates[neighbor_ptr.memory_node()].push_back(
+          service::storage_owner::ReverseUpdateOp{neighbor_ptr.raw_address, new_ptr.raw_address});
       }
+    }
 
-      write_neighbor_list(neighbor_ptr, updated_neighbors);
-      unlock_node(neighbor_ptr);
+    for (auto& [target_shard, ops] : remote_updates) {
+      if (!send_reverse_update_batch(target_shard, ops, config)) {
+        return false;
+      }
     }
 
     return true;
@@ -1273,6 +1499,9 @@ private:
   std::unique_ptr<MemoryRegion> peer_index_region_;
   HugePage<byte_t> peer_scratch_buffer_;
   std::unique_ptr<LocalMemoryRegion> peer_scratch_region_;
+  PeerRpcRuntimeState peer_rpc_runtime_;
+  std::unordered_map<u64, service::storage_owner::PeerRpcHeader> peer_rpc_responses_;
+  u64 next_peer_request_id_{1};
   InsertRuntimeState insert_runtime_;
   service::rabitq::Artifacts rabitq_artifacts_;
   bool rabitq_artifacts_ready_{false};
