@@ -41,3 +41,137 @@ pairing: 1272 -- 1274
 allocated ALIGNED MEM (no hugepage) at 129159181369408 with buffer size 67108864
 allocated ALIGNED MEM (no hugepage) at 108588164556544 with buffer size 4224
 [STATUS]: storage-owner insert runtime enabled on shard 2
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1236
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/1024dim50M_node3_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 1278 -- 1237
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 126686215536704 with buffer size 53687091200
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node3_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 1283 -- 1242
+pairing: 1289 -- 1247
+pairing: 1292 -- 1252
+pairing: 1297 -- 1257
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node3_of5.dat
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 1306 -- 1308
+pairing: 1311 -- 1310
+pairing: 1314 -- 1312
+pairing: 1316 -- 1319
+allocated ALIGNED MEM (no hugepage) at 126686137942080 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 98883654649600 with buffer size 4224
+[STATUS]: storage-owner insert runtime enabled on shard 2
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1236
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/1024dim50M_node3_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 1323 -- 1262
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 130153550184512 with buffer size 53687091200
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node3_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 1329 -- 1267
+pairing: 1334 -- 1272
+pairing: 1336 -- 1277
+pairing: 1343 -- 1282
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node3_of5.dat
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 1352 -- 1356
+pairing: 1359 -- 1360
+pairing: 1362 -- 1357
+pairing: 1363 -- 1361
+allocated ALIGNED MEM (no hugepage) at 130153470492736 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 108908937561856 with buffer size 4224
+[STATUS]: storage-owner insert runtime enabled on shard 2
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1236
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/1024dim50M_node3_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 1368 -- 1287
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 135765799469120 with buffer size 53687091200
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node3_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 1373 -- 1292
+pairing: 1379 -- 1297
+pairing: 1383 -- 1302
+pairing: 1388 -- 1307
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node3_of5.dat
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 1392 -- 1396
+pairing: 1398 -- 1397
+pairing: 1403 -- 1406
+pairing: 1409 -- 1407
+[storage-peer][token] self_shard=2 local_base=135765799469120 local_rkey=1582566 local_bytes=53687091200
+[storage-peer][token] self_shard=2 peer_shard=0 remote_base=129716203814976 remote_rkey=1581056
+[storage-peer][token] self_shard=2 peer_shard=1 remote_base=124528757833792 remote_rkey=1582080
+[storage-peer][token] self_shard=2 peer_shard=3 remote_base=136075569791040 remote_rkey=1581312
+[storage-peer][token] self_shard=2 peer_shard=4 remote_base=129249029652544 remote_rkey=1582592
+allocated ALIGNED MEM (no hugepage) at 135765721874496 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 97141173196544 with buffer size 4224
+[STATUS]: storage-owner insert runtime enabled on shard 2
