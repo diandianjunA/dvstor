@@ -62,6 +62,7 @@ if (DVSTOR_STORAGE_NODE_ONLY)
         src/memory_node_main.cc
         src/common/core_assignment.cc
         src/common/timing.cc
+        src/service/rabitq_artifacts.cc
     )
     target_include_directories(dvstor_memory_node PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src

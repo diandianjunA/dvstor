@@ -223,10 +223,6 @@ private:
                   << std::endl;
         exit_with_help_message(argv);
       }
-      if (storage_id >= storage_peers.size()) {
-        std::cerr << "[ERROR]: --storage-id must be within the range of --storage-peers" << std::endl;
-        exit_with_help_message(argv);
-      }
     }
   }
 
