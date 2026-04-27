@@ -345,6 +345,10 @@ private:
     peer_context_->close_server_socket();
 
     const MemoryRegionToken local_token = index_region_.createToken();
+    std::cerr << "[storage-peer][token] self_shard=" << storage_id_
+              << " local_base=" << local_token.address
+              << " local_rkey=" << local_token.rkey
+              << " local_bytes=" << index_buffer_.buffer_size << std::endl;
     for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
       if (peer_id == storage_id_) continue;
       LocalMemoryRegion peer_token_region{*peer_context_, peer_remote_tokens_[peer_id].get(), sizeof(MemoryRegionToken)};
@@ -352,6 +356,10 @@ private:
       peer_qps_[peer_id]->post_send_inlined(&local_token, sizeof(local_token), IBV_WR_SEND);
       peer_context_->poll_send_cq_until_completion();
       peer_context_->receive();
+      std::cerr << "[storage-peer][token] self_shard=" << storage_id_
+                << " peer_shard=" << peer_id
+                << " remote_base=" << peer_remote_tokens_[peer_id]->address
+                << " remote_rkey=" << peer_remote_tokens_[peer_id]->rkey << std::endl;
     }
 
     const size_t scratch_bytes = std::max<size_t>(64ull * 1024ull * 1024ull, align_up(VamanaNode::total_size() * 4));
