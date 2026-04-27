@@ -344,7 +344,10 @@ private:
     }
     peer_context_->close_server_socket();
 
-    const MemoryRegionToken local_token = index_region_.createToken();
+    peer_index_region_ = std::make_unique<MemoryRegion>(*peer_context_);
+    peer_index_region_->register_memory(index_buffer_.get_full_buffer(), index_buffer_.buffer_size, true);
+
+    const MemoryRegionToken local_token = peer_index_region_->createToken();
     std::cerr << "[storage-peer][token] self_shard=" << storage_id_
               << " local_base=" << local_token.address
               << " local_rkey=" << local_token.rkey
@@ -1267,6 +1270,7 @@ private:
   std::unique_ptr<Context> peer_context_;
   QPs peer_qps_;
   MemoryRegionTokens peer_remote_tokens_;
+  std::unique_ptr<MemoryRegion> peer_index_region_;
   HugePage<byte_t> peer_scratch_buffer_;
   std::unique_ptr<LocalMemoryRegion> peer_scratch_region_;
   InsertRuntimeState insert_runtime_;
