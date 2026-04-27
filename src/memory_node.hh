@@ -860,6 +860,16 @@ private:
                  " offset=" + std::to_string(remote_offset) +
                  " bytes=" + std::to_string(bytes) +
                  " capacity=" + std::to_string(mn_memory_bytes_));
+    static std::atomic<u32> debug_reads{0};
+    const u32 debug_idx = debug_reads.fetch_add(1, std::memory_order_relaxed);
+    if (debug_idx < 16) {
+      std::cerr << "[storage-peer][read] self_shard=" << storage_id_
+                << " target_shard=" << shard_id
+                << " remote_base=" << peer_remote_tokens_[shard_id]->address
+                << " rkey=" << peer_remote_tokens_[shard_id]->rkey
+                << " offset=" << remote_offset
+                << " bytes=" << bytes << std::endl;
+    }
     lib_assert(scratch_offset + bytes <= peer_scratch_buffer_.buffer_size, "peer scratch buffer exhausted");
     byte_t* scratch = peer_scratch_buffer_.get_full_buffer() + scratch_offset;
     peer_qps_[shard_id]->post_send(reinterpret_cast<u64>(scratch),
@@ -890,6 +900,16 @@ private:
                  " offset=" + std::to_string(remote_offset) +
                  " bytes=" + std::to_string(bytes) +
                  " capacity=" + std::to_string(mn_memory_bytes_));
+    static std::atomic<u32> debug_writes{0};
+    const u32 debug_idx = debug_writes.fetch_add(1, std::memory_order_relaxed);
+    if (debug_idx < 16) {
+      std::cerr << "[storage-peer][write] self_shard=" << storage_id_
+                << " target_shard=" << shard_id
+                << " remote_base=" << peer_remote_tokens_[shard_id]->address
+                << " rkey=" << peer_remote_tokens_[shard_id]->rkey
+                << " offset=" << remote_offset
+                << " bytes=" << bytes << std::endl;
+    }
     lib_assert(scratch_offset + bytes <= peer_scratch_buffer_.buffer_size, "peer scratch buffer exhausted");
     byte_t* scratch = peer_scratch_buffer_.get_full_buffer() + scratch_offset;
     std::memcpy(scratch, src, bytes);
@@ -918,6 +938,17 @@ private:
                "peer CAS exceeds shard bounds: shard=" + std::to_string(shard_id) +
                  " offset=" + std::to_string(remote_offset) +
                  " capacity=" + std::to_string(mn_memory_bytes_));
+    static std::atomic<u32> debug_cas{0};
+    const u32 debug_idx = debug_cas.fetch_add(1, std::memory_order_relaxed);
+    if (debug_idx < 16) {
+      std::cerr << "[storage-peer][cas] self_shard=" << storage_id_
+                << " target_shard=" << shard_id
+                << " remote_base=" << peer_remote_tokens_[shard_id]->address
+                << " rkey=" << peer_remote_tokens_[shard_id]->rkey
+                << " offset=" << remote_offset
+                << " expected=" << expected
+                << " desired=" << desired << std::endl;
+    }
     lib_assert(scratch_offset + sizeof(u64) <= peer_scratch_buffer_.buffer_size, "peer scratch buffer exhausted");
     auto* scratch = reinterpret_cast<u64*>(peer_scratch_buffer_.get_full_buffer() + scratch_offset);
     *scratch = 0;
