@@ -18,11 +18,13 @@ ALPHA="${ALPHA:-1.2}"
 RABITQ_BITS="${RABITQ_BITS:-4}"
 SEARCH_MODE="${SEARCH_MODE:-rabitq_gpu}"
 INDEX_PREFIX="${INDEX_PREFIX:-/data/xjs/index/shine_gpu_index/1024dim50M}"
+INDEX_FILE="${INDEX_FILE:-${INDEX_PREFIX}_node1_of5.dat}"
 
 ARGS=(
   --num-clients "$NUM_CLIENTS"
   --port "$PORT"
   --mn-memory "$MN_MEMORY"
+  --index-file "$INDEX_FILE"
 )
 
 if [[ "$ENABLE_STORAGE_OWNER" == "1" ]]; then

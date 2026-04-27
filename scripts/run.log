@@ -16,8 +16,8 @@ nohup: ignoring input
   测量时长:       60s
   操作粒度:       single_vector
   Query 文件:     synthetic
-  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260427_211909.json
-  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260427_211909.txt
+  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260427_213359.json
+  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260427_213359.txt
 
 ============================================================
                         CLIENT
@@ -71,55 +71,55 @@ interleaved policy
 client id: 0
 number of clients: 1
 connect to server 192.168.6.202:1234
-pairing: 1135 -- 1136
+pairing: 1185 -- 1186
 connect to server 192.168.6.202:1235
-pairing: 1136 -- 1137
+pairing: 1186 -- 1187
 connect to server 192.168.6.202:1236
-pairing: 1137 -- 1138
+pairing: 1187 -- 1188
 connect to server 192.168.6.202:1237
-pairing: 1138 -- 1139
+pairing: 1188 -- 1189
 connect to server 192.168.6.202:1238
-pairing: 1139 -- 1140
+pairing: 1189 -- 1190
 [STATUS]: pinned main thread to core 28
 [STATUS]: receive access tokens of remote memory regions
 [STATUS]: search mode: rabitq_gpu, cache=on
 [STATUS]: max cache size: 12859999846
-allocated ALIGNED MEM (no hugepage) at 140163674009664 with buffer size 53687091200
+allocated ALIGNED MEM (no hugepage) at 139910405156928 with buffer size 53687091200
 num cache buckets: 2499999
 allocate cache entries hugepage of size 99999960
-allocated ALIGNED MEM (no hugepage) at 140163574005824 with buffer size 99999960
+allocated ALIGNED MEM (no hugepage) at 139910305153088 with buffer size 99999960
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1140 -- 1141
-pairing: 1141 -- 1143
-pairing: 1142 -- 1144
-pairing: 1143 -- 1145
-pairing: 1144 -- 1142
+pairing: 1190 -- 1191
+pairing: 1191 -- 1192
+pairing: 1192 -- 1193
+pairing: 1193 -- 1194
+pairing: 1194 -- 1195
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1145 -- 1149
-pairing: 1146 -- 1146
-pairing: 1147 -- 1148
-pairing: 1148 -- 1147
-pairing: 1149 -- 1150
+pairing: 1195 -- 1197
+pairing: 1196 -- 1196
+pairing: 1197 -- 1198
+pairing: 1198 -- 1199
+pairing: 1199 -- 1200
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1150 -- 1153
-pairing: 1151 -- 1151
-pairing: 1152 -- 1155
-pairing: 1153 -- 1152
-pairing: 1154 -- 1154
+pairing: 1200 -- 1202
+pairing: 1201 -- 1201
+pairing: 1202 -- 1203
+pairing: 1203 -- 1205
+pairing: 1204 -- 1204
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1155 -- 1156
-pairing: 1156 -- 1158
-pairing: 1157 -- 1157
-pairing: 1158 -- 1159
-pairing: 1159 -- 1160
+pairing: 1205 -- 1206
+pairing: 1206 -- 1208
+pairing: 1207 -- 1207
+pairing: 1208 -- 1209
+pairing: 1209 -- 1210
 [STATUS]: neighbor cache worker 0: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
 [GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
@@ -192,15 +192,28 @@ pairing: 1159 -- 1160
 [breakdown] query data ready: count=65536
 [breakdown] effective insert start id=50010000
 [breakdown] starting warmup mixed
-[breakdown][warmup-mixed] progress elapsed=5.02095s/30s, completed=1278 ops, rate=254.533 ops/s
-Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=1
+[breakdown][warmup-mixed] progress elapsed=5.01323s/30s, completed=1450 ops, rate=289.235 ops/s
+Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=8589934593
 Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=12884901889
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=1
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=12884901890
+Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=8589934594
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=4294967296
 Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=12884901889
 Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=12884901889
-Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=12884901890
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=1
-free(): corrupted unsorted chunks
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=8589934592
-./run_breakdown_test.sh: line 206: 1441353 Aborted                 (core dumped) "$BINARY" "${ARGS[@]}"
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=12884901889
+[breakdown] fatal signal, backtrace:
+
+/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0x176ca)[0x55f4c682a6ca]
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=8589934594
+/usr/lib/x86_64-linux-gnu/libc.so.6(+0x42520)[0x7f4c57e1a520]
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=4294967296/usr/lib/x86_64-linux-gnu/libc.so.6(+0x453fc)[0x7f4c57e1d3fc]
+
+/usr/lib/x86_64-linux-gnu/libc.so.6(on_exit+0x0)[0x7f4c57e1d610]
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=8589934594/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0xa3459)[0x55f4c68b6459]
+
+/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0x80e78)[0x55f4c6893e78]
+/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0x821a3)[0x55f4c68951a3]
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=8589934593
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=8589934594
+/home/xjs/anaconda3/lib/libstdc++.so.6(+0xd828c)[0x7f4c5ed8a28c]
+/usr/lib/x86_64-linux-gnu/libc.so.6(+0x94b43)[0x7f4c57e6cb43]
+/usr/lib/x86_64-linux-gnu/libc.so.6(+0x126a00)[0x7f4c57efea00]
