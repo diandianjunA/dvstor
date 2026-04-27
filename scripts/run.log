@@ -16,8 +16,8 @@ nohup: ignoring input
   测量时长:       60s
   操作粒度:       single_vector
   Query 文件:     synthetic
-  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260427_213359.json
-  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260427_213359.txt
+  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260427_214304.json
+  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260427_214304.txt
 
 ============================================================
                         CLIENT
@@ -71,55 +71,55 @@ interleaved policy
 client id: 0
 number of clients: 1
 connect to server 192.168.6.202:1234
-pairing: 1185 -- 1186
+pairing: 1210 -- 1231
 connect to server 192.168.6.202:1235
-pairing: 1186 -- 1187
+pairing: 1211 -- 1232
 connect to server 192.168.6.202:1236
-pairing: 1187 -- 1188
+pairing: 1212 -- 1233
 connect to server 192.168.6.202:1237
-pairing: 1188 -- 1189
+pairing: 1213 -- 1234
 connect to server 192.168.6.202:1238
-pairing: 1189 -- 1190
+pairing: 1214 -- 1235
 [STATUS]: pinned main thread to core 28
 [STATUS]: receive access tokens of remote memory regions
 [STATUS]: search mode: rabitq_gpu, cache=on
 [STATUS]: max cache size: 12859999846
-allocated ALIGNED MEM (no hugepage) at 139910405156928 with buffer size 53687091200
+allocated ALIGNED MEM (no hugepage) at 140206221029440 with buffer size 53687091200
 num cache buckets: 2499999
 allocate cache entries hugepage of size 99999960
-allocated ALIGNED MEM (no hugepage) at 139910305153088 with buffer size 99999960
+allocated ALIGNED MEM (no hugepage) at 140206121025600 with buffer size 99999960
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1190 -- 1191
-pairing: 1191 -- 1192
-pairing: 1192 -- 1193
-pairing: 1193 -- 1194
-pairing: 1194 -- 1195
+pairing: 1215 -- 1237
+pairing: 1216 -- 1236
+pairing: 1217 -- 1238
+pairing: 1218 -- 1239
+pairing: 1219 -- 1240
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1195 -- 1197
-pairing: 1196 -- 1196
-pairing: 1197 -- 1198
-pairing: 1198 -- 1199
-pairing: 1199 -- 1200
+pairing: 1220 -- 1242
+pairing: 1221 -- 1243
+pairing: 1222 -- 1241
+pairing: 1223 -- 1244
+pairing: 1224 -- 1245
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1200 -- 1202
-pairing: 1201 -- 1201
-pairing: 1202 -- 1203
-pairing: 1203 -- 1205
-pairing: 1204 -- 1204
+pairing: 1225 -- 1247
+pairing: 1226 -- 1246
+pairing: 1227 -- 1249
+pairing: 1228 -- 1248
+pairing: 1229 -- 1250
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1205 -- 1206
-pairing: 1206 -- 1208
-pairing: 1207 -- 1207
-pairing: 1208 -- 1209
-pairing: 1209 -- 1210
+pairing: 1230 -- 1252
+pairing: 1231 -- 1253
+pairing: 1232 -- 1251
+pairing: 1233 -- 1254
+pairing: 1234 -- 1255
 [STATUS]: neighbor cache worker 0: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
 [GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
@@ -192,28 +192,39 @@ pairing: 1209 -- 1210
 [breakdown] query data ready: count=65536
 [breakdown] effective insert start id=50010000
 [breakdown] starting warmup mixed
-[breakdown][warmup-mixed] progress elapsed=5.01323s/30s, completed=1450 ops, rate=289.235 ops/s
-Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=8589934593
+[breakdown][warmup-mixed] progress elapsed=5.01378s/30s, completed=1477 ops, rate=294.588 ops/s
+Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=3
+Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=1
+Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=12884901890
 Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=12884901889
-Send request failed: status=12 (transport retry counter exceeded), opcode=2, vendor_err=129, wr_id=8589934594
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=3
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=4294967299
 Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=4294967296
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=12884901889
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=12884901889
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=12884901889
+
 [breakdown] fatal signal, backtrace:
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=4294967299
+[breakdown] fatal signal, backtrace:
+/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0x176ca)[0x5635d24916ca]
 
-/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0x176ca)[0x55f4c682a6ca]
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=8589934594
-/usr/lib/x86_64-linux-gnu/libc.so.6(+0x42520)[0x7f4c57e1a520]
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=4294967296/usr/lib/x86_64-linux-gnu/libc.so.6(+0x453fc)[0x7f4c57e1d3fc]
+/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0x176ca)[0x5635d24916ca]
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=12884901889/usr/lib/x86_64-linux-gnu/libc.so.6(+0x42520)[0x7f9137e2d520]
+/usr/lib/x86_64-linux-gnu/libc.so.6(+0x42520)[0x7f9137e2d520]
 
-/usr/lib/x86_64-linux-gnu/libc.so.6(on_exit+0x0)[0x7f4c57e1d610]
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=8589934594/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0xa3459)[0x55f4c68b6459]
+/usr/local/cuda/lib64/libcudart.so.12(+0x3d8a8)[0x7f913ec3d8a8]
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=1/usr/lib/x86_64-linux-gnu/libc.so.6(+0x453fc)[0x7f9137e303fc]
+/usr/local/cuda/lib64/libcudart.so.12(+0x3f161)[0x7f913ec3f161]
 
-/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0x80e78)[0x55f4c6893e78]
-/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0x821a3)[0x55f4c68951a3]
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=8589934593
-Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=8589934594
-/home/xjs/anaconda3/lib/libstdc++.so.6(+0xd828c)[0x7f4c5ed8a28c]
-/usr/lib/x86_64-linux-gnu/libc.so.6(+0x94b43)[0x7f4c57e6cb43]
-/usr/lib/x86_64-linux-gnu/libc.so.6(+0x126a00)[0x7f4c57efea00]
+/usr/lib/x86_64-linux-gnu/libc.so.6(on_exit+0x0)[0x7f9137e30610]
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=12884901889/usr/local/cuda/lib64/libcudart.so.12(+0x3f619)[0x7f913ec3f619]
+/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0xa3459)[0x5635d251d459]
+
+/usr/local/cuda/lib64/libcudart.so.12(+0x255a8)[0x7f913ec255a8]
+/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0x80e78)[0x5635d24fae78]
+/usr/local/cuda/lib64/libcudart.so.12(+0x266c5)[0x7f913ec266c5]
+/home/xjs/experiment/dvstor/build/dvstor_breakdown_benchmark(+0x821a3)[0x5635d24fc1a3]
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=12884901890/usr/lib/x86_64-linux-gnu/libc.so.6(__cxa_finalize+0xb6)[0x7f9137e30a56]
+
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=12884901889
+/home/xjs/anaconda3/lib/libstdc++.so.6(+0xd828c)[0x7f91380eb28c]
+Send request failed: status=5 (Work Request Flushed Error), opcode=2, vendor_err=249, wr_id=1/usr/local/cuda/lib64/libcudart.so.12(+0xf7f3)[0x7f913ec0f7f3]
+

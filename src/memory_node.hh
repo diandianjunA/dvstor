@@ -499,6 +499,13 @@ private:
   }
 
   bool read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
+    lib_assert(rptr.memory_node() < num_storage_nodes_,
+               "invalid remote shard id in read_node_snapshot: " + std::to_string(rptr.memory_node()));
+    lib_assert(rptr.byte_offset() + VamanaNode::size_until_vector_end() <= mn_memory_bytes_,
+               "node snapshot read exceeds shard bounds: shard=" + std::to_string(rptr.memory_node()) +
+                 " offset=" + std::to_string(rptr.byte_offset()) +
+                 " size=" + std::to_string(VamanaNode::size_until_vector_end()) +
+                 " capacity=" + std::to_string(mn_memory_bytes_));
     snapshot = NodeSnapshot{};
     snapshot.rptr = rptr;
     snapshot.components.resize(VamanaNode::DIM);
@@ -523,6 +530,13 @@ private:
   }
 
   vec<RemotePtr> read_neighbor_list(RemotePtr rptr) {
+    lib_assert(rptr.memory_node() < num_storage_nodes_,
+               "invalid remote shard id in read_neighbor_list: " + std::to_string(rptr.memory_node()));
+    lib_assert(rptr.byte_offset() + VamanaNode::offset_neighbors() + VamanaNode::NEIGHBORS_SIZE <= mn_memory_bytes_,
+               "neighbor-list read exceeds shard bounds: shard=" + std::to_string(rptr.memory_node()) +
+                 " offset=" + std::to_string(rptr.byte_offset()) +
+                 " size=" + std::to_string(VamanaNode::offset_neighbors() + VamanaNode::NEIGHBORS_SIZE) +
+                 " capacity=" + std::to_string(mn_memory_bytes_));
     vec<RemotePtr> neighbors;
     if (local_shard(rptr.memory_node())) {
       const byte_t* ptr = local_node_ptr(rptr);
@@ -555,6 +569,13 @@ private:
   }
 
   void write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neighbors) {
+    lib_assert(rptr.memory_node() < num_storage_nodes_,
+               "invalid remote shard id in write_neighbor_list: " + std::to_string(rptr.memory_node()));
+    lib_assert(rptr.byte_offset() + VamanaNode::offset_neighbors() + VamanaNode::NEIGHBORS_SIZE <= mn_memory_bytes_,
+               "neighbor-list write exceeds shard bounds: shard=" + std::to_string(rptr.memory_node()) +
+                 " offset=" + std::to_string(rptr.byte_offset()) +
+                 " size=" + std::to_string(VamanaNode::offset_neighbors() + VamanaNode::NEIGHBORS_SIZE) +
+                 " capacity=" + std::to_string(mn_memory_bytes_));
     const u8 edge_count = static_cast<u8>(std::min<size_t>(neighbors.size(), VamanaNode::R));
     if (local_shard(rptr.memory_node())) {
       byte_t* ptr = local_node_ptr(rptr);
@@ -828,6 +849,17 @@ private:
   void remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, size_t bytes, size_t scratch_offset) {
     if (bytes == 0) return;
     lib_assert(peer_context_ != nullptr, "storage peer context is not initialized");
+    lib_assert(shard_id < num_storage_nodes_, "invalid peer shard id: " + std::to_string(shard_id));
+    lib_assert(peer_qps_[shard_id] != nullptr, "peer QP is not initialized for shard " + std::to_string(shard_id));
+    lib_assert(peer_remote_tokens_[shard_id] != nullptr,
+               "peer token is not initialized for shard " + std::to_string(shard_id));
+    lib_assert(peer_remote_tokens_[shard_id]->address != 0 && peer_remote_tokens_[shard_id]->rkey != 0,
+               "peer token is invalid for shard " + std::to_string(shard_id));
+    lib_assert(remote_offset + bytes <= mn_memory_bytes_,
+               "peer RDMA read exceeds shard bounds: shard=" + std::to_string(shard_id) +
+                 " offset=" + std::to_string(remote_offset) +
+                 " bytes=" + std::to_string(bytes) +
+                 " capacity=" + std::to_string(mn_memory_bytes_));
     lib_assert(scratch_offset + bytes <= peer_scratch_buffer_.buffer_size, "peer scratch buffer exhausted");
     byte_t* scratch = peer_scratch_buffer_.get_full_buffer() + scratch_offset;
     peer_qps_[shard_id]->post_send(reinterpret_cast<u64>(scratch),
@@ -847,6 +879,17 @@ private:
   void remote_write_bytes(u32 shard_id, u64 remote_offset, const void* src, size_t bytes, size_t scratch_offset) {
     if (bytes == 0) return;
     lib_assert(peer_context_ != nullptr, "storage peer context is not initialized");
+    lib_assert(shard_id < num_storage_nodes_, "invalid peer shard id: " + std::to_string(shard_id));
+    lib_assert(peer_qps_[shard_id] != nullptr, "peer QP is not initialized for shard " + std::to_string(shard_id));
+    lib_assert(peer_remote_tokens_[shard_id] != nullptr,
+               "peer token is not initialized for shard " + std::to_string(shard_id));
+    lib_assert(peer_remote_tokens_[shard_id]->address != 0 && peer_remote_tokens_[shard_id]->rkey != 0,
+               "peer token is invalid for shard " + std::to_string(shard_id));
+    lib_assert(remote_offset + bytes <= mn_memory_bytes_,
+               "peer RDMA write exceeds shard bounds: shard=" + std::to_string(shard_id) +
+                 " offset=" + std::to_string(remote_offset) +
+                 " bytes=" + std::to_string(bytes) +
+                 " capacity=" + std::to_string(mn_memory_bytes_));
     lib_assert(scratch_offset + bytes <= peer_scratch_buffer_.buffer_size, "peer scratch buffer exhausted");
     byte_t* scratch = peer_scratch_buffer_.get_full_buffer() + scratch_offset;
     std::memcpy(scratch, src, bytes);
@@ -865,6 +908,16 @@ private:
 
   u64 remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 expected, u64 desired, size_t scratch_offset) {
     lib_assert(peer_context_ != nullptr, "storage peer context is not initialized");
+    lib_assert(shard_id < num_storage_nodes_, "invalid peer shard id: " + std::to_string(shard_id));
+    lib_assert(peer_qps_[shard_id] != nullptr, "peer QP is not initialized for shard " + std::to_string(shard_id));
+    lib_assert(peer_remote_tokens_[shard_id] != nullptr,
+               "peer token is not initialized for shard " + std::to_string(shard_id));
+    lib_assert(peer_remote_tokens_[shard_id]->address != 0 && peer_remote_tokens_[shard_id]->rkey != 0,
+               "peer token is invalid for shard " + std::to_string(shard_id));
+    lib_assert(remote_offset + sizeof(u64) <= mn_memory_bytes_,
+               "peer CAS exceeds shard bounds: shard=" + std::to_string(shard_id) +
+                 " offset=" + std::to_string(remote_offset) +
+                 " capacity=" + std::to_string(mn_memory_bytes_));
     lib_assert(scratch_offset + sizeof(u64) <= peer_scratch_buffer_.buffer_size, "peer scratch buffer exhausted");
     auto* scratch = reinterpret_cast<u64*>(peer_scratch_buffer_.get_full_buffer() + scratch_offset);
     *scratch = 0;
