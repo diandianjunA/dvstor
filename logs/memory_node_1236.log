@@ -223,3 +223,103 @@ pairing: 1452 -- 1453
 allocated ALIGNED MEM (no hugepage) at 137670112051264 with buffer size 67108864
 [storage-peer][read] self_shard=2 target_shard=0 remote_base=135157711372352 rkey=1581312 offset=0 bytes=16
 Send request failed: status=10 (remote access error), opcode=0, vendor_err=136, wr_id=0
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1236
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/1024dim50M_node3_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 1458 -- 1337
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 128270173470784 with buffer size 53687091200
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node3_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 1463 -- 1342
+pairing: 1466 -- 1347
+pairing: 1473 -- 1352
+pairing: 1479 -- 1357
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node3_of5.dat
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 1485 -- 1489
+pairing: 1490 -- 1493
+pairing: 1495 -- 1492
+pairing: 1497 -- 1499
+[storage-peer][token] self_shard=2 local_base=128270173470784 local_rkey=1585408 local_bytes=53687091200
+[storage-peer][token] self_shard=2 peer_shard=0 remote_base=133509733679168 remote_rkey=1584640
+[storage-peer][token] self_shard=2 peer_shard=1 remote_base=124469186134080 remote_rkey=1584896
+[storage-peer][token] self_shard=2 peer_shard=3 remote_base=125813708030016 remote_rkey=1585664
+[storage-peer][token] self_shard=2 peer_shard=4 remote_base=133474092580928 remote_rkey=1585152
+allocated ALIGNED MEM (no hugepage) at 128270095876160 with buffer size 67108864
+[storage-peer][read] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=0 bytes=16
+[storage-peer][probe] self_shard=2 peer_shard=0 free_ptr=51440000016 medoid_raw=33618154200
+[storage-peer][read] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=0 bytes=16
+[storage-peer][probe] self_shard=2 peer_shard=1 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=2 target_shard=3 remote_base=125813708030016 rkey=1585664 offset=0 bytes=16
+[storage-peer][probe] self_shard=2 peer_shard=3 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=2 target_shard=4 remote_base=133474092580928 rkey=1585152 offset=0 bytes=16
+[storage-peer][probe] self_shard=2 peer_shard=4 free_ptr=51440000016 medoid_raw=0
+allocated ALIGNED MEM (no hugepage) at 98777702733568 with buffer size 4224
+[STATUS]: storage-owner insert runtime enabled on shard 2
+[storage-peer][read] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=8 bytes=8
+[storage-peer][read] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=33618154200 bytes=4112
+[storage-peer][read] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=33618154212 bytes=1
+[storage-peer][read] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=33618158832 bytes=512
+[storage-peer][read] self_shard=2 target_shard=4 remote_base=133474092580928 rkey=1585152 offset=17607402760 bytes=4112
+[storage-peer][read] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=47810753696 bytes=4112
+[storage-peer][read] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=23478496872 bytes=4112
+[storage-peer][read] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=25635329776 bytes=4112
+[storage-peer][read] self_shard=2 target_shard=3 remote_base=125813708030016 rkey=1585664 offset=49864346520 bytes=4112
+[storage-peer][read] self_shard=2 target_shard=3 remote_base=125813708030016 rkey=1585664 offset=27227325760 bytes=4112
+[storage-peer][read] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=21407753952 bytes=4112
+[storage-peer][read] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=15917002056 bytes=4112
+[storage-peer][cas] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=10333694168 expected=0 desired=1
+[storage-peer][write] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=10333694180 bytes=4
+[storage-peer][write] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=10333698800 bytes=512
+[storage-peer][write] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=10333694168 bytes=1
+[storage-peer][cas] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=27728443952 expected=0 desired=1
+[storage-peer][write] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=27728443964 bytes=4
+[storage-peer][write] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=27728448584 bytes=512
+[storage-peer][write] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=27728443952 bytes=1
+[storage-peer][cas] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=14058824648 expected=0 desired=1
+[storage-peer][write] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=14058824660 bytes=4
+[storage-peer][write] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=14058829280 bytes=512
+[storage-peer][write] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=14058824648 bytes=1
+[storage-peer][cas] self_shard=2 target_shard=3 remote_base=125813708030016 rkey=1585664 offset=33082087672 expected=0 desired=1
+[storage-peer][write] self_shard=2 target_shard=3 remote_base=125813708030016 rkey=1585664 offset=33082087684 bytes=4
+[storage-peer][write] self_shard=2 target_shard=3 remote_base=125813708030016 rkey=1585664 offset=33082092304 bytes=512
+[storage-peer][write] self_shard=2 target_shard=3 remote_base=125813708030016 rkey=1585664 offset=33082087672 bytes=1
+[storage-peer][cas] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=14189970928 expected=0 desired=1
+[storage-peer][write] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=14189970940 bytes=4
+[storage-peer][write] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=14189975560 bytes=512
+[storage-peer][write] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=14189970928 bytes=1
+[storage-peer][cas] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=51440005160 expected=0 desired=1
+[storage-peer][write] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=51440005172 bytes=4
+[storage-peer][cas] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=51440015448 expected=0 desired=1
+[storage-peer][cas] self_shard=2 target_shard=3 remote_base=125813708030016 rkey=1585664 offset=51440010304 expected=0 desired=1
+[storage-peer][cas] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=5788743832 expected=0 desired=1
+[storage-peer][cas] self_shard=2 target_shard=3 remote_base=125813708030016 rkey=1585664 offset=20655716584 expected=0 desired=1
+[storage-peer][cas] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=21704192384 expected=0 desired=1
+[storage-peer][cas] self_shard=2 target_shard=3 remote_base=125813708030016 rkey=1585664 offset=8370738624 expected=0 desired=1
+[storage-peer][cas] self_shard=2 target_shard=1 remote_base=124469186134080 rkey=1584896 offset=44102737304 expected=0 desired=1
+[storage-peer][cas] self_shard=2 target_shard=0 remote_base=133509733679168 rkey=1584640 offset=11005953240 expected=0 desired=1
+[storage-peer][cas] self_shard=2 target_shard=3 remote_base=125813708030016 rkey=1585664 offset=7445430760 expected=0 desired=1
+[storage-peer][cas] self_shard=2 target_shard=4 remote_base=133474092580928 rkey=1585152 offset=1665894704 expected=0 desired=1
