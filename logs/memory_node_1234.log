@@ -1119,3 +1119,36 @@ pairing: 74 -- 74
 pairing: 75 -- 75
 [STATUS]: waiting for commands from compute node...
 [STATUS]: loading index (4888000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim1M_node1_of1.dat
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1234
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 1111 -- 1109
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 138729601630272 with buffer size 53687091200
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 1116 -- 1114
+pairing: 1123 -- 1119
+pairing: 1126 -- 1124
+pairing: 1131 -- 1129
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node1_of5.dat
+allocated ALIGNED MEM (no hugepage) at 104955584693824 with buffer size 128
+[STATUS]: storage-owner insert runtime enabled on shard 0
+Receive request failed: status=1 (local length error), opcode=0, vendor_err=215, wr_id=0
