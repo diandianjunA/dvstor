@@ -70,7 +70,8 @@ public:
   explicit MemoryNode(Configuration& config)
       : context_(config), cm_(context_, config), num_clients_(config.num_clients),
         storage_id_(config.storage_id),
-        num_storage_nodes_(config.num_server_nodes()),
+        num_storage_nodes_(config.storage_peers.empty() ? config.num_server_nodes()
+                                                        : static_cast<u32>(config.storage_peers.size())),
         use_storage_owner_insert_(config.use_storage_owner_insert()),
         ip_distance_(config.ip_distance),
         index_region_(context_),
