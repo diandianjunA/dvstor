@@ -367,6 +367,16 @@ private:
     peer_scratch_buffer_.touch_memory();
     peer_scratch_region_ =
       std::make_unique<LocalMemoryRegion>(*peer_context_, peer_scratch_buffer_.get_full_buffer(), scratch_bytes);
+
+    for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
+      if (peer_id == storage_id_) continue;
+      u64 header_words[2]{};
+      remote_read_bytes(peer_id, 0, header_words, sizeof(header_words), 0);
+      std::cerr << "[storage-peer][probe] self_shard=" << storage_id_
+                << " peer_shard=" << peer_id
+                << " free_ptr=" << header_words[0]
+                << " medoid_raw=" << header_words[1] << std::endl;
+    }
   }
 
   void setup_insert_runtime() {
