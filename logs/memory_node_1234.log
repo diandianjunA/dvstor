@@ -393,3 +393,23 @@ pairing: 5885 -- 5886
 pairing: 5887 -- 5888
 pairing: 5889 -- 5890
 [STATUS]: waiting for commands from compute node...
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1234
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+1 device(s) found
+Selected device: mlx5_0
+Selected port state: 2, lid: 65535
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 59 -- 60
+[STATUS]: pinned main thread to core 28

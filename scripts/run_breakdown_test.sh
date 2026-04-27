@@ -29,7 +29,7 @@
 # 环境变量:
 #   SERVICE_CONFIG, WORKLOAD, READ_RATIO, CLIENT_THREADS, WARMUP_SECONDS,
 #   MEASURE_SECONDS, WARMUP_OPS, MEASURE_OPS, QUERY_FILE,
-#   REPORT_DIR, LABEL
+#   REPORT_DIR, LABEL, INSERT_START_ID
 #
 # 示例:
 #   ./run_breakdown_test.sh
@@ -43,7 +43,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY="$PROJECT_DIR/build/dvstor_breakdown_benchmark"
 
-SERVICE_CONFIG="${SERVICE_CONFIG:-$PROJECT_DIR/test/config/remote_singe_cn.ini}"
+SERVICE_CONFIG="${SERVICE_CONFIG:-$PROJECT_DIR/test/config/test/gpucache.ini}"
 WORKLOAD="${WORKLOAD:-mixed}"
 READ_RATIO="${READ_RATIO:-0.5}"
 CLIENT_THREADS="${CLIENT_THREADS:-16}"
@@ -54,6 +54,7 @@ MEASURE_OPS="${MEASURE_OPS:-}"
 QUERY_FILE="${QUERY_FILE:-}"
 REPORT_DIR="${REPORT_DIR:-$PROJECT_DIR/reports/breakdown}"
 LABEL="${LABEL:-$(date +%Y%m%d_%H%M%S)}"
+INSERT_START_ID="${INSERT_START_ID:-}"
 
 usage() {
     sed -n '/^# 用法:/,/^# =====/p' "$0" | sed 's/^# \?//'
@@ -73,6 +74,7 @@ while [[ $# -gt 0 ]]; do
         --query-file)        QUERY_FILE="$2"; shift 2 ;;
         --report-dir)        REPORT_DIR="$2"; shift 2 ;;
         --label)             LABEL="$2"; shift 2 ;;
+        --insert-start-id)   INSERT_START_ID="$2"; shift 2 ;;
         -h|--help)           usage ;;
         *)
             echo "未知参数: $1"
@@ -131,6 +133,10 @@ if [[ -n "$QUERY_FILE" ]]; then
     ARGS+=(--query-file "$QUERY_FILE")
 fi
 
+if [[ -n "$INSERT_START_ID" ]]; then
+    ARGS+=(--insert-start-id "$INSERT_START_ID")
+fi
+
 get_ini_value() {
     local key="$1"
     awk -F'=' -v k="$key" '
@@ -158,6 +164,11 @@ echo "  index-prefix:   $(get_ini_value index-prefix || true)"
 echo "  gpudirect-rdma: $(get_ini_value gpudirect-rdma || true)"
 echo "  neighbor-cache: $(get_ini_value neighbor-cache-mb || true) MB"
 echo "  gpu-rabitq-cache: $(get_ini_value gpu-rabitq-cache-mb || true) MB"
+if [[ -n "$INSERT_START_ID" ]]; then
+    echo "  insert-start-id: $INSERT_START_ID"
+else
+    echo "  insert-start-id: auto"
+fi
 echo "  负载模式:       $WORKLOAD"
 echo "  读比例:         $READ_RATIO"
 echo "  前台线程数:     $CLIENT_THREADS"
@@ -205,13 +216,17 @@ measure_seconds = get(doc, "meta", "measure_seconds", default=0)
 if mode != "time":
     measure_seconds = 0
 
-reads = get(doc, "meta", "measure_mixed", "completed_reads", default=0)
-writes = get(doc, "meta", "measure_mixed", "completed_writes", default=0)
-total_ops = reads + writes
-throughput = (total_ops / measure_seconds) if measure_seconds else 0.0
-
 q = get(doc, "query_breakdown", "latency", default={})
 i = get(doc, "insert_breakdown", "latency", default={})
+query_count = get(doc, "query_breakdown", "count", default=0)
+insert_count = get(doc, "insert_breakdown", "count", default=0)
+
+mixed_reads = get(doc, "meta", "measure_mixed", "completed_reads", default=0)
+mixed_writes = get(doc, "meta", "measure_mixed", "completed_writes", default=0)
+total_ops = query_count + insert_count
+throughput = (total_ops / measure_seconds) if measure_seconds else 0.0
+query_throughput = (query_count / measure_seconds) if measure_seconds else 0.0
+insert_throughput = (insert_count / measure_seconds) if measure_seconds else 0.0
 
 def ns_to_ms(x):
     return float(x) / 1_000_000.0
@@ -219,8 +234,10 @@ def ns_to_ms(x):
 print("\n[DVSTOR Breakdown] 关键指标")
 if measure_seconds:
     print(f"  throughput: {throughput:.2f} ops/s (total={total_ops}, duration={measure_seconds}s)")
-if reads or writes:
-    print(f"  mixed completed: reads={reads}, writes={writes}")
+    print(f"  query throughput: {query_throughput:.2f} ops/s (count={query_count})")
+    print(f"  insert throughput: {insert_throughput:.2f} ops/s (count={insert_count})")
+if mixed_reads or mixed_writes:
+    print(f"  mixed completed: reads={mixed_reads}, writes={mixed_writes}")
 if q:
     print(
         "  query latency(ms): "

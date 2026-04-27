@@ -42,10 +42,13 @@ public:
   u32 neighbor_cache_mb{0};
   u32 gpu_rabitq_cache_mb{0};
   str search_mode{"exact_gpu"};
+  str insert_execution{"compute"};
   u32 insert_workers{};
   u32 query_workers{};
   u32 insert_coroutines{};
   u32 query_coroutines{};
+  u32 storage_id{0};
+  vec<str> storage_peers;
 
   // Legacy aliases for compatibility
   u32& ef_search = beam_width;
@@ -73,6 +76,7 @@ public:
     add_options();
     process_program_options(argc, argv);
     search_mode = normalize_search_mode(search_mode);
+    insert_execution = normalize_search_mode(insert_execution);
 
     if (!is_server) {
       validate_compute_node_options(argv);
@@ -128,6 +132,8 @@ private:
       "Bits per dimension for RaBitQ quantization (1, 2, 4, or 8).")(
       "search-mode", po::value<str>(&search_mode)->default_value(search_mode),
       "Search mode for the query path: exact_gpu or rabitq_gpu.")(
+      "insert-execution", po::value<str>(&insert_execution)->default_value(insert_execution),
+      "Insert execution mode: compute or storage_owner.")(
       "insert-workers", po::value<u32>(&insert_workers)->default_value(0),
       "Dedicated insert worker threads. 0 keeps the built-in split.")(
       "query-workers", po::value<u32>(&query_workers)->default_value(0),
@@ -136,6 +142,10 @@ private:
       "Coroutines per insert worker. 0 uses the global coroutines value.")(
       "query-coroutines", po::value<u32>(&query_coroutines)->default_value(0),
       "Coroutines per query worker. 0 uses the built-in query default.")(
+      "storage-id", po::value<u32>(&storage_id)->default_value(0),
+      "Storage-node id used by storage_owner insert execution.")(
+      "storage-peers", po::value<vec<str>>(&storage_peers)->multitoken(),
+      "Ordered list of storage-peer endpoints used for storage_owner insert execution.")(
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
@@ -176,6 +186,11 @@ private:
       exit_with_help_message(argv);
     }
 
+    if (insert_execution != "compute" && insert_execution != "storage_owner") {
+      std::cerr << "[ERROR]: --insert-execution must be compute or storage_owner" << std::endl;
+      exit_with_help_message(argv);
+    }
+
     if (rabitq_bits != 1 && rabitq_bits != 2 && rabitq_bits != 4 && rabitq_bits != 8) {
       std::cerr << "[ERROR]: --rabitq-bits must be 1, 2, 4, or 8" << std::endl;
       exit_with_help_message(argv);
@@ -195,6 +210,24 @@ private:
       std::cerr << "[ERROR]: --insert-coroutines and --query-coroutines cannot exceed --coroutines" << std::endl;
       exit_with_help_message(argv);
     }
+
+    if (insert_execution == "storage_owner") {
+      if (routing) {
+        std::cerr << "[ERROR]: --insert-execution=storage_owner is not compatible with --routing in the current implementation"
+                  << std::endl;
+        exit_with_help_message(argv);
+      }
+      if (storage_peers.size() != num_server_nodes()) {
+        std::cerr << "[ERROR]: --storage-peers must list exactly one endpoint per storage node when "
+                     "--insert-execution=storage_owner"
+                  << std::endl;
+        exit_with_help_message(argv);
+      }
+      if (storage_id >= storage_peers.size()) {
+        std::cerr << "[ERROR]: --storage-id must be within the range of --storage-peers" << std::endl;
+        exit_with_help_message(argv);
+      }
+    }
   }
 
   static str normalize_search_mode(str value) {
@@ -210,6 +243,7 @@ public:
   }
 
   bool use_rabitq_search() const { return search_mode == "rabitq_gpu"; }
+  bool use_storage_owner_insert() const { return insert_execution == "storage_owner"; }
 
   friend std::ostream& operator<<(std::ostream& os, const IndexConfiguration& config) {
     os << static_cast<const Configuration&>(config);
@@ -238,6 +272,15 @@ public:
       os << std::setw(width) << "beam width (search): " << config.beam_width << std::endl;
       os << std::setw(width) << "beam width (construction): " << config.beam_width_construction << std::endl;
       os << std::setw(width) << "alpha: " << config.alpha << std::endl;
+      os << std::setw(width) << "insert execution: " << config.insert_execution << std::endl;
+      if (!config.storage_peers.empty()) {
+        os << std::setw(width) << "storage id: " << config.storage_id << std::endl;
+        os << std::setw(width) << "storage peers: " << "[";
+        for (const str& node : config.storage_peers) {
+          os << node << ", ";
+        }
+        os << "\b\b]" << std::endl;
+      }
       os << std::setw(width) << "RaBitQ bits: " << config.rabitq_bits << std::endl;
       os << std::setw(width) << "search mode: " << config.search_mode << std::endl;
       os << std::setw(width) << "insert workers: " << config.insert_workers << std::endl;

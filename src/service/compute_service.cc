@@ -150,6 +150,34 @@ ComputeService<Distance>::~ComputeService() {
 
 template <class Distance>
 size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
+  if (config_.use_storage_owner_insert()) {
+    size_t inserted = 0;
+    for (const auto& item : batch) {
+      if (item.values.size() != config_.dim) {
+        throw std::invalid_argument("insert dimension mismatch");
+      }
+
+      std::shared_ptr<service::breakdown::Sample> sample;
+      if (breakdown_enabled_) {
+        sample = std::make_shared<service::breakdown::Sample>(service::breakdown::Operation::insert);
+        const auto now = std::chrono::steady_clock::now();
+        sample->enqueued_at = now;
+        sample->mark_started(now, now, statistics::ThreadStatistics{});
+      }
+
+      const bool ok = insert_via_storage_owner(item, sample);
+      if (ok) {
+        ++inserted;
+      }
+      if (sample && sample->finished_flag) {
+        std::lock_guard<std::mutex> lock(breakdown_mutex_);
+        completed_insert_samples_.push_back(*sample);
+      }
+    }
+    vectors_inserted_.fetch_add(inserted, std::memory_order_relaxed);
+    return inserted;
+  }
+
   vec<service::InsertRequest*> requests;
   vec<std::future<bool>> futures;
   vec<std::shared_ptr<service::breakdown::Sample>> samples;
@@ -193,6 +221,53 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
   }
 
   return inserted;
+}
+
+template <class Distance>
+bool ComputeService<Distance>::insert_via_storage_owner(
+    const InsertItem& item,
+    const std::shared_ptr<service::breakdown::Sample>& sample) {
+  std::lock_guard<std::mutex> lock(storage_insert_rpc_mutex_);
+
+  const u32 owner_storage = num_servers_ == 0 ? 0 : static_cast<u32>(item.id % num_servers_);
+  const u64 request_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
+
+  service::storage_owner::InsertRequest request{};
+  request.dim = config_.dim;
+  request.id = item.id;
+  request.owner_storage = owner_storage;
+  request.source_client = cm_.client_id;
+  request.request_id = request_id;
+
+  const size_t request_size = service::storage_owner::request_bytes(config_.dim);
+  vec<byte_t> request_buffer(request_size);
+  std::memcpy(request_buffer.data(), &request, sizeof(request));
+  std::memcpy(request_buffer.data() + sizeof(request),
+              item.values.data(),
+              static_cast<size_t>(config_.dim) * sizeof(element_t));
+
+  LocalMemoryRegion request_region{context_, request_buffer.data(), request_buffer.size()};
+  service::storage_owner::InsertResponse response{};
+  LocalMemoryRegion response_region{context_, &response, sizeof(response)};
+
+  auto& qp = *cm_.server_qps[owner_storage];
+  qp.post_receive(response_region);
+  qp.post_send(request_region,
+               static_cast<u32>(request_buffer.size()),
+               IBV_WR_SEND,
+               true,
+               nullptr,
+               0,
+               0);
+  context_.poll_send_cq_until_completion();
+  context_.receive();
+
+  if (sample) {
+    sample->mark_finished(std::chrono::steady_clock::now(), statistics::ThreadStatistics{});
+  }
+  return response.magic == service::storage_owner::kInsertMagic &&
+         response.request_id == request_id &&
+         response.status == static_cast<u32>(service::storage_owner::InsertStatus::ok);
 }
 
 template <class Distance>
@@ -493,6 +568,17 @@ typename ComputeService<Distance>::ServiceProfile ComputeService<Distance>::reso
   ServiceProfile profile{};
   const u32 num_threads = config_.num_threads;
 
+  if (config_.use_storage_owner_insert()) {
+    profile.insert_workers = 0;
+    profile.query_workers = num_threads;
+    profile.insert_coroutines = 0;
+    profile.query_coroutines =
+      config_.query_coroutines == 0 ? std::min<u32>(config_.num_coroutines, 4) : config_.query_coroutines;
+    lib_assert(profile.query_coroutines > 0 && profile.query_coroutines <= config_.num_coroutines,
+               "invalid query coroutine count");
+    return profile;
+  }
+
   if (config_.insert_workers == 0 && config_.query_workers == 0) {
     profile.insert_workers = num_threads <= 1 ? 1 : std::clamp<u32>(num_threads / 2, 1, num_threads - 1);
     profile.query_workers = num_threads - profile.insert_workers;
@@ -562,6 +648,30 @@ bool ComputeService<Distance>::maybe_load_rabitq_artifacts(const filepath_t& ind
     if (error_message) {
       *error_message = "RaBitQ artifact size mismatch: expected " + std::to_string(VamanaNode::RABITQ_SIZE) +
                        ", got " + std::to_string(artifacts.rabitq_size);
+    }
+    return false;
+  }
+  if (artifacts.R != config_.R) {
+    if (error_message) {
+      *error_message = "index R mismatch: expected " + std::to_string(config_.R) +
+                       ", got " + std::to_string(artifacts.R) +
+                       ". Runtime R must match the offline index metadata.";
+    }
+    return false;
+  }
+  if (artifacts.beam_width_construction != config_.beam_width_construction) {
+    if (error_message) {
+      *error_message = "index construction beam-width mismatch: expected " +
+                       std::to_string(config_.beam_width_construction) + ", got " +
+                       std::to_string(artifacts.beam_width_construction);
+    }
+    return false;
+  }
+  if (artifacts.node_size != VamanaNode::total_size()) {
+    if (error_message) {
+      *error_message = "index node size mismatch: expected " + std::to_string(VamanaNode::total_size()) +
+                       ", got " + std::to_string(artifacts.node_size) +
+                       ". Runtime layout must match the offline index metadata.";
     }
     return false;
   }
@@ -1181,6 +1291,10 @@ void ComputeService<Distance>::refresh_routing_state(bool wait_for_remote_regist
 template <class Distance>
 void ComputeService<Distance>::shutdown_remote_if_requested() {
   if (!shutdown_remote_on_stop_ || !cm_.is_initiator) {
+    return;
+  }
+
+  if (config_.use_storage_owner_insert()) {
     return;
   }
 

@@ -4,15 +4,18 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <execinfo.h>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <signal.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unistd.h>
 
 #include "common/configuration.hh"
 #include "common/distance.hh"
@@ -22,6 +25,15 @@
 namespace {
 
 using ConfigMap = std::unordered_map<std::string, std::string>;
+
+void segfault_handler(int signal) {
+  void* frames[64];
+  const int count = backtrace(frames, 64);
+  const char header[] = "\n[breakdown] fatal signal, backtrace:\n";
+  (void)::write(STDERR_FILENO, header, sizeof(header) - 1);
+  backtrace_symbols_fd(frames, count, STDERR_FILENO);
+  _exit(128 + signal);
+}
 
 struct Args {
   std::string service_config_path;
@@ -37,6 +49,7 @@ struct Args {
   bool synthetic{false};
   std::string report_json_path;
   std::string report_text_path;
+  uint32_t insert_start_id{0};
 };
 
 struct MixedPhaseStats {
@@ -119,8 +132,13 @@ std::vector<std::string> build_service_argv(const std::string& service_config_pa
   static const std::vector<std::string> flag_keys = {
     "initiator", "cache", "routing", "load-index", "store-index", "disable-thread-pinning", "no-recall", "ip-dist",
     "gpudirect-rdma"};
+  static const std::vector<std::string> benchmark_only_keys = {"insert-start-id", "write-id-base"};
 
   for (const auto& [key, value] : config) {
+    if (std::find(benchmark_only_keys.begin(), benchmark_only_keys.end(), key) != benchmark_only_keys.end()) {
+      continue;
+    }
+
     const std::string option = "--" + key;
     if (std::find(flag_keys.begin(), flag_keys.end(), key) != flag_keys.end()) {
       if (is_truthy(value)) {
@@ -182,6 +200,8 @@ Args parse_args(int argc, char** argv) {
       args.report_json_path = require_value("--report-json");
     } else if (flag == "--report-text") {
       args.report_text_path = require_value("--report-text");
+    } else if (flag == "--insert-start-id") {
+      args.insert_start_id = static_cast<uint32_t>(std::stoul(require_value("--insert-start-id")));
     } else {
       throw std::runtime_error("unknown argument: " + flag);
     }
@@ -202,6 +222,16 @@ Args parse_args(int argc, char** argv) {
   }
   if (args.read_ratio < 0.0 || args.read_ratio > 1.0) {
     throw std::runtime_error("--read-ratio must be in [0, 1]");
+  }
+  if (args.insert_start_id == 0) {
+    const auto service_config = read_config(args.service_config_path);
+    auto it = service_config.find("insert-start-id");
+    if (it == service_config.end()) {
+      it = service_config.find("write-id-base");
+    }
+    if (it != service_config.end() && !it->second.empty()) {
+      args.insert_start_id = static_cast<uint32_t>(std::stoul(it->second));
+    }
   }
   const bool use_time_mode = args.warmup_seconds > 0 || args.measure_seconds > 0;
   if (use_time_mode && (args.warmup_seconds == 0 || args.measure_seconds == 0)) {
@@ -372,6 +402,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"operation_granularity", "single_vector"},
     {"client_threads", args.client_threads},
     {"read_ratio", args.read_ratio},
+    {"insert_start_id", args.insert_start_id},
     {"dim", service.config().dim},
     {"threads", service.config().num_threads},
     {"coroutines", service.config().num_coroutines},
@@ -382,6 +413,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
                                   ? std::max<size_t>(4096, args.client_threads * 256)
                                   : std::max<size_t>(2048, args.measure_ops);
   const size_t bootstrap_count = bootstrap_work;
+  std::cerr << "[breakdown] preparing workload: bootstrap_count=" << bootstrap_count
+            << ", workload=" << args.workload << std::endl;
   const bool needs_query_data = (args.workload == "query" || args.workload == "both" || args.workload == "mixed");
   const bool requires_rabitq_artifacts = service.config().use_rabitq_search() &&
                                          (args.workload == "insert" || args.workload == "both" || args.workload == "mixed");
@@ -395,6 +428,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   std::vector<uint32_t> bootstrap_ids(bootstrap_count);
   std::iota(bootstrap_ids.begin(), bootstrap_ids.end(), 1);
   const auto bootstrap_vectors = make_dataset(bootstrap_ids, dim);
+  std::cerr << "[breakdown] bootstrap vectors ready" << std::endl;
 
   if (needs_query_data && !service.config().load_index) {
     vec<typename ComputeService<Distance>::InsertItem> bootstrap_batch;
@@ -466,6 +500,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     query_data = make_dataset(query_ids, dim);
     root["meta"]["synthetic_query_vectors"] = query_count;
   }
+  std::cerr << "[breakdown] query data ready: count=" << query_count << std::endl;
 
   auto run_query_phase_ops = [&](const std::string& label, size_t ops) {
     std::atomic<size_t> completed_ops{0};
@@ -652,12 +687,24 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     };
   };
 
-  uint32_t next_insert_id = static_cast<uint32_t>(bootstrap_count + 10'000);
+  uint32_t next_insert_id = args.insert_start_id;
+  if (next_insert_id == 0) {
+    const uint64_t default_start = service.config().load_index
+                                     ? static_cast<uint64_t>(service.config().max_vectors) + 10'000ull
+                                     : static_cast<uint64_t>(bootstrap_count) + 10'000ull;
+    if (default_start > std::numeric_limits<uint32_t>::max()) {
+      throw std::runtime_error("default insert start id exceeds uint32_t; pass --insert-start-id explicitly");
+    }
+    next_insert_id = static_cast<uint32_t>(default_start);
+  }
+  root["meta"]["effective_insert_start_id"] = next_insert_id;
+  std::cerr << "[breakdown] effective insert start id=" << next_insert_id << std::endl;
   const bool use_time_mode = args.warmup_seconds > 0 || args.measure_seconds > 0;
   MixedPhaseStats warmup_mixed_stats{};
   MixedPhaseStats measure_mixed_stats{};
 
   if (args.workload == "insert" || args.workload == "both") {
+    std::cerr << "[breakdown] starting warmup insert" << std::endl;
     if (use_time_mode) {
       next_insert_id = run_insert_phase_seconds("warmup-insert", args.warmup_seconds, next_insert_id) + 1024;
     } else {
@@ -666,6 +713,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     }
   }
   if (args.workload == "query" || args.workload == "both") {
+    std::cerr << "[breakdown] starting warmup query" << std::endl;
     if (use_time_mode) {
       run_query_phase_seconds("warmup-query", args.warmup_seconds);
     } else {
@@ -673,6 +721,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     }
   }
   if (args.workload == "mixed") {
+    std::cerr << "[breakdown] starting warmup mixed" << std::endl;
     if (use_time_mode) {
       warmup_mixed_stats = run_mixed_phase_seconds("warmup-mixed", args.warmup_seconds, next_insert_id);
       next_insert_id = warmup_mixed_stats.next_insert_id + 1024;
@@ -684,6 +733,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
 
   service.clear_thread_statistics();
   service.reset_breakdown_state();
+  std::cerr << "[breakdown] starting measure phase" << std::endl;
 
   if (args.workload == "insert" || args.workload == "both") {
     if (use_time_mode) {
@@ -732,8 +782,37 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   const SampleReport report = service.collect_breakdown_report();
   root.update(report_to_json(report));
 
+  const bool has_throughput_duration = use_time_mode && args.measure_seconds > 0;
+  const double throughput_duration = has_throughput_duration ? static_cast<double>(args.measure_seconds) : 0.0;
+  const double query_throughput = has_throughput_duration
+                                    ? static_cast<double>(report.query.count) / throughput_duration
+                                    : 0.0;
+  const double insert_throughput = has_throughput_duration
+                                     ? static_cast<double>(report.insert.count) / throughput_duration
+                                     : 0.0;
+  const double total_throughput = query_throughput + insert_throughput;
+  root["throughput"] = {
+    {"duration_seconds", throughput_duration},
+    {"total_ops", report.query.count + report.insert.count},
+    {"total_ops_per_sec", total_throughput},
+    {"query_ops", report.query.count},
+    {"query_ops_per_sec", query_throughput},
+    {"insert_ops", report.insert.count},
+    {"insert_ops_per_sec", insert_throughput},
+  };
+
   nlohmann::json summaries = nlohmann::json::object();
   std::ostringstream text_summary;
+  if (has_throughput_duration) {
+    text_summary << "throughput\n";
+    text_summary << "  duration_seconds: " << throughput_duration << '\n';
+    text_summary << "  total_ops_per_sec: " << total_throughput
+                 << " (ops=" << (report.query.count + report.insert.count) << ")\n";
+    text_summary << "  query_ops_per_sec: " << query_throughput
+                 << " (ops=" << report.query.count << ")\n";
+    text_summary << "  insert_ops_per_sec: " << insert_throughput
+                 << " (ops=" << report.insert.count << ")\n";
+  }
   if (report.has_insert()) {
     const auto summary = aggregate_text_summary(report.insert);
     summaries["insert"] = summary;
@@ -770,6 +849,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
 }  // namespace
 
 int main(int argc, char** argv) {
+  signal(SIGSEGV, segfault_handler);
   const Args args = parse_args(argc, argv);
   auto service_args = build_service_argv(args.service_config_path);
   auto service_argv = make_argv(service_args);

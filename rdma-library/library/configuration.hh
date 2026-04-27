@@ -15,6 +15,7 @@ public:
   i32 max_recv_queue_wr{1024};
   i32 max_poll_cqes{16};
   u32 port{1234};
+  str ib_device;
   u32 device_port{1};
   bool is_server{false};
   vec<str> server_nodes;

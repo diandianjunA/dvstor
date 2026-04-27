@@ -270,9 +270,14 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
 struct ThreadCounterDelta {
   u64 rdma_read_bytes{};
   u64 rdma_write_bytes{};
+  u64 rdma_read_ops{};
+  u64 rdma_write_ops{};
   u64 neighbor_rdma_bytes{};
   u64 vector_rdma_bytes{};
   u64 rabitq_rdma_bytes{};
+  u64 neighbor_rdma_read_ops{};
+  u64 vector_rdma_read_ops{};
+  u64 rabitq_rdma_read_ops{};
   u64 h2d_bytes{};
   u64 d2h_bytes{};
   u64 l2_kernels{};
@@ -283,6 +288,13 @@ struct ThreadCounterDelta {
   u64 visited_neighborlists{};
   u64 remote_allocations{};
   u64 overflow_prunes{};
+  u64 overflow_prune_candidates{};
+  u64 overflow_prune_max_candidates{};
+  u64 overflow_prune_pair_checks_upper_bound{};
+  u64 overflow_prune_global_load_bytes_upper_bound{};
+  u64 overflow_prune_kernel_blocks{};
+  u64 overflow_prune_kernel_threads{};
+  u64 overflow_prune_max_kernel_threads{};
   u64 cache_hits{};
   u64 cache_misses{};
   u64 query_rdma_to_staging_bytes{};
@@ -293,6 +305,10 @@ struct ThreadCounterDelta {
   u64 gpu_rabitq_cache_misses{};
   u64 gpu_rabitq_cache_fills{};
   u64 gpu_rabitq_cache_fill_bytes{};
+  u64 gpu_rabitq_cache_gather_batches{};
+  u64 gpu_rabitq_cache_gather_bytes{};
+  u64 gpu_rabitq_cache_loading_fallbacks{};
+  u64 gpu_rabitq_cache_evictions{};
   u64 gpu_rabitq_cache_duplicate_fills{};
   u64 gpu_rabitq_cache_fallback_batches{};
 };
@@ -306,9 +322,14 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
   if (operation == Operation::query) {
     out.rdma_read_bytes = end.query_rdma_reads_in_bytes - start.query_rdma_reads_in_bytes;
     out.rdma_write_bytes = end.query_rdma_writes_in_bytes - start.query_rdma_writes_in_bytes;
+    out.rdma_read_ops = end.query_rdma_read_ops - start.query_rdma_read_ops;
+    out.rdma_write_ops = end.query_rdma_write_ops - start.query_rdma_write_ops;
     out.neighbor_rdma_bytes = end.query_neighbor_rdma_reads_in_bytes - start.query_neighbor_rdma_reads_in_bytes;
     out.vector_rdma_bytes = end.query_vector_rdma_reads_in_bytes - start.query_vector_rdma_reads_in_bytes;
     out.rabitq_rdma_bytes = end.query_rabitq_rdma_reads_in_bytes - start.query_rabitq_rdma_reads_in_bytes;
+    out.neighbor_rdma_read_ops = end.query_neighbor_rdma_read_ops - start.query_neighbor_rdma_read_ops;
+    out.vector_rdma_read_ops = end.query_vector_rdma_read_ops - start.query_vector_rdma_read_ops;
+    out.rabitq_rdma_read_ops = end.query_rabitq_rdma_read_ops - start.query_rabitq_rdma_read_ops;
     out.h2d_bytes = end.query_h2d_bytes - start.query_h2d_bytes;
     out.d2h_bytes = end.query_d2h_bytes - start.query_d2h_bytes;
     out.rabitq_kernels = end.query_rabitq_kernels - start.query_rabitq_kernels;
@@ -326,6 +347,14 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
     out.gpu_rabitq_cache_misses = end.gpu_rabitq_cache_misses - start.gpu_rabitq_cache_misses;
     out.gpu_rabitq_cache_fills = end.gpu_rabitq_cache_fills - start.gpu_rabitq_cache_fills;
     out.gpu_rabitq_cache_fill_bytes = end.gpu_rabitq_cache_fill_bytes - start.gpu_rabitq_cache_fill_bytes;
+    out.gpu_rabitq_cache_gather_batches =
+      end.gpu_rabitq_cache_gather_batches - start.gpu_rabitq_cache_gather_batches;
+    out.gpu_rabitq_cache_gather_bytes =
+      end.gpu_rabitq_cache_gather_bytes - start.gpu_rabitq_cache_gather_bytes;
+    out.gpu_rabitq_cache_loading_fallbacks =
+      end.gpu_rabitq_cache_loading_fallbacks - start.gpu_rabitq_cache_loading_fallbacks;
+    out.gpu_rabitq_cache_evictions =
+      end.gpu_rabitq_cache_evictions - start.gpu_rabitq_cache_evictions;
     out.gpu_rabitq_cache_duplicate_fills =
       end.gpu_rabitq_cache_duplicate_fills - start.gpu_rabitq_cache_duplicate_fills;
     out.gpu_rabitq_cache_fallback_batches =
@@ -335,15 +364,38 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
 
   out.rdma_read_bytes = end.build_rdma_reads_in_bytes - start.build_rdma_reads_in_bytes;
   out.rdma_write_bytes = end.build_rdma_writes_in_bytes - start.build_rdma_writes_in_bytes;
+  out.rdma_read_ops = end.build_rdma_read_ops - start.build_rdma_read_ops;
+  out.rdma_write_ops = end.build_rdma_write_ops - start.build_rdma_write_ops;
   out.neighbor_rdma_bytes = end.build_neighbor_rdma_reads_in_bytes - start.build_neighbor_rdma_reads_in_bytes;
   out.vector_rdma_bytes = end.build_vector_rdma_reads_in_bytes - start.build_vector_rdma_reads_in_bytes;
   out.rabitq_rdma_bytes = end.build_rabitq_rdma_reads_in_bytes - start.build_rabitq_rdma_reads_in_bytes;
+  out.neighbor_rdma_read_ops = end.build_neighbor_rdma_read_ops - start.build_neighbor_rdma_read_ops;
+  out.vector_rdma_read_ops = end.build_vector_rdma_read_ops - start.build_vector_rdma_read_ops;
+  out.rabitq_rdma_read_ops = end.build_rabitq_rdma_read_ops - start.build_rabitq_rdma_read_ops;
   out.h2d_bytes = end.build_h2d_bytes - start.build_h2d_bytes;
   out.d2h_bytes = end.build_d2h_bytes - start.build_d2h_bytes;
   out.l2_kernels = end.build_l2_kernels - start.build_l2_kernels;
   out.prune_kernels = end.build_prune_kernels - start.build_prune_kernels;
   out.remote_allocations = end.remote_allocations - start.remote_allocations;
   out.overflow_prunes = end.build_overflow_prunes - start.build_overflow_prunes;
+  out.overflow_prune_candidates =
+    end.build_overflow_prune_candidates - start.build_overflow_prune_candidates;
+  out.overflow_prune_max_candidates =
+    end.build_overflow_prune_max_candidates > start.build_overflow_prune_max_candidates
+      ? end.build_overflow_prune_max_candidates
+      : 0;
+  out.overflow_prune_pair_checks_upper_bound =
+    end.build_overflow_prune_pair_checks_upper_bound - start.build_overflow_prune_pair_checks_upper_bound;
+  out.overflow_prune_global_load_bytes_upper_bound =
+    end.build_overflow_prune_global_load_bytes_upper_bound - start.build_overflow_prune_global_load_bytes_upper_bound;
+  out.overflow_prune_kernel_blocks =
+    end.build_overflow_prune_kernel_blocks - start.build_overflow_prune_kernel_blocks;
+  out.overflow_prune_kernel_threads =
+    end.build_overflow_prune_kernel_threads - start.build_overflow_prune_kernel_threads;
+  out.overflow_prune_max_kernel_threads =
+    end.build_overflow_prune_max_kernel_threads > start.build_overflow_prune_max_kernel_threads
+      ? end.build_overflow_prune_max_kernel_threads
+      : 0;
   out.cache_hits = end.cache_hits - start.cache_hits;
   out.cache_misses = end.cache_misses - start.cache_misses;
   return out;
@@ -367,6 +419,8 @@ struct Sample {
   u64 lock_attempts{};
   u64 lock_retries{};
   u64 cas_failures{};
+  u64 overflow_prune_max_candidates{};
+  u64 overflow_prune_max_kernel_threads{};
   bool started_flag{};
   bool finished_flag{};
 
@@ -465,9 +519,14 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   const ThreadCounterDelta delta = sample.counters();
   aggregate.counters.rdma_read_bytes += delta.rdma_read_bytes;
   aggregate.counters.rdma_write_bytes += delta.rdma_write_bytes;
+  aggregate.counters.rdma_read_ops += delta.rdma_read_ops;
+  aggregate.counters.rdma_write_ops += delta.rdma_write_ops;
   aggregate.counters.neighbor_rdma_bytes += delta.neighbor_rdma_bytes;
   aggregate.counters.vector_rdma_bytes += delta.vector_rdma_bytes;
   aggregate.counters.rabitq_rdma_bytes += delta.rabitq_rdma_bytes;
+  aggregate.counters.neighbor_rdma_read_ops += delta.neighbor_rdma_read_ops;
+  aggregate.counters.vector_rdma_read_ops += delta.vector_rdma_read_ops;
+  aggregate.counters.rabitq_rdma_read_ops += delta.rabitq_rdma_read_ops;
   aggregate.counters.h2d_bytes += delta.h2d_bytes;
   aggregate.counters.d2h_bytes += delta.d2h_bytes;
   aggregate.counters.l2_kernels += delta.l2_kernels;
@@ -478,6 +537,20 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.visited_neighborlists += delta.visited_neighborlists;
   aggregate.counters.remote_allocations += delta.remote_allocations;
   aggregate.counters.overflow_prunes += delta.overflow_prunes;
+  aggregate.counters.overflow_prune_candidates += delta.overflow_prune_candidates;
+  aggregate.counters.overflow_prune_max_candidates =
+    std::max(aggregate.counters.overflow_prune_max_candidates, delta.overflow_prune_max_candidates);
+  aggregate.counters.overflow_prune_max_candidates =
+    std::max(aggregate.counters.overflow_prune_max_candidates, sample.overflow_prune_max_candidates);
+  aggregate.counters.overflow_prune_pair_checks_upper_bound += delta.overflow_prune_pair_checks_upper_bound;
+  aggregate.counters.overflow_prune_global_load_bytes_upper_bound +=
+    delta.overflow_prune_global_load_bytes_upper_bound;
+  aggregate.counters.overflow_prune_kernel_blocks += delta.overflow_prune_kernel_blocks;
+  aggregate.counters.overflow_prune_kernel_threads += delta.overflow_prune_kernel_threads;
+  aggregate.counters.overflow_prune_max_kernel_threads =
+    std::max(aggregate.counters.overflow_prune_max_kernel_threads, delta.overflow_prune_max_kernel_threads);
+  aggregate.counters.overflow_prune_max_kernel_threads =
+    std::max(aggregate.counters.overflow_prune_max_kernel_threads, sample.overflow_prune_max_kernel_threads);
   aggregate.counters.cache_hits += delta.cache_hits;
   aggregate.counters.cache_misses += delta.cache_misses;
   aggregate.counters.query_rdma_to_staging_bytes += delta.query_rdma_to_staging_bytes;
@@ -488,6 +561,10 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.gpu_rabitq_cache_misses += delta.gpu_rabitq_cache_misses;
   aggregate.counters.gpu_rabitq_cache_fills += delta.gpu_rabitq_cache_fills;
   aggregate.counters.gpu_rabitq_cache_fill_bytes += delta.gpu_rabitq_cache_fill_bytes;
+  aggregate.counters.gpu_rabitq_cache_gather_batches += delta.gpu_rabitq_cache_gather_batches;
+  aggregate.counters.gpu_rabitq_cache_gather_bytes += delta.gpu_rabitq_cache_gather_bytes;
+  aggregate.counters.gpu_rabitq_cache_loading_fallbacks += delta.gpu_rabitq_cache_loading_fallbacks;
+  aggregate.counters.gpu_rabitq_cache_evictions += delta.gpu_rabitq_cache_evictions;
   aggregate.counters.gpu_rabitq_cache_duplicate_fills += delta.gpu_rabitq_cache_duplicate_fills;
   aggregate.counters.gpu_rabitq_cache_fallback_batches += delta.gpu_rabitq_cache_fallback_batches;
   aggregate.lock_attempts += sample.lock_attempts;
@@ -560,9 +637,39 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
   out["counters"] = {
     {"rdma_read_bytes", aggregate.counters.rdma_read_bytes},
     {"rdma_write_bytes", aggregate.counters.rdma_write_bytes},
+    {"rdma_read_ops", aggregate.counters.rdma_read_ops},
+    {"rdma_write_ops", aggregate.counters.rdma_write_ops},
+    {"rdma_read_avg_bytes",
+     aggregate.counters.rdma_read_ops == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.rdma_read_bytes) /
+           static_cast<double>(aggregate.counters.rdma_read_ops)},
+    {"rdma_write_avg_bytes",
+     aggregate.counters.rdma_write_ops == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.rdma_write_bytes) /
+           static_cast<double>(aggregate.counters.rdma_write_ops)},
     {"neighbor_rdma_bytes", aggregate.counters.neighbor_rdma_bytes},
     {"vector_rdma_bytes", aggregate.counters.vector_rdma_bytes},
     {"rabitq_rdma_bytes", aggregate.counters.rabitq_rdma_bytes},
+    {"neighbor_rdma_read_ops", aggregate.counters.neighbor_rdma_read_ops},
+    {"vector_rdma_read_ops", aggregate.counters.vector_rdma_read_ops},
+    {"rabitq_rdma_read_ops", aggregate.counters.rabitq_rdma_read_ops},
+    {"neighbor_rdma_read_avg_bytes",
+     aggregate.counters.neighbor_rdma_read_ops == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.neighbor_rdma_bytes) /
+           static_cast<double>(aggregate.counters.neighbor_rdma_read_ops)},
+    {"vector_rdma_read_avg_bytes",
+     aggregate.counters.vector_rdma_read_ops == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.vector_rdma_bytes) /
+           static_cast<double>(aggregate.counters.vector_rdma_read_ops)},
+    {"rabitq_rdma_read_avg_bytes",
+     aggregate.counters.rabitq_rdma_read_ops == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.rabitq_rdma_bytes) /
+           static_cast<double>(aggregate.counters.rabitq_rdma_read_ops)},
     {"h2d_bytes", aggregate.counters.h2d_bytes},
     {"d2h_bytes", aggregate.counters.d2h_bytes},
     {"l2_kernels", aggregate.counters.l2_kernels},
@@ -573,6 +680,29 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"visited_neighborlists", aggregate.counters.visited_neighborlists},
     {"remote_allocations", aggregate.counters.remote_allocations},
     {"overflow_prunes", aggregate.counters.overflow_prunes},
+    {"overflow_prune_candidates", aggregate.counters.overflow_prune_candidates},
+    {"overflow_prune_avg_candidates",
+     aggregate.counters.overflow_prunes == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.overflow_prune_candidates) /
+           static_cast<double>(aggregate.counters.overflow_prunes)},
+    {"overflow_prune_max_candidates", aggregate.counters.overflow_prune_max_candidates},
+    {"overflow_prune_pair_checks_upper_bound", aggregate.counters.overflow_prune_pair_checks_upper_bound},
+    {"overflow_prune_global_load_bytes_upper_bound",
+     aggregate.counters.overflow_prune_global_load_bytes_upper_bound},
+    {"overflow_prune_kernel_blocks", aggregate.counters.overflow_prune_kernel_blocks},
+    {"overflow_prune_avg_kernel_blocks",
+     aggregate.counters.overflow_prunes == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.overflow_prune_kernel_blocks) /
+           static_cast<double>(aggregate.counters.overflow_prunes)},
+    {"overflow_prune_kernel_threads", aggregate.counters.overflow_prune_kernel_threads},
+    {"overflow_prune_avg_kernel_threads",
+     aggregate.counters.overflow_prunes == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.overflow_prune_kernel_threads) /
+           static_cast<double>(aggregate.counters.overflow_prunes)},
+    {"overflow_prune_max_kernel_threads", aggregate.counters.overflow_prune_max_kernel_threads},
     {"cache_hits", aggregate.counters.cache_hits},
     {"cache_misses", aggregate.counters.cache_misses},
     {"query_rdma_to_staging_bytes", aggregate.counters.query_rdma_to_staging_bytes},
@@ -583,6 +713,10 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"gpu_rabitq_cache_misses", aggregate.counters.gpu_rabitq_cache_misses},
     {"gpu_rabitq_cache_fills", aggregate.counters.gpu_rabitq_cache_fills},
     {"gpu_rabitq_cache_fill_bytes", aggregate.counters.gpu_rabitq_cache_fill_bytes},
+    {"gpu_rabitq_cache_gather_batches", aggregate.counters.gpu_rabitq_cache_gather_batches},
+    {"gpu_rabitq_cache_gather_bytes", aggregate.counters.gpu_rabitq_cache_gather_bytes},
+    {"gpu_rabitq_cache_loading_fallbacks", aggregate.counters.gpu_rabitq_cache_loading_fallbacks},
+    {"gpu_rabitq_cache_evictions", aggregate.counters.gpu_rabitq_cache_evictions},
     {"gpu_rabitq_cache_duplicate_fills", aggregate.counters.gpu_rabitq_cache_duplicate_fills},
     {"gpu_rabitq_cache_fallback_batches", aggregate.counters.gpu_rabitq_cache_fallback_batches},
     {"lock_attempts", aggregate.lock_attempts},

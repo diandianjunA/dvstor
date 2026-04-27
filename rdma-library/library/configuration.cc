@@ -36,6 +36,9 @@ void Configuration::create_rdma_options() {
   // configuration options
   desc.add_options()(
     "port", po::value<u32>(&port)->default_value(port), "TCP port")(
+    "ib-device",
+    po::value<str>(&ib_device),
+    "InfiniBand/RDMA device name, for example mlx5_0. Empty selects the first device.")(
     "ib-port",
     po::value<u32>(&device_port)->default_value(device_port),
     "Port of infiniband device")(
@@ -127,6 +130,8 @@ std::ostream& operator<<(std::ostream& os, const Configuration& config) {
        << std::endl;
   }
   os << std::setw(width) << "TCP port: " << config.port << std::endl
+     << std::setw(width) << "IB device: "
+     << (config.ib_device.empty() ? str{"<auto>"} : config.ib_device) << std::endl
      << std::setw(width) << "IB port: " << config.device_port << std::endl
      << std::setw(width) << "max outstanding CQEs: " << config.max_poll_cqes
      << std::endl

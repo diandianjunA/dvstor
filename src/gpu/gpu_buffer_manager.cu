@@ -78,6 +78,8 @@ void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
         CUDA_CHECK(cudaMallocHost(&s.h_distances, max_batch * sizeof(float)));
         CUDA_CHECK(cudaMallocHost(&s.h_pruned_indices, max_R * sizeof(uint32_t)));
         CUDA_CHECK(cudaMallocHost(&s.h_pruned_count, sizeof(uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&s.h_cache_positions, max_batch * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&s.h_cache_reorder, max_batch * sizeof(uint32_t)));
 
         // Device buffers
         CUDA_CHECK(cudaMalloc(&s.d_query, dim * sizeof(float)));
@@ -90,6 +92,11 @@ void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
         CUDA_CHECK(cudaMalloc(&s.d_pruned_indices, max_R * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&s.d_pruned_count, sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&s.d_query_factor, 3 * sizeof(float)));  // RabitqQueryFactor
+        s.scratch_fill_indices.reserve(max_batch);
+        s.scratch_fill_slots.reserve(max_batch);
+        s.scratch_fill_addrs.reserve(max_batch);
+        s.scratch_inflight_indices.reserve(max_batch);
+        s.scratch_cache_positions.reserve(max_batch);
 
     }
 
@@ -207,6 +214,8 @@ void GpuBufferManager::destroy() {
         if (s.h_distances) cudaFreeHost(s.h_distances);
         if (s.h_pruned_indices) cudaFreeHost(s.h_pruned_indices);
         if (s.h_pruned_count) cudaFreeHost(s.h_pruned_count);
+        if (s.h_cache_positions) cudaFreeHost(s.h_cache_positions);
+        if (s.h_cache_reorder) cudaFreeHost(s.h_cache_reorder);
 
         // Stream and event
         if (s.event) cudaEventDestroy(s.event);
@@ -218,7 +227,6 @@ void GpuBufferManager::destroy() {
     if (d_centroid_) cudaFree(d_centroid_);
     if (cublas_handle_) cublasDestroy(cublas_handle_);
     rabitq_cache_.destroy();
-
     delete[] states_;
     states_ = nullptr;
     cublas_handle_ = nullptr;

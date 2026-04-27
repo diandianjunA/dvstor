@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 struct ibv_mr;
@@ -12,8 +13,9 @@ namespace gpu {
 struct GpuRabitqCacheResolve {
   bool ok{false};
   uint32_t n{0};
-  uint32_t miss_count{0};
   uint32_t hit_count{0};
+  uint32_t fill_count{0};
+  uint32_t inflight_fallback_count{0};
   uint32_t duplicate_loading_count{0};
 };
 
@@ -37,13 +39,15 @@ public:
   GpuRabitqCacheResolve resolve_batch(const void* remote_ptrs,
                                       uint32_t n,
                                       uint32_t* out_slot_ids,
-                                      std::vector<uint32_t>& miss_indices,
-                                      std::vector<uint32_t>& miss_slots,
-                                      std::vector<uint64_t>& miss_addrs);
+                                      std::vector<uint32_t>& fill_indices,
+                                      std::vector<uint32_t>& fill_slots,
+                                      std::vector<uint64_t>& fill_addrs,
+                                      std::vector<uint32_t>& inflight_indices);
   void publish_batch(const std::vector<uint32_t>& slots);
   void acquire_slots(const uint32_t* slots, uint32_t n);
   void release_slots(const uint32_t* slots, uint32_t n);
   void rollback_loading(const std::vector<uint32_t>& slots);
+  uint64_t slot_addr(uint32_t slot) const;
 
 private:
   enum class State : uint8_t { empty = 0, loading = 1, ready = 2 };
@@ -63,7 +67,6 @@ private:
   void rehash_cluster(size_t pos);
   bool allocate_slot(uint32_t& slot);
   void free_slot(uint32_t slot);
-  uint64_t slot_addr(uint32_t slot) const;
 
   bool enabled_{false};
   void* pool_{nullptr};
@@ -80,6 +83,8 @@ private:
   std::vector<State> slot_states_;
   std::vector<uint8_t> slot_refs_;
   std::vector<uint32_t> slot_use_counts_;
+  mutable std::mutex mutex_;
+  size_t evictions_{0};
 };
 
 }  // namespace gpu

@@ -10,6 +10,9 @@ struct Artifacts {
   u32 rabitq_bits{};
   u32 num_memory_nodes{};
   u32 rabitq_size{};
+  u32 R{};
+  u32 beam_width_construction{};
+  u32 node_size{};
   vec<float> rotation_matrix;
   vec<float> rotated_centroid;
   double t_const{};

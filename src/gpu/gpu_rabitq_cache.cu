@@ -4,6 +4,7 @@
 #include <infiniband/verbs.h>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 namespace gpu {
 
@@ -78,19 +79,24 @@ void GpuRabitqCache::destroy() {
 GpuRabitqCacheResolve GpuRabitqCache::resolve_batch(const void* remote_ptrs,
                                                     uint32_t n,
                                                     uint32_t* out_slot_ids,
-                                                    std::vector<uint32_t>& miss_indices,
-                                                    std::vector<uint32_t>& miss_slots,
-                                                    std::vector<uint64_t>& miss_addrs) {
+                                                    std::vector<uint32_t>& fill_indices,
+                                                    std::vector<uint32_t>& fill_slots,
+                                                    std::vector<uint64_t>& fill_addrs,
+                                                    std::vector<uint32_t>& inflight_indices) {
   GpuRabitqCacheResolve result{};
   result.n = n;
   if (!enabled_) return result;
 
-  miss_indices.clear();
-  miss_slots.clear();
-  miss_addrs.clear();
-  miss_indices.reserve(n);
-  miss_slots.reserve(n);
-  miss_addrs.reserve(n);
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  fill_indices.clear();
+  fill_slots.clear();
+  fill_addrs.clear();
+  inflight_indices.clear();
+  fill_indices.reserve(n);
+  fill_slots.reserve(n);
+  fill_addrs.reserve(n);
+  inflight_indices.reserve(n);
 
   std::vector<uint32_t> newly_reserved;
   newly_reserved.reserve(n);
@@ -107,15 +113,19 @@ GpuRabitqCacheResolve GpuRabitqCache::resolve_batch(const void* remote_ptrs,
         ++result.hit_count;
       } else {
         ++result.duplicate_loading_count;
-        miss_indices.push_back(i);
-        miss_slots.push_back(slot);
-        miss_addrs.push_back(slot_addr(slot));
+        ++result.inflight_fallback_count;
+        out_slot_ids[i] = kInvalidSlot;
+        inflight_indices.push_back(i);
       }
       continue;
     }
 
     if (!allocate_slot(slot) || !insert_entry(key, slot)) {
-      rollback_loading(newly_reserved);
+      for (uint32_t reserved_slot : newly_reserved) {
+        if (reserved_slot >= slot_states_.size() || slot_states_[reserved_slot] != State::loading) continue;
+        remove_entry(slot_keys_[reserved_slot]);
+        free_slot(reserved_slot);
+      }
       return result;
     }
     slot_keys_[slot] = key;
@@ -123,17 +133,18 @@ GpuRabitqCacheResolve GpuRabitqCache::resolve_batch(const void* remote_ptrs,
     slot_refs_[slot] = 1;
     newly_reserved.push_back(slot);
     out_slot_ids[i] = slot;
-    miss_indices.push_back(i);
-    miss_slots.push_back(slot);
-    miss_addrs.push_back(slot_addr(slot));
+    ++result.fill_count;
+    fill_indices.push_back(i);
+    fill_slots.push_back(slot);
+    fill_addrs.push_back(slot_addr(slot));
   }
 
-  result.miss_count = static_cast<uint32_t>(miss_indices.size());
   result.ok = true;
   return result;
 }
 
 void GpuRabitqCache::publish_batch(const std::vector<uint32_t>& slots) {
+  std::lock_guard<std::mutex> lock(mutex_);
   for (uint32_t slot : slots) {
     if (slot < slot_states_.size()) {
       slot_states_[slot] = State::ready;
@@ -143,6 +154,7 @@ void GpuRabitqCache::publish_batch(const std::vector<uint32_t>& slots) {
 }
 
 void GpuRabitqCache::acquire_slots(const uint32_t* slots, uint32_t n) {
+  std::lock_guard<std::mutex> lock(mutex_);
   for (uint32_t i = 0; i < n; ++i) {
     const uint32_t slot = slots[i];
     if (slot < slot_use_counts_.size()) ++slot_use_counts_[slot];
@@ -150,6 +162,7 @@ void GpuRabitqCache::acquire_slots(const uint32_t* slots, uint32_t n) {
 }
 
 void GpuRabitqCache::release_slots(const uint32_t* slots, uint32_t n) {
+  std::lock_guard<std::mutex> lock(mutex_);
   for (uint32_t i = 0; i < n; ++i) {
     const uint32_t slot = slots[i];
     if (slot < slot_use_counts_.size() && slot_use_counts_[slot] > 0) {
@@ -159,6 +172,7 @@ void GpuRabitqCache::release_slots(const uint32_t* slots, uint32_t n) {
 }
 
 void GpuRabitqCache::rollback_loading(const std::vector<uint32_t>& slots) {
+  std::lock_guard<std::mutex> lock(mutex_);
   for (uint32_t slot : slots) {
     if (slot >= slot_states_.size() || slot_states_[slot] != State::loading) continue;
     remove_entry(slot_keys_[slot]);
@@ -245,6 +259,7 @@ bool GpuRabitqCache::allocate_slot(uint32_t& slot) {
     }
     remove_entry(slot_keys_[candidate]);
     free_slot(candidate);
+    ++evictions_;
     slot = candidate;
     return true;
   }

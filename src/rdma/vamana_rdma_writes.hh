@@ -13,12 +13,15 @@
 
 namespace rdma::vamana {
 
-inline void track_total_rdma_write(const u_ptr<ComputeThread>& thread, size_t bytes) {
+inline void track_total_rdma_write(const u_ptr<ComputeThread>& thread, size_t bytes, size_t ops = 1) {
     thread->stats.rdma_writes_in_bytes += bytes;
+    thread->stats.rdma_write_ops += ops;
     if (thread->is_query_worker()) {
         thread->stats.query_rdma_writes_in_bytes += bytes;
+        thread->stats.query_rdma_write_ops += ops;
     } else if (thread->is_insert_worker()) {
         thread->stats.build_rdma_writes_in_bytes += bytes;
+        thread->stats.build_rdma_write_ops += ops;
     }
 }
 
@@ -158,7 +161,7 @@ inline auto write_vamana_neighbors(const s_ptr<VamanaNode>& node,
         reinterpret_cast<u64*>(nbr_buffer)[i] = 0;
     }
 
-    track_total_rdma_write(thread, meta_size + VamanaNode::NEIGHBORS_SIZE);
+    track_total_rdma_write(thread, meta_size + VamanaNode::NEIGHBORS_SIZE, 2);
 
     const QP& qp = thread->ctx->qps[node->rptr.memory_node()]->qp;
 

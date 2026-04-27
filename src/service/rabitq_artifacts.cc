@@ -36,6 +36,9 @@ bool load_artifacts(const filepath_t& index_prefix, Artifacts& artifacts, str* e
     artifacts.rabitq_bits = metadata.at("rabitq_bits").get<u32>();
     artifacts.num_memory_nodes = metadata.at("num_memory_nodes").get<u32>();
     artifacts.rabitq_size = metadata.at("rabitq_size").get<u32>();
+    artifacts.R = metadata.at("R").get<u32>();
+    artifacts.beam_width_construction = metadata.at("beam_width_construction").get<u32>();
+    artifacts.node_size = metadata.at("node_size").get<u32>();
   } catch (const std::exception& e) {
     return fail(error_message, "invalid metadata file " + meta_file.string() + ": " + e.what());
   }

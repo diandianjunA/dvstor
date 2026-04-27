@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "gpu/gpu_rabitq_cache.hh"
 
@@ -51,6 +52,8 @@ struct CoroutineGpuState {
     float*    h_distances{nullptr};      // [max_batch]
     uint32_t* h_pruned_indices{nullptr}; // [R]
     uint32_t* h_pruned_count{nullptr};   // [1]
+    uint32_t* h_cache_positions{nullptr};// [max_batch]
+    uint32_t* h_cache_reorder{nullptr};  // [max_batch]
 
     // Per-coroutine device buffers
     float*    d_query{nullptr};
@@ -72,6 +75,12 @@ struct CoroutineGpuState {
 
     // RaBitQ query factor (device, 3 floats)
     void*     d_query_factor{nullptr};
+
+    std::vector<uint32_t> scratch_fill_indices;
+    std::vector<uint32_t> scratch_fill_slots;
+    std::vector<uint64_t> scratch_fill_addrs;
+    std::vector<uint32_t> scratch_inflight_indices;
+    std::vector<uint32_t> scratch_cache_positions;
 };
 
 class GpuBufferManager {

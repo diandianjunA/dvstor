@@ -19,6 +19,8 @@
 #   -p, --port <port>         RDMA 通信端口（默认: 1234）
 #       --mn-memory <GB>      内存节点内存（GB）（默认: 10）
 #       --index-file <path>   启动时直接加载本地 shard 文件
+#       --storage-id <id>     storage_owner 模式下的存储节点编号
+#       --storage-peers <...> storage_owner 模式下的 storage-storage 通信端点列表
 #   -f, --foreground          前台运行（默认后台运行）
 #   -h, --help                显示此帮助信息
 #
@@ -53,6 +55,8 @@ NUM_CLIENTS="${NUM_CLIENTS:-1}"
 PORT="${PORT:-1234}"
 MN_MEMORY="${MN_MEMORY:-10}"
 INDEX_FILE="${INDEX_FILE:-}"
+STORAGE_ID="${STORAGE_ID:-0}"
+STORAGE_PEERS="${STORAGE_PEERS:-}"
 FOREGROUND=false
 
 # ---- 帮助信息 ----
@@ -77,6 +81,16 @@ while [[ $# -gt 0 ]]; do
         -p|--port)         PORT="$2"; shift 2 ;;
         --mn-memory)       MN_MEMORY="$2"; shift 2 ;;
         --index-file)      INDEX_FILE="$2"; shift 2 ;;
+        --storage-id)      STORAGE_ID="$2"; shift 2 ;;
+        --storage-peers)
+            shift
+            STORAGE_PEERS_ARGS=()
+            while [[ $# -gt 0 && ! "$1" =~ ^- ]]; do
+                STORAGE_PEERS_ARGS+=("$1")
+                shift
+            done
+            STORAGE_PEERS="${STORAGE_PEERS_ARGS[*]}"
+            ;;
         -f|--foreground)   FOREGROUND=true; shift ;;
         -h|--help)         usage ;;
         *)                 EXTRA_ARGS+=("$1"); shift ;;
@@ -166,6 +180,12 @@ do_start() {
         args+=(--server-index-file "$INDEX_FILE")
     fi
 
+    if [[ -n "$STORAGE_PEERS" ]]; then
+        # shellcheck disable=SC2206
+        local storage_peer_list=( $STORAGE_PEERS )
+        args+=(--insert-execution storage_owner --storage-id "$STORAGE_ID" --storage-peers "${storage_peer_list[@]}")
+    fi
+
     args+=("${EXTRA_ARGS[@]}")
 
     echo "[DVSTOR Memory Node] 启动参数:"
@@ -174,6 +194,10 @@ do_start() {
     echo "  内存(GB):     $MN_MEMORY"
     if [[ -n "$INDEX_FILE" ]]; then
         echo "  索引文件:     $INDEX_FILE"
+    fi
+    if [[ -n "$STORAGE_PEERS" ]]; then
+        echo "  存储节点ID:   $STORAGE_ID"
+        echo "  存储端点:     $STORAGE_PEERS"
     fi
 
     if [[ "$FOREGROUND" == true ]]; then

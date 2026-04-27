@@ -26,39 +26,48 @@ struct BatchReadDestination {
     bool gpu_destination{false};
 };
 
-inline void track_total_rdma_read(const u_ptr<ComputeThread>& thread, size_t bytes) {
+inline void track_total_rdma_read(const u_ptr<ComputeThread>& thread, size_t bytes, size_t ops = 1) {
     thread->stats.rdma_reads_in_bytes += bytes;
+    thread->stats.rdma_read_ops += ops;
     if (thread->is_query_worker()) {
         thread->stats.query_rdma_reads_in_bytes += bytes;
+        thread->stats.query_rdma_read_ops += ops;
     } else if (thread->is_insert_worker()) {
         thread->stats.build_rdma_reads_in_bytes += bytes;
+        thread->stats.build_rdma_read_ops += ops;
     }
 }
 
-inline void track_neighbor_rdma_read(const u_ptr<ComputeThread>& thread, size_t bytes) {
-    track_total_rdma_read(thread, bytes);
+inline void track_neighbor_rdma_read(const u_ptr<ComputeThread>& thread, size_t bytes, size_t ops = 1) {
+    track_total_rdma_read(thread, bytes, ops);
     if (thread->is_query_worker()) {
         thread->stats.query_neighbor_rdma_reads_in_bytes += bytes;
+        thread->stats.query_neighbor_rdma_read_ops += ops;
     } else if (thread->is_insert_worker()) {
         thread->stats.build_neighbor_rdma_reads_in_bytes += bytes;
+        thread->stats.build_neighbor_rdma_read_ops += ops;
     }
 }
 
-inline void track_vector_rdma_read(const u_ptr<ComputeThread>& thread, size_t bytes) {
-    track_total_rdma_read(thread, bytes);
+inline void track_vector_rdma_read(const u_ptr<ComputeThread>& thread, size_t bytes, size_t ops = 1) {
+    track_total_rdma_read(thread, bytes, ops);
     if (thread->is_query_worker()) {
         thread->stats.query_vector_rdma_reads_in_bytes += bytes;
+        thread->stats.query_vector_rdma_read_ops += ops;
     } else if (thread->is_insert_worker()) {
         thread->stats.build_vector_rdma_reads_in_bytes += bytes;
+        thread->stats.build_vector_rdma_read_ops += ops;
     }
 }
 
-inline void track_rabitq_rdma_read(const u_ptr<ComputeThread>& thread, size_t bytes) {
-    track_total_rdma_read(thread, bytes);
+inline void track_rabitq_rdma_read(const u_ptr<ComputeThread>& thread, size_t bytes, size_t ops = 1) {
+    track_total_rdma_read(thread, bytes, ops);
     if (thread->is_query_worker()) {
         thread->stats.query_rabitq_rdma_reads_in_bytes += bytes;
+        thread->stats.query_rabitq_rdma_read_ops += ops;
     } else if (thread->is_insert_worker()) {
         thread->stats.build_rabitq_rdma_reads_in_bytes += bytes;
+        thread->stats.build_rabitq_rdma_read_ops += ops;
     }
 }
 
@@ -151,7 +160,7 @@ inline auto read_vamana_neighbors(RemotePtr node_rptr, const u_ptr<ComputeThread
     const size_t read_size = sizeof(u8) + VamanaNode::NEIGHBORS_SIZE;
     byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(read_size);
 
-    track_neighbor_rdma_read(thread, read_size);
+    track_neighbor_rdma_read(thread, read_size, 2);
 
     const QP& qp = thread->ctx->qps[node_rptr.memory_node()]->qp;
     thread->track_post();

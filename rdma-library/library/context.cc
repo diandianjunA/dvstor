@@ -5,9 +5,22 @@
 #include <unistd.h>
 
 #include <iostream>
+#include <sstream>
 
 #include "queue_pair.hh"
 #include "utils.hh"
+
+namespace {
+
+str describe_wc_failure(const char* operation, const ibv_wc& wc) {
+  std::ostringstream out;
+  out << operation << " request failed: status=" << wc.status << " ("
+      << ibv_wc_status_str(wc.status) << "), opcode=" << wc.opcode
+      << ", vendor_err=" << wc.vendor_err << ", wr_id=" << wc.wr_id;
+  return out.str();
+}
+
+}  // namespace
 
 Context::Context(Configuration& config,
                  const i32 device_idx,
@@ -18,10 +31,19 @@ Context::Context(Configuration& config,
 
   lib_assert(num_devices > 0, "No InfiniBand devices found");
   lib_assert(device_list != nullptr, "Device list is null");
-  lib_assert(0 <= device_idx && device_idx < num_devices,
-             "Device " + std::to_string(device_idx) + " not found");
-
-  device_ = device_list[device_idx];
+  if (!config_.ib_device.empty()) {
+    for (i32 i = 0; i < num_devices; ++i) {
+      if (config_.ib_device == ibv_get_device_name(device_list[i])) {
+        device_ = device_list[i];
+        break;
+      }
+    }
+    lib_assert(device_ != nullptr, "RDMA device " + config_.ib_device + " not found");
+  } else {
+    lib_assert(0 <= device_idx && device_idx < num_devices,
+               "Device " + std::to_string(device_idx) + " not found");
+    device_ = device_list[device_idx];
+  }
 
   std::cerr << num_devices << " device(s) found" << std::endl;
   std::cerr << "Selected device: " << ibv_get_device_name(device_) << std::endl;
@@ -36,6 +58,8 @@ Context::Context(Configuration& config,
   lib_assert(
     ibv_query_port(context_, config_.device_port, &port_attributes_) == 0,
     "Cannot query port " + std::to_string(config_.device_port));
+  std::cerr << "Selected port state: " << port_attributes_.state
+            << ", lid: " << port_attributes_.lid << std::endl;
 
   // create completion queues
   send_cq_ =
@@ -202,7 +226,7 @@ i32 Context::poll_recv_cq(ibv_wc* work_completion,
     // verify completion status
     for (i32 i = 0; i < num_entries; ++i) {
       lib_assert(work_completion[i].status == IBV_WC_SUCCESS,
-                 "Receive request failed");
+                 describe_wc_failure("Receive", work_completion[i]));
       lib_debug("Receive request completed");
 
       if (recv_info && work_completion[i].opcode == IBV_WC_RECV) {
@@ -262,7 +286,7 @@ i32 Context::poll_send_cq(ibv_wc* work_completion,
     // verify completion status
     for (i32 i = 0; i < num_entries; ++i) {
       lib_assert(work_completion[i].status == IBV_WC_SUCCESS,
-                 "Send request failed");
+                 describe_wc_failure("Send", work_completion[i]));
 
       id_handler(work_completion[i].wr_id);
     }

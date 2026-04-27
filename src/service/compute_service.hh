@@ -17,6 +17,7 @@
 #include "http/vamana_service_scheduler.hh"
 #include "memory_node.hh"
 #include "service/breakdown.hh"
+#include "service/storage_owner_protocol.hh"
 #include "service/rabitq_artifacts.hh"
 #include "vamana/vamana.hh"
 #include "worker_pool.hh"
@@ -112,6 +113,8 @@ private:
   void pause_workers();
   void resume_workers();
   vec<node_t> search_local(const vec<element_t>& query, u32 k);
+  bool insert_via_storage_owner(const InsertItem& item,
+                                const std::shared_ptr<service::breakdown::Sample>& sample);
   bool routing_enabled() const;
   size_t rpc_message_size() const;
   vec<element_t> compute_local_routing_centroid() const;
@@ -152,6 +155,7 @@ private:
   std::atomic<size_t> vectors_inserted_{0};
 
   std::mutex mn_command_mutex_;
+  std::mutex storage_insert_rpc_mutex_;
   std::atomic<bool> workers_paused_{false};
   std::atomic<u32> workers_idle_count_{0};
   std::atomic<bool> stopped_{false};
