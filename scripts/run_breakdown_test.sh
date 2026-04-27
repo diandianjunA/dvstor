@@ -41,9 +41,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BINARY="$PROJECT_DIR/build/dvstor_breakdown_benchmark"
+BUILD_DIR="${BUILD_DIR:-$PROJECT_DIR/build}"
+BINARY="$BUILD_DIR/dvstor_breakdown_benchmark"
 
-SERVICE_CONFIG="${SERVICE_CONFIG:-$PROJECT_DIR/test/config/test/gpucache.ini}"
+SERVICE_CONFIG="${SERVICE_CONFIG:-$PROJECT_DIR/test/config/test/storage_owner_gpucache.ini}"
 WORKLOAD="${WORKLOAD:-mixed}"
 READ_RATIO="${READ_RATIO:-0.5}"
 CLIENT_THREADS="${CLIENT_THREADS:-16}"
@@ -98,6 +99,17 @@ fi
 if [[ ! -x "$BINARY" ]]; then
     echo "错误: 找不到可执行文件 $BINARY"
     echo "请先编译项目: cd $PROJECT_DIR && mkdir -p build && cd build && cmake .. && make -j"
+    exit 1
+fi
+
+if [[ -f "$BUILD_DIR/CMakeCache.txt" ]] && grep -q '^DVSTOR_STORAGE_NODE_ONLY:BOOL=ON$' "$BUILD_DIR/CMakeCache.txt"; then
+    echo "错误: 当前 BUILD_DIR=$BUILD_DIR 是 DVSTOR_STORAGE_NODE_ONLY=ON 的存储节点专用构建目录。"
+    echo "该目录中的 dvstor_breakdown_benchmark 可能是旧产物，不会随当前源码更新。"
+    echo "请使用单独的 compute 构建目录，例如："
+    echo "  cmake -S $PROJECT_DIR -B $PROJECT_DIR/build-compute -DCMAKE_BUILD_TYPE=Release"
+    echo "  cmake --build $PROJECT_DIR/build-compute -j --target dvstor_breakdown_benchmark"
+    echo "然后再运行："
+    echo "  BUILD_DIR=$PROJECT_DIR/build-compute $0 ..."
     exit 1
 fi
 
