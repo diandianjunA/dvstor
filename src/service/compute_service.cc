@@ -125,6 +125,9 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
 
   wait_for_load_or_store();
   synchronize_clients_after_startup();
+  if (config_.use_storage_delta_insert()) {
+    connect_delta_query_channel();
+  }
   if (config_.load_index && config_.use_rabitq_search() && !rabitq_artifacts_ready_) {
     str artifact_error;
     lib_assert(maybe_load_rabitq_artifacts(config_.resolved_index_prefix(), &artifact_error), artifact_error);
@@ -232,6 +235,21 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
 }
 
 template <class Distance>
+void ComputeService<Distance>::connect_delta_query_channel() {
+  delta_query_config_ = std::make_unique<configuration::Configuration>(config_);
+  delta_query_context_ = std::make_unique<Context>(*delta_query_config_);
+  delta_query_server_qps_.clear();
+  delta_query_server_qps_.reserve(config_.num_server_nodes());
+
+  for (const str& node : config_.server_nodes) {
+    const auto endpoint = parse_endpoint(node, config_.port);
+    const u32 delta_port = endpoint.port + config_.delta_query_port_offset;
+    delta_query_server_qps_.emplace_back(
+      delta_query_context_->connect_to_server(endpoint.address, delta_port, cm_.client_id));
+  }
+}
+
+template <class Distance>
 size_t ComputeService<Distance>::insert_via_storage_owner(
     const vec<InsertItem>& batch,
     const vec<std::shared_ptr<service::breakdown::Sample>>& samples) {
@@ -321,7 +339,11 @@ size_t ComputeService<Distance>::insert_via_storage_owner(
 
 template <class Distance>
 service::QueryResult ComputeService<Distance>::search_storage_delta(const vec<element_t>& query, u32 k) {
-  std::lock_guard<std::mutex> lock(storage_rpc_mutex_);
+  if (!delta_query_context_ || delta_query_server_qps_.empty()) {
+    return {};
+  }
+
+  std::lock_guard<std::mutex> lock(delta_query_rpc_mutex_);
   const vec<u32> selected_shards = select_sealed_delta_shards(query);
   if (selected_shards.empty()) {
     return {};
@@ -334,10 +356,8 @@ service::QueryResult ComputeService<Distance>::search_storage_delta(const vec<el
 
   vec<vec<byte_t>> request_buffers(num_servers_, vec<byte_t>(request_size));
   vec<vec<byte_t>> response_buffers(num_servers_, vec<byte_t>(response_size));
-  vec<u_ptr<LocalMemoryRegion>> request_regions;
-  vec<u_ptr<LocalMemoryRegion>> response_regions;
-  request_regions.reserve(selected_shards.size());
-  response_regions.reserve(selected_shards.size());
+  vec<u_ptr<LocalMemoryRegion>> request_regions(num_servers_);
+  vec<u_ptr<LocalMemoryRegion>> response_regions(num_servers_);
 
   for (u32 shard : selected_shards) {
     auto* request = reinterpret_cast<service::storage_owner::DeltaSearchRequestHeader*>(request_buffers[shard].data());
@@ -349,26 +369,26 @@ service::QueryResult ComputeService<Distance>::search_storage_delta(const vec<el
     std::memcpy(service::storage_owner::delta_search_query(request_buffers[shard].data()),
                 query.data(),
                 static_cast<size_t>(config_.dim) * sizeof(element_t));
-    request_regions.push_back(std::make_unique<LocalMemoryRegion>(
-      context_, request_buffers[shard].data(), request_buffers[shard].size()));
-    response_regions.push_back(std::make_unique<LocalMemoryRegion>(
-      context_, response_buffers[shard].data(), response_buffers[shard].size()));
+    request_regions[shard] = std::make_unique<LocalMemoryRegion>(
+      context_, request_buffers[shard].data(), request_buffers[shard].size());
+    response_regions[shard] = std::make_unique<LocalMemoryRegion>(
+      context_, response_buffers[shard].data(), response_buffers[shard].size());
   }
 
   for (u32 shard : selected_shards) {
-    cm_.server_qps[shard]->post_receive(*response_regions[shard], static_cast<u32>(response_size));
+    delta_query_server_qps_[shard]->post_receive(*response_regions[shard], static_cast<u32>(response_size));
   }
   for (u32 shard : selected_shards) {
-    cm_.server_qps[shard]->post_send(*request_regions[shard],
-                                     static_cast<u32>(request_size),
-                                     IBV_WR_SEND,
-                                     true,
-                                     nullptr,
-                                     0,
-                                     0);
+    delta_query_server_qps_[shard]->post_send(*request_regions[shard],
+                                              static_cast<u32>(request_size),
+                                              IBV_WR_SEND,
+                                              true,
+                                              nullptr,
+                                              0,
+                                              0);
   }
-  context_.poll_send_cq_until_completion(static_cast<i32>(selected_shards.size()));
-  context_.receive(static_cast<i32>(selected_shards.size()));
+  delta_query_context_->poll_send_cq_until_completion(static_cast<i32>(selected_shards.size()));
+  delta_query_context_->receive(static_cast<i32>(selected_shards.size()));
 
   service::QueryResult merged;
   merged.reserve(static_cast<size_t>(selected_shards.size()) * result_capacity);

@@ -58,6 +58,7 @@ public:
   u32 delta_hot_mirror_max_vectors{2048};
   u32 delta_hot_mirror_max_age_ms{250};
   u32 delta_synopsis_top_shards{2};
+  u32 delta_query_port_offset{1000};
   u32 delta_merge_batch_size{32};
   u32 delta_merge_sleep_ms{2};
 
@@ -179,6 +180,9 @@ private:
       "delta-synopsis-top-shards",
       po::value<u32>(&delta_synopsis_top_shards)->default_value(delta_synopsis_top_shards),
       "Maximum number of storage shards probed for sealed-delta search.")(
+      "delta-query-port-offset",
+      po::value<u32>(&delta_query_port_offset)->default_value(delta_query_port_offset),
+      "TCP/RDMA port offset used for the dedicated storage-delta query channel.")(
       "delta-merge-batch-size",
       po::value<u32>(&delta_merge_batch_size)->default_value(delta_merge_batch_size),
       "Maximum number of vectors merged from sealed delta into the main graph per merge round.")(
@@ -258,6 +262,10 @@ private:
       }
       if (storage_owner_batch_max == 0) {
         std::cerr << "[ERROR]: --storage-owner-batch-max must be > 0" << std::endl;
+        exit_with_help_message(argv);
+      }
+      if (delta_query_port_offset == 0) {
+        std::cerr << "[ERROR]: --delta-query-port-offset must be > 0" << std::endl;
         exit_with_help_message(argv);
       }
       if (storage_peers.size() != num_server_nodes()) {

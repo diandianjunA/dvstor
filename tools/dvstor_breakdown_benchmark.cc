@@ -398,7 +398,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"measure_seconds", args.measure_seconds},
     {"run_mode", (args.warmup_seconds > 0 || args.measure_seconds > 0) ? "time" : "ops"},
     {"time_completion_policy", "drain"},
-    {"time_issue_policy", "bounded_by_observed_call_latency"},
+    {"time_issue_policy", "dedicated_read_write_threads_until_deadline"},
+    {"mixed_dispatch_policy", "thread_pool_split"},
     {"operation_granularity", "single_vector"},
     {"client_threads", args.client_threads},
     {"read_ratio", args.read_ratio},
@@ -534,8 +535,21 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     reporter.finish();
   };
 
+  const auto mixed_read_thread_count = [&]() -> size_t {
+    if (args.client_threads == 0) {
+      return 0;
+    }
+    if (args.read_ratio <= 0.0) {
+      return 0;
+    }
+    if (args.read_ratio >= 1.0) {
+      return args.client_threads;
+    }
+    const size_t rounded = static_cast<size_t>(std::llround(static_cast<double>(args.client_threads) * args.read_ratio));
+    return std::clamp<size_t>(rounded, 1, args.client_threads - 1);
+  };
+
   auto run_mixed_phase_ops = [&](const std::string& label, size_t ops, uint32_t start_id) -> MixedPhaseStats {
-    std::atomic<size_t> next_op{0};
     std::atomic<size_t> completed_ops{0};
     std::atomic<uint32_t> next_insert_id{start_id};
     std::atomic<size_t> next_query_idx{0};
@@ -543,38 +557,40 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     std::atomic<size_t> issued_writes{0};
     std::atomic<size_t> completed_reads{0};
     std::atomic<size_t> completed_writes{0};
+    const size_t read_target = static_cast<size_t>(std::llround(static_cast<double>(ops) * args.read_ratio));
+    const size_t write_target = ops >= read_target ? (ops - read_target) : 0;
+    std::atomic<size_t> next_read{0};
+    std::atomic<size_t> next_write{0};
+    const size_t read_threads = mixed_read_thread_count();
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(args.client_threads));
     std::vector<std::thread> threads;
     threads.reserve(args.client_threads);
     ProgressReporter reporter(label, completed_ops, ops, 0);
 
-    const size_t read_period = args.read_ratio >= 1.0 ? 1 : (args.read_ratio <= 0.0 ? std::numeric_limits<size_t>::max()
-                                                                                    : static_cast<size_t>(1.0 / (1.0 - args.read_ratio)));
-
     for (size_t tid = 0; tid < args.client_threads; ++tid) {
       threads.emplace_back([&, tid]() {
         start_barrier.arrive_and_wait();
-        for (;;) {
-          const size_t op_index = next_op.fetch_add(1, std::memory_order_relaxed);
-          if (op_index >= ops) {
-            break;
-          }
-
-          bool do_read = true;
-          if (args.read_ratio <= 0.0) {
-            do_read = false;
-          } else if (args.read_ratio < 1.0) {
-            do_read = ((op_index + 1) % read_period) != 0;
-          }
-
-          if (do_read) {
+        const bool do_read = tid < read_threads;
+        if (do_read) {
+          for (;;) {
+            const size_t read_index = next_read.fetch_add(1, std::memory_order_relaxed);
+            if (read_index >= read_target) {
+              break;
+            }
             issued_reads.fetch_add(1, std::memory_order_relaxed);
             const size_t query_idx = next_query_idx.fetch_add(1, std::memory_order_relaxed) % query_count;
             std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(query_idx * dim),
                                      query_data.begin() + static_cast<std::ptrdiff_t>((query_idx + 1) * dim));
             (void)service.search(query, service.config().k);
             completed_reads.fetch_add(1, std::memory_order_relaxed);
-          } else {
+            completed_ops.fetch_add(1, std::memory_order_relaxed);
+          }
+        } else {
+          for (;;) {
+            const size_t write_index = next_write.fetch_add(1, std::memory_order_relaxed);
+            if (write_index >= write_target) {
+              break;
+            }
             issued_writes.fetch_add(1, std::memory_order_relaxed);
             const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
             auto values = make_deterministic_vector(id, dim);
@@ -583,8 +599,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
             insert_items.push_back({id, vec<element_t>(values.begin(), values.end())});
             (void)service.insert(insert_items);
             completed_writes.fetch_add(1, std::memory_order_relaxed);
+            completed_ops.fetch_add(1, std::memory_order_relaxed);
           }
-          completed_ops.fetch_add(1, std::memory_order_relaxed);
         }
       });
     }
@@ -610,39 +626,20 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     std::atomic<size_t> issued_writes{0};
     std::atomic<size_t> completed_reads{0};
     std::atomic<size_t> completed_writes{0};
+    const size_t read_threads = mixed_read_thread_count();
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(args.client_threads));
     std::vector<std::thread> threads;
     threads.reserve(args.client_threads);
     ProgressReporter reporter(label, completed_ops, 0, seconds);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
 
-    const size_t read_period = args.read_ratio >= 1.0 ? 1 : (args.read_ratio <= 0.0 ? std::numeric_limits<size_t>::max()
-                                                                                    : static_cast<size_t>(1.0 / (1.0 - args.read_ratio)));
-
     for (size_t tid = 0; tid < args.client_threads; ++tid) {
       threads.emplace_back([&, tid]() {
         start_barrier.arrive_and_wait();
-        size_t local_op_index = tid;
-        std::chrono::nanoseconds avg_read_duration{0};
-        std::chrono::nanoseconds avg_write_duration{0};
-        size_t local_reads = 0;
-        size_t local_writes = 0;
+        const bool do_read = tid < read_threads;
         for (;;) {
-          bool do_read = true;
-          if (args.read_ratio <= 0.0) {
-            do_read = false;
-          } else if (args.read_ratio < 1.0) {
-            do_read = ((local_op_index + 1) % read_period) != 0;
-          }
-
-          if (do_read) {
-            if (!can_start_timed_operation(deadline, avg_read_duration, local_reads)) {
-              break;
-            }
-          } else {
-            if (!can_start_timed_operation(deadline, avg_write_duration, local_writes)) {
-              break;
-            }
+          if (std::chrono::steady_clock::now() >= deadline) {
+            break;
           }
 
           if (do_read) {
@@ -650,10 +647,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
             const size_t query_idx = next_query_idx.fetch_add(1, std::memory_order_relaxed) % query_count;
             std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(query_idx * dim),
                                      query_data.begin() + static_cast<std::ptrdiff_t>((query_idx + 1) * dim));
-            const auto started_at = std::chrono::steady_clock::now();
             (void)service.search(query, service.config().k);
-            update_avg_duration(avg_read_duration, started_at, local_reads);
-            ++local_reads;
             completed_reads.fetch_add(1, std::memory_order_relaxed);
           } else {
             issued_writes.fetch_add(1, std::memory_order_relaxed);
@@ -662,14 +656,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
             vec<typename ComputeService<Distance>::InsertItem> insert_items;
             insert_items.reserve(1);
             insert_items.push_back({id, vec<element_t>(values.begin(), values.end())});
-            const auto started_at = std::chrono::steady_clock::now();
             (void)service.insert(insert_items);
-            update_avg_duration(avg_write_duration, started_at, local_writes);
-            ++local_writes;
             completed_writes.fetch_add(1, std::memory_order_relaxed);
           }
           completed_ops.fetch_add(1, std::memory_order_relaxed);
-          local_op_index += args.client_threads;
         }
       });
     }

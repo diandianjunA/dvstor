@@ -147,6 +147,7 @@ private:
                                            const service::QueryResult& delta_results,
                                            u32 k) const;
   vec<u32> select_sealed_delta_shards(const vec<element_t>& query) const;
+  void connect_delta_query_channel();
   bool routing_enabled() const;
   size_t rpc_message_size() const;
   vec<element_t> compute_local_routing_centroid() const;
@@ -188,6 +189,7 @@ private:
 
   std::mutex mn_command_mutex_;
   std::mutex storage_rpc_mutex_;
+  std::mutex delta_query_rpc_mutex_;
   std::atomic<bool> workers_paused_{false};
   std::atomic<u32> workers_idle_count_{0};
   std::atomic<bool> stopped_{false};
@@ -197,6 +199,9 @@ private:
 
   std::unique_ptr<vamana::Vamana<Distance>> vamana_;
   std::unique_ptr<WorkerPool> worker_pool_;
+  std::unique_ptr<configuration::Configuration> delta_query_config_;
+  std::unique_ptr<Context> delta_query_context_;
+  QPs delta_query_server_qps_;
   ServiceProfile service_profile_{};
   bool rabitq_artifacts_ready_{false};
   service::InsertQueue insert_queue_;

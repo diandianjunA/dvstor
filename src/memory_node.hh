@@ -147,6 +147,7 @@ public:
       }
       setup_storage_peers(config);
       setup_insert_runtime(config);
+      setup_delta_query_channel(config);
       if (use_storage_delta_insert_) {
         start_delta_merge_worker(config);
       }
@@ -198,6 +199,13 @@ private:
     std::unique_ptr<LocalMemoryRegion> region;
     size_t message_bytes{};
     size_t recv_region_bytes{};
+  };
+
+  struct DeltaQueryRuntimeState {
+    HugePage<byte_t> buffer;
+    std::unique_ptr<LocalMemoryRegion> region;
+    size_t request_bytes{};
+    size_t response_offset{};
   };
 
   struct DeltaSegment {
@@ -462,6 +470,28 @@ private:
       context_, insert_runtime_.buffer.get_full_buffer(), insert_runtime_.buffer.buffer_size);
   }
 
+  void setup_delta_query_channel(Configuration& config) {
+    if (!use_storage_delta_insert_) {
+      return;
+    }
+
+    delta_query_config_ = std::make_unique<configuration::Configuration>(config);
+    delta_query_config_->port = config.port + config.delta_query_port_offset;
+    delta_query_context_ = std::make_unique<Context>(*delta_query_config_);
+    delta_query_cm_ = std::make_unique<ServerConnectionManager>(*delta_query_context_, *delta_query_config_);
+    delta_query_cm_->connect_to_clients();
+
+    delta_query_runtime_.request_bytes =
+      align_up(service::storage_owner::delta_search_request_bytes(config.dim));
+    const size_t delta_search_response_bytes = align_up(
+      service::storage_owner::delta_search_response_bytes(config.k * config.delta_result_kfactor));
+    delta_query_runtime_.response_offset = delta_query_runtime_.request_bytes * num_clients_;
+    delta_query_runtime_.buffer.allocate(delta_query_runtime_.response_offset + delta_search_response_bytes * num_clients_);
+    delta_query_runtime_.buffer.touch_memory();
+    delta_query_runtime_.region = std::make_unique<LocalMemoryRegion>(
+      *delta_query_context_, delta_query_runtime_.buffer.get_full_buffer(), delta_query_runtime_.buffer.buffer_size);
+  }
+
   void repost_peer_rpc_receive(u32 peer_id) {
     if (!peer_context_ || peer_id == storage_id_) {
       return;
@@ -602,6 +632,7 @@ private:
     print_status((use_storage_delta_insert_ ? "storage-delta" : "storage-owner") +
                  str{" insert runtime enabled on shard "} + std::to_string(storage_id_));
     vec<ibv_wc> recv_wcs(std::max<i32>(1, config.max_recv_queue_wr));
+    vec<ibv_wc> delta_recv_wcs(std::max<i32>(1, config.max_recv_queue_wr));
 
     for (u32 client_id = 0; client_id < num_clients_; ++client_id) {
       cm_.client_qps[client_id]->post_receive(
@@ -609,45 +640,84 @@ private:
         static_cast<u32>(insert_runtime_.request_bytes),
         client_id,
         static_cast<u64>(client_id) * insert_runtime_.request_bytes);
+      if (delta_query_cm_) {
+        delta_query_cm_->client_qps[client_id]->post_receive(
+          *delta_query_runtime_.region,
+          static_cast<u32>(delta_query_runtime_.request_bytes),
+          client_id,
+          static_cast<u64>(client_id) * delta_query_runtime_.request_bytes);
+      }
     }
 
     for (;;) {
       bool progressed = pump_peer_rpcs(config, false);
       const i32 num_received = context_.poll_recv_cq(recv_wcs.data(), static_cast<i32>(recv_wcs.size()));
+      const i32 num_delta_received = delta_query_context_
+                                       ? delta_query_context_->poll_recv_cq(delta_recv_wcs.data(),
+                                                                            static_cast<i32>(delta_recv_wcs.size()))
+                                       : 0;
+      progressed = progressed || num_received > 0 || num_delta_received > 0;
       if (num_received == 0) {
-        if (!progressed) {
+        if (num_delta_received == 0 && !progressed) {
           std::this_thread::yield();
         }
-        continue;
+      } else {
+        for (i32 i = 0; i < num_received; ++i) {
+          const u32 client_id = static_cast<u32>(recv_wcs[i].wr_id);
+          const size_t offset = static_cast<size_t>(client_id) * insert_runtime_.request_bytes;
+          const byte_t* payload = insert_runtime_.buffer.get_full_buffer() + offset;
+          const size_t bytes = recv_wcs[i].byte_len;
+
+          const size_t response_bytes = handle_storage_runtime_request(client_id, payload, bytes, config);
+          lib_assert(response_bytes > 0, "invalid storage runtime request");
+
+          cm_.client_qps[client_id]->post_send(
+            *insert_runtime_.region,
+            static_cast<u32>(response_bytes),
+            IBV_WR_SEND,
+            true,
+            nullptr,
+            0,
+            insert_runtime_.response_offset +
+              static_cast<size_t>(client_id) *
+                std::max(align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max)),
+                         align_up(service::storage_owner::delta_search_response_bytes(config.k * config.delta_result_kfactor))));
+          context_.poll_send_cq_until_completion();
+
+          cm_.client_qps[client_id]->post_receive(
+            *insert_runtime_.region,
+            static_cast<u32>(insert_runtime_.request_bytes),
+            client_id,
+            static_cast<u64>(client_id) * insert_runtime_.request_bytes);
+        }
       }
 
-      for (i32 i = 0; i < num_received; ++i) {
-        const u32 client_id = static_cast<u32>(recv_wcs[i].wr_id);
-        const size_t offset = static_cast<size_t>(client_id) * insert_runtime_.request_bytes;
-        const byte_t* payload = insert_runtime_.buffer.get_full_buffer() + offset;
-        const size_t bytes = recv_wcs[i].byte_len;
+      for (i32 i = 0; i < num_delta_received; ++i) {
+        const u32 client_id = static_cast<u32>(delta_recv_wcs[i].wr_id);
+        const size_t offset = static_cast<size_t>(client_id) * delta_query_runtime_.request_bytes;
+        const byte_t* payload = delta_query_runtime_.buffer.get_full_buffer() + offset;
+        const size_t bytes = delta_recv_wcs[i].byte_len;
 
-        const size_t response_bytes = handle_storage_runtime_request(client_id, payload, bytes, config);
-        lib_assert(response_bytes > 0, "invalid storage runtime request");
+        const size_t response_bytes = handle_storage_delta_search_request(client_id, payload, bytes, config);
+        lib_assert(response_bytes > 0, "invalid delta-search runtime request");
 
-        cm_.client_qps[client_id]->post_send(
-          *insert_runtime_.region,
+        delta_query_cm_->client_qps[client_id]->post_send(
+          *delta_query_runtime_.region,
           static_cast<u32>(response_bytes),
           IBV_WR_SEND,
           true,
           nullptr,
           0,
-          insert_runtime_.response_offset +
+          delta_query_runtime_.response_offset +
             static_cast<size_t>(client_id) *
-              std::max(align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max)),
-                       align_up(service::storage_owner::delta_search_response_bytes(config.k * config.delta_result_kfactor))));
-        context_.poll_send_cq_until_completion();
+              align_up(service::storage_owner::delta_search_response_bytes(config.k * config.delta_result_kfactor)));
+        delta_query_context_->poll_send_cq_until_completion();
 
-        cm_.client_qps[client_id]->post_receive(
-          *insert_runtime_.region,
-          static_cast<u32>(insert_runtime_.request_bytes),
+        delta_query_cm_->client_qps[client_id]->post_receive(
+          *delta_query_runtime_.region,
+          static_cast<u32>(delta_query_runtime_.request_bytes),
           client_id,
-          static_cast<u64>(client_id) * insert_runtime_.request_bytes);
+          static_cast<u64>(client_id) * delta_query_runtime_.request_bytes);
       }
     }
   }
@@ -655,6 +725,10 @@ private:
   size_t response_slot_bytes(const Configuration& config) const {
     return std::max(align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max)),
                     align_up(service::storage_owner::delta_search_response_bytes(config.k * config.delta_result_kfactor)));
+  }
+
+  size_t delta_query_response_slot_bytes(const Configuration& config) const {
+    return align_up(service::storage_owner::delta_search_response_bytes(config.k * config.delta_result_kfactor));
   }
 
   u32 max_delta_response_items(const Configuration& config) const {
@@ -729,9 +803,14 @@ private:
       return 0;
     }
 
+    byte_t* response_base = insert_runtime_.buffer.get_full_buffer() + insert_runtime_.response_offset;
+    size_t response_stride = response_slot_bytes(config);
+    if (delta_query_context_) {
+      response_base = delta_query_runtime_.buffer.get_full_buffer() + delta_query_runtime_.response_offset;
+      response_stride = delta_query_response_slot_bytes(config);
+    }
     auto* response_ptr = reinterpret_cast<service::storage_owner::DeltaSearchResponseHeader*>(
-      insert_runtime_.buffer.get_full_buffer() + insert_runtime_.response_offset +
-      static_cast<size_t>(client_id) * response_slot_bytes(config));
+      response_base + static_cast<size_t>(client_id) * response_stride);
     response_ptr->magic = service::storage_owner::kDeltaSearchMagic;
 
     const auto query = span<const element_t>{service::storage_owner::delta_search_query(payload), config.dim};
@@ -1824,6 +1903,9 @@ private:
 
   HugePage<byte_t> index_buffer_;
   MemoryRegion index_region_;
+  std::unique_ptr<configuration::Configuration> delta_query_config_;
+  std::unique_ptr<Context> delta_query_context_;
+  std::unique_ptr<ServerConnectionManager> delta_query_cm_;
   std::unique_ptr<configuration::Configuration> peer_config_;
   std::unique_ptr<Context> peer_context_;
   QPs peer_qps_;
@@ -1835,6 +1917,7 @@ private:
   std::unordered_map<u64, service::storage_owner::PeerRpcHeader> peer_rpc_responses_;
   u64 next_peer_request_id_{1};
   InsertRuntimeState insert_runtime_;
+  DeltaQueryRuntimeState delta_query_runtime_;
   std::mutex delta_mutex_;
   std::condition_variable delta_merge_cv_;
   std::unique_ptr<DeltaSegment> active_delta_;
