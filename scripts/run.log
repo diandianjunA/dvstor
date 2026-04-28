@@ -16,8 +16,8 @@ nohup: ignoring input
   测量时长:       60s
   操作粒度:       single_vector
   Query 文件:     synthetic
-  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260428_140423.json
-  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260428_140423.txt
+  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260428_141521.json
+  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260428_141521.txt
 
 ============================================================
                         CLIENT
@@ -76,55 +76,55 @@ interleaved policy
 client id: 0
 number of clients: 1
 connect to server 192.168.6.202:1234
-pairing: 1385 -- 1546
+pairing: 1410 -- 1591
 connect to server 192.168.6.202:1235
-pairing: 1386 -- 1547
+pairing: 1411 -- 1592
 connect to server 192.168.6.202:1236
-pairing: 1387 -- 1548
+pairing: 1412 -- 1593
 connect to server 192.168.6.202:1237
-pairing: 1388 -- 1549
+pairing: 1413 -- 1594
 connect to server 192.168.6.202:1238
-pairing: 1389 -- 1550
+pairing: 1414 -- 1595
 [STATUS]: pinned main thread to core 28
 [STATUS]: receive access tokens of remote memory regions
 [STATUS]: search mode: rabitq_gpu, cache=on
 [STATUS]: max cache size: 12859999846
-allocated ALIGNED MEM (no hugepage) at 140134951415872 with buffer size 53687091200
+allocated ALIGNED MEM (no hugepage) at 140141595193408 with buffer size 53687091200
 num cache buckets: 2499999
 allocate cache entries hugepage of size 99999960
-allocated ALIGNED MEM (no hugepage) at 140134851412032 with buffer size 99999960
+allocated ALIGNED MEM (no hugepage) at 140141435187264 with buffer size 99999960
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1390 -- 1552
-pairing: 1391 -- 1551
-pairing: 1392 -- 1553
-pairing: 1393 -- 1554
-pairing: 1394 -- 1555
+pairing: 1415 -- 1596
+pairing: 1416 -- 1597
+pairing: 1417 -- 1598
+pairing: 1418 -- 1599
+pairing: 1419 -- 1600
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1395 -- 1557
-pairing: 1396 -- 1559
-pairing: 1397 -- 1556
-pairing: 1398 -- 1560
-pairing: 1399 -- 1558
+pairing: 1420 -- 1601
+pairing: 1421 -- 1603
+pairing: 1422 -- 1602
+pairing: 1423 -- 1604
+pairing: 1424 -- 1605
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1400 -- 1561
-pairing: 1401 -- 1562
-pairing: 1402 -- 1563
-pairing: 1403 -- 1564
-pairing: 1404 -- 1565
+pairing: 1425 -- 1606
+pairing: 1426 -- 1607
+pairing: 1427 -- 1610
+pairing: 1428 -- 1609
+pairing: 1429 -- 1608
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1405 -- 1566
-pairing: 1406 -- 1567
-pairing: 1407 -- 1568
-pairing: 1408 -- 1569
-pairing: 1409 -- 1570
+pairing: 1430 -- 1611
+pairing: 1431 -- 1612
+pairing: 1432 -- 1613
+pairing: 1433 -- 1614
+pairing: 1434 -- 1615
 [STATUS]: neighbor cache worker 0: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
 [GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
@@ -197,7 +197,60 @@ pairing: 1409 -- 1570
 [breakdown] query data ready: count=65536
 [breakdown] effective insert start id=50010000
 [breakdown] starting warmup mixed
-[breakdown][warmup-mixed] progress elapsed=5.01224s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=10.0124s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=15.0125s/30s, completed=0 ops, rate=0 ops/s
-Receive request failed: status=5 (Work Request Flushed Error), opcode=0, vendor_err=244, wr_id=0
+[breakdown][warmup-mixed] progress elapsed=5.01364s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=10.0138s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=15.0139s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=20.014s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=25.0141s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=30.0142s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=35.0143s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=40.0144s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=45.0145s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=50.0146s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=55.0148s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=60.0149s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=65.0151s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=70.0152s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=75.0153s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=80.0154s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=85.0156s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=90.0157s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=95.0158s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=100.016s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=105.016s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=110.016s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=115.016s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=120.016s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=125.016s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=130.017s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=135.017s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=140.017s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=145.017s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=150.017s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=155.017s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=160.017s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=165.017s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=170.017s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=175.017s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=180.018s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=185.018s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=190.018s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=195.018s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=200.019s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=205.019s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=210.019s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=215.019s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=220.019s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=225.019s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=230.019s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=235.019s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=240.019s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=245.02s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=250.02s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=255.02s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=260.02s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=265.02s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=270.02s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=275.02s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=280.02s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=285.02s/30s, completed=0 ops, rate=0 ops/s
