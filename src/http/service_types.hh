@@ -9,6 +9,13 @@
 
 namespace service {
 
+struct QueryResultItem {
+  node_t id;
+  distance_t distance;
+};
+
+using QueryResult = vec<QueryResultItem>;
+
 struct InsertRequest {
   node_t id;
   vec<element_t> components;
@@ -20,7 +27,7 @@ struct InsertRequest {
 struct QueryRequest {
   vec<element_t> components;
   u32 k;
-  std::promise<vec<node_t>> result;
+  std::promise<QueryResult> result;
   std::chrono::steady_clock::time_point enqueued_at{std::chrono::steady_clock::now()};
   std::shared_ptr<breakdown::Sample> breakdown_sample{};
 };

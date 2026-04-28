@@ -446,7 +446,7 @@ public:
                 coro.handle.resume();
             }
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_cache_lookup, t_cache_lookup);
-            results.push_back(node->id());
+            results.push_back({node->id(), beam[i].distance});
         }
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_query_result_ids, t_result_ids);
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_query_finalize, t_finalize);

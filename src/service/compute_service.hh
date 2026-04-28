@@ -112,9 +112,14 @@ private:
   void stop_workers();
   void pause_workers();
   void resume_workers();
+  service::QueryResult search_local_result(const vec<element_t>& query, u32 k);
   vec<node_t> search_local(const vec<element_t>& query, u32 k);
   size_t insert_via_storage_owner(const vec<InsertItem>& batch,
                                   const vec<std::shared_ptr<service::breakdown::Sample>>& samples);
+  service::QueryResult search_storage_delta(const vec<element_t>& query, u32 k);
+  vec<node_t> merge_main_and_delta_results(const service::QueryResult& main_results,
+                                           const service::QueryResult& delta_results,
+                                           u32 k) const;
   bool routing_enabled() const;
   size_t rpc_message_size() const;
   vec<element_t> compute_local_routing_centroid() const;
@@ -156,6 +161,7 @@ private:
 
   std::mutex mn_command_mutex_;
   std::mutex storage_insert_rpc_mutex_;
+  std::mutex storage_delta_rpc_mutex_;
   std::atomic<bool> workers_paused_{false};
   std::atomic<u32> workers_idle_count_{0};
   std::atomic<bool> stopped_{false};

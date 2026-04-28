@@ -9,6 +9,7 @@
 #include "common/statistics.hh"
 #include "coroutine.hh"
 #include "gpu/gpu_buffer_manager.hh"
+#include "http/service_types.hh"
 #include "service/breakdown.hh"
 #include "shared_context.hh"
 
@@ -111,8 +112,8 @@ public:
   SharedContext<ComputeThread>* ctx{nullptr};  // initialized by WorkerPool
   u32 ctx_tid{};
 
-  // stores the k-NNs (node ids) of this thread's processed queries (for recall computation)
-  hashmap_t<node_t, vec<node_t>> query_results;
+  // stores the k-NNs and their distances of this thread's processed queries
+  hashmap_t<node_t, service::QueryResult> query_results;
 
   vec<u_ptr<VamanaCoroutine>> vamana_coroutines;
   vec<std::atomic<i32>> post_balances;  // per coroutine (RDMA)

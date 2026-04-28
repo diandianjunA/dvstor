@@ -186,7 +186,7 @@ void vamana_service_schedule_queries(vamana::Vamana<Distance>& vamana_idx,
             active_requests[cid]->result.set_value(std::move(it->second));
             thread->query_results.erase(it);
           } else {
-            active_requests[cid]->result.set_value(vec<node_t>{});
+            active_requests[cid]->result.set_value(service::QueryResult{});
           }
           active_requests[cid] = nullptr;
         }

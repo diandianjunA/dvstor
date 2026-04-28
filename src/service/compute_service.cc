@@ -150,7 +150,7 @@ ComputeService<Distance>::~ComputeService() {
 
 template <class Distance>
 size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
-  if (config_.use_storage_owner_insert()) {
+  if (config_.use_storage_owner_insert() || config_.use_storage_delta_insert()) {
     vec<std::shared_ptr<service::breakdown::Sample>> samples;
     samples.reserve(batch.size());
     for (const auto& item : batch) {
@@ -304,7 +304,107 @@ size_t ComputeService<Distance>::insert_via_storage_owner(
 }
 
 template <class Distance>
-vec<node_t> ComputeService<Distance>::search_local(const vec<element_t>& query, u32 k) {
+service::QueryResult ComputeService<Distance>::search_storage_delta(const vec<element_t>& query, u32 k) {
+  std::lock_guard<std::mutex> lock(storage_delta_rpc_mutex_);
+  if (num_servers_ == 0) {
+    return {};
+  }
+
+  const u32 requested_k = std::min<u32>(k, config_.k);
+  const u32 result_capacity = std::max<u32>(requested_k, requested_k * config_.delta_result_kfactor);
+  const size_t request_size = service::storage_owner::delta_search_request_bytes(config_.dim);
+  const size_t response_size = service::storage_owner::delta_search_response_bytes(result_capacity);
+
+  vec<vec<byte_t>> request_buffers(num_servers_, vec<byte_t>(request_size));
+  vec<vec<byte_t>> response_buffers(num_servers_, vec<byte_t>(response_size));
+  vec<u_ptr<LocalMemoryRegion>> request_regions;
+  vec<u_ptr<LocalMemoryRegion>> response_regions;
+  request_regions.reserve(num_servers_);
+  response_regions.reserve(num_servers_);
+
+  for (u32 shard = 0; shard < num_servers_; ++shard) {
+    auto* request = reinterpret_cast<service::storage_owner::DeltaSearchRequestHeader*>(request_buffers[shard].data());
+    request->dim = config_.dim;
+    request->top_k = requested_k;
+    request->result_kfactor = config_.delta_result_kfactor;
+    std::memcpy(service::storage_owner::delta_search_query(request_buffers[shard].data()),
+                query.data(),
+                static_cast<size_t>(config_.dim) * sizeof(element_t));
+    request_regions.push_back(std::make_unique<LocalMemoryRegion>(
+      context_, request_buffers[shard].data(), request_buffers[shard].size()));
+    response_regions.push_back(std::make_unique<LocalMemoryRegion>(
+      context_, response_buffers[shard].data(), response_buffers[shard].size()));
+  }
+
+  for (u32 shard = 0; shard < num_servers_; ++shard) {
+    cm_.server_qps[shard]->post_receive(*response_regions[shard], static_cast<u32>(response_size));
+  }
+  for (u32 shard = 0; shard < num_servers_; ++shard) {
+    cm_.server_qps[shard]->post_send(*request_regions[shard],
+                                     static_cast<u32>(request_size),
+                                     IBV_WR_SEND,
+                                     true,
+                                     nullptr,
+                                     0,
+                                     0);
+  }
+  context_.poll_send_cq_until_completion(num_servers_);
+  context_.receive(num_servers_);
+
+  service::QueryResult merged;
+  merged.reserve(static_cast<size_t>(num_servers_) * result_capacity);
+  for (u32 shard = 0; shard < num_servers_; ++shard) {
+    const auto* response =
+      reinterpret_cast<const service::storage_owner::DeltaSearchResponseHeader*>(response_buffers[shard].data());
+    if (response->magic != service::storage_owner::kDeltaSearchMagic || response->item_count > result_capacity) {
+      continue;
+    }
+    const node_t* ids = service::storage_owner::delta_search_result_ids(response_buffers[shard].data());
+    const distance_t* distances =
+      service::storage_owner::delta_search_result_distances(response_buffers[shard].data(), response->item_count);
+    for (u32 i = 0; i < response->item_count; ++i) {
+      merged.push_back({ids[i], distances[i]});
+    }
+  }
+  return merged;
+}
+
+template <class Distance>
+vec<node_t> ComputeService<Distance>::merge_main_and_delta_results(const service::QueryResult& main_results,
+                                                                   const service::QueryResult& delta_results,
+                                                                   u32 k) const {
+  std::unordered_map<node_t, distance_t> best;
+  best.reserve(main_results.size() + delta_results.size());
+  for (const auto& item : main_results) {
+    auto [it, inserted] = best.emplace(item.id, item.distance);
+    if (!inserted && item.distance < it->second) {
+      it->second = item.distance;
+    }
+  }
+  for (const auto& item : delta_results) {
+    auto [it, inserted] = best.emplace(item.id, item.distance);
+    if (!inserted && item.distance < it->second) {
+      it->second = item.distance;
+    }
+  }
+
+  vec<std::pair<node_t, distance_t>> ranked;
+  ranked.reserve(best.size());
+  for (const auto& [id, dist] : best) {
+    ranked.emplace_back(id, dist);
+  }
+  std::sort(ranked.begin(), ranked.end(), [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
+
+  vec<node_t> ids;
+  ids.reserve(std::min<size_t>(k, ranked.size()));
+  for (size_t i = 0; i < ranked.size() && ids.size() < k; ++i) {
+    ids.push_back(ranked[i].first);
+  }
+  return ids;
+}
+
+template <class Distance>
+service::QueryResult ComputeService<Distance>::search_local_result(const vec<element_t>& query, u32 k) {
   if (query.size() != config_.dim) {
     throw std::invalid_argument("search dimension mismatch");
   }
@@ -315,21 +415,35 @@ vec<node_t> ComputeService<Distance>::search_local(const vec<element_t>& query, 
     sample->enqueued_at = std::chrono::steady_clock::now();
   }
 
-  auto* request = new service::QueryRequest{query, k, {}, std::chrono::steady_clock::now(), sample};
+  const u32 main_k = config_.use_storage_delta_insert() ? std::max<u32>(k, k * 2) : k;
+  auto* request = new service::QueryRequest{query, main_k, {}, std::chrono::steady_clock::now(), sample};
   auto future = request->result.get_future();
   query_queue_.enqueue(request);
 
-  vec<node_t> results = future.get();
+  service::QueryResult results = future.get();
   if (sample && sample->finished_flag) {
     std::lock_guard<std::mutex> lock(breakdown_mutex_);
     completed_query_samples_.push_back(*sample);
   }
   delete request;
 
-  if (results.size() > k) {
-    results.resize(k);
-  }
   return results;
+}
+
+template <class Distance>
+vec<node_t> ComputeService<Distance>::search_local(const vec<element_t>& query, u32 k) {
+  service::QueryResult main_results = search_local_result(query, k);
+  if (!config_.use_storage_delta_insert()) {
+    vec<node_t> ids;
+    ids.reserve(std::min<size_t>(k, main_results.size()));
+    for (size_t i = 0; i < main_results.size() && ids.size() < k; ++i) {
+      ids.push_back(main_results[i].id);
+    }
+    return ids;
+  }
+
+  service::QueryResult delta_results = search_storage_delta(query, k);
+  return merge_main_and_delta_results(main_results, delta_results, k);
 }
 
 template <class Distance>
@@ -601,7 +715,7 @@ typename ComputeService<Distance>::ServiceProfile ComputeService<Distance>::reso
   ServiceProfile profile{};
   const u32 num_threads = config_.num_threads;
 
-  if (config_.use_storage_owner_insert()) {
+  if (config_.use_storage_owner_insert() || config_.use_storage_delta_insert()) {
     profile.insert_workers = 0;
     profile.query_workers = num_threads;
     profile.insert_coroutines = 0;
@@ -1327,7 +1441,7 @@ void ComputeService<Distance>::shutdown_remote_if_requested() {
     return;
   }
 
-  if (config_.use_storage_owner_insert()) {
+  if (config_.use_storage_owner_insert() || config_.use_storage_delta_insert()) {
     return;
   }
 
