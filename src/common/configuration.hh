@@ -52,8 +52,14 @@ public:
   u32 storage_owner_batch_max{16};
   u32 storage_owner_batch_wait_us{250};
   u32 delta_active_max_vectors{1024};
+  u32 delta_active_max_age_ms{100};
   u32 delta_result_kfactor{2};
   u32 delta_merge_threshold_vectors{32768};
+  u32 delta_hot_mirror_max_vectors{2048};
+  u32 delta_hot_mirror_max_age_ms{250};
+  u32 delta_synopsis_top_shards{2};
+  u32 delta_merge_batch_size{32};
+  u32 delta_merge_sleep_ms{2};
 
   // Legacy aliases for compatibility
   u32& ef_search = beam_width;
@@ -157,11 +163,28 @@ private:
       "Maximum micro-batch wait in microseconds for storage_owner inserts.")(
       "delta-active-max-vectors", po::value<u32>(&delta_active_max_vectors)->default_value(delta_active_max_vectors),
       "Maximum number of vectors kept in the active delta segment before sealing.")(
+      "delta-active-max-age-ms", po::value<u32>(&delta_active_max_age_ms)->default_value(delta_active_max_age_ms),
+      "Maximum age in milliseconds of the active delta segment before sealing.")(
       "delta-result-kfactor", po::value<u32>(&delta_result_kfactor)->default_value(delta_result_kfactor),
       "Multiplier for the number of delta candidates returned per query.")(
       "delta-merge-threshold-vectors",
       po::value<u32>(&delta_merge_threshold_vectors)->default_value(delta_merge_threshold_vectors),
       "Minimum number of sealed delta vectors before background merge starts.")(
+      "delta-hot-mirror-max-vectors",
+      po::value<u32>(&delta_hot_mirror_max_vectors)->default_value(delta_hot_mirror_max_vectors),
+      "Maximum number of vectors kept in the compute-side hot delta mirror.")(
+      "delta-hot-mirror-max-age-ms",
+      po::value<u32>(&delta_hot_mirror_max_age_ms)->default_value(delta_hot_mirror_max_age_ms),
+      "Maximum age in milliseconds of vectors kept in the compute-side hot delta mirror.")(
+      "delta-synopsis-top-shards",
+      po::value<u32>(&delta_synopsis_top_shards)->default_value(delta_synopsis_top_shards),
+      "Maximum number of storage shards probed for sealed-delta search.")(
+      "delta-merge-batch-size",
+      po::value<u32>(&delta_merge_batch_size)->default_value(delta_merge_batch_size),
+      "Maximum number of vectors merged from sealed delta into the main graph per merge round.")(
+      "delta-merge-sleep-ms",
+      po::value<u32>(&delta_merge_sleep_ms)->default_value(delta_merge_sleep_ms),
+      "Sleep duration in milliseconds between delta merge rounds.")(
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(

@@ -7,6 +7,8 @@ namespace service::storage_owner {
 constexpr u32 kInsertMagic = 0x53494e54;  // "SINT"
 constexpr u32 kPeerRpcMagic = 0x53505250;  // "SPRP"
 constexpr u32 kDeltaSearchMagic = 0x53445348;  // "SDSH"
+constexpr u32 kDeltaSearchIncludeActive = 1u << 0;
+constexpr u32 kDeltaSearchIncludeSealed = 1u << 1;
 
 enum class InsertStatus : u32 {
   ok = 0,
@@ -41,6 +43,10 @@ struct DeltaSearchRequestHeader {
   u32 dim{};
   u32 top_k{};
   u32 result_kfactor{};
+  u32 flags{kDeltaSearchIncludeActive | kDeltaSearchIncludeSealed};
+  u32 reserved0{};
+  u32 reserved1{};
+  u32 reserved2{};
 };
 
 struct DeltaSearchResponseHeader {

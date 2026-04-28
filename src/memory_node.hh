@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <atomic>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
@@ -203,6 +204,9 @@ private:
     u64 segment_id{};
     bool sealed{false};
     bool retired{false};
+    size_t merge_cursor{0};
+    std::chrono::steady_clock::time_point created_at{};
+    std::chrono::steady_clock::time_point sealed_at{};
     vec<node_t> ids;
     vec<element_t> vectors;
     vec<element_t> centroid;
@@ -734,7 +738,9 @@ private:
     const u32 requested_items = request->top_k * request->result_kfactor;
     const u32 response_capacity = max_delta_response_items(config);
     const u32 capped_items = std::min(requested_items, response_capacity);
-    auto local_results = search_delta_segments(query, capped_items, config);
+    const bool include_active = (request->flags & service::storage_owner::kDeltaSearchIncludeActive) != 0;
+    const bool include_sealed = (request->flags & service::storage_owner::kDeltaSearchIncludeSealed) != 0;
+    auto local_results = search_delta_segments(query, capped_items, include_active, include_sealed, config);
     response_ptr->item_count = static_cast<u32>(local_results.size());
     node_t* ids = service::storage_owner::delta_search_result_ids(response_ptr);
     distance_t* distances =
@@ -752,6 +758,7 @@ private:
     }
     active_delta_ = std::make_unique<DeltaSegment>();
     active_delta_->segment_id = next_delta_segment_id_++;
+    active_delta_->created_at = std::chrono::steady_clock::now();
     active_delta_->centroid.assign(VamanaNode::DIM, 0.0f);
   }
 
@@ -791,6 +798,7 @@ private:
       return;
     }
     active_delta_->sealed = true;
+    active_delta_->sealed_at = std::chrono::steady_clock::now();
     sealed_deltas_.push_back(std::move(active_delta_));
     queued_delta_vectors_ += sealed_deltas_.back()->ids.size();
     if (queued_delta_vectors_ >= delta_merge_threshold_vectors_) {
@@ -802,6 +810,14 @@ private:
   void append_delta_batch(const node_t* ids, const element_t* vectors, u32 item_count, const Configuration& config) {
     std::lock_guard<std::mutex> lock(delta_mutex_);
     ensure_active_delta_locked();
+    const auto now = std::chrono::steady_clock::now();
+    if (active_delta_ && config.delta_active_max_age_ms > 0 &&
+        (now - active_delta_->created_at) > std::chrono::milliseconds(config.delta_active_max_age_ms) &&
+        !active_delta_->ids.empty()) {
+      rebuild_delta_summary(*active_delta_);
+      seal_active_delta_locked();
+      ensure_active_delta_locked();
+    }
     for (u32 i = 0; i < item_count; ++i) {
       active_delta_->ids.push_back(ids[i]);
       const element_t* src = vectors + static_cast<size_t>(i) * config.dim;
@@ -815,7 +831,11 @@ private:
     rebuild_delta_summary(*active_delta_);
   }
 
-  service::QueryResult search_delta_segments(const span<const element_t> query, u32 top_k, const Configuration&) {
+  service::QueryResult search_delta_segments(const span<const element_t> query,
+                                             u32 top_k,
+                                             bool include_active,
+                                             bool include_sealed,
+                                             const Configuration&) {
     std::lock_guard<std::mutex> lock(delta_mutex_);
     struct Candidate {
       node_t id;
@@ -832,11 +852,11 @@ private:
         candidates.push_back({segment.ids[idx], dist});
       }
     };
-    if (active_delta_) {
+    if (include_active && active_delta_) {
       scan_segment(*active_delta_);
     }
     for (const auto& segment : sealed_deltas_) {
-      if (segment) {
+      if (include_sealed && segment) {
         scan_segment(*segment);
       }
     }
@@ -852,6 +872,64 @@ private:
     return results;
   }
 
+  bool merge_delta_batch_round(DeltaSegment& segment,
+                               size_t begin,
+                               size_t batch_size,
+                               const Configuration& config) {
+    if (begin >= segment.ids.size() || batch_size == 0) {
+      return true;
+    }
+
+    const size_t end = std::min(segment.ids.size(), begin + batch_size);
+    RemotePtr medoid_ptr = read_global_medoid();
+    std::unordered_map<u64, vec<RemotePtr>> local_updates;
+    std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
+
+    for (size_t idx = begin; idx < end; ++idx) {
+      const element_t* vec_ptr = segment.vectors.data() + idx * VamanaNode::DIM;
+      const auto components = span<const element_t>{vec_ptr, VamanaNode::DIM};
+      const vec<byte_t> rabitq_data = quantize_rabitq_cpu(components, config);
+
+      if (medoid_ptr.is_null()) {
+        const RemotePtr new_ptr = allocate_local_node();
+        write_new_node(new_ptr, segment.ids[idx], components, rabitq_data, {});
+        RemotePtr observed;
+        if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
+          medoid_ptr = new_ptr;
+          continue;
+        }
+        medoid_ptr = observed;
+      }
+
+      const vec<RemotePtr> candidates = beam_search_candidates(components, medoid_ptr, config);
+      hashset_t<RemotePtr> empty_skip;
+      vec<RemotePtr> selected_neighbors = robust_prune_cpu(components, candidates, empty_skip, config);
+      const RemotePtr new_ptr = allocate_local_node();
+      write_new_node(new_ptr, segment.ids[idx], components, rabitq_data, selected_neighbors);
+
+      for (const RemotePtr& neighbor_ptr : selected_neighbors) {
+        if (local_shard(neighbor_ptr.memory_node())) {
+          local_updates[neighbor_ptr.raw_address].push_back(new_ptr);
+        } else {
+          remote_updates[neighbor_ptr.memory_node()].push_back(
+            service::storage_owner::ReverseUpdateOp{neighbor_ptr.raw_address, new_ptr.raw_address});
+        }
+      }
+    }
+
+    for (auto& [target_raw, candidates] : local_updates) {
+      if (!apply_local_reverse_update(RemotePtr{target_raw}, candidates, config)) {
+        return false;
+      }
+    }
+    for (auto& [target_shard, ops] : remote_updates) {
+      if (!send_reverse_update_batch(target_shard, ops, config)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   void start_delta_merge_worker(const Configuration& config) {
     delta_merge_threshold_vectors_ = config.delta_merge_threshold_vectors;
     delta_merge_thread_ = std::thread([this, config]() { delta_merge_loop(config); });
@@ -860,38 +938,54 @@ private:
   void delta_merge_loop(const Configuration& config) {
     for (;;) {
       std::unique_ptr<DeltaSegment> segment;
+      size_t begin = 0;
+      size_t merged_batch = 0;
       {
         std::unique_lock<std::mutex> lock(delta_mutex_);
         delta_merge_cv_.wait(lock, [&]() {
-          return delta_shutdown_.load(std::memory_order_acquire) || queued_delta_vectors_ >= delta_merge_threshold_vectors_;
+          const bool has_partial_segment = std::any_of(
+            sealed_deltas_.begin(), sealed_deltas_.end(), [](const auto& candidate) {
+              return candidate && !candidate->retired && candidate->merge_cursor > 0 &&
+                     candidate->merge_cursor < candidate->ids.size();
+            });
+          return delta_shutdown_.load(std::memory_order_acquire) ||
+                 (!sealed_deltas_.empty() &&
+                  (queued_delta_vectors_ >= delta_merge_threshold_vectors_ || has_partial_segment));
         });
         if (delta_shutdown_.load(std::memory_order_acquire)) {
           return;
         }
         auto it = std::find_if(sealed_deltas_.begin(), sealed_deltas_.end(), [](const auto& candidate) {
-          return candidate && !candidate->retired;
+          return candidate && !candidate->retired && candidate->merge_cursor < candidate->ids.size();
         });
         if (it == sealed_deltas_.end()) {
           continue;
         }
         segment = std::move(*it);
         sealed_deltas_.erase(it);
-        queued_delta_vectors_ -= segment->ids.size();
+        begin = segment->merge_cursor;
+        merged_batch = std::min<size_t>(std::max<u32>(1, config.delta_merge_batch_size), segment->ids.size() - begin);
       }
 
-      bool merged_ok = true;
-      for (size_t idx = 0; idx < segment->ids.size(); ++idx) {
-        const element_t* vec_ptr = segment->vectors.data() + idx * VamanaNode::DIM;
-        merged_ok &= execute_storage_owner_insert(segment->ids[idx],
-                                                  span<const element_t>{vec_ptr, VamanaNode::DIM},
-                                                  config);
-      }
+      const bool merged_ok = merge_delta_batch_round(*segment, begin, merged_batch, config);
       if (!merged_ok) {
         std::lock_guard<std::mutex> lock(delta_mutex_);
-        segment->retired = false;
-        queued_delta_vectors_ += segment->ids.size();
         sealed_deltas_.push_back(std::move(segment));
         delta_merge_cv_.notify_one();
+      } else {
+        std::lock_guard<std::mutex> lock(delta_mutex_);
+        segment->merge_cursor += merged_batch;
+        queued_delta_vectors_ = queued_delta_vectors_ > merged_batch ? queued_delta_vectors_ - merged_batch : 0;
+        if (segment->merge_cursor >= segment->ids.size()) {
+          segment->retired = true;
+        } else {
+          sealed_deltas_.push_back(std::move(segment));
+          delta_merge_cv_.notify_one();
+        }
+      }
+
+      if (config.delta_merge_sleep_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(config.delta_merge_sleep_ms));
       }
     }
   }

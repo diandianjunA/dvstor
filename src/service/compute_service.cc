@@ -38,9 +38,11 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
       num_servers_(config_.num_server_nodes()),
       shutdown_remote_on_stop_(shutdown_remote_on_stop) {
   if (config_.use_storage_delta_insert()) {
-    local_delta_mirror_.max_vectors =
-      std::max<size_t>(static_cast<size_t>(config_.delta_merge_threshold_vectors) * 2,
-                       static_cast<size_t>(config_.delta_active_max_vectors) * 8);
+    local_delta_mirror_.max_vectors = std::max<size_t>(1, config_.delta_hot_mirror_max_vectors);
+    local_delta_mirror_.max_age = std::chrono::milliseconds(config_.delta_hot_mirror_max_age_ms);
+    sealed_delta_synopsis_.counts.assign(num_servers_, 0);
+    sealed_delta_synopsis_.centroids.assign(num_servers_, vec<element_t>(config_.dim, 0.0f));
+    sealed_delta_synopsis_.radii.assign(num_servers_, 0.0f);
   }
   init_remote_tokens();
   cm_.connect();
@@ -320,7 +322,8 @@ size_t ComputeService<Distance>::insert_via_storage_owner(
 template <class Distance>
 service::QueryResult ComputeService<Distance>::search_storage_delta(const vec<element_t>& query, u32 k) {
   std::lock_guard<std::mutex> lock(storage_rpc_mutex_);
-  if (num_servers_ == 0) {
+  const vec<u32> selected_shards = select_sealed_delta_shards(query);
+  if (selected_shards.empty()) {
     return {};
   }
 
@@ -333,15 +336,16 @@ service::QueryResult ComputeService<Distance>::search_storage_delta(const vec<el
   vec<vec<byte_t>> response_buffers(num_servers_, vec<byte_t>(response_size));
   vec<u_ptr<LocalMemoryRegion>> request_regions;
   vec<u_ptr<LocalMemoryRegion>> response_regions;
-  request_regions.reserve(num_servers_);
-  response_regions.reserve(num_servers_);
+  request_regions.reserve(selected_shards.size());
+  response_regions.reserve(selected_shards.size());
 
-  for (u32 shard = 0; shard < num_servers_; ++shard) {
+  for (u32 shard : selected_shards) {
     auto* request = reinterpret_cast<service::storage_owner::DeltaSearchRequestHeader*>(request_buffers[shard].data());
     request->magic = service::storage_owner::kDeltaSearchMagic;
     request->dim = config_.dim;
     request->top_k = requested_k;
     request->result_kfactor = config_.delta_result_kfactor;
+    request->flags = service::storage_owner::kDeltaSearchIncludeSealed;
     std::memcpy(service::storage_owner::delta_search_query(request_buffers[shard].data()),
                 query.data(),
                 static_cast<size_t>(config_.dim) * sizeof(element_t));
@@ -351,10 +355,10 @@ service::QueryResult ComputeService<Distance>::search_storage_delta(const vec<el
       context_, response_buffers[shard].data(), response_buffers[shard].size()));
   }
 
-  for (u32 shard = 0; shard < num_servers_; ++shard) {
+  for (u32 shard : selected_shards) {
     cm_.server_qps[shard]->post_receive(*response_regions[shard], static_cast<u32>(response_size));
   }
-  for (u32 shard = 0; shard < num_servers_; ++shard) {
+  for (u32 shard : selected_shards) {
     cm_.server_qps[shard]->post_send(*request_regions[shard],
                                      static_cast<u32>(request_size),
                                      IBV_WR_SEND,
@@ -363,12 +367,12 @@ service::QueryResult ComputeService<Distance>::search_storage_delta(const vec<el
                                      0,
                                      0);
   }
-  context_.poll_send_cq_until_completion(num_servers_);
-  context_.receive(num_servers_);
+  context_.poll_send_cq_until_completion(static_cast<i32>(selected_shards.size()));
+  context_.receive(static_cast<i32>(selected_shards.size()));
 
   service::QueryResult merged;
-  merged.reserve(static_cast<size_t>(num_servers_) * result_capacity);
-  for (u32 shard = 0; shard < num_servers_; ++shard) {
+  merged.reserve(static_cast<size_t>(selected_shards.size()) * result_capacity);
+  for (u32 shard : selected_shards) {
     const auto* response =
       reinterpret_cast<const service::storage_owner::DeltaSearchResponseHeader*>(response_buffers[shard].data());
     if (response->magic != service::storage_owner::kDeltaSearchMagic || response->item_count > result_capacity) {
@@ -392,20 +396,108 @@ void ComputeService<Distance>::append_local_delta_mirror(const vec<InsertItem>& 
   }
 
   std::unique_lock<std::shared_mutex> lock(local_delta_mirror_.mutex);
+  const auto now = std::chrono::steady_clock::now();
   for (size_t idx : successful_indices) {
-    local_delta_mirror_.ids.push_back(batch[idx].id);
-    const auto& values = batch[idx].values;
-    local_delta_mirror_.vectors.insert(local_delta_mirror_.vectors.end(), values.begin(), values.end());
+    local_delta_mirror_.entries.push_back(
+      {batch[idx].id, batch[idx].values, num_servers_ == 0 ? 0 : static_cast<u32>(batch[idx].id % num_servers_), now});
   }
 
-  const size_t current = local_delta_mirror_.ids.size();
-  if (current > local_delta_mirror_.max_vectors) {
-    const size_t overflow = current - local_delta_mirror_.max_vectors;
-    local_delta_mirror_.ids.erase(local_delta_mirror_.ids.begin(), local_delta_mirror_.ids.begin() + overflow);
-    local_delta_mirror_.vectors.erase(local_delta_mirror_.vectors.begin(),
-                                      local_delta_mirror_.vectors.begin() +
-                                        overflow * static_cast<size_t>(config_.dim));
+  while (!local_delta_mirror_.entries.empty()) {
+    const bool over_capacity = local_delta_mirror_.entries.size() > local_delta_mirror_.max_vectors;
+    const bool expired =
+      local_delta_mirror_.max_age.count() > 0 && (now - local_delta_mirror_.entries.front().inserted_at) > local_delta_mirror_.max_age;
+    if (!over_capacity && !expired) {
+      break;
+    }
+    local_delta_mirror_.entries.pop_front();
   }
+  rebuild_sealed_delta_synopsis_locked();
+}
+
+template <class Distance>
+void ComputeService<Distance>::rebuild_sealed_delta_synopsis_locked() {
+  if (num_servers_ == 0) {
+    return;
+  }
+
+  std::unique_lock<std::shared_mutex> synopsis_lock(sealed_delta_synopsis_.mutex);
+  sealed_delta_synopsis_.counts.assign(num_servers_, 0);
+  sealed_delta_synopsis_.centroids.assign(num_servers_, vec<element_t>(config_.dim, 0.0f));
+  sealed_delta_synopsis_.radii.assign(num_servers_, 0.0f);
+
+  if (local_delta_mirror_.entries.empty()) {
+    return;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  const auto active_horizon = std::chrono::milliseconds(config_.delta_active_max_age_ms);
+  vec<vec<const vec<element_t>*>> grouped(num_servers_);
+  for (const auto& entry : local_delta_mirror_.entries) {
+    if ((now - entry.inserted_at) <= active_horizon) {
+      continue;
+    }
+    grouped[entry.owner_shard].push_back(&entry.values);
+  }
+
+  for (u32 shard = 0; shard < num_servers_; ++shard) {
+    if (grouped[shard].empty()) {
+      continue;
+    }
+    auto& centroid = sealed_delta_synopsis_.centroids[shard];
+    for (const auto* values : grouped[shard]) {
+      for (u32 d = 0; d < config_.dim; ++d) {
+        centroid[d] += (*values)[d];
+      }
+    }
+    for (u32 d = 0; d < config_.dim; ++d) {
+      centroid[d] /= static_cast<element_t>(grouped[shard].size());
+    }
+    float radius = 0.0f;
+    for (const auto* values : grouped[shard]) {
+      const float dist =
+        Distance::dist(span<const element_t>{values->data(), values->size()},
+                       span<const element_t>{centroid.data(), centroid.size()},
+                       config_.dim);
+      radius = std::max(radius, dist);
+    }
+    sealed_delta_synopsis_.counts[shard] = grouped[shard].size();
+    sealed_delta_synopsis_.radii[shard] = radius;
+  }
+}
+
+template <class Distance>
+vec<u32> ComputeService<Distance>::select_sealed_delta_shards(const vec<element_t>& query) const {
+  if (num_servers_ == 0) {
+    return {};
+  }
+
+  std::shared_lock<std::shared_mutex> lock(sealed_delta_synopsis_.mutex);
+  struct RankedShard {
+    u32 shard;
+    float score;
+  };
+  vec<RankedShard> ranked;
+  ranked.reserve(num_servers_);
+  for (u32 shard = 0; shard < num_servers_; ++shard) {
+    if (sealed_delta_synopsis_.counts.empty() || sealed_delta_synopsis_.counts[shard] == 0) {
+      continue;
+    }
+    const auto& centroid = sealed_delta_synopsis_.centroids[shard];
+    const float dist =
+      Distance::dist(span<const element_t>{query.data(), query.size()},
+                     span<const element_t>{centroid.data(), centroid.size()},
+                     config_.dim);
+    const float score = std::max(0.0f, dist - sealed_delta_synopsis_.radii[shard]);
+    ranked.push_back({shard, score});
+  }
+  std::sort(ranked.begin(), ranked.end(), [](const auto& lhs, const auto& rhs) { return lhs.score < rhs.score; });
+  const size_t keep = std::min<size_t>(std::max<u32>(1, config_.delta_synopsis_top_shards), ranked.size());
+  vec<u32> shards;
+  shards.reserve(keep);
+  for (size_t i = 0; i < keep; ++i) {
+    shards.push_back(ranked[i].shard);
+  }
+  return shards;
 }
 
 template <class Distance>
@@ -415,8 +507,7 @@ service::QueryResult ComputeService<Distance>::search_local_delta_mirror(const v
   }
 
   std::shared_lock<std::shared_mutex> lock(local_delta_mirror_.mutex);
-  const size_t count = local_delta_mirror_.ids.size();
-  if (count == 0) {
+  if (local_delta_mirror_.entries.empty()) {
     return {};
   }
 
@@ -426,14 +517,17 @@ service::QueryResult ComputeService<Distance>::search_local_delta_mirror(const v
   };
 
   vec<Candidate> candidates;
-  candidates.reserve(count);
+  candidates.reserve(local_delta_mirror_.entries.size());
   const u32 limit = std::max<u32>(k, k * config_.delta_result_kfactor);
-  for (size_t i = 0; i < count; ++i) {
-    const element_t* vec_ptr = local_delta_mirror_.vectors.data() + i * static_cast<size_t>(config_.dim);
+  const auto now = std::chrono::steady_clock::now();
+  for (const auto& entry : local_delta_mirror_.entries) {
+    if (local_delta_mirror_.max_age.count() > 0 && (now - entry.inserted_at) > local_delta_mirror_.max_age) {
+      continue;
+    }
     const distance_t dist = Distance::dist(span<const element_t>{query.data(), query.size()},
-                                           span<const element_t>{vec_ptr, config_.dim},
+                                           span<const element_t>{entry.values.data(), entry.values.size()},
                                            config_.dim);
-    candidates.push_back({local_delta_mirror_.ids[i], dist});
+    candidates.push_back({entry.id, dist});
   }
 
   std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) { return lhs.distance < rhs.distance; });
@@ -523,6 +617,8 @@ vec<node_t> ComputeService<Distance>::search_local(const vec<element_t>& query, 
   }
 
   service::QueryResult delta_results = search_local_delta_mirror(query, k);
+  service::QueryResult sealed_results = search_storage_delta(query, k);
+  delta_results.insert(delta_results.end(), sealed_results.begin(), sealed_results.end());
   return merge_main_and_delta_results(main_results, delta_results, k);
 }
 

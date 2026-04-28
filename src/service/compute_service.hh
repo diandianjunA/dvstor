@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -83,10 +84,24 @@ public:
   };
 
   struct LocalDeltaMirror {
+    struct Entry {
+      node_t id;
+      vec<element_t> values;
+      u32 owner_shard{};
+      std::chrono::steady_clock::time_point inserted_at{};
+    };
+
     mutable std::shared_mutex mutex;
-    vec<node_t> ids;
-    vec<element_t> vectors;
+    std::deque<Entry> entries;
     size_t max_vectors{};
+    std::chrono::milliseconds max_age{0};
+  };
+
+  struct SealedDeltaSynopsis {
+    mutable std::shared_mutex mutex;
+    vec<u64> counts;
+    vec<vec<element_t>> centroids;
+    vec<float> radii;
   };
 
 public:
@@ -126,10 +141,12 @@ private:
                                   const vec<std::shared_ptr<service::breakdown::Sample>>& samples);
   service::QueryResult search_storage_delta(const vec<element_t>& query, u32 k);
   void append_local_delta_mirror(const vec<InsertItem>& batch, const vec<size_t>& successful_indices);
+  void rebuild_sealed_delta_synopsis_locked();
   service::QueryResult search_local_delta_mirror(const vec<element_t>& query, u32 k) const;
   vec<node_t> merge_main_and_delta_results(const service::QueryResult& main_results,
                                            const service::QueryResult& delta_results,
                                            u32 k) const;
+  vec<u32> select_sealed_delta_shards(const vec<element_t>& query) const;
   bool routing_enabled() const;
   size_t rpc_message_size() const;
   vec<element_t> compute_local_routing_centroid() const;
@@ -208,6 +225,7 @@ private:
   std::vector<service::breakdown::Sample> completed_query_samples_;
   std::vector<service::breakdown::Sample> completed_insert_samples_;
   LocalDeltaMirror local_delta_mirror_;
+  SealedDeltaSynopsis sealed_delta_synopsis_;
 };
 
 extern template class ComputeService<L2Distance>;
