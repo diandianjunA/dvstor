@@ -370,9 +370,9 @@ service::QueryResult ComputeService<Distance>::search_storage_delta(const vec<el
                 query.data(),
                 static_cast<size_t>(config_.dim) * sizeof(element_t));
     request_regions[shard] = std::make_unique<LocalMemoryRegion>(
-      context_, request_buffers[shard].data(), request_buffers[shard].size());
+      *delta_query_context_, request_buffers[shard].data(), request_buffers[shard].size());
     response_regions[shard] = std::make_unique<LocalMemoryRegion>(
-      context_, response_buffers[shard].data(), response_buffers[shard].size());
+      *delta_query_context_, response_buffers[shard].data(), response_buffers[shard].size());
   }
 
   for (u32 shard : selected_shards) {
@@ -598,7 +598,8 @@ vec<node_t> ComputeService<Distance>::merge_main_and_delta_results(const service
 }
 
 template <class Distance>
-service::QueryResult ComputeService<Distance>::search_local_result(const vec<element_t>& query, u32 k) {
+typename ComputeService<Distance>::LocalMainSearchOutput ComputeService<Distance>::search_local_result(
+  const vec<element_t>& query, u32 k) {
   if (query.size() != config_.dim) {
     throw std::invalid_argument("search dimension mismatch");
   }
@@ -615,23 +616,30 @@ service::QueryResult ComputeService<Distance>::search_local_result(const vec<ele
   query_queue_.enqueue(request);
 
   service::QueryResult results = future.get();
-  if (sample && sample->finished_flag) {
-    std::lock_guard<std::mutex> lock(breakdown_mutex_);
-    completed_query_samples_.push_back(*sample);
-  }
   delete request;
 
-  return results;
+  return {.results = std::move(results), .sample = std::move(sample)};
 }
 
 template <class Distance>
 vec<node_t> ComputeService<Distance>::search_local(const vec<element_t>& query, u32 k) {
-  service::QueryResult main_results = search_local_result(query, k);
+  LocalMainSearchOutput main = search_local_result(query, k);
+  service::QueryResult& main_results = main.results;
   if (!config_.use_storage_delta_insert()) {
     vec<node_t> ids;
     ids.reserve(std::min<size_t>(k, main_results.size()));
     for (size_t i = 0; i < main_results.size() && ids.size() < k; ++i) {
       ids.push_back(main_results[i].id);
+    }
+    if (main.sample && main.sample->finished_flag) {
+      const auto finished_at = std::chrono::steady_clock::now();
+      main.sample->finished_at = finished_at;
+      main.sample->service_ns = static_cast<u64>(
+        std::chrono::duration_cast<service::breakdown::Nanoseconds>(finished_at - main.sample->started_at).count());
+      main.sample->end_to_end_ns = static_cast<u64>(
+        std::chrono::duration_cast<service::breakdown::Nanoseconds>(finished_at - main.sample->enqueued_at).count());
+      std::lock_guard<std::mutex> lock(breakdown_mutex_);
+      completed_query_samples_.push_back(*main.sample);
     }
     return ids;
   }
@@ -639,7 +647,18 @@ vec<node_t> ComputeService<Distance>::search_local(const vec<element_t>& query, 
   service::QueryResult delta_results = search_local_delta_mirror(query, k);
   service::QueryResult sealed_results = search_storage_delta(query, k);
   delta_results.insert(delta_results.end(), sealed_results.begin(), sealed_results.end());
-  return merge_main_and_delta_results(main_results, delta_results, k);
+  vec<node_t> merged = merge_main_and_delta_results(main_results, delta_results, k);
+  if (main.sample && main.sample->finished_flag) {
+    const auto finished_at = std::chrono::steady_clock::now();
+    main.sample->finished_at = finished_at;
+    main.sample->service_ns = static_cast<u64>(
+      std::chrono::duration_cast<service::breakdown::Nanoseconds>(finished_at - main.sample->started_at).count());
+    main.sample->end_to_end_ns = static_cast<u64>(
+      std::chrono::duration_cast<service::breakdown::Nanoseconds>(finished_at - main.sample->enqueued_at).count());
+    std::lock_guard<std::mutex> lock(breakdown_mutex_);
+    completed_query_samples_.push_back(*main.sample);
+  }
+  return merged;
 }
 
 template <class Distance>

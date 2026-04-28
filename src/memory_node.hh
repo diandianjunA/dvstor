@@ -11,6 +11,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -148,6 +149,8 @@ public:
       setup_storage_peers(config);
       setup_insert_runtime(config);
       setup_delta_query_channel(config);
+      delta_query_worker_config_ = std::make_unique<Configuration>(config);
+      start_delta_query_workers(config);
       if (use_storage_delta_insert_) {
         start_delta_merge_worker(config);
       }
@@ -164,6 +167,13 @@ public:
     delta_merge_cv_.notify_all();
     if (delta_merge_thread_.joinable()) {
       delta_merge_thread_.join();
+    }
+    delta_query_shutdown_.store(true, std::memory_order_release);
+    delta_query_tasks_cv_.notify_all();
+    for (auto& worker : delta_query_workers_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
     }
 
     print_status("memory node shutting down");
@@ -206,6 +216,11 @@ private:
     std::unique_ptr<LocalMemoryRegion> region;
     size_t request_bytes{};
     size_t response_offset{};
+  };
+
+  struct DeltaSearchTask {
+    u32 client_id{};
+    vec<byte_t> payload;
   };
 
   struct DeltaSegment {
@@ -492,6 +507,56 @@ private:
       *delta_query_context_, delta_query_runtime_.buffer.get_full_buffer(), delta_query_runtime_.buffer.buffer_size);
   }
 
+  void start_delta_query_workers(const Configuration&) {
+    if (!delta_query_context_ || !use_storage_delta_insert_) {
+      return;
+    }
+    const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
+    for (u32 i = 0; i < worker_count; ++i) {
+      delta_query_workers_.emplace_back([this]() { delta_query_worker_loop(); });
+    }
+  }
+
+  void delta_query_worker_loop() {
+    for (;;) {
+      DeltaSearchTask task;
+      {
+        std::unique_lock<std::mutex> lock(delta_query_tasks_mutex_);
+        delta_query_tasks_cv_.wait(lock, [&]() {
+          return delta_query_shutdown_.load(std::memory_order_acquire) || !delta_query_tasks_.empty();
+        });
+        if (delta_query_shutdown_.load(std::memory_order_acquire) && delta_query_tasks_.empty()) {
+          return;
+        }
+        task = std::move(delta_query_tasks_.front());
+        delta_query_tasks_.pop_front();
+      }
+
+      const size_t response_bytes =
+        handle_storage_delta_search_request(task.client_id, task.payload.data(), task.payload.size(), *delta_query_worker_config_);
+      lib_assert(response_bytes > 0, "invalid delta-search runtime request");
+
+      {
+        std::lock_guard<std::mutex> send_lock(delta_query_send_mutex_);
+        delta_query_cm_->client_qps[task.client_id]->post_send(
+          *delta_query_runtime_.region,
+          static_cast<u32>(response_bytes),
+          IBV_WR_SEND,
+          true,
+          nullptr,
+          0,
+          delta_query_runtime_.response_offset +
+            static_cast<size_t>(task.client_id) * delta_query_response_slot_bytes(*delta_query_worker_config_));
+        delta_query_context_->poll_send_cq_until_completion();
+        delta_query_cm_->client_qps[task.client_id]->post_receive(
+          *delta_query_runtime_.region,
+          static_cast<u32>(delta_query_runtime_.request_bytes),
+          task.client_id,
+          static_cast<u64>(task.client_id) * delta_query_runtime_.request_bytes);
+      }
+    }
+  }
+
   void repost_peer_rpc_receive(u32 peer_id) {
     if (!peer_context_ || peer_id == storage_id_) {
       return;
@@ -697,27 +762,14 @@ private:
         const size_t offset = static_cast<size_t>(client_id) * delta_query_runtime_.request_bytes;
         const byte_t* payload = delta_query_runtime_.buffer.get_full_buffer() + offset;
         const size_t bytes = delta_recv_wcs[i].byte_len;
-
-        const size_t response_bytes = handle_storage_delta_search_request(client_id, payload, bytes, config);
-        lib_assert(response_bytes > 0, "invalid delta-search runtime request");
-
-        delta_query_cm_->client_qps[client_id]->post_send(
-          *delta_query_runtime_.region,
-          static_cast<u32>(response_bytes),
-          IBV_WR_SEND,
-          true,
-          nullptr,
-          0,
-          delta_query_runtime_.response_offset +
-            static_cast<size_t>(client_id) *
-              align_up(service::storage_owner::delta_search_response_bytes(config.k * config.delta_result_kfactor)));
-        delta_query_context_->poll_send_cq_until_completion();
-
-        delta_query_cm_->client_qps[client_id]->post_receive(
-          *delta_query_runtime_.region,
-          static_cast<u32>(delta_query_runtime_.request_bytes),
-          client_id,
-          static_cast<u64>(client_id) * delta_query_runtime_.request_bytes);
+        DeltaSearchTask task;
+        task.client_id = client_id;
+        task.payload.assign(payload, payload + bytes);
+        {
+          std::lock_guard<std::mutex> lock(delta_query_tasks_mutex_);
+          delta_query_tasks_.push_back(std::move(task));
+        }
+        delta_query_tasks_cv_.notify_one();
       }
     }
   }
@@ -887,7 +939,7 @@ private:
   }
 
   void append_delta_batch(const node_t* ids, const element_t* vectors, u32 item_count, const Configuration& config) {
-    std::lock_guard<std::mutex> lock(delta_mutex_);
+    std::unique_lock<std::shared_mutex> lock(delta_mutex_);
     ensure_active_delta_locked();
     const auto now = std::chrono::steady_clock::now();
     if (active_delta_ && config.delta_active_max_age_ms > 0 &&
@@ -915,7 +967,7 @@ private:
                                              bool include_active,
                                              bool include_sealed,
                                              const Configuration&) {
-    std::lock_guard<std::mutex> lock(delta_mutex_);
+    std::shared_lock<std::shared_mutex> lock(delta_mutex_);
     struct Candidate {
       node_t id;
       distance_t distance;
@@ -1020,7 +1072,7 @@ private:
       size_t begin = 0;
       size_t merged_batch = 0;
       {
-        std::unique_lock<std::mutex> lock(delta_mutex_);
+        std::unique_lock<std::shared_mutex> lock(delta_mutex_);
         delta_merge_cv_.wait(lock, [&]() {
           const bool has_partial_segment = std::any_of(
             sealed_deltas_.begin(), sealed_deltas_.end(), [](const auto& candidate) {
@@ -1048,11 +1100,11 @@ private:
 
       const bool merged_ok = merge_delta_batch_round(*segment, begin, merged_batch, config);
       if (!merged_ok) {
-        std::lock_guard<std::mutex> lock(delta_mutex_);
+        std::unique_lock<std::shared_mutex> lock(delta_mutex_);
         sealed_deltas_.push_back(std::move(segment));
         delta_merge_cv_.notify_one();
       } else {
-        std::lock_guard<std::mutex> lock(delta_mutex_);
+        std::unique_lock<std::shared_mutex> lock(delta_mutex_);
         segment->merge_cursor += merged_batch;
         queued_delta_vectors_ = queued_delta_vectors_ > merged_batch ? queued_delta_vectors_ - merged_batch : 0;
         if (segment->merge_cursor >= segment->ids.size()) {
@@ -1918,12 +1970,19 @@ private:
   u64 next_peer_request_id_{1};
   InsertRuntimeState insert_runtime_;
   DeltaQueryRuntimeState delta_query_runtime_;
-  std::mutex delta_mutex_;
-  std::condition_variable delta_merge_cv_;
+  std::shared_mutex delta_mutex_;
+  std::condition_variable_any delta_merge_cv_;
   std::unique_ptr<DeltaSegment> active_delta_;
   vec<std::unique_ptr<DeltaSegment>> sealed_deltas_;
   std::thread delta_merge_thread_;
   std::atomic<bool> delta_shutdown_{false};
+  std::atomic<bool> delta_query_shutdown_{false};
+  std::unique_ptr<Configuration> delta_query_worker_config_;
+  std::mutex delta_query_send_mutex_;
+  std::mutex delta_query_tasks_mutex_;
+  std::condition_variable delta_query_tasks_cv_;
+  std::deque<DeltaSearchTask> delta_query_tasks_;
+  vec<std::thread> delta_query_workers_;
   u64 next_delta_segment_id_{1};
   size_t queued_delta_vectors_{0};
   u32 delta_merge_threshold_vectors_{0};

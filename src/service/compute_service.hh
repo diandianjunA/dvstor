@@ -104,6 +104,11 @@ public:
     vec<float> radii;
   };
 
+  struct LocalMainSearchOutput {
+    service::QueryResult results;
+    std::shared_ptr<service::breakdown::Sample> sample;
+  };
+
 public:
   explicit ComputeService(const Configuration& config, bool shutdown_remote_on_stop = false);
   ~ComputeService();
@@ -135,7 +140,7 @@ private:
   void stop_workers();
   void pause_workers();
   void resume_workers();
-  service::QueryResult search_local_result(const vec<element_t>& query, u32 k);
+  LocalMainSearchOutput search_local_result(const vec<element_t>& query, u32 k);
   vec<node_t> search_local(const vec<element_t>& query, u32 k);
   size_t insert_via_storage_owner(const vec<InsertItem>& batch,
                                   const vec<std::shared_ptr<service::breakdown::Sample>>& samples);
