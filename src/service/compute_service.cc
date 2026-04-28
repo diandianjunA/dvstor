@@ -228,7 +228,7 @@ template <class Distance>
 size_t ComputeService<Distance>::insert_via_storage_owner(
     const vec<InsertItem>& batch,
     const vec<std::shared_ptr<service::breakdown::Sample>>& samples) {
-  std::lock_guard<std::mutex> lock(storage_insert_rpc_mutex_);
+  std::lock_guard<std::mutex> lock(storage_rpc_mutex_);
 
   size_t inserted = 0;
   vec<vec<size_t>> owner_indices(std::max<u32>(1, num_servers_));
@@ -305,7 +305,7 @@ size_t ComputeService<Distance>::insert_via_storage_owner(
 
 template <class Distance>
 service::QueryResult ComputeService<Distance>::search_storage_delta(const vec<element_t>& query, u32 k) {
-  std::lock_guard<std::mutex> lock(storage_delta_rpc_mutex_);
+  std::lock_guard<std::mutex> lock(storage_rpc_mutex_);
   if (num_servers_ == 0) {
     return {};
   }

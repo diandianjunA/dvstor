@@ -160,8 +160,7 @@ private:
   std::atomic<size_t> vectors_inserted_{0};
 
   std::mutex mn_command_mutex_;
-  std::mutex storage_insert_rpc_mutex_;
-  std::mutex storage_delta_rpc_mutex_;
+  std::mutex storage_rpc_mutex_;
   std::atomic<bool> workers_paused_{false};
   std::atomic<u32> workers_idle_count_{0};
   std::atomic<bool> stopped_{false};

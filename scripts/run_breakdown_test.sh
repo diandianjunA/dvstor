@@ -44,7 +44,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$PROJECT_DIR/build}"
 BINARY="$BUILD_DIR/dvstor_breakdown_benchmark"
 
-SERVICE_CONFIG="${SERVICE_CONFIG:-$PROJECT_DIR/test/config/test/storage_owner_gpucache.ini}"
+SERVICE_CONFIG="${SERVICE_CONFIG:-$PROJECT_DIR/test/config/test/storage_delta_gpucache.ini}"
 WORKLOAD="${WORKLOAD:-mixed}"
 READ_RATIO="${READ_RATIO:-0.5}"
 CLIENT_THREADS="${CLIENT_THREADS:-16}"
