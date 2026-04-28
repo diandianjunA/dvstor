@@ -653,6 +653,15 @@ private:
                     align_up(service::storage_owner::delta_search_response_bytes(config.k * config.delta_result_kfactor)));
   }
 
+  u32 max_delta_response_items(const Configuration& config) const {
+    const size_t slot_bytes = response_slot_bytes(config);
+    if (slot_bytes <= sizeof(service::storage_owner::DeltaSearchResponseHeader)) {
+      return 0;
+    }
+    return static_cast<u32>(
+      (slot_bytes - sizeof(service::storage_owner::DeltaSearchResponseHeader)) / (sizeof(node_t) + sizeof(distance_t)));
+  }
+
   size_t handle_storage_runtime_request(u32 client_id, const byte_t* payload, size_t bytes, const Configuration& config) {
     if (bytes >= sizeof(u32)) {
       const u32 magic = *reinterpret_cast<const u32*>(payload);
@@ -722,7 +731,10 @@ private:
     response_ptr->magic = service::storage_owner::kDeltaSearchMagic;
 
     const auto query = span<const element_t>{service::storage_owner::delta_search_query(payload), config.dim};
-    auto local_results = search_delta_segments(query, request->top_k * request->result_kfactor, config);
+    const u32 requested_items = request->top_k * request->result_kfactor;
+    const u32 response_capacity = max_delta_response_items(config);
+    const u32 capped_items = std::min(requested_items, response_capacity);
+    auto local_results = search_delta_segments(query, capped_items, config);
     response_ptr->item_count = static_cast<u32>(local_results.size());
     node_t* ids = service::storage_owner::delta_search_result_ids(response_ptr);
     distance_t* distances =

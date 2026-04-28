@@ -18,6 +18,7 @@ BEAM_WIDTH_CONSTRUCTION="${BEAM_WIDTH_CONSTRUCTION:-400}"
 ALPHA="${ALPHA:-1.2}"
 RABITQ_BITS="${RABITQ_BITS:-4}"
 SEARCH_MODE="${SEARCH_MODE:-rabitq_gpu}"
+K="${K:-10}"
 INDEX_PREFIX="${INDEX_PREFIX:-/data/xjs/index/shine_gpu_index/1024dim50M}"
 INDEX_FILE="${INDEX_FILE:-${INDEX_PREFIX}_node5_of5.dat}"
 
@@ -41,6 +42,7 @@ if [[ "$ENABLE_STORAGE_OWNER" == "1" ]]; then
     --alpha "$ALPHA"
     --rabitq-bits "$RABITQ_BITS"
     --search-mode "$SEARCH_MODE"
+    --k "$K"
     --index-prefix "$INDEX_PREFIX"
   )
 fi

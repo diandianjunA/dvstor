@@ -16,8 +16,8 @@ nohup: ignoring input
   测量时长:       60s
   操作粒度:       single_vector
   Query 文件:     synthetic
-  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260428_143413.json
-  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260428_143413.txt
+  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260428_145023.json
+  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260428_145023.txt
 
 ============================================================
                         CLIENT
@@ -76,55 +76,55 @@ interleaved policy
 client id: 0
 number of clients: 1
 connect to server 192.168.6.202:1234
-pairing: 1435 -- 1636
+pairing: 1460 -- 1681
 connect to server 192.168.6.202:1235
-pairing: 1436 -- 1637
+pairing: 1461 -- 1682
 connect to server 192.168.6.202:1236
-pairing: 1437 -- 1638
+pairing: 1462 -- 1683
 connect to server 192.168.6.202:1237
-pairing: 1438 -- 1639
+pairing: 1463 -- 1684
 connect to server 192.168.6.202:1238
-pairing: 1439 -- 1640
+pairing: 1464 -- 1685
 [STATUS]: pinned main thread to core 28
 [STATUS]: receive access tokens of remote memory regions
 [STATUS]: search mode: rabitq_gpu, cache=on
 [STATUS]: max cache size: 12859999846
-allocated ALIGNED MEM (no hugepage) at 139631634935872 with buffer size 53687091200
+allocated ALIGNED MEM (no hugepage) at 139789743419456 with buffer size 53687091200
 num cache buckets: 2499999
 allocate cache entries hugepage of size 99999960
-allocated ALIGNED MEM (no hugepage) at 139631534932032 with buffer size 99999960
+allocated ALIGNED MEM (no hugepage) at 139789643415616 with buffer size 99999960
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1440 -- 1641
-pairing: 1441 -- 1642
-pairing: 1442 -- 1644
-pairing: 1443 -- 1643
-pairing: 1444 -- 1645
+pairing: 1465 -- 1686
+pairing: 1466 -- 1687
+pairing: 1467 -- 1689
+pairing: 1468 -- 1688
+pairing: 1469 -- 1690
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1445 -- 1650
-pairing: 1446 -- 1648
-pairing: 1447 -- 1646
-pairing: 1448 -- 1647
-pairing: 1449 -- 1649
+pairing: 1470 -- 1692
+pairing: 1471 -- 1693
+pairing: 1472 -- 1691
+pairing: 1473 -- 1694
+pairing: 1474 -- 1695
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1450 -- 1651
-pairing: 1451 -- 1653
-pairing: 1452 -- 1654
-pairing: 1453 -- 1652
-pairing: 1454 -- 1655
+pairing: 1475 -- 1698
+pairing: 1476 -- 1699
+pairing: 1477 -- 1696
+pairing: 1478 -- 1697
+pairing: 1479 -- 1700
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1455 -- 1658
-pairing: 1456 -- 1657
-pairing: 1457 -- 1656
-pairing: 1458 -- 1659
-pairing: 1459 -- 1660
+pairing: 1480 -- 1702
+pairing: 1481 -- 1701
+pairing: 1482 -- 1704
+pairing: 1483 -- 1705
+pairing: 1484 -- 1703
 [STATUS]: neighbor cache worker 0: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
 [GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
@@ -197,30 +197,150 @@ pairing: 1459 -- 1660
 [breakdown] query data ready: count=65536
 [breakdown] effective insert start id=50010000
 [breakdown] starting warmup mixed
-[breakdown][warmup-mixed] progress elapsed=5.01541s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=10.0155s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=15.0156s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=20.0157s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=25.0158s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=30.0159s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=35.016s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=40.0161s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=45.0162s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=50.0163s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=55.0164s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=60.0165s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=65.0166s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=70.0168s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=75.0169s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=80.017s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=85.0171s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=90.0172s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=95.0173s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=100.017s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=105.018s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=110.018s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=115.018s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=120.018s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=125.018s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=130.018s/30s, completed=0 ops, rate=0 ops/s
-[breakdown][warmup-mixed] progress elapsed=135.018s/30s, completed=0 ops, rate=0 ops/s
+[breakdown][warmup-mixed] progress elapsed=5.01269s/30s, completed=209 ops, rate=41.6941 ops/s
+[breakdown][warmup-mixed] progress elapsed=10.0128s/30s, completed=209 ops, rate=20.8733 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=15.0129s/30s, completed=209 ops, rate=13.9213 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=20.013s/30s, completed=209 ops, rate=10.4432 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=25.0131s/30s, completed=209 ops, rate=8.35561 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=30.0133s/30s, completed=209 ops, rate=6.96359 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=35.0134s/30s, completed=209 ops, rate=5.96915 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=40.0135s/30s, completed=209 ops, rate=5.22324 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=45.0136s/30s, completed=209 ops, rate=4.64304 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=50.0137s/30s, completed=209 ops, rate=4.17885 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=55.0138s/30s, completed=209 ops, rate=3.79905 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=60.0139s/30s, completed=209 ops, rate=3.48252 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=65.0141s/30s, completed=209 ops, rate=3.21469 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=70.0142s/30s, completed=209 ops, rate=2.98511 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=75.0143s/30s, completed=209 ops, rate=2.78614 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=80.0144s/30s, completed=209 ops, rate=2.61203 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=85.0145s/30s, completed=209 ops, rate=2.4584 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=90.0146s/30s, completed=209 ops, rate=2.32184 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=95.0148s/30s, completed=209 ops, rate=2.19966 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=100.015s/30s, completed=209 ops, rate=2.08969 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=105.015s/30s, completed=209 ops, rate=1.99019 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=110.015s/30s, completed=209 ops, rate=1.89974 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=115.015s/30s, completed=209 ops, rate=1.81715 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=120.015s/30s, completed=209 ops, rate=1.74144 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=125.015s/30s, completed=209 ops, rate=1.67179 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=130.016s/30s, completed=209 ops, rate=1.6075 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=135.016s/30s, completed=209 ops, rate=1.54797 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=140.016s/30s, completed=209 ops, rate=1.49269 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=145.016s/30s, completed=209 ops, rate=1.44122 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=150.016s/30s, completed=209 ops, rate=1.39318 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=155.016s/30s, completed=209 ops, rate=1.34825 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=160.016s/30s, completed=209 ops, rate=1.30612 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=165.016s/30s, completed=209 ops, rate=1.26654 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=170.016s/30s, completed=209 ops, rate=1.22929 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=175.017s/30s, completed=209 ops, rate=1.19417 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=180.017s/30s, completed=209 ops, rate=1.161 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=185.017s/30s, completed=209 ops, rate=1.12963 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=190.017s/30s, completed=209 ops, rate=1.0999 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=195.017s/30s, completed=209 ops, rate=1.0717 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=200.018s/30s, completed=209 ops, rate=1.04491 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=205.018s/30s, completed=209 ops, rate=1.01942 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=210.018s/30s, completed=209 ops, rate=0.995154 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=215.018s/30s, completed=209 ops, rate=0.972012 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=220.018s/30s, completed=209 ops, rate=0.949922 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=225.018s/30s, completed=209 ops, rate=0.928814 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=230.018s/30s, completed=209 ops, rate=0.908623 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=235.018s/30s, completed=209 ops, rate=0.889292 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=240.019s/30s, completed=209 ops, rate=0.870766 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=245.019s/30s, completed=209 ops, rate=0.852996 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=250.019s/30s, completed=209 ops, rate=0.835937 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=255.019s/30s, completed=209 ops, rate=0.819547 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=260.019s/30s, completed=209 ops, rate=0.803787 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=265.019s/30s, completed=209 ops, rate=0.788622 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=270.019s/30s, completed=209 ops, rate=0.774019 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=275.019s/30s, completed=209 ops, rate=0.759946 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=280.019s/30s, completed=209 ops, rate=0.746377 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=285.02s/30s, completed=209 ops, rate=0.733283 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=290.02s/30s, completed=209 ops, rate=0.720641 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=295.02s/30s, completed=209 ops, rate=0.708427 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=300.02s/30s, completed=209 ops, rate=0.69662 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=305.02s/30s, completed=209 ops, rate=0.685201 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=310.02s/30s, completed=209 ops, rate=0.67415 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=315.02s/30s, completed=209 ops, rate=0.663449 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=320.02s/30s, completed=209 ops, rate=0.653083 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=325.021s/30s, completed=209 ops, rate=0.643036 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=330.021s/30s, completed=209 ops, rate=0.633294 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=335.021s/30s, completed=209 ops, rate=0.623842 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=340.021s/30s, completed=209 ops, rate=0.614668 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=345.021s/30s, completed=209 ops, rate=0.60576 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=350.021s/30s, completed=209 ops, rate=0.597107 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=355.021s/30s, completed=209 ops, rate=0.588697 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=360.021s/30s, completed=209 ops, rate=0.580521 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=365.021s/30s, completed=209 ops, rate=0.572569 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
+[breakdown][warmup-mixed] progress elapsed=370.022s/30s, completed=209 ops, rate=0.564832 ops/s
+[breakdown][warmup-mixed] still running, no new completions in last interval
