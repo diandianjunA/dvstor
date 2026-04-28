@@ -495,3 +495,60 @@ allocated ALIGNED MEM (no hugepage) at 127528113320000 with buffer size 164480
 [storage-peer][probe] self_shard=4 peer_shard=3 free_ptr=51440000016 medoid_raw=0
 allocated ALIGNED MEM (no hugepage) at 100172934162048 with buffer size 65792
 [STATUS]: storage-owner insert runtime enabled on shard 4
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1238
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/1024dim50M_node5_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 1640 -- 1439
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 125646686650432 with buffer size 53687091200
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node5_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 1645 -- 1444
+pairing: 1649 -- 1449
+pairing: 1655 -- 1454
+pairing: 1660 -- 1459
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node5_of5.dat
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 1677 -- 1669
+pairing: 1678 -- 1672
+pairing: 1679 -- 1675
+pairing: 1680 -- 1676
+[storage-peer][token] self_shard=4 local_base=125646686650432 local_rkey=1581312 local_bytes=53687091200
+[storage-peer][token] self_shard=4 peer_shard=0 remote_base=124751687188544 remote_rkey=1584896
+[storage-peer][token] self_shard=4 peer_shard=1 remote_base=127305642934336 remote_rkey=1585408
+[storage-peer][token] self_shard=4 peer_shard=2 remote_base=129647803105344 remote_rkey=1585152
+[storage-peer][token] self_shard=4 peer_shard=3 remote_base=133280489799744 remote_rkey=1582080
+allocated ALIGNED MEM (no hugepage) at 125646609055808 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 125646684557376 with buffer size 164480
+[storage-peer][read] self_shard=4 target_shard=0 remote_base=124751687188544 rkey=1584896 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=0 free_ptr=51440000016 medoid_raw=33618154200
+[storage-peer][read] self_shard=4 target_shard=1 remote_base=127305642934336 rkey=1585408 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=1 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=2 remote_base=129647803105344 rkey=1585152 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=2 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=3 remote_base=133280489799744 rkey=1582080 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=3 free_ptr=51440000016 medoid_raw=0
+allocated ALIGNED MEM (no hugepage) at 100932446504576 with buffer size 65792
+[STATUS]: storage-delta insert runtime enabled on shard 4
