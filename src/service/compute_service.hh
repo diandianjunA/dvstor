@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -81,6 +82,13 @@ public:
     u32 query_coroutines{};
   };
 
+  struct LocalDeltaMirror {
+    mutable std::shared_mutex mutex;
+    vec<node_t> ids;
+    vec<element_t> vectors;
+    size_t max_vectors{};
+  };
+
 public:
   explicit ComputeService(const Configuration& config, bool shutdown_remote_on_stop = false);
   ~ComputeService();
@@ -117,6 +125,8 @@ private:
   size_t insert_via_storage_owner(const vec<InsertItem>& batch,
                                   const vec<std::shared_ptr<service::breakdown::Sample>>& samples);
   service::QueryResult search_storage_delta(const vec<element_t>& query, u32 k);
+  void append_local_delta_mirror(const vec<InsertItem>& batch, const vec<size_t>& successful_indices);
+  service::QueryResult search_local_delta_mirror(const vec<element_t>& query, u32 k) const;
   vec<node_t> merge_main_and_delta_results(const service::QueryResult& main_results,
                                            const service::QueryResult& delta_results,
                                            u32 k) const;
@@ -197,6 +207,7 @@ private:
   bool breakdown_enabled_{false};
   std::vector<service::breakdown::Sample> completed_query_samples_;
   std::vector<service::breakdown::Sample> completed_insert_samples_;
+  LocalDeltaMirror local_delta_mirror_;
 };
 
 extern template class ComputeService<L2Distance>;
