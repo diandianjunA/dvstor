@@ -144,11 +144,15 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
 
   start_workers();
   start_rpc();
+  if (config_.use_storage_owner_insert() || config_.use_storage_delta_insert()) {
+    start_storage_insert_runtime();
+  }
   refresh_routing_state(true);
 }
 
 template <class Distance>
 ComputeService<Distance>::~ComputeService() {
+  stop_storage_insert_runtime();
   stop_rpc();
   stop_workers();
   shutdown_remote_if_requested();
@@ -161,24 +165,43 @@ ComputeService<Distance>::~ComputeService() {
 template <class Distance>
 size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
   if (config_.use_storage_owner_insert() || config_.use_storage_delta_insert()) {
+    vec<std::future<bool>> futures;
     vec<std::shared_ptr<service::breakdown::Sample>> samples;
+    futures.reserve(batch.size());
     samples.reserve(batch.size());
-    for (const auto& item : batch) {
-      if (item.values.size() != config_.dim) {
-        throw std::invalid_argument("insert dimension mismatch");
+    {
+      std::lock_guard<std::mutex> lock(storage_insert_mutex_);
+      if (storage_insert_owner_queues_.empty()) {
+        storage_insert_owner_queues_.resize(std::max<u32>(1, num_servers_));
       }
+      for (const auto& item : batch) {
+        if (item.values.size() != config_.dim) {
+          throw std::invalid_argument("insert dimension mismatch");
+        }
 
-      std::shared_ptr<service::breakdown::Sample> sample;
-      if (breakdown_enabled_) {
-        sample = std::make_shared<service::breakdown::Sample>(service::breakdown::Operation::insert);
-        const auto now = std::chrono::steady_clock::now();
-        sample->enqueued_at = now;
-        sample->mark_started(now, now, statistics::ThreadStatistics{});
+        std::shared_ptr<service::breakdown::Sample> sample;
+        if (breakdown_enabled_) {
+          sample = std::make_shared<service::breakdown::Sample>(service::breakdown::Operation::insert);
+          const auto now = std::chrono::steady_clock::now();
+          sample->enqueued_at = now;
+          sample->mark_started(now, now, statistics::ThreadStatistics{});
+        }
+
+        auto task = std::make_unique<StorageInsertTask>();
+        task->item = item;
+        task->sample = sample;
+        futures.push_back(task->result.get_future());
+        samples.push_back(sample);
+        const u32 owner_storage = num_servers_ == 0 ? 0 : static_cast<u32>(item.id % num_servers_);
+        storage_insert_owner_queues_[owner_storage].push_back(std::move(task));
       }
-      samples.push_back(sample);
     }
+    storage_insert_cv_.notify_one();
 
-    const size_t inserted = insert_via_storage_owner(batch, samples);
+    size_t inserted = 0;
+    for (auto& future : futures) {
+      inserted += future.get() ? 1u : 0u;
+    }
     for (const auto& sample : samples) {
       if (sample && sample->finished_flag) {
         std::lock_guard<std::mutex> lock(breakdown_mutex_);
@@ -247,6 +270,200 @@ void ComputeService<Distance>::connect_delta_query_channel() {
     delta_query_server_qps_.emplace_back(
       delta_query_context_->connect_to_server(endpoint.address, delta_port, cm_.client_id));
   }
+}
+
+template <class Distance>
+void ComputeService<Distance>::start_storage_insert_runtime() {
+  if (storage_insert_thread_.joinable()) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(storage_insert_mutex_);
+    storage_insert_owner_queues_.clear();
+    storage_insert_owner_queues_.resize(std::max<u32>(1, num_servers_));
+    storage_insert_rr_owner_ = 0;
+  }
+  storage_insert_shutdown_.store(false, std::memory_order_release);
+  storage_insert_thread_ = std::thread([this]() { run_storage_insert_runtime(); });
+}
+
+template <class Distance>
+void ComputeService<Distance>::stop_storage_insert_runtime() {
+  storage_insert_shutdown_.store(true, std::memory_order_release);
+  storage_insert_cv_.notify_all();
+  if (storage_insert_thread_.joinable()) {
+    storage_insert_thread_.join();
+  }
+
+  std::lock_guard<std::mutex> lock(storage_insert_mutex_);
+  for (auto& queue : storage_insert_owner_queues_) {
+    while (!queue.empty()) {
+      queue.front()->result.set_value(false);
+      queue.pop_front();
+    }
+  }
+}
+
+template <class Distance>
+void ComputeService<Distance>::run_storage_insert_runtime() {
+  const auto has_pending = [&]() {
+    return std::any_of(storage_insert_owner_queues_.begin(),
+                       storage_insert_owner_queues_.end(),
+                       [](const auto& queue) { return !queue.empty(); });
+  };
+
+  for (;;) {
+    u32 owner_storage = 0;
+    vec<std::unique_ptr<StorageInsertTask>> owned_tasks;
+    {
+      std::unique_lock<std::mutex> lock(storage_insert_mutex_);
+      storage_insert_cv_.wait(lock, [&]() {
+        return storage_insert_shutdown_.load(std::memory_order_acquire) || has_pending();
+      });
+
+      if (storage_insert_shutdown_.load(std::memory_order_acquire) && !has_pending()) {
+        return;
+      }
+
+      const u32 owner_count = static_cast<u32>(storage_insert_owner_queues_.size());
+      bool found = false;
+      for (u32 attempt = 0; attempt < owner_count; ++attempt) {
+        const u32 candidate = (storage_insert_rr_owner_ + attempt) % owner_count;
+        if (!storage_insert_owner_queues_[candidate].empty()) {
+          owner_storage = candidate;
+          storage_insert_rr_owner_ = (candidate + 1) % owner_count;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        continue;
+      }
+
+      if (config_.storage_owner_batch_wait_us > 0 &&
+          storage_insert_owner_queues_[owner_storage].size() < config_.storage_owner_batch_max) {
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::microseconds(config_.storage_owner_batch_wait_us);
+        while (storage_insert_owner_queues_[owner_storage].size() < config_.storage_owner_batch_max &&
+               !storage_insert_shutdown_.load(std::memory_order_acquire)) {
+          if (storage_insert_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+            break;
+          }
+        }
+      }
+
+      const size_t batch_size =
+        std::min<size_t>(storage_insert_owner_queues_[owner_storage].size(), config_.storage_owner_batch_max);
+      owned_tasks.reserve(batch_size);
+      for (size_t i = 0; i < batch_size; ++i) {
+        owned_tasks.push_back(std::move(storage_insert_owner_queues_[owner_storage].front()));
+        storage_insert_owner_queues_[owner_storage].pop_front();
+      }
+    }
+
+    vec<StorageInsertTask*> task_ptrs;
+    vec<std::shared_ptr<service::breakdown::Sample>> samples;
+    task_ptrs.reserve(owned_tasks.size());
+    samples.reserve(owned_tasks.size());
+    for (auto& task : owned_tasks) {
+      task_ptrs.push_back(task.get());
+      samples.push_back(task->sample);
+    }
+
+    try {
+      send_storage_owner_batch(owner_storage, task_ptrs, samples);
+    } catch (...) {
+      const auto finished_at = std::chrono::steady_clock::now();
+      for (StorageInsertTask* task : task_ptrs) {
+        if (task->sample) {
+          task->sample->mark_finished(finished_at, statistics::ThreadStatistics{});
+        }
+        task->result.set_value(false);
+      }
+    }
+  }
+}
+
+template <class Distance>
+size_t ComputeService<Distance>::send_storage_owner_batch(
+    u32 owner_storage,
+    const vec<StorageInsertTask*>& tasks,
+    const vec<std::shared_ptr<service::breakdown::Sample>>& samples) {
+  if (tasks.empty()) {
+    return 0;
+  }
+
+  const u32 item_count = static_cast<u32>(tasks.size());
+  const u64 batch_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
+  const size_t request_size = service::storage_owner::insert_batch_request_bytes(item_count, config_.dim);
+  const size_t response_size = service::storage_owner::insert_batch_response_bytes(item_count);
+  vec<byte_t> request_buffer(request_size);
+  vec<byte_t> response_buffer(response_size);
+
+  auto* request = reinterpret_cast<service::storage_owner::InsertBatchRequestHeader*>(request_buffer.data());
+  request->magic = service::storage_owner::kInsertMagic;
+  request->dim = config_.dim;
+  request->owner_storage = owner_storage;
+  request->source_client = cm_.client_id;
+  request->item_count = item_count;
+  request->batch_id = batch_id;
+
+  node_t* ids = service::storage_owner::request_ids(request_buffer.data());
+  element_t* vectors = service::storage_owner::request_vectors(request_buffer.data(), item_count);
+  for (u32 i = 0; i < item_count; ++i) {
+    ids[i] = tasks[i]->item.id;
+    std::memcpy(vectors + static_cast<size_t>(i) * config_.dim,
+                tasks[i]->item.values.data(),
+                static_cast<size_t>(config_.dim) * sizeof(element_t));
+  }
+
+  LocalMemoryRegion request_region{context_, request_buffer.data(), request_buffer.size()};
+  LocalMemoryRegion response_region{context_, response_buffer.data(), response_buffer.size()};
+
+  auto& qp = *cm_.server_qps[owner_storage];
+  qp.post_receive(response_region, static_cast<u32>(response_size));
+  qp.post_send(request_region,
+               static_cast<u32>(request_size),
+               IBV_WR_SEND,
+               true,
+               nullptr,
+               0,
+               0);
+  context_.poll_send_cq_until_completion();
+  context_.receive();
+
+  const auto* response =
+    reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(response_buffer.data());
+  const u32* statuses = service::storage_owner::response_statuses(response_buffer.data());
+  const bool response_ok = response->magic == service::storage_owner::kInsertMagic &&
+                           response->owner_storage == owner_storage &&
+                           response->batch_id == batch_id &&
+                           response->item_count == item_count;
+  const auto finished_at = std::chrono::steady_clock::now();
+  vec<InsertItem> successful_batch;
+  vec<size_t> successful_indices;
+  successful_batch.reserve(item_count);
+  successful_indices.reserve(item_count);
+
+  size_t inserted = 0;
+  for (u32 i = 0; i < item_count; ++i) {
+    const bool ok = response_ok &&
+                    statuses[i] == static_cast<u32>(service::storage_owner::InsertStatus::ok);
+    inserted += ok ? 1u : 0u;
+    if (ok && config_.use_storage_delta_insert()) {
+      successful_indices.push_back(successful_batch.size());
+      successful_batch.push_back(tasks[i]->item);
+    }
+    if (samples[i]) {
+      samples[i]->mark_finished(finished_at, statistics::ThreadStatistics{});
+    }
+    tasks[i]->result.set_value(ok);
+  }
+
+  if (config_.use_storage_delta_insert() && !successful_indices.empty()) {
+    append_local_delta_mirror(successful_batch, successful_indices);
+  }
+  return inserted;
 }
 
 template <class Distance>

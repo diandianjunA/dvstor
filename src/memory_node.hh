@@ -835,9 +835,8 @@ private:
         statuses[i] = static_cast<u32>(service::storage_owner::InsertStatus::ok);
       }
     } else {
+      const bool ok = execute_storage_owner_batch_items(ids, vectors, request->item_count, config);
       for (u32 i = 0; i < request->item_count; ++i) {
-        const auto vec_span = span<const element_t>{vectors + static_cast<size_t>(i) * config.dim, config.dim};
-        const bool ok = execute_storage_owner_insert(ids[i], vec_span, config);
         statuses[i] = static_cast<u32>(ok ? service::storage_owner::InsertStatus::ok
                                           : service::storage_owner::InsertStatus::failed);
       }
@@ -1003,27 +1002,26 @@ private:
     return results;
   }
 
-  bool merge_delta_batch_round(DeltaSegment& segment,
-                               size_t begin,
-                               size_t batch_size,
-                               const Configuration& config) {
-    if (begin >= segment.ids.size() || batch_size == 0) {
+  bool execute_storage_owner_batch_items(const node_t* ids,
+                                         const element_t* vectors,
+                                         size_t item_count,
+                                         const Configuration& config) {
+    if (item_count == 0) {
       return true;
     }
 
-    const size_t end = std::min(segment.ids.size(), begin + batch_size);
     RemotePtr medoid_ptr = read_global_medoid();
     std::unordered_map<u64, vec<RemotePtr>> local_updates;
     std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
 
-    for (size_t idx = begin; idx < end; ++idx) {
-      const element_t* vec_ptr = segment.vectors.data() + idx * VamanaNode::DIM;
+    for (size_t idx = 0; idx < item_count; ++idx) {
+      const element_t* vec_ptr = vectors + idx * VamanaNode::DIM;
       const auto components = span<const element_t>{vec_ptr, VamanaNode::DIM};
       const vec<byte_t> rabitq_data = quantize_rabitq_cpu(components, config);
 
       if (medoid_ptr.is_null()) {
         const RemotePtr new_ptr = allocate_local_node();
-        write_new_node(new_ptr, segment.ids[idx], components, rabitq_data, {});
+        write_new_node(new_ptr, ids[idx], components, rabitq_data, {});
         RemotePtr observed;
         if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
           medoid_ptr = new_ptr;
@@ -1036,7 +1034,7 @@ private:
       hashset_t<RemotePtr> empty_skip;
       vec<RemotePtr> selected_neighbors = robust_prune_cpu(components, candidates, empty_skip, config);
       const RemotePtr new_ptr = allocate_local_node();
-      write_new_node(new_ptr, segment.ids[idx], components, rabitq_data, selected_neighbors);
+      write_new_node(new_ptr, ids[idx], components, rabitq_data, selected_neighbors);
 
       for (const RemotePtr& neighbor_ptr : selected_neighbors) {
         if (local_shard(neighbor_ptr.memory_node())) {
@@ -1059,6 +1057,19 @@ private:
       }
     }
     return true;
+  }
+
+  bool merge_delta_batch_round(DeltaSegment& segment,
+                               size_t begin,
+                               size_t batch_size,
+                               const Configuration& config) {
+    if (begin >= segment.ids.size() || batch_size == 0) {
+      return true;
+    }
+    return execute_storage_owner_batch_items(segment.ids.data() + begin,
+                                             segment.vectors.data() + begin * VamanaNode::DIM,
+                                             std::min(segment.ids.size() - begin, batch_size),
+                                             config);
   }
 
   void start_delta_merge_worker(const Configuration& config) {

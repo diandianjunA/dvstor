@@ -128,6 +128,12 @@ public:
   const Configuration& config() const { return config_; }
 
 private:
+  struct StorageInsertTask {
+    InsertItem item;
+    std::shared_ptr<service::breakdown::Sample> sample;
+    std::promise<bool> result;
+  };
+
   void init_remote_tokens();
   void receive_remote_access_tokens();
   void wait_for_load_or_store();
@@ -142,6 +148,12 @@ private:
   void resume_workers();
   LocalMainSearchOutput search_local_result(const vec<element_t>& query, u32 k);
   vec<node_t> search_local(const vec<element_t>& query, u32 k);
+  void start_storage_insert_runtime();
+  void stop_storage_insert_runtime();
+  void run_storage_insert_runtime();
+  size_t send_storage_owner_batch(u32 owner_storage,
+                                  const vec<StorageInsertTask*>& tasks,
+                                  const vec<std::shared_ptr<service::breakdown::Sample>>& samples);
   size_t insert_via_storage_owner(const vec<InsertItem>& batch,
                                   const vec<std::shared_ptr<service::breakdown::Sample>>& samples);
   service::QueryResult search_storage_delta(const vec<element_t>& query, u32 k);
@@ -195,6 +207,8 @@ private:
   std::mutex mn_command_mutex_;
   std::mutex storage_rpc_mutex_;
   std::mutex delta_query_rpc_mutex_;
+  std::mutex storage_insert_mutex_;
+  std::condition_variable storage_insert_cv_;
   std::atomic<bool> workers_paused_{false};
   std::atomic<u32> workers_idle_count_{0};
   std::atomic<bool> stopped_{false};
@@ -213,6 +227,10 @@ private:
   service::QueryQueue query_queue_;
   vec<std::thread> workers_;
   std::thread rpc_thread_;
+  std::thread storage_insert_thread_;
+  std::atomic<bool> storage_insert_shutdown_{false};
+  vec<std::deque<std::unique_ptr<StorageInsertTask>>> storage_insert_owner_queues_;
+  u32 storage_insert_rr_owner_{0};
 
   std::unique_ptr<byte_t[]> rpc_buffer_;
   std::unique_ptr<LocalMemoryRegion> rpc_region_;
