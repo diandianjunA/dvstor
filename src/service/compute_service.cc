@@ -248,6 +248,7 @@ size_t ComputeService<Distance>::insert_via_storage_owner(
       vec<byte_t> response_buffer(response_size);
 
       auto* request = reinterpret_cast<service::storage_owner::InsertBatchRequestHeader*>(request_buffer.data());
+      request->magic = service::storage_owner::kInsertMagic;
       request->dim = config_.dim;
       request->owner_storage = owner_storage;
       request->source_client = cm_.client_id;
@@ -324,6 +325,7 @@ service::QueryResult ComputeService<Distance>::search_storage_delta(const vec<el
 
   for (u32 shard = 0; shard < num_servers_; ++shard) {
     auto* request = reinterpret_cast<service::storage_owner::DeltaSearchRequestHeader*>(request_buffers[shard].data());
+    request->magic = service::storage_owner::kDeltaSearchMagic;
     request->dim = config_.dim;
     request->top_k = requested_k;
     request->result_kfactor = config_.delta_result_kfactor;

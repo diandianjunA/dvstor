@@ -579,6 +579,7 @@ private:
       const size_t bytes = service::storage_owner::reverse_update_request_bytes(item_count);
       vec<byte_t> message(bytes);
       auto* header = reinterpret_cast<service::storage_owner::PeerRpcHeader*>(message.data());
+      header->magic = service::storage_owner::kPeerRpcMagic;
       header->type = static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_request);
       header->source_shard = storage_id_;
       header->item_count = item_count;
