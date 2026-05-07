@@ -16,8 +16,8 @@ nohup: ignoring input
   测量时长:       60s
   操作粒度:       single_vector
   Query 文件:     synthetic
-  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260428_195110.json
-  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260428_195110.txt
+  JSON 报告:      /home/xjs/experiment/dvstor/reports/breakdown/20260428_200909.json
+  文本报告:       /home/xjs/experiment/dvstor/reports/breakdown/20260428_200909.txt
 
 ============================================================
                         CLIENT
@@ -73,55 +73,55 @@ interleaved policy
 client id: 0
 number of clients: 1
 connect to server 192.168.6.202:1234
-pairing: 1810 -- 2291
+pairing: 1835 -- 2336
 connect to server 192.168.6.202:1235
-pairing: 1811 -- 2292
+pairing: 1836 -- 2337
 connect to server 192.168.6.202:1236
-pairing: 1812 -- 2293
+pairing: 1837 -- 2338
 connect to server 192.168.6.202:1237
-pairing: 1813 -- 2294
+pairing: 1838 -- 2339
 connect to server 192.168.6.202:1238
-pairing: 1814 -- 2295
+pairing: 1839 -- 2340
 [STATUS]: pinned main thread to core 28
 [STATUS]: receive access tokens of remote memory regions
 [STATUS]: search mode: rabitq_gpu, cache=on
 [STATUS]: max cache size: 12859999846
-allocated ALIGNED MEM (no hugepage) at 140011068452928 with buffer size 53687091200
+allocated ALIGNED MEM (no hugepage) at 140307286978624 with buffer size 53687091200
 num cache buckets: 2499999
 allocate cache entries hugepage of size 99999960
-allocated ALIGNED MEM (no hugepage) at 140010968449088 with buffer size 99999960
+allocated ALIGNED MEM (no hugepage) at 140307106971712 with buffer size 99999960
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1815 -- 2296
-pairing: 1816 -- 2297
-pairing: 1817 -- 2300
-pairing: 1818 -- 2298
-pairing: 1819 -- 2299
+pairing: 1840 -- 2341
+pairing: 1841 -- 2344
+pairing: 1842 -- 2343
+pairing: 1843 -- 2345
+pairing: 1844 -- 2342
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1820 -- 2301
-pairing: 1821 -- 2302
-pairing: 1822 -- 2303
-pairing: 1823 -- 2304
-pairing: 1824 -- 2305
+pairing: 1845 -- 2347
+pairing: 1846 -- 2348
+pairing: 1847 -- 2349
+pairing: 1848 -- 2346
+pairing: 1849 -- 2350
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1825 -- 2307
-pairing: 1826 -- 2306
-pairing: 1827 -- 2310
-pairing: 1828 -- 2309
-pairing: 1829 -- 2308
+pairing: 1850 -- 2353
+pairing: 1851 -- 2351
+pairing: 1852 -- 2354
+pairing: 1853 -- 2352
+pairing: 1854 -- 2355
 1 device(s) found
 Selected device: mlx5_0
 Selected port state: 4, lid: 1
-pairing: 1830 -- 2312
-pairing: 1831 -- 2311
-pairing: 1832 -- 2313
-pairing: 1833 -- 2314
-pairing: 1834 -- 2315
+pairing: 1855 -- 2357
+pairing: 1856 -- 2358
+pairing: 1857 -- 2356
+pairing: 1858 -- 2360
+pairing: 1859 -- 2359
 [STATUS]: neighbor cache worker 0: slots=64403
 [GPUDirect RDMA] enabled for 16 coroutine GPU staging buffers
 [GPU RaBitQ cache] enabled: slots=2064888 stride=520 bytes=1073741760
@@ -194,57 +194,57 @@ pairing: 1834 -- 2315
 [breakdown] query data ready: count=65536
 [breakdown] effective insert start id=50010000
 [breakdown] starting warmup mixed
-[breakdown][warmup-mixed] progress elapsed=5.00095s/30s, completed=2489 ops, rate=497.705 ops/s
-[breakdown][warmup-mixed] progress elapsed=10.0011s/30s, completed=5217 ops, rate=521.643 ops/s
-[breakdown][warmup-mixed] progress elapsed=15.0012s/30s, completed=7953 ops, rate=530.157 ops/s
-[breakdown][warmup-mixed] progress elapsed=20.0013s/30s, completed=10725 ops, rate=536.214 ops/s
-[breakdown][warmup-mixed] progress elapsed=25.0015s/30s, completed=13464 ops, rate=538.529 ops/s
-[breakdown][warmup-mixed] progress elapsed=30.0016s/30s, completed=16202 ops, rate=540.038 ops/s
-[breakdown][warmup-mixed] progress elapsed=35.0017s/30s, completed=16217 ops, rate=463.32 ops/s
-[breakdown][warmup-mixed] done elapsed=35.0019s/30s, completed=16217 ops, avg_rate=463.318 ops/s
+[breakdown][warmup-mixed] progress elapsed=5.00095s/30s, completed=2479 ops, rate=495.705 ops/s
+[breakdown][warmup-mixed] progress elapsed=10.0011s/30s, completed=5190 ops, rate=518.943 ops/s
+[breakdown][warmup-mixed] progress elapsed=15.0015s/30s, completed=7917 ops, rate=527.748 ops/s
+[breakdown][warmup-mixed] progress elapsed=20.0016s/30s, completed=10662 ops, rate=533.057 ops/s
+[breakdown][warmup-mixed] progress elapsed=25.0017s/30s, completed=13394 ops, rate=535.723 ops/s
+[breakdown][warmup-mixed] progress elapsed=30.0019s/30s, completed=16106 ops, rate=536.833 ops/s
+[breakdown][warmup-mixed] progress elapsed=35.002s/30s, completed=16121 ops, rate=460.574 ops/s
+[breakdown][warmup-mixed] done elapsed=35.0022s/30s, completed=16121 ops, avg_rate=460.571 ops/s
 [breakdown] starting measure phase
-[breakdown][measure-mixed] progress elapsed=5.02057s/60s, completed=2746 ops, rate=546.95 ops/s
-[breakdown][measure-mixed] progress elapsed=10.0207s/60s, completed=5539 ops, rate=552.756 ops/s
-[breakdown][measure-mixed] progress elapsed=15.0208s/60s, completed=8304 ops, rate=552.833 ops/s
-[breakdown][measure-mixed] progress elapsed=20.021s/60s, completed=11069 ops, rate=552.871 ops/s
-[breakdown][measure-mixed] progress elapsed=25.0211s/60s, completed=13818 ops, rate=552.254 ops/s
-[breakdown][measure-mixed] progress elapsed=30.0212s/60s, completed=16591 ops, rate=552.642 ops/s
-[breakdown][measure-mixed] progress elapsed=35.0213s/60s, completed=19360 ops, rate=552.806 ops/s
-[breakdown][measure-mixed] progress elapsed=40.0215s/60s, completed=22129 ops, rate=552.928 ops/s
-[breakdown][measure-mixed] progress elapsed=45.0216s/60s, completed=24904 ops, rate=553.157 ops/s
-[breakdown][measure-mixed] progress elapsed=50.0217s/60s, completed=27681 ops, rate=553.379 ops/s
-[breakdown][measure-mixed] progress elapsed=55.0219s/60s, completed=30438 ops, rate=553.198 ops/s
-[breakdown][measure-mixed] progress elapsed=60.022s/60s, completed=33207 ops, rate=553.247 ops/s
-[breakdown][measure-mixed] progress elapsed=65.0221s/60s, completed=33215 ops, rate=510.826 ops/s
-[breakdown][measure-mixed] done elapsed=65.0223s/60s, completed=33215 ops, avg_rate=510.825 ops/s
-[breakdown][measure-mixed] reads issued/completed=33048/33048, writes issued/completed=167/167
+[breakdown][measure-mixed] progress elapsed=5.01405s/60s, completed=2756 ops, rate=549.655 ops/s
+[breakdown][measure-mixed] progress elapsed=10.0142s/60s, completed=5550 ops, rate=554.214 ops/s
+[breakdown][measure-mixed] progress elapsed=15.0143s/60s, completed=8305 ops, rate=553.139 ops/s
+[breakdown][measure-mixed] progress elapsed=20.0145s/60s, completed=11059 ops, rate=552.551 ops/s
+[breakdown][measure-mixed] progress elapsed=25.0146s/60s, completed=13806 ops, rate=551.918 ops/s
+[breakdown][measure-mixed] progress elapsed=30.0147s/60s, completed=16576 ops, rate=552.263 ops/s
+[breakdown][measure-mixed] progress elapsed=35.0148s/60s, completed=19349 ops, rate=552.594 ops/s
+[breakdown][measure-mixed] progress elapsed=40.015s/60s, completed=22097 ops, rate=552.218 ops/s
+[breakdown][measure-mixed] progress elapsed=45.0151s/60s, completed=24862 ops, rate=552.304 ops/s
+[breakdown][measure-mixed] progress elapsed=50.0152s/60s, completed=27632 ops, rate=552.472 ops/s
+[breakdown][measure-mixed] progress elapsed=55.0153s/60s, completed=30388 ops, rate=552.355 ops/s
+[breakdown][measure-mixed] progress elapsed=60.0155s/60s, completed=33162 ops, rate=552.558 ops/s
+[breakdown][measure-mixed] progress elapsed=65.0156s/60s, completed=33171 ops, rate=510.201 ops/s
+[breakdown][measure-mixed] done elapsed=65.0157s/60s, completed=33171 ops, avg_rate=510.2 ops/s
+[breakdown][measure-mixed] reads issued/completed=33030/33030, writes issued/completed=141/141
 throughput
   duration_seconds: 60
-  total_ops_per_sec: 553.583 (ops=33215)
-  query_ops_per_sec: 550.8 (ops=33048)
-  insert_ops_per_sec: 2.78333 (ops=167)
+  total_ops_per_sec: 552.85 (ops=33171)
+  query_ops_per_sec: 550.5 (ops=33030)
+  insert_ops_per_sec: 2.35 (ops=141)
 insert breakdown
-  count: 167
-  latency_ms: mean=2965.42 p50=2956.29 p95=5601.21 p99=6117.45
+  count: 141
+  latency_ms: mean=3492.85 p50=3486.24 p95=6468.65 p99=7180.29
   top_categories:
-    cpu_ns: 495225 ms (100%)
+    cpu_ns: 492492 ms (100%)
     gpu_ns: 0 ms (0%)
     rdma_ns: 0 ms (0%)
     transfer_ns: 0 ms (0%)
 query breakdown
-  count: 33048
-  latency_ms: mean=14.4374 p50=13.3507 p95=22.542 p99=27.8277
+  count: 33030
+  latency_ms: mean=14.4507 p50=13.3403 p95=22.7134 p99=28.0079
   top_categories:
-    gpu_ns: 282153 ms (59.1459%)
-    transfer_ns: 87375.9 ms (18.316%)
-    cpu_ns: 61133.6 ms (12.815%)
-    rdma_ns: 46383.7 ms (9.7231%)
+    gpu_ns: 283283 ms (59.36%)
+    transfer_ns: 89670.8 ms (18.7899%)
+    cpu_ns: 58720.2 ms (12.3044%)
+    rdma_ns: 45554.6 ms (9.54566%)
 cache histogram
-  size: 0 | freq: 2432341
-  size: 1 | freq: 66789
-  size: 2 | freq: 867
+  size: 0 | freq: 2432261
+  size: 1 | freq: 66855
+  size: 2 | freq: 881
   size: 3 | freq: 2
-total entries: 68529
+total entries: 68623
 cooling table histogram
   size: 0 | freq: 41667
   size: 1 | freq: 0
@@ -256,9 +256,9 @@ cooling table histogram
 CT total entries: 0
 
 [DVSTOR Breakdown] 关键指标
-  throughput: 553.58 ops/s (total=33215, duration=60s)
-  query throughput: 550.80 ops/s (count=33048)
-  insert throughput: 2.78 ops/s (count=167)
-  mixed completed: reads=33048, writes=167
-  query latency(ms): mean=14.4374, p95=22.5420, p99=27.8277
-  insert latency(ms): mean=2965.4221, p95=5601.2116, p99=6117.4535
+  throughput: 552.85 ops/s (total=33171, duration=60s)
+  query throughput: 550.50 ops/s (count=33030)
+  insert throughput: 2.35 ops/s (count=141)
+  mixed completed: reads=33030, writes=141
+  query latency(ms): mean=14.4507, p95=22.7134, p99=28.0079
+  insert latency(ms): mean=3492.8488, p95=6468.6486, p99=7180.2932

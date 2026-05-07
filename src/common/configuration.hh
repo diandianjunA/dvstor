@@ -51,16 +51,6 @@ public:
   vec<str> storage_peers;
   u32 storage_owner_batch_max{16};
   u32 storage_owner_batch_wait_us{250};
-  u32 delta_active_max_vectors{1024};
-  u32 delta_active_max_age_ms{100};
-  u32 delta_result_kfactor{2};
-  u32 delta_merge_threshold_vectors{32768};
-  u32 delta_hot_mirror_max_vectors{2048};
-  u32 delta_hot_mirror_max_age_ms{250};
-  u32 delta_synopsis_top_shards{2};
-  u32 delta_query_port_offset{1000};
-  u32 delta_merge_batch_size{32};
-  u32 delta_merge_sleep_ms{2};
 
   // Legacy aliases for compatibility
   u32& ef_search = beam_width;
@@ -145,7 +135,7 @@ private:
       "search-mode", po::value<str>(&search_mode)->default_value(search_mode),
       "Search mode for the query path: exact_gpu or rabitq_gpu.")(
       "insert-execution", po::value<str>(&insert_execution)->default_value(insert_execution),
-      "Insert execution mode: compute, storage_owner, or storage_delta.")(
+      "Insert execution mode: compute or storage_owner.")(
       "insert-workers", po::value<u32>(&insert_workers)->default_value(0),
       "Dedicated insert worker threads. 0 keeps the built-in split.")(
       "query-workers", po::value<u32>(&query_workers)->default_value(0),
@@ -162,33 +152,6 @@ private:
       "Maximum number of inserts grouped into one storage_owner batch.")(
       "storage-owner-batch-wait-us", po::value<u32>(&storage_owner_batch_wait_us)->default_value(storage_owner_batch_wait_us),
       "Maximum micro-batch wait in microseconds for storage_owner inserts.")(
-      "delta-active-max-vectors", po::value<u32>(&delta_active_max_vectors)->default_value(delta_active_max_vectors),
-      "Maximum number of vectors kept in the active delta segment before sealing.")(
-      "delta-active-max-age-ms", po::value<u32>(&delta_active_max_age_ms)->default_value(delta_active_max_age_ms),
-      "Maximum age in milliseconds of the active delta segment before sealing.")(
-      "delta-result-kfactor", po::value<u32>(&delta_result_kfactor)->default_value(delta_result_kfactor),
-      "Multiplier for the number of delta candidates returned per query.")(
-      "delta-merge-threshold-vectors",
-      po::value<u32>(&delta_merge_threshold_vectors)->default_value(delta_merge_threshold_vectors),
-      "Minimum number of sealed delta vectors before background merge starts.")(
-      "delta-hot-mirror-max-vectors",
-      po::value<u32>(&delta_hot_mirror_max_vectors)->default_value(delta_hot_mirror_max_vectors),
-      "Maximum number of vectors kept in the compute-side hot delta mirror.")(
-      "delta-hot-mirror-max-age-ms",
-      po::value<u32>(&delta_hot_mirror_max_age_ms)->default_value(delta_hot_mirror_max_age_ms),
-      "Maximum age in milliseconds of vectors kept in the compute-side hot delta mirror.")(
-      "delta-synopsis-top-shards",
-      po::value<u32>(&delta_synopsis_top_shards)->default_value(delta_synopsis_top_shards),
-      "Maximum number of storage shards probed for sealed-delta search.")(
-      "delta-query-port-offset",
-      po::value<u32>(&delta_query_port_offset)->default_value(delta_query_port_offset),
-      "TCP/RDMA port offset used for the dedicated storage-delta query channel.")(
-      "delta-merge-batch-size",
-      po::value<u32>(&delta_merge_batch_size)->default_value(delta_merge_batch_size),
-      "Maximum number of vectors merged from sealed delta into the main graph per merge round.")(
-      "delta-merge-sleep-ms",
-      po::value<u32>(&delta_merge_sleep_ms)->default_value(delta_merge_sleep_ms),
-      "Sleep duration in milliseconds between delta merge rounds.")(
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
@@ -229,8 +192,8 @@ private:
       exit_with_help_message(argv);
     }
 
-    if (insert_execution != "compute" && insert_execution != "storage_owner" && insert_execution != "storage_delta") {
-      std::cerr << "[ERROR]: --insert-execution must be compute, storage_owner, or storage_delta" << std::endl;
+    if (insert_execution != "compute" && insert_execution != "storage_owner") {
+      std::cerr << "[ERROR]: --insert-execution must be compute or storage_owner" << std::endl;
       exit_with_help_message(argv);
     }
 
@@ -254,7 +217,7 @@ private:
       exit_with_help_message(argv);
     }
 
-    if (insert_execution == "storage_owner" || insert_execution == "storage_delta") {
+    if (insert_execution == "storage_owner") {
       if (routing) {
         std::cerr << "[ERROR]: storage-side insert execution is not compatible with --routing in the current implementation"
                   << std::endl;
@@ -264,21 +227,11 @@ private:
         std::cerr << "[ERROR]: --storage-owner-batch-max must be > 0" << std::endl;
         exit_with_help_message(argv);
       }
-      if (delta_query_port_offset == 0) {
-        std::cerr << "[ERROR]: --delta-query-port-offset must be > 0" << std::endl;
-        exit_with_help_message(argv);
-      }
       if (storage_peers.size() != num_server_nodes()) {
         std::cerr << "[ERROR]: --storage-peers must list exactly one endpoint per storage node when "
                      "--insert-execution=storage_owner"
                   << std::endl;
         exit_with_help_message(argv);
-      }
-      if (insert_execution == "storage_delta") {
-        if (delta_active_max_vectors == 0 || delta_result_kfactor == 0 || delta_merge_threshold_vectors == 0) {
-          std::cerr << "[ERROR]: delta configuration values must be > 0" << std::endl;
-          exit_with_help_message(argv);
-        }
       }
     }
   }
@@ -297,7 +250,6 @@ public:
 
   bool use_rabitq_search() const { return search_mode == "rabitq_gpu"; }
   bool use_storage_owner_insert() const { return insert_execution == "storage_owner"; }
-  bool use_storage_delta_insert() const { return insert_execution == "storage_delta"; }
 
   friend std::ostream& operator<<(std::ostream& os, const IndexConfiguration& config) {
     os << static_cast<const Configuration&>(config);
@@ -331,11 +283,6 @@ public:
         os << std::setw(width) << "storage id: " << config.storage_id << std::endl;
         os << std::setw(width) << "storage batch max: " << config.storage_owner_batch_max << std::endl;
         os << std::setw(width) << "storage batch wait(us): " << config.storage_owner_batch_wait_us << std::endl;
-        if (config.use_storage_delta_insert()) {
-          os << std::setw(width) << "delta active max: " << config.delta_active_max_vectors << std::endl;
-          os << std::setw(width) << "delta result kfactor: " << config.delta_result_kfactor << std::endl;
-          os << std::setw(width) << "delta merge threshold: " << config.delta_merge_threshold_vectors << std::endl;
-        }
         os << std::setw(width) << "storage peers: " << "[";
         for (const str& node : config.storage_peers) {
           os << node << ", ";

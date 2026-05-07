@@ -37,13 +37,6 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
       cm_(context_, config_),
       num_servers_(config_.num_server_nodes()),
       shutdown_remote_on_stop_(shutdown_remote_on_stop) {
-  if (config_.use_storage_delta_insert()) {
-    local_delta_mirror_.max_vectors = std::max<size_t>(1, config_.delta_hot_mirror_max_vectors);
-    local_delta_mirror_.max_age = std::chrono::milliseconds(config_.delta_hot_mirror_max_age_ms);
-    sealed_delta_synopsis_.counts.assign(num_servers_, 0);
-    sealed_delta_synopsis_.centroids.assign(num_servers_, vec<element_t>(config_.dim, 0.0f));
-    sealed_delta_synopsis_.radii.assign(num_servers_, 0.0f);
-  }
   init_remote_tokens();
   cm_.connect();
 
@@ -125,9 +118,6 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
 
   wait_for_load_or_store();
   synchronize_clients_after_startup();
-  if (config_.use_storage_delta_insert()) {
-    connect_delta_query_channel();
-  }
   if (config_.load_index && config_.use_rabitq_search() && !rabitq_artifacts_ready_) {
     str artifact_error;
     lib_assert(maybe_load_rabitq_artifacts(config_.resolved_index_prefix(), &artifact_error), artifact_error);
@@ -144,7 +134,7 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
 
   start_workers();
   start_rpc();
-  if (config_.use_storage_owner_insert() || config_.use_storage_delta_insert()) {
+  if (config_.use_storage_owner_insert()) {
     start_storage_insert_runtime();
   }
   refresh_routing_state(true);
@@ -164,7 +154,7 @@ ComputeService<Distance>::~ComputeService() {
 
 template <class Distance>
 size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
-  if (config_.use_storage_owner_insert() || config_.use_storage_delta_insert()) {
+  if (config_.use_storage_owner_insert()) {
     vec<std::future<bool>> futures;
     vec<std::shared_ptr<service::breakdown::Sample>> samples;
     futures.reserve(batch.size());
@@ -255,21 +245,6 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
   }
 
   return inserted;
-}
-
-template <class Distance>
-void ComputeService<Distance>::connect_delta_query_channel() {
-  delta_query_config_ = std::make_unique<configuration::Configuration>(config_);
-  delta_query_context_ = std::make_unique<Context>(*delta_query_config_);
-  delta_query_server_qps_.clear();
-  delta_query_server_qps_.reserve(config_.num_server_nodes());
-
-  for (const str& node : config_.server_nodes) {
-    const auto endpoint = parse_endpoint(node, config_.port);
-    const u32 delta_port = endpoint.port + config_.delta_query_port_offset;
-    delta_query_server_qps_.emplace_back(
-      delta_query_context_->connect_to_server(endpoint.address, delta_port, cm_.client_id));
-  }
 }
 
 template <class Distance>
@@ -440,378 +415,19 @@ size_t ComputeService<Distance>::send_storage_owner_batch(
                            response->batch_id == batch_id &&
                            response->item_count == item_count;
   const auto finished_at = std::chrono::steady_clock::now();
-  vec<InsertItem> successful_batch;
-  vec<size_t> successful_indices;
-  successful_batch.reserve(item_count);
-  successful_indices.reserve(item_count);
 
   size_t inserted = 0;
   for (u32 i = 0; i < item_count; ++i) {
     const bool ok = response_ok &&
                     statuses[i] == static_cast<u32>(service::storage_owner::InsertStatus::ok);
     inserted += ok ? 1u : 0u;
-    if (ok && config_.use_storage_delta_insert()) {
-      successful_indices.push_back(successful_batch.size());
-      successful_batch.push_back(tasks[i]->item);
-    }
     if (samples[i]) {
       samples[i]->mark_finished(finished_at, statistics::ThreadStatistics{});
     }
     tasks[i]->result.set_value(ok);
   }
 
-  if (config_.use_storage_delta_insert() && !successful_indices.empty()) {
-    append_local_delta_mirror(successful_batch, successful_indices);
-  }
   return inserted;
-}
-
-template <class Distance>
-size_t ComputeService<Distance>::insert_via_storage_owner(
-    const vec<InsertItem>& batch,
-    const vec<std::shared_ptr<service::breakdown::Sample>>& samples) {
-  std::lock_guard<std::mutex> lock(storage_rpc_mutex_);
-
-  size_t inserted = 0;
-  vec<vec<size_t>> owner_indices(std::max<u32>(1, num_servers_));
-  for (size_t i = 0; i < batch.size(); ++i) {
-    const u32 owner_storage = num_servers_ == 0 ? 0 : static_cast<u32>(batch[i].id % num_servers_);
-    owner_indices[owner_storage].push_back(i);
-  }
-
-  for (u32 owner_storage = 0; owner_storage < owner_indices.size(); ++owner_storage) {
-    auto& indices = owner_indices[owner_storage];
-    for (size_t begin = 0; begin < indices.size(); begin += config_.storage_owner_batch_max) {
-      const u32 item_count = static_cast<u32>(std::min<size_t>(indices.size() - begin, config_.storage_owner_batch_max));
-      const u64 batch_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
-      const size_t request_size = service::storage_owner::insert_batch_request_bytes(item_count, config_.dim);
-      const size_t response_size = service::storage_owner::insert_batch_response_bytes(item_count);
-      vec<byte_t> request_buffer(request_size);
-      vec<byte_t> response_buffer(response_size);
-
-      auto* request = reinterpret_cast<service::storage_owner::InsertBatchRequestHeader*>(request_buffer.data());
-      request->magic = service::storage_owner::kInsertMagic;
-      request->dim = config_.dim;
-      request->owner_storage = owner_storage;
-      request->source_client = cm_.client_id;
-      request->item_count = item_count;
-      request->batch_id = batch_id;
-
-      node_t* ids = service::storage_owner::request_ids(request_buffer.data());
-      element_t* vectors = service::storage_owner::request_vectors(request_buffer.data(), item_count);
-      for (u32 i = 0; i < item_count; ++i) {
-        const size_t batch_idx = indices[begin + i];
-        ids[i] = batch[batch_idx].id;
-        std::memcpy(vectors + static_cast<size_t>(i) * config_.dim,
-                    batch[batch_idx].values.data(),
-                    static_cast<size_t>(config_.dim) * sizeof(element_t));
-      }
-
-      LocalMemoryRegion request_region{context_, request_buffer.data(), request_buffer.size()};
-      LocalMemoryRegion response_region{context_, response_buffer.data(), response_buffer.size()};
-
-      auto& qp = *cm_.server_qps[owner_storage];
-      qp.post_receive(response_region, static_cast<u32>(response_size));
-      qp.post_send(request_region,
-                   static_cast<u32>(request_size),
-                   IBV_WR_SEND,
-                   true,
-                   nullptr,
-                   0,
-                   0);
-      context_.poll_send_cq_until_completion();
-      context_.receive();
-
-      const auto* response =
-        reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(response_buffer.data());
-      const u32* statuses = service::storage_owner::response_statuses(response_buffer.data());
-      const bool response_ok = response->magic == service::storage_owner::kInsertMagic &&
-                               response->owner_storage == owner_storage &&
-                               response->batch_id == batch_id &&
-                               response->item_count == item_count;
-      const auto finished_at = std::chrono::steady_clock::now();
-      vec<size_t> successful_indices;
-      successful_indices.reserve(item_count);
-      for (u32 i = 0; i < item_count; ++i) {
-        const size_t batch_idx = indices[begin + i];
-        const bool ok = response_ok &&
-                        statuses[i] == static_cast<u32>(service::storage_owner::InsertStatus::ok);
-        inserted += ok ? 1u : 0u;
-        if (ok && config_.use_storage_delta_insert()) {
-          successful_indices.push_back(batch_idx);
-        }
-        const auto& sample = samples[batch_idx];
-        if (sample) {
-          sample->mark_finished(finished_at, statistics::ThreadStatistics{});
-        }
-      }
-      if (config_.use_storage_delta_insert() && !successful_indices.empty()) {
-        append_local_delta_mirror(batch, successful_indices);
-      }
-    }
-  }
-
-  return inserted;
-}
-
-template <class Distance>
-service::QueryResult ComputeService<Distance>::search_storage_delta(const vec<element_t>& query, u32 k) {
-  if (!delta_query_context_ || delta_query_server_qps_.empty()) {
-    return {};
-  }
-
-  std::lock_guard<std::mutex> lock(delta_query_rpc_mutex_);
-  const vec<u32> selected_shards = select_sealed_delta_shards(query);
-  if (selected_shards.empty()) {
-    return {};
-  }
-
-  const u32 requested_k = std::min<u32>(k, config_.k);
-  const u32 result_capacity = std::max<u32>(requested_k, requested_k * config_.delta_result_kfactor);
-  const size_t request_size = service::storage_owner::delta_search_request_bytes(config_.dim);
-  const size_t response_size = service::storage_owner::delta_search_response_bytes(result_capacity);
-
-  vec<vec<byte_t>> request_buffers(num_servers_, vec<byte_t>(request_size));
-  vec<vec<byte_t>> response_buffers(num_servers_, vec<byte_t>(response_size));
-  vec<u_ptr<LocalMemoryRegion>> request_regions(num_servers_);
-  vec<u_ptr<LocalMemoryRegion>> response_regions(num_servers_);
-
-  for (u32 shard : selected_shards) {
-    auto* request = reinterpret_cast<service::storage_owner::DeltaSearchRequestHeader*>(request_buffers[shard].data());
-    request->magic = service::storage_owner::kDeltaSearchMagic;
-    request->dim = config_.dim;
-    request->top_k = requested_k;
-    request->result_kfactor = config_.delta_result_kfactor;
-    request->flags = service::storage_owner::kDeltaSearchIncludeSealed;
-    std::memcpy(service::storage_owner::delta_search_query(request_buffers[shard].data()),
-                query.data(),
-                static_cast<size_t>(config_.dim) * sizeof(element_t));
-    request_regions[shard] = std::make_unique<LocalMemoryRegion>(
-      *delta_query_context_, request_buffers[shard].data(), request_buffers[shard].size());
-    response_regions[shard] = std::make_unique<LocalMemoryRegion>(
-      *delta_query_context_, response_buffers[shard].data(), response_buffers[shard].size());
-  }
-
-  for (u32 shard : selected_shards) {
-    delta_query_server_qps_[shard]->post_receive(*response_regions[shard], static_cast<u32>(response_size));
-  }
-  for (u32 shard : selected_shards) {
-    delta_query_server_qps_[shard]->post_send(*request_regions[shard],
-                                              static_cast<u32>(request_size),
-                                              IBV_WR_SEND,
-                                              true,
-                                              nullptr,
-                                              0,
-                                              0);
-  }
-  delta_query_context_->poll_send_cq_until_completion(static_cast<i32>(selected_shards.size()));
-  delta_query_context_->receive(static_cast<i32>(selected_shards.size()));
-
-  service::QueryResult merged;
-  merged.reserve(static_cast<size_t>(selected_shards.size()) * result_capacity);
-  for (u32 shard : selected_shards) {
-    const auto* response =
-      reinterpret_cast<const service::storage_owner::DeltaSearchResponseHeader*>(response_buffers[shard].data());
-    if (response->magic != service::storage_owner::kDeltaSearchMagic || response->item_count > result_capacity) {
-      continue;
-    }
-    const node_t* ids = service::storage_owner::delta_search_result_ids(response_buffers[shard].data());
-    const distance_t* distances =
-      service::storage_owner::delta_search_result_distances(response_buffers[shard].data(), response->item_count);
-    for (u32 i = 0; i < response->item_count; ++i) {
-      merged.push_back({ids[i], distances[i]});
-    }
-  }
-  return merged;
-}
-
-template <class Distance>
-void ComputeService<Distance>::append_local_delta_mirror(const vec<InsertItem>& batch,
-                                                         const vec<size_t>& successful_indices) {
-  if (successful_indices.empty() || local_delta_mirror_.max_vectors == 0) {
-    return;
-  }
-
-  std::unique_lock<std::shared_mutex> lock(local_delta_mirror_.mutex);
-  const auto now = std::chrono::steady_clock::now();
-  for (size_t idx : successful_indices) {
-    local_delta_mirror_.entries.push_back(
-      {batch[idx].id, batch[idx].values, num_servers_ == 0 ? 0 : static_cast<u32>(batch[idx].id % num_servers_), now});
-  }
-
-  while (!local_delta_mirror_.entries.empty()) {
-    const bool over_capacity = local_delta_mirror_.entries.size() > local_delta_mirror_.max_vectors;
-    const bool expired =
-      local_delta_mirror_.max_age.count() > 0 && (now - local_delta_mirror_.entries.front().inserted_at) > local_delta_mirror_.max_age;
-    if (!over_capacity && !expired) {
-      break;
-    }
-    local_delta_mirror_.entries.pop_front();
-  }
-  rebuild_sealed_delta_synopsis_locked();
-}
-
-template <class Distance>
-void ComputeService<Distance>::rebuild_sealed_delta_synopsis_locked() {
-  if (num_servers_ == 0) {
-    return;
-  }
-
-  std::unique_lock<std::shared_mutex> synopsis_lock(sealed_delta_synopsis_.mutex);
-  sealed_delta_synopsis_.counts.assign(num_servers_, 0);
-  sealed_delta_synopsis_.centroids.assign(num_servers_, vec<element_t>(config_.dim, 0.0f));
-  sealed_delta_synopsis_.radii.assign(num_servers_, 0.0f);
-
-  if (local_delta_mirror_.entries.empty()) {
-    return;
-  }
-
-  const auto now = std::chrono::steady_clock::now();
-  const auto active_horizon = std::chrono::milliseconds(config_.delta_active_max_age_ms);
-  vec<vec<const vec<element_t>*>> grouped(num_servers_);
-  for (const auto& entry : local_delta_mirror_.entries) {
-    if ((now - entry.inserted_at) <= active_horizon) {
-      continue;
-    }
-    grouped[entry.owner_shard].push_back(&entry.values);
-  }
-
-  for (u32 shard = 0; shard < num_servers_; ++shard) {
-    if (grouped[shard].empty()) {
-      continue;
-    }
-    auto& centroid = sealed_delta_synopsis_.centroids[shard];
-    for (const auto* values : grouped[shard]) {
-      for (u32 d = 0; d < config_.dim; ++d) {
-        centroid[d] += (*values)[d];
-      }
-    }
-    for (u32 d = 0; d < config_.dim; ++d) {
-      centroid[d] /= static_cast<element_t>(grouped[shard].size());
-    }
-    float radius = 0.0f;
-    for (const auto* values : grouped[shard]) {
-      const float dist =
-        Distance::dist(span<const element_t>{values->data(), values->size()},
-                       span<const element_t>{centroid.data(), centroid.size()},
-                       config_.dim);
-      radius = std::max(radius, dist);
-    }
-    sealed_delta_synopsis_.counts[shard] = grouped[shard].size();
-    sealed_delta_synopsis_.radii[shard] = radius;
-  }
-}
-
-template <class Distance>
-vec<u32> ComputeService<Distance>::select_sealed_delta_shards(const vec<element_t>& query) const {
-  if (num_servers_ == 0) {
-    return {};
-  }
-
-  std::shared_lock<std::shared_mutex> lock(sealed_delta_synopsis_.mutex);
-  struct RankedShard {
-    u32 shard;
-    float score;
-  };
-  vec<RankedShard> ranked;
-  ranked.reserve(num_servers_);
-  for (u32 shard = 0; shard < num_servers_; ++shard) {
-    if (sealed_delta_synopsis_.counts.empty() || sealed_delta_synopsis_.counts[shard] == 0) {
-      continue;
-    }
-    const auto& centroid = sealed_delta_synopsis_.centroids[shard];
-    const float dist =
-      Distance::dist(span<const element_t>{query.data(), query.size()},
-                     span<const element_t>{centroid.data(), centroid.size()},
-                     config_.dim);
-    const float score = std::max(0.0f, dist - sealed_delta_synopsis_.radii[shard]);
-    ranked.push_back({shard, score});
-  }
-  std::sort(ranked.begin(), ranked.end(), [](const auto& lhs, const auto& rhs) { return lhs.score < rhs.score; });
-  const size_t keep = std::min<size_t>(std::max<u32>(1, config_.delta_synopsis_top_shards), ranked.size());
-  vec<u32> shards;
-  shards.reserve(keep);
-  for (size_t i = 0; i < keep; ++i) {
-    shards.push_back(ranked[i].shard);
-  }
-  return shards;
-}
-
-template <class Distance>
-service::QueryResult ComputeService<Distance>::search_local_delta_mirror(const vec<element_t>& query, u32 k) const {
-  if (local_delta_mirror_.max_vectors == 0) {
-    return {};
-  }
-
-  std::shared_lock<std::shared_mutex> lock(local_delta_mirror_.mutex);
-  if (local_delta_mirror_.entries.empty()) {
-    return {};
-  }
-
-  struct Candidate {
-    node_t id;
-    distance_t distance;
-  };
-
-  vec<Candidate> candidates;
-  candidates.reserve(local_delta_mirror_.entries.size());
-  const u32 limit = std::max<u32>(k, k * config_.delta_result_kfactor);
-  const auto now = std::chrono::steady_clock::now();
-  for (const auto& entry : local_delta_mirror_.entries) {
-    if (local_delta_mirror_.max_age.count() > 0 && (now - entry.inserted_at) > local_delta_mirror_.max_age) {
-      continue;
-    }
-    const distance_t dist = Distance::dist(span<const element_t>{query.data(), query.size()},
-                                           span<const element_t>{entry.values.data(), entry.values.size()},
-                                           config_.dim);
-    candidates.push_back({entry.id, dist});
-  }
-
-  std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) { return lhs.distance < rhs.distance; });
-  if (candidates.size() > limit) {
-    candidates.resize(limit);
-  }
-
-  service::QueryResult results;
-  results.reserve(candidates.size());
-  for (const auto& candidate : candidates) {
-    results.push_back({candidate.id, candidate.distance});
-  }
-  return results;
-}
-
-template <class Distance>
-vec<node_t> ComputeService<Distance>::merge_main_and_delta_results(const service::QueryResult& main_results,
-                                                                   const service::QueryResult& delta_results,
-                                                                   u32 k) const {
-  std::unordered_map<node_t, distance_t> best;
-  best.reserve(main_results.size() + delta_results.size());
-  for (const auto& item : main_results) {
-    auto [it, inserted] = best.emplace(item.id, item.distance);
-    if (!inserted && item.distance < it->second) {
-      it->second = item.distance;
-    }
-  }
-  for (const auto& item : delta_results) {
-    auto [it, inserted] = best.emplace(item.id, item.distance);
-    if (!inserted && item.distance < it->second) {
-      it->second = item.distance;
-    }
-  }
-
-  vec<std::pair<node_t, distance_t>> ranked;
-  ranked.reserve(best.size());
-  for (const auto& [id, dist] : best) {
-    ranked.emplace_back(id, dist);
-  }
-  std::sort(ranked.begin(), ranked.end(), [](const auto& lhs, const auto& rhs) { return lhs.second < rhs.second; });
-
-  vec<node_t> ids;
-  ids.reserve(std::min<size_t>(k, ranked.size()));
-  for (size_t i = 0; i < ranked.size() && ids.size() < k; ++i) {
-    ids.push_back(ranked[i].first);
-  }
-  return ids;
 }
 
 template <class Distance>
@@ -827,8 +443,7 @@ typename ComputeService<Distance>::LocalMainSearchOutput ComputeService<Distance
     sample->enqueued_at = std::chrono::steady_clock::now();
   }
 
-  const u32 main_k = config_.use_storage_delta_insert() ? std::max<u32>(k, k * 2) : k;
-  auto* request = new service::QueryRequest{query, main_k, {}, std::chrono::steady_clock::now(), sample};
+  auto* request = new service::QueryRequest{query, k, {}, std::chrono::steady_clock::now(), sample};
   auto future = request->result.get_future();
   query_queue_.enqueue(request);
 
@@ -842,29 +457,11 @@ template <class Distance>
 vec<node_t> ComputeService<Distance>::search_local(const vec<element_t>& query, u32 k) {
   LocalMainSearchOutput main = search_local_result(query, k);
   service::QueryResult& main_results = main.results;
-  if (!config_.use_storage_delta_insert()) {
-    vec<node_t> ids;
-    ids.reserve(std::min<size_t>(k, main_results.size()));
-    for (size_t i = 0; i < main_results.size() && ids.size() < k; ++i) {
-      ids.push_back(main_results[i].id);
-    }
-    if (main.sample && main.sample->finished_flag) {
-      const auto finished_at = std::chrono::steady_clock::now();
-      main.sample->finished_at = finished_at;
-      main.sample->service_ns = static_cast<u64>(
-        std::chrono::duration_cast<service::breakdown::Nanoseconds>(finished_at - main.sample->started_at).count());
-      main.sample->end_to_end_ns = static_cast<u64>(
-        std::chrono::duration_cast<service::breakdown::Nanoseconds>(finished_at - main.sample->enqueued_at).count());
-      std::lock_guard<std::mutex> lock(breakdown_mutex_);
-      completed_query_samples_.push_back(*main.sample);
-    }
-    return ids;
+  vec<node_t> ids;
+  ids.reserve(std::min<size_t>(k, main_results.size()));
+  for (size_t i = 0; i < main_results.size() && ids.size() < k; ++i) {
+    ids.push_back(main_results[i].id);
   }
-
-  service::QueryResult delta_results = search_local_delta_mirror(query, k);
-  service::QueryResult sealed_results = search_storage_delta(query, k);
-  delta_results.insert(delta_results.end(), sealed_results.begin(), sealed_results.end());
-  vec<node_t> merged = merge_main_and_delta_results(main_results, delta_results, k);
   if (main.sample && main.sample->finished_flag) {
     const auto finished_at = std::chrono::steady_clock::now();
     main.sample->finished_at = finished_at;
@@ -875,7 +472,7 @@ vec<node_t> ComputeService<Distance>::search_local(const vec<element_t>& query, 
     std::lock_guard<std::mutex> lock(breakdown_mutex_);
     completed_query_samples_.push_back(*main.sample);
   }
-  return merged;
+  return ids;
 }
 
 template <class Distance>
@@ -1147,7 +744,7 @@ typename ComputeService<Distance>::ServiceProfile ComputeService<Distance>::reso
   ServiceProfile profile{};
   const u32 num_threads = config_.num_threads;
 
-  if (config_.use_storage_owner_insert() || config_.use_storage_delta_insert()) {
+  if (config_.use_storage_owner_insert()) {
     profile.insert_workers = 0;
     profile.query_workers = num_threads;
     profile.insert_coroutines = 0;
@@ -1873,7 +1470,7 @@ void ComputeService<Distance>::shutdown_remote_if_requested() {
     return;
   }
 
-  if (config_.use_storage_owner_insert() || config_.use_storage_delta_insert()) {
+  if (config_.use_storage_owner_insert()) {
     return;
   }
 

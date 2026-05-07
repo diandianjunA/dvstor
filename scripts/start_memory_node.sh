@@ -21,7 +21,7 @@
 #       --index-file <path>   启动时直接加载本地 shard 文件
 #       --storage-id <id>     storage-side insert 模式下的存储节点编号
 #       --storage-peers <...> storage-side insert 模式下的 storage-storage 通信端点列表
-#       --insert-execution <mode>  compute / storage_owner / storage_delta
+#       --insert-execution <mode>  compute / storage_owner
 #   -f, --foreground          前台运行（默认后台运行）
 #   -h, --help                显示此帮助信息
 #

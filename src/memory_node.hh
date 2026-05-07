@@ -11,7 +11,6 @@
 #include <limits>
 #include <mutex>
 #include <optional>
-#include <shared_mutex>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -79,7 +78,6 @@ public:
         num_storage_nodes_(config.storage_peers.empty() ? config.num_server_nodes()
                                                         : static_cast<u32>(config.storage_peers.size())),
         use_storage_owner_insert_(config.use_storage_owner_insert()),
-        use_storage_delta_insert_(config.use_storage_delta_insert()),
         ip_distance_(config.ip_distance),
         index_region_(context_),
         mn_memory_bytes_(static_cast<u64>(config.mn_memory_gb) * 1073741824ul) {
@@ -142,19 +140,14 @@ public:
     print_status("waiting for commands from compute node...");
     bool running = handle_command();
 
-    if (running && (use_storage_owner_insert_ || use_storage_delta_insert_)) {
+    if (running && use_storage_owner_insert_) {
       if (config.use_rabitq_search()) {
         load_rabitq_artifacts(config);
       }
       setup_storage_peers(config);
       setup_insert_runtime(config);
-      setup_delta_query_channel(config);
-      delta_query_worker_config_ = std::make_unique<Configuration>(config);
+      storage_worker_config_ = std::make_unique<Configuration>(config);
       start_storage_owner_insert_workers(config);
-      start_delta_query_workers(config);
-      if (use_storage_delta_insert_) {
-        start_delta_merge_worker(config);
-      }
       service_storage_runtime(config);
 
     } else {
@@ -164,18 +157,6 @@ public:
       }
     }
 
-    delta_shutdown_.store(true, std::memory_order_release);
-    delta_merge_cv_.notify_all();
-    if (delta_merge_thread_.joinable()) {
-      delta_merge_thread_.join();
-    }
-    delta_query_shutdown_.store(true, std::memory_order_release);
-    delta_query_tasks_cv_.notify_all();
-    for (auto& worker : delta_query_workers_) {
-      if (worker.joinable()) {
-        worker.join();
-      }
-    }
     storage_insert_shutdown_.store(true, std::memory_order_release);
     storage_insert_tasks_cv_.notify_all();
     for (auto& worker : storage_insert_workers_) {
@@ -219,36 +200,11 @@ private:
     size_t recv_region_bytes{};
   };
 
-  struct DeltaQueryRuntimeState {
-    HugePage<byte_t> buffer;
-    std::unique_ptr<LocalMemoryRegion> region;
-    size_t request_bytes{};
-    size_t response_offset{};
-  };
-
-  struct DeltaSearchTask {
-    u32 client_id{};
-    vec<byte_t> payload;
-  };
-
   struct StorageOwnerInsertTask {
     u32 client_id{};
     u32 item_count{};
     u64 batch_id{};
     vec<byte_t> payload;
-  };
-
-  struct DeltaSegment {
-    u64 segment_id{};
-    bool sealed{false};
-    bool retired{false};
-    size_t merge_cursor{0};
-    std::chrono::steady_clock::time_point created_at{};
-    std::chrono::steady_clock::time_point sealed_at{};
-    vec<node_t> ids;
-    vec<element_t> vectors;
-    vec<element_t> centroid;
-    float radius{0.0f};
   };
 
   void allocate_memory() {
@@ -384,7 +340,7 @@ private:
   }
 
   void setup_storage_peers(Configuration& config) {
-    if ((!use_storage_owner_insert_ && !use_storage_delta_insert_) || num_storage_nodes_ <= 1) {
+    if (!use_storage_owner_insert_ || num_storage_nodes_ <= 1) {
       return;
     }
 
@@ -485,51 +441,14 @@ private:
   void setup_insert_runtime(const Configuration& config) {
     const size_t insert_request_bytes =
       align_up(service::storage_owner::insert_batch_request_bytes(config.storage_owner_batch_max, VamanaNode::DIM));
-    const size_t delta_search_request_bytes =
-      align_up(service::storage_owner::delta_search_request_bytes(VamanaNode::DIM));
-    insert_runtime_.request_bytes = std::max(insert_request_bytes, delta_search_request_bytes);
+    insert_runtime_.request_bytes = insert_request_bytes;
     const size_t insert_response_bytes =
       align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max));
-    const size_t delta_search_response_bytes = align_up(
-      service::storage_owner::delta_search_response_bytes(config.k * config.delta_result_kfactor));
-    const size_t response_bytes = std::max(insert_response_bytes, delta_search_response_bytes);
     insert_runtime_.response_offset = insert_runtime_.request_bytes * num_clients_;
-    insert_runtime_.buffer.allocate(insert_runtime_.response_offset + response_bytes * num_clients_);
+    insert_runtime_.buffer.allocate(insert_runtime_.response_offset + insert_response_bytes * num_clients_);
     insert_runtime_.buffer.touch_memory();
     insert_runtime_.region = std::make_unique<LocalMemoryRegion>(
       context_, insert_runtime_.buffer.get_full_buffer(), insert_runtime_.buffer.buffer_size);
-  }
-
-  void setup_delta_query_channel(Configuration& config) {
-    if (!use_storage_delta_insert_) {
-      return;
-    }
-
-    delta_query_config_ = std::make_unique<configuration::Configuration>(config);
-    delta_query_config_->port = config.port + config.delta_query_port_offset;
-    delta_query_context_ = std::make_unique<Context>(*delta_query_config_);
-    delta_query_cm_ = std::make_unique<ServerConnectionManager>(*delta_query_context_, *delta_query_config_);
-    delta_query_cm_->connect_to_clients();
-
-    delta_query_runtime_.request_bytes =
-      align_up(service::storage_owner::delta_search_request_bytes(config.dim));
-    const size_t delta_search_response_bytes = align_up(
-      service::storage_owner::delta_search_response_bytes(config.k * config.delta_result_kfactor));
-    delta_query_runtime_.response_offset = delta_query_runtime_.request_bytes * num_clients_;
-    delta_query_runtime_.buffer.allocate(delta_query_runtime_.response_offset + delta_search_response_bytes * num_clients_);
-    delta_query_runtime_.buffer.touch_memory();
-    delta_query_runtime_.region = std::make_unique<LocalMemoryRegion>(
-      *delta_query_context_, delta_query_runtime_.buffer.get_full_buffer(), delta_query_runtime_.buffer.buffer_size);
-  }
-
-  void start_delta_query_workers(const Configuration&) {
-    if (!delta_query_context_ || !use_storage_delta_insert_) {
-      return;
-    }
-    const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
-    for (u32 i = 0; i < worker_count; ++i) {
-      delta_query_workers_.emplace_back([this]() { delta_query_worker_loop(); });
-    }
   }
 
   void start_storage_owner_insert_workers(const Configuration&) {
@@ -542,48 +461,8 @@ private:
     }
   }
 
-  void delta_query_worker_loop() {
-    for (;;) {
-      DeltaSearchTask task;
-      {
-        std::unique_lock<std::mutex> lock(delta_query_tasks_mutex_);
-        delta_query_tasks_cv_.wait(lock, [&]() {
-          return delta_query_shutdown_.load(std::memory_order_acquire) || !delta_query_tasks_.empty();
-        });
-        if (delta_query_shutdown_.load(std::memory_order_acquire) && delta_query_tasks_.empty()) {
-          return;
-        }
-        task = std::move(delta_query_tasks_.front());
-        delta_query_tasks_.pop_front();
-      }
-
-      const size_t response_bytes =
-        handle_storage_delta_search_request(task.client_id, task.payload.data(), task.payload.size(), *delta_query_worker_config_);
-      lib_assert(response_bytes > 0, "invalid delta-search runtime request");
-
-      {
-        std::lock_guard<std::mutex> send_lock(delta_query_send_mutex_);
-        delta_query_cm_->client_qps[task.client_id]->post_send(
-          *delta_query_runtime_.region,
-          static_cast<u32>(response_bytes),
-          IBV_WR_SEND,
-          true,
-          nullptr,
-          0,
-          delta_query_runtime_.response_offset +
-            static_cast<size_t>(task.client_id) * delta_query_response_slot_bytes(*delta_query_worker_config_));
-        delta_query_context_->poll_send_cq_until_completion();
-        delta_query_cm_->client_qps[task.client_id]->post_receive(
-          *delta_query_runtime_.region,
-          static_cast<u32>(delta_query_runtime_.request_bytes),
-          task.client_id,
-          static_cast<u64>(task.client_id) * delta_query_runtime_.request_bytes);
-      }
-    }
-  }
-
   void storage_owner_insert_worker_loop() {
-    const Configuration& config = *delta_query_worker_config_;
+    const Configuration& config = *storage_worker_config_;
     for (;;) {
       vec<StorageOwnerInsertTask> tasks;
       u32 total_items = 0;
@@ -752,7 +631,7 @@ private:
       return;
     }
 
-    const Configuration& config = *delta_query_worker_config_;
+    const Configuration& config = *storage_worker_config_;
     vec<node_t> batch_ids;
     vec<element_t> batch_vectors;
     vec<u32> item_counts;
@@ -800,10 +679,8 @@ private:
   }
 
   void service_storage_runtime(const Configuration& config) {
-    print_status((use_storage_delta_insert_ ? "storage-delta" : "storage-owner") +
-                 str{" insert runtime enabled on shard "} + std::to_string(storage_id_));
+    print_status("storage-owner insert runtime enabled on shard " + std::to_string(storage_id_));
     vec<ibv_wc> recv_wcs(std::max<i32>(1, config.max_recv_queue_wr));
-    vec<ibv_wc> delta_recv_wcs(std::max<i32>(1, config.max_recv_queue_wr));
 
     for (u32 client_id = 0; client_id < num_clients_; ++client_id) {
       cm_.client_qps[client_id]->post_receive(
@@ -811,128 +688,76 @@ private:
         static_cast<u32>(insert_runtime_.request_bytes),
         client_id,
         static_cast<u64>(client_id) * insert_runtime_.request_bytes);
-      if (delta_query_cm_) {
-        delta_query_cm_->client_qps[client_id]->post_receive(
-          *delta_query_runtime_.region,
-          static_cast<u32>(delta_query_runtime_.request_bytes),
-          client_id,
-          static_cast<u64>(client_id) * delta_query_runtime_.request_bytes);
-      }
     }
 
     for (;;) {
       bool progressed = pump_peer_rpcs(config, false);
       const i32 num_received = context_.poll_recv_cq(recv_wcs.data(), static_cast<i32>(recv_wcs.size()));
-      const i32 num_delta_received = delta_query_context_
-                                       ? delta_query_context_->poll_recv_cq(delta_recv_wcs.data(),
-                                                                            static_cast<i32>(delta_recv_wcs.size()))
-                                       : 0;
-      progressed = progressed || num_received > 0 || num_delta_received > 0;
+      progressed = progressed || num_received > 0;
       if (num_received == 0) {
-        if (num_delta_received == 0 && !progressed) {
+        if (!progressed) {
           std::this_thread::yield();
         }
-      } else {
-        for (i32 i = 0; i < num_received; ++i) {
-          const u32 client_id = static_cast<u32>(recv_wcs[i].wr_id);
-          const size_t offset = static_cast<size_t>(client_id) * insert_runtime_.request_bytes;
-          const byte_t* payload = insert_runtime_.buffer.get_full_buffer() + offset;
-          const size_t bytes = recv_wcs[i].byte_len;
-
-          bool handled_async = false;
-          if (use_storage_owner_insert_ && bytes >= sizeof(service::storage_owner::InsertBatchRequestHeader)) {
-            const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(payload);
-            if (request->magic == service::storage_owner::kInsertMagic &&
-                request->dim == config.dim &&
-                request->owner_storage == storage_id_ &&
-                request->item_count > 0 &&
-                request->item_count <= config.storage_owner_batch_max &&
-                bytes >= service::storage_owner::insert_batch_request_bytes(request->item_count, config.dim)) {
-              StorageOwnerInsertTask task;
-              task.client_id = client_id;
-              task.item_count = request->item_count;
-              task.batch_id = request->batch_id;
-              task.payload.assign(payload, payload + bytes);
-              {
-                std::lock_guard<std::mutex> lock(storage_insert_tasks_mutex_);
-                storage_insert_tasks_.push_back(std::move(task));
-              }
-              storage_insert_tasks_cv_.notify_one();
-              handled_async = true;
-            }
-          }
-
-          cm_.client_qps[client_id]->post_receive(
-            *insert_runtime_.region,
-            static_cast<u32>(insert_runtime_.request_bytes),
-            client_id,
-            static_cast<u64>(client_id) * insert_runtime_.request_bytes);
-
-          if (handled_async) {
-            continue;
-          }
-
-          const size_t response_bytes = handle_storage_runtime_request(client_id, payload, bytes, config);
-          lib_assert(response_bytes > 0, "invalid storage runtime request");
-
-          cm_.client_qps[client_id]->post_send(
-            *insert_runtime_.region,
-            static_cast<u32>(response_bytes),
-            IBV_WR_SEND,
-            true,
-            nullptr,
-            0,
-            insert_runtime_.response_offset +
-              static_cast<size_t>(client_id) *
-                std::max(align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max)),
-                         align_up(service::storage_owner::delta_search_response_bytes(config.k * config.delta_result_kfactor))));
-          context_.poll_send_cq_until_completion();
-        }
+        continue;
       }
 
-      for (i32 i = 0; i < num_delta_received; ++i) {
-        const u32 client_id = static_cast<u32>(delta_recv_wcs[i].wr_id);
-        const size_t offset = static_cast<size_t>(client_id) * delta_query_runtime_.request_bytes;
-        const byte_t* payload = delta_query_runtime_.buffer.get_full_buffer() + offset;
-        const size_t bytes = delta_recv_wcs[i].byte_len;
-        DeltaSearchTask task;
-        task.client_id = client_id;
-        task.payload.assign(payload, payload + bytes);
-        {
-          std::lock_guard<std::mutex> lock(delta_query_tasks_mutex_);
-          delta_query_tasks_.push_back(std::move(task));
+      for (i32 i = 0; i < num_received; ++i) {
+        const u32 client_id = static_cast<u32>(recv_wcs[i].wr_id);
+        const size_t offset = static_cast<size_t>(client_id) * insert_runtime_.request_bytes;
+        const byte_t* payload = insert_runtime_.buffer.get_full_buffer() + offset;
+        const size_t bytes = recv_wcs[i].byte_len;
+
+        bool handled_async = false;
+        if (bytes >= sizeof(service::storage_owner::InsertBatchRequestHeader)) {
+          const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(payload);
+          if (request->magic == service::storage_owner::kInsertMagic &&
+              request->dim == config.dim &&
+              request->owner_storage == storage_id_ &&
+              request->item_count > 0 &&
+              request->item_count <= config.storage_owner_batch_max &&
+              bytes >= service::storage_owner::insert_batch_request_bytes(request->item_count, config.dim)) {
+            StorageOwnerInsertTask task;
+            task.client_id = client_id;
+            task.item_count = request->item_count;
+            task.batch_id = request->batch_id;
+            task.payload.assign(payload, payload + bytes);
+            {
+              std::lock_guard<std::mutex> lock(storage_insert_tasks_mutex_);
+              storage_insert_tasks_.push_back(std::move(task));
+            }
+            storage_insert_tasks_cv_.notify_one();
+            handled_async = true;
+          }
         }
-        delta_query_tasks_cv_.notify_one();
+
+        cm_.client_qps[client_id]->post_receive(
+          *insert_runtime_.region,
+          static_cast<u32>(insert_runtime_.request_bytes),
+          client_id,
+          static_cast<u64>(client_id) * insert_runtime_.request_bytes);
+
+        if (handled_async) {
+          continue;
+        }
+
+        const size_t response_bytes = handle_storage_insert_request(client_id, payload, bytes, config);
+        lib_assert(response_bytes > 0, "invalid storage-owner insert request");
+
+        cm_.client_qps[client_id]->post_send(
+          *insert_runtime_.region,
+          static_cast<u32>(response_bytes),
+          IBV_WR_SEND,
+          true,
+          nullptr,
+          0,
+          insert_runtime_.response_offset + static_cast<size_t>(client_id) * response_slot_bytes(config));
+        context_.poll_send_cq_until_completion();
       }
     }
   }
 
   size_t response_slot_bytes(const Configuration& config) const {
-    return std::max(align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max)),
-                    align_up(service::storage_owner::delta_search_response_bytes(config.k * config.delta_result_kfactor)));
-  }
-
-  size_t delta_query_response_slot_bytes(const Configuration& config) const {
-    return align_up(service::storage_owner::delta_search_response_bytes(config.k * config.delta_result_kfactor));
-  }
-
-  u32 max_delta_response_items(const Configuration& config) const {
-    const size_t slot_bytes = response_slot_bytes(config);
-    if (slot_bytes <= sizeof(service::storage_owner::DeltaSearchResponseHeader)) {
-      return 0;
-    }
-    return static_cast<u32>(
-      (slot_bytes - sizeof(service::storage_owner::DeltaSearchResponseHeader)) / (sizeof(node_t) + sizeof(distance_t)));
-  }
-
-  size_t handle_storage_runtime_request(u32 client_id, const byte_t* payload, size_t bytes, const Configuration& config) {
-    if (bytes >= sizeof(u32)) {
-      const u32 magic = *reinterpret_cast<const u32*>(payload);
-      if (magic == service::storage_owner::kDeltaSearchMagic) {
-        return handle_storage_delta_search_request(client_id, payload, bytes, config);
-      }
-    }
-    return handle_storage_insert_request(client_id, payload, bytes, config);
+    return align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max));
   }
 
   size_t handle_storage_insert_request(u32 client_id, const byte_t* payload, size_t bytes, const Configuration& config) {
@@ -962,177 +787,12 @@ private:
 
     const node_t* ids = service::storage_owner::request_ids(payload);
     const element_t* vectors = service::storage_owner::request_vectors(payload, request->item_count);
-    if (use_storage_delta_insert_) {
-      append_delta_batch(ids, vectors, request->item_count, config);
-      for (u32 i = 0; i < request->item_count; ++i) {
-        statuses[i] = static_cast<u32>(service::storage_owner::InsertStatus::ok);
-      }
-    } else {
-      const bool ok = execute_storage_owner_batch_items(ids, vectors, request->item_count, config);
-      for (u32 i = 0; i < request->item_count; ++i) {
-        statuses[i] = static_cast<u32>(ok ? service::storage_owner::InsertStatus::ok
-                                          : service::storage_owner::InsertStatus::failed);
-      }
+    const bool ok = execute_storage_owner_batch_items(ids, vectors, request->item_count, config);
+    for (u32 i = 0; i < request->item_count; ++i) {
+      statuses[i] = static_cast<u32>(ok ? service::storage_owner::InsertStatus::ok
+                                        : service::storage_owner::InsertStatus::failed);
     }
     return service::storage_owner::insert_batch_response_bytes(request->item_count);
-  }
-
-  size_t handle_storage_delta_search_request(u32 client_id, const byte_t* payload, size_t bytes, const Configuration& config) {
-    if (bytes < service::storage_owner::delta_search_request_bytes(config.dim)) {
-      return 0;
-    }
-    const auto* request = reinterpret_cast<const service::storage_owner::DeltaSearchRequestHeader*>(payload);
-    if (request->magic != service::storage_owner::kDeltaSearchMagic || request->dim != config.dim || request->top_k == 0 ||
-        request->result_kfactor == 0) {
-      return 0;
-    }
-
-    byte_t* response_base = insert_runtime_.buffer.get_full_buffer() + insert_runtime_.response_offset;
-    size_t response_stride = response_slot_bytes(config);
-    if (delta_query_context_) {
-      response_base = delta_query_runtime_.buffer.get_full_buffer() + delta_query_runtime_.response_offset;
-      response_stride = delta_query_response_slot_bytes(config);
-    }
-    auto* response_ptr = reinterpret_cast<service::storage_owner::DeltaSearchResponseHeader*>(
-      response_base + static_cast<size_t>(client_id) * response_stride);
-    response_ptr->magic = service::storage_owner::kDeltaSearchMagic;
-
-    const auto query = span<const element_t>{service::storage_owner::delta_search_query(payload), config.dim};
-    const u32 requested_items = request->top_k * request->result_kfactor;
-    const u32 response_capacity = max_delta_response_items(config);
-    const u32 capped_items = std::min(requested_items, response_capacity);
-    const bool include_active = (request->flags & service::storage_owner::kDeltaSearchIncludeActive) != 0;
-    const bool include_sealed = (request->flags & service::storage_owner::kDeltaSearchIncludeSealed) != 0;
-    auto local_results = search_delta_segments(query, capped_items, include_active, include_sealed, config);
-    response_ptr->item_count = static_cast<u32>(local_results.size());
-    node_t* ids = service::storage_owner::delta_search_result_ids(response_ptr);
-    distance_t* distances =
-      service::storage_owner::delta_search_result_distances(response_ptr, response_ptr->item_count);
-    for (u32 i = 0; i < response_ptr->item_count; ++i) {
-      ids[i] = local_results[i].id;
-      distances[i] = local_results[i].distance;
-    }
-    return service::storage_owner::delta_search_response_bytes(response_ptr->item_count);
-  }
-
-  void ensure_active_delta_locked() {
-    if (active_delta_) {
-      return;
-    }
-    active_delta_ = std::make_unique<DeltaSegment>();
-    active_delta_->segment_id = next_delta_segment_id_++;
-    active_delta_->created_at = std::chrono::steady_clock::now();
-    active_delta_->centroid.assign(VamanaNode::DIM, 0.0f);
-  }
-
-  void rebuild_delta_summary(DeltaSegment& segment) const {
-    if (segment.ids.empty()) {
-      std::fill(segment.centroid.begin(), segment.centroid.end(), 0.0f);
-      segment.radius = 0.0f;
-      return;
-    }
-    if (segment.centroid.size() != VamanaNode::DIM) {
-      segment.centroid.assign(VamanaNode::DIM, 0.0f);
-    } else {
-      std::fill(segment.centroid.begin(), segment.centroid.end(), 0.0f);
-    }
-    const size_t count = segment.ids.size();
-    for (size_t idx = 0; idx < count; ++idx) {
-      const element_t* vec_ptr = segment.vectors.data() + idx * VamanaNode::DIM;
-      for (u32 d = 0; d < VamanaNode::DIM; ++d) {
-        segment.centroid[d] += vec_ptr[d];
-      }
-    }
-    for (u32 d = 0; d < VamanaNode::DIM; ++d) {
-      segment.centroid[d] /= static_cast<float>(count);
-    }
-    float max_radius = 0.0f;
-    const auto centroid_span = span<const element_t>{segment.centroid.data(), segment.centroid.size()};
-    for (size_t idx = 0; idx < count; ++idx) {
-      const element_t* vec_ptr = segment.vectors.data() + idx * VamanaNode::DIM;
-      const float dist = distance_fn()(span<const element_t>{vec_ptr, VamanaNode::DIM}, centroid_span, VamanaNode::DIM);
-      max_radius = std::max(max_radius, dist);
-    }
-    segment.radius = max_radius;
-  }
-
-  void seal_active_delta_locked() {
-    if (!active_delta_ || active_delta_->ids.empty()) {
-      return;
-    }
-    active_delta_->sealed = true;
-    active_delta_->sealed_at = std::chrono::steady_clock::now();
-    sealed_deltas_.push_back(std::move(active_delta_));
-    queued_delta_vectors_ += sealed_deltas_.back()->ids.size();
-    if (queued_delta_vectors_ >= delta_merge_threshold_vectors_) {
-      delta_merge_cv_.notify_one();
-    }
-    active_delta_.reset();
-  }
-
-  void append_delta_batch(const node_t* ids, const element_t* vectors, u32 item_count, const Configuration& config) {
-    std::unique_lock<std::shared_mutex> lock(delta_mutex_);
-    ensure_active_delta_locked();
-    const auto now = std::chrono::steady_clock::now();
-    if (active_delta_ && config.delta_active_max_age_ms > 0 &&
-        (now - active_delta_->created_at) > std::chrono::milliseconds(config.delta_active_max_age_ms) &&
-        !active_delta_->ids.empty()) {
-      rebuild_delta_summary(*active_delta_);
-      seal_active_delta_locked();
-      ensure_active_delta_locked();
-    }
-    for (u32 i = 0; i < item_count; ++i) {
-      active_delta_->ids.push_back(ids[i]);
-      const element_t* src = vectors + static_cast<size_t>(i) * config.dim;
-      active_delta_->vectors.insert(active_delta_->vectors.end(), src, src + config.dim);
-      if (active_delta_->ids.size() >= config.delta_active_max_vectors) {
-        rebuild_delta_summary(*active_delta_);
-        seal_active_delta_locked();
-        ensure_active_delta_locked();
-      }
-    }
-    rebuild_delta_summary(*active_delta_);
-  }
-
-  service::QueryResult search_delta_segments(const span<const element_t> query,
-                                             u32 top_k,
-                                             bool include_active,
-                                             bool include_sealed,
-                                             const Configuration&) {
-    std::shared_lock<std::shared_mutex> lock(delta_mutex_);
-    struct Candidate {
-      node_t id;
-      distance_t distance;
-    };
-    vec<Candidate> candidates;
-    const auto scan_segment = [&](const DeltaSegment& segment) {
-      if (segment.retired) {
-        return;
-      }
-      for (size_t idx = 0; idx < segment.ids.size(); ++idx) {
-        const element_t* vec_ptr = segment.vectors.data() + idx * VamanaNode::DIM;
-        const distance_t dist = distance_fn()(query, span<const element_t>{vec_ptr, VamanaNode::DIM}, VamanaNode::DIM);
-        candidates.push_back({segment.ids[idx], dist});
-      }
-    };
-    if (include_active && active_delta_) {
-      scan_segment(*active_delta_);
-    }
-    for (const auto& segment : sealed_deltas_) {
-      if (include_sealed && segment) {
-        scan_segment(*segment);
-      }
-    }
-    std::sort(candidates.begin(), candidates.end(), [](const auto& lhs, const auto& rhs) { return lhs.distance < rhs.distance; });
-    if (candidates.size() > top_k) {
-      candidates.resize(top_k);
-    }
-    service::QueryResult results;
-    results.reserve(candidates.size());
-    for (const auto& candidate : candidates) {
-      results.push_back({candidate.id, candidate.distance});
-    }
-    return results;
   }
 
   bool execute_storage_owner_batch_items(const node_t* ids,
@@ -1190,79 +850,6 @@ private:
       }
     }
     return true;
-  }
-
-  bool merge_delta_batch_round(DeltaSegment& segment,
-                               size_t begin,
-                               size_t batch_size,
-                               const Configuration& config) {
-    if (begin >= segment.ids.size() || batch_size == 0) {
-      return true;
-    }
-    return execute_storage_owner_batch_items(segment.ids.data() + begin,
-                                             segment.vectors.data() + begin * VamanaNode::DIM,
-                                             std::min(segment.ids.size() - begin, batch_size),
-                                             config);
-  }
-
-  void start_delta_merge_worker(const Configuration& config) {
-    delta_merge_threshold_vectors_ = config.delta_merge_threshold_vectors;
-    delta_merge_thread_ = std::thread([this, config]() { delta_merge_loop(config); });
-  }
-
-  void delta_merge_loop(const Configuration& config) {
-    for (;;) {
-      std::unique_ptr<DeltaSegment> segment;
-      size_t begin = 0;
-      size_t merged_batch = 0;
-      {
-        std::unique_lock<std::shared_mutex> lock(delta_mutex_);
-        delta_merge_cv_.wait(lock, [&]() {
-          const bool has_partial_segment = std::any_of(
-            sealed_deltas_.begin(), sealed_deltas_.end(), [](const auto& candidate) {
-              return candidate && !candidate->retired && candidate->merge_cursor > 0 &&
-                     candidate->merge_cursor < candidate->ids.size();
-            });
-          return delta_shutdown_.load(std::memory_order_acquire) ||
-                 (!sealed_deltas_.empty() &&
-                  (queued_delta_vectors_ >= delta_merge_threshold_vectors_ || has_partial_segment));
-        });
-        if (delta_shutdown_.load(std::memory_order_acquire)) {
-          return;
-        }
-        auto it = std::find_if(sealed_deltas_.begin(), sealed_deltas_.end(), [](const auto& candidate) {
-          return candidate && !candidate->retired && candidate->merge_cursor < candidate->ids.size();
-        });
-        if (it == sealed_deltas_.end()) {
-          continue;
-        }
-        segment = std::move(*it);
-        sealed_deltas_.erase(it);
-        begin = segment->merge_cursor;
-        merged_batch = std::min<size_t>(std::max<u32>(1, config.delta_merge_batch_size), segment->ids.size() - begin);
-      }
-
-      const bool merged_ok = merge_delta_batch_round(*segment, begin, merged_batch, config);
-      if (!merged_ok) {
-        std::unique_lock<std::shared_mutex> lock(delta_mutex_);
-        sealed_deltas_.push_back(std::move(segment));
-        delta_merge_cv_.notify_one();
-      } else {
-        std::unique_lock<std::shared_mutex> lock(delta_mutex_);
-        segment->merge_cursor += merged_batch;
-        queued_delta_vectors_ = queued_delta_vectors_ > merged_batch ? queued_delta_vectors_ - merged_batch : 0;
-        if (segment->merge_cursor >= segment->ids.size()) {
-          segment->retired = true;
-        } else {
-          sealed_deltas_.push_back(std::move(segment));
-          delta_merge_cv_.notify_one();
-        }
-      }
-
-      if (config.delta_merge_sleep_ms > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(config.delta_merge_sleep_ms));
-      }
-    }
   }
 
   RemotePtr allocate_local_node() {
@@ -1843,49 +1430,6 @@ private:
     return true;
   }
 
-  bool execute_storage_owner_insert(node_t id, const span<const element_t> components, const Configuration& config) {
-    RemotePtr medoid_ptr = read_global_medoid();
-    const vec<byte_t> rabitq_data = quantize_rabitq_cpu(components, config);
-
-    if (medoid_ptr.is_null()) {
-      const RemotePtr new_ptr = allocate_local_node();
-      write_new_node(new_ptr, id, components, rabitq_data, {});
-      RemotePtr observed;
-      if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
-        return true;
-      }
-      medoid_ptr = observed;
-    }
-
-    const vec<RemotePtr> candidates = beam_search_candidates(components, medoid_ptr, config);
-    hashset_t<RemotePtr> empty_skip;
-    vec<RemotePtr> selected_neighbors = robust_prune_cpu(components, candidates, empty_skip, config);
-
-    const RemotePtr new_ptr = allocate_local_node();
-    write_new_node(new_ptr, id, components, rabitq_data, selected_neighbors);
-
-    std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
-    for (const RemotePtr& neighbor_ptr : selected_neighbors) {
-      if (local_shard(neighbor_ptr.memory_node())) {
-        vec<RemotePtr> singleton{new_ptr};
-        if (!apply_local_reverse_update(neighbor_ptr, singleton, config)) {
-          return false;
-        }
-      } else {
-        remote_updates[neighbor_ptr.memory_node()].push_back(
-          service::storage_owner::ReverseUpdateOp{neighbor_ptr.raw_address, new_ptr.raw_address});
-      }
-    }
-
-    for (auto& [target_shard, ops] : remote_updates) {
-      if (!send_reverse_update_batch(target_shard, ops, config)) {
-        return false;
-      }
-    }
-
-    return true;
-  }
-
   static size_t align_up(size_t value, size_t alignment = CACHELINE_SIZE) {
     while (value % alignment != 0) {
       ++value;
@@ -2094,14 +1638,10 @@ private:
   const u32 storage_id_;
   const u32 num_storage_nodes_;
   const bool use_storage_owner_insert_;
-  const bool use_storage_delta_insert_;
   const bool ip_distance_;
 
   HugePage<byte_t> index_buffer_;
   MemoryRegion index_region_;
-  std::unique_ptr<configuration::Configuration> delta_query_config_;
-  std::unique_ptr<Context> delta_query_context_;
-  std::unique_ptr<ServerConnectionManager> delta_query_cm_;
   std::unique_ptr<configuration::Configuration> peer_config_;
   std::unique_ptr<Context> peer_context_;
   QPs peer_qps_;
@@ -2113,29 +1653,13 @@ private:
   std::unordered_map<u64, service::storage_owner::PeerRpcHeader> peer_rpc_responses_;
   u64 next_peer_request_id_{1};
   InsertRuntimeState insert_runtime_;
-  DeltaQueryRuntimeState delta_query_runtime_;
-  std::shared_mutex delta_mutex_;
-  std::condition_variable_any delta_merge_cv_;
-  std::unique_ptr<DeltaSegment> active_delta_;
-  vec<std::unique_ptr<DeltaSegment>> sealed_deltas_;
-  std::thread delta_merge_thread_;
-  std::atomic<bool> delta_shutdown_{false};
-  std::atomic<bool> delta_query_shutdown_{false};
-  std::unique_ptr<Configuration> delta_query_worker_config_;
-  std::mutex delta_query_send_mutex_;
-  std::mutex delta_query_tasks_mutex_;
-  std::condition_variable delta_query_tasks_cv_;
-  std::deque<DeltaSearchTask> delta_query_tasks_;
-  vec<std::thread> delta_query_workers_;
+  std::unique_ptr<Configuration> storage_worker_config_;
   std::mutex storage_send_mutex_;
   std::mutex storage_insert_tasks_mutex_;
   std::condition_variable storage_insert_tasks_cv_;
   std::deque<StorageOwnerInsertTask> storage_insert_tasks_;
   vec<std::thread> storage_insert_workers_;
   std::atomic<bool> storage_insert_shutdown_{false};
-  u64 next_delta_segment_id_{1};
-  size_t queued_delta_vectors_{0};
-  u32 delta_merge_threshold_vectors_{0};
   service::rabitq::Artifacts rabitq_artifacts_;
   bool rabitq_artifacts_ready_{false};
   const u64 mn_memory_bytes_;

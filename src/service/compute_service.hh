@@ -5,7 +5,6 @@
 #include <deque>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -83,27 +82,6 @@ public:
     u32 query_coroutines{};
   };
 
-  struct LocalDeltaMirror {
-    struct Entry {
-      node_t id;
-      vec<element_t> values;
-      u32 owner_shard{};
-      std::chrono::steady_clock::time_point inserted_at{};
-    };
-
-    mutable std::shared_mutex mutex;
-    std::deque<Entry> entries;
-    size_t max_vectors{};
-    std::chrono::milliseconds max_age{0};
-  };
-
-  struct SealedDeltaSynopsis {
-    mutable std::shared_mutex mutex;
-    vec<u64> counts;
-    vec<vec<element_t>> centroids;
-    vec<float> radii;
-  };
-
   struct LocalMainSearchOutput {
     service::QueryResult results;
     std::shared_ptr<service::breakdown::Sample> sample;
@@ -154,17 +132,6 @@ private:
   size_t send_storage_owner_batch(u32 owner_storage,
                                   const vec<StorageInsertTask*>& tasks,
                                   const vec<std::shared_ptr<service::breakdown::Sample>>& samples);
-  size_t insert_via_storage_owner(const vec<InsertItem>& batch,
-                                  const vec<std::shared_ptr<service::breakdown::Sample>>& samples);
-  service::QueryResult search_storage_delta(const vec<element_t>& query, u32 k);
-  void append_local_delta_mirror(const vec<InsertItem>& batch, const vec<size_t>& successful_indices);
-  void rebuild_sealed_delta_synopsis_locked();
-  service::QueryResult search_local_delta_mirror(const vec<element_t>& query, u32 k) const;
-  vec<node_t> merge_main_and_delta_results(const service::QueryResult& main_results,
-                                           const service::QueryResult& delta_results,
-                                           u32 k) const;
-  vec<u32> select_sealed_delta_shards(const vec<element_t>& query) const;
-  void connect_delta_query_channel();
   bool routing_enabled() const;
   size_t rpc_message_size() const;
   vec<element_t> compute_local_routing_centroid() const;
@@ -205,8 +172,6 @@ private:
   std::atomic<size_t> vectors_inserted_{0};
 
   std::mutex mn_command_mutex_;
-  std::mutex storage_rpc_mutex_;
-  std::mutex delta_query_rpc_mutex_;
   std::mutex storage_insert_mutex_;
   std::condition_variable storage_insert_cv_;
   std::atomic<bool> workers_paused_{false};
@@ -218,9 +183,6 @@ private:
 
   std::unique_ptr<vamana::Vamana<Distance>> vamana_;
   std::unique_ptr<WorkerPool> worker_pool_;
-  std::unique_ptr<configuration::Configuration> delta_query_config_;
-  std::unique_ptr<Context> delta_query_context_;
-  QPs delta_query_server_qps_;
   ServiceProfile service_profile_{};
   bool rabitq_artifacts_ready_{false};
   service::InsertQueue insert_queue_;
@@ -252,8 +214,6 @@ private:
   bool breakdown_enabled_{false};
   std::vector<service::breakdown::Sample> completed_query_samples_;
   std::vector<service::breakdown::Sample> completed_insert_samples_;
-  LocalDeltaMirror local_delta_mirror_;
-  SealedDeltaSynopsis sealed_delta_synopsis_;
 };
 
 extern template class ComputeService<L2Distance>;
