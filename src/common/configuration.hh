@@ -51,6 +51,8 @@ public:
   vec<str> storage_peers;
   u32 storage_owner_batch_max{16};
   u32 storage_owner_batch_wait_us{250};
+  u32 storage_owner_cache_mb{0};
+  u32 storage_owner_peer_rdma_tokens{8};
 
   // Legacy aliases for compatibility
   u32& ef_search = beam_width;
@@ -152,6 +154,11 @@ private:
       "Maximum number of inserts grouped into one storage_owner batch.")(
       "storage-owner-batch-wait-us", po::value<u32>(&storage_owner_batch_wait_us)->default_value(storage_owner_batch_wait_us),
       "Maximum micro-batch wait in microseconds for storage_owner inserts.")(
+      "storage-owner-cache-mb", po::value<u32>(&storage_owner_cache_mb)->default_value(storage_owner_cache_mb),
+      "Per-memory-node storage_owner local metadata/vector/neighbor cache size in MB. 0 disables it.")(
+      "storage-owner-peer-rdma-tokens",
+      po::value<u32>(&storage_owner_peer_rdma_tokens)->default_value(storage_owner_peer_rdma_tokens),
+      "Maximum storage-owner peer RDMA sends allowed by the guarded runtime.")(
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
@@ -227,6 +234,10 @@ private:
         std::cerr << "[ERROR]: --storage-owner-batch-max must be > 0" << std::endl;
         exit_with_help_message(argv);
       }
+      if (storage_owner_peer_rdma_tokens == 0) {
+        std::cerr << "[ERROR]: --storage-owner-peer-rdma-tokens must be > 0" << std::endl;
+        exit_with_help_message(argv);
+      }
       if (storage_peers.size() != num_server_nodes()) {
         std::cerr << "[ERROR]: --storage-peers must list exactly one endpoint per storage node when "
                      "--insert-execution=storage_owner"
@@ -283,6 +294,8 @@ public:
         os << std::setw(width) << "storage id: " << config.storage_id << std::endl;
         os << std::setw(width) << "storage batch max: " << config.storage_owner_batch_max << std::endl;
         os << std::setw(width) << "storage batch wait(us): " << config.storage_owner_batch_wait_us << std::endl;
+        os << std::setw(width) << "storage cache (MB): " << config.storage_owner_cache_mb << std::endl;
+        os << std::setw(width) << "storage peer RDMA tokens: " << config.storage_owner_peer_rdma_tokens << std::endl;
         os << std::setw(width) << "storage peers: " << "[";
         for (const str& node : config.storage_peers) {
           os << node << ", ";

@@ -68,3 +68,18 @@ struct VamanaCoroutine {
   // GPU state
   bool gpu_pending{false};
 };
+
+struct StorageOwnerInsertCoroutine {
+  struct promise_type {
+    StorageOwnerInsertCoroutine get_return_object() {
+      return StorageOwnerInsertCoroutine{Handle::from_promise(*this)};
+    }
+    static std::suspend_always initial_suspend() { return {}; }
+    static std::suspend_always final_suspend() noexcept { return {}; }
+    static void return_void() {}
+    static void unhandled_exception() { throw; }
+  };
+
+  using Handle = std::coroutine_handle<promise_type>;
+  Handle handle;
+};
