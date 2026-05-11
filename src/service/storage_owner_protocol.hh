@@ -35,6 +35,22 @@ struct InsertBatchResponseHeader {
   u64 batch_id{};
 };
 
+struct InsertBatchStats {
+  u64 cpu_quantize_ns{};
+  u64 cpu_search_ns{};
+  u64 cpu_prune_ns{};
+  u64 cpu_write_ns{};
+  u64 cpu_local_reverse_update_ns{};
+  u64 cpu_remote_reverse_update_ns{};
+  u64 rdma_peer_read_ns{};
+  u64 rdma_peer_write_ns{};
+  u64 rdma_peer_cas_ns{};
+  u64 snapshot_cache_hits{};
+  u64 snapshot_cache_misses{};
+  u64 neighbor_cache_hits{};
+  u64 neighbor_cache_misses{};
+};
+
 struct PeerRpcHeader {
   u32 magic{kPeerRpcMagic};
   u32 type{};
@@ -57,7 +73,18 @@ inline size_t insert_batch_request_bytes(u32 item_count, u32 dim) {
 }
 
 inline size_t insert_batch_response_bytes(u32 item_count) {
-  return sizeof(InsertBatchResponseHeader) + static_cast<size_t>(item_count) * sizeof(u32);
+  return sizeof(InsertBatchResponseHeader) + sizeof(InsertBatchStats) +
+         static_cast<size_t>(item_count) * sizeof(u32);
+}
+
+inline InsertBatchStats* response_stats(void* payload) {
+  return reinterpret_cast<InsertBatchStats*>(
+    reinterpret_cast<byte_t*>(payload) + sizeof(InsertBatchResponseHeader));
+}
+
+inline const InsertBatchStats* response_stats(const void* payload) {
+  return reinterpret_cast<const InsertBatchStats*>(
+    reinterpret_cast<const byte_t*>(payload) + sizeof(InsertBatchResponseHeader));
 }
 
 inline node_t* request_ids(void* payload) {
@@ -77,11 +104,11 @@ inline const element_t* request_vectors(const void* payload, u32 item_count) {
 }
 
 inline u32* response_statuses(void* payload) {
-  return reinterpret_cast<u32*>(reinterpret_cast<byte_t*>(payload) + sizeof(InsertBatchResponseHeader));
+  return reinterpret_cast<u32*>(reinterpret_cast<byte_t*>(response_stats(payload) + 1));
 }
 
 inline const u32* response_statuses(const void* payload) {
-  return reinterpret_cast<const u32*>(reinterpret_cast<const byte_t*>(payload) + sizeof(InsertBatchResponseHeader));
+  return reinterpret_cast<const u32*>(reinterpret_cast<const byte_t*>(response_stats(payload) + 1));
 }
 
 inline size_t reverse_update_request_bytes(u32 item_count) {

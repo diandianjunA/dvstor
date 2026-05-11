@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <array>
 #include <atomic>
 #include <cfloat>
 #include <chrono>
@@ -15,6 +16,7 @@
 #include <unordered_map>
 #include <vector>
 #include <library/connection_manager.hh>
+#include <library/batched_read.hh>
 #include <library/detached_qp.hh>
 #include <library/hugepage.hh>
 #include <library/memory_region.hh>
@@ -205,6 +207,72 @@ private:
     u32 item_count{};
     u64 batch_id{};
     vec<byte_t> payload;
+  };
+
+  struct StorageOwnerSearchResult {
+    vec<RemotePtr> candidates;
+    std::unordered_map<u64, NodeSnapshot> snapshots;
+  };
+
+  class StorageOwnerLocalCache {
+  public:
+    explicit StorageOwnerLocalCache(size_t capacity = 65536) : capacity_(capacity) {}
+
+    bool lookup_snapshot(u64 key, NodeSnapshot& snapshot) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto it = snapshots_.find(key);
+      if (it == snapshots_.end()) return false;
+      snapshot = it->second;
+      return true;
+    }
+
+    void insert_snapshot(const NodeSnapshot& snapshot) {
+      if (capacity_ == 0 || snapshot.rptr.is_null()) return;
+      std::lock_guard<std::mutex> lock(mutex_);
+      const u64 key = snapshot.rptr.raw_address;
+      if (snapshots_.find(key) == snapshots_.end()) {
+        order_.push_back(key);
+      }
+      snapshots_[key] = snapshot;
+      evict_if_needed();
+    }
+
+    bool lookup_neighbors(u64 key, vec<RemotePtr>& neighbors) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto it = neighbors_.find(key);
+      if (it == neighbors_.end()) return false;
+      neighbors = it->second;
+      return true;
+    }
+
+    void insert_neighbors(u64 key, const vec<RemotePtr>& neighbors) {
+      if (capacity_ == 0 || key == 0) return;
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (neighbors_.find(key) == neighbors_.end()) {
+        neighbor_order_.push_back(key);
+      }
+      neighbors_[key] = neighbors;
+      evict_if_needed();
+    }
+
+  private:
+    void evict_if_needed() {
+      while (snapshots_.size() > capacity_ && !order_.empty()) {
+        snapshots_.erase(order_.front());
+        order_.pop_front();
+      }
+      while (neighbors_.size() > capacity_ && !neighbor_order_.empty()) {
+        neighbors_.erase(neighbor_order_.front());
+        neighbor_order_.pop_front();
+      }
+    }
+
+    size_t capacity_{0};
+    std::mutex mutex_;
+    std::deque<u64> order_;
+    std::deque<u64> neighbor_order_;
+    std::unordered_map<u64, NodeSnapshot> snapshots_;
+    std::unordered_map<u64, vec<RemotePtr>> neighbors_;
   };
 
   void allocate_memory() {
@@ -650,7 +718,30 @@ private:
                            vectors + static_cast<size_t>(request->item_count) * config.dim);
     }
 
-    const bool ok = execute_storage_owner_batch_items(batch_ids.data(), batch_vectors.data(), batch_ids.size(), config);
+    service::storage_owner::InsertBatchStats batch_stats{};
+    const bool ok =
+      execute_storage_owner_batch_items(batch_ids.data(), batch_vectors.data(), batch_ids.size(), config, &batch_stats);
+    const auto scaled_stats = [](service::storage_owner::InsertBatchStats stats, u32 item_count, size_t total_items) {
+      if (total_items == 0 || item_count == total_items) return stats;
+      const auto scale = [item_count, total_items](u64 value) {
+        return static_cast<u64>((static_cast<long double>(value) * item_count) /
+                                static_cast<long double>(total_items));
+      };
+      stats.cpu_quantize_ns = scale(stats.cpu_quantize_ns);
+      stats.cpu_search_ns = scale(stats.cpu_search_ns);
+      stats.cpu_prune_ns = scale(stats.cpu_prune_ns);
+      stats.cpu_write_ns = scale(stats.cpu_write_ns);
+      stats.cpu_local_reverse_update_ns = scale(stats.cpu_local_reverse_update_ns);
+      stats.cpu_remote_reverse_update_ns = scale(stats.cpu_remote_reverse_update_ns);
+      stats.rdma_peer_read_ns = scale(stats.rdma_peer_read_ns);
+      stats.rdma_peer_write_ns = scale(stats.rdma_peer_write_ns);
+      stats.rdma_peer_cas_ns = scale(stats.rdma_peer_cas_ns);
+      stats.snapshot_cache_hits = scale(stats.snapshot_cache_hits);
+      stats.snapshot_cache_misses = scale(stats.snapshot_cache_misses);
+      stats.neighbor_cache_hits = scale(stats.neighbor_cache_hits);
+      stats.neighbor_cache_misses = scale(stats.neighbor_cache_misses);
+      return stats;
+    };
     for (size_t task_idx = 0; task_idx < tasks.size(); ++task_idx) {
       const auto& task = tasks[task_idx];
       const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(task.payload.data());
@@ -662,6 +753,8 @@ private:
       response->owner_storage = storage_id_;
       response->item_count = item_count;
       response->batch_id = request->batch_id;
+      *service::storage_owner::response_stats(response_buffer.data()) =
+        scaled_stats(batch_stats, item_count, batch_ids.size());
       u32* statuses = service::storage_owner::response_statuses(response_buffer.data());
       for (u32 i = 0; i < item_count; ++i) {
         statuses[i] = static_cast<u32>(ok ? service::storage_owner::InsertStatus::ok
@@ -787,7 +880,9 @@ private:
 
     const node_t* ids = service::storage_owner::request_ids(payload);
     const element_t* vectors = service::storage_owner::request_vectors(payload, request->item_count);
-    const bool ok = execute_storage_owner_batch_items(ids, vectors, request->item_count, config);
+    service::storage_owner::InsertBatchStats batch_stats{};
+    const bool ok = execute_storage_owner_batch_items(ids, vectors, request->item_count, config, &batch_stats);
+    *service::storage_owner::response_stats(response_ptr) = batch_stats;
     for (u32 i = 0; i < request->item_count; ++i) {
       statuses[i] = static_cast<u32>(ok ? service::storage_owner::InsertStatus::ok
                                         : service::storage_owner::InsertStatus::failed);
@@ -798,7 +893,8 @@ private:
   bool execute_storage_owner_batch_items(const node_t* ids,
                                          const element_t* vectors,
                                          size_t item_count,
-                                         const Configuration& config) {
+                                         const Configuration& config,
+                                         service::storage_owner::InsertBatchStats* stats = nullptr) {
     if (item_count == 0) {
       return true;
     }
@@ -810,11 +906,21 @@ private:
     for (size_t idx = 0; idx < item_count; ++idx) {
       const element_t* vec_ptr = vectors + idx * VamanaNode::DIM;
       const auto components = span<const element_t>{vec_ptr, VamanaNode::DIM};
+      const auto t_quantize = std::chrono::steady_clock::now();
       const vec<byte_t> rabitq_data = quantize_rabitq_cpu(components, config);
+      if (stats) {
+        stats->cpu_quantize_ns += static_cast<u64>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_quantize).count());
+      }
 
       if (medoid_ptr.is_null()) {
+        const auto t_write = std::chrono::steady_clock::now();
         const RemotePtr new_ptr = allocate_local_node();
         write_new_node(new_ptr, ids[idx], components, rabitq_data, {});
+        if (stats) {
+          stats->cpu_write_ns += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_write).count());
+        }
         RemotePtr observed;
         if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
           medoid_ptr = new_ptr;
@@ -823,11 +929,29 @@ private:
         medoid_ptr = observed;
       }
 
-      const vec<RemotePtr> candidates = beam_search_candidates(components, medoid_ptr, config);
+      const auto t_search = std::chrono::steady_clock::now();
+      StorageOwnerSearchResult search_result = beam_search_candidates(components, medoid_ptr, config, stats);
+      if (stats) {
+        stats->cpu_search_ns += static_cast<u64>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_search).count());
+      }
+
+      const auto t_prune = std::chrono::steady_clock::now();
       hashset_t<RemotePtr> empty_skip;
-      vec<RemotePtr> selected_neighbors = robust_prune_cpu(components, candidates, empty_skip, config);
+      vec<RemotePtr> selected_neighbors =
+        robust_prune_cpu(components, search_result.candidates, empty_skip, config, &search_result.snapshots, stats);
+      if (stats) {
+        stats->cpu_prune_ns += static_cast<u64>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_prune).count());
+      }
+
+      const auto t_write = std::chrono::steady_clock::now();
       const RemotePtr new_ptr = allocate_local_node();
       write_new_node(new_ptr, ids[idx], components, rabitq_data, selected_neighbors);
+      if (stats) {
+        stats->cpu_write_ns += static_cast<u64>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_write).count());
+      }
 
       for (const RemotePtr& neighbor_ptr : selected_neighbors) {
         if (local_shard(neighbor_ptr.memory_node())) {
@@ -840,13 +964,23 @@ private:
     }
 
     for (auto& [target_raw, candidates] : local_updates) {
-      if (!apply_local_reverse_update(RemotePtr{target_raw}, candidates, config)) {
+      const auto t_local_update = std::chrono::steady_clock::now();
+      if (!apply_local_reverse_update(RemotePtr{target_raw}, candidates, config, stats)) {
         return false;
+      }
+      if (stats) {
+        stats->cpu_local_reverse_update_ns += static_cast<u64>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_local_update).count());
       }
     }
     for (auto& [target_shard, ops] : remote_updates) {
+      const auto t_remote_update = std::chrono::steady_clock::now();
       if (!send_reverse_update_batch(target_shard, ops, config)) {
         return false;
+      }
+      if (stats) {
+        stats->cpu_remote_reverse_update_ns += static_cast<u64>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_remote_update).count());
       }
     }
     return true;
@@ -899,7 +1033,10 @@ private:
     return original == expected.raw_address;
   }
 
-  bool read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
+  bool read_node_snapshot(RemotePtr rptr,
+                          NodeSnapshot& snapshot,
+                          service::storage_owner::InsertBatchStats* stats = nullptr,
+                          bool use_cache = true) {
     lib_assert(rptr.memory_node() < num_storage_nodes_,
                "invalid remote shard id in read_node_snapshot: " + std::to_string(rptr.memory_node()));
     lib_assert(rptr.byte_offset() + VamanaNode::size_until_vector_end() <= mn_memory_bytes_,
@@ -907,6 +1044,12 @@ private:
                  " offset=" + std::to_string(rptr.byte_offset()) +
                  " size=" + std::to_string(VamanaNode::size_until_vector_end()) +
                  " capacity=" + std::to_string(mn_memory_bytes_));
+    if (use_cache && storage_owner_cache_.lookup_snapshot(rptr.raw_address, snapshot)) {
+      if (stats) ++stats->snapshot_cache_hits;
+      return true;
+    }
+    if (stats) ++stats->snapshot_cache_misses;
+
     snapshot = NodeSnapshot{};
     snapshot.rptr = rptr;
     snapshot.components.resize(VamanaNode::DIM);
@@ -918,19 +1061,103 @@ private:
       snapshot.id = *reinterpret_cast<const u32*>(ptr + VamanaNode::offset_id());
       snapshot.edge_count = *reinterpret_cast<const u8*>(ptr + VamanaNode::offset_edge_count());
       std::memcpy(snapshot.components.data(), ptr + VamanaNode::offset_vector(), VamanaNode::DIM * sizeof(element_t));
+      storage_owner_cache_.insert_snapshot(snapshot);
       return true;
     }
 
+    const auto t_read = std::chrono::steady_clock::now();
     remote_read_bytes(rptr.memory_node(), rptr.byte_offset(), peer_scratch_buffer_.get_full_buffer(), read_size, 0);
+    if (stats) {
+      stats->rdma_peer_read_ns += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_read).count());
+    }
     const byte_t* ptr = peer_scratch_buffer_.get_full_buffer();
     snapshot.header = *reinterpret_cast<const u64*>(ptr);
     snapshot.id = *reinterpret_cast<const u32*>(ptr + VamanaNode::offset_id());
     snapshot.edge_count = *reinterpret_cast<const u8*>(ptr + VamanaNode::offset_edge_count());
     std::memcpy(snapshot.components.data(), ptr + VamanaNode::offset_vector(), VamanaNode::DIM * sizeof(element_t));
+    storage_owner_cache_.insert_snapshot(snapshot);
     return true;
   }
 
-  vec<RemotePtr> read_neighbor_list(RemotePtr rptr) {
+  void read_node_snapshots_batched(const vec<RemotePtr>& rptrs,
+                                   vec<NodeSnapshot>& snapshots,
+                                   service::storage_owner::InsertBatchStats* stats = nullptr) {
+    snapshots.clear();
+    snapshots.reserve(rptrs.size());
+
+    std::array<vec<size_t>, 256> remote_by_shard;
+    const size_t read_size = VamanaNode::size_until_vector_end();
+    for (const RemotePtr& rptr : rptrs) {
+      NodeSnapshot snapshot;
+      if (storage_owner_cache_.lookup_snapshot(rptr.raw_address, snapshot)) {
+        if (stats) ++stats->snapshot_cache_hits;
+        snapshots.push_back(std::move(snapshot));
+        continue;
+      }
+      if (stats) ++stats->snapshot_cache_misses;
+      if (local_shard(rptr.memory_node())) {
+        read_node_snapshot(rptr, snapshot, nullptr, false);
+        snapshots.push_back(std::move(snapshot));
+      } else if (rptr.memory_node() < remote_by_shard.size()) {
+        remote_by_shard[rptr.memory_node()].push_back(snapshots.size());
+        NodeSnapshot pending{};
+        pending.rptr = rptr;
+        pending.components.resize(VamanaNode::DIM);
+        snapshots.push_back(std::move(pending));
+      } else {
+        read_node_snapshot(rptr, snapshot, stats, false);
+        snapshots.push_back(std::move(snapshot));
+      }
+    }
+
+    for (u32 shard_id = 0; shard_id < remote_by_shard.size(); ++shard_id) {
+      auto& indexes = remote_by_shard[shard_id];
+      if (indexes.empty()) continue;
+      lib_assert(peer_context_ != nullptr, "storage peer context is not initialized");
+      const size_t max_per_batch = std::max<size_t>(1, peer_scratch_buffer_.buffer_size / read_size);
+      for (size_t begin = 0; begin < indexes.size(); begin += max_per_batch) {
+        const size_t count = std::min<size_t>(indexes.size() - begin, max_per_batch);
+        std::lock_guard<std::mutex> peer_lock(peer_rdma_mutex_);
+        BatchedREAD batch(count);
+        for (size_t i = 0; i < count; ++i) {
+          const size_t snapshot_idx = indexes[begin + i];
+          const RemotePtr rptr = snapshots[snapshot_idx].rptr;
+          batch.add_to_batch(reinterpret_cast<u64>(peer_scratch_buffer_.get_full_buffer() + i * read_size),
+                             peer_remote_tokens_[shard_id]->address + rptr.byte_offset(),
+                             static_cast<u32>(read_size),
+                             peer_scratch_region_->get_lkey(),
+                             peer_remote_tokens_[shard_id]->rkey,
+                             static_cast<u64>(i),
+                             false);
+        }
+        const auto t_read = std::chrono::steady_clock::now();
+        batch.post_batch(peer_qps_[shard_id]);
+        peer_context_->poll_send_cq_until_completion();
+        if (stats) {
+          stats->rdma_peer_read_ns += static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_read).count());
+        }
+
+        for (size_t i = 0; i < count; ++i) {
+          const size_t snapshot_idx = indexes[begin + i];
+          const byte_t* ptr = peer_scratch_buffer_.get_full_buffer() + i * read_size;
+          NodeSnapshot& snapshot = snapshots[snapshot_idx];
+          snapshot.header = *reinterpret_cast<const u64*>(ptr);
+          snapshot.id = *reinterpret_cast<const u32*>(ptr + VamanaNode::offset_id());
+          snapshot.edge_count = *reinterpret_cast<const u8*>(ptr + VamanaNode::offset_edge_count());
+          std::memcpy(snapshot.components.data(),
+                      ptr + VamanaNode::offset_vector(),
+                      VamanaNode::DIM * sizeof(element_t));
+          storage_owner_cache_.insert_snapshot(snapshot);
+        }
+      }
+    }
+  }
+
+  vec<RemotePtr> read_neighbor_list(RemotePtr rptr,
+                                    service::storage_owner::InsertBatchStats* stats = nullptr,
+                                    bool use_cache = true) {
     lib_assert(rptr.memory_node() < num_storage_nodes_,
                "invalid remote shard id in read_neighbor_list: " + std::to_string(rptr.memory_node()));
     lib_assert(rptr.byte_offset() + VamanaNode::offset_neighbors() + VamanaNode::NEIGHBORS_SIZE <= mn_memory_bytes_,
@@ -939,6 +1166,11 @@ private:
                  " size=" + std::to_string(VamanaNode::offset_neighbors() + VamanaNode::NEIGHBORS_SIZE) +
                  " capacity=" + std::to_string(mn_memory_bytes_));
     vec<RemotePtr> neighbors;
+    if (use_cache && storage_owner_cache_.lookup_neighbors(rptr.raw_address, neighbors)) {
+      if (stats) ++stats->neighbor_cache_hits;
+      return neighbors;
+    }
+    if (stats) ++stats->neighbor_cache_misses;
     if (local_shard(rptr.memory_node())) {
       const byte_t* ptr = local_node_ptr(rptr);
       const u8 edge_count = *reinterpret_cast<const u8*>(ptr + VamanaNode::offset_edge_count());
@@ -949,10 +1181,12 @@ private:
           neighbors.push_back(slots[i]);
         }
       }
+      storage_owner_cache_.insert_neighbors(rptr.raw_address, neighbors);
       return neighbors;
     }
 
     u8 edge_count = 0;
+    const auto t_read = std::chrono::steady_clock::now();
     remote_read_bytes(rptr.memory_node(), rptr.byte_offset() + VamanaNode::offset_edge_count(), &edge_count, sizeof(edge_count), 0);
     vec<RemotePtr> slots(VamanaNode::R);
     remote_read_bytes(rptr.memory_node(),
@@ -960,12 +1194,17 @@ private:
                       slots.data(),
                       VamanaNode::NEIGHBORS_SIZE,
                       align_up(sizeof(u64)));
+    if (stats) {
+      stats->rdma_peer_read_ns += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t_read).count());
+    }
     neighbors.reserve(edge_count);
     for (u32 i = 0; i < edge_count && i < slots.size(); ++i) {
       if (!slots[i].is_null()) {
         neighbors.push_back(slots[i]);
       }
     }
+    storage_owner_cache_.insert_neighbors(rptr.raw_address, neighbors);
     return neighbors;
   }
 
@@ -989,6 +1228,7 @@ private:
       for (u32 i = edge_count; i < VamanaNode::R; ++i) {
         slots[i].reset();
       }
+      storage_owner_cache_.insert_neighbors(rptr.raw_address, neighbors);
       return;
     }
 
@@ -1005,6 +1245,7 @@ private:
                        slots.data(),
                        VamanaNode::NEIGHBORS_SIZE,
                        align_up(sizeof(meta)));
+    storage_owner_cache_.insert_neighbors(rptr.raw_address, neighbors);
   }
 
   void write_new_node(RemotePtr rptr,
@@ -1025,6 +1266,14 @@ private:
     for (u32 i = 0; i < neighbors.size() && i < VamanaNode::R; ++i) {
       slots[i] = neighbors[i];
     }
+    NodeSnapshot snapshot{};
+    snapshot.rptr = rptr;
+    snapshot.header = *reinterpret_cast<u64*>(ptr);
+    snapshot.id = id;
+    snapshot.edge_count = *reinterpret_cast<u8*>(ptr + VamanaNode::offset_edge_count());
+    snapshot.components.assign(components.begin(), components.end());
+    storage_owner_cache_.insert_snapshot(snapshot);
+    storage_owner_cache_.insert_neighbors(rptr.raw_address, neighbors);
   }
 
   void lock_node(RemotePtr rptr) {
@@ -1067,15 +1316,20 @@ private:
     remote_write_bytes(rptr.memory_node(), rptr.byte_offset() + VamanaNode::HEADER_UNTIL_LOCK, &unlock, 1, 0);
   }
 
-  vec<RemotePtr> beam_search_candidates(const span<const element_t> query, RemotePtr medoid, const Configuration& config) {
+  StorageOwnerSearchResult beam_search_candidates(const span<const element_t> query,
+                                                  RemotePtr medoid,
+                                                  const Configuration& config,
+                                                  service::storage_owner::InsertBatchStats* stats = nullptr) {
     hashset_t<RemotePtr> visited;
     vec<BeamEntry> beam;
+    StorageOwnerSearchResult result;
 
     NodeSnapshot medoid_snapshot;
-    read_node_snapshot(medoid, medoid_snapshot);
+    read_node_snapshot(medoid, medoid_snapshot, stats);
     const distance_t medoid_dist = distance_fn()(query, medoid_snapshot.components, config.dim);
     beam.push_back({medoid, medoid_dist, false});
     visited.insert(medoid);
+    result.snapshots[medoid.raw_address] = medoid_snapshot;
 
     for (;;) {
       i32 best_idx = -1;
@@ -1091,32 +1345,39 @@ private:
       }
 
       beam[best_idx].expanded = true;
-      const vec<RemotePtr> neighbors = read_neighbor_list(beam[best_idx].rptr);
+      const vec<RemotePtr> neighbors = read_neighbor_list(beam[best_idx].rptr, stats);
+      vec<RemotePtr> unvisited;
+      unvisited.reserve(neighbors.size());
       for (const RemotePtr& neighbor : neighbors) {
         if (neighbor.is_null() || visited.contains(neighbor)) {
           continue;
         }
         visited.insert(neighbor);
-        NodeSnapshot snapshot;
-        read_node_snapshot(neighbor, snapshot);
+        unvisited.push_back(neighbor);
+      }
+      vec<NodeSnapshot> snapshots;
+      read_node_snapshots_batched(unvisited, snapshots, stats);
+      for (NodeSnapshot& snapshot : snapshots) {
         const distance_t dist = distance_fn()(query, snapshot.components, config.dim);
-        insert_into_beam(beam, neighbor, dist, config.beam_width_construction);
+        insert_into_beam(beam, snapshot.rptr, dist, config.beam_width_construction);
+        result.snapshots[snapshot.rptr.raw_address] = std::move(snapshot);
       }
     }
 
-    vec<RemotePtr> candidates;
-    candidates.reserve(beam.size());
+    result.candidates.reserve(beam.size());
     std::sort(beam.begin(), beam.end(), [](const BeamEntry& lhs, const BeamEntry& rhs) { return lhs.distance < rhs.distance; });
     for (const auto& entry : beam) {
-      candidates.push_back(entry.rptr);
+      result.candidates.push_back(entry.rptr);
     }
-    return candidates;
+    return result;
   }
 
   vec<RemotePtr> robust_prune_cpu(const span<const element_t> source,
                                   const vec<RemotePtr>& candidates,
                                   const hashset_t<RemotePtr>& skip,
-                                  const Configuration& config) {
+                                  const Configuration& config,
+                                  const std::unordered_map<u64, NodeSnapshot>* snapshot_cache = nullptr,
+                                  service::storage_owner::InsertBatchStats* stats = nullptr) {
     struct CandidateInfo {
       RemotePtr rptr;
       distance_t dist{};
@@ -1130,7 +1391,16 @@ private:
         continue;
       }
       NodeSnapshot snapshot;
-      read_node_snapshot(candidate, snapshot);
+      if (snapshot_cache) {
+        const auto it = snapshot_cache->find(candidate.raw_address);
+        if (it != snapshot_cache->end()) {
+          snapshot = it->second;
+        } else {
+          read_node_snapshot(candidate, snapshot, stats);
+        }
+      } else {
+        read_node_snapshot(candidate, snapshot, stats);
+      }
       infos.push_back({candidate, distance_fn()(source, snapshot.components, config.dim), std::move(snapshot.components)});
     }
 
@@ -1249,6 +1519,7 @@ private:
 
   void remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, size_t bytes, size_t scratch_offset) {
     if (bytes == 0) return;
+    std::lock_guard<std::mutex> peer_lock(peer_rdma_mutex_);
     lib_assert(peer_context_ != nullptr, "storage peer context is not initialized");
     lib_assert(shard_id < num_storage_nodes_, "invalid peer shard id: " + std::to_string(shard_id));
     lib_assert(peer_qps_[shard_id] != nullptr, "peer QP is not initialized for shard " + std::to_string(shard_id));
@@ -1289,6 +1560,7 @@ private:
 
   void remote_write_bytes(u32 shard_id, u64 remote_offset, const void* src, size_t bytes, size_t scratch_offset) {
     if (bytes == 0) return;
+    std::lock_guard<std::mutex> peer_lock(peer_rdma_mutex_);
     lib_assert(peer_context_ != nullptr, "storage peer context is not initialized");
     lib_assert(shard_id < num_storage_nodes_, "invalid peer shard id: " + std::to_string(shard_id));
     lib_assert(peer_qps_[shard_id] != nullptr, "peer QP is not initialized for shard " + std::to_string(shard_id));
@@ -1328,6 +1600,7 @@ private:
   }
 
   u64 remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 expected, u64 desired, size_t scratch_offset) {
+    std::lock_guard<std::mutex> peer_lock(peer_rdma_mutex_);
     lib_assert(peer_context_ != nullptr, "storage peer context is not initialized");
     lib_assert(shard_id < num_storage_nodes_, "invalid peer shard id: " + std::to_string(shard_id));
     lib_assert(peer_qps_[shard_id] != nullptr, "peer QP is not initialized for shard " + std::to_string(shard_id));
@@ -1378,7 +1651,8 @@ private:
 
   bool apply_local_reverse_update(RemotePtr target_ptr,
                                   const vec<RemotePtr>& candidate_ptrs,
-                                  const Configuration& config) {
+                                  const Configuration& config,
+                                  service::storage_owner::InsertBatchStats* stats = nullptr) {
     lib_assert(local_shard(target_ptr.memory_node()), "target reverse update must be local");
     if (candidate_ptrs.empty()) {
       return true;
@@ -1388,8 +1662,8 @@ private:
     vec<RemotePtr> updated_neighbors;
     {
       NodeSnapshot target_snapshot;
-      read_node_snapshot(target_ptr, target_snapshot);
-      vec<RemotePtr> current_neighbors = read_neighbor_list(target_ptr);
+      read_node_snapshot(target_ptr, target_snapshot, stats);
+      vec<RemotePtr> current_neighbors = read_neighbor_list(target_ptr, stats);
       vec<RemotePtr> filtered_candidates;
       filtered_candidates.reserve(candidate_ptrs.size());
       for (const RemotePtr& candidate_ptr : candidate_ptrs) {
@@ -1421,7 +1695,7 @@ private:
         vec<RemotePtr> prune_candidates = current_neighbors;
         prune_candidates.insert(prune_candidates.end(), filtered_candidates.begin(), filtered_candidates.end());
         hashset_t<RemotePtr> skip{target_ptr};
-        updated_neighbors = robust_prune_cpu(target_snapshot.components, prune_candidates, skip, config);
+        updated_neighbors = robust_prune_cpu(target_snapshot.components, prune_candidates, skip, config, nullptr, stats);
       }
     }
 
@@ -1649,6 +1923,7 @@ private:
   std::unique_ptr<MemoryRegion> peer_index_region_;
   HugePage<byte_t> peer_scratch_buffer_;
   std::unique_ptr<LocalMemoryRegion> peer_scratch_region_;
+  std::mutex peer_rdma_mutex_;
   PeerRpcRuntimeState peer_rpc_runtime_;
   std::unordered_map<u64, service::storage_owner::PeerRpcHeader> peer_rpc_responses_;
   u64 next_peer_request_id_{1};
@@ -1660,6 +1935,7 @@ private:
   std::deque<StorageOwnerInsertTask> storage_insert_tasks_;
   vec<std::thread> storage_insert_workers_;
   std::atomic<bool> storage_insert_shutdown_{false};
+  StorageOwnerLocalCache storage_owner_cache_{65536};
   service::rabitq::Artifacts rabitq_artifacts_;
   bool rabitq_artifacts_ready_{false};
   const u64 mn_memory_bytes_;
