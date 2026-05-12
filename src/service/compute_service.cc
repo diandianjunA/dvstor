@@ -186,7 +186,7 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
         storage_insert_owner_queues_[owner_storage].push_back(std::move(task));
       }
     }
-    storage_insert_cv_.notify_one();
+    storage_insert_cv_.notify_all();
 
     size_t inserted = 0;
     for (auto& future : futures) {
@@ -249,26 +249,36 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
 
 template <class Distance>
 void ComputeService<Distance>::start_storage_insert_runtime() {
-  if (storage_insert_thread_.joinable()) {
+  if (!storage_insert_threads_.empty()) {
     return;
   }
   {
     std::lock_guard<std::mutex> lock(storage_insert_mutex_);
     storage_insert_owner_queues_.clear();
     storage_insert_owner_queues_.resize(std::max<u32>(1, num_servers_));
-    storage_insert_rr_owner_ = 0;
+    storage_insert_owner_response_ready_.clear();
+    storage_insert_owner_response_ready_.reserve(storage_insert_owner_queues_.size());
+    for (size_t i = 0; i < storage_insert_owner_queues_.size(); ++i) {
+      storage_insert_owner_response_ready_.push_back(std::make_unique<std::atomic<bool>>(false));
+    }
   }
   storage_insert_shutdown_.store(false, std::memory_order_release);
-  storage_insert_thread_ = std::thread([this]() { run_storage_insert_runtime(); });
+  storage_insert_threads_.reserve(storage_insert_owner_queues_.size());
+  for (u32 owner = 0; owner < storage_insert_owner_queues_.size(); ++owner) {
+    storage_insert_threads_.emplace_back([this, owner]() { run_storage_insert_runtime(owner); });
+  }
 }
 
 template <class Distance>
 void ComputeService<Distance>::stop_storage_insert_runtime() {
   storage_insert_shutdown_.store(true, std::memory_order_release);
   storage_insert_cv_.notify_all();
-  if (storage_insert_thread_.joinable()) {
-    storage_insert_thread_.join();
+  for (auto& thread : storage_insert_threads_) {
+    if (thread.joinable()) {
+      thread.join();
+    }
   }
+  storage_insert_threads_.clear();
 
   std::lock_guard<std::mutex> lock(storage_insert_mutex_);
   for (auto& queue : storage_insert_owner_queues_) {
@@ -280,39 +290,24 @@ void ComputeService<Distance>::stop_storage_insert_runtime() {
 }
 
 template <class Distance>
-void ComputeService<Distance>::run_storage_insert_runtime() {
-  const auto has_pending = [&]() {
-    return std::any_of(storage_insert_owner_queues_.begin(),
-                       storage_insert_owner_queues_.end(),
-                       [](const auto& queue) { return !queue.empty(); });
-  };
-
+void ComputeService<Distance>::run_storage_insert_runtime(u32 owner_storage) {
   for (;;) {
-    u32 owner_storage = 0;
     vec<std::unique_ptr<StorageInsertTask>> owned_tasks;
     {
       std::unique_lock<std::mutex> lock(storage_insert_mutex_);
       storage_insert_cv_.wait(lock, [&]() {
-        return storage_insert_shutdown_.load(std::memory_order_acquire) || has_pending();
+        return storage_insert_shutdown_.load(std::memory_order_acquire) ||
+               (owner_storage < storage_insert_owner_queues_.size() &&
+                !storage_insert_owner_queues_[owner_storage].empty());
       });
 
-      if (storage_insert_shutdown_.load(std::memory_order_acquire) && !has_pending()) {
+      if (owner_storage >= storage_insert_owner_queues_.size()) {
         return;
       }
 
-      const u32 owner_count = static_cast<u32>(storage_insert_owner_queues_.size());
-      bool found = false;
-      for (u32 attempt = 0; attempt < owner_count; ++attempt) {
-        const u32 candidate = (storage_insert_rr_owner_ + attempt) % owner_count;
-        if (!storage_insert_owner_queues_[candidate].empty()) {
-          owner_storage = candidate;
-          storage_insert_rr_owner_ = (candidate + 1) % owner_count;
-          found = true;
-          break;
-        }
-      }
-      if (!found) {
-        continue;
+      if (storage_insert_shutdown_.load(std::memory_order_acquire) &&
+          storage_insert_owner_queues_[owner_storage].empty()) {
+        return;
       }
 
       if (config_.storage_owner_batch_wait_us > 0 &&
@@ -360,6 +355,32 @@ void ComputeService<Distance>::run_storage_insert_runtime() {
 }
 
 template <class Distance>
+void ComputeService<Distance>::poll_storage_owner_responses() {
+  vec<ibv_wc> recv_wcs(std::max<i32>(1, config_.max_recv_queue_wr));
+  std::lock_guard<std::mutex> lock(storage_insert_recv_mutex_);
+  const i32 num_received =
+    Context::poll_recv_cq(recv_wcs.data(), static_cast<i32>(recv_wcs.size()), context_.get_receive_cq());
+  for (i32 i = 0; i < num_received; ++i) {
+    const u32 owner = static_cast<u32>(recv_wcs[i].wr_id);
+    if (owner < storage_insert_owner_response_ready_.size() &&
+        storage_insert_owner_response_ready_[owner]) {
+      storage_insert_owner_response_ready_[owner]->store(true, std::memory_order_release);
+    }
+  }
+}
+
+template <class Distance>
+void ComputeService<Distance>::wait_storage_owner_response(u32 owner_storage) {
+  lib_assert(owner_storage < storage_insert_owner_response_ready_.size(),
+             "invalid storage owner response slot");
+  auto& ready = *storage_insert_owner_response_ready_[owner_storage];
+  while (!ready.load(std::memory_order_acquire)) {
+    poll_storage_owner_responses();
+    std::this_thread::yield();
+  }
+}
+
+template <class Distance>
 size_t ComputeService<Distance>::send_storage_owner_batch(
     u32 owner_storage,
     const vec<StorageInsertTask*>& tasks,
@@ -396,16 +417,22 @@ size_t ComputeService<Distance>::send_storage_owner_batch(
   LocalMemoryRegion response_region{context_, response_buffer.data(), response_buffer.size()};
 
   auto& qp = *cm_.server_qps[owner_storage];
-  qp.post_receive(response_region, static_cast<u32>(response_size));
-  qp.post_send(request_region,
-               static_cast<u32>(request_size),
-               IBV_WR_SEND,
-               true,
-               nullptr,
-               0,
-               0);
-  context_.poll_send_cq_until_completion();
-  context_.receive();
+  lib_assert(owner_storage < storage_insert_owner_response_ready_.size(),
+             "invalid storage owner response slot");
+  storage_insert_owner_response_ready_[owner_storage]->store(false, std::memory_order_release);
+  qp.post_receive(response_region, static_cast<u32>(response_size), owner_storage, 0);
+  {
+    std::lock_guard<std::mutex> lock(storage_insert_send_mutex_);
+    qp.post_send(request_region,
+                 static_cast<u32>(request_size),
+                 IBV_WR_SEND,
+                 true,
+                 nullptr,
+                 0,
+                 0);
+    context_.poll_send_cq_until_completion();
+  }
+  wait_storage_owner_response(owner_storage);
 
   const auto* response =
     reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(response_buffer.data());

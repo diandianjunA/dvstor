@@ -128,7 +128,9 @@ private:
   vec<node_t> search_local(const vec<element_t>& query, u32 k);
   void start_storage_insert_runtime();
   void stop_storage_insert_runtime();
-  void run_storage_insert_runtime();
+  void run_storage_insert_runtime(u32 owner_storage);
+  void poll_storage_owner_responses();
+  void wait_storage_owner_response(u32 owner_storage);
   size_t send_storage_owner_batch(u32 owner_storage,
                                   const vec<StorageInsertTask*>& tasks,
                                   const vec<std::shared_ptr<service::breakdown::Sample>>& samples);
@@ -189,10 +191,12 @@ private:
   service::QueryQueue query_queue_;
   vec<std::thread> workers_;
   std::thread rpc_thread_;
-  std::thread storage_insert_thread_;
+  vec<std::thread> storage_insert_threads_;
   std::atomic<bool> storage_insert_shutdown_{false};
   vec<std::deque<std::unique_ptr<StorageInsertTask>>> storage_insert_owner_queues_;
-  u32 storage_insert_rr_owner_{0};
+  std::mutex storage_insert_send_mutex_;
+  std::mutex storage_insert_recv_mutex_;
+  vec<std::unique_ptr<std::atomic<bool>>> storage_insert_owner_response_ready_;
 
   std::unique_ptr<byte_t[]> rpc_buffer_;
   std::unique_ptr<LocalMemoryRegion> rpc_region_;
