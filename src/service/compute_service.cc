@@ -256,10 +256,10 @@ void ComputeService<Distance>::start_storage_insert_runtime() {
     std::lock_guard<std::mutex> lock(storage_insert_mutex_);
     storage_insert_owner_queues_.clear();
     storage_insert_owner_queues_.resize(std::max<u32>(1, num_servers_));
-    storage_insert_owner_response_ready_.clear();
-    storage_insert_owner_response_ready_.reserve(storage_insert_owner_queues_.size());
+    storage_insert_owner_response_counts_.clear();
+    storage_insert_owner_response_counts_.reserve(storage_insert_owner_queues_.size());
     for (size_t i = 0; i < storage_insert_owner_queues_.size(); ++i) {
-      storage_insert_owner_response_ready_.push_back(std::make_unique<std::atomic<bool>>(false));
+      storage_insert_owner_response_counts_.push_back(std::make_unique<std::atomic<u64>>(0));
     }
   }
   storage_insert_shutdown_.store(false, std::memory_order_release);
@@ -362,19 +362,19 @@ void ComputeService<Distance>::poll_storage_owner_responses() {
     Context::poll_recv_cq(recv_wcs.data(), static_cast<i32>(recv_wcs.size()), context_.get_receive_cq());
   for (i32 i = 0; i < num_received; ++i) {
     const u32 owner = static_cast<u32>(recv_wcs[i].wr_id);
-    if (owner < storage_insert_owner_response_ready_.size() &&
-        storage_insert_owner_response_ready_[owner]) {
-      storage_insert_owner_response_ready_[owner]->store(true, std::memory_order_release);
+    if (owner < storage_insert_owner_response_counts_.size() &&
+        storage_insert_owner_response_counts_[owner]) {
+      storage_insert_owner_response_counts_[owner]->fetch_add(1, std::memory_order_acq_rel);
     }
   }
 }
 
 template <class Distance>
-void ComputeService<Distance>::wait_storage_owner_response(u32 owner_storage) {
-  lib_assert(owner_storage < storage_insert_owner_response_ready_.size(),
+void ComputeService<Distance>::wait_storage_owner_response(u32 owner_storage, u64 target_count) {
+  lib_assert(owner_storage < storage_insert_owner_response_counts_.size(),
              "invalid storage owner response slot");
-  auto& ready = *storage_insert_owner_response_ready_[owner_storage];
-  while (!ready.load(std::memory_order_acquire)) {
+  auto& count = *storage_insert_owner_response_counts_[owner_storage];
+  while (count.load(std::memory_order_acquire) < target_count) {
     poll_storage_owner_responses();
     std::this_thread::yield();
   }
@@ -413,17 +413,19 @@ size_t ComputeService<Distance>::send_storage_owner_batch(
                 static_cast<size_t>(config_.dim) * sizeof(element_t));
   }
 
-  LocalMemoryRegion request_region{context_, request_buffer.data(), request_buffer.size()};
-  LocalMemoryRegion response_region{context_, response_buffer.data(), response_buffer.size()};
-
   auto& qp = *cm_.server_qps[owner_storage];
-  lib_assert(owner_storage < storage_insert_owner_response_ready_.size(),
+  lib_assert(owner_storage < storage_insert_owner_response_counts_.size(),
              "invalid storage owner response slot");
-  storage_insert_owner_response_ready_[owner_storage]->store(false, std::memory_order_release);
-  qp.post_receive(response_region, static_cast<u32>(response_size), owner_storage, 0);
+  const u64 target_response_count =
+    storage_insert_owner_response_counts_[owner_storage]->load(std::memory_order_acquire) + 1;
+  std::unique_ptr<LocalMemoryRegion> request_region;
+  std::unique_ptr<LocalMemoryRegion> response_region;
   {
     std::lock_guard<std::mutex> lock(storage_insert_send_mutex_);
-    qp.post_send(request_region,
+    request_region = std::make_unique<LocalMemoryRegion>(context_, request_buffer.data(), request_buffer.size());
+    response_region = std::make_unique<LocalMemoryRegion>(context_, response_buffer.data(), response_buffer.size());
+    qp.post_receive(*response_region, static_cast<u32>(response_size), owner_storage, 0);
+    qp.post_send(*request_region,
                  static_cast<u32>(request_size),
                  IBV_WR_SEND,
                  true,
@@ -432,7 +434,7 @@ size_t ComputeService<Distance>::send_storage_owner_batch(
                  0);
     context_.poll_send_cq_until_completion();
   }
-  wait_storage_owner_response(owner_storage);
+  wait_storage_owner_response(owner_storage, target_response_count);
 
   const auto* response =
     reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(response_buffer.data());

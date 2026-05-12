@@ -130,7 +130,7 @@ private:
   void stop_storage_insert_runtime();
   void run_storage_insert_runtime(u32 owner_storage);
   void poll_storage_owner_responses();
-  void wait_storage_owner_response(u32 owner_storage);
+  void wait_storage_owner_response(u32 owner_storage, u64 target_count);
   size_t send_storage_owner_batch(u32 owner_storage,
                                   const vec<StorageInsertTask*>& tasks,
                                   const vec<std::shared_ptr<service::breakdown::Sample>>& samples);
@@ -196,7 +196,7 @@ private:
   vec<std::deque<std::unique_ptr<StorageInsertTask>>> storage_insert_owner_queues_;
   std::mutex storage_insert_send_mutex_;
   std::mutex storage_insert_recv_mutex_;
-  vec<std::unique_ptr<std::atomic<bool>>> storage_insert_owner_response_ready_;
+  vec<std::unique_ptr<std::atomic<u64>>> storage_insert_owner_response_counts_;
 
   std::unique_ptr<byte_t[]> rpc_buffer_;
   std::unique_ptr<LocalMemoryRegion> rpc_region_;
