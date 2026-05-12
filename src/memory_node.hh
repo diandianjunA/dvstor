@@ -207,6 +207,7 @@ private:
     u32 client_id{};
     u32 item_count{};
     u64 batch_id{};
+    std::chrono::steady_clock::time_point received_at{};
     vec<byte_t> payload;
   };
 
@@ -354,6 +355,40 @@ private:
     vec<element_t> components;
     bool ok{false};
   };
+
+  using InsertBreakdownCounters = service::storage_owner::InsertBreakdownCounters;
+
+  static u64 elapsed_ns_since(const std::chrono::steady_clock::time_point start) {
+    return static_cast<u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+  }
+
+  static u64 scale_ns(const u64 value, const u32 part, const u32 total) {
+    if (value == 0 || part == 0 || total == 0) {
+      return 0;
+    }
+    const u64 quotient = value / total;
+    const u64 remainder = value % total;
+    return quotient * part + (remainder * part) / total;
+  }
+
+  static InsertBreakdownCounters scale_breakdown(const InsertBreakdownCounters& counters,
+                                                 const u32 part,
+                                                 const u32 total) {
+    InsertBreakdownCounters out{};
+    out.storage_owner_queue_wait_ns = scale_ns(counters.storage_owner_queue_wait_ns, part, total);
+    out.storage_owner_quantize_ns = scale_ns(counters.storage_owner_quantize_ns, part, total);
+    out.storage_owner_medoid_ns = scale_ns(counters.storage_owner_medoid_ns, part, total);
+    out.storage_owner_search_ns = scale_ns(counters.storage_owner_search_ns, part, total);
+    out.storage_owner_prune_ns = scale_ns(counters.storage_owner_prune_ns, part, total);
+    out.storage_owner_write_node_ns = scale_ns(counters.storage_owner_write_node_ns, part, total);
+    out.storage_owner_local_reverse_ns = scale_ns(counters.storage_owner_local_reverse_ns, part, total);
+    out.storage_owner_remote_reverse_ns = scale_ns(counters.storage_owner_remote_reverse_ns, part, total);
+    out.storage_owner_peer_reverse_apply_ns =
+      scale_ns(counters.storage_owner_peer_reverse_apply_ns, part, total);
+    out.storage_owner_response_send_ns = scale_ns(counters.storage_owner_response_send_ns, part, total);
+    return out;
+  }
 
   static constexpr u32 kPeerSyncWrOwner = std::numeric_limits<u32>::max();
 
@@ -872,13 +907,25 @@ private:
                            vectors + static_cast<size_t>(request->item_count) * config.dim);
     }
 
+    InsertBreakdownCounters breakdown{};
+    const auto process_started = std::chrono::steady_clock::now();
+    for (const auto& task : tasks) {
+      breakdown.storage_owner_queue_wait_ns += static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(process_started - task.received_at).count());
+    }
+
     const bool ok = current_storage_owner_thread_ != nullptr
                       ? execute_storage_owner_batch_items_async(batch_ids.data(),
                                                                  batch_vectors.data(),
                                                                  batch_ids.size(),
                                                                  *current_storage_owner_thread_,
+                                                                 breakdown,
                                                                  config)
-                      : execute_storage_owner_batch_items(batch_ids.data(), batch_vectors.data(), batch_ids.size(), config);
+                      : execute_storage_owner_batch_items(batch_ids.data(),
+                                                          batch_vectors.data(),
+                                                          batch_ids.size(),
+                                                          breakdown,
+                                                          config);
     for (size_t task_idx = 0; task_idx < tasks.size(); ++task_idx) {
       const auto& task = tasks[task_idx];
       const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(task.payload.data());
@@ -895,6 +942,8 @@ private:
         statuses[i] = static_cast<u32>(ok ? service::storage_owner::InsertStatus::ok
                                           : service::storage_owner::InsertStatus::failed);
       }
+      *service::storage_owner::response_breakdown(response_buffer.data(), item_count) =
+        scale_breakdown(breakdown, item_count, static_cast<u32>(std::max<size_t>(1, batch_ids.size())));
 
       LocalMemoryRegion response_region{context_, response_buffer.data(), response_buffer.size()};
       {
@@ -910,6 +959,7 @@ private:
                                                const element_t* vectors,
                                                size_t item_count,
                                                StorageOwnerThread& thread,
+                                               InsertBreakdownCounters& breakdown,
                                                const Configuration& config) {
     if (item_count == 0) {
       return true;
@@ -951,7 +1001,7 @@ private:
             coroutine.handle.destroy();
             thread.set_current_coroutine(coroutine_id);
             coroutine.handle = execute_storage_owner_insert_job_async(
-              thread, jobs[next_job++], local_updates, remote_updates, config).handle;
+              thread, jobs[next_job++], local_updates, remote_updates, breakdown, config).handle;
             all_done = false;
           }
         } else if (thread.is_ready(coroutine_id)) {
@@ -978,12 +1028,16 @@ private:
     for (const auto& job : jobs) {
       ok &= job.ok;
     }
+    auto t_local_reverse = std::chrono::steady_clock::now();
     for (auto& [target_raw, candidates] : local_updates) {
       ok &= apply_local_reverse_update(RemotePtr{target_raw}, candidates, config);
     }
+    breakdown.storage_owner_local_reverse_ns += elapsed_ns_since(t_local_reverse);
+    auto t_remote_reverse = std::chrono::steady_clock::now();
     for (auto& [target_shard, ops] : remote_updates) {
       ok &= send_reverse_update_batch(target_shard, ops, config);
     }
+    breakdown.storage_owner_remote_reverse_ns += elapsed_ns_since(t_remote_reverse);
     return ok;
   }
 
@@ -1033,6 +1087,7 @@ private:
             task.client_id = client_id;
             task.item_count = request->item_count;
             task.batch_id = request->batch_id;
+            task.received_at = std::chrono::steady_clock::now();
             task.payload.assign(payload, payload + bytes);
             {
               std::lock_guard<std::mutex> lock(storage_insert_tasks_mutex_);
@@ -1100,34 +1155,43 @@ private:
 
     const node_t* ids = service::storage_owner::request_ids(payload);
     const element_t* vectors = service::storage_owner::request_vectors(payload, request->item_count);
-    const bool ok = execute_storage_owner_batch_items(ids, vectors, request->item_count, config);
+    InsertBreakdownCounters breakdown{};
+    const bool ok = execute_storage_owner_batch_items(ids, vectors, request->item_count, breakdown, config);
     for (u32 i = 0; i < request->item_count; ++i) {
       statuses[i] = static_cast<u32>(ok ? service::storage_owner::InsertStatus::ok
                                         : service::storage_owner::InsertStatus::failed);
     }
+    *service::storage_owner::response_breakdown(response_ptr, request->item_count) = breakdown;
     return service::storage_owner::insert_batch_response_bytes(request->item_count);
   }
 
   bool execute_storage_owner_batch_items(const node_t* ids,
                                          const element_t* vectors,
                                          size_t item_count,
+                                         InsertBreakdownCounters& breakdown,
                                          const Configuration& config) {
     if (item_count == 0) {
       return true;
     }
 
+    auto t_medoid = std::chrono::steady_clock::now();
     RemotePtr medoid_ptr = read_global_medoid();
+    breakdown.storage_owner_medoid_ns += elapsed_ns_since(t_medoid);
     std::unordered_map<u64, vec<RemotePtr>> local_updates;
     std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
 
     for (size_t idx = 0; idx < item_count; ++idx) {
       const element_t* vec_ptr = vectors + idx * VamanaNode::DIM;
       const auto components = span<const element_t>{vec_ptr, VamanaNode::DIM};
+      auto t_quantize = std::chrono::steady_clock::now();
       const vec<byte_t> rabitq_data = quantize_rabitq_cpu(components, config);
+      breakdown.storage_owner_quantize_ns += elapsed_ns_since(t_quantize);
 
       if (medoid_ptr.is_null()) {
         const RemotePtr new_ptr = allocate_local_node();
+        auto t_write = std::chrono::steady_clock::now();
         write_new_node(new_ptr, ids[idx], components, rabitq_data, {});
+        breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
         RemotePtr observed;
         if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
           medoid_ptr = new_ptr;
@@ -1136,11 +1200,17 @@ private:
         medoid_ptr = observed;
       }
 
+      auto t_search = std::chrono::steady_clock::now();
       const vec<RemotePtr> candidates = beam_search_candidates(components, medoid_ptr, config);
+      breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
       hashset_t<RemotePtr> empty_skip;
+      auto t_prune = std::chrono::steady_clock::now();
       vec<RemotePtr> selected_neighbors = robust_prune_cpu(components, candidates, empty_skip, config);
+      breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
       const RemotePtr new_ptr = allocate_local_node();
+      auto t_write = std::chrono::steady_clock::now();
       write_new_node(new_ptr, ids[idx], components, rabitq_data, selected_neighbors);
+      breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
 
       for (const RemotePtr& neighbor_ptr : selected_neighbors) {
         if (local_shard(neighbor_ptr.memory_node())) {
@@ -1152,16 +1222,20 @@ private:
       }
     }
 
+    auto t_local_reverse = std::chrono::steady_clock::now();
     for (auto& [target_raw, candidates] : local_updates) {
       if (!apply_local_reverse_update(RemotePtr{target_raw}, candidates, config)) {
         return false;
       }
     }
+    breakdown.storage_owner_local_reverse_ns += elapsed_ns_since(t_local_reverse);
+    auto t_remote_reverse = std::chrono::steady_clock::now();
     for (auto& [target_shard, ops] : remote_updates) {
       if (!send_reverse_update_batch(target_shard, ops, config)) {
         return false;
       }
     }
+    breakdown.storage_owner_remote_reverse_ns += elapsed_ns_since(t_remote_reverse);
     return true;
   }
 
@@ -1715,14 +1789,21 @@ private:
                                               StorageOwnerInsertJob& job,
                                               std::unordered_map<u64, vec<RemotePtr>>& local_updates,
                                               std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>>& remote_updates,
+                                              InsertBreakdownCounters& breakdown,
                                               const Configuration& config) -> StorageOwnerInsertCoroutine {
     const auto components = span<const element_t>{job.components.data(), VamanaNode::DIM};
+    auto t_quantize = std::chrono::steady_clock::now();
     const vec<byte_t> rabitq_data = quantize_rabitq_cpu(components, config);
+    breakdown.storage_owner_quantize_ns += elapsed_ns_since(t_quantize);
 
+    auto t_medoid = std::chrono::steady_clock::now();
     RemotePtr medoid_ptr = co_await async_read_global_medoid(thread);
+    breakdown.storage_owner_medoid_ns += elapsed_ns_since(t_medoid);
     if (medoid_ptr.is_null()) {
       const RemotePtr new_ptr = allocate_local_node();
+      auto t_write = std::chrono::steady_clock::now();
       write_new_node(new_ptr, job.id, components, rabitq_data, {});
+      breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
       RemotePtr observed;
       if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
         job.ok = true;
@@ -1731,6 +1812,7 @@ private:
       medoid_ptr = observed;
     }
 
+    auto t_search = std::chrono::steady_clock::now();
     auto search = beam_search_candidates_async(components, medoid_ptr, config, thread);
     co_await std::suspend_always{};
     while (!search.handle.done()) {
@@ -1741,12 +1823,17 @@ private:
       }
     }
     search.handle.destroy();
+    breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
 
     const vec<RemotePtr>& candidates = storage_owner_async_candidates_[thread.id][thread.running_coroutine];
     hashset_t<RemotePtr> empty_skip;
+    auto t_prune = std::chrono::steady_clock::now();
     vec<RemotePtr> selected_neighbors = robust_prune_cpu(components, candidates, empty_skip, config);
+    breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
     const RemotePtr new_ptr = allocate_local_node();
+    auto t_write = std::chrono::steady_clock::now();
     write_new_node(new_ptr, job.id, components, rabitq_data, selected_neighbors);
+    breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
 
     for (const RemotePtr& neighbor_ptr : selected_neighbors) {
       if (local_shard(neighbor_ptr.memory_node())) {

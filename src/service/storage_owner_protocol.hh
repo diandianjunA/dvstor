@@ -35,6 +35,19 @@ struct InsertBatchResponseHeader {
   u64 batch_id{};
 };
 
+struct InsertBreakdownCounters {
+  u64 storage_owner_queue_wait_ns{};
+  u64 storage_owner_quantize_ns{};
+  u64 storage_owner_medoid_ns{};
+  u64 storage_owner_search_ns{};
+  u64 storage_owner_prune_ns{};
+  u64 storage_owner_write_node_ns{};
+  u64 storage_owner_local_reverse_ns{};
+  u64 storage_owner_remote_reverse_ns{};
+  u64 storage_owner_peer_reverse_apply_ns{};
+  u64 storage_owner_response_send_ns{};
+};
+
 struct PeerRpcHeader {
   u32 magic{kPeerRpcMagic};
   u32 type{};
@@ -57,7 +70,9 @@ inline size_t insert_batch_request_bytes(u32 item_count, u32 dim) {
 }
 
 inline size_t insert_batch_response_bytes(u32 item_count) {
-  return sizeof(InsertBatchResponseHeader) + static_cast<size_t>(item_count) * sizeof(u32);
+  return sizeof(InsertBatchResponseHeader) +
+         static_cast<size_t>(item_count) * sizeof(u32) +
+         sizeof(InsertBreakdownCounters);
 }
 
 inline node_t* request_ids(void* payload) {
@@ -82,6 +97,16 @@ inline u32* response_statuses(void* payload) {
 
 inline const u32* response_statuses(const void* payload) {
   return reinterpret_cast<const u32*>(reinterpret_cast<const byte_t*>(payload) + sizeof(InsertBatchResponseHeader));
+}
+
+inline InsertBreakdownCounters* response_breakdown(void* payload, u32 item_count) {
+  return reinterpret_cast<InsertBreakdownCounters*>(
+    reinterpret_cast<byte_t*>(response_statuses(payload) + item_count));
+}
+
+inline const InsertBreakdownCounters* response_breakdown(const void* payload, u32 item_count) {
+  return reinterpret_cast<const InsertBreakdownCounters*>(
+    reinterpret_cast<const byte_t*>(response_statuses(payload) + item_count));
 }
 
 inline size_t reverse_update_request_bytes(u32 item_count) {

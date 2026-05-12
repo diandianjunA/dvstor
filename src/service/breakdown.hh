@@ -65,6 +65,15 @@ enum class Subcategory : u8 {
   cpu_insert_neighbor_prepare,
   cpu_insert_pruned_neighbor_collect,
   cpu_insert_overflow_prepare,
+  cpu_storage_owner_queue_wait,
+  cpu_storage_owner_quantize,
+  cpu_storage_owner_search,
+  cpu_storage_owner_prune,
+  cpu_storage_owner_write_node,
+  cpu_storage_owner_local_reverse,
+  cpu_storage_owner_remote_reverse,
+  cpu_storage_owner_peer_reverse_apply,
+  cpu_storage_owner_response_send,
 
   // GPU
   gpu_query_prepare,
@@ -94,6 +103,7 @@ enum class Subcategory : u8 {
   rdma_overflow_vec_fetch,
   rdma_pruned_neighbor_write,
   rdma_neighbor_unlock,
+  rdma_storage_owner_medoid,
 
   // Transfer
   transfer_query_h2d,
@@ -143,6 +153,15 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "cpu_insert_neighbor_prepare_ns",
   "cpu_insert_pruned_neighbor_collect_ns",
   "cpu_insert_overflow_prepare_ns",
+  "cpu_storage_owner_queue_wait_ns",
+  "cpu_storage_owner_quantize_ns",
+  "cpu_storage_owner_search_ns",
+  "cpu_storage_owner_prune_ns",
+  "cpu_storage_owner_write_node_ns",
+  "cpu_storage_owner_local_reverse_ns",
+  "cpu_storage_owner_remote_reverse_ns",
+  "cpu_storage_owner_peer_reverse_apply_ns",
+  "cpu_storage_owner_response_send_ns",
   "gpu_query_prepare_ns",
   "gpu_query_distance_ns",
   "gpu_query_rerank_ns",
@@ -168,6 +187,7 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "rdma_overflow_vec_fetch_ns",
   "rdma_pruned_neighbor_write_ns",
   "rdma_neighbor_unlock_ns",
+  "rdma_storage_owner_medoid_ns",
   "transfer_query_h2d_ns",
   "transfer_rabitq_h2d_ns",
   "transfer_candidate_h2d_ns",
@@ -217,6 +237,15 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::cpu_insert_neighbor_prepare:
     case Subcategory::cpu_insert_pruned_neighbor_collect:
     case Subcategory::cpu_insert_overflow_prepare:
+    case Subcategory::cpu_storage_owner_queue_wait:
+    case Subcategory::cpu_storage_owner_quantize:
+    case Subcategory::cpu_storage_owner_search:
+    case Subcategory::cpu_storage_owner_prune:
+    case Subcategory::cpu_storage_owner_write_node:
+    case Subcategory::cpu_storage_owner_local_reverse:
+    case Subcategory::cpu_storage_owner_remote_reverse:
+    case Subcategory::cpu_storage_owner_peer_reverse_apply:
+    case Subcategory::cpu_storage_owner_response_send:
       return Category::cpu;
     case Subcategory::gpu_query_prepare:
     case Subcategory::gpu_query_distance:
@@ -244,6 +273,7 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::rdma_overflow_vec_fetch:
     case Subcategory::rdma_pruned_neighbor_write:
     case Subcategory::rdma_neighbor_unlock:
+    case Subcategory::rdma_storage_owner_medoid:
       return Category::rdma;
     case Subcategory::transfer_query_h2d:
     case Subcategory::transfer_rabitq_h2d:
