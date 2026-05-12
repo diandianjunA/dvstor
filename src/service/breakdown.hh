@@ -78,6 +78,13 @@ enum class Subcategory : u8 {
   cpu_storage_owner_batch_wait,
   cpu_storage_owner_request_prepare,
   cpu_storage_owner_response_wait_unaccounted,
+  cpu_storage_owner_search_select,
+  cpu_storage_owner_search_distance,
+  cpu_storage_owner_search_beam_update,
+  cpu_storage_owner_search_result_sort,
+  cpu_storage_owner_prune_distance,
+  cpu_storage_owner_prune_sort,
+  cpu_storage_owner_prune_pair_distance,
 
   // GPU
   gpu_query_prepare,
@@ -109,6 +116,9 @@ enum class Subcategory : u8 {
   rdma_neighbor_unlock,
   rdma_storage_owner_medoid,
   rdma_storage_owner_send,
+  rdma_storage_owner_search_neighbor_read,
+  rdma_storage_owner_search_snapshot_read,
+  rdma_storage_owner_prune_snapshot_read,
 
   // Transfer
   transfer_query_h2d,
@@ -171,6 +181,13 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "cpu_storage_owner_batch_wait_ns",
   "cpu_storage_owner_request_prepare_ns",
   "cpu_storage_owner_response_wait_unaccounted_ns",
+  "cpu_storage_owner_search_select_ns",
+  "cpu_storage_owner_search_distance_ns",
+  "cpu_storage_owner_search_beam_update_ns",
+  "cpu_storage_owner_search_result_sort_ns",
+  "cpu_storage_owner_prune_distance_ns",
+  "cpu_storage_owner_prune_sort_ns",
+  "cpu_storage_owner_prune_pair_distance_ns",
   "gpu_query_prepare_ns",
   "gpu_query_distance_ns",
   "gpu_query_rerank_ns",
@@ -198,6 +215,9 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "rdma_neighbor_unlock_ns",
   "rdma_storage_owner_medoid_ns",
   "rdma_storage_owner_send_ns",
+  "rdma_storage_owner_search_neighbor_read_ns",
+  "rdma_storage_owner_search_snapshot_read_ns",
+  "rdma_storage_owner_prune_snapshot_read_ns",
   "transfer_query_h2d_ns",
   "transfer_rabitq_h2d_ns",
   "transfer_candidate_h2d_ns",
@@ -260,6 +280,13 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::cpu_storage_owner_batch_wait:
     case Subcategory::cpu_storage_owner_request_prepare:
     case Subcategory::cpu_storage_owner_response_wait_unaccounted:
+    case Subcategory::cpu_storage_owner_search_select:
+    case Subcategory::cpu_storage_owner_search_distance:
+    case Subcategory::cpu_storage_owner_search_beam_update:
+    case Subcategory::cpu_storage_owner_search_result_sort:
+    case Subcategory::cpu_storage_owner_prune_distance:
+    case Subcategory::cpu_storage_owner_prune_sort:
+    case Subcategory::cpu_storage_owner_prune_pair_distance:
       return Category::cpu;
     case Subcategory::gpu_query_prepare:
     case Subcategory::gpu_query_distance:
@@ -289,6 +316,9 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::rdma_neighbor_unlock:
     case Subcategory::rdma_storage_owner_medoid:
     case Subcategory::rdma_storage_owner_send:
+    case Subcategory::rdma_storage_owner_search_neighbor_read:
+    case Subcategory::rdma_storage_owner_search_snapshot_read:
+    case Subcategory::rdma_storage_owner_prune_snapshot_read:
       return Category::rdma;
     case Subcategory::transfer_query_h2d:
     case Subcategory::transfer_rabitq_h2d:

@@ -47,6 +47,17 @@ struct InsertBreakdownCounters {
   u64 storage_owner_peer_reverse_apply_ns{};
   u64 storage_owner_response_send_ns{};
 
+  u64 storage_owner_search_select_ns{};
+  u64 storage_owner_search_neighbor_read_ns{};
+  u64 storage_owner_search_snapshot_read_ns{};
+  u64 storage_owner_search_distance_ns{};
+  u64 storage_owner_search_beam_update_ns{};
+  u64 storage_owner_search_result_sort_ns{};
+  u64 storage_owner_prune_snapshot_read_ns{};
+  u64 storage_owner_prune_distance_ns{};
+  u64 storage_owner_prune_sort_ns{};
+  u64 storage_owner_prune_pair_distance_ns{};
+
   u64 total() const {
     return storage_owner_queue_wait_ns +
            storage_owner_quantize_ns +

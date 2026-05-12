@@ -387,6 +387,23 @@ private:
     out.storage_owner_peer_reverse_apply_ns =
       scale_ns(counters.storage_owner_peer_reverse_apply_ns, part, total);
     out.storage_owner_response_send_ns = scale_ns(counters.storage_owner_response_send_ns, part, total);
+    out.storage_owner_search_select_ns = scale_ns(counters.storage_owner_search_select_ns, part, total);
+    out.storage_owner_search_neighbor_read_ns =
+      scale_ns(counters.storage_owner_search_neighbor_read_ns, part, total);
+    out.storage_owner_search_snapshot_read_ns =
+      scale_ns(counters.storage_owner_search_snapshot_read_ns, part, total);
+    out.storage_owner_search_distance_ns = scale_ns(counters.storage_owner_search_distance_ns, part, total);
+    out.storage_owner_search_beam_update_ns =
+      scale_ns(counters.storage_owner_search_beam_update_ns, part, total);
+    out.storage_owner_search_result_sort_ns =
+      scale_ns(counters.storage_owner_search_result_sort_ns, part, total);
+    out.storage_owner_prune_snapshot_read_ns =
+      scale_ns(counters.storage_owner_prune_snapshot_read_ns, part, total);
+    out.storage_owner_prune_distance_ns =
+      scale_ns(counters.storage_owner_prune_distance_ns, part, total);
+    out.storage_owner_prune_sort_ns = scale_ns(counters.storage_owner_prune_sort_ns, part, total);
+    out.storage_owner_prune_pair_distance_ns =
+      scale_ns(counters.storage_owner_prune_pair_distance_ns, part, total);
     return out;
   }
 
@@ -1201,11 +1218,11 @@ private:
       }
 
       auto t_search = std::chrono::steady_clock::now();
-      const vec<RemotePtr> candidates = beam_search_candidates(components, medoid_ptr, config);
+      const vec<RemotePtr> candidates = beam_search_candidates(components, medoid_ptr, config, &breakdown);
       breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
       hashset_t<RemotePtr> empty_skip;
       auto t_prune = std::chrono::steady_clock::now();
-      vec<RemotePtr> selected_neighbors = robust_prune_cpu(components, candidates, empty_skip, config);
+      vec<RemotePtr> selected_neighbors = robust_prune_cpu(components, candidates, empty_skip, config, &breakdown);
       breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
       const RemotePtr new_ptr = allocate_local_node();
       auto t_write = std::chrono::steady_clock::now();
@@ -1639,46 +1656,81 @@ private:
     remote_write_bytes(rptr.memory_node(), rptr.byte_offset() + VamanaNode::HEADER_UNTIL_LOCK, &unlock, 1, 0);
   }
 
-  vec<RemotePtr> beam_search_candidates(const span<const element_t> query, RemotePtr medoid, const Configuration& config) {
+  vec<RemotePtr> beam_search_candidates(const span<const element_t> query,
+                                        RemotePtr medoid,
+                                        const Configuration& config,
+                                        InsertBreakdownCounters* breakdown = nullptr) {
     hashset_t<RemotePtr> visited;
     vec<BeamEntry> beam;
 
     NodeSnapshot medoid_snapshot;
+    auto t_snapshot = std::chrono::steady_clock::now();
     read_node_snapshot(medoid, medoid_snapshot);
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snapshot);
+    }
+    auto t_distance = std::chrono::steady_clock::now();
     const distance_t medoid_dist = distance_fn()(query, medoid_snapshot.components, config.dim);
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_distance_ns += elapsed_ns_since(t_distance);
+    }
     beam.push_back({medoid, medoid_dist, false});
     visited.insert(medoid);
 
     for (;;) {
       i32 best_idx = -1;
       distance_t best_dist = std::numeric_limits<distance_t>::max();
+      auto t_select = std::chrono::steady_clock::now();
       for (i32 i = 0; i < static_cast<i32>(beam.size()); ++i) {
         if (!beam[i].expanded && beam[i].distance < best_dist) {
           best_dist = beam[i].distance;
           best_idx = i;
         }
       }
+      if (breakdown != nullptr) {
+        breakdown->storage_owner_search_select_ns += elapsed_ns_since(t_select);
+      }
       if (best_idx < 0) {
         break;
       }
 
       beam[best_idx].expanded = true;
+      auto t_neighbor_read = std::chrono::steady_clock::now();
       const vec<RemotePtr> neighbors = read_neighbor_list(beam[best_idx].rptr);
+      if (breakdown != nullptr) {
+        breakdown->storage_owner_search_neighbor_read_ns += elapsed_ns_since(t_neighbor_read);
+      }
       for (const RemotePtr& neighbor : neighbors) {
         if (neighbor.is_null() || visited.contains(neighbor)) {
           continue;
         }
         visited.insert(neighbor);
         NodeSnapshot snapshot;
+        t_snapshot = std::chrono::steady_clock::now();
         read_node_snapshot(neighbor, snapshot);
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snapshot);
+        }
+        t_distance = std::chrono::steady_clock::now();
         const distance_t dist = distance_fn()(query, snapshot.components, config.dim);
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_distance_ns += elapsed_ns_since(t_distance);
+        }
+        auto t_beam_update = std::chrono::steady_clock::now();
         insert_into_beam(beam, neighbor, dist, config.beam_width_construction);
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_beam_update_ns += elapsed_ns_since(t_beam_update);
+        }
       }
     }
 
     vec<RemotePtr> candidates;
     candidates.reserve(beam.size());
+    auto t_sort = std::chrono::steady_clock::now();
     std::sort(beam.begin(), beam.end(), [](const BeamEntry& lhs, const BeamEntry& rhs) { return lhs.distance < rhs.distance; });
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_result_sort_ns += elapsed_ns_since(t_sort);
+    }
     for (const auto& entry : beam) {
       candidates.push_back(entry.rptr);
     }
@@ -1688,45 +1740,78 @@ private:
   auto beam_search_candidates_async(const span<const element_t> query,
                                     RemotePtr medoid,
                                     const Configuration& config,
-                                    StorageOwnerThread& thread) -> StorageOwnerInsertCoroutine {
+                                    StorageOwnerThread& thread,
+                                    InsertBreakdownCounters* breakdown = nullptr) -> StorageOwnerInsertCoroutine {
     hashset_t<RemotePtr> visited;
     vec<BeamEntry> beam;
 
+    auto t_snapshot = std::chrono::steady_clock::now();
     NodeSnapshot medoid_snapshot = co_await async_read_node_snapshot(medoid, thread);
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snapshot);
+    }
+    auto t_distance = std::chrono::steady_clock::now();
     const distance_t medoid_dist = distance_fn()(query, medoid_snapshot.components, config.dim);
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_distance_ns += elapsed_ns_since(t_distance);
+    }
     beam.push_back({medoid, medoid_dist, false});
     visited.insert(medoid);
 
     for (;;) {
       i32 best_idx = -1;
       distance_t best_dist = std::numeric_limits<distance_t>::max();
+      auto t_select = std::chrono::steady_clock::now();
       for (i32 i = 0; i < static_cast<i32>(beam.size()); ++i) {
         if (!beam[i].expanded && beam[i].distance < best_dist) {
           best_dist = beam[i].distance;
           best_idx = i;
         }
       }
+      if (breakdown != nullptr) {
+        breakdown->storage_owner_search_select_ns += elapsed_ns_since(t_select);
+      }
       if (best_idx < 0) {
         break;
       }
 
       beam[best_idx].expanded = true;
+      auto t_neighbor_read = std::chrono::steady_clock::now();
       const vec<RemotePtr> neighbors = co_await async_read_neighbor_list(beam[best_idx].rptr, thread);
+      if (breakdown != nullptr) {
+        breakdown->storage_owner_search_neighbor_read_ns += elapsed_ns_since(t_neighbor_read);
+      }
       for (const RemotePtr& neighbor : neighbors) {
         if (neighbor.is_null() || visited.contains(neighbor)) {
           continue;
         }
         visited.insert(neighbor);
+        t_snapshot = std::chrono::steady_clock::now();
         NodeSnapshot snapshot = co_await async_read_node_snapshot(neighbor, thread);
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snapshot);
+        }
+        t_distance = std::chrono::steady_clock::now();
         const distance_t dist = distance_fn()(query, snapshot.components, config.dim);
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_distance_ns += elapsed_ns_since(t_distance);
+        }
+        auto t_beam_update = std::chrono::steady_clock::now();
         insert_into_beam(beam, neighbor, dist, config.beam_width_construction);
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_beam_update_ns += elapsed_ns_since(t_beam_update);
+        }
       }
     }
 
     auto& out = storage_owner_async_candidates_[thread.id][thread.running_coroutine];
     out.clear();
     out.reserve(beam.size());
+    auto t_sort = std::chrono::steady_clock::now();
     std::sort(beam.begin(), beam.end(), [](const BeamEntry& lhs, const BeamEntry& rhs) { return lhs.distance < rhs.distance; });
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_result_sort_ns += elapsed_ns_since(t_sort);
+    }
     for (const auto& entry : beam) {
       out.push_back(entry.rptr);
     }
@@ -1735,7 +1820,8 @@ private:
   vec<RemotePtr> robust_prune_cpu(const span<const element_t> source,
                                   const vec<RemotePtr>& candidates,
                                   const hashset_t<RemotePtr>& skip,
-                                  const Configuration& config) {
+                                  const Configuration& config,
+                                  InsertBreakdownCounters* breakdown = nullptr) {
     struct CandidateInfo {
       RemotePtr rptr;
       distance_t dist{};
@@ -1749,13 +1835,26 @@ private:
         continue;
       }
       NodeSnapshot snapshot;
+      auto t_snapshot = std::chrono::steady_clock::now();
       read_node_snapshot(candidate, snapshot);
-      infos.push_back({candidate, distance_fn()(source, snapshot.components, config.dim), std::move(snapshot.components)});
+      if (breakdown != nullptr) {
+        breakdown->storage_owner_prune_snapshot_read_ns += elapsed_ns_since(t_snapshot);
+      }
+      auto t_distance = std::chrono::steady_clock::now();
+      const distance_t dist = distance_fn()(source, snapshot.components, config.dim);
+      if (breakdown != nullptr) {
+        breakdown->storage_owner_prune_distance_ns += elapsed_ns_since(t_distance);
+      }
+      infos.push_back({candidate, dist, std::move(snapshot.components)});
     }
 
+    auto t_sort = std::chrono::steady_clock::now();
     std::sort(infos.begin(), infos.end(), [](const CandidateInfo& lhs, const CandidateInfo& rhs) {
       return lhs.dist < rhs.dist;
     });
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_prune_sort_ns += elapsed_ns_since(t_sort);
+    }
 
     vec<RemotePtr> selected;
     selected.reserve(config.R);
@@ -1769,7 +1868,11 @@ private:
 
       bool pruned = false;
       for (idx_t i = 0; i < selected_components.size(); ++i) {
+        auto t_pair_distance = std::chrono::steady_clock::now();
         const distance_t pair_dist = distance_fn()(candidate.components, selected_components[i], config.dim);
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_prune_pair_distance_ns += elapsed_ns_since(t_pair_distance);
+        }
         if (config.alpha * pair_dist <= candidate.dist) {
           pruned = true;
           break;
@@ -1813,7 +1916,7 @@ private:
     }
 
     auto t_search = std::chrono::steady_clock::now();
-    auto search = beam_search_candidates_async(components, medoid_ptr, config, thread);
+    auto search = beam_search_candidates_async(components, medoid_ptr, config, thread, &breakdown);
     co_await std::suspend_always{};
     while (!search.handle.done()) {
       if (thread.is_ready(thread.running_coroutine)) {
@@ -1828,7 +1931,7 @@ private:
     const vec<RemotePtr>& candidates = storage_owner_async_candidates_[thread.id][thread.running_coroutine];
     hashset_t<RemotePtr> empty_skip;
     auto t_prune = std::chrono::steady_clock::now();
-    vec<RemotePtr> selected_neighbors = robust_prune_cpu(components, candidates, empty_skip, config);
+    vec<RemotePtr> selected_neighbors = robust_prune_cpu(components, candidates, empty_skip, config, &breakdown);
     breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
     const RemotePtr new_ptr = allocate_local_node();
     auto t_write = std::chrono::steady_clock::now();
