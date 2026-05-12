@@ -46,6 +46,19 @@ struct InsertBreakdownCounters {
   u64 storage_owner_remote_reverse_ns{};
   u64 storage_owner_peer_reverse_apply_ns{};
   u64 storage_owner_response_send_ns{};
+
+  u64 total() const {
+    return storage_owner_queue_wait_ns +
+           storage_owner_quantize_ns +
+           storage_owner_medoid_ns +
+           storage_owner_search_ns +
+           storage_owner_prune_ns +
+           storage_owner_write_node_ns +
+           storage_owner_local_reverse_ns +
+           storage_owner_remote_reverse_ns +
+           storage_owner_peer_reverse_apply_ns +
+           storage_owner_response_send_ns;
+  }
 };
 
 struct PeerRpcHeader {

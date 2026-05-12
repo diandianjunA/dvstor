@@ -74,6 +74,10 @@ enum class Subcategory : u8 {
   cpu_storage_owner_remote_reverse,
   cpu_storage_owner_peer_reverse_apply,
   cpu_storage_owner_response_send,
+  cpu_storage_owner_sender_queue_wait,
+  cpu_storage_owner_batch_wait,
+  cpu_storage_owner_request_prepare,
+  cpu_storage_owner_response_wait_unaccounted,
 
   // GPU
   gpu_query_prepare,
@@ -104,6 +108,7 @@ enum class Subcategory : u8 {
   rdma_pruned_neighbor_write,
   rdma_neighbor_unlock,
   rdma_storage_owner_medoid,
+  rdma_storage_owner_send,
 
   // Transfer
   transfer_query_h2d,
@@ -162,6 +167,10 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "cpu_storage_owner_remote_reverse_ns",
   "cpu_storage_owner_peer_reverse_apply_ns",
   "cpu_storage_owner_response_send_ns",
+  "cpu_storage_owner_sender_queue_wait_ns",
+  "cpu_storage_owner_batch_wait_ns",
+  "cpu_storage_owner_request_prepare_ns",
+  "cpu_storage_owner_response_wait_unaccounted_ns",
   "gpu_query_prepare_ns",
   "gpu_query_distance_ns",
   "gpu_query_rerank_ns",
@@ -188,6 +197,7 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "rdma_pruned_neighbor_write_ns",
   "rdma_neighbor_unlock_ns",
   "rdma_storage_owner_medoid_ns",
+  "rdma_storage_owner_send_ns",
   "transfer_query_h2d_ns",
   "transfer_rabitq_h2d_ns",
   "transfer_candidate_h2d_ns",
@@ -246,6 +256,10 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::cpu_storage_owner_remote_reverse:
     case Subcategory::cpu_storage_owner_peer_reverse_apply:
     case Subcategory::cpu_storage_owner_response_send:
+    case Subcategory::cpu_storage_owner_sender_queue_wait:
+    case Subcategory::cpu_storage_owner_batch_wait:
+    case Subcategory::cpu_storage_owner_request_prepare:
+    case Subcategory::cpu_storage_owner_response_wait_unaccounted:
       return Category::cpu;
     case Subcategory::gpu_query_prepare:
     case Subcategory::gpu_query_distance:
@@ -274,6 +288,7 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::rdma_pruned_neighbor_write:
     case Subcategory::rdma_neighbor_unlock:
     case Subcategory::rdma_storage_owner_medoid:
+    case Subcategory::rdma_storage_owner_send:
       return Category::rdma;
     case Subcategory::transfer_query_h2d:
     case Subcategory::transfer_rabitq_h2d:

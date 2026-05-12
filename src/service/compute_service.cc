@@ -32,6 +32,19 @@ u64 per_item_ns(u64 total, u32 item_count) {
   return item_count == 0 ? 0 : total / item_count;
 }
 
+u64 duration_ns(std::chrono::steady_clock::time_point start,
+                std::chrono::steady_clock::time_point end) {
+  return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
+}
+
+u64 duration_ns_clamped(std::chrono::steady_clock::time_point start,
+                        std::chrono::steady_clock::time_point end) {
+  if (end <= start) {
+    return 0;
+  }
+  return duration_ns(start, end);
+}
+
 void add_storage_owner_breakdown(
     const std::shared_ptr<service::breakdown::Sample>& sample,
     const service::storage_owner::InsertBreakdownCounters& counters,
@@ -59,6 +72,29 @@ void add_storage_owner_breakdown(
                           per_item_ns(counters.storage_owner_peer_reverse_apply_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_response_send,
                           per_item_ns(counters.storage_owner_response_send_ns, item_count));
+}
+
+void add_storage_owner_sender_breakdown(
+    const std::shared_ptr<service::breakdown::Sample>& sample,
+    u64 sender_queue_wait_ns,
+    u64 batch_wait_ns,
+    u64 request_prepare_ns,
+    u64 send_ns,
+    u64 response_wait_unaccounted_ns,
+    u32 item_count) {
+  if (!sample) {
+    return;
+  }
+  sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_sender_queue_wait,
+                          sender_queue_wait_ns);
+  sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_batch_wait,
+                          batch_wait_ns);
+  sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_request_prepare,
+                          per_item_ns(request_prepare_ns, item_count));
+  sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_send,
+                          per_item_ns(send_ns, item_count));
+  sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_response_wait_unaccounted,
+                          per_item_ns(response_wait_unaccounted_ns, item_count));
 }
 
 }  // namespace
@@ -213,6 +249,7 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
         auto task = std::make_unique<StorageInsertTask>();
         task->item = item;
         task->sample = sample;
+        task->enqueued_at = std::chrono::steady_clock::now();
         futures.push_back(task->result.get_future());
         samples.push_back(sample);
         const u32 owner_storage = num_servers_ == 0 ? 0 : static_cast<u32>(item.id % num_servers_);
@@ -323,6 +360,8 @@ void ComputeService<Distance>::run_storage_insert_runtime() {
   for (;;) {
     u32 owner_storage = 0;
     vec<std::unique_ptr<StorageInsertTask>> owned_tasks;
+    u64 batch_wait_ns = 0;
+    auto owner_selected_at = std::chrono::steady_clock::now();
     {
       std::unique_lock<std::mutex> lock(storage_insert_mutex_);
       storage_insert_cv_.wait(lock, [&]() {
@@ -347,23 +386,27 @@ void ComputeService<Distance>::run_storage_insert_runtime() {
       if (!found) {
         continue;
       }
+      owner_selected_at = std::chrono::steady_clock::now();
 
       if (config_.storage_owner_batch_wait_us > 0 &&
           storage_insert_owner_queues_[owner_storage].size() < config_.storage_owner_batch_max) {
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::microseconds(config_.storage_owner_batch_wait_us);
+        const auto batch_wait_start = std::chrono::steady_clock::now();
         while (storage_insert_owner_queues_[owner_storage].size() < config_.storage_owner_batch_max &&
                !storage_insert_shutdown_.load(std::memory_order_acquire)) {
           if (storage_insert_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
             break;
           }
         }
+        batch_wait_ns = duration_ns(batch_wait_start, std::chrono::steady_clock::now());
       }
 
       const size_t batch_size =
         std::min<size_t>(storage_insert_owner_queues_[owner_storage].size(), config_.storage_owner_batch_max);
       owned_tasks.reserve(batch_size);
       for (size_t i = 0; i < batch_size; ++i) {
+        storage_insert_owner_queues_[owner_storage].front()->sender_dequeued_at = owner_selected_at;
         owned_tasks.push_back(std::move(storage_insert_owner_queues_[owner_storage].front()));
         storage_insert_owner_queues_[owner_storage].pop_front();
       }
@@ -379,7 +422,7 @@ void ComputeService<Distance>::run_storage_insert_runtime() {
     }
 
     try {
-      send_storage_owner_batch(owner_storage, task_ptrs, samples);
+      send_storage_owner_batch(owner_storage, task_ptrs, samples, batch_wait_ns);
     } catch (...) {
       const auto finished_at = std::chrono::steady_clock::now();
       for (StorageInsertTask* task : task_ptrs) {
@@ -396,13 +439,15 @@ template <class Distance>
 size_t ComputeService<Distance>::send_storage_owner_batch(
     u32 owner_storage,
     const vec<StorageInsertTask*>& tasks,
-    const vec<std::shared_ptr<service::breakdown::Sample>>& samples) {
+    const vec<std::shared_ptr<service::breakdown::Sample>>& samples,
+    u64 batch_wait_ns) {
   if (tasks.empty()) {
     return 0;
   }
 
   const u32 item_count = static_cast<u32>(tasks.size());
   const u64 batch_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
+  const auto prepare_start = std::chrono::steady_clock::now();
   const size_t request_size = service::storage_owner::insert_batch_request_bytes(item_count, config_.dim);
   const size_t response_size = service::storage_owner::insert_batch_response_bytes(item_count);
   vec<byte_t> request_buffer(request_size);
@@ -427,8 +472,10 @@ size_t ComputeService<Distance>::send_storage_owner_batch(
 
   LocalMemoryRegion request_region{context_, request_buffer.data(), request_buffer.size()};
   LocalMemoryRegion response_region{context_, response_buffer.data(), response_buffer.size()};
+  const u64 request_prepare_ns = duration_ns(prepare_start, std::chrono::steady_clock::now());
 
   auto& qp = *cm_.server_qps[owner_storage];
+  const auto send_start = std::chrono::steady_clock::now();
   qp.post_receive(response_region, static_cast<u32>(response_size));
   qp.post_send(request_region,
                static_cast<u32>(request_size),
@@ -438,7 +485,10 @@ size_t ComputeService<Distance>::send_storage_owner_batch(
                0,
                0);
   context_.poll_send_cq_until_completion();
+  const u64 send_ns = duration_ns(send_start, std::chrono::steady_clock::now());
+  const auto response_wait_start = std::chrono::steady_clock::now();
   context_.receive();
+  const u64 response_wait_ns = duration_ns(response_wait_start, std::chrono::steady_clock::now());
 
   const auto* response =
     reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(response_buffer.data());
@@ -450,6 +500,9 @@ size_t ComputeService<Distance>::send_storage_owner_batch(
   const auto* breakdown = response_ok
                             ? service::storage_owner::response_breakdown(response_buffer.data(), item_count)
                             : nullptr;
+  const u64 memory_breakdown_ns = breakdown == nullptr ? 0 : breakdown->total();
+  const u64 response_wait_unaccounted_ns =
+    response_wait_ns > memory_breakdown_ns ? response_wait_ns - memory_breakdown_ns : 0;
   const auto finished_at = std::chrono::steady_clock::now();
 
   size_t inserted = 0;
@@ -458,6 +511,14 @@ size_t ComputeService<Distance>::send_storage_owner_batch(
                     statuses[i] == static_cast<u32>(service::storage_owner::InsertStatus::ok);
     inserted += ok ? 1u : 0u;
     if (samples[i]) {
+      add_storage_owner_sender_breakdown(
+        samples[i],
+        duration_ns_clamped(tasks[i]->enqueued_at, tasks[i]->sender_dequeued_at),
+        per_item_ns(batch_wait_ns, item_count),
+        request_prepare_ns,
+        send_ns,
+        response_wait_unaccounted_ns,
+        item_count);
       if (breakdown) {
         add_storage_owner_breakdown(samples[i], *breakdown, item_count);
       }

@@ -110,6 +110,8 @@ private:
     InsertItem item;
     std::shared_ptr<service::breakdown::Sample> sample;
     std::promise<bool> result;
+    std::chrono::steady_clock::time_point enqueued_at{};
+    std::chrono::steady_clock::time_point sender_dequeued_at{};
   };
 
   void init_remote_tokens();
@@ -131,7 +133,8 @@ private:
   void run_storage_insert_runtime();
   size_t send_storage_owner_batch(u32 owner_storage,
                                   const vec<StorageInsertTask*>& tasks,
-                                  const vec<std::shared_ptr<service::breakdown::Sample>>& samples);
+                                  const vec<std::shared_ptr<service::breakdown::Sample>>& samples,
+                                  u64 batch_wait_ns);
   bool routing_enabled() const;
   size_t rpc_message_size() const;
   vec<element_t> compute_local_routing_centroid() const;
