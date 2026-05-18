@@ -679,6 +679,11 @@ private:
       thread->cache.init(cache_bytes_per_worker);
       storage_owner_threads_.push_back(std::move(thread));
     }
+    storage_owner_async_candidates_.clear();
+    storage_owner_async_candidates_.resize(worker_count);
+    for (auto& worker_candidates : storage_owner_async_candidates_) {
+      worker_candidates.resize(coroutines_per_worker);
+    }
     for (u32 i = 0; i < worker_count; ++i) {
       storage_insert_workers_.emplace_back([this, i]() { storage_owner_insert_worker_loop(i); });
     }
@@ -781,6 +786,7 @@ private:
     lib_assert(bytes <= peer_rpc_runtime_.message_bytes, "peer rpc message too large");
     const u64 wr_id = next_peer_sync_wr_id();
     const size_t offset = peer_rpc_runtime_.recv_region_bytes + static_cast<size_t>(peer_id) * peer_rpc_runtime_.message_bytes;
+    std::lock_guard<std::mutex> rpc_send_lock(peer_rpc_send_mutex_);
     std::memcpy(peer_rpc_runtime_.buffer.get_full_buffer() + offset, payload, bytes);
     {
       std::lock_guard<std::mutex> send_lock(peer_send_mutex_);
@@ -826,7 +832,7 @@ private:
     return success;
   }
 
-  bool pump_peer_rpcs(const Configuration& config, bool wait_for_event = false) {
+  bool pump_peer_rpcs_locked(const Configuration& config, bool wait_for_event = false) {
     if (!peer_context_) {
       return false;
     }
@@ -864,7 +870,17 @@ private:
     return progressed;
   }
 
-  bool wait_for_peer_reverse_update_response(u64 request_id, const Configuration& config) {
+  bool pump_peer_rpcs(const Configuration& config, bool wait_for_event = false) {
+    std::unique_lock<std::mutex> rpc_lock(peer_rpc_mutex_, std::defer_lock);
+    if (wait_for_event) {
+      rpc_lock.lock();
+    } else if (!rpc_lock.try_lock()) {
+      return false;
+    }
+    return pump_peer_rpcs_locked(config, wait_for_event);
+  }
+
+  bool wait_for_peer_reverse_update_response_locked(u64 request_id, const Configuration& config) {
     for (;;) {
       const auto it = peer_rpc_responses_.find(request_id);
       if (it != peer_rpc_responses_.end()) {
@@ -872,7 +888,7 @@ private:
         peer_rpc_responses_.erase(it);
         return success;
       }
-      if (!pump_peer_rpcs(config, false)) {
+      if (!pump_peer_rpcs_locked(config, false)) {
         std::this_thread::yield();
       }
     }
@@ -885,6 +901,7 @@ private:
       return true;
     }
 
+    std::lock_guard<std::mutex> rpc_lock(peer_rpc_mutex_);
     const u32 max_items = std::max<u32>(1, config.R * config.storage_owner_batch_max);
     for (size_t begin = 0; begin < ops.size(); begin += max_items) {
       const u32 item_count = static_cast<u32>(std::min<size_t>(ops.size() - begin, max_items));
@@ -899,7 +916,7 @@ private:
       auto* payload_ops = service::storage_owner::reverse_update_ops(message.data());
       std::memcpy(payload_ops, ops.data() + begin, static_cast<size_t>(item_count) * sizeof(service::storage_owner::ReverseUpdateOp));
       send_peer_rpc_message(target_shard, message.data(), bytes);
-      if (!wait_for_peer_reverse_update_response(header->request_id, config)) {
+      if (!wait_for_peer_reverse_update_response_locked(header->request_id, config)) {
         return false;
       }
     }
@@ -1001,10 +1018,10 @@ private:
     std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
 
     const u32 coroutine_count = static_cast<u32>(std::max<size_t>(1, thread.post_balances.size()));
-    if (storage_owner_async_candidates_.size() <= thread.id) {
-      storage_owner_async_candidates_.resize(thread.id + 1);
-    }
-    storage_owner_async_candidates_[thread.id].resize(coroutine_count);
+    lib_assert(thread.id < storage_owner_async_candidates_.size(),
+               "storage_owner async candidate slots not initialized for worker");
+    lib_assert(storage_owner_async_candidates_[thread.id].size() >= coroutine_count,
+               "storage_owner async candidate slots not initialized for coroutines");
 
     thread.coroutines.clear();
     thread.coroutines.reserve(coroutine_count);
@@ -2493,6 +2510,8 @@ private:
   std::unique_ptr<LocalMemoryRegion> peer_scratch_region_;
   PeerRpcRuntimeState peer_rpc_runtime_;
   std::unordered_map<u64, service::storage_owner::PeerRpcHeader> peer_rpc_responses_;
+  std::mutex peer_rpc_mutex_;
+  std::mutex peer_rpc_send_mutex_;
   std::mutex peer_send_mutex_;
   vec<ibv_wc> peer_send_wcs_;
   std::unordered_set<u64> peer_sync_completions_;
