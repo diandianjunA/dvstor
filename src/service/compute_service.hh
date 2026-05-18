@@ -114,6 +114,39 @@ private:
     std::chrono::steady_clock::time_point sender_dequeued_at{};
   };
 
+  struct StorageOwnerRpcSlot {
+    u32 owner_storage{};
+    u32 slot_id{};
+    bool in_use{false};
+    bool send_done{false};
+    bool response_done{false};
+    bool results_completed{false};
+    u32 item_count{};
+    u64 batch_id{};
+    u64 batch_wait_ns{};
+    u64 request_prepare_ns{};
+    size_t request_size{};
+    size_t response_size{};
+    std::chrono::steady_clock::time_point send_posted_at{};
+    std::chrono::steady_clock::time_point send_completed_at{};
+    std::chrono::steady_clock::time_point response_completed_at{};
+    vec<byte_t> request_buffer;
+    vec<byte_t> response_buffer;
+    std::unique_ptr<LocalMemoryRegion> request_region;
+    std::unique_ptr<LocalMemoryRegion> response_region;
+    vec<std::unique_ptr<StorageInsertTask>> tasks;
+    vec<std::shared_ptr<service::breakdown::Sample>> samples;
+  };
+
+  struct StorageOwnerSenderState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::unique_ptr<StorageInsertTask>> queue;
+    vec<StorageOwnerRpcSlot> slots;
+    std::deque<u32> free_slots;
+    std::thread thread;
+  };
+
   void init_remote_tokens();
   void receive_remote_access_tokens();
   void wait_for_load_or_store();
@@ -130,11 +163,17 @@ private:
   vec<node_t> search_local(const vec<element_t>& query, u32 k);
   void start_storage_insert_runtime();
   void stop_storage_insert_runtime();
-  void run_storage_insert_runtime();
-  size_t send_storage_owner_batch(u32 owner_storage,
-                                  const vec<StorageInsertTask*>& tasks,
-                                  const vec<std::shared_ptr<service::breakdown::Sample>>& samples,
-                                  u64 batch_wait_ns);
+  void run_storage_insert_sender(u32 owner_storage);
+  void run_storage_insert_completion_loop();
+  void post_storage_owner_batch(u32 owner_storage,
+                                u32 slot_id,
+                                vec<std::unique_ptr<StorageInsertTask>>&& tasks,
+                                u64 batch_wait_ns);
+  void handle_storage_owner_send_completion(u32 owner_storage, u32 slot_id);
+  void handle_storage_owner_response(u32 owner_storage, u32 slot_id);
+  void maybe_release_storage_owner_slot_locked(StorageOwnerSenderState& state,
+                                               StorageOwnerRpcSlot& slot);
+  void fail_storage_owner_tasks(vec<std::unique_ptr<StorageInsertTask>>& tasks);
   bool routing_enabled() const;
   size_t rpc_message_size() const;
   vec<element_t> compute_local_routing_centroid() const;
@@ -175,8 +214,6 @@ private:
   std::atomic<size_t> vectors_inserted_{0};
 
   std::mutex mn_command_mutex_;
-  std::mutex storage_insert_mutex_;
-  std::condition_variable storage_insert_cv_;
   std::atomic<bool> workers_paused_{false};
   std::atomic<u32> workers_idle_count_{0};
   std::atomic<bool> stopped_{false};
@@ -192,10 +229,11 @@ private:
   service::QueryQueue query_queue_;
   vec<std::thread> workers_;
   std::thread rpc_thread_;
-  std::thread storage_insert_thread_;
+  std::thread storage_insert_completion_thread_;
   std::atomic<bool> storage_insert_shutdown_{false};
-  vec<std::deque<std::unique_ptr<StorageInsertTask>>> storage_insert_owner_queues_;
-  u32 storage_insert_rr_owner_{0};
+  std::atomic<bool> storage_insert_senders_done_{false};
+  std::atomic<u32> storage_insert_inflight_{0};
+  vec<std::unique_ptr<StorageOwnerSenderState>> storage_insert_owners_;
 
   std::unique_ptr<byte_t[]> rpc_buffer_;
   std::unique_ptr<LocalMemoryRegion> rpc_region_;

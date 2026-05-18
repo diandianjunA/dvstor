@@ -194,6 +194,7 @@ private:
     std::unique_ptr<LocalMemoryRegion> region;
     size_t request_bytes{};
     size_t response_offset{};
+    u32 request_slot_count{1};
   };
 
   struct PeerRpcRuntimeState {
@@ -645,10 +646,15 @@ private:
     const size_t insert_request_bytes =
       align_up(service::storage_owner::insert_batch_request_bytes(config.storage_owner_batch_max, VamanaNode::DIM));
     insert_runtime_.request_bytes = insert_request_bytes;
+    insert_runtime_.request_slot_count = std::max<u32>(1, config.storage_owner_rpc_depth);
     const size_t insert_response_bytes =
       align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max));
-    insert_runtime_.response_offset = insert_runtime_.request_bytes * num_clients_;
-    insert_runtime_.buffer.allocate(insert_runtime_.response_offset + insert_response_bytes * num_clients_);
+    const size_t slot_count =
+      static_cast<size_t>(num_clients_) * insert_runtime_.request_slot_count;
+    lib_assert(slot_count <= static_cast<size_t>(config.max_recv_queue_wr),
+               "storage_owner RPC receive slots exceed memory-node receive CQ capacity");
+    insert_runtime_.response_offset = insert_runtime_.request_bytes * slot_count;
+    insert_runtime_.buffer.allocate(insert_runtime_.response_offset + insert_response_bytes * slot_count);
     insert_runtime_.buffer.touch_memory();
     insert_runtime_.region = std::make_unique<LocalMemoryRegion>(
       context_, insert_runtime_.buffer.get_full_buffer(), insert_runtime_.buffer.buffer_size);
@@ -1062,16 +1068,30 @@ private:
     co_return;
   }
 
+  size_t insert_request_slot_offset(u32 client_id, u32 slot_id) const {
+    const size_t slot_index =
+      static_cast<size_t>(client_id) * insert_runtime_.request_slot_count + slot_id;
+    return slot_index * insert_runtime_.request_bytes;
+  }
+
+  size_t insert_response_slot_offset(const Configuration& config, u32 client_id, u32 slot_id) const {
+    const size_t slot_index =
+      static_cast<size_t>(client_id) * insert_runtime_.request_slot_count + slot_id;
+    return insert_runtime_.response_offset + slot_index * response_slot_bytes(config);
+  }
+
   void service_storage_runtime(const Configuration& config) {
     print_status("storage-owner insert runtime enabled on shard " + std::to_string(storage_id_));
     vec<ibv_wc> recv_wcs(std::max<i32>(1, config.max_recv_queue_wr));
 
     for (u32 client_id = 0; client_id < num_clients_; ++client_id) {
-      cm_.client_qps[client_id]->post_receive(
-        *insert_runtime_.region,
-        static_cast<u32>(insert_runtime_.request_bytes),
-        client_id,
-        static_cast<u64>(client_id) * insert_runtime_.request_bytes);
+      for (u32 slot_id = 0; slot_id < insert_runtime_.request_slot_count; ++slot_id) {
+        cm_.client_qps[client_id]->post_receive(
+          *insert_runtime_.region,
+          static_cast<u32>(insert_runtime_.request_bytes),
+          encode_64bit(client_id, slot_id),
+          insert_request_slot_offset(client_id, slot_id));
+      }
     }
 
     for (;;) {
@@ -1086,8 +1106,11 @@ private:
       }
 
       for (i32 i = 0; i < num_received; ++i) {
-        const u32 client_id = static_cast<u32>(recv_wcs[i].wr_id);
-        const size_t offset = static_cast<size_t>(client_id) * insert_runtime_.request_bytes;
+        const auto [client_id, slot_id] = decode_64bit(recv_wcs[i].wr_id);
+        if (client_id >= num_clients_ || slot_id >= insert_runtime_.request_slot_count) {
+          continue;
+        }
+        const size_t offset = insert_request_slot_offset(client_id, slot_id);
         const byte_t* payload = insert_runtime_.buffer.get_full_buffer() + offset;
         const size_t bytes = recv_wcs[i].byte_len;
 
@@ -1118,8 +1141,8 @@ private:
         cm_.client_qps[client_id]->post_receive(
           *insert_runtime_.region,
           static_cast<u32>(insert_runtime_.request_bytes),
-          client_id,
-          static_cast<u64>(client_id) * insert_runtime_.request_bytes);
+          encode_64bit(client_id, slot_id),
+          insert_request_slot_offset(client_id, slot_id));
 
         if (handled_async) {
           continue;
@@ -1135,7 +1158,7 @@ private:
           true,
           nullptr,
           0,
-          insert_runtime_.response_offset + static_cast<size_t>(client_id) * response_slot_bytes(config));
+          insert_response_slot_offset(config, client_id, slot_id));
         context_.poll_send_cq_until_completion();
       }
     }
