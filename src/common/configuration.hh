@@ -160,7 +160,7 @@ private:
       "Per-memory-node storage_owner local metadata/vector/neighbor cache size in MB. 0 disables it.")(
       "storage-owner-peer-rdma-tokens",
       po::value<u32>(&storage_owner_peer_rdma_tokens)->default_value(storage_owner_peer_rdma_tokens),
-      "Maximum storage-owner peer RDMA reads allowed per peer QP. Capped by QP max_rd_atomic.")(
+      "Maximum storage-owner peer RDMA reads allowed per peer QP. Capped by the memory-node safety limit.")(
       "storage-owner-rpc-depth",
       po::value<u32>(&storage_owner_rpc_depth)->default_value(storage_owner_rpc_depth),
       "Maximum in-flight storage_owner insert batches per storage node.")(

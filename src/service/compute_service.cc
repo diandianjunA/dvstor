@@ -304,12 +304,16 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
     size_t inserted = 0;
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(config_.storage_owner_rpc_timeout_ms);
-    for (auto& future : futures) {
+    for (size_t i = 0; i < futures.size(); ++i) {
+      auto& future = futures[i];
       if (future.wait_until(deadline) != std::future_status::ready) {
         const u32 log_index = storage_insert_timeout_logs_.fetch_add(1, std::memory_order_relaxed);
         if (log_index < 8) {
           std::cerr << "[storage-owner] insert RPC timed out after "
                     << config_.storage_owner_rpc_timeout_ms << " ms" << std::endl;
+        }
+        if (samples[i] && !samples[i]->finished_flag) {
+          samples[i]->mark_finished(std::chrono::steady_clock::now(), statistics::ThreadStatistics{});
         }
         continue;
       }
@@ -434,10 +438,6 @@ void ComputeService<Distance>::stop_storage_insert_runtime() {
       state->thread.join();
     }
   }
-  storage_insert_senders_done_.store(true, std::memory_order_release);
-  if (storage_insert_completion_thread_.joinable()) {
-    storage_insert_completion_thread_.join();
-  }
 
   for (auto& state : storage_insert_owners_) {
     if (!state) {
@@ -454,11 +454,29 @@ void ComputeService<Distance>::stop_storage_insert_runtime() {
       if (slot.in_use && !slot.results_completed) {
         fail_storage_owner_tasks(slot.tasks);
       }
-      slot = StorageOwnerRpcSlot{};
+      slot.in_use = false;
+      slot.send_done = true;
+      slot.response_done = true;
+      slot.results_completed = true;
     }
   }
-  storage_insert_owners_.clear();
   storage_insert_inflight_.store(0, std::memory_order_release);
+  storage_insert_senders_done_.store(true, std::memory_order_release);
+  if (storage_insert_completion_thread_.joinable()) {
+    storage_insert_completion_thread_.join();
+  }
+
+  for (auto& state : storage_insert_owners_) {
+    if (!state) {
+      continue;
+    }
+    std::lock_guard<std::mutex> lock(state->mutex);
+    for (auto& slot : state->slots) {
+      slot = StorageOwnerRpcSlot{};
+    }
+    state->free_slots.clear();
+  }
+  storage_insert_owners_.clear();
 }
 
 template <class Distance>

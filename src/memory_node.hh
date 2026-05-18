@@ -85,6 +85,9 @@ public:
         index_region_(context_),
         peer_rdma_read_outstanding_(num_storage_nodes_),
         mn_memory_bytes_(static_cast<u64>(config.mn_memory_gb) * 1073741824ul) {
+    for (auto& credit : peer_rdma_read_outstanding_) {
+      credit.store(0, std::memory_order_relaxed);
+    }
     cm_.connect_to_clients();
 
     if (!config.disable_thread_pinning) {
@@ -419,7 +422,7 @@ private:
 
   static constexpr u32 kPeerSyncWrOwner = std::numeric_limits<u32>::max();
   static constexpr u32 kPeerAsyncWrOwner = std::numeric_limits<u32>::max() - 1;
-  static constexpr u32 kPeerMaxRdAtomic = 16;
+  static constexpr u32 kPeerSafeRdAtomic = 8;
 
   void allocate_memory() {
     const auto t_allocate = timing_.create_enroll("allocate_index_buffer");
@@ -675,6 +678,9 @@ private:
     if (!use_storage_owner_insert_) {
       return;
     }
+    print_status("storage-owner peer RDMA read credits per peer: " +
+                 std::to_string(peer_rdma_read_credit_limit()) +
+                 " (requested=" + std::to_string(storage_owner_peer_rdma_tokens_) + ")");
     const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
     const u32 coroutines_per_worker = std::max<u32>(1, config.insert_coroutines == 0 ? config.num_coroutines
                                                                                       : config.insert_coroutines);
@@ -747,7 +753,7 @@ private:
   }
 
   u32 peer_rdma_read_credit_limit() const {
-    return std::max<u32>(1, std::min<u32>(storage_owner_peer_rdma_tokens_, kPeerMaxRdAtomic));
+    return std::max<u32>(1, std::min<u32>(storage_owner_peer_rdma_tokens_, kPeerSafeRdAtomic));
   }
 
   bool try_acquire_peer_rdma_read_credit(u32 shard_id) {
