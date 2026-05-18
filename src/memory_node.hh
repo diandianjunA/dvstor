@@ -83,6 +83,7 @@ public:
         storage_owner_peer_rdma_tokens_(std::max<u32>(1, config.storage_owner_peer_rdma_tokens)),
         ip_distance_(config.ip_distance),
         index_region_(context_),
+        peer_rdma_read_outstanding_(num_storage_nodes_),
         mn_memory_bytes_(static_cast<u64>(config.mn_memory_gb) * 1073741824ul) {
     cm_.connect_to_clients();
 
@@ -202,6 +203,14 @@ private:
     std::unique_ptr<LocalMemoryRegion> region;
     size_t message_bytes{};
     size_t recv_region_bytes{};
+  };
+
+  struct PeerPendingSend {
+    u32 target_shard{};
+    u32 thread_id{};
+    u32 coroutine_id{};
+    bool async{};
+    bool rdma_read_credit{};
   };
 
   struct StorageOwnerInsertTask {
@@ -409,6 +418,8 @@ private:
   }
 
   static constexpr u32 kPeerSyncWrOwner = std::numeric_limits<u32>::max();
+  static constexpr u32 kPeerAsyncWrOwner = std::numeric_limits<u32>::max() - 1;
+  static constexpr u32 kPeerMaxRdAtomic = 16;
 
   void allocate_memory() {
     const auto t_allocate = timing_.create_enroll("allocate_index_buffer");
@@ -735,12 +746,63 @@ private:
     return encode_64bit(thread_id, coroutine_id);
   }
 
+  u32 peer_rdma_read_credit_limit() const {
+    return std::max<u32>(1, std::min<u32>(storage_owner_peer_rdma_tokens_, kPeerMaxRdAtomic));
+  }
+
+  bool try_acquire_peer_rdma_read_credit(u32 shard_id) {
+    const u32 limit = peer_rdma_read_credit_limit();
+    u32 current = peer_rdma_read_outstanding_[shard_id].load(std::memory_order_acquire);
+    while (current < limit) {
+      if (peer_rdma_read_outstanding_[shard_id].compare_exchange_weak(current,
+                                                                       current + 1,
+                                                                       std::memory_order_acq_rel,
+                                                                       std::memory_order_acquire)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void acquire_peer_rdma_read_credit(u32 shard_id) {
+    while (!try_acquire_peer_rdma_read_credit(shard_id)) {
+      poll_peer_send_cq();
+      std::this_thread::yield();
+    }
+  }
+
   u64 next_peer_sync_wr_id() {
     const u32 id = peer_sync_wr_id_counter_.fetch_add(1, std::memory_order_relaxed);
     return encode_64bit(kPeerSyncWrOwner, id);
   }
 
+  u64 next_peer_async_wr_id() {
+    const u32 id = peer_async_wr_id_counter_.fetch_add(1, std::memory_order_relaxed);
+    return encode_64bit(kPeerAsyncWrOwner, id);
+  }
+
+  void register_peer_pending_send_locked(u64 wr_id, PeerPendingSend pending) {
+    peer_pending_sends_[wr_id] = pending;
+  }
+
   void handle_peer_send_completion(u64 wr_id) {
+    const auto pending_it = peer_pending_sends_.find(wr_id);
+    if (pending_it != peer_pending_sends_.end()) {
+      const PeerPendingSend pending = pending_it->second;
+      peer_pending_sends_.erase(pending_it);
+      if (pending.rdma_read_credit) {
+        peer_rdma_read_outstanding_[pending.target_shard].fetch_sub(1, std::memory_order_acq_rel);
+      }
+      if (pending.async) {
+        if (pending.thread_id < storage_owner_threads_.size() && storage_owner_threads_[pending.thread_id]) {
+          auto& balance = storage_owner_threads_[pending.thread_id]->post_balances[pending.coroutine_id];
+          --balance;
+          peer_async_rdma_outstanding_.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        return;
+      }
+    }
+
     const auto [owner, id] = decode_64bit(wr_id);
     if (owner == kPeerSyncWrOwner) {
       peer_sync_completions_.insert(wr_id);
@@ -1335,14 +1397,18 @@ private:
     lib_assert(peer_remote_tokens_[shard_id] != nullptr,
                "peer token is not initialized for shard " + std::to_string(shard_id));
     lib_assert(remote_offset + bytes <= mn_memory_bytes_, "peer RDMA read exceeds shard bounds");
+    acquire_peer_rdma_read_credit(shard_id);
     while (peer_async_rdma_outstanding_.load(std::memory_order_acquire) >= storage_owner_peer_rdma_tokens_) {
       poll_peer_send_cq();
       std::this_thread::yield();
     }
     peer_async_rdma_outstanding_.fetch_add(1, std::memory_order_acq_rel);
     thread.track_post();
-    const u64 wr_id = peer_coroutine_wr_id(thread.id, thread.running_coroutine);
+    const u64 wr_id = next_peer_async_wr_id();
     std::lock_guard<std::mutex> send_lock(peer_send_mutex_);
+    register_peer_pending_send_locked(
+      wr_id,
+      PeerPendingSend{shard_id, thread.id, thread.running_coroutine, true, true});
     peer_qps_[shard_id]->post_send(reinterpret_cast<u64>(dst),
                                    static_cast<u32>(bytes),
                                    thread.scratch_region->get_lkey(),
@@ -2101,9 +2167,13 @@ private:
       owner_thread != nullptr && owner_thread->has_peer_scratch() ? *owner_thread->scratch_region : *peer_scratch_region_;
     lib_assert(scratch_offset + bytes <= scratch_buffer.buffer_size, "peer scratch buffer exhausted");
     byte_t* scratch = scratch_buffer.get_full_buffer() + scratch_offset;
+    acquire_peer_rdma_read_credit(shard_id);
     const u64 wr_id = next_peer_sync_wr_id();
     {
       std::lock_guard<std::mutex> send_lock(peer_send_mutex_);
+      register_peer_pending_send_locked(
+        wr_id,
+        PeerPendingSend{shard_id, 0, 0, false, true});
       peer_qps_[shard_id]->post_send(reinterpret_cast<u64>(scratch),
                                      static_cast<u32>(bytes),
                                      scratch_region.get_lkey(),
@@ -2199,9 +2269,13 @@ private:
     lib_assert(scratch_offset + sizeof(u64) <= scratch_buffer.buffer_size, "peer scratch buffer exhausted");
     auto* scratch = reinterpret_cast<u64*>(scratch_buffer.get_full_buffer() + scratch_offset);
     *scratch = 0;
+    acquire_peer_rdma_read_credit(shard_id);
     const u64 wr_id = next_peer_sync_wr_id();
     {
       std::lock_guard<std::mutex> send_lock(peer_send_mutex_);
+      register_peer_pending_send_locked(
+        wr_id,
+        PeerPendingSend{shard_id, 0, 0, false, true});
       peer_qps_[shard_id]->post_CAS(reinterpret_cast<u64>(scratch),
                                     scratch_region.get_lkey(),
                                     peer_remote_tokens_[shard_id].get(),
@@ -2515,7 +2589,10 @@ private:
   std::mutex peer_send_mutex_;
   vec<ibv_wc> peer_send_wcs_;
   std::unordered_set<u64> peer_sync_completions_;
+  std::unordered_map<u64, PeerPendingSend> peer_pending_sends_;
+  vec<std::atomic<u32>> peer_rdma_read_outstanding_;
   std::atomic<u32> peer_sync_wr_id_counter_{1};
+  std::atomic<u32> peer_async_wr_id_counter_{1};
   std::atomic<u32> peer_async_rdma_outstanding_{0};
   u64 next_peer_request_id_{1};
   InsertRuntimeState insert_runtime_;

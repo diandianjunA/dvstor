@@ -302,7 +302,17 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
     }
 
     size_t inserted = 0;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(config_.storage_owner_rpc_timeout_ms);
     for (auto& future : futures) {
+      if (future.wait_until(deadline) != std::future_status::ready) {
+        const u32 log_index = storage_insert_timeout_logs_.fetch_add(1, std::memory_order_relaxed);
+        if (log_index < 8) {
+          std::cerr << "[storage-owner] insert RPC timed out after "
+                    << config_.storage_owner_rpc_timeout_ms << " ms" << std::endl;
+        }
+        continue;
+      }
       inserted += future.get() ? 1u : 0u;
     }
     for (const auto& sample : samples) {

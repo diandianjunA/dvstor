@@ -233,6 +233,7 @@ private:
   std::atomic<bool> storage_insert_shutdown_{false};
   std::atomic<bool> storage_insert_senders_done_{false};
   std::atomic<u32> storage_insert_inflight_{0};
+  std::atomic<u32> storage_insert_timeout_logs_{0};
   vec<std::unique_ptr<StorageOwnerSenderState>> storage_insert_owners_;
 
   std::unique_ptr<byte_t[]> rpc_buffer_;

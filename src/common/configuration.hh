@@ -54,6 +54,7 @@ public:
   u32 storage_owner_cache_mb{0};
   u32 storage_owner_peer_rdma_tokens{8};
   u32 storage_owner_rpc_depth{8};
+  u32 storage_owner_rpc_timeout_ms{30000};
 
   // Legacy aliases for compatibility
   u32& ef_search = beam_width;
@@ -159,10 +160,13 @@ private:
       "Per-memory-node storage_owner local metadata/vector/neighbor cache size in MB. 0 disables it.")(
       "storage-owner-peer-rdma-tokens",
       po::value<u32>(&storage_owner_peer_rdma_tokens)->default_value(storage_owner_peer_rdma_tokens),
-      "Maximum storage-owner peer RDMA sends allowed by the guarded runtime.")(
+      "Maximum storage-owner peer RDMA reads allowed per peer QP. Capped by QP max_rd_atomic.")(
       "storage-owner-rpc-depth",
       po::value<u32>(&storage_owner_rpc_depth)->default_value(storage_owner_rpc_depth),
       "Maximum in-flight storage_owner insert batches per storage node.")(
+      "storage-owner-rpc-timeout-ms",
+      po::value<u32>(&storage_owner_rpc_timeout_ms)->default_value(storage_owner_rpc_timeout_ms),
+      "Maximum time to wait for one storage_owner insert RPC response.")(
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
@@ -246,6 +250,10 @@ private:
         std::cerr << "[ERROR]: --storage-owner-rpc-depth must be > 0" << std::endl;
         exit_with_help_message(argv);
       }
+      if (storage_owner_rpc_timeout_ms == 0) {
+        std::cerr << "[ERROR]: --storage-owner-rpc-timeout-ms must be > 0" << std::endl;
+        exit_with_help_message(argv);
+      }
       if (storage_peers.size() != num_server_nodes()) {
         std::cerr << "[ERROR]: --storage-peers must list exactly one endpoint per storage node when "
                      "--insert-execution=storage_owner"
@@ -305,6 +313,7 @@ public:
         os << std::setw(width) << "storage cache (MB): " << config.storage_owner_cache_mb << std::endl;
         os << std::setw(width) << "storage peer RDMA tokens: " << config.storage_owner_peer_rdma_tokens << std::endl;
         os << std::setw(width) << "storage RPC depth: " << config.storage_owner_rpc_depth << std::endl;
+        os << std::setw(width) << "storage RPC timeout(ms): " << config.storage_owner_rpc_timeout_ms << std::endl;
         os << std::setw(width) << "storage peers: " << "[";
         for (const str& node : config.storage_peers) {
           os << node << ", ";
