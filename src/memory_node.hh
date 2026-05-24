@@ -982,6 +982,7 @@ private:
     }
 
     service::storage_owner::PeerRpcHeader response{};
+    response.magic = service::storage_owner::kPeerRpcMagic;
     response.type = static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response);
     response.source_shard = storage_id_;
     response.item_count = header.item_count;
