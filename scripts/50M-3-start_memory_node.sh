@@ -21,6 +21,12 @@ SEARCH_MODE="${SEARCH_MODE:-rabitq_gpu}"
 K="${K:-10}"
 INDEX_PREFIX="${INDEX_PREFIX:-/data/xjs/index/shine_gpu_index/1024dim50M}"
 INDEX_FILE="${INDEX_FILE:-${INDEX_PREFIX}_node3_of5.dat}"
+STORAGE_OWNER_BATCH_MAX="${STORAGE_OWNER_BATCH_MAX:-16}"
+STORAGE_OWNER_BATCH_WAIT_US="${STORAGE_OWNER_BATCH_WAIT_US:-250}"
+STORAGE_OWNER_CACHE_MB="${STORAGE_OWNER_CACHE_MB:-512}"
+STORAGE_OWNER_PEER_RDMA_TOKENS="${STORAGE_OWNER_PEER_RDMA_TOKENS:-8}"
+STORAGE_OWNER_RPC_DEPTH="${STORAGE_OWNER_RPC_DEPTH:-4}"
+STORAGE_OWNER_RPC_TIMEOUT_MS="${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}"
 
 ARGS=(
   --num-clients "$NUM_CLIENTS"
@@ -44,6 +50,12 @@ if [[ "$ENABLE_STORAGE_OWNER" == "1" ]]; then
     --search-mode "$SEARCH_MODE"
     --k "$K"
     --index-prefix "$INDEX_PREFIX"
+    --storage-owner-batch-max "$STORAGE_OWNER_BATCH_MAX"
+    --storage-owner-batch-wait-us "$STORAGE_OWNER_BATCH_WAIT_US"
+    --storage-owner-cache-mb "$STORAGE_OWNER_CACHE_MB"
+    --storage-owner-peer-rdma-tokens "$STORAGE_OWNER_PEER_RDMA_TOKENS"
+    --storage-owner-rpc-depth "$STORAGE_OWNER_RPC_DEPTH"
+    --storage-owner-rpc-timeout-ms "$STORAGE_OWNER_RPC_TIMEOUT_MS"
   )
 fi
 
