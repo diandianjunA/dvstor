@@ -9,6 +9,7 @@
 #include <cstring>
 #include <deque>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -780,6 +781,7 @@ private:
                                           const service::storage_owner::PeerRpcHeader& header,
                                           const service::storage_owner::ReverseUpdateOp* ops,
                                           const Configuration& config) {
+    const auto apply_started = std::chrono::steady_clock::now();
     std::unordered_map<u64, vec<RemotePtr>> grouped;
     grouped.reserve(header.item_count);
     for (u32 i = 0; i < header.item_count; ++i) {
@@ -793,6 +795,21 @@ private:
     for (const auto& [target_raw, candidates] : grouped) {
       success &= apply_local_reverse_update(RemotePtr{target_raw}, candidates, config);
     }
+    const u64 apply_ns = elapsed_ns_since(apply_started);
+    if (apply_ns > 1000ull * 1000ull * 1000ull) {
+      static std::atomic<u32> slow_apply_logs{0};
+      const u32 log_index = slow_apply_logs.fetch_add(1, std::memory_order_relaxed);
+      if (log_index < 16) {
+        std::cerr << "[storage-peer] slow reverse-update apply"
+                  << " self_shard=" << storage_id_
+                  << " source_shard=" << source_shard
+                  << " request_id=" << header.request_id
+                  << " item_count=" << header.item_count
+                  << " grouped_targets=" << grouped.size()
+                  << " elapsed_ms=" << (apply_ns / 1000000.0)
+                  << std::endl;
+      }
+    }
 
     service::storage_owner::PeerRpcHeader response{};
     response.magic = service::storage_owner::kPeerRpcMagic;
@@ -802,7 +819,22 @@ private:
     response.request_id = header.request_id;
     response.status = static_cast<u32>(success ? service::storage_owner::InsertStatus::ok
                                                : service::storage_owner::InsertStatus::failed);
+    const auto response_send_started = std::chrono::steady_clock::now();
     send_peer_rpc_message(source_shard, &response, sizeof(response));
+    const u64 response_send_ns = elapsed_ns_since(response_send_started);
+    if (response_send_ns > 1000ull * 1000ull * 1000ull) {
+      static std::atomic<u32> slow_response_send_logs{0};
+      const u32 log_index = slow_response_send_logs.fetch_add(1, std::memory_order_relaxed);
+      if (log_index < 16) {
+        std::cerr << "[storage-peer] slow reverse-update response-send"
+                  << " self_shard=" << storage_id_
+                  << " source_shard=" << source_shard
+                  << " request_id=" << header.request_id
+                  << " item_count=" << header.item_count
+                  << " elapsed_ms=" << (response_send_ns / 1000000.0)
+                  << std::endl;
+      }
+    }
     return success;
   }
 
@@ -900,7 +932,11 @@ private:
     return handle_peer_rpc_requests(requests, config) || progressed;
   }
 
-  bool wait_for_peer_reverse_update_response(u64 request_id, const Configuration& config) {
+  bool wait_for_peer_reverse_update_response(u64 request_id,
+                                             u32 target_shard,
+                                             u32 item_count,
+                                             const Configuration& config) {
+    const auto wait_started = std::chrono::steady_clock::now();
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(config.storage_owner_rpc_timeout_ms);
     for (;;) {
@@ -912,6 +948,7 @@ private:
         if (it != peer_rpc_responses_.end()) {
           const bool success = it->second.status == static_cast<u32>(service::storage_owner::InsertStatus::ok);
           peer_rpc_responses_.erase(it);
+          log_slow_peer_reverse_update_response(wait_started, request_id, target_shard, item_count, success);
           return success;
         }
         progressed = pump_peer_rpcs_locked(config, requests, false);
@@ -920,6 +957,7 @@ private:
           const bool success =
             response_it->second.status == static_cast<u32>(service::storage_owner::InsertStatus::ok);
           peer_rpc_responses_.erase(response_it);
+          log_slow_peer_reverse_update_response(wait_started, request_id, target_shard, item_count, success);
           return success;
         }
       }
@@ -931,7 +969,10 @@ private:
           if (log_index < 8) {
             std::cerr << "[storage-peer] reverse-update RPC timed out after "
                       << config.storage_owner_rpc_timeout_ms << " ms"
-                      << " request_id=" << request_id << std::endl;
+                      << " self_shard=" << storage_id_
+                      << " target_shard=" << target_shard
+                      << " request_id=" << request_id
+                      << " item_count=" << item_count << std::endl;
           }
           return false;
         }
@@ -959,9 +1000,26 @@ private:
       header->item_count = item_count;
       header->request_id = next_peer_request_id_.fetch_add(1, std::memory_order_relaxed);
       auto* payload_ops = service::storage_owner::reverse_update_ops(message.data());
-      std::memcpy(payload_ops, ops.data() + begin, static_cast<size_t>(item_count) * sizeof(service::storage_owner::ReverseUpdateOp));
+      std::memcpy(payload_ops,
+                  ops.data() + begin,
+                  static_cast<size_t>(item_count) * sizeof(service::storage_owner::ReverseUpdateOp));
+      const auto send_started = std::chrono::steady_clock::now();
       send_peer_rpc_message(target_shard, message.data(), bytes);
-      if (!wait_for_peer_reverse_update_response(header->request_id, config)) {
+      const u64 send_ns = elapsed_ns_since(send_started);
+      if (send_ns > 1000ull * 1000ull * 1000ull) {
+        static std::atomic<u32> slow_send_logs{0};
+        const u32 log_index = slow_send_logs.fetch_add(1, std::memory_order_relaxed);
+        if (log_index < 16) {
+          std::cerr << "[storage-peer] slow reverse-update send"
+                    << " self_shard=" << storage_id_
+                    << " target_shard=" << target_shard
+                    << " request_id=" << header->request_id
+                    << " item_count=" << item_count
+                    << " elapsed_ms=" << (send_ns / 1000000.0)
+                    << std::endl;
+        }
+      }
+      if (!wait_for_peer_reverse_update_response(header->request_id, target_shard, item_count, config)) {
         return false;
       }
     }
@@ -2294,50 +2352,127 @@ private:
       return true;
     }
 
+    const auto update_started = std::chrono::steady_clock::now();
+    const auto lock_started = std::chrono::steady_clock::now();
     lock_node(target_ptr);
+    const u64 lock_wait_ns = elapsed_ns_since(lock_started);
     vec<RemotePtr> updated_neighbors;
-    {
-      NodeSnapshot target_snapshot;
-      read_node_snapshot(target_ptr, target_snapshot);
-      vec<RemotePtr> current_neighbors = read_neighbor_list(target_ptr);
-      vec<RemotePtr> filtered_candidates;
-      filtered_candidates.reserve(candidate_ptrs.size());
-      for (const RemotePtr& candidate_ptr : candidate_ptrs) {
-        if (candidate_ptr.is_null()) {
-          continue;
-        }
-        bool already_present = false;
-        for (const RemotePtr& existing : current_neighbors) {
-          if (existing == candidate_ptr) {
-            already_present = true;
-            break;
-          }
-        }
-        if (!already_present &&
-            std::find(filtered_candidates.begin(), filtered_candidates.end(), candidate_ptr) == filtered_candidates.end()) {
-          filtered_candidates.push_back(candidate_ptr);
-        }
-      }
+    bool changed = false;
+    bool pruned = false;
+    size_t current_count = 0;
+    size_t filtered_count = 0;
+    u64 snapshot_ns = 0;
+    u64 neighbor_read_ns = 0;
+    u64 filter_ns = 0;
+    u64 prune_ns = 0;
+    u64 write_ns = 0;
 
-      if (filtered_candidates.empty()) {
-        unlock_node(target_ptr);
-        return true;
+    NodeSnapshot target_snapshot;
+    auto step_started = std::chrono::steady_clock::now();
+    read_node_snapshot(target_ptr, target_snapshot);
+    snapshot_ns = elapsed_ns_since(step_started);
+
+    step_started = std::chrono::steady_clock::now();
+    vec<RemotePtr> current_neighbors = read_neighbor_list(target_ptr);
+    neighbor_read_ns = elapsed_ns_since(step_started);
+    current_count = current_neighbors.size();
+
+    step_started = std::chrono::steady_clock::now();
+    vec<RemotePtr> filtered_candidates;
+    filtered_candidates.reserve(candidate_ptrs.size());
+    for (const RemotePtr& candidate_ptr : candidate_ptrs) {
+      if (candidate_ptr.is_null()) {
+        continue;
       }
+      bool already_present = false;
+      for (const RemotePtr& existing : current_neighbors) {
+        if (existing == candidate_ptr) {
+          already_present = true;
+          break;
+        }
+      }
+      if (!already_present &&
+          std::find(filtered_candidates.begin(), filtered_candidates.end(), candidate_ptr) == filtered_candidates.end()) {
+        filtered_candidates.push_back(candidate_ptr);
+      }
+    }
+    filter_ns = elapsed_ns_since(step_started);
+    filtered_count = filtered_candidates.size();
+
+    if (!filtered_candidates.empty()) {
+      changed = true;
 
       if (current_neighbors.size() + filtered_candidates.size() <= config.R) {
         current_neighbors.insert(current_neighbors.end(), filtered_candidates.begin(), filtered_candidates.end());
         updated_neighbors = std::move(current_neighbors);
       } else {
+        pruned = true;
         vec<RemotePtr> prune_candidates = current_neighbors;
         prune_candidates.insert(prune_candidates.end(), filtered_candidates.begin(), filtered_candidates.end());
         hashset_t<RemotePtr> skip{target_ptr};
+        step_started = std::chrono::steady_clock::now();
         updated_neighbors = robust_prune_cpu(target_snapshot.components, prune_candidates, skip, config);
+        prune_ns = elapsed_ns_since(step_started);
       }
     }
 
-    write_neighbor_list(target_ptr, updated_neighbors);
+    if (changed) {
+      step_started = std::chrono::steady_clock::now();
+      write_neighbor_list(target_ptr, updated_neighbors);
+      write_ns = elapsed_ns_since(step_started);
+    }
     unlock_node(target_ptr);
+
+    const u64 update_ns = elapsed_ns_since(update_started);
+    if (update_ns > 1000ull * 1000ull * 1000ull) {
+      static std::atomic<u32> slow_update_logs{0};
+      const u32 log_index = slow_update_logs.fetch_add(1, std::memory_order_relaxed);
+      if (log_index < 16) {
+        std::cerr << "[storage-owner] slow reverse-update target"
+                  << " self_shard=" << storage_id_
+                  << " target_raw=" << target_ptr.raw_address
+                  << " candidates=" << candidate_ptrs.size()
+                  << " current_neighbors=" << current_count
+                  << " filtered_candidates=" << filtered_count
+                  << " changed=" << (changed ? 1 : 0)
+                  << " pruned=" << (pruned ? 1 : 0)
+                  << " elapsed_ms=" << (update_ns / 1000000.0)
+                  << " lock_wait_ms=" << (lock_wait_ns / 1000000.0)
+                  << " snapshot_ms=" << (snapshot_ns / 1000000.0)
+                  << " neighbor_read_ms=" << (neighbor_read_ns / 1000000.0)
+                  << " filter_ms=" << (filter_ns / 1000000.0)
+                  << " prune_ms=" << (prune_ns / 1000000.0)
+                  << " write_ms=" << (write_ns / 1000000.0)
+                  << std::endl;
+      }
+    }
     return true;
+  }
+
+  void log_slow_peer_reverse_update_response(std::chrono::steady_clock::time_point wait_started,
+                                             u64 request_id,
+                                             u32 target_shard,
+                                             u32 item_count,
+                                             bool success) const {
+    const u64 wait_ns = static_cast<u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - wait_started).count());
+    if (wait_ns <= 1000ull * 1000ull * 1000ull) {
+      return;
+    }
+    static std::atomic<u32> slow_response_logs{0};
+    const u32 log_index = slow_response_logs.fetch_add(1, std::memory_order_relaxed);
+    if (log_index >= 16) {
+      return;
+    }
+    std::cerr << "[storage-peer] slow reverse-update response"
+              << " self_shard=" << storage_id_
+              << " target_shard=" << target_shard
+              << " request_id=" << request_id
+              << " item_count=" << item_count
+              << " success=" << (success ? 1 : 0)
+              << " elapsed_ms=" << (wait_ns / 1000000.0)
+              << std::endl;
   }
 
   static size_t align_up(size_t value, size_t alignment = CACHELINE_SIZE) {
