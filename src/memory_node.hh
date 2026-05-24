@@ -206,6 +206,7 @@ private:
     std::unique_ptr<LocalMemoryRegion> region;
     size_t message_bytes{};
     size_t recv_region_bytes{};
+    u32 recv_slots_per_peer{1};
   };
 
   struct PeerPendingSend {
@@ -664,20 +665,31 @@ private:
     peer_rpc_runtime_.message_bytes = align_up(
       std::max(service::storage_owner::reverse_update_request_bytes(config.R * config.storage_owner_batch_max),
                service::storage_owner::reverse_update_response_bytes()));
-    peer_rpc_runtime_.recv_region_bytes = peer_rpc_runtime_.message_bytes * num_storage_nodes_;
+    const u32 remote_peer_count = num_storage_nodes_ - 1;
+    const u32 max_recv_wr = static_cast<u32>(std::max<i32>(1, config.max_recv_queue_wr));
+    const u32 max_slots_per_peer = std::max<u32>(1, max_recv_wr / remote_peer_count);
+    const u32 desired_slots_per_peer = std::max<u32>(16, config.storage_owner_rpc_depth * 4);
+    peer_rpc_runtime_.recv_slots_per_peer = std::min(desired_slots_per_peer, max_slots_per_peer);
+    peer_rpc_runtime_.recv_region_bytes =
+      peer_rpc_runtime_.message_bytes * num_storage_nodes_ * peer_rpc_runtime_.recv_slots_per_peer;
     const size_t send_region_bytes = peer_rpc_runtime_.message_bytes * num_storage_nodes_;
     peer_rpc_runtime_.buffer.allocate(peer_rpc_runtime_.recv_region_bytes + send_region_bytes);
     peer_rpc_runtime_.buffer.touch_memory();
     peer_rpc_runtime_.region = std::make_unique<LocalMemoryRegion>(
       *peer_context_, peer_rpc_runtime_.buffer.get_full_buffer(), peer_rpc_runtime_.buffer.buffer_size);
+    print_status("storage-owner peer RPC receive slots per peer: " +
+                 std::to_string(peer_rpc_runtime_.recv_slots_per_peer) +
+                 " (requested=" + std::to_string(desired_slots_per_peer) + ")");
 
     for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
       if (peer_id == storage_id_) continue;
-      peer_control_qp(peer_id)->post_receive(
-        *peer_rpc_runtime_.region,
-        static_cast<u32>(peer_rpc_runtime_.message_bytes),
-        peer_id,
-        static_cast<u64>(peer_id) * peer_rpc_runtime_.message_bytes);
+      for (u32 slot_id = 0; slot_id < peer_rpc_runtime_.recv_slots_per_peer; ++slot_id) {
+        peer_control_qp(peer_id)->post_receive(
+          *peer_rpc_runtime_.region,
+          static_cast<u32>(peer_rpc_runtime_.message_bytes),
+          encode_64bit(peer_id, slot_id),
+          peer_rpc_receive_offset(peer_id, slot_id));
+      }
     }
   }
 
@@ -763,15 +775,21 @@ private:
     }
   }
 
-  void repost_peer_rpc_receive(u32 peer_id) {
-    if (!peer_context_ || peer_id == storage_id_) {
+  size_t peer_rpc_receive_offset(u32 peer_id, u32 slot_id) const {
+    const size_t slot_index =
+      static_cast<size_t>(peer_id) * peer_rpc_runtime_.recv_slots_per_peer + slot_id;
+    return slot_index * peer_rpc_runtime_.message_bytes;
+  }
+
+  void repost_peer_rpc_receive(u32 peer_id, u32 slot_id) {
+    if (!peer_context_ || peer_id == storage_id_ || slot_id >= peer_rpc_runtime_.recv_slots_per_peer) {
       return;
     }
     peer_control_qp(peer_id)->post_receive(
       *peer_rpc_runtime_.region,
       static_cast<u32>(peer_rpc_runtime_.message_bytes),
-      peer_id,
-      static_cast<u64>(peer_id) * peer_rpc_runtime_.message_bytes);
+      encode_64bit(peer_id, slot_id),
+      peer_rpc_receive_offset(peer_id, slot_id));
   }
 
   QP& peer_control_qp(u32 shard_id) {
@@ -1022,20 +1040,20 @@ private:
       }
       progressed = true;
       for (i32 i = 0; i < num_received; ++i) {
-        const u32 peer_id = static_cast<u32>(recv_wcs[i].wr_id);
-        if (peer_id >= num_storage_nodes_) {
+        const auto [peer_id, slot_id] = decode_64bit(recv_wcs[i].wr_id);
+        if (peer_id >= num_storage_nodes_ || slot_id >= peer_rpc_runtime_.recv_slots_per_peer) {
           continue;
         }
-        const size_t offset = static_cast<size_t>(peer_id) * peer_rpc_runtime_.message_bytes;
+        const size_t offset = peer_rpc_receive_offset(peer_id, slot_id);
         const byte_t* payload = peer_rpc_runtime_.buffer.get_full_buffer() + offset;
         const size_t bytes = recv_wcs[i].byte_len;
         if (bytes < sizeof(service::storage_owner::PeerRpcHeader)) {
-          repost_peer_rpc_receive(peer_id);
+          repost_peer_rpc_receive(peer_id, slot_id);
           continue;
         }
         const auto* header = reinterpret_cast<const service::storage_owner::PeerRpcHeader*>(payload);
         if (header->magic != service::storage_owner::kPeerRpcMagic) {
-          repost_peer_rpc_receive(peer_id);
+          repost_peer_rpc_receive(peer_id, slot_id);
           continue;
         }
 
@@ -1048,7 +1066,7 @@ private:
           peer_rpc_responses_[header->request_id] = *header;
         }
 
-        repost_peer_rpc_receive(peer_id);
+        repost_peer_rpc_receive(peer_id, slot_id);
       }
     } while (wait_for_event);
 
