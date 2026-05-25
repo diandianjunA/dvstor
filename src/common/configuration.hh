@@ -55,6 +55,13 @@ public:
   u32 storage_owner_peer_rdma_tokens{8};
   u32 storage_owner_rpc_depth{8};
   u32 storage_owner_rpc_timeout_ms{30000};
+  u32 storage_owner_construction_beam_width{128};
+  u32 storage_owner_search_snapshot_batch{64};
+  u32 storage_owner_prune_max_candidates{128};
+  str storage_owner_reverse_mode{"async"};
+  u32 storage_owner_reverse_queue_depth{65536};
+  u32 storage_owner_reverse_flush_us{200};
+  u32 storage_owner_reverse_coalesce_max{256};
 
   // Legacy aliases for compatibility
   u32& ef_search = beam_width;
@@ -83,6 +90,7 @@ public:
     process_program_options(argc, argv);
     search_mode = normalize_search_mode(search_mode);
     insert_execution = normalize_search_mode(insert_execution);
+    storage_owner_reverse_mode = normalize_search_mode(storage_owner_reverse_mode);
 
     if (!is_server) {
       validate_compute_node_options(argv);
@@ -167,6 +175,27 @@ private:
       "storage-owner-rpc-timeout-ms",
       po::value<u32>(&storage_owner_rpc_timeout_ms)->default_value(storage_owner_rpc_timeout_ms),
       "Maximum time to wait for one storage_owner insert RPC response.")(
+      "storage-owner-construction-beam-width",
+      po::value<u32>(&storage_owner_construction_beam_width)->default_value(storage_owner_construction_beam_width),
+      "Storage-owner online construction beam width. 0 uses --beam-width-construction unchanged.")(
+      "storage-owner-search-snapshot-batch",
+      po::value<u32>(&storage_owner_search_snapshot_batch)->default_value(storage_owner_search_snapshot_batch),
+      "Maximum node snapshots read concurrently during storage-owner search/prune.")(
+      "storage-owner-prune-max-candidates",
+      po::value<u32>(&storage_owner_prune_max_candidates)->default_value(storage_owner_prune_max_candidates),
+      "Maximum candidates considered by storage-owner robust-prune. 0 disables the cap.")(
+      "storage-owner-reverse-mode",
+      po::value<str>(&storage_owner_reverse_mode)->default_value(storage_owner_reverse_mode),
+      "Reverse-update completion mode for storage_owner inserts: async or sync.")(
+      "storage-owner-reverse-queue-depth",
+      po::value<u32>(&storage_owner_reverse_queue_depth)->default_value(storage_owner_reverse_queue_depth),
+      "Maximum queued peer reverse-update requests per memory node.")(
+      "storage-owner-reverse-flush-us",
+      po::value<u32>(&storage_owner_reverse_flush_us)->default_value(storage_owner_reverse_flush_us),
+      "Maximum worker-side coalescing wait for peer reverse updates in microseconds.")(
+      "storage-owner-reverse-coalesce-max",
+      po::value<u32>(&storage_owner_reverse_coalesce_max)->default_value(storage_owner_reverse_coalesce_max),
+      "Maximum reverse-update operations coalesced by one peer worker batch.")(
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
@@ -254,6 +283,22 @@ private:
         std::cerr << "[ERROR]: --storage-owner-rpc-timeout-ms must be > 0" << std::endl;
         exit_with_help_message(argv);
       }
+      if (storage_owner_search_snapshot_batch == 0) {
+        std::cerr << "[ERROR]: --storage-owner-search-snapshot-batch must be > 0" << std::endl;
+        exit_with_help_message(argv);
+      }
+      if (storage_owner_reverse_mode != "async" && storage_owner_reverse_mode != "sync") {
+        std::cerr << "[ERROR]: --storage-owner-reverse-mode must be async or sync" << std::endl;
+        exit_with_help_message(argv);
+      }
+      if (storage_owner_reverse_queue_depth == 0) {
+        std::cerr << "[ERROR]: --storage-owner-reverse-queue-depth must be > 0" << std::endl;
+        exit_with_help_message(argv);
+      }
+      if (storage_owner_reverse_coalesce_max == 0) {
+        std::cerr << "[ERROR]: --storage-owner-reverse-coalesce-max must be > 0" << std::endl;
+        exit_with_help_message(argv);
+      }
       if (storage_peers.size() != num_server_nodes()) {
         std::cerr << "[ERROR]: --storage-peers must list exactly one endpoint per storage node when "
                      "--insert-execution=storage_owner"
@@ -314,6 +359,19 @@ public:
         os << std::setw(width) << "storage peer RDMA tokens: " << config.storage_owner_peer_rdma_tokens << std::endl;
         os << std::setw(width) << "storage RPC depth: " << config.storage_owner_rpc_depth << std::endl;
         os << std::setw(width) << "storage RPC timeout(ms): " << config.storage_owner_rpc_timeout_ms << std::endl;
+        os << std::setw(width) << "storage construction beam: "
+           << config.storage_owner_construction_beam_width << std::endl;
+        os << std::setw(width) << "storage snapshot batch: "
+           << config.storage_owner_search_snapshot_batch << std::endl;
+        os << std::setw(width) << "storage prune max candidates: "
+           << config.storage_owner_prune_max_candidates << std::endl;
+        os << std::setw(width) << "storage reverse mode: " << config.storage_owner_reverse_mode << std::endl;
+        os << std::setw(width) << "storage reverse queue depth: "
+           << config.storage_owner_reverse_queue_depth << std::endl;
+        os << std::setw(width) << "storage reverse flush(us): "
+           << config.storage_owner_reverse_flush_us << std::endl;
+        os << std::setw(width) << "storage reverse coalesce max: "
+           << config.storage_owner_reverse_coalesce_max << std::endl;
         os << std::setw(width) << "storage peers: " << "[";
         for (const str& node : config.storage_peers) {
           os << node << ", ";

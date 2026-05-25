@@ -29,17 +29,33 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
                std::to_string(peer_rdma_read_credit_limit()) +
                " per QP: " + std::to_string(peer_rdma_read_credit_limit_per_qp()) +
                " (requested=" + std::to_string(storage_owner_peer_rdma_tokens_) + ")");
+  print_status("storage-owner online insert tuning: construction_beam=" +
+               std::to_string(config.storage_owner_construction_beam_width == 0
+                                ? config.beam_width_construction
+                                : std::min(config.beam_width_construction,
+                                           config.storage_owner_construction_beam_width)) +
+               " snapshot_batch=" + std::to_string(config.storage_owner_search_snapshot_batch) +
+               " prune_max_candidates=" + std::to_string(config.storage_owner_prune_max_candidates));
   const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
   const u32 coroutines_per_worker = std::max<u32>(1, config.insert_coroutines == 0 ? config.num_coroutines
                                                                                     : config.insert_coroutines);
-  const size_t scratch_bytes = std::max<size_t>(64ull * 1024ull * 1024ull, align_up(VamanaNode::total_size() * 4));
+  const size_t snapshot_stride = align_up(VamanaNode::size_until_vector_end());
+  const size_t neighbor_stride = align_up(sizeof(u8)) + VamanaNode::NEIGHBORS_SIZE;
+  const size_t coroutine_scratch_stride =
+    align_up(std::max<size_t>(VamanaNode::total_size(),
+                              std::max(neighbor_stride,
+                                       snapshot_stride *
+                                         std::max<u32>(1, config.storage_owner_search_snapshot_batch))));
+  const size_t scratch_bytes =
+    std::max<size_t>(64ull * 1024ull * 1024ull,
+                     coroutine_scratch_stride * std::max<u32>(1, coroutines_per_worker));
   const size_t cache_bytes_per_worker =
     worker_count == 0 ? 0 : static_cast<size_t>(config.storage_owner_cache_mb) * 1024ull * 1024ull / worker_count;
   storage_owner_threads_.reserve(worker_count);
   for (u32 i = 0; i < worker_count; ++i) {
     auto thread = std::make_unique<StorageOwnerThread>(i, coroutines_per_worker, config.max_send_queue_wr);
     if (peer_context_) {
-      thread->init_peer_scratch(*peer_context_, scratch_bytes);
+      thread->init_peer_scratch(*peer_context_, scratch_bytes, coroutine_scratch_stride);
     }
     thread->cache.init(cache_bytes_per_worker);
     storage_owner_threads_.push_back(std::move(thread));

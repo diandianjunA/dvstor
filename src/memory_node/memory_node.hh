@@ -93,6 +93,7 @@ private:
   static constexpr u32 kPeerSyncWrOwner = std::numeric_limits<u32>::max();
   static constexpr u32 kPeerAsyncWrOwner = std::numeric_limits<u32>::max() - 1;
   static constexpr u32 kPeerSafeRdAtomic = 8;
+  static constexpr u32 kPeerRpcFlagNoResponse = 1u;
 
   // Lifecycle and commands
   static u64 elapsed_ns_since(const std::chrono::steady_clock::time_point start);
@@ -147,6 +148,7 @@ private:
       const service::storage_owner::PeerRpcHeader& request,
       bool success) const;
   bool apply_peer_reverse_update_task(const PeerReverseUpdateTask& task, const Configuration& config);
+  bool apply_peer_reverse_update_tasks(const vec<PeerReverseUpdateTask>& tasks, const Configuration& config);
   void send_peer_reverse_update_response(const PeerReverseUpdateResponse& response);
   bool handle_peer_reverse_update_request(u32 source_shard,
                                           const service::storage_owner::PeerRpcHeader& header,
@@ -210,6 +212,10 @@ private:
   bool read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot);
   vec<RemotePtr> read_neighbor_list(RemotePtr rptr);
   auto async_read_node_snapshot(RemotePtr rptr, StorageOwnerThread& thread);
+  auto async_read_node_snapshots(const vec<RemotePtr>& rptrs,
+                                 const Configuration& config,
+                                 StorageOwnerThread& thread);
+  vec<NodeSnapshot> read_node_snapshots_batched(const vec<RemotePtr>& rptrs, const Configuration& config);
   auto async_read_neighbor_list(RemotePtr rptr, StorageOwnerThread& thread);
   void write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neighbors);
   void write_new_node(RemotePtr rptr,
