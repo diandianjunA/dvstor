@@ -39,6 +39,8 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     ("alpha", po::value<f64>(&config.alpha)->default_value(config.alpha), "RobustPrune alpha parameter.")
     ("rabitq-bits", po::value<u32>(&config.rabitq_bits)->default_value(config.rabitq_bits),
      "Bits per dimension for RaBitQ (1, 2, 4, or 8).")
+    ("node-layout", po::value<str>(&config.node_layout)->default_value(config.node_layout),
+     "Node layout: legacy or rabitq_search_block.")
     ("seed", po::value<i32>(&config.seed)->default_value(config.seed), "PRNG seed.")
     ("max-vectors", po::value<size_t>(&config.max_vectors)->default_value(config.max_vectors),
      "Maximum number of vectors to read.")
@@ -67,6 +69,8 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
   if (config.rabitq_bits != 1 && config.rabitq_bits != 2 &&
       config.rabitq_bits != 4 && config.rabitq_bits != 8)
     lib_failure("--rabitq-bits must be 1, 2, 4, or 8");
+  if (config.node_layout != "legacy" && config.node_layout != "rabitq_search_block")
+    lib_failure("--node-layout must be legacy or rabitq_search_block");
 
   return config;
 }

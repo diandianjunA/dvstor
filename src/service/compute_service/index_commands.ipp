@@ -291,6 +291,8 @@ bool ComputeService<Distance>::maybe_load_rabitq_artifacts(const filepath_t& ind
     }
     return false;
   }
+  const auto index_layout = VamanaNode::parse_layout(artifacts.node_layout);
+  VamanaNode::set_layout(index_layout);
   if (artifacts.R != config_.R) {
     if (error_message) {
       *error_message = "index R mismatch: expected " + std::to_string(config_.R) +
@@ -327,7 +329,8 @@ bool ComputeService<Distance>::maybe_load_rabitq_artifacts(const filepath_t& ind
   rabitq_artifacts_ready_ = true;
   print_status("loaded RaBitQ artifacts from " + index_prefix.string() +
                " (dim=" + std::to_string(artifacts.dim) +
-               ", bits=" + std::to_string(artifacts.rabitq_bits) + ")");
+               ", bits=" + std::to_string(artifacts.rabitq_bits) +
+               ", layout=" + VamanaNode::layout_name() + ")");
   return true;
 }
 
@@ -409,4 +412,3 @@ auto ComputeService<Distance>::send_index_command(mn_command::Command cmd, const
 
   return results;
 }
-

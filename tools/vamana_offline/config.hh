@@ -17,6 +17,7 @@ struct VamanaBuildConfig {
   u32 beam_width{128};
   f64 alpha{1.2};
   u32 rabitq_bits{1};
+  str node_layout{"rabitq_search_block"};
   i32 seed{1234};
   size_t max_vectors{std::numeric_limits<u32>::max()};
   bool ip_distance{false};

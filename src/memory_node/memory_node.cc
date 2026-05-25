@@ -280,7 +280,12 @@ void MemoryNode::load_rabitq_artifacts(const Configuration& config) {
              error_message);
   lib_assert(rabitq_artifacts_.dim == config.dim, "RaBitQ artifact dim mismatch on storage node");
   lib_assert(rabitq_artifacts_.rabitq_bits == config.rabitq_bits, "RaBitQ artifact bits mismatch on storage node");
+  VamanaNode::set_layout(VamanaNode::parse_layout(rabitq_artifacts_.node_layout));
   rabitq_artifacts_ready_ = true;
+  print_status("loaded RaBitQ artifacts from " + config.resolved_index_prefix().string() +
+               " (dim=" + std::to_string(rabitq_artifacts_.dim) +
+               ", bits=" + std::to_string(rabitq_artifacts_.rabitq_bits) +
+               ", layout=" + VamanaNode::layout_name() + ")");
 }
 
 size_t MemoryNode::align_up(size_t value, size_t alignment) {
