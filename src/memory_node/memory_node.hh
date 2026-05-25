@@ -73,6 +73,12 @@ class MemoryNode {
     std::chrono::steady_clock::time_point queued_at{};
   };
 
+  struct PeerReverseOutgoingTask {
+    u32 target_shard{};
+    vec<service::storage_owner::ReverseUpdateOp> ops;
+    std::chrono::steady_clock::time_point queued_at{};
+  };
+
 public:
   explicit MemoryNode(Configuration& config);
 
@@ -82,6 +88,8 @@ private:
   using InsertBreakdownCounters = service::storage_owner::InsertBreakdownCounters;
   using BeamEntry = memory_node_detail::BeamEntry;
   using NodeSnapshot = memory_node_detail::NodeSnapshot;
+  using RabitqSearchState = memory_node_detail::RabitqSearchState;
+  using RabitqSnapshot = memory_node_detail::RabitqSnapshot;
   using InsertRuntimeState = memory_node_detail::InsertRuntimeState;
   using PeerRpcRuntimeState = memory_node_detail::PeerRpcRuntimeState;
   using PeerPendingSend = memory_node_detail::PeerPendingSend;
@@ -162,6 +170,7 @@ private:
   void peer_rpc_progress_loop();
   void peer_reverse_update_worker_loop(u32 worker_id);
   void peer_reverse_response_loop();
+  void peer_reverse_outgoing_loop();
   bool handle_peer_rpc_requests(vec<PeerRpcMessage>& requests, const Configuration& config);
   bool pump_peer_rpcs_locked(const Configuration&,
                              vec<PeerRpcMessage>& requests,
@@ -171,6 +180,13 @@ private:
                                              u32 target_shard,
                                              u32 item_count,
                                              const Configuration& config);
+  bool enqueue_reverse_update_batch(u32 target_shard,
+                                    const vec<service::storage_owner::ReverseUpdateOp>& ops,
+                                    const Configuration& config);
+  bool send_reverse_update_batch_direct(u32 target_shard,
+                                        const vec<service::storage_owner::ReverseUpdateOp>& ops,
+                                        bool wait_for_response,
+                                        const Configuration& config);
   bool send_reverse_update_batch(u32 target_shard,
                                  const vec<service::storage_owner::ReverseUpdateOp>& ops,
                                  const Configuration& config);
@@ -225,6 +241,16 @@ private:
                       const vec<RemotePtr>& neighbors);
   void lock_node(RemotePtr rptr);
   void unlock_node(RemotePtr rptr);
+  bool use_storage_owner_rabitq_search(const Configuration& config) const;
+  RabitqSearchState prepare_rabitq_search_state(const span<const element_t> query,
+                                                const Configuration& config) const;
+  distance_t rabitq_distance_cpu(const RabitqSearchState& state,
+                                 const byte_t* rabitq_data,
+                                 const Configuration& config) const;
+  vec<RabitqSnapshot> read_rabitq_snapshots_batched(const vec<RemotePtr>& rptrs, const Configuration& config);
+  auto async_read_rabitq_snapshots(const vec<RemotePtr>& rptrs,
+                                   const Configuration& config,
+                                   StorageOwnerThread& thread);
   vec<RemotePtr> beam_search_candidates(const span<const element_t> query,
                                         RemotePtr medoid,
                                         const Configuration& config,
@@ -301,6 +327,7 @@ private:
   std::thread peer_rpc_progress_thread_;
   vec<std::thread> peer_reverse_workers_;
   std::thread peer_reverse_response_thread_;
+  std::thread peer_reverse_outgoing_thread_;
   vec<u_ptr<StorageOwnerThread>> peer_reverse_worker_states_;
   std::mutex peer_reverse_tasks_mutex_;
   std::condition_variable peer_reverse_tasks_cv_;
@@ -308,9 +335,13 @@ private:
   std::mutex peer_reverse_responses_mutex_;
   std::condition_variable peer_reverse_responses_cv_;
   std::deque<PeerReverseUpdateResponse> peer_reverse_responses_;
+  std::mutex peer_reverse_outgoing_mutex_;
+  std::condition_variable peer_reverse_outgoing_cv_;
+  std::deque<PeerReverseOutgoingTask> peer_reverse_outgoing_;
   std::atomic<bool> peer_reverse_shutdown_{false};
   std::atomic<bool> peer_reverse_workers_done_{false};
   size_t peer_reverse_task_queue_limit_{1024};
+  size_t peer_reverse_outgoing_queue_limit_{1024};
   InsertRuntimeState insert_runtime_;
   std::unique_ptr<Configuration> storage_worker_config_;
   std::mutex storage_send_mutex_;

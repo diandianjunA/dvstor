@@ -48,6 +48,7 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   peer_reverse_workers_done_.store(false, std::memory_order_release);
   peer_reverse_task_queue_limit_ =
     std::max<size_t>(1024, static_cast<size_t>(config.storage_owner_reverse_queue_depth));
+  peer_reverse_outgoing_queue_limit_ = peer_reverse_task_queue_limit_;
 
   const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
   const size_t snapshot_stride = align_up(VamanaNode::size_until_vector_end());
@@ -67,6 +68,7 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
 
   peer_rpc_progress_thread_ = std::thread([this]() { peer_rpc_progress_loop(); });
   peer_reverse_response_thread_ = std::thread([this]() { peer_reverse_response_loop(); });
+  peer_reverse_outgoing_thread_ = std::thread([this]() { peer_reverse_outgoing_loop(); });
   for (u32 i = 0; i < worker_count; ++i) {
     peer_reverse_workers_.emplace_back([this, i]() { peer_reverse_update_worker_loop(i); });
   }
@@ -81,10 +83,14 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
   peer_reverse_shutdown_.store(true, std::memory_order_release);
   peer_reverse_tasks_cv_.notify_all();
   peer_reverse_responses_cv_.notify_all();
+  peer_reverse_outgoing_cv_.notify_all();
   peer_rpc_responses_cv_.notify_all();
 
   if (peer_rpc_progress_thread_.joinable()) {
     peer_rpc_progress_thread_.join();
+  }
+  if (peer_reverse_outgoing_thread_.joinable()) {
+    peer_reverse_outgoing_thread_.join();
   }
   for (auto& worker : peer_reverse_workers_) {
     if (worker.joinable()) {
@@ -412,6 +418,77 @@ void MemoryNode::peer_reverse_response_loop() {
   }
 }
 
+void MemoryNode::peer_reverse_outgoing_loop() {
+  const Configuration& config = *storage_worker_config_;
+  const u32 coalesce_max = std::max<u32>(1, config.storage_owner_reverse_coalesce_max);
+  for (;;) {
+    PeerReverseOutgoingTask task;
+    {
+      std::unique_lock<std::mutex> lock(peer_reverse_outgoing_mutex_);
+      peer_reverse_outgoing_cv_.wait(lock, [&]() {
+        return peer_reverse_shutdown_.load(std::memory_order_acquire) || !peer_reverse_outgoing_.empty();
+      });
+      if (peer_reverse_shutdown_.load(std::memory_order_acquire) && peer_reverse_outgoing_.empty()) {
+        return;
+      }
+
+      task = std::move(peer_reverse_outgoing_.front());
+      peer_reverse_outgoing_.pop_front();
+      size_t coalesced_ops = task.ops.size();
+      if (config.storage_owner_reverse_flush_us > 0 && peer_reverse_outgoing_.empty() &&
+          !peer_reverse_shutdown_.load(std::memory_order_acquire)) {
+        peer_reverse_outgoing_cv_.wait_for(lock,
+                                           std::chrono::microseconds(config.storage_owner_reverse_flush_us),
+                                           [&]() {
+                                             return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
+                                                    !peer_reverse_outgoing_.empty();
+                                           });
+      }
+
+      size_t scanned = 0;
+      constexpr size_t kOutboxCoalesceScanLimit = 64;
+      for (auto it = peer_reverse_outgoing_.begin();
+           it != peer_reverse_outgoing_.end() && coalesced_ops < coalesce_max &&
+           scanned < kOutboxCoalesceScanLimit;) {
+        ++scanned;
+        if (it->target_shard != task.target_shard) {
+          ++it;
+          continue;
+        }
+        const size_t next_ops = it->ops.size();
+        if (coalesced_ops + next_ops > coalesce_max) {
+          break;
+        }
+        task.ops.insert(task.ops.end(), it->ops.begin(), it->ops.end());
+        coalesced_ops += next_ops;
+        it = peer_reverse_outgoing_.erase(it);
+      }
+    }
+    peer_reverse_outgoing_cv_.notify_one();
+
+    const auto send_started = std::chrono::steady_clock::now();
+    const bool success = send_reverse_update_batch_direct(task.target_shard, task.ops, false, config);
+    const u64 send_ns = elapsed_ns_since(send_started);
+    if (!success || send_ns > 1000ull * 1000ull * 1000ull) {
+      static std::atomic<u32> slow_outbox_logs{0};
+      const u32 log_index = slow_outbox_logs.fetch_add(1, std::memory_order_relaxed);
+      if (log_index < 16) {
+        const u64 queued_ns = static_cast<u64>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+            send_started - task.queued_at).count());
+        std::cerr << "[storage-peer] slow reverse-update outbox send"
+                  << " self_shard=" << storage_id_
+                  << " target_shard=" << task.target_shard
+                  << " item_count=" << task.ops.size()
+                  << " success=" << (success ? 1 : 0)
+                  << " queued_ms=" << (queued_ns / 1000000.0)
+                  << " elapsed_ms=" << (send_ns / 1000000.0)
+                  << std::endl;
+      }
+    }
+  }
+}
+
 bool MemoryNode::handle_peer_rpc_requests(vec<PeerRpcMessage>& requests, const Configuration& config) {
   bool progressed = false;
   for (const auto& request : requests) {
@@ -518,9 +595,36 @@ bool MemoryNode::wait_for_peer_reverse_update_response(u64 request_id,
   }
 }
 
-bool MemoryNode::send_reverse_update_batch(u32 target_shard,
-                               const vec<service::storage_owner::ReverseUpdateOp>& ops,
-                               const Configuration& config) {
+bool MemoryNode::enqueue_reverse_update_batch(u32 target_shard,
+                                  const vec<service::storage_owner::ReverseUpdateOp>& ops,
+                                  const Configuration&) {
+  if (ops.empty()) {
+    return true;
+  }
+
+  PeerReverseOutgoingTask task;
+  task.target_shard = target_shard;
+  task.ops = ops;
+  task.queued_at = std::chrono::steady_clock::now();
+  {
+    std::unique_lock<std::mutex> lock(peer_reverse_outgoing_mutex_);
+    peer_reverse_outgoing_cv_.wait(lock, [&]() {
+      return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
+             peer_reverse_outgoing_.size() < peer_reverse_outgoing_queue_limit_;
+    });
+    if (peer_reverse_shutdown_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    peer_reverse_outgoing_.push_back(std::move(task));
+  }
+  peer_reverse_outgoing_cv_.notify_one();
+  return true;
+}
+
+bool MemoryNode::send_reverse_update_batch_direct(u32 target_shard,
+                                      const vec<service::storage_owner::ReverseUpdateOp>& ops,
+                                      bool wait_for_response,
+                                      const Configuration& config) {
   if (ops.empty()) {
     return true;
   }
@@ -536,7 +640,6 @@ bool MemoryNode::send_reverse_update_batch(u32 target_shard,
     header->source_shard = storage_id_;
     header->item_count = item_count;
     header->request_id = next_peer_request_id_.fetch_add(1, std::memory_order_relaxed);
-    const bool wait_for_response = config.storage_owner_reverse_mode != "async";
     if (!wait_for_response) {
       header->reserved |= kPeerRpcFlagNoResponse;
     }
@@ -566,6 +669,15 @@ bool MemoryNode::send_reverse_update_batch(u32 target_shard,
     }
   }
   return true;
+}
+
+bool MemoryNode::send_reverse_update_batch(u32 target_shard,
+                               const vec<service::storage_owner::ReverseUpdateOp>& ops,
+                               const Configuration& config) {
+  if (config.storage_owner_reverse_mode == "async") {
+    return enqueue_reverse_update_batch(target_shard, ops, config);
+  }
+  return send_reverse_update_batch_direct(target_shard, ops, true, config);
 }
 
 void MemoryNode::log_slow_peer_reverse_update_response(std::chrono::steady_clock::time_point wait_started,
