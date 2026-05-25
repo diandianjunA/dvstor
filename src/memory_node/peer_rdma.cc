@@ -197,11 +197,12 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
       }
     }
     if (pending.async) {
-      if (pending.thread_id < storage_owner_threads_.size() && storage_owner_threads_[pending.thread_id]) {
-        auto& balance = storage_owner_threads_[pending.thread_id]->post_balances[pending.coroutine_id];
-        --balance;
-        peer_async_rdma_outstanding_.fetch_sub(1, std::memory_order_acq_rel);
-      }
+      lib_assert(pending.thread != nullptr, "async peer RDMA completion has no owner thread");
+      lib_assert(pending.coroutine_id < pending.thread->post_balances.size(),
+                 "async peer RDMA completion has invalid coroutine id");
+      auto& balance = pending.thread->post_balances[pending.coroutine_id];
+      --balance;
+      peer_async_rdma_outstanding_.fetch_sub(1, std::memory_order_acq_rel);
       return;
     }
   }
@@ -274,7 +275,7 @@ void MemoryNode::post_peer_read_async(StorageOwnerThread& thread,
   std::lock_guard<std::mutex> send_lock(peer_send_mutex_);
   register_peer_pending_send_locked(
     wr_id,
-    PeerPendingSend{shard_id, qp_idx, thread.id, thread.running_coroutine, true, true});
+    PeerPendingSend{shard_id, qp_idx, thread.id, thread.running_coroutine, &thread, true, true});
   qp->post_send(reinterpret_cast<u64>(dst),
                 static_cast<u32>(bytes),
                 thread.scratch_region->get_lkey(),
@@ -325,7 +326,7 @@ void MemoryNode::remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, s
     std::lock_guard<std::mutex> send_lock(peer_send_mutex_);
     register_peer_pending_send_locked(
       wr_id,
-      PeerPendingSend{shard_id, qp_idx, 0, 0, false, true});
+      PeerPendingSend{shard_id, qp_idx, 0, 0, nullptr, false, true});
     qp->post_send(reinterpret_cast<u64>(scratch),
                   static_cast<u32>(bytes),
                   scratch_region.get_lkey(),
@@ -429,7 +430,7 @@ u64 MemoryNode::remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 exp
     std::lock_guard<std::mutex> send_lock(peer_send_mutex_);
     register_peer_pending_send_locked(
       wr_id,
-      PeerPendingSend{shard_id, qp_idx, 0, 0, false, true});
+      PeerPendingSend{shard_id, qp_idx, 0, 0, nullptr, false, true});
     qp->post_CAS(reinterpret_cast<u64>(scratch),
                  scratch_region.get_lkey(),
                  peer_remote_tokens_[shard_id].get(),

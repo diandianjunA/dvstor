@@ -58,11 +58,14 @@ struct PeerRpcRuntimeState {
   u32 recv_slots_per_peer{1};
 };
 
+struct StorageOwnerThread;
+
 struct PeerPendingSend {
   u32 target_shard{};
   u32 target_qp_idx{};
   u32 thread_id{};
   u32 coroutine_id{};
+  StorageOwnerThread* thread{};
   bool async{};
   bool rdma_read_credit{};
 };
