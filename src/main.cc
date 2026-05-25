@@ -1,6 +1,6 @@
 #include "common/configuration.hh"
 #include "common/distance.hh"
-#include "memory_node.hh"
+#include "memory_node/memory_node.hh"
 #include "service/compute_service.hh"
 
 #include <csignal>

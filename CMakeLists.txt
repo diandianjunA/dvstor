@@ -57,9 +57,33 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/thirdparty)
 add_subdirectory(rdma-library)
 add_subdirectory(thirdparty)
 
+set(DVSTOR_MEMORY_NODE_SOURCES
+    src/memory_node/memory_node.cc
+    src/memory_node/peer_rdma.cc
+    src/memory_node/peer_rpc.cc
+    src/memory_node/storage_owner_index.cc
+    src/memory_node/storage_owner_runtime.cc
+)
+
+set(DVSTOR_OFFLINE_BUILDER_SOURCES
+    tools/vamana_offline/config.cc
+    tools/vamana_offline/dataset_io.cc
+    tools/vamana_offline/graph.cc
+    tools/vamana_offline/progress.cc
+    tools/vamana_offline/rabitq.cc
+    tools/vamana_offline/shard_writer.cc
+)
+
+set(DVSTOR_BREAKDOWN_BENCHMARK_SOURCES
+    tools/breakdown_benchmark/args.cc
+    tools/breakdown_benchmark/progress.cc
+    tools/breakdown_benchmark/workload.cc
+)
+
 if (DVSTOR_STORAGE_NODE_ONLY)
     add_executable(dvstor_memory_node
         src/memory_node_main.cc
+        ${DVSTOR_MEMORY_NODE_SOURCES}
         src/common/core_assignment.cc
         src/common/timing.cc
         src/service/rabitq_artifacts.cc
@@ -121,6 +145,7 @@ else ()
 
     add_executable(dvstor_memory_node
         src/memory_node_main.cc
+        ${DVSTOR_MEMORY_NODE_SOURCES}
         src/common/core_assignment.cc
         src/common/timing.cc
         src/service/rabitq_artifacts.cc
@@ -136,7 +161,10 @@ else ()
         add_executable(dvstor src/main.cc)
         target_link_libraries(dvstor dvstor_runtime)
 
-        add_executable(vamana_offline_builder tools/vamana_offline_builder.cc)
+        add_executable(vamana_offline_builder
+            tools/vamana_offline_builder.cc
+            ${DVSTOR_OFFLINE_BUILDER_SOURCES}
+        )
         target_include_directories(vamana_offline_builder PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
@@ -150,7 +178,10 @@ else ()
             CUDA::cublas
         )
 
-        add_executable(dvstor_breakdown_benchmark tools/dvstor_breakdown_benchmark.cc)
+        add_executable(dvstor_breakdown_benchmark
+            tools/dvstor_breakdown_benchmark.cc
+            ${DVSTOR_BREAKDOWN_BENCHMARK_SOURCES}
+        )
         target_include_directories(dvstor_breakdown_benchmark PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library

@@ -1,5 +1,5 @@
 #include "common/configuration.hh"
-#include "memory_node.hh"
+#include "memory_node/memory_node.hh"
 
 #include <cstdlib>
 
