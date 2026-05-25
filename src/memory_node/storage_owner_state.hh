@@ -186,12 +186,15 @@ struct StorageOwnerThread {
     }
   }
 
-  void init_peer_scratch(Context& peer_context, size_t bytes) {
-    scratch_buffer.allocate(bytes);
+  void init_peer_scratch(Context& peer_context, size_t bytes, size_t per_coroutine_stride = 0) {
+    scratch_stride = per_coroutine_stride == 0
+                       ? align_to_cacheline(VamanaNode::total_size())
+                       : align_to_cacheline(per_coroutine_stride);
+    const size_t required_bytes = static_cast<size_t>(std::max<size_t>(1, post_balances.size())) * scratch_stride;
+    scratch_buffer.allocate(std::max(bytes, required_bytes));
     scratch_buffer.touch_memory();
     scratch_region = std::make_unique<LocalMemoryRegion>(
       peer_context, scratch_buffer.get_full_buffer(), scratch_buffer.buffer_size);
-    scratch_stride = align_to_cacheline(VamanaNode::total_size());
   }
 
   bool has_peer_scratch() const { return scratch_region != nullptr; }

@@ -3,6 +3,49 @@
 #include <algorithm>
 #include <iostream>
 
+namespace {
+
+using Configuration = configuration::IndexConfiguration;
+using NodeSnapshot = memory_node_detail::NodeSnapshot;
+
+size_t aligned_snapshot_bytes() {
+  size_t value = VamanaNode::size_until_vector_end();
+  while (value % CACHELINE_SIZE != 0) {
+    ++value;
+  }
+  return value;
+}
+
+u32 storage_owner_construction_width(const Configuration& config) {
+  const u32 configured = config.storage_owner_construction_beam_width == 0
+                           ? config.beam_width_construction
+                           : config.storage_owner_construction_beam_width;
+  return std::max<u32>(1, std::min(config.beam_width_construction, configured));
+}
+
+u32 storage_owner_snapshot_batch_size(const Configuration& config) {
+  return std::max<u32>(1, config.storage_owner_search_snapshot_batch);
+}
+
+u32 storage_owner_prune_candidate_limit(const Configuration& config) {
+  if (config.storage_owner_prune_max_candidates == 0) {
+    return std::numeric_limits<u32>::max();
+  }
+  return std::max(config.R, config.storage_owner_prune_max_candidates);
+}
+
+void parse_node_snapshot(RemotePtr rptr, const byte_t* ptr, NodeSnapshot& snapshot) {
+  snapshot = NodeSnapshot{};
+  snapshot.rptr = rptr;
+  snapshot.components.resize(VamanaNode::DIM);
+  snapshot.header = *reinterpret_cast<const u64*>(ptr);
+  snapshot.id = *reinterpret_cast<const u32*>(ptr + VamanaNode::offset_id());
+  snapshot.edge_count = *reinterpret_cast<const u8*>(ptr + VamanaNode::offset_edge_count());
+  std::memcpy(snapshot.components.data(), ptr + VamanaNode::offset_vector(), VamanaNode::DIM * sizeof(element_t));
+}
+
+}  // namespace
+
 RemotePtr MemoryNode::allocate_local_node() {
   size_t node_size = VamanaNode::total_size();
   while (node_size % 8 != 0) {
@@ -213,6 +256,151 @@ auto MemoryNode::async_read_node_snapshot(RemotePtr rptr, StorageOwnerThread& th
   return Awaitable{false, rptr, buffer, {}, this, &thread};
 }
 
+auto MemoryNode::async_read_node_snapshots(const vec<RemotePtr>& rptrs,
+                                           const Configuration& config,
+                                           StorageOwnerThread& thread) {
+  struct PendingRead {
+    RemotePtr rptr;
+    byte_t* buffer{};
+  };
+
+  struct Awaitable {
+    bool ready{true};
+    vec<NodeSnapshot> snapshots;
+    vec<PendingRead> pending;
+    StorageOwnerThread* thread{};
+
+    bool await_ready() const { return ready; }
+    static void await_suspend(std::coroutine_handle<>) {}
+    vec<NodeSnapshot> await_resume() {
+      for (const PendingRead& read : pending) {
+        NodeSnapshot snapshot;
+        parse_node_snapshot(read.rptr, read.buffer, snapshot);
+        thread->cache.insert_snapshot(snapshot);
+        snapshots.push_back(std::move(snapshot));
+      }
+      return std::move(snapshots);
+    }
+  };
+
+  Awaitable awaitable;
+  awaitable.snapshots.reserve(rptrs.size());
+  awaitable.pending.reserve(rptrs.size());
+  awaitable.thread = &thread;
+
+  const size_t snapshot_size = VamanaNode::size_until_vector_end();
+  const size_t snapshot_stride = aligned_snapshot_bytes();
+  const u32 max_batch = storage_owner_snapshot_batch_size(config);
+  lib_assert(rptrs.size() <= max_batch, "storage-owner snapshot batch exceeds configured limit");
+
+  u32 remote_slot = 0;
+  for (const RemotePtr& rptr : rptrs) {
+    if (rptr.is_null()) {
+      continue;
+    }
+
+    NodeSnapshot snapshot;
+    if (thread.cache.lookup_snapshot(rptr, snapshot)) {
+      awaitable.snapshots.push_back(std::move(snapshot));
+      continue;
+    }
+
+    if (local_shard(rptr.memory_node())) {
+      read_node_snapshot(rptr, snapshot);
+      awaitable.snapshots.push_back(std::move(snapshot));
+      continue;
+    }
+
+    const size_t scratch_offset = static_cast<size_t>(remote_slot) * snapshot_stride;
+    lib_assert(scratch_offset + snapshot_size <= thread.scratch_stride,
+               "storage-owner coroutine scratch stride is too small for snapshot batch");
+    byte_t* buffer = thread.coroutine_scratch(scratch_offset);
+    post_peer_read_async(thread, rptr.memory_node(), rptr.byte_offset(), buffer, snapshot_size);
+    awaitable.pending.push_back(PendingRead{rptr, buffer});
+    awaitable.ready = false;
+    ++remote_slot;
+  }
+
+  return awaitable;
+}
+
+vec<MemoryNode::NodeSnapshot> MemoryNode::read_node_snapshots_batched(const vec<RemotePtr>& rptrs,
+                                                                      const Configuration& config) {
+  vec<NodeSnapshot> snapshots;
+  snapshots.reserve(rptrs.size());
+  if (rptrs.empty()) {
+    return snapshots;
+  }
+
+  StorageOwnerThread* thread = current_storage_owner_thread_;
+  if (thread == nullptr || !thread->has_peer_scratch()) {
+    for (const RemotePtr& rptr : rptrs) {
+      NodeSnapshot snapshot;
+      if (!rptr.is_null() && read_node_snapshot(rptr, snapshot)) {
+        snapshots.push_back(std::move(snapshot));
+      }
+    }
+    return snapshots;
+  }
+
+  struct PendingRead {
+    RemotePtr rptr;
+    byte_t* buffer{};
+  };
+
+  const size_t snapshot_size = VamanaNode::size_until_vector_end();
+  const size_t snapshot_stride = aligned_snapshot_bytes();
+  const size_t max_batch = storage_owner_snapshot_batch_size(config);
+
+  for (size_t begin = 0; begin < rptrs.size(); begin += max_batch) {
+    const size_t end = std::min(rptrs.size(), begin + max_batch);
+    vec<PendingRead> pending;
+    pending.reserve(end - begin);
+    u32 remote_slot = 0;
+
+    for (size_t idx = begin; idx < end; ++idx) {
+      const RemotePtr& rptr = rptrs[idx];
+      if (rptr.is_null()) {
+        continue;
+      }
+
+      NodeSnapshot snapshot;
+      if (thread->cache.lookup_snapshot(rptr, snapshot)) {
+        snapshots.push_back(std::move(snapshot));
+        continue;
+      }
+
+      if (local_shard(rptr.memory_node())) {
+        read_node_snapshot(rptr, snapshot);
+        snapshots.push_back(std::move(snapshot));
+        continue;
+      }
+
+      const size_t scratch_offset = static_cast<size_t>(remote_slot) * snapshot_stride;
+      lib_assert(scratch_offset + snapshot_size <= thread->scratch_stride,
+                 "storage-owner coroutine scratch stride is too small for snapshot batch");
+      byte_t* buffer = thread->coroutine_scratch(scratch_offset);
+      post_peer_read_async(*thread, rptr.memory_node(), rptr.byte_offset(), buffer, snapshot_size);
+      pending.push_back(PendingRead{rptr, buffer});
+      ++remote_slot;
+    }
+
+    while (!thread->is_ready(thread->running_coroutine)) {
+      poll_peer_send_cq();
+      std::this_thread::yield();
+    }
+
+    for (const PendingRead& read : pending) {
+      NodeSnapshot snapshot;
+      parse_node_snapshot(read.rptr, read.buffer, snapshot);
+      thread->cache.insert_snapshot(snapshot);
+      snapshots.push_back(std::move(snapshot));
+    }
+  }
+
+  return snapshots;
+}
+
 auto MemoryNode::async_read_neighbor_list(RemotePtr rptr, StorageOwnerThread& thread) {
   struct Awaitable {
     bool ready{};
@@ -411,26 +599,39 @@ vec<RemotePtr> MemoryNode::beam_search_candidates(const span<const element_t> qu
     if (breakdown != nullptr) {
       breakdown->storage_owner_search_neighbor_read_ns += elapsed_ns_since(t_neighbor_read);
     }
+    vec<RemotePtr> unvisited_neighbors;
+    unvisited_neighbors.reserve(neighbors.size());
     for (const RemotePtr& neighbor : neighbors) {
       if (neighbor.is_null() || visited.contains(neighbor)) {
         continue;
       }
       visited.insert(neighbor);
-      NodeSnapshot snapshot;
+      unvisited_neighbors.push_back(neighbor);
+    }
+
+    const u32 snapshot_batch = storage_owner_snapshot_batch_size(config);
+    const u32 construction_width = storage_owner_construction_width(config);
+    for (size_t begin = 0; begin < unvisited_neighbors.size(); begin += snapshot_batch) {
+      const size_t end = std::min(unvisited_neighbors.size(), begin + snapshot_batch);
+      vec<RemotePtr> batch;
+      batch.reserve(end - begin);
+      batch.insert(batch.end(), unvisited_neighbors.begin() + begin, unvisited_neighbors.begin() + end);
       t_snapshot = std::chrono::steady_clock::now();
-      read_node_snapshot(neighbor, snapshot);
+      vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
       if (breakdown != nullptr) {
         breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snapshot);
       }
-      t_distance = std::chrono::steady_clock::now();
-      const distance_t dist = distance_fn()(query, snapshot.components, config.dim);
-      if (breakdown != nullptr) {
-        breakdown->storage_owner_search_distance_ns += elapsed_ns_since(t_distance);
-      }
-      auto t_beam_update = std::chrono::steady_clock::now();
-      insert_into_beam(beam, neighbor, dist, config.beam_width_construction);
-      if (breakdown != nullptr) {
-        breakdown->storage_owner_search_beam_update_ns += elapsed_ns_since(t_beam_update);
+      for (const NodeSnapshot& snapshot : snapshots) {
+        t_distance = std::chrono::steady_clock::now();
+        const distance_t dist = distance_fn()(query, snapshot.components, config.dim);
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_distance_ns += elapsed_ns_since(t_distance);
+        }
+        auto t_beam_update = std::chrono::steady_clock::now();
+        insert_into_beam(beam, snapshot.rptr, dist, construction_width);
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_beam_update_ns += elapsed_ns_since(t_beam_update);
+        }
       }
     }
   }
@@ -492,25 +693,39 @@ auto MemoryNode::beam_search_candidates_async(const span<const element_t> query,
     if (breakdown != nullptr) {
       breakdown->storage_owner_search_neighbor_read_ns += elapsed_ns_since(t_neighbor_read);
     }
+    vec<RemotePtr> unvisited_neighbors;
+    unvisited_neighbors.reserve(neighbors.size());
     for (const RemotePtr& neighbor : neighbors) {
       if (neighbor.is_null() || visited.contains(neighbor)) {
         continue;
       }
       visited.insert(neighbor);
+      unvisited_neighbors.push_back(neighbor);
+    }
+
+    const u32 snapshot_batch = storage_owner_snapshot_batch_size(config);
+    const u32 construction_width = storage_owner_construction_width(config);
+    for (size_t begin = 0; begin < unvisited_neighbors.size(); begin += snapshot_batch) {
+      const size_t end = std::min(unvisited_neighbors.size(), begin + snapshot_batch);
+      vec<RemotePtr> batch;
+      batch.reserve(end - begin);
+      batch.insert(batch.end(), unvisited_neighbors.begin() + begin, unvisited_neighbors.begin() + end);
       t_snapshot = std::chrono::steady_clock::now();
-      NodeSnapshot snapshot = co_await async_read_node_snapshot(neighbor, thread);
+      vec<NodeSnapshot> snapshots = co_await async_read_node_snapshots(batch, config, thread);
       if (breakdown != nullptr) {
         breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snapshot);
       }
-      t_distance = std::chrono::steady_clock::now();
-      const distance_t dist = distance_fn()(query, snapshot.components, config.dim);
-      if (breakdown != nullptr) {
-        breakdown->storage_owner_search_distance_ns += elapsed_ns_since(t_distance);
-      }
-      auto t_beam_update = std::chrono::steady_clock::now();
-      insert_into_beam(beam, neighbor, dist, config.beam_width_construction);
-      if (breakdown != nullptr) {
-        breakdown->storage_owner_search_beam_update_ns += elapsed_ns_since(t_beam_update);
+      for (const NodeSnapshot& snapshot : snapshots) {
+        t_distance = std::chrono::steady_clock::now();
+        const distance_t dist = distance_fn()(query, snapshot.components, config.dim);
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_distance_ns += elapsed_ns_since(t_distance);
+        }
+        auto t_beam_update = std::chrono::steady_clock::now();
+        insert_into_beam(beam, snapshot.rptr, dist, construction_width);
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_beam_update_ns += elapsed_ns_since(t_beam_update);
+        }
       }
     }
   }
@@ -541,22 +756,38 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const span<const element_t> source,
 
   vec<CandidateInfo> infos;
   infos.reserve(candidates.size());
+  vec<RemotePtr> filtered;
+  filtered.reserve(std::min<size_t>(candidates.size(), storage_owner_prune_candidate_limit(config)));
+  const u32 prune_candidate_limit = storage_owner_prune_candidate_limit(config);
   for (const RemotePtr& candidate : candidates) {
     if (candidate.is_null() || skip.contains(candidate)) {
       continue;
     }
-    NodeSnapshot snapshot;
+    filtered.push_back(candidate);
+    if (filtered.size() >= prune_candidate_limit) {
+      break;
+    }
+  }
+
+  const u32 snapshot_batch = storage_owner_snapshot_batch_size(config);
+  for (size_t begin = 0; begin < filtered.size(); begin += snapshot_batch) {
+    const size_t end = std::min(filtered.size(), begin + snapshot_batch);
+    vec<RemotePtr> batch;
+    batch.reserve(end - begin);
+    batch.insert(batch.end(), filtered.begin() + begin, filtered.begin() + end);
     auto t_snapshot = std::chrono::steady_clock::now();
-    read_node_snapshot(candidate, snapshot);
+    vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
     if (breakdown != nullptr) {
       breakdown->storage_owner_prune_snapshot_read_ns += elapsed_ns_since(t_snapshot);
     }
-    auto t_distance = std::chrono::steady_clock::now();
-    const distance_t dist = distance_fn()(source, snapshot.components, config.dim);
-    if (breakdown != nullptr) {
-      breakdown->storage_owner_prune_distance_ns += elapsed_ns_since(t_distance);
+    for (NodeSnapshot& snapshot : snapshots) {
+      auto t_distance = std::chrono::steady_clock::now();
+      const distance_t dist = distance_fn()(source, snapshot.components, config.dim);
+      if (breakdown != nullptr) {
+        breakdown->storage_owner_prune_distance_ns += elapsed_ns_since(t_distance);
+      }
+      infos.push_back({snapshot.rptr, dist, std::move(snapshot.components)});
     }
-    infos.push_back({candidate, dist, std::move(snapshot.components)});
   }
 
   auto t_sort = std::chrono::steady_clock::now();
