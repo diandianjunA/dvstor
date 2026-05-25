@@ -20,6 +20,14 @@
 
 namespace tools::breakdown_benchmark {
 
+struct MixedPhaseStats {
+  uint32_t next_insert_id{};
+  size_t issued_reads{};
+  size_t issued_writes{};
+  size_t completed_reads{};
+  size_t completed_writes{};
+};
+
 std::vector<float> make_deterministic_vector(uint32_t seed, size_t dim) {
   std::vector<float> vector(dim, 0.0f);
   uint64_t state = 1469598103934665603ull ^ static_cast<uint64_t>(seed);

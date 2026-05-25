@@ -7,9 +7,14 @@
 namespace tools::vamana_offline {
 
 struct RaBitQState {
-  Eigen::MatrixXf rotation_matrix;  // dim x dim, column-major
-  vec<float> rotated_centroid;       // dim
+  Eigen::MatrixXf rotation_matrix;
+  vec<float> rotated_centroid;
   double t_const{0.0};
+  u32 dim{0};
+  u32 bits_per_dim{0};
+  u32 packed_bytes{0};
+  u32 total_rabitq_bytes{0};
+};
 
 double best_rescale_factor(const float* abs_unit_residual, size_t dim, size_t bits_per_dim);
 double get_const_scaling_factors(size_t dim, size_t bits_per_dim, uint64_t seed);

@@ -166,6 +166,7 @@ else ()
             ${DVSTOR_OFFLINE_BUILDER_SOURCES}
         )
         target_include_directories(vamana_offline_builder PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
             ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
@@ -183,6 +184,7 @@ else ()
             ${DVSTOR_BREAKDOWN_BENCHMARK_SOURCES}
         )
         target_include_directories(dvstor_breakdown_benchmark PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/src
             ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
             ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty

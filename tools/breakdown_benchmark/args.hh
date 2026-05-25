@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -13,6 +14,19 @@ using ConfigMap = std::unordered_map<std::string, std::string>;
 struct Args {
   std::string service_config_path;
   std::string workload{"both"};
+  size_t warmup_ops{100};
+  size_t measure_ops{1000};
+  size_t warmup_seconds{0};
+  size_t measure_seconds{0};
+  size_t client_threads{4};
+  double read_ratio{0.5};
+  std::string query_file;
+  std::string insert_file;
+  bool synthetic{false};
+  std::string report_json_path;
+  std::string report_text_path;
+  uint32_t insert_start_id{0};
+};
 
 ConfigMap read_config(const std::string& path);
 std::vector<std::string> build_service_argv(const std::string& service_config_path);

@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <exception>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <utility>
 #include <unistd.h>
 
 #include "common/types.hh"
@@ -92,6 +94,11 @@ private:
   const bool interactive_;
   const std::chrono::steady_clock::time_point start_;
   std::atomic<size_t> current_{0};
+  std::atomic<bool> finished_{false};
+  size_t last_bucket_{0};
+  std::chrono::steady_clock::time_point last_render_;
+  std::thread thread_;
+};
 
 template <class Function>
 void parallel_for(size_t begin, size_t end, size_t num_threads, Function&& fn) {
