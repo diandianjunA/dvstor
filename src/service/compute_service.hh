@@ -213,6 +213,7 @@ private:
 
   std::atomic<bool> shutdown_{false};
   std::atomic<size_t> vectors_inserted_{0};
+  std::atomic<u64> graph_epoch_{1};
 
   std::mutex mn_command_mutex_;
   std::atomic<bool> workers_paused_{false};

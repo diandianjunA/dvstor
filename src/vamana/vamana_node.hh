@@ -4,6 +4,7 @@
 
 #include <library/utils.hh>
 
+#include "common/types.hh"
 #include "remote_pointer.hh"
 
 // forward declaration
@@ -87,6 +88,7 @@ public:  // static storage
       return Layout::rabitq_search_block;
     }
     lib_failure("unknown Vamana node layout: " + name);
+    return Layout::legacy;
   }
 
   static str layout_name(Layout layout) {

@@ -25,6 +25,7 @@ public:
 
     table_keys_.assign(table_capacity_, 0);
     table_slots_.assign(table_capacity_, kInvalidSlot);
+    table_generations_.assign(table_capacity_, 0);
     slot_keys_.assign(slot_count_, 0);
     slot_counts_.assign(slot_count_, 0);
     slot_refs_.assign(slot_count_, 0);
@@ -34,6 +35,24 @@ public:
 
   bool enabled() const { return enabled_; }
 
+  void clear() {
+    if (!enabled_) {
+      return;
+    }
+    if (++generation_ == 0) {
+      std::fill(table_keys_.begin(), table_keys_.end(), 0);
+      std::fill(table_slots_.begin(), table_slots_.end(), kInvalidSlot);
+      std::fill(table_generations_.begin(), table_generations_.end(), 0);
+      std::fill(slot_keys_.begin(), slot_keys_.end(), 0);
+      std::fill(slot_counts_.begin(), slot_counts_.end(), 0);
+      std::fill(slot_refs_.begin(), slot_refs_.end(), 0);
+      std::fill(neighbors_.begin(), neighbors_.end(), RemotePtr{});
+      generation_ = 1;
+    }
+    next_slot_ = 0;
+    clock_hand_ = 0;
+  }
+
   bool lookup(RemotePtr key, u8& count, const RemotePtr*& neighbors) {
     if (!enabled_ || key.is_null()) {
       return false;
@@ -41,7 +60,7 @@ public:
 
     size_t pos = hash(key.raw_address) & (table_capacity_ - 1);
     for (size_t probe = 0; probe < table_capacity_; ++probe) {
-      const u64 table_key = table_keys_[pos];
+      const u64 table_key = table_generations_[pos] == generation_ ? table_keys_[pos] : 0;
       if (table_key == 0) {
         return false;
       }
@@ -65,15 +84,17 @@ public:
     const u32 count = static_cast<u32>(std::min<size_t>(values.size(), VamanaNode::R));
     size_t pos = hash(key.raw_address) & (table_capacity_ - 1);
     for (size_t probe = 0; probe < table_capacity_; ++probe) {
-      if (table_keys_[pos] == key.raw_address) {
+      const bool occupied = table_generations_[pos] == generation_ && table_keys_[pos] != 0;
+      if (occupied && table_keys_[pos] == key.raw_address) {
         const u32 slot = table_slots_[pos];
         store_slot(slot, key.raw_address, values, count);
         return;
       }
-      if (table_keys_[pos] == 0) {
+      if (!occupied) {
         const u32 slot = allocate_slot();
         table_keys_[pos] = key.raw_address;
         table_slots_[pos] = slot;
+        table_generations_[pos] = generation_;
         store_slot(slot, key.raw_address, values, count);
         return;
       }
@@ -106,12 +127,14 @@ private:
   void remove_from_table(u64 key) {
     size_t pos = hash(key) & (table_capacity_ - 1);
     for (size_t probe = 0; probe < table_capacity_; ++probe) {
-      if (table_keys_[pos] == 0) {
+      const bool occupied = table_generations_[pos] == generation_ && table_keys_[pos] != 0;
+      if (!occupied) {
         return;
       }
       if (table_keys_[pos] == key) {
         table_keys_[pos] = 0;
         table_slots_[pos] = kInvalidSlot;
+        table_generations_[pos] = 0;
         rehash_cluster((pos + 1) & (table_capacity_ - 1));
         return;
       }
@@ -120,18 +143,20 @@ private:
   }
 
   void rehash_cluster(size_t pos) {
-    while (table_keys_[pos] != 0) {
+    while (table_generations_[pos] == generation_ && table_keys_[pos] != 0) {
       const u64 key = table_keys_[pos];
       const u32 slot = table_slots_[pos];
       table_keys_[pos] = 0;
       table_slots_[pos] = kInvalidSlot;
+      table_generations_[pos] = 0;
 
       size_t dst = hash(key) & (table_capacity_ - 1);
-      while (table_keys_[dst] != 0) {
+      while (table_generations_[dst] == generation_ && table_keys_[dst] != 0) {
         dst = (dst + 1) & (table_capacity_ - 1);
       }
       table_keys_[dst] = key;
       table_slots_[dst] = slot;
+      table_generations_[dst] = generation_;
       pos = (pos + 1) & (table_capacity_ - 1);
     }
   }
@@ -173,9 +198,11 @@ private:
   size_t table_capacity_{0};
   u32 next_slot_{0};
   u32 clock_hand_{0};
+  u32 generation_{1};
 
   std::vector<u64> table_keys_;
   std::vector<u32> table_slots_;
+  std::vector<u32> table_generations_;
   std::vector<u64> slot_keys_;
   std::vector<u8> slot_counts_;
   std::vector<u8> slot_refs_;

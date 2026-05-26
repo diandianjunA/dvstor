@@ -1,5 +1,6 @@
 #include "memory_node/memory_node.hh"
 
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 
@@ -34,6 +35,22 @@ MemoryNode::MemoryNode(Configuration& config)
 
   num_compute_threads_ = p.num_threads;
   VamanaNode::init_static_storage(config.dim, config.R, config.rabitq_bits);
+  const filepath_t index_prefix = config.resolved_index_prefix();
+  const filepath_t meta_file = filepath_t(index_prefix.string() + ".meta.json");
+  if (!index_prefix.empty() && std::filesystem::exists(meta_file)) {
+    service::rabitq::Artifacts metadata;
+    str metadata_error;
+    lib_assert(service::rabitq::load_metadata(index_prefix, metadata, &metadata_error), metadata_error);
+    lib_assert(metadata.dim == config.dim, "index metadata dim mismatch on storage node");
+    lib_assert(metadata.rabitq_bits == config.rabitq_bits, "index metadata RaBitQ bits mismatch on storage node");
+    lib_assert(metadata.rabitq_size == VamanaNode::RABITQ_SIZE, "index metadata RaBitQ size mismatch on storage node");
+    lib_assert(metadata.R == config.R, "index metadata R mismatch on storage node");
+    lib_assert(metadata.node_size == VamanaNode::total_size(), "index metadata node size mismatch on storage node");
+    lib_assert(metadata.num_memory_nodes == num_storage_nodes_, "index metadata storage-node count mismatch");
+    VamanaNode::set_layout(VamanaNode::parse_layout(metadata.node_layout));
+    print_status("loaded index metadata from " + index_prefix.string() +
+                 " (layout=" + VamanaNode::layout_name() + ")");
+  }
   allocate_memory();
 
   // free-ptr is initialized to 16 (points to first free address in the buffer)

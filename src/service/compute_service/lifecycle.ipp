@@ -54,6 +54,9 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                                               config_.use_cache,
                                               static_cast<u64>(config_.cn_memory_gb) * 1073741824ul);
   worker_pool_->allocate_worker_threads(context_, cm_, remote_access_tokens_, config_.num_coroutines);
+  for (auto& thread : compute_threads()) {
+    thread->set_graph_epoch_source(&graph_epoch_);
+  }
 
   // Initialize GPU buffers for each compute thread
   const u32 search_batch =
@@ -207,4 +210,3 @@ void ComputeService<Distance>::shutdown_remote_if_requested() {
 
   send_index_command(mn_command::SHUTDOWN, "");
 }
-

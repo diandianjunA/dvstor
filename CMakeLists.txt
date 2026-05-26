@@ -179,6 +179,17 @@ else ()
             CUDA::cublas
         )
 
+        add_executable(vamana_layout_converter
+            tools/vamana_layout_converter.cc
+        )
+        target_include_directories(vamana_layout_converter PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
+            ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
+        )
+        target_link_libraries(vamana_layout_converter rdma_library)
+
         add_executable(dvstor_breakdown_benchmark
             tools/dvstor_breakdown_benchmark.cc
             ${DVSTOR_BREAKDOWN_BENCHMARK_SOURCES}

@@ -61,6 +61,9 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
       }
     }
     vectors_inserted_.fetch_add(inserted, std::memory_order_relaxed);
+    if (inserted > 0) {
+      graph_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    }
     return inserted;
   }
 
@@ -101,6 +104,9 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
     }
   }
   vectors_inserted_.fetch_add(inserted, std::memory_order_relaxed);
+  if (inserted > 0) {
+    graph_epoch_.fetch_add(1, std::memory_order_acq_rel);
+  }
 
   for (auto* request : requests) {
     delete request;
@@ -435,6 +441,23 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
     const auto* breakdown = response_ok
                               ? service::storage_owner::response_breakdown(slot.response_buffer.data(), slot.item_count)
                               : nullptr;
+    if (!response_ok) {
+      static std::atomic<u32> bad_response_logs{0};
+      const u32 log_index = bad_response_logs.fetch_add(1, std::memory_order_relaxed);
+      if (log_index < 16) {
+        std::cerr << "[storage-owner] invalid insert response"
+                  << " owner=" << slot.owner_storage
+                  << " slot=" << slot.slot_id
+                  << " magic=0x" << std::hex << response->magic << std::dec
+                  << " response_owner=" << response->owner_storage
+                  << " expected_owner=" << slot.owner_storage
+                  << " batch_id=" << response->batch_id
+                  << " expected_batch_id=" << slot.batch_id
+                  << " item_count=" << response->item_count
+                  << " expected_item_count=" << slot.item_count
+                  << std::endl;
+      }
+    }
     const u64 memory_breakdown_ns = breakdown == nullptr ? 0 : breakdown->total();
     const u64 send_ns = duration_ns_clamped(slot.send_posted_at, slot.send_completed_at);
     const u64 response_wait_ns = duration_ns_clamped(slot.send_completed_at, slot.response_completed_at);
@@ -445,6 +468,19 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
     for (u32 i = 0; i < slot.item_count; ++i) {
       const bool ok = response_ok &&
                       statuses[i] == static_cast<u32>(service::storage_owner::InsertStatus::ok);
+      if (response_ok && !ok) {
+        static std::atomic<u32> failed_status_logs{0};
+        const u32 log_index = failed_status_logs.fetch_add(1, std::memory_order_relaxed);
+        if (log_index < 16) {
+          std::cerr << "[storage-owner] insert failed"
+                    << " owner=" << slot.owner_storage
+                    << " slot=" << slot.slot_id
+                    << " batch_id=" << slot.batch_id
+                    << " item=" << i
+                    << " status=" << statuses[i]
+                    << std::endl;
+        }
+      }
       if (slot.samples[i]) {
         add_storage_owner_sender_breakdown(
           slot.samples[i],
@@ -496,4 +532,3 @@ void ComputeService<Distance>::fail_storage_owner_tasks(vec<std::unique_ptr<Stor
   }
   tasks.clear();
 }
-

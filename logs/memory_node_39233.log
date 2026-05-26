@@ -1,0 +1,38 @@
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     39233
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/tmp/dvstor_offline_layout_smoke_39233_3396233/index/offline_layout_node1_of1.dat"
+============================================================
+1 device(s) found
+Selected device: mlx5_0
+Selected port state: 4, lid: 1
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 800 -- 801
+[STATUS]: loaded index metadata from /tmp/dvstor_offline_layout_smoke_39233_3396233/index/offline_layout (layout=rabitq_search_block)
+allocation size: 2147483648
+allocated ALIGNED MEM (no hugepage) at 139899737436224 with buffer size 2147483648
+[STATUS]: loading index (37904 Bytes) from /tmp/dvstor_offline_layout_smoke_39233_3396233/index/offline_layout_node1_of1.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 802 -- 803
+pairing: 804 -- 805
+pairing: 806 -- 807
+pairing: 808 -- 809
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (37904 Bytes) from /tmp/dvstor_offline_layout_smoke_39233_3396233/index/offline_layout_node1_of1.dat
+[STATUS]: loaded RaBitQ artifacts from /tmp/dvstor_offline_layout_smoke_39233_3396233/index/offline_layout (dim=32, bits=4, layout=rabitq_search_block)
+allocated ALIGNED MEM (no hugepage) at 94309721433280 with buffer size 4864
+[STATUS]: storage-owner peer RDMA read credits per peer: 8 per QP: 8 (requested=8)
+[STATUS]: storage-owner online insert tuning: construction_beam=64 snapshot_batch=16 prune_max_candidates=32
+[STATUS]: storage-owner insert runtime enabled on shard 0

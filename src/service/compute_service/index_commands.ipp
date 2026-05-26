@@ -26,6 +26,7 @@ bool ComputeService<Distance>::load_index(const std::string& path, str* error_me
     routing_centroids_[cm_.client_id] = compute_local_routing_centroid();
   }
 
+  graph_epoch_.fetch_add(1, std::memory_order_acq_rel);
   resume_rpc();
   refresh_routing_state(false);
   resume_workers();
@@ -253,6 +254,24 @@ typename ComputeService<Distance>::ServiceProfile ComputeService<Distance>::reso
 template <class Distance>
 bool ComputeService<Distance>::maybe_load_rabitq_artifacts(const filepath_t& index_prefix, str* error_message) {
   if (!config_.use_rabitq_search()) {
+    const filepath_t meta_file = filepath_t(index_prefix.string() + ".meta.json");
+    if (!index_prefix.empty() && std::filesystem::exists(meta_file)) {
+      service::rabitq::Artifacts metadata;
+      if (!service::rabitq::load_metadata(index_prefix, metadata, error_message)) {
+        return false;
+      }
+      if (metadata.dim != config_.dim || metadata.rabitq_bits != config_.rabitq_bits ||
+          metadata.rabitq_size != VamanaNode::RABITQ_SIZE || metadata.R != config_.R ||
+          metadata.node_size != VamanaNode::total_size() || metadata.num_memory_nodes != num_servers_) {
+        if (error_message) {
+          *error_message = "index metadata does not match runtime Vamana configuration";
+        }
+        return false;
+      }
+      VamanaNode::set_layout(VamanaNode::parse_layout(metadata.node_layout));
+      print_status("loaded index metadata from " + index_prefix.string() +
+                   " (layout=" + VamanaNode::layout_name() + ")");
+    }
     return true;
   }
 

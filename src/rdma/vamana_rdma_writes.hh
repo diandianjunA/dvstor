@@ -5,6 +5,8 @@
  * Follows the same patterns as rdma_writes.hh for HNSW.
  */
 
+#include <cstring>
+
 #include "compute_thread.hh"
 #include "coroutine.hh"
 #include "remote_pointer.hh"
@@ -68,38 +70,20 @@ inline auto write_vamana_node(const RemotePtr& rptr,
     if (is_medoid) header |= VamanaNode::HEADER_IS_MEDOID;
     if (node_lock) header |= VamanaNode::HEADER_NODE_LOCK;
 
-    byte_t* ptr = local_buffer;
-
-    // Header (8B)
-    *reinterpret_cast<u64*>(ptr) = header;
-    ptr += VamanaNode::HEADER_SIZE;
-
-    // ID (4B)
-    *reinterpret_cast<u32*>(ptr) = id;
-    ptr += sizeof(u32);
-
-    // Edge count (1B)
-    *reinterpret_cast<u8*>(ptr) = edge_count;
-    ptr += sizeof(u8);
-
-    // Padding (3B)
-    std::memset(ptr, 0, VamanaNode::PADDING_SIZE);
-    ptr += VamanaNode::PADDING_SIZE;
-
-    // Vector (dim * 4B)
-    std::memcpy(ptr, components.data(), VamanaNode::DIM * sizeof(element_t));
-    ptr += VamanaNode::DIM * sizeof(element_t);
-
-    // RaBitQ data
-    std::memcpy(ptr, rabitq_data, VamanaNode::RABITQ_SIZE);
-    ptr += VamanaNode::RABITQ_SIZE;
-
-    // Neighbors (R * 8B) — write active + zero the rest
-    for (u8 i = 0; i < edge_count && i < neighbors.size(); ++i) {
-        reinterpret_cast<u64*>(ptr)[i] = neighbors[i].raw_address;
+    std::memset(local_buffer, 0, total);
+    *reinterpret_cast<u64*>(local_buffer) = header;
+    *reinterpret_cast<u32*>(local_buffer + VamanaNode::offset_id()) = id;
+    *reinterpret_cast<u8*>(local_buffer + VamanaNode::offset_edge_count()) = edge_count;
+    std::memcpy(local_buffer + VamanaNode::offset_vector(),
+                components.data(),
+                VamanaNode::DIM * sizeof(element_t));
+    if (rabitq_data != nullptr) {
+        std::memcpy(local_buffer + VamanaNode::offset_rabitq(), rabitq_data, VamanaNode::RABITQ_SIZE);
     }
-    for (u32 i = edge_count; i < VamanaNode::R; ++i) {
-        reinterpret_cast<u64*>(ptr)[i] = 0;
+
+    auto* neighbor_slots = reinterpret_cast<u64*>(local_buffer + VamanaNode::offset_neighbors());
+    for (u8 i = 0; i < edge_count && i < neighbors.size(); ++i) {
+        neighbor_slots[i] = neighbors[i].raw_address;
     }
 
     track_total_rdma_write(thread, total);

@@ -160,6 +160,7 @@ void write_vamana_shards(const VamanaGraph& graph,
     {"num_memory_nodes", config.num_memory_nodes},
     {"medoid", {{"memory_node", medoid_ptr.memory_node()}, {"offset", medoid_ptr.byte_offset()}}},
     {"node_size", node_size},
+    {"node_layout", VamanaNode::layout_name()},
     {"rabitq_size", rabitq_state.total_rabitq_bytes},
   };
 

@@ -19,6 +19,7 @@ struct Artifacts {
   double t_const{};
 };
 
+bool load_metadata(const filepath_t& index_prefix, Artifacts& artifacts, str* error_message = nullptr);
 bool load_artifacts(const filepath_t& index_prefix, Artifacts& artifacts, str* error_message = nullptr);
 
 }  // namespace service::rabitq

@@ -3,6 +3,7 @@
         dbg::print(dbg::stream{} << "T" << thread->get_id() << " queries " << q_id << "\n");
         ++thread->stats.processed;
         ++thread->stats.processed_queries;
+        thread->refresh_neighbor_cache_if_stale();
 
         auto& coro_state = thread->current_vamana_coroutine();
         auto& beam = coro_state.beam;
@@ -402,4 +403,3 @@
     // =========================================================================
     // Insert
     // =========================================================================
-

@@ -29,3 +29,14 @@ The last two arguments are:
 
 - `concurrent_threads`
 - `vectors_per_thread`
+
+Offline layout integration smoke test:
+
+```bash
+./test/run_offline_layout_smoke.sh
+```
+
+This generates a tiny `.fbin` dataset, builds a `rabitq_search_block` index with
+`vamana_offline_builder`, starts one local memory node, loads the offline shard,
+then checks query recall before and after a small storage-owner update batch.
+Set `GPU_DEVICE`, `PORT`, or `KEEP_WORK_DIR=1` in the environment when needed.

@@ -6,6 +6,8 @@
  * for the fixed-size VamanaNode layout.
  */
 
+#include <cstring>
+
 #include "compute_thread.hh"
 #include "coroutine.hh"
 #include "remote_pointer.hh"
@@ -160,9 +162,8 @@ inline auto read_vamana_neighbors(RemotePtr node_rptr, const u_ptr<ComputeThread
     const size_t read_size = sizeof(u8) + VamanaNode::NEIGHBORS_SIZE;
     byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(read_size);
 
-    track_neighbor_rdma_read(thread, read_size, 2);
-
     const QP& qp = thread->ctx->qps[node_rptr.memory_node()]->qp;
+    track_neighbor_rdma_read(thread, read_size, 2);
     thread->track_post();
     qp->post_send(reinterpret_cast<u64>(local_buffer),
                   sizeof(u8),
