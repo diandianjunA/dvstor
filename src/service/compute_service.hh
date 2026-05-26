@@ -139,12 +139,21 @@ private:
     vec<std::shared_ptr<service::breakdown::Sample>> samples;
   };
 
+  struct StorageOwnerResponseSlot {
+    u32 owner_storage{};
+    u32 slot_id{};
+    vec<byte_t> buffer;
+    std::unique_ptr<LocalMemoryRegion> region;
+  };
+
   struct StorageOwnerSenderState {
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<std::unique_ptr<StorageInsertTask>> queue;
     vec<StorageOwnerRpcSlot> slots;
+    vec<StorageOwnerResponseSlot> response_slots;
     std::deque<u32> free_slots;
+    std::unordered_map<u64, u32> batch_to_slot;
     std::thread thread;
   };
 
@@ -171,7 +180,8 @@ private:
                                 vec<std::unique_ptr<StorageInsertTask>>&& tasks,
                                 u64 batch_wait_ns);
   void handle_storage_owner_send_completion(u32 owner_storage, u32 slot_id);
-  void handle_storage_owner_response(u32 owner_storage, u32 slot_id);
+  void handle_storage_owner_response(u32 owner_storage, u32 response_slot_id);
+  void post_storage_owner_response_receive(u32 owner_storage, u32 response_slot_id);
   void maybe_release_storage_owner_slot_locked(StorageOwnerSenderState& state,
                                                StorageOwnerRpcSlot& slot);
   void fail_storage_owner_tasks(vec<std::unique_ptr<StorageInsertTask>>& tasks);
