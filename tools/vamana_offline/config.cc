@@ -41,6 +41,12 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
      "Bits per dimension for RaBitQ (1, 2, 4, or 8).")
     ("node-layout", po::value<str>(&config.node_layout)->default_value(config.node_layout),
      "Node layout: legacy or rabitq_search_block.")
+    ("partition-strategy", po::value<str>(&config.partition_strategy)->default_value(config.partition_strategy),
+     "Shard placement strategy: balanced or metis.")
+    ("partition-max-degree", po::value<u32>(&config.partition_max_degree)->default_value(config.partition_max_degree),
+     "Maximum neighbors per node used to build the METIS partition graph.")
+    ("partition-imbalance", po::value<double>(&config.partition_imbalance)->default_value(config.partition_imbalance),
+     "METIS ubvec balance tolerance, e.g. 1.03 allows about 3% imbalance.")
     ("seed", po::value<i32>(&config.seed)->default_value(config.seed), "PRNG seed.")
     ("max-vectors", po::value<size_t>(&config.max_vectors)->default_value(config.max_vectors),
      "Maximum number of vectors to read.")
@@ -71,6 +77,12 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     lib_failure("--rabitq-bits must be 1, 2, 4, or 8");
   if (config.node_layout != "legacy" && config.node_layout != "rabitq_search_block")
     lib_failure("--node-layout must be legacy or rabitq_search_block");
+  if (config.partition_strategy != "balanced" && config.partition_strategy != "metis")
+    lib_failure("--partition-strategy must be balanced or metis");
+  if (config.partition_max_degree == 0)
+    lib_failure("--partition-max-degree must be > 0");
+  if (config.partition_imbalance < 1.0)
+    lib_failure("--partition-imbalance must be >= 1.0");
 
   return config;
 }

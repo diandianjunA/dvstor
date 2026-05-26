@@ -33,6 +33,14 @@ set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L/home/xjs/anaconda3/lib 
 
 option(DVSTOR_BUILD_EXECUTABLES "Build standalone DVSTOR executables and tools" ON)
 option(DVSTOR_BUILD_TESTS "Build local DVSTOR smoke tests" ON)
+set(DVSTOR_METIS_PARTITION "AUTO" CACHE STRING "METIS graph partitioning support: AUTO, ON, or OFF")
+set_property(CACHE DVSTOR_METIS_PARTITION PROPERTY STRINGS AUTO ON OFF)
+string(TOUPPER "${DVSTOR_METIS_PARTITION}" DVSTOR_METIS_PARTITION_MODE)
+if (NOT DVSTOR_METIS_PARTITION_MODE STREQUAL "AUTO" AND
+    NOT DVSTOR_METIS_PARTITION_MODE STREQUAL "ON" AND
+    NOT DVSTOR_METIS_PARTITION_MODE STREQUAL "OFF")
+    message(FATAL_ERROR "DVSTOR_METIS_PARTITION must be AUTO, ON, or OFF")
+endif ()
 
 # CXX compiler flags (not applied to CUDA files)
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wall>)
@@ -49,6 +57,22 @@ add_compile_options(-DNOHUGEPAGES)
 if (NOT DVSTOR_STORAGE_NODE_ONLY)
     find_package(CUDAToolkit 11.8 REQUIRED)
     find_package(Eigen3 3.3 REQUIRED NO_MODULE)
+endif ()
+if (NOT DVSTOR_METIS_PARTITION_MODE STREQUAL "OFF")
+    find_path(METIS_INCLUDE_DIR metis.h)
+    find_library(METIS_LIBRARY NAMES metis)
+    if (METIS_INCLUDE_DIR AND METIS_LIBRARY)
+        set(DVSTOR_HAVE_METIS ON)
+        message(STATUS "METIS partitioning: enabled (${METIS_LIBRARY})")
+    elseif (DVSTOR_METIS_PARTITION_MODE STREQUAL "ON")
+        message(FATAL_ERROR "METIS partitioning requested but metis.h/libmetis were not found. Install libmetis-dev or set -DDVSTOR_METIS_PARTITION=OFF.")
+    else ()
+        set(DVSTOR_HAVE_METIS OFF)
+        message(STATUS "METIS partitioning: disabled (metis.h/libmetis not found)")
+    endif ()
+else ()
+    set(DVSTOR_HAVE_METIS OFF)
+    message(STATUS "METIS partitioning: disabled")
 endif ()
 
 set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR})
@@ -69,6 +93,7 @@ set(DVSTOR_OFFLINE_BUILDER_SOURCES
     tools/vamana_offline/config.cc
     tools/vamana_offline/dataset_io.cc
     tools/vamana_offline/graph.cc
+    tools/vamana_offline/partitioning.cc
     tools/vamana_offline/progress.cc
     tools/vamana_offline/rabitq.cc
     tools/vamana_offline/shard_writer.cc
@@ -93,6 +118,31 @@ function(add_vamana_layout_converter_target)
     target_link_libraries(vamana_layout_converter rdma_library)
 endfunction()
 
+function(add_vamana_metis_repartitioner_target)
+    add_executable(vamana_metis_repartitioner
+        tools/vamana_metis_repartitioner.cc
+        tools/vamana_offline/partitioning.cc
+    )
+    target_include_directories(vamana_metis_repartitioner PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
+        ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
+    )
+    target_link_libraries(vamana_metis_repartitioner rdma_library)
+    target_link_metis(vamana_metis_repartitioner)
+endfunction()
+
+function(target_link_metis target_name)
+    if (DVSTOR_HAVE_METIS)
+        target_include_directories(${target_name} PRIVATE ${METIS_INCLUDE_DIR})
+        target_link_libraries(${target_name} ${METIS_LIBRARY})
+        target_compile_definitions(${target_name} PRIVATE DVSTOR_HAVE_METIS=1)
+    else ()
+        target_compile_definitions(${target_name} PRIVATE DVSTOR_HAVE_METIS=0)
+    endif ()
+endfunction()
+
 if (DVSTOR_STORAGE_NODE_ONLY)
     add_executable(dvstor_memory_node
         src/memory_node_main.cc
@@ -110,6 +160,7 @@ if (DVSTOR_STORAGE_NODE_ONLY)
 
     if (DVSTOR_BUILD_EXECUTABLES)
         add_vamana_layout_converter_target()
+        add_vamana_metis_repartitioner_target()
     endif ()
 else ()
     # GPU kernels library (compiled by nvcc)
@@ -195,8 +246,10 @@ else ()
             CUDA::cudart
             CUDA::cublas
         )
+        target_link_metis(vamana_offline_builder)
 
         add_vamana_layout_converter_target()
+        add_vamana_metis_repartitioner_target()
 
         add_executable(dvstor_breakdown_benchmark
             tools/dvstor_breakdown_benchmark.cc
