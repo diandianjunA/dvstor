@@ -80,6 +80,19 @@ set(DVSTOR_BREAKDOWN_BENCHMARK_SOURCES
     tools/breakdown_benchmark/workload.cc
 )
 
+function(add_vamana_layout_converter_target)
+    add_executable(vamana_layout_converter
+        tools/vamana_layout_converter.cc
+    )
+    target_include_directories(vamana_layout_converter PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
+        ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
+    )
+    target_link_libraries(vamana_layout_converter rdma_library)
+endfunction()
+
 if (DVSTOR_STORAGE_NODE_ONLY)
     add_executable(dvstor_memory_node
         src/memory_node_main.cc
@@ -94,6 +107,10 @@ if (DVSTOR_STORAGE_NODE_ONLY)
         ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
     )
     target_link_libraries(dvstor_memory_node rdma_library)
+
+    if (DVSTOR_BUILD_EXECUTABLES)
+        add_vamana_layout_converter_target()
+    endif ()
 else ()
     # GPU kernels library (compiled by nvcc)
     file(GLOB_RECURSE DVSTOR_GPU_SOURCES CONFIGURE_DEPENDS src/gpu/*.cu)
@@ -179,16 +196,7 @@ else ()
             CUDA::cublas
         )
 
-        add_executable(vamana_layout_converter
-            tools/vamana_layout_converter.cc
-        )
-        target_include_directories(vamana_layout_converter PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}
-            ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
-            ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
-        )
-        target_link_libraries(vamana_layout_converter rdma_library)
+        add_vamana_layout_converter_target()
 
         add_executable(dvstor_breakdown_benchmark
             tools/dvstor_breakdown_benchmark.cc
