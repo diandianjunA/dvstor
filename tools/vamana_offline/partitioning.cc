@@ -1,6 +1,7 @@
 #include "tools/vamana_offline/partitioning.hh"
 
 #include <algorithm>
+#include <deque>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -221,6 +222,94 @@ vec<NodePlacement> assign_nodes_to_shards_balanced(size_t num_vectors,
   }
 
   return placements;
+}
+
+vec<u32> compute_bfs_partition(const vec<vec<u32>>& neighbors,
+                               u32 num_parts,
+                               u32 start_node,
+                               PartitionStats* stats) {
+  if (num_parts == 0) {
+    throw std::runtime_error("BFS partition part count must be > 0");
+  }
+
+  const size_t num_nodes = neighbors.size();
+  vec<u32> parts(num_nodes, 0);
+  if (stats != nullptr) {
+    stats->input_edges = 0;
+    stats->unique_edges = 0;
+    stats->edge_cut = 0;
+    stats->partition_cross_shard_ratio = 0.0;
+    stats->part_node_counts.assign(num_parts, 0);
+    for (const auto& nbrs : neighbors) {
+      stats->input_edges += nbrs.size();
+    }
+    stats->unique_edges = stats->input_edges;
+  }
+
+  if (num_nodes == 0) {
+    return parts;
+  }
+
+  vec<byte_t> visited(num_nodes, 0);
+  vec<u32> bfs_order;
+  bfs_order.reserve(num_nodes);
+  std::deque<u32> queue;
+
+  const auto push_component = [&](u32 seed) {
+    if (seed >= num_nodes || visited[seed]) {
+      return;
+    }
+    visited[seed] = 1;
+    queue.push_back(seed);
+    while (!queue.empty()) {
+      const u32 node = queue.front();
+      queue.pop_front();
+      bfs_order.push_back(node);
+      for (u32 neighbor : neighbors[node]) {
+        if (neighbor < num_nodes && !visited[neighbor]) {
+          visited[neighbor] = 1;
+          queue.push_back(neighbor);
+        }
+      }
+    }
+  };
+
+  push_component(start_node);
+  for (u32 node = 0; node < num_nodes; ++node) {
+    push_component(node);
+  }
+
+  for (size_t order_idx = 0; order_idx < bfs_order.size(); ++order_idx) {
+    u32 part = static_cast<u32>((order_idx * static_cast<size_t>(num_parts)) / num_nodes);
+    if (part >= num_parts) {
+      part = num_parts - 1;
+    }
+    parts[bfs_order[order_idx]] = part;
+    if (stats != nullptr) {
+      ++stats->part_node_counts[part];
+    }
+  }
+
+  if (stats != nullptr) {
+    size_t total_edges = 0;
+    size_t cut_edges = 0;
+    for (size_t node = 0; node < neighbors.size(); ++node) {
+      for (u32 neighbor : neighbors[node]) {
+        if (neighbor >= num_nodes) {
+          continue;
+        }
+        ++total_edges;
+        if (parts[node] != parts[neighbor]) {
+          ++cut_edges;
+        }
+      }
+    }
+    stats->edge_cut = cut_edges;
+    stats->partition_cross_shard_ratio =
+      total_edges == 0 ? 0.0 : static_cast<double>(cut_edges) / static_cast<double>(total_edges);
+  }
+
+  return parts;
 }
 
 vec<NodePlacement> assign_nodes_to_shards_from_partition(const vec<u32>& parts,

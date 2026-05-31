@@ -37,6 +37,10 @@ vec<u32> compute_metis_partition(size_t num_nodes,
 vec<NodePlacement> assign_nodes_to_shards_balanced(size_t num_vectors,
                                                    u32 num_memory_nodes,
                                                    size_t aligned_node_size);
+vec<u32> compute_bfs_partition(const vec<vec<u32>>& neighbors,
+                               u32 num_parts,
+                               u32 start_node,
+                               PartitionStats* stats = nullptr);
 vec<NodePlacement> assign_nodes_to_shards_from_partition(const vec<u32>& parts,
                                                          u32 num_memory_nodes,
                                                          size_t aligned_node_size);

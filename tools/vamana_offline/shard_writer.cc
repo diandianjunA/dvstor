@@ -51,6 +51,10 @@ PlacementResult place_nodes(const VamanaGraph& graph,
     options.imbalance = config.partition_imbalance;
     vec<u32> parts = compute_metis_partition(graph.num_nodes, edges, options, &result.stats);
     result.placements = assign_nodes_to_shards_from_partition(parts, config.num_memory_nodes, aligned_size);
+  } else if (config.partition_strategy == "bfs") {
+    const u32 start_node = graph.medoid < graph.num_nodes ? graph.medoid : 0;
+    vec<u32> parts = compute_bfs_partition(graph.neighbors, config.num_memory_nodes, start_node, &result.stats);
+    result.placements = assign_nodes_to_shards_from_partition(parts, config.num_memory_nodes, aligned_size);
   } else {
     result.placements = assign_nodes_to_shards_balanced(graph.num_nodes, config.num_memory_nodes, aligned_size);
     result.stats.part_node_counts.assign(config.num_memory_nodes, 0);
@@ -69,6 +73,10 @@ void print_partition_stats(const VamanaBuildConfig& config, const PlacementResul
   if (config.partition_strategy == "metis") {
     std::cerr << "METIS partition edges: input=" << result.stats.input_edges
               << " unique=" << result.stats.unique_edges
+              << " edge_cut=" << result.stats.edge_cut
+              << " partition_cut_ratio=" << result.stats.partition_cross_shard_ratio << "\n";
+  } else if (config.partition_strategy == "bfs") {
+    std::cerr << "BFS partition edges: input=" << result.stats.input_edges
               << " edge_cut=" << result.stats.edge_cut
               << " partition_cut_ratio=" << result.stats.partition_cross_shard_ratio << "\n";
   }
