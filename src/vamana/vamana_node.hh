@@ -2,6 +2,9 @@
 
 #include <ostream>
 
+#include <library/utils.hh>
+
+#include "common/types.hh"
 #include "remote_pointer.hh"
 
 // forward declaration
@@ -15,15 +18,26 @@ class ComputeThread;
  *     id: 4B                            | uid(4) |
  *     edge_count: 1B                    | count(1) |
  *     padding: 3B                       | pad(3) |
- *     vector: d * 4B                    | v_1(4) | ... | v_d(4) |
- *     rabitq: rabitq_size B             | quantized_data | add(4) | rescale(4) |
- *     neighbors: R * 8B                | n_1(8) | ... | n_R(8) |
+ *     legacy layout:
+ *       vector: d * 4B                  | v_1(4) | ... | v_d(4) |
+ *       rabitq: rabitq_size B           | quantized_data | add(4) | rescale(4) |
+ *       neighbors: R * 8B               | n_1(8) | ... | n_R(8) |
+ *
+ *     rabitq_search_block layout:
+ *       rabitq: rabitq_size B           | quantized_data | add(4) | rescale(4) |
+ *       neighbors: R * 8B               | n_1(8) | ... | n_R(8) |
+ *       vector: d * 4B                  | v_1(4) | ... | v_d(4) |
  *  ]
  *
  *  All nodes have the same fixed size (no per-level variability as in HNSW).
  */
 class VamanaNode {
 public:  // static storage
+  enum class Layout : u32 {
+    legacy = 0,
+    rabitq_search_block = 1,
+  };
+
   // Header bit positions (little endian)
   static constexpr size_t HEADER_NODE_LOCK = 0b01;
   static constexpr size_t HEADER_MEDOID_LOCK = 0b100000000;  // was HEADER_NEW_LEVEL_LOCK
@@ -45,25 +59,82 @@ public:  // static storage
   inline static u32 RABITQ_BITS; // bits per dimension
   inline static u32 RABITQ_SIZE; // total bytes for RaBitQ data
   inline static u32 NEIGHBORS_SIZE; // R * sizeof(RemotePtr)
+  inline static Layout NODE_LAYOUT{Layout::legacy};
 
-  static void init_static_storage(u32 dim, u32 max_degree, u32 rabitq_bits_per_dim) {
+  static void init_static_storage(u32 dim,
+                                  u32 max_degree,
+                                  u32 rabitq_bits_per_dim,
+                                  Layout layout = Layout::legacy) {
     DIM = dim;
     R = max_degree;
     RABITQ_BITS = rabitq_bits_per_dim;
     // RaBitQ data: packed bits + add(float) + rescale(float)
     RABITQ_SIZE = (rabitq_bits_per_dim * dim + 7) / 8 + 2 * sizeof(f32);
     NEIGHBORS_SIZE = max_degree * sizeof(u64);  // RemotePtr is u64
+    NODE_LAYOUT = layout;
+  }
+
+  static void set_layout(Layout layout) {
+    NODE_LAYOUT = layout;
+  }
+
+  static Layout layout() { return NODE_LAYOUT; }
+
+  static Layout parse_layout(const str& name) {
+    if (name == "legacy") {
+      return Layout::legacy;
+    }
+    if (name == "rabitq_search_block") {
+      return Layout::rabitq_search_block;
+    }
+    lib_failure("unknown Vamana node layout: " + name);
+    return Layout::legacy;
+  }
+
+  static str layout_name(Layout layout) {
+    switch (layout) {
+      case Layout::legacy:
+        return "legacy";
+      case Layout::rabitq_search_block:
+        return "rabitq_search_block";
+    }
+    return "unknown";
+  }
+
+  static str layout_name() {
+    return layout_name(NODE_LAYOUT);
   }
 
   // Offsets within the node buffer
   static size_t offset_id() { return HEADER_SIZE; }
   static size_t offset_edge_count() { return HEADER_SIZE + ID_SIZE; }
-  static size_t offset_vector() { return HEADER_SIZE + META_SIZE; }
-  static size_t offset_rabitq() { return HEADER_SIZE + META_SIZE + DIM * sizeof(element_t); }
-  static size_t offset_neighbors() { return HEADER_SIZE + META_SIZE + DIM * sizeof(element_t) + RABITQ_SIZE; }
+  static size_t offset_vector() {
+    if (NODE_LAYOUT == Layout::rabitq_search_block) {
+      return HEADER_SIZE + META_SIZE + RABITQ_SIZE + NEIGHBORS_SIZE;
+    }
+    return HEADER_SIZE + META_SIZE;
+  }
+  static size_t offset_rabitq() {
+    if (NODE_LAYOUT == Layout::rabitq_search_block) {
+      return HEADER_SIZE + META_SIZE;
+    }
+    return HEADER_SIZE + META_SIZE + DIM * sizeof(element_t);
+  }
+  static size_t offset_neighbors() {
+    if (NODE_LAYOUT == Layout::rabitq_search_block) {
+      return HEADER_SIZE + META_SIZE + RABITQ_SIZE;
+    }
+    return HEADER_SIZE + META_SIZE + DIM * sizeof(element_t) + RABITQ_SIZE;
+  }
+  static size_t search_block_offset() { return offset_edge_count(); }
+  static size_t search_block_rabitq_offset() { return EDGE_COUNT_SIZE + PADDING_SIZE; }
+  static size_t search_block_neighbors_offset() { return EDGE_COUNT_SIZE + PADDING_SIZE + RABITQ_SIZE; }
+  static size_t search_block_size() { return EDGE_COUNT_SIZE + PADDING_SIZE + RABITQ_SIZE + NEIGHBORS_SIZE; }
+  static bool has_compact_search_block() { return NODE_LAYOUT == Layout::rabitq_search_block; }
 
   // Size calculations
-  static size_t size_until_vector_end() { return HEADER_SIZE + META_SIZE + DIM * sizeof(element_t); }
+  static size_t vector_bytes() { return DIM * sizeof(element_t); }
+  static size_t size_until_vector_end() { return offset_vector() + vector_bytes(); }
   static size_t total_size() {
     return HEADER_SIZE + META_SIZE + DIM * sizeof(element_t) + RABITQ_SIZE + NEIGHBORS_SIZE;
   }

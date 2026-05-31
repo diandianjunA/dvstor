@@ -110,6 +110,7 @@ Build an offline index:
 ./build/vamana_offline_builder \
   --data-path /path/to/dataset-or-dir \
   --memory-nodes 2 \
+  --partition-strategy bfs \
   --threads 32 \
   --R 32 \
   --beam-width-construction 128 \
@@ -129,6 +130,11 @@ This writes files like:
 /path/to/index/dvstor_index.meta.json
 /path/to/index/dvstor_index.rotation.bin
 ```
+
+Offline shard placement supports `--partition-strategy balanced` (default), `bfs`, and `metis`.
+The `bfs` strategy starts from the graph medoid, orders nodes by BFS traversal, and writes contiguous
+balanced BFS ranges into shard files so graph-near nodes are more likely to stay on the same memory node.
+The `metis` strategy additionally requires METIS support at CMake configure time.
 
 Then start each memory node with its local shard:
 ```bash

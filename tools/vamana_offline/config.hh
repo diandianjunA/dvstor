@@ -17,6 +17,10 @@ struct VamanaBuildConfig {
   u32 beam_width{128};
   f64 alpha{1.2};
   u32 rabitq_bits{1};
+  str node_layout{"rabitq_search_block"};
+  str partition_strategy{"balanced"};
+  u32 partition_max_degree{16};
+  double partition_imbalance{1.03};
   i32 seed{1234};
   size_t max_vectors{std::numeric_limits<u32>::max()};
   bool ip_distance{false};

@@ -3038,3 +3038,839 @@ allocated ALIGNED MEM (no hugepage) at 129540160487488 with buffer size 67108864
 allocated ALIGNED MEM (no hugepage) at 129540091281472 with buffer size 67108864
 allocated ALIGNED MEM (no hugepage) at 129540022075456 with buffer size 67108864
 [STATUS]: storage-owner insert runtime enabled on shard 4
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1238
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/1024dim50M_node5_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 5482 -- 749
+[STATUS]: pinned main thread to core 28
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 138746611630144 with buffer size 53687091200
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node5_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 5487 -- 754
+pairing: 5491 -- 759
+pairing: 5497 -- 764
+pairing: 5501 -- 769
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node5_of5.dat
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 5545 -- 5537
+pairing: 5548 -- 5549
+pairing: 5553 -- 5552
+pairing: 5557 -- 5556
+pairing: 5561 -- 5546
+pairing: 5564 -- 5563
+pairing: 5566 -- 5565
+pairing: 5568 -- 5567
+pairing: 5569 -- 5560
+pairing: 5571 -- 5570
+pairing: 5573 -- 5572
+pairing: 5575 -- 5574
+pairing: 5576 -- 5562
+pairing: 5578 -- 5577
+pairing: 5580 -- 5579
+pairing: 5582 -- 5581
+[STATUS]: storage-owner peer RDMA QPs per peer: 4
+[storage-peer][token] self_shard=4 local_base=138746611630144 local_rkey=1581056 local_bytes=53687091200
+[storage-peer][token] self_shard=4 peer_shard=0 remote_base=126956498583616 remote_rkey=1582566
+[storage-peer][token] self_shard=4 peer_shard=1 remote_base=136297236660288 remote_rkey=1584640
+[storage-peer][token] self_shard=4 peer_shard=2 remote_base=126543256879168 remote_rkey=1581312
+[storage-peer][token] self_shard=4 peer_shard=3 remote_base=123826480349248 remote_rkey=1585152
+allocated ALIGNED MEM (no hugepage) at 138746525646912 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138746593058880 with buffer size 1398080
+[STATUS]: storage-owner peer RPC receive slots per peer: 16 (requested=16)
+[storage-peer][read] self_shard=4 target_shard=0 remote_base=126956498583616 rkey=1582566 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=0 free_ptr=51440000016 medoid_raw=33618154200
+[storage-peer][read] self_shard=4 target_shard=1 remote_base=136297236660288 rkey=1584640 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=1 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=2 remote_base=126543256879168 rkey=1581312 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=2 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=3 remote_base=123826480349248 rkey=1585152 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=3 free_ptr=51440000016 medoid_raw=0
+allocated ALIGNED MEM (no hugepage) at 138746607644736 with buffer size 263680
+allocated ALIGNED MEM (no hugepage) at 138746456440896 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138746387234880 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138746318028864 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138746248822848 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138746179616832 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138746110410816 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138746041204800 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138745971998784 with buffer size 67108864
+[STATUS]: storage-owner peer reverse-update workers: 8
+[STATUS]: storage-owner peer reverse-update tuning: mode=async queue_depth=65536 flush_us=200 coalesce_max=256
+[STATUS]: storage-owner peer RDMA read credits per peer: 8 per QP: 8 (requested=8)
+[STATUS]: storage-owner online insert tuning: construction_beam=128 snapshot_batch=64 prune_max_candidates=128
+allocated ALIGNED MEM (no hugepage) at 138745787449408 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138744822759488 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138744753553472 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138744684347456 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138744615141440 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138744545935424 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138744476729408 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138744407523392 with buffer size 67108864
+[STATUS]: storage-owner insert runtime enabled on shard 4
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1238
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 5587 -- 824
+[STATUS]: pinned main thread to core 28
+[STATUS]: loaded index metadata from /data/xjs/index/shine_gpu_index/n1024dim50M (layout=rabitq_search_block)
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 123868471623744 with buffer size 53687091200
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 5590 -- 829
+pairing: 5596 -- 834
+pairing: 5602 -- 839
+pairing: 5605 -- 844
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/1024dim50M_node5_of5.dat
+[STATUS]: loaded RaBitQ artifacts from /data/xjs/index/shine_gpu_index/n1024dim50M (dim=1024, bits=4, layout=rabitq_search_block)
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 5609 -- 5608
+pairing: 5614 -- 5620
+pairing: 5622 -- 5627
+pairing: 5629 -- 5635
+pairing: 5638 -- 5643
+pairing: 5645 -- 5648
+pairing: 5651 -- 5654
+pairing: 5657 -- 5660
+pairing: 5663 -- 5666
+pairing: 5668 -- 5669
+pairing: 5671 -- 5674
+pairing: 5675 -- 5677
+pairing: 5679 -- 5681
+pairing: 5683 -- 5682
+pairing: 5684 -- 5685
+pairing: 5686 -- 5687
+[STATUS]: storage-owner peer RDMA QPs per peer: 4
+[storage-peer][token] self_shard=4 local_base=123868471623744 local_rkey=1584896 local_bytes=53687091200
+[storage-peer][token] self_shard=4 peer_shard=0 remote_base=132798667030592 remote_rkey=1581312
+[storage-peer][token] self_shard=4 peer_shard=1 remote_base=138777313935424 remote_rkey=1582592
+[storage-peer][token] self_shard=4 peer_shard=2 remote_base=126616600576064 remote_rkey=1584640
+[storage-peer][token] self_shard=4 peer_shard=3 remote_base=128251794030656 remote_rkey=1582566
+allocated ALIGNED MEM (no hugepage) at 123868387737664 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 123868455149632 with buffer size 1398080
+[STATUS]: storage-owner peer RPC receive slots per peer: 16 (requested=16)
+[storage-peer][read] self_shard=4 target_shard=0 remote_base=132798667030592 rkey=1581312 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=0 free_ptr=51440000016 medoid_raw=33618154200
+[storage-peer][read] self_shard=4 target_shard=1 remote_base=138777313935424 rkey=1582592 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=1 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=2 remote_base=126616600576064 rkey=1584640 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=2 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=3 remote_base=128251794030656 rkey=1582566 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=3 free_ptr=51440000016 medoid_raw=0
+allocated ALIGNED MEM (no hugepage) at 123868454883392 with buffer size 263680
+allocated ALIGNED MEM (no hugepage) at 123868318531648 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 123868249325632 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 123868180119616 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 123868110913600 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 123868041707584 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 123867972501568 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 123867903295552 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 123867834089536 with buffer size 67108864
+[STATUS]: storage-owner peer reverse-update workers: 8
+[STATUS]: storage-owner peer reverse-update tuning: mode=async queue_depth=65536 flush_us=200 coalesce_max=256
+[STATUS]: storage-owner peer RDMA read credits per peer: 8 per QP: 8 (requested=8)
+[STATUS]: storage-owner online insert tuning: construction_beam=128 snapshot_batch=64 prune_max_candidates=128
+allocated ALIGNED MEM (no hugepage) at 123867649540160 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 123866653392960 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 123866584186944 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 123866514980928 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 123866445774912 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 123866376568896 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 123866307362880 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 123866238156864 with buffer size 67108864
+[STATUS]: storage-owner insert runtime enabled on shard 4
+invalid peer shard id: 48306
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1238
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 5692 -- 849
+[STATUS]: pinned main thread to core 28
+[STATUS]: loaded index metadata from /data/xjs/index/shine_gpu_index/n1024dim50M (layout=rabitq_search_block)
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 139279099494464 with buffer size 53687091200
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 5697 -- 854
+pairing: 5702 -- 859
+pairing: 5705 -- 864
+pairing: 5712 -- 869
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat
+[STATUS]: loaded RaBitQ artifacts from /data/xjs/index/shine_gpu_index/n1024dim50M (dim=1024, bits=4, layout=rabitq_search_block)
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 5717 -- 5723
+pairing: 5724 -- 5730
+pairing: 5733 -- 5738
+pairing: 5741 -- 5746
+pairing: 5748 -- 5751
+pairing: 5754 -- 5757
+pairing: 5760 -- 5763
+pairing: 5766 -- 5769
+pairing: 5771 -- 5772
+pairing: 5775 -- 5776
+pairing: 5778 -- 5780
+pairing: 5782 -- 5781
+pairing: 5784 -- 5786
+pairing: 5788 -- 5787
+pairing: 5790 -- 5789
+pairing: 5792 -- 5791
+[STATUS]: storage-owner peer RDMA QPs per peer: 4
+[storage-peer][token] self_shard=4 local_base=139279099494464 local_rkey=1584896 local_bytes=53687091200
+[storage-peer][token] self_shard=4 peer_shard=0 remote_base=139749805260864 remote_rkey=1582566
+[storage-peer][token] self_shard=4 peer_shard=1 remote_base=129334448750656 remote_rkey=1584640
+[storage-peer][token] self_shard=4 peer_shard=2 remote_base=135644969959488 remote_rkey=1582592
+[storage-peer][token] self_shard=4 peer_shard=3 remote_base=139416133697600 remote_rkey=1581312
+allocated ALIGNED MEM (no hugepage) at 139279015608384 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 139279014207552 with buffer size 1398080
+[STATUS]: storage-owner peer RPC receive slots per peer: 16 (requested=16)
+[storage-peer][read] self_shard=4 target_shard=0 remote_base=139749805260864 rkey=1582566 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=0 free_ptr=51440000016 medoid_raw=33618154200
+[storage-peer][read] self_shard=4 target_shard=1 remote_base=129334448750656 rkey=1584640 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=1 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=2 remote_base=135644969959488 rkey=1582592 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=2 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=3 remote_base=139416133697600 rkey=1581312 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=3 free_ptr=51440000016 medoid_raw=0
+allocated ALIGNED MEM (no hugepage) at 139279083606080 with buffer size 263680
+allocated ALIGNED MEM (no hugepage) at 139278946402368 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 139278877196352 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 139278807990336 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 139278738784320 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 139278669578304 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 139278600372288 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 139278531166272 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 139278461960256 with buffer size 67108864
+[STATUS]: storage-owner peer reverse-update workers: 8
+[STATUS]: storage-owner peer reverse-update tuning: mode=async queue_depth=65536 flush_us=200 coalesce_max=256
+[STATUS]: storage-owner peer RDMA read credits per peer: 8 per QP: 8 (requested=8)
+[STATUS]: storage-owner online insert tuning: construction_beam=128 snapshot_batch=64 prune_max_candidates=128
+allocated ALIGNED MEM (no hugepage) at 139277465813056 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 139277396607040 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 139277327401024 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 139277258195008 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 139277188988992 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 139277119782976 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 139277050576960 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 139276981370944 with buffer size 67108864
+[STATUS]: storage-owner insert runtime enabled on shard 4
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1238
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 5797 -- 874
+[STATUS]: pinned main thread to core 28
+[STATUS]: loaded index metadata from /data/xjs/index/shine_gpu_index/n1024dim50M (layout=rabitq_search_block)
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 131191187439680 with buffer size 53687091200
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 5802 -- 879
+pairing: 5806 -- 884
+pairing: 5812 -- 889
+pairing: 5817 -- 894
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat
+[STATUS]: loaded RaBitQ artifacts from /data/xjs/index/shine_gpu_index/n1024dim50M (dim=1024, bits=4, layout=rabitq_search_block)
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 5819 -- 5818
+pairing: 5824 -- 5830
+pairing: 5832 -- 5837
+pairing: 5839 -- 5845
+pairing: 5848 -- 5853
+pairing: 5855 -- 5859
+pairing: 5861 -- 5864
+pairing: 5866 -- 5868
+pairing: 5871 -- 5874
+pairing: 5877 -- 5876
+pairing: 5882 -- 5883
+pairing: 5886 -- 5887
+pairing: 5890 -- 5891
+pairing: 5893 -- 5892
+pairing: 5895 -- 5894
+pairing: 5897 -- 5896
+[STATUS]: storage-owner peer RDMA QPs per peer: 4
+[storage-peer][token] self_shard=4 local_base=131191187439680 local_rkey=1582566 local_bytes=53687091200
+[storage-peer][token] self_shard=4 peer_shard=0 remote_base=124294814236736 remote_rkey=1585664
+[storage-peer][token] self_shard=4 peer_shard=1 remote_base=138772471611456 remote_rkey=1582592
+[storage-peer][token] self_shard=4 peer_shard=2 remote_base=124590315536448 remote_rkey=1581056
+[storage-peer][token] self_shard=4 peer_shard=3 remote_base=136577089011776 remote_rkey=1584640
+allocated ALIGNED MEM (no hugepage) at 131191103553600 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131191102152768 with buffer size 1398080
+[STATUS]: storage-owner peer RPC receive slots per peer: 16 (requested=16)
+[storage-peer][read] self_shard=4 target_shard=0 remote_base=124294814236736 rkey=1585664 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=0 free_ptr=51440000016 medoid_raw=33618154200
+[storage-peer][read] self_shard=4 target_shard=1 remote_base=138772471611456 rkey=1582592 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=1 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=2 remote_base=124590315536448 rkey=1581056 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=2 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=3 remote_base=136577089011776 rkey=1584640 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=3 free_ptr=51440000016 medoid_raw=0
+allocated ALIGNED MEM (no hugepage) at 131191101886528 with buffer size 263680
+allocated ALIGNED MEM (no hugepage) at 131191034347584 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131190965141568 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131190895935552 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131190826729536 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131190757523520 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131190688317504 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131190619111488 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131190549905472 with buffer size 67108864
+[STATUS]: storage-owner peer reverse-update workers: 8
+[STATUS]: storage-owner peer reverse-update tuning: mode=async queue_depth=65536 flush_us=200 coalesce_max=256
+[STATUS]: storage-owner peer RDMA read credits per peer: 8 per QP: 8 (requested=8)
+[STATUS]: storage-owner online insert tuning: construction_beam=128 snapshot_batch=64 prune_max_candidates=128
+allocated ALIGNED MEM (no hugepage) at 131190365356096 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131189371306048 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131189302100032 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131189232894016 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131189163688000 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131189094481984 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131189025275968 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131188956069952 with buffer size 67108864
+[STATUS]: storage-owner insert runtime enabled on shard 4
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1238
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 5902 -- 899
+[STATUS]: pinned main thread to core 28
+[STATUS]: loaded index metadata from /data/xjs/index/shine_gpu_index/n1024dim50M (layout=rabitq_search_block)
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 131409175904320 with buffer size 53687091200
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 5907 -- 904
+pairing: 5911 -- 909
+pairing: 5917 -- 914
+pairing: 5921 -- 919
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat
+[STATUS]: loaded RaBitQ artifacts from /data/xjs/index/shine_gpu_index/n1024dim50M (dim=1024, bits=4, layout=rabitq_search_block)
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 5924 -- 5931
+pairing: 5933 -- 5938
+pairing: 5941 -- 5946
+pairing: 5949 -- 5954
+pairing: 5957 -- 5958
+pairing: 5962 -- 5965
+pairing: 5967 -- 5971
+pairing: 5974 -- 5977
+pairing: 5980 -- 5976
+pairing: 5983 -- 5984
+pairing: 5987 -- 5988
+pairing: 5990 -- 5992
+pairing: 5995 -- 5996
+pairing: 5998 -- 5997
+pairing: 6000 -- 5999
+pairing: 6002 -- 6001
+[STATUS]: storage-owner peer RDMA QPs per peer: 4
+[storage-peer][token] self_shard=4 local_base=131409175904320 local_rkey=1585408 local_bytes=53687091200
+[storage-peer][token] self_shard=4 peer_shard=0 remote_base=131342813626432 remote_rkey=1584896
+[storage-peer][token] self_shard=4 peer_shard=1 remote_base=131997146021952 remote_rkey=1581056
+[storage-peer][token] self_shard=4 peer_shard=2 remote_base=139201154646080 remote_rkey=1582592
+[storage-peer][token] self_shard=4 peer_shard=3 remote_base=137465354518592 remote_rkey=1585664
+allocated ALIGNED MEM (no hugepage) at 131409092018240 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131409090617408 with buffer size 1398080
+[STATUS]: storage-owner peer RPC receive slots per peer: 16 (requested=16)
+[storage-peer][read] self_shard=4 target_shard=0 remote_base=131342813626432 rkey=1584896 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=0 free_ptr=51440000016 medoid_raw=33618154200
+[storage-peer][read] self_shard=4 target_shard=1 remote_base=131997146021952 rkey=1581056 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=1 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=2 remote_base=139201154646080 rkey=1582592 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=2 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=3 remote_base=137465354518592 rkey=1585664 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=3 free_ptr=51440000016 medoid_raw=0
+allocated ALIGNED MEM (no hugepage) at 131409159565376 with buffer size 263680
+allocated ALIGNED MEM (no hugepage) at 131409022812224 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131408953606208 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131408884400192 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131408815194176 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131408745988160 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131408676782144 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131408607576128 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131408538370112 with buffer size 67108864
+[STATUS]: storage-owner peer reverse-update workers: 8
+[STATUS]: storage-owner peer reverse-update tuning: mode=async queue_depth=65536 flush_us=200 coalesce_max=256
+[STATUS]: storage-owner peer RDMA read credits per peer: 8 per QP: 8 (requested=8)
+[STATUS]: storage-owner online insert tuning: construction_beam=128 snapshot_batch=64 prune_max_candidates=128
+allocated ALIGNED MEM (no hugepage) at 131407542222912 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131407473016896 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131407403810880 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131407334604864 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131407265398848 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131407196192832 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131407126986816 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 131407057780800 with buffer size 67108864
+[STATUS]: storage-owner insert runtime enabled on shard 4
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1238
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 6007 -- 924
+[STATUS]: pinned main thread to core 28
+[STATUS]: loaded index metadata from /data/xjs/index/shine_gpu_index/n1024dim50M (layout=rabitq_search_block)
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 127949646856256 with buffer size 53687091200
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 6012 -- 929
+pairing: 6016 -- 934
+pairing: 6022 -- 939
+pairing: 6027 -- 944
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat
+[STATUS]: loaded RaBitQ artifacts from /data/xjs/index/shine_gpu_index/n1024dim50M (dim=1024, bits=4, layout=rabitq_search_block)
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 6056 -- 6058
+pairing: 6059 -- 6061
+pairing: 6064 -- 6066
+pairing: 6067 -- 6069
+pairing: 6071 -- 6073
+pairing: 6075 -- 6076
+pairing: 6078 -- 6080
+pairing: 6083 -- 6084
+pairing: 6086 -- 6054
+pairing: 6088 -- 6091
+pairing: 6094 -- 6095
+pairing: 6098 -- 6099
+pairing: 6101 -- 6100
+pairing: 6102 -- 6103
+pairing: 6105 -- 6104
+pairing: 6107 -- 6106
+[STATUS]: storage-owner peer RDMA QPs per peer: 4
+[storage-peer][token] self_shard=4 local_base=127949646856256 local_rkey=1584640 local_bytes=53687091200
+[storage-peer][token] self_shard=4 peer_shard=0 remote_base=135077145083968 remote_rkey=1582592
+[storage-peer][token] self_shard=4 peer_shard=1 remote_base=123977477390400 remote_rkey=1582080
+[storage-peer][token] self_shard=4 peer_shard=2 remote_base=128696214093888 remote_rkey=1584896
+[storage-peer][token] self_shard=4 peer_shard=3 remote_base=123144029339712 remote_rkey=1581056
+allocated ALIGNED MEM (no hugepage) at 127949562970176 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127949561569344 with buffer size 1398080
+[STATUS]: storage-owner peer RPC receive slots per peer: 16 (requested=16)
+[storage-peer][read] self_shard=4 target_shard=0 remote_base=135077145083968 rkey=1582592 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=0 free_ptr=51440000016 medoid_raw=33618154200
+[storage-peer][read] self_shard=4 target_shard=1 remote_base=123977477390400 rkey=1582080 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=1 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=2 remote_base=128696214093888 rkey=1584896 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=2 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=3 remote_base=123144029339712 rkey=1581056 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=3 free_ptr=51440000016 medoid_raw=0
+allocated ALIGNED MEM (no hugepage) at 127949642723392 with buffer size 263680
+allocated ALIGNED MEM (no hugepage) at 127949493764160 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127949424558144 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127949355352128 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127949286146112 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127949216940096 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127949147734080 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127949078528064 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127949009322048 with buffer size 67108864
+[STATUS]: storage-owner peer reverse-update workers: 8
+[STATUS]: storage-owner peer reverse-update tuning: mode=async queue_depth=65536 flush_us=200 coalesce_max=256
+[STATUS]: storage-owner peer RDMA read credits per peer: 8 per QP: 8 (requested=8)
+[STATUS]: storage-owner online insert tuning: construction_beam=128 snapshot_batch=64 prune_max_candidates=128
+allocated ALIGNED MEM (no hugepage) at 127948824772672 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127947878957120 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127947809751104 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127947740545088 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127947671339072 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127947602133056 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127947532927040 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127947463721024 with buffer size 67108864
+[STATUS]: storage-owner insert runtime enabled on shard 4
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1238
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 6112 -- 959
+[STATUS]: pinned main thread to core 28
+[STATUS]: loaded index metadata from /data/xjs/index/shine_gpu_index/n1024dim50M (layout=rabitq_search_block)
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 126164481867840 with buffer size 53687091200
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 6117 -- 964
+pairing: 6122 -- 969
+pairing: 6126 -- 974
+pairing: 6132 -- 979
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51440000016 Bytes) from /data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat
+[STATUS]: loaded RaBitQ artifacts from /data/xjs/index/shine_gpu_index/n1024dim50M (dim=1024, bits=4, layout=rabitq_search_block)
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 6160 -- 6150
+pairing: 6162 -- 6165
+pairing: 6167 -- 6168
+pairing: 6171 -- 6173
+pairing: 6175 -- 6158
+pairing: 6178 -- 6179
+pairing: 6181 -- 6183
+pairing: 6186 -- 6187
+pairing: 6190 -- 6159
+pairing: 6193 -- 6194
+pairing: 6197 -- 6198
+pairing: 6201 -- 6202
+pairing: 6204 -- 6206
+pairing: 6208 -- 6207
+pairing: 6210 -- 6209
+pairing: 6212 -- 6211
+[STATUS]: storage-owner peer RDMA QPs per peer: 4
+[storage-peer][token] self_shard=4 local_base=126164481867840 local_rkey=1582592 local_bytes=53687091200
+[storage-peer][token] self_shard=4 peer_shard=0 remote_base=137141443100736 remote_rkey=1584896
+[storage-peer][token] self_shard=4 peer_shard=1 remote_base=133931617747008 remote_rkey=1585664
+[storage-peer][token] self_shard=4 peer_shard=2 remote_base=123544490999872 remote_rkey=1582080
+[storage-peer][token] self_shard=4 peer_shard=3 remote_base=131199752208448 remote_rkey=1581312
+allocated ALIGNED MEM (no hugepage) at 126164395884608 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 126164463296576 with buffer size 1398080
+[STATUS]: storage-owner peer RPC receive slots per peer: 16 (requested=16)
+[storage-peer][read] self_shard=4 target_shard=0 remote_base=137141443100736 rkey=1584896 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=0 free_ptr=51440000016 medoid_raw=33618154200
+[storage-peer][read] self_shard=4 target_shard=1 remote_base=133931617747008 rkey=1585664 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=1 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=2 remote_base=123544490999872 rkey=1582080 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=2 free_ptr=51440000016 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=3 remote_base=131199752208448 rkey=1581312 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=3 free_ptr=51440000016 medoid_raw=0
+allocated ALIGNED MEM (no hugepage) at 126164477874240 with buffer size 263680
+allocated ALIGNED MEM (no hugepage) at 126164326678592 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 126164257472576 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 126164188266560 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 126164119060544 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 126164049854528 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 126163980648512 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 126163911442496 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 126163842236480 with buffer size 67108864
+[STATUS]: storage-owner peer reverse-update workers: 8
+[STATUS]: storage-owner peer reverse-update tuning: mode=async queue_depth=65536 flush_us=200 coalesce_max=256
+[STATUS]: storage-owner peer RDMA read credits per peer: 8 per QP: 8 (requested=8)
+[STATUS]: storage-owner online insert tuning: construction_beam=128 snapshot_batch=64 prune_max_candidates=128
+allocated ALIGNED MEM (no hugepage) at 126163657687104 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 126162648956992 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 126162579750976 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 126162510544960 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 126162441338944 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 126162372132928 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 126162302926912 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 126162233720896 with buffer size 67108864
+[STATUS]: storage-owner insert runtime enabled on shard 4
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1238
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 6217 -- 984
+[STATUS]: pinned main thread to core 28
+[STATUS]: loaded index metadata from /data/xjs/index/shine_gpu_index/n1024dim50M (layout=rabitq_search_block)
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 137682629951552 with buffer size 53687091200
+[STATUS]: loading index (51205356456 Bytes) from /data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 6220 -- 989
+pairing: 6226 -- 994
+pairing: 6232 -- 999
+pairing: 6237 -- 1004
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51205356456 Bytes) from /data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat
+[STATUS]: loaded RaBitQ artifacts from /data/xjs/index/shine_gpu_index/n1024dim50M (dim=1024, bits=4, layout=rabitq_search_block)
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 6254 -- 6260
+pairing: 6261 -- 6265
+pairing: 6270 -- 6271
+pairing: 6277 -- 6275
+pairing: 6281 -- 6282
+pairing: 6284 -- 6288
+pairing: 6291 -- 6292
+pairing: 6297 -- 6294
+pairing: 6299 -- 6298
+pairing: 6302 -- 6305
+pairing: 6307 -- 6308
+pairing: 6310 -- 6309
+pairing: 6311 -- 6306
+pairing: 6313 -- 6312
+pairing: 6315 -- 6314
+pairing: 6317 -- 6316
+[STATUS]: storage-owner peer RDMA QPs per peer: 4
+[storage-peer][token] self_shard=4 local_base=137682629951552 local_rkey=1584896 local_bytes=53687091200
+[storage-peer][token] self_shard=4 peer_shard=0 remote_base=136145608376384 remote_rkey=1582080
+[storage-peer][token] self_shard=4 peer_shard=1 remote_base=140290792882240 remote_rkey=1582566
+[storage-peer][token] self_shard=4 peer_shard=2 remote_base=140040910929984 remote_rkey=1585664
+[storage-peer][token] self_shard=4 peer_shard=3 remote_base=131127067017280 remote_rkey=1585408
+allocated ALIGNED MEM (no hugepage) at 137682546065472 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 137682544664640 with buffer size 1398080
+[STATUS]: storage-owner peer RPC receive slots per peer: 16 (requested=16)
+[storage-peer][read] self_shard=4 target_shard=0 remote_base=136145608376384 rkey=1582080 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=0 free_ptr=51660497576 medoid_raw=1125906604016856
+[storage-peer][read] self_shard=4 target_shard=1 remote_base=140290792882240 rkey=1582566 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=1 free_ptr=51417464152 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=2 remote_base=140040910929984 rkey=1585664 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=2 free_ptr=51536768944 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=3 remote_base=131127067017280 rkey=1585408 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=3 free_ptr=51379912952 medoid_raw=0
+allocated ALIGNED MEM (no hugepage) at 137682544398400 with buffer size 263680
+allocated ALIGNED MEM (no hugepage) at 137682476859456 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 137682407653440 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 137682338447424 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 137682269241408 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 137682200035392 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 137682130829376 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 137682061623360 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 137681992417344 with buffer size 67108864
+[STATUS]: storage-owner peer reverse-update workers: 8
+[STATUS]: storage-owner peer reverse-update tuning: mode=async queue_depth=65536 flush_us=200 coalesce_max=256
+[STATUS]: storage-owner peer RDMA read credits per peer: 8 per QP: 8 (requested=8)
+[STATUS]: storage-owner online insert tuning: construction_beam=128 snapshot_batch=64 prune_max_candidates=128
+allocated ALIGNED MEM (no hugepage) at 137680945938496 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 137680876732480 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 137680807526464 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 137680738320448 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 137680669114432 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 137680599908416 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 137680530702400 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 137680461496384 with buffer size 67108864
+[STATUS]: storage-owner insert runtime enabled on shard 4
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1238
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 6322 -- 1009
+[STATUS]: pinned main thread to core 28
+[STATUS]: loaded index metadata from /data/xjs/index/shine_gpu_index/n1024dim50M (layout=rabitq_search_block)
+allocation size: 53687091200
+allocated ALIGNED MEM (no hugepage) at 129599692341312 with buffer size 53687091200
+[STATUS]: loading index (51205356456 Bytes) from /data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 6327 -- 1014
+pairing: 6329 -- 1019
+pairing: 6337 -- 1024
+pairing: 6342 -- 1029
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (51205356456 Bytes) from /data/xjs/index/shine_gpu_index/n1024dim50M_node5_of5.dat
+[STATUS]: loaded RaBitQ artifacts from /data/xjs/index/shine_gpu_index/n1024dim50M (dim=1024, bits=4, layout=rabitq_search_block)
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 6366 -- 6363
+pairing: 6369 -- 6373
+pairing: 6377 -- 6378
+pairing: 6380 -- 6383
+pairing: 6385 -- 6374
+pairing: 6387 -- 6389
+pairing: 6392 -- 6393
+pairing: 6396 -- 6397
+pairing: 6400 -- 6375
+pairing: 6402 -- 6403
+pairing: 6404 -- 6406
+pairing: 6409 -- 6410
+pairing: 6413 -- 6416
+pairing: 6418 -- 6417
+pairing: 6420 -- 6419
+pairing: 6422 -- 6421
+[STATUS]: storage-owner peer RDMA QPs per peer: 4
+[storage-peer][token] self_shard=4 local_base=129599692341312 local_rkey=1582592 local_bytes=53687091200
+[storage-peer][token] self_shard=4 peer_shard=0 remote_base=124868385308736 remote_rkey=1585664
+[storage-peer][token] self_shard=4 peer_shard=1 remote_base=132253717889088 remote_rkey=1584640
+[storage-peer][token] self_shard=4 peer_shard=2 remote_base=130496755400768 remote_rkey=1582566
+[storage-peer][token] self_shard=4 peer_shard=3 remote_base=134665146990656 remote_rkey=1582080
+allocated ALIGNED MEM (no hugepage) at 129599608455232 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129599675727936 with buffer size 1398080
+[STATUS]: storage-owner peer RPC receive slots per peer: 16 (requested=16)
+[storage-peer][read] self_shard=4 target_shard=0 remote_base=124868385308736 rkey=1585664 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=0 free_ptr=51660497576 medoid_raw=1125906604016856
+[storage-peer][read] self_shard=4 target_shard=1 remote_base=132253717889088 rkey=1584640 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=1 free_ptr=51417464152 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=2 remote_base=130496755400768 rkey=1582566 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=2 free_ptr=51536768944 medoid_raw=0
+[storage-peer][read] self_shard=4 target_shard=3 remote_base=134665146990656 rkey=1582080 offset=0 bytes=16
+[storage-peer][probe] self_shard=4 peer_shard=3 free_ptr=51379912952 medoid_raw=0
+allocated ALIGNED MEM (no hugepage) at 129599608188992 with buffer size 263680
+allocated ALIGNED MEM (no hugepage) at 129599539249216 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129599470043200 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129599400837184 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129599331631168 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129599262425152 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129599193219136 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129599124013120 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129599054807104 with buffer size 67108864
+[STATUS]: storage-owner peer reverse-update workers: 8
+[STATUS]: storage-owner peer reverse-update tuning: mode=async queue_depth=65536 flush_us=200 coalesce_max=256
+[STATUS]: storage-owner peer RDMA read credits per peer: 8 per QP: 8 (requested=8)
+[STATUS]: storage-owner online insert tuning: construction_beam=128 snapshot_batch=64 prune_max_candidates=128
+allocated ALIGNED MEM (no hugepage) at 129598870257728 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129597884596288 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129597815390272 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129597746184256 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129597676978240 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129597607772224 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129597538566208 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 129597469360192 with buffer size 67108864
+[STATUS]: storage-owner insert runtime enabled on shard 4

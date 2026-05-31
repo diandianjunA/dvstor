@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 
 #include <library/utils.hh>
 
@@ -12,29 +13,81 @@
 #include "nlohmann/json.hh"
 #include "remote_pointer.hh"
 #include "vamana/vamana_node.hh"
+#include "tools/vamana_offline/partitioning.hh"
 #include "tools/vamana_offline/progress.hh"
 
 namespace tools::vamana_offline {
 
 vec<NodePlacement> assign_nodes_to_shards(size_t num_vectors, u32 num_memory_nodes) {
   const size_t node_size = VamanaNode::total_size();
-  // Align to 8 bytes
   const size_t aligned_size = (node_size + 7) & ~7ULL;
-
-  vec<u64> shard_offsets(num_memory_nodes, 16);  // reserve 16B header: [free_ptr | medoid_ptr]
-  vec<NodePlacement> placements(num_vectors);
-
-  for (size_t i = 0; i < num_vectors; ++i) {
-    // Pick shard with least data
-    const auto min_it = std::min_element(shard_offsets.begin(), shard_offsets.end());
-    const u32 shard = static_cast<u32>(std::distance(shard_offsets.begin(), min_it));
-
-    placements[i] = {shard, *min_it};
-    *min_it += aligned_size;
-  }
-
-  return placements;
+  return assign_nodes_to_shards_balanced(num_vectors, num_memory_nodes, aligned_size);
 }
+
+namespace {
+
+struct PlacementResult {
+  vec<NodePlacement> placements;
+  PartitionStats stats;
+  double cross_shard_ratio{0.0};
+};
+
+PlacementResult place_nodes(const VamanaGraph& graph,
+                            const VamanaBuildConfig& config,
+                            size_t aligned_size) {
+  PlacementResult result;
+  if (config.partition_strategy == "metis") {
+    vec<u64> edges;
+    const size_t reserve_edges =
+      std::min<size_t>(graph.num_nodes * static_cast<size_t>(config.partition_max_degree),
+                       static_cast<size_t>(std::numeric_limits<u32>::max()));
+    edges.reserve(reserve_edges);
+    for (size_t i = 0; i < graph.neighbors.size(); ++i) {
+      append_partition_edges(static_cast<u32>(i), graph.neighbors[i], config.partition_max_degree, edges);
+    }
+    PartitionOptions options;
+    options.num_parts = config.num_memory_nodes;
+    options.max_degree = config.partition_max_degree;
+    options.imbalance = config.partition_imbalance;
+    vec<u32> parts = compute_metis_partition(graph.num_nodes, edges, options, &result.stats);
+    result.placements = assign_nodes_to_shards_from_partition(parts, config.num_memory_nodes, aligned_size);
+  } else if (config.partition_strategy == "bfs") {
+    const u32 start_node = graph.medoid < graph.num_nodes ? graph.medoid : 0;
+    vec<u32> parts = compute_bfs_partition(graph.neighbors, config.num_memory_nodes, start_node, &result.stats);
+    result.placements = assign_nodes_to_shards_from_partition(parts, config.num_memory_nodes, aligned_size);
+  } else {
+    result.placements = assign_nodes_to_shards_balanced(graph.num_nodes, config.num_memory_nodes, aligned_size);
+    result.stats.part_node_counts.assign(config.num_memory_nodes, 0);
+    for (const auto& placement : result.placements) {
+      ++result.stats.part_node_counts[placement.memory_node];
+    }
+  }
+  result.cross_shard_ratio = compute_cross_shard_ratio(graph.neighbors, result.placements);
+  return result;
+}
+
+void print_partition_stats(const VamanaBuildConfig& config, const PlacementResult& result) {
+  std::cerr << "partition strategy: " << config.partition_strategy
+            << " max_degree=" << config.partition_max_degree
+            << " imbalance=" << config.partition_imbalance << "\n";
+  if (config.partition_strategy == "metis") {
+    std::cerr << "METIS partition edges: input=" << result.stats.input_edges
+              << " unique=" << result.stats.unique_edges
+              << " edge_cut=" << result.stats.edge_cut
+              << " partition_cut_ratio=" << result.stats.partition_cross_shard_ratio << "\n";
+  } else if (config.partition_strategy == "bfs") {
+    std::cerr << "BFS partition edges: input=" << result.stats.input_edges
+              << " edge_cut=" << result.stats.edge_cut
+              << " partition_cut_ratio=" << result.stats.partition_cross_shard_ratio << "\n";
+  }
+  std::cerr << "partition node counts:";
+  for (size_t count : result.stats.part_node_counts) {
+    std::cerr << " " << count;
+  }
+  std::cerr << "\nactive neighbor cross-shard ratio: " << result.cross_shard_ratio << "\n";
+}
+
+}  // namespace
 
 void write_vamana_shards(const VamanaGraph& graph,
                          const Dataset& dataset,
@@ -49,7 +102,9 @@ void write_vamana_shards(const VamanaGraph& graph,
 
   ProgressReporter progress{"Exporting Vamana shards", n + config.num_memory_nodes};
 
-  const auto placements = assign_nodes_to_shards(n, config.num_memory_nodes);
+  PlacementResult placement_result = place_nodes(graph, config, aligned_size);
+  print_partition_stats(config, placement_result);
+  const auto& placements = placement_result.placements;
 
   // Compute shard sizes
   vec<u64> shard_sizes(config.num_memory_nodes, 16);
@@ -160,7 +215,13 @@ void write_vamana_shards(const VamanaGraph& graph,
     {"num_memory_nodes", config.num_memory_nodes},
     {"medoid", {{"memory_node", medoid_ptr.memory_node()}, {"offset", medoid_ptr.byte_offset()}}},
     {"node_size", node_size},
+    {"node_layout", VamanaNode::layout_name()},
     {"rabitq_size", rabitq_state.total_rabitq_bytes},
+    {"partition_strategy", config.partition_strategy},
+    {"partition_max_degree", config.partition_max_degree},
+    {"partition_imbalance", config.partition_imbalance},
+    {"partition_edge_cut", placement_result.stats.edge_cut},
+    {"partition_cross_shard_ratio", placement_result.cross_shard_ratio},
   };
 
   const filepath_t metadata_file = filepath_t(output_prefix.string() + ".meta.json");

@@ -201,6 +201,7 @@ std::vector<std::string> DvstorIndex::build_service_argv(const std::string& serv
     "disable-thread-pinning",
     "no-recall",
     "ip-dist",
+    "gpudirect-rdma",
   };
 
   for (const auto& [key, value] : config) {

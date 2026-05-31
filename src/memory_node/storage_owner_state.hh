@@ -53,6 +53,12 @@ struct RabitqSnapshot {
   vec<byte_t> data;
 };
 
+struct SearchBlockSnapshot {
+  RemotePtr rptr;
+  vec<byte_t> rabitq_data;
+  vec<RemotePtr> neighbors;
+};
+
 struct InsertRuntimeState {
   HugePage<byte_t> buffer;
   std::unique_ptr<LocalMemoryRegion> region;
@@ -104,9 +110,9 @@ public:
     const size_t snapshot_bytes = VamanaNode::size_until_vector_end() + sizeof(NodeSnapshot) + 64;
     const size_t neighbor_bytes = VamanaNode::NEIGHBORS_SIZE + sizeof(RemotePtr) + 64;
     const size_t rabitq_bytes = VamanaNode::RABITQ_SIZE + sizeof(byte_t) + 64;
-    snapshot_capacity_ = std::max<size_t>(1, bytes / 3 / std::max<size_t>(1, snapshot_bytes));
-    neighbor_capacity_ = std::max<size_t>(1, bytes / 3 / std::max<size_t>(1, neighbor_bytes));
-    rabitq_capacity_ = std::max<size_t>(1, bytes / 3 / std::max<size_t>(1, rabitq_bytes));
+    snapshot_capacity_ = std::max<size_t>(1, (bytes * 55 / 100) / std::max<size_t>(1, snapshot_bytes));
+    neighbor_capacity_ = std::max<size_t>(1, (bytes * 35 / 100) / std::max<size_t>(1, neighbor_bytes));
+    rabitq_capacity_ = std::max<size_t>(1, (bytes * 10 / 100) / std::max<size_t>(1, rabitq_bytes));
   }
 
   bool enabled() const { return enabled_; }

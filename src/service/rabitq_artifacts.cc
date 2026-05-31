@@ -19,7 +19,7 @@ bool fail(str* error_message, const str& message) {
 
 }  // namespace
 
-bool load_artifacts(const filepath_t& index_prefix, Artifacts& artifacts, str* error_message) {
+bool load_metadata(const filepath_t& index_prefix, Artifacts& artifacts, str* error_message) {
   artifacts = Artifacts{};
   artifacts.index_prefix = index_prefix;
 
@@ -39,8 +39,17 @@ bool load_artifacts(const filepath_t& index_prefix, Artifacts& artifacts, str* e
     artifacts.R = metadata.at("R").get<u32>();
     artifacts.beam_width_construction = metadata.at("beam_width_construction").get<u32>();
     artifacts.node_size = metadata.at("node_size").get<u32>();
+    artifacts.node_layout = metadata.value("node_layout", str{"legacy"});
   } catch (const std::exception& e) {
     return fail(error_message, "invalid metadata file " + meta_file.string() + ": " + e.what());
+  }
+
+  return true;
+}
+
+bool load_artifacts(const filepath_t& index_prefix, Artifacts& artifacts, str* error_message) {
+  if (!load_metadata(index_prefix, artifacts, error_message)) {
+    return false;
   }
 
   const filepath_t rotation_file = filepath_t(index_prefix.string() + ".rotation.bin");

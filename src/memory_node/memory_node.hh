@@ -90,6 +90,7 @@ private:
   using NodeSnapshot = memory_node_detail::NodeSnapshot;
   using RabitqSearchState = memory_node_detail::RabitqSearchState;
   using RabitqSnapshot = memory_node_detail::RabitqSnapshot;
+  using SearchBlockSnapshot = memory_node_detail::SearchBlockSnapshot;
   using InsertRuntimeState = memory_node_detail::InsertRuntimeState;
   using PeerRpcRuntimeState = memory_node_detail::PeerRpcRuntimeState;
   using PeerPendingSend = memory_node_detail::PeerPendingSend;
@@ -251,6 +252,11 @@ private:
   auto async_read_rabitq_snapshots(const vec<RemotePtr>& rptrs,
                                    const Configuration& config,
                                    StorageOwnerThread& thread);
+  vec<SearchBlockSnapshot> read_search_block_snapshots_batched(const vec<RemotePtr>& rptrs,
+                                                               const Configuration& config);
+  auto async_read_search_block_snapshots(const vec<RemotePtr>& rptrs,
+                                         const Configuration& config,
+                                         StorageOwnerThread& thread);
   vec<RemotePtr> beam_search_candidates(const span<const element_t> query,
                                         RemotePtr medoid,
                                         const Configuration& config,

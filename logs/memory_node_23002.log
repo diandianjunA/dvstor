@@ -1,0 +1,14 @@
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     23002
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+server index file:            "/tmp/dvstor_offline_layout_smoke_23002_2/index/offline_layout_node1_of1.dat"
+============================================================
+No InfiniBand devices found

@@ -32,12 +32,17 @@ int main(int argc, char** argv) {
   std::cerr << "memory nodes: " << config.num_memory_nodes << "\n";
   std::cerr << "threads: " << effective_thread_count(config.threads) << "\n";
   std::cerr << "R=" << config.R << " construction_beam_width=" << config.beam_width
-            << " alpha=" << config.alpha << " rabitq_bits=" << config.rabitq_bits << "\n";
+            << " alpha=" << config.alpha << " rabitq_bits=" << config.rabitq_bits
+            << " node_layout=" << config.node_layout << "\n";
+  std::cerr << "partition_strategy=" << config.partition_strategy
+            << " partition_max_degree=" << config.partition_max_degree
+            << " partition_imbalance=" << config.partition_imbalance << "\n";
 
   const auto build_start = std::chrono::steady_clock::now();
 
   // Initialize VamanaNode static storage
-  VamanaNode::init_static_storage(dataset.dim, config.R, config.rabitq_bits);
+  VamanaNode::init_static_storage(
+      dataset.dim, config.R, config.rabitq_bits, VamanaNode::parse_layout(config.node_layout));
 
   // Select distance function
   DistFn dist_fn = config.ip_distance ? ip_distance : l2_squared;
