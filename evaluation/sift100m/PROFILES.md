@@ -34,11 +34,11 @@ READ_RATIO=1.0 CLIENT_THREADS=32 MEASURE_SECONDS=120 ./evaluation/sift100m/run_p
 
 Profile summary:
 
-| Profile | GPUDirect RDMA | Neighbor cache | GPU RaBitQ cache | Cache mode | Insert mode |
-| --- | --- | --- | --- | --- | --- |
-| `baseline` | off | 2048 MB | 0 MB | off | `compute` |
-| `gpudirect_rdma` | on | 2048 MB | 0 MB | off | `compute` |
-| `gpudirect_slot_clock` | on | 2048 MB | 8192 MB | `slot_clock` | `compute` |
-| `gpudirect_gentile` | on | 2048 MB | 8192 MB | `gentile` | `compute` |
-| `gpudirect_gentile_storage_owner` | on | 2048 MB | 8192 MB | `gentile` | `storage_owner` |
+| Profile | GPUDirect RDMA | Neighbor cache | GPU RaBitQ cache | Cache mode | Insert mode | Workers |
+| --- | --- | --- | --- | --- | --- | --- |
+| `baseline` | off | 2048 MB | 0 MB | off | `compute` | 8 insert / 8 query |
+| `gpudirect_rdma` | on | 2048 MB | 0 MB | off | `compute` | 8 insert / 8 query |
+| `gpudirect_slot_clock` | on | 2048 MB | 8192 MB | `slot_clock` | `compute` | 8 insert / 8 query |
+| `gpudirect_gentile` | on | 2048 MB | 8192 MB | `gentile` | `compute` | 8 insert / 8 query |
+| `gpudirect_gentile_storage_owner` | on | 2048 MB | 8192 MB | `gentile` | `storage_owner` | 0 insert / 16 query |
 

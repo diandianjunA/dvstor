@@ -47,6 +47,7 @@ gpu-device = $GPU_DEVICE
 max-vectors = $MAX_VECTORS
 cn-memory = $CN_MEMORY
 mn-memory = $MN_MEMORY
+insert-workers = $INSERT_WORKERS
 query-workers = $QUERY_WORKERS
 query-coroutines = $QUERY_COROUTINES
 cache = $CACHE
