@@ -43,6 +43,13 @@ public:
   u32 neighbor_cache_invalidation_ms{0};
   u32 neighbor_cache_invalidation_inserts{1};
   u32 gpu_rabitq_cache_mb{0};
+  str rabitq_cache_mode{"slot_clock"};
+  u32 gentile_tile_slots{32};
+  double gentile_nursery_ratio{0.25};
+  u32 gentile_promotion_threshold{2};
+  bool gentile_enable_promotion{false};
+  bool gentile_enable_value_bin{false};
+  bool gentile_enable_hit_tile_grouping{true};
   str search_mode{"exact_gpu"};
   str insert_execution{"compute"};
   u32 insert_workers{};
@@ -93,6 +100,7 @@ public:
     search_mode = normalize_search_mode(search_mode);
     insert_execution = normalize_search_mode(insert_execution);
     storage_owner_reverse_mode = normalize_search_mode(storage_owner_reverse_mode);
+    rabitq_cache_mode = normalize_search_mode(rabitq_cache_mode);
 
     if (!is_server) {
       validate_compute_node_options(argv);
@@ -211,6 +219,22 @@ private:
       "Minimum successful inserts between neighbor-cache epoch invalidations.")(
       "gpu-rabitq-cache-mb", po::value<u32>(&gpu_rabitq_cache_mb)->default_value(0),
       "GPU RaBitQ cache size per compute node in MB. 0 disables it.")(
+      "rabitq-cache-mode", po::value<str>(&rabitq_cache_mode)->default_value(rabitq_cache_mode),
+      "GPU RaBitQ cache mode: off, slot_clock, or gentile.")(
+      "gentile-tile-slots", po::value<u32>(&gentile_tile_slots)->default_value(gentile_tile_slots),
+      "GenTile cache slots per tile.")(
+      "gentile-nursery-ratio", po::value<double>(&gentile_nursery_ratio)->default_value(gentile_nursery_ratio),
+      "Fraction of GenTile cache tiles reserved for nursery allocation.")(
+      "gentile-promotion-threshold",
+      po::value<u32>(&gentile_promotion_threshold)->default_value(gentile_promotion_threshold),
+      "GenTile nursery hit credit threshold before promotion. Reserved for later stages.")(
+      "gentile-enable-promotion", po::value<bool>(&gentile_enable_promotion)->default_value(gentile_enable_promotion),
+      "Enable GenTile nursery-to-hot promotion. Reserved for later stages.")(
+      "gentile-enable-value-bin", po::value<bool>(&gentile_enable_value_bin)->default_value(gentile_enable_value_bin),
+      "Enable GenTile tile-level value-bin replacement. Reserved for later stages.")(
+      "gentile-enable-hit-tile-grouping",
+      po::value<bool>(&gentile_enable_hit_tile_grouping)->default_value(gentile_enable_hit_tile_grouping),
+      "Enable GenTile grouped-by-tile cached distance kernel.")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
       "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
@@ -246,6 +270,19 @@ private:
 
     if (neighbor_cache_invalidation_inserts == 0) {
       std::cerr << "[ERROR]: --neighbor-cache-invalidation-inserts must be > 0" << std::endl;
+      exit_with_help_message(argv);
+    }
+
+    if (rabitq_cache_mode != "off" && rabitq_cache_mode != "slot_clock" && rabitq_cache_mode != "gentile") {
+      std::cerr << "[ERROR]: --rabitq-cache-mode must be off, slot_clock, or gentile" << std::endl;
+      exit_with_help_message(argv);
+    }
+    if (gentile_tile_slots == 0) {
+      std::cerr << "[ERROR]: --gentile-tile-slots must be > 0" << std::endl;
+      exit_with_help_message(argv);
+    }
+    if (gentile_nursery_ratio <= 0.0 || gentile_nursery_ratio > 1.0) {
+      std::cerr << "[ERROR]: --gentile-nursery-ratio must be in (0, 1]" << std::endl;
       exit_with_help_message(argv);
     }
 
@@ -405,6 +442,14 @@ public:
       os << std::setw(width) << "neighbor cache invalidation inserts: "
          << config.neighbor_cache_invalidation_inserts << std::endl;
       os << std::setw(width) << "GPU RaBitQ cache (MB): " << config.gpu_rabitq_cache_mb << std::endl;
+      os << std::setw(width) << "RaBitQ cache mode: " << config.rabitq_cache_mode << std::endl;
+      os << std::setw(width) << "GenTile tile slots: " << config.gentile_tile_slots << std::endl;
+      os << std::setw(width) << "GenTile nursery ratio: " << config.gentile_nursery_ratio << std::endl;
+      os << std::setw(width) << "GenTile promotion threshold: " << config.gentile_promotion_threshold << std::endl;
+      os << std::setw(width) << "GenTile promotion: " << (config.gentile_enable_promotion ? "true" : "false") << std::endl;
+      os << std::setw(width) << "GenTile value-bin: " << (config.gentile_enable_value_bin ? "true" : "false") << std::endl;
+      os << std::setw(width) << "GenTile hit grouping: "
+         << (config.gentile_enable_hit_tile_grouping ? "true" : "false") << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {
       os << std::left << std::setfill(' ');

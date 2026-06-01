@@ -137,6 +137,123 @@ __global__ void batch_rabitq_distance_kernel(
 }
 
 template <uint32_t TILE_SIZE, uint32_t BITS_PER_DIM>
+__global__ void batch_tile_cached_rabitq_distance_kernel(
+    const float* __restrict__ rot_query,
+    const RabitqQueryFactor* __restrict__ qfactor,
+    const uint8_t* __restrict__ rabitq_base,
+    const uint32_t* __restrict__ task_tile_ids,
+    const uint32_t* __restrict__ task_starts,
+    const uint32_t* __restrict__ task_counts,
+    const uint32_t* __restrict__ offsets,
+    const uint32_t* __restrict__ candidate_indices,
+    float* __restrict__ distances,
+    uint32_t n_items,
+    uint32_t n_tasks,
+    uint32_t dim,
+    uint32_t vec_stride,
+    uint32_t tile_slots)
+{
+    auto block = cg::this_thread_block();
+    auto tile = cg::tiled_partition<TILE_SIZE>(block);
+
+    uint32_t item = (blockIdx.x * blockDim.x + threadIdx.x) / TILE_SIZE;
+    if (item >= n_items) return;
+
+    uint32_t task_id = 0;
+    for (; task_id < n_tasks; ++task_id) {
+        const uint32_t start = task_starts[task_id];
+        if (item >= start && item < start + task_counts[task_id]) break;
+    }
+    if (task_id >= n_tasks) return;
+
+    const uint32_t tile_id = task_tile_ids[task_id];
+    const uint32_t offset = offsets[item];
+    const uint32_t out_idx = candidate_indices[item];
+    const uint32_t packed_bytes = (BITS_PER_DIM * dim + 7) / 8;
+    const uint8_t* tile_base = rabitq_base + static_cast<size_t>(tile_id) * tile_slots * vec_stride;
+    const uint8_t* vec_data = tile_base + static_cast<size_t>(offset) * vec_stride;
+    float data_add = *reinterpret_cast<const float*>(vec_data + packed_bytes);
+    float data_rescale = *reinterpret_cast<const float*>(vec_data + packed_bytes + sizeof(float));
+
+    float dot_tmp = 0.0f;
+    for (uint32_t j = tile.thread_rank(); j < dim; j += TILE_SIZE) {
+        uint32_t bit_idx = j * BITS_PER_DIM;
+        uint32_t byte_idx = bit_idx / 8;
+        uint32_t bit_off = bit_idx % 8;
+        uint16_t chunk = vec_data[byte_idx];
+        if (bit_off + BITS_PER_DIM > 8 && byte_idx + 1 < packed_bytes) {
+            chunk |= (uint16_t(vec_data[byte_idx + 1]) << 8);
+        }
+        uint8_t mask = (1u << BITS_PER_DIM) - 1u;
+        float val = static_cast<float>((chunk >> bit_off) & mask);
+        dot_tmp += val * rot_query[j];
+    }
+
+    float dot = cg::reduce(tile, dot_tmp, cg::plus<float>());
+    if (tile.thread_rank() == 0) {
+        float k1_factor = static_cast<float>((1 << BITS_PER_DIM) - 1);
+        distances[out_idx] = data_add + qfactor->add + data_rescale * (dot + qfactor->k1xSumq * k1_factor);
+    }
+}
+
+template <uint32_t TILE_SIZE>
+__global__ void batch_tile_cached_rabitq_8bit_distance_kernel(
+    const float* __restrict__ rot_query,
+    const RabitqQueryFactor* __restrict__ qfactor,
+    const uint8_t* __restrict__ rabitq_base,
+    const uint32_t* __restrict__ task_tile_ids,
+    const uint32_t* __restrict__ task_starts,
+    const uint32_t* __restrict__ task_counts,
+    const uint32_t* __restrict__ offsets,
+    const uint32_t* __restrict__ candidate_indices,
+    float* __restrict__ distances,
+    uint32_t n_items,
+    uint32_t n_tasks,
+    uint32_t dim,
+    uint32_t vec_stride,
+    uint32_t tile_slots)
+{
+    auto block = cg::this_thread_block();
+    auto tile = cg::tiled_partition<TILE_SIZE>(block);
+
+    uint32_t item = (blockIdx.x * blockDim.x + threadIdx.x) / TILE_SIZE;
+    if (item >= n_items) return;
+
+    uint32_t task_id = 0;
+    for (; task_id < n_tasks; ++task_id) {
+        const uint32_t start = task_starts[task_id];
+        if (item >= start && item < start + task_counts[task_id]) break;
+    }
+    if (task_id >= n_tasks) return;
+
+    const uint32_t tile_id = task_tile_ids[task_id];
+    const uint32_t offset = offsets[item];
+    const uint32_t out_idx = candidate_indices[item];
+    const uint8_t* tile_base = rabitq_base + static_cast<size_t>(tile_id) * tile_slots * vec_stride;
+    const uint8_t* vec_data = tile_base + static_cast<size_t>(offset) * vec_stride;
+    float data_add = *reinterpret_cast<const float*>(vec_data + dim);
+    float data_rescale = *reinterpret_cast<const float*>(vec_data + dim + sizeof(float));
+
+    const char4* data_ptr = reinterpret_cast<const char4*>(vec_data);
+    const float4* query_ptr = reinterpret_cast<const float4*>(rot_query);
+    float dot_tmp = 0.0f;
+    for (uint32_t i = tile.thread_rank(); i < dim / 4; i += TILE_SIZE) {
+        float4 q = query_ptr[i];
+        char4 d = data_ptr[i];
+        dot_tmp += static_cast<float>(static_cast<uint8_t>(d.x)) * q.x +
+                   static_cast<float>(static_cast<uint8_t>(d.y)) * q.y +
+                   static_cast<float>(static_cast<uint8_t>(d.z)) * q.z +
+                   static_cast<float>(static_cast<uint8_t>(d.w)) * q.w;
+    }
+
+    float dot = cg::reduce(tile, dot_tmp, cg::plus<float>());
+    if (tile.thread_rank() == 0) {
+        distances[out_idx] = data_add + qfactor->add + data_rescale *
+            (dot + qfactor->k1xSumq * static_cast<float>((1 << 8) - 1));
+    }
+}
+
+template <uint32_t TILE_SIZE, uint32_t BITS_PER_DIM>
 __global__ void batch_cached_rabitq_distance_kernel(
     const float* __restrict__ rot_query,
     const RabitqQueryFactor* __restrict__ qfactor,
