@@ -83,14 +83,7 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                              config_.rabitq_bits,
                              thread->ctx->context.get_protection_domain(),
                              config_.gpudirect_rdma,
-                             query_worker && config_.use_rabitq_search() ? gpu_rabitq_cache_bytes_per_query_worker : 0,
-                             config_.rabitq_cache_mode.c_str(),
-                             config_.gentile_tile_slots,
-                             config_.gentile_nursery_ratio,
-                             config_.gentile_promotion_threshold,
-                             config_.gentile_enable_promotion,
-                             config_.gentile_enable_value_bin,
-                             config_.gentile_enable_hit_tile_grouping);
+                             query_worker && config_.use_rabitq_search() ? gpu_rabitq_cache_bytes_per_query_worker : 0);
   }
   cm_.synchronize();
 

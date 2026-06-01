@@ -139,35 +139,15 @@
                     auto& fill_slots = gs.scratch_fill_slots;
                     auto& fill_addrs = gs.scratch_fill_addrs;
                     auto& inflight_indices = gs.scratch_inflight_indices;
-                    const auto t_resolve = std::chrono::steady_clock::now();
-                    gpu::GpuRabitqCacheTiledResolve tiled_resolved;
-                    gpu::GpuRabitqCacheResolve resolved;
-                    const bool use_gentile = rabitq_cache.gentile_enabled();
-                    if (use_gentile) {
-                        tiled_resolved = rabitq_cache.resolve_batch_tiled(
-                            unvisited.data(), n_batch, gs.h_cache_slot_ids, fill_indices, fill_slots, fill_addrs,
-                            inflight_indices);
-                        resolved = tiled_resolved.base;
-                    } else {
-                        resolved = rabitq_cache.resolve_batch(
-                            unvisited.data(), n_batch, gs.h_cache_slot_ids, fill_indices, fill_slots, fill_addrs,
-                            inflight_indices);
-                    }
-                    thread->stats.gpu_rabitq_cache_resolve_ns += static_cast<u64>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - t_resolve).count());
+                    const auto resolved = rabitq_cache.resolve_batch(
+                        unvisited.data(), n_batch, gs.h_cache_slot_ids, fill_indices, fill_slots, fill_addrs,
+                        inflight_indices);
 
                     if (resolved.ok && inflight_indices.empty()) {
                         used_gpu_cache = true;
                         thread->stats.gpu_rabitq_cache_hits += resolved.hit_count;
                         thread->stats.gpu_rabitq_cache_misses += resolved.fill_count;
                         thread->stats.gpu_rabitq_cache_duplicate_fills += resolved.duplicate_loading_count;
-                        if (use_gentile) {
-                            thread->stats.gpu_rabitq_cache_nursery_hits += resolved.hit_count;
-                            thread->stats.gpu_rabitq_cache_unique_tiles += tiled_resolved.unique_tiles;
-                            thread->stats.gpu_rabitq_cache_tile_tasks += tiled_resolved.hit_tasks.size();
-                            thread->stats.gpu_rabitq_cache_miss_ranges += fill_slots.empty() ? 0 : 1;
-                        }
 
                         if (!fill_indices.empty()) {
                             auto& fill_ptrs = coro_state.scratch_cache_ptrs;
@@ -183,9 +163,6 @@
                             }
                             const auto t_rabitq_fetch = std::chrono::steady_clock::now();
                             co_await rdma::vamana::batch_read_rabitq(fill_ptrs, thread, &destinations);
-                            const auto rdma_done = std::chrono::steady_clock::now();
-                            thread->stats.gpu_rabitq_cache_rdma_ns += static_cast<u64>(
-                                std::chrono::duration_cast<std::chrono::nanoseconds>(rdma_done - t_rabitq_fetch).count());
                             add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_rabitq_fetch,
                                                       t_rabitq_fetch);
                             rabitq_cache.publish_batch(fill_slots);
@@ -196,58 +173,17 @@
 
                         rabitq_cache.acquire_slots(gs.h_cache_slot_ids, n_batch);
                         const auto t_gpu_distance = std::chrono::steady_clock::now();
-                        if (use_gentile && rabitq_cache.hit_tile_grouping_enabled()) {
-                            const u32 task_count = static_cast<u32>(tiled_resolved.hit_tasks.size());
-                            const u32 item_count = static_cast<u32>(tiled_resolved.task_offsets.size());
-                            for (u32 i = 0; i < task_count; ++i) {
-                                gs.h_tile_task_tile_ids[i] = tiled_resolved.hit_tasks[i].tile_id;
-                                gs.h_tile_task_starts[i] = tiled_resolved.hit_tasks[i].start;
-                                gs.h_tile_task_counts[i] = tiled_resolved.hit_tasks[i].count;
-                            }
-                            for (u32 i = 0; i < item_count; ++i) {
-                                gs.h_tile_task_offsets[i] = tiled_resolved.task_offsets[i];
-                                gs.h_tile_task_candidate_indices[i] = tiled_resolved.task_candidate_indices[i];
-                            }
-                            cudaMemcpyAsync(gs.d_tile_task_tile_ids, gs.h_tile_task_tile_ids,
-                                            task_count * sizeof(uint32_t), cudaMemcpyHostToDevice, gs.stream);
-                            cudaMemcpyAsync(gs.d_tile_task_starts, gs.h_tile_task_starts,
-                                            task_count * sizeof(uint32_t), cudaMemcpyHostToDevice, gs.stream);
-                            cudaMemcpyAsync(gs.d_tile_task_counts, gs.h_tile_task_counts,
-                                            task_count * sizeof(uint32_t), cudaMemcpyHostToDevice, gs.stream);
-                            cudaMemcpyAsync(gs.d_tile_task_offsets, gs.h_tile_task_offsets,
-                                            item_count * sizeof(uint32_t), cudaMemcpyHostToDevice, gs.stream);
-                            cudaMemcpyAsync(gs.d_tile_task_candidate_indices, gs.h_tile_task_candidate_indices,
-                                            item_count * sizeof(uint32_t), cudaMemcpyHostToDevice, gs.stream);
-                            gpu::launch_batch_tile_cached_rabitq_distances(
-                                gs.stream, gs.event,
-                                gs.d_rot_query,
-                                gs.d_query_factor,
-                                rabitq_cache.base(),
-                                gs.d_tile_task_tile_ids,
-                                gs.d_tile_task_starts,
-                                gs.d_tile_task_counts,
-                                gs.d_tile_task_offsets,
-                                gs.d_tile_task_candidate_indices,
-                                gs.d_distances,
-                                item_count, task_count, dim_, rabitq_bits_,
-                                rabitq_cache.stride(),
-                                rabitq_cache.tile_slots());
-                        } else {
-                            gpu::launch_batch_cached_rabitq_distances(
-                                gs.stream, gs.event,
-                                gs.d_rot_query,
-                                gs.d_query_factor,
-                                rabitq_cache.base(),
-                                gs.d_cache_slot_ids,
-                                gs.d_distances,
-                                n_batch, dim_, rabitq_bits_,
-                                rabitq_cache.stride());
-                        }
+                        gpu::launch_batch_cached_rabitq_distances(
+                            gs.stream, gs.event,
+                            gs.d_rot_query,
+                            gs.d_query_factor,
+                            rabitq_cache.base(),
+                            gs.d_cache_slot_ids,
+                            gs.d_distances,
+                            n_batch, dim_, rabitq_bits_,
+                            rabitq_cache.stride());
                         ++thread->stats.query_rabitq_kernels;
                         co_await gpu::GpuAwaitable{thread.get()};
-                        thread->stats.gpu_rabitq_cache_kernel_ns += static_cast<u64>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                std::chrono::steady_clock::now() - t_gpu_distance).count());
                         rabitq_cache.release_slots(gs.h_cache_slot_ids, n_batch);
                         add_breakdown_subcategory(thread, service::breakdown::Subcategory::gpu_query_distance,
                                                   t_gpu_distance);

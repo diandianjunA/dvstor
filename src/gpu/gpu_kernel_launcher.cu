@@ -160,59 +160,6 @@ void launch_batch_cached_rabitq_distances(cudaStream_t stream, cudaEvent_t event
     CUDA_CHECK(cudaEventRecord(event, stream));
 }
 
-void launch_batch_tile_cached_rabitq_distances(cudaStream_t stream, cudaEvent_t event,
-                                               const float* d_rot_query,
-                                               const void* d_query_factor,
-                                               const void* d_rabitq_base,
-                                               const uint32_t* d_task_tile_ids,
-                                               const uint32_t* d_task_starts,
-                                               const uint32_t* d_task_counts,
-                                               const uint32_t* d_offsets,
-                                               const uint32_t* d_candidate_indices,
-                                               float* d_distances,
-                                               uint32_t n_items, uint32_t n_tasks, uint32_t dim,
-                                               uint32_t bits_per_dim,
-                                               uint32_t vec_stride,
-                                               uint32_t tile_slots) {
-    if (n_items == 0 || n_tasks == 0) {
-        CUDA_CHECK(cudaEventRecord(event, stream));
-        return;
-    }
-
-    uint32_t total_threads = n_items * TILE_SIZE;
-    uint32_t num_blocks = (total_threads + BLOCK_SIZE - 1) / BLOCK_SIZE;
-
-    auto* qfactor = static_cast<const gpu_kernels::RabitqQueryFactor*>(d_query_factor);
-    auto* base = static_cast<const uint8_t*>(d_rabitq_base);
-
-    if (bits_per_dim == 8) {
-        gpu_kernels::batch_tile_cached_rabitq_8bit_distance_kernel<TILE_SIZE>
-            <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-                d_rot_query, qfactor, base, d_task_tile_ids, d_task_starts, d_task_counts,
-                d_offsets, d_candidate_indices, d_distances, n_items, n_tasks, dim, vec_stride, tile_slots);
-    } else if (bits_per_dim == 1) {
-        gpu_kernels::batch_tile_cached_rabitq_distance_kernel<TILE_SIZE, 1>
-            <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-                d_rot_query, qfactor, base, d_task_tile_ids, d_task_starts, d_task_counts,
-                d_offsets, d_candidate_indices, d_distances, n_items, n_tasks, dim, vec_stride, tile_slots);
-    } else if (bits_per_dim == 2) {
-        gpu_kernels::batch_tile_cached_rabitq_distance_kernel<TILE_SIZE, 2>
-            <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-                d_rot_query, qfactor, base, d_task_tile_ids, d_task_starts, d_task_counts,
-                d_offsets, d_candidate_indices, d_distances, n_items, n_tasks, dim, vec_stride, tile_slots);
-    } else if (bits_per_dim == 4) {
-        gpu_kernels::batch_tile_cached_rabitq_distance_kernel<TILE_SIZE, 4>
-            <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-                d_rot_query, qfactor, base, d_task_tile_ids, d_task_starts, d_task_counts,
-                d_offsets, d_candidate_indices, d_distances, n_items, n_tasks, dim, vec_stride, tile_slots);
-    } else {
-        fprintf(stderr, "Unsupported tile cached bits_per_dim: %u\n", bits_per_dim);
-        abort();
-    }
-
-    CUDA_CHECK(cudaEventRecord(event, stream));
-}
-
 void launch_gather_cached_rabitq(cudaStream_t stream,
                                  const void* d_rabitq_base,
                                  const uint32_t* d_slot_ids,

@@ -68,21 +68,6 @@ void launch_batch_cached_rabitq_distances(cudaStream_t stream, cudaEvent_t event
                                           uint32_t bits_per_dim,
                                           uint32_t vec_stride);
 
-void launch_batch_tile_cached_rabitq_distances(cudaStream_t stream, cudaEvent_t event,
-                                               const float* d_rot_query,
-                                               const void* d_query_factor,
-                                               const void* d_rabitq_base,
-                                               const uint32_t* d_task_tile_ids,
-                                               const uint32_t* d_task_starts,
-                                               const uint32_t* d_task_counts,
-                                               const uint32_t* d_offsets,
-                                               const uint32_t* d_candidate_indices,
-                                               float* d_distances,
-                                               uint32_t n_items, uint32_t n_tasks, uint32_t dim,
-                                               uint32_t bits_per_dim,
-                                               uint32_t vec_stride,
-                                               uint32_t tile_slots);
-
 void launch_gather_cached_rabitq(cudaStream_t stream,
                                  const void* d_rabitq_base,
                                  const uint32_t* d_slot_ids,

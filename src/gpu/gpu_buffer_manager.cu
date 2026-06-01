@@ -40,14 +40,7 @@ void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
                             uint32_t rabitq_bits,
                             ibv_pd* rdma_pd,
                             bool enable_gpudirect_rdma,
-                            size_t gpu_rabitq_cache_bytes,
-                            const char* rabitq_cache_mode,
-                            uint32_t gentile_tile_slots,
-                            double gentile_nursery_ratio,
-                            uint32_t gentile_promotion_threshold,
-                            bool gentile_enable_promotion,
-                            bool gentile_enable_value_bin,
-                            bool gentile_enable_hit_tile_grouping) {
+                            size_t gpu_rabitq_cache_bytes) {
     num_coroutines_ = num_coroutines;
     dim_ = dim;
     max_batch_ = max_batch;
@@ -87,11 +80,6 @@ void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
         CUDA_CHECK(cudaMallocHost(&s.h_pruned_count, sizeof(uint32_t)));
         CUDA_CHECK(cudaMallocHost(&s.h_cache_positions, max_batch * sizeof(uint32_t)));
         CUDA_CHECK(cudaMallocHost(&s.h_cache_reorder, max_batch * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMallocHost(&s.h_tile_task_tile_ids, max_batch * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMallocHost(&s.h_tile_task_offsets, max_batch * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMallocHost(&s.h_tile_task_candidate_indices, max_batch * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMallocHost(&s.h_tile_task_starts, (max_batch + 1) * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMallocHost(&s.h_tile_task_counts, max_batch * sizeof(uint32_t)));
 
         // Device buffers
         CUDA_CHECK(cudaMalloc(&s.d_query, dim * sizeof(float)));
@@ -100,11 +88,6 @@ void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
         CUDA_CHECK(cudaMalloc(&s.d_candidate_vecs, max_batch * dim * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&s.d_candidate_dists, max_batch * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&s.d_candidate_order, max_batch * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&s.d_tile_task_tile_ids, max_batch * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&s.d_tile_task_offsets, max_batch * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&s.d_tile_task_candidate_indices, max_batch * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&s.d_tile_task_starts, (max_batch + 1) * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&s.d_tile_task_counts, max_batch * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&s.d_distances, max_batch * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&s.d_pruned_indices, max_R * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&s.d_pruned_count, sizeof(uint32_t)));
@@ -114,11 +97,6 @@ void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
         s.scratch_fill_addrs.reserve(max_batch);
         s.scratch_inflight_indices.reserve(max_batch);
         s.scratch_cache_positions.reserve(max_batch);
-        s.scratch_tile_task_tile_ids.reserve(max_batch);
-        s.scratch_tile_task_offsets.reserve(max_batch);
-        s.scratch_tile_task_candidate_indices.reserve(max_batch);
-        s.scratch_tile_task_starts.reserve(max_batch + 1);
-        s.scratch_tile_task_counts.reserve(max_batch);
 
     }
 
@@ -180,9 +158,7 @@ void GpuBufferManager::init(uint32_t num_coroutines, uint32_t dim,
     }
 
     if (gpudirect_rabitq_ready_ && gpu_rabitq_cache_bytes > 0) {
-        if (!rabitq_cache_.init(gpu_rabitq_cache_bytes, rabitq_vec_size_, pd, rabitq_cache_mode, gentile_tile_slots,
-                                gentile_nursery_ratio, gentile_promotion_threshold, gentile_enable_promotion,
-                                gentile_enable_value_bin, gentile_enable_hit_tile_grouping)) {
+        if (!rabitq_cache_.init(gpu_rabitq_cache_bytes, rabitq_vec_size_, pd)) {
             std::fprintf(stderr, "[GPU RaBitQ cache] disabled; falling back to staging buffers\n");
         }
     }
@@ -220,11 +196,6 @@ void GpuBufferManager::destroy() {
         if (s.d_candidate_vecs) cudaFree(s.d_candidate_vecs);
         if (s.d_candidate_dists) cudaFree(s.d_candidate_dists);
         if (s.d_candidate_order) cudaFree(s.d_candidate_order);
-        if (s.d_tile_task_tile_ids) cudaFree(s.d_tile_task_tile_ids);
-        if (s.d_tile_task_offsets) cudaFree(s.d_tile_task_offsets);
-        if (s.d_tile_task_candidate_indices) cudaFree(s.d_tile_task_candidate_indices);
-        if (s.d_tile_task_starts) cudaFree(s.d_tile_task_starts);
-        if (s.d_tile_task_counts) cudaFree(s.d_tile_task_counts);
         if (s.d_distances) cudaFree(s.d_distances);
         if (s.d_pruned_indices) cudaFree(s.d_pruned_indices);
         if (s.d_pruned_count) cudaFree(s.d_pruned_count);
@@ -245,11 +216,6 @@ void GpuBufferManager::destroy() {
         if (s.h_pruned_count) cudaFreeHost(s.h_pruned_count);
         if (s.h_cache_positions) cudaFreeHost(s.h_cache_positions);
         if (s.h_cache_reorder) cudaFreeHost(s.h_cache_reorder);
-        if (s.h_tile_task_tile_ids) cudaFreeHost(s.h_tile_task_tile_ids);
-        if (s.h_tile_task_offsets) cudaFreeHost(s.h_tile_task_offsets);
-        if (s.h_tile_task_candidate_indices) cudaFreeHost(s.h_tile_task_candidate_indices);
-        if (s.h_tile_task_starts) cudaFreeHost(s.h_tile_task_starts);
-        if (s.h_tile_task_counts) cudaFreeHost(s.h_tile_task_counts);
 
         // Stream and event
         if (s.event) cudaEventDestroy(s.event);

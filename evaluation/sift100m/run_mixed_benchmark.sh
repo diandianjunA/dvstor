@@ -58,13 +58,6 @@ neighbor-cache-invalidation-ms = $NEIGHBOR_CACHE_INVALIDATION_MS
 neighbor-cache-invalidation-inserts = $NEIGHBOR_CACHE_INVALIDATION_INSERTS
 gpudirect-rdma = $GPUDIRECT_RDMA
 gpu-rabitq-cache-mb = $GPU_RABITQ_CACHE_MB
-rabitq-cache-mode = $RABITQ_CACHE_MODE
-gentile-tile-slots = $GENTILE_TILE_SLOTS
-gentile-nursery-ratio = $GENTILE_NURSERY_RATIO
-gentile-promotion-threshold = $GENTILE_PROMOTION_THRESHOLD
-gentile-enable-promotion = $GENTILE_ENABLE_PROMOTION
-gentile-enable-value-bin = $GENTILE_ENABLE_VALUE_BIN
-gentile-enable-hit-tile-grouping = $GENTILE_ENABLE_HIT_TILE_GROUPING
 insert-start-id = $INSERT_START_ID
 EOF_CFG
 

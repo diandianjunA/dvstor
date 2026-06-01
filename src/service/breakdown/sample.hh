@@ -51,18 +51,6 @@ struct ThreadCounterDelta {
   u64 gpu_rabitq_cache_evictions{};
   u64 gpu_rabitq_cache_duplicate_fills{};
   u64 gpu_rabitq_cache_fallback_batches{};
-  u64 gpu_rabitq_cache_nursery_hits{};
-  u64 gpu_rabitq_cache_hot_hits{};
-  u64 gpu_rabitq_cache_promotions{};
-  u64 gpu_rabitq_cache_nursery_overwrites{};
-  u64 gpu_rabitq_cache_hot_tile_evictions{};
-  u64 gpu_rabitq_cache_unique_tiles{};
-  u64 gpu_rabitq_cache_tile_tasks{};
-  u64 gpu_rabitq_cache_miss_ranges{};
-  u64 gpu_rabitq_cache_resolve_ns{};
-  u64 gpu_rabitq_cache_victim_ns{};
-  u64 gpu_rabitq_cache_kernel_ns{};
-  u64 gpu_rabitq_cache_rdma_ns{};
 };
 
 
@@ -111,20 +99,6 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
       end.gpu_rabitq_cache_duplicate_fills - start.gpu_rabitq_cache_duplicate_fills;
     out.gpu_rabitq_cache_fallback_batches =
       end.gpu_rabitq_cache_fallback_batches - start.gpu_rabitq_cache_fallback_batches;
-    out.gpu_rabitq_cache_nursery_hits = end.gpu_rabitq_cache_nursery_hits - start.gpu_rabitq_cache_nursery_hits;
-    out.gpu_rabitq_cache_hot_hits = end.gpu_rabitq_cache_hot_hits - start.gpu_rabitq_cache_hot_hits;
-    out.gpu_rabitq_cache_promotions = end.gpu_rabitq_cache_promotions - start.gpu_rabitq_cache_promotions;
-    out.gpu_rabitq_cache_nursery_overwrites =
-      end.gpu_rabitq_cache_nursery_overwrites - start.gpu_rabitq_cache_nursery_overwrites;
-    out.gpu_rabitq_cache_hot_tile_evictions =
-      end.gpu_rabitq_cache_hot_tile_evictions - start.gpu_rabitq_cache_hot_tile_evictions;
-    out.gpu_rabitq_cache_unique_tiles = end.gpu_rabitq_cache_unique_tiles - start.gpu_rabitq_cache_unique_tiles;
-    out.gpu_rabitq_cache_tile_tasks = end.gpu_rabitq_cache_tile_tasks - start.gpu_rabitq_cache_tile_tasks;
-    out.gpu_rabitq_cache_miss_ranges = end.gpu_rabitq_cache_miss_ranges - start.gpu_rabitq_cache_miss_ranges;
-    out.gpu_rabitq_cache_resolve_ns = end.gpu_rabitq_cache_resolve_ns - start.gpu_rabitq_cache_resolve_ns;
-    out.gpu_rabitq_cache_victim_ns = end.gpu_rabitq_cache_victim_ns - start.gpu_rabitq_cache_victim_ns;
-    out.gpu_rabitq_cache_kernel_ns = end.gpu_rabitq_cache_kernel_ns - start.gpu_rabitq_cache_kernel_ns;
-    out.gpu_rabitq_cache_rdma_ns = end.gpu_rabitq_cache_rdma_ns - start.gpu_rabitq_cache_rdma_ns;
     return out;
   }
 

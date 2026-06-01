@@ -258,18 +258,6 @@ struct ThreadStatistics {
   size_t gpu_rabitq_cache_evictions{0};
   size_t gpu_rabitq_cache_duplicate_fills{0};
   size_t gpu_rabitq_cache_fallback_batches{0};
-  size_t gpu_rabitq_cache_nursery_hits{0};
-  size_t gpu_rabitq_cache_hot_hits{0};
-  size_t gpu_rabitq_cache_promotions{0};
-  size_t gpu_rabitq_cache_nursery_overwrites{0};
-  size_t gpu_rabitq_cache_hot_tile_evictions{0};
-  size_t gpu_rabitq_cache_unique_tiles{0};
-  size_t gpu_rabitq_cache_tile_tasks{0};
-  size_t gpu_rabitq_cache_miss_ranges{0};
-  u64 gpu_rabitq_cache_resolve_ns{0};
-  u64 gpu_rabitq_cache_victim_ns{0};
-  u64 gpu_rabitq_cache_kernel_ns{0};
-  u64 gpu_rabitq_cache_rdma_ns{0};
 
   void inc_visited_nodes(u32 level) {
     if (level > 0) {

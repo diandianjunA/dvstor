@@ -178,10 +178,6 @@ echo "  neighbor-cache: $(get_ini_value neighbor-cache-mb || true) MB"
 echo "  neighbor-cache-invalidation-ms: $(get_ini_value neighbor-cache-invalidation-ms || true)"
 echo "  neighbor-cache-invalidation-inserts: $(get_ini_value neighbor-cache-invalidation-inserts || true)"
 echo "  gpu-rabitq-cache: $(get_ini_value gpu-rabitq-cache-mb || true) MB"
-echo "  rabitq-cache-mode: $(get_ini_value rabitq-cache-mode || true)"
-echo "  gentile-tile-slots: $(get_ini_value gentile-tile-slots || true)"
-echo "  gentile-nursery-ratio: $(get_ini_value gentile-nursery-ratio || true)"
-echo "  gentile-hit-tile-grouping: $(get_ini_value gentile-enable-hit-tile-grouping || true)"
 if [[ -n "$INSERT_START_ID" ]]; then
     echo "  insert-start-id: $INSERT_START_ID"
 else

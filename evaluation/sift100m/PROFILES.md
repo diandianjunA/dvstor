@@ -19,9 +19,6 @@ Use these profiles to compare optimization gains one by one. Start memory nodes 
 ./evaluation/sift100m/start_profile_memory_nodes.sh gpudirect_slot_clock_storage_owner restart
 ./evaluation/sift100m/run_profile.sh gpudirect_slot_clock_storage_owner
 
-# 5. GPUDirect RDMA + GPU cache gentile mode + storage_owner mode.
-./evaluation/sift100m/start_profile_memory_nodes.sh gpudirect_gentile_storage_owner restart
-./evaluation/sift100m/run_profile.sh gpudirect_gentile_storage_owner
 ```
 
 Each run writes a generated compute config to `evaluation/sift100m/generated_sift100m_<profile>.ini` and reports under `evaluation/sift100m/reports/<profile>/`.
@@ -34,11 +31,10 @@ READ_RATIO=1.0 CLIENT_THREADS=32 MEASURE_SECONDS=120 ./evaluation/sift100m/run_p
 
 Profile summary:
 
-| Profile | GPUDirect RDMA | Neighbor cache | GPU RaBitQ cache | Cache mode | Insert mode | Workers |
-| --- | --- | --- | --- | --- | --- | --- |
-| `baseline` | off | 2048 MB | 0 MB | off | `compute` | 8 insert / 8 query |
-| `gpudirect_rdma` | on | 2048 MB | 0 MB | off | `compute` | 8 insert / 8 query |
-| `gpudirect_slot_clock` | on | 2048 MB | 8192 MB | `slot_clock` | `compute` | 8 insert / 8 query |
-| `gpudirect_slot_clock_storage_owner` | on | 2048 MB | 8192 MB | `slot_clock` | `storage_owner` | 0 insert / 16 query |
-| `gpudirect_gentile_storage_owner` | on | 2048 MB | 8192 MB | `gentile` | `storage_owner` | 0 insert / 16 query |
+| Profile | GPUDirect RDMA | Neighbor cache | GPU RaBitQ cache | Insert mode | Workers |
+| --- | --- | --- | --- | --- | --- |
+| `baseline` | off | 2048 MB | 0 MB | `compute` | 8 insert / 8 query |
+| `gpudirect_rdma` | on | 2048 MB | 0 MB | `compute` | 8 insert / 8 query |
+| `gpudirect_slot_clock` | on | 2048 MB | 8192 MB | `compute` | 8 insert / 8 query |
+| `gpudirect_slot_clock_storage_owner` | on | 2048 MB | 8192 MB | `storage_owner` | 0 insert / 16 query |
 

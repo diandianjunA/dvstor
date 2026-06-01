@@ -54,11 +54,6 @@ struct CoroutineGpuState {
     uint32_t* h_pruned_count{nullptr};   // [1]
     uint32_t* h_cache_positions{nullptr};// [max_batch]
     uint32_t* h_cache_reorder{nullptr};  // [max_batch]
-    uint32_t* h_tile_task_tile_ids{nullptr};  // [max_batch]
-    uint32_t* h_tile_task_offsets{nullptr};   // [max_batch]
-    uint32_t* h_tile_task_candidate_indices{nullptr};  // [max_batch]
-    uint32_t* h_tile_task_starts{nullptr};    // [max_batch + 1]
-    uint32_t* h_tile_task_counts{nullptr};    // [max_batch]
 
     // Per-coroutine device buffers
     float*    d_query{nullptr};
@@ -68,11 +63,6 @@ struct CoroutineGpuState {
     float*    d_candidate_dists{nullptr};
     uint32_t* d_candidate_order{nullptr};
     uint32_t* d_cache_slot_ids{nullptr}; // device alias of h_cache_slot_ids
-    uint32_t* d_tile_task_tile_ids{nullptr};
-    uint32_t* d_tile_task_offsets{nullptr};
-    uint32_t* d_tile_task_candidate_indices{nullptr};
-    uint32_t* d_tile_task_starts{nullptr};
-    uint32_t* d_tile_task_counts{nullptr};
     float*    d_distances{nullptr};
     uint32_t* d_pruned_indices{nullptr};
     uint32_t* d_pruned_count{nullptr};
@@ -91,11 +81,6 @@ struct CoroutineGpuState {
     std::vector<uint64_t> scratch_fill_addrs;
     std::vector<uint32_t> scratch_inflight_indices;
     std::vector<uint32_t> scratch_cache_positions;
-    std::vector<uint32_t> scratch_tile_task_tile_ids;
-    std::vector<uint32_t> scratch_tile_task_offsets;
-    std::vector<uint32_t> scratch_tile_task_candidate_indices;
-    std::vector<uint32_t> scratch_tile_task_starts;
-    std::vector<uint32_t> scratch_tile_task_counts;
 };
 
 class GpuBufferManager {
@@ -122,14 +107,7 @@ public:
               uint32_t max_R, uint32_t rabitq_bits,
               ibv_pd* rdma_pd = nullptr,
               bool enable_gpudirect_rdma = false,
-              size_t gpu_rabitq_cache_bytes = 0,
-              const char* rabitq_cache_mode = "slot_clock",
-              uint32_t gentile_tile_slots = 32,
-              double gentile_nursery_ratio = 0.25,
-              uint32_t gentile_promotion_threshold = 2,
-              bool gentile_enable_promotion = false,
-              bool gentile_enable_value_bin = false,
-              bool gentile_enable_hit_tile_grouping = true);
+              size_t gpu_rabitq_cache_bytes = 0);
 
     /**
      * Release all GPU resources.
