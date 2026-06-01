@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -207,6 +208,8 @@ private:
   u32 choose_destination(const vec<element_t>& query) const;
   void refresh_routing_state(bool wait_for_remote_registration);
   void shutdown_remote_if_requested();
+  void force_publish_graph_epoch();
+  void note_graph_insertions(size_t inserted);
 
   auto& compute_threads() { return worker_pool_->get_compute_threads(); }
   const auto& compute_threads() const { return worker_pool_->get_compute_threads(); }
@@ -224,6 +227,9 @@ private:
   std::atomic<bool> shutdown_{false};
   std::atomic<size_t> vectors_inserted_{0};
   std::atomic<u64> graph_epoch_{1};
+  std::mutex neighbor_cache_epoch_mutex_;
+  size_t pending_neighbor_cache_inserts_{0};
+  std::chrono::steady_clock::time_point last_neighbor_cache_epoch_publish_{std::chrono::steady_clock::now()};
 
   std::mutex mn_command_mutex_;
   std::atomic<bool> workers_paused_{false};

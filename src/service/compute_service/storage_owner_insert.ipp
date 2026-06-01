@@ -61,9 +61,7 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
       }
     }
     vectors_inserted_.fetch_add(inserted, std::memory_order_relaxed);
-    if (inserted > 0) {
-      graph_epoch_.fetch_add(1, std::memory_order_acq_rel);
-    }
+    note_graph_insertions(inserted);
     return inserted;
   }
 
@@ -104,9 +102,7 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
     }
   }
   vectors_inserted_.fetch_add(inserted, std::memory_order_relaxed);
-  if (inserted > 0) {
-    graph_epoch_.fetch_add(1, std::memory_order_acq_rel);
-  }
+  note_graph_insertions(inserted);
 
   for (auto* request : requests) {
     delete request;

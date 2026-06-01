@@ -47,6 +47,11 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
      "Maximum neighbors per node used to build the METIS partition graph.")
     ("partition-imbalance", po::value<double>(&config.partition_imbalance)->default_value(config.partition_imbalance),
      "METIS ubvec balance tolerance, e.g. 1.03 allows about 3% imbalance.")
+    ("offline-reverse-mode",
+     po::value<str>(&config.offline_reverse_mode)->default_value(config.offline_reverse_mode),
+     "Reverse-edge handling during offline graph build: immediate or deferred.")
+    ("skip-sanity-check", po::bool_switch(&config.skip_sanity_check),
+     "Skip the expensive in-memory brute-force recall sanity check after graph construction.")
     ("seed", po::value<i32>(&config.seed)->default_value(config.seed), "PRNG seed.")
     ("max-vectors", po::value<size_t>(&config.max_vectors)->default_value(config.max_vectors),
      "Maximum number of vectors to read.")
@@ -85,6 +90,8 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     lib_failure("--partition-max-degree must be > 0");
   if (config.partition_imbalance < 1.0)
     lib_failure("--partition-imbalance must be >= 1.0");
+  if (config.offline_reverse_mode != "immediate" && config.offline_reverse_mode != "deferred")
+    lib_failure("--offline-reverse-mode must be immediate or deferred");
 
   return config;
 }

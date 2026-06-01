@@ -40,6 +40,8 @@ public:
   u32 gpu_device{};       // CUDA device ID
   bool gpudirect_rdma{};  // Enable GPUDirect RDMA (read vectors directly into GPU buffers)
   u32 neighbor_cache_mb{0};
+  u32 neighbor_cache_invalidation_ms{0};
+  u32 neighbor_cache_invalidation_inserts{1};
   u32 gpu_rabitq_cache_mb{0};
   str search_mode{"exact_gpu"};
   str insert_execution{"compute"};
@@ -201,6 +203,12 @@ private:
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
       "neighbor-cache-mb", po::value<u32>(&neighbor_cache_mb)->default_value(0),
       "CPU neighbor-list cache size per compute node in MB. 0 disables it.")(
+      "neighbor-cache-invalidation-ms",
+      po::value<u32>(&neighbor_cache_invalidation_ms)->default_value(neighbor_cache_invalidation_ms),
+      "Minimum time between neighbor-cache epoch invalidations after inserts. 0 disables time batching.")(
+      "neighbor-cache-invalidation-inserts",
+      po::value<u32>(&neighbor_cache_invalidation_inserts)->default_value(neighbor_cache_invalidation_inserts),
+      "Minimum successful inserts between neighbor-cache epoch invalidations.")(
       "gpu-rabitq-cache-mb", po::value<u32>(&gpu_rabitq_cache_mb)->default_value(0),
       "GPU RaBitQ cache size per compute node in MB. 0 disables it.")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
@@ -233,6 +241,11 @@ private:
 
     if (search_mode != "exact_gpu" && search_mode != "rabitq_gpu") {
       std::cerr << "[ERROR]: --search-mode must be exact_gpu or rabitq_gpu" << std::endl;
+      exit_with_help_message(argv);
+    }
+
+    if (neighbor_cache_invalidation_inserts == 0) {
+      std::cerr << "[ERROR]: --neighbor-cache-invalidation-inserts must be > 0" << std::endl;
       exit_with_help_message(argv);
     }
 
@@ -387,6 +400,10 @@ public:
       os << std::setw(width) << "GPU device: " << config.gpu_device << std::endl;
       os << std::setw(width) << "GPUDirect RDMA: " << (config.gpudirect_rdma ? "true" : "false") << std::endl;
       os << std::setw(width) << "neighbor cache (MB): " << config.neighbor_cache_mb << std::endl;
+      os << std::setw(width) << "neighbor cache invalidation(ms): "
+         << config.neighbor_cache_invalidation_ms << std::endl;
+      os << std::setw(width) << "neighbor cache invalidation inserts: "
+         << config.neighbor_cache_invalidation_inserts << std::endl;
       os << std::setw(width) << "GPU RaBitQ cache (MB): " << config.gpu_rabitq_cache_mb << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {

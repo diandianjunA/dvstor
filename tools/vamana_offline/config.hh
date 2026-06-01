@@ -21,6 +21,8 @@ struct VamanaBuildConfig {
   str partition_strategy{"balanced"};
   u32 partition_max_degree{16};
   double partition_imbalance{1.03};
+  str offline_reverse_mode{"immediate"};
+  bool skip_sanity_check{false};
   i32 seed{1234};
   size_t max_vectors{std::numeric_limits<u32>::max()};
   bool ip_distance{false};

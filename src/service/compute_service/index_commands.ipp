@@ -26,7 +26,7 @@ bool ComputeService<Distance>::load_index(const std::string& path, str* error_me
     routing_centroids_[cm_.client_id] = compute_local_routing_centroid();
   }
 
-  graph_epoch_.fetch_add(1, std::memory_order_acq_rel);
+  force_publish_graph_epoch();
   resume_rpc();
   refresh_routing_state(false);
   resume_workers();

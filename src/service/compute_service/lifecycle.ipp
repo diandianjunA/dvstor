@@ -125,6 +125,40 @@ ComputeService<Distance>::~ComputeService() {
 
 
 template <class Distance>
+void ComputeService<Distance>::force_publish_graph_epoch() {
+  std::lock_guard<std::mutex> lock(neighbor_cache_epoch_mutex_);
+  pending_neighbor_cache_inserts_ = 0;
+  last_neighbor_cache_epoch_publish_ = std::chrono::steady_clock::now();
+  graph_epoch_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+template <class Distance>
+void ComputeService<Distance>::note_graph_insertions(size_t inserted) {
+  if (inserted == 0) {
+    return;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(neighbor_cache_epoch_mutex_);
+  pending_neighbor_cache_inserts_ += inserted;
+
+  const bool insert_threshold_met =
+    pending_neighbor_cache_inserts_ >= static_cast<size_t>(config_.neighbor_cache_invalidation_inserts);
+  const bool time_threshold_met =
+    config_.neighbor_cache_invalidation_ms > 0 &&
+    std::chrono::duration_cast<std::chrono::milliseconds>(now - last_neighbor_cache_epoch_publish_).count() >=
+      static_cast<int64_t>(config_.neighbor_cache_invalidation_ms);
+
+  if (!insert_threshold_met && !time_threshold_met) {
+    return;
+  }
+
+  pending_neighbor_cache_inserts_ = 0;
+  last_neighbor_cache_epoch_publish_ = now;
+  graph_epoch_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+template <class Distance>
 void ComputeService<Distance>::start_workers() {
   const u32 num_threads = config_.num_threads;
   const u32 dim = config_.dim;

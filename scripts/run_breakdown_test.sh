@@ -21,7 +21,7 @@
 #       --measure-seconds <n>     正式测量时长（秒，默认: 60）
 #       --warmup-ops <n>          预热请求数（兼容旧模式）
 #       --measure-ops <n>         正式测量请求数（兼容旧模式）
-#       --query-file <path>       外部 query 文件（.fbin），不提供则使用 synthetic query
+#       --query-file <path>       外部 query 文件（.fbin/.u8bin/.i8bin），不提供则使用 synthetic query
 #       --report-dir <path>       报告输出目录（默认: ./reports/breakdown）
 #       --label <name>            报告文件名前缀（默认: 时间戳）
 #   -h, --help                    显示帮助信息
@@ -175,6 +175,8 @@ echo "  load-index:     $(get_ini_value load-index || true)"
 echo "  index-prefix:   $(get_ini_value index-prefix || true)"
 echo "  gpudirect-rdma: $(get_ini_value gpudirect-rdma || true)"
 echo "  neighbor-cache: $(get_ini_value neighbor-cache-mb || true) MB"
+echo "  neighbor-cache-invalidation-ms: $(get_ini_value neighbor-cache-invalidation-ms || true)"
+echo "  neighbor-cache-invalidation-inserts: $(get_ini_value neighbor-cache-invalidation-inserts || true)"
 echo "  gpu-rabitq-cache: $(get_ini_value gpu-rabitq-cache-mb || true) MB"
 if [[ -n "$INSERT_START_ID" ]]; then
     echo "  insert-start-id: $INSERT_START_ID"

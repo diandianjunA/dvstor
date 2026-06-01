@@ -4,11 +4,14 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
+#include <cstdint>
 #include <cmath>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -53,7 +56,7 @@ std::vector<float> make_dataset(const std::vector<uint32_t>& ids, size_t dim) {
   return vectors;
 }
 
-std::vector<float> read_fbin(const std::string& path, uint32_t* dim_out, size_t* count_out) {
+std::vector<float> read_vector_bin(const std::string& path, uint32_t* dim_out, size_t* count_out) {
   std::ifstream input(path, std::ios::binary);
   if (!input) {
     throw std::runtime_error("failed to open " + path);
@@ -63,13 +66,39 @@ std::vector<float> read_fbin(const std::string& path, uint32_t* dim_out, size_t*
   input.read(reinterpret_cast<char*>(&count), sizeof(count));
   input.read(reinterpret_cast<char*>(&dim), sizeof(dim));
   if (!input) {
-    throw std::runtime_error("failed to read fbin header: " + path);
+    throw std::runtime_error("failed to read vector file header: " + path);
   }
+
   std::vector<float> data(static_cast<size_t>(count) * dim);
-  input.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size() * sizeof(float)));
-  if (!input) {
-    throw std::runtime_error("failed to read fbin payload: " + path);
+  const auto has_suffix = [&](const std::string& suffix) {
+    return path.size() >= suffix.size() && path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0;
+  };
+
+  if (has_suffix(".u8bin")) {
+    std::vector<uint8_t> raw(data.size());
+    input.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
+    if (!input) {
+      throw std::runtime_error("failed to read u8bin payload: " + path);
+    }
+    for (size_t i = 0; i < raw.size(); ++i) {
+      data[i] = static_cast<float>(raw[i]);
+    }
+  } else if (has_suffix(".i8bin")) {
+    std::vector<int8_t> raw(data.size());
+    input.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
+    if (!input) {
+      throw std::runtime_error("failed to read i8bin payload: " + path);
+    }
+    for (size_t i = 0; i < raw.size(); ++i) {
+      data[i] = static_cast<float>(raw[i]);
+    }
+  } else {
+    input.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size() * sizeof(float)));
+    if (!input) {
+      throw std::runtime_error("failed to read float vector payload: " + path);
+    }
   }
+
   if (dim_out) {
     *dim_out = dim;
   }
@@ -95,8 +124,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"measure_seconds", args.measure_seconds},
     {"run_mode", (args.warmup_seconds > 0 || args.measure_seconds > 0) ? "time" : "ops"},
     {"time_completion_policy", "drain"},
-    {"time_issue_policy", "dedicated_read_write_threads_until_deadline"},
-    {"mixed_dispatch_policy", "thread_pool_split"},
+    {"time_issue_policy", "probabilistic_read_write_per_thread_until_deadline"},
+    {"mixed_dispatch_policy", "per_operation_probability"},
     {"operation_granularity", "single_vector"},
     {"client_threads", args.client_threads},
     {"read_ratio", args.read_ratio},
@@ -185,7 +214,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       throw std::runtime_error("query file does not exist: " + args.query_file);
     }
     uint32_t file_dim = 0;
-    query_data = read_fbin(args.query_file, &file_dim, &query_count);
+    query_data = read_vector_bin(args.query_file, &file_dim, &query_count);
     if (file_dim != dim) {
       throw std::runtime_error("query dim mismatch with service config");
     }
@@ -232,18 +261,15 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     reporter.finish();
   };
 
-  const auto mixed_read_thread_count = [&]() -> size_t {
-    if (args.client_threads == 0) {
-      return 0;
-    }
+  auto choose_mixed_read = [&](std::mt19937_64& rng) {
     if (args.read_ratio <= 0.0) {
-      return 0;
+      return false;
     }
     if (args.read_ratio >= 1.0) {
-      return args.client_threads;
+      return true;
     }
-    const size_t rounded = static_cast<size_t>(std::llround(static_cast<double>(args.client_threads) * args.read_ratio));
-    return std::clamp<size_t>(rounded, 1, args.client_threads - 1);
+    std::bernoulli_distribution read_dist(args.read_ratio);
+    return read_dist(rng);
   };
 
   auto run_mixed_phase_ops = [&](const std::string& label, size_t ops, uint32_t start_id) -> MixedPhaseStats {
@@ -254,11 +280,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     std::atomic<size_t> issued_writes{0};
     std::atomic<size_t> completed_reads{0};
     std::atomic<size_t> completed_writes{0};
-    const size_t read_target = static_cast<size_t>(std::llround(static_cast<double>(ops) * args.read_ratio));
-    const size_t write_target = ops >= read_target ? (ops - read_target) : 0;
-    std::atomic<size_t> next_read{0};
-    std::atomic<size_t> next_write{0};
-    const size_t read_threads = mixed_read_thread_count();
+    std::atomic<size_t> next_op{0};
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(args.client_threads));
     std::vector<std::thread> threads;
     threads.reserve(args.client_threads);
@@ -266,28 +288,24 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
 
     for (size_t tid = 0; tid < args.client_threads; ++tid) {
       threads.emplace_back([&, tid]() {
+        std::mt19937_64 rng(0x9e3779b97f4a7c15ull ^
+                            (static_cast<uint64_t>(tid) << 32) ^
+                            static_cast<uint64_t>(std::hash<std::string>{}(label)));
         start_barrier.arrive_and_wait();
-        const bool do_read = tid < read_threads;
-        if (do_read) {
-          for (;;) {
-            const size_t read_index = next_read.fetch_add(1, std::memory_order_relaxed);
-            if (read_index >= read_target) {
-              break;
-            }
+        for (;;) {
+          const size_t op_index = next_op.fetch_add(1, std::memory_order_relaxed);
+          if (op_index >= ops) {
+            break;
+          }
+
+          if (choose_mixed_read(rng)) {
             issued_reads.fetch_add(1, std::memory_order_relaxed);
             const size_t query_idx = next_query_idx.fetch_add(1, std::memory_order_relaxed) % query_count;
             std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(query_idx * dim),
                                      query_data.begin() + static_cast<std::ptrdiff_t>((query_idx + 1) * dim));
             (void)service.search(query, service.config().k);
             completed_reads.fetch_add(1, std::memory_order_relaxed);
-            completed_ops.fetch_add(1, std::memory_order_relaxed);
-          }
-        } else {
-          for (;;) {
-            const size_t write_index = next_write.fetch_add(1, std::memory_order_relaxed);
-            if (write_index >= write_target) {
-              break;
-            }
+          } else {
             issued_writes.fetch_add(1, std::memory_order_relaxed);
             const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
             auto values = make_deterministic_vector(id, dim);
@@ -296,8 +314,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
             insert_items.push_back({id, vec<element_t>(values.begin(), values.end())});
             (void)service.insert(insert_items);
             completed_writes.fetch_add(1, std::memory_order_relaxed);
-            completed_ops.fetch_add(1, std::memory_order_relaxed);
           }
+          completed_ops.fetch_add(1, std::memory_order_relaxed);
         }
       });
     }
@@ -323,7 +341,6 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     std::atomic<size_t> issued_writes{0};
     std::atomic<size_t> completed_reads{0};
     std::atomic<size_t> completed_writes{0};
-    const size_t read_threads = mixed_read_thread_count();
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(args.client_threads));
     std::vector<std::thread> threads;
     threads.reserve(args.client_threads);
@@ -332,14 +349,16 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
 
     for (size_t tid = 0; tid < args.client_threads; ++tid) {
       threads.emplace_back([&, tid]() {
+        std::mt19937_64 rng(0xd1b54a32d192ed03ull ^
+                            (static_cast<uint64_t>(tid) << 32) ^
+                            static_cast<uint64_t>(std::hash<std::string>{}(label)));
         start_barrier.arrive_and_wait();
-        const bool do_read = tid < read_threads;
         for (;;) {
           if (std::chrono::steady_clock::now() >= deadline) {
             break;
           }
 
-          if (do_read) {
+          if (choose_mixed_read(rng)) {
             issued_reads.fetch_add(1, std::memory_order_relaxed);
             const size_t query_idx = next_query_idx.fetch_add(1, std::memory_order_relaxed) % query_count;
             std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(query_idx * dim),
@@ -462,8 +481,12 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     std::cerr << "[breakdown][measure-mixed] reads issued/completed=" << measure_mixed_stats.issued_reads << "/"
               << measure_mixed_stats.completed_reads << ", writes issued/completed="
               << measure_mixed_stats.issued_writes << "/" << measure_mixed_stats.completed_writes << std::endl;
-    lib_assert(measure_mixed_stats.completed_reads > 0, "mixed benchmark completed zero reads");
-    lib_assert(measure_mixed_stats.completed_writes > 0, "mixed benchmark completed zero writes");
+    if (args.read_ratio > 0.0) {
+      lib_assert(measure_mixed_stats.completed_reads > 0, "mixed benchmark completed zero reads");
+    }
+    if (args.read_ratio < 1.0) {
+      lib_assert(measure_mixed_stats.completed_writes > 0, "mixed benchmark completed zero writes");
+    }
   }
 
   const SampleReport report = service.collect_breakdown_report();

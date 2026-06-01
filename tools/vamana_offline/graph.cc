@@ -1,9 +1,11 @@
 #include "tools/vamana_offline/graph.hh"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <unordered_set>
@@ -17,6 +19,59 @@
 #endif
 
 namespace tools::vamana_offline {
+
+namespace {
+
+class LocalIdSet {
+public:
+  explicit LocalIdSet(size_t expected_items) {
+    size_t capacity = 1;
+    while (capacity < expected_items * 2) capacity <<= 1;
+    table_.assign(capacity, kEmpty);
+    mask_ = capacity - 1;
+  }
+
+  bool contains(u32 value) const {
+    size_t pos = hash(value) & mask_;
+    for (;;) {
+      const u32 current = table_[pos];
+      if (current == kEmpty) return false;
+      if (current == value) return true;
+      pos = (pos + 1) & mask_;
+    }
+  }
+
+  bool insert(u32 value) {
+    size_t pos = hash(value) & mask_;
+    for (;;) {
+      const u32 current = table_[pos];
+      if (current == value) return false;
+      if (current == kEmpty) {
+        table_[pos] = value;
+        return true;
+      }
+      pos = (pos + 1) & mask_;
+    }
+  }
+
+private:
+  static constexpr u32 kEmpty = std::numeric_limits<u32>::max();
+
+  static size_t hash(u32 value) {
+    uint64_t x = value;
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return static_cast<size_t>(x);
+  }
+
+  vec<u32> table_;
+  size_t mask_{0};
+};
+
+}  // namespace
 
 float l2_squared(const float* a, const float* b, u32 dim) {
 #ifdef __AVX__
@@ -140,8 +195,9 @@ vec<std::pair<float, u32>> beam_search(VamanaGraph& graph,
   vec<std::pair<float, u32>> all_visited;
   // beam: top beam_width candidates used for navigation
   vec<std::pair<float, u32>> beam;
-  std::unordered_set<u32> visited;
-  std::unordered_set<u32> expanded;
+  const size_t expected_seen = std::max<size_t>(1024, static_cast<size_t>(beam_width) * graph.R + graph.R + 1);
+  LocalIdSet visited(expected_seen);
+  LocalIdSet expanded(std::max<size_t>(1024, beam_width * 2));
 
   float medoid_dist = dist_fn(query, dataset.vector(graph.medoid), dim);
   beam.push_back({medoid_dist, static_cast<u32>(graph.medoid)});
@@ -162,7 +218,7 @@ vec<std::pair<float, u32>> beam_search(VamanaGraph& graph,
     // Find the closest unexpanded node in the (sorted) beam
     ssize_t best_pos = -1;
     for (size_t i = 0; i < beam.size(); ++i) {
-      if (expanded.count(beam[i].second) == 0) {
+      if (!expanded.contains(beam[i].second)) {
         best_pos = static_cast<ssize_t>(i);
         break;
       }
@@ -182,8 +238,7 @@ vec<std::pair<float, u32>> beam_search(VamanaGraph& graph,
     // Collect unvisited neighbors
     vec<u32> unvisited;
     for (u32 nbr : nbrs) {
-      if (visited.count(nbr)) continue;
-      visited.insert(nbr);
+      if (!visited.insert(nbr)) continue;
       unvisited.push_back(nbr);
     }
 
@@ -291,6 +346,7 @@ void build_vamana_graph(VamanaGraph& graph,
   const u32 beam_width = config.beam_width;
   const size_t num_threads = effective_thread_count(config.threads);
   const bool use_gpu = num_gpu_contexts > 0 && !config.ip_distance;
+  const bool deferred_reverse = config.offline_reverse_mode == "deferred";
 
   graph.init(n, dim, R);
 
@@ -334,6 +390,20 @@ void build_vamana_graph(VamanaGraph& graph,
               << alpha << " stored in metadata)\n";
   }
 
+  std::unique_ptr<u32[]> deferred_reverse_edges;
+  std::unique_ptr<std::atomic<u32>[]> deferred_reverse_counts;
+  if (deferred_reverse) {
+    std::cerr << "offline reverse updates: deferred flat final merge/prune"
+              << " (capacity=N*R edges, extra memory ~= N*R*4 + N*4 bytes)\n";
+    deferred_reverse_edges.reset(new u32[n * static_cast<size_t>(R)]);
+    deferred_reverse_counts.reset(new std::atomic<u32>[n]);
+    parallel_for(static_cast<size_t>(0), n, num_threads, [&](size_t node, size_t) {
+      deferred_reverse_counts[node].store(0, std::memory_order_relaxed);
+    });
+  } else {
+    std::cerr << "offline reverse updates: immediate" << "\n";
+  }
+
   ProgressReporter progress{"Building Vamana graph", n};
 
   // Node insertion logic
@@ -370,8 +440,17 @@ void build_vamana_graph(VamanaGraph& graph,
       graph.neighbors[node_idx] = new_neighbors;
     }
 
-    // Add reverse edges (lock each neighbor individually)
+    // Add reverse edges. In deferred mode, avoid pruning the same target node
+    // many times; a final per-node merge/prune pass applies all reverse edges.
     for (u32 nbr : new_neighbors) {
+      if (deferred_reverse) {
+        const u32 slot = deferred_reverse_counts[nbr].fetch_add(1, std::memory_order_relaxed);
+        if (slot < R) {
+          deferred_reverse_edges[static_cast<size_t>(nbr) * R + slot] = static_cast<u32>(node_idx);
+        }
+        continue;
+      }
+
       std::lock_guard<std::mutex> lock(graph.node_locks[nbr]);
       auto& nbr_list = graph.neighbors[nbr];
 
@@ -415,6 +494,49 @@ void build_vamana_graph(VamanaGraph& graph,
 
   progress.finish();
 
+  if (deferred_reverse) {
+    ProgressReporter reverse_progress{"Applying deferred reverse edges", n};
+    parallel_for(static_cast<size_t>(0), n, num_threads, [&](size_t node, size_t) {
+      const u32 addition_count = std::min<u32>(deferred_reverse_counts[node].load(std::memory_order_relaxed), R);
+      if (addition_count > 0) {
+        std::lock_guard<std::mutex> lock(graph.node_locks[node]);
+        auto& nbr_list = graph.neighbors[node];
+
+        vec<u32> candidate_ids;
+        candidate_ids.reserve(nbr_list.size() + addition_count);
+        for (u32 existing : nbr_list) {
+          if (existing != node) candidate_ids.push_back(existing);
+        }
+        const size_t base = node * static_cast<size_t>(R);
+        for (u32 i = 0; i < addition_count; ++i) {
+          const u32 incoming = deferred_reverse_edges[base + i];
+          if (incoming != node) candidate_ids.push_back(incoming);
+        }
+
+        std::sort(candidate_ids.begin(), candidate_ids.end());
+        candidate_ids.erase(std::unique(candidate_ids.begin(), candidate_ids.end()), candidate_ids.end());
+
+        if (candidate_ids.size() <= R) {
+          nbr_list = std::move(candidate_ids);
+        } else {
+          vec<std::pair<float, u32>> prune_candidates;
+          prune_candidates.reserve(candidate_ids.size());
+          const float* node_vec = dataset.vector(node);
+          for (u32 candidate : candidate_ids) {
+            const float d = dist_fn(node_vec, dataset.vector(candidate), dim);
+            prune_candidates.push_back({d, candidate});
+          }
+          std::sort(prune_candidates.begin(), prune_candidates.end());
+          nbr_list = robust_prune(dataset, static_cast<u32>(node), prune_candidates, build_alpha, R, dist_fn);
+        }
+      }
+      reverse_progress.increment();
+    });
+    reverse_progress.finish();
+    deferred_reverse_counts.reset();
+    deferred_reverse_edges.reset();
+  }
+
   // Print graph stats
   size_t total_edges = 0;
   size_t max_edges = 0;
@@ -428,7 +550,7 @@ void build_vamana_graph(VamanaGraph& graph,
             << " max=" << max_edges << " min=" << min_edges << "\n";
 
   // Quick in-memory recall sanity check
-  {
+  if (!config.skip_sanity_check) {
     const size_t n_queries = std::min<size_t>(200, n);
     const u32 topk = 10;
     std::mt19937 sample_rng(42);

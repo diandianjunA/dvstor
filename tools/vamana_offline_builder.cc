@@ -37,6 +37,8 @@ int main(int argc, char** argv) {
   std::cerr << "partition_strategy=" << config.partition_strategy
             << " partition_max_degree=" << config.partition_max_degree
             << " partition_imbalance=" << config.partition_imbalance << "\n";
+  std::cerr << "offline_reverse_mode=" << config.offline_reverse_mode
+            << " skip_sanity_check=" << (config.skip_sanity_check ? "true" : "false") << "\n";
 
   const auto build_start = std::chrono::steady_clock::now();
 
