@@ -1,0 +1,250 @@
+nohup: ignoring input
+[DVSTOR Breakdown] 运行参数:
+  配置文件:       /home/xjs/experiment/dvstor/evaluation/sift100m/generated_sift100m_baseline.ini
+  search-mode:    rabitq_gpu
+  load-index:     true
+  index-prefix:   /data/xjs/index/dvstor/sift100m/sift100m
+  gpudirect-rdma: false
+  neighbor-cache: 2048 MB
+  neighbor-cache-invalidation-ms: 100
+  neighbor-cache-invalidation-inserts: 1024
+  gpu-rabitq-cache: 0 MB
+  rabitq-cache-mode: off
+  gentile-tile-slots: 32
+  gentile-nursery-ratio: 0.25
+  gentile-hit-tile-grouping: true
+  insert-start-id: 100010000
+  负载模式:       mixed
+  读比例:         0.9
+  前台线程数:     16
+  运行模式:       time (drain)
+  预热时长:       30s
+  测量时长:       60s
+  操作粒度:       single_vector
+  Query 文件:     /data/xjs/datasets/sift100m/query.public.10K.u8bin
+  JSON 报告:      /home/xjs/experiment/dvstor/evaluation/sift100m/reports/baseline/sift100m_baseline_20260601_230305.json
+  文本报告:       /home/xjs/experiment/dvstor/evaluation/sift100m/reports/baseline/sift100m_baseline_20260601_230305.txt
+
+============================================================
+                        CLIENT
+============================================================
+connect to:                   [192.168.6.202:1234, 192.168.6.202:1235, 192.168.6.202:1236, 192.168.6.202:1237, 192.168.6.202:1238, ]
+is initiator:                 true
+TCP port:                     1234
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         16
+max send work requests:       1024
+max receive work requests:    1024
+============================================================
+data path:                    ""
+index prefix:                 "/data/xjs/index/dvstor/sift100m/sift100m"
+query suffix:                 
+number of threads:            16
+number of coroutines:         16
+threads pinned:               true
+seed:                         1234
+dimension:                    128
+max vectors:                  100000000
+CN memory (GB):               24
+------------------------------------------------------------
+K:                            10
+R (max degree):               48
+beam width (search):          32
+beam width (construction):    320
+alpha:                        1.2
+insert execution:             compute
+storage id:                   0
+storage batch max:            16
+storage batch wait(us):       250
+storage cache (MB):           0
+storage peer RDMA tokens:     8
+storage RPC depth:            4
+storage RPC timeout(ms):      30000
+storage construction beam:    128
+storage snapshot batch:       64
+storage prune max candidates: 128
+storage reverse mode:         async
+storage reverse queue depth:  65536
+storage reverse flush(us):    200
+storage reverse coalesce max: 256
+storage peers:                [192.168.6.202:2234, 192.168.6.202:2235, 192.168.6.202:2236, 192.168.6.202:2237, 192.168.6.202:2238, ]
+RaBitQ bits:                  4
+search mode:                  rabitq_gpu
+insert workers:               8
+query workers:                8
+insert coroutines:            0
+query coroutines:             4
+GPU device:                   1
+GPUDirect RDMA:               false
+neighbor cache (MB):          2048
+neighbor cache invalidation(ms): 100
+neighbor cache invalidation inserts: 1024
+GPU RaBitQ cache (MB):        0
+RaBitQ cache mode:            off
+GenTile tile slots:           32
+GenTile nursery ratio:        0.25
+GenTile promotion threshold:  2
+GenTile promotion:            false
+GenTile value-bin:            false
+GenTile hit grouping:         true
+============================================================
+1 device(s) found
+Selected device: mlx5_0
+Selected port state: 4, lid: 1
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+client id: 0
+number of clients: 1
+connect to server 192.168.6.202:1234
+pairing: 1371 -- 7818
+connect to server 192.168.6.202:1235
+pairing: 1372 -- 7819
+connect to server 192.168.6.202:1236
+pairing: 1373 -- 7820
+connect to server 192.168.6.202:1237
+pairing: 1374 -- 7821
+connect to server 192.168.6.202:1238
+pairing: 1375 -- 7822
+[STATUS]: pinned main thread to core 28
+[STATUS]: receive access tokens of remote memory regions
+[STATUS]: search mode: rabitq_gpu, cache=on
+[STATUS]: max cache size: 4920000102
+allocated ALIGNED MEM (no hugepage) at 139848933437504 with buffer size 25769803776
+num cache buckets: 5000000
+allocate cache entries hugepage of size 200000000
+allocated ALIGNED MEM (no hugepage) at 139848573431872 with buffer size 200000000
+1 device(s) found
+Selected device: mlx5_0
+Selected port state: 4, lid: 1
+pairing: 1376 -- 7823
+pairing: 1377 -- 7825
+pairing: 1378 -- 7824
+pairing: 1379 -- 7826
+pairing: 1380 -- 7827
+1 device(s) found
+Selected device: mlx5_0
+Selected port state: 4, lid: 1
+pairing: 1381 -- 7830
+pairing: 1382 -- 7828
+pairing: 1383 -- 7831
+pairing: 1384 -- 7829
+pairing: 1385 -- 7832
+1 device(s) found
+Selected device: mlx5_0
+Selected port state: 4, lid: 1
+pairing: 1386 -- 7833
+pairing: 1387 -- 7834
+pairing: 1388 -- 7835
+pairing: 1389 -- 7836
+pairing: 1390 -- 7837
+1 device(s) found
+Selected device: mlx5_0
+Selected port state: 4, lid: 1
+pairing: 1391 -- 7841
+pairing: 1392 -- 7838
+pairing: 1393 -- 7842
+pairing: 1394 -- 7839
+pairing: 1395 -- 7840
+[STATUS]: neighbor cache worker 8: slots=683041
+[STATUS]: neighbor cache worker 9: slots=683041
+[STATUS]: neighbor cache worker 10: slots=683041
+[STATUS]: neighbor cache worker 11: slots=683041
+[STATUS]: neighbor cache worker 12: slots=683041
+[STATUS]: neighbor cache worker 13: slots=683041
+[STATUS]: neighbor cache worker 14: slots=683041
+[STATUS]: neighbor cache worker 15: slots=683041
+[STATUS]: loaded RaBitQ artifacts from /data/xjs/index/dvstor/sift100m/sift100m (dim=128, bits=4, layout=rabitq_search_block)
+[STATUS]: starting 16 service worker threads (Vamana)
+[STATUS]: worker split: inserts=8, queries=8 | coroutines: insert=16, query=4
+[STATUS]: pinned worker 0 to core 0
+[STATUS]: pinned worker 1 to core 29
+[STATUS]: pinned worker 2 to core 1
+[STATUS]: pinned worker 3 to core 30
+[STATUS]: pinned worker 4 to core 2
+[STATUS]: pinned worker 5 to core 31
+[STATUS]: pinned worker 6 to core 3
+[STATUS]: pinned worker 7 to core 32
+[STATUS]: pinned worker 8 to core 4
+[STATUS]: pinned worker 9 to core 33
+[STATUS]: pinned worker 10 to core 5
+[STATUS]: pinned worker 11 to core 34
+[STATUS]: pinned worker 12 to core 6
+[STATUS]: pinned worker 13 to core 35
+[STATUS]: pinned worker 14 to core 7
+[STATUS]: pinned worker 15 to core 36
+[breakdown] preparing workload: bootstrap_count=4096, workload=mixed
+[breakdown] bootstrap vectors ready
+[breakdown] query data ready: count=10000
+[breakdown] effective insert start id=100010000
+[breakdown] starting warmup mixed
+[breakdown][warmup-mixed] progress elapsed=5.00085s/30s, completed=497 ops, rate=99.3832 ops/s
+[breakdown][warmup-mixed] progress elapsed=10.0011s/30s, completed=1122 ops, rate=112.187 ops/s
+[breakdown][warmup-mixed] progress elapsed=15.0014s/30s, completed=1773 ops, rate=118.189 ops/s
+[breakdown][warmup-mixed] progress elapsed=20.0017s/30s, completed=2441 ops, rate=122.04 ops/s
+[breakdown][warmup-mixed] progress elapsed=25.0019s/30s, completed=3154 ops, rate=126.15 ops/s
+[breakdown][warmup-mixed] progress elapsed=30.0021s/30s, completed=3868 ops, rate=128.924 ops/s
+[breakdown][warmup-mixed] progress elapsed=35.0022s/30s, completed=3884 ops, rate=110.964 ops/s
+[breakdown][warmup-mixed] done elapsed=35.0023s/30s, completed=3884 ops, avg_rate=110.964 ops/s
+[breakdown] starting measure phase
+[breakdown][measure-mixed] progress elapsed=5.00299s/60s, completed=707 ops, rate=141.316 ops/s
+[breakdown][measure-mixed] progress elapsed=10.0033s/60s, completed=1415 ops, rate=141.454 ops/s
+[breakdown][measure-mixed] progress elapsed=15.0036s/60s, completed=2125 ops, rate=141.633 ops/s
+[breakdown][measure-mixed] progress elapsed=20.0038s/60s, completed=2843 ops, rate=142.123 ops/s
+[breakdown][measure-mixed] progress elapsed=25.0041s/60s, completed=3543 ops, rate=141.697 ops/s
+[breakdown][measure-mixed] progress elapsed=30.0043s/60s, completed=4237 ops, rate=141.213 ops/s
+[breakdown][measure-mixed] progress elapsed=35.0044s/60s, completed=4938 ops, rate=141.068 ops/s
+[breakdown][measure-mixed] progress elapsed=40.0046s/60s, completed=5641 ops, rate=141.009 ops/s
+[breakdown][measure-mixed] progress elapsed=45.0049s/60s, completed=6338 ops, rate=140.829 ops/s
+[breakdown][measure-mixed] progress elapsed=50.005s/60s, completed=7008 ops, rate=140.146 ops/s
+[breakdown][measure-mixed] progress elapsed=55.0052s/60s, completed=7654 ops, rate=139.15 ops/s
+[breakdown][measure-mixed] progress elapsed=60.0055s/60s, completed=8309 ops, rate=138.471 ops/s
+[breakdown][measure-mixed] progress elapsed=65.0057s/60s, completed=8323 ops, rate=128.035 ops/s
+[breakdown][measure-mixed] done elapsed=65.0059s/60s, completed=8323 ops, avg_rate=128.035 ops/s
+[breakdown][measure-mixed] reads issued/completed=7494/7494, writes issued/completed=829/829
+throughput
+  duration_seconds: 60
+  total_ops_per_sec: 138.717 (ops=8323)
+  query_ops_per_sec: 124.9 (ops=7494)
+  insert_ops_per_sec: 13.8167 (ops=829)
+insert breakdown
+  count: 829
+  latency_ms: mean=101.309 p50=97.1805 p95=141.443 p99=169.837
+  top_categories:
+    rdma_ns: 42579.7 ms (50.7006%)
+    cpu_ns: 23124.9 ms (27.5353%)
+    gpu_ns: 14279.3 ms (17.0026%)
+    transfer_ns: 3998.8 ms (4.76146%)
+query breakdown
+  count: 7494
+  latency_ms: mean=116.898 p50=113.193 p95=193.02 p99=223.119
+  top_categories:
+    rdma_ns: 518935 ms (59.2472%)
+    cpu_ns: 201798 ms (23.0395%)
+    gpu_ns: 142251 ms (16.2409%)
+    transfer_ns: 12896.3 ms (1.47238%)
+cache histogram
+  size: 0 | freq: 4925667
+  size: 1 | freq: 73775
+  size: 2 | freq: 554
+  size: 3 | freq: 4
+total entries: 74895
+cooling table histogram
+  size: 0 | freq: 83334
+  size: 1 | freq: 0
+  size: 2 | freq: 0
+  size: 3 | freq: 0
+  size: 4 | freq: 0
+  size: 5 | freq: 0
+  size: 6 | freq: 0
+CT total entries: 0
+
+[DVSTOR Breakdown] 关键指标
+  throughput: 138.72 ops/s (total=8323, duration=60s)
+  query throughput: 124.90 ops/s (count=7494)
+  insert throughput: 13.82 ops/s (count=829)
+  mixed completed: reads=7494, writes=829
+  query latency(ms): mean=116.8983, p95=193.0196, p99=223.1185
+  insert latency(ms): mean=101.3086, p95=141.4432, p99=169.8372

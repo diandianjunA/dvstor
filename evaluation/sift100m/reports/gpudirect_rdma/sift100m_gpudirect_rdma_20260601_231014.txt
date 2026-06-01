@@ -1,0 +1,21 @@
+throughput
+  duration_seconds: 60
+  total_ops_per_sec: 727.067 (ops=43624)
+  query_ops_per_sec: 653.1 (ops=39186)
+  insert_ops_per_sec: 73.9667 (ops=4438)
+insert breakdown
+  count: 4438
+  latency_ms: mean=75.2544 p50=69.9872 p95=106.342 p99=124.341
+  top_categories:
+    gpu_ns: 157062 ms (47.029%)
+    rdma_ns: 96100.3 ms (28.7753%)
+    transfer_ns: 67236.6 ms (20.1326%)
+    cpu_ns: 13569.7 ms (4.06316%)
+query breakdown
+  count: 39186
+  latency_ms: mean=15.7759 p50=15.1947 p95=22.8837 p99=26.2737
+  top_categories:
+    rdma_ns: 263356 ms (42.6077%)
+    gpu_ns: 201354 ms (32.5764%)
+    transfer_ns: 110448 ms (17.8691%)
+    cpu_ns: 42938 ms (6.94683%)
