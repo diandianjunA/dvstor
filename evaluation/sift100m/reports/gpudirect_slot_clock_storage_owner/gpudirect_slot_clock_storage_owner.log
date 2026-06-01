@@ -6,13 +6,7 @@ nohup: ignoring input
   index-prefix:   /data/xjs/index/dvstor/sift100m/sift100m
   gpudirect-rdma: true
   neighbor-cache: 2048 MB
-  neighbor-cache-invalidation-ms: 100
-  neighbor-cache-invalidation-inserts: 1024
   gpu-rabitq-cache: 8192 MB
-  rabitq-cache-mode: slot_clock
-  gentile-tile-slots: 32
-  gentile-nursery-ratio: 0.25
-  gentile-hit-tile-grouping: true
   insert-start-id: 100010000
   负载模式:       mixed
   读比例:         0.9
@@ -82,12 +76,6 @@ neighbor cache invalidation(ms): 100
 neighbor cache invalidation inserts: 1024
 GPU RaBitQ cache (MB):        8192
 RaBitQ cache mode:            slot_clock
-GenTile tile slots:           32
-GenTile nursery ratio:        0.25
-GenTile promotion threshold:  2
-GenTile promotion:            false
-GenTile value-bin:            false
-GenTile hit grouping:         true
 ============================================================
 1 device(s) found
 Selected device: mlx5_0

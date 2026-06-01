@@ -61,7 +61,6 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
       }
     }
     vectors_inserted_.fetch_add(inserted, std::memory_order_relaxed);
-    note_graph_insertions(inserted);
     return inserted;
   }
 
@@ -102,7 +101,6 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
     }
   }
   vectors_inserted_.fetch_add(inserted, std::memory_order_relaxed);
-  note_graph_insertions(inserted);
 
   for (auto* request : requests) {
     delete request;
@@ -508,6 +506,17 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
                   << " item_count=" << response->item_count
                   << " expected_item_count=" << slot.item_count
                   << std::endl;
+      }
+    }
+    if (response_ok && shared_neighbor_cache_.enabled()) {
+      const u32 invalidation_capacity = service::storage_owner::response_invalidation_capacity(slot.item_count);
+      const u32 invalidation_count = std::min(*service::storage_owner::response_invalidation_count(
+                                                slot.response_buffer.data(), slot.item_count),
+                                              invalidation_capacity);
+      const u64* invalidated = service::storage_owner::response_invalidated_raws(
+        slot.response_buffer.data(), slot.item_count);
+      for (u32 i = 0; i < invalidation_count; ++i) {
+        shared_neighbor_cache_.invalidate(RemotePtr{invalidated[i]});
       }
     }
     const u64 memory_breakdown_ns = breakdown == nullptr ? 0 : breakdown->total();

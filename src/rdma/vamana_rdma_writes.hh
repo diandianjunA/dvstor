@@ -180,6 +180,7 @@ inline auto write_vamana_neighbors(const s_ptr<VamanaNode>& node,
         byte_t* nbr_buffer;
         size_t meta_size;
         size_t nbr_size;
+        RemotePtr rptr;
         const u_ptr<ComputeThread>& thread;
 
         static bool await_ready() { return false; }
@@ -187,10 +188,11 @@ inline auto write_vamana_neighbors(const s_ptr<VamanaNode>& node,
         void await_resume() {
             thread->buffer_allocator.free_buffer(meta_buffer, meta_size);
             thread->buffer_allocator.free_buffer(nbr_buffer, nbr_size);
+            thread->invalidate_neighbor_cache(rptr);
         }
     };
 
-    return awaitable{meta_buffer, nbr_buffer, meta_size, VamanaNode::NEIGHBORS_SIZE, thread};
+    return awaitable{meta_buffer, nbr_buffer, meta_size, VamanaNode::NEIGHBORS_SIZE, node->rptr, thread};
 }
 
 /**

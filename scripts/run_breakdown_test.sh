@@ -175,8 +175,6 @@ echo "  load-index:     $(get_ini_value load-index || true)"
 echo "  index-prefix:   $(get_ini_value index-prefix || true)"
 echo "  gpudirect-rdma: $(get_ini_value gpudirect-rdma || true)"
 echo "  neighbor-cache: $(get_ini_value neighbor-cache-mb || true) MB"
-echo "  neighbor-cache-invalidation-ms: $(get_ini_value neighbor-cache-invalidation-ms || true)"
-echo "  neighbor-cache-invalidation-inserts: $(get_ini_value neighbor-cache-invalidation-inserts || true)"
 echo "  gpu-rabitq-cache: $(get_ini_value gpu-rabitq-cache-mb || true) MB"
 if [[ -n "$INSERT_START_ID" ]]; then
     echo "  insert-start-id: $INSERT_START_ID"

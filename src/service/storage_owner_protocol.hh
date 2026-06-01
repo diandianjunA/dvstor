@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common/types.hh"
+#include "vamana/vamana_node.hh"
 
 namespace service::storage_owner {
 
@@ -96,7 +97,9 @@ inline size_t insert_batch_request_bytes(u32 item_count, u32 dim) {
 inline size_t insert_batch_response_bytes(u32 item_count) {
   return sizeof(InsertBatchResponseHeader) +
          static_cast<size_t>(item_count) * sizeof(u32) +
-         sizeof(InsertBreakdownCounters);
+         sizeof(InsertBreakdownCounters) +
+         sizeof(u32) +
+         static_cast<size_t>(item_count) * VamanaNode::R * sizeof(u64);
 }
 
 inline node_t* request_ids(void* payload) {
@@ -131,6 +134,26 @@ inline InsertBreakdownCounters* response_breakdown(void* payload, u32 item_count
 inline const InsertBreakdownCounters* response_breakdown(const void* payload, u32 item_count) {
   return reinterpret_cast<const InsertBreakdownCounters*>(
     reinterpret_cast<const byte_t*>(response_statuses(payload) + item_count));
+}
+
+inline u32* response_invalidation_count(void* payload, u32 item_count) {
+  return reinterpret_cast<u32*>(reinterpret_cast<byte_t*>(response_breakdown(payload, item_count) + 1));
+}
+
+inline const u32* response_invalidation_count(const void* payload, u32 item_count) {
+  return reinterpret_cast<const u32*>(reinterpret_cast<const byte_t*>(response_breakdown(payload, item_count) + 1));
+}
+
+inline u64* response_invalidated_raws(void* payload, u32 item_count) {
+  return reinterpret_cast<u64*>(response_invalidation_count(payload, item_count) + 1);
+}
+
+inline const u64* response_invalidated_raws(const void* payload, u32 item_count) {
+  return reinterpret_cast<const u64*>(response_invalidation_count(payload, item_count) + 1);
+}
+
+inline u32 response_invalidation_capacity(u32 item_count) {
+  return item_count * VamanaNode::R;
 }
 
 inline size_t reverse_update_request_bytes(u32 item_count) {

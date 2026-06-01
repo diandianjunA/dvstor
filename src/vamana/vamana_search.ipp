@@ -95,8 +95,12 @@
             s_ptr<VamanaNeighborlist> nlist;
             {
                 const auto t_neighbor_lookup = std::chrono::steady_clock::now();
-                if (thread->neighbor_cache.lookup(beam[best_idx].rptr, neighbor_count, neighbor_ptrs)) {
+                auto& cached_neighbors = coro_state.scratch_cached_neighbors;
+                if (thread->neighbor_cache_enabled() &&
+                    thread->neighbor_cache->lookup_copy(beam[best_idx].rptr, cached_neighbors)) {
                     ++thread->stats.neighbor_cache_hits;
+                    neighbor_count = static_cast<u8>(cached_neighbors.size());
+                    neighbor_ptrs = cached_neighbors.data();
                     add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_cache_lookup,
                                               t_neighbor_lookup);
                 } else {
@@ -107,7 +111,10 @@
                     nlist = co_await rdma::vamana::read_vamana_neighbors(beam[best_idx].rptr, thread);
                     add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_neighbor_fetch,
                                               t_neighbor_fetch);
-                    thread->neighbor_cache.insert(beam[best_idx].rptr, nlist->view());
+                    if (thread->neighbor_cache_enabled()) {
+                        const bool pin_entry = beam[best_idx].rptr == medoid_ptr;
+                        thread->neighbor_cache->insert(beam[best_idx].rptr, nlist->view(), pin_entry);
+                    }
                     neighbor_count = nlist->num_neighbors();
                     neighbor_ptrs = nlist->view().data();
                 }

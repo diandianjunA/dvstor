@@ -6,8 +6,6 @@ nohup: ignoring input
   index-prefix:   /data/xjs/index/dvstor/sift100m/sift100m
   gpudirect-rdma: true
   neighbor-cache: 2048 MB
-  neighbor-cache-invalidation-ms: 100
-  neighbor-cache-invalidation-inserts: 1024
   gpu-rabitq-cache: 0 MB
   insert-start-id: 100010000
   负载模式:       mixed

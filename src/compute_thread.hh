@@ -4,6 +4,7 @@
 #include <library/hugepage.hh>
 #include <library/thread.hh>
 #include <random>
+#include <memory>
 
 #include "buffer_allocator.hh"
 #include "cache/neighbor_cache.hh"
@@ -96,18 +97,12 @@ public:
   ServiceWorkerRole service_role() const { return service_role_; }
   bool is_query_worker() const { return service_role_ == ServiceWorkerRole::query; }
   bool is_insert_worker() const { return service_role_ == ServiceWorkerRole::insert; }
-  void set_graph_epoch_source(const std::atomic<u64>* source) {
-    graph_epoch_source_ = source;
-    observed_graph_epoch_ = source == nullptr ? 0 : source->load(std::memory_order_acquire);
-  }
-  void refresh_neighbor_cache_if_stale() {
-    if (graph_epoch_source_ == nullptr || !neighbor_cache.enabled()) {
-      return;
-    }
-    const u64 current_epoch = graph_epoch_source_->load(std::memory_order_acquire);
-    if (current_epoch != observed_graph_epoch_) {
-      neighbor_cache.clear();
-      observed_graph_epoch_ = current_epoch;
+  void set_neighbor_cache(cache::NeighborCache* shared_cache) { neighbor_cache = shared_cache; }
+  bool neighbor_cache_enabled() const { return neighbor_cache != nullptr && neighbor_cache->enabled(); }
+  void refresh_neighbor_cache_if_stale() {}
+  void invalidate_neighbor_cache(RemotePtr rptr) {
+    if (neighbor_cache != nullptr) {
+      neighbor_cache->invalidate(rptr);
     }
   }
 
@@ -135,7 +130,7 @@ public:
   vec<std::atomic<i32>> gpu_post_balances;  // per coroutine (GPU)
 
   gpu::GpuBufferManager gpu_buffers;  // CUDA streams, events, staging buffers
-  cache::NeighborCache neighbor_cache;  // CPU-side query neighbor-list cache
+  cache::NeighborCache* neighbor_cache{nullptr};  // shared CPU-side query neighbor-list cache
 
   statistics::ThreadStatistics stats{};
 
@@ -145,9 +140,6 @@ private:
   vec<u64*> pointer_slots_;  // memory region for a single pointer per coroutine
   vec<service::breakdown::Sample*> active_samples_;
   ServiceWorkerRole service_role_{ServiceWorkerRole::none};
-  const std::atomic<u64>* graph_epoch_source_{nullptr};
-  u64 observed_graph_epoch_{0};
-
   std::mt19937 generator_{std::random_device{}()};
   std::uniform_int_distribution<u32> dist_;
 };

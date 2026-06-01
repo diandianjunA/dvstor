@@ -54,27 +54,23 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                                               config_.use_cache,
                                               static_cast<u64>(config_.cn_memory_gb) * 1073741824ul);
   worker_pool_->allocate_worker_threads(context_, cm_, remote_access_tokens_, config_.num_coroutines);
-  for (auto& thread : compute_threads()) {
-    thread->set_graph_epoch_source(&graph_epoch_);
-  }
-
   // Initialize GPU buffers for each compute thread
   const u32 search_batch =
       config_.use_rabitq_search() ? (config_.beam_width + kRabitqSearchBeamSlack) : config_.beam_width;
   const u32 max_batch = std::max(search_batch, config_.beam_width_construction);
   const u64 neighbor_cache_total_bytes = static_cast<u64>(config_.neighbor_cache_mb) * 1024ull * 1024ull;
   const u64 gpu_rabitq_cache_total_bytes = static_cast<u64>(config_.gpu_rabitq_cache_mb) * 1024ull * 1024ull;
-  const u64 neighbor_cache_bytes_per_query_worker =
-    service_profile_.query_workers == 0 ? 0 : neighbor_cache_total_bytes / service_profile_.query_workers;
+  if (service_profile_.query_workers > 0 && neighbor_cache_total_bytes > 0) {
+    shared_neighbor_cache_.init(neighbor_cache_total_bytes);
+    print_status("shared neighbor cache: slots=" + std::to_string(shared_neighbor_cache_.slot_count()));
+  }
   const u64 gpu_rabitq_cache_bytes_per_query_worker =
     service_profile_.query_workers == 0 ? 0 : gpu_rabitq_cache_total_bytes / service_profile_.query_workers;
   for (u32 tid = 0; tid < compute_threads().size(); ++tid) {
     auto& thread = compute_threads()[tid];
     const bool query_worker = tid >= service_profile_.insert_workers;
-    if (query_worker && neighbor_cache_bytes_per_query_worker > 0) {
-      thread->neighbor_cache.init(neighbor_cache_bytes_per_query_worker);
-      print_status("neighbor cache worker " + std::to_string(tid) +
-                   ": slots=" + std::to_string(thread->neighbor_cache.slot_count()));
+    if (query_worker && shared_neighbor_cache_.enabled()) {
+      thread->set_neighbor_cache(&shared_neighbor_cache_);
     }
     thread->gpu_buffers.init(config_.num_coroutines,
                              config_.dim,
@@ -123,40 +119,6 @@ ComputeService<Distance>::~ComputeService() {
   gpu::gpu_shutdown();
 }
 
-
-template <class Distance>
-void ComputeService<Distance>::force_publish_graph_epoch() {
-  std::lock_guard<std::mutex> lock(neighbor_cache_epoch_mutex_);
-  pending_neighbor_cache_inserts_ = 0;
-  last_neighbor_cache_epoch_publish_ = std::chrono::steady_clock::now();
-  graph_epoch_.fetch_add(1, std::memory_order_acq_rel);
-}
-
-template <class Distance>
-void ComputeService<Distance>::note_graph_insertions(size_t inserted) {
-  if (inserted == 0) {
-    return;
-  }
-
-  const auto now = std::chrono::steady_clock::now();
-  std::lock_guard<std::mutex> lock(neighbor_cache_epoch_mutex_);
-  pending_neighbor_cache_inserts_ += inserted;
-
-  const bool insert_threshold_met =
-    pending_neighbor_cache_inserts_ >= static_cast<size_t>(config_.neighbor_cache_invalidation_inserts);
-  const bool time_threshold_met =
-    config_.neighbor_cache_invalidation_ms > 0 &&
-    std::chrono::duration_cast<std::chrono::milliseconds>(now - last_neighbor_cache_epoch_publish_).count() >=
-      static_cast<int64_t>(config_.neighbor_cache_invalidation_ms);
-
-  if (!insert_threshold_met && !time_threshold_met) {
-    return;
-  }
-
-  pending_neighbor_cache_inserts_ = 0;
-  last_neighbor_cache_epoch_publish_ = now;
-  graph_epoch_.fetch_add(1, std::memory_order_acq_rel);
-}
 
 template <class Distance>
 void ComputeService<Distance>::start_workers() {

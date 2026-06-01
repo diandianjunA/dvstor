@@ -132,18 +132,21 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
       std::chrono::duration_cast<std::chrono::nanoseconds>(process_started - task.received_at).count());
   }
 
+  vec<u64> invalidated_neighbors;
   const bool ok = current_storage_owner_thread_ != nullptr
                     ? execute_storage_owner_batch_items_async(batch_ids.data(),
                                                                batch_vectors.data(),
                                                                batch_ids.size(),
                                                                *current_storage_owner_thread_,
                                                                breakdown,
-                                                               config)
+                                                               config,
+                                                               &invalidated_neighbors)
                     : execute_storage_owner_batch_items(batch_ids.data(),
                                                         batch_vectors.data(),
                                                         batch_ids.size(),
                                                         breakdown,
-                                                        config);
+                                                        config,
+                                                        &invalidated_neighbors);
   for (size_t task_idx = 0; task_idx < tasks.size(); ++task_idx) {
     const auto& task = tasks[task_idx];
     const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(task.payload.data());
@@ -162,6 +165,13 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
     }
     *service::storage_owner::response_breakdown(response_buffer.data(), item_count) =
       scale_breakdown(breakdown, item_count, static_cast<u32>(std::max<size_t>(1, batch_ids.size())));
+    const u32 invalidation_capacity = service::storage_owner::response_invalidation_capacity(item_count);
+    const u32 invalidation_count = static_cast<u32>(std::min<size_t>(invalidated_neighbors.size(), invalidation_capacity));
+    *service::storage_owner::response_invalidation_count(response_buffer.data(), item_count) = invalidation_count;
+    u64* invalidated = service::storage_owner::response_invalidated_raws(response_buffer.data(), item_count);
+    for (u32 i = 0; i < invalidation_count; ++i) {
+      invalidated[i] = invalidated_neighbors[i];
+    }
 
     LocalMemoryRegion response_region{context_, response_buffer.data(), response_buffer.size()};
     {
@@ -178,7 +188,8 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
                                              size_t item_count,
                                              StorageOwnerThread& thread,
                                              InsertBreakdownCounters& breakdown,
-                                             const Configuration& config) {
+                                             const Configuration& config,
+                                             vec<u64>* invalidated_neighbors) {
   if (item_count == 0) {
     return true;
   }
@@ -256,6 +267,17 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
     ok &= send_reverse_update_batch(target_shard, ops, config);
   }
   breakdown.storage_owner_remote_reverse_ns += elapsed_ns_since(t_remote_reverse);
+  if (invalidated_neighbors != nullptr) {
+    invalidated_neighbors->reserve(invalidated_neighbors->size() + local_updates.size());
+    for (const auto& [target_raw, _] : local_updates) {
+      invalidated_neighbors->push_back(target_raw);
+    }
+    for (const auto& [_, ops] : remote_updates) {
+      for (const auto& op : ops) {
+        invalidated_neighbors->push_back(op.target_raw);
+      }
+    }
+  }
   return ok;
 }
 
@@ -387,12 +409,21 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* pa
   const node_t* ids = service::storage_owner::request_ids(payload);
   const element_t* vectors = service::storage_owner::request_vectors(payload, request->item_count);
   InsertBreakdownCounters breakdown{};
-  const bool ok = execute_storage_owner_batch_items(ids, vectors, request->item_count, breakdown, config);
+  vec<u64> invalidated_neighbors;
+  const bool ok = execute_storage_owner_batch_items(ids, vectors, request->item_count, breakdown, config,
+                                                    &invalidated_neighbors);
   for (u32 i = 0; i < request->item_count; ++i) {
     statuses[i] = static_cast<u32>(ok ? service::storage_owner::InsertStatus::ok
                                       : service::storage_owner::InsertStatus::failed);
   }
   *service::storage_owner::response_breakdown(response_ptr, request->item_count) = breakdown;
+  const u32 invalidation_capacity = service::storage_owner::response_invalidation_capacity(request->item_count);
+  const u32 invalidation_count = static_cast<u32>(std::min<size_t>(invalidated_neighbors.size(), invalidation_capacity));
+  *service::storage_owner::response_invalidation_count(response_ptr, request->item_count) = invalidation_count;
+  u64* invalidated = service::storage_owner::response_invalidated_raws(response_ptr, request->item_count);
+  for (u32 i = 0; i < invalidation_count; ++i) {
+    invalidated[i] = invalidated_neighbors[i];
+  }
   return service::storage_owner::insert_batch_response_bytes(request->item_count);
 }
 
@@ -400,7 +431,8 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
                                        const element_t* vectors,
                                        size_t item_count,
                                        InsertBreakdownCounters& breakdown,
-                                       const Configuration& config) {
+                                       const Configuration& config,
+                                       vec<u64>* invalidated_neighbors) {
   if (item_count == 0) {
     return true;
   }
@@ -467,5 +499,16 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
   }
   breakdown.storage_owner_remote_reverse_ns += elapsed_ns_since(t_remote_reverse);
+  if (invalidated_neighbors != nullptr) {
+    invalidated_neighbors->reserve(invalidated_neighbors->size() + local_updates.size());
+    for (const auto& [target_raw, _] : local_updates) {
+      invalidated_neighbors->push_back(target_raw);
+    }
+    for (const auto& [_, ops] : remote_updates) {
+      for (const auto& op : ops) {
+        invalidated_neighbors->push_back(op.target_raw);
+      }
+    }
+  }
   return true;
 }
