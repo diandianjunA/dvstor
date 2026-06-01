@@ -11,7 +11,7 @@ profiles:
   baseline
   gpudirect_rdma
   gpudirect_slot_clock
-  gpudirect_gentile
+  gpudirect_slot_clock_storage_owner
   gpudirect_gentile_storage_owner
 EOF
 }

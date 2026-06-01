@@ -15,9 +15,9 @@ Use these profiles to compare optimization gains one by one. Start memory nodes 
 ./evaluation/sift100m/start_profile_memory_nodes.sh gpudirect_slot_clock restart
 ./evaluation/sift100m/run_profile.sh gpudirect_slot_clock
 
-# 4. GPUDirect RDMA + GPU cache gentile mode.
-./evaluation/sift100m/start_profile_memory_nodes.sh gpudirect_gentile restart
-./evaluation/sift100m/run_profile.sh gpudirect_gentile
+# 4. GPUDirect RDMA + GPU cache slot_clock mode + storage_owner mode.
+./evaluation/sift100m/start_profile_memory_nodes.sh gpudirect_slot_clock_storage_owner restart
+./evaluation/sift100m/run_profile.sh gpudirect_slot_clock_storage_owner
 
 # 5. GPUDirect RDMA + GPU cache gentile mode + storage_owner mode.
 ./evaluation/sift100m/start_profile_memory_nodes.sh gpudirect_gentile_storage_owner restart
@@ -29,7 +29,7 @@ Each run writes a generated compute config to `evaluation/sift100m/generated_sif
 The profile files are plain shell env files, so common benchmark knobs still work:
 
 ```bash
-READ_RATIO=1.0 CLIENT_THREADS=32 MEASURE_SECONDS=120 ./evaluation/sift100m/run_profile.sh gpudirect_gentile
+READ_RATIO=1.0 CLIENT_THREADS=32 MEASURE_SECONDS=120 ./evaluation/sift100m/run_profile.sh gpudirect_slot_clock_storage_owner
 ```
 
 Profile summary:
@@ -39,6 +39,6 @@ Profile summary:
 | `baseline` | off | 2048 MB | 0 MB | off | `compute` | 8 insert / 8 query |
 | `gpudirect_rdma` | on | 2048 MB | 0 MB | off | `compute` | 8 insert / 8 query |
 | `gpudirect_slot_clock` | on | 2048 MB | 8192 MB | `slot_clock` | `compute` | 8 insert / 8 query |
-| `gpudirect_gentile` | on | 2048 MB | 8192 MB | `gentile` | `compute` | 8 insert / 8 query |
+| `gpudirect_slot_clock_storage_owner` | on | 2048 MB | 8192 MB | `slot_clock` | `storage_owner` | 0 insert / 16 query |
 | `gpudirect_gentile_storage_owner` | on | 2048 MB | 8192 MB | `gentile` | `storage_owner` | 0 insert / 16 query |
 
