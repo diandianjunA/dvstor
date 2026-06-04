@@ -40,4 +40,16 @@ Use `HOST=<ip>` when the compute node should connect through a non-local address
 ./evaluation/sift100m/run_mixed_benchmark.sh
 ```
 
-Defaults are `READ_RATIO=0.9`, `CLIENT_THREADS=16`, warmup `30s`, measure `60s`. The benchmark dispatches each operation in each client thread by sampling `read_ratio`, rather than assigning fixed read-only/write-only threads.
+Defaults are `READ_RATIO=0.5`, `MIXED_MODE=probability`, `CLIENT_THREADS=16`, warmup `30s`, measure `120s`.
+
+`MIXED_MODE=probability` samples `READ_RATIO` for every operation in every client thread. `MIXED_MODE=fixed_threads` splits client threads by `READ_RATIO`; for example `READ_RATIO=0.75 CLIENT_THREADS=16` assigns 12 query threads and 4 insert threads.
+
+Mixed inserts currently use deterministic synthetic vectors derived from the insert id, not vectors read from SIFT100M. Queries use `QUERY_FILE`, which defaults to `/data/xjs/datasets/sift100m/query.public.10K.u8bin`.
+
+Enable a before-performance recall check with:
+
+```bash
+ENABLE_RECALL=true RECALL_QUERIES=1000 ./evaluation/sift100m/run_mixed_benchmark.sh
+```
+
+The recall check runs before warmup/measure, uses `GROUNDTRUTH_FILE` from `sift100m_common.sh`, and reports `recall@K` in the JSON report and terminal summary. Set `MIN_RECALL=<value>` to fail the run when recall is below a threshold.

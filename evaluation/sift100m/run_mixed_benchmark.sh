@@ -10,9 +10,14 @@ REPORT_DIR="${REPORT_DIR:-$PROJECT_DIR/reports/sift100m}"
 LABEL="${LABEL:-sift100m_mixed_$(date +%Y%m%d_%H%M%S)}"
 WORKLOAD="${WORKLOAD:-mixed}"
 READ_RATIO="${READ_RATIO:-0.5}"
+MIXED_MODE="${MIXED_MODE:-fixed_threads}"
 CLIENT_THREADS="${CLIENT_THREADS:-16}"
 WARMUP_SECONDS="${WARMUP_SECONDS:-30}"
 MEASURE_SECONDS="${MEASURE_SECONDS:-120}"
+ENABLE_RECALL="${ENABLE_RECALL:-true}"
+RECALL_QUERIES="${RECALL_QUERIES:-1000}"
+RECALL_K="${RECALL_K:-10}"
+MIN_RECALL="${MIN_RECALL:-}"
 
 cat > "$GENERATED_CONFIG" <<EOF_CFG
 servers = $(join_server_endpoints)
@@ -68,6 +73,7 @@ args=(
   --service-config "$GENERATED_CONFIG"
   --workload "$WORKLOAD"
   --read-ratio "$READ_RATIO"
+  --mixed-mode "$MIXED_MODE"
   --client-threads "$CLIENT_THREADS"
   --warmup-seconds "$WARMUP_SECONDS"
   --measure-seconds "$MEASURE_SECONDS"
@@ -76,5 +82,16 @@ args=(
   --label "$LABEL"
   --insert-start-id "$INSERT_START_ID"
 )
+
+if [[ "$ENABLE_RECALL" == "true" || "$ENABLE_RECALL" == "1" || "$ENABLE_RECALL" == "yes" ]]; then
+  if [[ ! -f "$GROUNDTRUTH_FILE" ]]; then
+    echo "error: groundtruth file not found: $GROUNDTRUTH_FILE" >&2
+    exit 1
+  fi
+  args+=(--groundtruth-file "$GROUNDTRUTH_FILE" --recall-queries "$RECALL_QUERIES" --recall-k "$RECALL_K")
+  if [[ -n "$MIN_RECALL" ]]; then
+    args+=(--min-recall "$MIN_RECALL")
+  fi
+fi
 
 exec "$RUN_SCRIPT" "${args[@]}" "$@"

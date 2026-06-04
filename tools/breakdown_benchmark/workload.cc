@@ -15,6 +15,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "common/distance.hh"
@@ -109,6 +110,56 @@ std::vector<float> read_vector_bin(const std::string& path, uint32_t* dim_out, s
 }
 
 
+struct GroundTruth {
+  uint32_t rows{};
+  uint32_t top_k{};
+  std::vector<uint32_t> ids;
+
+  const uint32_t* row(size_t index) const {
+    return ids.data() + index * top_k;
+  }
+};
+
+GroundTruth read_groundtruth_bin(const std::string& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("failed to open groundtruth file: " + path);
+  }
+
+  GroundTruth gt;
+  input.read(reinterpret_cast<char*>(&gt.rows), sizeof(gt.rows));
+  input.read(reinterpret_cast<char*>(&gt.top_k), sizeof(gt.top_k));
+  if (!input || gt.rows == 0 || gt.top_k == 0) {
+    throw std::runtime_error("failed to read groundtruth header: " + path);
+  }
+
+  gt.ids.resize(static_cast<size_t>(gt.rows) * gt.top_k);
+  input.read(reinterpret_cast<char*>(gt.ids.data()),
+             static_cast<std::streamsize>(gt.ids.size() * sizeof(uint32_t)));
+  if (!input) {
+    throw std::runtime_error("failed to read groundtruth ids: " + path);
+  }
+  return gt;
+}
+
+double recall_at(const std::vector<uint32_t>& results, const uint32_t* gt, uint32_t k) {
+  std::unordered_set<uint32_t> truth;
+  truth.reserve(k);
+  for (uint32_t i = 0; i < k; ++i) {
+    truth.insert(gt[i]);
+  }
+
+  uint32_t hits = 0;
+  const size_t result_count = std::min<size_t>(results.size(), k);
+  for (size_t i = 0; i < result_count; ++i) {
+    if (truth.find(results[i]) != truth.end()) {
+      ++hits;
+    }
+  }
+  return static_cast<double>(hits) / static_cast<double>(k);
+}
+
+
 template <class Distance>
 nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args) {
   using SampleReport = service::breakdown::Report;
@@ -124,9 +175,11 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"measure_seconds", args.measure_seconds},
     {"run_mode", (args.warmup_seconds > 0 || args.measure_seconds > 0) ? "time" : "ops"},
     {"time_completion_policy", "drain"},
-    {"time_issue_policy", "probabilistic_read_write_per_thread_until_deadline"},
-    {"mixed_dispatch_policy", "per_operation_probability"},
+    {"time_issue_policy", args.mixed_mode == "fixed_threads" ? "fixed_read_write_threads_until_deadline"
+                                                        : "probabilistic_read_write_per_thread_until_deadline"},
+    {"mixed_dispatch_policy", args.mixed_mode},
     {"operation_granularity", "single_vector"},
+    {"insert_vector_source", "deterministic_synthetic_from_insert_id"},
     {"client_threads", args.client_threads},
     {"read_ratio", args.read_ratio},
     {"insert_start_id", args.insert_start_id},
@@ -136,6 +189,25 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"search_mode", service.config().search_mode},
   };
   const size_t dim = service.config().dim;
+  size_t fixed_read_threads = 0;
+  size_t fixed_write_threads = 0;
+  if (args.workload == "mixed" && args.mixed_mode == "fixed_threads") {
+    if (args.read_ratio <= 0.0) {
+      fixed_read_threads = 0;
+    } else if (args.read_ratio >= 1.0) {
+      fixed_read_threads = args.client_threads;
+    } else {
+      fixed_read_threads = static_cast<size_t>(std::llround(static_cast<double>(args.client_threads) * args.read_ratio));
+      fixed_read_threads = std::clamp<size_t>(fixed_read_threads, 1, args.client_threads - 1);
+    }
+    fixed_write_threads = args.client_threads - fixed_read_threads;
+    root["meta"]["mixed_fixed_threads"] = {
+      {"read_threads", fixed_read_threads},
+      {"write_threads", fixed_write_threads},
+    };
+    std::cerr << "[breakdown] mixed fixed thread split: reads=" << fixed_read_threads
+              << ", writes=" << fixed_write_threads << std::endl;
+  }
   const size_t bootstrap_work = args.measure_seconds > 0
                                   ? std::max<size_t>(4096, args.client_threads * 256)
                                   : std::max<size_t>(2048, args.measure_ops);
@@ -229,6 +301,60 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   }
   std::cerr << "[breakdown] query data ready: count=" << query_count << std::endl;
 
+  bool recall_below_threshold = false;
+  auto run_recall_check = [&]() {
+    if (args.groundtruth_file.empty()) {
+      return;
+    }
+    if (query_count == 0) {
+      throw std::runtime_error("recall requires query vectors");
+    }
+    const GroundTruth gt = read_groundtruth_bin(args.groundtruth_file);
+    if (gt.rows != query_count) {
+      throw std::runtime_error("query/groundtruth row count mismatch");
+    }
+    const uint32_t recall_k = args.recall_k == 0 ? std::min<uint32_t>(service.config().k, gt.top_k) : args.recall_k;
+    if (recall_k == 0 || recall_k > gt.top_k) {
+      throw std::runtime_error("invalid recall k");
+    }
+    const size_t recall_queries = args.recall_queries == 0 ? query_count : std::min<size_t>(args.recall_queries, query_count);
+    double total_recall = 0.0;
+    std::atomic<size_t> recall_completed{0};
+    ProgressReporter recall_reporter("recall", recall_completed, recall_queries, 0);
+    for (size_t qi = 0; qi < recall_queries; ++qi) {
+      std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(qi * dim),
+                               query_data.begin() + static_cast<std::ptrdiff_t>((qi + 1) * dim));
+      const auto results = service.search(query, recall_k);
+      std::vector<uint32_t> result_ids;
+      result_ids.reserve(results.size());
+      for (const auto id : results) {
+        result_ids.push_back(static_cast<uint32_t>(id));
+      }
+      total_recall += recall_at(result_ids, gt.row(qi), recall_k);
+      recall_completed.fetch_add(1, std::memory_order_relaxed);
+    }
+    recall_reporter.finish();
+    const double recall = recall_queries > 0 ? total_recall / static_cast<double>(recall_queries) : 0.0;
+    root["recall"] = {
+      {"phase", "before_performance"},
+      {"groundtruth_file", args.groundtruth_file},
+      {"queries", recall_queries},
+      {"k", recall_k},
+      {"recall", recall},
+      {"min_recall", args.min_recall},
+      {"passed", args.min_recall < 0.0 || recall >= args.min_recall},
+    };
+    std::cerr << "[breakdown][recall] before performance recall@" << recall_k << "=" << recall
+              << " queries=" << recall_queries << std::endl;
+    if (args.min_recall >= 0.0 && recall < args.min_recall) {
+      recall_below_threshold = true;
+    }
+
+    service.clear_thread_statistics();
+    service.reset_breakdown_state();
+  };
+  run_recall_check();
+
   auto run_query_phase_ops = [&](const std::string& label, size_t ops) {
     std::atomic<size_t> completed_ops{0};
     ProgressReporter reporter(label, completed_ops, ops, 0);
@@ -298,7 +424,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
             break;
           }
 
-          if (choose_mixed_read(rng)) {
+          const bool read_op = args.mixed_mode == "fixed_threads" ? tid < fixed_read_threads : choose_mixed_read(rng);
+          if (read_op) {
             issued_reads.fetch_add(1, std::memory_order_relaxed);
             const size_t query_idx = next_query_idx.fetch_add(1, std::memory_order_relaxed) % query_count;
             std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(query_idx * dim),
@@ -358,7 +485,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
             break;
           }
 
-          if (choose_mixed_read(rng)) {
+          const bool read_op = args.mixed_mode == "fixed_threads" ? tid < fixed_read_threads : choose_mixed_read(rng);
+          if (read_op) {
             issued_reads.fetch_add(1, std::memory_order_relaxed);
             const size_t query_idx = next_query_idx.fetch_add(1, std::memory_order_relaxed) % query_count;
             std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(query_idx * dim),
@@ -492,6 +620,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   const SampleReport report = service.collect_breakdown_report();
   root.update(report_to_json(report));
 
+
   const bool has_throughput_duration = use_time_mode && args.measure_seconds > 0;
   const double throughput_duration = has_throughput_duration ? static_cast<double>(args.measure_seconds) : 0.0;
   const double query_throughput = has_throughput_duration
@@ -553,6 +682,9 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   }
 
   std::cout << text_summary.str();
+  if (recall_below_threshold) {
+    throw std::runtime_error("recall below threshold");
+  }
   return root;
 }
 
