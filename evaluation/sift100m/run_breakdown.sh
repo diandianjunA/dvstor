@@ -12,7 +12,7 @@ fi
 source "$PROFILE_ENV"
 
 ensure_built dvstor_breakdown_benchmark
-"$SCRIPT_DIR/prepare_sift100m_data.sh"
+PREPARE_BASE="${PREPARE_BASE:-0}" "$SCRIPT_DIR/prepare_sift100m_data.sh"
 
 WORKLOAD="${WORKLOAD:-mixed}"
 READ_RATIO="${READ_RATIO:-0.95}"

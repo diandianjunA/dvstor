@@ -110,6 +110,9 @@ def main():
     parser.add_argument('--max-query', type=int, default=10_000)
     parser.add_argument('--topk', type=int, default=1000)
     parser.add_argument('--chunk-rows', type=int, default=1_000_000)
+    parser.add_argument('--skip-base', action='store_true')
+    parser.add_argument('--skip-query', action='store_true')
+    parser.add_argument('--skip-groundtruth', action='store_true')
     args = parser.parse_args()
 
     dataset = Path(args.dataset_dir)
@@ -120,9 +123,12 @@ def main():
 
     base_suffix = '' if args.max_base in (0, 1_000_000_000) else f'_{args.max_base}'
     query_suffix = '' if args.max_query in (0, 10_000) else f'_{args.max_query}'
-    convert_bvecs_to_u8bin(base_src, out / f'base{base_suffix}.u8bin', args.max_base, args.chunk_rows)
-    convert_bvecs_to_u8bin(query_src, out / f'query{query_suffix}.u8bin', args.max_query, args.chunk_rows)
-    convert_ivecs_to_bin(gt_src, out / f'groundtruth_{args.groundtruth_label}.bin', args.max_query, args.topk, args.chunk_rows)
+    if not args.skip_base:
+        convert_bvecs_to_u8bin(base_src, out / f'base{base_suffix}.u8bin', args.max_base, args.chunk_rows)
+    if not args.skip_query:
+        convert_bvecs_to_u8bin(query_src, out / f'query{query_suffix}.u8bin', args.max_query, args.chunk_rows)
+    if not args.skip_groundtruth:
+        convert_ivecs_to_bin(gt_src, out / f'groundtruth_{args.groundtruth_label}.bin', args.max_query, args.topk, args.chunk_rows)
 
 
 if __name__ == '__main__':
