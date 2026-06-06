@@ -661,6 +661,15 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     text_summary << "  insert_ops_per_sec: " << insert_throughput
                  << " (ops=" << report.insert.count << ")\n";
   }
+  if (root.contains("recall")) {
+    const auto& recall = root["recall"];
+    text_summary << "recall\n";
+    text_summary << "  recall@" << recall.value("k", 0) << ": "
+                 << recall.value("recall", 0.0) << '\n';
+    text_summary << "  queries: " << recall.value("queries", 0) << '\n';
+    text_summary << "  passed: " << (recall.value("passed", false) ? "true" : "false") << '\n';
+    text_summary << "  groundtruth_file: " << recall.value("groundtruth_file", "") << '\n';
+  }
   if (report.has_insert()) {
     const auto summary = aggregate_text_summary(report.insert);
     summaries["insert"] = summary;

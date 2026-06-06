@@ -1,3 +1,8 @@
+recall
+  recall@10: 0.0
+  queries: 1000
+  passed: true
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
 query breakdown
   count: 1
   latency_ms: mean=2.97949 p50=2.97949 p95=2.97949 p99=2.97949
