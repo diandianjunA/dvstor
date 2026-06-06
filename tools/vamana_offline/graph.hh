@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
+#include <limits>
+#include <memory>
 #include <cuda_runtime.h>
-#include <mutex>
 #include <utility>
 
 #include "gpu/gpu_kernel_launcher.hh"
@@ -9,23 +11,33 @@
 
 namespace tools::vamana_offline {
 
-using DistFn = float (*)(const float*, const float*, u32);
-
 struct VamanaGraph {
+  static constexpr u32 kEmptyNeighbor = std::numeric_limits<u32>::max();
+
   size_t num_nodes{0};
   u32 dim{0};
   u32 R{0};
   size_t medoid{0};
-  vec<vec<u32>> neighbors;
-  vec<std::mutex> node_locks;
+  vec<u32> neighbors;
+  vec<u8> degrees;
+  std::unique_ptr<std::atomic_flag[]> lock_stripes;
+  size_t lock_stripe_count{0};
 
-  void init(size_t n, u32 d, u32 max_degree) {
-    num_nodes = n;
-    dim = d;
-    R = max_degree;
-    neighbors.resize(n);
-    node_locks = vec<std::mutex>(n);
-  }
+  void init(size_t n, u32 d, u32 max_degree, size_t requested_lock_stripes = 1 << 20);
+  size_t offset(size_t node) const { return node * static_cast<size_t>(R); }
+  u8 degree(size_t node) const { return degrees[node]; }
+  void copy_neighbors(size_t node, vec<u32>& out) const;
+  bool contains_neighbor_unlocked(size_t node, u32 neighbor) const;
+  void set_neighbors(size_t node, const vec<u32>& new_neighbors);
+  void lock_node(size_t node);
+  void unlock_node(size_t node);
+};
+
+struct NodeLockGuard {
+  VamanaGraph& graph;
+  size_t node;
+  NodeLockGuard(VamanaGraph& graph_, size_t node_) : graph(graph_), node(node_) { graph.lock_node(node); }
+  ~NodeLockGuard() { graph.unlock_node(node); }
 };
 
 static constexpr u32 GPU_BATCH_THRESHOLD = 16;
@@ -33,86 +45,41 @@ static constexpr u32 GPU_BATCH_THRESHOLD = 16;
 struct BuilderGpuContext {
   cudaStream_t stream{nullptr};
   cudaEvent_t event{nullptr};
-  float* h_query{nullptr};
-  float* h_candidates{nullptr};
+  u32* h_candidate_ids{nullptr};
   float* h_distances{nullptr};
-  float* h_candidate_dists{nullptr};
-  u32* h_pruned_indices{nullptr};
-  u32* h_pruned_count{nullptr};
-  float* d_query{nullptr};
-  float* d_candidates{nullptr};
+  u32* d_candidate_ids{nullptr};
   float* d_distances{nullptr};
-  float* d_candidate_dists{nullptr};
-  u32* d_pruned_indices{nullptr};
-  u32* d_pruned_count{nullptr};
+  const void* d_base_vectors{nullptr};
   u32 dim{0};
   u32 max_candidates{0};
-  u32 max_R{0};
+  u32 dtype{0};
 
-  void init(u32 dim_, u32 max_cand, u32 R) {
-    dim = dim_;
-    max_candidates = max_cand;
-    max_R = R;
-
-    stream = gpu::gpu_stream_create();
-    event = gpu::gpu_event_create();
-
-    h_query = static_cast<float*>(gpu::gpu_malloc_host(dim * sizeof(float)));
-    h_candidates = static_cast<float*>(gpu::gpu_malloc_host(max_cand * dim * sizeof(float)));
-    h_distances = static_cast<float*>(gpu::gpu_malloc_host(max_cand * sizeof(float)));
-    h_candidate_dists = static_cast<float*>(gpu::gpu_malloc_host(max_cand * sizeof(float)));
-    h_pruned_indices = static_cast<u32*>(gpu::gpu_malloc_host(R * sizeof(u32)));
-    h_pruned_count = static_cast<u32*>(gpu::gpu_malloc_host(sizeof(u32)));
-
-    d_query = static_cast<float*>(gpu::gpu_malloc(dim * sizeof(float)));
-    d_candidates = static_cast<float*>(gpu::gpu_malloc(max_cand * dim * sizeof(float)));
-    d_distances = static_cast<float*>(gpu::gpu_malloc(max_cand * sizeof(float)));
-    d_candidate_dists = static_cast<float*>(gpu::gpu_malloc(max_cand * sizeof(float)));
-    d_pruned_indices = static_cast<u32*>(gpu::gpu_malloc(R * sizeof(u32)));
-    d_pruned_count = static_cast<u32*>(gpu::gpu_malloc(sizeof(u32)));
-  }
-
-  void destroy() {
-    if (!stream) {
-      return;
-    }
-    gpu::gpu_free_host(h_query);
-    gpu::gpu_free_host(h_candidates);
-    gpu::gpu_free_host(h_distances);
-    gpu::gpu_free_host(h_candidate_dists);
-    gpu::gpu_free_host(h_pruned_indices);
-    gpu::gpu_free_host(h_pruned_count);
-    gpu::gpu_free(d_query);
-    gpu::gpu_free(d_candidates);
-    gpu::gpu_free(d_distances);
-    gpu::gpu_free(d_candidate_dists);
-    gpu::gpu_free(d_pruned_indices);
-    gpu::gpu_free(d_pruned_count);
-    gpu::gpu_event_destroy(event);
-    gpu::gpu_stream_destroy(stream);
-    stream = nullptr;
-  }
+  void init(u32 dim_, u32 max_cand, VectorDType dtype_, const void* d_base_vectors_);
+  void destroy();
+  bool enabled() const { return stream != nullptr && d_base_vectors != nullptr; }
 };
 
-float l2_squared(const float* a, const float* b, u32 dim);
-float ip_distance(const float* a, const float* b, u32 dim);
-size_t compute_medoid(const Dataset& dataset, DistFn dist_fn);
+size_t compute_medoid(const Dataset& dataset, bool ip_distance);
 vec<std::pair<float, u32>> beam_search(VamanaGraph& graph,
                                        const Dataset& dataset,
-                                       const float* query,
+                                       u32 query_id,
                                        u32 beam_width,
-                                       DistFn dist_fn,
+                                       bool ip_distance,
                                        BuilderGpuContext* gpu_ctx = nullptr);
+vec<std::pair<float, u32>> beam_search_float_query(VamanaGraph& graph,
+                                                   const Dataset& dataset,
+                                                   const float* query,
+                                                   u32 beam_width,
+                                                   bool ip_distance);
 vec<u32> robust_prune(const Dataset& dataset,
                       u32 source,
                       const vec<std::pair<float, u32>>& sorted_candidates,
                       float alpha,
                       u32 R,
-                      DistFn dist_fn);
+                      bool ip_distance);
 void build_vamana_graph(VamanaGraph& graph,
                         const Dataset& dataset,
                         const VamanaBuildConfig& config,
-                        DistFn dist_fn,
                         BuilderGpuContext* gpu_contexts,
                         size_t num_gpu_contexts);
 

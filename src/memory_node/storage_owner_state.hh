@@ -39,24 +39,7 @@ struct NodeSnapshot {
   u64 header{};
   node_t id{};
   u8 edge_count{};
-  vec<element_t> components;
-};
-
-struct RabitqSearchState {
-  vec<float> rotated_query;
-  float add{};
-  float k1x_sumq{};
-};
-
-struct RabitqSnapshot {
-  RemotePtr rptr;
-  vec<byte_t> data;
-};
-
-struct SearchBlockSnapshot {
-  RemotePtr rptr;
-  vec<byte_t> rabitq_data;
-  vec<RemotePtr> neighbors;
+  vec<byte_t> vector_data;
 };
 
 struct InsertRuntimeState {
@@ -109,10 +92,8 @@ public:
     enabled_ = true;
     const size_t snapshot_bytes = VamanaNode::size_until_vector_end() + sizeof(NodeSnapshot) + 64;
     const size_t neighbor_bytes = VamanaNode::NEIGHBORS_SIZE + sizeof(RemotePtr) + 64;
-    const size_t rabitq_bytes = VamanaNode::RABITQ_SIZE + sizeof(byte_t) + 64;
-    snapshot_capacity_ = std::max<size_t>(1, (bytes * 55 / 100) / std::max<size_t>(1, snapshot_bytes));
-    neighbor_capacity_ = std::max<size_t>(1, (bytes * 35 / 100) / std::max<size_t>(1, neighbor_bytes));
-    rabitq_capacity_ = std::max<size_t>(1, (bytes * 10 / 100) / std::max<size_t>(1, rabitq_bytes));
+    snapshot_capacity_ = std::max<size_t>(1, (bytes * 60 / 100) / std::max<size_t>(1, snapshot_bytes));
+    neighbor_capacity_ = std::max<size_t>(1, (bytes * 40 / 100) / std::max<size_t>(1, neighbor_bytes));
   }
 
   bool enabled() const { return enabled_; }
@@ -171,33 +152,6 @@ public:
     neighbors_[key.raw_address] = values;
   }
 
-  bool lookup_rabitq(RemotePtr key, vec<byte_t>& data) {
-    if (!enabled_) {
-      return false;
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = rabitq_.find(key.raw_address);
-    if (it == rabitq_.end()) {
-      return false;
-    }
-    data = it->second;
-    return true;
-  }
-
-  void insert_rabitq(RemotePtr key, const vec<byte_t>& data) {
-    if (!enabled_ || key.is_null() || data.empty()) {
-      return;
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (rabitq_.contains(key.raw_address)) {
-      rabitq_[key.raw_address] = data;
-      return;
-    }
-    evict_fifo(rabitq_order_, rabitq_, rabitq_capacity_);
-    rabitq_order_.push_back(key.raw_address);
-    rabitq_[key.raw_address] = data;
-  }
-
   void invalidate(RemotePtr key) {
     if (!enabled_ || key.is_null()) {
       return;
@@ -205,7 +159,6 @@ public:
     std::lock_guard<std::mutex> lock(mutex_);
     snapshots_.erase(key.raw_address);
     neighbors_.erase(key.raw_address);
-    rabitq_.erase(key.raw_address);
   }
 
 private:
@@ -221,14 +174,11 @@ private:
   bool enabled_{false};
   size_t snapshot_capacity_{0};
   size_t neighbor_capacity_{0};
-  size_t rabitq_capacity_{0};
   std::mutex mutex_;
   std::deque<u64> snapshot_order_;
   std::deque<u64> neighbor_order_;
-  std::deque<u64> rabitq_order_;
   std::unordered_map<u64, NodeSnapshot> snapshots_;
   std::unordered_map<u64, vec<RemotePtr>> neighbors_;
-  std::unordered_map<u64, vec<byte_t>> rabitq_;
 };
 
 struct StorageOwnerThread {
@@ -277,7 +227,7 @@ struct StorageOwnerThread {
 
 struct StorageOwnerInsertJob {
   node_t id{};
-  vec<element_t> components;
+  vec<byte_t> vector_data;
   bool ok{false};
 };
 

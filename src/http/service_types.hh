@@ -5,6 +5,7 @@
 #include <memory>
 
 #include "common/types.hh"
+#include "common/vector_dtype.hh"
 #include "service/breakdown.hh"
 
 namespace service {
@@ -26,7 +27,9 @@ struct InsertRequest {
 
 struct QueryRequest {
   vec<element_t> components;
-  u32 k;
+  vec<byte_t> raw_components;
+  VectorDType query_dtype{VectorDType::float32};
+  u32 k{};
   std::promise<QueryResult> result;
   std::chrono::steady_clock::time_point enqueued_at{std::chrono::steady_clock::now()};
   std::shared_ptr<breakdown::Sample> breakdown_sample{};

@@ -117,12 +117,17 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
   for (const auto& task : tasks) {
     const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(task.payload.data());
     const node_t* ids = service::storage_owner::request_ids(task.payload.data());
-    const element_t* vectors = service::storage_owner::request_vectors(task.payload.data(), request->item_count);
+    const byte_t* vectors = service::storage_owner::request_vectors(task.payload.data(), request->item_count);
     item_counts.push_back(request->item_count);
     batch_ids.insert(batch_ids.end(), ids, ids + request->item_count);
-    batch_vectors.insert(batch_vectors.end(),
-                         vectors,
-                         vectors + static_cast<size_t>(request->item_count) * config.dim);
+    const size_t old_size = batch_vectors.size();
+    batch_vectors.resize(old_size + static_cast<size_t>(request->item_count) * config.dim);
+    for (u32 i = 0; i < request->item_count; ++i) {
+      decode_storage_vector_to_float(vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes(),
+                                     VamanaNode::vector_dtype(),
+                                     config.dim,
+                                     batch_vectors.data() + old_size + static_cast<size_t>(i) * config.dim);
+    }
   }
 
   InsertBreakdownCounters breakdown{};
@@ -199,7 +204,10 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
   for (size_t idx = 0; idx < item_count; ++idx) {
     StorageOwnerInsertJob job;
     job.id = ids[idx];
-    job.components.assign(vectors + idx * VamanaNode::DIM, vectors + (idx + 1) * VamanaNode::DIM);
+    job.vector_data.resize(static_cast<size_t>(VamanaNode::DIM) * sizeof(element_t));
+    std::memcpy(job.vector_data.data(),
+                vectors + idx * VamanaNode::DIM,
+                static_cast<size_t>(VamanaNode::DIM) * sizeof(element_t));
     jobs.push_back(std::move(job));
   }
 
@@ -335,6 +343,8 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
             request->owner_storage == storage_id_ &&
             request->item_count > 0 &&
             request->item_count <= config.storage_owner_batch_max &&
+            request->vector_dtype == static_cast<u32>(VamanaNode::vector_dtype()) &&
+            request->vector_bytes == VamanaNode::vector_bytes() &&
             bytes >= service::storage_owner::insert_batch_request_bytes(request->item_count, config.dim)) {
           StorageOwnerInsertTask task;
           task.client_id = client_id;
@@ -392,6 +402,8 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* pa
       request->owner_storage != storage_id_ ||
       request->item_count == 0 ||
       request->item_count > config.storage_owner_batch_max ||
+      request->vector_dtype != static_cast<u32>(VamanaNode::vector_dtype()) ||
+      request->vector_bytes != VamanaNode::vector_bytes() ||
       bytes < service::storage_owner::insert_batch_request_bytes(request->item_count, config.dim)) {
     return 0;
   }
@@ -407,10 +419,17 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* pa
   u32* statuses = service::storage_owner::response_statuses(response_ptr);
 
   const node_t* ids = service::storage_owner::request_ids(payload);
-  const element_t* vectors = service::storage_owner::request_vectors(payload, request->item_count);
+  const byte_t* raw_vectors = service::storage_owner::request_vectors(payload, request->item_count);
+  vec<element_t> decoded_vectors(static_cast<size_t>(request->item_count) * config.dim);
+  for (u32 i = 0; i < request->item_count; ++i) {
+    decode_storage_vector_to_float(raw_vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes(),
+                                   VamanaNode::vector_dtype(),
+                                   config.dim,
+                                   decoded_vectors.data() + static_cast<size_t>(i) * config.dim);
+  }
   InsertBreakdownCounters breakdown{};
   vec<u64> invalidated_neighbors;
-  const bool ok = execute_storage_owner_batch_items(ids, vectors, request->item_count, breakdown, config,
+  const bool ok = execute_storage_owner_batch_items(ids, decoded_vectors.data(), request->item_count, breakdown, config,
                                                     &invalidated_neighbors);
   for (u32 i = 0; i < request->item_count; ++i) {
     statuses[i] = static_cast<u32>(ok ? service::storage_owner::InsertStatus::ok
@@ -446,14 +465,10 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   for (size_t idx = 0; idx < item_count; ++idx) {
     const element_t* vec_ptr = vectors + idx * VamanaNode::DIM;
     const auto components = span<const element_t>{vec_ptr, VamanaNode::DIM};
-    auto t_quantize = std::chrono::steady_clock::now();
-    const vec<byte_t> rabitq_data = quantize_rabitq_cpu(components, config);
-    breakdown.storage_owner_quantize_ns += elapsed_ns_since(t_quantize);
-
     if (medoid_ptr.is_null()) {
       const RemotePtr new_ptr = allocate_local_node();
       auto t_write = std::chrono::steady_clock::now();
-      write_new_node(new_ptr, ids[idx], components, rabitq_data, {});
+      write_new_node(new_ptr, ids[idx], components, {});
       breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
       RemotePtr observed;
       if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
@@ -468,11 +483,12 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
     hashset_t<RemotePtr> empty_skip;
     auto t_prune = std::chrono::steady_clock::now();
-    vec<RemotePtr> selected_neighbors = robust_prune_cpu(components, candidates, empty_skip, config, &breakdown);
+    vec<RemotePtr> selected_neighbors = robust_prune_cpu(reinterpret_cast<const byte_t*>(components.data()),
+                                                         VectorDType::float32, candidates, empty_skip, config, &breakdown);
     breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
     const RemotePtr new_ptr = allocate_local_node();
     auto t_write = std::chrono::steady_clock::now();
-    write_new_node(new_ptr, ids[idx], components, rabitq_data, selected_neighbors);
+    write_new_node(new_ptr, ids[idx], components, selected_neighbors);
     breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
 
     for (const RemotePtr& neighbor_ptr : selected_neighbors) {

@@ -11,7 +11,12 @@ typename ComputeService<Distance>::LocalMainSearchOutput ComputeService<Distance
     sample->enqueued_at = std::chrono::steady_clock::now();
   }
 
-  auto* request = new service::QueryRequest{query, k, {}, std::chrono::steady_clock::now(), sample};
+  auto* request = new service::QueryRequest{};
+  request->components = query;
+  request->query_dtype = VectorDType::float32;
+  request->k = k;
+  request->enqueued_at = std::chrono::steady_clock::now();
+  request->breakdown_sample = sample;
   auto future = request->result.get_future();
   query_queue_.enqueue(request);
 
@@ -41,6 +46,74 @@ vec<node_t> ComputeService<Distance>::search_local(const vec<element_t>& query, 
     completed_query_samples_.push_back(*main.sample);
   }
   return ids;
+}
+
+template <class Distance>
+typename ComputeService<Distance>::LocalMainSearchOutput ComputeService<Distance>::search_local_raw_result(
+  VectorDType query_dtype, const byte_t* query_data, u32 k) {
+  if (query_data == nullptr) {
+    throw std::invalid_argument("raw query pointer is null");
+  }
+
+  std::shared_ptr<service::breakdown::Sample> sample;
+  if (breakdown_enabled_) {
+    sample = std::make_shared<service::breakdown::Sample>(service::breakdown::Operation::query);
+    sample->enqueued_at = std::chrono::steady_clock::now();
+  }
+
+  auto* request = new service::QueryRequest{};
+  request->raw_components.assign(query_data, query_data + vector_dtype_bytes(query_dtype, config_.dim));
+  request->query_dtype = query_dtype;
+  request->k = k;
+  request->enqueued_at = std::chrono::steady_clock::now();
+  request->breakdown_sample = sample;
+  auto future = request->result.get_future();
+  query_queue_.enqueue(request);
+
+  service::QueryResult results = future.get();
+  delete request;
+
+  return {.results = std::move(results), .sample = std::move(sample)};
+}
+
+template <class Distance>
+vec<node_t> ComputeService<Distance>::search_local_raw(VectorDType query_dtype, const byte_t* query_data, u32 k) {
+  LocalMainSearchOutput main = search_local_raw_result(query_dtype, query_data, k);
+  service::QueryResult& main_results = main.results;
+  vec<node_t> ids;
+  ids.reserve(std::min<size_t>(k, main_results.size()));
+  for (size_t i = 0; i < main_results.size() && ids.size() < k; ++i) {
+    ids.push_back(main_results[i].id);
+  }
+  if (main.sample && main.sample->finished_flag) {
+    const auto finished_at = std::chrono::steady_clock::now();
+    main.sample->finished_at = finished_at;
+    main.sample->service_ns = static_cast<u64>(
+      std::chrono::duration_cast<service::breakdown::Nanoseconds>(finished_at - main.sample->started_at).count());
+    main.sample->end_to_end_ns = static_cast<u64>(
+      std::chrono::duration_cast<service::breakdown::Nanoseconds>(finished_at - main.sample->enqueued_at).count());
+    std::lock_guard<std::mutex> lock(breakdown_mutex_);
+    completed_query_samples_.push_back(*main.sample);
+  }
+  return ids;
+}
+
+template <class Distance>
+vec<node_t> ComputeService<Distance>::search_raw(VectorDType query_dtype, const byte_t* query_data, u32 dim, u32 k) {
+  if (dim != config_.dim) {
+    throw std::invalid_argument("raw search dimension mismatch");
+  }
+  if (query_data == nullptr) {
+    throw std::invalid_argument("raw query pointer is null");
+  }
+
+  if (routing_enabled()) {
+    vec<element_t> decoded(config_.dim);
+    decode_storage_vector_to_float(query_data, query_dtype, config_.dim, decoded.data());
+    return search(decoded, k);
+  }
+
+  return search_local_raw(query_dtype, query_data, k);
 }
 
 template <class Distance>

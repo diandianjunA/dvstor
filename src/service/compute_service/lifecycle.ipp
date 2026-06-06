@@ -24,16 +24,31 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
 
   receive_remote_access_tokens();
 
+  if (config_.load_index) {
+    const filepath_t startup_prefix = config_.resolved_index_prefix();
+    const filepath_t meta_file = filepath_t(startup_prefix.string() + ".meta.json");
+    if (!startup_prefix.empty() && std::filesystem::exists(meta_file)) {
+      service::index_metadata::Metadata metadata;
+      str metadata_error;
+      lib_assert(service::index_metadata::load_metadata(startup_prefix, metadata, &metadata_error), metadata_error);
+      if (config_.vector_data_type != "auto" && config_.resolved_vector_dtype() != metadata.vector_dtype) {
+        lib_failure("configured vector-data-type=" + config_.vector_data_type +
+                    " does not match index metadata vector_data_type=" + vector_dtype_name(metadata.vector_dtype));
+      }
+      config_.vector_data_type = vector_dtype_name(metadata.vector_dtype);
+    }
+  }
+
   // Initialize GPU
   gpu::gpu_init(static_cast<int>(config_.gpu_device));
   service_profile_ = resolve_service_profile();
-  print_status("search mode: " + config_.search_mode +
-               ", cache=" + (config_.use_cache ? str{"on"} : str{"off"}));
+  print_status("search: exact, cache=" + (config_.use_cache ? str{"on"} : str{"off"}));
 
   // Construct Vamana index
   vamana_ = std::make_unique<vamana::Vamana<Distance>>(
     config_.R, config_.beam_width, config_.beam_width_construction,
-    config_.alpha, config_.k, config_.rabitq_bits, config_.dim, config_.use_cache, config_.use_rabitq_search());
+    config_.alpha, config_.k, config_.dim, config_.resolved_vector_dtype(),
+    config_.use_cache);
 
   const size_t estimated_index_size = config_.max_vectors * VamanaNode::total_size();
   const size_t cache_size = static_cast<f32>(estimated_index_size) / 100. * config_.cache_size_ratio;
@@ -55,41 +70,46 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                                               static_cast<u64>(config_.cn_memory_gb) * 1073741824ul);
   worker_pool_->allocate_worker_threads(context_, cm_, remote_access_tokens_, config_.num_coroutines);
   // Initialize GPU buffers for each compute thread
-  const u32 search_batch =
-      config_.use_rabitq_search() ? (config_.beam_width + kRabitqSearchBeamSlack) : config_.beam_width;
-  const u32 max_batch = std::max(search_batch, config_.beam_width_construction);
+  const u32 max_batch = std::max(config_.beam_width, config_.beam_width_construction);
   const u64 neighbor_cache_total_bytes = static_cast<u64>(config_.neighbor_cache_mb) * 1024ull * 1024ull;
-  const u64 gpu_rabitq_cache_total_bytes = static_cast<u64>(config_.gpu_rabitq_cache_mb) * 1024ull * 1024ull;
   if (service_profile_.query_workers > 0 && neighbor_cache_total_bytes > 0) {
     shared_neighbor_cache_.init(neighbor_cache_total_bytes);
     print_status("shared neighbor cache: slots=" + std::to_string(shared_neighbor_cache_.slot_count()));
   }
-  const u64 gpu_rabitq_cache_bytes_per_query_worker =
-    service_profile_.query_workers == 0 ? 0 : gpu_rabitq_cache_total_bytes / service_profile_.query_workers;
+  if (service_profile_.query_workers > 0 && config_.gpu_node_cache_mb > 0) {
+    if (config_.gpudirect_rdma) {
+      shared_gpu_node_cache_ = std::make_unique<gpu::GpuNodeCache>();
+      const size_t cache_bytes = static_cast<size_t>(config_.gpu_node_cache_mb) * 1024ull * 1024ull;
+      if (!shared_gpu_node_cache_->init(cache_bytes, VamanaNode::vector_bytes())) {
+        print_status("GPU node cache requested but initialization failed; disabling");
+        shared_gpu_node_cache_.reset();
+      }
+    } else {
+      print_status("GPU node cache requested but GPUDirect RDMA is disabled; disabling");
+    }
+  }
   for (u32 tid = 0; tid < compute_threads().size(); ++tid) {
     auto& thread = compute_threads()[tid];
     const bool query_worker = tid >= service_profile_.insert_workers;
     if (query_worker && shared_neighbor_cache_.enabled()) {
       thread->set_neighbor_cache(&shared_neighbor_cache_);
     }
+    if (query_worker && shared_gpu_node_cache_ && shared_gpu_node_cache_->enabled()) {
+      thread->set_gpu_node_cache(shared_gpu_node_cache_.get());
+    }
     thread->gpu_buffers.init(config_.num_coroutines,
                              config_.dim,
                              max_batch,
                              config_.R,
-                             config_.rabitq_bits,
+                             static_cast<size_t>(config_.dim) * sizeof(element_t),
+                             VamanaNode::vector_bytes(),
                              thread->ctx->context.get_protection_domain(),
-                             config_.gpudirect_rdma,
-                             query_worker && config_.use_rabitq_search() ? gpu_rabitq_cache_bytes_per_query_worker : 0);
+                             config_.gpudirect_rdma);
   }
   cm_.synchronize();
 
   wait_for_load_or_store();
   synchronize_clients_after_startup();
-  if (config_.load_index && config_.use_rabitq_search() && !rabitq_artifacts_ready_) {
-    str artifact_error;
-    lib_assert(maybe_load_rabitq_artifacts(config_.resolved_index_prefix(), &artifact_error), artifact_error);
-  }
-
   {
     std::lock_guard<std::mutex> lock(routing_mutex_);
     routing_centroids_.assign(cm_.num_total_clients, vec<element_t>{});
@@ -116,6 +136,7 @@ ComputeService<Distance>::~ComputeService() {
   for (auto& thread : compute_threads()) {
     thread->gpu_buffers.destroy();
   }
+  shared_gpu_node_cache_.reset();
   gpu::gpu_shutdown();
 }
 

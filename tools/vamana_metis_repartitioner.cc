@@ -14,6 +14,7 @@
 
 #include "common/index_path.hh"
 #include "common/types.hh"
+#include "common/vector_dtype.hh"
 #include "nlohmann/json.hh"
 #include "remote_pointer.hh"
 #include "tools/vamana_offline/partitioning.hh"
@@ -25,19 +26,14 @@ constexpr size_t kNodeHeaderBytes = 8;
 constexpr size_t kNodeMetaBytes = 8;
 constexpr size_t kNodeFixedPrefixBytes = kNodeHeaderBytes + kNodeMetaBytes;
 
-enum class NodeLayout {
-  legacy,
-  rabitq_search_block,
-};
-
 struct Options {
   filepath_t input_prefix;
   filepath_t output_prefix;
   u32 memory_nodes{};
   u32 dim{};
   u32 R{};
-  u32 rabitq_bits{};
-  std::string node_layout{"rabitq_search_block"};
+  VectorDType vector_dtype{VectorDType::float32};
+  bool vector_dtype_set{false};
   u32 partition_max_degree{16};
   double partition_imbalance{1.03};
   bool overwrite{false};
@@ -45,10 +41,8 @@ struct Options {
 
 struct NodeFormat {
   size_t vector_offset{};
-  size_t rabitq_offset{};
   size_t neighbors_offset{};
   size_t vector_bytes{};
-  size_t rabitq_bytes{};
   size_t neighbors_bytes{};
   size_t node_bytes{};
   size_t aligned_node_bytes{};
@@ -78,7 +72,8 @@ struct CrossShardStats {
   }
   std::cerr
     << "Usage: " << argv0 << " --input-prefix OLD_PREFIX --output-prefix NEW_PREFIX\n"
-    << "       [--memory-nodes N --dim D --R R --rabitq-bits B --node-layout LAYOUT]\n"
+    << "       [--memory-nodes N --dim D --R R]\n"
+    << "       [--vector-data-type auto|float32|uint8|int8]\n"
     << "       [--partition-max-degree 16 --partition-imbalance 1.03]\n"
     << "       [--overwrite]\n\n"
     << "Repartitions existing fixed-size Vamana shards with METIS and rewrites neighbor RemotePtr values.\n";
@@ -108,10 +103,14 @@ Options parse_options(int argc, char** argv) {
       options.dim = static_cast<u32>(std::stoul(require_value(i, argc, argv, arg)));
     } else if (arg == "--R") {
       options.R = static_cast<u32>(std::stoul(require_value(i, argc, argv, arg)));
-    } else if (arg == "--rabitq-bits") {
-      options.rabitq_bits = static_cast<u32>(std::stoul(require_value(i, argc, argv, arg)));
-    } else if (arg == "--node-layout") {
-      options.node_layout = require_value(i, argc, argv, arg);
+    } else if (arg == "--vector-data-type") {
+      const std::string value = require_value(i, argc, argv, arg);
+      if (value == "auto") {
+        options.vector_dtype_set = false;
+      } else {
+        options.vector_dtype = parse_vector_dtype(value);
+        options.vector_dtype_set = true;
+      }
     } else if (arg == "--partition-max-degree") {
       options.partition_max_degree = static_cast<u32>(std::stoul(require_value(i, argc, argv, arg)));
     } else if (arg == "--partition-imbalance") {
@@ -135,10 +134,6 @@ filepath_t metadata_path(const filepath_t& prefix) {
   return filepath_t(prefix.string() + ".meta.json");
 }
 
-filepath_t rotation_path(const filepath_t& prefix) {
-  return filepath_t(prefix.string() + ".rotation.bin");
-}
-
 nlohmann::json load_metadata(const filepath_t& prefix) {
   const filepath_t path = metadata_path(prefix);
   std::ifstream input(path);
@@ -160,43 +155,27 @@ void fill_from_metadata(Options& options, const nlohmann::json& metadata) {
   if (options.R == 0) {
     options.R = metadata.value("R", 0u);
   }
-  if (options.rabitq_bits == 0) {
-    options.rabitq_bits = metadata.value("rabitq_bits", 0u);
+  const VectorDType metadata_dtype = parse_vector_dtype(metadata.value("vector_data_type", std::string{"float32"}));
+  if (options.vector_dtype_set && options.vector_dtype != metadata_dtype) {
+    throw std::runtime_error("--vector-data-type does not match metadata vector_data_type");
   }
-  options.node_layout = metadata.value("node_layout", options.node_layout);
-}
-
-NodeLayout parse_layout(const std::string& name) {
-  if (name == "legacy") {
-    return NodeLayout::legacy;
+  if (!options.vector_dtype_set) {
+    options.vector_dtype = metadata_dtype;
   }
-  if (name == "rabitq_search_block") {
-    return NodeLayout::rabitq_search_block;
-  }
-  throw std::runtime_error("unknown node layout: " + name);
 }
 
 size_t align8(size_t value) {
   return (value + 7) & ~static_cast<size_t>(7);
 }
 
-NodeFormat make_format(NodeLayout layout, u32 dim, u32 R, u32 rabitq_bits) {
+NodeFormat make_format(u32 dim, u32 R, VectorDType vector_dtype) {
   NodeFormat format;
-  format.vector_bytes = static_cast<size_t>(dim) * sizeof(element_t);
-  format.rabitq_bytes = (static_cast<size_t>(rabitq_bits) * dim + 7) / 8 + 2 * sizeof(f32);
+  format.vector_bytes = vector_dtype_bytes(vector_dtype, dim);
   format.neighbors_bytes = static_cast<size_t>(R) * sizeof(u64);
-  format.node_bytes = kNodeFixedPrefixBytes + format.vector_bytes + format.rabitq_bytes + format.neighbors_bytes;
+  format.vector_offset = kNodeFixedPrefixBytes;
+  format.neighbors_offset = format.vector_offset + format.vector_bytes;
+  format.node_bytes = kNodeFixedPrefixBytes + format.vector_bytes + format.neighbors_bytes;
   format.aligned_node_bytes = align8(format.node_bytes);
-
-  if (layout == NodeLayout::rabitq_search_block) {
-    format.rabitq_offset = kNodeFixedPrefixBytes;
-    format.neighbors_offset = format.rabitq_offset + format.rabitq_bytes;
-    format.vector_offset = format.neighbors_offset + format.neighbors_bytes;
-  } else {
-    format.vector_offset = kNodeFixedPrefixBytes;
-    format.rabitq_offset = format.vector_offset + format.vector_bytes;
-    format.neighbors_offset = format.rabitq_offset + format.rabitq_bytes;
-  }
   return format;
 }
 
@@ -469,25 +448,6 @@ vec<u64> compute_shard_sizes(const vec<tools::vamana_offline::NodePlacement>& pl
   return shard_sizes;
 }
 
-void copy_rotation_file(const filepath_t& input_prefix, const filepath_t& output_prefix, bool overwrite) {
-  const filepath_t input = rotation_path(input_prefix);
-  if (!std::filesystem::exists(input)) {
-    std::cerr << "warning: rotation file not found: " << input << "\n";
-    return;
-  }
-  const filepath_t output = rotation_path(output_prefix);
-  if (std::filesystem::exists(output) && !overwrite) {
-    throw std::runtime_error("output rotation file exists, pass --overwrite: " + output.string());
-  }
-  if (!output.parent_path().empty()) {
-    std::filesystem::create_directories(output.parent_path());
-  }
-  std::filesystem::copy_file(input,
-                             output,
-                             overwrite ? std::filesystem::copy_options::overwrite_existing
-                                       : std::filesystem::copy_options::none);
-}
-
 void write_metadata(const Options& options,
                     nlohmann::json metadata,
                     const NodeFormat& format,
@@ -504,10 +464,12 @@ void write_metadata(const Options& options,
   metadata["num_memory_nodes"] = options.memory_nodes;
   metadata["dim"] = options.dim;
   metadata["R"] = options.R;
-  metadata["rabitq_bits"] = options.rabitq_bits;
+  metadata["schema_version"] = 3;
   metadata["node_size"] = format.node_bytes;
-  metadata["node_layout"] = options.node_layout;
-  metadata["rabitq_size"] = format.rabitq_bytes;
+  metadata["node_layout"] = "standard";
+  metadata["vector_data_type"] = vector_dtype_name(options.vector_dtype);
+  metadata["vector_component_size"] = vector_dtype_component_size(options.vector_dtype);
+  metadata["vector_bytes"] = format.vector_bytes;
   metadata["medoid"] = {{"memory_node", new_medoid.memory_node()}, {"offset", new_medoid.byte_offset()}};
   metadata["partition_strategy"] = "metis";
   metadata["partition_max_degree"] = options.partition_max_degree;
@@ -549,8 +511,8 @@ int main(int argc, char** argv) {
     const nlohmann::json metadata = load_metadata(options.input_prefix);
     fill_from_metadata(options, metadata);
 
-    if (options.memory_nodes == 0 || options.dim == 0 || options.R == 0 || options.rabitq_bits == 0) {
-      throw std::runtime_error("missing layout parameters; provide metadata or --memory-nodes/--dim/--R/--rabitq-bits");
+    if (options.memory_nodes == 0 || options.dim == 0 || options.R == 0) {
+      throw std::runtime_error("missing layout parameters; provide metadata or --memory-nodes/--dim/--R");
     }
     if (options.partition_max_degree == 0) {
       throw std::runtime_error("--partition-max-degree must be > 0");
@@ -562,14 +524,16 @@ int main(int argc, char** argv) {
       throw std::runtime_error(metis_unavailable_reason());
     }
 
-    const NodeFormat format = make_format(parse_layout(options.node_layout),
-                                          options.dim,
-                                          options.R,
-                                          options.rabitq_bits);
+    const NodeFormat format = make_format(options.dim, options.R, options.vector_dtype);
     const size_t metadata_node_size = metadata.value("node_size", format.node_bytes);
-    const size_t metadata_rabitq_size = metadata.value("rabitq_size", format.rabitq_bytes);
-    if (metadata_node_size != format.node_bytes || metadata_rabitq_size != format.rabitq_bytes) {
-      throw std::runtime_error("metadata node_size/rabitq_size does not match layout parameters");
+    const size_t metadata_vector_component_size =
+      metadata.value("vector_component_size", vector_dtype_component_size(options.vector_dtype));
+    const size_t metadata_vector_bytes = metadata.value("vector_bytes", format.vector_bytes);
+    if (metadata_node_size != format.node_bytes ||
+        metadata_vector_component_size != vector_dtype_component_size(options.vector_dtype) ||
+        metadata_vector_bytes != format.vector_bytes ||
+        metadata.value("node_layout", std::string{"standard"}) != "standard") {
+      throw std::runtime_error("metadata node/vector size does not match standard layout parameters");
     }
 
     ensure_output_paths_available(options);
@@ -577,8 +541,9 @@ int main(int argc, char** argv) {
               << "output prefix: " << options.output_prefix << "\n"
               << "memory nodes: " << options.memory_nodes << "\n"
               << "dim=" << options.dim << " R=" << options.R
-              << " rabitq_bits=" << options.rabitq_bits
-              << " node_layout=" << options.node_layout
+              << " node_layout=standard"
+              << " vector_data_type=" << vector_dtype_name(options.vector_dtype)
+              << " vector_bytes=" << format.vector_bytes
               << " node_size=" << format.node_bytes
               << " aligned_node_size=" << format.aligned_node_bytes << "\n"
               << "partition: metis max_degree=" << options.partition_max_degree
@@ -619,7 +584,6 @@ int main(int argc, char** argv) {
     std::cerr << "after cross-shard ratio: " << after_stats.ratio()
               << " (" << after_stats.cross_edges << "/" << after_stats.total_edges << ")\n";
 
-    copy_rotation_file(options.input_prefix, options.output_prefix, options.overwrite);
     write_metadata(options,
                    metadata,
                    format,

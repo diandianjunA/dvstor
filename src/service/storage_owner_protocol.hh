@@ -24,6 +24,8 @@ struct InsertBatchRequestHeader {
   u32 owner_storage{};
   u32 source_client{};
   u32 item_count{};
+  u32 vector_dtype{};
+  u32 vector_bytes{};
   u32 reserved{};
   u64 batch_id{};
 };
@@ -38,7 +40,6 @@ struct InsertBatchResponseHeader {
 
 struct InsertBreakdownCounters {
   u64 storage_owner_queue_wait_ns{};
-  u64 storage_owner_quantize_ns{};
   u64 storage_owner_medoid_ns{};
   u64 storage_owner_search_ns{};
   u64 storage_owner_prune_ns{};
@@ -61,7 +62,6 @@ struct InsertBreakdownCounters {
 
   u64 total() const {
     return storage_owner_queue_wait_ns +
-           storage_owner_quantize_ns +
            storage_owner_medoid_ns +
            storage_owner_search_ns +
            storage_owner_prune_ns +
@@ -89,9 +89,10 @@ struct ReverseUpdateOp {
 };
 
 inline size_t insert_batch_request_bytes(u32 item_count, u32 dim) {
+  (void)dim;
   return sizeof(InsertBatchRequestHeader) +
          static_cast<size_t>(item_count) * sizeof(node_t) +
-         static_cast<size_t>(item_count) * static_cast<size_t>(dim) * sizeof(element_t);
+         static_cast<size_t>(item_count) * VamanaNode::vector_bytes();
 }
 
 inline size_t insert_batch_response_bytes(u32 item_count) {
@@ -110,12 +111,20 @@ inline const node_t* request_ids(const void* payload) {
   return reinterpret_cast<const node_t*>(reinterpret_cast<const byte_t*>(payload) + sizeof(InsertBatchRequestHeader));
 }
 
-inline element_t* request_vectors(void* payload, u32 item_count) {
-  return reinterpret_cast<element_t*>(reinterpret_cast<byte_t*>(request_ids(payload) + item_count));
+inline byte_t* request_vectors(void* payload, u32 item_count) {
+  return reinterpret_cast<byte_t*>(request_ids(payload) + item_count);
 }
 
-inline const element_t* request_vectors(const void* payload, u32 item_count) {
-  return reinterpret_cast<const element_t*>(reinterpret_cast<const byte_t*>(request_ids(payload) + item_count));
+inline const byte_t* request_vectors(const void* payload, u32 item_count) {
+  return reinterpret_cast<const byte_t*>(request_ids(payload) + item_count);
+}
+
+inline byte_t* request_vector(void* payload, u32 item_count, u32 index) {
+  return request_vectors(payload, item_count) + static_cast<size_t>(index) * VamanaNode::vector_bytes();
+}
+
+inline const byte_t* request_vector(const void* payload, u32 item_count, u32 index) {
+  return request_vectors(payload, item_count) + static_cast<size_t>(index) * VamanaNode::vector_bytes();
 }
 
 inline u32* response_statuses(void* payload) {

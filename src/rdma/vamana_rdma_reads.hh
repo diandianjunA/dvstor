@@ -2,8 +2,6 @@
 
 /**
  * RDMA read operations for the Vamana index.
- * Follows the same patterns as rdma_reads.hh for HNSW but adapted
- * for the fixed-size VamanaNode layout.
  */
 
 #include <cstring>
@@ -62,21 +60,6 @@ inline void track_vector_rdma_read(const u_ptr<ComputeThread>& thread, size_t by
     }
 }
 
-inline void track_rabitq_rdma_read(const u_ptr<ComputeThread>& thread, size_t bytes, size_t ops = 1) {
-    track_total_rdma_read(thread, bytes, ops);
-    if (thread->is_query_worker()) {
-        thread->stats.query_rabitq_rdma_reads_in_bytes += bytes;
-        thread->stats.query_rabitq_rdma_read_ops += ops;
-    } else if (thread->is_insert_worker()) {
-        thread->stats.build_rabitq_rdma_reads_in_bytes += bytes;
-        thread->stats.build_rabitq_rdma_read_ops += ops;
-    }
-}
-
-/**
- * Read a complete VamanaNode from remote memory.
- * Reads header + id + edge_count + pad + vector (not rabitq or neighbors).
- */
 inline auto read_vamana_node(RemotePtr rptr, const u_ptr<ComputeThread>& thread) {
     const size_t read_size = VamanaNode::size_until_vector_end();
     byte_t* node_ptr = thread->buffer_allocator.allocate_buffer(read_size);
@@ -112,9 +95,6 @@ inline auto read_vamana_node(RemotePtr rptr, const u_ptr<ComputeThread>& thread)
     return awaitable{rptr, node_ptr, read_size, thread};
 }
 
-/**
- * Read the full VamanaNode including rabitq data and neighbor list.
- */
 inline auto read_vamana_node_full(RemotePtr rptr, const u_ptr<ComputeThread>& thread) {
     const size_t read_size = VamanaNode::total_size();
     byte_t* node_ptr = thread->buffer_allocator.allocate_vamana_node(thread->get_id());
@@ -150,14 +130,41 @@ inline auto read_vamana_node_full(RemotePtr rptr, const u_ptr<ComputeThread>& th
     return awaitable{rptr, node_ptr, read_size, thread};
 }
 
-/**
- * Read the neighbor list portion of a VamanaNode.
- * Reads only the fields actually needed by the search/insert path:
- *   - edge_count (1B)
- *   - neighbor slots (R * RemotePtr)
- * The vector and RaBitQ payload that sit between them in remote layout are
- * intentionally skipped.
- */
+
+inline auto read_vamana_id(RemotePtr rptr, const u_ptr<ComputeThread>& thread) {
+    node_t* id_ptr = reinterpret_cast<node_t*>(thread->buffer_allocator.allocate_buffer(sizeof(node_t)));
+
+    track_total_rdma_read(thread, sizeof(node_t));
+    thread->track_post();
+
+    const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
+    qp->post_send(reinterpret_cast<u64>(id_ptr),
+                  sizeof(node_t),
+                  thread->ctx->get_lkey(),
+                  IBV_WR_RDMA_READ,
+                  true,
+                  false,
+                  thread->ctx->get_remote_mrt(rptr.memory_node()),
+                  rptr.byte_offset() + VamanaNode::offset_id(),
+                  0,
+                  thread->create_wr_id());
+
+    struct awaitable {
+        node_t* id_ptr;
+        const u_ptr<ComputeThread>& thread;
+
+        static bool await_ready() { return false; }
+        static void await_suspend(std::coroutine_handle<>) {}
+        node_t await_resume() {
+            const node_t id = *id_ptr;
+            thread->buffer_allocator.free_buffer(reinterpret_cast<byte_t*>(id_ptr), sizeof(node_t));
+            return id;
+        }
+    };
+
+    return awaitable{id_ptr, thread};
+}
+
 inline auto read_vamana_neighbors(RemotePtr node_rptr, const u_ptr<ComputeThread>& thread) {
     const size_t read_size = sizeof(u8) + VamanaNode::NEIGHBORS_SIZE;
     byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(read_size);
@@ -203,130 +210,12 @@ inline auto read_vamana_neighbors(RemotePtr node_rptr, const u_ptr<ComputeThread
     return awaitable{local_buffer, read_size, thread};
 }
 
-/**
- * Read just the RaBitQ data portion of a VamanaNode.
- * Returns raw bytes: packed_bits + add(4B) + rescale(4B).
- */
-inline auto read_rabitq_vector(RemotePtr node_rptr, const u_ptr<ComputeThread>& thread) {
-    const size_t rabitq_size = VamanaNode::RABITQ_SIZE;
-    byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(rabitq_size);
-
-    track_rabitq_rdma_read(thread, rabitq_size);
-    thread->track_post();
-
-    const QP& qp = thread->ctx->qps[node_rptr.memory_node()]->qp;
-    qp->post_send(reinterpret_cast<u64>(local_buffer),
-                  rabitq_size,
-                  thread->ctx->get_lkey(),
-                  IBV_WR_RDMA_READ,
-                  true,
-                  false,
-                  thread->ctx->get_remote_mrt(node_rptr.memory_node()),
-                  node_rptr.byte_offset() + VamanaNode::offset_rabitq(),
-                  0,
-                  thread->create_wr_id());
-
-    struct awaitable {
-        byte_t* local_buffer;
-        size_t rabitq_size;
-        const u_ptr<ComputeThread>& thread;
-
-        static bool await_ready() { return false; }
-        static void await_suspend(std::coroutine_handle<>) {}
-        std::pair<byte_t*, size_t> await_resume() {
-            return {local_buffer, rabitq_size};
-        }
-    };
-
-    return awaitable{local_buffer, rabitq_size, thread};
-}
-
-struct RabitqBatchReadResult {
-    vec<byte_t*> host_buffers;
-    bool direct_to_gpu{false};
-};
-
-/**
- * Batch read RaBitQ vectors for multiple nodes.
- * Posts multiple RDMA reads, one co_await for all.
- * Returns host buffers unless a GPU buffer + lkey is provided.
- */
-inline auto batch_read_rabitq(const vec<RemotePtr>& node_rptrs,
-                              const u_ptr<ComputeThread>& thread,
-                              const vec<BatchReadDestination>* destinations = nullptr,
-                              void* gpu_buffer = nullptr,
-                              u32 gpu_lkey = 0) {
-    const size_t rabitq_size = VamanaNode::RABITQ_SIZE;
-    const bool using_destinations = destinations != nullptr && !destinations->empty();
-    const bool direct_to_gpu = using_destinations || (gpu_buffer != nullptr && gpu_lkey != 0);
-    vec<byte_t*> host_buffers;
-    host_buffers.reserve(node_rptrs.size());
-
-    for (size_t i = 0; i < node_rptrs.size(); ++i) {
-        const auto& rptr = node_rptrs[i];
-        u64 local_addr;
-        u32 lkey;
-        if (using_destinations) {
-            const auto& dst = (*destinations)[i];
-            local_addr = dst.local_addr;
-            lkey = dst.gpu_destination ? dst.lkey : thread->ctx->get_lkey();
-            if (dst.host_buffer) {
-                host_buffers.push_back(dst.host_buffer);
-            }
-        } else if (direct_to_gpu) {
-            local_addr = reinterpret_cast<u64>(gpu_buffer) + i * rabitq_size;
-            lkey = gpu_lkey;
-        } else {
-            byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(rabitq_size);
-            host_buffers.push_back(local_buffer);
-            local_addr = reinterpret_cast<u64>(local_buffer);
-            lkey = thread->ctx->get_lkey();
-        }
-
-        track_rabitq_rdma_read(thread, rabitq_size);
-        thread->track_post();
-
-        const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
-        qp->post_send(local_addr,
-                      rabitq_size,
-                      lkey,
-                      IBV_WR_RDMA_READ,
-                      true,
-                      false,
-                      thread->ctx->get_remote_mrt(rptr.memory_node()),
-                      rptr.byte_offset() + VamanaNode::offset_rabitq(),
-                      0,
-                      thread->create_wr_id());
-    }
-
-    struct awaitable {
-        RabitqBatchReadResult result;
-
-        static bool await_ready() { return false; }
-        static void await_suspend(std::coroutine_handle<>) {}
-        RabitqBatchReadResult await_resume() { return std::move(result); }
-    };
-
-    return awaitable{RabitqBatchReadResult{std::move(host_buffers), direct_to_gpu}};
-}
-
-inline auto batch_read_rabitq(const vec<RemotePtr>& node_rptrs,
-                              const u_ptr<ComputeThread>& thread,
-                              void* gpu_buffer,
-                              u32 gpu_lkey) {
-    return batch_read_rabitq(node_rptrs, thread, nullptr, gpu_buffer, gpu_lkey);
-}
-
-/**
- * Batch read full vectors (float components) for multiple nodes.
- * Used during insert for RobustPrune which needs full-precision vectors.
- */
 inline auto batch_read_vectors(const vec<RemotePtr>& node_rptrs,
                                const u_ptr<ComputeThread>& thread,
                                const vec<BatchReadDestination>* destinations = nullptr,
-                               float* gpu_buffer = nullptr,
+                               void* gpu_buffer = nullptr,
                                u32 gpu_lkey = 0) {
-    const size_t vec_size = VamanaNode::DIM * sizeof(element_t);
+    const size_t vec_size = VamanaNode::vector_bytes();
     const bool using_destinations = destinations != nullptr && !destinations->empty();
     const bool direct_to_gpu = using_destinations || (gpu_buffer != nullptr && gpu_lkey != 0);
     vec<byte_t*> host_buffers;
@@ -382,14 +271,11 @@ inline auto batch_read_vectors(const vec<RemotePtr>& node_rptrs,
 
 inline auto batch_read_vectors(const vec<RemotePtr>& node_rptrs,
                                const u_ptr<ComputeThread>& thread,
-                               float* gpu_buffer,
+                               void* gpu_buffer,
                                u32 gpu_lkey) {
     return batch_read_vectors(node_rptrs, thread, nullptr, gpu_buffer, gpu_lkey);
 }
 
-/**
- * Read multiple full VamanaNodes in batch.
- */
 inline auto read_vamana_nodes(const span<RemotePtr> remote_ptrs, const u_ptr<ComputeThread>& thread) {
     vec<s_ptr<VamanaNode>> nodes;
     nodes.reserve(remote_ptrs.size());
@@ -427,9 +313,6 @@ inline auto read_vamana_nodes(const span<RemotePtr> remote_ptrs, const u_ptr<Com
     return awaitable{std::move(nodes)};
 }
 
-/**
- * Read the medoid pointer from memory node 0 (stored at offset 8, same as entry_point).
- */
 inline auto read_medoid_ptr(const u_ptr<ComputeThread>& thread) {
     track_total_rdma_read(thread, sizeof(u64));
     thread->track_post();
@@ -442,7 +325,7 @@ inline auto read_medoid_ptr(const u_ptr<ComputeThread>& thread) {
                   true,
                   false,
                   thread->ctx->get_remote_mrt(0),
-                  8,  // medoid_ptr at offset 8 (after free_ptr)
+                  8,
                   0,
                   thread->create_wr_id());
 

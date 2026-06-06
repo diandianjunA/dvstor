@@ -14,15 +14,12 @@ struct ThreadCounterDelta {
   u64 rdma_write_ops{};
   u64 neighbor_rdma_bytes{};
   u64 vector_rdma_bytes{};
-  u64 rabitq_rdma_bytes{};
   u64 neighbor_rdma_read_ops{};
   u64 vector_rdma_read_ops{};
-  u64 rabitq_rdma_read_ops{};
   u64 h2d_bytes{};
   u64 d2h_bytes{};
   u64 l2_kernels{};
   u64 prune_kernels{};
-  u64 rabitq_kernels{};
   u64 exact_reranks{};
   u64 visited_nodes{};
   u64 visited_neighborlists{};
@@ -41,16 +38,11 @@ struct ThreadCounterDelta {
   u64 query_host_staging_fallback_bytes{};
   u64 neighbor_cache_hits{};
   u64 neighbor_cache_misses{};
-  u64 gpu_rabitq_cache_hits{};
-  u64 gpu_rabitq_cache_misses{};
-  u64 gpu_rabitq_cache_fills{};
-  u64 gpu_rabitq_cache_fill_bytes{};
-  u64 gpu_rabitq_cache_gather_batches{};
-  u64 gpu_rabitq_cache_gather_bytes{};
-  u64 gpu_rabitq_cache_loading_fallbacks{};
-  u64 gpu_rabitq_cache_evictions{};
-  u64 gpu_rabitq_cache_duplicate_fills{};
-  u64 gpu_rabitq_cache_fallback_batches{};
+  u64 gpu_node_cache_hits{};
+  u64 gpu_node_cache_misses{};
+  u64 gpu_node_cache_admissions{};
+  u64 gpu_node_cache_evictions{};
+  u64 gpu_node_cache_fill_skips{};
 };
 
 
@@ -66,13 +58,10 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
     out.rdma_write_ops = end.query_rdma_write_ops - start.query_rdma_write_ops;
     out.neighbor_rdma_bytes = end.query_neighbor_rdma_reads_in_bytes - start.query_neighbor_rdma_reads_in_bytes;
     out.vector_rdma_bytes = end.query_vector_rdma_reads_in_bytes - start.query_vector_rdma_reads_in_bytes;
-    out.rabitq_rdma_bytes = end.query_rabitq_rdma_reads_in_bytes - start.query_rabitq_rdma_reads_in_bytes;
     out.neighbor_rdma_read_ops = end.query_neighbor_rdma_read_ops - start.query_neighbor_rdma_read_ops;
     out.vector_rdma_read_ops = end.query_vector_rdma_read_ops - start.query_vector_rdma_read_ops;
-    out.rabitq_rdma_read_ops = end.query_rabitq_rdma_read_ops - start.query_rabitq_rdma_read_ops;
     out.h2d_bytes = end.query_h2d_bytes - start.query_h2d_bytes;
     out.d2h_bytes = end.query_d2h_bytes - start.query_d2h_bytes;
-    out.rabitq_kernels = end.query_rabitq_kernels - start.query_rabitq_kernels;
     out.exact_reranks = end.query_exact_reranks - start.query_exact_reranks;
     out.visited_nodes =
       (end.visited_nodes - start.visited_nodes) + (end.visited_nodes_l0 - start.visited_nodes_l0);
@@ -83,22 +72,11 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
     out.query_host_staging_fallback_bytes = end.query_host_staging_fallback_bytes - start.query_host_staging_fallback_bytes;
     out.neighbor_cache_hits = end.neighbor_cache_hits - start.neighbor_cache_hits;
     out.neighbor_cache_misses = end.neighbor_cache_misses - start.neighbor_cache_misses;
-    out.gpu_rabitq_cache_hits = end.gpu_rabitq_cache_hits - start.gpu_rabitq_cache_hits;
-    out.gpu_rabitq_cache_misses = end.gpu_rabitq_cache_misses - start.gpu_rabitq_cache_misses;
-    out.gpu_rabitq_cache_fills = end.gpu_rabitq_cache_fills - start.gpu_rabitq_cache_fills;
-    out.gpu_rabitq_cache_fill_bytes = end.gpu_rabitq_cache_fill_bytes - start.gpu_rabitq_cache_fill_bytes;
-    out.gpu_rabitq_cache_gather_batches =
-      end.gpu_rabitq_cache_gather_batches - start.gpu_rabitq_cache_gather_batches;
-    out.gpu_rabitq_cache_gather_bytes =
-      end.gpu_rabitq_cache_gather_bytes - start.gpu_rabitq_cache_gather_bytes;
-    out.gpu_rabitq_cache_loading_fallbacks =
-      end.gpu_rabitq_cache_loading_fallbacks - start.gpu_rabitq_cache_loading_fallbacks;
-    out.gpu_rabitq_cache_evictions =
-      end.gpu_rabitq_cache_evictions - start.gpu_rabitq_cache_evictions;
-    out.gpu_rabitq_cache_duplicate_fills =
-      end.gpu_rabitq_cache_duplicate_fills - start.gpu_rabitq_cache_duplicate_fills;
-    out.gpu_rabitq_cache_fallback_batches =
-      end.gpu_rabitq_cache_fallback_batches - start.gpu_rabitq_cache_fallback_batches;
+    out.gpu_node_cache_hits = end.gpu_node_cache_hits - start.gpu_node_cache_hits;
+    out.gpu_node_cache_misses = end.gpu_node_cache_misses - start.gpu_node_cache_misses;
+    out.gpu_node_cache_admissions = end.gpu_node_cache_admissions - start.gpu_node_cache_admissions;
+    out.gpu_node_cache_evictions = end.gpu_node_cache_evictions - start.gpu_node_cache_evictions;
+    out.gpu_node_cache_fill_skips = end.gpu_node_cache_fill_skips - start.gpu_node_cache_fill_skips;
     return out;
   }
 
@@ -108,10 +86,8 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
   out.rdma_write_ops = end.build_rdma_write_ops - start.build_rdma_write_ops;
   out.neighbor_rdma_bytes = end.build_neighbor_rdma_reads_in_bytes - start.build_neighbor_rdma_reads_in_bytes;
   out.vector_rdma_bytes = end.build_vector_rdma_reads_in_bytes - start.build_vector_rdma_reads_in_bytes;
-  out.rabitq_rdma_bytes = end.build_rabitq_rdma_reads_in_bytes - start.build_rabitq_rdma_reads_in_bytes;
   out.neighbor_rdma_read_ops = end.build_neighbor_rdma_read_ops - start.build_neighbor_rdma_read_ops;
   out.vector_rdma_read_ops = end.build_vector_rdma_read_ops - start.build_vector_rdma_read_ops;
-  out.rabitq_rdma_read_ops = end.build_rabitq_rdma_read_ops - start.build_rabitq_rdma_read_ops;
   out.h2d_bytes = end.build_h2d_bytes - start.build_h2d_bytes;
   out.d2h_bytes = end.build_d2h_bytes - start.build_d2h_bytes;
   out.l2_kernels = end.build_l2_kernels - start.build_l2_kernels;

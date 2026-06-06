@@ -1,55 +1,74 @@
-# SIFT100M DVSTOR Test
+# SIFT100M Evaluation Scripts
 
-This directory contains a 5-storage-node SIFT100M setup.
+This directory contains a self-contained SIFT100M test harness using the SIFT1B source files under `/data/xjs/datasets/sift1b`, limited to the first 100M base vectors and `gnd/idx_100M.ivecs`.
+It uses the exact-only, dtype-aware index layout: SIFT base/query vectors are converted to `.u8bin`, and recall uses raw `uint8` query input through `search_raw()`.
 
-## Build BFS-sharded index
+## Files
 
-```bash
-./evaluation/sift100m/build_bfs_index.sh
-```
+- `convert_sift100m.py`: converts `bigann_base.bvecs`, `bigann_query.bvecs`, and `gnd/idx_100M.ivecs` to dvstor `.u8bin` / `.bin`.
+- `build_sift100m_index.sh`: builds a 5-shard index. Default partition strategy is `bfs`; set `PARTITION_STRATEGY=metis` or `balanced` to change it.
+- `start_memory_node_1.sh` ... `start_memory_node_5.sh`: per-node launchers.
+- `start_all_memory_nodes.sh`: starts all five memory nodes for a profile.
+- `stop_memory_nodes.sh`: stops locally started memory nodes.
+- `configs/*.ini`: compute-side benchmark configs for baseline and optimization profiles.
+- `run_breakdown.sh`: mixed/query/insert breakdown benchmark driver.
+- `run_recall.sh`: recall-only driver using the benchmark tool's recall phase.
 
-Defaults:
-
-- data: `/data/xjs/datasets/sift100m/learn.100M.u8bin`
-- query: `/data/xjs/datasets/sift100m/query.public.10K.u8bin`
-- output prefix: `/data/xjs/index/dvstor/sift100m/sift100m`
-- shards: 5
-- partition strategy: `bfs`
-- graph quality defaults: `R=48`, `BEAM_WIDTH=320`
-- build threads: `32` by default; override with `BUILD_THREADS=<n>` after calibrating throughput
-- offline reverse updates: `OFFLINE_REVERSE_MODE=immediate` by default
-- post-build brute-force sanity check: skipped by default with `SKIP_SANITY_CHECK=true`
-- offline build GPU: `BUILD_USE_GPU=false` by default because the current builder uses small synchronized GPU batches
-- memory: `MN_MEMORY=32` GB per storage node and `CN_MEMORY=24` GB on the compute node by default
-- caches: `NEIGHBOR_CACHE_MB=2048`, `GPU_RABITQ_CACHE_MB=8192`, `STORAGE_OWNER_CACHE_MB=1024`
-- neighbor cache invalidation: `NEIGHBOR_CACHE_INVALIDATION_MS=100`, `NEIGHBOR_CACHE_INVALIDATION_INSERTS=1024`
-
-## Start storage nodes
+## Default Flow
 
 ```bash
-./evaluation/sift100m/start_all_memory_nodes.sh start
-./evaluation/sift100m/start_all_memory_nodes.sh status
-./evaluation/sift100m/start_all_memory_nodes.sh stop
+./evaluation/sift100m/build_sift100m_index.sh
+./evaluation/sift100m/start_all_memory_nodes.sh baseline
+./evaluation/sift100m/run_recall.sh baseline
+./evaluation/sift100m/run_breakdown.sh baseline
+./evaluation/sift100m/stop_memory_nodes.sh
 ```
 
-Use `HOST=<ip>` when the compute node should connect through a non-local address.
-
-## Run mixed read/write benchmark
+Optimization profiles:
 
 ```bash
-./evaluation/sift100m/run_mixed_benchmark.sh
+./evaluation/sift100m/start_all_memory_nodes.sh gpudirect_rdma
+./evaluation/sift100m/run_breakdown.sh gpudirect_rdma
+
+./evaluation/sift100m/start_all_memory_nodes.sh gpudirect_rdma_gpu_cache
+./evaluation/sift100m/run_breakdown.sh gpudirect_rdma_gpu_cache
+
+./evaluation/sift100m/start_all_memory_nodes.sh gpudirect_rdma_gpu_cache_storage_owner
+./evaluation/sift100m/run_breakdown.sh gpudirect_rdma_gpu_cache_storage_owner
 ```
 
-Defaults are `READ_RATIO=0.5`, `MIXED_MODE=probability`, `CLIENT_THREADS=16`, warmup `30s`, measure `120s`.
+`gpudirect_rdma_gpu_cache` enables the GPU-resident node vector cache with `gpu-node-cache-mb` and keeps the CPU neighbor-list cache enabled with `neighbor-cache-mb`; it requires `gpudirect-rdma=true`.
 
-`MIXED_MODE=probability` samples `READ_RATIO` for every operation in every client thread. `MIXED_MODE=fixed_threads` splits client threads by `READ_RATIO`; for example `READ_RATIO=0.75 CLIENT_THREADS=16` assigns 12 query threads and 4 insert threads.
-
-Mixed inserts currently use deterministic synthetic vectors derived from the insert id, not vectors read from SIFT100M. Queries use `QUERY_FILE`, which defaults to `/data/xjs/datasets/sift100m/query.public.10K.u8bin`.
-
-Enable a before-performance recall check with:
+## Common Overrides
 
 ```bash
-ENABLE_RECALL=true RECALL_QUERIES=1000 ./evaluation/sift100m/run_mixed_benchmark.sh
+HOSTS="mn1 mn2 mn3 mn4 mn5" BASE_PORT=1234 IB_DEVICE=mlx5_0 ./evaluation/sift100m/start_all_memory_nodes.sh baseline
+HOSTS="mn1 mn2 mn3 mn4 mn5" ./evaluation/sift100m/run_breakdown.sh baseline
+MAX_VECTORS=100000000 MAX_QUERIES=10000 GROUNDTRUTH_LABEL=100M ./evaluation/sift100m/build_sift100m_index.sh
+PARTITION_STRATEGY=metis ./evaluation/sift100m/build_sift100m_index.sh
+WORKLOAD=query WARMUP_SECONDS=10 MEASURE_SECONDS=60 ./evaluation/sift100m/run_breakdown.sh gpudirect_rdma
 ```
 
-The recall check runs before warmup/measure, uses `GROUNDTRUTH_FILE` from `sift100m_common.sh`, and reports `recall@K` in the JSON report and terminal summary. Set `MIN_RECALL=<value>` to fail the run when recall is below a threshold.
+When `MAX_VECTORS` is not the 100M, use the matching SIFT ground truth label, for example `GROUNDTRUTH_LABEL=100M` for `MAX_VECTORS=100000000`.
+
+
+## Build Performance Notes
+
+The default SIFT100M build uses the new raw-dtype offline GPU path with `GPU_MEMORY_GB=18`. For SIFT100M `uint8`, the builder keeps the raw base vectors resident on one GPU and sends candidate IDs to distance kernels, avoiding full float expansion and per-batch float candidate staging. Set `NO_GPU=1` to force the CPU typed path.
+
+The old deferred reverse-update mode has been removed. Reverse edges are maintained with bounded immediate updates, so the builder no longer allocates the former `MAX_VECTORS * R * 4` deferred edge buffer. For quick pipeline tests, use `MAX_VECTORS=1000000 GROUNDTRUTH_LABEL=1M`; full SIFT100M exact Vamana construction is still a long offline job.
+
+## Memory Defaults
+
+The scripts now estimate memory-node memory from the index shape:
+
+```text
+node_bytes ~= 16 + dim * component_size + R * 8
+mn_memory ~= ceil(MAX_VECTORS / SHARDS * node_bytes * 1.2) + 4GB
+```
+
+For full SIFT100M with `dim=128`, `R=64`, `uint8`, and 5 shards, this is about 152GB per memory node, not 200GB. Override with `MN_MEMORY_GB=...` if your partition or insert workload needs more slack.
+
+Compute-node memory defaults to 16GB. GPU node cache memory is allocated from GPU memory through `GPU_NODE_CACHE_MB`; common default is 0 and GPU-cache profiles set 2048MB.
+
+Ground truth conversion defaults to top-10, which is enough for recall@10 and avoids carrying the full top-1000 unless explicitly requested. Set `GROUNDTRUTH_TOPK=100` or `GROUNDTRUTH_TOPK=1000` if you need broader recall metrics. Recall scripts default to 1000 query vectors for quick testing; set `RECALL_QUERIES=10000` for the standard full query set.

@@ -17,12 +17,13 @@
 #include "cache/neighbor_cache.hh"
 #include "common/configuration.hh"
 #include "common/core_assignment.hh"
+#include "gpu/gpu_node_cache.hh"
 #include "http/vamana_service_scheduler.hh"
 #include "memory_node/command_protocol.hh"
 #include "service/breakdown.hh"
 #include "service/compute_service/state.hh"
 #include "service/storage_owner_protocol.hh"
-#include "service/rabitq_artifacts.hh"
+#include "service/index_metadata.hh"
 #include "vamana/vamana.hh"
 #include "worker_pool.hh"
 
@@ -99,6 +100,7 @@ public:
 
   size_t insert(const vec<InsertItem>& batch);
   vec<node_t> search(const vec<element_t>& query, u32 k);
+  vec<node_t> search_raw(VectorDType query_dtype, const byte_t* query_data, u32 dim, u32 k);
   bool load_index(const std::string& path, str* error_message = nullptr);
   bool store_index(const std::string& path, str* error_message = nullptr);
   Status status() const;
@@ -163,8 +165,7 @@ private:
   void receive_remote_access_tokens();
   void wait_for_load_or_store();
   ServiceProfile resolve_service_profile() const;
-  bool maybe_load_rabitq_artifacts(const filepath_t& index_prefix, str* error_message = nullptr);
-  void upload_rabitq_artifacts(const service::rabitq::Artifacts& artifacts);
+  bool validate_index_metadata(const filepath_t& index_prefix, str* error_message = nullptr);
   void synchronize_clients_after_startup();
   vec<CommandResult> send_index_command(mn_command::Command cmd, const std::string& path);
   void start_workers();
@@ -172,7 +173,9 @@ private:
   void pause_workers();
   void resume_workers();
   LocalMainSearchOutput search_local_result(const vec<element_t>& query, u32 k);
+  LocalMainSearchOutput search_local_raw_result(VectorDType query_dtype, const byte_t* query_data, u32 k);
   vec<node_t> search_local(const vec<element_t>& query, u32 k);
+  vec<node_t> search_local_raw(VectorDType query_dtype, const byte_t* query_data, u32 k);
   void start_storage_insert_runtime();
   void stop_storage_insert_runtime();
   void run_storage_insert_sender(u32 owner_storage);
@@ -226,6 +229,7 @@ private:
   std::atomic<bool> shutdown_{false};
   std::atomic<size_t> vectors_inserted_{0};
   cache::NeighborCache shared_neighbor_cache_;
+  std::unique_ptr<gpu::GpuNodeCache> shared_gpu_node_cache_;
 
   std::mutex mn_command_mutex_;
   std::atomic<bool> workers_paused_{false};
@@ -238,7 +242,6 @@ private:
   std::unique_ptr<vamana::Vamana<Distance>> vamana_;
   std::unique_ptr<WorkerPool> worker_pool_;
   ServiceProfile service_profile_{};
-  bool rabitq_artifacts_ready_{false};
   service::InsertQueue insert_queue_;
   service::QueryQueue query_queue_;
   vec<std::thread> workers_;

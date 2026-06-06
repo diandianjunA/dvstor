@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <stdexcept>
 
 #include <library/utils.hh>
 
@@ -32,6 +34,98 @@ struct PlacementResult {
   double cross_shard_ratio{0.0};
 };
 
+size_t graph_input_edges(const VamanaGraph& graph) {
+  size_t total = 0;
+  for (size_t i = 0; i < graph.num_nodes; ++i) total += graph.degree(i);
+  return total;
+}
+
+vec<u32> compute_bfs_partition_graph(const VamanaGraph& graph,
+                                     u32 num_parts,
+                                     u32 start_node,
+                                     PartitionStats* stats) {
+  if (num_parts == 0) {
+    throw std::runtime_error("BFS partition part count must be > 0");
+  }
+  const size_t num_nodes = graph.num_nodes;
+  vec<u32> parts(num_nodes, 0);
+  if (stats != nullptr) {
+    stats->input_edges = graph_input_edges(graph);
+    stats->unique_edges = stats->input_edges;
+    stats->edge_cut = 0;
+    stats->partition_cross_shard_ratio = 0.0;
+    stats->part_node_counts.assign(num_parts, 0);
+  }
+  if (num_nodes == 0) return parts;
+
+  vec<byte_t> visited(num_nodes, 0);
+  vec<u32> bfs_order;
+  bfs_order.reserve(num_nodes);
+  std::deque<u32> queue;
+  vec<u32> nbrs;
+
+  const auto push_component = [&](u32 seed) {
+    if (seed >= num_nodes || visited[seed]) return;
+    visited[seed] = 1;
+    queue.push_back(seed);
+    while (!queue.empty()) {
+      const u32 node = queue.front();
+      queue.pop_front();
+      bfs_order.push_back(node);
+      graph.copy_neighbors(node, nbrs);
+      for (u32 neighbor : nbrs) {
+        if (neighbor < num_nodes && !visited[neighbor]) {
+          visited[neighbor] = 1;
+          queue.push_back(neighbor);
+        }
+      }
+    }
+  };
+
+  push_component(start_node);
+  for (u32 node = 0; node < num_nodes; ++node) push_component(node);
+
+  for (size_t order_idx = 0; order_idx < bfs_order.size(); ++order_idx) {
+    u32 part = static_cast<u32>((order_idx * static_cast<size_t>(num_parts)) / num_nodes);
+    if (part >= num_parts) part = num_parts - 1;
+    parts[bfs_order[order_idx]] = part;
+    if (stats != nullptr) ++stats->part_node_counts[part];
+  }
+
+  if (stats != nullptr) {
+    size_t total_edges = 0;
+    size_t cut_edges = 0;
+    for (size_t node = 0; node < num_nodes; ++node) {
+      graph.copy_neighbors(node, nbrs);
+      for (u32 neighbor : nbrs) {
+        if (neighbor >= num_nodes) continue;
+        ++total_edges;
+        if (parts[node] != parts[neighbor]) ++cut_edges;
+      }
+    }
+    stats->edge_cut = cut_edges;
+    stats->partition_cross_shard_ratio =
+      total_edges == 0 ? 0.0 : static_cast<double>(cut_edges) / static_cast<double>(total_edges);
+  }
+  return parts;
+}
+
+double compute_cross_shard_ratio_graph(const VamanaGraph& graph, const vec<NodePlacement>& placements) {
+  size_t total_edges = 0;
+  size_t cross_edges = 0;
+  vec<u32> nbrs;
+  for (size_t i = 0; i < graph.num_nodes; ++i) {
+    const u32 source_shard = placements[i].memory_node;
+    graph.copy_neighbors(i, nbrs);
+    for (u32 neighbor : nbrs) {
+      if (neighbor >= placements.size()) continue;
+      ++total_edges;
+      if (placements[neighbor].memory_node != source_shard) ++cross_edges;
+    }
+  }
+  return total_edges == 0 ? 0.0 : static_cast<double>(cross_edges) / static_cast<double>(total_edges);
+}
+
 PlacementResult place_nodes(const VamanaGraph& graph,
                             const VamanaBuildConfig& config,
                             size_t aligned_size) {
@@ -42,8 +136,10 @@ PlacementResult place_nodes(const VamanaGraph& graph,
       std::min<size_t>(graph.num_nodes * static_cast<size_t>(config.partition_max_degree),
                        static_cast<size_t>(std::numeric_limits<u32>::max()));
     edges.reserve(reserve_edges);
-    for (size_t i = 0; i < graph.neighbors.size(); ++i) {
-      append_partition_edges(static_cast<u32>(i), graph.neighbors[i], config.partition_max_degree, edges);
+    vec<u32> nbrs;
+    for (size_t i = 0; i < graph.num_nodes; ++i) {
+      graph.copy_neighbors(i, nbrs);
+      append_partition_edges(static_cast<u32>(i), nbrs, config.partition_max_degree, edges);
     }
     PartitionOptions options;
     options.num_parts = config.num_memory_nodes;
@@ -52,17 +148,15 @@ PlacementResult place_nodes(const VamanaGraph& graph,
     vec<u32> parts = compute_metis_partition(graph.num_nodes, edges, options, &result.stats);
     result.placements = assign_nodes_to_shards_from_partition(parts, config.num_memory_nodes, aligned_size);
   } else if (config.partition_strategy == "bfs") {
-    const u32 start_node = graph.medoid < graph.num_nodes ? graph.medoid : 0;
-    vec<u32> parts = compute_bfs_partition(graph.neighbors, config.num_memory_nodes, start_node, &result.stats);
+    const u32 start_node = graph.medoid < graph.num_nodes ? static_cast<u32>(graph.medoid) : 0;
+    vec<u32> parts = compute_bfs_partition_graph(graph, config.num_memory_nodes, start_node, &result.stats);
     result.placements = assign_nodes_to_shards_from_partition(parts, config.num_memory_nodes, aligned_size);
   } else {
     result.placements = assign_nodes_to_shards_balanced(graph.num_nodes, config.num_memory_nodes, aligned_size);
     result.stats.part_node_counts.assign(config.num_memory_nodes, 0);
-    for (const auto& placement : result.placements) {
-      ++result.stats.part_node_counts[placement.memory_node];
-    }
+    for (const auto& placement : result.placements) ++result.stats.part_node_counts[placement.memory_node];
   }
-  result.cross_shard_ratio = compute_cross_shard_ratio(graph.neighbors, result.placements);
+  result.cross_shard_ratio = compute_cross_shard_ratio_graph(graph, result.placements);
   return result;
 }
 
@@ -81,10 +175,18 @@ void print_partition_stats(const VamanaBuildConfig& config, const PlacementResul
               << " partition_cut_ratio=" << result.stats.partition_cross_shard_ratio << "\n";
   }
   std::cerr << "partition node counts:";
-  for (size_t count : result.stats.part_node_counts) {
-    std::cerr << " " << count;
-  }
+  for (size_t count : result.stats.part_node_counts) std::cerr << " " << count;
   std::cerr << "\nactive neighbor cross-shard ratio: " << result.cross_shard_ratio << "\n";
+}
+
+void create_sized_file(const filepath_t& path, u64 size) {
+  std::ofstream output(path, std::ios::binary | std::ios::out | std::ios::trunc);
+  lib_assert(output.good(), "failed to create output shard file: " + path.string());
+  if (size > 0) {
+    output.seekp(static_cast<std::streamoff>(size - 1));
+    output.put(0);
+  }
+  lib_assert(output.good(), "failed to size output shard file: " + path.string());
 }
 
 }  // namespace
@@ -92,10 +194,8 @@ void print_partition_stats(const VamanaBuildConfig& config, const PlacementResul
 void write_vamana_shards(const VamanaGraph& graph,
                          const Dataset& dataset,
                          const VamanaBuildConfig& config,
-                         const RaBitQState& rabitq_state,
-                         const vec<vec<byte_t>>& rabitq_data,
                          const filepath_t& output_prefix) {
-  const size_t n = dataset.ids.size();
+  const size_t n = dataset.size();
   const u32 dim = dataset.dim;
   const size_t node_size = VamanaNode::total_size();
   const size_t aligned_size = (node_size + 7) & ~7ULL;
@@ -106,101 +206,70 @@ void write_vamana_shards(const VamanaGraph& graph,
   print_partition_stats(config, placement_result);
   const auto& placements = placement_result.placements;
 
-  // Compute shard sizes
   vec<u64> shard_sizes(config.num_memory_nodes, 16);
   for (const auto& p : placements) {
     shard_sizes[p.memory_node] = std::max<u64>(shard_sizes[p.memory_node], p.offset + aligned_size);
   }
 
-  // Allocate shard buffers
-  vec<vec<byte_t>> shard_buffers(config.num_memory_nodes);
+  const filepath_t output_dir = output_prefix.parent_path();
+  if (!output_dir.empty()) std::filesystem::create_directories(output_dir);
+
+  vec<filepath_t> shard_paths(config.num_memory_nodes);
   for (u32 shard = 0; shard < config.num_memory_nodes; ++shard) {
-    shard_buffers[shard].assign(shard_sizes[shard], 0);
-    // Write free_ptr at offset 0 (points past last node)
-    *reinterpret_cast<u64*>(shard_buffers[shard].data()) = shard_sizes[shard];
+    shard_paths[shard] = index_path::shard_file(output_prefix, shard + 1, config.num_memory_nodes);
+    create_sized_file(shard_paths[shard], shard_sizes[shard]);
   }
 
-  // Write medoid_ptr at offset 8 on shard 0
+  vec<std::fstream> shard_files(config.num_memory_nodes);
+  for (u32 shard = 0; shard < config.num_memory_nodes; ++shard) {
+    shard_files[shard].open(shard_paths[shard], std::ios::binary | std::ios::in | std::ios::out);
+    lib_assert(shard_files[shard].good(), "failed to open output shard file: " + shard_paths[shard].string());
+    shard_files[shard].seekp(0);
+    shard_files[shard].write(reinterpret_cast<const char*>(&shard_sizes[shard]), sizeof(u64));
+  }
+
   const RemotePtr medoid_ptr{placements[graph.medoid].memory_node, placements[graph.medoid].offset};
-  *reinterpret_cast<u64*>(shard_buffers[0].data() + 8) = medoid_ptr.raw_address;
+  shard_files[0].seekp(8);
+  shard_files[0].write(reinterpret_cast<const char*>(&medoid_ptr.raw_address), sizeof(u64));
 
-  // Serialize each node
+  vec<byte_t> node_buf(aligned_size, 0);
+  vec<u32> nbrs;
   for (size_t i = 0; i < n; ++i) {
-    const auto& placement = placements[i];
-    byte_t* buf = shard_buffers[placement.memory_node].data() + placement.offset;
+    std::fill(node_buf.begin(), node_buf.end(), 0);
+    byte_t* buf = node_buf.data();
 
-    // Header (8B)
     u64 header = 0;
     if (i == graph.medoid) header |= VamanaNode::HEADER_IS_MEDOID;
     *reinterpret_cast<u64*>(buf) = header;
+    *reinterpret_cast<u32*>(buf + VamanaNode::HEADER_SIZE) = dataset.id(i);
 
-    // ID (4B)
-    *reinterpret_cast<u32*>(buf + VamanaNode::HEADER_SIZE) = dataset.ids[i];
-
-    // Edge count (1B)
-    const u8 edge_count = static_cast<u8>(std::min<size_t>(graph.neighbors[i].size(), config.R));
+    graph.copy_neighbors(i, nbrs);
+    const u8 edge_count = static_cast<u8>(std::min<size_t>(nbrs.size(), config.R));
     *reinterpret_cast<u8*>(buf + VamanaNode::offset_edge_count()) = edge_count;
 
-    // Padding (3B) - already zeroed
+    std::memcpy(buf + VamanaNode::offset_vector(), dataset.raw_vector(i), dataset.vector_bytes);
 
-    // Vector (dim * 4B)
-    std::memcpy(buf + VamanaNode::offset_vector(),
-                dataset.vector(i),
-                dim * sizeof(float));
-
-    // RaBitQ data
-    std::memcpy(buf + VamanaNode::offset_rabitq(),
-                rabitq_data[i].data(),
-                rabitq_state.total_rabitq_bytes);
-
-    // Neighbors (R * 8B) — write active + zero rest
     auto* neighbor_buf = reinterpret_cast<u64*>(buf + VamanaNode::offset_neighbors());
     for (u8 j = 0; j < edge_count; ++j) {
-      const u32 nbr = graph.neighbors[i][j];
+      const u32 nbr = nbrs[j];
       RemotePtr nbr_ptr{placements[nbr].memory_node, placements[nbr].offset};
       neighbor_buf[j] = nbr_ptr.raw_address;
     }
-    // Remaining slots already zeroed
 
+    const auto& placement = placements[i];
+    auto& file = shard_files[placement.memory_node];
+    file.seekp(static_cast<std::streamoff>(placement.offset));
+    file.write(reinterpret_cast<const char*>(node_buf.data()), static_cast<std::streamsize>(node_buf.size()));
+    lib_assert(file.good(), "failed to write output shard node");
     progress.increment();
-  }
-
-  // Write shard files
-  const filepath_t output_dir = output_prefix.parent_path();
-  if (!output_dir.empty()) {
-    std::filesystem::create_directories(output_dir);
   }
 
   for (u32 shard = 0; shard < config.num_memory_nodes; ++shard) {
-    const filepath_t shard_file = index_path::shard_file(output_prefix, shard + 1, config.num_memory_nodes);
-    std::ofstream output(shard_file, std::ios::binary | std::ios::out);
-    lib_assert(output.good(), "failed to open output shard file: " + shard_file.string());
-    output.write(reinterpret_cast<const char*>(shard_buffers[shard].data()),
-                 static_cast<std::streamsize>(shard_buffers[shard].size()));
-    lib_assert(output.good(), "failed to write output shard file: " + shard_file.string());
+    shard_files[shard].flush();
+    lib_assert(shard_files[shard].good(), "failed to flush output shard file: " + shard_paths[shard].string());
     progress.increment();
   }
 
-  // Write rotation matrix to a separate file
-  {
-    const filepath_t rot_file = filepath_t(output_prefix.string() + ".rotation.bin");
-    std::ofstream out(rot_file, std::ios::binary);
-    lib_assert(out.good(), "failed to open rotation matrix file: " + rot_file.string());
-    // Write dim, then column-major matrix data
-    u32 d = dim;
-    out.write(reinterpret_cast<const char*>(&d), sizeof(u32));
-    out.write(reinterpret_cast<const char*>(rabitq_state.rotation_matrix.data()),
-              static_cast<std::streamsize>(dim * dim * sizeof(float)));
-    // Write rotated centroid
-    out.write(reinterpret_cast<const char*>(rabitq_state.rotated_centroid.data()),
-              static_cast<std::streamsize>(dim * sizeof(float)));
-    // Write t_const
-    double tc = rabitq_state.t_const;
-    out.write(reinterpret_cast<const char*>(&tc), sizeof(double));
-    lib_assert(out.good(), "failed to write rotation matrix file");
-  }
-
-  // Write metadata
   nlohmann::json metadata{
     {"data_file", dataset.source_file.string()},
     {"output_prefix", output_prefix.string()},
@@ -211,12 +280,14 @@ void write_vamana_shards(const VamanaGraph& graph,
     {"beam_width", config.beam_width},
     {"beam_width_construction", config.beam_width},
     {"alpha", config.alpha},
-    {"rabitq_bits", config.rabitq_bits},
     {"num_memory_nodes", config.num_memory_nodes},
     {"medoid", {{"memory_node", medoid_ptr.memory_node()}, {"offset", medoid_ptr.byte_offset()}}},
     {"node_size", node_size},
     {"node_layout", VamanaNode::layout_name()},
-    {"rabitq_size", rabitq_state.total_rabitq_bytes},
+    {"schema_version", 3},
+    {"vector_data_type", vector_dtype_name(dataset.dtype)},
+    {"vector_component_size", vector_dtype_component_size(dataset.dtype)},
+    {"vector_bytes", dataset.vector_bytes},
     {"partition_strategy", config.partition_strategy},
     {"partition_max_degree", config.partition_max_degree},
     {"partition_imbalance", config.partition_imbalance},

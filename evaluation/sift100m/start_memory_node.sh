@@ -1,62 +1,69 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
-
-if [[ $# -lt 1 ]]; then
-  echo "usage: $0 <node-index 0..4> [start|stop|restart|status] [extra args...]" >&2
-  exit 1
-fi
-
-NODE_INDEX="$1"
-shift
-
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/sift100m_common.sh"
 
-if ! [[ "$NODE_INDEX" =~ ^[0-9]+$ ]] || (( NODE_INDEX < 0 || NODE_INDEX >= MEMORY_NODES )); then
-  echo "error: node-index must be in [0, $((MEMORY_NODES - 1))]" >&2
+NODE_ID="${1:?usage: start_memory_node.sh <1-5> [profile]}"
+PROFILE="${2:-$PROFILE}"
+PROFILE_ENV="$SCRIPT_DIR/profiles/${PROFILE}.env"
+if [[ ! -f "$PROFILE_ENV" ]]; then
+  echo "unknown profile: $PROFILE" >&2
+  exit 1
+fi
+source "$PROFILE_ENV"
+
+if (( NODE_ID < 1 || NODE_ID > SHARDS )); then
+  echo "node id must be in [1,$SHARDS]" >&2
   exit 1
 fi
 
-COMMON_SCRIPT="$PROJECT_DIR/scripts/start_memory_node.sh"
-NODE_NUMBER=$((NODE_INDEX + 1))
-PORT="$((SERVER_PORT_BASE + NODE_INDEX))"
-INDEX_FILE="${INDEX_PREFIX}_node${NODE_NUMBER}_of${MEMORY_NODES}.dat"
-STORAGE_PEERS="$(join_storage_endpoints)"
-COMMAND="${1:-start}"
-if [[ $# -gt 0 ]]; then
-  shift
+ensure_built dvstor_memory_node
+
+PORT=$((BASE_PORT + NODE_ID - 1))
+SHARD_FILE="$(shard_file "$NODE_ID")"
+if [[ ! -f "$SHARD_FILE" ]]; then
+  echo "missing shard file: $SHARD_FILE" >&2
+  echo "build it first with: $SCRIPT_DIR/build_sift100m_index.sh" >&2
+  exit 1
 fi
 
-if [[ ! -f "$INDEX_FILE" && "$COMMAND" != "stop" && "$COMMAND" != "status" ]]; then
-  echo "warning: index shard not found yet: $INDEX_FILE" >&2
+PID_FILE="$PID_DIR/memory_node_${NODE_ID}.pid"
+LOG_FILE="$LOG_DIR/memory_node_${NODE_ID}_${PROFILE}.log"
+if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+  echo "memory node $NODE_ID already running: pid $(cat "$PID_FILE")" >&2
+  exit 1
 fi
 
-# shellcheck disable=SC2206
-storage_peer_args=( $STORAGE_PEERS )
-args=(
-  "$COMMAND"
-  "$@"
-  --num-clients "$NUM_CLIENTS"
+read -r -a SERVER_ARGS <<< "$(server_endpoints)"
+read -r -a RDMA_ARGS <<< "$(common_rdma_args)"
+cmd=("$BUILD_DIR/dvstor_memory_node"
+  --is-server
+  --num-clients 1
+  --servers "${SERVER_ARGS[@]}"
   --port "$PORT"
-  --mn-memory "$MN_MEMORY"
-  --index-file "$INDEX_FILE"
-  --insert-execution "$INSERT_EXECUTION"
-  --storage-id "$NODE_INDEX"
-  --storage-peers "${storage_peer_args[@]}"
-  --dim "$DIM"
-  --R "$R"
-  --beam-width-construction "$BEAM_WIDTH"
-  --alpha "$ALPHA"
-  --rabitq-bits "$RABITQ_BITS"
-  --search-mode "$SEARCH_MODE"
-  --k "$K"
+  "${RDMA_ARGS[@]}"
+  --server-index-file "$SHARD_FILE"
   --index-prefix "$INDEX_PREFIX"
-  --storage-owner-batch-max "$STORAGE_OWNER_BATCH_MAX"
-  --storage-owner-batch-wait-us "$STORAGE_OWNER_BATCH_WAIT_US"
-  --storage-owner-cache-mb "$STORAGE_OWNER_CACHE_MB"
-  --storage-owner-peer-rdma-tokens "$STORAGE_OWNER_PEER_RDMA_TOKENS"
-  --storage-owner-rpc-depth "$STORAGE_OWNER_RPC_DEPTH"
-  --storage-owner-rpc-timeout-ms "$STORAGE_OWNER_RPC_TIMEOUT_MS"
-)
+  --data-path "$(base_bin)"
+  --load-index
+  --dim "$DIM"
+  --max-vectors "$MAX_VECTORS"
+  --R "$R"
+  --beam-width "$SEARCH_BEAM"
+  --beam-width-construction "$BUILD_BEAM"
+  --alpha "$ALPHA"
+  --k "$K"
+  --vector-data-type "$VECTOR_DATA_TYPE"
+  --mn-memory "$MN_MEMORY_GB"
+  --insert-execution "$INSERT_EXECUTION"
+  --storage-id "$((NODE_ID - 1))")
 
-exec "$COMMON_SCRIPT" "${args[@]}"
+if [[ "$INSERT_EXECUTION" == "storage_owner" ]]; then
+  cmd+=(--storage-peers "${SERVER_ARGS[@]}"
+    --storage-owner-cache-mb "$STORAGE_OWNER_CACHE_MB")
+fi
+
+printf '[memory-node-%s] command:' "$NODE_ID"; printf ' %q' "${cmd[@]}"; echo
+nohup "${cmd[@]}" > "$LOG_FILE" 2>&1 &
+echo $! > "$PID_FILE"
+echo "memory node $NODE_ID started: pid $(cat "$PID_FILE"), log $LOG_FILE"

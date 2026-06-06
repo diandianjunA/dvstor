@@ -32,7 +32,6 @@ constexpr static u32 DEFAULT_R = 64;                  // max out-degree
 constexpr static u32 DEFAULT_BEAM_WIDTH = 128;         // search beam width
 constexpr static u32 DEFAULT_BEAM_WIDTH_CONSTRUCTION = 200;  // insert beam width
 constexpr static f64 DEFAULT_ALPHA = 1.2;             // RobustPrune diversity factor
-constexpr static u32 DEFAULT_RABITQ_BITS = 1;         // bits per dimension for RaBitQ
 constexpr static u32 GPU_TILE_SIZE = 4;               // cooperative group tile size for distance
 constexpr static u32 GPU_BLOCK_SIZE = 512;             // CUDA block size
 }  // namespace vamana

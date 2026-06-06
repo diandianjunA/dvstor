@@ -198,8 +198,6 @@ void vamana_service_schedule_queries(vamana::Vamana<Distance>& vamana_idx,
           thread->stats.query_queue_wait_ns +=
             static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(queue_wait).count());
 
-          auto slot_components = staging.get_components(cid);
-          std::copy(req->components.begin(), req->components.end(), slot_components.begin());
           active_requests[cid] = req;
           thread->set_active_sample(cid, req->breakdown_sample.get());
           if (req->breakdown_sample) {
@@ -211,7 +209,13 @@ void vamana_service_schedule_queries(vamana::Vamana<Distance>& vamana_idx,
           coroutine.handle.destroy();
           reset_vamana_coroutine_state(coroutine);
           thread->set_current_coroutine(cid);
-          coroutine.handle = vamana_idx.knn(slot_ids[cid], slot_components, thread).handle;
+          if (!req->raw_components.empty()) {
+            coroutine.handle = vamana_idx.knn_raw(slot_ids[cid], req->raw_components.data(), req->query_dtype, thread).handle;
+          } else {
+            auto slot_components = staging.get_components(cid);
+            std::copy(req->components.begin(), req->components.end(), slot_components.begin());
+            coroutine.handle = vamana_idx.knn(slot_ids[cid], slot_components, thread).handle;
+          }
         }
 
       } else if (thread->is_ready(cid)) {

@@ -65,6 +65,7 @@ struct VamanaCoroutine {
   vec<RemotePtr> scratch_cached_neighbors{};
   vec<RemotePtr> scratch_cache_ptrs{};
   vec<RemotePtr> scratch_fallback_ptrs{};
+  vec<u32> scratch_miss_indices{};
 
   // GPU state
   bool gpu_pending{false};

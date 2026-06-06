@@ -52,14 +52,12 @@ enum class Subcategory : u8 {
   cpu_insert_beam_update,
   cpu_insert_candidate_sort,
   cpu_insert_prune_prepare,
-  cpu_insert_quantize_prepare,
   cpu_insert_neighbor_collect,
   cpu_insert_finalize,
   cpu_insert_neighbor_prepare,
   cpu_insert_pruned_neighbor_collect,
   cpu_insert_overflow_prepare,
   cpu_storage_owner_queue_wait,
-  cpu_storage_owner_quantize,
   cpu_storage_owner_search,
   cpu_storage_owner_prune,
   cpu_storage_owner_write_node,
@@ -85,14 +83,12 @@ enum class Subcategory : u8 {
   gpu_query_rerank,
   gpu_insert_distance,
   gpu_insert_prune,
-  gpu_insert_quantize,
   gpu_insert_overflow_distance,
   gpu_insert_overflow_prune,
 
   // RDMA
   rdma_medoid_ptr,
   rdma_neighbor_fetch,
-  rdma_rabitq_fetch,
   rdma_vector_fetch,
   rdma_rerank_fetch,
   rdma_alloc,
@@ -115,7 +111,6 @@ enum class Subcategory : u8 {
 
   // Transfer
   transfer_query_h2d,
-  transfer_rabitq_h2d,
   transfer_candidate_h2d,
   transfer_distance_d2h,
   transfer_rerank_h2d,
@@ -123,7 +118,6 @@ enum class Subcategory : u8 {
   transfer_insert_query_h2d,
   transfer_prune_h2d,
   transfer_prune_d2h,
-  transfer_quantize_d2h,
   transfer_overflow_query_h2d,
   transfer_overflow_candidate_h2d,
   transfer_overflow_dist_d2h,
@@ -155,14 +149,12 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "cpu_insert_beam_update_ns",
   "cpu_insert_candidate_sort_ns",
   "cpu_insert_prune_prepare_ns",
-  "cpu_insert_quantize_prepare_ns",
   "cpu_insert_neighbor_collect_ns",
   "cpu_insert_finalize_ns",
   "cpu_insert_neighbor_prepare_ns",
   "cpu_insert_pruned_neighbor_collect_ns",
   "cpu_insert_overflow_prepare_ns",
   "cpu_storage_owner_queue_wait_ns",
-  "cpu_storage_owner_quantize_ns",
   "cpu_storage_owner_search_ns",
   "cpu_storage_owner_prune_ns",
   "cpu_storage_owner_write_node_ns",
@@ -186,12 +178,10 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "gpu_query_rerank_ns",
   "gpu_insert_distance_ns",
   "gpu_insert_prune_ns",
-  "gpu_insert_quantize_ns",
   "gpu_insert_overflow_distance_ns",
   "gpu_insert_overflow_prune_ns",
   "rdma_medoid_ptr_ns",
   "rdma_neighbor_fetch_ns",
-  "rdma_rabitq_fetch_ns",
   "rdma_vector_fetch_ns",
   "rdma_rerank_fetch_ns",
   "rdma_alloc_ns",
@@ -212,7 +202,6 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "rdma_storage_owner_search_snapshot_read_ns",
   "rdma_storage_owner_prune_snapshot_read_ns",
   "transfer_query_h2d_ns",
-  "transfer_rabitq_h2d_ns",
   "transfer_candidate_h2d_ns",
   "transfer_distance_d2h_ns",
   "transfer_rerank_h2d_ns",
@@ -220,7 +209,6 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "transfer_insert_query_h2d_ns",
   "transfer_prune_h2d_ns",
   "transfer_prune_d2h_ns",
-  "transfer_quantize_d2h_ns",
   "transfer_overflow_query_h2d_ns",
   "transfer_overflow_candidate_h2d_ns",
   "transfer_overflow_dist_d2h_ns",
@@ -254,14 +242,12 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::cpu_insert_beam_update:
     case Subcategory::cpu_insert_candidate_sort:
     case Subcategory::cpu_insert_prune_prepare:
-    case Subcategory::cpu_insert_quantize_prepare:
     case Subcategory::cpu_insert_neighbor_collect:
     case Subcategory::cpu_insert_finalize:
     case Subcategory::cpu_insert_neighbor_prepare:
     case Subcategory::cpu_insert_pruned_neighbor_collect:
     case Subcategory::cpu_insert_overflow_prepare:
     case Subcategory::cpu_storage_owner_queue_wait:
-    case Subcategory::cpu_storage_owner_quantize:
     case Subcategory::cpu_storage_owner_search:
     case Subcategory::cpu_storage_owner_prune:
     case Subcategory::cpu_storage_owner_write_node:
@@ -286,13 +272,11 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::gpu_query_rerank:
     case Subcategory::gpu_insert_distance:
     case Subcategory::gpu_insert_prune:
-    case Subcategory::gpu_insert_quantize:
     case Subcategory::gpu_insert_overflow_distance:
     case Subcategory::gpu_insert_overflow_prune:
       return Category::gpu;
     case Subcategory::rdma_medoid_ptr:
     case Subcategory::rdma_neighbor_fetch:
-    case Subcategory::rdma_rabitq_fetch:
     case Subcategory::rdma_vector_fetch:
     case Subcategory::rdma_rerank_fetch:
     case Subcategory::rdma_alloc:
@@ -314,7 +298,6 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::rdma_storage_owner_prune_snapshot_read:
       return Category::rdma;
     case Subcategory::transfer_query_h2d:
-    case Subcategory::transfer_rabitq_h2d:
     case Subcategory::transfer_candidate_h2d:
     case Subcategory::transfer_distance_d2h:
     case Subcategory::transfer_rerank_h2d:
@@ -322,7 +305,6 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::transfer_insert_query_h2d:
     case Subcategory::transfer_prune_h2d:
     case Subcategory::transfer_prune_d2h:
-    case Subcategory::transfer_quantize_d2h:
     case Subcategory::transfer_overflow_query_h2d:
     case Subcategory::transfer_overflow_candidate_h2d:
     case Subcategory::transfer_overflow_dist_d2h:

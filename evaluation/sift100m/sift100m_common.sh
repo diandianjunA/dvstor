@@ -1,96 +1,199 @@
-#!/bin/bash
-# Common defaults for the SIFT100M 5-storage-node DVSTOR test.
-# Override these through environment variables when running on a different host.
+#!/usr/bin/env bash
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+BUILD_DIR="${BUILD_DIR:-$PROJECT_DIR/build}"
 
-DATASET_DIR="${DATASET_DIR:-/data/xjs/datasets/sift100m}"
-DATA_FILE="${DATA_FILE:-$DATASET_DIR/learn.100M.u8bin}"
-QUERY_FILE="${QUERY_FILE:-$DATASET_DIR/query.public.10K.u8bin}"
-GROUNDTRUTH_FILE="${GROUNDTRUTH_FILE:-$DATASET_DIR/bigann-100M.gt}"
+DATASET_DIR="${DATASET_DIR:-/data/xjs/datasets/sift1b}"
+WORK_DIR="${WORK_DIR:-/data/xjs/index/dvstor_sift100m}"
+CONVERTED_DIR="${CONVERTED_DIR:-$WORK_DIR/converted}"
+INDEX_DIR="${INDEX_DIR:-$WORK_DIR/index}"
+REPORT_DIR="${REPORT_DIR:-$SCRIPT_DIR/reports}"
+LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
+PID_DIR="${PID_DIR:-$SCRIPT_DIR/pids}"
 
-INDEX_DIR="${INDEX_DIR:-/data/xjs/index/dvstor/sift100m}"
-INDEX_PREFIX="${INDEX_PREFIX:-$INDEX_DIR/sift100m}"
-
-MEMORY_NODES="${MEMORY_NODES:-5}"
-MAX_VECTORS="${MAX_VECTORS:-100000000}"
-DIM="${DIM:-128}"
-R="${R:-48}"
-BEAM_WIDTH="${BEAM_WIDTH:-320}"
-ALPHA="${ALPHA:-1.2}"
-RABITQ_BITS="${RABITQ_BITS:-4}"
-NODE_LAYOUT="${NODE_LAYOUT:-rabitq_search_block}"
+SHARDS="${SHARDS:-5}"
 PARTITION_STRATEGY="${PARTITION_STRATEGY:-bfs}"
-PARTITION_MAX_DEGREE="${PARTITION_MAX_DEGREE:-48}"
-PARTITION_IMBALANCE="${PARTITION_IMBALANCE:-1.03}"
-OFFLINE_REVERSE_MODE="${OFFLINE_REVERSE_MODE:-immediate}"
-SKIP_SANITY_CHECK="${SKIP_SANITY_CHECK:-true}"
-BUILD_THREADS="${BUILD_THREADS:-32}"
-BUILD_GPU_DEVICE="${BUILD_GPU_DEVICE:-0}"
-BUILD_USE_GPU="${BUILD_USE_GPU:-false}"
-
-HOST="${HOST:-192.168.6.202}"
-SERVER_PORT_BASE="${SERVER_PORT_BASE:-1234}"
-STORAGE_PORT_BASE="${STORAGE_PORT_BASE:-2234}"
-NUM_CLIENTS="${NUM_CLIENTS:-1}"
-MN_MEMORY="${MN_MEMORY:-32}"
-CN_MEMORY="${CN_MEMORY:-24}"
-GPU_DEVICE="${GPU_DEVICE:-1}"
-
-SEARCH_MODE="${SEARCH_MODE:-rabitq_gpu}"
+R="${R:-48}"
+BUILD_BEAM="${BUILD_BEAM:-200}"
+SEARCH_BEAM="${SEARCH_BEAM:-128}"
+ALPHA="${ALPHA:-1.2}"
 K="${K:-10}"
-THREADS="${THREADS:-16}"
-COROUTINES="${COROUTINES:-16}"
-INSERT_WORKERS="${INSERT_WORKERS:-0}"
-QUERY_WORKERS="${QUERY_WORKERS:-16}"
-QUERY_COROUTINES="${QUERY_COROUTINES:-4}"
-INSERT_EXECUTION="${INSERT_EXECUTION:-storage_owner}"
+DIM="${DIM:-128}"
+VECTOR_DATA_TYPE="${VECTOR_DATA_TYPE:-uint8}"
+BUILD_THREADS="${BUILD_THREADS:-32}"
+SERVICE_THREADS="${SERVICE_THREADS:-16}"
+COROUTINES="${COROUTINES:-4}"
+CLIENT_THREADS="${CLIENT_THREADS:-16}"
+GPU_DEVICE="${GPU_DEVICE:-1}"
+MAX_VECTORS="${MAX_VECTORS:-100000000}"
+MAX_QUERIES="${MAX_QUERIES:-10000}"
+GROUNDTRUTH_LABEL="${GROUNDTRUTH_LABEL:-100M}"
+GROUNDTRUTH_TOPK="${GROUNDTRUTH_TOPK:-10}"
 
-STORAGE_OWNER_BATCH_MAX="${STORAGE_OWNER_BATCH_MAX:-16}"
-STORAGE_OWNER_BATCH_WAIT_US="${STORAGE_OWNER_BATCH_WAIT_US:-250}"
-STORAGE_OWNER_CACHE_MB="${STORAGE_OWNER_CACHE_MB:-1024}"
-STORAGE_OWNER_PEER_RDMA_TOKENS="${STORAGE_OWNER_PEER_RDMA_TOKENS:-8}"
-STORAGE_OWNER_RPC_DEPTH="${STORAGE_OWNER_RPC_DEPTH:-4}"
-STORAGE_OWNER_RPC_TIMEOUT_MS="${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}"
-STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH="${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-128}"
-STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH="${STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH:-64}"
-STORAGE_OWNER_PRUNE_MAX_CANDIDATES="${STORAGE_OWNER_PRUNE_MAX_CANDIDATES:-128}"
-STORAGE_OWNER_REVERSE_MODE="${STORAGE_OWNER_REVERSE_MODE:-async}"
-STORAGE_OWNER_REVERSE_QUEUE_DEPTH="${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
-STORAGE_OWNER_REVERSE_FLUSH_US="${STORAGE_OWNER_REVERSE_FLUSH_US:-200}"
-STORAGE_OWNER_REVERSE_COALESCE_MAX="${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}"
+estimate_node_bytes() {
+  local component_size=4
+  case "$VECTOR_DATA_TYPE" in
+    uint8|int8) component_size=1 ;;
+    float32|auto) component_size=4 ;;
+  esac
+  echo $((16 + DIM * component_size + R * 8))
+}
 
-CACHE="${CACHE:-true}"
+estimate_mn_memory_gb() {
+  local node_bytes vectors_per_shard bytes gib
+  node_bytes="$(estimate_node_bytes)"
+  vectors_per_shard=$(((MAX_VECTORS + SHARDS - 1) / SHARDS))
+  bytes=$((vectors_per_shard * node_bytes))
+  # 20% slack for partition imbalance, headers, allocator alignment, and online inserts, plus 4GB floor slack.
+  gib=$(((bytes * 12 / 10 + 4 * 1024 * 1024 * 1024 + 1024 * 1024 * 1024 - 1) / (1024 * 1024 * 1024)))
+  if (( gib < 8 )); then gib=8; fi
+  echo "$gib"
+}
+
+if [[ -z "${CN_MEMORY_GB+x}" ]]; then
+  CN_MEMORY_GB=16
+  CN_MEMORY_GB_WAS_DEFAULT=1
+else
+  CN_MEMORY_GB_WAS_DEFAULT=0
+fi
+MN_MEMORY_GB="${MN_MEMORY_GB:-$(estimate_mn_memory_gb)}"
 CACHE_RATIO="${CACHE_RATIO:-5}"
-NEIGHBOR_CACHE_MB="${NEIGHBOR_CACHE_MB:-1024}"
-GPU_RABITQ_CACHE_MB="${GPU_RABITQ_CACHE_MB:-1024}"
-GPUDIRECT_RDMA="${GPUDIRECT_RDMA:-true}"
-DISABLE_THREAD_PINNING="${DISABLE_THREAD_PINNING:-false}"
-INSERT_START_ID="${INSERT_START_ID:-100010000}"
+NEIGHBOR_CACHE_MB="${NEIGHBOR_CACHE_MB:-2048}"
+if [[ -z "${GPU_NODE_CACHE_MB+x}" ]]; then
+  GPU_NODE_CACHE_MB=0
+  GPU_NODE_CACHE_MB_WAS_DEFAULT=1
+else
+  GPU_NODE_CACHE_MB_WAS_DEFAULT=0
+fi
+STORAGE_OWNER_CACHE_MB="${STORAGE_OWNER_CACHE_MB:-2048}"
 
-server_endpoint() {
-  local index="$1"
-  echo "$HOST:$((SERVER_PORT_BASE + index))"
+BASE_PORT="${BASE_PORT:-1234}"
+HOSTS="${HOSTS:-127.0.0.1 127.0.0.1 127.0.0.1 127.0.0.1 127.0.0.1}"
+IB_DEVICE="${IB_DEVICE:-}"
+IB_PORT="${IB_PORT:-1}"
+MAX_SEND_WRS="${MAX_SEND_WRS:-4096}"
+MAX_RECEIVE_WRS="${MAX_RECEIVE_WRS:-4096}"
+MAX_POLL_CQES="${MAX_POLL_CQES:-64}"
+
+PROFILE="${PROFILE:-baseline}"
+INDEX_PREFIX="${INDEX_PREFIX:-$INDEX_DIR/sift100m_R${R}_bw${BUILD_BEAM}_${PARTITION_STRATEGY}}"
+
+mkdir -p "$CONVERTED_DIR" "$INDEX_DIR" "$REPORT_DIR" "$LOG_DIR" "$PID_DIR"
+
+base_suffix() {
+  if [[ "$MAX_VECTORS" == "0" || "$MAX_VECTORS" == "1000000000" ]]; then
+    echo ""
+  else
+    echo "_${MAX_VECTORS}"
+  fi
 }
 
-storage_endpoint() {
-  local index="$1"
-  echo "$HOST:$((STORAGE_PORT_BASE + index))"
+query_suffix() {
+  if [[ "$MAX_QUERIES" == "0" || "$MAX_QUERIES" == "10000" ]]; then
+    echo ""
+  else
+    echo "_${MAX_QUERIES}"
+  fi
 }
 
-join_server_endpoints() {
+base_bin() { echo "$CONVERTED_DIR/base$(base_suffix).u8bin"; }
+query_bin() { echo "$CONVERTED_DIR/query$(query_suffix).u8bin"; }
+groundtruth_bin() { echo "$CONVERTED_DIR/groundtruth_${GROUNDTRUTH_LABEL}.bin"; }
+
+server_endpoints() {
+  local idx=0
   local endpoints=()
-  for ((i = 0; i < MEMORY_NODES; ++i)); do
-    endpoints+=("$(server_endpoint "$i")")
+  for host in $HOSTS; do
+    if (( idx >= SHARDS )); then break; fi
+    endpoints+=("${host}:$((BASE_PORT + idx))")
+    idx=$((idx + 1))
   done
-  echo "${endpoints[*]}"
+  if (( ${#endpoints[@]} != SHARDS )); then
+    echo "HOSTS must contain $SHARDS entries; got ${#endpoints[@]}" >&2
+    return 1
+  fi
+  printf '%s ' "${endpoints[@]}"
 }
 
-join_storage_endpoints() {
-  local endpoints=()
-  for ((i = 0; i < MEMORY_NODES; ++i)); do
-    endpoints+=("$(storage_endpoint "$i")")
-  done
-  echo "${endpoints[*]}"
+shard_file() {
+  local node_id="$1"
+  echo "${INDEX_PREFIX}_node${node_id}_of${SHARDS}.dat"
+}
+
+common_rdma_args() {
+  local args=(--ib-port "$IB_PORT" --max-send-wrs "$MAX_SEND_WRS" --max-receive-wrs "$MAX_RECEIVE_WRS" --max-poll-cqes "$MAX_POLL_CQES")
+  if [[ -n "$IB_DEVICE" ]]; then
+    args+=(--ib-device "$IB_DEVICE")
+  fi
+  printf '%q ' "${args[@]}"
+}
+
+ensure_built() {
+  cmake --build "$BUILD_DIR" -j --target "$@"
+}
+
+
+write_service_config() {
+  local output="$1"
+  local endpoints
+  endpoints="$(server_endpoints)"
+  {
+    echo "servers = $endpoints"
+    echo "initiator = true"
+    echo "num-clients = 1"
+    echo "port = 2234"
+    echo "ib-port = $IB_PORT"
+    if [[ -n "$IB_DEVICE" ]]; then echo "ib-device = $IB_DEVICE"; fi
+    echo "max-send-wrs = $MAX_SEND_WRS"
+    echo "max-receive-wrs = $MAX_RECEIVE_WRS"
+    echo "max-poll-cqes = $MAX_POLL_CQES"
+    echo "data-path = $(base_bin)"
+    echo "index-prefix = $INDEX_PREFIX"
+    echo "load-index = true"
+    echo "no-recall = true"
+    echo "vector-data-type = $VECTOR_DATA_TYPE"
+    echo "dim = $DIM"
+    echo "max-vectors = $MAX_VECTORS"
+    echo "threads = $SERVICE_THREADS"
+    echo "coroutines = $COROUTINES"
+    echo "R = $R"
+    echo "beam-width = $SEARCH_BEAM"
+    echo "beam-width-construction = $BUILD_BEAM"
+    echo "alpha = $ALPHA"
+    echo "k = $K"
+    echo "gpu-device = $GPU_DEVICE"
+    echo "cn-memory = $CN_MEMORY_GB"
+    echo "mn-memory = $MN_MEMORY_GB"
+    echo "insert-workers = ${INSERT_WORKERS:-4}"
+    echo "query-workers = ${QUERY_WORKERS:-12}"
+    echo "insert-coroutines = ${INSERT_COROUTINES:-2}"
+    echo "query-coroutines = ${QUERY_COROUTINES:-4}"
+    echo "label = sift100m_${PROFILE_NAME:-$PROFILE}"
+    if [[ "${GPUDIRECT_RDMA:-0}" == "1" ]]; then echo "gpudirect-rdma = true"; fi
+    if [[ "${COMPUTE_CACHE:-0}" == "1" ]]; then
+      echo "cache = true"
+      echo "cache-ratio = $CACHE_RATIO"
+    fi
+    if [[ "${NEIGHBOR_CACHE_MB:-0}" != "0" ]]; then echo "neighbor-cache-mb = $NEIGHBOR_CACHE_MB"; fi
+    if [[ "${GPU_NODE_CACHE_MB:-0}" != "0" ]]; then echo "gpu-node-cache-mb = $GPU_NODE_CACHE_MB"; fi
+    echo "insert-execution = ${INSERT_EXECUTION:-compute}"
+    if [[ "${INSERT_EXECUTION:-compute}" == "storage_owner" ]]; then
+      echo "storage-peers = $endpoints"
+      echo "storage-owner-batch-max = ${STORAGE_OWNER_BATCH_MAX:-32}"
+      echo "storage-owner-batch-wait-us = ${STORAGE_OWNER_BATCH_WAIT_US:-100}"
+      echo "storage-owner-cache-mb = $STORAGE_OWNER_CACHE_MB"
+      echo "storage-owner-peer-rdma-tokens = ${STORAGE_OWNER_PEER_RDMA_TOKENS:-8}"
+      echo "storage-owner-rpc-depth = ${STORAGE_OWNER_RPC_DEPTH:-16}"
+      echo "storage-owner-rpc-timeout-ms = ${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}"
+      echo "storage-owner-construction-beam-width = ${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-$BUILD_BEAM}"
+      echo "storage-owner-search-snapshot-batch = ${STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH:-64}"
+      echo "storage-owner-prune-max-candidates = ${STORAGE_OWNER_PRUNE_MAX_CANDIDATES:-128}"
+      echo "storage-owner-reverse-mode = ${STORAGE_OWNER_REVERSE_MODE:-async}"
+      echo "storage-owner-reverse-queue-depth = ${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
+      echo "storage-owner-reverse-flush-us = ${STORAGE_OWNER_REVERSE_FLUSH_US:-200}"
+      echo "storage-owner-reverse-coalesce-max = ${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}"
+    fi
+  } > "$output"
 }

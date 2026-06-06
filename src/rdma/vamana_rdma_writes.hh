@@ -51,12 +51,11 @@ inline auto unlock_vamana_node(const s_ptr<VamanaNode>& node, const u_ptr<Comput
 
 /**
  * Write a complete new VamanaNode to remote memory.
- * Writes: header + id + edge_count + pad + vector + rabitq + neighbors.
+ * Writes: header + id + edge_count + pad + vector + neighbors.
  */
 inline auto write_vamana_node(const RemotePtr& rptr,
                               node_t id,
                               const span<element_t> components,
-                              const byte_t* rabitq_data,
                               const span<RemotePtr> neighbors,
                               u8 edge_count,
                               bool is_medoid,
@@ -74,13 +73,8 @@ inline auto write_vamana_node(const RemotePtr& rptr,
     *reinterpret_cast<u64*>(local_buffer) = header;
     *reinterpret_cast<u32*>(local_buffer + VamanaNode::offset_id()) = id;
     *reinterpret_cast<u8*>(local_buffer + VamanaNode::offset_edge_count()) = edge_count;
-    std::memcpy(local_buffer + VamanaNode::offset_vector(),
-                components.data(),
-                VamanaNode::DIM * sizeof(element_t));
-    if (rabitq_data != nullptr) {
-        std::memcpy(local_buffer + VamanaNode::offset_rabitq(), rabitq_data, VamanaNode::RABITQ_SIZE);
-    }
-
+    encode_float_vector_to_storage(components.data(), VamanaNode::DIM, VamanaNode::vector_dtype(),
+                                   local_buffer + VamanaNode::offset_vector());
     auto* neighbor_slots = reinterpret_cast<u64*>(local_buffer + VamanaNode::offset_neighbors());
     for (u8 i = 0; i < edge_count && i < neighbors.size(); ++i) {
         neighbor_slots[i] = neighbors[i].raw_address;
@@ -121,8 +115,8 @@ inline auto write_vamana_node(const RemotePtr& rptr,
 /**
  * Write the neighbor list of a VamanaNode (edge_count + neighbors).
  *
- * The node layout has vector and rabitq data BETWEEN the edge_count and
- * the neighbor slots, so we must write them at their actual offsets:
+ * The node layout has vector data BETWEEN the edge_count and the neighbor slots,
+ * so we must write them at their actual offsets:
  *   - edge_count + padding (4B) at offset_edge_count()
  *   - neighbor slots (R*8B) at offset_neighbors()
  */

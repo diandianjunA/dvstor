@@ -316,15 +316,16 @@ void ComputeService<Distance>::post_storage_owner_batch(
   request->owner_storage = owner_storage;
   request->source_client = cm_.client_id;
   request->item_count = item_count;
+  request->vector_dtype = static_cast<u32>(VamanaNode::vector_dtype());
+  request->vector_bytes = static_cast<u32>(VamanaNode::vector_bytes());
   request->batch_id = batch_id;
 
   node_t* ids = service::storage_owner::request_ids(slot.request_buffer.data());
-  element_t* vectors = service::storage_owner::request_vectors(slot.request_buffer.data(), item_count);
+  byte_t* vectors = service::storage_owner::request_vectors(slot.request_buffer.data(), item_count);
   for (u32 i = 0; i < item_count; ++i) {
     ids[i] = slot.tasks[i]->item.id;
-    std::memcpy(vectors + static_cast<size_t>(i) * config_.dim,
-                slot.tasks[i]->item.values.data(),
-                static_cast<size_t>(config_.dim) * sizeof(element_t));
+    encode_float_vector_to_storage(slot.tasks[i]->item.values.data(), config_.dim, VamanaNode::vector_dtype(),
+                                   vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes());
   }
 
   const u64 request_prepare_ns = duration_ns(prepare_start, std::chrono::steady_clock::now());

@@ -1,0 +1,75 @@
+reading dataset "/data/xjs/index/dvstor_sift100m/converted/base_1000000.u8bin" (dim=128, vectors=1000000/1000000, dtype=uint8, vector_bytes=128)
+Reading raw dataset 100% (1000000/1000000) elapsed 0s done
+offline dataset memory: raw_vectors=128000000 bytes, float_expansion=0 bytes
+output prefix: "/data/xjs/index/dvstor_sift100m/index/sift100m_R64_bw200_bfs"
+memory nodes: 5
+threads: 32
+R=64 construction_beam_width=200 alpha=1.2 vector_data_type=uint8
+partition_strategy=bfs partition_max_degree=16 partition_imbalance=1.03
+skip_sanity_check=true
+GPU: device 1 resident_raw_base=true streams=32 raw_bytes=128000000 budget_bytes=19327352832
+offline graph memory: neighbors=256000000 bytes, degrees=1000000 bytes, lock_stripes=1048576
+computing medoid...
+medoid: node 89028
+initializing random R-regular graph (degree=64)...
+note: using alpha=1.0 for construction (config alpha=1.2 stored in metadata)
+reverse edge maintenance: bounded immediate
+Building Vamana graph 4% (42108/1000000) elapsed 15s
+Building Vamana graph 5% (50200/1000000) elapsed 18s
+Building Vamana graph 8% (81810/1000000) elapsed 33s
+Building Vamana graph 10% (100171/1000000) elapsed 42s
+Building Vamana graph 12% (129756/1000000) elapsed 57s
+Building Vamana graph 15% (150042/1000000) elapsed 1m8s
+Building Vamana graph 17% (178582/1000000) elapsed 1m23s
+Building Vamana graph 20% (200297/1000000) elapsed 1m34s
+Building Vamana graph 22% (227748/1000000) elapsed 1m49s
+Building Vamana graph 25% (250049/1000000) elapsed 2m3s
+Building Vamana graph 27% (274111/1000000) elapsed 2m18s
+Building Vamana graph 29% (298304/1000000) elapsed 2m33s
+Building Vamana graph 30% (300303/1000000) elapsed 2m34s
+Building Vamana graph 32% (325741/1000000) elapsed 2m49s
+Building Vamana graph 35% (350076/1000000) elapsed 3m3s
+Building Vamana graph 37% (377125/1000000) elapsed 3m18s
+Building Vamana graph 40% (400125/1000000) elapsed 3m32s
+Building Vamana graph 42% (424993/1000000) elapsed 3m47s
+Building Vamana graph 45% (450088/1000000) elapsed 4m2s
+Building Vamana graph 47% (474588/1000000) elapsed 4m17s
+Building Vamana graph 49% (498985/1000000) elapsed 4m32s
+Building Vamana graph 50% (500188/1000000) elapsed 4m32s
+Building Vamana graph 52% (524908/1000000) elapsed 4m47s
+Building Vamana graph 55% (550176/1000000) elapsed 5m2s
+Building Vamana graph 57% (575928/1000000) elapsed 5m17s
+Building Vamana graph 60% (600190/1000000) elapsed 5m31s
+Building Vamana graph 62% (626100/1000000) elapsed 5m46s
+Building Vamana graph 65% (650028/1000000) elapsed 6m0s
+Building Vamana graph 67% (675645/1000000) elapsed 6m15s
+Building Vamana graph 70% (700147/1000000) elapsed 6m30s
+Building Vamana graph 72% (725745/1000000) elapsed 6m45s
+Building Vamana graph 75% (750058/1000000) elapsed 6m59s
+Building Vamana graph 77% (775810/1000000) elapsed 7m14s
+Building Vamana graph 80% (800208/1000000) elapsed 7m28s
+Building Vamana graph 82% (825472/1000000) elapsed 7m43s
+Building Vamana graph 85% (850294/1000000) elapsed 7m58s
+Building Vamana graph 87% (875925/1000000) elapsed 8m13s
+Building Vamana graph 90% (900242/1000000) elapsed 8m27s
+Building Vamana graph 92% (926040/1000000) elapsed 8m42s
+Building Vamana graph 95% (950165/1000000) elapsed 8m56s
+Building Vamana graph 97% (976006/1000000) elapsed 9m11s
+Building Vamana graph 100% (1000000/1000000) elapsed 9m25s done
+graph stats: avg_degree=63.8912 max=64 min=2
+partition strategy: bfs max_degree=16 imbalance=1.03
+BFS partition edges: input=63891161 edge_cut=51200000 partition_cut_ratio=0.801363
+partition node counts: 200000 200000 200000 200000 200000
+active neighbor cross-shard ratio: 0.801363
+Exporting Vamana shards 13% (133929/1000005) elapsed 0s
+Exporting Vamana shards 23% (232521/1000005) elapsed 1s
+Exporting Vamana shards 33% (331185/1000005) elapsed 1s
+Exporting Vamana shards 42% (429972/1000005) elapsed 1s
+Exporting Vamana shards 52% (528238/1000005) elapsed 1s
+Exporting Vamana shards 62% (624472/1000005) elapsed 2s
+Exporting Vamana shards 72% (721576/1000005) elapsed 2s
+Exporting Vamana shards 81% (819059/1000005) elapsed 2s
+Exporting Vamana shards 90% (903914/1000005) elapsed 2s
+Exporting Vamana shards 97% (977712/1000005) elapsed 3s
+Exporting Vamana shards 100% (1000005/1000005) elapsed 3s done
+offline build finished in 569.535 seconds

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
+#include <cstring>
 #include <cstdint>
 #include <cmath>
 #include <fstream>
@@ -19,8 +20,10 @@
 #include <vector>
 
 #include "common/distance.hh"
+#include "common/vector_dtype.hh"
 #include "service/breakdown.hh"
 #include "tools/breakdown_benchmark/progress.hh"
+#include "vamana/vamana_node.hh"
 
 namespace tools::breakdown_benchmark {
 
@@ -57,11 +60,25 @@ std::vector<float> make_dataset(const std::vector<uint32_t>& ids, size_t dim) {
   return vectors;
 }
 
-std::vector<float> read_vector_bin(const std::string& path, uint32_t* dim_out, size_t* count_out) {
+struct VectorRows {
+  VectorDType dtype{VectorDType::float32};
+  uint32_t dim{};
+  size_t count{};
+  size_t vector_bytes{};
+  std::vector<byte_t> raw;
+  std::vector<float> decoded;
+
+  const byte_t* raw_row(size_t index) const {
+    return raw.data() + index * vector_bytes;
+  }
+};
+
+VectorRows read_vector_rows(const std::string& path) {
   std::ifstream input(path, std::ios::binary);
   if (!input) {
     throw std::runtime_error("failed to open " + path);
   }
+
   uint32_t count = 0;
   uint32_t dim = 0;
   input.read(reinterpret_cast<char*>(&count), sizeof(count));
@@ -70,43 +87,36 @@ std::vector<float> read_vector_bin(const std::string& path, uint32_t* dim_out, s
     throw std::runtime_error("failed to read vector file header: " + path);
   }
 
-  std::vector<float> data(static_cast<size_t>(count) * dim);
-  const auto has_suffix = [&](const std::string& suffix) {
-    return path.size() >= suffix.size() && path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0;
-  };
+  VectorRows rows;
+  rows.dtype = resolve_vector_dtype_config("auto", filepath_t{path});
+  rows.dim = dim;
+  rows.count = count;
+  rows.vector_bytes = vector_dtype_bytes(rows.dtype, dim);
+  rows.raw.resize(static_cast<size_t>(count) * rows.vector_bytes);
+  rows.decoded.resize(static_cast<size_t>(count) * dim);
 
-  if (has_suffix(".u8bin")) {
-    std::vector<uint8_t> raw(data.size());
-    input.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
-    if (!input) {
-      throw std::runtime_error("failed to read u8bin payload: " + path);
-    }
-    for (size_t i = 0; i < raw.size(); ++i) {
-      data[i] = static_cast<float>(raw[i]);
-    }
-  } else if (has_suffix(".i8bin")) {
-    std::vector<int8_t> raw(data.size());
-    input.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
-    if (!input) {
-      throw std::runtime_error("failed to read i8bin payload: " + path);
-    }
-    for (size_t i = 0; i < raw.size(); ++i) {
-      data[i] = static_cast<float>(raw[i]);
-    }
-  } else {
-    input.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size() * sizeof(float)));
-    if (!input) {
-      throw std::runtime_error("failed to read float vector payload: " + path);
-    }
+  input.read(reinterpret_cast<char*>(rows.raw.data()), static_cast<std::streamsize>(rows.raw.size()));
+  if (!input) {
+    throw std::runtime_error("failed to read vector payload: " + path);
   }
 
-  if (dim_out) {
-    *dim_out = dim;
+  for (size_t row = 0; row < rows.count; ++row) {
+    decode_storage_vector_to_float(rows.raw_row(row), rows.dtype, rows.dim,
+                                   rows.decoded.data() + row * rows.dim);
   }
-  if (count_out) {
-    *count_out = count;
-  }
-  return data;
+  return rows;
+}
+
+VectorRows make_float_query_rows(const std::vector<float>& values, uint32_t dim) {
+  VectorRows rows;
+  rows.dtype = VectorDType::float32;
+  rows.dim = dim;
+  rows.count = dim == 0 ? 0 : values.size() / dim;
+  rows.vector_bytes = vector_dtype_bytes(rows.dtype, dim);
+  rows.decoded = values;
+  rows.raw.resize(values.size() * sizeof(float));
+  std::memcpy(rows.raw.data(), values.data(), rows.raw.size());
+  return rows;
 }
 
 
@@ -166,6 +176,11 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   using service::breakdown::aggregate_text_summary;
   using service::breakdown::report_to_json;
 
+  const uint64_t gpu_node_cache_requested_bytes =
+    static_cast<uint64_t>(service.config().gpu_node_cache_mb) * 1024ull * 1024ull;
+  const uint64_t gpu_node_cache_slots = VamanaNode::vector_bytes() == 0
+                                          ? 0
+                                          : (gpu_node_cache_requested_bytes / VamanaNode::vector_bytes() / 4ull) * 4ull;
   nlohmann::json root;
   root["meta"] = {
     {"workload", args.workload},
@@ -178,6 +193,15 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"time_issue_policy", args.mixed_mode == "fixed_threads" ? "fixed_read_write_threads_until_deadline"
                                                         : "probabilistic_read_write_per_thread_until_deadline"},
     {"mixed_dispatch_policy", args.mixed_mode},
+    {"vector_data_type", VamanaNode::vector_dtype_name()},
+    {"vector_component_size", VamanaNode::vector_component_size()},
+    {"vector_bytes", VamanaNode::vector_bytes()},
+    {"node_size", VamanaNode::total_size()},
+    {"candidate_vector_rdma_bytes", VamanaNode::vector_bytes()},
+    {"gpu_node_cache_mb", service.config().gpu_node_cache_mb},
+    {"gpu_node_cache_bytes", gpu_node_cache_slots * VamanaNode::vector_bytes()},
+    {"gpu_node_cache_slots", gpu_node_cache_slots},
+    {"effective_bytes_per_vector", VamanaNode::vector_bytes()},
     {"operation_granularity", "single_vector"},
     {"insert_vector_source", "deterministic_synthetic_from_insert_id"},
     {"client_threads", args.client_threads},
@@ -186,7 +210,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"dim", service.config().dim},
     {"threads", service.config().num_threads},
     {"coroutines", service.config().num_coroutines},
-    {"search_mode", service.config().search_mode},
+    {"search", "exact"},
   };
   const size_t dim = service.config().dim;
   size_t fixed_read_threads = 0;
@@ -215,15 +239,6 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   std::cerr << "[breakdown] preparing workload: bootstrap_count=" << bootstrap_count
             << ", workload=" << args.workload << std::endl;
   const bool needs_query_data = (args.workload == "query" || args.workload == "both" || args.workload == "mixed");
-  const bool requires_rabitq_artifacts = service.config().use_rabitq_search() &&
-                                         (args.workload == "insert" || args.workload == "both" || args.workload == "mixed");
-
-  if (requires_rabitq_artifacts && !service.config().load_index) {
-    throw std::runtime_error(
-      "mixed/insert benchmark with search-mode=rabitq_gpu requires a preloaded offline index. "
-      "Enable --load-index and provide a valid index-prefix so the .meta.json and .rotation.bin artifacts are loaded.");
-  }
-
   std::vector<uint32_t> bootstrap_ids(bootstrap_count);
   std::iota(bootstrap_ids.begin(), bootstrap_ids.end(), 1);
   const auto bootstrap_vectors = make_dataset(bootstrap_ids, dim);
@@ -278,16 +293,16 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     return current_id;
   };
 
-  std::vector<float> query_data;
+  VectorRows query_rows;
   size_t query_count = 0;
   if (!args.query_file.empty()) {
     std::ifstream probe(args.query_file, std::ios::binary);
     if (!probe.good()) {
       throw std::runtime_error("query file does not exist: " + args.query_file);
     }
-    uint32_t file_dim = 0;
-    query_data = read_vector_bin(args.query_file, &file_dim, &query_count);
-    if (file_dim != dim) {
+    query_rows = read_vector_rows(args.query_file);
+    query_count = query_rows.count;
+    if (query_rows.dim != dim) {
       throw std::runtime_error("query dim mismatch with service config");
     }
   } else {
@@ -296,10 +311,14 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       args.measure_seconds > 0 ? args.client_threads * 4096 : args.measure_ops * args.client_threads);
     std::vector<uint32_t> query_ids(query_count);
     std::iota(query_ids.begin(), query_ids.end(), bootstrap_count + 1);
-    query_data = make_dataset(query_ids, dim);
+    query_rows = make_float_query_rows(make_dataset(query_ids, dim), static_cast<uint32_t>(dim));
     root["meta"]["synthetic_query_vectors"] = query_count;
   }
-  std::cerr << "[breakdown] query data ready: count=" << query_count << std::endl;
+  root["meta"]["query_data_type"] = vector_dtype_name(query_rows.dtype);
+  root["meta"]["query_vector_bytes"] = query_rows.vector_bytes;
+  std::cerr << "[breakdown] query data ready: count=" << query_count
+            << " dtype=" << vector_dtype_name(query_rows.dtype)
+            << " vector_bytes=" << query_rows.vector_bytes << std::endl;
 
   bool recall_below_threshold = false;
   auto run_recall_check = [&]() {
@@ -322,9 +341,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     std::atomic<size_t> recall_completed{0};
     ProgressReporter recall_reporter("recall", recall_completed, recall_queries, 0);
     for (size_t qi = 0; qi < recall_queries; ++qi) {
-      std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(qi * dim),
-                               query_data.begin() + static_cast<std::ptrdiff_t>((qi + 1) * dim));
-      const auto results = service.search(query, recall_k);
+      const auto results = service.search_raw(query_rows.dtype, query_rows.raw_row(qi), dim, recall_k);
       std::vector<uint32_t> result_ids;
       result_ids.reserve(results.size());
       for (const auto id : results) {
@@ -360,9 +377,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     ProgressReporter reporter(label, completed_ops, ops, 0);
     for (size_t op = 0; op < ops; ++op) {
       const size_t idx = op % query_count;
-      std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(idx * dim),
-                               query_data.begin() + static_cast<std::ptrdiff_t>((idx + 1) * dim));
-      (void)service.search(query, service.config().k);
+      (void)service.search_raw(query_rows.dtype, query_rows.raw_row(idx), dim, service.config().k);
       completed_ops.fetch_add(1, std::memory_order_relaxed);
     }
     reporter.finish();
@@ -376,10 +391,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     std::chrono::nanoseconds avg_query_duration{0};
     while (can_start_timed_operation(deadline, avg_query_duration, op)) {
       const size_t idx = op % query_count;
-      std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(idx * dim),
-                               query_data.begin() + static_cast<std::ptrdiff_t>((idx + 1) * dim));
       const auto started_at = std::chrono::steady_clock::now();
-      (void)service.search(query, service.config().k);
+      (void)service.search_raw(query_rows.dtype, query_rows.raw_row(idx), dim, service.config().k);
       update_avg_duration(avg_query_duration, started_at, op);
       completed_ops.fetch_add(1, std::memory_order_relaxed);
       ++op;
@@ -428,9 +441,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
           if (read_op) {
             issued_reads.fetch_add(1, std::memory_order_relaxed);
             const size_t query_idx = next_query_idx.fetch_add(1, std::memory_order_relaxed) % query_count;
-            std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(query_idx * dim),
-                                     query_data.begin() + static_cast<std::ptrdiff_t>((query_idx + 1) * dim));
-            (void)service.search(query, service.config().k);
+            (void)service.search_raw(query_rows.dtype, query_rows.raw_row(query_idx), dim, service.config().k);
             completed_reads.fetch_add(1, std::memory_order_relaxed);
           } else {
             issued_writes.fetch_add(1, std::memory_order_relaxed);
@@ -489,9 +500,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
           if (read_op) {
             issued_reads.fetch_add(1, std::memory_order_relaxed);
             const size_t query_idx = next_query_idx.fetch_add(1, std::memory_order_relaxed) % query_count;
-            std::vector<float> query(query_data.begin() + static_cast<std::ptrdiff_t>(query_idx * dim),
-                                     query_data.begin() + static_cast<std::ptrdiff_t>((query_idx + 1) * dim));
-            (void)service.search(query, service.config().k);
+            (void)service.search_raw(query_rows.dtype, query_rows.raw_row(query_idx), dim, service.config().k);
             completed_reads.fetch_add(1, std::memory_order_relaxed);
           } else {
             issued_writes.fetch_add(1, std::memory_order_relaxed);

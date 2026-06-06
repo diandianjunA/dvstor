@@ -137,6 +137,27 @@ public:
   }
 
 private:
+  static f32 node_node_distance(const s_ptr<VamanaNode>& lhs, const s_ptr<VamanaNode>& rhs) {
+    if constexpr (std::is_same_v<Distance, IPDistance>) {
+      return typed_ip_distance(lhs->vector_data(), VamanaNode::vector_dtype(),
+                               rhs->vector_data(), VamanaNode::vector_dtype(), VamanaNode::DIM);
+    } else {
+      return typed_l2_distance(lhs->vector_data(), VamanaNode::vector_dtype(),
+                               rhs->vector_data(), VamanaNode::vector_dtype(), VamanaNode::DIM);
+    }
+  }
+
+  static f32 node_centroid_distance(const s_ptr<VamanaNode>& node, const vec<f32>& centroid) {
+    const auto* centroid_bytes = reinterpret_cast<const byte_t*>(centroid.data());
+    if constexpr (std::is_same_v<Distance, IPDistance>) {
+      return typed_ip_distance(node->vector_data(), VamanaNode::vector_dtype(),
+                               centroid_bytes, VectorDType::float32, VamanaNode::DIM);
+    } else {
+      return typed_l2_distance(node->vector_data(), VamanaNode::vector_dtype(),
+                               centroid_bytes, VectorDType::float32, VamanaNode::DIM);
+    }
+  }
+
   /**
    * @brief Compute for each node in `nodes` the smallest distance to the centroids.
    */
@@ -148,7 +169,7 @@ private:
       f32 closest = std::numeric_limits<f32>::max();
 
       for (auto& centroid : node_centroids) {
-        const f32 distance = Distance::dist(node->components(), centroid->components(), VamanaNode::DIM);
+        const f32 distance = node_node_distance(node, centroid);
         if (distance < closest) {
           closest = distance;
         }
@@ -189,7 +210,7 @@ private:
     // copy components
     for (idx_t i = 0; i < k; ++i) {
       for (idx_t j = 0; j < VamanaNode::DIM; ++j) {
-        centroids[i][j] = node_centroids[i]->components()[j];
+        centroids[i][j] = node_centroids[i]->component_as_float(j);
       }
     }
 
@@ -208,7 +229,7 @@ private:
 
       // determine closest centroid
       for (idx_t i = 0; i < centroids.size(); ++i) {
-        const f32 dist = Distance::dist(node->components(), centroids[i], VamanaNode::DIM);
+        const f32 dist = node_centroid_distance(node, centroids[i]);
 
         if (dist < smallest_distance) {
           smallest_distance = dist;
@@ -234,7 +255,7 @@ private:
       ++count[cluster_assignment[i]];
 
       for (idx_t j = 0; j < VamanaNode::DIM; ++j) {
-        new_centroid[j] += nodes[i]->components()[j];
+        new_centroid[j] += nodes[i]->component_as_float(j);
       }
     }
 
@@ -272,7 +293,7 @@ private:
     vec sum_coords(k, vec<f32>(VamanaNode::DIM, 0.));
     for (idx_t i = 0; i < nodes.size(); ++i) {
       for (idx_t j = 0; j < VamanaNode::DIM; ++j) {
-        sum_coords[cluster_assignment[i]][j] += nodes[i]->components()[j];
+        sum_coords[cluster_assignment[i]][j] += nodes[i]->component_as_float(j);
       }
     }
 
@@ -289,7 +310,7 @@ private:
         // remove point
         auto& old_centroid = centroids[old_cluster_assignment];
         for (idx_t j = 0; j < VamanaNode::DIM; ++j) {
-          sum_coords[old_cluster_assignment][j] -= node->components()[j];
+          sum_coords[old_cluster_assignment][j] -= node->component_as_float(j);
           old_centroid[j] =
             sum_coords[old_cluster_assignment][j] / static_cast<f32>(cluster_sizes[old_cluster_assignment] - 1);
         }
@@ -301,11 +322,11 @@ private:
         auto& new_cluster_assignment = cluster_assignment[node_idx];
         f32 cost = std::numeric_limits<f32>::max();
 
-        const f32 dist_old_centroid = Distance::dist(old_centroid, node->components(), VamanaNode::DIM);
+        const f32 dist_old_centroid = node_centroid_distance(node, old_centroid);
         const f32 old_size = static_cast<f32>(cluster_sizes[old_cluster_assignment]) + c;
 
         for (idx_t j = 0; j < k; j++) {
-          const f32 dist_j = Distance::dist(centroids[j], node->components(), VamanaNode::DIM);
+          const f32 dist_j = node_centroid_distance(node, centroids[j]);
           const f32 size_j = static_cast<f32>(cluster_sizes[j]);
           const f32 penalty_needed = (dist_j - dist_old_centroid) / (old_size - size_j);
 
@@ -333,7 +354,7 @@ private:
         size_t& new_cluster_size = cluster_sizes[new_cluster_assignment];
 
         for (idx_t j = 0; j < VamanaNode::DIM; ++j) {
-          sum_coords[new_cluster_assignment][j] += node->components()[j];
+          sum_coords[new_cluster_assignment][j] += node->component_as_float(j);
           new_centroid[j] = sum_coords[new_cluster_assignment][j] / static_cast<f32>(new_cluster_size + 1);
         }
         ++new_cluster_size;
@@ -358,7 +379,7 @@ private:
       f32 min_dist = std::numeric_limits<f32>::max();
       idx_t index = 0;
       for (idx_t i = 0; i < k; ++i) {
-        const f32 dist = Distance::dist(centroids[i], node->components(), VamanaNode::DIM);
+        const f32 dist = node_centroid_distance(node, centroids[i]);
         if (dist < min_dist) {
           min_dist = dist;
           index = i;

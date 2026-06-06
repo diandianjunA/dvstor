@@ -7,6 +7,8 @@
 #include <numeric>
 #include <unordered_set>
 
+#include <cuda_runtime.h>
+
 #include <library/utils.hh>
 
 #include "gpu/gpu_kernel_launcher.hh"
@@ -14,7 +16,6 @@
 #include "tools/vamana_offline/dataset_io.hh"
 #include "tools/vamana_offline/graph.hh"
 #include "tools/vamana_offline/progress.hh"
-#include "tools/vamana_offline/rabitq.hh"
 #include "tools/vamana_offline/shard_writer.hh"
 #include "vamana/vamana_node.hh"
 
@@ -32,37 +33,54 @@ int main(int argc, char** argv) {
   std::cerr << "memory nodes: " << config.num_memory_nodes << "\n";
   std::cerr << "threads: " << effective_thread_count(config.threads) << "\n";
   std::cerr << "R=" << config.R << " construction_beam_width=" << config.beam_width
-            << " alpha=" << config.alpha << " rabitq_bits=" << config.rabitq_bits
-            << " node_layout=" << config.node_layout << "\n";
+            << " alpha=" << config.alpha
+            << " vector_data_type=" << vector_dtype_name(dataset.dtype) << "\n";
   std::cerr << "partition_strategy=" << config.partition_strategy
             << " partition_max_degree=" << config.partition_max_degree
             << " partition_imbalance=" << config.partition_imbalance << "\n";
-  std::cerr << "offline_reverse_mode=" << config.offline_reverse_mode
-            << " skip_sanity_check=" << (config.skip_sanity_check ? "true" : "false") << "\n";
+  std::cerr << "skip_sanity_check=" << (config.skip_sanity_check ? "true" : "false") << "\n";
 
   const auto build_start = std::chrono::steady_clock::now();
 
   // Initialize VamanaNode static storage
-  VamanaNode::init_static_storage(
-      dataset.dim, config.R, config.rabitq_bits, VamanaNode::parse_layout(config.node_layout));
-
-  // Select distance function
-  DistFn dist_fn = config.ip_distance ? ip_distance : l2_squared;
+  VamanaNode::init_static_storage(dataset.dim, config.R, dataset.dtype);
 
   // GPU initialization
   const size_t num_threads = effective_thread_count(config.threads);
   std::unique_ptr<BuilderGpuContext[]> gpu_contexts;
   size_t num_gpu_contexts = 0;
+  void* d_base_vectors = nullptr;
 
   if (!config.no_gpu && !config.ip_distance) {
     gpu::gpu_init(config.gpu_device);
-    num_gpu_contexts = num_threads;
-    gpu_contexts = std::make_unique<BuilderGpuContext[]>(num_gpu_contexts);
-    for (size_t i = 0; i < num_gpu_contexts; ++i) {
-      gpu_contexts[i].init(dataset.dim, config.beam_width, config.R);
+    const size_t gpu_budget_bytes = static_cast<size_t>(config.gpu_memory_gb * 1024.0 * 1024.0 * 1024.0);
+    const size_t raw_bytes = dataset.raw_vectors.size();
+    const size_t workspace_streams = config.build_gpu_streams == 0
+        ? std::min<size_t>(num_threads, 32)
+        : static_cast<size_t>(config.build_gpu_streams);
+    const size_t workspace_bytes = workspace_streams *
+        (static_cast<size_t>(config.beam_width) * (sizeof(u32) + sizeof(float)) + 4096);
+    if (raw_bytes + workspace_bytes <= gpu_budget_bytes) {
+      d_base_vectors = gpu::gpu_malloc(raw_bytes);
+      cudaStream_t upload_stream = gpu::gpu_stream_create();
+      gpu::gpu_memcpy_h2d_async(d_base_vectors, dataset.raw_vectors.data(), raw_bytes, upload_stream);
+      gpu::gpu_stream_synchronize(upload_stream);
+      gpu::gpu_stream_destroy(upload_stream);
+      num_gpu_contexts = workspace_streams;
+      gpu_contexts = std::make_unique<BuilderGpuContext[]>(num_gpu_contexts);
+      for (size_t i = 0; i < num_gpu_contexts; ++i) {
+        gpu_contexts[i].init(dataset.dim, config.beam_width, dataset.dtype, d_base_vectors);
+      }
+      std::cerr << "GPU: device " << config.gpu_device
+                << " resident_raw_base=true streams=" << num_gpu_contexts
+                << " raw_bytes=" << raw_bytes
+                << " budget_bytes=" << gpu_budget_bytes << "\n";
+    } else {
+      std::cerr << "GPU: disabled (raw dataset + workspace exceeds --gpu-memory-gb budget: raw="
+                << raw_bytes << " workspace=" << workspace_bytes
+                << " budget=" << gpu_budget_bytes << ")\n";
+      gpu::gpu_shutdown();
     }
-    std::cerr << "GPU: device " << config.gpu_device
-              << " (" << num_gpu_contexts << " streams)\n";
   } else {
     std::cerr << "GPU: disabled"
               << (config.ip_distance ? " (IP distance not supported on GPU)" : "")
@@ -71,8 +89,7 @@ int main(int argc, char** argv) {
 
   // Step 1: Build Vamana graph
   VamanaGraph graph;
-  build_vamana_graph(graph, dataset, config, dist_fn,
-                     gpu_contexts.get(), num_gpu_contexts);
+  build_vamana_graph(graph, dataset, config, gpu_contexts.get(), num_gpu_contexts);
 
   // Optional: recall test with external queries and ground truth
   if (!config.query_path.empty() && !config.groundtruth_path.empty()) {
@@ -110,7 +127,7 @@ int main(int argc, char** argv) {
       size_t total_hits = 0;
       for (u32 qi = 0; qi < n_queries; ++qi) {
         const float* qvec = query_vecs.data() + static_cast<size_t>(qi) * q_dim;
-        auto results = beam_search(graph, dataset, qvec, search_beam, dist_fn);
+        auto results = beam_search_float_query(graph, dataset, qvec, search_beam, config.ip_distance);
 
         // Ground truth for this query
         const u32* gt_row = gt_ids.data() + static_cast<size_t>(qi) * gt_k;
@@ -130,28 +147,14 @@ int main(int argc, char** argv) {
     std::cerr << "=== End Recall Test ===\n\n";
   }
 
-  // Step 2: Initialize RaBitQ and quantize all vectors
-  RaBitQState rabitq_state = init_rabitq(dataset, config.rabitq_bits, config.seed);
-
-  vec<vec<byte_t>> rabitq_data(dataset.ids.size());
-  {
-    ProgressReporter progress{"Quantizing vectors (RaBitQ)", dataset.ids.size()};
-    parallel_for(0, dataset.ids.size(), config.threads,
-                 [&](size_t i, size_t) {
-                   rabitq_data[i].resize(rabitq_state.total_rabitq_bytes);
-                   rabitq_quantize_vector(dataset.vector(i), rabitq_state, rabitq_data[i].data());
-                   progress.increment();
-                 });
-    progress.finish();
-  }
-
-  // Step 3: Serialize to shard files
-  write_vamana_shards(graph, dataset, config, rabitq_state, rabitq_data, output_prefix);
+  // Step 2: Serialize to shard files
+  write_vamana_shards(graph, dataset, config, output_prefix);
 
   // GPU cleanup
   for (size_t i = 0; i < num_gpu_contexts; ++i) gpu_contexts[i].destroy();
   gpu_contexts.reset();
-  if (num_gpu_contexts > 0) gpu::gpu_shutdown();
+  if (d_base_vectors) gpu::gpu_free(d_base_vectors);
+  if (num_gpu_contexts > 0 || d_base_vectors) gpu::gpu_shutdown();
 
   const auto build_end = std::chrono::steady_clock::now();
   const auto seconds = std::chrono::duration_cast<std::chrono::duration<double>>(build_end - build_start).count();

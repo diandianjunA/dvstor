@@ -19,6 +19,9 @@
 namespace cache {
 class Cache;
 }
+namespace gpu {
+class GpuNodeCache;
+}
 
 enum class ServiceWorkerRole { none, insert, query };
 
@@ -98,6 +101,7 @@ public:
   bool is_query_worker() const { return service_role_ == ServiceWorkerRole::query; }
   bool is_insert_worker() const { return service_role_ == ServiceWorkerRole::insert; }
   void set_neighbor_cache(cache::NeighborCache* shared_cache) { neighbor_cache = shared_cache; }
+  void set_gpu_node_cache(gpu::GpuNodeCache* shared_cache) { gpu_node_cache = shared_cache; }
   bool neighbor_cache_enabled() const { return neighbor_cache != nullptr && neighbor_cache->enabled(); }
   void refresh_neighbor_cache_if_stale() {}
   void invalidate_neighbor_cache(RemotePtr rptr) {
@@ -131,6 +135,7 @@ public:
 
   gpu::GpuBufferManager gpu_buffers;  // CUDA streams, events, staging buffers
   cache::NeighborCache* neighbor_cache{nullptr};  // shared CPU-side query neighbor-list cache
+  gpu::GpuNodeCache* gpu_node_cache{nullptr};  // shared GPU-resident full-vector cache
 
   statistics::ThreadStatistics stats{};
 
