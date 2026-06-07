@@ -527,9 +527,12 @@ vec<RemotePtr> MemoryNode::beam_search_candidates(const span<const element_t> qu
   beam.push_back({medoid, medoid_dist, false});
   visited.insert(medoid);
 
-  // DEBUG: per-iteration shard locality
+  // DEBUG: per-insert shard locality summary
+  static std::atomic<u32> insert_seq{0};
+  u32 this_insert = insert_seq.fetch_add(1, std::memory_order_relaxed);
+  bool should_log = (this_insert < 5) || (this_insert % 500 == 0);
   u32 iter_count = 0;
-  u32 total_expanded = 0, total_local_unvisited = 0, total_remote_unvisited = 0;
+  u32 local_unvisited_sum = 0, remote_unvisited_sum = 0;
 
   for (;;) {
     ++iter_count;
@@ -566,17 +569,8 @@ vec<RemotePtr> MemoryNode::beam_search_candidates(const span<const element_t> qu
       unvisited_neighbors.push_back(neighbor);
       if (local_shard(neighbor.memory_node())) ++iter_local; else ++iter_remote;
     }
-    total_local_unvisited += iter_local;
-    total_remote_unvisited += iter_remote;
-    ++total_expanded;
-
-    // Print per-iteration shard distribution (first ~200 iterations across inserts)
-    if (total_expanded <= 200) {
-      std::cerr << "[beam_search] iter=" << iter_count
-                << " expanded_shard=" << beam[best_idx].rptr.memory_node()
-                << " local=" << iter_local << " remote=" << iter_remote
-                << std::endl;
-    }
+    local_unvisited_sum += iter_local;
+    remote_unvisited_sum += iter_remote;
 
     const u32 snapshot_batch = storage_owner_snapshot_batch_size(config);
     const u32 construction_width = storage_owner_construction_width(config);
@@ -605,14 +599,15 @@ vec<RemotePtr> MemoryNode::beam_search_candidates(const span<const element_t> qu
     }
   }
 
-  // DEBUG: summary for this beam search
-  if (total_expanded <= 200) {
-    float local_pct = (total_local_unvisited + total_remote_unvisited) > 0
-      ? 100.0f * total_local_unvisited / (total_local_unvisited + total_remote_unvisited) : 0;
-    std::cerr << "[beam_search] DONE: iterations=" << iter_count
-              << " expanded=" << total_expanded
-              << " local_unvisited=" << total_local_unvisited
-              << " remote_unvisited=" << total_remote_unvisited
+  // DEBUG: per-insert summary
+  if (should_log) {
+    u32 total = local_unvisited_sum + remote_unvisited_sum;
+    float local_pct = total > 0 ? 100.0f * local_unvisited_sum / total : 0;
+    std::cerr << "[beam_search] insert=" << this_insert
+              << " shard=" << storage_id_
+              << " iters=" << iter_count
+              << " local=" << local_unvisited_sum
+              << " remote=" << remote_unvisited_sum
               << " local_pct=" << local_pct << "%"
               << std::endl;
   }
