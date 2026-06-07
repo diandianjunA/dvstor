@@ -649,7 +649,15 @@ auto MemoryNode::beam_search_candidates_async(const span<const element_t> query,
   beam.push_back({medoid, medoid_dist, false});
   visited.insert(medoid);
 
+  // DEBUG: per-insert shard locality summary
+  static std::atomic<u32> async_insert_seq{0};
+  u32 this_insert_a = async_insert_seq.fetch_add(1, std::memory_order_relaxed);
+  bool should_log_a = (this_insert_a < 5) || (this_insert_a % 500 == 0);
+  u32 iter_count_a = 0;
+  u32 local_sum_a = 0, remote_sum_a = 0;
+
   for (;;) {
+    ++iter_count_a;
     i32 best_idx = -1;
     distance_t best_dist = std::numeric_limits<distance_t>::max();
     auto t_select = std::chrono::steady_clock::now();
@@ -674,13 +682,17 @@ auto MemoryNode::beam_search_candidates_async(const span<const element_t> query,
     }
     vec<RemotePtr> unvisited_neighbors;
     unvisited_neighbors.reserve(neighbors.size());
+    u32 iter_local_a = 0, iter_remote_a = 0;
     for (const RemotePtr& neighbor : neighbors) {
       if (neighbor.is_null() || visited.contains(neighbor)) {
         continue;
       }
       visited.insert(neighbor);
       unvisited_neighbors.push_back(neighbor);
+      if (local_shard(neighbor.memory_node())) ++iter_local_a; else ++iter_remote_a;
     }
+    local_sum_a += iter_local_a;
+    remote_sum_a += iter_remote_a;
 
     const u32 snapshot_batch = storage_owner_snapshot_batch_size(config);
     const u32 construction_width = storage_owner_construction_width(config);
@@ -707,6 +719,19 @@ auto MemoryNode::beam_search_candidates_async(const span<const element_t> query,
         }
       }
     }
+  }
+
+  // DEBUG: per-insert summary
+  if (should_log_a) {
+    u32 total = local_sum_a + remote_sum_a;
+    float local_pct = total > 0 ? 100.0f * local_sum_a / total : 0;
+    std::cerr << "[beam_search_async] insert=" << this_insert_a
+              << " shard=" << storage_id_
+              << " iters=" << iter_count_a
+              << " local=" << local_sum_a
+              << " remote=" << remote_sum_a
+              << " local_pct=" << local_pct << "%"
+              << std::endl;
   }
 
   auto& out = storage_owner_async_candidates_[thread.id][thread.running_coroutine];
