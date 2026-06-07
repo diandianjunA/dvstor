@@ -44,6 +44,7 @@ cmd=("$BUILD_DIR/dvstor_breakdown_benchmark"
   --recall-k "$RECALL_K"
   --min-recall "$MIN_RECALL"
   --insert-start-id "${INSERT_START_ID:-$((MAX_VECTORS + 1000000))}"
+  --insert-file "$(insert_bin)"
   --report-json "$JSON_REPORT"
   --report-text "$TEXT_REPORT")
 

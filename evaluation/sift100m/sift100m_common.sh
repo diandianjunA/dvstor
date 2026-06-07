@@ -14,8 +14,8 @@ LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
 PID_DIR="${PID_DIR:-$SCRIPT_DIR/pids}"
 
 SHARDS="${SHARDS:-5}"
-PARTITION_STRATEGY="${PARTITION_STRATEGY:-bfs}"
-# PARTITION_STRATEGY="${PARTITION_STRATEGY:-balanced}"
+# PARTITION_STRATEGY="${PARTITION_STRATEGY:-bfs}"
+PARTITION_STRATEGY="${PARTITION_STRATEGY:-balanced}"
 R="${R:-48}"
 BUILD_BEAM="${BUILD_BEAM:-200}"
 SEARCH_BEAM="${SEARCH_BEAM:-128}"
@@ -93,6 +93,7 @@ query_suffix() {
 base_bin() { echo "$CONVERTED_DIR/base$(base_suffix).u8bin"; }
 query_bin() { echo "$CONVERTED_DIR/query$(query_suffix).u8bin"; }
 groundtruth_bin() { echo "$CONVERTED_DIR/groundtruth_${GROUNDTRUTH_LABEL}.bin"; }
+insert_bin() { echo "${INSERT_FILE:-$CONVERTED_DIR/insert_test.u8bin}"; }
 
 metadata_file() { echo "${INDEX_PREFIX}.meta.json"; }
 
