@@ -131,11 +131,6 @@ bool MemoryNode::read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
   snapshot.rptr = rptr;
   snapshot.vector_data.resize(VamanaNode::vector_bytes());
 
-  if (current_storage_owner_thread_ != nullptr &&
-      current_storage_owner_thread_->cache.lookup_snapshot(rptr, snapshot)) {
-    return true;
-  }
-
   const size_t read_size = VamanaNode::size_until_vector_end();
   if (local_shard(rptr.memory_node())) {
     const byte_t* ptr = local_node_ptr(rptr);
@@ -143,9 +138,6 @@ bool MemoryNode::read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
     snapshot.id = *reinterpret_cast<const u32*>(ptr + VamanaNode::offset_id());
     snapshot.edge_count = *reinterpret_cast<const u8*>(ptr + VamanaNode::offset_edge_count());
     std::memcpy(snapshot.vector_data.data(), ptr + VamanaNode::offset_vector(), VamanaNode::vector_bytes());
-    if (current_storage_owner_thread_ != nullptr) {
-      current_storage_owner_thread_->cache.insert_snapshot(snapshot);
-    }
     return true;
   }
 
@@ -159,9 +151,6 @@ bool MemoryNode::read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
   snapshot.id = *reinterpret_cast<const u32*>(ptr + VamanaNode::offset_id());
   snapshot.edge_count = *reinterpret_cast<const u8*>(ptr + VamanaNode::offset_edge_count());
   std::memcpy(snapshot.vector_data.data(), ptr + VamanaNode::offset_vector(), VamanaNode::vector_bytes());
-  if (current_storage_owner_thread_ != nullptr) {
-    current_storage_owner_thread_->cache.insert_snapshot(snapshot);
-  }
   return true;
 }
 
@@ -174,11 +163,6 @@ vec<RemotePtr> MemoryNode::read_neighbor_list(RemotePtr rptr) {
                " size=" + std::to_string(VamanaNode::offset_neighbors() + VamanaNode::NEIGHBORS_SIZE) +
                " capacity=" + std::to_string(mn_memory_bytes_));
   vec<RemotePtr> neighbors;
-  if (current_storage_owner_thread_ != nullptr &&
-      current_storage_owner_thread_->cache.lookup_neighbors(rptr, neighbors)) {
-    return neighbors;
-  }
-
   if (local_shard(rptr.memory_node())) {
     const byte_t* ptr = local_node_ptr(rptr);
     const u8 edge_count = *reinterpret_cast<const u8*>(ptr + VamanaNode::offset_edge_count());
@@ -188,9 +172,6 @@ vec<RemotePtr> MemoryNode::read_neighbor_list(RemotePtr rptr) {
       if (!slots[i].is_null()) {
         neighbors.push_back(slots[i]);
       }
-    }
-    if (current_storage_owner_thread_ != nullptr) {
-      current_storage_owner_thread_->cache.insert_neighbors(rptr, neighbors);
     }
     return neighbors;
   }
@@ -208,9 +189,6 @@ vec<RemotePtr> MemoryNode::read_neighbor_list(RemotePtr rptr) {
     if (!slots[i].is_null()) {
       neighbors.push_back(slots[i]);
     }
-  }
-  if (current_storage_owner_thread_ != nullptr) {
-    current_storage_owner_thread_->cache.insert_neighbors(rptr, neighbors);
   }
   return neighbors;
 }
@@ -237,15 +215,9 @@ auto MemoryNode::async_read_node_snapshot(RemotePtr rptr, StorageOwnerThread& th
       snapshot.id = *reinterpret_cast<const u32*>(buffer + VamanaNode::offset_id());
       snapshot.edge_count = *reinterpret_cast<const u8*>(buffer + VamanaNode::offset_edge_count());
       std::memcpy(snapshot.vector_data.data(), buffer + VamanaNode::offset_vector(), VamanaNode::vector_bytes());
-      thread->cache.insert_snapshot(snapshot);
       return std::move(snapshot);
     }
   };
-
-  NodeSnapshot cached;
-  if (thread.cache.lookup_snapshot(rptr, cached)) {
-    return Awaitable{true, rptr, nullptr, std::move(cached), this, &thread};
-  }
 
   if (local_shard(rptr.memory_node())) {
     NodeSnapshot snapshot;
@@ -278,7 +250,6 @@ auto MemoryNode::async_read_node_snapshots(const vec<RemotePtr>& rptrs,
       for (const PendingRead& read : pending) {
         NodeSnapshot snapshot;
         parse_node_snapshot(read.rptr, read.buffer, snapshot);
-        thread->cache.insert_snapshot(snapshot);
         snapshots.push_back(std::move(snapshot));
       }
       return std::move(snapshots);
@@ -302,11 +273,6 @@ auto MemoryNode::async_read_node_snapshots(const vec<RemotePtr>& rptrs,
     }
 
     NodeSnapshot snapshot;
-    if (thread.cache.lookup_snapshot(rptr, snapshot)) {
-      awaitable.snapshots.push_back(std::move(snapshot));
-      continue;
-    }
-
     if (local_shard(rptr.memory_node())) {
       read_node_snapshot(rptr, snapshot);
       awaitable.snapshots.push_back(std::move(snapshot));
@@ -367,11 +333,6 @@ vec<MemoryNode::NodeSnapshot> MemoryNode::read_node_snapshots_batched(const vec<
       }
 
       NodeSnapshot snapshot;
-      if (thread->cache.lookup_snapshot(rptr, snapshot)) {
-        snapshots.push_back(std::move(snapshot));
-        continue;
-      }
-
       if (local_shard(rptr.memory_node())) {
         read_node_snapshot(rptr, snapshot);
         snapshots.push_back(std::move(snapshot));
@@ -395,7 +356,6 @@ vec<MemoryNode::NodeSnapshot> MemoryNode::read_node_snapshots_batched(const vec<
     for (const PendingRead& read : pending) {
       NodeSnapshot snapshot;
       parse_node_snapshot(read.rptr, read.buffer, snapshot);
-      thread->cache.insert_snapshot(snapshot);
       snapshots.push_back(std::move(snapshot));
     }
   }
@@ -426,15 +386,9 @@ auto MemoryNode::async_read_neighbor_list(RemotePtr rptr, StorageOwnerThread& th
           neighbors.push_back(slots[i]);
         }
       }
-      thread->cache.insert_neighbors(rptr, neighbors);
       return std::move(neighbors);
     }
   };
-
-  vec<RemotePtr> cached;
-  if (thread.cache.lookup_neighbors(rptr, cached)) {
-    return Awaitable{true, rptr, nullptr, std::move(cached), this, &thread};
-  }
 
   if (local_shard(rptr.memory_node())) {
     vec<RemotePtr> neighbors = read_neighbor_list(rptr);
@@ -476,7 +430,6 @@ void MemoryNode::write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neigh
     for (u32 i = edge_count; i < VamanaNode::R; ++i) {
       slots[i].reset();
     }
-    invalidate_storage_owner_cache(rptr);
     return;
   }
 
@@ -493,7 +446,6 @@ void MemoryNode::write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neigh
                      slots.data(),
                      VamanaNode::NEIGHBORS_SIZE,
                      align_up(sizeof(meta)));
-  invalidate_storage_owner_cache(rptr);
 }
 
 void MemoryNode::write_new_node(RemotePtr rptr,
@@ -511,7 +463,6 @@ void MemoryNode::write_new_node(RemotePtr rptr,
   for (u32 i = 0; i < neighbors.size() && i < VamanaNode::R; ++i) {
     slots[i] = neighbors[i];
   }
-  invalidate_storage_owner_cache(rptr);
 }
 
 void MemoryNode::lock_node(RemotePtr rptr) {

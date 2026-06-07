@@ -119,22 +119,8 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
        : static_cast<double>(aggregate.counters.overflow_prune_kernel_threads) /
            static_cast<double>(aggregate.counters.overflow_prunes)},
     {"overflow_prune_max_kernel_threads", aggregate.counters.overflow_prune_max_kernel_threads},
-    {"cache_hits", aggregate.counters.cache_hits},
-    {"cache_misses", aggregate.counters.cache_misses},
     {"query_rdma_to_staging_bytes", aggregate.counters.query_rdma_to_staging_bytes},
     {"query_host_staging_fallback_bytes", aggregate.counters.query_host_staging_fallback_bytes},
-    {"neighbor_cache_hits", aggregate.counters.neighbor_cache_hits},
-    {"neighbor_cache_misses", aggregate.counters.neighbor_cache_misses},
-    {"gpu_node_cache_hits", aggregate.counters.gpu_node_cache_hits},
-    {"gpu_node_cache_misses", aggregate.counters.gpu_node_cache_misses},
-    {"gpu_node_cache_hit_rate",
-     aggregate.counters.gpu_node_cache_hits + aggregate.counters.gpu_node_cache_misses == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.gpu_node_cache_hits) /
-           static_cast<double>(aggregate.counters.gpu_node_cache_hits + aggregate.counters.gpu_node_cache_misses)},
-    {"gpu_node_cache_admissions", aggregate.counters.gpu_node_cache_admissions},
-    {"gpu_node_cache_evictions", aggregate.counters.gpu_node_cache_evictions},
-    {"gpu_node_cache_fill_skips", aggregate.counters.gpu_node_cache_fill_skips},
     {"lock_attempts", aggregate.lock_attempts},
     {"lock_retries", aggregate.lock_retries},
     {"cas_failures", aggregate.cas_failures},

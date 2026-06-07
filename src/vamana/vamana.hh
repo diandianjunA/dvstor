@@ -16,7 +16,6 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 
-#include "cache/cache.hh"
 #include "common/constants.hh"
 #include "common/debug.hh"
 #include "common/distance.hh"
@@ -25,7 +24,6 @@
 #include "coroutine.hh"
 #include "gpu/gpu_awaitable.hh"
 #include "gpu/gpu_kernel_launcher.hh"
-#include "gpu/gpu_node_cache.hh"
 #include "rdma/vamana_rdma_operations.hh"
 #include "remote_pointer.hh"
 #include "vamana/vamana_neighborlist.hh"
@@ -55,14 +53,14 @@ template <class Distance>
 class Vamana {
 public:
     Vamana(u32 R, u32 beam_width, u32 beam_width_construction, f64 alpha,
-           u32 k, u32 dim, VectorDType vector_dtype, bool use_cache)
+           u32 k, u32 dim, VectorDType vector_dtype)
         : R_(R),
           beam_width_(beam_width),
           beam_width_construction_(beam_width_construction),
           alpha_(static_cast<f32>(alpha)),
           k_(k),
           dim_(dim),
-          use_cache_(use_cache) {
+          direct_node_reads_(true) {
         lib_assert(beam_width_ >= k_, "beam_width must be >= k");
         VamanaNode::init_static_storage(dim, R, vector_dtype);
     }
@@ -82,7 +80,7 @@ private:
     const f32 alpha_;
     const u32 k_;
     const u32 dim_;
-    const bool use_cache_;
+    const bool direct_node_reads_;
 };
 
 }  // namespace vamana

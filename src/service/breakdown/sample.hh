@@ -32,17 +32,8 @@ struct ThreadCounterDelta {
   u64 overflow_prune_kernel_blocks{};
   u64 overflow_prune_kernel_threads{};
   u64 overflow_prune_max_kernel_threads{};
-  u64 cache_hits{};
-  u64 cache_misses{};
   u64 query_rdma_to_staging_bytes{};
   u64 query_host_staging_fallback_bytes{};
-  u64 neighbor_cache_hits{};
-  u64 neighbor_cache_misses{};
-  u64 gpu_node_cache_hits{};
-  u64 gpu_node_cache_misses{};
-  u64 gpu_node_cache_admissions{};
-  u64 gpu_node_cache_evictions{};
-  u64 gpu_node_cache_fill_skips{};
 };
 
 
@@ -66,17 +57,8 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
     out.visited_nodes =
       (end.visited_nodes - start.visited_nodes) + (end.visited_nodes_l0 - start.visited_nodes_l0);
     out.visited_neighborlists = end.visited_neighborlists - start.visited_neighborlists;
-    out.cache_hits = end.cache_hits - start.cache_hits;
-    out.cache_misses = end.cache_misses - start.cache_misses;
     out.query_rdma_to_staging_bytes = end.query_rdma_to_staging_bytes - start.query_rdma_to_staging_bytes;
     out.query_host_staging_fallback_bytes = end.query_host_staging_fallback_bytes - start.query_host_staging_fallback_bytes;
-    out.neighbor_cache_hits = end.neighbor_cache_hits - start.neighbor_cache_hits;
-    out.neighbor_cache_misses = end.neighbor_cache_misses - start.neighbor_cache_misses;
-    out.gpu_node_cache_hits = end.gpu_node_cache_hits - start.gpu_node_cache_hits;
-    out.gpu_node_cache_misses = end.gpu_node_cache_misses - start.gpu_node_cache_misses;
-    out.gpu_node_cache_admissions = end.gpu_node_cache_admissions - start.gpu_node_cache_admissions;
-    out.gpu_node_cache_evictions = end.gpu_node_cache_evictions - start.gpu_node_cache_evictions;
-    out.gpu_node_cache_fill_skips = end.gpu_node_cache_fill_skips - start.gpu_node_cache_fill_skips;
     return out;
   }
 
@@ -112,8 +94,6 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
     end.build_overflow_prune_max_kernel_threads > start.build_overflow_prune_max_kernel_threads
       ? end.build_overflow_prune_max_kernel_threads
       : 0;
-  out.cache_hits = end.cache_hits - start.cache_hits;
-  out.cache_misses = end.cache_misses - start.cache_misses;
   return out;
 }
 

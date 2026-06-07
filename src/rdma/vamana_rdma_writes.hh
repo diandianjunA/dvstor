@@ -182,7 +182,6 @@ inline auto write_vamana_neighbors(const s_ptr<VamanaNode>& node,
         void await_resume() {
             thread->buffer_allocator.free_buffer(meta_buffer, meta_size);
             thread->buffer_allocator.free_buffer(nbr_buffer, nbr_size);
-            thread->invalidate_neighbor_cache(rptr);
         }
     };
 

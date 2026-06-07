@@ -15,7 +15,7 @@ ensure_built dvstor_breakdown_benchmark
 PREPARE_BASE="${PREPARE_BASE:-0}" "$SCRIPT_DIR/prepare_sift100m_data.sh"
 
 WORKLOAD="${WORKLOAD:-mixed}"
-READ_RATIO="${READ_RATIO:-0.95}"
+READ_RATIO="${READ_RATIO:-0.5}"
 MIXED_MODE="${MIXED_MODE:-fixed_threads}"
 WARMUP_SECONDS="${WARMUP_SECONDS:-30}"
 MEASURE_SECONDS="${MEASURE_SECONDS:-120}"

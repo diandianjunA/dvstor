@@ -30,14 +30,9 @@ Optimization profiles:
 ./evaluation/sift1b/start_all_memory_nodes.sh gpudirect_rdma
 ./evaluation/sift1b/run_breakdown.sh gpudirect_rdma
 
-./evaluation/sift1b/start_all_memory_nodes.sh gpudirect_rdma_gpu_cache
-./evaluation/sift1b/run_breakdown.sh gpudirect_rdma_gpu_cache
-
-./evaluation/sift1b/start_all_memory_nodes.sh gpudirect_rdma_gpu_cache_storage_owner
-./evaluation/sift1b/run_breakdown.sh gpudirect_rdma_gpu_cache_storage_owner
+./evaluation/sift1b/start_all_memory_nodes.sh gpudirect_rdma_storage_owner
+./evaluation/sift1b/run_breakdown.sh gpudirect_rdma_storage_owner
 ```
-
-`gpudirect_rdma_gpu_cache` enables the GPU-resident node vector cache with `gpu-node-cache-mb` and keeps the CPU neighbor-list cache enabled with `neighbor-cache-mb`; it requires `gpudirect-rdma=true`.
 
 ## Common Overrides
 
@@ -63,6 +58,6 @@ mn_memory ~= ceil(MAX_VECTORS / SHARDS * node_bytes * 1.2) + 4GB
 
 For full SIFT1B with `dim=128`, `R=64`, `uint8`, and 5 shards, this is about 152GB per memory node, not 200GB. Override with `MN_MEMORY_GB=...` if your partition or insert workload needs more slack.
 
-Compute-node memory defaults to 16GB. GPU node cache memory is allocated from GPU memory through `GPU_NODE_CACHE_MB`; common default is 0 and GPU-cache profiles set 4096MB.
+Compute-node memory defaults to 16GB.
 
 Ground truth conversion defaults to top-100, which is enough for recall@10/recall@100 and avoids carrying the full top-1000 unless explicitly requested. Set `GROUNDTRUTH_TOPK=1000` if you need full SIFT1B ground truth rows. Recall scripts default to 1000 query vectors for quick testing; set `RECALL_QUERIES=10000` for the standard full query set.

@@ -326,14 +326,6 @@ const byte_t* MemoryNode::local_node_ptr(const RemotePtr& rptr) const {
   return index_buffer_.get_full_buffer() + rptr.byte_offset();
 }
 
-void MemoryNode::invalidate_storage_owner_cache(RemotePtr rptr) {
-  for (auto& thread : storage_owner_threads_) {
-    if (thread) {
-      thread->cache.invalidate(rptr);
-    }
-  }
-}
-
 void MemoryNode::insert_into_beam(vec<BeamEntry>& beam, const RemotePtr& rptr, distance_t dist, u32 max_beam_width) {
   auto it = std::lower_bound(
     beam.begin(), beam.end(), dist, [](const BeamEntry& entry, distance_t value) { return entry.distance < value; });

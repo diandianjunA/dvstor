@@ -90,5 +90,5 @@ private:
   std::mutex freelist_mutex_;
   std::unordered_map<size_t, concurrent_queue<byte_t*>> freelists_by_size_;
 
-  concurrent_vec<byte_t*> allocated_buffers_;  // track valid pointers (for cache eviction)
+  concurrent_vec<byte_t*> allocated_buffers_;  // tracks allocator-owned pointers
 };

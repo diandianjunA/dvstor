@@ -59,15 +59,6 @@ else
   CN_MEMORY_GB_WAS_DEFAULT=0
 fi
 MN_MEMORY_GB="${MN_MEMORY_GB:-$(estimate_mn_memory_gb)}"
-CACHE_RATIO="${CACHE_RATIO:-5}"
-NEIGHBOR_CACHE_MB="${NEIGHBOR_CACHE_MB:-4096}"
-if [[ -z "${GPU_NODE_CACHE_MB+x}" ]]; then
-  GPU_NODE_CACHE_MB=0
-  GPU_NODE_CACHE_MB_WAS_DEFAULT=1
-else
-  GPU_NODE_CACHE_MB_WAS_DEFAULT=0
-fi
-STORAGE_OWNER_CACHE_MB="${STORAGE_OWNER_CACHE_MB:-4096}"
 
 BASE_PORT="${BASE_PORT:-1234}"
 HOSTS="${HOSTS:-127.0.0.1 127.0.0.1 127.0.0.1 127.0.0.1 127.0.0.1}"
@@ -172,18 +163,11 @@ write_service_config() {
     echo "query-coroutines = ${QUERY_COROUTINES:-4}"
     echo "label = sift1b_${PROFILE_NAME:-$PROFILE}"
     if [[ "${GPUDIRECT_RDMA:-0}" == "1" ]]; then echo "gpudirect-rdma = true"; fi
-    if [[ "${COMPUTE_CACHE:-0}" == "1" ]]; then
-      echo "cache = true"
-      echo "cache-ratio = $CACHE_RATIO"
-    fi
-    if [[ "${NEIGHBOR_CACHE_MB:-0}" != "0" ]]; then echo "neighbor-cache-mb = $NEIGHBOR_CACHE_MB"; fi
-    if [[ "${GPU_NODE_CACHE_MB:-0}" != "0" ]]; then echo "gpu-node-cache-mb = $GPU_NODE_CACHE_MB"; fi
     echo "insert-execution = ${INSERT_EXECUTION:-compute}"
     if [[ "${INSERT_EXECUTION:-compute}" == "storage_owner" ]]; then
       echo "storage-peers = $endpoints"
       echo "storage-owner-batch-max = ${STORAGE_OWNER_BATCH_MAX:-32}"
       echo "storage-owner-batch-wait-us = ${STORAGE_OWNER_BATCH_WAIT_US:-100}"
-      echo "storage-owner-cache-mb = $STORAGE_OWNER_CACHE_MB"
       echo "storage-owner-peer-rdma-tokens = ${STORAGE_OWNER_PEER_RDMA_TOKENS:-8}"
       echo "storage-owner-rpc-depth = ${STORAGE_OWNER_RPC_DEPTH:-16}"
       echo "storage-owner-rpc-timeout-ms = ${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}"

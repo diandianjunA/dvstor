@@ -14,10 +14,8 @@
 #include <library/connection_manager.hh>
 #include <library/memory_region.hh>
 
-#include "cache/neighbor_cache.hh"
 #include "common/configuration.hh"
 #include "common/core_assignment.hh"
-#include "gpu/gpu_node_cache.hh"
 #include "http/vamana_service_scheduler.hh"
 #include "memory_node/command_protocol.hh"
 #include "service/breakdown.hh"
@@ -228,8 +226,7 @@ private:
 
   std::atomic<bool> shutdown_{false};
   std::atomic<size_t> vectors_inserted_{0};
-  cache::NeighborCache shared_neighbor_cache_;
-  std::unique_ptr<gpu::GpuNodeCache> shared_gpu_node_cache_;
+  void* reserved_query_state_[2]{};
 
   std::mutex mn_command_mutex_;
   std::atomic<bool> workers_paused_{false};

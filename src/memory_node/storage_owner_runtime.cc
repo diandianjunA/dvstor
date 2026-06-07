@@ -49,15 +49,12 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
   const size_t scratch_bytes =
     std::max<size_t>(64ull * 1024ull * 1024ull,
                      coroutine_scratch_stride * std::max<u32>(1, coroutines_per_worker));
-  const size_t cache_bytes_per_worker =
-    worker_count == 0 ? 0 : static_cast<size_t>(config.storage_owner_cache_mb) * 1024ull * 1024ull / worker_count;
   storage_owner_threads_.reserve(worker_count);
   for (u32 i = 0; i < worker_count; ++i) {
     auto thread = std::make_unique<StorageOwnerThread>(i, coroutines_per_worker, config.max_send_queue_wr);
     if (peer_context_) {
       thread->init_peer_scratch(*peer_context_, scratch_bytes, coroutine_scratch_stride);
     }
-    thread->cache.init(cache_bytes_per_worker);
     storage_owner_threads_.push_back(std::move(thread));
   }
   storage_owner_async_candidates_.clear();

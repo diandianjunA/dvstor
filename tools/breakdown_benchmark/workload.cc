@@ -176,11 +176,6 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   using service::breakdown::aggregate_text_summary;
   using service::breakdown::report_to_json;
 
-  const uint64_t gpu_node_cache_requested_bytes =
-    static_cast<uint64_t>(service.config().gpu_node_cache_mb) * 1024ull * 1024ull;
-  const uint64_t gpu_node_cache_slots = VamanaNode::vector_bytes() == 0
-                                          ? 0
-                                          : (gpu_node_cache_requested_bytes / VamanaNode::vector_bytes() / 4ull) * 4ull;
   nlohmann::json root;
   root["meta"] = {
     {"workload", args.workload},
@@ -198,9 +193,6 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"vector_bytes", VamanaNode::vector_bytes()},
     {"node_size", VamanaNode::total_size()},
     {"candidate_vector_rdma_bytes", VamanaNode::vector_bytes()},
-    {"gpu_node_cache_mb", service.config().gpu_node_cache_mb},
-    {"gpu_node_cache_bytes", gpu_node_cache_slots * VamanaNode::vector_bytes()},
-    {"gpu_node_cache_slots", gpu_node_cache_slots},
     {"effective_bytes_per_vector", VamanaNode::vector_bytes()},
     {"operation_granularity", "single_vector"},
     {"insert_vector_source", "deterministic_synthetic_from_insert_id"},

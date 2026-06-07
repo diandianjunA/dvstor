@@ -509,17 +509,6 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
                   << std::endl;
       }
     }
-    if (response_ok && shared_neighbor_cache_.enabled()) {
-      const u32 invalidation_capacity = service::storage_owner::response_invalidation_capacity(slot.item_count);
-      const u32 invalidation_count = std::min(*service::storage_owner::response_invalidation_count(
-                                                slot.response_buffer.data(), slot.item_count),
-                                              invalidation_capacity);
-      const u64* invalidated = service::storage_owner::response_invalidated_raws(
-        slot.response_buffer.data(), slot.item_count);
-      for (u32 i = 0; i < invalidation_count; ++i) {
-        shared_neighbor_cache_.invalidate(RemotePtr{invalidated[i]});
-      }
-    }
     const u64 memory_breakdown_ns = breakdown == nullptr ? 0 : breakdown->total();
     const u64 send_ns = duration_ns_clamped(slot.send_posted_at, slot.send_completed_at);
     const u64 response_wait_ns = duration_ns_clamped(slot.send_completed_at, slot.response_completed_at);

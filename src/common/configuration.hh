@@ -15,7 +15,7 @@ namespace configuration {
 // struct used for sending serialized from CN to MN
 struct Parameters {
   u32 num_threads{};
-  bool use_cache{};
+  bool reserved{};
   bool routing{};
 };
 
@@ -39,8 +39,6 @@ public:
   u32 k{};
   u32 gpu_device{};       // CUDA device ID
   bool gpudirect_rdma{};  // Enable GPUDirect RDMA (read vectors directly into GPU buffers)
-  u32 neighbor_cache_mb{0};
-  u32 gpu_node_cache_mb{0};
   str vector_data_type{"auto"};
   str insert_execution{"compute"};
   u32 insert_workers{};
@@ -51,7 +49,6 @@ public:
   vec<str> storage_peers;
   u32 storage_owner_batch_max{16};
   u32 storage_owner_batch_wait_us{250};
-  u32 storage_owner_cache_mb{0};
   u32 storage_owner_peer_rdma_tokens{8};
   u32 storage_owner_rpc_depth{8};
   u32 storage_owner_rpc_timeout_ms{30000};
@@ -73,8 +70,6 @@ public:
   bool no_recall{};  // does not calculate the recall and thus requires no groundtruth
   bool ip_distance{};  // use the inner product distance rather than squared L2 norm
 
-  u32 cache_size_ratio{};  // in %
-  bool use_cache{};
   bool routing{};
 
   u32 dim{};
@@ -125,11 +120,7 @@ private:
       "load-index,l",
       po::bool_switch(&load_index),
       "The index is not built, the memory servers load the index from a file.")(
-      "cache", po::bool_switch(&use_cache), "Activate cache on CNs.")(
       "routing", po::bool_switch(&routing), "Activate adaptive query routing.")(
-      "cache-ratio",
-      po::value<u32>(&cache_size_ratio)->default_value(5),
-      "Cache size ratio relative to the index size in %.")(
       "no-recall", po::bool_switch(&no_recall), "No recall computation, ground truth file can be omitted.")(
       "ip-dist", po::bool_switch(&ip_distance), "Use the inner product distance rather than the squared L2 norm.")(
       "beam-width", po::value<u32>(&beam_width), "Beam width during search (replaces ef-search).")(
@@ -161,8 +152,6 @@ private:
       "Maximum number of inserts grouped into one storage_owner batch.")(
       "storage-owner-batch-wait-us", po::value<u32>(&storage_owner_batch_wait_us)->default_value(storage_owner_batch_wait_us),
       "Maximum micro-batch wait in microseconds for storage_owner inserts.")(
-      "storage-owner-cache-mb", po::value<u32>(&storage_owner_cache_mb)->default_value(storage_owner_cache_mb),
-      "Per-memory-node storage_owner local metadata/vector/neighbor cache size in MB. 0 disables it.")(
       "storage-owner-peer-rdma-tokens",
       po::value<u32>(&storage_owner_peer_rdma_tokens)->default_value(storage_owner_peer_rdma_tokens),
       "Maximum storage-owner peer RDMA reads allowed per peer QP. Capped by the memory-node safety limit.")(
@@ -196,10 +185,6 @@ private:
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
-      "neighbor-cache-mb", po::value<u32>(&neighbor_cache_mb)->default_value(0),
-      "Shared CPU neighbor-list cache size per compute node in MB. 0 disables it.")(
-      "gpu-node-cache-mb", po::value<u32>(&gpu_node_cache_mb)->default_value(0),
-      "Shared GPU-resident full-vector node cache size per compute node in MB. Requires --gpudirect-rdma.")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
       "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
@@ -220,11 +205,6 @@ private:
     if ((store_index || load_index) && index_prefix.empty() && data_path.empty()) {
       std::cerr << "[ERROR]: --data-path or --index-prefix is required when --load-index or --store-index is set"
                 << std::endl;
-      exit_with_help_message(argv);
-    }
-
-    if (use_cache && cache_size_ratio == 0) {
-      std::cerr << "[ERROR]: If --cache is set, --cache-ratio must be > 0" << std::endl;
       exit_with_help_message(argv);
     }
 
@@ -361,7 +341,6 @@ public:
         os << std::setw(width) << "storage id: " << config.storage_id << std::endl;
         os << std::setw(width) << "storage batch max: " << config.storage_owner_batch_max << std::endl;
         os << std::setw(width) << "storage batch wait(us): " << config.storage_owner_batch_wait_us << std::endl;
-        os << std::setw(width) << "storage cache (MB): " << config.storage_owner_cache_mb << std::endl;
         os << std::setw(width) << "storage peer RDMA tokens: " << config.storage_owner_peer_rdma_tokens << std::endl;
         os << std::setw(width) << "storage RPC depth: " << config.storage_owner_rpc_depth << std::endl;
         os << std::setw(width) << "storage RPC timeout(ms): " << config.storage_owner_rpc_timeout_ms << std::endl;
@@ -390,8 +369,6 @@ public:
       os << std::setw(width) << "query coroutines: " << config.query_coroutines << std::endl;
       os << std::setw(width) << "GPU device: " << config.gpu_device << std::endl;
       os << std::setw(width) << "GPUDirect RDMA: " << (config.gpudirect_rdma ? "true" : "false") << std::endl;
-      os << std::setw(width) << "shared neighbor cache (MB): " << config.neighbor_cache_mb << std::endl;
-      os << std::setw(width) << "GPU node cache (MB): " << config.gpu_node_cache_mb << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {
       os << std::left << std::setfill(' ');

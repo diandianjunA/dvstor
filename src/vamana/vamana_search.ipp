@@ -8,7 +8,6 @@
         dbg::print(dbg::stream{} << "T" << thread->get_id() << " queries " << q_id << "\n");
         ++thread->stats.processed;
         ++thread->stats.processed_queries;
-        thread->refresh_neighbor_cache_if_stale();
 
         auto& coro_state = thread->current_vamana_coroutine();
         auto& beam = coro_state.beam;
@@ -25,13 +24,13 @@
 
         s_ptr<VamanaNode> medoid_node;
         {
-            const auto t_cache_start = std::chrono::steady_clock::now();
-            auto coro = cache_lookup(medoid_ptr, medoid_node, thread, true);
+            const auto t_node_read = std::chrono::steady_clock::now();
+            auto coro = read_node(medoid_ptr, medoid_node, thread, true);
             while (!coro.handle.done()) {
                 co_await std::suspend_always{};
                 coro.handle.resume();
             }
-            add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_cache_lookup, t_cache_start);
+            add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_node_read, t_node_read);
         }
 
         const size_t query_bytes = vector_dtype_bytes(query_dtype, dim_);
@@ -65,35 +64,12 @@
 
             beam[best_idx].expanded = true;
 
-            u8 neighbor_count = 0;
-            const RemotePtr* neighbor_ptrs = nullptr;
-            s_ptr<VamanaNeighborlist> nlist;
-            {
-                const auto t_neighbor_lookup = std::chrono::steady_clock::now();
-                auto& cached_neighbors = coro_state.scratch_cached_neighbors;
-                if (thread->neighbor_cache_enabled() &&
-                    thread->neighbor_cache->lookup_copy(beam[best_idx].rptr, cached_neighbors)) {
-                    ++thread->stats.neighbor_cache_hits;
-                    neighbor_count = static_cast<u8>(cached_neighbors.size());
-                    neighbor_ptrs = cached_neighbors.data();
-                    add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_cache_lookup,
-                                              t_neighbor_lookup);
-                } else {
-                    ++thread->stats.neighbor_cache_misses;
-                    add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_cache_lookup,
-                                              t_neighbor_lookup);
-                    const auto t_neighbor_fetch = std::chrono::steady_clock::now();
-                    nlist = co_await rdma::vamana::read_vamana_neighbors(beam[best_idx].rptr, thread);
-                    add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_neighbor_fetch,
-                                              t_neighbor_fetch);
-                    if (thread->neighbor_cache_enabled()) {
-                        const bool pin_entry = beam[best_idx].rptr == medoid_ptr;
-                        thread->neighbor_cache->insert(beam[best_idx].rptr, nlist->view(), pin_entry);
-                    }
-                    neighbor_count = nlist->num_neighbors();
-                    neighbor_ptrs = nlist->view().data();
-                }
-            }
+            const auto t_neighbor_fetch = std::chrono::steady_clock::now();
+            auto nlist = co_await rdma::vamana::read_vamana_neighbors(beam[best_idx].rptr, thread);
+            add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_neighbor_fetch,
+                                      t_neighbor_fetch);
+            const u8 neighbor_count = nlist->num_neighbors();
+            const RemotePtr* neighbor_ptrs = nlist->view().data();
             ++thread->stats.visited_neighborlists;
 
             const auto t_filter = std::chrono::steady_clock::now();
@@ -111,15 +87,15 @@
             if (unvisited.empty()) continue;
 
             const u32 n_batch = unvisited.size();
-            const bool use_gpu_node_cache = use_gpudirect_candidate_rdma && thread->gpu_node_cache != nullptr &&
-                                            thread->gpu_node_cache->enabled();
+            const bool use_indirect_candidate_path =
+                use_gpudirect_candidate_rdma && thread->reserved_query_state[1] != nullptr;
             uint8_t* query_staging_vecs = nullptr;
-            auto& miss_ptrs = coro_state.scratch_fallback_ptrs;
-            auto& miss_indices = coro_state.scratch_miss_indices;
+            auto& miss_ptrs = coro_state.indirect_candidate_ptrs;
+            auto& miss_indices = coro_state.indirect_candidate_indices;
             miss_ptrs.clear();
             miss_indices.clear();
 
-            if (use_gpu_node_cache) {
+            if (use_indirect_candidate_path) {
                 gs.flip_query_candidate_buffer();
                 query_staging_vecs = gs.current_query_candidate_vecs();
                 const u32 query_staging_lkey = gs.current_query_candidate_vecs_lkey();
@@ -129,22 +105,15 @@
                 miss_indices.reserve(n_batch);
 
                 for (u32 i = 0; i < n_batch; ++i) {
-                    const void* device_ptr = nullptr;
-                    if (thread->gpu_node_cache->lookup(unvisited[i].raw_address, &device_ptr)) {
-                        ++thread->stats.gpu_node_cache_hits;
-                        gs.h_candidate_ptrs[i] = device_ptr;
-                    } else {
-                        ++thread->stats.gpu_node_cache_misses;
-                        const auto staging_ptr = query_staging_vecs + static_cast<size_t>(i) * VamanaNode::vector_bytes();
-                        gs.h_candidate_ptrs[i] = staging_ptr;
-                        miss_ptrs.push_back(unvisited[i]);
-                        miss_indices.push_back(i);
-                        destinations.push_back(rdma::vamana::BatchReadDestination{
-                            reinterpret_cast<u64>(staging_ptr),
-                            query_staging_lkey,
-                            nullptr,
-                            true});
-                    }
+                    const auto staging_ptr = query_staging_vecs + static_cast<size_t>(i) * VamanaNode::vector_bytes();
+                    gs.h_candidate_ptrs[i] = staging_ptr;
+                    miss_ptrs.push_back(unvisited[i]);
+                    miss_indices.push_back(i);
+                    destinations.push_back(rdma::vamana::BatchReadDestination{
+                        reinterpret_cast<u64>(staging_ptr),
+                        query_staging_lkey,
+                        nullptr,
+                        true});
                 }
 
                 if (!miss_ptrs.empty()) {
@@ -194,7 +163,7 @@
             }
 
             const auto t_gpu_distance = std::chrono::steady_clock::now();
-            if (use_gpu_node_cache) {
+            if (use_indirect_candidate_path) {
                 gpu::launch_batch_typed_query_l2_distances_indirect(
                     gs.stream, gs.event,
                     gs.d_query, static_cast<u32>(query_dtype),
@@ -221,25 +190,6 @@
             cudaStreamSynchronize(gs.stream);
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::transfer_distance_d2h, t_distance_d2h);
 
-            if (use_gpu_node_cache && !miss_ptrs.empty()) {
-                for (size_t mi = 0; mi < miss_ptrs.size(); ++mi) {
-                    const u32 original_idx = miss_indices[mi];
-                    const auto staging_ptr = query_staging_vecs +
-                                             static_cast<size_t>(original_idx) * VamanaNode::vector_bytes();
-                    const auto admission = thread->gpu_node_cache->admit_from_device(
-                        miss_ptrs[mi].raw_address, staging_ptr, gs.stream);
-                    if (admission.enqueued) {
-                        ++thread->stats.gpu_node_cache_admissions;
-                        if (admission.evicted) {
-                            ++thread->stats.gpu_node_cache_evictions;
-                        }
-                    }
-                    if (admission.skipped) {
-                        ++thread->stats.gpu_node_cache_fill_skips;
-                    }
-                }
-            }
-
             const auto t_beam_update = std::chrono::steady_clock::now();
             for (u32 i = 0; i < n_batch; ++i) {
                 insert_into_beam(beam, unvisited[i], gs.h_distances[i], beam_width_);
@@ -258,19 +208,19 @@
 
         const auto t_result_ids = std::chrono::steady_clock::now();
         for (u32 i = 0; i < count; ++i) {
-            if (!use_cache_) {
+            if (direct_node_reads_) {
                 const node_t id = co_await rdma::vamana::read_vamana_id(beam[i].rptr, thread);
                 results.push_back({id, beam[i].distance});
                 continue;
             }
             s_ptr<VamanaNode> node;
-            const auto t_cache_lookup = std::chrono::steady_clock::now();
-            auto coro = cache_lookup(beam[i].rptr, node, thread, true);
+            const auto t_node_read = std::chrono::steady_clock::now();
+            auto coro = read_node(beam[i].rptr, node, thread, true);
             while (!coro.handle.done()) {
                 co_await std::suspend_always{};
                 coro.handle.resume();
             }
-            add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_cache_lookup, t_cache_lookup);
+            add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_node_read, t_node_read);
             results.push_back({node->id(), beam[i].distance});
         }
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_query_result_ids, t_result_ids);

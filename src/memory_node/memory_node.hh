@@ -275,7 +275,6 @@ private:
   bool local_shard(u32 shard_id) const;
   byte_t* local_node_ptr(const RemotePtr& rptr);
   const byte_t* local_node_ptr(const RemotePtr& rptr) const;
-  void invalidate_storage_owner_cache(RemotePtr rptr);
   static void insert_into_beam(vec<BeamEntry>& beam, const RemotePtr& rptr, distance_t dist, u32 max_beam_width);
   void route_queries(i32 max_cqes);
   void idle();

@@ -3,7 +3,6 @@
 #include <library/latch.hh>
 
 #include "buffer_allocator.hh"
-#include "cache/cache.hh"
 #include "common/configuration.hh"
 #include "common/constants.hh"
 #include "compute_thread.hh"
@@ -20,15 +19,10 @@ public:
 public:
   WorkerPool(u32 num_compute_threads,
              i32 max_send_queue_wr,
-             size_t cache_size,
-             size_t num_cache_buckets,
-             size_t num_cooling_table_buckets,
-             bool use_cache,
              u64 buffer_size_bytes = COMPUTE_NODE_MAX_MEMORY)
       : num_compute_threads_(num_compute_threads),
         max_send_queue_wr_(max_send_queue_wr),
-        buffer_allocator_(num_compute_threads, buffer_size_bytes),
-        cache_(cache_size, num_cache_buckets, num_cooling_table_buckets, num_compute_threads, use_cache) {
+        buffer_allocator_(num_compute_threads, buffer_size_bytes) {
     reset_barriers();  // initialize latches
   }
 
@@ -46,7 +40,7 @@ public:
     for (u32 id = 0; id < num_compute_threads_; ++id) {
       const u32 num_memory_nodes = remote_mrts.size();
       compute_threads_.push_back(std::make_unique<ComputeThread>(
-        id, cm.client_id, max_send_queue_wr_, buffer_allocator_, cache_, num_memory_nodes, num_coroutines));
+        id, cm.client_id, max_send_queue_wr_, buffer_allocator_, num_memory_nodes, num_coroutines));
     }
 
     // assign the contexts (now the thread pointers can no longer change)
@@ -58,8 +52,6 @@ public:
 
   ComputeThreads& get_compute_threads() { return compute_threads_; }
   BufferAllocator& get_buffer_allocator() { return buffer_allocator_; }
-  void track_local_cache_statistics(statistics::Statistics& stats) const { cache_.track_cache_statistics(stats); }
-
   void reset_barriers() {
     start_latch_.init(static_cast<i32>(num_compute_threads_));
     end_latch_.init(static_cast<i32>(num_compute_threads_));
@@ -98,7 +90,6 @@ private:
   vec<u_ptr<SharedCtx>> shared_contexts_;
 
   BufferAllocator buffer_allocator_;  // global per compute node
-  cache::Cache cache_;
 
   Latch start_latch_{};
   Latch end_latch_{};

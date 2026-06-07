@@ -3,10 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <deque>
 #include <memory>
-#include <mutex>
-#include <unordered_map>
 
 #include <library/context.hh>
 #include <library/hugepage.hh>
@@ -83,104 +80,6 @@ struct StorageOwnerInsertTask {
   vec<byte_t> payload;
 };
 
-class StorageOwnerLocalCache {
-public:
-  void init(size_t bytes) {
-    if (bytes == 0) {
-      return;
-    }
-    enabled_ = true;
-    const size_t snapshot_bytes = VamanaNode::size_until_vector_end() + sizeof(NodeSnapshot) + 64;
-    const size_t neighbor_bytes = VamanaNode::NEIGHBORS_SIZE + sizeof(RemotePtr) + 64;
-    snapshot_capacity_ = std::max<size_t>(1, (bytes * 60 / 100) / std::max<size_t>(1, snapshot_bytes));
-    neighbor_capacity_ = std::max<size_t>(1, (bytes * 40 / 100) / std::max<size_t>(1, neighbor_bytes));
-  }
-
-  bool enabled() const { return enabled_; }
-
-  bool lookup_snapshot(RemotePtr key, NodeSnapshot& snapshot) {
-    if (!enabled_) {
-      return false;
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = snapshots_.find(key.raw_address);
-    if (it == snapshots_.end()) {
-      return false;
-    }
-    snapshot = it->second;
-    return true;
-  }
-
-  void insert_snapshot(const NodeSnapshot& snapshot) {
-    if (!enabled_ || snapshot.rptr.is_null()) {
-      return;
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (snapshots_.contains(snapshot.rptr.raw_address)) {
-      snapshots_[snapshot.rptr.raw_address] = snapshot;
-      return;
-    }
-    evict_fifo(snapshot_order_, snapshots_, snapshot_capacity_);
-    snapshot_order_.push_back(snapshot.rptr.raw_address);
-    snapshots_[snapshot.rptr.raw_address] = snapshot;
-  }
-
-  bool lookup_neighbors(RemotePtr key, vec<RemotePtr>& neighbors) {
-    if (!enabled_) {
-      return false;
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = neighbors_.find(key.raw_address);
-    if (it == neighbors_.end()) {
-      return false;
-    }
-    neighbors = it->second;
-    return true;
-  }
-
-  void insert_neighbors(RemotePtr key, const vec<RemotePtr>& values) {
-    if (!enabled_ || key.is_null()) {
-      return;
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (neighbors_.contains(key.raw_address)) {
-      neighbors_[key.raw_address] = values;
-      return;
-    }
-    evict_fifo(neighbor_order_, neighbors_, neighbor_capacity_);
-    neighbor_order_.push_back(key.raw_address);
-    neighbors_[key.raw_address] = values;
-  }
-
-  void invalidate(RemotePtr key) {
-    if (!enabled_ || key.is_null()) {
-      return;
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    snapshots_.erase(key.raw_address);
-    neighbors_.erase(key.raw_address);
-  }
-
-private:
-  template <class Value>
-  static void evict_fifo(std::deque<u64>& order, std::unordered_map<u64, Value>& map, size_t capacity) {
-    while (map.size() >= capacity && !order.empty()) {
-      const u64 victim = order.front();
-      order.pop_front();
-      map.erase(victim);
-    }
-  }
-
-  bool enabled_{false};
-  size_t snapshot_capacity_{0};
-  size_t neighbor_capacity_{0};
-  std::mutex mutex_;
-  std::deque<u64> snapshot_order_;
-  std::deque<u64> neighbor_order_;
-  std::unordered_map<u64, NodeSnapshot> snapshots_;
-  std::unordered_map<u64, vec<RemotePtr>> neighbors_;
-};
-
 struct StorageOwnerThread {
   explicit StorageOwnerThread(u32 id, u32 num_coroutines, i32 max_send_queue_wr)
       : id(id), send_wcs(std::max<i32>(1, max_send_queue_wr)), post_balances(num_coroutines) {
@@ -220,7 +119,6 @@ struct StorageOwnerThread {
   vec<u_ptr<StorageOwnerInsertCoroutine>> coroutines;
   HugePage<byte_t> scratch_buffer;
   std::unique_ptr<LocalMemoryRegion> scratch_region;
-  StorageOwnerLocalCache cache;
   u32 running_coroutine{};
   size_t scratch_stride{};
 };

@@ -105,17 +105,8 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
     std::max(aggregate.counters.overflow_prune_max_kernel_threads, delta.overflow_prune_max_kernel_threads);
   aggregate.counters.overflow_prune_max_kernel_threads =
     std::max(aggregate.counters.overflow_prune_max_kernel_threads, sample.overflow_prune_max_kernel_threads);
-  aggregate.counters.cache_hits += delta.cache_hits;
-  aggregate.counters.cache_misses += delta.cache_misses;
   aggregate.counters.query_rdma_to_staging_bytes += delta.query_rdma_to_staging_bytes;
   aggregate.counters.query_host_staging_fallback_bytes += delta.query_host_staging_fallback_bytes;
-  aggregate.counters.neighbor_cache_hits += delta.neighbor_cache_hits;
-  aggregate.counters.neighbor_cache_misses += delta.neighbor_cache_misses;
-  aggregate.counters.gpu_node_cache_hits += delta.gpu_node_cache_hits;
-  aggregate.counters.gpu_node_cache_misses += delta.gpu_node_cache_misses;
-  aggregate.counters.gpu_node_cache_admissions += delta.gpu_node_cache_admissions;
-  aggregate.counters.gpu_node_cache_evictions += delta.gpu_node_cache_evictions;
-  aggregate.counters.gpu_node_cache_fill_skips += delta.gpu_node_cache_fill_skips;
   aggregate.lock_attempts += sample.lock_attempts;
   aggregate.lock_retries += sample.lock_retries;
   aggregate.cas_failures += sample.cas_failures;

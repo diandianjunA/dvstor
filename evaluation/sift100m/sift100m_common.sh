@@ -14,7 +14,8 @@ LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
 PID_DIR="${PID_DIR:-$SCRIPT_DIR/pids}"
 
 SHARDS="${SHARDS:-5}"
-PARTITION_STRATEGY="${PARTITION_STRATEGY:-bfs}"
+#PARTITION_STRATEGY="${PARTITION_STRATEGY:-bfs}"
+PARTITION_STRATEGY="${PARTITION_STRATEGY:-balanced}"
 R="${R:-48}"
 BUILD_BEAM="${BUILD_BEAM:-200}"
 SEARCH_BEAM="${SEARCH_BEAM:-128}"
@@ -59,15 +60,6 @@ else
   CN_MEMORY_GB_WAS_DEFAULT=0
 fi
 MN_MEMORY_GB="${MN_MEMORY_GB:-$(estimate_mn_memory_gb)}"
-CACHE_RATIO="${CACHE_RATIO:-5}"
-NEIGHBOR_CACHE_MB="${NEIGHBOR_CACHE_MB:-2048}"
-if [[ -z "${GPU_NODE_CACHE_MB+x}" ]]; then
-  GPU_NODE_CACHE_MB=0
-  GPU_NODE_CACHE_MB_WAS_DEFAULT=1
-else
-  GPU_NODE_CACHE_MB_WAS_DEFAULT=0
-fi
-STORAGE_OWNER_CACHE_MB="${STORAGE_OWNER_CACHE_MB:-2048}"
 
 BASE_PORT="${BASE_PORT:-1234}"
 HOSTS="${HOSTS:-192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202}"
@@ -101,6 +93,59 @@ query_suffix() {
 base_bin() { echo "$CONVERTED_DIR/base$(base_suffix).u8bin"; }
 query_bin() { echo "$CONVERTED_DIR/query$(query_suffix).u8bin"; }
 groundtruth_bin() { echo "$CONVERTED_DIR/groundtruth_${GROUNDTRUTH_LABEL}.bin"; }
+
+metadata_file() { echo "${INDEX_PREFIX}.meta.json"; }
+
+validate_index_metadata() {
+  local metadata
+  metadata="$(metadata_file)"
+  if [[ ! -f "$metadata" ]]; then
+    echo "missing index metadata: $metadata" >&2
+    return 1
+  fi
+
+  python3 - "$metadata" "$INDEX_PREFIX" "$R" "$BUILD_BEAM" "$DIM" "$MAX_VECTORS" "$SHARDS" "$VECTOR_DATA_TYPE" <<'PY_VALIDATE'
+import json
+import sys
+
+path, expected_prefix, expected_r, expected_beam, expected_dim, expected_vectors, expected_shards, expected_dtype = sys.argv[1:]
+with open(path, 'r', encoding='utf-8') as f:
+    metadata = json.load(f)
+
+expected = {
+    'output_prefix': expected_prefix,
+    'R': int(expected_r),
+    'beam_width_construction': int(expected_beam),
+    'dim': int(expected_dim),
+    'num_vectors': int(expected_vectors),
+    'num_memory_nodes': int(expected_shards),
+    'vector_data_type': expected_dtype,
+}
+errors = []
+for key, value in expected.items():
+    if metadata.get(key) != value:
+        errors.append(f"{key}: metadata={metadata.get(key)!r}, expected={value!r}")
+if metadata.get('offline_builder_version', 0) < 2:
+    errors.append('offline_builder_version is missing or older than 2; rebuild with the fixed per-node random graph initializer')
+if metadata.get('random_graph_seed_scope') != 'per_node':
+    errors.append('random_graph_seed_scope is not per_node; this index may contain duplicated initial neighbor lists')
+
+if errors:
+    print(f"incompatible or unsafe index metadata: {path}", file=sys.stderr)
+    for error in errors:
+        print(f"  - {error}", file=sys.stderr)
+    sys.exit(1)
+PY_VALIDATE
+
+  local node_id shard
+  for ((node_id = 1; node_id <= SHARDS; ++node_id)); do
+    shard="$(shard_file "$node_id")"
+    if [[ ! -s "$shard" ]]; then
+      echo "missing or empty shard file: $shard" >&2
+      return 1
+    fi
+  done
+}
 
 server_endpoints() {
   local idx=0
@@ -138,7 +183,34 @@ ensure_built() {
 write_service_config() {
   local output="$1"
   local endpoints
+  local insert_execution="${INSERT_EXECUTION:-compute}"
+  local insert_workers query_workers insert_coroutines query_coroutines
   endpoints="$(server_endpoints)"
+
+  if [[ "$insert_execution" == "storage_owner" ]]; then
+    # Inserts execute on memory nodes; all compute-side workers remain available for queries.
+    insert_workers=0
+    query_workers="$SERVICE_THREADS"
+    insert_coroutines=0
+    query_coroutines="${QUERY_COROUTINES:-$COROUTINES}"
+  else
+    if [[ -z "${INSERT_WORKERS+x}" && -z "${QUERY_WORKERS+x}" ]]; then
+      insert_workers=$((SERVICE_THREADS / 2))
+      query_workers=$((SERVICE_THREADS - insert_workers))
+    elif [[ -z "${INSERT_WORKERS+x}" ]]; then
+      query_workers="$QUERY_WORKERS"
+      insert_workers=$((SERVICE_THREADS - query_workers))
+    elif [[ -z "${QUERY_WORKERS+x}" ]]; then
+      insert_workers="$INSERT_WORKERS"
+      query_workers=$((SERVICE_THREADS - insert_workers))
+    else
+      insert_workers="$INSERT_WORKERS"
+      query_workers="$QUERY_WORKERS"
+    fi
+    insert_coroutines="${INSERT_COROUTINES:-$COROUTINES}"
+    query_coroutines="${QUERY_COROUTINES:-$COROUTINES}"
+  fi
+
   {
     echo "servers = $endpoints"
     echo "initiator = true"
@@ -166,24 +238,17 @@ write_service_config() {
     echo "gpu-device = $GPU_DEVICE"
     echo "cn-memory = $CN_MEMORY_GB"
     echo "mn-memory = $MN_MEMORY_GB"
-    echo "insert-workers = ${INSERT_WORKERS:-4}"
-    echo "query-workers = ${QUERY_WORKERS:-12}"
-    echo "insert-coroutines = ${INSERT_COROUTINES:-2}"
-    echo "query-coroutines = ${QUERY_COROUTINES:-4}"
+    echo "insert-workers = $insert_workers"
+    echo "query-workers = $query_workers"
+    echo "insert-coroutines = $insert_coroutines"
+    echo "query-coroutines = $query_coroutines"
     echo "label = sift100m_${PROFILE_NAME:-$PROFILE}"
     if [[ "${GPUDIRECT_RDMA:-0}" == "1" ]]; then echo "gpudirect-rdma = true"; fi
-    if [[ "${COMPUTE_CACHE:-0}" == "1" ]]; then
-      echo "cache = true"
-      echo "cache-ratio = $CACHE_RATIO"
-    fi
-    if [[ "${NEIGHBOR_CACHE_MB:-0}" != "0" ]]; then echo "neighbor-cache-mb = $NEIGHBOR_CACHE_MB"; fi
-    if [[ "${GPU_NODE_CACHE_MB:-0}" != "0" ]]; then echo "gpu-node-cache-mb = $GPU_NODE_CACHE_MB"; fi
-    echo "insert-execution = ${INSERT_EXECUTION:-compute}"
-    if [[ "${INSERT_EXECUTION:-compute}" == "storage_owner" ]]; then
+    echo "insert-execution = $insert_execution"
+    if [[ "$insert_execution" == "storage_owner" ]]; then
       echo "storage-peers = $endpoints"
       echo "storage-owner-batch-max = ${STORAGE_OWNER_BATCH_MAX:-32}"
       echo "storage-owner-batch-wait-us = ${STORAGE_OWNER_BATCH_WAIT_US:-100}"
-      echo "storage-owner-cache-mb = $STORAGE_OWNER_CACHE_MB"
       echo "storage-owner-peer-rdma-tokens = ${STORAGE_OWNER_PEER_RDMA_TOKENS:-8}"
       echo "storage-owner-rpc-depth = ${STORAGE_OWNER_RPC_DEPTH:-16}"
       echo "storage-owner-rpc-timeout-ms = ${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}"

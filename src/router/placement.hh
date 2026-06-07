@@ -2,7 +2,7 @@
 
 #include <queue>
 
-#include "cache/kmeans.hh"
+#include "router/kmeans.hh"
 #include "common/timing.hh"
 #include "coroutine.hh"
 #include "rdma/vamana_rdma_operations.hh"

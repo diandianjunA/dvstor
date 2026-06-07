@@ -8,14 +8,6 @@ constexpr static u64 MEMORY_NODE_MAX_MEMORY = 260ul * 1073741824ul;  // 260 GB
 constexpr static u32 MAX_QPS = 4;  // max number of QPs per compute node
 constexpr static size_t CACHELINE_SIZE = 64;
 
-namespace cache {
-constexpr static bool CACHE_WARMUP = true;
-constexpr static size_t MAX_LOOKUP_RESTARTS = 100;  // optimistic cache lookup restarts
-constexpr static size_t COOLING_TABLE_BUCKET_ENTRIES = 6;
-constexpr static f32 COOLING_TABLE_RATIO = 0.1;  // must be < 1
-constexpr static f32 ADMISSION_RATIO = 0.01;  // admit nodes to cache with 1% probability
-}  // namespace cache
-
 namespace query_router {
 constexpr static bool BALANCED_ROUTING = true;  // use histogram to balance routing
 constexpr static bool ADAPTIVE_ROUTING = true;

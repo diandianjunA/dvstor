@@ -84,11 +84,6 @@ struct CNStatistics {
 
   size_t query_rdma_to_staging_bytes{};
   size_t query_host_staging_fallback_bytes{};
-  size_t gpu_node_cache_hits{};
-  size_t gpu_node_cache_misses{};
-  size_t gpu_node_cache_admissions{};
-  size_t gpu_node_cache_evictions{};
-  size_t gpu_node_cache_fill_skips{};
 
   size_t query_visited_nodes{};
   size_t query_visited_nodes_l0{};
@@ -137,11 +132,6 @@ struct CNStatistics {
     query_exact_reranks += other.query_exact_reranks;
     query_rdma_to_staging_bytes += other.query_rdma_to_staging_bytes;
     query_host_staging_fallback_bytes += other.query_host_staging_fallback_bytes;
-    gpu_node_cache_hits += other.gpu_node_cache_hits;
-    gpu_node_cache_misses += other.gpu_node_cache_misses;
-    gpu_node_cache_admissions += other.gpu_node_cache_admissions;
-    gpu_node_cache_evictions += other.gpu_node_cache_evictions;
-    gpu_node_cache_fill_skips += other.gpu_node_cache_fill_skips;
     query_visited_nodes += other.query_visited_nodes;
     query_visited_nodes_l0 += other.query_visited_nodes_l0;
     query_visited_neighborlists += other.query_visited_neighborlists;
@@ -180,11 +170,6 @@ struct CNStatistics {
     statistics.add_nested_static_stat(query_group, "visited_nodes_l0", query_visited_nodes_l0);
     statistics.add_nested_static_stat(query_group, "visited_neighborlists", query_visited_neighborlists);
     statistics.add_nested_static_stat(query_group, "processed", processed_queries);
-    statistics.add_nested_static_stat(query_group, "gpu_node_cache_hits", gpu_node_cache_hits);
-    statistics.add_nested_static_stat(query_group, "gpu_node_cache_misses", gpu_node_cache_misses);
-    statistics.add_nested_static_stat(query_group, "gpu_node_cache_admissions", gpu_node_cache_admissions);
-    statistics.add_nested_static_stat(query_group, "gpu_node_cache_evictions", gpu_node_cache_evictions);
-    statistics.add_nested_static_stat(query_group, "gpu_node_cache_fill_skips", gpu_node_cache_fill_skips);
     statistics.add_nested_static_stat(query_group, "queue_wait_ns", query_queue_wait_ns);
 
     statistics.add_static_stat("actual_total_local_buffer_size", local_allocation_size);
@@ -242,18 +227,9 @@ struct ThreadStatistics {
   u64 query_queue_wait_ns{0};
   u64 insert_queue_wait_ns{0};
 
-  size_t cache_hits{0};
-  size_t cache_misses{0};
-
   size_t query_rdma_to_staging_bytes{0};
   size_t query_host_staging_fallback_bytes{0};
-  size_t neighbor_cache_hits{0};
-  size_t neighbor_cache_misses{0};
-  size_t gpu_node_cache_hits{0};
-  size_t gpu_node_cache_misses{0};
-  size_t gpu_node_cache_admissions{0};
-  size_t gpu_node_cache_evictions{0};
-  size_t gpu_node_cache_fill_skips{0};
+  size_t reserved_counter_slots[9]{};
 
   void inc_visited_nodes(u32 level) {
     if (level > 0) {
@@ -263,10 +239,6 @@ struct ThreadStatistics {
     }
   }
 
-  f64 cache_hit_rate() const {
-    return cache_hits + cache_misses == 0 ? 0
-                                          : static_cast<f64>(cache_hits) / static_cast<f64>(cache_hits + cache_misses);
-  }
 };
 
 }  // namespace statistics

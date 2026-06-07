@@ -50,13 +50,13 @@
         // Phase 1: Beam search for candidate neighbors
         s_ptr<VamanaNode> medoid_node;
         {
-            const auto t_cache_start = std::chrono::steady_clock::now();
-            auto coro = cache_lookup(medoid_ptr, medoid_node, thread, true);
+            const auto t_node_read = std::chrono::steady_clock::now();
+            auto coro = read_node(medoid_ptr, medoid_node, thread, true);
             while (!coro.handle.done()) {
                 co_await std::suspend_always{};
                 coro.handle.resume();
             }
-            add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_cache_lookup, t_cache_start);
+            add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_node_read, t_node_read);
         }
 
         const auto t_insert_init = std::chrono::steady_clock::now();
@@ -509,4 +509,3 @@
     // =========================================================================
     // Index size estimation
     // =========================================================================
-

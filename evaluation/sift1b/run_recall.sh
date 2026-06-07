@@ -3,7 +3,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/sift1b_common.sh"
 
-PROFILE="${1:-${PROFILE:-gpudirect_rdma_gpu_cache}}"
+PROFILE="${1:-${PROFILE:-gpudirect_rdma}}"
 PROFILE_ENV="$SCRIPT_DIR/profiles/${PROFILE}.env"
 if [[ ! -f "$PROFILE_ENV" ]]; then
   echo "unknown profile: $PROFILE" >&2

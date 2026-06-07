@@ -59,8 +59,7 @@ cmd=("$BUILD_DIR/dvstor_memory_node"
   --storage-id "$((NODE_ID - 1))")
 
 if [[ "$INSERT_EXECUTION" == "storage_owner" ]]; then
-  cmd+=(--storage-peers "${SERVER_ARGS[@]}"
-    --storage-owner-cache-mb "$STORAGE_OWNER_CACHE_MB")
+  cmd+=(--storage-peers "${SERVER_ARGS[@]}")
 fi
 
 printf '[memory-node-%s] command:' "$NODE_ID"; printf ' %q' "${cmd[@]}"; echo
