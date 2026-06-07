@@ -31,7 +31,7 @@
 #include "http/service_types.hh"
 #include "memory_node/command_protocol.hh"
 #include "memory_node/storage_owner_state.hh"
-#include "service/rabitq_artifacts.hh"
+#include "service/index_metadata.hh"
 #include "service/storage_owner_protocol.hh"
 #include "vamana/vamana_node.hh"
 
@@ -83,14 +83,9 @@ public:
   explicit MemoryNode(Configuration& config);
 
 private:
-  using DistFn = f32 (*)(const span<const f32>&, const span<const f32>&, size_t);
-
   using InsertBreakdownCounters = service::storage_owner::InsertBreakdownCounters;
   using BeamEntry = memory_node_detail::BeamEntry;
   using NodeSnapshot = memory_node_detail::NodeSnapshot;
-  using RabitqSearchState = memory_node_detail::RabitqSearchState;
-  using RabitqSnapshot = memory_node_detail::RabitqSnapshot;
-  using SearchBlockSnapshot = memory_node_detail::SearchBlockSnapshot;
   using InsertRuntimeState = memory_node_detail::InsertRuntimeState;
   using PeerRpcRuntimeState = memory_node_detail::PeerRpcRuntimeState;
   using PeerPendingSend = memory_node_detail::PeerPendingSend;
@@ -114,7 +109,6 @@ private:
   bool handle_command();
   std::pair<bool, str> load_index_file(const str& path);
   std::pair<bool, str> store_index_file(const str& path);
-  void load_rabitq_artifacts(const Configuration& config);
 
   // Peer RDMA transport
   void setup_storage_peers(Configuration& config);
@@ -207,7 +201,8 @@ private:
                                                size_t item_count,
                                                StorageOwnerThread& thread,
                                                InsertBreakdownCounters& breakdown,
-                                               const Configuration& config);
+                                               const Configuration& config,
+                                               vec<u64>* invalidated_neighbors = nullptr);
   static StorageOwnerInsertCoroutine dummy_storage_owner_insert_coroutine();
   size_t insert_request_slot_offset(u32 client_id, u32 slot_id) const;
   size_t insert_response_slot_offset(const Configuration& config, u32 client_id, u32 slot_id) const;
@@ -218,7 +213,8 @@ private:
                                          const element_t* vectors,
                                          size_t item_count,
                                          InsertBreakdownCounters& breakdown,
-                                         const Configuration& config);
+                                         const Configuration& config,
+                                         vec<u64>* invalidated_neighbors = nullptr);
 
   // Storage-owner index operations
   RemotePtr allocate_local_node();
@@ -238,25 +234,9 @@ private:
   void write_new_node(RemotePtr rptr,
                       node_t id,
                       const span<const element_t> components,
-                      const vec<byte_t>& rabitq_data,
                       const vec<RemotePtr>& neighbors);
   void lock_node(RemotePtr rptr);
   void unlock_node(RemotePtr rptr);
-  bool use_storage_owner_rabitq_search(const Configuration& config) const;
-  RabitqSearchState prepare_rabitq_search_state(const span<const element_t> query,
-                                                const Configuration& config) const;
-  distance_t rabitq_distance_cpu(const RabitqSearchState& state,
-                                 const byte_t* rabitq_data,
-                                 const Configuration& config) const;
-  vec<RabitqSnapshot> read_rabitq_snapshots_batched(const vec<RemotePtr>& rptrs, const Configuration& config);
-  auto async_read_rabitq_snapshots(const vec<RemotePtr>& rptrs,
-                                   const Configuration& config,
-                                   StorageOwnerThread& thread);
-  vec<SearchBlockSnapshot> read_search_block_snapshots_batched(const vec<RemotePtr>& rptrs,
-                                                               const Configuration& config);
-  auto async_read_search_block_snapshots(const vec<RemotePtr>& rptrs,
-                                         const Configuration& config,
-                                         StorageOwnerThread& thread);
   vec<RemotePtr> beam_search_candidates(const span<const element_t> query,
                                         RemotePtr medoid,
                                         const Configuration& config,
@@ -266,7 +246,8 @@ private:
                                     const Configuration& config,
                                     StorageOwnerThread& thread,
                                     InsertBreakdownCounters* breakdown = nullptr) -> StorageOwnerInsertCoroutine;
-  vec<RemotePtr> robust_prune_cpu(const span<const element_t> source,
+  vec<RemotePtr> robust_prune_cpu(const byte_t* source,
+                                  VectorDType source_dtype,
                                   const vec<RemotePtr>& candidates,
                                   const hashset_t<RemotePtr>& skip,
                                   const Configuration& config,
@@ -277,18 +258,23 @@ private:
                                               std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>>& remote_updates,
                                               InsertBreakdownCounters& breakdown,
                                               const Configuration& config) -> StorageOwnerInsertCoroutine;
-  vec<byte_t> quantize_rabitq_cpu(const span<const element_t> components, const Configuration& config) const;
   bool apply_local_reverse_update(RemotePtr target_ptr,
                                   const vec<RemotePtr>& candidate_ptrs,
                                   const Configuration& config);
 
   // Misc helpers
   static size_t align_up(size_t value, size_t alignment = CACHELINE_SIZE);
-  DistFn distance_fn() const;
+  distance_t distance_to_stored_vector(const span<const element_t> query,
+                                        const byte_t* stored,
+                                        const Configuration& config) const;
+  distance_t distance_between_vectors(const byte_t* lhs,
+                                      VectorDType lhs_dtype,
+                                      const byte_t* rhs,
+                                      VectorDType rhs_dtype,
+                                      const Configuration& config) const;
   bool local_shard(u32 shard_id) const;
   byte_t* local_node_ptr(const RemotePtr& rptr);
   const byte_t* local_node_ptr(const RemotePtr& rptr) const;
-  void invalidate_storage_owner_cache(RemotePtr rptr);
   static void insert_into_beam(vec<BeamEntry>& beam, const RemotePtr& rptr, distance_t dist, u32 max_beam_width);
   void route_queries(i32 max_cqes);
   void idle();
@@ -358,8 +344,6 @@ private:
   vec<vec<vec<RemotePtr>>> storage_owner_async_candidates_;
   vec<std::thread> storage_insert_workers_;
   std::atomic<bool> storage_insert_shutdown_{false};
-  service::rabitq::Artifacts rabitq_artifacts_;
-  bool rabitq_artifacts_ready_{false};
   const u64 mn_memory_bytes_;
   timing::Timing timing_;
 

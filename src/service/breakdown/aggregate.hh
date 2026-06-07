@@ -80,15 +80,12 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.rdma_write_ops += delta.rdma_write_ops;
   aggregate.counters.neighbor_rdma_bytes += delta.neighbor_rdma_bytes;
   aggregate.counters.vector_rdma_bytes += delta.vector_rdma_bytes;
-  aggregate.counters.rabitq_rdma_bytes += delta.rabitq_rdma_bytes;
   aggregate.counters.neighbor_rdma_read_ops += delta.neighbor_rdma_read_ops;
   aggregate.counters.vector_rdma_read_ops += delta.vector_rdma_read_ops;
-  aggregate.counters.rabitq_rdma_read_ops += delta.rabitq_rdma_read_ops;
   aggregate.counters.h2d_bytes += delta.h2d_bytes;
   aggregate.counters.d2h_bytes += delta.d2h_bytes;
   aggregate.counters.l2_kernels += delta.l2_kernels;
   aggregate.counters.prune_kernels += delta.prune_kernels;
-  aggregate.counters.rabitq_kernels += delta.rabitq_kernels;
   aggregate.counters.exact_reranks += delta.exact_reranks;
   aggregate.counters.visited_nodes += delta.visited_nodes;
   aggregate.counters.visited_neighborlists += delta.visited_neighborlists;
@@ -108,22 +105,8 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
     std::max(aggregate.counters.overflow_prune_max_kernel_threads, delta.overflow_prune_max_kernel_threads);
   aggregate.counters.overflow_prune_max_kernel_threads =
     std::max(aggregate.counters.overflow_prune_max_kernel_threads, sample.overflow_prune_max_kernel_threads);
-  aggregate.counters.cache_hits += delta.cache_hits;
-  aggregate.counters.cache_misses += delta.cache_misses;
   aggregate.counters.query_rdma_to_staging_bytes += delta.query_rdma_to_staging_bytes;
   aggregate.counters.query_host_staging_fallback_bytes += delta.query_host_staging_fallback_bytes;
-  aggregate.counters.neighbor_cache_hits += delta.neighbor_cache_hits;
-  aggregate.counters.neighbor_cache_misses += delta.neighbor_cache_misses;
-  aggregate.counters.gpu_rabitq_cache_hits += delta.gpu_rabitq_cache_hits;
-  aggregate.counters.gpu_rabitq_cache_misses += delta.gpu_rabitq_cache_misses;
-  aggregate.counters.gpu_rabitq_cache_fills += delta.gpu_rabitq_cache_fills;
-  aggregate.counters.gpu_rabitq_cache_fill_bytes += delta.gpu_rabitq_cache_fill_bytes;
-  aggregate.counters.gpu_rabitq_cache_gather_batches += delta.gpu_rabitq_cache_gather_batches;
-  aggregate.counters.gpu_rabitq_cache_gather_bytes += delta.gpu_rabitq_cache_gather_bytes;
-  aggregate.counters.gpu_rabitq_cache_loading_fallbacks += delta.gpu_rabitq_cache_loading_fallbacks;
-  aggregate.counters.gpu_rabitq_cache_evictions += delta.gpu_rabitq_cache_evictions;
-  aggregate.counters.gpu_rabitq_cache_duplicate_fills += delta.gpu_rabitq_cache_duplicate_fills;
-  aggregate.counters.gpu_rabitq_cache_fallback_batches += delta.gpu_rabitq_cache_fallback_batches;
   aggregate.lock_attempts += sample.lock_attempts;
   aggregate.lock_retries += sample.lock_retries;
   aggregate.cas_failures += sample.cas_failures;

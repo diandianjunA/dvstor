@@ -3,6 +3,7 @@
 #include <limits>
 
 #include "common/types.hh"
+#include "common/vector_dtype.hh"
 
 namespace tools::vamana_offline {
 
@@ -16,16 +17,18 @@ struct VamanaBuildConfig {
   u32 R{64};
   u32 beam_width{128};
   f64 alpha{1.2};
-  u32 rabitq_bits{1};
-  str node_layout{"rabitq_search_block"};
+  str vector_data_type{"auto"};
   str partition_strategy{"balanced"};
   u32 partition_max_degree{16};
   double partition_imbalance{1.03};
+  bool skip_sanity_check{false};
   i32 seed{1234};
   size_t max_vectors{std::numeric_limits<u32>::max()};
   bool ip_distance{false};
   bool no_gpu{false};
   i32 gpu_device{0};
+  double gpu_memory_gb{18.0};
+  u32 build_gpu_streams{0};
 };
 
 filepath_t default_vamana_prefix(const filepath_t& data_path, u32 R, u32 beam_width);

@@ -4,7 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <numeric>
+#include <limits>
 
 #include <library/utils.hh>
 
@@ -12,12 +12,34 @@
 
 namespace tools::vamana_offline {
 
+namespace {
+
 u32 read_u32(std::ifstream& input) {
   u32 value{};
-  if (!input.read(reinterpret_cast<char*>(&value), sizeof(value)))
+  if (!input.read(reinterpret_cast<char*>(&value), sizeof(value))) {
     lib_failure("failed to read u32 from dataset");
+  }
   return value;
 }
+
+float l2_float_query_to_raw(const float* query, const byte_t* rhs, VectorDType dtype, u32 dim) {
+  float sum = 0.0f;
+  for (u32 i = 0; i < dim; ++i) {
+    const float diff = query[i] - vector_component_as_float(rhs, dtype, i);
+    sum += diff * diff;
+  }
+  return sum;
+}
+
+float ip_float_query_to_raw(const float* query, const byte_t* rhs, VectorDType dtype, u32 dim) {
+  float dot = 0.0f;
+  for (u32 i = 0; i < dim; ++i) {
+    dot += query[i] * vector_component_as_float(rhs, dtype, i);
+  }
+  return -dot;
+}
+
+}  // namespace
 
 filepath_t resolve_dataset_file(const filepath_t& input_path) {
   if (std::filesystem::is_regular_file(input_path)) return input_path;
@@ -39,64 +61,99 @@ Dataset read_dataset(const VamanaBuildConfig& config) {
   lib_assert(input.good(), "dataset file does not exist: " + dataset.source_file.string());
 
   const str ext = dataset.source_file.extension().string();
-  const bool is_float32 = ext == ".fbin" || ext == ".bin";
-  const bool is_uint8 = ext == ".u8bin";
-  const bool is_int8 = ext == ".i8bin";
-  lib_assert(is_float32 || is_uint8 || is_int8, "unsupported dataset extension: " + ext);
+  const auto inferred_dtype = infer_vector_dtype_from_path(dataset.source_file);
+  lib_assert(inferred_dtype.has_value(), "unsupported dataset extension: " + ext);
+  dataset.dtype = resolve_vector_dtype_config(config.vector_data_type, dataset.source_file);
+  if (config.vector_data_type != "auto" && inferred_dtype.has_value() && dataset.dtype != *inferred_dtype) {
+    lib_failure("--vector-data-type=" + config.vector_data_type +
+                " does not match dataset suffix " + ext +
+                " (inferred " + vector_dtype_name(*inferred_dtype) + ")");
+  }
 
   dataset.total_vectors = read_u32(input);
   dataset.dim = read_u32(input);
-
-  const size_t num_vectors = std::min(dataset.total_vectors, config.max_vectors);
-  lib_assert(num_vectors > 0, "dataset is empty");
+  dataset.vector_bytes = vector_dtype_bytes(dataset.dtype, dataset.dim);
+  dataset.vector_count = std::min(dataset.total_vectors, config.max_vectors);
+  lib_assert(dataset.vector_count > 0, "dataset is empty");
+  lib_assert(dataset.vector_count <= static_cast<size_t>(std::numeric_limits<u32>::max()),
+             "offline builder currently supports at most 2^32-1 vectors");
 
   std::cerr << "reading dataset " << dataset.source_file
-            << " (dim=" << dataset.dim << ", vectors=" << num_vectors
-            << "/" << dataset.total_vectors << ")\n";
+            << " (dim=" << dataset.dim << ", vectors=" << dataset.vector_count
+            << "/" << dataset.total_vectors << ", dtype=" << vector_dtype_name(dataset.dtype)
+            << ", vector_bytes=" << dataset.vector_bytes << ")\n";
 
-  dataset.vectors.resize(num_vectors * dataset.dim);
-  dataset.ids.resize(num_vectors);
-  std::iota(dataset.ids.begin(), dataset.ids.end(), 0);
-
-  if (is_float32) {
-    ProgressReporter progress{"Reading dataset", num_vectors};
-    const size_t rows_per_chunk = std::max<size_t>(1, (8 * 1024 * 1024) / (dataset.dim * sizeof(element_t)));
-    for (size_t row = 0; row < num_vectors; row += rows_per_chunk) {
-      const size_t chunk_rows = std::min(rows_per_chunk, num_vectors - row);
-      const size_t chunk_bytes = chunk_rows * dataset.dim * sizeof(element_t);
-      if (!input.read(reinterpret_cast<char*>(dataset.vectors.data() + row * dataset.dim), chunk_bytes))
-        lib_failure("failed to read float32 dataset payload");
-      progress.increment(chunk_rows);
+  dataset.raw_vectors.resize(dataset.vector_count * dataset.vector_bytes);
+  ProgressReporter progress{"Reading raw dataset", dataset.vector_count};
+  const size_t rows_per_chunk = std::max<size_t>(1, (64 * 1024 * 1024) / std::max<size_t>(1, dataset.vector_bytes));
+  for (size_t row = 0; row < dataset.vector_count; row += rows_per_chunk) {
+    const size_t chunk_rows = std::min(rows_per_chunk, dataset.vector_count - row);
+    byte_t* raw_dst = dataset.raw_vectors.data() + row * dataset.vector_bytes;
+    const size_t chunk_bytes = chunk_rows * dataset.vector_bytes;
+    if (!input.read(reinterpret_cast<char*>(raw_dst), static_cast<std::streamsize>(chunk_bytes))) {
+      lib_failure("failed to read dataset payload");
     }
-    progress.finish();
-  } else if (is_uint8) {
-    vec<u8> raw(dataset.vectors.size());
-    if (!input.read(reinterpret_cast<char*>(raw.data()), raw.size()))
-      lib_failure("failed to read uint8 dataset payload");
-    ProgressReporter progress{"Converting dataset", num_vectors};
-    parallel_for(0, num_vectors, config.threads, [&](size_t row, size_t) {
-      const size_t base = row * dataset.dim;
-      for (size_t col = 0; col < dataset.dim; ++col)
-        dataset.vectors[base + col] = static_cast<element_t>(raw[base + col]);
-      progress.increment();
-    });
-    progress.finish();
-  } else {
-    vec<i8> raw(dataset.vectors.size());
-    if (!input.read(reinterpret_cast<char*>(raw.data()), raw.size()))
-      lib_failure("failed to read int8 dataset payload");
-    ProgressReporter progress{"Converting dataset", num_vectors};
-    parallel_for(0, num_vectors, config.threads, [&](size_t row, size_t) {
-      const size_t base = row * dataset.dim;
-      for (size_t col = 0; col < dataset.dim; ++col)
-        dataset.vectors[base + col] = static_cast<element_t>(raw[base + col]);
-      progress.increment();
-    });
-    progress.finish();
+    progress.increment(chunk_rows);
   }
+  progress.finish();
 
+  std::cerr << "offline dataset memory: raw_vectors=" << dataset.raw_vectors.size()
+            << " bytes, float_expansion=0 bytes\n";
   return dataset;
 }
 
+float dataset_l2_distance(const Dataset& dataset, size_t lhs, size_t rhs) {
+  const byte_t* a = dataset.raw_vector(lhs);
+  const byte_t* b = dataset.raw_vector(rhs);
+  const u32 dim = dataset.dim;
+  switch (dataset.dtype) {
+    case VectorDType::uint8: {
+      const auto* au = reinterpret_cast<const u8*>(a);
+      const auto* bu = reinterpret_cast<const u8*>(b);
+      u32 sum = 0;
+      for (u32 i = 0; i < dim; ++i) {
+        const int diff = static_cast<int>(au[i]) - static_cast<int>(bu[i]);
+        sum += static_cast<u32>(diff * diff);
+      }
+      return static_cast<float>(sum);
+    }
+    case VectorDType::int8: {
+      const auto* ai = reinterpret_cast<const i8*>(a);
+      const auto* bi = reinterpret_cast<const i8*>(b);
+      u32 sum = 0;
+      for (u32 i = 0; i < dim; ++i) {
+        const int diff = static_cast<int>(ai[i]) - static_cast<int>(bi[i]);
+        sum += static_cast<u32>(diff * diff);
+      }
+      return static_cast<float>(sum);
+    }
+    case VectorDType::float32:
+      return typed_l2_distance(a, dataset.dtype, b, dataset.dtype, dim);
+  }
+  return 0.0f;
+}
+
+float dataset_ip_distance(const Dataset& dataset, size_t lhs, size_t rhs) {
+  const byte_t* a = dataset.raw_vector(lhs);
+  const byte_t* b = dataset.raw_vector(rhs);
+  float dot = 0.0f;
+  for (u32 i = 0; i < dataset.dim; ++i) {
+    dot += vector_component_as_float(a, dataset.dtype, i) * vector_component_as_float(b, dataset.dtype, i);
+  }
+  return -dot;
+}
+
+float dataset_distance(const Dataset& dataset, size_t lhs, size_t rhs, bool ip_distance) {
+  return ip_distance ? dataset_ip_distance(dataset, lhs, rhs) : dataset_l2_distance(dataset, lhs, rhs);
+}
+
+float dataset_distance_float_query(const Dataset& dataset, const float* query, size_t rhs, bool ip_distance) {
+  return ip_distance ? ip_float_query_to_raw(query, dataset.raw_vector(rhs), dataset.dtype, dataset.dim)
+                     : l2_float_query_to_raw(query, dataset.raw_vector(rhs), dataset.dtype, dataset.dim);
+}
+
+void dataset_decode_vector(const Dataset& dataset, size_t row, float* dst) {
+  decode_storage_vector_to_float(dataset.raw_vector(row), dataset.dtype, dataset.dim, dst);
+}
 
 }  // namespace tools::vamana_offline

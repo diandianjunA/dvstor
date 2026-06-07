@@ -33,6 +33,7 @@ set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -L/home/xjs/anaconda3/lib 
 
 option(DVSTOR_BUILD_EXECUTABLES "Build standalone DVSTOR executables and tools" ON)
 option(DVSTOR_BUILD_TESTS "Build local DVSTOR smoke tests" ON)
+option(DVSTOR_USE_NATIVE_ARCH "Compile C++ sources with -march=native" OFF)
 set(DVSTOR_METIS_PARTITION "AUTO" CACHE STRING "METIS graph partitioning support: AUTO, ON, or OFF")
 set_property(CACHE DVSTOR_METIS_PARTITION PROPERTY STRINGS AUTO ON OFF)
 string(TOUPPER "${DVSTOR_METIS_PARTITION}" DVSTOR_METIS_PARTITION_MODE)
@@ -47,7 +48,9 @@ add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wall>)
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wextra>)
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wpedantic>)
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wfatal-errors>)
-add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-march=native>)
+if (DVSTOR_USE_NATIVE_ARCH)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-march=native>)
+endif ()
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ffast-math>)
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-mavx2>)
 add_compile_options(-DNOHUGEPAGES)
@@ -56,7 +59,6 @@ add_compile_options(-DNOHUGEPAGES)
 # Find dependencies
 if (NOT DVSTOR_STORAGE_NODE_ONLY)
     find_package(CUDAToolkit 11.8 REQUIRED)
-    find_package(Eigen3 3.3 REQUIRED NO_MODULE)
 endif ()
 if (NOT DVSTOR_METIS_PARTITION_MODE STREQUAL "OFF")
     find_path(METIS_INCLUDE_DIR metis.h)
@@ -95,7 +97,6 @@ set(DVSTOR_OFFLINE_BUILDER_SOURCES
     tools/vamana_offline/graph.cc
     tools/vamana_offline/partitioning.cc
     tools/vamana_offline/progress.cc
-    tools/vamana_offline/rabitq.cc
     tools/vamana_offline/shard_writer.cc
 )
 
@@ -104,19 +105,6 @@ set(DVSTOR_BREAKDOWN_BENCHMARK_SOURCES
     tools/breakdown_benchmark/progress.cc
     tools/breakdown_benchmark/workload.cc
 )
-
-function(add_vamana_layout_converter_target)
-    add_executable(vamana_layout_converter
-        tools/vamana_layout_converter.cc
-    )
-    target_include_directories(vamana_layout_converter PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
-        ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
-    )
-    target_link_libraries(vamana_layout_converter rdma_library)
-endfunction()
 
 function(add_vamana_metis_repartitioner_target)
     add_executable(vamana_metis_repartitioner
@@ -149,7 +137,7 @@ if (DVSTOR_STORAGE_NODE_ONLY)
         ${DVSTOR_MEMORY_NODE_SOURCES}
         src/common/core_assignment.cc
         src/common/timing.cc
-        src/service/rabitq_artifacts.cc
+        src/service/index_metadata.cc
     )
     target_include_directories(dvstor_memory_node PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -159,7 +147,6 @@ if (DVSTOR_STORAGE_NODE_ONLY)
     target_link_libraries(dvstor_memory_node rdma_library)
 
     if (DVSTOR_BUILD_EXECUTABLES)
-        add_vamana_layout_converter_target()
         add_vamana_metis_repartitioner_target()
     endif ()
 else ()
@@ -169,12 +156,11 @@ else ()
         add_library(dvstor_gpu_kernels STATIC ${DVSTOR_GPU_SOURCES})
         target_include_directories(dvstor_gpu_kernels PUBLIC
             ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
             ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
         )
         target_link_libraries(dvstor_gpu_kernels
             CUDA::cudart
-            CUDA::cublas
-            Eigen3::Eigen
         )
         set_target_properties(dvstor_gpu_kernels PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
@@ -204,7 +190,6 @@ else ()
     target_link_libraries(dvstor_runtime
         rdma_library
         CUDA::cudart
-        Eigen3::Eigen
     )
     if (DVSTOR_GPU_SOURCES)
         target_link_libraries(dvstor_runtime dvstor_gpu_kernels)
@@ -216,7 +201,7 @@ else ()
         ${DVSTOR_MEMORY_NODE_SOURCES}
         src/common/core_assignment.cc
         src/common/timing.cc
-        src/service/rabitq_artifacts.cc
+        src/service/index_metadata.cc
     )
     target_include_directories(dvstor_memory_node PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -241,14 +226,11 @@ else ()
         )
         target_link_libraries(vamana_offline_builder
             rdma_library
-            Eigen3::Eigen
-            dvstor_gpu_kernels
+                dvstor_gpu_kernels
             CUDA::cudart
-            CUDA::cublas
         )
         target_link_metis(vamana_offline_builder)
 
-        add_vamana_layout_converter_target()
         add_vamana_metis_repartitioner_target()
 
         add_executable(dvstor_breakdown_benchmark
@@ -264,7 +246,7 @@ else ()
         target_link_libraries(dvstor_breakdown_benchmark dvstor_runtime)
     endif ()
 
-    if (DVSTOR_BUILD_TESTS)
+    if (DVSTOR_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/CMakeLists.txt")
         add_subdirectory(test)
     endif ()
 

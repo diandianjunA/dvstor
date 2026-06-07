@@ -4,7 +4,7 @@
 #include <library/queue_pair.hh>
 #include <random>
 
-#include "cache/placement.hh"
+#include "router/placement.hh"
 #include "common/constants.hh"
 #include "common/statistics.hh"
 #include "common/timing.hh"

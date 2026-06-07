@@ -79,7 +79,7 @@ std::vector<std::string> build_service_argv(const std::string& service_config_pa
 
   static const std::vector<std::string> multi_keys = {"servers", "clients", "storage-peers"};
   static const std::vector<std::string> flag_keys = {
-    "initiator", "cache", "routing", "load-index", "store-index", "disable-thread-pinning", "no-recall", "ip-dist",
+    "initiator", "routing", "load-index", "store-index", "disable-thread-pinning", "no-recall", "ip-dist",
     "gpudirect-rdma"};
   static const std::vector<std::string> benchmark_only_keys = {"insert-start-id", "write-id-base"};
 
@@ -139,10 +139,20 @@ Args parse_args(int argc, char** argv) {
       args.client_threads = std::stoull(require_value("--client-threads"));
     } else if (flag == "--read-ratio") {
       args.read_ratio = std::stod(require_value("--read-ratio"));
+    } else if (flag == "--mixed-mode") {
+      args.mixed_mode = require_value("--mixed-mode");
     } else if (flag == "--query-file") {
       args.query_file = require_value("--query-file");
     } else if (flag == "--insert-file") {
       args.insert_file = require_value("--insert-file");
+    } else if (flag == "--groundtruth-file") {
+      args.groundtruth_file = require_value("--groundtruth-file");
+    } else if (flag == "--recall-queries") {
+      args.recall_queries = std::stoull(require_value("--recall-queries"));
+    } else if (flag == "--recall-k") {
+      args.recall_k = static_cast<uint32_t>(std::stoul(require_value("--recall-k")));
+    } else if (flag == "--min-recall") {
+      args.min_recall = std::stod(require_value("--min-recall"));
     } else if (flag == "--synthetic") {
       args.synthetic = true;
     } else if (flag == "--report-json") {
@@ -171,6 +181,12 @@ Args parse_args(int argc, char** argv) {
   }
   if (args.read_ratio < 0.0 || args.read_ratio > 1.0) {
     throw std::runtime_error("--read-ratio must be in [0, 1]");
+  }
+  if (args.mixed_mode != "probability" && args.mixed_mode != "fixed_threads") {
+    throw std::runtime_error("--mixed-mode must be probability or fixed_threads");
+  }
+  if (args.min_recall > 1.0) {
+    throw std::runtime_error("--min-recall must be <= 1");
   }
   if (args.insert_start_id == 0) {
     const auto service_config = read_config(args.service_config_path);

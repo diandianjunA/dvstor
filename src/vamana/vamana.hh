@@ -14,10 +14,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cuda_runtime.h>
+#include <type_traits>
 
-#include "cache/cache.hh"
 #include "common/constants.hh"
 #include "common/debug.hh"
+#include "common/distance.hh"
 #include "common/types.hh"
 #include "compute_thread.hh"
 #include "coroutine.hh"
@@ -30,24 +31,38 @@
 
 namespace vamana {
 
-constexpr u32 kRabitqSearchBeamSlack = 64;
+template <class Distance>
+inline distance_t distance_to_stored_vector(const span<const element_t> query, const byte_t* stored) {
+    return typed_distance_float_query(query,
+                                      stored,
+                                      VamanaNode::vector_dtype(),
+                                      VamanaNode::DIM,
+                                      std::is_same_v<Distance, IPDistance>);
+}
+
+template <class Distance>
+inline distance_t distance_to_stored_vector(const byte_t* query, VectorDType query_dtype, const byte_t* stored) {
+    if constexpr (std::is_same_v<Distance, IPDistance>) {
+        return typed_ip_distance(query, query_dtype, stored, VamanaNode::vector_dtype(), VamanaNode::DIM);
+    } else {
+        return typed_l2_distance(query, query_dtype, stored, VamanaNode::vector_dtype(), VamanaNode::DIM);
+    }
+}
 
 template <class Distance>
 class Vamana {
 public:
     Vamana(u32 R, u32 beam_width, u32 beam_width_construction, f64 alpha,
-           u32 k, u32 rabitq_bits, u32 dim, bool use_cache, bool use_rabitq_search)
+           u32 k, u32 dim, VectorDType vector_dtype)
         : R_(R),
           beam_width_(beam_width),
           beam_width_construction_(beam_width_construction),
           alpha_(static_cast<f32>(alpha)),
           k_(k),
-          rabitq_bits_(rabitq_bits),
           dim_(dim),
-          use_cache_(use_cache),
-          use_rabitq_search_(use_rabitq_search) {
+          direct_node_reads_(true) {
         lib_assert(beam_width_ >= k_, "beam_width must be >= k");
-        VamanaNode::init_static_storage(dim, R, rabitq_bits);
+        VamanaNode::init_static_storage(dim, R, vector_dtype);
     }
 
     // =========================================================================
@@ -64,10 +79,8 @@ private:
     const u32 beam_width_construction_;
     const f32 alpha_;
     const u32 k_;
-    const u32 rabitq_bits_;
     const u32 dim_;
-    const bool use_cache_;
-    const bool use_rabitq_search_;
+    const bool direct_node_reads_;
 };
 
 }  // namespace vamana

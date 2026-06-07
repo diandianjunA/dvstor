@@ -64,7 +64,6 @@ struct CNStatistics {
   size_t build_rdma_writes{};
   size_t build_neighbor_rdma_reads{};
   size_t build_vector_rdma_reads{};
-  size_t build_rabitq_rdma_reads{};
   size_t build_h2d_bytes{};
   size_t build_d2h_bytes{};
   size_t build_l2_kernels{};
@@ -79,10 +78,8 @@ struct CNStatistics {
   size_t query_rdma_writes{};
   size_t query_neighbor_rdma_reads{};
   size_t query_vector_rdma_reads{};
-  size_t query_rabitq_rdma_reads{};
   size_t query_h2d_bytes{};
   size_t query_d2h_bytes{};
-  size_t query_rabitq_kernels{};
   size_t query_exact_reranks{};
 
   size_t query_rdma_to_staging_bytes{};
@@ -113,7 +110,6 @@ struct CNStatistics {
     build_rdma_writes += other.build_rdma_writes;
     build_neighbor_rdma_reads += other.build_neighbor_rdma_reads;
     build_vector_rdma_reads += other.build_vector_rdma_reads;
-    build_rabitq_rdma_reads += other.build_rabitq_rdma_reads;
     build_h2d_bytes += other.build_h2d_bytes;
     build_d2h_bytes += other.build_d2h_bytes;
     build_l2_kernels += other.build_l2_kernels;
@@ -131,10 +127,8 @@ struct CNStatistics {
     query_rdma_writes += other.query_rdma_writes;
     query_neighbor_rdma_reads += other.query_neighbor_rdma_reads;
     query_vector_rdma_reads += other.query_vector_rdma_reads;
-    query_rabitq_rdma_reads += other.query_rabitq_rdma_reads;
     query_h2d_bytes += other.query_h2d_bytes;
     query_d2h_bytes += other.query_d2h_bytes;
-    query_rabitq_kernels += other.query_rabitq_kernels;
     query_exact_reranks += other.query_exact_reranks;
     query_rdma_to_staging_bytes += other.query_rdma_to_staging_bytes;
     query_host_staging_fallback_bytes += other.query_host_staging_fallback_bytes;
@@ -152,7 +146,6 @@ struct CNStatistics {
     statistics.add_nested_static_stat(build_group, "rdma_writes_in_bytes", build_rdma_writes);
     statistics.add_nested_static_stat(build_group, "neighbor_rdma_reads_in_bytes", build_neighbor_rdma_reads);
     statistics.add_nested_static_stat(build_group, "vector_rdma_reads_in_bytes", build_vector_rdma_reads);
-    statistics.add_nested_static_stat(build_group, "rabitq_rdma_reads_in_bytes", build_rabitq_rdma_reads);
     statistics.add_nested_static_stat(build_group, "h2d_in_bytes", build_h2d_bytes);
     statistics.add_nested_static_stat(build_group, "d2h_in_bytes", build_d2h_bytes);
     statistics.add_nested_static_stat(build_group, "l2_kernels", build_l2_kernels);
@@ -169,10 +162,8 @@ struct CNStatistics {
     statistics.add_nested_static_stat(query_group, "rdma_writes_in_bytes", query_rdma_writes);
     statistics.add_nested_static_stat(query_group, "neighbor_rdma_reads_in_bytes", query_neighbor_rdma_reads);
     statistics.add_nested_static_stat(query_group, "vector_rdma_reads_in_bytes", query_vector_rdma_reads);
-    statistics.add_nested_static_stat(query_group, "rabitq_rdma_reads_in_bytes", query_rabitq_rdma_reads);
     statistics.add_nested_static_stat(query_group, "h2d_in_bytes", query_h2d_bytes);
     statistics.add_nested_static_stat(query_group, "d2h_in_bytes", query_d2h_bytes);
-    statistics.add_nested_static_stat(query_group, "rabitq_kernels", query_rabitq_kernels);
     statistics.add_nested_static_stat(query_group, "exact_reranks", query_exact_reranks);
     statistics.add_nested_static_stat(query_group, "recall", rolling_recall);
     statistics.add_nested_static_stat(query_group, "visited_nodes", query_visited_nodes);
@@ -203,21 +194,16 @@ struct ThreadStatistics {
   size_t build_rdma_write_ops{0};
   size_t query_neighbor_rdma_reads_in_bytes{0};
   size_t query_vector_rdma_reads_in_bytes{0};
-  size_t query_rabitq_rdma_reads_in_bytes{0};
   size_t build_neighbor_rdma_reads_in_bytes{0};
   size_t build_vector_rdma_reads_in_bytes{0};
-  size_t build_rabitq_rdma_reads_in_bytes{0};
   size_t query_neighbor_rdma_read_ops{0};
   size_t query_vector_rdma_read_ops{0};
-  size_t query_rabitq_rdma_read_ops{0};
   size_t build_neighbor_rdma_read_ops{0};
   size_t build_vector_rdma_read_ops{0};
-  size_t build_rabitq_rdma_read_ops{0};
   size_t query_h2d_bytes{0};
   size_t query_d2h_bytes{0};
   size_t build_h2d_bytes{0};
   size_t build_d2h_bytes{0};
-  size_t query_rabitq_kernels{0};
   size_t query_exact_reranks{0};
   size_t build_l2_kernels{0};
   size_t build_prune_kernels{0};
@@ -241,23 +227,9 @@ struct ThreadStatistics {
   u64 query_queue_wait_ns{0};
   u64 insert_queue_wait_ns{0};
 
-  size_t cache_hits{0};
-  size_t cache_misses{0};
-
   size_t query_rdma_to_staging_bytes{0};
   size_t query_host_staging_fallback_bytes{0};
-  size_t neighbor_cache_hits{0};
-  size_t neighbor_cache_misses{0};
-  size_t gpu_rabitq_cache_hits{0};
-  size_t gpu_rabitq_cache_misses{0};
-  size_t gpu_rabitq_cache_fills{0};
-  size_t gpu_rabitq_cache_fill_bytes{0};
-  size_t gpu_rabitq_cache_gather_batches{0};
-  size_t gpu_rabitq_cache_gather_bytes{0};
-  size_t gpu_rabitq_cache_loading_fallbacks{0};
-  size_t gpu_rabitq_cache_evictions{0};
-  size_t gpu_rabitq_cache_duplicate_fills{0};
-  size_t gpu_rabitq_cache_fallback_batches{0};
+  size_t reserved_counter_slots[9]{};
 
   void inc_visited_nodes(u32 level) {
     if (level > 0) {
@@ -267,10 +239,6 @@ struct ThreadStatistics {
     }
   }
 
-  f64 cache_hit_rate() const {
-    return cache_hits + cache_misses == 0 ? 0
-                                          : static_cast<f64>(cache_hits) / static_cast<f64>(cache_hits + cache_misses);
-  }
 };
 
 }  // namespace statistics

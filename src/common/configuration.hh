@@ -8,13 +8,14 @@
 
 #include "index_path.hh"
 #include "types.hh"
+#include "vector_dtype.hh"
 
 namespace configuration {
 
 // struct used for sending serialized from CN to MN
 struct Parameters {
   u32 num_threads{};
-  bool use_cache{};
+  bool reserved{};
   bool routing{};
 };
 
@@ -35,13 +36,10 @@ public:
   u32 beam_width{};       // beam width for search (replaces ef_search)
   u32 beam_width_construction{}; // beam width for insert (replaces ef_construction)
   f64 alpha{};            // RobustPrune alpha parameter
-  u32 rabitq_bits{};      // bits per dimension for RaBitQ quantization
   u32 k{};
   u32 gpu_device{};       // CUDA device ID
   bool gpudirect_rdma{};  // Enable GPUDirect RDMA (read vectors directly into GPU buffers)
-  u32 neighbor_cache_mb{0};
-  u32 gpu_rabitq_cache_mb{0};
-  str search_mode{"exact_gpu"};
+  str vector_data_type{"auto"};
   str insert_execution{"compute"};
   u32 insert_workers{};
   u32 query_workers{};
@@ -51,7 +49,6 @@ public:
   vec<str> storage_peers;
   u32 storage_owner_batch_max{16};
   u32 storage_owner_batch_wait_us{250};
-  u32 storage_owner_cache_mb{0};
   u32 storage_owner_peer_rdma_tokens{8};
   u32 storage_owner_rpc_depth{8};
   u32 storage_owner_rpc_timeout_ms{30000};
@@ -73,8 +70,6 @@ public:
   bool no_recall{};  // does not calculate the recall and thus requires no groundtruth
   bool ip_distance{};  // use the inner product distance rather than squared L2 norm
 
-  u32 cache_size_ratio{};  // in %
-  bool use_cache{};
   bool routing{};
 
   u32 dim{};
@@ -88,9 +83,8 @@ public:
   IndexConfiguration(int argc, char** argv) {
     add_options();
     process_program_options(argc, argv);
-    search_mode = normalize_search_mode(search_mode);
-    insert_execution = normalize_search_mode(insert_execution);
-    storage_owner_reverse_mode = normalize_search_mode(storage_owner_reverse_mode);
+    insert_execution = normalize_mode(insert_execution);
+    storage_owner_reverse_mode = normalize_mode(storage_owner_reverse_mode);
 
     if (!is_server) {
       validate_compute_node_options(argv);
@@ -126,11 +120,7 @@ private:
       "load-index,l",
       po::bool_switch(&load_index),
       "The index is not built, the memory servers load the index from a file.")(
-      "cache", po::bool_switch(&use_cache), "Activate cache on CNs.")(
       "routing", po::bool_switch(&routing), "Activate adaptive query routing.")(
-      "cache-ratio",
-      po::value<u32>(&cache_size_ratio)->default_value(5),
-      "Cache size ratio relative to the index size in %.")(
       "no-recall", po::bool_switch(&no_recall), "No recall computation, ground truth file can be omitted.")(
       "ip-dist", po::bool_switch(&ip_distance), "Use the inner product distance rather than the squared L2 norm.")(
       "beam-width", po::value<u32>(&beam_width), "Beam width during search (replaces ef-search).")(
@@ -141,11 +131,9 @@ private:
       "k,k", po::value<u32>(&k), "Number of k nearest neighbors.")(
       "R", po::value<u32>(&R)->default_value(64), "Maximum out-degree of Vamana graph.")(
       "m,m", po::value<u32>(&R), "Alias for --R (max out-degree).")(
-      "alpha", po::value<f64>(&alpha)->default_value(1.2), "RobustPrune diversity factor.")(
-      "rabitq-bits", po::value<u32>(&rabitq_bits)->default_value(1),
-      "Bits per dimension for RaBitQ quantization (1, 2, 4, or 8).")(
-      "search-mode", po::value<str>(&search_mode)->default_value(search_mode),
-      "Search mode for the query path: exact_gpu or rabitq_gpu.")(
+      "alpha", po::value<f64>(&alpha)->default_value(1.2), "RobustPrune diversity factor.")
+      ("vector-data-type", po::value<str>(&vector_data_type)->default_value(vector_data_type),
+      "Storage dtype for full vectors: auto, float32, uint8, or int8.")(
       "insert-execution", po::value<str>(&insert_execution)->default_value(insert_execution),
       "Insert execution mode: compute or storage_owner.")(
       "insert-workers", po::value<u32>(&insert_workers)->default_value(0),
@@ -164,8 +152,6 @@ private:
       "Maximum number of inserts grouped into one storage_owner batch.")(
       "storage-owner-batch-wait-us", po::value<u32>(&storage_owner_batch_wait_us)->default_value(storage_owner_batch_wait_us),
       "Maximum micro-batch wait in microseconds for storage_owner inserts.")(
-      "storage-owner-cache-mb", po::value<u32>(&storage_owner_cache_mb)->default_value(storage_owner_cache_mb),
-      "Per-memory-node storage_owner local metadata/vector/neighbor cache size in MB. 0 disables it.")(
       "storage-owner-peer-rdma-tokens",
       po::value<u32>(&storage_owner_peer_rdma_tokens)->default_value(storage_owner_peer_rdma_tokens),
       "Maximum storage-owner peer RDMA reads allowed per peer QP. Capped by the memory-node safety limit.")(
@@ -199,10 +185,6 @@ private:
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
-      "neighbor-cache-mb", po::value<u32>(&neighbor_cache_mb)->default_value(0),
-      "CPU neighbor-list cache size per compute node in MB. 0 disables it.")(
-      "gpu-rabitq-cache-mb", po::value<u32>(&gpu_rabitq_cache_mb)->default_value(0),
-      "GPU RaBitQ cache size per compute node in MB. 0 disables it.")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
       "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
@@ -226,23 +208,18 @@ private:
       exit_with_help_message(argv);
     }
 
-    if (use_cache && cache_size_ratio == 0) {
-      std::cerr << "[ERROR]: If --cache is set, --cache-ratio must be > 0" << std::endl;
-      exit_with_help_message(argv);
-    }
-
-    if (search_mode != "exact_gpu" && search_mode != "rabitq_gpu") {
-      std::cerr << "[ERROR]: --search-mode must be exact_gpu or rabitq_gpu" << std::endl;
-      exit_with_help_message(argv);
+    if (vector_data_type != "auto") {
+      try {
+        (void)parse_vector_dtype(vector_data_type);
+      } catch (const std::exception& e) {
+        std::cerr << "[ERROR]: --vector-data-type must be auto, float32, uint8, or int8: "
+                  << e.what() << std::endl;
+        exit_with_help_message(argv);
+      }
     }
 
     if (insert_execution != "compute" && insert_execution != "storage_owner") {
       std::cerr << "[ERROR]: --insert-execution must be compute or storage_owner" << std::endl;
-      exit_with_help_message(argv);
-    }
-
-    if (rabitq_bits != 1 && rabitq_bits != 2 && rabitq_bits != 4 && rabitq_bits != 8) {
-      std::cerr << "[ERROR]: --rabitq-bits must be 1, 2, 4, or 8" << std::endl;
       exit_with_help_message(argv);
     }
 
@@ -308,7 +285,16 @@ private:
     }
   }
 
-  static str normalize_search_mode(str value) {
+public:
+  VectorDType resolved_vector_dtype() const {
+    if (vector_data_type == "auto") {
+      return VectorDType::float32;
+    }
+    return parse_vector_dtype(vector_data_type);
+  }
+
+private:
+  static str normalize_mode(str value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
       return static_cast<char>(std::tolower(ch));
     });
@@ -320,7 +306,6 @@ public:
     return index_path::resolve_prefix(data_path, index_prefix, R, beam_width_construction);
   }
 
-  bool use_rabitq_search() const { return search_mode == "rabitq_gpu"; }
   bool use_storage_owner_insert() const { return insert_execution == "storage_owner"; }
 
   friend std::ostream& operator<<(std::ostream& os, const IndexConfiguration& config) {
@@ -350,12 +335,12 @@ public:
       os << std::setw(width) << "beam width (search): " << config.beam_width << std::endl;
       os << std::setw(width) << "beam width (construction): " << config.beam_width_construction << std::endl;
       os << std::setw(width) << "alpha: " << config.alpha << std::endl;
+      os << std::setw(width) << "vector data type: " << config.vector_data_type << std::endl;
       os << std::setw(width) << "insert execution: " << config.insert_execution << std::endl;
       if (!config.storage_peers.empty()) {
         os << std::setw(width) << "storage id: " << config.storage_id << std::endl;
         os << std::setw(width) << "storage batch max: " << config.storage_owner_batch_max << std::endl;
         os << std::setw(width) << "storage batch wait(us): " << config.storage_owner_batch_wait_us << std::endl;
-        os << std::setw(width) << "storage cache (MB): " << config.storage_owner_cache_mb << std::endl;
         os << std::setw(width) << "storage peer RDMA tokens: " << config.storage_owner_peer_rdma_tokens << std::endl;
         os << std::setw(width) << "storage RPC depth: " << config.storage_owner_rpc_depth << std::endl;
         os << std::setw(width) << "storage RPC timeout(ms): " << config.storage_owner_rpc_timeout_ms << std::endl;
@@ -378,16 +363,12 @@ public:
         }
         os << "\b\b]" << std::endl;
       }
-      os << std::setw(width) << "RaBitQ bits: " << config.rabitq_bits << std::endl;
-      os << std::setw(width) << "search mode: " << config.search_mode << std::endl;
       os << std::setw(width) << "insert workers: " << config.insert_workers << std::endl;
       os << std::setw(width) << "query workers: " << config.query_workers << std::endl;
       os << std::setw(width) << "insert coroutines: " << config.insert_coroutines << std::endl;
       os << std::setw(width) << "query coroutines: " << config.query_coroutines << std::endl;
       os << std::setw(width) << "GPU device: " << config.gpu_device << std::endl;
       os << std::setw(width) << "GPUDirect RDMA: " << (config.gpudirect_rdma ? "true" : "false") << std::endl;
-      os << std::setw(width) << "neighbor cache (MB): " << config.neighbor_cache_mb << std::endl;
-      os << std::setw(width) << "GPU RaBitQ cache (MB): " << config.gpu_rabitq_cache_mb << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {
       os << std::left << std::setfill(' ');

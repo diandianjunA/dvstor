@@ -75,10 +75,8 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
            static_cast<double>(aggregate.counters.rdma_write_ops)},
     {"neighbor_rdma_bytes", aggregate.counters.neighbor_rdma_bytes},
     {"vector_rdma_bytes", aggregate.counters.vector_rdma_bytes},
-    {"rabitq_rdma_bytes", aggregate.counters.rabitq_rdma_bytes},
     {"neighbor_rdma_read_ops", aggregate.counters.neighbor_rdma_read_ops},
     {"vector_rdma_read_ops", aggregate.counters.vector_rdma_read_ops},
-    {"rabitq_rdma_read_ops", aggregate.counters.rabitq_rdma_read_ops},
     {"neighbor_rdma_read_avg_bytes",
      aggregate.counters.neighbor_rdma_read_ops == 0
        ? 0.0
@@ -89,16 +87,10 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
        ? 0.0
        : static_cast<double>(aggregate.counters.vector_rdma_bytes) /
            static_cast<double>(aggregate.counters.vector_rdma_read_ops)},
-    {"rabitq_rdma_read_avg_bytes",
-     aggregate.counters.rabitq_rdma_read_ops == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.rabitq_rdma_bytes) /
-           static_cast<double>(aggregate.counters.rabitq_rdma_read_ops)},
     {"h2d_bytes", aggregate.counters.h2d_bytes},
     {"d2h_bytes", aggregate.counters.d2h_bytes},
     {"l2_kernels", aggregate.counters.l2_kernels},
     {"prune_kernels", aggregate.counters.prune_kernels},
-    {"rabitq_kernels", aggregate.counters.rabitq_kernels},
     {"exact_reranks", aggregate.counters.exact_reranks},
     {"visited_nodes", aggregate.counters.visited_nodes},
     {"visited_neighborlists", aggregate.counters.visited_neighborlists},
@@ -127,22 +119,8 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
        : static_cast<double>(aggregate.counters.overflow_prune_kernel_threads) /
            static_cast<double>(aggregate.counters.overflow_prunes)},
     {"overflow_prune_max_kernel_threads", aggregate.counters.overflow_prune_max_kernel_threads},
-    {"cache_hits", aggregate.counters.cache_hits},
-    {"cache_misses", aggregate.counters.cache_misses},
     {"query_rdma_to_staging_bytes", aggregate.counters.query_rdma_to_staging_bytes},
     {"query_host_staging_fallback_bytes", aggregate.counters.query_host_staging_fallback_bytes},
-    {"neighbor_cache_hits", aggregate.counters.neighbor_cache_hits},
-    {"neighbor_cache_misses", aggregate.counters.neighbor_cache_misses},
-    {"gpu_rabitq_cache_hits", aggregate.counters.gpu_rabitq_cache_hits},
-    {"gpu_rabitq_cache_misses", aggregate.counters.gpu_rabitq_cache_misses},
-    {"gpu_rabitq_cache_fills", aggregate.counters.gpu_rabitq_cache_fills},
-    {"gpu_rabitq_cache_fill_bytes", aggregate.counters.gpu_rabitq_cache_fill_bytes},
-    {"gpu_rabitq_cache_gather_batches", aggregate.counters.gpu_rabitq_cache_gather_batches},
-    {"gpu_rabitq_cache_gather_bytes", aggregate.counters.gpu_rabitq_cache_gather_bytes},
-    {"gpu_rabitq_cache_loading_fallbacks", aggregate.counters.gpu_rabitq_cache_loading_fallbacks},
-    {"gpu_rabitq_cache_evictions", aggregate.counters.gpu_rabitq_cache_evictions},
-    {"gpu_rabitq_cache_duplicate_fills", aggregate.counters.gpu_rabitq_cache_duplicate_fills},
-    {"gpu_rabitq_cache_fallback_batches", aggregate.counters.gpu_rabitq_cache_fallback_batches},
     {"lock_attempts", aggregate.lock_attempts},
     {"lock_retries", aggregate.lock_retries},
     {"cas_failures", aggregate.cas_failures},

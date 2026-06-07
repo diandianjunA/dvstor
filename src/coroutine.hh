@@ -62,8 +62,10 @@ struct VamanaCoroutine {
   vec<BeamEntry> beam{};
   hashset_t<RemotePtr> visited_nodes{};
   vec<RemotePtr> scratch_unvisited{};
-  vec<RemotePtr> scratch_cache_ptrs{};
-  vec<RemotePtr> scratch_fallback_ptrs{};
+  vec<RemotePtr> reserved_ptrs_a{};
+  vec<RemotePtr> reserved_ptrs_b{};
+  vec<RemotePtr> indirect_candidate_ptrs{};
+  vec<u32> indirect_candidate_indices{};
 
   // GPU state
   bool gpu_pending{false};

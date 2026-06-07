@@ -34,22 +34,34 @@ MemoryNode::MemoryNode(Configuration& config)
   context_.receive();
 
   num_compute_threads_ = p.num_threads;
-  VamanaNode::init_static_storage(config.dim, config.R, config.rabitq_bits);
   const filepath_t index_prefix = config.resolved_index_prefix();
+  VectorDType startup_dtype = config.resolved_vector_dtype();
   const filepath_t meta_file = filepath_t(index_prefix.string() + ".meta.json");
   if (!index_prefix.empty() && std::filesystem::exists(meta_file)) {
-    service::rabitq::Artifacts metadata;
+    service::index_metadata::Metadata metadata;
     str metadata_error;
-    lib_assert(service::rabitq::load_metadata(index_prefix, metadata, &metadata_error), metadata_error);
+    lib_assert(service::index_metadata::load_metadata(index_prefix, metadata, &metadata_error), metadata_error);
     lib_assert(metadata.dim == config.dim, "index metadata dim mismatch on storage node");
-    lib_assert(metadata.rabitq_bits == config.rabitq_bits, "index metadata RaBitQ bits mismatch on storage node");
-    lib_assert(metadata.rabitq_size == VamanaNode::RABITQ_SIZE, "index metadata RaBitQ size mismatch on storage node");
     lib_assert(metadata.R == config.R, "index metadata R mismatch on storage node");
-    lib_assert(metadata.node_size == VamanaNode::total_size(), "index metadata node size mismatch on storage node");
     lib_assert(metadata.num_memory_nodes == num_storage_nodes_, "index metadata storage-node count mismatch");
-    VamanaNode::set_layout(VamanaNode::parse_layout(metadata.node_layout));
+    lib_assert(metadata.node_layout == "standard", "unsupported index node layout on storage node");
+    if (config.vector_data_type != "auto" && config.resolved_vector_dtype() != metadata.vector_dtype) {
+      lib_failure("configured vector-data-type=" + config.vector_data_type +
+                  " does not match index metadata vector_data_type=" + vector_dtype_name(metadata.vector_dtype));
+    }
+    startup_dtype = metadata.vector_dtype;
+    config.vector_data_type = vector_dtype_name(startup_dtype);
+    VamanaNode::init_static_storage(config.dim, config.R, startup_dtype);
+    lib_assert(metadata.vector_component_size == VamanaNode::vector_component_size(),
+               "index metadata vector component size mismatch on storage node");
+    lib_assert(metadata.vector_bytes == VamanaNode::vector_bytes(),
+               "index metadata vector byte size mismatch on storage node");
+    lib_assert(metadata.node_size == VamanaNode::total_size(), "index metadata node size mismatch on storage node");
     print_status("loaded index metadata from " + index_prefix.string() +
-                 " (layout=" + VamanaNode::layout_name() + ")");
+                 " (layout=" + VamanaNode::layout_name() +
+                 ", vector_data_type=" + VamanaNode::vector_dtype_name() + ")");
+  } else {
+    VamanaNode::init_static_storage(config.dim, config.R, startup_dtype);
   }
   allocate_memory();
 
@@ -94,9 +106,6 @@ MemoryNode::MemoryNode(Configuration& config)
   bool running = handle_command();
 
   if (running && use_storage_owner_insert_) {
-    if (config.use_rabitq_search()) {
-      load_rabitq_artifacts(config);
-    }
     setup_storage_peers(config);
     setup_insert_runtime(config);
     storage_worker_config_ = std::make_unique<Configuration>(config);
@@ -143,7 +152,6 @@ MemoryNode::InsertBreakdownCounters MemoryNode::scale_breakdown(const InsertBrea
                                                const u32 total) {
   InsertBreakdownCounters out{};
   out.storage_owner_queue_wait_ns = scale_ns(counters.storage_owner_queue_wait_ns, part, total);
-  out.storage_owner_quantize_ns = scale_ns(counters.storage_owner_quantize_ns, part, total);
   out.storage_owner_medoid_ns = scale_ns(counters.storage_owner_medoid_ns, part, total);
   out.storage_owner_search_ns = scale_ns(counters.storage_owner_search_ns, part, total);
   out.storage_owner_prune_ns = scale_ns(counters.storage_owner_prune_ns, part, total);
@@ -286,25 +294,6 @@ std::pair<bool, str> MemoryNode::store_index_file(const str& path) {
   return {true, ""};
 }
 
-void MemoryNode::load_rabitq_artifacts(const Configuration& config) {
-  if (!config.use_rabitq_search()) {
-    rabitq_artifacts_ready_ = false;
-    return;
-  }
-
-  str error_message;
-  lib_assert(service::rabitq::load_artifacts(config.resolved_index_prefix(), rabitq_artifacts_, &error_message),
-             error_message);
-  lib_assert(rabitq_artifacts_.dim == config.dim, "RaBitQ artifact dim mismatch on storage node");
-  lib_assert(rabitq_artifacts_.rabitq_bits == config.rabitq_bits, "RaBitQ artifact bits mismatch on storage node");
-  VamanaNode::set_layout(VamanaNode::parse_layout(rabitq_artifacts_.node_layout));
-  rabitq_artifacts_ready_ = true;
-  print_status("loaded RaBitQ artifacts from " + config.resolved_index_prefix().string() +
-               " (dim=" + std::to_string(rabitq_artifacts_.dim) +
-               ", bits=" + std::to_string(rabitq_artifacts_.rabitq_bits) +
-               ", layout=" + VamanaNode::layout_name() + ")");
-}
-
 size_t MemoryNode::align_up(size_t value, size_t alignment) {
   while (value % alignment != 0) {
     ++value;
@@ -312,8 +301,19 @@ size_t MemoryNode::align_up(size_t value, size_t alignment) {
   return value;
 }
 
-MemoryNode::DistFn MemoryNode::distance_fn() const {
-  return ip_distance_ ? &ip_distance : &l2;
+distance_t MemoryNode::distance_to_stored_vector(const span<const element_t> query,
+                                                const byte_t* stored,
+                                                const Configuration& config) const {
+  return typed_distance_float_query(query, stored, VamanaNode::vector_dtype(), config.dim, ip_distance_);
+}
+
+distance_t MemoryNode::distance_between_vectors(const byte_t* lhs,
+                                                VectorDType lhs_dtype,
+                                                const byte_t* rhs,
+                                                VectorDType rhs_dtype,
+                                                const Configuration& config) const {
+  return ip_distance_ ? typed_ip_distance(lhs, lhs_dtype, rhs, rhs_dtype, config.dim)
+                      : typed_l2_distance(lhs, lhs_dtype, rhs, rhs_dtype, config.dim);
 }
 
 bool MemoryNode::local_shard(u32 shard_id) const { return shard_id == storage_id_; }
@@ -324,14 +324,6 @@ byte_t* MemoryNode::local_node_ptr(const RemotePtr& rptr) {
 
 const byte_t* MemoryNode::local_node_ptr(const RemotePtr& rptr) const {
   return index_buffer_.get_full_buffer() + rptr.byte_offset();
-}
-
-void MemoryNode::invalidate_storage_owner_cache(RemotePtr rptr) {
-  for (auto& thread : storage_owner_threads_) {
-    if (thread) {
-      thread->cache.invalidate(rptr);
-    }
-  }
 }
 
 void MemoryNode::insert_into_beam(vec<BeamEntry>& beam, const RemotePtr& rptr, distance_t dist, u32 max_beam_width) {

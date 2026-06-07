@@ -52,28 +52,13 @@ private:
     }
 
     // =========================================================================
-    // Cache lookup (currently bypasses cache; VamanaNode caching TBD)
+    // Full-node RDMA read kept as a nested coroutine so the search coroutine
+    // retains its established suspension and frame layout.
     // =========================================================================
 
-    MinorCoroutine cache_lookup(RemotePtr rptr,
-                                s_ptr<VamanaNode>& value,
-                                const u_ptr<ComputeThread>& thread,
-                                bool admit) const {
-        if (!use_cache_) {
-            value = co_await rdma::vamana::read_vamana_node(rptr, thread);
-            co_return;
-        }
-
-        auto cache_entry = thread->cache.get<VamanaNode>(rptr);
-        if (cache_entry.has_value()) {
-            value = *cache_entry;
-            ++thread->stats.cache_hits;
-        } else {
-            value = co_await rdma::vamana::read_vamana_node(rptr, thread);
-            if (admit) {
-                thread->cache.insert(rptr, value, thread->get_id());
-            }
-            ++thread->stats.cache_misses;
-        }
+    MinorCoroutine read_node(RemotePtr rptr,
+                             s_ptr<VamanaNode>& value,
+                             const u_ptr<ComputeThread>& thread,
+                             bool) const {
+        value = co_await rdma::vamana::read_vamana_node(rptr, thread);
     }
-

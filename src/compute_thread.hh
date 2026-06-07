@@ -4,20 +4,15 @@
 #include <library/hugepage.hh>
 #include <library/thread.hh>
 #include <random>
+#include <memory>
 
 #include "buffer_allocator.hh"
-#include "cache/neighbor_cache.hh"
 #include "common/statistics.hh"
 #include "coroutine.hh"
 #include "gpu/gpu_buffer_manager.hh"
 #include "http/service_types.hh"
 #include "service/breakdown.hh"
 #include "shared_context.hh"
-
-// forward declaration
-namespace cache {
-class Cache;
-}
 
 enum class ServiceWorkerRole { none, insert, query };
 
@@ -27,14 +22,12 @@ public:
                 u32 compute_node_id,
                 i32 max_send_queue_wr,
                 BufferAllocator& buffer_allocator,
-                cache::Cache& cache,
                 u32 num_memory_nodes,
                 u32 num_coroutines)
       : Thread(id),
         node_id(compute_node_id),
         send_wcs(max_send_queue_wr),
         buffer_allocator(buffer_allocator),
-        cache(cache),
         post_balances(num_coroutines),
         gpu_post_balances(num_coroutines),
         max_send_queue_wr_(max_send_queue_wr),
@@ -96,21 +89,6 @@ public:
   ServiceWorkerRole service_role() const { return service_role_; }
   bool is_query_worker() const { return service_role_ == ServiceWorkerRole::query; }
   bool is_insert_worker() const { return service_role_ == ServiceWorkerRole::insert; }
-  void set_graph_epoch_source(const std::atomic<u64>* source) {
-    graph_epoch_source_ = source;
-    observed_graph_epoch_ = source == nullptr ? 0 : source->load(std::memory_order_acquire);
-  }
-  void refresh_neighbor_cache_if_stale() {
-    if (graph_epoch_source_ == nullptr || !neighbor_cache.enabled()) {
-      return;
-    }
-    const u64 current_epoch = graph_epoch_source_->load(std::memory_order_acquire);
-    if (current_epoch != observed_graph_epoch_) {
-      neighbor_cache.clear();
-      observed_graph_epoch_ = current_epoch;
-    }
-  }
-
   /**
    * Poll GPU events for all coroutines.
    * Decrements gpu_post_balances when a coroutine's GPU work completes.
@@ -122,7 +100,7 @@ public:
   vec<ibv_wc> send_wcs;
 
   BufferAllocator& buffer_allocator;  // global per compute node
-  cache::Cache& cache;  // global per compute node
+  void* reserved_node_store{nullptr};
 
   SharedContext<ComputeThread>* ctx{nullptr};  // initialized by WorkerPool
   u32 ctx_tid{};
@@ -135,7 +113,7 @@ public:
   vec<std::atomic<i32>> gpu_post_balances;  // per coroutine (GPU)
 
   gpu::GpuBufferManager gpu_buffers;  // CUDA streams, events, staging buffers
-  cache::NeighborCache neighbor_cache;  // CPU-side query neighbor-list cache
+  void* reserved_query_state[2]{};
 
   statistics::ThreadStatistics stats{};
 
@@ -145,9 +123,6 @@ private:
   vec<u64*> pointer_slots_;  // memory region for a single pointer per coroutine
   vec<service::breakdown::Sample*> active_samples_;
   ServiceWorkerRole service_role_{ServiceWorkerRole::none};
-  const std::atomic<u64>* graph_epoch_source_{nullptr};
-  u64 observed_graph_epoch_{0};
-
   std::mt19937 generator_{std::random_device{}()};
   std::uniform_int_distribution<u32> dist_;
 };

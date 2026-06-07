@@ -15,7 +15,7 @@ bool ComputeService<Distance>::load_index(const std::string& path, str* error_me
     }
   }
 
-  if (!maybe_load_rabitq_artifacts(filepath_t{path}, error_message)) {
+  if (!validate_index_metadata(filepath_t{path}, error_message)) {
     resume_rpc();
     resume_workers();
     return false;
@@ -26,7 +26,6 @@ bool ComputeService<Distance>::load_index(const std::string& path, str* error_me
     routing_centroids_[cm_.client_id] = compute_local_routing_centroid();
   }
 
-  graph_epoch_.fetch_add(1, std::memory_order_acq_rel);
   resume_rpc();
   refresh_routing_state(false);
   resume_workers();
@@ -120,7 +119,7 @@ vec<element_t> ComputeService<Distance>::compute_local_routing_centroid() const 
 
   if (medoid_node) {
     for (idx_t i = 0; i < config_.dim; ++i) {
-      centroid[i] = medoid_node->components()[i];
+      centroid[i] = medoid_node->component_as_float(i);
     }
   }
   return centroid;
@@ -197,11 +196,6 @@ void ComputeService<Distance>::wait_for_load_or_store() {
     const str detail = msg.empty() ? "" : ": " + msg;
     lib_assert(resp.success, "startup load/store failed on memory server " + std::to_string(i) + detail);
   }
-
-  if (cmd == mn_command::LOAD && config_.use_rabitq_search()) {
-    str artifact_error;
-    lib_assert(maybe_load_rabitq_artifacts(index_prefix, &artifact_error), artifact_error);
-  }
 }
 
 template <class Distance>
@@ -252,116 +246,60 @@ typename ComputeService<Distance>::ServiceProfile ComputeService<Distance>::reso
 }
 
 template <class Distance>
-bool ComputeService<Distance>::maybe_load_rabitq_artifacts(const filepath_t& index_prefix, str* error_message) {
-  if (!config_.use_rabitq_search()) {
-    const filepath_t meta_file = filepath_t(index_prefix.string() + ".meta.json");
-    if (!index_prefix.empty() && std::filesystem::exists(meta_file)) {
-      service::rabitq::Artifacts metadata;
-      if (!service::rabitq::load_metadata(index_prefix, metadata, error_message)) {
-        return false;
-      }
-      if (metadata.dim != config_.dim || metadata.rabitq_bits != config_.rabitq_bits ||
-          metadata.rabitq_size != VamanaNode::RABITQ_SIZE || metadata.R != config_.R ||
-          metadata.node_size != VamanaNode::total_size() || metadata.num_memory_nodes != num_servers_) {
-        if (error_message) {
-          *error_message = "index metadata does not match runtime Vamana configuration";
-        }
-        return false;
-      }
-      VamanaNode::set_layout(VamanaNode::parse_layout(metadata.node_layout));
-      print_status("loaded index metadata from " + index_prefix.string() +
-                   " (layout=" + VamanaNode::layout_name() + ")");
-    }
+bool ComputeService<Distance>::validate_index_metadata(const filepath_t& index_prefix, str* error_message) {
+  const filepath_t meta_file = filepath_t(index_prefix.string() + ".meta.json");
+  if (index_prefix.empty() || !std::filesystem::exists(meta_file)) {
+    VamanaNode::init_static_storage(config_.dim, config_.R, config_.resolved_vector_dtype());
     return true;
   }
 
-  rabitq_artifacts_ready_ = false;
-
-  if (index_prefix.empty()) {
-    if (error_message) {
-      *error_message = "rabitq_gpu search requires a non-empty index prefix";
-    }
+  service::index_metadata::Metadata metadata;
+  if (!service::index_metadata::load_metadata(index_prefix, metadata, error_message)) {
     return false;
   }
 
-  service::rabitq::Artifacts artifacts;
-  if (!service::rabitq::load_artifacts(index_prefix, artifacts, error_message)) {
+  if (config_.vector_data_type != "auto" && config_.resolved_vector_dtype() != metadata.vector_dtype) {
+    if (error_message) {
+      *error_message = "index vector dtype mismatch: runtime=" + config_.vector_data_type +
+                       ", metadata=" + vector_dtype_name(metadata.vector_dtype);
+    }
     return false;
   }
 
-  if (artifacts.dim != config_.dim) {
+  VamanaNode::init_static_storage(config_.dim, config_.R, metadata.vector_dtype);
+  config_.vector_data_type = vector_dtype_name(metadata.vector_dtype);
+
+  if (metadata.dim != config_.dim || metadata.R != config_.R ||
+      metadata.vector_component_size != VamanaNode::vector_component_size() ||
+      metadata.vector_bytes != VamanaNode::vector_bytes() ||
+      metadata.node_size != VamanaNode::total_size() ||
+      metadata.num_memory_nodes != num_servers_) {
     if (error_message) {
-      *error_message = "RaBitQ artifact dim mismatch: expected " + std::to_string(config_.dim) +
-                       ", got " + std::to_string(artifacts.dim);
+      *error_message = "index metadata does not match runtime Vamana configuration";
     }
     return false;
   }
-  if (artifacts.rabitq_bits != config_.rabitq_bits) {
-    if (error_message) {
-      *error_message = "RaBitQ artifact bits mismatch: expected " + std::to_string(config_.rabitq_bits) +
-                       ", got " + std::to_string(artifacts.rabitq_bits);
-    }
-    return false;
-  }
-  if (artifacts.rabitq_size != VamanaNode::RABITQ_SIZE) {
-    if (error_message) {
-      *error_message = "RaBitQ artifact size mismatch: expected " + std::to_string(VamanaNode::RABITQ_SIZE) +
-                       ", got " + std::to_string(artifacts.rabitq_size);
-    }
-    return false;
-  }
-  const auto index_layout = VamanaNode::parse_layout(artifacts.node_layout);
-  VamanaNode::set_layout(index_layout);
-  if (artifacts.R != config_.R) {
-    if (error_message) {
-      *error_message = "index R mismatch: expected " + std::to_string(config_.R) +
-                       ", got " + std::to_string(artifacts.R) +
-                       ". Runtime R must match the offline index metadata.";
-    }
-    return false;
-  }
-  if (artifacts.beam_width_construction != config_.beam_width_construction) {
+  if (metadata.beam_width_construction != 0 &&
+      metadata.beam_width_construction != config_.beam_width_construction) {
     if (error_message) {
       *error_message = "index construction beam-width mismatch: expected " +
                        std::to_string(config_.beam_width_construction) + ", got " +
-                       std::to_string(artifacts.beam_width_construction);
+                       std::to_string(metadata.beam_width_construction);
     }
     return false;
   }
-  if (artifacts.node_size != VamanaNode::total_size()) {
+  if (metadata.node_layout != "standard") {
     if (error_message) {
-      *error_message = "index node size mismatch: expected " + std::to_string(VamanaNode::total_size()) +
-                       ", got " + std::to_string(artifacts.node_size) +
-                       ". Runtime layout must match the offline index metadata.";
-    }
-    return false;
-  }
-  if (artifacts.num_memory_nodes != num_servers_) {
-    if (error_message) {
-      *error_message = "RaBitQ artifact memory-node count mismatch: expected " + std::to_string(num_servers_) +
-                       ", got " + std::to_string(artifacts.num_memory_nodes);
+      *error_message = "unsupported index node_layout=" + metadata.node_layout +
+                       "; rebuild the index with the standard exact-vector layout";
     }
     return false;
   }
 
-  upload_rabitq_artifacts(artifacts);
-  rabitq_artifacts_ready_ = true;
-  print_status("loaded RaBitQ artifacts from " + index_prefix.string() +
-               " (dim=" + std::to_string(artifacts.dim) +
-               ", bits=" + std::to_string(artifacts.rabitq_bits) +
-               ", layout=" + VamanaNode::layout_name() + ")");
+  print_status("loaded index metadata from " + index_prefix.string() +
+               " (layout=" + VamanaNode::layout_name() +
+               ", vector_data_type=" + VamanaNode::vector_dtype_name() + ")");
   return true;
-}
-
-template <class Distance>
-void ComputeService<Distance>::upload_rabitq_artifacts(const service::rabitq::Artifacts& artifacts) {
-  for (auto& thread : compute_threads()) {
-    thread->gpu_buffers.configure_rabitq(
-      artifacts.rotation_matrix.data(),
-      artifacts.rotated_centroid.data(),
-      artifacts.dim,
-      artifacts.t_const);
-  }
 }
 
 template <class Distance>

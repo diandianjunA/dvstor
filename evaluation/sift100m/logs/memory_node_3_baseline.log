@@ -1,0 +1,34 @@
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1236
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         64
+max send work requests:       4096
+max receive work requests:    4096
+============================================================
+server index file:            "/data/xjs/index/dvstor_sift100m/index/sift100m_R64_bw200_bfs_node3_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 9351 -- 9350
+[STATUS]: pinned main thread to core 28
+[STATUS]: loaded index metadata from /data/xjs/index/dvstor_sift100m/index/sift100m_R64_bw200_bfs (layout=standard, vector_data_type=uint8)
+allocation size: 20401094656
+allocated ALIGNED MEM (no hugepage) at 128166641270848 with buffer size 20401094656
+[STATUS]: loading index (131200016 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R64_bw200_bfs_node3_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 9358 -- 9364
+pairing: 9367 -- 9373
+pairing: 9379 -- 9383
+pairing: 9386 -- 9393
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (131200016 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R64_bw200_bfs_node3_of5.dat

@@ -4,6 +4,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <unordered_set>
@@ -12,461 +13,496 @@
 
 #include "tools/vamana_offline/progress.hh"
 
-#ifdef __AVX__
-#include <x86intrin.h>
-#endif
-
 namespace tools::vamana_offline {
 
-float l2_squared(const float* a, const float* b, u32 dim) {
-#ifdef __AVX__
-  __m256 sum = _mm256_setzero_ps();
-  u32 i = 0;
-  for (; i + 16 <= dim; i += 16) {
-    __m256 v1 = _mm256_loadu_ps(a + i);
-    __m256 v2 = _mm256_loadu_ps(b + i);
-    __m256 d = _mm256_sub_ps(v1, v2);
-    sum = _mm256_add_ps(sum, _mm256_mul_ps(d, d));
-    v1 = _mm256_loadu_ps(a + i + 8);
-    v2 = _mm256_loadu_ps(b + i + 8);
-    d = _mm256_sub_ps(v1, v2);
-    sum = _mm256_add_ps(sum, _mm256_mul_ps(d, d));
+namespace {
+
+class LocalIdSet {
+public:
+  explicit LocalIdSet(size_t expected_items) {
+    size_t capacity = 1;
+    while (capacity < expected_items * 2) capacity <<= 1;
+    table_.assign(capacity, kEmpty);
+    mask_ = capacity - 1;
   }
-  float __attribute__((aligned(32))) tmp[8];
-  _mm256_store_ps(tmp, sum);
-  float result = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
-  for (; i < dim; ++i) {
-    float d = a[i] - b[i];
-    result += d * d;
+
+  bool contains(u32 value) const {
+    size_t pos = hash(value) & mask_;
+    for (;;) {
+      const u32 current = table_[pos];
+      if (current == kEmpty) return false;
+      if (current == value) return true;
+      pos = (pos + 1) & mask_;
+    }
   }
-  return result;
-#else
-  float sum = 0.0f;
-  for (u32 i = 0; i < dim; ++i) {
-    const float d = a[i] - b[i];
-    sum += d * d;
+
+  bool insert(u32 value) {
+    size_t pos = hash(value) & mask_;
+    for (;;) {
+      const u32 current = table_[pos];
+      if (current == value) return false;
+      if (current == kEmpty) {
+        table_[pos] = value;
+        return true;
+      }
+      pos = (pos + 1) & mask_;
+    }
   }
-  return sum;
-#endif
+
+private:
+  static constexpr u32 kEmpty = std::numeric_limits<u32>::max();
+
+  static size_t hash(u32 value) {
+    uint64_t x = value;
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return static_cast<size_t>(x);
+  }
+
+  vec<u32> table_;
+  size_t mask_{0};
+};
+
+bool candidate_id_less(const std::pair<float, u32>& a, const std::pair<float, u32>& b) {
+  if (a.first != b.first) return a.first < b.first;
+  return a.second < b.second;
 }
 
-float ip_distance(const float* a, const float* b, u32 dim) {
-#ifdef __AVX__
-  __m256 sum = _mm256_setzero_ps();
-  u32 i = 0;
-  for (; i + 16 <= dim; i += 16) {
-    __m256 v1 = _mm256_loadu_ps(a + i);
-    __m256 v2 = _mm256_loadu_ps(b + i);
-    sum = _mm256_add_ps(sum, _mm256_mul_ps(v1, v2));
-    v1 = _mm256_loadu_ps(a + i + 8);
-    v2 = _mm256_loadu_ps(b + i + 8);
-    sum = _mm256_add_ps(sum, _mm256_mul_ps(v1, v2));
+void sort_and_unique_candidates(vec<std::pair<float, u32>>& candidates) {
+  std::sort(candidates.begin(), candidates.end(), candidate_id_less);
+  vec<std::pair<float, u32>> unique;
+  unique.reserve(candidates.size());
+  LocalIdSet seen(std::max<size_t>(1024, candidates.size()));
+  for (const auto& item : candidates) {
+    if (seen.insert(item.second)) {
+      unique.push_back(item);
+    }
   }
-  float __attribute__((aligned(32))) tmp[8];
-  _mm256_store_ps(tmp, sum);
-  float dot = tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7];
-  for (; i < dim; ++i) dot += a[i] * b[i];
-  return -dot;
-#else
-  float sum = 0.0f;
-  for (u32 i = 0; i < dim; ++i) sum += a[i] * b[i];
-  return -sum;
-#endif
+  candidates.swap(unique);
 }
 
-/**
- * Compute medoid: the vector with minimum sum of distances to all others.
- * Uses sampling for large datasets.
- */
-size_t compute_medoid(const Dataset& dataset, DistFn dist_fn) {
-  const size_t n = dataset.ids.size();
+}  // namespace
+
+void VamanaGraph::init(size_t n, u32 d, u32 max_degree, size_t requested_lock_stripes) {
+  lib_assert(max_degree <= std::numeric_limits<u8>::max(), "offline graph degree must fit in u8");
+  num_nodes = n;
+  dim = d;
+  R = max_degree;
+  medoid = 0;
+  neighbors.assign(n * static_cast<size_t>(R), kEmptyNeighbor);
+  degrees.assign(n, 0);
+  lock_stripe_count = 1;
+  const size_t target = std::max<size_t>(1, std::min(requested_lock_stripes, n));
+  while (lock_stripe_count < target) lock_stripe_count <<= 1;
+  lock_stripes.reset(new std::atomic_flag[lock_stripe_count]);
+  for (size_t i = 0; i < lock_stripe_count; ++i) {
+    lock_stripes[i].clear(std::memory_order_relaxed);
+  }
+  std::cerr << "offline graph memory: neighbors=" << neighbors.size() * sizeof(u32)
+            << " bytes, degrees=" << degrees.size() * sizeof(u8)
+            << " bytes, lock_stripes=" << lock_stripe_count << "\n";
+}
+
+void VamanaGraph::copy_neighbors(size_t node, vec<u32>& out) const {
+  out.clear();
+  const size_t base = offset(node);
+  const u8 count = degrees[node];
+  out.reserve(count);
+  for (u8 i = 0; i < count; ++i) {
+    const u32 nbr = neighbors[base + i];
+    if (nbr != kEmptyNeighbor) out.push_back(nbr);
+  }
+}
+
+bool VamanaGraph::contains_neighbor_unlocked(size_t node, u32 neighbor) const {
+  const size_t base = offset(node);
+  const u8 count = degrees[node];
+  for (u8 i = 0; i < count; ++i) {
+    if (neighbors[base + i] == neighbor) return true;
+  }
+  return false;
+}
+
+void VamanaGraph::set_neighbors(size_t node, const vec<u32>& new_neighbors) {
+  const size_t base = offset(node);
+  const u8 count = static_cast<u8>(std::min<size_t>(new_neighbors.size(), R));
+  for (u8 i = 0; i < count; ++i) {
+    neighbors[base + i] = new_neighbors[i];
+  }
+  for (u32 i = count; i < R; ++i) {
+    neighbors[base + i] = kEmptyNeighbor;
+  }
+  degrees[node] = count;
+}
+
+void VamanaGraph::lock_node(size_t node) {
+  auto& flag = lock_stripes[node & (lock_stripe_count - 1)];
+  while (flag.test_and_set(std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#endif
+  }
+}
+
+void VamanaGraph::unlock_node(size_t node) {
+  lock_stripes[node & (lock_stripe_count - 1)].clear(std::memory_order_release);
+}
+
+void BuilderGpuContext::init(u32 dim_, u32 max_cand, VectorDType dtype_, const void* d_base_vectors_) {
+  dim = dim_;
+  max_candidates = max_cand;
+  dtype = static_cast<u32>(dtype_);
+  d_base_vectors = d_base_vectors_;
+  stream = gpu::gpu_stream_create();
+  event = gpu::gpu_event_create();
+  h_candidate_ids = static_cast<u32*>(gpu::gpu_malloc_host(max_candidates * sizeof(u32)));
+  h_distances = static_cast<float*>(gpu::gpu_malloc_host(max_candidates * sizeof(float)));
+  d_candidate_ids = static_cast<u32*>(gpu::gpu_malloc(max_candidates * sizeof(u32)));
+  d_distances = static_cast<float*>(gpu::gpu_malloc(max_candidates * sizeof(float)));
+}
+
+void BuilderGpuContext::destroy() {
+  if (!stream) return;
+  gpu::gpu_free_host(h_candidate_ids);
+  gpu::gpu_free_host(h_distances);
+  gpu::gpu_free(d_candidate_ids);
+  gpu::gpu_free(d_distances);
+  gpu::gpu_event_destroy(event);
+  gpu::gpu_stream_destroy(stream);
+  stream = nullptr;
+}
+
+size_t compute_medoid(const Dataset& dataset, bool ip_distance) {
+  const size_t n = dataset.size();
   const u32 dim = dataset.dim;
-
-  // For large datasets, sample to find approximate medoid
   const size_t sample_size = std::min<size_t>(n, 10000);
-  vec<size_t> sample_indices(n);
-  std::iota(sample_indices.begin(), sample_indices.end(), 0);
-
+  vec<u32> sample_indices(sample_size);
+  for (size_t i = 0; i < sample_size; ++i) sample_indices[i] = static_cast<u32>(i);
   if (sample_size < n) {
     std::mt19937 rng(42);
-    std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
-    sample_indices.resize(sample_size);
+    std::uniform_int_distribution<u32> dist(0, static_cast<u32>(n - 1));
+    for (size_t i = 0; i < sample_size; ++i) sample_indices[i] = dist(rng);
   }
 
-  // Compute centroid
   vec<float> centroid(dim, 0.0f);
-  for (size_t idx : sample_indices) {
-    const float* v = dataset.vector(idx);
-    for (u32 d = 0; d < dim; ++d) centroid[d] += v[d];
+  vec<float> decoded(dim);
+  for (u32 idx : sample_indices) {
+    dataset_decode_vector(dataset, idx, decoded.data());
+    for (u32 d = 0; d < dim; ++d) centroid[d] += decoded[d];
   }
   for (u32 d = 0; d < dim; ++d) centroid[d] /= static_cast<float>(sample_size);
 
-  // Find vector closest to centroid
   size_t best = 0;
   float best_dist = std::numeric_limits<float>::max();
   for (size_t i = 0; i < n; ++i) {
-    float d = dist_fn(dataset.vector(i), centroid.data(), dim);
-    if (d < best_dist) {
-      best_dist = d;
+    const float dist = dataset_distance_float_query(dataset, centroid.data(), i, ip_distance);
+    if (dist < best_dist) {
+      best_dist = dist;
       best = i;
     }
   }
   return best;
 }
 
-/**
- * Beam search from medoid to find nearest candidates for a query vector.
- * Thread-safe: reads neighbor lists under per-node locks.
- * Optionally uses GPU for batch distance computation.
- */
-/**
- * Beam search from medoid to find nearest candidates for a query vector.
- * Thread-safe: reads neighbor lists under per-node locks.
- * Optionally uses GPU for batch distance computation.
- *
- * Returns ALL visited nodes with their distances (the full visited set V),
- * sorted by distance. The DiskANN paper uses V (not just the beam L) as
- * candidates for RobustPrune.
- */
 vec<std::pair<float, u32>> beam_search(VamanaGraph& graph,
                                        const Dataset& dataset,
-                                       const float* query,
+                                       u32 query_id,
                                        u32 beam_width,
-                                       DistFn dist_fn,
+                                       bool ip_distance,
                                        BuilderGpuContext* gpu_ctx) {
-  const u32 dim = dataset.dim;
-
-  // all_visited: every node we computed distance for (returned to caller)
   vec<std::pair<float, u32>> all_visited;
-  // beam: top beam_width candidates used for navigation
   vec<std::pair<float, u32>> beam;
-  std::unordered_set<u32> visited;
-  std::unordered_set<u32> expanded;
+  const size_t expected_seen = std::max<size_t>(1024, static_cast<size_t>(beam_width) * graph.R + graph.R + 1);
+  LocalIdSet visited(expected_seen);
+  LocalIdSet expanded(std::max<size_t>(1024, beam_width * 2));
 
-  float medoid_dist = dist_fn(query, dataset.vector(graph.medoid), dim);
+  const float medoid_dist = dataset_distance(dataset, query_id, graph.medoid, ip_distance);
   beam.push_back({medoid_dist, static_cast<u32>(graph.medoid)});
   all_visited.push_back({medoid_dist, static_cast<u32>(graph.medoid)});
   visited.insert(static_cast<u32>(graph.medoid));
 
-  // Upload query to GPU once per search
-  bool query_on_gpu = false;
-  if (gpu_ctx) {
-    std::memcpy(gpu_ctx->h_query, query, dim * sizeof(float));
-    gpu::gpu_memcpy_h2d_async(gpu_ctx->d_query, gpu_ctx->h_query,
-                               dim * sizeof(float), gpu_ctx->stream);
-    gpu::gpu_stream_synchronize(gpu_ctx->stream);
-    query_on_gpu = true;
-  }
-
+  vec<u32> nbrs;
+  vec<u32> unvisited;
   while (true) {
-    // Find the closest unexpanded node in the (sorted) beam
     ssize_t best_pos = -1;
     for (size_t i = 0; i < beam.size(); ++i) {
-      if (expanded.count(beam[i].second) == 0) {
+      if (!expanded.contains(beam[i].second)) {
         best_pos = static_cast<ssize_t>(i);
         break;
       }
     }
     if (best_pos < 0) break;
 
-    u32 best_node = beam[best_pos].second;
+    const u32 best_node = beam[best_pos].second;
     expanded.insert(best_node);
 
-    // Read neighbors under lock (thread-safe)
-    vec<u32> nbrs;
     {
-      std::lock_guard<std::mutex> lock(graph.node_locks[best_node]);
-      nbrs = graph.neighbors[best_node];
+      NodeLockGuard lock(graph, best_node);
+      graph.copy_neighbors(best_node, nbrs);
     }
 
-    // Collect unvisited neighbors
-    vec<u32> unvisited;
+    unvisited.clear();
     for (u32 nbr : nbrs) {
-      if (visited.count(nbr)) continue;
-      visited.insert(nbr);
+      if (!visited.insert(nbr)) continue;
       unvisited.push_back(nbr);
     }
 
     if (!unvisited.empty()) {
-      if (gpu_ctx && query_on_gpu && unvisited.size() >= GPU_BATCH_THRESHOLD) {
-        // GPU batch distance path
+      if (!ip_distance && gpu_ctx && gpu_ctx->enabled() && unvisited.size() >= GPU_BATCH_THRESHOLD) {
         const u32 batch = static_cast<u32>(std::min<size_t>(unvisited.size(), gpu_ctx->max_candidates));
-        for (u32 j = 0; j < batch; ++j) {
-          std::memcpy(gpu_ctx->h_candidates + static_cast<size_t>(j) * dim,
-                       dataset.vector(unvisited[j]),
-                       dim * sizeof(float));
-        }
-        gpu::gpu_memcpy_h2d_async(gpu_ctx->d_candidates, gpu_ctx->h_candidates,
-                                   static_cast<size_t>(batch) * dim * sizeof(float), gpu_ctx->stream);
-        gpu::launch_batch_l2_distances(gpu_ctx->stream, gpu_ctx->event,
-                                        gpu_ctx->d_query, gpu_ctx->d_candidates,
-                                        gpu_ctx->d_distances, batch, dim);
+        std::memcpy(gpu_ctx->h_candidate_ids, unvisited.data(), batch * sizeof(u32));
+        gpu::gpu_memcpy_h2d_async(gpu_ctx->d_candidate_ids, gpu_ctx->h_candidate_ids,
+                                  batch * sizeof(u32), gpu_ctx->stream);
+        gpu::launch_batch_id_l2_distances(gpu_ctx->stream, gpu_ctx->event,
+                                          gpu_ctx->d_base_vectors,
+                                          query_id,
+                                          gpu_ctx->d_candidate_ids,
+                                          gpu_ctx->d_distances,
+                                          batch,
+                                          dataset.dim,
+                                          gpu_ctx->dtype);
         gpu::gpu_memcpy_d2h_async(gpu_ctx->h_distances, gpu_ctx->d_distances,
-                                   batch * sizeof(float), gpu_ctx->stream);
+                                  batch * sizeof(float), gpu_ctx->stream);
         gpu::gpu_stream_synchronize(gpu_ctx->stream);
         for (u32 j = 0; j < batch; ++j) {
           beam.push_back({gpu_ctx->h_distances[j], unvisited[j]});
           all_visited.push_back({gpu_ctx->h_distances[j], unvisited[j]});
         }
-        // Handle any overflow beyond max_candidates with CPU
         for (size_t j = batch; j < unvisited.size(); ++j) {
-          float d = dist_fn(query, dataset.vector(unvisited[j]), dim);
+          const float d = dataset_distance(dataset, query_id, unvisited[j], ip_distance);
           beam.push_back({d, unvisited[j]});
           all_visited.push_back({d, unvisited[j]});
         }
       } else {
-        // CPU SIMD path
         for (u32 nbr : unvisited) {
-          float d = dist_fn(query, dataset.vector(nbr), dim);
+          const float d = dataset_distance(dataset, query_id, nbr, ip_distance);
           beam.push_back({d, nbr});
           all_visited.push_back({d, nbr});
         }
       }
     }
 
-    std::sort(beam.begin(), beam.end());
+    std::sort(beam.begin(), beam.end(), candidate_id_less);
     if (beam.size() > beam_width) beam.resize(beam_width);
   }
 
-  std::sort(all_visited.begin(), all_visited.end());
+  std::sort(all_visited.begin(), all_visited.end(), candidate_id_less);
   return all_visited;
 }
 
-/**
- * RobustPrune: select up to R diverse neighbors from sorted candidates.
- *
- * For each candidate p* (in order of increasing distance from source):
- *   Accept p* unless there exists an already-selected p' such that
- *   alpha * dist(p*, p') <= dist(source, p*)
- */
+vec<std::pair<float, u32>> beam_search_float_query(VamanaGraph& graph,
+                                                   const Dataset& dataset,
+                                                   const float* query,
+                                                   u32 beam_width,
+                                                   bool ip_distance) {
+  vec<std::pair<float, u32>> all_visited;
+  vec<std::pair<float, u32>> beam;
+  const size_t expected_seen = std::max<size_t>(1024, static_cast<size_t>(beam_width) * graph.R + graph.R + 1);
+  LocalIdSet visited(expected_seen);
+  LocalIdSet expanded(std::max<size_t>(1024, beam_width * 2));
+
+  const float medoid_dist = dataset_distance_float_query(dataset, query, graph.medoid, ip_distance);
+  beam.push_back({medoid_dist, static_cast<u32>(graph.medoid)});
+  all_visited.push_back({medoid_dist, static_cast<u32>(graph.medoid)});
+  visited.insert(static_cast<u32>(graph.medoid));
+
+  vec<u32> nbrs;
+  while (true) {
+    ssize_t best_pos = -1;
+    for (size_t i = 0; i < beam.size(); ++i) {
+      if (!expanded.contains(beam[i].second)) {
+        best_pos = static_cast<ssize_t>(i);
+        break;
+      }
+    }
+    if (best_pos < 0) break;
+    const u32 best_node = beam[best_pos].second;
+    expanded.insert(best_node);
+    {
+      NodeLockGuard lock(graph, best_node);
+      graph.copy_neighbors(best_node, nbrs);
+    }
+    for (u32 nbr : nbrs) {
+      if (!visited.insert(nbr)) continue;
+      const float d = dataset_distance_float_query(dataset, query, nbr, ip_distance);
+      beam.push_back({d, nbr});
+      all_visited.push_back({d, nbr});
+    }
+    std::sort(beam.begin(), beam.end(), candidate_id_less);
+    if (beam.size() > beam_width) beam.resize(beam_width);
+  }
+  std::sort(all_visited.begin(), all_visited.end(), candidate_id_less);
+  return all_visited;
+}
+
 vec<u32> robust_prune(const Dataset& dataset,
                       u32 source,
                       const vec<std::pair<float, u32>>& sorted_candidates,
                       float alpha,
                       u32 R,
-                      DistFn dist_fn) {
-  const u32 dim = dataset.dim;
+                      bool ip_distance) {
   vec<u32> selected;
   selected.reserve(R);
-
   for (const auto& [cand_dist, cand_id] : sorted_candidates) {
     if (cand_id == source) continue;
     if (selected.size() >= R) break;
 
     bool pruned = false;
     for (u32 sel_id : selected) {
-      float d_sel_cand = dist_fn(dataset.vector(sel_id), dataset.vector(cand_id), dim);
+      const float d_sel_cand = dataset_distance(dataset, sel_id, cand_id, ip_distance);
       if (alpha * d_sel_cand <= cand_dist) {
         pruned = true;
         break;
       }
     }
-
-    if (!pruned) {
-      selected.push_back(cand_id);
-    }
+    if (!pruned) selected.push_back(cand_id);
   }
-
   return selected;
 }
 
-/**
- * Build the Vamana graph using parallel insertion with optional GPU acceleration.
- *
- * Algorithm from DiskANN paper:
- *   1. Compute medoid
- *   2. Sequential warmup: insert first R*2 nodes (graph too sparse for parallelism)
- *   3. Parallel insert remaining nodes: beam search → RobustPrune → locked edge updates
- */
 void build_vamana_graph(VamanaGraph& graph,
                         const Dataset& dataset,
                         const VamanaBuildConfig& config,
-                        DistFn dist_fn,
                         BuilderGpuContext* gpu_contexts,
                         size_t num_gpu_contexts) {
-  const size_t n = dataset.ids.size();
-  const u32 dim = dataset.dim;
+  const size_t n = dataset.size();
   const u32 R = config.R;
   const float alpha = static_cast<float>(config.alpha);
   const u32 beam_width = config.beam_width;
   const size_t num_threads = effective_thread_count(config.threads);
   const bool use_gpu = num_gpu_contexts > 0 && !config.ip_distance;
 
-  graph.init(n, dim, R);
+  graph.init(n, dataset.dim, R);
 
   std::cerr << "computing medoid...\n";
-  graph.medoid = compute_medoid(dataset, dist_fn);
+  graph.medoid = compute_medoid(dataset, config.ip_distance);
   std::cerr << "medoid: node " << graph.medoid << "\n";
 
-  // Random insertion order
-  vec<size_t> order(n);
+  vec<u32> order(n);
   std::iota(order.begin(), order.end(), 0);
   const size_t seed = config.seed == -1 ? std::random_device{}() : static_cast<size_t>(config.seed);
   std::mt19937 rng(seed);
   std::shuffle(order.begin(), order.end(), rng);
 
-  // Initialize graph with random R-regular directed edges (DiskANN Algorithm 2, step 1).
-  // This provides baseline connectivity that the Vamana insertion pass refines.
-  {
-    std::cerr << "initializing random R-regular graph (degree=" << R << ")...\n";
-    std::mt19937 init_rng(seed + 1);
-    std::uniform_int_distribution<size_t> dist(0, n - 1);
-    for (size_t i = 0; i < n; ++i) {
-      graph.neighbors[i].reserve(R);
-      while (graph.neighbors[i].size() < R) {
-        size_t j = dist(init_rng);
-        if (j == i) continue;
-        bool dup = false;
-        for (u32 k : graph.neighbors[i]) {
-          if (k == static_cast<u32>(j)) { dup = true; break; }
-        }
-        if (!dup) graph.neighbors[i].push_back(static_cast<u32>(j));
+  std::cerr << "initializing random R-regular graph (degree=" << R << ")...\n";
+  parallel_for(static_cast<size_t>(0), n, num_threads, [&](size_t i, size_t tid) {
+    std::mt19937 init_rng(static_cast<u32>(seed + 1 + tid * 1315423911u));
+    std::uniform_int_distribution<u32> dist(0, static_cast<u32>(n - 1));
+    vec<u32> initial;
+    initial.reserve(R);
+    while (initial.size() < R) {
+      const u32 j = dist(init_rng);
+      if (j == i) continue;
+      bool dup = false;
+      for (u32 existing : initial) {
+        if (existing == j) { dup = true; break; }
       }
+      if (!dup) initial.push_back(j);
     }
-  }
+    graph.set_neighbors(i, initial);
+  });
 
-  // Construction uses alpha=1.0 for reliable connectivity in high dimensions.
-  // Alpha > 1 causes aggressive pruning that disconnects the directed graph when
-  // distances are concentrated (curse of dimensionality).
   const float build_alpha = 1.0f;
   if (alpha > 1.0f + 1e-6f) {
     std::cerr << "note: using alpha=1.0 for construction (config alpha="
               << alpha << " stored in metadata)\n";
   }
+  std::cerr << "reverse edge maintenance: bounded immediate\n";
 
   ProgressReporter progress{"Building Vamana graph", n};
-
-  // Node insertion logic
-  auto insert_node = [&](size_t step, size_t tid) {
-    const size_t node_idx = order[step];
-
+  parallel_for(static_cast<size_t>(0), n, num_threads, [&](size_t step, size_t tid) {
+    const u32 node_idx = order[step];
     BuilderGpuContext* gpu_ctx = (use_gpu && tid < num_gpu_contexts) ? &gpu_contexts[tid] : nullptr;
 
-    // Beam search to find candidate neighbors (returns ALL visited nodes)
-    const float* query = dataset.vector(node_idx);
-    auto candidates = beam_search(graph, dataset, query, beam_width, dist_fn, gpu_ctx);
+    auto candidates = beam_search(graph, dataset, node_idx, beam_width, config.ip_distance, gpu_ctx);
 
-    // Merge with existing neighbors (preserves connectivity from random init)
+    vec<u32> existing_neighbors;
     {
-      std::lock_guard<std::mutex> lock(graph.node_locks[node_idx]);
-      for (u32 existing : graph.neighbors[node_idx]) {
-        float d = dist_fn(query, dataset.vector(existing), dim);
-        candidates.push_back({d, existing});
-      }
+      NodeLockGuard lock(graph, node_idx);
+      graph.copy_neighbors(node_idx, existing_neighbors);
     }
-    std::sort(candidates.begin(), candidates.end());
+    for (u32 existing : existing_neighbors) {
+      candidates.push_back({dataset_distance(dataset, node_idx, existing, config.ip_distance), existing});
+    }
+    sort_and_unique_candidates(candidates);
 
-    // Deduplicate
-    candidates.erase(std::unique(candidates.begin(), candidates.end(),
-        [](const auto& a, const auto& b) { return a.second == b.second; }),
-        candidates.end());
-
-    vec<u32> new_neighbors = robust_prune(
-        dataset, static_cast<u32>(node_idx), candidates, build_alpha, R, dist_fn);
-
-    // Set forward edges (lock own node)
+    vec<u32> new_neighbors = robust_prune(dataset, node_idx, candidates, build_alpha, R, config.ip_distance);
     {
-      std::lock_guard<std::mutex> lock(graph.node_locks[node_idx]);
-      graph.neighbors[node_idx] = new_neighbors;
+      NodeLockGuard lock(graph, node_idx);
+      graph.set_neighbors(node_idx, new_neighbors);
     }
 
-    // Add reverse edges (lock each neighbor individually)
+    vec<u32> nbr_list;
     for (u32 nbr : new_neighbors) {
-      std::lock_guard<std::mutex> lock(graph.node_locks[nbr]);
-      auto& nbr_list = graph.neighbors[nbr];
-
-      // Check if already present
-      bool already_present = false;
-      for (u32 existing : nbr_list) {
-        if (existing == static_cast<u32>(node_idx)) {
-          already_present = true;
-          break;
-        }
-      }
-      if (already_present) continue;
-
+      NodeLockGuard lock(graph, nbr);
+      if (graph.contains_neighbor_unlocked(nbr, node_idx)) continue;
+      graph.copy_neighbors(nbr, nbr_list);
       if (nbr_list.size() < R) {
-        nbr_list.push_back(static_cast<u32>(node_idx));
+        nbr_list.push_back(node_idx);
+        graph.set_neighbors(nbr, nbr_list);
       } else {
-        // Need to prune: collect current neighbors + new node as candidates
         vec<std::pair<float, u32>> prune_candidates;
         prune_candidates.reserve(nbr_list.size() + 1);
-
-        const float* nbr_vec = dataset.vector(nbr);
         for (u32 existing : nbr_list) {
-          float d = dist_fn(nbr_vec, dataset.vector(existing), dim);
-          prune_candidates.push_back({d, existing});
+          prune_candidates.push_back({dataset_distance(dataset, nbr, existing, config.ip_distance), existing});
         }
-        float d_new = dist_fn(nbr_vec, dataset.vector(node_idx), dim);
-        prune_candidates.push_back({d_new, static_cast<u32>(node_idx)});
-
-        std::sort(prune_candidates.begin(), prune_candidates.end());
-        nbr_list = robust_prune(dataset, nbr, prune_candidates, build_alpha, R, dist_fn);
+        prune_candidates.push_back({dataset_distance(dataset, nbr, node_idx, config.ip_distance), node_idx});
+        sort_and_unique_candidates(prune_candidates);
+        graph.set_neighbors(nbr, robust_prune(dataset, nbr, prune_candidates, build_alpha, R, config.ip_distance));
       }
     }
-
     progress.increment();
-  };
-
-  // Parallel construction (random init provides connectivity, no warmup needed)
-  parallel_for(static_cast<size_t>(0), n, num_threads, [&](size_t step, size_t tid) {
-    insert_node(step, tid);
   });
-
   progress.finish();
 
-  // Print graph stats
   size_t total_edges = 0;
   size_t max_edges = 0;
   size_t min_edges = std::numeric_limits<size_t>::max();
   for (size_t i = 0; i < n; ++i) {
-    total_edges += graph.neighbors[i].size();
-    max_edges = std::max(max_edges, graph.neighbors[i].size());
-    min_edges = std::min(min_edges, graph.neighbors[i].size());
+    const size_t count = graph.degree(i);
+    total_edges += count;
+    max_edges = std::max(max_edges, count);
+    min_edges = std::min(min_edges, count);
   }
   std::cerr << "graph stats: avg_degree=" << (static_cast<double>(total_edges) / n)
             << " max=" << max_edges << " min=" << min_edges << "\n";
 
-  // Quick in-memory recall sanity check
-  {
+  if (!config.skip_sanity_check) {
     const size_t n_queries = std::min<size_t>(200, n);
     const u32 topk = 10;
     std::mt19937 sample_rng(42);
-    vec<size_t> query_indices(n);
-    std::iota(query_indices.begin(), query_indices.end(), 0);
-    std::shuffle(query_indices.begin(), query_indices.end(), sample_rng);
-    query_indices.resize(n_queries);
+    vec<u32> query_indices(n_queries);
+    std::uniform_int_distribution<u32> qdist(0, static_cast<u32>(n - 1));
+    for (u32& q : query_indices) q = qdist(sample_rng);
 
     size_t total_hits = 0;
-    for (size_t qi = 0; qi < n_queries; ++qi) {
-      const size_t qid = query_indices[qi];
-      const float* qvec = dataset.vector(qid);
-
-      // brute-force top-k
+    for (u32 qid : query_indices) {
       vec<std::pair<float, u32>> all_dists;
       all_dists.reserve(n);
       for (size_t i = 0; i < n; ++i) {
         if (i == qid) continue;
-        all_dists.push_back({dist_fn(qvec, dataset.vector(i), dim), static_cast<u32>(i)});
+        all_dists.push_back({dataset_distance(dataset, qid, i, config.ip_distance), static_cast<u32>(i)});
       }
       std::partial_sort(all_dists.begin(),
                         all_dists.begin() + std::min<size_t>(topk, all_dists.size()),
-                        all_dists.end());
+                        all_dists.end(),
+                        candidate_id_less);
       std::unordered_set<u32> gt;
       for (size_t i = 0; i < topk && i < all_dists.size(); ++i) gt.insert(all_dists[i].second);
 
-      // beam_search on built graph
-      auto results = beam_search(graph, dataset, qvec, beam_width, dist_fn);
+      auto results = beam_search(graph, dataset, qid, beam_width, config.ip_distance, nullptr);
       size_t hits = 0;
       for (size_t i = 0; i < topk && i < results.size(); ++i) {
         if (gt.count(results[i].second)) ++hits;
       }
       total_hits += hits;
     }
-    double recall = static_cast<double>(total_hits) / static_cast<double>(n_queries * topk);
+    const double recall = static_cast<double>(total_hits) / static_cast<double>(n_queries * topk);
     std::cerr << "in-memory recall@" << topk << " (sample " << n_queries << "): " << recall << "\n";
   }
 }
-
 
 }  // namespace tools::vamana_offline

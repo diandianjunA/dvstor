@@ -37,16 +37,16 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     ("ef-construction", po::value<u32>(&config.beam_width),
      "Alias for --beam-width in the offline builder.")
     ("alpha", po::value<f64>(&config.alpha)->default_value(config.alpha), "RobustPrune alpha parameter.")
-    ("rabitq-bits", po::value<u32>(&config.rabitq_bits)->default_value(config.rabitq_bits),
-     "Bits per dimension for RaBitQ (1, 2, 4, or 8).")
-    ("node-layout", po::value<str>(&config.node_layout)->default_value(config.node_layout),
-     "Node layout: legacy or rabitq_search_block.")
+    ("vector-data-type", po::value<str>(&config.vector_data_type)->default_value(config.vector_data_type),
+     "Storage dtype for full vectors: auto, float32, uint8, or int8.")
     ("partition-strategy", po::value<str>(&config.partition_strategy)->default_value(config.partition_strategy),
      "Shard placement strategy: balanced, bfs, or metis.")
     ("partition-max-degree", po::value<u32>(&config.partition_max_degree)->default_value(config.partition_max_degree),
      "Maximum neighbors per node used to build the METIS partition graph.")
     ("partition-imbalance", po::value<double>(&config.partition_imbalance)->default_value(config.partition_imbalance),
      "METIS ubvec balance tolerance, e.g. 1.03 allows about 3% imbalance.")
+    ("skip-sanity-check", po::bool_switch(&config.skip_sanity_check),
+     "Skip the expensive in-memory brute-force recall sanity check after graph construction.")
     ("seed", po::value<i32>(&config.seed)->default_value(config.seed), "PRNG seed.")
     ("max-vectors", po::value<size_t>(&config.max_vectors)->default_value(config.max_vectors),
      "Maximum number of vectors to read.")
@@ -54,6 +54,10 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     ("no-gpu", po::bool_switch(&config.no_gpu), "Disable GPU acceleration.")
     ("gpu-device", po::value<i32>(&config.gpu_device)->default_value(config.gpu_device),
      "CUDA device ID (default 0).")
+    ("gpu-memory-gb", po::value<double>(&config.gpu_memory_gb)->default_value(config.gpu_memory_gb),
+     "Maximum GPU memory in GiB used by the offline builder. Default 18.")
+    ("build-gpu-streams", po::value<u32>(&config.build_gpu_streams)->default_value(config.build_gpu_streams),
+     "Number of offline GPU streams. 0 = min(threads, 32).")
     ("query-path", po::value<filepath_t>(&config.query_path),
      "Path to query file (.fbin) for post-build recall test.")
     ("groundtruth-path", po::value<filepath_t>(&config.groundtruth_path),
@@ -72,11 +76,13 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
   if (config.data_path.empty()) lib_failure("--data-path is required");
   if (config.num_memory_nodes == 0) lib_failure("--memory-nodes must be > 0");
   if (config.R == 0) lib_failure("--R must be > 0");
-  if (config.rabitq_bits != 1 && config.rabitq_bits != 2 &&
-      config.rabitq_bits != 4 && config.rabitq_bits != 8)
-    lib_failure("--rabitq-bits must be 1, 2, 4, or 8");
-  if (config.node_layout != "legacy" && config.node_layout != "rabitq_search_block")
-    lib_failure("--node-layout must be legacy or rabitq_search_block");
+  if (config.vector_data_type != "auto") {
+    try {
+      (void)parse_vector_dtype(config.vector_data_type);
+    } catch (const std::exception& e) {
+      lib_failure(str{"--vector-data-type must be auto, float32, uint8, or int8: "} + e.what());
+    }
+  }
   if (config.partition_strategy != "balanced" &&
       config.partition_strategy != "bfs" &&
       config.partition_strategy != "metis")
@@ -85,6 +91,8 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     lib_failure("--partition-max-degree must be > 0");
   if (config.partition_imbalance < 1.0)
     lib_failure("--partition-imbalance must be >= 1.0");
+  if (config.gpu_memory_gb <= 0.0)
+    lib_failure("--gpu-memory-gb must be > 0");
 
   return config;
 }
