@@ -910,13 +910,79 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
       current_neighbors.insert(current_neighbors.end(), filtered_candidates.begin(), filtered_candidates.end());
       updated_neighbors = std::move(current_neighbors);
     } else {
+      // Evict-farthest: for each new candidate, compute distance from target
+      // and replace the farthest existing neighbor if the candidate is closer.
+      // This is O(R) distance calls per candidate instead of O(R²) pair distances
+      // from full RobustPrune, trading a small diversity loss for large speedup.
       pruned = true;
-      vec<RemotePtr> prune_candidates = current_neighbors;
-      prune_candidates.insert(prune_candidates.end(), filtered_candidates.begin(), filtered_candidates.end());
-      hashset_t<RemotePtr> skip{target_ptr};
       step_started = std::chrono::steady_clock::now();
-      updated_neighbors = robust_prune_cpu(target_snapshot.vector_data.data(), VamanaNode::vector_dtype(),
-                                      prune_candidates, skip, config);
+
+      // 1. Collect non-null current neighbors (do this once, reuse below)
+      vec<RemotePtr> non_null_neighbors;
+      non_null_neighbors.reserve(current_neighbors.size());
+      for (const auto& n : current_neighbors) {
+        if (!n.is_null()) non_null_neighbors.push_back(n);
+      }
+
+      // 2. Batch-read all current neighbor snapshots + compute distances (O(R), SIMD)
+      vec<distance_t> neighbor_dists;
+      neighbor_dists.reserve(non_null_neighbors.size());
+      if (!non_null_neighbors.empty()) {
+        vec<NodeSnapshot> neighbor_snapshots =
+            read_node_snapshots_batched(non_null_neighbors, config);
+        for (const auto& snap : neighbor_snapshots) {
+          neighbor_dists.push_back(distance_between_vectors(
+              target_snapshot.vector_data.data(), VamanaNode::vector_dtype(),
+              snap.vector_data.data(), VamanaNode::vector_dtype(), config));
+        }
+      }
+
+      // 3. Initialise updated_neighbors from filtered list (no extra allocation)
+      updated_neighbors = std::move(non_null_neighbors);
+
+      // 4. For each candidate, evict farthest if candidate is closer
+      {
+        vec<RemotePtr> non_null_candidates;
+        non_null_candidates.reserve(filtered_candidates.size());
+        for (const auto& c : filtered_candidates) {
+          if (!c.is_null()) non_null_candidates.push_back(c);
+        }
+
+        vec<NodeSnapshot> candidate_snapshots;
+        if (!non_null_candidates.empty()) {
+          candidate_snapshots = read_node_snapshots_batched(non_null_candidates, config);
+        }
+
+        for (size_t ci = 0; ci < candidate_snapshots.size(); ++ci) {
+          const auto& cand_snap = candidate_snapshots[ci];
+          const distance_t cand_dist = distance_between_vectors(
+              target_snapshot.vector_data.data(), VamanaNode::vector_dtype(),
+              cand_snap.vector_data.data(), VamanaNode::vector_dtype(), config);
+
+          if (updated_neighbors.size() < config.R) {
+            updated_neighbors.push_back(cand_snap.rptr);
+            neighbor_dists.push_back(cand_dist);
+          } else {
+            // updated_neighbors.size() >= R, and neighbor_dists tracks the same
+            // set, so at least one element exists.
+            lib_assert(!neighbor_dists.empty(),
+                       "neighbor_dists non-empty when updated_neighbors >= R");
+            size_t farthest_idx = 0;
+            distance_t farthest_dist = neighbor_dists[0];
+            for (size_t j = 1; j < neighbor_dists.size(); ++j) {
+              if (neighbor_dists[j] > farthest_dist) {
+                farthest_dist = neighbor_dists[j];
+                farthest_idx = j;
+              }
+            }
+            if (cand_dist < farthest_dist) {
+              updated_neighbors[farthest_idx] = cand_snap.rptr;
+              neighbor_dists[farthest_idx] = cand_dist;
+            }
+          }
+        }
+      }
+
       prune_ns = elapsed_ns_since(step_started);
     }
   }
