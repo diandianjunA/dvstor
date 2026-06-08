@@ -3,6 +3,39 @@
 Implementation of a GPU-accelerated Vamana index for memory disaggregation.
 This repository is used as a storage-compute disaggregated GPU vector-search baseline.
 
+## Project Structure
+
+```
+dvstor/
+├── src/                    # Core runtime source code
+│   ├── common/             # Shared config, types, distance functions, utilities
+│   ├── gpu/                # CUDA kernels and GPU resource management
+│   ├── http/               # HTTP service interface
+│   ├── io/                 # Data read/write abstraction
+│   ├── memory_node/        # Storage node: index storage, insert, peer RDMA/RPC
+│   ├── rdma/               # RDMA operation wrappers (read/write/atomics)
+│   ├── router/             # Multi-compute-node adaptive query routing
+│   ├── service/            # Compute service orchestration (ComputeService)
+│   └── vamana/             # Vamana graph index core implementation
+├── tools/                  # Standalone binaries and scripts
+│   ├── vamana_offline/     # Offline Vamana graph builder library
+│   ├── breakdown_benchmark/# Performance breakdown benchmark tool
+│   ├── vamana_offline_builder.cc   # Offline index builder
+│   ├── vamana_metis_repartitioner.cc # METIS graph partitioning tool
+│   └── run_recall_test.sh  # Recall evaluation helper
+├── evaluation/             # Evaluation harnesses (SIFT100M, SIFT1B)
+├── rdma-library/           # RDMA low-level library (QP management, memory registration)
+├── thirdparty/             # Bundled third-party libraries (httplib, nlohmann/json, xoshiro)
+├── structure/              # Architecture documentation (30-course series in Chinese)
+├── reports/                # Performance reports and analysis scripts
+│   ├── breakdown/          # Breakdown benchmark result JSON/TXT files
+│   ├── analyze/            # Analysis reports and Python scripts
+│   └── python/             # Plotting and visualization scripts
+└── logs/                   # Runtime log output directory
+```
+
+For a detailed walkthrough of the architecture, see the course series under `structure/`.
+
 ## Setup
 
 ### C++ Libraries and Unix Packages
@@ -12,8 +45,7 @@ Note that `ibverbs` (the RDMA library) is Linux-only.
 The code also compiles without InfiniBand network cards.
 
 * [ibverbs](https://github.com/linux-rdma/rdma-core/tree/master)
-* [boost](https://www.boost.org/doc/libs/1_83_0/doc/html/program_options.html) (to support `boost::program_options` for
-  CLI parsing)
+* [boost](https://www.boost.org/doc/libs/1_83_0/doc/html/program_options.html) (to support `boost::program_options` for CLI parsing)
 * pthreads (for multithreading)
 * [oneTBB](https://github.com/oneapi-src/oneTBB) (for concurrent data structures)
 * a C++ compiler that supports C++20 (we have used `g++-12`)
@@ -25,6 +57,11 @@ The code also compiles without InfiniBand network cards.
 For instance, to install the requirements on Debian, run the following command:
 ```
 apt-get -y install g++ libboost-all-dev libibverbs1 libibverbs-dev numactl cmake libtbb-dev git python3-venv vmtouch axel
+```
+
+For METIS-based graph partitioning support (optional), also install:
+```
+apt-get -y install libmetis-dev
 ```
 
 ### Cluster Nodes Configuration
@@ -42,9 +79,11 @@ make
 ```
 
 This produces these main binaries:
-- `build/dvstor`: online memory/compute node service
+- `build/dvstor`: online compute node service
 - `build/dvstor_memory_node`: memory-node-only service
 - `build/vamana_offline_builder`: offline Vamana builder that exports DVSTOR shard files plus RaBitQ artifacts
+- `build/vamana_metis_repartitioner`: repartition an existing offline-built index using METIS graph partitioning
+- `build/dvstor_breakdown_benchmark`: performance breakdown benchmark tool for throughput/latency profiling
 
 Storage nodes may not have GPUs. For storage-node-only deployment, build just the memory-node binary:
 ```bash
@@ -52,43 +91,93 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDVSTOR_STORAGE_NODE_ONLY=ON
 cmake --build build -j
 ```
 
-## Download the Data
+Additional CMake options:
+- `-DDVSTOR_METIS_PARTITION=ON`: require METIS partitioning support (default: AUTO)
+- `-DDVSTOR_METIS_PARTITION=OFF`: disable METIS partitioning support
+- `-DDVSTOR_USE_NATIVE_ARCH=ON`: compile with `-march=native` for host-specific optimizations
+- `-DDVSTOR_BUILD_EXECUTABLES=OFF`: skip building standalone executables
+- `-DDVSTOR_BUILD_TESTS=OFF`: skip building tests
 
-First, install all Python requirements:
-```
-cd scripts
-python3 -m pip install -r requirements.txt
+## Data Preparation
+
+### SIFT100M / SIFT1B Datasets
+
+Evaluation scripts for SIFT100M and SIFT1B are provided under `evaluation/`. Each evaluation directory contains a self-contained harness:
+
+```bash
+# Convert SIFT data to DVSTOR format (adjust paths inside the script first)
+python3 evaluation/sift100m/convert_sift100m.py
+
+# Build the offline index (default: 5-shard BFS)
+./evaluation/sift100m/build_sift100m_index.sh
+
+# Quick test with reduced scale:
+MAX_VECTORS=1000000 GROUNDTRUTH_LABEL=1M ./evaluation/sift100m/build_sift100m_index.sh
 ```
 
-Then, run the following script to download the data. 
-This may take a while, we recommend to run the script within a `tmux` session.
-Also make sure that `axel` (a download accelerator) is installed.
-```
-cd data
-bash download.sh
-```
+See `evaluation/sift100m/README.md` and `evaluation/sift1b/README.md` for full details on data preparation, memory defaults, and configuration options.
 
-Finally, create the queries (adjust the `DATASET_PATH` in `create_queries.py`):
-```
-python3 create_queries.py
-```
+### Custom Dataset
 
-Now all the data is available in `data/datasets`, move them to a location where all cluster nodes have access to (e.g., to an NFS).
-Then, adjust the path in `config.py`.
+For custom datasets, use `vamana_offline_builder` directly (see "Offline Build And Online Load" below), or adapt the evaluation scripts to your data paths.
 
 ## Run the Experiments
 
-* TODO
+The evaluation harnesses under `evaluation/sift100m/` and `evaluation/sift1b/` support multiple optimization profiles (baseline, gpudirect_rdma, gpudirect_rdma_storage_owner). Each profile has a corresponding INI config and environment file.
 
-### Configuration-Driven Performance Test
-
-Use `run_breakdown_test.sh` to benchmark throughput and latency directly from your config file.
-This keeps optimization control fully decoupled from the script: enable/disable any current or
-future optimization only in `service-config` (e.g., `gpudirect-rdma`, `gpu-cache`, etc.).
+### Quick Start: SIFT100M
 
 ```bash
-./scripts/run_breakdown_test.sh \
-  --service-config ./test/config/local_same_host_5mn.ini \
+# 1. Build the index
+./evaluation/sift100m/build_sift100m_index.sh
+
+# 2. Start memory nodes with a profile
+./evaluation/sift100m/start_all_memory_nodes.sh baseline
+
+# 3. Run recall evaluation
+./evaluation/sift100m/run_recall.sh baseline
+
+# 4. Run breakdown benchmark (throughput/latency profiling)
+./evaluation/sift100m/run_breakdown.sh baseline
+
+# 5. Stop memory nodes
+./evaluation/sift100m/stop_memory_nodes.sh
+```
+
+### Optimization Profiles
+
+```bash
+# GPU-Direct RDMA profile
+./evaluation/sift100m/start_all_memory_nodes.sh gpudirect_rdma
+./evaluation/sift100m/run_breakdown.sh gpudirect_rdma
+
+# GPU-Direct RDMA + storage owner profile
+./evaluation/sift100m/start_all_memory_nodes.sh gpudirect_rdma_storage_owner
+./evaluation/sift100m/run_breakdown.sh gpudirect_rdma_storage_owner
+```
+
+### Common Overrides
+
+```bash
+# Specify cluster hosts
+HOSTS="mn1 mn2 mn3 mn4 mn5" BASE_PORT=1234 IB_DEVICE=mlx5_0 \
+  ./evaluation/sift100m/start_all_memory_nodes.sh baseline
+
+# Different partition strategy
+PARTITION_STRATEGY=metis ./evaluation/sift100m/build_sift100m_index.sh
+
+# Query-only workload
+WORKLOAD=query WARMUP_SECONDS=10 MEASURE_SECONDS=60 \
+  ./evaluation/sift100m/run_breakdown.sh gpudirect_rdma
+```
+
+### Breakdown Benchmark Tool
+
+The `dvstor_breakdown_benchmark` binary provides detailed performance breakdowns for throughput and latency across query and insert workloads. Run it standalone:
+
+```bash
+./build/dvstor_breakdown_benchmark \
+  --service-config ./evaluation/sift100m/configs/baseline.ini \
   --workload mixed \
   --client-threads 16 \
   --read-ratio 0.5 \
@@ -96,8 +185,7 @@ future optimization only in `service-config` (e.g., `gpudirect-rdma`, `gpu-cache
   --measure-seconds 60
 ```
 
-The script writes JSON/TXT reports under `reports/breakdown/` and prints key metrics
-(throughput, query/insert mean/p95/p99 latency, mixed read/write completions).
+Results are written under `reports/breakdown/` as JSON and TXT files with per-category (CPU/GPU/RDMA/transfer) timing breakdowns.
 
 ## Offline Build And Online Load
 
@@ -105,7 +193,8 @@ The project supports building a Vamana graph offline and exporting it into DVSTO
 memory-node shard format. The offline build also emits RaBitQ search artifacts used by the online
 GPU query path.
 
-Build an offline index:
+### Build an Offline Index
+
 ```bash
 ./build/vamana_offline_builder \
   --data-path /path/to/dataset-or-dir \
@@ -136,14 +225,35 @@ The `bfs` strategy starts from the graph medoid, orders nodes by BFS traversal, 
 balanced BFS ranges into shard files so graph-near nodes are more likely to stay on the same memory node.
 The `metis` strategy additionally requires METIS support at CMake configure time.
 
-Then start each memory node with its local shard:
+### METIS Graph Repartitioning
+
+The `vamana_metis_repartitioner` tool repartitions an existing offline-built index using METIS
+graph partitioning without rebuilding the Vamana graph:
+
 ```bash
-./scripts/start_memory_node.sh --index-file /path/to/index/dvstor_index_node1_of2.dat
+./build/vamana_metis_repartitioner \
+  --input-prefix /path/to/index/dvstor_index \
+  --output-prefix /path/to/index/dvstor_metis_index \
+  --num-partitions 5
 ```
 
-Or let the compute-node initiator trigger startup loading on all memory nodes:
+This reads the existing shard files and meta JSON, builds a METIS graph from the Vamana adjacency
+structure, computes a new balanced partition, and writes repartitioned shard files with a new
+`.meta.json`. The repartitioned index can be used directly in the online cluster without rebuilding.
+
+### Online Load
+
+Start each memory node with its local shard:
 ```bash
-./scripts/start_compute_node.sh --load-index --index-prefix /path/to/index/dvstor_index
+./build/dvstor_memory_node --index-file /path/to/index/dvstor_index_node1_of2.dat \
+  --port 1234 --mn-memory 152
+```
+
+Or let the compute node trigger startup loading on all memory nodes:
+```bash
+./build/dvstor --servers mn1:1234 mn2:1235 \
+  --load-index --index-prefix /path/to/index/dvstor_index \
+  --dim 128 --threads 16 --coroutines 16 --k 10 --ef-search 32
 ```
 
 In both cases, the online cluster reuses the offline-built graph directly instead of rebuilding it through RDMA.
@@ -161,22 +271,28 @@ to each GPU worker.
 endpoints such as `127.0.0.1:1235`. This allows running multiple memory nodes on the same machine as long as each
 instance uses a distinct port.
 
+### Multi-Node Local Example
+
 Example: five memory nodes on one host with online load:
 
 ```bash
-./scripts/build_offline_index.sh \
+# Build with 5 shards
+./build/vamana_offline_builder \
   --data-path /path/to/dataset-or-dir \
   --memory-nodes 5 \
   --threads 32 \
   --output-prefix /tmp/dvstor_index
 
-./scripts/start_memory_node.sh --port 1234 --index-file /tmp/dvstor_index_node1_of5.dat
-./scripts/start_memory_node.sh --port 1235 --index-file /tmp/dvstor_index_node2_of5.dat
-./scripts/start_memory_node.sh --port 1236 --index-file /tmp/dvstor_index_node3_of5.dat
-./scripts/start_memory_node.sh --port 1237 --index-file /tmp/dvstor_index_node4_of5.dat
-./scripts/start_memory_node.sh --port 1238 --index-file /tmp/dvstor_index_node5_of5.dat
+# Start memory nodes on different ports
+for i in $(seq 1 5); do
+  port=$((1233 + i))
+  ./build/dvstor_memory_node --port $port \
+    --index-file /tmp/dvstor_index_node${i}_of5.dat \
+    --mn-memory 10 &
+done
 
-./scripts/start_compute_node.sh \
+# Start compute node
+./build/dvstor \
   --servers 127.0.0.1:1234 127.0.0.1:1235 127.0.0.1:1236 127.0.0.1:1237 127.0.0.1:1238 \
   --load-index \
   --index-prefix /tmp/dvstor_index \
@@ -186,3 +302,65 @@ Example: five memory nodes on one host with online load:
   --k 10 \
   --ef-search 32
 ```
+
+## Recall Testing
+
+The `tools/run_recall_test.sh` script builds an offline index and evaluates recall against
+ground truth:
+
+```bash
+./tools/run_recall_test.sh \
+  --data-path /path/to/dataset \
+  --output-prefix /path/to/index/output \
+  --query-path /path/to/queries.fbin \
+  --groundtruth-path /path/to/groundtruth.bin \
+  --R 32 \
+  --alpha 1.2 \
+  --threads 32
+```
+
+Environment variable overrides are also supported:
+```bash
+DATA_PATH=/path/to/dataset OUTPUT_PREFIX=/path/to/index ./tools/run_recall_test.sh
+```
+
+## Architecture Documentation
+
+A detailed 30-course architecture series (in Chinese) is available under `structure/`, covering every subsystem:
+
+| # | Topic |
+|---|-------|
+| 01 | Project overview and architecture |
+| 02 | Type system and common infrastructure |
+| 03 | Vamana graph index algorithm basics |
+| 04 | Vamana node and neighbor list data structures |
+| 05 | C++20 coroutines and async scheduler |
+| 06 | Beam-Search search algorithm implementation |
+| 07 | Vamana insert and RobustPrune implementation |
+| 08 | RDMA library low-level implementation |
+| 09 | RDMA read/write/atomic operation wrappers |
+| 10 | Memory management and BufferAllocator |
+| 11 | ComputeService compute service architecture |
+| 12 | ComputeThread thread design and GPU polling |
+| 13 | MemoryNode storage node architecture |
+| 14 | Storage owner insert protocol details |
+| 15 | GPU kernel implementation: distance computation |
+| 16 | GPU kernel implementation: RobustPrune |
+| 17 | GPU resource management and GPU-Direct RDMA |
+| 18 | Multi-compute-node routing system |
+| 19 | Offline Vamana graph builder |
+| 20 | Performance breakdown and statistics system |
+| 21 | Vector data types and quantization storage |
+| 22 | IO and data management layer |
+| 23 | HTTP service and external interface |
+| 24 | Multi-memory-node peer communication |
+| 25 | RPC routing and multi-CN coordination |
+| 26 | Build system and compilation optimization |
+| 27 | Evaluation scripts and experiment workflow |
+| 28 | Key performance optimization techniques |
+| 29 | Testing and debugging methods |
+| 30 | Extension development and future directions |
+
+## License
+
+MIT License — see [LICENSE](LICENSE).
