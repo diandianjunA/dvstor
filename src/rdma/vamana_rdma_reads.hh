@@ -281,6 +281,17 @@ inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rp
     vec<byte_t*> host_buffers;
     host_buffers.reserve(node_rptrs.size());
 
+    // Group WRs per memory node and build linked lists for batched posting.
+    const u32 num_nodes = static_cast<u32>(thread->ctx->qps.size());
+    // Per-node arrays pre-sized to avoid reallocation invalidating sg_list pointers.
+    vec<vec<ibv_send_wr>> wr_lists(num_nodes);
+    vec<vec<ibv_sge>> sge_lists(num_nodes);
+    for (u32 n = 0; n < num_nodes; ++n) {
+        const size_t cap = node_rptrs.size() / num_nodes + 1;
+        wr_lists[n].reserve(cap);
+        sge_lists[n].reserve(cap);
+    }
+
     for (size_t i = 0; i < node_rptrs.size(); ++i) {
         const auto& rptr = node_rptrs[i];
         u64 local_addr;
@@ -289,9 +300,7 @@ inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rp
             const auto& dst = (*destinations)[i];
             local_addr = dst.local_addr;
             lkey = dst.gpu_destination ? dst.lkey : thread->ctx->get_lkey();
-            if (dst.host_buffer) {
-                host_buffers.push_back(dst.host_buffer);
-            }
+            if (dst.host_buffer) host_buffers.push_back(dst.host_buffer);
         } else if (direct_to_gpu) {
             local_addr = reinterpret_cast<u64>(gpu_buffer) + i * vec_size;
             lkey = gpu_lkey;
@@ -305,17 +314,45 @@ inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rp
         track_vector_rdma_read(thread, vec_size);
         thread->track_post();
 
-        const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
-        qp->post_send(local_addr,
-                      vec_size,
-                      lkey,
-                      IBV_WR_RDMA_READ,
-                      true,
-                      false,
-                      thread->ctx->get_remote_mrt(rptr.memory_node()),
-                      rptr.byte_offset() + VamanaNode::offset_vector(),
-                      0,
-                      thread->create_wr_id());
+        const u32 node = rptr.memory_node();
+        auto* token = thread->ctx->get_remote_mrt(node);
+        auto& sges = sge_lists[node];
+        auto& wrs = wr_lists[node];
+
+        // Build SGE and WR.  Push SGE first (may realloc), then WR
+        // with a pointer to the stable SGE.
+        sges.push_back({});
+        ibv_sge& sge = sges.back();
+        sge.addr = local_addr;
+        sge.length = static_cast<u32>(vec_size);
+        sge.lkey = lkey;
+
+        wrs.push_back({});
+        ibv_send_wr& wr = wrs.back();
+        wr.wr_id = thread->create_wr_id();
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        wr.opcode = IBV_WR_RDMA_READ;
+        wr.send_flags = IBV_SEND_SIGNALED;
+        wr.wr.rdma.remote_addr = token->address + rptr.byte_offset()
+                                 + VamanaNode::offset_vector();
+        wr.wr.rdma.rkey = token->rkey;
+        wr.next = nullptr;
+    }
+
+    // Fix sg_list pointers (may have been invalidated by vector realloc)
+    // and chain WRs into linked lists, then post one batch per node.
+    for (u32 node = 0; node < num_nodes; ++node) {
+        auto& wrs = wr_lists[node];
+        auto& sges = sge_lists[node];
+        if (wrs.empty()) continue;
+        for (size_t j = 0; j < wrs.size(); ++j) {
+            wrs[j].sg_list = &sges[j];  // re-anchor after possible realloc
+            if (j + 1 < wrs.size()) wrs[j].next = &wrs[j + 1];
+        }
+        struct ibv_send_wr* bad = nullptr;
+        ibv_post_send(thread->ctx->qps[node]->qp->get_ibv_qp(),
+                      &wrs[0], &bad);
     }
 
     return VectorBatchReadAwaitable(VectorBatchReadResult{std::move(host_buffers), direct_to_gpu});

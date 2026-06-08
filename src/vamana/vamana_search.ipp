@@ -71,7 +71,6 @@
         const bool use_indirect_candidate_path =
             use_gpudirect_candidate_rdma && thread->reserved_query_state[1] != nullptr;
 
-        // Pending neighbour reads for the next iteration.
         vec<rdma::vamana::NeighborReadAwaitable> pf_neighbors(K);
         u32 pending_K = 0;
 

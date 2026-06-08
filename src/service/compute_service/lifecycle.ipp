@@ -48,7 +48,6 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   vamana_ = std::make_unique<vamana::Vamana<Distance>>(
     config_.R, config_.beam_width, config_.beam_width_construction,
     config_.alpha, config_.k, config_.dim, config_.resolved_vector_dtype());
-  vamana_->set_prefetch_pipeline(config_.prefetch_pipeline);
   vamana_->set_expansion_batch(config_.expansion_batch);
 
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,

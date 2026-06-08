@@ -75,7 +75,6 @@ public:
 #include "vamana/vamana_helpers.ipp"
 
 public:
-    void set_prefetch_pipeline(bool v) { prefetch_pipeline_ = v; }
     void set_expansion_batch(u32 k) { expansion_batch_ = k; }
     u32 expansion_batch() const { return expansion_batch_; }
 
@@ -88,9 +87,6 @@ private:
     const u32 k_;
     const u32 dim_;
     const bool direct_node_reads_;
-
-public:
-    bool prefetch_pipeline_{false};
 };
 
 }  // namespace vamana

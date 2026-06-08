@@ -34,18 +34,6 @@ struct ThreadCounterDelta {
   u64 overflow_prune_max_kernel_threads{};
   u64 query_rdma_to_staging_bytes{};
   u64 query_host_staging_fallback_bytes{};
-  u64 neighbor_cache_hits{};
-  u64 neighbor_cache_misses{};
-  u64 gpu_vector_cache_hits{};
-  u64 gpu_vector_cache_misses{};
-  u64 neighbor_cache_lookup_probes{};
-  u64 neighbor_cache_insert_probes{};
-  u64 gpu_vector_cache_lookup_probes{};
-  u64 gpu_vector_cache_alloc_probes{};
-  u64 neighbor_cache_admitted{};
-  u64 neighbor_cache_rejected{};
-  u64 gpu_vector_cache_admitted{};
-  u64 gpu_vector_cache_rejected{};
 };
 
 
@@ -71,26 +59,6 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
     out.visited_neighborlists = end.visited_neighborlists - start.visited_neighborlists;
     out.query_rdma_to_staging_bytes = end.query_rdma_to_staging_bytes - start.query_rdma_to_staging_bytes;
     out.query_host_staging_fallback_bytes = end.query_host_staging_fallback_bytes - start.query_host_staging_fallback_bytes;
-    out.neighbor_cache_hits = end.neighbor_cache_hits - start.neighbor_cache_hits;
-    out.neighbor_cache_misses = end.neighbor_cache_misses - start.neighbor_cache_misses;
-    out.gpu_vector_cache_hits = end.gpu_vector_cache_hits - start.gpu_vector_cache_hits;
-    out.gpu_vector_cache_misses = end.gpu_vector_cache_misses - start.gpu_vector_cache_misses;
-    out.neighbor_cache_lookup_probes =
-      end.neighbor_cache_lookup_probes - start.neighbor_cache_lookup_probes;
-    out.neighbor_cache_insert_probes =
-      end.neighbor_cache_insert_probes - start.neighbor_cache_insert_probes;
-    out.gpu_vector_cache_lookup_probes =
-      end.gpu_vector_cache_lookup_probes - start.gpu_vector_cache_lookup_probes;
-    out.gpu_vector_cache_alloc_probes =
-      end.gpu_vector_cache_alloc_probes - start.gpu_vector_cache_alloc_probes;
-    out.neighbor_cache_admitted =
-      end.neighbor_cache_admitted - start.neighbor_cache_admitted;
-    out.neighbor_cache_rejected =
-      end.neighbor_cache_rejected - start.neighbor_cache_rejected;
-    out.gpu_vector_cache_admitted =
-      end.gpu_vector_cache_admitted - start.gpu_vector_cache_admitted;
-    out.gpu_vector_cache_rejected =
-      end.gpu_vector_cache_rejected - start.gpu_vector_cache_rejected;
     return out;
   }
 
