@@ -97,11 +97,13 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     auto& t0 = compute_threads()[0];
     const size_t read_size = sizeof(u8) + VamanaNode::NEIGHBORS_SIZE;
 
-    // Read medoid pointer synchronously
-    u64 medoid_raw = 0;
+    // Use buffer_allocator memory (registered for RDMA) — never stack memory.
+    byte_t* rdma_buf = t0->buffer_allocator.allocate_buffer(read_size);
+
+    // Read medoid pointer synchronously (into registered buffer)
     {
       const QP& qp = t0->ctx->qps[0]->qp;
-      qp->post_send(reinterpret_cast<u64>(&medoid_raw),
+      qp->post_send(reinterpret_cast<u64>(rdma_buf),
                     sizeof(u64),
                     t0->ctx->get_lkey(),
                     IBV_WR_RDMA_READ,
@@ -113,11 +115,12 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                     t0->create_wr_id());
       t0->ctx->context.poll_send_cq_until_completion();
     }
+    u64 medoid_raw = *reinterpret_cast<u64*>(rdma_buf);
     RemotePtr medoid_ptr{medoid_raw};
 
     if (!medoid_ptr.is_null()) {
       // Synchronous helper: read edge_count + neighbors into buf.
-      // Returns the edge count.
+      // Both buf and buf+sizeof(u8) must be in registered memory.
       auto read_neighbors_sync = [&](RemotePtr rptr, byte_t* buf) -> u8 {
         const QP& qp = t0->ctx->qps[rptr.memory_node()]->qp;
         // Step 1: read edge_count
@@ -157,16 +160,15 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
       visited.insert(medoid_raw);
 
       size_t total_cached = 0;
-      byte_t* read_buf = t0->buffer_allocator.allocate_buffer(read_size);
 
       for (size_t hop = 0; hop < kMaxHops && !frontier.empty(); ++hop) {
         vec<RemotePtr> next_frontier;
         size_t hop_cached = 0;
 
         for (const auto& node_rptr : frontier) {
-          u8 count = read_neighbors_sync(node_rptr, read_buf);
+          u8 count = read_neighbors_sync(node_rptr, rdma_buf);
           const RemotePtr* neighbors =
-              reinterpret_cast<const RemotePtr*>(read_buf + sizeof(u8));
+              reinterpret_cast<const RemotePtr*>(rdma_buf + sizeof(u8));
 
           neighbor_cache_->insert(node_rptr, count, neighbors);
           ++hop_cached;
@@ -188,10 +190,11 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
         frontier = std::move(next_frontier);
       }
 
-      t0->buffer_allocator.free_buffer(read_buf, read_size);
       print_status("neighbor cache warmup complete: " +
                    std::to_string(total_cached) + " total entries cached");
     }
+
+    t0->buffer_allocator.free_buffer(rdma_buf, read_size);
   }
 
   start_workers();
