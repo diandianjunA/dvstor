@@ -246,6 +246,7 @@ write_service_config() {
     echo "query-coroutines = $query_coroutines"
     echo "label = sift100m_${PROFILE_NAME:-$PROFILE}"
     if [[ "${GPUDIRECT_RDMA:-0}" == "1" ]]; then echo "gpudirect-rdma = true"; fi
+    if [[ "${PREFETCH_PIPELINE:-0}" == "1" ]]; then echo "prefetch-pipeline = true"; fi
     if [[ "${GPU_CACHE_OPTIMIZATION:-0}" == "1" ]]; then echo "gpu-cache-optimization = true"; fi
     if [[ -n "${NEIGHBOR_CACHE_MB:-}" ]]; then echo "neighbor-cache-mb = ${NEIGHBOR_CACHE_MB}"; fi
     if [[ -n "${GPU_VECTOR_CACHE_MB:-}" ]]; then echo "gpu-vector-cache-mb = ${GPU_VECTOR_CACHE_MB}"; fi

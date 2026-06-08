@@ -18,8 +18,6 @@
 #include "common/configuration.hh"
 #include "common/core_assignment.hh"
 #include "http/vamana_service_scheduler.hh"
-#include "common/neighbor_cache.hh"
-#include "gpu/gpu_vector_cache.hh"
 #include "memory_node/command_protocol.hh"
 #include "service/breakdown.hh"
 #include "service/compute_service/state.hh"
@@ -240,8 +238,6 @@ private:
   std::atomic<bool> rpc_idle_{false};
 
   std::unique_ptr<vamana::Vamana<Distance>> vamana_;
-  std::unique_ptr<NeighborCache> neighbor_cache_;
-  std::unique_ptr<GpuVectorCache> gpu_vector_cache_;
   std::unique_ptr<WorkerPool> worker_pool_;
   ServiceProfile service_profile_{};
   service::InsertQueue insert_queue_;

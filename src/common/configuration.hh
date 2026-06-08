@@ -39,10 +39,7 @@ public:
   u32 k{};
   u32 gpu_device{};       // CUDA device ID
   bool gpudirect_rdma{};  // Enable GPUDirect RDMA (read vectors directly into GPU buffers)
-  bool gpu_cache_optimization{};  // Enable CPU-side NeighborCache (not GPU)
-  u32 neighbor_cache_mb{0};      // Neighbor cache size in MB, 0 = disabled
-  u32 neighbor_cache_warmup_hops{3};  // BFS hops for cache warmup, 0 = skip
-  u32 gpu_vector_cache_mb{0};  // GPU-resident GpuVectorCache size in MB, 0 = disabled (independent of gpu_cache_optimization)
+  bool prefetch_pipeline{};  // Enable two-stage RDMA prefetch pipeline (neighbour + vector overlapped with GPU)
   str vector_data_type{"auto"};
   str insert_execution{"compute"};
   u32 insert_workers{};
@@ -189,15 +186,8 @@ private:
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
-      "gpu-cache-optimization", po::bool_switch(&gpu_cache_optimization)->default_value(false),
-      "Enable GPU-side cache and prefetch optimization.")(
-      "neighbor-cache-mb", po::value<u32>(&neighbor_cache_mb)->default_value(0),
-      "Neighbor cache size in MB (0 = disabled).")(
-      "neighbor-cache-warmup-hops", po::value<u32>(&neighbor_cache_warmup_hops)->default_value(3),
-      "BFS hops for neighbor cache warmup at startup (0 = skip warmup).")(
-      "gpu-vector-cache-mb", po::value<u32>(&gpu_vector_cache_mb)->default_value(0),
-      "GPU vector cache size in MB (0 = disabled). Caches vectors in GPU memory — eliminates "
-      "RDMA reads for hot nodes. Best combined with --gpudirect-rdma.")(
+      "prefetch-pipeline", po::bool_switch(&prefetch_pipeline)->default_value(false),
+      "Enable two-stage RDMA prefetch pipeline: overlap neighbour+vector RDMA with GPU compute.")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
       "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
@@ -382,10 +372,7 @@ public:
       os << std::setw(width) << "query coroutines: " << config.query_coroutines << std::endl;
       os << std::setw(width) << "GPU device: " << config.gpu_device << std::endl;
       os << std::setw(width) << "GPUDirect RDMA: " << (config.gpudirect_rdma ? "true" : "false") << std::endl;
-      os << std::setw(width) << "GPU Cache Optimization: " << (config.gpu_cache_optimization ? "true" : "false") << std::endl;
-      os << std::setw(width) << "Neighbor Cache (MB): " << config.neighbor_cache_mb << std::endl;
-      os << std::setw(width) << "Neighbor Cache Warmup Hops: " << config.neighbor_cache_warmup_hops << std::endl;
-      os << std::setw(width) << "GPU Vector Cache (MB): " << config.gpu_vector_cache_mb << std::endl;
+      os << std::setw(width) << "Prefetch Pipeline: " << (config.prefetch_pipeline ? "true" : "false") << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {
       os << std::left << std::setfill(' ');

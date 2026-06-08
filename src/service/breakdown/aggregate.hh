@@ -107,6 +107,18 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
     std::max(aggregate.counters.overflow_prune_max_kernel_threads, sample.overflow_prune_max_kernel_threads);
   aggregate.counters.query_rdma_to_staging_bytes += delta.query_rdma_to_staging_bytes;
   aggregate.counters.query_host_staging_fallback_bytes += delta.query_host_staging_fallback_bytes;
+  aggregate.counters.neighbor_cache_hits += delta.neighbor_cache_hits;
+  aggregate.counters.neighbor_cache_misses += delta.neighbor_cache_misses;
+  aggregate.counters.gpu_vector_cache_hits += delta.gpu_vector_cache_hits;
+  aggregate.counters.gpu_vector_cache_misses += delta.gpu_vector_cache_misses;
+  aggregate.counters.neighbor_cache_lookup_probes += delta.neighbor_cache_lookup_probes;
+  aggregate.counters.neighbor_cache_insert_probes += delta.neighbor_cache_insert_probes;
+  aggregate.counters.gpu_vector_cache_lookup_probes += delta.gpu_vector_cache_lookup_probes;
+  aggregate.counters.gpu_vector_cache_alloc_probes += delta.gpu_vector_cache_alloc_probes;
+  aggregate.counters.neighbor_cache_admitted += delta.neighbor_cache_admitted;
+  aggregate.counters.neighbor_cache_rejected += delta.neighbor_cache_rejected;
+  aggregate.counters.gpu_vector_cache_admitted += delta.gpu_vector_cache_admitted;
+  aggregate.counters.gpu_vector_cache_rejected += delta.gpu_vector_cache_rejected;
   aggregate.lock_attempts += sample.lock_attempts;
   aggregate.lock_retries += sample.lock_retries;
   aggregate.cas_failures += sample.cas_failures;

@@ -48,6 +48,7 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   vamana_ = std::make_unique<vamana::Vamana<Distance>>(
     config_.R, config_.beam_width, config_.beam_width_construction,
     config_.alpha, config_.k, config_.dim, config_.resolved_vector_dtype());
+  vamana_->set_prefetch_pipeline(config_.prefetch_pipeline);
 
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,
                                               config_.max_send_queue_wr,
@@ -66,40 +67,6 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                              thread->ctx->context.get_protection_domain(),
                              config_.gpudirect_rdma);
   }
-  // Initialize GPU vector cache (GPU-resident vector data, eliminates RDMA reads)
-  if (config_.gpu_vector_cache_mb > 0) {
-    const size_t slot_stride = (static_cast<size_t>(VamanaNode::vector_bytes()) + 15) & ~static_cast<size_t>(15);
-    const size_t cache_bytes = static_cast<size_t>(config_.gpu_vector_cache_mb) * 1024 * 1024;
-    const size_t cache_slots = cache_bytes / slot_stride;
-    // Collect unique PDs from all SharedContexts so every thread's QPs
-    // can use GPUDirect RDMA into cache slots.
-    std::vector<ibv_pd*> pds;
-    if (config_.gpudirect_rdma) {
-      std::unordered_set<ibv_pd*> seen;
-      for (auto& thread : compute_threads()) {
-        ibv_pd* pd = thread->ctx->context.get_protection_domain();
-        if (seen.insert(pd).second) {
-          pds.push_back(pd);
-        }
-      }
-    }
-    gpu_vector_cache_ = std::make_unique<GpuVectorCache>();
-    gpu_vector_cache_->init(cache_slots, VamanaNode::vector_bytes(), pds);
-    vamana_->set_gpu_vector_cache(gpu_vector_cache_.get());
-  }
-
-  // Initialize neighbor cache if gpu_cache_optimization is enabled
-  if (config_.gpu_cache_optimization && config_.neighbor_cache_mb > 0) {
-    const size_t entry_size = NeighborCache::kEntryHeaderSize + static_cast<size_t>(config_.R) * sizeof(u64);
-    const size_t cache_bytes = static_cast<size_t>(config_.neighbor_cache_mb) * 1024 * 1024;
-    const size_t cache_entries = cache_bytes / entry_size;
-    neighbor_cache_ = std::make_unique<NeighborCache>(cache_entries, config_.R);
-    vamana_->set_neighbor_cache(neighbor_cache_.get());
-    print_status("neighbor cache initialized: " + std::to_string(config_.neighbor_cache_mb) +
-                 " MB, " + std::to_string(cache_entries) + " entries (" +
-                 std::to_string(entry_size) + " bytes/entry)");
-  }
-
   cm_.synchronize();
 
   wait_for_load_or_store();
@@ -111,119 +78,6 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     if (routing_enabled()) {
       routing_centroids_[cm_.client_id] = compute_local_routing_centroid();
     }
-  }
-
-  // BFS pre-populate neighbor cache (configurable hops from medoid).
-  // Reads only edge_count + neighbors (not full nodes) to minimize RDMA traffic.
-  // Posts both RDMA reads back-to-back with a single completion poll,
-  // saving one poll_send_cq_until_completion() system-call overhead per node
-  // (same strategy as read_vamana_neighbors).
-  if (neighbor_cache_ && !compute_threads().empty() && config_.neighbor_cache_warmup_hops > 0) {
-    auto& t0 = compute_threads()[0];
-    const size_t read_size = sizeof(u8) + VamanaNode::NEIGHBORS_SIZE;
-
-    // Use buffer_allocator memory (registered for RDMA) — never stack memory.
-    byte_t* rdma_buf = t0->buffer_allocator.allocate_buffer(read_size);
-
-    // Read medoid pointer synchronously (into registered buffer)
-    {
-      const QP& qp = t0->ctx->qps[0]->qp;
-      qp->post_send(reinterpret_cast<u64>(rdma_buf),
-                    sizeof(u64),
-                    t0->ctx->get_lkey(),
-                    IBV_WR_RDMA_READ,
-                    true,
-                    false,
-                    t0->ctx->get_remote_mrt(0),
-                    8,  // medoid pointer stored at offset 8
-                    0,
-                    t0->create_wr_id());
-      t0->ctx->context.poll_send_cq_until_completion();
-    }
-    u64 medoid_raw = *reinterpret_cast<u64*>(rdma_buf);
-    RemotePtr medoid_ptr{medoid_raw};
-
-    if (!medoid_ptr.is_null()) {
-      // Synchronous helper: read edge_count + neighbors into buf.
-      // Posts both RDMA reads back-to-back, then polls for a single
-      // completion.  The second (signaled) read cannot start until the
-      // first (unsignaled) finishes due to in-order QP execution, so
-      // the two reads are sequential on the wire.  The savings comes
-      // from skipping one poll_send_cq_until_completion() call.
-      auto read_neighbors_sync = [&](RemotePtr rptr, byte_t* buf) -> u8 {
-        const QP& qp = t0->ctx->qps[rptr.memory_node()]->qp;
-        // Post both RDMA reads (edge_count + neighbors) back-to-back
-        qp->post_send(reinterpret_cast<u64>(buf),
-                      sizeof(u8),
-                      t0->ctx->get_lkey(),
-                      IBV_WR_RDMA_READ,
-                      false,  // unsignaled — signaled on second post
-                      false,
-                      t0->ctx->get_remote_mrt(rptr.memory_node()),
-                      rptr.byte_offset() + VamanaNode::offset_edge_count(),
-                      0,
-                      0);  // no wr_id needed for unsignaled
-        qp->post_send(reinterpret_cast<u64>(buf + sizeof(u8)),
-                      VamanaNode::NEIGHBORS_SIZE,
-                      t0->ctx->get_lkey(),
-                      IBV_WR_RDMA_READ,
-                      true,   // signaled
-                      false,
-                      t0->ctx->get_remote_mrt(rptr.memory_node()),
-                      rptr.byte_offset() + VamanaNode::offset_neighbors(),
-                      0,
-                      t0->create_wr_id());
-        t0->ctx->context.poll_send_cq_until_completion();
-        return *reinterpret_cast<u8*>(buf);
-      };
-
-      const u32 kMaxHops = config_.neighbor_cache_warmup_hops;
-      std::unordered_set<u64> visited;
-      vec<RemotePtr> frontier;
-      frontier.push_back(medoid_ptr);
-      visited.insert(medoid_raw);
-
-      size_t total_cached = 0;
-      auto warmup_start = std::chrono::steady_clock::now();
-
-      for (u32 hop = 0; hop < kMaxHops && !frontier.empty(); ++hop) {
-        vec<RemotePtr> next_frontier;
-        size_t hop_cached = 0;
-
-        for (const auto& node_rptr : frontier) {
-          u8 count = read_neighbors_sync(node_rptr, rdma_buf);
-          const RemotePtr* neighbors =
-              reinterpret_cast<const RemotePtr*>(rdma_buf + sizeof(u8));
-
-          neighbor_cache_->insert(node_rptr, count, neighbors);
-          ++hop_cached;
-
-          // Enqueue unvisited neighbors for next hop
-          for (u8 i = 0; i < count; ++i) {
-            if (!neighbors[i].is_null() &&
-                visited.insert(neighbors[i].raw_address).second) {
-              next_frontier.push_back(neighbors[i]);
-            }
-          }
-        }
-
-        total_cached += hop_cached;
-        print_status("neighbor cache warmup hop " + std::to_string(hop + 1) + "/" +
-                     std::to_string(kMaxHops) + ": cached " +
-                     std::to_string(hop_cached) + " nodes, " +
-                     std::to_string(next_frontier.size()) + " in next frontier");
-
-        frontier = std::move(next_frontier);
-      }
-
-      auto warmup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::steady_clock::now() - warmup_start).count();
-      print_status("neighbor cache warmup complete: " +
-                   std::to_string(total_cached) + " total entries cached in " +
-                   std::to_string(warmup_ms) + " ms");
-    }
-
-    t0->buffer_allocator.free_buffer(rdma_buf, read_size);
   }
 
   start_workers();

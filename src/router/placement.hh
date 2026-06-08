@@ -93,7 +93,7 @@ private:
     // BFS expansion from medoid
     for (idx_t iter = 0; iter < nodes.size() && nodes.size() < k; ++iter) {
       const auto& node = nodes[iter];
-      const auto nlist = co_await rdma::vamana::read_vamana_neighbors(node->rptr, thread);
+      const auto nlist = co_await rdma::vamana::read_vamana_neighbors(node->rptr, &thread);
 
       for (const RemotePtr& r_ptr : nlist->view()) {
         if (!r_ptr.is_null() && !visited_nodes.contains(r_ptr)) {

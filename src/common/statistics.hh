@@ -92,6 +92,14 @@ struct CNStatistics {
   size_t neighbor_cache_misses{};
   size_t gpu_vector_cache_hits{};
   size_t gpu_vector_cache_misses{};
+  size_t neighbor_cache_lookup_probes{};
+  size_t neighbor_cache_insert_probes{};
+  size_t gpu_vector_cache_lookup_probes{};
+  size_t gpu_vector_cache_alloc_probes{};
+  size_t neighbor_cache_admitted{};
+  size_t neighbor_cache_rejected{};
+  size_t gpu_vector_cache_admitted{};
+  size_t gpu_vector_cache_rejected{};
 
   size_t processed_queries{};
   size_t processed_inserts{};
@@ -143,6 +151,14 @@ struct CNStatistics {
     neighbor_cache_misses += other.neighbor_cache_misses;
     gpu_vector_cache_hits += other.gpu_vector_cache_hits;
     gpu_vector_cache_misses += other.gpu_vector_cache_misses;
+    neighbor_cache_lookup_probes += other.neighbor_cache_lookup_probes;
+    neighbor_cache_insert_probes += other.neighbor_cache_insert_probes;
+    gpu_vector_cache_lookup_probes += other.gpu_vector_cache_lookup_probes;
+    gpu_vector_cache_alloc_probes += other.gpu_vector_cache_alloc_probes;
+    neighbor_cache_admitted += other.neighbor_cache_admitted;
+    neighbor_cache_rejected += other.neighbor_cache_rejected;
+    gpu_vector_cache_admitted += other.gpu_vector_cache_admitted;
+    gpu_vector_cache_rejected += other.gpu_vector_cache_rejected;
   }
 
   void convert(Statistics& statistics) const {
@@ -181,6 +197,14 @@ struct CNStatistics {
     statistics.add_nested_static_stat(query_group, "neighbor_cache_misses", neighbor_cache_misses);
     statistics.add_nested_static_stat(query_group, "gpu_vector_cache_hits", gpu_vector_cache_hits);
     statistics.add_nested_static_stat(query_group, "gpu_vector_cache_misses", gpu_vector_cache_misses);
+    statistics.add_nested_static_stat(query_group, "neighbor_cache_lookup_probes", neighbor_cache_lookup_probes);
+    statistics.add_nested_static_stat(query_group, "neighbor_cache_insert_probes", neighbor_cache_insert_probes);
+    statistics.add_nested_static_stat(query_group, "gpu_vector_cache_lookup_probes", gpu_vector_cache_lookup_probes);
+    statistics.add_nested_static_stat(query_group, "gpu_vector_cache_alloc_probes", gpu_vector_cache_alloc_probes);
+    statistics.add_nested_static_stat(query_group, "neighbor_cache_admitted", neighbor_cache_admitted);
+    statistics.add_nested_static_stat(query_group, "neighbor_cache_rejected", neighbor_cache_rejected);
+    statistics.add_nested_static_stat(query_group, "gpu_vector_cache_admitted", gpu_vector_cache_admitted);
+    statistics.add_nested_static_stat(query_group, "gpu_vector_cache_rejected", gpu_vector_cache_rejected);
     statistics.add_nested_static_stat(query_group, "processed", processed_queries);
     statistics.add_nested_static_stat(query_group, "queue_wait_ns", query_queue_wait_ns);
 
@@ -245,7 +269,15 @@ struct ThreadStatistics {
   size_t neighbor_cache_misses{0};
   size_t gpu_vector_cache_hits{0};
   size_t gpu_vector_cache_misses{0};
-  size_t reserved_counter_slots[7]{};
+  size_t neighbor_cache_lookup_probes{0};
+  size_t neighbor_cache_insert_probes{0};
+  size_t gpu_vector_cache_lookup_probes{0};
+  size_t gpu_vector_cache_alloc_probes{0};
+  size_t neighbor_cache_admitted{0};
+  size_t neighbor_cache_rejected{0};
+  size_t gpu_vector_cache_admitted{0};
+  size_t gpu_vector_cache_rejected{0};
+  size_t reserved_counter_slots[3]{};
 
   void inc_visited_nodes(u32 level) {
     if (level > 0) {

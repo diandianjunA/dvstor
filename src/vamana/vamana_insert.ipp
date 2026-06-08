@@ -96,8 +96,8 @@
 
             const auto t_neighbor_fetch = std::chrono::steady_clock::now();
             s_ptr<VamanaNeighborlist> nlist =
-                co_await rdma::vamana::read_vamana_neighbors_cached(
-                    beam[best_idx].rptr, thread, neighbor_cache_);
+                co_await rdma::vamana::read_vamana_neighbors(
+                    beam[best_idx].rptr, &thread);
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_neighbor_fetch, t_neighbor_fetch);
             ++thread->stats.visited_neighborlists;
 
@@ -297,8 +297,8 @@
             // Read neighbor's neighbor list (mutable: may call add() later)
             const auto t_neighbor_list_read = std::chrono::steady_clock::now();
             s_ptr<VamanaNeighborlist> neighbor_nlist =
-                co_await rdma::vamana::read_vamana_neighbors_cached(
-                    neighbor_ptr, thread, neighbor_cache_, true /* mutable_access */);
+                co_await rdma::vamana::read_vamana_neighbors(
+                    neighbor_ptr, &thread);
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_neighbor_list_read, t_neighbor_list_read);
 
             if (neighbor_nlist->num_neighbors() < R_) {
@@ -315,10 +315,6 @@
                     neighbor_nlist->num_neighbors(),
                     thread);
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_neighbor_list_write, t_neighbor_list_write);
-                // Invalidate cache entry for this neighbor
-                if (neighbor_cache_) {
-                    neighbor_cache_->invalidate(neighbor_ptr);
-                }
             } else {
                 // Need to prune: gather all candidate neighbors + new node
                 ++thread->stats.build_overflow_prunes;
@@ -496,10 +492,6 @@
                     static_cast<u8>(new_count),
                     thread);
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_pruned_neighbor_write, t_pruned_neighbor_write);
-                // Invalidate cache entry for this neighbor
-                if (neighbor_cache_) {
-                    neighbor_cache_->invalidate(neighbor_ptr);
-                }
 
                 // (bump allocator; no individual free)
             }

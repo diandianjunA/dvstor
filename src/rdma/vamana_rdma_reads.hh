@@ -6,7 +6,6 @@
 
 #include <cstring>
 
-#include "common/neighbor_cache.hh"
 #include "compute_thread.hh"
 #include "coroutine.hh"
 #include "remote_pointer.hh"
@@ -166,131 +165,37 @@ inline auto read_vamana_id(RemotePtr rptr, const u_ptr<ComputeThread>& thread) {
     return awaitable{id_ptr, thread};
 }
 
-inline auto read_vamana_neighbors(RemotePtr node_rptr, const u_ptr<ComputeThread>& thread) {
-    const size_t read_size = sizeof(u8) + VamanaNode::NEIGHBORS_SIZE;
-    byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(read_size);
+struct NeighborReadAwaitable {
+    byte_t* local_buffer{nullptr};
+    size_t read_size{0};
+    const u_ptr<ComputeThread>* thread_ptr{nullptr};
 
-    const QP& qp = thread->ctx->qps[node_rptr.memory_node()]->qp;
-    track_neighbor_rdma_read(thread, read_size, 2);
-    thread->track_post();
-    qp->post_send(reinterpret_cast<u64>(local_buffer),
-                  sizeof(u8),
-                  thread->ctx->get_lkey(),
-                  IBV_WR_RDMA_READ,
-                  true,
-                  false,
-                  thread->ctx->get_remote_mrt(node_rptr.memory_node()),
-                  node_rptr.byte_offset() + VamanaNode::offset_edge_count(),
-                  0,
-                  thread->create_wr_id());
-
-    thread->track_post();
-    qp->post_send(reinterpret_cast<u64>(local_buffer + sizeof(u8)),
-                  VamanaNode::NEIGHBORS_SIZE,
-                  thread->ctx->get_lkey(),
-                  IBV_WR_RDMA_READ,
-                  true,
-                  false,
-                  thread->ctx->get_remote_mrt(node_rptr.memory_node()),
-                  node_rptr.byte_offset() + VamanaNode::offset_neighbors(),
-                  0,
-                  thread->create_wr_id());
-
-    struct awaitable {
-        byte_t* local_buffer;
-        size_t read_size;
-        const u_ptr<ComputeThread>& thread;
-
-        static bool await_ready() { return false; }
-        static void await_suspend(std::coroutine_handle<>) {}
-        s_ptr<VamanaNeighborlist> await_resume() {
-            return std::make_shared<VamanaNeighborlist>(local_buffer, read_size, thread.get());
-        }
-    };
-
-    return awaitable{local_buffer, read_size, thread};
-}
-
-// Cached version: checks NeighborCache before issuing RDMA reads.
-// On cache hit, returns immediately without suspending the coroutine.
-//
-// When mutable_access = false (default, search path): cache-hit nlist borrows the
-// thread-local scratch buffer (no buffer_allocator allocation, no extra memcpy).
-// When mutable_access = true (insert path, reverse-edge update): cache-hit nlist
-// gets its own allocated buffer because the caller may call nlist->add().
-inline auto read_vamana_neighbors_cached(RemotePtr node_rptr,
-                                          const u_ptr<ComputeThread>& thread,
-                                          NeighborCache* cache,
-                                          bool mutable_access = false) {
-    const size_t read_size = sizeof(u8) + VamanaNode::NEIGHBORS_SIZE;
-
-    // Single awaitable type for both cache-hit and cache-miss paths
-    struct awaitable {
-        byte_t* local_buffer{nullptr};
-        size_t read_size{0};
-        const u_ptr<ComputeThread>* thread_ptr{nullptr};
-        s_ptr<VamanaNeighborlist> cached_result;
-        RemotePtr node_rptr;
-        NeighborCache* cache{nullptr};
-        bool is_cache_hit{false};
-
-        bool await_ready() const {
-            return is_cache_hit;  // cache hit: no suspension; miss: suspend
-        }
-        static void await_suspend(std::coroutine_handle<>) {}
-        s_ptr<VamanaNeighborlist> await_resume() {
-            if (is_cache_hit) {
-                return std::move(cached_result);
-            }
-            auto nlist = std::make_shared<VamanaNeighborlist>(local_buffer, read_size,
-                                                               thread_ptr->get());
-            if (cache) {
-                (*thread_ptr)->stats.neighbor_cache_misses++;
-                cache->insert(node_rptr, nlist->num_neighbors(), nlist->view().data());
-            }
-            return nlist;
-        }
-    };
-
-    if (cache) {
-        // Lazy-init per-thread scratch buffer in VamanaNeighborlist format:
-        //   [count(1B)][neighbors(R*8B)]
-        auto& scratch = thread->cached_neighbor_data;
-        if (scratch.empty()) {
-            scratch.resize(VamanaNeighborlist::buffer_size());
-        }
-
-        u8 cached_count = 0;
-        // find() writes neighbors into scratch+1, returns hit and count
-        if (cache->find(node_rptr,
-                         reinterpret_cast<RemotePtr*>(scratch.data() + sizeof(u8)),
-                         cached_count)) {
-            thread->stats.neighbor_cache_hits++;
-
-            if (!mutable_access) {
-                // Fast path (read-only): borrow thread-local scratch buffer.
-                // No buffer_allocator allocation, no second memcpy.
-                scratch[0] = static_cast<byte_t>(cached_count);
-                auto nlist = std::make_shared<VamanaNeighborlist>(
-                    scratch.data(), read_size, thread.get(),
-                    false /* owns_buffer = false */);
-                return awaitable{nullptr, read_size, &thread, std::move(nlist),
-                                 RemotePtr{}, nullptr, true};
-            }
-
-            // Mutable path: caller may modify nlist (e.g., add()).
-            // Allocate a dedicated buffer and copy from scratch.
-            byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(read_size);
-            *reinterpret_cast<u8*>(local_buffer) = cached_count;
-            std::memcpy(local_buffer + sizeof(u8), scratch.data() + sizeof(u8),
-                        static_cast<size_t>(cached_count) * sizeof(RemotePtr));
-            auto nlist = std::make_shared<VamanaNeighborlist>(local_buffer, read_size, thread.get());
-            return awaitable{local_buffer, read_size, &thread, std::move(nlist),
-                             RemotePtr{}, nullptr, true};
+    ~NeighborReadAwaitable() {
+        // If the awaitable is destroyed without being awaited (e.g.,
+        // overwritten by move-assignment or the coroutine frame is freed),
+        // release the allocated RDMA buffer back to the freelist.
+        if (local_buffer && thread_ptr) {
+            (*thread_ptr)->buffer_allocator.free_buffer(local_buffer, read_size);
         }
     }
 
-    // Cache miss — perform the original two-step RDMA read
+    bool valid() const { return local_buffer != nullptr; }
+    bool await_ready() const { return false; }
+    void await_suspend(std::coroutine_handle<>) {}
+    s_ptr<VamanaNeighborlist> await_resume() {
+        auto nlist = std::make_shared<VamanaNeighborlist>(local_buffer, read_size, thread_ptr->get());
+        local_buffer = nullptr;  // ownership transferred to VamanaNeighborlist
+        return nlist;
+    }
+};
+
+// NOTE: takes thread as a pointer (not reference) so the awaitable can be
+// stored and awaited later.  The pointer must point into the coroutine frame
+// (which is heap-allocated and stable across suspensions), NOT the caller's
+// stack frame.
+inline NeighborReadAwaitable read_vamana_neighbors(RemotePtr node_rptr, const u_ptr<ComputeThread>* thread_ptr) {
+    auto& thread = *thread_ptr;
+    const size_t read_size = sizeof(u8) + VamanaNode::NEIGHBORS_SIZE;
     byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(read_size);
 
     const QP& qp = thread->ctx->qps[node_rptr.memory_node()]->qp;
@@ -319,10 +224,17 @@ inline auto read_vamana_neighbors_cached(RemotePtr node_rptr,
                   0,
                   thread->create_wr_id());
 
-    return awaitable{local_buffer, read_size, &thread, nullptr, node_rptr, cache, false};
+    return NeighborReadAwaitable{local_buffer, read_size, thread_ptr};
 }
 
-inline auto batch_read_vectors(const vec<RemotePtr>& node_rptrs,
+struct VectorBatchReadAwaitable {
+    VectorBatchReadResult result;
+    bool await_ready() const { return false; }
+    void await_suspend(std::coroutine_handle<>) {}
+    VectorBatchReadResult await_resume() { return std::move(result); }
+};
+
+inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rptrs,
                                const u_ptr<ComputeThread>& thread,
                                const vec<BatchReadDestination>* destinations = nullptr,
                                void* gpu_buffer = nullptr,
@@ -370,18 +282,10 @@ inline auto batch_read_vectors(const vec<RemotePtr>& node_rptrs,
                       thread->create_wr_id());
     }
 
-    struct awaitable {
-        VectorBatchReadResult result;
-
-        static bool await_ready() { return false; }
-        static void await_suspend(std::coroutine_handle<>) {}
-        VectorBatchReadResult await_resume() { return std::move(result); }
-    };
-
-    return awaitable{VectorBatchReadResult{std::move(host_buffers), direct_to_gpu}};
+    return VectorBatchReadAwaitable{VectorBatchReadResult{std::move(host_buffers), direct_to_gpu}};
 }
 
-inline auto batch_read_vectors(const vec<RemotePtr>& node_rptrs,
+inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rptrs,
                                const u_ptr<ComputeThread>& thread,
                                void* gpu_buffer,
                                u32 gpu_lkey) {
