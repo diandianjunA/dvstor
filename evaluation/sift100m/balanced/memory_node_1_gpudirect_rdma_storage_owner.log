@@ -18,84 +18,84 @@ num_cores: 112
 physical cores per socket: 28
 hyperthreading enabled
 interleaved policy
-pairing: 11866 -- 3202
+pairing: 12496 -- 3352
 [STATUS]: pinned main thread to core 28
 [STATUS]: loaded index metadata from /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced (layout=standard, vector_data_type=uint8)
 allocation size: 17179869184
-allocated ALIGNED MEM (no hugepage) at 131778192867392 with buffer size 17179869184
+allocated ALIGNED MEM (no hugepage) at 127908542677056 with buffer size 17179869184
 [STATUS]: loading index (10560000016 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced_node1_of5.dat
 [STATUS]: register memory and distribute access token
 [STATUS]: connect QPs of compute threads
-pairing: 11871 -- 3207
-pairing: 11877 -- 3212
-pairing: 11881 -- 3217
-pairing: 11886 -- 3222
+pairing: 12501 -- 3357
+pairing: 12507 -- 3362
+pairing: 12513 -- 3367
+pairing: 12516 -- 3372
 [STATUS]: waiting for commands from compute node...
 [STATUS]: loading index (10560000016 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced_node1_of5.dat
 1 device(s) found
 Selected device: ibp86s0
 Selected port state: 4, lid: 8
-pairing: 11891 -- 11892
-pairing: 11894 -- 11893
-pairing: 11897 -- 11895
-pairing: 11898 -- 11896
-pairing: 11900 -- 11899
-pairing: 11903 -- 11901
-pairing: 11904 -- 11902
-pairing: 11907 -- 11906
-pairing: 11909 -- 11912
-pairing: 11914 -- 11913
-pairing: 11917 -- 11918
-pairing: 11920 -- 11919
-pairing: 11924 -- 11921
-pairing: 11927 -- 11928
-pairing: 11930 -- 11931
-pairing: 11935 -- 11934
+pairing: 12522 -- 12521
+pairing: 12525 -- 12523
+pairing: 12527 -- 12524
+pairing: 12528 -- 12526
+pairing: 12532 -- 12529
+pairing: 12534 -- 12530
+pairing: 12537 -- 12531
+pairing: 12539 -- 12533
+pairing: 12540 -- 12535
+pairing: 12543 -- 12536
+pairing: 12544 -- 12538
+pairing: 12546 -- 12542
+pairing: 12548 -- 12545
+pairing: 12551 -- 12547
+pairing: 12553 -- 12550
+pairing: 12556 -- 12554
 [STATUS]: storage-owner peer RDMA QPs per peer: 4
-[storage-peer][token] self_shard=0 local_base=131778192867392 local_rkey=1585152 local_bytes=17179869184
-[storage-peer][token] self_shard=0 peer_shard=1 remote_base=140686795997248 remote_rkey=1585664
-[storage-peer][token] self_shard=0 peer_shard=2 remote_base=132505462112320 remote_rkey=1581056
-[storage-peer][token] self_shard=0 peer_shard=3 remote_base=130844517728320 remote_rkey=1582566
-[storage-peer][token] self_shard=0 peer_shard=4 remote_base=124382913495104 remote_rkey=1584640
-allocated ALIGNED MEM (no hugepage) at 131778039775296 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 131778106941504 with buffer size 2038080
+[storage-peer][token] self_shard=0 local_base=127908542677056 local_rkey=1585664 local_bytes=17179869184
+[storage-peer][token] self_shard=0 peer_shard=1 remote_base=126406195413056 remote_rkey=1584640
+[storage-peer][token] self_shard=0 peer_shard=2 remote_base=132511736791104 remote_rkey=1582566
+[storage-peer][token] self_shard=0 peer_shard=3 remote_base=140620186255424 remote_rkey=1585152
+[storage-peer][token] self_shard=0 peer_shard=4 remote_base=137493007564864 remote_rkey=1581056
+allocated ALIGNED MEM (no hugepage) at 127908389584960 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127908456751168 with buffer size 2038080
 [STATUS]: storage-owner peer RPC receive slots per peer: 32 (requested=32)
-[storage-peer][read] self_shard=0 target_shard=1 remote_base=140686795997248 rkey=1585664 offset=0 bytes=16
+[storage-peer][read] self_shard=0 target_shard=1 remote_base=126406195413056 rkey=1584640 offset=0 bytes=16
 [storage-peer][probe] self_shard=0 peer_shard=1 free_ptr=10560000016 medoid_raw=0
-[storage-peer][read] self_shard=0 target_shard=2 remote_base=132505462112320 rkey=1581056 offset=0 bytes=16
+[storage-peer][read] self_shard=0 target_shard=2 remote_base=132511736791104 rkey=1582566 offset=0 bytes=16
 [storage-peer][probe] self_shard=0 peer_shard=2 free_ptr=10560000016 medoid_raw=0
-[storage-peer][read] self_shard=0 target_shard=3 remote_base=130844517728320 rkey=1582566 offset=0 bytes=16
+[storage-peer][read] self_shard=0 target_shard=3 remote_base=140620186255424 rkey=1585152 offset=0 bytes=16
 [storage-peer][probe] self_shard=0 peer_shard=3 free_ptr=10560000016 medoid_raw=0
-[storage-peer][read] self_shard=0 target_shard=4 remote_base=124382913495104 rkey=1584640 offset=0 bytes=16
+[storage-peer][read] self_shard=0 target_shard=4 remote_base=137493007564864 rkey=1581056 offset=0 bytes=16
 [storage-peer][probe] self_shard=0 peer_shard=4 free_ptr=10560000016 medoid_raw=0
-allocated ALIGNED MEM (no hugepage) at 99366229058496 with buffer size 68608
-allocated ALIGNED MEM (no hugepage) at 131777970569280 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 131777901363264 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 131777832157248 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 131777762951232 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 131777693745216 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 131777624539200 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 131777555333184 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 131777486127168 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 104807839908800 with buffer size 68608
+allocated ALIGNED MEM (no hugepage) at 127908320378944 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127908251172928 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127908181966912 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127908112760896 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127908043554880 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127907974348864 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127907905142848 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127907835936832 with buffer size 67108864
 [STATUS]: storage-owner peer reverse-update workers: 8
 [STATUS]: storage-owner peer reverse-update tuning: mode=async queue_depth=65536 flush_us=200 coalesce_max=256
 [STATUS]: storage-owner peer RDMA read credits per peer: 8 per QP: 8 (requested=8)
 [STATUS]: storage-owner online insert tuning: construction_beam=128 snapshot_batch=64 prune_max_candidates=128
-allocated ALIGNED MEM (no hugepage) at 131777301577792 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 131776305430592 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 131776236224576 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 131776167018560 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 131776097812544 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 131776028606528 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 131775959400512 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 131775890194496 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127907651387456 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127906674114624 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127906604908608 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127906535702592 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127906466496576 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127906397290560 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127906328084544 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 127906258878528 with buffer size 67108864
 [STATUS]: storage-owner insert runtime enabled on shard 0
-[beam_search_async] insert=0 shard=0 iters=134 local=867 remote=3313 local_pct=20.7416%
-[beam_search_async] insert=1 shard=0 iters=134 local=833 remote=3401 local_pct=19.6741%
-[beam_search_async] insert=3 shard=0 iters=138 local=589 remote=2332 local_pct=20.1643%
-[beam_search_async] insert=2 shard=0 iters=135 local=843 remote=3367 local_pct=20.0238%
-[beam_search_async] insert=4 shard=0 iters=138 local=404 remote=1534 local_pct=20.8462%
-[beam_search_async] insert=500 shard=0 iters=137 local=859 remote=3285 local_pct=20.7288%
-[beam_search_async] insert=1000 shard=0 iters=135 local=526 remote=2151 local_pct=19.6489%
-[beam_search_async] insert=1500 shard=0 iters=138 local=886 remote=3726 local_pct=19.2108%
-[beam_search_async] insert=2000 shard=0 iters=137 local=676 remote=2636 local_pct=20.4106%
+[beam_search_async] insert=0 self=0 iters=134 expanded=133 local=1677 sh1=817(19%) sh2=849(20%) sh3=837(20%) sh4=1677(40%)
+[beam_search_async] insert=1 self=0 iters=134 expanded=133 local=1674 sh1=878(20%) sh2=856(20%) sh3=826(19%) sh4=1674(39%)
+[beam_search_async] insert=3 self=0 iters=138 expanded=137 local=1154 sh1=592(20%) sh2=578(19%) sh3=597(20%) sh4=1154(39%)
+[beam_search_async] insert=2 self=0 iters=135 expanded=134 local=1677 sh1=815(19%) sh2=877(20%) sh3=841(19%) sh4=1677(39%)
+[beam_search_async] insert=4 self=0 iters=138 expanded=137 local=797 sh1=382(19%) sh2=374(19%) sh3=385(19%) sh4=797(41%)
+[beam_search_async] insert=500 self=0 iters=139 expanded=138 local=1895 sh1=997(20%) sh2=985(20%) sh3=998(20%) sh4=1895(38%)
+[beam_search_async] insert=1000 self=0 iters=135 expanded=134 local=1042 sh1=543(20%) sh2=544(20%) sh3=549(20%) sh4=1042(38%)
+[beam_search_async] insert=1500 self=0 iters=138 expanded=137 local=1825 sh1=965(20%) sh2=871(18%) sh3=951(20%) sh4=1825(39%)
+[beam_search_async] insert=2000 self=0 iters=136 expanded=135 local=1370 sh1=636(19%) sh2=641(19%) sh3=649(19%) sh4=1370(41%)
