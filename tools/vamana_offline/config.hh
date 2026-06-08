@@ -25,10 +25,6 @@ struct VamanaBuildConfig {
   i32 seed{1234};
   size_t max_vectors{std::numeric_limits<u32>::max()};
   bool ip_distance{false};
-  bool no_gpu{false};
-  i32 gpu_device{0};
-  double gpu_memory_gb{18.0};
-  u32 build_gpu_streams{0};
 };
 
 filepath_t default_vamana_prefix(const filepath_t& data_path, u32 R, u32 beam_width);

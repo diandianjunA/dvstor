@@ -525,6 +525,108 @@ inline float typed_ip_distance_int8_simd(const byte_t* lhs, const byte_t* rhs, u
   return 1.0f - dot;
 }
 
+
+inline float horizontal_sum_ps(__m256 value) {
+  __m128 lo = _mm256_castps256_ps128(value);
+  __m128 hi = _mm256_extractf128_ps(value, 1);
+  __m128 sum = _mm_add_ps(lo, hi);
+  sum = _mm_hadd_ps(sum, sum);
+  sum = _mm_hadd_ps(sum, sum);
+  return _mm_cvtss_f32(sum);
+}
+
+inline float typed_l2_distance_float_query_uint8_simd(const span<const element_t> query,
+                                                      const byte_t* stored,
+                                                      u32 dim) {
+  const float* q = query.data();
+  const u8* s = reinterpret_cast<const u8*>(stored);
+  __m256 acc0 = _mm256_setzero_ps();
+  __m256 acc1 = _mm256_setzero_ps();
+  __m256 acc2 = _mm256_setzero_ps();
+  __m256 acc3 = _mm256_setzero_ps();
+
+  u32 i = 0;
+  for (; i + 32 <= dim; i += 32) {
+    { __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + i));
+      __m256 sv = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes));
+      __m256 qv = _mm256_loadu_ps(q + i);
+      __m256 diff = _mm256_sub_ps(qv, sv);
+      acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(diff, diff)); }
+    { __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + i + 8));
+      __m256 sv = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes));
+      __m256 qv = _mm256_loadu_ps(q + i + 8);
+      __m256 diff = _mm256_sub_ps(qv, sv);
+      acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(diff, diff)); }
+    { __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + i + 16));
+      __m256 sv = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes));
+      __m256 qv = _mm256_loadu_ps(q + i + 16);
+      __m256 diff = _mm256_sub_ps(qv, sv);
+      acc2 = _mm256_add_ps(acc2, _mm256_mul_ps(diff, diff)); }
+    { __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + i + 24));
+      __m256 sv = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes));
+      __m256 qv = _mm256_loadu_ps(q + i + 24);
+      __m256 diff = _mm256_sub_ps(qv, sv);
+      acc3 = _mm256_add_ps(acc3, _mm256_mul_ps(diff, diff)); }
+  }
+
+  acc0 = _mm256_add_ps(acc0, acc1);
+  acc2 = _mm256_add_ps(acc2, acc3);
+  acc0 = _mm256_add_ps(acc0, acc2);
+  float sum = horizontal_sum_ps(acc0);
+
+  for (; i < dim; ++i) {
+    const float diff = q[i] - static_cast<float>(s[i]);
+    sum += diff * diff;
+  }
+  return sum;
+}
+
+inline float typed_l2_distance_float_query_int8_simd(const span<const element_t> query,
+                                                     const byte_t* stored,
+                                                     u32 dim) {
+  const float* q = query.data();
+  const i8* s = reinterpret_cast<const i8*>(stored);
+  __m256 acc0 = _mm256_setzero_ps();
+  __m256 acc1 = _mm256_setzero_ps();
+  __m256 acc2 = _mm256_setzero_ps();
+  __m256 acc3 = _mm256_setzero_ps();
+
+  u32 i = 0;
+  for (; i + 32 <= dim; i += 32) {
+    { __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + i));
+      __m256 sv = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes));
+      __m256 qv = _mm256_loadu_ps(q + i);
+      __m256 diff = _mm256_sub_ps(qv, sv);
+      acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(diff, diff)); }
+    { __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + i + 8));
+      __m256 sv = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes));
+      __m256 qv = _mm256_loadu_ps(q + i + 8);
+      __m256 diff = _mm256_sub_ps(qv, sv);
+      acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(diff, diff)); }
+    { __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + i + 16));
+      __m256 sv = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes));
+      __m256 qv = _mm256_loadu_ps(q + i + 16);
+      __m256 diff = _mm256_sub_ps(qv, sv);
+      acc2 = _mm256_add_ps(acc2, _mm256_mul_ps(diff, diff)); }
+    { __m128i bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s + i + 24));
+      __m256 sv = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(bytes));
+      __m256 qv = _mm256_loadu_ps(q + i + 24);
+      __m256 diff = _mm256_sub_ps(qv, sv);
+      acc3 = _mm256_add_ps(acc3, _mm256_mul_ps(diff, diff)); }
+  }
+
+  acc0 = _mm256_add_ps(acc0, acc1);
+  acc2 = _mm256_add_ps(acc2, acc3);
+  acc0 = _mm256_add_ps(acc0, acc2);
+  float sum = horizontal_sum_ps(acc0);
+
+  for (; i < dim; ++i) {
+    const float diff = q[i] - static_cast<float>(s[i]);
+    sum += diff * diff;
+  }
+  return sum;
+}
+
 #endif  // __AVX2__
 
 inline float typed_l2_distance(const byte_t* lhs,
@@ -577,6 +679,14 @@ inline float typed_l2_distance_float_query(const span<const element_t> query,
                                            const byte_t* stored,
                                            VectorDType stored_dtype,
                                            u32 dim) {
+#ifdef __AVX2__
+  if (stored_dtype == VectorDType::uint8) {
+    return typed_l2_distance_float_query_uint8_simd(query, stored, dim);
+  }
+  if (stored_dtype == VectorDType::int8) {
+    return typed_l2_distance_float_query_int8_simd(query, stored, dim);
+  }
+#endif
   float sum = 0.0f;
   for (u32 i = 0; i < dim; ++i) {
     const float diff = query[i] - vector_component_as_float(stored, stored_dtype, i);

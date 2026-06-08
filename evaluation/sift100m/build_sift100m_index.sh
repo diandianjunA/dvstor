@@ -3,10 +3,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/sift100m_common.sh"
 
-NO_GPU="${NO_GPU:-0}"
-GPU_MEMORY_GB="${GPU_MEMORY_GB:-18}"
-BUILD_GPU_STREAMS="${BUILD_GPU_STREAMS:-0}"
-
 ensure_built vamana_offline_builder
 "$SCRIPT_DIR/prepare_sift100m_data.sh"
 
@@ -24,18 +20,14 @@ cmd=("$BUILD_DIR/vamana_offline_builder"
   --threads "$BUILD_THREADS"
   --max-vectors "$MAX_VECTORS"
   --vector-data-type "$VECTOR_DATA_TYPE"
-  --partition-max-degree "${PARTITION_MAX_DEGREE:-16}"
+  --partition-max-degree "${PARTITION_MAX_DEGREE:-48}"
   --partition-imbalance "${PARTITION_IMBALANCE:-1.03}"
   --skip-sanity-check)
 
-if [[ "${NO_GPU:-0}" == "1" ]]; then
-  cmd+=(--no-gpu)
-else
-  cmd+=(--gpu-device "$GPU_DEVICE" --gpu-memory-gb "$GPU_MEMORY_GB" --build-gpu-streams "$BUILD_GPU_STREAMS")
-fi
-
 echo "[build] index prefix: $INDEX_PREFIX"
 echo "[build] partition: $PARTITION_STRATEGY shards=$SHARDS R=$R build_beam=$BUILD_BEAM dtype=$VECTOR_DATA_TYPE"
+echo "[build] distance execution: cpu-avx2"
 printf '[build] command:'; printf ' %q' "${cmd[@]}"; echo
 "${cmd[@]}" 2>&1 | tee "$LOG_FILE"
+validate_index_metadata
 echo "[build] log: $LOG_FILE"

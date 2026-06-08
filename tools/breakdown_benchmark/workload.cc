@@ -176,6 +176,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   using service::breakdown::aggregate_text_summary;
   using service::breakdown::report_to_json;
 
+  const bool use_insert_file = !args.insert_file.empty();
+
   nlohmann::json root;
   root["meta"] = {
     {"workload", args.workload},
@@ -195,7 +197,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"candidate_vector_rdma_bytes", VamanaNode::vector_bytes()},
     {"effective_bytes_per_vector", VamanaNode::vector_bytes()},
     {"operation_granularity", "single_vector"},
-    {"insert_vector_source", "deterministic_synthetic_from_insert_id"},
+    {"insert_vector_source", use_insert_file ? args.insert_file : "deterministic_synthetic_from_insert_id"},
     {"client_threads", args.client_threads},
     {"read_ratio", args.read_ratio},
     {"insert_start_id", args.insert_start_id},
@@ -231,10 +233,34 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   std::cerr << "[breakdown] preparing workload: bootstrap_count=" << bootstrap_count
             << ", workload=" << args.workload << std::endl;
   const bool needs_query_data = (args.workload == "query" || args.workload == "both" || args.workload == "mixed");
+
+  // Load insert vectors from file if specified, otherwise use synthetic data.
+  VectorRows insert_rows;
+  if (use_insert_file) {
+    insert_rows = read_vector_rows(args.insert_file);
+    if (insert_rows.dim != dim) {
+      throw std::runtime_error("insert-file dim mismatch: " + std::to_string(insert_rows.dim)
+                               + " vs config " + std::to_string(dim));
+    }
+    std::cerr << "[breakdown] insert-file vectors: count=" << insert_rows.count
+              << " dim=" << insert_rows.dim << " dtype=" << vector_dtype_name(insert_rows.dtype)
+              << std::endl;
+  }
+
+  auto get_insert_vector = [&](uint32_t id) -> vec<element_t> {
+    if (use_insert_file) {
+      size_t row = id % insert_rows.count;
+      return vec<element_t>(insert_rows.decoded.begin() + row * dim,
+                            insert_rows.decoded.begin() + (row + 1) * dim);
+    }
+    auto gen = make_deterministic_vector(id, dim);
+    return vec<element_t>(gen.begin(), gen.end());
+  };
+
   std::vector<uint32_t> bootstrap_ids(bootstrap_count);
   std::iota(bootstrap_ids.begin(), bootstrap_ids.end(), 1);
   const auto bootstrap_vectors = make_dataset(bootstrap_ids, dim);
-  std::cerr << "[breakdown] bootstrap vectors ready" << std::endl;
+  std::cerr << "[breakdown] bootstrap vectors ready (synthetic)" << std::endl;
 
   if (needs_query_data && !service.config().load_index) {
     vec<typename ComputeService<Distance>::InsertItem> bootstrap_batch;
@@ -252,10 +278,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     ProgressReporter reporter(label, completed_ops, ops, 0);
     for (size_t op = 0; op < ops; ++op) {
       const uint32_t id = start_id + static_cast<uint32_t>(op);
-      auto values = make_deterministic_vector(id, dim);
+      vec<element_t> values = get_insert_vector(id);
       vec<typename ComputeService<Distance>::InsertItem> insert_items;
       insert_items.reserve(1);
-      insert_items.push_back({id, vec<element_t>(values.begin(), values.end())});
+      insert_items.push_back({id, std::move(values)});
       service.insert(insert_items);
       completed_ops.fetch_add(1, std::memory_order_relaxed);
     }
@@ -271,10 +297,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     size_t local_completed = 0;
     while (can_start_timed_operation(deadline, avg_insert_duration, local_completed)) {
       const uint32_t id = current_id++;
-      auto values = make_deterministic_vector(id, dim);
+      vec<element_t> values = get_insert_vector(id);
       vec<typename ComputeService<Distance>::InsertItem> insert_items;
       insert_items.reserve(1);
-      insert_items.push_back({id, vec<element_t>(values.begin(), values.end())});
+      insert_items.push_back({id, std::move(values)});
       const auto started_at = std::chrono::steady_clock::now();
       service.insert(insert_items);
       update_avg_duration(avg_insert_duration, started_at, local_completed);
@@ -438,10 +464,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
           } else {
             issued_writes.fetch_add(1, std::memory_order_relaxed);
             const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
-            auto values = make_deterministic_vector(id, dim);
+            vec<element_t> values = get_insert_vector(id);
             vec<typename ComputeService<Distance>::InsertItem> insert_items;
             insert_items.reserve(1);
-            insert_items.push_back({id, vec<element_t>(values.begin(), values.end())});
+            insert_items.push_back({id, std::move(values)});
             (void)service.insert(insert_items);
             completed_writes.fetch_add(1, std::memory_order_relaxed);
           }
@@ -497,10 +523,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
           } else {
             issued_writes.fetch_add(1, std::memory_order_relaxed);
             const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
-            auto values = make_deterministic_vector(id, dim);
+            vec<element_t> values = get_insert_vector(id);
             vec<typename ComputeService<Distance>::InsertItem> insert_items;
             insert_items.reserve(1);
-            insert_items.push_back({id, vec<element_t>(values.begin(), values.end())});
+            insert_items.push_back({id, std::move(values)});
             (void)service.insert(insert_items);
             completed_writes.fetch_add(1, std::memory_order_relaxed);
           }

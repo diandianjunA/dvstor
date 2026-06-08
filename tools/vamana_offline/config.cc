@@ -51,13 +51,6 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     ("max-vectors", po::value<size_t>(&config.max_vectors)->default_value(config.max_vectors),
      "Maximum number of vectors to read.")
     ("ip-dist", po::bool_switch(&config.ip_distance), "Use inner-product distance instead of L2.")
-    ("no-gpu", po::bool_switch(&config.no_gpu), "Disable GPU acceleration.")
-    ("gpu-device", po::value<i32>(&config.gpu_device)->default_value(config.gpu_device),
-     "CUDA device ID (default 0).")
-    ("gpu-memory-gb", po::value<double>(&config.gpu_memory_gb)->default_value(config.gpu_memory_gb),
-     "Maximum GPU memory in GiB used by the offline builder. Default 18.")
-    ("build-gpu-streams", po::value<u32>(&config.build_gpu_streams)->default_value(config.build_gpu_streams),
-     "Number of offline GPU streams. 0 = min(threads, 32).")
     ("query-path", po::value<filepath_t>(&config.query_path),
      "Path to query file (.fbin) for post-build recall test.")
     ("groundtruth-path", po::value<filepath_t>(&config.groundtruth_path),
@@ -91,9 +84,6 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     lib_failure("--partition-max-degree must be > 0");
   if (config.partition_imbalance < 1.0)
     lib_failure("--partition-imbalance must be >= 1.0");
-  if (config.gpu_memory_gb <= 0.0)
-    lib_failure("--gpu-memory-gb must be > 0");
-
   return config;
 }
 
