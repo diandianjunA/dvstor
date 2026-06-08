@@ -66,6 +66,18 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                              thread->ctx->context.get_protection_domain(),
                              config_.gpudirect_rdma);
   }
+  // Initialize neighbor cache if gpu_cache_optimization is enabled
+  if (config_.gpu_cache_optimization && config_.neighbor_cache_mb > 0) {
+    const size_t entry_size = NeighborCache::kEntryHeaderSize + static_cast<size_t>(config_.R) * sizeof(u64);
+    const size_t cache_bytes = static_cast<size_t>(config_.neighbor_cache_mb) * 1024 * 1024;
+    const size_t cache_entries = cache_bytes / entry_size;
+    neighbor_cache_ = std::make_unique<NeighborCache>(cache_entries, config_.R);
+    vamana_->set_neighbor_cache(neighbor_cache_.get());
+    print_status("neighbor cache initialized: " + std::to_string(config_.neighbor_cache_mb) +
+                 " MB, " + std::to_string(cache_entries) + " entries (" +
+                 std::to_string(entry_size) + " bytes/entry)");
+  }
+
   cm_.synchronize();
 
   wait_for_load_or_store();
@@ -76,6 +88,109 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     routing_inflight_.assign(cm_.num_total_clients, 0);
     if (routing_enabled()) {
       routing_centroids_[cm_.client_id] = compute_local_routing_centroid();
+    }
+  }
+
+  // BFS pre-populate neighbor cache (up to 3 hops from medoid).
+  // Reads only edge_count + neighbors (not full nodes) to minimize RDMA traffic.
+  if (neighbor_cache_ && !compute_threads().empty()) {
+    auto& t0 = compute_threads()[0];
+    const size_t read_size = sizeof(u8) + VamanaNode::NEIGHBORS_SIZE;
+
+    // Read medoid pointer synchronously
+    u64 medoid_raw = 0;
+    {
+      const QP& qp = t0->ctx->qps[0]->qp;
+      qp->post_send(reinterpret_cast<u64>(&medoid_raw),
+                    sizeof(u64),
+                    t0->ctx->get_lkey(),
+                    IBV_WR_RDMA_READ,
+                    true,
+                    false,
+                    t0->ctx->get_remote_mrt(0),
+                    8,  // medoid pointer stored at offset 8
+                    0,
+                    t0->create_wr_id());
+      t0->ctx->context.poll_send_cq_until_completion();
+    }
+    RemotePtr medoid_ptr{medoid_raw};
+
+    if (!medoid_ptr.is_null()) {
+      // Synchronous helper: read edge_count + neighbors into buf.
+      // Returns the edge count.
+      auto read_neighbors_sync = [&](RemotePtr rptr, byte_t* buf) -> u8 {
+        const QP& qp = t0->ctx->qps[rptr.memory_node()]->qp;
+        // Step 1: read edge_count
+        qp->post_send(reinterpret_cast<u64>(buf),
+                      sizeof(u8),
+                      t0->ctx->get_lkey(),
+                      IBV_WR_RDMA_READ,
+                      true,
+                      false,
+                      t0->ctx->get_remote_mrt(rptr.memory_node()),
+                      rptr.byte_offset() + VamanaNode::offset_edge_count(),
+                      0,
+                      t0->create_wr_id());
+        t0->ctx->context.poll_send_cq_until_completion();
+        u8 count = *reinterpret_cast<u8*>(buf);
+        if (count > 0) {
+          // Step 2: read neighbors
+          qp->post_send(reinterpret_cast<u64>(buf + sizeof(u8)),
+                        VamanaNode::NEIGHBORS_SIZE,
+                        t0->ctx->get_lkey(),
+                        IBV_WR_RDMA_READ,
+                        true,
+                        false,
+                        t0->ctx->get_remote_mrt(rptr.memory_node()),
+                        rptr.byte_offset() + VamanaNode::offset_neighbors(),
+                        0,
+                        t0->create_wr_id());
+          t0->ctx->context.poll_send_cq_until_completion();
+        }
+        return count;
+      };
+
+      constexpr size_t kMaxHops = 3;
+      std::unordered_set<u64> visited;
+      vec<RemotePtr> frontier;
+      frontier.push_back(medoid_ptr);
+      visited.insert(medoid_raw);
+
+      size_t total_cached = 0;
+      byte_t* read_buf = t0->buffer_allocator.allocate_buffer(read_size);
+
+      for (size_t hop = 0; hop < kMaxHops && !frontier.empty(); ++hop) {
+        vec<RemotePtr> next_frontier;
+        size_t hop_cached = 0;
+
+        for (const auto& node_rptr : frontier) {
+          u8 count = read_neighbors_sync(node_rptr, read_buf);
+          const RemotePtr* neighbors =
+              reinterpret_cast<const RemotePtr*>(read_buf + sizeof(u8));
+
+          neighbor_cache_->insert(node_rptr, count, neighbors);
+          ++hop_cached;
+
+          // Enqueue unvisited neighbors for next hop
+          for (u8 i = 0; i < count; ++i) {
+            if (!neighbors[i].is_null() &&
+                visited.insert(neighbors[i].raw_address).second) {
+              next_frontier.push_back(neighbors[i]);
+            }
+          }
+        }
+
+        total_cached += hop_cached;
+        print_status("neighbor cache warmup hop " + std::to_string(hop + 1) +
+                     ": cached " + std::to_string(hop_cached) + " nodes, " +
+                     std::to_string(next_frontier.size()) + " in next frontier");
+
+        frontier = std::move(next_frontier);
+      }
+
+      t0->buffer_allocator.free_buffer(read_buf, read_size);
+      print_status("neighbor cache warmup complete: " +
+                   std::to_string(total_cached) + " total entries cached");
     }
   }
 

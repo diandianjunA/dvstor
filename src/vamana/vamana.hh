@@ -19,6 +19,7 @@
 #include "common/constants.hh"
 #include "common/debug.hh"
 #include "common/distance.hh"
+#include "common/neighbor_cache.hh"
 #include "common/types.hh"
 #include "compute_thread.hh"
 #include "coroutine.hh"
@@ -60,10 +61,14 @@ public:
           alpha_(static_cast<f32>(alpha)),
           k_(k),
           dim_(dim),
-          direct_node_reads_(true) {
+          direct_node_reads_(true),
+          neighbor_cache_(nullptr) {
         lib_assert(beam_width_ >= k_, "beam_width must be >= k");
         VamanaNode::init_static_storage(dim, R, vector_dtype);
     }
+
+    void set_neighbor_cache(NeighborCache* cache) { neighbor_cache_ = cache; }
+    NeighborCache* neighbor_cache() const { return neighbor_cache_; }
 
     // =========================================================================
     // Search (knn)
@@ -81,6 +86,7 @@ private:
     const u32 k_;
     const u32 dim_;
     const bool direct_node_reads_;
+    NeighborCache* neighbor_cache_;
 };
 
 }  // namespace vamana

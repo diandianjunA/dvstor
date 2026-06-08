@@ -115,6 +115,10 @@ public:
   gpu::GpuBufferManager gpu_buffers;  // CUDA streams, events, staging buffers
   void* reserved_query_state[2]{};
 
+  // Neighbor cache scratch buffer (per-thread, sized to buffer_size() at init).
+  // Layout: [count(1B)][neighbors(R*8B)], matches VamanaNeighborlist buffer format.
+  vec<byte_t> cached_neighbor_data;
+
   statistics::ThreadStatistics stats{};
 
 private:

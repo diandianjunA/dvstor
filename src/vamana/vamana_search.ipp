@@ -65,7 +65,8 @@
             beam[best_idx].expanded = true;
 
             const auto t_neighbor_fetch = std::chrono::steady_clock::now();
-            auto nlist = co_await rdma::vamana::read_vamana_neighbors(beam[best_idx].rptr, thread);
+            auto nlist = co_await rdma::vamana::read_vamana_neighbors_cached(
+                beam[best_idx].rptr, thread, neighbor_cache_);
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_neighbor_fetch,
                                       t_neighbor_fetch);
             const u8 neighbor_count = nlist->num_neighbors();

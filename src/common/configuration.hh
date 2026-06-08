@@ -39,6 +39,8 @@ public:
   u32 k{};
   u32 gpu_device{};       // CUDA device ID
   bool gpudirect_rdma{};  // Enable GPUDirect RDMA (read vectors directly into GPU buffers)
+  bool gpu_cache_optimization{};  // Enable GPU-side cache and prefetch optimization
+  u32 neighbor_cache_mb{0};      // Neighbor cache size in MB, 0 = disabled
   str vector_data_type{"auto"};
   str insert_execution{"compute"};
   u32 insert_workers{};
@@ -185,6 +187,10 @@ private:
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
+      "gpu-cache-optimization", po::bool_switch(&gpu_cache_optimization)->default_value(false),
+      "Enable GPU-side cache and prefetch optimization.")(
+      "neighbor-cache-mb", po::value<u32>(&neighbor_cache_mb)->default_value(0),
+      "Neighbor cache size in MB (0 = disabled).")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
       "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
@@ -369,6 +375,8 @@ public:
       os << std::setw(width) << "query coroutines: " << config.query_coroutines << std::endl;
       os << std::setw(width) << "GPU device: " << config.gpu_device << std::endl;
       os << std::setw(width) << "GPUDirect RDMA: " << (config.gpudirect_rdma ? "true" : "false") << std::endl;
+      os << std::setw(width) << "GPU Cache Optimization: " << (config.gpu_cache_optimization ? "true" : "false") << std::endl;
+      os << std::setw(width) << "Neighbor Cache (MB): " << config.neighbor_cache_mb << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {
       os << std::left << std::setfill(' ');
