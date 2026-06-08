@@ -226,8 +226,6 @@ else ()
         )
         target_link_libraries(vamana_offline_builder
             rdma_library
-                dvstor_gpu_kernels
-            CUDA::cudart
         )
         target_link_metis(vamana_offline_builder)
 

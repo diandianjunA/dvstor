@@ -7,11 +7,8 @@
 #include <numeric>
 #include <unordered_set>
 
-#include <cuda_runtime.h>
-
 #include <library/utils.hh>
 
-#include "gpu/gpu_kernel_launcher.hh"
 #include "tools/vamana_offline/config.hh"
 #include "tools/vamana_offline/dataset_io.hh"
 #include "tools/vamana_offline/graph.hh"
@@ -45,51 +42,11 @@ int main(int argc, char** argv) {
   // Initialize VamanaNode static storage
   VamanaNode::init_static_storage(dataset.dim, config.R, dataset.dtype);
 
-  // GPU initialization
-  const size_t num_threads = effective_thread_count(config.threads);
-  std::unique_ptr<BuilderGpuContext[]> gpu_contexts;
-  size_t num_gpu_contexts = 0;
-  void* d_base_vectors = nullptr;
-
-  if (!config.no_gpu && !config.ip_distance) {
-    gpu::gpu_init(config.gpu_device);
-    const size_t gpu_budget_bytes = static_cast<size_t>(config.gpu_memory_gb * 1024.0 * 1024.0 * 1024.0);
-    const size_t raw_bytes = dataset.raw_vectors.size();
-    const size_t workspace_streams = config.build_gpu_streams == 0
-        ? std::min<size_t>(num_threads, 32)
-        : static_cast<size_t>(config.build_gpu_streams);
-    const size_t workspace_bytes = workspace_streams *
-        (static_cast<size_t>(config.beam_width) * (sizeof(u32) + sizeof(float)) + 4096);
-    if (raw_bytes + workspace_bytes <= gpu_budget_bytes) {
-      d_base_vectors = gpu::gpu_malloc(raw_bytes);
-      cudaStream_t upload_stream = gpu::gpu_stream_create();
-      gpu::gpu_memcpy_h2d_async(d_base_vectors, dataset.raw_vectors.data(), raw_bytes, upload_stream);
-      gpu::gpu_stream_synchronize(upload_stream);
-      gpu::gpu_stream_destroy(upload_stream);
-      num_gpu_contexts = workspace_streams;
-      gpu_contexts = std::make_unique<BuilderGpuContext[]>(num_gpu_contexts);
-      for (size_t i = 0; i < num_gpu_contexts; ++i) {
-        gpu_contexts[i].init(dataset.dim, config.beam_width, dataset.dtype, d_base_vectors);
-      }
-      std::cerr << "GPU: device " << config.gpu_device
-                << " resident_raw_base=true streams=" << num_gpu_contexts
-                << " raw_bytes=" << raw_bytes
-                << " budget_bytes=" << gpu_budget_bytes << "\n";
-    } else {
-      std::cerr << "GPU: disabled (raw dataset + workspace exceeds --gpu-memory-gb budget: raw="
-                << raw_bytes << " workspace=" << workspace_bytes
-                << " budget=" << gpu_budget_bytes << ")\n";
-      gpu::gpu_shutdown();
-    }
-  } else {
-    std::cerr << "GPU: disabled"
-              << (config.ip_distance ? " (IP distance not supported on GPU)" : "")
-              << "\n";
-  }
+  std::cerr << "offline distance execution: cpu-avx2\n";
 
   // Step 1: Build Vamana graph
   VamanaGraph graph;
-  build_vamana_graph(graph, dataset, config, gpu_contexts.get(), num_gpu_contexts);
+  build_vamana_graph(graph, dataset, config);
 
   // Optional: recall test with external queries and ground truth
   if (!config.query_path.empty() && !config.groundtruth_path.empty()) {
@@ -150,11 +107,6 @@ int main(int argc, char** argv) {
   // Step 2: Serialize to shard files
   write_vamana_shards(graph, dataset, config, output_prefix);
 
-  // GPU cleanup
-  for (size_t i = 0; i < num_gpu_contexts; ++i) gpu_contexts[i].destroy();
-  gpu_contexts.reset();
-  if (d_base_vectors) gpu::gpu_free(d_base_vectors);
-  if (num_gpu_contexts > 0 || d_base_vectors) gpu::gpu_shutdown();
 
   const auto build_end = std::chrono::steady_clock::now();
   const auto seconds = std::chrono::duration_cast<std::chrono::duration<double>>(build_end - build_start).count();

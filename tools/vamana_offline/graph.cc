@@ -1,7 +1,6 @@
 #include "tools/vamana_offline/graph.hh"
 
 #include <algorithm>
-#include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -71,6 +70,13 @@ bool candidate_id_less(const std::pair<float, u32>& a, const std::pair<float, u3
   return a.second < b.second;
 }
 
+u64 mix_seed(u64 value) {
+  value += 0x9e3779b97f4a7c15ULL;
+  value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+  return value ^ (value >> 31);
+}
+
 void sort_and_unique_candidates(vec<std::pair<float, u32>>& candidates) {
   std::sort(candidates.begin(), candidates.end(), candidate_id_less);
   vec<std::pair<float, u32>> unique;
@@ -82,6 +88,15 @@ void sort_and_unique_candidates(vec<std::pair<float, u32>>& candidates) {
     }
   }
   candidates.swap(unique);
+}
+
+void insert_sorted_beam(vec<std::pair<float, u32>>& beam,
+                        std::pair<float, u32> candidate,
+                        size_t beam_width) {
+  if (beam.size() == beam_width && !candidate_id_less(candidate, beam.back())) return;
+  const auto pos = std::lower_bound(beam.begin(), beam.end(), candidate, candidate_id_less);
+  beam.insert(pos, candidate);
+  if (beam.size() > beam_width) beam.pop_back();
 }
 
 }  // namespace
@@ -126,6 +141,18 @@ bool VamanaGraph::contains_neighbor_unlocked(size_t node, u32 neighbor) const {
   return false;
 }
 
+bool VamanaGraph::try_append_neighbor_unlocked(size_t node, u32 neighbor) {
+  const u8 count = degrees[node];
+  if (count >= R) return false;
+  const size_t base = offset(node);
+  for (u8 i = 0; i < count; ++i) {
+    if (neighbors[base + i] == neighbor) return false;
+  }
+  neighbors[base + count] = neighbor;
+  degrees[node] = static_cast<u8>(count + 1);
+  return true;
+}
+
 void VamanaGraph::set_neighbors(size_t node, const vec<u32>& new_neighbors) {
   const size_t base = offset(node);
   const u8 count = static_cast<u8>(std::min<size_t>(new_neighbors.size(), R));
@@ -149,30 +176,6 @@ void VamanaGraph::lock_node(size_t node) {
 
 void VamanaGraph::unlock_node(size_t node) {
   lock_stripes[node & (lock_stripe_count - 1)].clear(std::memory_order_release);
-}
-
-void BuilderGpuContext::init(u32 dim_, u32 max_cand, VectorDType dtype_, const void* d_base_vectors_) {
-  dim = dim_;
-  max_candidates = max_cand;
-  dtype = static_cast<u32>(dtype_);
-  d_base_vectors = d_base_vectors_;
-  stream = gpu::gpu_stream_create();
-  event = gpu::gpu_event_create();
-  h_candidate_ids = static_cast<u32*>(gpu::gpu_malloc_host(max_candidates * sizeof(u32)));
-  h_distances = static_cast<float*>(gpu::gpu_malloc_host(max_candidates * sizeof(float)));
-  d_candidate_ids = static_cast<u32*>(gpu::gpu_malloc(max_candidates * sizeof(u32)));
-  d_distances = static_cast<float*>(gpu::gpu_malloc(max_candidates * sizeof(float)));
-}
-
-void BuilderGpuContext::destroy() {
-  if (!stream) return;
-  gpu::gpu_free_host(h_candidate_ids);
-  gpu::gpu_free_host(h_distances);
-  gpu::gpu_free(d_candidate_ids);
-  gpu::gpu_free(d_distances);
-  gpu::gpu_event_destroy(event);
-  gpu::gpu_stream_destroy(stream);
-  stream = nullptr;
 }
 
 size_t compute_medoid(const Dataset& dataset, bool ip_distance) {
@@ -211,8 +214,7 @@ vec<std::pair<float, u32>> beam_search(VamanaGraph& graph,
                                        const Dataset& dataset,
                                        u32 query_id,
                                        u32 beam_width,
-                                       bool ip_distance,
-                                       BuilderGpuContext* gpu_ctx) {
+                                       bool ip_distance) {
   vec<std::pair<float, u32>> all_visited;
   vec<std::pair<float, u32>> beam;
   const size_t expected_seen = std::max<size_t>(1024, static_cast<size_t>(beam_width) * graph.R + graph.R + 1);
@@ -250,43 +252,12 @@ vec<std::pair<float, u32>> beam_search(VamanaGraph& graph,
       unvisited.push_back(nbr);
     }
 
-    if (!unvisited.empty()) {
-      if (!ip_distance && gpu_ctx && gpu_ctx->enabled() && unvisited.size() >= GPU_BATCH_THRESHOLD) {
-        const u32 batch = static_cast<u32>(std::min<size_t>(unvisited.size(), gpu_ctx->max_candidates));
-        std::memcpy(gpu_ctx->h_candidate_ids, unvisited.data(), batch * sizeof(u32));
-        gpu::gpu_memcpy_h2d_async(gpu_ctx->d_candidate_ids, gpu_ctx->h_candidate_ids,
-                                  batch * sizeof(u32), gpu_ctx->stream);
-        gpu::launch_batch_id_l2_distances(gpu_ctx->stream, gpu_ctx->event,
-                                          gpu_ctx->d_base_vectors,
-                                          query_id,
-                                          gpu_ctx->d_candidate_ids,
-                                          gpu_ctx->d_distances,
-                                          batch,
-                                          dataset.dim,
-                                          gpu_ctx->dtype);
-        gpu::gpu_memcpy_d2h_async(gpu_ctx->h_distances, gpu_ctx->d_distances,
-                                  batch * sizeof(float), gpu_ctx->stream);
-        gpu::gpu_stream_synchronize(gpu_ctx->stream);
-        for (u32 j = 0; j < batch; ++j) {
-          beam.push_back({gpu_ctx->h_distances[j], unvisited[j]});
-          all_visited.push_back({gpu_ctx->h_distances[j], unvisited[j]});
-        }
-        for (size_t j = batch; j < unvisited.size(); ++j) {
-          const float d = dataset_distance(dataset, query_id, unvisited[j], ip_distance);
-          beam.push_back({d, unvisited[j]});
-          all_visited.push_back({d, unvisited[j]});
-        }
-      } else {
-        for (u32 nbr : unvisited) {
-          const float d = dataset_distance(dataset, query_id, nbr, ip_distance);
-          beam.push_back({d, nbr});
-          all_visited.push_back({d, nbr});
-        }
-      }
+    for (u32 nbr : unvisited) {
+      const float d = dataset_distance(dataset, query_id, nbr, ip_distance);
+      insert_sorted_beam(beam, {d, nbr}, beam_width);
+      all_visited.push_back({d, nbr});
     }
 
-    std::sort(beam.begin(), beam.end(), candidate_id_less);
-    if (beam.size() > beam_width) beam.resize(beam_width);
   }
 
   std::sort(all_visited.begin(), all_visited.end(), candidate_id_less);
@@ -328,11 +299,9 @@ vec<std::pair<float, u32>> beam_search_float_query(VamanaGraph& graph,
     for (u32 nbr : nbrs) {
       if (!visited.insert(nbr)) continue;
       const float d = dataset_distance_float_query(dataset, query, nbr, ip_distance);
-      beam.push_back({d, nbr});
+      insert_sorted_beam(beam, {d, nbr}, beam_width);
       all_visited.push_back({d, nbr});
     }
-    std::sort(beam.begin(), beam.end(), candidate_id_less);
-    if (beam.size() > beam_width) beam.resize(beam_width);
   }
   std::sort(all_visited.begin(), all_visited.end(), candidate_id_less);
   return all_visited;
@@ -363,17 +332,100 @@ vec<u32> robust_prune(const Dataset& dataset,
   return selected;
 }
 
+void consolidate_reverse_edges(VamanaGraph& graph,
+                               const Dataset& dataset,
+                               const VamanaBuildConfig& config,
+                               size_t num_threads,
+                               float build_alpha) {
+  const size_t n = graph.num_nodes;
+  std::cerr << "building reverse-edge CSR for bulk consolidation...\n";
+
+  std::unique_ptr<std::atomic<u32>[]> incoming_counts(new std::atomic<u32>[n]);
+  parallel_for(static_cast<size_t>(0), n, num_threads, [&](size_t node, size_t) {
+    incoming_counts[node].store(0, std::memory_order_relaxed);
+  });
+
+  parallel_for(static_cast<size_t>(0), n, num_threads, [&](size_t source, size_t) {
+    const size_t base = graph.offset(source);
+    const u8 degree = graph.degree(source);
+    for (u8 i = 0; i < degree; ++i) {
+      const u32 target = graph.neighbors[base + i];
+      if (target < n && target != source) {
+        incoming_counts[target].fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  });
+
+  vec<u64> incoming_offsets(n + 1, 0);
+  for (size_t node = 0; node < n; ++node) {
+    incoming_offsets[node + 1] = incoming_offsets[node] +
+        incoming_counts[node].load(std::memory_order_relaxed);
+  }
+  const u64 total_incoming = incoming_offsets.back();
+  std::cerr << "bulk reverse consolidation memory: incoming_edges=" << total_incoming
+            << " edge_bytes=" << total_incoming * sizeof(u32)
+            << " offset_bytes=" << incoming_offsets.size() * sizeof(u64)
+            << " count_bytes=" << n * sizeof(std::atomic<u32>) << "\n";
+
+  vec<u32> incoming_edges(static_cast<size_t>(total_incoming));
+  parallel_for(static_cast<size_t>(0), n, num_threads, [&](size_t node, size_t) {
+    incoming_counts[node].store(0, std::memory_order_relaxed);
+  });
+  parallel_for(static_cast<size_t>(0), n, num_threads, [&](size_t source, size_t) {
+    const size_t base = graph.offset(source);
+    const u8 degree = graph.degree(source);
+    for (u8 i = 0; i < degree; ++i) {
+      const u32 target = graph.neighbors[base + i];
+      if (target >= n || target == source) continue;
+      const u32 slot = incoming_counts[target].fetch_add(1, std::memory_order_relaxed);
+      incoming_edges[static_cast<size_t>(incoming_offsets[target] + slot)] = static_cast<u32>(source);
+    }
+  });
+  incoming_counts.reset();
+
+  ProgressReporter reverse_progress{"Bulk reverse-edge consolidation", n};
+  parallel_for(static_cast<size_t>(0), n, num_threads, [&](size_t node, size_t) {
+    vec<u32> candidate_ids;
+    const u8 outgoing_degree = graph.degree(node);
+    const u64 incoming_begin = incoming_offsets[node];
+    const u64 incoming_end = incoming_offsets[node + 1];
+    candidate_ids.reserve(static_cast<size_t>(outgoing_degree) +
+                          static_cast<size_t>(incoming_end - incoming_begin));
+
+    const size_t base = graph.offset(node);
+    for (u8 i = 0; i < outgoing_degree; ++i) {
+      const u32 candidate = graph.neighbors[base + i];
+      if (candidate != node && candidate < n) candidate_ids.push_back(candidate);
+    }
+    for (u64 pos = incoming_begin; pos < incoming_end; ++pos) {
+      const u32 candidate = incoming_edges[static_cast<size_t>(pos)];
+      if (candidate != node) candidate_ids.push_back(candidate);
+    }
+
+    std::sort(candidate_ids.begin(), candidate_ids.end());
+    candidate_ids.erase(std::unique(candidate_ids.begin(), candidate_ids.end()), candidate_ids.end());
+
+    vec<std::pair<float, u32>> prune_candidates;
+    prune_candidates.reserve(candidate_ids.size());
+    for (u32 candidate : candidate_ids) {
+      prune_candidates.push_back({dataset_distance(dataset, node, candidate, config.ip_distance), candidate});
+    }
+    std::sort(prune_candidates.begin(), prune_candidates.end(), candidate_id_less);
+    graph.set_neighbors(node, robust_prune(dataset, static_cast<u32>(node), prune_candidates,
+                                           build_alpha, graph.R, config.ip_distance));
+    reverse_progress.increment();
+  });
+  reverse_progress.finish();
+}
+
 void build_vamana_graph(VamanaGraph& graph,
                         const Dataset& dataset,
-                        const VamanaBuildConfig& config,
-                        BuilderGpuContext* gpu_contexts,
-                        size_t num_gpu_contexts) {
+                        const VamanaBuildConfig& config) {
   const size_t n = dataset.size();
   const u32 R = config.R;
   const float alpha = static_cast<float>(config.alpha);
   const u32 beam_width = config.beam_width;
   const size_t num_threads = effective_thread_count(config.threads);
-  const bool use_gpu = num_gpu_contexts > 0 && !config.ip_distance;
 
   graph.init(n, dataset.dim, R);
 
@@ -388,8 +440,9 @@ void build_vamana_graph(VamanaGraph& graph,
   std::shuffle(order.begin(), order.end(), rng);
 
   std::cerr << "initializing random R-regular graph (degree=" << R << ")...\n";
-  parallel_for(static_cast<size_t>(0), n, num_threads, [&](size_t i, size_t tid) {
-    std::mt19937 init_rng(static_cast<u32>(seed + 1 + tid * 1315423911u));
+  parallel_for(static_cast<size_t>(0), n, num_threads, [&](size_t i, size_t) {
+    const u64 node_seed = mix_seed(static_cast<u64>(seed) ^ static_cast<u64>(i));
+    std::mt19937 init_rng(static_cast<u32>(node_seed ^ (node_seed >> 32)));
     std::uniform_int_distribution<u32> dist(0, static_cast<u32>(n - 1));
     vec<u32> initial;
     initial.reserve(R);
@@ -405,19 +458,39 @@ void build_vamana_graph(VamanaGraph& graph,
     graph.set_neighbors(i, initial);
   });
 
+  const size_t signature_sample = std::min<size_t>(n, 4096);
+  std::unordered_set<u64> neighbor_signatures;
+  neighbor_signatures.reserve(signature_sample * 2);
+  vec<u32> signature_neighbors;
+  for (size_t i = 0; i < signature_sample; ++i) {
+    graph.copy_neighbors(i, signature_neighbors);
+    u64 signature = 1469598103934665603ULL;
+    for (u32 neighbor : signature_neighbors) {
+      signature ^= neighbor;
+      signature *= 1099511628211ULL;
+    }
+    neighbor_signatures.insert(signature);
+  }
+  const double unique_signature_ratio = signature_sample == 0
+      ? 1.0
+      : static_cast<double>(neighbor_signatures.size()) / static_cast<double>(signature_sample);
+  std::cerr << "random graph unique neighbor signature ratio=" << unique_signature_ratio
+            << " sample=" << signature_sample << "\n";
+  lib_assert(unique_signature_ratio >= 0.99,
+             "random graph initialization produced too many duplicate neighbor lists");
+
   const float build_alpha = 1.0f;
   if (alpha > 1.0f + 1e-6f) {
     std::cerr << "note: using alpha=1.0 for construction (config alpha="
               << alpha << " stored in metadata)\n";
   }
-  std::cerr << "reverse edge maintenance: bounded immediate\n";
+  std::cerr << "reverse edge maintenance: cheap append plus bulk consolidation\n";
 
   ProgressReporter progress{"Building Vamana graph", n};
-  parallel_for(static_cast<size_t>(0), n, num_threads, [&](size_t step, size_t tid) {
+  parallel_for(static_cast<size_t>(0), n, num_threads, [&](size_t step, size_t) {
     const u32 node_idx = order[step];
-    BuilderGpuContext* gpu_ctx = (use_gpu && tid < num_gpu_contexts) ? &gpu_contexts[tid] : nullptr;
 
-    auto candidates = beam_search(graph, dataset, node_idx, beam_width, config.ip_distance, gpu_ctx);
+    auto candidates = beam_search(graph, dataset, node_idx, beam_width, config.ip_distance);
 
     vec<u32> existing_neighbors;
     {
@@ -435,28 +508,15 @@ void build_vamana_graph(VamanaGraph& graph,
       graph.set_neighbors(node_idx, new_neighbors);
     }
 
-    vec<u32> nbr_list;
     for (u32 nbr : new_neighbors) {
       NodeLockGuard lock(graph, nbr);
-      if (graph.contains_neighbor_unlocked(nbr, node_idx)) continue;
-      graph.copy_neighbors(nbr, nbr_list);
-      if (nbr_list.size() < R) {
-        nbr_list.push_back(node_idx);
-        graph.set_neighbors(nbr, nbr_list);
-      } else {
-        vec<std::pair<float, u32>> prune_candidates;
-        prune_candidates.reserve(nbr_list.size() + 1);
-        for (u32 existing : nbr_list) {
-          prune_candidates.push_back({dataset_distance(dataset, nbr, existing, config.ip_distance), existing});
-        }
-        prune_candidates.push_back({dataset_distance(dataset, nbr, node_idx, config.ip_distance), node_idx});
-        sort_and_unique_candidates(prune_candidates);
-        graph.set_neighbors(nbr, robust_prune(dataset, nbr, prune_candidates, build_alpha, R, config.ip_distance));
-      }
+      graph.try_append_neighbor_unlocked(nbr, node_idx);
     }
     progress.increment();
   });
   progress.finish();
+
+  consolidate_reverse_edges(graph, dataset, config, num_threads, build_alpha);
 
   size_t total_edges = 0;
   size_t max_edges = 0;
@@ -493,7 +553,7 @@ void build_vamana_graph(VamanaGraph& graph,
       std::unordered_set<u32> gt;
       for (size_t i = 0; i < topk && i < all_dists.size(); ++i) gt.insert(all_dists[i].second);
 
-      auto results = beam_search(graph, dataset, qid, beam_width, config.ip_distance, nullptr);
+      auto results = beam_search(graph, dataset, qid, beam_width, config.ip_distance);
       size_t hits = 0;
       for (size_t i = 0; i < topk && i < results.size(); ++i) {
         if (gt.count(results[i].second)) ++hits;
