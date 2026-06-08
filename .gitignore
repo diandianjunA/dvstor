@@ -1,2 +1,13 @@
 build/
 .cache/
+*.log
+__pycache__/
+*.pyc
+*.pyo
+compile_commands.json
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
