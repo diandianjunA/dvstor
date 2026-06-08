@@ -88,6 +88,8 @@
             if (unvisited.empty()) continue;
 
             const u32 n_batch = unvisited.size();
+            const bool use_gpu_vector_cache_path =
+                gpu_vector_cache_ != nullptr && gpu_vector_cache_->gpu_buffer_registered();
             const bool use_indirect_candidate_path =
                 use_gpudirect_candidate_rdma && thread->reserved_query_state[1] != nullptr;
             uint8_t* query_staging_vecs = nullptr;
@@ -96,7 +98,100 @@
             miss_ptrs.clear();
             miss_indices.clear();
 
-            if (use_indirect_candidate_path) {
+            if (use_gpu_vector_cache_path) {
+                // ── GPU Vector Cache path ───────────────────────────────
+                // NOTE: The cache is safe under the current single-threaded
+                // coroutine model where all coroutines on one ComputeThread
+                // execute sequentially.  If the cache is shared across
+                // threads, there is a TOCTOU window between find() returning
+                // a slot_id and the GPU kernel reading d_candidate_ptrs:
+                // another thread could evict the slot via allocate_slot.
+                // Cross-thread safety would require a read-side epoch or RCU.
+                gs.flip_query_candidate_buffer();
+                query_staging_vecs = gs.current_query_candidate_vecs();
+                const u32 query_staging_lkey = gs.current_query_candidate_vecs_lkey();
+
+                struct CacheMissEntry {
+                    RemotePtr rptr;
+                    int32_t slot;
+                    u32 batch_idx;
+                };
+                vec<CacheMissEntry> cache_slot_misses;  // RDMA → cache slot
+                vec<CacheMissEntry> staging_misses;      // RDMA → staging (fallback)
+                cache_slot_misses.reserve(n_batch);
+                staging_misses.reserve(n_batch);
+
+                // Step 1: Check cache for all unvisited nodes
+                for (u32 i = 0; i < n_batch; ++i) {
+                    int32_t slot = gpu_vector_cache_->find(unvisited[i]);
+                    if (slot >= 0) {
+                        // Cache hit — vector already on GPU
+                        gs.h_candidate_ptrs[i] = gpu_vector_cache_->gpu_slot_ptr(slot);
+                        thread->stats.gpu_vector_cache_hits++;
+                    } else {
+                        thread->stats.gpu_vector_cache_misses++;
+                        // Try to reserve a cache slot for direct RDMA
+                        int32_t new_slot = gpu_vector_cache_->allocate_slot(unvisited[i]);
+                        if (new_slot >= 0) {
+                            cache_slot_misses.push_back({unvisited[i], new_slot, i});
+                        } else {
+                            staging_misses.push_back({unvisited[i], -1, i});
+                        }
+                    }
+                }
+
+                // Step 2: Build RDMA destinations (single batch)
+                vec<rdma::vamana::BatchReadDestination> destinations;
+                destinations.reserve(cache_slot_misses.size() + staging_misses.size());
+
+                for (auto& m : cache_slot_misses) {
+                    miss_ptrs.push_back(m.rptr);
+                    miss_indices.push_back(m.batch_idx);
+                    destinations.push_back(rdma::vamana::BatchReadDestination{
+                        gpu_vector_cache_->gpu_slot_addr(m.slot),
+                        gpu_vector_cache_->gpu_buffer_lkey(thread->ctx->context.get_protection_domain()),
+                        nullptr,
+                        true});
+                }
+                for (auto& m : staging_misses) {
+                    miss_ptrs.push_back(m.rptr);
+                    miss_indices.push_back(m.batch_idx);
+                    auto* staging = query_staging_vecs
+                                  + static_cast<size_t>(m.batch_idx) * VamanaNode::vector_bytes();
+                    gs.h_candidate_ptrs[m.batch_idx] = staging;
+                    destinations.push_back(rdma::vamana::BatchReadDestination{
+                        reinterpret_cast<u64>(staging),
+                        query_staging_lkey,
+                        nullptr,
+                        true});
+                }
+
+                // Step 3: Batch RDMA read
+                if (!miss_ptrs.empty()) {
+                    const auto t_vector_fetch = std::chrono::steady_clock::now();
+                    auto vec_read = co_await rdma::vamana::batch_read_vectors(
+                        miss_ptrs, thread, &destinations);
+                    (void)vec_read;
+                    add_breakdown_subcategory(thread,
+                        service::breakdown::Subcategory::rdma_vector_fetch, t_vector_fetch);
+                    thread->stats.query_rdma_to_staging_bytes +=
+                        static_cast<u64>(miss_ptrs.size()) * VamanaNode::vector_bytes();
+
+                    // Step 4: Commit cache slots (vectors now in GPU via GPUDirect RDMA)
+                    for (auto& m : cache_slot_misses) {
+                        gpu_vector_cache_->commit_slot(m.slot, m.rptr);
+                        gs.h_candidate_ptrs[m.batch_idx] =
+                            gpu_vector_cache_->gpu_slot_ptr(m.slot);
+                    }
+                }
+
+                // Step 5: H2D copy of d_candidate_ptrs
+                cudaMemcpyAsync(const_cast<void**>(gs.d_candidate_ptrs), gs.h_candidate_ptrs,
+                                static_cast<size_t>(n_batch) * sizeof(void*),
+                                cudaMemcpyHostToDevice, gs.stream);
+                track_query_h2d(thread, static_cast<u64>(n_batch) * sizeof(void*));
+
+            } else if (use_indirect_candidate_path) {
                 gs.flip_query_candidate_buffer();
                 query_staging_vecs = gs.current_query_candidate_vecs();
                 const u32 query_staging_lkey = gs.current_query_candidate_vecs_lkey();
@@ -164,7 +259,7 @@
             }
 
             const auto t_gpu_distance = std::chrono::steady_clock::now();
-            if (use_indirect_candidate_path) {
+            if (use_gpu_vector_cache_path || use_indirect_candidate_path) {
                 gpu::launch_batch_typed_query_l2_distances_indirect(
                     gs.stream, gs.event,
                     gs.d_query, static_cast<u32>(query_dtype),

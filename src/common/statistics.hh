@@ -90,6 +90,8 @@ struct CNStatistics {
   size_t query_visited_neighborlists{};
   size_t neighbor_cache_hits{};
   size_t neighbor_cache_misses{};
+  size_t gpu_vector_cache_hits{};
+  size_t gpu_vector_cache_misses{};
 
   size_t processed_queries{};
   size_t processed_inserts{};
@@ -139,6 +141,8 @@ struct CNStatistics {
     query_visited_neighborlists += other.query_visited_neighborlists;
     neighbor_cache_hits += other.neighbor_cache_hits;
     neighbor_cache_misses += other.neighbor_cache_misses;
+    gpu_vector_cache_hits += other.gpu_vector_cache_hits;
+    gpu_vector_cache_misses += other.gpu_vector_cache_misses;
   }
 
   void convert(Statistics& statistics) const {
@@ -175,6 +179,8 @@ struct CNStatistics {
     statistics.add_nested_static_stat(query_group, "visited_neighborlists", query_visited_neighborlists);
     statistics.add_nested_static_stat(query_group, "neighbor_cache_hits", neighbor_cache_hits);
     statistics.add_nested_static_stat(query_group, "neighbor_cache_misses", neighbor_cache_misses);
+    statistics.add_nested_static_stat(query_group, "gpu_vector_cache_hits", gpu_vector_cache_hits);
+    statistics.add_nested_static_stat(query_group, "gpu_vector_cache_misses", gpu_vector_cache_misses);
     statistics.add_nested_static_stat(query_group, "processed", processed_queries);
     statistics.add_nested_static_stat(query_group, "queue_wait_ns", query_queue_wait_ns);
 
@@ -237,6 +243,8 @@ struct ThreadStatistics {
   size_t query_host_staging_fallback_bytes{0};
   size_t neighbor_cache_hits{0};
   size_t neighbor_cache_misses{0};
+  size_t gpu_vector_cache_hits{0};
+  size_t gpu_vector_cache_misses{0};
   size_t reserved_counter_slots[7]{};
 
   void inc_visited_nodes(u32 level) {

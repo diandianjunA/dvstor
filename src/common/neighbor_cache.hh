@@ -80,10 +80,12 @@ private:
         u8* entries;          // flat array: entry_size_ * num_entries bytes
         size_t num_entries;
         size_t clock_hand{0};
-        mutable std::atomic<u64> hits{0};
-        mutable std::atomic<u64> misses{0};
-        mutable std::atomic<u64> evictions{0};
-        mutable std::atomic<u64> inserts{0};
+        // Statistics — each on its own cache line to eliminate false sharing
+        // between readers (hits/misses) and writers (inserts/evictions).
+        alignas(64) mutable std::atomic<u64> hits{0};
+        alignas(64) mutable std::atomic<u64> misses{0};
+        alignas(64) mutable std::atomic<u64> evictions{0};
+        alignas(64) mutable std::atomic<u64> inserts{0};
     };
 
     static u64 hash_key(RemotePtr key);
@@ -204,11 +206,10 @@ inline bool NeighborCache::find(RemotePtr key, RemotePtr* out_buffer, u8& out_co
             continue;  // different key
         }
 
-        // Potential match — read data under seqlock
+        // Potential match — read data under seqlock.
+        // seq1.load(acquire) already prevents subsequent reads from being
+        // reordered before it (both compiler barrier and CPU acquire semantic).
         u32 seq1 = seq_atomic.load(std::memory_order_acquire);
-        // Acquire fence prevents data reads from being reordered before seq read,
-        // and also prevents them from moving after the re-validation below.
-        std::atomic_thread_fence(std::memory_order_acquire);
 
         u8 count = entry_count(entry);
         const RemotePtr* neighbors_ptr = entry_neighbors(entry);

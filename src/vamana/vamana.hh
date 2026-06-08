@@ -20,6 +20,7 @@
 #include "common/debug.hh"
 #include "common/distance.hh"
 #include "common/neighbor_cache.hh"
+#include "gpu/gpu_vector_cache.hh"
 #include "common/types.hh"
 #include "compute_thread.hh"
 #include "coroutine.hh"
@@ -70,6 +71,9 @@ public:
     void set_neighbor_cache(NeighborCache* cache) { neighbor_cache_ = cache; }
     NeighborCache* neighbor_cache() const { return neighbor_cache_; }
 
+    void set_gpu_vector_cache(GpuVectorCache* cache) { gpu_vector_cache_ = cache; }
+    GpuVectorCache* gpu_vector_cache() const { return gpu_vector_cache_; }
+
     // =========================================================================
     // Search (knn)
     // =========================================================================
@@ -87,6 +91,7 @@ private:
     const u32 dim_;
     const bool direct_node_reads_;
     NeighborCache* neighbor_cache_;
+    GpuVectorCache* gpu_vector_cache_{nullptr};
 };
 
 }  // namespace vamana

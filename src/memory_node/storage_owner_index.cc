@@ -527,15 +527,19 @@ vec<RemotePtr> MemoryNode::beam_search_candidates(const span<const element_t> qu
   beam.push_back({medoid, medoid_dist, false});
   visited.insert(medoid);
 
+#ifdef DVSTOR_DEBUG_SHARD_LOCALITY
   // DEBUG: per-insert shard locality summary
   static std::atomic<u32> insert_seq{0};
   u32 this_insert = insert_seq.fetch_add(1, std::memory_order_relaxed);
   bool should_log = (this_insert < 5) || (this_insert % 500 == 0);
   u32 iter_count = 0;
   u32 local_unvisited_sum = 0, remote_unvisited_sum = 0;
+#endif
 
   for (;;) {
+#ifdef DVSTOR_DEBUG_SHARD_LOCALITY
     ++iter_count;
+#endif
     i32 best_idx = -1;
     distance_t best_dist = std::numeric_limits<distance_t>::max();
     auto t_select = std::chrono::steady_clock::now();
@@ -560,17 +564,23 @@ vec<RemotePtr> MemoryNode::beam_search_candidates(const span<const element_t> qu
     }
     vec<RemotePtr> unvisited_neighbors;
     unvisited_neighbors.reserve(neighbors.size());
+#ifdef DVSTOR_DEBUG_SHARD_LOCALITY
     u32 iter_local = 0, iter_remote = 0;
+#endif
     for (const RemotePtr& neighbor : neighbors) {
       if (neighbor.is_null() || visited.contains(neighbor)) {
         continue;
       }
       visited.insert(neighbor);
       unvisited_neighbors.push_back(neighbor);
+#ifdef DVSTOR_DEBUG_SHARD_LOCALITY
       if (local_shard(neighbor.memory_node())) ++iter_local; else ++iter_remote;
+#endif
     }
+#ifdef DVSTOR_DEBUG_SHARD_LOCALITY
     local_unvisited_sum += iter_local;
     remote_unvisited_sum += iter_remote;
+#endif
 
     const u32 snapshot_batch = storage_owner_snapshot_batch_size(config);
     const u32 construction_width = storage_owner_construction_width(config);
@@ -599,6 +609,7 @@ vec<RemotePtr> MemoryNode::beam_search_candidates(const span<const element_t> qu
     }
   }
 
+#ifdef DVSTOR_DEBUG_SHARD_LOCALITY
   // DEBUG: per-insert summary
   if (should_log) {
     u32 total = local_unvisited_sum + remote_unvisited_sum;
@@ -611,6 +622,7 @@ vec<RemotePtr> MemoryNode::beam_search_candidates(const span<const element_t> qu
               << " local_pct=" << local_pct << "%"
               << std::endl;
   }
+#endif
 
   vec<RemotePtr> candidates;
   candidates.reserve(beam.size());
@@ -649,15 +661,19 @@ auto MemoryNode::beam_search_candidates_async(const span<const element_t> query,
   beam.push_back({medoid, medoid_dist, false});
   visited.insert(medoid);
 
+#ifdef DVSTOR_DEBUG_SHARD_LOCALITY
   // DEBUG: per-insert per-shard distribution
   static std::atomic<u32> async_insert_seq{0};
   u32 this_insert_a = async_insert_seq.fetch_add(1, std::memory_order_relaxed);
   bool should_log_a = (this_insert_a < 5) || (this_insert_a % 500 == 0);
   u32 iter_count_a = 0;
   u32 shard_hist[6] = {0};  // [0..3]=remote by shard, [4]=local(self), [5]=total expanded
+#endif
 
   for (;;) {
+#ifdef DVSTOR_DEBUG_SHARD_LOCALITY
     ++iter_count_a;
+#endif
     i32 best_idx = -1;
     distance_t best_dist = std::numeric_limits<distance_t>::max();
     auto t_select = std::chrono::steady_clock::now();
@@ -682,17 +698,23 @@ auto MemoryNode::beam_search_candidates_async(const span<const element_t> query,
     }
     vec<RemotePtr> unvisited_neighbors;
     unvisited_neighbors.reserve(neighbors.size());
+#ifdef DVSTOR_DEBUG_SHARD_LOCALITY
     u32 expanded_shard = beam[best_idx].rptr.memory_node();
+#endif
     for (const RemotePtr& neighbor : neighbors) {
       if (neighbor.is_null() || visited.contains(neighbor)) {
         continue;
       }
       visited.insert(neighbor);
       unvisited_neighbors.push_back(neighbor);
+#ifdef DVSTOR_DEBUG_SHARD_LOCALITY
       u32 ns = neighbor.memory_node();
       if (ns == storage_id_) ++shard_hist[4]; else ++shard_hist[ns];
+#endif
     }
+#ifdef DVSTOR_DEBUG_SHARD_LOCALITY
     ++shard_hist[5];
+#endif
 
     const u32 snapshot_batch = storage_owner_snapshot_batch_size(config);
     const u32 construction_width = storage_owner_construction_width(config);
@@ -721,6 +743,7 @@ auto MemoryNode::beam_search_candidates_async(const span<const element_t> query,
     }
   }
 
+#ifdef DVSTOR_DEBUG_SHARD_LOCALITY
   // DEBUG: per-insert per-shard summary
   if (should_log_a) {
     u32 total_neighbors = 0;
@@ -737,6 +760,7 @@ auto MemoryNode::beam_search_candidates_async(const span<const element_t> query,
     }
     std::cerr << std::endl;
   }
+#endif
 
   auto& out = storage_owner_async_candidates_[thread.id][thread.running_coroutine];
   out.clear();
