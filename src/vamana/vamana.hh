@@ -76,8 +76,11 @@ public:
 
 public:
     void set_prefetch_pipeline(bool v) { prefetch_pipeline_ = v; }
+    void set_expansion_batch(u32 k) { expansion_batch_ = k; }
+    u32 expansion_batch() const { return expansion_batch_; }
 
 private:
+    u32 expansion_batch_{1};
     const u32 R_;
     const u32 beam_width_;
     const u32 beam_width_construction_;

@@ -49,13 +49,15 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     config_.R, config_.beam_width, config_.beam_width_construction,
     config_.alpha, config_.k, config_.dim, config_.resolved_vector_dtype());
   vamana_->set_prefetch_pipeline(config_.prefetch_pipeline);
+  vamana_->set_expansion_batch(config_.expansion_batch);
 
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,
                                               config_.max_send_queue_wr,
                                               static_cast<u64>(config_.cn_memory_gb) * 1073741824ul);
   worker_pool_->allocate_worker_threads(context_, cm_, remote_access_tokens_, config_.num_coroutines);
   // Initialize GPU buffers for each compute thread
-  const u32 max_batch = std::max(config_.beam_width, config_.beam_width_construction);
+  const u32 max_batch = std::max(config_.beam_width * config_.expansion_batch,
+                                   config_.beam_width_construction);
   for (u32 tid = 0; tid < compute_threads().size(); ++tid) {
     auto& thread = compute_threads()[tid];
     thread->gpu_buffers.init(config_.num_coroutines,

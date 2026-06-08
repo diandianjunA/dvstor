@@ -40,6 +40,7 @@ public:
   u32 gpu_device{};       // CUDA device ID
   bool gpudirect_rdma{};  // Enable GPUDirect RDMA (read vectors directly into GPU buffers)
   bool prefetch_pipeline{};  // Enable two-stage RDMA prefetch pipeline (neighbour + vector overlapped with GPU)
+  u32 expansion_batch{1};   // Batch K beam expansions per iteration (1=serial, 8=batched)
   str vector_data_type{"auto"};
   str insert_execution{"compute"};
   u32 insert_workers{};
@@ -188,6 +189,8 @@ private:
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
       "prefetch-pipeline", po::bool_switch(&prefetch_pipeline)->default_value(false),
       "Enable two-stage RDMA prefetch pipeline: overlap neighbour+vector RDMA with GPU compute.")(
+      "expansion-batch,K", po::value<u32>(&expansion_batch)->default_value(1),
+      "Number of beam nodes expanded per iteration. K=1 is serial search; K=8 batches 8 expansions into one GPU kernel + D2H transfer.")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
       "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
@@ -373,6 +376,7 @@ public:
       os << std::setw(width) << "GPU device: " << config.gpu_device << std::endl;
       os << std::setw(width) << "GPUDirect RDMA: " << (config.gpudirect_rdma ? "true" : "false") << std::endl;
       os << std::setw(width) << "Prefetch Pipeline: " << (config.prefetch_pipeline ? "true" : "false") << std::endl;
+      os << std::setw(width) << "Expansion Batch (K): " << config.expansion_batch << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {
       os << std::left << std::setfill(' ');

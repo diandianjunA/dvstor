@@ -170,23 +170,53 @@ struct NeighborReadAwaitable {
     size_t read_size{0};
     const u_ptr<ComputeThread>* thread_ptr{nullptr};
 
+    NeighborReadAwaitable() = default;
+    NeighborReadAwaitable(byte_t* buf, size_t size, const u_ptr<ComputeThread>* tp)
+        : local_buffer(buf), read_size(size), thread_ptr(tp) {}
+
+    // Explicit move: the compiler-generated move would copy the raw
+    // local_buffer pointer without nulling the source, causing the
+    // source destructor to free the buffer (double-free / use-after-free).
+    NeighborReadAwaitable(NeighborReadAwaitable&& other) noexcept
+        : local_buffer(other.local_buffer)
+        , read_size(other.read_size)
+        , thread_ptr(other.thread_ptr) {
+        other.local_buffer = nullptr;
+    }
+    NeighborReadAwaitable& operator=(NeighborReadAwaitable&& other) noexcept {
+        if (this != &other) {
+            if (local_buffer && thread_ptr)
+                (*thread_ptr)->buffer_allocator.free_buffer(local_buffer, read_size);
+            local_buffer = other.local_buffer;
+            read_size = other.read_size;
+            thread_ptr = other.thread_ptr;
+            other.local_buffer = nullptr;
+        }
+        return *this;
+    }
+
     ~NeighborReadAwaitable() {
         // If the awaitable is destroyed without being awaited (e.g.,
         // overwritten by move-assignment or the coroutine frame is freed),
         // release the allocated RDMA buffer back to the freelist.
+        // After a proper move, local_buffer is nullptr → no-op.
         if (local_buffer && thread_ptr) {
             (*thread_ptr)->buffer_allocator.free_buffer(local_buffer, read_size);
         }
     }
 
     bool valid() const { return local_buffer != nullptr; }
-    bool await_ready() const { return false; }
+    bool await_ready() const { return ready_; }
     void await_suspend(std::coroutine_handle<>) {}
     s_ptr<VamanaNeighborlist> await_resume() {
         auto nlist = std::make_shared<VamanaNeighborlist>(local_buffer, read_size, thread_ptr->get());
-        local_buffer = nullptr;  // ownership transferred to VamanaNeighborlist
+        local_buffer = nullptr;
+        ready_ = false;
         return nlist;
     }
+    void mark_ready() { ready_ = true; }
+private:
+    bool ready_{false};
 };
 
 // NOTE: takes thread as a pointer (not reference) so the awaitable can be
@@ -224,14 +254,20 @@ inline NeighborReadAwaitable read_vamana_neighbors(RemotePtr node_rptr, const u_
                   0,
                   thread->create_wr_id());
 
-    return NeighborReadAwaitable{local_buffer, read_size, thread_ptr};
+    return NeighborReadAwaitable(local_buffer, read_size, thread_ptr);
 }
 
 struct VectorBatchReadAwaitable {
     VectorBatchReadResult result;
-    bool await_ready() const { return false; }
+    VectorBatchReadAwaitable() = default;
+    explicit VectorBatchReadAwaitable(VectorBatchReadResult r)
+        : result(std::move(r)) {}
+    bool await_ready() const { return ready_; }
     void await_suspend(std::coroutine_handle<>) {}
-    VectorBatchReadResult await_resume() { return std::move(result); }
+    VectorBatchReadResult await_resume() { ready_ = false; return std::move(result); }
+    void mark_ready() { ready_ = true; }
+private:
+    bool ready_{false};
 };
 
 inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rptrs,
@@ -282,7 +318,7 @@ inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rp
                       thread->create_wr_id());
     }
 
-    return VectorBatchReadAwaitable{VectorBatchReadResult{std::move(host_buffers), direct_to_gpu}};
+    return VectorBatchReadAwaitable(VectorBatchReadResult{std::move(host_buffers), direct_to_gpu});
 }
 
 inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rptrs,
