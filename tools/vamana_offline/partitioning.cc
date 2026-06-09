@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <deque>
 #include <limits>
-#include <numeric>
 #include <stdexcept>
+#include <utility>
 
 #ifndef DVSTOR_HAVE_METIS
 #define DVSTOR_HAVE_METIS 0
@@ -246,67 +246,118 @@ vec<u32> compute_bfs_partition(const vec<vec<u32>>& neighbors,
     stats->unique_edges = stats->input_edges;
   }
 
-  if (num_nodes == 0) {
+  if (num_nodes == 0) return parts;
+  if (num_parts == 1) {
+    if (stats != nullptr) stats->part_node_counts[0] = num_nodes;
     return parts;
   }
 
-  vec<byte_t> visited(num_nodes, 0);
-  vec<u32> bfs_order;
-  bfs_order.reserve(num_nodes);
-  std::deque<u32> queue;
+  const u32 safe_start = (start_node < num_nodes) ? start_node : 0;
 
-  const auto push_component = [&](u32 seed) {
-    if (seed >= num_nodes || visited[seed]) {
-      return;
-    }
-    visited[seed] = 1;
-    queue.push_back(seed);
-    while (!queue.empty()) {
-      const u32 node = queue.front();
-      queue.pop_front();
-      bfs_order.push_back(node);
-      for (u32 neighbor : neighbors[node]) {
-        if (neighbor < num_nodes && !visited[neighbor]) {
-          visited[neighbor] = 1;
-          queue.push_back(neighbor);
+  // ── Step 1: Select seeds via farthest-point heuristic ──
+  vec<u32> seeds;
+  seeds.reserve(num_parts);
+  seeds.push_back(safe_start);
+
+  const u32 kUnreachable = std::numeric_limits<u32>::max();
+  vec<u32> dist(num_nodes, kUnreachable);
+
+  auto bfs_update_distances = [&](u32 source) {
+    std::deque<u32> q;
+    dist[source] = 0;
+    q.push_back(source);
+    while (!q.empty()) {
+      const u32 node = q.front();
+      q.pop_front();
+      const u32 ndist = dist[node] + 1;
+      for (u32 nbr : neighbors[node]) {
+        if (nbr < num_nodes && dist[nbr] > ndist) {
+          dist[nbr] = ndist;
+          q.push_back(nbr);
         }
       }
     }
   };
 
-  push_component(start_node);
-  for (u32 node = 0; node < num_nodes; ++node) {
-    push_component(node);
+  bfs_update_distances(safe_start);
+
+  while (seeds.size() < num_parts) {
+    u32 farthest = 0;
+    u32 max_dist = 0;
+    for (size_t i = 0; i < num_nodes; ++i) {
+      if (dist[i] != kUnreachable && dist[i] > max_dist) {
+        max_dist = dist[i];
+        farthest = static_cast<u32>(i);
+      }
+    }
+    seeds.push_back(farthest);
+    bfs_update_distances(farthest);
   }
 
-  for (size_t order_idx = 0; order_idx < bfs_order.size(); ++order_idx) {
-    u32 part = static_cast<u32>((order_idx * static_cast<size_t>(num_parts)) / num_nodes);
-    if (part >= num_parts) {
-      part = num_parts - 1;
+  // ── Step 2: Multi-source BFS with load balancing ──
+  const u32 kUnassigned = std::numeric_limits<u32>::max();
+  std::fill(parts.begin(), parts.end(), kUnassigned);
+
+  vec<byte_t> visited(num_nodes, 0);
+  vec<u32> shard_size(num_parts, 0);
+  const size_t target = num_nodes / num_parts;
+
+  std::deque<std::pair<u32, u32>> queue;
+  for (u32 s = 0; s < num_parts; ++s) {
+    queue.emplace_back(seeds[s], s);
+    visited[seeds[s]] = 1;
+  }
+
+  while (!queue.empty()) {
+    const auto [node, pref_shard] = queue.front();
+    queue.pop_front();
+
+    if (parts[node] != kUnassigned) continue;
+
+    u32 target_shard = pref_shard;
+    if (shard_size[pref_shard] >= target) {
+      target_shard = static_cast<u32>(
+          std::min_element(shard_size.begin(), shard_size.end()) - shard_size.begin());
     }
-    parts[bfs_order[order_idx]] = part;
-    if (stats != nullptr) {
-      ++stats->part_node_counts[part];
+
+    parts[node] = target_shard;
+    ++shard_size[target_shard];
+
+    for (u32 nbr : neighbors[node]) {
+      if (nbr < num_nodes && !visited[nbr]) {
+        visited[nbr] = 1;
+        queue.emplace_back(nbr, target_shard);
+      }
     }
   }
 
+  // ── Step 3: Assign leftovers (isolated components) ──
+  for (size_t i = 0; i < num_nodes; ++i) {
+    if (parts[i] == kUnassigned) {
+      const u32 s = static_cast<u32>(
+          std::min_element(shard_size.begin(), shard_size.end()) - shard_size.begin());
+      parts[i] = s;
+      ++shard_size[s];
+    }
+  }
+
+  // ── Step 4: Compute stats ──
   if (stats != nullptr) {
+    for (u32 s = 0; s < num_parts; ++s) {
+      stats->part_node_counts[s] = shard_size[s];
+    }
     size_t total_edges = 0;
     size_t cut_edges = 0;
     for (size_t node = 0; node < neighbors.size(); ++node) {
       for (u32 neighbor : neighbors[node]) {
-        if (neighbor >= num_nodes) {
-          continue;
-        }
+        if (neighbor >= num_nodes) continue;
         ++total_edges;
-        if (parts[node] != parts[neighbor]) {
-          ++cut_edges;
-        }
+        if (parts[node] != parts[neighbor]) ++cut_edges;
       }
     }
     stats->edge_cut = cut_edges;
     stats->partition_cross_shard_ratio =
-      total_edges == 0 ? 0.0 : static_cast<double>(cut_edges) / static_cast<double>(total_edges);
+        total_edges == 0 ? 0.0 : static_cast<double>(cut_edges) / static_cast<double>(total_edges);
   }
 
   return parts;

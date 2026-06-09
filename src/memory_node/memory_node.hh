@@ -241,6 +241,44 @@ private:
                                         RemotePtr medoid,
                                         const Configuration& config,
                                         InsertBreakdownCounters* breakdown = nullptr);
+
+  // Transitive (handoff-based) beam search for storage_owner inserts.
+  // When enabled, exhausts local nodes first, then hands off to remote shards via RPC
+  // instead of fine-grained RDMA reads.
+
+  // Expand all local nodes in beam (helper for transitive search).
+  bool expand_all_local_nodes(vec<BeamEntry>& beam,
+                              hashset_t<RemotePtr>& visited,
+                              const span<const element_t> query,
+                              const Configuration& config,
+                              u32 local_shard_id,
+                              InsertBreakdownCounters* breakdown);
+  vec<RemotePtr> beam_search_candidates_transitive(const span<const element_t> query,
+                                                    RemotePtr medoid,
+                                                    const Configuration& config,
+                                                    InsertBreakdownCounters* breakdown);
+  StorageOwnerInsertCoroutine beam_search_candidates_transitive_async(
+      const span<const element_t> query,
+      RemotePtr medoid,
+      const Configuration& config,
+      StorageOwnerThread& thread,
+      InsertBreakdownCounters* breakdown);
+
+  // Process an incoming search handoff RPC from a peer storage node.
+  bool handle_search_handoff_rpc(u32 source_shard,
+                                 const service::storage_owner::SearchHandoffRequestHeader* req,
+                                 const byte_t* payload,
+                                 const Configuration& config);
+
+  // Send a search handoff request to a peer and wait for the response.
+  bool send_search_handoff(u32 target_shard,
+                           const byte_t* message,
+                           size_t message_bytes);
+  bool wait_for_search_handoff_response(u64 request_id,
+                                         u32 target_shard,
+                                         const Configuration& config,
+                                         vec<byte_t>& response_buffer);
+
   auto beam_search_candidates_async(const span<const element_t> query,
                                     RemotePtr medoid,
                                     const Configuration& config,
@@ -304,6 +342,7 @@ private:
   std::unique_ptr<LocalMemoryRegion> peer_scratch_region_;
   PeerRpcRuntimeState peer_rpc_runtime_;
   std::unordered_map<u64, service::storage_owner::PeerRpcHeader> peer_rpc_responses_;
+  std::unordered_map<u64, vec<byte_t>> peer_rpc_response_payloads_;
   std::mutex peer_rpc_mutex_;
   std::condition_variable peer_rpc_responses_cv_;
   std::mutex peer_rpc_send_mutex_;

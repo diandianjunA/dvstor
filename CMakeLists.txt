@@ -131,6 +131,20 @@ function(add_vamana_metis_repartitioner_target)
     target_link_metis(vamana_metis_repartitioner)
 endfunction()
 
+function(add_vamana_bfs_repartitioner_target)
+    add_executable(vamana_bfs_repartitioner
+        tools/vamana_bfs_repartitioner.cc
+        tools/vamana_offline/partitioning.cc
+    )
+    target_include_directories(vamana_bfs_repartitioner PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
+        ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
+    )
+    target_link_libraries(vamana_bfs_repartitioner rdma_library)
+endfunction()
+
 function(target_link_metis target_name)
     if (DVSTOR_HAVE_METIS)
         target_include_directories(${target_name} PRIVATE ${METIS_INCLUDE_DIR})
@@ -161,6 +175,7 @@ if (DVSTOR_STORAGE_NODE_ONLY)
 
     if (DVSTOR_BUILD_EXECUTABLES)
         add_vamana_metis_repartitioner_target()
+        add_vamana_bfs_repartitioner_target()
     endif ()
 else ()
     # GPU kernels library (compiled by nvcc)
@@ -243,6 +258,7 @@ else ()
         target_link_metis(vamana_offline_builder)
 
         add_vamana_metis_repartitioner_target()
+        add_vamana_bfs_repartitioner_target()
 
         add_executable(dvstor_breakdown_benchmark
             tools/dvstor_breakdown_benchmark.cc

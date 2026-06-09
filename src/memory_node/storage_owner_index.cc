@@ -9,6 +9,19 @@ namespace {
 using Configuration = configuration::IndexConfiguration;
 using NodeSnapshot = memory_node_detail::NodeSnapshot;
 using StorageOwnerThread = memory_node_detail::StorageOwnerThread;
+using BeamEntrySerialized = service::storage_owner::BeamEntrySerialized;
+using SearchHandoffRequestHeader = service::storage_owner::SearchHandoffRequestHeader;
+using SearchHandoffResponseHeader = service::storage_owner::SearchHandoffResponseHeader;
+using PeerRpcType = service::storage_owner::PeerRpcType;
+using InsertStatus = service::storage_owner::InsertStatus;
+static constexpr u32 kPeerRpcMagic = service::storage_owner::kPeerRpcMagic;
+using service::storage_owner::handoff_query_vector;
+using service::storage_owner::handoff_request_beam;
+using service::storage_owner::handoff_request_visited;
+using service::storage_owner::handoff_response_beam;
+using service::storage_owner::handoff_response_visited;
+using service::storage_owner::search_handoff_request_bytes;
+using service::storage_owner::search_handoff_response_bytes;
 
 size_t aligned_snapshot_bytes() {
   size_t value = VamanaNode::size_until_vector_end();
@@ -898,7 +911,9 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   }
 
   auto t_search = std::chrono::steady_clock::now();
-  auto search = beam_search_candidates_async(components, medoid_ptr, config, thread, &breakdown);
+  auto search = config.storage_owner_transitive_search
+      ? beam_search_candidates_transitive_async(components, medoid_ptr, config, thread, &breakdown)
+      : beam_search_candidates_async(components, medoid_ptr, config, thread, &breakdown);
   co_await std::suspend_always{};
   while (!search.handle.done()) {
     if (thread.is_ready(thread.running_coroutine)) {
@@ -1101,5 +1116,517 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
                 << std::endl;
     }
   }
+  return true;
+}
+
+// ─── Transitive (handoff-based) beam search ──────────────────────────
+
+// Expand ALL unexpanded local nodes in the beam.
+// Remote nodes are deferred (only added to beam with approximate distance).
+bool MemoryNode::expand_all_local_nodes(vec<BeamEntry>& beam,
+                                            hashset_t<RemotePtr>& visited,
+                                            const span<const element_t> query,
+                                            const Configuration& config,
+                                            u32 local_shard_id,
+                                            InsertBreakdownCounters* breakdown) {
+  bool any_expanded = false;
+  const u32 construction_width = storage_owner_construction_width(config);
+
+  for (;;) {
+    // Find best unexpanded LOCAL node
+    i32 best_idx = -1;
+    distance_t best_dist = std::numeric_limits<distance_t>::max();
+    auto t_select = std::chrono::steady_clock::now();
+    for (i32 i = 0; i < static_cast<i32>(beam.size()); ++i) {
+      if (!beam[i].expanded && beam[i].distance < best_dist) {
+        best_dist = beam[i].distance;
+        best_idx = i;
+      }
+    }
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_select_ns += elapsed_ns_since(t_select);
+    }
+    if (best_idx < 0) break;
+
+    const RemotePtr best_rptr = beam[best_idx].rptr;
+    // Only expand local nodes; break if the best candidate is remote
+    if (best_rptr.memory_node() != local_shard_id) break;
+
+    beam[best_idx].expanded = true;
+    any_expanded = true;
+
+    auto t_nbr = std::chrono::steady_clock::now();
+    const vec<RemotePtr> neighbors = read_neighbor_list(best_rptr);
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_neighbor_read_ns += elapsed_ns_since(t_nbr);
+    }
+
+    vec<RemotePtr> local_unvisited;
+    vec<RemotePtr> remote_unvisited;
+    for (const RemotePtr& neighbor : neighbors) {
+      if (neighbor.is_null() || visited.contains(neighbor)) continue;
+      visited.insert(neighbor);
+      if (neighbor.memory_node() == local_shard_id) {
+        local_unvisited.push_back(neighbor);
+      } else {
+        remote_unvisited.push_back(neighbor);
+      }
+    }
+
+    // Process local unvisited nodes: read snapshots, compute distances
+    const u32 snapshot_batch = storage_owner_snapshot_batch_size(config);
+    for (size_t begin = 0; begin < local_unvisited.size(); begin += snapshot_batch) {
+      const size_t end = std::min(local_unvisited.size(), begin + snapshot_batch);
+      vec<RemotePtr> batch(local_unvisited.begin() + begin, local_unvisited.begin() + end);
+      auto t_snap = std::chrono::steady_clock::now();
+      vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
+      if (breakdown != nullptr) {
+        breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snap);
+      }
+      for (const NodeSnapshot& snapshot : snapshots) {
+        auto t_dist = std::chrono::steady_clock::now();
+        const distance_t dist = distance_to_stored_vector(query, snapshot.vector_data.data(), config);
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_distance_ns += elapsed_ns_since(t_dist);
+        }
+        auto t_beam = std::chrono::steady_clock::now();
+        insert_into_beam(beam, snapshot.rptr, dist, construction_width);
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_beam_update_ns += elapsed_ns_since(t_beam);
+        }
+      }
+    }
+
+    // Defer remote nodes: add to beam with approximate distance (parent distance)
+    for (const RemotePtr& rptr : remote_unvisited) {
+      insert_into_beam(beam, rptr, best_dist, construction_width);
+    }
+  }
+
+  return any_expanded;
+}
+
+
+// Synchronous version of transitive beam search.
+vec<RemotePtr> MemoryNode::beam_search_candidates_transitive(
+    const span<const element_t> query,
+    RemotePtr medoid,
+    const Configuration& config,
+    InsertBreakdownCounters* breakdown) {
+
+  hashset_t<RemotePtr> visited;
+  vec<BeamEntry> beam;
+
+  auto t_snap = std::chrono::steady_clock::now();
+  NodeSnapshot medoid_snap;
+  read_node_snapshot(medoid, medoid_snap);
+  if (breakdown != nullptr) {
+    breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snap);
+  }
+  auto t_dist = std::chrono::steady_clock::now();
+  const distance_t medoid_dist = distance_to_stored_vector(query, medoid_snap.vector_data.data(), config);
+  if (breakdown != nullptr) {
+    breakdown->storage_owner_search_distance_ns += elapsed_ns_since(t_dist);
+  }
+
+  beam.push_back({medoid, medoid_dist, false});
+  visited.insert(medoid);
+
+  vec<byte_t> shard_searched(config.num_server_nodes(), 0);
+  shard_searched[storage_id_] = 1;
+
+  for (;;) {
+    expand_all_local_nodes(beam, visited, query, config, storage_id_, breakdown);
+
+    i32 best_idx = -1;
+    distance_t best_dist = std::numeric_limits<distance_t>::max();
+    for (i32 i = 0; i < static_cast<i32>(beam.size()); ++i) {
+      if (!beam[i].expanded && beam[i].distance < best_dist) {
+        best_dist = beam[i].distance;
+        best_idx = i;
+      }
+    }
+    if (best_idx < 0) break;
+
+    const u32 target_shard = beam[best_idx].rptr.memory_node();
+    if (target_shard >= config.num_server_nodes()) break;
+
+    if (shard_searched[target_shard]) {
+      beam[best_idx].expanded = true;
+      continue;
+    }
+
+    // Build handoff request
+    vec<BeamEntrySerialized> beam_ser;
+    vec<u64> visited_ser;
+    beam_ser.reserve(beam.size());
+    visited_ser.reserve(visited.size());
+    for (const auto& entry : beam) {
+      if (!entry.expanded) {
+        beam_ser.push_back({entry.rptr.raw_address, entry.distance});
+      }
+    }
+    for (auto it = visited.begin(); it != visited.end(); ++it) {
+      visited_ser.push_back(it->raw_address);
+    }
+
+    const u32 vector_bytes = VamanaNode::vector_bytes();
+    const size_t payload_bytes =
+        static_cast<size_t>(vector_bytes) +
+        beam_ser.size() * sizeof(BeamEntrySerialized) +
+        visited_ser.size() * sizeof(u64);
+
+    vec<byte_t> msg(sizeof(SearchHandoffRequestHeader) + payload_bytes);
+    auto* req = reinterpret_cast<SearchHandoffRequestHeader*>(msg.data());
+    req->rpc.magic = kPeerRpcMagic;
+    req->rpc.type = static_cast<u32>(PeerRpcType::search_handoff_request);
+    req->rpc.source_shard = storage_id_;
+    req->rpc.item_count = static_cast<u32>(beam_ser.size());
+    req->rpc.request_id = next_peer_request_id_.fetch_add(1, std::memory_order_relaxed);
+    req->rpc.status = static_cast<u32>(InsertStatus::failed);
+    req->rpc.reserved = 0;
+    req->beam_width = storage_owner_construction_width(config);
+    req->snapshot_batch = storage_owner_snapshot_batch_size(config);
+    req->originator_shard = storage_id_;
+    
+    req->visited_count = static_cast<u32>(visited_ser.size());
+    req->vector_bytes = vector_bytes;
+    req->reserved = 0;
+
+    std::memcpy(handoff_query_vector(req), query.data(), vector_bytes);
+    auto* beam_out = handoff_request_beam(req, vector_bytes);
+    std::memcpy(beam_out, beam_ser.data(), beam_ser.size() * sizeof(BeamEntrySerialized));
+    auto* visited_out = handoff_request_visited(req, vector_bytes, static_cast<u32>(beam_ser.size()));
+    std::memcpy(visited_out, visited_ser.data(), visited_ser.size() * sizeof(u64));
+
+    auto t_handoff = std::chrono::steady_clock::now();
+    send_search_handoff(target_shard, msg.data(), sizeof(SearchHandoffRequestHeader) + payload_bytes);
+    vec<byte_t> response_buf;
+    const bool ok = wait_for_search_handoff_response(req->rpc.request_id, target_shard, config, response_buf);
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_handoff);
+    }
+    shard_searched[target_shard] = 1;
+
+    if (ok && !response_buf.empty()) {
+      const auto* resp = reinterpret_cast<const SearchHandoffResponseHeader*>(response_buf.data());
+      if (resp->rpc.magic == kPeerRpcMagic &&
+          resp->rpc.status == static_cast<u32>(InsertStatus::ok)) {
+        const auto* resp_beam = handoff_response_beam(resp);
+        hashset_t<RemotePtr> existing;
+        for (const auto& entry : beam) existing.insert(entry.rptr);
+        const u32 cw = storage_owner_construction_width(config);
+        for (u32 i = 0; i < resp->updated_beam_count; ++i) {
+          RemotePtr rptr{resp_beam[i].rptr_raw};
+          if (!existing.contains(rptr)) {
+            insert_into_beam(beam, rptr, resp_beam[i].distance, cw);
+          } else {
+            for (auto& entry : beam) {
+              if (entry.rptr == rptr && resp_beam[i].distance < entry.distance) {
+                entry.distance = resp_beam[i].distance;
+              }
+            }
+          }
+        }
+        const auto* resp_visited = handoff_response_visited(resp, resp->updated_beam_count);
+        for (u32 i = 0; i < resp->new_visited_count; ++i) {
+          visited.insert(RemotePtr{resp_visited[i]});
+        }
+      }
+    }
+  }
+
+  vec<RemotePtr> candidates;
+  candidates.reserve(beam.size());
+  std::sort(beam.begin(), beam.end(), [](const BeamEntry& lhs, const BeamEntry& rhs) {
+    return lhs.distance < rhs.distance;
+  });
+  for (const auto& entry : beam) {
+    candidates.push_back(entry.rptr);
+  }
+  return candidates;
+}
+
+// Originator-side transitive beam search (coroutine version).
+// Exhausts local nodes, then hands off to remote shards via RPC.
+auto MemoryNode::beam_search_candidates_transitive_async(
+    const span<const element_t> query,
+    RemotePtr medoid,
+    const Configuration& config,
+    StorageOwnerThread& thread,
+    InsertBreakdownCounters* breakdown) -> StorageOwnerInsertCoroutine {
+
+  hashset_t<RemotePtr> visited;
+  vec<BeamEntry> beam;
+
+  auto t_snap = std::chrono::steady_clock::now();
+  NodeSnapshot medoid_snap = co_await async_read_node_snapshot(medoid, thread);
+  if (breakdown != nullptr) {
+    breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snap);
+  }
+  auto t_dist = std::chrono::steady_clock::now();
+  const distance_t medoid_dist = distance_to_stored_vector(query, medoid_snap.vector_data.data(), config);
+  if (breakdown != nullptr) {
+    breakdown->storage_owner_search_distance_ns += elapsed_ns_since(t_dist);
+  }
+
+  beam.push_back({medoid, medoid_dist, false});
+  visited.insert(medoid);
+
+  // Track which shards have been searched (local + handoffs)
+  vec<byte_t> shard_searched(config.num_server_nodes(), 0);
+  shard_searched[storage_id_] = 1;
+
+  for (;;) {
+    // Phase 1: Expand all local nodes
+    expand_all_local_nodes(beam, visited, query, config, storage_id_, breakdown);
+
+    // Phase 2: Find best unexpanded remote node
+    i32 best_idx = -1;
+    distance_t best_dist = std::numeric_limits<distance_t>::max();
+    for (i32 i = 0; i < static_cast<i32>(beam.size()); ++i) {
+      if (!beam[i].expanded && beam[i].distance < best_dist) {
+        best_dist = beam[i].distance;
+        best_idx = i;
+      }
+    }
+    if (best_idx < 0) break;  // all expanded
+
+    const u32 target_shard = beam[best_idx].rptr.memory_node();
+    if (target_shard >= config.num_server_nodes()) break;
+
+    // Skip shards we've already searched (mark expanded and continue)
+    if (shard_searched[target_shard]) {
+      beam[best_idx].expanded = true;
+      continue;
+    }
+
+    // Phase 3: Build and send search handoff RPC
+    // Collect unexpanded beam entries (both local and remote) to send
+    vec<BeamEntrySerialized> beam_serialized;
+    vec<u64> visited_serialized;
+    beam_serialized.reserve(beam.size());
+    visited_serialized.reserve(visited.size());
+
+    for (const auto& entry : beam) {
+      if (!entry.expanded) {
+        beam_serialized.push_back({entry.rptr.raw_address, entry.distance});
+      }
+    }
+    for (auto it = visited.begin(); it != visited.end(); ++it) {
+      visited_serialized.push_back(it->raw_address);
+    }
+
+    const u32 vector_bytes = VamanaNode::vector_bytes();
+    const size_t payload_bytes =
+        static_cast<size_t>(vector_bytes) +
+        beam_serialized.size() * sizeof(BeamEntrySerialized) +
+        visited_serialized.size() * sizeof(u64);
+
+    vec<byte_t> msg_buffer(sizeof(SearchHandoffRequestHeader) + payload_bytes);
+    auto* req = reinterpret_cast<SearchHandoffRequestHeader*>(msg_buffer.data());
+    req->rpc.magic = kPeerRpcMagic;
+    req->rpc.type = static_cast<u32>(PeerRpcType::search_handoff_request);
+    req->rpc.source_shard = storage_id_;
+    req->rpc.item_count = static_cast<u32>(beam_serialized.size());
+    req->rpc.request_id = next_peer_request_id_.fetch_add(1, std::memory_order_relaxed);
+    req->rpc.status = static_cast<u32>(InsertStatus::failed);
+    req->rpc.reserved = 0;
+    req->beam_width = storage_owner_construction_width(config);
+    req->snapshot_batch = storage_owner_snapshot_batch_size(config);
+    req->originator_shard = storage_id_;
+    
+    req->visited_count = static_cast<u32>(visited_serialized.size());
+    req->vector_bytes = vector_bytes;
+    req->reserved = 0;
+
+    // Copy query vector
+    std::memcpy(handoff_query_vector(req), query.data(), vector_bytes);
+
+    // Copy beam
+    auto* beam_out = handoff_request_beam(req, vector_bytes);
+    std::memcpy(beam_out, beam_serialized.data(),
+                beam_serialized.size() * sizeof(BeamEntrySerialized));
+
+    // Copy visited (variable size, stored after beam)
+    auto* visited_out = handoff_request_visited(req, vector_bytes, static_cast<u32>(beam_serialized.size()));
+    std::memcpy(visited_out, visited_serialized.data(),
+                visited_serialized.size() * sizeof(u64));
+
+    // Send and wait for response
+    auto t_handoff = std::chrono::steady_clock::now();
+    send_search_handoff(target_shard, msg_buffer.data(),
+                        sizeof(SearchHandoffRequestHeader) + payload_bytes);
+    vec<byte_t> response_dummy;
+    const bool ok = wait_for_search_handoff_response(
+        req->rpc.request_id, target_shard, config, response_dummy);
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_handoff);
+    }
+    shard_searched[target_shard] = 1;
+
+    if (!ok) {
+      beam[best_idx].expanded = true;  // skip failed shard, continue
+      continue;
+    }
+
+    // Phase 4: Merge response data
+    if (!response_dummy.empty()) {
+      const auto* resp = reinterpret_cast<const SearchHandoffResponseHeader*>(response_dummy.data());
+      if (resp->rpc.magic == kPeerRpcMagic &&
+          resp->rpc.type == static_cast<u32>(PeerRpcType::search_handoff_response) &&
+          resp->rpc.status == static_cast<u32>(InsertStatus::ok)) {
+        // Merge updated beam: update distances for existing entries, add new ones
+        const auto* resp_beam = handoff_response_beam(resp);
+        hashset_t<RemotePtr> existing;
+        for (const auto& entry : beam) {
+          existing.insert(entry.rptr);
+        }
+        const u32 construction_width = storage_owner_construction_width(config);
+        for (u32 i = 0; i < resp->updated_beam_count; ++i) {
+          RemotePtr rptr{resp_beam[i].rptr_raw};
+          if (!existing.contains(rptr)) {
+            insert_into_beam(beam, rptr, resp_beam[i].distance, construction_width);
+          } else {
+            // Update distance if better
+            for (auto& entry : beam) {
+              if (entry.rptr == rptr && resp_beam[i].distance < entry.distance) {
+                entry.distance = resp_beam[i].distance;
+              }
+            }
+          }
+        }
+        // Merge new visited entries
+        const auto* resp_visited = handoff_response_visited(resp, resp->updated_beam_count);
+        for (u32 i = 0; i < resp->new_visited_count; ++i) {
+          visited.insert(RemotePtr{resp_visited[i]});
+        }
+      }
+    }
+  }
+
+  // Build result from beam
+  auto& out = storage_owner_async_candidates_[thread.id][thread.running_coroutine];
+  out.clear();
+  out.reserve(beam.size());
+  auto t_sort = std::chrono::steady_clock::now();
+  std::sort(beam.begin(), beam.end(), [](const BeamEntry& lhs, const BeamEntry& rhs) {
+    return lhs.distance < rhs.distance;
+  });
+  if (breakdown != nullptr) {
+    breakdown->storage_owner_search_result_sort_ns += elapsed_ns_since(t_sort);
+  }
+  for (const auto& entry : beam) {
+    out.push_back(entry.rptr);
+  }
+  co_return;
+}
+
+// Remote-side search handoff handler.
+// Processes an incoming handoff request by doing local-only beam search,
+// then sends the response back.
+bool MemoryNode::handle_search_handoff_rpc(u32 source_shard,
+                                           const SearchHandoffRequestHeader* req,
+                                           const byte_t* /*payload*/,
+                                           const Configuration& config) {
+  const u32 vector_bytes = req->vector_bytes;
+  const u32 beam_count = req->rpc.item_count;
+
+  // Unpack query vector
+  const auto* query_vec = handoff_query_vector(req);
+  const span<const element_t> query{
+      reinterpret_cast<const element_t*>(query_vec),
+      VamanaNode::DIM};
+
+  // Unpack beam entries
+  const auto* serialized_beam = handoff_request_beam(req, vector_bytes);
+  vec<BeamEntry> beam;
+  beam.reserve(beam_count);
+  for (u32 i = 0; i < beam_count; ++i) {
+    const RemotePtr rptr{serialized_beam[i].rptr_raw};
+    const bool is_local = local_shard(rptr.memory_node());
+    beam.push_back({rptr, serialized_beam[i].distance, !is_local});
+  }
+
+  // Unpack visited set from the request payload (follows beam entries)
+  hashset_t<RemotePtr> visited;
+  const u32 req_visited_count = req->visited_count;
+  const auto* req_visited_raws = handoff_request_visited(req, vector_bytes, beam_count);
+  for (u32 i = 0; i < req_visited_count; ++i) {
+    visited.insert(RemotePtr{req_visited_raws[i]});
+  }
+
+  // Phase 1: Compute precise distances for local unexpanded beam entries
+  const u32 snapshot_batch = req->snapshot_batch;
+  vec<RemotePtr> local_unexpanded;
+  for (auto& entry : beam) {
+    if (!entry.expanded && local_shard(entry.rptr.memory_node())) {
+      local_unexpanded.push_back(entry.rptr);
+    }
+  }
+  for (size_t begin = 0; begin < local_unexpanded.size(); begin += snapshot_batch) {
+    const size_t end = std::min(local_unexpanded.size(), begin + snapshot_batch);
+    vec<RemotePtr> batch(local_unexpanded.begin() + begin, local_unexpanded.begin() + end);
+    vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
+    for (const NodeSnapshot& snapshot : snapshots) {
+      const distance_t dist = distance_to_stored_vector(query, snapshot.vector_data.data(), config);
+      // Update distance in beam
+      for (auto& entry : beam) {
+        if (entry.rptr == snapshot.rptr) {
+          entry.distance = dist;
+          break;
+        }
+      }
+    }
+  }
+
+  // Phase 2: Expand all local nodes
+  expand_all_local_nodes(beam, visited, query, config, storage_id_, nullptr);
+
+  // Phase 3: Build and send response
+  vec<BeamEntrySerialized> response_beam;
+  vec<u64> new_visited_raws;
+  response_beam.reserve(beam.size());
+  for (const auto& entry : beam) {
+    if (!entry.expanded) {
+      response_beam.push_back({entry.rptr.raw_address, entry.distance});
+    }
+  }
+  // Collect newly discovered nodes for visited set
+  for (auto it = visited.begin(); it != visited.end(); ++it) {
+    bool already_in_beam = false;
+    for (u32 j = 0; j < beam_count; ++j) {
+      if (serialized_beam[j].rptr_raw == it->raw_address) { already_in_beam = true; break; }
+    }
+    if (!already_in_beam) {
+      new_visited_raws.push_back(it->raw_address);
+    }
+  }
+
+  const size_t response_bytes = search_handoff_response_bytes(
+      static_cast<u32>(response_beam.size()),
+      static_cast<u32>(new_visited_raws.size()));
+  vec<byte_t> response_msg(response_bytes);
+  auto* resp = reinterpret_cast<SearchHandoffResponseHeader*>(response_msg.data());
+  resp->rpc.magic = kPeerRpcMagic;
+  resp->rpc.type = static_cast<u32>(PeerRpcType::search_handoff_response);
+  resp->rpc.source_shard = storage_id_;
+  resp->rpc.item_count = static_cast<u32>(response_beam.size());
+  resp->rpc.request_id = req->rpc.request_id;
+  resp->rpc.status = static_cast<u32>(InsertStatus::ok);
+  resp->rpc.reserved = 0;
+  resp->updated_beam_count = static_cast<u32>(response_beam.size());
+  resp->new_visited_count = static_cast<u32>(new_visited_raws.size());
+  resp->total_visited_count = static_cast<u32>(visited.size());
+  resp->reserved = 0;
+
+  auto* resp_beam = handoff_response_beam(resp);
+  std::memcpy(resp_beam, response_beam.data(),
+              response_beam.size() * sizeof(BeamEntrySerialized));
+  auto* resp_visited = handoff_response_visited(resp, static_cast<u32>(response_beam.size()));
+  std::memcpy(resp_visited, new_visited_raws.data(),
+              new_visited_raws.size() * sizeof(u64));
+
+  send_peer_rpc_message(source_shard, response_msg.data(), response_bytes);
   return true;
 }

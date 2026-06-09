@@ -476,7 +476,9 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
 
     auto t_search = std::chrono::steady_clock::now();
-    const vec<RemotePtr> candidates = beam_search_candidates(components, medoid_ptr, config, &breakdown);
+    const vec<RemotePtr> candidates = config.storage_owner_transitive_search
+        ? beam_search_candidates_transitive(components, medoid_ptr, config, &breakdown)
+        : beam_search_candidates(components, medoid_ptr, config, &breakdown);
     breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
     hashset_t<RemotePtr> empty_skip;
     auto t_prune = std::chrono::steady_clock::now();

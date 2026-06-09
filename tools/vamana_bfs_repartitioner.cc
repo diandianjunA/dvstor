@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -7,7 +6,6 @@
 #include <iostream>
 #include <limits>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,8 +32,6 @@ struct Options {
   u32 R{};
   VectorDType vector_dtype{VectorDType::float32};
   bool vector_dtype_set{false};
-  u32 partition_max_degree{16};
-  double partition_imbalance{1.03};
   bool overwrite{false};
 };
 
@@ -74,9 +70,9 @@ struct CrossShardStats {
     << "Usage: " << argv0 << " --input-prefix OLD_PREFIX --output-prefix NEW_PREFIX\n"
     << "       [--memory-nodes N --dim D --R R]\n"
     << "       [--vector-data-type auto|float32|uint8|int8]\n"
-    << "       [--partition-max-degree 16 --partition-imbalance 1.03]\n"
     << "       [--overwrite]\n\n"
-    << "Repartitions existing fixed-size Vamana shards with METIS and rewrites neighbor RemotePtr values.\n";
+    << "Repartitions existing fixed-size Vamana shards with multi-source BFS and rewrites neighbor RemotePtr values.\n"
+    << "All layout parameters (memory-nodes, dim, R, vector-data-type) are auto-detected from metadata.\n";
   std::exit(error.empty() ? EXIT_SUCCESS : EXIT_FAILURE);
 }
 
@@ -111,10 +107,6 @@ Options parse_options(int argc, char** argv) {
         options.vector_dtype = parse_vector_dtype(value);
         options.vector_dtype_set = true;
       }
-    } else if (arg == "--partition-max-degree") {
-      options.partition_max_degree = static_cast<u32>(std::stoul(require_value(i, argc, argv, arg)));
-    } else if (arg == "--partition-imbalance") {
-      options.partition_imbalance = std::stod(require_value(i, argc, argv, arg));
     } else if (arg == "--overwrite") {
       options.overwrite = true;
     } else {
@@ -125,7 +117,7 @@ Options parse_options(int argc, char** argv) {
     usage(argv[0], "--input-prefix is required");
   }
   if (options.output_prefix.empty()) {
-    options.output_prefix = filepath_t(options.input_prefix.string() + "_metis");
+    options.output_prefix = filepath_t(options.input_prefix.string() + "_bfs");
   }
   return options;
 }
@@ -201,7 +193,7 @@ void write_u64(std::ostream& output, u64 value) {
 
 size_t checked_u32_vertex(size_t vertex) {
   if (vertex > static_cast<size_t>(std::numeric_limits<u32>::max())) {
-    throw std::runtime_error("index has more than 2^32 vertices; RemotePtr repartitioner needs u32 vertex ids");
+    throw std::runtime_error("index has more than 2^32 vertices; repartitioner needs u32 vertex ids");
   }
   return vertex;
 }
@@ -227,11 +219,16 @@ size_t vertex_from_old_ptr(RemotePtr ptr, const std::vector<ShardInfo>& shards, 
   return info.base_vertex + local;
 }
 
-RemotePtr new_ptr_for_vertex(size_t vertex, const vec<tools::vamana_offline::NodePlacement>& placements) {
+tools::vamana_offline::NodePlacement placement_for_vertex(
+    size_t vertex, const vec<tools::vamana_offline::NodePlacement>& placements) {
   if (vertex >= placements.size()) {
     throw std::runtime_error("vertex id maps past placement table");
   }
-  const auto& placement = placements[vertex];
+  return placements[vertex];
+}
+
+RemotePtr new_ptr_for_vertex(size_t vertex, const vec<tools::vamana_offline::NodePlacement>& placements) {
+  const auto& placement = placement_for_vertex(vertex, placements);
   return RemotePtr{placement.memory_node, placement.offset};
 }
 
@@ -271,26 +268,25 @@ std::vector<ShardInfo> inspect_shards(const Options& options, const NodeFormat& 
 
 size_t total_nodes(const std::vector<ShardInfo>& shards) {
   size_t total = 0;
-  for (const auto& shard : shards) {
-    total += shard.node_count;
-  }
+  for (const auto& shard : shards) total += shard.node_count;
   return total;
 }
 
-CrossShardStats build_partition_edges(const std::vector<ShardInfo>& shards,
-                                      const NodeFormat& format,
-                                      const Options& options,
-                                      vec<u64>& edges) {
+CrossShardStats build_neighbor_list(const std::vector<ShardInfo>& shards,
+                                    const NodeFormat& format,
+                                    u32 R,
+                                    vec<vec<u32>>& neighbors,
+                                    size_t& medoid_vertex) {
   CrossShardStats stats;
   const size_t total = total_nodes(shards);
-  const size_t reserve_edges =
-    std::min<size_t>(total * static_cast<size_t>(options.partition_max_degree),
-                     static_cast<size_t>(std::numeric_limits<u32>::max()));
-  edges.reserve(reserve_edges);
+  neighbors.resize(total);
+  medoid_vertex = 0;
+  bool medoid_found = false;
+
   std::vector<unsigned char> node(format.aligned_node_bytes);
 
-  for (u32 shard = 0; shard < shards.size(); ++shard) {
-    const auto& info = shards[shard];
+  for (u32 shard_id = 0; shard_id < shards.size(); ++shard_id) {
+    const auto& info = shards[shard_id];
     std::ifstream input(info.path, std::ios::binary);
     if (!input.good()) {
       throw std::runtime_error("failed to open shard: " + info.path.string());
@@ -299,29 +295,48 @@ CrossShardStats build_partition_edges(const std::vector<ShardInfo>& shards,
     for (size_t local = 0; local < info.node_count; ++local) {
       read_exact(input, node.data(), node.size(), info.path);
       const size_t source_vertex = info.base_vertex + local;
+
+      // Check for medoid
+      if (!medoid_found && shard_id == 0 && local == 0) {
+        const u64 medoid_raw = shards[0].medoid_raw;
+        const u64 first_offset = kShardHeaderBytes;
+        if (medoid_raw == ((static_cast<u64>(0) << 32) | first_offset)) {
+          medoid_vertex = source_vertex;
+          medoid_found = true;
+        }
+      }
+
       const u8 edge_count = *reinterpret_cast<const u8*>(node.data() + kNodeHeaderBytes + sizeof(u32));
-      const size_t active_edges = std::min<size_t>(edge_count, options.R);
-      const auto* neighbors = reinterpret_cast<const u64*>(node.data() + format.neighbors_offset);
+      const size_t active_edges = std::min<size_t>(edge_count, R);
+      const auto* nbr_ptrs = reinterpret_cast<const u64*>(node.data() + format.neighbors_offset);
+
+      auto& nbr_list = neighbors[source_vertex];
+      nbr_list.reserve(active_edges);
       for (size_t j = 0; j < active_edges; ++j) {
-        const RemotePtr old_neighbor{neighbors[j]};
-        if (old_neighbor.is_null()) {
-          continue;
-        }
+        const RemotePtr old_neighbor{nbr_ptrs[j]};
+        if (old_neighbor.is_null()) continue;
         const size_t neighbor_vertex = vertex_from_old_ptr(old_neighbor, shards, format);
+        nbr_list.push_back(static_cast<u32>(neighbor_vertex));
         ++stats.total_edges;
-        if (old_neighbor.memory_node() != shard) {
+        if (old_neighbor.memory_node() != shard_id) {
           ++stats.cross_edges;
-        }
-        if (j < options.partition_max_degree) {
-          const u64 edge = tools::vamana_offline::pack_undirected_edge(
-            static_cast<u32>(source_vertex), static_cast<u32>(neighbor_vertex));
-          if (edge != 0) {
-            edges.push_back(edge);
-          }
         }
       }
     }
   }
+
+  // Find medoid if not in first position: scan shard0 header
+  if (!medoid_found) {
+    const RemotePtr old_medoid{shards[0].medoid_raw};
+    if (!old_medoid.is_null()) {
+      medoid_vertex = vertex_from_old_ptr(old_medoid, shards, format);
+      medoid_found = true;
+    }
+  }
+  if (!medoid_found) {
+    throw std::runtime_error("could not locate medoid in input shards");
+  }
+
   return stats;
 }
 
@@ -342,7 +357,6 @@ void ensure_output_paths_available(const Options& options) {
 }
 
 std::vector<filepath_t> open_output_shards(const Options& options,
-                                           const vec<u64>& shard_sizes,
                                            std::vector<std::unique_ptr<std::ofstream>>& outputs) {
   const filepath_t output_dir = options.output_prefix.parent_path();
   if (!output_dir.empty()) {
@@ -365,25 +379,26 @@ std::vector<filepath_t> open_output_shards(const Options& options,
     }
     temp_paths[shard] = temp;
     outputs[shard] = std::move(stream);
-    (void)shard_sizes;
   }
   return temp_paths;
 }
 
 CrossShardStats rewrite_shards(const std::vector<ShardInfo>& shards,
                                const NodeFormat& format,
-                               const Options& options,
+                               u32 R,
                                const vec<tools::vamana_offline::NodePlacement>& placements,
-                               const vec<u64>& shard_sizes,
-                               const RemotePtr& new_medoid) {
+                               const RemotePtr& new_medoid,
+                               const Options& options) {
   ensure_output_paths_available(options);
   std::vector<std::unique_ptr<std::ofstream>> outputs;
-  const std::vector<filepath_t> temp_paths = open_output_shards(options, shard_sizes, outputs);
+  const std::vector<filepath_t> temp_paths = open_output_shards(options, outputs);
+
+  vec<u64> shard_sizes(options.memory_nodes, kShardHeaderBytes);
   std::vector<unsigned char> node(format.aligned_node_bytes);
   CrossShardStats stats;
 
-  for (u32 shard = 0; shard < shards.size(); ++shard) {
-    const auto& info = shards[shard];
+  for (u32 shard_id = 0; shard_id < shards.size(); ++shard_id) {
+    const auto& info = shards[shard_id];
     std::ifstream input(info.path, std::ios::binary);
     if (!input.good()) {
       throw std::runtime_error("failed to open shard: " + info.path.string());
@@ -392,15 +407,14 @@ CrossShardStats rewrite_shards(const std::vector<ShardInfo>& shards,
     for (size_t local = 0; local < info.node_count; ++local) {
       read_exact(input, node.data(), node.size(), info.path);
       const size_t source_vertex = info.base_vertex + local;
-      auto& placement = placements[source_vertex];
+      const auto& placement = placements[source_vertex];
+
       const u8 edge_count = *reinterpret_cast<const u8*>(node.data() + kNodeHeaderBytes + sizeof(u32));
-      const size_t active_edges = std::min<size_t>(edge_count, options.R);
+      const size_t active_edges = std::min<size_t>(edge_count, R);
       auto* neighbors = reinterpret_cast<u64*>(node.data() + format.neighbors_offset);
       for (size_t j = 0; j < active_edges; ++j) {
         const RemotePtr old_neighbor{neighbors[j]};
-        if (old_neighbor.is_null()) {
-          continue;
-        }
+        if (old_neighbor.is_null()) continue;
         const size_t neighbor_vertex = vertex_from_old_ptr(old_neighbor, shards, format);
         const RemotePtr rewritten = new_ptr_for_vertex(neighbor_vertex, placements);
         neighbors[j] = rewritten.raw_address;
@@ -416,6 +430,9 @@ CrossShardStats rewrite_shards(const std::vector<ShardInfo>& shards,
       if (!output.good()) {
         throw std::runtime_error("failed to write repartitioned node");
       }
+
+      shard_sizes[placement.memory_node] =
+        std::max<u64>(shard_sizes[placement.memory_node], placement.offset + format.aligned_node_bytes);
     }
   }
 
@@ -440,27 +457,15 @@ CrossShardStats rewrite_shards(const std::vector<ShardInfo>& shards,
   return stats;
 }
 
-vec<u64> compute_shard_sizes(const vec<tools::vamana_offline::NodePlacement>& placements,
-                             u32 memory_nodes,
-                             size_t aligned_node_bytes) {
-  vec<u64> shard_sizes(memory_nodes, kShardHeaderBytes);
-  for (const auto& placement : placements) {
-    shard_sizes[placement.memory_node] =
-      std::max<u64>(shard_sizes[placement.memory_node], placement.offset + aligned_node_bytes);
-  }
-  return shard_sizes;
-}
-
 void write_metadata(const Options& options,
                     nlohmann::json metadata,
                     const NodeFormat& format,
-                    const tools::vamana_offline::PartitionStats& partition_stats,
+                    const tools::vamana_offline::PartitionStats& /*partition_stats*/,
                     const CrossShardStats& before_stats,
                     const CrossShardStats& after_stats,
-                    RemotePtr new_medoid,
-                    bool overwrite) {
+                    RemotePtr new_medoid) {
   const filepath_t output = metadata_path(options.output_prefix);
-  if (std::filesystem::exists(output) && !overwrite) {
+  if (std::filesystem::exists(output) && !options.overwrite) {
     throw std::runtime_error("output metadata exists, pass --overwrite: " + output.string());
   }
   metadata["output_prefix"] = options.output_prefix.string();
@@ -469,16 +474,14 @@ void write_metadata(const Options& options,
   metadata["R"] = options.R;
   metadata["schema_version"] = 3;
   metadata["node_size"] = format.node_bytes;
-  metadata["node_layout"] = "standard";
+  metadata["node_layout"] = metadata.value("node_layout", std::string{"standard"});
   metadata["vector_data_type"] = vector_dtype_name(options.vector_dtype);
   metadata["vector_component_size"] = vector_dtype_component_size(options.vector_dtype);
   metadata["vector_bytes"] = format.vector_bytes;
   metadata["medoid"] = {{"memory_node", new_medoid.memory_node()}, {"offset", new_medoid.byte_offset()}};
-  metadata["partition_strategy"] = "metis";
-  metadata["partition_max_degree"] = options.partition_max_degree;
-  metadata["partition_imbalance"] = options.partition_imbalance;
-  metadata["partition_edge_cut"] = partition_stats.edge_cut;
+  metadata["partition_strategy"] = "bfs";
   metadata["partition_cross_shard_ratio"] = after_stats.ratio();
+  metadata["partition_edge_cut"] = after_stats.cross_edges;
   metadata["partition_source_prefix"] = options.input_prefix.string();
   metadata["partition_before_cross_shard_ratio"] = before_stats.ratio();
   metadata["partition_before_cross_shard_edges"] = before_stats.cross_edges;
@@ -498,9 +501,7 @@ void write_metadata(const Options& options,
 
 void print_part_counts(const vec<size_t>& counts) {
   std::cerr << "partition node counts:";
-  for (size_t count : counts) {
-    std::cerr << " " << count;
-  }
+  for (size_t count : counts) std::cerr << " " << count;
   std::cerr << "\n";
 }
 
@@ -517,29 +518,18 @@ int main(int argc, char** argv) {
     if (options.memory_nodes == 0 || options.dim == 0 || options.R == 0) {
       throw std::runtime_error("missing layout parameters; provide metadata or --memory-nodes/--dim/--R");
     }
-    if (options.partition_max_degree == 0) {
-      throw std::runtime_error("--partition-max-degree must be > 0");
-    }
-    if (options.partition_imbalance < 1.0) {
-      throw std::runtime_error("--partition-imbalance must be >= 1.0");
-    }
-    if (!metis_partitioning_available()) {
-      throw std::runtime_error(metis_unavailable_reason());
-    }
 
     const std::string node_layout = metadata.value("node_layout", std::string{"standard"});
     if (node_layout != "standard" && node_layout != "rabitq") {
       throw std::runtime_error("unsupported node_layout: " + node_layout);
     }
+
     const NodeFormat format = make_format(options.dim, options.R, options.vector_dtype, node_layout);
     const size_t metadata_node_size = metadata.value("node_size", format.node_bytes);
-    const size_t metadata_vector_component_size =
-      metadata.value("vector_component_size", vector_dtype_component_size(options.vector_dtype));
-    const size_t metadata_vector_bytes = metadata.value("vector_bytes", format.vector_bytes);
-    if (metadata_node_size != format.node_bytes ||
-        metadata_vector_component_size != vector_dtype_component_size(options.vector_dtype) ||
-        metadata_vector_bytes != format.vector_bytes) {
-      throw std::runtime_error("metadata node/vector size does not match layout parameters");
+    if (metadata_node_size != format.node_bytes) {
+      throw std::runtime_error(
+          "metadata node_size " + std::to_string(metadata_node_size) +
+          " does not match computed node_bytes " + std::to_string(format.node_bytes));
     }
 
     ensure_output_paths_available(options);
@@ -551,58 +541,44 @@ int main(int argc, char** argv) {
               << " vector_data_type=" << vector_dtype_name(options.vector_dtype)
               << " vector_bytes=" << format.vector_bytes
               << " node_size=" << format.node_bytes
-              << " aligned_node_size=" << format.aligned_node_bytes << "\n"
-              << "partition: metis max_degree=" << options.partition_max_degree
-              << " imbalance=" << options.partition_imbalance << "\n";
+              << " aligned_node_size=" << format.aligned_node_bytes << "\n";
 
     std::vector<ShardInfo> shards = inspect_shards(options, format);
     const size_t n = total_nodes(shards);
     checked_u32_vertex(n);
     std::cerr << "input nodes: " << n << "\n";
 
-    vec<u64> partition_edges;
-    CrossShardStats before_stats = build_partition_edges(shards, format, options, partition_edges);
+    // Build neighbor list from shard files
+    vec<vec<u32>> neighbors;
+    size_t medoid_vertex = 0;
+    CrossShardStats before_stats = build_neighbor_list(shards, format, options.R, neighbors, medoid_vertex);
     std::cerr << "before cross-shard ratio: " << before_stats.ratio()
               << " (" << before_stats.cross_edges << "/" << before_stats.total_edges << ")\n";
 
-    PartitionOptions partition_options;
-    partition_options.num_parts = options.memory_nodes;
-    partition_options.max_degree = options.partition_max_degree;
-    partition_options.imbalance = options.partition_imbalance;
+    // Run multi-source BFS partition
     PartitionStats partition_stats;
-    vec<u32> parts = compute_metis_partition(n, partition_edges, partition_options, &partition_stats);
-    vec<NodePlacement> placements =
-      assign_nodes_to_shards_from_partition(parts, options.memory_nodes, format.aligned_node_bytes);
+    vec<u32> parts = compute_bfs_partition(
+        neighbors, options.memory_nodes, static_cast<u32>(medoid_vertex), &partition_stats);
     print_part_counts(partition_stats.part_node_counts);
-    std::cerr << "METIS partition edges: input=" << partition_stats.input_edges
-              << " unique=" << partition_stats.unique_edges
+    std::cerr << "BFS partition (multi-source) edges: input=" << partition_stats.input_edges
               << " edge_cut=" << partition_stats.edge_cut
               << " partition_cut_ratio=" << partition_stats.partition_cross_shard_ratio << "\n";
 
-    const RemotePtr old_medoid{shards[0].medoid_raw};
-    if (old_medoid.is_null()) {
-      throw std::runtime_error("input shard0 medoid pointer is null");
-    }
-    const size_t medoid_vertex = vertex_from_old_ptr(old_medoid, shards, format);
+    // Generate placements and rewrite
+    vec<NodePlacement> placements =
+        assign_nodes_to_shards_from_partition(parts, options.memory_nodes, format.aligned_node_bytes);
     const RemotePtr new_medoid = new_ptr_for_vertex(medoid_vertex, placements);
-    const vec<u64> shard_sizes = compute_shard_sizes(placements, options.memory_nodes, format.aligned_node_bytes);
-    CrossShardStats after_stats = rewrite_shards(shards, format, options, placements, shard_sizes, new_medoid);
+
+    CrossShardStats after_stats = rewrite_shards(shards, format, options.R, placements, new_medoid, options);
     std::cerr << "after cross-shard ratio: " << after_stats.ratio()
               << " (" << after_stats.cross_edges << "/" << after_stats.total_edges << ")\n";
 
-    write_metadata(options,
-                   metadata,
-                   format,
-                   partition_stats,
-                   before_stats,
-                   after_stats,
-                   new_medoid,
-                   options.overwrite);
+    write_metadata(options, metadata, format, partition_stats, before_stats, after_stats, new_medoid);
 
     std::cerr << "repartition finished: " << n << " nodes\n";
     return EXIT_SUCCESS;
   } catch (const std::exception& e) {
-    std::cerr << "vamana_metis_repartitioner failed: " << e.what() << "\n";
+    std::cerr << "vamana_bfs_repartitioner failed: " << e.what() << "\n";
     return EXIT_FAILURE;
   }
 }

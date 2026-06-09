@@ -266,6 +266,19 @@ bool MemoryNode::handle_peer_rpc_request(const PeerRpcMessage& message, const Co
     return handle_peer_reverse_update_request(message.source_shard, *header, ops, config);
   }
 
+  if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::search_handoff_request)) {
+    if (message.payload.size() < sizeof(service::storage_owner::SearchHandoffRequestHeader)) {
+      return false;
+    }
+    const auto* req = reinterpret_cast<const service::storage_owner::SearchHandoffRequestHeader*>(header);
+    const size_t expected_bytes = service::storage_owner::search_handoff_request_bytes(
+        req->rpc.item_count, 0, req->vector_bytes);
+    if (message.payload.size() < expected_bytes) {
+      return false;
+    }
+    return handle_search_handoff_rpc(message.source_shard, req, message.payload.data(), config);
+  }
+
   return false;
 }
 
@@ -344,6 +357,24 @@ void MemoryNode::peer_rpc_progress_loop() {
           peer_rpc_responses_[header->request_id] = *header;
         }
         peer_rpc_responses_cv_.notify_all();
+      } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::search_handoff_response)) {
+        {
+          std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
+          peer_rpc_responses_[header->request_id] = *header;
+          vec<byte_t> payload_copy(payload, payload + bytes);
+          peer_rpc_response_payloads_[header->request_id] = std::move(payload_copy);
+        }
+        peer_rpc_responses_cv_.notify_all();
+      } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::search_handoff_request)) {
+        // Process search handoff inline (local-only reads, no locks or RDMA)
+        if (bytes >= sizeof(service::storage_owner::SearchHandoffRequestHeader)) {
+          const auto* req = reinterpret_cast<const service::storage_owner::SearchHandoffRequestHeader*>(header);
+          const size_t expected_bytes = service::storage_owner::search_handoff_request_bytes(
+              req->rpc.item_count, req->visited_count, req->vector_bytes);
+          if (bytes >= expected_bytes) {
+            handle_search_handoff_rpc(peer_id, req, payload, *storage_worker_config_);
+          }
+        }
       }
 
       repost_peer_rpc_receive(peer_id, slot_id);
@@ -539,6 +570,8 @@ bool MemoryNode::pump_peer_rpcs_locked(const Configuration&,
         requests.push_back(std::move(request));
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response)) {
         peer_rpc_responses_[header->request_id] = *header;
+      } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::search_handoff_response)) {
+        peer_rpc_responses_[header->request_id] = *header;
       }
 
       repost_peer_rpc_receive(peer_id, slot_id);
@@ -621,6 +654,48 @@ bool MemoryNode::enqueue_reverse_update_batch(u32 target_shard,
   return true;
 }
 
+
+bool MemoryNode::send_search_handoff(u32 target_shard,
+                                      const byte_t* message,
+                                      size_t message_bytes) {
+  send_peer_rpc_message(target_shard, message, message_bytes);
+  return true;
+}
+
+bool MemoryNode::wait_for_search_handoff_response(u64 request_id,
+                                                   u32 target_shard,
+                                                   const Configuration& config,
+                                                   vec<byte_t>& response_buffer) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(config.storage_owner_rpc_timeout_ms);
+  std::unique_lock<std::mutex> lock(peer_rpc_mutex_);
+  for (;;) {
+    const auto it = peer_rpc_responses_.find(request_id);
+    if (it != peer_rpc_responses_.end()) {
+      const bool success = it->second.status == static_cast<u32>(service::storage_owner::InsertStatus::ok);
+      auto pit = peer_rpc_response_payloads_.find(request_id);
+      if (pit != peer_rpc_response_payloads_.end()) {
+        response_buffer = std::move(pit->second);
+        peer_rpc_response_payloads_.erase(pit);
+      }
+      peer_rpc_responses_.erase(it);
+      lock.unlock();
+      return success;
+    }
+
+    if (peer_rpc_responses_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+      static std::atomic<u32> timeout_logs{0};
+      const u32 log_index = timeout_logs.fetch_add(1, std::memory_order_relaxed);
+      if (log_index < 8) {
+        std::cerr << "[storage-peer] search-handoff RPC timed out after " << config.storage_owner_rpc_timeout_ms << " ms"
+                  << " self_shard=" << storage_id_
+                  << " target_shard=" << target_shard
+                  << " request_id=" << request_id << std::endl;
+      }
+      return false;
+    }
+  }
+}
 bool MemoryNode::send_reverse_update_batch_direct(u32 target_shard,
                                       const vec<service::storage_owner::ReverseUpdateOp>& ops,
                                       bool wait_for_response,

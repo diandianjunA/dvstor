@@ -16,6 +16,8 @@ enum class InsertStatus : u32 {
 enum class PeerRpcType : u32 {
   reverse_update_request = 1,
   reverse_update_response = 2,
+  search_handoff_request = 3,
+  search_handoff_response = 4,
 };
 
 struct InsertBatchRequestHeader {
@@ -179,6 +181,83 @@ inline ReverseUpdateOp* reverse_update_ops(void* payload) {
 
 inline const ReverseUpdateOp* reverse_update_ops(const void* payload) {
   return reinterpret_cast<const ReverseUpdateOp*>(reinterpret_cast<const byte_t*>(payload) + sizeof(PeerRpcHeader));
+}
+
+struct __attribute__((packed)) BeamEntrySerialized {
+  u64 rptr_raw;
+  float distance;
+};
+static_assert(sizeof(BeamEntrySerialized) == 12, "BeamEntrySerialized must be 12 bytes");
+
+struct SearchHandoffRequestHeader {
+  PeerRpcHeader rpc;
+  u32 beam_width;
+  u32 snapshot_batch;
+  u32 originator_shard;
+  u32 visited_count;
+  u32 vector_bytes;
+  u32 reserved;
+};
+
+struct SearchHandoffResponseHeader {
+  PeerRpcHeader rpc;
+  u32 updated_beam_count;
+  u32 new_visited_count;
+  u32 total_visited_count;
+  u32 reserved;
+};
+
+inline size_t search_handoff_request_bytes(u32 beam_count, u32 visited_count, u32 vector_bytes) {
+  return sizeof(SearchHandoffRequestHeader) +
+         static_cast<size_t>(vector_bytes) +
+         static_cast<size_t>(beam_count) * sizeof(BeamEntrySerialized) +
+         static_cast<size_t>(visited_count) * sizeof(u64);
+}
+
+inline size_t search_handoff_response_bytes(u32 beam_count, u32 visited_count) {
+  return sizeof(SearchHandoffResponseHeader) +
+         static_cast<size_t>(beam_count) * sizeof(BeamEntrySerialized) +
+         static_cast<size_t>(visited_count) * sizeof(u64);
+}
+
+inline byte_t* handoff_query_vector(void* payload) {
+  return reinterpret_cast<byte_t*>(reinterpret_cast<SearchHandoffRequestHeader*>(payload) + 1);
+}
+
+inline const byte_t* handoff_query_vector(const void* payload) {
+  return reinterpret_cast<const byte_t*>(reinterpret_cast<const SearchHandoffRequestHeader*>(payload) + 1);
+}
+
+inline BeamEntrySerialized* handoff_request_beam(void* payload, u32 vector_bytes) {
+  return reinterpret_cast<BeamEntrySerialized*>(handoff_query_vector(payload) + vector_bytes);
+}
+
+inline const BeamEntrySerialized* handoff_request_beam(const void* payload, u32 vector_bytes) {
+  return reinterpret_cast<const BeamEntrySerialized*>(handoff_query_vector(payload) + vector_bytes);
+}
+
+inline u64* handoff_request_visited(void* payload, u32 vector_bytes, u32 beam_count) {
+  return reinterpret_cast<u64*>(handoff_request_beam(payload, vector_bytes) + beam_count);
+}
+
+inline const u64* handoff_request_visited(const void* payload, u32 vector_bytes, u32 beam_count) {
+  return reinterpret_cast<const u64*>(handoff_request_beam(payload, vector_bytes) + beam_count);
+}
+
+inline BeamEntrySerialized* handoff_response_beam(void* payload) {
+  return reinterpret_cast<BeamEntrySerialized*>(reinterpret_cast<SearchHandoffResponseHeader*>(payload) + 1);
+}
+
+inline const BeamEntrySerialized* handoff_response_beam(const void* payload) {
+  return reinterpret_cast<const BeamEntrySerialized*>(reinterpret_cast<const SearchHandoffResponseHeader*>(payload) + 1);
+}
+
+inline u64* handoff_response_visited(void* payload, u32 beam_count) {
+  return reinterpret_cast<u64*>(handoff_response_beam(payload) + beam_count);
+}
+
+inline const u64* handoff_response_visited(const void* payload, u32 beam_count) {
+  return reinterpret_cast<const u64*>(handoff_response_beam(payload) + beam_count);
 }
 
 }  // namespace service::storage_owner

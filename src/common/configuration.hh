@@ -64,6 +64,7 @@ public:
   u32 storage_owner_reverse_queue_depth{65536};
   u32 storage_owner_reverse_flush_us{200};
   u32 storage_owner_reverse_coalesce_max{256};
+  bool storage_owner_transitive_search{false};
 
   // Legacy aliases for compatibility
   u32& ef_search = beam_width;
@@ -187,6 +188,9 @@ private:
       "storage-owner-reverse-coalesce-max",
       po::value<u32>(&storage_owner_reverse_coalesce_max)->default_value(storage_owner_reverse_coalesce_max),
       "Maximum reverse-update operations coalesced by one peer worker batch.")(
+      "storage-owner-transitive-search",
+      po::bool_switch(&storage_owner_transitive_search)->default_value(false),
+      "Use transitive (RPC-based) beam search for storage_owner inserts instead of fine-grained RDMA reads.")(
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
@@ -370,6 +374,8 @@ public:
            << config.storage_owner_reverse_flush_us << std::endl;
         os << std::setw(width) << "storage reverse coalesce max: "
            << config.storage_owner_reverse_coalesce_max << std::endl;
+        os << std::setw(width) << "storage transitive search: "
+           << (config.storage_owner_transitive_search ? "true" : "false") << std::endl;
         os << std::setw(width) << "storage peers: " << "[";
         for (const str& node : config.storage_peers) {
           os << node << ", ";
