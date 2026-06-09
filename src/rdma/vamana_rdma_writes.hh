@@ -36,7 +36,7 @@ inline auto unlock_vamana_node(const s_ptr<VamanaNode>& node, const u_ptr<Comput
     track_total_rdma_write(thread, 1);
     thread->track_post();
 
-    const QP& qp = thread->ctx->qps[node->rptr.memory_node()]->qp;
+    const QP& qp = thread->ctx->qps[node->rptr.memory_node()][0]->qp;
     qp->post_send_inlined(std::addressof(unlock),
                           1,
                           IBV_WR_RDMA_WRITE,
@@ -83,7 +83,7 @@ inline auto write_vamana_node(const RemotePtr& rptr,
     track_total_rdma_write(thread, total);
     thread->track_post();
 
-    const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
+    const QP& qp = thread->ctx->qps[rptr.memory_node()][0]->qp;
     qp->post_send(reinterpret_cast<u64>(local_buffer),
                   total,
                   thread->ctx->get_lkey(),
@@ -141,7 +141,7 @@ inline auto write_vamana_neighbors(const s_ptr<VamanaNode>& node,
 
     track_total_rdma_write(thread, meta_size + VamanaNode::NEIGHBORS_SIZE, 2);
 
-    const QP& qp = thread->ctx->qps[node->rptr.memory_node()]->qp;
+    const QP& qp = thread->ctx->qps[node->rptr.memory_node()][0]->qp;
 
     // Write 1: edge_count + padding at offset_edge_count()
     thread->track_post();
@@ -195,7 +195,7 @@ inline auto write_medoid_ptr(const RemotePtr& medoid_ptr, const u_ptr<ComputeThr
     track_total_rdma_write(thread, RemotePtr::SIZE);
     thread->track_post();
 
-    const QP& qp = thread->ctx->qps[0]->qp;
+    const QP& qp = thread->ctx->qps[0][0]->qp;
     qp->post_send_inlined(std::addressof(medoid_ptr.raw_address),
                           RemotePtr::SIZE,
                           IBV_WR_RDMA_WRITE,
@@ -223,7 +223,7 @@ inline auto write_vamana_header(const RemotePtr& rptr,
     track_total_rdma_write(thread, VamanaNode::HEADER_SIZE);
     thread->track_post();
 
-    const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
+    const QP& qp = thread->ctx->qps[rptr.memory_node()][0]->qp;
     qp->post_send_inlined(std::addressof(header),
                           VamanaNode::HEADER_SIZE,
                           IBV_WR_RDMA_WRITE,

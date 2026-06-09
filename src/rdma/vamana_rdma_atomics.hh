@@ -20,7 +20,7 @@ inline auto try_lock_vamana_node(const RemotePtr& rptr,
 
     thread->track_post();
 
-    const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
+    const QP& qp = thread->ctx->qps[rptr.memory_node()][0]->qp;
     qp->post_CAS(reinterpret_cast<u64>(thread->coros_pointer_slot()),
                  thread->ctx->get_lkey(),
                  thread->ctx->get_remote_mrt(rptr.memory_node()),
@@ -96,7 +96,7 @@ inline auto allocate_vamana_node(const u_ptr<ComputeThread>& thread) {
     ++thread->stats.remote_allocations;
     thread->track_post();
 
-    const QP& qp = thread->ctx->qps[memory_node]->qp;
+    const QP& qp = thread->ctx->qps[memory_node][0]->qp;
     qp->post_FAA(reinterpret_cast<u64>(thread->coros_pointer_slot()),
                  thread->ctx->get_lkey(),
                  thread->ctx->get_remote_mrt(memory_node),
@@ -131,7 +131,7 @@ inline auto swap_medoid_ptr(const RemotePtr& old_ptr, const RemotePtr& new_ptr,
                             const u_ptr<ComputeThread>& thread) {
     thread->track_post();
 
-    const QP& qp = thread->ctx->qps[0]->qp;
+    const QP& qp = thread->ctx->qps[0][0]->qp;
     qp->post_CAS(reinterpret_cast<u64>(thread->coros_pointer_slot()),
                  thread->ctx->get_lkey(),
                  thread->ctx->get_remote_mrt(0),

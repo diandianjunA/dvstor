@@ -285,6 +285,7 @@ private:
 
   const u32 num_clients_;
   u32 num_compute_threads_{};
+  u32 qp_pool_size_{1};
   const u32 storage_id_;
   const u32 num_storage_nodes_;
   const bool use_storage_owner_insert_;

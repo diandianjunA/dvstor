@@ -67,7 +67,7 @@ inline auto read_vamana_node(RemotePtr rptr, const u_ptr<ComputeThread>& thread)
     track_vector_rdma_read(thread, read_size);
     thread->track_post();
 
-    const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
+    const QP& qp = thread->ctx->qps[rptr.memory_node()][0]->qp;
     qp->post_send(reinterpret_cast<u64>(node_ptr),
                   read_size,
                   thread->ctx->get_lkey(),
@@ -102,7 +102,7 @@ inline auto read_vamana_node_full(RemotePtr rptr, const u_ptr<ComputeThread>& th
     track_vector_rdma_read(thread, read_size);
     thread->track_post();
 
-    const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
+    const QP& qp = thread->ctx->qps[rptr.memory_node()][0]->qp;
     qp->post_send(reinterpret_cast<u64>(node_ptr),
                   read_size,
                   thread->ctx->get_lkey(),
@@ -137,7 +137,7 @@ inline auto read_vamana_id(RemotePtr rptr, const u_ptr<ComputeThread>& thread) {
     track_total_rdma_read(thread, sizeof(node_t));
     thread->track_post();
 
-    const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
+    const QP& qp = thread->ctx->qps[rptr.memory_node()][0]->qp;
     qp->post_send(reinterpret_cast<u64>(id_ptr),
                   sizeof(node_t),
                   thread->ctx->get_lkey(),
@@ -228,7 +228,7 @@ inline NeighborReadAwaitable read_vamana_neighbors(RemotePtr node_rptr, const u_
     const size_t read_size = sizeof(u8) + VamanaNode::NEIGHBORS_SIZE;
     byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(read_size);
 
-    const QP& qp = thread->ctx->qps[node_rptr.memory_node()]->qp;
+    const QP& qp = thread->ctx->qps[node_rptr.memory_node()][0]->qp;
     track_neighbor_rdma_read(thread, read_size, 2);
     thread->track_post();
     qp->post_send(reinterpret_cast<u64>(local_buffer),
@@ -281,15 +281,21 @@ inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rp
     vec<byte_t*> host_buffers;
     host_buffers.reserve(node_rptrs.size());
 
-    // Group WRs per memory node and build linked lists for batched posting.
+    // Group WRs per (memory_node, QP) pair and build linked lists.
+    // Round-robin across the QP pool for each node.
     const u32 num_nodes = static_cast<u32>(thread->ctx->qps.size());
-    // Per-node arrays pre-sized to avoid reallocation invalidating sg_list pointers.
-    vec<vec<ibv_send_wr>> wr_lists(num_nodes);
-    vec<vec<ibv_sge>> sge_lists(num_nodes);
+    vec<u32> qp_counters(num_nodes, 0);
+    vec<vec<vec<ibv_send_wr>>> wr_lists(num_nodes);
+    vec<vec<vec<ibv_sge>>> sge_lists(num_nodes);
     for (u32 n = 0; n < num_nodes; ++n) {
-        const size_t cap = node_rptrs.size() / num_nodes + 1;
-        wr_lists[n].reserve(cap);
-        sge_lists[n].reserve(cap);
+        u32 pool_sz = static_cast<u32>(thread->ctx->qps[n].size());
+        wr_lists[n].resize(pool_sz);
+        sge_lists[n].resize(pool_sz);
+        size_t cap = node_rptrs.size() / num_nodes / pool_sz + 1;
+        for (u32 p = 0; p < pool_sz; ++p) {
+            wr_lists[n][p].reserve(cap);
+            sge_lists[n][p].reserve(cap);
+        }
     }
 
     for (size_t i = 0; i < node_rptrs.size(); ++i) {
@@ -315,12 +321,11 @@ inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rp
         thread->track_post();
 
         const u32 node = rptr.memory_node();
+        const u32 qp_idx = (qp_counters[node]++) % wr_lists[node].size();
         auto* token = thread->ctx->get_remote_mrt(node);
-        auto& sges = sge_lists[node];
-        auto& wrs = wr_lists[node];
+        auto& sges = sge_lists[node][qp_idx];
+        auto& wrs = wr_lists[node][qp_idx];
 
-        // Build SGE and WR.  Push SGE first (may realloc), then WR
-        // with a pointer to the stable SGE.
         sges.push_back({});
         ibv_sge& sge = sges.back();
         sge.addr = local_addr;
@@ -340,19 +345,20 @@ inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rp
         wr.next = nullptr;
     }
 
-    // Fix sg_list pointers (may have been invalidated by vector realloc)
-    // and chain WRs into linked lists, then post one batch per node.
+    // Post batched WRs: one ibv_post_send per (node, qp_idx) pair.
     for (u32 node = 0; node < num_nodes; ++node) {
-        auto& wrs = wr_lists[node];
-        auto& sges = sge_lists[node];
-        if (wrs.empty()) continue;
-        for (size_t j = 0; j < wrs.size(); ++j) {
-            wrs[j].sg_list = &sges[j];  // re-anchor after possible realloc
-            if (j + 1 < wrs.size()) wrs[j].next = &wrs[j + 1];
+        for (u32 qp = 0; qp < wr_lists[node].size(); ++qp) {
+            auto& wrs = wr_lists[node][qp];
+            auto& sges = sge_lists[node][qp];
+            if (wrs.empty()) continue;
+            for (size_t j = 0; j < wrs.size(); ++j) {
+                wrs[j].sg_list = &sges[j];
+                if (j + 1 < wrs.size()) wrs[j].next = &wrs[j + 1];
+            }
+            struct ibv_send_wr* bad = nullptr;
+            ibv_post_send(thread->ctx->qps[node][qp]->qp->get_ibv_qp(),
+                          &wrs[0], &bad);
         }
-        struct ibv_send_wr* bad = nullptr;
-        ibv_post_send(thread->ctx->qps[node]->qp->get_ibv_qp(),
-                      &wrs[0], &bad);
     }
 
     return VectorBatchReadAwaitable(VectorBatchReadResult{std::move(host_buffers), direct_to_gpu});
@@ -378,7 +384,7 @@ inline auto read_vamana_nodes(const span<RemotePtr> remote_ptrs, const u_ptr<Com
         track_vector_rdma_read(thread, read_size);
         thread->track_post();
 
-        const QP& qp = thread->ctx->qps[rptr.memory_node()]->qp;
+        const QP& qp = thread->ctx->qps[rptr.memory_node()][0]->qp;
         qp->post_send(reinterpret_cast<u64>(node_ptr),
                       read_size,
                       thread->ctx->get_lkey(),
@@ -406,7 +412,7 @@ inline auto read_medoid_ptr(const u_ptr<ComputeThread>& thread) {
     track_total_rdma_read(thread, sizeof(u64));
     thread->track_post();
 
-    const QP& qp = thread->ctx->qps[0]->qp;
+    const QP& qp = thread->ctx->qps[0][0]->qp;
     qp->post_send(reinterpret_cast<u64>(thread->coros_pointer_slot()),
                   sizeof(u64),
                   thread->ctx->get_lkey(),

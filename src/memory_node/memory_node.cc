@@ -34,6 +34,7 @@ MemoryNode::MemoryNode(Configuration& config)
   context_.receive();
 
   num_compute_threads_ = p.num_threads;
+  qp_pool_size_ = p.qp_pool_size;
   const filepath_t index_prefix = config.resolved_index_prefix();
   VectorDType startup_dtype = config.resolved_vector_dtype();
   const filepath_t meta_file = filepath_t(index_prefix.string() + ".meta.json");
@@ -88,7 +89,7 @@ MemoryNode::MemoryNode(Configuration& config)
   vec<u_ptr<DetachedQP>> qps;
 
   // note: no need for QP sharing on the memory server side
-  const u32 qps_per_node = std::min<u32>(num_compute_threads_, MAX_QPS);
+  const u32 qps_per_node = std::min<u32>(num_compute_threads_, MAX_QPS) * qp_pool_size_;
   qps.reserve(num_clients_ * qps_per_node);
 
   for (QP& client_qp : cm_.client_qps) {
