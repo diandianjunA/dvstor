@@ -19,6 +19,7 @@ class ComputeThread;
  *   padding: 3B
  *   vector: vector_bytes
  *   neighbors: R * 8B
+ *   rabitq_code: 8B
  * ]
  */
 class VamanaNode {
@@ -57,16 +58,91 @@ public:
   static VectorDType vector_dtype() { return VECTOR_DTYPE; }
   static str vector_dtype_name() { return ::vector_dtype_name(VECTOR_DTYPE); }
   static size_t vector_component_size() { return VECTOR_COMPONENT_SIZE; }
-  static str layout_name() { return "standard"; }
+  static str layout_name() { return HAS_RABITQ_CODE ? "rabitq" : "standard"; }
 
   static size_t offset_id() { return HEADER_SIZE; }
   static size_t offset_edge_count() { return HEADER_SIZE + ID_SIZE; }
   static size_t offset_vector() { return HEADER_SIZE + META_SIZE; }
+  static constexpr size_t RABITQ_CODE_SIZE = sizeof(u64);
   static size_t offset_neighbors() { return HEADER_SIZE + META_SIZE + vector_bytes(); }
+  static size_t offset_rabitq_code() { return offset_neighbors() + NEIGHBORS_SIZE; }
 
   static size_t vector_bytes() { return VECTOR_BYTES; }
   static size_t size_until_vector_end() { return offset_vector() + vector_bytes(); }
-  static size_t total_size() { return HEADER_SIZE + META_SIZE + vector_bytes() + NEIGHBORS_SIZE; }
+  static size_t total_size() { return offset_neighbors() + NEIGHBORS_SIZE + (HAS_RABITQ_CODE ? RABITQ_CODE_SIZE : 0); }
+
+  // RaBitQ projection matrix + code computation
+  inline static bool HAS_RABITQ_CODE = false;
+  inline static vec<int8_t> rabitq_proj_matrix;
+  inline static float rabitq_scaling = 1.0f;
+
+  static void enable_rabitq() {
+      if (HAS_RABITQ_CODE) return;
+      HAS_RABITQ_CODE = true;
+      init_rabitq_matrix();
+  }
+
+  static void init_rabitq_matrix() {
+      if (!rabitq_proj_matrix.empty()) return;
+      rabitq_proj_matrix.resize(static_cast<size_t>(DIM) * 64);
+      uint32_t seed = 42;
+      for (size_t i = 0; i < rabitq_proj_matrix.size(); ++i) {
+          seed = seed * 1103515245 + 12345;
+          rabitq_proj_matrix[i] = (seed & 1) ? 1 : -1;
+      }
+      rabitq_scaling = static_cast<float>(DIM) / 32.0f;
+  }
+
+public:
+  static uint64_t compute_rabitq_code(const byte_t* vec, VectorDType dtype) {
+      switch (dtype) {
+          case VectorDType::float32: {
+              const auto* fv = reinterpret_cast<const float*>(vec);
+              float mean = 0.0f;
+              for (u32 d = 0; d < DIM; ++d) mean += fv[d];
+              mean /= static_cast<float>(DIM);
+              uint64_t code = 0;
+              for (int b = 0; b < 64; ++b) {
+                  float sum = 0.0f;
+                  for (u32 d = 0; d < DIM; ++d)
+                      sum += (fv[d] - mean) * static_cast<float>(rabitq_proj_matrix[d * 64 + b]);
+                  if (sum > 0.0f) code |= (1ULL << (63 - b));
+              }
+              return code;
+          }
+          case VectorDType::uint8: {
+              const auto* uv = reinterpret_cast<const u8*>(vec);
+              int mean = 0;
+              for (u32 d = 0; d < DIM; ++d) mean += static_cast<int>(uv[d]);
+              mean /= static_cast<int>(DIM);
+              uint64_t code = 0;
+              for (int b = 0; b < 64; ++b) {
+                  int sum = 0;
+                  for (u32 d = 0; d < DIM; ++d)
+                      sum += (static_cast<int>(uv[d]) - mean) * rabitq_proj_matrix[d * 64 + b];
+                  if (sum > 0) code |= (1ULL << (63 - b));
+              }
+              return code;
+          }
+          case VectorDType::int8: {
+              const auto* sv = reinterpret_cast<const i8*>(vec);
+              int mean = 0;
+              for (u32 d = 0; d < DIM; ++d) mean += static_cast<int>(sv[d]);
+              mean /= static_cast<int>(DIM);
+              uint64_t code = 0;
+              for (int b = 0; b < 64; ++b) {
+                  int sum = 0;
+                  for (u32 d = 0; d < DIM; ++d)
+                      sum += (static_cast<int>(sv[d]) - mean) * rabitq_proj_matrix[d * 64 + b];
+                  if (sum > 0) code |= (1ULL << (63 - b));
+              }
+              return code;
+          }
+      }
+      return 0;
+  }
+
+private:
 
 public:
   VamanaNode() = default;

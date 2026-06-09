@@ -267,6 +267,7 @@ bool ComputeService<Distance>::validate_index_metadata(const filepath_t& index_p
   }
 
   VamanaNode::init_static_storage(config_.dim, config_.R, metadata.vector_dtype);
+  if (metadata.node_layout == "rabitq") VamanaNode::enable_rabitq();
   config_.vector_data_type = vector_dtype_name(metadata.vector_dtype);
 
   if (metadata.dim != config_.dim || metadata.R != config_.R ||
@@ -288,14 +289,6 @@ bool ComputeService<Distance>::validate_index_metadata(const filepath_t& index_p
     }
     return false;
   }
-  if (metadata.node_layout != "standard") {
-    if (error_message) {
-      *error_message = "unsupported index node_layout=" + metadata.node_layout +
-                       "; rebuild the index with the standard exact-vector layout";
-    }
-    return false;
-  }
-
   print_status("loaded index metadata from " + index_prefix.string() +
                " (layout=" + VamanaNode::layout_name() +
                ", vector_data_type=" + VamanaNode::vector_dtype_name() + ")");

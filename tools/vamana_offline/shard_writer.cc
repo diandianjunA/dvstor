@@ -197,6 +197,7 @@ void write_vamana_shards(const VamanaGraph& graph,
                          const filepath_t& output_prefix) {
   const size_t n = dataset.size();
   const u32 dim = dataset.dim;
+  if (config.use_rabitq) VamanaNode::enable_rabitq();
   const size_t node_size = VamanaNode::total_size();
   const size_t aligned_size = (node_size + 7) & ~7ULL;
 
@@ -254,6 +255,11 @@ void write_vamana_shards(const VamanaGraph& graph,
       const u32 nbr = nbrs[j];
       RemotePtr nbr_ptr{placements[nbr].memory_node, placements[nbr].offset};
       neighbor_buf[j] = nbr_ptr.raw_address;
+    }
+
+    if (config.use_rabitq) {
+        *reinterpret_cast<u64*>(buf + VamanaNode::offset_rabitq_code()) =
+            VamanaNode::compute_rabitq_code(dataset.raw_vector(i), dataset.dtype);
     }
 
     const auto& placement = placements[i];

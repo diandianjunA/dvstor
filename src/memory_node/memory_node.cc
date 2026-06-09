@@ -45,7 +45,6 @@ MemoryNode::MemoryNode(Configuration& config)
     lib_assert(metadata.dim == config.dim, "index metadata dim mismatch on storage node");
     lib_assert(metadata.R == config.R, "index metadata R mismatch on storage node");
     lib_assert(metadata.num_memory_nodes == num_storage_nodes_, "index metadata storage-node count mismatch");
-    lib_assert(metadata.node_layout == "standard", "unsupported index node layout on storage node");
     if (config.vector_data_type != "auto" && config.resolved_vector_dtype() != metadata.vector_dtype) {
       lib_failure("configured vector-data-type=" + config.vector_data_type +
                   " does not match index metadata vector_data_type=" + vector_dtype_name(metadata.vector_dtype));
@@ -53,6 +52,7 @@ MemoryNode::MemoryNode(Configuration& config)
     startup_dtype = metadata.vector_dtype;
     config.vector_data_type = vector_dtype_name(startup_dtype);
     VamanaNode::init_static_storage(config.dim, config.R, startup_dtype);
+    if (metadata.node_layout == "rabitq") VamanaNode::enable_rabitq();
     lib_assert(metadata.vector_component_size == VamanaNode::vector_component_size(),
                "index metadata vector component size mismatch on storage node");
     lib_assert(metadata.vector_bytes == VamanaNode::vector_bytes(),

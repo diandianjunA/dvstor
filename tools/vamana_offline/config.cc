@@ -47,6 +47,8 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
      "METIS ubvec balance tolerance, e.g. 1.03 allows about 3% imbalance.")
     ("skip-sanity-check", po::bool_switch(&config.skip_sanity_check),
      "Skip the expensive in-memory brute-force recall sanity check after graph construction.")
+    ("use-rabitq", po::bool_switch(&config.use_rabitq),
+     "Store RaBitQ 8-byte binary codes per node for fast GPU-accelerated approximate search.")
     ("seed", po::value<i32>(&config.seed)->default_value(config.seed), "PRNG seed.")
     ("max-vectors", po::value<size_t>(&config.max_vectors)->default_value(config.max_vectors),
      "Maximum number of vectors to read.")

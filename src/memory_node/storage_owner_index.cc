@@ -463,6 +463,12 @@ void MemoryNode::write_new_node(RemotePtr rptr,
   for (u32 i = 0; i < neighbors.size() && i < VamanaNode::R; ++i) {
     slots[i] = neighbors[i];
   }
+  if (VamanaNode::HAS_RABITQ_CODE) {
+      *reinterpret_cast<u64*>(ptr + VamanaNode::offset_rabitq_code()) =
+          VamanaNode::compute_rabitq_code(
+              ptr + VamanaNode::offset_vector(),
+              VamanaNode::vector_dtype());
+  }
 }
 
 void MemoryNode::lock_node(RemotePtr rptr) {

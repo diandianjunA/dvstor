@@ -317,4 +317,19 @@ __global__ void robust_prune_typed_kernel(
     }
 }
 
+// RaBitQ: approximate L2 via XOR + popcount of 64-bit binary codes.
+// distance ≈ popcount(query_code XOR candidate_codes[i]) * scaling
+__global__ void rabitq_popcount_kernel(
+    const uint64_t* __restrict__ query_code,
+    const uint64_t* __restrict__ candidate_codes,
+    float* __restrict__ distances,
+    uint32_t n_candidates, float scaling)
+{
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_candidates) return;
+    uint64_t xored = *query_code ^ candidate_codes[tid];
+    uint32_t pop = __popcll(xored);
+    distances[tid] = static_cast<float>(pop) * scaling;
+}
+
 }  // namespace gpu_kernels

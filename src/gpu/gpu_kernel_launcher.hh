@@ -70,6 +70,12 @@ void launch_robust_prune_typed(cudaStream_t stream, cudaEvent_t event,
                                float alpha, uint32_t R,
                                uint32_t* d_pruned_indices, uint32_t* d_pruned_count);
 
+void launch_batch_rabitq_distances(cudaStream_t stream, cudaEvent_t event,
+                                    const uint64_t* d_query_code,
+                                    const uint64_t* d_candidate_codes,
+                                    float* d_distances,
+                                    uint32_t n_candidates, float scaling);
+
 void gpu_init(int device_id);
 void gpu_shutdown();
 

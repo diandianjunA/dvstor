@@ -249,6 +249,7 @@ write_service_config() {
     if [[ -n "${EXPANSION_BATCH:-}" ]]; then echo "expansion-batch = ${EXPANSION_BATCH}"; fi
     if [[ -n "${RDMA_QP_POOL_SIZE:-}" ]]; then echo "rdma-qp-pool-size = ${RDMA_QP_POOL_SIZE}"; fi
     if [[ -n "${QUERY_BATCH_SIZE:-}" ]]; then echo "query-batch-size = ${QUERY_BATCH_SIZE}"; fi
+    if [[ "${USE_RABITQ:-0}" == "1" ]]; then echo "use-rabitq = true"; fi
     echo "insert-execution = $insert_execution"
     if [[ "$insert_execution" == "storage_owner" ]]; then
       echo "storage-peers = $endpoints"
