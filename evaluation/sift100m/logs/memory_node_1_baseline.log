@@ -9,7 +9,7 @@ max outstanding CQEs:         64
 max send work requests:       4096
 max receive work requests:    4096
 ============================================================
-server index file:            "/data/xjs/index/dvstor_sift100m/index/sift100m_R64_bw200_bfs_node1_of5.dat"
+server index file:            "/data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced_node1_of5.dat"
 ============================================================
 1 device(s) found
 Selected device: ibp86s0
@@ -18,17 +18,17 @@ num_cores: 112
 physical cores per socket: 28
 hyperthreading enabled
 interleaved policy
-pairing: 9347 -- 9346
+pairing: 19926 -- 5183
 [STATUS]: pinned main thread to core 28
-[STATUS]: loaded index metadata from /data/xjs/index/dvstor_sift100m/index/sift100m_R64_bw200_bfs (layout=standard, vector_data_type=uint8)
-allocation size: 20401094656
-allocated ALIGNED MEM (no hugepage) at 128651634933824 with buffer size 20401094656
-[STATUS]: loading index (131200016 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R64_bw200_bfs_node1_of5.dat
+[STATUS]: loaded index metadata from /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced (layout=rabitq, vector_data_type=uint8)
+allocation size: 17179869184
+allocated ALIGNED MEM (no hugepage) at 130366862000192 with buffer size 17179869184
+[STATUS]: loading index (10720000016 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced_node1_of5.dat
 [STATUS]: register memory and distribute access token
 [STATUS]: connect QPs of compute threads
-pairing: 9356 -- 9361
-pairing: 9363 -- 9371
-pairing: 9375 -- 9381
-pairing: 9385 -- 9391
+pairing: 19931 -- 5188
+pairing: 19936 -- 5193
+pairing: 19941 -- 5198
+pairing: 19946 -- 5203
 [STATUS]: waiting for commands from compute node...
-[STATUS]: loading index (131200016 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R64_bw200_bfs_node1_of5.dat
+[STATUS]: loading index (10720000016 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced_node1_of5.dat
