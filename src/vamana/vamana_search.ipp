@@ -258,6 +258,203 @@
         visited.clear();
     }
 
+    VamanaCoroutine knn_batch(const vec<node_t>& q_ids,
+                               const vec<const byte_t*>& query_datas,
+                               VectorDType query_dtype,
+                               const u_ptr<ComputeThread>& thread) const {
+        const u32 Q = static_cast<u32>(q_ids.size());
+        const u32 coro_id = thread->current_coroutine_id();
+        auto& gpu = thread->gpu_buffers;
+        auto& gs = gpu.state(coro_id);
+
+        // Per-query state arrays
+        using BeamEntry = VamanaCoroutine::BeamEntry;
+        struct QState {
+            vec<BeamEntry> beam;
+            hashset_t<RemotePtr> visited;
+            rdma::vamana::NeighborReadAwaitable pf_neighbor;
+            i32 best_idx = -1;
+            bool active = true;
+            node_t q_id;
+        };
+        vec<QState> qs(Q);
+        const size_t q_bytes = vector_dtype_bytes(query_dtype, dim_);
+        vec<u32> batch_offsets(Q + 1, 0);  // candidate offsets per query
+        vec<RemotePtr> all_unvisited;
+        all_unvisited.reserve(Q * R_);
+
+        // Init: read medoid + first neighbor for each query
+        for (u32 q = 0; q < Q; ++q) {
+            auto& s = qs[q];
+            s.q_id = q_ids[q];
+            ++thread->stats.processed;
+            ++thread->stats.processed_queries;
+            RemotePtr medoid = co_await rdma::vamana::read_medoid_ptr(thread);
+            s_ptr<VamanaNode> medoid_node;
+            auto coro = read_node(medoid, medoid_node, thread, true);
+            while (!coro.handle.done()) { co_await std::suspend_always{}; coro.handle.resume(); }
+            distance_t medoid_dist = distance_to_stored_vector<Distance>(
+                query_datas[q], query_dtype, medoid_node->vector_data());
+            ++thread->stats.distcomps; ++thread->stats.query_distcomps;
+            s.beam.clear(); s.beam.push_back({medoid, medoid_dist, false});
+            s.visited.clear(); s.visited.insert(medoid);
+            s.best_idx = 0; s.beam[0].expanded = true;
+            s.pf_neighbor = rdma::vamana::read_vamana_neighbors(
+                s.beam[0].rptr, &thread);
+        }
+
+        while (true) {
+            // Phase 1: consume neighbor reads, collect all unvisited
+            all_unvisited.clear();
+            batch_offsets[0] = 0;
+            u32 active_count = 0;
+            for (u32 q = 0; q < Q; ++q) {
+                if (!qs[q].active) { batch_offsets[q+1] = batch_offsets[q]; continue; }
+                active_count++;
+                auto& s = qs[q];
+                thread->poll_cq();
+                if (thread->post_balances[thread->current_coroutine_id()].load(
+                        std::memory_order_acquire) == 0)
+                    s.pf_neighbor.mark_ready();
+                auto nlist = co_await s.pf_neighbor;
+                ++thread->stats.visited_neighborlists;
+                const u8 nc = nlist->num_neighbors();
+                const RemotePtr* np = nlist->view().data();
+                for (u32 i = 0; i < nc; ++i) {
+                    if (np[i].is_null()) continue;
+                    if (!s.visited.contains(np[i])) {
+                        s.visited.insert(np[i]);
+                        all_unvisited.push_back(np[i]);
+                    }
+                }
+                batch_offsets[q+1] = static_cast<u32>(all_unvisited.size());
+            }
+            if (active_count == 0) break;
+
+            const u32 n_batch = static_cast<u32>(all_unvisited.size());
+            if (n_batch == 0) {
+                // All neighbors visited for every query; pick new bests
+                for (u32 q = 0; q < Q; ++q) {
+                    if (!qs[q].active) continue;
+                    auto& s = qs[q];
+                    i32 best = -1; distance_t best_d = std::numeric_limits<distance_t>::max();
+                    for (i32 i = 0; i < static_cast<i32>(s.beam.size()); ++i)
+                        if (!s.beam[i].expanded && s.beam[i].distance < best_d)
+                            { best_d = s.beam[i].distance; best = i; }
+                    if (best < 0) { s.active = false; continue; }
+                    s.beam[best].expanded = true;
+                    s.pf_neighbor = rdma::vamana::read_vamana_neighbors(
+                        s.beam[best].rptr, &thread);
+                }
+                continue;
+            }
+
+            // Phase 2: select best for next iteration
+            for (u32 q = 0; q < Q; ++q) {
+                if (!qs[q].active) continue;
+                auto& s = qs[q];
+                i32 best = -1; distance_t best_d = std::numeric_limits<distance_t>::max();
+                for (i32 i = 0; i < static_cast<i32>(s.beam.size()); ++i)
+                    if (!s.beam[i].expanded && s.beam[i].distance < best_d)
+                        { best_d = s.beam[i].distance; best = i; }
+                if (best >= 0) {
+                    s.beam[best].expanded = true;
+                    s.pf_neighbor = rdma::vamana::read_vamana_neighbors(
+                        s.beam[best].rptr, &thread);
+                }
+                s.best_idx = best;
+            }
+
+            // Phase 3: vector RDMA for all_unvisited (one batch)
+            gs.flip_query_candidate_buffer();
+            uint8_t* staging = gs.current_query_candidate_vecs();
+            const u32 staging_lkey = gs.current_query_candidate_vecs_lkey();
+            const bool use_gdr = gpu.gpudirect_candidate_ready() &&
+                                 gs.d_candidate_vecs_rdma_registered;
+            const auto tvf = std::chrono::steady_clock::now();
+            auto vr = co_await rdma::vamana::batch_read_vectors(
+                all_unvisited, thread,
+                use_gdr ? staging : nullptr, use_gdr ? staging_lkey : 0);
+            add_breakdown_subcategory(thread,
+                service::breakdown::Subcategory::rdma_vector_fetch, tvf);
+            if (vr.direct_to_gpu) {
+                thread->stats.query_rdma_to_staging_bytes += n_batch * VamanaNode::vector_bytes();
+            }
+
+            // Phase 4: Q GPU kernels (one per query) + ONE D2H for all
+            const size_t vec_sz = VamanaNode::vector_bytes();
+            const auto t_gpu = std::chrono::steady_clock::now();
+            for (u32 q = 0; q < Q; ++q) {
+                u32 nq = batch_offsets[q+1] - batch_offsets[q];
+                if (nq == 0) continue;
+                cudaMemcpyAsync(gs.d_query, query_datas[q], q_bytes,
+                                cudaMemcpyHostToDevice, gs.stream);
+                gpu::launch_batch_typed_query_l2_distances(
+                    gs.stream, nullptr,
+                    gs.d_query, static_cast<u32>(query_dtype),
+                    staging + batch_offsets[q] * vec_sz,
+                    static_cast<u32>(VamanaNode::vector_dtype()),
+                    gs.d_distances + batch_offsets[q], nq, dim_);
+            }
+            cudaEventRecord(gs.event, gs.stream);
+            co_await gpu::GpuAwaitable{thread.get()};
+            add_breakdown_subcategory(thread,
+                service::breakdown::Subcategory::gpu_query_distance, t_gpu);
+            thread->stats.distcomps += n_batch;
+            thread->stats.query_distcomps += n_batch;
+
+            // Phase 5: D2H + per-query beam update
+            const auto t_d2h = std::chrono::steady_clock::now();
+            cudaMemcpyAsync(gs.h_distances, gs.d_distances,
+                            n_batch * sizeof(float),
+                            cudaMemcpyDeviceToHost, gs.stream);
+            track_query_d2h(thread, n_batch * sizeof(float));
+            cudaStreamSynchronize(gs.stream);
+            add_breakdown_subcategory(thread,
+                service::breakdown::Subcategory::transfer_distance_d2h, t_d2h);
+
+            for (u32 q = 0; q < Q; ++q) {
+                if (!qs[q].active) continue;
+                auto& s = qs[q];
+                for (u32 i = batch_offsets[q]; i < batch_offsets[q+1]; ++i)
+                    insert_into_beam(s.beam, all_unvisited[i],
+                                     gs.h_distances[i], beam_width_);
+                if (s.best_idx < 0) {
+                    i32 best = -1; distance_t best_d = std::numeric_limits<distance_t>::max();
+                    for (i32 i = 0; i < static_cast<i32>(s.beam.size()); ++i)
+                        if (!s.beam[i].expanded && s.beam[i].distance < best_d)
+                            { best_d = s.beam[i].distance; best = i; }
+                    if (best < 0) { s.active = false; continue; }
+                    s.beam[best].expanded = true;
+                    s.pf_neighbor = rdma::vamana::read_vamana_neighbors(
+                        s.beam[best].rptr, &thread);
+                }
+            }
+        }
+
+        // Finalize: sort beams, collect results
+        for (u32 q = 0; q < Q; ++q) {
+            auto& s = qs[q];
+            std::sort(s.beam.begin(), s.beam.end(),
+                [](const auto& a, const auto& b) { return a.distance < b.distance; });
+            auto& results = thread->query_results[s.q_id];
+            results.clear();
+            u32 count = std::min(k_, static_cast<u32>(s.beam.size()));
+            for (u32 i = 0; i < count; ++i) {
+                if (direct_node_reads_) {
+                    const node_t id = co_await rdma::vamana::read_vamana_id(
+                        s.beam[i].rptr, thread);
+                    results.push_back({id, s.beam[i].distance});
+                    continue;
+                }
+                s_ptr<VamanaNode> node;
+                auto coro = read_node(s.beam[i].rptr, node, thread, true);
+                while (!coro.handle.done()) { co_await std::suspend_always{}; coro.handle.resume(); }
+                results.push_back({node->id(), s.beam[i].distance});
+            }
+        }
+    }
+
     // =========================================================================
     // Insert
     // =========================================================================

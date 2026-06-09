@@ -42,6 +42,7 @@ public:
   bool gpudirect_rdma{};  // Enable GPUDirect RDMA (read vectors directly into GPU buffers)
   u32 expansion_batch{1};   // Batch K beam expansions per iteration (1=serial)
   u32 rdma_qp_pool_size{1}; // QPs per memory node per SharedContext (1=default)
+  u32 query_batch_size{1};  // Fuse GPU across N queries (1=single query)
   str vector_data_type{"auto"};
   str insert_execution{"compute"};
   u32 insert_workers{};
@@ -192,6 +193,8 @@ private:
       "Number of beam nodes expanded per iteration.")(
       "rdma-qp-pool-size", po::value<u32>(&rdma_qp_pool_size)->default_value(1),
       "QPs per memory node per SharedContext. >1 enables parallel RDMA reads to the same node.")(
+      "query-batch-size", po::value<u32>(&query_batch_size)->default_value(1),
+      "Fuse GPU/D2H across N queries processed in lockstep (1=disabled, 2-4=batch).")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
       "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
@@ -378,6 +381,7 @@ public:
       os << std::setw(width) << "GPUDirect RDMA: " << (config.gpudirect_rdma ? "true" : "false") << std::endl;
       os << std::setw(width) << "Expansion Batch (K): " << config.expansion_batch << std::endl;
       os << std::setw(width) << "RDMA QP Pool Size: " << config.rdma_qp_pool_size << std::endl;
+      os << std::setw(width) << "Query Batch Size: " << config.query_batch_size << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {
       os << std::left << std::setfill(' ');

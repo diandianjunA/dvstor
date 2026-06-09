@@ -88,18 +88,36 @@ void schedule(Vamana<Distance>& vamana_idx,
                     }
                 } else {
                     if (not query_router->done || query_router->queue_size > 0) {
-                        idx_t slot;
                         all_done = false;
 
-                        if (query_router->query_queue.try_dequeue(slot)) {
-                            query_router->queue_size.fetch_sub(1);
-                            print_status(slot);
-
-                            coroutine.handle.destroy();
-                            thread->set_current_coroutine(coroutine_id);
-
-                            coroutine.handle = vamana_idx.knn(
-                                db.get_id(slot), db.get_components(slot), thread).handle;
+                        const u32 Q = vamana_idx.query_batch_size();
+                        if (Q > 1 && query_router->queue_size >= Q) {
+                            vec<node_t> q_ids(Q);
+                            vec<const byte_t*> q_datas(Q);
+                            bool ok = true;
+                            for (u32 i = 0; i < Q; ++i) {
+                                idx_t s;
+                                if (!query_router->query_queue.try_dequeue(s)) { ok = false; break; }
+                                query_router->queue_size.fetch_sub(1);
+                                q_ids[i] = db.get_id(s);
+                                q_datas[i] = reinterpret_cast<const byte_t*>(db.get_components(s).data());
+                            }
+                            if (ok) {
+                                coroutine.handle.destroy();
+                                thread->set_current_coroutine(coroutine_id);
+                                coroutine.handle = vamana_idx.knn_batch(
+                                    q_ids, q_datas, VectorDType::uint8, thread).handle;
+                            }
+                        } else {
+                            idx_t slot;
+                            if (query_router->query_queue.try_dequeue(slot)) {
+                                query_router->queue_size.fetch_sub(1);
+                                print_status(slot);
+                                coroutine.handle.destroy();
+                                thread->set_current_coroutine(coroutine_id);
+                                coroutine.handle = vamana_idx.knn(
+                                    db.get_id(slot), db.get_components(slot), thread).handle;
+                            }
                         }
                     }
                 }

@@ -77,9 +77,12 @@ public:
 public:
     void set_expansion_batch(u32 k) { expansion_batch_ = k; }
     u32 expansion_batch() const { return expansion_batch_; }
+    void set_query_batch_size(u32 q) { query_batch_size_ = q; }
+    u32 query_batch_size() const { return query_batch_size_; }
 
 private:
     u32 expansion_batch_{1};
+    u32 query_batch_size_{1};
     const u32 R_;
     const u32 beam_width_;
     const u32 beam_width_construction_;

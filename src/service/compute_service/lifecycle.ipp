@@ -49,6 +49,7 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     config_.R, config_.beam_width, config_.beam_width_construction,
     config_.alpha, config_.k, config_.dim, config_.resolved_vector_dtype());
   vamana_->set_expansion_batch(config_.expansion_batch);
+  vamana_->set_query_batch_size(config_.query_batch_size);
 
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,
                                               config_.max_send_queue_wr,
