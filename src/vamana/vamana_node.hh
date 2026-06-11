@@ -19,7 +19,8 @@ class ComputeThread;
  *   padding: 3B
  *   vector: vector_bytes
  *   neighbors: R * 8B
- *   rabitq_code: 8B
+ *   rabitq_code: 16B   (128-bit, two u64 halves)
+ *   rabitq_norm: 4B    (float, centred L2 norm)
  * ]
  */
 class VamanaNode {
@@ -146,12 +147,16 @@ public:
               return nsq;
           }
           default: {
-              int mean = 0;
-              for (u32 d = 0; d < DIM; ++d) mean += static_cast<int>(vec[d]);
-              mean /= static_cast<int>(DIM);
-              int nsq = 0;
-              for (u32 d = 0; d < DIM; ++d) { int c = static_cast<int>(vec[d]) - mean; nsq += c * c; }
-              return static_cast<float>(nsq);
+              // Use float centering, consistent with compute_rabitq_code.
+              float mean = 0.0f;
+              for (u32 d = 0; d < DIM; ++d) mean += static_cast<float>(static_cast<int>(vec[d]));
+              mean /= static_cast<float>(DIM);
+              float nsq = 0.0f;
+              for (u32 d = 0; d < DIM; ++d) {
+                  float c = static_cast<float>(static_cast<int>(vec[d])) - mean;
+                  nsq += c * c;
+              }
+              return nsq;
           }
       }
   }
@@ -180,25 +185,32 @@ public:
               break;
           }
           default: {
-              int mean = 0;
-              for (u32 d = 0; d < DIM; ++d) mean += static_cast<int>(vec[d]);
-              mean /= static_cast<int>(DIM);
+              // Convert integer vector to float for projection onto the
+              // orthonormal float matrix (cast-to-int would truncate all
+              // |values|<1 to zero).
+              vec<float> fv(DIM);
+              float mean = 0.0f;
+              for (u32 d = 0; d < DIM; ++d) {
+                  fv[d] = static_cast<float>(static_cast<int>(vec[d]));
+                  mean += fv[d];
+              }
+              mean /= static_cast<float>(DIM);
               for (u32 j = 0; j < 64; ++j) {
-                  int sum = 0;
+                  float sum = 0.0f;
                   for (u32 d = 0; d < DIM; ++d)
-                      sum += (static_cast<int>(vec[d]) - mean) * static_cast<int>(rabitq_proj_matrix[d * b + j]);
-                  if (sum > 0) lo |= (1ULL << (63 - j));
+                      sum += (fv[d] - mean) * rabitq_proj_matrix[d * b + j];
+                  if (sum > 0.0f) lo |= (1ULL << (63 - j));
               }
               for (u32 j = 64; j < b; ++j) {
-                  int sum = 0;
+                  float sum = 0.0f;
                   for (u32 d = 0; d < DIM; ++d)
-                      sum += (static_cast<int>(vec[d]) - mean) * static_cast<int>(rabitq_proj_matrix[d * b + j]);
-                  if (sum > 0) hi |= (1ULL << (127 - j));
+                      sum += (fv[d] - mean) * rabitq_proj_matrix[d * b + j];
+                  if (sum > 0.0f) hi |= (1ULL << (127 - j));
               }
               break;
           }
       }
-      return {0, 0};
+      return {hi, lo};
   }
 
   // Approximate L2 distance from RaBitQ codes using arcsin formula:

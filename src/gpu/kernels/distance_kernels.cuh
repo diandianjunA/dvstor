@@ -319,19 +319,22 @@ __global__ void robust_prune_typed_kernel(
 
 // RaBitQ: approximate L2 from 128-bit codes via arcsin formula.
 // Codes and norms are interleaved: [code_lo(8B)][code_hi(8B)][norm(4B)] per candidate.
+// Entries are tightly packed at 20 bytes; addressed at byte granularity to
+// avoid the stride-vs-packing mismatch (stride_qwords rounds 20B -> 3 qwords
+// = 24B, but RDMA writes 20B per entry).
 __global__ void rabitq_popcount_kernel(
     const uint64_t* __restrict__ query_code,
-    const uint64_t* __restrict__ candidate_data,
+    const uint8_t* __restrict__ candidate_data,
     float* __restrict__ distances,
-    float query_norm2, uint32_t n_candidates, uint32_t stride_qwords)
+    float query_norm2, uint32_t n_candidates, uint32_t entry_bytes)
 {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n_candidates) return;
     uint64_t q_lo = query_code[0], q_hi = query_code[1];
-    const uint64_t* entry = candidate_data + static_cast<size_t>(tid) * stride_qwords;
-    uint64_t c_lo = entry[0], c_hi = entry[1];
-    // Norm is 4 bytes starting at byte 16 of the 20-byte entry
-    float vn2 = *reinterpret_cast<const float*>(reinterpret_cast<const char*>(entry) + 16);
+    const uint8_t* entry = candidate_data + static_cast<size_t>(tid) * entry_bytes;
+    uint64_t c_lo = *reinterpret_cast<const uint64_t*>(entry);
+    uint64_t c_hi = *reinterpret_cast<const uint64_t*>(entry + 8);
+    float vn2 = *reinterpret_cast<const float*>(entry + 16);
 
     uint32_t pop = __popcll(q_lo ^ c_lo) + __popcll(q_hi ^ c_hi);
     float qn = sqrtf(fmaxf(query_norm2, 0.0f));

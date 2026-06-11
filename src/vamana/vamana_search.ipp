@@ -159,7 +159,6 @@
             const auto tvf = std::chrono::steady_clock::now();
             static constexpr size_t RQ_ENTRY = VamanaNode::RABITQ_CODE_SIZE
                                                + VamanaNode::RABITQ_NORM_SIZE;  // 20
-            static constexpr u32 RQ_STRIDE_QWORDS = (RQ_ENTRY + 7) / 8;  // 3
             if (use_rabitq_) {
                 // Read 20-byte RaBitQ codes (16B) + norms (4B).
                 if (use_gpudirect_candidate_rdma
@@ -223,9 +222,9 @@
                 gpu::launch_batch_rabitq_distances(
                     gs.stream, gs.event,
                     reinterpret_cast<const uint64_t*>(gs.d_query),
-                    reinterpret_cast<const uint64_t*>(staging),
+                    staging,
                     gs.d_distances, rabitq_query_norm2,
-                    n_batch, RQ_STRIDE_QWORDS);
+                    n_batch, RQ_ENTRY);
             } else if (use_indirect_candidate_path) {
                 for (u32 i = 0; i < n_batch; ++i)
                     gs.h_candidate_ptrs[i] = staging + i * VamanaNode::vector_bytes();
