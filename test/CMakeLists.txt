@@ -12,6 +12,7 @@ add_test(NAME storage_owner_handoff_protocol_test
 add_executable(rabitq_encoding_test
     rabitq_encoding_test.cc
 )
+target_link_libraries(rabitq_encoding_test PRIVATE dvstor_gpu_kernels rdma_library CUDA::cudart)
 target_include_directories(rabitq_encoding_test PRIVATE
     ${PROJECT_SOURCE_DIR}/src
     ${PROJECT_SOURCE_DIR}/rdma-library

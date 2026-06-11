@@ -276,13 +276,14 @@ bool ComputeService<Distance>::validate_index_metadata(const filepath_t& index_p
     }
     return false;
   }
-  if (metadata.node_layout == "rabitq") {
-    if (metadata.schema_version < 5) {
-      if (error_message) {
-        *error_message = "RaBitQ index schema is obsolete; rebuild the index with the current offline builder";
-      }
-      return false;
+  if (metadata.schema_version < 7 ||
+      metadata.storage_format != VamanaNode::storage_format_name()) {
+    if (error_message) {
+      *error_message = "index storage format is obsolete; rebuild the index with the current offline builder";
     }
+    return false;
+  }
+  if (metadata.node_layout == "rabitq") {
     if (metadata.rabitq_centroid.size() != metadata.dim) {
       if (error_message) {
         *error_message = "RaBitQ index metadata has a missing or invalid centroid";
@@ -305,6 +306,11 @@ bool ComputeService<Distance>::validate_index_metadata(const filepath_t& index_p
       metadata.vector_component_size != VamanaNode::vector_component_size() ||
       metadata.vector_bytes != VamanaNode::vector_bytes() ||
       metadata.node_size != VamanaNode::total_size() ||
+      metadata.graph_hot_bytes != VamanaNode::graph_hot_bytes() ||
+      metadata.vector_offset != VamanaNode::offset_vector() ||
+      metadata.neighbors_offset != VamanaNode::offset_neighbors() ||
+      metadata.rabitq_offset != (VamanaNode::HAS_RABITQ_CODE
+                                   ? VamanaNode::offset_rabitq_code() : 0) ||
       metadata.num_memory_nodes != num_servers_) {
     if (error_message) {
       *error_message = "index metadata does not match runtime Vamana configuration";

@@ -40,8 +40,8 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
   const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
   const u32 coroutines_per_worker = std::max<u32>(1, config.insert_coroutines == 0 ? config.num_coroutines
                                                                                     : config.insert_coroutines);
-  const size_t snapshot_stride = align_up(VamanaNode::size_until_vector_end());
-  const size_t neighbor_stride = align_up(sizeof(u8)) + VamanaNode::NEIGHBORS_SIZE;
+  const size_t snapshot_stride = align_up(VamanaNode::vector_bytes());
+  const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
   const size_t coroutine_scratch_stride =
     align_up(std::max<size_t>(VamanaNode::total_size(),
                               std::max(neighbor_stride,

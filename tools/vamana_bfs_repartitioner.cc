@@ -36,8 +36,10 @@ struct Options {
 };
 
 struct NodeFormat {
+  size_t graph_hot_bytes{};
   size_t vector_offset{};
   size_t neighbors_offset{};
+  size_t rabitq_offset{};
   size_t vector_bytes{};
   size_t neighbors_bytes{};
   size_t node_bytes{};
@@ -160,6 +162,10 @@ size_t align8(size_t value) {
   return (value + 7) & ~static_cast<size_t>(7);
 }
 
+size_t align64(size_t value) {
+  return (value + 63) & ~static_cast<size_t>(63);
+}
+
 size_t rabitq_entry_bytes(u32 dim) {
   if (dim == 0 || dim > (1u << 30)) {
     throw std::runtime_error("RaBitQ dimension must be in [1, 2^30]");
@@ -167,20 +173,23 @@ size_t rabitq_entry_bytes(u32 dim) {
   u32 bits = 1;
   while (bits < dim) bits <<= 1;
   bits = std::max<u32>(bits, 8);
-  return align8(bits / 8 + 2 * sizeof(float));
+  const size_t code_bytes = (bits / 8 + 3) & ~static_cast<size_t>(3);
+  return align8(code_bytes + 2 * sizeof(float));
 }
 
 NodeFormat make_format(u32 dim, u32 R, VectorDType vector_dtype, const std::string& node_layout) {
   NodeFormat format;
   format.vector_bytes = vector_dtype_bytes(vector_dtype, dim);
   format.neighbors_bytes = static_cast<size_t>(R) * sizeof(u64);
-  format.vector_offset = kNodeFixedPrefixBytes;
-  format.neighbors_offset = format.vector_offset + format.vector_bytes;
-  format.node_bytes = kNodeFixedPrefixBytes + format.vector_bytes + format.neighbors_bytes;
+  format.neighbors_offset = kNodeFixedPrefixBytes;
+  format.graph_hot_bytes = align64(format.neighbors_offset + format.neighbors_bytes);
+  format.vector_offset = format.graph_hot_bytes;
+  format.node_bytes = format.vector_offset + align64(format.vector_bytes);
   if (node_layout == "rabitq") {
-    format.node_bytes += rabitq_entry_bytes(dim);
+    format.rabitq_offset = format.node_bytes;
+    format.node_bytes += align64(rabitq_entry_bytes(dim));
   }
-  format.aligned_node_bytes = align8(format.node_bytes);
+  format.aligned_node_bytes = align64(format.node_bytes);
   return format;
 }
 
@@ -482,12 +491,21 @@ void write_metadata(const Options& options,
   metadata["num_memory_nodes"] = options.memory_nodes;
   metadata["dim"] = options.dim;
   metadata["R"] = options.R;
-  metadata["schema_version"] = metadata.value("schema_version", 3u);
+  metadata["schema_version"] = 7;
+  metadata["storage_format"] = "hybrid_split_v1";
   metadata["node_size"] = format.node_bytes;
+  metadata["graph_hot_bytes"] = format.graph_hot_bytes;
+  metadata["vector_offset"] = format.vector_offset;
+  metadata["neighbors_offset"] = format.neighbors_offset;
+  metadata["rabitq_offset"] = format.rabitq_offset;
   metadata["node_layout"] = metadata.value("node_layout", std::string{"standard"});
   metadata["vector_data_type"] = vector_dtype_name(options.vector_dtype);
   metadata["vector_component_size"] = vector_dtype_component_size(options.vector_dtype);
   metadata["vector_bytes"] = format.vector_bytes;
+  metadata["vector_storage_bytes"] = align64(format.vector_bytes);
+  if (metadata.value("node_layout", std::string{"standard"}) == "rabitq") {
+    metadata["rabitq_entry_storage_size"] = align64(rabitq_entry_bytes(options.dim));
+  }
   metadata["medoid"] = {{"memory_node", new_medoid.memory_node()}, {"offset", new_medoid.byte_offset()}};
   metadata["partition_strategy"] = "bfs";
   metadata["partition_cross_shard_ratio"] = after_stats.ratio();
@@ -534,12 +552,19 @@ int main(int argc, char** argv) {
       throw std::runtime_error("unsupported node_layout: " + node_layout);
     }
 
+    if (metadata.value("schema_version", 0u) < 7 ||
+        metadata.value("storage_format", std::string{}) != "hybrid_split_v1") {
+      throw std::runtime_error("input index must be rebuilt with hybrid_split_v1 schema");
+    }
+
     const NodeFormat format = make_format(options.dim, options.R, options.vector_dtype, node_layout);
     const size_t metadata_node_size = metadata.value("node_size", format.node_bytes);
-    if (metadata_node_size != format.node_bytes) {
-      throw std::runtime_error(
-          "metadata node_size " + std::to_string(metadata_node_size) +
-          " does not match computed node_bytes " + std::to_string(format.node_bytes));
+    if (metadata_node_size != format.node_bytes ||
+        metadata.value("graph_hot_bytes", 0u) != format.graph_hot_bytes ||
+        metadata.value("vector_offset", 0u) != format.vector_offset ||
+        metadata.value("neighbors_offset", 0u) != format.neighbors_offset ||
+        metadata.value("rabitq_offset", 0u) != format.rabitq_offset) {
+      throw std::runtime_error("metadata storage layout does not match computed hybrid_split_v1 layout");
     }
 
     ensure_output_paths_available(options);

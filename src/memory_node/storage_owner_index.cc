@@ -7,6 +7,8 @@
 namespace {
 
 using Configuration = configuration::IndexConfiguration;
+using BeamEntry = memory_node_detail::BeamEntry;
+using HandoffResult = memory_node_detail::HandoffResult;
 using NodeSnapshot = memory_node_detail::NodeSnapshot;
 using StorageOwnerThread = memory_node_detail::StorageOwnerThread;
 using BeamEntrySerialized = service::storage_owner::BeamEntrySerialized;
@@ -20,11 +22,9 @@ using service::storage_owner::handoff_request_beam;
 using service::storage_owner::handoff_request_visited;
 using service::storage_owner::handoff_response_beam;
 using service::storage_owner::handoff_response_visited;
-using service::storage_owner::search_handoff_request_bytes;
-using service::storage_owner::search_handoff_response_bytes;
 
 size_t aligned_snapshot_bytes() {
-  size_t value = VamanaNode::size_until_vector_end();
+  size_t value = VamanaNode::vector_bytes();
   while (value % CACHELINE_SIZE != 0) {
     ++value;
   }
@@ -49,14 +49,165 @@ u32 storage_owner_prune_candidate_limit(const Configuration& config) {
   return std::max(config.R, config.storage_owner_prune_max_candidates);
 }
 
-void parse_node_snapshot(RemotePtr rptr, const byte_t* ptr, NodeSnapshot& snapshot) {
+void parse_vector_snapshot(RemotePtr rptr, const byte_t* ptr, NodeSnapshot& snapshot) {
   snapshot = NodeSnapshot{};
   snapshot.rptr = rptr;
   snapshot.vector_data.resize(VamanaNode::vector_bytes());
-  snapshot.header = *reinterpret_cast<const u64*>(ptr);
-  snapshot.id = *reinterpret_cast<const u32*>(ptr + VamanaNode::offset_id());
-  snapshot.edge_count = *reinterpret_cast<const u8*>(ptr + VamanaNode::offset_edge_count());
-  std::memcpy(snapshot.vector_data.data(), ptr + VamanaNode::offset_vector(), VamanaNode::vector_bytes());
+  std::memcpy(snapshot.vector_data.data(), ptr, VamanaNode::vector_bytes());
+}
+
+struct HandoffTargetShard {
+  u32 shard{};
+  distance_t best_distance{std::numeric_limits<distance_t>::max()};
+};
+
+vec<HandoffTargetShard> collect_handoff_targets(const vec<BeamEntry>& beam,
+                                                const vec<byte_t>& shard_searched,
+                                                u32 local_shard_id,
+                                                u32 shard_count) {
+  vec<HandoffTargetShard> targets;
+  targets.reserve(shard_count);
+  for (const BeamEntry& entry : beam) {
+    if (entry.expanded) {
+      continue;
+    }
+    const u32 shard = entry.rptr.memory_node();
+    if (shard >= shard_count || shard == local_shard_id || shard_searched[shard]) {
+      continue;
+    }
+    auto it = std::find_if(targets.begin(), targets.end(), [shard](const HandoffTargetShard& target) {
+      return target.shard == shard;
+    });
+    if (it == targets.end()) {
+      targets.push_back(HandoffTargetShard{shard, entry.distance});
+    } else if (entry.distance < it->best_distance) {
+      it->best_distance = entry.distance;
+    }
+  }
+  std::sort(targets.begin(), targets.end(), [](const HandoffTargetShard& lhs, const HandoffTargetShard& rhs) {
+    return lhs.best_distance < rhs.best_distance;
+  });
+  return targets;
+}
+
+void mark_shard_frontier_expanded(vec<BeamEntry>& beam, u32 shard) {
+  for (BeamEntry& entry : beam) {
+    if (!entry.expanded && entry.rptr.memory_node() == shard) {
+      entry.expanded = true;
+    }
+  }
+}
+
+vec<BeamEntrySerialized> serialize_unexpanded_beam(const vec<BeamEntry>& beam) {
+  vec<BeamEntrySerialized> serialized;
+  serialized.reserve(beam.size());
+  for (const BeamEntry& entry : beam) {
+    if (!entry.expanded) {
+      serialized.push_back({entry.rptr.raw_address, entry.distance});
+    }
+  }
+  return serialized;
+}
+
+vec<u64> serialize_visited_for_shard(const hashset_t<RemotePtr>& visited,
+                                     u32 target_shard,
+                                     size_t max_visited) {
+  vec<u64> serialized;
+  serialized.reserve(std::min(visited.size(), max_visited));
+  for (const RemotePtr& entry : visited) {
+    if (entry.memory_node() == target_shard) {
+      serialized.push_back(entry.raw_address);
+      if (serialized.size() == max_visited) {
+        break;
+      }
+    }
+  }
+  return serialized;
+}
+
+vec<byte_t> build_search_handoff_request(const span<const element_t> query,
+                                         const vec<BeamEntry>& beam,
+                                         const hashset_t<RemotePtr>& visited,
+                                         u32 target_shard,
+                                         u32 source_shard,
+                                         u64 request_id,
+                                         const Configuration& config) {
+  const vec<BeamEntrySerialized> beam_serialized = serialize_unexpanded_beam(beam);
+  const size_t max_visited = static_cast<size_t>(storage_owner_construction_width(config)) * config.R;
+  const vec<u64> visited_serialized = serialize_visited_for_shard(visited, target_shard, max_visited);
+  const u32 vector_bytes = static_cast<u32>(VamanaNode::DIM * sizeof(element_t));
+  const size_t payload_bytes = static_cast<size_t>(vector_bytes) +
+                               beam_serialized.size() * sizeof(BeamEntrySerialized) +
+                               visited_serialized.size() * sizeof(u64);
+
+  vec<byte_t> msg_buffer(sizeof(SearchHandoffRequestHeader) + payload_bytes);
+  auto* req = reinterpret_cast<SearchHandoffRequestHeader*>(msg_buffer.data());
+  req->rpc.magic = kPeerRpcMagic;
+  req->rpc.type = static_cast<u32>(PeerRpcType::search_handoff_request);
+  req->rpc.source_shard = source_shard;
+  req->rpc.item_count = static_cast<u32>(beam_serialized.size());
+  req->rpc.request_id = request_id;
+  req->rpc.status = static_cast<u32>(InsertStatus::failed);
+  req->rpc.reserved = 0;
+  req->beam_width = storage_owner_construction_width(config);
+  req->snapshot_batch = storage_owner_snapshot_batch_size(config);
+  req->originator_shard = source_shard;
+  req->visited_count = static_cast<u32>(visited_serialized.size());
+  req->vector_bytes = vector_bytes;
+  req->reserved = 0;
+
+  std::memcpy(handoff_query_vector(req), query.data(), vector_bytes);
+  auto* beam_out = handoff_request_beam(req, vector_bytes);
+  std::memcpy(beam_out, beam_serialized.data(), beam_serialized.size() * sizeof(BeamEntrySerialized));
+  auto* visited_out = handoff_request_visited(req, vector_bytes, static_cast<u32>(beam_serialized.size()));
+  std::memcpy(visited_out, visited_serialized.data(), visited_serialized.size() * sizeof(u64));
+  return msg_buffer;
+}
+
+void merge_or_update_beam_entry(vec<BeamEntry>& beam, RemotePtr rptr, distance_t dist, u32 max_beam_width) {
+  for (BeamEntry& entry : beam) {
+    if (entry.rptr == rptr) {
+      if (dist < entry.distance) {
+        entry.distance = dist;
+      }
+      return;
+    }
+  }
+
+  auto it = std::lower_bound(
+    beam.begin(), beam.end(), dist, [](const BeamEntry& entry, distance_t value) { return entry.distance < value; });
+  beam.insert(it, BeamEntry{rptr, dist, false});
+  if (beam.size() > max_beam_width) {
+    beam.resize(max_beam_width);
+  }
+}
+
+bool merge_search_handoff_response(vec<BeamEntry>& beam,
+                                   hashset_t<RemotePtr>& visited,
+                                   const HandoffResult& result,
+                                   u32 construction_width) {
+  if (!result.ok() || result.response.empty()) {
+    return false;
+  }
+  const auto* resp = reinterpret_cast<const SearchHandoffResponseHeader*>(result.response.data());
+  if (resp->rpc.magic != kPeerRpcMagic ||
+      resp->rpc.type != static_cast<u32>(PeerRpcType::search_handoff_response) ||
+      resp->rpc.status != static_cast<u32>(InsertStatus::ok)) {
+    return false;
+  }
+
+  const auto* resp_beam = handoff_response_beam(resp);
+  for (u32 i = 0; i < resp->updated_beam_count; ++i) {
+    merge_or_update_beam_entry(beam, RemotePtr{resp_beam[i].rptr_raw}, resp_beam[i].distance, construction_width);
+  }
+
+  const byte_t* resp_visited = handoff_response_visited(resp, resp->updated_beam_count);
+  for (u32 i = 0; i < resp->new_visited_count; ++i) {
+    u64 raw{};
+    std::memcpy(&raw, resp_visited + static_cast<size_t>(i) * sizeof(raw), sizeof(raw));
+    visited.insert(RemotePtr{raw});
+  }
+  return true;
 }
 
 }  // namespace
@@ -135,16 +286,16 @@ bool MemoryNode::try_set_global_medoid(const RemotePtr& expected, const RemotePt
 bool MemoryNode::read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
   lib_assert(rptr.memory_node() < num_storage_nodes_,
              "invalid remote shard id in read_node_snapshot: " + std::to_string(rptr.memory_node()));
-  lib_assert(rptr.byte_offset() + VamanaNode::size_until_vector_end() <= mn_memory_bytes_,
+  lib_assert(rptr.byte_offset() + VamanaNode::offset_vector() + VamanaNode::vector_bytes() <= mn_memory_bytes_,
              "node snapshot read exceeds shard bounds: shard=" + std::to_string(rptr.memory_node()) +
                " offset=" + std::to_string(rptr.byte_offset()) +
-               " size=" + std::to_string(VamanaNode::size_until_vector_end()) +
+               " size=" + std::to_string(VamanaNode::vector_bytes()) +
                " capacity=" + std::to_string(mn_memory_bytes_));
   snapshot = NodeSnapshot{};
   snapshot.rptr = rptr;
   snapshot.vector_data.resize(VamanaNode::vector_bytes());
 
-  const size_t read_size = VamanaNode::size_until_vector_end();
+  const size_t read_size = VamanaNode::vector_bytes();
   if (local_shard(rptr.memory_node())) {
     const byte_t* ptr = local_node_ptr(rptr);
     snapshot.header = *reinterpret_cast<const u64*>(ptr);
@@ -158,12 +309,12 @@ bool MemoryNode::read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
   byte_t* read_buffer = owner_thread != nullptr && owner_thread->has_peer_scratch()
                           ? owner_thread->scratch_buffer.get_full_buffer()
                           : peer_scratch_buffer_.get_full_buffer();
-  remote_read_bytes(rptr.memory_node(), rptr.byte_offset(), read_buffer, read_size, 0);
-  const byte_t* ptr = read_buffer;
-  snapshot.header = *reinterpret_cast<const u64*>(ptr);
-  snapshot.id = *reinterpret_cast<const u32*>(ptr + VamanaNode::offset_id());
-  snapshot.edge_count = *reinterpret_cast<const u8*>(ptr + VamanaNode::offset_edge_count());
-  std::memcpy(snapshot.vector_data.data(), ptr + VamanaNode::offset_vector(), VamanaNode::vector_bytes());
+  remote_read_bytes(rptr.memory_node(),
+                    rptr.byte_offset() + VamanaNode::offset_vector(),
+                    read_buffer,
+                    read_size,
+                    0);
+  parse_vector_snapshot(rptr, read_buffer, snapshot);
   return true;
 }
 
@@ -189,16 +340,19 @@ vec<RemotePtr> MemoryNode::read_neighbor_list(RemotePtr rptr) {
     return neighbors;
   }
 
-  u8 edge_count = 0;
-  remote_read_bytes(rptr.memory_node(), rptr.byte_offset() + VamanaNode::offset_edge_count(), &edge_count, sizeof(edge_count), 0);
-  vec<RemotePtr> slots(VamanaNode::R);
+  StorageOwnerThread* owner_thread = current_storage_owner_thread_;
+  byte_t* read_buffer = owner_thread != nullptr && owner_thread->has_peer_scratch()
+                          ? owner_thread->scratch_buffer.get_full_buffer()
+                          : peer_scratch_buffer_.get_full_buffer();
   remote_read_bytes(rptr.memory_node(),
-                    rptr.byte_offset() + VamanaNode::offset_neighbors(),
-                    slots.data(),
-                    VamanaNode::NEIGHBORS_SIZE,
-                    align_up(sizeof(u64)));
+                    rptr.byte_offset() + VamanaNode::neighbor_read_offset(),
+                    read_buffer,
+                    VamanaNode::neighbor_read_size(),
+                    0);
+  const u8 edge_count = *reinterpret_cast<const u8*>(read_buffer + VamanaNode::neighbor_count_offset_in_read());
+  const auto* slots = reinterpret_cast<const RemotePtr*>(read_buffer + VamanaNode::neighbor_payload_offset_in_read());
   neighbors.reserve(edge_count);
-  for (u32 i = 0; i < edge_count && i < slots.size(); ++i) {
+  for (u32 i = 0; i < edge_count && i < VamanaNode::R; ++i) {
     if (!slots[i].is_null()) {
       neighbors.push_back(slots[i]);
     }
@@ -221,13 +375,7 @@ auto MemoryNode::async_read_node_snapshot(RemotePtr rptr, StorageOwnerThread& th
       if (ready) {
         return std::move(snapshot);
       }
-      snapshot = NodeSnapshot{};
-      snapshot.rptr = rptr;
-      snapshot.vector_data.resize(VamanaNode::vector_bytes());
-      snapshot.header = *reinterpret_cast<const u64*>(buffer);
-      snapshot.id = *reinterpret_cast<const u32*>(buffer + VamanaNode::offset_id());
-      snapshot.edge_count = *reinterpret_cast<const u8*>(buffer + VamanaNode::offset_edge_count());
-      std::memcpy(snapshot.vector_data.data(), buffer + VamanaNode::offset_vector(), VamanaNode::vector_bytes());
+      parse_vector_snapshot(rptr, buffer, snapshot);
       return std::move(snapshot);
     }
   };
@@ -239,7 +387,11 @@ auto MemoryNode::async_read_node_snapshot(RemotePtr rptr, StorageOwnerThread& th
   }
 
   byte_t* buffer = thread.coroutine_scratch();
-  post_peer_read_async(thread, rptr.memory_node(), rptr.byte_offset(), buffer, VamanaNode::size_until_vector_end());
+  post_peer_read_async(thread,
+                       rptr.memory_node(),
+                       rptr.byte_offset() + VamanaNode::offset_vector(),
+                       buffer,
+                       VamanaNode::vector_bytes());
   return Awaitable{false, rptr, buffer, {}, this, &thread};
 }
 
@@ -262,7 +414,7 @@ auto MemoryNode::async_read_node_snapshots(const vec<RemotePtr>& rptrs,
     vec<NodeSnapshot> await_resume() {
       for (const PendingRead& read : pending) {
         NodeSnapshot snapshot;
-        parse_node_snapshot(read.rptr, read.buffer, snapshot);
+        parse_vector_snapshot(read.rptr, read.buffer, snapshot);
         snapshots.push_back(std::move(snapshot));
       }
       return std::move(snapshots);
@@ -274,7 +426,7 @@ auto MemoryNode::async_read_node_snapshots(const vec<RemotePtr>& rptrs,
   awaitable.pending.reserve(rptrs.size());
   awaitable.thread = &thread;
 
-  const size_t snapshot_size = VamanaNode::size_until_vector_end();
+  const size_t snapshot_size = VamanaNode::vector_bytes();
   const size_t snapshot_stride = aligned_snapshot_bytes();
   const u32 max_batch = storage_owner_snapshot_batch_size(config);
   lib_assert(rptrs.size() <= max_batch, "storage-owner snapshot batch exceeds configured limit");
@@ -296,7 +448,7 @@ auto MemoryNode::async_read_node_snapshots(const vec<RemotePtr>& rptrs,
     lib_assert(scratch_offset + snapshot_size <= thread.scratch_stride,
                "storage-owner coroutine scratch stride is too small for snapshot batch");
     byte_t* buffer = thread.coroutine_scratch(scratch_offset);
-    post_peer_read_async(thread, rptr.memory_node(), rptr.byte_offset(), buffer, snapshot_size);
+    post_peer_read_async(thread, rptr.memory_node(), rptr.byte_offset() + VamanaNode::offset_vector(), buffer, snapshot_size);
     awaitable.pending.push_back(PendingRead{rptr, buffer});
     awaitable.ready = false;
     ++remote_slot;
@@ -329,7 +481,7 @@ vec<MemoryNode::NodeSnapshot> MemoryNode::read_node_snapshots_batched(const vec<
     byte_t* buffer{};
   };
 
-  const size_t snapshot_size = VamanaNode::size_until_vector_end();
+  const size_t snapshot_size = VamanaNode::vector_bytes();
   const size_t snapshot_stride = aligned_snapshot_bytes();
   const size_t max_batch = storage_owner_snapshot_batch_size(config);
 
@@ -356,7 +508,7 @@ vec<MemoryNode::NodeSnapshot> MemoryNode::read_node_snapshots_batched(const vec<
       lib_assert(scratch_offset + snapshot_size <= thread->scratch_stride,
                  "storage-owner coroutine scratch stride is too small for snapshot batch");
       byte_t* buffer = thread->coroutine_scratch(scratch_offset);
-      post_peer_read_async(*thread, rptr.memory_node(), rptr.byte_offset(), buffer, snapshot_size);
+      post_peer_read_async(*thread, rptr.memory_node(), rptr.byte_offset() + VamanaNode::offset_vector(), buffer, snapshot_size);
       pending.push_back(PendingRead{rptr, buffer});
       ++remote_slot;
     }
@@ -368,7 +520,7 @@ vec<MemoryNode::NodeSnapshot> MemoryNode::read_node_snapshots_batched(const vec<
 
     for (const PendingRead& read : pending) {
       NodeSnapshot snapshot;
-      parse_node_snapshot(read.rptr, read.buffer, snapshot);
+      parse_vector_snapshot(read.rptr, read.buffer, snapshot);
       snapshots.push_back(std::move(snapshot));
     }
   }
@@ -391,8 +543,10 @@ auto MemoryNode::async_read_neighbor_list(RemotePtr rptr, StorageOwnerThread& th
       if (ready) {
         return std::move(neighbors);
       }
-      const u8 edge_count = *reinterpret_cast<const u8*>(buffer);
-      const auto* slots = reinterpret_cast<const RemotePtr*>(buffer + align_up(sizeof(u8)));
+      const u8 edge_count = *reinterpret_cast<const u8*>(
+        buffer + VamanaNode::neighbor_count_offset_in_read());
+      const auto* slots = reinterpret_cast<const RemotePtr*>(
+        buffer + VamanaNode::neighbor_payload_offset_in_read());
       neighbors.reserve(edge_count);
       for (u32 i = 0; i < edge_count && i < VamanaNode::R; ++i) {
         if (!slots[i].is_null()) {
@@ -411,15 +565,9 @@ auto MemoryNode::async_read_neighbor_list(RemotePtr rptr, StorageOwnerThread& th
   byte_t* buffer = thread.coroutine_scratch();
   post_peer_read_async(thread,
                        rptr.memory_node(),
-                       rptr.byte_offset() + VamanaNode::offset_edge_count(),
+                       rptr.byte_offset() + VamanaNode::neighbor_read_offset(),
                        buffer,
-                       sizeof(u8));
-  post_peer_read_async(thread,
-                       rptr.memory_node(),
-                       rptr.byte_offset() + VamanaNode::offset_neighbors(),
-                       buffer,
-                       VamanaNode::NEIGHBORS_SIZE,
-                       align_up(sizeof(u8)));
+                       VamanaNode::neighbor_read_size());
   return Awaitable{false, rptr, buffer, {}, this, &thread};
 }
 
@@ -1275,92 +1423,53 @@ auto MemoryNode::beam_search_candidates_transitive_async(
     // Phase 1: Expand all local nodes
     expand_all_local_nodes(beam, visited, query, config, storage_id_, breakdown);
 
-    // Phase 2: Find best unexpanded remote node
-    i32 best_idx = -1;
-    distance_t best_dist = std::numeric_limits<distance_t>::max();
-    for (i32 i = 0; i < static_cast<i32>(beam.size()); ++i) {
-      if (!beam[i].expanded && beam[i].distance < best_dist) {
-        best_dist = beam[i].distance;
-        best_idx = i;
+    // Phase 2: collect every remote shard currently represented in the frontier.
+    // Issuing these handoffs together avoids serial shard-by-shard update search.
+    vec<HandoffTargetShard> targets = collect_handoff_targets(
+      beam, shard_searched, storage_id_, config.num_server_nodes());
+    if (targets.empty()) {
+      break;
+    }
+
+    struct PendingHandoff {
+      u32 target_shard{};
+      SearchHandoffAwaitable awaitable;
+    };
+    vec<PendingHandoff> pending;
+    pending.reserve(targets.size());
+    for (const HandoffTargetShard& target : targets) {
+      vec<byte_t> message = build_search_handoff_request(
+        query,
+        beam,
+        visited,
+        target.shard,
+        storage_id_,
+        next_peer_request_id_.fetch_add(1, std::memory_order_relaxed),
+        config);
+      pending.push_back(PendingHandoff{
+        target.shard,
+        async_search_handoff(target.shard, std::move(message), thread, config)});
+      shard_searched[target.shard] = 1;
+    }
+
+    struct CompletedHandoff {
+      u32 target_shard{};
+      HandoffResult result;
+    };
+    vec<CompletedHandoff> completed;
+    completed.reserve(pending.size());
+    bool queue_full = false;
+    for (PendingHandoff& item : pending) {
+      HandoffResult handoff = co_await item.awaitable;
+      if (breakdown != nullptr) {
+        breakdown->storage_owner_handoff_queue_wait_ns += handoff.queue_wait_ns;
+        breakdown->storage_owner_handoff_send_ns += handoff.send_ns;
+        breakdown->storage_owner_handoff_response_wait_ns += handoff.response_wait_ns;
       }
+      queue_full = queue_full || handoff.status == HandoffResultStatus::queue_full;
+      completed.push_back(CompletedHandoff{item.target_shard, std::move(handoff)});
     }
-    if (best_idx < 0) break;  // all expanded
-
-    const u32 target_shard = beam[best_idx].rptr.memory_node();
-    if (target_shard >= config.num_server_nodes()) break;
-
-    // Skip shards we've already searched (mark expanded and continue)
-    if (shard_searched[target_shard]) {
-      beam[best_idx].expanded = true;
-      continue;
-    }
-
-    // Phase 3: Build and send search handoff RPC
-    // Collect unexpanded beam entries (both local and remote) to send
-    vec<BeamEntrySerialized> beam_serialized;
-    vec<u64> visited_serialized;
-    beam_serialized.reserve(beam.size());
-    visited_serialized.reserve(visited.size());
-
-    for (const auto& entry : beam) {
-      if (!entry.expanded) {
-        beam_serialized.push_back({entry.rptr.raw_address, entry.distance});
-      }
-    }
-    for (const RemotePtr& entry : visited) {
-      if (entry.memory_node() == target_shard) {
-        visited_serialized.push_back(entry.raw_address);
-      }
-    }
-    const size_t max_visited = static_cast<size_t>(storage_owner_construction_width(config)) * config.R;
-    if (visited_serialized.size() > max_visited) {
-      visited_serialized.resize(max_visited);
-    }
-
-    const u32 vector_bytes = VamanaNode::vector_bytes();
-    const size_t payload_bytes =
-        static_cast<size_t>(vector_bytes) +
-        beam_serialized.size() * sizeof(BeamEntrySerialized) +
-        visited_serialized.size() * sizeof(u64);
-
-    vec<byte_t> msg_buffer(sizeof(SearchHandoffRequestHeader) + payload_bytes);
-    auto* req = reinterpret_cast<SearchHandoffRequestHeader*>(msg_buffer.data());
-    req->rpc.magic = kPeerRpcMagic;
-    req->rpc.type = static_cast<u32>(PeerRpcType::search_handoff_request);
-    req->rpc.source_shard = storage_id_;
-    req->rpc.item_count = static_cast<u32>(beam_serialized.size());
-    req->rpc.request_id = next_peer_request_id_.fetch_add(1, std::memory_order_relaxed);
-    req->rpc.status = static_cast<u32>(InsertStatus::failed);
-    req->rpc.reserved = 0;
-    req->beam_width = storage_owner_construction_width(config);
-    req->snapshot_batch = storage_owner_snapshot_batch_size(config);
-    req->originator_shard = storage_id_;
-    
-    req->visited_count = static_cast<u32>(visited_serialized.size());
-    req->vector_bytes = vector_bytes;
-    req->reserved = 0;
-
-    // Copy query vector
-    std::memcpy(handoff_query_vector(req), query.data(), vector_bytes);
-
-    // Copy beam
-    auto* beam_out = handoff_request_beam(req, vector_bytes);
-    std::memcpy(beam_out, beam_serialized.data(),
-                beam_serialized.size() * sizeof(BeamEntrySerialized));
-
-    // Copy visited (variable size, stored after beam)
-    auto* visited_out = handoff_request_visited(req, vector_bytes, static_cast<u32>(beam_serialized.size()));
-    std::memcpy(visited_out, visited_serialized.data(),
-                visited_serialized.size() * sizeof(u64));
-
-    const HandoffResult handoff = co_await async_search_handoff(
-      target_shard, std::move(msg_buffer), thread, config);
-    if (breakdown != nullptr) {
-      breakdown->storage_owner_handoff_queue_wait_ns += handoff.queue_wait_ns;
-      breakdown->storage_owner_handoff_send_ns += handoff.send_ns;
-      breakdown->storage_owner_handoff_response_wait_ns += handoff.response_wait_ns;
-    }
-    if (handoff.status == HandoffResultStatus::queue_full) {
+    if (queue_full) {
       auto fallback = beam_search_candidates_async(query, medoid, config, thread, breakdown);
       co_await std::suspend_always{};
       while (!fallback.handle.done()) {
@@ -1373,46 +1482,11 @@ auto MemoryNode::beam_search_candidates_transitive_async(
       fallback.handle.destroy();
       co_return;
     }
-    shard_searched[target_shard] = 1;
 
-    if (!handoff.ok()) {
-      beam[best_idx].expanded = true;  // skip failed shard, continue
-      continue;
-    }
-
-    // Phase 4: Merge response data
-    if (!handoff.response.empty()) {
-      const auto* resp = reinterpret_cast<const SearchHandoffResponseHeader*>(handoff.response.data());
-      if (resp->rpc.magic == kPeerRpcMagic &&
-          resp->rpc.type == static_cast<u32>(PeerRpcType::search_handoff_response) &&
-          resp->rpc.status == static_cast<u32>(InsertStatus::ok)) {
-        // Merge updated beam: update distances for existing entries, add new ones
-        const auto* resp_beam = handoff_response_beam(resp);
-        hashset_t<RemotePtr> existing;
-        for (const auto& entry : beam) {
-          existing.insert(entry.rptr);
-        }
-        const u32 construction_width = storage_owner_construction_width(config);
-        for (u32 i = 0; i < resp->updated_beam_count; ++i) {
-          RemotePtr rptr{resp_beam[i].rptr_raw};
-          if (!existing.contains(rptr)) {
-            insert_into_beam(beam, rptr, resp_beam[i].distance, construction_width);
-          } else {
-            // Update distance if better
-            for (auto& entry : beam) {
-              if (entry.rptr == rptr && resp_beam[i].distance < entry.distance) {
-                entry.distance = resp_beam[i].distance;
-              }
-            }
-          }
-        }
-        // Merge new visited entries
-        const byte_t* resp_visited = handoff_response_visited(resp, resp->updated_beam_count);
-        for (u32 i = 0; i < resp->new_visited_count; ++i) {
-          u64 raw{};
-          std::memcpy(&raw, resp_visited + static_cast<size_t>(i) * sizeof(raw), sizeof(raw));
-          visited.insert(RemotePtr{raw});
-        }
+    const u32 construction_width = storage_owner_construction_width(config);
+    for (const CompletedHandoff& item : completed) {
+      if (!merge_search_handoff_response(beam, visited, item.result, construction_width)) {
+        mark_shard_frontier_expanded(beam, item.target_shard);
       }
     }
   }
@@ -1434,125 +1508,6 @@ auto MemoryNode::beam_search_candidates_transitive_async(
   co_return;
 }
 
-// Remote-side search handoff handler.
-// Processes an incoming handoff request by doing local-only beam search,
-// then sends the response back.
-bool MemoryNode::handle_search_handoff_rpc(u32 source_shard,
-                                           const SearchHandoffRequestHeader* req,
-                                           const byte_t* /*payload*/,
-                                           const Configuration& config) {
-  const u32 vector_bytes = req->vector_bytes;
-  const u32 beam_count = req->rpc.item_count;
 
-  // Unpack query vector
-  const auto* query_vec = handoff_query_vector(req);
-  const span<const element_t> query{
-      reinterpret_cast<const element_t*>(query_vec),
-      VamanaNode::DIM};
 
-  // Unpack beam entries
-  const auto* serialized_beam = handoff_request_beam(req, vector_bytes);
-  vec<BeamEntry> beam;
-  beam.reserve(beam_count);
-  for (u32 i = 0; i < beam_count; ++i) {
-    const RemotePtr rptr{serialized_beam[i].rptr_raw};
-    const bool is_local = local_shard(rptr.memory_node());
-    beam.push_back({rptr, serialized_beam[i].distance, !is_local});
-  }
 
-  // Unpack visited set from the request payload (follows beam entries)
-  hashset_t<RemotePtr> visited;
-  hashset_t<RemotePtr> request_visited;
-  const u32 req_visited_count = req->visited_count;
-  const byte_t* req_visited_raws = handoff_request_visited(req, vector_bytes, beam_count);
-  visited.reserve(req_visited_count + req->beam_width * config.R);
-  request_visited.reserve(req_visited_count);
-  for (u32 i = 0; i < req_visited_count; ++i) {
-    u64 raw{};
-    std::memcpy(&raw, req_visited_raws + static_cast<size_t>(i) * sizeof(raw), sizeof(raw));
-    const RemotePtr rptr{raw};
-    visited.insert(rptr);
-    request_visited.insert(rptr);
-  }
-
-  // Phase 1: Compute precise distances for local unexpanded beam entries
-  const u32 snapshot_batch = req->snapshot_batch;
-  const u64 shard_cap = mn_memory_bytes_;
-  vec<RemotePtr> local_unexpanded;
-  for (auto& entry : beam) {
-    if (!entry.expanded && local_shard(entry.rptr.memory_node()) &&
-        ptr_in_bounds(entry.rptr, shard_cap)) {
-      local_unexpanded.push_back(entry.rptr);
-    }
-  }
-  for (size_t begin = 0; begin < local_unexpanded.size(); begin += snapshot_batch) {
-    const size_t end = std::min(local_unexpanded.size(), begin + snapshot_batch);
-    vec<RemotePtr> batch(local_unexpanded.begin() + begin, local_unexpanded.begin() + end);
-    vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
-    for (const NodeSnapshot& snapshot : snapshots) {
-      const distance_t dist = distance_to_stored_vector(query, snapshot.vector_data.data(), config);
-      // Update distance in beam
-      for (auto& entry : beam) {
-        if (entry.rptr == snapshot.rptr) {
-          entry.distance = dist;
-          break;
-        }
-      }
-    }
-  }
-
-  // Phase 2: Expand all local nodes
-  expand_all_local_nodes(beam, visited, query, config, storage_id_, nullptr);
-
-  // Phase 3: Build and send response
-  vec<BeamEntrySerialized> response_beam;
-  vec<u64> new_visited_raws;
-  response_beam.reserve(beam.size());
-  for (const auto& entry : beam) {
-    if (!entry.expanded) {
-      response_beam.push_back({entry.rptr.raw_address, entry.distance});
-    }
-  }
-  // Collect newly discovered nodes for visited set
-  for (const RemotePtr& entry : visited) {
-    if (!request_visited.contains(entry)) {
-      new_visited_raws.push_back(entry.raw_address);
-    }
-  }
-
-  const size_t fixed_response_bytes = search_handoff_response_bytes(
-    static_cast<u32>(response_beam.size()), 0);
-  if (fixed_response_bytes > peer_rpc_runtime_.message_bytes) {
-    return false;
-  }
-  const size_t max_new_visited =
-    (peer_rpc_runtime_.message_bytes - fixed_response_bytes) / sizeof(u64);
-  if (new_visited_raws.size() > max_new_visited) {
-    new_visited_raws.resize(max_new_visited);
-  }
-  const size_t response_bytes = search_handoff_response_bytes(
-    static_cast<u32>(response_beam.size()),
-    static_cast<u32>(new_visited_raws.size()));
-  vec<byte_t> response_msg(response_bytes);
-  auto* resp = reinterpret_cast<SearchHandoffResponseHeader*>(response_msg.data());
-  resp->rpc.magic = kPeerRpcMagic;
-  resp->rpc.type = static_cast<u32>(PeerRpcType::search_handoff_response);
-  resp->rpc.source_shard = storage_id_;
-  resp->rpc.item_count = static_cast<u32>(response_beam.size());
-  resp->rpc.request_id = req->rpc.request_id;
-  resp->rpc.status = static_cast<u32>(InsertStatus::ok);
-  resp->rpc.reserved = 0;
-  resp->updated_beam_count = static_cast<u32>(response_beam.size());
-  resp->new_visited_count = static_cast<u32>(new_visited_raws.size());
-  resp->total_visited_count = static_cast<u32>(visited.size());
-  resp->reserved = 0;
-
-  auto* resp_beam = handoff_response_beam(resp);
-  std::memcpy(resp_beam, response_beam.data(),
-              response_beam.size() * sizeof(BeamEntrySerialized));
-  auto* resp_visited = handoff_response_visited(resp, static_cast<u32>(response_beam.size()));
-  std::memcpy(resp_visited, new_visited_raws.data(),
-              new_visited_raws.size() * sizeof(u64));
-
-  return enqueue_handoff_response(source_shard, std::move(response_msg));
-}

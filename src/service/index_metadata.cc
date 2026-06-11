@@ -36,6 +36,11 @@ bool load_metadata(const filepath_t& index_prefix, Metadata& metadata, str* erro
     metadata.num_memory_nodes = json.at("num_memory_nodes").get<u32>();
     metadata.node_size = json.at("node_size").get<u32>();
     metadata.node_layout = json.value("node_layout", str{"standard"});
+    metadata.storage_format = json.value("storage_format", str{"legacy_aos"});
+    metadata.graph_hot_bytes = json.value("graph_hot_bytes", 0u);
+    metadata.vector_offset = json.value("vector_offset", 0u);
+    metadata.neighbors_offset = json.value("neighbors_offset", 0u);
+    metadata.rabitq_offset = json.value("rabitq_offset", 0u);
     metadata.vector_dtype = parse_vector_dtype(json.value("vector_data_type", str{"float32"}));
     metadata.vector_component_size = json.value(
       "vector_component_size", static_cast<u32>(vector_dtype_component_size(metadata.vector_dtype)));

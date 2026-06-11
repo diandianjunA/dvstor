@@ -38,9 +38,10 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
       }
       config_.vector_data_type = vector_dtype_name(metadata.vector_dtype);
       VamanaNode::init_static_storage(config_.dim, config_.R, metadata.vector_dtype);
+      lib_assert(metadata.schema_version >= 7 &&
+                 metadata.storage_format == VamanaNode::storage_format_name(),
+                 "index storage format is obsolete; rebuild with the current offline builder");
       if (metadata.node_layout == "rabitq") {
-        lib_assert(metadata.schema_version >= 5,
-                   "RaBitQ index schema is obsolete; rebuild with the current offline builder");
         lib_assert(metadata.rabitq_centroid.size() == metadata.dim,
                    "RaBitQ index metadata has a missing or invalid centroid");
         VamanaNode::enable_rabitq();
@@ -51,13 +52,23 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
       } else if (config_.use_rabitq) {
         lib_failure("--use-rabitq requires an index built with --use-rabitq");
       }
+      lib_assert(metadata.vector_component_size == VamanaNode::vector_component_size(),
+                 "index metadata vector component size mismatch on compute node");
+      lib_assert(metadata.vector_bytes == VamanaNode::vector_bytes(),
+                 "index metadata vector byte size mismatch on compute node");
+      lib_assert(metadata.node_size == VamanaNode::total_size(),
+                 "index metadata node size mismatch on compute node");
+      lib_assert(metadata.graph_hot_bytes == VamanaNode::graph_hot_bytes() &&
+                 metadata.vector_offset == VamanaNode::offset_vector() &&
+                 metadata.neighbors_offset == VamanaNode::offset_neighbors() &&
+                 metadata.rabitq_offset == (VamanaNode::HAS_RABITQ_CODE ? VamanaNode::offset_rabitq_code() : 0),
+                 "index metadata storage offsets mismatch on compute node");
     }
   }
 
   // Initialize GPU
   gpu::gpu_init(static_cast<int>(config_.gpu_device));
   service_profile_ = resolve_service_profile();
-  print_status(config_.use_rabitq ? "search: RaBitQ + exact rerank" : "search: exact");
 
   // Construct Vamana index
   vamana_ = std::make_unique<vamana::Vamana<Distance>>(
@@ -66,6 +77,7 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   vamana_->set_expansion_batch(config_.expansion_batch);
   vamana_->set_query_batch_size(config_.query_batch_size);
   vamana_->set_use_rabitq(config_.use_rabitq);
+  print_status(vamana_->use_rabitq() ? "search: RaBitQ + exact rerank" : "search: exact");
 
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,
                                               config_.max_send_queue_wr,

@@ -95,6 +95,41 @@ inline auto read_vamana_node(RemotePtr rptr, const u_ptr<ComputeThread>& thread)
     return awaitable{rptr, node_ptr, read_size, thread};
 }
 
+inline auto read_vamana_node_prefix(RemotePtr rptr, const u_ptr<ComputeThread>& thread) {
+    const size_t read_size = VamanaNode::NODE_PREFIX_SIZE;
+    byte_t* node_ptr = thread->buffer_allocator.allocate_buffer(read_size);
+
+    track_total_rdma_read(thread, read_size);
+    thread->track_post();
+
+    const QP& qp = thread->ctx->qps[rptr.memory_node()][0]->qp;
+    qp->post_send(reinterpret_cast<u64>(node_ptr),
+                  read_size,
+                  thread->ctx->get_lkey(),
+                  IBV_WR_RDMA_READ,
+                  true,
+                  false,
+                  thread->ctx->get_remote_mrt(rptr.memory_node()),
+                  rptr.byte_offset(),
+                  0,
+                  thread->create_wr_id());
+
+    struct awaitable {
+        RemotePtr rptr;
+        byte_t* node_ptr;
+        size_t read_size;
+        const u_ptr<ComputeThread>& thread;
+
+        static bool await_ready() { return false; }
+        static void await_suspend(std::coroutine_handle<>) {}
+        s_ptr<VamanaNode> await_resume() {
+            return std::make_shared<VamanaNode>(node_ptr, read_size, rptr, thread.get());
+        }
+    };
+
+    return awaitable{rptr, node_ptr, read_size, thread};
+}
+
 inline auto read_vamana_node_full(RemotePtr rptr, const u_ptr<ComputeThread>& thread) {
     const size_t read_size = VamanaNode::total_size();
     byte_t* node_ptr = thread->buffer_allocator.allocate_vamana_node(thread->get_id());
@@ -225,32 +260,20 @@ private:
 // stack frame.
 inline NeighborReadAwaitable read_vamana_neighbors(RemotePtr node_rptr, const u_ptr<ComputeThread>* thread_ptr) {
     auto& thread = *thread_ptr;
-    const size_t read_size = sizeof(u8) + VamanaNode::NEIGHBORS_SIZE;
+    const size_t read_size = VamanaNode::neighbor_read_size();
     byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(read_size);
 
     const QP& qp = thread->ctx->qps[node_rptr.memory_node()][0]->qp;
-    track_neighbor_rdma_read(thread, read_size, 2);
+    track_neighbor_rdma_read(thread, read_size, 1);
     thread->track_post();
     qp->post_send(reinterpret_cast<u64>(local_buffer),
-                  sizeof(u8),
+                  read_size,
                   thread->ctx->get_lkey(),
                   IBV_WR_RDMA_READ,
                   true,
                   false,
                   thread->ctx->get_remote_mrt(node_rptr.memory_node()),
-                  node_rptr.byte_offset() + VamanaNode::offset_edge_count(),
-                  0,
-                  thread->create_wr_id());
-
-    thread->track_post();
-    qp->post_send(reinterpret_cast<u64>(local_buffer + sizeof(u8)),
-                  VamanaNode::NEIGHBORS_SIZE,
-                  thread->ctx->get_lkey(),
-                  IBV_WR_RDMA_READ,
-                  true,
-                  false,
-                  thread->ctx->get_remote_mrt(node_rptr.memory_node()),
-                  node_rptr.byte_offset() + VamanaNode::offset_neighbors(),
+                  node_rptr.byte_offset() + VamanaNode::neighbor_read_offset(),
                   0,
                   thread->create_wr_id());
 
@@ -274,8 +297,11 @@ inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rp
                                const u_ptr<ComputeThread>& thread,
                                const vec<BatchReadDestination>* destinations = nullptr,
                                void* gpu_buffer = nullptr,
-                               u32 gpu_lkey = 0) {
-    const size_t vec_size = VamanaNode::vector_bytes();
+                               u32 gpu_lkey = 0,
+                               size_t read_size_override = 0,
+                               u64 node_offset_override = 0) {
+    const size_t vec_size = read_size_override == 0
+        ? VamanaNode::vector_bytes() : read_size_override;
     const bool using_destinations = destinations != nullptr && !destinations->empty();
     const bool direct_to_gpu = using_destinations || (gpu_buffer != nullptr && gpu_lkey != 0);
     vec<byte_t*> host_buffers;
@@ -340,7 +366,8 @@ inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rp
         wr.opcode = IBV_WR_RDMA_READ;
         wr.send_flags = IBV_SEND_SIGNALED;
         wr.wr.rdma.remote_addr = token->address + rptr.byte_offset()
-                                 + VamanaNode::offset_vector();
+                                 + (read_size_override == 0
+                                        ? VamanaNode::offset_vector() : node_offset_override);
         wr.wr.rdma.rkey = token->rkey;
         wr.next = nullptr;
     }
@@ -370,41 +397,8 @@ inline VectorBatchReadAwaitable batch_read_at_offset(
         const u_ptr<ComputeThread>& thread,
         u64 node_offset, size_t read_size,
         void* gpu_buffer, u32 gpu_lkey) {
-    vec<byte_t*> host_buffers;
-    const u32 num_nodes = static_cast<u32>(thread->ctx->qps.size());
-    vec<vec<ibv_send_wr>> wr_lists(num_nodes);
-    vec<vec<ibv_sge>> sge_lists(num_nodes);
-    for (u32 n = 0; n < num_nodes; ++n) {
-        wr_lists[n].reserve(node_rptrs.size() / num_nodes + 1);
-        sge_lists[n].reserve(node_rptrs.size() / num_nodes + 1);
-    }
-    for (size_t i = 0; i < node_rptrs.size(); ++i) {
-        const auto& rptr = node_rptrs[i];
-        u64 local_addr = reinterpret_cast<u64>(gpu_buffer) + i * read_size;
-        track_vector_rdma_read(thread, read_size);
-        thread->track_post();
-        const u32 node = rptr.memory_node();
-        auto* token = thread->ctx->get_remote_mrt(node);
-        auto& sges = sge_lists[node]; auto& wrs = wr_lists[node];
-        sges.push_back({}); ibv_sge& sge = sges.back();
-        sge.addr = local_addr; sge.length = static_cast<u32>(read_size); sge.lkey = gpu_lkey;
-        wrs.push_back({}); ibv_send_wr& wr = wrs.back();
-        wr.wr_id = thread->create_wr_id(); wr.sg_list = &sge; wr.num_sge = 1;
-        wr.opcode = IBV_WR_RDMA_READ; wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = token->address + rptr.byte_offset() + node_offset;
-        wr.wr.rdma.rkey = token->rkey; wr.next = nullptr;
-    }
-    for (u32 node = 0; node < num_nodes; ++node) {
-        auto& wrs = wr_lists[node]; auto& sges = sge_lists[node];
-        if (wrs.empty()) continue;
-        for (size_t j = 0; j < wrs.size(); ++j) {
-            wrs[j].sg_list = &sges[j];
-            if (j + 1 < wrs.size()) wrs[j].next = &wrs[j + 1];
-        }
-        struct ibv_send_wr* bad = nullptr;
-        ibv_post_send(thread->ctx->qps[node][0]->qp->get_ibv_qp(), &wrs[0], &bad);
-    }
-    return VectorBatchReadAwaitable(VectorBatchReadResult{std::move(host_buffers), true});
+    return batch_read_vectors(node_rptrs, thread, nullptr, gpu_buffer, gpu_lkey,
+                              read_size, node_offset);
 }
 
 // Host-buffer variant of batch_read_at_offset: reads to host buffers,
@@ -413,46 +407,8 @@ inline VectorBatchReadAwaitable batch_read_at_offset_to_host(
         const vec<RemotePtr>& node_rptrs,
         const u_ptr<ComputeThread>& thread,
         u64 node_offset, size_t read_size) {
-    vec<byte_t*> host_buffers;
-    host_buffers.reserve(node_rptrs.size());
-    const u32 num_nodes = static_cast<u32>(thread->ctx->qps.size());
-    vec<vec<ibv_send_wr>> wr_lists(num_nodes);
-    vec<vec<ibv_sge>> sge_lists(num_nodes);
-    for (u32 n = 0; n < num_nodes; ++n) {
-        wr_lists[n].reserve(node_rptrs.size() / num_nodes + 1);
-        sge_lists[n].reserve(node_rptrs.size() / num_nodes + 1);
-    }
-    for (size_t i = 0; i < node_rptrs.size(); ++i) {
-        const auto& rptr = node_rptrs[i];
-        byte_t* buf = thread->buffer_allocator.allocate_buffer(read_size);
-        if (!buf) throw std::bad_alloc();
-        host_buffers.push_back(buf);
-        u64 local_addr = reinterpret_cast<u64>(buf);
-        track_vector_rdma_read(thread, read_size);
-        thread->track_post();
-        const u32 node = rptr.memory_node();
-        auto* token = thread->ctx->get_remote_mrt(node);
-        auto& sges = sge_lists[node]; auto& wrs = wr_lists[node];
-        sges.push_back({}); ibv_sge& sge = sges.back();
-        sge.addr = local_addr; sge.length = static_cast<u32>(read_size);
-        sge.lkey = thread->ctx->get_lkey();
-        wrs.push_back({}); ibv_send_wr& wr = wrs.back();
-        wr.wr_id = thread->create_wr_id(); wr.sg_list = &sge; wr.num_sge = 1;
-        wr.opcode = IBV_WR_RDMA_READ; wr.send_flags = IBV_SEND_SIGNALED;
-        wr.wr.rdma.remote_addr = token->address + rptr.byte_offset() + node_offset;
-        wr.wr.rdma.rkey = token->rkey; wr.next = nullptr;
-    }
-    for (u32 node = 0; node < num_nodes; ++node) {
-        auto& wrs = wr_lists[node]; auto& sges = sge_lists[node];
-        if (wrs.empty()) continue;
-        for (size_t j = 0; j < wrs.size(); ++j) {
-            wrs[j].sg_list = &sges[j];
-            if (j + 1 < wrs.size()) wrs[j].next = &wrs[j + 1];
-        }
-        struct ibv_send_wr* bad = nullptr;
-        ibv_post_send(thread->ctx->qps[node][0]->qp->get_ibv_qp(), &wrs[0], &bad);
-    }
-    return VectorBatchReadAwaitable(VectorBatchReadResult{std::move(host_buffers), false});
+    return batch_read_vectors(node_rptrs, thread, nullptr, nullptr, 0,
+                              read_size, node_offset);
 }
 
 inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rptrs,

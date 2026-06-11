@@ -383,7 +383,13 @@ void write_vamana_shards(const VamanaGraph& graph,
     {"medoid", {{"memory_node", medoid_ptr.memory_node()}, {"offset", medoid_ptr.byte_offset()}}},
     {"node_size", node_size},
     {"node_layout", VamanaNode::layout_name()},
-    {"schema_version", 5},
+    {"storage_format", VamanaNode::storage_format_name()},
+    {"schema_version", 7},
+    {"graph_hot_bytes", VamanaNode::graph_hot_bytes()},
+    {"vector_offset", VamanaNode::offset_vector()},
+    {"neighbors_offset", VamanaNode::offset_neighbors()},
+    {"rabitq_offset", config.use_rabitq ? VamanaNode::offset_rabitq_code() : 0},
+    {"vector_storage_bytes", VamanaNode::vector_storage_bytes()},
     {"offline_builder_version", 2},
     {"random_graph_seed_scope", "per_node"},
     {"vector_data_type", vector_dtype_name(dataset.dtype)},
@@ -399,6 +405,7 @@ void write_vamana_shards(const VamanaGraph& graph,
     metadata["rabitq_centroid"] = VamanaNode::rabitq_centroid;
     metadata["rabitq_code_bits"] = VamanaNode::rabitq_code_bits();
     metadata["rabitq_entry_size"] = VamanaNode::rabitq_entry_size();
+    metadata["rabitq_entry_storage_size"] = VamanaNode::rabitq_entry_storage_size();
   }
 
   const filepath_t metadata_file = filepath_t(output_prefix.string() + ".meta.json");

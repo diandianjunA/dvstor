@@ -17,7 +17,6 @@
 #include <type_traits>
 
 #include "common/constants.hh"
-#include "common/debug.hh"
 #include "common/distance.hh"
 #include "common/types.hh"
 #include "compute_thread.hh"
@@ -86,9 +85,16 @@ public:
         query_batch_size_ = q;
     }
     u32 query_batch_size() const { return query_batch_size_; }
+    bool use_rabitq() const { return use_rabitq_; }
     void set_use_rabitq(bool v) {
         use_rabitq_ = v;
         if (!v) return;
+        if (VamanaNode::rabitq_entry_size() >= VamanaNode::vector_bytes()) {
+            std::cerr << "[WARNING] RaBitQ entry is not smaller than the stored vector; "
+                         "using the exact search path to avoid increasing RDMA traffic" << std::endl;
+            use_rabitq_ = false;
+            return;
+        }
         if (query_batch_size_ > 1) {
             std::cerr << "[WARNING] disabling query batching because RaBitQ does not support knn_batch"
                       << std::endl;

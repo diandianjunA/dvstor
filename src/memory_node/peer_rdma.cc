@@ -1,7 +1,6 @@
 #include "memory_node/memory_node.hh"
 
 #include <algorithm>
-#include <iostream>
 
 void MemoryNode::setup_storage_peers(Configuration& config) {
   if (!use_storage_owner_insert_ || num_storage_nodes_ <= 1) {
@@ -69,10 +68,6 @@ void MemoryNode::setup_storage_peers(Configuration& config) {
   peer_index_region_->register_memory(index_buffer_.get_full_buffer(), index_buffer_.buffer_size, true);
 
   const MemoryRegionToken local_token = peer_index_region_->createToken();
-  std::cerr << "[storage-peer][token] self_shard=" << storage_id_
-            << " local_base=" << local_token.address
-            << " local_rkey=" << local_token.rkey
-            << " local_bytes=" << index_buffer_.buffer_size << std::endl;
   for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
     if (peer_id == storage_id_) continue;
     LocalMemoryRegion peer_token_region{*peer_context_, peer_remote_tokens_[peer_id].get(), sizeof(MemoryRegionToken)};
@@ -80,10 +75,6 @@ void MemoryNode::setup_storage_peers(Configuration& config) {
     peer_control_qp(peer_id)->post_send_inlined(&local_token, sizeof(local_token), IBV_WR_SEND);
     peer_context_->poll_send_cq_until_completion();
     peer_context_->receive();
-    std::cerr << "[storage-peer][token] self_shard=" << storage_id_
-              << " peer_shard=" << peer_id
-              << " remote_base=" << peer_remote_tokens_[peer_id]->address
-              << " remote_rkey=" << peer_remote_tokens_[peer_id]->rkey << std::endl;
   }
 
   const size_t scratch_bytes = std::max<size_t>(64ull * 1024ull * 1024ull, align_up(VamanaNode::total_size() * 4));
@@ -99,10 +90,6 @@ void MemoryNode::setup_storage_peers(Configuration& config) {
     if (peer_id == storage_id_) continue;
     u64 header_words[2]{};
     remote_read_bytes(peer_id, 0, header_words, sizeof(header_words), 0);
-    std::cerr << "[storage-peer][probe] self_shard=" << storage_id_
-              << " peer_shard=" << peer_id
-              << " free_ptr=" << header_words[0]
-              << " medoid_raw=" << header_words[1] << std::endl;
   }
 }
 
@@ -332,16 +319,6 @@ void MemoryNode::remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, s
                " offset=" + std::to_string(remote_offset) +
                " bytes=" + std::to_string(bytes) +
                " capacity=" + std::to_string(mn_memory_bytes_));
-  static std::atomic<u32> debug_reads{0};
-  const u32 debug_idx = debug_reads.fetch_add(1, std::memory_order_relaxed);
-  if (debug_idx < 16) {
-    std::cerr << "[storage-peer][read] self_shard=" << storage_id_
-              << " target_shard=" << shard_id
-              << " remote_base=" << peer_remote_tokens_[shard_id]->address
-              << " rkey=" << peer_remote_tokens_[shard_id]->rkey
-              << " offset=" << remote_offset
-              << " bytes=" << bytes << std::endl;
-  }
   StorageOwnerThread* owner_thread = current_storage_owner_thread_;
   const u32 qp_idx = peer_data_qp_index(owner_thread != nullptr ? owner_thread->id : 0);
   QP& qp = peer_data_qp(shard_id, qp_idx);
@@ -386,16 +363,6 @@ void MemoryNode::remote_write_bytes(u32 shard_id, u64 remote_offset, const void*
                " offset=" + std::to_string(remote_offset) +
                " bytes=" + std::to_string(bytes) +
                " capacity=" + std::to_string(mn_memory_bytes_));
-  static std::atomic<u32> debug_writes{0};
-  const u32 debug_idx = debug_writes.fetch_add(1, std::memory_order_relaxed);
-  if (debug_idx < 16) {
-    std::cerr << "[storage-peer][write] self_shard=" << storage_id_
-              << " target_shard=" << shard_id
-              << " remote_base=" << peer_remote_tokens_[shard_id]->address
-              << " rkey=" << peer_remote_tokens_[shard_id]->rkey
-              << " offset=" << remote_offset
-              << " bytes=" << bytes << std::endl;
-  }
   StorageOwnerThread* owner_thread = current_storage_owner_thread_;
   const u32 qp_idx = peer_data_qp_index(owner_thread != nullptr ? owner_thread->id : 0);
   QP& qp = peer_data_qp(shard_id, qp_idx);
@@ -434,17 +401,6 @@ u64 MemoryNode::remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 exp
              "peer CAS exceeds shard bounds: shard=" + std::to_string(shard_id) +
                " offset=" + std::to_string(remote_offset) +
                " capacity=" + std::to_string(mn_memory_bytes_));
-  static std::atomic<u32> debug_cas{0};
-  const u32 debug_idx = debug_cas.fetch_add(1, std::memory_order_relaxed);
-  if (debug_idx < 16) {
-    std::cerr << "[storage-peer][cas] self_shard=" << storage_id_
-              << " target_shard=" << shard_id
-              << " remote_base=" << peer_remote_tokens_[shard_id]->address
-              << " rkey=" << peer_remote_tokens_[shard_id]->rkey
-              << " offset=" << remote_offset
-              << " expected=" << expected
-              << " desired=" << desired << std::endl;
-  }
   StorageOwnerThread* owner_thread = current_storage_owner_thread_;
   const u32 qp_idx = peer_data_qp_index(owner_thread != nullptr ? owner_thread->id : 0);
   QP& qp = peer_data_qp(shard_id, qp_idx);

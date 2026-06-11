@@ -8,7 +8,6 @@
 #include <limits>
 #include <stdexcept>
 
-#include "common/debug.hh"
 #include "coroutine.hh"
 #include "gpu/gpu_kernel_launcher.hh"
 #include "rdma/vamana_rdma_operations.hh"

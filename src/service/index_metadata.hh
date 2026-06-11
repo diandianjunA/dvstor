@@ -13,6 +13,11 @@ struct Metadata {
   u32 num_memory_nodes{};
   u32 node_size{};
   str node_layout{"standard"};
+  str storage_format{"legacy_aos"};
+  u32 graph_hot_bytes{};
+  u32 vector_offset{};
+  u32 neighbors_offset{};
+  u32 rabitq_offset{};
   VectorDType vector_dtype{VectorDType::float32};
   u32 vector_component_size{sizeof(element_t)};
   u32 vector_bytes{};

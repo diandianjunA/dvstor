@@ -5,7 +5,6 @@
 
     VamanaCoroutine knn_raw(node_t q_id, const byte_t* query_data, VectorDType query_dtype,
                             const u_ptr<ComputeThread>& thread) const {
-        dbg::print(dbg::stream{} << "T" << thread->get_id() << " queries " << q_id << "\n");
         ++thread->stats.processed;
         ++thread->stats.processed_queries;
 

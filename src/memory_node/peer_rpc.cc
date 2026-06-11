@@ -16,7 +16,8 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
   const size_t reverse_update_bytes =
     service::storage_owner::reverse_update_request_bytes(config.R * config.storage_owner_batch_max);
   const size_t handoff_request_bytes = service::storage_owner::search_handoff_request_bytes(
-    handoff_beam_width, handoff_visited_capacity, VamanaNode::vector_bytes());
+    handoff_beam_width, handoff_visited_capacity,
+    static_cast<u32>(VamanaNode::DIM * sizeof(element_t)));
   const size_t handoff_response_bytes =
     service::storage_owner::search_handoff_response_bytes(handoff_beam_width, handoff_visited_capacity);
   peer_rpc_runtime_.message_bytes = align_up(
@@ -29,7 +30,9 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
   const u32 max_slots_per_peer = std::max<u32>(1, max_recv_wr / remote_peer_count);
   const u32 desired_slots_per_peer = std::max<u32>(16, config.storage_owner_rpc_depth * 4);
   peer_rpc_runtime_.recv_slots_per_peer = std::min(desired_slots_per_peer, max_slots_per_peer);
-  peer_rpc_runtime_.send_slots_per_peer = std::max<u32>(1, config.storage_owner_rpc_depth);
+  peer_rpc_runtime_.send_slots_per_peer = std::min(
+    std::max<u32>(1, config.storage_owner_rpc_depth),
+    peer_rpc_runtime_.recv_slots_per_peer);
   peer_rpc_runtime_.recv_region_bytes =
     peer_rpc_runtime_.message_bytes * num_storage_nodes_ * peer_rpc_runtime_.recv_slots_per_peer;
   peer_rpc_runtime_.sync_send_offset = peer_rpc_runtime_.recv_region_bytes;
@@ -45,7 +48,7 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
                std::to_string(peer_rpc_runtime_.recv_slots_per_peer) +
                " (requested=" + std::to_string(desired_slots_per_peer) + ")");
   peer_handoff_queue_limit_ = config.storage_owner_handoff_queue_depth == 0
-    ? static_cast<size_t>(config.storage_owner_rpc_depth) * 4
+    ? static_cast<size_t>(peer_rpc_runtime_.send_slots_per_peer) * 4
     : config.storage_owner_handoff_queue_depth;
   peer_handoff_states_.clear();
   peer_handoff_states_.resize(num_storage_nodes_);
@@ -87,8 +90,8 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   peer_reverse_outgoing_queue_limit_ = peer_reverse_task_queue_limit_;
 
   const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
-  const size_t snapshot_stride = align_up(VamanaNode::size_until_vector_end());
-  const size_t neighbor_stride = align_up(sizeof(u8)) + VamanaNode::NEIGHBORS_SIZE;
+  const size_t snapshot_stride = align_up(VamanaNode::vector_bytes());
+  const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
   const size_t coroutine_scratch_stride =
     align_up(std::max<size_t>(VamanaNode::total_size(),
                               std::max(neighbor_stride,
@@ -716,7 +719,7 @@ void MemoryNode::peer_rpc_progress_loop() {
             req->beam_width > 0 && req->beam_width <= max_beam_width &&
             req->snapshot_batch > 0 &&
             req->visited_count <= max_visited_count &&
-            req->vector_bytes == VamanaNode::vector_bytes();
+            req->vector_bytes == static_cast<u32>(VamanaNode::DIM * sizeof(element_t));
           const size_t expected_bytes = header_valid
             ? service::storage_owner::search_handoff_request_bytes(
                 req->rpc.item_count, req->visited_count, req->vector_bytes)

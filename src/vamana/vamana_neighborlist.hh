@@ -11,7 +11,7 @@ class ComputeThread;
 
 /**
  * Vamana Neighborlist: a view of the neighbor list portion of a remote node.
- * Fixed-size buffer: edge_count(1B) + R * RemotePtr(8B).
+ * Fixed-size buffer: id(4B) + edge_count(1B) + padding + R * RemotePtr(8B).
  *
  * Unlike HNSW's Neighborlist which varies by level, all Vamana nodes have
  * the same maximum degree R.
@@ -33,23 +33,23 @@ public:
 
   // Number of active neighbors
   u8 num_neighbors() const {
-    return *reinterpret_cast<u8*>(buffer_slice_);
+    return *reinterpret_cast<u8*>(buffer_slice_ + VamanaNode::neighbor_count_offset_in_read());
   }
 
   // Set number of active neighbors
   void set_num_neighbors(u8 count) {
-    *reinterpret_cast<u8*>(buffer_slice_) = count;
+    *reinterpret_cast<u8*>(buffer_slice_ + VamanaNode::neighbor_count_offset_in_read()) = count;
   }
 
   // View of active neighbors (only the first edge_count entries)
   span<RemotePtr> view() const {
-    return {reinterpret_cast<RemotePtr*>(buffer_slice_ + sizeof(u8)),
+    return {reinterpret_cast<RemotePtr*>(buffer_slice_ + VamanaNode::neighbor_payload_offset_in_read()),
             static_cast<size_t>(num_neighbors())};
   }
 
   // View of all R neighbor slots
   span<RemotePtr> all_slots() const {
-    return {reinterpret_cast<RemotePtr*>(buffer_slice_ + sizeof(u8)),
+    return {reinterpret_cast<RemotePtr*>(buffer_slice_ + VamanaNode::neighbor_payload_offset_in_read()),
             static_cast<size_t>(VamanaNode::R)};
   }
 
@@ -57,7 +57,7 @@ public:
   void add(const RemotePtr& rptr) {
     u8 count = num_neighbors();
     lib_assert(count < VamanaNode::R, "neighbor list is full");
-    reinterpret_cast<RemotePtr*>(buffer_slice_ + sizeof(u8))[count] = rptr;
+    reinterpret_cast<RemotePtr*>(buffer_slice_ + VamanaNode::neighbor_payload_offset_in_read())[count] = rptr;
     set_num_neighbors(count + 1);
   }
 
@@ -68,7 +68,7 @@ public:
 
   // Total buffer size needed
   static size_t buffer_size() {
-    return sizeof(u8) + VamanaNode::R * sizeof(u64);
+    return VamanaNode::neighbor_read_size();
   }
 
   byte_t* get_underlying_buffer() const { return buffer_slice_; }

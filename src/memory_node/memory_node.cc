@@ -53,9 +53,10 @@ MemoryNode::MemoryNode(Configuration& config)
     config.vector_data_type = vector_dtype_name(startup_dtype);
     VamanaNode::disable_rabitq();
     VamanaNode::init_static_storage(config.dim, config.R, startup_dtype);
+    lib_assert(metadata.schema_version >= 7 &&
+               metadata.storage_format == VamanaNode::storage_format_name(),
+               "index storage format is obsolete; rebuild with the current offline builder");
     if (metadata.node_layout == "rabitq") {
-        lib_assert(metadata.schema_version >= 5,
-                   "RaBitQ index schema is obsolete; rebuild with the current offline builder");
         lib_assert(metadata.rabitq_centroid.size() == metadata.dim,
                    "RaBitQ index metadata has a missing or invalid centroid");
         VamanaNode::enable_rabitq();
@@ -69,6 +70,11 @@ MemoryNode::MemoryNode(Configuration& config)
     lib_assert(metadata.vector_bytes == VamanaNode::vector_bytes(),
                "index metadata vector byte size mismatch on storage node");
     lib_assert(metadata.node_size == VamanaNode::total_size(), "index metadata node size mismatch on storage node");
+    lib_assert(metadata.graph_hot_bytes == VamanaNode::graph_hot_bytes() &&
+               metadata.vector_offset == VamanaNode::offset_vector() &&
+               metadata.neighbors_offset == VamanaNode::offset_neighbors() &&
+               metadata.rabitq_offset == (VamanaNode::HAS_RABITQ_CODE ? VamanaNode::offset_rabitq_code() : 0),
+               "index metadata storage offsets mismatch on storage node");
     print_status("loaded index metadata from " + index_prefix.string() +
                  " (layout=" + VamanaNode::layout_name() +
                  ", vector_data_type=" + VamanaNode::vector_dtype_name() + ")");

@@ -1,6 +1,5 @@
     VamanaCoroutine insert(node_t id, const span<element_t> components,
                            const u_ptr<ComputeThread>& thread) {
-        dbg::print(dbg::stream{} << "T" << thread->get_id() << " inserts " << id << "\n");
         ++thread->stats.processed;
         ++thread->stats.processed_inserts;
 
@@ -282,7 +281,7 @@
             // Lock the neighbor
             const auto t_neighbor_node_read = std::chrono::steady_clock::now();
             s_ptr<VamanaNode> neighbor_node =
-                co_await rdma::vamana::read_vamana_node(neighbor_ptr, thread);
+                co_await rdma::vamana::read_vamana_node_prefix(neighbor_ptr, thread);
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_neighbor_node_read, t_neighbor_node_read);
             {
                 const auto t_neighbor_lock = std::chrono::steady_clock::now();

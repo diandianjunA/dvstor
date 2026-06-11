@@ -17,11 +17,13 @@ class ComputeThread;
  *   id: 4B
  *   edge_count: 1B
  *   padding: 3B
- *   vector: vector_bytes
  *   neighbors: R * 8B
+ *   graph padding: to 64B
+ *   vector: vector_bytes, padded to 64B
  *   rabitq_code: next_power_of_two(dim) bits
  *   rabitq_norm: 4B    (float, ||x - centroid||)
  *   rabitq_error: 4B   (float, quantization error correction factor)
+ *   rabitq padding: to 64B
  * ]
  */
 class VamanaNode {
@@ -61,12 +63,22 @@ public:
   static str vector_dtype_name() { return ::vector_dtype_name(VECTOR_DTYPE); }
   static size_t vector_component_size() { return VECTOR_COMPONENT_SIZE; }
   static str layout_name() { return HAS_RABITQ_CODE ? "rabitq" : "standard"; }
+  static str storage_format_name() { return "hybrid_split_v1"; }
+
+  static constexpr size_t STORAGE_ALIGNMENT = 64;
+  static constexpr size_t NODE_PREFIX_SIZE = HEADER_SIZE + META_SIZE;
+
+  static size_t align_storage(size_t value) {
+    return (value + STORAGE_ALIGNMENT - 1) & ~(STORAGE_ALIGNMENT - 1);
+  }
 
   static size_t offset_id() { return HEADER_SIZE; }
   static size_t offset_edge_count() { return HEADER_SIZE + ID_SIZE; }
-  static size_t offset_vector() { return HEADER_SIZE + META_SIZE; }
-  static size_t offset_neighbors() { return HEADER_SIZE + META_SIZE + vector_bytes(); }
-  static size_t offset_rabitq_code() { return offset_neighbors() + NEIGHBORS_SIZE; }
+  static size_t offset_neighbors() { return NODE_PREFIX_SIZE; }
+  static size_t graph_hot_bytes() { return align_storage(offset_neighbors() + NEIGHBORS_SIZE); }
+  static size_t offset_vector() { return graph_hot_bytes(); }
+  static size_t vector_storage_bytes() { return align_storage(vector_bytes()); }
+  static size_t offset_rabitq_code() { return offset_vector() + vector_storage_bytes(); }
   static u32 rabitq_code_bits() {
       lib_assert(DIM > 0 && DIM <= (1u << 30), "RaBitQ dimension must be in [1, 2^30]");
       u32 value = 1;
@@ -74,15 +86,29 @@ public:
       return std::max<u32>(value, 8);
   }
   static size_t rabitq_code_size() { return rabitq_code_bits() / 8; }
-  static size_t rabitq_entry_size() { return (rabitq_code_size() + 8 + 7) & ~size_t{7}; }
-  static size_t offset_rabitq_norm() { return offset_rabitq_code() + rabitq_code_size(); }
+  static size_t rabitq_code_storage_size() { return (rabitq_code_size() + 3) & ~size_t{3}; }
+  static size_t rabitq_entry_size() { return (rabitq_code_storage_size() + 8 + 7) & ~size_t{7}; }
+  static size_t rabitq_entry_storage_size() { return align_storage(rabitq_entry_size()); }
+  static size_t offset_rabitq_norm() { return offset_rabitq_code() + rabitq_code_storage_size(); }
   static size_t offset_rabitq_error() { return offset_rabitq_norm() + sizeof(float); }
 
   static size_t vector_bytes() { return VECTOR_BYTES; }
   static size_t size_until_vector_end() { return offset_vector() + vector_bytes(); }
+  static size_t neighbor_read_offset() { return offset_id(); }
+  static size_t neighbor_read_size() {
+    return offset_neighbors() + NEIGHBORS_SIZE - neighbor_read_offset();
+  }
+  static size_t neighbor_count_offset_in_read() {
+    return offset_edge_count() - neighbor_read_offset();
+  }
+  static size_t neighbor_payload_offset_in_read() {
+    return offset_neighbors() - neighbor_read_offset();
+  }
   static size_t total_size() {
-      return offset_neighbors() + NEIGHBORS_SIZE
-             + (HAS_RABITQ_CODE ? rabitq_entry_size() : 0);
+    const size_t end = HAS_RABITQ_CODE
+          ? offset_rabitq_code() + rabitq_entry_storage_size()
+          : offset_vector() + vector_storage_bytes();
+    return align_storage(end);
   }
 
   // RaBitQ: asymmetric binary quantization after a deterministic signed Hadamard rotation.
@@ -144,19 +170,19 @@ public:
   }
 
   // Compute ||x - centroid|| (L2 norm, not squared).
-  static float compute_rabitq_norm(const byte_t* vec, VectorDType dtype) {
+  static float compute_rabitq_norm(const byte_t* vector, VectorDType dtype) {
       vec<float> rotated(rabitq_code_bits());
       float norm2 = 0.0f;
-      compute_rotated_query(vec, dtype, rotated.data(), &norm2);
+      compute_rotated_query(vector, dtype, rotated.data(), &norm2);
       return std::sqrt(norm2);
   }
 
   // Compute binary code from the signs of the rotated centered vector.
-  static RabitqCode compute_rabitq_code(const byte_t* vec, VectorDType dtype) {
+  static RabitqCode compute_rabitq_code(const byte_t* vector, VectorDType dtype) {
       const u32 bits = rabitq_code_bits();
       vec<float> rotated(bits);
       float norm2 = 0.0f;
-      compute_rotated_query(vec, dtype, rotated.data(), &norm2);
+      compute_rotated_query(vector, dtype, rotated.data(), &norm2);
       RabitqCode code(rabitq_code_size(), 0);
       for (u32 bit = 0; bit < bits; ++bit) {
           if (rotated[bit] > 0.0f) {
@@ -166,12 +192,12 @@ public:
       return code;
   }
 
-  static void compute_rabitq_entry(const byte_t* vec, VectorDType dtype,
+  static void compute_rabitq_entry(const byte_t* vector, VectorDType dtype,
                                    RabitqCode& code, float& norm, float& error) {
       const u32 bits = rabitq_code_bits();
       vec<float> rotated(bits);
       float norm2 = 0.0f;
-      compute_rotated_query(vec, dtype, rotated.data(), &norm2);
+      compute_rotated_query(vector, dtype, rotated.data(), &norm2);
 
       code.assign(rabitq_code_size(), 0);
       float signed_dot = 0.0f;
@@ -193,11 +219,11 @@ public:
 
   // Compute error correction factor: e = (1/√D) * <R*x̄, b>
   // where x̄ = (x - centroid) / ||x - centroid|| and b is the dynamic binary code.
-  static float compute_rabitq_error_factor(const byte_t* vec, VectorDType dtype, const RabitqCode& code) {
+  static float compute_rabitq_error_factor(const byte_t* vector, VectorDType dtype, const RabitqCode& code) {
       const u32 bits = rabitq_code_bits();
       vec<float> rotated(bits);
       float norm2 = 0.0f;
-      compute_rotated_query(vec, dtype, rotated.data(), &norm2);
+      compute_rotated_query(vector, dtype, rotated.data(), &norm2);
       const float inv_norm = 1.0f / std::max(std::sqrt(norm2), 1e-15f);
       float dot_sum = 0.0f;
       for (u32 bit = 0; bit < bits; ++bit) {
