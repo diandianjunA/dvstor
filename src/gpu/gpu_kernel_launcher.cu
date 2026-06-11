@@ -348,14 +348,16 @@ void gpu_stream_synchronize(cudaStream_t stream) {
 
 void launch_batch_rabitq_distances(cudaStream_t stream, cudaEvent_t event,
                                     const uint64_t* d_query_code,
-                                    const uint64_t* d_candidate_codes,
+                                    const uint64_t* d_candidate_data,
                                     float* d_distances,
-                                    uint32_t n_candidates, float scaling) {
+                                    float query_norm2, uint32_t n_candidates,
+                                    uint32_t stride_qwords) {
     if (n_candidates == 0) { CUDA_CHECK(cudaEventRecord(event, stream)); return; }
     constexpr uint32_t BLOCK = 512;
     uint32_t blocks = (n_candidates + BLOCK - 1) / BLOCK;
     gpu_kernels::rabitq_popcount_kernel<<<blocks, BLOCK, 0, stream>>>(
-        d_query_code, d_candidate_codes, d_distances, n_candidates, scaling);
+        d_query_code, d_candidate_data, d_distances,
+        query_norm2, n_candidates, stride_qwords);
     CUDA_CHECK(cudaEventRecord(event, stream));
 }
 
