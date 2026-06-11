@@ -24,6 +24,7 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
 
   receive_remote_access_tokens();
 
+  VamanaNode::disable_rabitq();
   if (config_.load_index) {
     const filepath_t startup_prefix = config_.resolved_index_prefix();
     const filepath_t meta_file = filepath_t(startup_prefix.string() + ".meta.json");
@@ -36,13 +37,27 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                     " does not match index metadata vector_data_type=" + vector_dtype_name(metadata.vector_dtype));
       }
       config_.vector_data_type = vector_dtype_name(metadata.vector_dtype);
+      VamanaNode::init_static_storage(config_.dim, config_.R, metadata.vector_dtype);
+      if (metadata.node_layout == "rabitq") {
+        lib_assert(metadata.schema_version >= 5,
+                   "RaBitQ index schema is obsolete; rebuild with the current offline builder");
+        lib_assert(metadata.rabitq_centroid.size() == metadata.dim,
+                   "RaBitQ index metadata has a missing or invalid centroid");
+        VamanaNode::enable_rabitq();
+        VamanaNode::set_rabitq_centroid(metadata.rabitq_centroid);
+        lib_assert(metadata.rabitq_code_bits == VamanaNode::rabitq_code_bits() &&
+                   metadata.rabitq_entry_size == VamanaNode::rabitq_entry_size(),
+                   "RaBitQ index code layout does not match the runtime dimension");
+      } else if (config_.use_rabitq) {
+        lib_failure("--use-rabitq requires an index built with --use-rabitq");
+      }
     }
   }
 
   // Initialize GPU
   gpu::gpu_init(static_cast<int>(config_.gpu_device));
   service_profile_ = resolve_service_profile();
-  print_status("search: exact");
+  print_status(config_.use_rabitq ? "search: RaBitQ + exact rerank" : "search: exact");
 
   // Construct Vamana index
   vamana_ = std::make_unique<vamana::Vamana<Distance>>(
@@ -60,14 +75,19 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   // Initialize GPU buffers for each compute thread
   const u32 max_batch = std::max(config_.beam_width * config_.expansion_batch,
                                    config_.beam_width_construction);
+  const size_t query_buffer_bytes = std::max(
+    static_cast<size_t>(config_.dim) * sizeof(element_t),
+    static_cast<size_t>(VamanaNode::rabitq_code_bits()) * sizeof(float));
+  const size_t candidate_buffer_bytes = std::max(
+    VamanaNode::vector_bytes(), VamanaNode::rabitq_entry_size());
   for (u32 tid = 0; tid < compute_threads().size(); ++tid) {
     auto& thread = compute_threads()[tid];
     thread->gpu_buffers.init(config_.num_coroutines,
                              config_.dim,
                              max_batch,
                              config_.R,
-                             static_cast<size_t>(config_.dim) * sizeof(element_t),
-                             VamanaNode::vector_bytes(),
+                             query_buffer_bytes,
+                             candidate_buffer_bytes,
                              thread->ctx->context.get_protection_domain(),
                              config_.gpudirect_rdma);
   }

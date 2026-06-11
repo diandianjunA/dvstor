@@ -249,7 +249,9 @@ template <class Distance>
 bool ComputeService<Distance>::validate_index_metadata(const filepath_t& index_prefix, str* error_message) {
   const filepath_t meta_file = filepath_t(index_prefix.string() + ".meta.json");
   if (index_prefix.empty() || !std::filesystem::exists(meta_file)) {
+    VamanaNode::disable_rabitq();
     VamanaNode::init_static_storage(config_.dim, config_.R, config_.resolved_vector_dtype());
+    if (config_.use_rabitq) VamanaNode::enable_rabitq();
     return true;
   }
 
@@ -266,8 +268,37 @@ bool ComputeService<Distance>::validate_index_metadata(const filepath_t& index_p
     return false;
   }
 
+  VamanaNode::disable_rabitq();
   VamanaNode::init_static_storage(config_.dim, config_.R, metadata.vector_dtype);
-  if (metadata.node_layout == "rabitq") VamanaNode::enable_rabitq();
+  if (config_.use_rabitq && metadata.node_layout != "rabitq") {
+    if (error_message) {
+      *error_message = "--use-rabitq requires an index built with --use-rabitq";
+    }
+    return false;
+  }
+  if (metadata.node_layout == "rabitq") {
+    if (metadata.schema_version < 5) {
+      if (error_message) {
+        *error_message = "RaBitQ index schema is obsolete; rebuild the index with the current offline builder";
+      }
+      return false;
+    }
+    if (metadata.rabitq_centroid.size() != metadata.dim) {
+      if (error_message) {
+        *error_message = "RaBitQ index metadata has a missing or invalid centroid";
+      }
+      return false;
+    }
+    VamanaNode::enable_rabitq();
+    VamanaNode::set_rabitq_centroid(metadata.rabitq_centroid);
+    if (metadata.rabitq_code_bits != VamanaNode::rabitq_code_bits() ||
+        metadata.rabitq_entry_size != VamanaNode::rabitq_entry_size()) {
+      if (error_message) {
+        *error_message = "RaBitQ index code layout does not match the runtime dimension";
+      }
+      return false;
+    }
+  }
   config_.vector_data_type = vector_dtype_name(metadata.vector_dtype);
 
   if (metadata.dim != config_.dim || metadata.R != config_.R ||

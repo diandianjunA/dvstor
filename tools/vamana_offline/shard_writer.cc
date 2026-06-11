@@ -271,20 +271,18 @@ void write_vamana_shards(const VamanaGraph& graph,
   const size_t n = dataset.size();
   const u32 dim = dataset.dim;
   if (config.use_rabitq) {
+    lib_assert(n > 0, "cannot build RaBitQ metadata for an empty dataset");
     VamanaNode::enable_rabitq();
     // Compute global centroid for asymmetric RaBitQ.
-    vec<float> centroid(dim, 0.0f);
+    vec<double> centroid_sum(dim, 0.0);
     for (size_t i = 0; i < n; ++i) {
         const byte_t* raw = dataset.raw_vector(i);
-        if (dataset.dtype == VectorDType::float32) {
-            const auto* fv = reinterpret_cast<const float*>(raw);
-            for (u32 d = 0; d < dim; ++d) centroid[d] += fv[d];
-        } else {
-            for (u32 d = 0; d < dim; ++d)
-                centroid[d] += static_cast<float>(static_cast<int>(raw[d]));
-        }
+        for (u32 d = 0; d < dim; ++d)
+            centroid_sum[d] += vector_component_as_float(raw, dataset.dtype, d);
     }
-    for (u32 d = 0; d < dim; ++d) centroid[d] /= static_cast<float>(n);
+    vec<float> centroid(dim);
+    for (u32 d = 0; d < dim; ++d)
+        centroid[d] = static_cast<float>(centroid_sum[d] / static_cast<double>(n));
     VamanaNode::set_rabitq_centroid(centroid);
   }
   const size_t node_size = VamanaNode::total_size();
@@ -347,14 +345,14 @@ void write_vamana_shards(const VamanaGraph& graph,
     }
 
     if (config.use_rabitq) {
-        auto code = VamanaNode::compute_rabitq_code(
-            dataset.raw_vector(i), dataset.dtype);
-        *reinterpret_cast<u64*>(buf + VamanaNode::offset_rabitq_code()) = code.lo;
-        *reinterpret_cast<u64*>(buf + VamanaNode::offset_rabitq_code() + 8) = code.hi;
-        *reinterpret_cast<float*>(buf + VamanaNode::offset_rabitq_norm()) =
-            VamanaNode::compute_rabitq_norm(dataset.raw_vector(i), dataset.dtype);
-        *reinterpret_cast<float*>(buf + VamanaNode::offset_rabitq_error()) =
-            VamanaNode::compute_rabitq_error_factor(dataset.raw_vector(i), dataset.dtype, code);
+        VamanaNode::RabitqCode code;
+        float norm = 0.0f;
+        float error = 0.0f;
+        VamanaNode::compute_rabitq_entry(dataset.raw_vector(i), dataset.dtype,
+                                         code, norm, error);
+        std::memcpy(buf + VamanaNode::offset_rabitq_code(), code.data(), code.size());
+        *reinterpret_cast<float*>(buf + VamanaNode::offset_rabitq_norm()) = norm;
+        *reinterpret_cast<float*>(buf + VamanaNode::offset_rabitq_error()) = error;
     }
 
     const auto& placement = placements[i];
@@ -385,7 +383,7 @@ void write_vamana_shards(const VamanaGraph& graph,
     {"medoid", {{"memory_node", medoid_ptr.memory_node()}, {"offset", medoid_ptr.byte_offset()}}},
     {"node_size", node_size},
     {"node_layout", VamanaNode::layout_name()},
-    {"schema_version", 4},
+    {"schema_version", 5},
     {"offline_builder_version", 2},
     {"random_graph_seed_scope", "per_node"},
     {"vector_data_type", vector_dtype_name(dataset.dtype)},
@@ -399,6 +397,8 @@ void write_vamana_shards(const VamanaGraph& graph,
   };
   if (config.use_rabitq) {
     metadata["rabitq_centroid"] = VamanaNode::rabitq_centroid;
+    metadata["rabitq_code_bits"] = VamanaNode::rabitq_code_bits();
+    metadata["rabitq_entry_size"] = VamanaNode::rabitq_entry_size();
   }
 
   const filepath_t metadata_file = filepath_t(output_prefix.string() + ".meta.json");

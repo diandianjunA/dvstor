@@ -51,11 +51,18 @@ MemoryNode::MemoryNode(Configuration& config)
     }
     startup_dtype = metadata.vector_dtype;
     config.vector_data_type = vector_dtype_name(startup_dtype);
+    VamanaNode::disable_rabitq();
     VamanaNode::init_static_storage(config.dim, config.R, startup_dtype);
     if (metadata.node_layout == "rabitq") {
+        lib_assert(metadata.schema_version >= 5,
+                   "RaBitQ index schema is obsolete; rebuild with the current offline builder");
+        lib_assert(metadata.rabitq_centroid.size() == metadata.dim,
+                   "RaBitQ index metadata has a missing or invalid centroid");
         VamanaNode::enable_rabitq();
-        if (!metadata.rabitq_centroid.empty())
-            VamanaNode::set_rabitq_centroid(metadata.rabitq_centroid);
+        VamanaNode::set_rabitq_centroid(metadata.rabitq_centroid);
+        lib_assert(metadata.rabitq_code_bits == VamanaNode::rabitq_code_bits() &&
+                   metadata.rabitq_entry_size == VamanaNode::rabitq_entry_size(),
+                   "RaBitQ index code layout does not match the runtime dimension");
     }
     lib_assert(metadata.vector_component_size == VamanaNode::vector_component_size(),
                "index metadata vector component size mismatch on storage node");
@@ -66,7 +73,9 @@ MemoryNode::MemoryNode(Configuration& config)
                  " (layout=" + VamanaNode::layout_name() +
                  ", vector_data_type=" + VamanaNode::vector_dtype_name() + ")");
   } else {
+    VamanaNode::disable_rabitq();
     VamanaNode::init_static_storage(config.dim, config.R, startup_dtype);
+    if (config.use_rabitq) VamanaNode::enable_rabitq();
   }
   allocate_memory();
 

@@ -33,12 +33,14 @@
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_node_read, t_node_read);
         }
 
-        const size_t query_bytes = vector_dtype_bytes(query_dtype, dim_);
-        const auto t_query_h2d = std::chrono::steady_clock::now();
-        std::memcpy(reinterpret_cast<byte_t*>(gs.h_query), query_data, query_bytes);
-        cudaMemcpyAsync(gs.d_query, gs.h_query, query_bytes, cudaMemcpyHostToDevice, gs.stream);
-        track_query_h2d(thread, query_bytes);
-        add_breakdown_subcategory(thread, service::breakdown::Subcategory::transfer_query_h2d, t_query_h2d);
+        if (!use_rabitq_) {
+            const size_t query_bytes = vector_dtype_bytes(query_dtype, dim_);
+            const auto t_query_h2d = std::chrono::steady_clock::now();
+            std::memcpy(reinterpret_cast<byte_t*>(gs.h_query), query_data, query_bytes);
+            cudaMemcpyAsync(gs.d_query, gs.h_query, query_bytes, cudaMemcpyHostToDevice, gs.stream);
+            track_query_h2d(thread, query_bytes);
+            add_breakdown_subcategory(thread, service::breakdown::Subcategory::transfer_query_h2d, t_query_h2d);
+        }
 
         distance_t medoid_dist = distance_to_stored_vector<Distance>(query_data, query_dtype, medoid_node->vector_data());
         ++thread->stats.distcomps;
@@ -83,14 +85,18 @@
         pending_K = 1;
 
         // Pre-compute asymmetric RaBitQ rotated query + norm once.
-        float rabitq_rotated_query[128] = {};
         float rabitq_query_norm2 = 0.0f;
         if (use_rabitq_) {
+            const auto t_query_h2d = std::chrono::steady_clock::now();
+            auto* rabitq_rotated_query = static_cast<float*>(gs.h_query);
             VamanaNode::compute_rotated_query(query_data, query_dtype,
                                               rabitq_rotated_query, &rabitq_query_norm2);
-            std::memcpy(gs.h_query, rabitq_rotated_query, 128 * sizeof(float));
-            cudaMemcpyAsync(gs.d_query, gs.h_query, 128 * sizeof(float),
+            const size_t rotated_query_bytes =
+                static_cast<size_t>(VamanaNode::rabitq_code_bits()) * sizeof(float);
+            cudaMemcpyAsync(gs.d_query, gs.h_query, rotated_query_bytes,
                             cudaMemcpyHostToDevice, gs.stream);
+            track_query_h2d(thread, rotated_query_bytes);
+            add_breakdown_subcategory(thread, service::breakdown::Subcategory::transfer_query_h2d, t_query_h2d);
         }
 
         while (true) {
@@ -139,30 +145,30 @@
             const u32 staging_lkey = gs.current_query_candidate_vecs_lkey();
 
             const auto tvf = std::chrono::steady_clock::now();
-            static constexpr size_t RQ_ENTRY = VamanaNode::RABITQ_ENTRY_SIZE;  // 32
+            const size_t rabitq_entry_size = VamanaNode::rabitq_entry_size();
             if (use_rabitq_) {
-                // Read 24-byte RaBitQ entries: code(16B) + norm(4B) + error(4B).
+                // Read the aligned dynamic entry: code, norm, error, and reserved padding.
                 if (use_gpudirect_candidate_rdma
                     && gs.current_query_candidate_vecs_registered()) {
                     co_await rdma::vamana::batch_read_at_offset(
                         all_unvisited, thread,
-                        VamanaNode::offset_rabitq_code(), RQ_ENTRY,
+                        VamanaNode::offset_rabitq_code(), rabitq_entry_size,
                         staging, staging_lkey);
                 } else {
                     auto rvr = co_await rdma::vamana::batch_read_at_offset_to_host(
                         all_unvisited, thread,
-                        VamanaNode::offset_rabitq_code(), RQ_ENTRY);
-                    thread->stats.query_host_staging_fallback_bytes += n_batch * RQ_ENTRY;
+                        VamanaNode::offset_rabitq_code(), rabitq_entry_size);
+                    thread->stats.query_host_staging_fallback_bytes += n_batch * rabitq_entry_size;
                     for (u32 i = 0; i < n_batch; ++i) {
-                        std::memcpy(gs.h_candidate_vecs + i * RQ_ENTRY,
-                                    rvr.host_buffers[i], RQ_ENTRY);
-                        thread->buffer_allocator.free_buffer(rvr.host_buffers[i], RQ_ENTRY);
+                        std::memcpy(gs.h_candidate_vecs + i * rabitq_entry_size,
+                                    rvr.host_buffers[i], rabitq_entry_size);
+                        thread->buffer_allocator.free_buffer(rvr.host_buffers[i], rabitq_entry_size);
                     }
                     cudaMemcpyAsync(staging, gs.h_candidate_vecs,
-                        n_batch * RQ_ENTRY, cudaMemcpyHostToDevice, gs.stream);
-                    track_query_h2d(thread, n_batch * RQ_ENTRY);
+                        n_batch * rabitq_entry_size, cudaMemcpyHostToDevice, gs.stream);
+                    track_query_h2d(thread, n_batch * rabitq_entry_size);
                 }
-                thread->stats.query_rdma_to_staging_bytes += n_batch * RQ_ENTRY;
+                thread->stats.query_rdma_to_staging_bytes += n_batch * rabitq_entry_size;
             } else {
                 auto vr = co_await rdma::vamana::batch_read_vectors(
                     all_unvisited, thread,
@@ -203,7 +209,9 @@
                     reinterpret_cast<const float*>(gs.d_query),
                     staging,
                     gs.d_distances, rabitq_query_norm2,
-                    n_batch, RQ_ENTRY);
+                    n_batch, VamanaNode::rabitq_code_bits(),
+                    static_cast<u32>(VamanaNode::rabitq_code_size()),
+                    static_cast<u32>(rabitq_entry_size));
             } else if (use_indirect_candidate_path) {
                 for (u32 i = 0; i < n_batch; ++i)
                     gs.h_candidate_ptrs[i] = staging + i * VamanaNode::vector_bytes();
@@ -273,7 +281,8 @@
 
         // RaBitQ: re-rank top candidates with exact L2 distances
         if (use_rabitq_ && !beam.empty()) {
-            u32 rerank_n = std::min(k_ * 2, static_cast<u32>(beam.size()));
+            const u32 rerank_target = std::max(k_ * 4, k_ + 64);
+            const u32 rerank_n = std::min(rerank_target, static_cast<u32>(beam.size()));
             vec<RemotePtr> rerank_ptrs(rerank_n);
             for (u32 i = 0; i < rerank_n; ++i)
                 rerank_ptrs[i] = beam[i].rptr;
@@ -289,6 +298,7 @@
                 thread->buffer_allocator.free_buffer(
                     rvr.host_buffers[i], VamanaNode::vector_bytes());
             }
+            beam.resize(rerank_n);
             std::sort(beam.begin(), beam.end(),
                 [](const auto& a, const auto& b) { return a.distance < b.distance; });
             ++thread->stats.query_exact_reranks;

@@ -31,12 +31,12 @@ __global__ void batch_l2_typed_pair_distance_kernel(
 
     const CandidateT* cand_vec = candidates + static_cast<size_t>(tile_id) * dim;
     if constexpr (std::is_integral_v<QueryT> && std::is_integral_v<CandidateT>) {
-        int local_sum = 0;
+        float local_sum = 0.0f;
         for (uint32_t i = tile.thread_rank(); i < dim; i += TILE_SIZE) {
             const int diff = static_cast<int>(query[i]) - static_cast<int>(cand_vec[i]);
-            local_sum += diff * diff;
+            local_sum += static_cast<float>(diff * diff);
         }
-        int total = cg::reduce(tile, local_sum, cg::plus<int>());
+        float total = cg::reduce(tile, local_sum, cg::plus<float>());
         if (tile.thread_rank() == 0) {
             distances[tile_id] = static_cast<float>(total);
         }
@@ -70,12 +70,12 @@ __global__ void batch_l2_typed_pair_distance_indirect_kernel(
 
     const CandidateT* cand_vec = static_cast<const CandidateT*>(candidate_ptrs[tile_id]);
     if constexpr (std::is_integral_v<QueryT> && std::is_integral_v<CandidateT>) {
-        int local_sum = 0;
+        float local_sum = 0.0f;
         for (uint32_t i = tile.thread_rank(); i < dim; i += TILE_SIZE) {
             const int diff = static_cast<int>(query[i]) - static_cast<int>(cand_vec[i]);
-            local_sum += diff * diff;
+            local_sum += static_cast<float>(diff * diff);
         }
-        int total = cg::reduce(tile, local_sum, cg::plus<int>());
+        float total = cg::reduce(tile, local_sum, cg::plus<float>());
         if (tile.thread_rank() == 0) {
             distances[tile_id] = static_cast<float>(total);
         }
@@ -112,12 +112,12 @@ __global__ void batch_l2_id_distance_kernel(
     const uint32_t cand_id = candidate_ids[tile_id];
     const T* cand = base_vectors + static_cast<size_t>(cand_id) * dim;
     if constexpr (std::is_integral_v<T>) {
-        int local_sum = 0;
+        float local_sum = 0.0f;
         for (uint32_t i = tile.thread_rank(); i < dim; i += TILE_SIZE) {
             const int diff = static_cast<int>(query[i]) - static_cast<int>(cand[i]);
-            local_sum += diff * diff;
+            local_sum += static_cast<float>(diff * diff);
         }
-        int total = cg::reduce(tile, local_sum, cg::plus<int>());
+        float total = cg::reduce(tile, local_sum, cg::plus<float>());
         if (tile.thread_rank() == 0) distances[tile_id] = static_cast<float>(total);
     } else {
         float local_sum = 0.0f;
@@ -317,87 +317,40 @@ __global__ void robust_prune_typed_kernel(
     }
 }
 
-// Asymmetric RaBitQ with byte-level LUT optimization.
-// Entry layout (32B): [code_lo(8B)][code_hi(8B)][x_norm(4B)][error_factor(4B)][reserved(8B)]
-// Distance: ||q-x||² ≈ q_norm2 + x_norm² - 2*x_norm*e*(1/√128)*signed_dot
-//
-// LUT optimization: precompute lut[16][256] in shared memory where
-//   lut[byte_pos][byte_val] = Σ_{bit j in byte} q_r[byte_pos*8+j] * sign(bit_j)
-// Then signed_dot = Σ_{pos=0}^{15} lut[pos][code_byte[pos]]
-// This reduces per-candidate work from 128 multiply-adds to 16 table lookups + adds.
+// Asymmetric RaBitQ. One warp evaluates one candidate so arbitrary code sizes
+// remain parallel without a dimension-dependent shared-memory LUT.
 __global__ void rabitq_asymmetric_kernel(
     const float* __restrict__ d_rotated_query,
     const uint8_t* __restrict__ candidate_data,
     float* __restrict__ distances,
-    float query_norm2, uint32_t n_candidates, uint32_t entry_bytes)
+    float query_norm2, uint32_t n_candidates,
+    uint32_t code_bits, uint32_t code_bytes, uint32_t entry_bytes)
 {
-    // LUT: 16 byte positions × 256 possible byte values = 4096 floats = 16KB shared mem
-    __shared__ float s_lut[16][256];
+    constexpr uint32_t warp_size = 32;
+    const uint32_t global_thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t candidate = global_thread / warp_size;
+    const uint32_t lane = threadIdx.x & (warp_size - 1);
+    if (candidate >= n_candidates) return;
 
-    // Build LUT cooperatively across all threads in the block.
-    // Total entries: 16 * 256 = 4096. Each thread handles multiple entries.
-    const uint32_t lut_size = 16 * 256;
-    for (uint32_t idx = threadIdx.x; idx < lut_size; idx += blockDim.x) {
-        uint32_t pos = idx >> 8;        // byte position 0..15
-        uint32_t byte_val = idx & 0xFF; // byte value 0..255
-        // Bit layout: code bytes are stored big-endian within each u64 half.
-        // code_lo stores bits 0..63 (byte 0 = bits 0..7 = MSB of code_lo)
-        // code_hi stores bits 64..127 (byte 8 = bits 64..71 = MSB of code_hi)
-        // Within each byte, bit 7 (MSB) corresponds to the lower query index.
-        float sum = 0.0f;
-        uint32_t base_bit = pos * 8;
-        for (uint32_t b = 0; b < 8; ++b) {
-            float q_val = d_rotated_query[base_bit + b];
-            // Bit (7-b) in the byte corresponds to query index (base_bit + b)
-            float sign = (byte_val & (1 << (7 - b))) ? 1.0f : -1.0f;
-            sum += q_val * sign;
-        }
-        s_lut[pos][byte_val] = sum;
-    }
-    __syncthreads();
-
-    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n_candidates) return;
-
-    const uint8_t* entry = candidate_data + static_cast<size_t>(tid) * entry_bytes;
-    float x_norm = *reinterpret_cast<const float*>(entry + 16);
-    float e      = *reinterpret_cast<const float*>(entry + 20);
-
-    // Read the 16-byte code and compute signed_dot via LUT lookups.
-    // Code is stored as [lo(8B)][hi(8B)], each u64 in native (little-endian) order.
-    // Byte 0 of code_lo (at entry[0]) on little-endian = bits 0-7 of the u64 value,
-    // which is the LEAST significant byte. But our bit layout uses (63-j) encoding:
-    //   bit j is at position (63-j) in the u64, so j=0 is at bit 63 (MSB).
-    // On little-endian, MSB = byte[7], so j=0..7 → byte[7], j=8..15 → byte[6], etc.
-    // To get byte_pos 0 (query indices 0..7), we need byte[7] of code_lo = entry[7].
+    const uint8_t* entry = candidate_data + static_cast<size_t>(candidate) * entry_bytes;
     float signed_dot = 0.0f;
-    // code_lo: query indices 0..63, stored at entry[0..7]
-    // byte at entry[7] has the MSBs (bits 56-63 of u64 = query indices 0-7)
-    // byte at entry[6] has bits 48-55 = query indices 8-15
-    // ...
-    // byte at entry[0] has bits 0-7 = query indices 56-63
-    signed_dot += s_lut[0][entry[7]];
-    signed_dot += s_lut[1][entry[6]];
-    signed_dot += s_lut[2][entry[5]];
-    signed_dot += s_lut[3][entry[4]];
-    signed_dot += s_lut[4][entry[3]];
-    signed_dot += s_lut[5][entry[2]];
-    signed_dot += s_lut[6][entry[1]];
-    signed_dot += s_lut[7][entry[0]];
-    // code_hi: query indices 64..127, stored at entry[8..15]
-    signed_dot += s_lut[8][entry[15]];
-    signed_dot += s_lut[9][entry[14]];
-    signed_dot += s_lut[10][entry[13]];
-    signed_dot += s_lut[11][entry[12]];
-    signed_dot += s_lut[12][entry[11]];
-    signed_dot += s_lut[13][entry[10]];
-    signed_dot += s_lut[14][entry[9]];
-    signed_dot += s_lut[15][entry[8]];
-
-    float x_norm2 = x_norm * x_norm;
-    float ip_approx = x_norm * e * (1.0f / sqrtf(128.0f)) * signed_dot;
-    float d2 = query_norm2 + x_norm2 - 2.0f * ip_approx;
-    distances[tid] = fmaxf(d2, 0.0f);
+    for (uint32_t bit = lane; bit < code_bits; bit += warp_size) {
+        const bool positive = (entry[bit >> 3] & (1u << (7u - (bit & 7u)))) != 0;
+        signed_dot += positive ? d_rotated_query[bit] : -d_rotated_query[bit];
+    }
+    for (uint32_t offset = warp_size / 2; offset > 0; offset >>= 1) {
+        signed_dot += __shfl_down_sync(0xffffffffu, signed_dot, offset);
+    }
+    if (lane == 0) {
+        const float x_norm = *reinterpret_cast<const float*>(entry + code_bytes);
+        const float e = *reinterpret_cast<const float*>(entry + code_bytes + sizeof(float));
+        float ip_approx = 0.0f;
+        if (e > 1e-12f) {
+            ip_approx = x_norm * signed_dot / (sqrtf(static_cast<float>(code_bits)) * e);
+        }
+        const float d2 = query_norm2 + x_norm * x_norm - 2.0f * ip_approx;
+        distances[candidate] = fmaxf(d2, 0.0f);
+    }
 }
 
 }  // namespace gpu_kernels

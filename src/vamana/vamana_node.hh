@@ -19,8 +19,8 @@ class ComputeThread;
  *   padding: 3B
  *   vector: vector_bytes
  *   neighbors: R * 8B
- *   rabitq_code: 16B   (128-bit binary code, two u64: lo then hi)
- *   rabitq_norm: 4B    (float, ||x - centroid||²)
+ *   rabitq_code: next_power_of_two(dim) bits
+ *   rabitq_norm: 4B    (float, ||x - centroid||)
  *   rabitq_error: 4B   (float, quantization error correction factor)
  * ]
  */
@@ -65,31 +65,37 @@ public:
   static size_t offset_id() { return HEADER_SIZE; }
   static size_t offset_edge_count() { return HEADER_SIZE + ID_SIZE; }
   static size_t offset_vector() { return HEADER_SIZE + META_SIZE; }
-  static constexpr size_t RABITQ_CODE_BITS = 128;
-  static constexpr size_t RABITQ_CODE_SIZE = RABITQ_CODE_BITS / 8;  // 16 bytes
-  // Entry: code(16B) + x_norm(4B) + error_factor(4B) + reserved(8B) = 32B
-  static constexpr size_t RABITQ_ENTRY_SIZE = 32;
   static size_t offset_neighbors() { return HEADER_SIZE + META_SIZE + vector_bytes(); }
   static size_t offset_rabitq_code() { return offset_neighbors() + NEIGHBORS_SIZE; }
-  static size_t offset_rabitq_norm() { return offset_rabitq_code() + RABITQ_CODE_SIZE; }
+  static u32 rabitq_code_bits() {
+      lib_assert(DIM > 0 && DIM <= (1u << 30), "RaBitQ dimension must be in [1, 2^30]");
+      u32 value = 1;
+      while (value < DIM) value <<= 1;
+      return std::max<u32>(value, 8);
+  }
+  static size_t rabitq_code_size() { return rabitq_code_bits() / 8; }
+  static size_t rabitq_entry_size() { return (rabitq_code_size() + 8 + 7) & ~size_t{7}; }
+  static size_t offset_rabitq_norm() { return offset_rabitq_code() + rabitq_code_size(); }
   static size_t offset_rabitq_error() { return offset_rabitq_norm() + sizeof(float); }
 
   static size_t vector_bytes() { return VECTOR_BYTES; }
   static size_t size_until_vector_end() { return offset_vector() + vector_bytes(); }
   static size_t total_size() {
       return offset_neighbors() + NEIGHBORS_SIZE
-             + (HAS_RABITQ_CODE ? RABITQ_ENTRY_SIZE : 0);
+             + (HAS_RABITQ_CODE ? rabitq_entry_size() : 0);
   }
 
-  // RaBitQ: asymmetric 128-bit quantization with error correction.
+  // RaBitQ: asymmetric binary quantization after a deterministic signed Hadamard rotation.
   inline static bool HAS_RABITQ_CODE = false;
-  inline static vec<float> rabitq_proj_matrix;  // DIM × 128 (column-major)
   inline static vec<float> rabitq_centroid;     // DIM floats (global dataset centroid)
 
   static void enable_rabitq() {
-      if (HAS_RABITQ_CODE) return;
       HAS_RABITQ_CODE = true;
-      init_rabitq_matrix();
+  }
+
+  static void disable_rabitq() {
+      HAS_RABITQ_CODE = false;
+      rabitq_centroid.clear();
   }
 
   static void set_rabitq_centroid(const vec<float>& c) {
@@ -97,205 +103,108 @@ public:
       else rabitq_centroid.assign(DIM, 0.0f);
   }
 
-  static void init_rabitq_matrix() {
-      if (!rabitq_proj_matrix.empty() || DIM == 0) return;
-      const u32 b = RABITQ_CODE_BITS;
-      rabitq_proj_matrix.resize(static_cast<size_t>(DIM) * b);
-      uint32_t seed = 42;
-      auto rand_gaussian = [&]() -> float {
-          seed = seed * 1103515245 + 12345;
-          float u1 = static_cast<float>(seed & 0x7FFFFFFF) / 2147483648.0f;
-          seed = seed * 1103515245 + 12345;
-          float u2 = static_cast<float>(seed & 0x7FFFFFFF) / 2147483648.0f;
-          return std::sqrt(-2.0f * std::log(std::max(u1, 1e-9f)))
-                 * std::cos(6.2831853f * u2);
-      };
-      for (size_t i = 0; i < rabitq_proj_matrix.size(); ++i)
-          rabitq_proj_matrix[i] = rand_gaussian();
-      // Gram-Schmidt orthonormalization of columns
-      for (u32 j = 0; j < b; ++j) {
-          for (u32 i = 0; i < j; ++i) {
-              float dot = 0.0f;
-              for (u32 d = 0; d < DIM; ++d)
-                  dot += rabitq_proj_matrix[d * b + i] * rabitq_proj_matrix[d * b + j];
-              for (u32 d = 0; d < DIM; ++d)
-                  rabitq_proj_matrix[d * b + j] -= dot * rabitq_proj_matrix[d * b + i];
-          }
-          float norm = 0.0f;
-          for (u32 d = 0; d < DIM; ++d)
-              norm += rabitq_proj_matrix[d * b + j] * rabitq_proj_matrix[d * b + j];
-          norm = std::sqrt(norm);
-          if (norm > 1e-9f)
-              for (u32 d = 0; d < DIM; ++d)
-                  rabitq_proj_matrix[d * b + j] /= norm;
-      }
+public:
+  using RabitqCode = vec<byte_t>;
+
+  static bool rabitq_bit(const RabitqCode& code, u32 bit) {
+      return (code[bit >> 3] & static_cast<byte_t>(1u << (7u - (bit & 7u)))) != 0;
   }
 
-public:
-  struct RabitqCode { u64 hi; u64 lo; };
+  static void compute_rotated_query(const byte_t* vector, VectorDType dtype,
+                                    float* rotated_out, float* norm2_out) {
+      const u32 bits = rabitq_code_bits();
+      const float* centroid = rabitq_centroid.empty() ? nullptr : rabitq_centroid.data();
+      float norm2 = 0.0f;
+      for (u32 d = 0; d < bits; ++d) {
+          float value = 0.0f;
+          if (d < DIM) {
+              value = vector_component_as_float(vector, dtype, d) - (centroid ? centroid[d] : 0.0f);
+              norm2 += value * value;
+              u32 hash = d + 0x9e3779b9u;
+              hash ^= hash >> 16;
+              hash *= 0x7feb352du;
+              hash ^= hash >> 15;
+              value = (hash & 1u) ? value : -value;
+          }
+          rotated_out[d] = value;
+      }
+      for (u32 width = 1; width < bits; width <<= 1) {
+          for (u32 base = 0; base < bits; base += width << 1) {
+              for (u32 offset = 0; offset < width; ++offset) {
+                  const float lhs = rotated_out[base + offset];
+                  const float rhs = rotated_out[base + width + offset];
+                  rotated_out[base + offset] = lhs + rhs;
+                  rotated_out[base + width + offset] = lhs - rhs;
+              }
+          }
+      }
+      const float scale = 1.0f / std::sqrt(static_cast<float>(bits));
+      for (u32 d = 0; d < bits; ++d) rotated_out[d] *= scale;
+      *norm2_out = norm2;
+  }
 
   // Compute ||x - centroid|| (L2 norm, not squared).
   static float compute_rabitq_norm(const byte_t* vec, VectorDType dtype) {
-      const float* c = rabitq_centroid.empty() ? nullptr : rabitq_centroid.data();
-      switch (dtype) {
-          case VectorDType::float32: {
-              const auto* fv = reinterpret_cast<const float*>(vec);
-              float nsq = 0.0f;
-              for (u32 d = 0; d < DIM; ++d) {
-                  float diff = fv[d] - (c ? c[d] : 0.0f);
-                  nsq += diff * diff;
-              }
-              return std::sqrt(nsq);
-          }
-          default: {
-              float nsq = 0.0f;
-              for (u32 d = 0; d < DIM; ++d) {
-                  float diff = static_cast<float>(static_cast<int>(vec[d])) - (c ? c[d] : 0.0f);
-                  nsq += diff * diff;
-              }
-              return std::sqrt(nsq);
-          }
-      }
+      vec<float> rotated(rabitq_code_bits());
+      float norm2 = 0.0f;
+      compute_rotated_query(vec, dtype, rotated.data(), &norm2);
+      return std::sqrt(norm2);
   }
 
-  // Compute binary code: b = sign(R * (x - centroid)).
+  // Compute binary code from the signs of the rotated centered vector.
   static RabitqCode compute_rabitq_code(const byte_t* vec, VectorDType dtype) {
-      const u32 b = RABITQ_CODE_BITS;
-      const float* c = rabitq_centroid.empty() ? nullptr : rabitq_centroid.data();
-      u64 hi = 0, lo = 0;
-      switch (dtype) {
-          case VectorDType::float32: {
-              const auto* fv = reinterpret_cast<const float*>(vec);
-              for (u32 j = 0; j < 64; ++j) {
-                  float sum = 0.0f;
-                  for (u32 d = 0; d < DIM; ++d)
-                      sum += (fv[d] - (c ? c[d] : 0.0f)) * rabitq_proj_matrix[d * b + j];
-                  if (sum > 0.0f) lo |= (1ULL << (63 - j));
-              }
-              for (u32 j = 64; j < b; ++j) {
-                  float sum = 0.0f;
-                  for (u32 d = 0; d < DIM; ++d)
-                      sum += (fv[d] - (c ? c[d] : 0.0f)) * rabitq_proj_matrix[d * b + j];
-                  if (sum > 0.0f) hi |= (1ULL << (127 - j));
-              }
-              break;
-          }
-          default: {
-              float fv[DIM];
-              for (u32 d = 0; d < DIM; ++d)
-                  fv[d] = static_cast<float>(static_cast<int>(vec[d]));
-              for (u32 j = 0; j < 64; ++j) {
-                  float sum = 0.0f;
-                  for (u32 d = 0; d < DIM; ++d)
-                      sum += (fv[d] - (c ? c[d] : 0.0f)) * rabitq_proj_matrix[d * b + j];
-                  if (sum > 0.0f) lo |= (1ULL << (63 - j));
-              }
-              for (u32 j = 64; j < b; ++j) {
-                  float sum = 0.0f;
-                  for (u32 d = 0; d < DIM; ++d)
-                      sum += (fv[d] - (c ? c[d] : 0.0f)) * rabitq_proj_matrix[d * b + j];
-                  if (sum > 0.0f) hi |= (1ULL << (127 - j));
-              }
-              break;
+      const u32 bits = rabitq_code_bits();
+      vec<float> rotated(bits);
+      float norm2 = 0.0f;
+      compute_rotated_query(vec, dtype, rotated.data(), &norm2);
+      RabitqCode code(rabitq_code_size(), 0);
+      for (u32 bit = 0; bit < bits; ++bit) {
+          if (rotated[bit] > 0.0f) {
+              code[bit >> 3] |= static_cast<byte_t>(1u << (7u - (bit & 7u)));
           }
       }
-      return {hi, lo};
+      return code;
+  }
+
+  static void compute_rabitq_entry(const byte_t* vec, VectorDType dtype,
+                                   RabitqCode& code, float& norm, float& error) {
+      const u32 bits = rabitq_code_bits();
+      vec<float> rotated(bits);
+      float norm2 = 0.0f;
+      compute_rotated_query(vec, dtype, rotated.data(), &norm2);
+
+      code.assign(rabitq_code_size(), 0);
+      float signed_dot = 0.0f;
+      for (u32 bit = 0; bit < bits; ++bit) {
+          const bool positive = rotated[bit] > 0.0f;
+          if (positive) {
+              code[bit >> 3] |= static_cast<byte_t>(1u << (7u - (bit & 7u)));
+          }
+          signed_dot += positive ? rotated[bit] : -rotated[bit];
+      }
+
+      norm = std::sqrt(norm2);
+      if (norm <= 1e-15f) {
+          error = 1.0f;
+      } else {
+          error = std::max(signed_dot / (norm * std::sqrt(static_cast<float>(bits))), 1e-15f);
+      }
   }
 
   // Compute error correction factor: e = (1/√D) * <R*x̄, b>
-  // where x̄ = (x - centroid) / ||x - centroid||, b ∈ {-1,+1}^128.
-  static float compute_rabitq_error_factor(const byte_t* vec, VectorDType dtype, RabitqCode code) {
-      const u32 b = RABITQ_CODE_BITS;
-      const float* c = rabitq_centroid.empty() ? nullptr : rabitq_centroid.data();
-      float x_norm = compute_rabitq_norm(vec, dtype);
-      float inv_norm = 1.0f / std::max(x_norm, 1e-15f);
-
-      float dot_sum = 0.0f;
-      switch (dtype) {
-          case VectorDType::float32: {
-              const auto* fv = reinterpret_cast<const float*>(vec);
-              for (u32 j = 0; j < 64; ++j) {
-                  float proj = 0.0f;
-                  for (u32 d = 0; d < DIM; ++d)
-                      proj += (fv[d] - (c ? c[d] : 0.0f)) * inv_norm * rabitq_proj_matrix[d * b + j];
-                  float sign = (code.lo & (1ULL << (63 - j))) ? 1.0f : -1.0f;
-                  dot_sum += proj * sign;
-              }
-              for (u32 j = 64; j < b; ++j) {
-                  float proj = 0.0f;
-                  for (u32 d = 0; d < DIM; ++d)
-                      proj += (fv[d] - (c ? c[d] : 0.0f)) * inv_norm * rabitq_proj_matrix[d * b + j];
-                  float sign = (code.hi & (1ULL << (127 - j))) ? 1.0f : -1.0f;
-                  dot_sum += proj * sign;
-              }
-              break;
-          }
-          default: {
-              float fv[DIM];
-              for (u32 d = 0; d < DIM; ++d)
-                  fv[d] = static_cast<float>(static_cast<int>(vec[d]));
-              for (u32 j = 0; j < 64; ++j) {
-                  float proj = 0.0f;
-                  for (u32 d = 0; d < DIM; ++d)
-                      proj += (fv[d] - (c ? c[d] : 0.0f)) * inv_norm * rabitq_proj_matrix[d * b + j];
-                  float sign = (code.lo & (1ULL << (63 - j))) ? 1.0f : -1.0f;
-                  dot_sum += proj * sign;
-              }
-              for (u32 j = 64; j < b; ++j) {
-                  float proj = 0.0f;
-                  for (u32 d = 0; d < DIM; ++d)
-                      proj += (fv[d] - (c ? c[d] : 0.0f)) * inv_norm * rabitq_proj_matrix[d * b + j];
-                  float sign = (code.hi & (1ULL << (127 - j))) ? 1.0f : -1.0f;
-                  dot_sum += proj * sign;
-              }
-              break;
-          }
-      }
-      float e = dot_sum / std::sqrt(static_cast<float>(b));
-      return std::max(e, 0.0f);
-  }
-
-  // Compute the full-precision rotated query for asymmetric distance.
-  // rotated_out[j] = Σ_d (q[d] - centroid[d]) * proj_matrix[d*128 + j]
-  static void compute_rotated_query(const byte_t* query, VectorDType dtype,
-                                     float* rotated_out, float* norm2_out) {
-      const u32 b = RABITQ_CODE_BITS;
-      const float* c = rabitq_centroid.empty() ? nullptr : rabitq_centroid.data();
+  // where x̄ = (x - centroid) / ||x - centroid|| and b is the dynamic binary code.
+  static float compute_rabitq_error_factor(const byte_t* vec, VectorDType dtype, const RabitqCode& code) {
+      const u32 bits = rabitq_code_bits();
+      vec<float> rotated(bits);
       float norm2 = 0.0f;
-
-      switch (dtype) {
-          case VectorDType::float32: {
-              const auto* fv = reinterpret_cast<const float*>(query);
-              for (u32 j = 0; j < b; ++j) {
-                  float sum = 0.0f;
-                  for (u32 d = 0; d < DIM; ++d)
-                      sum += (fv[d] - (c ? c[d] : 0.0f)) * rabitq_proj_matrix[d * b + j];
-                  rotated_out[j] = sum;
-              }
-              for (u32 d = 0; d < DIM; ++d) {
-                  float diff = fv[d] - (c ? c[d] : 0.0f);
-                  norm2 += diff * diff;
-              }
-              break;
-          }
-          default: {
-              float fv[DIM];
-              for (u32 d = 0; d < DIM; ++d)
-                  fv[d] = static_cast<float>(static_cast<int>(query[d]));
-              for (u32 j = 0; j < b; ++j) {
-                  float sum = 0.0f;
-                  for (u32 d = 0; d < DIM; ++d)
-                      sum += (fv[d] - (c ? c[d] : 0.0f)) * rabitq_proj_matrix[d * b + j];
-                  rotated_out[j] = sum;
-              }
-              for (u32 d = 0; d < DIM; ++d) {
-                  float diff = fv[d] - (c ? c[d] : 0.0f);
-                  norm2 += diff * diff;
-              }
-              break;
-          }
+      compute_rotated_query(vec, dtype, rotated.data(), &norm2);
+      const float inv_norm = 1.0f / std::max(std::sqrt(norm2), 1e-15f);
+      float dot_sum = 0.0f;
+      for (u32 bit = 0; bit < bits; ++bit) {
+          dot_sum += rotated[bit] * inv_norm * (rabitq_bit(code, bit) ? 1.0f : -1.0f);
       }
-      *norm2_out = norm2;
+      float e = dot_sum / std::sqrt(static_cast<float>(bits));
+      return std::max(e, 0.0f);
   }
 
 private:

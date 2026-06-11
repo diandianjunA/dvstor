@@ -75,6 +75,7 @@ void launch_batch_rabitq_asymmetric_distances(cudaStream_t stream, cudaEvent_t e
                                     const uint8_t* d_candidate_data,
                                     float* d_distances,
                                     float query_norm2, uint32_t n_candidates,
+                                    uint32_t code_bits, uint32_t code_bytes,
                                     uint32_t entry_bytes);
 
 void gpu_init(int device_id);

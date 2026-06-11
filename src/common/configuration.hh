@@ -43,7 +43,7 @@ public:
   u32 expansion_batch{1};   // Batch K beam expansions per iteration (1=serial)
   u32 rdma_qp_pool_size{1}; // QPs per memory node per SharedContext (1=default)
   u32 query_batch_size{1};  // Fuse GPU across N queries (1=single query)
-  bool use_rabitq{};        // Use RaBitQ codes (8B) instead of full vectors (128B)
+  bool use_rabitq{};        // Use RaBitQ entries instead of full vectors during beam search
   str vector_data_type{"auto"};
   str insert_execution{"compute"};
   u32 insert_workers{};
@@ -205,7 +205,7 @@ private:
       "query-batch-size", po::value<u32>(&query_batch_size)->default_value(1),
       "Fuse GPU/D2H across N queries processed in lockstep (1=disabled, 2-4=batch).")(
       "use-rabitq", po::bool_switch(&use_rabitq)->default_value(false),
-      "Use RaBitQ 8-byte codes for approximate beam search + exact re-rank.")(
+      "Use dimension-scaled RaBitQ entries for approximate beam search + exact re-rank.")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
       "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
@@ -237,6 +237,11 @@ private:
                   << e.what() << std::endl;
         exit_with_help_message(argv);
       }
+    }
+
+    if (use_rabitq && ip_distance) {
+      std::cerr << "[ERROR]: --use-rabitq currently supports L2 distance only" << std::endl;
+      exit_with_help_message(argv);
     }
 
     if (insert_execution != "compute" && insert_execution != "storage_owner") {

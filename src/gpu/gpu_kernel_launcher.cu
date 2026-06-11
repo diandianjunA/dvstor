@@ -351,13 +351,15 @@ void launch_batch_rabitq_asymmetric_distances(cudaStream_t stream, cudaEvent_t e
                                     const uint8_t* d_candidate_data,
                                     float* d_distances,
                                     float query_norm2, uint32_t n_candidates,
+                                    uint32_t code_bits, uint32_t code_bytes,
                                     uint32_t entry_bytes) {
     if (n_candidates == 0) { CUDA_CHECK(cudaEventRecord(event, stream)); return; }
     constexpr uint32_t BLOCK = 256;
-    uint32_t blocks = (n_candidates + BLOCK - 1) / BLOCK;
+    constexpr uint32_t CANDIDATES_PER_BLOCK = BLOCK / 32;
+    uint32_t blocks = (n_candidates + CANDIDATES_PER_BLOCK - 1) / CANDIDATES_PER_BLOCK;
     gpu_kernels::rabitq_asymmetric_kernel<<<blocks, BLOCK, 0, stream>>>(
         d_rotated_query, d_candidate_data, d_distances,
-        query_norm2, n_candidates, entry_bytes);
+        query_norm2, n_candidates, code_bits, code_bytes, entry_bytes);
     CUDA_CHECK(cudaEventRecord(event, stream));
 }
 

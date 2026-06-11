@@ -48,7 +48,7 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     ("skip-sanity-check", po::bool_switch(&config.skip_sanity_check),
      "Skip the expensive in-memory brute-force recall sanity check after graph construction.")
     ("use-rabitq", po::bool_switch(&config.use_rabitq),
-     "Store RaBitQ 8-byte binary codes per node for fast GPU-accelerated approximate search.")
+     "Store dimension-scaled RaBitQ search entries per node for GPU approximate search.")
     ("seed", po::value<i32>(&config.seed)->default_value(config.seed), "PRNG seed.")
     ("max-vectors", po::value<size_t>(&config.max_vectors)->default_value(config.max_vectors),
      "Maximum number of vectors to read.")
@@ -86,6 +86,8 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     lib_failure("--partition-max-degree must be > 0");
   if (config.partition_imbalance < 1.0)
     lib_failure("--partition-imbalance must be >= 1.0");
+  if (config.use_rabitq && config.ip_distance)
+    lib_failure("--use-rabitq currently supports L2 distance only");
   return config;
 }
 

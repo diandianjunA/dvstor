@@ -477,16 +477,14 @@ void MemoryNode::write_new_node(RemotePtr rptr,
     slots[i] = neighbors[i];
   }
   if (VamanaNode::HAS_RABITQ_CODE) {
-      auto code = VamanaNode::compute_rabitq_code(
-          ptr + VamanaNode::offset_vector(), VamanaNode::vector_dtype());
-      *reinterpret_cast<u64*>(ptr + VamanaNode::offset_rabitq_code()) = code.lo;
-      *reinterpret_cast<u64*>(ptr + VamanaNode::offset_rabitq_code() + 8) = code.hi;
-      *reinterpret_cast<float*>(ptr + VamanaNode::offset_rabitq_norm()) =
-          VamanaNode::compute_rabitq_norm(
-              ptr + VamanaNode::offset_vector(), VamanaNode::vector_dtype());
-      *reinterpret_cast<float*>(ptr + VamanaNode::offset_rabitq_error()) =
-          VamanaNode::compute_rabitq_error_factor(
-              ptr + VamanaNode::offset_vector(), VamanaNode::vector_dtype(), code);
+      VamanaNode::RabitqCode code;
+      float norm = 0.0f;
+      float error = 0.0f;
+      VamanaNode::compute_rabitq_entry(
+          ptr + VamanaNode::offset_vector(), VamanaNode::vector_dtype(), code, norm, error);
+      std::memcpy(ptr + VamanaNode::offset_rabitq_code(), code.data(), code.size());
+      *reinterpret_cast<float*>(ptr + VamanaNode::offset_rabitq_norm()) = norm;
+      *reinterpret_cast<float*>(ptr + VamanaNode::offset_rabitq_error()) = error;
   }
 }
 

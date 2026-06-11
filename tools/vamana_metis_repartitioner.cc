@@ -168,6 +168,16 @@ size_t align8(size_t value) {
   return (value + 7) & ~static_cast<size_t>(7);
 }
 
+size_t rabitq_entry_bytes(u32 dim) {
+  if (dim == 0 || dim > (1u << 30)) {
+    throw std::runtime_error("RaBitQ dimension must be in [1, 2^30]");
+  }
+  u32 bits = 1;
+  while (bits < dim) bits <<= 1;
+  bits = std::max<u32>(bits, 8);
+  return align8(bits / 8 + 2 * sizeof(float));
+}
+
 NodeFormat make_format(u32 dim, u32 R, VectorDType vector_dtype, const std::string& node_layout) {
   NodeFormat format;
   format.vector_bytes = vector_dtype_bytes(vector_dtype, dim);
@@ -176,7 +186,7 @@ NodeFormat make_format(u32 dim, u32 R, VectorDType vector_dtype, const std::stri
   format.neighbors_offset = format.vector_offset + format.vector_bytes;
   format.node_bytes = kNodeFixedPrefixBytes + format.vector_bytes + format.neighbors_bytes;
   if (node_layout == "rabitq") {
-    format.node_bytes += sizeof(u64);  // rabitq_code
+    format.node_bytes += rabitq_entry_bytes(dim);
   }
   format.aligned_node_bytes = align8(format.node_bytes);
   return format;
@@ -467,9 +477,9 @@ void write_metadata(const Options& options,
   metadata["num_memory_nodes"] = options.memory_nodes;
   metadata["dim"] = options.dim;
   metadata["R"] = options.R;
-  metadata["schema_version"] = 3;
+  metadata["schema_version"] = metadata.value("schema_version", 3u);
   metadata["node_size"] = format.node_bytes;
-  metadata["node_layout"] = "standard";
+  metadata["node_layout"] = metadata.value("node_layout", std::string{"standard"});
   metadata["vector_data_type"] = vector_dtype_name(options.vector_dtype);
   metadata["vector_component_size"] = vector_dtype_component_size(options.vector_dtype);
   metadata["vector_bytes"] = format.vector_bytes;

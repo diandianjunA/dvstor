@@ -22,7 +22,6 @@ constexpr u32 kRpcMagic = 0x53484e57;  // "SHNW"
 constexpr u32 kRpcVersion = 1;
 constexpr u32 kInitialRpcRecvsPerPeer = 8;
 constexpr u32 kMaxRpcResults = 512;
-constexpr u32 kRabitqSearchBeamSlack = 64;
 
 MinorCoroutine read_medoid_probe(RemotePtr& medoid_ptr, s_ptr<VamanaNode>& node, const u_ptr<ComputeThread>& thread) {
   medoid_ptr = co_await rdma::vamana::read_medoid_ptr(thread);

@@ -79,6 +79,16 @@ inline auto write_vamana_node(const RemotePtr& rptr,
     for (u8 i = 0; i < edge_count && i < neighbors.size(); ++i) {
         neighbor_slots[i] = neighbors[i].raw_address;
     }
+    if (VamanaNode::HAS_RABITQ_CODE) {
+        const byte_t* vector = local_buffer + VamanaNode::offset_vector();
+        VamanaNode::RabitqCode code;
+        float norm = 0.0f;
+        float error = 0.0f;
+        VamanaNode::compute_rabitq_entry(vector, VamanaNode::vector_dtype(), code, norm, error);
+        std::memcpy(local_buffer + VamanaNode::offset_rabitq_code(), code.data(), code.size());
+        *reinterpret_cast<float*>(local_buffer + VamanaNode::offset_rabitq_norm()) = norm;
+        *reinterpret_cast<float*>(local_buffer + VamanaNode::offset_rabitq_error()) = error;
+    }
 
     track_total_rdma_write(thread, total);
     thread->track_post();

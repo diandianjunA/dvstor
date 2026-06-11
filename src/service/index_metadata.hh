@@ -16,6 +16,8 @@ struct Metadata {
   VectorDType vector_dtype{VectorDType::float32};
   u32 vector_component_size{sizeof(element_t)};
   u32 vector_bytes{};
+  u32 rabitq_code_bits{};
+  u32 rabitq_entry_size{};
   vec<float> rabitq_centroid;
 };
 
