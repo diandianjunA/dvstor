@@ -63,18 +63,24 @@ public:
   static size_t offset_id() { return HEADER_SIZE; }
   static size_t offset_edge_count() { return HEADER_SIZE + ID_SIZE; }
   static size_t offset_vector() { return HEADER_SIZE + META_SIZE; }
-  static constexpr size_t RABITQ_CODE_SIZE = sizeof(u64);
+  static constexpr size_t RABITQ_CODE_BITS = 128;
+  static constexpr size_t RABITQ_CODE_SIZE = RABITQ_CODE_BITS / 8;  // 16 bytes
+  static constexpr size_t RABITQ_NORM_SIZE = sizeof(float);          // 4 bytes
   static size_t offset_neighbors() { return HEADER_SIZE + META_SIZE + vector_bytes(); }
   static size_t offset_rabitq_code() { return offset_neighbors() + NEIGHBORS_SIZE; }
+  static size_t offset_rabitq_norm() { return offset_rabitq_code() + RABITQ_CODE_SIZE; }
 
   static size_t vector_bytes() { return VECTOR_BYTES; }
   static size_t size_until_vector_end() { return offset_vector() + vector_bytes(); }
-  static size_t total_size() { return offset_neighbors() + NEIGHBORS_SIZE + (HAS_RABITQ_CODE ? RABITQ_CODE_SIZE : 0); }
+  static size_t total_size() {
+      return offset_neighbors() + NEIGHBORS_SIZE
+             + (HAS_RABITQ_CODE ? RABITQ_CODE_SIZE + RABITQ_NORM_SIZE : 0);
+  }
 
-  // RaBitQ projection matrix + code computation
+  // RaBitQ: 128-bit codes via random orthogonal projection.
   inline static bool HAS_RABITQ_CODE = false;
-  inline static vec<int8_t> rabitq_proj_matrix;
-  inline static float rabitq_scaling = 1.0f;
+  inline static vec<float> rabitq_proj_matrix;  // DIM × 128
+  inline static float rabitq_scale_coarse = 1.0f;
 
   static void enable_rabitq() {
       if (HAS_RABITQ_CODE) return;
@@ -83,63 +89,127 @@ public:
   }
 
   static void init_rabitq_matrix() {
-      if (!rabitq_proj_matrix.empty()) return;
-      rabitq_proj_matrix.resize(static_cast<size_t>(DIM) * 64);
+      if (!rabitq_proj_matrix.empty() || DIM == 0) return;
+      const u32 b = RABITQ_CODE_BITS;
+      rabitq_proj_matrix.resize(static_cast<size_t>(DIM) * b);
+      // Random Gaussian matrix
       uint32_t seed = 42;
-      for (size_t i = 0; i < rabitq_proj_matrix.size(); ++i) {
+      auto rand_gaussian = [&]() -> float {
+          // Box-Muller transform
           seed = seed * 1103515245 + 12345;
-          rabitq_proj_matrix[i] = (seed & 1) ? 1 : -1;
+          float u1 = static_cast<float>(seed & 0x7FFFFFFF) / 2147483648.0f;
+          seed = seed * 1103515245 + 12345;
+          float u2 = static_cast<float>(seed & 0x7FFFFFFF) / 2147483648.0f;
+          return std::sqrt(-2.0f * std::log(std::max(u1, 1e-9f)))
+                 * std::cos(6.2831853f * u2);
+      };
+      for (size_t i = 0; i < rabitq_proj_matrix.size(); ++i)
+          rabitq_proj_matrix[i] = rand_gaussian();
+      // Gram-Schmidt orthogonalization of columns
+      for (u32 j = 0; j < b; ++j) {
+          for (u32 i = 0; i < j; ++i) {
+              float dot = 0.0f;
+              for (u32 d = 0; d < DIM; ++d)
+                  dot += rabitq_proj_matrix[d * b + i] * rabitq_proj_matrix[d * b + j];
+              for (u32 d = 0; d < DIM; ++d)
+                  rabitq_proj_matrix[d * b + j] -= dot * rabitq_proj_matrix[d * b + i];
+          }
+          float norm = 0.0f;
+          for (u32 d = 0; d < DIM; ++d)
+              norm += rabitq_proj_matrix[d * b + j] * rabitq_proj_matrix[d * b + j];
+          norm = std::sqrt(norm);
+          if (norm > 1e-9f)
+              for (u32 d = 0; d < DIM; ++d)
+                  rabitq_proj_matrix[d * b + j] /= norm;
       }
-      rabitq_scaling = static_cast<float>(DIM) / 32.0f;
+      // Coarse quantizer scale: average absolute projection value
+      float avg_abs = 0.0f;
+      for (size_t i = 0; i < rabitq_proj_matrix.size(); ++i)
+          avg_abs += std::abs(rabitq_proj_matrix[i]);
+      rabitq_scale_coarse = avg_abs / static_cast<float>(rabitq_proj_matrix.size());
   }
 
 public:
-  static uint64_t compute_rabitq_code(const byte_t* vec, VectorDType dtype) {
+  // RaBitQ 128-bit code: two u64 halves [hi, lo].
+  struct RabitqCode { u64 hi; u64 lo; };
+
+  // Compute centred L2 norm (for distance estimation).
+  static float compute_rabitq_norm(const byte_t* vec, VectorDType dtype) {
       switch (dtype) {
           case VectorDType::float32: {
               const auto* fv = reinterpret_cast<const float*>(vec);
               float mean = 0.0f;
               for (u32 d = 0; d < DIM; ++d) mean += fv[d];
               mean /= static_cast<float>(DIM);
-              uint64_t code = 0;
-              for (int b = 0; b < 64; ++b) {
-                  float sum = 0.0f;
-                  for (u32 d = 0; d < DIM; ++d)
-                      sum += (fv[d] - mean) * static_cast<float>(rabitq_proj_matrix[d * 64 + b]);
-                  if (sum > 0.0f) code |= (1ULL << (63 - b));
-              }
-              return code;
+              float nsq = 0.0f;
+              for (u32 d = 0; d < DIM; ++d) { float c = fv[d] - mean; nsq += c * c; }
+              return nsq;
           }
-          case VectorDType::uint8: {
-              const auto* uv = reinterpret_cast<const u8*>(vec);
+          default: {
               int mean = 0;
-              for (u32 d = 0; d < DIM; ++d) mean += static_cast<int>(uv[d]);
+              for (u32 d = 0; d < DIM; ++d) mean += static_cast<int>(vec[d]);
               mean /= static_cast<int>(DIM);
-              uint64_t code = 0;
-              for (int b = 0; b < 64; ++b) {
-                  int sum = 0;
-                  for (u32 d = 0; d < DIM; ++d)
-                      sum += (static_cast<int>(uv[d]) - mean) * rabitq_proj_matrix[d * 64 + b];
-                  if (sum > 0) code |= (1ULL << (63 - b));
-              }
-              return code;
-          }
-          case VectorDType::int8: {
-              const auto* sv = reinterpret_cast<const i8*>(vec);
-              int mean = 0;
-              for (u32 d = 0; d < DIM; ++d) mean += static_cast<int>(sv[d]);
-              mean /= static_cast<int>(DIM);
-              uint64_t code = 0;
-              for (int b = 0; b < 64; ++b) {
-                  int sum = 0;
-                  for (u32 d = 0; d < DIM; ++d)
-                      sum += (static_cast<int>(sv[d]) - mean) * rabitq_proj_matrix[d * 64 + b];
-                  if (sum > 0) code |= (1ULL << (63 - b));
-              }
-              return code;
+              int nsq = 0;
+              for (u32 d = 0; d < DIM; ++d) { int c = static_cast<int>(vec[d]) - mean; nsq += c * c; }
+              return static_cast<float>(nsq);
           }
       }
-      return 0;
+  }
+
+  static RabitqCode compute_rabitq_code(const byte_t* vec, VectorDType dtype) {
+      const u32 b = RABITQ_CODE_BITS;
+      u64 hi = 0, lo = 0;
+      switch (dtype) {
+          case VectorDType::float32: {
+              const auto* fv = reinterpret_cast<const float*>(vec);
+              float mean = 0.0f;
+              for (u32 d = 0; d < DIM; ++d) mean += fv[d];
+              mean /= static_cast<float>(DIM);
+              for (u32 j = 0; j < 64; ++j) {
+                  float sum = 0.0f;
+                  for (u32 d = 0; d < DIM; ++d)
+                      sum += (fv[d] - mean) * rabitq_proj_matrix[d * b + j];
+                  if (sum > 0.0f) lo |= (1ULL << (63 - j));
+              }
+              for (u32 j = 64; j < b; ++j) {
+                  float sum = 0.0f;
+                  for (u32 d = 0; d < DIM; ++d)
+                      sum += (fv[d] - mean) * rabitq_proj_matrix[d * b + j];
+                  if (sum > 0.0f) hi |= (1ULL << (127 - j));
+              }
+              break;
+          }
+          default: {
+              int mean = 0;
+              for (u32 d = 0; d < DIM; ++d) mean += static_cast<int>(vec[d]);
+              mean /= static_cast<int>(DIM);
+              for (u32 j = 0; j < 64; ++j) {
+                  int sum = 0;
+                  for (u32 d = 0; d < DIM; ++d)
+                      sum += (static_cast<int>(vec[d]) - mean) * static_cast<int>(rabitq_proj_matrix[d * b + j]);
+                  if (sum > 0) lo |= (1ULL << (63 - j));
+              }
+              for (u32 j = 64; j < b; ++j) {
+                  int sum = 0;
+                  for (u32 d = 0; d < DIM; ++d)
+                      sum += (static_cast<int>(vec[d]) - mean) * static_cast<int>(rabitq_proj_matrix[d * b + j]);
+                  if (sum > 0) hi |= (1ULL << (127 - j));
+              }
+              break;
+          }
+      }
+      return {0, 0};
+  }
+
+  // Approximate L2 distance from RaBitQ codes using arcsin formula:
+  //   ||q-v||² ≈ qn2 + vn2 - 2*√(qn2)*√(vn2)*cos(π*popcount/128)
+  static float rabitq_approx_l2(float q_norm2, float v_norm2, u32 popcount) {
+      float qn = std::sqrt(std::max(q_norm2, 0.0f));
+      float vn = std::sqrt(std::max(v_norm2, 0.0f));
+      float angle = 3.14159265f * static_cast<float>(popcount) / static_cast<float>(RABITQ_CODE_BITS);
+      float cos_angle = std::cos(angle);
+      float d2 = q_norm2 + v_norm2 - 2.0f * qn * vn * cos_angle;
+      return std::max(d2, 0.0f);
   }
 
 private:

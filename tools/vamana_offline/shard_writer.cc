@@ -331,8 +331,12 @@ void write_vamana_shards(const VamanaGraph& graph,
     }
 
     if (config.use_rabitq) {
-        *reinterpret_cast<u64*>(buf + VamanaNode::offset_rabitq_code()) =
-            VamanaNode::compute_rabitq_code(dataset.raw_vector(i), dataset.dtype);
+        auto code = VamanaNode::compute_rabitq_code(
+            dataset.raw_vector(i), dataset.dtype);
+        *reinterpret_cast<u64*>(buf + VamanaNode::offset_rabitq_code()) = code.lo;
+        *reinterpret_cast<u64*>(buf + VamanaNode::offset_rabitq_code() + 8) = code.hi;
+        *reinterpret_cast<float*>(buf + VamanaNode::offset_rabitq_norm()) =
+            VamanaNode::compute_rabitq_norm(dataset.raw_vector(i), dataset.dtype);
     }
 
     const auto& placement = placements[i];

@@ -477,10 +477,13 @@ void MemoryNode::write_new_node(RemotePtr rptr,
     slots[i] = neighbors[i];
   }
   if (VamanaNode::HAS_RABITQ_CODE) {
-      *reinterpret_cast<u64*>(ptr + VamanaNode::offset_rabitq_code()) =
-          VamanaNode::compute_rabitq_code(
-              ptr + VamanaNode::offset_vector(),
-              VamanaNode::vector_dtype());
+      auto code = VamanaNode::compute_rabitq_code(
+          ptr + VamanaNode::offset_vector(), VamanaNode::vector_dtype());
+      *reinterpret_cast<u64*>(ptr + VamanaNode::offset_rabitq_code()) = code.lo;
+      *reinterpret_cast<u64*>(ptr + VamanaNode::offset_rabitq_code() + 8) = code.hi;
+      *reinterpret_cast<float*>(ptr + VamanaNode::offset_rabitq_norm()) =
+          VamanaNode::compute_rabitq_norm(
+              ptr + VamanaNode::offset_vector(), VamanaNode::vector_dtype());
   }
 }
 

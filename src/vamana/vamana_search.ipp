@@ -82,32 +82,31 @@
             beam[best_idx].rptr, &thread);
         pending_K = 1;
 
-        // Pre-compute RaBitQ query code once (invariant across iterations).
-        // The code must be computed in the STORED vector dtype so that XOR
-        // distance against stored codes is meaningful.
-        uint64_t rabitq_query_code = 0;
+        // Pre-compute RaBitQ query code + norm once.
+        VamanaNode::RabitqCode rabitq_query_code{0, 0};
+        float rabitq_query_norm2 = 0.0f;
         if (use_rabitq_) {
             if (query_dtype == VamanaNode::vector_dtype()) {
                 rabitq_query_code = VamanaNode::compute_rabitq_code(
                     query_data, VamanaNode::vector_dtype());
+                rabitq_query_norm2 = VamanaNode::compute_rabitq_norm(
+                    query_data, VamanaNode::vector_dtype());
             } else {
-                // Convert query to stored dtype first, then compute code.
                 vec<byte_t> converted(VamanaNode::vector_bytes());
                 if (query_dtype == VectorDType::float32) {
                     encode_float_vector_to_storage(
                         reinterpret_cast<const float*>(query_data),
-                        VamanaNode::DIM, VamanaNode::vector_dtype(),
-                        converted.data());
+                        VamanaNode::DIM, VamanaNode::vector_dtype(), converted.data());
                 } else {
-                    // General fallback: decode to float, re-encode to stored dtype.
                     vec<float> tmp(VamanaNode::DIM);
                     decode_storage_vector_to_float(
                         query_data, query_dtype, VamanaNode::DIM, tmp.data());
                     encode_float_vector_to_storage(
-                        tmp.data(), VamanaNode::DIM, VamanaNode::vector_dtype(),
-                        converted.data());
+                        tmp.data(), VamanaNode::DIM, VamanaNode::vector_dtype(), converted.data());
                 }
                 rabitq_query_code = VamanaNode::compute_rabitq_code(
+                    converted.data(), VamanaNode::vector_dtype());
+                rabitq_query_norm2 = VamanaNode::compute_rabitq_norm(
                     converted.data(), VamanaNode::vector_dtype());
             }
         }
@@ -158,37 +157,32 @@
             const u32 staging_lkey = gs.current_query_candidate_vecs_lkey();
 
             const auto tvf = std::chrono::steady_clock::now();
+            static constexpr size_t RQ_ENTRY = VamanaNode::RABITQ_CODE_SIZE
+                                               + VamanaNode::RABITQ_NORM_SIZE;  // 20
+            static constexpr u32 RQ_STRIDE_QWORDS = (RQ_ENTRY + 7) / 8;  // 3
             if (use_rabitq_) {
-                // Read 8-byte RaBitQ codes instead of 128-byte full vectors.
+                // Read 20-byte RaBitQ codes (16B) + norms (4B).
                 if (use_gpudirect_candidate_rdma
                     && gs.current_query_candidate_vecs_registered()) {
-                    // Fast path: RDMA directly into GPU buffer.
                     co_await rdma::vamana::batch_read_at_offset(
                         all_unvisited, thread,
-                        VamanaNode::offset_rabitq_code(),
-                        VamanaNode::RABITQ_CODE_SIZE,
+                        VamanaNode::offset_rabitq_code(), RQ_ENTRY,
                         staging, staging_lkey);
                 } else {
-                    // Host fallback: RDMA to host, then upload to GPU.
                     auto rvr = co_await rdma::vamana::batch_read_at_offset_to_host(
                         all_unvisited, thread,
-                        VamanaNode::offset_rabitq_code(),
-                        VamanaNode::RABITQ_CODE_SIZE);
-                    thread->stats.query_host_staging_fallback_bytes +=
-                        n_batch * VamanaNode::RABITQ_CODE_SIZE;
+                        VamanaNode::offset_rabitq_code(), RQ_ENTRY);
+                    thread->stats.query_host_staging_fallback_bytes += n_batch * RQ_ENTRY;
                     for (u32 i = 0; i < n_batch; ++i) {
-                        std::memcpy(gs.h_candidate_vecs + i * VamanaNode::RABITQ_CODE_SIZE,
-                                    rvr.host_buffers[i], VamanaNode::RABITQ_CODE_SIZE);
-                        thread->buffer_allocator.free_buffer(
-                            rvr.host_buffers[i], VamanaNode::RABITQ_CODE_SIZE);
+                        std::memcpy(gs.h_candidate_vecs + i * RQ_ENTRY,
+                                    rvr.host_buffers[i], RQ_ENTRY);
+                        thread->buffer_allocator.free_buffer(rvr.host_buffers[i], RQ_ENTRY);
                     }
                     cudaMemcpyAsync(staging, gs.h_candidate_vecs,
-                        n_batch * VamanaNode::RABITQ_CODE_SIZE,
-                        cudaMemcpyHostToDevice, gs.stream);
-                    track_query_h2d(thread, n_batch * VamanaNode::RABITQ_CODE_SIZE);
+                        n_batch * RQ_ENTRY, cudaMemcpyHostToDevice, gs.stream);
+                    track_query_h2d(thread, n_batch * RQ_ENTRY);
                 }
-                thread->stats.query_rdma_to_staging_bytes +=
-                    n_batch * VamanaNode::RABITQ_CODE_SIZE;
+                thread->stats.query_rdma_to_staging_bytes += n_batch * RQ_ENTRY;
             } else {
                 auto vr = co_await rdma::vamana::batch_read_vectors(
                     all_unvisited, thread,
@@ -224,14 +218,14 @@
             // ── Phase 3: GPU ───────────────────────────────────────────
             const auto t_gpu = std::chrono::steady_clock::now();
             if (use_rabitq_) {
-                cudaMemcpy(gs.d_query, &rabitq_query_code, sizeof(uint64_t),
-                           cudaMemcpyHostToDevice);
+                cudaMemcpy(gs.d_query, &rabitq_query_code,
+                           sizeof(uint64_t) * 2, cudaMemcpyHostToDevice);
                 gpu::launch_batch_rabitq_distances(
                     gs.stream, gs.event,
                     reinterpret_cast<const uint64_t*>(gs.d_query),
                     reinterpret_cast<const uint64_t*>(staging),
-                    gs.d_distances, n_batch,
-                    VamanaNode::rabitq_scaling);
+                    gs.d_distances, rabitq_query_norm2,
+                    n_batch, RQ_STRIDE_QWORDS);
             } else if (use_indirect_candidate_path) {
                 for (u32 i = 0; i < n_batch; ++i)
                     gs.h_candidate_ptrs[i] = staging + i * VamanaNode::vector_bytes();
