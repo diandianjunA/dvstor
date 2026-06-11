@@ -130,8 +130,10 @@ MemoryNode::MemoryNode(Configuration& config)
   }
   peer_handoff_shutdown_.store(true, std::memory_order_release);
   peer_handoff_tasks_cv_.notify_all();
-  if (peer_handoff_worker_thread_.joinable()) {
-    peer_handoff_worker_thread_.join();
+  for (auto& worker : peer_handoff_workers_) {
+    if (worker.joinable()) {
+      worker.join();
+    }
   }
   stop_peer_reverse_update_runtime();
 

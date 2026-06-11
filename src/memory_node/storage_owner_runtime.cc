@@ -66,8 +66,14 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
   for (u32 i = 0; i < worker_count; ++i) {
     storage_insert_workers_.emplace_back([this, i]() { storage_owner_insert_worker_loop(i); });
   }
-  peer_handoff_shutdown_.store(false, std::memory_order_release);
-  peer_handoff_worker_thread_ = std::thread([this]() { peer_handoff_worker_loop(); });
+  if (config.storage_owner_transitive_search && num_storage_nodes_ > 1) {
+    peer_handoff_shutdown_.store(false, std::memory_order_release);
+    peer_handoff_workers_.reserve(worker_count);
+    for (u32 i = 0; i < worker_count; ++i) {
+      peer_handoff_workers_.emplace_back([this]() { peer_handoff_worker_loop(); });
+    }
+    print_status("storage-owner search handoff workers: " + std::to_string(worker_count));
+  }
 }
 
 void MemoryNode::storage_owner_insert_worker_loop(u32 worker_id) {
@@ -479,9 +485,8 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
 
     auto t_search = std::chrono::steady_clock::now();
-    const vec<RemotePtr> candidates = config.storage_owner_transitive_search
-        ? beam_search_candidates_transitive(components, medoid_ptr, config, &breakdown)
-        : beam_search_candidates(components, medoid_ptr, config, &breakdown);
+    const vec<RemotePtr> candidates = beam_search_candidates(
+      components, medoid_ptr, config, &breakdown);
     breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
     hashset_t<RemotePtr> empty_skip;
     auto t_prune = std::chrono::steady_clock::now();

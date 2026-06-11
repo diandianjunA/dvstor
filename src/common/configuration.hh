@@ -57,6 +57,7 @@ public:
   u32 storage_owner_peer_rdma_tokens{8};
   u32 storage_owner_rpc_depth{8};
   u32 storage_owner_rpc_timeout_ms{30000};
+  u32 storage_owner_handoff_queue_depth{};
   u32 storage_owner_construction_beam_width{128};
   u32 storage_owner_search_snapshot_batch{64};
   u32 storage_owner_prune_max_candidates{128};
@@ -167,6 +168,9 @@ private:
       "storage-owner-rpc-timeout-ms",
       po::value<u32>(&storage_owner_rpc_timeout_ms)->default_value(storage_owner_rpc_timeout_ms),
       "Maximum time to wait for one storage_owner insert RPC response.")(
+      "storage-owner-handoff-queue-depth",
+      po::value<u32>(&storage_owner_handoff_queue_depth)->default_value(storage_owner_handoff_queue_depth),
+      "Maximum queued handoff requests per peer. 0 uses 4x --storage-owner-rpc-depth.")(
       "storage-owner-construction-beam-width",
       po::value<u32>(&storage_owner_construction_beam_width)->default_value(storage_owner_construction_beam_width),
       "Storage-owner online construction beam width. 0 uses --beam-width-construction unchanged.")(
@@ -360,6 +364,8 @@ public:
         os << std::setw(width) << "storage batch wait(us): " << config.storage_owner_batch_wait_us << std::endl;
         os << std::setw(width) << "storage peer RDMA tokens: " << config.storage_owner_peer_rdma_tokens << std::endl;
         os << std::setw(width) << "storage RPC depth: " << config.storage_owner_rpc_depth << std::endl;
+        os << std::setw(width) << "storage handoff queue depth: "
+           << config.storage_owner_handoff_queue_depth << std::endl;
         os << std::setw(width) << "storage RPC timeout(ms): " << config.storage_owner_rpc_timeout_ms << std::endl;
         os << std::setw(width) << "storage construction beam: "
            << config.storage_owner_construction_beam_width << std::endl;

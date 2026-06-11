@@ -1,16 +1,3 @@
-nohup: ignoring input
-[ 46%] Built target rdma_library
-[100%] Built target vamana_offline_builder
-[convert] exists: /data/xjs/index/dvstor_sift100m/converted/base_100000000.u8bin rows=100000000 dim=128
-[convert] exists: /data/xjs/index/dvstor_sift100m/converted/query.u8bin rows=10000 dim=128
-[convert] exists: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin rows=10000 topk=10
-base:        /data/xjs/index/dvstor_sift100m/converted/base_100000000.u8bin
-query:       /data/xjs/index/dvstor_sift100m/converted/query.u8bin
-groundtruth: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
-[build] index prefix: /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced
-[build] partition: balanced shards=5 R=48 build_beam=200 dtype=uint8
-[build] distance execution: cpu-avx2
-[build] command: /home/xjs/experiment/dvstor/build/vamana_offline_builder --data-path /data/xjs/index/dvstor_sift100m/converted/base_100000000.u8bin --output-prefix /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced --memory-nodes 5 --partition-strategy balanced --R 48 --beam-width 200 --alpha 1.2 --threads 32 --max-vectors 100000000 --vector-data-type uint8 --partition-max-degree 48 --partition-imbalance 1.03 --skip-sanity-check --use-rabitq
 reading dataset "/data/xjs/index/dvstor_sift100m/converted/base_100000000.u8bin" (dim=128, vectors=100000000/100000000, dtype=uint8, vector_bytes=128)
 Reading raw dataset 7% (7340032/100000000) elapsed 0s
 Reading raw dataset 11% (11534336/100000000) elapsed 0s
@@ -667,4 +654,3 @@ Exporting Vamana shards 95% (95061909/100000005) elapsed 6m18s
 Exporting Vamana shards 99% (99688028/100000005) elapsed 6m33s
 Exporting Vamana shards 100% (100000005/100000005) elapsed 6m34s done
 offline build finished in 8762.76 seconds
-[build] log: /home/xjs/experiment/dvstor/evaluation/sift100m/logs/build_balanced_20260611_093013.log

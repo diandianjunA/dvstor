@@ -11,6 +11,7 @@ constexpr u32 kPeerRpcMagic = 0x53505250;  // "SPRP"
 enum class InsertStatus : u32 {
   ok = 0,
   failed = 1,
+  overloaded = 2,
 };
 
 enum class PeerRpcType : u32 {
@@ -57,6 +58,9 @@ struct InsertBreakdownCounters {
   u64 storage_owner_search_distance_ns{};
   u64 storage_owner_search_beam_update_ns{};
   u64 storage_owner_search_result_sort_ns{};
+  u64 storage_owner_handoff_queue_wait_ns{};
+  u64 storage_owner_handoff_send_ns{};
+  u64 storage_owner_handoff_response_wait_ns{};
   u64 storage_owner_prune_snapshot_read_ns{};
   u64 storage_owner_prune_distance_ns{};
   u64 storage_owner_prune_sort_ns{};
@@ -236,12 +240,12 @@ inline const BeamEntrySerialized* handoff_request_beam(const void* payload, u32 
   return reinterpret_cast<const BeamEntrySerialized*>(handoff_query_vector(payload) + vector_bytes);
 }
 
-inline u64* handoff_request_visited(void* payload, u32 vector_bytes, u32 beam_count) {
-  return reinterpret_cast<u64*>(handoff_request_beam(payload, vector_bytes) + beam_count);
+inline byte_t* handoff_request_visited(void* payload, u32 vector_bytes, u32 beam_count) {
+  return reinterpret_cast<byte_t*>(handoff_request_beam(payload, vector_bytes) + beam_count);
 }
 
-inline const u64* handoff_request_visited(const void* payload, u32 vector_bytes, u32 beam_count) {
-  return reinterpret_cast<const u64*>(handoff_request_beam(payload, vector_bytes) + beam_count);
+inline const byte_t* handoff_request_visited(const void* payload, u32 vector_bytes, u32 beam_count) {
+  return reinterpret_cast<const byte_t*>(handoff_request_beam(payload, vector_bytes) + beam_count);
 }
 
 inline BeamEntrySerialized* handoff_response_beam(void* payload) {
@@ -252,12 +256,12 @@ inline const BeamEntrySerialized* handoff_response_beam(const void* payload) {
   return reinterpret_cast<const BeamEntrySerialized*>(reinterpret_cast<const SearchHandoffResponseHeader*>(payload) + 1);
 }
 
-inline u64* handoff_response_visited(void* payload, u32 beam_count) {
-  return reinterpret_cast<u64*>(handoff_response_beam(payload) + beam_count);
+inline byte_t* handoff_response_visited(void* payload, u32 beam_count) {
+  return reinterpret_cast<byte_t*>(handoff_response_beam(payload) + beam_count);
 }
 
-inline const u64* handoff_response_visited(const void* payload, u32 beam_count) {
-  return reinterpret_cast<const u64*>(handoff_response_beam(payload) + beam_count);
+inline const byte_t* handoff_response_visited(const void* payload, u32 beam_count) {
+  return reinterpret_cast<const byte_t*>(handoff_response_beam(payload) + beam_count);
 }
 
 }  // namespace service::storage_owner
