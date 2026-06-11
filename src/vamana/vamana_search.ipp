@@ -82,33 +82,15 @@
             beam[best_idx].rptr, &thread);
         pending_K = 1;
 
-        // Pre-compute RaBitQ query code + norm once.
-        VamanaNode::RabitqCode rabitq_query_code{0, 0};
+        // Pre-compute asymmetric RaBitQ rotated query + norm once.
+        float rabitq_rotated_query[128] = {};
         float rabitq_query_norm2 = 0.0f;
         if (use_rabitq_) {
-            if (query_dtype == VamanaNode::vector_dtype()) {
-                rabitq_query_code = VamanaNode::compute_rabitq_code(
-                    query_data, VamanaNode::vector_dtype());
-                rabitq_query_norm2 = VamanaNode::compute_rabitq_norm(
-                    query_data, VamanaNode::vector_dtype());
-            } else {
-                vec<byte_t> converted(VamanaNode::vector_bytes());
-                if (query_dtype == VectorDType::float32) {
-                    encode_float_vector_to_storage(
-                        reinterpret_cast<const float*>(query_data),
-                        VamanaNode::DIM, VamanaNode::vector_dtype(), converted.data());
-                } else {
-                    vec<float> tmp(VamanaNode::DIM);
-                    decode_storage_vector_to_float(
-                        query_data, query_dtype, VamanaNode::DIM, tmp.data());
-                    encode_float_vector_to_storage(
-                        tmp.data(), VamanaNode::DIM, VamanaNode::vector_dtype(), converted.data());
-                }
-                rabitq_query_code = VamanaNode::compute_rabitq_code(
-                    converted.data(), VamanaNode::vector_dtype());
-                rabitq_query_norm2 = VamanaNode::compute_rabitq_norm(
-                    converted.data(), VamanaNode::vector_dtype());
-            }
+            VamanaNode::compute_rotated_query(query_data, query_dtype,
+                                              rabitq_rotated_query, &rabitq_query_norm2);
+            std::memcpy(gs.h_query, rabitq_rotated_query, 128 * sizeof(float));
+            cudaMemcpyAsync(gs.d_query, gs.h_query, 128 * sizeof(float),
+                            cudaMemcpyHostToDevice, gs.stream);
         }
 
         while (true) {
@@ -157,10 +139,9 @@
             const u32 staging_lkey = gs.current_query_candidate_vecs_lkey();
 
             const auto tvf = std::chrono::steady_clock::now();
-            static constexpr size_t RQ_ENTRY = VamanaNode::RABITQ_CODE_SIZE
-                                               + VamanaNode::RABITQ_NORM_SIZE;  // 20
+            static constexpr size_t RQ_ENTRY = VamanaNode::RABITQ_ENTRY_SIZE;  // 32
             if (use_rabitq_) {
-                // Read 20-byte RaBitQ codes (16B) + norms (4B).
+                // Read 24-byte RaBitQ entries: code(16B) + norm(4B) + error(4B).
                 if (use_gpudirect_candidate_rdma
                     && gs.current_query_candidate_vecs_registered()) {
                     co_await rdma::vamana::batch_read_at_offset(
@@ -217,11 +198,9 @@
             // ── Phase 3: GPU ───────────────────────────────────────────
             const auto t_gpu = std::chrono::steady_clock::now();
             if (use_rabitq_) {
-                cudaMemcpy(gs.d_query, &rabitq_query_code,
-                           sizeof(uint64_t) * 2, cudaMemcpyHostToDevice);
-                gpu::launch_batch_rabitq_distances(
+                gpu::launch_batch_rabitq_asymmetric_distances(
                     gs.stream, gs.event,
-                    reinterpret_cast<const uint64_t*>(gs.d_query),
+                    reinterpret_cast<const float*>(gs.d_query),
                     staging,
                     gs.d_distances, rabitq_query_norm2,
                     n_batch, RQ_ENTRY);

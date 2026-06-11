@@ -52,7 +52,11 @@ MemoryNode::MemoryNode(Configuration& config)
     startup_dtype = metadata.vector_dtype;
     config.vector_data_type = vector_dtype_name(startup_dtype);
     VamanaNode::init_static_storage(config.dim, config.R, startup_dtype);
-    if (metadata.node_layout == "rabitq") VamanaNode::enable_rabitq();
+    if (metadata.node_layout == "rabitq") {
+        VamanaNode::enable_rabitq();
+        if (!metadata.rabitq_centroid.empty())
+            VamanaNode::set_rabitq_centroid(metadata.rabitq_centroid);
+    }
     lib_assert(metadata.vector_component_size == VamanaNode::vector_component_size(),
                "index metadata vector component size mismatch on storage node");
     lib_assert(metadata.vector_bytes == VamanaNode::vector_bytes(),

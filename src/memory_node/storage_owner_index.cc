@@ -484,6 +484,9 @@ void MemoryNode::write_new_node(RemotePtr rptr,
       *reinterpret_cast<float*>(ptr + VamanaNode::offset_rabitq_norm()) =
           VamanaNode::compute_rabitq_norm(
               ptr + VamanaNode::offset_vector(), VamanaNode::vector_dtype());
+      *reinterpret_cast<float*>(ptr + VamanaNode::offset_rabitq_error()) =
+          VamanaNode::compute_rabitq_error_factor(
+              ptr + VamanaNode::offset_vector(), VamanaNode::vector_dtype(), code);
   }
 }
 

@@ -270,7 +270,23 @@ void write_vamana_shards(const VamanaGraph& graph,
                          const filepath_t& output_prefix) {
   const size_t n = dataset.size();
   const u32 dim = dataset.dim;
-  if (config.use_rabitq) VamanaNode::enable_rabitq();
+  if (config.use_rabitq) {
+    VamanaNode::enable_rabitq();
+    // Compute global centroid for asymmetric RaBitQ.
+    vec<float> centroid(dim, 0.0f);
+    for (size_t i = 0; i < n; ++i) {
+        const byte_t* raw = dataset.raw_vector(i);
+        if (dataset.dtype == VectorDType::float32) {
+            const auto* fv = reinterpret_cast<const float*>(raw);
+            for (u32 d = 0; d < dim; ++d) centroid[d] += fv[d];
+        } else {
+            for (u32 d = 0; d < dim; ++d)
+                centroid[d] += static_cast<float>(static_cast<int>(raw[d]));
+        }
+    }
+    for (u32 d = 0; d < dim; ++d) centroid[d] /= static_cast<float>(n);
+    VamanaNode::set_rabitq_centroid(centroid);
+  }
   const size_t node_size = VamanaNode::total_size();
   const size_t aligned_size = (node_size + 7) & ~7ULL;
 
@@ -337,6 +353,8 @@ void write_vamana_shards(const VamanaGraph& graph,
         *reinterpret_cast<u64*>(buf + VamanaNode::offset_rabitq_code() + 8) = code.hi;
         *reinterpret_cast<float*>(buf + VamanaNode::offset_rabitq_norm()) =
             VamanaNode::compute_rabitq_norm(dataset.raw_vector(i), dataset.dtype);
+        *reinterpret_cast<float*>(buf + VamanaNode::offset_rabitq_error()) =
+            VamanaNode::compute_rabitq_error_factor(dataset.raw_vector(i), dataset.dtype, code);
     }
 
     const auto& placement = placements[i];
@@ -367,7 +385,7 @@ void write_vamana_shards(const VamanaGraph& graph,
     {"medoid", {{"memory_node", medoid_ptr.memory_node()}, {"offset", medoid_ptr.byte_offset()}}},
     {"node_size", node_size},
     {"node_layout", VamanaNode::layout_name()},
-    {"schema_version", 3},
+    {"schema_version", 4},
     {"offline_builder_version", 2},
     {"random_graph_seed_scope", "per_node"},
     {"vector_data_type", vector_dtype_name(dataset.dtype)},
@@ -379,6 +397,9 @@ void write_vamana_shards(const VamanaGraph& graph,
     {"partition_edge_cut", placement_result.stats.edge_cut},
     {"partition_cross_shard_ratio", placement_result.cross_shard_ratio},
   };
+  if (config.use_rabitq) {
+    metadata["rabitq_centroid"] = VamanaNode::rabitq_centroid;
+  }
 
   const filepath_t metadata_file = filepath_t(output_prefix.string() + ".meta.json");
   std::ofstream metadata_output(metadata_file);

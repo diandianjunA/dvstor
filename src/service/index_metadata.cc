@@ -41,6 +41,9 @@ bool load_metadata(const filepath_t& index_prefix, Metadata& metadata, str* erro
       "vector_component_size", static_cast<u32>(vector_dtype_component_size(metadata.vector_dtype)));
     metadata.vector_bytes = json.value(
       "vector_bytes", static_cast<u32>(vector_dtype_bytes(metadata.vector_dtype, metadata.dim)));
+    if (json.contains("rabitq_centroid")) {
+        metadata.rabitq_centroid = json["rabitq_centroid"].get<vec<float>>();
+    }
   } catch (const std::exception& e) {
     return fail(error_message, "failed to parse index metadata " + metadata_file.string() + ": " + e.what());
   }

@@ -16,6 +16,7 @@ struct Metadata {
   VectorDType vector_dtype{VectorDType::float32};
   u32 vector_component_size{sizeof(element_t)};
   u32 vector_bytes{};
+  vec<float> rabitq_centroid;
 };
 
 bool load_metadata(const filepath_t& index_prefix, Metadata& metadata, str* error_message = nullptr);
