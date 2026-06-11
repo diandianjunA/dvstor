@@ -446,7 +446,7 @@ void MemoryNode::progress_handoff_runtime(const Configuration&) {
           std::memcpy(peer_rpc_runtime_.buffer.get_full_buffer() + offset,
                       request->request.data(), bytes);
         }
-        const u64 wr_id = next_peer_async_wr_id();
+        const u64 wr_id = next_peer_handoff_wr_id();
         slot.wr_id = wr_id;
         peer_handoff_send_slots_[wr_id] = {peer_id, slot_id};
         posts.push_back(PendingPost{peer_id, slot_id, wr_id, offset, bytes});

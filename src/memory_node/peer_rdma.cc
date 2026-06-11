@@ -60,6 +60,10 @@ void MemoryNode::setup_storage_peers(Configuration& config) {
   }
   peer_context_->close_server_socket();
   print_status("storage-owner peer RDMA QPs per peer: " + std::to_string(peer_qps_per_peer_));
+  if (peer_qps_per_peer_ > 1) {
+    print_status("storage-owner peer QP0 reserved for RPC; data RDMA uses QP1.." +
+                 std::to_string(peer_qps_per_peer_ - 1));
+  }
 
   peer_index_region_ = std::make_unique<MemoryRegion>(*peer_context_);
   peer_index_region_->register_memory(index_buffer_.get_full_buffer(), index_buffer_.buffer_size, true);
@@ -111,7 +115,10 @@ QP& MemoryNode::peer_control_qp(u32 shard_id) {
 
 u32 MemoryNode::peer_data_qp_index(u32 worker_id) const {
   lib_assert(peer_qps_per_peer_ > 0, "peer QP count is not initialized");
-  return worker_id % peer_qps_per_peer_;
+  if (peer_qps_per_peer_ == 1) {
+    return 0;
+  }
+  return 1 + worker_id % (peer_qps_per_peer_ - 1);
 }
 
 QP& MemoryNode::peer_data_qp(u32 shard_id, u32 qp_idx) {
@@ -184,6 +191,11 @@ u64 MemoryNode::next_peer_async_wr_id() {
   return encode_64bit(kPeerAsyncWrOwner, id);
 }
 
+u64 MemoryNode::next_peer_handoff_wr_id() {
+  const u32 id = peer_handoff_wr_id_counter_.fetch_add(1, std::memory_order_relaxed);
+  return encode_64bit(kPeerHandoffWrOwner, id);
+}
+
 void MemoryNode::register_peer_pending_send_locked(u64 wr_id, PeerPendingSend pending) {
   std::lock_guard<std::mutex> lock(peer_completion_mutex_);
   peer_pending_sends_[wr_id] = pending;
@@ -227,7 +239,7 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
     peer_sync_completions_.insert(wr_id);
     return;
   }
-  if (owner == kPeerAsyncWrOwner) {
+  if (owner == kPeerHandoffWrOwner) {
     handle_handoff_send_completion(wr_id);
     return;
   }

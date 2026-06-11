@@ -107,6 +107,7 @@ private:
 
   static constexpr u32 kPeerSyncWrOwner = std::numeric_limits<u32>::max();
   static constexpr u32 kPeerAsyncWrOwner = std::numeric_limits<u32>::max() - 1;
+  static constexpr u32 kPeerHandoffWrOwner = std::numeric_limits<u32>::max() - 2;
   static constexpr u32 kPeerSafeRdAtomic = 8;
   static constexpr u32 kPeerRpcFlagNoResponse = 1u;
 
@@ -143,6 +144,7 @@ private:
   void acquire_peer_rdma_read_credit(u32 shard_id, u32 qp_idx);
   u64 next_peer_sync_wr_id();
   u64 next_peer_async_wr_id();
+  u64 next_peer_handoff_wr_id();
   void register_peer_pending_send_locked(u64 wr_id, PeerPendingSend pending);
   void handle_peer_send_completion(u64 wr_id);
   void poll_peer_send_cq();
@@ -388,6 +390,7 @@ private:
   vec<vec<std::atomic<u32>>> peer_rdma_read_qp_outstanding_;
   std::atomic<u32> peer_sync_wr_id_counter_{1};
   std::atomic<u32> peer_async_wr_id_counter_{1};
+  std::atomic<u32> peer_handoff_wr_id_counter_{1};
   std::atomic<u32> peer_async_rdma_outstanding_{0};
   std::atomic<u64> next_peer_request_id_{1};
   std::thread peer_rpc_progress_thread_;
