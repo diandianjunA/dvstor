@@ -128,6 +128,11 @@ MemoryNode::MemoryNode(Configuration& config)
       worker.join();
     }
   }
+  peer_handoff_shutdown_.store(true, std::memory_order_release);
+  peer_handoff_tasks_cv_.notify_all();
+  if (peer_handoff_worker_thread_.joinable()) {
+    peer_handoff_worker_thread_.join();
+  }
   stop_peer_reverse_update_runtime();
 
   print_status("memory node shutting down");

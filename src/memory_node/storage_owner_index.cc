@@ -911,19 +911,24 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   }
 
   auto t_search = std::chrono::steady_clock::now();
-  auto search = config.storage_owner_transitive_search
-      ? beam_search_candidates_transitive_async(components, medoid_ptr, config, thread, &breakdown)
-      : beam_search_candidates_async(components, medoid_ptr, config, thread, &breakdown);
-  co_await std::suspend_always{};
-  while (!search.handle.done()) {
-    if (thread.is_ready(thread.running_coroutine)) {
-      search.handle.resume();
-    } else {
-      co_await std::suspend_always{};
+  if (config.storage_owner_transitive_search) {
+    vec<RemotePtr> result =
+        beam_search_candidates_transitive(components, medoid_ptr, config, &breakdown);
+    breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
+    storage_owner_async_candidates_[thread.id][thread.running_coroutine] = std::move(result);
+  } else {
+    auto search = beam_search_candidates_async(components, medoid_ptr, config, thread, &breakdown);
+    co_await std::suspend_always{};
+    while (!search.handle.done()) {
+      if (thread.is_ready(thread.running_coroutine)) {
+        search.handle.resume();
+      } else {
+        co_await std::suspend_always{};
+      }
     }
+    search.handle.destroy();
+    breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
   }
-  search.handle.destroy();
-  breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
 
   const vec<RemotePtr>& candidates = storage_owner_async_candidates_[thread.id][thread.running_coroutine];
   hashset_t<RemotePtr> empty_skip;
@@ -1121,6 +1126,13 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
 
 // ─── Transitive (handoff-based) beam search ──────────────────────────
 
+// Check whether a RemotePtr points within the local shard bounds.
+// Returns false for garbage pointers that would crash read_node_snapshot / read_neighbor_list.
+inline bool ptr_in_bounds(RemotePtr rptr, u64 shard_cap) {
+  if (rptr.is_null()) return false;
+  return rptr.byte_offset() + VamanaNode::total_size() <= shard_cap;
+}
+
 // Expand ALL unexpanded local nodes in the beam.
 // Remote nodes are deferred (only added to beam with approximate distance).
 bool MemoryNode::expand_all_local_nodes(vec<BeamEntry>& beam,
@@ -1131,6 +1143,7 @@ bool MemoryNode::expand_all_local_nodes(vec<BeamEntry>& beam,
                                             InsertBreakdownCounters* breakdown) {
   bool any_expanded = false;
   const u32 construction_width = storage_owner_construction_width(config);
+  const u64 shard_cap = mn_memory_bytes_;
 
   for (;;) {
     // Find best unexpanded LOCAL node
@@ -1156,7 +1169,9 @@ bool MemoryNode::expand_all_local_nodes(vec<BeamEntry>& beam,
     any_expanded = true;
 
     auto t_nbr = std::chrono::steady_clock::now();
-    const vec<RemotePtr> neighbors = read_neighbor_list(best_rptr);
+    const vec<RemotePtr> neighbors = ptr_in_bounds(best_rptr, shard_cap)
+        ? read_neighbor_list(best_rptr)
+        : vec<RemotePtr>{};
     if (breakdown != nullptr) {
       breakdown->storage_owner_search_neighbor_read_ns += elapsed_ns_since(t_nbr);
     }
@@ -1177,7 +1192,14 @@ bool MemoryNode::expand_all_local_nodes(vec<BeamEntry>& beam,
     const u32 snapshot_batch = storage_owner_snapshot_batch_size(config);
     for (size_t begin = 0; begin < local_unvisited.size(); begin += snapshot_batch) {
       const size_t end = std::min(local_unvisited.size(), begin + snapshot_batch);
-      vec<RemotePtr> batch(local_unvisited.begin() + begin, local_unvisited.begin() + end);
+      vec<RemotePtr> batch;
+      batch.reserve(end - begin);
+      for (size_t bi = begin; bi < end; ++bi) {
+        if (ptr_in_bounds(local_unvisited[bi], shard_cap)) {
+          batch.push_back(local_unvisited[bi]);
+        }
+      }
+      if (batch.empty()) continue;
       auto t_snap = std::chrono::steady_clock::now();
       vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
       if (breakdown != nullptr) {
@@ -1558,9 +1580,11 @@ bool MemoryNode::handle_search_handoff_rpc(u32 source_shard,
 
   // Phase 1: Compute precise distances for local unexpanded beam entries
   const u32 snapshot_batch = req->snapshot_batch;
+  const u64 shard_cap = mn_memory_bytes_;
   vec<RemotePtr> local_unexpanded;
   for (auto& entry : beam) {
-    if (!entry.expanded && local_shard(entry.rptr.memory_node())) {
+    if (!entry.expanded && local_shard(entry.rptr.memory_node()) &&
+        ptr_in_bounds(entry.rptr, shard_cap)) {
       local_unexpanded.push_back(entry.rptr);
     }
   }
@@ -1627,6 +1651,10 @@ bool MemoryNode::handle_search_handoff_rpc(u32 source_shard,
   std::memcpy(resp_visited, new_visited_raws.data(),
               new_visited_raws.size() * sizeof(u64));
 
+  std::cerr << "[handoff-resp] sending " << response_bytes << " bytes to shard "
+            << source_shard << " on shard " << storage_id_ << std::endl;
   send_peer_rpc_message(source_shard, response_msg.data(), response_bytes);
+  std::cerr << "[handoff-resp] sent to shard " << source_shard
+            << " on shard " << storage_id_ << std::endl;
   return true;
 }

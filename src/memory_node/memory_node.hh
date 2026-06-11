@@ -67,6 +67,13 @@ class MemoryNode {
     std::chrono::steady_clock::time_point received_at{};
   };
 
+  struct PeerHandoffTask {
+    u32 source_shard{};
+    service::storage_owner::SearchHandoffRequestHeader req{};
+    vec<byte_t> payload;
+    std::chrono::steady_clock::time_point received_at{};
+  };
+
   struct PeerReverseUpdateResponse {
     u32 destination_shard{};
     service::storage_owner::PeerRpcHeader header{};
@@ -164,6 +171,7 @@ private:
                                             bool success);
   void peer_rpc_progress_loop();
   void peer_reverse_update_worker_loop(u32 worker_id);
+  void peer_handoff_worker_loop();
   void peer_reverse_response_loop();
   void peer_reverse_outgoing_loop();
   bool handle_peer_rpc_requests(vec<PeerRpcMessage>& requests, const Configuration& config);
@@ -364,6 +372,11 @@ private:
   std::mutex peer_reverse_tasks_mutex_;
   std::condition_variable peer_reverse_tasks_cv_;
   std::deque<PeerReverseUpdateTask> peer_reverse_tasks_;
+  std::deque<PeerHandoffTask> peer_handoff_tasks_;
+  std::mutex peer_handoff_tasks_mutex_;
+  std::condition_variable peer_handoff_tasks_cv_;
+  std::atomic<bool> peer_handoff_shutdown_{false};
+  std::thread peer_handoff_worker_thread_;
   std::mutex peer_reverse_responses_mutex_;
   std::condition_variable peer_reverse_responses_cv_;
   std::deque<PeerReverseUpdateResponse> peer_reverse_responses_;

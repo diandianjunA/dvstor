@@ -366,13 +366,50 @@ void MemoryNode::peer_rpc_progress_loop() {
         }
         peer_rpc_responses_cv_.notify_all();
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::search_handoff_request)) {
-        // Process search handoff inline (local-only reads, no locks or RDMA)
+        // Enqueue for async processing to avoid blocking the progress thread
         if (bytes >= sizeof(service::storage_owner::SearchHandoffRequestHeader)) {
           const auto* req = reinterpret_cast<const service::storage_owner::SearchHandoffRequestHeader*>(header);
           const size_t expected_bytes = service::storage_owner::search_handoff_request_bytes(
               req->rpc.item_count, req->visited_count, req->vector_bytes);
           if (bytes >= expected_bytes) {
-            handle_search_handoff_rpc(peer_id, req, payload, *storage_worker_config_);
+            PeerHandoffTask task;
+            task.source_shard = peer_id;
+            task.received_at = std::chrono::steady_clock::now();
+            task.req = *req;
+            task.payload.assign(payload, payload + bytes);
+            std::unique_lock<std::mutex> lock(peer_handoff_tasks_mutex_);
+            static std::atomic<u32> enq_count{0};
+            if (enq_count.fetch_add(1) < 10) {
+              std::cerr << "[handoff] enqueued on shard " << storage_id_
+                        << " from shard " << peer_id
+                        << " beam=" << req->rpc.item_count
+                        << " visited=" << req->visited_count
+                        << " qdepth=" << (peer_handoff_tasks_.size() + 1)
+                        << std::endl;
+            }
+            peer_handoff_tasks_.push_back(std::move(task));
+            lock.unlock();
+            peer_handoff_tasks_cv_.notify_one();
+          } else {
+            static std::atomic<u32> size_err_count{0};
+            if (size_err_count.fetch_add(1) < 5) {
+              std::cerr << "[handoff] size mismatch on shard " << storage_id_
+                        << " from shard " << peer_id
+                        << " received=" << bytes
+                        << " expected=" << expected_bytes
+                        << " beam=" << req->rpc.item_count
+                        << " visited=" << req->visited_count
+                        << " vec_bytes=" << req->vector_bytes
+                        << std::endl;
+            }
+          }
+        } else {
+          static std::atomic<u32> hdr_err_count{0};
+          if (hdr_err_count.fetch_add(1) < 5) {
+            std::cerr << "[handoff] header too small on shard " << storage_id_
+                      << " from shard " << peer_id
+                      << " received=" << bytes
+                      << std::endl;
           }
         }
       }
@@ -780,3 +817,36 @@ void MemoryNode::log_slow_peer_reverse_update_response(std::chrono::steady_clock
             << " elapsed_ms=" << (wait_ns / 1000000.0)
             << std::endl;
 }
+
+void MemoryNode::peer_handoff_worker_loop() {
+  std::cerr << "[handoff-worker] started on shard " << storage_id_ << std::endl;
+  const Configuration& config = *storage_worker_config_;
+  while (!peer_handoff_shutdown_.load(std::memory_order_acquire)) {
+    PeerHandoffTask task;
+    {
+      std::unique_lock<std::mutex> lock(peer_handoff_tasks_mutex_);
+      peer_handoff_tasks_cv_.wait(lock, [&]() {
+        return peer_handoff_shutdown_.load(std::memory_order_acquire) || !peer_handoff_tasks_.empty();
+      });
+      if (peer_handoff_shutdown_.load(std::memory_order_acquire) && peer_handoff_tasks_.empty()) {
+        std::cerr << "[handoff-worker] shutting down on shard " << storage_id_ << std::endl;
+        return;
+      }
+      task = std::move(peer_handoff_tasks_.front());
+      peer_handoff_tasks_.pop_front();
+    }
+    std::cerr << "[handoff-worker] processing on shard " << storage_id_
+              << " from shard " << task.source_shard
+              << " beam=" << task.req.rpc.item_count
+              << std::endl;
+    try {
+      handle_search_handoff_rpc(task.source_shard, &task.req, task.payload.data(), config);
+    } catch (const std::exception& e) {
+      std::cerr << "[handoff-worker] exception on shard " << storage_id_
+                << ": " << e.what() << std::endl;
+    } catch (...) {
+      std::cerr << "[handoff-worker] unknown exception on shard " << storage_id_ << std::endl;
+    }
+  }
+}
+

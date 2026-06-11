@@ -35,7 +35,8 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
                                 : std::min(config.beam_width_construction,
                                            config.storage_owner_construction_beam_width)) +
                " snapshot_batch=" + std::to_string(config.storage_owner_search_snapshot_batch) +
-               " prune_max_candidates=" + std::to_string(config.storage_owner_prune_max_candidates));
+               " prune_max_candidates=" + std::to_string(config.storage_owner_prune_max_candidates) +
+               " transitive_search=" + (config.storage_owner_transitive_search ? "true" : "false"));
   const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
   const u32 coroutines_per_worker = std::max<u32>(1, config.insert_coroutines == 0 ? config.num_coroutines
                                                                                     : config.insert_coroutines);
@@ -65,6 +66,8 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
   for (u32 i = 0; i < worker_count; ++i) {
     storage_insert_workers_.emplace_back([this, i]() { storage_owner_insert_worker_loop(i); });
   }
+  peer_handoff_shutdown_.store(false, std::memory_order_release);
+  peer_handoff_worker_thread_ = std::thread([this]() { peer_handoff_worker_loop(); });
 }
 
 void MemoryNode::storage_owner_insert_worker_loop(u32 worker_id) {

@@ -1,0 +1,112 @@
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1237
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         64
+max send work requests:       4096
+max receive work requests:    4096
+============================================================
+server index file:            "/data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced_node4_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 21134 -- 5511
+[STATUS]: pinned main thread to core 28
+[STATUS]: loaded index metadata from /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced (layout=rabitq, vector_data_type=uint8)
+allocation size: 17179869184
+allocated ALIGNED MEM (no hugepage) at 124119645421632 with buffer size 17179869184
+[STATUS]: loading index (10720000016 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced_node4_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 21138 -- 5516
+pairing: 21145 -- 5521
+pairing: 21149 -- 5526
+pairing: 21154 -- 5531
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (10720000016 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced_node4_of5.dat
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 21159 -- 21166
+pairing: 21167 -- 21173
+pairing: 21176 -- 21181
+pairing: 21184 -- 21189
+pairing: 21195 -- 21199
+pairing: 21200 -- 21204
+pairing: 21207 -- 21210
+pairing: 21214 -- 21212
+pairing: 21218 -- 21220
+pairing: 21222 -- 21223
+pairing: 21226 -- 21225
+pairing: 21228 -- 21227
+pairing: 21229 -- 21224
+pairing: 21230 -- 21231
+pairing: 21233 -- 21232
+pairing: 21234 -- 21235
+[STATUS]: storage-owner peer RDMA QPs per peer: 4
+[storage-peer][token] self_shard=3 local_base=124119645421632 local_rkey=1581312 local_bytes=17179869184
+[storage-peer][token] self_shard=3 peer_shard=0 remote_base=140625372512320 remote_rkey=1581056
+[storage-peer][token] self_shard=3 peer_shard=1 remote_base=132110534836288 remote_rkey=1585408
+[storage-peer][token] self_shard=3 peer_shard=2 remote_base=138225186242624 remote_rkey=1582592
+[storage-peer][token] self_shard=3 peer_shard=4 remote_base=136036093001792 remote_rkey=1585664
+allocated ALIGNED MEM (no hugepage) at 124119492329536 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 124119559495744 with buffer size 2038080
+[STATUS]: storage-owner peer RPC receive slots per peer: 32 (requested=32)
+[storage-peer][read] self_shard=3 target_shard=0 remote_base=140625372512320 rkey=1581056 offset=0 bytes=16
+[storage-peer][probe] self_shard=3 peer_shard=0 free_ptr=10720000016 medoid_raw=562956986901232
+[storage-peer][read] self_shard=3 target_shard=1 remote_base=132110534836288 rkey=1585408 offset=0 bytes=16
+[storage-peer][probe] self_shard=3 peer_shard=1 free_ptr=10720000016 medoid_raw=0
+[storage-peer][read] self_shard=3 target_shard=2 remote_base=138225186242624 rkey=1582592 offset=0 bytes=16
+[storage-peer][probe] self_shard=3 peer_shard=2 free_ptr=10720000016 medoid_raw=0
+[storage-peer][read] self_shard=3 target_shard=4 remote_base=136036093001792 rkey=1585664 offset=0 bytes=16
+[storage-peer][probe] self_shard=3 peer_shard=4 free_ptr=10720000016 medoid_raw=0
+allocated ALIGNED MEM (no hugepage) at 106647167778304 with buffer size 68608
+allocated ALIGNED MEM (no hugepage) at 124119423123520 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 124119353917504 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 124119284711488 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 124119215505472 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 124119146299456 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 124119077093440 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 124119007887424 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 124118938681408 with buffer size 67108864
+[STATUS]: storage-owner peer reverse-update workers: 8
+[STATUS]: storage-owner peer reverse-update tuning: mode=async queue_depth=65536 flush_us=200 coalesce_max=256
+[STATUS]: storage-owner peer RDMA read credits per peer: 8 per QP: 8 (requested=8)
+[STATUS]: storage-owner online insert tuning: construction_beam=128 snapshot_batch=64 prune_max_candidates=128 transitive_search=true
+allocated ALIGNED MEM (no hugepage) at 124117908979776 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 124117839773760 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 124117770567744 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 124117701361728 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 124117632155712 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 124117562949696 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 124117493743680 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 124117424537664 with buffer size 67108864
+[handoff-worker] started on shard 3
+[STATUS]: storage-owner insert runtime enabled on shard 3
+[storage-peer][read] self_shard=3 target_shard=2 remote_base=138225186242624 rkey=1582592 offset=7033479920 bytes=144
+[handoff] enqueued on shard 3 from shard 2 beam=122 visited=170 qdepth=1
+[storage-peer][read] self_shard=3 target_shard=2 remote_base=138225186242624 rkey=1582592 offset=7033479920 bytes=144
+[handoff-worker] processing on shard 3 from shard 2 beam=122
+[handoff] enqueued on shard 3 from shard 2 beam=93 visited=98 qdepth=1
+[handoff-worker] processing on shard 3 from shard 2 beam=93
+[storage-peer][read] self_shard=3 target_shard=2 remote_base=138225186242624 rkey=1582592 offset=7033479920 bytes=144
+[handoff] enqueued on shard 3 from shard 2 beam=125 visited=209 qdepth=1
+[handoff-worker] processing on shard 3 from shard 2 beam=125
+[storage-peer][read] self_shard=3 target_shard=2 remote_base=138225186242624 rkey=1582592 offset=7033479920 bytes=144
+[handoff] enqueued on shard 3 from shard 2 beam=117 visited=137 qdepth=1
+[handoff-worker] processing on shard 3 from shard 2 beam=117
+[storage-peer][read] self_shard=3 target_shard=2 remote_base=138225186242624 rkey=1582592 offset=7033479920 bytes=144
+[storage-peer][read] self_shard=3 target_shard=2 remote_base=138225186242624 rkey=1582592 offset=7033479920 bytes=144
+[handoff] enqueued on shard 3 from shard 2 beam=115 visited=138 qdepth=1
+[handoff-worker] processing on shard 3 from shard 2 beam=115
+[storage-peer][read] self_shard=3 target_shard=2 remote_base=138225186242624 rkey=1582592 offset=7033479920 bytes=144
+[storage-peer] search-handoff RPC timed out after 30000 ms self_shard=3 target_shard=2 request_id=13
+Send request failed: status=12 (transport retry counter exceeded), opcode=0, vendor_err=129, wr_id=18446744065119617077
