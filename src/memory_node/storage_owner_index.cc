@@ -14,6 +14,7 @@ namespace {
 using Configuration = configuration::IndexConfiguration;
 using BeamEntry = memory_node_detail::BeamEntry;
 using HandoffResult = memory_node_detail::HandoffResult;
+using HandoffResultStatus = memory_node_detail::HandoffResultStatus;
 using NodeSnapshot = memory_node_detail::NodeSnapshot;
 using StorageOwnerThread = memory_node_detail::StorageOwnerThread;
 using BeamEntrySerialized = service::storage_owner::BeamEntrySerialized;
@@ -21,6 +22,7 @@ using SearchHandoffRequestHeader = service::storage_owner::SearchHandoffRequestH
 using SearchHandoffResponseHeader = service::storage_owner::SearchHandoffResponseHeader;
 using PeerRpcType = service::storage_owner::PeerRpcType;
 using InsertStatus = service::storage_owner::InsertStatus;
+using InsertBreakdownCounters = service::storage_owner::InsertBreakdownCounters;
 static constexpr u32 kPeerRpcMagic = service::storage_owner::kPeerRpcMagic;
 using service::storage_owner::handoff_query_vector;
 using service::storage_owner::handoff_request_beam;
@@ -234,6 +236,54 @@ bool merge_search_handoff_response(vec<BeamEntry>& beam,
     visited.insert(RemotePtr{raw});
   }
   return true;
+}
+
+void record_search_handoff_stats(InsertBreakdownCounters* breakdown,
+                                 const HandoffResult& result,
+                                 size_t request_bytes) {
+  if (breakdown == nullptr) {
+    return;
+  }
+  ++breakdown->storage_owner_handoff_requests;
+  breakdown->storage_owner_handoff_request_bytes += request_bytes;
+  breakdown->storage_owner_handoff_response_bytes += result.response.size();
+
+  switch (result.status) {
+    case HandoffResultStatus::ok:
+      ++breakdown->storage_owner_handoff_successes;
+      break;
+    case HandoffResultStatus::queue_full:
+      ++breakdown->storage_owner_handoff_queue_full;
+      break;
+    case HandoffResultStatus::timeout:
+      ++breakdown->storage_owner_handoff_timeouts;
+      break;
+    case HandoffResultStatus::overloaded:
+      ++breakdown->storage_owner_handoff_overloaded;
+      break;
+    case HandoffResultStatus::pending:
+    case HandoffResultStatus::shutdown:
+    case HandoffResultStatus::failed:
+      ++breakdown->storage_owner_handoff_failed;
+      break;
+  }
+
+  if (!result.ok() || result.response.size() < sizeof(SearchHandoffResponseHeader)) {
+    return;
+  }
+  const auto* resp = reinterpret_cast<const SearchHandoffResponseHeader*>(result.response.data());
+  if (resp->rpc.magic != kPeerRpcMagic ||
+      resp->rpc.type != static_cast<u32>(PeerRpcType::search_handoff_response) ||
+      resp->rpc.status != static_cast<u32>(InsertStatus::ok)) {
+    return;
+  }
+  breakdown->storage_owner_handoff_remote_handler_ns += resp->handler_cpu_ns;
+  breakdown->storage_owner_handoff_remote_expanded_nodes += resp->local_expanded_count;
+  breakdown->storage_owner_handoff_remote_snapshot_reads += resp->local_snapshot_reads;
+  breakdown->storage_owner_handoff_remote_neighbor_reads += resp->local_neighbor_reads;
+  breakdown->storage_owner_handoff_response_beam_entries += resp->updated_beam_count;
+  breakdown->storage_owner_handoff_response_visited_entries += resp->new_visited_count;
+  breakdown->storage_owner_handoff_response_visited_truncated += resp->visited_truncated_count;
 }
 
 }  // namespace
@@ -1624,7 +1674,10 @@ bool MemoryNode::expand_all_local_nodes(vec<BeamEntry>& beam,
                                             const span<const element_t> query,
                                             const Configuration& config,
                                             u32 local_shard_id,
-                                            InsertBreakdownCounters* breakdown) {
+                                            InsertBreakdownCounters* breakdown,
+                                            u64* expanded_count,
+                                            u64* snapshot_read_count,
+                                            u64* neighbor_read_count) {
   bool any_expanded = false;
   const u32 construction_width = storage_owner_construction_width(config);
   const u64 shard_cap = mn_memory_bytes_;
@@ -1651,11 +1704,17 @@ bool MemoryNode::expand_all_local_nodes(vec<BeamEntry>& beam,
 
     beam[best_idx].expanded = true;
     any_expanded = true;
+    if (expanded_count != nullptr) {
+      ++*expanded_count;
+    }
 
     auto t_nbr = std::chrono::steady_clock::now();
     const vec<RemotePtr> neighbors = ptr_in_bounds(best_rptr, shard_cap)
         ? read_neighbor_list(best_rptr)
         : vec<RemotePtr>{};
+    if (neighbor_read_count != nullptr && ptr_in_bounds(best_rptr, shard_cap)) {
+      ++*neighbor_read_count;
+    }
     if (breakdown != nullptr) {
       breakdown->storage_owner_search_neighbor_read_ns += elapsed_ns_since(t_nbr);
     }
@@ -1686,6 +1745,9 @@ bool MemoryNode::expand_all_local_nodes(vec<BeamEntry>& beam,
       if (batch.empty()) continue;
       auto t_snap = std::chrono::steady_clock::now();
       vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
+      if (snapshot_read_count != nullptr) {
+        *snapshot_read_count += batch.size();
+      }
       if (breakdown != nullptr) {
         breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snap);
       }
@@ -1760,6 +1822,7 @@ auto MemoryNode::beam_search_candidates_transitive_async(
 
     struct PendingHandoff {
       u32 target_shard{};
+      size_t request_bytes{};
       SearchHandoffAwaitable awaitable;
     };
     vec<PendingHandoff> pending;
@@ -1773,8 +1836,10 @@ auto MemoryNode::beam_search_candidates_transitive_async(
         storage_id_,
         next_peer_request_id_.fetch_add(1, std::memory_order_relaxed),
         config);
+      const size_t request_bytes = message.size();
       pending.push_back(PendingHandoff{
         target.shard,
+        request_bytes,
         async_search_handoff(target.shard, std::move(message), thread, config)});
       shard_searched[target.shard] = 1;
     }
@@ -1788,6 +1853,7 @@ auto MemoryNode::beam_search_candidates_transitive_async(
     bool queue_full = false;
     for (PendingHandoff& item : pending) {
       HandoffResult handoff = co_await item.awaitable;
+      record_search_handoff_stats(breakdown, handoff, item.request_bytes);
       if (breakdown != nullptr) {
         breakdown->storage_owner_handoff_queue_wait_ns += handoff.queue_wait_ns;
         breakdown->storage_owner_handoff_send_ns += handoff.send_ns;

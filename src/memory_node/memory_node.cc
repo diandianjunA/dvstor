@@ -239,6 +239,36 @@ MemoryNode::InsertBreakdownCounters MemoryNode::scale_breakdown(const InsertBrea
   out.storage_owner_prune_sort_ns = scale_ns(counters.storage_owner_prune_sort_ns, part, total);
   out.storage_owner_prune_pair_distance_ns =
     scale_ns(counters.storage_owner_prune_pair_distance_ns, part, total);
+  out.storage_owner_handoff_requests =
+    scale_ns(counters.storage_owner_handoff_requests, part, total);
+  out.storage_owner_handoff_successes =
+    scale_ns(counters.storage_owner_handoff_successes, part, total);
+  out.storage_owner_handoff_queue_full =
+    scale_ns(counters.storage_owner_handoff_queue_full, part, total);
+  out.storage_owner_handoff_timeouts =
+    scale_ns(counters.storage_owner_handoff_timeouts, part, total);
+  out.storage_owner_handoff_overloaded =
+    scale_ns(counters.storage_owner_handoff_overloaded, part, total);
+  out.storage_owner_handoff_failed =
+    scale_ns(counters.storage_owner_handoff_failed, part, total);
+  out.storage_owner_handoff_request_bytes =
+    scale_ns(counters.storage_owner_handoff_request_bytes, part, total);
+  out.storage_owner_handoff_response_bytes =
+    scale_ns(counters.storage_owner_handoff_response_bytes, part, total);
+  out.storage_owner_handoff_remote_handler_ns =
+    scale_ns(counters.storage_owner_handoff_remote_handler_ns, part, total);
+  out.storage_owner_handoff_remote_expanded_nodes =
+    scale_ns(counters.storage_owner_handoff_remote_expanded_nodes, part, total);
+  out.storage_owner_handoff_remote_snapshot_reads =
+    scale_ns(counters.storage_owner_handoff_remote_snapshot_reads, part, total);
+  out.storage_owner_handoff_remote_neighbor_reads =
+    scale_ns(counters.storage_owner_handoff_remote_neighbor_reads, part, total);
+  out.storage_owner_handoff_response_beam_entries =
+    scale_ns(counters.storage_owner_handoff_response_beam_entries, part, total);
+  out.storage_owner_handoff_response_visited_entries =
+    scale_ns(counters.storage_owner_handoff_response_visited_entries, part, total);
+  out.storage_owner_handoff_response_visited_truncated =
+    scale_ns(counters.storage_owner_handoff_response_visited_truncated, part, total);
   return out;
 }
 
