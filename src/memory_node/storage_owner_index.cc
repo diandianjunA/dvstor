@@ -32,17 +32,11 @@ constexpr size_t kSnapshotPrefixBytes =
   VamanaNode::HEADER_SIZE + VamanaNode::COMPACT_META_SIZE;
 
 size_t snapshot_buffer_bytes() {
-  return VamanaNode::compact_storage()
-    ? VamanaNode::size_until_vector_end()
-    : kSnapshotPrefixBytes + VamanaNode::vector_bytes();
+  return memory_node_detail::storage_owner_snapshot_bytes();
 }
 
 size_t aligned_snapshot_bytes() {
-  size_t value = snapshot_buffer_bytes();
-  while (value % CACHELINE_SIZE != 0) {
-    ++value;
-  }
-  return value;
+  return memory_node_detail::storage_owner_snapshot_stride();
 }
 
 u32 storage_owner_construction_width(const Configuration& config) {
@@ -644,7 +638,12 @@ auto MemoryNode::async_read_node_snapshots(const vec<RemotePtr>& rptrs,
 
     const size_t scratch_offset = static_cast<size_t>(remote_slot) * snapshot_stride;
     lib_assert(scratch_offset + snapshot_size <= thread.scratch_stride,
-               "storage-owner coroutine scratch stride is too small for snapshot batch");
+               "storage-owner coroutine scratch stride is too small for snapshot batch: "
+               "offset=" + std::to_string(scratch_offset) +
+               " snapshot=" + std::to_string(snapshot_size) +
+               " stride=" + std::to_string(thread.scratch_stride) +
+               " remote_slot=" + std::to_string(remote_slot) +
+               " batch=" + std::to_string(rptrs.size()));
     byte_t* buffer = thread.coroutine_scratch(scratch_offset);
     if (VamanaNode::compact_storage()) {
       post_peer_read_async(thread, rptr.memory_node(), rptr.byte_offset(), buffer,
@@ -713,7 +712,12 @@ vec<MemoryNode::NodeSnapshot> MemoryNode::read_node_snapshots_batched(const vec<
 
       const size_t scratch_offset = static_cast<size_t>(remote_slot) * snapshot_stride;
       lib_assert(scratch_offset + snapshot_size <= thread->scratch_stride,
-                 "storage-owner coroutine scratch stride is too small for snapshot batch");
+                 "storage-owner coroutine scratch stride is too small for snapshot batch: "
+                 "offset=" + std::to_string(scratch_offset) +
+                 " snapshot=" + std::to_string(snapshot_size) +
+                 " stride=" + std::to_string(thread->scratch_stride) +
+                 " remote_slot=" + std::to_string(remote_slot) +
+                 " chunk=" + std::to_string(end - begin));
       byte_t* buffer = thread->coroutine_scratch(scratch_offset);
       if (VamanaNode::compact_storage()) {
         post_peer_read_async(*thread, rptr.memory_node(), rptr.byte_offset(), buffer,

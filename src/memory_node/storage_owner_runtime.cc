@@ -41,20 +41,24 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
   const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
   const u32 coroutines_per_worker = std::max<u32>(1, config.insert_coroutines == 0 ? config.num_coroutines
                                                                                     : config.insert_coroutines);
-  const size_t snapshot_bytes = VamanaNode::compact_storage()
-                                  ? VamanaNode::size_until_vector_end()
-                                  : VamanaNode::HEADER_SIZE + VamanaNode::COMPACT_META_SIZE +
-                                      VamanaNode::vector_bytes();
-  const size_t snapshot_stride = align_up(snapshot_bytes);
+  const size_t snapshot_bytes = memory_node_detail::storage_owner_snapshot_bytes();
+  const size_t snapshot_stride = memory_node_detail::storage_owner_snapshot_stride();
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
+  const size_t snapshot_batch =
+    std::max<u32>(1, config.storage_owner_search_snapshot_batch);
+  // Keep one general-purpose slot beyond the batch area. This prevents a
+  // neighbor/node fallback in the same coroutine from aliasing batched reads.
   const size_t coroutine_scratch_stride =
-    align_up(std::max<size_t>(VamanaNode::total_size(),
-                              std::max(neighbor_stride,
-                                       snapshot_stride *
-                                         std::max<u32>(1, config.storage_owner_search_snapshot_batch))));
+    align_up(snapshot_stride * snapshot_batch +
+             std::max(VamanaNode::total_size(), neighbor_stride));
   const size_t scratch_bytes =
     std::max<size_t>(64ull * 1024ull * 1024ull,
                      coroutine_scratch_stride * std::max<u32>(1, coroutines_per_worker));
+  print_status("storage-owner coroutine scratch: snapshot_bytes=" +
+               std::to_string(snapshot_bytes) +
+               " snapshot_stride=" + std::to_string(snapshot_stride) +
+               " batch=" + std::to_string(snapshot_batch) +
+               " per_coroutine=" + std::to_string(coroutine_scratch_stride));
   storage_owner_threads_.reserve(worker_count);
   for (u32 i = 0; i < worker_count; ++i) {
     auto thread = std::make_unique<StorageOwnerThread>(i, coroutines_per_worker, config.max_send_queue_wr);

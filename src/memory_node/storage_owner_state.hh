@@ -27,6 +27,17 @@ inline size_t align_to_cacheline(size_t value) {
   return value;
 }
 
+inline size_t storage_owner_snapshot_bytes() {
+  return VamanaNode::compact_storage()
+    ? VamanaNode::size_until_vector_end()
+    : VamanaNode::HEADER_SIZE + VamanaNode::COMPACT_META_SIZE +
+        VamanaNode::vector_bytes();
+}
+
+inline size_t storage_owner_snapshot_stride() {
+  return align_to_cacheline(storage_owner_snapshot_bytes());
+}
+
 struct BeamEntry {
   RemotePtr rptr;
   distance_t distance{};
