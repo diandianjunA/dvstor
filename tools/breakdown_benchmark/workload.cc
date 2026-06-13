@@ -239,6 +239,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
         ? service.config().rabitq_coalesce_min : 0},
     {"rabitq_coalesce_wait_us", service.config().use_rabitq
         ? service.config().rabitq_coalesce_wait_us : 0},
+    {"rabitq_warmup_exact_expansions", service.config().use_rabitq
+        ? service.config().rabitq_warmup_exact_expansions : 0},
     {"rabitq_strict_recall", service.config().use_rabitq
         ? service.config().rabitq_strict_recall : false},
   };

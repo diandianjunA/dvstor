@@ -74,6 +74,7 @@
 
         vec<rdma::vamana::NeighborReadAwaitable> pf_neighbors(K);
         u32 pending_K = 0;
+        u32 rabitq_warmup_remaining = rabitq_warmup_exact_expansions_;
 
         // ── Cold start: read the first neighbour ───────────────────────
         i32 best_idx = select_best();
@@ -111,6 +112,7 @@
             // ── Phase 1: consume neighbour reads → filter ──────────────
             auto& all_unvisited = coro_state.scratch_unvisited;
             all_unvisited.clear();
+            const u32 consumed_K = std::max<u32>(1, pending_K);
             for (u32 k = 0; k < pending_K; ++k) {
                 thread->poll_cq();
                 if (thread->post_balances[thread->current_coroutine_id()].load(
@@ -152,9 +154,16 @@
                            "RaBitQ gate requires a loaded RFQ4 sidecar");
                 auto& exact_ptrs = coro_state.reserved_ptrs_a;
                 auto& gate_indices = coro_state.scratch_indices_b;
-                const bool bypass_gate_for_small_batch =
-                    rabitq_strict_recall_ && n_batch <= rabitq_coalesce_min_;
-                if (bypass_gate_for_small_batch) {
+                const bool warmup_exact = rabitq_warmup_remaining > 0;
+                rabitq_warmup_remaining = consumed_K >= rabitq_warmup_remaining
+                    ? 0 : rabitq_warmup_remaining - consumed_K;
+                const u32 gate_scale = std::max<u32>(1, consumed_K);
+                const u32 effective_gate_width =
+                    std::min<u32>(n_batch, rabitq_gate_width_ * gate_scale);
+                const u32 effective_gate_max_width =
+                    std::min<u32>(n_batch, std::max(rabitq_gate_max_width_ * gate_scale,
+                                                    effective_gate_width));
+                if (warmup_exact) {
                     gate_indices.clear();
                     gate_indices.reserve(n_batch);
                     exact_ptrs.clear();
@@ -164,7 +173,7 @@
                         exact_ptrs.push_back(all_unvisited[i]);
                     }
                     thread->stats.query_rabitq_l0_candidates += n_batch;
-                    thread->stats.query_rabitq_l1_candidates += n_batch;
+                    thread->stats.query_rabitq_l1_candidates += gate_indices.size();
                     ++thread->stats.query_rabitq_forced_widen;
                 } else {
                     const auto t_gate = std::chrono::steady_clock::now();
@@ -175,26 +184,25 @@
                     approximate_distances.assign(n_batch,
                         std::numeric_limits<f32>::infinity());
                     cache_miss_indices.clear();
-                    const auto& quantization = rabitq_cache_->quantization();
                     for (u32 i = 0; i < n_batch; ++i) {
                         const auto* entry = rabitq_cache_->find(all_unvisited[i]);
                         if (entry == nullptr) {
                             cache_miss_indices.push_back(i);
                         } else {
-                            approximate_distances[i] = rabitq::estimate_distance_lut(
-                                rabitq_query_lut, rabitq_query_norm2, *entry, quantization);
+                            approximate_distances[i] = rabitq_cache_->estimate_distance_lut(
+                                rabitq_query_lut, rabitq_query_norm2, *entry);
                         }
                     }
                     thread->stats.query_rabitq_l0_candidates += n_batch;
                     thread->stats.query_rabitq_cache_misses += cache_miss_indices.size();
                     rabitq::select_gate_into(approximate_distances, cache_miss_indices,
-                        rabitq_gate_width_, rabitq_gate_max_width_, rabitq_gate_margin_,
+                        effective_gate_width, effective_gate_max_width, rabitq_gate_margin_,
                         gate_indices, cached_order, gate_flags);
                     if (rabitq_strict_recall_ && gate_indices.size() < n_batch &&
-                        gate_indices.size() < rabitq_coalesce_min_) {
+                        gate_indices.size() < effective_gate_width) {
                         gate_flags.assign(n_batch, 0);
                         for (u32 index : gate_indices) gate_flags[index] = 1;
-                        const u32 target = std::min<u32>(n_batch, rabitq_coalesce_min_);
+                        const u32 target = std::min<u32>(n_batch, effective_gate_width);
                         for (u32 index : cached_order) {
                             if (gate_indices.size() >= target) break;
                             if (!gate_flags[index]) {
@@ -267,6 +275,7 @@
                 co_await gpu::GpuAwaitable{thread.get()};
                 add_breakdown_subcategory(thread,
                     service::breakdown::Subcategory::gpu_query_distance, t_exact);
+
                 const auto t_d2h = std::chrono::steady_clock::now();
                 cudaMemcpyAsync(gs.h_distances, gs.d_distances,
                                 gate_indices.size() * sizeof(float),
@@ -294,6 +303,7 @@
                         beam[best_idx].rptr, &thread);
                     pending_K = k + 1;
                 }
+
                 if (pending_K == 0) break;
                 continue;
             }

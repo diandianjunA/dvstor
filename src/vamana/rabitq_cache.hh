@@ -293,9 +293,22 @@ public:
       entry_count_ += entries.size();
     }
     node_size_ = expected_node_size;
+    rebuild_decode_tables();
     init_dynamic(dynamic_budget_bytes);
     prewarm();
     return true;
+  }
+
+  f32 estimate_distance_lut(const QueryLut& lut, f32 query_norm2,
+                            const CompactEntry& entry) const {
+    f32 signed_dot = 0.0f;
+    for (u32 byte = 0; byte < kCodeBytes; ++byte) {
+      signed_dot += lut[byte * 256 + entry.code[byte]];
+    }
+    const u32 scale_index =
+      (static_cast<u32>(entry.norm_q) << 8u) | static_cast<u32>(entry.error_q);
+    return std::max(query_norm2 + norm2_table_[entry.norm_q] -
+                    scale_table_[scale_index] * signed_dot, 0.0f);
   }
 
   const CompactEntry* find(RemotePtr pointer) const {
@@ -369,7 +382,8 @@ public:
   const Quantization& quantization() const { return quantization_; }
   size_t size_bytes() const { return size_bytes_; }
   size_t dynamic_size_bytes() const { return dynamic_slots_.size() * sizeof(DynamicSlot); }
-  size_t total_size_bytes() const { return size_bytes_ + dynamic_size_bytes(); }
+  size_t decode_table_bytes() const { return sizeof(norm2_table_) + sizeof(scale_table_); }
+  size_t total_size_bytes() const { return size_bytes_ + dynamic_size_bytes() + decode_table_bytes(); }
   size_t entry_count() const { return entry_count_; }
   size_t dynamic_capacity() const { return dynamic_slots_.size(); }
   size_t dynamic_live() const { return dynamic_live_; }
@@ -384,6 +398,22 @@ private:
     value *= 0xc4ceb9fe1a85ec53ULL;
     value ^= value >> 33;
     return value;
+  }
+
+  void rebuild_decode_tables() {
+    for (u32 norm_q = 0; norm_q < 256; ++norm_q) {
+      const f32 norm = dequantize(static_cast<u8>(norm_q),
+                                  quantization_.norm_min, quantization_.norm_max);
+      norm2_table_[norm_q] = norm * norm;
+      for (u32 error_q = 0; error_q < 256; ++error_q) {
+        const f32 error = dequantize(static_cast<u8>(error_q),
+                                     quantization_.error_min, quantization_.error_max);
+        const u32 index = (norm_q << 8u) | error_q;
+        scale_table_[index] = error > 1e-12f
+          ? 2.0f * norm / (std::sqrt(static_cast<f32>(kCodeBits)) * error)
+          : 0.0f;
+      }
+    }
   }
 
   void init_dynamic(size_t budget_bytes) {
@@ -425,6 +455,8 @@ private:
   vec<vec<CompactEntry>> shards_;
   mutable std::shared_mutex dynamic_mutex_;
   vec<DynamicSlot> dynamic_slots_;
+  std::array<f32, 256> norm2_table_{};
+  std::array<f32, 256 * 256> scale_table_{};
   Quantization quantization_{};
   u32 node_size_{};
   size_t size_bytes_{};

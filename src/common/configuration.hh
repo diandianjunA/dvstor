@@ -53,6 +53,7 @@ public:
   u32 rabitq_coalesce_target{64};
   u32 rabitq_coalesce_min{32};
   u32 rabitq_coalesce_wait_us{6};
+  u32 rabitq_warmup_exact_expansions{4};
   bool rabitq_strict_recall{true};
   str vector_data_type{"auto"};
   str insert_execution{"compute"};
@@ -240,6 +241,9 @@ private:
       "rabitq-coalesce-wait-us",
       po::value<u32>(&rabitq_coalesce_wait_us)->default_value(rabitq_coalesce_wait_us),
       "Maximum RaBitQ coalescer wait in microseconds.")(
+      "rabitq-warmup-exact-expansions",
+      po::value<u32>(&rabitq_warmup_exact_expansions)->default_value(rabitq_warmup_exact_expansions),
+      "Exactify all candidates for this many initial RaBitQ graph expansions.")(
       "rabitq-strict-recall",
       po::value<bool>(&rabitq_strict_recall)->default_value(rabitq_strict_recall),
       "Widen uncertain small RaBitQ gates so recall is protected.")(
@@ -459,6 +463,8 @@ public:
       os << std::setw(width) << "RaBitQ coalesce target: " << config.rabitq_coalesce_target << std::endl;
       os << std::setw(width) << "RaBitQ coalesce min: " << config.rabitq_coalesce_min << std::endl;
       os << std::setw(width) << "RaBitQ coalesce wait(us): " << config.rabitq_coalesce_wait_us << std::endl;
+      os << std::setw(width) << "RaBitQ warmup exact expansions: "
+         << config.rabitq_warmup_exact_expansions << std::endl;
       os << std::setw(width) << "RaBitQ strict recall: "
          << (config.rabitq_strict_recall ? "true" : "false") << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;

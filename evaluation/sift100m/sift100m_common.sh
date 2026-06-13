@@ -267,6 +267,7 @@ write_service_config() {
       echo "rabitq-coalesce-target = ${RABITQ_COALESCE_TARGET:-64}"
       echo "rabitq-coalesce-min = ${RABITQ_COALESCE_MIN:-32}"
       echo "rabitq-coalesce-wait-us = ${RABITQ_COALESCE_WAIT_US:-6}"
+      echo "rabitq-warmup-exact-expansions = ${RABITQ_WARMUP_EXACT_EXPANSIONS:-4}"
       if [[ "${RABITQ_STRICT_RECALL:-1}" == "1" ]]; then
         echo "rabitq-strict-recall = true"
       else

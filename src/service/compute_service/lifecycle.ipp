@@ -110,6 +110,7 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                            config_.rabitq_gate_max_width,
                            static_cast<f32>(config_.rabitq_gate_margin));
   vamana_->set_rabitq_runtime(config_.rabitq_coalesce_min,
+                              config_.rabitq_warmup_exact_expansions,
                               config_.rabitq_strict_recall);
   vamana_->set_use_rabitq(config_.use_rabitq);
   if (vamana_->use_rabitq() && config_.load_index) {
@@ -129,7 +130,8 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     vamana_->set_rabitq_cache(rabitq_cache_.get());
     print_status("RaBitQ budget gate cache: static " +
                  std::to_string(rabitq_cache_->size_bytes()) + " bytes, dynamic " +
-                 std::to_string(rabitq_cache_->dynamic_size_bytes()) + " bytes, NUMA " +
+                 std::to_string(rabitq_cache_->dynamic_size_bytes()) + " bytes, decode " +
+                 std::to_string(rabitq_cache_->decode_table_bytes()) + " bytes, NUMA " +
                  (rabitq_cache_->numa_interleaved() ? "interleaved" : "local"));
   }
   print_status(vamana_->use_rabitq()
