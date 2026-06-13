@@ -46,8 +46,19 @@ u32 storage_owner_construction_width(const Configuration& config) {
   return std::max<u32>(1, std::min(config.beam_width_construction, configured));
 }
 
-u32 storage_owner_snapshot_batch_size(const Configuration& config) {
-  return std::max<u32>(1, config.storage_owner_search_snapshot_batch);
+u32 storage_owner_snapshot_batch_size(const Configuration& config,
+                                      const StorageOwnerThread* thread = nullptr) {
+  const u32 configured = std::max<u32>(1, config.storage_owner_search_snapshot_batch);
+  if (thread == nullptr || !thread->has_peer_scratch()) {
+    return configured;
+  }
+  const size_t stride = aligned_snapshot_bytes();
+  const size_t capacity = stride == 0 ? 0 : thread->scratch_stride / stride;
+  lib_assert(capacity > 0,
+             "storage-owner coroutine scratch cannot hold one snapshot: snapshot_stride=" +
+             std::to_string(stride) + " scratch_stride=" +
+             std::to_string(thread->scratch_stride));
+  return static_cast<u32>(std::min<size_t>(configured, capacity));
 }
 
 u32 storage_owner_prune_candidate_limit(const Configuration& config) {
@@ -620,7 +631,7 @@ auto MemoryNode::async_read_node_snapshots(const vec<RemotePtr>& rptrs,
 
   const size_t snapshot_size = snapshot_buffer_bytes();
   const size_t snapshot_stride = aligned_snapshot_bytes();
-  const u32 max_batch = storage_owner_snapshot_batch_size(config);
+  const u32 max_batch = storage_owner_snapshot_batch_size(config, &thread);
   lib_assert(rptrs.size() <= max_batch, "storage-owner snapshot batch exceeds configured limit");
 
   u32 remote_slot = 0;
@@ -689,7 +700,7 @@ vec<MemoryNode::NodeSnapshot> MemoryNode::read_node_snapshots_batched(const vec<
 
   const size_t snapshot_size = snapshot_buffer_bytes();
   const size_t snapshot_stride = aligned_snapshot_bytes();
-  const size_t max_batch = storage_owner_snapshot_batch_size(config);
+  const size_t max_batch = storage_owner_snapshot_batch_size(config, thread);
 
   for (size_t begin = 0; begin < rptrs.size(); begin += max_batch) {
     const size_t end = std::min(rptrs.size(), begin + max_batch);
@@ -1027,7 +1038,7 @@ vec<RemotePtr> MemoryNode::beam_search_candidates(const span<const element_t> qu
     remote_unvisited_sum += iter_remote;
 #endif
 
-    const u32 snapshot_batch = storage_owner_snapshot_batch_size(config);
+    const u32 snapshot_batch = storage_owner_snapshot_batch_size(config, current_storage_owner_thread_);
     const u32 construction_width = storage_owner_construction_width(config);
     for (size_t begin = 0; begin < unvisited_neighbors.size(); begin += snapshot_batch) {
       const size_t end = std::min(unvisited_neighbors.size(), begin + snapshot_batch);
@@ -1164,7 +1175,7 @@ auto MemoryNode::beam_search_candidates_async(const span<const element_t> query,
     ++shard_hist[5];
 #endif
 
-    const u32 snapshot_batch = storage_owner_snapshot_batch_size(config);
+    const u32 snapshot_batch = storage_owner_snapshot_batch_size(config, &thread);
     const u32 construction_width = storage_owner_construction_width(config);
     for (size_t begin = 0; begin < unvisited_neighbors.size(); begin += snapshot_batch) {
       const size_t end = std::min(unvisited_neighbors.size(), begin + snapshot_batch);
@@ -1255,7 +1266,7 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
     }
   }
 
-  const u32 snapshot_batch = storage_owner_snapshot_batch_size(config);
+  const u32 snapshot_batch = storage_owner_snapshot_batch_size(config, current_storage_owner_thread_);
   for (size_t begin = 0; begin < filtered.size(); begin += snapshot_batch) {
     const size_t end = std::min(filtered.size(), begin + snapshot_batch);
     vec<RemotePtr> batch;
@@ -1658,7 +1669,7 @@ bool MemoryNode::expand_all_local_nodes(vec<BeamEntry>& beam,
     }
 
     // Process local unvisited nodes: read snapshots, compute distances
-    const u32 snapshot_batch = storage_owner_snapshot_batch_size(config);
+    const u32 snapshot_batch = storage_owner_snapshot_batch_size(config, current_storage_owner_thread_);
     for (size_t begin = 0; begin < local_unvisited.size(); begin += snapshot_batch) {
       const size_t end = std::min(local_unvisited.size(), begin + snapshot_batch);
       vec<RemotePtr> batch;
