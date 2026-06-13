@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <deque>
 #include <memory>
 
 #include <library/context.hh>
@@ -14,6 +15,7 @@
 #include "common/types.hh"
 #include "coroutine.hh"
 #include "remote_pointer.hh"
+#include "service/storage_owner_protocol.hh"
 #include "vamana/vamana_node.hh"
 
 namespace memory_node_detail {
@@ -23,6 +25,17 @@ inline size_t align_to_cacheline(size_t value) {
     ++value;
   }
   return value;
+}
+
+inline size_t storage_owner_snapshot_bytes() {
+  return VamanaNode::compact_storage()
+    ? VamanaNode::size_until_vector_end()
+    : VamanaNode::HEADER_SIZE + VamanaNode::COMPACT_META_SIZE +
+        VamanaNode::vector_bytes();
+}
+
+inline size_t storage_owner_snapshot_stride() {
+  return align_to_cacheline(storage_owner_snapshot_bytes());
 }
 
 struct BeamEntry {
@@ -35,7 +48,9 @@ struct NodeSnapshot {
   RemotePtr rptr;
   u64 header{};
   node_t id{};
+  u32 generation{};
   u8 edge_count{};
+  bool deleted{};
   vec<byte_t> vector_data;
 };
 
@@ -52,10 +67,74 @@ struct PeerRpcRuntimeState {
   std::unique_ptr<LocalMemoryRegion> region;
   size_t message_bytes{};
   size_t recv_region_bytes{};
+  size_t sync_send_offset{};
+  size_t async_send_offset{};
   u32 recv_slots_per_peer{1};
+  u32 send_slots_per_peer{1};
 };
 
 struct StorageOwnerThread;
+
+enum class HandoffResultStatus : u8 {
+  pending = 0,
+  ok,
+  overloaded,
+  queue_full,
+  timeout,
+  shutdown,
+  failed,
+};
+
+struct HandoffResult {
+  HandoffResultStatus status{HandoffResultStatus::failed};
+  vec<byte_t> response;
+  u64 queue_wait_ns{};
+  u64 send_ns{};
+  u64 response_wait_ns{};
+
+  bool ok() const { return status == HandoffResultStatus::ok; }
+};
+
+struct HandoffRequestState {
+  u64 request_id{};
+  u32 target_shard{};
+  StorageOwnerThread* thread{};
+  u32 coroutine_id{};
+  vec<byte_t> request;
+  vec<byte_t> response;
+  std::chrono::steady_clock::time_point queued_at{};
+  std::chrono::steady_clock::time_point deadline{};
+  std::chrono::steady_clock::time_point send_posted_at{};
+  std::chrono::steady_clock::time_point send_completed_at{};
+  std::chrono::steady_clock::time_point response_completed_at{};
+  HandoffResultStatus status{HandoffResultStatus::pending};
+  bool sent{};
+  std::atomic<bool> completed{false};
+};
+
+struct HandoffResponseTask {
+  u32 target_shard{};
+  vec<byte_t> payload;
+};
+
+struct HandoffSendSlot {
+  bool in_use{};
+  bool response_only{};
+  u32 peer_id{};
+  u32 slot_id{};
+  u64 wr_id{};
+  std::shared_ptr<HandoffRequestState> request;
+};
+
+struct PeerHandoffState {
+  std::deque<std::shared_ptr<HandoffRequestState>> request_queue;
+  std::deque<HandoffResponseTask> response_queue;
+  vec<HandoffSendSlot> send_slots;
+  std::deque<u32> free_slots;
+  u32 inflight_requests{};
+  u32 max_queue_depth{};
+  u32 max_inflight_requests{};
+};
 
 struct PeerPendingSend {
   u32 target_shard{};
@@ -125,8 +204,19 @@ struct StorageOwnerThread {
 
 struct StorageOwnerInsertJob {
   node_t id{};
+  service::storage_owner::MutationKind kind{service::storage_owner::MutationKind::insert};
   vec<byte_t> vector_data;
+  service::storage_owner::MutationStatus status{service::storage_owner::MutationStatus::failed};
   bool ok{false};
+  RemotePtr new_ptr{};
+  RemotePtr old_ptr{};
+  u32 generation{};
+};
+
+struct FreshnessEntry {
+  RemotePtr current;
+  u32 generation{};
+  bool deleted{};
 };
 
 }  // namespace memory_node_detail

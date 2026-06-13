@@ -35,6 +35,7 @@ enum class Subcategory : u8 {
   cpu_node_read = 0,
   cpu_query_select,
   cpu_query_filter,
+  cpu_query_rabitq_gate,
   cpu_query_stage_candidates,
   cpu_query_beam_update,
   cpu_query_rerank_collect,
@@ -73,6 +74,7 @@ enum class Subcategory : u8 {
   cpu_storage_owner_search_distance,
   cpu_storage_owner_search_beam_update,
   cpu_storage_owner_search_result_sort,
+  cpu_storage_owner_handoff_queue_wait,
   cpu_storage_owner_prune_distance,
   cpu_storage_owner_prune_sort,
   cpu_storage_owner_prune_pair_distance,
@@ -107,6 +109,8 @@ enum class Subcategory : u8 {
   rdma_storage_owner_send,
   rdma_storage_owner_search_neighbor_read,
   rdma_storage_owner_search_snapshot_read,
+  rdma_storage_owner_handoff_send,
+  rdma_storage_owner_handoff_response_wait,
   rdma_storage_owner_prune_snapshot_read,
 
   // Transfer
@@ -132,6 +136,7 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "cpu_node_read_ns",
   "cpu_query_select_ns",
   "cpu_query_filter_ns",
+  "cpu_query_rabitq_gate_ns",
   "cpu_query_stage_candidates_ns",
   "cpu_query_beam_update_ns",
   "cpu_query_rerank_collect_ns",
@@ -170,6 +175,7 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "cpu_storage_owner_search_distance_ns",
   "cpu_storage_owner_search_beam_update_ns",
   "cpu_storage_owner_search_result_sort_ns",
+  "cpu_storage_owner_handoff_queue_wait_ns",
   "cpu_storage_owner_prune_distance_ns",
   "cpu_storage_owner_prune_sort_ns",
   "cpu_storage_owner_prune_pair_distance_ns",
@@ -200,6 +206,8 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "rdma_storage_owner_send_ns",
   "rdma_storage_owner_search_neighbor_read_ns",
   "rdma_storage_owner_search_snapshot_read_ns",
+  "rdma_storage_owner_handoff_send_ns",
+  "rdma_storage_owner_handoff_response_wait_ns",
   "rdma_storage_owner_prune_snapshot_read_ns",
   "transfer_query_h2d_ns",
   "transfer_candidate_h2d_ns",
@@ -225,6 +233,7 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::cpu_node_read:
     case Subcategory::cpu_query_select:
     case Subcategory::cpu_query_filter:
+    case Subcategory::cpu_query_rabitq_gate:
     case Subcategory::cpu_query_stage_candidates:
     case Subcategory::cpu_query_beam_update:
     case Subcategory::cpu_query_rerank_collect:
@@ -263,6 +272,7 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::cpu_storage_owner_search_distance:
     case Subcategory::cpu_storage_owner_search_beam_update:
     case Subcategory::cpu_storage_owner_search_result_sort:
+    case Subcategory::cpu_storage_owner_handoff_queue_wait:
     case Subcategory::cpu_storage_owner_prune_distance:
     case Subcategory::cpu_storage_owner_prune_sort:
     case Subcategory::cpu_storage_owner_prune_pair_distance:
@@ -295,6 +305,8 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::rdma_storage_owner_send:
     case Subcategory::rdma_storage_owner_search_neighbor_read:
     case Subcategory::rdma_storage_owner_search_snapshot_read:
+    case Subcategory::rdma_storage_owner_handoff_send:
+    case Subcategory::rdma_storage_owner_handoff_response_wait:
     case Subcategory::rdma_storage_owner_prune_snapshot_read:
       return Category::rdma;
     case Subcategory::transfer_query_h2d:

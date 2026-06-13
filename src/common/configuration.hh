@@ -17,6 +17,7 @@ struct Parameters {
   u32 num_threads{};
   bool reserved{};
   bool routing{};
+  u32 qp_pool_size{1};
 };
 
 class IndexConfiguration : public Configuration {
@@ -39,6 +40,26 @@ public:
   u32 k{};
   u32 gpu_device{};       // CUDA device ID
   bool gpudirect_rdma{};  // Enable GPUDirect RDMA (read vectors directly into GPU buffers)
+  u32 expansion_batch{1};   // Batch K beam expansions per iteration (1=serial)
+  u32 rdma_qp_pool_size{1}; // QPs per memory node per SharedContext (1=default)
+  u32 query_batch_size{1};  // Fuse GPU across N queries (1=single query)
+  bool use_rabitq{};        // Use the local RaBitQ gate before exact beam insertion
+  str rabitq_mode{"exact_safe"};
+  u32 rabitq_gate_width{18};
+  u32 rabitq_gate_max_width{36};
+  f64 rabitq_gate_margin{0.08};
+  f64 rabitq_cache_max_ratio{0.10};
+  u32 rabitq_dynamic_budget_mb{64};
+  u32 rabitq_coalesce_target{64};
+  u32 rabitq_coalesce_min{32};
+  u32 rabitq_coalesce_wait_us{6};
+  u32 rabitq_prefetch_width{2};
+  u32 rabitq_prefetch_min_samples{16};
+  f64 rabitq_prefetch_min_hit_ratio{0.35};
+  u32 rabitq_warmup_exact_expansions{6};
+  u32 rabitq_audit_period{12};
+  f64 rabitq_safe_epsilon{1e-4};
+  bool rabitq_strict_recall{true};
   str vector_data_type{"auto"};
   str insert_execution{"compute"};
   u32 insert_workers{};
@@ -52,6 +73,7 @@ public:
   u32 storage_owner_peer_rdma_tokens{8};
   u32 storage_owner_rpc_depth{8};
   u32 storage_owner_rpc_timeout_ms{30000};
+  u32 storage_owner_handoff_queue_depth{};
   u32 storage_owner_construction_beam_width{128};
   u32 storage_owner_search_snapshot_batch{64};
   u32 storage_owner_prune_max_candidates{128};
@@ -59,6 +81,7 @@ public:
   u32 storage_owner_reverse_queue_depth{65536};
   u32 storage_owner_reverse_flush_us{200};
   u32 storage_owner_reverse_coalesce_max{256};
+  bool storage_owner_transitive_search{false};
 
   // Legacy aliases for compatibility
   u32& ef_search = beam_width;
@@ -161,6 +184,9 @@ private:
       "storage-owner-rpc-timeout-ms",
       po::value<u32>(&storage_owner_rpc_timeout_ms)->default_value(storage_owner_rpc_timeout_ms),
       "Maximum time to wait for one storage_owner insert RPC response.")(
+      "storage-owner-handoff-queue-depth",
+      po::value<u32>(&storage_owner_handoff_queue_depth)->default_value(storage_owner_handoff_queue_depth),
+      "Maximum queued handoff requests per peer. 0 uses 4x --storage-owner-rpc-depth.")(
       "storage-owner-construction-beam-width",
       po::value<u32>(&storage_owner_construction_beam_width)->default_value(storage_owner_construction_beam_width),
       "Storage-owner online construction beam width. 0 uses --beam-width-construction unchanged.")(
@@ -182,9 +208,65 @@ private:
       "storage-owner-reverse-coalesce-max",
       po::value<u32>(&storage_owner_reverse_coalesce_max)->default_value(storage_owner_reverse_coalesce_max),
       "Maximum reverse-update operations coalesced by one peer worker batch.")(
+      "storage-owner-transitive-search",
+      po::bool_switch(&storage_owner_transitive_search)->default_value(false),
+      "Use transitive (RPC-based) beam search for storage_owner inserts instead of fine-grained RDMA reads.")(
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
+      "expansion-batch,K", po::value<u32>(&expansion_batch)->default_value(1),
+      "Number of beam nodes expanded per iteration.")(
+      "rdma-qp-pool-size", po::value<u32>(&rdma_qp_pool_size)->default_value(1),
+      "QPs per memory node per SharedContext. >1 enables parallel RDMA reads to the same node.")(
+      "query-batch-size", po::value<u32>(&query_batch_size)->default_value(1),
+      "Fuse GPU/D2H across N queries processed in lockstep (1=disabled, 2-4=batch).")(
+      "use-rabitq", po::bool_switch(&use_rabitq)->default_value(false),
+      "Use the local RaBitQ gate; only exact distances enter the beam.")(
+      "rabitq-mode", po::value<str>(&rabitq_mode)->default_value(rabitq_mode),
+      "RaBitQ execution mode: exact_safe, speculative_prefetch, gpu_coalesced, or cpu_gate.")(
+      "rabitq-gate-width", po::value<u32>(&rabitq_gate_width)->default_value(rabitq_gate_width),
+      "Minimum cached candidates exactified per expansion.")(
+      "rabitq-gate-max-width",
+      po::value<u32>(&rabitq_gate_max_width)->default_value(rabitq_gate_max_width),
+      "Maximum cached candidates exactified after margin expansion.")(
+      "rabitq-gate-margin", po::value<f64>(&rabitq_gate_margin)->default_value(rabitq_gate_margin),
+      "Relative margin around the gate-width cutoff.")(
+      "rabitq-cache-max-ratio",
+      po::value<f64>(&rabitq_cache_max_ratio)->default_value(rabitq_cache_max_ratio),
+      "Maximum compute-node RaBitQ bytes as a ratio of raw vector bytes.")(
+      "rabitq-dynamic-budget-mb",
+      po::value<u32>(&rabitq_dynamic_budget_mb)->default_value(rabitq_dynamic_budget_mb),
+      "Fixed RaBitQ dynamic overlay budget in MiB, capped by --rabitq-cache-max-ratio.")(
+      "rabitq-coalesce-target",
+      po::value<u32>(&rabitq_coalesce_target)->default_value(rabitq_coalesce_target),
+      "Target candidates per RaBitQ exactification flush.")(
+      "rabitq-coalesce-min",
+      po::value<u32>(&rabitq_coalesce_min)->default_value(rabitq_coalesce_min),
+      "Minimum RDMA-friendly candidates exactified before strict recall widening stops.")(
+      "rabitq-coalesce-wait-us",
+      po::value<u32>(&rabitq_coalesce_wait_us)->default_value(rabitq_coalesce_wait_us),
+      "Maximum RaBitQ coalescer wait in microseconds.")(
+      "rabitq-prefetch-width",
+      po::value<u32>(&rabitq_prefetch_width)->default_value(rabitq_prefetch_width),
+      "Number of RaBitQ-ranked neighbor lists speculatively prefetched per exact GPU batch.")(
+      "rabitq-prefetch-min-samples",
+      po::value<u32>(&rabitq_prefetch_min_samples)->default_value(rabitq_prefetch_min_samples),
+      "Predictions observed before applying the per-query prefetch stop-loss.")(
+      "rabitq-prefetch-min-hit-ratio",
+      po::value<f64>(&rabitq_prefetch_min_hit_ratio)->default_value(rabitq_prefetch_min_hit_ratio),
+      "Disable speculative prefetch for a query when its hit ratio falls below this value.")(
+      "rabitq-warmup-exact-expansions",
+      po::value<u32>(&rabitq_warmup_exact_expansions)->default_value(rabitq_warmup_exact_expansions),
+      "Exactify all candidates for this many initial RaBitQ graph expansions.")(
+      "rabitq-audit-period",
+      po::value<u32>(&rabitq_audit_period)->default_value(rabitq_audit_period),
+      "Exactify one full RaBitQ frontier every N graph expansions after warmup. 0 disables audit.")(
+      "rabitq-safe-epsilon",
+      po::value<f64>(&rabitq_safe_epsilon)->default_value(rabitq_safe_epsilon),
+      "Absolute safety margin for RFQ5 exact-safe lower-bound skipping.")(
+      "rabitq-strict-recall",
+      po::value<bool>(&rabitq_strict_recall)->default_value(rabitq_strict_recall),
+      "Widen uncertain small RaBitQ gates so recall is protected.")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
       "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
@@ -216,6 +298,28 @@ private:
                   << e.what() << std::endl;
         exit_with_help_message(argv);
       }
+    }
+
+    if (use_rabitq && ip_distance) {
+      std::cerr << "[ERROR]: --use-rabitq currently supports L2 distance only" << std::endl;
+      exit_with_help_message(argv);
+    }
+    if (use_rabitq && rabitq_mode != "exact_safe" &&
+        rabitq_mode != "speculative_prefetch" &&
+        rabitq_mode != "gpu_coalesced" && rabitq_mode != "cpu_gate") {
+      std::cerr << "[ERROR]: --rabitq-mode must be exact_safe, speculative_prefetch, "
+                   "gpu_coalesced, or cpu_gate" << std::endl;
+      exit_with_help_message(argv);
+    }
+    if (rabitq_gate_width == 0 || rabitq_gate_max_width < rabitq_gate_width ||
+        rabitq_gate_margin < 0.0 || rabitq_cache_max_ratio <= 0.0 ||
+        rabitq_coalesce_min == 0 || rabitq_coalesce_target < rabitq_coalesce_min ||
+        (rabitq_mode == "speculative_prefetch" &&
+         (rabitq_prefetch_width == 0 || rabitq_prefetch_min_samples == 0 ||
+          rabitq_prefetch_width > 8 ||
+          rabitq_prefetch_min_hit_ratio < 0.0 || rabitq_prefetch_min_hit_ratio > 1.0))) {
+      std::cerr << "[ERROR]: invalid RaBitQ gate configuration" << std::endl;
+      exit_with_help_message(argv);
     }
 
     if (insert_execution != "compute" && insert_execution != "storage_owner") {
@@ -343,6 +447,8 @@ public:
         os << std::setw(width) << "storage batch wait(us): " << config.storage_owner_batch_wait_us << std::endl;
         os << std::setw(width) << "storage peer RDMA tokens: " << config.storage_owner_peer_rdma_tokens << std::endl;
         os << std::setw(width) << "storage RPC depth: " << config.storage_owner_rpc_depth << std::endl;
+        os << std::setw(width) << "storage handoff queue depth: "
+           << config.storage_owner_handoff_queue_depth << std::endl;
         os << std::setw(width) << "storage RPC timeout(ms): " << config.storage_owner_rpc_timeout_ms << std::endl;
         os << std::setw(width) << "storage construction beam: "
            << config.storage_owner_construction_beam_width << std::endl;
@@ -357,6 +463,8 @@ public:
            << config.storage_owner_reverse_flush_us << std::endl;
         os << std::setw(width) << "storage reverse coalesce max: "
            << config.storage_owner_reverse_coalesce_max << std::endl;
+        os << std::setw(width) << "storage transitive search: "
+           << (config.storage_owner_transitive_search ? "true" : "false") << std::endl;
         os << std::setw(width) << "storage peers: " << "[";
         for (const str& node : config.storage_peers) {
           os << node << ", ";
@@ -369,6 +477,30 @@ public:
       os << std::setw(width) << "query coroutines: " << config.query_coroutines << std::endl;
       os << std::setw(width) << "GPU device: " << config.gpu_device << std::endl;
       os << std::setw(width) << "GPUDirect RDMA: " << (config.gpudirect_rdma ? "true" : "false") << std::endl;
+      os << std::setw(width) << "Expansion Batch (K): " << config.expansion_batch << std::endl;
+      os << std::setw(width) << "RDMA QP Pool Size: " << config.rdma_qp_pool_size << std::endl;
+      os << std::setw(width) << "Query Batch Size: " << config.query_batch_size << std::endl;
+      os << std::setw(width) << "Use RaBitQ: " << (config.use_rabitq ? "true" : "false") << std::endl;
+      os << std::setw(width) << "RaBitQ mode: " << config.rabitq_mode << std::endl;
+      os << std::setw(width) << "RaBitQ gate width: " << config.rabitq_gate_width << std::endl;
+      os << std::setw(width) << "RaBitQ gate max width: " << config.rabitq_gate_max_width << std::endl;
+      os << std::setw(width) << "RaBitQ gate margin: " << config.rabitq_gate_margin << std::endl;
+      os << std::setw(width) << "RaBitQ cache max ratio: " << config.rabitq_cache_max_ratio << std::endl;
+      os << std::setw(width) << "RaBitQ dynamic budget MB: " << config.rabitq_dynamic_budget_mb << std::endl;
+      os << std::setw(width) << "RaBitQ coalesce target: " << config.rabitq_coalesce_target << std::endl;
+      os << std::setw(width) << "RaBitQ coalesce min: " << config.rabitq_coalesce_min << std::endl;
+      os << std::setw(width) << "RaBitQ coalesce wait(us): " << config.rabitq_coalesce_wait_us << std::endl;
+      os << std::setw(width) << "RaBitQ prefetch width: " << config.rabitq_prefetch_width << std::endl;
+      os << std::setw(width) << "RaBitQ prefetch min samples: "
+         << config.rabitq_prefetch_min_samples << std::endl;
+      os << std::setw(width) << "RaBitQ prefetch min hit ratio: "
+         << config.rabitq_prefetch_min_hit_ratio << std::endl;
+      os << std::setw(width) << "RaBitQ warmup exact expansions: "
+         << config.rabitq_warmup_exact_expansions << std::endl;
+      os << std::setw(width) << "RaBitQ audit period: " << config.rabitq_audit_period << std::endl;
+      os << std::setw(width) << "RaBitQ safe epsilon: " << config.rabitq_safe_epsilon << std::endl;
+      os << std::setw(width) << "RaBitQ strict recall: "
+         << (config.rabitq_strict_recall ? "true" : "false") << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {
       os << std::left << std::setfill(' ');

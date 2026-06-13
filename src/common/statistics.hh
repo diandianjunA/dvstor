@@ -198,6 +198,8 @@ struct ThreadStatistics {
   size_t build_vector_rdma_reads_in_bytes{0};
   size_t query_neighbor_rdma_read_ops{0};
   size_t query_vector_rdma_read_ops{0};
+  size_t query_vector_rdma_batch_calls{0};
+  size_t query_vector_rdma_cqes{0};
   size_t build_neighbor_rdma_read_ops{0};
   size_t build_vector_rdma_read_ops{0};
   size_t query_h2d_bytes{0};
@@ -205,6 +207,19 @@ struct ThreadStatistics {
   size_t build_h2d_bytes{0};
   size_t build_d2h_bytes{0};
   size_t query_exact_reranks{0};
+  size_t query_rabitq_l0_candidates{0};
+  size_t query_rabitq_cache_misses{0};
+  size_t query_rabitq_l1_candidates{0};
+  size_t query_rabitq_l2_candidates{0};
+  size_t query_rabitq_forced_widen{0};
+  size_t query_rabitq_audit_expansions{0};
+  size_t query_rabitq_audit_candidates{0};
+  size_t query_rabitq_safe_skips{0};
+  size_t query_rabitq_exact_fallbacks{0};
+  size_t query_rabitq_prefetch_issued{0};
+  size_t query_rabitq_prefetch_hits{0};
+  size_t query_rabitq_prefetch_misses{0};
+  size_t query_rabitq_prefetch_disabled_queries{0};
   size_t build_l2_kernels{0};
   size_t build_prune_kernels{0};
   size_t build_overflow_prunes{0};
@@ -229,7 +244,7 @@ struct ThreadStatistics {
 
   size_t query_rdma_to_staging_bytes{0};
   size_t query_host_staging_fallback_bytes{0};
-  size_t reserved_counter_slots[9]{};
+  size_t reserved_counter_slots[3]{};
 
   void inc_visited_nodes(u32 level) {
     if (level > 0) {

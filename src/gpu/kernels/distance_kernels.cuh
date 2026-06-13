@@ -15,7 +15,8 @@ __device__ __forceinline__ float typed_component_to_float(T value) {
     return static_cast<float>(value);
 }
 
-template <uint32_t TILE_SIZE, typename QueryT, typename CandidateT>
+template <uint32_t TILE_SIZE, typename QueryT, typename CandidateT,
+          typename IntegralAccumulator = int32_t>
 __global__ void batch_l2_typed_pair_distance_kernel(
     const QueryT* __restrict__ query,
     const CandidateT* __restrict__ candidates,
@@ -31,12 +32,12 @@ __global__ void batch_l2_typed_pair_distance_kernel(
 
     const CandidateT* cand_vec = candidates + static_cast<size_t>(tile_id) * dim;
     if constexpr (std::is_integral_v<QueryT> && std::is_integral_v<CandidateT>) {
-        int local_sum = 0;
+        IntegralAccumulator local_sum = 0;
         for (uint32_t i = tile.thread_rank(); i < dim; i += TILE_SIZE) {
             const int diff = static_cast<int>(query[i]) - static_cast<int>(cand_vec[i]);
-            local_sum += diff * diff;
+            local_sum += static_cast<IntegralAccumulator>(diff * diff);
         }
-        int total = cg::reduce(tile, local_sum, cg::plus<int>());
+        IntegralAccumulator total = cg::reduce(tile, local_sum, cg::plus<IntegralAccumulator>());
         if (tile.thread_rank() == 0) {
             distances[tile_id] = static_cast<float>(total);
         }
@@ -54,7 +55,8 @@ __global__ void batch_l2_typed_pair_distance_kernel(
 }
 
 
-template <uint32_t TILE_SIZE, typename QueryT, typename CandidateT>
+template <uint32_t TILE_SIZE, typename QueryT, typename CandidateT,
+          typename IntegralAccumulator = int32_t>
 __global__ void batch_l2_typed_pair_distance_indirect_kernel(
     const QueryT* __restrict__ query,
     const void* const* __restrict__ candidate_ptrs,
@@ -70,12 +72,53 @@ __global__ void batch_l2_typed_pair_distance_indirect_kernel(
 
     const CandidateT* cand_vec = static_cast<const CandidateT*>(candidate_ptrs[tile_id]);
     if constexpr (std::is_integral_v<QueryT> && std::is_integral_v<CandidateT>) {
-        int local_sum = 0;
+        IntegralAccumulator local_sum = 0;
         for (uint32_t i = tile.thread_rank(); i < dim; i += TILE_SIZE) {
             const int diff = static_cast<int>(query[i]) - static_cast<int>(cand_vec[i]);
+            local_sum += static_cast<IntegralAccumulator>(diff * diff);
+        }
+        IntegralAccumulator total = cg::reduce(tile, local_sum, cg::plus<IntegralAccumulator>());
+        if (tile.thread_rank() == 0) {
+            distances[tile_id] = static_cast<float>(total);
+        }
+    } else {
+        float local_sum = 0.0f;
+        for (uint32_t i = tile.thread_rank(); i < dim; i += TILE_SIZE) {
+            const float diff = typed_component_to_float(query[i]) - typed_component_to_float(cand_vec[i]);
             local_sum += diff * diff;
         }
-        int total = cg::reduce(tile, local_sum, cg::plus<int>());
+        float total = cg::reduce(tile, local_sum, cg::plus<float>());
+        if (tile.thread_rank() == 0) {
+            distances[tile_id] = total;
+        }
+    }
+}
+
+template <uint32_t TILE_SIZE, typename QueryT, typename CandidateT,
+          typename IntegralAccumulator = int32_t>
+__global__ void batch_l2_typed_multi_query_distance_kernel(
+    const QueryT* __restrict__ queries,
+    const uint32_t* __restrict__ candidate_query_ids,
+    const CandidateT* __restrict__ candidates,
+    float* __restrict__ distances,
+    uint32_t n_candidates,
+    uint32_t dim)
+{
+    auto block = cg::this_thread_block();
+    auto tile = cg::tiled_partition<TILE_SIZE>(block);
+
+    uint32_t tile_id = (blockIdx.x * blockDim.x + threadIdx.x) / TILE_SIZE;
+    if (tile_id >= n_candidates) return;
+
+    const QueryT* query = queries + static_cast<size_t>(candidate_query_ids[tile_id]) * dim;
+    const CandidateT* cand_vec = candidates + static_cast<size_t>(tile_id) * dim;
+    if constexpr (std::is_integral_v<QueryT> && std::is_integral_v<CandidateT>) {
+        IntegralAccumulator local_sum = 0;
+        for (uint32_t i = tile.thread_rank(); i < dim; i += TILE_SIZE) {
+            const int diff = static_cast<int>(query[i]) - static_cast<int>(cand_vec[i]);
+            local_sum += static_cast<IntegralAccumulator>(diff * diff);
+        }
+        IntegralAccumulator total = cg::reduce(tile, local_sum, cg::plus<IntegralAccumulator>());
         if (tile.thread_rank() == 0) {
             distances[tile_id] = static_cast<float>(total);
         }
@@ -93,7 +136,7 @@ __global__ void batch_l2_typed_pair_distance_indirect_kernel(
 }
 
 
-template <uint32_t TILE_SIZE, typename T>
+template <uint32_t TILE_SIZE, typename T, typename IntegralAccumulator = int32_t>
 __global__ void batch_l2_id_distance_kernel(
     const T* __restrict__ base_vectors,
     uint32_t query_id,
@@ -112,12 +155,12 @@ __global__ void batch_l2_id_distance_kernel(
     const uint32_t cand_id = candidate_ids[tile_id];
     const T* cand = base_vectors + static_cast<size_t>(cand_id) * dim;
     if constexpr (std::is_integral_v<T>) {
-        int local_sum = 0;
+        IntegralAccumulator local_sum = 0;
         for (uint32_t i = tile.thread_rank(); i < dim; i += TILE_SIZE) {
             const int diff = static_cast<int>(query[i]) - static_cast<int>(cand[i]);
-            local_sum += diff * diff;
+            local_sum += static_cast<IntegralAccumulator>(diff * diff);
         }
-        int total = cg::reduce(tile, local_sum, cg::plus<int>());
+        IntegralAccumulator total = cg::reduce(tile, local_sum, cg::plus<IntegralAccumulator>());
         if (tile.thread_rank() == 0) distances[tile_id] = static_cast<float>(total);
     } else {
         float local_sum = 0.0f;
@@ -314,6 +357,44 @@ __global__ void robust_prune_typed_kernel(
 
     if (threadIdx.x == 0) {
         *pruned_count = write_idx;
+    }
+}
+
+// Asymmetric RaBitQ. One cooperative tile evaluates one candidate so
+// remain parallel without a dimension-dependent shared-memory LUT.
+template <uint32_t TILE_SIZE>
+__global__ void rabitq_asymmetric_kernel(
+    const float* __restrict__ d_rotated_query,
+    const uint8_t* __restrict__ candidate_data,
+    float* __restrict__ distances,
+    float query_norm2, uint32_t n_candidates,
+    uint32_t code_bits, uint32_t code_bytes, uint32_t entry_bytes)
+{
+    static_assert(TILE_SIZE == 8 || TILE_SIZE == 16 || TILE_SIZE == 32);
+    const uint32_t global_thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t candidate = global_thread / TILE_SIZE;
+    const uint32_t lane = threadIdx.x & (TILE_SIZE - 1);
+    if (candidate >= n_candidates) return;
+
+    const uint8_t* entry = candidate_data + static_cast<size_t>(candidate) * entry_bytes;
+    float signed_dot = 0.0f;
+    for (uint32_t bit = lane; bit < code_bits; bit += TILE_SIZE) {
+        const bool positive = (entry[bit >> 3] & (1u << (7u - (bit & 7u)))) != 0;
+        signed_dot += positive ? d_rotated_query[bit] : -d_rotated_query[bit];
+    }
+    for (uint32_t offset = TILE_SIZE / 2; offset > 0; offset >>= 1) {
+        signed_dot += __shfl_down_sync(__activemask(), signed_dot, offset, TILE_SIZE);
+    }
+    if (lane == 0) {
+        const uint32_t scalar_offset = (code_bytes + 3u) & ~3u;
+        const float x_norm = *reinterpret_cast<const float*>(entry + scalar_offset);
+        const float e = *reinterpret_cast<const float*>(entry + scalar_offset + sizeof(float));
+        float ip_approx = 0.0f;
+        if (e > 1e-12f) {
+            ip_approx = x_norm * signed_dot / (sqrtf(static_cast<float>(code_bits)) * e);
+        }
+        const float d2 = query_norm2 + x_norm * x_norm - 2.0f * ip_approx;
+        distances[candidate] = fmaxf(d2, 0.0f);
     }
 }
 

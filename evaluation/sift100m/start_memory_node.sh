@@ -60,6 +60,9 @@ cmd=("$BUILD_DIR/dvstor_memory_node"
 
 if [[ "$INSERT_EXECUTION" == "storage_owner" ]]; then
   cmd+=(--storage-peers "${SERVER_ARGS[@]}")
+  if [[ "${STORAGE_OWNER_TRANSITIVE_SEARCH:-0}" == "1" ]]; then
+    cmd+=(--storage-owner-transitive-search)
+  fi
 fi
 
 printf '[memory-node-%s] command:' "$NODE_ID"; printf ' %q' "${cmd[@]}"; echo

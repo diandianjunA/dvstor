@@ -99,7 +99,7 @@ void vamana_service_schedule_inserts(vamana::Vamana<Distance>& vamana_idx,
           coroutine.handle.destroy();
           reset_vamana_coroutine_state(coroutine);
           thread->set_current_coroutine(cid);
-          coroutine.handle = vamana_idx.insert(req->id, slot_components, thread).handle;
+          coroutine.handle = vamana_idx.insert(req->id, slot_components, thread, &req->new_ptr).handle;
         }
 
       } else if (thread->is_ready(cid)) {

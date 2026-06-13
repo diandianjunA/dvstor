@@ -87,6 +87,12 @@ inline void add_storage_owner_breakdown(
                           per_item_ns(counters.storage_owner_search_beam_update_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_search_result_sort,
                           per_item_ns(counters.storage_owner_search_result_sort_ns, item_count));
+  sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_handoff_queue_wait,
+                          per_item_ns(counters.storage_owner_handoff_queue_wait_ns, item_count));
+  sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_handoff_send,
+                          per_item_ns(counters.storage_owner_handoff_send_ns, item_count));
+  sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_handoff_response_wait,
+                          per_item_ns(counters.storage_owner_handoff_response_wait_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_prune_snapshot_read,
                           per_item_ns(counters.storage_owner_prune_snapshot_read_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_prune_distance,

@@ -12,12 +12,12 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cuda_runtime.h>
 #include <type_traits>
 
 #include "common/constants.hh"
-#include "common/debug.hh"
 #include "common/distance.hh"
 #include "common/types.hh"
 #include "compute_thread.hh"
@@ -26,6 +26,7 @@
 #include "gpu/gpu_kernel_launcher.hh"
 #include "rdma/vamana_rdma_operations.hh"
 #include "remote_pointer.hh"
+#include "vamana/rabitq_cache.hh"
 #include "vamana/vamana_neighborlist.hh"
 #include "vamana/vamana_node.hh"
 
@@ -65,6 +66,7 @@ public:
         VamanaNode::init_static_storage(dim, R, vector_dtype);
     }
 
+
     // =========================================================================
     // Search (knn)
     // =========================================================================
@@ -73,7 +75,69 @@ public:
 #include "vamana/vamana_insert.ipp"
 #include "vamana/vamana_helpers.ipp"
 
+public:
+    void set_expansion_batch(u32 k) { expansion_batch_ = k; }
+    u32 expansion_batch() const { return expansion_batch_; }
+    void set_query_batch_size(u32 q) {
+        query_batch_size_ = q;
+    }
+    u32 query_batch_size() const { return use_rabitq_ ? 1 : query_batch_size_; }
+    bool use_rabitq() const { return use_rabitq_; }
+    void set_rabitq_cache(const rabitq::Cache* cache) { rabitq_cache_ = cache; }
+    void set_rabitq_gate(u32 width, u32 max_width, f32 margin) {
+        rabitq_gate_width_ = width;
+        rabitq_gate_max_width_ = max_width;
+        rabitq_gate_margin_ = std::max(margin, 0.0f);
+    }
+    void set_rabitq_runtime(u32 coalesce_min, u32 warmup_exact_expansions,
+                            u32 audit_period,
+                            bool strict_recall) {
+        rabitq_coalesce_min_ = std::max<u32>(1, coalesce_min);
+        rabitq_warmup_exact_expansions_ = warmup_exact_expansions;
+        rabitq_audit_period_ = audit_period;
+        rabitq_strict_recall_ = strict_recall;
+    }
+    void set_rabitq_exact_safe(bool enabled, f32 epsilon) {
+        rabitq_exact_safe_ = enabled;
+        rabitq_safe_epsilon_ = std::max(epsilon, 0.0f);
+    }
+    void set_rabitq_speculative_prefetch(bool enabled, u32 width,
+                                         u32 min_samples, f32 min_hit_ratio) {
+        rabitq_speculative_prefetch_ = enabled;
+        rabitq_prefetch_width_ = std::clamp<u32>(width, 1, kRabitqMaxPrefetchWidth);
+        rabitq_prefetch_min_samples_ = std::max<u32>(1, min_samples);
+        rabitq_prefetch_min_hit_ratio_ = std::clamp(min_hit_ratio, 0.0f, 1.0f);
+    }
+    void set_use_rabitq(bool v) {
+        use_rabitq_ = v;
+        if (!v) return;
+        rabitq::validate_dimension();
+        VamanaNode::enable_rabitq();
+    }
+
 private:
+    static constexpr u32 kRabitqMaxPrefetchWidth{8};
+    u32 expansion_batch_{1};
+    u32 query_batch_size_{1};
+    bool use_rabitq_{false};
+    const rabitq::Cache* rabitq_cache_{nullptr};
+    u32 rabitq_gate_width_{16};
+    u32 rabitq_gate_max_width_{24};
+    f32 rabitq_gate_margin_{0.05f};
+    u32 rabitq_coalesce_min_{32};
+    u32 rabitq_warmup_exact_expansions_{6};
+    u32 rabitq_audit_period_{12};
+    bool rabitq_exact_safe_{true};
+    f32 rabitq_safe_epsilon_{1e-4f};
+    bool rabitq_strict_recall_{true};
+    bool rabitq_speculative_prefetch_{false};
+    u32 rabitq_prefetch_width_{2};
+    u32 rabitq_prefetch_min_samples_{16};
+    f32 rabitq_prefetch_min_hit_ratio_{0.35f};
+    // Retained only for compilation of the unreachable legacy branch below the v2 gate.
+    f32 rabitq_confidence_epsilon_{1.9f};
+    u32 rabitq_exact_batch_{0};
+    u32 rabitq_exact_budget_{0};
     const u32 R_;
     const u32 beam_width_;
     const u32 beam_width_construction_;

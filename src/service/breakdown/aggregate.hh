@@ -82,11 +82,27 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.vector_rdma_bytes += delta.vector_rdma_bytes;
   aggregate.counters.neighbor_rdma_read_ops += delta.neighbor_rdma_read_ops;
   aggregate.counters.vector_rdma_read_ops += delta.vector_rdma_read_ops;
+  aggregate.counters.vector_rdma_batch_calls += delta.vector_rdma_batch_calls;
+  aggregate.counters.vector_rdma_cqes += delta.vector_rdma_cqes;
   aggregate.counters.h2d_bytes += delta.h2d_bytes;
   aggregate.counters.d2h_bytes += delta.d2h_bytes;
   aggregate.counters.l2_kernels += delta.l2_kernels;
   aggregate.counters.prune_kernels += delta.prune_kernels;
   aggregate.counters.exact_reranks += delta.exact_reranks;
+  aggregate.counters.rabitq_l0_candidates += delta.rabitq_l0_candidates;
+  aggregate.counters.rabitq_cache_misses += delta.rabitq_cache_misses;
+  aggregate.counters.rabitq_l1_candidates += delta.rabitq_l1_candidates;
+  aggregate.counters.rabitq_l2_candidates += delta.rabitq_l2_candidates;
+  aggregate.counters.rabitq_forced_widen += delta.rabitq_forced_widen;
+  aggregate.counters.rabitq_audit_expansions += delta.rabitq_audit_expansions;
+  aggregate.counters.rabitq_audit_candidates += delta.rabitq_audit_candidates;
+  aggregate.counters.rabitq_safe_skips += delta.rabitq_safe_skips;
+  aggregate.counters.rabitq_exact_fallbacks += delta.rabitq_exact_fallbacks;
+  aggregate.counters.rabitq_prefetch_issued += delta.rabitq_prefetch_issued;
+  aggregate.counters.rabitq_prefetch_hits += delta.rabitq_prefetch_hits;
+  aggregate.counters.rabitq_prefetch_misses += delta.rabitq_prefetch_misses;
+  aggregate.counters.rabitq_prefetch_disabled_queries +=
+    delta.rabitq_prefetch_disabled_queries;
   aggregate.counters.visited_nodes += delta.visited_nodes;
   aggregate.counters.visited_neighborlists += delta.visited_neighborlists;
   aggregate.counters.remote_allocations += delta.remote_allocations;

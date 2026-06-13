@@ -115,6 +115,7 @@ public:
   gpu::GpuBufferManager gpu_buffers;  // CUDA streams, events, staging buffers
   void* reserved_query_state[2]{};
 
+
   statistics::ThreadStatistics stats{};
 
 private:

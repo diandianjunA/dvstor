@@ -1,0 +1,78 @@
+reading dataset "/data/xjs/index/dvstor_sift100m/converted/base_100000000.u8bin" (dim=128, vectors=100000000/100000000, dtype=uint8, vector_bytes=128)
+Reading raw dataset 12% (12582912/100000000) elapsed 0s
+Reading raw dataset 25% (25690112/100000000) elapsed 0s
+Reading raw dataset 38% (38797312/100000000) elapsed 0s
+Reading raw dataset 51% (51904512/100000000) elapsed 1s
+Reading raw dataset 65% (65011712/100000000) elapsed 1s
+Reading raw dataset 78% (78118912/100000000) elapsed 1s
+Reading raw dataset 90% (90701824/100000000) elapsed 1s
+Reading raw dataset 100% (100000000/100000000) elapsed 2s done
+offline dataset memory: raw_vectors=12800000000 bytes, float_expansion=0 bytes
+output prefix: "/data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_bfs"
+memory nodes: 5
+threads: 32
+R=48 construction_beam_width=200 alpha=1.2 vector_data_type=uint8
+partition_strategy=bfs partition_max_degree=48 partition_imbalance=1.03
+skip_sanity_check=true
+offline distance execution: cpu-avx2
+offline graph memory: neighbors=19200000000 bytes, degrees=100000000 bytes, lock_stripes=1048576
+computing medoid...
+medoid: node 65610822
+initializing random R-regular graph (degree=48)...
+random graph unique neighbor signature ratio=1 sample=4096
+note: using alpha=1.0 for construction (config alpha=1.2 stored in metadata)
+reverse edge maintenance: cheap append plus bulk consolidation
+Building Vamana graph 0% (90342/100000000) elapsed 15s
+Building Vamana graph 0% (183552/100000000) elapsed 30s
+Building Vamana graph 0% (277230/100000000) elapsed 45s
+Building Vamana graph 0% (372244/100000000) elapsed 1m0s
+Building Vamana graph 0% (468055/100000000) elapsed 1m15s
+Building Vamana graph 0% (564680/100000000) elapsed 1m30s
+Building Vamana graph 0% (661500/100000000) elapsed 1m45s
+Building Vamana graph 0% (758459/100000000) elapsed 2m0s
+Building Vamana graph 0% (855915/100000000) elapsed 2m15s
+Building Vamana graph 0% (952901/100000000) elapsed 2m30s
+Building Vamana graph 1% (1050406/100000000) elapsed 2m45s
+Building Vamana graph 1% (1148416/100000000) elapsed 3m0s
+Building Vamana graph 1% (1246674/100000000) elapsed 3m15s
+Building Vamana graph 1% (1344313/100000000) elapsed 3m30s
+Building Vamana graph 1% (1442027/100000000) elapsed 3m45s
+Building Vamana graph 1% (1540123/100000000) elapsed 4m0s
+Building Vamana graph 1% (1639500/100000000) elapsed 4m15s
+Building Vamana graph 1% (1739219/100000000) elapsed 4m30s
+Building Vamana graph 1% (1840288/100000000) elapsed 4m45s
+Building Vamana graph 1% (1942568/100000000) elapsed 5m0s
+Building Vamana graph 2% (2046951/100000000) elapsed 5m15s
+Building Vamana graph 2% (2152210/100000000) elapsed 5m30s
+Building Vamana graph 2% (2261555/100000000) elapsed 5m45s
+Building Vamana graph 2% (2373472/100000000) elapsed 6m0s
+Building Vamana graph 2% (2488072/100000000) elapsed 6m15s
+Building Vamana graph 2% (2604695/100000000) elapsed 6m30s
+Building Vamana graph 2% (2723123/100000000) elapsed 6m45s
+Building Vamana graph 2% (2844084/100000000) elapsed 7m0s
+Building Vamana graph 2% (2967523/100000000) elapsed 7m15s
+Building Vamana graph 3% (3094431/100000000) elapsed 7m30s
+Building Vamana graph 3% (3223340/100000000) elapsed 7m45s
+Building Vamana graph 3% (3354015/100000000) elapsed 8m0s
+Building Vamana graph 3% (3486836/100000000) elapsed 8m15s
+Building Vamana graph 3% (3622193/100000000) elapsed 8m30s
+Building Vamana graph 3% (3759255/100000000) elapsed 8m45s
+Building Vamana graph 3% (3897963/100000000) elapsed 9m0s
+Building Vamana graph 4% (4038406/100000000) elapsed 9m15s
+Building Vamana graph 4% (4180717/100000000) elapsed 9m30s
+Building Vamana graph 4% (4325070/100000000) elapsed 9m45s
+Building Vamana graph 4% (4470534/100000000) elapsed 10m0s
+Building Vamana graph 4% (4617463/100000000) elapsed 10m15s
+Building Vamana graph 4% (4765269/100000000) elapsed 10m30s
+Building Vamana graph 4% (4914692/100000000) elapsed 10m45s
+Building Vamana graph 5% (5002352/100000000) elapsed 10m53s
+Building Vamana graph 5% (5153264/100000000) elapsed 11m8s
+Building Vamana graph 5% (5305078/100000000) elapsed 11m23s
+Building Vamana graph 5% (5458198/100000000) elapsed 11m38s
+Building Vamana graph 5% (5612965/100000000) elapsed 11m53s
+Building Vamana graph 5% (5768221/100000000) elapsed 12m8s
+Building Vamana graph 5% (5924349/100000000) elapsed 12m23s
+Building Vamana graph 6% (6081993/100000000) elapsed 12m38s
+Building Vamana graph 6% (6241054/100000000) elapsed 12m53s
+Building Vamana graph 6% (6401212/100000000) elapsed 13m8s
+Building Vamana graph 6% (6562034/100000000) elapsed 13m24s

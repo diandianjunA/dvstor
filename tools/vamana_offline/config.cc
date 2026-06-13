@@ -7,6 +7,8 @@
 #include <boost/program_options.hpp>
 #include <library/utils.hh>
 
+#include "vamana/storage_format.hh"
+
 namespace po = boost::program_options;
 
 namespace tools::vamana_offline {
@@ -47,17 +49,14 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
      "METIS ubvec balance tolerance, e.g. 1.03 allows about 3% imbalance.")
     ("skip-sanity-check", po::bool_switch(&config.skip_sanity_check),
      "Skip the expensive in-memory brute-force recall sanity check after graph construction.")
+    ("use-rabitq", po::bool_switch(&config.use_rabitq),
+     "Store dimension-scaled RaBitQ search entries per node for GPU approximate search.")
+    ("storage-format", po::value<str>(&config.storage_format)->default_value(config.storage_format),
+     "Storage format to write: vamana_aos_v1 or vamana_compact_v1.")
     ("seed", po::value<i32>(&config.seed)->default_value(config.seed), "PRNG seed.")
     ("max-vectors", po::value<size_t>(&config.max_vectors)->default_value(config.max_vectors),
      "Maximum number of vectors to read.")
     ("ip-dist", po::bool_switch(&config.ip_distance), "Use inner-product distance instead of L2.")
-    ("no-gpu", po::bool_switch(&config.no_gpu), "Disable GPU acceleration.")
-    ("gpu-device", po::value<i32>(&config.gpu_device)->default_value(config.gpu_device),
-     "CUDA device ID (default 0).")
-    ("gpu-memory-gb", po::value<double>(&config.gpu_memory_gb)->default_value(config.gpu_memory_gb),
-     "Maximum GPU memory in GiB used by the offline builder. Default 18.")
-    ("build-gpu-streams", po::value<u32>(&config.build_gpu_streams)->default_value(config.build_gpu_streams),
-     "Number of offline GPU streams. 0 = min(threads, 32).")
     ("query-path", po::value<filepath_t>(&config.query_path),
      "Path to query file (.fbin) for post-build recall test.")
     ("groundtruth-path", po::value<filepath_t>(&config.groundtruth_path),
@@ -91,9 +90,10 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     lib_failure("--partition-max-degree must be > 0");
   if (config.partition_imbalance < 1.0)
     lib_failure("--partition-imbalance must be >= 1.0");
-  if (config.gpu_memory_gb <= 0.0)
-    lib_failure("--gpu-memory-gb must be > 0");
-
+  if (config.use_rabitq && config.ip_distance)
+    lib_failure("--use-rabitq currently supports L2 distance only");
+  if (!vamana::parse_storage_format(config.storage_format))
+    lib_failure("--storage-format must be vamana_aos_v1 or vamana_compact_v1");
   return config;
 }
 
