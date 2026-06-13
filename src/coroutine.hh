@@ -67,6 +67,7 @@ struct VamanaCoroutine {
   vec<RemotePtr> indirect_candidate_ptrs{};
   vec<u32> indirect_candidate_indices{};
   vec<float> scratch_distances{};
+  vec<const byte_t*> scratch_entry_ptrs{};
   vec<u32> scratch_indices_a{};
   vec<u32> scratch_indices_b{};
   vec<u8> scratch_flags{};

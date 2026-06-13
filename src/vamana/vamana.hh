@@ -12,6 +12,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cuda_runtime.h>
 #include <type_traits>
@@ -100,6 +101,13 @@ public:
         rabitq_exact_safe_ = enabled;
         rabitq_safe_epsilon_ = std::max(epsilon, 0.0f);
     }
+    void set_rabitq_speculative_prefetch(bool enabled, u32 width,
+                                         u32 min_samples, f32 min_hit_ratio) {
+        rabitq_speculative_prefetch_ = enabled;
+        rabitq_prefetch_width_ = std::clamp<u32>(width, 1, kRabitqMaxPrefetchWidth);
+        rabitq_prefetch_min_samples_ = std::max<u32>(1, min_samples);
+        rabitq_prefetch_min_hit_ratio_ = std::clamp(min_hit_ratio, 0.0f, 1.0f);
+    }
     void set_use_rabitq(bool v) {
         use_rabitq_ = v;
         if (!v) return;
@@ -108,6 +116,7 @@ public:
     }
 
 private:
+    static constexpr u32 kRabitqMaxPrefetchWidth{8};
     u32 expansion_batch_{1};
     u32 query_batch_size_{1};
     bool use_rabitq_{false};
@@ -121,6 +130,10 @@ private:
     bool rabitq_exact_safe_{true};
     f32 rabitq_safe_epsilon_{1e-4f};
     bool rabitq_strict_recall_{true};
+    bool rabitq_speculative_prefetch_{false};
+    u32 rabitq_prefetch_width_{2};
+    u32 rabitq_prefetch_min_samples_{16};
+    f32 rabitq_prefetch_min_hit_ratio_{0.35f};
     // Retained only for compilation of the unreachable legacy branch below the v2 gate.
     f32 rabitq_confidence_epsilon_{1.9f};
     u32 rabitq_exact_batch_{0};

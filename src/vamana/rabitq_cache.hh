@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -9,6 +10,7 @@
 #include <limits>
 #include <linux/mempolicy.h>
 #include <mutex>
+#include <numeric>
 #include <shared_mutex>
 #include <sstream>
 #include <sys/syscall.h>
@@ -284,6 +286,35 @@ inline void select_gate_into(const vec<f32>& distances,
                              vec<u8>& is_miss) {
   selected.clear();
   cached.clear();
+  const auto less_by_distance = [&](u32 lhs, u32 rhs) {
+    if (distances[lhs] != distances[rhs]) return distances[lhs] < distances[rhs];
+    return lhs < rhs;
+  };
+  if (cache_miss_indices.empty()) {
+    is_miss.clear();
+    cached.resize(distances.size());
+    std::iota(cached.begin(), cached.end(), 0u);
+    const u32 base = std::min<u32>(width, cached.size());
+    const u32 limit = std::max(width, max_width);
+    const u32 bounded_limit = std::min<u32>(limit, cached.size());
+    if (bounded_limit == 0) return;
+    if (cached.size() > bounded_limit) {
+      std::nth_element(cached.begin(), cached.begin() + bounded_limit,
+                       cached.end(), less_by_distance);
+      cached.resize(bounded_limit);
+    }
+    std::sort(cached.begin(), cached.end(), less_by_distance);
+    selected.insert(selected.end(), cached.begin(), cached.begin() + base);
+    if (base > 0) {
+      const f32 cutoff = distances[cached[base - 1]];
+      const f32 margin_cutoff = cutoff + std::abs(cutoff) * std::max(margin, 0.0f);
+      for (u32 i = base; i < bounded_limit; ++i) {
+        if (distances[cached[i]] > margin_cutoff) break;
+        selected.push_back(cached[i]);
+      }
+    }
+    return;
+  }
   is_miss.assign(distances.size(), 0);
   for (u32 index : cache_miss_indices) {
     if (index < is_miss.size() && !is_miss[index]) {
@@ -294,10 +325,6 @@ inline void select_gate_into(const vec<f32>& distances,
   for (u32 i = 0; i < distances.size(); ++i) {
     if (!is_miss[i]) cached.push_back(i);
   }
-  const auto less_by_distance = [&](u32 lhs, u32 rhs) {
-    if (distances[lhs] != distances[rhs]) return distances[lhs] < distances[rhs];
-    return lhs < rhs;
-  };
   const u32 base = std::min<u32>(width, cached.size());
   const u32 limit = std::max(width, max_width);
   const u32 bounded_limit = std::min<u32>(limit, cached.size());
@@ -339,6 +366,8 @@ public:
     ScopedNumaInterleave interleave;
     numa_interleaved_ = interleave.enabled();
     shards_.assign(num_nodes, {});
+    override_bits_.assign(num_nodes, {});
+    has_dynamic_entries_.store(false, std::memory_order_relaxed);
     size_bytes_ = 0;
     entry_count_ = 0;
     for (u32 node = 0; node < num_nodes; ++node) {
@@ -365,6 +394,7 @@ public:
       }
       auto& entries = shards_[node];
       entries.resize(header.entry_count * entry_bytes_);
+      override_bits_[node].assign((header.entry_count + 63u) / 64u, 0);
       input.read(reinterpret_cast<char*>(entries.data()),
                  static_cast<std::streamsize>(entries.size()));
       if (!input.good()) return fail(error, "truncated RFQ5 RaBitQ sidecar: " + path.string());
@@ -376,8 +406,15 @@ public:
     const size_t total_budget = max_cache_ratio > 0.0
       ? static_cast<size_t>(std::floor(static_cast<f64>(raw_bytes) * max_cache_ratio))
       : 0;
+    override_bitmap_bytes_ = 0;
+    for (const auto& bits : override_bits_) {
+      override_bitmap_bytes_ += bits.size() * sizeof(u64);
+    }
+    const size_t static_budget_bytes = size_bytes_ + override_bitmap_bytes_;
     const size_t capped_dynamic_budget =
-      total_budget > size_bytes_ ? std::min(dynamic_budget_bytes, total_budget - size_bytes_) : 0;
+      total_budget > static_budget_bytes
+        ? std::min(dynamic_budget_bytes, total_budget - static_budget_bytes)
+        : 0;
     init_dynamic(capped_dynamic_budget);
     prewarm();
     return true;
@@ -393,6 +430,37 @@ public:
     return rabitq::lower_bound_lut(lut, query_norm2, entry, quantization_);
   }
 
+  void estimate_batch_lut(const QueryLut& lut, f32 query_norm2,
+                          const vec<RemotePtr>& pointers,
+                          u32 begin, u32 count,
+                          vec<f32>& distances,
+                          vec<u32>& cache_miss_indices,
+                          vec<const byte_t*>& entries) const {
+    constexpr u32 prefetch_distance = 8;
+    distances.resize(count);
+    cache_miss_indices.clear();
+    entries.resize(count);
+    for (u32 step = 0; step < count + prefetch_distance; ++step) {
+      if (step < count) {
+        const byte_t* entry = find(pointers[begin + step]);
+        entries[step] = entry;
+        if (entry == nullptr) {
+          cache_miss_indices.push_back(step);
+        } else {
+          __builtin_prefetch(entry, 0, 1);
+        }
+      }
+      if (step >= prefetch_distance) {
+        const u32 score_index = step - prefetch_distance;
+        const byte_t* entry = entries[score_index];
+        if (entry != nullptr) {
+          distances[score_index] =
+            rabitq::estimate_distance_lut(lut, query_norm2, entry, quantization_);
+        }
+      }
+    }
+  }
+
   const byte_t* find(RemotePtr pointer) const {
     if (pointer.memory_node() < shards_.size() && pointer.byte_offset() >= 16 && node_size_ != 0) {
       const u64 relative = pointer.byte_offset() - 16;
@@ -401,16 +469,28 @@ public:
         const auto& entries = shards_[pointer.memory_node()];
         const u64 offset = slot * entry_bytes_;
         if (entry_bytes_ != 0 && offset + entry_bytes_ <= entries.size()) {
+          if (!has_dynamic_entries_.load(std::memory_order_acquire)) {
+            return entries.data() + offset;
+          }
+          const auto& bits = override_bits_[pointer.memory_node()];
+          const size_t word = static_cast<size_t>(slot >> 6u);
+          const u64 mask = 1ull << (slot & 63u);
+          if (word < bits.size() &&
+              (std::atomic_ref<const u64>(bits[word]).load(std::memory_order_acquire) & mask) != 0) {
+            return find_dynamic(pointer);
+          }
           return entries.data() + offset;
         }
       }
     }
+    if (!has_dynamic_entries_.load(std::memory_order_acquire)) return nullptr;
     return find_dynamic(pointer);
   }
 
   bool upsert_dynamic(RemotePtr pointer, const byte_t* vector, VectorDType dtype) {
     if (dynamic_slots_.empty() || pointer.is_null() || entry_bytes_ < 2) return false;
-    vec<byte_t> entry(entry_bytes_, 0);
+    thread_local vec<byte_t> entry;
+    entry.assign(entry_bytes_, 0);
     if (!encode_into(vector, dtype, quantization_, code_bits_, entry_bytes_, entry.data())) {
       ++dynamic_overflow_;
       return false;
@@ -425,6 +505,8 @@ public:
       if (slot.state == 1 && slot.raw == raw) {
         std::memcpy(dynamic_entries_.data() + slot_index * entry_bytes_,
                     entry.data(), entry_bytes_);
+        has_dynamic_entries_.store(true, std::memory_order_release);
+        mark_static_override(pointer);
         return true;
       }
       if (slot.state == 2 && first_deleted == dynamic_slots_.size()) {
@@ -439,6 +521,8 @@ public:
         std::memcpy(dynamic_entries_.data() + target_index * entry_bytes_,
                     entry.data(), entry_bytes_);
         ++dynamic_live_;
+        has_dynamic_entries_.store(true, std::memory_order_release);
+        mark_static_override(pointer);
         return true;
       }
     }
@@ -449,6 +533,8 @@ public:
       std::memcpy(dynamic_entries_.data() + first_deleted * entry_bytes_,
                   entry.data(), entry_bytes_);
       ++dynamic_live_;
+      has_dynamic_entries_.store(true, std::memory_order_release);
+      mark_static_override(pointer);
       return true;
     }
     ++dynamic_overflow_;
@@ -478,7 +564,10 @@ public:
     return dynamic_slots_.size() * sizeof(DynamicSlot) + dynamic_entries_.size();
   }
   size_t decode_table_bytes() const { return 0; }
-  size_t total_size_bytes() const { return size_bytes_ + dynamic_size_bytes(); }
+  size_t override_bitmap_bytes() const { return override_bitmap_bytes_; }
+  size_t total_size_bytes() const {
+    return size_bytes_ + override_bitmap_bytes_ + dynamic_size_bytes();
+  }
   size_t entry_count() const { return entry_count_; }
   size_t entry_bytes() const { return entry_bytes_; }
   size_t code_bits() const { return code_bits_; }
@@ -496,6 +585,21 @@ private:
     value *= 0xc4ceb9fe1a85ec53ULL;
     value ^= value >> 33;
     return value;
+  }
+
+  void mark_static_override(RemotePtr pointer) {
+    if (pointer.memory_node() >= override_bits_.size() ||
+        pointer.byte_offset() < 16 || node_size_ == 0) {
+      return;
+    }
+    const u64 relative = pointer.byte_offset() - 16;
+    if (relative % node_size_ != 0) return;
+    const u64 slot = relative / node_size_;
+    auto& bits = override_bits_[pointer.memory_node()];
+    const size_t word = static_cast<size_t>(slot >> 6u);
+    if (word >= bits.size()) return;
+    const u64 mask = 1ull << (slot & 63u);
+    std::atomic_ref<u64>(bits[word]).fetch_or(mask, std::memory_order_release);
   }
 
   void init_dynamic(size_t budget_bytes) {
@@ -541,6 +645,8 @@ private:
   }
 
   vec<vec<byte_t>> shards_;
+  vec<vec<u64>> override_bits_;
+  std::atomic<bool> has_dynamic_entries_{false};
   mutable std::shared_mutex dynamic_mutex_;
   vec<DynamicSlot> dynamic_slots_;
   vec<byte_t> dynamic_entries_;
@@ -550,6 +656,7 @@ private:
   u32 code_bits_{};
   u32 code_bytes_{};
   size_t size_bytes_{};
+  size_t override_bitmap_bytes_{};
   size_t entry_count_{};
   size_t dynamic_live_{};
   size_t dynamic_overflow_{};

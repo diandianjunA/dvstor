@@ -98,6 +98,11 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.rabitq_audit_candidates += delta.rabitq_audit_candidates;
   aggregate.counters.rabitq_safe_skips += delta.rabitq_safe_skips;
   aggregate.counters.rabitq_exact_fallbacks += delta.rabitq_exact_fallbacks;
+  aggregate.counters.rabitq_prefetch_issued += delta.rabitq_prefetch_issued;
+  aggregate.counters.rabitq_prefetch_hits += delta.rabitq_prefetch_hits;
+  aggregate.counters.rabitq_prefetch_misses += delta.rabitq_prefetch_misses;
+  aggregate.counters.rabitq_prefetch_disabled_queries +=
+    delta.rabitq_prefetch_disabled_queries;
   aggregate.counters.visited_nodes += delta.visited_nodes;
   aggregate.counters.visited_neighborlists += delta.visited_neighborlists;
   aggregate.counters.remote_allocations += delta.remote_allocations;

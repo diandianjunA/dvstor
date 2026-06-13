@@ -73,9 +73,17 @@
             use_gpudirect_candidate_rdma && thread->reserved_query_state[1] != nullptr;
 
         vec<rdma::vamana::NeighborReadAwaitable> pf_neighbors(K);
+        std::array<rdma::vamana::NeighborReadAwaitable,
+                   kRabitqMaxPrefetchWidth> speculative_neighbors;
+        u32 speculative_count = 0;
+        auto& speculative_ptrs = coro_state.reserved_ptrs_b;
+        speculative_ptrs.reserve(rabitq_prefetch_width_);
         u32 pending_K = 0;
         u32 rabitq_warmup_remaining = rabitq_warmup_exact_expansions_;
         u32 rabitq_expansions_seen = 0;
+        u32 rabitq_prefetch_issued_query = 0;
+        u32 rabitq_prefetch_hits_query = 0;
+        bool rabitq_prefetch_enabled_query = rabitq_speculative_prefetch_;
         u32 rabitq_next_audit_expansion = rabitq_audit_period_ == 0
             ? 0 : rabitq_warmup_exact_expansions_ + rabitq_audit_period_;
 
@@ -159,6 +167,29 @@
             if (use_rabitq_) {
                 lib_assert(rabitq_cache_ != nullptr,
                            "RaBitQ gate requires a loaded RFQ5 sidecar");
+                speculative_ptrs.clear();
+                if (rabitq_prefetch_enabled_query) {
+                    const u32 exact_slots = std::min<u32>(
+                        K, rabitq_prefetch_width_ > 1
+                             ? rabitq_prefetch_width_ - 1 : 1);
+                    for (u32 slot = 0; slot < exact_slots; ++slot) {
+                        i32 predicted = -1;
+                        distance_t predicted_distance =
+                            std::numeric_limits<distance_t>::max();
+                        for (i32 i = 0; i < static_cast<i32>(beam.size()); ++i) {
+                            if (beam[i].expanded ||
+                                beam[i].distance >= predicted_distance ||
+                                std::find(speculative_ptrs.begin(), speculative_ptrs.end(),
+                                          beam[i].rptr) != speculative_ptrs.end()) {
+                                continue;
+                            }
+                            predicted = i;
+                            predicted_distance = beam[i].distance;
+                        }
+                        if (predicted < 0) break;
+                        speculative_ptrs.push_back(beam[predicted].rptr);
+                    }
+                }
                 auto& exact_ptrs = coro_state.reserved_ptrs_a;
                 auto& gate_indices = coro_state.scratch_indices_b;
                 if (rabitq_exact_safe_) {
@@ -236,18 +267,11 @@
                         auto& cache_miss_indices = coro_state.scratch_indices_a;
                         auto& cached_order = coro_state.indirect_candidate_indices;
                         auto& gate_flags = coro_state.scratch_flags;
-                        approximate_distances.assign(n_batch,
-                            std::numeric_limits<f32>::infinity());
-                        cache_miss_indices.clear();
-                        for (u32 i = 0; i < n_batch; ++i) {
-                            const auto* entry = rabitq_cache_->find(all_unvisited[i]);
-                            if (entry == nullptr) {
-                                cache_miss_indices.push_back(i);
-                            } else {
-                                approximate_distances[i] = rabitq_cache_->estimate_distance_lut(
-                                    rabitq_query_lut, rabitq_query_norm2, entry);
-                            }
-                        }
+                        rabitq_cache_->estimate_batch_lut(
+                            rabitq_query_lut, rabitq_query_norm2,
+                            all_unvisited, 0, n_batch,
+                            approximate_distances, cache_miss_indices,
+                            coro_state.scratch_entry_ptrs);
                         thread->stats.query_rabitq_l0_candidates += n_batch;
                         thread->stats.query_rabitq_cache_misses += cache_miss_indices.size();
                         rabitq::select_gate_into(approximate_distances, cache_miss_indices,
@@ -274,6 +298,19 @@
                         exact_ptrs.clear();
                         exact_ptrs.reserve(gate_indices.size());
                         for (u32 index : gate_indices) exact_ptrs.push_back(all_unvisited[index]);
+                        if (rabitq_prefetch_enabled_query) {
+                            gate_flags.assign(n_batch, 0);
+                            for (u32 index : gate_indices) gate_flags[index] = 1;
+                            for (u32 index : cached_order) {
+                                if (speculative_ptrs.size() >= rabitq_prefetch_width_) break;
+                                const RemotePtr predicted = all_unvisited[index];
+                                if (gate_flags[index] &&
+                                    std::find(speculative_ptrs.begin(), speculative_ptrs.end(),
+                                              predicted) == speculative_ptrs.end()) {
+                                    speculative_ptrs.push_back(predicted);
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -341,6 +378,18 @@
                     static_cast<u32>(query_dtype), exact_staging,
                     static_cast<u32>(VamanaNode::vector_dtype()),
                     gs.d_distances, static_cast<u32>(gate_indices.size()), dim_);
+
+                // Start the GPU first, then post predicted neighbor reads.
+                // The scheduler resumes only after both completion domains
+                // drain, so a hit removes the next graph-read dependency
+                // without allowing an approximate distance into the beam.
+                speculative_count = 0;
+                for (RemotePtr pointer : speculative_ptrs) {
+                    speculative_neighbors[speculative_count++] =
+                        rdma::vamana::read_vamana_neighbors(pointer, &thread);
+                    ++thread->stats.query_rabitq_prefetch_issued;
+                    ++rabitq_prefetch_issued_query;
+                }
                 co_await gpu::GpuAwaitable{thread.get()};
                 add_breakdown_subcategory(thread,
                     service::breakdown::Subcategory::gpu_query_distance, t_exact);
@@ -368,9 +417,40 @@
                     best_idx = select_best();
                     if (best_idx < 0) break;
                     beam[best_idx].expanded = true;
-                    pf_neighbors[k] = rdma::vamana::read_vamana_neighbors(
-                        beam[best_idx].rptr, &thread);
+                    const RemotePtr selected = beam[best_idx].rptr;
+                    bool prefetched = false;
+                    for (u32 i = 0; i < speculative_count; ++i) {
+                        if (speculative_ptrs[i] == selected &&
+                            speculative_neighbors[i].valid()) {
+                            speculative_neighbors[i].mark_ready();
+                            pf_neighbors[k] = std::move(speculative_neighbors[i]);
+                            prefetched = true;
+                            ++thread->stats.query_rabitq_prefetch_hits;
+                            ++rabitq_prefetch_hits_query;
+                            break;
+                        }
+                    }
+                    if (!prefetched) {
+                        pf_neighbors[k] = rdma::vamana::read_vamana_neighbors(
+                            selected, &thread);
+                        if (!speculative_ptrs.empty()) {
+                            ++thread->stats.query_rabitq_prefetch_misses;
+                        }
+                    }
                     pending_K = k + 1;
+                }
+                for (u32 i = 0; i < speculative_count; ++i) {
+                    speculative_neighbors[i] = {};
+                }
+                speculative_count = 0;
+                speculative_ptrs.clear();
+                if (rabitq_prefetch_enabled_query &&
+                    rabitq_prefetch_issued_query >= rabitq_prefetch_min_samples_ &&
+                    static_cast<f32>(rabitq_prefetch_hits_query) <
+                      static_cast<f32>(rabitq_prefetch_issued_query) *
+                        rabitq_prefetch_min_hit_ratio_) {
+                    rabitq_prefetch_enabled_query = false;
+                    ++thread->stats.query_rabitq_prefetch_disabled_queries;
                 }
 
                 if (pending_K == 0) break;

@@ -1,5 +1,6 @@
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -127,6 +128,39 @@ int main() {
       cache.entry_bytes() != entry.size() ||
       cache.code_bits() != code_bits) {
     std::cerr << "RFQ5 sidecar address mapping failed\n";
+    return 1;
+  }
+  vec<f32> batch_distances;
+  vec<u32> batch_misses;
+  vec<const byte_t*> batch_entries;
+  const vec<RemotePtr> batch_ptrs{
+    RemotePtr{0, 16},
+    RemotePtr{1, 16},
+    RemotePtr{0, 16 + node_size},
+  };
+  cache.estimate_batch_lut(lut, norm2, batch_ptrs, 0,
+                           static_cast<u32>(batch_ptrs.size()),
+                           batch_distances, batch_misses, batch_entries);
+  if (batch_misses != vec<u32>({2}) ||
+      std::abs(batch_distances[0] - cache.estimate_distance_lut(
+        lut, norm2, cache.find(batch_ptrs[0]))) > 1e-4f ||
+      std::abs(batch_distances[1] - cache.estimate_distance_lut(
+        lut, norm2, cache.find(batch_ptrs[1]))) > 1e-4f) {
+    std::cerr << "RFQ5 prefetched batch scoring failed\n";
+    return 1;
+  }
+  std::array<byte_t, dim> replacement = vector;
+  for (u32 i = 0; i < dim; ++i) replacement[i] ^= static_cast<byte_t>(0x5a);
+  const auto replacement_entry = vamana::rabitq::encode(
+    replacement.data(), VectorDType::uint8, quantization, code_bits, entry_bytes);
+  const RemotePtr static_override{0, 16};
+  if (!cache.upsert_dynamic(static_override, replacement.data(), VectorDType::uint8) ||
+      cache.find(static_override) == nullptr ||
+      std::memcmp(cache.find(static_override), replacement_entry.data(), entry_bytes) != 0 ||
+      cache.override_bitmap_bytes() == 0 ||
+      !cache.erase_dynamic(static_override) ||
+      cache.find(static_override) != nullptr) {
+    std::cerr << "RFQ5 static-slot dynamic override failed\n";
     return 1;
   }
   const RemotePtr dynamic_ptr{0, 16 + node_size * 4};

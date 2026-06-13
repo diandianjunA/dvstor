@@ -213,7 +213,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"dim", service.config().dim},
     {"threads", service.config().num_threads},
     {"coroutines", service.config().num_coroutines},
-    {"search", service.config().use_rabitq ? "rabitq_rfq5_exact_safe" : "exact"},
+    {"search", service.config().use_rabitq
+        ? "rabitq_rfq5_" + service.config().rabitq_mode : "exact"},
     {"rabitq_cache_bytes", service.rabitq_cache_bytes()},
     {"rabitq_cache_entries", service.rabitq_cache_entries()},
     {"rabitq_cache_numa_interleaved", service.rabitq_cache_numa_interleaved()},
@@ -223,6 +224,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
           (service.rabitq_cache_entries() * VamanaNode::vector_bytes())},
     {"rabitq_cache_entry_bytes", service.rabitq_cache_entry_bytes()},
     {"rabitq_cache_code_bits", service.rabitq_cache_code_bits()},
+    {"rabitq_cache_override_bitmap_bytes",
+     service.rabitq_cache_override_bitmap_bytes()},
     {"rabitq_cache_dynamic_live", service.rabitq_cache_dynamic_live()},
     {"rabitq_cache_dynamic_overflow", service.rabitq_cache_dynamic_overflow()},
     {"rabitq_gate_width", service.config().use_rabitq
@@ -241,6 +244,12 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
         ? service.config().rabitq_coalesce_min : 0},
     {"rabitq_coalesce_wait_us", service.config().use_rabitq
         ? service.config().rabitq_coalesce_wait_us : 0},
+    {"rabitq_prefetch_width", service.config().use_rabitq
+        ? service.config().rabitq_prefetch_width : 0},
+    {"rabitq_prefetch_min_samples", service.config().use_rabitq
+        ? service.config().rabitq_prefetch_min_samples : 0},
+    {"rabitq_prefetch_min_hit_ratio", service.config().use_rabitq
+        ? service.config().rabitq_prefetch_min_hit_ratio : 0.0},
     {"rabitq_warmup_exact_expansions", service.config().use_rabitq
         ? service.config().rabitq_warmup_exact_expansions : 0},
     {"rabitq_audit_period", service.config().use_rabitq

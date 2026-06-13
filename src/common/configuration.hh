@@ -53,6 +53,9 @@ public:
   u32 rabitq_coalesce_target{64};
   u32 rabitq_coalesce_min{32};
   u32 rabitq_coalesce_wait_us{6};
+  u32 rabitq_prefetch_width{2};
+  u32 rabitq_prefetch_min_samples{16};
+  f64 rabitq_prefetch_min_hit_ratio{0.35};
   u32 rabitq_warmup_exact_expansions{6};
   u32 rabitq_audit_period{12};
   f64 rabitq_safe_epsilon{1e-4};
@@ -220,7 +223,7 @@ private:
       "use-rabitq", po::bool_switch(&use_rabitq)->default_value(false),
       "Use the local RaBitQ gate; only exact distances enter the beam.")(
       "rabitq-mode", po::value<str>(&rabitq_mode)->default_value(rabitq_mode),
-      "RaBitQ execution mode: exact_safe, gpu_coalesced, or cpu_gate.")(
+      "RaBitQ execution mode: exact_safe, speculative_prefetch, gpu_coalesced, or cpu_gate.")(
       "rabitq-gate-width", po::value<u32>(&rabitq_gate_width)->default_value(rabitq_gate_width),
       "Minimum cached candidates exactified per expansion.")(
       "rabitq-gate-max-width",
@@ -243,6 +246,15 @@ private:
       "rabitq-coalesce-wait-us",
       po::value<u32>(&rabitq_coalesce_wait_us)->default_value(rabitq_coalesce_wait_us),
       "Maximum RaBitQ coalescer wait in microseconds.")(
+      "rabitq-prefetch-width",
+      po::value<u32>(&rabitq_prefetch_width)->default_value(rabitq_prefetch_width),
+      "Number of RaBitQ-ranked neighbor lists speculatively prefetched per exact GPU batch.")(
+      "rabitq-prefetch-min-samples",
+      po::value<u32>(&rabitq_prefetch_min_samples)->default_value(rabitq_prefetch_min_samples),
+      "Predictions observed before applying the per-query prefetch stop-loss.")(
+      "rabitq-prefetch-min-hit-ratio",
+      po::value<f64>(&rabitq_prefetch_min_hit_ratio)->default_value(rabitq_prefetch_min_hit_ratio),
+      "Disable speculative prefetch for a query when its hit ratio falls below this value.")(
       "rabitq-warmup-exact-expansions",
       po::value<u32>(&rabitq_warmup_exact_expansions)->default_value(rabitq_warmup_exact_expansions),
       "Exactify all candidates for this many initial RaBitQ graph expansions.")(
@@ -293,13 +305,19 @@ private:
       exit_with_help_message(argv);
     }
     if (use_rabitq && rabitq_mode != "exact_safe" &&
+        rabitq_mode != "speculative_prefetch" &&
         rabitq_mode != "gpu_coalesced" && rabitq_mode != "cpu_gate") {
-      std::cerr << "[ERROR]: --rabitq-mode must be exact_safe, gpu_coalesced, or cpu_gate" << std::endl;
+      std::cerr << "[ERROR]: --rabitq-mode must be exact_safe, speculative_prefetch, "
+                   "gpu_coalesced, or cpu_gate" << std::endl;
       exit_with_help_message(argv);
     }
     if (rabitq_gate_width == 0 || rabitq_gate_max_width < rabitq_gate_width ||
         rabitq_gate_margin < 0.0 || rabitq_cache_max_ratio <= 0.0 ||
-        rabitq_coalesce_min == 0 || rabitq_coalesce_target < rabitq_coalesce_min) {
+        rabitq_coalesce_min == 0 || rabitq_coalesce_target < rabitq_coalesce_min ||
+        (rabitq_mode == "speculative_prefetch" &&
+         (rabitq_prefetch_width == 0 || rabitq_prefetch_min_samples == 0 ||
+          rabitq_prefetch_width > 8 ||
+          rabitq_prefetch_min_hit_ratio < 0.0 || rabitq_prefetch_min_hit_ratio > 1.0))) {
       std::cerr << "[ERROR]: invalid RaBitQ gate configuration" << std::endl;
       exit_with_help_message(argv);
     }
@@ -472,6 +490,11 @@ public:
       os << std::setw(width) << "RaBitQ coalesce target: " << config.rabitq_coalesce_target << std::endl;
       os << std::setw(width) << "RaBitQ coalesce min: " << config.rabitq_coalesce_min << std::endl;
       os << std::setw(width) << "RaBitQ coalesce wait(us): " << config.rabitq_coalesce_wait_us << std::endl;
+      os << std::setw(width) << "RaBitQ prefetch width: " << config.rabitq_prefetch_width << std::endl;
+      os << std::setw(width) << "RaBitQ prefetch min samples: "
+         << config.rabitq_prefetch_min_samples << std::endl;
+      os << std::setw(width) << "RaBitQ prefetch min hit ratio: "
+         << config.rabitq_prefetch_min_hit_ratio << std::endl;
       os << std::setw(width) << "RaBitQ warmup exact expansions: "
          << config.rabitq_warmup_exact_expansions << std::endl;
       os << std::setw(width) << "RaBitQ audit period: " << config.rabitq_audit_period << std::endl;

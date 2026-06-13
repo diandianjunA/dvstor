@@ -116,6 +116,16 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"rabitq_safe_skip_vector_bytes",
      aggregate.counters.rabitq_safe_skips * VamanaNode::vector_bytes()},
     {"rabitq_exact_fallbacks", aggregate.counters.rabitq_exact_fallbacks},
+    {"rabitq_prefetch_issued", aggregate.counters.rabitq_prefetch_issued},
+    {"rabitq_prefetch_hits", aggregate.counters.rabitq_prefetch_hits},
+    {"rabitq_prefetch_misses", aggregate.counters.rabitq_prefetch_misses},
+    {"rabitq_prefetch_disabled_queries",
+     aggregate.counters.rabitq_prefetch_disabled_queries},
+    {"rabitq_prefetch_hit_ratio",
+     aggregate.counters.rabitq_prefetch_issued == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.rabitq_prefetch_hits) /
+           static_cast<double>(aggregate.counters.rabitq_prefetch_issued)},
     {"rabitq_local_scores", aggregate.counters.rabitq_l0_candidates},
     {"rabitq_gate_passes", aggregate.counters.rabitq_l1_candidates},
     {"rabitq_exact_vector_reads", aggregate.counters.rabitq_l2_candidates},

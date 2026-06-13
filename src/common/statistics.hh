@@ -216,6 +216,10 @@ struct ThreadStatistics {
   size_t query_rabitq_audit_candidates{0};
   size_t query_rabitq_safe_skips{0};
   size_t query_rabitq_exact_fallbacks{0};
+  size_t query_rabitq_prefetch_issued{0};
+  size_t query_rabitq_prefetch_hits{0};
+  size_t query_rabitq_prefetch_misses{0};
+  size_t query_rabitq_prefetch_disabled_queries{0};
   size_t build_l2_kernels{0};
   size_t build_prune_kernels{0};
   size_t build_overflow_prunes{0};

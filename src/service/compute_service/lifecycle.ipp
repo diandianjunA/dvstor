@@ -113,6 +113,11 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                               config_.rabitq_strict_recall);
   vamana_->set_rabitq_exact_safe(config_.rabitq_mode == "exact_safe",
                                  static_cast<f32>(config_.rabitq_safe_epsilon));
+  vamana_->set_rabitq_speculative_prefetch(
+    config_.rabitq_mode == "speculative_prefetch",
+    config_.rabitq_prefetch_width,
+    config_.rabitq_prefetch_min_samples,
+    static_cast<f32>(config_.rabitq_prefetch_min_hit_ratio));
   vamana_->set_use_rabitq(config_.use_rabitq);
   if (vamana_->use_rabitq() && config_.load_index) {
     const filepath_t startup_prefix = config_.resolved_index_prefix();
@@ -130,14 +135,15 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                  config_.rabitq_cache_max_ratio,
                "RaBitQ gate sidecar exceeds --rabitq-cache-max-ratio");
     vamana_->set_rabitq_cache(rabitq_cache_.get());
-    print_status("RaBitQ RFQ5 exact-safe cache: static " +
+    print_status("RaBitQ RFQ5 cache: static " +
                  std::to_string(rabitq_cache_->size_bytes()) + " bytes, dynamic " +
-                 std::to_string(rabitq_cache_->dynamic_size_bytes()) + " bytes, decode " +
+                 std::to_string(rabitq_cache_->dynamic_size_bytes()) + " bytes, overrides " +
+                 std::to_string(rabitq_cache_->override_bitmap_bytes()) + " bytes, decode " +
                  std::to_string(rabitq_cache_->decode_table_bytes()) + " bytes, NUMA " +
                  (rabitq_cache_->numa_interleaved() ? "interleaved" : "local"));
   }
   print_status(vamana_->use_rabitq()
-    ? "search: RFQ5 RaBitQ exact-safe filter + GPUDirect exact beam"
+    ? "search: RFQ5 RaBitQ " + config_.rabitq_mode + " + GPUDirect exact beam"
     : "search: exact");
 
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,
