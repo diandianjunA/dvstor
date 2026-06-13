@@ -16,11 +16,17 @@ struct ThreadCounterDelta {
   u64 vector_rdma_bytes{};
   u64 neighbor_rdma_read_ops{};
   u64 vector_rdma_read_ops{};
+  u64 vector_rdma_batch_calls{};
+  u64 vector_rdma_cqes{};
   u64 h2d_bytes{};
   u64 d2h_bytes{};
   u64 l2_kernels{};
   u64 prune_kernels{};
   u64 exact_reranks{};
+  u64 rabitq_l0_candidates{};
+  u64 rabitq_cache_misses{};
+  u64 rabitq_l1_candidates{};
+  u64 rabitq_l2_candidates{};
   u64 visited_nodes{};
   u64 visited_neighborlists{};
   u64 remote_allocations{};
@@ -51,9 +57,16 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
     out.vector_rdma_bytes = end.query_vector_rdma_reads_in_bytes - start.query_vector_rdma_reads_in_bytes;
     out.neighbor_rdma_read_ops = end.query_neighbor_rdma_read_ops - start.query_neighbor_rdma_read_ops;
     out.vector_rdma_read_ops = end.query_vector_rdma_read_ops - start.query_vector_rdma_read_ops;
+    out.vector_rdma_batch_calls =
+      end.query_vector_rdma_batch_calls - start.query_vector_rdma_batch_calls;
+    out.vector_rdma_cqes = end.query_vector_rdma_cqes - start.query_vector_rdma_cqes;
     out.h2d_bytes = end.query_h2d_bytes - start.query_h2d_bytes;
     out.d2h_bytes = end.query_d2h_bytes - start.query_d2h_bytes;
     out.exact_reranks = end.query_exact_reranks - start.query_exact_reranks;
+    out.rabitq_l0_candidates = end.query_rabitq_l0_candidates - start.query_rabitq_l0_candidates;
+    out.rabitq_cache_misses = end.query_rabitq_cache_misses - start.query_rabitq_cache_misses;
+    out.rabitq_l1_candidates = end.query_rabitq_l1_candidates - start.query_rabitq_l1_candidates;
+    out.rabitq_l2_candidates = end.query_rabitq_l2_candidates - start.query_rabitq_l2_candidates;
     out.visited_nodes =
       (end.visited_nodes - start.visited_nodes) + (end.visited_nodes_l0 - start.visited_nodes_l0);
     out.visited_neighborlists = end.visited_neighborlists - start.visited_neighborlists;

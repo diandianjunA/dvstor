@@ -2,6 +2,7 @@ template <class Distance>
 bool ComputeService<Distance>::load_index(const std::string& path, str* error_message) {
   pause_workers();
   pause_rpc();
+  VamanaNode::set_storage_format(vamana::StorageFormat::aos_v1);
   const auto results = send_index_command(mn_command::LOAD, path);
 
   for (const auto& result : results) {
@@ -19,6 +20,13 @@ bool ComputeService<Distance>::load_index(const std::string& path, str* error_me
     resume_rpc();
     resume_workers();
     return false;
+  }
+  if (!config_.use_storage_owner_insert()) {
+    service::index_metadata::Metadata metadata;
+    str metadata_error;
+    if (service::index_metadata::load_metadata(filepath_t{path}, metadata, &metadata_error)) {
+      (void)initialize_compute_side_idmap(filepath_t{path}, metadata);
+    }
   }
 
   if (routing_enabled()) {
@@ -59,6 +67,130 @@ typename ComputeService<Distance>::Status ComputeService<Distance>::status() con
     .dimension = config_.dim,
     .threads = config_.num_threads,
   };
+}
+
+template <class Distance>
+bool ComputeService<Distance>::initialize_compute_side_idmap(
+    const filepath_t& index_prefix,
+    const service::index_metadata::Metadata& metadata) {
+  const auto clear_idmap = [this]() {
+    std::lock_guard<std::mutex> lock(compute_side_idmap_mutex_);
+    compute_side_idmap_.clear();
+  };
+  if (metadata.idmap_format != "owner_sharded_v1") {
+    clear_idmap();
+    return false;
+  }
+  if (index_prefix.empty()) {
+    clear_idmap();
+    return false;
+  }
+  hashmap_t<node_t, ComputeSideIdEntry> loaded;
+  for (u32 owner = 0; owner < num_servers_; ++owner) {
+    const filepath_t path = index_path::owner_idmap_file(index_prefix, owner + 1, num_servers_);
+    std::ifstream input(path, std::ios::binary);
+    if (!input.good()) {
+      std::cerr << "[compute-side] missing idmap sidecar, upsert/delete for base ids disabled: "
+                << path << std::endl;
+      clear_idmap();
+      return false;
+    }
+    vamana::idmap::Header header;
+    input.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (!input.good() ||
+        header.magic != vamana::idmap::kMagic ||
+        header.version != vamana::idmap::kVersion ||
+        header.owner_shard != owner ||
+        header.shard_count != num_servers_) {
+      std::cerr << "[compute-side] invalid idmap sidecar: " << path << std::endl;
+      clear_idmap();
+      return false;
+    }
+    for (u64 i = 0; i < header.entry_count; ++i) {
+      vamana::idmap::Entry entry;
+      input.read(reinterpret_cast<char*>(&entry), sizeof(entry));
+      if (!input.good()) {
+        clear_idmap();
+        return false;
+      }
+      loaded[entry.id] = ComputeSideIdEntry{
+        RemotePtr{entry.rptr_raw},
+        (entry.flags & vamana::idmap::kDeleted) != 0};
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(compute_side_idmap_mutex_);
+    compute_side_idmap_ = std::move(loaded);
+  }
+  std::cerr << "[compute-side] loaded runtime idmap entries=" << compute_side_idmap_.size() << std::endl;
+  return true;
+}
+
+template <class Distance>
+bool ComputeService<Distance>::mark_remote_deleted(RemotePtr ptr) {
+  if (ptr.is_null() || ptr.memory_node() >= num_servers_) {
+    return false;
+  }
+  u64 header = 0;
+  LocalMemoryRegion read_region{context_, &header, sizeof(header)};
+  auto& qp = *cm_.server_qps[ptr.memory_node()];
+  const auto header_addr = vamana::StorageLayoutResolver::header(ptr);
+  qp.post_send(read_region,
+               static_cast<u32>(sizeof(header)),
+               IBV_WR_RDMA_READ,
+               true,
+               remote_access_tokens_[ptr.memory_node()].get(),
+               header_addr.offset,
+               0);
+  context_.poll_send_cq_until_completion();
+  header |= static_cast<u64>(VamanaNode::HEADER_DELETED);
+  qp.post_send_inlined(&header,
+                       static_cast<u32>(sizeof(header)),
+                       IBV_WR_RDMA_WRITE,
+                       true,
+                       remote_access_tokens_[ptr.memory_node()].get(),
+                       header_addr.offset,
+                       0);
+  context_.poll_send_cq_until_completion();
+  if (VamanaNode::hot_graph_entry_available(ptr)) {
+    vec<byte_t> hot_entry(VamanaNode::hot_graph_entry_size(), 0);
+    VamanaNode::encode_hot_graph_entry(
+      hot_entry.data(), 0, 0, nullptr, 0,
+      VamanaNode::HOT_GRAPH_SHARD_BITS, 0,
+      VamanaNode::HOT_GRAPH_FORMAT_VERSION, true);
+    LocalMemoryRegion hot_region{context_, hot_entry.data(), hot_entry.size()};
+    qp.post_send(hot_region,
+                 static_cast<u32>(hot_entry.size()),
+                 IBV_WR_RDMA_WRITE,
+                 true,
+                 remote_access_tokens_[ptr.memory_node()].get(),
+                 VamanaNode::hot_graph_entry_offset(ptr),
+                 0);
+    context_.poll_send_cq_until_completion();
+  }
+  return true;
+}
+
+template <class Distance>
+void ComputeService<Distance>::publish_compute_side_id(node_t id, RemotePtr ptr, bool deleted) {
+  std::lock_guard<std::mutex> lock(compute_side_idmap_mutex_);
+  compute_side_idmap_[id] = ComputeSideIdEntry{ptr, deleted};
+}
+
+template <class Distance>
+bool ComputeService<Distance>::lookup_compute_side_id(node_t id, RemotePtr* ptr, bool* deleted) const {
+  std::lock_guard<std::mutex> lock(compute_side_idmap_mutex_);
+  const auto it = compute_side_idmap_.find(id);
+  if (it == compute_side_idmap_.end()) {
+    return false;
+  }
+  if (ptr != nullptr) {
+    *ptr = it->second.ptr;
+  }
+  if (deleted != nullptr) {
+    *deleted = it->second.deleted;
+  }
+  return true;
 }
 
 template <class Distance>
@@ -250,6 +382,8 @@ bool ComputeService<Distance>::validate_index_metadata(const filepath_t& index_p
   const filepath_t meta_file = filepath_t(index_prefix.string() + ".meta.json");
   if (index_prefix.empty() || !std::filesystem::exists(meta_file)) {
     VamanaNode::disable_rabitq();
+    VamanaNode::disable_hot_graph();
+    VamanaNode::set_storage_format(vamana::StorageFormat::aos_v1);
     VamanaNode::init_static_storage(config_.dim, config_.R, config_.resolved_vector_dtype());
     if (config_.use_rabitq) VamanaNode::enable_rabitq();
     return true;
@@ -269,17 +403,19 @@ bool ComputeService<Distance>::validate_index_metadata(const filepath_t& index_p
   }
 
   VamanaNode::disable_rabitq();
+  VamanaNode::disable_hot_graph();
+  const auto storage_format = vamana::parse_storage_format(metadata.storage_format);
+  if (!storage_format || metadata.schema_version != 13) {
+    if (error_message) {
+      *error_message = "index storage format is obsolete; rebuild the index with the current offline builder";
+    }
+    return false;
+  }
+  VamanaNode::set_storage_format(*storage_format);
   VamanaNode::init_static_storage(config_.dim, config_.R, metadata.vector_dtype);
   if (config_.use_rabitq && metadata.node_layout != "rabitq") {
     if (error_message) {
       *error_message = "--use-rabitq requires an index built with --use-rabitq";
-    }
-    return false;
-  }
-  if (metadata.schema_version < 7 ||
-      metadata.storage_format != VamanaNode::storage_format_name()) {
-    if (error_message) {
-      *error_message = "index storage format is obsolete; rebuild the index with the current offline builder";
     }
     return false;
   }
@@ -293,7 +429,9 @@ bool ComputeService<Distance>::validate_index_metadata(const filepath_t& index_p
     VamanaNode::enable_rabitq();
     VamanaNode::set_rabitq_centroid(metadata.rabitq_centroid);
     if (metadata.rabitq_code_bits != VamanaNode::rabitq_code_bits() ||
-        metadata.rabitq_entry_size != VamanaNode::rabitq_entry_size()) {
+        metadata.rabitq_entry_size != VamanaNode::rabitq_entry_size() ||
+        metadata.rabitq_cache_bits != vamana::rabitq::kCacheBits ||
+        metadata.rabitq_cache_entry_size != vamana::rabitq::kCacheEntryBytes) {
       if (error_message) {
         *error_message = "RaBitQ index code layout does not match the runtime dimension";
       }
@@ -316,6 +454,40 @@ bool ComputeService<Distance>::validate_index_metadata(const filepath_t& index_p
       *error_message = "index metadata does not match runtime Vamana configuration";
     }
     return false;
+  }
+  if (*storage_format == vamana::StorageFormat::compact_v1) {
+    if (metadata.hot_graph_pointer_bytes != vamana::hot_graph::kCompactPointerBytes ||
+        metadata.hot_graph_entry_size != VamanaNode::hot_graph_entry_size() ||
+        metadata.hot_graph_offsets.size() != num_servers_ ||
+        metadata.hot_graph_entry_counts.size() != num_servers_) {
+      if (error_message) {
+        *error_message = "index hot graph metadata does not match runtime Vamana configuration";
+      }
+      return false;
+    }
+    if (metadata.hot_graph_dynamic_base_offsets.size() != num_servers_ ||
+         metadata.hot_graph_dynamic_record_bytes <
+           metadata.hot_graph_dynamic_hot_offset + metadata.hot_graph_entry_size ||
+         metadata.hot_graph_dynamic_hot_offset < VamanaNode::total_size()) {
+      if (error_message) {
+        *error_message = "index dynamic hot graph metadata does not match runtime Vamana configuration";
+      }
+      return false;
+    }
+    VamanaNode::configure_hot_graph(metadata.hot_graph_offsets,
+                                    metadata.hot_graph_entry_counts,
+                                    metadata.hot_graph_entry_size,
+                                    metadata.hot_graph_shard_bits,
+                                    2u,
+                                    metadata.hot_graph_dynamic_base_offsets,
+                                    metadata.hot_graph_dynamic_record_bytes,
+                                    metadata.hot_graph_dynamic_hot_offset);
+    if (!VamanaNode::HAS_HOT_GRAPH) {
+      if (error_message) {
+        *error_message = "failed to enable compact hot graph";
+      }
+      return false;
+    }
   }
   if (metadata.beam_width_construction != 0 &&
       metadata.beam_width_construction != config_.beam_width_construction) {

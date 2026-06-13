@@ -2,7 +2,12 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+
+#include "common/index_path.hh"
+#include "vamana/idmap.hh"
+#include "vamana/storage_layout_resolver.hh"
 
 namespace {
 
@@ -23,8 +28,17 @@ using service::storage_owner::handoff_request_visited;
 using service::storage_owner::handoff_response_beam;
 using service::storage_owner::handoff_response_visited;
 
+constexpr size_t kSnapshotPrefixBytes =
+  VamanaNode::HEADER_SIZE + VamanaNode::COMPACT_META_SIZE;
+
+size_t snapshot_buffer_bytes() {
+  return VamanaNode::compact_storage()
+    ? VamanaNode::size_until_vector_end()
+    : kSnapshotPrefixBytes + VamanaNode::vector_bytes();
+}
+
 size_t aligned_snapshot_bytes() {
-  size_t value = VamanaNode::vector_bytes();
+  size_t value = snapshot_buffer_bytes();
   while (value % CACHELINE_SIZE != 0) {
     ++value;
   }
@@ -49,11 +63,18 @@ u32 storage_owner_prune_candidate_limit(const Configuration& config) {
   return std::max(config.R, config.storage_owner_prune_max_candidates);
 }
 
-void parse_vector_snapshot(RemotePtr rptr, const byte_t* ptr, NodeSnapshot& snapshot) {
+void parse_remote_snapshot(RemotePtr rptr, const byte_t* ptr, NodeSnapshot& snapshot) {
   snapshot = NodeSnapshot{};
   snapshot.rptr = rptr;
+  snapshot.header = *reinterpret_cast<const u64*>(ptr);
+  snapshot.id = *reinterpret_cast<const u32*>(ptr + VamanaNode::offset_id());
+  snapshot.generation = VamanaNode::compact_storage()
+    ? *reinterpret_cast<const u32*>(ptr + VamanaNode::offset_generation()) : 0;
+  snapshot.deleted = (snapshot.header & VamanaNode::HEADER_DELETED) != 0;
   snapshot.vector_data.resize(VamanaNode::vector_bytes());
-  std::memcpy(snapshot.vector_data.data(), ptr, VamanaNode::vector_bytes());
+  const size_t vector_offset = VamanaNode::compact_storage()
+    ? VamanaNode::offset_vector() : kSnapshotPrefixBytes;
+  std::memcpy(snapshot.vector_data.data(), ptr + vector_offset, VamanaNode::vector_bytes());
 }
 
 struct HandoffTargetShard {
@@ -213,7 +234,7 @@ bool merge_search_handoff_response(vec<BeamEntry>& beam,
 }  // namespace
 
 RemotePtr MemoryNode::allocate_local_node() {
-  size_t node_size = VamanaNode::total_size();
+  size_t node_size = VamanaNode::allocation_size();
   while (node_size % 8 != 0) {
     node_size += 4;
   }
@@ -223,6 +244,108 @@ RemotePtr MemoryNode::allocate_local_node() {
   const u64 offset = alloc_ref.fetch_add(node_size, std::memory_order_acq_rel);
   lib_assert(offset + node_size <= mn_memory_bytes_, "storage node out of memory");
   return RemotePtr{storage_id_, offset};
+}
+
+bool MemoryNode::load_owner_idmap(const filepath_t& index_prefix) {
+  idmap_.clear();
+  mutations_inflight_.clear();
+  if (index_prefix.empty()) {
+    return true;
+  }
+  const filepath_t path = index_path::owner_idmap_file(index_prefix, storage_id_ + 1, num_storage_nodes_);
+  std::ifstream input(path, std::ios::binary);
+  if (!input.good()) {
+    std::cerr << "[storage-owner] missing idmap sidecar: " << path << std::endl;
+    return false;
+  }
+  vamana::idmap::Header header;
+  input.read(reinterpret_cast<char*>(&header), sizeof(header));
+  if (!input.good() || header.magic != vamana::idmap::kMagic ||
+      header.version != vamana::idmap::kVersion ||
+      header.owner_shard != storage_id_ ||
+      header.shard_count != num_storage_nodes_) {
+    std::cerr << "[storage-owner] invalid idmap sidecar: " << path << std::endl;
+    return false;
+  }
+  idmap_.reserve(static_cast<size_t>(header.entry_count));
+  for (u64 i = 0; i < header.entry_count; ++i) {
+    vamana::idmap::Entry entry;
+    input.read(reinterpret_cast<char*>(&entry), sizeof(entry));
+    if (!input.good()) return false;
+    idmap_[entry.id] = FreshnessEntry{
+      RemotePtr{entry.rptr_raw},
+      entry.generation,
+      (entry.flags & vamana::idmap::kDeleted) != 0};
+  }
+  return true;
+}
+
+void MemoryNode::publish_mutation(node_t id, RemotePtr ptr, u32 generation, bool deleted) {
+  std::lock_guard<std::mutex> lock(idmap_mutex_);
+  idmap_[id] = FreshnessEntry{ptr, generation, deleted};
+  mutations_inflight_.erase(id);
+}
+
+service::storage_owner::MutationStatus MemoryNode::prepare_mutation(
+    node_t id,
+    service::storage_owner::MutationKind kind,
+    FreshnessEntry* old_entry,
+    u32* new_generation) {
+  std::lock_guard<std::mutex> lock(idmap_mutex_);
+  if (mutations_inflight_.contains(id)) {
+    return service::storage_owner::MutationStatus::failed;
+  }
+  auto it = idmap_.find(id);
+  const bool exists = it != idmap_.end();
+  const bool live = exists && !it->second.deleted;
+  if (old_entry != nullptr) {
+    *old_entry = exists ? it->second : FreshnessEntry{};
+  }
+  const u32 previous_generation = exists ? it->second.generation : 0;
+  if (new_generation != nullptr) {
+    *new_generation = previous_generation + 1;
+  }
+  if (kind == service::storage_owner::MutationKind::insert && live) {
+    return service::storage_owner::MutationStatus::already_exists;
+  }
+  if (kind == service::storage_owner::MutationKind::erase) {
+    if (!exists) return service::storage_owner::MutationStatus::not_found;
+    if (!live) return service::storage_owner::MutationStatus::already_deleted;
+  }
+  mutations_inflight_.insert(id);
+  return service::storage_owner::MutationStatus::ok;
+}
+
+bool MemoryNode::mark_node_deleted(RemotePtr rptr, u32 generation) {
+  if (rptr.is_null()) return true;
+  const auto header_addr = vamana::StorageLayoutResolver::header(rptr);
+  const bool remote = !local_shard(rptr.memory_node());
+  if (local_shard(rptr.memory_node())) {
+    auto* header_ptr = reinterpret_cast<u64*>(index_buffer_.get_full_buffer() + header_addr.offset);
+    std::atomic_ref<u64> ref(*header_ptr);
+    ref.fetch_or(static_cast<u64>(VamanaNode::HEADER_DELETED), std::memory_order_acq_rel);
+  } else {
+    lock_node(rptr);
+    u64 header = 0;
+    remote_read_bytes(rptr.memory_node(), header_addr.offset, &header, sizeof(header), 0);
+    header |= static_cast<u64>(VamanaNode::HEADER_DELETED);
+    remote_write_bytes(rptr.memory_node(), header_addr.offset, &header, sizeof(header), 0);
+  }
+  if (VamanaNode::compact_storage()) {
+    vec<byte_t> entry(VamanaNode::hot_graph_entry_size(), 0);
+    VamanaNode::encode_hot_graph_entry(entry.data(), 0, 0, nullptr, 0,
+      VamanaNode::HOT_GRAPH_SHARD_BITS, generation, 2, true);
+    const u64 hot_offset = VamanaNode::hot_graph_entry_offset(rptr);
+    if (local_shard(rptr.memory_node())) {
+      std::memcpy(index_buffer_.get_full_buffer() + hot_offset, entry.data(), entry.size());
+    } else {
+      remote_write_bytes(rptr.memory_node(), hot_offset, entry.data(), entry.size(), 0);
+    }
+  }
+  if (remote) {
+    unlock_node(rptr);
+  }
+  return true;
 }
 
 RemotePtr MemoryNode::read_global_medoid() {
@@ -286,10 +409,11 @@ bool MemoryNode::try_set_global_medoid(const RemotePtr& expected, const RemotePt
 bool MemoryNode::read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
   lib_assert(rptr.memory_node() < num_storage_nodes_,
              "invalid remote shard id in read_node_snapshot: " + std::to_string(rptr.memory_node()));
-  lib_assert(rptr.byte_offset() + VamanaNode::offset_vector() + VamanaNode::vector_bytes() <= mn_memory_bytes_,
+  const auto vector_addr = vamana::StorageLayoutResolver::vector(rptr);
+  lib_assert(vector_addr.offset + vector_addr.size <= mn_memory_bytes_,
              "node snapshot read exceeds shard bounds: shard=" + std::to_string(rptr.memory_node()) +
                " offset=" + std::to_string(rptr.byte_offset()) +
-               " size=" + std::to_string(VamanaNode::vector_bytes()) +
+               " size=" + std::to_string(vector_addr.size) +
                " capacity=" + std::to_string(mn_memory_bytes_));
   snapshot = NodeSnapshot{};
   snapshot.rptr = rptr;
@@ -297,11 +421,16 @@ bool MemoryNode::read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
 
   const size_t read_size = VamanaNode::vector_bytes();
   if (local_shard(rptr.memory_node())) {
-    const byte_t* ptr = local_node_ptr(rptr);
+    const byte_t* base = index_buffer_.get_full_buffer();
+    const byte_t* ptr = base + rptr.byte_offset();
     snapshot.header = *reinterpret_cast<const u64*>(ptr);
     snapshot.id = *reinterpret_cast<const u32*>(ptr + VamanaNode::offset_id());
-    snapshot.edge_count = *reinterpret_cast<const u8*>(ptr + VamanaNode::offset_edge_count());
-    std::memcpy(snapshot.vector_data.data(), ptr + VamanaNode::offset_vector(), VamanaNode::vector_bytes());
+    snapshot.generation = VamanaNode::compact_storage()
+      ? *reinterpret_cast<const u32*>(ptr + VamanaNode::offset_generation()) : 0;
+    snapshot.edge_count = VamanaNode::compact_storage()
+      ? 0 : *reinterpret_cast<const u8*>(ptr + VamanaNode::offset_edge_count());
+    snapshot.deleted = (snapshot.header & VamanaNode::HEADER_DELETED) != 0;
+    std::memcpy(snapshot.vector_data.data(), base + vector_addr.offset, VamanaNode::vector_bytes());
     return true;
   }
 
@@ -309,22 +438,33 @@ bool MemoryNode::read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
   byte_t* read_buffer = owner_thread != nullptr && owner_thread->has_peer_scratch()
                           ? owner_thread->scratch_buffer.get_full_buffer()
                           : peer_scratch_buffer_.get_full_buffer();
+  byte_t prefix[VamanaNode::HEADER_SIZE + VamanaNode::COMPACT_META_SIZE]{};
+  remote_read_bytes(rptr.memory_node(), rptr.byte_offset(), prefix, sizeof(prefix), 0);
   remote_read_bytes(rptr.memory_node(),
-                    rptr.byte_offset() + VamanaNode::offset_vector(),
+                    vector_addr.offset,
                     read_buffer,
                     read_size,
                     0);
-  parse_vector_snapshot(rptr, read_buffer, snapshot);
+  snapshot.vector_data.resize(VamanaNode::vector_bytes());
+  std::memcpy(snapshot.vector_data.data(), read_buffer, VamanaNode::vector_bytes());
+  snapshot.header = *reinterpret_cast<const u64*>(prefix);
+  snapshot.id = *reinterpret_cast<const u32*>(prefix + VamanaNode::offset_id());
+  snapshot.generation = VamanaNode::compact_storage()
+    ? *reinterpret_cast<const u32*>(prefix + VamanaNode::offset_generation()) : 0;
+  snapshot.edge_count = VamanaNode::compact_storage()
+    ? 0 : *reinterpret_cast<const u8*>(prefix + VamanaNode::offset_edge_count());
+  snapshot.deleted = (snapshot.header & VamanaNode::HEADER_DELETED) != 0;
   return true;
 }
 
-vec<RemotePtr> MemoryNode::read_neighbor_list(RemotePtr rptr) {
+vec<RemotePtr> MemoryNode::read_neighbor_list_aos(RemotePtr rptr) {
   lib_assert(rptr.memory_node() < num_storage_nodes_,
              "invalid remote shard id in read_neighbor_list: " + std::to_string(rptr.memory_node()));
-  lib_assert(rptr.byte_offset() + VamanaNode::offset_neighbors() + VamanaNode::NEIGHBORS_SIZE <= mn_memory_bytes_,
+  const auto neighbor_addr = vamana::StorageLayoutResolver::neighbor_slots(rptr);
+  lib_assert(neighbor_addr.offset + neighbor_addr.size <= mn_memory_bytes_,
              "neighbor-list read exceeds shard bounds: shard=" + std::to_string(rptr.memory_node()) +
                " offset=" + std::to_string(rptr.byte_offset()) +
-               " size=" + std::to_string(VamanaNode::offset_neighbors() + VamanaNode::NEIGHBORS_SIZE) +
+               " size=" + std::to_string(neighbor_addr.size) +
                " capacity=" + std::to_string(mn_memory_bytes_));
   vec<RemotePtr> neighbors;
   if (local_shard(rptr.memory_node())) {
@@ -345,12 +485,65 @@ vec<RemotePtr> MemoryNode::read_neighbor_list(RemotePtr rptr) {
                           ? owner_thread->scratch_buffer.get_full_buffer()
                           : peer_scratch_buffer_.get_full_buffer();
   remote_read_bytes(rptr.memory_node(),
-                    rptr.byte_offset() + VamanaNode::neighbor_read_offset(),
+                    vamana::StorageLayoutResolver::neighbor_read(rptr).address.offset,
                     read_buffer,
                     VamanaNode::neighbor_read_size(),
                     0);
   const u8 edge_count = *reinterpret_cast<const u8*>(read_buffer + VamanaNode::neighbor_count_offset_in_read());
   const auto* slots = reinterpret_cast<const RemotePtr*>(read_buffer + VamanaNode::neighbor_payload_offset_in_read());
+  neighbors.reserve(edge_count);
+  for (u32 i = 0; i < edge_count && i < VamanaNode::R; ++i) {
+    if (!slots[i].is_null()) {
+      neighbors.push_back(slots[i]);
+    }
+  }
+  return neighbors;
+}
+
+vec<RemotePtr> MemoryNode::read_neighbor_list(RemotePtr rptr) {
+  if (!VamanaNode::compact_storage()) {
+    return read_neighbor_list_aos(rptr);
+  }
+
+  vec<byte_t> local_entry;
+  StorageOwnerThread* owner_thread = current_storage_owner_thread_;
+  byte_t* read_buffer = nullptr;
+  if (local_shard(rptr.memory_node())) {
+    local_entry.resize(VamanaNode::hot_graph_entry_size());
+    read_buffer = local_entry.data();
+  } else {
+    read_buffer = owner_thread != nullptr && owner_thread->has_peer_scratch()
+                    ? owner_thread->scratch_buffer.get_full_buffer()
+                    : peer_scratch_buffer_.get_full_buffer();
+  }
+  vec<byte_t> decoded(VamanaNode::neighbor_read_size());
+  bool decoded_ok = false;
+  constexpr u32 kMaxReadAttempts = 3;
+  for (u32 attempt = 0; attempt < kMaxReadAttempts; ++attempt) {
+    if (local_shard(rptr.memory_node())) {
+      std::memcpy(read_buffer,
+                  index_buffer_.get_full_buffer() + VamanaNode::hot_graph_entry_offset(rptr),
+                  VamanaNode::hot_graph_entry_size());
+    } else {
+      remote_read_bytes(rptr.memory_node(),
+                        VamanaNode::hot_graph_entry_offset(rptr),
+                        read_buffer,
+                        VamanaNode::hot_graph_entry_size(),
+                        0);
+    }
+    decoded_ok = VamanaNode::decode_hot_graph_entry(read_buffer, decoded.data());
+    if (decoded_ok) {
+      break;
+    }
+    std::this_thread::yield();
+  }
+  if (!decoded_ok) {
+    return {};
+  }
+  const byte_t* parse_buffer = decoded.data();
+  const u8 edge_count = *reinterpret_cast<const u8*>(parse_buffer + VamanaNode::neighbor_count_offset_in_read());
+  const auto* slots = reinterpret_cast<const RemotePtr*>(parse_buffer + VamanaNode::neighbor_payload_offset_in_read());
+  vec<RemotePtr> neighbors;
   neighbors.reserve(edge_count);
   for (u32 i = 0; i < edge_count && i < VamanaNode::R; ++i) {
     if (!slots[i].is_null()) {
@@ -375,7 +568,7 @@ auto MemoryNode::async_read_node_snapshot(RemotePtr rptr, StorageOwnerThread& th
       if (ready) {
         return std::move(snapshot);
       }
-      parse_vector_snapshot(rptr, buffer, snapshot);
+      parse_remote_snapshot(rptr, buffer, snapshot);
       return std::move(snapshot);
     }
   };
@@ -387,11 +580,16 @@ auto MemoryNode::async_read_node_snapshot(RemotePtr rptr, StorageOwnerThread& th
   }
 
   byte_t* buffer = thread.coroutine_scratch();
-  post_peer_read_async(thread,
-                       rptr.memory_node(),
-                       rptr.byte_offset() + VamanaNode::offset_vector(),
-                       buffer,
-                       VamanaNode::vector_bytes());
+  if (VamanaNode::compact_storage()) {
+    post_peer_read_async(thread, rptr.memory_node(), rptr.byte_offset(), buffer,
+                         VamanaNode::size_until_vector_end());
+  } else {
+    post_peer_read_async(thread, rptr.memory_node(), rptr.byte_offset(), buffer,
+                         kSnapshotPrefixBytes);
+    post_peer_read_async(thread, rptr.memory_node(),
+                         vamana::StorageLayoutResolver::vector(rptr).offset,
+                         buffer + kSnapshotPrefixBytes, VamanaNode::vector_bytes());
+  }
   return Awaitable{false, rptr, buffer, {}, this, &thread};
 }
 
@@ -414,7 +612,7 @@ auto MemoryNode::async_read_node_snapshots(const vec<RemotePtr>& rptrs,
     vec<NodeSnapshot> await_resume() {
       for (const PendingRead& read : pending) {
         NodeSnapshot snapshot;
-        parse_vector_snapshot(read.rptr, read.buffer, snapshot);
+        parse_remote_snapshot(read.rptr, read.buffer, snapshot);
         snapshots.push_back(std::move(snapshot));
       }
       return std::move(snapshots);
@@ -426,7 +624,7 @@ auto MemoryNode::async_read_node_snapshots(const vec<RemotePtr>& rptrs,
   awaitable.pending.reserve(rptrs.size());
   awaitable.thread = &thread;
 
-  const size_t snapshot_size = VamanaNode::vector_bytes();
+  const size_t snapshot_size = snapshot_buffer_bytes();
   const size_t snapshot_stride = aligned_snapshot_bytes();
   const u32 max_batch = storage_owner_snapshot_batch_size(config);
   lib_assert(rptrs.size() <= max_batch, "storage-owner snapshot batch exceeds configured limit");
@@ -448,7 +646,16 @@ auto MemoryNode::async_read_node_snapshots(const vec<RemotePtr>& rptrs,
     lib_assert(scratch_offset + snapshot_size <= thread.scratch_stride,
                "storage-owner coroutine scratch stride is too small for snapshot batch");
     byte_t* buffer = thread.coroutine_scratch(scratch_offset);
-    post_peer_read_async(thread, rptr.memory_node(), rptr.byte_offset() + VamanaNode::offset_vector(), buffer, snapshot_size);
+    if (VamanaNode::compact_storage()) {
+      post_peer_read_async(thread, rptr.memory_node(), rptr.byte_offset(), buffer,
+                           VamanaNode::size_until_vector_end());
+    } else {
+      post_peer_read_async(thread, rptr.memory_node(), rptr.byte_offset(), buffer,
+                           kSnapshotPrefixBytes);
+      post_peer_read_async(thread, rptr.memory_node(),
+                           vamana::StorageLayoutResolver::vector(rptr).offset,
+                           buffer + kSnapshotPrefixBytes, VamanaNode::vector_bytes());
+    }
     awaitable.pending.push_back(PendingRead{rptr, buffer});
     awaitable.ready = false;
     ++remote_slot;
@@ -481,7 +688,7 @@ vec<MemoryNode::NodeSnapshot> MemoryNode::read_node_snapshots_batched(const vec<
     byte_t* buffer{};
   };
 
-  const size_t snapshot_size = VamanaNode::vector_bytes();
+  const size_t snapshot_size = snapshot_buffer_bytes();
   const size_t snapshot_stride = aligned_snapshot_bytes();
   const size_t max_batch = storage_owner_snapshot_batch_size(config);
 
@@ -508,7 +715,16 @@ vec<MemoryNode::NodeSnapshot> MemoryNode::read_node_snapshots_batched(const vec<
       lib_assert(scratch_offset + snapshot_size <= thread->scratch_stride,
                  "storage-owner coroutine scratch stride is too small for snapshot batch");
       byte_t* buffer = thread->coroutine_scratch(scratch_offset);
-      post_peer_read_async(*thread, rptr.memory_node(), rptr.byte_offset() + VamanaNode::offset_vector(), buffer, snapshot_size);
+      if (VamanaNode::compact_storage()) {
+        post_peer_read_async(*thread, rptr.memory_node(), rptr.byte_offset(), buffer,
+                             VamanaNode::size_until_vector_end());
+      } else {
+        post_peer_read_async(*thread, rptr.memory_node(), rptr.byte_offset(), buffer,
+                             kSnapshotPrefixBytes);
+        post_peer_read_async(*thread, rptr.memory_node(),
+                             vamana::StorageLayoutResolver::vector(rptr).offset,
+                             buffer + kSnapshotPrefixBytes, VamanaNode::vector_bytes());
+      }
       pending.push_back(PendingRead{rptr, buffer});
       ++remote_slot;
     }
@@ -520,7 +736,7 @@ vec<MemoryNode::NodeSnapshot> MemoryNode::read_node_snapshots_batched(const vec<
 
     for (const PendingRead& read : pending) {
       NodeSnapshot snapshot;
-      parse_vector_snapshot(read.rptr, read.buffer, snapshot);
+      parse_remote_snapshot(read.rptr, read.buffer, snapshot);
       snapshots.push_back(std::move(snapshot));
     }
   }
@@ -536,6 +752,7 @@ auto MemoryNode::async_read_neighbor_list(RemotePtr rptr, StorageOwnerThread& th
     vec<RemotePtr> neighbors;
     MemoryNode* node{};
     StorageOwnerThread* thread{};
+    bool hot_graph{};
 
     bool await_ready() const { return ready; }
     static void await_suspend(std::coroutine_handle<>) {}
@@ -543,10 +760,20 @@ auto MemoryNode::async_read_neighbor_list(RemotePtr rptr, StorageOwnerThread& th
       if (ready) {
         return std::move(neighbors);
       }
+      vec<byte_t> decoded;
+      const byte_t* parse_buffer = buffer;
+      if (hot_graph) {
+        decoded.resize(VamanaNode::neighbor_read_size());
+        const bool ok = VamanaNode::decode_hot_graph_entry(buffer, decoded.data());
+        if (!ok) {
+          return node->read_neighbor_list(rptr);
+        }
+        parse_buffer = decoded.data();
+      }
       const u8 edge_count = *reinterpret_cast<const u8*>(
-        buffer + VamanaNode::neighbor_count_offset_in_read());
+        parse_buffer + VamanaNode::neighbor_count_offset_in_read());
       const auto* slots = reinterpret_cast<const RemotePtr*>(
-        buffer + VamanaNode::neighbor_payload_offset_in_read());
+        parse_buffer + VamanaNode::neighbor_payload_offset_in_read());
       neighbors.reserve(edge_count);
       for (u32 i = 0; i < edge_count && i < VamanaNode::R; ++i) {
         if (!slots[i].is_null()) {
@@ -559,29 +786,56 @@ auto MemoryNode::async_read_neighbor_list(RemotePtr rptr, StorageOwnerThread& th
 
   if (local_shard(rptr.memory_node())) {
     vec<RemotePtr> neighbors = read_neighbor_list(rptr);
-    return Awaitable{true, rptr, nullptr, std::move(neighbors), this, &thread};
+    return Awaitable{true, rptr, nullptr, std::move(neighbors), this, &thread, false};
   }
 
   byte_t* buffer = thread.coroutine_scratch();
+  const auto neighbor_read = vamana::StorageLayoutResolver::neighbor_read(rptr);
+  const bool use_hot_graph = neighbor_read.compact;
   post_peer_read_async(thread,
                        rptr.memory_node(),
-                       rptr.byte_offset() + VamanaNode::neighbor_read_offset(),
+                       neighbor_read.address.offset,
                        buffer,
-                       VamanaNode::neighbor_read_size());
-  return Awaitable{false, rptr, buffer, {}, this, &thread};
+                       neighbor_read.address.size);
+  return Awaitable{false, rptr, buffer, {}, this, &thread, use_hot_graph};
+}
+
+void MemoryNode::write_hot_graph_entry(RemotePtr rptr, u32 id, const vec<RemotePtr>& neighbors) {
+  if (!VamanaNode::hot_graph_entry_available(rptr)) {
+    return;
+  }
+  const size_t entry_size = VamanaNode::hot_graph_entry_size();
+  vec<byte_t> entry(entry_size, 0);
+  const u8 edge_count = static_cast<u8>(std::min<size_t>(neighbors.size(), VamanaNode::R));
+  VamanaNode::encode_hot_graph_entry(entry.data(), id, edge_count,
+                                     neighbors.data(), edge_count);
+  const u64 hot_offset = VamanaNode::hot_graph_entry_offset(rptr);
+  if (local_shard(rptr.memory_node())) {
+    lib_assert(hot_offset + entry_size <= mn_memory_bytes_,
+               "hot graph write exceeds shard bounds");
+    std::memcpy(index_buffer_.get_full_buffer() + hot_offset, entry.data(), entry_size);
+    return;
+  }
+  remote_write_bytes(rptr.memory_node(), hot_offset, entry.data(), entry_size, 0);
 }
 
 void MemoryNode::write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neighbors) {
   lib_assert(rptr.memory_node() < num_storage_nodes_,
              "invalid remote shard id in write_neighbor_list: " + std::to_string(rptr.memory_node()));
-  lib_assert(rptr.byte_offset() + VamanaNode::offset_neighbors() + VamanaNode::NEIGHBORS_SIZE <= mn_memory_bytes_,
+  const auto neighbor_addr = vamana::StorageLayoutResolver::neighbor_slots(rptr);
+  lib_assert(neighbor_addr.offset + neighbor_addr.size <= mn_memory_bytes_,
              "neighbor-list write exceeds shard bounds: shard=" + std::to_string(rptr.memory_node()) +
                " offset=" + std::to_string(rptr.byte_offset()) +
-               " size=" + std::to_string(VamanaNode::offset_neighbors() + VamanaNode::NEIGHBORS_SIZE) +
+               " size=" + std::to_string(neighbor_addr.size) +
                " capacity=" + std::to_string(mn_memory_bytes_));
   const u8 edge_count = static_cast<u8>(std::min<size_t>(neighbors.size(), VamanaNode::R));
+  if (VamanaNode::compact_storage()) {
+    write_hot_graph_entry(rptr, 0, neighbors);
+    return;
+  }
   if (local_shard(rptr.memory_node())) {
     byte_t* ptr = local_node_ptr(rptr);
+    const u32 id = *reinterpret_cast<const u32*>(ptr + VamanaNode::offset_id());
     *reinterpret_cast<u8*>(ptr + VamanaNode::offset_edge_count()) = edge_count;
     std::memset(ptr + VamanaNode::offset_edge_count() + sizeof(u8), 0, VamanaNode::PADDING_SIZE);
     auto* slots = reinterpret_cast<RemotePtr*>(ptr + VamanaNode::offset_neighbors());
@@ -591,6 +845,7 @@ void MemoryNode::write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neigh
     for (u32 i = edge_count; i < VamanaNode::R; ++i) {
       slots[i].reset();
     }
+    write_hot_graph_entry(rptr, id, neighbors);
     return;
   }
 
@@ -607,23 +862,33 @@ void MemoryNode::write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neigh
                      slots.data(),
                      VamanaNode::NEIGHBORS_SIZE,
                      align_up(sizeof(meta)));
+  write_hot_graph_entry(rptr, 0, neighbors);
 }
 
 void MemoryNode::write_new_node(RemotePtr rptr,
                     node_t id,
                     const span<const element_t> components,
-                    const vec<RemotePtr>& neighbors) {
+                    const vec<RemotePtr>& neighbors,
+                    u32 generation) {
   byte_t* ptr = local_node_ptr(rptr);
   std::memset(ptr, 0, VamanaNode::total_size());
   *reinterpret_cast<u64*>(ptr) = 0;
   *reinterpret_cast<u32*>(ptr + VamanaNode::offset_id()) = id;
-  *reinterpret_cast<u8*>(ptr + VamanaNode::offset_edge_count()) = static_cast<u8>(std::min<size_t>(neighbors.size(), VamanaNode::R));
+  if (VamanaNode::compact_storage()) {
+    *reinterpret_cast<u32*>(ptr + VamanaNode::offset_generation()) = generation;
+  } else {
+    *reinterpret_cast<u8*>(ptr + VamanaNode::offset_edge_count()) =
+      static_cast<u8>(std::min<size_t>(neighbors.size(), VamanaNode::R));
+  }
   encode_float_vector_to_storage(components.data(), VamanaNode::DIM, VamanaNode::vector_dtype(),
                                  ptr + VamanaNode::offset_vector());
-  auto* slots = reinterpret_cast<RemotePtr*>(ptr + VamanaNode::offset_neighbors());
-  for (u32 i = 0; i < neighbors.size() && i < VamanaNode::R; ++i) {
-    slots[i] = neighbors[i];
+  if (!VamanaNode::compact_storage()) {
+    auto* slots = reinterpret_cast<RemotePtr*>(ptr + VamanaNode::offset_neighbors());
+    for (u32 i = 0; i < neighbors.size() && i < VamanaNode::R; ++i) {
+      slots[i] = neighbors[i];
+    }
   }
+  write_hot_graph_entry(rptr, id, neighbors);
   if (VamanaNode::HAS_RABITQ_CODE) {
       VamanaNode::RabitqCode code;
       float norm = 0.0f;
@@ -638,7 +903,8 @@ void MemoryNode::write_new_node(RemotePtr rptr,
 
 void MemoryNode::lock_node(RemotePtr rptr) {
   if (local_shard(rptr.memory_node())) {
-    auto* header_ptr = reinterpret_cast<u64*>(local_node_ptr(rptr));
+    auto* header_ptr = reinterpret_cast<u64*>(
+      index_buffer_.get_full_buffer() + vamana::StorageLayoutResolver::header(rptr).offset);
     std::atomic_ref<u64> ref(*header_ptr);
     for (;;) {
       u64 header = ref.load(std::memory_order_acquire);
@@ -666,14 +932,18 @@ void MemoryNode::lock_node(RemotePtr rptr) {
 
 void MemoryNode::unlock_node(RemotePtr rptr) {
   if (local_shard(rptr.memory_node())) {
-    auto* header_ptr = reinterpret_cast<u64*>(local_node_ptr(rptr));
+    auto* header_ptr = reinterpret_cast<u64*>(
+      index_buffer_.get_full_buffer() + vamana::StorageLayoutResolver::header(rptr).offset);
     std::atomic_ref<u64> ref(*header_ptr);
     ref.fetch_and(~static_cast<u64>(VamanaNode::HEADER_NODE_LOCK), std::memory_order_acq_rel);
     return;
   }
 
   const byte_t unlock = 0;
-  remote_write_bytes(rptr.memory_node(), rptr.byte_offset() + VamanaNode::HEADER_UNTIL_LOCK, &unlock, 1, 0);
+  remote_write_bytes(rptr.memory_node(),
+                     vamana::StorageLayoutResolver::header(rptr).offset +
+                       VamanaNode::HEADER_UNTIL_LOCK,
+                     &unlock, 1, 0);
 }
 
 vec<RemotePtr> MemoryNode::beam_search_candidates(const span<const element_t> query,
@@ -766,6 +1036,9 @@ vec<RemotePtr> MemoryNode::beam_search_candidates(const span<const element_t> qu
         breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snapshot);
       }
       for (const NodeSnapshot& snapshot : snapshots) {
+        if (snapshot.deleted) {
+          continue;
+        }
         t_distance = std::chrono::steady_clock::now();
         const distance_t dist = distance_to_stored_vector(query, snapshot.vector_data.data(), config);
         if (breakdown != nullptr) {
@@ -900,6 +1173,9 @@ auto MemoryNode::beam_search_candidates_async(const span<const element_t> query,
         breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snapshot);
       }
       for (const NodeSnapshot& snapshot : snapshots) {
+        if (snapshot.deleted) {
+          continue;
+        }
         t_distance = std::chrono::steady_clock::now();
         const distance_t dist = distance_to_stored_vector(query, snapshot.vector_data.data(), config);
         if (breakdown != nullptr) {
@@ -987,6 +1263,9 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
       breakdown->storage_owner_prune_snapshot_read_ns += elapsed_ns_since(t_snapshot);
     }
     for (NodeSnapshot& snapshot : snapshots) {
+      if (snapshot.deleted) {
+        continue;
+      }
       auto t_distance = std::chrono::steady_clock::now();
       const distance_t dist = distance_between_vectors(source, source_dtype,
                                                        snapshot.vector_data.data(), VamanaNode::vector_dtype(), config);
@@ -1046,17 +1325,39 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
                                             const Configuration& config) -> StorageOwnerInsertCoroutine {
   const auto components = span<const element_t>{reinterpret_cast<const element_t*>(job.vector_data.data()),
                                                  VamanaNode::DIM};
+  FreshnessEntry old_entry{};
+  u32 generation = 0;
+  const auto status = prepare_mutation(job.id, job.kind, &old_entry, &generation);
+  if (status != service::storage_owner::MutationStatus::ok) {
+    job.status = status;
+    job.ok = false;
+    co_return;
+  }
+  if (job.kind == service::storage_owner::MutationKind::erase) {
+    job.ok = mark_node_deleted(old_entry.current, old_entry.generation);
+    job.status = job.ok ? service::storage_owner::MutationStatus::ok
+                        : service::storage_owner::MutationStatus::failed;
+    if (job.ok) {
+      publish_mutation(job.id, old_entry.current, old_entry.generation, true);
+    }
+    co_return;
+  }
   auto t_medoid = std::chrono::steady_clock::now();
   RemotePtr medoid_ptr = co_await async_read_global_medoid(thread);
   breakdown.storage_owner_medoid_ns += elapsed_ns_since(t_medoid);
   if (medoid_ptr.is_null()) {
     const RemotePtr new_ptr = allocate_local_node();
     auto t_write = std::chrono::steady_clock::now();
-    write_new_node(new_ptr, job.id, components, {});
+    write_new_node(new_ptr, job.id, components, {}, generation);
     breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
     RemotePtr observed;
     if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
       job.ok = true;
+      job.status = service::storage_owner::MutationStatus::ok;
+      if (job.kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
+        mark_node_deleted(old_entry.current, old_entry.generation);
+      }
+      publish_mutation(job.id, new_ptr, generation, false);
       co_return;
     }
     medoid_ptr = observed;
@@ -1098,8 +1399,12 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
   const RemotePtr new_ptr = allocate_local_node();
   auto t_write = std::chrono::steady_clock::now();
-  write_new_node(new_ptr, job.id, components, selected_neighbors);
+  write_new_node(new_ptr, job.id, components, selected_neighbors, generation);
   breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
+  if (job.kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
+    mark_node_deleted(old_entry.current, old_entry.generation);
+  }
+  publish_mutation(job.id, new_ptr, generation, false);
 
   for (const RemotePtr& neighbor_ptr : selected_neighbors) {
     if (local_shard(neighbor_ptr.memory_node())) {
@@ -1110,6 +1415,7 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
     }
   }
   job.ok = true;
+  job.status = service::storage_owner::MutationStatus::ok;
 }
 
 bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
@@ -1289,8 +1595,7 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
 // Check whether a RemotePtr points within the local shard bounds.
 // Returns false for garbage pointers that would crash read_node_snapshot / read_neighbor_list.
 inline bool ptr_in_bounds(RemotePtr rptr, u64 shard_cap) {
-  if (rptr.is_null()) return false;
-  return rptr.byte_offset() + VamanaNode::total_size() <= shard_cap;
+  return vamana::StorageLayoutResolver::ptr_in_bounds(rptr, shard_cap);
 }
 
 // Expand ALL unexpanded local nodes in the beam.
@@ -1366,6 +1671,9 @@ bool MemoryNode::expand_all_local_nodes(vec<BeamEntry>& beam,
         breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snap);
       }
       for (const NodeSnapshot& snapshot : snapshots) {
+        if (snapshot.deleted) {
+          continue;
+        }
         auto t_dist = std::chrono::steady_clock::now();
         const distance_t dist = distance_to_stored_vector(query, snapshot.vector_data.data(), config);
         if (breakdown != nullptr) {
@@ -1507,7 +1815,3 @@ auto MemoryNode::beam_search_candidates_transitive_async(
   }
   co_return;
 }
-
-
-
-

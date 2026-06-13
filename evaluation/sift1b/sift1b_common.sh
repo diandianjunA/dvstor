@@ -22,6 +22,7 @@ ALPHA="${ALPHA:-1.2}"
 K="${K:-10}"
 DIM="${DIM:-128}"
 VECTOR_DATA_TYPE="${VECTOR_DATA_TYPE:-uint8}"
+STORAGE_FORMAT="${STORAGE_FORMAT:-vamana_compact_v1}"
 BUILD_THREADS="${BUILD_THREADS:-32}"
 SERVICE_THREADS="${SERVICE_THREADS:-16}"
 COROUTINES="${COROUTINES:-4}"
@@ -38,7 +39,13 @@ estimate_node_bytes() {
     uint8|int8) component_size=1 ;;
     float32|auto) component_size=4 ;;
   esac
-  echo $((16 + DIM * component_size + R * 8))
+  if [[ "$STORAGE_FORMAT" == "vamana_compact_v1" ]]; then
+    local fixed_bytes=$((((16 + DIM * component_size + 15) / 16) * 16))
+    local graph_bytes=$((((8 + R * 5 + 7) / 8) * 8))
+    echo $((fixed_bytes + graph_bytes))
+  else
+    echo $((16 + DIM * component_size + R * 8))
+  fi
 }
 
 estimate_mn_memory_gb() {

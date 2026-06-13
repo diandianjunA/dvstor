@@ -24,8 +24,19 @@ bool nearly_equal(float lhs, float rhs, float tolerance) {
   return std::abs(lhs - rhs) <= tolerance * std::max(1.0f, std::max(std::abs(lhs), std::abs(rhs)));
 }
 
+bool cuda_device_available() {
+  static const bool available = [] {
+    int count = 0;
+    const cudaError_t status = cudaGetDeviceCount(&count);
+    return status == cudaSuccess && count > 0;
+  }();
+  return available;
+}
+
 bool check_layout_case(u32 dim, u32 R, VectorDType dtype, bool rabitq) {
   VamanaNode::disable_rabitq();
+  VamanaNode::disable_hot_graph();
+  VamanaNode::set_storage_format(vamana::StorageFormat::aos_v1);
   VamanaNode::init_static_storage(dim, R, dtype);
   if (rabitq) VamanaNode::enable_rabitq();
 
@@ -33,7 +44,7 @@ bool check_layout_case(u32 dim, u32 R, VectorDType dtype, bool rabitq) {
   const size_t graph_end = VamanaNode::offset_neighbors() + VamanaNode::NEIGHBORS_SIZE;
   const size_t vector_end = VamanaNode::offset_vector() + vector_bytes;
 
-  if (VamanaNode::storage_format_name() != "hybrid_split_v1") return false;
+  if (VamanaNode::storage_format_name() != "vamana_aos_v1") return false;
   if (VamanaNode::offset_neighbors() != VamanaNode::HEADER_SIZE + VamanaNode::META_SIZE) return false;
   if (VamanaNode::graph_hot_bytes() % VamanaNode::STORAGE_ALIGNMENT != 0) return false;
   if (VamanaNode::offset_vector() != VamanaNode::graph_hot_bytes()) return false;
@@ -55,11 +66,117 @@ bool check_layout_case(u32 dim, u32 R, VectorDType dtype, bool rabitq) {
   return true;
 }
 
+bool check_hot_graph_case(u32 dim, u32 R, VectorDType dtype) {
+  VamanaNode::disable_rabitq();
+  VamanaNode::disable_hot_graph();
+  VamanaNode::set_storage_format(vamana::StorageFormat::compact_v1);
+  VamanaNode::init_static_storage(dim, R, dtype);
+  if (VamanaNode::offset_vector() != 16 ||
+      VamanaNode::total_size() % VamanaNode::COMPACT_ALIGNMENT != 0) {
+    return false;
+  }
+  const u32 shard_bits = vamana::hot_graph::shard_bits_for(5);
+  const u32 entry_size = static_cast<u32>(VamanaNode::hot_graph_entry_size());
+  vec<u64> offsets{4096, 8192, 12288, 16384, 20480};
+  vec<u64> counts{8, 8, 8, 8, 8};
+  vec<u64> dynamic_offsets{32768, 65536, 98304, 131072, 163840};
+  VamanaNode::configure_hot_graph(offsets, counts, entry_size, shard_bits, 2,
+                                  dynamic_offsets,
+                                  static_cast<u32>(VamanaNode::dynamic_record_size()),
+                                  static_cast<u32>(VamanaNode::total_size()));
+  if (!VamanaNode::HAS_HOT_GRAPH ||
+      VamanaNode::storage_format_name() != "vamana_compact_v1" ||
+      !VamanaNode::supports_storage_format("vamana_aos_v1") ||
+      !VamanaNode::supports_storage_format("vamana_compact_v1")) {
+    return false;
+  }
+
+  const RemotePtr owner{2, 16 + 3 * VamanaNode::total_size()};
+  if (!VamanaNode::hot_graph_entry_available(owner) ||
+      VamanaNode::hot_graph_entry_offset(owner) != offsets[2] + 3 * entry_size) {
+    return false;
+  }
+  const RemotePtr dynamic_neighbor{4, 98765432};
+  const RemotePtr base_neighbor{1, 16 + 7 * VamanaNode::total_size()};
+  vec<RemotePtr> neighbors{dynamic_neighbor};
+  if (R > 1) neighbors.push_back(base_neighbor);
+  vec<byte_t> entry(entry_size, 0);
+  VamanaNode::encode_hot_graph_entry(entry.data(), 123, static_cast<u8>(neighbors.size()),
+                                     neighbors.data(), neighbors.size(), shard_bits);
+  vec<byte_t> decoded(VamanaNode::neighbor_read_size(), 0);
+  VamanaNode::decode_hot_graph_entry(entry.data(), decoded.data());
+  const u8 edge_count = *reinterpret_cast<u8*>(
+    decoded.data() + VamanaNode::neighbor_count_offset_in_read());
+  const auto* slots = reinterpret_cast<const RemotePtr*>(
+    decoded.data() + VamanaNode::neighbor_payload_offset_in_read());
+  if (edge_count != neighbors.size() || slots[0] != dynamic_neighbor ||
+      (R > 1 && slots[1] != base_neighbor)) {
+    return false;
+  }
+  VamanaNode::disable_hot_graph();
+  return true;
+}
+
+bool check_hot_graph_v2_case(u32 dim, u32 R, VectorDType dtype) {
+  VamanaNode::disable_rabitq();
+  VamanaNode::disable_hot_graph();
+  VamanaNode::set_storage_format(vamana::StorageFormat::compact_v1);
+  VamanaNode::init_static_storage(dim, R, dtype);
+  const u32 shard_bits = vamana::hot_graph::shard_bits_for(4);
+  const u32 entry_size = static_cast<u32>(VamanaNode::hot_graph_entry_size());
+  const u32 dynamic_record_bytes = static_cast<u32>(VamanaNode::dynamic_record_size());
+  const u32 dynamic_hot_offset = static_cast<u32>(VamanaNode::total_size());
+  vec<u64> base_offsets{4096, 8192, 12288, 16384};
+  vec<u64> base_counts{4, 4, 4, 4};
+  vec<u64> dynamic_offsets{32768, 65536, 98304, 131072};
+  VamanaNode::configure_hot_graph(base_offsets, base_counts, entry_size, shard_bits,
+                                  2, dynamic_offsets, dynamic_record_bytes,
+                                  dynamic_hot_offset);
+  if (!VamanaNode::HAS_HOT_GRAPH ||
+      VamanaNode::storage_format_name() != "vamana_compact_v1" ||
+      VamanaNode::allocation_size() != dynamic_record_bytes) {
+    return false;
+  }
+
+  const RemotePtr dynamic_owner{2, dynamic_offsets[2] + 3ull * dynamic_record_bytes};
+  if (!VamanaNode::hot_graph_entry_available(dynamic_owner) ||
+      VamanaNode::hot_graph_entry_offset(dynamic_owner) != dynamic_owner.byte_offset() + dynamic_hot_offset) {
+    return false;
+  }
+
+  const RemotePtr neighbor{3, dynamic_offsets[3] + dynamic_record_bytes};
+  vec<RemotePtr> neighbors{neighbor};
+  vec<byte_t> entry(entry_size, 0);
+  VamanaNode::encode_hot_graph_entry(entry.data(), 0, 1, neighbors.data(), 1,
+                                     shard_bits, 17, 2);
+  vec<byte_t> decoded(VamanaNode::neighbor_read_size(), 0);
+  if (!VamanaNode::decode_hot_graph_entry(entry.data(), decoded.data())) {
+    return false;
+  }
+  const auto* slots = reinterpret_cast<const RemotePtr*>(
+    decoded.data() + VamanaNode::neighbor_payload_offset_in_read());
+  if (slots[0] != neighbor) return false;
+  entry.back() ^= 0x1u;
+  if (VamanaNode::decode_hot_graph_entry(entry.data(), decoded.data())) {
+    return false;
+  }
+  VamanaNode::disable_hot_graph();
+  return true;
+}
+
 template <class T>
 bool run_case(u32 dim, VectorDType dtype) {
   VamanaNode::disable_rabitq();
+  VamanaNode::disable_hot_graph();
+  VamanaNode::set_storage_format(vamana::StorageFormat::compact_v1);
   VamanaNode::init_static_storage(dim, 32, dtype);
   VamanaNode::enable_rabitq();
+  if (VamanaNode::offset_vector() != 16 ||
+      VamanaNode::size_until_vector_end() != 16 + VamanaNode::vector_bytes() ||
+      VamanaNode::offset_rabitq_code() % 8 != 0 ||
+      VamanaNode::total_size() % VamanaNode::COMPACT_ALIGNMENT != 0) {
+    return false;
+  }
 
   std::vector<float> centroid(dim);
   std::vector<T> vector(dim);
@@ -107,6 +224,10 @@ bool run_case(u32 dim, VectorDType dtype) {
   std::memcpy(entry.data() + VamanaNode::rabitq_code_storage_size() + sizeof(norm),
               &error, sizeof(error));
 
+  if (!cuda_device_available()) {
+    return true;
+  }
+
   float* d_query = nullptr;
   byte_t* d_entry = nullptr;
   float* d_distance = nullptr;
@@ -150,7 +271,9 @@ int main() {
     for (VectorDType dtype : {VectorDType::float32, VectorDType::uint8, VectorDType::int8}) {
       for (u32 R : {1u, 16u, 32u, 63u}) {
         if (!check_layout_case(dim, R, dtype, false) ||
-            !check_layout_case(dim, R, dtype, true)) {
+            !check_layout_case(dim, R, dtype, true) ||
+            !check_hot_graph_case(dim, R, dtype) ||
+            !check_hot_graph_v2_case(dim, R, dtype)) {
           std::cerr << "Hybrid Split layout test failed at dimension " << dim << "\n";
           return 1;
         }

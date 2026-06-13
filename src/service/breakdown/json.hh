@@ -77,6 +77,18 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"vector_rdma_bytes", aggregate.counters.vector_rdma_bytes},
     {"neighbor_rdma_read_ops", aggregate.counters.neighbor_rdma_read_ops},
     {"vector_rdma_read_ops", aggregate.counters.vector_rdma_read_ops},
+    {"vector_rdma_batch_calls", aggregate.counters.vector_rdma_batch_calls},
+    {"vector_rdma_cqes", aggregate.counters.vector_rdma_cqes},
+    {"vector_rdma_reads_per_batch",
+     aggregate.counters.vector_rdma_batch_calls == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.vector_rdma_read_ops) /
+           static_cast<double>(aggregate.counters.vector_rdma_batch_calls)},
+    {"vector_rdma_reads_per_cqe",
+     aggregate.counters.vector_rdma_cqes == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.vector_rdma_read_ops) /
+           static_cast<double>(aggregate.counters.vector_rdma_cqes)},
     {"neighbor_rdma_read_avg_bytes",
      aggregate.counters.neighbor_rdma_read_ops == 0
        ? 0.0
@@ -92,6 +104,10 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"l2_kernels", aggregate.counters.l2_kernels},
     {"prune_kernels", aggregate.counters.prune_kernels},
     {"exact_reranks", aggregate.counters.exact_reranks},
+    {"rabitq_l0_candidates", aggregate.counters.rabitq_l0_candidates},
+    {"rabitq_cache_misses", aggregate.counters.rabitq_cache_misses},
+    {"rabitq_l1_candidates", aggregate.counters.rabitq_l1_candidates},
+    {"rabitq_l2_candidates", aggregate.counters.rabitq_l2_candidates},
     {"visited_nodes", aggregate.counters.visited_nodes},
     {"visited_neighborlists", aggregate.counters.visited_neighborlists},
     {"remote_allocations", aggregate.counters.remote_allocations},

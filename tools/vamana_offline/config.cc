@@ -7,6 +7,8 @@
 #include <boost/program_options.hpp>
 #include <library/utils.hh>
 
+#include "vamana/storage_format.hh"
+
 namespace po = boost::program_options;
 
 namespace tools::vamana_offline {
@@ -49,6 +51,8 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
      "Skip the expensive in-memory brute-force recall sanity check after graph construction.")
     ("use-rabitq", po::bool_switch(&config.use_rabitq),
      "Store dimension-scaled RaBitQ search entries per node for GPU approximate search.")
+    ("storage-format", po::value<str>(&config.storage_format)->default_value(config.storage_format),
+     "Storage format to write: vamana_aos_v1 or vamana_compact_v1.")
     ("seed", po::value<i32>(&config.seed)->default_value(config.seed), "PRNG seed.")
     ("max-vectors", po::value<size_t>(&config.max_vectors)->default_value(config.max_vectors),
      "Maximum number of vectors to read.")
@@ -88,6 +92,8 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     lib_failure("--partition-imbalance must be >= 1.0");
   if (config.use_rabitq && config.ip_distance)
     lib_failure("--use-rabitq currently supports L2 distance only");
+  if (!vamana::parse_storage_format(config.storage_format))
+    lib_failure("--storage-format must be vamana_aos_v1 or vamana_compact_v1");
   return config;
 }
 

@@ -24,6 +24,7 @@ ALPHA="${ALPHA:-1.2}"
 K="${K:-10}"
 DIM="${DIM:-128}"
 VECTOR_DATA_TYPE="${VECTOR_DATA_TYPE:-uint8}"
+STORAGE_FORMAT="${STORAGE_FORMAT:-vamana_compact_v1}"
 BUILD_THREADS="${BUILD_THREADS:-32}"
 SERVICE_THREADS="${SERVICE_THREADS:-16}"
 COROUTINES="${COROUTINES:-4}"
@@ -40,7 +41,13 @@ estimate_node_bytes() {
     uint8|int8) component_size=1 ;;
     float32|auto) component_size=4 ;;
   esac
-  echo $((16 + DIM * component_size + R * 8))
+  if [[ "$STORAGE_FORMAT" == "vamana_compact_v1" ]]; then
+    local fixed_bytes=$((((16 + DIM * component_size + 15) / 16) * 16))
+    local graph_bytes=$((((8 + R * 5 + 7) / 8) * 8))
+    echo $((fixed_bytes + graph_bytes))
+  else
+    echo $((16 + DIM * component_size + R * 8))
+  fi
 }
 
 estimate_mn_memory_gb() {
@@ -250,6 +257,11 @@ write_service_config() {
     if [[ -n "${RDMA_QP_POOL_SIZE:-}" ]]; then echo "rdma-qp-pool-size = ${RDMA_QP_POOL_SIZE}"; fi
     if [[ -n "${QUERY_BATCH_SIZE:-}" ]]; then echo "query-batch-size = ${QUERY_BATCH_SIZE}"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then echo "use-rabitq = true"; fi
+    if [[ "${USE_RABITQ:-0}" == "1" ]]; then
+      echo "rabitq-confidence-epsilon = ${RABITQ_CONFIDENCE_EPSILON:-1.9}"
+      echo "rabitq-exact-batch = ${RABITQ_EXACT_BATCH:-64}"
+      echo "rabitq-exact-budget = ${RABITQ_EXACT_BUDGET:-256}"
+    fi
     echo "insert-execution = $insert_execution"
     if [[ "$insert_execution" == "storage_owner" ]]; then
       echo "storage-peers = $endpoints"

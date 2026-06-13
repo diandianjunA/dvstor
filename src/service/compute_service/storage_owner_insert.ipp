@@ -23,6 +23,7 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
 
       auto task = std::make_unique<StorageInsertTask>();
       task->item = item;
+      task->kind = service::storage_owner::MutationKind::insert;
       task->sample = sample;
       task->enqueued_at = std::chrono::steady_clock::now();
       futures.push_back(task->result.get_future());
@@ -82,7 +83,12 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
       sample->enqueued_at = std::chrono::steady_clock::now();
     }
 
-    auto* request = new service::InsertRequest{item.id, item.values, {}, std::chrono::steady_clock::now(), sample};
+    auto* request = new service::InsertRequest{};
+    request->id = item.id;
+    request->components = item.values;
+    request->kind = service::storage_owner::MutationKind::insert;
+    request->enqueued_at = std::chrono::steady_clock::now();
+    request->breakdown_sample = sample;
     futures.push_back(request->result.get_future());
     requests.push_back(request);
     samples.push_back(sample);
@@ -94,6 +100,7 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
     const bool ok = futures[i].get();
     if (ok) {
       ++inserted;
+      publish_compute_side_id(requests[i]->id, requests[i]->new_ptr, false);
     }
     if (samples[i] && samples[i]->finished_flag) {
       std::lock_guard<std::mutex> lock(breakdown_mutex_);
@@ -110,6 +117,121 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
 }
 
 template <class Distance>
+size_t ComputeService<Distance>::upsert(const vec<InsertItem>& batch) {
+  if (!config_.use_storage_owner_insert()) {
+    vec<service::InsertRequest*> requests;
+    vec<std::future<bool>> futures;
+    requests.reserve(batch.size());
+    futures.reserve(batch.size());
+    for (const auto& item : batch) {
+      if (item.values.size() != config_.dim) {
+        throw std::invalid_argument("upsert dimension mismatch");
+      }
+      RemotePtr old_ptr{};
+      bool deleted = false;
+      const bool old_live = lookup_compute_side_id(item.id, &old_ptr, &deleted) && !deleted;
+      auto* request = new service::InsertRequest{};
+      request->id = item.id;
+      request->components = item.values;
+      request->kind = service::storage_owner::MutationKind::upsert;
+      request->old_ptr = old_live ? old_ptr : RemotePtr{};
+      request->enqueued_at = std::chrono::steady_clock::now();
+      futures.push_back(request->result.get_future());
+      requests.push_back(request);
+      insert_queue_.enqueue(request);
+    }
+    size_t updated = 0;
+    for (size_t i = 0; i < futures.size(); ++i) {
+      const bool ok = futures[i].get();
+      if (ok) {
+        ++updated;
+        if (!requests[i]->old_ptr.is_null()) {
+          (void)mark_remote_deleted(requests[i]->old_ptr);
+        }
+        publish_compute_side_id(requests[i]->id, requests[i]->new_ptr, false);
+      }
+    }
+    vectors_inserted_.fetch_add(updated, std::memory_order_relaxed);
+    for (auto* request : requests) {
+      delete request;
+    }
+    return updated;
+  }
+  if (storage_insert_owners_.empty()) {
+    throw std::runtime_error("storage_owner mutation runtime is not initialized");
+  }
+  vec<std::future<bool>> futures;
+  futures.reserve(batch.size());
+  for (const auto& item : batch) {
+    if (item.values.size() != config_.dim) {
+      throw std::invalid_argument("upsert dimension mismatch");
+    }
+    auto task = std::make_unique<StorageInsertTask>();
+    task->item = item;
+    task->kind = service::storage_owner::MutationKind::upsert;
+    task->enqueued_at = std::chrono::steady_clock::now();
+    futures.push_back(task->result.get_future());
+    const u32 owner_storage = num_servers_ == 0 ? 0 : static_cast<u32>(item.id % num_servers_);
+    auto& state = *storage_insert_owners_[owner_storage];
+    {
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.queue.push_back(std::move(task));
+    }
+    state.cv.notify_one();
+  }
+  size_t updated = 0;
+  for (auto& future : futures) {
+    updated += future.get() ? 1u : 0u;
+  }
+  vectors_inserted_.fetch_add(updated, std::memory_order_relaxed);
+  return updated;
+}
+
+template <class Distance>
+size_t ComputeService<Distance>::erase(const vec<node_t>& ids) {
+  if (!config_.use_storage_owner_insert()) {
+    size_t erased = 0;
+    for (const node_t id : ids) {
+      RemotePtr ptr{};
+      bool deleted = false;
+      if (!lookup_compute_side_id(id, &ptr, &deleted) || deleted) {
+        continue;
+      }
+      if (mark_remote_deleted(ptr)) {
+        publish_compute_side_id(id, ptr, true);
+        ++erased;
+      }
+    }
+    return erased;
+  }
+  if (storage_insert_owners_.empty()) {
+    throw std::runtime_error("storage_owner mutation runtime is not initialized");
+  }
+  vec<std::future<bool>> futures;
+  futures.reserve(ids.size());
+  for (const node_t id : ids) {
+    auto task = std::make_unique<StorageInsertTask>();
+    task->item.id = id;
+    task->item.values.assign(config_.dim, 0.0f);
+    task->kind = service::storage_owner::MutationKind::erase;
+    task->enqueued_at = std::chrono::steady_clock::now();
+    futures.push_back(task->result.get_future());
+    const u32 owner_storage = num_servers_ == 0 ? 0 : static_cast<u32>(id % num_servers_);
+    auto& state = *storage_insert_owners_[owner_storage];
+    {
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.queue.push_back(std::move(task));
+    }
+    state.cv.notify_one();
+  }
+  size_t erased = 0;
+  for (auto& future : futures) {
+    erased += future.get() ? 1u : 0u;
+  }
+  return erased;
+}
+
+template <class Distance>
 void ComputeService<Distance>::start_storage_insert_runtime() {
   if (!storage_insert_owners_.empty()) {
     return;
@@ -117,8 +239,9 @@ void ComputeService<Distance>::start_storage_insert_runtime() {
 
   const u32 owner_count = std::max<u32>(1, num_servers_);
   const u32 rpc_depth = std::max<u32>(1, config_.storage_owner_rpc_depth);
-  const size_t request_bytes =
-    service::storage_owner::insert_batch_request_bytes(config_.storage_owner_batch_max, config_.dim);
+  const size_t request_bytes = std::max(
+    service::storage_owner::insert_batch_request_bytes(config_.storage_owner_batch_max, config_.dim),
+    service::storage_owner::mutation_batch_request_bytes(config_.storage_owner_batch_max, config_.dim));
   const size_t response_bytes =
     service::storage_owner::insert_batch_response_bytes(config_.storage_owner_batch_max);
   const size_t max_inflight = static_cast<size_t>(owner_count) * rpc_depth;
@@ -299,7 +422,13 @@ void ComputeService<Distance>::post_storage_owner_batch(
   const u32 item_count = static_cast<u32>(tasks.size());
   const u64 batch_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
   const auto prepare_start = std::chrono::steady_clock::now();
-  const size_t request_size = service::storage_owner::insert_batch_request_bytes(item_count, config_.dim);
+  bool mutation_request = false;
+  for (const auto& task : tasks) {
+    mutation_request = mutation_request || task->kind != service::storage_owner::MutationKind::insert;
+  }
+  const size_t request_size = mutation_request
+    ? service::storage_owner::mutation_batch_request_bytes(item_count, config_.dim)
+    : service::storage_owner::insert_batch_request_bytes(item_count, config_.dim);
   const size_t response_size = service::storage_owner::insert_batch_response_bytes(item_count);
   auto& state = *storage_insert_owners_[owner_storage];
   auto& slot = state.slots[slot_id];
@@ -311,7 +440,8 @@ void ComputeService<Distance>::post_storage_owner_batch(
   }
 
   auto* request = reinterpret_cast<service::storage_owner::InsertBatchRequestHeader*>(slot.request_buffer.data());
-  request->magic = service::storage_owner::kInsertMagic;
+  request->magic = mutation_request ? service::storage_owner::kMutationMagic
+                                    : service::storage_owner::kInsertMagic;
   request->dim = config_.dim;
   request->owner_storage = owner_storage;
   request->source_client = cm_.client_id;
@@ -320,10 +450,19 @@ void ComputeService<Distance>::post_storage_owner_batch(
   request->vector_bytes = static_cast<u32>(VamanaNode::vector_bytes());
   request->batch_id = batch_id;
 
-  node_t* ids = service::storage_owner::request_ids(slot.request_buffer.data());
-  byte_t* vectors = service::storage_owner::request_vectors(slot.request_buffer.data(), item_count);
+  node_t* ids = mutation_request
+    ? service::storage_owner::mutation_request_ids(slot.request_buffer.data())
+    : service::storage_owner::request_ids(slot.request_buffer.data());
+  byte_t* vectors = mutation_request
+    ? service::storage_owner::mutation_request_vectors(slot.request_buffer.data(), item_count)
+    : service::storage_owner::request_vectors(slot.request_buffer.data(), item_count);
+  u32* kinds = mutation_request ? service::storage_owner::mutation_request_kinds(slot.request_buffer.data())
+                                : nullptr;
   for (u32 i = 0; i < item_count; ++i) {
     ids[i] = slot.tasks[i]->item.id;
+    if (kinds != nullptr) {
+      kinds[i] = static_cast<u32>(slot.tasks[i]->kind);
+    }
     encode_float_vector_to_storage(slot.tasks[i]->item.values.data(), config_.dim, VamanaNode::vector_dtype(),
                                    vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes());
   }
@@ -426,7 +565,8 @@ void ComputeService<Distance>::handle_storage_owner_response(u32 owner_storage, 
     std::lock_guard<std::mutex> lock(state.mutex);
     const auto* response =
       reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(response_slot.buffer.data());
-    const bool header_ok = response->magic == service::storage_owner::kInsertMagic &&
+    const bool header_ok = (response->magic == service::storage_owner::kInsertMagic ||
+                            response->magic == service::storage_owner::kMutationMagic) &&
                            response->owner_storage == owner_storage;
     auto slot_it = header_ok ? state.batch_to_slot.find(response->batch_id) : state.batch_to_slot.end();
     if (!header_ok || slot_it == state.batch_to_slot.end() || slot_it->second >= state.slots.size()) {
@@ -485,7 +625,8 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
     const auto* response =
       reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(slot.response_buffer.data());
     const u32* statuses = service::storage_owner::response_statuses(slot.response_buffer.data());
-    const bool response_ok = response->magic == service::storage_owner::kInsertMagic &&
+    const bool response_ok = (response->magic == service::storage_owner::kInsertMagic ||
+                              response->magic == service::storage_owner::kMutationMagic) &&
                              response->owner_storage == slot.owner_storage &&
                              response->batch_id == slot.batch_id &&
                              response->item_count == slot.item_count;
@@ -517,8 +658,7 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
     const auto finished_at = slot.response_completed_at;
 
     for (u32 i = 0; i < slot.item_count; ++i) {
-      const bool ok = response_ok &&
-                      statuses[i] == static_cast<u32>(service::storage_owner::InsertStatus::ok);
+      const bool ok = response_ok && statuses[i] == 0;
       if (response_ok && !ok) {
         static std::atomic<u32> failed_status_logs{0};
         const u32 log_index = failed_status_logs.fetch_add(1, std::memory_order_relaxed);

@@ -24,7 +24,7 @@ inline auto try_lock_vamana_node(const RemotePtr& rptr,
     qp->post_CAS(reinterpret_cast<u64>(thread->coros_pointer_slot()),
                  thread->ctx->get_lkey(),
                  thread->ctx->get_remote_mrt(rptr.memory_node()),
-                 rptr.byte_offset(),
+                 ::vamana::StorageLayoutResolver::header(rptr).offset,
                  compare,
                  swap,
                  true,
@@ -85,7 +85,7 @@ inline MinorCoroutine spinlock_vamana_node(const s_ptr<VamanaNode>& node,
  */
 inline auto allocate_vamana_node(const u_ptr<ComputeThread>& thread) {
     const u32 memory_node = thread->get_random_memory_node();
-    size_t node_size = VamanaNode::total_size();
+    size_t node_size = VamanaNode::allocation_size();
 
     // Ensure 8B alignment for CAS on header
     while (node_size % 8 != 0) {

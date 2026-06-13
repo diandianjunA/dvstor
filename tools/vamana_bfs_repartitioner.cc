@@ -491,8 +491,8 @@ void write_metadata(const Options& options,
   metadata["num_memory_nodes"] = options.memory_nodes;
   metadata["dim"] = options.dim;
   metadata["R"] = options.R;
-  metadata["schema_version"] = 7;
-  metadata["storage_format"] = "hybrid_split_v1";
+  metadata["schema_version"] = 13;
+  metadata["storage_format"] = "vamana_aos_v1";
   metadata["node_size"] = format.node_bytes;
   metadata["graph_hot_bytes"] = format.graph_hot_bytes;
   metadata["vector_offset"] = format.vector_offset;
@@ -552,9 +552,9 @@ int main(int argc, char** argv) {
       throw std::runtime_error("unsupported node_layout: " + node_layout);
     }
 
-    if (metadata.value("schema_version", 0u) < 7 ||
-        metadata.value("storage_format", std::string{}) != "hybrid_split_v1") {
-      throw std::runtime_error("input index must be rebuilt with hybrid_split_v1 schema");
+    if (metadata.value("schema_version", 0u) != 13 ||
+        metadata.value("storage_format", std::string{}) != "vamana_aos_v1") {
+      throw std::runtime_error("input index must use vamana_aos_v1 schema 12");
     }
 
     const NodeFormat format = make_format(options.dim, options.R, options.vector_dtype, node_layout);
@@ -564,7 +564,7 @@ int main(int argc, char** argv) {
         metadata.value("vector_offset", 0u) != format.vector_offset ||
         metadata.value("neighbors_offset", 0u) != format.neighbors_offset ||
         metadata.value("rabitq_offset", 0u) != format.rabitq_offset) {
-      throw std::runtime_error("metadata storage layout does not match computed hybrid_split_v1 layout");
+      throw std::runtime_error("metadata storage layout does not match computed vamana_aos_v1 layout");
     }
 
     ensure_output_paths_available(options);

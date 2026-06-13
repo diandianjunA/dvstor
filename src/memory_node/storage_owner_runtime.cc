@@ -4,8 +4,9 @@
 #include <iostream>
 
 void MemoryNode::setup_insert_runtime(const Configuration& config) {
-  const size_t insert_request_bytes =
-    align_up(service::storage_owner::insert_batch_request_bytes(config.storage_owner_batch_max, VamanaNode::DIM));
+  const size_t insert_request_bytes = align_up(std::max(
+    service::storage_owner::insert_batch_request_bytes(config.storage_owner_batch_max, VamanaNode::DIM),
+    service::storage_owner::mutation_batch_request_bytes(config.storage_owner_batch_max, VamanaNode::DIM)));
   insert_runtime_.request_bytes = insert_request_bytes;
   insert_runtime_.request_slot_count = std::max<u32>(1, config.storage_owner_rpc_depth);
   const size_t insert_response_bytes =
@@ -40,7 +41,11 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
   const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
   const u32 coroutines_per_worker = std::max<u32>(1, config.insert_coroutines == 0 ? config.num_coroutines
                                                                                     : config.insert_coroutines);
-  const size_t snapshot_stride = align_up(VamanaNode::vector_bytes());
+  const size_t snapshot_bytes = VamanaNode::compact_storage()
+                                  ? VamanaNode::size_until_vector_end()
+                                  : VamanaNode::HEADER_SIZE + VamanaNode::COMPACT_META_SIZE +
+                                      VamanaNode::vector_bytes();
+  const size_t snapshot_stride = align_up(snapshot_bytes);
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
   const size_t coroutine_scratch_stride =
     align_up(std::max<size_t>(VamanaNode::total_size(),
@@ -114,18 +119,35 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
 
   const Configuration& config = *storage_worker_config_;
   vec<node_t> batch_ids;
+  vec<service::storage_owner::MutationKind> batch_kinds;
   vec<element_t> batch_vectors;
   vec<u32> item_counts;
+  vec<u32> response_magics;
   batch_ids.reserve(std::max<u32>(config.storage_owner_batch_max, 64));
+  batch_kinds.reserve(std::max<u32>(config.storage_owner_batch_max, 64));
   batch_vectors.reserve(static_cast<size_t>(std::max<u32>(config.storage_owner_batch_max, 64)) * config.dim);
   item_counts.reserve(tasks.size());
+  response_magics.reserve(tasks.size());
 
   for (const auto& task : tasks) {
     const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(task.payload.data());
-    const node_t* ids = service::storage_owner::request_ids(task.payload.data());
-    const byte_t* vectors = service::storage_owner::request_vectors(task.payload.data(), request->item_count);
+    const bool mutation = request->magic == service::storage_owner::kMutationMagic;
+    const node_t* ids = mutation
+      ? service::storage_owner::mutation_request_ids(task.payload.data())
+      : service::storage_owner::request_ids(task.payload.data());
+    const byte_t* vectors = mutation
+      ? service::storage_owner::mutation_request_vectors(task.payload.data(), request->item_count)
+      : service::storage_owner::request_vectors(task.payload.data(), request->item_count);
+    const u32* kinds = mutation ? service::storage_owner::mutation_request_kinds(task.payload.data())
+                                : nullptr;
     item_counts.push_back(request->item_count);
+    response_magics.push_back(request->magic);
     batch_ids.insert(batch_ids.end(), ids, ids + request->item_count);
+    for (u32 i = 0; i < request->item_count; ++i) {
+      batch_kinds.push_back(kinds == nullptr
+        ? service::storage_owner::MutationKind::insert
+        : static_cast<service::storage_owner::MutationKind>(kinds[i]));
+    }
     const size_t old_size = batch_vectors.size();
     batch_vectors.resize(old_size + static_cast<size_t>(request->item_count) * config.dim);
     for (u32 i = 0; i < request->item_count; ++i) {
@@ -144,20 +166,26 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
   }
 
   vec<u64> invalidated_neighbors;
+  vec<u32> statuses(batch_ids.size(), static_cast<u32>(service::storage_owner::MutationStatus::failed));
   const bool ok = current_storage_owner_thread_ != nullptr
                     ? execute_storage_owner_batch_items_async(batch_ids.data(),
+                                                               batch_kinds.data(),
                                                                batch_vectors.data(),
                                                                batch_ids.size(),
                                                                *current_storage_owner_thread_,
                                                                breakdown,
                                                                config,
-                                                               &invalidated_neighbors)
+                                                               &invalidated_neighbors,
+                                                               &statuses)
                     : execute_storage_owner_batch_items(batch_ids.data(),
+                                                        batch_kinds.data(),
                                                         batch_vectors.data(),
                                                         batch_ids.size(),
                                                         breakdown,
                                                         config,
-                                                        &invalidated_neighbors);
+                                                        &invalidated_neighbors,
+                                                        &statuses);
+  size_t status_base = 0;
   for (size_t task_idx = 0; task_idx < tasks.size(); ++task_idx) {
     const auto& task = tasks[task_idx];
     const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(task.payload.data());
@@ -165,15 +193,16 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
     const size_t response_size = service::storage_owner::insert_batch_response_bytes(item_count);
     vec<byte_t> response_buffer(response_size);
     auto* response = reinterpret_cast<service::storage_owner::InsertBatchResponseHeader*>(response_buffer.data());
-    response->magic = service::storage_owner::kInsertMagic;
+    response->magic = response_magics[task_idx];
     response->owner_storage = storage_id_;
     response->item_count = item_count;
     response->batch_id = request->batch_id;
-    u32* statuses = service::storage_owner::response_statuses(response_buffer.data());
+    u32* response_statuses = service::storage_owner::response_statuses(response_buffer.data());
     for (u32 i = 0; i < item_count; ++i) {
-      statuses[i] = static_cast<u32>(ok ? service::storage_owner::InsertStatus::ok
-                                        : service::storage_owner::InsertStatus::failed);
+      response_statuses[i] = ok ? statuses[status_base + i]
+                                : static_cast<u32>(service::storage_owner::MutationStatus::failed);
     }
+    status_base += item_count;
     *service::storage_owner::response_breakdown(response_buffer.data(), item_count) =
       scale_breakdown(breakdown, item_count, static_cast<u32>(std::max<size_t>(1, batch_ids.size())));
     const u32 invalidation_capacity = service::storage_owner::response_invalidation_capacity(item_count);
@@ -195,12 +224,14 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
 }
 
 bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
+                                             const service::storage_owner::MutationKind* kinds,
                                              const element_t* vectors,
                                              size_t item_count,
                                              StorageOwnerThread& thread,
                                              InsertBreakdownCounters& breakdown,
                                              const Configuration& config,
-                                             vec<u64>* invalidated_neighbors) {
+                                             vec<u64>* invalidated_neighbors,
+                                             vec<u32>* statuses) {
   if (item_count == 0) {
     return true;
   }
@@ -210,6 +241,7 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
   for (size_t idx = 0; idx < item_count; ++idx) {
     StorageOwnerInsertJob job;
     job.id = ids[idx];
+    job.kind = kinds == nullptr ? service::storage_owner::MutationKind::insert : kinds[idx];
     job.vector_data.resize(static_cast<size_t>(VamanaNode::DIM) * sizeof(element_t));
     std::memcpy(job.vector_data.data(),
                 vectors + idx * VamanaNode::DIM,
@@ -268,8 +300,14 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
   thread.coroutines.clear();
 
   bool ok = true;
-  for (const auto& job : jobs) {
-    ok &= job.ok;
+  if (statuses != nullptr) {
+    statuses->assign(item_count, static_cast<u32>(service::storage_owner::MutationStatus::failed));
+  }
+  for (size_t i = 0; i < jobs.size(); ++i) {
+    const auto& job = jobs[i];
+    if (statuses != nullptr) {
+      (*statuses)[i] = static_cast<u32>(job.status);
+    }
   }
   auto t_local_reverse = std::chrono::steady_clock::now();
   for (auto& [target_raw, candidates] : local_updates) {
@@ -344,14 +382,19 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
       bool handled_async = false;
       if (bytes >= sizeof(service::storage_owner::InsertBatchRequestHeader)) {
         const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(payload);
-        if (request->magic == service::storage_owner::kInsertMagic &&
+        const bool magic_ok = request->magic == service::storage_owner::kInsertMagic ||
+                              request->magic == service::storage_owner::kMutationMagic;
+        const size_t expected_bytes = request->magic == service::storage_owner::kMutationMagic
+          ? service::storage_owner::mutation_batch_request_bytes(request->item_count, config.dim)
+          : service::storage_owner::insert_batch_request_bytes(request->item_count, config.dim);
+        if (magic_ok &&
             request->dim == config.dim &&
             request->owner_storage == storage_id_ &&
             request->item_count > 0 &&
             request->item_count <= config.storage_owner_batch_max &&
             request->vector_dtype == static_cast<u32>(VamanaNode::vector_dtype()) &&
             request->vector_bytes == VamanaNode::vector_bytes() &&
-            bytes >= service::storage_owner::insert_batch_request_bytes(request->item_count, config.dim)) {
+            bytes >= expected_bytes) {
           StorageOwnerInsertTask task;
           task.client_id = client_id;
           task.item_count = request->item_count;
@@ -403,14 +446,19 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* pa
   }
 
   const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(payload);
-  if (request->magic != service::storage_owner::kInsertMagic ||
+  const bool mutation = request->magic == service::storage_owner::kMutationMagic;
+  const bool magic_ok = request->magic == service::storage_owner::kInsertMagic || mutation;
+  const size_t expected_bytes = mutation
+    ? service::storage_owner::mutation_batch_request_bytes(request->item_count, config.dim)
+    : service::storage_owner::insert_batch_request_bytes(request->item_count, config.dim);
+  if (!magic_ok ||
       request->dim != config.dim ||
       request->owner_storage != storage_id_ ||
       request->item_count == 0 ||
       request->item_count > config.storage_owner_batch_max ||
       request->vector_dtype != static_cast<u32>(VamanaNode::vector_dtype()) ||
       request->vector_bytes != VamanaNode::vector_bytes() ||
-      bytes < service::storage_owner::insert_batch_request_bytes(request->item_count, config.dim)) {
+      bytes < expected_bytes) {
     return 0;
   }
 
@@ -418,14 +466,23 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* pa
     insert_runtime_.buffer.get_full_buffer() + insert_runtime_.response_offset +
     static_cast<size_t>(client_id) *
       response_slot_bytes(config));
-  response_ptr->magic = service::storage_owner::kInsertMagic;
+  response_ptr->magic = request->magic;
   response_ptr->owner_storage = storage_id_;
   response_ptr->item_count = request->item_count;
   response_ptr->batch_id = request->batch_id;
   u32* statuses = service::storage_owner::response_statuses(response_ptr);
 
-  const node_t* ids = service::storage_owner::request_ids(payload);
-  const byte_t* raw_vectors = service::storage_owner::request_vectors(payload, request->item_count);
+  const node_t* ids = mutation ? service::storage_owner::mutation_request_ids(payload)
+                               : service::storage_owner::request_ids(payload);
+  const u32* kinds_raw = mutation ? service::storage_owner::mutation_request_kinds(payload)
+                                  : nullptr;
+  const byte_t* raw_vectors = mutation
+    ? service::storage_owner::mutation_request_vectors(payload, request->item_count)
+    : service::storage_owner::request_vectors(payload, request->item_count);
+  vec<service::storage_owner::MutationKind> kinds(request->item_count, service::storage_owner::MutationKind::insert);
+  for (u32 i = 0; i < request->item_count && kinds_raw != nullptr; ++i) {
+    kinds[i] = static_cast<service::storage_owner::MutationKind>(kinds_raw[i]);
+  }
   vec<element_t> decoded_vectors(static_cast<size_t>(request->item_count) * config.dim);
   for (u32 i = 0; i < request->item_count; ++i) {
     decode_storage_vector_to_float(raw_vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes(),
@@ -435,11 +492,12 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* pa
   }
   InsertBreakdownCounters breakdown{};
   vec<u64> invalidated_neighbors;
-  const bool ok = execute_storage_owner_batch_items(ids, decoded_vectors.data(), request->item_count, breakdown, config,
-                                                    &invalidated_neighbors);
+  vec<u32> item_statuses(request->item_count, static_cast<u32>(service::storage_owner::MutationStatus::failed));
+  const bool ok = execute_storage_owner_batch_items(ids, kinds.data(), decoded_vectors.data(), request->item_count,
+                                                    breakdown, config, &invalidated_neighbors, &item_statuses);
   for (u32 i = 0; i < request->item_count; ++i) {
-    statuses[i] = static_cast<u32>(ok ? service::storage_owner::InsertStatus::ok
-                                      : service::storage_owner::InsertStatus::failed);
+    statuses[i] = ok ? item_statuses[i]
+                     : static_cast<u32>(service::storage_owner::MutationStatus::failed);
   }
   *service::storage_owner::response_breakdown(response_ptr, request->item_count) = breakdown;
   const u32 invalidation_capacity = service::storage_owner::response_invalidation_capacity(request->item_count);
@@ -453,11 +511,13 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* pa
 }
 
 bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
+                                       const service::storage_owner::MutationKind* kinds,
                                        const element_t* vectors,
                                        size_t item_count,
                                        InsertBreakdownCounters& breakdown,
                                        const Configuration& config,
-                                       vec<u64>* invalidated_neighbors) {
+                                       vec<u64>* invalidated_neighbors,
+                                       vec<u32>* statuses) {
   if (item_count == 0) {
     return true;
   }
@@ -467,18 +527,49 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   breakdown.storage_owner_medoid_ns += elapsed_ns_since(t_medoid);
   std::unordered_map<u64, vec<RemotePtr>> local_updates;
   std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
+  if (statuses != nullptr) {
+    statuses->assign(item_count, static_cast<u32>(service::storage_owner::MutationStatus::failed));
+  }
 
   for (size_t idx = 0; idx < item_count; ++idx) {
+    const auto kind = kinds == nullptr ? service::storage_owner::MutationKind::insert : kinds[idx];
+    FreshnessEntry old_entry{};
+    u32 generation = 0;
+    const auto status = prepare_mutation(ids[idx], kind, &old_entry, &generation);
+    if (status != service::storage_owner::MutationStatus::ok) {
+      if (statuses != nullptr) {
+        (*statuses)[idx] = static_cast<u32>(status);
+      }
+      continue;
+    }
+    if (kind == service::storage_owner::MutationKind::erase) {
+      const bool deleted = mark_node_deleted(old_entry.current, old_entry.generation);
+      if (deleted) {
+        publish_mutation(ids[idx], old_entry.current, old_entry.generation, true);
+      }
+      if (statuses != nullptr) {
+        (*statuses)[idx] = static_cast<u32>(deleted ? service::storage_owner::MutationStatus::ok
+                                                    : service::storage_owner::MutationStatus::failed);
+      }
+      continue;
+    }
     const element_t* vec_ptr = vectors + idx * VamanaNode::DIM;
     const auto components = span<const element_t>{vec_ptr, VamanaNode::DIM};
     if (medoid_ptr.is_null()) {
       const RemotePtr new_ptr = allocate_local_node();
       auto t_write = std::chrono::steady_clock::now();
-      write_new_node(new_ptr, ids[idx], components, {});
+      write_new_node(new_ptr, ids[idx], components, {}, generation);
       breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
+      if (kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
+        mark_node_deleted(old_entry.current, old_entry.generation);
+      }
+      publish_mutation(ids[idx], new_ptr, generation, false);
       RemotePtr observed;
       if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
         medoid_ptr = new_ptr;
+        if (statuses != nullptr) {
+          (*statuses)[idx] = static_cast<u32>(service::storage_owner::MutationStatus::ok);
+        }
         continue;
       }
       medoid_ptr = observed;
@@ -495,8 +586,15 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
     const RemotePtr new_ptr = allocate_local_node();
     auto t_write = std::chrono::steady_clock::now();
-    write_new_node(new_ptr, ids[idx], components, selected_neighbors);
+    write_new_node(new_ptr, ids[idx], components, selected_neighbors, generation);
     breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
+    if (kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
+      mark_node_deleted(old_entry.current, old_entry.generation);
+    }
+    publish_mutation(ids[idx], new_ptr, generation, false);
+    if (statuses != nullptr) {
+      (*statuses)[idx] = static_cast<u32>(service::storage_owner::MutationStatus::ok);
+    }
 
     for (const RemotePtr& neighbor_ptr : selected_neighbors) {
       if (local_shard(neighbor_ptr.memory_node())) {

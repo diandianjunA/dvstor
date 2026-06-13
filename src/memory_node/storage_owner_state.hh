@@ -37,7 +37,9 @@ struct NodeSnapshot {
   RemotePtr rptr;
   u64 header{};
   node_t id{};
+  u32 generation{};
   u8 edge_count{};
+  bool deleted{};
   vec<byte_t> vector_data;
 };
 
@@ -191,8 +193,16 @@ struct StorageOwnerThread {
 
 struct StorageOwnerInsertJob {
   node_t id{};
+  service::storage_owner::MutationKind kind{service::storage_owner::MutationKind::insert};
   vec<byte_t> vector_data;
+  service::storage_owner::MutationStatus status{service::storage_owner::MutationStatus::failed};
   bool ok{false};
+};
+
+struct FreshnessEntry {
+  RemotePtr current;
+  u32 generation{};
+  bool deleted{};
 };
 
 }  // namespace memory_node_detail

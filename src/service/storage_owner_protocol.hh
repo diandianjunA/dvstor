@@ -6,12 +6,27 @@
 namespace service::storage_owner {
 
 constexpr u32 kInsertMagic = 0x53494e54;  // "SINT"
+constexpr u32 kMutationMagic = 0x4d555444;  // D T U M / "DUTM"
 constexpr u32 kPeerRpcMagic = 0x53505250;  // "SPRP"
 
 enum class InsertStatus : u32 {
   ok = 0,
   failed = 1,
   overloaded = 2,
+};
+
+enum class MutationKind : u32 {
+  insert = 1,
+  upsert = 2,
+  erase = 3,
+};
+
+enum class MutationStatus : u32 {
+  ok = 0,
+  not_found = 1,
+  already_exists = 2,
+  already_deleted = 3,
+  failed = 4,
 };
 
 enum class PeerRpcType : u32 {
@@ -23,6 +38,18 @@ enum class PeerRpcType : u32 {
 
 struct InsertBatchRequestHeader {
   u32 magic{kInsertMagic};
+  u32 dim{};
+  u32 owner_storage{};
+  u32 source_client{};
+  u32 item_count{};
+  u32 vector_dtype{};
+  u32 vector_bytes{};
+  u32 reserved{};
+  u64 batch_id{};
+};
+
+struct MutationBatchRequestHeader {
+  u32 magic{kMutationMagic};
   u32 dim{};
   u32 owner_storage{};
   u32 source_client{};
@@ -101,6 +128,14 @@ inline size_t insert_batch_request_bytes(u32 item_count, u32 dim) {
          static_cast<size_t>(item_count) * VamanaNode::vector_bytes();
 }
 
+inline size_t mutation_batch_request_bytes(u32 item_count, u32 dim) {
+  (void)dim;
+  return sizeof(MutationBatchRequestHeader) +
+         static_cast<size_t>(item_count) * sizeof(u32) +
+         static_cast<size_t>(item_count) * sizeof(node_t) +
+         static_cast<size_t>(item_count) * VamanaNode::vector_bytes();
+}
+
 inline size_t insert_batch_response_bytes(u32 item_count) {
   return sizeof(InsertBatchResponseHeader) +
          static_cast<size_t>(item_count) * sizeof(u32) +
@@ -115,6 +150,32 @@ inline node_t* request_ids(void* payload) {
 
 inline const node_t* request_ids(const void* payload) {
   return reinterpret_cast<const node_t*>(reinterpret_cast<const byte_t*>(payload) + sizeof(InsertBatchRequestHeader));
+}
+
+inline u32* mutation_request_kinds(void* payload) {
+  return reinterpret_cast<u32*>(reinterpret_cast<byte_t*>(payload) + sizeof(MutationBatchRequestHeader));
+}
+
+inline const u32* mutation_request_kinds(const void* payload) {
+  return reinterpret_cast<const u32*>(reinterpret_cast<const byte_t*>(payload) + sizeof(MutationBatchRequestHeader));
+}
+
+inline node_t* mutation_request_ids(void* payload) {
+  return reinterpret_cast<node_t*>(mutation_request_kinds(payload) +
+                                   reinterpret_cast<MutationBatchRequestHeader*>(payload)->item_count);
+}
+
+inline const node_t* mutation_request_ids(const void* payload) {
+  return reinterpret_cast<const node_t*>(mutation_request_kinds(payload) +
+                                         reinterpret_cast<const MutationBatchRequestHeader*>(payload)->item_count);
+}
+
+inline byte_t* mutation_request_vectors(void* payload, u32 item_count) {
+  return reinterpret_cast<byte_t*>(mutation_request_ids(payload) + item_count);
+}
+
+inline const byte_t* mutation_request_vectors(const void* payload, u32 item_count) {
+  return reinterpret_cast<const byte_t*>(mutation_request_ids(payload) + item_count);
 }
 
 inline byte_t* request_vectors(void* payload, u32 item_count) {

@@ -1,5 +1,6 @@
     VamanaCoroutine insert(node_t id, const span<element_t> components,
-                           const u_ptr<ComputeThread>& thread) {
+                           const u_ptr<ComputeThread>& thread,
+                           RemotePtr* inserted_ptr = nullptr) {
         ++thread->stats.processed;
         ++thread->stats.processed_inserts;
 
@@ -21,6 +22,7 @@
         if (medoid_ptr.is_null()) {
             const auto t_alloc = std::chrono::steady_clock::now();
             RemotePtr new_ptr = co_await rdma::vamana::allocate_vamana_node(thread);
+            if (inserted_ptr != nullptr) *inserted_ptr = new_ptr;
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_alloc, t_alloc);
 
             // Write node with no neighbors.
@@ -267,6 +269,7 @@
         // Phase 3: Allocate and write new node
         const auto t_alloc = std::chrono::steady_clock::now();
         RemotePtr new_ptr = co_await rdma::vamana::allocate_vamana_node(thread);
+        if (inserted_ptr != nullptr) *inserted_ptr = new_ptr;
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_alloc, t_alloc);
 
         const auto t_new_write = std::chrono::steady_clock::now();

@@ -6,7 +6,9 @@
 
 #include "common/types.hh"
 #include "common/vector_dtype.hh"
+#include "remote_pointer.hh"
 #include "service/breakdown.hh"
+#include "service/storage_owner_protocol.hh"
 
 namespace service {
 
@@ -20,6 +22,9 @@ using QueryResult = vec<QueryResultItem>;
 struct InsertRequest {
   node_t id;
   vec<element_t> components;
+  service::storage_owner::MutationKind kind{service::storage_owner::MutationKind::insert};
+  RemotePtr old_ptr{};
+  RemotePtr new_ptr{};
   std::promise<bool> result;
   std::chrono::steady_clock::time_point enqueued_at{std::chrono::steady_clock::now()};
   std::shared_ptr<breakdown::Sample> breakdown_sample{};

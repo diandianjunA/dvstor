@@ -44,6 +44,9 @@ public:
   u32 rdma_qp_pool_size{1}; // QPs per memory node per SharedContext (1=default)
   u32 query_batch_size{1};  // Fuse GPU across N queries (1=single query)
   bool use_rabitq{};        // Use RaBitQ entries instead of full vectors during beam search
+  f64 rabitq_confidence_epsilon{1.9}; // RaBitQ theoretical error-bound multiplier
+  u32 rabitq_exact_batch{64};         // Maximum ambiguous candidates exactified together
+  u32 rabitq_exact_budget{256};       // Per-query traversal exactification budget
   str vector_data_type{"auto"};
   str insert_execution{"compute"};
   u32 insert_workers{};
@@ -206,6 +209,15 @@ private:
       "Fuse GPU/D2H across N queries processed in lockstep (1=disabled, 2-4=batch).")(
       "use-rabitq", po::bool_switch(&use_rabitq)->default_value(false),
       "Use dimension-scaled RaBitQ entries for approximate beam search + exact re-rank.")(
+      "rabitq-confidence-epsilon",
+      po::value<f64>(&rabitq_confidence_epsilon)->default_value(rabitq_confidence_epsilon),
+      "RaBitQ distance-bound multiplier. 1.9 matches the reference implementation.")(
+      "rabitq-exact-batch",
+      po::value<u32>(&rabitq_exact_batch)->default_value(rabitq_exact_batch),
+      "Maximum bound-overlap candidates exactified in one batch. 0 disables traversal exactification.")(
+      "rabitq-exact-budget",
+      po::value<u32>(&rabitq_exact_budget)->default_value(rabitq_exact_budget),
+      "Maximum candidates exactified during traversal per query. Final top-k reranking is separate.")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
       "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
@@ -403,6 +415,12 @@ public:
       os << std::setw(width) << "RDMA QP Pool Size: " << config.rdma_qp_pool_size << std::endl;
       os << std::setw(width) << "Query Batch Size: " << config.query_batch_size << std::endl;
       os << std::setw(width) << "Use RaBitQ: " << (config.use_rabitq ? "true" : "false") << std::endl;
+      os << std::setw(width) << "RaBitQ confidence epsilon: "
+         << config.rabitq_confidence_epsilon << std::endl;
+      os << std::setw(width) << "RaBitQ exact batch: "
+         << config.rabitq_exact_batch << std::endl;
+      os << std::setw(width) << "RaBitQ exact budget: "
+         << config.rabitq_exact_budget << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {
       os << std::left << std::setfill(' ');

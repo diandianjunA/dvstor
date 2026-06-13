@@ -10,6 +10,7 @@
 #include "compute_thread.hh"
 #include "coroutine.hh"
 #include "remote_pointer.hh"
+#include "vamana/storage_layout_resolver.hh"
 #include "vamana/vamana_neighborlist.hh"
 #include "vamana/vamana_node.hh"
 
@@ -42,7 +43,8 @@ inline auto unlock_vamana_node(const s_ptr<VamanaNode>& node, const u_ptr<Comput
                           IBV_WR_RDMA_WRITE,
                           true,
                           thread->ctx->get_remote_mrt(node->rptr.memory_node()),
-                          node->rptr.byte_offset() + VamanaNode::HEADER_UNTIL_LOCK,
+                          ::vamana::StorageLayoutResolver::header(node->rptr).offset +
+                            VamanaNode::HEADER_UNTIL_LOCK,
                           thread->create_wr_id());
 
     node->reset_lock();
@@ -72,12 +74,18 @@ inline auto write_vamana_node(const RemotePtr& rptr,
     std::memset(local_buffer, 0, total);
     *reinterpret_cast<u64*>(local_buffer) = header;
     *reinterpret_cast<u32*>(local_buffer + VamanaNode::offset_id()) = id;
-    *reinterpret_cast<u8*>(local_buffer + VamanaNode::offset_edge_count()) = edge_count;
+    if (VamanaNode::compact_storage()) {
+        *reinterpret_cast<u32*>(local_buffer + VamanaNode::offset_generation()) = 0;
+    } else {
+        *reinterpret_cast<u8*>(local_buffer + VamanaNode::offset_edge_count()) = edge_count;
+    }
     encode_float_vector_to_storage(components.data(), VamanaNode::DIM, VamanaNode::vector_dtype(),
                                    local_buffer + VamanaNode::offset_vector());
-    auto* neighbor_slots = reinterpret_cast<u64*>(local_buffer + VamanaNode::offset_neighbors());
-    for (u8 i = 0; i < edge_count && i < neighbors.size(); ++i) {
-        neighbor_slots[i] = neighbors[i].raw_address;
+    if (!VamanaNode::compact_storage()) {
+        auto* neighbor_slots = reinterpret_cast<u64*>(local_buffer + VamanaNode::offset_neighbors());
+        for (u8 i = 0; i < edge_count && i < neighbors.size(); ++i) {
+            neighbor_slots[i] = neighbors[i].raw_address;
+        }
     }
     if (VamanaNode::HAS_RABITQ_CODE) {
         const byte_t* vector = local_buffer + VamanaNode::offset_vector();
@@ -88,6 +96,17 @@ inline auto write_vamana_node(const RemotePtr& rptr,
         std::memcpy(local_buffer + VamanaNode::offset_rabitq_code(), code.data(), code.size());
         *reinterpret_cast<float*>(local_buffer + VamanaNode::offset_rabitq_norm()) = norm;
         *reinterpret_cast<float*>(local_buffer + VamanaNode::offset_rabitq_error()) = error;
+    }
+    byte_t* hot_buffer = nullptr;
+    size_t hot_size = 0;
+    if (VamanaNode::hot_graph_entry_available(rptr)) {
+        hot_size = VamanaNode::hot_graph_entry_size();
+        hot_buffer = thread->buffer_allocator.allocate_buffer(hot_size);
+        VamanaNode::encode_hot_graph_entry(hot_buffer,
+                                           id,
+                                           edge_count,
+                                           neighbors.data(),
+                                           std::min<size_t>(edge_count, neighbors.size()));
     }
 
     track_total_rdma_write(thread, total);
@@ -104,10 +123,26 @@ inline auto write_vamana_node(const RemotePtr& rptr,
                   rptr.byte_offset(),
                   0,
                   thread->create_wr_id());
+    if (hot_buffer != nullptr) {
+        track_total_rdma_write(thread, hot_size);
+        thread->track_post();
+        qp->post_send(reinterpret_cast<u64>(hot_buffer),
+                      hot_size,
+                      thread->ctx->get_lkey(),
+                      IBV_WR_RDMA_WRITE,
+                      true,
+                      false,
+                      thread->ctx->get_remote_mrt(rptr.memory_node()),
+                      VamanaNode::hot_graph_entry_offset(rptr),
+                      0,
+                      thread->create_wr_id());
+    }
 
     struct awaitable {
         byte_t* local_buffer;
+        byte_t* hot_buffer;
         size_t total_size;
+        size_t hot_size;
         const RemotePtr& rptr;
         const u_ptr<ComputeThread>& thread;
 
@@ -115,18 +150,20 @@ inline auto write_vamana_node(const RemotePtr& rptr,
         static void await_suspend(std::coroutine_handle<>) {}
 
         s_ptr<VamanaNode> await_resume() {
+            if (hot_buffer != nullptr) {
+                thread->buffer_allocator.free_buffer(hot_buffer, hot_size);
+            }
             return std::make_shared<VamanaNode>(local_buffer, total_size, rptr, thread.get());
         }
     };
 
-    return awaitable{local_buffer, total, rptr, thread};
+    return awaitable{local_buffer, hot_buffer, total, hot_size, rptr, thread};
 }
 
 /**
  * Write the neighbor list of a VamanaNode (edge_count + neighbors).
  *
- * The node layout has vector data BETWEEN the edge_count and the neighbor slots,
- * so we must write them at their actual offsets:
+ * AoS writes metadata and neighbor slots at their actual offsets:
  *   - edge_count + padding (4B) at offset_edge_count()
  *   - neighbor slots (R*8B) at offset_neighbors()
  */
@@ -134,6 +171,56 @@ inline auto write_vamana_neighbors(const s_ptr<VamanaNode>& node,
                                    const span<RemotePtr> neighbors,
                                    u8 edge_count,
                                    const u_ptr<ComputeThread>& thread) {
+    struct awaitable {
+        byte_t* meta_buffer;
+        byte_t* nbr_buffer;
+        byte_t* hot_buffer;
+        size_t meta_size;
+        size_t nbr_size;
+        size_t hot_size;
+        RemotePtr rptr;
+        const u_ptr<ComputeThread>& thread;
+
+        static bool await_ready() { return false; }
+        static void await_suspend(std::coroutine_handle<>) {}
+        void await_resume() {
+            if (meta_buffer != nullptr) {
+                thread->buffer_allocator.free_buffer(meta_buffer, meta_size);
+            }
+            if (nbr_buffer != nullptr) {
+                thread->buffer_allocator.free_buffer(nbr_buffer, nbr_size);
+            }
+            if (hot_buffer != nullptr) {
+                thread->buffer_allocator.free_buffer(hot_buffer, hot_size);
+            }
+        }
+    };
+
+    if (VamanaNode::compact_storage()) {
+        const size_t hot_size = VamanaNode::hot_graph_entry_size();
+        byte_t* hot_buffer = thread->buffer_allocator.allocate_buffer(hot_size);
+        VamanaNode::encode_hot_graph_entry(hot_buffer,
+                                           node->id(),
+                                           edge_count,
+                                           neighbors.data(),
+                                           std::min<size_t>(edge_count, neighbors.size()));
+
+        track_total_rdma_write(thread, hot_size, 1);
+        const QP& qp = thread->ctx->qps[node->rptr.memory_node()][0]->qp;
+        thread->track_post();
+        qp->post_send(reinterpret_cast<u64>(hot_buffer),
+                      hot_size,
+                      thread->ctx->get_lkey(),
+                      IBV_WR_RDMA_WRITE,
+                      true,
+                      false,
+                      thread->ctx->get_remote_mrt(node->rptr.memory_node()),
+                      VamanaNode::hot_graph_entry_offset(node->rptr),
+                      0,
+                      thread->create_wr_id());
+        return awaitable{nullptr, nullptr, hot_buffer,
+                         0, 0, hot_size, node->rptr, thread};
+    }
     // Buffer 1: edge_count(1B) + padding(3B)
     const size_t meta_size = VamanaNode::EDGE_COUNT_SIZE + VamanaNode::PADDING_SIZE;
     byte_t* meta_buffer = thread->buffer_allocator.allocate_buffer(meta_size);
@@ -149,7 +236,20 @@ inline auto write_vamana_neighbors(const s_ptr<VamanaNode>& node,
         reinterpret_cast<u64*>(nbr_buffer)[i] = 0;
     }
 
-    track_total_rdma_write(thread, meta_size + VamanaNode::NEIGHBORS_SIZE, 2);
+    byte_t* hot_buffer = nullptr;
+    size_t hot_size = 0;
+    if (VamanaNode::hot_graph_entry_available(node->rptr)) {
+        hot_size = VamanaNode::hot_graph_entry_size();
+        hot_buffer = thread->buffer_allocator.allocate_buffer(hot_size);
+        VamanaNode::encode_hot_graph_entry(hot_buffer,
+                                           node->id(),
+                                           edge_count,
+                                           neighbors.data(),
+                                           std::min<size_t>(edge_count, neighbors.size()));
+    }
+
+    track_total_rdma_write(thread, meta_size + VamanaNode::NEIGHBORS_SIZE + hot_size,
+                           hot_buffer == nullptr ? 2 : 3);
 
     const QP& qp = thread->ctx->qps[node->rptr.memory_node()][0]->qp;
 
@@ -162,7 +262,7 @@ inline auto write_vamana_neighbors(const s_ptr<VamanaNode>& node,
                   true,
                   false,
                   thread->ctx->get_remote_mrt(node->rptr.memory_node()),
-                  node->rptr.byte_offset() + VamanaNode::offset_edge_count(),
+                  ::vamana::StorageLayoutResolver::edge_count(node->rptr).offset,
                   0,
                   thread->create_wr_id());
 
@@ -175,27 +275,27 @@ inline auto write_vamana_neighbors(const s_ptr<VamanaNode>& node,
                   true,
                   false,
                   thread->ctx->get_remote_mrt(node->rptr.memory_node()),
-                  node->rptr.byte_offset() + VamanaNode::offset_neighbors(),
+                  ::vamana::StorageLayoutResolver::neighbor_slots(node->rptr).offset,
                   0,
                   thread->create_wr_id());
 
-    struct awaitable {
-        byte_t* meta_buffer;
-        byte_t* nbr_buffer;
-        size_t meta_size;
-        size_t nbr_size;
-        RemotePtr rptr;
-        const u_ptr<ComputeThread>& thread;
+    if (hot_buffer != nullptr) {
+        thread->track_post();
+        qp->post_send(reinterpret_cast<u64>(hot_buffer),
+                      hot_size,
+                      thread->ctx->get_lkey(),
+                      IBV_WR_RDMA_WRITE,
+                      true,
+                      false,
+                      thread->ctx->get_remote_mrt(node->rptr.memory_node()),
+                      VamanaNode::hot_graph_entry_offset(node->rptr),
+                      0,
+                      thread->create_wr_id());
+    }
 
-        static bool await_ready() { return false; }
-        static void await_suspend(std::coroutine_handle<>) {}
-        void await_resume() {
-            thread->buffer_allocator.free_buffer(meta_buffer, meta_size);
-            thread->buffer_allocator.free_buffer(nbr_buffer, nbr_size);
-        }
-    };
-
-    return awaitable{meta_buffer, nbr_buffer, meta_size, VamanaNode::NEIGHBORS_SIZE, node->rptr, thread};
+    return awaitable{meta_buffer, nbr_buffer, hot_buffer,
+                     meta_size, VamanaNode::NEIGHBORS_SIZE, hot_size,
+                     node->rptr, thread};
 }
 
 /**
@@ -239,7 +339,7 @@ inline auto write_vamana_header(const RemotePtr& rptr,
                           IBV_WR_RDMA_WRITE,
                           true,
                           thread->ctx->get_remote_mrt(rptr.memory_node()),
-                          rptr.byte_offset(),
+                          ::vamana::StorageLayoutResolver::header(rptr).offset,
                           thread->create_wr_id());
 
     return std::suspend_always{};

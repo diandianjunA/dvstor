@@ -25,6 +25,10 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   receive_remote_access_tokens();
 
   VamanaNode::disable_rabitq();
+  VamanaNode::disable_hot_graph();
+  VamanaNode::set_storage_format(vamana::StorageFormat::aos_v1);
+  service::index_metadata::Metadata startup_metadata;
+  bool have_startup_metadata = false;
   if (config_.load_index) {
     const filepath_t startup_prefix = config_.resolved_index_prefix();
     const filepath_t meta_file = filepath_t(startup_prefix.string() + ".meta.json");
@@ -32,22 +36,27 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
       service::index_metadata::Metadata metadata;
       str metadata_error;
       lib_assert(service::index_metadata::load_metadata(startup_prefix, metadata, &metadata_error), metadata_error);
+      startup_metadata = metadata;
+      have_startup_metadata = true;
       if (config_.vector_data_type != "auto" && config_.resolved_vector_dtype() != metadata.vector_dtype) {
         lib_failure("configured vector-data-type=" + config_.vector_data_type +
                     " does not match index metadata vector_data_type=" + vector_dtype_name(metadata.vector_dtype));
       }
       config_.vector_data_type = vector_dtype_name(metadata.vector_dtype);
-      VamanaNode::init_static_storage(config_.dim, config_.R, metadata.vector_dtype);
-      lib_assert(metadata.schema_version >= 7 &&
-                 metadata.storage_format == VamanaNode::storage_format_name(),
+      const auto storage_format = vamana::parse_storage_format(metadata.storage_format);
+      lib_assert(storage_format.has_value() && metadata.schema_version == 13,
                  "index storage format is obsolete; rebuild with the current offline builder");
+      VamanaNode::set_storage_format(*storage_format);
+      VamanaNode::init_static_storage(config_.dim, config_.R, metadata.vector_dtype);
       if (metadata.node_layout == "rabitq") {
         lib_assert(metadata.rabitq_centroid.size() == metadata.dim,
                    "RaBitQ index metadata has a missing or invalid centroid");
         VamanaNode::enable_rabitq();
         VamanaNode::set_rabitq_centroid(metadata.rabitq_centroid);
         lib_assert(metadata.rabitq_code_bits == VamanaNode::rabitq_code_bits() &&
-                   metadata.rabitq_entry_size == VamanaNode::rabitq_entry_size(),
+                   metadata.rabitq_entry_size == VamanaNode::rabitq_entry_size() &&
+                   metadata.rabitq_cache_bits == vamana::rabitq::kCacheBits &&
+                   metadata.rabitq_cache_entry_size == vamana::rabitq::kCacheEntryBytes,
                    "RaBitQ index code layout does not match the runtime dimension");
       } else if (config_.use_rabitq) {
         lib_failure("--use-rabitq requires an index built with --use-rabitq");
@@ -63,6 +72,27 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                  metadata.neighbors_offset == VamanaNode::offset_neighbors() &&
                  metadata.rabitq_offset == (VamanaNode::HAS_RABITQ_CODE ? VamanaNode::offset_rabitq_code() : 0),
                  "index metadata storage offsets mismatch on compute node");
+      if (*storage_format == vamana::StorageFormat::compact_v1) {
+        lib_assert(metadata.hot_graph_pointer_bytes == vamana::hot_graph::kCompactPointerBytes &&
+                   metadata.hot_graph_entry_size == VamanaNode::hot_graph_entry_size() &&
+                   metadata.hot_graph_offsets.size() == num_servers_ &&
+                   metadata.hot_graph_entry_counts.size() == num_servers_,
+                   "index hot graph metadata mismatch on compute node");
+        lib_assert(metadata.hot_graph_dynamic_base_offsets.size() == num_servers_ &&
+                   metadata.hot_graph_dynamic_record_bytes >=
+                     metadata.hot_graph_dynamic_hot_offset + metadata.hot_graph_entry_size &&
+                   metadata.hot_graph_dynamic_hot_offset >= VamanaNode::total_size(),
+                   "index dynamic hot graph metadata mismatch on compute node");
+        VamanaNode::configure_hot_graph(metadata.hot_graph_offsets,
+                                        metadata.hot_graph_entry_counts,
+                                        metadata.hot_graph_entry_size,
+                                        metadata.hot_graph_shard_bits,
+                                        2u,
+                                        metadata.hot_graph_dynamic_base_offsets,
+                                        metadata.hot_graph_dynamic_record_bytes,
+                                        metadata.hot_graph_dynamic_hot_offset);
+        lib_assert(VamanaNode::HAS_HOT_GRAPH, "failed to enable compact hot graph on compute node");
+      }
     }
   }
 
@@ -76,8 +106,28 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     config_.alpha, config_.k, config_.dim, config_.resolved_vector_dtype());
   vamana_->set_expansion_batch(config_.expansion_batch);
   vamana_->set_query_batch_size(config_.query_batch_size);
+  vamana_->set_rabitq_pipeline(
+    static_cast<f32>(config_.rabitq_confidence_epsilon),
+    config_.rabitq_exact_batch,
+    config_.rabitq_exact_budget);
   vamana_->set_use_rabitq(config_.use_rabitq);
-  print_status(vamana_->use_rabitq() ? "search: RaBitQ + exact rerank" : "search: exact");
+  if (vamana_->use_rabitq() && config_.load_index) {
+    const filepath_t startup_prefix = config_.resolved_index_prefix();
+    rabitq_cache_ = std::make_unique<vamana::rabitq::Cache>();
+    str cache_error;
+    lib_assert(rabitq_cache_->load(startup_prefix, num_servers_,
+                                  static_cast<u32>(VamanaNode::total_size()), &cache_error),
+               cache_error);
+    const size_t raw_bytes = rabitq_cache_->entry_count() * VamanaNode::vector_bytes();
+    lib_assert(raw_bytes == 0 || rabitq_cache_->size_bytes() * 10 <= raw_bytes,
+               "RaBitQ compute cache exceeds the 10% raw-vector budget");
+    vamana_->set_rabitq_cache(rabitq_cache_.get());
+    print_status("RaBitQ local control cache: " +
+                 std::to_string(rabitq_cache_->size_bytes()) + " bytes");
+  }
+  print_status(vamana_->use_rabitq()
+    ? "search: RaBitQ + budgeted CPU exact refinement"
+    : "search: exact");
 
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,
                                               config_.max_send_queue_wr,
@@ -104,6 +154,9 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                              config_.gpudirect_rdma);
   }
   cm_.synchronize();
+  if (have_startup_metadata && !config_.use_storage_owner_insert()) {
+    (void)initialize_compute_side_idmap(config_.resolved_index_prefix(), startup_metadata);
+  }
 
   wait_for_load_or_store();
   synchronize_clients_after_startup();

@@ -4,14 +4,18 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
 
 #include "coroutine.hh"
+#include "common/index_path.hh"
 #include "gpu/gpu_kernel_launcher.hh"
 #include "rdma/vamana_rdma_operations.hh"
 #include "service/storage_owner_client_helpers.hh"
+#include "vamana/idmap.hh"
+#include "vamana/storage_layout_resolver.hh"
 
 #include <cuda_runtime.h>
 

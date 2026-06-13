@@ -198,6 +198,8 @@ struct ThreadStatistics {
   size_t build_vector_rdma_reads_in_bytes{0};
   size_t query_neighbor_rdma_read_ops{0};
   size_t query_vector_rdma_read_ops{0};
+  size_t query_vector_rdma_batch_calls{0};
+  size_t query_vector_rdma_cqes{0};
   size_t build_neighbor_rdma_read_ops{0};
   size_t build_vector_rdma_read_ops{0};
   size_t query_h2d_bytes{0};
@@ -205,6 +207,10 @@ struct ThreadStatistics {
   size_t build_h2d_bytes{0};
   size_t build_d2h_bytes{0};
   size_t query_exact_reranks{0};
+  size_t query_rabitq_l0_candidates{0};
+  size_t query_rabitq_cache_misses{0};
+  size_t query_rabitq_l1_candidates{0};
+  size_t query_rabitq_l2_candidates{0};
   size_t build_l2_kernels{0};
   size_t build_prune_kernels{0};
   size_t build_overflow_prunes{0};

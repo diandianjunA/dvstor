@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstring>
 
+#include "vamana/storage_layout_resolver.hh"
+
 namespace {
 
 using Configuration = configuration::IndexConfiguration;
@@ -22,10 +24,7 @@ using service::storage_owner::handoff_response_visited;
 using service::storage_owner::search_handoff_response_bytes;
 
 inline bool ptr_in_bounds(RemotePtr rptr, u64 shard_cap) {
-  if (rptr.is_null()) {
-    return false;
-  }
-  return rptr.byte_offset() + VamanaNode::total_size() <= shard_cap;
+  return vamana::StorageLayoutResolver::ptr_in_bounds(rptr, shard_cap);
 }
 
 }  // namespace
@@ -86,6 +85,9 @@ bool MemoryNode::handle_search_handoff_rpc(u32 source_shard,
     vec<RemotePtr> batch(local_unexpanded.begin() + begin, local_unexpanded.begin() + end);
     vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
     for (const NodeSnapshot& snapshot : snapshots) {
+      if (snapshot.deleted) {
+        continue;
+      }
       const distance_t dist = distance_to_stored_vector(query, snapshot.vector_data.data(), config);
       // Update distance in beam
       for (auto& entry : beam) {

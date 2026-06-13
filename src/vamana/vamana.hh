@@ -25,6 +25,7 @@
 #include "gpu/gpu_kernel_launcher.hh"
 #include "rdma/vamana_rdma_operations.hh"
 #include "remote_pointer.hh"
+#include "vamana/rabitq_cache.hh"
 #include "vamana/vamana_neighborlist.hh"
 #include "vamana/vamana_node.hh"
 
@@ -86,6 +87,12 @@ public:
     }
     u32 query_batch_size() const { return query_batch_size_; }
     bool use_rabitq() const { return use_rabitq_; }
+    void set_rabitq_cache(const rabitq::Cache* cache) { rabitq_cache_ = cache; }
+    void set_rabitq_pipeline(f32 confidence_epsilon, u32 exact_batch, u32 exact_budget) {
+        rabitq_confidence_epsilon_ = std::max(confidence_epsilon, 0.0f);
+        rabitq_exact_batch_ = exact_batch;
+        rabitq_exact_budget_ = exact_budget;
+    }
     void set_use_rabitq(bool v) {
         use_rabitq_ = v;
         if (!v) return;
@@ -107,6 +114,10 @@ private:
     u32 expansion_batch_{1};
     u32 query_batch_size_{1};
     bool use_rabitq_{false};
+    const rabitq::Cache* rabitq_cache_{nullptr};
+    f32 rabitq_confidence_epsilon_{1.9f};
+    u32 rabitq_exact_batch_{64};
+    u32 rabitq_exact_budget_{256};
     const u32 R_;
     const u32 beam_width_;
     const u32 beam_width_construction_;
