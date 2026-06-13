@@ -115,20 +115,23 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     rabitq_cache_ = std::make_unique<vamana::rabitq::Cache>();
     str cache_error;
     lib_assert(rabitq_cache_->load(startup_prefix, num_servers_,
-                                  static_cast<u32>(VamanaNode::total_size()), &cache_error),
+                                  static_cast<u32>(VamanaNode::total_size()),
+                                  static_cast<size_t>(config_.rabitq_dynamic_budget_mb) << 20,
+                                  &cache_error),
                cache_error);
     const size_t raw_bytes = rabitq_cache_->entry_count() * VamanaNode::vector_bytes();
     lib_assert(raw_bytes == 0 ||
-               static_cast<double>(rabitq_cache_->size_bytes()) / raw_bytes <=
+               static_cast<double>(rabitq_cache_->total_size_bytes()) / raw_bytes <=
                  config_.rabitq_cache_max_ratio,
                "RaBitQ gate sidecar exceeds --rabitq-cache-max-ratio");
     vamana_->set_rabitq_cache(rabitq_cache_.get());
-    print_status("RaBitQ gate v2 cache: " +
-                 std::to_string(rabitq_cache_->size_bytes()) + " bytes, NUMA " +
+    print_status("RaBitQ budget gate cache: static " +
+                 std::to_string(rabitq_cache_->size_bytes()) + " bytes, dynamic " +
+                 std::to_string(rabitq_cache_->dynamic_size_bytes()) + " bytes, NUMA " +
                  (rabitq_cache_->numa_interleaved() ? "interleaved" : "local"));
   }
   print_status(vamana_->use_rabitq()
-    ? "search: local RaBitQ gate + exact CPU beam"
+    ? "search: budget RaBitQ gate + GPUDirect exact beam"
     : "search: exact");
 
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,
@@ -137,10 +140,11 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   worker_pool_->allocate_worker_threads(context_, cm_, remote_access_tokens_, config_.num_coroutines,
                                          config_.rdma_qp_pool_size);
   // Initialize GPU buffers for each compute thread
-  const u32 max_batch = std::max(config_.beam_width * config_.expansion_batch,
+  const u32 query_batch_factor = std::max<u32>(1, config_.query_batch_size);
+  const u32 max_batch = std::max(config_.beam_width * config_.expansion_batch * query_batch_factor,
                                    config_.beam_width_construction);
   const size_t query_buffer_bytes = std::max(
-    static_cast<size_t>(config_.dim) * sizeof(element_t),
+    static_cast<size_t>(config_.dim) * sizeof(element_t) * query_batch_factor,
     static_cast<size_t>(VamanaNode::rabitq_code_bits()) * sizeof(float));
   const size_t candidate_buffer_bytes = std::max(
     VamanaNode::vector_bytes(), VamanaNode::rabitq_entry_size());

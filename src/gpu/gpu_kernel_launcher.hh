@@ -35,6 +35,15 @@ void launch_batch_typed_query_l2_distances(cudaStream_t stream, cudaEvent_t even
                                            float* d_distances,
                                            uint32_t n_candidates, uint32_t dim);
 
+void launch_batch_typed_multi_query_l2_distances(cudaStream_t stream, cudaEvent_t event,
+                                                 const void* d_queries,
+                                                 uint32_t query_dtype,
+                                                 const uint32_t* d_candidate_query_ids,
+                                                 const void* d_candidates,
+                                                 uint32_t candidate_dtype,
+                                                 float* d_distances,
+                                                 uint32_t n_candidates,
+                                                 uint32_t dim);
 
 void launch_batch_id_l2_distances(cudaStream_t stream, cudaEvent_t event,
                                   const void* d_base_vectors,

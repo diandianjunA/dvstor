@@ -261,7 +261,8 @@ write_service_config() {
       echo "rabitq-gate-width = ${RABITQ_GATE_WIDTH:-16}"
       echo "rabitq-gate-max-width = ${RABITQ_GATE_MAX_WIDTH:-24}"
       echo "rabitq-gate-margin = ${RABITQ_GATE_MARGIN:-0.05}"
-      echo "rabitq-cache-max-ratio = ${RABITQ_CACHE_MAX_RATIO:-0.15}"
+      echo "rabitq-cache-max-ratio = ${RABITQ_CACHE_MAX_RATIO:-0.10}"
+      echo "rabitq-dynamic-budget-mb = ${RABITQ_DYNAMIC_BUDGET_MB:-64}"
     fi
     echo "insert-execution = $insert_execution"
     if [[ "$insert_execution" == "storage_owner" ]]; then

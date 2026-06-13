@@ -68,6 +68,13 @@ struct InsertBatchResponseHeader {
   u64 batch_id{};
 };
 
+struct MutationResult {
+  u64 new_rptr_raw{};
+  u64 old_rptr_raw{};
+  u32 generation{};
+  u32 reserved{};
+};
+
 struct InsertBreakdownCounters {
   u64 storage_owner_queue_wait_ns{};
   u64 storage_owner_medoid_ns{};
@@ -139,6 +146,7 @@ inline size_t mutation_batch_request_bytes(u32 item_count, u32 dim) {
 inline size_t insert_batch_response_bytes(u32 item_count) {
   return sizeof(InsertBatchResponseHeader) +
          static_cast<size_t>(item_count) * sizeof(u32) +
+         static_cast<size_t>(item_count) * sizeof(MutationResult) +
          sizeof(InsertBreakdownCounters) +
          sizeof(u32) +
          static_cast<size_t>(item_count) * VamanaNode::R * sizeof(u64);
@@ -202,14 +210,22 @@ inline const u32* response_statuses(const void* payload) {
   return reinterpret_cast<const u32*>(reinterpret_cast<const byte_t*>(payload) + sizeof(InsertBatchResponseHeader));
 }
 
+inline MutationResult* response_mutation_results(void* payload, u32 item_count) {
+  return reinterpret_cast<MutationResult*>(response_statuses(payload) + item_count);
+}
+
+inline const MutationResult* response_mutation_results(const void* payload, u32 item_count) {
+  return reinterpret_cast<const MutationResult*>(response_statuses(payload) + item_count);
+}
+
 inline InsertBreakdownCounters* response_breakdown(void* payload, u32 item_count) {
   return reinterpret_cast<InsertBreakdownCounters*>(
-    reinterpret_cast<byte_t*>(response_statuses(payload) + item_count));
+    reinterpret_cast<byte_t*>(response_mutation_results(payload, item_count) + item_count));
 }
 
 inline const InsertBreakdownCounters* response_breakdown(const void* payload, u32 item_count) {
   return reinterpret_cast<const InsertBreakdownCounters*>(
-    reinterpret_cast<const byte_t*>(response_statuses(payload) + item_count));
+    reinterpret_cast<const byte_t*>(response_mutation_results(payload, item_count) + item_count));
 }
 
 inline u32* response_invalidation_count(void* payload, u32 item_count) {

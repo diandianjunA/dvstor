@@ -242,7 +242,8 @@ private:
                                                InsertBreakdownCounters& breakdown,
                                                const Configuration& config,
                                                vec<u64>* invalidated_neighbors = nullptr,
-                                               vec<u32>* statuses = nullptr);
+                                               vec<u32>* statuses = nullptr,
+                                               vec<service::storage_owner::MutationResult>* results = nullptr);
   static StorageOwnerInsertCoroutine dummy_storage_owner_insert_coroutine();
   size_t insert_request_slot_offset(u32 client_id, u32 slot_id) const;
   size_t insert_response_slot_offset(const Configuration& config, u32 client_id, u32 slot_id) const;
@@ -256,7 +257,8 @@ private:
                                          InsertBreakdownCounters& breakdown,
                                          const Configuration& config,
                                          vec<u64>* invalidated_neighbors = nullptr,
-                                         vec<u32>* statuses = nullptr);
+                                         vec<u32>* statuses = nullptr,
+                                         vec<service::storage_owner::MutationResult>* results = nullptr);
 
   // Storage-owner index operations
   RemotePtr allocate_local_node();

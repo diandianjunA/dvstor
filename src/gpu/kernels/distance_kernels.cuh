@@ -94,6 +94,47 @@ __global__ void batch_l2_typed_pair_distance_indirect_kernel(
     }
 }
 
+template <uint32_t TILE_SIZE, typename QueryT, typename CandidateT,
+          typename IntegralAccumulator = int32_t>
+__global__ void batch_l2_typed_multi_query_distance_kernel(
+    const QueryT* __restrict__ queries,
+    const uint32_t* __restrict__ candidate_query_ids,
+    const CandidateT* __restrict__ candidates,
+    float* __restrict__ distances,
+    uint32_t n_candidates,
+    uint32_t dim)
+{
+    auto block = cg::this_thread_block();
+    auto tile = cg::tiled_partition<TILE_SIZE>(block);
+
+    uint32_t tile_id = (blockIdx.x * blockDim.x + threadIdx.x) / TILE_SIZE;
+    if (tile_id >= n_candidates) return;
+
+    const QueryT* query = queries + static_cast<size_t>(candidate_query_ids[tile_id]) * dim;
+    const CandidateT* cand_vec = candidates + static_cast<size_t>(tile_id) * dim;
+    if constexpr (std::is_integral_v<QueryT> && std::is_integral_v<CandidateT>) {
+        IntegralAccumulator local_sum = 0;
+        for (uint32_t i = tile.thread_rank(); i < dim; i += TILE_SIZE) {
+            const int diff = static_cast<int>(query[i]) - static_cast<int>(cand_vec[i]);
+            local_sum += static_cast<IntegralAccumulator>(diff * diff);
+        }
+        IntegralAccumulator total = cg::reduce(tile, local_sum, cg::plus<IntegralAccumulator>());
+        if (tile.thread_rank() == 0) {
+            distances[tile_id] = static_cast<float>(total);
+        }
+    } else {
+        float local_sum = 0.0f;
+        for (uint32_t i = tile.thread_rank(); i < dim; i += TILE_SIZE) {
+            const float diff = typed_component_to_float(query[i]) - typed_component_to_float(cand_vec[i]);
+            local_sum += diff * diff;
+        }
+        float total = cg::reduce(tile, local_sum, cg::plus<float>());
+        if (tile.thread_rank() == 0) {
+            distances[tile_id] = total;
+        }
+    }
+}
+
 
 template <uint32_t TILE_SIZE, typename T, typename IntegralAccumulator = int32_t>
 __global__ void batch_l2_id_distance_kernel(

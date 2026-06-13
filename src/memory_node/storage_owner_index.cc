@@ -1343,6 +1343,8 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   FreshnessEntry old_entry{};
   u32 generation = 0;
   const auto status = prepare_mutation(job.id, job.kind, &old_entry, &generation);
+  job.old_ptr = old_entry.current;
+  job.generation = generation;
   if (status != service::storage_owner::MutationStatus::ok) {
     job.status = status;
     job.ok = false;
@@ -1362,6 +1364,7 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   breakdown.storage_owner_medoid_ns += elapsed_ns_since(t_medoid);
   if (medoid_ptr.is_null()) {
     const RemotePtr new_ptr = allocate_local_node();
+    job.new_ptr = new_ptr;
     auto t_write = std::chrono::steady_clock::now();
     write_new_node(new_ptr, job.id, components, {}, generation);
     breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
@@ -1413,6 +1416,7 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
                                                        VectorDType::float32, candidates, empty_skip, config, &breakdown);
   breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
   const RemotePtr new_ptr = allocate_local_node();
+  job.new_ptr = new_ptr;
   auto t_write = std::chrono::steady_clock::now();
   write_new_node(new_ptr, job.id, components, selected_neighbors, generation);
   breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);

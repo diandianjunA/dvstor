@@ -78,11 +78,6 @@ public:
     void set_expansion_batch(u32 k) { expansion_batch_ = k; }
     u32 expansion_batch() const { return expansion_batch_; }
     void set_query_batch_size(u32 q) {
-        if (q > 1 && use_rabitq_) {
-            std::cerr << "[WARNING] query-batch-size > 1 combined with use-rabitq: "
-                         "RaBitQ is not yet supported in the batched query path (knn_batch). "
-                         "Falling back to single-query path for correctness." << std::endl;
-        }
         query_batch_size_ = q;
     }
     u32 query_batch_size() const { return query_batch_size_; }
@@ -97,11 +92,6 @@ public:
         use_rabitq_ = v;
         if (!v) return;
         rabitq::validate_dimension();
-        if (query_batch_size_ > 1) {
-            std::cerr << "[WARNING] disabling query batching because RaBitQ does not support knn_batch"
-                      << std::endl;
-            query_batch_size_ = 1;
-        }
         VamanaNode::enable_rabitq();
     }
 

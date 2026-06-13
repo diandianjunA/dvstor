@@ -101,6 +101,13 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
     if (ok) {
       ++inserted;
       publish_compute_side_id(requests[i]->id, requests[i]->new_ptr, false);
+      if (rabitq_cache_) {
+        const auto stored = encode_float_vector_to_storage(
+            span<const element_t>{requests[i]->components.data(), requests[i]->components.size()},
+            VamanaNode::vector_dtype());
+        (void)rabitq_cache_->upsert_dynamic(
+            requests[i]->new_ptr, stored.data(), VamanaNode::vector_dtype());
+      }
     }
     if (samples[i] && samples[i]->finished_flag) {
       std::lock_guard<std::mutex> lock(breakdown_mutex_);
@@ -147,8 +154,18 @@ size_t ComputeService<Distance>::upsert(const vec<InsertItem>& batch) {
         ++updated;
         if (!requests[i]->old_ptr.is_null()) {
           (void)mark_remote_deleted(requests[i]->old_ptr);
+          if (rabitq_cache_) {
+            (void)rabitq_cache_->erase_dynamic(requests[i]->old_ptr);
+          }
         }
         publish_compute_side_id(requests[i]->id, requests[i]->new_ptr, false);
+        if (rabitq_cache_) {
+          const auto stored = encode_float_vector_to_storage(
+              span<const element_t>{requests[i]->components.data(), requests[i]->components.size()},
+              VamanaNode::vector_dtype());
+          (void)rabitq_cache_->upsert_dynamic(
+              requests[i]->new_ptr, stored.data(), VamanaNode::vector_dtype());
+        }
       }
     }
     vectors_inserted_.fetch_add(updated, std::memory_order_relaxed);
@@ -199,6 +216,9 @@ size_t ComputeService<Distance>::erase(const vec<node_t>& ids) {
       }
       if (mark_remote_deleted(ptr)) {
         publish_compute_side_id(id, ptr, true);
+        if (rabitq_cache_) {
+          (void)rabitq_cache_->erase_dynamic(ptr);
+        }
         ++erased;
       }
     }
@@ -625,6 +645,8 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
     const auto* response =
       reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(slot.response_buffer.data());
     const u32* statuses = service::storage_owner::response_statuses(slot.response_buffer.data());
+    const auto* mutation_results = service::storage_owner::response_mutation_results(
+      slot.response_buffer.data(), slot.item_count);
     const bool response_ok = (response->magic == service::storage_owner::kInsertMagic ||
                               response->magic == service::storage_owner::kMutationMagic) &&
                              response->owner_storage == slot.owner_storage &&
@@ -656,6 +678,10 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
     const u64 response_wait_unaccounted_ns =
       response_wait_ns > memory_breakdown_ns ? response_wait_ns - memory_breakdown_ns : 0;
     const auto finished_at = slot.response_completed_at;
+    const bool mutation_response = response->magic == service::storage_owner::kMutationMagic;
+    const byte_t* request_vectors = mutation_response
+      ? service::storage_owner::mutation_request_vectors(slot.request_buffer.data(), slot.item_count)
+      : service::storage_owner::request_vectors(slot.request_buffer.data(), slot.item_count);
 
     for (u32 i = 0; i < slot.item_count; ++i) {
       const bool ok = response_ok && statuses[i] == 0;
@@ -685,6 +711,19 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
           add_storage_owner_breakdown(slot.samples[i], *breakdown, slot.item_count);
         }
         slot.samples[i]->mark_finished(finished_at, statistics::ThreadStatistics{});
+      }
+      if (ok && rabitq_cache_ != nullptr) {
+        const auto& result = mutation_results[i];
+        if (result.old_rptr_raw != 0) {
+          (void)rabitq_cache_->erase_dynamic(RemotePtr{result.old_rptr_raw});
+        }
+        if (result.new_rptr_raw != 0 &&
+            slot.tasks[i]->kind != service::storage_owner::MutationKind::erase) {
+          (void)rabitq_cache_->upsert_dynamic(
+            RemotePtr{result.new_rptr_raw},
+            request_vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes(),
+            VamanaNode::vector_dtype());
+        }
       }
       slot.tasks[i]->result.set_value(ok);
     }

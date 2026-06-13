@@ -47,7 +47,8 @@ public:
   u32 rabitq_gate_width{16};
   u32 rabitq_gate_max_width{24};
   f64 rabitq_gate_margin{0.05};
-  f64 rabitq_cache_max_ratio{0.15};
+  f64 rabitq_cache_max_ratio{0.10};
+  u32 rabitq_dynamic_budget_mb{64};
   str vector_data_type{"auto"};
   str insert_execution{"compute"};
   u32 insert_workers{};
@@ -219,7 +220,10 @@ private:
       "Relative margin around the gate-width cutoff.")(
       "rabitq-cache-max-ratio",
       po::value<f64>(&rabitq_cache_max_ratio)->default_value(rabitq_cache_max_ratio),
-      "Maximum sidecar bytes as a ratio of raw vector bytes.")(
+      "Maximum compute-node RaBitQ bytes as a ratio of raw vector bytes.")(
+      "rabitq-dynamic-budget-mb",
+      po::value<u32>(&rabitq_dynamic_budget_mb)->default_value(rabitq_dynamic_budget_mb),
+      "Fixed RaBitQ dynamic overlay budget in MiB.")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
       "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
@@ -426,6 +430,7 @@ public:
       os << std::setw(width) << "RaBitQ gate max width: " << config.rabitq_gate_max_width << std::endl;
       os << std::setw(width) << "RaBitQ gate margin: " << config.rabitq_gate_margin << std::endl;
       os << std::setw(width) << "RaBitQ cache max ratio: " << config.rabitq_cache_max_ratio << std::endl;
+      os << std::setw(width) << "RaBitQ dynamic budget MB: " << config.rabitq_dynamic_budget_mb << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {
       os << std::left << std::setfill(' ');

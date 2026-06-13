@@ -187,6 +187,25 @@ void launch_typed_pair_distance_indirect(cudaStream_t stream,
             d_distances, n_candidates, dim);
 }
 
+template <typename QueryT, typename CandidateT, typename IntegralAccumulator = int32_t>
+void launch_typed_multi_query_distance(cudaStream_t stream,
+                                       const void* d_queries,
+                                       const uint32_t* d_candidate_query_ids,
+                                       const void* d_candidates,
+                                       float* d_distances,
+                                       uint32_t n_candidates,
+                                       uint32_t dim) {
+    uint32_t total_threads = n_candidates * TILE_SIZE;
+    uint32_t num_blocks = (total_threads + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    gpu_kernels::batch_l2_typed_multi_query_distance_kernel<
+        TILE_SIZE, QueryT, CandidateT, IntegralAccumulator>
+        <<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+            static_cast<const QueryT*>(d_queries),
+            d_candidate_query_ids,
+            static_cast<const CandidateT*>(d_candidates),
+            d_distances, n_candidates, dim);
+}
+
 template <typename QueryT, typename CandidateT>
 void launch_integral_pair_distance(cudaStream_t stream,
                                    const void* d_query,
@@ -200,6 +219,23 @@ void launch_integral_pair_distance(cudaStream_t stream,
     } else {
         launch_typed_pair_distance<QueryT, CandidateT, int64_t>(
             stream, d_query, d_candidates, d_distances, n_candidates, dim);
+    }
+}
+
+template <typename QueryT, typename CandidateT>
+void launch_integral_multi_query_distance(cudaStream_t stream,
+                                          const void* d_queries,
+                                          const uint32_t* d_candidate_query_ids,
+                                          const void* d_candidates,
+                                          float* d_distances,
+                                          uint32_t n_candidates,
+                                          uint32_t dim) {
+    if (int32_accumulator_is_safe<QueryT, CandidateT>(dim)) {
+        launch_typed_multi_query_distance<QueryT, CandidateT, int32_t>(
+            stream, d_queries, d_candidate_query_ids, d_candidates, d_distances, n_candidates, dim);
+    } else {
+        launch_typed_multi_query_distance<QueryT, CandidateT, int64_t>(
+            stream, d_queries, d_candidate_query_ids, d_candidates, d_distances, n_candidates, dim);
     }
 }
 
@@ -257,6 +293,55 @@ void launch_batch_typed_query_l2_distances(cudaStream_t stream, cudaEvent_t even
         launch_integral_pair_distance<int8_t, int8_t>(stream, d_query, d_candidates, d_distances, n_candidates, dim);
     } else {
         fprintf(stderr, "Unsupported query/candidate dtype pair: %u/%u\n", query_dtype, candidate_dtype);
+        abort();
+    }
+
+    CUDA_CHECK(cudaEventRecord(event, stream));
+}
+
+void launch_batch_typed_multi_query_l2_distances(cudaStream_t stream, cudaEvent_t event,
+                                                 const void* d_queries,
+                                                 uint32_t query_dtype,
+                                                 const uint32_t* d_candidate_query_ids,
+                                                 const void* d_candidates,
+                                                 uint32_t candidate_dtype,
+                                                 float* d_distances,
+                                                 uint32_t n_candidates,
+                                                 uint32_t dim) {
+    if (n_candidates == 0) {
+        CUDA_CHECK(cudaEventRecord(event, stream));
+        return;
+    }
+
+    if (query_dtype == 0 && candidate_dtype == 0) {
+        launch_typed_multi_query_distance<float, float>(
+            stream, d_queries, d_candidate_query_ids, d_candidates, d_distances, n_candidates, dim);
+    } else if (query_dtype == 0 && candidate_dtype == 1) {
+        launch_typed_multi_query_distance<float, uint8_t>(
+            stream, d_queries, d_candidate_query_ids, d_candidates, d_distances, n_candidates, dim);
+    } else if (query_dtype == 0 && candidate_dtype == 2) {
+        launch_typed_multi_query_distance<float, int8_t>(
+            stream, d_queries, d_candidate_query_ids, d_candidates, d_distances, n_candidates, dim);
+    } else if (query_dtype == 1 && candidate_dtype == 0) {
+        launch_typed_multi_query_distance<uint8_t, float>(
+            stream, d_queries, d_candidate_query_ids, d_candidates, d_distances, n_candidates, dim);
+    } else if (query_dtype == 1 && candidate_dtype == 1) {
+        launch_integral_multi_query_distance<uint8_t, uint8_t>(
+            stream, d_queries, d_candidate_query_ids, d_candidates, d_distances, n_candidates, dim);
+    } else if (query_dtype == 1 && candidate_dtype == 2) {
+        launch_integral_multi_query_distance<uint8_t, int8_t>(
+            stream, d_queries, d_candidate_query_ids, d_candidates, d_distances, n_candidates, dim);
+    } else if (query_dtype == 2 && candidate_dtype == 0) {
+        launch_typed_multi_query_distance<int8_t, float>(
+            stream, d_queries, d_candidate_query_ids, d_candidates, d_distances, n_candidates, dim);
+    } else if (query_dtype == 2 && candidate_dtype == 1) {
+        launch_integral_multi_query_distance<int8_t, uint8_t>(
+            stream, d_queries, d_candidate_query_ids, d_candidates, d_distances, n_candidates, dim);
+    } else if (query_dtype == 2 && candidate_dtype == 2) {
+        launch_integral_multi_query_distance<int8_t, int8_t>(
+            stream, d_queries, d_candidate_query_ids, d_candidates, d_distances, n_candidates, dim);
+    } else {
+        fprintf(stderr, "Unsupported multi-query dtype pair: %u/%u\n", query_dtype, candidate_dtype);
         abort();
     }
 

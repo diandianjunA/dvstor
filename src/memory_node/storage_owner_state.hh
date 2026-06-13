@@ -208,6 +208,9 @@ struct StorageOwnerInsertJob {
   vec<byte_t> vector_data;
   service::storage_owner::MutationStatus status{service::storage_owner::MutationStatus::failed};
   bool ok{false};
+  RemotePtr new_ptr{};
+  RemotePtr old_ptr{};
+  u32 generation{};
 };
 
 struct FreshnessEntry {

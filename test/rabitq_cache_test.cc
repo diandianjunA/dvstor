@@ -97,7 +97,7 @@ int main() {
 
   vamana::rabitq::Cache cache;
   str error;
-  if (!cache.load(prefix, 2, node_size, &error)) {
+  if (!cache.load(prefix, 2, node_size, 4096, &error)) {
     std::cerr << error << "\n";
     return 1;
   }
@@ -106,6 +106,14 @@ int main() {
       cache.find(RemotePtr{0, 16 + node_size}) != nullptr ||
       cache.size_bytes() != 2 * sizeof(vamana::rabitq::CompactEntry)) {
     std::cerr << "compact RaBitQ sidecar address mapping failed\n";
+    return 1;
+  }
+  const RemotePtr dynamic_ptr{0, 16 + node_size * 4};
+  if (!cache.upsert_dynamic(dynamic_ptr, vector.data(), VectorDType::uint8) ||
+      cache.find(dynamic_ptr) == nullptr ||
+      !cache.erase_dynamic(dynamic_ptr) ||
+      cache.find(dynamic_ptr) != nullptr) {
+    std::cerr << "compact RaBitQ dynamic overlay failed\n";
     return 1;
   }
   std::filesystem::remove_all(temp_dir);

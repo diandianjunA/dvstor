@@ -111,7 +111,7 @@ public:
   service::breakdown::Report collect_breakdown_report() const;
 
   const Configuration& config() const { return config_; }
-  size_t rabitq_cache_bytes() const { return rabitq_cache_ ? rabitq_cache_->size_bytes() : 0; }
+  size_t rabitq_cache_bytes() const { return rabitq_cache_ ? rabitq_cache_->total_size_bytes() : 0; }
   size_t rabitq_cache_entries() const { return rabitq_cache_ ? rabitq_cache_->entry_count() : 0; }
   bool rabitq_cache_numa_interleaved() const {
     return rabitq_cache_ && rabitq_cache_->numa_interleaved();

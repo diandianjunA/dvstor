@@ -178,23 +178,73 @@
                 for (u32 index : gate_indices) exact_ptrs.push_back(all_unvisited[index]);
 
                 const auto t_exact_fetch = std::chrono::steady_clock::now();
+                if (!exact_query_uploaded) {
+                    const size_t exact_query_bytes = vector_dtype_bytes(query_dtype, dim_);
+                    const auto t_exact_query_h2d = std::chrono::steady_clock::now();
+                    cudaMemcpyAsync(gs.d_query, query_data, exact_query_bytes,
+                                    cudaMemcpyHostToDevice, gs.stream);
+                    track_query_h2d(thread, exact_query_bytes);
+                    add_breakdown_subcategory(thread,
+                        service::breakdown::Subcategory::transfer_query_h2d,
+                        t_exact_query_h2d);
+                    exact_query_uploaded = true;
+                }
+                gs.flip_query_candidate_buffer();
+                uint8_t* exact_staging = gs.current_query_candidate_vecs();
                 auto exact_vectors = co_await rdma::vamana::batch_read_vectors(
-                    exact_ptrs, thread, static_cast<void*>(nullptr), static_cast<u32>(0));
+                    exact_ptrs, thread,
+                    use_gpudirect_candidate_rdma ? exact_staging : nullptr,
+                    use_gpudirect_candidate_rdma
+                      ? gs.current_query_candidate_vecs_lkey() : 0);
                 add_breakdown_subcategory(thread,
                     service::breakdown::Subcategory::rdma_vector_fetch, t_exact_fetch);
-                thread->stats.query_host_staging_fallback_bytes +=
-                    gate_indices.size() * VamanaNode::vector_bytes();
+                if (exact_vectors.direct_to_gpu) {
+                    thread->stats.query_rdma_to_staging_bytes +=
+                        gate_indices.size() * VamanaNode::vector_bytes();
+                } else {
+                    thread->stats.query_host_staging_fallback_bytes +=
+                        gate_indices.size() * VamanaNode::vector_bytes();
+                    const auto t_stage = std::chrono::steady_clock::now();
+                    for (u32 i = 0; i < gate_indices.size(); ++i) {
+                        std::memcpy(gs.h_candidate_vecs + i * VamanaNode::vector_bytes(),
+                                    exact_vectors.host_buffers[i], VamanaNode::vector_bytes());
+                        thread->buffer_allocator.free_buffer(
+                            exact_vectors.host_buffers[i], VamanaNode::vector_bytes());
+                    }
+                    add_breakdown_subcategory(thread,
+                        service::breakdown::Subcategory::cpu_query_stage_candidates, t_stage);
+                    const auto t_h2d = std::chrono::steady_clock::now();
+                    cudaMemcpyAsync(exact_staging, gs.h_candidate_vecs,
+                                    gate_indices.size() * VamanaNode::vector_bytes(),
+                                    cudaMemcpyHostToDevice, gs.stream);
+                    track_query_h2d(thread, gate_indices.size() * VamanaNode::vector_bytes());
+                    add_breakdown_subcategory(thread,
+                        service::breakdown::Subcategory::transfer_candidate_h2d, t_h2d);
+                }
 
                 const auto t_exact = std::chrono::steady_clock::now();
+                gpu::launch_batch_typed_query_l2_distances(
+                    gs.stream, gs.event, gs.d_query,
+                    static_cast<u32>(query_dtype), exact_staging,
+                    static_cast<u32>(VamanaNode::vector_dtype()),
+                    gs.d_distances, static_cast<u32>(gate_indices.size()), dim_);
+                co_await gpu::GpuAwaitable{thread.get()};
+                add_breakdown_subcategory(thread,
+                    service::breakdown::Subcategory::gpu_query_distance, t_exact);
+                const auto t_d2h = std::chrono::steady_clock::now();
+                cudaMemcpyAsync(gs.h_distances, gs.d_distances,
+                                gate_indices.size() * sizeof(float),
+                                cudaMemcpyDeviceToHost, gs.stream);
+                track_query_d2h(thread, gate_indices.size() * sizeof(float));
+                cudaStreamSynchronize(gs.stream);
+                add_breakdown_subcategory(thread,
+                    service::breakdown::Subcategory::transfer_distance_d2h, t_d2h);
+                const auto t_beam_update = std::chrono::steady_clock::now();
                 for (u32 i = 0; i < gate_indices.size(); ++i) {
-                    const distance_t exact_distance = distance_to_stored_vector<Distance>(
-                        query_data, query_dtype, exact_vectors.host_buffers[i]);
-                    insert_into_beam(beam, exact_ptrs[i], exact_distance, beam_width_);
-                    thread->buffer_allocator.free_buffer(
-                        exact_vectors.host_buffers[i], VamanaNode::vector_bytes());
+                    insert_into_beam(beam, exact_ptrs[i], gs.h_distances[i], beam_width_);
                 }
                 add_breakdown_subcategory(thread,
-                    service::breakdown::Subcategory::cpu_query_beam_update, t_exact);
+                    service::breakdown::Subcategory::cpu_query_beam_update, t_beam_update);
                 thread->stats.distcomps += gate_indices.size();
                 thread->stats.query_distcomps += gate_indices.size();
                 thread->stats.query_exact_reranks += gate_indices.size();
@@ -673,6 +723,23 @@
         vec<u32> batch_offsets(Q + 1, 0);  // candidate offsets per query
         vec<RemotePtr> all_unvisited;
         all_unvisited.reserve(Q * R_);
+        vec<u32> gate_offsets(Q + 1, 0);
+        vec<RemotePtr> gate_unvisited;
+        gate_unvisited.reserve(Q * rabitq_gate_max_width_);
+        vec<rabitq::QueryLut> rabitq_luts;
+        vec<f32> rabitq_query_norm2s;
+        if (use_rabitq_) {
+            lib_assert(rabitq_cache_ != nullptr,
+                       "RaBitQ batch gate requires a loaded budget sidecar");
+            rabitq_luts.resize(Q);
+            rabitq_query_norm2s.resize(Q, 0.0f);
+            vec<f32> rotated(VamanaNode::rabitq_code_bits());
+            for (u32 q = 0; q < Q; ++q) {
+                VamanaNode::compute_rotated_query(query_datas[q], query_dtype,
+                                                  rotated.data(), &rabitq_query_norm2s[q]);
+                rabitq_luts[q] = rabitq::build_query_lut(rotated.data());
+            }
+        }
 
         // Init: read medoid + first neighbor for each query
         for (u32 q = 0; q < Q; ++q) {
@@ -740,6 +807,52 @@
                 continue;
             }
 
+            const vec<RemotePtr>* distance_ptrs = &all_unvisited;
+            const vec<u32>* distance_offsets = &batch_offsets;
+            u32 distance_n_batch = n_batch;
+            if (use_rabitq_) {
+                const auto t_gate = std::chrono::steady_clock::now();
+                gate_unvisited.clear();
+                gate_offsets[0] = 0;
+                const auto& quantization = rabitq_cache_->quantization();
+                vec<f32> approximate_distances;
+                vec<u32> cache_miss_indices;
+                for (u32 q = 0; q < Q; ++q) {
+                    const u32 begin = batch_offsets[q];
+                    const u32 end = batch_offsets[q + 1];
+                    const u32 count = end - begin;
+                    approximate_distances.assign(count,
+                        std::numeric_limits<f32>::infinity());
+                    cache_miss_indices.clear();
+                    for (u32 i = 0; i < count; ++i) {
+                        const auto* entry = rabitq_cache_->find(all_unvisited[begin + i]);
+                        if (entry == nullptr) {
+                            cache_miss_indices.push_back(i);
+                        } else {
+                            approximate_distances[i] = rabitq::estimate_distance_lut(
+                                rabitq_luts[q], rabitq_query_norm2s[q], *entry, quantization);
+                        }
+                    }
+                    thread->stats.query_rabitq_l0_candidates += count;
+                    thread->stats.query_rabitq_cache_misses += cache_miss_indices.size();
+                    const vec<u32> selected = rabitq::select_gate(
+                        approximate_distances, cache_miss_indices,
+                        rabitq_gate_width_, rabitq_gate_max_width_, rabitq_gate_margin_);
+                    for (u32 local_index : selected) {
+                        gate_unvisited.push_back(all_unvisited[begin + local_index]);
+                    }
+                    gate_offsets[q + 1] = static_cast<u32>(gate_unvisited.size());
+                }
+                thread->stats.query_rabitq_l1_candidates += gate_unvisited.size();
+                thread->stats.query_rabitq_l2_candidates += gate_unvisited.size();
+                add_breakdown_subcategory(thread,
+                    service::breakdown::Subcategory::cpu_query_rabitq_gate, t_gate);
+                distance_ptrs = &gate_unvisited;
+                distance_offsets = &gate_offsets;
+                distance_n_batch = static_cast<u32>(gate_unvisited.size());
+                if (distance_n_batch == 0) continue;
+            }
+
             // Phase 2: select best for next iteration
             for (u32 q = 0; q < Q; ++q) {
                 if (!qs[q].active) continue;
@@ -764,42 +877,51 @@
                                  gs.d_candidate_vecs_rdma_registered;
             const auto tvf = std::chrono::steady_clock::now();
             auto vr = co_await rdma::vamana::batch_read_vectors(
-                all_unvisited, thread,
+                *distance_ptrs, thread,
                 use_gdr ? staging : nullptr, use_gdr ? staging_lkey : 0);
             add_breakdown_subcategory(thread,
                 service::breakdown::Subcategory::rdma_vector_fetch, tvf);
             if (vr.direct_to_gpu) {
-                thread->stats.query_rdma_to_staging_bytes += n_batch * VamanaNode::vector_bytes();
+                thread->stats.query_rdma_to_staging_bytes +=
+                    distance_n_batch * VamanaNode::vector_bytes();
             }
 
             // Phase 4: Q GPU kernels (one per query) + ONE D2H for all
             const size_t vec_sz = VamanaNode::vector_bytes();
             const auto t_gpu = std::chrono::steady_clock::now();
+            byte_t* batched_queries = static_cast<byte_t*>(gs.h_query);
             for (u32 q = 0; q < Q; ++q) {
-                u32 nq = batch_offsets[q+1] - batch_offsets[q];
-                if (nq == 0) continue;
-                cudaMemcpyAsync(gs.d_query, query_datas[q], q_bytes,
-                                cudaMemcpyHostToDevice, gs.stream);
-                gpu::launch_batch_typed_query_l2_distances(
-                    gs.stream, nullptr,
-                    gs.d_query, static_cast<u32>(query_dtype),
-                    staging + batch_offsets[q] * vec_sz,
-                    static_cast<u32>(VamanaNode::vector_dtype()),
-                    gs.d_distances + batch_offsets[q], nq, dim_);
+                std::memcpy(batched_queries + static_cast<size_t>(q) * q_bytes,
+                            query_datas[q], q_bytes);
+                for (u32 i = (*distance_offsets)[q]; i < (*distance_offsets)[q + 1]; ++i) {
+                    gs.h_candidate_order[i] = q;
+                }
             }
-            cudaEventRecord(gs.event, gs.stream);
+            cudaMemcpyAsync(gs.d_query, gs.h_query, static_cast<size_t>(Q) * q_bytes,
+                            cudaMemcpyHostToDevice, gs.stream);
+            track_query_h2d(thread, static_cast<size_t>(Q) * q_bytes);
+            cudaMemcpyAsync(gs.d_candidate_order, gs.h_candidate_order,
+                            distance_n_batch * sizeof(u32),
+                            cudaMemcpyHostToDevice, gs.stream);
+            track_query_h2d(thread, distance_n_batch * sizeof(u32));
+            gpu::launch_batch_typed_multi_query_l2_distances(
+                gs.stream, gs.event,
+                gs.d_query, static_cast<u32>(query_dtype),
+                gs.d_candidate_order,
+                staging, static_cast<u32>(VamanaNode::vector_dtype()),
+                gs.d_distances, distance_n_batch, dim_);
             co_await gpu::GpuAwaitable{thread.get()};
             add_breakdown_subcategory(thread,
                 service::breakdown::Subcategory::gpu_query_distance, t_gpu);
-            thread->stats.distcomps += n_batch;
-            thread->stats.query_distcomps += n_batch;
+            thread->stats.distcomps += distance_n_batch;
+            thread->stats.query_distcomps += distance_n_batch;
 
             // Phase 5: D2H + per-query beam update
             const auto t_d2h = std::chrono::steady_clock::now();
             cudaMemcpyAsync(gs.h_distances, gs.d_distances,
-                            n_batch * sizeof(float),
+                            distance_n_batch * sizeof(float),
                             cudaMemcpyDeviceToHost, gs.stream);
-            track_query_d2h(thread, n_batch * sizeof(float));
+            track_query_d2h(thread, distance_n_batch * sizeof(float));
             cudaStreamSynchronize(gs.stream);
             add_breakdown_subcategory(thread,
                 service::breakdown::Subcategory::transfer_distance_d2h, t_d2h);
@@ -807,8 +929,8 @@
             for (u32 q = 0; q < Q; ++q) {
                 if (!qs[q].active) continue;
                 auto& s = qs[q];
-                for (u32 i = batch_offsets[q]; i < batch_offsets[q+1]; ++i)
-                    insert_into_beam(s.beam, all_unvisited[i],
+                for (u32 i = (*distance_offsets)[q]; i < (*distance_offsets)[q+1]; ++i)
+                    insert_into_beam(s.beam, (*distance_ptrs)[i],
                                      gs.h_distances[i], beam_width_);
                 if (s.best_idx < 0) {
                     i32 best = -1; distance_t best_d = std::numeric_limits<distance_t>::max();

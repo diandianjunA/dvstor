@@ -30,7 +30,7 @@ inline filepath_t shard_file(const filepath_t& prefix, size_t node_ordinal, size
 
 inline filepath_t rabitq_cache_file(const filepath_t& prefix, size_t node_ordinal, size_t num_nodes) {
   return filepath_t(prefix.string() + "_node" + std::to_string(node_ordinal) + "_of" +
-                    std::to_string(num_nodes) + ".rabitq18");
+                    std::to_string(num_nodes) + ".rabitq11");
 }
 
 inline filepath_t owner_idmap_file(const filepath_t& prefix, size_t node_ordinal, size_t num_nodes) {

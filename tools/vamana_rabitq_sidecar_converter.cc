@@ -43,9 +43,11 @@ int main(int argc, char** argv) {
   const u32 node_size = metadata.at("node_size").get<u32>();
   const u32 rabitq_offset = metadata.at("rabitq_offset").get<u32>();
   const u32 code_bits = metadata.at("rabitq_code_bits").get<u32>();
+  const u32 full_code_bytes = (code_bits + 7u) / 8u;
+  const u32 full_code_storage_bytes = (full_code_bytes + 3u) & ~3u;
   if (metadata.value("node_layout", std::string{}) != "rabitq" ||
-      code_bits != vamana::rabitq::kCodeBits) {
-    std::cerr << "converter requires an index with full 128-bit RaBitQ entries\n";
+      code_bits < vamana::rabitq::kCodeBits) {
+    std::cerr << "converter requires an index with full RaBitQ entries\n";
     return 1;
   }
   vec<u64> counts;
@@ -69,7 +71,7 @@ int main(int argc, char** argv) {
       f32 norm = 0.0f;
       f32 error = 0.0f;
       const u64 scalar_offset = 16 + slot * node_size + rabitq_offset +
-        vamana::rabitq::kCodeBytes;
+        full_code_storage_bytes;
       shard.seekg(static_cast<std::streamoff>(scalar_offset));
       shard.read(reinterpret_cast<char*>(&norm), sizeof(norm));
       shard.read(reinterpret_cast<char*>(&error), sizeof(error));
@@ -105,6 +107,7 @@ int main(int argc, char** argv) {
       const u64 entry_offset = 16 + slot * node_size + rabitq_offset;
       shard.seekg(static_cast<std::streamoff>(entry_offset));
       shard.read(reinterpret_cast<char*>(code.data()), code.size());
+      shard.seekg(static_cast<std::streamoff>(entry_offset + full_code_storage_bytes));
       shard.read(reinterpret_cast<char*>(&norm), sizeof(norm));
       shard.read(reinterpret_cast<char*>(&error), sizeof(error));
       if (!shard.good()) {

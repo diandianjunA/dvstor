@@ -7,6 +7,8 @@
 #include <filesystem>
 #include <fstream>
 #include <linux/mempolicy.h>
+#include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -56,11 +58,11 @@ private:
   bool enabled_{};
 };
 
-constexpr u32 kCodeBits = 128;
+constexpr u32 kCodeBits = 72;
 constexpr u32 kCodeBytes = kCodeBits / 8;
-constexpr u32 kEntryBytes = 18;
-constexpr u32 kSidecarMagic = 0x32514652;  // RFQ2
-constexpr u32 kSidecarVersion = 2;
+constexpr u32 kEntryBytes = 11;
+constexpr u32 kSidecarMagic = 0x33514652;  // RFQ3
+constexpr u32 kSidecarVersion = 3;
 
 #pragma pack(push, 1)
 struct CompactEntry {
@@ -98,6 +100,12 @@ struct SidecarHeader {
   Quantization quantization{};
 };
 
+struct DynamicSlot {
+  u64 raw{};
+  CompactEntry entry{};
+  u8 state{};  // 0=empty, 1=live, 2=deleted
+};
+
 inline u8 quantize(f32 value, f32 min_value, f32 max_value) {
   if (!(max_value > min_value)) return 0;
   const f32 scaled = (value - min_value) * (255.0f / (max_value - min_value));
@@ -110,15 +118,15 @@ inline f32 dequantize(u8 value, f32 min_value, f32 max_value) {
 }
 
 inline void validate_dimension() {
-  lib_assert(VamanaNode::rabitq_code_bits() == kCodeBits,
-             "RaBitQ gate v2 currently requires 128-dimensional codes");
+  lib_assert(VamanaNode::rabitq_code_bits() >= kCodeBits,
+             "RaBitQ budget gate requires at least 72 rotated dimensions");
 }
 
 inline void compute_values(const byte_t* vector, VectorDType dtype,
                            std::array<byte_t, kCodeBytes>* code,
                            f32* norm, f32* error) {
   validate_dimension();
-  vec<f32> rotated(kCodeBits);
+  vec<f32> rotated(VamanaNode::rabitq_code_bits());
   f32 norm2 = 0.0f;
   VamanaNode::compute_rotated_query(vector, dtype, rotated.data(), &norm2);
   code->fill(0);
@@ -238,7 +246,8 @@ inline vec<u32> select_gate(const vec<f32>& distances,
 
 class Cache {
 public:
-  bool load(const filepath_t& prefix, u32 num_nodes, u32 expected_node_size, str* error) {
+  bool load(const filepath_t& prefix, u32 num_nodes, u32 expected_node_size,
+            size_t dynamic_budget_bytes, str* error) {
     validate_dimension();
     ScopedNumaInterleave interleave;
     numa_interleaved_ = interleave.enabled();
@@ -269,27 +278,120 @@ public:
       entry_count_ += entries.size();
     }
     node_size_ = expected_node_size;
+    init_dynamic(dynamic_budget_bytes);
     prewarm();
     return true;
   }
 
   const CompactEntry* find(RemotePtr pointer) const {
-    if (pointer.memory_node() >= shards_.size() || pointer.byte_offset() < 16 || node_size_ == 0) {
-      return nullptr;
+    if (pointer.memory_node() < shards_.size() && pointer.byte_offset() >= 16 && node_size_ != 0) {
+      const u64 relative = pointer.byte_offset() - 16;
+      if (relative % node_size_ == 0) {
+        const u64 slot = relative / node_size_;
+        const auto& entries = shards_[pointer.memory_node()];
+        if (slot < entries.size()) return &entries[slot];
+      }
     }
-    const u64 relative = pointer.byte_offset() - 16;
-    if (relative % node_size_ != 0) return nullptr;
-    const u64 slot = relative / node_size_;
-    const auto& entries = shards_[pointer.memory_node()];
-    return slot < entries.size() ? &entries[slot] : nullptr;
+    return find_dynamic(pointer);
+  }
+
+  bool upsert_dynamic(RemotePtr pointer, const byte_t* vector, VectorDType dtype) {
+    if (dynamic_slots_.empty() || pointer.is_null()) return false;
+    const CompactEntry entry = encode(vector, dtype, quantization_);
+    std::unique_lock lock(dynamic_mutex_);
+    const u64 raw = pointer.raw_address;
+    const u64 mask = static_cast<u64>(dynamic_slots_.size() - 1);
+    size_t first_deleted = dynamic_slots_.size();
+    for (u64 probe = 0; probe < dynamic_slots_.size(); ++probe) {
+      const size_t slot_index = (hash_raw(raw) + probe) & mask;
+      auto& slot = dynamic_slots_[slot_index];
+      if (slot.state == 1 && slot.raw == raw) {
+        slot.entry = entry;
+        return true;
+      }
+      if (slot.state == 2 && first_deleted == dynamic_slots_.size()) {
+        first_deleted = slot_index;
+      }
+      if (slot.state == 0) {
+        auto& target = dynamic_slots_[first_deleted == dynamic_slots_.size()
+          ? slot_index : first_deleted];
+        target.raw = raw;
+        target.entry = entry;
+        target.state = 1;
+        ++dynamic_live_;
+        return true;
+      }
+    }
+    if (first_deleted != dynamic_slots_.size()) {
+      auto& target = dynamic_slots_[first_deleted];
+      target.raw = raw;
+      target.entry = entry;
+      target.state = 1;
+      ++dynamic_live_;
+      return true;
+    }
+    ++dynamic_overflow_;
+    return false;
+  }
+
+  bool erase_dynamic(RemotePtr pointer) {
+    if (dynamic_slots_.empty() || pointer.is_null()) return false;
+    std::unique_lock lock(dynamic_mutex_);
+    const u64 raw = pointer.raw_address;
+    const u64 mask = static_cast<u64>(dynamic_slots_.size() - 1);
+    for (u64 probe = 0; probe < dynamic_slots_.size(); ++probe) {
+      auto& slot = dynamic_slots_[(hash_raw(raw) + probe) & mask];
+      if (slot.state == 0) return false;
+      if (slot.state == 1 && slot.raw == raw) {
+        slot.state = 2;
+        --dynamic_live_;
+        return true;
+      }
+    }
+    return false;
   }
 
   const Quantization& quantization() const { return quantization_; }
   size_t size_bytes() const { return size_bytes_; }
+  size_t dynamic_size_bytes() const { return dynamic_slots_.size() * sizeof(DynamicSlot); }
+  size_t total_size_bytes() const { return size_bytes_ + dynamic_size_bytes(); }
   size_t entry_count() const { return entry_count_; }
+  size_t dynamic_capacity() const { return dynamic_slots_.size(); }
+  size_t dynamic_live() const { return dynamic_live_; }
+  size_t dynamic_overflow() const { return dynamic_overflow_; }
   bool numa_interleaved() const { return numa_interleaved_; }
 
 private:
+  static u64 hash_raw(u64 value) {
+    value ^= value >> 33;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33;
+    value *= 0xc4ceb9fe1a85ec53ULL;
+    value ^= value >> 33;
+    return value;
+  }
+
+  void init_dynamic(size_t budget_bytes) {
+    if (budget_bytes < sizeof(DynamicSlot) * 2) return;
+    size_t capacity = 1;
+    const size_t requested = budget_bytes / sizeof(DynamicSlot);
+    while (capacity * 2 <= requested) capacity *= 2;
+    dynamic_slots_.assign(capacity, {});
+  }
+
+  const CompactEntry* find_dynamic(RemotePtr pointer) const {
+    if (dynamic_slots_.empty() || pointer.is_null()) return nullptr;
+    std::shared_lock lock(dynamic_mutex_);
+    const u64 raw = pointer.raw_address;
+    const u64 mask = static_cast<u64>(dynamic_slots_.size() - 1);
+    for (u64 probe = 0; probe < dynamic_slots_.size(); ++probe) {
+      const auto& slot = dynamic_slots_[(hash_raw(raw) + probe) & mask];
+      if (slot.state == 0) return nullptr;
+      if (slot.raw == raw) return slot.state == 1 ? &slot.entry : nullptr;
+    }
+    return nullptr;
+  }
+
   void prewarm() const {
     volatile u8 sink = 0;
     for (const auto& shard : shards_) {
@@ -306,10 +408,14 @@ private:
   }
 
   vec<vec<CompactEntry>> shards_;
+  mutable std::shared_mutex dynamic_mutex_;
+  vec<DynamicSlot> dynamic_slots_;
   Quantization quantization_{};
   u32 node_size_{};
   size_t size_bytes_{};
   size_t entry_count_{};
+  size_t dynamic_live_{};
+  size_t dynamic_overflow_{};
   bool numa_interleaved_{};
 };
 

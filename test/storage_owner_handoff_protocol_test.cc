@@ -46,5 +46,30 @@ int main() {
          response.data() + sizeof(SearchHandoffResponseHeader));
   assert(handoff_response_visited(response_header, beam_count) +
            visited_count * sizeof(u64) == response.data() + response.size());
+  constexpr u32 item_count = 4;
+  std::vector<byte_t> insert_response(insert_batch_response_bytes(item_count));
+  auto* insert_header = reinterpret_cast<InsertBatchResponseHeader*>(insert_response.data());
+  insert_header->item_count = item_count;
+  u32* statuses = response_statuses(insert_response.data());
+  MutationResult* mutation_results = response_mutation_results(insert_response.data(), item_count);
+  auto* breakdown = response_breakdown(insert_response.data(), item_count);
+  u32* invalidation_count = response_invalidation_count(insert_response.data(), item_count);
+  u64* invalidated = response_invalidated_raws(insert_response.data(), item_count);
+  statuses[0] = static_cast<u32>(MutationStatus::ok);
+  mutation_results[0].new_rptr_raw = 0x1234;
+  mutation_results[0].old_rptr_raw = 0x5678;
+  mutation_results[0].generation = 9;
+  breakdown->storage_owner_write_node_ns = 11;
+  *invalidation_count = 1;
+  invalidated[0] = 0x9abc;
+  assert(reinterpret_cast<byte_t*>(statuses) ==
+         insert_response.data() + sizeof(InsertBatchResponseHeader));
+  assert(reinterpret_cast<byte_t*>(mutation_results) ==
+         reinterpret_cast<byte_t*>(statuses + item_count));
+  assert(reinterpret_cast<byte_t*>(breakdown) ==
+         reinterpret_cast<byte_t*>(mutation_results + item_count));
+  assert(reinterpret_cast<byte_t*>(invalidated + response_invalidation_capacity(item_count)) ==
+         insert_response.data() + insert_response.size());
+  assert(response_mutation_results(insert_response.data(), item_count)[0].generation == 9);
   assert(static_cast<u32>(InsertStatus::overloaded) == 2);
 }
