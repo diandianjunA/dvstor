@@ -44,11 +44,16 @@ public:
   u32 rdma_qp_pool_size{1}; // QPs per memory node per SharedContext (1=default)
   u32 query_batch_size{1};  // Fuse GPU across N queries (1=single query)
   bool use_rabitq{};        // Use the local RaBitQ gate before exact beam insertion
+  str rabitq_mode{"gpu_coalesced"};
   u32 rabitq_gate_width{16};
-  u32 rabitq_gate_max_width{24};
-  f64 rabitq_gate_margin{0.05};
+  u32 rabitq_gate_max_width{32};
+  f64 rabitq_gate_margin{0.08};
   f64 rabitq_cache_max_ratio{0.10};
   u32 rabitq_dynamic_budget_mb{64};
+  u32 rabitq_coalesce_target{64};
+  u32 rabitq_coalesce_min{32};
+  u32 rabitq_coalesce_wait_us{6};
+  bool rabitq_strict_recall{true};
   str vector_data_type{"auto"};
   str insert_execution{"compute"};
   u32 insert_workers{};
@@ -210,7 +215,9 @@ private:
       "query-batch-size", po::value<u32>(&query_batch_size)->default_value(1),
       "Fuse GPU/D2H across N queries processed in lockstep (1=disabled, 2-4=batch).")(
       "use-rabitq", po::bool_switch(&use_rabitq)->default_value(false),
-      "Use the local 128-bit RaBitQ gate; only exact distances enter the beam.")(
+      "Use the local RaBitQ gate; only exact distances enter the beam.")(
+      "rabitq-mode", po::value<str>(&rabitq_mode)->default_value(rabitq_mode),
+      "RaBitQ execution mode: gpu_coalesced or cpu_gate.")(
       "rabitq-gate-width", po::value<u32>(&rabitq_gate_width)->default_value(rabitq_gate_width),
       "Minimum cached candidates exactified per expansion.")(
       "rabitq-gate-max-width",
@@ -223,7 +230,19 @@ private:
       "Maximum compute-node RaBitQ bytes as a ratio of raw vector bytes.")(
       "rabitq-dynamic-budget-mb",
       po::value<u32>(&rabitq_dynamic_budget_mb)->default_value(rabitq_dynamic_budget_mb),
-      "Fixed RaBitQ dynamic overlay budget in MiB.")(
+      "Fixed RaBitQ dynamic overlay budget in MiB, capped by --rabitq-cache-max-ratio.")(
+      "rabitq-coalesce-target",
+      po::value<u32>(&rabitq_coalesce_target)->default_value(rabitq_coalesce_target),
+      "Target candidates per RaBitQ exactification flush.")(
+      "rabitq-coalesce-min",
+      po::value<u32>(&rabitq_coalesce_min)->default_value(rabitq_coalesce_min),
+      "Minimum RDMA-friendly candidates exactified before strict recall widening stops.")(
+      "rabitq-coalesce-wait-us",
+      po::value<u32>(&rabitq_coalesce_wait_us)->default_value(rabitq_coalesce_wait_us),
+      "Maximum RaBitQ coalescer wait in microseconds.")(
+      "rabitq-strict-recall",
+      po::value<bool>(&rabitq_strict_recall)->default_value(rabitq_strict_recall),
+      "Widen uncertain small RaBitQ gates so recall is protected.")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
       "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
@@ -261,8 +280,13 @@ private:
       std::cerr << "[ERROR]: --use-rabitq currently supports L2 distance only" << std::endl;
       exit_with_help_message(argv);
     }
+    if (use_rabitq && rabitq_mode != "gpu_coalesced" && rabitq_mode != "cpu_gate") {
+      std::cerr << "[ERROR]: --rabitq-mode must be gpu_coalesced or cpu_gate" << std::endl;
+      exit_with_help_message(argv);
+    }
     if (rabitq_gate_width == 0 || rabitq_gate_max_width < rabitq_gate_width ||
-        rabitq_gate_margin < 0.0 || rabitq_cache_max_ratio <= 0.0) {
+        rabitq_gate_margin < 0.0 || rabitq_cache_max_ratio <= 0.0 ||
+        rabitq_coalesce_min == 0 || rabitq_coalesce_target < rabitq_coalesce_min) {
       std::cerr << "[ERROR]: invalid RaBitQ gate configuration" << std::endl;
       exit_with_help_message(argv);
     }
@@ -426,11 +450,17 @@ public:
       os << std::setw(width) << "RDMA QP Pool Size: " << config.rdma_qp_pool_size << std::endl;
       os << std::setw(width) << "Query Batch Size: " << config.query_batch_size << std::endl;
       os << std::setw(width) << "Use RaBitQ: " << (config.use_rabitq ? "true" : "false") << std::endl;
+      os << std::setw(width) << "RaBitQ mode: " << config.rabitq_mode << std::endl;
       os << std::setw(width) << "RaBitQ gate width: " << config.rabitq_gate_width << std::endl;
       os << std::setw(width) << "RaBitQ gate max width: " << config.rabitq_gate_max_width << std::endl;
       os << std::setw(width) << "RaBitQ gate margin: " << config.rabitq_gate_margin << std::endl;
       os << std::setw(width) << "RaBitQ cache max ratio: " << config.rabitq_cache_max_ratio << std::endl;
       os << std::setw(width) << "RaBitQ dynamic budget MB: " << config.rabitq_dynamic_budget_mb << std::endl;
+      os << std::setw(width) << "RaBitQ coalesce target: " << config.rabitq_coalesce_target << std::endl;
+      os << std::setw(width) << "RaBitQ coalesce min: " << config.rabitq_coalesce_min << std::endl;
+      os << std::setw(width) << "RaBitQ coalesce wait(us): " << config.rabitq_coalesce_wait_us << std::endl;
+      os << std::setw(width) << "RaBitQ strict recall: "
+         << (config.rabitq_strict_recall ? "true" : "false") << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {
       os << std::left << std::setfill(' ');

@@ -109,6 +109,8 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   vamana_->set_rabitq_gate(config_.rabitq_gate_width,
                            config_.rabitq_gate_max_width,
                            static_cast<f32>(config_.rabitq_gate_margin));
+  vamana_->set_rabitq_runtime(config_.rabitq_coalesce_min,
+                              config_.rabitq_strict_recall);
   vamana_->set_use_rabitq(config_.use_rabitq);
   if (vamana_->use_rabitq() && config_.load_index) {
     const filepath_t startup_prefix = config_.resolved_index_prefix();
@@ -131,7 +133,7 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                  (rabitq_cache_->numa_interleaved() ? "interleaved" : "local"));
   }
   print_status(vamana_->use_rabitq()
-    ? "search: budget RaBitQ gate + GPUDirect exact beam"
+    ? "search: RFQ4 RaBitQ gate + GPUDirect exact beam"
     : "search: exact");
 
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,

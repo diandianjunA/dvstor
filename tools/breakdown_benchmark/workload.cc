@@ -213,7 +213,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"dim", service.config().dim},
     {"threads", service.config().num_threads},
     {"coroutines", service.config().num_coroutines},
-    {"search", service.config().use_rabitq ? "rabitq_gate_v2_exact_beam" : "exact"},
+    {"search", service.config().use_rabitq ? "rabitq_rfq4_exact_beam" : "exact"},
     {"rabitq_cache_bytes", service.rabitq_cache_bytes()},
     {"rabitq_cache_entries", service.rabitq_cache_entries()},
     {"rabitq_cache_numa_interleaved", service.rabitq_cache_numa_interleaved()},
@@ -231,6 +231,16 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
         ? service.config().rabitq_gate_margin : 0.0},
     {"rabitq_cache_max_ratio", service.config().use_rabitq
         ? service.config().rabitq_cache_max_ratio : 0.0},
+    {"rabitq_mode", service.config().use_rabitq
+        ? service.config().rabitq_mode : ""},
+    {"rabitq_coalesce_target", service.config().use_rabitq
+        ? service.config().rabitq_coalesce_target : 0},
+    {"rabitq_coalesce_min", service.config().use_rabitq
+        ? service.config().rabitq_coalesce_min : 0},
+    {"rabitq_coalesce_wait_us", service.config().use_rabitq
+        ? service.config().rabitq_coalesce_wait_us : 0},
+    {"rabitq_strict_recall", service.config().use_rabitq
+        ? service.config().rabitq_strict_recall : false},
   };
   const size_t dim = service.config().dim;
   const double write_ratio_sum = args.write_insert_ratio + args.write_upsert_ratio + args.write_delete_ratio;

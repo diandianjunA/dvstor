@@ -15,7 +15,9 @@ bool write_sidecar(const filepath_t& prefix, u32 ordinal, u32 nodes,
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
   vamana::rabitq::SidecarHeader header;
   header.node_size = node_size;
+  header.raw_vector_bytes = static_cast<u32>(VamanaNode::vector_bytes());
   header.entry_count = 1;
+  header.cache_budget_bytes = sizeof(header) + sizeof(entry);
   header.quantization = quantization;
   output.write(reinterpret_cast<const char*>(&header), sizeof(header));
   output.write(reinterpret_cast<const char*>(&entry), sizeof(entry));

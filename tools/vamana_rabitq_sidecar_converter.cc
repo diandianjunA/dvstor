@@ -97,7 +97,10 @@ int main(int argc, char** argv) {
     }
     vamana::rabitq::SidecarHeader header;
     header.node_size = node_size;
+    header.raw_vector_bytes = static_cast<u32>(VamanaNode::vector_bytes());
     header.entry_count = counts[node];
+    header.cache_budget_bytes = sizeof(vamana::rabitq::SidecarHeader) +
+      counts[node] * sizeof(vamana::rabitq::CompactEntry);
     header.quantization = quantization;
     sidecar.write(reinterpret_cast<const char*>(&header), sizeof(header));
     for (u64 slot = 0; slot < counts[node]; ++slot) {

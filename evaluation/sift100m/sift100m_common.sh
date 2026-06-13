@@ -258,11 +258,20 @@ write_service_config() {
     if [[ -n "${QUERY_BATCH_SIZE:-}" ]]; then echo "query-batch-size = ${QUERY_BATCH_SIZE}"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then echo "use-rabitq = true"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then
+      echo "rabitq-mode = ${RABITQ_MODE:-gpu_coalesced}"
       echo "rabitq-gate-width = ${RABITQ_GATE_WIDTH:-16}"
-      echo "rabitq-gate-max-width = ${RABITQ_GATE_MAX_WIDTH:-24}"
-      echo "rabitq-gate-margin = ${RABITQ_GATE_MARGIN:-0.05}"
+      echo "rabitq-gate-max-width = ${RABITQ_GATE_MAX_WIDTH:-32}"
+      echo "rabitq-gate-margin = ${RABITQ_GATE_MARGIN:-0.08}"
       echo "rabitq-cache-max-ratio = ${RABITQ_CACHE_MAX_RATIO:-0.10}"
       echo "rabitq-dynamic-budget-mb = ${RABITQ_DYNAMIC_BUDGET_MB:-64}"
+      echo "rabitq-coalesce-target = ${RABITQ_COALESCE_TARGET:-64}"
+      echo "rabitq-coalesce-min = ${RABITQ_COALESCE_MIN:-32}"
+      echo "rabitq-coalesce-wait-us = ${RABITQ_COALESCE_WAIT_US:-6}"
+      if [[ "${RABITQ_STRICT_RECALL:-1}" == "1" ]]; then
+        echo "rabitq-strict-recall = true"
+      else
+        echo "rabitq-strict-recall = false"
+      fi
     fi
     echo "insert-execution = $insert_execution"
     if [[ "$insert_execution" == "storage_owner" ]]; then

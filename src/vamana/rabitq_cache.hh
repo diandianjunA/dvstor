@@ -58,11 +58,11 @@ private:
   bool enabled_{};
 };
 
-constexpr u32 kCodeBits = 72;
+constexpr u32 kCodeBits = 80;
 constexpr u32 kCodeBytes = kCodeBits / 8;
-constexpr u32 kEntryBytes = 11;
-constexpr u32 kSidecarMagic = 0x33514652;  // RFQ3
-constexpr u32 kSidecarVersion = 3;
+constexpr u32 kEntryBytes = 12;
+constexpr u32 kSidecarMagic = 0x34514652;  // RFQ4
+constexpr u32 kSidecarVersion = 4;
 
 #pragma pack(push, 1)
 struct CompactEntry {
@@ -95,8 +95,9 @@ struct SidecarHeader {
   u32 entry_size{kEntryBytes};
   u32 code_bits{kCodeBits};
   u32 node_size{};
-  u32 reserved{};
+  u32 raw_vector_bytes{};
   u64 entry_count{};
+  u64 cache_budget_bytes{};
   Quantization quantization{};
 };
 
@@ -126,7 +127,8 @@ inline void compute_values(const byte_t* vector, VectorDType dtype,
                            std::array<byte_t, kCodeBytes>* code,
                            f32* norm, f32* error) {
   validate_dimension();
-  vec<f32> rotated(VamanaNode::rabitq_code_bits());
+  thread_local vec<f32> rotated;
+  rotated.resize(VamanaNode::rabitq_code_bits());
   f32 norm2 = 0.0f;
   VamanaNode::compute_rotated_query(vector, dtype, rotated.data(), &norm2);
   code->fill(0);
@@ -211,18 +213,21 @@ inline f32 estimate_full_entry(const f32* rotated_query, f32 query_norm2,
   return std::max(query_norm2 + norm * norm - 2.0f * inner_product, 0.0f);
 }
 
-inline vec<u32> select_gate(const vec<f32>& distances,
-                            const vec<u32>& cache_miss_indices,
-                            u32 width, u32 max_width, f32 margin) {
-  vec<bool> is_miss(distances.size(), false);
-  vec<u32> selected;
+inline void select_gate_into(const vec<f32>& distances,
+                             const vec<u32>& cache_miss_indices,
+                             u32 width, u32 max_width, f32 margin,
+                             vec<u32>& selected,
+                             vec<u32>& cached,
+                             vec<u8>& is_miss) {
+  selected.clear();
+  cached.clear();
+  is_miss.assign(distances.size(), 0);
   for (u32 index : cache_miss_indices) {
     if (index < is_miss.size() && !is_miss[index]) {
-      is_miss[index] = true;
+      is_miss[index] = 1;
       selected.push_back(index);
     }
   }
-  vec<u32> cached;
   for (u32 i = 0; i < distances.size(); ++i) {
     if (!is_miss[i]) cached.push_back(i);
   }
@@ -241,6 +246,16 @@ inline vec<u32> select_gate(const vec<f32>& distances,
       selected.push_back(cached[i]);
     }
   }
+}
+
+inline vec<u32> select_gate(const vec<f32>& distances,
+                            const vec<u32>& cache_miss_indices,
+                            u32 width, u32 max_width, f32 margin) {
+  vec<u32> selected;
+  vec<u32> cached;
+  vec<u8> is_miss;
+  select_gate_into(distances, cache_miss_indices, width, max_width, margin,
+                   selected, cached, is_miss);
   return selected;
 }
 
@@ -257,13 +272,13 @@ public:
     for (u32 node = 0; node < num_nodes; ++node) {
       const filepath_t path = index_path::rabitq_cache_file(prefix, node + 1, num_nodes);
       std::ifstream input(path, std::ios::binary);
-      if (!input.good()) return fail(error, "missing RaBitQ gate v2 sidecar: " + path.string());
+      if (!input.good()) return fail(error, "missing RFQ4 RaBitQ sidecar: " + path.string());
       SidecarHeader header;
       input.read(reinterpret_cast<char*>(&header), sizeof(header));
       if (!input.good() || header.magic != kSidecarMagic ||
           header.version != kSidecarVersion || header.entry_size != kEntryBytes ||
           header.code_bits != kCodeBits || header.node_size != expected_node_size) {
-        return fail(error, "invalid RaBitQ gate v2 sidecar header: " + path.string());
+        return fail(error, "invalid RFQ4 RaBitQ sidecar header: " + path.string());
       }
       if (node == 0) quantization_ = header.quantization;
       if (std::memcmp(&quantization_, &header.quantization, sizeof(Quantization)) != 0) {
@@ -273,7 +288,7 @@ public:
       entries.resize(header.entry_count);
       input.read(reinterpret_cast<char*>(entries.data()),
                  static_cast<std::streamsize>(entries.size() * sizeof(CompactEntry)));
-      if (!input.good()) return fail(error, "truncated RaBitQ gate v2 sidecar: " + path.string());
+      if (!input.good()) return fail(error, "truncated RFQ4 RaBitQ sidecar: " + path.string());
       size_bytes_ += entries.size() * sizeof(CompactEntry);
       entry_count_ += entries.size();
     }

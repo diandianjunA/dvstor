@@ -80,13 +80,17 @@ public:
     void set_query_batch_size(u32 q) {
         query_batch_size_ = q;
     }
-    u32 query_batch_size() const { return query_batch_size_; }
+    u32 query_batch_size() const { return use_rabitq_ ? 1 : query_batch_size_; }
     bool use_rabitq() const { return use_rabitq_; }
     void set_rabitq_cache(const rabitq::Cache* cache) { rabitq_cache_ = cache; }
     void set_rabitq_gate(u32 width, u32 max_width, f32 margin) {
         rabitq_gate_width_ = width;
         rabitq_gate_max_width_ = max_width;
         rabitq_gate_margin_ = std::max(margin, 0.0f);
+    }
+    void set_rabitq_runtime(u32 coalesce_min, bool strict_recall) {
+        rabitq_coalesce_min_ = std::max<u32>(1, coalesce_min);
+        rabitq_strict_recall_ = strict_recall;
     }
     void set_use_rabitq(bool v) {
         use_rabitq_ = v;
@@ -103,6 +107,8 @@ private:
     u32 rabitq_gate_width_{16};
     u32 rabitq_gate_max_width_{24};
     f32 rabitq_gate_margin_{0.05f};
+    u32 rabitq_coalesce_min_{32};
+    bool rabitq_strict_recall_{true};
     // Retained only for compilation of the unreachable legacy branch below the v2 gate.
     f32 rabitq_confidence_epsilon_{1.9f};
     u32 rabitq_exact_batch_{0};

@@ -392,7 +392,9 @@ void write_vamana_shards(const VamanaGraph& graph,
       lib_assert(cache_files[shard].good(), "failed to open RaBitQ cache sidecar: " + cache_path.string());
       vamana::rabitq::SidecarHeader header;
       header.node_size = static_cast<u32>(aligned_size);
+      header.raw_vector_bytes = static_cast<u32>(VamanaNode::vector_bytes());
       header.entry_count = shard_entry_counts[shard];
+      header.cache_budget_bytes = cache_size;
       header.quantization = cache_quantization;
       cache_files[shard].write(reinterpret_cast<const char*>(&header), sizeof(header));
     }
