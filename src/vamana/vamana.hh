@@ -96,6 +96,10 @@ public:
         rabitq_audit_period_ = audit_period;
         rabitq_strict_recall_ = strict_recall;
     }
+    void set_rabitq_exact_safe(bool enabled, f32 epsilon) {
+        rabitq_exact_safe_ = enabled;
+        rabitq_safe_epsilon_ = std::max(epsilon, 0.0f);
+    }
     void set_use_rabitq(bool v) {
         use_rabitq_ = v;
         if (!v) return;
@@ -114,6 +118,8 @@ private:
     u32 rabitq_coalesce_min_{32};
     u32 rabitq_warmup_exact_expansions_{6};
     u32 rabitq_audit_period_{12};
+    bool rabitq_exact_safe_{true};
+    f32 rabitq_safe_epsilon_{1e-4f};
     bool rabitq_strict_recall_{true};
     // Retained only for compilation of the unreachable legacy branch below the v2 gate.
     f32 rabitq_confidence_epsilon_{1.9f};

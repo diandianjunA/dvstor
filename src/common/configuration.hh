@@ -44,7 +44,7 @@ public:
   u32 rdma_qp_pool_size{1}; // QPs per memory node per SharedContext (1=default)
   u32 query_batch_size{1};  // Fuse GPU across N queries (1=single query)
   bool use_rabitq{};        // Use the local RaBitQ gate before exact beam insertion
-  str rabitq_mode{"gpu_coalesced"};
+  str rabitq_mode{"exact_safe"};
   u32 rabitq_gate_width{18};
   u32 rabitq_gate_max_width{36};
   f64 rabitq_gate_margin{0.08};
@@ -55,6 +55,7 @@ public:
   u32 rabitq_coalesce_wait_us{6};
   u32 rabitq_warmup_exact_expansions{6};
   u32 rabitq_audit_period{12};
+  f64 rabitq_safe_epsilon{1e-4};
   bool rabitq_strict_recall{true};
   str vector_data_type{"auto"};
   str insert_execution{"compute"};
@@ -219,7 +220,7 @@ private:
       "use-rabitq", po::bool_switch(&use_rabitq)->default_value(false),
       "Use the local RaBitQ gate; only exact distances enter the beam.")(
       "rabitq-mode", po::value<str>(&rabitq_mode)->default_value(rabitq_mode),
-      "RaBitQ execution mode: gpu_coalesced or cpu_gate.")(
+      "RaBitQ execution mode: exact_safe, gpu_coalesced, or cpu_gate.")(
       "rabitq-gate-width", po::value<u32>(&rabitq_gate_width)->default_value(rabitq_gate_width),
       "Minimum cached candidates exactified per expansion.")(
       "rabitq-gate-max-width",
@@ -248,6 +249,9 @@ private:
       "rabitq-audit-period",
       po::value<u32>(&rabitq_audit_period)->default_value(rabitq_audit_period),
       "Exactify one full RaBitQ frontier every N graph expansions after warmup. 0 disables audit.")(
+      "rabitq-safe-epsilon",
+      po::value<f64>(&rabitq_safe_epsilon)->default_value(rabitq_safe_epsilon),
+      "Absolute safety margin for RFQ5 exact-safe lower-bound skipping.")(
       "rabitq-strict-recall",
       po::value<bool>(&rabitq_strict_recall)->default_value(rabitq_strict_recall),
       "Widen uncertain small RaBitQ gates so recall is protected.")(
@@ -288,8 +292,9 @@ private:
       std::cerr << "[ERROR]: --use-rabitq currently supports L2 distance only" << std::endl;
       exit_with_help_message(argv);
     }
-    if (use_rabitq && rabitq_mode != "gpu_coalesced" && rabitq_mode != "cpu_gate") {
-      std::cerr << "[ERROR]: --rabitq-mode must be gpu_coalesced or cpu_gate" << std::endl;
+    if (use_rabitq && rabitq_mode != "exact_safe" &&
+        rabitq_mode != "gpu_coalesced" && rabitq_mode != "cpu_gate") {
+      std::cerr << "[ERROR]: --rabitq-mode must be exact_safe, gpu_coalesced, or cpu_gate" << std::endl;
       exit_with_help_message(argv);
     }
     if (rabitq_gate_width == 0 || rabitq_gate_max_width < rabitq_gate_width ||
@@ -470,6 +475,7 @@ public:
       os << std::setw(width) << "RaBitQ warmup exact expansions: "
          << config.rabitq_warmup_exact_expansions << std::endl;
       os << std::setw(width) << "RaBitQ audit period: " << config.rabitq_audit_period << std::endl;
+      os << std::setw(width) << "RaBitQ safe epsilon: " << config.rabitq_safe_epsilon << std::endl;
       os << std::setw(width) << "RaBitQ strict recall: "
          << (config.rabitq_strict_recall ? "true" : "false") << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;

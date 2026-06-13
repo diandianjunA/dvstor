@@ -258,7 +258,7 @@ write_service_config() {
     if [[ -n "${QUERY_BATCH_SIZE:-}" ]]; then echo "query-batch-size = ${QUERY_BATCH_SIZE}"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then echo "use-rabitq = true"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then
-      echo "rabitq-mode = ${RABITQ_MODE:-gpu_coalesced}"
+      echo "rabitq-mode = ${RABITQ_MODE:-exact_safe}"
       echo "rabitq-gate-width = ${RABITQ_GATE_WIDTH:-18}"
       echo "rabitq-gate-max-width = ${RABITQ_GATE_MAX_WIDTH:-36}"
       echo "rabitq-gate-margin = ${RABITQ_GATE_MARGIN:-0.08}"
@@ -269,6 +269,7 @@ write_service_config() {
       echo "rabitq-coalesce-wait-us = ${RABITQ_COALESCE_WAIT_US:-6}"
       echo "rabitq-warmup-exact-expansions = ${RABITQ_WARMUP_EXACT_EXPANSIONS:-6}"
       echo "rabitq-audit-period = ${RABITQ_AUDIT_PERIOD:-12}"
+      echo "rabitq-safe-epsilon = ${RABITQ_SAFE_EPSILON:-0.0001}"
       if [[ "${RABITQ_STRICT_RECALL:-1}" == "1" ]]; then
         echo "rabitq-strict-recall = true"
       else

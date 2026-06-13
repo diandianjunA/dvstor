@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <linux/mempolicy.h>
 #include <mutex>
 #include <shared_mutex>
@@ -58,27 +59,17 @@ private:
   bool enabled_{};
 };
 
-constexpr u32 kCodeBits = 80;
-constexpr u32 kCodeBytes = kCodeBits / 8;
-constexpr u32 kEntryBytes = 12;
-constexpr u32 kSidecarMagic = 0x34514652;  // RFQ4
-constexpr u32 kSidecarVersion = 4;
-
-#pragma pack(push, 1)
-struct CompactEntry {
-  std::array<byte_t, kCodeBytes> code{};
-  u8 norm_q{};
-  u8 error_q{};
-};
-#pragma pack(pop)
-
-static_assert(sizeof(CompactEntry) == kEntryBytes);
+constexpr u32 kSidecarMagic = 0x35514652;  // RFQ5
+constexpr u32 kSidecarVersion = 5;
+constexpr u32 kDefaultEntryBytes = 12;
+constexpr u32 kEntryBytes = kDefaultEntryBytes;  // compatibility for older metadata/report code
+constexpr f64 kDefaultCacheRatio = 0.10;
 
 struct Quantization {
   f32 norm_min{};
   f32 norm_max{};
-  f32 error_min{};
-  f32 error_max{};
+  f32 error_min{};  // retained for metadata compatibility; unused by RFQ5
+  f32 error_max{};  // retained for metadata compatibility; unused by RFQ5
 };
 
 struct Estimate {
@@ -87,13 +78,18 @@ struct Estimate {
   f32 upper_bound{};
 };
 
-using QueryLut = std::array<f32, kCodeBytes * 256>;
+struct QueryLut {
+  vec<f32> signed_dot;
+  vec<f32> mismatch_energy;
+  u32 code_bits{};
+  u32 code_bytes{};
+};
 
 struct SidecarHeader {
   u32 magic{kSidecarMagic};
   u32 version{kSidecarVersion};
-  u32 entry_size{kEntryBytes};
-  u32 code_bits{kCodeBits};
+  u32 entry_size{};
+  u32 code_bits{};
   u32 node_size{};
   u32 raw_vector_bytes{};
   u64 entry_count{};
@@ -103,9 +99,24 @@ struct SidecarHeader {
 
 struct DynamicSlot {
   u64 raw{};
-  CompactEntry entry{};
   u8 state{};  // 0=empty, 1=live, 2=deleted
 };
+
+inline u32 entry_code_bytes(u32 entry_bytes) {
+  return entry_bytes > 0 ? entry_bytes - 1 : 0;
+}
+
+inline u32 entry_code_bits(u32 entry_bytes) {
+  return entry_code_bytes(entry_bytes) * 8u;
+}
+
+inline u32 choose_entry_bytes(u32 raw_vector_bytes, f64 ratio = kDefaultCacheRatio) {
+  if (raw_vector_bytes == 0 || ratio <= 0.0) return 0;
+  const auto budget = static_cast<u32>(std::floor(raw_vector_bytes * ratio));
+  if (budget < 2) return 0;
+  const u32 full_code_bytes = (VamanaNode::rabitq_code_bits() + 7u) / 8u;
+  return std::min<u32>(budget, full_code_bytes + 1u);
+}
 
 inline u8 quantize(f32 value, f32 min_value, f32 max_value) {
   if (!(max_value > min_value)) return 0;
@@ -118,80 +129,132 @@ inline f32 dequantize(u8 value, f32 min_value, f32 max_value) {
   return min_value + static_cast<f32>(value) * ((max_value - min_value) / 255.0f);
 }
 
-inline void validate_dimension() {
-  lib_assert(VamanaNode::rabitq_code_bits() >= kCodeBits,
-             "RaBitQ budget gate requires at least 72 rotated dimensions");
+inline f32 dequantize_norm_lower(u8 value, const Quantization& q) {
+  if (!(q.norm_max > q.norm_min)) return q.norm_min;
+  const f32 step = (q.norm_max - q.norm_min) / 255.0f;
+  return q.norm_min + std::max(0.0f, static_cast<f32>(value) - 0.5f) * step;
 }
 
-inline void compute_values(const byte_t* vector, VectorDType dtype,
-                           std::array<byte_t, kCodeBytes>* code,
-                           f32* norm, f32* error) {
+inline f32 dequantize_norm_upper(u8 value, const Quantization& q) {
+  if (!(q.norm_max > q.norm_min)) return q.norm_min;
+  const f32 step = (q.norm_max - q.norm_min) / 255.0f;
+  return q.norm_min + std::min(255.0f, static_cast<f32>(value) + 0.5f) * step;
+}
+
+inline void validate_dimension() {
+  lib_assert(VamanaNode::rabitq_code_bits() >= 8,
+             "RaBitQ requires at least one rotated byte");
+}
+
+inline bool compute_values(const byte_t* vector, VectorDType dtype,
+                           u32 code_bits, byte_t* code,
+                           f32* norm) {
   validate_dimension();
+  if (code_bits == 0 || code_bits > VamanaNode::rabitq_code_bits() ||
+      (code_bits % 8u) != 0) {
+    return false;
+  }
+  const u32 code_bytes = code_bits / 8u;
   thread_local vec<f32> rotated;
   rotated.resize(VamanaNode::rabitq_code_bits());
   f32 norm2 = 0.0f;
   VamanaNode::compute_rotated_query(vector, dtype, rotated.data(), &norm2);
-  code->fill(0);
-  f32 signed_dot = 0.0f;
-  for (u32 bit = 0; bit < kCodeBits; ++bit) {
-    const bool positive = rotated[bit] > 0.0f;
-    if (positive) (*code)[bit >> 3] |= static_cast<byte_t>(1u << (7u - (bit & 7u)));
-    signed_dot += positive ? rotated[bit] : -rotated[bit];
+  std::memset(code, 0, code_bytes);
+  for (u32 bit = 0; bit < code_bits; ++bit) {
+    if (rotated[bit] > 0.0f) code[bit >> 3] |= static_cast<byte_t>(1u << (7u - (bit & 7u)));
   }
   *norm = std::sqrt(norm2);
-  *error = *norm <= 1e-15f
-    ? 1.0f
-    : std::max(signed_dot / (*norm * std::sqrt(static_cast<f32>(kCodeBits))), 1e-15f);
+  return true;
 }
 
-inline CompactEntry encode(const byte_t* vector, VectorDType dtype,
-                           const Quantization& quantization) {
-  CompactEntry entry;
+inline bool encode_into(const byte_t* vector, VectorDType dtype,
+                        const Quantization& quantization,
+                        u32 code_bits, u32 entry_bytes,
+                        byte_t* entry) {
+  if (entry_bytes < 2 || code_bits != entry_code_bits(entry_bytes)) return false;
   f32 norm = 0.0f;
-  f32 error = 0.0f;
-  compute_values(vector, dtype, &entry.code, &norm, &error);
-  entry.norm_q = quantize(norm, quantization.norm_min, quantization.norm_max);
-  entry.error_q = quantize(error, quantization.error_min, quantization.error_max);
+  if (!compute_values(vector, dtype, code_bits, entry, &norm)) return false;
+  if (norm < quantization.norm_min || norm > quantization.norm_max) {
+    return false;
+  }
+  entry[entry_code_bytes(entry_bytes)] =
+      quantize(norm, quantization.norm_min, quantization.norm_max);
+  return true;
+}
+
+inline vec<byte_t> encode(const byte_t* vector, VectorDType dtype,
+                          const Quantization& quantization,
+                          u32 code_bits, u32 entry_bytes) {
+  vec<byte_t> entry(entry_bytes, 0);
+  (void)encode_into(vector, dtype, quantization, code_bits, entry_bytes, entry.data());
   return entry;
 }
 
-inline QueryLut build_query_lut(const f32* rotated_query) {
-  QueryLut lut{};
-  for (u32 byte = 0; byte < kCodeBytes; ++byte) {
+inline QueryLut build_query_lut(const f32* rotated_query, u32 code_bits) {
+  QueryLut lut;
+  lut.code_bits = code_bits;
+  lut.code_bytes = code_bits / 8u;
+  lut.signed_dot.assign(static_cast<size_t>(lut.code_bytes) * 256u, 0.0f);
+  lut.mismatch_energy.assign(static_cast<size_t>(lut.code_bytes) * 256u, 0.0f);
+  for (u32 byte = 0; byte < lut.code_bytes; ++byte) {
     for (u32 code = 0; code < 256; ++code) {
-      f32 sum = 0.0f;
+      f32 dot = 0.0f;
+      f32 mismatch = 0.0f;
       for (u32 bit = 0; bit < 8; ++bit) {
+        const u32 global_bit = byte * 8u + bit;
+        if (global_bit >= code_bits) break;
         const bool positive = (code & (1u << (7u - bit))) != 0;
-        const f32 value = rotated_query[byte * 8 + bit];
-        sum += positive ? value : -value;
+        const f32 value = rotated_query[global_bit];
+        dot += positive ? value : -value;
+        if ((value > 0.0f) != positive) mismatch += value * value;
       }
-      lut[byte * 256 + code] = sum;
+      lut.signed_dot[byte * 256u + code] = dot;
+      lut.mismatch_energy[byte * 256u + code] = mismatch;
     }
   }
   return lut;
 }
 
+inline QueryLut build_query_lut(const f32* rotated_query) {
+  return build_query_lut(rotated_query, VamanaNode::rabitq_code_bits());
+}
+
 inline f32 estimate_distance_lut(const QueryLut& lut, f32 query_norm2,
-                                 const CompactEntry& entry,
+                                 const byte_t* entry,
                                  const Quantization& quantization) {
   f32 signed_dot = 0.0f;
-  for (u32 byte = 0; byte < kCodeBytes; ++byte) {
-    signed_dot += lut[byte * 256 + entry.code[byte]];
+  for (u32 byte = 0; byte < lut.code_bytes; ++byte) {
+    signed_dot += lut.signed_dot[byte * 256u + entry[byte]];
   }
-  const f32 norm = dequantize(entry.norm_q, quantization.norm_min, quantization.norm_max);
-  const f32 error = dequantize(entry.error_q, quantization.error_min, quantization.error_max);
-  const f32 inner_product = error > 1e-12f
-    ? norm * signed_dot / (std::sqrt(static_cast<f32>(kCodeBits)) * error)
-    : 0.0f;
+  const f32 norm = dequantize(entry[lut.code_bytes],
+                              quantization.norm_min, quantization.norm_max);
+  const f32 denom = std::sqrt(static_cast<f32>(std::max<u32>(1, lut.code_bits)));
+  const f32 inner_product = norm * signed_dot / denom;
   return std::max(query_norm2 + norm * norm - 2.0f * inner_product, 0.0f);
 }
 
+inline f32 lower_bound_lut(const QueryLut& lut, f32 query_norm2,
+                           const byte_t* entry,
+                           const Quantization& quantization) {
+  f32 mismatch = 0.0f;
+  for (u32 byte = 0; byte < lut.code_bytes; ++byte) {
+    mismatch += lut.mismatch_energy[byte * 256u + entry[byte]];
+  }
+  const f32 projection_norm = std::sqrt(std::max(query_norm2 - mismatch, 0.0f));
+  const u8 norm_q = entry[lut.code_bytes];
+  const f32 norm_lo = dequantize_norm_lower(norm_q, quantization);
+  const f32 norm_hi = dequantize_norm_upper(norm_q, quantization);
+  const f32 r = std::clamp(projection_norm, norm_lo, norm_hi);
+  return std::max(query_norm2 + r * r - 2.0f * projection_norm * r, 0.0f);
+}
+
 inline Estimate estimate_interval_lut(const QueryLut& lut, f32 query_norm2,
-                                      const CompactEntry& entry,
+                                      const byte_t* entry,
                                       const Quantization& quantization,
                                       f32) {
   const f32 distance = estimate_distance_lut(lut, query_norm2, entry, quantization);
-  return {distance, distance, distance};
+  const f32 lower = lower_bound_lut(lut, query_norm2, entry, quantization);
+  return {distance, lower, std::numeric_limits<f32>::infinity()};
 }
 
 inline f32 estimate_full_entry(const f32* rotated_query, f32 query_norm2,
@@ -270,7 +333,8 @@ inline vec<u32> select_gate(const vec<f32>& distances,
 class Cache {
 public:
   bool load(const filepath_t& prefix, u32 num_nodes, u32 expected_node_size,
-            size_t dynamic_budget_bytes, str* error) {
+            size_t dynamic_budget_bytes, str* error,
+            f64 max_cache_ratio = kDefaultCacheRatio) {
     validate_dimension();
     ScopedNumaInterleave interleave;
     numa_interleaved_ = interleave.enabled();
@@ -280,60 +344,77 @@ public:
     for (u32 node = 0; node < num_nodes; ++node) {
       const filepath_t path = index_path::rabitq_cache_file(prefix, node + 1, num_nodes);
       std::ifstream input(path, std::ios::binary);
-      if (!input.good()) return fail(error, "missing RFQ4 RaBitQ sidecar: " + path.string());
+      if (!input.good()) return fail(error, "missing RFQ5 RaBitQ sidecar: " + path.string());
       SidecarHeader header;
       input.read(reinterpret_cast<char*>(&header), sizeof(header));
       if (!input.good() || header.magic != kSidecarMagic ||
-          header.version != kSidecarVersion || header.entry_size != kEntryBytes ||
-          header.code_bits != kCodeBits || header.node_size != expected_node_size) {
-        return fail(error, "invalid RFQ4 RaBitQ sidecar header: " + path.string());
+          header.version != kSidecarVersion || header.node_size != expected_node_size ||
+          header.entry_size < 2 || header.code_bits != entry_code_bits(header.entry_size) ||
+          header.raw_vector_bytes != VamanaNode::vector_bytes()) {
+        return fail(error, "invalid RFQ5 RaBitQ sidecar header: " + path.string());
       }
-      if (node == 0) quantization_ = header.quantization;
-      if (std::memcmp(&quantization_, &header.quantization, sizeof(Quantization)) != 0) {
-        return fail(error, "RaBitQ gate quantization differs across shards");
+      if (node == 0) {
+        entry_bytes_ = header.entry_size;
+        code_bits_ = header.code_bits;
+        code_bytes_ = entry_code_bytes(entry_bytes_);
+        quantization_ = header.quantization;
+      }
+      if (entry_bytes_ != header.entry_size || code_bits_ != header.code_bits ||
+          std::memcmp(&quantization_, &header.quantization, sizeof(Quantization)) != 0) {
+        return fail(error, "RaBitQ RFQ5 sidecar layout differs across shards");
       }
       auto& entries = shards_[node];
-      entries.resize(header.entry_count);
+      entries.resize(header.entry_count * entry_bytes_);
       input.read(reinterpret_cast<char*>(entries.data()),
-                 static_cast<std::streamsize>(entries.size() * sizeof(CompactEntry)));
-      if (!input.good()) return fail(error, "truncated RFQ4 RaBitQ sidecar: " + path.string());
-      size_bytes_ += entries.size() * sizeof(CompactEntry);
-      entry_count_ += entries.size();
+                 static_cast<std::streamsize>(entries.size()));
+      if (!input.good()) return fail(error, "truncated RFQ5 RaBitQ sidecar: " + path.string());
+      size_bytes_ += entries.size();
+      entry_count_ += header.entry_count;
     }
     node_size_ = expected_node_size;
-    rebuild_decode_tables();
-    init_dynamic(dynamic_budget_bytes);
+    const size_t raw_bytes = entry_count_ * VamanaNode::vector_bytes();
+    const size_t total_budget = max_cache_ratio > 0.0
+      ? static_cast<size_t>(std::floor(static_cast<f64>(raw_bytes) * max_cache_ratio))
+      : 0;
+    const size_t capped_dynamic_budget =
+      total_budget > size_bytes_ ? std::min(dynamic_budget_bytes, total_budget - size_bytes_) : 0;
+    init_dynamic(capped_dynamic_budget);
     prewarm();
     return true;
   }
 
   f32 estimate_distance_lut(const QueryLut& lut, f32 query_norm2,
-                            const CompactEntry& entry) const {
-    f32 signed_dot = 0.0f;
-    for (u32 byte = 0; byte < kCodeBytes; ++byte) {
-      signed_dot += lut[byte * 256 + entry.code[byte]];
-    }
-    const u32 scale_index =
-      (static_cast<u32>(entry.norm_q) << 8u) | static_cast<u32>(entry.error_q);
-    return std::max(query_norm2 + norm2_table_[entry.norm_q] -
-                    scale_table_[scale_index] * signed_dot, 0.0f);
+                            const byte_t* entry) const {
+    return rabitq::estimate_distance_lut(lut, query_norm2, entry, quantization_);
   }
 
-  const CompactEntry* find(RemotePtr pointer) const {
+  f32 lower_bound_lut(const QueryLut& lut, f32 query_norm2,
+                      const byte_t* entry) const {
+    return rabitq::lower_bound_lut(lut, query_norm2, entry, quantization_);
+  }
+
+  const byte_t* find(RemotePtr pointer) const {
     if (pointer.memory_node() < shards_.size() && pointer.byte_offset() >= 16 && node_size_ != 0) {
       const u64 relative = pointer.byte_offset() - 16;
       if (relative % node_size_ == 0) {
         const u64 slot = relative / node_size_;
         const auto& entries = shards_[pointer.memory_node()];
-        if (slot < entries.size()) return &entries[slot];
+        const u64 offset = slot * entry_bytes_;
+        if (entry_bytes_ != 0 && offset + entry_bytes_ <= entries.size()) {
+          return entries.data() + offset;
+        }
       }
     }
     return find_dynamic(pointer);
   }
 
   bool upsert_dynamic(RemotePtr pointer, const byte_t* vector, VectorDType dtype) {
-    if (dynamic_slots_.empty() || pointer.is_null()) return false;
-    const CompactEntry entry = encode(vector, dtype, quantization_);
+    if (dynamic_slots_.empty() || pointer.is_null() || entry_bytes_ < 2) return false;
+    vec<byte_t> entry(entry_bytes_, 0);
+    if (!encode_into(vector, dtype, quantization_, code_bits_, entry_bytes_, entry.data())) {
+      ++dynamic_overflow_;
+      return false;
+    }
     std::unique_lock lock(dynamic_mutex_);
     const u64 raw = pointer.raw_address;
     const u64 mask = static_cast<u64>(dynamic_slots_.size() - 1);
@@ -342,18 +423,21 @@ public:
       const size_t slot_index = (hash_raw(raw) + probe) & mask;
       auto& slot = dynamic_slots_[slot_index];
       if (slot.state == 1 && slot.raw == raw) {
-        slot.entry = entry;
+        std::memcpy(dynamic_entries_.data() + slot_index * entry_bytes_,
+                    entry.data(), entry_bytes_);
         return true;
       }
       if (slot.state == 2 && first_deleted == dynamic_slots_.size()) {
         first_deleted = slot_index;
       }
       if (slot.state == 0) {
-        auto& target = dynamic_slots_[first_deleted == dynamic_slots_.size()
-          ? slot_index : first_deleted];
+        const size_t target_index = first_deleted == dynamic_slots_.size()
+          ? slot_index : first_deleted;
+        auto& target = dynamic_slots_[target_index];
         target.raw = raw;
-        target.entry = entry;
         target.state = 1;
+        std::memcpy(dynamic_entries_.data() + target_index * entry_bytes_,
+                    entry.data(), entry_bytes_);
         ++dynamic_live_;
         return true;
       }
@@ -361,8 +445,9 @@ public:
     if (first_deleted != dynamic_slots_.size()) {
       auto& target = dynamic_slots_[first_deleted];
       target.raw = raw;
-      target.entry = entry;
       target.state = 1;
+      std::memcpy(dynamic_entries_.data() + first_deleted * entry_bytes_,
+                  entry.data(), entry_bytes_);
       ++dynamic_live_;
       return true;
     }
@@ -389,10 +474,15 @@ public:
 
   const Quantization& quantization() const { return quantization_; }
   size_t size_bytes() const { return size_bytes_; }
-  size_t dynamic_size_bytes() const { return dynamic_slots_.size() * sizeof(DynamicSlot); }
-  size_t decode_table_bytes() const { return sizeof(norm2_table_) + sizeof(scale_table_); }
-  size_t total_size_bytes() const { return size_bytes_ + dynamic_size_bytes() + decode_table_bytes(); }
+  size_t dynamic_size_bytes() const {
+    return dynamic_slots_.size() * sizeof(DynamicSlot) + dynamic_entries_.size();
+  }
+  size_t decode_table_bytes() const { return 0; }
+  size_t total_size_bytes() const { return size_bytes_ + dynamic_size_bytes(); }
   size_t entry_count() const { return entry_count_; }
+  size_t entry_bytes() const { return entry_bytes_; }
+  size_t code_bits() const { return code_bits_; }
+  size_t code_bytes() const { return code_bytes_; }
   size_t dynamic_capacity() const { return dynamic_slots_.size(); }
   size_t dynamic_live() const { return dynamic_live_; }
   size_t dynamic_overflow() const { return dynamic_overflow_; }
@@ -408,39 +498,31 @@ private:
     return value;
   }
 
-  void rebuild_decode_tables() {
-    for (u32 norm_q = 0; norm_q < 256; ++norm_q) {
-      const f32 norm = dequantize(static_cast<u8>(norm_q),
-                                  quantization_.norm_min, quantization_.norm_max);
-      norm2_table_[norm_q] = norm * norm;
-      for (u32 error_q = 0; error_q < 256; ++error_q) {
-        const f32 error = dequantize(static_cast<u8>(error_q),
-                                     quantization_.error_min, quantization_.error_max);
-        const u32 index = (norm_q << 8u) | error_q;
-        scale_table_[index] = error > 1e-12f
-          ? 2.0f * norm / (std::sqrt(static_cast<f32>(kCodeBits)) * error)
-          : 0.0f;
-      }
-    }
-  }
-
   void init_dynamic(size_t budget_bytes) {
-    if (budget_bytes < sizeof(DynamicSlot) * 2) return;
+    if (entry_bytes_ == 0) return;
+    const size_t per_slot = sizeof(DynamicSlot) + entry_bytes_;
+    if (budget_bytes < per_slot * 2) return;
     size_t capacity = 1;
-    const size_t requested = budget_bytes / sizeof(DynamicSlot);
+    const size_t requested = budget_bytes / per_slot;
     while (capacity * 2 <= requested) capacity *= 2;
     dynamic_slots_.assign(capacity, {});
+    dynamic_entries_.assign(capacity * entry_bytes_, 0);
   }
 
-  const CompactEntry* find_dynamic(RemotePtr pointer) const {
-    if (dynamic_slots_.empty() || pointer.is_null()) return nullptr;
+  const byte_t* find_dynamic(RemotePtr pointer) const {
+    if (dynamic_slots_.empty() || pointer.is_null() || entry_bytes_ == 0) return nullptr;
     std::shared_lock lock(dynamic_mutex_);
     const u64 raw = pointer.raw_address;
     const u64 mask = static_cast<u64>(dynamic_slots_.size() - 1);
     for (u64 probe = 0; probe < dynamic_slots_.size(); ++probe) {
-      const auto& slot = dynamic_slots_[(hash_raw(raw) + probe) & mask];
+      const size_t slot_index = (hash_raw(raw) + probe) & mask;
+      const auto& slot = dynamic_slots_[slot_index];
       if (slot.state == 0) return nullptr;
-      if (slot.raw == raw) return slot.state == 1 ? &slot.entry : nullptr;
+      if (slot.raw == raw) {
+        return slot.state == 1
+          ? dynamic_entries_.data() + slot_index * entry_bytes_
+          : nullptr;
+      }
     }
     return nullptr;
   }
@@ -448,9 +530,7 @@ private:
   void prewarm() const {
     volatile u8 sink = 0;
     for (const auto& shard : shards_) {
-      const auto* bytes = reinterpret_cast<const u8*>(shard.data());
-      const size_t bytes_size = shard.size() * sizeof(CompactEntry);
-      for (size_t offset = 0; offset < bytes_size; offset += 4096) sink ^= bytes[offset];
+      for (size_t offset = 0; offset < shard.size(); offset += 4096) sink ^= shard[offset];
     }
     (void)sink;
   }
@@ -460,13 +540,15 @@ private:
     return false;
   }
 
-  vec<vec<CompactEntry>> shards_;
+  vec<vec<byte_t>> shards_;
   mutable std::shared_mutex dynamic_mutex_;
   vec<DynamicSlot> dynamic_slots_;
-  std::array<f32, 256> norm2_table_{};
-  std::array<f32, 256 * 256> scale_table_{};
+  vec<byte_t> dynamic_entries_;
   Quantization quantization_{};
   u32 node_size_{};
+  u32 entry_bytes_{};
+  u32 code_bits_{};
+  u32 code_bytes_{};
   size_t size_bytes_{};
   size_t entry_count_{};
   size_t dynamic_live_{};

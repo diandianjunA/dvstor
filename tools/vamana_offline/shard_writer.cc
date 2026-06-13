@@ -294,21 +294,23 @@ void write_vamana_shards(const VamanaGraph& graph,
   }
 
   vamana::rabitq::Quantization cache_quantization{};
+  u32 rabitq_cache_entry_bytes = 0;
+  u32 rabitq_cache_code_bits = 0;
   if (config.use_rabitq) {
+    rabitq_cache_entry_bytes = vamana::rabitq::choose_entry_bytes(
+      static_cast<u32>(dataset.vector_bytes));
+    lib_assert(rabitq_cache_entry_bytes >= 2,
+               "RaBitQ RFQ5 sidecar cannot fit within the 10% raw-vector budget for this dtype/dim");
+    rabitq_cache_code_bits = vamana::rabitq::entry_code_bits(rabitq_cache_entry_bytes);
     cache_quantization.norm_min = std::numeric_limits<f32>::max();
-    cache_quantization.error_min = std::numeric_limits<f32>::max();
     cache_quantization.norm_max = std::numeric_limits<f32>::lowest();
-    cache_quantization.error_max = std::numeric_limits<f32>::lowest();
-    std::array<byte_t, vamana::rabitq::kCodeBytes> ignored_code{};
+    vec<byte_t> ignored_code(vamana::rabitq::entry_code_bytes(rabitq_cache_entry_bytes));
     for (size_t i = 0; i < n; ++i) {
       f32 norm = 0.0f;
-      f32 error = 0.0f;
       vamana::rabitq::compute_values(dataset.raw_vector(i), dataset.dtype,
-                                     &ignored_code, &norm, &error);
+                                     rabitq_cache_code_bits, ignored_code.data(), &norm);
       cache_quantization.norm_min = std::min(cache_quantization.norm_min, norm);
       cache_quantization.norm_max = std::max(cache_quantization.norm_max, norm);
-      cache_quantization.error_min = std::min(cache_quantization.error_min, error);
-      cache_quantization.error_max = std::max(cache_quantization.error_max, error);
     }
   }
   const size_t node_size = VamanaNode::total_size();
@@ -386,11 +388,13 @@ void write_vamana_shards(const VamanaGraph& graph,
       const filepath_t cache_path = index_path::rabitq_cache_file(
         output_prefix, shard + 1, config.num_memory_nodes);
       const u64 cache_size = sizeof(vamana::rabitq::SidecarHeader) +
-        shard_entry_counts[shard] * sizeof(vamana::rabitq::CompactEntry);
+        shard_entry_counts[shard] * rabitq_cache_entry_bytes;
       create_sized_file(cache_path, cache_size);
       cache_files[shard].open(cache_path, std::ios::binary | std::ios::in | std::ios::out);
       lib_assert(cache_files[shard].good(), "failed to open RaBitQ cache sidecar: " + cache_path.string());
       vamana::rabitq::SidecarHeader header;
+      header.entry_size = rabitq_cache_entry_bytes;
+      header.code_bits = rabitq_cache_code_bits;
       header.node_size = static_cast<u32>(aligned_size);
       header.raw_vector_bytes = static_cast<u32>(VamanaNode::vector_bytes());
       header.entry_count = shard_entry_counts[shard];
@@ -448,14 +452,16 @@ void write_vamana_shards(const VamanaGraph& graph,
         *reinterpret_cast<float*>(buf + VamanaNode::offset_rabitq_error()) = error;
 
         const auto cache_entry = vamana::rabitq::encode(
-          dataset.raw_vector(i), dataset.dtype, cache_quantization);
+          dataset.raw_vector(i), dataset.dtype, cache_quantization,
+          rabitq_cache_code_bits, rabitq_cache_entry_bytes);
         const auto& placement = placements[i];
         const u64 slot = (placement.offset - 16) / aligned_size;
         auto& cache_file = cache_files[placement.memory_node];
         const u64 cache_offset = sizeof(vamana::rabitq::SidecarHeader) +
-          slot * sizeof(vamana::rabitq::CompactEntry);
+          slot * rabitq_cache_entry_bytes;
         cache_file.seekp(static_cast<std::streamoff>(cache_offset));
-        cache_file.write(reinterpret_cast<const char*>(&cache_entry), sizeof(cache_entry));
+        cache_file.write(reinterpret_cast<const char*>(cache_entry.data()),
+                         static_cast<std::streamsize>(cache_entry.size()));
         lib_assert(cache_file.good(), "failed to write RaBitQ cache sidecar entry");
     }
 
@@ -546,8 +552,8 @@ void write_vamana_shards(const VamanaGraph& graph,
     metadata["rabitq_code_bits"] = VamanaNode::rabitq_code_bits();
     metadata["rabitq_entry_size"] = VamanaNode::rabitq_entry_size();
     metadata["rabitq_entry_storage_size"] = VamanaNode::rabitq_entry_storage_size();
-    metadata["rabitq_cache_bits"] = vamana::rabitq::kCodeBits;
-    metadata["rabitq_cache_entry_size"] = vamana::rabitq::kEntryBytes;
+    metadata["rabitq_cache_bits"] = rabitq_cache_code_bits;
+    metadata["rabitq_cache_entry_size"] = rabitq_cache_entry_bytes;
     metadata["rabitq_cache_norm_min"] = cache_quantization.norm_min;
     metadata["rabitq_cache_norm_max"] = cache_quantization.norm_max;
     metadata["rabitq_cache_error_min"] = cache_quantization.error_min;

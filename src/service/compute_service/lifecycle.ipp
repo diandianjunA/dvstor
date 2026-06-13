@@ -54,9 +54,7 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
         VamanaNode::enable_rabitq();
         VamanaNode::set_rabitq_centroid(metadata.rabitq_centroid);
         lib_assert(metadata.rabitq_code_bits == VamanaNode::rabitq_code_bits() &&
-                   metadata.rabitq_entry_size == VamanaNode::rabitq_entry_size() &&
-                   metadata.rabitq_cache_bits == vamana::rabitq::kCodeBits &&
-                   metadata.rabitq_cache_entry_size == vamana::rabitq::kEntryBytes,
+                   metadata.rabitq_entry_size == VamanaNode::rabitq_entry_size(),
                    "RaBitQ index code layout does not match the runtime dimension");
       } else if (config_.use_rabitq) {
         lib_failure("--use-rabitq requires an index built with --use-rabitq");
@@ -113,6 +111,8 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                               config_.rabitq_warmup_exact_expansions,
                               config_.rabitq_audit_period,
                               config_.rabitq_strict_recall);
+  vamana_->set_rabitq_exact_safe(config_.rabitq_mode == "exact_safe",
+                                 static_cast<f32>(config_.rabitq_safe_epsilon));
   vamana_->set_use_rabitq(config_.use_rabitq);
   if (vamana_->use_rabitq() && config_.load_index) {
     const filepath_t startup_prefix = config_.resolved_index_prefix();
@@ -121,7 +121,8 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     lib_assert(rabitq_cache_->load(startup_prefix, num_servers_,
                                   static_cast<u32>(VamanaNode::total_size()),
                                   static_cast<size_t>(config_.rabitq_dynamic_budget_mb) << 20,
-                                  &cache_error),
+                                  &cache_error,
+                                  config_.rabitq_cache_max_ratio),
                cache_error);
     const size_t raw_bytes = rabitq_cache_->entry_count() * VamanaNode::vector_bytes();
     lib_assert(raw_bytes == 0 ||
@@ -129,14 +130,14 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                  config_.rabitq_cache_max_ratio,
                "RaBitQ gate sidecar exceeds --rabitq-cache-max-ratio");
     vamana_->set_rabitq_cache(rabitq_cache_.get());
-    print_status("RaBitQ budget gate cache: static " +
+    print_status("RaBitQ RFQ5 exact-safe cache: static " +
                  std::to_string(rabitq_cache_->size_bytes()) + " bytes, dynamic " +
                  std::to_string(rabitq_cache_->dynamic_size_bytes()) + " bytes, decode " +
                  std::to_string(rabitq_cache_->decode_table_bytes()) + " bytes, NUMA " +
                  (rabitq_cache_->numa_interleaved() ? "interleaved" : "local"));
   }
   print_status(vamana_->use_rabitq()
-    ? "search: RFQ4 RaBitQ gate + GPUDirect exact beam"
+    ? "search: RFQ5 RaBitQ exact-safe filter + GPUDirect exact beam"
     : "search: exact");
 
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,

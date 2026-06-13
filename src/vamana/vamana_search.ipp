@@ -107,7 +107,10 @@
                 add_breakdown_subcategory(thread,
                     service::breakdown::Subcategory::transfer_query_h2d, t_query_h2d);
             } else {
-                rabitq_query_lut = rabitq::build_query_lut(rabitq_rotated_query);
+                const u32 cache_code_bits = use_local_rabitq_cache
+                    ? static_cast<u32>(rabitq_cache_->code_bits())
+                    : VamanaNode::rabitq_code_bits();
+                rabitq_query_lut = rabitq::build_query_lut(rabitq_rotated_query, cache_code_bits);
             }
         }
 
@@ -155,85 +158,136 @@
 
             if (use_rabitq_) {
                 lib_assert(rabitq_cache_ != nullptr,
-                           "RaBitQ gate requires a loaded RFQ4 sidecar");
+                           "RaBitQ gate requires a loaded RFQ5 sidecar");
                 auto& exact_ptrs = coro_state.reserved_ptrs_a;
                 auto& gate_indices = coro_state.scratch_indices_b;
-                const bool warmup_exact = rabitq_warmup_remaining > 0;
-                rabitq_warmup_remaining = consumed_K >= rabitq_warmup_remaining
-                    ? 0 : rabitq_warmup_remaining - consumed_K;
-                const bool audit_exact = !warmup_exact && rabitq_audit_period_ > 0 &&
-                    rabitq_expansions_seen >= rabitq_next_audit_expansion;
-                if (audit_exact) {
-                    while (rabitq_expansions_seen >= rabitq_next_audit_expansion) {
-                        rabitq_next_audit_expansion += rabitq_audit_period_;
-                    }
-                }
-                const u32 gate_scale = std::max<u32>(1, consumed_K);
-                const u32 effective_gate_width =
-                    std::min<u32>(n_batch, rabitq_gate_width_ * gate_scale);
-                const u32 effective_gate_max_width =
-                    std::min<u32>(n_batch, std::max(rabitq_gate_max_width_ * gate_scale,
-                                                    effective_gate_width));
-                if (warmup_exact || audit_exact) {
+                if (rabitq_exact_safe_) {
+                    const auto t_gate = std::chrono::steady_clock::now();
                     gate_indices.clear();
-                    gate_indices.reserve(n_batch);
                     exact_ptrs.clear();
+                    gate_indices.reserve(n_batch);
                     exact_ptrs.reserve(n_batch);
+                    const bool beam_full = beam.size() >= beam_width_;
+                    const distance_t cutoff = beam_full
+                        ? beam.back().distance
+                        : std::numeric_limits<distance_t>::max();
+                    u32 cache_misses = 0;
+                    u32 safe_skips = 0;
                     for (u32 i = 0; i < n_batch; ++i) {
+                        const auto* entry = rabitq_cache_->find(all_unvisited[i]);
+                        if (entry == nullptr) {
+                            ++cache_misses;
+                            gate_indices.push_back(i);
+                            exact_ptrs.push_back(all_unvisited[i]);
+                            continue;
+                        }
+                        const f32 lower_bound = rabitq_cache_->lower_bound_lut(
+                            rabitq_query_lut, rabitq_query_norm2, entry);
+                        if (beam_full && lower_bound > cutoff + rabitq_safe_epsilon_) {
+                            ++safe_skips;
+                            continue;
+                        }
                         gate_indices.push_back(i);
                         exact_ptrs.push_back(all_unvisited[i]);
                     }
                     thread->stats.query_rabitq_l0_candidates += n_batch;
+                    thread->stats.query_rabitq_cache_misses += cache_misses;
                     thread->stats.query_rabitq_l1_candidates += gate_indices.size();
-                    if (warmup_exact) ++thread->stats.query_rabitq_forced_widen;
-                    if (audit_exact) {
-                        thread->stats.query_rabitq_audit_expansions += consumed_K;
-                        thread->stats.query_rabitq_audit_candidates += n_batch;
-                    }
-                } else {
-                    const auto t_gate = std::chrono::steady_clock::now();
-                    auto& approximate_distances = coro_state.scratch_distances;
-                    auto& cache_miss_indices = coro_state.scratch_indices_a;
-                    auto& cached_order = coro_state.indirect_candidate_indices;
-                    auto& gate_flags = coro_state.scratch_flags;
-                    approximate_distances.assign(n_batch,
-                        std::numeric_limits<f32>::infinity());
-                    cache_miss_indices.clear();
-                    for (u32 i = 0; i < n_batch; ++i) {
-                        const auto* entry = rabitq_cache_->find(all_unvisited[i]);
-                        if (entry == nullptr) {
-                            cache_miss_indices.push_back(i);
-                        } else {
-                            approximate_distances[i] = rabitq_cache_->estimate_distance_lut(
-                                rabitq_query_lut, rabitq_query_norm2, *entry);
-                        }
-                    }
-                    thread->stats.query_rabitq_l0_candidates += n_batch;
-                    thread->stats.query_rabitq_cache_misses += cache_miss_indices.size();
-                    rabitq::select_gate_into(approximate_distances, cache_miss_indices,
-                        effective_gate_width, effective_gate_max_width, rabitq_gate_margin_,
-                        gate_indices, cached_order, gate_flags);
-                    if (rabitq_strict_recall_ && gate_indices.size() < n_batch &&
-                        gate_indices.size() < effective_gate_width) {
-                        gate_flags.assign(n_batch, 0);
-                        for (u32 index : gate_indices) gate_flags[index] = 1;
-                        const u32 target = std::min<u32>(n_batch, effective_gate_width);
-                        for (u32 index : cached_order) {
-                            if (gate_indices.size() >= target) break;
-                            if (!gate_flags[index]) {
-                                gate_flags[index] = 1;
-                                gate_indices.push_back(index);
-                            }
-                        }
-                        ++thread->stats.query_rabitq_forced_widen;
-                    }
-                    thread->stats.query_rabitq_l1_candidates += gate_indices.size();
+                    thread->stats.query_rabitq_safe_skips += safe_skips;
+                    thread->stats.query_rabitq_exact_fallbacks += cache_misses;
                     add_breakdown_subcategory(thread,
                         service::breakdown::Subcategory::cpu_query_rabitq_gate, t_gate);
+                } else {
+                    const bool warmup_exact = rabitq_warmup_remaining > 0;
+                    rabitq_warmup_remaining = consumed_K >= rabitq_warmup_remaining
+                        ? 0 : rabitq_warmup_remaining - consumed_K;
+                    const bool audit_exact = !warmup_exact && rabitq_audit_period_ > 0 &&
+                        rabitq_expansions_seen >= rabitq_next_audit_expansion;
+                    if (audit_exact) {
+                        while (rabitq_expansions_seen >= rabitq_next_audit_expansion) {
+                            rabitq_next_audit_expansion += rabitq_audit_period_;
+                        }
+                    }
+                    const u32 gate_scale = std::max<u32>(1, consumed_K);
+                    const u32 effective_gate_width =
+                        std::min<u32>(n_batch, rabitq_gate_width_ * gate_scale);
+                    const u32 effective_gate_max_width =
+                        std::min<u32>(n_batch, std::max(rabitq_gate_max_width_ * gate_scale,
+                                                        effective_gate_width));
+                    if (warmup_exact || audit_exact) {
+                        gate_indices.clear();
+                        gate_indices.reserve(n_batch);
+                        exact_ptrs.clear();
+                        exact_ptrs.reserve(n_batch);
+                        for (u32 i = 0; i < n_batch; ++i) {
+                            gate_indices.push_back(i);
+                            exact_ptrs.push_back(all_unvisited[i]);
+                        }
+                        thread->stats.query_rabitq_l0_candidates += n_batch;
+                        thread->stats.query_rabitq_l1_candidates += gate_indices.size();
+                        if (warmup_exact) ++thread->stats.query_rabitq_forced_widen;
+                        if (audit_exact) {
+                            thread->stats.query_rabitq_audit_expansions += consumed_K;
+                            thread->stats.query_rabitq_audit_candidates += n_batch;
+                        }
+                    } else {
+                        const auto t_gate = std::chrono::steady_clock::now();
+                        auto& approximate_distances = coro_state.scratch_distances;
+                        auto& cache_miss_indices = coro_state.scratch_indices_a;
+                        auto& cached_order = coro_state.indirect_candidate_indices;
+                        auto& gate_flags = coro_state.scratch_flags;
+                        approximate_distances.assign(n_batch,
+                            std::numeric_limits<f32>::infinity());
+                        cache_miss_indices.clear();
+                        for (u32 i = 0; i < n_batch; ++i) {
+                            const auto* entry = rabitq_cache_->find(all_unvisited[i]);
+                            if (entry == nullptr) {
+                                cache_miss_indices.push_back(i);
+                            } else {
+                                approximate_distances[i] = rabitq_cache_->estimate_distance_lut(
+                                    rabitq_query_lut, rabitq_query_norm2, entry);
+                            }
+                        }
+                        thread->stats.query_rabitq_l0_candidates += n_batch;
+                        thread->stats.query_rabitq_cache_misses += cache_miss_indices.size();
+                        rabitq::select_gate_into(approximate_distances, cache_miss_indices,
+                            effective_gate_width, effective_gate_max_width, rabitq_gate_margin_,
+                            gate_indices, cached_order, gate_flags);
+                        if (rabitq_strict_recall_ && gate_indices.size() < n_batch &&
+                            gate_indices.size() < effective_gate_width) {
+                            gate_flags.assign(n_batch, 0);
+                            for (u32 index : gate_indices) gate_flags[index] = 1;
+                            const u32 target = std::min<u32>(n_batch, effective_gate_width);
+                            for (u32 index : cached_order) {
+                                if (gate_indices.size() >= target) break;
+                                if (!gate_flags[index]) {
+                                    gate_flags[index] = 1;
+                                    gate_indices.push_back(index);
+                                }
+                            }
+                            ++thread->stats.query_rabitq_forced_widen;
+                        }
+                        thread->stats.query_rabitq_l1_candidates += gate_indices.size();
+                        add_breakdown_subcategory(thread,
+                            service::breakdown::Subcategory::cpu_query_rabitq_gate, t_gate);
 
-                    exact_ptrs.clear();
-                    exact_ptrs.reserve(gate_indices.size());
-                    for (u32 index : gate_indices) exact_ptrs.push_back(all_unvisited[index]);
+                        exact_ptrs.clear();
+                        exact_ptrs.reserve(gate_indices.size());
+                        for (u32 index : gate_indices) exact_ptrs.push_back(all_unvisited[index]);
+                    }
+                }
+
+                if (gate_indices.empty()) {
+                    for (u32 k = 0; k < K; ++k) {
+                        best_idx = select_best();
+                        if (best_idx < 0) break;
+                        beam[best_idx].expanded = true;
+                        pf_neighbors[k] = rdma::vamana::read_vamana_neighbors(
+                            beam[best_idx].rptr, &thread);
+                        pending_K = k + 1;
+                    }
+                    if (pending_K == 0) break;
+                    continue;
                 }
 
                 const auto t_exact_fetch = std::chrono::steady_clock::now();
@@ -403,7 +457,7 @@
                         cache_miss_indices.push_back(i);
                     } else {
                         const auto estimate = rabitq::estimate_interval_lut(
-                            rabitq_query_lut, rabitq_query_norm2, *entry, quantization,
+                            rabitq_query_lut, rabitq_query_norm2, entry, quantization,
                             rabitq_confidence_epsilon_);
                         gs.h_distances[i] = estimate.distance;
                         gs.h_candidate_dists[i] = estimate.lower_bound;
@@ -798,7 +852,8 @@
             for (u32 q = 0; q < Q; ++q) {
                 VamanaNode::compute_rotated_query(query_datas[q], query_dtype,
                                                   rotated.data(), &rabitq_query_norm2s[q]);
-                rabitq_luts[q] = rabitq::build_query_lut(rotated.data());
+                rabitq_luts[q] = rabitq::build_query_lut(
+                    rotated.data(), static_cast<u32>(rabitq_cache_->code_bits()));
             }
         }
 
@@ -891,7 +946,7 @@
                             cache_miss_indices.push_back(i);
                         } else {
                             approximate_distances[i] = rabitq::estimate_distance_lut(
-                                rabitq_luts[q], rabitq_query_norm2s[q], *entry, quantization);
+                                rabitq_luts[q], rabitq_query_norm2s[q], entry, quantization);
                         }
                     }
                     thread->stats.query_rabitq_l0_candidates += count;

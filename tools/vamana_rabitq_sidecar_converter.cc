@@ -1,4 +1,3 @@
-#include <array>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -40,13 +39,26 @@ int main(int argc, char** argv) {
   nlohmann::json metadata;
   metadata_input >> metadata;
   const u32 nodes = metadata.at("num_memory_nodes").get<u32>();
+  const u32 dim = metadata.at("dim").get<u32>();
+  const u32 R = metadata.at("R").get<u32>();
+  const VectorDType dtype = parse_vector_dtype(metadata.value("vector_data_type", std::string{"float32"}));
+  VamanaNode::init_static_storage(dim, R, dtype);
+  VamanaNode::enable_rabitq();
   const u32 node_size = metadata.at("node_size").get<u32>();
   const u32 rabitq_offset = metadata.at("rabitq_offset").get<u32>();
   const u32 code_bits = metadata.at("rabitq_code_bits").get<u32>();
+  const u32 raw_vector_bytes = metadata.at("vector_bytes").get<u32>();
+  const u32 sidecar_entry_bytes = vamana::rabitq::choose_entry_bytes(raw_vector_bytes);
+  if (sidecar_entry_bytes < 2) {
+    std::cerr << "RFQ5 sidecar cannot fit within the 10% raw-vector budget\n";
+    return 1;
+  }
+  const u32 sidecar_code_bits = vamana::rabitq::entry_code_bits(sidecar_entry_bytes);
+  const u32 sidecar_code_bytes = vamana::rabitq::entry_code_bytes(sidecar_entry_bytes);
   const u32 full_code_bytes = (code_bits + 7u) / 8u;
   const u32 full_code_storage_bytes = (full_code_bytes + 3u) & ~3u;
   if (metadata.value("node_layout", std::string{}) != "rabitq" ||
-      code_bits < vamana::rabitq::kCodeBits) {
+      code_bits < sidecar_code_bits) {
     std::cerr << "converter requires an index with full RaBitQ entries\n";
     return 1;
   }
@@ -64,25 +76,21 @@ int main(int argc, char** argv) {
   if (counts.size() != nodes) return 1;
   vamana::rabitq::Quantization quantization{
     std::numeric_limits<f32>::max(), std::numeric_limits<f32>::lowest(),
-    std::numeric_limits<f32>::max(), std::numeric_limits<f32>::lowest()};
+    0.0f, 0.0f};
   for (u32 node = 0; node < nodes; ++node) {
     std::ifstream shard(index_path::shard_file(prefix, node + 1, nodes), std::ios::binary);
     for (u64 slot = 0; slot < counts[node]; ++slot) {
       f32 norm = 0.0f;
-      f32 error = 0.0f;
       const u64 scalar_offset = 16 + slot * node_size + rabitq_offset +
         full_code_storage_bytes;
       shard.seekg(static_cast<std::streamoff>(scalar_offset));
       shard.read(reinterpret_cast<char*>(&norm), sizeof(norm));
-      shard.read(reinterpret_cast<char*>(&error), sizeof(error));
       if (!shard.good()) {
         std::cerr << "truncated RaBitQ entry while scanning quantization\n";
         return 1;
       }
       quantization.norm_min = std::min(quantization.norm_min, norm);
       quantization.norm_max = std::max(quantization.norm_max, norm);
-      quantization.error_min = std::min(quantization.error_min, error);
-      quantization.error_max = std::max(quantization.error_max, error);
     }
   }
 
@@ -96,34 +104,31 @@ int main(int argc, char** argv) {
       return 1;
     }
     vamana::rabitq::SidecarHeader header;
+    header.entry_size = sidecar_entry_bytes;
+    header.code_bits = sidecar_code_bits;
     header.node_size = node_size;
-    header.raw_vector_bytes = static_cast<u32>(VamanaNode::vector_bytes());
+    header.raw_vector_bytes = raw_vector_bytes;
     header.entry_count = counts[node];
     header.cache_budget_bytes = sizeof(vamana::rabitq::SidecarHeader) +
-      counts[node] * sizeof(vamana::rabitq::CompactEntry);
+      counts[node] * sidecar_entry_bytes;
     header.quantization = quantization;
     sidecar.write(reinterpret_cast<const char*>(&header), sizeof(header));
     for (u64 slot = 0; slot < counts[node]; ++slot) {
-      std::array<byte_t, vamana::rabitq::kCodeBytes> code{};
-      f32 norm = 0.0f;
-      f32 error = 0.0f;
+      vec<byte_t> entry(sidecar_entry_bytes, 0);
       const u64 entry_offset = 16 + slot * node_size + rabitq_offset;
       shard.seekg(static_cast<std::streamoff>(entry_offset));
-      shard.read(reinterpret_cast<char*>(code.data()), code.size());
+      shard.read(reinterpret_cast<char*>(entry.data()), sidecar_code_bytes);
       shard.seekg(static_cast<std::streamoff>(entry_offset + full_code_storage_bytes));
+      f32 norm = 0.0f;
       shard.read(reinterpret_cast<char*>(&norm), sizeof(norm));
-      shard.read(reinterpret_cast<char*>(&error), sizeof(error));
       if (!shard.good()) {
         std::cerr << "truncated RaBitQ entry in " << shard_path << "\n";
         return 1;
       }
-      vamana::rabitq::CompactEntry entry;
-      entry.code = code;
-      entry.norm_q = vamana::rabitq::quantize(
+      entry[sidecar_code_bytes] = vamana::rabitq::quantize(
         norm, quantization.norm_min, quantization.norm_max);
-      entry.error_q = vamana::rabitq::quantize(
-        error, quantization.error_min, quantization.error_max);
-      sidecar.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
+      sidecar.write(reinterpret_cast<const char*>(entry.data()),
+                    static_cast<std::streamsize>(entry.size()));
     }
     if (!sidecar.good()) {
       std::cerr << "failed to write " << sidecar_path << "\n";
@@ -131,8 +136,8 @@ int main(int argc, char** argv) {
     }
     std::cout << "wrote " << sidecar_path << " (" << counts[node] << " entries)\n";
   }
-  metadata["rabitq_cache_bits"] = vamana::rabitq::kCodeBits;
-  metadata["rabitq_cache_entry_size"] = vamana::rabitq::kEntryBytes;
+  metadata["rabitq_cache_bits"] = sidecar_code_bits;
+  metadata["rabitq_cache_entry_size"] = sidecar_entry_bytes;
   metadata["rabitq_cache_norm_min"] = quantization.norm_min;
   metadata["rabitq_cache_norm_max"] = quantization.norm_max;
   metadata["rabitq_cache_error_min"] = quantization.error_min;

@@ -213,7 +213,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"dim", service.config().dim},
     {"threads", service.config().num_threads},
     {"coroutines", service.config().num_coroutines},
-    {"search", service.config().use_rabitq ? "rabitq_rfq4_exact_beam" : "exact"},
+    {"search", service.config().use_rabitq ? "rabitq_rfq5_exact_safe" : "exact"},
     {"rabitq_cache_bytes", service.rabitq_cache_bytes()},
     {"rabitq_cache_entries", service.rabitq_cache_entries()},
     {"rabitq_cache_numa_interleaved", service.rabitq_cache_numa_interleaved()},
@@ -221,8 +221,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       service.rabitq_cache_entries() == 0 ? 0.0 :
         static_cast<double>(service.rabitq_cache_bytes()) /
           (service.rabitq_cache_entries() * VamanaNode::vector_bytes())},
-    {"rabitq_cache_entry_bytes", service.config().use_rabitq
-        ? vamana::rabitq::kEntryBytes : 0},
+    {"rabitq_cache_entry_bytes", service.rabitq_cache_entry_bytes()},
+    {"rabitq_cache_code_bits", service.rabitq_cache_code_bits()},
+    {"rabitq_cache_dynamic_live", service.rabitq_cache_dynamic_live()},
+    {"rabitq_cache_dynamic_overflow", service.rabitq_cache_dynamic_overflow()},
     {"rabitq_gate_width", service.config().use_rabitq
         ? service.config().rabitq_gate_width : 0},
     {"rabitq_gate_max_width", service.config().use_rabitq
@@ -243,6 +245,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
         ? service.config().rabitq_warmup_exact_expansions : 0},
     {"rabitq_audit_period", service.config().use_rabitq
         ? service.config().rabitq_audit_period : 0},
+    {"rabitq_safe_epsilon", service.config().use_rabitq
+        ? service.config().rabitq_safe_epsilon : 0.0},
     {"rabitq_strict_recall", service.config().use_rabitq
         ? service.config().rabitq_strict_recall : false},
   };

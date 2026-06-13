@@ -4,6 +4,7 @@
 
 #include "nlohmann/json.hh"
 #include "service/breakdown/aggregate.hh"
+#include "vamana/vamana_node.hh"
 
 namespace service::breakdown {
 
@@ -111,6 +112,10 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"rabitq_forced_widen", aggregate.counters.rabitq_forced_widen},
     {"rabitq_audit_expansions", aggregate.counters.rabitq_audit_expansions},
     {"rabitq_audit_candidates", aggregate.counters.rabitq_audit_candidates},
+    {"rabitq_safe_skips", aggregate.counters.rabitq_safe_skips},
+    {"rabitq_safe_skip_vector_bytes",
+     aggregate.counters.rabitq_safe_skips * VamanaNode::vector_bytes()},
+    {"rabitq_exact_fallbacks", aggregate.counters.rabitq_exact_fallbacks},
     {"rabitq_local_scores", aggregate.counters.rabitq_l0_candidates},
     {"rabitq_gate_passes", aggregate.counters.rabitq_l1_candidates},
     {"rabitq_exact_vector_reads", aggregate.counters.rabitq_l2_candidates},

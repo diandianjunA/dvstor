@@ -96,6 +96,8 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.rabitq_forced_widen += delta.rabitq_forced_widen;
   aggregate.counters.rabitq_audit_expansions += delta.rabitq_audit_expansions;
   aggregate.counters.rabitq_audit_candidates += delta.rabitq_audit_candidates;
+  aggregate.counters.rabitq_safe_skips += delta.rabitq_safe_skips;
+  aggregate.counters.rabitq_exact_fallbacks += delta.rabitq_exact_fallbacks;
   aggregate.counters.visited_nodes += delta.visited_nodes;
   aggregate.counters.visited_neighborlists += delta.visited_neighborlists;
   aggregate.counters.remote_allocations += delta.remote_allocations;

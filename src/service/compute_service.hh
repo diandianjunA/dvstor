@@ -113,6 +113,12 @@ public:
   const Configuration& config() const { return config_; }
   size_t rabitq_cache_bytes() const { return rabitq_cache_ ? rabitq_cache_->total_size_bytes() : 0; }
   size_t rabitq_cache_entries() const { return rabitq_cache_ ? rabitq_cache_->entry_count() : 0; }
+  size_t rabitq_cache_entry_bytes() const { return rabitq_cache_ ? rabitq_cache_->entry_bytes() : 0; }
+  size_t rabitq_cache_code_bits() const { return rabitq_cache_ ? rabitq_cache_->code_bits() : 0; }
+  size_t rabitq_cache_dynamic_live() const { return rabitq_cache_ ? rabitq_cache_->dynamic_live() : 0; }
+  size_t rabitq_cache_dynamic_overflow() const {
+    return rabitq_cache_ ? rabitq_cache_->dynamic_overflow() : 0;
+  }
   bool rabitq_cache_numa_interleaved() const {
     return rabitq_cache_ && rabitq_cache_->numa_interleaved();
   }

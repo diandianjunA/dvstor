@@ -214,6 +214,8 @@ struct ThreadStatistics {
   size_t query_rabitq_forced_widen{0};
   size_t query_rabitq_audit_expansions{0};
   size_t query_rabitq_audit_candidates{0};
+  size_t query_rabitq_safe_skips{0};
+  size_t query_rabitq_exact_fallbacks{0};
   size_t build_l2_kernels{0};
   size_t build_prune_kernels{0};
   size_t build_overflow_prunes{0};
