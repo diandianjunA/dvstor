@@ -28,6 +28,8 @@ struct ThreadCounterDelta {
   u64 rabitq_l1_candidates{};
   u64 rabitq_l2_candidates{};
   u64 rabitq_forced_widen{};
+  u64 rabitq_audit_expansions{};
+  u64 rabitq_audit_candidates{};
   u64 visited_nodes{};
   u64 visited_neighborlists{};
   u64 remote_allocations{};
@@ -69,6 +71,10 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
     out.rabitq_l1_candidates = end.query_rabitq_l1_candidates - start.query_rabitq_l1_candidates;
     out.rabitq_l2_candidates = end.query_rabitq_l2_candidates - start.query_rabitq_l2_candidates;
     out.rabitq_forced_widen = end.query_rabitq_forced_widen - start.query_rabitq_forced_widen;
+    out.rabitq_audit_expansions =
+      end.query_rabitq_audit_expansions - start.query_rabitq_audit_expansions;
+    out.rabitq_audit_candidates =
+      end.query_rabitq_audit_candidates - start.query_rabitq_audit_candidates;
     out.visited_nodes =
       (end.visited_nodes - start.visited_nodes) + (end.visited_nodes_l0 - start.visited_nodes_l0);
     out.visited_neighborlists = end.visited_neighborlists - start.visited_neighborlists;

@@ -45,15 +45,16 @@ public:
   u32 query_batch_size{1};  // Fuse GPU across N queries (1=single query)
   bool use_rabitq{};        // Use the local RaBitQ gate before exact beam insertion
   str rabitq_mode{"gpu_coalesced"};
-  u32 rabitq_gate_width{16};
-  u32 rabitq_gate_max_width{32};
+  u32 rabitq_gate_width{18};
+  u32 rabitq_gate_max_width{36};
   f64 rabitq_gate_margin{0.08};
   f64 rabitq_cache_max_ratio{0.10};
   u32 rabitq_dynamic_budget_mb{64};
   u32 rabitq_coalesce_target{64};
   u32 rabitq_coalesce_min{32};
   u32 rabitq_coalesce_wait_us{6};
-  u32 rabitq_warmup_exact_expansions{4};
+  u32 rabitq_warmup_exact_expansions{6};
+  u32 rabitq_audit_period{12};
   bool rabitq_strict_recall{true};
   str vector_data_type{"auto"};
   str insert_execution{"compute"};
@@ -244,6 +245,9 @@ private:
       "rabitq-warmup-exact-expansions",
       po::value<u32>(&rabitq_warmup_exact_expansions)->default_value(rabitq_warmup_exact_expansions),
       "Exactify all candidates for this many initial RaBitQ graph expansions.")(
+      "rabitq-audit-period",
+      po::value<u32>(&rabitq_audit_period)->default_value(rabitq_audit_period),
+      "Exactify one full RaBitQ frontier every N graph expansions after warmup. 0 disables audit.")(
       "rabitq-strict-recall",
       po::value<bool>(&rabitq_strict_recall)->default_value(rabitq_strict_recall),
       "Widen uncertain small RaBitQ gates so recall is protected.")(
@@ -465,6 +469,7 @@ public:
       os << std::setw(width) << "RaBitQ coalesce wait(us): " << config.rabitq_coalesce_wait_us << std::endl;
       os << std::setw(width) << "RaBitQ warmup exact expansions: "
          << config.rabitq_warmup_exact_expansions << std::endl;
+      os << std::setw(width) << "RaBitQ audit period: " << config.rabitq_audit_period << std::endl;
       os << std::setw(width) << "RaBitQ strict recall: "
          << (config.rabitq_strict_recall ? "true" : "false") << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;

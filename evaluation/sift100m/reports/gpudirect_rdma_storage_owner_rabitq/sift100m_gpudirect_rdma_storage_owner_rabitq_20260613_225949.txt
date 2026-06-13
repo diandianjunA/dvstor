@@ -1,0 +1,27 @@
+throughput
+  duration_seconds: 120
+  total_ops_per_sec: 1136.6 (ops=136392)
+  query_ops_per_sec: 1049.83 (ops=125979)
+  write_ops_per_sec: 86.775 (ops=10413)
+  write_mix_completed: insert=5127 upsert=4199 delete=1087
+recall
+  recall@10: 0.8816
+  queries: 1000
+  passed: false
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+insert breakdown
+  count: 5127
+  latency_ms: mean=103.08 p50=104.135 p95=126.289 p99=169.049
+  top_categories:
+    rdma_ns: 486781 ms (92.1074%)
+    cpu_ns: 41711.6 ms (7.89257%)
+    gpu_ns: 0 ms (0%)
+    transfer_ns: 0 ms (0%)
+query breakdown
+  count: 125979
+  latency_ms: mean=7.54236 p50=7.21383 p95=10.4353 p99=12.466
+  top_categories:
+    rdma_ns: 335656 ms (35.3332%)
+    cpu_ns: 284130 ms (29.9092%)
+    gpu_ns: 199305 ms (20.98%)
+    transfer_ns: 130884 ms (13.7776%)

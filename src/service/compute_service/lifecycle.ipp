@@ -111,6 +111,7 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                            static_cast<f32>(config_.rabitq_gate_margin));
   vamana_->set_rabitq_runtime(config_.rabitq_coalesce_min,
                               config_.rabitq_warmup_exact_expansions,
+                              config_.rabitq_audit_period,
                               config_.rabitq_strict_recall);
   vamana_->set_use_rabitq(config_.use_rabitq);
   if (vamana_->use_rabitq() && config_.load_index) {

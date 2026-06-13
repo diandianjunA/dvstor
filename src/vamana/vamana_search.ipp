@@ -75,6 +75,9 @@
         vec<rdma::vamana::NeighborReadAwaitable> pf_neighbors(K);
         u32 pending_K = 0;
         u32 rabitq_warmup_remaining = rabitq_warmup_exact_expansions_;
+        u32 rabitq_expansions_seen = 0;
+        u32 rabitq_next_audit_expansion = rabitq_audit_period_ == 0
+            ? 0 : rabitq_warmup_exact_expansions_ + rabitq_audit_period_;
 
         // ── Cold start: read the first neighbour ───────────────────────
         i32 best_idx = select_best();
@@ -112,7 +115,7 @@
             // ── Phase 1: consume neighbour reads → filter ──────────────
             auto& all_unvisited = coro_state.scratch_unvisited;
             all_unvisited.clear();
-            const u32 consumed_K = std::max<u32>(1, pending_K);
+            const u32 consumed_K = pending_K;
             for (u32 k = 0; k < pending_K; ++k) {
                 thread->poll_cq();
                 if (thread->post_balances[thread->current_coroutine_id()].load(
@@ -136,6 +139,7 @@
                 }
             }
             pending_K = 0;
+            rabitq_expansions_seen += consumed_K;
 
             if (all_unvisited.empty()) {
                 best_idx = select_best();
@@ -157,13 +161,20 @@
                 const bool warmup_exact = rabitq_warmup_remaining > 0;
                 rabitq_warmup_remaining = consumed_K >= rabitq_warmup_remaining
                     ? 0 : rabitq_warmup_remaining - consumed_K;
+                const bool audit_exact = !warmup_exact && rabitq_audit_period_ > 0 &&
+                    rabitq_expansions_seen >= rabitq_next_audit_expansion;
+                if (audit_exact) {
+                    while (rabitq_expansions_seen >= rabitq_next_audit_expansion) {
+                        rabitq_next_audit_expansion += rabitq_audit_period_;
+                    }
+                }
                 const u32 gate_scale = std::max<u32>(1, consumed_K);
                 const u32 effective_gate_width =
                     std::min<u32>(n_batch, rabitq_gate_width_ * gate_scale);
                 const u32 effective_gate_max_width =
                     std::min<u32>(n_batch, std::max(rabitq_gate_max_width_ * gate_scale,
                                                     effective_gate_width));
-                if (warmup_exact) {
+                if (warmup_exact || audit_exact) {
                     gate_indices.clear();
                     gate_indices.reserve(n_batch);
                     exact_ptrs.clear();
@@ -174,7 +185,11 @@
                     }
                     thread->stats.query_rabitq_l0_candidates += n_batch;
                     thread->stats.query_rabitq_l1_candidates += gate_indices.size();
-                    ++thread->stats.query_rabitq_forced_widen;
+                    if (warmup_exact) ++thread->stats.query_rabitq_forced_widen;
+                    if (audit_exact) {
+                        thread->stats.query_rabitq_audit_expansions += consumed_K;
+                        thread->stats.query_rabitq_audit_candidates += n_batch;
+                    }
                 } else {
                     const auto t_gate = std::chrono::steady_clock::now();
                     auto& approximate_distances = coro_state.scratch_distances;

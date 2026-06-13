@@ -259,15 +259,16 @@ write_service_config() {
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then echo "use-rabitq = true"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then
       echo "rabitq-mode = ${RABITQ_MODE:-gpu_coalesced}"
-      echo "rabitq-gate-width = ${RABITQ_GATE_WIDTH:-16}"
-      echo "rabitq-gate-max-width = ${RABITQ_GATE_MAX_WIDTH:-32}"
+      echo "rabitq-gate-width = ${RABITQ_GATE_WIDTH:-18}"
+      echo "rabitq-gate-max-width = ${RABITQ_GATE_MAX_WIDTH:-36}"
       echo "rabitq-gate-margin = ${RABITQ_GATE_MARGIN:-0.08}"
       echo "rabitq-cache-max-ratio = ${RABITQ_CACHE_MAX_RATIO:-0.10}"
       echo "rabitq-dynamic-budget-mb = ${RABITQ_DYNAMIC_BUDGET_MB:-64}"
       echo "rabitq-coalesce-target = ${RABITQ_COALESCE_TARGET:-64}"
       echo "rabitq-coalesce-min = ${RABITQ_COALESCE_MIN:-32}"
       echo "rabitq-coalesce-wait-us = ${RABITQ_COALESCE_WAIT_US:-6}"
-      echo "rabitq-warmup-exact-expansions = ${RABITQ_WARMUP_EXACT_EXPANSIONS:-4}"
+      echo "rabitq-warmup-exact-expansions = ${RABITQ_WARMUP_EXACT_EXPANSIONS:-6}"
+      echo "rabitq-audit-period = ${RABITQ_AUDIT_PERIOD:-12}"
       if [[ "${RABITQ_STRICT_RECALL:-1}" == "1" ]]; then
         echo "rabitq-strict-recall = true"
       else

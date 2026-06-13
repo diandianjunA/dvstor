@@ -89,9 +89,11 @@ public:
         rabitq_gate_margin_ = std::max(margin, 0.0f);
     }
     void set_rabitq_runtime(u32 coalesce_min, u32 warmup_exact_expansions,
+                            u32 audit_period,
                             bool strict_recall) {
         rabitq_coalesce_min_ = std::max<u32>(1, coalesce_min);
         rabitq_warmup_exact_expansions_ = warmup_exact_expansions;
+        rabitq_audit_period_ = audit_period;
         rabitq_strict_recall_ = strict_recall;
     }
     void set_use_rabitq(bool v) {
@@ -110,7 +112,8 @@ private:
     u32 rabitq_gate_max_width_{24};
     f32 rabitq_gate_margin_{0.05f};
     u32 rabitq_coalesce_min_{32};
-    u32 rabitq_warmup_exact_expansions_{4};
+    u32 rabitq_warmup_exact_expansions_{6};
+    u32 rabitq_audit_period_{12};
     bool rabitq_strict_recall_{true};
     // Retained only for compilation of the unreachable legacy branch below the v2 gate.
     f32 rabitq_confidence_epsilon_{1.9f};

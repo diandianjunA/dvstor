@@ -231,17 +231,25 @@ inline void select_gate_into(const vec<f32>& distances,
   for (u32 i = 0; i < distances.size(); ++i) {
     if (!is_miss[i]) cached.push_back(i);
   }
-  std::sort(cached.begin(), cached.end(), [&](u32 lhs, u32 rhs) {
+  const auto less_by_distance = [&](u32 lhs, u32 rhs) {
     if (distances[lhs] != distances[rhs]) return distances[lhs] < distances[rhs];
     return lhs < rhs;
-  });
+  };
   const u32 base = std::min<u32>(width, cached.size());
   const u32 limit = std::max(width, max_width);
+  const u32 bounded_limit = std::min<u32>(limit, cached.size());
+  if (bounded_limit == 0) return;
+  if (cached.size() > bounded_limit) {
+    std::nth_element(cached.begin(), cached.begin() + bounded_limit,
+                     cached.end(), less_by_distance);
+    cached.resize(bounded_limit);
+  }
+  std::sort(cached.begin(), cached.end(), less_by_distance);
   for (u32 i = 0; i < base; ++i) selected.push_back(cached[i]);
   if (base > 0) {
     const f32 cutoff = distances[cached[base - 1]];
     const f32 margin_cutoff = cutoff + std::abs(cutoff) * std::max(margin, 0.0f);
-    for (u32 i = base; i < cached.size() && i < limit; ++i) {
+    for (u32 i = base; i < bounded_limit; ++i) {
       if (distances[cached[i]] > margin_cutoff) break;
       selected.push_back(cached[i]);
     }

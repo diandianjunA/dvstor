@@ -109,6 +109,8 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"rabitq_l1_candidates", aggregate.counters.rabitq_l1_candidates},
     {"rabitq_l2_candidates", aggregate.counters.rabitq_l2_candidates},
     {"rabitq_forced_widen", aggregate.counters.rabitq_forced_widen},
+    {"rabitq_audit_expansions", aggregate.counters.rabitq_audit_expansions},
+    {"rabitq_audit_candidates", aggregate.counters.rabitq_audit_candidates},
     {"rabitq_local_scores", aggregate.counters.rabitq_l0_candidates},
     {"rabitq_gate_passes", aggregate.counters.rabitq_l1_candidates},
     {"rabitq_exact_vector_reads", aggregate.counters.rabitq_l2_candidates},
