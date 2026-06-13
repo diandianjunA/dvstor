@@ -147,6 +147,71 @@
 
             const u32 n_batch = static_cast<u32>(all_unvisited.size());
 
+            if (use_rabitq_) {
+                lib_assert(rabitq_cache_ != nullptr,
+                           "RaBitQ gate requires a loaded v2 sidecar");
+                const auto t_gate = std::chrono::steady_clock::now();
+                vec<f32> approximate_distances(n_batch,
+                    std::numeric_limits<f32>::infinity());
+                vec<u32> cache_miss_indices;
+                const auto& quantization = rabitq_cache_->quantization();
+                for (u32 i = 0; i < n_batch; ++i) {
+                    const auto* entry = rabitq_cache_->find(all_unvisited[i]);
+                    if (entry == nullptr) {
+                        cache_miss_indices.push_back(i);
+                    } else {
+                        approximate_distances[i] = rabitq::estimate_distance_lut(
+                            rabitq_query_lut, rabitq_query_norm2, *entry, quantization);
+                    }
+                }
+                thread->stats.query_rabitq_l0_candidates += n_batch;
+                thread->stats.query_rabitq_cache_misses += cache_miss_indices.size();
+                const vec<u32> gate_indices = rabitq::select_gate(
+                    approximate_distances, cache_miss_indices,
+                    rabitq_gate_width_, rabitq_gate_max_width_, rabitq_gate_margin_);
+                thread->stats.query_rabitq_l1_candidates += gate_indices.size();
+                add_breakdown_subcategory(thread,
+                    service::breakdown::Subcategory::cpu_query_rabitq_gate, t_gate);
+
+                vec<RemotePtr> exact_ptrs;
+                exact_ptrs.reserve(gate_indices.size());
+                for (u32 index : gate_indices) exact_ptrs.push_back(all_unvisited[index]);
+
+                const auto t_exact_fetch = std::chrono::steady_clock::now();
+                auto exact_vectors = co_await rdma::vamana::batch_read_vectors(
+                    exact_ptrs, thread, static_cast<void*>(nullptr), static_cast<u32>(0));
+                add_breakdown_subcategory(thread,
+                    service::breakdown::Subcategory::rdma_vector_fetch, t_exact_fetch);
+                thread->stats.query_host_staging_fallback_bytes +=
+                    gate_indices.size() * VamanaNode::vector_bytes();
+
+                const auto t_exact = std::chrono::steady_clock::now();
+                for (u32 i = 0; i < gate_indices.size(); ++i) {
+                    const distance_t exact_distance = distance_to_stored_vector<Distance>(
+                        query_data, query_dtype, exact_vectors.host_buffers[i]);
+                    insert_into_beam(beam, exact_ptrs[i], exact_distance, beam_width_);
+                    thread->buffer_allocator.free_buffer(
+                        exact_vectors.host_buffers[i], VamanaNode::vector_bytes());
+                }
+                add_breakdown_subcategory(thread,
+                    service::breakdown::Subcategory::cpu_query_beam_update, t_exact);
+                thread->stats.distcomps += gate_indices.size();
+                thread->stats.query_distcomps += gate_indices.size();
+                thread->stats.query_exact_reranks += gate_indices.size();
+                thread->stats.query_rabitq_l2_candidates += gate_indices.size();
+
+                for (u32 k = 0; k < K; ++k) {
+                    best_idx = select_best();
+                    if (best_idx < 0) break;
+                    beam[best_idx].expanded = true;
+                    pf_neighbors[k] = rdma::vamana::read_vamana_neighbors(
+                        beam[best_idx].rptr, &thread);
+                    pending_K = k + 1;
+                }
+                if (pending_K == 0) break;
+                continue;
+            }
+
             // ── Phase 2: vector / RaBitQ RDMA ──────────────────────────
             gs.flip_query_candidate_buffer();
             uint8_t* staging = gs.current_query_candidate_vecs();
@@ -241,7 +306,8 @@
                     for (u32 i = 0; i < cache_misses.size(); ++i) {
                         gs.h_distances[cache_miss_indices[i]] = rabitq::estimate_full_entry(
                             rotated_query, rabitq_query_norm2, misses.host_buffers[i]);
-                        gs.h_candidate_dists[cache_miss_indices[i]] = 0.0f;
+                        gs.h_candidate_dists[cache_miss_indices[i]] =
+                            std::numeric_limits<distance_t>::quiet_NaN();
                         thread->buffer_allocator.free_buffer(
                             misses.host_buffers[i], rabitq_entry_size);
                     }
@@ -305,7 +371,11 @@
                 add_breakdown_subcategory(thread,
                     service::breakdown::Subcategory::transfer_distance_d2h, t_d2h);
                 if (use_rabitq_) {
-                    std::fill(gs.h_candidate_dists, gs.h_candidate_dists + n_batch, 0.0f);
+                    // Full-dimensional entries provide an estimate but no conservative
+                    // interval. Mark that explicitly so exactification is ranked by the
+                    // estimate instead of treating every candidate as lower_bound=0.
+                    std::fill(gs.h_candidate_dists, gs.h_candidate_dists + n_batch,
+                              std::numeric_limits<distance_t>::quiet_NaN());
                 }
             }
 
@@ -317,8 +387,14 @@
                 u32 eligible_n = 0;
                 for (u32 i = 0; i < n_batch; ++i) {
                     const distance_t lower = gs.h_candidate_dists[i];
-                    const distance_t upper = 2.0f * gs.h_distances[i] - lower;
-                    if (!beam_full || (lower <= cutoff && upper >= cutoff)) {
+                    const bool has_interval = std::isfinite(lower);
+                    const distance_t upper = has_interval
+                        ? 2.0f * gs.h_distances[i] - lower
+                        : gs.h_distances[i];
+                    const bool competitive = has_interval
+                        ? (lower <= cutoff && upper >= cutoff)
+                        : gs.h_distances[i] <= cutoff;
+                    if (!beam_full || competitive) {
                         gs.h_candidate_order[eligible_n++] = i;
                     }
                 }
@@ -330,7 +406,13 @@
                                       gs.h_candidate_order + refine_n,
                                       gs.h_candidate_order + eligible_n,
                                       [&](u32 lhs, u32 rhs) {
-                                          return gs.h_candidate_dists[lhs] < gs.h_candidate_dists[rhs];
+                                          const distance_t lhs_lower = gs.h_candidate_dists[lhs];
+                                          const distance_t rhs_lower = gs.h_candidate_dists[rhs];
+                                          const distance_t lhs_rank = std::isfinite(lhs_lower)
+                                              ? lhs_lower : gs.h_distances[lhs];
+                                          const distance_t rhs_rank = std::isfinite(rhs_lower)
+                                              ? rhs_lower : gs.h_distances[rhs];
+                                          return lhs_rank < rhs_rank;
                                       });
 
                     vec<RemotePtr> refine_ptrs(refine_n);
@@ -456,7 +538,7 @@
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_query_beam_sort, t_beam_sort);
 
         // RaBitQ: re-rank top candidates with exact L2 distances
-        if (use_rabitq_ && !beam.empty()) {
+        if (false && use_rabitq_ && !beam.empty()) {
             const u32 rerank_target = std::max(k_ * 4, k_ + 64);
             const u32 rerank_n = std::min(rerank_target, static_cast<u32>(beam.size()));
             vec<RemotePtr> rerank_ptrs(rerank_n);

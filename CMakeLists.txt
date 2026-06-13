@@ -179,6 +179,16 @@ if (DVSTOR_STORAGE_NODE_ONLY)
     if (DVSTOR_BUILD_EXECUTABLES)
         add_vamana_metis_repartitioner_target()
         add_vamana_bfs_repartitioner_target()
+
+        add_executable(vamana_rabitq_sidecar_converter
+            tools/vamana_rabitq_sidecar_converter.cc
+        )
+        target_include_directories(vamana_rabitq_sidecar_converter PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
+            ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
+        )
+        target_link_libraries(vamana_rabitq_sidecar_converter rdma_library)
     endif ()
 else ()
     # GPU kernels library (compiled by nvcc)
@@ -262,6 +272,16 @@ else ()
 
         add_vamana_metis_repartitioner_target()
         add_vamana_bfs_repartitioner_target()
+
+        add_executable(vamana_rabitq_sidecar_converter
+            tools/vamana_rabitq_sidecar_converter.cc
+        )
+        target_include_directories(vamana_rabitq_sidecar_converter PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
+            ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
+        )
+        target_link_libraries(vamana_rabitq_sidecar_converter rdma_library)
 
         add_executable(dvstor_breakdown_benchmark
             tools/dvstor_breakdown_benchmark.cc

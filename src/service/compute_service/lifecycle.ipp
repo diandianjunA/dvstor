@@ -55,8 +55,8 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
         VamanaNode::set_rabitq_centroid(metadata.rabitq_centroid);
         lib_assert(metadata.rabitq_code_bits == VamanaNode::rabitq_code_bits() &&
                    metadata.rabitq_entry_size == VamanaNode::rabitq_entry_size() &&
-                   metadata.rabitq_cache_bits == vamana::rabitq::kCacheBits &&
-                   metadata.rabitq_cache_entry_size == vamana::rabitq::kCacheEntryBytes,
+                   metadata.rabitq_cache_bits == vamana::rabitq::kCodeBits &&
+                   metadata.rabitq_cache_entry_size == vamana::rabitq::kEntryBytes,
                    "RaBitQ index code layout does not match the runtime dimension");
       } else if (config_.use_rabitq) {
         lib_failure("--use-rabitq requires an index built with --use-rabitq");
@@ -106,10 +106,9 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     config_.alpha, config_.k, config_.dim, config_.resolved_vector_dtype());
   vamana_->set_expansion_batch(config_.expansion_batch);
   vamana_->set_query_batch_size(config_.query_batch_size);
-  vamana_->set_rabitq_pipeline(
-    static_cast<f32>(config_.rabitq_confidence_epsilon),
-    config_.rabitq_exact_batch,
-    config_.rabitq_exact_budget);
+  vamana_->set_rabitq_gate(config_.rabitq_gate_width,
+                           config_.rabitq_gate_max_width,
+                           static_cast<f32>(config_.rabitq_gate_margin));
   vamana_->set_use_rabitq(config_.use_rabitq);
   if (vamana_->use_rabitq() && config_.load_index) {
     const filepath_t startup_prefix = config_.resolved_index_prefix();
@@ -119,14 +118,17 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                                   static_cast<u32>(VamanaNode::total_size()), &cache_error),
                cache_error);
     const size_t raw_bytes = rabitq_cache_->entry_count() * VamanaNode::vector_bytes();
-    lib_assert(raw_bytes == 0 || rabitq_cache_->size_bytes() * 10 <= raw_bytes,
-               "RaBitQ compute cache exceeds the 10% raw-vector budget");
+    lib_assert(raw_bytes == 0 ||
+               static_cast<double>(rabitq_cache_->size_bytes()) / raw_bytes <=
+                 config_.rabitq_cache_max_ratio,
+               "RaBitQ gate sidecar exceeds --rabitq-cache-max-ratio");
     vamana_->set_rabitq_cache(rabitq_cache_.get());
-    print_status("RaBitQ local control cache: " +
-                 std::to_string(rabitq_cache_->size_bytes()) + " bytes");
+    print_status("RaBitQ gate v2 cache: " +
+                 std::to_string(rabitq_cache_->size_bytes()) + " bytes, NUMA " +
+                 (rabitq_cache_->numa_interleaved() ? "interleaved" : "local"));
   }
   print_status(vamana_->use_rabitq()
-    ? "search: RaBitQ + budgeted CPU exact refinement"
+    ? "search: local RaBitQ gate + exact CPU beam"
     : "search: exact");
 
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,

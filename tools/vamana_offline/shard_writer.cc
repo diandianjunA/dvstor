@@ -299,7 +299,7 @@ void write_vamana_shards(const VamanaGraph& graph,
     cache_quantization.error_min = std::numeric_limits<f32>::max();
     cache_quantization.norm_max = std::numeric_limits<f32>::lowest();
     cache_quantization.error_max = std::numeric_limits<f32>::lowest();
-    std::array<byte_t, vamana::rabitq::kCacheCodeBytes> ignored_code{};
+    std::array<byte_t, vamana::rabitq::kCodeBytes> ignored_code{};
     for (size_t i = 0; i < n; ++i) {
       f32 norm = 0.0f;
       f32 error = 0.0f;
@@ -544,8 +544,8 @@ void write_vamana_shards(const VamanaGraph& graph,
     metadata["rabitq_code_bits"] = VamanaNode::rabitq_code_bits();
     metadata["rabitq_entry_size"] = VamanaNode::rabitq_entry_size();
     metadata["rabitq_entry_storage_size"] = VamanaNode::rabitq_entry_storage_size();
-    metadata["rabitq_cache_bits"] = vamana::rabitq::kCacheBits;
-    metadata["rabitq_cache_entry_size"] = vamana::rabitq::kCacheEntryBytes;
+    metadata["rabitq_cache_bits"] = vamana::rabitq::kCodeBits;
+    metadata["rabitq_cache_entry_size"] = vamana::rabitq::kEntryBytes;
     metadata["rabitq_cache_norm_min"] = cache_quantization.norm_min;
     metadata["rabitq_cache_norm_max"] = cache_quantization.norm_max;
     metadata["rabitq_cache_error_min"] = cache_quantization.error_min;

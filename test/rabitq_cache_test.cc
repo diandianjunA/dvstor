@@ -39,19 +39,50 @@ int main() {
   vec<float> rotated(VamanaNode::rabitq_code_bits());
   float norm2 = 0.0f;
   VamanaNode::compute_rotated_query(vector.data(), VectorDType::uint8, rotated.data(), &norm2);
-  const float estimate = vamana::rabitq::estimate_distance(
-    rotated.data(), norm2, entry, quantization);
   const auto lut = vamana::rabitq::build_query_lut(rotated.data());
   const float lut_estimate = vamana::rabitq::estimate_distance_lut(
     lut, norm2, entry, quantization);
-  if (!std::isfinite(estimate) || estimate > 1e-2f * std::max(1.0f, norm2)) {
-    std::cerr << "compact RaBitQ self-distance is invalid: " << estimate << "\n";
+  float scalar_dot = 0.0f;
+  for (u32 bit = 0; bit < vamana::rabitq::kCodeBits; ++bit) {
+    const bool positive = (entry.code[bit >> 3] & (1u << (7u - (bit & 7u)))) != 0;
+    scalar_dot += positive ? rotated[bit] : -rotated[bit];
+  }
+  const float decoded_norm = vamana::rabitq::dequantize(
+    entry.norm_q, quantization.norm_min, quantization.norm_max);
+  const float decoded_error = vamana::rabitq::dequantize(
+    entry.error_q, quantization.error_min, quantization.error_max);
+  const float scalar_estimate = std::max(
+    norm2 + decoded_norm * decoded_norm -
+      2.0f * decoded_norm * scalar_dot /
+        (std::sqrt(static_cast<float>(vamana::rabitq::kCodeBits)) * decoded_error),
+    0.0f);
+  if (!std::isfinite(lut_estimate) ||
+      lut_estimate > 1e-2f * std::max(1.0f, norm2)) {
+    std::cerr << "compact RaBitQ self-distance is invalid: " << lut_estimate << "\n";
     return 1;
   }
-  if (std::abs(estimate - lut_estimate) >
-      1e-3f * std::max(1.0f, std::abs(estimate))) {
-    std::cerr << "compact RaBitQ LUT estimate differs: " << estimate
+  if (std::abs(scalar_estimate - lut_estimate) >
+      1e-3f * std::max(1.0f, std::abs(scalar_estimate))) {
+    std::cerr << "compact RaBitQ LUT estimate differs: " << scalar_estimate
               << " vs " << lut_estimate << "\n";
+    return 1;
+  }
+
+  const vec<float> gate_distances{1.0f, 2.0f, 2.05f, 2.2f, 0.5f};
+  const vec<u32> gate = vamana::rabitq::select_gate(
+    gate_distances, vec<u32>{4}, 2, 3, 0.05f);
+  if (gate != vec<u32>({4, 0, 1, 2})) {
+    std::cerr << "RaBitQ gate margin or cache-miss selection failed\n";
+    return 1;
+  }
+  if (vamana::rabitq::select_gate(vec<f32>{3.0f, 1.0f}, {}, 16, 24, 0.05f) !=
+      vec<u32>({1, 0})) {
+    std::cerr << "RaBitQ gate short-batch selection failed\n";
+    return 1;
+  }
+  if (vamana::rabitq::select_gate(vec<f32>{1.0f, 1.0f, 1.0f, 1.0f}, {},
+                                  2, 3, 0.05f) != vec<u32>({0, 1, 2})) {
+    std::cerr << "RaBitQ gate tie cap failed\n";
     return 1;
   }
 

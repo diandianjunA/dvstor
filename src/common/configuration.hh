@@ -43,10 +43,11 @@ public:
   u32 expansion_batch{1};   // Batch K beam expansions per iteration (1=serial)
   u32 rdma_qp_pool_size{1}; // QPs per memory node per SharedContext (1=default)
   u32 query_batch_size{1};  // Fuse GPU across N queries (1=single query)
-  bool use_rabitq{};        // Use RaBitQ entries instead of full vectors during beam search
-  f64 rabitq_confidence_epsilon{1.9}; // RaBitQ theoretical error-bound multiplier
-  u32 rabitq_exact_batch{64};         // Maximum ambiguous candidates exactified together
-  u32 rabitq_exact_budget{256};       // Per-query traversal exactification budget
+  bool use_rabitq{};        // Use the local RaBitQ gate before exact beam insertion
+  u32 rabitq_gate_width{16};
+  u32 rabitq_gate_max_width{24};
+  f64 rabitq_gate_margin{0.05};
+  f64 rabitq_cache_max_ratio{0.15};
   str vector_data_type{"auto"};
   str insert_execution{"compute"};
   u32 insert_workers{};
@@ -208,16 +209,17 @@ private:
       "query-batch-size", po::value<u32>(&query_batch_size)->default_value(1),
       "Fuse GPU/D2H across N queries processed in lockstep (1=disabled, 2-4=batch).")(
       "use-rabitq", po::bool_switch(&use_rabitq)->default_value(false),
-      "Use dimension-scaled RaBitQ entries for approximate beam search + exact re-rank.")(
-      "rabitq-confidence-epsilon",
-      po::value<f64>(&rabitq_confidence_epsilon)->default_value(rabitq_confidence_epsilon),
-      "RaBitQ distance-bound multiplier. 1.9 matches the reference implementation.")(
-      "rabitq-exact-batch",
-      po::value<u32>(&rabitq_exact_batch)->default_value(rabitq_exact_batch),
-      "Maximum bound-overlap candidates exactified in one batch. 0 disables traversal exactification.")(
-      "rabitq-exact-budget",
-      po::value<u32>(&rabitq_exact_budget)->default_value(rabitq_exact_budget),
-      "Maximum candidates exactified during traversal per query. Final top-k reranking is separate.")(
+      "Use the local 128-bit RaBitQ gate; only exact distances enter the beam.")(
+      "rabitq-gate-width", po::value<u32>(&rabitq_gate_width)->default_value(rabitq_gate_width),
+      "Minimum cached candidates exactified per expansion.")(
+      "rabitq-gate-max-width",
+      po::value<u32>(&rabitq_gate_max_width)->default_value(rabitq_gate_max_width),
+      "Maximum cached candidates exactified after margin expansion.")(
+      "rabitq-gate-margin", po::value<f64>(&rabitq_gate_margin)->default_value(rabitq_gate_margin),
+      "Relative margin around the gate-width cutoff.")(
+      "rabitq-cache-max-ratio",
+      po::value<f64>(&rabitq_cache_max_ratio)->default_value(rabitq_cache_max_ratio),
+      "Maximum sidecar bytes as a ratio of raw vector bytes.")(
       "dim", po::value<u32>(&dim), "Vector dimension")(
       "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
       "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
@@ -253,6 +255,11 @@ private:
 
     if (use_rabitq && ip_distance) {
       std::cerr << "[ERROR]: --use-rabitq currently supports L2 distance only" << std::endl;
+      exit_with_help_message(argv);
+    }
+    if (rabitq_gate_width == 0 || rabitq_gate_max_width < rabitq_gate_width ||
+        rabitq_gate_margin < 0.0 || rabitq_cache_max_ratio <= 0.0) {
+      std::cerr << "[ERROR]: invalid RaBitQ gate configuration" << std::endl;
       exit_with_help_message(argv);
     }
 
@@ -415,12 +422,10 @@ public:
       os << std::setw(width) << "RDMA QP Pool Size: " << config.rdma_qp_pool_size << std::endl;
       os << std::setw(width) << "Query Batch Size: " << config.query_batch_size << std::endl;
       os << std::setw(width) << "Use RaBitQ: " << (config.use_rabitq ? "true" : "false") << std::endl;
-      os << std::setw(width) << "RaBitQ confidence epsilon: "
-         << config.rabitq_confidence_epsilon << std::endl;
-      os << std::setw(width) << "RaBitQ exact batch: "
-         << config.rabitq_exact_batch << std::endl;
-      os << std::setw(width) << "RaBitQ exact budget: "
-         << config.rabitq_exact_budget << std::endl;
+      os << std::setw(width) << "RaBitQ gate width: " << config.rabitq_gate_width << std::endl;
+      os << std::setw(width) << "RaBitQ gate max width: " << config.rabitq_gate_max_width << std::endl;
+      os << std::setw(width) << "RaBitQ gate margin: " << config.rabitq_gate_margin << std::endl;
+      os << std::setw(width) << "RaBitQ cache max ratio: " << config.rabitq_cache_max_ratio << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {
       os << std::left << std::setfill(' ');

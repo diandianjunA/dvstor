@@ -35,6 +35,7 @@ enum class Subcategory : u8 {
   cpu_node_read = 0,
   cpu_query_select,
   cpu_query_filter,
+  cpu_query_rabitq_gate,
   cpu_query_stage_candidates,
   cpu_query_beam_update,
   cpu_query_rerank_collect,
@@ -135,6 +136,7 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "cpu_node_read_ns",
   "cpu_query_select_ns",
   "cpu_query_filter_ns",
+  "cpu_query_rabitq_gate_ns",
   "cpu_query_stage_candidates_ns",
   "cpu_query_beam_update_ns",
   "cpu_query_rerank_collect_ns",
@@ -231,6 +233,7 @@ inline constexpr Category parent_category(const Subcategory subcategory) {
     case Subcategory::cpu_node_read:
     case Subcategory::cpu_query_select:
     case Subcategory::cpu_query_filter:
+    case Subcategory::cpu_query_rabitq_gate:
     case Subcategory::cpu_query_stage_candidates:
     case Subcategory::cpu_query_beam_update:
     case Subcategory::cpu_query_rerank_collect:

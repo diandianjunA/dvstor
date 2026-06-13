@@ -430,8 +430,8 @@ bool ComputeService<Distance>::validate_index_metadata(const filepath_t& index_p
     VamanaNode::set_rabitq_centroid(metadata.rabitq_centroid);
     if (metadata.rabitq_code_bits != VamanaNode::rabitq_code_bits() ||
         metadata.rabitq_entry_size != VamanaNode::rabitq_entry_size() ||
-        metadata.rabitq_cache_bits != vamana::rabitq::kCacheBits ||
-        metadata.rabitq_cache_entry_size != vamana::rabitq::kCacheEntryBytes) {
+        metadata.rabitq_cache_bits != vamana::rabitq::kCodeBits ||
+        metadata.rabitq_cache_entry_size != vamana::rabitq::kEntryBytes) {
       if (error_message) {
         *error_message = "RaBitQ index code layout does not match the runtime dimension";
       }

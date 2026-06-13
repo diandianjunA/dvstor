@@ -200,8 +200,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"vector_component_size", VamanaNode::vector_component_size()},
     {"vector_bytes", VamanaNode::vector_bytes()},
     {"node_size", VamanaNode::total_size()},
-    {"candidate_vector_rdma_bytes", service.config().use_rabitq
-        ? 0 : VamanaNode::vector_bytes()},
+    {"candidate_vector_rdma_bytes", VamanaNode::vector_bytes()},
     {"effective_bytes_per_vector", VamanaNode::vector_bytes()},
     {"operation_granularity", "single_vector"},
     {"insert_vector_source", use_insert_file ? args.insert_file : "deterministic_synthetic_from_insert_id"},
@@ -214,17 +213,24 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"dim", service.config().dim},
     {"threads", service.config().num_threads},
     {"coroutines", service.config().num_coroutines},
-    {"search", service.config().use_rabitq ? "raflow_local_control" : "exact"},
+    {"search", service.config().use_rabitq ? "rabitq_gate_v2_exact_beam" : "exact"},
     {"rabitq_cache_bytes", service.rabitq_cache_bytes()},
     {"rabitq_cache_entries", service.rabitq_cache_entries()},
+    {"rabitq_cache_numa_interleaved", service.rabitq_cache_numa_interleaved()},
+    {"rabitq_cache_ratio",
+      service.rabitq_cache_entries() == 0 ? 0.0 :
+        static_cast<double>(service.rabitq_cache_bytes()) /
+          (service.rabitq_cache_entries() * VamanaNode::vector_bytes())},
     {"rabitq_cache_entry_bytes", service.config().use_rabitq
-        ? vamana::rabitq::kCacheEntryBytes : 0},
-    {"rabitq_confidence_epsilon", service.config().use_rabitq
-        ? service.config().rabitq_confidence_epsilon : 0.0},
-    {"rabitq_exact_batch", service.config().use_rabitq
-        ? service.config().rabitq_exact_batch : 0},
-    {"rabitq_exact_budget", service.config().use_rabitq
-        ? service.config().rabitq_exact_budget : 0},
+        ? vamana::rabitq::kEntryBytes : 0},
+    {"rabitq_gate_width", service.config().use_rabitq
+        ? service.config().rabitq_gate_width : 0},
+    {"rabitq_gate_max_width", service.config().use_rabitq
+        ? service.config().rabitq_gate_max_width : 0},
+    {"rabitq_gate_margin", service.config().use_rabitq
+        ? service.config().rabitq_gate_margin : 0.0},
+    {"rabitq_cache_max_ratio", service.config().use_rabitq
+        ? service.config().rabitq_cache_max_ratio : 0.0},
   };
   const size_t dim = service.config().dim;
   const double write_ratio_sum = args.write_insert_ratio + args.write_upsert_ratio + args.write_delete_ratio;

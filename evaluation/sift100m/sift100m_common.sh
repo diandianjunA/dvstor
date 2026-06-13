@@ -258,9 +258,10 @@ write_service_config() {
     if [[ -n "${QUERY_BATCH_SIZE:-}" ]]; then echo "query-batch-size = ${QUERY_BATCH_SIZE}"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then echo "use-rabitq = true"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then
-      echo "rabitq-confidence-epsilon = ${RABITQ_CONFIDENCE_EPSILON:-1.9}"
-      echo "rabitq-exact-batch = ${RABITQ_EXACT_BATCH:-64}"
-      echo "rabitq-exact-budget = ${RABITQ_EXACT_BUDGET:-256}"
+      echo "rabitq-gate-width = ${RABITQ_GATE_WIDTH:-16}"
+      echo "rabitq-gate-max-width = ${RABITQ_GATE_MAX_WIDTH:-24}"
+      echo "rabitq-gate-margin = ${RABITQ_GATE_MARGIN:-0.05}"
+      echo "rabitq-cache-max-ratio = ${RABITQ_CACHE_MAX_RATIO:-0.15}"
     fi
     echo "insert-execution = $insert_execution"
     if [[ "$insert_execution" == "storage_owner" ]]; then

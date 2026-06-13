@@ -6,7 +6,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <limits>
+#include <linux/mempolicy.h>
+#include <sstream>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "common/index_path.hh"
 #include "common/types.hh"
@@ -16,20 +19,58 @@
 
 namespace vamana::rabitq {
 
-constexpr u32 kCacheBits = 80;
-constexpr u32 kCacheCodeBytes = kCacheBits / 8;
-constexpr u32 kCacheEntryBytes = 12;
-constexpr u32 kCacheMagic = 0x31514652;  // RFQ1
+class ScopedNumaInterleave {
+public:
+  ScopedNumaInterleave() {
+    std::ifstream input("/sys/devices/system/node/online");
+    str spec;
+    if (!input.good() || !std::getline(input, spec)) return;
+    u32 max_node = 0;
+    std::stringstream ranges(spec);
+    str range;
+    vec<u32> nodes;
+    while (std::getline(ranges, range, ',')) {
+      const auto dash = range.find('-');
+      const u32 first = static_cast<u32>(std::stoul(range.substr(0, dash)));
+      const u32 last = dash == str::npos
+        ? first : static_cast<u32>(std::stoul(range.substr(dash + 1)));
+      for (u32 node = first; node <= last; ++node) nodes.push_back(node);
+      max_node = std::max(max_node, last);
+    }
+    if (nodes.size() < 2) return;
+    constexpr u32 word_bits = sizeof(unsigned long) * 8;
+    mask_.assign(max_node / word_bits + 1, 0);
+    for (u32 node : nodes) mask_[node / word_bits] |= 1ul << (node % word_bits);
+    enabled_ = syscall(SYS_set_mempolicy, MPOL_INTERLEAVE,
+                       mask_.data(), max_node + 1) == 0;
+  }
+
+  ~ScopedNumaInterleave() {
+    if (enabled_) syscall(SYS_set_mempolicy, MPOL_DEFAULT, nullptr, 0);
+  }
+
+  bool enabled() const { return enabled_; }
+
+private:
+  vec<unsigned long> mask_;
+  bool enabled_{};
+};
+
+constexpr u32 kCodeBits = 128;
+constexpr u32 kCodeBytes = kCodeBits / 8;
+constexpr u32 kEntryBytes = 18;
+constexpr u32 kSidecarMagic = 0x32514652;  // RFQ2
+constexpr u32 kSidecarVersion = 2;
 
 #pragma pack(push, 1)
 struct CompactEntry {
-  std::array<byte_t, kCacheCodeBytes> code{};
+  std::array<byte_t, kCodeBytes> code{};
   u8 norm_q{};
   u8 error_q{};
 };
 #pragma pack(pop)
 
-static_assert(sizeof(CompactEntry) == kCacheEntryBytes);
+static_assert(sizeof(CompactEntry) == kEntryBytes);
 
 struct Quantization {
   f32 norm_min{};
@@ -44,13 +85,13 @@ struct Estimate {
   f32 upper_bound{};
 };
 
-using QueryLut = std::array<f32, kCacheCodeBytes * 256>;
+using QueryLut = std::array<f32, kCodeBytes * 256>;
 
 struct SidecarHeader {
-  u32 magic{kCacheMagic};
-  u32 version{1};
-  u32 entry_size{kCacheEntryBytes};
-  u32 code_bits{kCacheBits};
+  u32 magic{kSidecarMagic};
+  u32 version{kSidecarVersion};
+  u32 entry_size{kEntryBytes};
+  u32 code_bits{kCodeBits};
   u32 node_size{};
   u32 reserved{};
   u64 entry_count{};
@@ -68,25 +109,29 @@ inline f32 dequantize(u8 value, f32 min_value, f32 max_value) {
   return min_value + static_cast<f32>(value) * ((max_value - min_value) / 255.0f);
 }
 
+inline void validate_dimension() {
+  lib_assert(VamanaNode::rabitq_code_bits() == kCodeBits,
+             "RaBitQ gate v2 currently requires 128-dimensional codes");
+}
+
 inline void compute_values(const byte_t* vector, VectorDType dtype,
-                           std::array<byte_t, kCacheCodeBytes>* code,
+                           std::array<byte_t, kCodeBytes>* code,
                            f32* norm, f32* error) {
-  vec<f32> rotated(VamanaNode::rabitq_code_bits());
+  validate_dimension();
+  vec<f32> rotated(kCodeBits);
   f32 norm2 = 0.0f;
   VamanaNode::compute_rotated_query(vector, dtype, rotated.data(), &norm2);
   code->fill(0);
   f32 signed_dot = 0.0f;
-  for (u32 bit = 0; bit < kCacheBits; ++bit) {
+  for (u32 bit = 0; bit < kCodeBits; ++bit) {
     const bool positive = rotated[bit] > 0.0f;
-    if (positive) {
-      (*code)[bit >> 3] |= static_cast<byte_t>(1u << (7u - (bit & 7u)));
-    }
+    if (positive) (*code)[bit >> 3] |= static_cast<byte_t>(1u << (7u - (bit & 7u)));
     signed_dot += positive ? rotated[bit] : -rotated[bit];
   }
   *norm = std::sqrt(norm2);
   *error = *norm <= 1e-15f
     ? 1.0f
-    : std::max(signed_dot / (*norm * std::sqrt(static_cast<f32>(kCacheBits))), 1e-15f);
+    : std::max(signed_dot / (*norm * std::sqrt(static_cast<f32>(kCodeBits))), 1e-15f);
 }
 
 inline CompactEntry encode(const byte_t* vector, VectorDType dtype,
@@ -100,25 +145,9 @@ inline CompactEntry encode(const byte_t* vector, VectorDType dtype,
   return entry;
 }
 
-inline f32 estimate_distance(const f32* rotated_query, f32 query_norm2,
-                             const CompactEntry& entry,
-                             const Quantization& quantization) {
-  f32 signed_dot = 0.0f;
-  for (u32 bit = 0; bit < kCacheBits; ++bit) {
-    const bool positive = (entry.code[bit >> 3] & (1u << (7u - (bit & 7u)))) != 0;
-    signed_dot += positive ? rotated_query[bit] : -rotated_query[bit];
-  }
-  const f32 norm = dequantize(entry.norm_q, quantization.norm_min, quantization.norm_max);
-  const f32 error = dequantize(entry.error_q, quantization.error_min, quantization.error_max);
-  const f32 inner_product = error > 1e-12f
-    ? norm * signed_dot / (std::sqrt(static_cast<f32>(kCacheBits)) * error)
-    : 0.0f;
-  return std::max(query_norm2 + norm * norm - 2.0f * inner_product, 0.0f);
-}
-
 inline QueryLut build_query_lut(const f32* rotated_query) {
   QueryLut lut{};
-  for (u32 byte = 0; byte < kCacheCodeBytes; ++byte) {
+  for (u32 byte = 0; byte < kCodeBytes; ++byte) {
     for (u32 code = 0; code < 256; ++code) {
       f32 sum = 0.0f;
       for (u32 bit = 0; bit < 8; ++bit) {
@@ -136,51 +165,23 @@ inline f32 estimate_distance_lut(const QueryLut& lut, f32 query_norm2,
                                  const CompactEntry& entry,
                                  const Quantization& quantization) {
   f32 signed_dot = 0.0f;
-  for (u32 byte = 0; byte < kCacheCodeBytes; ++byte) {
+  for (u32 byte = 0; byte < kCodeBytes; ++byte) {
     signed_dot += lut[byte * 256 + entry.code[byte]];
   }
   const f32 norm = dequantize(entry.norm_q, quantization.norm_min, quantization.norm_max);
   const f32 error = dequantize(entry.error_q, quantization.error_min, quantization.error_max);
   const f32 inner_product = error > 1e-12f
-    ? norm * signed_dot / (std::sqrt(static_cast<f32>(kCacheBits)) * error)
+    ? norm * signed_dot / (std::sqrt(static_cast<f32>(kCodeBits)) * error)
     : 0.0f;
   return std::max(query_norm2 + norm * norm - 2.0f * inner_product, 0.0f);
-}
-
-inline Estimate estimate_interval(const f32* rotated_query, f32 query_norm2,
-                                  const CompactEntry& entry,
-                                  const Quantization& quantization,
-                                  f32 epsilon = 1.9f) {
-  const f32 distance = estimate_distance(rotated_query, query_norm2, entry, quantization);
-  const f32 norm = dequantize(entry.norm_q, quantization.norm_min, quantization.norm_max);
-  const f32 correlation = std::max(
-    dequantize(entry.error_q, quantization.error_min, quantization.error_max), 1e-6f);
-  const f32 angular_error = 2.0f * norm * epsilon *
-    std::sqrt(std::max(1.0f / (correlation * correlation) - 1.0f, 0.0f) /
-              static_cast<f32>(kCacheBits - 1)) * std::sqrt(query_norm2);
-  const f32 norm_step = (quantization.norm_max - quantization.norm_min) / 255.0f;
-  const f32 quantization_error = 2.0f * norm_step *
-    (std::sqrt(query_norm2) + norm + norm_step);
-  const f32 error = angular_error + quantization_error;
-  return {distance, std::max(distance - error, 0.0f), distance + error};
 }
 
 inline Estimate estimate_interval_lut(const QueryLut& lut, f32 query_norm2,
                                       const CompactEntry& entry,
                                       const Quantization& quantization,
-                                      f32 epsilon = 1.9f) {
+                                      f32) {
   const f32 distance = estimate_distance_lut(lut, query_norm2, entry, quantization);
-  const f32 norm = dequantize(entry.norm_q, quantization.norm_min, quantization.norm_max);
-  const f32 correlation = std::max(
-    dequantize(entry.error_q, quantization.error_min, quantization.error_max), 1e-6f);
-  const f32 angular_error = 2.0f * norm * epsilon *
-    std::sqrt(std::max(1.0f / (correlation * correlation) - 1.0f, 0.0f) /
-              static_cast<f32>(kCacheBits - 1)) * std::sqrt(query_norm2);
-  const f32 norm_step = (quantization.norm_max - quantization.norm_min) / 255.0f;
-  const f32 quantization_error = 2.0f * norm_step *
-    (std::sqrt(query_norm2) + norm + norm_step);
-  const f32 error = angular_error + quantization_error;
-  return {distance, std::max(distance - error, 0.0f), distance + error};
+  return {distance, distance, distance};
 }
 
 inline f32 estimate_full_entry(const f32* rotated_query, f32 query_norm2,
@@ -190,9 +191,9 @@ inline f32 estimate_full_entry(const f32* rotated_query, f32 query_norm2,
     const bool positive = (entry[bit >> 3] & (1u << (7u - (bit & 7u)))) != 0;
     signed_dot += positive ? rotated_query[bit] : -rotated_query[bit];
   }
-  const u32 scalar_offset = static_cast<u32>(VamanaNode::rabitq_code_storage_size());
   f32 norm = 0.0f;
   f32 error = 0.0f;
+  const size_t scalar_offset = VamanaNode::rabitq_code_storage_size();
   std::memcpy(&norm, entry + scalar_offset, sizeof(norm));
   std::memcpy(&error, entry + scalar_offset + sizeof(norm), sizeof(error));
   const f32 inner_product = error > 1e-12f
@@ -202,37 +203,73 @@ inline f32 estimate_full_entry(const f32* rotated_query, f32 query_norm2,
   return std::max(query_norm2 + norm * norm - 2.0f * inner_product, 0.0f);
 }
 
+inline vec<u32> select_gate(const vec<f32>& distances,
+                            const vec<u32>& cache_miss_indices,
+                            u32 width, u32 max_width, f32 margin) {
+  vec<bool> is_miss(distances.size(), false);
+  vec<u32> selected;
+  for (u32 index : cache_miss_indices) {
+    if (index < is_miss.size() && !is_miss[index]) {
+      is_miss[index] = true;
+      selected.push_back(index);
+    }
+  }
+  vec<u32> cached;
+  for (u32 i = 0; i < distances.size(); ++i) {
+    if (!is_miss[i]) cached.push_back(i);
+  }
+  std::sort(cached.begin(), cached.end(), [&](u32 lhs, u32 rhs) {
+    if (distances[lhs] != distances[rhs]) return distances[lhs] < distances[rhs];
+    return lhs < rhs;
+  });
+  const u32 base = std::min<u32>(width, cached.size());
+  const u32 limit = std::max(width, max_width);
+  for (u32 i = 0; i < base; ++i) selected.push_back(cached[i]);
+  if (base > 0) {
+    const f32 cutoff = distances[cached[base - 1]];
+    const f32 margin_cutoff = cutoff + std::abs(cutoff) * std::max(margin, 0.0f);
+    for (u32 i = base; i < cached.size() && i < limit; ++i) {
+      if (distances[cached[i]] > margin_cutoff) break;
+      selected.push_back(cached[i]);
+    }
+  }
+  return selected;
+}
+
 class Cache {
 public:
   bool load(const filepath_t& prefix, u32 num_nodes, u32 expected_node_size, str* error) {
-    shards_.clear();
-    shards_.resize(num_nodes);
+    validate_dimension();
+    ScopedNumaInterleave interleave;
+    numa_interleaved_ = interleave.enabled();
+    shards_.assign(num_nodes, {});
     size_bytes_ = 0;
     entry_count_ = 0;
     for (u32 node = 0; node < num_nodes; ++node) {
       const filepath_t path = index_path::rabitq_cache_file(prefix, node + 1, num_nodes);
       std::ifstream input(path, std::ios::binary);
-      if (!input.good()) return fail(error, "missing RaBitQ cache sidecar: " + path.string());
+      if (!input.good()) return fail(error, "missing RaBitQ gate v2 sidecar: " + path.string());
       SidecarHeader header;
       input.read(reinterpret_cast<char*>(&header), sizeof(header));
-      if (!input.good() || header.magic != kCacheMagic || header.version != 1 ||
-          header.entry_size != kCacheEntryBytes || header.code_bits != kCacheBits ||
-          header.node_size != expected_node_size) {
-        return fail(error, "invalid RaBitQ cache sidecar header: " + path.string());
+      if (!input.good() || header.magic != kSidecarMagic ||
+          header.version != kSidecarVersion || header.entry_size != kEntryBytes ||
+          header.code_bits != kCodeBits || header.node_size != expected_node_size) {
+        return fail(error, "invalid RaBitQ gate v2 sidecar header: " + path.string());
       }
       if (node == 0) quantization_ = header.quantization;
       if (std::memcmp(&quantization_, &header.quantization, sizeof(Quantization)) != 0) {
-        return fail(error, "RaBitQ cache quantization differs across shards");
+        return fail(error, "RaBitQ gate quantization differs across shards");
       }
       auto& entries = shards_[node];
       entries.resize(header.entry_count);
       input.read(reinterpret_cast<char*>(entries.data()),
                  static_cast<std::streamsize>(entries.size() * sizeof(CompactEntry)));
-      if (!input.good()) return fail(error, "truncated RaBitQ cache sidecar: " + path.string());
+      if (!input.good()) return fail(error, "truncated RaBitQ gate v2 sidecar: " + path.string());
       size_bytes_ += entries.size() * sizeof(CompactEntry);
       entry_count_ += entries.size();
     }
     node_size_ = expected_node_size;
+    prewarm();
     return true;
   }
 
@@ -250,8 +287,19 @@ public:
   const Quantization& quantization() const { return quantization_; }
   size_t size_bytes() const { return size_bytes_; }
   size_t entry_count() const { return entry_count_; }
+  bool numa_interleaved() const { return numa_interleaved_; }
 
 private:
+  void prewarm() const {
+    volatile u8 sink = 0;
+    for (const auto& shard : shards_) {
+      const auto* bytes = reinterpret_cast<const u8*>(shard.data());
+      const size_t bytes_size = shard.size() * sizeof(CompactEntry);
+      for (size_t offset = 0; offset < bytes_size; offset += 4096) sink ^= bytes[offset];
+    }
+    (void)sink;
+  }
+
   static bool fail(str* error, const str& message) {
     if (error != nullptr) *error = message;
     return false;
@@ -262,6 +310,7 @@ private:
   u32 node_size_{};
   size_t size_bytes_{};
   size_t entry_count_{};
+  bool numa_interleaved_{};
 };
 
 }  // namespace vamana::rabitq

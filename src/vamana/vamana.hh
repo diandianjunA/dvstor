@@ -88,20 +88,15 @@ public:
     u32 query_batch_size() const { return query_batch_size_; }
     bool use_rabitq() const { return use_rabitq_; }
     void set_rabitq_cache(const rabitq::Cache* cache) { rabitq_cache_ = cache; }
-    void set_rabitq_pipeline(f32 confidence_epsilon, u32 exact_batch, u32 exact_budget) {
-        rabitq_confidence_epsilon_ = std::max(confidence_epsilon, 0.0f);
-        rabitq_exact_batch_ = exact_batch;
-        rabitq_exact_budget_ = exact_budget;
+    void set_rabitq_gate(u32 width, u32 max_width, f32 margin) {
+        rabitq_gate_width_ = width;
+        rabitq_gate_max_width_ = max_width;
+        rabitq_gate_margin_ = std::max(margin, 0.0f);
     }
     void set_use_rabitq(bool v) {
         use_rabitq_ = v;
         if (!v) return;
-        if (VamanaNode::rabitq_entry_size() >= VamanaNode::vector_bytes()) {
-            std::cerr << "[WARNING] RaBitQ entry is not smaller than the stored vector; "
-                         "using the exact search path to avoid increasing RDMA traffic" << std::endl;
-            use_rabitq_ = false;
-            return;
-        }
+        rabitq::validate_dimension();
         if (query_batch_size_ > 1) {
             std::cerr << "[WARNING] disabling query batching because RaBitQ does not support knn_batch"
                       << std::endl;
@@ -115,9 +110,13 @@ private:
     u32 query_batch_size_{1};
     bool use_rabitq_{false};
     const rabitq::Cache* rabitq_cache_{nullptr};
+    u32 rabitq_gate_width_{16};
+    u32 rabitq_gate_max_width_{24};
+    f32 rabitq_gate_margin_{0.05f};
+    // Retained only for compilation of the unreachable legacy branch below the v2 gate.
     f32 rabitq_confidence_epsilon_{1.9f};
-    u32 rabitq_exact_batch_{64};
-    u32 rabitq_exact_budget_{256};
+    u32 rabitq_exact_batch_{0};
+    u32 rabitq_exact_budget_{0};
     const u32 R_;
     const u32 beam_width_;
     const u32 beam_width_construction_;
