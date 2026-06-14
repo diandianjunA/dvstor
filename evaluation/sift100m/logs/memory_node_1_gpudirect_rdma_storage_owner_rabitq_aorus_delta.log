@@ -1,0 +1,86 @@
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1234
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         64
+max send work requests:       4096
+max receive work requests:    4096
+============================================================
+server index file:            "/data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced_node1_of5.dat"
+============================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 26201 -- 6808
+[STATUS]: pinned main thread to core 28
+[STATUS]: loaded index metadata from /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced (layout=rabitq, vector_data_type=uint8)
+allocation size: 13958643712
+allocated ALIGNED MEM (no hugepage) at 128429452165184 with buffer size 13958643712
+[STATUS]: loading index (8480000128 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced_node1_of5.dat
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+pairing: 26206 -- 6813
+pairing: 26211 -- 6818
+pairing: 26218 -- 6823
+pairing: 26221 -- 6828
+[STATUS]: waiting for commands from compute node...
+[STATUS]: loading index (8480000128 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced_node1_of5.dat
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 26227 -- 26226
+pairing: 26228 -- 26229
+pairing: 26232 -- 26230
+pairing: 26234 -- 26231
+pairing: 26237 -- 26233
+pairing: 26239 -- 26235
+pairing: 26240 -- 26236
+pairing: 26243 -- 26238
+pairing: 26244 -- 26241
+pairing: 26248 -- 26242
+pairing: 26250 -- 26246
+pairing: 26251 -- 26247
+pairing: 26253 -- 26249
+pairing: 26255 -- 26252
+pairing: 26258 -- 26260
+pairing: 26261 -- 26262
+[STATUS]: storage-owner peer RDMA QPs per peer: 4
+[STATUS]: storage-owner peer QP0 reserved for RPC; data RDMA uses QP1..3
+[STATUS]: storage-owner maintenance RDMA uses dedicated peer QP3
+allocated ALIGNED MEM (no hugepage) at 128429129203776 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128429116620864 with buffer size 10509120
+[STATUS]: storage-owner peer RPC receive slots per peer: 32 (requested=32)
+[STATUS]: storage-owner handoff queue depth per peer: 32 send slots per peer: 8
+allocated ALIGNED MEM (no hugepage) at 95556155438016 with buffer size 75776
+allocated ALIGNED MEM (no hugepage) at 128429047414848 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128428978208832 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128428909002816 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128428839796800 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128428770590784 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128428701384768 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128428632178752 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128428562972736 with buffer size 67108864
+[STATUS]: storage-owner peer reverse-update workers: 8
+[STATUS]: storage-owner peer reverse-update tuning: mode=async queue_depth=65536 flush_us=200 coalesce_max=256
+[STATUS]: storage-owner peer RDMA read credits per peer: 8 per QP: 8 (requested=8) maintenance per peer: 1 per QP: 1 (requested=1)
+[STATUS]: storage-owner online insert tuning: construction_beam=128 snapshot_batch=64 prune_max_candidates=128 transitive_search=false update_search_mode=adaptive entry_points=2048 entry_probes=16
+[STATUS]: storage-owner coroutine scratch: snapshot_bytes=144 snapshot_stride=192 batch=64 per_coroutine=12736
+allocated ALIGNED MEM (no hugepage) at 128428378423360 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128427371790400 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128427302584384 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128427233378368 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128427164172352 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128427094966336 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128427025760320 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128426956554304 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 128426887348288 with buffer size 67108864
+[STATUS]: storage-owner delta graph commit workers: 1 policy=isolated batch=32 interval_us=0 pending_depth=262144 maintenance_rdma_tokens=1
+[STATUS]: storage-owner insert runtime enabled on shard 0
+[STATUS]: pinned delta graph commit worker 0 to core 0
