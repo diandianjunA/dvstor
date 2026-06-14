@@ -123,6 +123,28 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
     std::max(aggregate.counters.overflow_prune_max_kernel_threads, sample.overflow_prune_max_kernel_threads);
   aggregate.counters.query_rdma_to_staging_bytes += delta.query_rdma_to_staging_bytes;
   aggregate.counters.query_host_staging_fallback_bytes += delta.query_host_staging_fallback_bytes;
+  aggregate.counters.storage_owner_handoff_requests += delta.storage_owner_handoff_requests;
+  aggregate.counters.storage_owner_handoff_successes += delta.storage_owner_handoff_successes;
+  aggregate.counters.storage_owner_handoff_queue_full += delta.storage_owner_handoff_queue_full;
+  aggregate.counters.storage_owner_handoff_timeouts += delta.storage_owner_handoff_timeouts;
+  aggregate.counters.storage_owner_handoff_overloaded += delta.storage_owner_handoff_overloaded;
+  aggregate.counters.storage_owner_handoff_failed += delta.storage_owner_handoff_failed;
+  aggregate.counters.storage_owner_handoff_request_bytes += delta.storage_owner_handoff_request_bytes;
+  aggregate.counters.storage_owner_handoff_response_bytes += delta.storage_owner_handoff_response_bytes;
+  aggregate.counters.storage_owner_handoff_remote_handler_ns +=
+    delta.storage_owner_handoff_remote_handler_ns;
+  aggregate.counters.storage_owner_handoff_remote_expanded_nodes +=
+    delta.storage_owner_handoff_remote_expanded_nodes;
+  aggregate.counters.storage_owner_handoff_remote_snapshot_reads +=
+    delta.storage_owner_handoff_remote_snapshot_reads;
+  aggregate.counters.storage_owner_handoff_remote_neighbor_reads +=
+    delta.storage_owner_handoff_remote_neighbor_reads;
+  aggregate.counters.storage_owner_handoff_response_beam_entries +=
+    delta.storage_owner_handoff_response_beam_entries;
+  aggregate.counters.storage_owner_handoff_response_visited_entries +=
+    delta.storage_owner_handoff_response_visited_entries;
+  aggregate.counters.storage_owner_handoff_response_visited_truncated +=
+    delta.storage_owner_handoff_response_visited_truncated;
   aggregate.lock_attempts += sample.lock_attempts;
   aggregate.lock_retries += sample.lock_retries;
   aggregate.cas_failures += sample.cas_failures;

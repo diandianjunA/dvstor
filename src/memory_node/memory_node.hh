@@ -306,7 +306,10 @@ private:
                               const span<const element_t> query,
                               const Configuration& config,
                               u32 local_shard_id,
-                              InsertBreakdownCounters* breakdown);
+                              InsertBreakdownCounters* breakdown,
+                              u64* expanded_count = nullptr,
+                              u64* snapshot_read_count = nullptr,
+                              u64* neighbor_read_count = nullptr);
   StorageOwnerInsertCoroutine beam_search_candidates_transitive_async(
       const span<const element_t> query,
       RemotePtr medoid,

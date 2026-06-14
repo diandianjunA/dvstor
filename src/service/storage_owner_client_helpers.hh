@@ -103,6 +103,31 @@ inline void add_storage_owner_breakdown(
                           per_item_ns(counters.storage_owner_prune_pair_distance_ns, item_count));
 }
 
+inline void add_storage_owner_counters(
+    const std::shared_ptr<service::breakdown::Sample>& sample,
+    const service::storage_owner::InsertBreakdownCounters& counters) {
+  if (!sample) {
+    return;
+  }
+  service::breakdown::ThreadCounterDelta delta{};
+  delta.storage_owner_handoff_requests = counters.storage_owner_handoff_requests;
+  delta.storage_owner_handoff_successes = counters.storage_owner_handoff_successes;
+  delta.storage_owner_handoff_queue_full = counters.storage_owner_handoff_queue_full;
+  delta.storage_owner_handoff_timeouts = counters.storage_owner_handoff_timeouts;
+  delta.storage_owner_handoff_overloaded = counters.storage_owner_handoff_overloaded;
+  delta.storage_owner_handoff_failed = counters.storage_owner_handoff_failed;
+  delta.storage_owner_handoff_request_bytes = counters.storage_owner_handoff_request_bytes;
+  delta.storage_owner_handoff_response_bytes = counters.storage_owner_handoff_response_bytes;
+  delta.storage_owner_handoff_remote_handler_ns = counters.storage_owner_handoff_remote_handler_ns;
+  delta.storage_owner_handoff_remote_expanded_nodes = counters.storage_owner_handoff_remote_expanded_nodes;
+  delta.storage_owner_handoff_remote_snapshot_reads = counters.storage_owner_handoff_remote_snapshot_reads;
+  delta.storage_owner_handoff_remote_neighbor_reads = counters.storage_owner_handoff_remote_neighbor_reads;
+  delta.storage_owner_handoff_response_beam_entries = counters.storage_owner_handoff_response_beam_entries;
+  delta.storage_owner_handoff_response_visited_entries = counters.storage_owner_handoff_response_visited_entries;
+  delta.storage_owner_handoff_response_visited_truncated = counters.storage_owner_handoff_response_visited_truncated;
+  sample->add_counters(delta);
+}
+
 inline void add_storage_owner_sender_breakdown(
     const std::shared_ptr<service::breakdown::Sample>& sample,
     u64 sender_queue_wait_ns,

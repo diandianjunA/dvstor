@@ -100,6 +100,22 @@ struct InsertBreakdownCounters {
   u64 storage_owner_prune_sort_ns{};
   u64 storage_owner_prune_pair_distance_ns{};
 
+  u64 storage_owner_handoff_requests{};
+  u64 storage_owner_handoff_successes{};
+  u64 storage_owner_handoff_queue_full{};
+  u64 storage_owner_handoff_timeouts{};
+  u64 storage_owner_handoff_overloaded{};
+  u64 storage_owner_handoff_failed{};
+  u64 storage_owner_handoff_request_bytes{};
+  u64 storage_owner_handoff_response_bytes{};
+  u64 storage_owner_handoff_remote_handler_ns{};
+  u64 storage_owner_handoff_remote_expanded_nodes{};
+  u64 storage_owner_handoff_remote_snapshot_reads{};
+  u64 storage_owner_handoff_remote_neighbor_reads{};
+  u64 storage_owner_handoff_response_beam_entries{};
+  u64 storage_owner_handoff_response_visited_entries{};
+  u64 storage_owner_handoff_response_visited_truncated{};
+
   u64 total() const {
     return storage_owner_queue_wait_ns +
            storage_owner_medoid_ns +
@@ -285,6 +301,11 @@ struct SearchHandoffResponseHeader {
   u32 updated_beam_count;
   u32 new_visited_count;
   u32 total_visited_count;
+  u32 visited_truncated_count;
+  u64 handler_cpu_ns;
+  u32 local_expanded_count;
+  u32 local_snapshot_reads;
+  u32 local_neighbor_reads;
   u32 reserved;
 };
 

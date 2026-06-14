@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 #include "vamana/storage_layout_resolver.hh"
 
@@ -36,8 +37,12 @@ bool MemoryNode::handle_search_handoff_rpc(u32 source_shard,
                                            const SearchHandoffRequestHeader* req,
                                            const byte_t* /*payload*/,
                                            const Configuration& config) {
+  const auto handler_started = std::chrono::steady_clock::now();
   const u32 vector_bytes = req->vector_bytes;
   const u32 beam_count = req->rpc.item_count;
+  u64 local_expanded_count = 0;
+  u64 local_snapshot_reads = 0;
+  u64 local_neighbor_reads = 0;
 
   // Unpack query vector
   const auto* query_vec = handoff_query_vector(req);
@@ -84,6 +89,7 @@ bool MemoryNode::handle_search_handoff_rpc(u32 source_shard,
     const size_t end = std::min(local_unexpanded.size(), begin + snapshot_batch);
     vec<RemotePtr> batch(local_unexpanded.begin() + begin, local_unexpanded.begin() + end);
     vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
+    local_snapshot_reads += batch.size();
     for (const NodeSnapshot& snapshot : snapshots) {
       if (snapshot.deleted) {
         continue;
@@ -100,7 +106,9 @@ bool MemoryNode::handle_search_handoff_rpc(u32 source_shard,
   }
 
   // Phase 2: Expand all local nodes
-  expand_all_local_nodes(beam, visited, query, config, storage_id_, nullptr);
+  expand_all_local_nodes(beam, visited, query, config, storage_id_, nullptr,
+                         &local_expanded_count, &local_snapshot_reads,
+                         &local_neighbor_reads);
 
   // Phase 3: Build and send response
   vec<BeamEntrySerialized> response_beam;
@@ -125,7 +133,9 @@ bool MemoryNode::handle_search_handoff_rpc(u32 source_shard,
   }
   const size_t max_new_visited =
     (peer_rpc_runtime_.message_bytes - fixed_response_bytes) / sizeof(u64);
+  u32 visited_truncated_count = 0;
   if (new_visited_raws.size() > max_new_visited) {
+    visited_truncated_count = static_cast<u32>(new_visited_raws.size() - max_new_visited);
     new_visited_raws.resize(max_new_visited);
   }
   const size_t response_bytes = search_handoff_response_bytes(
@@ -143,6 +153,14 @@ bool MemoryNode::handle_search_handoff_rpc(u32 source_shard,
   resp->updated_beam_count = static_cast<u32>(response_beam.size());
   resp->new_visited_count = static_cast<u32>(new_visited_raws.size());
   resp->total_visited_count = static_cast<u32>(visited.size());
+  resp->visited_truncated_count = visited_truncated_count;
+  resp->handler_cpu_ns = 0;
+  resp->local_expanded_count = static_cast<u32>(std::min<u64>(
+    local_expanded_count, std::numeric_limits<u32>::max()));
+  resp->local_snapshot_reads = static_cast<u32>(std::min<u64>(
+    local_snapshot_reads, std::numeric_limits<u32>::max()));
+  resp->local_neighbor_reads = static_cast<u32>(std::min<u64>(
+    local_neighbor_reads, std::numeric_limits<u32>::max()));
   resp->reserved = 0;
 
   auto* resp_beam = handoff_response_beam(resp);
@@ -151,6 +169,7 @@ bool MemoryNode::handle_search_handoff_rpc(u32 source_shard,
   auto* resp_visited = handoff_response_visited(resp, static_cast<u32>(response_beam.size()));
   std::memcpy(resp_visited, new_visited_raws.data(),
               new_visited_raws.size() * sizeof(u64));
+  resp->handler_cpu_ns = elapsed_ns_since(handler_started);
 
   return enqueue_handoff_response(source_shard, std::move(response_msg));
 }

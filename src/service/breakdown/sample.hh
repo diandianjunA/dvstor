@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 
 #include "common/statistics.hh"
@@ -49,7 +50,83 @@ struct ThreadCounterDelta {
   u64 overflow_prune_max_kernel_threads{};
   u64 query_rdma_to_staging_bytes{};
   u64 query_host_staging_fallback_bytes{};
+  u64 storage_owner_handoff_requests{};
+  u64 storage_owner_handoff_successes{};
+  u64 storage_owner_handoff_queue_full{};
+  u64 storage_owner_handoff_timeouts{};
+  u64 storage_owner_handoff_overloaded{};
+  u64 storage_owner_handoff_failed{};
+  u64 storage_owner_handoff_request_bytes{};
+  u64 storage_owner_handoff_response_bytes{};
+  u64 storage_owner_handoff_remote_handler_ns{};
+  u64 storage_owner_handoff_remote_expanded_nodes{};
+  u64 storage_owner_handoff_remote_snapshot_reads{};
+  u64 storage_owner_handoff_remote_neighbor_reads{};
+  u64 storage_owner_handoff_response_beam_entries{};
+  u64 storage_owner_handoff_response_visited_entries{};
+  u64 storage_owner_handoff_response_visited_truncated{};
 };
+
+inline void add_counter_delta(ThreadCounterDelta& lhs, const ThreadCounterDelta& rhs) {
+  lhs.rdma_read_bytes += rhs.rdma_read_bytes;
+  lhs.rdma_write_bytes += rhs.rdma_write_bytes;
+  lhs.rdma_read_ops += rhs.rdma_read_ops;
+  lhs.rdma_write_ops += rhs.rdma_write_ops;
+  lhs.neighbor_rdma_bytes += rhs.neighbor_rdma_bytes;
+  lhs.vector_rdma_bytes += rhs.vector_rdma_bytes;
+  lhs.neighbor_rdma_read_ops += rhs.neighbor_rdma_read_ops;
+  lhs.vector_rdma_read_ops += rhs.vector_rdma_read_ops;
+  lhs.vector_rdma_batch_calls += rhs.vector_rdma_batch_calls;
+  lhs.vector_rdma_cqes += rhs.vector_rdma_cqes;
+  lhs.h2d_bytes += rhs.h2d_bytes;
+  lhs.d2h_bytes += rhs.d2h_bytes;
+  lhs.l2_kernels += rhs.l2_kernels;
+  lhs.prune_kernels += rhs.prune_kernels;
+  lhs.exact_reranks += rhs.exact_reranks;
+  lhs.rabitq_l0_candidates += rhs.rabitq_l0_candidates;
+  lhs.rabitq_cache_misses += rhs.rabitq_cache_misses;
+  lhs.rabitq_l1_candidates += rhs.rabitq_l1_candidates;
+  lhs.rabitq_l2_candidates += rhs.rabitq_l2_candidates;
+  lhs.rabitq_forced_widen += rhs.rabitq_forced_widen;
+  lhs.rabitq_audit_expansions += rhs.rabitq_audit_expansions;
+  lhs.rabitq_audit_candidates += rhs.rabitq_audit_candidates;
+  lhs.rabitq_safe_skips += rhs.rabitq_safe_skips;
+  lhs.rabitq_exact_fallbacks += rhs.rabitq_exact_fallbacks;
+  lhs.rabitq_prefetch_issued += rhs.rabitq_prefetch_issued;
+  lhs.rabitq_prefetch_hits += rhs.rabitq_prefetch_hits;
+  lhs.rabitq_prefetch_misses += rhs.rabitq_prefetch_misses;
+  lhs.rabitq_prefetch_disabled_queries += rhs.rabitq_prefetch_disabled_queries;
+  lhs.visited_nodes += rhs.visited_nodes;
+  lhs.visited_neighborlists += rhs.visited_neighborlists;
+  lhs.remote_allocations += rhs.remote_allocations;
+  lhs.overflow_prunes += rhs.overflow_prunes;
+  lhs.overflow_prune_candidates += rhs.overflow_prune_candidates;
+  lhs.overflow_prune_max_candidates =
+    std::max(lhs.overflow_prune_max_candidates, rhs.overflow_prune_max_candidates);
+  lhs.overflow_prune_pair_checks_upper_bound += rhs.overflow_prune_pair_checks_upper_bound;
+  lhs.overflow_prune_global_load_bytes_upper_bound += rhs.overflow_prune_global_load_bytes_upper_bound;
+  lhs.overflow_prune_kernel_blocks += rhs.overflow_prune_kernel_blocks;
+  lhs.overflow_prune_kernel_threads += rhs.overflow_prune_kernel_threads;
+  lhs.overflow_prune_max_kernel_threads =
+    std::max(lhs.overflow_prune_max_kernel_threads, rhs.overflow_prune_max_kernel_threads);
+  lhs.query_rdma_to_staging_bytes += rhs.query_rdma_to_staging_bytes;
+  lhs.query_host_staging_fallback_bytes += rhs.query_host_staging_fallback_bytes;
+  lhs.storage_owner_handoff_requests += rhs.storage_owner_handoff_requests;
+  lhs.storage_owner_handoff_successes += rhs.storage_owner_handoff_successes;
+  lhs.storage_owner_handoff_queue_full += rhs.storage_owner_handoff_queue_full;
+  lhs.storage_owner_handoff_timeouts += rhs.storage_owner_handoff_timeouts;
+  lhs.storage_owner_handoff_overloaded += rhs.storage_owner_handoff_overloaded;
+  lhs.storage_owner_handoff_failed += rhs.storage_owner_handoff_failed;
+  lhs.storage_owner_handoff_request_bytes += rhs.storage_owner_handoff_request_bytes;
+  lhs.storage_owner_handoff_response_bytes += rhs.storage_owner_handoff_response_bytes;
+  lhs.storage_owner_handoff_remote_handler_ns += rhs.storage_owner_handoff_remote_handler_ns;
+  lhs.storage_owner_handoff_remote_expanded_nodes += rhs.storage_owner_handoff_remote_expanded_nodes;
+  lhs.storage_owner_handoff_remote_snapshot_reads += rhs.storage_owner_handoff_remote_snapshot_reads;
+  lhs.storage_owner_handoff_remote_neighbor_reads += rhs.storage_owner_handoff_remote_neighbor_reads;
+  lhs.storage_owner_handoff_response_beam_entries += rhs.storage_owner_handoff_response_beam_entries;
+  lhs.storage_owner_handoff_response_visited_entries += rhs.storage_owner_handoff_response_visited_entries;
+  lhs.storage_owner_handoff_response_visited_truncated += rhs.storage_owner_handoff_response_visited_truncated;
+}
 
 
 inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistics& end,
@@ -156,6 +233,7 @@ struct Sample {
   u64 cas_failures{};
   u64 overflow_prune_max_candidates{};
   u64 overflow_prune_max_kernel_threads{};
+  ThreadCounterDelta extra_counters{};
   bool started_flag{};
   bool finished_flag{};
 
@@ -183,7 +261,15 @@ struct Sample {
     category_ns[static_cast<size_t>(parent_category(subcategory))] += ns;
   }
 
-  ThreadCounterDelta counters() const { return diff_thread_counters(end_counters, start_counters, operation); }
+  void add_counters(const ThreadCounterDelta& delta) {
+    add_counter_delta(extra_counters, delta);
+  }
+
+  ThreadCounterDelta counters() const {
+    ThreadCounterDelta out = diff_thread_counters(end_counters, start_counters, operation);
+    add_counter_delta(out, extra_counters);
+    return out;
+  }
 };
 
 }  // namespace service::breakdown

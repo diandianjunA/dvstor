@@ -34,6 +34,7 @@ MinorCoroutine read_medoid_probe(RemotePtr& medoid_ptr, s_ptr<VamanaNode>& node,
 }
 
 using service::storage_owner_client::add_storage_owner_breakdown;
+using service::storage_owner_client::add_storage_owner_counters;
 using service::storage_owner_client::add_storage_owner_sender_breakdown;
 using service::storage_owner_client::duration_ns;
 using service::storage_owner_client::duration_ns_clamped;
