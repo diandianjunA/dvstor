@@ -18,20 +18,23 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
   const u32 max_slots_per_peer = std::max<u32>(1, max_recv_wr / remote_peer_count);
   const u32 desired_slots_per_peer = std::max<u32>(16, config.storage_owner_rpc_depth * 4);
   peer_rpc_runtime_.recv_slots_per_peer = std::min(desired_slots_per_peer, max_slots_per_peer);
+  peer_rpc_runtime_.send_slots_per_peer = std::min(
+    std::max<u32>(1, config.storage_owner_rpc_depth),
+    peer_rpc_runtime_.recv_slots_per_peer);
   peer_rpc_runtime_.recv_region_bytes =
     peer_rpc_runtime_.message_bytes * num_storage_nodes_ * peer_rpc_runtime_.recv_slots_per_peer;
   peer_rpc_runtime_.sync_send_offset = peer_rpc_runtime_.recv_region_bytes;
-  peer_rpc_runtime_.buffer.allocate(
-    peer_rpc_runtime_.sync_send_offset + peer_rpc_runtime_.message_bytes * num_storage_nodes_);
+  peer_rpc_runtime_.async_send_offset =
+    peer_rpc_runtime_.sync_send_offset + peer_rpc_runtime_.message_bytes * num_storage_nodes_;
+  const size_t async_send_bytes = peer_rpc_runtime_.message_bytes * num_storage_nodes_ *
+                                  peer_rpc_runtime_.send_slots_per_peer;
+  peer_rpc_runtime_.buffer.allocate(peer_rpc_runtime_.async_send_offset + async_send_bytes);
   peer_rpc_runtime_.buffer.touch_memory();
   peer_rpc_runtime_.region = std::make_unique<LocalMemoryRegion>(
     *peer_context_, peer_rpc_runtime_.buffer.get_full_buffer(), peer_rpc_runtime_.buffer.buffer_size);
   print_status("storage-owner peer RPC receive slots per peer: " +
                std::to_string(peer_rpc_runtime_.recv_slots_per_peer) +
                " (requested=" + std::to_string(desired_slots_per_peer) + ")");
-  print_status("storage-owner peer RPC sync send slots: " +
-               std::to_string(num_storage_nodes_ - 1));
-
   for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
     if (peer_id == storage_id_) continue;
     for (u32 slot_id = 0; slot_id < peer_rpc_runtime_.recv_slots_per_peer; ++slot_id) {
@@ -51,24 +54,19 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
 
   peer_reverse_shutdown_.store(false, std::memory_order_release);
   peer_reverse_workers_done_.store(false, std::memory_order_release);
-  peer_rpc_producers_done_.store(false, std::memory_order_release);
   peer_reverse_task_queue_limit_ =
     std::max<size_t>(1024, static_cast<size_t>(config.storage_owner_reverse_queue_depth));
   peer_reverse_outgoing_queue_limit_ = peer_reverse_task_queue_limit_;
 
-  const u32 worker_count = qir_enabled(config)
-    ? std::max<u32>(1, std::min<u32>(4, std::max<u32>(1, num_compute_threads_ / 4)))
-    : std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
-  const size_t snapshot_stride = memory_node_detail::storage_owner_snapshot_stride();
+  const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
+  const size_t snapshot_stride = align_up(VamanaNode::vector_bytes());
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
   const size_t coroutine_scratch_stride =
     align_up(std::max<size_t>(VamanaNode::total_size(),
                               std::max(neighbor_stride,
                                        snapshot_stride *
                                          std::max<u32>(1, config.storage_owner_search_snapshot_batch))));
-  const size_t scratch_bytes = qir_enabled(config)
-    ? std::max<size_t>(2ull * 1024ull * 1024ull, coroutine_scratch_stride)
-    : std::max<size_t>(64ull * 1024ull * 1024ull, coroutine_scratch_stride);
+  const size_t scratch_bytes = std::max<size_t>(64ull * 1024ull * 1024ull, coroutine_scratch_stride);
   peer_reverse_worker_states_.reserve(worker_count);
   for (u32 i = 0; i < worker_count; ++i) {
     auto worker = std::make_unique<StorageOwnerThread>(i, 1, config.max_send_queue_wr);
@@ -109,7 +107,6 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
   if (peer_reverse_response_thread_.joinable()) {
     peer_reverse_response_thread_.join();
   }
-  peer_rpc_producers_done_.store(true, std::memory_order_release);
   if (peer_rpc_progress_thread_.joinable()) {
     peer_rpc_progress_thread_.join();
   }
@@ -124,6 +121,12 @@ size_t MemoryNode::peer_rpc_receive_offset(u32 peer_id, u32 slot_id) const {
 size_t MemoryNode::peer_rpc_sync_send_offset(u32 peer_id) const {
   return peer_rpc_runtime_.sync_send_offset +
          static_cast<size_t>(peer_id) * peer_rpc_runtime_.message_bytes;
+}
+
+size_t MemoryNode::peer_rpc_async_send_offset(u32 peer_id, u32 slot_id) const {
+  const size_t slot_index =
+    static_cast<size_t>(peer_id) * peer_rpc_runtime_.send_slots_per_peer + slot_id;
+  return peer_rpc_runtime_.async_send_offset + slot_index * peer_rpc_runtime_.message_bytes;
 }
 
 void MemoryNode::repost_peer_rpc_receive(u32 peer_id, u32 slot_id) {
@@ -185,28 +188,18 @@ bool MemoryNode::apply_peer_reverse_update_tasks(const vec<PeerReverseUpdateTask
   }
 
   const auto apply_started = std::chrono::steady_clock::now();
-  std::unordered_map<u64, vec<service::storage_owner::ReverseUpdateOp>> grouped;
+  std::unordered_map<u64, vec<RemotePtr>> grouped;
   size_t item_count = 0;
-  u64 queue_delay_ns = 0;
-  const auto apply_time = std::chrono::steady_clock::now();
   for (const PeerReverseUpdateTask& task : tasks) {
     item_count += task.ops.size();
-    const bool qir_task = std::any_of(task.ops.begin(), task.ops.end(), [](const auto& op) {
-      return op.source_insert_id != 0;
-    });
-    if (qir_task) {
-      queue_delay_ns += static_cast<u64>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-          apply_time - task.received_at).count());
-    }
   }
-  qir_repair_queue_delay_ns_total_.fetch_add(queue_delay_ns, std::memory_order_relaxed);
   grouped.reserve(item_count);
   for (const PeerReverseUpdateTask& task : tasks) {
     for (const auto& op : task.ops) {
       const RemotePtr target{op.target_raw};
+      const RemotePtr candidate{op.candidate_raw};
       lib_assert(local_shard(target.memory_node()), "reverse-update target routed to wrong shard");
-      grouped[target.raw_address].push_back(op);
+      grouped[target.raw_address].push_back(candidate);
     }
   }
 
@@ -253,96 +246,6 @@ void MemoryNode::send_peer_reverse_update_response(const PeerReverseUpdateRespon
   }
 }
 
-bool MemoryNode::qir_repair_backlog_over_threshold(const Configuration& config) {
-  if (!qir_enabled(config)) {
-    return false;
-  }
-  if (config.qir_backlog_sync_threshold <= 0.0) {
-    return true;
-  }
-  const auto over = [](size_t size, size_t limit, double threshold) {
-    return limit > 0 &&
-           static_cast<double>(size) >= static_cast<double>(limit) * threshold;
-  };
-  {
-    std::lock_guard<std::mutex> lock(peer_reverse_tasks_mutex_);
-    if (over(peer_reverse_tasks_.size(), peer_reverse_task_queue_limit_,
-             config.qir_backlog_sync_threshold)) {
-      return true;
-    }
-  }
-  {
-    std::lock_guard<std::mutex> lock(peer_reverse_outgoing_mutex_);
-    if (over(peer_reverse_outgoing_.size(), peer_reverse_outgoing_queue_limit_,
-             config.qir_backlog_sync_threshold)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool MemoryNode::enqueue_local_reverse_update_batch(
-    const vec<service::storage_owner::ReverseUpdateOp>& ops,
-    const Configuration& config) {
-  if (ops.empty()) {
-    return true;
-  }
-  if (!qir_enabled(config) ||
-      config.storage_owner_reverse_mode != "async" ||
-      peer_reverse_worker_states_.empty()) {
-    return false;
-  }
-  service::storage_owner::PeerRpcHeader header{};
-  header.magic = service::storage_owner::kPeerRpcMagic;
-  header.type = static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_request);
-  header.source_shard = storage_id_;
-  header.item_count = static_cast<u32>(ops.size());
-  header.request_id = next_peer_request_id_.fetch_add(1, std::memory_order_relaxed);
-  header.reserved |= kPeerRpcFlagNoResponse;
-  PeerReverseUpdateTask task;
-  task.source_shard = storage_id_;
-  task.header = header;
-  task.ops = ops;
-  task.received_at = std::chrono::steady_clock::now();
-  const bool priority = std::any_of(task.ops.begin(), task.ops.end(), [](const auto& op) {
-    return (op.reserved & service::storage_owner::kReverseUpdatePriority) != 0;
-  });
-  {
-    std::lock_guard<std::mutex> lock(peer_reverse_tasks_mutex_);
-    const size_t threshold = std::max<size_t>(
-      1, static_cast<size_t>(static_cast<double>(peer_reverse_task_queue_limit_) *
-                             config.qir_backlog_sync_threshold));
-    if (peer_reverse_shutdown_.load(std::memory_order_acquire) ||
-        peer_reverse_tasks_.size() >= threshold ||
-        peer_reverse_tasks_.size() >= peer_reverse_task_queue_limit_) {
-      return false;
-    }
-    if (priority) {
-      peer_reverse_tasks_.push_front(std::move(task));
-    } else {
-      peer_reverse_tasks_.push_back(std::move(task));
-    }
-  }
-  peer_reverse_tasks_cv_.notify_one();
-  return true;
-}
-
-bool MemoryNode::enqueue_qir_audit(QirAuditTask&& task) {
-  if (peer_reverse_worker_states_.empty()) {
-    return false;
-  }
-  {
-    std::lock_guard<std::mutex> lock(peer_reverse_tasks_mutex_);
-    if (peer_reverse_shutdown_.load(std::memory_order_acquire) ||
-        qir_audit_tasks_.size() >= qir_audit_queue_limit_) {
-      return false;
-    }
-    qir_audit_tasks_.push_back(std::move(task));
-  }
-  peer_reverse_tasks_cv_.notify_one();
-  return true;
-}
-
 bool MemoryNode::handle_peer_reverse_update_request(u32 source_shard,
                                         const service::storage_owner::PeerRpcHeader& header,
                                         const service::storage_owner::ReverseUpdateOp* ops,
@@ -386,26 +289,15 @@ bool MemoryNode::handle_peer_rpc_request(const PeerRpcMessage& message, const Co
 }
 
 bool MemoryNode::enqueue_peer_reverse_update_task(PeerReverseUpdateTask&& task) {
-  const bool priority = std::any_of(task.ops.begin(), task.ops.end(), [](const auto& op) {
-    return (op.reserved & service::storage_owner::kReverseUpdatePriority) != 0;
-  });
   std::unique_lock<std::mutex> lock(peer_reverse_tasks_mutex_);
-  const bool expects_response = (task.header.reserved & kPeerRpcFlagNoResponse) == 0;
-  if (!expects_response) {
-    peer_reverse_tasks_cv_.wait(lock, [&]() {
-      return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
-             peer_reverse_tasks_.size() < peer_reverse_task_queue_limit_;
-    });
-  }
-  if (peer_reverse_shutdown_.load(std::memory_order_acquire) ||
-      (expects_response && peer_reverse_tasks_.size() >= peer_reverse_task_queue_limit_)) {
+  peer_reverse_tasks_cv_.wait(lock, [&]() {
+    return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
+           peer_reverse_tasks_.size() < peer_reverse_task_queue_limit_;
+  });
+  if (peer_reverse_shutdown_.load(std::memory_order_acquire)) {
     return false;
   }
-  if (priority) {
-    peer_reverse_tasks_.push_front(std::move(task));
-  } else {
-    peer_reverse_tasks_.push_back(std::move(task));
-  }
+  peer_reverse_tasks_.push_back(std::move(task));
   lock.unlock();
   peer_reverse_tasks_cv_.notify_one();
   return true;
@@ -432,7 +324,9 @@ void MemoryNode::peer_rpc_progress_loop() {
     const i32 num_received =
       peer_context_->poll_recv_cq(recv_wcs.data(), static_cast<i32>(recv_wcs.size()));
     if (num_received <= 0) {
-      if (peer_rpc_producers_done_.load(std::memory_order_acquire)) {
+      if (peer_reverse_workers_done_.load(std::memory_order_acquire) &&
+          peer_reverse_responses_.empty() &&
+          peer_reverse_outgoing_.empty()) {
         return;
       }
       std::this_thread::yield();
@@ -467,10 +361,7 @@ void MemoryNode::peer_rpc_progress_loop() {
           task.header = *header;
           task.received_at = std::chrono::steady_clock::now();
           task.ops.assign(ops, ops + header->item_count);
-          if (!enqueue_peer_reverse_update_task(std::move(task)) &&
-              (header->reserved & kPeerRpcFlagNoResponse) == 0) {
-            enqueue_peer_reverse_update_response(peer_id, *header, false);
-          }
+          enqueue_peer_reverse_update_task(std::move(task));
         }
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response)) {
         {
@@ -488,82 +379,42 @@ void MemoryNode::peer_rpc_progress_loop() {
 void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
   current_storage_owner_thread_ = peer_reverse_worker_states_[worker_id].get();
   const Configuration& config = *storage_worker_config_;
-  u32 repair_batches_since_audit = 0;
   for (;;) {
     vec<PeerReverseUpdateTask> tasks;
     tasks.reserve(8);
-    QirAuditTask audit;
-    bool run_audit = false;
     {
       std::unique_lock<std::mutex> lock(peer_reverse_tasks_mutex_);
       peer_reverse_tasks_cv_.wait(lock, [&]() {
-        return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
-               !peer_reverse_tasks_.empty() || !qir_audit_tasks_.empty();
+        return peer_reverse_shutdown_.load(std::memory_order_acquire) || !peer_reverse_tasks_.empty();
       });
-      if (peer_reverse_shutdown_.load(std::memory_order_acquire) &&
-          peer_reverse_tasks_.empty() && qir_audit_tasks_.empty()) {
+      if (peer_reverse_shutdown_.load(std::memory_order_acquire) && peer_reverse_tasks_.empty()) {
         current_storage_owner_thread_ = nullptr;
         return;
       }
-      const bool audit_due = !qir_audit_tasks_.empty() &&
-                             (peer_reverse_tasks_.empty() || repair_batches_since_audit >= 16);
-      if (audit_due) {
-        audit = std::move(qir_audit_tasks_.front());
-        qir_audit_tasks_.pop_front();
-        run_audit = true;
-        repair_batches_since_audit = 0;
-      } else {
+      tasks.push_back(std::move(peer_reverse_tasks_.front()));
+      peer_reverse_tasks_.pop_front();
+      size_t coalesced_ops = tasks.back().ops.size();
+      if (config.storage_owner_reverse_flush_us > 0 && peer_reverse_tasks_.empty() &&
+          !peer_reverse_shutdown_.load(std::memory_order_acquire)) {
+        peer_reverse_tasks_cv_.wait_for(lock,
+                                        std::chrono::microseconds(config.storage_owner_reverse_flush_us),
+                                        [&]() {
+                                          return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
+                                                 !peer_reverse_tasks_.empty();
+                                        });
+      }
+      while (!peer_reverse_tasks_.empty() &&
+             coalesced_ops < config.storage_owner_reverse_coalesce_max) {
+        const size_t next_ops = peer_reverse_tasks_.front().ops.size();
+        if (!tasks.empty() && coalesced_ops + next_ops > config.storage_owner_reverse_coalesce_max) {
+          break;
+        }
         tasks.push_back(std::move(peer_reverse_tasks_.front()));
         peer_reverse_tasks_.pop_front();
-        ++repair_batches_since_audit;
-      }
-      if (run_audit) {
-        lock.unlock();
-      } else {
-        size_t coalesced_ops = tasks.back().ops.size();
-        if (config.storage_owner_reverse_flush_us > 0 && peer_reverse_tasks_.empty() &&
-            !peer_reverse_shutdown_.load(std::memory_order_acquire)) {
-          peer_reverse_tasks_cv_.wait_for(lock,
-                                          std::chrono::microseconds(config.storage_owner_reverse_flush_us),
-                                          [&]() {
-                                            return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
-                                                   !peer_reverse_tasks_.empty();
-                                          });
-        }
-        while (!peer_reverse_tasks_.empty() &&
-               coalesced_ops < config.storage_owner_reverse_coalesce_max) {
-          const size_t next_ops = peer_reverse_tasks_.front().ops.size();
-          if (!tasks.empty() && coalesced_ops + next_ops > config.storage_owner_reverse_coalesce_max) {
-            break;
-          }
-          tasks.push_back(std::move(peer_reverse_tasks_.front()));
-          peer_reverse_tasks_.pop_front();
-          coalesced_ops += next_ops;
-        }
+        coalesced_ops += next_ops;
       }
     }
     peer_reverse_tasks_cv_.notify_one();
-
-    if (run_audit) {
-      const auto source = span<const element_t>{audit.source.data(), audit.source.size()};
-      const vec<RemotePtr> exact_candidates =
-        beam_search_candidates(source, audit.medoid, config, nullptr);
-      hashset_t<RemotePtr> empty_skip;
-      InsertBreakdownCounters counters{};
-      const bool disagreement = maybe_audit_qir_prune(
-        reinterpret_cast<const byte_t*>(audit.source.data()),
-        VectorDType::float32,
-        exact_candidates,
-        empty_skip,
-        audit.selected,
-        config,
-        counters);
-      qir_audit_samples_total_.fetch_add(1, std::memory_order_relaxed);
-      if (disagreement) {
-        qir_audit_disagreements_total_.fetch_add(1, std::memory_order_relaxed);
-      }
-      continue;
-    }
 
     const bool success = apply_peer_reverse_update_tasks(tasks, config);
     for (const PeerReverseUpdateTask& task : tasks) {
@@ -641,13 +492,7 @@ void MemoryNode::peer_reverse_outgoing_loop() {
     peer_reverse_outgoing_cv_.notify_one();
 
     const auto send_started = std::chrono::steady_clock::now();
-    bool success = false;
-    const u32 max_attempts = qir_enabled(config) ? 3u : 1u;
-    const bool wait_for_response = qir_enabled(config);
-    for (u32 attempt = 0; attempt < max_attempts && !success; ++attempt) {
-      success = send_reverse_update_batch_direct(
-        task.target_shard, task.ops, wait_for_response, config);
-    }
+    const bool success = send_reverse_update_batch_direct(task.target_shard, task.ops, false, config);
     const u64 send_ns = elapsed_ns_since(send_started);
     if (!success || send_ns > 1000ull * 1000ull * 1000ull) {
       static std::atomic<u32> slow_outbox_logs{0};
@@ -777,7 +622,7 @@ bool MemoryNode::wait_for_peer_reverse_update_response(u64 request_id,
 
 bool MemoryNode::enqueue_reverse_update_batch(u32 target_shard,
                                   const vec<service::storage_owner::ReverseUpdateOp>& ops,
-                                  const Configuration& config) {
+                                  const Configuration&) {
   if (ops.empty()) {
     return true;
   }
@@ -786,29 +631,8 @@ bool MemoryNode::enqueue_reverse_update_batch(u32 target_shard,
   task.target_shard = target_shard;
   task.ops = ops;
   task.queued_at = std::chrono::steady_clock::now();
-  const bool priority = std::any_of(task.ops.begin(), task.ops.end(), [](const auto& op) {
-    return (op.reserved & service::storage_owner::kReverseUpdatePriority) != 0;
-  });
   {
     std::unique_lock<std::mutex> lock(peer_reverse_outgoing_mutex_);
-    if (qir_enabled(config)) {
-      const size_t threshold = std::max<size_t>(
-        1, static_cast<size_t>(static_cast<double>(peer_reverse_outgoing_queue_limit_) *
-                               config.qir_backlog_sync_threshold));
-      if (peer_reverse_shutdown_.load(std::memory_order_acquire) ||
-          peer_reverse_outgoing_.size() >= threshold ||
-          peer_reverse_outgoing_.size() >= peer_reverse_outgoing_queue_limit_) {
-        return false;
-      }
-      if (priority) {
-        peer_reverse_outgoing_.push_front(std::move(task));
-      } else {
-        peer_reverse_outgoing_.push_back(std::move(task));
-      }
-      lock.unlock();
-      peer_reverse_outgoing_cv_.notify_one();
-      return true;
-    }
     peer_reverse_outgoing_cv_.wait(lock, [&]() {
       return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
              peer_reverse_outgoing_.size() < peer_reverse_outgoing_queue_limit_;
@@ -875,22 +699,9 @@ bool MemoryNode::send_reverse_update_batch_direct(u32 target_shard,
 
 bool MemoryNode::send_reverse_update_batch(u32 target_shard,
                                const vec<service::storage_owner::ReverseUpdateOp>& ops,
-                               const Configuration& config,
-                               bool* sync_fallback) {
-  if (sync_fallback != nullptr) {
-    *sync_fallback = false;
-  }
+                               const Configuration& config) {
   if (config.storage_owner_reverse_mode == "async") {
-    if (enqueue_reverse_update_batch(target_shard, ops, config)) {
-      return true;
-    }
-    if (qir_enabled(config)) {
-      if (sync_fallback != nullptr) {
-        *sync_fallback = true;
-      }
-      return send_reverse_update_batch_direct(target_shard, ops, true, config);
-    }
-    return false;
+    return enqueue_reverse_update_batch(target_shard, ops, config);
   }
   return send_reverse_update_batch_direct(target_shard, ops, true, config);
 }

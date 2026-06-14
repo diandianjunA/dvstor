@@ -60,8 +60,7 @@ inline void add_storage_owner_breakdown(
   sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_medoid,
                           per_item_ns(counters.storage_owner_medoid_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_search,
-                          per_item_ns(saturating_sub(counters.storage_owner_search_ns,
-                                                     explained_search_ns),
+                          per_item_ns(saturating_sub(counters.storage_owner_search_ns, explained_search_ns),
                                       item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_prune,
                           per_item_ns(saturating_sub(counters.storage_owner_prune_ns, explained_prune_ns),
@@ -100,27 +99,10 @@ inline void add_storage_owner_breakdown(
 
 inline void add_storage_owner_counters(
     const std::shared_ptr<service::breakdown::Sample>& sample,
-    const service::storage_owner::InsertBreakdownCounters& counters) {
+    const service::storage_owner::InsertBreakdownCounters&) {
   if (!sample) {
     return;
   }
-  service::breakdown::ThreadCounterDelta delta{};
-  delta.qir_qcode_rdma_ops = counters.qir_qcode_rdma_ops;
-  delta.qir_qcode_rdma_bytes = counters.qir_qcode_rdma_bytes;
-  delta.qir_qcode_cache_hits = counters.qir_qcode_cache_hits;
-  delta.qir_qcode_cache_misses = counters.qir_qcode_cache_misses;
-  delta.qir_exact_reads = counters.qir_exact_reads;
-  delta.qir_exact_reads_avoided = counters.qir_exact_reads_avoided;
-  delta.qir_uncertain_candidates = counters.qir_uncertain_candidates;
-  delta.qir_prune_fallbacks = counters.qir_prune_fallbacks;
-  delta.qir_repair_intents = counters.qir_repair_intents;
-  delta.qir_repair_queue_delay_ns = counters.qir_repair_queue_delay_ns;
-  delta.qir_repair_applied_edges = counters.qir_repair_applied_edges;
-  delta.qir_repair_stale_skips = counters.qir_repair_stale_skips;
-  delta.qir_sync_repair_fallbacks = counters.qir_sync_repair_fallbacks;
-  delta.qir_audit_samples = counters.qir_audit_samples;
-  delta.qir_audit_disagreements = counters.qir_audit_disagreements;
-  sample->add_counters(delta);
 }
 
 inline void add_storage_owner_sender_breakdown(

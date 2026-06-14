@@ -709,9 +709,6 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
           slot.item_count);
         if (breakdown) {
           add_storage_owner_breakdown(slot.samples[i], *breakdown, slot.item_count);
-          if (i == 0) {
-            add_storage_owner_counters(slot.samples[i], *breakdown);
-          }
         }
         slot.samples[i]->mark_finished(finished_at, statistics::ThreadStatistics{});
       }

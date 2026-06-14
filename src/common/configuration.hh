@@ -80,13 +80,6 @@ public:
   u32 storage_owner_reverse_queue_depth{65536};
   u32 storage_owner_reverse_flush_us{200};
   u32 storage_owner_reverse_coalesce_max{256};
-  str storage_owner_search_mode{"exact_rdma"};
-  u32 qir_exact_budget{16};
-  u32 qir_audit_rate{64};
-  u32 qir_cache_mb{512};
-  bool qir_enable_prune{true};
-  f64 qir_backlog_sync_threshold{0.75};
-  f64 qir_uncertain_ratio_threshold{0.35};
 
   // Legacy aliases for compatibility
   u32& ef_search = beam_width;
@@ -113,7 +106,6 @@ public:
     process_program_options(argc, argv);
     insert_execution = normalize_mode(insert_execution);
     storage_owner_reverse_mode = normalize_mode(storage_owner_reverse_mode);
-    storage_owner_search_mode = normalize_mode(storage_owner_search_mode);
 
     if (!is_server) {
       validate_compute_node_options(argv);
@@ -211,27 +203,6 @@ private:
       "storage-owner-reverse-coalesce-max",
       po::value<u32>(&storage_owner_reverse_coalesce_max)->default_value(storage_owner_reverse_coalesce_max),
       "Maximum reverse-update operations coalesced by one peer worker batch.")(
-      "storage-owner-search-mode",
-      po::value<str>(&storage_owner_search_mode)->default_value(storage_owner_search_mode),
-      "Storage-owner insert search mode: exact_rdma or qir.")(
-      "qir-exact-budget",
-      po::value<u32>(&qir_exact_budget)->default_value(qir_exact_budget),
-      "Maximum QIR foreground exact vector reads for uncertain prune candidates.")(
-      "qir-audit-rate",
-      po::value<u32>(&qir_audit_rate)->default_value(qir_audit_rate),
-      "Run one QIR exact shadow audit every N inserts. 0 disables audit.")(
-      "qir-cache-mb",
-      po::value<u32>(&qir_cache_mb)->default_value(qir_cache_mb),
-      "Bounded storage-owner QIR qcode read-through cache size in MiB.")(
-      "qir-enable-prune",
-      po::value<bool>(&qir_enable_prune)->default_value(qir_enable_prune),
-      "Use quantized interval RobustPrune in QIR. False keeps QIR search with exact prune.")(
-      "qir-backlog-sync-threshold",
-      po::value<f64>(&qir_backlog_sync_threshold)->default_value(qir_backlog_sync_threshold),
-      "Repair queue occupancy ratio that forces foreground synchronous repair in QIR.")(
-      "qir-uncertain-ratio-threshold",
-      po::value<f64>(&qir_uncertain_ratio_threshold)->default_value(qir_uncertain_ratio_threshold),
-      "Uncertain prune candidate ratio that falls back to exact RobustPrune in QIR.")(
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
@@ -401,23 +372,6 @@ private:
         std::cerr << "[ERROR]: --storage-owner-reverse-coalesce-max must be > 0" << std::endl;
         exit_with_help_message(argv);
       }
-      if (storage_owner_search_mode != "exact_rdma" && storage_owner_search_mode != "qir") {
-        std::cerr << "[ERROR]: --storage-owner-search-mode must be exact_rdma or qir" << std::endl;
-        exit_with_help_message(argv);
-      }
-      if (storage_owner_search_mode == "qir" && ip_distance) {
-        std::cerr << "[ERROR]: --storage-owner-search-mode=qir currently supports L2 distance only" << std::endl;
-        exit_with_help_message(argv);
-      }
-      if (storage_owner_search_mode == "qir" && qir_exact_budget == 0) {
-        std::cerr << "[ERROR]: --qir-exact-budget must be > 0" << std::endl;
-        exit_with_help_message(argv);
-      }
-      if (qir_backlog_sync_threshold < 0.0 || qir_backlog_sync_threshold > 1.0 ||
-          qir_uncertain_ratio_threshold < 0.0 || qir_uncertain_ratio_threshold > 1.0) {
-        std::cerr << "[ERROR]: QIR ratio thresholds must be in [0, 1]" << std::endl;
-        exit_with_help_message(argv);
-      }
       if (storage_peers.size() != num_server_nodes()) {
         std::cerr << "[ERROR]: --storage-peers must list exactly one endpoint per storage node when "
                      "--insert-execution=storage_owner"
@@ -449,10 +403,6 @@ public:
   }
 
   bool use_storage_owner_insert() const { return insert_execution == "storage_owner"; }
-  bool use_storage_owner_qir_search() const { return storage_owner_search_mode == "qir"; }
-  bool use_storage_owner_qir_prune() const {
-    return use_storage_owner_qir_search() && qir_enable_prune;
-  }
 
   friend std::ostream& operator<<(std::ostream& os, const IndexConfiguration& config) {
     os << static_cast<const Configuration&>(config);
@@ -503,16 +453,6 @@ public:
            << config.storage_owner_reverse_flush_us << std::endl;
         os << std::setw(width) << "storage reverse coalesce max: "
            << config.storage_owner_reverse_coalesce_max << std::endl;
-        os << std::setw(width) << "storage search mode: " << config.storage_owner_search_mode << std::endl;
-        os << std::setw(width) << "QIR exact budget: " << config.qir_exact_budget << std::endl;
-        os << std::setw(width) << "QIR audit rate: " << config.qir_audit_rate << std::endl;
-        os << std::setw(width) << "QIR cache MB: " << config.qir_cache_mb << std::endl;
-        os << std::setw(width) << "QIR quantized prune: "
-           << config.qir_enable_prune << std::endl;
-        os << std::setw(width) << "QIR backlog sync: "
-           << config.qir_backlog_sync_threshold << std::endl;
-        os << std::setw(width) << "QIR uncertain ratio: "
-           << config.qir_uncertain_ratio_threshold << std::endl;
         os << std::setw(width) << "storage peers: " << "[";
         for (const str& node : config.storage_peers) {
           os << node << ", ";

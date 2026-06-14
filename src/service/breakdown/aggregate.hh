@@ -103,21 +103,6 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.rabitq_prefetch_misses += delta.rabitq_prefetch_misses;
   aggregate.counters.rabitq_prefetch_disabled_queries +=
     delta.rabitq_prefetch_disabled_queries;
-  aggregate.counters.qir_qcode_rdma_ops += delta.qir_qcode_rdma_ops;
-  aggregate.counters.qir_qcode_rdma_bytes += delta.qir_qcode_rdma_bytes;
-  aggregate.counters.qir_qcode_cache_hits += delta.qir_qcode_cache_hits;
-  aggregate.counters.qir_qcode_cache_misses += delta.qir_qcode_cache_misses;
-  aggregate.counters.qir_exact_reads += delta.qir_exact_reads;
-  aggregate.counters.qir_exact_reads_avoided += delta.qir_exact_reads_avoided;
-  aggregate.counters.qir_uncertain_candidates += delta.qir_uncertain_candidates;
-  aggregate.counters.qir_prune_fallbacks += delta.qir_prune_fallbacks;
-  aggregate.counters.qir_repair_intents += delta.qir_repair_intents;
-  aggregate.counters.qir_repair_queue_delay_ns += delta.qir_repair_queue_delay_ns;
-  aggregate.counters.qir_repair_applied_edges += delta.qir_repair_applied_edges;
-  aggregate.counters.qir_repair_stale_skips += delta.qir_repair_stale_skips;
-  aggregate.counters.qir_sync_repair_fallbacks += delta.qir_sync_repair_fallbacks;
-  aggregate.counters.qir_audit_samples += delta.qir_audit_samples;
-  aggregate.counters.qir_audit_disagreements += delta.qir_audit_disagreements;
   aggregate.counters.visited_nodes += delta.visited_nodes;
   aggregate.counters.visited_neighborlists += delta.visited_neighborlists;
   aggregate.counters.remote_allocations += delta.remote_allocations;

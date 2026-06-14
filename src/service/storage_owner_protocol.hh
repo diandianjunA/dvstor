@@ -8,8 +8,6 @@ namespace service::storage_owner {
 constexpr u32 kInsertMagic = 0x53494e54;  // "SINT"
 constexpr u32 kMutationMagic = 0x4d555444;  // D T U M / "DUTM"
 constexpr u32 kPeerRpcMagic = 0x53505250;  // "SPRP"
-constexpr u32 kReverseUpdatePriority = 1u;
-constexpr u32 kReverseUpdateReachability = 1u << 1;
 
 enum class InsertStatus : u32 {
   ok = 0,
@@ -97,22 +95,6 @@ struct InsertBreakdownCounters {
   u64 storage_owner_prune_sort_ns{};
   u64 storage_owner_prune_pair_distance_ns{};
 
-  u64 qir_qcode_rdma_ops{};
-  u64 qir_qcode_rdma_bytes{};
-  u64 qir_qcode_cache_hits{};
-  u64 qir_qcode_cache_misses{};
-  u64 qir_exact_reads{};
-  u64 qir_exact_reads_avoided{};
-  u64 qir_uncertain_candidates{};
-  u64 qir_prune_fallbacks{};
-  u64 qir_repair_intents{};
-  u64 qir_repair_queue_delay_ns{};
-  u64 qir_repair_applied_edges{};
-  u64 qir_repair_stale_skips{};
-  u64 qir_sync_repair_fallbacks{};
-  u64 qir_audit_samples{};
-  u64 qir_audit_disagreements{};
-
   u64 total() const {
     return storage_owner_queue_wait_ns +
            storage_owner_medoid_ns +
@@ -139,9 +121,6 @@ struct PeerRpcHeader {
 struct ReverseUpdateOp {
   u64 target_raw{};
   u64 candidate_raw{};
-  u32 candidate_generation{};
-  u32 reserved{};  // kReverseUpdatePriority for audit-prioritized repair.
-  u64 source_insert_id{};
 };
 
 inline size_t insert_batch_request_bytes(u32 item_count, u32 dim) {
@@ -163,7 +142,9 @@ inline size_t insert_batch_response_bytes(u32 item_count) {
   return sizeof(InsertBatchResponseHeader) +
          static_cast<size_t>(item_count) * sizeof(u32) +
          static_cast<size_t>(item_count) * sizeof(MutationResult) +
-         sizeof(InsertBreakdownCounters);
+         sizeof(InsertBreakdownCounters) +
+         sizeof(u32) +
+         static_cast<size_t>(item_count) * VamanaNode::R * sizeof(u64);
 }
 
 inline node_t* request_ids(void* payload) {
@@ -240,6 +221,26 @@ inline InsertBreakdownCounters* response_breakdown(void* payload, u32 item_count
 inline const InsertBreakdownCounters* response_breakdown(const void* payload, u32 item_count) {
   return reinterpret_cast<const InsertBreakdownCounters*>(
     reinterpret_cast<const byte_t*>(response_mutation_results(payload, item_count) + item_count));
+}
+
+inline u32* response_invalidation_count(void* payload, u32 item_count) {
+  return reinterpret_cast<u32*>(reinterpret_cast<byte_t*>(response_breakdown(payload, item_count) + 1));
+}
+
+inline const u32* response_invalidation_count(const void* payload, u32 item_count) {
+  return reinterpret_cast<const u32*>(reinterpret_cast<const byte_t*>(response_breakdown(payload, item_count) + 1));
+}
+
+inline u64* response_invalidated_raws(void* payload, u32 item_count) {
+  return reinterpret_cast<u64*>(response_invalidation_count(payload, item_count) + 1);
+}
+
+inline const u64* response_invalidated_raws(const void* payload, u32 item_count) {
+  return reinterpret_cast<const u64*>(response_invalidation_count(payload, item_count) + 1);
+}
+
+inline u32 response_invalidation_capacity(u32 item_count) {
+  return item_count * VamanaNode::R;
 }
 
 inline size_t reverse_update_request_bytes(u32 item_count) {

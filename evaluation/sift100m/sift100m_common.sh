@@ -15,8 +15,8 @@ PID_DIR="${PID_DIR:-$SCRIPT_DIR/pids}"
 
 SHARDS="${SHARDS:-5}"
 # PARTITION_STRATEGY="${PARTITION_STRATEGY:-bfs}"
-# PARTITION_STRATEGY="${PARTITION_STRATEGY:-metis}"
-PARTITION_STRATEGY="${PARTITION_STRATEGY:-balanced}"
+PARTITION_STRATEGY="${PARTITION_STRATEGY:-metis}"
+# PARTITION_STRATEGY="${PARTITION_STRATEGY:-balanced}"
 R="${R:-48}"
 BUILD_BEAM="${BUILD_BEAM:-200}"
 SEARCH_BEAM="${SEARCH_BEAM:-128}"
@@ -294,27 +294,6 @@ write_service_config() {
       echo "storage-owner-reverse-queue-depth = ${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
       echo "storage-owner-reverse-flush-us = ${STORAGE_OWNER_REVERSE_FLUSH_US:-200}"
       echo "storage-owner-reverse-coalesce-max = ${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}"
-      if [[ -n "${STORAGE_OWNER_SEARCH_MODE:-}" ]]; then
-        echo "storage-owner-search-mode = ${STORAGE_OWNER_SEARCH_MODE}"
-      fi
-      if [[ -n "${QIR_EXACT_BUDGET:-}" ]]; then
-        echo "qir-exact-budget = ${QIR_EXACT_BUDGET}"
-      fi
-      if [[ -n "${QIR_AUDIT_RATE:-}" ]]; then
-        echo "qir-audit-rate = ${QIR_AUDIT_RATE}"
-      fi
-      if [[ -n "${QIR_CACHE_MB:-}" ]]; then
-        echo "qir-cache-mb = ${QIR_CACHE_MB}"
-      fi
-      if [[ -n "${QIR_ENABLE_PRUNE:-}" ]]; then
-        echo "qir-enable-prune = ${QIR_ENABLE_PRUNE}"
-      fi
-      if [[ -n "${QIR_BACKLOG_SYNC_THRESHOLD:-}" ]]; then
-        echo "qir-backlog-sync-threshold = ${QIR_BACKLOG_SYNC_THRESHOLD}"
-      fi
-      if [[ -n "${QIR_UNCERTAIN_RATIO_THRESHOLD:-}" ]]; then
-        echo "qir-uncertain-ratio-threshold = ${QIR_UNCERTAIN_RATIO_THRESHOLD}"
-      fi
     fi
   } > "$output"
 }

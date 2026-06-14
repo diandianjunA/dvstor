@@ -14,7 +14,6 @@
 #include "common/types.hh"
 #include "coroutine.hh"
 #include "remote_pointer.hh"
-#include "service/storage_owner_protocol.hh"
 #include "vamana/vamana_node.hh"
 
 namespace memory_node_detail {
@@ -53,60 +52,6 @@ struct NodeSnapshot {
   vec<byte_t> vector_data;
 };
 
-struct QirCodeEntry {
-  QirCodeEntry() = default;
-  QirCodeEntry(const vec<byte_t>& value) : bytes(std::make_shared<vec<byte_t>>(value)) {}
-  QirCodeEntry(vec<byte_t>&& value) : bytes(std::make_shared<vec<byte_t>>(std::move(value))) {}
-
-  QirCodeEntry& operator=(const vec<byte_t>& value) {
-    bytes = std::make_shared<vec<byte_t>>(value);
-    return *this;
-  }
-
-  QirCodeEntry& operator=(vec<byte_t>&& value) {
-    bytes = std::make_shared<vec<byte_t>>(std::move(value));
-    return *this;
-  }
-
-  void resize(size_t size) {
-    ensure_unique();
-    bytes->resize(size);
-  }
-
-  byte_t* data() {
-    return bytes == nullptr ? nullptr : bytes->data();
-  }
-
-  const byte_t* data() const { return bytes == nullptr ? nullptr : bytes->data(); }
-  size_t size() const { return bytes == nullptr ? 0 : bytes->size(); }
-  bool empty() const { return size() == 0; }
-
- private:
-  void ensure_unique() {
-    if (bytes == nullptr) {
-      bytes = std::make_shared<vec<byte_t>>();
-    } else if (!bytes.unique()) {
-      bytes = std::make_shared<vec<byte_t>>(*bytes);
-    }
-  }
-
-  std::shared_ptr<vec<byte_t>> bytes;
-};
-
-struct QirCodeSnapshot {
-  RemotePtr rptr;
-  u32 generation{};
-  bool deleted{};
-  bool prefix_validated{};
-  QirCodeEntry entry;
-};
-
-struct QirDistanceInterval {
-  distance_t estimate{};
-  distance_t lower{};
-  distance_t upper{};
-};
-
 struct InsertRuntimeState {
   HugePage<byte_t> buffer;
   std::unique_ptr<LocalMemoryRegion> region;
@@ -121,7 +66,9 @@ struct PeerRpcRuntimeState {
   size_t message_bytes{};
   size_t recv_region_bytes{};
   size_t sync_send_offset{};
+  size_t async_send_offset{};
   u32 recv_slots_per_peer{1};
+  u32 send_slots_per_peer{1};
 };
 
 struct StorageOwnerThread;
@@ -207,12 +154,6 @@ struct FreshnessEntry {
   RemotePtr current;
   u32 generation{};
   bool deleted{};
-};
-
-struct QirAuditTask {
-  vec<element_t> source;
-  RemotePtr medoid;
-  vec<RemotePtr> selected;
 };
 
 }  // namespace memory_node_detail

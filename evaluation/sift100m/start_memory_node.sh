@@ -72,27 +72,6 @@ if [[ "$INSERT_EXECUTION" == "storage_owner" ]]; then
   cmd+=(--storage-owner-reverse-queue-depth "${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}")
   cmd+=(--storage-owner-reverse-flush-us "${STORAGE_OWNER_REVERSE_FLUSH_US:-200}")
   cmd+=(--storage-owner-reverse-coalesce-max "${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}")
-  if [[ -n "${STORAGE_OWNER_SEARCH_MODE:-}" ]]; then
-    cmd+=(--storage-owner-search-mode "$STORAGE_OWNER_SEARCH_MODE")
-  fi
-  if [[ -n "${QIR_EXACT_BUDGET:-}" ]]; then
-    cmd+=(--qir-exact-budget "$QIR_EXACT_BUDGET")
-  fi
-  if [[ -n "${QIR_AUDIT_RATE:-}" ]]; then
-    cmd+=(--qir-audit-rate "$QIR_AUDIT_RATE")
-  fi
-  if [[ -n "${QIR_CACHE_MB:-}" ]]; then
-    cmd+=(--qir-cache-mb "$QIR_CACHE_MB")
-  fi
-  if [[ -n "${QIR_ENABLE_PRUNE:-}" ]]; then
-    cmd+=(--qir-enable-prune "$QIR_ENABLE_PRUNE")
-  fi
-  if [[ -n "${QIR_BACKLOG_SYNC_THRESHOLD:-}" ]]; then
-    cmd+=(--qir-backlog-sync-threshold "$QIR_BACKLOG_SYNC_THRESHOLD")
-  fi
-  if [[ -n "${QIR_UNCERTAIN_RATIO_THRESHOLD:-}" ]]; then
-    cmd+=(--qir-uncertain-ratio-threshold "$QIR_UNCERTAIN_RATIO_THRESHOLD")
-  fi
 fi
 
 printf '[memory-node-%s] command:' "$NODE_ID"; printf ' %q' "${cmd[@]}"; echo

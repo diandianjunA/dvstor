@@ -34,28 +34,6 @@ Optimization profiles:
 ./evaluation/sift100m/run_breakdown.sh gpudirect_rdma_storage_owner
 ```
 
-QIR Direct Insert profiles:
-
-```bash
-# Exact storage-owner insert baseline; RaBitQ remains enabled only for queries.
-./evaluation/sift100m/run_breakdown.sh gpudirect_rdma_storage_owner_rabitq
-
-# Quantized search, exact prune, synchronous reverse edges.
-./evaluation/sift100m/run_breakdown.sh gpudirect_rdma_storage_owner_rabitq_qir_search_only
-
-# Quantized search and prune, synchronous reverse edges.
-./evaluation/sift100m/run_breakdown.sh gpudirect_rdma_storage_owner_rabitq_qir_prune
-
-# Full QIR with bounded asynchronous repair and background exact shadow audits.
-./evaluation/sift100m/run_breakdown.sh gpudirect_rdma_storage_owner_rabitq_qir
-```
-
-The full profile defaults to an exact-read budget of 16, one audit per 64 inserts,
-a 512 MiB qcode cache, a 0.75 repair backlog fallback threshold, and a 0.35
-uncertain-candidate fallback threshold. Breakdown JSON includes qcode RDMA/cache
-counters, exact reads avoided, uncertain candidates, repair delay/applied edges,
-sync fallbacks, and audit disagreement.
-
 ## Common Overrides
 
 ```bash

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <algorithm>
 #include <chrono>
 
 #include "common/statistics.hh"
@@ -37,21 +36,6 @@ struct ThreadCounterDelta {
   u64 rabitq_prefetch_hits{};
   u64 rabitq_prefetch_misses{};
   u64 rabitq_prefetch_disabled_queries{};
-  u64 qir_qcode_rdma_ops{};
-  u64 qir_qcode_rdma_bytes{};
-  u64 qir_qcode_cache_hits{};
-  u64 qir_qcode_cache_misses{};
-  u64 qir_exact_reads{};
-  u64 qir_exact_reads_avoided{};
-  u64 qir_uncertain_candidates{};
-  u64 qir_prune_fallbacks{};
-  u64 qir_repair_intents{};
-  u64 qir_repair_queue_delay_ns{};
-  u64 qir_repair_applied_edges{};
-  u64 qir_repair_stale_skips{};
-  u64 qir_sync_repair_fallbacks{};
-  u64 qir_audit_samples{};
-  u64 qir_audit_disagreements{};
   u64 visited_nodes{};
   u64 visited_neighborlists{};
   u64 remote_allocations{};
@@ -66,67 +50,6 @@ struct ThreadCounterDelta {
   u64 query_rdma_to_staging_bytes{};
   u64 query_host_staging_fallback_bytes{};
 };
-
-inline void add_counter_delta(ThreadCounterDelta& lhs, const ThreadCounterDelta& rhs) {
-  lhs.rdma_read_bytes += rhs.rdma_read_bytes;
-  lhs.rdma_write_bytes += rhs.rdma_write_bytes;
-  lhs.rdma_read_ops += rhs.rdma_read_ops;
-  lhs.rdma_write_ops += rhs.rdma_write_ops;
-  lhs.neighbor_rdma_bytes += rhs.neighbor_rdma_bytes;
-  lhs.vector_rdma_bytes += rhs.vector_rdma_bytes;
-  lhs.neighbor_rdma_read_ops += rhs.neighbor_rdma_read_ops;
-  lhs.vector_rdma_read_ops += rhs.vector_rdma_read_ops;
-  lhs.vector_rdma_batch_calls += rhs.vector_rdma_batch_calls;
-  lhs.vector_rdma_cqes += rhs.vector_rdma_cqes;
-  lhs.h2d_bytes += rhs.h2d_bytes;
-  lhs.d2h_bytes += rhs.d2h_bytes;
-  lhs.l2_kernels += rhs.l2_kernels;
-  lhs.prune_kernels += rhs.prune_kernels;
-  lhs.exact_reranks += rhs.exact_reranks;
-  lhs.rabitq_l0_candidates += rhs.rabitq_l0_candidates;
-  lhs.rabitq_cache_misses += rhs.rabitq_cache_misses;
-  lhs.rabitq_l1_candidates += rhs.rabitq_l1_candidates;
-  lhs.rabitq_l2_candidates += rhs.rabitq_l2_candidates;
-  lhs.rabitq_forced_widen += rhs.rabitq_forced_widen;
-  lhs.rabitq_audit_expansions += rhs.rabitq_audit_expansions;
-  lhs.rabitq_audit_candidates += rhs.rabitq_audit_candidates;
-  lhs.rabitq_safe_skips += rhs.rabitq_safe_skips;
-  lhs.rabitq_exact_fallbacks += rhs.rabitq_exact_fallbacks;
-  lhs.rabitq_prefetch_issued += rhs.rabitq_prefetch_issued;
-  lhs.rabitq_prefetch_hits += rhs.rabitq_prefetch_hits;
-  lhs.rabitq_prefetch_misses += rhs.rabitq_prefetch_misses;
-  lhs.rabitq_prefetch_disabled_queries += rhs.rabitq_prefetch_disabled_queries;
-  lhs.qir_qcode_rdma_ops += rhs.qir_qcode_rdma_ops;
-  lhs.qir_qcode_rdma_bytes += rhs.qir_qcode_rdma_bytes;
-  lhs.qir_qcode_cache_hits += rhs.qir_qcode_cache_hits;
-  lhs.qir_qcode_cache_misses += rhs.qir_qcode_cache_misses;
-  lhs.qir_exact_reads += rhs.qir_exact_reads;
-  lhs.qir_exact_reads_avoided += rhs.qir_exact_reads_avoided;
-  lhs.qir_uncertain_candidates += rhs.qir_uncertain_candidates;
-  lhs.qir_prune_fallbacks += rhs.qir_prune_fallbacks;
-  lhs.qir_repair_intents += rhs.qir_repair_intents;
-  lhs.qir_repair_queue_delay_ns += rhs.qir_repair_queue_delay_ns;
-  lhs.qir_repair_applied_edges += rhs.qir_repair_applied_edges;
-  lhs.qir_repair_stale_skips += rhs.qir_repair_stale_skips;
-  lhs.qir_sync_repair_fallbacks += rhs.qir_sync_repair_fallbacks;
-  lhs.qir_audit_samples += rhs.qir_audit_samples;
-  lhs.qir_audit_disagreements += rhs.qir_audit_disagreements;
-  lhs.visited_nodes += rhs.visited_nodes;
-  lhs.visited_neighborlists += rhs.visited_neighborlists;
-  lhs.remote_allocations += rhs.remote_allocations;
-  lhs.overflow_prunes += rhs.overflow_prunes;
-  lhs.overflow_prune_candidates += rhs.overflow_prune_candidates;
-  lhs.overflow_prune_max_candidates =
-    std::max(lhs.overflow_prune_max_candidates, rhs.overflow_prune_max_candidates);
-  lhs.overflow_prune_pair_checks_upper_bound += rhs.overflow_prune_pair_checks_upper_bound;
-  lhs.overflow_prune_global_load_bytes_upper_bound += rhs.overflow_prune_global_load_bytes_upper_bound;
-  lhs.overflow_prune_kernel_blocks += rhs.overflow_prune_kernel_blocks;
-  lhs.overflow_prune_kernel_threads += rhs.overflow_prune_kernel_threads;
-  lhs.overflow_prune_max_kernel_threads =
-    std::max(lhs.overflow_prune_max_kernel_threads, rhs.overflow_prune_max_kernel_threads);
-  lhs.query_rdma_to_staging_bytes += rhs.query_rdma_to_staging_bytes;
-  lhs.query_host_staging_fallback_bytes += rhs.query_host_staging_fallback_bytes;
-}
 
 
 inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistics& end,
@@ -233,7 +156,6 @@ struct Sample {
   u64 cas_failures{};
   u64 overflow_prune_max_candidates{};
   u64 overflow_prune_max_kernel_threads{};
-  ThreadCounterDelta extra_counters{};
   bool started_flag{};
   bool finished_flag{};
 
@@ -261,15 +183,7 @@ struct Sample {
     category_ns[static_cast<size_t>(parent_category(subcategory))] += ns;
   }
 
-  void add_counters(const ThreadCounterDelta& delta) {
-    add_counter_delta(extra_counters, delta);
-  }
-
-  ThreadCounterDelta counters() const {
-    ThreadCounterDelta out = diff_thread_counters(end_counters, start_counters, operation);
-    add_counter_delta(out, extra_counters);
-    return out;
-  }
+  ThreadCounterDelta counters() const { return diff_thread_counters(end_counters, start_counters, operation); }
 };
 
 }  // namespace service::breakdown

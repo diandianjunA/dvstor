@@ -126,37 +126,6 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
        ? 0.0
        : static_cast<double>(aggregate.counters.rabitq_prefetch_hits) /
            static_cast<double>(aggregate.counters.rabitq_prefetch_issued)},
-    {"qir_qcode_rdma_ops", aggregate.counters.qir_qcode_rdma_ops},
-    {"qir_qcode_rdma_bytes", aggregate.counters.qir_qcode_rdma_bytes},
-    {"qir_qcode_rdma_avg_bytes",
-     aggregate.counters.qir_qcode_rdma_ops == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.qir_qcode_rdma_bytes) /
-           static_cast<double>(aggregate.counters.qir_qcode_rdma_ops)},
-    {"qir_qcode_cache_hits", aggregate.counters.qir_qcode_cache_hits},
-    {"qir_qcode_cache_misses", aggregate.counters.qir_qcode_cache_misses},
-    {"qir_qcode_cache_hit_rate",
-     aggregate.counters.qir_qcode_cache_hits + aggregate.counters.qir_qcode_cache_misses == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.qir_qcode_cache_hits) /
-           static_cast<double>(aggregate.counters.qir_qcode_cache_hits +
-                               aggregate.counters.qir_qcode_cache_misses)},
-    {"qir_exact_reads", aggregate.counters.qir_exact_reads},
-    {"qir_exact_reads_avoided", aggregate.counters.qir_exact_reads_avoided},
-    {"qir_uncertain_candidates", aggregate.counters.qir_uncertain_candidates},
-    {"qir_prune_fallbacks", aggregate.counters.qir_prune_fallbacks},
-    {"qir_repair_intents", aggregate.counters.qir_repair_intents},
-    {"qir_repair_queue_delay_ns", aggregate.counters.qir_repair_queue_delay_ns},
-    {"qir_repair_applied_edges", aggregate.counters.qir_repair_applied_edges},
-    {"qir_repair_stale_skips", aggregate.counters.qir_repair_stale_skips},
-    {"qir_sync_repair_fallbacks", aggregate.counters.qir_sync_repair_fallbacks},
-    {"qir_audit_samples", aggregate.counters.qir_audit_samples},
-    {"qir_audit_disagreements", aggregate.counters.qir_audit_disagreements},
-    {"qir_audit_disagreement_rate",
-     aggregate.counters.qir_audit_samples == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.qir_audit_disagreements) /
-           static_cast<double>(aggregate.counters.qir_audit_samples)},
     {"rabitq_local_scores", aggregate.counters.rabitq_l0_candidates},
     {"rabitq_gate_passes", aggregate.counters.rabitq_l1_candidates},
     {"rabitq_exact_vector_reads", aggregate.counters.rabitq_l2_candidates},

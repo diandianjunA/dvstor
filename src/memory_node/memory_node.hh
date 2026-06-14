@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <atomic>
 #include <cfloat>
 #include <chrono>
@@ -8,7 +7,6 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
-#include <list>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -88,9 +86,6 @@ private:
   using InsertBreakdownCounters = service::storage_owner::InsertBreakdownCounters;
   using BeamEntry = memory_node_detail::BeamEntry;
   using NodeSnapshot = memory_node_detail::NodeSnapshot;
-  using QirCodeSnapshot = memory_node_detail::QirCodeSnapshot;
-  using QirAuditTask = memory_node_detail::QirAuditTask;
-  using QirDistanceInterval = memory_node_detail::QirDistanceInterval;
   using InsertRuntimeState = memory_node_detail::InsertRuntimeState;
   using PeerRpcRuntimeState = memory_node_detail::PeerRpcRuntimeState;
   using PeerPendingSend = memory_node_detail::PeerPendingSend;
@@ -107,8 +102,8 @@ private:
 
   // Lifecycle and commands
   static u64 elapsed_ns_since(const std::chrono::steady_clock::time_point start);
+  static u64 scale_ns(const u64 value, const u32 part, const u32 total);
   static InsertBreakdownCounters scale_breakdown(const InsertBreakdownCounters& counters,
-                                                 const u32 offset,
                                                  const u32 part,
                                                  const u32 total);
   void allocate_memory();
@@ -148,9 +143,10 @@ private:
 
   // Peer reverse-update RPC
   void setup_peer_rpc_runtime(const Configuration& config);
-  size_t peer_rpc_sync_send_offset(u32 peer_id) const;
   void start_peer_reverse_update_runtime(const Configuration& config);
   void stop_peer_reverse_update_runtime();
+  size_t peer_rpc_sync_send_offset(u32 peer_id) const;
+  size_t peer_rpc_async_send_offset(u32 peer_id, u32 slot_id) const;
   size_t peer_rpc_receive_offset(u32 peer_id, u32 slot_id) const;
   void repost_peer_rpc_receive(u32 peer_id, u32 slot_id);
   void send_peer_rpc_message(u32 peer_id, const void* payload, size_t bytes);
@@ -160,10 +156,6 @@ private:
   bool apply_peer_reverse_update_task(const PeerReverseUpdateTask& task, const Configuration& config);
   bool apply_peer_reverse_update_tasks(const vec<PeerReverseUpdateTask>& tasks, const Configuration& config);
   void send_peer_reverse_update_response(const PeerReverseUpdateResponse& response);
-  bool qir_repair_backlog_over_threshold(const Configuration& config);
-  bool enqueue_local_reverse_update_batch(const vec<service::storage_owner::ReverseUpdateOp>& ops,
-                                          const Configuration& config);
-  bool enqueue_qir_audit(QirAuditTask&& task);
   bool handle_peer_reverse_update_request(u32 source_shard,
                                           const service::storage_owner::PeerRpcHeader& header,
                                           const service::storage_owner::ReverseUpdateOp* ops,
@@ -195,8 +187,7 @@ private:
                                         const Configuration& config);
   bool send_reverse_update_batch(u32 target_shard,
                                  const vec<service::storage_owner::ReverseUpdateOp>& ops,
-                                 const Configuration& config,
-                                 bool* sync_fallback = nullptr);
+                                 const Configuration& config);
   void log_slow_peer_reverse_update_response(std::chrono::steady_clock::time_point wait_started,
                                              u64 request_id,
                                              u32 target_shard,
@@ -215,6 +206,7 @@ private:
                                                StorageOwnerThread& thread,
                                                InsertBreakdownCounters& breakdown,
                                                const Configuration& config,
+                                               vec<u64>* invalidated_neighbors = nullptr,
                                                vec<u32>* statuses = nullptr,
                                                vec<service::storage_owner::MutationResult>* results = nullptr);
   static StorageOwnerInsertCoroutine dummy_storage_owner_insert_coroutine();
@@ -229,6 +221,7 @@ private:
                                          size_t item_count,
                                          InsertBreakdownCounters& breakdown,
                                          const Configuration& config,
+                                         vec<u64>* invalidated_neighbors = nullptr,
                                          vec<u32>* statuses = nullptr,
                                          vec<service::storage_owner::MutationResult>* results = nullptr);
 
@@ -254,26 +247,6 @@ private:
                                  StorageOwnerThread& thread);
   vec<NodeSnapshot> read_node_snapshots_batched(const vec<RemotePtr>& rptrs, const Configuration& config);
   auto async_read_neighbor_list(RemotePtr rptr, StorageOwnerThread& thread);
-  void init_qir_runtime(const Configuration& config);
-  bool qir_enabled(const Configuration& config) const;
-  bool qir_cache_lookup(RemotePtr rptr, QirCodeSnapshot& snapshot, InsertBreakdownCounters* breakdown);
-  void qir_cache_store(const QirCodeSnapshot& snapshot);
-  void qir_cache_erase(RemotePtr rptr);
-  bool read_qir_code_snapshot(RemotePtr rptr,
-                              QirCodeSnapshot& snapshot,
-                              const Configuration& config,
-                              InsertBreakdownCounters* breakdown = nullptr,
-                              bool search_phase = false);
-  vec<QirCodeSnapshot> read_qir_code_snapshots_batched(const vec<RemotePtr>& rptrs,
-                                                       const Configuration& config,
-                                                       InsertBreakdownCounters* breakdown = nullptr,
-                                                       bool search_phase = false);
-  QirDistanceInterval qir_estimate_source_interval(const byte_t* source,
-                                                   VectorDType source_dtype,
-                                                   const QirCodeSnapshot& candidate,
-                                                   const Configuration& config) const;
-  QirDistanceInterval qir_estimate_pair_interval(const QirCodeSnapshot& lhs,
-                                                 const QirCodeSnapshot& rhs) const;
   void write_hot_graph_entry(RemotePtr rptr, u32 id, const vec<RemotePtr>& neighbors);
   void write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neighbors);
   void write_new_node(RemotePtr rptr,
@@ -287,55 +260,27 @@ private:
                                         RemotePtr medoid,
                                         const Configuration& config,
                                         InsertBreakdownCounters* breakdown = nullptr);
-  vec<RemotePtr> beam_search_candidates_qir(const span<const element_t> query,
-                                            RemotePtr medoid,
-                                            const Configuration& config,
-                                            InsertBreakdownCounters* breakdown = nullptr);
 
-  // Original storage-owner beam search and QIR search.
   auto beam_search_candidates_async(const span<const element_t> query,
                                     RemotePtr medoid,
                                     const Configuration& config,
                                     StorageOwnerThread& thread,
                                     InsertBreakdownCounters* breakdown = nullptr) -> StorageOwnerInsertCoroutine;
-  auto beam_search_candidates_qir_async(const span<const element_t> query,
-                                        RemotePtr medoid,
-                                        const Configuration& config,
-                                        StorageOwnerThread& thread,
-                                        InsertBreakdownCounters* breakdown = nullptr) -> StorageOwnerInsertCoroutine;
   vec<RemotePtr> robust_prune_cpu(const byte_t* source,
                                   VectorDType source_dtype,
                                   const vec<RemotePtr>& candidates,
                                   const hashset_t<RemotePtr>& skip,
                                   const Configuration& config,
                                   InsertBreakdownCounters* breakdown = nullptr);
-  vec<RemotePtr> robust_prune_qir_cpu(const byte_t* source,
-                                      VectorDType source_dtype,
-                                      const vec<RemotePtr>& candidates,
-                                      const hashset_t<RemotePtr>& skip,
-                                      const Configuration& config,
-                                      InsertBreakdownCounters* breakdown = nullptr);
-  bool maybe_audit_qir_prune(const byte_t* source,
-                             VectorDType source_dtype,
-                             const vec<RemotePtr>& candidates,
-                             const hashset_t<RemotePtr>& skip,
-                             const vec<RemotePtr>& selected,
-                             const Configuration& config,
-                             InsertBreakdownCounters& breakdown);
   auto execute_storage_owner_insert_job_async(StorageOwnerThread& thread,
                                               StorageOwnerInsertJob& job,
-                                              std::unordered_map<u64, vec<service::storage_owner::ReverseUpdateOp>>& local_updates,
+                                              std::unordered_map<u64, vec<RemotePtr>>& local_updates,
                                               std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>>& remote_updates,
                                               InsertBreakdownCounters& breakdown,
                                               const Configuration& config) -> StorageOwnerInsertCoroutine;
   bool apply_local_reverse_update(RemotePtr target_ptr,
-                                  const vec<service::storage_owner::ReverseUpdateOp>& ops,
+                                  const vec<RemotePtr>& candidate_ptrs,
                                   const Configuration& config);
-  bool install_qir_reachability_anchor(RemotePtr new_ptr,
-                                       u32 generation,
-                                       const vec<RemotePtr>& selected_neighbors,
-                                       const Configuration& config,
-                                       RemotePtr* anchor_target);
 
   // Misc helpers
   static size_t align_up(size_t value, size_t alignment = CACHELINE_SIZE);
@@ -385,12 +330,12 @@ private:
   std::mutex peer_rpc_send_mutex_;
   std::mutex peer_send_cq_mutex_;
   std::mutex peer_completion_mutex_;
-  vec<vec<std::unique_ptr<std::mutex>>> peer_qp_send_mutexes_;
   vec<ibv_wc> peer_send_wcs_;
   std::unordered_set<u64> peer_sync_completions_;
   std::unordered_map<u64, PeerPendingSend> peer_pending_sends_;
   vec<std::atomic<u32>> peer_rdma_read_outstanding_;
   vec<vec<std::atomic<u32>>> peer_rdma_read_qp_outstanding_;
+  vec<vec<std::unique_ptr<std::mutex>>> peer_qp_send_mutexes_;
   std::atomic<u32> peer_sync_wr_id_counter_{1};
   std::atomic<u32> peer_async_wr_id_counter_{1};
   std::atomic<u32> peer_async_rdma_outstanding_{0};
@@ -411,7 +356,6 @@ private:
   std::deque<PeerReverseOutgoingTask> peer_reverse_outgoing_;
   std::atomic<bool> peer_reverse_shutdown_{false};
   std::atomic<bool> peer_reverse_workers_done_{false};
-  std::atomic<bool> peer_rpc_producers_done_{false};
   size_t peer_reverse_task_queue_limit_{1024};
   size_t peer_reverse_outgoing_queue_limit_{1024};
   InsertRuntimeState insert_runtime_;
@@ -431,33 +375,6 @@ private:
   std::mutex idmap_mutex_;
   std::unordered_map<node_t, FreshnessEntry> idmap_;
   std::unordered_set<node_t> mutations_inflight_;
-  struct QirCacheEntry {
-    u32 generation{};
-    memory_node_detail::QirCodeEntry entry;
-    std::chrono::steady_clock::time_point expires_at{};
-    std::chrono::steady_clock::time_point prefix_valid_until{};
-    std::list<u64>::iterator lru_it;
-  };
-  struct QirCacheShard {
-    std::mutex mutex;
-    std::unordered_map<u64, QirCacheEntry> entries;
-    std::list<u64> lru;
-    size_t bytes{};
-    size_t capacity{};
-  };
-  static constexpr size_t kQirCacheShards = 64;
-  std::array<QirCacheShard, kQirCacheShards> qir_qcode_cache_;
-  size_t qir_qcode_cache_capacity_bytes_{};
-  std::atomic<u32> qir_effective_exact_budget_{16};
-  std::atomic<u64> qir_insert_sequence_{0};
-  std::atomic<u64> qir_next_insert_id_{1};
-  std::atomic<u64> qir_repair_queue_delay_ns_total_{0};
-  std::atomic<u64> qir_repair_applied_edges_total_{0};
-  std::atomic<u64> qir_repair_stale_skips_total_{0};
-  std::atomic<u64> qir_audit_samples_total_{0};
-  std::atomic<u64> qir_audit_disagreements_total_{0};
-  std::deque<QirAuditTask> qir_audit_tasks_;
-  size_t qir_audit_queue_limit_{1024};
 
   inline static thread_local StorageOwnerThread* current_storage_owner_thread_{nullptr};
 };

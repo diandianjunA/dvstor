@@ -36,14 +36,7 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
                                 : std::min(config.beam_width_construction,
                                            config.storage_owner_construction_beam_width)) +
                " snapshot_batch=" + std::to_string(config.storage_owner_search_snapshot_batch) +
-               " prune_max_candidates=" + std::to_string(config.storage_owner_prune_max_candidates) +
-               " search_mode=" + config.storage_owner_search_mode +
-               " qir_exact_budget=" + std::to_string(config.qir_exact_budget) +
-               " qir_audit_rate=" + std::to_string(config.qir_audit_rate) +
-               " qir_cache_mb=" + std::to_string(config.qir_cache_mb) +
-               " qir_backlog_sync_threshold=" + std::to_string(config.qir_backlog_sync_threshold) +
-               " qir_uncertain_ratio_threshold=" + std::to_string(config.qir_uncertain_ratio_threshold));
-  init_qir_runtime(config);
+               " prune_max_candidates=" + std::to_string(config.storage_owner_prune_max_candidates));
   const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
   const u32 coroutines_per_worker = std::max<u32>(1, config.insert_coroutines == 0 ? config.num_coroutines
                                                                                     : config.insert_coroutines);
@@ -167,6 +160,7 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
       std::chrono::duration_cast<std::chrono::nanoseconds>(process_started - task.received_at).count());
   }
 
+  vec<u64> invalidated_neighbors;
   vec<u32> statuses(batch_ids.size(), static_cast<u32>(service::storage_owner::MutationStatus::failed));
   vec<service::storage_owner::MutationResult> mutation_results(batch_ids.size());
   const bool ok = current_storage_owner_thread_ != nullptr
@@ -177,6 +171,7 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
                                                                *current_storage_owner_thread_,
                                                                breakdown,
                                                                config,
+                                                               &invalidated_neighbors,
                                                                &statuses,
                                                                &mutation_results)
                     : execute_storage_owner_batch_items(batch_ids.data(),
@@ -185,6 +180,7 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
                                                         batch_ids.size(),
                                                         breakdown,
                                                         config,
+                                                        &invalidated_neighbors,
                                                         &statuses,
                                                         &mutation_results);
   size_t status_base = 0;
@@ -212,10 +208,15 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
     }
     status_base += item_count;
     *service::storage_owner::response_breakdown(response_buffer.data(), item_count) =
-      scale_breakdown(breakdown,
-                      static_cast<u32>(status_base - item_count),
-                      item_count,
-                      static_cast<u32>(std::max<size_t>(1, batch_ids.size())));
+      scale_breakdown(breakdown, item_count, static_cast<u32>(std::max<size_t>(1, batch_ids.size())));
+    const u32 invalidation_capacity = service::storage_owner::response_invalidation_capacity(item_count);
+    const u32 invalidation_count = static_cast<u32>(std::min<size_t>(invalidated_neighbors.size(), invalidation_capacity));
+    *service::storage_owner::response_invalidation_count(response_buffer.data(), item_count) = invalidation_count;
+    u64* invalidated = service::storage_owner::response_invalidated_raws(response_buffer.data(), item_count);
+    for (u32 i = 0; i < invalidation_count; ++i) {
+      invalidated[i] = invalidated_neighbors[i];
+    }
+
     LocalMemoryRegion response_region{context_, response_buffer.data(), response_buffer.size()};
     {
       std::lock_guard<std::mutex> lock(storage_send_mutex_);
@@ -233,20 +234,12 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
                                              StorageOwnerThread& thread,
                                              InsertBreakdownCounters& breakdown,
                                              const Configuration& config,
+                                             vec<u64>* invalidated_neighbors,
                                              vec<u32>* statuses,
                                              vec<service::storage_owner::MutationResult>* results) {
   if (item_count == 0) {
     return true;
   }
-  const u64 repair_queue_delay_start =
-    qir_repair_queue_delay_ns_total_.load(std::memory_order_acquire);
-  const u64 repair_applied_start =
-    qir_repair_applied_edges_total_.load(std::memory_order_acquire);
-  const u64 repair_stale_start =
-    qir_repair_stale_skips_total_.load(std::memory_order_acquire);
-  const u64 audit_samples_start = qir_audit_samples_total_.load(std::memory_order_acquire);
-  const u64 audit_disagreements_start =
-    qir_audit_disagreements_total_.load(std::memory_order_acquire);
 
   vec<StorageOwnerInsertJob> jobs;
   jobs.reserve(item_count);
@@ -261,7 +254,7 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
     jobs.push_back(std::move(job));
   }
 
-  std::unordered_map<u64, vec<service::storage_owner::ReverseUpdateOp>> local_updates;
+  std::unordered_map<u64, vec<RemotePtr>> local_updates;
   std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
 
   const u32 coroutine_count = static_cast<u32>(std::max<size_t>(1, thread.post_balances.size()));
@@ -333,41 +326,25 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
   }
   auto t_local_reverse = std::chrono::steady_clock::now();
   for (auto& [target_raw, candidates] : local_updates) {
-    if (qir_enabled(config) &&
-        !qir_repair_backlog_over_threshold(config) &&
-        enqueue_local_reverse_update_batch(candidates, config)) {
-      continue;
-    }
-    if (qir_enabled(config)) {
-      breakdown.qir_sync_repair_fallbacks += candidates.size();
-    }
     ok &= apply_local_reverse_update(RemotePtr{target_raw}, candidates, config);
   }
   breakdown.storage_owner_local_reverse_ns += elapsed_ns_since(t_local_reverse);
   auto t_remote_reverse = std::chrono::steady_clock::now();
   for (auto& [target_shard, ops] : remote_updates) {
-    if (qir_enabled(config) && qir_repair_backlog_over_threshold(config)) {
-      breakdown.qir_sync_repair_fallbacks += ops.size();
-      ok &= send_reverse_update_batch_direct(target_shard, ops, true, config);
-    } else {
-      bool sync_fallback = false;
-      ok &= send_reverse_update_batch(target_shard, ops, config, &sync_fallback);
-      if (sync_fallback) {
-        breakdown.qir_sync_repair_fallbacks += ops.size();
+    ok &= send_reverse_update_batch(target_shard, ops, config);
+  }
+  breakdown.storage_owner_remote_reverse_ns += elapsed_ns_since(t_remote_reverse);
+  if (invalidated_neighbors != nullptr) {
+    invalidated_neighbors->reserve(invalidated_neighbors->size() + local_updates.size());
+    for (const auto& [target_raw, _] : local_updates) {
+      invalidated_neighbors->push_back(target_raw);
+    }
+    for (const auto& [_, ops] : remote_updates) {
+      for (const auto& op : ops) {
+        invalidated_neighbors->push_back(op.target_raw);
       }
     }
   }
-  breakdown.storage_owner_remote_reverse_ns += elapsed_ns_since(t_remote_reverse);
-  breakdown.qir_repair_queue_delay_ns +=
-    qir_repair_queue_delay_ns_total_.load(std::memory_order_acquire) - repair_queue_delay_start;
-  breakdown.qir_repair_applied_edges +=
-    qir_repair_applied_edges_total_.load(std::memory_order_acquire) - repair_applied_start;
-  breakdown.qir_repair_stale_skips +=
-    qir_repair_stale_skips_total_.load(std::memory_order_acquire) - repair_stale_start;
-  breakdown.qir_audit_samples +=
-    qir_audit_samples_total_.load(std::memory_order_acquire) - audit_samples_start;
-  breakdown.qir_audit_disagreements +=
-    qir_audit_disagreements_total_.load(std::memory_order_acquire) - audit_disagreements_start;
   return ok;
 }
 
@@ -529,10 +506,11 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* pa
                                    decoded_vectors.data() + static_cast<size_t>(i) * config.dim);
   }
   InsertBreakdownCounters breakdown{};
+  vec<u64> invalidated_neighbors;
   vec<u32> item_statuses(request->item_count, static_cast<u32>(service::storage_owner::MutationStatus::failed));
   vec<service::storage_owner::MutationResult> mutation_results(request->item_count);
   const bool ok = execute_storage_owner_batch_items(ids, kinds.data(), decoded_vectors.data(), request->item_count,
-                                                    breakdown, config,
+                                                    breakdown, config, &invalidated_neighbors,
                                                     &item_statuses, &mutation_results);
   for (u32 i = 0; i < request->item_count; ++i) {
     statuses[i] = ok ? item_statuses[i]
@@ -543,6 +521,13 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* pa
     response_results[i] = ok ? mutation_results[i] : service::storage_owner::MutationResult{};
   }
   *service::storage_owner::response_breakdown(response_ptr, request->item_count) = breakdown;
+  const u32 invalidation_capacity = service::storage_owner::response_invalidation_capacity(request->item_count);
+  const u32 invalidation_count = static_cast<u32>(std::min<size_t>(invalidated_neighbors.size(), invalidation_capacity));
+  *service::storage_owner::response_invalidation_count(response_ptr, request->item_count) = invalidation_count;
+  u64* invalidated = service::storage_owner::response_invalidated_raws(response_ptr, request->item_count);
+  for (u32 i = 0; i < invalidation_count; ++i) {
+    invalidated[i] = invalidated_neighbors[i];
+  }
   return service::storage_owner::insert_batch_response_bytes(request->item_count);
 }
 
@@ -552,25 +537,17 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
                                        size_t item_count,
                                        InsertBreakdownCounters& breakdown,
                                        const Configuration& config,
+                                       vec<u64>* invalidated_neighbors,
                                        vec<u32>* statuses,
                                        vec<service::storage_owner::MutationResult>* results) {
   if (item_count == 0) {
     return true;
   }
-  const u64 repair_queue_delay_start =
-    qir_repair_queue_delay_ns_total_.load(std::memory_order_acquire);
-  const u64 repair_applied_start =
-    qir_repair_applied_edges_total_.load(std::memory_order_acquire);
-  const u64 repair_stale_start =
-    qir_repair_stale_skips_total_.load(std::memory_order_acquire);
-  const u64 audit_samples_start = qir_audit_samples_total_.load(std::memory_order_acquire);
-  const u64 audit_disagreements_start =
-    qir_audit_disagreements_total_.load(std::memory_order_acquire);
 
   auto t_medoid = std::chrono::steady_clock::now();
   RemotePtr medoid_ptr = read_global_medoid();
   breakdown.storage_owner_medoid_ns += elapsed_ns_since(t_medoid);
-  std::unordered_map<u64, vec<service::storage_owner::ReverseUpdateOp>> local_updates;
+  std::unordered_map<u64, vec<RemotePtr>> local_updates;
   std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
   if (statuses != nullptr) {
     statuses->assign(item_count, static_cast<u32>(service::storage_owner::MutationStatus::failed));
@@ -597,7 +574,6 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     if (kind == service::storage_owner::MutationKind::erase) {
       const bool deleted = mark_node_deleted(old_entry.current, old_entry.generation);
       if (deleted) {
-        qir_cache_erase(old_entry.current);
         publish_mutation(ids[idx], old_entry.current, old_entry.generation, true);
       }
       if (statuses != nullptr) {
@@ -618,7 +594,6 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
       if (kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
         mark_node_deleted(old_entry.current, old_entry.generation);
-        qir_cache_erase(old_entry.current);
       }
       publish_mutation(ids[idx], new_ptr, generation, false);
       RemotePtr observed;
@@ -632,27 +607,13 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       medoid_ptr = observed;
     }
 
-    bool audit_qir = false;
-    if (qir_enabled(config) && config.use_storage_owner_qir_prune()) {
-      const u64 sequence = qir_insert_sequence_.fetch_add(1, std::memory_order_acq_rel) + 1;
-      audit_qir = config.qir_audit_rate != 0 && sequence % config.qir_audit_rate == 0;
-    }
-
     auto t_search = std::chrono::steady_clock::now();
-    const vec<RemotePtr> candidates = config.use_storage_owner_qir_search()
-      ? beam_search_candidates_qir(components, medoid_ptr, config, &breakdown)
-      : beam_search_candidates(components, medoid_ptr, config, &breakdown);
+    const vec<RemotePtr> candidates = beam_search_candidates(components, medoid_ptr, config, &breakdown);
     breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
     hashset_t<RemotePtr> empty_skip;
     auto t_prune = std::chrono::steady_clock::now();
-    vec<RemotePtr> selected_neighbors = config.use_storage_owner_qir_prune()
-      ? robust_prune_qir_cpu(reinterpret_cast<const byte_t*>(components.data()),
-                             VectorDType::float32, candidates, empty_skip, config, &breakdown)
-      : robust_prune_cpu(reinterpret_cast<const byte_t*>(components.data()),
-                         VectorDType::float32, candidates, empty_skip, config, &breakdown);
-    if (selected_neighbors.empty() && !medoid_ptr.is_null()) {
-      selected_neighbors.push_back(medoid_ptr);
-    }
+    vec<RemotePtr> selected_neighbors = robust_prune_cpu(reinterpret_cast<const byte_t*>(components.data()),
+                                                         VectorDType::float32, candidates, empty_skip, config, &breakdown);
     breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
     const RemotePtr new_ptr = allocate_local_node();
     if (results != nullptr) {
@@ -661,66 +622,26 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     auto t_write = std::chrono::steady_clock::now();
     write_new_node(new_ptr, ids[idx], components, selected_neighbors, generation);
     breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
-    RemotePtr anchor_target;
-    if (qir_enabled(config) && config.storage_owner_reverse_mode == "async" &&
-        !install_qir_reachability_anchor(
-          new_ptr, generation, selected_neighbors, config, &anchor_target)) {
-      mark_node_deleted(new_ptr, generation);
-      if (statuses != nullptr) {
-        (*statuses)[idx] = static_cast<u32>(service::storage_owner::MutationStatus::failed);
-      }
-      continue;
-    }
     if (kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
       mark_node_deleted(old_entry.current, old_entry.generation);
-      qir_cache_erase(old_entry.current);
     }
     publish_mutation(ids[idx], new_ptr, generation, false);
-    if (audit_qir) {
-      QirAuditTask audit;
-      audit.source.assign(components.begin(), components.end());
-      audit.medoid = medoid_ptr;
-      audit.selected = selected_neighbors;
-      (void)enqueue_qir_audit(std::move(audit));
-    }
     if (statuses != nullptr) {
       (*statuses)[idx] = static_cast<u32>(service::storage_owner::MutationStatus::ok);
     }
 
-    const u64 source_insert_id = qir_enabled(config)
-      ? qir_next_insert_id_.fetch_add(1, std::memory_order_acq_rel)
-      : 0;
     for (const RemotePtr& neighbor_ptr : selected_neighbors) {
-      if (neighbor_ptr == anchor_target) {
-        continue;
-      }
-      service::storage_owner::ReverseUpdateOp op{
-        neighbor_ptr.raw_address,
-        new_ptr.raw_address,
-        generation,
-        0,
-        source_insert_id};
       if (local_shard(neighbor_ptr.memory_node())) {
-        local_updates[neighbor_ptr.raw_address].push_back(op);
+        local_updates[neighbor_ptr.raw_address].push_back(new_ptr);
       } else {
-        remote_updates[neighbor_ptr.memory_node()].push_back(op);
-      }
-      if (qir_enabled(config)) {
-        ++breakdown.qir_repair_intents;
+        remote_updates[neighbor_ptr.memory_node()].push_back(
+          service::storage_owner::ReverseUpdateOp{neighbor_ptr.raw_address, new_ptr.raw_address});
       }
     }
   }
 
   auto t_local_reverse = std::chrono::steady_clock::now();
   for (auto& [target_raw, candidates] : local_updates) {
-    if (qir_enabled(config) &&
-        !qir_repair_backlog_over_threshold(config) &&
-        enqueue_local_reverse_update_batch(candidates, config)) {
-      continue;
-    }
-    if (qir_enabled(config)) {
-      breakdown.qir_sync_repair_fallbacks += candidates.size();
-    }
     if (!apply_local_reverse_update(RemotePtr{target_raw}, candidates, config)) {
       return false;
     }
@@ -728,32 +649,21 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   breakdown.storage_owner_local_reverse_ns += elapsed_ns_since(t_local_reverse);
   auto t_remote_reverse = std::chrono::steady_clock::now();
   for (auto& [target_shard, ops] : remote_updates) {
-    const bool sync_repair = qir_enabled(config) &&
-                             qir_repair_backlog_over_threshold(config);
-    if (sync_repair) {
-      breakdown.qir_sync_repair_fallbacks += ops.size();
-    }
-    bool enqueue_fallback = false;
-    const bool success = sync_repair
-      ? send_reverse_update_batch_direct(target_shard, ops, true, config)
-      : send_reverse_update_batch(target_shard, ops, config, &enqueue_fallback);
-    if (enqueue_fallback) {
-      breakdown.qir_sync_repair_fallbacks += ops.size();
-    }
-    if (!success) {
+    if (!send_reverse_update_batch(target_shard, ops, config)) {
       return false;
     }
   }
   breakdown.storage_owner_remote_reverse_ns += elapsed_ns_since(t_remote_reverse);
-  breakdown.qir_repair_queue_delay_ns +=
-    qir_repair_queue_delay_ns_total_.load(std::memory_order_acquire) - repair_queue_delay_start;
-  breakdown.qir_repair_applied_edges +=
-    qir_repair_applied_edges_total_.load(std::memory_order_acquire) - repair_applied_start;
-  breakdown.qir_repair_stale_skips +=
-    qir_repair_stale_skips_total_.load(std::memory_order_acquire) - repair_stale_start;
-  breakdown.qir_audit_samples +=
-    qir_audit_samples_total_.load(std::memory_order_acquire) - audit_samples_start;
-  breakdown.qir_audit_disagreements +=
-    qir_audit_disagreements_total_.load(std::memory_order_acquire) - audit_disagreements_start;
+  if (invalidated_neighbors != nullptr) {
+    invalidated_neighbors->reserve(invalidated_neighbors->size() + local_updates.size());
+    for (const auto& [target_raw, _] : local_updates) {
+      invalidated_neighbors->push_back(target_raw);
+    }
+    for (const auto& [_, ops] : remote_updates) {
+      for (const auto& op : ops) {
+        invalidated_neighbors->push_back(op.target_raw);
+      }
+    }
+  }
   return true;
 }
