@@ -232,6 +232,12 @@ MemoryNode::InsertBreakdownCounters MemoryNode::scale_breakdown(const InsertBrea
     scale_ns(counters.storage_owner_search_beam_update_ns, part, total);
   out.storage_owner_search_result_sort_ns =
     scale_ns(counters.storage_owner_search_result_sort_ns, part, total);
+  out.storage_owner_handoff_queue_wait_ns =
+    scale_ns(counters.storage_owner_handoff_queue_wait_ns, part, total);
+  out.storage_owner_handoff_send_ns =
+    scale_ns(counters.storage_owner_handoff_send_ns, part, total);
+  out.storage_owner_handoff_response_wait_ns =
+    scale_ns(counters.storage_owner_handoff_response_wait_ns, part, total);
   out.storage_owner_prune_snapshot_read_ns =
     scale_ns(counters.storage_owner_prune_snapshot_read_ns, part, total);
   out.storage_owner_prune_distance_ns =
@@ -269,6 +275,34 @@ MemoryNode::InsertBreakdownCounters MemoryNode::scale_breakdown(const InsertBrea
     scale_ns(counters.storage_owner_handoff_response_visited_entries, part, total);
   out.storage_owner_handoff_response_visited_truncated =
     scale_ns(counters.storage_owner_handoff_response_visited_truncated, part, total);
+  out.storage_owner_qdi_requests =
+    scale_ns(counters.storage_owner_qdi_requests, part, total);
+  out.storage_owner_qdi_successes =
+    scale_ns(counters.storage_owner_qdi_successes, part, total);
+  out.storage_owner_qdi_queue_full =
+    scale_ns(counters.storage_owner_qdi_queue_full, part, total);
+  out.storage_owner_qdi_timeouts =
+    scale_ns(counters.storage_owner_qdi_timeouts, part, total);
+  out.storage_owner_qdi_overloaded =
+    scale_ns(counters.storage_owner_qdi_overloaded, part, total);
+  out.storage_owner_qdi_failed =
+    scale_ns(counters.storage_owner_qdi_failed, part, total);
+  out.storage_owner_qdi_request_bytes =
+    scale_ns(counters.storage_owner_qdi_request_bytes, part, total);
+  out.storage_owner_qdi_response_bytes =
+    scale_ns(counters.storage_owner_qdi_response_bytes, part, total);
+  out.storage_owner_qdi_remote_handler_ns =
+    scale_ns(counters.storage_owner_qdi_remote_handler_ns, part, total);
+  out.storage_owner_qdi_remote_expanded_nodes =
+    scale_ns(counters.storage_owner_qdi_remote_expanded_nodes, part, total);
+  out.storage_owner_qdi_remote_approx_scores =
+    scale_ns(counters.storage_owner_qdi_remote_approx_scores, part, total);
+  out.storage_owner_qdi_remote_exact_reads =
+    scale_ns(counters.storage_owner_qdi_remote_exact_reads, part, total);
+  out.storage_owner_qdi_remote_neighbor_reads =
+    scale_ns(counters.storage_owner_qdi_remote_neighbor_reads, part, total);
+  out.storage_owner_qdi_response_candidates =
+    scale_ns(counters.storage_owner_qdi_response_candidates, part, total);
   return out;
 }
 

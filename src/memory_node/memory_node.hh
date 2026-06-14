@@ -174,6 +174,9 @@ private:
   void handle_handoff_response(const service::storage_owner::SearchHandoffResponseHeader& response,
                                const byte_t* payload,
                                size_t bytes);
+  void handle_qdi_search_response(const service::storage_owner::QdiSearchResponseHeader& response,
+                                  const byte_t* payload,
+                                  size_t bytes);
   void handle_handoff_send_completion(u64 wr_id);
   bool enqueue_handoff_response(u32 target_shard, vec<byte_t>&& payload);
   void complete_handoff_locked(const std::shared_ptr<HandoffRequestState>& request,
@@ -323,12 +326,35 @@ private:
                                  const byte_t* payload,
                                  const Configuration& config);
 
+  struct QdiLocalStats {
+    u64 expanded_nodes{};
+    u64 approximate_scores{};
+    u64 exact_reads{};
+    u64 neighbor_reads{};
+  };
+
+  RemotePtr first_local_qdi_seed() const;
+  vec<BeamEntry> qdi_search_local(const span<const element_t> query,
+                                  RemotePtr medoid,
+                                  const Configuration& config,
+                                  QdiLocalStats* stats = nullptr,
+                                  InsertBreakdownCounters* breakdown = nullptr);
+  bool handle_qdi_search_rpc(u32 source_shard,
+                             const service::storage_owner::QdiSearchRequestHeader* req,
+                             const byte_t* payload,
+                             const Configuration& config);
+
   // Send a search handoff request to a peer and wait for the response.
   auto beam_search_candidates_async(const span<const element_t> query,
                                     RemotePtr medoid,
                                     const Configuration& config,
                                     StorageOwnerThread& thread,
                                     InsertBreakdownCounters* breakdown = nullptr) -> StorageOwnerInsertCoroutine;
+  auto beam_search_candidates_qdi_async(const span<const element_t> query,
+                                        RemotePtr medoid,
+                                        const Configuration& config,
+                                        StorageOwnerThread& thread,
+                                        InsertBreakdownCounters* breakdown = nullptr) -> StorageOwnerInsertCoroutine;
   vec<RemotePtr> robust_prune_cpu(const byte_t* source,
                                   VectorDType source_dtype,
                                   const vec<RemotePtr>& candidates,

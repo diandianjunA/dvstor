@@ -7,6 +7,7 @@
 
 #include "common/index_path.hh"
 #include "vamana/idmap.hh"
+#include "vamana/rabitq_cache.hh"
 #include "vamana/storage_layout_resolver.hh"
 
 namespace {
@@ -20,6 +21,8 @@ using StorageOwnerThread = memory_node_detail::StorageOwnerThread;
 using BeamEntrySerialized = service::storage_owner::BeamEntrySerialized;
 using SearchHandoffRequestHeader = service::storage_owner::SearchHandoffRequestHeader;
 using SearchHandoffResponseHeader = service::storage_owner::SearchHandoffResponseHeader;
+using QdiSearchRequestHeader = service::storage_owner::QdiSearchRequestHeader;
+using QdiSearchResponseHeader = service::storage_owner::QdiSearchResponseHeader;
 using PeerRpcType = service::storage_owner::PeerRpcType;
 using InsertStatus = service::storage_owner::InsertStatus;
 using InsertBreakdownCounters = service::storage_owner::InsertBreakdownCounters;
@@ -29,6 +32,8 @@ using service::storage_owner::handoff_request_beam;
 using service::storage_owner::handoff_request_visited;
 using service::storage_owner::handoff_response_beam;
 using service::storage_owner::handoff_response_visited;
+using service::storage_owner::qdi_query_vector;
+using service::storage_owner::qdi_response_candidates;
 
 constexpr size_t kSnapshotPrefixBytes =
   VamanaNode::HEADER_SIZE + VamanaNode::COMPACT_META_SIZE;
@@ -192,6 +197,32 @@ vec<byte_t> build_search_handoff_request(const span<const element_t> query,
   return msg_buffer;
 }
 
+vec<byte_t> build_qdi_search_request(const span<const element_t> query,
+                                     RemotePtr medoid,
+                                     u32 source_shard,
+                                     u64 request_id,
+                                     const Configuration& config) {
+  const u32 vector_bytes = static_cast<u32>(VamanaNode::DIM * sizeof(element_t));
+  vec<byte_t> msg_buffer(service::storage_owner::qdi_search_request_bytes(vector_bytes));
+  auto* req = reinterpret_cast<QdiSearchRequestHeader*>(msg_buffer.data());
+  req->rpc.magic = kPeerRpcMagic;
+  req->rpc.type = static_cast<u32>(PeerRpcType::qdi_search_request);
+  req->rpc.source_shard = source_shard;
+  req->rpc.item_count = 1;
+  req->rpc.request_id = request_id;
+  req->rpc.status = static_cast<u32>(InsertStatus::failed);
+  req->rpc.reserved = 0;
+  req->local_beam_width = config.storage_owner_qdi_local_beam;
+  req->result_count = config.storage_owner_qdi_return_candidates;
+  req->exact_count = config.storage_owner_qdi_exact_candidates;
+  req->entry_points = config.storage_owner_qdi_entry_points;
+  req->vector_bytes = vector_bytes;
+  req->reserved = 0;
+  req->medoid_raw = medoid.raw_address;
+  std::memcpy(qdi_query_vector(req), query.data(), vector_bytes);
+  return msg_buffer;
+}
+
 void merge_or_update_beam_entry(vec<BeamEntry>& beam, RemotePtr rptr, distance_t dist, u32 max_beam_width) {
   for (BeamEntry& entry : beam) {
     if (entry.rptr == rptr) {
@@ -208,6 +239,27 @@ void merge_or_update_beam_entry(vec<BeamEntry>& beam, RemotePtr rptr, distance_t
   if (beam.size() > max_beam_width) {
     beam.resize(max_beam_width);
   }
+}
+
+bool merge_qdi_search_response(vec<BeamEntry>& beam,
+                               const HandoffResult& result,
+                               u32 max_beam_width) {
+  if (!result.ok() || result.response.empty()) {
+    return false;
+  }
+  const auto* resp = reinterpret_cast<const QdiSearchResponseHeader*>(result.response.data());
+  if (resp->rpc.magic != kPeerRpcMagic ||
+      resp->rpc.type != static_cast<u32>(PeerRpcType::qdi_search_response) ||
+      resp->rpc.status != static_cast<u32>(InsertStatus::ok)) {
+    return false;
+  }
+
+  const auto* candidates = qdi_response_candidates(resp);
+  for (u32 i = 0; i < resp->candidate_count; ++i) {
+    merge_or_update_beam_entry(beam, RemotePtr{candidates[i].rptr_raw},
+                               candidates[i].distance, max_beam_width);
+  }
+  return true;
 }
 
 bool merge_search_handoff_response(vec<BeamEntry>& beam,
@@ -236,6 +288,53 @@ bool merge_search_handoff_response(vec<BeamEntry>& beam,
     visited.insert(RemotePtr{raw});
   }
   return true;
+}
+
+void record_qdi_search_stats(InsertBreakdownCounters* breakdown,
+                             const HandoffResult& result,
+                             size_t request_bytes) {
+  if (breakdown == nullptr) {
+    return;
+  }
+  ++breakdown->storage_owner_qdi_requests;
+  breakdown->storage_owner_qdi_request_bytes += request_bytes;
+  breakdown->storage_owner_qdi_response_bytes += result.response.size();
+
+  switch (result.status) {
+    case HandoffResultStatus::ok:
+      ++breakdown->storage_owner_qdi_successes;
+      break;
+    case HandoffResultStatus::queue_full:
+      ++breakdown->storage_owner_qdi_queue_full;
+      break;
+    case HandoffResultStatus::timeout:
+      ++breakdown->storage_owner_qdi_timeouts;
+      break;
+    case HandoffResultStatus::overloaded:
+      ++breakdown->storage_owner_qdi_overloaded;
+      break;
+    case HandoffResultStatus::pending:
+    case HandoffResultStatus::shutdown:
+    case HandoffResultStatus::failed:
+      ++breakdown->storage_owner_qdi_failed;
+      break;
+  }
+
+  if (!result.ok() || result.response.size() < sizeof(QdiSearchResponseHeader)) {
+    return;
+  }
+  const auto* resp = reinterpret_cast<const QdiSearchResponseHeader*>(result.response.data());
+  if (resp->rpc.magic != kPeerRpcMagic ||
+      resp->rpc.type != static_cast<u32>(PeerRpcType::qdi_search_response) ||
+      resp->rpc.status != static_cast<u32>(InsertStatus::ok)) {
+    return;
+  }
+  breakdown->storage_owner_qdi_remote_handler_ns += resp->handler_cpu_ns;
+  breakdown->storage_owner_qdi_remote_expanded_nodes += resp->expanded_count;
+  breakdown->storage_owner_qdi_remote_approx_scores += resp->approximate_score_count;
+  breakdown->storage_owner_qdi_remote_exact_reads += resp->exact_read_count;
+  breakdown->storage_owner_qdi_remote_neighbor_reads += resp->neighbor_read_count;
+  breakdown->storage_owner_qdi_response_candidates += resp->candidate_count;
 }
 
 void record_search_handoff_stats(InsertBreakdownCounters* breakdown,
@@ -1382,6 +1481,309 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
   return selected;
 }
 
+RemotePtr MemoryNode::first_local_qdi_seed() const {
+  const auto* base = index_buffer_.get_full_buffer();
+  const u64 free_ptr = *reinterpret_cast<const u64*>(base);
+  const u64 upper = std::min<u64>(free_ptr, mn_memory_bytes_);
+  if (upper < 16 + VamanaNode::total_size()) {
+    return RemotePtr{};
+  }
+
+  const size_t stride = VamanaNode::total_size();
+  for (u64 offset = 16; offset + VamanaNode::total_size() <= upper; offset += stride) {
+    const auto* ptr = base + offset;
+    const u64 header = *reinterpret_cast<const u64*>(ptr);
+    if ((header & VamanaNode::HEADER_DELETED) == 0) {
+      return RemotePtr{storage_id_, offset};
+    }
+  }
+  return RemotePtr{};
+}
+
+vec<MemoryNode::BeamEntry> MemoryNode::qdi_search_local(const span<const element_t> query,
+                                                        RemotePtr medoid,
+                                                        const Configuration& config,
+                                                        QdiLocalStats* stats,
+                                                        InsertBreakdownCounters* breakdown) {
+  vec<BeamEntry> beam;
+  if (!VamanaNode::HAS_RABITQ_CODE) {
+    return beam;
+  }
+
+  const auto* base = index_buffer_.get_full_buffer();
+  const u64 free_ptr = *reinterpret_cast<const u64*>(base);
+  const u64 upper = std::min<u64>(free_ptr, mn_memory_bytes_);
+  const size_t stride = VamanaNode::total_size();
+  if (stride == 0 || upper < 16 + VamanaNode::total_size()) {
+    return beam;
+  }
+
+  vec<float> rotated_query(VamanaNode::rabitq_code_bits(), 0.0f);
+  float query_norm2 = 0.0f;
+  VamanaNode::compute_rotated_query(reinterpret_cast<const byte_t*>(query.data()),
+                                    VectorDType::float32,
+                                    rotated_query.data(),
+                                    &query_norm2);
+
+  const auto live_local = [&](RemotePtr rptr) {
+    if (!local_shard(rptr.memory_node()) ||
+        !vamana::StorageLayoutResolver::ptr_in_bounds(rptr, mn_memory_bytes_)) {
+      return false;
+    }
+    const byte_t* ptr = local_node_ptr(rptr);
+    const u64 header = *reinterpret_cast<const u64*>(ptr);
+    return (header & VamanaNode::HEADER_DELETED) == 0;
+  };
+
+  const auto approximate_distance = [&](RemotePtr rptr) {
+    const byte_t* ptr = local_node_ptr(rptr);
+    const byte_t* entry = ptr + VamanaNode::offset_rabitq_code();
+    auto t_distance = std::chrono::steady_clock::now();
+    const distance_t dist = vamana::rabitq::estimate_full_entry(
+      rotated_query.data(), query_norm2, entry);
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_distance_ns += elapsed_ns_since(t_distance);
+    }
+    if (stats != nullptr) {
+      ++stats->approximate_scores;
+    }
+    return dist;
+  };
+
+  const u32 result_count = std::max<u32>(1, config.storage_owner_qdi_return_candidates);
+  const u32 local_beam_width = std::max<u32>(1, config.storage_owner_qdi_local_beam);
+  const u32 max_beam_width = std::max(result_count, local_beam_width);
+  hashset_t<RemotePtr> visited;
+  visited.reserve(static_cast<size_t>(max_beam_width) * std::max<u32>(1, config.R));
+
+  const auto add_seed = [&](RemotePtr rptr) {
+    if (rptr.is_null() || visited.contains(rptr) || !live_local(rptr)) {
+      return;
+    }
+    visited.insert(rptr);
+    insert_into_beam(beam, rptr, approximate_distance(rptr), max_beam_width);
+  };
+
+  add_seed(medoid);
+  const u64 slot_count = (upper - 16) / stride;
+  const u32 entry_points = std::max<u32>(1, config.storage_owner_qdi_entry_points);
+  if (slot_count > 0) {
+    for (u32 i = 0; i < entry_points; ++i) {
+      const u64 slot = (static_cast<u64>(i) * slot_count) / entry_points;
+      add_seed(RemotePtr{storage_id_, 16 + slot * stride});
+    }
+  }
+  if (beam.empty()) {
+    add_seed(first_local_qdi_seed());
+  }
+
+  u32 expanded = 0;
+  while (expanded < local_beam_width) {
+    i32 best_idx = -1;
+    distance_t best_dist = std::numeric_limits<distance_t>::max();
+    auto t_select = std::chrono::steady_clock::now();
+    for (i32 i = 0; i < static_cast<i32>(beam.size()); ++i) {
+      if (!beam[i].expanded && beam[i].distance < best_dist) {
+        best_dist = beam[i].distance;
+        best_idx = i;
+      }
+    }
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_select_ns += elapsed_ns_since(t_select);
+    }
+    if (best_idx < 0) {
+      break;
+    }
+
+    RemotePtr current = beam[best_idx].rptr;
+    beam[best_idx].expanded = true;
+    ++expanded;
+    if (stats != nullptr) {
+      ++stats->expanded_nodes;
+    }
+
+    auto t_neighbor = std::chrono::steady_clock::now();
+    const vec<RemotePtr> neighbors = read_neighbor_list(current);
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_neighbor_read_ns += elapsed_ns_since(t_neighbor);
+    }
+    if (stats != nullptr) {
+      ++stats->neighbor_reads;
+    }
+
+    for (const RemotePtr& neighbor : neighbors) {
+      if (neighbor.is_null() || neighbor.memory_node() != storage_id_ ||
+          visited.contains(neighbor) || !live_local(neighbor)) {
+        continue;
+      }
+      visited.insert(neighbor);
+      auto t_beam = std::chrono::steady_clock::now();
+      insert_into_beam(beam, neighbor, approximate_distance(neighbor), max_beam_width);
+      if (breakdown != nullptr) {
+        breakdown->storage_owner_search_beam_update_ns += elapsed_ns_since(t_beam);
+      }
+    }
+  }
+
+  auto t_sort = std::chrono::steady_clock::now();
+  std::sort(beam.begin(), beam.end(), [](const BeamEntry& lhs, const BeamEntry& rhs) {
+    return lhs.distance < rhs.distance;
+  });
+  if (breakdown != nullptr) {
+    breakdown->storage_owner_search_result_sort_ns += elapsed_ns_since(t_sort);
+  }
+
+  const u32 exact_count = std::min<u32>(
+    static_cast<u32>(beam.size()),
+    std::max<u32>(1, config.storage_owner_qdi_exact_candidates));
+  const u32 snapshot_batch = storage_owner_snapshot_batch_size(config, current_storage_owner_thread_);
+  for (u32 begin = 0; begin < exact_count; begin += snapshot_batch) {
+    const u32 end = std::min<u32>(exact_count, begin + snapshot_batch);
+    vec<RemotePtr> batch;
+    batch.reserve(end - begin);
+    for (u32 i = begin; i < end; ++i) {
+      batch.push_back(beam[i].rptr);
+    }
+    auto t_snapshot = std::chrono::steady_clock::now();
+    vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snapshot);
+    }
+    if (stats != nullptr) {
+      stats->exact_reads += batch.size();
+    }
+    for (const NodeSnapshot& snapshot : snapshots) {
+      if (snapshot.deleted) {
+        continue;
+      }
+      auto t_distance = std::chrono::steady_clock::now();
+      const distance_t dist = distance_to_stored_vector(query, snapshot.vector_data.data(), config);
+      if (breakdown != nullptr) {
+        breakdown->storage_owner_search_distance_ns += elapsed_ns_since(t_distance);
+      }
+      for (BeamEntry& entry : beam) {
+        if (entry.rptr == snapshot.rptr) {
+          entry.distance = dist;
+          break;
+        }
+      }
+    }
+  }
+
+  t_sort = std::chrono::steady_clock::now();
+  std::sort(beam.begin(), beam.end(), [](const BeamEntry& lhs, const BeamEntry& rhs) {
+    return lhs.distance < rhs.distance;
+  });
+  if (breakdown != nullptr) {
+    breakdown->storage_owner_search_result_sort_ns += elapsed_ns_since(t_sort);
+  }
+  if (beam.size() > result_count) {
+    beam.resize(result_count);
+  }
+  return beam;
+}
+
+auto MemoryNode::beam_search_candidates_qdi_async(const span<const element_t> query,
+                                                  RemotePtr medoid,
+                                                  const Configuration& config,
+                                                  StorageOwnerThread& thread,
+                                                  InsertBreakdownCounters* breakdown)
+  -> StorageOwnerInsertCoroutine {
+  if (!VamanaNode::HAS_RABITQ_CODE || num_storage_nodes_ <= 1) {
+    auto fallback = beam_search_candidates_async(query, medoid, config, thread, breakdown);
+    co_await std::suspend_always{};
+    while (!fallback.handle.done()) {
+      if (thread.is_ready(thread.running_coroutine)) {
+        fallback.handle.resume();
+      } else {
+        co_await std::suspend_always{};
+      }
+    }
+    fallback.handle.destroy();
+    co_return;
+  }
+
+  const u32 construction_width = storage_owner_construction_width(config);
+  const u32 max_beam_width = std::max({construction_width,
+                                       config.storage_owner_qdi_return_candidates,
+                                       config.storage_owner_qdi_local_beam});
+  vec<BeamEntry> beam;
+  beam.reserve(static_cast<size_t>(config.storage_owner_qdi_return_candidates) * num_storage_nodes_);
+
+  QdiLocalStats local_stats;
+  vec<BeamEntry> local = qdi_search_local(query, medoid, config, &local_stats, breakdown);
+  for (const BeamEntry& entry : local) {
+    merge_or_update_beam_entry(beam, entry.rptr, entry.distance, max_beam_width);
+  }
+
+  struct PendingQdi {
+    u32 target_shard{};
+    size_t request_bytes{};
+    SearchHandoffAwaitable awaitable;
+  };
+  vec<PendingQdi> pending;
+  pending.reserve(num_storage_nodes_ - 1);
+  for (u32 shard = 0; shard < num_storage_nodes_; ++shard) {
+    if (shard == storage_id_) {
+      continue;
+    }
+    vec<byte_t> message = build_qdi_search_request(
+      query,
+      medoid,
+      storage_id_,
+      next_peer_request_id_.fetch_add(1, std::memory_order_relaxed),
+      config);
+    const size_t request_bytes = message.size();
+    pending.push_back(PendingQdi{
+      shard,
+      request_bytes,
+      async_search_handoff(shard, std::move(message), thread, config)});
+  }
+
+  bool fallback_needed = false;
+  for (PendingQdi& item : pending) {
+    HandoffResult result = co_await item.awaitable;
+    record_qdi_search_stats(breakdown, result, item.request_bytes);
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_handoff_queue_wait_ns += result.queue_wait_ns;
+      breakdown->storage_owner_handoff_send_ns += result.send_ns;
+      breakdown->storage_owner_handoff_response_wait_ns += result.response_wait_ns;
+    }
+    if (!merge_qdi_search_response(beam, result, max_beam_width)) {
+      fallback_needed = true;
+    }
+  }
+
+  if (fallback_needed || beam.empty()) {
+    auto fallback = beam_search_candidates_async(query, medoid, config, thread, breakdown);
+    co_await std::suspend_always{};
+    while (!fallback.handle.done()) {
+      if (thread.is_ready(thread.running_coroutine)) {
+        fallback.handle.resume();
+      } else {
+        co_await std::suspend_always{};
+      }
+    }
+    fallback.handle.destroy();
+    co_return;
+  }
+
+  auto& out = storage_owner_async_candidates_[thread.id][thread.running_coroutine];
+  out.clear();
+  out.reserve(beam.size());
+  auto t_sort = std::chrono::steady_clock::now();
+  std::sort(beam.begin(), beam.end(), [](const BeamEntry& lhs, const BeamEntry& rhs) {
+    return lhs.distance < rhs.distance;
+  });
+  if (breakdown != nullptr) {
+    breakdown->storage_owner_search_result_sort_ns += elapsed_ns_since(t_sort);
+  }
+  for (const auto& entry : beam) {
+    out.push_back(entry.rptr);
+  }
+  co_return;
+}
+
 auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thread,
                                             StorageOwnerInsertJob& job,
                                             std::unordered_map<u64, vec<RemotePtr>>& local_updates,
@@ -1432,7 +1834,20 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   }
 
   auto t_search = std::chrono::steady_clock::now();
-  if (config.storage_owner_transitive_search) {
+  if (config.use_storage_owner_qdi_search()) {
+    auto search = beam_search_candidates_qdi_async(
+      components, medoid_ptr, config, thread, &breakdown);
+    co_await std::suspend_always{};
+    while (!search.handle.done()) {
+      if (thread.is_ready(thread.running_coroutine)) {
+        search.handle.resume();
+      } else {
+        co_await std::suspend_always{};
+      }
+    }
+    search.handle.destroy();
+    breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
+  } else if (config.use_storage_owner_transitive_search()) {
     auto search = beam_search_candidates_transitive_async(
       components, medoid_ptr, config, thread, &breakdown);
     co_await std::suspend_always{};

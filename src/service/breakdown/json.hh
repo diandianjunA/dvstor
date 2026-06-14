@@ -215,6 +215,61 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
      aggregate.counters.storage_owner_handoff_response_visited_entries},
     {"storage_owner_handoff_response_visited_truncated",
      aggregate.counters.storage_owner_handoff_response_visited_truncated},
+    {"storage_owner_qdi_requests", aggregate.counters.storage_owner_qdi_requests},
+    {"storage_owner_qdi_successes", aggregate.counters.storage_owner_qdi_successes},
+    {"storage_owner_qdi_queue_full", aggregate.counters.storage_owner_qdi_queue_full},
+    {"storage_owner_qdi_timeouts", aggregate.counters.storage_owner_qdi_timeouts},
+    {"storage_owner_qdi_overloaded", aggregate.counters.storage_owner_qdi_overloaded},
+    {"storage_owner_qdi_failed", aggregate.counters.storage_owner_qdi_failed},
+    {"storage_owner_qdi_success_ratio",
+     aggregate.counters.storage_owner_qdi_requests == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.storage_owner_qdi_successes) /
+           static_cast<double>(aggregate.counters.storage_owner_qdi_requests)},
+    {"storage_owner_qdi_request_bytes", aggregate.counters.storage_owner_qdi_request_bytes},
+    {"storage_owner_qdi_response_bytes", aggregate.counters.storage_owner_qdi_response_bytes},
+    {"storage_owner_qdi_avg_request_bytes",
+     aggregate.counters.storage_owner_qdi_requests == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.storage_owner_qdi_request_bytes) /
+           static_cast<double>(aggregate.counters.storage_owner_qdi_requests)},
+    {"storage_owner_qdi_avg_response_bytes",
+     aggregate.counters.storage_owner_qdi_requests == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.storage_owner_qdi_response_bytes) /
+           static_cast<double>(aggregate.counters.storage_owner_qdi_requests)},
+    {"storage_owner_qdi_remote_handler_ns",
+     aggregate.counters.storage_owner_qdi_remote_handler_ns},
+    {"storage_owner_qdi_remote_handler_avg_ns",
+     aggregate.counters.storage_owner_qdi_successes == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.storage_owner_qdi_remote_handler_ns) /
+           static_cast<double>(aggregate.counters.storage_owner_qdi_successes)},
+    {"storage_owner_qdi_remote_expanded_nodes",
+     aggregate.counters.storage_owner_qdi_remote_expanded_nodes},
+    {"storage_owner_qdi_remote_approx_scores",
+     aggregate.counters.storage_owner_qdi_remote_approx_scores},
+    {"storage_owner_qdi_remote_exact_reads",
+     aggregate.counters.storage_owner_qdi_remote_exact_reads},
+    {"storage_owner_qdi_remote_neighbor_reads",
+     aggregate.counters.storage_owner_qdi_remote_neighbor_reads},
+    {"storage_owner_qdi_response_candidates",
+     aggregate.counters.storage_owner_qdi_response_candidates},
+    {"storage_owner_qdi_remote_expanded_per_rpc",
+     aggregate.counters.storage_owner_qdi_successes == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.storage_owner_qdi_remote_expanded_nodes) /
+           static_cast<double>(aggregate.counters.storage_owner_qdi_successes)},
+    {"storage_owner_qdi_remote_approx_scores_per_rpc",
+     aggregate.counters.storage_owner_qdi_successes == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.storage_owner_qdi_remote_approx_scores) /
+           static_cast<double>(aggregate.counters.storage_owner_qdi_successes)},
+    {"storage_owner_qdi_remote_exact_reads_per_rpc",
+     aggregate.counters.storage_owner_qdi_successes == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.storage_owner_qdi_remote_exact_reads) /
+           static_cast<double>(aggregate.counters.storage_owner_qdi_successes)},
     {"lock_attempts", aggregate.lock_attempts},
     {"lock_retries", aggregate.lock_retries},
     {"cas_failures", aggregate.cas_failures},

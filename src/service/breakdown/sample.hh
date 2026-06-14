@@ -65,6 +65,20 @@ struct ThreadCounterDelta {
   u64 storage_owner_handoff_response_beam_entries{};
   u64 storage_owner_handoff_response_visited_entries{};
   u64 storage_owner_handoff_response_visited_truncated{};
+  u64 storage_owner_qdi_requests{};
+  u64 storage_owner_qdi_successes{};
+  u64 storage_owner_qdi_queue_full{};
+  u64 storage_owner_qdi_timeouts{};
+  u64 storage_owner_qdi_overloaded{};
+  u64 storage_owner_qdi_failed{};
+  u64 storage_owner_qdi_request_bytes{};
+  u64 storage_owner_qdi_response_bytes{};
+  u64 storage_owner_qdi_remote_handler_ns{};
+  u64 storage_owner_qdi_remote_expanded_nodes{};
+  u64 storage_owner_qdi_remote_approx_scores{};
+  u64 storage_owner_qdi_remote_exact_reads{};
+  u64 storage_owner_qdi_remote_neighbor_reads{};
+  u64 storage_owner_qdi_response_candidates{};
 };
 
 inline void add_counter_delta(ThreadCounterDelta& lhs, const ThreadCounterDelta& rhs) {
@@ -126,6 +140,20 @@ inline void add_counter_delta(ThreadCounterDelta& lhs, const ThreadCounterDelta&
   lhs.storage_owner_handoff_response_beam_entries += rhs.storage_owner_handoff_response_beam_entries;
   lhs.storage_owner_handoff_response_visited_entries += rhs.storage_owner_handoff_response_visited_entries;
   lhs.storage_owner_handoff_response_visited_truncated += rhs.storage_owner_handoff_response_visited_truncated;
+  lhs.storage_owner_qdi_requests += rhs.storage_owner_qdi_requests;
+  lhs.storage_owner_qdi_successes += rhs.storage_owner_qdi_successes;
+  lhs.storage_owner_qdi_queue_full += rhs.storage_owner_qdi_queue_full;
+  lhs.storage_owner_qdi_timeouts += rhs.storage_owner_qdi_timeouts;
+  lhs.storage_owner_qdi_overloaded += rhs.storage_owner_qdi_overloaded;
+  lhs.storage_owner_qdi_failed += rhs.storage_owner_qdi_failed;
+  lhs.storage_owner_qdi_request_bytes += rhs.storage_owner_qdi_request_bytes;
+  lhs.storage_owner_qdi_response_bytes += rhs.storage_owner_qdi_response_bytes;
+  lhs.storage_owner_qdi_remote_handler_ns += rhs.storage_owner_qdi_remote_handler_ns;
+  lhs.storage_owner_qdi_remote_expanded_nodes += rhs.storage_owner_qdi_remote_expanded_nodes;
+  lhs.storage_owner_qdi_remote_approx_scores += rhs.storage_owner_qdi_remote_approx_scores;
+  lhs.storage_owner_qdi_remote_exact_reads += rhs.storage_owner_qdi_remote_exact_reads;
+  lhs.storage_owner_qdi_remote_neighbor_reads += rhs.storage_owner_qdi_remote_neighbor_reads;
+  lhs.storage_owner_qdi_response_candidates += rhs.storage_owner_qdi_response_candidates;
 }
 
 

@@ -50,6 +50,10 @@ inline void add_storage_owner_breakdown(
     counters.storage_owner_search_distance_ns +
     counters.storage_owner_search_beam_update_ns +
     counters.storage_owner_search_result_sort_ns;
+  const u64 explained_handoff_ns =
+    counters.storage_owner_handoff_queue_wait_ns +
+    counters.storage_owner_handoff_send_ns +
+    counters.storage_owner_handoff_response_wait_ns;
   const u64 explained_prune_ns =
     counters.storage_owner_prune_snapshot_read_ns +
     counters.storage_owner_prune_distance_ns +
@@ -60,7 +64,8 @@ inline void add_storage_owner_breakdown(
   sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_medoid,
                           per_item_ns(counters.storage_owner_medoid_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_search,
-                          per_item_ns(saturating_sub(counters.storage_owner_search_ns, explained_search_ns),
+                          per_item_ns(saturating_sub(counters.storage_owner_search_ns,
+                                                     explained_search_ns + explained_handoff_ns),
                                       item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_prune,
                           per_item_ns(saturating_sub(counters.storage_owner_prune_ns, explained_prune_ns),
@@ -125,6 +130,20 @@ inline void add_storage_owner_counters(
   delta.storage_owner_handoff_response_beam_entries = counters.storage_owner_handoff_response_beam_entries;
   delta.storage_owner_handoff_response_visited_entries = counters.storage_owner_handoff_response_visited_entries;
   delta.storage_owner_handoff_response_visited_truncated = counters.storage_owner_handoff_response_visited_truncated;
+  delta.storage_owner_qdi_requests = counters.storage_owner_qdi_requests;
+  delta.storage_owner_qdi_successes = counters.storage_owner_qdi_successes;
+  delta.storage_owner_qdi_queue_full = counters.storage_owner_qdi_queue_full;
+  delta.storage_owner_qdi_timeouts = counters.storage_owner_qdi_timeouts;
+  delta.storage_owner_qdi_overloaded = counters.storage_owner_qdi_overloaded;
+  delta.storage_owner_qdi_failed = counters.storage_owner_qdi_failed;
+  delta.storage_owner_qdi_request_bytes = counters.storage_owner_qdi_request_bytes;
+  delta.storage_owner_qdi_response_bytes = counters.storage_owner_qdi_response_bytes;
+  delta.storage_owner_qdi_remote_handler_ns = counters.storage_owner_qdi_remote_handler_ns;
+  delta.storage_owner_qdi_remote_expanded_nodes = counters.storage_owner_qdi_remote_expanded_nodes;
+  delta.storage_owner_qdi_remote_approx_scores = counters.storage_owner_qdi_remote_approx_scores;
+  delta.storage_owner_qdi_remote_exact_reads = counters.storage_owner_qdi_remote_exact_reads;
+  delta.storage_owner_qdi_remote_neighbor_reads = counters.storage_owner_qdi_remote_neighbor_reads;
+  delta.storage_owner_qdi_response_candidates = counters.storage_owner_qdi_response_candidates;
   sample->add_counters(delta);
 }
 

@@ -34,6 +34,8 @@ enum class PeerRpcType : u32 {
   reverse_update_response = 2,
   search_handoff_request = 3,
   search_handoff_response = 4,
+  qdi_search_request = 5,
+  qdi_search_response = 6,
 };
 
 struct InsertBatchRequestHeader {
@@ -115,6 +117,21 @@ struct InsertBreakdownCounters {
   u64 storage_owner_handoff_response_beam_entries{};
   u64 storage_owner_handoff_response_visited_entries{};
   u64 storage_owner_handoff_response_visited_truncated{};
+
+  u64 storage_owner_qdi_requests{};
+  u64 storage_owner_qdi_successes{};
+  u64 storage_owner_qdi_queue_full{};
+  u64 storage_owner_qdi_timeouts{};
+  u64 storage_owner_qdi_overloaded{};
+  u64 storage_owner_qdi_failed{};
+  u64 storage_owner_qdi_request_bytes{};
+  u64 storage_owner_qdi_response_bytes{};
+  u64 storage_owner_qdi_remote_handler_ns{};
+  u64 storage_owner_qdi_remote_expanded_nodes{};
+  u64 storage_owner_qdi_remote_approx_scores{};
+  u64 storage_owner_qdi_remote_exact_reads{};
+  u64 storage_owner_qdi_remote_neighbor_reads{};
+  u64 storage_owner_qdi_response_candidates{};
 
   u64 total() const {
     return storage_owner_queue_wait_ns +
@@ -360,6 +377,53 @@ inline byte_t* handoff_response_visited(void* payload, u32 beam_count) {
 
 inline const byte_t* handoff_response_visited(const void* payload, u32 beam_count) {
   return reinterpret_cast<const byte_t*>(handoff_response_beam(payload) + beam_count);
+}
+
+struct QdiSearchRequestHeader {
+  PeerRpcHeader rpc;
+  u32 local_beam_width;
+  u32 result_count;
+  u32 exact_count;
+  u32 entry_points;
+  u32 vector_bytes;
+  u32 reserved;
+  u64 medoid_raw;
+};
+
+struct QdiSearchResponseHeader {
+  PeerRpcHeader rpc;
+  u32 candidate_count;
+  u32 expanded_count;
+  u32 approximate_score_count;
+  u32 exact_read_count;
+  u32 neighbor_read_count;
+  u32 reserved;
+  u64 handler_cpu_ns;
+};
+
+inline size_t qdi_search_request_bytes(u32 vector_bytes) {
+  return sizeof(QdiSearchRequestHeader) + static_cast<size_t>(vector_bytes);
+}
+
+inline size_t qdi_search_response_bytes(u32 candidate_count) {
+  return sizeof(QdiSearchResponseHeader) +
+         static_cast<size_t>(candidate_count) * sizeof(BeamEntrySerialized);
+}
+
+inline byte_t* qdi_query_vector(void* payload) {
+  return reinterpret_cast<byte_t*>(reinterpret_cast<QdiSearchRequestHeader*>(payload) + 1);
+}
+
+inline const byte_t* qdi_query_vector(const void* payload) {
+  return reinterpret_cast<const byte_t*>(reinterpret_cast<const QdiSearchRequestHeader*>(payload) + 1);
+}
+
+inline BeamEntrySerialized* qdi_response_candidates(void* payload) {
+  return reinterpret_cast<BeamEntrySerialized*>(reinterpret_cast<QdiSearchResponseHeader*>(payload) + 1);
+}
+
+inline const BeamEntrySerialized* qdi_response_candidates(const void* payload) {
+  return reinterpret_cast<const BeamEntrySerialized*>(reinterpret_cast<const QdiSearchResponseHeader*>(payload) + 1);
 }
 
 }  // namespace service::storage_owner

@@ -14,6 +14,8 @@ using NodeSnapshot = memory_node_detail::NodeSnapshot;
 using BeamEntrySerialized = service::storage_owner::BeamEntrySerialized;
 using SearchHandoffRequestHeader = service::storage_owner::SearchHandoffRequestHeader;
 using SearchHandoffResponseHeader = service::storage_owner::SearchHandoffResponseHeader;
+using QdiSearchRequestHeader = service::storage_owner::QdiSearchRequestHeader;
+using QdiSearchResponseHeader = service::storage_owner::QdiSearchResponseHeader;
 using PeerRpcType = service::storage_owner::PeerRpcType;
 using InsertStatus = service::storage_owner::InsertStatus;
 static constexpr u32 kPeerRpcMagic = service::storage_owner::kPeerRpcMagic;
@@ -23,6 +25,8 @@ using service::storage_owner::handoff_request_visited;
 using service::storage_owner::handoff_response_beam;
 using service::storage_owner::handoff_response_visited;
 using service::storage_owner::search_handoff_response_bytes;
+using service::storage_owner::qdi_query_vector;
+using service::storage_owner::qdi_response_candidates;
 
 inline bool ptr_in_bounds(RemotePtr rptr, u64 shard_cap) {
   return vamana::StorageLayoutResolver::ptr_in_bounds(rptr, shard_cap);
@@ -171,5 +175,58 @@ bool MemoryNode::handle_search_handoff_rpc(u32 source_shard,
               new_visited_raws.size() * sizeof(u64));
   resp->handler_cpu_ns = elapsed_ns_since(handler_started);
 
+  return enqueue_handoff_response(source_shard, std::move(response_msg));
+}
+
+bool MemoryNode::handle_qdi_search_rpc(u32 source_shard,
+                                       const QdiSearchRequestHeader* req,
+                                       const byte_t* /*payload*/,
+                                       const Configuration& config) {
+  const auto handler_started = std::chrono::steady_clock::now();
+  const u32 vector_bytes = req->vector_bytes;
+  const auto* query_vec = qdi_query_vector(req);
+  const span<const element_t> query{
+    reinterpret_cast<const element_t*>(query_vec),
+    VamanaNode::DIM};
+
+  QdiLocalStats stats;
+  vec<BeamEntry> candidates;
+  if (VamanaNode::HAS_RABITQ_CODE) {
+    candidates = qdi_search_local(query, RemotePtr{req->medoid_raw}, config, &stats, nullptr);
+  }
+
+  const u32 max_candidates = std::min<u32>(req->result_count, static_cast<u32>(candidates.size()));
+  const size_t response_bytes = service::storage_owner::qdi_search_response_bytes(max_candidates);
+  if (response_bytes > peer_rpc_runtime_.message_bytes) {
+    return false;
+  }
+
+  vec<byte_t> response_msg(response_bytes);
+  auto* resp = reinterpret_cast<QdiSearchResponseHeader*>(response_msg.data());
+  resp->rpc.magic = kPeerRpcMagic;
+  resp->rpc.type = static_cast<u32>(PeerRpcType::qdi_search_response);
+  resp->rpc.source_shard = storage_id_;
+  resp->rpc.item_count = max_candidates;
+  resp->rpc.request_id = req->rpc.request_id;
+  resp->rpc.status = static_cast<u32>(
+    VamanaNode::HAS_RABITQ_CODE ? InsertStatus::ok : InsertStatus::failed);
+  resp->rpc.reserved = 0;
+  resp->candidate_count = max_candidates;
+  resp->expanded_count = static_cast<u32>(std::min<u64>(
+    stats.expanded_nodes, std::numeric_limits<u32>::max()));
+  resp->approximate_score_count = static_cast<u32>(std::min<u64>(
+    stats.approximate_scores, std::numeric_limits<u32>::max()));
+  resp->exact_read_count = static_cast<u32>(std::min<u64>(
+    stats.exact_reads, std::numeric_limits<u32>::max()));
+  resp->neighbor_read_count = static_cast<u32>(std::min<u64>(
+    stats.neighbor_reads, std::numeric_limits<u32>::max()));
+  resp->reserved = vector_bytes;
+  resp->handler_cpu_ns = 0;
+
+  auto* out = qdi_response_candidates(resp);
+  for (u32 i = 0; i < max_candidates; ++i) {
+    out[i] = {candidates[i].rptr.raw_address, candidates[i].distance};
+  }
+  resp->handler_cpu_ns = elapsed_ns_since(handler_started);
   return enqueue_handoff_response(source_shard, std::move(response_msg));
 }

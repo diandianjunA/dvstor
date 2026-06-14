@@ -186,6 +186,24 @@ write_service_config() {
       echo "storage-owner-reverse-queue-depth = ${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
       echo "storage-owner-reverse-flush-us = ${STORAGE_OWNER_REVERSE_FLUSH_US:-200}"
       echo "storage-owner-reverse-coalesce-max = ${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}"
+      if [[ -n "${STORAGE_OWNER_SEARCH_MODE:-}" ]]; then
+        echo "storage-owner-search-mode = ${STORAGE_OWNER_SEARCH_MODE}"
+      fi
+      if [[ -n "${STORAGE_OWNER_QDI_LOCAL_BEAM:-}" ]]; then
+        echo "storage-owner-qdi-local-beam = ${STORAGE_OWNER_QDI_LOCAL_BEAM}"
+      fi
+      if [[ -n "${STORAGE_OWNER_QDI_RETURN_CANDIDATES:-}" ]]; then
+        echo "storage-owner-qdi-return-candidates = ${STORAGE_OWNER_QDI_RETURN_CANDIDATES}"
+      fi
+      if [[ -n "${STORAGE_OWNER_QDI_EXACT_CANDIDATES:-}" ]]; then
+        echo "storage-owner-qdi-exact-candidates = ${STORAGE_OWNER_QDI_EXACT_CANDIDATES}"
+      fi
+      if [[ -n "${STORAGE_OWNER_QDI_ENTRY_POINTS:-}" ]]; then
+        echo "storage-owner-qdi-entry-points = ${STORAGE_OWNER_QDI_ENTRY_POINTS}"
+      fi
+      if [[ "${STORAGE_OWNER_TRANSITIVE_SEARCH:-0}" == "1" ]]; then
+        echo "storage-owner-transitive-search = true"
+      fi
     fi
   } > "$output"
 }

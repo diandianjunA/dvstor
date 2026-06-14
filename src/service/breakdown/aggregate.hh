@@ -145,6 +145,26 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
     delta.storage_owner_handoff_response_visited_entries;
   aggregate.counters.storage_owner_handoff_response_visited_truncated +=
     delta.storage_owner_handoff_response_visited_truncated;
+  aggregate.counters.storage_owner_qdi_requests += delta.storage_owner_qdi_requests;
+  aggregate.counters.storage_owner_qdi_successes += delta.storage_owner_qdi_successes;
+  aggregate.counters.storage_owner_qdi_queue_full += delta.storage_owner_qdi_queue_full;
+  aggregate.counters.storage_owner_qdi_timeouts += delta.storage_owner_qdi_timeouts;
+  aggregate.counters.storage_owner_qdi_overloaded += delta.storage_owner_qdi_overloaded;
+  aggregate.counters.storage_owner_qdi_failed += delta.storage_owner_qdi_failed;
+  aggregate.counters.storage_owner_qdi_request_bytes += delta.storage_owner_qdi_request_bytes;
+  aggregate.counters.storage_owner_qdi_response_bytes += delta.storage_owner_qdi_response_bytes;
+  aggregate.counters.storage_owner_qdi_remote_handler_ns +=
+    delta.storage_owner_qdi_remote_handler_ns;
+  aggregate.counters.storage_owner_qdi_remote_expanded_nodes +=
+    delta.storage_owner_qdi_remote_expanded_nodes;
+  aggregate.counters.storage_owner_qdi_remote_approx_scores +=
+    delta.storage_owner_qdi_remote_approx_scores;
+  aggregate.counters.storage_owner_qdi_remote_exact_reads +=
+    delta.storage_owner_qdi_remote_exact_reads;
+  aggregate.counters.storage_owner_qdi_remote_neighbor_reads +=
+    delta.storage_owner_qdi_remote_neighbor_reads;
+  aggregate.counters.storage_owner_qdi_response_candidates +=
+    delta.storage_owner_qdi_response_candidates;
   aggregate.lock_attempts += sample.lock_attempts;
   aggregate.lock_retries += sample.lock_retries;
   aggregate.cas_failures += sample.cas_failures;
