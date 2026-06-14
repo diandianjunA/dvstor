@@ -103,6 +103,21 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.rabitq_prefetch_misses += delta.rabitq_prefetch_misses;
   aggregate.counters.rabitq_prefetch_disabled_queries +=
     delta.rabitq_prefetch_disabled_queries;
+  aggregate.counters.qir_qcode_rdma_ops += delta.qir_qcode_rdma_ops;
+  aggregate.counters.qir_qcode_rdma_bytes += delta.qir_qcode_rdma_bytes;
+  aggregate.counters.qir_qcode_cache_hits += delta.qir_qcode_cache_hits;
+  aggregate.counters.qir_qcode_cache_misses += delta.qir_qcode_cache_misses;
+  aggregate.counters.qir_exact_reads += delta.qir_exact_reads;
+  aggregate.counters.qir_exact_reads_avoided += delta.qir_exact_reads_avoided;
+  aggregate.counters.qir_uncertain_candidates += delta.qir_uncertain_candidates;
+  aggregate.counters.qir_prune_fallbacks += delta.qir_prune_fallbacks;
+  aggregate.counters.qir_repair_intents += delta.qir_repair_intents;
+  aggregate.counters.qir_repair_queue_delay_ns += delta.qir_repair_queue_delay_ns;
+  aggregate.counters.qir_repair_applied_edges += delta.qir_repair_applied_edges;
+  aggregate.counters.qir_repair_stale_skips += delta.qir_repair_stale_skips;
+  aggregate.counters.qir_sync_repair_fallbacks += delta.qir_sync_repair_fallbacks;
+  aggregate.counters.qir_audit_samples += delta.qir_audit_samples;
+  aggregate.counters.qir_audit_disagreements += delta.qir_audit_disagreements;
   aggregate.counters.visited_nodes += delta.visited_nodes;
   aggregate.counters.visited_neighborlists += delta.visited_neighborlists;
   aggregate.counters.remote_allocations += delta.remote_allocations;
@@ -123,48 +138,6 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
     std::max(aggregate.counters.overflow_prune_max_kernel_threads, sample.overflow_prune_max_kernel_threads);
   aggregate.counters.query_rdma_to_staging_bytes += delta.query_rdma_to_staging_bytes;
   aggregate.counters.query_host_staging_fallback_bytes += delta.query_host_staging_fallback_bytes;
-  aggregate.counters.storage_owner_handoff_requests += delta.storage_owner_handoff_requests;
-  aggregate.counters.storage_owner_handoff_successes += delta.storage_owner_handoff_successes;
-  aggregate.counters.storage_owner_handoff_queue_full += delta.storage_owner_handoff_queue_full;
-  aggregate.counters.storage_owner_handoff_timeouts += delta.storage_owner_handoff_timeouts;
-  aggregate.counters.storage_owner_handoff_overloaded += delta.storage_owner_handoff_overloaded;
-  aggregate.counters.storage_owner_handoff_failed += delta.storage_owner_handoff_failed;
-  aggregate.counters.storage_owner_handoff_request_bytes += delta.storage_owner_handoff_request_bytes;
-  aggregate.counters.storage_owner_handoff_response_bytes += delta.storage_owner_handoff_response_bytes;
-  aggregate.counters.storage_owner_handoff_remote_handler_ns +=
-    delta.storage_owner_handoff_remote_handler_ns;
-  aggregate.counters.storage_owner_handoff_remote_expanded_nodes +=
-    delta.storage_owner_handoff_remote_expanded_nodes;
-  aggregate.counters.storage_owner_handoff_remote_snapshot_reads +=
-    delta.storage_owner_handoff_remote_snapshot_reads;
-  aggregate.counters.storage_owner_handoff_remote_neighbor_reads +=
-    delta.storage_owner_handoff_remote_neighbor_reads;
-  aggregate.counters.storage_owner_handoff_response_beam_entries +=
-    delta.storage_owner_handoff_response_beam_entries;
-  aggregate.counters.storage_owner_handoff_response_visited_entries +=
-    delta.storage_owner_handoff_response_visited_entries;
-  aggregate.counters.storage_owner_handoff_response_visited_truncated +=
-    delta.storage_owner_handoff_response_visited_truncated;
-  aggregate.counters.storage_owner_qdi_requests += delta.storage_owner_qdi_requests;
-  aggregate.counters.storage_owner_qdi_successes += delta.storage_owner_qdi_successes;
-  aggregate.counters.storage_owner_qdi_queue_full += delta.storage_owner_qdi_queue_full;
-  aggregate.counters.storage_owner_qdi_timeouts += delta.storage_owner_qdi_timeouts;
-  aggregate.counters.storage_owner_qdi_overloaded += delta.storage_owner_qdi_overloaded;
-  aggregate.counters.storage_owner_qdi_failed += delta.storage_owner_qdi_failed;
-  aggregate.counters.storage_owner_qdi_request_bytes += delta.storage_owner_qdi_request_bytes;
-  aggregate.counters.storage_owner_qdi_response_bytes += delta.storage_owner_qdi_response_bytes;
-  aggregate.counters.storage_owner_qdi_remote_handler_ns +=
-    delta.storage_owner_qdi_remote_handler_ns;
-  aggregate.counters.storage_owner_qdi_remote_expanded_nodes +=
-    delta.storage_owner_qdi_remote_expanded_nodes;
-  aggregate.counters.storage_owner_qdi_remote_approx_scores +=
-    delta.storage_owner_qdi_remote_approx_scores;
-  aggregate.counters.storage_owner_qdi_remote_exact_reads +=
-    delta.storage_owner_qdi_remote_exact_reads;
-  aggregate.counters.storage_owner_qdi_remote_neighbor_reads +=
-    delta.storage_owner_qdi_remote_neighbor_reads;
-  aggregate.counters.storage_owner_qdi_response_candidates +=
-    delta.storage_owner_qdi_response_candidates;
   aggregate.lock_attempts += sample.lock_attempts;
   aggregate.lock_retries += sample.lock_retries;
   aggregate.cas_failures += sample.cas_failures;

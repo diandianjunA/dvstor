@@ -178,7 +178,6 @@ write_service_config() {
       echo "storage-owner-peer-rdma-tokens = ${STORAGE_OWNER_PEER_RDMA_TOKENS:-8}"
       echo "storage-owner-rpc-depth = ${STORAGE_OWNER_RPC_DEPTH:-16}"
       echo "storage-owner-rpc-timeout-ms = ${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}"
-      echo "storage-owner-handoff-queue-depth = ${STORAGE_OWNER_HANDOFF_QUEUE_DEPTH:-0}"
       echo "storage-owner-construction-beam-width = ${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-$BUILD_BEAM}"
       echo "storage-owner-search-snapshot-batch = ${STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH:-64}"
       echo "storage-owner-prune-max-candidates = ${STORAGE_OWNER_PRUNE_MAX_CANDIDATES:-128}"
@@ -189,20 +188,23 @@ write_service_config() {
       if [[ -n "${STORAGE_OWNER_SEARCH_MODE:-}" ]]; then
         echo "storage-owner-search-mode = ${STORAGE_OWNER_SEARCH_MODE}"
       fi
-      if [[ -n "${STORAGE_OWNER_QDI_LOCAL_BEAM:-}" ]]; then
-        echo "storage-owner-qdi-local-beam = ${STORAGE_OWNER_QDI_LOCAL_BEAM}"
+      if [[ -n "${QIR_EXACT_BUDGET:-}" ]]; then
+        echo "qir-exact-budget = ${QIR_EXACT_BUDGET}"
       fi
-      if [[ -n "${STORAGE_OWNER_QDI_RETURN_CANDIDATES:-}" ]]; then
-        echo "storage-owner-qdi-return-candidates = ${STORAGE_OWNER_QDI_RETURN_CANDIDATES}"
+      if [[ -n "${QIR_AUDIT_RATE:-}" ]]; then
+        echo "qir-audit-rate = ${QIR_AUDIT_RATE}"
       fi
-      if [[ -n "${STORAGE_OWNER_QDI_EXACT_CANDIDATES:-}" ]]; then
-        echo "storage-owner-qdi-exact-candidates = ${STORAGE_OWNER_QDI_EXACT_CANDIDATES}"
+      if [[ -n "${QIR_CACHE_MB:-}" ]]; then
+        echo "qir-cache-mb = ${QIR_CACHE_MB}"
       fi
-      if [[ -n "${STORAGE_OWNER_QDI_ENTRY_POINTS:-}" ]]; then
-        echo "storage-owner-qdi-entry-points = ${STORAGE_OWNER_QDI_ENTRY_POINTS}"
+      if [[ -n "${QIR_ENABLE_PRUNE:-}" ]]; then
+        echo "qir-enable-prune = ${QIR_ENABLE_PRUNE}"
       fi
-      if [[ "${STORAGE_OWNER_TRANSITIVE_SEARCH:-0}" == "1" ]]; then
-        echo "storage-owner-transitive-search = true"
+      if [[ -n "${QIR_BACKLOG_SYNC_THRESHOLD:-}" ]]; then
+        echo "qir-backlog-sync-threshold = ${QIR_BACKLOG_SYNC_THRESHOLD}"
+      fi
+      if [[ -n "${QIR_UNCERTAIN_RATIO_THRESHOLD:-}" ]]; then
+        echo "qir-uncertain-ratio-threshold = ${QIR_UNCERTAIN_RATIO_THRESHOLD}"
       fi
     fi
   } > "$output"

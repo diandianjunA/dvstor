@@ -181,13 +181,6 @@ MemoryNode::MemoryNode(Configuration& config)
       worker.join();
     }
   }
-  peer_handoff_shutdown_.store(true, std::memory_order_release);
-  peer_handoff_tasks_cv_.notify_all();
-  for (auto& worker : peer_handoff_workers_) {
-    if (worker.joinable()) {
-      worker.join();
-    }
-  }
   stop_peer_reverse_update_runtime();
 
   print_status("memory node shutting down");
@@ -199,110 +192,64 @@ u64 MemoryNode::elapsed_ns_since(const std::chrono::steady_clock::time_point sta
     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
 }
 
-u64 MemoryNode::scale_ns(const u64 value, const u32 part, const u32 total) {
-  if (value == 0 || part == 0 || total == 0) {
-    return 0;
-  }
-  const u64 quotient = value / total;
-  const u64 remainder = value % total;
-  return quotient * part + (remainder * part) / total;
-}
-
 MemoryNode::InsertBreakdownCounters MemoryNode::scale_breakdown(const InsertBreakdownCounters& counters,
+                                               const u32 offset,
                                                const u32 part,
                                                const u32 total) {
+  const auto partition = [offset, part, total](u64 value) {
+    if (value == 0 || part == 0 || total == 0) {
+      return u64{0};
+    }
+    const u64 quotient = value / total;
+    const u64 remainder = value % total;
+    const auto prefix = [&](u32 count) {
+      return quotient * count + (remainder * count) / total;
+    };
+    return prefix(offset + part) - prefix(offset);
+  };
   InsertBreakdownCounters out{};
-  out.storage_owner_queue_wait_ns = scale_ns(counters.storage_owner_queue_wait_ns, part, total);
-  out.storage_owner_medoid_ns = scale_ns(counters.storage_owner_medoid_ns, part, total);
-  out.storage_owner_search_ns = scale_ns(counters.storage_owner_search_ns, part, total);
-  out.storage_owner_prune_ns = scale_ns(counters.storage_owner_prune_ns, part, total);
-  out.storage_owner_write_node_ns = scale_ns(counters.storage_owner_write_node_ns, part, total);
-  out.storage_owner_local_reverse_ns = scale_ns(counters.storage_owner_local_reverse_ns, part, total);
-  out.storage_owner_remote_reverse_ns = scale_ns(counters.storage_owner_remote_reverse_ns, part, total);
+  out.storage_owner_queue_wait_ns = partition(counters.storage_owner_queue_wait_ns);
+  out.storage_owner_medoid_ns = partition(counters.storage_owner_medoid_ns);
+  out.storage_owner_search_ns = partition(counters.storage_owner_search_ns);
+  out.storage_owner_prune_ns = partition(counters.storage_owner_prune_ns);
+  out.storage_owner_write_node_ns = partition(counters.storage_owner_write_node_ns);
+  out.storage_owner_local_reverse_ns = partition(counters.storage_owner_local_reverse_ns);
+  out.storage_owner_remote_reverse_ns = partition(counters.storage_owner_remote_reverse_ns);
   out.storage_owner_peer_reverse_apply_ns =
-    scale_ns(counters.storage_owner_peer_reverse_apply_ns, part, total);
-  out.storage_owner_response_send_ns = scale_ns(counters.storage_owner_response_send_ns, part, total);
-  out.storage_owner_search_select_ns = scale_ns(counters.storage_owner_search_select_ns, part, total);
+    partition(counters.storage_owner_peer_reverse_apply_ns);
+  out.storage_owner_response_send_ns = partition(counters.storage_owner_response_send_ns);
+  out.storage_owner_search_select_ns = partition(counters.storage_owner_search_select_ns);
   out.storage_owner_search_neighbor_read_ns =
-    scale_ns(counters.storage_owner_search_neighbor_read_ns, part, total);
+    partition(counters.storage_owner_search_neighbor_read_ns);
   out.storage_owner_search_snapshot_read_ns =
-    scale_ns(counters.storage_owner_search_snapshot_read_ns, part, total);
-  out.storage_owner_search_distance_ns = scale_ns(counters.storage_owner_search_distance_ns, part, total);
+    partition(counters.storage_owner_search_snapshot_read_ns);
+  out.storage_owner_search_distance_ns = partition(counters.storage_owner_search_distance_ns);
   out.storage_owner_search_beam_update_ns =
-    scale_ns(counters.storage_owner_search_beam_update_ns, part, total);
+    partition(counters.storage_owner_search_beam_update_ns);
   out.storage_owner_search_result_sort_ns =
-    scale_ns(counters.storage_owner_search_result_sort_ns, part, total);
-  out.storage_owner_handoff_queue_wait_ns =
-    scale_ns(counters.storage_owner_handoff_queue_wait_ns, part, total);
-  out.storage_owner_handoff_send_ns =
-    scale_ns(counters.storage_owner_handoff_send_ns, part, total);
-  out.storage_owner_handoff_response_wait_ns =
-    scale_ns(counters.storage_owner_handoff_response_wait_ns, part, total);
+    partition(counters.storage_owner_search_result_sort_ns);
   out.storage_owner_prune_snapshot_read_ns =
-    scale_ns(counters.storage_owner_prune_snapshot_read_ns, part, total);
+    partition(counters.storage_owner_prune_snapshot_read_ns);
   out.storage_owner_prune_distance_ns =
-    scale_ns(counters.storage_owner_prune_distance_ns, part, total);
-  out.storage_owner_prune_sort_ns = scale_ns(counters.storage_owner_prune_sort_ns, part, total);
+    partition(counters.storage_owner_prune_distance_ns);
+  out.storage_owner_prune_sort_ns = partition(counters.storage_owner_prune_sort_ns);
   out.storage_owner_prune_pair_distance_ns =
-    scale_ns(counters.storage_owner_prune_pair_distance_ns, part, total);
-  out.storage_owner_handoff_requests =
-    scale_ns(counters.storage_owner_handoff_requests, part, total);
-  out.storage_owner_handoff_successes =
-    scale_ns(counters.storage_owner_handoff_successes, part, total);
-  out.storage_owner_handoff_queue_full =
-    scale_ns(counters.storage_owner_handoff_queue_full, part, total);
-  out.storage_owner_handoff_timeouts =
-    scale_ns(counters.storage_owner_handoff_timeouts, part, total);
-  out.storage_owner_handoff_overloaded =
-    scale_ns(counters.storage_owner_handoff_overloaded, part, total);
-  out.storage_owner_handoff_failed =
-    scale_ns(counters.storage_owner_handoff_failed, part, total);
-  out.storage_owner_handoff_request_bytes =
-    scale_ns(counters.storage_owner_handoff_request_bytes, part, total);
-  out.storage_owner_handoff_response_bytes =
-    scale_ns(counters.storage_owner_handoff_response_bytes, part, total);
-  out.storage_owner_handoff_remote_handler_ns =
-    scale_ns(counters.storage_owner_handoff_remote_handler_ns, part, total);
-  out.storage_owner_handoff_remote_expanded_nodes =
-    scale_ns(counters.storage_owner_handoff_remote_expanded_nodes, part, total);
-  out.storage_owner_handoff_remote_snapshot_reads =
-    scale_ns(counters.storage_owner_handoff_remote_snapshot_reads, part, total);
-  out.storage_owner_handoff_remote_neighbor_reads =
-    scale_ns(counters.storage_owner_handoff_remote_neighbor_reads, part, total);
-  out.storage_owner_handoff_response_beam_entries =
-    scale_ns(counters.storage_owner_handoff_response_beam_entries, part, total);
-  out.storage_owner_handoff_response_visited_entries =
-    scale_ns(counters.storage_owner_handoff_response_visited_entries, part, total);
-  out.storage_owner_handoff_response_visited_truncated =
-    scale_ns(counters.storage_owner_handoff_response_visited_truncated, part, total);
-  out.storage_owner_qdi_requests =
-    scale_ns(counters.storage_owner_qdi_requests, part, total);
-  out.storage_owner_qdi_successes =
-    scale_ns(counters.storage_owner_qdi_successes, part, total);
-  out.storage_owner_qdi_queue_full =
-    scale_ns(counters.storage_owner_qdi_queue_full, part, total);
-  out.storage_owner_qdi_timeouts =
-    scale_ns(counters.storage_owner_qdi_timeouts, part, total);
-  out.storage_owner_qdi_overloaded =
-    scale_ns(counters.storage_owner_qdi_overloaded, part, total);
-  out.storage_owner_qdi_failed =
-    scale_ns(counters.storage_owner_qdi_failed, part, total);
-  out.storage_owner_qdi_request_bytes =
-    scale_ns(counters.storage_owner_qdi_request_bytes, part, total);
-  out.storage_owner_qdi_response_bytes =
-    scale_ns(counters.storage_owner_qdi_response_bytes, part, total);
-  out.storage_owner_qdi_remote_handler_ns =
-    scale_ns(counters.storage_owner_qdi_remote_handler_ns, part, total);
-  out.storage_owner_qdi_remote_expanded_nodes =
-    scale_ns(counters.storage_owner_qdi_remote_expanded_nodes, part, total);
-  out.storage_owner_qdi_remote_approx_scores =
-    scale_ns(counters.storage_owner_qdi_remote_approx_scores, part, total);
-  out.storage_owner_qdi_remote_exact_reads =
-    scale_ns(counters.storage_owner_qdi_remote_exact_reads, part, total);
-  out.storage_owner_qdi_remote_neighbor_reads =
-    scale_ns(counters.storage_owner_qdi_remote_neighbor_reads, part, total);
-  out.storage_owner_qdi_response_candidates =
-    scale_ns(counters.storage_owner_qdi_response_candidates, part, total);
+    partition(counters.storage_owner_prune_pair_distance_ns);
+  out.qir_qcode_rdma_ops = partition(counters.qir_qcode_rdma_ops);
+  out.qir_qcode_rdma_bytes = partition(counters.qir_qcode_rdma_bytes);
+  out.qir_qcode_cache_hits = partition(counters.qir_qcode_cache_hits);
+  out.qir_qcode_cache_misses = partition(counters.qir_qcode_cache_misses);
+  out.qir_exact_reads = partition(counters.qir_exact_reads);
+  out.qir_exact_reads_avoided = partition(counters.qir_exact_reads_avoided);
+  out.qir_uncertain_candidates = partition(counters.qir_uncertain_candidates);
+  out.qir_prune_fallbacks = partition(counters.qir_prune_fallbacks);
+  out.qir_repair_intents = partition(counters.qir_repair_intents);
+  out.qir_repair_queue_delay_ns = partition(counters.qir_repair_queue_delay_ns);
+  out.qir_repair_applied_edges = partition(counters.qir_repair_applied_edges);
+  out.qir_repair_stale_skips = partition(counters.qir_repair_stale_skips);
+  out.qir_sync_repair_fallbacks = partition(counters.qir_sync_repair_fallbacks);
+  out.qir_audit_samples = partition(counters.qir_audit_samples);
+  out.qir_audit_disagreements = partition(counters.qir_audit_disagreements);
   return out;
 }
 

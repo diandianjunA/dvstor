@@ -50,10 +50,6 @@ inline void add_storage_owner_breakdown(
     counters.storage_owner_search_distance_ns +
     counters.storage_owner_search_beam_update_ns +
     counters.storage_owner_search_result_sort_ns;
-  const u64 explained_handoff_ns =
-    counters.storage_owner_handoff_queue_wait_ns +
-    counters.storage_owner_handoff_send_ns +
-    counters.storage_owner_handoff_response_wait_ns;
   const u64 explained_prune_ns =
     counters.storage_owner_prune_snapshot_read_ns +
     counters.storage_owner_prune_distance_ns +
@@ -65,7 +61,7 @@ inline void add_storage_owner_breakdown(
                           per_item_ns(counters.storage_owner_medoid_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_search,
                           per_item_ns(saturating_sub(counters.storage_owner_search_ns,
-                                                     explained_search_ns + explained_handoff_ns),
+                                                     explained_search_ns),
                                       item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_prune,
                           per_item_ns(saturating_sub(counters.storage_owner_prune_ns, explained_prune_ns),
@@ -92,12 +88,6 @@ inline void add_storage_owner_breakdown(
                           per_item_ns(counters.storage_owner_search_beam_update_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_search_result_sort,
                           per_item_ns(counters.storage_owner_search_result_sort_ns, item_count));
-  sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_handoff_queue_wait,
-                          per_item_ns(counters.storage_owner_handoff_queue_wait_ns, item_count));
-  sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_handoff_send,
-                          per_item_ns(counters.storage_owner_handoff_send_ns, item_count));
-  sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_handoff_response_wait,
-                          per_item_ns(counters.storage_owner_handoff_response_wait_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_prune_snapshot_read,
                           per_item_ns(counters.storage_owner_prune_snapshot_read_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_prune_distance,
@@ -115,35 +105,21 @@ inline void add_storage_owner_counters(
     return;
   }
   service::breakdown::ThreadCounterDelta delta{};
-  delta.storage_owner_handoff_requests = counters.storage_owner_handoff_requests;
-  delta.storage_owner_handoff_successes = counters.storage_owner_handoff_successes;
-  delta.storage_owner_handoff_queue_full = counters.storage_owner_handoff_queue_full;
-  delta.storage_owner_handoff_timeouts = counters.storage_owner_handoff_timeouts;
-  delta.storage_owner_handoff_overloaded = counters.storage_owner_handoff_overloaded;
-  delta.storage_owner_handoff_failed = counters.storage_owner_handoff_failed;
-  delta.storage_owner_handoff_request_bytes = counters.storage_owner_handoff_request_bytes;
-  delta.storage_owner_handoff_response_bytes = counters.storage_owner_handoff_response_bytes;
-  delta.storage_owner_handoff_remote_handler_ns = counters.storage_owner_handoff_remote_handler_ns;
-  delta.storage_owner_handoff_remote_expanded_nodes = counters.storage_owner_handoff_remote_expanded_nodes;
-  delta.storage_owner_handoff_remote_snapshot_reads = counters.storage_owner_handoff_remote_snapshot_reads;
-  delta.storage_owner_handoff_remote_neighbor_reads = counters.storage_owner_handoff_remote_neighbor_reads;
-  delta.storage_owner_handoff_response_beam_entries = counters.storage_owner_handoff_response_beam_entries;
-  delta.storage_owner_handoff_response_visited_entries = counters.storage_owner_handoff_response_visited_entries;
-  delta.storage_owner_handoff_response_visited_truncated = counters.storage_owner_handoff_response_visited_truncated;
-  delta.storage_owner_qdi_requests = counters.storage_owner_qdi_requests;
-  delta.storage_owner_qdi_successes = counters.storage_owner_qdi_successes;
-  delta.storage_owner_qdi_queue_full = counters.storage_owner_qdi_queue_full;
-  delta.storage_owner_qdi_timeouts = counters.storage_owner_qdi_timeouts;
-  delta.storage_owner_qdi_overloaded = counters.storage_owner_qdi_overloaded;
-  delta.storage_owner_qdi_failed = counters.storage_owner_qdi_failed;
-  delta.storage_owner_qdi_request_bytes = counters.storage_owner_qdi_request_bytes;
-  delta.storage_owner_qdi_response_bytes = counters.storage_owner_qdi_response_bytes;
-  delta.storage_owner_qdi_remote_handler_ns = counters.storage_owner_qdi_remote_handler_ns;
-  delta.storage_owner_qdi_remote_expanded_nodes = counters.storage_owner_qdi_remote_expanded_nodes;
-  delta.storage_owner_qdi_remote_approx_scores = counters.storage_owner_qdi_remote_approx_scores;
-  delta.storage_owner_qdi_remote_exact_reads = counters.storage_owner_qdi_remote_exact_reads;
-  delta.storage_owner_qdi_remote_neighbor_reads = counters.storage_owner_qdi_remote_neighbor_reads;
-  delta.storage_owner_qdi_response_candidates = counters.storage_owner_qdi_response_candidates;
+  delta.qir_qcode_rdma_ops = counters.qir_qcode_rdma_ops;
+  delta.qir_qcode_rdma_bytes = counters.qir_qcode_rdma_bytes;
+  delta.qir_qcode_cache_hits = counters.qir_qcode_cache_hits;
+  delta.qir_qcode_cache_misses = counters.qir_qcode_cache_misses;
+  delta.qir_exact_reads = counters.qir_exact_reads;
+  delta.qir_exact_reads_avoided = counters.qir_exact_reads_avoided;
+  delta.qir_uncertain_candidates = counters.qir_uncertain_candidates;
+  delta.qir_prune_fallbacks = counters.qir_prune_fallbacks;
+  delta.qir_repair_intents = counters.qir_repair_intents;
+  delta.qir_repair_queue_delay_ns = counters.qir_repair_queue_delay_ns;
+  delta.qir_repair_applied_edges = counters.qir_repair_applied_edges;
+  delta.qir_repair_stale_skips = counters.qir_repair_stale_skips;
+  delta.qir_sync_repair_fallbacks = counters.qir_sync_repair_fallbacks;
+  delta.qir_audit_samples = counters.qir_audit_samples;
+  delta.qir_audit_disagreements = counters.qir_audit_disagreements;
   sample->add_counters(delta);
 }
 

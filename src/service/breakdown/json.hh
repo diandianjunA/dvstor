@@ -126,6 +126,37 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
        ? 0.0
        : static_cast<double>(aggregate.counters.rabitq_prefetch_hits) /
            static_cast<double>(aggregate.counters.rabitq_prefetch_issued)},
+    {"qir_qcode_rdma_ops", aggregate.counters.qir_qcode_rdma_ops},
+    {"qir_qcode_rdma_bytes", aggregate.counters.qir_qcode_rdma_bytes},
+    {"qir_qcode_rdma_avg_bytes",
+     aggregate.counters.qir_qcode_rdma_ops == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.qir_qcode_rdma_bytes) /
+           static_cast<double>(aggregate.counters.qir_qcode_rdma_ops)},
+    {"qir_qcode_cache_hits", aggregate.counters.qir_qcode_cache_hits},
+    {"qir_qcode_cache_misses", aggregate.counters.qir_qcode_cache_misses},
+    {"qir_qcode_cache_hit_rate",
+     aggregate.counters.qir_qcode_cache_hits + aggregate.counters.qir_qcode_cache_misses == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.qir_qcode_cache_hits) /
+           static_cast<double>(aggregate.counters.qir_qcode_cache_hits +
+                               aggregate.counters.qir_qcode_cache_misses)},
+    {"qir_exact_reads", aggregate.counters.qir_exact_reads},
+    {"qir_exact_reads_avoided", aggregate.counters.qir_exact_reads_avoided},
+    {"qir_uncertain_candidates", aggregate.counters.qir_uncertain_candidates},
+    {"qir_prune_fallbacks", aggregate.counters.qir_prune_fallbacks},
+    {"qir_repair_intents", aggregate.counters.qir_repair_intents},
+    {"qir_repair_queue_delay_ns", aggregate.counters.qir_repair_queue_delay_ns},
+    {"qir_repair_applied_edges", aggregate.counters.qir_repair_applied_edges},
+    {"qir_repair_stale_skips", aggregate.counters.qir_repair_stale_skips},
+    {"qir_sync_repair_fallbacks", aggregate.counters.qir_sync_repair_fallbacks},
+    {"qir_audit_samples", aggregate.counters.qir_audit_samples},
+    {"qir_audit_disagreements", aggregate.counters.qir_audit_disagreements},
+    {"qir_audit_disagreement_rate",
+     aggregate.counters.qir_audit_samples == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.qir_audit_disagreements) /
+           static_cast<double>(aggregate.counters.qir_audit_samples)},
     {"rabitq_local_scores", aggregate.counters.rabitq_l0_candidates},
     {"rabitq_gate_passes", aggregate.counters.rabitq_l1_candidates},
     {"rabitq_exact_vector_reads", aggregate.counters.rabitq_l2_candidates},
@@ -158,118 +189,6 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"overflow_prune_max_kernel_threads", aggregate.counters.overflow_prune_max_kernel_threads},
     {"query_rdma_to_staging_bytes", aggregate.counters.query_rdma_to_staging_bytes},
     {"query_host_staging_fallback_bytes", aggregate.counters.query_host_staging_fallback_bytes},
-    {"storage_owner_handoff_requests", aggregate.counters.storage_owner_handoff_requests},
-    {"storage_owner_handoff_successes", aggregate.counters.storage_owner_handoff_successes},
-    {"storage_owner_handoff_queue_full", aggregate.counters.storage_owner_handoff_queue_full},
-    {"storage_owner_handoff_timeouts", aggregate.counters.storage_owner_handoff_timeouts},
-    {"storage_owner_handoff_overloaded", aggregate.counters.storage_owner_handoff_overloaded},
-    {"storage_owner_handoff_failed", aggregate.counters.storage_owner_handoff_failed},
-    {"storage_owner_handoff_success_ratio",
-     aggregate.counters.storage_owner_handoff_requests == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_handoff_successes) /
-           static_cast<double>(aggregate.counters.storage_owner_handoff_requests)},
-    {"storage_owner_handoff_request_bytes", aggregate.counters.storage_owner_handoff_request_bytes},
-    {"storage_owner_handoff_response_bytes", aggregate.counters.storage_owner_handoff_response_bytes},
-    {"storage_owner_handoff_avg_request_bytes",
-     aggregate.counters.storage_owner_handoff_requests == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_handoff_request_bytes) /
-           static_cast<double>(aggregate.counters.storage_owner_handoff_requests)},
-    {"storage_owner_handoff_avg_response_bytes",
-     aggregate.counters.storage_owner_handoff_requests == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_handoff_response_bytes) /
-           static_cast<double>(aggregate.counters.storage_owner_handoff_requests)},
-    {"storage_owner_handoff_remote_handler_ns",
-     aggregate.counters.storage_owner_handoff_remote_handler_ns},
-    {"storage_owner_handoff_remote_handler_avg_ns",
-     aggregate.counters.storage_owner_handoff_successes == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_handoff_remote_handler_ns) /
-           static_cast<double>(aggregate.counters.storage_owner_handoff_successes)},
-    {"storage_owner_handoff_remote_expanded_nodes",
-     aggregate.counters.storage_owner_handoff_remote_expanded_nodes},
-    {"storage_owner_handoff_remote_snapshot_reads",
-     aggregate.counters.storage_owner_handoff_remote_snapshot_reads},
-    {"storage_owner_handoff_remote_neighbor_reads",
-     aggregate.counters.storage_owner_handoff_remote_neighbor_reads},
-    {"storage_owner_handoff_remote_expanded_per_handoff",
-     aggregate.counters.storage_owner_handoff_successes == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_handoff_remote_expanded_nodes) /
-           static_cast<double>(aggregate.counters.storage_owner_handoff_successes)},
-    {"storage_owner_handoff_remote_snapshot_reads_per_handoff",
-     aggregate.counters.storage_owner_handoff_successes == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_handoff_remote_snapshot_reads) /
-           static_cast<double>(aggregate.counters.storage_owner_handoff_successes)},
-    {"storage_owner_handoff_remote_neighbor_reads_per_handoff",
-     aggregate.counters.storage_owner_handoff_successes == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_handoff_remote_neighbor_reads) /
-           static_cast<double>(aggregate.counters.storage_owner_handoff_successes)},
-    {"storage_owner_handoff_response_beam_entries",
-     aggregate.counters.storage_owner_handoff_response_beam_entries},
-    {"storage_owner_handoff_response_visited_entries",
-     aggregate.counters.storage_owner_handoff_response_visited_entries},
-    {"storage_owner_handoff_response_visited_truncated",
-     aggregate.counters.storage_owner_handoff_response_visited_truncated},
-    {"storage_owner_qdi_requests", aggregate.counters.storage_owner_qdi_requests},
-    {"storage_owner_qdi_successes", aggregate.counters.storage_owner_qdi_successes},
-    {"storage_owner_qdi_queue_full", aggregate.counters.storage_owner_qdi_queue_full},
-    {"storage_owner_qdi_timeouts", aggregate.counters.storage_owner_qdi_timeouts},
-    {"storage_owner_qdi_overloaded", aggregate.counters.storage_owner_qdi_overloaded},
-    {"storage_owner_qdi_failed", aggregate.counters.storage_owner_qdi_failed},
-    {"storage_owner_qdi_success_ratio",
-     aggregate.counters.storage_owner_qdi_requests == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_qdi_successes) /
-           static_cast<double>(aggregate.counters.storage_owner_qdi_requests)},
-    {"storage_owner_qdi_request_bytes", aggregate.counters.storage_owner_qdi_request_bytes},
-    {"storage_owner_qdi_response_bytes", aggregate.counters.storage_owner_qdi_response_bytes},
-    {"storage_owner_qdi_avg_request_bytes",
-     aggregate.counters.storage_owner_qdi_requests == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_qdi_request_bytes) /
-           static_cast<double>(aggregate.counters.storage_owner_qdi_requests)},
-    {"storage_owner_qdi_avg_response_bytes",
-     aggregate.counters.storage_owner_qdi_requests == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_qdi_response_bytes) /
-           static_cast<double>(aggregate.counters.storage_owner_qdi_requests)},
-    {"storage_owner_qdi_remote_handler_ns",
-     aggregate.counters.storage_owner_qdi_remote_handler_ns},
-    {"storage_owner_qdi_remote_handler_avg_ns",
-     aggregate.counters.storage_owner_qdi_successes == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_qdi_remote_handler_ns) /
-           static_cast<double>(aggregate.counters.storage_owner_qdi_successes)},
-    {"storage_owner_qdi_remote_expanded_nodes",
-     aggregate.counters.storage_owner_qdi_remote_expanded_nodes},
-    {"storage_owner_qdi_remote_approx_scores",
-     aggregate.counters.storage_owner_qdi_remote_approx_scores},
-    {"storage_owner_qdi_remote_exact_reads",
-     aggregate.counters.storage_owner_qdi_remote_exact_reads},
-    {"storage_owner_qdi_remote_neighbor_reads",
-     aggregate.counters.storage_owner_qdi_remote_neighbor_reads},
-    {"storage_owner_qdi_response_candidates",
-     aggregate.counters.storage_owner_qdi_response_candidates},
-    {"storage_owner_qdi_remote_expanded_per_rpc",
-     aggregate.counters.storage_owner_qdi_successes == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_qdi_remote_expanded_nodes) /
-           static_cast<double>(aggregate.counters.storage_owner_qdi_successes)},
-    {"storage_owner_qdi_remote_approx_scores_per_rpc",
-     aggregate.counters.storage_owner_qdi_successes == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_qdi_remote_approx_scores) /
-           static_cast<double>(aggregate.counters.storage_owner_qdi_successes)},
-    {"storage_owner_qdi_remote_exact_reads_per_rpc",
-     aggregate.counters.storage_owner_qdi_successes == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_qdi_remote_exact_reads) /
-           static_cast<double>(aggregate.counters.storage_owner_qdi_successes)},
     {"lock_attempts", aggregate.lock_attempts},
     {"lock_retries", aggregate.lock_retries},
     {"cas_failures", aggregate.cas_failures},

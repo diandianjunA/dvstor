@@ -99,7 +99,6 @@ set(DVSTOR_MEMORY_NODE_SOURCES
     src/memory_node/memory_node.cc
     src/memory_node/peer_rdma.cc
     src/memory_node/peer_rpc.cc
-    src/memory_node/storage_owner_handoff.cc
     src/memory_node/storage_owner_index.cc
     src/memory_node/storage_owner_runtime.cc
 )

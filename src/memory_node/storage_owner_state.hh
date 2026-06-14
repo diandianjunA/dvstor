@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <deque>
 #include <memory>
 
 #include <library/context.hh>
@@ -54,6 +53,60 @@ struct NodeSnapshot {
   vec<byte_t> vector_data;
 };
 
+struct QirCodeEntry {
+  QirCodeEntry() = default;
+  QirCodeEntry(const vec<byte_t>& value) : bytes(std::make_shared<vec<byte_t>>(value)) {}
+  QirCodeEntry(vec<byte_t>&& value) : bytes(std::make_shared<vec<byte_t>>(std::move(value))) {}
+
+  QirCodeEntry& operator=(const vec<byte_t>& value) {
+    bytes = std::make_shared<vec<byte_t>>(value);
+    return *this;
+  }
+
+  QirCodeEntry& operator=(vec<byte_t>&& value) {
+    bytes = std::make_shared<vec<byte_t>>(std::move(value));
+    return *this;
+  }
+
+  void resize(size_t size) {
+    ensure_unique();
+    bytes->resize(size);
+  }
+
+  byte_t* data() {
+    return bytes == nullptr ? nullptr : bytes->data();
+  }
+
+  const byte_t* data() const { return bytes == nullptr ? nullptr : bytes->data(); }
+  size_t size() const { return bytes == nullptr ? 0 : bytes->size(); }
+  bool empty() const { return size() == 0; }
+
+ private:
+  void ensure_unique() {
+    if (bytes == nullptr) {
+      bytes = std::make_shared<vec<byte_t>>();
+    } else if (!bytes.unique()) {
+      bytes = std::make_shared<vec<byte_t>>(*bytes);
+    }
+  }
+
+  std::shared_ptr<vec<byte_t>> bytes;
+};
+
+struct QirCodeSnapshot {
+  RemotePtr rptr;
+  u32 generation{};
+  bool deleted{};
+  bool prefix_validated{};
+  QirCodeEntry entry;
+};
+
+struct QirDistanceInterval {
+  distance_t estimate{};
+  distance_t lower{};
+  distance_t upper{};
+};
+
 struct InsertRuntimeState {
   HugePage<byte_t> buffer;
   std::unique_ptr<LocalMemoryRegion> region;
@@ -68,73 +121,10 @@ struct PeerRpcRuntimeState {
   size_t message_bytes{};
   size_t recv_region_bytes{};
   size_t sync_send_offset{};
-  size_t async_send_offset{};
   u32 recv_slots_per_peer{1};
-  u32 send_slots_per_peer{1};
 };
 
 struct StorageOwnerThread;
-
-enum class HandoffResultStatus : u8 {
-  pending = 0,
-  ok,
-  overloaded,
-  queue_full,
-  timeout,
-  shutdown,
-  failed,
-};
-
-struct HandoffResult {
-  HandoffResultStatus status{HandoffResultStatus::failed};
-  vec<byte_t> response;
-  u64 queue_wait_ns{};
-  u64 send_ns{};
-  u64 response_wait_ns{};
-
-  bool ok() const { return status == HandoffResultStatus::ok; }
-};
-
-struct HandoffRequestState {
-  u64 request_id{};
-  u32 target_shard{};
-  StorageOwnerThread* thread{};
-  u32 coroutine_id{};
-  vec<byte_t> request;
-  vec<byte_t> response;
-  std::chrono::steady_clock::time_point queued_at{};
-  std::chrono::steady_clock::time_point deadline{};
-  std::chrono::steady_clock::time_point send_posted_at{};
-  std::chrono::steady_clock::time_point send_completed_at{};
-  std::chrono::steady_clock::time_point response_completed_at{};
-  HandoffResultStatus status{HandoffResultStatus::pending};
-  bool sent{};
-  std::atomic<bool> completed{false};
-};
-
-struct HandoffResponseTask {
-  u32 target_shard{};
-  vec<byte_t> payload;
-};
-
-struct HandoffSendSlot {
-  bool in_use{};
-  bool response_only{};
-  u32 peer_id{};
-  u32 slot_id{};
-  u64 wr_id{};
-  std::shared_ptr<HandoffRequestState> request;
-};
-
-struct PeerHandoffState {
-  std::deque<std::shared_ptr<HandoffRequestState>> request_queue;
-  std::deque<HandoffResponseTask> response_queue;
-  vec<HandoffSendSlot> send_slots;
-  std::deque<u32> free_slots;
-  u32 inflight_requests{};
-  u32 max_queue_depth{};
-  u32 max_inflight_requests{};
-};
 
 struct PeerPendingSend {
   u32 target_shard{};
@@ -217,6 +207,12 @@ struct FreshnessEntry {
   RemotePtr current;
   u32 generation{};
   bool deleted{};
+};
+
+struct QirAuditTask {
+  vec<element_t> source;
+  RemotePtr medoid;
+  vec<RemotePtr> selected;
 };
 
 }  // namespace memory_node_detail

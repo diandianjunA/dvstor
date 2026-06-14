@@ -73,7 +73,6 @@ public:
   u32 storage_owner_peer_rdma_tokens{8};
   u32 storage_owner_rpc_depth{8};
   u32 storage_owner_rpc_timeout_ms{30000};
-  u32 storage_owner_handoff_queue_depth{};
   u32 storage_owner_construction_beam_width{128};
   u32 storage_owner_search_snapshot_batch{64};
   u32 storage_owner_prune_max_candidates{128};
@@ -81,12 +80,13 @@ public:
   u32 storage_owner_reverse_queue_depth{65536};
   u32 storage_owner_reverse_flush_us{200};
   u32 storage_owner_reverse_coalesce_max{256};
-  bool storage_owner_transitive_search{false};
   str storage_owner_search_mode{"exact_rdma"};
-  u32 storage_owner_qdi_local_beam{128};
-  u32 storage_owner_qdi_return_candidates{128};
-  u32 storage_owner_qdi_exact_candidates{64};
-  u32 storage_owner_qdi_entry_points{16};
+  u32 qir_exact_budget{16};
+  u32 qir_audit_rate{64};
+  u32 qir_cache_mb{512};
+  bool qir_enable_prune{true};
+  f64 qir_backlog_sync_threshold{0.75};
+  f64 qir_uncertain_ratio_threshold{0.35};
 
   // Legacy aliases for compatibility
   u32& ef_search = beam_width;
@@ -114,9 +114,6 @@ public:
     insert_execution = normalize_mode(insert_execution);
     storage_owner_reverse_mode = normalize_mode(storage_owner_reverse_mode);
     storage_owner_search_mode = normalize_mode(storage_owner_search_mode);
-    if (storage_owner_transitive_search && storage_owner_search_mode == "exact_rdma") {
-      storage_owner_search_mode = "transitive_handoff";
-    }
 
     if (!is_server) {
       validate_compute_node_options(argv);
@@ -193,9 +190,6 @@ private:
       "storage-owner-rpc-timeout-ms",
       po::value<u32>(&storage_owner_rpc_timeout_ms)->default_value(storage_owner_rpc_timeout_ms),
       "Maximum time to wait for one storage_owner insert RPC response.")(
-      "storage-owner-handoff-queue-depth",
-      po::value<u32>(&storage_owner_handoff_queue_depth)->default_value(storage_owner_handoff_queue_depth),
-      "Maximum queued handoff requests per peer. 0 uses 4x --storage-owner-rpc-depth.")(
       "storage-owner-construction-beam-width",
       po::value<u32>(&storage_owner_construction_beam_width)->default_value(storage_owner_construction_beam_width),
       "Storage-owner online construction beam width. 0 uses --beam-width-construction unchanged.")(
@@ -217,24 +211,27 @@ private:
       "storage-owner-reverse-coalesce-max",
       po::value<u32>(&storage_owner_reverse_coalesce_max)->default_value(storage_owner_reverse_coalesce_max),
       "Maximum reverse-update operations coalesced by one peer worker batch.")(
-      "storage-owner-transitive-search",
-      po::bool_switch(&storage_owner_transitive_search)->default_value(false),
-      "Use transitive (RPC-based) beam search for storage_owner inserts instead of fine-grained RDMA reads.")(
       "storage-owner-search-mode",
       po::value<str>(&storage_owner_search_mode)->default_value(storage_owner_search_mode),
-      "Storage-owner insert search mode: exact_rdma, transitive_handoff, or qdi.")(
-      "storage-owner-qdi-local-beam",
-      po::value<u32>(&storage_owner_qdi_local_beam)->default_value(storage_owner_qdi_local_beam),
-      "QDI local quantized beam expansions per shard.")(
-      "storage-owner-qdi-return-candidates",
-      po::value<u32>(&storage_owner_qdi_return_candidates)->default_value(storage_owner_qdi_return_candidates),
-      "QDI candidates returned per shard after local quantized search.")(
-      "storage-owner-qdi-exact-candidates",
-      po::value<u32>(&storage_owner_qdi_exact_candidates)->default_value(storage_owner_qdi_exact_candidates),
-      "QDI top local candidates exactified before returning to the owner shard.")(
-      "storage-owner-qdi-entry-points",
-      po::value<u32>(&storage_owner_qdi_entry_points)->default_value(storage_owner_qdi_entry_points),
-      "QDI sampled local entry points scored by RaBitQ before shard-local search.")(
+      "Storage-owner insert search mode: exact_rdma or qir.")(
+      "qir-exact-budget",
+      po::value<u32>(&qir_exact_budget)->default_value(qir_exact_budget),
+      "Maximum QIR foreground exact vector reads for uncertain prune candidates.")(
+      "qir-audit-rate",
+      po::value<u32>(&qir_audit_rate)->default_value(qir_audit_rate),
+      "Run one QIR exact shadow audit every N inserts. 0 disables audit.")(
+      "qir-cache-mb",
+      po::value<u32>(&qir_cache_mb)->default_value(qir_cache_mb),
+      "Bounded storage-owner QIR qcode read-through cache size in MiB.")(
+      "qir-enable-prune",
+      po::value<bool>(&qir_enable_prune)->default_value(qir_enable_prune),
+      "Use quantized interval RobustPrune in QIR. False keeps QIR search with exact prune.")(
+      "qir-backlog-sync-threshold",
+      po::value<f64>(&qir_backlog_sync_threshold)->default_value(qir_backlog_sync_threshold),
+      "Repair queue occupancy ratio that forces foreground synchronous repair in QIR.")(
+      "qir-uncertain-ratio-threshold",
+      po::value<f64>(&qir_uncertain_ratio_threshold)->default_value(qir_uncertain_ratio_threshold),
+      "Uncertain prune candidate ratio that falls back to exact RobustPrune in QIR.")(
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
@@ -404,22 +401,21 @@ private:
         std::cerr << "[ERROR]: --storage-owner-reverse-coalesce-max must be > 0" << std::endl;
         exit_with_help_message(argv);
       }
-      if (storage_owner_search_mode != "exact_rdma" &&
-          storage_owner_search_mode != "transitive_handoff" &&
-          storage_owner_search_mode != "qdi") {
-        std::cerr << "[ERROR]: --storage-owner-search-mode must be exact_rdma, "
-                     "transitive_handoff, or qdi" << std::endl;
+      if (storage_owner_search_mode != "exact_rdma" && storage_owner_search_mode != "qir") {
+        std::cerr << "[ERROR]: --storage-owner-search-mode must be exact_rdma or qir" << std::endl;
         exit_with_help_message(argv);
       }
-      if (storage_owner_search_mode == "qdi" && ip_distance) {
-        std::cerr << "[ERROR]: --storage-owner-search-mode=qdi currently supports L2 distance only" << std::endl;
+      if (storage_owner_search_mode == "qir" && ip_distance) {
+        std::cerr << "[ERROR]: --storage-owner-search-mode=qir currently supports L2 distance only" << std::endl;
         exit_with_help_message(argv);
       }
-      if (storage_owner_qdi_local_beam == 0 ||
-          storage_owner_qdi_return_candidates == 0 ||
-          storage_owner_qdi_exact_candidates == 0 ||
-          storage_owner_qdi_entry_points == 0) {
-        std::cerr << "[ERROR]: storage-owner QDI parameters must be > 0" << std::endl;
+      if (storage_owner_search_mode == "qir" && qir_exact_budget == 0) {
+        std::cerr << "[ERROR]: --qir-exact-budget must be > 0" << std::endl;
+        exit_with_help_message(argv);
+      }
+      if (qir_backlog_sync_threshold < 0.0 || qir_backlog_sync_threshold > 1.0 ||
+          qir_uncertain_ratio_threshold < 0.0 || qir_uncertain_ratio_threshold > 1.0) {
+        std::cerr << "[ERROR]: QIR ratio thresholds must be in [0, 1]" << std::endl;
         exit_with_help_message(argv);
       }
       if (storage_peers.size() != num_server_nodes()) {
@@ -453,10 +449,10 @@ public:
   }
 
   bool use_storage_owner_insert() const { return insert_execution == "storage_owner"; }
-  bool use_storage_owner_transitive_search() const {
-    return storage_owner_search_mode == "transitive_handoff";
+  bool use_storage_owner_qir_search() const { return storage_owner_search_mode == "qir"; }
+  bool use_storage_owner_qir_prune() const {
+    return use_storage_owner_qir_search() && qir_enable_prune;
   }
-  bool use_storage_owner_qdi_search() const { return storage_owner_search_mode == "qdi"; }
 
   friend std::ostream& operator<<(std::ostream& os, const IndexConfiguration& config) {
     os << static_cast<const Configuration&>(config);
@@ -493,8 +489,6 @@ public:
         os << std::setw(width) << "storage batch wait(us): " << config.storage_owner_batch_wait_us << std::endl;
         os << std::setw(width) << "storage peer RDMA tokens: " << config.storage_owner_peer_rdma_tokens << std::endl;
         os << std::setw(width) << "storage RPC depth: " << config.storage_owner_rpc_depth << std::endl;
-        os << std::setw(width) << "storage handoff queue depth: "
-           << config.storage_owner_handoff_queue_depth << std::endl;
         os << std::setw(width) << "storage RPC timeout(ms): " << config.storage_owner_rpc_timeout_ms << std::endl;
         os << std::setw(width) << "storage construction beam: "
            << config.storage_owner_construction_beam_width << std::endl;
@@ -509,17 +503,16 @@ public:
            << config.storage_owner_reverse_flush_us << std::endl;
         os << std::setw(width) << "storage reverse coalesce max: "
            << config.storage_owner_reverse_coalesce_max << std::endl;
-        os << std::setw(width) << "storage transitive search: "
-           << (config.storage_owner_transitive_search ? "true" : "false") << std::endl;
         os << std::setw(width) << "storage search mode: " << config.storage_owner_search_mode << std::endl;
-        os << std::setw(width) << "storage QDI local beam: "
-           << config.storage_owner_qdi_local_beam << std::endl;
-        os << std::setw(width) << "storage QDI return cand: "
-           << config.storage_owner_qdi_return_candidates << std::endl;
-        os << std::setw(width) << "storage QDI exact cand: "
-           << config.storage_owner_qdi_exact_candidates << std::endl;
-        os << std::setw(width) << "storage QDI entry points: "
-           << config.storage_owner_qdi_entry_points << std::endl;
+        os << std::setw(width) << "QIR exact budget: " << config.qir_exact_budget << std::endl;
+        os << std::setw(width) << "QIR audit rate: " << config.qir_audit_rate << std::endl;
+        os << std::setw(width) << "QIR cache MB: " << config.qir_cache_mb << std::endl;
+        os << std::setw(width) << "QIR quantized prune: "
+           << config.qir_enable_prune << std::endl;
+        os << std::setw(width) << "QIR backlog sync: "
+           << config.qir_backlog_sync_threshold << std::endl;
+        os << std::setw(width) << "QIR uncertain ratio: "
+           << config.qir_uncertain_ratio_threshold << std::endl;
         os << std::setw(width) << "storage peers: " << "[";
         for (const str& node : config.storage_peers) {
           os << node << ", ";

@@ -34,6 +34,19 @@ Optimization profiles:
 ./evaluation/sift1b/run_breakdown.sh gpudirect_rdma_storage_owner
 ```
 
+QIR Direct Insert profiles:
+
+```bash
+./evaluation/sift1b/run_breakdown.sh gpudirect_rdma_storage_owner_rabitq
+./evaluation/sift1b/run_breakdown.sh gpudirect_rdma_storage_owner_rabitq_qir_search_only
+./evaluation/sift1b/run_breakdown.sh gpudirect_rdma_storage_owner_rabitq_qir_prune
+./evaluation/sift1b/run_breakdown.sh gpudirect_rdma_storage_owner_rabitq_qir
+```
+
+These profiles isolate quantized search, quantized RobustPrune, and bounded
+asynchronous repair. The full profile also enables exact shadow audits and emits
+QIR qcode, exact-read, repair-queue, and audit counters in breakdown JSON.
+
 ## Common Overrides
 
 ```bash

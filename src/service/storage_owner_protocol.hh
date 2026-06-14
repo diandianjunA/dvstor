@@ -8,6 +8,8 @@ namespace service::storage_owner {
 constexpr u32 kInsertMagic = 0x53494e54;  // "SINT"
 constexpr u32 kMutationMagic = 0x4d555444;  // D T U M / "DUTM"
 constexpr u32 kPeerRpcMagic = 0x53505250;  // "SPRP"
+constexpr u32 kReverseUpdatePriority = 1u;
+constexpr u32 kReverseUpdateReachability = 1u << 1;
 
 enum class InsertStatus : u32 {
   ok = 0,
@@ -32,10 +34,6 @@ enum class MutationStatus : u32 {
 enum class PeerRpcType : u32 {
   reverse_update_request = 1,
   reverse_update_response = 2,
-  search_handoff_request = 3,
-  search_handoff_response = 4,
-  qdi_search_request = 5,
-  qdi_search_response = 6,
 };
 
 struct InsertBatchRequestHeader {
@@ -94,44 +92,26 @@ struct InsertBreakdownCounters {
   u64 storage_owner_search_distance_ns{};
   u64 storage_owner_search_beam_update_ns{};
   u64 storage_owner_search_result_sort_ns{};
-  u64 storage_owner_handoff_queue_wait_ns{};
-  u64 storage_owner_handoff_send_ns{};
-  u64 storage_owner_handoff_response_wait_ns{};
   u64 storage_owner_prune_snapshot_read_ns{};
   u64 storage_owner_prune_distance_ns{};
   u64 storage_owner_prune_sort_ns{};
   u64 storage_owner_prune_pair_distance_ns{};
 
-  u64 storage_owner_handoff_requests{};
-  u64 storage_owner_handoff_successes{};
-  u64 storage_owner_handoff_queue_full{};
-  u64 storage_owner_handoff_timeouts{};
-  u64 storage_owner_handoff_overloaded{};
-  u64 storage_owner_handoff_failed{};
-  u64 storage_owner_handoff_request_bytes{};
-  u64 storage_owner_handoff_response_bytes{};
-  u64 storage_owner_handoff_remote_handler_ns{};
-  u64 storage_owner_handoff_remote_expanded_nodes{};
-  u64 storage_owner_handoff_remote_snapshot_reads{};
-  u64 storage_owner_handoff_remote_neighbor_reads{};
-  u64 storage_owner_handoff_response_beam_entries{};
-  u64 storage_owner_handoff_response_visited_entries{};
-  u64 storage_owner_handoff_response_visited_truncated{};
-
-  u64 storage_owner_qdi_requests{};
-  u64 storage_owner_qdi_successes{};
-  u64 storage_owner_qdi_queue_full{};
-  u64 storage_owner_qdi_timeouts{};
-  u64 storage_owner_qdi_overloaded{};
-  u64 storage_owner_qdi_failed{};
-  u64 storage_owner_qdi_request_bytes{};
-  u64 storage_owner_qdi_response_bytes{};
-  u64 storage_owner_qdi_remote_handler_ns{};
-  u64 storage_owner_qdi_remote_expanded_nodes{};
-  u64 storage_owner_qdi_remote_approx_scores{};
-  u64 storage_owner_qdi_remote_exact_reads{};
-  u64 storage_owner_qdi_remote_neighbor_reads{};
-  u64 storage_owner_qdi_response_candidates{};
+  u64 qir_qcode_rdma_ops{};
+  u64 qir_qcode_rdma_bytes{};
+  u64 qir_qcode_cache_hits{};
+  u64 qir_qcode_cache_misses{};
+  u64 qir_exact_reads{};
+  u64 qir_exact_reads_avoided{};
+  u64 qir_uncertain_candidates{};
+  u64 qir_prune_fallbacks{};
+  u64 qir_repair_intents{};
+  u64 qir_repair_queue_delay_ns{};
+  u64 qir_repair_applied_edges{};
+  u64 qir_repair_stale_skips{};
+  u64 qir_sync_repair_fallbacks{};
+  u64 qir_audit_samples{};
+  u64 qir_audit_disagreements{};
 
   u64 total() const {
     return storage_owner_queue_wait_ns +
@@ -159,6 +139,9 @@ struct PeerRpcHeader {
 struct ReverseUpdateOp {
   u64 target_raw{};
   u64 candidate_raw{};
+  u32 candidate_generation{};
+  u32 reserved{};  // kReverseUpdatePriority for audit-prioritized repair.
+  u64 source_insert_id{};
 };
 
 inline size_t insert_batch_request_bytes(u32 item_count, u32 dim) {
@@ -180,9 +163,7 @@ inline size_t insert_batch_response_bytes(u32 item_count) {
   return sizeof(InsertBatchResponseHeader) +
          static_cast<size_t>(item_count) * sizeof(u32) +
          static_cast<size_t>(item_count) * sizeof(MutationResult) +
-         sizeof(InsertBreakdownCounters) +
-         sizeof(u32) +
-         static_cast<size_t>(item_count) * VamanaNode::R * sizeof(u64);
+         sizeof(InsertBreakdownCounters);
 }
 
 inline node_t* request_ids(void* payload) {
@@ -261,26 +242,6 @@ inline const InsertBreakdownCounters* response_breakdown(const void* payload, u3
     reinterpret_cast<const byte_t*>(response_mutation_results(payload, item_count) + item_count));
 }
 
-inline u32* response_invalidation_count(void* payload, u32 item_count) {
-  return reinterpret_cast<u32*>(reinterpret_cast<byte_t*>(response_breakdown(payload, item_count) + 1));
-}
-
-inline const u32* response_invalidation_count(const void* payload, u32 item_count) {
-  return reinterpret_cast<const u32*>(reinterpret_cast<const byte_t*>(response_breakdown(payload, item_count) + 1));
-}
-
-inline u64* response_invalidated_raws(void* payload, u32 item_count) {
-  return reinterpret_cast<u64*>(response_invalidation_count(payload, item_count) + 1);
-}
-
-inline const u64* response_invalidated_raws(const void* payload, u32 item_count) {
-  return reinterpret_cast<const u64*>(response_invalidation_count(payload, item_count) + 1);
-}
-
-inline u32 response_invalidation_capacity(u32 item_count) {
-  return item_count * VamanaNode::R;
-}
-
 inline size_t reverse_update_request_bytes(u32 item_count) {
   return sizeof(PeerRpcHeader) + static_cast<size_t>(item_count) * sizeof(ReverseUpdateOp);
 }
@@ -295,135 +256,6 @@ inline ReverseUpdateOp* reverse_update_ops(void* payload) {
 
 inline const ReverseUpdateOp* reverse_update_ops(const void* payload) {
   return reinterpret_cast<const ReverseUpdateOp*>(reinterpret_cast<const byte_t*>(payload) + sizeof(PeerRpcHeader));
-}
-
-struct __attribute__((packed)) BeamEntrySerialized {
-  u64 rptr_raw;
-  float distance;
-};
-static_assert(sizeof(BeamEntrySerialized) == 12, "BeamEntrySerialized must be 12 bytes");
-
-struct SearchHandoffRequestHeader {
-  PeerRpcHeader rpc;
-  u32 beam_width;
-  u32 snapshot_batch;
-  u32 originator_shard;
-  u32 visited_count;
-  u32 vector_bytes;
-  u32 reserved;
-};
-
-struct SearchHandoffResponseHeader {
-  PeerRpcHeader rpc;
-  u32 updated_beam_count;
-  u32 new_visited_count;
-  u32 total_visited_count;
-  u32 visited_truncated_count;
-  u64 handler_cpu_ns;
-  u32 local_expanded_count;
-  u32 local_snapshot_reads;
-  u32 local_neighbor_reads;
-  u32 reserved;
-};
-
-inline size_t search_handoff_request_bytes(u32 beam_count, u32 visited_count, u32 vector_bytes) {
-  return sizeof(SearchHandoffRequestHeader) +
-         static_cast<size_t>(vector_bytes) +
-         static_cast<size_t>(beam_count) * sizeof(BeamEntrySerialized) +
-         static_cast<size_t>(visited_count) * sizeof(u64);
-}
-
-inline size_t search_handoff_response_bytes(u32 beam_count, u32 visited_count) {
-  return sizeof(SearchHandoffResponseHeader) +
-         static_cast<size_t>(beam_count) * sizeof(BeamEntrySerialized) +
-         static_cast<size_t>(visited_count) * sizeof(u64);
-}
-
-inline byte_t* handoff_query_vector(void* payload) {
-  return reinterpret_cast<byte_t*>(reinterpret_cast<SearchHandoffRequestHeader*>(payload) + 1);
-}
-
-inline const byte_t* handoff_query_vector(const void* payload) {
-  return reinterpret_cast<const byte_t*>(reinterpret_cast<const SearchHandoffRequestHeader*>(payload) + 1);
-}
-
-inline BeamEntrySerialized* handoff_request_beam(void* payload, u32 vector_bytes) {
-  return reinterpret_cast<BeamEntrySerialized*>(handoff_query_vector(payload) + vector_bytes);
-}
-
-inline const BeamEntrySerialized* handoff_request_beam(const void* payload, u32 vector_bytes) {
-  return reinterpret_cast<const BeamEntrySerialized*>(handoff_query_vector(payload) + vector_bytes);
-}
-
-inline byte_t* handoff_request_visited(void* payload, u32 vector_bytes, u32 beam_count) {
-  return reinterpret_cast<byte_t*>(handoff_request_beam(payload, vector_bytes) + beam_count);
-}
-
-inline const byte_t* handoff_request_visited(const void* payload, u32 vector_bytes, u32 beam_count) {
-  return reinterpret_cast<const byte_t*>(handoff_request_beam(payload, vector_bytes) + beam_count);
-}
-
-inline BeamEntrySerialized* handoff_response_beam(void* payload) {
-  return reinterpret_cast<BeamEntrySerialized*>(reinterpret_cast<SearchHandoffResponseHeader*>(payload) + 1);
-}
-
-inline const BeamEntrySerialized* handoff_response_beam(const void* payload) {
-  return reinterpret_cast<const BeamEntrySerialized*>(reinterpret_cast<const SearchHandoffResponseHeader*>(payload) + 1);
-}
-
-inline byte_t* handoff_response_visited(void* payload, u32 beam_count) {
-  return reinterpret_cast<byte_t*>(handoff_response_beam(payload) + beam_count);
-}
-
-inline const byte_t* handoff_response_visited(const void* payload, u32 beam_count) {
-  return reinterpret_cast<const byte_t*>(handoff_response_beam(payload) + beam_count);
-}
-
-struct QdiSearchRequestHeader {
-  PeerRpcHeader rpc;
-  u32 local_beam_width;
-  u32 result_count;
-  u32 exact_count;
-  u32 entry_points;
-  u32 vector_bytes;
-  u32 reserved;
-  u64 medoid_raw;
-};
-
-struct QdiSearchResponseHeader {
-  PeerRpcHeader rpc;
-  u32 candidate_count;
-  u32 expanded_count;
-  u32 approximate_score_count;
-  u32 exact_read_count;
-  u32 neighbor_read_count;
-  u32 reserved;
-  u64 handler_cpu_ns;
-};
-
-inline size_t qdi_search_request_bytes(u32 vector_bytes) {
-  return sizeof(QdiSearchRequestHeader) + static_cast<size_t>(vector_bytes);
-}
-
-inline size_t qdi_search_response_bytes(u32 candidate_count) {
-  return sizeof(QdiSearchResponseHeader) +
-         static_cast<size_t>(candidate_count) * sizeof(BeamEntrySerialized);
-}
-
-inline byte_t* qdi_query_vector(void* payload) {
-  return reinterpret_cast<byte_t*>(reinterpret_cast<QdiSearchRequestHeader*>(payload) + 1);
-}
-
-inline const byte_t* qdi_query_vector(const void* payload) {
-  return reinterpret_cast<const byte_t*>(reinterpret_cast<const QdiSearchRequestHeader*>(payload) + 1);
-}
-
-inline BeamEntrySerialized* qdi_response_candidates(void* payload) {
-  return reinterpret_cast<BeamEntrySerialized*>(reinterpret_cast<QdiSearchResponseHeader*>(payload) + 1);
-}
-
-inline const BeamEntrySerialized* qdi_response_candidates(const void* payload) {
-  return reinterpret_cast<const BeamEntrySerialized*>(reinterpret_cast<const QdiSearchResponseHeader*>(payload) + 1);
 }
 
 }  // namespace service::storage_owner
