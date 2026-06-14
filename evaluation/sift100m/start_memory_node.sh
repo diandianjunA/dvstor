@@ -60,6 +60,34 @@ cmd=("$BUILD_DIR/dvstor_memory_node"
 
 if [[ "$INSERT_EXECUTION" == "storage_owner" ]]; then
   cmd+=(--storage-peers "${SERVER_ARGS[@]}")
+  cmd+=(--storage-owner-batch-max "${STORAGE_OWNER_BATCH_MAX:-32}")
+  cmd+=(--storage-owner-batch-wait-us "${STORAGE_OWNER_BATCH_WAIT_US:-100}")
+  cmd+=(--storage-owner-peer-rdma-tokens "${STORAGE_OWNER_PEER_RDMA_TOKENS:-8}")
+  cmd+=(--storage-owner-rpc-depth "${STORAGE_OWNER_RPC_DEPTH:-16}")
+  cmd+=(--storage-owner-rpc-timeout-ms "${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}")
+  cmd+=(--storage-owner-handoff-queue-depth "${STORAGE_OWNER_HANDOFF_QUEUE_DEPTH:-0}")
+  cmd+=(--storage-owner-construction-beam-width "${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-$BUILD_BEAM}")
+  cmd+=(--storage-owner-search-snapshot-batch "${STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH:-64}")
+  cmd+=(--storage-owner-prune-max-candidates "${STORAGE_OWNER_PRUNE_MAX_CANDIDATES:-128}")
+  cmd+=(--storage-owner-reverse-mode "${STORAGE_OWNER_REVERSE_MODE:-async}")
+  cmd+=(--storage-owner-reverse-queue-depth "${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}")
+  cmd+=(--storage-owner-reverse-flush-us "${STORAGE_OWNER_REVERSE_FLUSH_US:-200}")
+  cmd+=(--storage-owner-reverse-coalesce-max "${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}")
+  if [[ -n "${STORAGE_OWNER_SEARCH_MODE:-}" ]]; then
+    cmd+=(--storage-owner-search-mode "$STORAGE_OWNER_SEARCH_MODE")
+  fi
+  if [[ -n "${STORAGE_OWNER_QDI_LOCAL_BEAM:-}" ]]; then
+    cmd+=(--storage-owner-qdi-local-beam "$STORAGE_OWNER_QDI_LOCAL_BEAM")
+  fi
+  if [[ -n "${STORAGE_OWNER_QDI_RETURN_CANDIDATES:-}" ]]; then
+    cmd+=(--storage-owner-qdi-return-candidates "$STORAGE_OWNER_QDI_RETURN_CANDIDATES")
+  fi
+  if [[ -n "${STORAGE_OWNER_QDI_EXACT_CANDIDATES:-}" ]]; then
+    cmd+=(--storage-owner-qdi-exact-candidates "$STORAGE_OWNER_QDI_EXACT_CANDIDATES")
+  fi
+  if [[ -n "${STORAGE_OWNER_QDI_ENTRY_POINTS:-}" ]]; then
+    cmd+=(--storage-owner-qdi-entry-points "$STORAGE_OWNER_QDI_ENTRY_POINTS")
+  fi
   if [[ "${STORAGE_OWNER_TRANSITIVE_SEARCH:-0}" == "1" ]]; then
     cmd+=(--storage-owner-transitive-search)
   fi
