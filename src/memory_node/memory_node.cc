@@ -232,6 +232,15 @@ MemoryNode::InsertBreakdownCounters MemoryNode::scale_breakdown(const InsertBrea
   out.storage_owner_prune_sort_ns = scale_ns(counters.storage_owner_prune_sort_ns, part, total);
   out.storage_owner_prune_pair_distance_ns =
     scale_ns(counters.storage_owner_prune_pair_distance_ns, part, total);
+  out.storage_owner_anchor_hints = scale_ns(counters.storage_owner_anchor_hints, part, total);
+  out.storage_owner_anchor_valid_hints = scale_ns(counters.storage_owner_anchor_valid_hints, part, total);
+  out.storage_owner_anchor_expansions = scale_ns(counters.storage_owner_anchor_expansions, part, total);
+  out.storage_owner_anchor_remote_expansions =
+    scale_ns(counters.storage_owner_anchor_remote_expansions, part, total);
+  out.storage_owner_anchor_fallbacks = scale_ns(counters.storage_owner_anchor_fallbacks, part, total);
+  out.storage_owner_anchor_audits = scale_ns(counters.storage_owner_anchor_audits, part, total);
+  out.storage_owner_anchor_audit_failures =
+    scale_ns(counters.storage_owner_anchor_audit_failures, part, total);
   return out;
 }
 

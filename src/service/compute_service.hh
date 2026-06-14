@@ -24,6 +24,7 @@
 #include "service/storage_owner_protocol.hh"
 #include "service/index_metadata.hh"
 #include "vamana/storage_layout_resolver.hh"
+#include "vamana/anchor_index.hh"
 #include "vamana/vamana.hh"
 #include "worker_pool.hh"
 
@@ -134,6 +135,7 @@ private:
     std::promise<bool> result;
     std::chrono::steady_clock::time_point enqueued_at{};
     std::chrono::steady_clock::time_point sender_dequeued_at{};
+    vec<RemotePtr> anchor_hints;
   };
 
   struct StorageOwnerRpcSlot {
@@ -210,8 +212,11 @@ private:
   bool initialize_compute_side_idmap(const filepath_t& index_prefix,
                                      const service::index_metadata::Metadata& metadata);
   bool mark_remote_deleted(RemotePtr ptr);
-  void publish_compute_side_id(node_t id, RemotePtr ptr, bool deleted);
+  void publish_compute_side_id(node_t id, RemotePtr ptr, bool deleted, u32 owner_storage);
   bool lookup_compute_side_id(node_t id, RemotePtr* ptr, bool* deleted = nullptr) const;
+  u32 storage_owner_for_id(node_t id) const;
+  vamana::anchor::Route route_storage_owner_update(const InsertItem& item,
+                                                    std::optional<u32> owner_override = std::nullopt) const;
   bool routing_enabled() const;
   size_t rpc_message_size() const;
   vec<element_t> compute_local_routing_centroid() const;
@@ -262,6 +267,7 @@ private:
 
   std::unique_ptr<vamana::Vamana<Distance>> vamana_;
   std::unique_ptr<vamana::rabitq::Cache> rabitq_cache_;
+  std::unique_ptr<vamana::anchor::Index> anchor_index_;
   std::unique_ptr<WorkerPool> worker_pool_;
   ServiceProfile service_profile_{};
   service::InsertQueue insert_queue_;
@@ -277,6 +283,7 @@ private:
   struct ComputeSideIdEntry {
     RemotePtr ptr;
     bool deleted{};
+    u32 owner_storage{};
   };
   mutable std::mutex compute_side_idmap_mutex_;
   hashmap_t<node_t, ComputeSideIdEntry> compute_side_idmap_;

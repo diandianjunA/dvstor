@@ -38,4 +38,8 @@ inline filepath_t owner_idmap_file(const filepath_t& prefix, size_t node_ordinal
                     std::to_string(num_nodes) + ".idmap");
 }
 
+inline filepath_t anchor_file(const filepath_t& prefix) {
+  return filepath_t(prefix.string() + ".anchors");
+}
+
 }  // namespace index_path

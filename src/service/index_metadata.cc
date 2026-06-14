@@ -76,6 +76,8 @@ bool load_metadata(const filepath_t& index_prefix, Metadata& metadata, str* erro
       json.value("hot_graph_dynamic_hot_offset", 0u);
     metadata.allocation_size = json.value("allocation_size", metadata.node_size);
     metadata.idmap_format = json.value("idmap_format", str{});
+    metadata.anchor_format = json.value("anchor_format", str{});
+    metadata.anchor_count_per_shard = json.value("anchor_count_per_shard", 0u);
   } catch (const std::exception& e) {
     return fail(error_message, "failed to parse index metadata " + metadata_file.string() + ": " + e.what());
   }

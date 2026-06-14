@@ -121,6 +121,15 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"rabitq_prefetch_misses", aggregate.counters.rabitq_prefetch_misses},
     {"rabitq_prefetch_disabled_queries",
      aggregate.counters.rabitq_prefetch_disabled_queries},
+    {"storage_owner_anchor_hints", aggregate.counters.storage_owner_anchor_hints},
+    {"storage_owner_anchor_valid_hints", aggregate.counters.storage_owner_anchor_valid_hints},
+    {"storage_owner_anchor_expansions", aggregate.counters.storage_owner_anchor_expansions},
+    {"storage_owner_anchor_remote_expansions",
+     aggregate.counters.storage_owner_anchor_remote_expansions},
+    {"storage_owner_anchor_fallbacks", aggregate.counters.storage_owner_anchor_fallbacks},
+    {"storage_owner_anchor_audits", aggregate.counters.storage_owner_anchor_audits},
+    {"storage_owner_anchor_audit_failures",
+     aggregate.counters.storage_owner_anchor_audit_failures},
     {"rabitq_prefetch_hit_ratio",
      aggregate.counters.rabitq_prefetch_issued == 0
        ? 0.0

@@ -103,6 +103,9 @@ private:
   // Lifecycle and commands
   static u64 elapsed_ns_since(const std::chrono::steady_clock::time_point start);
   static u64 scale_ns(const u64 value, const u32 part, const u32 total);
+  static double storage_owner_candidate_overlap(const vec<RemotePtr>& lhs,
+                                                const vec<RemotePtr>& rhs,
+                                                u32 limit);
   static InsertBreakdownCounters scale_breakdown(const InsertBreakdownCounters& counters,
                                                  const u32 part,
                                                  const u32 total);
@@ -202,6 +205,8 @@ private:
   bool execute_storage_owner_batch_items_async(const node_t* ids,
                                                const service::storage_owner::MutationKind* kinds,
                                                const element_t* vectors,
+                                               const u64* anchor_hints,
+                                               u32 anchor_hint_count,
                                                size_t item_count,
                                                StorageOwnerThread& thread,
                                                InsertBreakdownCounters& breakdown,
@@ -218,6 +223,8 @@ private:
   bool execute_storage_owner_batch_items(const node_t* ids,
                                          const service::storage_owner::MutationKind* kinds,
                                          const element_t* vectors,
+                                         const u64* anchor_hints,
+                                         u32 anchor_hint_count,
                                          size_t item_count,
                                          InsertBreakdownCounters& breakdown,
                                          const Configuration& config,
@@ -266,6 +273,16 @@ private:
                                     const Configuration& config,
                                     StorageOwnerThread& thread,
                                     InsertBreakdownCounters* breakdown = nullptr) -> StorageOwnerInsertCoroutine;
+  vec<RemotePtr> anchor_search_candidates(const span<const element_t> query,
+                                          const vec<RemotePtr>& anchor_hints,
+                                          const Configuration& config,
+                                          InsertBreakdownCounters* breakdown = nullptr);
+  auto anchor_search_candidates_async(const span<const element_t> query,
+                                      const vec<RemotePtr>& anchor_hints,
+                                      const Configuration& config,
+                                      StorageOwnerThread& thread,
+                                      InsertBreakdownCounters* breakdown = nullptr)
+    -> StorageOwnerInsertCoroutine;
   vec<RemotePtr> robust_prune_cpu(const byte_t* source,
                                   VectorDType source_dtype,
                                   const vec<RemotePtr>& candidates,
@@ -334,6 +351,7 @@ private:
   std::unordered_set<u64> peer_sync_completions_;
   std::unordered_map<u64, PeerPendingSend> peer_pending_sends_;
   vec<std::atomic<u32>> peer_rdma_read_outstanding_;
+  std::atomic<u64> storage_owner_anchor_insert_sequence_{0};
   vec<vec<std::atomic<u32>>> peer_rdma_read_qp_outstanding_;
   vec<vec<std::unique_ptr<std::mutex>>> peer_qp_send_mutexes_;
   std::atomic<u32> peer_sync_wr_id_counter_{1};

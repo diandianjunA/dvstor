@@ -97,11 +97,13 @@ set(DVSTOR_MEMORY_NODE_SOURCES
     src/memory_node/memory_node.cc
     src/memory_node/peer_rdma.cc
     src/memory_node/peer_rpc.cc
+    src/memory_node/storage_owner_anchor.cc
     src/memory_node/storage_owner_index.cc
     src/memory_node/storage_owner_runtime.cc
 )
 
 set(DVSTOR_OFFLINE_BUILDER_SOURCES
+    tools/vamana_offline/anchor_builder.cc
     tools/vamana_offline/config.cc
     tools/vamana_offline/dataset_io.cc
     tools/vamana_offline/graph.cc
@@ -267,6 +269,18 @@ else ()
         )
         target_link_metis(vamana_offline_builder)
 
+        add_executable(vamana_anchor_sidecar_builder
+            tools/vamana_anchor_sidecar_builder.cc
+            src/vamana/anchor_index.cc
+        )
+        target_include_directories(vamana_anchor_sidecar_builder PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
+            ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
+        )
+        target_link_libraries(vamana_anchor_sidecar_builder rdma_library)
+
         add_vamana_metis_repartitioner_target()
         add_vamana_bfs_repartitioner_target()
 
@@ -294,6 +308,7 @@ else ()
     endif ()
 
     if (DVSTOR_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/CMakeLists.txt")
+        enable_testing()
         add_subdirectory(test)
     endif ()
 

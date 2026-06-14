@@ -33,3 +33,16 @@ target_include_directories(storage_layout_resolver_test PRIVATE
 )
 add_test(NAME storage_layout_resolver_test
          COMMAND storage_layout_resolver_test)
+
+add_executable(anchor_update_protocol_test
+    anchor_update_protocol_test.cc
+    ${PROJECT_SOURCE_DIR}/src/vamana/anchor_index.cc
+)
+target_link_libraries(anchor_update_protocol_test PRIVATE rdma_library)
+target_include_directories(anchor_update_protocol_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/rdma-library
+    ${PROJECT_SOURCE_DIR}/thirdparty
+)
+add_test(NAME anchor_update_protocol_test
+         COMMAND anchor_update_protocol_test)

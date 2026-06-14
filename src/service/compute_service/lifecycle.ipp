@@ -142,6 +142,20 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                  std::to_string(rabitq_cache_->decode_table_bytes()) + " bytes, NUMA " +
                  (rabitq_cache_->numa_interleaved() ? "interleaved" : "local"));
   }
+  if (config_.use_storage_owner_insert() && config_.storage_owner_update_mode == "anchored") {
+    anchor_index_ = std::make_unique<vamana::anchor::Index>();
+    str anchor_error;
+    if (!have_startup_metadata || startup_metadata.anchor_format != "owner_anchor_v1" ||
+        !anchor_index_->load(config_.resolved_index_prefix(), config_.dim, num_servers_, &anchor_error)) {
+      print_status("anchored storage-owner sidecar unavailable; requests will use exact fallback: " +
+                   anchor_error);
+      anchor_index_.reset();
+    } else {
+      print_status("storage-owner anchors: entries=" +
+                   std::to_string(anchor_index_->anchor_count()) + " memory=" +
+                   std::to_string(anchor_index_->memory_bytes()) + " bytes");
+    }
+  }
   print_status(vamana_->use_rabitq()
     ? "search: RFQ5 RaBitQ " + config_.rabitq_mode + " + GPUDirect exact beam"
     : "search: exact");

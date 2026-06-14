@@ -148,6 +148,7 @@ struct StorageOwnerInsertJob {
   RemotePtr new_ptr{};
   RemotePtr old_ptr{};
   u32 generation{};
+  vec<RemotePtr> anchor_hints;
 };
 
 struct FreshnessEntry {

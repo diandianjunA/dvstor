@@ -76,6 +76,14 @@ public:
   u32 storage_owner_construction_beam_width{128};
   u32 storage_owner_search_snapshot_batch{64};
   u32 storage_owner_prune_max_candidates{128};
+  str storage_owner_update_mode{"exact"};
+  u32 storage_owner_anchor_hints{4};
+  u32 storage_owner_anchor_beam_width{64};
+  u32 storage_owner_anchor_expand_cap{16};
+  u32 storage_owner_anchor_remote_rescue_cap{4};
+  u32 storage_owner_anchor_audit_rate{256};
+  f64 storage_owner_anchor_min_overlap{0.5};
+  bool storage_owner_anchor_rehome_upsert{false};
   str storage_owner_reverse_mode{"async"};
   u32 storage_owner_reverse_queue_depth{65536};
   u32 storage_owner_reverse_flush_us{200};
@@ -106,6 +114,7 @@ public:
     process_program_options(argc, argv);
     insert_execution = normalize_mode(insert_execution);
     storage_owner_reverse_mode = normalize_mode(storage_owner_reverse_mode);
+    storage_owner_update_mode = normalize_mode(storage_owner_update_mode);
 
     if (!is_server) {
       validate_compute_node_options(argv);
@@ -191,6 +200,30 @@ private:
       "storage-owner-prune-max-candidates",
       po::value<u32>(&storage_owner_prune_max_candidates)->default_value(storage_owner_prune_max_candidates),
       "Maximum candidates considered by storage-owner robust-prune. 0 disables the cap.")(
+      "storage-owner-update-mode",
+      po::value<str>(&storage_owner_update_mode)->default_value(storage_owner_update_mode),
+      "Storage-owner update search: exact or anchored.")(
+      "storage-owner-anchor-hints",
+      po::value<u32>(&storage_owner_anchor_hints)->default_value(storage_owner_anchor_hints),
+      "Anchor entry points attached to each storage-owner mutation.")(
+      "storage-owner-anchor-beam-width",
+      po::value<u32>(&storage_owner_anchor_beam_width)->default_value(storage_owner_anchor_beam_width),
+      "Maximum beam width for anchored storage-owner search.")(
+      "storage-owner-anchor-expand-cap",
+      po::value<u32>(&storage_owner_anchor_expand_cap)->default_value(storage_owner_anchor_expand_cap),
+      "Maximum graph expansions in anchored foreground search.")(
+      "storage-owner-anchor-remote-rescue-cap",
+      po::value<u32>(&storage_owner_anchor_remote_rescue_cap)->default_value(storage_owner_anchor_remote_rescue_cap),
+      "Maximum remote-node expansions in anchored foreground search.")(
+      "storage-owner-anchor-audit-rate",
+      po::value<u32>(&storage_owner_anchor_audit_rate)->default_value(storage_owner_anchor_audit_rate),
+      "Run one sampled exact shadow audit per N successful anchored inserts. 0 disables auditing.")(
+      "storage-owner-anchor-min-overlap",
+      po::value<f64>(&storage_owner_anchor_min_overlap)->default_value(storage_owner_anchor_min_overlap),
+      "Minimum selected-neighbor overlap accepted by anchor shadow audits.")(
+      "storage-owner-anchor-rehome-upsert",
+      po::value<bool>(&storage_owner_anchor_rehome_upsert)->default_value(storage_owner_anchor_rehome_upsert),
+      "Allow anchored upserts to migrate ID ownership. Disabled until distributed two-phase ownership is enabled.")(
       "storage-owner-reverse-mode",
       po::value<str>(&storage_owner_reverse_mode)->default_value(storage_owner_reverse_mode),
       "Reverse-update completion mode for storage_owner inserts: async or sync.")(
@@ -360,6 +393,19 @@ private:
         std::cerr << "[ERROR]: --storage-owner-search-snapshot-batch must be > 0" << std::endl;
         exit_with_help_message(argv);
       }
+      if (storage_owner_update_mode != "exact" && storage_owner_update_mode != "anchored") {
+        std::cerr << "[ERROR]: --storage-owner-update-mode must be exact or anchored" << std::endl;
+        exit_with_help_message(argv);
+      }
+      if (storage_owner_update_mode == "anchored" &&
+          (ip_distance || storage_owner_anchor_hints == 0 ||
+           storage_owner_anchor_beam_width == 0 || storage_owner_anchor_expand_cap == 0 ||
+           storage_owner_anchor_min_overlap < 0.0 || storage_owner_anchor_min_overlap > 1.0 ||
+           storage_owner_anchor_rehome_upsert)) {
+        std::cerr << "[ERROR]: invalid anchored storage-owner configuration; L2 is required and "
+                     "upsert rehome is not enabled in this protocol version" << std::endl;
+        exit_with_help_message(argv);
+      }
       if (storage_owner_reverse_mode != "async" && storage_owner_reverse_mode != "sync") {
         std::cerr << "[ERROR]: --storage-owner-reverse-mode must be async or sync" << std::endl;
         exit_with_help_message(argv);
@@ -446,6 +492,15 @@ public:
            << config.storage_owner_search_snapshot_batch << std::endl;
         os << std::setw(width) << "storage prune max candidates: "
            << config.storage_owner_prune_max_candidates << std::endl;
+        os << std::setw(width) << "storage update mode: " << config.storage_owner_update_mode << std::endl;
+        if (config.storage_owner_update_mode == "anchored") {
+          os << std::setw(width) << "anchor hints: " << config.storage_owner_anchor_hints << std::endl;
+          os << std::setw(width) << "anchor beam width: " << config.storage_owner_anchor_beam_width << std::endl;
+          os << std::setw(width) << "anchor expand cap: " << config.storage_owner_anchor_expand_cap << std::endl;
+          os << std::setw(width) << "anchor remote cap: "
+             << config.storage_owner_anchor_remote_rescue_cap << std::endl;
+          os << std::setw(width) << "anchor audit rate: " << config.storage_owner_anchor_audit_rate << std::endl;
+        }
         os << std::setw(width) << "storage reverse mode: " << config.storage_owner_reverse_mode << std::endl;
         os << std::setw(width) << "storage reverse queue depth: "
            << config.storage_owner_reverse_queue_depth << std::endl;

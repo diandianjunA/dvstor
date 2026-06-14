@@ -21,6 +21,7 @@
 #include "vamana/vamana_node.hh"
 #include "tools/vamana_offline/partitioning.hh"
 #include "tools/vamana_offline/progress.hh"
+#include "tools/vamana_offline/anchor_builder.hh"
 
 namespace tools::vamana_offline {
 
@@ -321,6 +322,7 @@ void write_vamana_shards(const VamanaGraph& graph,
   PlacementResult placement_result = place_nodes(graph, config, aligned_size);
   print_partition_stats(config, placement_result);
   const auto& placements = placement_result.placements;
+  write_anchor_sidecar(graph, dataset, config, placements, output_prefix);
 
   vec<u64> shard_sizes(config.num_memory_nodes, 16);
   vec<u64> shard_entry_counts(config.num_memory_nodes, 0);
@@ -547,6 +549,8 @@ void write_vamana_shards(const VamanaGraph& graph,
     metadata["allocation_size"] = VamanaNode::allocation_size();
   }
   metadata["idmap_format"] = "owner_sharded_v1";
+  metadata["anchor_format"] = config.anchor_count_per_shard == 0 ? "" : "owner_anchor_v1";
+  metadata["anchor_count_per_shard"] = config.anchor_count_per_shard;
   if (config.use_rabitq) {
     metadata["rabitq_centroid"] = VamanaNode::rabitq_centroid;
     metadata["rabitq_code_bits"] = VamanaNode::rabitq_code_bits();

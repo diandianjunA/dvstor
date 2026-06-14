@@ -60,7 +60,10 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     ("query-path", po::value<filepath_t>(&config.query_path),
      "Path to query file (.fbin) for post-build recall test.")
     ("groundtruth-path", po::value<filepath_t>(&config.groundtruth_path),
-     "Path to ground truth file (.bin) for post-build recall test.");
+     "Path to ground truth file (.bin) for post-build recall test.")
+    ("anchor-count-per-shard",
+     po::value<u32>(&config.anchor_count_per_shard)->default_value(config.anchor_count_per_shard),
+     "Representative anchors written per shard. 0 disables the anchor sidecar.");
 
   po::variables_map vm;
   po::store(po::parse_command_line(argc, argv, desc), vm);

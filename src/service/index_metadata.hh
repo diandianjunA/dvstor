@@ -40,6 +40,8 @@ struct Metadata {
   u32 hot_graph_dynamic_hot_offset{};
   u32 allocation_size{};
   str idmap_format{};
+  str anchor_format{};
+  u32 anchor_count_per_shard{};
 };
 
 bool load_metadata(const filepath_t& index_prefix, Metadata& metadata, str* error_message = nullptr);

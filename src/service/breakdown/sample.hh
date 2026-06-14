@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <memory>
 
 #include "common/statistics.hh"
 #include "service/breakdown/names.hh"
@@ -49,6 +50,23 @@ struct ThreadCounterDelta {
   u64 overflow_prune_max_kernel_threads{};
   u64 query_rdma_to_staging_bytes{};
   u64 query_host_staging_fallback_bytes{};
+  u64 storage_owner_anchor_hints{};
+  u64 storage_owner_anchor_valid_hints{};
+  u64 storage_owner_anchor_expansions{};
+  u64 storage_owner_anchor_remote_expansions{};
+  u64 storage_owner_anchor_fallbacks{};
+  u64 storage_owner_anchor_audits{};
+  u64 storage_owner_anchor_audit_failures{};
+};
+
+struct StorageOwnerAnchorCounters {
+  u64 hints{};
+  u64 valid_hints{};
+  u64 expansions{};
+  u64 remote_expansions{};
+  u64 fallbacks{};
+  u64 audits{};
+  u64 audit_failures{};
 };
 
 
@@ -156,6 +174,7 @@ struct Sample {
   u64 cas_failures{};
   u64 overflow_prune_max_candidates{};
   u64 overflow_prune_max_kernel_threads{};
+  std::shared_ptr<StorageOwnerAnchorCounters> storage_owner_anchor;
   bool started_flag{};
   bool finished_flag{};
 
@@ -183,7 +202,19 @@ struct Sample {
     category_ns[static_cast<size_t>(parent_category(subcategory))] += ns;
   }
 
-  ThreadCounterDelta counters() const { return diff_thread_counters(end_counters, start_counters, operation); }
+  ThreadCounterDelta counters() const {
+    ThreadCounterDelta out = diff_thread_counters(end_counters, start_counters, operation);
+    if (storage_owner_anchor != nullptr) {
+      out.storage_owner_anchor_hints = storage_owner_anchor->hints;
+      out.storage_owner_anchor_valid_hints = storage_owner_anchor->valid_hints;
+      out.storage_owner_anchor_expansions = storage_owner_anchor->expansions;
+      out.storage_owner_anchor_remote_expansions = storage_owner_anchor->remote_expansions;
+      out.storage_owner_anchor_fallbacks = storage_owner_anchor->fallbacks;
+      out.storage_owner_anchor_audits = storage_owner_anchor->audits;
+      out.storage_owner_anchor_audit_failures = storage_owner_anchor->audit_failures;
+    }
+    return out;
+  }
 };
 
 }  // namespace service::breakdown

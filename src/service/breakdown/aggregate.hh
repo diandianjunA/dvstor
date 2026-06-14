@@ -123,6 +123,15 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
     std::max(aggregate.counters.overflow_prune_max_kernel_threads, sample.overflow_prune_max_kernel_threads);
   aggregate.counters.query_rdma_to_staging_bytes += delta.query_rdma_to_staging_bytes;
   aggregate.counters.query_host_staging_fallback_bytes += delta.query_host_staging_fallback_bytes;
+  aggregate.counters.storage_owner_anchor_hints += delta.storage_owner_anchor_hints;
+  aggregate.counters.storage_owner_anchor_valid_hints += delta.storage_owner_anchor_valid_hints;
+  aggregate.counters.storage_owner_anchor_expansions += delta.storage_owner_anchor_expansions;
+  aggregate.counters.storage_owner_anchor_remote_expansions +=
+    delta.storage_owner_anchor_remote_expansions;
+  aggregate.counters.storage_owner_anchor_fallbacks += delta.storage_owner_anchor_fallbacks;
+  aggregate.counters.storage_owner_anchor_audits += delta.storage_owner_anchor_audits;
+  aggregate.counters.storage_owner_anchor_audit_failures +=
+    delta.storage_owner_anchor_audit_failures;
   aggregate.lock_attempts += sample.lock_attempts;
   aggregate.lock_retries += sample.lock_retries;
   aggregate.cas_failures += sample.cas_failures;

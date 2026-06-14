@@ -34,6 +34,31 @@ Optimization profiles:
 ./evaluation/sift100m/run_breakdown.sh gpudirect_rdma_storage_owner
 ```
 
+## Anchor-Local Direct Insert (ALDI)
+
+The ALDI profile keeps the existing GPUDirect/RaBitQ query path and changes only
+storage-owner update routing and candidate discovery. Existing indexes do not
+need to be rebuilt. The existing shard files or original base dataset must be
+available while generating the bounded anchor sidecar once:
+
+```bash
+./build/vamana_anchor_sidecar_builder \
+  --index-prefix /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced \
+  --anchors-per-shard 4096
+```
+
+Then restart the memory nodes and run the dedicated profile:
+
+```bash
+./evaluation/sift100m/start_all_memory_nodes.sh gpudirect_rdma_storage_owner_rabitq_aldi
+./evaluation/sift100m/run_breakdown.sh gpudirect_rdma_storage_owner_rabitq_aldi
+```
+
+If the sidecar is absent or incompatible, the profile keeps the original exact
+storage-owner search for correctness. The baseline
+`gpudirect_rdma_storage_owner_rabitq` profile remains unchanged and uses
+`storage-owner-update-mode = exact`.
+
 ## Common Overrides
 
 ```bash
