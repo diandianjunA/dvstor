@@ -1334,7 +1334,8 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   const bool use_anchors = anchored_update_enabled(config, job.anchor_hints);
   RemotePtr medoid_ptr{};
   bool medoid_loaded = false;
-  vec<RemotePtr> candidates;
+  vec<RemotePtr> owned_candidates;
+  const vec<RemotePtr>* candidates = nullptr;
   vec<RemotePtr> audit_exact_candidates;
 
   if (use_anchors) {
@@ -1350,12 +1351,13 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
     }
     search.handle.destroy();
     breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
-    candidates = storage_owner_async_candidates_[thread.id][thread.running_coroutine];
+    owned_candidates = storage_owner_async_candidates_[thread.id][thread.running_coroutine];
+    candidates = &owned_candidates;
 
     const u64 sequence = storage_owner_anchor_insert_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
     const bool audit = config.storage_owner_anchor_audit_rate != 0 &&
                        sequence % config.storage_owner_anchor_audit_rate == 0;
-    const bool insufficient = candidates.size() < config.R;
+    const bool insufficient = owned_candidates.size() < config.R;
     if (audit || insufficient) {
       auto t_medoid = std::chrono::steady_clock::now();
       medoid_ptr = co_await async_read_global_medoid(thread);
@@ -1379,7 +1381,8 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
           ++breakdown.storage_owner_anchor_audits;
         }
         if (insufficient) {
-          candidates = exact;
+          owned_candidates = exact;
+          candidates = &owned_candidates;
           ++breakdown.storage_owner_anchor_fallbacks;
         } else if (audit) {
           audit_exact_candidates = exact;
@@ -1426,13 +1429,14 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
     }
     search.handle.destroy();
     breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
-    candidates = storage_owner_async_candidates_[thread.id][thread.running_coroutine];
+    candidates = &storage_owner_async_candidates_[thread.id][thread.running_coroutine];
   }
 
+  lib_assert(candidates != nullptr, "storage-owner insert search produced no candidate set");
   hashset_t<RemotePtr> empty_skip;
   auto t_prune = std::chrono::steady_clock::now();
   vec<RemotePtr> selected_neighbors = robust_prune_cpu(reinterpret_cast<const byte_t*>(components.data()),
-                                                       VectorDType::float32, candidates, empty_skip, config, &breakdown);
+                                                       VectorDType::float32, *candidates, empty_skip, config, &breakdown);
   breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
   if (!audit_exact_candidates.empty()) {
     t_prune = std::chrono::steady_clock::now();

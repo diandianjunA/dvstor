@@ -147,9 +147,10 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     str anchor_error;
     if (!have_startup_metadata || startup_metadata.anchor_format != "owner_anchor_v1" ||
         !anchor_index_->load(config_.resolved_index_prefix(), config_.dim, num_servers_, &anchor_error)) {
-      print_status("anchored storage-owner sidecar unavailable; requests will use exact fallback: " +
-                   anchor_error);
       anchor_index_.reset();
+      throw std::runtime_error(
+        "anchored storage-owner sidecar unavailable; refusing to run ALDI without anchors: " +
+        anchor_error);
     } else {
       print_status("storage-owner anchors: entries=" +
                    std::to_string(anchor_index_->anchor_count()) + " memory=" +
