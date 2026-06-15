@@ -40,7 +40,8 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
                                 : std::min(config.beam_width_construction,
                                            config.storage_owner_construction_beam_width)) +
                " snapshot_batch=" + std::to_string(config.storage_owner_search_snapshot_batch) +
-               " prune_max_candidates=" + std::to_string(config.storage_owner_prune_max_candidates));
+               " prune_max_candidates=" + std::to_string(config.storage_owner_prune_max_candidates) +
+               " update_mode=" + config.storage_owner_update_mode);
   const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
   const u32 coroutines_per_worker = std::max<u32>(1, config.insert_coroutines == 0 ? config.num_coroutines
                                                                                     : config.insert_coroutines);
@@ -121,8 +122,8 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
   vec<service::storage_owner::MutationKind> batch_kinds;
   vec<element_t> batch_vectors;
   vec<u64> batch_anchor_hints;
-  const u32 anchor_hint_count = config.storage_owner_update_mode == "anchored"
-                                  ? config.storage_owner_anchor_hints : 0;
+  const u32 expected_anchor_hint_count = config.storage_owner_update_mode == "anchored"
+                                           ? config.storage_owner_anchor_hints : 0;
   vec<u32> item_counts;
   vec<u32> response_magics;
   batch_ids.reserve(std::max<u32>(config.storage_owner_batch_max, 64));
@@ -155,9 +156,8 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
     }
     const size_t kind_base = batch_kinds.size() - request->item_count;
     for (u32 i = 0; i < request->item_count; ++i) {
-      for (u32 hint = 0; hint < anchor_hint_count; ++hint) {
-        batch_anchor_hints.push_back(hint < request->anchor_hint_count
-          ? hints[static_cast<size_t>(i) * request->anchor_hint_count + hint] : 0);
+      for (u32 hint = 0; hint < request->anchor_hint_count; ++hint) {
+        batch_anchor_hints.push_back(hints[static_cast<size_t>(i) * request->anchor_hint_count + hint]);
       }
     }
     const size_t old_size = batch_vectors.size();
@@ -186,7 +186,7 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
                                                                batch_kinds.data(),
                                                                batch_vectors.data(),
                                                                batch_anchor_hints.empty() ? nullptr : batch_anchor_hints.data(),
-                                                               anchor_hint_count,
+                                                               expected_anchor_hint_count,
                                                                batch_ids.size(),
                                                                *current_storage_owner_thread_,
                                                                breakdown,
@@ -198,7 +198,7 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
                                                         batch_kinds.data(),
                                                         batch_vectors.data(),
                                                         batch_anchor_hints.empty() ? nullptr : batch_anchor_hints.data(),
-                                                        anchor_hint_count,
+                                                        expected_anchor_hint_count,
                                                         batch_ids.size(),
                                                         breakdown,
                                                         config,
@@ -432,6 +432,8 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
         const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(payload);
         const bool magic_ok = request->magic == service::storage_owner::kInsertMagic ||
                               request->magic == service::storage_owner::kMutationMagic;
+        const u32 expected_anchor_hint_count = config.storage_owner_update_mode == "anchored"
+                                                 ? config.storage_owner_anchor_hints : 0;
         const size_t expected_bytes = request->magic == service::storage_owner::kMutationMagic
           ? service::storage_owner::mutation_batch_request_bytes(
               request->item_count, config.dim, request->anchor_hint_count)
@@ -444,7 +446,7 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
             request->item_count <= config.storage_owner_batch_max &&
             request->vector_dtype == static_cast<u32>(VamanaNode::vector_dtype()) &&
             request->vector_bytes == VamanaNode::vector_bytes() &&
-            request->anchor_hint_count <= config.storage_owner_anchor_hints &&
+            request->anchor_hint_count == expected_anchor_hint_count &&
             bytes >= expected_bytes) {
           StorageOwnerInsertTask task;
           task.client_id = client_id;

@@ -54,10 +54,10 @@ Then restart the memory nodes and run the dedicated profile:
 ./evaluation/sift100m/run_breakdown.sh gpudirect_rdma_storage_owner_rabitq_aldi
 ```
 
-If the sidecar is absent or incompatible, the profile keeps the original exact
-storage-owner search for correctness. The baseline
-`gpudirect_rdma_storage_owner_rabitq` profile remains unchanged and uses
-`storage-owner-update-mode = exact`.
+If the sidecar is absent or incompatible, the ALDI profile fails at startup
+instead of silently falling back. The baseline
+`gpudirect_rdma_storage_owner_rabitq` profile remains unchanged and uses the
+default exact storage-owner update path.
 
 ## Common Overrides
 

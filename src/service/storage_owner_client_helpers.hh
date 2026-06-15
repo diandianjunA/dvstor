@@ -103,6 +103,15 @@ inline void add_storage_owner_counters(
   if (!sample) {
     return;
   }
+  if (counters.storage_owner_anchor_hints == 0 &&
+      counters.storage_owner_anchor_valid_hints == 0 &&
+      counters.storage_owner_anchor_expansions == 0 &&
+      counters.storage_owner_anchor_remote_expansions == 0 &&
+      counters.storage_owner_anchor_fallbacks == 0 &&
+      counters.storage_owner_anchor_audits == 0 &&
+      counters.storage_owner_anchor_audit_failures == 0) {
+    return;
+  }
   if (sample->storage_owner_anchor == nullptr) {
     sample->storage_owner_anchor =
       std::make_shared<service::breakdown::StorageOwnerAnchorCounters>();
