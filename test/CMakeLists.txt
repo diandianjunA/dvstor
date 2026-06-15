@@ -46,3 +46,15 @@ target_include_directories(anchor_update_protocol_test PRIVATE
 )
 add_test(NAME anchor_update_protocol_test
          COMMAND anchor_update_protocol_test)
+
+add_executable(vector_batch_planner_test
+    vector_batch_planner_test.cc
+)
+target_link_libraries(vector_batch_planner_test PRIVATE rdma_library)
+target_include_directories(vector_batch_planner_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_SOURCE_DIR}/rdma-library
+    ${PROJECT_SOURCE_DIR}/thirdparty
+)
+add_test(NAME vector_batch_planner_test
+         COMMAND vector_batch_planner_test)

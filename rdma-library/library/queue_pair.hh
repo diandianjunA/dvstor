@@ -35,6 +35,7 @@ public:
 
   u32 get_qp_num() { return queue_pair_->qp_num; }
   ibv_qp* get_ibv_qp() { return queue_pair_; }
+  u32 max_send_wr() const { return max_send_wr_; }
 
   void transition_to_init();
   void transition_to_rtr(const QPInfo& remote_buffer);
@@ -119,6 +120,7 @@ private:
   const bool use_shared_receive_cq_;
 
   ibv_qp* queue_pair_{nullptr};
+  u32 max_send_wr_{};
 };
 
 using QP = u_ptr<QueuePair>;

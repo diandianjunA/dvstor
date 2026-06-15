@@ -255,6 +255,9 @@ write_service_config() {
     if [[ "${GPUDIRECT_RDMA:-0}" == "1" ]]; then echo "gpudirect-rdma = true"; fi
     if [[ -n "${EXPANSION_BATCH:-}" ]]; then echo "expansion-batch = ${EXPANSION_BATCH}"; fi
     if [[ -n "${RDMA_QP_POOL_SIZE:-}" ]]; then echo "rdma-qp-pool-size = ${RDMA_QP_POOL_SIZE}"; fi
+    if [[ -n "${RDMA_READ_BATCH_MODE:-}" ]]; then echo "rdma-read-batch-mode = ${RDMA_READ_BATCH_MODE}"; fi
+    if [[ -n "${RDMA_READ_CHAIN_SIZE:-}" ]]; then echo "rdma-read-chain-size = ${RDMA_READ_CHAIN_SIZE}"; fi
+    if [[ -n "${RDMA_READ_MAX_INFLIGHT_WRS:-}" ]]; then echo "rdma-read-max-inflight-wrs = ${RDMA_READ_MAX_INFLIGHT_WRS}"; fi
     if [[ -n "${QUERY_BATCH_SIZE:-}" ]]; then echo "query-batch-size = ${QUERY_BATCH_SIZE}"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then echo "use-rabitq = true"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then

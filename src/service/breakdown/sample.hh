@@ -19,6 +19,17 @@ struct ThreadCounterDelta {
   u64 vector_rdma_read_ops{};
   u64 vector_rdma_batch_calls{};
   u64 vector_rdma_cqes{};
+  u64 vector_rdma_active_nodes{};
+  u64 vector_rdma_active_qps{};
+  u64 vector_rdma_chain_wrs{};
+  u64 vector_rdma_max_chain_wrs{};
+  u64 vector_rdma_qp_high_water_wrs{};
+  u64 vector_rdma_credit_waits{};
+  u64 vector_rdma_credit_wait_ns{};
+  u64 vector_rdma_completion_token_waits{};
+  u64 vector_rdma_post_send_calls{};
+  u64 vector_rdma_post_send_retries{};
+  u64 vector_rdma_post_send_errors{};
   u64 h2d_bytes{};
   u64 d2h_bytes{};
   u64 l2_kernels{};
@@ -85,8 +96,27 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
     out.neighbor_rdma_read_ops = end.query_neighbor_rdma_read_ops - start.query_neighbor_rdma_read_ops;
     out.vector_rdma_read_ops = end.query_vector_rdma_read_ops - start.query_vector_rdma_read_ops;
     out.vector_rdma_batch_calls =
-      end.query_vector_rdma_batch_calls - start.query_vector_rdma_batch_calls;
-    out.vector_rdma_cqes = end.query_vector_rdma_cqes - start.query_vector_rdma_cqes;
+      end.vector_rdma_batch_calls - start.vector_rdma_batch_calls;
+    out.vector_rdma_cqes = end.vector_rdma_chunks - start.vector_rdma_chunks;
+    out.vector_rdma_active_nodes =
+      end.vector_rdma_active_nodes - start.vector_rdma_active_nodes;
+    out.vector_rdma_active_qps =
+      end.vector_rdma_active_qps - start.vector_rdma_active_qps;
+    out.vector_rdma_chain_wrs = end.vector_rdma_chain_wrs - start.vector_rdma_chain_wrs;
+    out.vector_rdma_max_chain_wrs = end.vector_rdma_max_chain_wrs;
+    out.vector_rdma_qp_high_water_wrs = end.vector_rdma_qp_high_water_wrs;
+    out.vector_rdma_credit_waits =
+      end.vector_rdma_credit_waits - start.vector_rdma_credit_waits;
+    out.vector_rdma_credit_wait_ns =
+      end.vector_rdma_credit_wait_ns - start.vector_rdma_credit_wait_ns;
+    out.vector_rdma_completion_token_waits =
+      end.vector_rdma_completion_token_waits - start.vector_rdma_completion_token_waits;
+    out.vector_rdma_post_send_calls =
+      end.vector_rdma_post_send_calls - start.vector_rdma_post_send_calls;
+    out.vector_rdma_post_send_retries =
+      end.vector_rdma_post_send_retries - start.vector_rdma_post_send_retries;
+    out.vector_rdma_post_send_errors =
+      end.vector_rdma_post_send_errors - start.vector_rdma_post_send_errors;
     out.h2d_bytes = end.query_h2d_bytes - start.query_h2d_bytes;
     out.d2h_bytes = end.query_d2h_bytes - start.query_d2h_bytes;
     out.exact_reranks = end.query_exact_reranks - start.query_exact_reranks;
@@ -127,6 +157,28 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
   out.vector_rdma_bytes = end.build_vector_rdma_reads_in_bytes - start.build_vector_rdma_reads_in_bytes;
   out.neighbor_rdma_read_ops = end.build_neighbor_rdma_read_ops - start.build_neighbor_rdma_read_ops;
   out.vector_rdma_read_ops = end.build_vector_rdma_read_ops - start.build_vector_rdma_read_ops;
+  out.vector_rdma_batch_calls =
+    end.vector_rdma_batch_calls - start.vector_rdma_batch_calls;
+  out.vector_rdma_cqes = end.vector_rdma_chunks - start.vector_rdma_chunks;
+  out.vector_rdma_active_nodes =
+    end.vector_rdma_active_nodes - start.vector_rdma_active_nodes;
+  out.vector_rdma_active_qps =
+    end.vector_rdma_active_qps - start.vector_rdma_active_qps;
+  out.vector_rdma_chain_wrs = end.vector_rdma_chain_wrs - start.vector_rdma_chain_wrs;
+  out.vector_rdma_max_chain_wrs = end.vector_rdma_max_chain_wrs;
+  out.vector_rdma_qp_high_water_wrs = end.vector_rdma_qp_high_water_wrs;
+  out.vector_rdma_credit_waits =
+    end.vector_rdma_credit_waits - start.vector_rdma_credit_waits;
+  out.vector_rdma_credit_wait_ns =
+    end.vector_rdma_credit_wait_ns - start.vector_rdma_credit_wait_ns;
+  out.vector_rdma_completion_token_waits =
+    end.vector_rdma_completion_token_waits - start.vector_rdma_completion_token_waits;
+  out.vector_rdma_post_send_calls =
+    end.vector_rdma_post_send_calls - start.vector_rdma_post_send_calls;
+  out.vector_rdma_post_send_retries =
+    end.vector_rdma_post_send_retries - start.vector_rdma_post_send_retries;
+  out.vector_rdma_post_send_errors =
+    end.vector_rdma_post_send_errors - start.vector_rdma_post_send_errors;
   out.h2d_bytes = end.build_h2d_bytes - start.build_h2d_bytes;
   out.d2h_bytes = end.build_d2h_bytes - start.build_d2h_bytes;
   out.l2_kernels = end.build_l2_kernels - start.build_l2_kernels;

@@ -4,6 +4,7 @@
  * RDMA read operations for the Vamana index.
  */
 
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <thread>
@@ -11,9 +12,11 @@
 #include "compute_thread.hh"
 #include "coroutine.hh"
 #include "remote_pointer.hh"
+#include "rdma/rdma_send_chain.hh"
 #include "vamana/storage_layout_resolver.hh"
 #include "vamana/vamana_neighborlist.hh"
 #include "vamana/vamana_node.hh"
+#include "rdma/vector_batch_planner.hh"
 
 namespace rdma::vamana {
 
@@ -30,29 +33,33 @@ struct BatchReadDestination {
 };
 
 struct VectorBatchReadScratch {
-    vec<u32> qp_counters;
-    vec<vec<vec<ibv_send_wr>>> wr_lists;
-    vec<vec<vec<ibv_sge>>> sge_lists;
+    struct ChunkBuffers {
+        vec<ibv_send_wr> wrs;
+        vec<ibv_sge> sges;
+    };
 
-    void prepare(const u_ptr<ComputeThread>& thread, size_t request_count) {
-        const u32 num_nodes = static_cast<u32>(thread->ctx->qps.size());
-        qp_counters.assign(num_nodes, 0);
-        wr_lists.resize(num_nodes);
-        sge_lists.resize(num_nodes);
-        for (u32 node = 0; node < num_nodes; ++node) {
-            const u32 pool_size = static_cast<u32>(thread->ctx->qps[node].size());
-            wr_lists[node].resize(pool_size);
-            sge_lists[node].resize(pool_size);
-            const size_t capacity = request_count / std::max<u32>(1, num_nodes) /
-                                      std::max<u32>(1, pool_size) + 1;
-            for (u32 qp = 0; qp < pool_size; ++qp) {
-                auto& wrs = wr_lists[node][qp];
-                auto& sges = sge_lists[node][qp];
-                wrs.clear();
-                sges.clear();
-                if (wrs.capacity() < capacity) wrs.reserve(capacity);
-                if (sges.capacity() < capacity) sges.reserve(capacity);
-            }
+    vec<ChunkBuffers> chunks;
+    VectorReadPlannerScratch planner_scratch;
+    VectorReadBatchPlan batch_plan;
+    vec<u32> request_nodes;
+    vec<u32> qp_counts;
+    vec<vec<u32>> outstanding_wrs;
+    vec<u32> tie_breakers;
+    vec<vec<bool>> actual_qps;
+    vec<u64> local_addrs;
+    vec<u32> local_lkeys;
+    vec<u64> remote_addrs;
+    vec<u32> remote_rkeys;
+
+    void prepare(const VectorReadBatchPlan& plan) {
+        if (chunks.size() < plan.chunks.size()) chunks.resize(plan.chunks.size());
+        for (u32 i = 0; i < plan.chunks.size(); ++i) {
+            auto& buffers = chunks[i];
+            const size_t count = plan.chunks[i].request_count;
+            buffers.wrs.clear();
+            buffers.sges.clear();
+            if (buffers.wrs.capacity() < count) buffers.wrs.reserve(count);
+            if (buffers.sges.capacity() < count) buffers.sges.reserve(count);
         }
     }
 };
@@ -396,87 +403,179 @@ inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rp
     if (!direct_to_gpu || using_destinations) {
         host_buffers.reserve(node_rptrs.size());
     }
-    if (thread->is_query_worker() && !node_rptrs.empty()) {
-        ++thread->stats.query_vector_rdma_batch_calls;
+    if (node_rptrs.empty()) {
+        return VectorBatchReadAwaitable(
+            VectorBatchReadResult{std::move(host_buffers), direct_to_gpu});
     }
 
-    // Group WRs per (memory_node, QP) pair and build linked lists.
-    // Round-robin across the QP pool for each node.
+    ++thread->stats.vector_rdma_batch_calls;
+    if (thread->is_query_worker()) ++thread->stats.query_vector_rdma_batch_calls;
+
     auto& scratch = vector_batch_read_scratch;
-    scratch.prepare(thread, node_rptrs.size());
     const u32 num_nodes = static_cast<u32>(thread->ctx->qps.size());
-    auto& qp_counters = scratch.qp_counters;
-    auto& wr_lists = scratch.wr_lists;
-    auto& sge_lists = scratch.sge_lists;
+    scratch.request_nodes.clear();
+    scratch.request_nodes.reserve(node_rptrs.size());
+    scratch.qp_counts.clear();
+    scratch.qp_counts.reserve(num_nodes);
+    for (u32 node = 0; node < num_nodes; ++node) {
+        scratch.qp_counts.push_back(static_cast<u32>(thread->ctx->qps[node].size()));
+    }
+    for (const auto& rptr : node_rptrs) scratch.request_nodes.push_back(rptr.memory_node());
+
+    u32 chain_size = thread->ctx->effective_chain_size();
+    if (num_nodes > 0 && !thread->ctx->qps[0].empty()) {
+        const u32 bulk_qp = thread->ctx->qps[0].size() > 1 ? 1 : 0;
+        chain_size = std::min(chain_size, thread->ctx->qp_credit_limit(0, bulk_qp));
+    }
+    thread->ctx->qp_outstanding_snapshot(scratch.outstanding_wrs);
+    thread->ctx->next_qp_tie_breakers(scratch.tie_breakers);
+    plan_vector_read_batch(
+        scratch.request_nodes, scratch.qp_counts, scratch.outstanding_wrs,
+        scratch.tie_breakers, chain_size, thread->ctx->batch_options().adaptive,
+        scratch.batch_plan, scratch.planner_scratch);
+    const auto& batch_plan = scratch.batch_plan;
+    thread->stats.vector_rdma_active_nodes += batch_plan.active_nodes;
+    thread->stats.vector_rdma_max_chain_wrs = std::max<size_t>(
+        thread->stats.vector_rdma_max_chain_wrs, batch_plan.max_chain_wrs);
+    scratch.actual_qps.resize(num_nodes);
+    for (u32 node = 0; node < num_nodes; ++node) {
+        scratch.actual_qps[node].assign(thread->ctx->qps[node].size(), false);
+    }
+
+    scratch.local_addrs.resize(node_rptrs.size());
+    scratch.local_lkeys.resize(node_rptrs.size());
+    scratch.remote_addrs.resize(node_rptrs.size());
+    scratch.remote_rkeys.resize(node_rptrs.size());
 
     for (size_t i = 0; i < node_rptrs.size(); ++i) {
         const auto& rptr = node_rptrs[i];
-        u64 local_addr;
-        u32 lkey;
         if (using_destinations) {
             const auto& dst = (*destinations)[i];
-            local_addr = dst.local_addr;
-            lkey = dst.gpu_destination ? dst.lkey : thread->ctx->get_lkey();
+            scratch.local_addrs[i] = dst.local_addr;
+            scratch.local_lkeys[i] = dst.gpu_destination ? dst.lkey : thread->ctx->get_lkey();
             if (dst.host_buffer) host_buffers.push_back(dst.host_buffer);
         } else if (direct_to_gpu) {
-            local_addr = reinterpret_cast<u64>(gpu_buffer) + i * vec_size;
-            lkey = gpu_lkey;
+            scratch.local_addrs[i] = reinterpret_cast<u64>(gpu_buffer) + i * vec_size;
+            scratch.local_lkeys[i] = gpu_lkey;
         } else {
             byte_t* local_buffer = thread->buffer_allocator.allocate_buffer(vec_size);
             host_buffers.push_back(local_buffer);
-            local_addr = reinterpret_cast<u64>(local_buffer);
-            lkey = thread->ctx->get_lkey();
+            scratch.local_addrs[i] = reinterpret_cast<u64>(local_buffer);
+            scratch.local_lkeys[i] = thread->ctx->get_lkey();
         }
 
         track_vector_rdma_read(thread, vec_size);
-
         const u32 node = rptr.memory_node();
-        const u32 qp_idx = (qp_counters[node]++) % wr_lists[node].size();
         auto* token = thread->ctx->get_remote_mrt(node);
-        auto& sges = sge_lists[node][qp_idx];
-        auto& wrs = wr_lists[node][qp_idx];
-
-        sges.push_back({});
-        ibv_sge& sge = sges.back();
-        sge.addr = local_addr;
-        sge.length = static_cast<u32>(vec_size);
-        sge.lkey = lkey;
-
-        wrs.push_back({});
-        ibv_send_wr& wr = wrs.back();
-        wr.wr_id = 0;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-        wr.opcode = IBV_WR_RDMA_READ;
-        wr.send_flags = 0;
         const u64 resolved_offset = read_size_override == 0
             ? ::vamana::StorageLayoutResolver::vector(rptr).offset
             : rptr.byte_offset() + node_offset_override;
-        wr.wr.rdma.remote_addr = token->address + resolved_offset;
-        wr.wr.rdma.rkey = token->rkey;
-        wr.next = nullptr;
+        scratch.remote_addrs[i] = token->address + resolved_offset;
+        scratch.remote_rkeys[i] = token->rkey;
     }
 
-    // Post batched WRs: one ibv_post_send per (node, qp_idx) pair.
-    for (u32 node = 0; node < num_nodes; ++node) {
-        for (u32 qp = 0; qp < wr_lists[node].size(); ++qp) {
-            auto& wrs = wr_lists[node][qp];
-            auto& sges = sge_lists[node][qp];
-            if (wrs.empty()) continue;
-            for (size_t j = 0; j < wrs.size(); ++j) {
-                wrs[j].sg_list = &sges[j];
-                if (j + 1 < wrs.size()) wrs[j].next = &wrs[j + 1];
-            }
-            wrs.back().wr_id = thread->create_wr_id();
-            wrs.back().send_flags = IBV_SEND_SIGNALED;
-            thread->track_post();
-            if (thread->is_query_worker()) {
-                ++thread->stats.query_vector_rdma_cqes;
-            }
-            struct ibv_send_wr* bad = nullptr;
-            ibv_post_send(thread->ctx->qps[node][qp]->qp->get_ibv_qp(),
-                          &wrs[0], &bad);
+    scratch.prepare(batch_plan);
+    for (u32 chunk_index = 0; chunk_index < batch_plan.chunks.size(); ++chunk_index) {
+        const auto& chunk = batch_plan.chunks[chunk_index];
+        auto& buffers = scratch.chunks[chunk_index];
+        for (u32 i = 0; i < chunk.request_count; ++i) {
+            const u32 request_index =
+                batch_plan.request_order[chunk.request_offset + i];
+            buffers.sges.push_back({});
+            auto& sge = buffers.sges.back();
+            sge.addr = scratch.local_addrs[request_index];
+            sge.length = static_cast<u32>(vec_size);
+            sge.lkey = scratch.local_lkeys[request_index];
+
+            buffers.wrs.push_back({});
+            auto& wr = buffers.wrs.back();
+            wr.wr_id = 0;
+            wr.sg_list = &sge;
+            wr.num_sge = 1;
+            wr.opcode = IBV_WR_RDMA_READ;
+            wr.send_flags = 0;
+            wr.wr.rdma.remote_addr = scratch.remote_addrs[request_index];
+            wr.wr.rdma.rkey = scratch.remote_rkeys[request_index];
+            wr.next = nullptr;
         }
+    }
+
+    for (u32 chunk_index = 0; chunk_index < batch_plan.chunks.size(); ++chunk_index) {
+        const auto& chunk = batch_plan.chunks[chunk_index];
+        auto& buffers = scratch.chunks[chunk_index];
+        auto& wrs = buffers.wrs;
+        auto& sges = buffers.sges;
+        const u32 wr_count = static_cast<u32>(wrs.size());
+        lib_assert(wr_count > 0, "empty vector RDMA chunk");
+        for (u32 i = 0; i < wr_count; ++i) {
+            wrs[i].sg_list = &sges[i];
+            wrs[i].next = i + 1 < wr_count ? &wrs[i + 1] : nullptr;
+        }
+
+        const auto wait_start = std::chrono::steady_clock::now();
+        bool waited_for_credit = false;
+        u32 selected_qp = chunk.qp_index;
+        while (!thread->ctx->try_reserve_bulk_qp_wrs(
+            chunk.memory_node, chunk.qp_index, wr_count, selected_qp)) {
+            waited_for_credit = true;
+            thread->poll_cq();
+            std::this_thread::yield();
+        }
+        scratch.actual_qps[chunk.memory_node][selected_qp] = true;
+        thread->stats.vector_rdma_qp_high_water_wrs = std::max<size_t>(
+            thread->stats.vector_rdma_qp_high_water_wrs,
+            thread->ctx->qp_runtime[chunk.memory_node][selected_qp]
+                ->high_water_wrs.load(std::memory_order_relaxed));
+        if (waited_for_credit) {
+            ++thread->stats.vector_rdma_credit_waits;
+            thread->stats.vector_rdma_credit_wait_ns +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_start).count();
+        }
+
+        u64 completion_id = 0;
+        while (completion_id == 0) {
+            completion_id = thread->ctx->try_create_batch_completion(
+                thread->ctx_tid, thread->current_coroutine_id(),
+                chunk.memory_node, selected_qp, wr_count);
+            if (completion_id == 0) {
+                ++thread->stats.vector_rdma_completion_token_waits;
+                thread->poll_cq();
+                std::this_thread::yield();
+            }
+        }
+
+        wrs.back().wr_id = completion_id;
+        wrs.back().send_flags = IBV_SEND_SIGNALED;
+        thread->track_post();
+        ++thread->stats.vector_rdma_chunks;
+        thread->stats.vector_rdma_chain_wrs += wr_count;
+        if (thread->is_query_worker()) ++thread->stats.query_vector_rdma_cqes;
+
+        const auto post_result = ::rdma::post_send_chain_with_retry(
+            wrs.data(),
+            [&](ibv_send_wr* first, ibv_send_wr** bad) {
+                return ibv_post_send(
+                    thread->ctx->qps[chunk.memory_node][selected_qp]
+                        ->qp->get_ibv_qp(),
+                    first, bad);
+            },
+            [&] {
+                thread->poll_cq();
+                std::this_thread::yield();
+            });
+        thread->stats.vector_rdma_post_send_calls += post_result.post_calls;
+        thread->stats.vector_rdma_post_send_retries += post_result.retries;
+        if (!post_result.success) {
+            ++thread->stats.vector_rdma_post_send_errors;
+            lib_failure("Cannot post vector RDMA READ chain: rc=" +
+                        std::to_string(post_result.error));
+        }
+    }
+
+    for (const auto& node_qps : scratch.actual_qps) {
+        thread->stats.vector_rdma_active_qps += static_cast<size_t>(
+            std::count(node_qps.begin(), node_qps.end(), true));
     }
 
     return VectorBatchReadAwaitable(VectorBatchReadResult{std::move(host_buffers), direct_to_gpu});

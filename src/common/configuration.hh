@@ -6,6 +6,7 @@
 #include <iostream>
 #include <library/configuration.hh>
 
+#include "constants.hh"
 #include "index_path.hh"
 #include "types.hh"
 #include "vector_dtype.hh"
@@ -41,7 +42,10 @@ public:
   u32 gpu_device{};       // CUDA device ID
   bool gpudirect_rdma{};  // Enable GPUDirect RDMA (read vectors directly into GPU buffers)
   u32 expansion_batch{1};   // Batch K beam expansions per iteration (1=serial)
-  u32 rdma_qp_pool_size{1}; // QPs per memory node per SharedContext (1=default)
+  u32 rdma_qp_pool_size{};   // QPs per memory node per SharedContext (0=auto)
+  str rdma_read_batch_mode{"adaptive"};
+  u32 rdma_read_chain_size{};
+  u32 rdma_read_max_inflight_wrs{};
   u32 query_batch_size{1};  // Fuse GPU across N queries (1=single query)
   bool use_rabitq{};        // Use the local RaBitQ gate before exact beam insertion
   str rabitq_mode{"exact_safe"};
@@ -115,6 +119,7 @@ public:
     insert_execution = normalize_mode(insert_execution);
     storage_owner_reverse_mode = normalize_mode(storage_owner_reverse_mode);
     storage_owner_update_mode = normalize_mode(storage_owner_update_mode);
+    rdma_read_batch_mode = normalize_mode(rdma_read_batch_mode);
 
     if (!is_server) {
       validate_compute_node_options(argv);
@@ -241,8 +246,17 @@ private:
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
       "expansion-batch,K", po::value<u32>(&expansion_batch)->default_value(1),
       "Number of beam nodes expanded per iteration.")(
-      "rdma-qp-pool-size", po::value<u32>(&rdma_qp_pool_size)->default_value(1),
-      "QPs per memory node per SharedContext. >1 enables parallel RDMA reads to the same node.")(
+      "rdma-qp-pool-size", po::value<u32>(&rdma_qp_pool_size)->default_value(rdma_qp_pool_size),
+      "QPs per memory node per SharedContext. 0 selects the automatic pool size.")(
+      "rdma-read-batch-mode",
+      po::value<str>(&rdma_read_batch_mode)->default_value(rdma_read_batch_mode),
+      "Vector RDMA batch scheduling mode: adaptive or legacy.")(
+      "rdma-read-chain-size",
+      po::value<u32>(&rdma_read_chain_size)->default_value(rdma_read_chain_size),
+      "Maximum RDMA READ WRs per signaled chain. 0 derives it from device capabilities.")(
+      "rdma-read-max-inflight-wrs",
+      po::value<u32>(&rdma_read_max_inflight_wrs)->default_value(rdma_read_max_inflight_wrs),
+      "Maximum outstanding bulk READ WRs per QP. 0 derives it from the send queue capacity.")(
       "query-batch-size", po::value<u32>(&query_batch_size)->default_value(1),
       "Fuse GPU/D2H across N queries processed in lockstep (1=disabled, 2-4=batch).")(
       "use-rabitq", po::bool_switch(&use_rabitq)->default_value(false),
@@ -306,6 +320,11 @@ private:
 
     if (store_index && load_index) {
       std::cerr << "[ERROR]: --store-index and --load-index cannot be used in conjunction" << std::endl;
+      exit_with_help_message(argv);
+    }
+
+    if (rdma_read_batch_mode != "adaptive" && rdma_read_batch_mode != "legacy") {
+      std::cerr << "[ERROR]: --rdma-read-batch-mode must be adaptive or legacy" << std::endl;
       exit_with_help_message(argv);
     }
 
@@ -449,6 +468,10 @@ public:
   }
 
   bool use_storage_owner_insert() const { return insert_execution == "storage_owner"; }
+  u32 effective_rdma_qp_pool_size() const {
+    if (rdma_qp_pool_size != 0) return rdma_qp_pool_size;
+    return rdma_read_batch_mode == "legacy" ? 1 : MAX_QPS;
+  }
 
   friend std::ostream& operator<<(std::ostream& os, const IndexConfiguration& config) {
     os << static_cast<const Configuration&>(config);
@@ -521,7 +544,14 @@ public:
       os << std::setw(width) << "GPU device: " << config.gpu_device << std::endl;
       os << std::setw(width) << "GPUDirect RDMA: " << (config.gpudirect_rdma ? "true" : "false") << std::endl;
       os << std::setw(width) << "Expansion Batch (K): " << config.expansion_batch << std::endl;
-      os << std::setw(width) << "RDMA QP Pool Size: " << config.rdma_qp_pool_size << std::endl;
+      os << std::setw(width) << "RDMA QP Pool Size: "
+         << config.effective_rdma_qp_pool_size();
+      if (config.rdma_qp_pool_size == 0) os << " (auto)";
+      os << std::endl;
+      os << std::setw(width) << "RDMA read batch mode: " << config.rdma_read_batch_mode << std::endl;
+      os << std::setw(width) << "RDMA read chain size: " << config.rdma_read_chain_size << std::endl;
+      os << std::setw(width) << "RDMA read max inflight WRs: "
+         << config.rdma_read_max_inflight_wrs << std::endl;
       os << std::setw(width) << "Query Batch Size: " << config.query_batch_size << std::endl;
       os << std::setw(width) << "Use RaBitQ: " << (config.use_rabitq ? "true" : "false") << std::endl;
       os << std::setw(width) << "RaBitQ mode: " << config.rabitq_mode << std::endl;

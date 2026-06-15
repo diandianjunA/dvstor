@@ -15,7 +15,8 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   }
 
   if (cm_.is_initiator) {
-    configuration::Parameters p{config_.num_threads, false, config_.routing, config_.rdma_qp_pool_size};
+    configuration::Parameters p{
+      config_.num_threads, false, config_.routing, config_.effective_rdma_qp_pool_size()};
     for (const QP& qp : cm_.server_qps) {
       qp->post_send_inlined(&p, sizeof(configuration::Parameters), IBV_WR_SEND);
       context_.poll_send_cq_until_completion();
@@ -164,8 +165,14 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,
                                               config_.max_send_queue_wr,
                                               static_cast<u64>(config_.cn_memory_gb) * 1073741824ul);
-  worker_pool_->allocate_worker_threads(context_, cm_, remote_access_tokens_, config_.num_coroutines,
-                                         config_.rdma_qp_pool_size);
+  const RdmaReadBatchOptions rdma_batch_options{
+    config_.rdma_read_batch_mode == "adaptive",
+    config_.rdma_read_chain_size,
+    config_.rdma_read_max_inflight_wrs,
+  };
+  worker_pool_->allocate_worker_threads(
+    context_, cm_, remote_access_tokens_, config_.num_coroutines,
+    config_.effective_rdma_qp_pool_size(), rdma_batch_options);
   // Initialize GPU buffers for each compute thread
   const u32 query_batch_factor = std::max<u32>(1, config_.query_batch_size);
   const u32 max_batch = std::max(config_.beam_width * config_.expansion_batch * query_batch_factor,

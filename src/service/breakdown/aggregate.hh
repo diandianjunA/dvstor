@@ -84,6 +84,21 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.vector_rdma_read_ops += delta.vector_rdma_read_ops;
   aggregate.counters.vector_rdma_batch_calls += delta.vector_rdma_batch_calls;
   aggregate.counters.vector_rdma_cqes += delta.vector_rdma_cqes;
+  aggregate.counters.vector_rdma_active_nodes += delta.vector_rdma_active_nodes;
+  aggregate.counters.vector_rdma_active_qps += delta.vector_rdma_active_qps;
+  aggregate.counters.vector_rdma_chain_wrs += delta.vector_rdma_chain_wrs;
+  aggregate.counters.vector_rdma_max_chain_wrs = std::max(
+    aggregate.counters.vector_rdma_max_chain_wrs, delta.vector_rdma_max_chain_wrs);
+  aggregate.counters.vector_rdma_qp_high_water_wrs = std::max(
+    aggregate.counters.vector_rdma_qp_high_water_wrs,
+    delta.vector_rdma_qp_high_water_wrs);
+  aggregate.counters.vector_rdma_credit_waits += delta.vector_rdma_credit_waits;
+  aggregate.counters.vector_rdma_credit_wait_ns += delta.vector_rdma_credit_wait_ns;
+  aggregate.counters.vector_rdma_completion_token_waits +=
+    delta.vector_rdma_completion_token_waits;
+  aggregate.counters.vector_rdma_post_send_calls += delta.vector_rdma_post_send_calls;
+  aggregate.counters.vector_rdma_post_send_retries += delta.vector_rdma_post_send_retries;
+  aggregate.counters.vector_rdma_post_send_errors += delta.vector_rdma_post_send_errors;
   aggregate.counters.h2d_bytes += delta.h2d_bytes;
   aggregate.counters.d2h_bytes += delta.d2h_bytes;
   aggregate.counters.l2_kernels += delta.l2_kernels;

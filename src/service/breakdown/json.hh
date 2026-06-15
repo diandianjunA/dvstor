@@ -80,6 +80,33 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"vector_rdma_read_ops", aggregate.counters.vector_rdma_read_ops},
     {"vector_rdma_batch_calls", aggregate.counters.vector_rdma_batch_calls},
     {"vector_rdma_cqes", aggregate.counters.vector_rdma_cqes},
+    {"vector_rdma_active_nodes", aggregate.counters.vector_rdma_active_nodes},
+    {"vector_rdma_active_qps", aggregate.counters.vector_rdma_active_qps},
+    {"vector_rdma_mean_active_nodes_per_batch",
+     aggregate.counters.vector_rdma_batch_calls == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.vector_rdma_active_nodes) /
+           static_cast<double>(aggregate.counters.vector_rdma_batch_calls)},
+    {"vector_rdma_mean_active_qps_per_batch",
+     aggregate.counters.vector_rdma_batch_calls == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.vector_rdma_active_qps) /
+           static_cast<double>(aggregate.counters.vector_rdma_batch_calls)},
+    {"vector_rdma_mean_chain_wrs",
+     aggregate.counters.vector_rdma_cqes == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.vector_rdma_chain_wrs) /
+           static_cast<double>(aggregate.counters.vector_rdma_cqes)},
+    {"vector_rdma_max_chain_wrs", aggregate.counters.vector_rdma_max_chain_wrs},
+    {"vector_rdma_qp_high_water_wrs",
+     aggregate.counters.vector_rdma_qp_high_water_wrs},
+    {"vector_rdma_credit_waits", aggregate.counters.vector_rdma_credit_waits},
+    {"vector_rdma_credit_wait_ns", aggregate.counters.vector_rdma_credit_wait_ns},
+    {"vector_rdma_completion_token_waits",
+     aggregate.counters.vector_rdma_completion_token_waits},
+    {"vector_rdma_post_send_calls", aggregate.counters.vector_rdma_post_send_calls},
+    {"vector_rdma_post_send_retries", aggregate.counters.vector_rdma_post_send_retries},
+    {"vector_rdma_post_send_errors", aggregate.counters.vector_rdma_post_send_errors},
     {"vector_rdma_reads_per_batch",
      aggregate.counters.vector_rdma_batch_calls == 0
        ? 0.0
