@@ -255,6 +255,9 @@ write_service_config() {
     if [[ "${GPUDIRECT_RDMA:-0}" == "1" ]]; then echo "gpudirect-rdma = true"; fi
     if [[ -n "${EXPANSION_BATCH:-}" ]]; then echo "expansion-batch = ${EXPANSION_BATCH}"; fi
     if [[ -n "${RDMA_QP_POOL_SIZE:-}" ]]; then echo "rdma-qp-pool-size = ${RDMA_QP_POOL_SIZE}"; fi
+    if [[ -n "${RDMA_READ_BATCH_MODE:-}" ]]; then echo "rdma-read-batch-mode = ${RDMA_READ_BATCH_MODE}"; fi
+    if [[ -n "${RDMA_READ_CHAIN_SIZE:-}" ]]; then echo "rdma-read-chain-size = ${RDMA_READ_CHAIN_SIZE}"; fi
+    if [[ -n "${RDMA_READ_MAX_INFLIGHT_WRS:-}" ]]; then echo "rdma-read-max-inflight-wrs = ${RDMA_READ_MAX_INFLIGHT_WRS}"; fi
     if [[ -n "${QUERY_BATCH_SIZE:-}" ]]; then echo "query-batch-size = ${QUERY_BATCH_SIZE}"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then echo "use-rabitq = true"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then
@@ -287,17 +290,25 @@ write_service_config() {
       echo "storage-owner-peer-rdma-tokens = ${STORAGE_OWNER_PEER_RDMA_TOKENS:-8}"
       echo "storage-owner-rpc-depth = ${STORAGE_OWNER_RPC_DEPTH:-16}"
       echo "storage-owner-rpc-timeout-ms = ${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}"
-      echo "storage-owner-handoff-queue-depth = ${STORAGE_OWNER_HANDOFF_QUEUE_DEPTH:-0}"
-      echo "storage-owner-construction-beam-width = ${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-$BUILD_BEAM}"
+      echo "storage-owner-construction-beam-width = ${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-$SEARCH_BEAM}"
       echo "storage-owner-search-snapshot-batch = ${STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH:-64}"
       echo "storage-owner-prune-max-candidates = ${STORAGE_OWNER_PRUNE_MAX_CANDIDATES:-128}"
+      local update_mode="${STORAGE_OWNER_UPDATE_MODE:-exact}"
+      if [[ "$update_mode" != "exact" ]]; then
+        echo "storage-owner-update-mode = ${update_mode}"
+      fi
+      if [[ "$update_mode" == "anchored" ]]; then
+        echo "storage-owner-anchor-hints = ${STORAGE_OWNER_ANCHOR_HINTS:-4}"
+        echo "storage-owner-anchor-beam-width = ${STORAGE_OWNER_ANCHOR_BEAM_WIDTH:-64}"
+        echo "storage-owner-anchor-expand-cap = ${STORAGE_OWNER_ANCHOR_EXPAND_CAP:-16}"
+        echo "storage-owner-anchor-remote-rescue-cap = ${STORAGE_OWNER_ANCHOR_REMOTE_RESCUE_CAP:-4}"
+        echo "storage-owner-anchor-audit-rate = ${STORAGE_OWNER_ANCHOR_AUDIT_RATE:-256}"
+        echo "storage-owner-anchor-min-overlap = ${STORAGE_OWNER_ANCHOR_MIN_OVERLAP:-0.5}"
+      fi
       echo "storage-owner-reverse-mode = ${STORAGE_OWNER_REVERSE_MODE:-async}"
       echo "storage-owner-reverse-queue-depth = ${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
       echo "storage-owner-reverse-flush-us = ${STORAGE_OWNER_REVERSE_FLUSH_US:-200}"
       echo "storage-owner-reverse-coalesce-max = ${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}"
-    if [[ "${STORAGE_OWNER_TRANSITIVE_SEARCH:-0}" == "1" ]]; then
-      echo "storage-owner-transitive-search = true"
-    fi
     fi
   } > "$output"
 }

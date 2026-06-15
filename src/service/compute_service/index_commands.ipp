@@ -115,7 +115,8 @@ bool ComputeService<Distance>::initialize_compute_side_idmap(
       }
       loaded[entry.id] = ComputeSideIdEntry{
         RemotePtr{entry.rptr_raw},
-        (entry.flags & vamana::idmap::kDeleted) != 0};
+        (entry.flags & vamana::idmap::kDeleted) != 0,
+        owner};
     }
   }
   {
@@ -172,9 +173,12 @@ bool ComputeService<Distance>::mark_remote_deleted(RemotePtr ptr) {
 }
 
 template <class Distance>
-void ComputeService<Distance>::publish_compute_side_id(node_t id, RemotePtr ptr, bool deleted) {
+void ComputeService<Distance>::publish_compute_side_id(node_t id,
+                                                       RemotePtr ptr,
+                                                       bool deleted,
+                                                       u32 owner_storage) {
   std::lock_guard<std::mutex> lock(compute_side_idmap_mutex_);
-  compute_side_idmap_[id] = ComputeSideIdEntry{ptr, deleted};
+  compute_side_idmap_[id] = ComputeSideIdEntry{ptr, deleted, owner_storage};
 }
 
 template <class Distance>
@@ -191,6 +195,31 @@ bool ComputeService<Distance>::lookup_compute_side_id(node_t id, RemotePtr* ptr,
     *deleted = it->second.deleted;
   }
   return true;
+}
+
+template <class Distance>
+u32 ComputeService<Distance>::storage_owner_for_id(node_t id) const {
+  {
+    std::lock_guard<std::mutex> lock(compute_side_idmap_mutex_);
+    const auto it = compute_side_idmap_.find(id);
+    if (it != compute_side_idmap_.end()) {
+      return it->second.owner_storage;
+    }
+  }
+  return num_servers_ == 0 ? 0 : static_cast<u32>(id % num_servers_);
+}
+
+template <class Distance>
+vamana::anchor::Route ComputeService<Distance>::route_storage_owner_update(
+    const InsertItem& item,
+    std::optional<u32> owner_override) const {
+  if (anchor_index_ == nullptr || anchor_index_->empty()) {
+    vamana::anchor::Route route;
+    route.owner = owner_override.value_or(
+      num_servers_ == 0 ? 0 : static_cast<u32>(item.id % num_servers_));
+    return route;
+  }
+  return anchor_index_->route(item.values, config_.storage_owner_anchor_hints, owner_override);
 }
 
 template <class Distance>

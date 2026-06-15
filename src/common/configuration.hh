@@ -6,6 +6,7 @@
 #include <iostream>
 #include <library/configuration.hh>
 
+#include "constants.hh"
 #include "index_path.hh"
 #include "types.hh"
 #include "vector_dtype.hh"
@@ -41,7 +42,10 @@ public:
   u32 gpu_device{};       // CUDA device ID
   bool gpudirect_rdma{};  // Enable GPUDirect RDMA (read vectors directly into GPU buffers)
   u32 expansion_batch{1};   // Batch K beam expansions per iteration (1=serial)
-  u32 rdma_qp_pool_size{1}; // QPs per memory node per SharedContext (1=default)
+  u32 rdma_qp_pool_size{};   // QPs per memory node per SharedContext (0=auto)
+  str rdma_read_batch_mode{"adaptive"};
+  u32 rdma_read_chain_size{};
+  u32 rdma_read_max_inflight_wrs{};
   u32 query_batch_size{1};  // Fuse GPU across N queries (1=single query)
   bool use_rabitq{};        // Use the local RaBitQ gate before exact beam insertion
   str rabitq_mode{"exact_safe"};
@@ -73,15 +77,21 @@ public:
   u32 storage_owner_peer_rdma_tokens{8};
   u32 storage_owner_rpc_depth{8};
   u32 storage_owner_rpc_timeout_ms{30000};
-  u32 storage_owner_handoff_queue_depth{};
   u32 storage_owner_construction_beam_width{128};
   u32 storage_owner_search_snapshot_batch{64};
   u32 storage_owner_prune_max_candidates{128};
+  str storage_owner_update_mode{"exact"};
+  u32 storage_owner_anchor_hints{4};
+  u32 storage_owner_anchor_beam_width{64};
+  u32 storage_owner_anchor_expand_cap{16};
+  u32 storage_owner_anchor_remote_rescue_cap{4};
+  u32 storage_owner_anchor_audit_rate{256};
+  f64 storage_owner_anchor_min_overlap{0.5};
+  bool storage_owner_anchor_rehome_upsert{false};
   str storage_owner_reverse_mode{"async"};
   u32 storage_owner_reverse_queue_depth{65536};
   u32 storage_owner_reverse_flush_us{200};
   u32 storage_owner_reverse_coalesce_max{256};
-  bool storage_owner_transitive_search{false};
 
   // Legacy aliases for compatibility
   u32& ef_search = beam_width;
@@ -108,6 +118,8 @@ public:
     process_program_options(argc, argv);
     insert_execution = normalize_mode(insert_execution);
     storage_owner_reverse_mode = normalize_mode(storage_owner_reverse_mode);
+    storage_owner_update_mode = normalize_mode(storage_owner_update_mode);
+    rdma_read_batch_mode = normalize_mode(rdma_read_batch_mode);
 
     if (!is_server) {
       validate_compute_node_options(argv);
@@ -184,9 +196,6 @@ private:
       "storage-owner-rpc-timeout-ms",
       po::value<u32>(&storage_owner_rpc_timeout_ms)->default_value(storage_owner_rpc_timeout_ms),
       "Maximum time to wait for one storage_owner insert RPC response.")(
-      "storage-owner-handoff-queue-depth",
-      po::value<u32>(&storage_owner_handoff_queue_depth)->default_value(storage_owner_handoff_queue_depth),
-      "Maximum queued handoff requests per peer. 0 uses 4x --storage-owner-rpc-depth.")(
       "storage-owner-construction-beam-width",
       po::value<u32>(&storage_owner_construction_beam_width)->default_value(storage_owner_construction_beam_width),
       "Storage-owner online construction beam width. 0 uses --beam-width-construction unchanged.")(
@@ -196,6 +205,30 @@ private:
       "storage-owner-prune-max-candidates",
       po::value<u32>(&storage_owner_prune_max_candidates)->default_value(storage_owner_prune_max_candidates),
       "Maximum candidates considered by storage-owner robust-prune. 0 disables the cap.")(
+      "storage-owner-update-mode",
+      po::value<str>(&storage_owner_update_mode)->default_value(storage_owner_update_mode),
+      "Storage-owner update search: exact or anchored.")(
+      "storage-owner-anchor-hints",
+      po::value<u32>(&storage_owner_anchor_hints)->default_value(storage_owner_anchor_hints),
+      "Anchor entry points attached to each storage-owner mutation.")(
+      "storage-owner-anchor-beam-width",
+      po::value<u32>(&storage_owner_anchor_beam_width)->default_value(storage_owner_anchor_beam_width),
+      "Maximum beam width for anchored storage-owner search.")(
+      "storage-owner-anchor-expand-cap",
+      po::value<u32>(&storage_owner_anchor_expand_cap)->default_value(storage_owner_anchor_expand_cap),
+      "Maximum graph expansions in anchored foreground search.")(
+      "storage-owner-anchor-remote-rescue-cap",
+      po::value<u32>(&storage_owner_anchor_remote_rescue_cap)->default_value(storage_owner_anchor_remote_rescue_cap),
+      "Maximum remote-node expansions in anchored foreground search.")(
+      "storage-owner-anchor-audit-rate",
+      po::value<u32>(&storage_owner_anchor_audit_rate)->default_value(storage_owner_anchor_audit_rate),
+      "Run one sampled exact shadow audit per N successful anchored inserts. 0 disables auditing.")(
+      "storage-owner-anchor-min-overlap",
+      po::value<f64>(&storage_owner_anchor_min_overlap)->default_value(storage_owner_anchor_min_overlap),
+      "Minimum selected-neighbor overlap accepted by anchor shadow audits.")(
+      "storage-owner-anchor-rehome-upsert",
+      po::value<bool>(&storage_owner_anchor_rehome_upsert)->default_value(storage_owner_anchor_rehome_upsert),
+      "Allow anchored upserts to migrate ID ownership. Disabled until distributed two-phase ownership is enabled.")(
       "storage-owner-reverse-mode",
       po::value<str>(&storage_owner_reverse_mode)->default_value(storage_owner_reverse_mode),
       "Reverse-update completion mode for storage_owner inserts: async or sync.")(
@@ -208,16 +241,22 @@ private:
       "storage-owner-reverse-coalesce-max",
       po::value<u32>(&storage_owner_reverse_coalesce_max)->default_value(storage_owner_reverse_coalesce_max),
       "Maximum reverse-update operations coalesced by one peer worker batch.")(
-      "storage-owner-transitive-search",
-      po::bool_switch(&storage_owner_transitive_search)->default_value(false),
-      "Use transitive (RPC-based) beam search for storage_owner inserts instead of fine-grained RDMA reads.")(
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
       "expansion-batch,K", po::value<u32>(&expansion_batch)->default_value(1),
       "Number of beam nodes expanded per iteration.")(
-      "rdma-qp-pool-size", po::value<u32>(&rdma_qp_pool_size)->default_value(1),
-      "QPs per memory node per SharedContext. >1 enables parallel RDMA reads to the same node.")(
+      "rdma-qp-pool-size", po::value<u32>(&rdma_qp_pool_size)->default_value(rdma_qp_pool_size),
+      "QPs per memory node per SharedContext. 0 selects the automatic pool size.")(
+      "rdma-read-batch-mode",
+      po::value<str>(&rdma_read_batch_mode)->default_value(rdma_read_batch_mode),
+      "Vector RDMA batch scheduling mode: adaptive or legacy.")(
+      "rdma-read-chain-size",
+      po::value<u32>(&rdma_read_chain_size)->default_value(rdma_read_chain_size),
+      "Maximum RDMA READ WRs per signaled chain. 0 derives it from device capabilities.")(
+      "rdma-read-max-inflight-wrs",
+      po::value<u32>(&rdma_read_max_inflight_wrs)->default_value(rdma_read_max_inflight_wrs),
+      "Maximum outstanding bulk READ WRs per QP. 0 derives it from the send queue capacity.")(
       "query-batch-size", po::value<u32>(&query_batch_size)->default_value(1),
       "Fuse GPU/D2H across N queries processed in lockstep (1=disabled, 2-4=batch).")(
       "use-rabitq", po::bool_switch(&use_rabitq)->default_value(false),
@@ -281,6 +320,11 @@ private:
 
     if (store_index && load_index) {
       std::cerr << "[ERROR]: --store-index and --load-index cannot be used in conjunction" << std::endl;
+      exit_with_help_message(argv);
+    }
+
+    if (rdma_read_batch_mode != "adaptive" && rdma_read_batch_mode != "legacy") {
+      std::cerr << "[ERROR]: --rdma-read-batch-mode must be adaptive or legacy" << std::endl;
       exit_with_help_message(argv);
     }
 
@@ -368,6 +412,19 @@ private:
         std::cerr << "[ERROR]: --storage-owner-search-snapshot-batch must be > 0" << std::endl;
         exit_with_help_message(argv);
       }
+      if (storage_owner_update_mode != "exact" && storage_owner_update_mode != "anchored") {
+        std::cerr << "[ERROR]: --storage-owner-update-mode must be exact or anchored" << std::endl;
+        exit_with_help_message(argv);
+      }
+      if (storage_owner_update_mode == "anchored" &&
+          (ip_distance || storage_owner_anchor_hints == 0 ||
+           storage_owner_anchor_beam_width == 0 || storage_owner_anchor_expand_cap == 0 ||
+           storage_owner_anchor_min_overlap < 0.0 || storage_owner_anchor_min_overlap > 1.0 ||
+           storage_owner_anchor_rehome_upsert)) {
+        std::cerr << "[ERROR]: invalid anchored storage-owner configuration; L2 is required and "
+                     "upsert rehome is not enabled in this protocol version" << std::endl;
+        exit_with_help_message(argv);
+      }
       if (storage_owner_reverse_mode != "async" && storage_owner_reverse_mode != "sync") {
         std::cerr << "[ERROR]: --storage-owner-reverse-mode must be async or sync" << std::endl;
         exit_with_help_message(argv);
@@ -411,6 +468,10 @@ public:
   }
 
   bool use_storage_owner_insert() const { return insert_execution == "storage_owner"; }
+  u32 effective_rdma_qp_pool_size() const {
+    if (rdma_qp_pool_size != 0) return rdma_qp_pool_size;
+    return rdma_read_batch_mode == "legacy" ? 1 : MAX_QPS;
+  }
 
   friend std::ostream& operator<<(std::ostream& os, const IndexConfiguration& config) {
     os << static_cast<const Configuration&>(config);
@@ -447,8 +508,6 @@ public:
         os << std::setw(width) << "storage batch wait(us): " << config.storage_owner_batch_wait_us << std::endl;
         os << std::setw(width) << "storage peer RDMA tokens: " << config.storage_owner_peer_rdma_tokens << std::endl;
         os << std::setw(width) << "storage RPC depth: " << config.storage_owner_rpc_depth << std::endl;
-        os << std::setw(width) << "storage handoff queue depth: "
-           << config.storage_owner_handoff_queue_depth << std::endl;
         os << std::setw(width) << "storage RPC timeout(ms): " << config.storage_owner_rpc_timeout_ms << std::endl;
         os << std::setw(width) << "storage construction beam: "
            << config.storage_owner_construction_beam_width << std::endl;
@@ -456,6 +515,15 @@ public:
            << config.storage_owner_search_snapshot_batch << std::endl;
         os << std::setw(width) << "storage prune max candidates: "
            << config.storage_owner_prune_max_candidates << std::endl;
+        os << std::setw(width) << "storage update mode: " << config.storage_owner_update_mode << std::endl;
+        if (config.storage_owner_update_mode == "anchored") {
+          os << std::setw(width) << "anchor hints: " << config.storage_owner_anchor_hints << std::endl;
+          os << std::setw(width) << "anchor beam width: " << config.storage_owner_anchor_beam_width << std::endl;
+          os << std::setw(width) << "anchor expand cap: " << config.storage_owner_anchor_expand_cap << std::endl;
+          os << std::setw(width) << "anchor remote cap: "
+             << config.storage_owner_anchor_remote_rescue_cap << std::endl;
+          os << std::setw(width) << "anchor audit rate: " << config.storage_owner_anchor_audit_rate << std::endl;
+        }
         os << std::setw(width) << "storage reverse mode: " << config.storage_owner_reverse_mode << std::endl;
         os << std::setw(width) << "storage reverse queue depth: "
            << config.storage_owner_reverse_queue_depth << std::endl;
@@ -463,8 +531,6 @@ public:
            << config.storage_owner_reverse_flush_us << std::endl;
         os << std::setw(width) << "storage reverse coalesce max: "
            << config.storage_owner_reverse_coalesce_max << std::endl;
-        os << std::setw(width) << "storage transitive search: "
-           << (config.storage_owner_transitive_search ? "true" : "false") << std::endl;
         os << std::setw(width) << "storage peers: " << "[";
         for (const str& node : config.storage_peers) {
           os << node << ", ";
@@ -478,7 +544,14 @@ public:
       os << std::setw(width) << "GPU device: " << config.gpu_device << std::endl;
       os << std::setw(width) << "GPUDirect RDMA: " << (config.gpudirect_rdma ? "true" : "false") << std::endl;
       os << std::setw(width) << "Expansion Batch (K): " << config.expansion_batch << std::endl;
-      os << std::setw(width) << "RDMA QP Pool Size: " << config.rdma_qp_pool_size << std::endl;
+      os << std::setw(width) << "RDMA QP Pool Size: "
+         << config.effective_rdma_qp_pool_size();
+      if (config.rdma_qp_pool_size == 0) os << " (auto)";
+      os << std::endl;
+      os << std::setw(width) << "RDMA read batch mode: " << config.rdma_read_batch_mode << std::endl;
+      os << std::setw(width) << "RDMA read chain size: " << config.rdma_read_chain_size << std::endl;
+      os << std::setw(width) << "RDMA read max inflight WRs: "
+         << config.rdma_read_max_inflight_wrs << std::endl;
       os << std::setw(width) << "Query Batch Size: " << config.query_batch_size << std::endl;
       os << std::setw(width) << "Use RaBitQ: " << (config.use_rabitq ? "true" : "false") << std::endl;
       os << std::setw(width) << "RaBitQ mode: " << config.rabitq_mode << std::endl;

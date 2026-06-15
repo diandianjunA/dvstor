@@ -87,12 +87,6 @@ inline void add_storage_owner_breakdown(
                           per_item_ns(counters.storage_owner_search_beam_update_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_search_result_sort,
                           per_item_ns(counters.storage_owner_search_result_sort_ns, item_count));
-  sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_handoff_queue_wait,
-                          per_item_ns(counters.storage_owner_handoff_queue_wait_ns, item_count));
-  sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_handoff_send,
-                          per_item_ns(counters.storage_owner_handoff_send_ns, item_count));
-  sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_handoff_response_wait,
-                          per_item_ns(counters.storage_owner_handoff_response_wait_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_prune_snapshot_read,
                           per_item_ns(counters.storage_owner_prune_snapshot_read_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_prune_distance,
@@ -109,23 +103,27 @@ inline void add_storage_owner_counters(
   if (!sample) {
     return;
   }
-  service::breakdown::ThreadCounterDelta delta{};
-  delta.storage_owner_handoff_requests = counters.storage_owner_handoff_requests;
-  delta.storage_owner_handoff_successes = counters.storage_owner_handoff_successes;
-  delta.storage_owner_handoff_queue_full = counters.storage_owner_handoff_queue_full;
-  delta.storage_owner_handoff_timeouts = counters.storage_owner_handoff_timeouts;
-  delta.storage_owner_handoff_overloaded = counters.storage_owner_handoff_overloaded;
-  delta.storage_owner_handoff_failed = counters.storage_owner_handoff_failed;
-  delta.storage_owner_handoff_request_bytes = counters.storage_owner_handoff_request_bytes;
-  delta.storage_owner_handoff_response_bytes = counters.storage_owner_handoff_response_bytes;
-  delta.storage_owner_handoff_remote_handler_ns = counters.storage_owner_handoff_remote_handler_ns;
-  delta.storage_owner_handoff_remote_expanded_nodes = counters.storage_owner_handoff_remote_expanded_nodes;
-  delta.storage_owner_handoff_remote_snapshot_reads = counters.storage_owner_handoff_remote_snapshot_reads;
-  delta.storage_owner_handoff_remote_neighbor_reads = counters.storage_owner_handoff_remote_neighbor_reads;
-  delta.storage_owner_handoff_response_beam_entries = counters.storage_owner_handoff_response_beam_entries;
-  delta.storage_owner_handoff_response_visited_entries = counters.storage_owner_handoff_response_visited_entries;
-  delta.storage_owner_handoff_response_visited_truncated = counters.storage_owner_handoff_response_visited_truncated;
-  sample->add_counters(delta);
+  if (counters.storage_owner_anchor_hints == 0 &&
+      counters.storage_owner_anchor_valid_hints == 0 &&
+      counters.storage_owner_anchor_expansions == 0 &&
+      counters.storage_owner_anchor_remote_expansions == 0 &&
+      counters.storage_owner_anchor_fallbacks == 0 &&
+      counters.storage_owner_anchor_audits == 0 &&
+      counters.storage_owner_anchor_audit_failures == 0) {
+    return;
+  }
+  if (sample->storage_owner_anchor == nullptr) {
+    sample->storage_owner_anchor =
+      std::make_shared<service::breakdown::StorageOwnerAnchorCounters>();
+  }
+  auto& anchor = *sample->storage_owner_anchor;
+  anchor.hints += counters.storage_owner_anchor_hints;
+  anchor.valid_hints += counters.storage_owner_anchor_valid_hints;
+  anchor.expansions += counters.storage_owner_anchor_expansions;
+  anchor.remote_expansions += counters.storage_owner_anchor_remote_expansions;
+  anchor.fallbacks += counters.storage_owner_anchor_fallbacks;
+  anchor.audits += counters.storage_owner_anchor_audits;
+  anchor.audit_failures += counters.storage_owner_anchor_audit_failures;
 }
 
 inline void add_storage_owner_sender_breakdown(

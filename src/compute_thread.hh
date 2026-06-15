@@ -50,8 +50,7 @@ public:
 
   void poll_cq() {
     Context::poll_send_cq(send_wcs.data(), max_send_queue_wr_, ctx->get_cq(), [&](u64 wr_id) {
-      auto [ctx_offset, coroutine_id] = decode_64bit(wr_id);
-      --ctx->registered_threads[ctx_offset]->post_balances[coroutine_id];
+      ctx->complete_send(wr_id);
     });
   }
 
@@ -76,7 +75,7 @@ public:
     return post_balances[coroutine_id] == 0 && gpu_post_balances[coroutine_id] == 0;
   }
 
-  void track_post() { ++post_balances[running_coroutine_]; }
+  void track_post(u32 count = 1) { post_balances[running_coroutine_] += count; }
   void track_gpu_post() { ++gpu_post_balances[running_coroutine_]; }
   void set_current_coroutine(u32 id) { running_coroutine_ = id; }
   u32 current_coroutine_id() const { return running_coroutine_; }

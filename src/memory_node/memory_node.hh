@@ -67,12 +67,6 @@ class MemoryNode {
     std::chrono::steady_clock::time_point received_at{};
   };
 
-  struct PeerHandoffTask {
-    u32 source_shard{};
-    vec<byte_t> payload;
-    std::chrono::steady_clock::time_point received_at{};
-  };
-
   struct PeerReverseUpdateResponse {
     u32 destination_shard{};
     service::storage_owner::PeerRpcHeader header{};
@@ -96,11 +90,6 @@ private:
   using PeerRpcRuntimeState = memory_node_detail::PeerRpcRuntimeState;
   using PeerPendingSend = memory_node_detail::PeerPendingSend;
   using PeerRpcMessage = memory_node_detail::PeerRpcMessage;
-  using HandoffRequestState = memory_node_detail::HandoffRequestState;
-  using HandoffResponseTask = memory_node_detail::HandoffResponseTask;
-  using HandoffResult = memory_node_detail::HandoffResult;
-  using HandoffResultStatus = memory_node_detail::HandoffResultStatus;
-  using PeerHandoffState = memory_node_detail::PeerHandoffState;
   using StorageOwnerInsertTask = memory_node_detail::StorageOwnerInsertTask;
   using StorageOwnerThread = memory_node_detail::StorageOwnerThread;
   using StorageOwnerInsertJob = memory_node_detail::StorageOwnerInsertJob;
@@ -108,21 +97,15 @@ private:
 
   static constexpr u32 kPeerSyncWrOwner = std::numeric_limits<u32>::max();
   static constexpr u32 kPeerAsyncWrOwner = std::numeric_limits<u32>::max() - 1;
-  static constexpr u32 kPeerHandoffWrOwner = std::numeric_limits<u32>::max() - 2;
   static constexpr u32 kPeerSafeRdAtomic = 8;
   static constexpr u32 kPeerRpcFlagNoResponse = 1u;
-
-  struct SearchHandoffAwaitable {
-    std::shared_ptr<HandoffRequestState> state;
-
-    bool await_ready() const { return state->completed.load(std::memory_order_acquire); }
-    static void await_suspend(std::coroutine_handle<>) {}
-    HandoffResult await_resume();
-  };
 
   // Lifecycle and commands
   static u64 elapsed_ns_since(const std::chrono::steady_clock::time_point start);
   static u64 scale_ns(const u64 value, const u32 part, const u32 total);
+  static double storage_owner_candidate_overlap(const vec<RemotePtr>& lhs,
+                                                const vec<RemotePtr>& rhs,
+                                                u32 limit);
   static InsertBreakdownCounters scale_breakdown(const InsertBreakdownCounters& counters,
                                                  const u32 part,
                                                  const u32 total);
@@ -145,7 +128,6 @@ private:
   void acquire_peer_rdma_read_credit(u32 shard_id, u32 qp_idx);
   u64 next_peer_sync_wr_id();
   u64 next_peer_async_wr_id();
-  u64 next_peer_handoff_wr_id();
   void register_peer_pending_send_locked(u64 wr_id, PeerPendingSend pending);
   void handle_peer_send_completion(u64 wr_id);
   void poll_peer_send_cq();
@@ -164,23 +146,10 @@ private:
 
   // Peer reverse-update RPC
   void setup_peer_rpc_runtime(const Configuration& config);
-  size_t peer_rpc_sync_send_offset(u32 peer_id) const;
-  size_t peer_rpc_async_send_offset(u32 peer_id, u32 slot_id) const;
-  SearchHandoffAwaitable async_search_handoff(u32 target_shard,
-                                              vec<byte_t>&& message,
-                                              StorageOwnerThread& thread,
-                                              const Configuration& config);
-  void progress_handoff_runtime(const Configuration& config);
-  void handle_handoff_response(const service::storage_owner::SearchHandoffResponseHeader& response,
-                               const byte_t* payload,
-                               size_t bytes);
-  void handle_handoff_send_completion(u64 wr_id);
-  bool enqueue_handoff_response(u32 target_shard, vec<byte_t>&& payload);
-  void complete_handoff_locked(const std::shared_ptr<HandoffRequestState>& request,
-                               HandoffResultStatus status,
-                               vec<byte_t>&& response = {});
   void start_peer_reverse_update_runtime(const Configuration& config);
   void stop_peer_reverse_update_runtime();
+  size_t peer_rpc_sync_send_offset(u32 peer_id) const;
+  size_t peer_rpc_async_send_offset(u32 peer_id, u32 slot_id) const;
   size_t peer_rpc_receive_offset(u32 peer_id, u32 slot_id) const;
   void repost_peer_rpc_receive(u32 peer_id, u32 slot_id);
   void send_peer_rpc_message(u32 peer_id, const void* payload, size_t bytes);
@@ -201,7 +170,6 @@ private:
                                             bool success);
   void peer_rpc_progress_loop();
   void peer_reverse_update_worker_loop(u32 worker_id);
-  void peer_handoff_worker_loop();
   void peer_reverse_response_loop();
   void peer_reverse_outgoing_loop();
   bool handle_peer_rpc_requests(vec<PeerRpcMessage>& requests, const Configuration& config);
@@ -237,6 +205,8 @@ private:
   bool execute_storage_owner_batch_items_async(const node_t* ids,
                                                const service::storage_owner::MutationKind* kinds,
                                                const element_t* vectors,
+                                               const u64* anchor_hints,
+                                               u32 anchor_hint_count,
                                                size_t item_count,
                                                StorageOwnerThread& thread,
                                                InsertBreakdownCounters& breakdown,
@@ -253,6 +223,8 @@ private:
   bool execute_storage_owner_batch_items(const node_t* ids,
                                          const service::storage_owner::MutationKind* kinds,
                                          const element_t* vectors,
+                                         const u64* anchor_hints,
+                                         u32 anchor_hint_count,
                                          size_t item_count,
                                          InsertBreakdownCounters& breakdown,
                                          const Configuration& config,
@@ -296,39 +268,21 @@ private:
                                         const Configuration& config,
                                         InsertBreakdownCounters* breakdown = nullptr);
 
-  // Transitive (handoff-based) beam search for storage_owner inserts.
-  // When enabled, exhausts local nodes first, then hands off to remote shards via RPC
-  // instead of fine-grained RDMA reads.
-
-  // Expand all local nodes in beam (helper for transitive search).
-  bool expand_all_local_nodes(vec<BeamEntry>& beam,
-                              hashset_t<RemotePtr>& visited,
-                              const span<const element_t> query,
-                              const Configuration& config,
-                              u32 local_shard_id,
-                              InsertBreakdownCounters* breakdown,
-                              u64* expanded_count = nullptr,
-                              u64* snapshot_read_count = nullptr,
-                              u64* neighbor_read_count = nullptr);
-  StorageOwnerInsertCoroutine beam_search_candidates_transitive_async(
-      const span<const element_t> query,
-      RemotePtr medoid,
-      const Configuration& config,
-      StorageOwnerThread& thread,
-      InsertBreakdownCounters* breakdown);
-
-  // Process an incoming search handoff RPC from a peer storage node.
-  bool handle_search_handoff_rpc(u32 source_shard,
-                                 const service::storage_owner::SearchHandoffRequestHeader* req,
-                                 const byte_t* payload,
-                                 const Configuration& config);
-
-  // Send a search handoff request to a peer and wait for the response.
   auto beam_search_candidates_async(const span<const element_t> query,
                                     RemotePtr medoid,
                                     const Configuration& config,
                                     StorageOwnerThread& thread,
                                     InsertBreakdownCounters* breakdown = nullptr) -> StorageOwnerInsertCoroutine;
+  vec<RemotePtr> anchor_search_candidates(const span<const element_t> query,
+                                          const vec<RemotePtr>& anchor_hints,
+                                          const Configuration& config,
+                                          InsertBreakdownCounters* breakdown = nullptr);
+  auto anchor_search_candidates_async(const span<const element_t> query,
+                                      const vec<RemotePtr>& anchor_hints,
+                                      const Configuration& config,
+                                      StorageOwnerThread& thread,
+                                      InsertBreakdownCounters* breakdown = nullptr)
+    -> StorageOwnerInsertCoroutine;
   vec<RemotePtr> robust_prune_cpu(const byte_t* source,
                                   VectorDType source_dtype,
                                   const vec<RemotePtr>& candidates,
@@ -386,15 +340,6 @@ private:
   HugePage<byte_t> peer_scratch_buffer_;
   std::unique_ptr<LocalMemoryRegion> peer_scratch_region_;
   PeerRpcRuntimeState peer_rpc_runtime_;
-  vec<PeerHandoffState> peer_handoff_states_;
-  std::unordered_map<u64, std::shared_ptr<HandoffRequestState>> peer_handoff_inflight_;
-  std::unordered_map<u64, std::pair<u32, u32>> peer_handoff_send_slots_;
-  std::mutex peer_handoff_runtime_mutex_;
-  size_t peer_handoff_queue_limit_{};
-  std::atomic<u64> peer_handoff_queue_full_{0};
-  std::atomic<u64> peer_handoff_timeouts_{0};
-  std::atomic<u64> peer_handoff_overloaded_{0};
-  std::atomic<u64> peer_handoff_late_responses_{0};
   std::unordered_map<u64, service::storage_owner::PeerRpcHeader> peer_rpc_responses_;
   std::unordered_map<u64, vec<byte_t>> peer_rpc_response_payloads_;
   std::mutex peer_rpc_mutex_;
@@ -402,15 +347,15 @@ private:
   std::mutex peer_rpc_send_mutex_;
   std::mutex peer_send_cq_mutex_;
   std::mutex peer_completion_mutex_;
-  vec<vec<std::unique_ptr<std::mutex>>> peer_qp_send_mutexes_;
   vec<ibv_wc> peer_send_wcs_;
   std::unordered_set<u64> peer_sync_completions_;
   std::unordered_map<u64, PeerPendingSend> peer_pending_sends_;
   vec<std::atomic<u32>> peer_rdma_read_outstanding_;
+  std::atomic<u64> storage_owner_anchor_insert_sequence_{0};
   vec<vec<std::atomic<u32>>> peer_rdma_read_qp_outstanding_;
+  vec<vec<std::unique_ptr<std::mutex>>> peer_qp_send_mutexes_;
   std::atomic<u32> peer_sync_wr_id_counter_{1};
   std::atomic<u32> peer_async_wr_id_counter_{1};
-  std::atomic<u32> peer_handoff_wr_id_counter_{1};
   std::atomic<u32> peer_async_rdma_outstanding_{0};
   std::atomic<u64> next_peer_request_id_{1};
   std::thread peer_rpc_progress_thread_;
@@ -421,11 +366,6 @@ private:
   std::mutex peer_reverse_tasks_mutex_;
   std::condition_variable peer_reverse_tasks_cv_;
   std::deque<PeerReverseUpdateTask> peer_reverse_tasks_;
-  std::deque<PeerHandoffTask> peer_handoff_tasks_;
-  std::mutex peer_handoff_tasks_mutex_;
-  std::condition_variable peer_handoff_tasks_cv_;
-  std::atomic<bool> peer_handoff_shutdown_{false};
-  vec<std::thread> peer_handoff_workers_;
   std::mutex peer_reverse_responses_mutex_;
   std::condition_variable peer_reverse_responses_cv_;
   std::deque<PeerReverseUpdateResponse> peer_reverse_responses_;
@@ -434,7 +374,6 @@ private:
   std::deque<PeerReverseOutgoingTask> peer_reverse_outgoing_;
   std::atomic<bool> peer_reverse_shutdown_{false};
   std::atomic<bool> peer_reverse_workers_done_{false};
-  std::atomic<bool> peer_rpc_producers_done_{false};
   size_t peer_reverse_task_queue_limit_{1024};
   size_t peer_reverse_outgoing_queue_limit_{1024};
   InsertRuntimeState insert_runtime_;

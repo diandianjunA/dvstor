@@ -15,7 +15,8 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   }
 
   if (cm_.is_initiator) {
-    configuration::Parameters p{config_.num_threads, false, config_.routing, config_.rdma_qp_pool_size};
+    configuration::Parameters p{
+      config_.num_threads, false, config_.routing, config_.effective_rdma_qp_pool_size()};
     for (const QP& qp : cm_.server_qps) {
       qp->post_send_inlined(&p, sizeof(configuration::Parameters), IBV_WR_SEND);
       context_.poll_send_cq_until_completion();
@@ -142,6 +143,21 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                  std::to_string(rabitq_cache_->decode_table_bytes()) + " bytes, NUMA " +
                  (rabitq_cache_->numa_interleaved() ? "interleaved" : "local"));
   }
+  if (config_.use_storage_owner_insert() && config_.storage_owner_update_mode == "anchored") {
+    anchor_index_ = std::make_unique<vamana::anchor::Index>();
+    str anchor_error;
+    if (!have_startup_metadata || startup_metadata.anchor_format != "owner_anchor_v1" ||
+        !anchor_index_->load(config_.resolved_index_prefix(), config_.dim, num_servers_, &anchor_error)) {
+      anchor_index_.reset();
+      throw std::runtime_error(
+        "anchored storage-owner sidecar unavailable; refusing to run ALDI without anchors: " +
+        anchor_error);
+    } else {
+      print_status("storage-owner anchors: entries=" +
+                   std::to_string(anchor_index_->anchor_count()) + " memory=" +
+                   std::to_string(anchor_index_->memory_bytes()) + " bytes");
+    }
+  }
   print_status(vamana_->use_rabitq()
     ? "search: RFQ5 RaBitQ " + config_.rabitq_mode + " + GPUDirect exact beam"
     : "search: exact");
@@ -149,8 +165,14 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,
                                               config_.max_send_queue_wr,
                                               static_cast<u64>(config_.cn_memory_gb) * 1073741824ul);
-  worker_pool_->allocate_worker_threads(context_, cm_, remote_access_tokens_, config_.num_coroutines,
-                                         config_.rdma_qp_pool_size);
+  const RdmaReadBatchOptions rdma_batch_options{
+    config_.rdma_read_batch_mode == "adaptive",
+    config_.rdma_read_chain_size,
+    config_.rdma_read_max_inflight_wrs,
+  };
+  worker_pool_->allocate_worker_threads(
+    context_, cm_, remote_access_tokens_, config_.num_coroutines,
+    config_.effective_rdma_qp_pool_size(), rdma_batch_options);
   // Initialize GPU buffers for each compute thread
   const u32 query_batch_factor = std::max<u32>(1, config_.query_batch_size);
   const u32 max_batch = std::max(config_.beam_width * config_.expansion_batch * query_batch_factor,

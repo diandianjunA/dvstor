@@ -178,11 +178,6 @@ u64 MemoryNode::next_peer_async_wr_id() {
   return encode_64bit(kPeerAsyncWrOwner, id);
 }
 
-u64 MemoryNode::next_peer_handoff_wr_id() {
-  const u32 id = peer_handoff_wr_id_counter_.fetch_add(1, std::memory_order_relaxed);
-  return encode_64bit(kPeerHandoffWrOwner, id);
-}
-
 void MemoryNode::register_peer_pending_send_locked(u64 wr_id, PeerPendingSend pending) {
   std::lock_guard<std::mutex> lock(peer_completion_mutex_);
   peer_pending_sends_[wr_id] = pending;
@@ -224,10 +219,6 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
   if (owner == kPeerSyncWrOwner) {
     std::lock_guard<std::mutex> lock(peer_completion_mutex_);
     peer_sync_completions_.insert(wr_id);
-    return;
-  }
-  if (owner == kPeerHandoffWrOwner) {
-    handle_handoff_send_completion(wr_id);
     return;
   }
   if (owner < storage_owner_threads_.size() && storage_owner_threads_[owner]) {

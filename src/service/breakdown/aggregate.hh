@@ -84,6 +84,21 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.vector_rdma_read_ops += delta.vector_rdma_read_ops;
   aggregate.counters.vector_rdma_batch_calls += delta.vector_rdma_batch_calls;
   aggregate.counters.vector_rdma_cqes += delta.vector_rdma_cqes;
+  aggregate.counters.vector_rdma_active_nodes += delta.vector_rdma_active_nodes;
+  aggregate.counters.vector_rdma_active_qps += delta.vector_rdma_active_qps;
+  aggregate.counters.vector_rdma_chain_wrs += delta.vector_rdma_chain_wrs;
+  aggregate.counters.vector_rdma_max_chain_wrs = std::max(
+    aggregate.counters.vector_rdma_max_chain_wrs, delta.vector_rdma_max_chain_wrs);
+  aggregate.counters.vector_rdma_qp_high_water_wrs = std::max(
+    aggregate.counters.vector_rdma_qp_high_water_wrs,
+    delta.vector_rdma_qp_high_water_wrs);
+  aggregate.counters.vector_rdma_credit_waits += delta.vector_rdma_credit_waits;
+  aggregate.counters.vector_rdma_credit_wait_ns += delta.vector_rdma_credit_wait_ns;
+  aggregate.counters.vector_rdma_completion_token_waits +=
+    delta.vector_rdma_completion_token_waits;
+  aggregate.counters.vector_rdma_post_send_calls += delta.vector_rdma_post_send_calls;
+  aggregate.counters.vector_rdma_post_send_retries += delta.vector_rdma_post_send_retries;
+  aggregate.counters.vector_rdma_post_send_errors += delta.vector_rdma_post_send_errors;
   aggregate.counters.h2d_bytes += delta.h2d_bytes;
   aggregate.counters.d2h_bytes += delta.d2h_bytes;
   aggregate.counters.l2_kernels += delta.l2_kernels;
@@ -123,28 +138,15 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
     std::max(aggregate.counters.overflow_prune_max_kernel_threads, sample.overflow_prune_max_kernel_threads);
   aggregate.counters.query_rdma_to_staging_bytes += delta.query_rdma_to_staging_bytes;
   aggregate.counters.query_host_staging_fallback_bytes += delta.query_host_staging_fallback_bytes;
-  aggregate.counters.storage_owner_handoff_requests += delta.storage_owner_handoff_requests;
-  aggregate.counters.storage_owner_handoff_successes += delta.storage_owner_handoff_successes;
-  aggregate.counters.storage_owner_handoff_queue_full += delta.storage_owner_handoff_queue_full;
-  aggregate.counters.storage_owner_handoff_timeouts += delta.storage_owner_handoff_timeouts;
-  aggregate.counters.storage_owner_handoff_overloaded += delta.storage_owner_handoff_overloaded;
-  aggregate.counters.storage_owner_handoff_failed += delta.storage_owner_handoff_failed;
-  aggregate.counters.storage_owner_handoff_request_bytes += delta.storage_owner_handoff_request_bytes;
-  aggregate.counters.storage_owner_handoff_response_bytes += delta.storage_owner_handoff_response_bytes;
-  aggregate.counters.storage_owner_handoff_remote_handler_ns +=
-    delta.storage_owner_handoff_remote_handler_ns;
-  aggregate.counters.storage_owner_handoff_remote_expanded_nodes +=
-    delta.storage_owner_handoff_remote_expanded_nodes;
-  aggregate.counters.storage_owner_handoff_remote_snapshot_reads +=
-    delta.storage_owner_handoff_remote_snapshot_reads;
-  aggregate.counters.storage_owner_handoff_remote_neighbor_reads +=
-    delta.storage_owner_handoff_remote_neighbor_reads;
-  aggregate.counters.storage_owner_handoff_response_beam_entries +=
-    delta.storage_owner_handoff_response_beam_entries;
-  aggregate.counters.storage_owner_handoff_response_visited_entries +=
-    delta.storage_owner_handoff_response_visited_entries;
-  aggregate.counters.storage_owner_handoff_response_visited_truncated +=
-    delta.storage_owner_handoff_response_visited_truncated;
+  aggregate.counters.storage_owner_anchor_hints += delta.storage_owner_anchor_hints;
+  aggregate.counters.storage_owner_anchor_valid_hints += delta.storage_owner_anchor_valid_hints;
+  aggregate.counters.storage_owner_anchor_expansions += delta.storage_owner_anchor_expansions;
+  aggregate.counters.storage_owner_anchor_remote_expansions +=
+    delta.storage_owner_anchor_remote_expansions;
+  aggregate.counters.storage_owner_anchor_fallbacks += delta.storage_owner_anchor_fallbacks;
+  aggregate.counters.storage_owner_anchor_audits += delta.storage_owner_anchor_audits;
+  aggregate.counters.storage_owner_anchor_audit_failures +=
+    delta.storage_owner_anchor_audit_failures;
   aggregate.lock_attempts += sample.lock_attempts;
   aggregate.lock_retries += sample.lock_retries;
   aggregate.cas_failures += sample.cas_failures;

@@ -23,7 +23,7 @@ rdma::vamana::read_vamana_node()      ← 高层语义操作
 | `read_vamana_node_full` | 1次读 | 读完整节点（含邻居） |
 | `read_vamana_id` | 1次读4B | 仅读节点ID |
 | `read_vamana_neighbors` | 2次读 | 分别读edge_count和neighbor_slots |
-| `batch_read_vectors` | N次读 | 批量读N个节点的向量 |
+| `batch_read_vectors` | N个READ WR | 批量读N个节点的向量；每条signaled WR链只产生一个完成事件 |
 | `read_vamana_nodes` | N次读 | 批量读N个完整节点 |
 
 ### 3. 统计追踪模式
@@ -86,6 +86,19 @@ batch_read_vectors(..., &destinations);
 ```
 
 注册流程在`gpu_buffer_manager.cu`中：`ibv_reg_mr(pd, d_candidate_vecs, bytes, IBV_ACCESS_LOCAL_WRITE)`
+
+### 8. 自适应向量READ批处理
+
+向量地址通常不连续，因此不能把N个向量直接变成一个RDMA READ。当前实现仍为每个向量构造一个READ WR，但会：
+
+- 按memory node分组，并将bulk读取分散到QP1..N；QP0保留给medoid、neighbor和原子操作。
+- 根据QP outstanding WR选择负载最低的QP，而不是每批都从QP0开始。
+- 默认按`2 * max_qp_init_rd_atom`限制每条WR链长度，链尾才设置`IBV_SEND_SIGNALED`。
+- 每条链调用一次`track_post()`，CQE到达后同时释放协程余额和QP send credit。
+- 对SQ临时满产生的partial post从`bad_wr`继续提交，不静默丢失链尾完成事件。
+
+相关配置为`rdma-read-batch-mode`、`rdma-qp-pool-size`、`rdma-read-chain-size`和
+`rdma-read-max-inflight-wrs`。`adaptive`为默认模式，`legacy`配合自动QP配置时恢复单QP旧行为。
 
 ## 课后任务
 1. 统计：一次搜索调用中每种RDMA操作的次数

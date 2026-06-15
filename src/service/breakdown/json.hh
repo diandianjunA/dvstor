@@ -80,6 +80,33 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"vector_rdma_read_ops", aggregate.counters.vector_rdma_read_ops},
     {"vector_rdma_batch_calls", aggregate.counters.vector_rdma_batch_calls},
     {"vector_rdma_cqes", aggregate.counters.vector_rdma_cqes},
+    {"vector_rdma_active_nodes", aggregate.counters.vector_rdma_active_nodes},
+    {"vector_rdma_active_qps", aggregate.counters.vector_rdma_active_qps},
+    {"vector_rdma_mean_active_nodes_per_batch",
+     aggregate.counters.vector_rdma_batch_calls == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.vector_rdma_active_nodes) /
+           static_cast<double>(aggregate.counters.vector_rdma_batch_calls)},
+    {"vector_rdma_mean_active_qps_per_batch",
+     aggregate.counters.vector_rdma_batch_calls == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.vector_rdma_active_qps) /
+           static_cast<double>(aggregate.counters.vector_rdma_batch_calls)},
+    {"vector_rdma_mean_chain_wrs",
+     aggregate.counters.vector_rdma_cqes == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.vector_rdma_chain_wrs) /
+           static_cast<double>(aggregate.counters.vector_rdma_cqes)},
+    {"vector_rdma_max_chain_wrs", aggregate.counters.vector_rdma_max_chain_wrs},
+    {"vector_rdma_qp_high_water_wrs",
+     aggregate.counters.vector_rdma_qp_high_water_wrs},
+    {"vector_rdma_credit_waits", aggregate.counters.vector_rdma_credit_waits},
+    {"vector_rdma_credit_wait_ns", aggregate.counters.vector_rdma_credit_wait_ns},
+    {"vector_rdma_completion_token_waits",
+     aggregate.counters.vector_rdma_completion_token_waits},
+    {"vector_rdma_post_send_calls", aggregate.counters.vector_rdma_post_send_calls},
+    {"vector_rdma_post_send_retries", aggregate.counters.vector_rdma_post_send_retries},
+    {"vector_rdma_post_send_errors", aggregate.counters.vector_rdma_post_send_errors},
     {"vector_rdma_reads_per_batch",
      aggregate.counters.vector_rdma_batch_calls == 0
        ? 0.0
@@ -121,6 +148,15 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"rabitq_prefetch_misses", aggregate.counters.rabitq_prefetch_misses},
     {"rabitq_prefetch_disabled_queries",
      aggregate.counters.rabitq_prefetch_disabled_queries},
+    {"storage_owner_anchor_hints", aggregate.counters.storage_owner_anchor_hints},
+    {"storage_owner_anchor_valid_hints", aggregate.counters.storage_owner_anchor_valid_hints},
+    {"storage_owner_anchor_expansions", aggregate.counters.storage_owner_anchor_expansions},
+    {"storage_owner_anchor_remote_expansions",
+     aggregate.counters.storage_owner_anchor_remote_expansions},
+    {"storage_owner_anchor_fallbacks", aggregate.counters.storage_owner_anchor_fallbacks},
+    {"storage_owner_anchor_audits", aggregate.counters.storage_owner_anchor_audits},
+    {"storage_owner_anchor_audit_failures",
+     aggregate.counters.storage_owner_anchor_audit_failures},
     {"rabitq_prefetch_hit_ratio",
      aggregate.counters.rabitq_prefetch_issued == 0
        ? 0.0
@@ -158,63 +194,6 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"overflow_prune_max_kernel_threads", aggregate.counters.overflow_prune_max_kernel_threads},
     {"query_rdma_to_staging_bytes", aggregate.counters.query_rdma_to_staging_bytes},
     {"query_host_staging_fallback_bytes", aggregate.counters.query_host_staging_fallback_bytes},
-    {"storage_owner_handoff_requests", aggregate.counters.storage_owner_handoff_requests},
-    {"storage_owner_handoff_successes", aggregate.counters.storage_owner_handoff_successes},
-    {"storage_owner_handoff_queue_full", aggregate.counters.storage_owner_handoff_queue_full},
-    {"storage_owner_handoff_timeouts", aggregate.counters.storage_owner_handoff_timeouts},
-    {"storage_owner_handoff_overloaded", aggregate.counters.storage_owner_handoff_overloaded},
-    {"storage_owner_handoff_failed", aggregate.counters.storage_owner_handoff_failed},
-    {"storage_owner_handoff_success_ratio",
-     aggregate.counters.storage_owner_handoff_requests == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_handoff_successes) /
-           static_cast<double>(aggregate.counters.storage_owner_handoff_requests)},
-    {"storage_owner_handoff_request_bytes", aggregate.counters.storage_owner_handoff_request_bytes},
-    {"storage_owner_handoff_response_bytes", aggregate.counters.storage_owner_handoff_response_bytes},
-    {"storage_owner_handoff_avg_request_bytes",
-     aggregate.counters.storage_owner_handoff_requests == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_handoff_request_bytes) /
-           static_cast<double>(aggregate.counters.storage_owner_handoff_requests)},
-    {"storage_owner_handoff_avg_response_bytes",
-     aggregate.counters.storage_owner_handoff_requests == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_handoff_response_bytes) /
-           static_cast<double>(aggregate.counters.storage_owner_handoff_requests)},
-    {"storage_owner_handoff_remote_handler_ns",
-     aggregate.counters.storage_owner_handoff_remote_handler_ns},
-    {"storage_owner_handoff_remote_handler_avg_ns",
-     aggregate.counters.storage_owner_handoff_successes == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_handoff_remote_handler_ns) /
-           static_cast<double>(aggregate.counters.storage_owner_handoff_successes)},
-    {"storage_owner_handoff_remote_expanded_nodes",
-     aggregate.counters.storage_owner_handoff_remote_expanded_nodes},
-    {"storage_owner_handoff_remote_snapshot_reads",
-     aggregate.counters.storage_owner_handoff_remote_snapshot_reads},
-    {"storage_owner_handoff_remote_neighbor_reads",
-     aggregate.counters.storage_owner_handoff_remote_neighbor_reads},
-    {"storage_owner_handoff_remote_expanded_per_handoff",
-     aggregate.counters.storage_owner_handoff_successes == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_handoff_remote_expanded_nodes) /
-           static_cast<double>(aggregate.counters.storage_owner_handoff_successes)},
-    {"storage_owner_handoff_remote_snapshot_reads_per_handoff",
-     aggregate.counters.storage_owner_handoff_successes == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_handoff_remote_snapshot_reads) /
-           static_cast<double>(aggregate.counters.storage_owner_handoff_successes)},
-    {"storage_owner_handoff_remote_neighbor_reads_per_handoff",
-     aggregate.counters.storage_owner_handoff_successes == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.storage_owner_handoff_remote_neighbor_reads) /
-           static_cast<double>(aggregate.counters.storage_owner_handoff_successes)},
-    {"storage_owner_handoff_response_beam_entries",
-     aggregate.counters.storage_owner_handoff_response_beam_entries},
-    {"storage_owner_handoff_response_visited_entries",
-     aggregate.counters.storage_owner_handoff_response_visited_entries},
-    {"storage_owner_handoff_response_visited_truncated",
-     aggregate.counters.storage_owner_handoff_response_visited_truncated},
     {"lock_attempts", aggregate.lock_attempts},
     {"lock_retries", aggregate.lock_retries},
     {"cas_failures", aggregate.cas_failures},

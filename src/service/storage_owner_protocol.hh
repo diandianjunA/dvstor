@@ -32,8 +32,6 @@ enum class MutationStatus : u32 {
 enum class PeerRpcType : u32 {
   reverse_update_request = 1,
   reverse_update_response = 2,
-  search_handoff_request = 3,
-  search_handoff_response = 4,
 };
 
 struct InsertBatchRequestHeader {
@@ -44,7 +42,7 @@ struct InsertBatchRequestHeader {
   u32 item_count{};
   u32 vector_dtype{};
   u32 vector_bytes{};
-  u32 reserved{};
+  u32 anchor_hint_count{};
   u64 batch_id{};
 };
 
@@ -56,7 +54,7 @@ struct MutationBatchRequestHeader {
   u32 item_count{};
   u32 vector_dtype{};
   u32 vector_bytes{};
-  u32 reserved{};
+  u32 anchor_hint_count{};
   u64 batch_id{};
 };
 
@@ -92,29 +90,18 @@ struct InsertBreakdownCounters {
   u64 storage_owner_search_distance_ns{};
   u64 storage_owner_search_beam_update_ns{};
   u64 storage_owner_search_result_sort_ns{};
-  u64 storage_owner_handoff_queue_wait_ns{};
-  u64 storage_owner_handoff_send_ns{};
-  u64 storage_owner_handoff_response_wait_ns{};
   u64 storage_owner_prune_snapshot_read_ns{};
   u64 storage_owner_prune_distance_ns{};
   u64 storage_owner_prune_sort_ns{};
   u64 storage_owner_prune_pair_distance_ns{};
 
-  u64 storage_owner_handoff_requests{};
-  u64 storage_owner_handoff_successes{};
-  u64 storage_owner_handoff_queue_full{};
-  u64 storage_owner_handoff_timeouts{};
-  u64 storage_owner_handoff_overloaded{};
-  u64 storage_owner_handoff_failed{};
-  u64 storage_owner_handoff_request_bytes{};
-  u64 storage_owner_handoff_response_bytes{};
-  u64 storage_owner_handoff_remote_handler_ns{};
-  u64 storage_owner_handoff_remote_expanded_nodes{};
-  u64 storage_owner_handoff_remote_snapshot_reads{};
-  u64 storage_owner_handoff_remote_neighbor_reads{};
-  u64 storage_owner_handoff_response_beam_entries{};
-  u64 storage_owner_handoff_response_visited_entries{};
-  u64 storage_owner_handoff_response_visited_truncated{};
+  u64 storage_owner_anchor_hints{};
+  u64 storage_owner_anchor_valid_hints{};
+  u64 storage_owner_anchor_expansions{};
+  u64 storage_owner_anchor_remote_expansions{};
+  u64 storage_owner_anchor_fallbacks{};
+  u64 storage_owner_anchor_audits{};
+  u64 storage_owner_anchor_audit_failures{};
 
   u64 total() const {
     return storage_owner_queue_wait_ns +
@@ -144,19 +131,47 @@ struct ReverseUpdateOp {
   u64 candidate_raw{};
 };
 
-inline size_t insert_batch_request_bytes(u32 item_count, u32 dim) {
-  (void)dim;
-  return sizeof(InsertBatchRequestHeader) +
-         static_cast<size_t>(item_count) * sizeof(node_t) +
-         static_cast<size_t>(item_count) * VamanaNode::vector_bytes();
+constexpr size_t align_wire_u64(size_t value) {
+  return (value + alignof(u64) - 1) & ~(alignof(u64) - 1);
 }
 
-inline size_t mutation_batch_request_bytes(u32 item_count, u32 dim) {
+static_assert(align_wire_u64(1) == 8);
+static_assert(align_wire_u64(8) == 8);
+
+inline size_t insert_anchor_offset(u32 item_count) {
+  return align_wire_u64(sizeof(InsertBatchRequestHeader) +
+                        static_cast<size_t>(item_count) * sizeof(node_t) +
+                        static_cast<size_t>(item_count) * VamanaNode::vector_bytes());
+}
+
+inline size_t mutation_anchor_offset(u32 item_count) {
+  return align_wire_u64(sizeof(MutationBatchRequestHeader) +
+                        static_cast<size_t>(item_count) * sizeof(u32) +
+                        static_cast<size_t>(item_count) * sizeof(node_t) +
+                        static_cast<size_t>(item_count) * VamanaNode::vector_bytes());
+}
+
+inline size_t insert_batch_request_bytes(u32 item_count, u32 dim, u32 anchor_hint_count = 0) {
   (void)dim;
-  return sizeof(MutationBatchRequestHeader) +
-         static_cast<size_t>(item_count) * sizeof(u32) +
-         static_cast<size_t>(item_count) * sizeof(node_t) +
-         static_cast<size_t>(item_count) * VamanaNode::vector_bytes();
+  const size_t vector_end = sizeof(InsertBatchRequestHeader) +
+                            static_cast<size_t>(item_count) * sizeof(node_t) +
+                            static_cast<size_t>(item_count) * VamanaNode::vector_bytes();
+  return anchor_hint_count == 0
+    ? vector_end
+    : insert_anchor_offset(item_count) +
+        static_cast<size_t>(item_count) * anchor_hint_count * sizeof(u64);
+}
+
+inline size_t mutation_batch_request_bytes(u32 item_count, u32 dim, u32 anchor_hint_count = 0) {
+  (void)dim;
+  const size_t vector_end = sizeof(MutationBatchRequestHeader) +
+                            static_cast<size_t>(item_count) * sizeof(u32) +
+                            static_cast<size_t>(item_count) * sizeof(node_t) +
+                            static_cast<size_t>(item_count) * VamanaNode::vector_bytes();
+  return anchor_hint_count == 0
+    ? vector_end
+    : mutation_anchor_offset(item_count) +
+        static_cast<size_t>(item_count) * anchor_hint_count * sizeof(u64);
 }
 
 inline size_t insert_batch_response_bytes(u32 item_count) {
@@ -216,6 +231,28 @@ inline byte_t* request_vector(void* payload, u32 item_count, u32 index) {
 
 inline const byte_t* request_vector(const void* payload, u32 item_count, u32 index) {
   return request_vectors(payload, item_count) + static_cast<size_t>(index) * VamanaNode::vector_bytes();
+}
+
+inline u64* request_anchor_hints(void* payload, u32 item_count) {
+  if (reinterpret_cast<InsertBatchRequestHeader*>(payload)->anchor_hint_count == 0) return nullptr;
+  return reinterpret_cast<u64*>(reinterpret_cast<byte_t*>(payload) + insert_anchor_offset(item_count));
+}
+
+inline const u64* request_anchor_hints(const void* payload, u32 item_count) {
+  if (reinterpret_cast<const InsertBatchRequestHeader*>(payload)->anchor_hint_count == 0) return nullptr;
+  return reinterpret_cast<const u64*>(reinterpret_cast<const byte_t*>(payload) +
+                                      insert_anchor_offset(item_count));
+}
+
+inline u64* mutation_request_anchor_hints(void* payload, u32 item_count) {
+  if (reinterpret_cast<MutationBatchRequestHeader*>(payload)->anchor_hint_count == 0) return nullptr;
+  return reinterpret_cast<u64*>(reinterpret_cast<byte_t*>(payload) + mutation_anchor_offset(item_count));
+}
+
+inline const u64* mutation_request_anchor_hints(const void* payload, u32 item_count) {
+  if (reinterpret_cast<const MutationBatchRequestHeader*>(payload)->anchor_hint_count == 0) return nullptr;
+  return reinterpret_cast<const u64*>(reinterpret_cast<const byte_t*>(payload) +
+                                      mutation_anchor_offset(item_count));
 }
 
 inline u32* response_statuses(void* payload) {
@@ -278,88 +315,6 @@ inline ReverseUpdateOp* reverse_update_ops(void* payload) {
 
 inline const ReverseUpdateOp* reverse_update_ops(const void* payload) {
   return reinterpret_cast<const ReverseUpdateOp*>(reinterpret_cast<const byte_t*>(payload) + sizeof(PeerRpcHeader));
-}
-
-struct __attribute__((packed)) BeamEntrySerialized {
-  u64 rptr_raw;
-  float distance;
-};
-static_assert(sizeof(BeamEntrySerialized) == 12, "BeamEntrySerialized must be 12 bytes");
-
-struct SearchHandoffRequestHeader {
-  PeerRpcHeader rpc;
-  u32 beam_width;
-  u32 snapshot_batch;
-  u32 originator_shard;
-  u32 visited_count;
-  u32 vector_bytes;
-  u32 reserved;
-};
-
-struct SearchHandoffResponseHeader {
-  PeerRpcHeader rpc;
-  u32 updated_beam_count;
-  u32 new_visited_count;
-  u32 total_visited_count;
-  u32 visited_truncated_count;
-  u64 handler_cpu_ns;
-  u32 local_expanded_count;
-  u32 local_snapshot_reads;
-  u32 local_neighbor_reads;
-  u32 reserved;
-};
-
-inline size_t search_handoff_request_bytes(u32 beam_count, u32 visited_count, u32 vector_bytes) {
-  return sizeof(SearchHandoffRequestHeader) +
-         static_cast<size_t>(vector_bytes) +
-         static_cast<size_t>(beam_count) * sizeof(BeamEntrySerialized) +
-         static_cast<size_t>(visited_count) * sizeof(u64);
-}
-
-inline size_t search_handoff_response_bytes(u32 beam_count, u32 visited_count) {
-  return sizeof(SearchHandoffResponseHeader) +
-         static_cast<size_t>(beam_count) * sizeof(BeamEntrySerialized) +
-         static_cast<size_t>(visited_count) * sizeof(u64);
-}
-
-inline byte_t* handoff_query_vector(void* payload) {
-  return reinterpret_cast<byte_t*>(reinterpret_cast<SearchHandoffRequestHeader*>(payload) + 1);
-}
-
-inline const byte_t* handoff_query_vector(const void* payload) {
-  return reinterpret_cast<const byte_t*>(reinterpret_cast<const SearchHandoffRequestHeader*>(payload) + 1);
-}
-
-inline BeamEntrySerialized* handoff_request_beam(void* payload, u32 vector_bytes) {
-  return reinterpret_cast<BeamEntrySerialized*>(handoff_query_vector(payload) + vector_bytes);
-}
-
-inline const BeamEntrySerialized* handoff_request_beam(const void* payload, u32 vector_bytes) {
-  return reinterpret_cast<const BeamEntrySerialized*>(handoff_query_vector(payload) + vector_bytes);
-}
-
-inline byte_t* handoff_request_visited(void* payload, u32 vector_bytes, u32 beam_count) {
-  return reinterpret_cast<byte_t*>(handoff_request_beam(payload, vector_bytes) + beam_count);
-}
-
-inline const byte_t* handoff_request_visited(const void* payload, u32 vector_bytes, u32 beam_count) {
-  return reinterpret_cast<const byte_t*>(handoff_request_beam(payload, vector_bytes) + beam_count);
-}
-
-inline BeamEntrySerialized* handoff_response_beam(void* payload) {
-  return reinterpret_cast<BeamEntrySerialized*>(reinterpret_cast<SearchHandoffResponseHeader*>(payload) + 1);
-}
-
-inline const BeamEntrySerialized* handoff_response_beam(const void* payload) {
-  return reinterpret_cast<const BeamEntrySerialized*>(reinterpret_cast<const SearchHandoffResponseHeader*>(payload) + 1);
-}
-
-inline byte_t* handoff_response_visited(void* payload, u32 beam_count) {
-  return reinterpret_cast<byte_t*>(handoff_response_beam(payload) + beam_count);
-}
-
-inline const byte_t* handoff_response_visited(const void* payload, u32 beam_count) {
-  return reinterpret_cast<const byte_t*>(handoff_response_beam(payload) + beam_count);
 }
 
 }  // namespace service::storage_owner

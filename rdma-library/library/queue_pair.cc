@@ -21,6 +21,7 @@ QueuePair::QueuePair(Context* context,
   queue_pair_ =
     ibv_create_qp(context->get_protection_domain(), &init_attributes);
   lib_assert(queue_pair_, "Cannot create queue pair");
+  max_send_wr_ = init_attributes.cap.max_send_wr;
 
   transition_to_init();
 }
@@ -79,7 +80,7 @@ void QueuePair::transition_to_rtr(const QPInfo& remote_buffer) {
   attributes.path_mtu = IBV_MTU_4096;
   attributes.dest_qp_num = remote_buffer.qp_number;
   attributes.rq_psn = 0;
-  attributes.max_dest_rd_atomic = 16;
+  attributes.max_dest_rd_atomic = context_->max_qp_dest_read_atomic();
   attributes.min_rnr_timer = 12;
   attributes.ah_attr.is_global = 0;
   attributes.ah_attr.dlid = remote_buffer.lid;
@@ -105,7 +106,7 @@ void QueuePair::transition_to_rts() {
   attributes.retry_cnt = 7;
   attributes.rnr_retry = 7;
   attributes.sq_psn = 0;
-  attributes.max_rd_atomic = 16;
+  attributes.max_rd_atomic = context_->max_qp_read_atomic();
 
   lib_assert(ibv_modify_qp(queue_pair_,
                            &attributes,
