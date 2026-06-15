@@ -287,7 +287,7 @@ write_service_config() {
       echo "storage-owner-peer-rdma-tokens = ${STORAGE_OWNER_PEER_RDMA_TOKENS:-8}"
       echo "storage-owner-rpc-depth = ${STORAGE_OWNER_RPC_DEPTH:-16}"
       echo "storage-owner-rpc-timeout-ms = ${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}"
-      echo "storage-owner-construction-beam-width = ${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-$BUILD_BEAM}"
+      echo "storage-owner-construction-beam-width = ${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-$SEARCH_BEAM}"
       echo "storage-owner-search-snapshot-batch = ${STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH:-64}"
       echo "storage-owner-prune-max-candidates = ${STORAGE_OWNER_PRUNE_MAX_CANDIDATES:-128}"
       local update_mode="${STORAGE_OWNER_UPDATE_MODE:-exact}"
