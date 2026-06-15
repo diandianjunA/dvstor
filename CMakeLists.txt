@@ -121,6 +121,7 @@ set(DVSTOR_BREAKDOWN_BENCHMARK_SOURCES
 function(add_vamana_metis_repartitioner_target)
     add_executable(vamana_metis_repartitioner
         tools/vamana_metis_repartitioner.cc
+        tools/vamana_repartitioner_common.cc
         tools/vamana_offline/partitioning.cc
     )
     target_include_directories(vamana_metis_repartitioner PRIVATE
@@ -136,6 +137,7 @@ endfunction()
 function(add_vamana_bfs_repartitioner_target)
     add_executable(vamana_bfs_repartitioner
         tools/vamana_bfs_repartitioner.cc
+        tools/vamana_repartitioner_common.cc
         tools/vamana_offline/partitioning.cc
     )
     target_include_directories(vamana_bfs_repartitioner PRIVATE
