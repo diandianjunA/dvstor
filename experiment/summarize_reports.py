@@ -6,9 +6,9 @@ from pathlib import Path
 
 DEFAULT_PROFILES = [
     "00_baseline",
-    "01_gpu_rdma_pipeline",
-    "02_gpu_rdma_pipeline_aldi",
-    "03_gpu_rdma_pipeline_aldi_vcpi",
+    "01_rabitq_gpu_pipeline",
+    "02_rabitq_gpu_pipeline_aldi",
+    "03_rabitq_gpu_pipeline_aldi_rdma",
 ]
 
 
@@ -40,9 +40,8 @@ def row_for(path: Path) -> dict:
     ilat = insert.get("latency", {})
 
     q_vector_bytes = get_counter(query, "vector_rdma_bytes")
-    q_safe_skips = get_counter(query, "rabitq_safe_skips")
-    q_gate_passes = get_counter(query, "rabitq_gate_passes")
     q_l0 = get_counter(query, "rabitq_l0_candidates")
+    q_l1 = get_counter(query, "rabitq_l1_candidates")
     q_exact_reads = get_counter(query, "rabitq_exact_vector_reads")
     a_audits = get_counter(insert, "storage_owner_anchor_audits")
     a_failures = get_counter(insert, "storage_owner_anchor_audit_failures")
@@ -58,9 +57,15 @@ def row_for(path: Path) -> dict:
         "insert_p50_ms": ns_to_ms(ilat.get("p50_end_to_end_ns")),
         "insert_p95_ms": ns_to_ms(ilat.get("p95_end_to_end_ns")),
         "vector_rdma_gb": q_vector_bytes / (1024.0 ** 3),
-        "vcpi_skip_pct": pct(q_safe_skips, q_l0),
-        "vcpi_gate_pass_pct": pct(q_gate_passes, q_l0),
-        "vcpi_exact_reads": q_exact_reads,
+        "rabitq_keep_pct": pct(q_l1, q_l0),
+        "rabitq_drop_pct": pct(q_l0 - q_l1, q_l0),
+        "rabitq_exact_reads": q_exact_reads,
+        "rdma_nodes_per_batch": float(query.get("counters", {}).get(
+            "vector_rdma_mean_active_nodes_per_batch", 0.0)),
+        "rdma_qps_per_batch": float(query.get("counters", {}).get(
+            "vector_rdma_mean_active_qps_per_batch", 0.0)),
+        "rdma_reads_per_cqe": float(query.get("counters", {}).get(
+            "vector_rdma_reads_per_cqe", 0.0)),
         "aldi_audits": a_audits,
         "aldi_fail_pct": pct(a_failures, a_audits),
         "report": str(path),
@@ -76,8 +81,10 @@ def print_table(rows: list[dict]) -> None:
         ("query_p50_ms", "q_p50_ms"),
         ("insert_p50_ms", "ins_p50_ms"),
         ("vector_rdma_gb", "vec_rdma_gb"),
-        ("vcpi_skip_pct", "vcpi_skip_%"),
-        ("vcpi_gate_pass_pct", "vcpi_pass_%"),
+        ("rabitq_drop_pct", "rabitq_drop_%"),
+        ("rdma_nodes_per_batch", "rdma_nodes/b"),
+        ("rdma_qps_per_batch", "rdma_qps/b"),
+        ("rdma_reads_per_cqe", "rdma_reads/cqe"),
         ("aldi_fail_pct", "aldi_fail_%"),
     ]
     widths = []
@@ -136,4 +143,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

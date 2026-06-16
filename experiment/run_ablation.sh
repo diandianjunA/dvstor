@@ -6,9 +6,9 @@ profiles=("$@")
 if (( ${#profiles[@]} == 0 )); then
   profiles=(
     00_baseline
-    01_gpu_rdma_pipeline
-    02_gpu_rdma_pipeline_aldi
-    03_gpu_rdma_pipeline_aldi_vcpi
+    01_rabitq_gpu_pipeline
+    02_rabitq_gpu_pipeline_aldi
+    03_rabitq_gpu_pipeline_aldi_rdma
   )
 fi
 
@@ -27,4 +27,3 @@ done
 
 cleanup
 python3 "$SCRIPT_DIR/summarize_reports.py" "${profiles[@]}"
-
