@@ -25,6 +25,17 @@ inline size_t align_to_cacheline(size_t value) {
   return value;
 }
 
+inline size_t storage_owner_snapshot_bytes() {
+  return VamanaNode::compact_storage()
+    ? VamanaNode::size_until_vector_end()
+    : VamanaNode::HEADER_SIZE + VamanaNode::COMPACT_META_SIZE +
+        VamanaNode::vector_bytes();
+}
+
+inline size_t storage_owner_snapshot_stride() {
+  return align_to_cacheline(storage_owner_snapshot_bytes());
+}
+
 struct BeamEntry {
   RemotePtr rptr;
   distance_t distance{};
@@ -35,7 +46,9 @@ struct NodeSnapshot {
   RemotePtr rptr;
   u64 header{};
   node_t id{};
+  u32 generation{};
   u8 edge_count{};
+  bool deleted{};
   vec<byte_t> vector_data;
 };
 
@@ -52,7 +65,10 @@ struct PeerRpcRuntimeState {
   std::unique_ptr<LocalMemoryRegion> region;
   size_t message_bytes{};
   size_t recv_region_bytes{};
+  size_t sync_send_offset{};
+  size_t async_send_offset{};
   u32 recv_slots_per_peer{1};
+  u32 send_slots_per_peer{1};
 };
 
 struct StorageOwnerThread;
@@ -125,8 +141,20 @@ struct StorageOwnerThread {
 
 struct StorageOwnerInsertJob {
   node_t id{};
+  service::storage_owner::MutationKind kind{service::storage_owner::MutationKind::insert};
   vec<byte_t> vector_data;
+  service::storage_owner::MutationStatus status{service::storage_owner::MutationStatus::failed};
   bool ok{false};
+  RemotePtr new_ptr{};
+  RemotePtr old_ptr{};
+  u32 generation{};
+  vec<RemotePtr> anchor_hints;
+};
+
+struct FreshnessEntry {
+  RemotePtr current;
+  u32 generation{};
+  bool deleted{};
 };
 
 }  // namespace memory_node_detail

@@ -82,11 +82,42 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.vector_rdma_bytes += delta.vector_rdma_bytes;
   aggregate.counters.neighbor_rdma_read_ops += delta.neighbor_rdma_read_ops;
   aggregate.counters.vector_rdma_read_ops += delta.vector_rdma_read_ops;
+  aggregate.counters.vector_rdma_batch_calls += delta.vector_rdma_batch_calls;
+  aggregate.counters.vector_rdma_cqes += delta.vector_rdma_cqes;
+  aggregate.counters.vector_rdma_active_nodes += delta.vector_rdma_active_nodes;
+  aggregate.counters.vector_rdma_active_qps += delta.vector_rdma_active_qps;
+  aggregate.counters.vector_rdma_chain_wrs += delta.vector_rdma_chain_wrs;
+  aggregate.counters.vector_rdma_max_chain_wrs = std::max(
+    aggregate.counters.vector_rdma_max_chain_wrs, delta.vector_rdma_max_chain_wrs);
+  aggregate.counters.vector_rdma_qp_high_water_wrs = std::max(
+    aggregate.counters.vector_rdma_qp_high_water_wrs,
+    delta.vector_rdma_qp_high_water_wrs);
+  aggregate.counters.vector_rdma_credit_waits += delta.vector_rdma_credit_waits;
+  aggregate.counters.vector_rdma_credit_wait_ns += delta.vector_rdma_credit_wait_ns;
+  aggregate.counters.vector_rdma_completion_token_waits +=
+    delta.vector_rdma_completion_token_waits;
+  aggregate.counters.vector_rdma_post_send_calls += delta.vector_rdma_post_send_calls;
+  aggregate.counters.vector_rdma_post_send_retries += delta.vector_rdma_post_send_retries;
+  aggregate.counters.vector_rdma_post_send_errors += delta.vector_rdma_post_send_errors;
   aggregate.counters.h2d_bytes += delta.h2d_bytes;
   aggregate.counters.d2h_bytes += delta.d2h_bytes;
   aggregate.counters.l2_kernels += delta.l2_kernels;
   aggregate.counters.prune_kernels += delta.prune_kernels;
   aggregate.counters.exact_reranks += delta.exact_reranks;
+  aggregate.counters.rabitq_l0_candidates += delta.rabitq_l0_candidates;
+  aggregate.counters.rabitq_cache_misses += delta.rabitq_cache_misses;
+  aggregate.counters.rabitq_l1_candidates += delta.rabitq_l1_candidates;
+  aggregate.counters.rabitq_l2_candidates += delta.rabitq_l2_candidates;
+  aggregate.counters.rabitq_forced_widen += delta.rabitq_forced_widen;
+  aggregate.counters.rabitq_audit_expansions += delta.rabitq_audit_expansions;
+  aggregate.counters.rabitq_audit_candidates += delta.rabitq_audit_candidates;
+  aggregate.counters.rabitq_safe_skips += delta.rabitq_safe_skips;
+  aggregate.counters.rabitq_exact_fallbacks += delta.rabitq_exact_fallbacks;
+  aggregate.counters.rabitq_prefetch_issued += delta.rabitq_prefetch_issued;
+  aggregate.counters.rabitq_prefetch_hits += delta.rabitq_prefetch_hits;
+  aggregate.counters.rabitq_prefetch_misses += delta.rabitq_prefetch_misses;
+  aggregate.counters.rabitq_prefetch_disabled_queries +=
+    delta.rabitq_prefetch_disabled_queries;
   aggregate.counters.visited_nodes += delta.visited_nodes;
   aggregate.counters.visited_neighborlists += delta.visited_neighborlists;
   aggregate.counters.remote_allocations += delta.remote_allocations;
@@ -107,6 +138,15 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
     std::max(aggregate.counters.overflow_prune_max_kernel_threads, sample.overflow_prune_max_kernel_threads);
   aggregate.counters.query_rdma_to_staging_bytes += delta.query_rdma_to_staging_bytes;
   aggregate.counters.query_host_staging_fallback_bytes += delta.query_host_staging_fallback_bytes;
+  aggregate.counters.storage_owner_anchor_hints += delta.storage_owner_anchor_hints;
+  aggregate.counters.storage_owner_anchor_valid_hints += delta.storage_owner_anchor_valid_hints;
+  aggregate.counters.storage_owner_anchor_expansions += delta.storage_owner_anchor_expansions;
+  aggregate.counters.storage_owner_anchor_remote_expansions +=
+    delta.storage_owner_anchor_remote_expansions;
+  aggregate.counters.storage_owner_anchor_fallbacks += delta.storage_owner_anchor_fallbacks;
+  aggregate.counters.storage_owner_anchor_audits += delta.storage_owner_anchor_audits;
+  aggregate.counters.storage_owner_anchor_audit_failures +=
+    delta.storage_owner_anchor_audit_failures;
   aggregate.lock_attempts += sample.lock_attempts;
   aggregate.lock_retries += sample.lock_retries;
   aggregate.cas_failures += sample.cas_failures;

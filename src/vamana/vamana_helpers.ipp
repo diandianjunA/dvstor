@@ -10,19 +10,28 @@ private:
     static void insert_into_beam(vec<VamanaCoroutine::BeamEntry>& beam,
                                  const RemotePtr& rptr, distance_t dist,
                                  u32 max_beam_width) {
-        // Find insertion position (beam is maintained sorted by distance ascending)
         auto it = std::lower_bound(beam.begin(), beam.end(), dist,
             [](const VamanaCoroutine::BeamEntry& e, distance_t d) {
                 return e.distance < d;
             });
-
-        // Insert
         beam.insert(it, {rptr, dist, false});
+        if (beam.size() > max_beam_width) beam.resize(max_beam_width);
+    }
 
-        // Trim if over capacity
-        if (beam.size() > max_beam_width) {
-            beam.resize(max_beam_width);
+    // Insert or update: if rptr already in beam, update its distance
+    // (only if new distance is smaller).  Otherwise insert normally.
+    // Used for eager beam updates with estimated distances.
+    static void upsert_beam(vec<VamanaCoroutine::BeamEntry>& beam,
+                            const RemotePtr& rptr, distance_t dist,
+                            u32 max_beam_width) {
+        // Linear scan to find existing entry (beam ≤ 128, cheap)
+        for (auto& e : beam) {
+            if (e.rptr == rptr) {
+                if (dist < e.distance) e.distance = dist;
+                return;
+            }
         }
+        insert_into_beam(beam, rptr, dist, max_beam_width);
     }
 
     static void track_query_h2d(const u_ptr<ComputeThread>& thread, size_t bytes) {

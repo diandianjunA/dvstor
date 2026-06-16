@@ -4,6 +4,8 @@
 #include <fstream>
 #include <iostream>
 
+#include "vamana/storage_layout_resolver.hh"
+
 MemoryNode::MemoryNode(Configuration& config)
     : context_(config), cm_(context_, config), num_clients_(config.num_clients),
       storage_id_(config.storage_id),
@@ -34,7 +36,9 @@ MemoryNode::MemoryNode(Configuration& config)
   context_.receive();
 
   num_compute_threads_ = p.num_threads;
+  qp_pool_size_ = p.qp_pool_size;
   const filepath_t index_prefix = config.resolved_index_prefix();
+  index_prefix_ = index_prefix;
   VectorDType startup_dtype = config.resolved_vector_dtype();
   const filepath_t meta_file = filepath_t(index_prefix.string() + ".meta.json");
   if (!index_prefix.empty() && std::filesystem::exists(meta_file)) {
@@ -44,24 +48,71 @@ MemoryNode::MemoryNode(Configuration& config)
     lib_assert(metadata.dim == config.dim, "index metadata dim mismatch on storage node");
     lib_assert(metadata.R == config.R, "index metadata R mismatch on storage node");
     lib_assert(metadata.num_memory_nodes == num_storage_nodes_, "index metadata storage-node count mismatch");
-    lib_assert(metadata.node_layout == "standard", "unsupported index node layout on storage node");
     if (config.vector_data_type != "auto" && config.resolved_vector_dtype() != metadata.vector_dtype) {
       lib_failure("configured vector-data-type=" + config.vector_data_type +
                   " does not match index metadata vector_data_type=" + vector_dtype_name(metadata.vector_dtype));
     }
     startup_dtype = metadata.vector_dtype;
     config.vector_data_type = vector_dtype_name(startup_dtype);
+    VamanaNode::disable_rabitq();
+    VamanaNode::disable_hot_graph();
+    const auto storage_format = vamana::parse_storage_format(metadata.storage_format);
+    lib_assert(storage_format.has_value(),
+               "index storage format is obsolete; rebuild with the current offline builder");
+    VamanaNode::set_storage_format(*storage_format);
     VamanaNode::init_static_storage(config.dim, config.R, startup_dtype);
+    lib_assert(metadata.schema_version == 13,
+               "index storage format is obsolete; rebuild with the current offline builder");
+    if (metadata.node_layout == "rabitq") {
+        lib_assert(metadata.rabitq_centroid.size() == metadata.dim,
+                   "RaBitQ index metadata has a missing or invalid centroid");
+        VamanaNode::enable_rabitq();
+        VamanaNode::set_rabitq_centroid(metadata.rabitq_centroid);
+        lib_assert(metadata.rabitq_code_bits == VamanaNode::rabitq_code_bits() &&
+                   metadata.rabitq_entry_size == VamanaNode::rabitq_entry_size(),
+                   "RaBitQ index code layout does not match the runtime dimension");
+    }
     lib_assert(metadata.vector_component_size == VamanaNode::vector_component_size(),
                "index metadata vector component size mismatch on storage node");
     lib_assert(metadata.vector_bytes == VamanaNode::vector_bytes(),
                "index metadata vector byte size mismatch on storage node");
     lib_assert(metadata.node_size == VamanaNode::total_size(), "index metadata node size mismatch on storage node");
+    lib_assert(metadata.graph_hot_bytes == VamanaNode::graph_hot_bytes() &&
+               metadata.vector_offset == VamanaNode::offset_vector() &&
+               metadata.neighbors_offset == VamanaNode::offset_neighbors() &&
+               metadata.rabitq_offset == (VamanaNode::HAS_RABITQ_CODE ? VamanaNode::offset_rabitq_code() : 0),
+               "index metadata storage offsets mismatch on storage node");
+    if (*storage_format == vamana::StorageFormat::compact_v1) {
+      lib_assert(metadata.hot_graph_pointer_bytes == vamana::hot_graph::kCompactPointerBytes &&
+                 metadata.hot_graph_entry_size == VamanaNode::hot_graph_entry_size() &&
+                 metadata.hot_graph_offsets.size() == num_storage_nodes_ &&
+                 metadata.hot_graph_entry_counts.size() == num_storage_nodes_,
+                 "index hot graph metadata mismatch on storage node");
+      lib_assert(metadata.hot_graph_dynamic_base_offsets.size() == num_storage_nodes_ &&
+                 metadata.hot_graph_dynamic_record_bytes >=
+                   metadata.hot_graph_dynamic_hot_offset + metadata.hot_graph_entry_size &&
+                 metadata.hot_graph_dynamic_hot_offset >= VamanaNode::total_size(),
+                 "index dynamic hot graph metadata mismatch on storage node");
+      VamanaNode::configure_hot_graph(metadata.hot_graph_offsets,
+                                      metadata.hot_graph_entry_counts,
+                                      metadata.hot_graph_entry_size,
+                                      metadata.hot_graph_shard_bits,
+                                      2u,
+                                      metadata.hot_graph_dynamic_base_offsets,
+                                      metadata.hot_graph_dynamic_record_bytes,
+                                      metadata.hot_graph_dynamic_hot_offset);
+      lib_assert(VamanaNode::HAS_HOT_GRAPH, "failed to enable compact hot graph on storage node");
+    }
+    owner_idmap_required_ = metadata.idmap_format == "owner_sharded_v1";
     print_status("loaded index metadata from " + index_prefix.string() +
                  " (layout=" + VamanaNode::layout_name() +
                  ", vector_data_type=" + VamanaNode::vector_dtype_name() + ")");
   } else {
+    VamanaNode::disable_rabitq();
+    VamanaNode::disable_hot_graph();
+    VamanaNode::set_storage_format(vamana::StorageFormat::aos_v1);
     VamanaNode::init_static_storage(config.dim, config.R, startup_dtype);
+    if (config.use_rabitq) VamanaNode::enable_rabitq();
   }
   allocate_memory();
 
@@ -71,6 +122,9 @@ MemoryNode::MemoryNode(Configuration& config)
   if (!config.server_index_file.empty()) {
     const auto [success, message] = load_index_file(config.server_index_file.string());
     lib_assert(success, message);
+    if (owner_idmap_required_) {
+      lib_assert(load_owner_idmap(index_prefix_), "failed to load owner-sharded idmap");
+    }
   }
 
   print_status("register memory and distribute access token");
@@ -88,7 +142,7 @@ MemoryNode::MemoryNode(Configuration& config)
   vec<u_ptr<DetachedQP>> qps;
 
   // note: no need for QP sharing on the memory server side
-  const u32 qps_per_node = std::min<u32>(num_compute_threads_, MAX_QPS);
+  const u32 qps_per_node = std::min<u32>(num_compute_threads_, MAX_QPS) * qp_pool_size_;
   qps.reserve(num_clients_ * qps_per_node);
 
   for (QP& client_qp : cm_.client_qps) {
@@ -178,6 +232,15 @@ MemoryNode::InsertBreakdownCounters MemoryNode::scale_breakdown(const InsertBrea
   out.storage_owner_prune_sort_ns = scale_ns(counters.storage_owner_prune_sort_ns, part, total);
   out.storage_owner_prune_pair_distance_ns =
     scale_ns(counters.storage_owner_prune_pair_distance_ns, part, total);
+  out.storage_owner_anchor_hints = scale_ns(counters.storage_owner_anchor_hints, part, total);
+  out.storage_owner_anchor_valid_hints = scale_ns(counters.storage_owner_anchor_valid_hints, part, total);
+  out.storage_owner_anchor_expansions = scale_ns(counters.storage_owner_anchor_expansions, part, total);
+  out.storage_owner_anchor_remote_expansions =
+    scale_ns(counters.storage_owner_anchor_remote_expansions, part, total);
+  out.storage_owner_anchor_fallbacks = scale_ns(counters.storage_owner_anchor_fallbacks, part, total);
+  out.storage_owner_anchor_audits = scale_ns(counters.storage_owner_anchor_audits, part, total);
+  out.storage_owner_anchor_audit_failures =
+    scale_ns(counters.storage_owner_anchor_audit_failures, part, total);
   return out;
 }
 

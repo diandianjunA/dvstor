@@ -16,7 +16,8 @@ void segfault_handler(int signal) {
   void* frames[64];
   const int count = backtrace(frames, 64);
   const char header[] = "\n[breakdown] fatal signal, backtrace:\n";
-  (void)::write(STDERR_FILENO, header, sizeof(header) - 1);
+  const ssize_t ignored = ::write(STDERR_FILENO, header, sizeof(header) - 1);
+  (void)ignored;
   backtrace_symbols_fd(frames, count, STDERR_FILENO);
   _exit(128 + signal);
 }

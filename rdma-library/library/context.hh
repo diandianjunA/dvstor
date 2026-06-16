@@ -3,6 +3,7 @@
 
 #include <infiniband/verbs.h>
 
+#include <algorithm>
 #include <utility>
 
 #include "configuration.hh"
@@ -40,6 +41,12 @@ public:
   ibv_srq* get_shared_receive_cq() { return shared_receive_cq_; }
   Configuration& get_config() const { return config_; }
   u16 get_lid() const { return port_attributes_.lid; }
+  u32 max_qp_read_atomic() const {
+    return std::max<u32>(1, std::min<u32>(16, device_attributes_.max_qp_init_rd_atom));
+  }
+  u32 max_qp_dest_read_atomic() const {
+    return std::max<u32>(1, std::min<u32>(16, device_attributes_.max_qp_rd_atom));
+  }
 
   void bind_to_port(u32 tcp_port);
   void close_server_socket() const;
@@ -84,6 +91,7 @@ private:
   ibv_srq* shared_receive_cq_{nullptr};
 
   ibv_port_attr port_attributes_{};
+  ibv_device_attr device_attributes_{};
 };
 
 #endif  // RDMA_LIBRARY_CONTEXT_HH

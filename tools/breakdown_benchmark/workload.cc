@@ -31,8 +31,14 @@ struct MixedPhaseStats {
   uint32_t next_insert_id{};
   size_t issued_reads{};
   size_t issued_writes{};
+  size_t issued_inserts{};
+  size_t issued_upserts{};
+  size_t issued_deletes{};
   size_t completed_reads{};
   size_t completed_writes{};
+  size_t completed_inserts{};
+  size_t completed_upserts{};
+  size_t completed_deletes{};
 };
 
 std::vector<float> make_deterministic_vector(uint32_t seed, size_t dim) {
@@ -200,13 +206,69 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"insert_vector_source", use_insert_file ? args.insert_file : "deterministic_synthetic_from_insert_id"},
     {"client_threads", args.client_threads},
     {"read_ratio", args.read_ratio},
+    {"write_insert_ratio", args.write_insert_ratio},
+    {"write_upsert_ratio", args.write_upsert_ratio},
+    {"write_delete_ratio", args.write_delete_ratio},
     {"insert_start_id", args.insert_start_id},
     {"dim", service.config().dim},
     {"threads", service.config().num_threads},
     {"coroutines", service.config().num_coroutines},
-    {"search", "exact"},
+    {"search", service.config().use_rabitq
+        ? "rabitq_rfq5_" + service.config().rabitq_mode : "exact"},
+    {"rabitq_cache_bytes", service.rabitq_cache_bytes()},
+    {"rabitq_cache_entries", service.rabitq_cache_entries()},
+    {"rabitq_cache_numa_interleaved", service.rabitq_cache_numa_interleaved()},
+    {"rabitq_cache_ratio",
+      service.rabitq_cache_entries() == 0 ? 0.0 :
+        static_cast<double>(service.rabitq_cache_bytes()) /
+          (service.rabitq_cache_entries() * VamanaNode::vector_bytes())},
+    {"rabitq_cache_entry_bytes", service.rabitq_cache_entry_bytes()},
+    {"rabitq_cache_code_bits", service.rabitq_cache_code_bits()},
+    {"rabitq_cache_override_bitmap_bytes",
+     service.rabitq_cache_override_bitmap_bytes()},
+    {"rabitq_cache_dynamic_live", service.rabitq_cache_dynamic_live()},
+    {"rabitq_cache_dynamic_overflow", service.rabitq_cache_dynamic_overflow()},
+    {"rabitq_gate_width", service.config().use_rabitq
+        ? service.config().rabitq_gate_width : 0},
+    {"rabitq_gate_max_width", service.config().use_rabitq
+        ? service.config().rabitq_gate_max_width : 0},
+    {"rabitq_gate_margin", service.config().use_rabitq
+        ? service.config().rabitq_gate_margin : 0.0},
+    {"rabitq_cache_max_ratio", service.config().use_rabitq
+        ? service.config().rabitq_cache_max_ratio : 0.0},
+    {"rabitq_mode", service.config().use_rabitq
+        ? service.config().rabitq_mode : ""},
+    {"rabitq_coalesce_target", service.config().use_rabitq
+        ? service.config().rabitq_coalesce_target : 0},
+    {"rabitq_coalesce_min", service.config().use_rabitq
+        ? service.config().rabitq_coalesce_min : 0},
+    {"rabitq_coalesce_wait_us", service.config().use_rabitq
+        ? service.config().rabitq_coalesce_wait_us : 0},
+    {"rabitq_prefetch_width", service.config().use_rabitq
+        ? service.config().rabitq_prefetch_width : 0},
+    {"rabitq_prefetch_min_samples", service.config().use_rabitq
+        ? service.config().rabitq_prefetch_min_samples : 0},
+    {"rabitq_prefetch_min_hit_ratio", service.config().use_rabitq
+        ? service.config().rabitq_prefetch_min_hit_ratio : 0.0},
+    {"rabitq_warmup_exact_expansions", service.config().use_rabitq
+        ? service.config().rabitq_warmup_exact_expansions : 0},
+    {"rabitq_audit_period", service.config().use_rabitq
+        ? service.config().rabitq_audit_period : 0},
+    {"rabitq_safe_epsilon", service.config().use_rabitq
+        ? service.config().rabitq_safe_epsilon : 0.0},
+    {"rabitq_strict_recall", service.config().use_rabitq
+        ? service.config().rabitq_strict_recall : false},
   };
   const size_t dim = service.config().dim;
+  const double write_ratio_sum = args.write_insert_ratio + args.write_upsert_ratio + args.write_delete_ratio;
+  const double normalized_insert_ratio = args.write_insert_ratio / write_ratio_sum;
+  const double normalized_upsert_ratio = args.write_upsert_ratio / write_ratio_sum;
+  const double normalized_delete_ratio = args.write_delete_ratio / write_ratio_sum;
+  root["meta"]["normalized_write_mix"] = {
+    {"insert", normalized_insert_ratio},
+    {"upsert", normalized_upsert_ratio},
+    {"delete", normalized_delete_ratio},
+  };
   size_t fixed_read_threads = 0;
   size_t fixed_write_threads = 0;
   if (args.workload == "mixed" && args.mixed_mode == "fixed_threads") {
@@ -255,6 +317,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     }
     auto gen = make_deterministic_vector(id, dim);
     return vec<element_t>(gen.begin(), gen.end());
+  };
+
+  auto get_update_vector = [&](uint32_t target_id, uint32_t version) -> vec<element_t> {
+    return get_insert_vector(target_id ^ (0x9e3779b9u * (version + 1u)));
   };
 
   std::vector<uint32_t> bootstrap_ids(bootstrap_count);
@@ -429,15 +495,78 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     return read_dist(rng);
   };
 
+  enum class WriteKind { insert, upsert, erase };
+  auto choose_write_kind = [&](std::mt19937_64& rng) {
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    const double pick = dist(rng);
+    if (pick < normalized_insert_ratio) return WriteKind::insert;
+    if (pick < normalized_insert_ratio + normalized_upsert_ratio) return WriteKind::upsert;
+    return WriteKind::erase;
+  };
+
+  const uint32_t base_id_count = static_cast<uint32_t>(
+    std::max<size_t>(1, service.config().max_vectors));
+  auto sample_existing_id = [&](std::mt19937_64& rng) {
+    std::uniform_int_distribution<uint32_t> dist(0, base_id_count - 1);
+    return dist(rng);
+  };
+
+  auto issue_mixed_write = [&](std::mt19937_64& rng,
+                               std::atomic<uint32_t>& next_insert_id,
+                               std::atomic<uint32_t>& next_update_version,
+                               std::atomic<size_t>& issued_inserts,
+                               std::atomic<size_t>& issued_upserts,
+                               std::atomic<size_t>& issued_deletes,
+                               std::atomic<size_t>& completed_inserts,
+                               std::atomic<size_t>& completed_upserts,
+                               std::atomic<size_t>& completed_deletes) {
+    switch (choose_write_kind(rng)) {
+      case WriteKind::insert: {
+        issued_inserts.fetch_add(1, std::memory_order_relaxed);
+        const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
+        vec<element_t> values = get_insert_vector(id);
+        vec<typename ComputeService<Distance>::InsertItem> items;
+        items.push_back({id, std::move(values)});
+        completed_inserts.fetch_add(service.insert(items), std::memory_order_relaxed);
+        break;
+      }
+      case WriteKind::upsert: {
+        issued_upserts.fetch_add(1, std::memory_order_relaxed);
+        const uint32_t id = sample_existing_id(rng);
+        const uint32_t version = next_update_version.fetch_add(1, std::memory_order_relaxed);
+        vec<element_t> values = get_update_vector(id, version);
+        vec<typename ComputeService<Distance>::InsertItem> items;
+        items.push_back({id, std::move(values)});
+        completed_upserts.fetch_add(service.upsert(items), std::memory_order_relaxed);
+        break;
+      }
+      case WriteKind::erase: {
+        issued_deletes.fetch_add(1, std::memory_order_relaxed);
+        const uint32_t id = sample_existing_id(rng);
+        vec<node_t> ids;
+        ids.push_back(id);
+        completed_deletes.fetch_add(service.erase(ids), std::memory_order_relaxed);
+        break;
+      }
+    }
+  };
+
   auto run_mixed_phase_ops = [&](const std::string& label, size_t ops, uint32_t start_id) -> MixedPhaseStats {
     std::atomic<size_t> completed_ops{0};
     std::atomic<uint32_t> next_insert_id{start_id};
     std::atomic<size_t> next_query_idx{0};
     std::atomic<size_t> issued_reads{0};
     std::atomic<size_t> issued_writes{0};
+    std::atomic<size_t> issued_inserts{0};
+    std::atomic<size_t> issued_upserts{0};
+    std::atomic<size_t> issued_deletes{0};
     std::atomic<size_t> completed_reads{0};
     std::atomic<size_t> completed_writes{0};
+    std::atomic<size_t> completed_inserts{0};
+    std::atomic<size_t> completed_upserts{0};
+    std::atomic<size_t> completed_deletes{0};
     std::atomic<size_t> next_op{0};
+    std::atomic<uint32_t> next_update_version{0};
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(args.client_threads));
     std::vector<std::thread> threads;
     threads.reserve(args.client_threads);
@@ -463,12 +592,9 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
             completed_reads.fetch_add(1, std::memory_order_relaxed);
           } else {
             issued_writes.fetch_add(1, std::memory_order_relaxed);
-            const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
-            vec<element_t> values = get_insert_vector(id);
-            vec<typename ComputeService<Distance>::InsertItem> insert_items;
-            insert_items.reserve(1);
-            insert_items.push_back({id, std::move(values)});
-            (void)service.insert(insert_items);
+            issue_mixed_write(rng, next_insert_id, next_update_version,
+                              issued_inserts, issued_upserts, issued_deletes,
+                              completed_inserts, completed_upserts, completed_deletes);
             completed_writes.fetch_add(1, std::memory_order_relaxed);
           }
           completed_ops.fetch_add(1, std::memory_order_relaxed);
@@ -484,8 +610,14 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       .next_insert_id = next_insert_id.load(std::memory_order_relaxed),
       .issued_reads = issued_reads.load(std::memory_order_relaxed),
       .issued_writes = issued_writes.load(std::memory_order_relaxed),
+      .issued_inserts = issued_inserts.load(std::memory_order_relaxed),
+      .issued_upserts = issued_upserts.load(std::memory_order_relaxed),
+      .issued_deletes = issued_deletes.load(std::memory_order_relaxed),
       .completed_reads = completed_reads.load(std::memory_order_relaxed),
       .completed_writes = completed_writes.load(std::memory_order_relaxed),
+      .completed_inserts = completed_inserts.load(std::memory_order_relaxed),
+      .completed_upserts = completed_upserts.load(std::memory_order_relaxed),
+      .completed_deletes = completed_deletes.load(std::memory_order_relaxed),
     };
   };
 
@@ -495,8 +627,15 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     std::atomic<size_t> next_query_idx{0};
     std::atomic<size_t> issued_reads{0};
     std::atomic<size_t> issued_writes{0};
+    std::atomic<size_t> issued_inserts{0};
+    std::atomic<size_t> issued_upserts{0};
+    std::atomic<size_t> issued_deletes{0};
     std::atomic<size_t> completed_reads{0};
     std::atomic<size_t> completed_writes{0};
+    std::atomic<size_t> completed_inserts{0};
+    std::atomic<size_t> completed_upserts{0};
+    std::atomic<size_t> completed_deletes{0};
+    std::atomic<uint32_t> next_update_version{0};
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(args.client_threads));
     std::vector<std::thread> threads;
     threads.reserve(args.client_threads);
@@ -522,12 +661,9 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
             completed_reads.fetch_add(1, std::memory_order_relaxed);
           } else {
             issued_writes.fetch_add(1, std::memory_order_relaxed);
-            const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
-            vec<element_t> values = get_insert_vector(id);
-            vec<typename ComputeService<Distance>::InsertItem> insert_items;
-            insert_items.reserve(1);
-            insert_items.push_back({id, std::move(values)});
-            (void)service.insert(insert_items);
+            issue_mixed_write(rng, next_insert_id, next_update_version,
+                              issued_inserts, issued_upserts, issued_deletes,
+                              completed_inserts, completed_upserts, completed_deletes);
             completed_writes.fetch_add(1, std::memory_order_relaxed);
           }
           completed_ops.fetch_add(1, std::memory_order_relaxed);
@@ -543,8 +679,14 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       .next_insert_id = next_insert_id.load(std::memory_order_relaxed),
       .issued_reads = issued_reads.load(std::memory_order_relaxed),
       .issued_writes = issued_writes.load(std::memory_order_relaxed),
+      .issued_inserts = issued_inserts.load(std::memory_order_relaxed),
+      .issued_upserts = issued_upserts.load(std::memory_order_relaxed),
+      .issued_deletes = issued_deletes.load(std::memory_order_relaxed),
       .completed_reads = completed_reads.load(std::memory_order_relaxed),
       .completed_writes = completed_writes.load(std::memory_order_relaxed),
+      .completed_inserts = completed_inserts.load(std::memory_order_relaxed),
+      .completed_upserts = completed_upserts.load(std::memory_order_relaxed),
+      .completed_deletes = completed_deletes.load(std::memory_order_relaxed),
     };
   };
 
@@ -624,18 +766,33 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     root["meta"]["warmup_mixed"] = {
       {"issued_reads", warmup_mixed_stats.issued_reads},
       {"issued_writes", warmup_mixed_stats.issued_writes},
+      {"issued_inserts", warmup_mixed_stats.issued_inserts},
+      {"issued_upserts", warmup_mixed_stats.issued_upserts},
+      {"issued_deletes", warmup_mixed_stats.issued_deletes},
       {"completed_reads", warmup_mixed_stats.completed_reads},
       {"completed_writes", warmup_mixed_stats.completed_writes},
+      {"completed_inserts", warmup_mixed_stats.completed_inserts},
+      {"completed_upserts", warmup_mixed_stats.completed_upserts},
+      {"completed_deletes", warmup_mixed_stats.completed_deletes},
     };
     root["meta"]["measure_mixed"] = {
       {"issued_reads", measure_mixed_stats.issued_reads},
       {"issued_writes", measure_mixed_stats.issued_writes},
+      {"issued_inserts", measure_mixed_stats.issued_inserts},
+      {"issued_upserts", measure_mixed_stats.issued_upserts},
+      {"issued_deletes", measure_mixed_stats.issued_deletes},
       {"completed_reads", measure_mixed_stats.completed_reads},
       {"completed_writes", measure_mixed_stats.completed_writes},
+      {"completed_inserts", measure_mixed_stats.completed_inserts},
+      {"completed_upserts", measure_mixed_stats.completed_upserts},
+      {"completed_deletes", measure_mixed_stats.completed_deletes},
     };
     std::cerr << "[breakdown][measure-mixed] reads issued/completed=" << measure_mixed_stats.issued_reads << "/"
               << measure_mixed_stats.completed_reads << ", writes issued/completed="
-              << measure_mixed_stats.issued_writes << "/" << measure_mixed_stats.completed_writes << std::endl;
+              << measure_mixed_stats.issued_writes << "/" << measure_mixed_stats.completed_writes
+              << " (insert=" << measure_mixed_stats.completed_inserts
+              << ", upsert=" << measure_mixed_stats.completed_upserts
+              << ", delete=" << measure_mixed_stats.completed_deletes << ")" << std::endl;
     if (args.read_ratio > 0.0) {
       lib_assert(measure_mixed_stats.completed_reads > 0, "mixed benchmark completed zero reads");
     }
@@ -650,21 +807,41 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
 
   const bool has_throughput_duration = use_time_mode && args.measure_seconds > 0;
   const double throughput_duration = has_throughput_duration ? static_cast<double>(args.measure_seconds) : 0.0;
+  const size_t throughput_query_ops = args.workload == "mixed"
+    ? measure_mixed_stats.completed_reads
+    : report.query.count;
+  const size_t throughput_write_ops = args.workload == "mixed"
+    ? measure_mixed_stats.completed_writes
+    : report.insert.count;
   const double query_throughput = has_throughput_duration
-                                    ? static_cast<double>(report.query.count) / throughput_duration
+                                    ? static_cast<double>(throughput_query_ops) / throughput_duration
                                     : 0.0;
-  const double insert_throughput = has_throughput_duration
-                                     ? static_cast<double>(report.insert.count) / throughput_duration
-                                     : 0.0;
-  const double total_throughput = query_throughput + insert_throughput;
+  const double write_throughput = has_throughput_duration
+                                    ? static_cast<double>(throughput_write_ops) / throughput_duration
+                                    : 0.0;
+  const double total_throughput = query_throughput + write_throughput;
   root["throughput"] = {
     {"duration_seconds", throughput_duration},
-    {"total_ops", report.query.count + report.insert.count},
+    {"total_ops", throughput_query_ops + throughput_write_ops},
     {"total_ops_per_sec", total_throughput},
-    {"query_ops", report.query.count},
+    {"query_ops", throughput_query_ops},
     {"query_ops_per_sec", query_throughput},
-    {"insert_ops", report.insert.count},
-    {"insert_ops_per_sec", insert_throughput},
+    {"write_ops", throughput_write_ops},
+    {"write_ops_per_sec", write_throughput},
+    {"insert_ops", args.workload == "mixed" ? measure_mixed_stats.completed_inserts : report.insert.count},
+    {"insert_ops_per_sec", has_throughput_duration
+      ? static_cast<double>(args.workload == "mixed"
+          ? measure_mixed_stats.completed_inserts
+          : report.insert.count) / throughput_duration
+      : 0.0},
+    {"upsert_ops", args.workload == "mixed" ? measure_mixed_stats.completed_upserts : 0},
+    {"upsert_ops_per_sec", has_throughput_duration && args.workload == "mixed"
+      ? static_cast<double>(measure_mixed_stats.completed_upserts) / throughput_duration
+      : 0.0},
+    {"delete_ops", args.workload == "mixed" ? measure_mixed_stats.completed_deletes : 0},
+    {"delete_ops_per_sec", has_throughput_duration && args.workload == "mixed"
+      ? static_cast<double>(measure_mixed_stats.completed_deletes) / throughput_duration
+      : 0.0},
   };
 
   nlohmann::json summaries = nlohmann::json::object();
@@ -673,11 +850,16 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     text_summary << "throughput\n";
     text_summary << "  duration_seconds: " << throughput_duration << '\n';
     text_summary << "  total_ops_per_sec: " << total_throughput
-                 << " (ops=" << (report.query.count + report.insert.count) << ")\n";
+                 << " (ops=" << (throughput_query_ops + throughput_write_ops) << ")\n";
     text_summary << "  query_ops_per_sec: " << query_throughput
-                 << " (ops=" << report.query.count << ")\n";
-    text_summary << "  insert_ops_per_sec: " << insert_throughput
-                 << " (ops=" << report.insert.count << ")\n";
+                 << " (ops=" << throughput_query_ops << ")\n";
+    text_summary << "  write_ops_per_sec: " << write_throughput
+                 << " (ops=" << throughput_write_ops << ")\n";
+    if (args.workload == "mixed") {
+      text_summary << "  write_mix_completed: insert=" << measure_mixed_stats.completed_inserts
+                   << " upsert=" << measure_mixed_stats.completed_upserts
+                   << " delete=" << measure_mixed_stats.completed_deletes << '\n';
+    }
   }
   if (root.contains("recall")) {
     const auto& recall = root["recall"];

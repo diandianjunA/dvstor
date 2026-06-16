@@ -161,6 +161,12 @@ Args parse_args(int argc, char** argv) {
       args.report_text_path = require_value("--report-text");
     } else if (flag == "--insert-start-id") {
       args.insert_start_id = static_cast<uint32_t>(std::stoul(require_value("--insert-start-id")));
+    } else if (flag == "--write-insert-ratio") {
+      args.write_insert_ratio = std::stod(require_value("--write-insert-ratio"));
+    } else if (flag == "--write-upsert-ratio") {
+      args.write_upsert_ratio = std::stod(require_value("--write-upsert-ratio"));
+    } else if (flag == "--write-delete-ratio") {
+      args.write_delete_ratio = std::stod(require_value("--write-delete-ratio"));
     } else {
       throw std::runtime_error("unknown argument: " + flag);
     }
@@ -184,6 +190,12 @@ Args parse_args(int argc, char** argv) {
   }
   if (args.mixed_mode != "probability" && args.mixed_mode != "fixed_threads") {
     throw std::runtime_error("--mixed-mode must be probability or fixed_threads");
+  }
+  if (args.write_insert_ratio < 0.0 || args.write_upsert_ratio < 0.0 || args.write_delete_ratio < 0.0) {
+    throw std::runtime_error("write mutation ratios must be >= 0");
+  }
+  if (args.write_insert_ratio + args.write_upsert_ratio + args.write_delete_ratio <= 0.0) {
+    throw std::runtime_error("at least one write mutation ratio must be > 0");
   }
   if (args.min_recall > 1.0) {
     throw std::runtime_error("--min-recall must be <= 1");

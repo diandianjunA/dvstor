@@ -12,6 +12,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_FLAGS_DEBUG "-g -fno-omit-frame-pointer -fno-inline -fsanitize=address")
 
+# Use RPATH (not RUNPATH) so that custom METIS/GKlib paths take priority
+# over system library paths at runtime.
+set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--disable-new-dtags")
+set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--disable-new-dtags")
+
 if (NOT DVSTOR_STORAGE_NODE_ONLY)
     # CUDA standard
     set(CMAKE_CUDA_STANDARD 17)
@@ -63,9 +68,14 @@ endif ()
 if (NOT DVSTOR_METIS_PARTITION_MODE STREQUAL "OFF")
     find_path(METIS_INCLUDE_DIR metis.h)
     find_library(METIS_LIBRARY NAMES metis)
+    find_library(GKLIB_LIBRARY NAMES GKlib)
     if (METIS_INCLUDE_DIR AND METIS_LIBRARY)
         set(DVSTOR_HAVE_METIS ON)
-        message(STATUS "METIS partitioning: enabled (${METIS_LIBRARY})")
+        if (GKLIB_LIBRARY)
+            message(STATUS "METIS partitioning: enabled (${METIS_LIBRARY}, GKlib: ${GKLIB_LIBRARY})")
+        else ()
+            message(STATUS "METIS partitioning: enabled (${METIS_LIBRARY})")
+        endif ()
     elseif (DVSTOR_METIS_PARTITION_MODE STREQUAL "ON")
         message(FATAL_ERROR "METIS partitioning requested but metis.h/libmetis were not found. Install libmetis-dev or set -DDVSTOR_METIS_PARTITION=OFF.")
     else ()
@@ -87,11 +97,13 @@ set(DVSTOR_MEMORY_NODE_SOURCES
     src/memory_node/memory_node.cc
     src/memory_node/peer_rdma.cc
     src/memory_node/peer_rpc.cc
+    src/memory_node/storage_owner_anchor.cc
     src/memory_node/storage_owner_index.cc
     src/memory_node/storage_owner_runtime.cc
 )
 
 set(DVSTOR_OFFLINE_BUILDER_SOURCES
+    tools/vamana_offline/anchor_builder.cc
     tools/vamana_offline/config.cc
     tools/vamana_offline/dataset_io.cc
     tools/vamana_offline/graph.cc
@@ -109,6 +121,7 @@ set(DVSTOR_BREAKDOWN_BENCHMARK_SOURCES
 function(add_vamana_metis_repartitioner_target)
     add_executable(vamana_metis_repartitioner
         tools/vamana_metis_repartitioner.cc
+        tools/vamana_repartitioner_common.cc
         tools/vamana_offline/partitioning.cc
     )
     target_include_directories(vamana_metis_repartitioner PRIVATE
@@ -121,10 +134,28 @@ function(add_vamana_metis_repartitioner_target)
     target_link_metis(vamana_metis_repartitioner)
 endfunction()
 
+function(add_vamana_bfs_repartitioner_target)
+    add_executable(vamana_bfs_repartitioner
+        tools/vamana_bfs_repartitioner.cc
+        tools/vamana_repartitioner_common.cc
+        tools/vamana_offline/partitioning.cc
+    )
+    target_include_directories(vamana_bfs_repartitioner PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
+        ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
+    )
+    target_link_libraries(vamana_bfs_repartitioner rdma_library)
+endfunction()
+
 function(target_link_metis target_name)
     if (DVSTOR_HAVE_METIS)
         target_include_directories(${target_name} PRIVATE ${METIS_INCLUDE_DIR})
         target_link_libraries(${target_name} ${METIS_LIBRARY})
+        if (GKLIB_LIBRARY)
+            target_link_libraries(${target_name} ${GKLIB_LIBRARY})
+        endif ()
         target_compile_definitions(${target_name} PRIVATE DVSTOR_HAVE_METIS=1)
     else ()
         target_compile_definitions(${target_name} PRIVATE DVSTOR_HAVE_METIS=0)
@@ -148,6 +179,17 @@ if (DVSTOR_STORAGE_NODE_ONLY)
 
     if (DVSTOR_BUILD_EXECUTABLES)
         add_vamana_metis_repartitioner_target()
+        add_vamana_bfs_repartitioner_target()
+
+        add_executable(vamana_rabitq_sidecar_converter
+            tools/vamana_rabitq_sidecar_converter.cc
+        )
+        target_include_directories(vamana_rabitq_sidecar_converter PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
+            ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
+        )
+        target_link_libraries(vamana_rabitq_sidecar_converter rdma_library)
     endif ()
 else ()
     # GPU kernels library (compiled by nvcc)
@@ -229,7 +271,30 @@ else ()
         )
         target_link_metis(vamana_offline_builder)
 
+        add_executable(vamana_anchor_sidecar_builder
+            tools/vamana_anchor_sidecar_builder.cc
+            src/vamana/anchor_index.cc
+        )
+        target_include_directories(vamana_anchor_sidecar_builder PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
+            ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
+        )
+        target_link_libraries(vamana_anchor_sidecar_builder rdma_library)
+
         add_vamana_metis_repartitioner_target()
+        add_vamana_bfs_repartitioner_target()
+
+        add_executable(vamana_rabitq_sidecar_converter
+            tools/vamana_rabitq_sidecar_converter.cc
+        )
+        target_include_directories(vamana_rabitq_sidecar_converter PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/rdma-library
+            ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty
+        )
+        target_link_libraries(vamana_rabitq_sidecar_converter rdma_library)
 
         add_executable(dvstor_breakdown_benchmark
             tools/dvstor_breakdown_benchmark.cc
@@ -245,6 +310,7 @@ else ()
     endif ()
 
     if (DVSTOR_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/CMakeLists.txt")
+        enable_testing()
         add_subdirectory(test)
     endif ()
 

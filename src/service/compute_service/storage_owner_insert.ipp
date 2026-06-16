@@ -23,11 +23,14 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
 
       auto task = std::make_unique<StorageInsertTask>();
       task->item = item;
+      task->kind = service::storage_owner::MutationKind::insert;
       task->sample = sample;
       task->enqueued_at = std::chrono::steady_clock::now();
       futures.push_back(task->result.get_future());
       samples.push_back(sample);
-      const u32 owner_storage = num_servers_ == 0 ? 0 : static_cast<u32>(item.id % num_servers_);
+      const auto route = route_storage_owner_update(item);
+      task->anchor_hints = route.hints;
+      const u32 owner_storage = route.owner;
       auto& state = *storage_insert_owners_[owner_storage];
       {
         std::lock_guard<std::mutex> lock(state.mutex);
@@ -82,7 +85,12 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
       sample->enqueued_at = std::chrono::steady_clock::now();
     }
 
-    auto* request = new service::InsertRequest{item.id, item.values, {}, std::chrono::steady_clock::now(), sample};
+    auto* request = new service::InsertRequest{};
+    request->id = item.id;
+    request->components = item.values;
+    request->kind = service::storage_owner::MutationKind::insert;
+    request->enqueued_at = std::chrono::steady_clock::now();
+    request->breakdown_sample = sample;
     futures.push_back(request->result.get_future());
     requests.push_back(request);
     samples.push_back(sample);
@@ -94,6 +102,15 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
     const bool ok = futures[i].get();
     if (ok) {
       ++inserted;
+      publish_compute_side_id(requests[i]->id, requests[i]->new_ptr, false,
+                              requests[i]->new_ptr.memory_node());
+      if (rabitq_cache_) {
+        const auto stored = encode_float_vector_to_storage(
+            span<const element_t>{requests[i]->components.data(), requests[i]->components.size()},
+            VamanaNode::vector_dtype());
+        (void)rabitq_cache_->upsert_dynamic(
+            requests[i]->new_ptr, stored.data(), VamanaNode::vector_dtype());
+      }
     }
     if (samples[i] && samples[i]->finished_flag) {
       std::lock_guard<std::mutex> lock(breakdown_mutex_);
@@ -110,6 +127,137 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
 }
 
 template <class Distance>
+size_t ComputeService<Distance>::upsert(const vec<InsertItem>& batch) {
+  if (!config_.use_storage_owner_insert()) {
+    vec<service::InsertRequest*> requests;
+    vec<std::future<bool>> futures;
+    requests.reserve(batch.size());
+    futures.reserve(batch.size());
+    for (const auto& item : batch) {
+      if (item.values.size() != config_.dim) {
+        throw std::invalid_argument("upsert dimension mismatch");
+      }
+      RemotePtr old_ptr{};
+      bool deleted = false;
+      const bool old_live = lookup_compute_side_id(item.id, &old_ptr, &deleted) && !deleted;
+      auto* request = new service::InsertRequest{};
+      request->id = item.id;
+      request->components = item.values;
+      request->kind = service::storage_owner::MutationKind::upsert;
+      request->old_ptr = old_live ? old_ptr : RemotePtr{};
+      request->enqueued_at = std::chrono::steady_clock::now();
+      futures.push_back(request->result.get_future());
+      requests.push_back(request);
+      insert_queue_.enqueue(request);
+    }
+    size_t updated = 0;
+    for (size_t i = 0; i < futures.size(); ++i) {
+      const bool ok = futures[i].get();
+      if (ok) {
+        ++updated;
+        if (!requests[i]->old_ptr.is_null()) {
+          (void)mark_remote_deleted(requests[i]->old_ptr);
+          if (rabitq_cache_) {
+            (void)rabitq_cache_->erase_dynamic(requests[i]->old_ptr);
+          }
+        }
+        publish_compute_side_id(requests[i]->id, requests[i]->new_ptr, false,
+                                requests[i]->new_ptr.memory_node());
+        if (rabitq_cache_) {
+          const auto stored = encode_float_vector_to_storage(
+              span<const element_t>{requests[i]->components.data(), requests[i]->components.size()},
+              VamanaNode::vector_dtype());
+          (void)rabitq_cache_->upsert_dynamic(
+              requests[i]->new_ptr, stored.data(), VamanaNode::vector_dtype());
+        }
+      }
+    }
+    vectors_inserted_.fetch_add(updated, std::memory_order_relaxed);
+    for (auto* request : requests) {
+      delete request;
+    }
+    return updated;
+  }
+  if (storage_insert_owners_.empty()) {
+    throw std::runtime_error("storage_owner mutation runtime is not initialized");
+  }
+  vec<std::future<bool>> futures;
+  futures.reserve(batch.size());
+  for (const auto& item : batch) {
+    if (item.values.size() != config_.dim) {
+      throw std::invalid_argument("upsert dimension mismatch");
+    }
+    auto task = std::make_unique<StorageInsertTask>();
+    task->item = item;
+    task->kind = service::storage_owner::MutationKind::upsert;
+    task->enqueued_at = std::chrono::steady_clock::now();
+    futures.push_back(task->result.get_future());
+    const u32 owner_storage = storage_owner_for_id(item.id);
+    const auto route = route_storage_owner_update(item, owner_storage);
+    task->anchor_hints = route.hints;
+    auto& state = *storage_insert_owners_[owner_storage];
+    {
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.queue.push_back(std::move(task));
+    }
+    state.cv.notify_one();
+  }
+  size_t updated = 0;
+  for (auto& future : futures) {
+    updated += future.get() ? 1u : 0u;
+  }
+  vectors_inserted_.fetch_add(updated, std::memory_order_relaxed);
+  return updated;
+}
+
+template <class Distance>
+size_t ComputeService<Distance>::erase(const vec<node_t>& ids) {
+  if (!config_.use_storage_owner_insert()) {
+    size_t erased = 0;
+    for (const node_t id : ids) {
+      RemotePtr ptr{};
+      bool deleted = false;
+      if (!lookup_compute_side_id(id, &ptr, &deleted) || deleted) {
+        continue;
+      }
+      if (mark_remote_deleted(ptr)) {
+        publish_compute_side_id(id, ptr, true, ptr.memory_node());
+        if (rabitq_cache_) {
+          (void)rabitq_cache_->erase_dynamic(ptr);
+        }
+        ++erased;
+      }
+    }
+    return erased;
+  }
+  if (storage_insert_owners_.empty()) {
+    throw std::runtime_error("storage_owner mutation runtime is not initialized");
+  }
+  vec<std::future<bool>> futures;
+  futures.reserve(ids.size());
+  for (const node_t id : ids) {
+    auto task = std::make_unique<StorageInsertTask>();
+    task->item.id = id;
+    task->item.values.assign(config_.dim, 0.0f);
+    task->kind = service::storage_owner::MutationKind::erase;
+    task->enqueued_at = std::chrono::steady_clock::now();
+    futures.push_back(task->result.get_future());
+    const u32 owner_storage = storage_owner_for_id(id);
+    auto& state = *storage_insert_owners_[owner_storage];
+    {
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.queue.push_back(std::move(task));
+    }
+    state.cv.notify_one();
+  }
+  size_t erased = 0;
+  for (auto& future : futures) {
+    erased += future.get() ? 1u : 0u;
+  }
+  return erased;
+}
+
+template <class Distance>
 void ComputeService<Distance>::start_storage_insert_runtime() {
   if (!storage_insert_owners_.empty()) {
     return;
@@ -117,8 +265,13 @@ void ComputeService<Distance>::start_storage_insert_runtime() {
 
   const u32 owner_count = std::max<u32>(1, num_servers_);
   const u32 rpc_depth = std::max<u32>(1, config_.storage_owner_rpc_depth);
-  const size_t request_bytes =
-    service::storage_owner::insert_batch_request_bytes(config_.storage_owner_batch_max, config_.dim);
+  const size_t request_bytes = std::max(
+    service::storage_owner::insert_batch_request_bytes(
+      config_.storage_owner_batch_max, config_.dim,
+      config_.storage_owner_update_mode == "anchored" ? config_.storage_owner_anchor_hints : 0),
+    service::storage_owner::mutation_batch_request_bytes(
+      config_.storage_owner_batch_max, config_.dim,
+      config_.storage_owner_update_mode == "anchored" ? config_.storage_owner_anchor_hints : 0));
   const size_t response_bytes =
     service::storage_owner::insert_batch_response_bytes(config_.storage_owner_batch_max);
   const size_t max_inflight = static_cast<size_t>(owner_count) * rpc_depth;
@@ -297,9 +450,17 @@ void ComputeService<Distance>::post_storage_owner_batch(
   }
 
   const u32 item_count = static_cast<u32>(tasks.size());
+  const u32 anchor_hint_count = config_.storage_owner_update_mode == "anchored"
+                                  ? config_.storage_owner_anchor_hints : 0;
   const u64 batch_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
   const auto prepare_start = std::chrono::steady_clock::now();
-  const size_t request_size = service::storage_owner::insert_batch_request_bytes(item_count, config_.dim);
+  bool mutation_request = false;
+  for (const auto& task : tasks) {
+    mutation_request = mutation_request || task->kind != service::storage_owner::MutationKind::insert;
+  }
+  const size_t request_size = mutation_request
+    ? service::storage_owner::mutation_batch_request_bytes(item_count, config_.dim, anchor_hint_count)
+    : service::storage_owner::insert_batch_request_bytes(item_count, config_.dim, anchor_hint_count);
   const size_t response_size = service::storage_owner::insert_batch_response_bytes(item_count);
   auto& state = *storage_insert_owners_[owner_storage];
   auto& slot = state.slots[slot_id];
@@ -311,21 +472,45 @@ void ComputeService<Distance>::post_storage_owner_batch(
   }
 
   auto* request = reinterpret_cast<service::storage_owner::InsertBatchRequestHeader*>(slot.request_buffer.data());
-  request->magic = service::storage_owner::kInsertMagic;
+  request->magic = mutation_request ? service::storage_owner::kMutationMagic
+                                    : service::storage_owner::kInsertMagic;
   request->dim = config_.dim;
   request->owner_storage = owner_storage;
   request->source_client = cm_.client_id;
   request->item_count = item_count;
   request->vector_dtype = static_cast<u32>(VamanaNode::vector_dtype());
   request->vector_bytes = static_cast<u32>(VamanaNode::vector_bytes());
+  request->anchor_hint_count = anchor_hint_count;
   request->batch_id = batch_id;
 
-  node_t* ids = service::storage_owner::request_ids(slot.request_buffer.data());
-  byte_t* vectors = service::storage_owner::request_vectors(slot.request_buffer.data(), item_count);
+  node_t* ids = mutation_request
+    ? service::storage_owner::mutation_request_ids(slot.request_buffer.data())
+    : service::storage_owner::request_ids(slot.request_buffer.data());
+  byte_t* vectors = mutation_request
+    ? service::storage_owner::mutation_request_vectors(slot.request_buffer.data(), item_count)
+    : service::storage_owner::request_vectors(slot.request_buffer.data(), item_count);
+  u32* kinds = mutation_request ? service::storage_owner::mutation_request_kinds(slot.request_buffer.data())
+                                : nullptr;
+  u64* anchor_hints = mutation_request
+    ? service::storage_owner::mutation_request_anchor_hints(slot.request_buffer.data(), item_count)
+    : service::storage_owner::request_anchor_hints(slot.request_buffer.data(), item_count);
   for (u32 i = 0; i < item_count; ++i) {
     ids[i] = slot.tasks[i]->item.id;
-    encode_float_vector_to_storage(slot.tasks[i]->item.values.data(), config_.dim, VamanaNode::vector_dtype(),
-                                   vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes());
+    if (kinds != nullptr) {
+      kinds[i] = static_cast<u32>(slot.tasks[i]->kind);
+    }
+    byte_t* vector_output = vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes();
+    if (slot.tasks[i]->kind == service::storage_owner::MutationKind::erase) {
+      std::memset(vector_output, 0, VamanaNode::vector_bytes());
+    } else {
+      encode_float_vector_to_storage(slot.tasks[i]->item.values.data(), config_.dim,
+                                     VamanaNode::vector_dtype(), vector_output);
+    }
+    for (u32 hint = 0; hint < anchor_hint_count; ++hint) {
+      anchor_hints[static_cast<size_t>(i) * anchor_hint_count + hint] =
+        hint < slot.tasks[i]->anchor_hints.size()
+          ? slot.tasks[i]->anchor_hints[hint].raw_address : 0;
+    }
   }
 
   const u64 request_prepare_ns = duration_ns(prepare_start, std::chrono::steady_clock::now());
@@ -426,7 +611,8 @@ void ComputeService<Distance>::handle_storage_owner_response(u32 owner_storage, 
     std::lock_guard<std::mutex> lock(state.mutex);
     const auto* response =
       reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(response_slot.buffer.data());
-    const bool header_ok = response->magic == service::storage_owner::kInsertMagic &&
+    const bool header_ok = (response->magic == service::storage_owner::kInsertMagic ||
+                            response->magic == service::storage_owner::kMutationMagic) &&
                            response->owner_storage == owner_storage;
     auto slot_it = header_ok ? state.batch_to_slot.find(response->batch_id) : state.batch_to_slot.end();
     if (!header_ok || slot_it == state.batch_to_slot.end() || slot_it->second >= state.slots.size()) {
@@ -485,7 +671,10 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
     const auto* response =
       reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(slot.response_buffer.data());
     const u32* statuses = service::storage_owner::response_statuses(slot.response_buffer.data());
-    const bool response_ok = response->magic == service::storage_owner::kInsertMagic &&
+    const auto* mutation_results = service::storage_owner::response_mutation_results(
+      slot.response_buffer.data(), slot.item_count);
+    const bool response_ok = (response->magic == service::storage_owner::kInsertMagic ||
+                              response->magic == service::storage_owner::kMutationMagic) &&
                              response->owner_storage == slot.owner_storage &&
                              response->batch_id == slot.batch_id &&
                              response->item_count == slot.item_count;
@@ -515,10 +704,13 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
     const u64 response_wait_unaccounted_ns =
       response_wait_ns > memory_breakdown_ns ? response_wait_ns - memory_breakdown_ns : 0;
     const auto finished_at = slot.response_completed_at;
+    const bool mutation_response = response->magic == service::storage_owner::kMutationMagic;
+    const byte_t* request_vectors = mutation_response
+      ? service::storage_owner::mutation_request_vectors(slot.request_buffer.data(), slot.item_count)
+      : service::storage_owner::request_vectors(slot.request_buffer.data(), slot.item_count);
 
     for (u32 i = 0; i < slot.item_count; ++i) {
-      const bool ok = response_ok &&
-                      statuses[i] == static_cast<u32>(service::storage_owner::InsertStatus::ok);
+      const bool ok = response_ok && statuses[i] == 0;
       if (response_ok && !ok) {
         static std::atomic<u32> failed_status_logs{0};
         const u32 log_index = failed_status_logs.fetch_add(1, std::memory_order_relaxed);
@@ -543,8 +735,32 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
           slot.item_count);
         if (breakdown) {
           add_storage_owner_breakdown(slot.samples[i], *breakdown, slot.item_count);
+          if (i == 0) add_storage_owner_counters(slot.samples[i], *breakdown);
         }
         slot.samples[i]->mark_finished(finished_at, statistics::ThreadStatistics{});
+      }
+      if (ok && rabitq_cache_ != nullptr) {
+        const auto& result = mutation_results[i];
+        if (result.old_rptr_raw != 0) {
+          (void)rabitq_cache_->erase_dynamic(RemotePtr{result.old_rptr_raw});
+        }
+        if (result.new_rptr_raw != 0 &&
+            slot.tasks[i]->kind != service::storage_owner::MutationKind::erase) {
+          (void)rabitq_cache_->upsert_dynamic(
+            RemotePtr{result.new_rptr_raw},
+            request_vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes(),
+            VamanaNode::vector_dtype());
+        }
+      }
+      if (ok) {
+        const auto& result = mutation_results[i];
+        if (slot.tasks[i]->kind == service::storage_owner::MutationKind::erase) {
+          publish_compute_side_id(slot.tasks[i]->item.id,
+                                  RemotePtr{result.old_rptr_raw}, true, slot.owner_storage);
+        } else {
+          publish_compute_side_id(slot.tasks[i]->item.id,
+                                  RemotePtr{result.new_rptr_raw}, false, slot.owner_storage);
+        }
       }
       slot.tasks[i]->result.set_value(ok);
     }

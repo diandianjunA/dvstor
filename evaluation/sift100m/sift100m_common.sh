@@ -15,8 +15,8 @@ PID_DIR="${PID_DIR:-$SCRIPT_DIR/pids}"
 
 SHARDS="${SHARDS:-5}"
 # PARTITION_STRATEGY="${PARTITION_STRATEGY:-bfs}"
-PARTITION_STRATEGY="${PARTITION_STRATEGY:-metis}"
-# PARTITION_STRATEGY="${PARTITION_STRATEGY:-balanced}"
+# PARTITION_STRATEGY="${PARTITION_STRATEGY:-metis}"
+PARTITION_STRATEGY="${PARTITION_STRATEGY:-balanced}"
 R="${R:-48}"
 BUILD_BEAM="${BUILD_BEAM:-200}"
 SEARCH_BEAM="${SEARCH_BEAM:-128}"
@@ -24,6 +24,7 @@ ALPHA="${ALPHA:-1.2}"
 K="${K:-10}"
 DIM="${DIM:-128}"
 VECTOR_DATA_TYPE="${VECTOR_DATA_TYPE:-uint8}"
+STORAGE_FORMAT="${STORAGE_FORMAT:-vamana_compact_v1}"
 BUILD_THREADS="${BUILD_THREADS:-32}"
 SERVICE_THREADS="${SERVICE_THREADS:-16}"
 COROUTINES="${COROUTINES:-4}"
@@ -40,7 +41,13 @@ estimate_node_bytes() {
     uint8|int8) component_size=1 ;;
     float32|auto) component_size=4 ;;
   esac
-  echo $((16 + DIM * component_size + R * 8))
+  if [[ "$STORAGE_FORMAT" == "vamana_compact_v1" ]]; then
+    local fixed_bytes=$((((16 + DIM * component_size + 15) / 16) * 16))
+    local graph_bytes=$((((8 + R * 5 + 7) / 8) * 8))
+    echo $((fixed_bytes + graph_bytes))
+  else
+    echo $((16 + DIM * component_size + R * 8))
+  fi
 }
 
 estimate_mn_memory_gb() {
@@ -246,6 +253,35 @@ write_service_config() {
     echo "query-coroutines = $query_coroutines"
     echo "label = sift100m_${PROFILE_NAME:-$PROFILE}"
     if [[ "${GPUDIRECT_RDMA:-0}" == "1" ]]; then echo "gpudirect-rdma = true"; fi
+    if [[ -n "${EXPANSION_BATCH:-}" ]]; then echo "expansion-batch = ${EXPANSION_BATCH}"; fi
+    if [[ -n "${RDMA_QP_POOL_SIZE:-}" ]]; then echo "rdma-qp-pool-size = ${RDMA_QP_POOL_SIZE}"; fi
+    if [[ -n "${RDMA_READ_BATCH_MODE:-}" ]]; then echo "rdma-read-batch-mode = ${RDMA_READ_BATCH_MODE}"; fi
+    if [[ -n "${RDMA_READ_CHAIN_SIZE:-}" ]]; then echo "rdma-read-chain-size = ${RDMA_READ_CHAIN_SIZE}"; fi
+    if [[ -n "${RDMA_READ_MAX_INFLIGHT_WRS:-}" ]]; then echo "rdma-read-max-inflight-wrs = ${RDMA_READ_MAX_INFLIGHT_WRS}"; fi
+    if [[ -n "${QUERY_BATCH_SIZE:-}" ]]; then echo "query-batch-size = ${QUERY_BATCH_SIZE}"; fi
+    if [[ "${USE_RABITQ:-0}" == "1" ]]; then echo "use-rabitq = true"; fi
+    if [[ "${USE_RABITQ:-0}" == "1" ]]; then
+      echo "rabitq-mode = ${RABITQ_MODE:-exact_safe}"
+      echo "rabitq-gate-width = ${RABITQ_GATE_WIDTH:-18}"
+      echo "rabitq-gate-max-width = ${RABITQ_GATE_MAX_WIDTH:-36}"
+      echo "rabitq-gate-margin = ${RABITQ_GATE_MARGIN:-0.08}"
+      echo "rabitq-cache-max-ratio = ${RABITQ_CACHE_MAX_RATIO:-0.10}"
+      echo "rabitq-dynamic-budget-mb = ${RABITQ_DYNAMIC_BUDGET_MB:-64}"
+      echo "rabitq-coalesce-target = ${RABITQ_COALESCE_TARGET:-64}"
+      echo "rabitq-coalesce-min = ${RABITQ_COALESCE_MIN:-32}"
+      echo "rabitq-coalesce-wait-us = ${RABITQ_COALESCE_WAIT_US:-6}"
+      echo "rabitq-prefetch-width = ${RABITQ_PREFETCH_WIDTH:-2}"
+      echo "rabitq-prefetch-min-samples = ${RABITQ_PREFETCH_MIN_SAMPLES:-16}"
+      echo "rabitq-prefetch-min-hit-ratio = ${RABITQ_PREFETCH_MIN_HIT_RATIO:-0.35}"
+      echo "rabitq-warmup-exact-expansions = ${RABITQ_WARMUP_EXACT_EXPANSIONS:-6}"
+      echo "rabitq-audit-period = ${RABITQ_AUDIT_PERIOD:-12}"
+      echo "rabitq-safe-epsilon = ${RABITQ_SAFE_EPSILON:-0.0001}"
+      if [[ "${RABITQ_STRICT_RECALL:-1}" == "1" ]]; then
+        echo "rabitq-strict-recall = true"
+      else
+        echo "rabitq-strict-recall = false"
+      fi
+    fi
     echo "insert-execution = $insert_execution"
     if [[ "$insert_execution" == "storage_owner" ]]; then
       echo "storage-peers = $endpoints"
@@ -254,9 +290,21 @@ write_service_config() {
       echo "storage-owner-peer-rdma-tokens = ${STORAGE_OWNER_PEER_RDMA_TOKENS:-8}"
       echo "storage-owner-rpc-depth = ${STORAGE_OWNER_RPC_DEPTH:-16}"
       echo "storage-owner-rpc-timeout-ms = ${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}"
-      echo "storage-owner-construction-beam-width = ${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-$BUILD_BEAM}"
+      echo "storage-owner-construction-beam-width = ${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-$SEARCH_BEAM}"
       echo "storage-owner-search-snapshot-batch = ${STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH:-64}"
       echo "storage-owner-prune-max-candidates = ${STORAGE_OWNER_PRUNE_MAX_CANDIDATES:-128}"
+      local update_mode="${STORAGE_OWNER_UPDATE_MODE:-exact}"
+      if [[ "$update_mode" != "exact" ]]; then
+        echo "storage-owner-update-mode = ${update_mode}"
+      fi
+      if [[ "$update_mode" == "anchored" ]]; then
+        echo "storage-owner-anchor-hints = ${STORAGE_OWNER_ANCHOR_HINTS:-4}"
+        echo "storage-owner-anchor-beam-width = ${STORAGE_OWNER_ANCHOR_BEAM_WIDTH:-64}"
+        echo "storage-owner-anchor-expand-cap = ${STORAGE_OWNER_ANCHOR_EXPAND_CAP:-16}"
+        echo "storage-owner-anchor-remote-rescue-cap = ${STORAGE_OWNER_ANCHOR_REMOTE_RESCUE_CAP:-4}"
+        echo "storage-owner-anchor-audit-rate = ${STORAGE_OWNER_ANCHOR_AUDIT_RATE:-256}"
+        echo "storage-owner-anchor-min-overlap = ${STORAGE_OWNER_ANCHOR_MIN_OVERLAP:-0.5}"
+      fi
       echo "storage-owner-reverse-mode = ${STORAGE_OWNER_REVERSE_MODE:-async}"
       echo "storage-owner-reverse-queue-depth = ${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
       echo "storage-owner-reverse-flush-us = ${STORAGE_OWNER_REVERSE_FLUSH_US:-200}"

@@ -1,4 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$SCRIPT_DIR/start_memory_node.sh" 4 "${1:-${PROFILE:-baseline}}"

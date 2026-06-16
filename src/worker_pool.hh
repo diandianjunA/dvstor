@@ -29,11 +29,14 @@ public:
   void allocate_worker_threads(Context& context,
                                ClientConnectionManager& cm,
                                MemoryRegionTokens& remote_mrts,
-                               u32 num_coroutines) {
+                               u32 num_coroutines,
+                               u32 qp_pool_size = 1,
+                               RdmaReadBatchOptions batch_options = {}) {
     // create shared contexts (and QPs)
     for (u32 i = 0; i < std::min<u32>(num_compute_threads_, MAX_QPS); ++i) {
       shared_contexts_.emplace_back(
-        std::make_unique<SharedCtx>(context, cm, buffer_allocator_.get_raw_buffer(), remote_mrts));
+        std::make_unique<SharedCtx>(context, cm, buffer_allocator_.get_raw_buffer(),
+                                    remote_mrts, qp_pool_size, batch_options));
     }
 
     // pre-allocate worker threads

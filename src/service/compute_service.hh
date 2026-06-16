@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <library/connection_manager.hh>
@@ -22,6 +23,8 @@
 #include "service/compute_service/state.hh"
 #include "service/storage_owner_protocol.hh"
 #include "service/index_metadata.hh"
+#include "vamana/storage_layout_resolver.hh"
+#include "vamana/anchor_index.hh"
 #include "vamana/vamana.hh"
 #include "worker_pool.hh"
 
@@ -97,6 +100,8 @@ public:
   ComputeService& operator=(const ComputeService&) = delete;
 
   size_t insert(const vec<InsertItem>& batch);
+  size_t upsert(const vec<InsertItem>& batch);
+  size_t erase(const vec<node_t>& ids);
   vec<node_t> search(const vec<element_t>& query, u32 k);
   vec<node_t> search_raw(VectorDType query_dtype, const byte_t* query_data, u32 dim, u32 k);
   bool load_index(const std::string& path, str* error_message = nullptr);
@@ -107,14 +112,30 @@ public:
   service::breakdown::Report collect_breakdown_report() const;
 
   const Configuration& config() const { return config_; }
+  size_t rabitq_cache_bytes() const { return rabitq_cache_ ? rabitq_cache_->total_size_bytes() : 0; }
+  size_t rabitq_cache_entries() const { return rabitq_cache_ ? rabitq_cache_->entry_count() : 0; }
+  size_t rabitq_cache_entry_bytes() const { return rabitq_cache_ ? rabitq_cache_->entry_bytes() : 0; }
+  size_t rabitq_cache_code_bits() const { return rabitq_cache_ ? rabitq_cache_->code_bits() : 0; }
+  size_t rabitq_cache_override_bitmap_bytes() const {
+    return rabitq_cache_ ? rabitq_cache_->override_bitmap_bytes() : 0;
+  }
+  size_t rabitq_cache_dynamic_live() const { return rabitq_cache_ ? rabitq_cache_->dynamic_live() : 0; }
+  size_t rabitq_cache_dynamic_overflow() const {
+    return rabitq_cache_ ? rabitq_cache_->dynamic_overflow() : 0;
+  }
+  bool rabitq_cache_numa_interleaved() const {
+    return rabitq_cache_ && rabitq_cache_->numa_interleaved();
+  }
 
 private:
   struct StorageInsertTask {
     InsertItem item;
+    service::storage_owner::MutationKind kind{service::storage_owner::MutationKind::insert};
     std::shared_ptr<service::breakdown::Sample> sample;
     std::promise<bool> result;
     std::chrono::steady_clock::time_point enqueued_at{};
     std::chrono::steady_clock::time_point sender_dequeued_at{};
+    vec<RemotePtr> anchor_hints;
   };
 
   struct StorageOwnerRpcSlot {
@@ -188,6 +209,14 @@ private:
   void maybe_release_storage_owner_slot_locked(StorageOwnerSenderState& state,
                                                StorageOwnerRpcSlot& slot);
   void fail_storage_owner_tasks(vec<std::unique_ptr<StorageInsertTask>>& tasks);
+  bool initialize_compute_side_idmap(const filepath_t& index_prefix,
+                                     const service::index_metadata::Metadata& metadata);
+  bool mark_remote_deleted(RemotePtr ptr);
+  void publish_compute_side_id(node_t id, RemotePtr ptr, bool deleted, u32 owner_storage);
+  bool lookup_compute_side_id(node_t id, RemotePtr* ptr, bool* deleted = nullptr) const;
+  u32 storage_owner_for_id(node_t id) const;
+  vamana::anchor::Route route_storage_owner_update(const InsertItem& item,
+                                                    std::optional<u32> owner_override = std::nullopt) const;
   bool routing_enabled() const;
   size_t rpc_message_size() const;
   vec<element_t> compute_local_routing_centroid() const;
@@ -237,6 +266,8 @@ private:
   std::atomic<bool> rpc_idle_{false};
 
   std::unique_ptr<vamana::Vamana<Distance>> vamana_;
+  std::unique_ptr<vamana::rabitq::Cache> rabitq_cache_;
+  std::unique_ptr<vamana::anchor::Index> anchor_index_;
   std::unique_ptr<WorkerPool> worker_pool_;
   ServiceProfile service_profile_{};
   service::InsertQueue insert_queue_;
@@ -249,6 +280,13 @@ private:
   std::atomic<u32> storage_insert_inflight_{0};
   std::atomic<u32> storage_insert_timeout_logs_{0};
   vec<std::unique_ptr<StorageOwnerSenderState>> storage_insert_owners_;
+  struct ComputeSideIdEntry {
+    RemotePtr ptr;
+    bool deleted{};
+    u32 owner_storage{};
+  };
+  mutable std::mutex compute_side_idmap_mutex_;
+  hashmap_t<node_t, ComputeSideIdEntry> compute_side_idmap_;
 
   std::unique_ptr<byte_t[]> rpc_buffer_;
   std::unique_ptr<LocalMemoryRegion> rpc_region_;

@@ -1,7 +1,6 @@
 #include "memory_node/memory_node.hh"
 
 #include <algorithm>
-#include <iostream>
 
 void MemoryNode::setup_storage_peers(Configuration& config) {
   if (!use_storage_owner_insert_ || num_storage_nodes_ <= 1) {
@@ -20,6 +19,7 @@ void MemoryNode::setup_storage_peers(Configuration& config) {
 
   peer_qps_per_peer_ = std::max<u32>(1, std::min<u32>(MAX_QPS, std::max<u32>(1, num_compute_threads_)));
   peer_qps_.resize(num_storage_nodes_);
+  peer_qp_send_mutexes_.resize(num_storage_nodes_);
   peer_remote_tokens_.resize(num_storage_nodes_);
   peer_rdma_read_qp_outstanding_.clear();
   peer_rdma_read_qp_outstanding_.reserve(num_storage_nodes_);
@@ -30,6 +30,10 @@ void MemoryNode::setup_storage_peers(Configuration& config) {
     }
     if (i != storage_id_) {
       peer_qps_[i].resize(peer_qps_per_peer_);
+      peer_qp_send_mutexes_[i].reserve(peer_qps_per_peer_);
+      for (u32 qp_idx = 0; qp_idx < peer_qps_per_peer_; ++qp_idx) {
+        peer_qp_send_mutexes_[i].push_back(std::make_unique<std::mutex>());
+      }
       peer_remote_tokens_[i] = std::make_unique<MemoryRegionToken>();
     }
   }
@@ -55,15 +59,15 @@ void MemoryNode::setup_storage_peers(Configuration& config) {
   }
   peer_context_->close_server_socket();
   print_status("storage-owner peer RDMA QPs per peer: " + std::to_string(peer_qps_per_peer_));
+  if (peer_qps_per_peer_ > 1) {
+    print_status("storage-owner peer QP0 reserved for RPC; data RDMA uses QP1.." +
+                 std::to_string(peer_qps_per_peer_ - 1));
+  }
 
   peer_index_region_ = std::make_unique<MemoryRegion>(*peer_context_);
   peer_index_region_->register_memory(index_buffer_.get_full_buffer(), index_buffer_.buffer_size, true);
 
   const MemoryRegionToken local_token = peer_index_region_->createToken();
-  std::cerr << "[storage-peer][token] self_shard=" << storage_id_
-            << " local_base=" << local_token.address
-            << " local_rkey=" << local_token.rkey
-            << " local_bytes=" << index_buffer_.buffer_size << std::endl;
   for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
     if (peer_id == storage_id_) continue;
     LocalMemoryRegion peer_token_region{*peer_context_, peer_remote_tokens_[peer_id].get(), sizeof(MemoryRegionToken)};
@@ -71,10 +75,6 @@ void MemoryNode::setup_storage_peers(Configuration& config) {
     peer_control_qp(peer_id)->post_send_inlined(&local_token, sizeof(local_token), IBV_WR_SEND);
     peer_context_->poll_send_cq_until_completion();
     peer_context_->receive();
-    std::cerr << "[storage-peer][token] self_shard=" << storage_id_
-              << " peer_shard=" << peer_id
-              << " remote_base=" << peer_remote_tokens_[peer_id]->address
-              << " remote_rkey=" << peer_remote_tokens_[peer_id]->rkey << std::endl;
   }
 
   const size_t scratch_bytes = std::max<size_t>(64ull * 1024ull * 1024ull, align_up(VamanaNode::total_size() * 4));
@@ -90,10 +90,6 @@ void MemoryNode::setup_storage_peers(Configuration& config) {
     if (peer_id == storage_id_) continue;
     u64 header_words[2]{};
     remote_read_bytes(peer_id, 0, header_words, sizeof(header_words), 0);
-    std::cerr << "[storage-peer][probe] self_shard=" << storage_id_
-              << " peer_shard=" << peer_id
-              << " free_ptr=" << header_words[0]
-              << " medoid_raw=" << header_words[1] << std::endl;
   }
 }
 
@@ -106,7 +102,10 @@ QP& MemoryNode::peer_control_qp(u32 shard_id) {
 
 u32 MemoryNode::peer_data_qp_index(u32 worker_id) const {
   lib_assert(peer_qps_per_peer_ > 0, "peer QP count is not initialized");
-  return worker_id % peer_qps_per_peer_;
+  if (peer_qps_per_peer_ == 1) {
+    return 0;
+  }
+  return 1 + worker_id % (peer_qps_per_peer_ - 1);
 }
 
 QP& MemoryNode::peer_data_qp(u32 shard_id, u32 qp_idx) {
@@ -180,14 +179,23 @@ u64 MemoryNode::next_peer_async_wr_id() {
 }
 
 void MemoryNode::register_peer_pending_send_locked(u64 wr_id, PeerPendingSend pending) {
+  std::lock_guard<std::mutex> lock(peer_completion_mutex_);
   peer_pending_sends_[wr_id] = pending;
 }
 
 void MemoryNode::handle_peer_send_completion(u64 wr_id) {
-  const auto pending_it = peer_pending_sends_.find(wr_id);
-  if (pending_it != peer_pending_sends_.end()) {
-    const PeerPendingSend pending = pending_it->second;
-    peer_pending_sends_.erase(pending_it);
+  PeerPendingSend pending;
+  bool has_pending = false;
+  {
+    std::lock_guard<std::mutex> lock(peer_completion_mutex_);
+    const auto pending_it = peer_pending_sends_.find(wr_id);
+    if (pending_it != peer_pending_sends_.end()) {
+      pending = pending_it->second;
+      peer_pending_sends_.erase(pending_it);
+      has_pending = true;
+    }
+  }
+  if (has_pending) {
     if (pending.rdma_read_credit) {
       peer_rdma_read_outstanding_[pending.target_shard].fetch_sub(1, std::memory_order_acq_rel);
       if (pending.target_shard < peer_rdma_read_qp_outstanding_.size() &&
@@ -209,6 +217,7 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
 
   const auto [owner, id] = decode_64bit(wr_id);
   if (owner == kPeerSyncWrOwner) {
+    std::lock_guard<std::mutex> lock(peer_completion_mutex_);
     peer_sync_completions_.insert(wr_id);
     return;
   }
@@ -223,7 +232,7 @@ void MemoryNode::poll_peer_send_cq() {
   if (!peer_context_) {
     return;
   }
-  std::lock_guard<std::mutex> lock(peer_send_mutex_);
+  std::lock_guard<std::mutex> lock(peer_send_cq_mutex_);
   Context::poll_send_cq(peer_send_wcs_.data(),
                         static_cast<i32>(peer_send_wcs_.size()),
                         peer_context_->get_send_cq(),
@@ -231,7 +240,7 @@ void MemoryNode::poll_peer_send_cq() {
 }
 
 bool MemoryNode::consume_peer_sync_completion(u64 wr_id) {
-  std::lock_guard<std::mutex> lock(peer_send_mutex_);
+  std::lock_guard<std::mutex> lock(peer_completion_mutex_);
   const auto it = peer_sync_completions_.find(wr_id);
   if (it == peer_sync_completions_.end()) {
     return false;
@@ -272,10 +281,10 @@ void MemoryNode::post_peer_read_async(StorageOwnerThread& thread,
   peer_async_rdma_outstanding_.fetch_add(1, std::memory_order_acq_rel);
   thread.track_post();
   const u64 wr_id = next_peer_async_wr_id();
-  std::lock_guard<std::mutex> send_lock(peer_send_mutex_);
   register_peer_pending_send_locked(
     wr_id,
     PeerPendingSend{shard_id, qp_idx, thread.id, thread.running_coroutine, &thread, true, true});
+  std::lock_guard<std::mutex> send_lock(*peer_qp_send_mutexes_[shard_id][qp_idx]);
   qp->post_send(reinterpret_cast<u64>(dst),
                 static_cast<u32>(bytes),
                 thread.scratch_region->get_lkey(),
@@ -301,16 +310,6 @@ void MemoryNode::remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, s
                " offset=" + std::to_string(remote_offset) +
                " bytes=" + std::to_string(bytes) +
                " capacity=" + std::to_string(mn_memory_bytes_));
-  static std::atomic<u32> debug_reads{0};
-  const u32 debug_idx = debug_reads.fetch_add(1, std::memory_order_relaxed);
-  if (debug_idx < 16) {
-    std::cerr << "[storage-peer][read] self_shard=" << storage_id_
-              << " target_shard=" << shard_id
-              << " remote_base=" << peer_remote_tokens_[shard_id]->address
-              << " rkey=" << peer_remote_tokens_[shard_id]->rkey
-              << " offset=" << remote_offset
-              << " bytes=" << bytes << std::endl;
-  }
   StorageOwnerThread* owner_thread = current_storage_owner_thread_;
   const u32 qp_idx = peer_data_qp_index(owner_thread != nullptr ? owner_thread->id : 0);
   QP& qp = peer_data_qp(shard_id, qp_idx);
@@ -323,10 +322,10 @@ void MemoryNode::remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, s
   acquire_peer_rdma_read_credit(shard_id, qp_idx);
   const u64 wr_id = next_peer_sync_wr_id();
   {
-    std::lock_guard<std::mutex> send_lock(peer_send_mutex_);
     register_peer_pending_send_locked(
       wr_id,
       PeerPendingSend{shard_id, qp_idx, 0, 0, nullptr, false, true});
+    std::lock_guard<std::mutex> send_lock(*peer_qp_send_mutexes_[shard_id][qp_idx]);
     qp->post_send(reinterpret_cast<u64>(scratch),
                   static_cast<u32>(bytes),
                   scratch_region.get_lkey(),
@@ -355,16 +354,6 @@ void MemoryNode::remote_write_bytes(u32 shard_id, u64 remote_offset, const void*
                " offset=" + std::to_string(remote_offset) +
                " bytes=" + std::to_string(bytes) +
                " capacity=" + std::to_string(mn_memory_bytes_));
-  static std::atomic<u32> debug_writes{0};
-  const u32 debug_idx = debug_writes.fetch_add(1, std::memory_order_relaxed);
-  if (debug_idx < 16) {
-    std::cerr << "[storage-peer][write] self_shard=" << storage_id_
-              << " target_shard=" << shard_id
-              << " remote_base=" << peer_remote_tokens_[shard_id]->address
-              << " rkey=" << peer_remote_tokens_[shard_id]->rkey
-              << " offset=" << remote_offset
-              << " bytes=" << bytes << std::endl;
-  }
   StorageOwnerThread* owner_thread = current_storage_owner_thread_;
   const u32 qp_idx = peer_data_qp_index(owner_thread != nullptr ? owner_thread->id : 0);
   QP& qp = peer_data_qp(shard_id, qp_idx);
@@ -377,7 +366,7 @@ void MemoryNode::remote_write_bytes(u32 shard_id, u64 remote_offset, const void*
   std::memcpy(scratch, src, bytes);
   const u64 wr_id = next_peer_sync_wr_id();
   {
-    std::lock_guard<std::mutex> send_lock(peer_send_mutex_);
+    std::lock_guard<std::mutex> send_lock(*peer_qp_send_mutexes_[shard_id][qp_idx]);
     qp->post_send(reinterpret_cast<u64>(scratch),
                   static_cast<u32>(bytes),
                   scratch_region.get_lkey(),
@@ -403,17 +392,6 @@ u64 MemoryNode::remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 exp
              "peer CAS exceeds shard bounds: shard=" + std::to_string(shard_id) +
                " offset=" + std::to_string(remote_offset) +
                " capacity=" + std::to_string(mn_memory_bytes_));
-  static std::atomic<u32> debug_cas{0};
-  const u32 debug_idx = debug_cas.fetch_add(1, std::memory_order_relaxed);
-  if (debug_idx < 16) {
-    std::cerr << "[storage-peer][cas] self_shard=" << storage_id_
-              << " target_shard=" << shard_id
-              << " remote_base=" << peer_remote_tokens_[shard_id]->address
-              << " rkey=" << peer_remote_tokens_[shard_id]->rkey
-              << " offset=" << remote_offset
-              << " expected=" << expected
-              << " desired=" << desired << std::endl;
-  }
   StorageOwnerThread* owner_thread = current_storage_owner_thread_;
   const u32 qp_idx = peer_data_qp_index(owner_thread != nullptr ? owner_thread->id : 0);
   QP& qp = peer_data_qp(shard_id, qp_idx);
@@ -427,10 +405,10 @@ u64 MemoryNode::remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 exp
   acquire_peer_rdma_read_credit(shard_id, qp_idx);
   const u64 wr_id = next_peer_sync_wr_id();
   {
-    std::lock_guard<std::mutex> send_lock(peer_send_mutex_);
     register_peer_pending_send_locked(
       wr_id,
       PeerPendingSend{shard_id, qp_idx, 0, 0, nullptr, false, true});
+    std::lock_guard<std::mutex> send_lock(*peer_qp_send_mutexes_[shard_id][qp_idx]);
     qp->post_CAS(reinterpret_cast<u64>(scratch),
                  scratch_region.get_lkey(),
                  peer_remote_tokens_[shard_id].get(),

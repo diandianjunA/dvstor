@@ -97,6 +97,35 @@ inline void add_storage_owner_breakdown(
                           per_item_ns(counters.storage_owner_prune_pair_distance_ns, item_count));
 }
 
+inline void add_storage_owner_counters(
+    const std::shared_ptr<service::breakdown::Sample>& sample,
+    const service::storage_owner::InsertBreakdownCounters& counters) {
+  if (!sample) {
+    return;
+  }
+  if (counters.storage_owner_anchor_hints == 0 &&
+      counters.storage_owner_anchor_valid_hints == 0 &&
+      counters.storage_owner_anchor_expansions == 0 &&
+      counters.storage_owner_anchor_remote_expansions == 0 &&
+      counters.storage_owner_anchor_fallbacks == 0 &&
+      counters.storage_owner_anchor_audits == 0 &&
+      counters.storage_owner_anchor_audit_failures == 0) {
+    return;
+  }
+  if (sample->storage_owner_anchor == nullptr) {
+    sample->storage_owner_anchor =
+      std::make_shared<service::breakdown::StorageOwnerAnchorCounters>();
+  }
+  auto& anchor = *sample->storage_owner_anchor;
+  anchor.hints += counters.storage_owner_anchor_hints;
+  anchor.valid_hints += counters.storage_owner_anchor_valid_hints;
+  anchor.expansions += counters.storage_owner_anchor_expansions;
+  anchor.remote_expansions += counters.storage_owner_anchor_remote_expansions;
+  anchor.fallbacks += counters.storage_owner_anchor_fallbacks;
+  anchor.audits += counters.storage_owner_anchor_audits;
+  anchor.audit_failures += counters.storage_owner_anchor_audit_failures;
+}
+
 inline void add_storage_owner_sender_breakdown(
     const std::shared_ptr<service::breakdown::Sample>& sample,
     u64 sender_queue_wait_ns,

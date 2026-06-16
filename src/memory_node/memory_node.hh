@@ -93,6 +93,7 @@ private:
   using StorageOwnerInsertTask = memory_node_detail::StorageOwnerInsertTask;
   using StorageOwnerThread = memory_node_detail::StorageOwnerThread;
   using StorageOwnerInsertJob = memory_node_detail::StorageOwnerInsertJob;
+  using FreshnessEntry = memory_node_detail::FreshnessEntry;
 
   static constexpr u32 kPeerSyncWrOwner = std::numeric_limits<u32>::max();
   static constexpr u32 kPeerAsyncWrOwner = std::numeric_limits<u32>::max() - 1;
@@ -102,6 +103,9 @@ private:
   // Lifecycle and commands
   static u64 elapsed_ns_since(const std::chrono::steady_clock::time_point start);
   static u64 scale_ns(const u64 value, const u32 part, const u32 total);
+  static double storage_owner_candidate_overlap(const vec<RemotePtr>& lhs,
+                                                const vec<RemotePtr>& rhs,
+                                                u32 limit);
   static InsertBreakdownCounters scale_breakdown(const InsertBreakdownCounters& counters,
                                                  const u32 part,
                                                  const u32 total);
@@ -144,6 +148,8 @@ private:
   void setup_peer_rpc_runtime(const Configuration& config);
   void start_peer_reverse_update_runtime(const Configuration& config);
   void stop_peer_reverse_update_runtime();
+  size_t peer_rpc_sync_send_offset(u32 peer_id) const;
+  size_t peer_rpc_async_send_offset(u32 peer_id, u32 slot_id) const;
   size_t peer_rpc_receive_offset(u32 peer_id, u32 slot_id) const;
   void repost_peer_rpc_receive(u32 peer_id, u32 slot_id);
   void send_peer_rpc_message(u32 peer_id, const void* payload, size_t bytes);
@@ -197,12 +203,17 @@ private:
   void storage_owner_insert_worker_loop(u32 worker_id);
   void process_storage_owner_insert_tasks(const vec<StorageOwnerInsertTask>& tasks);
   bool execute_storage_owner_batch_items_async(const node_t* ids,
+                                               const service::storage_owner::MutationKind* kinds,
                                                const element_t* vectors,
+                                               const u64* anchor_hints,
+                                               u32 anchor_hint_count,
                                                size_t item_count,
                                                StorageOwnerThread& thread,
                                                InsertBreakdownCounters& breakdown,
                                                const Configuration& config,
-                                               vec<u64>* invalidated_neighbors = nullptr);
+                                               vec<u64>* invalidated_neighbors = nullptr,
+                                               vec<u32>* statuses = nullptr,
+                                               vec<service::storage_owner::MutationResult>* results = nullptr);
   static StorageOwnerInsertCoroutine dummy_storage_owner_insert_coroutine();
   size_t insert_request_slot_offset(u32 client_id, u32 slot_id) const;
   size_t insert_response_slot_offset(const Configuration& config, u32 client_id, u32 slot_id) const;
@@ -210,19 +221,32 @@ private:
   size_t response_slot_bytes(const Configuration& config) const;
   size_t handle_storage_insert_request(u32 client_id, const byte_t* payload, size_t bytes, const Configuration& config);
   bool execute_storage_owner_batch_items(const node_t* ids,
+                                         const service::storage_owner::MutationKind* kinds,
                                          const element_t* vectors,
+                                         const u64* anchor_hints,
+                                         u32 anchor_hint_count,
                                          size_t item_count,
                                          InsertBreakdownCounters& breakdown,
                                          const Configuration& config,
-                                         vec<u64>* invalidated_neighbors = nullptr);
+                                         vec<u64>* invalidated_neighbors = nullptr,
+                                         vec<u32>* statuses = nullptr,
+                                         vec<service::storage_owner::MutationResult>* results = nullptr);
 
   // Storage-owner index operations
   RemotePtr allocate_local_node();
+  bool load_owner_idmap(const filepath_t& index_prefix);
+  bool mark_node_deleted(RemotePtr rptr, u32 generation);
+  service::storage_owner::MutationStatus prepare_mutation(node_t id,
+                                                          service::storage_owner::MutationKind kind,
+                                                          FreshnessEntry* old_entry,
+                                                          u32* new_generation);
+  void publish_mutation(node_t id, RemotePtr ptr, u32 generation, bool deleted);
   RemotePtr read_global_medoid();
   auto async_read_global_medoid(StorageOwnerThread& thread);
   void write_global_medoid(const RemotePtr& medoid);
   bool try_set_global_medoid(const RemotePtr& expected, const RemotePtr& desired, RemotePtr& observed);
   bool read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot);
+  vec<RemotePtr> read_neighbor_list_aos(RemotePtr rptr);
   vec<RemotePtr> read_neighbor_list(RemotePtr rptr);
   auto async_read_node_snapshot(RemotePtr rptr, StorageOwnerThread& thread);
   auto async_read_node_snapshots(const vec<RemotePtr>& rptrs,
@@ -230,22 +254,35 @@ private:
                                  StorageOwnerThread& thread);
   vec<NodeSnapshot> read_node_snapshots_batched(const vec<RemotePtr>& rptrs, const Configuration& config);
   auto async_read_neighbor_list(RemotePtr rptr, StorageOwnerThread& thread);
+  void write_hot_graph_entry(RemotePtr rptr, u32 id, const vec<RemotePtr>& neighbors);
   void write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neighbors);
   void write_new_node(RemotePtr rptr,
                       node_t id,
                       const span<const element_t> components,
-                      const vec<RemotePtr>& neighbors);
+                      const vec<RemotePtr>& neighbors,
+                      u32 generation = 0);
   void lock_node(RemotePtr rptr);
   void unlock_node(RemotePtr rptr);
   vec<RemotePtr> beam_search_candidates(const span<const element_t> query,
                                         RemotePtr medoid,
                                         const Configuration& config,
                                         InsertBreakdownCounters* breakdown = nullptr);
+
   auto beam_search_candidates_async(const span<const element_t> query,
                                     RemotePtr medoid,
                                     const Configuration& config,
                                     StorageOwnerThread& thread,
                                     InsertBreakdownCounters* breakdown = nullptr) -> StorageOwnerInsertCoroutine;
+  vec<RemotePtr> anchor_search_candidates(const span<const element_t> query,
+                                          const vec<RemotePtr>& anchor_hints,
+                                          const Configuration& config,
+                                          InsertBreakdownCounters* breakdown = nullptr);
+  auto anchor_search_candidates_async(const span<const element_t> query,
+                                      const vec<RemotePtr>& anchor_hints,
+                                      const Configuration& config,
+                                      StorageOwnerThread& thread,
+                                      InsertBreakdownCounters* breakdown = nullptr)
+    -> StorageOwnerInsertCoroutine;
   vec<RemotePtr> robust_prune_cpu(const byte_t* source,
                                   VectorDType source_dtype,
                                   const vec<RemotePtr>& candidates,
@@ -285,6 +322,7 @@ private:
 
   const u32 num_clients_;
   u32 num_compute_threads_{};
+  u32 qp_pool_size_{1};
   const u32 storage_id_;
   const u32 num_storage_nodes_;
   const bool use_storage_owner_insert_;
@@ -303,15 +341,19 @@ private:
   std::unique_ptr<LocalMemoryRegion> peer_scratch_region_;
   PeerRpcRuntimeState peer_rpc_runtime_;
   std::unordered_map<u64, service::storage_owner::PeerRpcHeader> peer_rpc_responses_;
+  std::unordered_map<u64, vec<byte_t>> peer_rpc_response_payloads_;
   std::mutex peer_rpc_mutex_;
   std::condition_variable peer_rpc_responses_cv_;
   std::mutex peer_rpc_send_mutex_;
-  std::mutex peer_send_mutex_;
+  std::mutex peer_send_cq_mutex_;
+  std::mutex peer_completion_mutex_;
   vec<ibv_wc> peer_send_wcs_;
   std::unordered_set<u64> peer_sync_completions_;
   std::unordered_map<u64, PeerPendingSend> peer_pending_sends_;
   vec<std::atomic<u32>> peer_rdma_read_outstanding_;
+  std::atomic<u64> storage_owner_anchor_insert_sequence_{0};
   vec<vec<std::atomic<u32>>> peer_rdma_read_qp_outstanding_;
+  vec<vec<std::unique_ptr<std::mutex>>> peer_qp_send_mutexes_;
   std::atomic<u32> peer_sync_wr_id_counter_{1};
   std::atomic<u32> peer_async_wr_id_counter_{1};
   std::atomic<u32> peer_async_rdma_outstanding_{0};
@@ -346,6 +388,11 @@ private:
   std::atomic<bool> storage_insert_shutdown_{false};
   const u64 mn_memory_bytes_;
   timing::Timing timing_;
+  filepath_t index_prefix_;
+  bool owner_idmap_required_{false};
+  std::mutex idmap_mutex_;
+  std::unordered_map<node_t, FreshnessEntry> idmap_;
+  std::unordered_set<node_t> mutations_inflight_;
 
   inline static thread_local StorageOwnerThread* current_storage_owner_thread_{nullptr};
 };

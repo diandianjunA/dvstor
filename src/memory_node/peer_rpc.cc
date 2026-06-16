@@ -8,25 +8,33 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
     return;
   }
 
+  const size_t reverse_update_bytes =
+    service::storage_owner::reverse_update_request_bytes(config.R * config.storage_owner_batch_max);
   peer_rpc_runtime_.message_bytes = align_up(
-    std::max(service::storage_owner::reverse_update_request_bytes(config.R * config.storage_owner_batch_max),
-             service::storage_owner::reverse_update_response_bytes()));
+    std::max({reverse_update_bytes,
+              service::storage_owner::reverse_update_response_bytes()}));
   const u32 remote_peer_count = num_storage_nodes_ - 1;
   const u32 max_recv_wr = static_cast<u32>(std::max<i32>(1, config.max_recv_queue_wr));
   const u32 max_slots_per_peer = std::max<u32>(1, max_recv_wr / remote_peer_count);
   const u32 desired_slots_per_peer = std::max<u32>(16, config.storage_owner_rpc_depth * 4);
   peer_rpc_runtime_.recv_slots_per_peer = std::min(desired_slots_per_peer, max_slots_per_peer);
+  peer_rpc_runtime_.send_slots_per_peer = std::min(
+    std::max<u32>(1, config.storage_owner_rpc_depth),
+    peer_rpc_runtime_.recv_slots_per_peer);
   peer_rpc_runtime_.recv_region_bytes =
     peer_rpc_runtime_.message_bytes * num_storage_nodes_ * peer_rpc_runtime_.recv_slots_per_peer;
-  const size_t send_region_bytes = peer_rpc_runtime_.message_bytes * num_storage_nodes_;
-  peer_rpc_runtime_.buffer.allocate(peer_rpc_runtime_.recv_region_bytes + send_region_bytes);
+  peer_rpc_runtime_.sync_send_offset = peer_rpc_runtime_.recv_region_bytes;
+  peer_rpc_runtime_.async_send_offset =
+    peer_rpc_runtime_.sync_send_offset + peer_rpc_runtime_.message_bytes * num_storage_nodes_;
+  const size_t async_send_bytes = peer_rpc_runtime_.message_bytes * num_storage_nodes_ *
+                                  peer_rpc_runtime_.send_slots_per_peer;
+  peer_rpc_runtime_.buffer.allocate(peer_rpc_runtime_.async_send_offset + async_send_bytes);
   peer_rpc_runtime_.buffer.touch_memory();
   peer_rpc_runtime_.region = std::make_unique<LocalMemoryRegion>(
     *peer_context_, peer_rpc_runtime_.buffer.get_full_buffer(), peer_rpc_runtime_.buffer.buffer_size);
   print_status("storage-owner peer RPC receive slots per peer: " +
                std::to_string(peer_rpc_runtime_.recv_slots_per_peer) +
                " (requested=" + std::to_string(desired_slots_per_peer) + ")");
-
   for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
     if (peer_id == storage_id_) continue;
     for (u32 slot_id = 0; slot_id < peer_rpc_runtime_.recv_slots_per_peer; ++slot_id) {
@@ -51,8 +59,8 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   peer_reverse_outgoing_queue_limit_ = peer_reverse_task_queue_limit_;
 
   const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
-  const size_t snapshot_stride = align_up(VamanaNode::size_until_vector_end());
-  const size_t neighbor_stride = align_up(sizeof(u8)) + VamanaNode::NEIGHBORS_SIZE;
+  const size_t snapshot_stride = align_up(VamanaNode::vector_bytes());
+  const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
   const size_t coroutine_scratch_stride =
     align_up(std::max<size_t>(VamanaNode::total_size(),
                               std::max(neighbor_stride,
@@ -86,9 +94,6 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
   peer_reverse_outgoing_cv_.notify_all();
   peer_rpc_responses_cv_.notify_all();
 
-  if (peer_rpc_progress_thread_.joinable()) {
-    peer_rpc_progress_thread_.join();
-  }
   if (peer_reverse_outgoing_thread_.joinable()) {
     peer_reverse_outgoing_thread_.join();
   }
@@ -102,12 +107,26 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
   if (peer_reverse_response_thread_.joinable()) {
     peer_reverse_response_thread_.join();
   }
+  if (peer_rpc_progress_thread_.joinable()) {
+    peer_rpc_progress_thread_.join();
+  }
 }
 
 size_t MemoryNode::peer_rpc_receive_offset(u32 peer_id, u32 slot_id) const {
   const size_t slot_index =
     static_cast<size_t>(peer_id) * peer_rpc_runtime_.recv_slots_per_peer + slot_id;
   return slot_index * peer_rpc_runtime_.message_bytes;
+}
+
+size_t MemoryNode::peer_rpc_sync_send_offset(u32 peer_id) const {
+  return peer_rpc_runtime_.sync_send_offset +
+         static_cast<size_t>(peer_id) * peer_rpc_runtime_.message_bytes;
+}
+
+size_t MemoryNode::peer_rpc_async_send_offset(u32 peer_id, u32 slot_id) const {
+  const size_t slot_index =
+    static_cast<size_t>(peer_id) * peer_rpc_runtime_.send_slots_per_peer + slot_id;
+  return peer_rpc_runtime_.async_send_offset + slot_index * peer_rpc_runtime_.message_bytes;
 }
 
 void MemoryNode::repost_peer_rpc_receive(u32 peer_id, u32 slot_id) {
@@ -125,11 +144,11 @@ void MemoryNode::send_peer_rpc_message(u32 peer_id, const void* payload, size_t 
   lib_assert(peer_context_ != nullptr, "peer context not initialized");
   lib_assert(bytes <= peer_rpc_runtime_.message_bytes, "peer rpc message too large");
   const u64 wr_id = next_peer_sync_wr_id();
-  const size_t offset = peer_rpc_runtime_.recv_region_bytes + static_cast<size_t>(peer_id) * peer_rpc_runtime_.message_bytes;
+  const size_t offset = peer_rpc_sync_send_offset(peer_id);
   std::lock_guard<std::mutex> rpc_send_lock(peer_rpc_send_mutex_);
   std::memcpy(peer_rpc_runtime_.buffer.get_full_buffer() + offset, payload, bytes);
   {
-    std::lock_guard<std::mutex> send_lock(peer_send_mutex_);
+    std::lock_guard<std::mutex> send_lock(*peer_qp_send_mutexes_[peer_id][0]);
     peer_control_qp(peer_id)->post_send_with_id(
       *peer_rpc_runtime_.region,
       static_cast<u32>(bytes),
@@ -300,10 +319,16 @@ void MemoryNode::enqueue_peer_reverse_update_response(u32 destination_shard,
 
 void MemoryNode::peer_rpc_progress_loop() {
   vec<ibv_wc> recv_wcs(std::max<i32>(1, peer_context_->get_config().max_recv_queue_wr));
-  while (!peer_reverse_shutdown_.load(std::memory_order_acquire)) {
+  for (;;) {
+    poll_peer_send_cq();
     const i32 num_received =
       peer_context_->poll_recv_cq(recv_wcs.data(), static_cast<i32>(recv_wcs.size()));
     if (num_received <= 0) {
+      if (peer_reverse_workers_done_.load(std::memory_order_acquire) &&
+          peer_reverse_responses_.empty() &&
+          peer_reverse_outgoing_.empty()) {
+        return;
+      }
       std::this_thread::yield();
       continue;
     }
@@ -620,6 +645,7 @@ bool MemoryNode::enqueue_reverse_update_batch(u32 target_shard,
   peer_reverse_outgoing_cv_.notify_one();
   return true;
 }
+
 
 bool MemoryNode::send_reverse_update_batch_direct(u32 target_shard,
                                       const vec<service::storage_owner::ReverseUpdateOp>& ops,

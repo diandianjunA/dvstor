@@ -4,6 +4,7 @@
 
 #include "nlohmann/json.hh"
 #include "service/breakdown/aggregate.hh"
+#include "vamana/vamana_node.hh"
 
 namespace service::breakdown {
 
@@ -77,6 +78,45 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"vector_rdma_bytes", aggregate.counters.vector_rdma_bytes},
     {"neighbor_rdma_read_ops", aggregate.counters.neighbor_rdma_read_ops},
     {"vector_rdma_read_ops", aggregate.counters.vector_rdma_read_ops},
+    {"vector_rdma_batch_calls", aggregate.counters.vector_rdma_batch_calls},
+    {"vector_rdma_cqes", aggregate.counters.vector_rdma_cqes},
+    {"vector_rdma_active_nodes", aggregate.counters.vector_rdma_active_nodes},
+    {"vector_rdma_active_qps", aggregate.counters.vector_rdma_active_qps},
+    {"vector_rdma_mean_active_nodes_per_batch",
+     aggregate.counters.vector_rdma_batch_calls == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.vector_rdma_active_nodes) /
+           static_cast<double>(aggregate.counters.vector_rdma_batch_calls)},
+    {"vector_rdma_mean_active_qps_per_batch",
+     aggregate.counters.vector_rdma_batch_calls == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.vector_rdma_active_qps) /
+           static_cast<double>(aggregate.counters.vector_rdma_batch_calls)},
+    {"vector_rdma_mean_chain_wrs",
+     aggregate.counters.vector_rdma_cqes == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.vector_rdma_chain_wrs) /
+           static_cast<double>(aggregate.counters.vector_rdma_cqes)},
+    {"vector_rdma_max_chain_wrs", aggregate.counters.vector_rdma_max_chain_wrs},
+    {"vector_rdma_qp_high_water_wrs",
+     aggregate.counters.vector_rdma_qp_high_water_wrs},
+    {"vector_rdma_credit_waits", aggregate.counters.vector_rdma_credit_waits},
+    {"vector_rdma_credit_wait_ns", aggregate.counters.vector_rdma_credit_wait_ns},
+    {"vector_rdma_completion_token_waits",
+     aggregate.counters.vector_rdma_completion_token_waits},
+    {"vector_rdma_post_send_calls", aggregate.counters.vector_rdma_post_send_calls},
+    {"vector_rdma_post_send_retries", aggregate.counters.vector_rdma_post_send_retries},
+    {"vector_rdma_post_send_errors", aggregate.counters.vector_rdma_post_send_errors},
+    {"vector_rdma_reads_per_batch",
+     aggregate.counters.vector_rdma_batch_calls == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.vector_rdma_read_ops) /
+           static_cast<double>(aggregate.counters.vector_rdma_batch_calls)},
+    {"vector_rdma_reads_per_cqe",
+     aggregate.counters.vector_rdma_cqes == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.vector_rdma_read_ops) /
+           static_cast<double>(aggregate.counters.vector_rdma_cqes)},
     {"neighbor_rdma_read_avg_bytes",
      aggregate.counters.neighbor_rdma_read_ops == 0
        ? 0.0
@@ -92,6 +132,39 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"l2_kernels", aggregate.counters.l2_kernels},
     {"prune_kernels", aggregate.counters.prune_kernels},
     {"exact_reranks", aggregate.counters.exact_reranks},
+    {"rabitq_l0_candidates", aggregate.counters.rabitq_l0_candidates},
+    {"rabitq_cache_misses", aggregate.counters.rabitq_cache_misses},
+    {"rabitq_l1_candidates", aggregate.counters.rabitq_l1_candidates},
+    {"rabitq_l2_candidates", aggregate.counters.rabitq_l2_candidates},
+    {"rabitq_forced_widen", aggregate.counters.rabitq_forced_widen},
+    {"rabitq_audit_expansions", aggregate.counters.rabitq_audit_expansions},
+    {"rabitq_audit_candidates", aggregate.counters.rabitq_audit_candidates},
+    {"rabitq_safe_skips", aggregate.counters.rabitq_safe_skips},
+    {"rabitq_safe_skip_vector_bytes",
+     aggregate.counters.rabitq_safe_skips * VamanaNode::vector_bytes()},
+    {"rabitq_exact_fallbacks", aggregate.counters.rabitq_exact_fallbacks},
+    {"rabitq_prefetch_issued", aggregate.counters.rabitq_prefetch_issued},
+    {"rabitq_prefetch_hits", aggregate.counters.rabitq_prefetch_hits},
+    {"rabitq_prefetch_misses", aggregate.counters.rabitq_prefetch_misses},
+    {"rabitq_prefetch_disabled_queries",
+     aggregate.counters.rabitq_prefetch_disabled_queries},
+    {"storage_owner_anchor_hints", aggregate.counters.storage_owner_anchor_hints},
+    {"storage_owner_anchor_valid_hints", aggregate.counters.storage_owner_anchor_valid_hints},
+    {"storage_owner_anchor_expansions", aggregate.counters.storage_owner_anchor_expansions},
+    {"storage_owner_anchor_remote_expansions",
+     aggregate.counters.storage_owner_anchor_remote_expansions},
+    {"storage_owner_anchor_fallbacks", aggregate.counters.storage_owner_anchor_fallbacks},
+    {"storage_owner_anchor_audits", aggregate.counters.storage_owner_anchor_audits},
+    {"storage_owner_anchor_audit_failures",
+     aggregate.counters.storage_owner_anchor_audit_failures},
+    {"rabitq_prefetch_hit_ratio",
+     aggregate.counters.rabitq_prefetch_issued == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.rabitq_prefetch_hits) /
+           static_cast<double>(aggregate.counters.rabitq_prefetch_issued)},
+    {"rabitq_local_scores", aggregate.counters.rabitq_l0_candidates},
+    {"rabitq_gate_passes", aggregate.counters.rabitq_l1_candidates},
+    {"rabitq_exact_vector_reads", aggregate.counters.rabitq_l2_candidates},
     {"visited_nodes", aggregate.counters.visited_nodes},
     {"visited_neighborlists", aggregate.counters.visited_neighborlists},
     {"remote_allocations", aggregate.counters.remote_allocations},

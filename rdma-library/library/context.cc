@@ -50,6 +50,8 @@ Context::Context(Configuration& config,
 
   context_ = ibv_open_device(device_);
   lib_assert(device_ && context_, "Cannot open device");
+  lib_assert(ibv_query_device(context_, &device_attributes_) == 0,
+             "Cannot query RDMA device capabilities");
 
   // allocate protection domain
   protection_domain_ = ibv_alloc_pd(context_);

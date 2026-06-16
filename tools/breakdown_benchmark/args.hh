@@ -31,6 +31,9 @@ struct Args {
   std::string report_json_path;
   std::string report_text_path;
   uint32_t insert_start_id{0};
+  double write_insert_ratio{0.5};
+  double write_upsert_ratio{0.4};
+  double write_delete_ratio{0.1};
 };
 
 ConfigMap read_config(const std::string& path);

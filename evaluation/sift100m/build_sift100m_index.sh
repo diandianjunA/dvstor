@@ -20,9 +20,11 @@ cmd=("$BUILD_DIR/vamana_offline_builder"
   --threads "$BUILD_THREADS"
   --max-vectors "$MAX_VECTORS"
   --vector-data-type "$VECTOR_DATA_TYPE"
+  --storage-format "$STORAGE_FORMAT"
   --partition-max-degree "${PARTITION_MAX_DEGREE:-48}"
   --partition-imbalance "${PARTITION_IMBALANCE:-1.03}"
-  --skip-sanity-check)
+  --skip-sanity-check
+  --use-rabitq)
 
 echo "[build] index prefix: $INDEX_PREFIX"
 echo "[build] partition: $PARTITION_STRATEGY shards=$SHARDS R=$R build_beam=$BUILD_BEAM dtype=$VECTOR_DATA_TYPE"
