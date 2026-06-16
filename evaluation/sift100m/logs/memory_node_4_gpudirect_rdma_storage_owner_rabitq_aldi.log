@@ -18,64 +18,8 @@ num_cores: 112
 physical cores per socket: 28
 hyperthreading enabled
 interleaved policy
-pairing: 26964 -- 7011
+pairing: 28019 -- 7266
 [STATUS]: pinned main thread to core 28
 [STATUS]: loaded index metadata from /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced (layout=rabitq, vector_data_type=uint8)
 allocation size: 13958643712
-allocated ALIGNED MEM (no hugepage) at 136419538370624 with buffer size 13958643712
-[STATUS]: loading index (8480000128 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced_node4_of5.dat
-[STATUS]: register memory and distribute access token
-[STATUS]: connect QPs of compute threads
-pairing: 26967 -- 7016
-pairing: 26975 -- 7021
-pairing: 26980 -- 7026
-pairing: 26984 -- 7031
-[STATUS]: waiting for commands from compute node...
-[STATUS]: loading index (8480000128 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_balanced_node4_of5.dat
-1 device(s) found
-Selected device: ibp86s0
-Selected port state: 4, lid: 8
-pairing: 26987 -- 26988
-pairing: 26990 -- 26994
-pairing: 26997 -- 27000
-pairing: 27002 -- 27007
-pairing: 27009 -- 27013
-pairing: 27015 -- 27016
-pairing: 27018 -- 27020
-pairing: 27022 -- 27024
-pairing: 27027 -- 27029
-pairing: 27030 -- 27031
-pairing: 27033 -- 27032
-pairing: 27035 -- 27034
-pairing: 27037 -- 27059
-pairing: 27061 -- 27060
-pairing: 27063 -- 27062
-pairing: 27064 -- 27065
-[STATUS]: storage-owner peer RDMA QPs per peer: 4
-[STATUS]: storage-owner peer QP0 reserved for RPC; data RDMA uses QP1..3
-allocated ALIGNED MEM (no hugepage) at 136419215409216 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 136419204923456 with buffer size 9979200
-[STATUS]: storage-owner peer RPC receive slots per peer: 64 (requested=64)
-allocated ALIGNED MEM (no hugepage) at 136419345686592 with buffer size 302080
-allocated ALIGNED MEM (no hugepage) at 136419135717440 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 136419066511424 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 136418997305408 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 136418928099392 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 136418858893376 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 136418789687360 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 136418720481344 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 136418651275328 with buffer size 67108864
-[STATUS]: storage-owner peer reverse-update workers: 8
-[STATUS]: storage-owner peer reverse-update tuning: mode=async queue_depth=65536 flush_us=200 coalesce_max=256
-[STATUS]: storage-owner peer RDMA read credits per peer: 8 per QP: 8 (requested=8)
-[STATUS]: storage-owner online insert tuning: construction_beam=200 snapshot_batch=64 prune_max_candidates=128
-[STATUS]: storage-owner coroutine scratch: snapshot_bytes=144 snapshot_stride=192 batch=64 per_coroutine=12736
-allocated ALIGNED MEM (no hugepage) at 136418466725952 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 136417487355968 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 136417418149952 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 136417348943936 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 136417279737920 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 136417210531904 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 136417141325888 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 136417072119872 with buffer size 67108864
-[STATUS]: storage-owner insert runtime enabled on shard 3
+allocated ALIGNED MEM (no hugepage) at 130765075513408 with buffer size 13958643712
