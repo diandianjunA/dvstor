@@ -30,7 +30,8 @@ void GpuBufferManager::init(uint32_t num_coroutines,
                             size_t query_vector_bytes,
                             size_t candidate_vector_bytes,
                             ibv_pd* rdma_pd,
-                            bool enable_gpudirect_rdma) {
+                            bool enable_gpudirect_rdma,
+                            bool enable_kernel_timing) {
     num_coroutines_ = num_coroutines;
     dim_ = dim;
     max_batch_ = max_batch;
@@ -41,6 +42,7 @@ void GpuBufferManager::init(uint32_t num_coroutines,
                                                           : candidate_vector_bytes;
     gpudirect_rdma_enabled_ = false;
     gpudirect_candidate_ready_ = false;
+    kernel_timing_enabled_ = enable_kernel_timing;
 
     const bool try_gpudirect_rdma = enable_gpudirect_rdma && rdma_pd != nullptr;
     const size_t candidate_bytes = static_cast<size_t>(max_batch) * candidate_vector_bytes_;
@@ -53,7 +55,10 @@ void GpuBufferManager::init(uint32_t num_coroutines,
 
         CUDA_CHECK(cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&s.event, cudaEventDisableTiming));
-        CUDA_CHECK(cudaEventCreate(&s.kernel_start_event));
+        if (kernel_timing_enabled_) {
+            CUDA_CHECK(cudaEventCreate(&s.kernel_start_event));
+            CUDA_CHECK(cudaEventCreate(&s.kernel_end_event));
+        }
 
         CUDA_CHECK(cudaMallocHost(&s.h_query, query_vector_bytes_));
         CUDA_CHECK(cudaMallocHost(&s.h_candidate_vecs, max_batch * candidate_vector_bytes_));
@@ -146,6 +151,7 @@ void GpuBufferManager::destroy() {
 
         if (s.event) cudaEventDestroy(s.event);
         if (s.kernel_start_event) cudaEventDestroy(s.kernel_start_event);
+        if (s.kernel_end_event) cudaEventDestroy(s.kernel_end_event);
         if (s.stream) cudaStreamDestroy(s.stream);
     }
 
@@ -153,6 +159,7 @@ void GpuBufferManager::destroy() {
     states_ = nullptr;
     gpudirect_rdma_enabled_ = false;
     gpudirect_candidate_ready_ = false;
+    kernel_timing_enabled_ = false;
     initialized_ = false;
 }
 

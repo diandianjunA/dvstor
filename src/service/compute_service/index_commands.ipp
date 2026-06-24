@@ -227,7 +227,7 @@ void ComputeService<Distance>::reset_breakdown_state() {
   std::lock_guard<std::mutex> lock(breakdown_mutex_);
   completed_query_samples_.clear();
   completed_insert_samples_.clear();
-  breakdown_enabled_ = true;
+  breakdown_enabled_ = config_.enable_breakdown;
 }
 
 template <class Distance>

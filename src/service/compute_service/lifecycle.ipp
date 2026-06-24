@@ -104,6 +104,8 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     config_.R, config_.beam_width, config_.beam_width_construction,
     config_.alpha, config_.k, config_.dim, config_.resolved_vector_dtype());
   vamana_->set_expansion_batch(config_.expansion_batch);
+  vamana_->set_observe_device_utilization(
+    config_.enable_breakdown && config_.observe_device_utilization);
   vamana_->set_query_batch_size(config_.query_batch_size);
   vamana_->set_rabitq_gate(config_.rabitq_gate_width,
                            config_.rabitq_gate_max_width,
@@ -191,7 +193,8 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                              query_buffer_bytes,
                              candidate_buffer_bytes,
                              thread->ctx->context.get_protection_domain(),
-                             config_.gpudirect_rdma);
+                             config_.gpudirect_rdma,
+                             config_.enable_breakdown && config_.observe_device_utilization);
   }
   cm_.synchronize();
   if (have_startup_metadata && !config_.use_storage_owner_insert()) {

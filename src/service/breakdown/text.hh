@@ -42,6 +42,10 @@ inline std::string aggregate_text_summary(const Aggregate& aggregate) {
     os << "    " << name << ": " << ns_to_ms(value) << " ms (" << ratio * 100.0 << "%)\n";
   }
   if (aggregate.operation == Operation::query) {
+    if (!aggregate.device_utilization_observed) {
+      os << "  utilization: disabled (set --observe-device-utilization to enable)\n";
+      return os.str();
+    }
     const double service_ns = static_cast<double>(aggregate.total_service_ns);
     const double gpu_busy = service_ns == 0.0 ? 0.0
       : static_cast<double>(aggregate.total_gpu_kernel_ns) / service_ns;

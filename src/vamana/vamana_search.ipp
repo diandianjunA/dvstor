@@ -14,6 +14,11 @@
         auto& gpu = thread->gpu_buffers;
         const u32 coro_id = thread->current_coroutine_id();
         auto& gs = gpu.state(coro_id);
+        if (observe_device_utilization_) {
+            if (auto* sample = thread->current_breakdown_sample()) {
+                sample->set_device_utilization_observed();
+            }
+        }
         const bool use_gpudirect_candidate_rdma =
             gpu.gpudirect_candidate_ready() && gs.d_candidate_vecs_rdma_registered;
 
@@ -373,7 +378,7 @@
                 }
 
                 const auto t_exact = std::chrono::steady_clock::now();
-                begin_query_gpu_kernel_timing(gs);
+                if (observe_device_utilization_) begin_query_gpu_kernel_timing(gs);
                 gpu::launch_batch_typed_query_l2_distances(
                     gs.stream, gs.event, gs.d_query,
                     static_cast<u32>(query_dtype), exact_staging,
@@ -392,7 +397,7 @@
                     ++rabitq_prefetch_issued_query;
                 }
                 co_await gpu::GpuAwaitable{thread.get()};
-                finish_query_gpu_kernel_timing(thread, gs);
+                if (observe_device_utilization_) finish_query_gpu_kernel_timing(thread, gs);
                 add_breakdown_subcategory(thread,
                     service::breakdown::Subcategory::gpu_query_distance, t_exact);
 
@@ -560,7 +565,7 @@
                     }
                 }
             } else if (use_rabitq_) {
-                begin_query_gpu_kernel_timing(gs);
+                if (observe_device_utilization_) begin_query_gpu_kernel_timing(gs);
                 gpu::launch_batch_rabitq_asymmetric_distances(
                     gs.stream, gs.event,
                     reinterpret_cast<const float*>(gs.d_query),
@@ -576,7 +581,7 @@
                     gs.h_candidate_ptrs, n_batch * sizeof(void*),
                     cudaMemcpyHostToDevice, gs.stream);
                 track_query_h2d(thread, n_batch * sizeof(void*));
-                begin_query_gpu_kernel_timing(gs);
+                if (observe_device_utilization_) begin_query_gpu_kernel_timing(gs);
                 gpu::launch_batch_typed_query_l2_distances_indirect(
                     gs.stream, gs.event, gs.d_query,
                     static_cast<u32>(query_dtype),
@@ -584,7 +589,7 @@
                     static_cast<u32>(VamanaNode::vector_dtype()),
                     gs.d_distances, n_batch, dim_);
             } else {
-                begin_query_gpu_kernel_timing(gs);
+                if (observe_device_utilization_) begin_query_gpu_kernel_timing(gs);
                 gpu::launch_batch_typed_query_l2_distances(
                     gs.stream, gs.event, gs.d_query,
                     static_cast<u32>(query_dtype),
@@ -593,7 +598,7 @@
             }
             if (!use_local_rabitq_cache) {
                 co_await gpu::GpuAwaitable{thread.get()};
-                finish_query_gpu_kernel_timing(thread, gs);
+                if (observe_device_utilization_) finish_query_gpu_kernel_timing(thread, gs);
                 add_breakdown_subcategory(thread,
                     service::breakdown::Subcategory::gpu_query_distance, t_gpu);
             }
@@ -723,14 +728,14 @@
                             track_query_h2d(thread, refine_n * VamanaNode::vector_bytes());
                         }
                         const auto t_rerank_gpu = std::chrono::steady_clock::now();
-                        begin_query_gpu_kernel_timing(gs);
+                        if (observe_device_utilization_) begin_query_gpu_kernel_timing(gs);
                         gpu::launch_batch_typed_query_l2_distances(
                             gs.stream, gs.event, gs.d_query,
                             static_cast<u32>(query_dtype), exact_staging,
                             static_cast<u32>(VamanaNode::vector_dtype()),
                             gs.d_distances, refine_n, dim_);
                         co_await gpu::GpuAwaitable{thread.get()};
-                        finish_query_gpu_kernel_timing(thread, gs);
+                        if (observe_device_utilization_) finish_query_gpu_kernel_timing(thread, gs);
                         add_breakdown_subcategory(thread,
                             service::breakdown::Subcategory::gpu_query_rerank,
                             t_rerank_gpu);
@@ -837,14 +842,14 @@
                 track_query_h2d(thread, rerank_n * VamanaNode::vector_bytes());
             }
             const auto t_final_rerank_gpu = std::chrono::steady_clock::now();
-            begin_query_gpu_kernel_timing(gs);
+            if (observe_device_utilization_) begin_query_gpu_kernel_timing(gs);
             gpu::launch_batch_typed_query_l2_distances(
                 gs.stream, gs.event, gs.d_query,
                 static_cast<u32>(query_dtype), rerank_staging,
                 static_cast<u32>(VamanaNode::vector_dtype()),
                 gs.d_distances, rerank_n, dim_);
             co_await gpu::GpuAwaitable{thread.get()};
-            finish_query_gpu_kernel_timing(thread, gs);
+            if (observe_device_utilization_) finish_query_gpu_kernel_timing(thread, gs);
             add_breakdown_subcategory(thread,
                 service::breakdown::Subcategory::gpu_query_rerank,
                 t_final_rerank_gpu);
@@ -1110,7 +1115,7 @@
                             distance_n_batch * sizeof(u32),
                             cudaMemcpyHostToDevice, gs.stream);
             track_query_h2d(thread, distance_n_batch * sizeof(u32));
-            begin_query_gpu_kernel_timing(gs);
+            if (observe_device_utilization_) begin_query_gpu_kernel_timing(gs);
             gpu::launch_batch_typed_multi_query_l2_distances(
                 gs.stream, gs.event,
                 gs.d_query, static_cast<u32>(query_dtype),
@@ -1118,7 +1123,7 @@
                 staging, static_cast<u32>(VamanaNode::vector_dtype()),
                 gs.d_distances, distance_n_batch, dim_);
             co_await gpu::GpuAwaitable{thread.get()};
-            finish_query_gpu_kernel_timing(thread, gs);
+            if (observe_device_utilization_) finish_query_gpu_kernel_timing(thread, gs);
             add_breakdown_subcategory(thread,
                 service::breakdown::Subcategory::gpu_query_distance, t_gpu);
             thread->stats.distcomps += distance_n_batch;

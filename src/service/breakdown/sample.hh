@@ -235,6 +235,7 @@ struct Sample {
   std::shared_ptr<StorageOwnerAnchorCounters> storage_owner_anchor;
   bool started_flag{};
   bool finished_flag{};
+  bool device_utilization_observed{};
 
   void mark_started(const Clock::time_point dequeued,
                     const Clock::time_point started,
@@ -266,6 +267,8 @@ struct Sample {
   void add_gpu_kernel_time(const u64 ns) {
     if (operation == Operation::query) gpu_kernel_ns += ns;
   }
+
+  void set_device_utilization_observed() { device_utilization_observed = true; }
 
   ThreadCounterDelta counters() const {
     ThreadCounterDelta out = diff_thread_counters(end_counters, start_counters, operation);

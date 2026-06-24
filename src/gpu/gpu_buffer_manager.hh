@@ -28,6 +28,7 @@ struct CoroutineGpuState {
     // Timing is kept separate from the completion event: the latter has timing
     // disabled so scheduler polling remains cheap.
     cudaEvent_t  kernel_start_event{nullptr};
+    cudaEvent_t  kernel_end_event{nullptr};
 
     // Per-coroutine pinned staging buffers (host side)
     void*     h_query{nullptr};          // [dim * query component bytes]
@@ -88,7 +89,8 @@ public:
               size_t query_vector_bytes = 0,
               size_t candidate_vector_bytes = 0,
               ibv_pd* rdma_pd = nullptr,
-              bool enable_gpudirect_rdma = false);
+              bool enable_gpudirect_rdma = false,
+              bool enable_kernel_timing = false);
 
     void destroy();
 
@@ -117,6 +119,7 @@ private:
 
     bool gpudirect_rdma_enabled_{false};
     bool gpudirect_candidate_ready_{false};
+    bool kernel_timing_enabled_{false};
     bool initialized_{false};
 };
 

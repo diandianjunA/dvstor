@@ -41,6 +41,8 @@ public:
   u32 k{};
   u32 gpu_device{};       // CUDA device ID
   bool gpudirect_rdma{};  // Enable GPUDirect RDMA (read vectors directly into GPU buffers)
+  bool enable_breakdown{true};  // Per-request fine-grained timing/counter collection
+  bool observe_device_utilization{};  // CUDA-event instrumentation for motivation experiments
   u32 expansion_batch{1};   // Batch K beam expansions per iteration (1=serial)
   u32 rdma_qp_pool_size{};   // QPs per memory node per SharedContext (0=auto)
   str rdma_read_batch_mode{"adaptive"};
@@ -244,6 +246,11 @@ private:
       "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
       "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
       "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
+      "enable-breakdown", po::value<bool>(&enable_breakdown)->default_value(enable_breakdown),
+      "Enable per-request fine-grained breakdown collection. Disable for performance-only runs.")(
+      "observe-device-utilization",
+      po::bool_switch(&observe_device_utilization)->default_value(false),
+      "Collect CUDA-kernel and RDMA-wait utilization metrics (benchmark instrumentation).")(
       "expansion-batch,K", po::value<u32>(&expansion_batch)->default_value(1),
       "Number of beam nodes expanded per iteration.")(
       "rdma-qp-pool-size", po::value<u32>(&rdma_qp_pool_size)->default_value(rdma_qp_pool_size),
@@ -543,6 +550,10 @@ public:
       os << std::setw(width) << "query coroutines: " << config.query_coroutines << std::endl;
       os << std::setw(width) << "GPU device: " << config.gpu_device << std::endl;
       os << std::setw(width) << "GPUDirect RDMA: " << (config.gpudirect_rdma ? "true" : "false") << std::endl;
+      os << std::setw(width) << "Fine-grained breakdown: "
+         << (config.enable_breakdown ? "true" : "false") << std::endl;
+      os << std::setw(width) << "Observe device utilization: "
+         << (config.observe_device_utilization ? "true" : "false") << std::endl;
       os << std::setw(width) << "Expansion Batch (K): " << config.expansion_batch << std::endl;
       os << std::setw(width) << "RDMA QP Pool Size: "
          << config.effective_rdma_qp_pool_size();

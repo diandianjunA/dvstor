@@ -253,6 +253,16 @@ write_service_config() {
     echo "query-coroutines = $query_coroutines"
     echo "label = sift100m_${PROFILE_NAME:-$PROFILE}"
     if [[ "${GPUDIRECT_RDMA:-0}" == "1" ]]; then echo "gpudirect-rdma = true"; fi
+    if [[ -n "${ENABLE_BREAKDOWN:-}" ]]; then
+      if [[ "${ENABLE_BREAKDOWN}" == "1" || "${ENABLE_BREAKDOWN}" == "true" ]]; then
+        echo "enable-breakdown = true"
+      else
+        echo "enable-breakdown = false"
+      fi
+    fi
+    if [[ "${OBSERVE_DEVICE_UTILIZATION:-0}" == "1" || "${OBSERVE_DEVICE_UTILIZATION:-0}" == "true" ]]; then
+      echo "observe-device-utilization = true"
+    fi
     if [[ -n "${EXPANSION_BATCH:-}" ]]; then echo "expansion-batch = ${EXPANSION_BATCH}"; fi
     if [[ -n "${RDMA_QP_POOL_SIZE:-}" ]]; then echo "rdma-qp-pool-size = ${RDMA_QP_POOL_SIZE}"; fi
     if [[ -n "${RDMA_READ_BATCH_MODE:-}" ]]; then echo "rdma-read-batch-mode = ${RDMA_READ_BATCH_MODE}"; fi

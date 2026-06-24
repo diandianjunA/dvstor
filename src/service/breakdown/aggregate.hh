@@ -16,6 +16,7 @@ struct Aggregate {
   u64 total_end_to_end_ns{};
   u64 total_rdma_wait_ns{};
   u64 total_gpu_kernel_ns{};
+  bool device_utilization_observed{};
   std::vector<u64> end_to_end_latencies_ns{};
   std::vector<u64> service_latencies_ns{};
   std::array<u64, kCategoryCount> category_ns{};
@@ -68,6 +69,8 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.total_end_to_end_ns += sample.end_to_end_ns;
   aggregate.total_rdma_wait_ns += sample.rdma_wait_ns;
   aggregate.total_gpu_kernel_ns += sample.gpu_kernel_ns;
+  aggregate.device_utilization_observed = aggregate.device_utilization_observed ||
+    sample.device_utilization_observed;
   aggregate.end_to_end_latencies_ns.push_back(sample.end_to_end_ns);
   aggregate.service_latencies_ns.push_back(sample.service_ns);
   for (size_t i = 0; i < aggregate.category_ns.size(); ++i) {

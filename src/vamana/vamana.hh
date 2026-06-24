@@ -78,6 +78,7 @@ public:
 public:
     void set_expansion_batch(u32 k) { expansion_batch_ = k; }
     u32 expansion_batch() const { return expansion_batch_; }
+    void set_observe_device_utilization(bool enabled) { observe_device_utilization_ = enabled; }
     void set_query_batch_size(u32 q) {
         query_batch_size_ = q;
     }
@@ -119,6 +120,7 @@ private:
     static constexpr u32 kRabitqMaxPrefetchWidth{8};
     u32 expansion_batch_{1};
     u32 query_batch_size_{1};
+    bool observe_device_utilization_{false};
     bool use_rabitq_{false};
     const rabitq::Cache* rabitq_cache_{nullptr};
     u32 rabitq_gate_width_{16};

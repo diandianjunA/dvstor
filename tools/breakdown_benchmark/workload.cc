@@ -213,6 +213,9 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"dim", service.config().dim},
     {"threads", service.config().num_threads},
     {"coroutines", service.config().num_coroutines},
+    {"fine_grained_breakdown_enabled", service.config().enable_breakdown},
+    {"device_utilization_observation_enabled",
+     service.config().enable_breakdown && service.config().observe_device_utilization},
     {"search", service.config().use_rabitq
         ? "rabitq_rfq5_" + service.config().rabitq_mode : "exact"},
     {"rabitq_cache_bytes", service.rabitq_cache_bytes()},
@@ -456,7 +459,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   };
   run_recall_check();
 
-  auto run_query_phase_ops = [&](const std::string& label, size_t ops) {
+  auto run_query_phase_ops = [&](const std::string& label, size_t ops) -> size_t {
     std::atomic<size_t> completed_ops{0};
     ProgressReporter reporter(label, completed_ops, ops, 0);
     for (size_t op = 0; op < ops; ++op) {
@@ -465,9 +468,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       completed_ops.fetch_add(1, std::memory_order_relaxed);
     }
     reporter.finish();
+    return completed_ops.load(std::memory_order_relaxed);
   };
 
-  auto run_query_phase_seconds = [&](const std::string& label, size_t seconds) {
+  auto run_query_phase_seconds = [&](const std::string& label, size_t seconds) -> size_t {
     std::atomic<size_t> completed_ops{0};
     ProgressReporter reporter(label, completed_ops, 0, seconds);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
@@ -482,6 +486,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       ++op;
     }
     reporter.finish();
+    return completed_ops.load(std::memory_order_relaxed);
   };
 
   auto choose_mixed_read = [&](std::mt19937_64& rng) {
@@ -718,9 +723,9 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   if (args.workload == "query" || args.workload == "both") {
     std::cerr << "[breakdown] starting warmup query" << std::endl;
     if (use_time_mode) {
-      run_query_phase_seconds("warmup-query", args.warmup_seconds);
+      (void)run_query_phase_seconds("warmup-query", args.warmup_seconds);
     } else {
-      run_query_phase_ops("warmup-query", args.warmup_ops);
+      (void)run_query_phase_ops("warmup-query", args.warmup_ops);
     }
   }
   if (args.workload == "mixed") {
@@ -737,19 +742,24 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   service.clear_thread_statistics();
   service.reset_breakdown_state();
   std::cerr << "[breakdown] starting measure phase" << std::endl;
+  size_t measured_query_operations = 0;
+  size_t measured_insert_operations = 0;
 
   if (args.workload == "insert" || args.workload == "both") {
     if (use_time_mode) {
+      const uint32_t start_id = next_insert_id;
       next_insert_id = run_insert_phase_seconds("measure-insert", args.measure_seconds, next_insert_id);
+      measured_insert_operations = next_insert_id - start_id;
     } else {
       run_insert_phase_ops("measure-insert", args.measure_ops, next_insert_id);
+      measured_insert_operations = args.measure_ops;
     }
   }
   if (args.workload == "query" || args.workload == "both") {
     if (use_time_mode) {
-      run_query_phase_seconds("measure-query", args.measure_seconds);
+      measured_query_operations = run_query_phase_seconds("measure-query", args.measure_seconds);
     } else {
-      run_query_phase_ops("measure-query", args.measure_ops);
+      measured_query_operations = run_query_phase_ops("measure-query", args.measure_ops);
     }
   }
   if (args.workload == "mixed") {
@@ -809,10 +819,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   const double throughput_duration = has_throughput_duration ? static_cast<double>(args.measure_seconds) : 0.0;
   const size_t throughput_query_ops = args.workload == "mixed"
     ? measure_mixed_stats.completed_reads
-    : report.query.count;
+    : (service.config().enable_breakdown ? report.query.count : measured_query_operations);
   const size_t throughput_write_ops = args.workload == "mixed"
     ? measure_mixed_stats.completed_writes
-    : report.insert.count;
+    : (service.config().enable_breakdown ? report.insert.count : measured_insert_operations);
   const double query_throughput = has_throughput_duration
                                     ? static_cast<double>(throughput_query_ops) / throughput_duration
                                     : 0.0;
@@ -828,11 +838,14 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"query_ops_per_sec", query_throughput},
     {"write_ops", throughput_write_ops},
     {"write_ops_per_sec", write_throughput},
-    {"insert_ops", args.workload == "mixed" ? measure_mixed_stats.completed_inserts : report.insert.count},
+    {"insert_ops", args.workload == "mixed" ? measure_mixed_stats.completed_inserts
+                                                : (service.config().enable_breakdown
+                                                    ? report.insert.count : measured_insert_operations)},
     {"insert_ops_per_sec", has_throughput_duration
       ? static_cast<double>(args.workload == "mixed"
           ? measure_mixed_stats.completed_inserts
-          : report.insert.count) / throughput_duration
+          : (service.config().enable_breakdown ? report.insert.count
+                                               : measured_insert_operations)) / throughput_duration
       : 0.0},
     {"upsert_ops", args.workload == "mixed" ? measure_mixed_stats.completed_upserts : 0},
     {"upsert_ops_per_sec", has_throughput_duration && args.workload == "mixed"

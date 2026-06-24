@@ -49,16 +49,18 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
   // query service windows, so use a single-query workload for a per-query
   // pipeline-utilization interpretation.
   const double service_ns = static_cast<double>(aggregate.total_service_ns);
+  const bool observed = aggregate.device_utilization_observed;
   out["utilization"] = {
-    {"gpu_kernel_busy_ns", aggregate.total_gpu_kernel_ns},
-    {"gpu_kernel_busy_ratio", service_ns == 0.0 ? 0.0 :
+    {"device_utilization_observed", observed},
+    {"gpu_kernel_busy_ns", observed ? aggregate.total_gpu_kernel_ns : 0},
+    {"gpu_kernel_busy_ratio", !observed || service_ns == 0.0 ? 0.0 :
       static_cast<double>(aggregate.total_gpu_kernel_ns) / service_ns},
-    {"gpu_kernel_idle_ratio", service_ns == 0.0 ? 0.0 :
+    {"gpu_kernel_idle_ratio", !observed || service_ns == 0.0 ? 0.0 :
       std::max(0.0, 1.0 - static_cast<double>(aggregate.total_gpu_kernel_ns) / service_ns)},
-    {"rdma_completion_wait_ns", aggregate.total_rdma_wait_ns},
-    {"rdma_completion_wait_ratio", service_ns == 0.0 ? 0.0 :
+    {"rdma_completion_wait_ns", observed ? aggregate.total_rdma_wait_ns : 0},
+    {"rdma_completion_wait_ratio", !observed || service_ns == 0.0 ? 0.0 :
       static_cast<double>(aggregate.total_rdma_wait_ns) / service_ns},
-    {"rdma_payload_bytes_per_service_s", service_ns == 0.0 ? 0.0 :
+    {"rdma_payload_bytes_per_service_s", !observed || service_ns == 0.0 ? 0.0 :
       static_cast<double>(aggregate.counters.rdma_read_bytes) * 1e9 / service_ns},
   };
 
