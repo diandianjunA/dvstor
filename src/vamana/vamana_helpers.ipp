@@ -68,15 +68,9 @@ private:
     static void finish_query_gpu_kernel_timing(const u_ptr<ComputeThread>& thread,
                                                 gpu::CoroutineGpuState& state) {
         float elapsed_ms = 0.0f;
-        // The scheduler completion event deliberately has timing disabled.
-        // Record a separate timing end event after the launcher's completion
-        // event, then wait only for this already-queued marker.
-        lib_assert(cudaEventRecord(state.kernel_end_event, state.stream) == cudaSuccess,
-                   "failed to record GPU kernel end event");
-        lib_assert(cudaEventSynchronize(state.kernel_end_event) == cudaSuccess,
-                   "failed to synchronize GPU kernel end event");
-        lib_assert(cudaEventElapsedTime(&elapsed_ms, state.kernel_start_event,
-                                        state.kernel_end_event) == cudaSuccess,
+        // GpuAwaitable resumes only after state.event completes, so this is a
+        // non-blocking measurement of the interval recorded around the kernel.
+        lib_assert(cudaEventElapsedTime(&elapsed_ms, state.kernel_start_event, state.event) == cudaSuccess,
                    "failed to measure GPU kernel time");
         if (auto* sample = thread->current_breakdown_sample()) {
             sample->add_gpu_kernel_time(static_cast<u64>(elapsed_ms * 1'000'000.0f));

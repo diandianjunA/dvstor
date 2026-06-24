@@ -1,0 +1,22 @@
+throughput
+  duration_seconds: 120
+  total_ops_per_sec: 127.15 (ops=15258)
+  query_ops_per_sec: 127.15 (ops=15258)
+  write_ops_per_sec: 0 (ops=0)
+recall
+  recall@10: 0.8823
+  queries: 1000
+  passed: true
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+query breakdown
+  count: 15258
+  latency_ms: mean=7.8607 p50=7.79588 p95=8.39578 p99=9.64891
+  top_categories:
+    gpu_ns: 65642.4 ms (54.7389%)
+    rdma_ns: 27024.4 ms (22.5355%)
+    transfer_ns: 17158.3 ms (14.3082%)
+    cpu_ns: 10094 ms (8.41735%)
+  utilization (query software view):
+    gpu_kernel_busy: 37.1321% (CUDA event, excludes launch/copies)
+    rdma_completion_wait: 22.5355% (awaited-completion time)
+    rdma_payload: 0.595243 Gb/s per summed service window

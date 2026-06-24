@@ -25,10 +25,9 @@ namespace gpu {
 struct CoroutineGpuState {
     cudaStream_t stream{nullptr};
     cudaEvent_t  event{nullptr};
-    // Timing is kept separate from the completion event: the latter has timing
-    // disabled so scheduler polling remains cheap.
+    // When utilization observation is enabled, the completion event also has
+    // timing enabled.  The scheduler can still poll it normally.
     cudaEvent_t  kernel_start_event{nullptr};
-    cudaEvent_t  kernel_end_event{nullptr};
 
     // Per-coroutine pinned staging buffers (host side)
     void*     h_query{nullptr};          // [dim * query component bytes]
