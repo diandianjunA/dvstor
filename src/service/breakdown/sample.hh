@@ -221,6 +221,12 @@ struct Sample {
   u64 queue_wait_ns{};
   u64 service_ns{};
   u64 end_to_end_ns{};
+  // RDMA wait is a query-level software occupancy proxy: it measures time
+  // spent awaiting RDMA completions, not physical NIC line-rate utilization.
+  u64 rdma_wait_ns{};
+  // Measured with CUDA events around distance kernels; excludes CPU launch,
+  // stream queueing, and D2H copies.
+  u64 gpu_kernel_ns{};
   u64 lock_attempts{};
   u64 lock_retries{};
   u64 cas_failures{};
@@ -252,6 +258,13 @@ struct Sample {
   void add_subcategory(const Subcategory subcategory, const u64 ns) {
     subcategory_ns[static_cast<size_t>(subcategory)] += ns;
     category_ns[static_cast<size_t>(parent_category(subcategory))] += ns;
+    if (operation == Operation::query && parent_category(subcategory) == Category::rdma) {
+      rdma_wait_ns += ns;
+    }
+  }
+
+  void add_gpu_kernel_time(const u64 ns) {
+    if (operation == Operation::query) gpu_kernel_ns += ns;
   }
 
   ThreadCounterDelta counters() const {

@@ -60,6 +60,21 @@ private:
         }
     }
 
+    static void begin_query_gpu_kernel_timing(gpu::CoroutineGpuState& state) {
+        lib_assert(cudaEventRecord(state.kernel_start_event, state.stream) == cudaSuccess,
+                   "failed to record GPU kernel start event");
+    }
+
+    static void finish_query_gpu_kernel_timing(const u_ptr<ComputeThread>& thread,
+                                                gpu::CoroutineGpuState& state) {
+        float elapsed_ms = 0.0f;
+        lib_assert(cudaEventElapsedTime(&elapsed_ms, state.kernel_start_event, state.event) == cudaSuccess,
+                   "failed to measure GPU kernel time");
+        if (auto* sample = thread->current_breakdown_sample()) {
+            sample->add_gpu_kernel_time(static_cast<u64>(elapsed_ms * 1'000'000.0f));
+        }
+    }
+
     // =========================================================================
     // Full-node RDMA read kept as a nested coroutine so the search coroutine
     // retains its established suspension and frame layout.

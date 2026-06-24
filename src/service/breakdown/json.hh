@@ -43,6 +43,25 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
   categories["transfer_ns"] = aggregate.category_ns[static_cast<size_t>(Category::transfer)];
   out["breakdown"] = std::move(categories);
 
+  // These values are deliberately separate from the category totals. RDMA
+  // scopes measure software time blocked on completions, while CUDA events
+  // measure device execution time only. Both are normalized by the sum of
+  // query service windows, so use a single-query workload for a per-query
+  // pipeline-utilization interpretation.
+  const double service_ns = static_cast<double>(aggregate.total_service_ns);
+  out["utilization"] = {
+    {"gpu_kernel_busy_ns", aggregate.total_gpu_kernel_ns},
+    {"gpu_kernel_busy_ratio", service_ns == 0.0 ? 0.0 :
+      static_cast<double>(aggregate.total_gpu_kernel_ns) / service_ns},
+    {"gpu_kernel_idle_ratio", service_ns == 0.0 ? 0.0 :
+      std::max(0.0, 1.0 - static_cast<double>(aggregate.total_gpu_kernel_ns) / service_ns)},
+    {"rdma_completion_wait_ns", aggregate.total_rdma_wait_ns},
+    {"rdma_completion_wait_ratio", service_ns == 0.0 ? 0.0 :
+      static_cast<double>(aggregate.total_rdma_wait_ns) / service_ns},
+    {"rdma_payload_bytes_per_service_s", service_ns == 0.0 ? 0.0 :
+      static_cast<double>(aggregate.counters.rdma_read_bytes) * 1e9 / service_ns},
+  };
+
   json sub = json::object();
   for (size_t c = 0; c < kCategoryCount; ++c) {
     sub[std::string{kCategoryNames[c]}] = json::object();

@@ -41,6 +41,21 @@ inline std::string aggregate_text_summary(const Aggregate& aggregate) {
                            : static_cast<double>(value) / static_cast<double>(aggregate.total_service_ns);
     os << "    " << name << ": " << ns_to_ms(value) << " ms (" << ratio * 100.0 << "%)\n";
   }
+  if (aggregate.operation == Operation::query) {
+    const double service_ns = static_cast<double>(aggregate.total_service_ns);
+    const double gpu_busy = service_ns == 0.0 ? 0.0
+      : static_cast<double>(aggregate.total_gpu_kernel_ns) / service_ns;
+    const double rdma_wait = service_ns == 0.0 ? 0.0
+      : static_cast<double>(aggregate.total_rdma_wait_ns) / service_ns;
+    const double rdma_payload_gbps = service_ns == 0.0 ? 0.0
+      : static_cast<double>(aggregate.counters.rdma_read_bytes) * 8.0 / service_ns;
+    os << "  utilization (query software view):\n";
+    os << "    gpu_kernel_busy: " << gpu_busy * 100.0 << "%"
+       << " (CUDA event, excludes launch/copies)\n";
+    os << "    rdma_completion_wait: " << rdma_wait * 100.0 << "%"
+       << " (awaited-completion time)\n";
+    os << "    rdma_payload: " << rdma_payload_gbps << " Gb/s per summed service window\n";
+  }
   return os.str();
 }
 

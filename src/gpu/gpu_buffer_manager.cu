@@ -53,6 +53,7 @@ void GpuBufferManager::init(uint32_t num_coroutines,
 
         CUDA_CHECK(cudaStreamCreateWithFlags(&s.stream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&s.event, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreate(&s.kernel_start_event));
 
         CUDA_CHECK(cudaMallocHost(&s.h_query, query_vector_bytes_));
         CUDA_CHECK(cudaMallocHost(&s.h_candidate_vecs, max_batch * candidate_vector_bytes_));
@@ -144,6 +145,7 @@ void GpuBufferManager::destroy() {
         if (s.h_pruned_count) cudaFreeHost(s.h_pruned_count);
 
         if (s.event) cudaEventDestroy(s.event);
+        if (s.kernel_start_event) cudaEventDestroy(s.kernel_start_event);
         if (s.stream) cudaStreamDestroy(s.stream);
     }
 
