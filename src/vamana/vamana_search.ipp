@@ -62,7 +62,143 @@
         // GPU distance computations into one GPU kernel launch and one D2H
         // transfer, reducing per-iteration overhead by K×.
         //
-        const u32 K = expansion_batch_;
+        const u32 K = std::max<u32>(1, expansion_batch_);
+        struct CreditExpansionController {
+            bool enabled{};
+            u32 min_k{1};
+            u32 max_k{1};
+            u32 issue_k{1};
+            u32 max_lookahead{};
+            u32 lookahead_k{};
+            u32 target_candidates{};
+            u32 graph_degree{};
+            u32 no_progress_streak{};
+            bool cost_guard{};
+            f32 cost_max_extra_ratio{1.05f};
+            u32 cost_probe_rounds{4};
+            f32 baseline_cost_per_expansion{};
+            f32 ewma_cost_per_expansion{};
+            u32 baseline_samples{};
+
+            f32 round_cost_per_expansion(const u32 issued_expansions,
+                                         const u32 frontier_candidates,
+                                         const u32 exact_candidates) const {
+                if (issued_expansions == 0) return 0.0f;
+                const f32 expansion_cost =
+                    static_cast<f32>(issued_expansions) * static_cast<f32>(graph_degree);
+                const f32 frontier_cost = static_cast<f32>(frontier_candidates);
+                const f32 exact_cost = 2.0f * static_cast<f32>(exact_candidates);
+                return (expansion_cost + frontier_cost + exact_cost) /
+                    static_cast<f32>(issued_expansions);
+            }
+
+            u32 issue_width() const {
+                return enabled ? std::clamp(issue_k, min_k, max_k) : max_k;
+            }
+
+            u32 precommit_width() const {
+                if (!enabled) return max_k;
+                return std::min(lookahead_k, issue_width());
+            }
+
+            void record_round(const u32 issued_expansions,
+                              const u32 frontier_candidates,
+                              const u32 exact_candidates,
+                              const bool credit_stall,
+                              const bool progressed,
+                              statistics::ThreadStatistics& stats) {
+                if (!enabled) return;
+                ++stats.query_credit_rounds;
+                if (credit_stall) ++stats.query_credit_credit_stalls;
+                const f32 cost_per_expansion = round_cost_per_expansion(
+                    issued_expansions, frontier_candidates, exact_candidates);
+                if (cost_guard && issued_expansions > 0 && cost_per_expansion > 0.0f) {
+                    if (issued_expansions == min_k) {
+                        const f32 alpha = baseline_samples == 0 ? 1.0f : 0.25f;
+                        baseline_cost_per_expansion =
+                            baseline_cost_per_expansion == 0.0f
+                                ? cost_per_expansion
+                                : baseline_cost_per_expansion * (1.0f - alpha) +
+                                    cost_per_expansion * alpha;
+                        ++baseline_samples;
+                        ++stats.query_credit_cost_baseline_samples;
+                    }
+                    const f32 alpha = ewma_cost_per_expansion == 0.0f ? 1.0f : 0.125f;
+                    ewma_cost_per_expansion =
+                        ewma_cost_per_expansion == 0.0f
+                            ? cost_per_expansion
+                            : ewma_cost_per_expansion * (1.0f - alpha) +
+                                cost_per_expansion * alpha;
+                }
+                const bool underfilled = target_candidates > 0 &&
+                    frontier_candidates * 4u <= target_candidates * 3u;
+                const bool overfilled = target_candidates > 0 &&
+                    frontier_candidates * 4u > target_candidates * 5u;
+                const bool cost_guard_ready = cost_guard &&
+                    baseline_samples >= cost_probe_rounds &&
+                    baseline_cost_per_expansion > 0.0f &&
+                    ewma_cost_per_expansion > 0.0f;
+                const bool cost_too_high = cost_guard_ready &&
+                    ewma_cost_per_expansion >
+                        baseline_cost_per_expansion * cost_max_extra_ratio;
+                if (underfilled) ++stats.query_credit_underfilled_rounds;
+                if (overfilled) ++stats.query_credit_overfilled_rounds;
+                if (!progressed) {
+                    ++no_progress_streak;
+                    ++stats.query_credit_no_progress_rounds;
+                } else {
+                    no_progress_streak = 0;
+                }
+
+                if (cost_too_high) {
+                    ++stats.query_credit_cost_guard_events;
+                }
+
+                if ((credit_stall || overfilled || cost_too_high ||
+                     no_progress_streak >= 2) &&
+                    issue_k > min_k) {
+                    --issue_k;
+                    ++stats.query_credit_shrink_events;
+                } else if (!credit_stall && !overfilled && !cost_too_high &&
+                           underfilled && progressed && issue_k < max_k) {
+                    ++issue_k;
+                    ++stats.query_credit_grow_events;
+                } else if (cost_too_high && underfilled && progressed && issue_k < max_k) {
+                    ++stats.query_credit_cost_growth_blocked;
+                }
+
+                const bool shrink_lookahead =
+                    credit_stall || cost_too_high || no_progress_streak >= 1;
+                if (shrink_lookahead && lookahead_k > 0) {
+                    --lookahead_k;
+                } else if (!shrink_lookahead && progressed &&
+                           lookahead_k < std::min(max_lookahead, issue_width())) {
+                    ++lookahead_k;
+                }
+            }
+        };
+        CreditExpansionController credit{};
+        credit.enabled = credit_aware_expansion_;
+        credit.min_k = std::min(std::max<u32>(1, credit_aware_min_k_), K);
+        credit.max_k = credit_aware_max_k_ == 0 ? K : std::min(credit_aware_max_k_, K);
+        credit.max_k = std::max(credit.max_k, credit.min_k);
+        credit.issue_k = credit.enabled
+            ? std::clamp<u32>(std::max<u32>(1, credit.max_k / 2u), credit.min_k, credit.max_k)
+            : credit.max_k;
+        credit.target_candidates = credit_aware_target_candidates_ == 0
+            ? std::max<u32>(R_, (R_ * credit.max_k) / 2u)
+            : credit_aware_target_candidates_;
+        credit.graph_degree = R_;
+        credit.max_lookahead = credit_aware_max_lookahead_ == 0
+            ? std::min<u32>(credit.max_k, std::max<u32>(1, credit.max_k / 2u))
+            : std::min(credit_aware_max_lookahead_, credit.max_k);
+        credit.lookahead_k = credit.enabled
+            ? std::min(credit.max_lookahead, credit.issue_k)
+            : credit.max_k;
+        credit.cost_guard = credit_aware_cost_guard_;
+        credit.cost_max_extra_ratio = credit_aware_cost_max_extra_ratio_;
+        credit.cost_probe_rounds = credit_aware_cost_probe_rounds_;
+
         auto select_best = [&beam]() -> i32 {
             i32 best = -1;
             distance_t best_d = std::numeric_limits<distance_t>::max();
@@ -73,6 +209,11 @@
                 }
             }
             return best;
+        };
+        auto best_beam_distance = [&beam]() -> distance_t {
+            return beam.empty()
+                ? std::numeric_limits<distance_t>::max()
+                : beam.front().distance;
         };
         const bool use_indirect_candidate_path =
             use_gpudirect_candidate_rdma && thread->reserved_query_state[1] != nullptr;
@@ -91,9 +232,32 @@
         bool rabitq_prefetch_enabled_query = rabitq_speculative_prefetch_;
         u32 rabitq_next_audit_expansion = rabitq_audit_period_ == 0
             ? 0 : rabitq_warmup_exact_expansions_ + rabitq_audit_period_;
+        i32 best_idx = -1;
+        auto issue_plain_neighbor_reads = [&](u32 desired, u32 start_slot,
+                                             bool precommit) -> u32 {
+            desired = std::min(desired, K);
+            u32 slot = std::min(start_slot, desired);
+            for (; slot < desired; ++slot) {
+                best_idx = select_best();
+                if (best_idx < 0) break;
+                beam[best_idx].expanded = true;
+                pf_neighbors[slot] = rdma::vamana::read_vamana_neighbors(
+                    beam[best_idx].rptr, &thread);
+            }
+            const u32 issued = slot > start_slot ? slot - start_slot : 0;
+            if (credit.enabled && issued > 0) {
+                thread->stats.query_credit_expansions_issued += issued;
+                if (precommit) {
+                    thread->stats.query_credit_precommit_expansions += issued;
+                } else {
+                    thread->stats.query_credit_postcommit_expansions += issued;
+                }
+            }
+            return slot;
+        };
 
         // ── Cold start: read the first neighbour ───────────────────────
-        i32 best_idx = select_best();
+        best_idx = select_best();
         if (best_idx < 0) co_return;
         beam[best_idx].expanded = true;
         pf_neighbors[0] = rdma::vamana::read_vamana_neighbors(
@@ -158,12 +322,19 @@
             rabitq_expansions_seen += consumed_K;
 
             if (all_unvisited.empty()) {
-                best_idx = select_best();
-                if (best_idx < 0) break;
-                beam[best_idx].expanded = true;
-                pf_neighbors[0] = rdma::vamana::read_vamana_neighbors(
-                    beam[best_idx].rptr, &thread);
-                pending_K = 1;
+                credit.record_round(consumed_K, 0, 0, false, false, thread->stats);
+                if (credit.enabled) {
+                    pending_K = issue_plain_neighbor_reads(credit.issue_width(), 0, false);
+                } else {
+                    best_idx = select_best();
+                    if (best_idx >= 0) {
+                        beam[best_idx].expanded = true;
+                        pf_neighbors[0] = rdma::vamana::read_vamana_neighbors(
+                            beam[best_idx].rptr, &thread);
+                        pending_K = 1;
+                    }
+                }
+                if (pending_K == 0) break;
                 continue;
             }
 
@@ -320,19 +491,17 @@
                 }
 
                 if (gate_indices.empty()) {
-                    for (u32 k = 0; k < K; ++k) {
-                        best_idx = select_best();
-                        if (best_idx < 0) break;
-                        beam[best_idx].expanded = true;
-                        pf_neighbors[k] = rdma::vamana::read_vamana_neighbors(
-                            beam[best_idx].rptr, &thread);
-                        pending_K = k + 1;
-                    }
+                    pending_K = issue_plain_neighbor_reads(credit.issue_width(), 0, false);
                     if (pending_K == 0) break;
                     continue;
                 }
 
                 const auto t_exact_fetch = std::chrono::steady_clock::now();
+                const auto credit_waits_before = thread->stats.vector_rdma_credit_waits;
+                const auto credit_completion_before =
+                    thread->stats.vector_rdma_completion_token_waits;
+                const auto credit_retries_before =
+                    thread->stats.vector_rdma_post_send_retries;
                 if (!exact_query_uploaded) {
                     const size_t exact_query_bytes = vector_dtype_bytes(query_dtype, dim_);
                     const auto t_exact_query_h2d = std::chrono::steady_clock::now();
@@ -351,6 +520,10 @@
                     use_gpudirect_candidate_rdma ? exact_staging : nullptr,
                     use_gpudirect_candidate_rdma
                       ? gs.current_query_candidate_vecs_lkey() : 0);
+                const bool exact_credit_stall =
+                    thread->stats.vector_rdma_credit_waits != credit_waits_before ||
+                    thread->stats.vector_rdma_completion_token_waits != credit_completion_before ||
+                    thread->stats.vector_rdma_post_send_retries != credit_retries_before;
                 add_breakdown_subcategory(thread,
                     service::breakdown::Subcategory::rdma_vector_fetch, t_exact_fetch);
                 if (exact_vectors.direct_to_gpu) {
@@ -410,6 +583,11 @@
                 add_breakdown_subcategory(thread,
                     service::breakdown::Subcategory::transfer_distance_d2h, t_d2h);
                 const auto t_beam_update = std::chrono::steady_clock::now();
+                const size_t beam_size_before_update = beam.size();
+                const distance_t best_before_update = best_beam_distance();
+                const distance_t cutoff_before_update = beam.size() >= beam_width_
+                    ? beam.back().distance
+                    : std::numeric_limits<distance_t>::max();
                 for (u32 i = 0; i < gate_indices.size(); ++i) {
                     insert_into_beam(beam, exact_ptrs[i], gs.h_distances[i], beam_width_);
                 }
@@ -419,8 +597,22 @@
                 thread->stats.query_distcomps += gate_indices.size();
                 thread->stats.query_exact_reranks += gate_indices.size();
                 thread->stats.query_rabitq_l2_candidates += gate_indices.size();
+                const distance_t cutoff_after_update = beam.size() >= beam_width_
+                    ? beam.back().distance
+                    : std::numeric_limits<distance_t>::max();
+                const bool progressed =
+                    beam.size() > beam_size_before_update ||
+                    best_beam_distance() + std::numeric_limits<distance_t>::epsilon() <
+                        best_before_update ||
+                    cutoff_after_update + std::numeric_limits<distance_t>::epsilon() <
+                        cutoff_before_update;
+                credit.record_round(consumed_K, n_batch,
+                                    static_cast<u32>(gate_indices.size()),
+                                    exact_credit_stall, progressed, thread->stats);
 
-                for (u32 k = 0; k < K; ++k) {
+                const u32 desired_issue = credit.issue_width();
+                u32 issued_next = 0;
+                for (u32 k = 0; k < desired_issue; ++k) {
                     best_idx = select_best();
                     if (best_idx < 0) break;
                     beam[best_idx].expanded = true;
@@ -445,6 +637,11 @@
                         }
                     }
                     pending_K = k + 1;
+                    ++issued_next;
+                }
+                if (credit.enabled && issued_next > 0) {
+                    thread->stats.query_credit_expansions_issued += issued_next;
+                    thread->stats.query_credit_postcommit_expansions += issued_next;
                 }
                 for (u32 i = 0; i < speculative_count; ++i) {
                     speculative_neighbors[i] = {};
@@ -470,6 +667,11 @@
             const u32 staging_lkey = gs.current_query_candidate_vecs_lkey();
 
             const auto tvf = std::chrono::steady_clock::now();
+            const auto vector_credit_waits_before = thread->stats.vector_rdma_credit_waits;
+            const auto vector_completion_before =
+                thread->stats.vector_rdma_completion_token_waits;
+            const auto vector_retries_before =
+                thread->stats.vector_rdma_post_send_retries;
             const size_t rabitq_entry_size = VamanaNode::rabitq_entry_size();
             if (use_rabitq_ && !use_local_rabitq_cache) {
                 thread->stats.query_rabitq_l1_candidates += n_batch;
@@ -528,6 +730,10 @@
                 add_breakdown_subcategory(thread,
                     service::breakdown::Subcategory::rdma_vector_fetch, tvf);
             }
+            const bool vector_credit_stall =
+                thread->stats.vector_rdma_credit_waits != vector_credit_waits_before ||
+                thread->stats.vector_rdma_completion_token_waits != vector_completion_before ||
+                thread->stats.vector_rdma_post_send_retries != vector_retries_before;
 
             // ── Phase 3: GPU ───────────────────────────────────────────
             const auto t_gpu = std::chrono::steady_clock::now();
@@ -608,14 +814,7 @@
             // ── Phase 3: issue neighbour reads for next iteration ────
             // Issued before D2H so the RDMA overlaps with
             // cudaMemcpyAsync + cudaStreamSynchronize (8-10μs).
-            for (u32 k = 0; k < K; ++k) {
-                best_idx = select_best();
-                if (best_idx < 0) break;
-                beam[best_idx].expanded = true;
-                pf_neighbors[k] = rdma::vamana::read_vamana_neighbors(
-                    beam[best_idx].rptr, &thread);
-                pending_K = k + 1;
-            }
+            pending_K = issue_plain_neighbor_reads(credit.precommit_width(), 0, true);
 
             if (!use_local_rabitq_cache) {
                 const auto t_d2h = std::chrono::steady_clock::now();
@@ -776,18 +975,43 @@
             }
 
             const auto t_bu = std::chrono::steady_clock::now();
+            const size_t beam_size_before_update = beam.size();
+            const distance_t best_before_update = best_beam_distance();
+            const distance_t cutoff_before_update = beam.size() >= beam_width_
+                ? beam.back().distance
+                : std::numeric_limits<distance_t>::max();
             for (u32 i = 0; i < n_batch; ++i)
                 insert_into_beam(beam, all_unvisited[i], gs.h_distances[i], beam_width_);
             add_breakdown_subcategory(thread,
                 service::breakdown::Subcategory::cpu_query_beam_update, t_bu);
+            const distance_t cutoff_after_update = beam.size() >= beam_width_
+                ? beam.back().distance
+                : std::numeric_limits<distance_t>::max();
+            const bool progressed =
+                beam.size() > beam_size_before_update ||
+                best_beam_distance() + std::numeric_limits<distance_t>::epsilon() <
+                    best_before_update ||
+                cutoff_after_update + std::numeric_limits<distance_t>::epsilon() <
+                    cutoff_before_update;
+            credit.record_round(consumed_K, n_batch, n_batch,
+                                vector_credit_stall, progressed, thread->stats);
+
+            if (credit.enabled && pending_K < credit.issue_width()) {
+                pending_K = issue_plain_neighbor_reads(credit.issue_width(), pending_K, false);
+            }
 
             if (pending_K == 0) {
-                best_idx = select_best();
-                if (best_idx < 0) break;
-                beam[best_idx].expanded = true;
-                pf_neighbors[0] = rdma::vamana::read_vamana_neighbors(
-                    beam[best_idx].rptr, &thread);
-                pending_K = 1;
+                if (credit.enabled) {
+                    pending_K = issue_plain_neighbor_reads(credit.issue_width(), 0, false);
+                    if (pending_K == 0) break;
+                } else {
+                    best_idx = select_best();
+                    if (best_idx < 0) break;
+                    beam[best_idx].expanded = true;
+                    pf_neighbors[0] = rdma::vamana::read_vamana_neighbors(
+                        beam[best_idx].rptr, &thread);
+                    pending_K = 1;
+                }
             }
         }
 

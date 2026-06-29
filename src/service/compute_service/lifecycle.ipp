@@ -104,6 +104,14 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     config_.R, config_.beam_width, config_.beam_width_construction,
     config_.alpha, config_.k, config_.dim, config_.resolved_vector_dtype());
   vamana_->set_expansion_batch(config_.expansion_batch);
+  vamana_->set_credit_aware_expansion(config_.credit_aware_expansion,
+                                      config_.credit_aware_min_k,
+                                      config_.credit_aware_max_k,
+                                      config_.credit_aware_target_candidates,
+                                      config_.credit_aware_max_lookahead,
+                                      config_.credit_aware_cost_guard,
+                                      static_cast<f32>(config_.credit_aware_cost_max_extra_ratio),
+                                      config_.credit_aware_cost_probe_rounds);
   vamana_->set_observe_device_utilization(
     config_.enable_breakdown && config_.observe_device_utilization);
   vamana_->set_query_batch_size(config_.query_batch_size);
@@ -160,9 +168,10 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                    std::to_string(anchor_index_->memory_bytes()) + " bytes");
     }
   }
-  print_status(vamana_->use_rabitq()
-    ? "search: RFQ5 RaBitQ " + config_.rabitq_mode + " + GPUDirect exact beam"
-    : "search: exact");
+  print_status((config_.credit_aware_expansion ? "search: credit-aware " : "search: ") +
+    (vamana_->use_rabitq()
+      ? "RFQ5 RaBitQ " + config_.rabitq_mode + " + GPUDirect exact beam"
+      : "exact"));
 
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,
                                               config_.max_send_queue_wr,

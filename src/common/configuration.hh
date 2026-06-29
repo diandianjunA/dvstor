@@ -44,6 +44,14 @@ public:
   bool enable_breakdown{true};  // Per-request fine-grained timing/counter collection
   bool observe_device_utilization{};  // CUDA-event instrumentation for motivation experiments
   u32 expansion_batch{1};   // Batch K beam expansions per iteration (1=serial)
+  bool credit_aware_expansion{};  // Treat expansion_batch as a hardware-credit-driven upper bound
+  u32 credit_aware_min_k{1};
+  u32 credit_aware_max_k{};
+  u32 credit_aware_target_candidates{};
+  u32 credit_aware_max_lookahead{};
+  bool credit_aware_cost_guard{};
+  f64 credit_aware_cost_max_extra_ratio{1.05};
+  u32 credit_aware_cost_probe_rounds{4};
   u32 rdma_qp_pool_size{};   // QPs per memory node per SharedContext (0=auto)
   str rdma_read_batch_mode{"adaptive"};
   u32 rdma_read_chain_size{};
@@ -253,6 +261,30 @@ private:
       "Collect CUDA-kernel and RDMA-wait utilization metrics (benchmark instrumentation).")(
       "expansion-batch,K", po::value<u32>(&expansion_batch)->default_value(1),
       "Number of beam nodes expanded per iteration.")(
+      "credit-aware-expansion",
+      po::bool_switch(&credit_aware_expansion)->default_value(false),
+      "Enable resource-credit-driven per-query expansion scheduling; --expansion-batch becomes the hard cap.")(
+      "credit-aware-min-k",
+      po::value<u32>(&credit_aware_min_k)->default_value(credit_aware_min_k),
+      "Minimum expansions issued by the credit-aware scheduler.")(
+      "credit-aware-max-k",
+      po::value<u32>(&credit_aware_max_k)->default_value(credit_aware_max_k),
+      "Maximum expansions issued by the credit-aware scheduler. 0 uses --expansion-batch.")(
+      "credit-aware-target-candidates",
+      po::value<u32>(&credit_aware_target_candidates)->default_value(credit_aware_target_candidates),
+      "Target generated frontier candidates per expansion round. 0 derives it from graph degree and max K.")(
+      "credit-aware-max-lookahead",
+      po::value<u32>(&credit_aware_max_lookahead)->default_value(credit_aware_max_lookahead),
+      "Maximum pre-commit speculative neighbor reads. 0 derives it from max K.")(
+      "credit-aware-cost-guard",
+      po::bool_switch(&credit_aware_cost_guard)->default_value(false),
+      "Use a query-local work-per-expansion guard to reject unprofitable K growth.")(
+      "credit-aware-cost-max-extra-ratio",
+      po::value<f64>(&credit_aware_cost_max_extra_ratio)->default_value(credit_aware_cost_max_extra_ratio),
+      "Maximum work-per-expansion over the query-local min-K baseline before shrinking K.")(
+      "credit-aware-cost-probe-rounds",
+      po::value<u32>(&credit_aware_cost_probe_rounds)->default_value(credit_aware_cost_probe_rounds),
+      "Minimum min-K rounds used to learn the query-local cost baseline.")(
       "rdma-qp-pool-size", po::value<u32>(&rdma_qp_pool_size)->default_value(rdma_qp_pool_size),
       "QPs per memory node per SharedContext. 0 selects the automatic pool size.")(
       "rdma-read-batch-mode",
@@ -370,6 +402,17 @@ private:
           rabitq_prefetch_width > 8 ||
           rabitq_prefetch_min_hit_ratio < 0.0 || rabitq_prefetch_min_hit_ratio > 1.0))) {
       std::cerr << "[ERROR]: invalid RaBitQ gate configuration" << std::endl;
+      exit_with_help_message(argv);
+    }
+
+    if (expansion_batch == 0 ||
+        credit_aware_min_k == 0 ||
+        (credit_aware_max_k != 0 && credit_aware_max_k < credit_aware_min_k) ||
+        (credit_aware_max_k != 0 && credit_aware_max_k > expansion_batch) ||
+        credit_aware_max_lookahead > expansion_batch ||
+        credit_aware_cost_max_extra_ratio < 1.0 ||
+        credit_aware_cost_probe_rounds == 0) {
+      std::cerr << "[ERROR]: invalid credit-aware expansion configuration" << std::endl;
       exit_with_help_message(argv);
     }
 
@@ -555,6 +598,22 @@ public:
       os << std::setw(width) << "Observe device utilization: "
          << (config.observe_device_utilization ? "true" : "false") << std::endl;
       os << std::setw(width) << "Expansion Batch (K): " << config.expansion_batch << std::endl;
+      os << std::setw(width) << "Credit-aware expansion: "
+         << (config.credit_aware_expansion ? "true" : "false") << std::endl;
+      os << std::setw(width) << "Credit-aware min K: " << config.credit_aware_min_k << std::endl;
+      os << std::setw(width) << "Credit-aware max K: "
+         << (config.credit_aware_max_k == 0 ? config.expansion_batch : config.credit_aware_max_k)
+         << std::endl;
+      os << std::setw(width) << "Credit-aware target candidates: "
+         << config.credit_aware_target_candidates << std::endl;
+      os << std::setw(width) << "Credit-aware max lookahead: "
+         << config.credit_aware_max_lookahead << std::endl;
+      os << std::setw(width) << "Credit-aware cost guard: "
+         << (config.credit_aware_cost_guard ? "true" : "false") << std::endl;
+      os << std::setw(width) << "Credit-aware cost max extra ratio: "
+         << config.credit_aware_cost_max_extra_ratio << std::endl;
+      os << std::setw(width) << "Credit-aware cost probe rounds: "
+         << config.credit_aware_cost_probe_rounds << std::endl;
       os << std::setw(width) << "RDMA QP Pool Size: "
          << config.effective_rdma_qp_pool_size();
       if (config.rdma_qp_pool_size == 0) os << " (auto)";

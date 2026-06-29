@@ -125,6 +125,19 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.rabitq_prefetch_misses += delta.rabitq_prefetch_misses;
   aggregate.counters.rabitq_prefetch_disabled_queries +=
     delta.rabitq_prefetch_disabled_queries;
+  aggregate.counters.credit_rounds += delta.credit_rounds;
+  aggregate.counters.credit_expansions_issued += delta.credit_expansions_issued;
+  aggregate.counters.credit_precommit_expansions += delta.credit_precommit_expansions;
+  aggregate.counters.credit_postcommit_expansions += delta.credit_postcommit_expansions;
+  aggregate.counters.credit_grow_events += delta.credit_grow_events;
+  aggregate.counters.credit_shrink_events += delta.credit_shrink_events;
+  aggregate.counters.credit_credit_stalls += delta.credit_credit_stalls;
+  aggregate.counters.credit_no_progress_rounds += delta.credit_no_progress_rounds;
+  aggregate.counters.credit_underfilled_rounds += delta.credit_underfilled_rounds;
+  aggregate.counters.credit_overfilled_rounds += delta.credit_overfilled_rounds;
+  aggregate.counters.credit_cost_guard_events += delta.credit_cost_guard_events;
+  aggregate.counters.credit_cost_growth_blocked += delta.credit_cost_growth_blocked;
+  aggregate.counters.credit_cost_baseline_samples += delta.credit_cost_baseline_samples;
   aggregate.counters.visited_nodes += delta.visited_nodes;
   aggregate.counters.visited_neighborlists += delta.visited_neighborlists;
   aggregate.counters.remote_allocations += delta.remote_allocations;

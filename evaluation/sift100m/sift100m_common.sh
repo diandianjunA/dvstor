@@ -264,6 +264,26 @@ write_service_config() {
       echo "observe-device-utilization = true"
     fi
     if [[ -n "${EXPANSION_BATCH:-}" ]]; then echo "expansion-batch = ${EXPANSION_BATCH}"; fi
+    if [[ "${CREDIT_AWARE_EXPANSION:-0}" == "1" || "${CREDIT_AWARE_EXPANSION:-0}" == "true" ]]; then
+      echo "credit-aware-expansion = true"
+      if [[ -n "${CREDIT_AWARE_MIN_K:-}" ]]; then echo "credit-aware-min-k = ${CREDIT_AWARE_MIN_K}"; fi
+      if [[ -n "${CREDIT_AWARE_MAX_K:-}" ]]; then echo "credit-aware-max-k = ${CREDIT_AWARE_MAX_K}"; fi
+      if [[ -n "${CREDIT_AWARE_TARGET_CANDIDATES:-}" ]]; then
+        echo "credit-aware-target-candidates = ${CREDIT_AWARE_TARGET_CANDIDATES}"
+      fi
+      if [[ -n "${CREDIT_AWARE_MAX_LOOKAHEAD:-}" ]]; then
+        echo "credit-aware-max-lookahead = ${CREDIT_AWARE_MAX_LOOKAHEAD}"
+      fi
+      if [[ "${CREDIT_AWARE_COST_GUARD:-0}" == "1" || "${CREDIT_AWARE_COST_GUARD:-0}" == "true" ]]; then
+        echo "credit-aware-cost-guard = true"
+        if [[ -n "${CREDIT_AWARE_COST_MAX_EXTRA_RATIO:-}" ]]; then
+          echo "credit-aware-cost-max-extra-ratio = ${CREDIT_AWARE_COST_MAX_EXTRA_RATIO}"
+        fi
+        if [[ -n "${CREDIT_AWARE_COST_PROBE_ROUNDS:-}" ]]; then
+          echo "credit-aware-cost-probe-rounds = ${CREDIT_AWARE_COST_PROBE_ROUNDS}"
+        fi
+      fi
+    fi
     if [[ -n "${RDMA_QP_POOL_SIZE:-}" ]]; then echo "rdma-qp-pool-size = ${RDMA_QP_POOL_SIZE}"; fi
     if [[ -n "${RDMA_READ_BATCH_MODE:-}" ]]; then echo "rdma-read-batch-mode = ${RDMA_READ_BATCH_MODE}"; fi
     if [[ -n "${RDMA_READ_CHAIN_SIZE:-}" ]]; then echo "rdma-read-chain-size = ${RDMA_READ_CHAIN_SIZE}"; fi
