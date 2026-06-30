@@ -216,8 +216,26 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"fine_grained_breakdown_enabled", service.config().enable_breakdown},
     {"device_utilization_observation_enabled",
      service.config().enable_breakdown && service.config().observe_device_utilization},
-    {"search", service.config().use_rabitq
-        ? "rabitq_rfq5_" + service.config().rabitq_mode : "exact"},
+    {"search", std::string(service.config().credit_aware_expansion ? "credit_aware_" : "") +
+        (service.config().use_rabitq
+          ? "rabitq_rfq5_" + service.config().rabitq_mode : "exact")},
+    {"credit_aware_expansion", service.config().credit_aware_expansion},
+    {"credit_aware_min_k", service.config().credit_aware_expansion
+        ? service.config().credit_aware_min_k : 0},
+    {"credit_aware_max_k", service.config().credit_aware_expansion
+        ? (service.config().credit_aware_max_k == 0
+            ? service.config().expansion_batch : service.config().credit_aware_max_k)
+        : 0},
+    {"credit_aware_target_candidates", service.config().credit_aware_expansion
+        ? service.config().credit_aware_target_candidates : 0},
+    {"credit_aware_max_lookahead", service.config().credit_aware_expansion
+        ? service.config().credit_aware_max_lookahead : 0},
+    {"credit_aware_cost_guard", service.config().credit_aware_expansion
+        ? service.config().credit_aware_cost_guard : false},
+    {"credit_aware_cost_max_extra_ratio", service.config().credit_aware_expansion
+        ? service.config().credit_aware_cost_max_extra_ratio : 0.0},
+    {"credit_aware_cost_probe_rounds", service.config().credit_aware_expansion
+        ? service.config().credit_aware_cost_probe_rounds : 0},
     {"rabitq_cache_bytes", service.rabitq_cache_bytes()},
     {"rabitq_cache_entries", service.rabitq_cache_entries()},
     {"rabitq_cache_numa_interleaved", service.rabitq_cache_numa_interleaved()},

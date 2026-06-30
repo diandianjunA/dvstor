@@ -78,11 +78,27 @@ public:
 public:
     void set_expansion_batch(u32 k) { expansion_batch_ = k; }
     u32 expansion_batch() const { return expansion_batch_; }
+    void set_credit_aware_expansion(bool enabled, u32 min_k, u32 max_k,
+                                    u32 target_candidates, u32 max_lookahead,
+                                    bool cost_guard, f32 cost_max_extra_ratio,
+                                    u32 cost_probe_rounds) {
+        credit_aware_expansion_ = enabled;
+        credit_aware_min_k_ = std::max<u32>(1, min_k);
+        credit_aware_max_k_ = max_k == 0 ? expansion_batch_ : std::min(max_k, expansion_batch_);
+        credit_aware_max_k_ = std::max(credit_aware_max_k_, credit_aware_min_k_);
+        credit_aware_target_candidates_ = target_candidates;
+        credit_aware_max_lookahead_ = std::min(max_lookahead, credit_aware_max_k_);
+        credit_aware_cost_guard_ = cost_guard;
+        credit_aware_cost_max_extra_ratio_ = std::max(1.0f, cost_max_extra_ratio);
+        credit_aware_cost_probe_rounds_ = std::max<u32>(1, cost_probe_rounds);
+    }
     void set_observe_device_utilization(bool enabled) { observe_device_utilization_ = enabled; }
     void set_query_batch_size(u32 q) {
         query_batch_size_ = q;
     }
-    u32 query_batch_size() const { return use_rabitq_ ? 1 : query_batch_size_; }
+    u32 query_batch_size() const {
+        return (use_rabitq_ || credit_aware_expansion_) ? 1 : query_batch_size_;
+    }
     bool use_rabitq() const { return use_rabitq_; }
     void set_rabitq_cache(const rabitq::Cache* cache) { rabitq_cache_ = cache; }
     void set_rabitq_gate(u32 width, u32 max_width, f32 margin) {
@@ -119,6 +135,14 @@ public:
 private:
     static constexpr u32 kRabitqMaxPrefetchWidth{8};
     u32 expansion_batch_{1};
+    bool credit_aware_expansion_{false};
+    u32 credit_aware_min_k_{1};
+    u32 credit_aware_max_k_{0};
+    u32 credit_aware_target_candidates_{0};
+    u32 credit_aware_max_lookahead_{0};
+    bool credit_aware_cost_guard_{false};
+    f32 credit_aware_cost_max_extra_ratio_{1.05f};
+    u32 credit_aware_cost_probe_rounds_{4};
     u32 query_batch_size_{1};
     bool observe_device_utilization_{false};
     bool use_rabitq_{false};

@@ -169,6 +169,29 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"rabitq_prefetch_misses", aggregate.counters.rabitq_prefetch_misses},
     {"rabitq_prefetch_disabled_queries",
      aggregate.counters.rabitq_prefetch_disabled_queries},
+    {"credit_rounds", aggregate.counters.credit_rounds},
+    {"credit_expansions_issued", aggregate.counters.credit_expansions_issued},
+    {"credit_precommit_expansions", aggregate.counters.credit_precommit_expansions},
+    {"credit_postcommit_expansions", aggregate.counters.credit_postcommit_expansions},
+    {"credit_grow_events", aggregate.counters.credit_grow_events},
+    {"credit_shrink_events", aggregate.counters.credit_shrink_events},
+    {"credit_credit_stalls", aggregate.counters.credit_credit_stalls},
+    {"credit_no_progress_rounds", aggregate.counters.credit_no_progress_rounds},
+    {"credit_underfilled_rounds", aggregate.counters.credit_underfilled_rounds},
+    {"credit_overfilled_rounds", aggregate.counters.credit_overfilled_rounds},
+    {"credit_cost_guard_events", aggregate.counters.credit_cost_guard_events},
+    {"credit_cost_growth_blocked", aggregate.counters.credit_cost_growth_blocked},
+    {"credit_cost_baseline_samples", aggregate.counters.credit_cost_baseline_samples},
+    {"credit_mean_issue_k",
+     aggregate.counters.credit_rounds == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.credit_expansions_issued) /
+           static_cast<double>(aggregate.counters.credit_rounds)},
+    {"credit_precommit_ratio",
+     aggregate.counters.credit_expansions_issued == 0
+       ? 0.0
+       : static_cast<double>(aggregate.counters.credit_precommit_expansions) /
+           static_cast<double>(aggregate.counters.credit_expansions_issued)},
     {"storage_owner_anchor_hints", aggregate.counters.storage_owner_anchor_hints},
     {"storage_owner_anchor_valid_hints", aggregate.counters.storage_owner_anchor_valid_hints},
     {"storage_owner_anchor_expansions", aggregate.counters.storage_owner_anchor_expansions},

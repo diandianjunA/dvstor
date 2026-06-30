@@ -48,6 +48,19 @@ struct ThreadCounterDelta {
   u64 rabitq_prefetch_hits{};
   u64 rabitq_prefetch_misses{};
   u64 rabitq_prefetch_disabled_queries{};
+  u64 credit_rounds{};
+  u64 credit_expansions_issued{};
+  u64 credit_precommit_expansions{};
+  u64 credit_postcommit_expansions{};
+  u64 credit_grow_events{};
+  u64 credit_shrink_events{};
+  u64 credit_credit_stalls{};
+  u64 credit_no_progress_rounds{};
+  u64 credit_underfilled_rounds{};
+  u64 credit_overfilled_rounds{};
+  u64 credit_cost_guard_events{};
+  u64 credit_cost_growth_blocked{};
+  u64 credit_cost_baseline_samples{};
   u64 visited_nodes{};
   u64 visited_neighborlists{};
   u64 remote_allocations{};
@@ -141,6 +154,29 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
     out.rabitq_prefetch_disabled_queries =
       end.query_rabitq_prefetch_disabled_queries -
       start.query_rabitq_prefetch_disabled_queries;
+    out.credit_rounds = end.query_credit_rounds - start.query_credit_rounds;
+    out.credit_expansions_issued =
+      end.query_credit_expansions_issued - start.query_credit_expansions_issued;
+    out.credit_precommit_expansions =
+      end.query_credit_precommit_expansions - start.query_credit_precommit_expansions;
+    out.credit_postcommit_expansions =
+      end.query_credit_postcommit_expansions - start.query_credit_postcommit_expansions;
+    out.credit_grow_events = end.query_credit_grow_events - start.query_credit_grow_events;
+    out.credit_shrink_events = end.query_credit_shrink_events - start.query_credit_shrink_events;
+    out.credit_credit_stalls =
+      end.query_credit_credit_stalls - start.query_credit_credit_stalls;
+    out.credit_no_progress_rounds =
+      end.query_credit_no_progress_rounds - start.query_credit_no_progress_rounds;
+    out.credit_underfilled_rounds =
+      end.query_credit_underfilled_rounds - start.query_credit_underfilled_rounds;
+    out.credit_overfilled_rounds =
+      end.query_credit_overfilled_rounds - start.query_credit_overfilled_rounds;
+    out.credit_cost_guard_events =
+      end.query_credit_cost_guard_events - start.query_credit_cost_guard_events;
+    out.credit_cost_growth_blocked =
+      end.query_credit_cost_growth_blocked - start.query_credit_cost_growth_blocked;
+    out.credit_cost_baseline_samples =
+      end.query_credit_cost_baseline_samples - start.query_credit_cost_baseline_samples;
     out.visited_nodes =
       (end.visited_nodes - start.visited_nodes) + (end.visited_nodes_l0 - start.visited_nodes_l0);
     out.visited_neighborlists = end.visited_neighborlists - start.visited_neighborlists;
