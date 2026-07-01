@@ -40,7 +40,7 @@ inline void add_storage_owner_breakdown(
     const std::shared_ptr<service::breakdown::Sample>& sample,
     const service::storage_owner::InsertBreakdownCounters& counters,
     u32 item_count) {
-  if (!sample) {
+  if (!sample || !sample->collects_breakdown()) {
     return;
   }
   const u64 explained_search_ns =
@@ -100,7 +100,7 @@ inline void add_storage_owner_breakdown(
 inline void add_storage_owner_counters(
     const std::shared_ptr<service::breakdown::Sample>& sample,
     const service::storage_owner::InsertBreakdownCounters& counters) {
-  if (!sample) {
+  if (!sample || !sample->collects_breakdown()) {
     return;
   }
   if (counters.storage_owner_anchor_hints == 0 &&
@@ -134,7 +134,7 @@ inline void add_storage_owner_sender_breakdown(
     u64 send_ns,
     u64 response_wait_unaccounted_ns,
     u32 item_count) {
-  if (!sample) {
+  if (!sample || !sample->collects_breakdown()) {
     return;
   }
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_sender_queue_wait,

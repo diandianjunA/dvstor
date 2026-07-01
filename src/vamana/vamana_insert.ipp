@@ -349,7 +349,8 @@
                 thread->stats.build_overflow_prune_kernel_threads += prune_threads;
                 thread->stats.build_overflow_prune_max_kernel_threads =
                     std::max(thread->stats.build_overflow_prune_max_kernel_threads, prune_threads);
-                if (auto* sample = thread->current_breakdown_sample()) {
+                if (auto* sample = thread->current_breakdown_sample();
+                    sample != nullptr && sample->collects_breakdown()) {
                     sample->overflow_prune_max_candidates =
                         std::max<u64>(sample->overflow_prune_max_candidates, n_all);
                     sample->overflow_prune_max_kernel_threads =

@@ -27,6 +27,20 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"p95_service_ns", percentile_ns(aggregate.service_latencies_ns, 0.95)},
     {"p99_service_ns", percentile_ns(aggregate.service_latencies_ns, 0.99)},
   };
+  out["fine_grained_breakdown_observed"] = aggregate.fine_grained_breakdown_observed;
+
+  if (!aggregate.fine_grained_breakdown_observed) {
+    out["utilization"] = {
+      {"device_utilization_observed", false},
+      {"gpu_kernel_busy_ns", 0},
+      {"gpu_kernel_busy_ratio", 0.0},
+      {"gpu_kernel_idle_ratio", 0.0},
+      {"rdma_completion_wait_ns", 0},
+      {"rdma_completion_wait_ratio", 0.0},
+      {"rdma_payload_bytes_per_service_s", 0.0},
+    };
+    return out;
+  }
 
   const u64 cpu_total = aggregate.total_service_ns > (aggregate.category_ns[static_cast<size_t>(Category::gpu)] +
                                                       aggregate.category_ns[static_cast<size_t>(Category::rdma)] +

@@ -13,21 +13,17 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
         throw std::invalid_argument("insert dimension mismatch");
       }
 
-      std::shared_ptr<service::breakdown::Sample> sample;
-      if (breakdown_enabled_) {
-        sample = std::make_shared<service::breakdown::Sample>(service::breakdown::Operation::insert);
-        const auto now = std::chrono::steady_clock::now();
-        sample->enqueued_at = now;
-        sample->mark_started(now, now, statistics::ThreadStatistics{});
-      }
+      auto sample = std::make_shared<service::breakdown::Sample>(
+        service::breakdown::Operation::insert, breakdown_enabled_);
+      const auto now = std::chrono::steady_clock::now();
+      sample->enqueued_at = now;
+      sample->mark_started(now, now, statistics::ThreadStatistics{});
 
       auto task = std::make_unique<StorageInsertTask>();
       task->item = item;
       task->kind = service::storage_owner::MutationKind::insert;
       task->sample = sample;
-      if (sample) {
-        task->enqueued_at = sample->enqueued_at;
-      }
+      task->enqueued_at = sample->enqueued_at;
       futures.push_back(task->result.get_future());
       samples.push_back(sample);
       const auto route = route_storage_owner_update(item);
@@ -81,13 +77,10 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
       throw std::invalid_argument("insert dimension mismatch");
     }
 
-    std::shared_ptr<service::breakdown::Sample> sample;
-    std::chrono::steady_clock::time_point enqueued_at{};
-    if (breakdown_enabled_) {
-      sample = std::make_shared<service::breakdown::Sample>(service::breakdown::Operation::insert);
-      enqueued_at = std::chrono::steady_clock::now();
-      sample->enqueued_at = enqueued_at;
-    }
+    auto sample = std::make_shared<service::breakdown::Sample>(
+      service::breakdown::Operation::insert, breakdown_enabled_);
+    const auto enqueued_at = std::chrono::steady_clock::now();
+    sample->enqueued_at = enqueued_at;
 
     auto* request = new service::InsertRequest{};
     request->id = item.id;
@@ -431,7 +424,8 @@ void ComputeService<Distance>::run_storage_insert_sender(u32 owner_storage) {
       const size_t batch_size = std::min<size_t>(state.queue.size(), config_.storage_owner_batch_max);
       owned_tasks.reserve(batch_size);
       for (size_t i = 0; i < batch_size; ++i) {
-        if (state.queue.front()->sample) {
+        if (state.queue.front()->sample &&
+            state.queue.front()->sample->collects_breakdown()) {
           state.queue.front()->sender_dequeued_at = owner_selected_at;
         }
         owned_tasks.push_back(std::move(state.queue.front()));
@@ -465,7 +459,7 @@ void ComputeService<Distance>::post_storage_owner_batch(
   const u64 batch_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
   bool collect_breakdown = false;
   for (const auto& task : tasks) {
-    if (task->sample) {
+    if (task->sample && task->sample->collects_breakdown()) {
       collect_breakdown = true;
       break;
     }
@@ -616,7 +610,7 @@ void ComputeService<Distance>::handle_storage_owner_send_completion(u32 owner_st
   }
   bool collect_breakdown = false;
   for (const auto& sample : slot.samples) {
-    if (sample) {
+    if (sample && sample->collects_breakdown()) {
       collect_breakdown = true;
       break;
     }
@@ -667,13 +661,20 @@ void ComputeService<Distance>::handle_storage_owner_response(u32 owner_storage, 
         std::memcpy(slot.response_buffer.data(), response_slot.buffer.data(), response_size);
         bool collect_breakdown = false;
         for (const auto& sample : slot.samples) {
-          if (sample) {
+          if (sample && sample->collects_breakdown()) {
             collect_breakdown = true;
             break;
           }
         }
+        bool collect_latency = false;
+        for (const auto& sample : slot.samples) {
+          if (sample) {
+            collect_latency = true;
+            break;
+          }
+        }
         slot.response_done = true;
-        if (collect_breakdown) {
+        if (collect_breakdown || collect_latency) {
           slot.response_completed_at = std::chrono::steady_clock::now();
         }
         maybe_release_storage_owner_slot_locked(state, slot);
@@ -721,7 +722,7 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
                              response->item_count == slot.item_count;
     bool collect_breakdown = false;
     for (const auto& sample : slot.samples) {
-      if (sample) {
+      if (sample && sample->collects_breakdown()) {
         collect_breakdown = true;
         break;
       }
@@ -777,7 +778,7 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
                     << std::endl;
         }
       }
-      if (slot.samples[i]) {
+      if (slot.samples[i] && slot.samples[i]->collects_breakdown()) {
         add_storage_owner_sender_breakdown(
           slot.samples[i],
           duration_ns_clamped(slot.tasks[i]->enqueued_at, slot.tasks[i]->sender_dequeued_at),
@@ -790,6 +791,8 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
           add_storage_owner_breakdown(slot.samples[i], *breakdown, slot.item_count);
           if (i == 0) add_storage_owner_counters(slot.samples[i], *breakdown);
         }
+      }
+      if (slot.samples[i]) {
         slot.samples[i]->mark_finished(finished_at, statistics::ThreadStatistics{});
       }
       if (ok && rabitq_cache_ != nullptr) {

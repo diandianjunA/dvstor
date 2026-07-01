@@ -52,7 +52,8 @@ private:
 
     static std::chrono::steady_clock::time_point breakdown_start(
                                     const u_ptr<ComputeThread>& thread) {
-        return thread->current_breakdown_sample() == nullptr
+        const auto* sample = thread->current_breakdown_sample();
+        return sample == nullptr || !sample->collects_breakdown()
             ? std::chrono::steady_clock::time_point{}
             : std::chrono::steady_clock::now();
     }

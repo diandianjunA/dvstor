@@ -5,13 +5,10 @@ typename ComputeService<Distance>::LocalMainSearchOutput ComputeService<Distance
     throw std::invalid_argument("search dimension mismatch");
   }
 
-  std::shared_ptr<service::breakdown::Sample> sample;
-  std::chrono::steady_clock::time_point enqueued_at{};
-  if (breakdown_enabled_) {
-    sample = std::make_shared<service::breakdown::Sample>(service::breakdown::Operation::query);
-    enqueued_at = std::chrono::steady_clock::now();
-    sample->enqueued_at = enqueued_at;
-  }
+  auto sample = std::make_shared<service::breakdown::Sample>(
+    service::breakdown::Operation::query, breakdown_enabled_);
+  const auto enqueued_at = std::chrono::steady_clock::now();
+  sample->enqueued_at = enqueued_at;
 
   auto* request = new service::QueryRequest{};
   request->components = query;
@@ -57,13 +54,10 @@ typename ComputeService<Distance>::LocalMainSearchOutput ComputeService<Distance
     throw std::invalid_argument("raw query pointer is null");
   }
 
-  std::shared_ptr<service::breakdown::Sample> sample;
-  std::chrono::steady_clock::time_point enqueued_at{};
-  if (breakdown_enabled_) {
-    sample = std::make_shared<service::breakdown::Sample>(service::breakdown::Operation::query);
-    enqueued_at = std::chrono::steady_clock::now();
-    sample->enqueued_at = enqueued_at;
-  }
+  auto sample = std::make_shared<service::breakdown::Sample>(
+    service::breakdown::Operation::query, breakdown_enabled_);
+  const auto enqueued_at = std::chrono::steady_clock::now();
+  sample->enqueued_at = enqueued_at;
 
   auto* request = new service::QueryRequest{};
   request->raw_components.assign(query_data, query_data + vector_dtype_bytes(query_dtype, config_.dim));

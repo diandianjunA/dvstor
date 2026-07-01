@@ -243,9 +243,11 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
 }
 
 struct Sample {
-  explicit Sample(Operation op) : operation(op) {}
+  explicit Sample(Operation op, bool collect_fine_grained = true)
+      : operation(op), collect_fine_grained_breakdown(collect_fine_grained) {}
 
   Operation operation;
+  bool collect_fine_grained_breakdown{};
   Clock::time_point enqueued_at{};
   Clock::time_point dequeued_at{};
   Clock::time_point started_at{};
@@ -278,7 +280,9 @@ struct Sample {
                     const statistics::ThreadStatistics& counters) {
     dequeued_at = dequeued;
     started_at = started;
-    start_counters = counters;
+    if (collect_fine_grained_breakdown) {
+      start_counters = counters;
+    }
     started_flag = true;
     queue_wait_ns =
       static_cast<u64>(std::chrono::duration_cast<Nanoseconds>(dequeued_at - enqueued_at).count());
@@ -286,13 +290,18 @@ struct Sample {
 
   void mark_finished(const Clock::time_point finished, const statistics::ThreadStatistics& counters) {
     finished_at = finished;
-    end_counters = counters;
+    if (collect_fine_grained_breakdown) {
+      end_counters = counters;
+    }
     finished_flag = true;
     service_ns = static_cast<u64>(std::chrono::duration_cast<Nanoseconds>(finished_at - started_at).count());
     end_to_end_ns = static_cast<u64>(std::chrono::duration_cast<Nanoseconds>(finished_at - enqueued_at).count());
   }
 
+  [[nodiscard]] bool collects_breakdown() const { return collect_fine_grained_breakdown; }
+
   void add_subcategory(const Subcategory subcategory, const u64 ns) {
+    if (!collect_fine_grained_breakdown) return;
     subcategory_ns[static_cast<size_t>(subcategory)] += ns;
     category_ns[static_cast<size_t>(parent_category(subcategory))] += ns;
     if (operation == Operation::query && parent_category(subcategory) == Category::rdma) {
@@ -301,12 +310,16 @@ struct Sample {
   }
 
   void add_gpu_kernel_time(const u64 ns) {
+    if (!collect_fine_grained_breakdown) return;
     if (operation == Operation::query) gpu_kernel_ns += ns;
   }
 
-  void set_device_utilization_observed() { device_utilization_observed = true; }
+  void set_device_utilization_observed() {
+    if (collect_fine_grained_breakdown) device_utilization_observed = true;
+  }
 
   ThreadCounterDelta counters() const {
+    if (!collect_fine_grained_breakdown) return {};
     ThreadCounterDelta out = diff_thread_counters(end_counters, start_counters, operation);
     if (storage_owner_anchor != nullptr) {
       out.storage_owner_anchor_hints = storage_owner_anchor->hints;
