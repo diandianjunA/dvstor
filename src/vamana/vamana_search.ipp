@@ -22,13 +22,13 @@
         const bool use_gpudirect_candidate_rdma =
             gpu.gpudirect_candidate_ready() && gs.d_candidate_vecs_rdma_registered;
 
-        const auto t_medoid_ptr_start = std::chrono::steady_clock::now();
+        const auto t_medoid_ptr_start = breakdown_start(thread);
         RemotePtr medoid_ptr = co_await rdma::vamana::read_medoid_ptr(thread);
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_medoid_ptr, t_medoid_ptr_start);
 
         s_ptr<VamanaNode> medoid_node;
         {
-            const auto t_node_read = std::chrono::steady_clock::now();
+            const auto t_node_read = breakdown_start(thread);
             auto coro = read_node(medoid_ptr, medoid_node, thread, true);
             while (!coro.handle.done()) {
                 co_await std::suspend_always{};
@@ -39,7 +39,7 @@
 
         if (!use_rabitq_) {
             const size_t query_bytes = vector_dtype_bytes(query_dtype, dim_);
-            const auto t_query_h2d = std::chrono::steady_clock::now();
+            const auto t_query_h2d = breakdown_start(thread);
             std::memcpy(reinterpret_cast<byte_t*>(gs.h_query), query_data, query_bytes);
             cudaMemcpyAsync(gs.d_query, gs.h_query, query_bytes, cudaMemcpyHostToDevice, gs.stream);
             track_query_h2d(thread, query_bytes);
@@ -271,7 +271,7 @@
         const bool use_local_rabitq_cache = use_rabitq_ && rabitq_cache_ != nullptr;
         rabitq::QueryLut rabitq_query_lut{};
         if (use_rabitq_) {
-            const auto t_query_h2d = std::chrono::steady_clock::now();
+            const auto t_query_h2d = breakdown_start(thread);
             auto* rabitq_rotated_query = static_cast<float*>(gs.h_query);
             VamanaNode::compute_rotated_query(query_data, query_dtype,
                                               rabitq_rotated_query, &rabitq_query_norm2);
@@ -302,7 +302,7 @@
                         std::memory_order_acquire) == 0) {
                     pf_neighbors[k].mark_ready();
                 }
-                const auto t_nf = std::chrono::steady_clock::now();
+                const auto t_nf = breakdown_start(thread);
                 auto nlist = co_await pf_neighbors[k];
                 add_breakdown_subcategory(thread,
                     service::breakdown::Subcategory::rdma_neighbor_fetch, t_nf);
@@ -369,7 +369,7 @@
                 auto& exact_ptrs = coro_state.reserved_ptrs_a;
                 auto& gate_indices = coro_state.scratch_indices_b;
                 if (rabitq_exact_safe_) {
-                    const auto t_gate = std::chrono::steady_clock::now();
+                    const auto t_gate = breakdown_start(thread);
                     gate_indices.clear();
                     exact_ptrs.clear();
                     gate_indices.reserve(n_batch);
@@ -438,7 +438,7 @@
                             thread->stats.query_rabitq_audit_candidates += n_batch;
                         }
                     } else {
-                        const auto t_gate = std::chrono::steady_clock::now();
+                        const auto t_gate = breakdown_start(thread);
                         auto& approximate_distances = coro_state.scratch_distances;
                         auto& cache_miss_indices = coro_state.scratch_indices_a;
                         auto& cached_order = coro_state.indirect_candidate_indices;
@@ -496,7 +496,7 @@
                     continue;
                 }
 
-                const auto t_exact_fetch = std::chrono::steady_clock::now();
+                const auto t_exact_fetch = breakdown_start(thread);
                 const auto credit_waits_before = thread->stats.vector_rdma_credit_waits;
                 const auto credit_completion_before =
                     thread->stats.vector_rdma_completion_token_waits;
@@ -504,7 +504,7 @@
                     thread->stats.vector_rdma_post_send_retries;
                 if (!exact_query_uploaded) {
                     const size_t exact_query_bytes = vector_dtype_bytes(query_dtype, dim_);
-                    const auto t_exact_query_h2d = std::chrono::steady_clock::now();
+                    const auto t_exact_query_h2d = breakdown_start(thread);
                     cudaMemcpyAsync(gs.d_query, query_data, exact_query_bytes,
                                     cudaMemcpyHostToDevice, gs.stream);
                     track_query_h2d(thread, exact_query_bytes);
@@ -532,7 +532,7 @@
                 } else {
                     thread->stats.query_host_staging_fallback_bytes +=
                         gate_indices.size() * VamanaNode::vector_bytes();
-                    const auto t_stage = std::chrono::steady_clock::now();
+                    const auto t_stage = breakdown_start(thread);
                     for (u32 i = 0; i < gate_indices.size(); ++i) {
                         std::memcpy(gs.h_candidate_vecs + i * VamanaNode::vector_bytes(),
                                     exact_vectors.host_buffers[i], VamanaNode::vector_bytes());
@@ -541,7 +541,7 @@
                     }
                     add_breakdown_subcategory(thread,
                         service::breakdown::Subcategory::cpu_query_stage_candidates, t_stage);
-                    const auto t_h2d = std::chrono::steady_clock::now();
+                    const auto t_h2d = breakdown_start(thread);
                     cudaMemcpyAsync(exact_staging, gs.h_candidate_vecs,
                                     gate_indices.size() * VamanaNode::vector_bytes(),
                                     cudaMemcpyHostToDevice, gs.stream);
@@ -550,7 +550,7 @@
                         service::breakdown::Subcategory::transfer_candidate_h2d, t_h2d);
                 }
 
-                const auto t_exact = std::chrono::steady_clock::now();
+                const auto t_exact = breakdown_start(thread);
                 if (observe_device_utilization_) begin_query_gpu_kernel_timing(gs);
                 gpu::launch_batch_typed_query_l2_distances(
                     gs.stream, gs.event, gs.d_query,
@@ -574,7 +574,7 @@
                 add_breakdown_subcategory(thread,
                     service::breakdown::Subcategory::gpu_query_distance, t_exact);
 
-                const auto t_d2h = std::chrono::steady_clock::now();
+                const auto t_d2h = breakdown_start(thread);
                 cudaMemcpyAsync(gs.h_distances, gs.d_distances,
                                 gate_indices.size() * sizeof(float),
                                 cudaMemcpyDeviceToHost, gs.stream);
@@ -582,7 +582,7 @@
                 cudaStreamSynchronize(gs.stream);
                 add_breakdown_subcategory(thread,
                     service::breakdown::Subcategory::transfer_distance_d2h, t_d2h);
-                const auto t_beam_update = std::chrono::steady_clock::now();
+                const auto t_beam_update = breakdown_start(thread);
                 const size_t beam_size_before_update = beam.size();
                 const distance_t best_before_update = best_beam_distance();
                 const distance_t cutoff_before_update = beam.size() >= beam_width_
@@ -666,7 +666,7 @@
             uint8_t* staging = gs.current_query_candidate_vecs();
             const u32 staging_lkey = gs.current_query_candidate_vecs_lkey();
 
-            const auto tvf = std::chrono::steady_clock::now();
+            const auto tvf = breakdown_start(thread);
             const auto vector_credit_waits_before = thread->stats.vector_rdma_credit_waits;
             const auto vector_completion_before =
                 thread->stats.vector_rdma_completion_token_waits;
@@ -708,7 +708,7 @@
                 } else {
                     thread->stats.query_host_staging_fallback_bytes +=
                         n_batch * VamanaNode::vector_bytes();
-                    const auto tsc = std::chrono::steady_clock::now();
+                    const auto tsc = breakdown_start(thread);
                     for (u32 i = 0; i < n_batch; ++i) {
                         std::memcpy(gs.h_candidate_vecs + i * VamanaNode::vector_bytes(),
                                     vr.host_buffers[i], VamanaNode::vector_bytes());
@@ -717,7 +717,7 @@
                     }
                     add_breakdown_subcategory(thread,
                         service::breakdown::Subcategory::cpu_query_stage_candidates, tsc);
-                    const auto th2d = std::chrono::steady_clock::now();
+                    const auto th2d = breakdown_start(thread);
                     cudaMemcpyAsync(staging, gs.h_candidate_vecs,
                         n_batch * VamanaNode::vector_bytes(),
                         cudaMemcpyHostToDevice, gs.stream);
@@ -736,7 +736,7 @@
                 thread->stats.vector_rdma_post_send_retries != vector_retries_before;
 
             // ── Phase 3: GPU ───────────────────────────────────────────
-            const auto t_gpu = std::chrono::steady_clock::now();
+            const auto t_gpu = breakdown_start(thread);
             if (use_local_rabitq_cache) {
                 thread->stats.query_rabitq_l0_candidates += n_batch;
                 const auto* rotated_query = static_cast<const f32*>(gs.h_query);
@@ -817,7 +817,7 @@
             pending_K = issue_plain_neighbor_reads(credit.precommit_width(), 0, true);
 
             if (!use_local_rabitq_cache) {
-                const auto t_d2h = std::chrono::steady_clock::now();
+                const auto t_d2h = breakdown_start(thread);
                 cudaMemcpyAsync(gs.h_distances, gs.d_distances,
                                 n_batch * sizeof(float),
                                 cudaMemcpyDeviceToHost, gs.stream);
@@ -875,13 +875,13 @@
                         refine_ptrs[i] = all_unvisited[gs.h_candidate_order[i]];
                     }
 
-                    const auto t_rerank_fetch = std::chrono::steady_clock::now();
+                    const auto t_rerank_fetch = breakdown_start(thread);
                     rdma::vamana::VectorBatchReadResult exact_vectors;
                     uint8_t* exact_staging = nullptr;
                     if (use_local_rabitq_cache) {
                         if (!exact_query_uploaded) {
                             const size_t exact_query_bytes = vector_dtype_bytes(query_dtype, dim_);
-                            const auto t_exact_query_h2d = std::chrono::steady_clock::now();
+                            const auto t_exact_query_h2d = breakdown_start(thread);
                             cudaMemcpyAsync(gs.d_query, query_data, exact_query_bytes,
                                             cudaMemcpyHostToDevice, gs.stream);
                             track_query_h2d(thread, exact_query_bytes);
@@ -926,7 +926,7 @@
                                             cudaMemcpyHostToDevice, gs.stream);
                             track_query_h2d(thread, refine_n * VamanaNode::vector_bytes());
                         }
-                        const auto t_rerank_gpu = std::chrono::steady_clock::now();
+                        const auto t_rerank_gpu = breakdown_start(thread);
                         if (observe_device_utilization_) begin_query_gpu_kernel_timing(gs);
                         gpu::launch_batch_typed_query_l2_distances(
                             gs.stream, gs.event, gs.d_query,
@@ -938,7 +938,7 @@
                         add_breakdown_subcategory(thread,
                             service::breakdown::Subcategory::gpu_query_rerank,
                             t_rerank_gpu);
-                        const auto t_rerank_d2h = std::chrono::steady_clock::now();
+                        const auto t_rerank_d2h = breakdown_start(thread);
                         cudaMemcpyAsync(gs.h_candidate_dists, gs.d_distances,
                                         refine_n * sizeof(float),
                                         cudaMemcpyDeviceToHost, gs.stream);
@@ -947,7 +947,7 @@
                         add_breakdown_subcategory(thread,
                             service::breakdown::Subcategory::transfer_rerank_d2h,
                             t_rerank_d2h);
-                        const auto t_rerank_update = std::chrono::steady_clock::now();
+                        const auto t_rerank_update = breakdown_start(thread);
                         for (u32 i = 0; i < refine_n; ++i) {
                             gs.h_distances[gs.h_candidate_order[i]] = gs.h_candidate_dists[i];
                         }
@@ -955,7 +955,7 @@
                             service::breakdown::Subcategory::cpu_query_rerank_update,
                             t_rerank_update);
                     } else {
-                        const auto t_rerank_update = std::chrono::steady_clock::now();
+                        const auto t_rerank_update = breakdown_start(thread);
                         for (u32 i = 0; i < refine_n; ++i) {
                             const u32 candidate_index = gs.h_candidate_order[i];
                             gs.h_distances[candidate_index] = distance_to_stored_vector<Distance>(
@@ -974,7 +974,7 @@
                 }
             }
 
-            const auto t_bu = std::chrono::steady_clock::now();
+            const auto t_bu = breakdown_start(thread);
             const size_t beam_size_before_update = beam.size();
             const distance_t best_before_update = best_beam_distance();
             const distance_t cutoff_before_update = beam.size() >= beam_width_
@@ -1015,7 +1015,7 @@
             }
         }
 
-        const auto t_beam_sort = std::chrono::steady_clock::now();
+        const auto t_beam_sort = breakdown_start(thread);
         std::sort(beam.begin(), beam.end(), [](const auto& a, const auto& b) { return a.distance < b.distance; });
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_query_beam_sort, t_beam_sort);
 
@@ -1028,7 +1028,7 @@
                 rerank_ptrs[i] = beam[i].rptr;
             if (!exact_query_uploaded) {
                 const size_t exact_query_bytes = vector_dtype_bytes(query_dtype, dim_);
-                const auto t_exact_query_h2d = std::chrono::steady_clock::now();
+                const auto t_exact_query_h2d = breakdown_start(thread);
                 cudaMemcpyAsync(gs.d_query, query_data, exact_query_bytes,
                                 cudaMemcpyHostToDevice, gs.stream);
                 track_query_h2d(thread, exact_query_bytes);
@@ -1039,7 +1039,7 @@
             }
             gs.flip_query_candidate_buffer();
             uint8_t* rerank_staging = gs.current_query_candidate_vecs();
-            const auto t_final_rerank_fetch = std::chrono::steady_clock::now();
+            const auto t_final_rerank_fetch = breakdown_start(thread);
             auto rvr = co_await rdma::vamana::batch_read_vectors(
                 rerank_ptrs, thread,
                 use_gpudirect_candidate_rdma ? rerank_staging : nullptr,
@@ -1065,7 +1065,7 @@
                                 cudaMemcpyHostToDevice, gs.stream);
                 track_query_h2d(thread, rerank_n * VamanaNode::vector_bytes());
             }
-            const auto t_final_rerank_gpu = std::chrono::steady_clock::now();
+            const auto t_final_rerank_gpu = breakdown_start(thread);
             if (observe_device_utilization_) begin_query_gpu_kernel_timing(gs);
             gpu::launch_batch_typed_query_l2_distances(
                 gs.stream, gs.event, gs.d_query,
@@ -1077,7 +1077,7 @@
             add_breakdown_subcategory(thread,
                 service::breakdown::Subcategory::gpu_query_rerank,
                 t_final_rerank_gpu);
-            const auto t_final_rerank_d2h = std::chrono::steady_clock::now();
+            const auto t_final_rerank_d2h = breakdown_start(thread);
             cudaMemcpyAsync(gs.h_candidate_dists, gs.d_distances,
                             rerank_n * sizeof(float),
                             cudaMemcpyDeviceToHost, gs.stream);
@@ -1086,7 +1086,7 @@
             add_breakdown_subcategory(thread,
                 service::breakdown::Subcategory::transfer_rerank_d2h,
                 t_final_rerank_d2h);
-            const auto t_final_rerank_update = std::chrono::steady_clock::now();
+            const auto t_final_rerank_update = breakdown_start(thread);
             for (u32 i = 0; i < rerank_n; ++i) {
                 beam[i].distance = gs.h_candidate_dists[i];
             }
@@ -1100,10 +1100,10 @@
             thread->stats.query_rabitq_l2_candidates += rerank_n;
         }
 
-        const auto t_finalize = std::chrono::steady_clock::now();
+        const auto t_finalize = breakdown_start(thread);
         auto& results = thread->query_results[q_id];
         results.clear();
-        const auto t_result_ids = std::chrono::steady_clock::now();
+        const auto t_result_ids = breakdown_start(thread);
         for (u32 i = 0; i < beam.size() && results.size() < k_; ++i) {
             if (direct_node_reads_) {
                 const node_t id = co_await rdma::vamana::read_vamana_id(beam[i].rptr, thread);
@@ -1114,7 +1114,7 @@
                 continue;
             }
             s_ptr<VamanaNode> node;
-            const auto t_node_read = std::chrono::steady_clock::now();
+            const auto t_node_read = breakdown_start(thread);
             auto coro = read_node(beam[i].rptr, node, thread, true);
             while (!coro.handle.done()) {
                 co_await std::suspend_always{};
@@ -1246,7 +1246,7 @@
             const vec<u32>* distance_offsets = &batch_offsets;
             u32 distance_n_batch = n_batch;
             if (use_rabitq_) {
-                const auto t_gate = std::chrono::steady_clock::now();
+                const auto t_gate = breakdown_start(thread);
                 gate_unvisited.clear();
                 gate_offsets[0] = 0;
                 const auto& quantization = rabitq_cache_->quantization();
@@ -1310,7 +1310,7 @@
             const u32 staging_lkey = gs.current_query_candidate_vecs_lkey();
             const bool use_gdr = gpu.gpudirect_candidate_ready() &&
                                  gs.d_candidate_vecs_rdma_registered;
-            const auto tvf = std::chrono::steady_clock::now();
+            const auto tvf = breakdown_start(thread);
             auto vr = co_await rdma::vamana::batch_read_vectors(
                 *distance_ptrs, thread,
                 use_gdr ? staging : nullptr, use_gdr ? staging_lkey : 0);
@@ -1323,7 +1323,7 @@
 
             // Phase 4: Q GPU kernels (one per query) + ONE D2H for all
             const size_t vec_sz = VamanaNode::vector_bytes();
-            const auto t_gpu = std::chrono::steady_clock::now();
+            const auto t_gpu = breakdown_start(thread);
             byte_t* batched_queries = static_cast<byte_t*>(gs.h_query);
             for (u32 q = 0; q < Q; ++q) {
                 std::memcpy(batched_queries + static_cast<size_t>(q) * q_bytes,
@@ -1354,7 +1354,7 @@
             thread->stats.query_distcomps += distance_n_batch;
 
             // Phase 5: D2H + per-query beam update
-            const auto t_d2h = std::chrono::steady_clock::now();
+            const auto t_d2h = breakdown_start(thread);
             cudaMemcpyAsync(gs.h_distances, gs.d_distances,
                             distance_n_batch * sizeof(float),
                             cudaMemcpyDeviceToHost, gs.stream);

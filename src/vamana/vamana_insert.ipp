@@ -14,32 +14,32 @@
             gpu.gpudirect_candidate_ready() && gs.d_candidate_vecs_rdma_registered;
 
         // Read medoid
-        const auto t_medoid_ptr = std::chrono::steady_clock::now();
+        const auto t_medoid_ptr = breakdown_start(thread);
         RemotePtr medoid_ptr = co_await rdma::vamana::read_medoid_ptr(thread);
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_medoid_ptr, t_medoid_ptr);
 
         // Handle first insert (empty index)
         if (medoid_ptr.is_null()) {
-            const auto t_alloc = std::chrono::steady_clock::now();
+            const auto t_alloc = breakdown_start(thread);
             RemotePtr new_ptr = co_await rdma::vamana::allocate_vamana_node(thread);
             if (inserted_ptr != nullptr) *inserted_ptr = new_ptr;
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_alloc, t_alloc);
 
             // Write node with no neighbors.
-            const auto t_write = std::chrono::steady_clock::now();
+            const auto t_write = breakdown_start(thread);
             s_ptr<VamanaNode> new_node = co_await rdma::vamana::write_vamana_node(
                 new_ptr, id, components, span<RemotePtr>{},
                 0, false, false, thread);
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_new_node_write, t_write);
 
             // Try to set as medoid
-            const auto t_medoid_update = std::chrono::steady_clock::now();
+            const auto t_medoid_update = breakdown_start(thread);
             RemotePtr old_medoid = co_await rdma::vamana::swap_medoid_ptr(
                 RemotePtr{}, new_ptr, thread);
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_medoid_update, t_medoid_update);
             if (old_medoid.is_null()) {
                 // Success — we set the medoid
-                const auto t_header_write = std::chrono::steady_clock::now();
+                const auto t_header_write = breakdown_start(thread);
                 co_await rdma::vamana::write_vamana_header(new_ptr, true, false, false, thread);
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_header_write, t_header_write);
                 co_return;
@@ -51,7 +51,7 @@
         // Phase 1: Beam search for candidate neighbors
         s_ptr<VamanaNode> medoid_node;
         {
-            const auto t_node_read = std::chrono::steady_clock::now();
+            const auto t_node_read = breakdown_start(thread);
             auto coro = read_node(medoid_ptr, medoid_node, thread, true);
             while (!coro.handle.done()) {
                 co_await std::suspend_always{};
@@ -60,7 +60,7 @@
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_node_read, t_node_read);
         }
 
-        const auto t_insert_init = std::chrono::steady_clock::now();
+        const auto t_insert_init = breakdown_start(thread);
         distance_t medoid_dist = distance_to_stored_vector<Distance>(components, medoid_node->vector_data());
         ++thread->stats.distcomps;
         ++thread->stats.build_distcomps;
@@ -73,7 +73,7 @@
 
         // Beam search using full L2 distances (exact, not RaBitQ)
         // Upload query vector once
-        const auto t_insert_query_h2d = std::chrono::steady_clock::now();
+        const auto t_insert_query_h2d = breakdown_start(thread);
         std::memcpy(gs.h_query, components.data(), dim_ * sizeof(float));
         cudaMemcpyAsync(gs.d_query, gs.h_query, dim_ * sizeof(float),
                        cudaMemcpyHostToDevice, gs.stream);
@@ -81,7 +81,7 @@
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::transfer_insert_query_h2d, t_insert_query_h2d);
 
         while (true) {
-            const auto t_select = std::chrono::steady_clock::now();
+            const auto t_select = breakdown_start(thread);
             i32 best_idx = -1;
             distance_t best_dist = std::numeric_limits<distance_t>::max();
             for (i32 i = 0; i < static_cast<i32>(beam.size()); ++i) {
@@ -95,14 +95,14 @@
 
             beam[best_idx].expanded = true;
 
-            const auto t_neighbor_fetch = std::chrono::steady_clock::now();
+            const auto t_neighbor_fetch = breakdown_start(thread);
             s_ptr<VamanaNeighborlist> nlist =
                 co_await rdma::vamana::read_vamana_neighbors(
                     beam[best_idx].rptr, &thread);
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_neighbor_fetch, t_neighbor_fetch);
             ++thread->stats.visited_neighborlists;
 
-            const auto t_filter = std::chrono::steady_clock::now();
+            const auto t_filter = breakdown_start(thread);
             vec<RemotePtr> unvisited;
             for (const RemotePtr& n_ptr : nlist->view()) {
                 if (n_ptr.is_null()) continue;
@@ -117,7 +117,7 @@
 
             // Batch read full vectors for exact distance
             const u32 n_batch = unvisited.size();
-            const auto t_vector_fetch = std::chrono::steady_clock::now();
+            const auto t_vector_fetch = breakdown_start(thread);
             auto vec_read = co_await rdma::vamana::batch_read_vectors(
                 unvisited, thread,
                 use_gpudirect_candidate_rdma ? gs.d_candidate_vecs : nullptr,
@@ -125,7 +125,7 @@
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_vector_fetch, t_vector_fetch);
 
             if (!vec_read.direct_to_gpu) {
-                const auto t_stage_candidates = std::chrono::steady_clock::now();
+                const auto t_stage_candidates = breakdown_start(thread);
                 for (u32 i = 0; i < n_batch; ++i) {
                     std::memcpy(gs.h_candidate_vecs + static_cast<size_t>(i) * VamanaNode::vector_bytes(),
                                 vec_read.host_buffers[i],
@@ -134,7 +134,7 @@
                 }
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_stage_candidates, t_stage_candidates);
 
-                const auto t_candidate_h2d = std::chrono::steady_clock::now();
+                const auto t_candidate_h2d = breakdown_start(thread);
                 cudaMemcpyAsync(gs.d_candidate_vecs, gs.h_candidate_vecs,
                                 static_cast<size_t>(n_batch) * VamanaNode::vector_bytes(),
                                 cudaMemcpyHostToDevice, gs.stream);
@@ -142,7 +142,7 @@
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::transfer_candidate_h2d, t_candidate_h2d);
             }
 
-            const auto t_gpu_distance = std::chrono::steady_clock::now();
+            const auto t_gpu_distance = breakdown_start(thread);
             gpu::launch_batch_typed_l2_distances(
                 gs.stream, gs.event,
                 static_cast<const float*>(gs.d_query), gs.d_candidate_vecs,
@@ -152,7 +152,7 @@
             co_await gpu::GpuAwaitable{thread.get()};
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::gpu_insert_distance, t_gpu_distance);
 
-            const auto t_dist_d2h = std::chrono::steady_clock::now();
+            const auto t_dist_d2h = breakdown_start(thread);
             cudaMemcpyAsync(gs.h_distances, gs.d_distances,
                            n_batch * sizeof(float),
                            cudaMemcpyDeviceToHost, gs.stream);
@@ -160,7 +160,7 @@
             cudaStreamSynchronize(gs.stream);
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::transfer_distance_d2h, t_dist_d2h);
 
-            const auto t_beam_update = std::chrono::steady_clock::now();
+            const auto t_beam_update = breakdown_start(thread);
             for (u32 i = 0; i < n_batch; ++i) {
                 ++thread->stats.distcomps;
                 ++thread->stats.build_distcomps;
@@ -172,7 +172,7 @@
         }
 
         // Phase 2: GPU RobustPrune to select R neighbors
-        const auto t_preprune_sort = std::chrono::steady_clock::now();
+        const auto t_preprune_sort = breakdown_start(thread);
         std::sort(beam.begin(), beam.end(),
                   [](const auto& a, const auto& b) { return a.distance < b.distance; });
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_preprune_sort, t_preprune_sort);
@@ -180,7 +180,7 @@
         const u32 n_candidates = beam.size();
 
         // Collect candidate RemotePtrs and distances (already sorted)
-        const auto t_candidate_collect = std::chrono::steady_clock::now();
+        const auto t_candidate_collect = breakdown_start(thread);
         vec<RemotePtr> candidate_rptrs;
         candidate_rptrs.reserve(n_candidates);
         for (auto& entry : beam) {
@@ -189,7 +189,7 @@
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_candidate_collect, t_candidate_collect);
 
         // Batch read full vectors for all candidates (for RobustPrune)
-        const auto t_candidate_fetch = std::chrono::steady_clock::now();
+        const auto t_candidate_fetch = breakdown_start(thread);
         auto candidate_read = co_await rdma::vamana::batch_read_vectors(
             candidate_rptrs,
             thread,
@@ -198,7 +198,7 @@
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_candidate_fetch, t_candidate_fetch);
 
         // Stage to GPU: candidate vectors + distances
-        const auto t_candidate_sort = std::chrono::steady_clock::now();
+        const auto t_candidate_sort = breakdown_start(thread);
         if (!candidate_read.direct_to_gpu) {
             for (u32 i = 0; i < n_candidates; ++i) {
                 std::memcpy(gs.h_candidate_vecs + static_cast<size_t>(i) * VamanaNode::vector_bytes(),
@@ -212,8 +212,8 @@
         }
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_candidate_sort, t_candidate_sort);
 
-        const auto t_prune_prepare = std::chrono::steady_clock::now();
-        const auto t_prune_h2d = std::chrono::steady_clock::now();
+        const auto t_prune_prepare = breakdown_start(thread);
+        const auto t_prune_h2d = breakdown_start(thread);
         if (!candidate_read.direct_to_gpu) {
             cudaMemcpyAsync(gs.d_candidate_vecs, gs.h_candidate_vecs,
                            static_cast<size_t>(n_candidates) * VamanaNode::vector_bytes(),
@@ -228,7 +228,7 @@
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_prune_prepare, t_prune_prepare);
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::transfer_prune_h2d, t_prune_h2d);
 
-        const auto t_gpu_prune = std::chrono::steady_clock::now();
+        const auto t_gpu_prune = breakdown_start(thread);
         gpu::launch_robust_prune_typed(
             gs.stream, gs.event,
             gs.d_candidate_vecs,
@@ -241,7 +241,7 @@
         co_await gpu::GpuAwaitable{thread.get()};
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::gpu_insert_prune, t_gpu_prune);
 
-        const auto t_prune_d2h = std::chrono::steady_clock::now();
+        const auto t_prune_d2h = breakdown_start(thread);
         cudaMemcpyAsync(gs.h_pruned_indices, gs.d_pruned_indices,
                        R_ * sizeof(uint32_t),
                        cudaMemcpyDeviceToHost, gs.stream);
@@ -255,7 +255,7 @@
         const u32 pruned_count = *gs.h_pruned_count;
 
         // Map pruned indices back to RemotePtrs
-        const auto t_pruned_collect = std::chrono::steady_clock::now();
+        const auto t_pruned_collect = breakdown_start(thread);
         vec<RemotePtr> selected_neighbors;
         selected_neighbors.reserve(pruned_count);
         for (u32 i = 0; i < pruned_count; ++i) {
@@ -267,12 +267,12 @@
         // Free candidate vector buffers (bump allocator; no individual free)
 
         // Phase 3: Allocate and write new node
-        const auto t_alloc = std::chrono::steady_clock::now();
+        const auto t_alloc = breakdown_start(thread);
         RemotePtr new_ptr = co_await rdma::vamana::allocate_vamana_node(thread);
         if (inserted_ptr != nullptr) *inserted_ptr = new_ptr;
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_alloc, t_alloc);
 
-        const auto t_new_write = std::chrono::steady_clock::now();
+        const auto t_new_write = breakdown_start(thread);
         s_ptr<VamanaNode> new_node = co_await rdma::vamana::write_vamana_node(
             new_ptr, id, components,
             span<RemotePtr>{selected_neighbors.data(), selected_neighbors.size()},
@@ -282,12 +282,12 @@
         // Phase 5: Update reverse edges (bidirectional connectivity)
         for (const RemotePtr& neighbor_ptr : selected_neighbors) {
             // Lock the neighbor
-            const auto t_neighbor_node_read = std::chrono::steady_clock::now();
+            const auto t_neighbor_node_read = breakdown_start(thread);
             s_ptr<VamanaNode> neighbor_node =
                 co_await rdma::vamana::read_vamana_node_prefix(neighbor_ptr, thread);
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_neighbor_node_read, t_neighbor_node_read);
             {
-                const auto t_neighbor_lock = std::chrono::steady_clock::now();
+                const auto t_neighbor_lock = breakdown_start(thread);
                 auto coro = rdma::vamana::spinlock_vamana_node(neighbor_node, thread);
                 while (!coro.handle.done()) {
                     co_await std::suspend_always{};
@@ -297,7 +297,7 @@
             }
 
             // Read neighbor's neighbor list (mutable: may call add() later)
-            const auto t_neighbor_list_read = std::chrono::steady_clock::now();
+            const auto t_neighbor_list_read = breakdown_start(thread);
             s_ptr<VamanaNeighborlist> neighbor_nlist =
                 co_await rdma::vamana::read_vamana_neighbors(
                     neighbor_ptr, &thread);
@@ -305,12 +305,12 @@
 
             if (neighbor_nlist->num_neighbors() < R_) {
                 // Room available — just append
-                const auto t_neighbor_prepare = std::chrono::steady_clock::now();
+                const auto t_neighbor_prepare = breakdown_start(thread);
                 neighbor_nlist->add(new_ptr);
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_neighbor_prepare, t_neighbor_prepare);
 
                 // Write updated neighbor list
-                const auto t_neighbor_list_write = std::chrono::steady_clock::now();
+                const auto t_neighbor_list_write = breakdown_start(thread);
                 co_await rdma::vamana::write_vamana_neighbors(
                     neighbor_node,
                     neighbor_nlist->view(),
@@ -320,8 +320,8 @@
             } else {
                 // Need to prune: gather all candidate neighbors + new node
                 ++thread->stats.build_overflow_prunes;
-                const auto t_overflow_prepare = std::chrono::steady_clock::now();
-                const auto t_neighbor_collect = std::chrono::steady_clock::now();
+                const auto t_overflow_prepare = breakdown_start(thread);
+                const auto t_neighbor_collect = breakdown_start(thread);
                 vec<RemotePtr> all_candidate_ptrs;
                 all_candidate_ptrs.reserve(neighbor_nlist->num_neighbors() + 1);
                 for (const auto& n : neighbor_nlist->view()) {
@@ -363,7 +363,7 @@
                 for (u32 i = 0; i + 1 < n_all; ++i) {
                     remote_candidate_ptrs.push_back(all_candidate_ptrs[i]);
                 }
-                const auto t_overflow_vec_fetch = std::chrono::steady_clock::now();
+                const auto t_overflow_vec_fetch = breakdown_start(thread);
                 auto remote_vec_read = co_await rdma::vamana::batch_read_vectors(remote_candidate_ptrs, thread);
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_overflow_vec_fetch, t_overflow_vec_fetch);
                 for (u32 i = 0; i + 1 < n_all; ++i) {
@@ -371,7 +371,7 @@
                 }
 
                 // Upload neighbor's vector as query for prune
-                const auto t_overflow_query_h2d = std::chrono::steady_clock::now();
+                const auto t_overflow_query_h2d = breakdown_start(thread);
                 decode_storage_vector_to_float(neighbor_node->vector_data(), VamanaNode::vector_dtype(), dim_,
                                                static_cast<float*>(gs.h_query));
                 cudaMemcpyAsync(gs.d_query, gs.h_query, dim_ * sizeof(float),
@@ -380,7 +380,7 @@
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::transfer_overflow_query_h2d, t_overflow_query_h2d);
 
                 // Compute distances from neighbor to all candidates
-                const auto t_stage_overflow = std::chrono::steady_clock::now();
+                const auto t_stage_overflow = breakdown_start(thread);
                 for (u32 i = 0; i < n_all; ++i) {
                     if (i + 1 == n_all) {
                         encode_float_vector_to_storage(components.data(), dim_, VamanaNode::vector_dtype(),
@@ -393,14 +393,14 @@
                 }
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_stage_candidates, t_stage_overflow);
 
-                const auto t_overflow_candidate_h2d = std::chrono::steady_clock::now();
+                const auto t_overflow_candidate_h2d = breakdown_start(thread);
                 cudaMemcpyAsync(gs.d_candidate_vecs, gs.h_candidate_vecs,
                                static_cast<size_t>(n_all) * VamanaNode::vector_bytes(),
                                cudaMemcpyHostToDevice, gs.stream);
                 track_build_h2d(thread, static_cast<u64>(n_all) * VamanaNode::vector_bytes());
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::transfer_overflow_candidate_h2d, t_overflow_candidate_h2d);
 
-                const auto t_overflow_gpu_distance = std::chrono::steady_clock::now();
+                const auto t_overflow_gpu_distance = breakdown_start(thread);
                 gpu::launch_batch_typed_l2_distances(
                     gs.stream, gs.event,
                     static_cast<const float*>(gs.d_query), gs.d_candidate_vecs,
@@ -410,7 +410,7 @@
                 co_await gpu::GpuAwaitable{thread.get()};
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::gpu_insert_overflow_distance, t_overflow_gpu_distance);
 
-                const auto t_overflow_dist_d2h = std::chrono::steady_clock::now();
+                const auto t_overflow_dist_d2h = breakdown_start(thread);
                 cudaMemcpyAsync(gs.h_distances, gs.d_distances,
                                n_all * sizeof(float),
                                cudaMemcpyDeviceToHost, gs.stream);
@@ -421,7 +421,7 @@
                 thread->stats.build_distcomps += n_all;
 
                 // Sort candidates by distance
-                const auto t_overflow_cpu = std::chrono::steady_clock::now();
+                const auto t_overflow_cpu = breakdown_start(thread);
                 vec<std::pair<u32, float>> idx_dist;
                 idx_dist.reserve(n_all);
                 for (u32 i = 0; i < n_all; ++i) {
@@ -440,7 +440,7 @@
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_overflow_prepare, t_overflow_cpu);
 
                 // Upload sorted distances and the corresponding original candidate order.
-                const auto t_overflow_prune_inputs_h2d = std::chrono::steady_clock::now();
+                const auto t_overflow_prune_inputs_h2d = breakdown_start(thread);
                 cudaMemcpyAsync(gs.d_candidate_dists, gs.h_candidate_dists,
                                n_all * sizeof(float),
                                cudaMemcpyHostToDevice, gs.stream);
@@ -454,7 +454,7 @@
                     thread->buffer_allocator.free_buffer(all_vec_bufs[i], VamanaNode::vector_bytes());
                 }
 
-                const auto t_overflow_gpu_prune = std::chrono::steady_clock::now();
+                const auto t_overflow_gpu_prune = breakdown_start(thread);
                 gpu::launch_robust_prune_typed(
                     gs.stream, gs.event,
                     gs.d_candidate_vecs,
@@ -467,7 +467,7 @@
                 co_await gpu::GpuAwaitable{thread.get()};
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::gpu_insert_overflow_prune, t_overflow_gpu_prune);
 
-                const auto t_overflow_prune_d2h = std::chrono::steady_clock::now();
+                const auto t_overflow_prune_d2h = breakdown_start(thread);
                 cudaMemcpyAsync(gs.h_pruned_indices, gs.d_pruned_indices,
                                R_ * sizeof(uint32_t),
                                cudaMemcpyDeviceToHost, gs.stream);
@@ -478,7 +478,7 @@
                 cudaStreamSynchronize(gs.stream);
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::transfer_overflow_prune_d2h, t_overflow_prune_d2h);
 
-                const auto t_pruned_collect = std::chrono::steady_clock::now();
+                const auto t_pruned_collect = breakdown_start(thread);
                 u32 new_count = *gs.h_pruned_count;
                 vec<RemotePtr> pruned_neighbors;
                 pruned_neighbors.reserve(new_count);
@@ -487,7 +487,7 @@
                 }
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_pruned_neighbor_collect, t_pruned_collect);
 
-                const auto t_pruned_neighbor_write = std::chrono::steady_clock::now();
+                const auto t_pruned_neighbor_write = breakdown_start(thread);
                 co_await rdma::vamana::write_vamana_neighbors(
                     neighbor_node,
                     span<RemotePtr>{pruned_neighbors.data(), pruned_neighbors.size()},
@@ -499,12 +499,12 @@
             }
 
             // Unlock neighbor
-            const auto t_neighbor_unlock = std::chrono::steady_clock::now();
+            const auto t_neighbor_unlock = breakdown_start(thread);
             co_await rdma::vamana::unlock_vamana_node(neighbor_node, thread);
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_neighbor_unlock, t_neighbor_unlock);
         }
 
-        const auto t_insert_finalize = std::chrono::steady_clock::now();
+        const auto t_insert_finalize = breakdown_start(thread);
         beam.clear();
         visited.clear();
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_finalize, t_insert_finalize);

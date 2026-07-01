@@ -50,9 +50,17 @@ private:
         thread->stats.build_d2h_bytes += bytes;
     }
 
+    static std::chrono::steady_clock::time_point breakdown_start(
+                                    const u_ptr<ComputeThread>& thread) {
+        return thread->current_breakdown_sample() == nullptr
+            ? std::chrono::steady_clock::time_point{}
+            : std::chrono::steady_clock::now();
+    }
+
     static void add_breakdown_subcategory(const u_ptr<ComputeThread>& thread,
                                     const service::breakdown::Subcategory subcategory,
                                     const std::chrono::steady_clock::time_point start) {
+        if (start == std::chrono::steady_clock::time_point{}) return;
         if (auto* sample = thread->current_breakdown_sample()) {
             const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - start).count();

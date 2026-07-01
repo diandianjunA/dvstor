@@ -81,9 +81,6 @@ void vamana_service_schedule_inserts(vamana::Vamana<Distance>& vamana_idx,
         InsertRequest* req = nullptr;
         if (queue.try_dequeue(req)) {
           all_idle = false;
-          const auto queue_wait = std::chrono::steady_clock::now() - req->enqueued_at;
-          thread->stats.insert_queue_wait_ns +=
-            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(queue_wait).count());
 
           auto slot_components = staging.get_components(cid);
           std::copy(req->components.begin(), req->components.end(), slot_components.begin());
@@ -92,6 +89,9 @@ void vamana_service_schedule_inserts(vamana::Vamana<Distance>& vamana_idx,
           thread->set_active_sample(cid, req->breakdown_sample.get());
           if (req->breakdown_sample) {
             const auto now = std::chrono::steady_clock::now();
+            const auto queue_wait = now - req->enqueued_at;
+            thread->stats.insert_queue_wait_ns +=
+              static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(queue_wait).count());
             req->breakdown_sample->enqueued_at = req->enqueued_at;
             req->breakdown_sample->mark_started(now, now, thread->stats);
           }
@@ -194,14 +194,14 @@ void vamana_service_schedule_queries(vamana::Vamana<Distance>& vamana_idx,
         QueryRequest* req = nullptr;
         if (queue.try_dequeue(req)) {
           all_idle = false;
-          const auto queue_wait = std::chrono::steady_clock::now() - req->enqueued_at;
-          thread->stats.query_queue_wait_ns +=
-            static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(queue_wait).count());
 
           active_requests[cid] = req;
           thread->set_active_sample(cid, req->breakdown_sample.get());
           if (req->breakdown_sample) {
             const auto now = std::chrono::steady_clock::now();
+            const auto queue_wait = now - req->enqueued_at;
+            thread->stats.query_queue_wait_ns +=
+              static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(queue_wait).count());
             req->breakdown_sample->enqueued_at = req->enqueued_at;
             req->breakdown_sample->mark_started(now, now, thread->stats);
           }

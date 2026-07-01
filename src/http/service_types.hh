@@ -26,7 +26,7 @@ struct InsertRequest {
   RemotePtr old_ptr{};
   RemotePtr new_ptr{};
   std::promise<bool> result;
-  std::chrono::steady_clock::time_point enqueued_at{std::chrono::steady_clock::now()};
+  std::chrono::steady_clock::time_point enqueued_at{};
   std::shared_ptr<breakdown::Sample> breakdown_sample{};
 };
 
@@ -36,7 +36,7 @@ struct QueryRequest {
   VectorDType query_dtype{VectorDType::float32};
   u32 k{};
   std::promise<QueryResult> result;
-  std::chrono::steady_clock::time_point enqueued_at{std::chrono::steady_clock::now()};
+  std::chrono::steady_clock::time_point enqueued_at{};
   std::shared_ptr<breakdown::Sample> breakdown_sample{};
 };
 

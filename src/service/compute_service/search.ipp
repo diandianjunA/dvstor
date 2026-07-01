@@ -6,16 +6,18 @@ typename ComputeService<Distance>::LocalMainSearchOutput ComputeService<Distance
   }
 
   std::shared_ptr<service::breakdown::Sample> sample;
+  std::chrono::steady_clock::time_point enqueued_at{};
   if (breakdown_enabled_) {
     sample = std::make_shared<service::breakdown::Sample>(service::breakdown::Operation::query);
-    sample->enqueued_at = std::chrono::steady_clock::now();
+    enqueued_at = std::chrono::steady_clock::now();
+    sample->enqueued_at = enqueued_at;
   }
 
   auto* request = new service::QueryRequest{};
   request->components = query;
   request->query_dtype = VectorDType::float32;
   request->k = k;
-  request->enqueued_at = std::chrono::steady_clock::now();
+  request->enqueued_at = enqueued_at;
   request->breakdown_sample = sample;
   auto future = request->result.get_future();
   query_queue_.enqueue(request);
@@ -56,16 +58,18 @@ typename ComputeService<Distance>::LocalMainSearchOutput ComputeService<Distance
   }
 
   std::shared_ptr<service::breakdown::Sample> sample;
+  std::chrono::steady_clock::time_point enqueued_at{};
   if (breakdown_enabled_) {
     sample = std::make_shared<service::breakdown::Sample>(service::breakdown::Operation::query);
-    sample->enqueued_at = std::chrono::steady_clock::now();
+    enqueued_at = std::chrono::steady_clock::now();
+    sample->enqueued_at = enqueued_at;
   }
 
   auto* request = new service::QueryRequest{};
   request->raw_components.assign(query_data, query_data + vector_dtype_bytes(query_dtype, config_.dim));
   request->query_dtype = query_dtype;
   request->k = k;
-  request->enqueued_at = std::chrono::steady_clock::now();
+  request->enqueued_at = enqueued_at;
   request->breakdown_sample = sample;
   auto future = request->result.get_future();
   query_queue_.enqueue(request);
@@ -174,4 +178,3 @@ vec<node_t> ComputeService<Distance>::search(const vec<element_t>& query, u32 k)
   enqueue_rpc(outbound);
   return future.get();
 }
-

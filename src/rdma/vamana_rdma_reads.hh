@@ -512,11 +512,14 @@ inline VectorBatchReadAwaitable batch_read_vectors(const vec<RemotePtr>& node_rp
             wrs[i].next = i + 1 < wr_count ? &wrs[i + 1] : nullptr;
         }
 
-        const auto wait_start = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point wait_start{};
         bool waited_for_credit = false;
         u32 selected_qp = chunk.qp_index;
         while (!thread->ctx->try_reserve_bulk_qp_wrs(
             chunk.memory_node, chunk.qp_index, wr_count, selected_qp)) {
+            if (!waited_for_credit) {
+                wait_start = std::chrono::steady_clock::now();
+            }
             waited_for_credit = true;
             thread->poll_cq();
             std::this_thread::yield();

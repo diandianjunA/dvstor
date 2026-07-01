@@ -247,7 +247,7 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
 
 
 inline nlohmann::json report_to_json(const Report& report) {
-  nlohmann::json out;
+  nlohmann::json out = nlohmann::json::object();
   if (report.has_query()) {
     out["query_breakdown"] = aggregate_to_json(report.query);
   }
