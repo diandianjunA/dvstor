@@ -1,0 +1,19 @@
+throughput
+  duration_seconds: 120
+  total_ops_per_sec: 1575.08 (ops=189010)
+  query_ops_per_sec: 1491.27 (ops=178952)
+  write_ops_per_sec: 83.8167 (ops=10058)
+  write_mix_completed: insert=4953 upsert=4046 delete=1059
+recall
+  recall@10: 0.8851
+  queries: 1000
+  passed: true
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+insert breakdown
+  count: 4953
+  latency_ms: mean=106.552 p50=108.749 p95=130.54 p99=154.878
+  fine_grained_breakdown: disabled
+query breakdown
+  count: 178952
+  latency_ms: mean=5.28577 p50=5.11429 p95=7.20581 p99=8.40229
+  fine_grained_breakdown: disabled

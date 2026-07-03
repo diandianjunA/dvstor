@@ -23,7 +23,7 @@ dvstor/
 │   ├── vamana_offline_builder.cc   # Offline index builder
 │   ├── vamana_metis_repartitioner.cc # METIS graph partitioning tool
 │   └── run_recall_test.sh  # Recall evaluation helper
-├── evaluation/             # Evaluation harnesses (SIFT100M, SIFT1B)
+├── experiment/             # SIFT100M experiment harness, profiles, and reports
 ├── rdma-library/           # RDMA low-level library (QP management, memory registration)
 ├── thirdparty/             # Bundled third-party libraries (httplib, nlohmann/json, xoshiro)
 ├── structure/              # Architecture documentation (30-course series in Chinese)
@@ -100,22 +100,22 @@ Additional CMake options:
 
 ## Data Preparation
 
-### SIFT100M / SIFT1B Datasets
+### SIFT100M Dataset
 
-Evaluation scripts for SIFT100M and SIFT1B are provided under `evaluation/`. Each evaluation directory contains a self-contained harness:
+Experiment scripts for SIFT100M are provided under `experiment/`:
 
 ```bash
 # Convert SIFT data to DVSTOR format (adjust paths inside the script first)
-python3 evaluation/sift100m/convert_sift100m.py
+python3 experiment/convert_sift100m.py
 
-# Build the offline index (default: 5-shard BFS)
-./evaluation/sift100m/build_sift100m_index.sh
+# Build the offline index
+./experiment/build_sift100m_index.sh
 
 # Quick test with reduced scale:
-MAX_VECTORS=1000000 GROUNDTRUTH_LABEL=1M ./evaluation/sift100m/build_sift100m_index.sh
+MAX_VECTORS=1000000 GROUNDTRUTH_LABEL=1M ./experiment/build_sift100m_index.sh
 ```
 
-See `evaluation/sift100m/README.md` and `evaluation/sift1b/README.md` for full details on data preparation, memory defaults, and configuration options.
+See `experiment/README.md` for experiment profiles, memory defaults, and configuration options.
 
 ### Custom Dataset
 
@@ -123,37 +123,43 @@ For custom datasets, use `vamana_offline_builder` directly (see "Offline Build A
 
 ## Run the Experiments
 
-The evaluation harnesses under `evaluation/sift100m/` and `evaluation/sift1b/` support multiple optimization profiles (baseline, gpudirect_rdma, gpudirect_rdma_storage_owner). Each profile has a corresponding INI config and environment file.
+The experiment harness under `experiment/` supports the ablation profiles in
+`experiment/profiles/`. Each run writes the generated service config and reports
+under `experiment/reports/<profile>/`.
 
 ### Quick Start: SIFT100M
 
 ```bash
 # 1. Build the index
-./evaluation/sift100m/build_sift100m_index.sh
+./experiment/build_sift100m_index.sh
 
 # 2. Start memory nodes with a profile
-./evaluation/sift100m/start_all_memory_nodes.sh baseline
+./experiment/start_all_memory_nodes.sh 00_baseline
 
 # 3. Run recall evaluation
-./evaluation/sift100m/run_recall.sh baseline
+./experiment/run_recall.sh 00_baseline
 
 # 4. Run breakdown benchmark (throughput/latency profiling)
-./evaluation/sift100m/run_breakdown.sh baseline
+./experiment/run_breakdown.sh 00_baseline
 
 # 5. Stop memory nodes
-./evaluation/sift100m/stop_memory_nodes.sh
+./experiment/stop_memory_nodes.sh
 ```
 
 ### Optimization Profiles
 
 ```bash
-# GPU-Direct RDMA profile
-./evaluation/sift100m/start_all_memory_nodes.sh gpudirect_rdma
-./evaluation/sift100m/run_breakdown.sh gpudirect_rdma
+# RaBitQ-aware GPU query pipeline
+./experiment/start_all_memory_nodes.sh 01_rabitq_expension_aware
+./experiment/run_breakdown.sh 01_rabitq_expension_aware
 
-# GPU-Direct RDMA + storage owner profile
-./evaluation/sift100m/start_all_memory_nodes.sh gpudirect_rdma_storage_owner
-./evaluation/sift100m/run_breakdown.sh gpudirect_rdma_storage_owner
+# RaBitQ + ALDI + locality-oriented placement
+./experiment/start_all_memory_nodes.sh 02_rabitq_expension_aware_aldi
+./experiment/run_breakdown.sh 02_rabitq_expension_aware_aldi
+
+# RaBitQ + ALDI + adaptive RDMA scheduling
+./experiment/start_all_memory_nodes.sh 03_rabitq_gpu_pipeline_aldi_rdma
+./experiment/run_breakdown.sh 03_rabitq_gpu_pipeline_aldi_rdma
 ```
 
 ### Common Overrides
@@ -161,14 +167,14 @@ The evaluation harnesses under `evaluation/sift100m/` and `evaluation/sift1b/` s
 ```bash
 # Specify cluster hosts
 HOSTS="mn1 mn2 mn3 mn4 mn5" BASE_PORT=1234 IB_DEVICE=mlx5_0 \
-  ./evaluation/sift100m/start_all_memory_nodes.sh baseline
+  ./experiment/start_all_memory_nodes.sh 00_baseline
 
 # Different partition strategy
-PARTITION_STRATEGY=metis ./evaluation/sift100m/build_sift100m_index.sh
+PARTITION_STRATEGY=metis ./experiment/build_sift100m_index.sh
 
 # Query-only workload
 WORKLOAD=query WARMUP_SECONDS=10 MEASURE_SECONDS=60 \
-  ./evaluation/sift100m/run_breakdown.sh gpudirect_rdma
+  ./experiment/run_breakdown.sh 01_rabitq_expension_aware
 ```
 
 ### Breakdown Benchmark Tool
@@ -177,7 +183,7 @@ The `dvstor_breakdown_benchmark` binary provides detailed performance breakdowns
 
 ```bash
 ./build/dvstor_breakdown_benchmark \
-  --service-config ./evaluation/sift100m/configs/baseline.ini \
+  --service-config ./experiment/reports/00_baseline/service_<timestamp>.ini \
   --workload mixed \
   --client-threads 16 \
   --read-ratio 0.5 \

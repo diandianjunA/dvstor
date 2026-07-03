@@ -18,7 +18,7 @@ PORT=$((BASE_PORT + NODE_ID - 1))
 SHARD_FILE="$(shard_file "$NODE_ID")"
 if [[ ! -f "$SHARD_FILE" ]]; then
   echo "missing shard file: $SHARD_FILE" >&2
-  echo "build it first with: $EVALUATION_DIR/build_sift100m_index.sh" >&2
+  echo "build it first with: $EXPERIMENT_DIR/build_sift100m_index.sh" >&2
   exit 1
 fi
 
@@ -85,4 +85,3 @@ printf '[memory-node-%s] command:' "$NODE_ID"; printf ' %q' "${cmd[@]}"; echo
 nohup "${cmd[@]}" > "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
 echo "memory node $NODE_ID started: pid $(cat "$PID_FILE"), log $LOG_FILE"
-

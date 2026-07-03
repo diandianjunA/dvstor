@@ -7,7 +7,7 @@ PROFILE="${1:-${PROFILE:-00_baseline}}"
 load_experiment_profile "$PROFILE"
 
 ensure_built dvstor_breakdown_benchmark
-PREPARE_BASE="${PREPARE_BASE:-0}" "$EVALUATION_DIR/prepare_sift100m_data.sh"
+PREPARE_BASE="${PREPARE_BASE:-0}" "$EXPERIMENT_DIR/prepare_sift100m_data.sh"
 
 RECALL_QUERIES="${RECALL_QUERIES:-1000}"
 RECALL_K="${RECALL_K:-$K}"
@@ -38,4 +38,3 @@ printf '[recall] profile=%s command:' "$PROFILE"; printf ' %q' "${cmd[@]}"; echo
 "${cmd[@]}"
 echo "json: $JSON_REPORT"
 echo "text: $TEXT_REPORT"
-

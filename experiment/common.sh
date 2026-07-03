@@ -3,13 +3,12 @@ set -euo pipefail
 
 EXPERIMENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$EXPERIMENT_DIR/.." && pwd)"
-EVALUATION_DIR="$PROJECT_DIR/evaluation/sift100m"
 
 REPORT_DIR="${REPORT_DIR:-$EXPERIMENT_DIR/reports}"
 LOG_DIR="${LOG_DIR:-$EXPERIMENT_DIR/logs}"
 PID_DIR="${PID_DIR:-$EXPERIMENT_DIR/pids}"
 
-source "$EVALUATION_DIR/sift100m_common.sh"
+source "$EXPERIMENT_DIR/sift100m_common.sh"
 
 load_experiment_profile() {
   local profile="${1:?profile name is required}"
@@ -24,4 +23,3 @@ load_experiment_profile() {
   PROFILE="$profile"
   source "$profile_env"
 }
-
