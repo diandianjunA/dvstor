@@ -237,6 +237,7 @@ private:
                                    RemotePtr target,
                                    const Configuration& config);
   bool enqueue_deleted_node_cleanup(RemotePtr deleted_ptr, const Configuration& config);
+  void mark_storage_owner_foreground_activity();
   void storage_owner_maintenance_worker_loop(u32 worker_id);
   bool storage_owner_maintenance_foreground_busy(const Configuration& config);
   bool try_acquire_storage_owner_maintenance_slot(const Configuration& config);
@@ -444,6 +445,7 @@ private:
   std::atomic<u64> storage_owner_maintenance_max_backlog_{0};
   std::atomic<u64> storage_owner_maintenance_pressure_yields_{0};
   std::atomic<u32> storage_owner_maintenance_active_workers_{0};
+  std::atomic<u64> storage_owner_foreground_last_active_ns_{0};
   InsertRuntimeState insert_runtime_;
   std::unique_ptr<Configuration> storage_worker_config_;
   std::mutex storage_send_mutex_;

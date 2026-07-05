@@ -108,9 +108,11 @@ void MemoryNode::storage_owner_insert_worker_loop(u32 worker_id) {
       }
     }
 
+    mark_storage_owner_foreground_activity();
     storage_owner_insert_active_workers_.fetch_add(1, std::memory_order_acq_rel);
     process_storage_owner_insert_tasks(tasks);
     storage_owner_insert_active_workers_.fetch_sub(1, std::memory_order_acq_rel);
+    mark_storage_owner_foreground_activity();
   }
 }
 
@@ -456,6 +458,7 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
           task.batch_id = request->batch_id;
           task.received_at = std::chrono::steady_clock::now();
           task.payload.assign(payload, payload + bytes);
+          mark_storage_owner_foreground_activity();
           {
             std::lock_guard<std::mutex> lock(storage_insert_tasks_mutex_);
             storage_insert_tasks_.push_back(std::move(task));
@@ -557,11 +560,15 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* pa
   vec<u64> invalidated_neighbors;
   vec<u32> item_statuses(request->item_count, static_cast<u32>(service::storage_owner::MutationStatus::failed));
   vec<service::storage_owner::MutationResult> mutation_results(request->item_count);
+  mark_storage_owner_foreground_activity();
+  storage_owner_insert_active_workers_.fetch_add(1, std::memory_order_acq_rel);
   const bool ok = execute_storage_owner_batch_items(ids, kinds.data(), decoded_vectors.data(),
                                                     anchor_hints, request->anchor_hint_count,
                                                     request->item_count,
                                                     breakdown, config, &invalidated_neighbors,
                                                     &item_statuses, &mutation_results);
+  storage_owner_insert_active_workers_.fetch_sub(1, std::memory_order_acq_rel);
+  mark_storage_owner_foreground_activity();
   for (u32 i = 0; i < request->item_count; ++i) {
     statuses[i] = ok ? item_statuses[i]
                      : static_cast<u32>(service::storage_owner::MutationStatus::failed);

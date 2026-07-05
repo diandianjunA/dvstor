@@ -12,6 +12,14 @@
 
 namespace {
 
+constexpr u64 kMaintenanceForegroundQuietNs = 5ull * 1000ull * 1000ull;
+
+u64 steady_now_ns() {
+  return static_cast<u64>(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 bool same_neighbors(const vec<RemotePtr>& lhs, const vec<RemotePtr>& rhs) {
   if (lhs.size() != rhs.size()) {
     return false;
@@ -66,7 +74,7 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   }
 
   storage_owner_maintenance_shutdown_.store(false, std::memory_order_release);
-  const u32 worker_count = std::max<u32>(1, config.storage_owner_maintenance_workers);
+  const u32 worker_count = 1;
   const size_t snapshot_stride = memory_node_detail::storage_owner_snapshot_stride();
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
   const size_t snapshot_batch = std::max<u32>(1, config.storage_owner_search_snapshot_batch);
@@ -90,7 +98,9 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
       [this, worker_id]() { storage_owner_maintenance_worker_loop(worker_id); });
   }
 
-  print_status("storage-owner maintenance workers: " + std::to_string(worker_count));
+  print_status("storage-owner maintenance workers: " + std::to_string(worker_count) +
+               " (configured=" + std::to_string(config.storage_owner_maintenance_workers) +
+               ", ordered_finalization=true)");
   print_status("storage-owner maintenance tuning: mode=" + config.storage_owner_maintenance_mode +
                " exact_finalization=true");
 }
@@ -174,7 +184,15 @@ bool MemoryNode::enqueue_deleted_node_cleanup(RemotePtr deleted_ptr, const Confi
   return enqueue_storage_owner_maintenance(std::move(task), config);
 }
 
+void MemoryNode::mark_storage_owner_foreground_activity() {
+  storage_owner_foreground_last_active_ns_.store(steady_now_ns(), std::memory_order_release);
+}
+
 bool MemoryNode::storage_owner_maintenance_foreground_busy(const Configuration&) {
+  if (storage_owner_insert_active_workers_.load(std::memory_order_acquire) != 0) {
+    return true;
+  }
+
   {
     std::unique_lock<std::mutex> lock(storage_insert_tasks_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) {
@@ -183,6 +201,11 @@ bool MemoryNode::storage_owner_maintenance_foreground_busy(const Configuration&)
     if (!storage_insert_tasks_.empty()) {
       return true;
     }
+  }
+
+  const u64 last_active = storage_owner_foreground_last_active_ns_.load(std::memory_order_acquire);
+  if (last_active != 0 && steady_now_ns() - last_active < kMaintenanceForegroundQuietNs) {
+    return true;
   }
 
   {
@@ -227,15 +250,9 @@ bool MemoryNode::try_acquire_storage_owner_maintenance_slot(const Configuration&
     return false;
   }
 
-  const u32 max_workers = std::max<u32>(1, config.storage_owner_maintenance_workers);
-  const u32 active_insert_workers =
-    storage_owner_insert_active_workers_.load(std::memory_order_acquire);
-  const u32 allowed_workers = active_insert_workers == 0
-                                ? max_workers
-                                : std::max<u32>(1, max_workers / 2);
-
+  const u32 max_workers = 1;
   u32 active = storage_owner_maintenance_active_workers_.load(std::memory_order_acquire);
-  while (active < allowed_workers) {
+  while (active < max_workers) {
     if (storage_owner_maintenance_active_workers_.compare_exchange_weak(
           active, active + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
       return true;
@@ -268,7 +285,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     if (!try_acquire_storage_owner_maintenance_slot(config)) {
       storage_owner_maintenance_pressure_yields_.fetch_add(1, std::memory_order_relaxed);
       std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
-      storage_owner_maintenance_cv_.wait_for(lock, std::chrono::microseconds(100), [&]() {
+      storage_owner_maintenance_cv_.wait_for(lock, std::chrono::milliseconds(1), [&]() {
         return storage_owner_maintenance_shutdown_.load(std::memory_order_acquire);
       });
       continue;
@@ -282,6 +299,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         return;
       }
       if (storage_owner_maintenance_tasks_.empty()) {
+        continue;
+      }
+      if (storage_owner_maintenance_foreground_busy(config)) {
+        storage_owner_maintenance_pressure_yields_.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
       task = std::move(storage_owner_maintenance_tasks_.front());
