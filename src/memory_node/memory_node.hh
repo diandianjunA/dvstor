@@ -75,21 +75,25 @@ class MemoryNode {
 
   struct PeerReverseOutgoingTask {
     u32 target_shard{};
+    service::storage_owner::PeerRpcType rpc_type{
+      service::storage_owner::PeerRpcType::reverse_update_request};
     vec<service::storage_owner::ReverseUpdateOp> ops;
     std::chrono::steady_clock::time_point queued_at{};
   };
 
   enum class StorageOwnerMaintenanceKind : u8 {
-    inserted_node_repair,
-    reverse_edge_repair,
-    tombstone_cleanup,
+    dirty_node,
   };
 
   struct StorageOwnerMaintenanceTask {
-    StorageOwnerMaintenanceKind kind{StorageOwnerMaintenanceKind::inserted_node_repair};
+    StorageOwnerMaintenanceKind kind{StorageOwnerMaintenanceKind::dirty_node};
     RemotePtr target;
     vec<RemotePtr> candidates;
     std::chrono::steady_clock::time_point queued_at{};
+    u32 dirty_count{};
+    bool expand_hint{};
+    bool tombstone_hint{};
+    bool queued{};
   };
 
 public:
@@ -176,6 +180,10 @@ private:
                                           const service::storage_owner::PeerRpcHeader& header,
                                           const service::storage_owner::ReverseUpdateOp* ops,
                                           const Configuration& config);
+  bool handle_peer_maintenance_dirty_request(u32 source_shard,
+                                             const service::storage_owner::PeerRpcHeader& header,
+                                             const service::storage_owner::ReverseUpdateOp* ops,
+                                             const Configuration& config);
   bool handle_peer_rpc_request(const PeerRpcMessage& message, const Configuration& config);
   bool enqueue_peer_reverse_update_task(PeerReverseUpdateTask&& task);
   void enqueue_peer_reverse_update_response(u32 destination_shard,
@@ -197,6 +205,14 @@ private:
   bool enqueue_reverse_update_batch(u32 target_shard,
                                     const vec<service::storage_owner::ReverseUpdateOp>& ops,
                                     const Configuration& config);
+  bool enqueue_maintenance_dirty_batch(u32 target_shard,
+                                       const vec<service::storage_owner::ReverseUpdateOp>& ops,
+                                       const Configuration& config);
+  bool send_peer_op_batch_direct(u32 target_shard,
+                                 const vec<service::storage_owner::ReverseUpdateOp>& ops,
+                                 service::storage_owner::PeerRpcType rpc_type,
+                                 bool wait_for_response,
+                                 const Configuration& config);
   bool send_reverse_update_batch_direct(u32 target_shard,
                                         const vec<service::storage_owner::ReverseUpdateOp>& ops,
                                         bool wait_for_response,
@@ -204,6 +220,9 @@ private:
   bool send_reverse_update_batch(u32 target_shard,
                                  const vec<service::storage_owner::ReverseUpdateOp>& ops,
                                  const Configuration& config);
+  bool send_maintenance_dirty_batch(u32 target_shard,
+                                    const vec<service::storage_owner::ReverseUpdateOp>& ops,
+                                    const Configuration& config);
   void log_slow_peer_reverse_update_response(std::chrono::steady_clock::time_point wait_started,
                                              u64 request_id,
                                              u32 target_shard,
@@ -215,7 +234,9 @@ private:
   void start_storage_owner_maintenance_runtime(const Configuration& config);
   void stop_storage_owner_maintenance_runtime();
   bool enqueue_storage_owner_maintenance(StorageOwnerMaintenanceTask&& task, const Configuration& config);
-  bool enqueue_inserted_node_repair(RemotePtr target, const Configuration& config);
+  bool enqueue_inserted_node_repair(RemotePtr target,
+                                    const vec<RemotePtr>& candidates,
+                                    const Configuration& config);
   bool enqueue_reverse_edge_repair(RemotePtr target,
                                    const vec<RemotePtr>& candidates,
                                    const Configuration& config);
@@ -223,9 +244,16 @@ private:
                                  const vec<RemotePtr>& candidate_neighbors,
                                  const Configuration& config);
   void storage_owner_maintenance_worker_loop(u32 worker_id);
-  bool repair_inserted_storage_owner_node(RemotePtr target_ptr, const Configuration& config);
+  bool storage_owner_maintenance_foreground_busy(const Configuration& config);
+  bool try_lock_node(RemotePtr rptr);
+  bool repair_dirty_storage_owner_node(const StorageOwnerMaintenanceTask& task,
+                                       const Configuration& config);
+  bool repair_inserted_storage_owner_node(RemotePtr target_ptr,
+                                          const vec<RemotePtr>& candidates,
+                                          const Configuration& config);
   bool repair_storage_owner_neighbors(RemotePtr target_ptr,
                                       const vec<RemotePtr>& candidate_ptrs,
+                                      bool allow_expand,
                                       const Configuration& config);
 
   // Storage-owner RPC runtime
@@ -319,7 +347,8 @@ private:
                                   const vec<RemotePtr>& candidates,
                                   const hashset_t<RemotePtr>& skip,
                                   const Configuration& config,
-                                  InsertBreakdownCounters* breakdown = nullptr);
+                                  InsertBreakdownCounters* breakdown = nullptr,
+                                  u32 candidate_limit_override = 0);
   auto execute_storage_owner_insert_job_async(StorageOwnerThread& thread,
                                               StorageOwnerInsertJob& job,
                                               std::unordered_map<u64, vec<RemotePtr>>& local_updates,
@@ -412,14 +441,18 @@ private:
   vec<u_ptr<StorageOwnerThread>> storage_owner_maintenance_worker_states_;
   std::mutex storage_owner_maintenance_mutex_;
   std::condition_variable storage_owner_maintenance_cv_;
-  std::deque<StorageOwnerMaintenanceTask> storage_owner_maintenance_tasks_;
-  std::unordered_map<u64, vec<RemotePtr>> storage_owner_maintenance_reverse_candidates_;
+  std::deque<u64> storage_owner_maintenance_dirty_queue_;
+  std::unordered_map<u64, StorageOwnerMaintenanceTask> storage_owner_maintenance_dirty_;
   std::atomic<bool> storage_owner_maintenance_shutdown_{false};
   size_t storage_owner_maintenance_queue_limit_{65536};
   std::atomic<u64> storage_owner_maintenance_enqueued_{0};
+  std::atomic<u64> storage_owner_maintenance_coalesced_{0};
   std::atomic<u64> storage_owner_maintenance_dropped_{0};
   std::atomic<u64> storage_owner_maintenance_processed_{0};
   std::atomic<u64> storage_owner_maintenance_failed_{0};
+  std::atomic<u64> storage_owner_maintenance_skipped_busy_{0};
+  std::atomic<u64> storage_owner_maintenance_local_repairs_{0};
+  std::atomic<u64> storage_owner_maintenance_expand_repairs_{0};
   InsertRuntimeState insert_runtime_;
   std::unique_ptr<Configuration> storage_worker_config_;
   std::mutex storage_send_mutex_;

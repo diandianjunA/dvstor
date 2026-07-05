@@ -706,7 +706,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       }
       publish_mutation(ids[idx], new_ptr, generation, false);
       if (maintenance_enabled) {
-        (void)enqueue_inserted_node_repair(new_ptr, config);
+        (void)enqueue_inserted_node_repair(new_ptr, vec<RemotePtr>{}, config);
         (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
       }
       RemotePtr observed;
@@ -759,7 +759,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
     publish_mutation(ids[idx], new_ptr, generation, false);
     if (maintenance_enabled) {
-      (void)enqueue_inserted_node_repair(new_ptr, config);
+      (void)enqueue_inserted_node_repair(new_ptr, selected_neighbors, config);
       (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
     }
     if (statuses != nullptr) {

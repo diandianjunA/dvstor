@@ -426,7 +426,10 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
             << " vector_bytes=" << query_rows.vector_bytes << std::endl;
 
   bool recall_below_threshold = false;
-  auto run_recall_check = [&]() {
+  auto run_recall_check = [&](const char* phase,
+                              const char* key,
+                              bool reset_after,
+                              bool enforce_threshold) {
     if (args.groundtruth_file.empty()) {
       return;
     }
@@ -444,7 +447,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     const size_t recall_queries = args.recall_queries == 0 ? query_count : std::min<size_t>(args.recall_queries, query_count);
     double total_recall = 0.0;
     std::atomic<size_t> recall_completed{0};
-    ProgressReporter recall_reporter("recall", recall_completed, recall_queries, 0);
+    ProgressReporter recall_reporter(key, recall_completed, recall_queries, 0);
     for (size_t qi = 0; qi < recall_queries; ++qi) {
       const auto results = service.search_raw(query_rows.dtype, query_rows.raw_row(qi), dim, recall_k);
       std::vector<uint32_t> result_ids;
@@ -457,8 +460,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     }
     recall_reporter.finish();
     const double recall = recall_queries > 0 ? total_recall / static_cast<double>(recall_queries) : 0.0;
-    root["recall"] = {
-      {"phase", "before_performance"},
+    root[key] = {
+      {"phase", phase},
       {"groundtruth_file", args.groundtruth_file},
       {"queries", recall_queries},
       {"k", recall_k},
@@ -466,16 +469,18 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       {"min_recall", args.min_recall},
       {"passed", args.min_recall < 0.0 || recall >= args.min_recall},
     };
-    std::cerr << "[breakdown][recall] before performance recall@" << recall_k << "=" << recall
+    std::cerr << "[breakdown][recall] " << phase << " recall@" << recall_k << "=" << recall
               << " queries=" << recall_queries << std::endl;
-    if (args.min_recall >= 0.0 && recall < args.min_recall) {
+    if (enforce_threshold && args.min_recall >= 0.0 && recall < args.min_recall) {
       recall_below_threshold = true;
     }
 
-    service.clear_thread_statistics();
-    service.reset_breakdown_state();
+    if (reset_after) {
+      service.clear_thread_statistics();
+      service.reset_breakdown_state();
+    }
   };
-  run_recall_check();
+  run_recall_check("before_performance", "recall", true, true);
 
   auto run_query_phase_ops = [&](const std::string& label, size_t ops) -> size_t {
     std::atomic<size_t> completed_ops{0};
@@ -875,6 +880,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       : 0.0},
   };
 
+  run_recall_check("after_performance", "post_recall", false, false);
+
   nlohmann::json summaries = nlohmann::json::object();
   std::ostringstream text_summary;
   if (has_throughput_duration) {
@@ -899,6 +906,14 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
                  << recall.value("recall", 0.0) << '\n';
     text_summary << "  queries: " << recall.value("queries", 0) << '\n';
     text_summary << "  passed: " << (recall.value("passed", false) ? "true" : "false") << '\n';
+    text_summary << "  groundtruth_file: " << recall.value("groundtruth_file", "") << '\n';
+  }
+  if (root.contains("post_recall")) {
+    const auto& recall = root["post_recall"];
+    text_summary << "post_recall\n";
+    text_summary << "  recall@" << recall.value("k", 0) << ": "
+                 << recall.value("recall", 0.0) << '\n';
+    text_summary << "  queries: " << recall.value("queries", 0) << '\n';
     text_summary << "  groundtruth_file: " << recall.value("groundtruth_file", "") << '\n';
   }
   if (report.has_insert()) {

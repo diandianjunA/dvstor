@@ -32,6 +32,7 @@ enum class MutationStatus : u32 {
 enum class PeerRpcType : u32 {
   reverse_update_request = 1,
   reverse_update_response = 2,
+  maintenance_dirty_request = 3,
 };
 
 struct InsertBatchRequestHeader {

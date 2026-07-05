@@ -178,13 +178,19 @@ service::storage_owner::MutationStatus MemoryNode::prepare_mutation(
 bool MemoryNode::mark_node_deleted(RemotePtr rptr, u32 generation) {
   if (rptr.is_null()) return true;
   const auto header_addr = vamana::StorageLayoutResolver::header(rptr);
-  const bool remote = !local_shard(rptr.memory_node());
-  if (local_shard(rptr.memory_node())) {
+  const bool local = local_shard(rptr.memory_node());
+  bool locked = false;
+  if (local) {
     auto* header_ptr = reinterpret_cast<u64*>(index_buffer_.get_full_buffer() + header_addr.offset);
     std::atomic_ref<u64> ref(*header_ptr);
     ref.fetch_or(static_cast<u64>(VamanaNode::HEADER_DELETED), std::memory_order_acq_rel);
+    if (VamanaNode::compact_storage()) {
+      lock_node(rptr);
+      locked = true;
+    }
   } else {
     lock_node(rptr);
+    locked = true;
     u64 header = 0;
     remote_read_bytes(rptr.memory_node(), header_addr.offset, &header, sizeof(header), 0);
     header |= static_cast<u64>(VamanaNode::HEADER_DELETED);
@@ -201,7 +207,7 @@ bool MemoryNode::mark_node_deleted(RemotePtr rptr, u32 generation) {
       remote_write_bytes(rptr.memory_node(), hot_offset, entry.data(), entry.size(), 0);
     }
   }
-  if (remote) {
+  if (locked) {
     unlock_node(rptr);
   }
   return true;
@@ -1216,7 +1222,8 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
                                             const vec<RemotePtr>& candidates,
                                             const hashset_t<RemotePtr>& skip,
                                             const Configuration& config,
-                                            InsertBreakdownCounters* breakdown) {
+                                            InsertBreakdownCounters* breakdown,
+                                            u32 candidate_limit_override) {
   struct CandidateInfo {
     RemotePtr rptr;
     distance_t dist{};
@@ -1227,7 +1234,9 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
   infos.reserve(candidates.size());
   vec<RemotePtr> filtered;
   filtered.reserve(std::min<size_t>(candidates.size(), storage_owner_prune_candidate_limit(config)));
-  const u32 prune_candidate_limit = storage_owner_prune_candidate_limit(config);
+  const u32 prune_candidate_limit = candidate_limit_override == 0
+                                      ? storage_owner_prune_candidate_limit(config)
+                                      : std::max(config.R, candidate_limit_override);
   for (const RemotePtr& candidate : candidates) {
     if (candidate.is_null() || skip.contains(candidate)) {
       continue;
@@ -1424,7 +1433,7 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
       }
       publish_mutation(job.id, new_ptr, generation, false);
       if (maintenance_enabled) {
-        (void)enqueue_inserted_node_repair(new_ptr, config);
+        (void)enqueue_inserted_node_repair(new_ptr, vec<RemotePtr>{}, config);
         (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
       }
       co_return;
@@ -1481,7 +1490,7 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   }
   publish_mutation(job.id, new_ptr, generation, false);
   if (maintenance_enabled) {
-    (void)enqueue_inserted_node_repair(new_ptr, config);
+    (void)enqueue_inserted_node_repair(new_ptr, selected_neighbors, config);
     (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
   }
 
