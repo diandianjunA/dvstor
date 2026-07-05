@@ -880,7 +880,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       : 0.0},
   };
 
-  run_recall_check("after_performance", "post_recall", false, false);
+  run_recall_check("after_performance", "static_gt_post_recall", false, false);
 
   nlohmann::json summaries = nlohmann::json::object();
   std::ostringstream text_summary;
@@ -908,9 +908,9 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     text_summary << "  passed: " << (recall.value("passed", false) ? "true" : "false") << '\n';
     text_summary << "  groundtruth_file: " << recall.value("groundtruth_file", "") << '\n';
   }
-  if (root.contains("post_recall")) {
-    const auto& recall = root["post_recall"];
-    text_summary << "post_recall\n";
+  if (root.contains("static_gt_post_recall")) {
+    const auto& recall = root["static_gt_post_recall"];
+    text_summary << "static_gt_post_recall\n";
     text_summary << "  recall@" << recall.value("k", 0) << ": "
                  << recall.value("recall", 0.0) << '\n';
     text_summary << "  queries: " << recall.value("queries", 0) << '\n';

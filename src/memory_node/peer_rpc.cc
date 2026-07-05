@@ -266,7 +266,7 @@ bool MemoryNode::handle_peer_reverse_update_request(u32 source_shard,
   return success;
 }
 
-bool MemoryNode::handle_peer_maintenance_dirty_request(
+bool MemoryNode::handle_peer_cleanup_deleted_request(
     u32 source_shard,
     const service::storage_owner::PeerRpcHeader& header,
     const service::storage_owner::ReverseUpdateOp* ops,
@@ -280,14 +280,16 @@ bool MemoryNode::handle_peer_maintenance_dirty_request(
   grouped.reserve(header.item_count);
   for (u32 i = 0; i < header.item_count; ++i) {
     const RemotePtr target{ops[i].target_raw};
-    const RemotePtr candidate{ops[i].candidate_raw};
-    lib_assert(local_shard(target.memory_node()), "maintenance-dirty target routed to wrong shard");
-    grouped[target.raw_address].push_back(candidate);
+    const RemotePtr deleted{ops[i].candidate_raw};
+    lib_assert(local_shard(target.memory_node()), "cleanup-deleted target routed to wrong shard");
+    grouped[target.raw_address].push_back(deleted);
   }
 
   bool success = true;
-  for (auto& [target_raw, candidates] : grouped) {
-    success &= enqueue_reverse_edge_repair(RemotePtr{target_raw}, candidates, config);
+  for (auto& [target_raw, deleted_ptrs] : grouped) {
+    for (const RemotePtr& deleted : deleted_ptrs) {
+      success &= remove_local_neighbor(RemotePtr{target_raw}, deleted, config);
+    }
   }
   return success;
 }
@@ -310,13 +312,13 @@ bool MemoryNode::handle_peer_rpc_request(const PeerRpcMessage& message, const Co
     const auto* ops = service::storage_owner::reverse_update_ops(message.payload.data());
     return handle_peer_reverse_update_request(message.source_shard, *header, ops, config);
   }
-  if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::maintenance_dirty_request)) {
+  if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::cleanup_deleted_request)) {
     const size_t expected_bytes = service::storage_owner::reverse_update_request_bytes(header->item_count);
     if (message.payload.size() < expected_bytes) {
       return false;
     }
     const auto* ops = service::storage_owner::reverse_update_ops(message.payload.data());
-    return handle_peer_maintenance_dirty_request(message.source_shard, *header, ops, config);
+    return handle_peer_cleanup_deleted_request(message.source_shard, *header, ops, config);
   }
 
   return false;
@@ -398,11 +400,11 @@ void MemoryNode::peer_rpc_progress_loop() {
           task.ops.assign(ops, ops + header->item_count);
           enqueue_peer_reverse_update_task(std::move(task));
         }
-      } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::maintenance_dirty_request)) {
+      } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::cleanup_deleted_request)) {
         const size_t expected_bytes = service::storage_owner::reverse_update_request_bytes(header->item_count);
         if (bytes >= expected_bytes) {
           const auto* ops = service::storage_owner::reverse_update_ops(payload);
-          (void)handle_peer_maintenance_dirty_request(peer_id, *header, ops, config);
+          (void)handle_peer_cleanup_deleted_request(peer_id, *header, ops, config);
         }
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response)) {
         {
@@ -601,7 +603,7 @@ bool MemoryNode::pump_peer_rpcs_locked(const Configuration&,
       }
 
       if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_request) ||
-          header->type == static_cast<u32>(service::storage_owner::PeerRpcType::maintenance_dirty_request)) {
+          header->type == static_cast<u32>(service::storage_owner::PeerRpcType::cleanup_deleted_request)) {
         PeerRpcMessage request;
         request.source_shard = peer_id;
         request.payload.assign(payload, payload + bytes);
@@ -690,7 +692,7 @@ bool MemoryNode::enqueue_reverse_update_batch(u32 target_shard,
   return true;
 }
 
-bool MemoryNode::enqueue_maintenance_dirty_batch(
+bool MemoryNode::enqueue_cleanup_deleted_batch(
     u32 target_shard,
     const vec<service::storage_owner::ReverseUpdateOp>& ops,
     const Configuration&) {
@@ -700,7 +702,7 @@ bool MemoryNode::enqueue_maintenance_dirty_batch(
 
   PeerReverseOutgoingTask task;
   task.target_shard = target_shard;
-  task.rpc_type = service::storage_owner::PeerRpcType::maintenance_dirty_request;
+  task.rpc_type = service::storage_owner::PeerRpcType::cleanup_deleted_request;
   task.ops = ops;
   task.queued_at = std::chrono::steady_clock::now();
   {
@@ -787,16 +789,16 @@ bool MemoryNode::send_reverse_update_batch(u32 target_shard,
   return send_reverse_update_batch_direct(target_shard, ops, true, config);
 }
 
-bool MemoryNode::send_maintenance_dirty_batch(
+bool MemoryNode::send_cleanup_deleted_batch(
     u32 target_shard,
     const vec<service::storage_owner::ReverseUpdateOp>& ops,
     const Configuration& config) {
   if (config.storage_owner_reverse_mode == "async") {
-    return enqueue_maintenance_dirty_batch(target_shard, ops, config);
+    return enqueue_cleanup_deleted_batch(target_shard, ops, config);
   }
   return send_peer_op_batch_direct(target_shard,
                                    ops,
-                                   service::storage_owner::PeerRpcType::maintenance_dirty_request,
+                                   service::storage_owner::PeerRpcType::cleanup_deleted_request,
                                    false,
                                    config);
 }

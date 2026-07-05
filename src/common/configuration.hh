@@ -99,17 +99,7 @@ public:
   f64 storage_owner_anchor_min_overlap{0.5};
   bool storage_owner_anchor_rehome_upsert{false};
   str storage_owner_maintenance_mode{"off"};
-  str storage_owner_maintenance_policy{"delta_log"};
   u32 storage_owner_maintenance_workers{0};
-  u32 storage_owner_maintenance_budget_us{0};
-  u32 storage_owner_maintenance_period_us{1000};
-  u32 storage_owner_maintenance_queue_depth{65536};
-  u32 storage_owner_maintenance_max_dirty_per_period{1};
-  u32 storage_owner_maintenance_max_expansions{4};
-  u32 storage_owner_maintenance_max_candidates{192};
-  f64 storage_owner_maintenance_high_watermark{0.75};
-  u32 storage_owner_maintenance_exact_audit_rate{4096};
-  f64 storage_owner_maintenance_audit_min_overlap{0.5};
   str storage_owner_reverse_mode{"async"};
   u32 storage_owner_reverse_queue_depth{65536};
   u32 storage_owner_reverse_flush_us{200};
@@ -142,7 +132,6 @@ public:
     storage_owner_reverse_mode = normalize_mode(storage_owner_reverse_mode);
     storage_owner_update_mode = normalize_mode(storage_owner_update_mode);
     storage_owner_maintenance_mode = normalize_mode(storage_owner_maintenance_mode);
-    storage_owner_maintenance_policy = normalize_mode(storage_owner_maintenance_policy);
     rdma_read_batch_mode = normalize_mode(rdma_read_batch_mode);
 
     if (!is_server) {
@@ -255,40 +244,10 @@ private:
       "Allow anchored upserts to migrate ID ownership. Disabled until distributed two-phase ownership is enabled.")(
       "storage-owner-maintenance-mode",
       po::value<str>(&storage_owner_maintenance_mode)->default_value(storage_owner_maintenance_mode),
-      "Storage-owner background graph-quality maintenance: off or budgeted.")(
-      "storage-owner-maintenance-policy",
-      po::value<str>(&storage_owner_maintenance_policy)->default_value(storage_owner_maintenance_policy),
-      "Storage-owner maintenance scheduling policy: delta_log.")(
+      "Storage-owner background graph-quality maintenance: off or finalize.")(
       "storage-owner-maintenance-workers",
       po::value<u32>(&storage_owner_maintenance_workers)->default_value(storage_owner_maintenance_workers),
-      "Background storage-owner maintenance worker threads. 0 disables maintenance.")(
-      "storage-owner-maintenance-budget-us",
-      po::value<u32>(&storage_owner_maintenance_budget_us)->default_value(storage_owner_maintenance_budget_us),
-      "Maximum maintenance work time per worker period in microseconds.")(
-      "storage-owner-maintenance-period-us",
-      po::value<u32>(&storage_owner_maintenance_period_us)->default_value(storage_owner_maintenance_period_us),
-      "Maintenance worker scheduling period in microseconds.")(
-      "storage-owner-maintenance-queue-depth",
-      po::value<u32>(&storage_owner_maintenance_queue_depth)->default_value(storage_owner_maintenance_queue_depth),
-      "Maximum queued storage-owner maintenance tasks.")(
-      "storage-owner-maintenance-max-dirty-per-period",
-      po::value<u32>(&storage_owner_maintenance_max_dirty_per_period)->default_value(storage_owner_maintenance_max_dirty_per_period),
-      "Maximum dirty nodes repaired by one maintenance worker per scheduling period.")(
-      "storage-owner-maintenance-max-expansions",
-      po::value<u32>(&storage_owner_maintenance_max_expansions)->default_value(storage_owner_maintenance_max_expansions),
-      "Maximum local graph expansions used by one maintenance repair.")(
-      "storage-owner-maintenance-max-candidates",
-      po::value<u32>(&storage_owner_maintenance_max_candidates)->default_value(storage_owner_maintenance_max_candidates),
-      "Maximum candidates considered by one maintenance repair.")(
-      "storage-owner-maintenance-high-watermark",
-      po::value<f64>(&storage_owner_maintenance_high_watermark)->default_value(storage_owner_maintenance_high_watermark),
-      "Foreground queue occupancy fraction above which maintenance yields.")(
-      "storage-owner-maintenance-exact-audit-rate",
-      po::value<u32>(&storage_owner_maintenance_exact_audit_rate)->default_value(storage_owner_maintenance_exact_audit_rate),
-      "Low-frequency exact maintenance audit rate. 0 disables exact audits.")(
-      "storage-owner-maintenance-audit-min-overlap",
-      po::value<f64>(&storage_owner_maintenance_audit_min_overlap)->default_value(storage_owner_maintenance_audit_min_overlap),
-      "Minimum overlap accepted by exact maintenance audits.")(
+      "Background exact-finalization worker threads. 0 disables maintenance.")(
       "storage-owner-reverse-mode",
       po::value<str>(&storage_owner_reverse_mode)->default_value(storage_owner_reverse_mode),
       "Reverse-update completion mode for storage_owner inserts: async or sync.")(
@@ -529,27 +488,13 @@ private:
         std::cerr << "[ERROR]: --storage-owner-reverse-mode must be async or sync" << std::endl;
         exit_with_help_message(argv);
       }
-      if (storage_owner_maintenance_mode != "off" && storage_owner_maintenance_mode != "budgeted") {
-        std::cerr << "[ERROR]: --storage-owner-maintenance-mode must be off or budgeted" << std::endl;
+      if (storage_owner_maintenance_mode != "off" && storage_owner_maintenance_mode != "finalize") {
+        std::cerr << "[ERROR]: --storage-owner-maintenance-mode must be off or finalize" << std::endl;
         exit_with_help_message(argv);
       }
-      if (storage_owner_maintenance_policy != "delta_log") {
-        std::cerr << "[ERROR]: --storage-owner-maintenance-policy must be delta_log" << std::endl;
-        exit_with_help_message(argv);
-      }
-      if (storage_owner_maintenance_mode == "budgeted" &&
-          (storage_owner_maintenance_workers == 0 ||
-           storage_owner_maintenance_budget_us == 0 ||
-           storage_owner_maintenance_period_us == 0 ||
-           storage_owner_maintenance_queue_depth == 0 ||
-           storage_owner_maintenance_budget_us > storage_owner_maintenance_period_us ||
-           storage_owner_maintenance_max_dirty_per_period == 0 ||
-           storage_owner_maintenance_max_candidates < storage_owner_maintenance_max_expansions ||
-           storage_owner_maintenance_high_watermark <= 0.0 ||
-           storage_owner_maintenance_high_watermark > 1.0 ||
-           storage_owner_maintenance_audit_min_overlap < 0.0 ||
-           storage_owner_maintenance_audit_min_overlap > 1.0)) {
-        std::cerr << "[ERROR]: invalid storage-owner maintenance budget configuration" << std::endl;
+      if (storage_owner_maintenance_mode == "finalize" &&
+          storage_owner_maintenance_workers == 0) {
+        std::cerr << "[ERROR]: --storage-owner-maintenance-workers must be > 0 when finalize mode is enabled" << std::endl;
         exit_with_help_message(argv);
       }
       if (storage_owner_reverse_queue_depth == 0) {
@@ -649,24 +594,8 @@ public:
         }
         os << std::setw(width) << "storage maintenance mode: "
            << config.storage_owner_maintenance_mode << std::endl;
-        os << std::setw(width) << "storage maintenance policy: "
-           << config.storage_owner_maintenance_policy << std::endl;
         os << std::setw(width) << "storage maintenance workers: "
            << config.storage_owner_maintenance_workers << std::endl;
-        os << std::setw(width) << "storage maintenance budget(us): "
-           << config.storage_owner_maintenance_budget_us << std::endl;
-        os << std::setw(width) << "storage maintenance period(us): "
-           << config.storage_owner_maintenance_period_us << std::endl;
-        os << std::setw(width) << "storage maintenance queue: "
-           << config.storage_owner_maintenance_queue_depth << std::endl;
-        os << std::setw(width) << "storage maintenance dirty/period: "
-           << config.storage_owner_maintenance_max_dirty_per_period << std::endl;
-        os << std::setw(width) << "storage maintenance expansions: "
-           << config.storage_owner_maintenance_max_expansions << std::endl;
-        os << std::setw(width) << "storage maintenance candidates: "
-           << config.storage_owner_maintenance_max_candidates << std::endl;
-        os << std::setw(width) << "storage maintenance high watermark: "
-           << config.storage_owner_maintenance_high_watermark << std::endl;
         os << std::setw(width) << "storage reverse mode: " << config.storage_owner_reverse_mode << std::endl;
         os << std::setw(width) << "storage reverse queue depth: "
            << config.storage_owner_reverse_queue_depth << std::endl;

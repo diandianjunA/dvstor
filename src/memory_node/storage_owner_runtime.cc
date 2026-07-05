@@ -108,7 +108,9 @@ void MemoryNode::storage_owner_insert_worker_loop(u32 worker_id) {
       }
     }
 
+    storage_owner_insert_active_workers_.fetch_add(1, std::memory_order_acq_rel);
     process_storage_owner_insert_tasks(tasks);
+    storage_owner_insert_active_workers_.fetch_sub(1, std::memory_order_acq_rel);
   }
 }
 
@@ -622,15 +624,11 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       continue;
     }
     if (kind == service::storage_owner::MutationKind::erase) {
-      vec<RemotePtr> old_neighbors;
-      if (maintenance_enabled && !old_entry.current.is_null()) {
-        old_neighbors = read_neighbor_list(old_entry.current);
-      }
       const bool deleted = mark_node_deleted(old_entry.current, old_entry.generation);
       if (deleted) {
         publish_mutation(ids[idx], old_entry.current, old_entry.generation, true);
         if (maintenance_enabled) {
-          (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
+          (void)enqueue_deleted_node_cleanup(old_entry.current, config);
         }
       }
       if (statuses != nullptr) {
@@ -697,17 +695,13 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       auto t_write = std::chrono::steady_clock::now();
       write_new_node(new_ptr, ids[idx], components, {}, generation);
       breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
-      vec<RemotePtr> old_neighbors;
       if (kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
-        if (maintenance_enabled && !old_entry.current.is_null()) {
-          old_neighbors = read_neighbor_list(old_entry.current);
-        }
         mark_node_deleted(old_entry.current, old_entry.generation);
       }
       publish_mutation(ids[idx], new_ptr, generation, false);
       if (maintenance_enabled) {
-        (void)enqueue_inserted_node_repair(new_ptr, vec<RemotePtr>{}, config);
-        (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
+        (void)enqueue_insert_finalization(ids[idx], generation, new_ptr, config);
+        (void)enqueue_deleted_node_cleanup(old_entry.current, config);
       }
       RemotePtr observed;
       if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
@@ -750,28 +744,26 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     auto t_write = std::chrono::steady_clock::now();
     write_new_node(new_ptr, ids[idx], components, selected_neighbors, generation);
     breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
-    vec<RemotePtr> old_neighbors;
     if (kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
-      if (maintenance_enabled && !old_entry.current.is_null()) {
-        old_neighbors = read_neighbor_list(old_entry.current);
-      }
       mark_node_deleted(old_entry.current, old_entry.generation);
     }
     publish_mutation(ids[idx], new_ptr, generation, false);
     if (maintenance_enabled) {
-      (void)enqueue_inserted_node_repair(new_ptr, selected_neighbors, config);
-      (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
+      (void)enqueue_insert_finalization(ids[idx], generation, new_ptr, config);
+      (void)enqueue_deleted_node_cleanup(old_entry.current, config);
     }
     if (statuses != nullptr) {
       (*statuses)[idx] = static_cast<u32>(service::storage_owner::MutationStatus::ok);
     }
 
-    for (const RemotePtr& neighbor_ptr : selected_neighbors) {
-      if (local_shard(neighbor_ptr.memory_node())) {
-        local_updates[neighbor_ptr.raw_address].push_back(new_ptr);
-      } else {
-        remote_updates[neighbor_ptr.memory_node()].push_back(
-          service::storage_owner::ReverseUpdateOp{neighbor_ptr.raw_address, new_ptr.raw_address});
+    if (!maintenance_enabled) {
+      for (const RemotePtr& neighbor_ptr : selected_neighbors) {
+        if (local_shard(neighbor_ptr.memory_node())) {
+          local_updates[neighbor_ptr.raw_address].push_back(new_ptr);
+        } else {
+          remote_updates[neighbor_ptr.memory_node()].push_back(
+            service::storage_owner::ReverseUpdateOp{neighbor_ptr.raw_address, new_ptr.raw_address});
+        }
       }
     }
   }

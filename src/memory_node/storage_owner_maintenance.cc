@@ -3,40 +3,14 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cmath>
 #include <iostream>
 #include <thread>
+#include <unordered_map>
 
+#include "vamana/hot_graph.hh"
 #include "vamana/storage_layout_resolver.hh"
 
 namespace {
-
-size_t maintenance_candidate_limit(const configuration::IndexConfiguration& config) {
-  return std::max<size_t>(config.R, config.storage_owner_maintenance_max_candidates);
-}
-
-bool append_unique(vec<RemotePtr>& out, RemotePtr ptr, size_t limit) {
-  if (ptr.is_null() || out.size() >= limit) {
-    return false;
-  }
-  if (std::find(out.begin(), out.end(), ptr) != out.end()) {
-    return false;
-  }
-  out.push_back(ptr);
-  return true;
-}
-
-void append_unique_all(vec<RemotePtr>& out,
-                       const vec<RemotePtr>& input,
-                       size_t limit,
-                       RemotePtr skip = RemotePtr{}) {
-  for (const RemotePtr& ptr : input) {
-    if (ptr == skip) {
-      continue;
-    }
-    append_unique(out, ptr, limit);
-  }
-}
 
 bool same_neighbors(const vec<RemotePtr>& lhs, const vec<RemotePtr>& rhs) {
   if (lhs.size() != rhs.size()) {
@@ -50,21 +24,40 @@ bool same_neighbors(const vec<RemotePtr>& lhs, const vec<RemotePtr>& rhs) {
   return true;
 }
 
-bool contains_ptr(const vec<RemotePtr>& values, RemotePtr ptr) {
-  return std::find(values.begin(), values.end(), ptr) != values.end();
+void update_max_relaxed(std::atomic<u64>& target, u64 value) {
+  u64 observed = target.load(std::memory_order_relaxed);
+  while (observed < value &&
+         !target.compare_exchange_weak(observed, value, std::memory_order_relaxed)) {
+  }
 }
+
+bool queue_near_limit(size_t size, size_t limit) {
+  if (limit == 0) {
+    return size != 0;
+  }
+  const size_t threshold = std::max<size_t>(1, (limit * 3) / 4);
+  return size >= threshold;
+}
+
+bool counter_near_limit(u32 value, u32 limit) {
+  const u32 threshold = std::max<u32>(1, (limit * 3) / 4);
+  return value >= threshold;
+}
+
+struct CounterReleaseGuard {
+  explicit CounterReleaseGuard(std::atomic<u32>& counter) : counter(counter) {}
+  ~CounterReleaseGuard() {
+    counter.fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+  std::atomic<u32>& counter;
+};
 
 }  // namespace
 
 bool MemoryNode::storage_owner_maintenance_enabled(const Configuration& config) {
-  return config.storage_owner_maintenance_mode == "budgeted" &&
-         config.storage_owner_maintenance_policy == "delta_log" &&
-         config.storage_owner_maintenance_workers > 0 &&
-         config.storage_owner_maintenance_budget_us > 0 &&
-         config.storage_owner_maintenance_period_us > 0 &&
-         config.storage_owner_maintenance_queue_depth > 0 &&
-         config.storage_owner_maintenance_max_dirty_per_period > 0 &&
-         config.storage_owner_maintenance_budget_us <= config.storage_owner_maintenance_period_us;
+  return config.storage_owner_maintenance_mode == "finalize" &&
+         config.storage_owner_maintenance_workers > 0;
 }
 
 void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& config) {
@@ -73,18 +66,15 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   }
 
   storage_owner_maintenance_shutdown_.store(false, std::memory_order_release);
-  storage_owner_maintenance_queue_limit_ =
-    std::max<size_t>(1, config.storage_owner_maintenance_queue_depth);
-
   const u32 worker_count = std::max<u32>(1, config.storage_owner_maintenance_workers);
   const size_t snapshot_stride = memory_node_detail::storage_owner_snapshot_stride();
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
+  const size_t snapshot_batch = std::max<u32>(1, config.storage_owner_search_snapshot_batch);
   const size_t coroutine_scratch_stride =
-    align_up(std::max<size_t>(VamanaNode::total_size(),
-                              std::max(neighbor_stride,
-                                       snapshot_stride *
-                                         std::max<u32>(1, config.storage_owner_search_snapshot_batch))));
-  const size_t scratch_bytes = std::max<size_t>(64ull * 1024ull * 1024ull, coroutine_scratch_stride);
+    align_up(snapshot_stride * snapshot_batch +
+             std::max(VamanaNode::total_size(), neighbor_stride));
+  const size_t scratch_bytes =
+    std::max<size_t>(64ull * 1024ull * 1024ull, coroutine_scratch_stride);
 
   storage_owner_maintenance_worker_states_.reserve(worker_count);
   for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {
@@ -102,16 +92,7 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
 
   print_status("storage-owner maintenance workers: " + std::to_string(worker_count));
   print_status("storage-owner maintenance tuning: mode=" + config.storage_owner_maintenance_mode +
-               " policy=" + config.storage_owner_maintenance_policy +
-               " budget_us=" + std::to_string(config.storage_owner_maintenance_budget_us) +
-               " period_us=" + std::to_string(config.storage_owner_maintenance_period_us) +
-               " dirty_per_period=" +
-               std::to_string(config.storage_owner_maintenance_max_dirty_per_period) +
-               " max_candidates=" +
-               std::to_string(config.storage_owner_maintenance_max_candidates) +
-               " max_expansions=" +
-               std::to_string(config.storage_owner_maintenance_max_expansions) +
-               " queue_depth=" + std::to_string(storage_owner_maintenance_queue_limit_));
+               " exact_finalization=true");
 }
 
 void MemoryNode::stop_storage_owner_maintenance_runtime() {
@@ -124,179 +105,139 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
     }
   }
 
+  size_t remaining = 0;
   {
     std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
-    storage_owner_maintenance_dirty_queue_.clear();
-    storage_owner_maintenance_dirty_.clear();
+    remaining = storage_owner_maintenance_tasks_.size();
+    storage_owner_maintenance_tasks_.clear();
   }
   storage_owner_maintenance_workers_.clear();
   storage_owner_maintenance_worker_states_.clear();
 
-  if (storage_owner_maintenance_enqueued_.load(std::memory_order_relaxed) != 0 ||
-      storage_owner_maintenance_coalesced_.load(std::memory_order_relaxed) != 0 ||
-      storage_owner_maintenance_dropped_.load(std::memory_order_relaxed) != 0) {
+  if (storage_owner_maintenance_enqueued_.load(std::memory_order_relaxed) != 0) {
     print_status("storage-owner maintenance summary: enqueued=" +
                  std::to_string(storage_owner_maintenance_enqueued_.load(std::memory_order_relaxed)) +
-                 " coalesced=" +
-                 std::to_string(storage_owner_maintenance_coalesced_.load(std::memory_order_relaxed)) +
-                 " processed=" +
+                 " insert_tasks_done=" +
                  std::to_string(storage_owner_maintenance_processed_.load(std::memory_order_relaxed)) +
+                 " cleanup_processed=" +
+                 std::to_string(storage_owner_maintenance_cleanup_processed_.load(std::memory_order_relaxed)) +
+                 " stale=" +
+                 std::to_string(storage_owner_maintenance_stale_.load(std::memory_order_relaxed)) +
                  " failed=" +
                  std::to_string(storage_owner_maintenance_failed_.load(std::memory_order_relaxed)) +
-                 " dropped=" +
-                 std::to_string(storage_owner_maintenance_dropped_.load(std::memory_order_relaxed)) +
-                 " skipped_busy=" +
-                 std::to_string(storage_owner_maintenance_skipped_busy_.load(std::memory_order_relaxed)) +
-                 " local_repairs=" +
-                 std::to_string(storage_owner_maintenance_local_repairs_.load(std::memory_order_relaxed)) +
-                 " expand_repairs=" +
-                 std::to_string(storage_owner_maintenance_expand_repairs_.load(std::memory_order_relaxed)));
+                 " max_backlog=" +
+                 std::to_string(storage_owner_maintenance_max_backlog_.load(std::memory_order_relaxed)) +
+                 " pressure_yields=" +
+                 std::to_string(storage_owner_maintenance_pressure_yields_.load(std::memory_order_relaxed)) +
+                 " remaining=" + std::to_string(remaining));
   }
 }
 
 bool MemoryNode::enqueue_storage_owner_maintenance(StorageOwnerMaintenanceTask&& task,
                                                    const Configuration& config) {
-  if (!storage_owner_maintenance_enabled(config) ||
-      task.target.is_null() ||
-      !local_shard(task.target.memory_node())) {
+  if (!storage_owner_maintenance_enabled(config) || task.target.is_null()) {
     return false;
   }
 
-  task.kind = StorageOwnerMaintenanceKind::dirty_node;
   task.queued_at = std::chrono::steady_clock::now();
-  task.dirty_count = std::max<u32>(1, task.dirty_count);
-  const size_t candidate_limit = maintenance_candidate_limit(config);
-
-  bool should_notify = false;
+  size_t backlog = 0;
   {
     std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
     if (storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
       return false;
     }
-
-    const u64 key = task.target.raw_address;
-    auto existing = storage_owner_maintenance_dirty_.find(key);
-    if (existing != storage_owner_maintenance_dirty_.end()) {
-      append_unique_all(existing->second.candidates, task.candidates, candidate_limit, task.target);
-      const u32 max_dirty = std::numeric_limits<u32>::max() - 1;
-      existing->second.dirty_count =
-        existing->second.dirty_count > max_dirty - task.dirty_count
-          ? max_dirty
-          : existing->second.dirty_count + task.dirty_count;
-      existing->second.expand_hint = existing->second.expand_hint || task.expand_hint;
-      existing->second.tombstone_hint = existing->second.tombstone_hint || task.tombstone_hint;
-      storage_owner_maintenance_coalesced_.fetch_add(1, std::memory_order_relaxed);
-      should_notify = !existing->second.queued;
-    } else {
-      vec<RemotePtr> candidates;
-      candidates.reserve(std::min(candidate_limit, task.candidates.size()));
-      append_unique_all(candidates, task.candidates, candidate_limit, task.target);
-      task.candidates = std::move(candidates);
-      task.queued = storage_owner_maintenance_dirty_queue_.size() < storage_owner_maintenance_queue_limit_;
-      if (task.queued) {
-        storage_owner_maintenance_dirty_queue_.push_back(key);
-        storage_owner_maintenance_enqueued_.fetch_add(1, std::memory_order_relaxed);
-      }
-      should_notify = true;
-      storage_owner_maintenance_dirty_.emplace(key, std::move(task));
-    }
+    storage_owner_maintenance_tasks_.push_back(std::move(task));
+    backlog = storage_owner_maintenance_tasks_.size();
   }
-
-  if (should_notify) {
-    storage_owner_maintenance_cv_.notify_one();
-  }
+  storage_owner_maintenance_enqueued_.fetch_add(1, std::memory_order_relaxed);
+  update_max_relaxed(storage_owner_maintenance_max_backlog_, static_cast<u64>(backlog));
+  storage_owner_maintenance_cv_.notify_one();
   return true;
 }
 
-bool MemoryNode::enqueue_inserted_node_repair(RemotePtr target,
-                                              const vec<RemotePtr>& candidates,
-                                              const Configuration& config) {
-  StorageOwnerMaintenanceTask task;
-  task.target = target;
-  task.candidates = candidates;
-  task.dirty_count = 1;
-  return enqueue_storage_owner_maintenance(std::move(task), config);
-}
-
-bool MemoryNode::enqueue_reverse_edge_repair(RemotePtr target,
-                                             const vec<RemotePtr>& candidates,
+bool MemoryNode::enqueue_insert_finalization(node_t id,
+                                             u32 generation,
+                                             RemotePtr target,
                                              const Configuration& config) {
-  if (candidates.empty()) {
-    return false;
-  }
   StorageOwnerMaintenanceTask task;
+  task.kind = StorageOwnerMaintenanceKind::finalize_insert;
+  task.id = id;
+  task.generation = generation;
   task.target = target;
-  task.candidates = candidates;
-  task.dirty_count = 1;
-  task.expand_hint = candidates.size() >= config.storage_owner_maintenance_max_expansions;
   return enqueue_storage_owner_maintenance(std::move(task), config);
 }
 
-bool MemoryNode::enqueue_tombstone_cleanup(RemotePtr deleted_ptr,
-                                           const vec<RemotePtr>& candidate_neighbors,
-                                           const Configuration& config) {
-  if (deleted_ptr.is_null() || candidate_neighbors.empty()) {
-    return false;
-  }
-
-  bool enqueued = false;
-  std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_dirty;
-  for (const RemotePtr& neighbor : candidate_neighbors) {
-    if (neighbor.is_null()) {
-      continue;
-    }
-    if (local_shard(neighbor.memory_node())) {
-      StorageOwnerMaintenanceTask task;
-      task.target = neighbor;
-      task.candidates.push_back(deleted_ptr);
-      task.dirty_count = 1;
-      task.tombstone_hint = true;
-      task.expand_hint = true;
-      enqueued = enqueue_storage_owner_maintenance(std::move(task), config) || enqueued;
-    } else {
-      remote_dirty[neighbor.memory_node()].push_back(
-        service::storage_owner::ReverseUpdateOp{neighbor.raw_address, deleted_ptr.raw_address});
-      enqueued = true;
-    }
-  }
-
-  for (auto& [target_shard, ops] : remote_dirty) {
-    (void)send_maintenance_dirty_batch(target_shard, ops, config);
-  }
-  return enqueued;
+bool MemoryNode::enqueue_deleted_node_cleanup(RemotePtr deleted_ptr, const Configuration& config) {
+  StorageOwnerMaintenanceTask task;
+  task.kind = StorageOwnerMaintenanceKind::cleanup_deleted_node;
+  task.target = deleted_ptr;
+  return enqueue_storage_owner_maintenance(std::move(task), config);
 }
 
-bool MemoryNode::storage_owner_maintenance_foreground_busy(const Configuration& config) {
-  const double high_watermark = std::clamp(config.storage_owner_maintenance_high_watermark, 0.01, 1.0);
-  const size_t insert_high_watermark =
-    std::max<size_t>(1, static_cast<size_t>(std::ceil(config.storage_owner_rpc_depth * high_watermark)));
-  const size_t reverse_high_watermark =
-    std::max<size_t>(1, static_cast<size_t>(std::ceil(peer_reverse_outgoing_queue_limit_ * high_watermark)));
-
+bool MemoryNode::storage_owner_maintenance_foreground_busy(const Configuration&) {
   {
     std::unique_lock<std::mutex> lock(storage_insert_tasks_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) {
       return true;
     }
-    if (storage_insert_tasks_.size() >= insert_high_watermark) {
+    if (!storage_insert_tasks_.empty()) {
       return true;
     }
   }
-  {
-    std::unique_lock<std::mutex> lock(peer_reverse_outgoing_mutex_, std::try_to_lock);
-    if (!lock.owns_lock()) {
-      return true;
-    }
-    if (peer_reverse_outgoing_.size() >= reverse_high_watermark) {
-      return true;
-    }
-  }
+
   {
     std::unique_lock<std::mutex> lock(peer_reverse_tasks_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) {
       return true;
     }
-    if (peer_reverse_tasks_.size() >= reverse_high_watermark) {
+    if (queue_near_limit(peer_reverse_tasks_.size(), peer_reverse_task_queue_limit_)) {
+      return true;
+    }
+  }
+
+  {
+    std::unique_lock<std::mutex> lock(peer_reverse_outgoing_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+      return true;
+    }
+    if (queue_near_limit(peer_reverse_outgoing_.size(), peer_reverse_outgoing_queue_limit_)) {
+      return true;
+    }
+  }
+
+  if (peer_context_) {
+    poll_peer_send_cq();
+    if (counter_near_limit(peer_async_rdma_outstanding_.load(std::memory_order_acquire),
+                           peer_rdma_read_global_credit_limit())) {
+      return true;
+    }
+    const u32 per_peer_limit = peer_rdma_read_credit_limit();
+    for (const auto& counter : peer_rdma_read_outstanding_) {
+      if (counter_near_limit(counter.load(std::memory_order_acquire), per_peer_limit)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+bool MemoryNode::try_acquire_storage_owner_maintenance_slot(const Configuration& config) {
+  if (storage_owner_maintenance_foreground_busy(config)) {
+    return false;
+  }
+
+  const u32 max_workers = std::max<u32>(1, config.storage_owner_maintenance_workers);
+  const u32 active_insert_workers =
+    storage_owner_insert_active_workers_.load(std::memory_order_acquire);
+  const u32 allowed_workers = active_insert_workers == 0
+                                ? max_workers
+                                : std::max<u32>(1, max_workers / 2);
+
+  u32 active = storage_owner_maintenance_active_workers_.load(std::memory_order_acquire);
+  while (active < allowed_workers) {
+    if (storage_owner_maintenance_active_workers_.compare_exchange_weak(
+          active, active + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
       return true;
     }
   }
@@ -308,98 +249,74 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
              "storage-owner maintenance worker state missing");
   StorageOwnerThread& thread = *storage_owner_maintenance_worker_states_[worker_id];
   current_storage_owner_thread_ = &thread;
-
   const Configuration& config = *storage_worker_config_;
-  const auto budget = std::chrono::microseconds(config.storage_owner_maintenance_budget_us);
-  const auto period = std::chrono::microseconds(config.storage_owner_maintenance_period_us);
-  const u32 max_dirty_per_period =
-    std::max<u32>(1, config.storage_owner_maintenance_max_dirty_per_period);
-
-  auto queue_unqueued_locked = [&]() {
-    if (!storage_owner_maintenance_dirty_queue_.empty()) {
-      return;
-    }
-    for (auto& [key, dirty] : storage_owner_maintenance_dirty_) {
-      if (!dirty.queued) {
-        dirty.queued = true;
-        storage_owner_maintenance_dirty_queue_.push_back(key);
-        storage_owner_maintenance_enqueued_.fetch_add(1, std::memory_order_relaxed);
-        break;
-      }
-    }
-  };
 
   for (;;) {
-    const auto window_started = std::chrono::steady_clock::now();
-    u32 processed_this_period = 0;
-
-    while (processed_this_period < max_dirty_per_period) {
+    StorageOwnerMaintenanceTask task;
+    {
+      std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+      storage_owner_maintenance_cv_.wait(lock, [&]() {
+        return storage_owner_maintenance_shutdown_.load(std::memory_order_acquire) ||
+               !storage_owner_maintenance_tasks_.empty();
+      });
       if (storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
         current_storage_owner_thread_ = nullptr;
         return;
       }
-
-      if (storage_owner_maintenance_foreground_busy(config)) {
-        storage_owner_maintenance_skipped_busy_.fetch_add(1, std::memory_order_relaxed);
-        break;
-      }
-
-      StorageOwnerMaintenanceTask task;
-      {
-        std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
-        queue_unqueued_locked();
-        if (storage_owner_maintenance_dirty_queue_.empty()) {
-          storage_owner_maintenance_cv_.wait_until(lock, window_started + period, [&]() {
-            if (storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
-              return true;
-            }
-            queue_unqueued_locked();
-            return !storage_owner_maintenance_dirty_queue_.empty();
-          });
-          if (storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
-            current_storage_owner_thread_ = nullptr;
-            return;
-          }
-          queue_unqueued_locked();
-          if (storage_owner_maintenance_dirty_queue_.empty()) {
-            break;
-          }
-        }
-
-        const u64 key = storage_owner_maintenance_dirty_queue_.front();
-        storage_owner_maintenance_dirty_queue_.pop_front();
-        auto dirty = storage_owner_maintenance_dirty_.find(key);
-        if (dirty == storage_owner_maintenance_dirty_.end()) {
-          continue;
-        }
-        task = std::move(dirty->second);
-        task.queued = false;
-        storage_owner_maintenance_dirty_.erase(dirty);
-      }
-
-      const bool ok = repair_dirty_storage_owner_node(task, config);
-      if (ok) {
-        storage_owner_maintenance_processed_.fetch_add(1, std::memory_order_relaxed);
-      } else {
-        storage_owner_maintenance_failed_.fetch_add(1, std::memory_order_relaxed);
-      }
-      ++processed_this_period;
-
-      const auto elapsed =
-        std::chrono::duration_cast<std::chrono::microseconds>(
-          std::chrono::steady_clock::now() - window_started);
-      if (elapsed >= budget) {
-        break;
-      }
     }
 
-    const auto elapsed =
-      std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - window_started);
-    if (elapsed < period) {
-      std::this_thread::sleep_for(period - elapsed);
-    } else {
-      std::this_thread::yield();
+    if (!try_acquire_storage_owner_maintenance_slot(config)) {
+      storage_owner_maintenance_pressure_yields_.fetch_add(1, std::memory_order_relaxed);
+      std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+      storage_owner_maintenance_cv_.wait_for(lock, std::chrono::microseconds(100), [&]() {
+        return storage_owner_maintenance_shutdown_.load(std::memory_order_acquire);
+      });
+      continue;
+    }
+    CounterReleaseGuard active_slot(storage_owner_maintenance_active_workers_);
+
+    {
+      std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+      if (storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
+        current_storage_owner_thread_ = nullptr;
+        return;
+      }
+      if (storage_owner_maintenance_tasks_.empty()) {
+        continue;
+      }
+      task = std::move(storage_owner_maintenance_tasks_.front());
+      storage_owner_maintenance_tasks_.pop_front();
+    }
+
+    bool ok = true;
+    switch (task.kind) {
+      case StorageOwnerMaintenanceKind::finalize_insert:
+        ok = finalize_inserted_storage_owner_node(task, config);
+        if (ok) {
+          storage_owner_maintenance_processed_.fetch_add(1, std::memory_order_relaxed);
+        }
+        break;
+      case StorageOwnerMaintenanceKind::cleanup_deleted_node:
+        ok = cleanup_deleted_storage_owner_node(task, config);
+        if (ok) {
+          storage_owner_maintenance_cleanup_processed_.fetch_add(1, std::memory_order_relaxed);
+        }
+        break;
+    }
+    if (!ok) {
+      storage_owner_maintenance_failed_.fetch_add(1, std::memory_order_relaxed);
+      if (!storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
+        {
+          std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
+          if (!storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
+            storage_owner_maintenance_tasks_.push_back(std::move(task));
+            update_max_relaxed(storage_owner_maintenance_max_backlog_,
+                               static_cast<u64>(storage_owner_maintenance_tasks_.size()));
+          }
+        }
+        storage_owner_maintenance_cv_.notify_one();
+        std::this_thread::yield();
+      }
     }
   }
 }
@@ -425,181 +342,213 @@ bool MemoryNode::try_lock_node(RemotePtr rptr) {
   return false;
 }
 
-bool MemoryNode::repair_dirty_storage_owner_node(const StorageOwnerMaintenanceTask& task,
-                                                 const Configuration& config) {
-  const bool allow_expand = task.expand_hint || task.tombstone_hint || task.dirty_count >= 4;
-  return repair_storage_owner_neighbors(task.target, task.candidates, allow_expand, config);
+bool MemoryNode::storage_owner_task_current(node_t id, u32 generation, RemotePtr target) {
+  std::lock_guard<std::mutex> lock(idmap_mutex_);
+  const auto it = idmap_.find(id);
+  return it != idmap_.end() &&
+         !it->second.deleted &&
+         it->second.generation == generation &&
+         it->second.current == target;
 }
 
-bool MemoryNode::repair_storage_owner_neighbors(RemotePtr target_ptr,
-                                                const vec<RemotePtr>& candidate_ptrs,
-                                                bool allow_expand,
-                                                const Configuration& config) {
-  if (target_ptr.is_null() || !local_shard(target_ptr.memory_node())) {
+vec<RemotePtr> MemoryNode::read_preserved_neighbor_list(RemotePtr rptr) {
+  if (rptr.is_null()) {
+    return {};
+  }
+  if (!VamanaNode::compact_storage()) {
+    return read_neighbor_list(rptr);
+  }
+
+  vec<byte_t> entry(VamanaNode::hot_graph_entry_size());
+  const u64 hot_offset = VamanaNode::hot_graph_entry_offset(rptr);
+  if (local_shard(rptr.memory_node())) {
+    std::memcpy(entry.data(),
+                index_buffer_.get_full_buffer() + hot_offset,
+                entry.size());
+  } else {
+    remote_read_bytes(rptr.memory_node(), hot_offset, entry.data(), entry.size(), 0);
+  }
+
+  if (VamanaNode::HOT_GRAPH_FORMAT_VERSION >= 2) {
+    const u8 edge_count = entry[0];
+    if (edge_count > VamanaNode::R) {
+      return {};
+    }
+    const u16 expected = vamana::hot_graph::load_u16_le(entry.data() + 2);
+    const u16 actual = vamana::hot_graph::checksum16(entry.data(), entry.size());
+    if (expected != actual) {
+      return {};
+    }
+    vec<RemotePtr> neighbors;
+    neighbors.reserve(edge_count);
+    for (u32 i = 0; i < edge_count; ++i) {
+      RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
+        entry.data() + vamana::hot_graph::neighbor_offset(i),
+        VamanaNode::HOT_GRAPH_SHARD_BITS);
+      if (!neighbor.is_null()) {
+        neighbors.push_back(neighbor);
+      }
+    }
+    return neighbors;
+  }
+
+  vec<byte_t> decoded(VamanaNode::neighbor_read_size());
+  if (!VamanaNode::decode_hot_graph_entry(entry.data(), decoded.data())) {
+    return {};
+  }
+  const u8 edge_count =
+    *reinterpret_cast<const u8*>(decoded.data() + VamanaNode::neighbor_count_offset_in_read());
+  const auto* slots = reinterpret_cast<const RemotePtr*>(
+    decoded.data() + VamanaNode::neighbor_payload_offset_in_read());
+  vec<RemotePtr> neighbors;
+  neighbors.reserve(edge_count);
+  for (u32 i = 0; i < edge_count && i < VamanaNode::R; ++i) {
+    if (!slots[i].is_null()) {
+      neighbors.push_back(slots[i]);
+    }
+  }
+  return neighbors;
+}
+
+bool MemoryNode::remove_local_neighbor(RemotePtr target_ptr,
+                                       RemotePtr deleted_ptr,
+                                       const Configuration&) {
+  if (target_ptr.is_null() || deleted_ptr.is_null() || !local_shard(target_ptr.memory_node())) {
     return false;
   }
 
-  const size_t candidate_limit = maintenance_candidate_limit(config);
-  for (u32 attempt = 0; attempt < 2; ++attempt) {
-    if (!try_lock_node(target_ptr)) {
-      StorageOwnerMaintenanceTask deferred;
-      deferred.target = target_ptr;
-      deferred.candidates = candidate_ptrs;
-      deferred.dirty_count = 1;
-      deferred.expand_hint = allow_expand;
-      storage_owner_maintenance_skipped_busy_.fetch_add(1, std::memory_order_relaxed);
-      (void)enqueue_storage_owner_maintenance(std::move(deferred), config);
-      return true;
-    }
-
-    NodeSnapshot target_snapshot;
-    if (!read_node_snapshot(target_ptr, target_snapshot)) {
-      unlock_node(target_ptr);
-      return false;
-    }
-    if (target_snapshot.deleted) {
-      unlock_node(target_ptr);
-      return true;
-    }
-    const vec<RemotePtr> current_neighbors = read_neighbor_list(target_ptr);
+  lock_node(target_ptr);
+  NodeSnapshot snapshot;
+  if (!read_node_snapshot(target_ptr, snapshot)) {
     unlock_node(target_ptr);
-
-    vec<RemotePtr> repair_candidates;
-    repair_candidates.reserve(
-      std::min(candidate_limit, current_neighbors.size() + candidate_ptrs.size()));
-    append_unique_all(repair_candidates, current_neighbors, candidate_limit, target_ptr);
-    append_unique_all(repair_candidates, candidate_ptrs, candidate_limit, target_ptr);
-
-    if (allow_expand && config.storage_owner_maintenance_max_expansions > 0) {
-      vec<RemotePtr> expansion_roots;
-      expansion_roots.reserve(config.storage_owner_maintenance_max_expansions);
-      append_unique_all(expansion_roots,
-                        current_neighbors,
-                        config.storage_owner_maintenance_max_expansions,
-                        target_ptr);
-      append_unique_all(expansion_roots,
-                        candidate_ptrs,
-                        config.storage_owner_maintenance_max_expansions,
-                        target_ptr);
-      for (const RemotePtr& root : expansion_roots) {
-        if (repair_candidates.size() >= candidate_limit) {
-          break;
-        }
-        append_unique_all(repair_candidates, read_neighbor_list(root), candidate_limit, target_ptr);
-      }
-      storage_owner_maintenance_expand_repairs_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    hashset_t<RemotePtr> skip;
-    skip.insert(target_ptr);
-    vec<RemotePtr> repaired = robust_prune_cpu(target_snapshot.vector_data.data(),
-                                               VamanaNode::vector_dtype(),
-                                               repair_candidates,
-                                               skip,
-                                               config,
-                                               nullptr,
-                                               static_cast<u32>(candidate_limit));
-
-    static std::atomic<u64> audit_sequence{0};
-    const u64 sequence = audit_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (config.storage_owner_maintenance_exact_audit_rate != 0 &&
-        sequence % config.storage_owner_maintenance_exact_audit_rate == 0) {
-      RemotePtr medoid = read_global_medoid();
-      if (!medoid.is_null()) {
-        vec<element_t> query = decode_storage_vector_to_float(
-          target_snapshot.vector_data.data(), VamanaNode::vector_dtype(), VamanaNode::DIM);
-        vec<RemotePtr> exact_candidates =
-          beam_search_candidates(span<const element_t>{query.data(), query.size()}, medoid, config, nullptr);
-        vec<RemotePtr> exact_repaired = robust_prune_cpu(target_snapshot.vector_data.data(),
-                                                         VamanaNode::vector_dtype(),
-                                                         exact_candidates,
-                                                         skip,
-                                                         config,
-                                                         nullptr,
-                                                         static_cast<u32>(candidate_limit));
-        if (!exact_repaired.empty() &&
-            storage_owner_candidate_overlap(repaired, exact_repaired, config.R) <
-              config.storage_owner_maintenance_audit_min_overlap) {
-          repaired = std::move(exact_repaired);
-        }
-      }
-    }
-
-    if (!try_lock_node(target_ptr)) {
-      StorageOwnerMaintenanceTask deferred;
-      deferred.target = target_ptr;
-      deferred.candidates = candidate_ptrs;
-      deferred.dirty_count = 1;
-      deferred.expand_hint = allow_expand;
-      storage_owner_maintenance_skipped_busy_.fetch_add(1, std::memory_order_relaxed);
-      (void)enqueue_storage_owner_maintenance(std::move(deferred), config);
-      return true;
-    }
-
-    NodeSnapshot latest_snapshot;
-    if (!read_node_snapshot(target_ptr, latest_snapshot)) {
-      unlock_node(target_ptr);
-      return false;
-    }
-    if (latest_snapshot.deleted) {
-      unlock_node(target_ptr);
-      return true;
-    }
-
-    const vec<RemotePtr> latest_neighbors = read_neighbor_list(target_ptr);
-    if (!same_neighbors(current_neighbors, latest_neighbors)) {
-      if (attempt == 0) {
-        unlock_node(target_ptr);
-        continue;
-      }
-      vec<RemotePtr> merged_candidates;
-      merged_candidates.reserve(candidate_limit);
-      append_unique_all(merged_candidates, latest_neighbors, candidate_limit, target_ptr);
-      append_unique_all(merged_candidates, candidate_ptrs, candidate_limit, target_ptr);
-      append_unique_all(merged_candidates, repaired, candidate_limit, target_ptr);
-      repaired = robust_prune_cpu(latest_snapshot.vector_data.data(),
-                                  VamanaNode::vector_dtype(),
-                                  merged_candidates,
-                                  skip,
-                                  config,
-                                  nullptr,
-                                  static_cast<u32>(candidate_limit));
-    }
-
-    vec<RemotePtr> added_neighbors;
-    if (!same_neighbors(latest_neighbors, repaired)) {
-      write_neighbor_list(target_ptr, repaired);
-      storage_owner_maintenance_local_repairs_.fetch_add(1, std::memory_order_relaxed);
-      for (const RemotePtr& neighbor : repaired) {
-        if (!contains_ptr(latest_neighbors, neighbor)) {
-          added_neighbors.push_back(neighbor);
-        }
-      }
-    }
+    return false;
+  }
+  if (snapshot.deleted) {
     unlock_node(target_ptr);
-
-    if (!added_neighbors.empty()) {
-      std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_dirty;
-      for (const RemotePtr& neighbor : added_neighbors) {
-        if (local_shard(neighbor.memory_node())) {
-          vec<RemotePtr> reverse_candidate{target_ptr};
-          (void)enqueue_reverse_edge_repair(neighbor, reverse_candidate, config);
-        } else {
-          remote_dirty[neighbor.memory_node()].push_back(
-            service::storage_owner::ReverseUpdateOp{neighbor.raw_address, target_ptr.raw_address});
-        }
-      }
-      for (auto& [target_shard, ops] : remote_dirty) {
-        (void)send_maintenance_dirty_batch(target_shard, ops, config);
-      }
-    }
     return true;
+  }
+
+  vec<RemotePtr> neighbors = read_neighbor_list(target_ptr);
+  const auto old_size = neighbors.size();
+  neighbors.erase(std::remove(neighbors.begin(), neighbors.end(), deleted_ptr), neighbors.end());
+  if (neighbors.size() != old_size) {
+    write_neighbor_list(target_ptr, neighbors);
+  }
+  unlock_node(target_ptr);
+  return true;
+}
+
+bool MemoryNode::finalize_inserted_storage_owner_node(const StorageOwnerMaintenanceTask& task,
+                                                      const Configuration& config) {
+  if (!local_shard(task.target.memory_node())) {
+    return true;
+  }
+  if (!storage_owner_task_current(task.id, task.generation, task.target)) {
+    storage_owner_maintenance_stale_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+
+  NodeSnapshot target_snapshot;
+  if (!read_node_snapshot(task.target, target_snapshot)) {
+    return false;
+  }
+  if (target_snapshot.deleted) {
+    storage_owner_maintenance_stale_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+
+  RemotePtr medoid = read_global_medoid();
+  if (medoid.is_null()) {
+    return true;
+  }
+
+  vec<element_t> query = decode_storage_vector_to_float(
+    target_snapshot.vector_data.data(), VamanaNode::vector_dtype(), VamanaNode::DIM);
+  vec<RemotePtr> candidates =
+    beam_search_candidates(span<const element_t>{query.data(), query.size()}, medoid, config, nullptr);
+
+  hashset_t<RemotePtr> skip;
+  skip.insert(task.target);
+  vec<RemotePtr> final_neighbors = robust_prune_cpu(target_snapshot.vector_data.data(),
+                                                    VamanaNode::vector_dtype(),
+                                                    candidates,
+                                                    skip,
+                                                    config,
+                                                    nullptr);
+
+  lock_node(task.target);
+  if (!storage_owner_task_current(task.id, task.generation, task.target)) {
+    unlock_node(task.target);
+    storage_owner_maintenance_stale_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  NodeSnapshot latest_snapshot;
+  if (!read_node_snapshot(task.target, latest_snapshot)) {
+    unlock_node(task.target);
+    return false;
+  }
+  if (latest_snapshot.deleted) {
+    unlock_node(task.target);
+    storage_owner_maintenance_stale_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  const vec<RemotePtr> current_neighbors = read_neighbor_list(task.target);
+  if (!same_neighbors(current_neighbors, final_neighbors)) {
+    write_neighbor_list(task.target, final_neighbors);
+  }
+  unlock_node(task.target);
+
+  std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
+  for (const RemotePtr& neighbor : final_neighbors) {
+    if (local_shard(neighbor.memory_node())) {
+      vec<RemotePtr> reverse_candidate{task.target};
+      if (!apply_local_reverse_update(neighbor, reverse_candidate, config, false)) {
+        return false;
+      }
+    } else {
+      remote_updates[neighbor.memory_node()].push_back(
+        service::storage_owner::ReverseUpdateOp{neighbor.raw_address, task.target.raw_address});
+    }
+  }
+  for (auto& [target_shard, ops] : remote_updates) {
+    if (!send_reverse_update_batch(target_shard, ops, config)) {
+      return false;
+    }
   }
   return true;
 }
 
-bool MemoryNode::repair_inserted_storage_owner_node(RemotePtr target_ptr,
-                                                    const vec<RemotePtr>& candidates,
+bool MemoryNode::cleanup_deleted_storage_owner_node(const StorageOwnerMaintenanceTask& task,
                                                     const Configuration& config) {
-  return repair_storage_owner_neighbors(target_ptr, candidates, false, config);
+  if (task.target.is_null()) {
+    return true;
+  }
+
+  NodeSnapshot deleted_snapshot;
+  if (!read_node_snapshot(task.target, deleted_snapshot)) {
+    return false;
+  }
+  if (!deleted_snapshot.deleted) {
+    storage_owner_maintenance_stale_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+
+  const vec<RemotePtr> old_neighbors = read_preserved_neighbor_list(task.target);
+  std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_cleanup;
+  bool ok = true;
+  for (const RemotePtr& neighbor : old_neighbors) {
+    if (neighbor.is_null()) {
+      continue;
+    }
+    if (local_shard(neighbor.memory_node())) {
+      ok &= remove_local_neighbor(neighbor, task.target, config);
+    } else {
+      remote_cleanup[neighbor.memory_node()].push_back(
+        service::storage_owner::ReverseUpdateOp{neighbor.raw_address, task.target.raw_address});
+    }
+  }
+  for (auto& [target_shard, ops] : remote_cleanup) {
+    ok &= send_cleanup_deleted_batch(target_shard, ops, config);
+  }
+  return ok;
 }

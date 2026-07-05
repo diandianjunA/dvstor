@@ -197,13 +197,32 @@ bool MemoryNode::mark_node_deleted(RemotePtr rptr, u32 generation) {
     remote_write_bytes(rptr.memory_node(), header_addr.offset, &header, sizeof(header), 0);
   }
   if (VamanaNode::compact_storage()) {
-    vec<byte_t> entry(VamanaNode::hot_graph_entry_size(), 0);
-    VamanaNode::encode_hot_graph_entry(entry.data(), 0, 0, nullptr, 0,
-      VamanaNode::HOT_GRAPH_SHARD_BITS, generation, 2, true);
     const u64 hot_offset = VamanaNode::hot_graph_entry_offset(rptr);
     if (local_shard(rptr.memory_node())) {
-      std::memcpy(index_buffer_.get_full_buffer() + hot_offset, entry.data(), entry.size());
+      byte_t* entry = index_buffer_.get_full_buffer() + hot_offset;
+      if (VamanaNode::HOT_GRAPH_FORMAT_VERSION >= 2) {
+        entry[1] |= VamanaNode::HOT_GRAPH_DELETED;
+        vamana::hot_graph::store_u32_le(entry + 4, generation);
+        const u16 checksum = vamana::hot_graph::checksum16(entry, VamanaNode::hot_graph_entry_size());
+        vamana::hot_graph::store_u16_le(entry + 2, checksum);
+      } else {
+        vec<byte_t> empty_entry(VamanaNode::hot_graph_entry_size(), 0);
+        VamanaNode::encode_hot_graph_entry(empty_entry.data(), 0, 0, nullptr, 0,
+          VamanaNode::HOT_GRAPH_SHARD_BITS, generation, VamanaNode::HOT_GRAPH_FORMAT_VERSION, true);
+        std::memcpy(entry, empty_entry.data(), empty_entry.size());
+      }
     } else {
+      vec<byte_t> entry(VamanaNode::hot_graph_entry_size(), 0);
+      remote_read_bytes(rptr.memory_node(), hot_offset, entry.data(), entry.size(), 0);
+      if (VamanaNode::HOT_GRAPH_FORMAT_VERSION >= 2) {
+        entry[1] |= VamanaNode::HOT_GRAPH_DELETED;
+        vamana::hot_graph::store_u32_le(entry.data() + 4, generation);
+        const u16 checksum = vamana::hot_graph::checksum16(entry.data(), entry.size());
+        vamana::hot_graph::store_u16_le(entry.data() + 2, checksum);
+      } else {
+        VamanaNode::encode_hot_graph_entry(entry.data(), 0, 0, nullptr, 0,
+          VamanaNode::HOT_GRAPH_SHARD_BITS, generation, VamanaNode::HOT_GRAPH_FORMAT_VERSION, true);
+      }
       remote_write_bytes(rptr.memory_node(), hot_offset, entry.data(), entry.size(), 0);
     }
   }
@@ -1333,17 +1352,13 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
     co_return;
   }
   if (job.kind == service::storage_owner::MutationKind::erase) {
-    vec<RemotePtr> old_neighbors;
-    if (maintenance_enabled && !old_entry.current.is_null()) {
-      old_neighbors = read_neighbor_list(old_entry.current);
-    }
     job.ok = mark_node_deleted(old_entry.current, old_entry.generation);
     job.status = job.ok ? service::storage_owner::MutationStatus::ok
                         : service::storage_owner::MutationStatus::failed;
     if (job.ok) {
       publish_mutation(job.id, old_entry.current, old_entry.generation, true);
       if (maintenance_enabled) {
-        (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
+        (void)enqueue_deleted_node_cleanup(old_entry.current, config);
       }
     }
     co_return;
@@ -1424,17 +1439,13 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
     if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
       job.ok = true;
       job.status = service::storage_owner::MutationStatus::ok;
-      vec<RemotePtr> old_neighbors;
       if (job.kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
-        if (maintenance_enabled && !old_entry.current.is_null()) {
-          old_neighbors = read_neighbor_list(old_entry.current);
-        }
         mark_node_deleted(old_entry.current, old_entry.generation);
       }
       publish_mutation(job.id, new_ptr, generation, false);
       if (maintenance_enabled) {
-        (void)enqueue_inserted_node_repair(new_ptr, vec<RemotePtr>{}, config);
-        (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
+        (void)enqueue_insert_finalization(job.id, generation, new_ptr, config);
+        (void)enqueue_deleted_node_cleanup(old_entry.current, config);
       }
       co_return;
     }
@@ -1481,25 +1492,23 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   auto t_write = std::chrono::steady_clock::now();
   write_new_node(new_ptr, job.id, components, selected_neighbors, generation);
   breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
-  vec<RemotePtr> old_neighbors;
   if (job.kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
-    if (maintenance_enabled && !old_entry.current.is_null()) {
-      old_neighbors = read_neighbor_list(old_entry.current);
-    }
     mark_node_deleted(old_entry.current, old_entry.generation);
   }
   publish_mutation(job.id, new_ptr, generation, false);
   if (maintenance_enabled) {
-    (void)enqueue_inserted_node_repair(new_ptr, selected_neighbors, config);
-    (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
+    (void)enqueue_insert_finalization(job.id, generation, new_ptr, config);
+    (void)enqueue_deleted_node_cleanup(old_entry.current, config);
   }
 
-  for (const RemotePtr& neighbor_ptr : selected_neighbors) {
-    if (local_shard(neighbor_ptr.memory_node())) {
-      local_updates[neighbor_ptr.raw_address].push_back(new_ptr);
-    } else {
-      remote_updates[neighbor_ptr.memory_node()].push_back(
-        service::storage_owner::ReverseUpdateOp{neighbor_ptr.raw_address, new_ptr.raw_address});
+  if (!maintenance_enabled) {
+    for (const RemotePtr& neighbor_ptr : selected_neighbors) {
+      if (local_shard(neighbor_ptr.memory_node())) {
+        local_updates[neighbor_ptr.raw_address].push_back(new_ptr);
+      } else {
+        remote_updates[neighbor_ptr.memory_node()].push_back(
+          service::storage_owner::ReverseUpdateOp{neighbor_ptr.raw_address, new_ptr.raw_address});
+      }
     }
   }
   job.ok = true;
@@ -1532,7 +1541,10 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
 
   NodeSnapshot target_snapshot;
   auto step_started = std::chrono::steady_clock::now();
-  read_node_snapshot(target_ptr, target_snapshot);
+  if (!read_node_snapshot(target_ptr, target_snapshot) || target_snapshot.deleted) {
+    unlock_node(target_ptr);
+    return true;
+  }
   snapshot_ns = elapsed_ns_since(step_started);
 
   step_started = std::chrono::steady_clock::now();
@@ -1653,9 +1665,7 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
   }
   unlock_node(target_ptr);
 
-  if (changed && enqueue_maintenance && storage_owner_maintenance_enabled(config)) {
-    (void)enqueue_reverse_edge_repair(target_ptr, filtered_candidates, config);
-  }
+  (void)enqueue_maintenance;
 
   const u64 update_ns = elapsed_ns_since(update_started);
   if (update_ns > 1000ull * 1000ull * 1000ull) {
