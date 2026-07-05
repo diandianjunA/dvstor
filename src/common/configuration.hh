@@ -90,12 +90,13 @@ public:
   u32 storage_owner_anchor_audit_rate{256};
   f64 storage_owner_anchor_min_overlap{0.5};
   bool storage_owner_anchor_rehome_upsert{false};
-  u32 storage_owner_route_top_owners{2};
+  u32 storage_owner_route_top_owners{1};
   f64 storage_owner_route_confidence_threshold{0.0};
   u32 storage_owner_anchor_refresh_interval{100000};
   u32 storage_owner_dynamic_anchor_cap{64};
   u32 storage_owner_repair_workers{1};
   u32 storage_owner_repair_budget_us{0};
+  u32 storage_owner_repair_period_us{1000};
   u32 storage_owner_repair_queue_depth{65536};
   u32 storage_owner_pending_edge_cap{256};
   str storage_owner_reverse_mode{"async"};
@@ -241,7 +242,7 @@ private:
       "Allow anchored upserts to migrate ID ownership. Disabled until distributed two-phase ownership is enabled.")(
       "storage-owner-route-top-owners",
       po::value<u32>(&storage_owner_route_top_owners)->default_value(storage_owner_route_top_owners),
-      "Number of owner candidates considered by ALDI route scoring.")(
+      "Maximum owner shards used for ALDI anchor hints. 1 keeps the foreground path owner-local; >1 enables cross-owner rescue.")(
       "storage-owner-route-confidence-threshold",
       po::value<f64>(&storage_owner_route_confidence_threshold)->default_value(storage_owner_route_confidence_threshold),
       "Minimum ALDI route confidence accepted by foreground anchored search before exact fallback. 0 disables foreground exact fallback.")(
@@ -256,7 +257,10 @@ private:
       "Background repair workers reserved for ALDI dirty-node maintenance.")(
       "storage-owner-repair-budget-us",
       po::value<u32>(&storage_owner_repair_budget_us)->default_value(storage_owner_repair_budget_us),
-      "Per-worker ALDI background repair budget in microseconds before yielding. 0 disables background repair.")(
+      "Per-worker ALDI background repair CPU budget per period in microseconds. 0 disables background repair.")(
+      "storage-owner-repair-period-us",
+      po::value<u32>(&storage_owner_repair_period_us)->default_value(storage_owner_repair_period_us),
+      "Per-worker ALDI background repair period in microseconds.")(
       "storage-owner-repair-queue-depth",
       po::value<u32>(&storage_owner_repair_queue_depth)->default_value(storage_owner_repair_queue_depth),
       "Maximum dirty targets queued for ALDI background graph repair.")(
@@ -478,6 +482,11 @@ private:
         std::cerr << "[ERROR]: --storage-owner-repair-queue-depth must be > 0 when repair workers are enabled" << std::endl;
         exit_with_help_message(argv);
       }
+      if (storage_owner_repair_workers > 0 && storage_owner_repair_budget_us > 0 &&
+          storage_owner_repair_period_us == 0) {
+        std::cerr << "[ERROR]: --storage-owner-repair-period-us must be > 0 when repair budget is enabled" << std::endl;
+        exit_with_help_message(argv);
+      }
       if (storage_owner_reverse_coalesce_max == 0) {
         std::cerr << "[ERROR]: --storage-owner-reverse-coalesce-max must be > 0" << std::endl;
         exit_with_help_message(argv);
@@ -583,6 +592,8 @@ public:
            << config.storage_owner_repair_workers << std::endl;
         os << std::setw(width) << "storage repair budget(us): "
            << config.storage_owner_repair_budget_us << std::endl;
+        os << std::setw(width) << "storage repair period(us): "
+           << config.storage_owner_repair_period_us << std::endl;
         os << std::setw(width) << "storage repair queue depth: "
            << config.storage_owner_repair_queue_depth << std::endl;
         os << std::setw(width) << "storage pending edge cap: "

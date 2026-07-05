@@ -110,6 +110,8 @@ void MemoryNode::storage_owner_repair_worker_loop(u32 worker_id) {
                                     : nullptr;
   const Configuration& config = *storage_worker_config_;
   const auto budget = std::chrono::microseconds(config.storage_owner_repair_budget_us);
+  const auto period = std::chrono::microseconds(
+    std::max(config.storage_owner_repair_period_us, config.storage_owner_repair_budget_us));
   auto window_started = std::chrono::steady_clock::now();
   for (;;) {
     StorageOwnerRepairTask task;
@@ -136,10 +138,18 @@ void MemoryNode::storage_owner_repair_worker_loop(u32 worker_id) {
     }
 
     (void)repair_storage_owner_neighbors(task.target, task.candidates, config);
-    if (budget.count() > 0 &&
-        std::chrono::steady_clock::now() - window_started >= budget) {
-      std::this_thread::yield();
-      window_started = std::chrono::steady_clock::now();
+    if (budget.count() > 0) {
+      const auto now = std::chrono::steady_clock::now();
+      const auto elapsed = now - window_started;
+      if (elapsed >= budget) {
+        const auto elapsed_us =
+          std::chrono::duration_cast<std::chrono::microseconds>(elapsed);
+        const auto sleep_us = elapsed_us < period
+                                ? period - elapsed_us
+                                : std::chrono::microseconds(1);
+        std::this_thread::sleep_for(sleep_us);
+        window_started = std::chrono::steady_clock::now();
+      }
     }
   }
 }

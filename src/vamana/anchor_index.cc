@@ -285,11 +285,15 @@ Route Index::route(const span<const element_t> query,
   }
 
   vec<u32> hint_shards;
-  hint_shards.reserve(ranked_shards.size() + 1);
+  hint_shards.reserve(std::min<size_t>(ranked_shards.size() + 1, owner_count));
   hint_shards.push_back(route.owner);
-  const u32 hint_owner_count = std::min<u32>(owner_count, static_cast<u32>(ranked_shards.size()));
-  for (u32 i = 0; i < hint_owner_count; ++i) {
-    const ShardScore& score = ranked_shards[i];
+
+  // Keep the default foreground path owner-local. When upsert ownership is
+  // fixed, extra semantic owners are rescue hints and must be explicitly budgeted.
+  for (const ShardScore& score : ranked_shards) {
+    if (hint_shards.size() >= owner_count) {
+      break;
+    }
     if (std::find(hint_shards.begin(), hint_shards.end(), score.shard) == hint_shards.end()) {
       hint_shards.push_back(score.shard);
     }
