@@ -328,7 +328,7 @@ write_service_config() {
         echo "storage-owner-anchor-min-overlap = ${STORAGE_OWNER_ANCHOR_MIN_OVERLAP:-0.5}"
         echo "storage-owner-anchor-rehome-upsert = ${STORAGE_OWNER_ANCHOR_REHOME_UPSERT:-0}"
         echo "storage-owner-route-top-owners = ${STORAGE_OWNER_ROUTE_TOP_OWNERS:-2}"
-        echo "storage-owner-route-confidence-threshold = ${STORAGE_OWNER_ROUTE_CONFIDENCE_THRESHOLD:-0.10}"
+        echo "storage-owner-route-confidence-threshold = ${STORAGE_OWNER_ROUTE_CONFIDENCE_THRESHOLD:-0.0}"
         echo "storage-owner-anchor-refresh-interval = ${STORAGE_OWNER_ANCHOR_REFRESH_INTERVAL:-100000}"
         echo "storage-owner-dynamic-anchor-cap = ${STORAGE_OWNER_DYNAMIC_ANCHOR_CAP:-64}"
       fi

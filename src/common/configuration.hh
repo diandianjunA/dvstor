@@ -91,7 +91,7 @@ public:
   f64 storage_owner_anchor_min_overlap{0.5};
   bool storage_owner_anchor_rehome_upsert{false};
   u32 storage_owner_route_top_owners{2};
-  f64 storage_owner_route_confidence_threshold{0.10};
+  f64 storage_owner_route_confidence_threshold{0.0};
   u32 storage_owner_anchor_refresh_interval{100000};
   u32 storage_owner_dynamic_anchor_cap{64};
   u32 storage_owner_repair_workers{1};
@@ -244,7 +244,7 @@ private:
       "Number of owner candidates considered by ALDI route scoring.")(
       "storage-owner-route-confidence-threshold",
       po::value<f64>(&storage_owner_route_confidence_threshold)->default_value(storage_owner_route_confidence_threshold),
-      "Minimum ALDI route confidence accepted by foreground anchored search before exact fallback.")(
+      "Minimum ALDI route confidence accepted by foreground anchored search before exact fallback. 0 disables foreground exact fallback.")(
       "storage-owner-anchor-refresh-interval",
       po::value<u32>(&storage_owner_anchor_refresh_interval)->default_value(storage_owner_anchor_refresh_interval),
       "Foreground updates between ALDI anchor refresh opportunities. 0 disables refresh hooks.")(

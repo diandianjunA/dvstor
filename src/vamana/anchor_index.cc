@@ -153,15 +153,23 @@ bool Index::add_runtime_anchor(u32 shard_id,
   return true;
 }
 
+distance_t Index::centroid_distance(const span<const element_t> query, u32 shard_id) const {
+  if (shard_id >= shards_.size()) {
+    return std::numeric_limits<distance_t>::max();
+  }
+  const auto& shard = shards_[shard_id];
+  if (shard.centroid.size() == dim_) {
+    return L2Distance::dist(query, shard.centroid, dim_);
+  }
+  return std::numeric_limits<distance_t>::max();
+}
+
 distance_t Index::shard_distance(const span<const element_t> query, u32 shard_id) const {
   if (shard_id >= shards_.size()) {
     return std::numeric_limits<distance_t>::max();
   }
   const auto& shard = shards_[shard_id];
-  distance_t best_distance = std::numeric_limits<distance_t>::max();
-  if (shard.centroid.size() == dim_) {
-    best_distance = L2Distance::dist(query, shard.centroid, dim_);
-  }
+  distance_t best_distance = centroid_distance(query, shard_id);
   for (u32 i = 0; i < shard.pointers.size(); ++i) {
     const span<const element_t> anchor{
       shard.vectors.data() + static_cast<size_t>(i) * dim_, dim_};
@@ -182,7 +190,7 @@ Index::ShardScore Index::nearest_shard(const span<const element_t> query,
   }
   distance_t best_distance = std::numeric_limits<distance_t>::max();
   for (u32 shard = 0; shard < shards_.size(); ++shard) {
-    const distance_t distance = shard_distance(query, shard);
+    const distance_t distance = centroid_distance(query, shard);
     if (distance < best_distance) {
       second = best_distance;
       best_distance = distance;
@@ -204,7 +212,7 @@ vec<Index::ShardScore> Index::top_shards(const span<const element_t> query, u32 
   }
   scores.reserve(shards_.size());
   for (u32 shard = 0; shard < shards_.size(); ++shard) {
-    scores.push_back(ShardScore{shard, shard_distance(query, shard)});
+    scores.push_back(ShardScore{shard, centroid_distance(query, shard)});
   }
   const u32 keep = std::min<u32>(count, static_cast<u32>(scores.size()));
   std::partial_sort(scores.begin(), scores.begin() + keep, scores.end(),

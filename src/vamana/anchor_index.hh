@@ -82,6 +82,7 @@ private:
   ShardScore nearest_shard(const span<const element_t> query,
                            distance_t* second_distance = nullptr) const;
   vec<ShardScore> top_shards(const span<const element_t> query, u32 count) const;
+  distance_t centroid_distance(const span<const element_t> query, u32 shard) const;
   distance_t shard_distance(const span<const element_t> query, u32 shard) const;
   vec<RemotePtr> nearest_anchors(const span<const element_t> query,
                                  u32 shard,
