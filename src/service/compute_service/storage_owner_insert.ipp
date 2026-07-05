@@ -29,13 +29,6 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
       const auto route = route_storage_owner_update(item);
       task->anchor_hints = route.hints;
       const u32 owner_storage = route.owner;
-      task->route_metadata.semantic_owner = route.semantic_owner;
-      task->route_metadata.anchor_version = route.anchor_version;
-      task->route_metadata.route_confidence = route.confidence;
-      task->route_metadata.flags = route.flags;
-      if (route.confidence < config_.storage_owner_route_confidence_threshold) {
-        task->route_metadata.flags |= service::storage_owner::kRouteFlagLowConfidence;
-      }
       auto& state = *storage_insert_owners_[owner_storage];
       {
         std::lock_guard<std::mutex> lock(state.mutex);
@@ -190,34 +183,13 @@ size_t ComputeService<Distance>::upsert(const vec<InsertItem>& batch) {
     if (item.values.size() != config_.dim) {
       throw std::invalid_argument("upsert dimension mismatch");
     }
-    RemotePtr old_ptr{};
-    bool deleted = false;
-    u32 old_generation = 0;
-    u32 old_owner = storage_owner_for_id(item.id);
-    const bool old_live = lookup_compute_side_id(item.id, &old_ptr, &deleted, &old_generation, &old_owner) &&
-                          !deleted;
     auto task = std::make_unique<StorageInsertTask>();
     task->item = item;
     task->kind = service::storage_owner::MutationKind::upsert;
     futures.push_back(task->result.get_future());
-    const auto route = config_.storage_owner_anchor_rehome_upsert
-      ? route_storage_owner_update(item)
-      : route_storage_owner_update(item, old_owner);
+    const u32 owner_storage = storage_owner_for_id(item.id);
+    const auto route = route_storage_owner_update(item, owner_storage);
     task->anchor_hints = route.hints;
-    task->route_metadata.old_rptr_raw = old_live ? old_ptr.raw_address : 0;
-    task->route_metadata.old_generation = old_live ? old_generation : 0;
-    task->route_metadata.old_owner = old_owner;
-    task->route_metadata.semantic_owner = route.semantic_owner;
-    task->route_metadata.anchor_version = route.anchor_version;
-    task->route_metadata.route_confidence = route.confidence;
-    task->route_metadata.flags = route.flags;
-    if (route.confidence < config_.storage_owner_route_confidence_threshold) {
-      task->route_metadata.flags |= service::storage_owner::kRouteFlagLowConfidence;
-    }
-    const u32 owner_storage = route.owner;
-    if (old_live && owner_storage != old_owner) {
-      task->route_metadata.flags |= service::storage_owner::kRouteFlagRehome;
-    }
     auto& state = *storage_insert_owners_[owner_storage];
     {
       std::lock_guard<std::mutex> lock(state.mutex);
@@ -535,9 +507,6 @@ void ComputeService<Distance>::post_storage_owner_batch(
   u64* anchor_hints = mutation_request
     ? service::storage_owner::mutation_request_anchor_hints(slot.request_buffer.data(), item_count)
     : service::storage_owner::request_anchor_hints(slot.request_buffer.data(), item_count);
-  service::storage_owner::RouteMetadata* route_metadata = mutation_request
-    ? service::storage_owner::mutation_request_route_metadata(slot.request_buffer.data(), item_count)
-    : service::storage_owner::request_route_metadata(slot.request_buffer.data(), item_count);
   for (u32 i = 0; i < item_count; ++i) {
     ids[i] = slot.tasks[i]->item.id;
     if (kinds != nullptr) {
@@ -554,9 +523,6 @@ void ComputeService<Distance>::post_storage_owner_batch(
       anchor_hints[static_cast<size_t>(i) * anchor_hint_count + hint] =
         hint < slot.tasks[i]->anchor_hints.size()
           ? slot.tasks[i]->anchor_hints[hint].raw_address : 0;
-    }
-    if (route_metadata != nullptr) {
-      route_metadata[i] = slot.tasks[i]->route_metadata;
     }
   }
 
@@ -846,11 +812,10 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
         const auto& result = mutation_results[i];
         if (slot.tasks[i]->kind == service::storage_owner::MutationKind::erase) {
           publish_compute_side_id(slot.tasks[i]->item.id,
-                                  RemotePtr{result.old_rptr_raw}, true, slot.owner_storage, result.generation);
+                                  RemotePtr{result.old_rptr_raw}, true, slot.owner_storage);
         } else {
           publish_compute_side_id(slot.tasks[i]->item.id,
-                                  RemotePtr{result.new_rptr_raw}, false, slot.owner_storage, result.generation);
-          maybe_publish_dynamic_anchor(*slot.tasks[i], result, slot.owner_storage);
+                                  RemotePtr{result.new_rptr_raw}, false, slot.owner_storage);
         }
       }
       slot.tasks[i]->result.set_value(ok);

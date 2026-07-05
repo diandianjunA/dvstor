@@ -28,6 +28,7 @@ while [[ $# -gt 0 ]]; do
         --alpha)                ALPHA="$2"; shift 2 ;;
         -t|--threads)           THREADS="$2"; shift 2 ;;
         --max-vectors)          MAX_VECTORS="$2"; shift 2 ;;
+        --no-gpu)               NO_GPU="--no-gpu"; shift ;;
         -h|--help)
             echo "Usage: $0 [options]"
             echo "  -d, --data-path <path>       Base vectors directory (default: $DATA_PATH)"
@@ -38,6 +39,7 @@ while [[ $# -gt 0 ]]; do
             echo "      --alpha <f>              Alpha parameter (default: $ALPHA)"
             echo "  -t, --threads <n>            Thread count (default: auto)"
             echo "      --max-vectors <n>        Limit dataset size"
+            echo "      --no-gpu                 Disable GPU"
             exit 0
             ;;
         *)  echo "Unknown arg: $1"; exit 1 ;;
@@ -66,4 +68,5 @@ exec "$BINARY" \
     --R "$R" \
     --alpha "$ALPHA" \
     --threads "$THREADS" \
-    --max-vectors "$MAX_VECTORS"
+    --max-vectors "$MAX_VECTORS" \
+    ${NO_GPU:-}

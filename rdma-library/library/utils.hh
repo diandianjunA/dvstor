@@ -1,9 +1,15 @@
 #ifndef RDMA_LIBRARY_UTILS_HH
 #define RDMA_LIBRARY_UTILS_HH
 
+#include <chrono>
 #include <iostream>
 
 #include "types.hh"
+
+using Timepoint = std::chrono::time_point<std::chrono::high_resolution_clock>;
+using ToSeconds = std::chrono::duration<f64, std::chrono::seconds::period>;
+using ToMicroSeconds =
+  std::chrono::duration<f64, std::chrono::microseconds::period>;
 
 // why using macros? for std::string&& (rvalues) always _M_dispose() is called,
 // even if the body is empty; using const char* also does not help because we
@@ -37,6 +43,16 @@ struct Endpoint {
 };
 
 Endpoint parse_endpoint(const str& endpoint, u32 default_port);
+
+f64 compute_throughput(i32 message_size,
+                       i32 repeats,
+                       Timepoint start,
+                       Timepoint end);
+
+f64 compute_latency(i32 repeats,
+                    Timepoint start,
+                    Timepoint end,
+                    bool is_read_or_atomic);
 
 template <typename T>
 void touch_memory(u_ptr<T[]>& buffer, size_t buffer_len) {

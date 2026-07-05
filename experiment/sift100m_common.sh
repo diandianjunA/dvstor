@@ -291,13 +291,21 @@ write_service_config() {
     if [[ -n "${QUERY_BATCH_SIZE:-}" ]]; then echo "query-batch-size = ${QUERY_BATCH_SIZE}"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then echo "use-rabitq = true"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then
+      echo "rabitq-mode = ${RABITQ_MODE:-exact_safe}"
       echo "rabitq-gate-width = ${RABITQ_GATE_WIDTH:-18}"
       echo "rabitq-gate-max-width = ${RABITQ_GATE_MAX_WIDTH:-36}"
       echo "rabitq-gate-margin = ${RABITQ_GATE_MARGIN:-0.08}"
       echo "rabitq-cache-max-ratio = ${RABITQ_CACHE_MAX_RATIO:-0.10}"
       echo "rabitq-dynamic-budget-mb = ${RABITQ_DYNAMIC_BUDGET_MB:-64}"
+      echo "rabitq-coalesce-target = ${RABITQ_COALESCE_TARGET:-64}"
+      echo "rabitq-coalesce-min = ${RABITQ_COALESCE_MIN:-32}"
+      echo "rabitq-coalesce-wait-us = ${RABITQ_COALESCE_WAIT_US:-6}"
+      echo "rabitq-prefetch-width = ${RABITQ_PREFETCH_WIDTH:-2}"
+      echo "rabitq-prefetch-min-samples = ${RABITQ_PREFETCH_MIN_SAMPLES:-16}"
+      echo "rabitq-prefetch-min-hit-ratio = ${RABITQ_PREFETCH_MIN_HIT_RATIO:-0.35}"
       echo "rabitq-warmup-exact-expansions = ${RABITQ_WARMUP_EXACT_EXPANSIONS:-6}"
       echo "rabitq-audit-period = ${RABITQ_AUDIT_PERIOD:-12}"
+      echo "rabitq-safe-epsilon = ${RABITQ_SAFE_EPSILON:-0.0001}"
       if [[ "${RABITQ_STRICT_RECALL:-1}" == "1" ]]; then
         echo "rabitq-strict-recall = true"
       else
@@ -326,17 +334,7 @@ write_service_config() {
         echo "storage-owner-anchor-remote-rescue-cap = ${STORAGE_OWNER_ANCHOR_REMOTE_RESCUE_CAP:-4}"
         echo "storage-owner-anchor-audit-rate = ${STORAGE_OWNER_ANCHOR_AUDIT_RATE:-256}"
         echo "storage-owner-anchor-min-overlap = ${STORAGE_OWNER_ANCHOR_MIN_OVERLAP:-0.5}"
-        echo "storage-owner-anchor-rehome-upsert = ${STORAGE_OWNER_ANCHOR_REHOME_UPSERT:-0}"
-        echo "storage-owner-route-top-owners = ${STORAGE_OWNER_ROUTE_TOP_OWNERS:-1}"
-        echo "storage-owner-route-confidence-threshold = ${STORAGE_OWNER_ROUTE_CONFIDENCE_THRESHOLD:-0.0}"
-        echo "storage-owner-anchor-refresh-interval = ${STORAGE_OWNER_ANCHOR_REFRESH_INTERVAL:-100000}"
-        echo "storage-owner-dynamic-anchor-cap = ${STORAGE_OWNER_DYNAMIC_ANCHOR_CAP:-64}"
       fi
-      echo "storage-owner-repair-workers = ${STORAGE_OWNER_REPAIR_WORKERS:-1}"
-      echo "storage-owner-repair-budget-us = ${STORAGE_OWNER_REPAIR_BUDGET_US:-0}"
-      echo "storage-owner-repair-period-us = ${STORAGE_OWNER_REPAIR_PERIOD_US:-1000}"
-      echo "storage-owner-repair-queue-depth = ${STORAGE_OWNER_REPAIR_QUEUE_DEPTH:-65536}"
-      echo "storage-owner-pending-edge-cap = ${STORAGE_OWNER_PENDING_EDGE_CAP:-256}"
       echo "storage-owner-reverse-mode = ${STORAGE_OWNER_REVERSE_MODE:-async}"
       echo "storage-owner-reverse-queue-depth = ${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
       echo "storage-owner-reverse-flush-us = ${STORAGE_OWNER_REVERSE_FLUSH_US:-200}"

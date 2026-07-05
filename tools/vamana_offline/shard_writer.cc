@@ -25,6 +25,12 @@
 
 namespace tools::vamana_offline {
 
+vec<NodePlacement> assign_nodes_to_shards(size_t num_vectors, u32 num_memory_nodes) {
+  const size_t node_size = VamanaNode::total_size();
+  const size_t aligned_size = (node_size + 7) & ~7ULL;
+  return assign_nodes_to_shards_balanced(num_vectors, num_memory_nodes, aligned_size);
+}
+
 namespace {
 
 struct PlacementResult {
@@ -543,7 +549,7 @@ void write_vamana_shards(const VamanaGraph& graph,
     metadata["allocation_size"] = VamanaNode::allocation_size();
   }
   metadata["idmap_format"] = "owner_sharded_v1";
-  metadata["anchor_format"] = config.anchor_count_per_shard == 0 ? "" : "owner_anchor_v2";
+  metadata["anchor_format"] = config.anchor_count_per_shard == 0 ? "" : "owner_anchor_v1";
   metadata["anchor_count_per_shard"] = config.anchor_count_per_shard;
   if (config.use_rabitq) {
     metadata["rabitq_centroid"] = VamanaNode::rabitq_centroid;

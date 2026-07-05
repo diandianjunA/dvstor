@@ -136,7 +136,6 @@ private:
     std::chrono::steady_clock::time_point enqueued_at{};
     std::chrono::steady_clock::time_point sender_dequeued_at{};
     vec<RemotePtr> anchor_hints;
-    service::storage_owner::RouteMetadata route_metadata;
   };
 
   struct StorageOwnerRpcSlot {
@@ -213,22 +212,11 @@ private:
   bool initialize_compute_side_idmap(const filepath_t& index_prefix,
                                      const service::index_metadata::Metadata& metadata);
   bool mark_remote_deleted(RemotePtr ptr);
-  void publish_compute_side_id(node_t id,
-                               RemotePtr ptr,
-                               bool deleted,
-                               u32 owner_storage,
-                               u32 generation = 0);
-  bool lookup_compute_side_id(node_t id,
-                              RemotePtr* ptr,
-                              bool* deleted = nullptr,
-                              u32* generation = nullptr,
-                              u32* owner_storage = nullptr) const;
+  void publish_compute_side_id(node_t id, RemotePtr ptr, bool deleted, u32 owner_storage);
+  bool lookup_compute_side_id(node_t id, RemotePtr* ptr, bool* deleted = nullptr) const;
   u32 storage_owner_for_id(node_t id) const;
   vamana::anchor::Route route_storage_owner_update(const InsertItem& item,
                                                     std::optional<u32> owner_override = std::nullopt) const;
-  void maybe_publish_dynamic_anchor(const StorageInsertTask& task,
-                                    const service::storage_owner::MutationResult& result,
-                                    u32 owner_storage);
   bool routing_enabled() const;
   size_t rpc_message_size() const;
   vec<element_t> compute_local_routing_centroid() const;
@@ -291,13 +279,11 @@ private:
   std::atomic<bool> storage_insert_senders_done_{false};
   std::atomic<u32> storage_insert_inflight_{0};
   std::atomic<u32> storage_insert_timeout_logs_{0};
-  std::atomic<u64> storage_owner_anchor_refresh_counter_{0};
   vec<std::unique_ptr<StorageOwnerSenderState>> storage_insert_owners_;
   struct ComputeSideIdEntry {
     RemotePtr ptr;
     bool deleted{};
     u32 owner_storage{};
-    u32 generation{};
   };
   mutable std::mutex compute_side_idmap_mutex_;
   hashmap_t<node_t, ComputeSideIdEntry> compute_side_idmap_;

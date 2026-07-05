@@ -999,7 +999,7 @@ struct Index::Impl {
       output_metadata[key] = value;
     }
     output_metadata["idmap_format"] = "owner_sharded_v1";
-    output_metadata["anchor_format"] = write_anchors ? "owner_anchor_v2" : "";
+    output_metadata["anchor_format"] = write_anchors ? "owner_anchor_v1" : "";
     output_metadata["anchor_count_per_shard"] =
       write_anchors ? options.anchors_per_shard : 0;
 

@@ -10,8 +10,8 @@ dvstor/
 ├── src/                    # Core runtime source code
 │   ├── common/             # Shared config, types, distance functions, utilities
 │   ├── gpu/                # CUDA kernels and GPU resource management
-│   ├── http/               # Service request types and worker schedulers
-│   ├── io/                 # In-memory vector batch containers
+│   ├── http/               # HTTP service interface
+│   ├── io/                 # Data read/write abstraction
 │   ├── memory_node/        # Storage node: index storage, insert, peer RDMA/RPC
 │   ├── rdma/               # RDMA operation wrappers (read/write/atomics)
 │   ├── router/             # Multi-compute-node adaptive query routing
@@ -25,9 +25,16 @@ dvstor/
 │   └── run_recall_test.sh  # Recall evaluation helper
 ├── experiment/             # SIFT100M experiment harness, profiles, and reports
 ├── rdma-library/           # RDMA low-level library (QP management, memory registration)
-├── thirdparty/             # Bundled third-party header libraries (nlohmann/json)
-└── motivation/             # Historical motivation experiment outputs
+├── thirdparty/             # Bundled third-party libraries (httplib, nlohmann/json, xoshiro)
+├── structure/              # Architecture documentation (30-course series in Chinese)
+├── reports/                # Performance reports and analysis scripts
+│   ├── breakdown/          # Breakdown benchmark result JSON/TXT files
+│   ├── analyze/            # Analysis reports and Python scripts
+│   └── python/             # Plotting and visualization scripts
+└── logs/                   # Runtime log output directory
 ```
+
+For a detailed walkthrough of the architecture, see the course series under `structure/`.
 
 ## Setup
 
@@ -89,6 +96,7 @@ Additional CMake options:
 - `-DDVSTOR_METIS_PARTITION=OFF`: disable METIS partitioning support
 - `-DDVSTOR_USE_NATIVE_ARCH=ON`: compile with `-march=native` for host-specific optimizations
 - `-DDVSTOR_BUILD_EXECUTABLES=OFF`: skip building standalone executables
+- `-DDVSTOR_BUILD_TESTS=OFF`: skip building tests
 
 ## Data Preparation
 
@@ -141,7 +149,7 @@ under `experiment/reports/<profile>/`.
 ### Optimization Profiles
 
 ```bash
-# RaBitQ CPU gate + GPU exact beam
+# RaBitQ-aware GPU query pipeline
 ./experiment/start_all_memory_nodes.sh 01_rabitq_expension_aware
 ./experiment/run_breakdown.sh 01_rabitq_expension_aware
 
@@ -150,8 +158,8 @@ under `experiment/reports/<profile>/`.
 ./experiment/run_breakdown.sh 02_rabitq_expension_aware_aldi
 
 # RaBitQ + ALDI + adaptive RDMA scheduling
-./experiment/start_all_memory_nodes.sh 03_rabitq_expension_aware_aldi_rdma
-./experiment/run_breakdown.sh 03_rabitq_expension_aware_aldi_rdma
+./experiment/start_all_memory_nodes.sh 03_rabitq_gpu_pipeline_aldi_rdma
+./experiment/run_breakdown.sh 03_rabitq_gpu_pipeline_aldi_rdma
 ```
 
 ### Common Overrides
@@ -183,8 +191,7 @@ The `dvstor_breakdown_benchmark` binary provides detailed performance breakdowns
   --measure-seconds 60
 ```
 
-Results are written next to the selected `--output` path as JSON and TXT files with per-category
-CPU, GPU, RDMA, and transfer timing breakdowns.
+Results are written under `reports/breakdown/` as JSON and TXT files with per-category (CPU/GPU/RDMA/transfer) timing breakdowns.
 
 ## Offline Build And Online Load
 
@@ -256,16 +263,15 @@ Or let the compute node trigger startup loading on all memory nodes:
 ```
 
 In both cases, the online cluster reuses the offline-built graph directly instead of rebuilding it through RDMA.
-When `--use-rabitq` is enabled on the compute side, the online service loads
-the RaBitQ RFQ5 sidecar for the index prefix and uses a CPU gate before exact
-GPU distance evaluation.
+When `--search-mode rabitq_gpu` is enabled on the compute side, the online service loads
+`<index_prefix>.rotation.bin` and uploads the rotation matrix, rotated centroid, and `t_const`
+to each GPU worker.
 
 ### Search Modes
 
-- Exact search: GPU exact distance search over remotely fetched full vectors.
-  This is the default path and remains the correctness reference.
-- RaBitQ CPU gate: enable with `--use-rabitq`. The gate ranks cached RFQ5
-  candidates locally, then only exact distances enter the beam.
+- `exact_gpu`: GPU exact distance search over remotely fetched full vectors. Useful as an ablation and correctness reference.
+- `rabitq_gpu`: GPU RaBitQ search with final exact rerank. This is the intended paper baseline mode when evaluating
+  the disaggregated GPU index without cache or GPU-direct transport optimizations.
 
 `--servers` can now be specified either as plain node names such as `cluster3` or as explicit `host:port`
 endpoints such as `127.0.0.1:1235`. This allows running multiple memory nodes on the same machine as long as each
@@ -323,6 +329,43 @@ Environment variable overrides are also supported:
 ```bash
 DATA_PATH=/path/to/dataset OUTPUT_PREFIX=/path/to/index ./tools/run_recall_test.sh
 ```
+
+## Architecture Documentation
+
+A detailed 30-course architecture series (in Chinese) is available under `structure/`, covering every subsystem:
+
+| # | Topic |
+|---|-------|
+| 01 | Project overview and architecture |
+| 02 | Type system and common infrastructure |
+| 03 | Vamana graph index algorithm basics |
+| 04 | Vamana node and neighbor list data structures |
+| 05 | C++20 coroutines and async scheduler |
+| 06 | Beam-Search search algorithm implementation |
+| 07 | Vamana insert and RobustPrune implementation |
+| 08 | RDMA library low-level implementation |
+| 09 | RDMA read/write/atomic operation wrappers |
+| 10 | Memory management and BufferAllocator |
+| 11 | ComputeService compute service architecture |
+| 12 | ComputeThread thread design and GPU polling |
+| 13 | MemoryNode storage node architecture |
+| 14 | Storage owner insert protocol details |
+| 15 | GPU kernel implementation: distance computation |
+| 16 | GPU kernel implementation: RobustPrune |
+| 17 | GPU resource management and GPU-Direct RDMA |
+| 18 | Multi-compute-node routing system |
+| 19 | Offline Vamana graph builder |
+| 20 | Performance breakdown and statistics system |
+| 21 | Vector data types and quantization storage |
+| 22 | IO and data management layer |
+| 23 | HTTP service and external interface |
+| 24 | Multi-memory-node peer communication |
+| 25 | RPC routing and multi-CN coordination |
+| 26 | Build system and compilation optimization |
+| 27 | Evaluation scripts and experiment workflow |
+| 28 | Key performance optimization techniques |
+| 29 | Testing and debugging methods |
+| 30 | Extension development and future directions |
 
 ## License
 

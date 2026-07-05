@@ -218,7 +218,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
      service.config().enable_breakdown && service.config().observe_device_utilization},
     {"search", std::string(service.config().credit_aware_expansion ? "credit_aware_" : "") +
         (service.config().use_rabitq
-          ? "rabitq_rfq5_cpu_gate" : "exact")},
+          ? "rabitq_rfq5_" + service.config().rabitq_mode : "exact")},
     {"credit_aware_expansion", service.config().credit_aware_expansion},
     {"credit_aware_min_k", service.config().credit_aware_expansion
         ? service.config().credit_aware_min_k : 0},
@@ -257,10 +257,26 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
         ? service.config().rabitq_gate_margin : 0.0},
     {"rabitq_cache_max_ratio", service.config().use_rabitq
         ? service.config().rabitq_cache_max_ratio : 0.0},
+    {"rabitq_mode", service.config().use_rabitq
+        ? service.config().rabitq_mode : ""},
+    {"rabitq_coalesce_target", service.config().use_rabitq
+        ? service.config().rabitq_coalesce_target : 0},
+    {"rabitq_coalesce_min", service.config().use_rabitq
+        ? service.config().rabitq_coalesce_min : 0},
+    {"rabitq_coalesce_wait_us", service.config().use_rabitq
+        ? service.config().rabitq_coalesce_wait_us : 0},
+    {"rabitq_prefetch_width", service.config().use_rabitq
+        ? service.config().rabitq_prefetch_width : 0},
+    {"rabitq_prefetch_min_samples", service.config().use_rabitq
+        ? service.config().rabitq_prefetch_min_samples : 0},
+    {"rabitq_prefetch_min_hit_ratio", service.config().use_rabitq
+        ? service.config().rabitq_prefetch_min_hit_ratio : 0.0},
     {"rabitq_warmup_exact_expansions", service.config().use_rabitq
         ? service.config().rabitq_warmup_exact_expansions : 0},
     {"rabitq_audit_period", service.config().use_rabitq
         ? service.config().rabitq_audit_period : 0},
+    {"rabitq_safe_epsilon", service.config().use_rabitq
+        ? service.config().rabitq_safe_epsilon : 0.0},
     {"rabitq_strict_recall", service.config().use_rabitq
         ? service.config().rabitq_strict_recall : false},
   };

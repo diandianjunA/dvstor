@@ -79,11 +79,6 @@ class MemoryNode {
     std::chrono::steady_clock::time_point queued_at{};
   };
 
-  struct StorageOwnerRepairTask {
-    RemotePtr target;
-    vec<RemotePtr> candidates;
-  };
-
 public:
   explicit MemoryNode(Configuration& config);
 
@@ -99,56 +94,6 @@ private:
   using StorageOwnerThread = memory_node_detail::StorageOwnerThread;
   using StorageOwnerInsertJob = memory_node_detail::StorageOwnerInsertJob;
   using FreshnessEntry = memory_node_detail::FreshnessEntry;
-
-  // Awaitables returned by storage-owner RDMA read helpers.
-  struct GlobalMedoidReadAwaitable {
-    bool ready{};
-    RemotePtr value{};
-    const byte_t* buffer{};
-
-    bool await_ready() const;
-    static void await_suspend(std::coroutine_handle<>);
-    RemotePtr await_resume() const;
-  };
-
-  struct NodeSnapshotReadAwaitable {
-    bool ready{};
-    RemotePtr rptr;
-    byte_t* buffer{};
-    NodeSnapshot snapshot;
-
-    bool await_ready() const;
-    static void await_suspend(std::coroutine_handle<>);
-    NodeSnapshot await_resume();
-  };
-
-  struct NodeSnapshotsReadAwaitable {
-    struct PendingRead {
-      RemotePtr rptr;
-      byte_t* buffer{};
-    };
-
-    bool ready{true};
-    vec<NodeSnapshot> snapshots;
-    vec<PendingRead> pending;
-
-    bool await_ready() const;
-    static void await_suspend(std::coroutine_handle<>);
-    vec<NodeSnapshot> await_resume();
-  };
-
-  struct NeighborListReadAwaitable {
-    bool ready{};
-    RemotePtr rptr;
-    byte_t* buffer{};
-    vec<RemotePtr> neighbors;
-    MemoryNode* node{};
-    bool hot_graph{};
-
-    bool await_ready() const;
-    static void await_suspend(std::coroutine_handle<>);
-    vec<RemotePtr> await_resume();
-  };
 
   static constexpr u32 kPeerSyncWrOwner = std::numeric_limits<u32>::max();
   static constexpr u32 kPeerAsyncWrOwner = std::numeric_limits<u32>::max() - 1;
@@ -213,20 +158,11 @@ private:
       bool success) const;
   bool apply_peer_reverse_update_task(const PeerReverseUpdateTask& task, const Configuration& config);
   bool apply_peer_reverse_update_tasks(const vec<PeerReverseUpdateTask>& tasks, const Configuration& config);
-  bool apply_owner_directory_updates(const service::storage_owner::OwnerDirectoryUpdateOp* ops,
-                                     u32 item_count);
-  bool send_owner_directory_update_batch(
-      u32 target_shard,
-      const vec<service::storage_owner::OwnerDirectoryUpdateOp>& ops,
-      const Configuration& config);
   void send_peer_reverse_update_response(const PeerReverseUpdateResponse& response);
   bool handle_peer_reverse_update_request(u32 source_shard,
                                           const service::storage_owner::PeerRpcHeader& header,
                                           const service::storage_owner::ReverseUpdateOp* ops,
                                           const Configuration& config);
-  bool handle_peer_owner_directory_update_request(
-      const service::storage_owner::PeerRpcHeader& header,
-      const service::storage_owner::OwnerDirectoryUpdateOp* ops);
   bool handle_peer_rpc_request(const PeerRpcMessage& message, const Configuration& config);
   bool enqueue_peer_reverse_update_task(PeerReverseUpdateTask&& task);
   void enqueue_peer_reverse_update_response(u32 destination_shard,
@@ -270,7 +206,6 @@ private:
                                                const service::storage_owner::MutationKind* kinds,
                                                const element_t* vectors,
                                                const u64* anchor_hints,
-                                               const service::storage_owner::RouteMetadata* route_metadata,
                                                u32 anchor_hint_count,
                                                size_t item_count,
                                                StorageOwnerThread& thread,
@@ -289,7 +224,6 @@ private:
                                          const service::storage_owner::MutationKind* kinds,
                                          const element_t* vectors,
                                          const u64* anchor_hints,
-                                         const service::storage_owner::RouteMetadata* route_metadata,
                                          u32 anchor_hint_count,
                                          size_t item_count,
                                          InsertBreakdownCounters& breakdown,
@@ -308,18 +242,18 @@ private:
                                                           u32* new_generation);
   void publish_mutation(node_t id, RemotePtr ptr, u32 generation, bool deleted);
   RemotePtr read_global_medoid();
-  GlobalMedoidReadAwaitable async_read_global_medoid(StorageOwnerThread& thread);
+  auto async_read_global_medoid(StorageOwnerThread& thread);
   void write_global_medoid(const RemotePtr& medoid);
   bool try_set_global_medoid(const RemotePtr& expected, const RemotePtr& desired, RemotePtr& observed);
   bool read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot);
   vec<RemotePtr> read_neighbor_list_aos(RemotePtr rptr);
   vec<RemotePtr> read_neighbor_list(RemotePtr rptr);
-  NodeSnapshotReadAwaitable async_read_node_snapshot(RemotePtr rptr, StorageOwnerThread& thread);
-  NodeSnapshotsReadAwaitable async_read_node_snapshots(const vec<RemotePtr>& rptrs,
-                                                       const Configuration& config,
-                                                       StorageOwnerThread& thread);
+  auto async_read_node_snapshot(RemotePtr rptr, StorageOwnerThread& thread);
+  auto async_read_node_snapshots(const vec<RemotePtr>& rptrs,
+                                 const Configuration& config,
+                                 StorageOwnerThread& thread);
   vec<NodeSnapshot> read_node_snapshots_batched(const vec<RemotePtr>& rptrs, const Configuration& config);
-  NeighborListReadAwaitable async_read_neighbor_list(RemotePtr rptr, StorageOwnerThread& thread);
+  auto async_read_neighbor_list(RemotePtr rptr, StorageOwnerThread& thread);
   void write_hot_graph_entry(RemotePtr rptr, u32 id, const vec<RemotePtr>& neighbors);
   void write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neighbors);
   void write_new_node(RemotePtr rptr,
@@ -364,15 +298,6 @@ private:
   bool apply_local_reverse_update(RemotePtr target_ptr,
                                   const vec<RemotePtr>& candidate_ptrs,
                                   const Configuration& config);
-  void start_storage_owner_repair_runtime(const Configuration& config);
-  void stop_storage_owner_repair_runtime();
-  bool enqueue_storage_owner_repair(RemotePtr target_ptr,
-                                    const vec<RemotePtr>& candidate_ptrs,
-                                    const Configuration& config);
-  void storage_owner_repair_worker_loop(u32 worker_id);
-  bool repair_storage_owner_neighbors(RemotePtr target_ptr,
-                                      const vec<RemotePtr>& candidate_ptrs,
-                                      const Configuration& config);
 
   // Misc helpers
   static size_t align_up(size_t value, size_t alignment = CACHELINE_SIZE);
@@ -451,14 +376,6 @@ private:
   std::atomic<bool> peer_reverse_workers_done_{false};
   size_t peer_reverse_task_queue_limit_{1024};
   size_t peer_reverse_outgoing_queue_limit_{1024};
-  vec<std::thread> storage_owner_repair_workers_;
-  vec<u_ptr<StorageOwnerThread>> storage_owner_repair_worker_states_;
-  std::mutex storage_owner_repair_mutex_;
-  std::condition_variable storage_owner_repair_cv_;
-  std::deque<u64> storage_owner_repair_order_;
-  std::unordered_map<u64, vec<RemotePtr>> storage_owner_repair_candidates_;
-  std::atomic<bool> storage_owner_repair_shutdown_{false};
-  size_t storage_owner_repair_queue_limit_{65536};
   InsertRuntimeState insert_runtime_;
   std::unique_ptr<Configuration> storage_worker_config_;
   std::mutex storage_send_mutex_;

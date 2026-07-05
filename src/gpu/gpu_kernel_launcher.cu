@@ -506,4 +506,32 @@ void gpu_stream_synchronize(cudaStream_t stream) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
+void launch_batch_rabitq_asymmetric_distances(cudaStream_t stream, cudaEvent_t event,
+                                    const float* d_rotated_query,
+                                    const uint8_t* d_candidate_data,
+                                    float* d_distances,
+                                    float query_norm2, uint32_t n_candidates,
+                                    uint32_t code_bits, uint32_t code_bytes,
+                                    uint32_t entry_bytes) {
+    if (n_candidates == 0) { CUDA_CHECK(cudaEventRecord(event, stream)); return; }
+    constexpr uint32_t BLOCK = 256;
+    if (code_bits <= 256) {
+        const uint32_t blocks = (n_candidates + BLOCK / 8 - 1) / (BLOCK / 8);
+        gpu_kernels::rabitq_asymmetric_kernel<8><<<blocks, BLOCK, 0, stream>>>(
+            d_rotated_query, d_candidate_data, d_distances, query_norm2, n_candidates,
+            code_bits, code_bytes, entry_bytes);
+    } else if (code_bits <= 512) {
+        const uint32_t blocks = (n_candidates + BLOCK / 16 - 1) / (BLOCK / 16);
+        gpu_kernels::rabitq_asymmetric_kernel<16><<<blocks, BLOCK, 0, stream>>>(
+            d_rotated_query, d_candidate_data, d_distances, query_norm2, n_candidates,
+            code_bits, code_bytes, entry_bytes);
+    } else {
+        const uint32_t blocks = (n_candidates + BLOCK / 32 - 1) / (BLOCK / 32);
+        gpu_kernels::rabitq_asymmetric_kernel<32><<<blocks, BLOCK, 0, stream>>>(
+            d_rotated_query, d_candidate_data, d_distances, query_norm2, n_candidates,
+            code_bits, code_bytes, entry_bytes);
+    }
+    CUDA_CHECK(cudaEventRecord(event, stream));
+}
+
 }  // namespace gpu

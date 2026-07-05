@@ -1,7 +1,6 @@
 #include "memory_node/memory_node.hh"
 
 #include <algorithm>
-#include <cstring>
 #include <iostream>
 
 void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
@@ -11,11 +10,8 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
 
   const size_t reverse_update_bytes =
     service::storage_owner::reverse_update_request_bytes(config.R * config.storage_owner_batch_max);
-  const size_t owner_directory_bytes =
-    service::storage_owner::owner_directory_update_request_bytes(config.storage_owner_batch_max);
   peer_rpc_runtime_.message_bytes = align_up(
     std::max({reverse_update_bytes,
-              owner_directory_bytes,
               service::storage_owner::reverse_update_response_bytes()}));
   const u32 remote_peer_count = num_storage_nodes_ - 1;
   const u32 max_recv_wr = static_cast<u32>(std::max<i32>(1, config.max_recv_queue_wr));
@@ -228,68 +224,6 @@ bool MemoryNode::apply_peer_reverse_update_tasks(const vec<PeerReverseUpdateTask
   return success;
 }
 
-bool MemoryNode::apply_owner_directory_updates(
-    const service::storage_owner::OwnerDirectoryUpdateOp* ops,
-    u32 item_count) {
-  if (ops == nullptr || item_count == 0) {
-    return true;
-  }
-
-  std::lock_guard<std::mutex> lock(idmap_mutex_);
-  for (u32 i = 0; i < item_count; ++i) {
-    const auto& op = ops[i];
-    if (mutations_inflight_.contains(op.id)) {
-      continue;
-    }
-    auto it = idmap_.find(op.id);
-    const bool newer = it == idmap_.end() || op.generation >= it->second.generation;
-    if (!newer) {
-      continue;
-    }
-    idmap_[op.id] = FreshnessEntry{
-      RemotePtr{op.current_raw},
-      op.generation,
-      (op.flags & service::storage_owner::kOwnerDirectoryDeleted) != 0};
-  }
-  return true;
-}
-
-bool MemoryNode::send_owner_directory_update_batch(
-    u32 target_shard,
-    const vec<service::storage_owner::OwnerDirectoryUpdateOp>& ops,
-    const Configuration& config) {
-  if (ops.empty()) {
-    return true;
-  }
-  if (target_shard == storage_id_) {
-    return apply_owner_directory_updates(ops.data(), static_cast<u32>(ops.size()));
-  }
-  if (!peer_context_ || target_shard >= num_storage_nodes_) {
-    return false;
-  }
-
-  const u32 max_items = std::max<u32>(1, config.storage_owner_batch_max);
-  for (size_t begin = 0; begin < ops.size(); begin += max_items) {
-    const u32 item_count = static_cast<u32>(std::min<size_t>(ops.size() - begin, max_items));
-    const size_t bytes = service::storage_owner::owner_directory_update_request_bytes(item_count);
-    vec<byte_t> message(bytes);
-    auto* header = reinterpret_cast<service::storage_owner::PeerRpcHeader*>(message.data());
-    header->magic = service::storage_owner::kPeerRpcMagic;
-    header->type = static_cast<u32>(service::storage_owner::PeerRpcType::owner_directory_update_request);
-    header->source_shard = storage_id_;
-    header->item_count = item_count;
-    header->request_id = next_peer_request_id_.fetch_add(1, std::memory_order_relaxed);
-    header->reserved |= kPeerRpcFlagNoResponse;
-    auto* payload_ops = service::storage_owner::owner_directory_update_ops(message.data());
-    std::memcpy(payload_ops,
-                ops.data() + begin,
-                static_cast<size_t>(item_count) *
-                  sizeof(service::storage_owner::OwnerDirectoryUpdateOp));
-    send_peer_rpc_message(target_shard, message.data(), bytes);
-  }
-  return true;
-}
-
 void MemoryNode::send_peer_reverse_update_response(const PeerReverseUpdateResponse& response) {
   const auto response_send_started = std::chrono::steady_clock::now();
   send_peer_rpc_message(response.destination_shard, &response.header, sizeof(response.header));
@@ -332,12 +266,6 @@ bool MemoryNode::handle_peer_reverse_update_request(u32 source_shard,
   return success;
 }
 
-bool MemoryNode::handle_peer_owner_directory_update_request(
-    const service::storage_owner::PeerRpcHeader& header,
-    const service::storage_owner::OwnerDirectoryUpdateOp* ops) {
-  return apply_owner_directory_updates(ops, header.item_count);
-}
-
 bool MemoryNode::handle_peer_rpc_request(const PeerRpcMessage& message, const Configuration& config) {
   if (message.payload.size() < sizeof(service::storage_owner::PeerRpcHeader)) {
     return false;
@@ -355,16 +283,6 @@ bool MemoryNode::handle_peer_rpc_request(const PeerRpcMessage& message, const Co
     }
     const auto* ops = service::storage_owner::reverse_update_ops(message.payload.data());
     return handle_peer_reverse_update_request(message.source_shard, *header, ops, config);
-  }
-
-  if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::owner_directory_update_request)) {
-    const size_t expected_bytes =
-      service::storage_owner::owner_directory_update_request_bytes(header->item_count);
-    if (message.payload.size() < expected_bytes) {
-      return false;
-    }
-    const auto* ops = service::storage_owner::owner_directory_update_ops(message.payload.data());
-    return handle_peer_owner_directory_update_request(*header, ops);
   }
 
   return false;
@@ -444,14 +362,6 @@ void MemoryNode::peer_rpc_progress_loop() {
           task.received_at = std::chrono::steady_clock::now();
           task.ops.assign(ops, ops + header->item_count);
           enqueue_peer_reverse_update_task(std::move(task));
-        }
-      } else if (header->type ==
-                 static_cast<u32>(service::storage_owner::PeerRpcType::owner_directory_update_request)) {
-        const size_t expected_bytes =
-          service::storage_owner::owner_directory_update_request_bytes(header->item_count);
-        if (bytes >= expected_bytes) {
-          const auto* ops = service::storage_owner::owner_directory_update_ops(payload);
-          (void)handle_peer_owner_directory_update_request(*header, ops);
         }
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response)) {
         {
@@ -648,12 +558,6 @@ bool MemoryNode::pump_peer_rpcs_locked(const Configuration&,
       }
 
       if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_request)) {
-        PeerRpcMessage request;
-        request.source_shard = peer_id;
-        request.payload.assign(payload, payload + bytes);
-        requests.push_back(std::move(request));
-      } else if (header->type ==
-                 static_cast<u32>(service::storage_owner::PeerRpcType::owner_directory_update_request)) {
         PeerRpcMessage request;
         request.source_shard = peer_id;
         request.payload.assign(payload, payload + bytes);

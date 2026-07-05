@@ -12,6 +12,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cuda_runtime.h>
 #include <type_traits>
@@ -105,11 +106,24 @@ public:
         rabitq_gate_max_width_ = max_width;
         rabitq_gate_margin_ = std::max(margin, 0.0f);
     }
-    void set_rabitq_runtime(u32 warmup_exact_expansions, u32 audit_period,
+    void set_rabitq_runtime(u32 coalesce_min, u32 warmup_exact_expansions,
+                            u32 audit_period,
                             bool strict_recall) {
+        rabitq_coalesce_min_ = std::max<u32>(1, coalesce_min);
         rabitq_warmup_exact_expansions_ = warmup_exact_expansions;
         rabitq_audit_period_ = audit_period;
         rabitq_strict_recall_ = strict_recall;
+    }
+    void set_rabitq_exact_safe(bool enabled, f32 epsilon) {
+        rabitq_exact_safe_ = enabled;
+        rabitq_safe_epsilon_ = std::max(epsilon, 0.0f);
+    }
+    void set_rabitq_speculative_prefetch(bool enabled, u32 width,
+                                         u32 min_samples, f32 min_hit_ratio) {
+        rabitq_speculative_prefetch_ = enabled;
+        rabitq_prefetch_width_ = std::clamp<u32>(width, 1, kRabitqMaxPrefetchWidth);
+        rabitq_prefetch_min_samples_ = std::max<u32>(1, min_samples);
+        rabitq_prefetch_min_hit_ratio_ = std::clamp(min_hit_ratio, 0.0f, 1.0f);
     }
     void set_use_rabitq(bool v) {
         use_rabitq_ = v;
@@ -119,6 +133,7 @@ public:
     }
 
 private:
+    static constexpr u32 kRabitqMaxPrefetchWidth{8};
     u32 expansion_batch_{1};
     bool credit_aware_expansion_{false};
     u32 credit_aware_min_k_{1};
@@ -135,9 +150,20 @@ private:
     u32 rabitq_gate_width_{16};
     u32 rabitq_gate_max_width_{24};
     f32 rabitq_gate_margin_{0.05f};
+    u32 rabitq_coalesce_min_{32};
     u32 rabitq_warmup_exact_expansions_{6};
     u32 rabitq_audit_period_{12};
+    bool rabitq_exact_safe_{true};
+    f32 rabitq_safe_epsilon_{1e-4f};
     bool rabitq_strict_recall_{true};
+    bool rabitq_speculative_prefetch_{false};
+    u32 rabitq_prefetch_width_{2};
+    u32 rabitq_prefetch_min_samples_{16};
+    f32 rabitq_prefetch_min_hit_ratio_{0.35f};
+    // Retained only for compilation of the unreachable legacy branch below the v2 gate.
+    f32 rabitq_confidence_epsilon_{1.9f};
+    u32 rabitq_exact_batch_{0};
+    u32 rabitq_exact_budget_{0};
     const u32 R_;
     const u32 beam_width_;
     const u32 beam_width_construction_;

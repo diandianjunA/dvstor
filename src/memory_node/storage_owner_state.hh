@@ -147,14 +147,7 @@ struct StorageOwnerInsertJob {
   bool ok{false};
   RemotePtr new_ptr{};
   RemotePtr old_ptr{};
-  RemotePtr old_ptr_hint{};
   u32 generation{};
-  u32 old_generation_hint{};
-  u32 old_owner{};
-  u32 semantic_owner{};
-  u32 anchor_version{};
-  f32 route_confidence{1.0f};
-  u32 route_flags{};
   vec<RemotePtr> anchor_hints;
 };
 

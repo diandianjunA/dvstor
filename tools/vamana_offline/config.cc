@@ -50,7 +50,7 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     ("skip-sanity-check", po::bool_switch(&config.skip_sanity_check),
      "Skip the expensive in-memory brute-force recall sanity check after graph construction.")
     ("use-rabitq", po::bool_switch(&config.use_rabitq),
-     "Store RFQ5 RaBitQ sidecar entries for the online CPU gate.")
+     "Store dimension-scaled RaBitQ search entries per node for GPU approximate search.")
     ("storage-format", po::value<str>(&config.storage_format)->default_value(config.storage_format),
      "Storage format to write: vamana_aos_v1 or vamana_compact_v1.")
     ("seed", po::value<i32>(&config.seed)->default_value(config.seed), "PRNG seed.")

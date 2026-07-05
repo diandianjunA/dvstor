@@ -227,6 +227,12 @@ struct ThreadStatistics {
   size_t query_rabitq_forced_widen{0};
   size_t query_rabitq_audit_expansions{0};
   size_t query_rabitq_audit_candidates{0};
+  size_t query_rabitq_safe_skips{0};
+  size_t query_rabitq_exact_fallbacks{0};
+  size_t query_rabitq_prefetch_issued{0};
+  size_t query_rabitq_prefetch_hits{0};
+  size_t query_rabitq_prefetch_misses{0};
+  size_t query_rabitq_prefetch_disabled_queries{0};
   size_t query_credit_rounds{0};
   size_t query_credit_expansions_issued{0};
   size_t query_credit_precommit_expansions{0};

@@ -4,8 +4,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 PROFILE="${1:-${PROFILE:-00_baseline}}"
-load_experiment_profile "$PROFILE"
-
 for node in $(seq 1 "$SHARDS"); do
   "$EXPERIMENT_DIR/start_memory_node.sh" "$node" "$PROFILE"
 done

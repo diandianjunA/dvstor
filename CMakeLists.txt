@@ -34,6 +34,7 @@ if (NOT CMAKE_BUILD_TYPE)
 endif ()
 
 option(DVSTOR_BUILD_EXECUTABLES "Build standalone DVSTOR executables and tools" ON)
+option(DVSTOR_BUILD_TESTS "Build local DVSTOR smoke tests" ON)
 option(DVSTOR_USE_NATIVE_ARCH "Compile C++ sources with -march=native" OFF)
 set(DVSTOR_METIS_PARTITION "AUTO" CACHE STRING "METIS graph partitioning support: AUTO, ON, or OFF")
 set_property(CACHE DVSTOR_METIS_PARTITION PROPERTY STRINGS AUTO ON OFF)
@@ -69,8 +70,10 @@ list(APPEND CMAKE_MODULE_PATH
 include(DvstorDependencies)
 include(DvstorTargetHelpers)
 
+include_directories(${DVSTOR_SOURCE_ROOT}/src)
+include_directories(${DVSTOR_SOURCE_ROOT}/thirdparty)
 add_subdirectory(rdma-library)
-target_include_directories(rdma_library PUBLIC ${DVSTOR_SOURCE_ROOT}/src)
+add_subdirectory(thirdparty)
 
 set(DVSTOR_MEMORY_NODE_SOURCES
     src/memory_node/memory_node.cc
@@ -78,11 +81,7 @@ set(DVSTOR_MEMORY_NODE_SOURCES
     src/memory_node/peer_rpc.cc
     src/memory_node/storage_owner_anchor.cc
     src/memory_node/storage_owner_index.cc
-    src/memory_node/storage_owner_mutation.cc
-    src/memory_node/storage_owner_prune.cc
-    src/memory_node/storage_owner_reverse_update.cc
     src/memory_node/storage_owner_runtime.cc
-    src/memory_node/storage_owner_search.cc
 )
 
 set(DVSTOR_OFFLINE_BUILDER_SOURCES
@@ -208,6 +207,11 @@ else ()
         )
         dvstor_target_tool_includes(dvstor_breakdown_benchmark)
         target_link_libraries(dvstor_breakdown_benchmark dvstor_runtime)
+    endif ()
+
+    if (DVSTOR_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/CMakeLists.txt")
+        enable_testing()
+        add_subdirectory(test)
     endif ()
 
     # status prints

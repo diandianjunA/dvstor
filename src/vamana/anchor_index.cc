@@ -1,15 +1,12 @@
 #include "vamana/anchor_index.hh"
 
 #include <algorithm>
-#include <cmath>
 #include <fstream>
 #include <limits>
-#include <mutex>
 #include <queue>
 
 #include "common/distance.hh"
 #include "common/index_path.hh"
-#include "service/storage_owner_protocol.hh"
 
 namespace vamana::anchor {
 
@@ -28,10 +25,7 @@ bool Index::load(const filepath_t& index_prefix,
                  u32 expected_dim,
                  u32 expected_shards,
                  str* error_message) {
-  std::unique_lock lock(mutex_);
   dim_ = 0;
-  version_ = kVersion;
-  route_epoch_ = kVersion;
   total_anchors_ = 0;
   shards_.clear();
 
@@ -43,13 +37,10 @@ bool Index::load(const filepath_t& index_prefix,
 
   Header header;
   input.read(reinterpret_cast<char*>(&header), sizeof(header));
-  if (!input.good() || header.magic != kMagic ||
-      (header.version != kVersion && header.version != kLegacyVersion) ||
+  if (!input.good() || header.magic != kMagic || header.version != kVersion ||
       header.dim != expected_dim || header.shard_count != expected_shards) {
     return fail(error_message, "invalid or incompatible anchor sidecar: " + path.string());
   }
-  version_ = header.version;
-  route_epoch_ = header.version;
 
   VectorDType dtype;
   try {
@@ -103,7 +94,6 @@ bool Index::load(const filepath_t& index_prefix,
       shard.pointers.emplace_back(entry.rptr_raw);
       ++loaded;
     }
-    shard.static_anchor_count = shard_header.anchor_count;
   }
 
   if (loaded != header.total_anchors) {
@@ -114,7 +104,6 @@ bool Index::load(const filepath_t& index_prefix,
 }
 
 size_t Index::memory_bytes() const {
-  std::shared_lock lock(mutex_);
   size_t bytes = 0;
   for (const auto& shard : shards_) {
     bytes += shard.centroid.size() * sizeof(element_t);
@@ -124,103 +113,20 @@ size_t Index::memory_bytes() const {
   return bytes;
 }
 
-bool Index::add_runtime_anchor(u32 shard_id,
-                               const span<const element_t> vector,
-                               RemotePtr pointer,
-                               u32 max_runtime_anchors_per_shard) {
-  if (max_runtime_anchors_per_shard == 0 || pointer.is_null() ||
-      shard_id >= shards_.size() || vector.size() != dim_) {
-    return false;
-  }
-
-  std::unique_lock lock(mutex_);
-  auto& shard = shards_[shard_id];
-  const size_t dynamic_count = shard.pointers.size() >= shard.static_anchor_count
-                                 ? shard.pointers.size() - shard.static_anchor_count
-                                 : 0;
-  if (dynamic_count >= max_runtime_anchors_per_shard) {
-    const size_t evict_index = shard.static_anchor_count;
-    shard.pointers.erase(shard.pointers.begin() + static_cast<idx_t>(evict_index));
-    const auto vec_begin = shard.vectors.begin() + static_cast<idx_t>(evict_index * dim_);
-    shard.vectors.erase(vec_begin, vec_begin + dim_);
-    --total_anchors_;
-  }
-
-  shard.pointers.push_back(pointer);
-  shard.vectors.insert(shard.vectors.end(), vector.begin(), vector.end());
-  ++total_anchors_;
-  ++route_epoch_;
-  return true;
-}
-
-distance_t Index::centroid_distance(const span<const element_t> query, u32 shard_id) const {
-  if (shard_id >= shards_.size()) {
-    return std::numeric_limits<distance_t>::max();
-  }
-  const auto& shard = shards_[shard_id];
-  if (shard.centroid.size() == dim_) {
-    return L2Distance::dist(query, shard.centroid, dim_);
-  }
-  return std::numeric_limits<distance_t>::max();
-}
-
-distance_t Index::shard_distance(const span<const element_t> query, u32 shard_id) const {
-  if (shard_id >= shards_.size()) {
-    return std::numeric_limits<distance_t>::max();
-  }
-  const auto& shard = shards_[shard_id];
-  distance_t best_distance = centroid_distance(query, shard_id);
-  for (u32 i = 0; i < shard.pointers.size(); ++i) {
-    const span<const element_t> anchor{
-      shard.vectors.data() + static_cast<size_t>(i) * dim_, dim_};
-    best_distance = std::min(best_distance, L2Distance::dist(query, anchor, dim_));
-  }
-  return best_distance;
-}
-
-Index::ShardScore Index::nearest_shard(const span<const element_t> query,
-                                       distance_t* second_distance) const {
-  ShardScore best{0, std::numeric_limits<distance_t>::max()};
-  distance_t second = std::numeric_limits<distance_t>::max();
-  if (second_distance != nullptr) {
-    *second_distance = second;
-  }
-  if (shards_.empty()) {
-    return best;
-  }
+u32 Index::nearest_shard(const span<const element_t> query) const {
+  u32 best_shard = 0;
   distance_t best_distance = std::numeric_limits<distance_t>::max();
   for (u32 shard = 0; shard < shards_.size(); ++shard) {
-    const distance_t distance = centroid_distance(query, shard);
+    if (shards_[shard].centroid.size() != dim_) {
+      continue;
+    }
+    const distance_t distance = L2Distance::dist(query, shards_[shard].centroid, dim_);
     if (distance < best_distance) {
-      second = best_distance;
       best_distance = distance;
-      best = ShardScore{shard, distance};
-    } else if (distance < second) {
-      second = distance;
+      best_shard = shard;
     }
   }
-  if (second_distance != nullptr) {
-    *second_distance = second;
-  }
-  return best;
-}
-
-vec<Index::ShardScore> Index::top_shards(const span<const element_t> query, u32 count) const {
-  vec<ShardScore> scores;
-  if (count == 0 || shards_.empty()) {
-    return scores;
-  }
-  scores.reserve(shards_.size());
-  for (u32 shard = 0; shard < shards_.size(); ++shard) {
-    scores.push_back(ShardScore{shard, centroid_distance(query, shard)});
-  }
-  const u32 keep = std::min<u32>(count, static_cast<u32>(scores.size()));
-  std::partial_sort(scores.begin(), scores.begin() + keep, scores.end(),
-                    [](const ShardScore& lhs, const ShardScore& rhs) {
-                      return lhs.distance < rhs.distance;
-                    });
-  scores.resize(keep);
-  return scores;
+  return best_shard;
 }
 
 vec<RemotePtr> Index::nearest_anchors(const span<const element_t> query,
@@ -254,79 +160,24 @@ vec<RemotePtr> Index::nearest_anchors(const span<const element_t> query,
 
 Route Index::route(const span<const element_t> query,
                    u32 hint_count,
-                   u32 top_owners,
                    std::optional<u32> owner_override) const {
-  std::shared_lock lock(mutex_);
   Route route;
   if (shards_.empty() || query.size() != dim_) {
     return route;
   }
-  const u32 owner_count = std::max<u32>(1, top_owners);
-  vec<ShardScore> ranked_shards = top_shards(query, std::max<u32>(2, owner_count));
-  if (ranked_shards.empty()) {
+  const u32 semantic_shard = nearest_shard(query);
+  route.owner = owner_override.has_value() ? *owner_override : semantic_shard;
+  if (route.owner == semantic_shard) {
+    route.hints = nearest_anchors(query, semantic_shard, hint_count);
     return route;
   }
-  const ShardScore semantic = ranked_shards.front();
-  const distance_t second_distance = ranked_shards.size() > 1
-                                       ? ranked_shards[1].distance
-                                       : std::numeric_limits<distance_t>::max();
-  const u32 semantic_shard = semantic.shard;
-  route.semantic_owner = semantic_shard;
-  route.anchor_version = route_epoch_;
-  if (std::isfinite(second_distance) && second_distance > 0.0f) {
-    route.confidence = static_cast<f32>(
-      std::clamp((second_distance - semantic.distance) / second_distance, 0.0f, 1.0f));
-  } else {
-    route.confidence = shards_.size() <= 1 ? 1.0f : 0.0f;
-  }
-  route.owner = owner_override.has_value() ? *owner_override : semantic_shard;
-  if (owner_override.has_value() && *owner_override != semantic_shard) {
-    route.flags |= service::storage_owner::kRouteFlagOwnerOverride;
-  }
 
-  vec<u32> hint_shards;
-  hint_shards.reserve(std::min<size_t>(ranked_shards.size() + 1, owner_count));
-  hint_shards.push_back(route.owner);
-
-  // Keep the default foreground path owner-local. When upsert ownership is
-  // fixed, extra semantic owners are rescue hints and must be explicitly budgeted.
-  for (const ShardScore& score : ranked_shards) {
-    if (hint_shards.size() >= owner_count) {
-      break;
-    }
-    if (std::find(hint_shards.begin(), hint_shards.end(), score.shard) == hint_shards.end()) {
-      hint_shards.push_back(score.shard);
-    }
-  }
-
-  const u32 per_shard_min = std::max<u32>(1, hint_count / std::max<u32>(1, hint_shards.size()));
-  for (const u32 shard : hint_shards) {
-    if (route.hints.size() >= hint_count) {
-      break;
-    }
-    const u32 remaining = hint_count - static_cast<u32>(route.hints.size());
-    const u32 shard_budget = std::max<u32>(per_shard_min, remaining == hint_count ? (hint_count + 1) / 2 : 1);
-    vec<RemotePtr> shard_hints = nearest_anchors(query, shard, std::min(remaining, shard_budget));
-    for (const RemotePtr hint : shard_hints) {
-      if (std::find(route.hints.begin(), route.hints.end(), hint) == route.hints.end()) {
-        route.hints.push_back(hint);
-        if (route.hints.size() >= hint_count) {
-          break;
-        }
-      }
-    }
-  }
-  if (route.hints.size() < hint_count) {
-    for (const u32 shard : hint_shards) {
-      vec<RemotePtr> shard_hints = nearest_anchors(query, shard, hint_count);
-      for (const RemotePtr hint : shard_hints) {
-        if (std::find(route.hints.begin(), route.hints.end(), hint) == route.hints.end()) {
-          route.hints.push_back(hint);
-          if (route.hints.size() >= hint_count) {
-            return route;
-          }
-        }
-      }
+  const u32 local_count = (hint_count + 1) / 2;
+  route.hints = nearest_anchors(query, route.owner, local_count);
+  vec<RemotePtr> semantic = nearest_anchors(query, semantic_shard, hint_count - local_count);
+  for (const RemotePtr hint : semantic) {
+    if (std::find(route.hints.begin(), route.hints.end(), hint) == route.hints.end()) {
+      route.hints.push_back(hint);
     }
   }
   return route;

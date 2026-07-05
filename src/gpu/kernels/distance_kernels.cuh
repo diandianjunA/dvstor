@@ -360,4 +360,42 @@ __global__ void robust_prune_typed_kernel(
     }
 }
 
+// Asymmetric RaBitQ. One cooperative tile evaluates one candidate so
+// remain parallel without a dimension-dependent shared-memory LUT.
+template <uint32_t TILE_SIZE>
+__global__ void rabitq_asymmetric_kernel(
+    const float* __restrict__ d_rotated_query,
+    const uint8_t* __restrict__ candidate_data,
+    float* __restrict__ distances,
+    float query_norm2, uint32_t n_candidates,
+    uint32_t code_bits, uint32_t code_bytes, uint32_t entry_bytes)
+{
+    static_assert(TILE_SIZE == 8 || TILE_SIZE == 16 || TILE_SIZE == 32);
+    const uint32_t global_thread = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t candidate = global_thread / TILE_SIZE;
+    const uint32_t lane = threadIdx.x & (TILE_SIZE - 1);
+    if (candidate >= n_candidates) return;
+
+    const uint8_t* entry = candidate_data + static_cast<size_t>(candidate) * entry_bytes;
+    float signed_dot = 0.0f;
+    for (uint32_t bit = lane; bit < code_bits; bit += TILE_SIZE) {
+        const bool positive = (entry[bit >> 3] & (1u << (7u - (bit & 7u)))) != 0;
+        signed_dot += positive ? d_rotated_query[bit] : -d_rotated_query[bit];
+    }
+    for (uint32_t offset = TILE_SIZE / 2; offset > 0; offset >>= 1) {
+        signed_dot += __shfl_down_sync(__activemask(), signed_dot, offset, TILE_SIZE);
+    }
+    if (lane == 0) {
+        const uint32_t scalar_offset = (code_bytes + 3u) & ~3u;
+        const float x_norm = *reinterpret_cast<const float*>(entry + scalar_offset);
+        const float e = *reinterpret_cast<const float*>(entry + scalar_offset + sizeof(float));
+        float ip_approx = 0.0f;
+        if (e > 1e-12f) {
+            ip_approx = x_norm * signed_dot / (sqrtf(static_cast<float>(code_bits)) * e);
+        }
+        const float d2 = query_norm2 + x_norm * x_norm - 2.0f * ip_approx;
+        distances[candidate] = fmaxf(d2, 0.0f);
+    }
+}
+
 }  // namespace gpu_kernels

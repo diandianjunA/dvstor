@@ -125,6 +125,13 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.rabitq_forced_widen += delta.rabitq_forced_widen;
   aggregate.counters.rabitq_audit_expansions += delta.rabitq_audit_expansions;
   aggregate.counters.rabitq_audit_candidates += delta.rabitq_audit_candidates;
+  aggregate.counters.rabitq_safe_skips += delta.rabitq_safe_skips;
+  aggregate.counters.rabitq_exact_fallbacks += delta.rabitq_exact_fallbacks;
+  aggregate.counters.rabitq_prefetch_issued += delta.rabitq_prefetch_issued;
+  aggregate.counters.rabitq_prefetch_hits += delta.rabitq_prefetch_hits;
+  aggregate.counters.rabitq_prefetch_misses += delta.rabitq_prefetch_misses;
+  aggregate.counters.rabitq_prefetch_disabled_queries +=
+    delta.rabitq_prefetch_disabled_queries;
   aggregate.counters.credit_rounds += delta.credit_rounds;
   aggregate.counters.credit_expansions_issued += delta.credit_expansions_issued;
   aggregate.counters.credit_precommit_expansions += delta.credit_precommit_expansions;
