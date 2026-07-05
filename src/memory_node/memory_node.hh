@@ -79,6 +79,19 @@ class MemoryNode {
     std::chrono::steady_clock::time_point queued_at{};
   };
 
+  enum class StorageOwnerMaintenanceKind : u8 {
+    inserted_node_repair,
+    reverse_edge_repair,
+    tombstone_cleanup,
+  };
+
+  struct StorageOwnerMaintenanceTask {
+    StorageOwnerMaintenanceKind kind{StorageOwnerMaintenanceKind::inserted_node_repair};
+    RemotePtr target;
+    vec<RemotePtr> candidates;
+    std::chrono::steady_clock::time_point queued_at{};
+  };
+
 public:
   explicit MemoryNode(Configuration& config);
 
@@ -197,6 +210,24 @@ private:
                                              u32 item_count,
                                              bool success) const;
 
+  // Storage-owner background graph maintenance
+  static bool storage_owner_maintenance_enabled(const Configuration& config);
+  void start_storage_owner_maintenance_runtime(const Configuration& config);
+  void stop_storage_owner_maintenance_runtime();
+  bool enqueue_storage_owner_maintenance(StorageOwnerMaintenanceTask&& task, const Configuration& config);
+  bool enqueue_inserted_node_repair(RemotePtr target, const Configuration& config);
+  bool enqueue_reverse_edge_repair(RemotePtr target,
+                                   const vec<RemotePtr>& candidates,
+                                   const Configuration& config);
+  bool enqueue_tombstone_cleanup(RemotePtr deleted_ptr,
+                                 const vec<RemotePtr>& candidate_neighbors,
+                                 const Configuration& config);
+  void storage_owner_maintenance_worker_loop(u32 worker_id);
+  bool repair_inserted_storage_owner_node(RemotePtr target_ptr, const Configuration& config);
+  bool repair_storage_owner_neighbors(RemotePtr target_ptr,
+                                      const vec<RemotePtr>& candidate_ptrs,
+                                      const Configuration& config);
+
   // Storage-owner RPC runtime
   void setup_insert_runtime(const Configuration& config);
   void start_storage_owner_insert_workers(const Configuration& config);
@@ -297,7 +328,8 @@ private:
                                               const Configuration& config) -> StorageOwnerInsertCoroutine;
   bool apply_local_reverse_update(RemotePtr target_ptr,
                                   const vec<RemotePtr>& candidate_ptrs,
-                                  const Configuration& config);
+                                  const Configuration& config,
+                                  bool enqueue_maintenance = true);
 
   // Misc helpers
   static size_t align_up(size_t value, size_t alignment = CACHELINE_SIZE);
@@ -376,6 +408,18 @@ private:
   std::atomic<bool> peer_reverse_workers_done_{false};
   size_t peer_reverse_task_queue_limit_{1024};
   size_t peer_reverse_outgoing_queue_limit_{1024};
+  vec<std::thread> storage_owner_maintenance_workers_;
+  vec<u_ptr<StorageOwnerThread>> storage_owner_maintenance_worker_states_;
+  std::mutex storage_owner_maintenance_mutex_;
+  std::condition_variable storage_owner_maintenance_cv_;
+  std::deque<StorageOwnerMaintenanceTask> storage_owner_maintenance_tasks_;
+  std::unordered_map<u64, vec<RemotePtr>> storage_owner_maintenance_reverse_candidates_;
+  std::atomic<bool> storage_owner_maintenance_shutdown_{false};
+  size_t storage_owner_maintenance_queue_limit_{65536};
+  std::atomic<u64> storage_owner_maintenance_enqueued_{0};
+  std::atomic<u64> storage_owner_maintenance_dropped_{0};
+  std::atomic<u64> storage_owner_maintenance_processed_{0};
+  std::atomic<u64> storage_owner_maintenance_failed_{0};
   InsertRuntimeState insert_runtime_;
   std::unique_ptr<Configuration> storage_worker_config_;
   std::mutex storage_send_mutex_;

@@ -81,6 +81,7 @@ set(DVSTOR_MEMORY_NODE_SOURCES
     src/memory_node/peer_rpc.cc
     src/memory_node/storage_owner_anchor.cc
     src/memory_node/storage_owner_index.cc
+    src/memory_node/storage_owner_maintenance.cc
     src/memory_node/storage_owner_runtime.cc
 )
 

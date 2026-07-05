@@ -1317,17 +1317,25 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   const auto status = prepare_mutation(job.id, job.kind, &old_entry, &generation);
   job.old_ptr = old_entry.current;
   job.generation = generation;
+  const bool maintenance_enabled = storage_owner_maintenance_enabled(config);
   if (status != service::storage_owner::MutationStatus::ok) {
     job.status = status;
     job.ok = false;
     co_return;
   }
   if (job.kind == service::storage_owner::MutationKind::erase) {
+    vec<RemotePtr> old_neighbors;
+    if (maintenance_enabled && !old_entry.current.is_null()) {
+      old_neighbors = read_neighbor_list(old_entry.current);
+    }
     job.ok = mark_node_deleted(old_entry.current, old_entry.generation);
     job.status = job.ok ? service::storage_owner::MutationStatus::ok
                         : service::storage_owner::MutationStatus::failed;
     if (job.ok) {
       publish_mutation(job.id, old_entry.current, old_entry.generation, true);
+      if (maintenance_enabled) {
+        (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
+      }
     }
     co_return;
   }
@@ -1407,10 +1415,18 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
     if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
       job.ok = true;
       job.status = service::storage_owner::MutationStatus::ok;
+      vec<RemotePtr> old_neighbors;
       if (job.kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
+        if (maintenance_enabled && !old_entry.current.is_null()) {
+          old_neighbors = read_neighbor_list(old_entry.current);
+        }
         mark_node_deleted(old_entry.current, old_entry.generation);
       }
       publish_mutation(job.id, new_ptr, generation, false);
+      if (maintenance_enabled) {
+        (void)enqueue_inserted_node_repair(new_ptr, config);
+        (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
+      }
       co_return;
     }
     medoid_ptr = observed;
@@ -1456,10 +1472,18 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   auto t_write = std::chrono::steady_clock::now();
   write_new_node(new_ptr, job.id, components, selected_neighbors, generation);
   breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
+  vec<RemotePtr> old_neighbors;
   if (job.kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
+    if (maintenance_enabled && !old_entry.current.is_null()) {
+      old_neighbors = read_neighbor_list(old_entry.current);
+    }
     mark_node_deleted(old_entry.current, old_entry.generation);
   }
   publish_mutation(job.id, new_ptr, generation, false);
+  if (maintenance_enabled) {
+    (void)enqueue_inserted_node_repair(new_ptr, config);
+    (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
+  }
 
   for (const RemotePtr& neighbor_ptr : selected_neighbors) {
     if (local_shard(neighbor_ptr.memory_node())) {
@@ -1475,7 +1499,8 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
 
 bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
                                 const vec<RemotePtr>& candidate_ptrs,
-                                const Configuration& config) {
+                                const Configuration& config,
+                                bool enqueue_maintenance) {
   lib_assert(local_shard(target_ptr.memory_node()), "target reverse update must be local");
   if (candidate_ptrs.empty()) {
     return true;
@@ -1618,6 +1643,10 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
     write_ns = elapsed_ns_since(step_started);
   }
   unlock_node(target_ptr);
+
+  if (changed && enqueue_maintenance && storage_owner_maintenance_enabled(config)) {
+    (void)enqueue_reverse_edge_repair(target_ptr, filtered_candidates, config);
+  }
 
   const u64 update_ns = elapsed_ns_since(update_started);
   if (update_ns > 1000ull * 1000ull * 1000ull) {

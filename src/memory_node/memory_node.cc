@@ -164,6 +164,7 @@ MemoryNode::MemoryNode(Configuration& config)
     setup_insert_runtime(config);
     storage_worker_config_ = std::make_unique<Configuration>(config);
     start_peer_reverse_update_runtime(config);
+    start_storage_owner_maintenance_runtime(config);
     start_storage_owner_insert_workers(config);
     service_storage_runtime(config);
 
@@ -181,6 +182,7 @@ MemoryNode::MemoryNode(Configuration& config)
       worker.join();
     }
   }
+  stop_storage_owner_maintenance_runtime();
   stop_peer_reverse_update_runtime();
 
   print_status("memory node shutting down");

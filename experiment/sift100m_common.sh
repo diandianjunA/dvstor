@@ -335,6 +335,11 @@ write_service_config() {
         echo "storage-owner-anchor-audit-rate = ${STORAGE_OWNER_ANCHOR_AUDIT_RATE:-256}"
         echo "storage-owner-anchor-min-overlap = ${STORAGE_OWNER_ANCHOR_MIN_OVERLAP:-0.5}"
       fi
+      echo "storage-owner-maintenance-mode = ${STORAGE_OWNER_MAINTENANCE_MODE:-off}"
+      echo "storage-owner-maintenance-workers = ${STORAGE_OWNER_MAINTENANCE_WORKERS:-0}"
+      echo "storage-owner-maintenance-budget-us = ${STORAGE_OWNER_MAINTENANCE_BUDGET_US:-0}"
+      echo "storage-owner-maintenance-period-us = ${STORAGE_OWNER_MAINTENANCE_PERIOD_US:-1000}"
+      echo "storage-owner-maintenance-queue-depth = ${STORAGE_OWNER_MAINTENANCE_QUEUE_DEPTH:-65536}"
       echo "storage-owner-reverse-mode = ${STORAGE_OWNER_REVERSE_MODE:-async}"
       echo "storage-owner-reverse-queue-depth = ${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
       echo "storage-owner-reverse-flush-us = ${STORAGE_OWNER_REVERSE_FLUSH_US:-200}"

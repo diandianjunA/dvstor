@@ -75,6 +75,11 @@ if [[ "$INSERT_EXECUTION" == "storage_owner" ]]; then
     cmd+=(--storage-owner-anchor-audit-rate "${STORAGE_OWNER_ANCHOR_AUDIT_RATE:-256}")
     cmd+=(--storage-owner-anchor-min-overlap "${STORAGE_OWNER_ANCHOR_MIN_OVERLAP:-0.5}")
   fi
+  cmd+=(--storage-owner-maintenance-mode "${STORAGE_OWNER_MAINTENANCE_MODE:-off}")
+  cmd+=(--storage-owner-maintenance-workers "${STORAGE_OWNER_MAINTENANCE_WORKERS:-0}")
+  cmd+=(--storage-owner-maintenance-budget-us "${STORAGE_OWNER_MAINTENANCE_BUDGET_US:-0}")
+  cmd+=(--storage-owner-maintenance-period-us "${STORAGE_OWNER_MAINTENANCE_PERIOD_US:-1000}")
+  cmd+=(--storage-owner-maintenance-queue-depth "${STORAGE_OWNER_MAINTENANCE_QUEUE_DEPTH:-65536}")
   cmd+=(--storage-owner-reverse-mode "${STORAGE_OWNER_REVERSE_MODE:-async}")
   cmd+=(--storage-owner-reverse-queue-depth "${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}")
   cmd+=(--storage-owner-reverse-flush-us "${STORAGE_OWNER_REVERSE_FLUSH_US:-200}")

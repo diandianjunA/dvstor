@@ -596,6 +596,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
 
   RemotePtr medoid_ptr{};
   bool medoid_loaded = false;
+  const bool maintenance_enabled = storage_owner_maintenance_enabled(config);
   std::unordered_map<u64, vec<RemotePtr>> local_updates;
   std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
   if (statuses != nullptr) {
@@ -621,9 +622,16 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       continue;
     }
     if (kind == service::storage_owner::MutationKind::erase) {
+      vec<RemotePtr> old_neighbors;
+      if (maintenance_enabled && !old_entry.current.is_null()) {
+        old_neighbors = read_neighbor_list(old_entry.current);
+      }
       const bool deleted = mark_node_deleted(old_entry.current, old_entry.generation);
       if (deleted) {
         publish_mutation(ids[idx], old_entry.current, old_entry.generation, true);
+        if (maintenance_enabled) {
+          (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
+        }
       }
       if (statuses != nullptr) {
         (*statuses)[idx] = static_cast<u32>(deleted ? service::storage_owner::MutationStatus::ok
@@ -689,10 +697,18 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       auto t_write = std::chrono::steady_clock::now();
       write_new_node(new_ptr, ids[idx], components, {}, generation);
       breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
+      vec<RemotePtr> old_neighbors;
       if (kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
+        if (maintenance_enabled && !old_entry.current.is_null()) {
+          old_neighbors = read_neighbor_list(old_entry.current);
+        }
         mark_node_deleted(old_entry.current, old_entry.generation);
       }
       publish_mutation(ids[idx], new_ptr, generation, false);
+      if (maintenance_enabled) {
+        (void)enqueue_inserted_node_repair(new_ptr, config);
+        (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
+      }
       RemotePtr observed;
       if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
         medoid_ptr = new_ptr;
@@ -734,10 +750,18 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     auto t_write = std::chrono::steady_clock::now();
     write_new_node(new_ptr, ids[idx], components, selected_neighbors, generation);
     breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
+    vec<RemotePtr> old_neighbors;
     if (kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
+      if (maintenance_enabled && !old_entry.current.is_null()) {
+        old_neighbors = read_neighbor_list(old_entry.current);
+      }
       mark_node_deleted(old_entry.current, old_entry.generation);
     }
     publish_mutation(ids[idx], new_ptr, generation, false);
+    if (maintenance_enabled) {
+      (void)enqueue_inserted_node_repair(new_ptr, config);
+      (void)enqueue_tombstone_cleanup(old_entry.current, old_neighbors, config);
+    }
     if (statuses != nullptr) {
       (*statuses)[idx] = static_cast<u32>(service::storage_owner::MutationStatus::ok);
     }

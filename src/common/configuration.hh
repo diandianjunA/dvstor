@@ -98,6 +98,11 @@ public:
   u32 storage_owner_anchor_audit_rate{256};
   f64 storage_owner_anchor_min_overlap{0.5};
   bool storage_owner_anchor_rehome_upsert{false};
+  str storage_owner_maintenance_mode{"off"};
+  u32 storage_owner_maintenance_workers{0};
+  u32 storage_owner_maintenance_budget_us{0};
+  u32 storage_owner_maintenance_period_us{1000};
+  u32 storage_owner_maintenance_queue_depth{65536};
   str storage_owner_reverse_mode{"async"};
   u32 storage_owner_reverse_queue_depth{65536};
   u32 storage_owner_reverse_flush_us{200};
@@ -129,6 +134,7 @@ public:
     insert_execution = normalize_mode(insert_execution);
     storage_owner_reverse_mode = normalize_mode(storage_owner_reverse_mode);
     storage_owner_update_mode = normalize_mode(storage_owner_update_mode);
+    storage_owner_maintenance_mode = normalize_mode(storage_owner_maintenance_mode);
     rdma_read_batch_mode = normalize_mode(rdma_read_batch_mode);
 
     if (!is_server) {
@@ -239,6 +245,21 @@ private:
       "storage-owner-anchor-rehome-upsert",
       po::value<bool>(&storage_owner_anchor_rehome_upsert)->default_value(storage_owner_anchor_rehome_upsert),
       "Allow anchored upserts to migrate ID ownership. Disabled until distributed two-phase ownership is enabled.")(
+      "storage-owner-maintenance-mode",
+      po::value<str>(&storage_owner_maintenance_mode)->default_value(storage_owner_maintenance_mode),
+      "Storage-owner background graph-quality maintenance: off or budgeted.")(
+      "storage-owner-maintenance-workers",
+      po::value<u32>(&storage_owner_maintenance_workers)->default_value(storage_owner_maintenance_workers),
+      "Background storage-owner maintenance worker threads. 0 disables maintenance.")(
+      "storage-owner-maintenance-budget-us",
+      po::value<u32>(&storage_owner_maintenance_budget_us)->default_value(storage_owner_maintenance_budget_us),
+      "Maximum maintenance work time per worker period in microseconds.")(
+      "storage-owner-maintenance-period-us",
+      po::value<u32>(&storage_owner_maintenance_period_us)->default_value(storage_owner_maintenance_period_us),
+      "Maintenance worker scheduling period in microseconds.")(
+      "storage-owner-maintenance-queue-depth",
+      po::value<u32>(&storage_owner_maintenance_queue_depth)->default_value(storage_owner_maintenance_queue_depth),
+      "Maximum queued storage-owner maintenance tasks.")(
       "storage-owner-reverse-mode",
       po::value<str>(&storage_owner_reverse_mode)->default_value(storage_owner_reverse_mode),
       "Reverse-update completion mode for storage_owner inserts: async or sync.")(
@@ -479,6 +500,19 @@ private:
         std::cerr << "[ERROR]: --storage-owner-reverse-mode must be async or sync" << std::endl;
         exit_with_help_message(argv);
       }
+      if (storage_owner_maintenance_mode != "off" && storage_owner_maintenance_mode != "budgeted") {
+        std::cerr << "[ERROR]: --storage-owner-maintenance-mode must be off or budgeted" << std::endl;
+        exit_with_help_message(argv);
+      }
+      if (storage_owner_maintenance_mode == "budgeted" &&
+          (storage_owner_maintenance_workers == 0 ||
+           storage_owner_maintenance_budget_us == 0 ||
+           storage_owner_maintenance_period_us == 0 ||
+           storage_owner_maintenance_queue_depth == 0 ||
+           storage_owner_maintenance_budget_us > storage_owner_maintenance_period_us)) {
+        std::cerr << "[ERROR]: invalid storage-owner maintenance budget configuration" << std::endl;
+        exit_with_help_message(argv);
+      }
       if (storage_owner_reverse_queue_depth == 0) {
         std::cerr << "[ERROR]: --storage-owner-reverse-queue-depth must be > 0" << std::endl;
         exit_with_help_message(argv);
@@ -574,6 +608,16 @@ public:
              << config.storage_owner_anchor_remote_rescue_cap << std::endl;
           os << std::setw(width) << "anchor audit rate: " << config.storage_owner_anchor_audit_rate << std::endl;
         }
+        os << std::setw(width) << "storage maintenance mode: "
+           << config.storage_owner_maintenance_mode << std::endl;
+        os << std::setw(width) << "storage maintenance workers: "
+           << config.storage_owner_maintenance_workers << std::endl;
+        os << std::setw(width) << "storage maintenance budget(us): "
+           << config.storage_owner_maintenance_budget_us << std::endl;
+        os << std::setw(width) << "storage maintenance period(us): "
+           << config.storage_owner_maintenance_period_us << std::endl;
+        os << std::setw(width) << "storage maintenance queue: "
+           << config.storage_owner_maintenance_queue_depth << std::endl;
         os << std::setw(width) << "storage reverse mode: " << config.storage_owner_reverse_mode << std::endl;
         os << std::setw(width) << "storage reverse queue depth: "
            << config.storage_owner_reverse_queue_depth << std::endl;
