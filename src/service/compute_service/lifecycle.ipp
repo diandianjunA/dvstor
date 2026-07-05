@@ -118,17 +118,9 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   vamana_->set_rabitq_gate(config_.rabitq_gate_width,
                            config_.rabitq_gate_max_width,
                            static_cast<f32>(config_.rabitq_gate_margin));
-  vamana_->set_rabitq_runtime(config_.rabitq_coalesce_min,
-                              config_.rabitq_warmup_exact_expansions,
+  vamana_->set_rabitq_runtime(config_.rabitq_warmup_exact_expansions,
                               config_.rabitq_audit_period,
                               config_.rabitq_strict_recall);
-  vamana_->set_rabitq_exact_safe(config_.rabitq_mode == "exact_safe",
-                                 static_cast<f32>(config_.rabitq_safe_epsilon));
-  vamana_->set_rabitq_speculative_prefetch(
-    config_.rabitq_mode == "speculative_prefetch",
-    config_.rabitq_prefetch_width,
-    config_.rabitq_prefetch_min_samples,
-    static_cast<f32>(config_.rabitq_prefetch_min_hit_ratio));
   vamana_->set_use_rabitq(config_.use_rabitq);
   if (vamana_->use_rabitq() && config_.load_index) {
     const filepath_t startup_prefix = config_.resolved_index_prefix();
@@ -156,7 +148,9 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   if (config_.use_storage_owner_insert() && config_.storage_owner_update_mode == "anchored") {
     anchor_index_ = std::make_unique<vamana::anchor::Index>();
     str anchor_error;
-    if (!have_startup_metadata || startup_metadata.anchor_format != "owner_anchor_v1" ||
+    const bool anchor_format_ok = startup_metadata.anchor_format == "owner_anchor_v1" ||
+                                  startup_metadata.anchor_format == "owner_anchor_v2";
+    if (!have_startup_metadata || !anchor_format_ok ||
         !anchor_index_->load(config_.resolved_index_prefix(), config_.dim, num_servers_, &anchor_error)) {
       anchor_index_.reset();
       throw std::runtime_error(
@@ -168,9 +162,9 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                    std::to_string(anchor_index_->memory_bytes()) + " bytes");
     }
   }
-  print_status((config_.credit_aware_expansion ? "search: credit-aware " : "search: ") +
+  print_status(std::string(config_.credit_aware_expansion ? "search: credit-aware " : "search: ") +
     (vamana_->use_rabitq()
-      ? "RFQ5 RaBitQ " + config_.rabitq_mode + " + GPUDirect exact beam"
+      ? "RFQ5 RaBitQ CPU gate + GPUDirect exact beam"
       : "exact"));
 
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,

@@ -122,6 +122,7 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
   vec<service::storage_owner::MutationKind> batch_kinds;
   vec<element_t> batch_vectors;
   vec<u64> batch_anchor_hints;
+  vec<service::storage_owner::RouteMetadata> batch_route_metadata;
   const u32 expected_anchor_hint_count = config.storage_owner_update_mode == "anchored"
                                            ? config.storage_owner_anchor_hints : 0;
   vec<u32> item_counts;
@@ -129,6 +130,7 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
   batch_ids.reserve(std::max<u32>(config.storage_owner_batch_max, 64));
   batch_kinds.reserve(std::max<u32>(config.storage_owner_batch_max, 64));
   batch_vectors.reserve(static_cast<size_t>(std::max<u32>(config.storage_owner_batch_max, 64)) * config.dim);
+  batch_route_metadata.reserve(std::max<u32>(config.storage_owner_batch_max, 64));
   item_counts.reserve(tasks.size());
   response_magics.reserve(tasks.size());
 
@@ -146,6 +148,9 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
     const u64* hints = mutation
       ? service::storage_owner::mutation_request_anchor_hints(task.payload.data(), request->item_count)
       : service::storage_owner::request_anchor_hints(task.payload.data(), request->item_count);
+    const auto* route_metadata = mutation
+      ? service::storage_owner::mutation_request_route_metadata(task.payload.data(), request->item_count)
+      : service::storage_owner::request_route_metadata(task.payload.data(), request->item_count);
     item_counts.push_back(request->item_count);
     response_magics.push_back(request->magic);
     batch_ids.insert(batch_ids.end(), ids, ids + request->item_count);
@@ -159,6 +164,9 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
       for (u32 hint = 0; hint < request->anchor_hint_count; ++hint) {
         batch_anchor_hints.push_back(hints[static_cast<size_t>(i) * request->anchor_hint_count + hint]);
       }
+      batch_route_metadata.push_back(route_metadata == nullptr
+        ? service::storage_owner::RouteMetadata{}
+        : route_metadata[i]);
     }
     const size_t old_size = batch_vectors.size();
     batch_vectors.resize(old_size + static_cast<size_t>(request->item_count) * config.dim);
@@ -186,6 +194,7 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
                                                                batch_kinds.data(),
                                                                batch_vectors.data(),
                                                                batch_anchor_hints.empty() ? nullptr : batch_anchor_hints.data(),
+                                                               batch_route_metadata.empty() ? nullptr : batch_route_metadata.data(),
                                                                expected_anchor_hint_count,
                                                                batch_ids.size(),
                                                                *current_storage_owner_thread_,
@@ -198,6 +207,7 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
                                                         batch_kinds.data(),
                                                         batch_vectors.data(),
                                                         batch_anchor_hints.empty() ? nullptr : batch_anchor_hints.data(),
+                                                        batch_route_metadata.empty() ? nullptr : batch_route_metadata.data(),
                                                         expected_anchor_hint_count,
                                                         batch_ids.size(),
                                                         breakdown,
@@ -253,6 +263,7 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
                                              const service::storage_owner::MutationKind* kinds,
                                              const element_t* vectors,
                                              const u64* anchor_hints,
+                                             const service::storage_owner::RouteMetadata* route_metadata,
                                              u32 anchor_hint_count,
                                              size_t item_count,
                                              StorageOwnerThread& thread,
@@ -284,11 +295,22 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
         }
       }
     }
+    if (route_metadata != nullptr) {
+      const auto& meta = route_metadata[idx];
+      job.old_ptr_hint = RemotePtr{meta.old_rptr_raw};
+      job.old_generation_hint = meta.old_generation;
+      job.old_owner = meta.old_owner;
+      job.semantic_owner = meta.semantic_owner;
+      job.anchor_version = meta.anchor_version;
+      job.route_confidence = meta.route_confidence;
+      job.route_flags = meta.flags;
+    }
     jobs.push_back(std::move(job));
   }
 
   std::unordered_map<u64, vec<RemotePtr>> local_updates;
   std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
+  std::unordered_map<u32, vec<service::storage_owner::OwnerDirectoryUpdateOp>> owner_directory_updates;
 
   const u32 coroutine_count = static_cast<u32>(std::max<size_t>(1, thread.post_balances.size()));
   lib_assert(thread.id < storage_owner_async_candidates_.size(),
@@ -356,6 +378,47 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
         job.generation,
         0};
     }
+    if (!job.ok) {
+      continue;
+    }
+    if (job.kind == service::storage_owner::MutationKind::upsert &&
+        (job.route_flags & service::storage_owner::kRouteFlagRehome) != 0 &&
+        job.old_owner < num_storage_nodes_ &&
+        job.old_owner != storage_id_ &&
+        !job.new_ptr.is_null()) {
+      owner_directory_updates[job.old_owner].push_back(
+        service::storage_owner::OwnerDirectoryUpdateOp{
+          job.id,
+          storage_id_,
+          job.generation,
+          0,
+          job.new_ptr.raw_address});
+    }
+    if (job.kind == service::storage_owner::MutationKind::upsert &&
+        (job.route_flags & service::storage_owner::kRouteFlagRehome) == 0 &&
+        !job.old_ptr.is_null() &&
+        job.old_ptr.memory_node() < num_storage_nodes_ &&
+        job.old_ptr.memory_node() != storage_id_) {
+      owner_directory_updates[job.old_ptr.memory_node()].push_back(
+        service::storage_owner::OwnerDirectoryUpdateOp{
+          job.id,
+          job.old_ptr.memory_node(),
+          job.generation,
+          service::storage_owner::kOwnerDirectoryDeleted,
+          job.old_ptr.raw_address});
+    }
+    if (job.kind == service::storage_owner::MutationKind::erase &&
+        !job.old_ptr.is_null() &&
+        job.old_ptr.memory_node() < num_storage_nodes_ &&
+        job.old_ptr.memory_node() != storage_id_) {
+      owner_directory_updates[job.old_ptr.memory_node()].push_back(
+        service::storage_owner::OwnerDirectoryUpdateOp{
+          job.id,
+          job.old_ptr.memory_node(),
+          job.generation,
+          service::storage_owner::kOwnerDirectoryDeleted,
+          job.old_ptr.raw_address});
+    }
   }
   auto t_local_reverse = std::chrono::steady_clock::now();
   for (auto& [target_raw, candidates] : local_updates) {
@@ -365,6 +428,9 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
   auto t_remote_reverse = std::chrono::steady_clock::now();
   for (auto& [target_shard, ops] : remote_updates) {
     ok &= send_reverse_update_batch(target_shard, ops, config);
+  }
+  for (auto& [target_shard, ops] : owner_directory_updates) {
+    ok &= send_owner_directory_update_batch(target_shard, ops, config);
   }
   breakdown.storage_owner_remote_reverse_ns += elapsed_ns_since(t_remote_reverse);
   if (invalidated_neighbors != nullptr) {
@@ -539,6 +605,9 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* pa
   const u64* anchor_hints = mutation
     ? service::storage_owner::mutation_request_anchor_hints(payload, request->item_count)
     : service::storage_owner::request_anchor_hints(payload, request->item_count);
+  const auto* route_metadata = mutation
+    ? service::storage_owner::mutation_request_route_metadata(payload, request->item_count)
+    : service::storage_owner::request_route_metadata(payload, request->item_count);
   vec<service::storage_owner::MutationKind> kinds(request->item_count, service::storage_owner::MutationKind::insert);
   for (u32 i = 0; i < request->item_count && kinds_raw != nullptr; ++i) {
     kinds[i] = static_cast<service::storage_owner::MutationKind>(kinds_raw[i]);
@@ -556,7 +625,7 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* pa
   vec<u32> item_statuses(request->item_count, static_cast<u32>(service::storage_owner::MutationStatus::failed));
   vec<service::storage_owner::MutationResult> mutation_results(request->item_count);
   const bool ok = execute_storage_owner_batch_items(ids, kinds.data(), decoded_vectors.data(),
-                                                    anchor_hints, request->anchor_hint_count,
+                                                    anchor_hints, route_metadata, request->anchor_hint_count,
                                                     request->item_count,
                                                     breakdown, config, &invalidated_neighbors,
                                                     &item_statuses, &mutation_results);
@@ -583,6 +652,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
                                        const service::storage_owner::MutationKind* kinds,
                                        const element_t* vectors,
                                        const u64* anchor_hints,
+                                       const service::storage_owner::RouteMetadata* route_metadata,
                                        u32 anchor_hint_count,
                                        size_t item_count,
                                        InsertBreakdownCounters& breakdown,
@@ -598,6 +668,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   bool medoid_loaded = false;
   std::unordered_map<u64, vec<RemotePtr>> local_updates;
   std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
+  std::unordered_map<u32, vec<service::storage_owner::OwnerDirectoryUpdateOp>> owner_directory_updates;
   if (statuses != nullptr) {
     statuses->assign(item_count, static_cast<u32>(service::storage_owner::MutationStatus::failed));
   }
@@ -610,8 +681,15 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     FreshnessEntry old_entry{};
     u32 generation = 0;
     const auto status = prepare_mutation(ids[idx], kind, &old_entry, &generation);
+    const service::storage_owner::RouteMetadata meta =
+      route_metadata == nullptr ? service::storage_owner::RouteMetadata{} : route_metadata[idx];
+    if (old_entry.current.is_null() && meta.old_generation >= generation) {
+      generation = meta.old_generation + 1;
+    }
     if (results != nullptr) {
-      (*results)[idx].old_rptr_raw = old_entry.current.raw_address;
+      (*results)[idx].old_rptr_raw = old_entry.current.is_null()
+        ? meta.old_rptr_raw
+        : old_entry.current.raw_address;
       (*results)[idx].generation = generation;
     }
     if (status != service::storage_owner::MutationStatus::ok) {
@@ -621,9 +699,23 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       continue;
     }
     if (kind == service::storage_owner::MutationKind::erase) {
-      const bool deleted = mark_node_deleted(old_entry.current, old_entry.generation);
+      const RemotePtr erase_ptr = old_entry.current.is_null()
+        ? RemotePtr{meta.old_rptr_raw}
+        : old_entry.current;
+      const bool deleted = mark_node_deleted(erase_ptr, generation);
       if (deleted) {
-        publish_mutation(ids[idx], old_entry.current, old_entry.generation, true);
+        publish_mutation(ids[idx], erase_ptr, generation, true);
+        if (!erase_ptr.is_null() &&
+            erase_ptr.memory_node() < num_storage_nodes_ &&
+            erase_ptr.memory_node() != storage_id_) {
+          owner_directory_updates[erase_ptr.memory_node()].push_back(
+            service::storage_owner::OwnerDirectoryUpdateOp{
+              ids[idx],
+              erase_ptr.memory_node(),
+              generation,
+              service::storage_owner::kOwnerDirectoryDeleted,
+              erase_ptr.raw_address});
+        }
       }
       if (statuses != nullptr) {
         (*statuses)[idx] = static_cast<u32>(deleted ? service::storage_owner::MutationStatus::ok
@@ -641,8 +733,15 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
         if (!ptr.is_null()) item_anchor_hints.push_back(ptr);
       }
     }
+    const bool low_confidence =
+      (meta.flags & service::storage_owner::kRouteFlagLowConfidence) != 0 ||
+      meta.route_confidence < static_cast<f32>(config.storage_owner_route_confidence_threshold);
+    if (config.storage_owner_update_mode == "anchored" && !item_anchor_hints.empty() && low_confidence) {
+      ++breakdown.storage_owner_anchor_fallbacks;
+    }
     const bool use_anchors = config.storage_owner_update_mode == "anchored" &&
-                             !item_anchor_hints.empty();
+                             !item_anchor_hints.empty() &&
+                             !low_confidence;
     vec<RemotePtr> candidates;
     vec<RemotePtr> audit_exact_candidates;
     if (use_anchors) {
@@ -690,9 +789,46 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       write_new_node(new_ptr, ids[idx], components, {}, generation);
       breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
       if (kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
-        mark_node_deleted(old_entry.current, old_entry.generation);
+        const RemotePtr previous_ptr = old_entry.current.is_null()
+          ? RemotePtr{meta.old_rptr_raw}
+          : old_entry.current;
+        const u32 previous_generation = old_entry.current.is_null()
+          ? meta.old_generation
+          : old_entry.generation;
+        if (!previous_ptr.is_null()) {
+          mark_node_deleted(previous_ptr, previous_generation);
+        }
       }
       publish_mutation(ids[idx], new_ptr, generation, false);
+      if (kind == service::storage_owner::MutationKind::upsert &&
+          (meta.flags & service::storage_owner::kRouteFlagRehome) != 0 &&
+          meta.old_owner < num_storage_nodes_ &&
+          meta.old_owner != storage_id_) {
+        owner_directory_updates[meta.old_owner].push_back(
+          service::storage_owner::OwnerDirectoryUpdateOp{
+            ids[idx],
+            storage_id_,
+            generation,
+            0,
+            new_ptr.raw_address});
+      }
+      if (kind == service::storage_owner::MutationKind::upsert &&
+          (meta.flags & service::storage_owner::kRouteFlagRehome) == 0) {
+        const RemotePtr previous_ptr = old_entry.current.is_null()
+          ? RemotePtr{meta.old_rptr_raw}
+          : old_entry.current;
+        if (!previous_ptr.is_null() &&
+            previous_ptr.memory_node() < num_storage_nodes_ &&
+            previous_ptr.memory_node() != storage_id_) {
+          owner_directory_updates[previous_ptr.memory_node()].push_back(
+            service::storage_owner::OwnerDirectoryUpdateOp{
+              ids[idx],
+              previous_ptr.memory_node(),
+              generation,
+              service::storage_owner::kOwnerDirectoryDeleted,
+              previous_ptr.raw_address});
+        }
+      }
       RemotePtr observed;
       if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
         medoid_ptr = new_ptr;
@@ -735,9 +871,46 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     write_new_node(new_ptr, ids[idx], components, selected_neighbors, generation);
     breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
     if (kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
-      mark_node_deleted(old_entry.current, old_entry.generation);
+      const RemotePtr previous_ptr = old_entry.current.is_null()
+        ? RemotePtr{meta.old_rptr_raw}
+        : old_entry.current;
+      const u32 previous_generation = old_entry.current.is_null()
+        ? meta.old_generation
+        : old_entry.generation;
+      if (!previous_ptr.is_null()) {
+        mark_node_deleted(previous_ptr, previous_generation);
+      }
     }
     publish_mutation(ids[idx], new_ptr, generation, false);
+    if (kind == service::storage_owner::MutationKind::upsert &&
+        (meta.flags & service::storage_owner::kRouteFlagRehome) != 0 &&
+        meta.old_owner < num_storage_nodes_ &&
+        meta.old_owner != storage_id_) {
+      owner_directory_updates[meta.old_owner].push_back(
+        service::storage_owner::OwnerDirectoryUpdateOp{
+          ids[idx],
+          storage_id_,
+          generation,
+          0,
+          new_ptr.raw_address});
+    }
+    if (kind == service::storage_owner::MutationKind::upsert &&
+        (meta.flags & service::storage_owner::kRouteFlagRehome) == 0) {
+      const RemotePtr previous_ptr = old_entry.current.is_null()
+        ? RemotePtr{meta.old_rptr_raw}
+        : old_entry.current;
+      if (!previous_ptr.is_null() &&
+          previous_ptr.memory_node() < num_storage_nodes_ &&
+          previous_ptr.memory_node() != storage_id_) {
+        owner_directory_updates[previous_ptr.memory_node()].push_back(
+          service::storage_owner::OwnerDirectoryUpdateOp{
+            ids[idx],
+            previous_ptr.memory_node(),
+            generation,
+            service::storage_owner::kOwnerDirectoryDeleted,
+            previous_ptr.raw_address});
+      }
+    }
     if (statuses != nullptr) {
       (*statuses)[idx] = static_cast<u32>(service::storage_owner::MutationStatus::ok);
     }
@@ -762,6 +935,11 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   auto t_remote_reverse = std::chrono::steady_clock::now();
   for (auto& [target_shard, ops] : remote_updates) {
     if (!send_reverse_update_batch(target_shard, ops, config)) {
+      return false;
+    }
+  }
+  for (auto& [target_shard, ops] : owner_directory_updates) {
+    if (!send_owner_directory_update_batch(target_shard, ops, config)) {
       return false;
     }
   }

@@ -174,15 +174,6 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"rabitq_forced_widen", aggregate.counters.rabitq_forced_widen},
     {"rabitq_audit_expansions", aggregate.counters.rabitq_audit_expansions},
     {"rabitq_audit_candidates", aggregate.counters.rabitq_audit_candidates},
-    {"rabitq_safe_skips", aggregate.counters.rabitq_safe_skips},
-    {"rabitq_safe_skip_vector_bytes",
-     aggregate.counters.rabitq_safe_skips * VamanaNode::vector_bytes()},
-    {"rabitq_exact_fallbacks", aggregate.counters.rabitq_exact_fallbacks},
-    {"rabitq_prefetch_issued", aggregate.counters.rabitq_prefetch_issued},
-    {"rabitq_prefetch_hits", aggregate.counters.rabitq_prefetch_hits},
-    {"rabitq_prefetch_misses", aggregate.counters.rabitq_prefetch_misses},
-    {"rabitq_prefetch_disabled_queries",
-     aggregate.counters.rabitq_prefetch_disabled_queries},
     {"credit_rounds", aggregate.counters.credit_rounds},
     {"credit_expansions_issued", aggregate.counters.credit_expansions_issued},
     {"credit_precommit_expansions", aggregate.counters.credit_precommit_expansions},
@@ -215,11 +206,6 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"storage_owner_anchor_audits", aggregate.counters.storage_owner_anchor_audits},
     {"storage_owner_anchor_audit_failures",
      aggregate.counters.storage_owner_anchor_audit_failures},
-    {"rabitq_prefetch_hit_ratio",
-     aggregate.counters.rabitq_prefetch_issued == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.rabitq_prefetch_hits) /
-           static_cast<double>(aggregate.counters.rabitq_prefetch_issued)},
     {"rabitq_local_scores", aggregate.counters.rabitq_l0_candidates},
     {"rabitq_gate_passes", aggregate.counters.rabitq_l1_candidates},
     {"rabitq_exact_vector_reads", aggregate.counters.rabitq_l2_candidates},

@@ -132,15 +132,6 @@ void VamanaGraph::copy_neighbors(size_t node, vec<u32>& out) const {
   }
 }
 
-bool VamanaGraph::contains_neighbor_unlocked(size_t node, u32 neighbor) const {
-  const size_t base = offset(node);
-  const u8 count = degrees[node];
-  for (u8 i = 0; i < count; ++i) {
-    if (neighbors[base + i] == neighbor) return true;
-  }
-  return false;
-}
-
 bool VamanaGraph::try_append_neighbor_unlocked(size_t node, u32 neighbor) {
   const u8 count = degrees[node];
   if (count >= R) return false;

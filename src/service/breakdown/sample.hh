@@ -42,12 +42,6 @@ struct ThreadCounterDelta {
   u64 rabitq_forced_widen{};
   u64 rabitq_audit_expansions{};
   u64 rabitq_audit_candidates{};
-  u64 rabitq_safe_skips{};
-  u64 rabitq_exact_fallbacks{};
-  u64 rabitq_prefetch_issued{};
-  u64 rabitq_prefetch_hits{};
-  u64 rabitq_prefetch_misses{};
-  u64 rabitq_prefetch_disabled_queries{};
   u64 credit_rounds{};
   u64 credit_expansions_issued{};
   u64 credit_precommit_expansions{};
@@ -142,18 +136,6 @@ inline ThreadCounterDelta diff_thread_counters(const statistics::ThreadStatistic
       end.query_rabitq_audit_expansions - start.query_rabitq_audit_expansions;
     out.rabitq_audit_candidates =
       end.query_rabitq_audit_candidates - start.query_rabitq_audit_candidates;
-    out.rabitq_safe_skips = end.query_rabitq_safe_skips - start.query_rabitq_safe_skips;
-    out.rabitq_exact_fallbacks =
-      end.query_rabitq_exact_fallbacks - start.query_rabitq_exact_fallbacks;
-    out.rabitq_prefetch_issued =
-      end.query_rabitq_prefetch_issued - start.query_rabitq_prefetch_issued;
-    out.rabitq_prefetch_hits =
-      end.query_rabitq_prefetch_hits - start.query_rabitq_prefetch_hits;
-    out.rabitq_prefetch_misses =
-      end.query_rabitq_prefetch_misses - start.query_rabitq_prefetch_misses;
-    out.rabitq_prefetch_disabled_queries =
-      end.query_rabitq_prefetch_disabled_queries -
-      start.query_rabitq_prefetch_disabled_queries;
     out.credit_rounds = end.query_credit_rounds - start.query_credit_rounds;
     out.credit_expansions_issued =
       end.query_credit_expansions_issued - start.query_credit_expansions_issued;

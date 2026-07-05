@@ -55,8 +55,6 @@ public:
                                      u32 tcp_port,
                                      u32 node_id = 0);
 
-  void post_shared_receive(MemoryRegion& region);
-
   static i32 poll_recv_cq(ibv_wc* work_completion,
                           i32 max_cqes,
                           ibv_cq* recv_cq,

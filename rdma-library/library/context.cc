@@ -194,28 +194,6 @@ QP Context::connect_to_server(const str& address, u32 tcp_port, u32 node_id) {
   return queue_pair;
 }
 
-void Context::post_shared_receive(MemoryRegion& region) {
-  ibv_recv_wr work_request{};
-  ibv_sge scatter_gather_entry{};
-  ibv_recv_wr* bad_work_request{nullptr};
-
-  lib_assert(shared_receive_cq_, "No shared receive CQ exists");
-
-  scatter_gather_entry.addr = region.get_address();
-  scatter_gather_entry.length = region.get_size_in_bytes();
-  scatter_gather_entry.lkey = region.get_lkey();
-
-  work_request.wr_id = reinterpret_cast<u64>(&region);
-  work_request.next = nullptr;
-  work_request.sg_list = &scatter_gather_entry;
-  work_request.num_sge = 1;
-
-  lib_assert(ibv_post_srq_recv(
-               get_shared_receive_cq(), &work_request, &bad_work_request) == 0,
-             "Cannot post shared receive request");
-  lib_debug("Shared receive request successfully posted");
-}
-
 // static function
 i32 Context::poll_recv_cq(ibv_wc* work_completion,
                           const i32 max_cqes,

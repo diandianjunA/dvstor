@@ -245,7 +245,7 @@ int main(int argc, char** argv) {
     lib_assert(probe_route.owner == probe_owner && !probe_route.hints.empty(),
                "anchor route validation failed");
 
-    metadata["anchor_format"] = "owner_anchor_v1";
+    metadata["anchor_format"] = "owner_anchor_v2";
     metadata["anchor_count_per_shard"] = config.anchors_per_shard;
     const filepath_t metadata_tmp{metadata_path.string() + ".anchor.tmp"};
     {

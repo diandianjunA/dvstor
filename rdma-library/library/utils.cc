@@ -1,7 +1,6 @@
 #include "utils.hh"
 
 #include <algorithm>
-#include <cmath>
 #include <map>
 #include <stdexcept>
 
@@ -53,22 +52,6 @@ Endpoint parse_endpoint(const str& endpoint, u32 default_port) {
   }
 
   return Endpoint{host, address, port};
-}
-
-f64 compute_throughput(i32 message_size,
-                       i32 repeats,
-                       Timepoint start,
-                       Timepoint end) {
-  return message_size / (ToSeconds(end - start).count() / repeats) /
-         std::pow(1000, 2);
-}
-
-f64 compute_latency(i32 repeats,
-                    Timepoint start,
-                    Timepoint end,
-                    bool is_read_or_atomic) {
-  i32 rtt_factor = is_read_or_atomic ? 1 : 2;
-  return ToMicroSeconds(end - start).count() / repeats / rtt_factor;
 }
 
 void print_status(str&& status) {

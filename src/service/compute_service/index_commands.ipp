@@ -116,7 +116,8 @@ bool ComputeService<Distance>::initialize_compute_side_idmap(
       loaded[entry.id] = ComputeSideIdEntry{
         RemotePtr{entry.rptr_raw},
         (entry.flags & vamana::idmap::kDeleted) != 0,
-        owner};
+        owner,
+        entry.generation};
     }
   }
   {
@@ -176,13 +177,18 @@ template <class Distance>
 void ComputeService<Distance>::publish_compute_side_id(node_t id,
                                                        RemotePtr ptr,
                                                        bool deleted,
-                                                       u32 owner_storage) {
+                                                       u32 owner_storage,
+                                                       u32 generation) {
   std::lock_guard<std::mutex> lock(compute_side_idmap_mutex_);
-  compute_side_idmap_[id] = ComputeSideIdEntry{ptr, deleted, owner_storage};
+  compute_side_idmap_[id] = ComputeSideIdEntry{ptr, deleted, owner_storage, generation};
 }
 
 template <class Distance>
-bool ComputeService<Distance>::lookup_compute_side_id(node_t id, RemotePtr* ptr, bool* deleted) const {
+bool ComputeService<Distance>::lookup_compute_side_id(node_t id,
+                                                      RemotePtr* ptr,
+                                                      bool* deleted,
+                                                      u32* generation,
+                                                      u32* owner_storage) const {
   std::lock_guard<std::mutex> lock(compute_side_idmap_mutex_);
   const auto it = compute_side_idmap_.find(id);
   if (it == compute_side_idmap_.end()) {
@@ -193,6 +199,12 @@ bool ComputeService<Distance>::lookup_compute_side_id(node_t id, RemotePtr* ptr,
   }
   if (deleted != nullptr) {
     *deleted = it->second.deleted;
+  }
+  if (generation != nullptr) {
+    *generation = it->second.generation;
+  }
+  if (owner_storage != nullptr) {
+    *owner_storage = it->second.owner_storage;
   }
   return true;
 }
@@ -217,9 +229,41 @@ vamana::anchor::Route ComputeService<Distance>::route_storage_owner_update(
     vamana::anchor::Route route;
     route.owner = owner_override.value_or(
       num_servers_ == 0 ? 0 : static_cast<u32>(item.id % num_servers_));
+    route.semantic_owner = route.owner;
     return route;
   }
-  return anchor_index_->route(item.values, config_.storage_owner_anchor_hints, owner_override);
+  return anchor_index_->route(item.values,
+                              config_.storage_owner_anchor_hints,
+                              config_.storage_owner_route_top_owners,
+                              owner_override);
+}
+
+template <class Distance>
+void ComputeService<Distance>::maybe_publish_dynamic_anchor(
+    const StorageInsertTask& task,
+    const service::storage_owner::MutationResult& result,
+    u32 owner_storage) {
+  if (anchor_index_ == nullptr || anchor_index_->empty() ||
+      config_.storage_owner_update_mode != "anchored" ||
+      config_.storage_owner_anchor_refresh_interval == 0 ||
+      config_.storage_owner_dynamic_anchor_cap == 0 ||
+      task.kind == service::storage_owner::MutationKind::erase ||
+      result.new_rptr_raw == 0 ||
+      task.item.values.size() != config_.dim) {
+    return;
+  }
+
+  const u64 sequence = storage_owner_anchor_refresh_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (sequence % config_.storage_owner_anchor_refresh_interval != 0) {
+    return;
+  }
+
+  const RemotePtr pointer{result.new_rptr_raw};
+  const u32 shard = pointer.memory_node() < num_servers_ ? pointer.memory_node() : owner_storage;
+  (void)anchor_index_->add_runtime_anchor(shard,
+                                          span<const element_t>{task.item.values.data(), task.item.values.size()},
+                                          pointer,
+                                          config_.storage_owner_dynamic_anchor_cap);
 }
 
 template <class Distance>

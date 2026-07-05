@@ -44,7 +44,5 @@ vec<u32> compute_bfs_partition(const vec<vec<u32>>& neighbors,
 vec<NodePlacement> assign_nodes_to_shards_from_partition(const vec<u32>& parts,
                                                          u32 num_memory_nodes,
                                                          size_t aligned_node_size);
-double compute_cross_shard_ratio(const vec<vec<u32>>& neighbors,
-                                 const vec<NodePlacement>& placements);
 
 }  // namespace tools::vamana_offline

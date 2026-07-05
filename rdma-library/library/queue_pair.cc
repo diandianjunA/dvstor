@@ -146,16 +146,6 @@ void QueuePair::post_receive(MemoryRegion& region,
   lib_debug("Receive request successfully posted");
 }
 
-u32 QueuePair::receive_u32(Context& context) {
-  u32 value;
-
-  LocalMemoryRegion region{context, std::addressof(value), sizeof(u32)};
-  post_receive(region);
-  context.receive();
-
-  return value;
-}
-
 void QueuePair::post_send_inlined(const void* address,
                                   u32 size_in_bytes,
                                   enum ibv_wr_opcode opcode,
@@ -173,19 +163,6 @@ void QueuePair::post_send_inlined(const void* address,
             remote_offset,
             0,
             wr_id);
-}
-
-void QueuePair::post_send_u32(u32& value, bool signaled) {
-  post_send(reinterpret_cast<u64>(std::addressof(value)),
-            sizeof(u32),
-            0,
-            IBV_WR_SEND,
-            signaled,
-            true,
-            nullptr,
-            0,
-            0,
-            0);
 }
 
 void QueuePair::post_send(MemoryRegion& region,

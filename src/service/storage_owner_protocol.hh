@@ -32,6 +32,23 @@ enum class MutationStatus : u32 {
 enum class PeerRpcType : u32 {
   reverse_update_request = 1,
   reverse_update_response = 2,
+  owner_directory_update_request = 3,
+  owner_directory_update_response = 4,
+};
+
+constexpr u32 kRouteFlagLowConfidence = 1u << 0;
+constexpr u32 kRouteFlagRehome = 1u << 1;
+constexpr u32 kRouteFlagOwnerOverride = 1u << 2;
+constexpr u32 kOwnerDirectoryDeleted = 1u << 0;
+
+struct RouteMetadata {
+  u64 old_rptr_raw{};
+  u32 semantic_owner{};
+  u32 old_owner{};
+  u32 old_generation{};
+  u32 anchor_version{};
+  f32 route_confidence{1.0f};
+  u32 flags{};
 };
 
 struct InsertBatchRequestHeader {
@@ -131,6 +148,14 @@ struct ReverseUpdateOp {
   u64 candidate_raw{};
 };
 
+struct OwnerDirectoryUpdateOp {
+  node_t id{};
+  u32 owner_storage{};
+  u32 generation{};
+  u32 flags{};
+  u64 current_raw{};
+};
+
 constexpr size_t align_wire_u64(size_t value) {
   return (value + alignof(u64) - 1) & ~(alignof(u64) - 1);
 }
@@ -151,6 +176,16 @@ inline size_t mutation_anchor_offset(u32 item_count) {
                         static_cast<size_t>(item_count) * VamanaNode::vector_bytes());
 }
 
+inline size_t insert_route_metadata_offset(u32 item_count, u32 anchor_hint_count) {
+  return insert_anchor_offset(item_count) +
+         static_cast<size_t>(item_count) * anchor_hint_count * sizeof(u64);
+}
+
+inline size_t mutation_route_metadata_offset(u32 item_count, u32 anchor_hint_count) {
+  return mutation_anchor_offset(item_count) +
+         static_cast<size_t>(item_count) * anchor_hint_count * sizeof(u64);
+}
+
 inline size_t insert_batch_request_bytes(u32 item_count, u32 dim, u32 anchor_hint_count = 0) {
   (void)dim;
   const size_t vector_end = sizeof(InsertBatchRequestHeader) +
@@ -158,8 +193,8 @@ inline size_t insert_batch_request_bytes(u32 item_count, u32 dim, u32 anchor_hin
                             static_cast<size_t>(item_count) * VamanaNode::vector_bytes();
   return anchor_hint_count == 0
     ? vector_end
-    : insert_anchor_offset(item_count) +
-        static_cast<size_t>(item_count) * anchor_hint_count * sizeof(u64);
+    : insert_route_metadata_offset(item_count, anchor_hint_count) +
+        static_cast<size_t>(item_count) * sizeof(RouteMetadata);
 }
 
 inline size_t mutation_batch_request_bytes(u32 item_count, u32 dim, u32 anchor_hint_count = 0) {
@@ -170,8 +205,8 @@ inline size_t mutation_batch_request_bytes(u32 item_count, u32 dim, u32 anchor_h
                             static_cast<size_t>(item_count) * VamanaNode::vector_bytes();
   return anchor_hint_count == 0
     ? vector_end
-    : mutation_anchor_offset(item_count) +
-        static_cast<size_t>(item_count) * anchor_hint_count * sizeof(u64);
+    : mutation_route_metadata_offset(item_count, anchor_hint_count) +
+        static_cast<size_t>(item_count) * sizeof(RouteMetadata);
 }
 
 inline size_t insert_batch_response_bytes(u32 item_count) {
@@ -255,6 +290,38 @@ inline const u64* mutation_request_anchor_hints(const void* payload, u32 item_co
                                       mutation_anchor_offset(item_count));
 }
 
+inline RouteMetadata* request_route_metadata(void* payload, u32 item_count) {
+  const auto* header = reinterpret_cast<const InsertBatchRequestHeader*>(payload);
+  if (header->anchor_hint_count == 0) return nullptr;
+  return reinterpret_cast<RouteMetadata*>(
+    reinterpret_cast<byte_t*>(payload) +
+    insert_route_metadata_offset(item_count, header->anchor_hint_count));
+}
+
+inline const RouteMetadata* request_route_metadata(const void* payload, u32 item_count) {
+  const auto* header = reinterpret_cast<const InsertBatchRequestHeader*>(payload);
+  if (header->anchor_hint_count == 0) return nullptr;
+  return reinterpret_cast<const RouteMetadata*>(
+    reinterpret_cast<const byte_t*>(payload) +
+    insert_route_metadata_offset(item_count, header->anchor_hint_count));
+}
+
+inline RouteMetadata* mutation_request_route_metadata(void* payload, u32 item_count) {
+  const auto* header = reinterpret_cast<const MutationBatchRequestHeader*>(payload);
+  if (header->anchor_hint_count == 0) return nullptr;
+  return reinterpret_cast<RouteMetadata*>(
+    reinterpret_cast<byte_t*>(payload) +
+    mutation_route_metadata_offset(item_count, header->anchor_hint_count));
+}
+
+inline const RouteMetadata* mutation_request_route_metadata(const void* payload, u32 item_count) {
+  const auto* header = reinterpret_cast<const MutationBatchRequestHeader*>(payload);
+  if (header->anchor_hint_count == 0) return nullptr;
+  return reinterpret_cast<const RouteMetadata*>(
+    reinterpret_cast<const byte_t*>(payload) +
+    mutation_route_metadata_offset(item_count, header->anchor_hint_count));
+}
+
 inline u32* response_statuses(void* payload) {
   return reinterpret_cast<u32*>(reinterpret_cast<byte_t*>(payload) + sizeof(InsertBatchResponseHeader));
 }
@@ -309,12 +376,30 @@ inline size_t reverse_update_response_bytes() {
   return sizeof(PeerRpcHeader);
 }
 
+inline size_t owner_directory_update_request_bytes(u32 item_count) {
+  return sizeof(PeerRpcHeader) + static_cast<size_t>(item_count) * sizeof(OwnerDirectoryUpdateOp);
+}
+
+inline size_t owner_directory_update_response_bytes() {
+  return sizeof(PeerRpcHeader);
+}
+
 inline ReverseUpdateOp* reverse_update_ops(void* payload) {
   return reinterpret_cast<ReverseUpdateOp*>(reinterpret_cast<byte_t*>(payload) + sizeof(PeerRpcHeader));
 }
 
 inline const ReverseUpdateOp* reverse_update_ops(const void* payload) {
   return reinterpret_cast<const ReverseUpdateOp*>(reinterpret_cast<const byte_t*>(payload) + sizeof(PeerRpcHeader));
+}
+
+inline OwnerDirectoryUpdateOp* owner_directory_update_ops(void* payload) {
+  return reinterpret_cast<OwnerDirectoryUpdateOp*>(
+    reinterpret_cast<byte_t*>(payload) + sizeof(PeerRpcHeader));
+}
+
+inline const OwnerDirectoryUpdateOp* owner_directory_update_ops(const void* payload) {
+  return reinterpret_cast<const OwnerDirectoryUpdateOp*>(
+    reinterpret_cast<const byte_t*>(payload) + sizeof(PeerRpcHeader));
 }
 
 }  // namespace service::storage_owner

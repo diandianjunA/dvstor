@@ -46,7 +46,6 @@ public:
                     u32 size_in_bytes,
                     u64 wr_id = 0,
                     u64 local_offset = 0);
-  u32 receive_u32(Context& context);
 
   void post_send_inlined(const void* address,
                          u32 size_in_bytes,
@@ -55,7 +54,6 @@ public:
                          MemoryRegionToken* token = nullptr,
                          u64 remote_offset = 0,
                          u64 wr_id = 0);
-  void post_send_u32(u32& value, bool signaled);
   void post_send(MemoryRegion& region,
                  enum ibv_wr_opcode opcode,
                  bool signaled = true,

@@ -382,23 +382,4 @@ vec<NodePlacement> assign_nodes_to_shards_from_partition(const vec<u32>& parts,
   return placements;
 }
 
-double compute_cross_shard_ratio(const vec<vec<u32>>& neighbors,
-                                 const vec<NodePlacement>& placements) {
-  size_t total_edges = 0;
-  size_t cross_edges = 0;
-  for (size_t i = 0; i < neighbors.size(); ++i) {
-    const u32 source_shard = placements[i].memory_node;
-    for (u32 neighbor : neighbors[i]) {
-      if (neighbor >= placements.size()) {
-        continue;
-      }
-      ++total_edges;
-      if (placements[neighbor].memory_node != source_shard) {
-        ++cross_edges;
-      }
-    }
-  }
-  return total_edges == 0 ? 0.0 : static_cast<double>(cross_edges) / static_cast<double>(total_edges);
-}
-
 }  // namespace tools::vamana_offline

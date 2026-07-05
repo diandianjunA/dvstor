@@ -25,7 +25,6 @@ struct VamanaGraph {
   size_t offset(size_t node) const { return node * static_cast<size_t>(R); }
   u8 degree(size_t node) const { return degrees[node]; }
   void copy_neighbors(size_t node, vec<u32>& out) const;
-  bool contains_neighbor_unlocked(size_t node, u32 neighbor) const;
   bool try_append_neighbor_unlocked(size_t node, u32 neighbor);
   void set_neighbors(size_t node, const vec<u32>& new_neighbors);
   void lock_node(size_t node);

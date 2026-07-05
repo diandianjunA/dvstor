@@ -5,7 +5,6 @@
 
 namespace tools::vamana_offline {
 
-vec<NodePlacement> assign_nodes_to_shards(size_t num_vectors, u32 num_memory_nodes);
 void write_vamana_shards(const VamanaGraph& graph,
                          const Dataset& dataset,
                          const VamanaBuildConfig& config,
