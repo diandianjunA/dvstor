@@ -415,7 +415,6 @@
                         }
                         ++thread->stats.query_rabitq_forced_widen;
                     }
-                    thread->stats.query_rabitq_l0_candidates += n_batch;
                     thread->stats.query_rabitq_l1_candidates += gate_indices.size();
                     add_breakdown_subcategory(thread,
                         service::breakdown::Subcategory::cpu_query_rabitq_gate, t_gate);
