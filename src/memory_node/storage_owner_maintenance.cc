@@ -13,6 +13,7 @@
 namespace {
 
 constexpr u64 kMaintenanceObservationPeriodNs = 5ull * 1000ull * 1000ull * 1000ull;
+constexpr u64 kStitchCompactionDelayNs = 3ull * 1000ull * 1000ull * 1000ull;
 constexpr size_t kForegroundQueueYieldMultiplier = 2;
 
 u64 steady_now_ns() {
@@ -129,7 +130,8 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                " (configured=" + std::to_string(config.storage_owner_maintenance_workers) +
                ", resource_gated_parallel_stitching=true)");
   print_status("storage-owner maintenance tuning: mode=" + config.storage_owner_maintenance_mode +
-               " local_stitch=" + (config.storage_owner_update_mode == "local_stitch" ? "true" : "false"));
+               " local_stitch=" + (config.storage_owner_update_mode == "local_stitch" ? "true" : "false") +
+               " compaction_delay_ms=" + std::to_string(kStitchCompactionDelayNs / 1000000ull));
 }
 
 void MemoryNode::stop_storage_owner_maintenance_runtime() {
@@ -142,20 +144,24 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
     }
   }
 
-  size_t remaining = 0;
+  size_t stitch_remaining = 0;
+  size_t cleanup_remaining = 0;
   {
     std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
-    remaining = storage_owner_stitch_tasks_.size() + storage_owner_cleanup_tasks_.size();
+    stitch_remaining = storage_owner_stitch_tasks_.size();
+    cleanup_remaining = storage_owner_cleanup_tasks_.size();
     storage_owner_stitch_tasks_.clear();
     storage_owner_cleanup_tasks_.clear();
   }
   storage_owner_maintenance_workers_.clear();
   storage_owner_maintenance_worker_states_.clear();
 
-  log_storage_owner_maintenance_observation(remaining, true);
+  log_storage_owner_maintenance_observation(stitch_remaining, cleanup_remaining, true);
 }
 
-void MemoryNode::log_storage_owner_maintenance_observation(size_t remaining, bool final) {
+void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaining,
+                                                           size_t cleanup_remaining,
+                                                           bool final) {
   if (storage_owner_maintenance_enqueued_.load(std::memory_order_relaxed) == 0) {
     return;
   }
@@ -193,6 +199,7 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t remaining, boo
   const double peer_stitch_rate = elapsed_s > 0.0
                                     ? static_cast<double>(peer_stitch_items) / elapsed_s
                                     : 0.0;
+  const size_t remaining = stitch_remaining + cleanup_remaining;
 
   print_status(str("storage-owner maintenance ") + (final ? "summary" : "observation") +
                ": enqueued=" +
@@ -217,6 +224,8 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t remaining, boo
                std::to_string(avg_finalize_ms) +
                " max_stitch_delay_ms=" +
                std::to_string(static_cast<double>(max_finalize_latency_ns) / 1e6) +
+               " compaction_delay_ms=" +
+               std::to_string(kStitchCompactionDelayNs / 1000000ull) +
                " stitch_rate_per_sec=" +
                std::to_string(repair_rate) +
                " failed=" +
@@ -243,6 +252,10 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t remaining, boo
                std::to_string(peer_stitch_rate) +
                " peer_stitch_max_queue=" +
                std::to_string(peer_stitch_search_max_queue_.load(std::memory_order_relaxed)) +
+               " stitch_remaining=" +
+               std::to_string(stitch_remaining) +
+               " cleanup_remaining=" +
+               std::to_string(cleanup_remaining) +
                " remaining=" + std::to_string(remaining));
 }
 
@@ -252,12 +265,14 @@ void MemoryNode::maybe_log_storage_owner_maintenance_observation() {
   while (now - last >= kMaintenanceObservationPeriodNs) {
     if (storage_owner_maintenance_last_observation_ns_.compare_exchange_weak(
           last, now, std::memory_order_acq_rel, std::memory_order_acquire)) {
-      size_t remaining = 0;
+      size_t stitch_remaining = 0;
+      size_t cleanup_remaining = 0;
       {
         std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
-        remaining = storage_owner_stitch_tasks_.size() + storage_owner_cleanup_tasks_.size();
+        stitch_remaining = storage_owner_stitch_tasks_.size();
+        cleanup_remaining = storage_owner_cleanup_tasks_.size();
       }
-      log_storage_owner_maintenance_observation(remaining, false);
+      log_storage_owner_maintenance_observation(stitch_remaining, cleanup_remaining, false);
       return;
     }
   }
@@ -418,6 +433,24 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     }
 
     maybe_log_storage_owner_maintenance_observation();
+    {
+      std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+      if (storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
+        current_storage_owner_thread_ = nullptr;
+        return;
+      }
+      if (storage_owner_cleanup_tasks_.empty() && !storage_owner_stitch_tasks_.empty()) {
+        const auto ready_at = storage_owner_stitch_tasks_.front().queued_at +
+                              std::chrono::nanoseconds(kStitchCompactionDelayNs);
+        if (std::chrono::steady_clock::now() < ready_at) {
+          storage_owner_maintenance_cv_.wait_until(lock, ready_at, [&]() {
+            return storage_owner_maintenance_shutdown_.load(std::memory_order_acquire) ||
+                   !storage_owner_cleanup_tasks_.empty();
+          });
+          continue;
+        }
+      }
+    }
     if (!try_acquire_storage_owner_maintenance_slot(config)) {
       storage_owner_maintenance_pressure_yields_.fetch_add(1, std::memory_order_relaxed);
       std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
@@ -444,10 +477,16 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         storage_owner_maintenance_pressure_yields_.fetch_add(1, std::memory_order_relaxed);
         continue;
       }
-      if (!storage_owner_stitch_tasks_.empty()) {
+      const auto now = std::chrono::steady_clock::now();
+      const auto ready_for_compaction = [now](const StorageOwnerMaintenanceTask& task) {
+        return now >= task.queued_at + std::chrono::nanoseconds(kStitchCompactionDelayNs);
+      };
+      if (!storage_owner_stitch_tasks_.empty() &&
+          ready_for_compaction(storage_owner_stitch_tasks_.front())) {
         const size_t batch_limit = std::max<u32>(1, config.storage_owner_batch_max);
         stitch_batch.reserve(batch_limit);
-        while (!storage_owner_stitch_tasks_.empty() && stitch_batch.size() < batch_limit) {
+        while (!storage_owner_stitch_tasks_.empty() && stitch_batch.size() < batch_limit &&
+               ready_for_compaction(storage_owner_stitch_tasks_.front())) {
           stitch_batch.push_back(std::move(storage_owner_stitch_tasks_.front()));
           storage_owner_stitch_tasks_.pop_front();
         }
@@ -456,10 +495,12 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           storage_owner_cleanup_tasks_.pop_front();
           has_cleanup_task = true;
         }
-      } else {
+      } else if (!storage_owner_cleanup_tasks_.empty()) {
         cleanup_task = std::move(storage_owner_cleanup_tasks_.front());
         storage_owner_cleanup_tasks_.pop_front();
         has_cleanup_task = true;
+      } else {
+        continue;
       }
     }
 

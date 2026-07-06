@@ -265,7 +265,9 @@ private:
                              const Configuration& config);
   bool enqueue_deleted_node_cleanup(RemotePtr deleted_ptr, const Configuration& config);
   void mark_storage_owner_foreground_activity();
-  void log_storage_owner_maintenance_observation(size_t remaining, bool final);
+  void log_storage_owner_maintenance_observation(size_t stitch_remaining,
+                                                 size_t cleanup_remaining,
+                                                 bool final);
   void maybe_log_storage_owner_maintenance_observation();
   void storage_owner_maintenance_worker_loop(u32 worker_id);
   bool storage_owner_maintenance_foreground_busy(const Configuration& config);
