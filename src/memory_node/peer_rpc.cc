@@ -3,6 +3,17 @@
 #include <algorithm>
 #include <iostream>
 
+namespace {
+
+void update_max_relaxed(std::atomic<u64>& target, u64 value) {
+  u64 observed = target.load(std::memory_order_relaxed);
+  while (observed < value &&
+         !target.compare_exchange_weak(observed, value, std::memory_order_relaxed)) {
+  }
+}
+
+}  // namespace
+
 void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
   if (!peer_context_ || num_storage_nodes_ <= 1) {
     return;
@@ -62,7 +73,12 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   peer_reverse_workers_done_.store(false, std::memory_order_release);
   peer_reverse_task_queue_limit_ =
     std::max<size_t>(1024, static_cast<size_t>(config.storage_owner_reverse_queue_depth));
+  peer_stitch_search_task_queue_limit_ = peer_reverse_task_queue_limit_;
   peer_reverse_outgoing_queue_limit_ = peer_reverse_task_queue_limit_;
+  peer_stitch_search_enqueued_.store(0, std::memory_order_relaxed);
+  peer_stitch_search_processed_.store(0, std::memory_order_relaxed);
+  peer_stitch_search_items_.store(0, std::memory_order_relaxed);
+  peer_stitch_search_max_queue_.store(0, std::memory_order_relaxed);
 
   const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
   const size_t snapshot_stride = align_up(VamanaNode::vector_bytes());
@@ -74,10 +90,15 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
                                          std::max<u32>(1, config.storage_owner_search_snapshot_batch))));
   const size_t scratch_bytes = std::max<size_t>(64ull * 1024ull * 1024ull, coroutine_scratch_stride);
   peer_reverse_worker_states_.reserve(worker_count);
+  peer_stitch_search_worker_states_.reserve(worker_count);
   for (u32 i = 0; i < worker_count; ++i) {
     auto worker = std::make_unique<StorageOwnerThread>(i, 1, config.max_send_queue_wr);
     worker->init_peer_scratch(*peer_context_, scratch_bytes, coroutine_scratch_stride);
     peer_reverse_worker_states_.push_back(std::move(worker));
+
+    auto stitch_worker = std::make_unique<StorageOwnerThread>(worker_count + i, 1, config.max_send_queue_wr);
+    stitch_worker->init_peer_scratch(*peer_context_, scratch_bytes, coroutine_scratch_stride);
+    peer_stitch_search_worker_states_.push_back(std::move(stitch_worker));
   }
 
   peer_rpc_progress_thread_ = std::thread([this]() { peer_rpc_progress_loop(); });
@@ -85,8 +106,10 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   peer_reverse_outgoing_thread_ = std::thread([this]() { peer_reverse_outgoing_loop(); });
   for (u32 i = 0; i < worker_count; ++i) {
     peer_reverse_workers_.emplace_back([this, i]() { peer_reverse_update_worker_loop(i); });
+    peer_stitch_search_workers_.emplace_back([this, i]() { peer_stitch_search_worker_loop(i); });
   }
   print_status("storage-owner peer reverse-update workers: " + std::to_string(worker_count));
+  print_status("storage-owner peer stitch-search workers: " + std::to_string(worker_count));
   print_status("storage-owner peer reverse-update tuning: mode=" + config.storage_owner_reverse_mode +
                " queue_depth=" + std::to_string(peer_reverse_task_queue_limit_) +
                " flush_us=" + std::to_string(config.storage_owner_reverse_flush_us) +
@@ -96,6 +119,7 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
 void MemoryNode::stop_peer_reverse_update_runtime() {
   peer_reverse_shutdown_.store(true, std::memory_order_release);
   peer_reverse_tasks_cv_.notify_all();
+  peer_stitch_search_tasks_cv_.notify_all();
   peer_reverse_responses_cv_.notify_all();
   peer_reverse_outgoing_cv_.notify_all();
   peer_rpc_responses_cv_.notify_all();
@@ -108,6 +132,11 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
       worker.join();
     }
   }
+  for (auto& worker : peer_stitch_search_workers_) {
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
   peer_reverse_workers_done_.store(true, std::memory_order_release);
   peer_reverse_responses_cv_.notify_all();
   if (peer_reverse_response_thread_.joinable()) {
@@ -116,6 +145,10 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
   if (peer_rpc_progress_thread_.joinable()) {
     peer_rpc_progress_thread_.join();
   }
+  peer_reverse_workers_.clear();
+  peer_stitch_search_workers_.clear();
+  peer_reverse_worker_states_.clear();
+  peer_stitch_search_worker_states_.clear();
 }
 
 size_t MemoryNode::peer_rpc_receive_offset(u32 peer_id, u32 slot_id) const {
@@ -365,6 +398,24 @@ bool MemoryNode::handle_peer_stitch_search_request(
   return true;
 }
 
+void MemoryNode::send_peer_stitch_search_failed_response(
+    u32 destination_shard,
+    const service::storage_owner::PeerRpcHeader& request) {
+  const size_t response_bytes =
+    service::storage_owner::stitch_search_response_bytes(request.item_count);
+  vec<byte_t> response(response_bytes, 0);
+  auto* response_header =
+    reinterpret_cast<service::storage_owner::PeerRpcHeader*>(response.data());
+  response_header->magic = service::storage_owner::kPeerRpcMagic;
+  response_header->type =
+    static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_response);
+  response_header->source_shard = storage_id_;
+  response_header->item_count = request.item_count;
+  response_header->request_id = request.request_id;
+  response_header->status = static_cast<u32>(service::storage_owner::InsertStatus::failed);
+  send_peer_rpc_message(destination_shard, response.data(), response.size());
+}
+
 bool MemoryNode::handle_peer_rpc_request(const PeerRpcMessage& message, const Configuration& config) {
   if (message.payload.size() < sizeof(service::storage_owner::PeerRpcHeader)) {
     return false;
@@ -396,7 +447,16 @@ bool MemoryNode::handle_peer_rpc_request(const PeerRpcMessage& message, const Co
     if (message.payload.size() < expected_bytes) {
       return false;
     }
-    return handle_peer_stitch_search_request(message.source_shard, *header, message.payload.data(), config);
+    PeerStitchSearchTask task;
+    task.source_shard = message.source_shard;
+    task.header = *header;
+    task.received_at = std::chrono::steady_clock::now();
+    task.payload.assign(message.payload.data(), message.payload.data() + expected_bytes);
+    if (!enqueue_peer_stitch_search_task(std::move(task))) {
+      send_peer_stitch_search_failed_response(message.source_shard, *header);
+      return false;
+    }
+    return true;
   }
 
   return false;
@@ -414,6 +474,20 @@ bool MemoryNode::enqueue_peer_reverse_update_task(PeerReverseUpdateTask&& task) 
   peer_reverse_tasks_.push_back(std::move(task));
   lock.unlock();
   peer_reverse_tasks_cv_.notify_one();
+  return true;
+}
+
+bool MemoryNode::enqueue_peer_stitch_search_task(PeerStitchSearchTask&& task) {
+  std::lock_guard<std::mutex> lock(peer_stitch_search_tasks_mutex_);
+  if (peer_reverse_shutdown_.load(std::memory_order_acquire) ||
+      peer_stitch_search_tasks_.size() >= peer_stitch_search_task_queue_limit_) {
+    return false;
+  }
+  peer_stitch_search_tasks_.push_back(std::move(task));
+  peer_stitch_search_enqueued_.fetch_add(1, std::memory_order_relaxed);
+  update_max_relaxed(peer_stitch_search_max_queue_,
+                     static_cast<u64>(peer_stitch_search_tasks_.size()));
+  peer_stitch_search_tasks_cv_.notify_one();
   return true;
 }
 
@@ -487,7 +561,14 @@ void MemoryNode::peer_rpc_progress_loop() {
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_request)) {
         const size_t expected_bytes = service::storage_owner::stitch_search_request_bytes(header->item_count);
         if (bytes >= expected_bytes) {
-          (void)handle_peer_stitch_search_request(peer_id, *header, payload, config);
+          PeerStitchSearchTask task;
+          task.source_shard = peer_id;
+          task.header = *header;
+          task.received_at = std::chrono::steady_clock::now();
+          task.payload.assign(payload, payload + expected_bytes);
+          if (!enqueue_peer_stitch_search_task(std::move(task))) {
+            send_peer_stitch_search_failed_response(peer_id, *header);
+          }
         }
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response)) {
         {
@@ -554,6 +635,36 @@ void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
       if ((task.header.reserved & kPeerRpcFlagNoResponse) == 0) {
         enqueue_peer_reverse_update_response(task.source_shard, task.header, success);
       }
+    }
+  }
+}
+
+void MemoryNode::peer_stitch_search_worker_loop(u32 worker_id) {
+  current_storage_owner_thread_ = peer_stitch_search_worker_states_[worker_id].get();
+  const Configuration& config = *storage_worker_config_;
+  for (;;) {
+    PeerStitchSearchTask task;
+    {
+      std::unique_lock<std::mutex> lock(peer_stitch_search_tasks_mutex_);
+      peer_stitch_search_tasks_cv_.wait(lock, [&]() {
+        return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
+               !peer_stitch_search_tasks_.empty();
+      });
+      if (peer_reverse_shutdown_.load(std::memory_order_acquire) &&
+          peer_stitch_search_tasks_.empty()) {
+        current_storage_owner_thread_ = nullptr;
+        return;
+      }
+      task = std::move(peer_stitch_search_tasks_.front());
+      peer_stitch_search_tasks_.pop_front();
+    }
+    peer_stitch_search_tasks_cv_.notify_one();
+
+    const bool success = handle_peer_stitch_search_request(
+      task.source_shard, task.header, task.payload.data(), config);
+    peer_stitch_search_processed_.fetch_add(1, std::memory_order_relaxed);
+    if (success) {
+      peer_stitch_search_items_.fetch_add(task.header.item_count, std::memory_order_relaxed);
     }
   }
 }
@@ -763,7 +874,7 @@ bool MemoryNode::wait_for_peer_reverse_update_response(u64 request_id,
 bool MemoryNode::wait_for_peer_stitch_search_response(u64 request_id,
                                                       u32 target_shard,
                                                       u32 item_count,
-                                                      vec<RemotePtr>& candidates,
+                                                      vec<vec<RemotePtr>>& candidates_by_item,
                                                       const Configuration& config) {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(config.storage_owner_rpc_timeout_ms);
@@ -778,15 +889,17 @@ bool MemoryNode::wait_for_peer_stitch_search_response(u64 request_id,
         payload_it != peer_rpc_response_payloads_.end() &&
         payload_it->second.size() >= service::storage_owner::stitch_search_response_bytes(item_count);
       if (success) {
+        candidates_by_item.assign(item_count, {});
         const byte_t* payload = payload_it->second.data();
         const u32* counts = service::storage_owner::stitch_search_response_counts(payload);
         const u64* raws = service::storage_owner::stitch_search_response_candidates(payload, item_count);
         for (u32 item = 0; item < item_count; ++item) {
           const u32 count = std::min<u32>(counts[item], VamanaNode::R);
+          candidates_by_item[item].reserve(count);
           for (u32 i = 0; i < count; ++i) {
             const u64 raw = raws[static_cast<size_t>(item) * VamanaNode::R + i];
             if (raw != 0) {
-              candidates.emplace_back(raw);
+              candidates_by_item[item].emplace_back(raw);
             }
           }
         }

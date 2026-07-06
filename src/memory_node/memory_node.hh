@@ -82,6 +82,13 @@ class MemoryNode {
     std::chrono::steady_clock::time_point queued_at{};
   };
 
+  struct PeerStitchSearchTask {
+    u32 source_shard{};
+    service::storage_owner::PeerRpcHeader header{};
+    vec<byte_t> payload;
+    std::chrono::steady_clock::time_point received_at{};
+  };
+
   enum class StorageOwnerMaintenanceKind : u8 {
     stitch_insert,
     cleanup_deleted_node,
@@ -187,13 +194,18 @@ private:
                                          const service::storage_owner::PeerRpcHeader& header,
                                          const byte_t* payload,
                                          const Configuration& config);
+  void send_peer_stitch_search_failed_response(
+      u32 destination_shard,
+      const service::storage_owner::PeerRpcHeader& request);
   bool handle_peer_rpc_request(const PeerRpcMessage& message, const Configuration& config);
   bool enqueue_peer_reverse_update_task(PeerReverseUpdateTask&& task);
+  bool enqueue_peer_stitch_search_task(PeerStitchSearchTask&& task);
   void enqueue_peer_reverse_update_response(u32 destination_shard,
                                             const service::storage_owner::PeerRpcHeader& request,
                                             bool success);
   void peer_rpc_progress_loop();
   void peer_reverse_update_worker_loop(u32 worker_id);
+  void peer_stitch_search_worker_loop(u32 worker_id);
   void peer_reverse_response_loop();
   void peer_reverse_outgoing_loop();
   bool handle_peer_rpc_requests(vec<PeerRpcMessage>& requests, const Configuration& config);
@@ -208,7 +220,7 @@ private:
   bool wait_for_peer_stitch_search_response(u64 request_id,
                                             u32 target_shard,
                                             u32 item_count,
-                                            vec<RemotePtr>& candidates,
+                                            vec<vec<RemotePtr>>& candidates_by_item,
                                             const Configuration& config);
   bool post_stitch_search_request(u32 target_shard,
                                   const vec<NodeSnapshot>& targets,
@@ -262,6 +274,10 @@ private:
   bool storage_owner_task_current(node_t id, u32 generation, RemotePtr target);
   vec<RemotePtr> read_preserved_neighbor_list(RemotePtr rptr);
   bool remove_local_neighbor(RemotePtr target_ptr, RemotePtr deleted_ptr, const Configuration& config);
+  bool stitch_inserted_storage_owner_nodes(const vec<StorageOwnerMaintenanceTask>& tasks,
+                                           const Configuration& config,
+                                           vec<StorageOwnerMaintenanceTask>& retry_tasks,
+                                           u64& processed_count);
   bool stitch_inserted_storage_owner_node(const StorageOwnerMaintenanceTask& task,
                                           const Configuration& config);
   bool cleanup_deleted_storage_owner_node(const StorageOwnerMaintenanceTask& task,
@@ -434,12 +450,17 @@ private:
   std::atomic<u64> next_peer_request_id_{1};
   std::thread peer_rpc_progress_thread_;
   vec<std::thread> peer_reverse_workers_;
+  vec<std::thread> peer_stitch_search_workers_;
   std::thread peer_reverse_response_thread_;
   std::thread peer_reverse_outgoing_thread_;
   vec<u_ptr<StorageOwnerThread>> peer_reverse_worker_states_;
+  vec<u_ptr<StorageOwnerThread>> peer_stitch_search_worker_states_;
   std::mutex peer_reverse_tasks_mutex_;
   std::condition_variable peer_reverse_tasks_cv_;
   std::deque<PeerReverseUpdateTask> peer_reverse_tasks_;
+  std::mutex peer_stitch_search_tasks_mutex_;
+  std::condition_variable peer_stitch_search_tasks_cv_;
+  std::deque<PeerStitchSearchTask> peer_stitch_search_tasks_;
   std::mutex peer_reverse_responses_mutex_;
   std::condition_variable peer_reverse_responses_cv_;
   std::deque<PeerReverseUpdateResponse> peer_reverse_responses_;
@@ -449,12 +470,18 @@ private:
   std::atomic<bool> peer_reverse_shutdown_{false};
   std::atomic<bool> peer_reverse_workers_done_{false};
   size_t peer_reverse_task_queue_limit_{1024};
+  size_t peer_stitch_search_task_queue_limit_{1024};
   size_t peer_reverse_outgoing_queue_limit_{1024};
+  std::atomic<u64> peer_stitch_search_enqueued_{0};
+  std::atomic<u64> peer_stitch_search_processed_{0};
+  std::atomic<u64> peer_stitch_search_items_{0};
+  std::atomic<u64> peer_stitch_search_max_queue_{0};
   vec<std::thread> storage_owner_maintenance_workers_;
   vec<u_ptr<StorageOwnerThread>> storage_owner_maintenance_worker_states_;
   std::mutex storage_owner_maintenance_mutex_;
   std::condition_variable storage_owner_maintenance_cv_;
-  std::deque<StorageOwnerMaintenanceTask> storage_owner_maintenance_tasks_;
+  std::deque<StorageOwnerMaintenanceTask> storage_owner_stitch_tasks_;
+  std::deque<StorageOwnerMaintenanceTask> storage_owner_cleanup_tasks_;
   std::atomic<bool> storage_owner_maintenance_shutdown_{false};
   std::atomic<u64> storage_owner_maintenance_enqueued_{0};
   std::atomic<u64> storage_owner_maintenance_finalize_enqueued_{0};
@@ -468,6 +495,8 @@ private:
   std::atomic<u64> storage_owner_maintenance_pressure_yields_{0};
   std::atomic<u64> storage_owner_stitch_external_requests_{0};
   std::atomic<u64> storage_owner_stitch_external_candidates_{0};
+  std::atomic<u64> storage_owner_stitch_batches_{0};
+  std::atomic<u64> storage_owner_stitch_batched_items_{0};
   std::atomic<u32> storage_owner_maintenance_active_workers_{0};
   std::atomic<u64> storage_owner_maintenance_started_ns_{0};
   std::atomic<u64> storage_owner_maintenance_last_observation_ns_{0};
