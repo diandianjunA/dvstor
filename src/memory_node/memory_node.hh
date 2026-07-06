@@ -91,6 +91,7 @@ class MemoryNode {
     node_t id{};
     u32 generation{};
     RemotePtr target;
+    vec<RemotePtr> continuation_seeds;
     std::chrono::steady_clock::time_point queued_at{};
   };
 
@@ -235,6 +236,7 @@ private:
   bool enqueue_insert_finalization(node_t id,
                                    u32 generation,
                                    RemotePtr target,
+                                   vec<RemotePtr> continuation_seeds,
                                    const Configuration& config);
   bool enqueue_deleted_node_cleanup(RemotePtr deleted_ptr, const Configuration& config);
   void mark_storage_owner_foreground_activity();
@@ -245,6 +247,16 @@ private:
   bool try_acquire_storage_owner_maintenance_slot(const Configuration& config);
   bool try_lock_node(RemotePtr rptr);
   bool storage_owner_task_current(node_t id, u32 generation, RemotePtr target);
+  vec<RemotePtr> build_storage_owner_finalization_seeds(const vec<RemotePtr>& selected_neighbors,
+                                                        const vec<RemotePtr>& candidates,
+                                                        const vec<RemotePtr>& anchor_hints,
+                                                        RemotePtr medoid,
+                                                        const Configuration& config) const;
+  vec<RemotePtr> beam_search_candidates_seeded(const span<const element_t> query,
+                                               RemotePtr medoid,
+                                               const vec<RemotePtr>& seeds,
+                                               const Configuration& config,
+                                               InsertBreakdownCounters* breakdown = nullptr);
   vec<RemotePtr> read_preserved_neighbor_list(RemotePtr rptr);
   bool remove_local_neighbor(RemotePtr target_ptr, RemotePtr deleted_ptr, const Configuration& config);
   bool finalize_inserted_storage_owner_node(const StorageOwnerMaintenanceTask& task,
@@ -449,6 +461,8 @@ private:
   std::atomic<u64> storage_owner_maintenance_cleanup_processed_{0};
   std::atomic<u64> storage_owner_maintenance_max_backlog_{0};
   std::atomic<u64> storage_owner_maintenance_pressure_yields_{0};
+  std::atomic<u64> storage_owner_maintenance_seeded_tasks_{0};
+  std::atomic<u64> storage_owner_maintenance_seed_candidates_{0};
   std::atomic<u32> storage_owner_maintenance_active_workers_{0};
   std::atomic<u64> storage_owner_maintenance_started_ns_{0};
   std::atomic<u64> storage_owner_maintenance_last_observation_ns_{0};

@@ -12,8 +12,9 @@
 
 namespace {
 
-constexpr u64 kMaintenanceForegroundQuietNs = 5ull * 1000ull * 1000ull;
 constexpr u64 kMaintenanceObservationPeriodNs = 5ull * 1000ull * 1000ull * 1000ull;
+constexpr u32 kFinalizationSeedMultiplier = 4;
+constexpr size_t kForegroundQueueYieldMultiplier = 2;
 
 u64 steady_now_ns() {
   return static_cast<u64>(
@@ -55,8 +56,8 @@ bool queue_near_limit(size_t size, size_t limit) {
   return size >= threshold;
 }
 
-bool counter_near_limit(u32 value, u32 limit) {
-  const u32 threshold = std::max<u32>(1, (limit * 3) / 4);
+bool counter_above_fraction(u32 value, u32 limit, u32 numerator, u32 denominator) {
+  const u32 threshold = std::max<u32>(1, (limit * numerator) / denominator);
   return value >= threshold;
 }
 
@@ -92,12 +93,14 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   storage_owner_maintenance_cleanup_processed_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_max_backlog_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_pressure_yields_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_seeded_tasks_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_seed_candidates_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_active_workers_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_finalize_latency_ns_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_finalize_max_latency_ns_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_started_ns_.store(steady_now_ns(), std::memory_order_release);
   storage_owner_maintenance_last_observation_ns_.store(0, std::memory_order_relaxed);
-  const u32 worker_count = 1;
+  const u32 worker_count = std::max<u32>(1, config.storage_owner_maintenance_workers);
   const size_t snapshot_stride = memory_node_detail::storage_owner_snapshot_stride();
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
   const size_t snapshot_batch = std::max<u32>(1, config.storage_owner_search_snapshot_batch);
@@ -123,7 +126,7 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
 
   print_status("storage-owner maintenance workers: " + std::to_string(worker_count) +
                " (configured=" + std::to_string(config.storage_owner_maintenance_workers) +
-               ", ordered_finalization=true)");
+               ", resource_gated_parallel_finalization=true)");
   print_status("storage-owner maintenance tuning: mode=" + config.storage_owner_maintenance_mode +
                " exact_finalization=true");
 }
@@ -211,6 +214,10 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t remaining, boo
                std::to_string(storage_owner_maintenance_max_backlog_.load(std::memory_order_relaxed)) +
                " pressure_yields=" +
                std::to_string(storage_owner_maintenance_pressure_yields_.load(std::memory_order_relaxed)) +
+               " seeded_tasks=" +
+               std::to_string(storage_owner_maintenance_seeded_tasks_.load(std::memory_order_relaxed)) +
+               " seed_candidates=" +
+               std::to_string(storage_owner_maintenance_seed_candidates_.load(std::memory_order_relaxed)) +
                " remaining=" + std::to_string(remaining));
 }
 
@@ -256,15 +263,22 @@ bool MemoryNode::enqueue_storage_owner_maintenance(StorageOwnerMaintenanceTask&&
 bool MemoryNode::enqueue_insert_finalization(node_t id,
                                              u32 generation,
                                              RemotePtr target,
+                                             vec<RemotePtr> continuation_seeds,
                                              const Configuration& config) {
   StorageOwnerMaintenanceTask task;
   task.kind = StorageOwnerMaintenanceKind::finalize_insert;
   task.id = id;
   task.generation = generation;
   task.target = target;
+  task.continuation_seeds = std::move(continuation_seeds);
+  const size_t seed_count = task.continuation_seeds.size();
   const bool queued = enqueue_storage_owner_maintenance(std::move(task), config);
   if (queued) {
     storage_owner_maintenance_finalize_enqueued_.fetch_add(1, std::memory_order_relaxed);
+    if (seed_count != 0) {
+      storage_owner_maintenance_seeded_tasks_.fetch_add(1, std::memory_order_relaxed);
+      storage_owner_maintenance_seed_candidates_.fetch_add(seed_count, std::memory_order_relaxed);
+    }
   }
   return queued;
 }
@@ -285,23 +299,19 @@ void MemoryNode::mark_storage_owner_foreground_activity() {
 }
 
 bool MemoryNode::storage_owner_maintenance_foreground_busy(const Configuration&) {
-  if (storage_owner_insert_active_workers_.load(std::memory_order_acquire) != 0) {
-    return true;
-  }
+  const bool foreground_active =
+    storage_owner_insert_active_workers_.load(std::memory_order_acquire) != 0;
 
   {
     std::unique_lock<std::mutex> lock(storage_insert_tasks_mutex_, std::try_to_lock);
     if (!lock.owns_lock()) {
       return true;
     }
-    if (!storage_insert_tasks_.empty()) {
+    const size_t foreground_queue_yield_threshold =
+      std::max<size_t>(4, storage_owner_threads_.size() * kForegroundQueueYieldMultiplier);
+    if (storage_insert_tasks_.size() >= foreground_queue_yield_threshold) {
       return true;
     }
-  }
-
-  const u64 last_active = storage_owner_foreground_last_active_ns_.load(std::memory_order_acquire);
-  if (last_active != 0 && steady_now_ns() - last_active < kMaintenanceForegroundQuietNs) {
-    return true;
   }
 
   {
@@ -326,13 +336,20 @@ bool MemoryNode::storage_owner_maintenance_foreground_busy(const Configuration&)
 
   if (peer_context_) {
     poll_peer_send_cq();
-    if (counter_near_limit(peer_async_rdma_outstanding_.load(std::memory_order_acquire),
-                           peer_rdma_read_global_credit_limit())) {
+    const u32 pressure_num = foreground_active ? 1 : 3;
+    const u32 pressure_den = foreground_active ? 2 : 4;
+    if (counter_above_fraction(peer_async_rdma_outstanding_.load(std::memory_order_acquire),
+                               peer_rdma_read_global_credit_limit(),
+                               pressure_num,
+                               pressure_den)) {
       return true;
     }
     const u32 per_peer_limit = peer_rdma_read_credit_limit();
     for (const auto& counter : peer_rdma_read_outstanding_) {
-      if (counter_near_limit(counter.load(std::memory_order_acquire), per_peer_limit)) {
+      if (counter_above_fraction(counter.load(std::memory_order_acquire),
+                                 per_peer_limit,
+                                 pressure_num,
+                                 pressure_den)) {
         return true;
       }
     }
@@ -346,7 +363,7 @@ bool MemoryNode::try_acquire_storage_owner_maintenance_slot(const Configuration&
     return false;
   }
 
-  const u32 max_workers = 1;
+  const u32 max_workers = std::max<u32>(1, config.storage_owner_maintenance_workers);
   u32 active = storage_owner_maintenance_active_workers_.load(std::memory_order_acquire);
   while (active < max_workers) {
     if (storage_owner_maintenance_active_workers_.compare_exchange_weak(
@@ -355,6 +372,33 @@ bool MemoryNode::try_acquire_storage_owner_maintenance_slot(const Configuration&
     }
   }
   return false;
+}
+
+vec<RemotePtr> MemoryNode::build_storage_owner_finalization_seeds(
+    const vec<RemotePtr>& selected_neighbors,
+    const vec<RemotePtr>& candidates,
+    const vec<RemotePtr>& anchor_hints,
+    RemotePtr medoid,
+    const Configuration& config) const {
+  const size_t limit = std::max<size_t>(config.R, static_cast<size_t>(config.R) * kFinalizationSeedMultiplier);
+  vec<RemotePtr> seeds;
+  seeds.reserve(std::min<size_t>(limit, selected_neighbors.size() + candidates.size() +
+                                           anchor_hints.size() + 1));
+  hashset_t<RemotePtr> seen;
+  auto append = [&](RemotePtr ptr) {
+    if (seeds.size() >= limit || ptr.is_null() || ptr.memory_node() >= num_storage_nodes_) {
+      return;
+    }
+    if (seen.insert(ptr).second) {
+      seeds.push_back(ptr);
+    }
+  };
+
+  for (const RemotePtr& ptr : selected_neighbors) append(ptr);
+  for (const RemotePtr& ptr : candidates) append(ptr);
+  for (const RemotePtr& ptr : anchor_hints) append(ptr);
+  append(medoid);
+  return seeds;
 }
 
 void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
@@ -584,7 +628,11 @@ bool MemoryNode::finalize_inserted_storage_owner_node(const StorageOwnerMaintena
   vec<element_t> query = decode_storage_vector_to_float(
     target_snapshot.vector_data.data(), VamanaNode::vector_dtype(), VamanaNode::DIM);
   vec<RemotePtr> candidates =
-    beam_search_candidates(span<const element_t>{query.data(), query.size()}, medoid, config, nullptr);
+    beam_search_candidates_seeded(span<const element_t>{query.data(), query.size()},
+                                  medoid,
+                                  task.continuation_seeds,
+                                  config,
+                                  nullptr);
 
   hashset_t<RemotePtr> skip;
   skip.insert(task.target);

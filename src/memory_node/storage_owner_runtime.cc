@@ -707,7 +707,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       }
       publish_mutation(ids[idx], new_ptr, generation, false);
       if (maintenance_enabled) {
-        (void)enqueue_insert_finalization(ids[idx], generation, new_ptr, config);
+        (void)enqueue_insert_finalization(ids[idx], generation, new_ptr, {}, config);
         (void)enqueue_deleted_node_cleanup(old_entry.current, config);
       }
       RemotePtr observed;
@@ -756,7 +756,14 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
     publish_mutation(ids[idx], new_ptr, generation, false);
     if (maintenance_enabled) {
-      (void)enqueue_insert_finalization(ids[idx], generation, new_ptr, config);
+      vec<RemotePtr> finalization_seeds =
+        build_storage_owner_finalization_seeds(selected_neighbors,
+                                               candidates,
+                                               item_anchor_hints,
+                                               medoid_ptr,
+                                               config);
+      (void)enqueue_insert_finalization(ids[idx], generation, new_ptr,
+                                        std::move(finalization_seeds), config);
       (void)enqueue_deleted_node_cleanup(old_entry.current, config);
     }
     if (statuses != nullptr) {
