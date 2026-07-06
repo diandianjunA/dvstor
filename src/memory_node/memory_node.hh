@@ -476,6 +476,7 @@ private:
   std::atomic<u64> peer_stitch_search_processed_{0};
   std::atomic<u64> peer_stitch_search_items_{0};
   std::atomic<u64> peer_stitch_search_max_queue_{0};
+  std::atomic<u32> peer_stitch_search_active_workers_{0};
   vec<std::thread> storage_owner_maintenance_workers_;
   vec<u_ptr<StorageOwnerThread>> storage_owner_maintenance_worker_states_;
   std::mutex storage_owner_maintenance_mutex_;

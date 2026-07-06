@@ -386,29 +386,8 @@ bool MemoryNode::try_acquire_storage_owner_maintenance_slot(const Configuration&
   }
 
   const u32 max_workers = std::max<u32>(1, config.storage_owner_maintenance_workers);
-  const size_t batch_limit = std::max<u32>(1, config.storage_owner_batch_max);
-  size_t stitch_backlog = 0;
-  size_t cleanup_backlog = 0;
-  {
-    std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
-    stitch_backlog = storage_owner_stitch_tasks_.size();
-    cleanup_backlog = storage_owner_cleanup_tasks_.size();
-  }
-  if (stitch_backlog == 0 && cleanup_backlog == 0) {
-    return false;
-  }
-
-  u32 worker_limit = 1;
-  if (stitch_backlog >= batch_limit * static_cast<size_t>(max_workers) * 4) {
-    worker_limit = max_workers;
-  } else if (stitch_backlog >= batch_limit * static_cast<size_t>(max_workers)) {
-    worker_limit = std::max<u32>(1, max_workers / 2);
-  } else if (stitch_backlog >= batch_limit * 2) {
-    worker_limit = std::max<u32>(1, max_workers / 4);
-  }
-
   u32 active = storage_owner_maintenance_active_workers_.load(std::memory_order_acquire);
-  while (active < worker_limit) {
+  while (active < max_workers) {
     if (storage_owner_maintenance_active_workers_.compare_exchange_weak(
           active, active + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
       return true;
@@ -467,24 +446,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       }
       if (!storage_owner_stitch_tasks_.empty()) {
         const size_t batch_limit = std::max<u32>(1, config.storage_owner_batch_max);
-        if (storage_owner_stitch_tasks_.size() < batch_limit &&
-            !storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
-          storage_owner_maintenance_cv_.wait_for(lock,
-                                                 std::chrono::milliseconds(1),
-                                                 [&]() {
-                                                   return storage_owner_maintenance_shutdown_.load(
-                                                            std::memory_order_acquire) ||
-                                                          storage_owner_stitch_tasks_.size() >= batch_limit;
-                                                 });
-          if (storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
-            current_storage_owner_thread_ = nullptr;
-            return;
-          }
-          if (storage_owner_maintenance_foreground_busy(config)) {
-            storage_owner_maintenance_pressure_yields_.fetch_add(1, std::memory_order_relaxed);
-            continue;
-          }
-        }
         stitch_batch.reserve(batch_limit);
         while (!storage_owner_stitch_tasks_.empty() && stitch_batch.size() < batch_limit) {
           stitch_batch.push_back(std::move(storage_owner_stitch_tasks_.front()));

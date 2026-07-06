@@ -12,6 +12,15 @@ void update_max_relaxed(std::atomic<u64>& target, u64 value) {
   }
 }
 
+struct AtomicCounterGuard {
+  explicit AtomicCounterGuard(std::atomic<u32>& counter) : counter(counter) {}
+  ~AtomicCounterGuard() {
+    counter.fetch_sub(1, std::memory_order_acq_rel);
+  }
+
+  std::atomic<u32>& counter;
+};
+
 }  // namespace
 
 void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
@@ -79,6 +88,7 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   peer_stitch_search_processed_.store(0, std::memory_order_relaxed);
   peer_stitch_search_items_.store(0, std::memory_order_relaxed);
   peer_stitch_search_max_queue_.store(0, std::memory_order_relaxed);
+  peer_stitch_search_active_workers_.store(0, std::memory_order_relaxed);
 
   const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
   const size_t snapshot_stride = align_up(VamanaNode::vector_bytes());
@@ -642,8 +652,9 @@ void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
 void MemoryNode::peer_stitch_search_worker_loop(u32 worker_id) {
   current_storage_owner_thread_ = peer_stitch_search_worker_states_[worker_id].get();
   const Configuration& config = *storage_worker_config_;
+  const u32 worker_count =
+    static_cast<u32>(std::max<size_t>(1, peer_stitch_search_worker_states_.size()));
   for (;;) {
-    PeerStitchSearchTask task;
     {
       std::unique_lock<std::mutex> lock(peer_stitch_search_tasks_mutex_);
       peer_stitch_search_tasks_cv_.wait(lock, [&]() {
@@ -654,6 +665,62 @@ void MemoryNode::peer_stitch_search_worker_loop(u32 worker_id) {
           peer_stitch_search_tasks_.empty()) {
         current_storage_owner_thread_ = nullptr;
         return;
+      }
+    }
+
+    bool foreground_active =
+      storage_owner_insert_active_workers_.load(std::memory_order_acquire) != 0;
+    {
+      std::unique_lock<std::mutex> lock(storage_insert_tasks_mutex_, std::try_to_lock);
+      foreground_active = foreground_active || !lock.owns_lock() || !storage_insert_tasks_.empty();
+    }
+    u32 worker_limit = foreground_active
+                         ? std::max<u32>(1, worker_count / 4)
+                         : worker_count;
+    u32 active = peer_stitch_search_active_workers_.load(std::memory_order_acquire);
+    while (active >= worker_limit) {
+      std::unique_lock<std::mutex> lock(peer_stitch_search_tasks_mutex_);
+      peer_stitch_search_tasks_cv_.wait_for(lock, std::chrono::milliseconds(1), [&]() {
+        return peer_reverse_shutdown_.load(std::memory_order_acquire);
+      });
+      if (peer_reverse_shutdown_.load(std::memory_order_acquire) &&
+          peer_stitch_search_tasks_.empty()) {
+        current_storage_owner_thread_ = nullptr;
+        return;
+      }
+      foreground_active =
+        storage_owner_insert_active_workers_.load(std::memory_order_acquire) != 0;
+      {
+        std::unique_lock<std::mutex> insert_lock(storage_insert_tasks_mutex_, std::try_to_lock);
+        foreground_active = foreground_active || !insert_lock.owns_lock() ||
+                            !storage_insert_tasks_.empty();
+      }
+      const u32 refreshed_limit = foreground_active
+                                    ? std::max<u32>(1, worker_count / 4)
+                                    : worker_count;
+      worker_limit = refreshed_limit;
+      active = peer_stitch_search_active_workers_.load(std::memory_order_acquire);
+      if (active < refreshed_limit) {
+        break;
+      }
+    }
+    active = peer_stitch_search_active_workers_.load(std::memory_order_acquire);
+    while (active < worker_limit) {
+      if (peer_stitch_search_active_workers_.compare_exchange_weak(
+            active, active + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+        break;
+      }
+    }
+    if (active >= worker_limit) {
+      continue;
+    }
+    AtomicCounterGuard active_slot(peer_stitch_search_active_workers_);
+
+    PeerStitchSearchTask task;
+    {
+      std::lock_guard<std::mutex> lock(peer_stitch_search_tasks_mutex_);
+      if (peer_stitch_search_tasks_.empty()) {
+        continue;
       }
       task = std::move(peer_stitch_search_tasks_.front());
       peer_stitch_search_tasks_.pop_front();
@@ -666,6 +733,7 @@ void MemoryNode::peer_stitch_search_worker_loop(u32 worker_id) {
     if (success) {
       peer_stitch_search_items_.fetch_add(task.header.item_count, std::memory_order_relaxed);
     }
+    peer_stitch_search_tasks_cv_.notify_one();
   }
 }
 
