@@ -13,6 +13,7 @@
 namespace {
 
 constexpr u64 kMaintenanceForegroundQuietNs = 5ull * 1000ull * 1000ull;
+constexpr u64 kMaintenanceObservationPeriodNs = 5ull * 1000ull * 1000ull * 1000ull;
 
 u64 steady_now_ns() {
   return static_cast<u64>(
@@ -37,6 +38,13 @@ void update_max_relaxed(std::atomic<u64>& target, u64 value) {
   while (observed < value &&
          !target.compare_exchange_weak(observed, value, std::memory_order_relaxed)) {
   }
+}
+
+double ratio_or_zero(u64 numerator, u64 denominator) {
+  if (denominator == 0) {
+    return 0.0;
+  }
+  return static_cast<double>(numerator) / static_cast<double>(denominator);
 }
 
 bool queue_near_limit(size_t size, size_t limit) {
@@ -74,6 +82,21 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   }
 
   storage_owner_maintenance_shutdown_.store(false, std::memory_order_release);
+  storage_owner_maintenance_enqueued_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_finalize_enqueued_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_cleanup_enqueued_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_processed_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_finalized_live_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_failed_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_stale_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_cleanup_processed_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_max_backlog_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_pressure_yields_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_active_workers_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_finalize_latency_ns_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_finalize_max_latency_ns_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_started_ns_.store(steady_now_ns(), std::memory_order_release);
+  storage_owner_maintenance_last_observation_ns_.store(0, std::memory_order_relaxed);
   const u32 worker_count = 1;
   const size_t snapshot_stride = memory_node_detail::storage_owner_snapshot_stride();
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
@@ -124,22 +147,87 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
   storage_owner_maintenance_workers_.clear();
   storage_owner_maintenance_worker_states_.clear();
 
-  if (storage_owner_maintenance_enqueued_.load(std::memory_order_relaxed) != 0) {
-    print_status("storage-owner maintenance summary: enqueued=" +
-                 std::to_string(storage_owner_maintenance_enqueued_.load(std::memory_order_relaxed)) +
-                 " insert_tasks_done=" +
-                 std::to_string(storage_owner_maintenance_processed_.load(std::memory_order_relaxed)) +
-                 " cleanup_processed=" +
-                 std::to_string(storage_owner_maintenance_cleanup_processed_.load(std::memory_order_relaxed)) +
-                 " stale=" +
-                 std::to_string(storage_owner_maintenance_stale_.load(std::memory_order_relaxed)) +
-                 " failed=" +
-                 std::to_string(storage_owner_maintenance_failed_.load(std::memory_order_relaxed)) +
-                 " max_backlog=" +
-                 std::to_string(storage_owner_maintenance_max_backlog_.load(std::memory_order_relaxed)) +
-                 " pressure_yields=" +
-                 std::to_string(storage_owner_maintenance_pressure_yields_.load(std::memory_order_relaxed)) +
-                 " remaining=" + std::to_string(remaining));
+  log_storage_owner_maintenance_observation(remaining, true);
+}
+
+void MemoryNode::log_storage_owner_maintenance_observation(size_t remaining, bool final) {
+  if (storage_owner_maintenance_enqueued_.load(std::memory_order_relaxed) == 0) {
+    return;
+  }
+
+  const u64 finalize_enqueued =
+    storage_owner_maintenance_finalize_enqueued_.load(std::memory_order_relaxed);
+  const u64 cleanup_enqueued =
+    storage_owner_maintenance_cleanup_enqueued_.load(std::memory_order_relaxed);
+  const u64 finalized_live =
+    storage_owner_maintenance_finalized_live_.load(std::memory_order_relaxed);
+  const u64 stale =
+    storage_owner_maintenance_stale_.load(std::memory_order_relaxed);
+  const u64 live_required = finalize_enqueued > stale ? finalize_enqueued - stale : 0;
+  const u64 total_finalize_latency_ns =
+    storage_owner_maintenance_finalize_latency_ns_.load(std::memory_order_relaxed);
+  const u64 max_finalize_latency_ns =
+    storage_owner_maintenance_finalize_max_latency_ns_.load(std::memory_order_relaxed);
+  const u64 started_ns =
+    storage_owner_maintenance_started_ns_.load(std::memory_order_acquire);
+  const u64 elapsed_ns = started_ns == 0 ? 0 : steady_now_ns() - started_ns;
+  const double elapsed_s = static_cast<double>(elapsed_ns) / 1e9;
+  const double repair_rate = elapsed_s > 0.0
+                               ? static_cast<double>(finalized_live) / elapsed_s
+                               : 0.0;
+  const double avg_finalize_ms = finalized_live == 0
+                                   ? 0.0
+                                   : static_cast<double>(total_finalize_latency_ns) /
+                                       static_cast<double>(finalized_live) / 1e6;
+
+  print_status(str("storage-owner maintenance ") + (final ? "summary" : "observation") +
+               ": enqueued=" +
+               std::to_string(storage_owner_maintenance_enqueued_.load(std::memory_order_relaxed)) +
+               " finalize_enqueued=" +
+               std::to_string(finalize_enqueued) +
+               " cleanup_enqueued=" +
+               std::to_string(cleanup_enqueued) +
+               " insert_tasks_done=" +
+               std::to_string(storage_owner_maintenance_processed_.load(std::memory_order_relaxed)) +
+               " finalized_live=" +
+               std::to_string(finalized_live) +
+               " cleanup_processed=" +
+               std::to_string(storage_owner_maintenance_cleanup_processed_.load(std::memory_order_relaxed)) +
+               " stale=" +
+               std::to_string(stale) +
+               " raw_repair_ratio=" +
+               std::to_string(ratio_or_zero(finalized_live, finalize_enqueued)) +
+               " live_repair_ratio=" +
+               std::to_string(ratio_or_zero(finalized_live, live_required)) +
+               " avg_finalize_delay_ms=" +
+               std::to_string(avg_finalize_ms) +
+               " max_finalize_delay_ms=" +
+               std::to_string(static_cast<double>(max_finalize_latency_ns) / 1e6) +
+               " finalize_rate_per_sec=" +
+               std::to_string(repair_rate) +
+               " failed=" +
+               std::to_string(storage_owner_maintenance_failed_.load(std::memory_order_relaxed)) +
+               " max_backlog=" +
+               std::to_string(storage_owner_maintenance_max_backlog_.load(std::memory_order_relaxed)) +
+               " pressure_yields=" +
+               std::to_string(storage_owner_maintenance_pressure_yields_.load(std::memory_order_relaxed)) +
+               " remaining=" + std::to_string(remaining));
+}
+
+void MemoryNode::maybe_log_storage_owner_maintenance_observation() {
+  const u64 now = steady_now_ns();
+  u64 last = storage_owner_maintenance_last_observation_ns_.load(std::memory_order_acquire);
+  while (now - last >= kMaintenanceObservationPeriodNs) {
+    if (storage_owner_maintenance_last_observation_ns_.compare_exchange_weak(
+          last, now, std::memory_order_acq_rel, std::memory_order_acquire)) {
+      size_t remaining = 0;
+      {
+        std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
+        remaining = storage_owner_maintenance_tasks_.size();
+      }
+      log_storage_owner_maintenance_observation(remaining, false);
+      return;
+    }
   }
 }
 
@@ -174,14 +262,22 @@ bool MemoryNode::enqueue_insert_finalization(node_t id,
   task.id = id;
   task.generation = generation;
   task.target = target;
-  return enqueue_storage_owner_maintenance(std::move(task), config);
+  const bool queued = enqueue_storage_owner_maintenance(std::move(task), config);
+  if (queued) {
+    storage_owner_maintenance_finalize_enqueued_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return queued;
 }
 
 bool MemoryNode::enqueue_deleted_node_cleanup(RemotePtr deleted_ptr, const Configuration& config) {
   StorageOwnerMaintenanceTask task;
   task.kind = StorageOwnerMaintenanceKind::cleanup_deleted_node;
   task.target = deleted_ptr;
-  return enqueue_storage_owner_maintenance(std::move(task), config);
+  const bool queued = enqueue_storage_owner_maintenance(std::move(task), config);
+  if (queued) {
+    storage_owner_maintenance_cleanup_enqueued_.fetch_add(1, std::memory_order_relaxed);
+  }
+  return queued;
 }
 
 void MemoryNode::mark_storage_owner_foreground_activity() {
@@ -282,6 +378,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       }
     }
 
+    maybe_log_storage_owner_maintenance_observation();
     if (!try_acquire_storage_owner_maintenance_slot(config)) {
       storage_owner_maintenance_pressure_yields_.fetch_add(1, std::memory_order_relaxed);
       std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
@@ -339,6 +436,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         std::this_thread::yield();
       }
     }
+    maybe_log_storage_owner_maintenance_observation();
   }
 }
 
@@ -536,6 +634,14 @@ bool MemoryNode::finalize_inserted_storage_owner_node(const StorageOwnerMaintena
       return false;
     }
   }
+
+  const u64 finalize_latency_ns = static_cast<u64>(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - task.queued_at).count());
+  storage_owner_maintenance_finalized_live_.fetch_add(1, std::memory_order_relaxed);
+  storage_owner_maintenance_finalize_latency_ns_.fetch_add(finalize_latency_ns,
+                                                           std::memory_order_relaxed);
+  update_max_relaxed(storage_owner_maintenance_finalize_max_latency_ns_, finalize_latency_ns);
   return true;
 }
 
