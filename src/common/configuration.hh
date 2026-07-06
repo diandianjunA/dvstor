@@ -220,7 +220,7 @@ private:
       "Maximum candidates considered by storage-owner robust-prune. 0 disables the cap.")(
       "storage-owner-update-mode",
       po::value<str>(&storage_owner_update_mode)->default_value(storage_owner_update_mode),
-      "Storage-owner update search: exact or anchored.")(
+      "Storage-owner update search: exact, anchored, or local_stitch.")(
       "storage-owner-anchor-hints",
       po::value<u32>(&storage_owner_anchor_hints)->default_value(storage_owner_anchor_hints),
       "Anchor entry points attached to each storage-owner mutation.")(
@@ -471,16 +471,18 @@ private:
         std::cerr << "[ERROR]: --storage-owner-search-snapshot-batch must be > 0" << std::endl;
         exit_with_help_message(argv);
       }
-      if (storage_owner_update_mode != "exact" && storage_owner_update_mode != "anchored") {
-        std::cerr << "[ERROR]: --storage-owner-update-mode must be exact or anchored" << std::endl;
+      if (storage_owner_update_mode != "exact" &&
+          storage_owner_update_mode != "anchored" &&
+          storage_owner_update_mode != "local_stitch") {
+        std::cerr << "[ERROR]: --storage-owner-update-mode must be exact, anchored, or local_stitch" << std::endl;
         exit_with_help_message(argv);
       }
-      if (storage_owner_update_mode == "anchored" &&
+      if ((storage_owner_update_mode == "anchored" || storage_owner_update_mode == "local_stitch") &&
           (ip_distance || storage_owner_anchor_hints == 0 ||
            storage_owner_anchor_beam_width == 0 || storage_owner_anchor_expand_cap == 0 ||
            storage_owner_anchor_min_overlap < 0.0 || storage_owner_anchor_min_overlap > 1.0 ||
            storage_owner_anchor_rehome_upsert)) {
-        std::cerr << "[ERROR]: invalid anchored storage-owner configuration; L2 is required and "
+        std::cerr << "[ERROR]: invalid anchored/local_stitch storage-owner configuration; L2 is required and "
                      "upsert rehome is not enabled in this protocol version" << std::endl;
         exit_with_help_message(argv);
       }
@@ -490,6 +492,12 @@ private:
       }
       if (storage_owner_maintenance_mode != "off" && storage_owner_maintenance_mode != "finalize") {
         std::cerr << "[ERROR]: --storage-owner-maintenance-mode must be off or finalize" << std::endl;
+        exit_with_help_message(argv);
+      }
+      if (storage_owner_update_mode == "local_stitch" &&
+          storage_owner_maintenance_mode != "finalize") {
+        std::cerr << "[ERROR]: --storage-owner-update-mode=local_stitch requires "
+                     "--storage-owner-maintenance-mode=finalize" << std::endl;
         exit_with_help_message(argv);
       }
       if (storage_owner_maintenance_mode == "finalize" &&
@@ -584,7 +592,8 @@ public:
         os << std::setw(width) << "storage prune max candidates: "
            << config.storage_owner_prune_max_candidates << std::endl;
         os << std::setw(width) << "storage update mode: " << config.storage_owner_update_mode << std::endl;
-        if (config.storage_owner_update_mode == "anchored") {
+        if (config.storage_owner_update_mode == "anchored" ||
+            config.storage_owner_update_mode == "local_stitch") {
           os << std::setw(width) << "anchor hints: " << config.storage_owner_anchor_hints << std::endl;
           os << std::setw(width) << "anchor beam width: " << config.storage_owner_anchor_beam_width << std::endl;
           os << std::setw(width) << "anchor expand cap: " << config.storage_owner_anchor_expand_cap << std::endl;

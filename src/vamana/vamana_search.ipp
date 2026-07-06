@@ -1,10 +1,13 @@
     VamanaCoroutine knn(node_t q_id, const span<element_t> components,
-                        const u_ptr<ComputeThread>& thread) const {
-        return knn_raw(q_id, reinterpret_cast<const byte_t*>(components.data()), VectorDType::float32, thread);
+                        const u_ptr<ComputeThread>& thread,
+                        const vec<RemotePtr>* entry_points = nullptr) const {
+        return knn_raw(q_id, reinterpret_cast<const byte_t*>(components.data()),
+                       VectorDType::float32, thread, entry_points);
     }
 
     VamanaCoroutine knn_raw(node_t q_id, const byte_t* query_data, VectorDType query_dtype,
-                            const u_ptr<ComputeThread>& thread) const {
+                            const u_ptr<ComputeThread>& thread,
+                            const vec<RemotePtr>* entry_points = nullptr) const {
         ++thread->stats.processed;
         ++thread->stats.processed_queries;
 
@@ -22,21 +25,6 @@
         const bool use_gpudirect_candidate_rdma =
             gpu.gpudirect_candidate_ready() && gs.d_candidate_vecs_rdma_registered;
 
-        const auto t_medoid_ptr_start = breakdown_start(thread);
-        RemotePtr medoid_ptr = co_await rdma::vamana::read_medoid_ptr(thread);
-        add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_medoid_ptr, t_medoid_ptr_start);
-
-        s_ptr<VamanaNode> medoid_node;
-        {
-            const auto t_node_read = breakdown_start(thread);
-            auto coro = read_node(medoid_ptr, medoid_node, thread, true);
-            while (!coro.handle.done()) {
-                co_await std::suspend_always{};
-                coro.handle.resume();
-            }
-            add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_node_read, t_node_read);
-        }
-
         if (!use_rabitq_) {
             const size_t query_bytes = vector_dtype_bytes(query_dtype, dim_);
             const auto t_query_h2d = breakdown_start(thread);
@@ -46,14 +34,53 @@
             add_breakdown_subcategory(thread, service::breakdown::Subcategory::transfer_query_h2d, t_query_h2d);
         }
 
-        distance_t medoid_dist = distance_to_stored_vector<Distance>(query_data, query_dtype, medoid_node->vector_data());
-        ++thread->stats.distcomps;
-        ++thread->stats.query_distcomps;
-
         beam.clear();
-        beam.push_back({medoid_ptr, medoid_dist, false});
         visited.clear();
-        visited.insert(medoid_ptr);
+
+        auto add_start_point = [&](RemotePtr ptr) -> VamanaCoroutine {
+            if (ptr.is_null() || visited.contains(ptr)) {
+                co_return;
+            }
+            s_ptr<VamanaNode> node;
+            const auto t_node_read = breakdown_start(thread);
+            auto coro = read_node(ptr, node, thread, true);
+            while (!coro.handle.done()) {
+                co_await std::suspend_always{};
+                coro.handle.resume();
+            }
+            add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_node_read, t_node_read);
+            const distance_t dist =
+                distance_to_stored_vector<Distance>(query_data, query_dtype, node->vector_data());
+            ++thread->stats.distcomps;
+            ++thread->stats.query_distcomps;
+            beam.push_back({ptr, dist, false});
+            visited.insert(ptr);
+        };
+
+        if (entry_points != nullptr) {
+            for (const RemotePtr& entry : *entry_points) {
+                auto add = add_start_point(entry);
+                while (!add.handle.done()) {
+                    co_await std::suspend_always{};
+                    add.handle.resume();
+                }
+                add.handle.destroy();
+            }
+        }
+        if (beam.empty()) {
+            const auto t_medoid_ptr_start = breakdown_start(thread);
+            RemotePtr medoid_ptr = co_await rdma::vamana::read_medoid_ptr(thread);
+            add_breakdown_subcategory(thread, service::breakdown::Subcategory::rdma_medoid_ptr, t_medoid_ptr_start);
+            auto add = add_start_point(medoid_ptr);
+            while (!add.handle.done()) {
+                co_await std::suspend_always{};
+                add.handle.resume();
+            }
+            add.handle.destroy();
+        }
+        std::sort(beam.begin(), beam.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.distance < rhs.distance;
+        });
 
         // ── K-way Batched Beam Expansion ──────────────────────────────
         // Instead of expanding one node per iteration (serial beam search),

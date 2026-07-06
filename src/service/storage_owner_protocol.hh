@@ -33,6 +33,8 @@ enum class PeerRpcType : u32 {
   reverse_update_request = 1,
   reverse_update_response = 2,
   cleanup_deleted_request = 3,
+  stitch_search_request = 4,
+  stitch_search_response = 5,
 };
 
 struct InsertBatchRequestHeader {
@@ -130,6 +132,12 @@ struct PeerRpcHeader {
 struct ReverseUpdateOp {
   u64 target_raw{};
   u64 candidate_raw{};
+};
+
+struct StitchSearchItem {
+  u64 target_raw{};
+  u32 id{};
+  u32 generation{};
 };
 
 constexpr size_t align_wire_u64(size_t value) {
@@ -310,12 +318,67 @@ inline size_t reverse_update_response_bytes() {
   return sizeof(PeerRpcHeader);
 }
 
+inline size_t stitch_search_vectors_offset(u32 item_count) {
+  return align_wire_u64(sizeof(PeerRpcHeader) +
+                        static_cast<size_t>(item_count) * sizeof(StitchSearchItem));
+}
+
+inline size_t stitch_search_request_bytes(u32 item_count) {
+  return stitch_search_vectors_offset(item_count) +
+         static_cast<size_t>(item_count) * VamanaNode::vector_bytes();
+}
+
+inline size_t stitch_search_candidates_offset(u32 item_count) {
+  return align_wire_u64(sizeof(PeerRpcHeader) +
+                        static_cast<size_t>(item_count) * sizeof(u32));
+}
+
+inline size_t stitch_search_response_bytes(u32 item_count) {
+  return stitch_search_candidates_offset(item_count) +
+         static_cast<size_t>(item_count) * VamanaNode::R * sizeof(u64);
+}
+
 inline ReverseUpdateOp* reverse_update_ops(void* payload) {
   return reinterpret_cast<ReverseUpdateOp*>(reinterpret_cast<byte_t*>(payload) + sizeof(PeerRpcHeader));
 }
 
 inline const ReverseUpdateOp* reverse_update_ops(const void* payload) {
   return reinterpret_cast<const ReverseUpdateOp*>(reinterpret_cast<const byte_t*>(payload) + sizeof(PeerRpcHeader));
+}
+
+inline StitchSearchItem* stitch_search_items(void* payload) {
+  return reinterpret_cast<StitchSearchItem*>(reinterpret_cast<byte_t*>(payload) + sizeof(PeerRpcHeader));
+}
+
+inline const StitchSearchItem* stitch_search_items(const void* payload) {
+  return reinterpret_cast<const StitchSearchItem*>(reinterpret_cast<const byte_t*>(payload) +
+                                                   sizeof(PeerRpcHeader));
+}
+
+inline byte_t* stitch_search_vectors(void* payload, u32 item_count) {
+  return reinterpret_cast<byte_t*>(payload) + stitch_search_vectors_offset(item_count);
+}
+
+inline const byte_t* stitch_search_vectors(const void* payload, u32 item_count) {
+  return reinterpret_cast<const byte_t*>(payload) + stitch_search_vectors_offset(item_count);
+}
+
+inline u32* stitch_search_response_counts(void* payload) {
+  return reinterpret_cast<u32*>(reinterpret_cast<byte_t*>(payload) + sizeof(PeerRpcHeader));
+}
+
+inline const u32* stitch_search_response_counts(const void* payload) {
+  return reinterpret_cast<const u32*>(reinterpret_cast<const byte_t*>(payload) + sizeof(PeerRpcHeader));
+}
+
+inline u64* stitch_search_response_candidates(void* payload, u32 item_count) {
+  return reinterpret_cast<u64*>(reinterpret_cast<byte_t*>(payload) +
+                                stitch_search_candidates_offset(item_count));
+}
+
+inline const u64* stitch_search_response_candidates(const void* payload, u32 item_count) {
+  return reinterpret_cast<const u64*>(reinterpret_cast<const byte_t*>(payload) +
+                                      stitch_search_candidates_offset(item_count));
 }
 
 }  // namespace service::storage_owner

@@ -1,4 +1,29 @@
 template <class Distance>
+vec<RemotePtr> ComputeService<Distance>::storage_owner_query_entry_points(
+  const span<const element_t> query) const {
+  vec<RemotePtr> entries;
+  if (config_.storage_owner_update_mode != "local_stitch" ||
+      anchor_index_ == nullptr || anchor_index_->empty()) {
+    return entries;
+  }
+
+  constexpr u32 kQueryShardEntryCount = 2;
+  const vec<u32> shards = anchor_index_->nearest_shards(query, kQueryShardEntryCount);
+  entries.reserve(static_cast<size_t>(shards.size()) * config_.storage_owner_anchor_hints);
+  hashset_t<RemotePtr> seen;
+  for (const u32 shard : shards) {
+    vec<RemotePtr> anchors =
+      anchor_index_->nearest_anchors(query, shard, config_.storage_owner_anchor_hints);
+    for (const RemotePtr& anchor : anchors) {
+      if (!anchor.is_null() && seen.insert(anchor).second) {
+        entries.push_back(anchor);
+      }
+    }
+  }
+  return entries;
+}
+
+template <class Distance>
 typename ComputeService<Distance>::LocalMainSearchOutput ComputeService<Distance>::search_local_result(
   const vec<element_t>& query, u32 k) {
   if (query.size() != config_.dim) {
@@ -12,6 +37,8 @@ typename ComputeService<Distance>::LocalMainSearchOutput ComputeService<Distance
 
   auto* request = new service::QueryRequest{};
   request->components = query;
+  request->entry_points = storage_owner_query_entry_points(
+    span<const element_t>{query.data(), query.size()});
   request->query_dtype = VectorDType::float32;
   request->k = k;
   request->enqueued_at = enqueued_at;
@@ -61,6 +88,13 @@ typename ComputeService<Distance>::LocalMainSearchOutput ComputeService<Distance
 
   auto* request = new service::QueryRequest{};
   request->raw_components.assign(query_data, query_data + vector_dtype_bytes(query_dtype, config_.dim));
+  if (config_.storage_owner_update_mode == "local_stitch" &&
+      anchor_index_ != nullptr && !anchor_index_->empty()) {
+    vec<element_t> decoded(config_.dim);
+    decode_storage_vector_to_float(query_data, query_dtype, config_.dim, decoded.data());
+    request->entry_points = storage_owner_query_entry_points(
+      span<const element_t>{decoded.data(), decoded.size()});
+  }
   request->query_dtype = query_dtype;
   request->k = k;
   request->enqueued_at = enqueued_at;

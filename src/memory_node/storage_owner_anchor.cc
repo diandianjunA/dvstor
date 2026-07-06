@@ -50,7 +50,8 @@ vec<RemotePtr> sorted_candidates(vec<BeamEntry>& beam) {
 vec<RemotePtr> MemoryNode::anchor_search_candidates(const span<const element_t> query,
                                                      const vec<RemotePtr>& anchor_hints,
                                                      const Configuration& config,
-                                                     InsertBreakdownCounters* breakdown) {
+                                                     InsertBreakdownCounters* breakdown,
+                                                     bool local_only) {
   hashset_t<RemotePtr> visited;
   vec<BeamEntry> beam;
   const u32 beam_width = std::max<u32>(config.R, config.storage_owner_anchor_beam_width);
@@ -65,7 +66,9 @@ vec<RemotePtr> MemoryNode::anchor_search_candidates(const span<const element_t> 
     batch.reserve(end - begin);
     for (size_t i = begin; i < end; ++i) {
       const RemotePtr hint = anchor_hints[i];
-      if (!hint.is_null() && hint.memory_node() < num_storage_nodes_ && visited.insert(hint).second) {
+      if (!hint.is_null() && hint.memory_node() < num_storage_nodes_ &&
+          (!local_only || local_shard(hint.memory_node())) &&
+          visited.insert(hint).second) {
         batch.push_back(hint);
       }
     }
@@ -99,6 +102,9 @@ vec<RemotePtr> MemoryNode::anchor_search_candidates(const span<const element_t> 
     BeamEntry& entry = beam[best];
     entry.expanded = true;
     const bool remote = !local_shard(entry.rptr.memory_node());
+    if (local_only && remote) {
+      continue;
+    }
     if (remote && remote_expansions >= config.storage_owner_anchor_remote_rescue_cap) {
       continue;
     }
@@ -114,6 +120,7 @@ vec<RemotePtr> MemoryNode::anchor_search_candidates(const span<const element_t> 
     unvisited.reserve(neighbors.size());
     for (const RemotePtr neighbor : neighbors) {
       if (!neighbor.is_null() && neighbor.memory_node() < num_storage_nodes_ &&
+          (!local_only || local_shard(neighbor.memory_node())) &&
           visited.insert(neighbor).second) {
         unvisited.push_back(neighbor);
       }

@@ -83,6 +83,7 @@ set(DVSTOR_MEMORY_NODE_SOURCES
     src/memory_node/storage_owner_index.cc
     src/memory_node/storage_owner_maintenance.cc
     src/memory_node/storage_owner_runtime.cc
+    src/vamana/anchor_index.cc
 )
 
 set(DVSTOR_OFFLINE_BUILDER_SOURCES

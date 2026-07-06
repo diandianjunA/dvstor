@@ -33,6 +33,7 @@ struct InsertRequest {
 struct QueryRequest {
   vec<element_t> components;
   vec<byte_t> raw_components;
+  vec<RemotePtr> entry_points;
   VectorDType query_dtype{VectorDType::float32};
   u32 k{};
   std::promise<QueryResult> result;

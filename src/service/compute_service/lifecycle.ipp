@@ -153,7 +153,9 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                  std::to_string(rabitq_cache_->decode_table_bytes()) + " bytes, NUMA " +
                  (rabitq_cache_->numa_interleaved() ? "interleaved" : "local"));
   }
-  if (config_.use_storage_owner_insert() && config_.storage_owner_update_mode == "anchored") {
+  if (config_.use_storage_owner_insert() &&
+      (config_.storage_owner_update_mode == "anchored" ||
+       config_.storage_owner_update_mode == "local_stitch")) {
     anchor_index_ = std::make_unique<vamana::anchor::Index>();
     str anchor_error;
     if (!have_startup_metadata || startup_metadata.anchor_format != "owner_anchor_v1" ||

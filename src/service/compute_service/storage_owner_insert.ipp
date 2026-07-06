@@ -259,13 +259,15 @@ void ComputeService<Distance>::start_storage_insert_runtime() {
 
   const u32 owner_count = std::max<u32>(1, num_servers_);
   const u32 rpc_depth = std::max<u32>(1, config_.storage_owner_rpc_depth);
+  const bool anchor_mode = config_.storage_owner_update_mode == "anchored" ||
+                           config_.storage_owner_update_mode == "local_stitch";
   const size_t request_bytes = std::max(
     service::storage_owner::insert_batch_request_bytes(
       config_.storage_owner_batch_max, config_.dim,
-      config_.storage_owner_update_mode == "anchored" ? config_.storage_owner_anchor_hints : 0),
+      anchor_mode ? config_.storage_owner_anchor_hints : 0),
     service::storage_owner::mutation_batch_request_bytes(
       config_.storage_owner_batch_max, config_.dim,
-      config_.storage_owner_update_mode == "anchored" ? config_.storage_owner_anchor_hints : 0));
+      anchor_mode ? config_.storage_owner_anchor_hints : 0));
   const size_t response_bytes =
     service::storage_owner::insert_batch_response_bytes(config_.storage_owner_batch_max);
   const size_t max_inflight = static_cast<size_t>(owner_count) * rpc_depth;
@@ -454,7 +456,9 @@ void ComputeService<Distance>::post_storage_owner_batch(
   }
 
   const u32 item_count = static_cast<u32>(tasks.size());
-  const u32 anchor_hint_count = config_.storage_owner_update_mode == "anchored"
+  const bool anchor_mode = config_.storage_owner_update_mode == "anchored" ||
+                           config_.storage_owner_update_mode == "local_stitch";
+  const u32 anchor_hint_count = anchor_mode
                                   ? config_.storage_owner_anchor_hints : 0;
   const u64 batch_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
   bool collect_breakdown = false;

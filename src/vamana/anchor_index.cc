@@ -129,6 +129,33 @@ u32 Index::nearest_shard(const span<const element_t> query) const {
   return best_shard;
 }
 
+vec<u32> Index::nearest_shards(const span<const element_t> query, u32 count) const {
+  vec<u32> result;
+  if (count == 0 || shards_.empty() || query.size() != dim_) {
+    return result;
+  }
+  using Candidate = std::pair<distance_t, u32>;
+  std::priority_queue<Candidate> nearest;
+  for (u32 shard = 0; shard < shards_.size(); ++shard) {
+    if (shards_[shard].centroid.size() != dim_) {
+      continue;
+    }
+    const distance_t distance = L2Distance::dist(query, shards_[shard].centroid, dim_);
+    if (nearest.size() < count) {
+      nearest.emplace(distance, shard);
+    } else if (distance < nearest.top().first) {
+      nearest.pop();
+      nearest.emplace(distance, shard);
+    }
+  }
+  result.resize(nearest.size());
+  for (size_t pos = result.size(); pos > 0; --pos) {
+    result[pos - 1] = nearest.top().second;
+    nearest.pop();
+  }
+  return result;
+}
+
 vec<RemotePtr> Index::nearest_anchors(const span<const element_t> query,
                                       u32 shard_id,
                                       u32 count) const {

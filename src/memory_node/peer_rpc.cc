@@ -10,9 +10,15 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
 
   const size_t reverse_update_bytes =
     service::storage_owner::reverse_update_request_bytes(config.R * config.storage_owner_batch_max);
+  const size_t stitch_request_bytes =
+    service::storage_owner::stitch_search_request_bytes(config.storage_owner_batch_max);
+  const size_t stitch_response_bytes =
+    service::storage_owner::stitch_search_response_bytes(config.storage_owner_batch_max);
   peer_rpc_runtime_.message_bytes = align_up(
     std::max({reverse_update_bytes,
-              service::storage_owner::reverse_update_response_bytes()}));
+              service::storage_owner::reverse_update_response_bytes(),
+              stitch_request_bytes,
+              stitch_response_bytes}));
   const u32 remote_peer_count = num_storage_nodes_ - 1;
   const u32 max_recv_wr = static_cast<u32>(std::max<i32>(1, config.max_recv_queue_wr));
   const u32 max_slots_per_peer = std::max<u32>(1, max_recv_wr / remote_peer_count);
@@ -294,6 +300,71 @@ bool MemoryNode::handle_peer_cleanup_deleted_request(
   return success;
 }
 
+bool MemoryNode::handle_peer_stitch_search_request(
+    u32 source_shard,
+    const service::storage_owner::PeerRpcHeader& header,
+    const byte_t* payload,
+    const Configuration& config) {
+  const size_t response_bytes = service::storage_owner::stitch_search_response_bytes(header.item_count);
+  vec<byte_t> response(response_bytes, 0);
+  auto* response_header =
+    reinterpret_cast<service::storage_owner::PeerRpcHeader*>(response.data());
+  response_header->magic = service::storage_owner::kPeerRpcMagic;
+  response_header->type = static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_response);
+  response_header->source_shard = storage_id_;
+  response_header->item_count = header.item_count;
+  response_header->request_id = header.request_id;
+  response_header->status = static_cast<u32>(service::storage_owner::InsertStatus::ok);
+
+  if (storage_owner_anchor_index_ == nullptr || storage_owner_anchor_index_->empty()) {
+    response_header->status = static_cast<u32>(service::storage_owner::InsertStatus::failed);
+    send_peer_rpc_message(source_shard, response.data(), response.size());
+    return false;
+  }
+
+  const auto* items = service::storage_owner::stitch_search_items(payload);
+  const byte_t* vectors = service::storage_owner::stitch_search_vectors(payload, header.item_count);
+  u32* counts = service::storage_owner::stitch_search_response_counts(response.data());
+  u64* candidate_slots =
+    service::storage_owner::stitch_search_response_candidates(response.data(), header.item_count);
+
+  for (u32 i = 0; i < header.item_count; ++i) {
+    const byte_t* raw_vector = vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes();
+    vec<element_t> query = decode_storage_vector_to_float(
+      raw_vector, VamanaNode::vector_dtype(), VamanaNode::DIM);
+    vec<RemotePtr> anchors =
+      storage_owner_anchor_index_->nearest_anchors(
+        span<const element_t>{query.data(), query.size()},
+        storage_id_,
+        config.storage_owner_anchor_hints);
+    vec<RemotePtr> candidates =
+      anchor_search_candidates(span<const element_t>{query.data(), query.size()},
+                               anchors,
+                               config,
+                               nullptr,
+                               true);
+    u32 written = 0;
+    hashset_t<RemotePtr> seen;
+    for (const RemotePtr& candidate : candidates) {
+      if (written >= config.R) {
+        break;
+      }
+      if (candidate.is_null() || !local_shard(candidate.memory_node()) ||
+          candidate.raw_address == items[i].target_raw ||
+          !seen.insert(candidate).second) {
+        continue;
+      }
+      candidate_slots[static_cast<size_t>(i) * VamanaNode::R + written] =
+        candidate.raw_address;
+      ++written;
+    }
+    counts[i] = written;
+  }
+
+  send_peer_rpc_message(source_shard, response.data(), response.size());
+  return true;
+}
+
 bool MemoryNode::handle_peer_rpc_request(const PeerRpcMessage& message, const Configuration& config) {
   if (message.payload.size() < sizeof(service::storage_owner::PeerRpcHeader)) {
     return false;
@@ -319,6 +390,13 @@ bool MemoryNode::handle_peer_rpc_request(const PeerRpcMessage& message, const Co
     }
     const auto* ops = service::storage_owner::reverse_update_ops(message.payload.data());
     return handle_peer_cleanup_deleted_request(message.source_shard, *header, ops, config);
+  }
+  if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_request)) {
+    const size_t expected_bytes = service::storage_owner::stitch_search_request_bytes(header->item_count);
+    if (message.payload.size() < expected_bytes) {
+      return false;
+    }
+    return handle_peer_stitch_search_request(message.source_shard, *header, message.payload.data(), config);
   }
 
   return false;
@@ -406,10 +484,22 @@ void MemoryNode::peer_rpc_progress_loop() {
           const auto* ops = service::storage_owner::reverse_update_ops(payload);
           (void)handle_peer_cleanup_deleted_request(peer_id, *header, ops, config);
         }
+      } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_request)) {
+        const size_t expected_bytes = service::storage_owner::stitch_search_request_bytes(header->item_count);
+        if (bytes >= expected_bytes) {
+          (void)handle_peer_stitch_search_request(peer_id, *header, payload, config);
+        }
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response)) {
         {
           std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
           peer_rpc_responses_[header->request_id] = *header;
+        }
+        peer_rpc_responses_cv_.notify_all();
+      } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_response)) {
+        {
+          std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
+          peer_rpc_responses_[header->request_id] = *header;
+          peer_rpc_response_payloads_[header->request_id].assign(payload, payload + bytes);
         }
         peer_rpc_responses_cv_.notify_all();
       }
@@ -603,13 +693,17 @@ bool MemoryNode::pump_peer_rpcs_locked(const Configuration&,
       }
 
       if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_request) ||
-          header->type == static_cast<u32>(service::storage_owner::PeerRpcType::cleanup_deleted_request)) {
+          header->type == static_cast<u32>(service::storage_owner::PeerRpcType::cleanup_deleted_request) ||
+          header->type == static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_request)) {
         PeerRpcMessage request;
         request.source_shard = peer_id;
         request.payload.assign(payload, payload + bytes);
         requests.push_back(std::move(request));
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response)) {
         peer_rpc_responses_[header->request_id] = *header;
+      } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_response)) {
+        peer_rpc_responses_[header->request_id] = *header;
+        peer_rpc_response_payloads_[header->request_id].assign(payload, payload + bytes);
       }
 
       repost_peer_rpc_receive(peer_id, slot_id);
@@ -664,6 +758,99 @@ bool MemoryNode::wait_for_peer_reverse_update_response(u64 request_id,
       return false;
     }
   }
+}
+
+bool MemoryNode::wait_for_peer_stitch_search_response(u64 request_id,
+                                                      u32 target_shard,
+                                                      u32 item_count,
+                                                      vec<RemotePtr>& candidates,
+                                                      const Configuration& config) {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(config.storage_owner_rpc_timeout_ms);
+  std::unique_lock<std::mutex> lock(peer_rpc_mutex_);
+  for (;;) {
+    const auto it = peer_rpc_responses_.find(request_id);
+    if (it != peer_rpc_responses_.end()) {
+      const auto header = it->second;
+      auto payload_it = peer_rpc_response_payloads_.find(request_id);
+      const bool success =
+        header.status == static_cast<u32>(service::storage_owner::InsertStatus::ok) &&
+        payload_it != peer_rpc_response_payloads_.end() &&
+        payload_it->second.size() >= service::storage_owner::stitch_search_response_bytes(item_count);
+      if (success) {
+        const byte_t* payload = payload_it->second.data();
+        const u32* counts = service::storage_owner::stitch_search_response_counts(payload);
+        const u64* raws = service::storage_owner::stitch_search_response_candidates(payload, item_count);
+        for (u32 item = 0; item < item_count; ++item) {
+          const u32 count = std::min<u32>(counts[item], VamanaNode::R);
+          for (u32 i = 0; i < count; ++i) {
+            const u64 raw = raws[static_cast<size_t>(item) * VamanaNode::R + i];
+            if (raw != 0) {
+              candidates.emplace_back(raw);
+            }
+          }
+        }
+      }
+      peer_rpc_responses_.erase(it);
+      if (payload_it != peer_rpc_response_payloads_.end()) {
+        peer_rpc_response_payloads_.erase(payload_it);
+      }
+      return success;
+    }
+
+    if (peer_rpc_responses_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+      static std::atomic<u32> timeout_logs{0};
+      const u32 log_index = timeout_logs.fetch_add(1, std::memory_order_relaxed);
+      if (log_index < 8) {
+        std::cerr << "[storage-peer] stitch-search RPC timed out after "
+                  << config.storage_owner_rpc_timeout_ms << " ms"
+                  << " self_shard=" << storage_id_
+                  << " target_shard=" << target_shard
+                  << " request_id=" << request_id
+                  << " item_count=" << item_count << std::endl;
+      }
+      return false;
+    }
+  }
+}
+
+bool MemoryNode::post_stitch_search_request(u32 target_shard,
+                                            const vec<NodeSnapshot>& targets,
+                                            u64& request_id,
+                                            u32& item_count,
+                                            const Configuration& config) {
+  if (targets.empty() || target_shard == storage_id_) {
+    return true;
+  }
+
+  const u32 max_items = std::max<u32>(1, config.storage_owner_batch_max);
+  lib_assert(targets.size() <= max_items,
+             "stitch-search request batch exceeds storage_owner_batch_max");
+  item_count = static_cast<u32>(std::min<size_t>(targets.size(), max_items));
+  const size_t bytes = service::storage_owner::stitch_search_request_bytes(item_count);
+  vec<byte_t> message(bytes, 0);
+  auto* header = reinterpret_cast<service::storage_owner::PeerRpcHeader*>(message.data());
+  header->magic = service::storage_owner::kPeerRpcMagic;
+  header->type = static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_request);
+  header->source_shard = storage_id_;
+  header->item_count = item_count;
+  header->request_id = next_peer_request_id_.fetch_add(1, std::memory_order_relaxed);
+  request_id = header->request_id;
+
+  auto* items = service::storage_owner::stitch_search_items(message.data());
+  byte_t* vectors = service::storage_owner::stitch_search_vectors(message.data(), item_count);
+  for (u32 i = 0; i < item_count; ++i) {
+    const NodeSnapshot& snapshot = targets[i];
+    items[i].target_raw = snapshot.rptr.raw_address;
+    items[i].id = snapshot.id;
+    items[i].generation = snapshot.generation;
+    std::memcpy(vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes(),
+                snapshot.vector_data.data(),
+                VamanaNode::vector_bytes());
+  }
+
+  send_peer_rpc_message(target_shard, message.data(), bytes);
+  return true;
 }
 
 bool MemoryNode::enqueue_reverse_update_batch(u32 target_shard,

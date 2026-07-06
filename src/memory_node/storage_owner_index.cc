@@ -56,8 +56,13 @@ u32 storage_owner_prune_candidate_limit(const Configuration& config) {
   return std::max(config.R, config.storage_owner_prune_max_candidates);
 }
 
-bool anchored_update_enabled(const Configuration& config, const vec<RemotePtr>& hints) {
-  return config.storage_owner_update_mode == "anchored" && !hints.empty();
+bool anchor_update_enabled(const Configuration& config, const vec<RemotePtr>& hints) {
+  return (config.storage_owner_update_mode == "anchored" ||
+          config.storage_owner_update_mode == "local_stitch") && !hints.empty();
+}
+
+bool local_stitch_enabled(const Configuration& config) {
+  return config.storage_owner_update_mode == "local_stitch";
 }
 
 void parse_remote_snapshot(RemotePtr rptr, const byte_t* ptr, NodeSnapshot& snapshot) {
@@ -977,141 +982,6 @@ vec<RemotePtr> MemoryNode::beam_search_candidates(const span<const element_t> qu
   return candidates;
 }
 
-vec<RemotePtr> MemoryNode::beam_search_candidates_seeded(const span<const element_t> query,
-                                                         RemotePtr medoid,
-                                                         const vec<RemotePtr>& seeds,
-                                                         const Configuration& config,
-                                                         InsertBreakdownCounters* breakdown) {
-  if (seeds.empty()) {
-    return beam_search_candidates(query, medoid, config, breakdown);
-  }
-
-  hashset_t<RemotePtr> visited;
-  vec<RemotePtr> initial;
-  const size_t initial_limit = std::max<size_t>(config.R, static_cast<size_t>(config.R) * 4);
-  initial.reserve(std::min<size_t>(initial_limit, seeds.size() + 1));
-  auto append_seed = [&](RemotePtr ptr) {
-    if (initial.size() >= initial_limit || ptr.is_null() || ptr.memory_node() >= num_storage_nodes_) {
-      return;
-    }
-    if (visited.insert(ptr).second) {
-      initial.push_back(ptr);
-    }
-  };
-  append_seed(medoid);
-  for (const RemotePtr& seed : seeds) {
-    append_seed(seed);
-  }
-
-  if (initial.empty()) {
-    return {};
-  }
-
-  vec<BeamEntry> beam;
-  const u32 construction_width = std::max<u32>(
-    storage_owner_construction_width(config),
-    std::min<u32>(config.beam_width_construction,
-                  static_cast<u32>(std::max<size_t>(config.R, initial.size()))));
-
-  auto t_snapshot = std::chrono::steady_clock::now();
-  vec<NodeSnapshot> seed_snapshots = read_node_snapshots_batched(initial, config);
-  if (breakdown != nullptr) {
-    breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snapshot);
-  }
-  for (const NodeSnapshot& snapshot : seed_snapshots) {
-    if (snapshot.deleted) {
-      continue;
-    }
-    auto t_distance = std::chrono::steady_clock::now();
-    const distance_t dist = distance_to_stored_vector(query, snapshot.vector_data.data(), config);
-    if (breakdown != nullptr) {
-      breakdown->storage_owner_search_distance_ns += elapsed_ns_since(t_distance);
-    }
-    insert_into_beam(beam, snapshot.rptr, dist, construction_width);
-  }
-
-  if (beam.empty()) {
-    return {};
-  }
-
-  for (;;) {
-    i32 best_idx = -1;
-    distance_t best_dist = std::numeric_limits<distance_t>::max();
-    auto t_select = std::chrono::steady_clock::now();
-    for (i32 i = 0; i < static_cast<i32>(beam.size()); ++i) {
-      if (!beam[i].expanded && beam[i].distance < best_dist) {
-        best_dist = beam[i].distance;
-        best_idx = i;
-      }
-    }
-    if (breakdown != nullptr) {
-      breakdown->storage_owner_search_select_ns += elapsed_ns_since(t_select);
-    }
-    if (best_idx < 0) {
-      break;
-    }
-
-    beam[best_idx].expanded = true;
-    auto t_neighbor_read = std::chrono::steady_clock::now();
-    const vec<RemotePtr> neighbors = read_neighbor_list(beam[best_idx].rptr);
-    if (breakdown != nullptr) {
-      breakdown->storage_owner_search_neighbor_read_ns += elapsed_ns_since(t_neighbor_read);
-    }
-
-    vec<RemotePtr> unvisited_neighbors;
-    unvisited_neighbors.reserve(neighbors.size());
-    for (const RemotePtr& neighbor : neighbors) {
-      if (neighbor.is_null() || visited.contains(neighbor)) {
-        continue;
-      }
-      visited.insert(neighbor);
-      unvisited_neighbors.push_back(neighbor);
-    }
-
-    const u32 snapshot_batch = storage_owner_snapshot_batch_size(config, current_storage_owner_thread_);
-    for (size_t begin = 0; begin < unvisited_neighbors.size(); begin += snapshot_batch) {
-      const size_t end = std::min(unvisited_neighbors.size(), begin + snapshot_batch);
-      vec<RemotePtr> batch;
-      batch.reserve(end - begin);
-      batch.insert(batch.end(), unvisited_neighbors.begin() + begin, unvisited_neighbors.begin() + end);
-      t_snapshot = std::chrono::steady_clock::now();
-      vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
-      if (breakdown != nullptr) {
-        breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(t_snapshot);
-      }
-      for (const NodeSnapshot& snapshot : snapshots) {
-        if (snapshot.deleted) {
-          continue;
-        }
-        auto t_distance = std::chrono::steady_clock::now();
-        const distance_t dist = distance_to_stored_vector(query, snapshot.vector_data.data(), config);
-        if (breakdown != nullptr) {
-          breakdown->storage_owner_search_distance_ns += elapsed_ns_since(t_distance);
-        }
-        auto t_beam_update = std::chrono::steady_clock::now();
-        insert_into_beam(beam, snapshot.rptr, dist, construction_width);
-        if (breakdown != nullptr) {
-          breakdown->storage_owner_search_beam_update_ns += elapsed_ns_since(t_beam_update);
-        }
-      }
-    }
-  }
-
-  vec<RemotePtr> candidates;
-  candidates.reserve(beam.size());
-  auto t_sort = std::chrono::steady_clock::now();
-  std::sort(beam.begin(), beam.end(), [](const BeamEntry& lhs, const BeamEntry& rhs) {
-    return lhs.distance < rhs.distance;
-  });
-  if (breakdown != nullptr) {
-    breakdown->storage_owner_search_result_sort_ns += elapsed_ns_since(t_sort);
-  }
-  for (const auto& entry : beam) {
-    candidates.push_back(entry.rptr);
-  }
-  return candidates;
-}
-
 auto MemoryNode::beam_search_candidates_async(const span<const element_t> query,
                                               RemotePtr medoid,
                                               const Configuration& config,
@@ -1257,7 +1127,8 @@ auto MemoryNode::anchor_search_candidates_async(const span<const element_t> quer
                                                 const vec<RemotePtr>& anchor_hints,
                                                 const Configuration& config,
                                                 StorageOwnerThread& thread,
-                                                InsertBreakdownCounters* breakdown)
+                                                InsertBreakdownCounters* breakdown,
+                                                bool local_only)
   -> StorageOwnerInsertCoroutine {
   hashset_t<RemotePtr> visited;
   vec<BeamEntry> beam;
@@ -1273,7 +1144,9 @@ auto MemoryNode::anchor_search_candidates_async(const span<const element_t> quer
     batch.reserve(end - begin);
     for (size_t i = begin; i < end; ++i) {
       const RemotePtr hint = anchor_hints[i];
-      if (!hint.is_null() && hint.memory_node() < num_storage_nodes_ && visited.insert(hint).second) {
+      if (!hint.is_null() && hint.memory_node() < num_storage_nodes_ &&
+          (!local_only || local_shard(hint.memory_node())) &&
+          visited.insert(hint).second) {
         batch.push_back(hint);
       }
     }
@@ -1314,6 +1187,9 @@ auto MemoryNode::anchor_search_candidates_async(const span<const element_t> quer
     BeamEntry& entry = beam[best];
     entry.expanded = true;
     const bool remote = !local_shard(entry.rptr.memory_node());
+    if (local_only && remote) {
+      continue;
+    }
     if (remote && remote_expansions >= config.storage_owner_anchor_remote_rescue_cap) {
       continue;
     }
@@ -1329,6 +1205,7 @@ auto MemoryNode::anchor_search_candidates_async(const span<const element_t> quer
     unvisited.reserve(neighbors.size());
     for (const RemotePtr neighbor : neighbors) {
       if (!neighbor.is_null() && neighbor.memory_node() < num_storage_nodes_ &&
+          (!local_only || local_shard(neighbor.memory_node())) &&
           visited.insert(neighbor).second) {
         unvisited.push_back(neighbor);
       }
@@ -1498,7 +1375,8 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
     }
     co_return;
   }
-  const bool use_anchors = anchored_update_enabled(config, job.anchor_hints);
+  const bool local_stitch = local_stitch_enabled(config);
+  const bool use_anchors = anchor_update_enabled(config, job.anchor_hints);
   RemotePtr medoid_ptr{};
   bool medoid_loaded = false;
   vec<RemotePtr> owned_candidates;
@@ -1507,7 +1385,8 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
 
   if (use_anchors) {
     auto t_search = std::chrono::steady_clock::now();
-    auto search = anchor_search_candidates_async(components, job.anchor_hints, config, thread, &breakdown);
+    auto search = anchor_search_candidates_async(components, job.anchor_hints, config, thread,
+                                                 &breakdown, local_stitch);
     co_await std::suspend_always{};
     while (!search.handle.done()) {
       if (thread.is_ready(thread.running_coroutine)) {
@@ -1522,9 +1401,10 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
     candidates = &owned_candidates;
 
     const u64 sequence = storage_owner_anchor_insert_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
-    const bool audit = config.storage_owner_anchor_audit_rate != 0 &&
+    const bool audit = !local_stitch &&
+                       config.storage_owner_anchor_audit_rate != 0 &&
                        sequence % config.storage_owner_anchor_audit_rate == 0;
-    const bool insufficient = owned_candidates.size() < config.R;
+    const bool insufficient = !local_stitch && owned_candidates.size() < config.R;
     if (audit || insufficient) {
       auto t_medoid = std::chrono::steady_clock::now();
       medoid_ptr = co_await async_read_global_medoid(thread);
@@ -1579,7 +1459,7 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
       }
       publish_mutation(job.id, new_ptr, generation, false);
       if (maintenance_enabled) {
-        (void)enqueue_insert_finalization(job.id, generation, new_ptr, {}, config);
+        (void)enqueue_insert_stitch(job.id, generation, new_ptr, config);
         (void)enqueue_deleted_node_cleanup(old_entry.current, config);
       }
       co_return;
@@ -1632,22 +1512,15 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   }
   publish_mutation(job.id, new_ptr, generation, false);
   if (maintenance_enabled) {
-    vec<RemotePtr> finalization_seeds =
-      build_storage_owner_finalization_seeds(selected_neighbors,
-                                             *candidates,
-                                             job.anchor_hints,
-                                             medoid_ptr,
-                                             config);
-    (void)enqueue_insert_finalization(job.id, generation, new_ptr,
-                                      std::move(finalization_seeds), config);
+    (void)enqueue_insert_stitch(job.id, generation, new_ptr, config);
     (void)enqueue_deleted_node_cleanup(old_entry.current, config);
   }
 
-  if (!maintenance_enabled) {
+  if (!maintenance_enabled || local_stitch) {
     for (const RemotePtr& neighbor_ptr : selected_neighbors) {
       if (local_shard(neighbor_ptr.memory_node())) {
         local_updates[neighbor_ptr.raw_address].push_back(new_ptr);
-      } else {
+      } else if (!local_stitch) {
         remote_updates[neighbor_ptr.memory_node()].push_back(
           service::storage_owner::ReverseUpdateOp{neighbor_ptr.raw_address, new_ptr.raw_address});
       }

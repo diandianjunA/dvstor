@@ -33,6 +33,7 @@
 #include "memory_node/storage_owner_state.hh"
 #include "service/index_metadata.hh"
 #include "service/storage_owner_protocol.hh"
+#include "vamana/anchor_index.hh"
 #include "vamana/vamana_node.hh"
 
 /**
@@ -82,16 +83,15 @@ class MemoryNode {
   };
 
   enum class StorageOwnerMaintenanceKind : u8 {
-    finalize_insert,
+    stitch_insert,
     cleanup_deleted_node,
   };
 
   struct StorageOwnerMaintenanceTask {
-    StorageOwnerMaintenanceKind kind{StorageOwnerMaintenanceKind::finalize_insert};
+    StorageOwnerMaintenanceKind kind{StorageOwnerMaintenanceKind::stitch_insert};
     node_t id{};
     u32 generation{};
     RemotePtr target;
-    vec<RemotePtr> continuation_seeds;
     std::chrono::steady_clock::time_point queued_at{};
   };
 
@@ -183,6 +183,10 @@ private:
                                            const service::storage_owner::PeerRpcHeader& header,
                                            const service::storage_owner::ReverseUpdateOp* ops,
                                            const Configuration& config);
+  bool handle_peer_stitch_search_request(u32 source_shard,
+                                         const service::storage_owner::PeerRpcHeader& header,
+                                         const byte_t* payload,
+                                         const Configuration& config);
   bool handle_peer_rpc_request(const PeerRpcMessage& message, const Configuration& config);
   bool enqueue_peer_reverse_update_task(PeerReverseUpdateTask&& task);
   void enqueue_peer_reverse_update_response(u32 destination_shard,
@@ -201,6 +205,16 @@ private:
                                              u32 target_shard,
                                              u32 item_count,
                                              const Configuration& config);
+  bool wait_for_peer_stitch_search_response(u64 request_id,
+                                            u32 target_shard,
+                                            u32 item_count,
+                                            vec<RemotePtr>& candidates,
+                                            const Configuration& config);
+  bool post_stitch_search_request(u32 target_shard,
+                                  const vec<NodeSnapshot>& targets,
+                                  u64& request_id,
+                                  u32& item_count,
+                                  const Configuration& config);
   bool enqueue_reverse_update_batch(u32 target_shard,
                                     const vec<service::storage_owner::ReverseUpdateOp>& ops,
                                     const Configuration& config);
@@ -233,11 +247,10 @@ private:
   void start_storage_owner_maintenance_runtime(const Configuration& config);
   void stop_storage_owner_maintenance_runtime();
   bool enqueue_storage_owner_maintenance(StorageOwnerMaintenanceTask&& task, const Configuration& config);
-  bool enqueue_insert_finalization(node_t id,
-                                   u32 generation,
-                                   RemotePtr target,
-                                   vec<RemotePtr> continuation_seeds,
-                                   const Configuration& config);
+  bool enqueue_insert_stitch(node_t id,
+                             u32 generation,
+                             RemotePtr target,
+                             const Configuration& config);
   bool enqueue_deleted_node_cleanup(RemotePtr deleted_ptr, const Configuration& config);
   void mark_storage_owner_foreground_activity();
   void log_storage_owner_maintenance_observation(size_t remaining, bool final);
@@ -247,20 +260,10 @@ private:
   bool try_acquire_storage_owner_maintenance_slot(const Configuration& config);
   bool try_lock_node(RemotePtr rptr);
   bool storage_owner_task_current(node_t id, u32 generation, RemotePtr target);
-  vec<RemotePtr> build_storage_owner_finalization_seeds(const vec<RemotePtr>& selected_neighbors,
-                                                        const vec<RemotePtr>& candidates,
-                                                        const vec<RemotePtr>& anchor_hints,
-                                                        RemotePtr medoid,
-                                                        const Configuration& config) const;
-  vec<RemotePtr> beam_search_candidates_seeded(const span<const element_t> query,
-                                               RemotePtr medoid,
-                                               const vec<RemotePtr>& seeds,
-                                               const Configuration& config,
-                                               InsertBreakdownCounters* breakdown = nullptr);
   vec<RemotePtr> read_preserved_neighbor_list(RemotePtr rptr);
   bool remove_local_neighbor(RemotePtr target_ptr, RemotePtr deleted_ptr, const Configuration& config);
-  bool finalize_inserted_storage_owner_node(const StorageOwnerMaintenanceTask& task,
-                                            const Configuration& config);
+  bool stitch_inserted_storage_owner_node(const StorageOwnerMaintenanceTask& task,
+                                          const Configuration& config);
   bool cleanup_deleted_storage_owner_node(const StorageOwnerMaintenanceTask& task,
                                           const Configuration& config);
 
@@ -343,12 +346,14 @@ private:
   vec<RemotePtr> anchor_search_candidates(const span<const element_t> query,
                                           const vec<RemotePtr>& anchor_hints,
                                           const Configuration& config,
-                                          InsertBreakdownCounters* breakdown = nullptr);
+                                          InsertBreakdownCounters* breakdown = nullptr,
+                                          bool local_only = false);
   auto anchor_search_candidates_async(const span<const element_t> query,
                                       const vec<RemotePtr>& anchor_hints,
                                       const Configuration& config,
                                       StorageOwnerThread& thread,
-                                      InsertBreakdownCounters* breakdown = nullptr)
+                                      InsertBreakdownCounters* breakdown = nullptr,
+                                      bool local_only = false)
     -> StorageOwnerInsertCoroutine;
   vec<RemotePtr> robust_prune_cpu(const byte_t* source,
                                   VectorDType source_dtype,
@@ -461,8 +466,8 @@ private:
   std::atomic<u64> storage_owner_maintenance_cleanup_processed_{0};
   std::atomic<u64> storage_owner_maintenance_max_backlog_{0};
   std::atomic<u64> storage_owner_maintenance_pressure_yields_{0};
-  std::atomic<u64> storage_owner_maintenance_seeded_tasks_{0};
-  std::atomic<u64> storage_owner_maintenance_seed_candidates_{0};
+  std::atomic<u64> storage_owner_stitch_external_requests_{0};
+  std::atomic<u64> storage_owner_stitch_external_candidates_{0};
   std::atomic<u32> storage_owner_maintenance_active_workers_{0};
   std::atomic<u64> storage_owner_maintenance_started_ns_{0};
   std::atomic<u64> storage_owner_maintenance_last_observation_ns_{0};
@@ -483,6 +488,7 @@ private:
   const u64 mn_memory_bytes_;
   timing::Timing timing_;
   filepath_t index_prefix_;
+  std::unique_ptr<vamana::anchor::Index> storage_owner_anchor_index_;
   bool owner_idmap_required_{false};
   std::mutex idmap_mutex_;
   std::unordered_map<node_t, FreshnessEntry> idmap_;

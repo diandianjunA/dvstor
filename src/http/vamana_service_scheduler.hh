@@ -209,12 +209,15 @@ void vamana_service_schedule_queries(vamana::Vamana<Distance>& vamana_idx,
           coroutine.handle.destroy();
           reset_vamana_coroutine_state(coroutine);
           thread->set_current_coroutine(cid);
+          const vec<RemotePtr>* entry_points =
+            req->entry_points.empty() ? nullptr : &req->entry_points;
           if (!req->raw_components.empty()) {
-            coroutine.handle = vamana_idx.knn_raw(slot_ids[cid], req->raw_components.data(), req->query_dtype, thread).handle;
+            coroutine.handle = vamana_idx.knn_raw(slot_ids[cid], req->raw_components.data(),
+                                                  req->query_dtype, thread, entry_points).handle;
           } else {
             auto slot_components = staging.get_components(cid);
             std::copy(req->components.begin(), req->components.end(), slot_components.begin());
-            coroutine.handle = vamana_idx.knn(slot_ids[cid], slot_components, thread).handle;
+            coroutine.handle = vamana_idx.knn(slot_ids[cid], slot_components, thread, entry_points).handle;
           }
         }
 
