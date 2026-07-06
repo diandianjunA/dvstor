@@ -14,6 +14,7 @@ namespace {
 
 constexpr u64 kMaintenanceObservationPeriodNs = 5ull * 1000ull * 1000ull * 1000ull;
 constexpr u64 kStitchCompactionMaxDelayNs = 3ull * 1000ull * 1000ull * 1000ull;
+constexpr u64 kStitchCompactionPaceSlotNs = 80ull * 1000ull * 1000ull;
 constexpr size_t kForegroundQueueYieldMultiplier = 2;
 
 u64 steady_now_ns() {
@@ -46,6 +47,10 @@ double ratio_or_zero(u64 numerator, u64 denominator) {
     return 0.0;
   }
   return static_cast<double>(numerator) / static_cast<double>(denominator);
+}
+
+u64 stitch_compaction_round_ns(u32 shard_count) {
+  return kStitchCompactionPaceSlotNs * std::max<u32>(1, shard_count);
 }
 
 bool queue_near_limit(size_t size, size_t limit) {
@@ -98,6 +103,11 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   storage_owner_stitch_batches_.store(0, std::memory_order_relaxed);
   storage_owner_stitch_batched_items_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_active_workers_.store(0, std::memory_order_relaxed);
+  storage_owner_next_stitch_release_ns_.store(
+    steady_now_ns() +
+      (static_cast<u64>(storage_id_ % std::max<u32>(1, num_storage_nodes_)) *
+       kStitchCompactionPaceSlotNs),
+    std::memory_order_relaxed);
   storage_owner_maintenance_finalize_latency_ns_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_finalize_max_latency_ns_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_started_ns_.store(steady_now_ns(), std::memory_order_release);
@@ -133,7 +143,9 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                " local_stitch=" + (config.storage_owner_update_mode == "local_stitch" ? "true" : "false") +
                " compaction_batch_target=" + std::to_string(config.storage_owner_batch_max) +
                " compaction_max_delay_ms=" +
-               std::to_string(kStitchCompactionMaxDelayNs / 1000000ull));
+               std::to_string(kStitchCompactionMaxDelayNs / 1000000ull) +
+               " compaction_pace_slot_ms=" +
+               std::to_string(kStitchCompactionPaceSlotNs / 1000000ull));
 }
 
 void MemoryNode::stop_storage_owner_maintenance_runtime() {
@@ -232,6 +244,8 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
                                 : 0) +
                " compaction_max_delay_ms=" +
                std::to_string(kStitchCompactionMaxDelayNs / 1000000ull) +
+               " compaction_pace_slot_ms=" +
+               std::to_string(kStitchCompactionPaceSlotNs / 1000000ull) +
                " stitch_rate_per_sec=" +
                std::to_string(repair_rate) +
                " failed=" +
@@ -449,8 +463,22 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         const size_t batch_limit = std::max<u32>(1, config.storage_owner_batch_max);
         const auto ready_at = storage_owner_stitch_tasks_.front().queued_at +
                               std::chrono::nanoseconds(kStitchCompactionMaxDelayNs);
-        if (storage_owner_stitch_tasks_.size() < batch_limit &&
-            std::chrono::steady_clock::now() < ready_at) {
+        const auto now = std::chrono::steady_clock::now();
+        const bool candidate_ready =
+          storage_owner_stitch_tasks_.size() >= batch_limit || now >= ready_at;
+        const u64 now_ns = steady_now_ns();
+        const u64 release_ns = storage_owner_next_stitch_release_ns_.load(std::memory_order_acquire);
+        if (candidate_ready && now_ns < release_ns) {
+          storage_owner_maintenance_cv_.wait_for(lock,
+                                                 std::chrono::nanoseconds(release_ns - now_ns),
+                                                 [&]() {
+                                                   return storage_owner_maintenance_shutdown_.load(
+                                                            std::memory_order_acquire) ||
+                                                          !storage_owner_cleanup_tasks_.empty();
+                                                 });
+          continue;
+        }
+        if (!candidate_ready) {
           storage_owner_maintenance_cv_.wait_until(lock, ready_at, [&]() {
             return storage_owner_maintenance_shutdown_.load(std::memory_order_acquire) ||
                    !storage_owner_cleanup_tasks_.empty() ||
@@ -493,7 +521,13 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         !storage_owner_stitch_tasks_.empty() &&
         now >= storage_owner_stitch_tasks_.front().queued_at +
                  std::chrono::nanoseconds(kStitchCompactionMaxDelayNs);
-      if (!storage_owner_stitch_tasks_.empty() && (stitch_batch_full || stitch_wait_expired)) {
+      const u64 now_ns = steady_now_ns();
+      const u64 release_ns = storage_owner_next_stitch_release_ns_.load(std::memory_order_acquire);
+      if (!storage_owner_stitch_tasks_.empty() && (stitch_batch_full || stitch_wait_expired) &&
+          now_ns >= release_ns) {
+        storage_owner_next_stitch_release_ns_.store(
+          std::max(now_ns, release_ns) + stitch_compaction_round_ns(num_storage_nodes_),
+          std::memory_order_release);
         stitch_batch.reserve(batch_limit);
         while (!storage_owner_stitch_tasks_.empty() && stitch_batch.size() < batch_limit) {
           stitch_batch.push_back(std::move(storage_owner_stitch_tasks_.front()));

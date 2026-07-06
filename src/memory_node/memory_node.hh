@@ -501,6 +501,7 @@ private:
   std::atomic<u64> storage_owner_stitch_batches_{0};
   std::atomic<u64> storage_owner_stitch_batched_items_{0};
   std::atomic<u32> storage_owner_maintenance_active_workers_{0};
+  std::atomic<u64> storage_owner_next_stitch_release_ns_{0};
   std::atomic<u64> storage_owner_maintenance_started_ns_{0};
   std::atomic<u64> storage_owner_maintenance_last_observation_ns_{0};
   std::atomic<u64> storage_owner_maintenance_finalize_latency_ns_{0};
