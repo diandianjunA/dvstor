@@ -58,7 +58,6 @@ public:
   u32 rdma_read_max_inflight_wrs{};
   u32 query_batch_size{1};  // Fuse GPU across N queries (1=single query)
   bool use_rabitq{};        // Use the local RaBitQ gate before exact beam insertion
-  str rabitq_mode{"exact_safe"};
   u32 rabitq_gate_width{18};
   u32 rabitq_gate_max_width{36};
   f64 rabitq_gate_margin{0.08};
@@ -67,12 +66,8 @@ public:
   u32 rabitq_coalesce_target{64};
   u32 rabitq_coalesce_min{32};
   u32 rabitq_coalesce_wait_us{6};
-  u32 rabitq_prefetch_width{2};
-  u32 rabitq_prefetch_min_samples{16};
-  f64 rabitq_prefetch_min_hit_ratio{0.35};
   u32 rabitq_warmup_exact_expansions{6};
   u32 rabitq_audit_period{12};
-  f64 rabitq_safe_epsilon{1e-4};
   bool rabitq_strict_recall{true};
   str vector_data_type{"auto"};
   str insert_execution{"compute"};
@@ -95,9 +90,6 @@ public:
   u32 storage_owner_anchor_beam_width{64};
   u32 storage_owner_anchor_expand_cap{16};
   u32 storage_owner_anchor_remote_rescue_cap{4};
-  u32 storage_owner_anchor_audit_rate{256};
-  f64 storage_owner_anchor_min_overlap{0.5};
-  bool storage_owner_anchor_rehome_upsert{false};
   str storage_owner_maintenance_mode{"off"};
   u32 storage_owner_maintenance_workers{0};
   str storage_owner_reverse_mode{"async"};
@@ -220,28 +212,19 @@ private:
       "Maximum candidates considered by storage-owner robust-prune. 0 disables the cap.")(
       "storage-owner-update-mode",
       po::value<str>(&storage_owner_update_mode)->default_value(storage_owner_update_mode),
-      "Storage-owner update search: exact, anchored, or local_stitch.")(
+      "Storage-owner update search: exact or local_stitch.")(
       "storage-owner-anchor-hints",
       po::value<u32>(&storage_owner_anchor_hints)->default_value(storage_owner_anchor_hints),
       "Anchor entry points attached to each storage-owner mutation.")(
       "storage-owner-anchor-beam-width",
       po::value<u32>(&storage_owner_anchor_beam_width)->default_value(storage_owner_anchor_beam_width),
-      "Maximum beam width for anchored storage-owner search.")(
+      "Maximum beam width for local-stitch storage-owner search.")(
       "storage-owner-anchor-expand-cap",
       po::value<u32>(&storage_owner_anchor_expand_cap)->default_value(storage_owner_anchor_expand_cap),
-      "Maximum graph expansions in anchored foreground search.")(
+      "Maximum graph expansions in local-stitch foreground search.")(
       "storage-owner-anchor-remote-rescue-cap",
       po::value<u32>(&storage_owner_anchor_remote_rescue_cap)->default_value(storage_owner_anchor_remote_rescue_cap),
-      "Maximum remote-node expansions in anchored foreground search.")(
-      "storage-owner-anchor-audit-rate",
-      po::value<u32>(&storage_owner_anchor_audit_rate)->default_value(storage_owner_anchor_audit_rate),
-      "Run one sampled exact shadow audit per N successful anchored inserts. 0 disables auditing.")(
-      "storage-owner-anchor-min-overlap",
-      po::value<f64>(&storage_owner_anchor_min_overlap)->default_value(storage_owner_anchor_min_overlap),
-      "Minimum selected-neighbor overlap accepted by anchor shadow audits.")(
-      "storage-owner-anchor-rehome-upsert",
-      po::value<bool>(&storage_owner_anchor_rehome_upsert)->default_value(storage_owner_anchor_rehome_upsert),
-      "Allow anchored upserts to migrate ID ownership. Disabled until distributed two-phase ownership is enabled.")(
+      "Maximum remote-node expansions in local-stitch foreground search.")(
       "storage-owner-maintenance-mode",
       po::value<str>(&storage_owner_maintenance_mode)->default_value(storage_owner_maintenance_mode),
       "Storage-owner background graph-quality maintenance: off or finalize.")(
@@ -308,9 +291,7 @@ private:
       "query-batch-size", po::value<u32>(&query_batch_size)->default_value(1),
       "Fuse GPU/D2H across N queries processed in lockstep (1=disabled, 2-4=batch).")(
       "use-rabitq", po::bool_switch(&use_rabitq)->default_value(false),
-      "Use the local RaBitQ gate; only exact distances enter the beam.")(
-      "rabitq-mode", po::value<str>(&rabitq_mode)->default_value(rabitq_mode),
-      "RaBitQ execution mode: exact_safe, speculative_prefetch, gpu_coalesced, or cpu_gate.")(
+      "Use the local RaBitQ CPU gate; only exact distances enter the beam.")(
       "rabitq-gate-width", po::value<u32>(&rabitq_gate_width)->default_value(rabitq_gate_width),
       "Minimum cached candidates exactified per expansion.")(
       "rabitq-gate-max-width",
@@ -333,24 +314,12 @@ private:
       "rabitq-coalesce-wait-us",
       po::value<u32>(&rabitq_coalesce_wait_us)->default_value(rabitq_coalesce_wait_us),
       "Maximum RaBitQ coalescer wait in microseconds.")(
-      "rabitq-prefetch-width",
-      po::value<u32>(&rabitq_prefetch_width)->default_value(rabitq_prefetch_width),
-      "Number of RaBitQ-ranked neighbor lists speculatively prefetched per exact GPU batch.")(
-      "rabitq-prefetch-min-samples",
-      po::value<u32>(&rabitq_prefetch_min_samples)->default_value(rabitq_prefetch_min_samples),
-      "Predictions observed before applying the per-query prefetch stop-loss.")(
-      "rabitq-prefetch-min-hit-ratio",
-      po::value<f64>(&rabitq_prefetch_min_hit_ratio)->default_value(rabitq_prefetch_min_hit_ratio),
-      "Disable speculative prefetch for a query when its hit ratio falls below this value.")(
       "rabitq-warmup-exact-expansions",
       po::value<u32>(&rabitq_warmup_exact_expansions)->default_value(rabitq_warmup_exact_expansions),
       "Exactify all candidates for this many initial RaBitQ graph expansions.")(
       "rabitq-audit-period",
       po::value<u32>(&rabitq_audit_period)->default_value(rabitq_audit_period),
       "Exactify one full RaBitQ frontier every N graph expansions after warmup. 0 disables audit.")(
-      "rabitq-safe-epsilon",
-      po::value<f64>(&rabitq_safe_epsilon)->default_value(rabitq_safe_epsilon),
-      "Absolute safety margin for RFQ5 exact-safe lower-bound skipping.")(
       "rabitq-strict-recall",
       po::value<bool>(&rabitq_strict_recall)->default_value(rabitq_strict_recall),
       "Widen uncertain small RaBitQ gates so recall is protected.")(
@@ -396,20 +365,9 @@ private:
       std::cerr << "[ERROR]: --use-rabitq currently supports L2 distance only" << std::endl;
       exit_with_help_message(argv);
     }
-    if (use_rabitq && rabitq_mode != "exact_safe" &&
-        rabitq_mode != "speculative_prefetch" &&
-        rabitq_mode != "gpu_coalesced" && rabitq_mode != "cpu_gate") {
-      std::cerr << "[ERROR]: --rabitq-mode must be exact_safe, speculative_prefetch, "
-                   "gpu_coalesced, or cpu_gate" << std::endl;
-      exit_with_help_message(argv);
-    }
     if (rabitq_gate_width == 0 || rabitq_gate_max_width < rabitq_gate_width ||
         rabitq_gate_margin < 0.0 || rabitq_cache_max_ratio <= 0.0 ||
-        rabitq_coalesce_min == 0 || rabitq_coalesce_target < rabitq_coalesce_min ||
-        (rabitq_mode == "speculative_prefetch" &&
-         (rabitq_prefetch_width == 0 || rabitq_prefetch_min_samples == 0 ||
-          rabitq_prefetch_width > 8 ||
-          rabitq_prefetch_min_hit_ratio < 0.0 || rabitq_prefetch_min_hit_ratio > 1.0))) {
+        rabitq_coalesce_min == 0 || rabitq_coalesce_target < rabitq_coalesce_min) {
       std::cerr << "[ERROR]: invalid RaBitQ gate configuration" << std::endl;
       exit_with_help_message(argv);
     }
@@ -472,18 +430,14 @@ private:
         exit_with_help_message(argv);
       }
       if (storage_owner_update_mode != "exact" &&
-          storage_owner_update_mode != "anchored" &&
           storage_owner_update_mode != "local_stitch") {
-        std::cerr << "[ERROR]: --storage-owner-update-mode must be exact, anchored, or local_stitch" << std::endl;
+        std::cerr << "[ERROR]: --storage-owner-update-mode must be exact or local_stitch" << std::endl;
         exit_with_help_message(argv);
       }
-      if ((storage_owner_update_mode == "anchored" || storage_owner_update_mode == "local_stitch") &&
+      if (storage_owner_update_mode == "local_stitch" &&
           (ip_distance || storage_owner_anchor_hints == 0 ||
-           storage_owner_anchor_beam_width == 0 || storage_owner_anchor_expand_cap == 0 ||
-           storage_owner_anchor_min_overlap < 0.0 || storage_owner_anchor_min_overlap > 1.0 ||
-           storage_owner_anchor_rehome_upsert)) {
-        std::cerr << "[ERROR]: invalid anchored/local_stitch storage-owner configuration; L2 is required and "
-                     "upsert rehome is not enabled in this protocol version" << std::endl;
+           storage_owner_anchor_beam_width == 0 || storage_owner_anchor_expand_cap == 0)) {
+        std::cerr << "[ERROR]: invalid local_stitch storage-owner configuration; L2 is required" << std::endl;
         exit_with_help_message(argv);
       }
       if (storage_owner_reverse_mode != "async" && storage_owner_reverse_mode != "sync") {
@@ -592,14 +546,12 @@ public:
         os << std::setw(width) << "storage prune max candidates: "
            << config.storage_owner_prune_max_candidates << std::endl;
         os << std::setw(width) << "storage update mode: " << config.storage_owner_update_mode << std::endl;
-        if (config.storage_owner_update_mode == "anchored" ||
-            config.storage_owner_update_mode == "local_stitch") {
+        if (config.storage_owner_update_mode == "local_stitch") {
           os << std::setw(width) << "anchor hints: " << config.storage_owner_anchor_hints << std::endl;
           os << std::setw(width) << "anchor beam width: " << config.storage_owner_anchor_beam_width << std::endl;
           os << std::setw(width) << "anchor expand cap: " << config.storage_owner_anchor_expand_cap << std::endl;
           os << std::setw(width) << "anchor remote cap: "
              << config.storage_owner_anchor_remote_rescue_cap << std::endl;
-          os << std::setw(width) << "anchor audit rate: " << config.storage_owner_anchor_audit_rate << std::endl;
         }
         os << std::setw(width) << "storage maintenance mode: "
            << config.storage_owner_maintenance_mode << std::endl;
@@ -655,7 +607,7 @@ public:
          << config.rdma_read_max_inflight_wrs << std::endl;
       os << std::setw(width) << "Query Batch Size: " << config.query_batch_size << std::endl;
       os << std::setw(width) << "Use RaBitQ: " << (config.use_rabitq ? "true" : "false") << std::endl;
-      os << std::setw(width) << "RaBitQ mode: " << config.rabitq_mode << std::endl;
+      os << std::setw(width) << "RaBitQ mode: cpu_gate" << std::endl;
       os << std::setw(width) << "RaBitQ gate width: " << config.rabitq_gate_width << std::endl;
       os << std::setw(width) << "RaBitQ gate max width: " << config.rabitq_gate_max_width << std::endl;
       os << std::setw(width) << "RaBitQ gate margin: " << config.rabitq_gate_margin << std::endl;
@@ -664,15 +616,9 @@ public:
       os << std::setw(width) << "RaBitQ coalesce target: " << config.rabitq_coalesce_target << std::endl;
       os << std::setw(width) << "RaBitQ coalesce min: " << config.rabitq_coalesce_min << std::endl;
       os << std::setw(width) << "RaBitQ coalesce wait(us): " << config.rabitq_coalesce_wait_us << std::endl;
-      os << std::setw(width) << "RaBitQ prefetch width: " << config.rabitq_prefetch_width << std::endl;
-      os << std::setw(width) << "RaBitQ prefetch min samples: "
-         << config.rabitq_prefetch_min_samples << std::endl;
-      os << std::setw(width) << "RaBitQ prefetch min hit ratio: "
-         << config.rabitq_prefetch_min_hit_ratio << std::endl;
       os << std::setw(width) << "RaBitQ warmup exact expansions: "
          << config.rabitq_warmup_exact_expansions << std::endl;
       os << std::setw(width) << "RaBitQ audit period: " << config.rabitq_audit_period << std::endl;
-      os << std::setw(width) << "RaBitQ safe epsilon: " << config.rabitq_safe_epsilon << std::endl;
       os << std::setw(width) << "RaBitQ strict recall: "
          << (config.rabitq_strict_recall ? "true" : "false") << std::endl;
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;

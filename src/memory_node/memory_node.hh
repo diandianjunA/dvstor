@@ -126,9 +126,6 @@ private:
   // Lifecycle and commands
   static u64 elapsed_ns_since(const std::chrono::steady_clock::time_point start);
   static u64 scale_ns(const u64 value, const u32 part, const u32 total);
-  static double storage_owner_candidate_overlap(const vec<RemotePtr>& lhs,
-                                                const vec<RemotePtr>& rhs,
-                                                u32 limit);
   static InsertBreakdownCounters scale_breakdown(const InsertBreakdownCounters& counters,
                                                  const u32 part,
                                                  const u32 total);
@@ -443,7 +440,6 @@ private:
   std::unordered_set<u64> peer_sync_completions_;
   std::unordered_map<u64, PeerPendingSend> peer_pending_sends_;
   vec<std::atomic<u32>> peer_rdma_read_outstanding_;
-  std::atomic<u64> storage_owner_anchor_insert_sequence_{0};
   vec<vec<std::atomic<u32>>> peer_rdma_read_qp_outstanding_;
   vec<vec<std::unique_ptr<std::mutex>>> peer_qp_send_mutexes_;
   std::atomic<u32> peer_sync_wr_id_counter_{1};

@@ -291,7 +291,6 @@ write_service_config() {
     if [[ -n "${QUERY_BATCH_SIZE:-}" ]]; then echo "query-batch-size = ${QUERY_BATCH_SIZE}"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then echo "use-rabitq = true"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then
-      echo "rabitq-mode = ${RABITQ_MODE:-exact_safe}"
       echo "rabitq-gate-width = ${RABITQ_GATE_WIDTH:-18}"
       echo "rabitq-gate-max-width = ${RABITQ_GATE_MAX_WIDTH:-36}"
       echo "rabitq-gate-margin = ${RABITQ_GATE_MARGIN:-0.08}"
@@ -300,12 +299,8 @@ write_service_config() {
       echo "rabitq-coalesce-target = ${RABITQ_COALESCE_TARGET:-64}"
       echo "rabitq-coalesce-min = ${RABITQ_COALESCE_MIN:-32}"
       echo "rabitq-coalesce-wait-us = ${RABITQ_COALESCE_WAIT_US:-6}"
-      echo "rabitq-prefetch-width = ${RABITQ_PREFETCH_WIDTH:-2}"
-      echo "rabitq-prefetch-min-samples = ${RABITQ_PREFETCH_MIN_SAMPLES:-16}"
-      echo "rabitq-prefetch-min-hit-ratio = ${RABITQ_PREFETCH_MIN_HIT_RATIO:-0.35}"
       echo "rabitq-warmup-exact-expansions = ${RABITQ_WARMUP_EXACT_EXPANSIONS:-6}"
       echo "rabitq-audit-period = ${RABITQ_AUDIT_PERIOD:-12}"
-      echo "rabitq-safe-epsilon = ${RABITQ_SAFE_EPSILON:-0.0001}"
       if [[ "${RABITQ_STRICT_RECALL:-1}" == "1" ]]; then
         echo "rabitq-strict-recall = true"
       else
@@ -327,13 +322,11 @@ write_service_config() {
       if [[ "$update_mode" != "exact" ]]; then
         echo "storage-owner-update-mode = ${update_mode}"
       fi
-      if [[ "$update_mode" == "anchored" ]]; then
+      if [[ "$update_mode" == "local_stitch" ]]; then
         echo "storage-owner-anchor-hints = ${STORAGE_OWNER_ANCHOR_HINTS:-4}"
         echo "storage-owner-anchor-beam-width = ${STORAGE_OWNER_ANCHOR_BEAM_WIDTH:-64}"
         echo "storage-owner-anchor-expand-cap = ${STORAGE_OWNER_ANCHOR_EXPAND_CAP:-16}"
         echo "storage-owner-anchor-remote-rescue-cap = ${STORAGE_OWNER_ANCHOR_REMOTE_RESCUE_CAP:-4}"
-        echo "storage-owner-anchor-audit-rate = ${STORAGE_OWNER_ANCHOR_AUDIT_RATE:-256}"
-        echo "storage-owner-anchor-min-overlap = ${STORAGE_OWNER_ANCHOR_MIN_OVERLAP:-0.5}"
       fi
       echo "storage-owner-maintenance-mode = ${STORAGE_OWNER_MAINTENANCE_MODE:-off}"
       echo "storage-owner-maintenance-workers = ${STORAGE_OWNER_MAINTENANCE_WORKERS:-0}"

@@ -102,9 +102,6 @@ struct InsertBreakdownCounters {
   u64 storage_owner_anchor_valid_hints{};
   u64 storage_owner_anchor_expansions{};
   u64 storage_owner_anchor_remote_expansions{};
-  u64 storage_owner_anchor_fallbacks{};
-  u64 storage_owner_anchor_audits{};
-  u64 storage_owner_anchor_audit_failures{};
 
   u64 total() const {
     return storage_owner_queue_wait_ns +

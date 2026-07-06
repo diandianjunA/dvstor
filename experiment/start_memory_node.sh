@@ -67,13 +67,11 @@ if [[ "$INSERT_EXECUTION" == "storage_owner" ]]; then
   if [[ "$update_mode" != "exact" ]]; then
     cmd+=(--storage-owner-update-mode "$update_mode")
   fi
-  if [[ "$update_mode" == "anchored" ]]; then
+  if [[ "$update_mode" == "local_stitch" ]]; then
     cmd+=(--storage-owner-anchor-hints "${STORAGE_OWNER_ANCHOR_HINTS:-4}")
     cmd+=(--storage-owner-anchor-beam-width "${STORAGE_OWNER_ANCHOR_BEAM_WIDTH:-64}")
     cmd+=(--storage-owner-anchor-expand-cap "${STORAGE_OWNER_ANCHOR_EXPAND_CAP:-16}")
     cmd+=(--storage-owner-anchor-remote-rescue-cap "${STORAGE_OWNER_ANCHOR_REMOTE_RESCUE_CAP:-4}")
-    cmd+=(--storage-owner-anchor-audit-rate "${STORAGE_OWNER_ANCHOR_AUDIT_RATE:-256}")
-    cmd+=(--storage-owner-anchor-min-overlap "${STORAGE_OWNER_ANCHOR_MIN_OVERLAP:-0.5}")
   fi
   cmd+=(--storage-owner-maintenance-mode "${STORAGE_OWNER_MAINTENANCE_MODE:-off}")
   cmd+=(--storage-owner-maintenance-workers "${STORAGE_OWNER_MAINTENANCE_WORKERS:-0}")

@@ -130,8 +130,7 @@ MemoryNode::MemoryNode(Configuration& config)
   }
 
   if (use_storage_owner_insert_ &&
-      (config.storage_owner_update_mode == "anchored" ||
-       config.storage_owner_update_mode == "local_stitch")) {
+      config.storage_owner_update_mode == "local_stitch") {
     storage_owner_anchor_index_ = std::make_unique<vamana::anchor::Index>();
     str anchor_error;
     lib_assert(startup_anchor_format == "owner_anchor_v1" &&
@@ -257,10 +256,6 @@ MemoryNode::InsertBreakdownCounters MemoryNode::scale_breakdown(const InsertBrea
   out.storage_owner_anchor_expansions = scale_ns(counters.storage_owner_anchor_expansions, part, total);
   out.storage_owner_anchor_remote_expansions =
     scale_ns(counters.storage_owner_anchor_remote_expansions, part, total);
-  out.storage_owner_anchor_fallbacks = scale_ns(counters.storage_owner_anchor_fallbacks, part, total);
-  out.storage_owner_anchor_audits = scale_ns(counters.storage_owner_anchor_audits, part, total);
-  out.storage_owner_anchor_audit_failures =
-    scale_ns(counters.storage_owner_anchor_audit_failures, part, total);
   return out;
 }
 

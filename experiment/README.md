@@ -8,14 +8,13 @@ isolates adaptive RDMA scheduling as the third contribution.
 | --- | --- | --- |
 | `00_baseline` | storage-owner exact search/update substrate | baseline, no paper contribution |
 | `01_rabitq_expension_aware` | Contribution 1 | RaBitQ-aware expansion and GPU query pipeline |
-| `02_rabitq_expension_aware_aldi` | Contribution 1 + 2 | add ALDI and METIS/locality-oriented placement |
-| `03_rabitq_gpu_pipeline_aldi_rdma` | Contribution 1 + 2 + 3 | add adaptive multi-QP RDMA scheduling |
+| `02_rabitq_expension_aware_two_stage_aldi` | Contribution 1 + 2 | add local-stitch two-stage ALDI and METIS/locality-oriented placement |
+| `03_rabitq_expension_aware_two_stage_aldi_rdma` | Contribution 1 + 2 + 3 | add adaptive multi-QP RDMA scheduling |
 
 Contribution 1 includes the compute-side RaBitQ proxy gate because the current
 measurements show it behaves as part of the query execution pipeline: it trades
-CPU gate work for fewer full-vector RDMA reads. The default profile uses
-`RABITQ_MODE=cpu_gate`. Use `RABITQ_MODE=exact_safe` only as a conservative
-lower-bound control.
+CPU gate work for fewer full-vector RDMA reads. RaBitQ now has a single
+CPU-gate execution path in these experiments.
 
 Contribution 3 is the adaptive RDMA scheduler. It should be evaluated after
 Contribution 2 because ALDI + METIS increases edge locality, which can reduce
@@ -68,15 +67,8 @@ To isolate Contribution 1 and Contribution 3 on query performance:
 
 ```bash
 WORKLOAD=query WARMUP_SECONDS=10 MEASURE_SECONDS=60 ./experiment/run_breakdown.sh 01_rabitq_expension_aware
-WORKLOAD=query WARMUP_SECONDS=10 MEASURE_SECONDS=60 ./experiment/run_breakdown.sh 02_rabitq_expension_aware_aldi
-WORKLOAD=query WARMUP_SECONDS=10 MEASURE_SECONDS=60 ./experiment/run_breakdown.sh 03_rabitq_gpu_pipeline_aldi_rdma
-```
-
-To compare the conservative RaBitQ gate against the performance gate:
-
-```bash
-RABITQ_MODE=exact_safe WORKLOAD=query ./experiment/run_breakdown.sh 01_rabitq_expension_aware
-RABITQ_MODE=cpu_gate WORKLOAD=query ./experiment/run_breakdown.sh 01_rabitq_expension_aware
+WORKLOAD=query WARMUP_SECONDS=10 MEASURE_SECONDS=60 ./experiment/run_breakdown.sh 02_rabitq_expension_aware_two_stage_aldi
+WORKLOAD=query WARMUP_SECONDS=10 MEASURE_SECONDS=60 ./experiment/run_breakdown.sh 03_rabitq_expension_aware_two_stage_aldi_rdma
 ```
 
 ## Summarize Latest Reports
@@ -86,5 +78,5 @@ RABITQ_MODE=cpu_gate WORKLOAD=query ./experiment/run_breakdown.sh 01_rabitq_expe
 ```
 
 The summary prints query/write throughput, recall, p50 latencies, vector RDMA
-traffic, RaBitQ drop ratio, RDMA active-node/QP indicators, and ALDI audit
-failure rate.
+traffic, RaBitQ drop ratio, RDMA active-node/QP indicators, and ALDI repair
+progress.

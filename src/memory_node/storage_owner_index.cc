@@ -57,8 +57,7 @@ u32 storage_owner_prune_candidate_limit(const Configuration& config) {
 }
 
 bool anchor_update_enabled(const Configuration& config, const vec<RemotePtr>& hints) {
-  return (config.storage_owner_update_mode == "anchored" ||
-          config.storage_owner_update_mode == "local_stitch") && !hints.empty();
+  return config.storage_owner_update_mode == "local_stitch" && !hints.empty();
 }
 
 bool local_stitch_enabled(const Configuration& config) {
@@ -80,22 +79,6 @@ void parse_remote_snapshot(RemotePtr rptr, const byte_t* ptr, NodeSnapshot& snap
 }
 
 }  // namespace
-
-double MemoryNode::storage_owner_candidate_overlap(const vec<RemotePtr>& lhs,
-                                                   const vec<RemotePtr>& rhs,
-                                                   u32 limit) {
-  const size_t lhs_size = std::min<size_t>(lhs.size(), limit);
-  const size_t rhs_size = std::min<size_t>(rhs.size(), limit);
-  const size_t denominator = std::max<size_t>(1, std::min(lhs_size, rhs_size));
-  hashset_t<RemotePtr> left;
-  left.reserve(lhs_size);
-  for (size_t i = 0; i < lhs_size; ++i) left.insert(lhs[i]);
-  size_t matches = 0;
-  for (size_t i = 0; i < rhs_size; ++i) {
-    if (left.contains(rhs[i])) ++matches;
-  }
-  return static_cast<double>(matches) / static_cast<double>(denominator);
-}
 
 RemotePtr MemoryNode::allocate_local_node() {
   size_t node_size = VamanaNode::allocation_size();
@@ -1381,7 +1364,6 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   bool medoid_loaded = false;
   vec<RemotePtr> owned_candidates;
   const vec<RemotePtr>* candidates = nullptr;
-  vec<RemotePtr> audit_exact_candidates;
 
   if (use_anchors) {
     auto t_search = std::chrono::steady_clock::now();
@@ -1399,43 +1381,6 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
     breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
     owned_candidates = storage_owner_async_candidates_[thread.id][thread.running_coroutine];
     candidates = &owned_candidates;
-
-    const u64 sequence = storage_owner_anchor_insert_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
-    const bool audit = !local_stitch &&
-                       config.storage_owner_anchor_audit_rate != 0 &&
-                       sequence % config.storage_owner_anchor_audit_rate == 0;
-    const bool insufficient = !local_stitch && owned_candidates.size() < config.R;
-    if (audit || insufficient) {
-      auto t_medoid = std::chrono::steady_clock::now();
-      medoid_ptr = co_await async_read_global_medoid(thread);
-      medoid_loaded = true;
-      breakdown.storage_owner_medoid_ns += elapsed_ns_since(t_medoid);
-      if (!medoid_ptr.is_null()) {
-        t_search = std::chrono::steady_clock::now();
-        auto exact_search = beam_search_candidates_async(components, medoid_ptr, config, thread, &breakdown);
-        co_await std::suspend_always{};
-        while (!exact_search.handle.done()) {
-          if (thread.is_ready(thread.running_coroutine)) {
-            exact_search.handle.resume();
-          } else {
-            co_await std::suspend_always{};
-          }
-        }
-        exact_search.handle.destroy();
-        breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
-        const vec<RemotePtr>& exact = storage_owner_async_candidates_[thread.id][thread.running_coroutine];
-        if (audit) {
-          ++breakdown.storage_owner_anchor_audits;
-        }
-        if (insufficient) {
-          owned_candidates = exact;
-          candidates = &owned_candidates;
-          ++breakdown.storage_owner_anchor_fallbacks;
-        } else if (audit) {
-          audit_exact_candidates = exact;
-        }
-      }
-    }
   }
 
   if (!use_anchors) {
@@ -1489,19 +1434,6 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   vec<RemotePtr> selected_neighbors = robust_prune_cpu(reinterpret_cast<const byte_t*>(components.data()),
                                                        VectorDType::float32, *candidates, empty_skip, config, &breakdown);
   breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
-  if (!audit_exact_candidates.empty()) {
-    t_prune = std::chrono::steady_clock::now();
-    vec<RemotePtr> exact_selected = robust_prune_cpu(
-      reinterpret_cast<const byte_t*>(components.data()), VectorDType::float32,
-      audit_exact_candidates, empty_skip, config, &breakdown);
-    breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
-    if (storage_owner_candidate_overlap(selected_neighbors, exact_selected, config.R) <
-        config.storage_owner_anchor_min_overlap) {
-      selected_neighbors = std::move(exact_selected);
-      ++breakdown.storage_owner_anchor_fallbacks;
-      ++breakdown.storage_owner_anchor_audit_failures;
-    }
-  }
   const RemotePtr new_ptr = allocate_local_node();
   job.new_ptr = new_ptr;
   auto t_write = std::chrono::steady_clock::now();

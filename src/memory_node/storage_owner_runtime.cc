@@ -6,8 +6,7 @@
 namespace {
 
 bool storage_owner_anchor_mode(const configuration::IndexConfiguration& config) {
-  return config.storage_owner_update_mode == "anchored" ||
-         config.storage_owner_update_mode == "local_stitch";
+  return config.storage_owner_update_mode == "local_stitch";
 }
 
 bool storage_owner_local_stitch_mode(const configuration::IndexConfiguration& config) {
@@ -671,38 +670,11 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     const bool use_anchors = storage_owner_anchor_mode(config) &&
                              !item_anchor_hints.empty();
     vec<RemotePtr> candidates;
-    vec<RemotePtr> audit_exact_candidates;
     if (use_anchors) {
       auto t_search = std::chrono::steady_clock::now();
       candidates = anchor_search_candidates(components, item_anchor_hints, config,
                                             &breakdown, local_stitch);
       breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
-
-      const u64 sequence = storage_owner_anchor_insert_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
-      const bool audit = !local_stitch &&
-                         config.storage_owner_anchor_audit_rate != 0 &&
-                         sequence % config.storage_owner_anchor_audit_rate == 0;
-      const bool insufficient = !local_stitch && candidates.size() < config.R;
-      if (audit || insufficient) {
-        if (!medoid_loaded) {
-          auto t_medoid = std::chrono::steady_clock::now();
-          medoid_ptr = read_global_medoid();
-          medoid_loaded = true;
-          breakdown.storage_owner_medoid_ns += elapsed_ns_since(t_medoid);
-        }
-        if (!medoid_ptr.is_null()) {
-          t_search = std::chrono::steady_clock::now();
-          const vec<RemotePtr> exact = beam_search_candidates(components, medoid_ptr, config, &breakdown);
-          breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
-          if (audit) ++breakdown.storage_owner_anchor_audits;
-          if (insufficient) {
-            candidates = exact;
-            ++breakdown.storage_owner_anchor_fallbacks;
-          } else if (audit) {
-            audit_exact_candidates = exact;
-          }
-        }
-      }
     } else if (!medoid_loaded) {
       auto t_medoid = std::chrono::steady_clock::now();
       medoid_ptr = read_global_medoid();
@@ -747,19 +719,6 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     vec<RemotePtr> selected_neighbors = robust_prune_cpu(reinterpret_cast<const byte_t*>(components.data()),
                                                          VectorDType::float32, candidates, empty_skip, config, &breakdown);
     breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
-    if (!audit_exact_candidates.empty()) {
-      t_prune = std::chrono::steady_clock::now();
-      vec<RemotePtr> exact_selected = robust_prune_cpu(
-        reinterpret_cast<const byte_t*>(components.data()), VectorDType::float32,
-        audit_exact_candidates, empty_skip, config, &breakdown);
-      breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
-      if (storage_owner_candidate_overlap(selected_neighbors, exact_selected, config.R) <
-          config.storage_owner_anchor_min_overlap) {
-        selected_neighbors = std::move(exact_selected);
-        ++breakdown.storage_owner_anchor_fallbacks;
-        ++breakdown.storage_owner_anchor_audit_failures;
-      }
-    }
     const RemotePtr new_ptr = allocate_local_node();
     if (results != nullptr) {
       (*results)[idx].new_rptr_raw = new_ptr.raw_address;
