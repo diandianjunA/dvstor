@@ -290,14 +290,11 @@
         if (use_rabitq_) {
             lib_assert(rabitq_cache_ != nullptr,
                        "RaBitQ CPU gate requires a loaded RFQ5 sidecar");
-            const auto t_query_h2d = breakdown_start(thread);
             auto* rabitq_rotated_query = static_cast<float*>(gs.h_query);
             VamanaNode::compute_rotated_query(query_data, query_dtype,
                                               rabitq_rotated_query, &rabitq_query_norm2);
             const u32 cache_code_bits = static_cast<u32>(rabitq_cache_->code_bits());
             rabitq_query_lut = rabitq::build_query_lut(rabitq_rotated_query, cache_code_bits);
-            add_breakdown_subcategory(thread,
-                service::breakdown::Subcategory::cpu_query_rabitq_gate, t_query_h2d);
         }
 
         while (true) {
