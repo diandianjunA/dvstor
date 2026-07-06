@@ -13,7 +13,7 @@
 namespace {
 
 constexpr u64 kMaintenanceObservationPeriodNs = 5ull * 1000ull * 1000ull * 1000ull;
-constexpr u64 kStitchCompactionDelayNs = 3ull * 1000ull * 1000ull * 1000ull;
+constexpr u64 kStitchCompactionMaxDelayNs = 3ull * 1000ull * 1000ull * 1000ull;
 constexpr size_t kForegroundQueueYieldMultiplier = 2;
 
 u64 steady_now_ns() {
@@ -131,7 +131,9 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                ", resource_gated_parallel_stitching=true)");
   print_status("storage-owner maintenance tuning: mode=" + config.storage_owner_maintenance_mode +
                " local_stitch=" + (config.storage_owner_update_mode == "local_stitch" ? "true" : "false") +
-               " compaction_delay_ms=" + std::to_string(kStitchCompactionDelayNs / 1000000ull));
+               " compaction_batch_target=" + std::to_string(config.storage_owner_batch_max) +
+               " compaction_max_delay_ms=" +
+               std::to_string(kStitchCompactionMaxDelayNs / 1000000ull));
 }
 
 void MemoryNode::stop_storage_owner_maintenance_runtime() {
@@ -224,8 +226,12 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
                std::to_string(avg_finalize_ms) +
                " max_stitch_delay_ms=" +
                std::to_string(static_cast<double>(max_finalize_latency_ns) / 1e6) +
-               " compaction_delay_ms=" +
-               std::to_string(kStitchCompactionDelayNs / 1000000ull) +
+               " compaction_batch_target=" +
+               std::to_string(storage_worker_config_ != nullptr
+                                ? storage_worker_config_->storage_owner_batch_max
+                                : 0) +
+               " compaction_max_delay_ms=" +
+               std::to_string(kStitchCompactionMaxDelayNs / 1000000ull) +
                " stitch_rate_per_sec=" +
                std::to_string(repair_rate) +
                " failed=" +
@@ -440,12 +446,15 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         return;
       }
       if (storage_owner_cleanup_tasks_.empty() && !storage_owner_stitch_tasks_.empty()) {
+        const size_t batch_limit = std::max<u32>(1, config.storage_owner_batch_max);
         const auto ready_at = storage_owner_stitch_tasks_.front().queued_at +
-                              std::chrono::nanoseconds(kStitchCompactionDelayNs);
-        if (std::chrono::steady_clock::now() < ready_at) {
+                              std::chrono::nanoseconds(kStitchCompactionMaxDelayNs);
+        if (storage_owner_stitch_tasks_.size() < batch_limit &&
+            std::chrono::steady_clock::now() < ready_at) {
           storage_owner_maintenance_cv_.wait_until(lock, ready_at, [&]() {
             return storage_owner_maintenance_shutdown_.load(std::memory_order_acquire) ||
-                   !storage_owner_cleanup_tasks_.empty();
+                   !storage_owner_cleanup_tasks_.empty() ||
+                   storage_owner_stitch_tasks_.size() >= batch_limit;
           });
           continue;
         }
@@ -478,15 +487,15 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         continue;
       }
       const auto now = std::chrono::steady_clock::now();
-      const auto ready_for_compaction = [now](const StorageOwnerMaintenanceTask& task) {
-        return now >= task.queued_at + std::chrono::nanoseconds(kStitchCompactionDelayNs);
-      };
-      if (!storage_owner_stitch_tasks_.empty() &&
-          ready_for_compaction(storage_owner_stitch_tasks_.front())) {
-        const size_t batch_limit = std::max<u32>(1, config.storage_owner_batch_max);
+      const size_t batch_limit = std::max<u32>(1, config.storage_owner_batch_max);
+      const bool stitch_batch_full = storage_owner_stitch_tasks_.size() >= batch_limit;
+      const bool stitch_wait_expired =
+        !storage_owner_stitch_tasks_.empty() &&
+        now >= storage_owner_stitch_tasks_.front().queued_at +
+                 std::chrono::nanoseconds(kStitchCompactionMaxDelayNs);
+      if (!storage_owner_stitch_tasks_.empty() && (stitch_batch_full || stitch_wait_expired)) {
         stitch_batch.reserve(batch_limit);
-        while (!storage_owner_stitch_tasks_.empty() && stitch_batch.size() < batch_limit &&
-               ready_for_compaction(storage_owner_stitch_tasks_.front())) {
+        while (!storage_owner_stitch_tasks_.empty() && stitch_batch.size() < batch_limit) {
           stitch_batch.push_back(std::move(storage_owner_stitch_tasks_.front()));
           storage_owner_stitch_tasks_.pop_front();
         }
