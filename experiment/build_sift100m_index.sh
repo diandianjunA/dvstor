@@ -21,7 +21,7 @@ cmd=("$BUILD_DIR/vamana_offline_builder"
   --max-vectors "$MAX_VECTORS"
   --vector-data-type "$VECTOR_DATA_TYPE"
   --storage-format "$STORAGE_FORMAT"
-  --partition-max-degree "${PARTITION_MAX_DEGREE:-48}"
+  --partition-max-degree "${PARTITION_MAX_DEGREE:-16}"
   --partition-imbalance "${PARTITION_IMBALANCE:-1.03}"
   --skip-sanity-check
   --use-rabitq)

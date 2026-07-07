@@ -115,6 +115,16 @@ if (DVSTOR_STORAGE_NODE_ONLY)
     target_link_libraries(dvstor_memory_node rdma_library)
 
     if (DVSTOR_BUILD_EXECUTABLES)
+        add_executable(vamana_offline_builder
+            tools/vamana_offline_builder.cc
+            ${DVSTOR_OFFLINE_BUILDER_SOURCES}
+        )
+        dvstor_target_tool_includes(vamana_offline_builder)
+        target_link_libraries(vamana_offline_builder
+            rdma_library
+        )
+        target_link_metis(vamana_offline_builder)
+
         add_vamana_metis_repartitioner_target()
         add_vamana_bfs_repartitioner_target()
 
@@ -123,6 +133,11 @@ if (DVSTOR_STORAGE_NODE_ONLY)
         )
         dvstor_target_common_includes(vamana_rabitq_sidecar_converter)
         target_link_libraries(vamana_rabitq_sidecar_converter rdma_library)
+
+        add_executable(generate_sift101m_recall_data
+            tools/generate_sift101m_recall_data.cc
+        )
+        dvstor_target_tool_includes(generate_sift101m_recall_data)
     endif ()
 else ()
     # GPU kernels library (compiled by nvcc)
@@ -202,6 +217,11 @@ else ()
         )
         dvstor_target_common_includes(vamana_rabitq_sidecar_converter)
         target_link_libraries(vamana_rabitq_sidecar_converter rdma_library)
+
+        add_executable(generate_sift101m_recall_data
+            tools/generate_sift101m_recall_data.cc
+        )
+        dvstor_target_tool_includes(generate_sift101m_recall_data)
 
         add_executable(dvstor_breakdown_benchmark
             tools/dvstor_breakdown_benchmark.cc
