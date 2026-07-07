@@ -4,6 +4,7 @@
 #include <cctype>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <library/configuration.hh>
 
 #include "constants.hh"
@@ -126,6 +127,7 @@ public:
     storage_owner_maintenance_mode = normalize_mode(storage_owner_maintenance_mode);
     rdma_read_batch_mode = normalize_mode(rdma_read_batch_mode);
 
+    validate_common_options(argv);
     if (!is_server) {
       validate_compute_node_options(argv);
     }
@@ -134,6 +136,26 @@ public:
   }
 
 private:
+  void validate_common_options(char** argv) const {
+    if (dim == 0 || R == 0 || max_vectors == 0 || num_coroutines == 0) {
+      std::cerr << "[ERROR]: Parameters dim, R, max-vectors, and coroutines must be > 0" << std::endl;
+      exit_with_help_message(argv);
+    }
+    if (R > std::numeric_limits<u8>::max()) {
+      std::cerr << "[ERROR]: --R must be <= 255 because the on-wire node format stores edge_count in one byte"
+                << std::endl;
+      exit_with_help_message(argv);
+    }
+    if (beam_width_construction == 0 || query_batch_size == 0) {
+      std::cerr << "[ERROR]: --beam-width-construction and --query-batch-size must be > 0" << std::endl;
+      exit_with_help_message(argv);
+    }
+    if (cn_memory_gb == 0 || mn_memory_gb == 0) {
+      std::cerr << "[ERROR]: --cn-memory and --mn-memory must be > 0" << std::endl;
+      exit_with_help_message(argv);
+    }
+  }
+
   void add_options() {
     desc.add_options()("data-path,d",
                        po::value<filepath_t>(&data_path),
@@ -334,6 +356,10 @@ private:
       std::cerr << "[ERROR]: Parameters threads, beam-width (ef-search), k, and dim are required" << std::endl;
       exit_with_help_message(argv);
     }
+    if (beam_width < k) {
+      std::cerr << "[ERROR]: --beam-width must be >= k" << std::endl;
+      exit_with_help_message(argv);
+    }
 
     if (store_index && load_index) {
       std::cerr << "[ERROR]: --store-index and --load-index cannot be used in conjunction" << std::endl;
@@ -411,6 +437,11 @@ private:
       }
       if (storage_owner_batch_max == 0) {
         std::cerr << "[ERROR]: --storage-owner-batch-max must be > 0" << std::endl;
+        exit_with_help_message(argv);
+      }
+      if (storage_owner_batch_max > std::numeric_limits<u32>::max() / R) {
+        std::cerr << "[ERROR]: --storage-owner-batch-max is too large for R; response invalidation capacity "
+                     "must fit in u32" << std::endl;
         exit_with_help_message(argv);
       }
       if (storage_owner_peer_rdma_tokens == 0) {

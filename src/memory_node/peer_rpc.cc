@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <limits>
 
 namespace {
 
@@ -28,8 +29,12 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
     return;
   }
 
+  const u64 max_reverse_update_ops =
+    static_cast<u64>(config.R) * static_cast<u64>(config.storage_owner_batch_max);
+  lib_assert(max_reverse_update_ops <= std::numeric_limits<u32>::max(),
+             "storage-owner reverse-update RPC batch is too large for the wire format");
   const size_t reverse_update_bytes =
-    service::storage_owner::reverse_update_request_bytes(config.R * config.storage_owner_batch_max);
+    service::storage_owner::reverse_update_request_bytes(static_cast<u32>(max_reverse_update_ops));
   const size_t stitch_request_bytes =
     service::storage_owner::stitch_search_request_bytes(config.storage_owner_batch_max);
   const size_t stitch_response_bytes =
@@ -39,6 +44,8 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
               service::storage_owner::reverse_update_response_bytes(),
               stitch_request_bytes,
               stitch_response_bytes}));
+  lib_assert(peer_rpc_runtime_.message_bytes <= std::numeric_limits<u32>::max(),
+             "storage-owner peer RPC message is too large for verbs SGEs");
   const u32 remote_peer_count = num_storage_nodes_ - 1;
   const u32 max_recv_wr = static_cast<u32>(std::max<i32>(1, config.max_recv_queue_wr));
   const u32 max_slots_per_peer = std::max<u32>(1, max_recv_wr / remote_peer_count);
@@ -1093,10 +1100,16 @@ bool MemoryNode::send_peer_op_batch_direct(u32 target_shard,
     return true;
   }
 
-  const u32 max_items = std::max<u32>(1, config.R * config.storage_owner_batch_max);
+  const u64 max_items_u64 =
+    std::max<u64>(1, static_cast<u64>(config.R) * config.storage_owner_batch_max);
+  lib_assert(max_items_u64 <= std::numeric_limits<u32>::max(),
+             "storage-owner reverse-update RPC batch is too large for the wire format");
+  const u32 max_items = static_cast<u32>(max_items_u64);
   for (size_t begin = 0; begin < ops.size(); begin += max_items) {
     const u32 item_count = static_cast<u32>(std::min<size_t>(ops.size() - begin, max_items));
     const size_t bytes = service::storage_owner::reverse_update_request_bytes(item_count);
+    lib_assert(bytes <= peer_rpc_runtime_.message_bytes,
+               "storage-owner peer RPC message exceeds the registered slot size");
     vec<byte_t> message(bytes);
     auto* header = reinterpret_cast<service::storage_owner::PeerRpcHeader*>(message.data());
     header->magic = service::storage_owner::kPeerRpcMagic;

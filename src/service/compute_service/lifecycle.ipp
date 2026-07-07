@@ -180,8 +180,16 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     config_.effective_rdma_qp_pool_size(), rdma_batch_options);
   // Initialize GPU buffers for each compute thread
   const u32 query_batch_factor = std::max<u32>(1, config_.query_batch_size);
-  const u32 max_batch = std::max(config_.beam_width * config_.expansion_batch * query_batch_factor,
-                                   config_.beam_width_construction);
+  const u64 query_frontier_batch =
+    static_cast<u64>(std::max(config_.R, config_.beam_width)) *
+    config_.expansion_batch * query_batch_factor;
+  const u64 construction_batch = config_.beam_width_construction;
+  const u64 overflow_prune_batch = static_cast<u64>(config_.R) + 1u;
+  const u64 max_batch_u64 =
+    std::max(std::max(query_frontier_batch, construction_batch), overflow_prune_batch);
+  lib_assert(max_batch_u64 <= std::numeric_limits<u32>::max(),
+             "GPU candidate batch capacity exceeds u32; reduce R, expansion-batch, or query-batch-size");
+  const u32 max_batch = static_cast<u32>(max_batch_u64);
   const size_t query_buffer_bytes = std::max(
     static_cast<size_t>(config_.dim) * sizeof(element_t) * query_batch_factor,
     static_cast<size_t>(VamanaNode::rabitq_code_bits()) * sizeof(float));

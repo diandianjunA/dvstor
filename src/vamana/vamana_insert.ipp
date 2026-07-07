@@ -117,6 +117,10 @@
 
             // Batch read full vectors for exact distance
             const u32 n_batch = unvisited.size();
+            lib_assert(n_batch <= gpu.max_batch(),
+                "insert search candidate batch exceeds GPU/RDMA buffer capacity: candidates=" +
+                std::to_string(n_batch) + ", capacity=" + std::to_string(gpu.max_batch()) +
+                ", R=" + std::to_string(R_));
             const auto t_vector_fetch = breakdown_start(thread);
             auto vec_read = co_await rdma::vamana::batch_read_vectors(
                 unvisited, thread,
@@ -178,6 +182,10 @@
         add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_preprune_sort, t_preprune_sort);
 
         const u32 n_candidates = beam.size();
+        lib_assert(n_candidates <= gpu.max_batch(),
+            "insert prune candidate batch exceeds GPU/RDMA buffer capacity: candidates=" +
+            std::to_string(n_candidates) + ", capacity=" + std::to_string(gpu.max_batch()) +
+            ", construction_beam=" + std::to_string(beam_width_construction_));
 
         // Collect candidate RemotePtrs and distances (already sorted)
         const auto t_candidate_collect = breakdown_start(thread);
@@ -332,6 +340,10 @@
                 add_breakdown_subcategory(thread, service::breakdown::Subcategory::cpu_insert_overflow_prepare, t_overflow_prepare);
 
                 u32 n_all = all_candidate_ptrs.size();
+                lib_assert(n_all <= gpu.max_batch(),
+                    "insert overflow prune candidate batch exceeds GPU/RDMA buffer capacity: candidates=" +
+                    std::to_string(n_all) + ", capacity=" + std::to_string(gpu.max_batch()) +
+                    ", R=" + std::to_string(R_));
                 const u64 selected_upper_bound = std::min<u64>(R_, n_all);
                 const u64 pair_checks_upper_bound =
                     selected_upper_bound * static_cast<u64>(n_all) -

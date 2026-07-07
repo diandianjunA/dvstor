@@ -269,6 +269,9 @@ void ComputeService<Distance>::start_storage_insert_runtime() {
       anchor_mode ? config_.storage_owner_anchor_hints : 0));
   const size_t response_bytes =
     service::storage_owner::insert_batch_response_bytes(config_.storage_owner_batch_max);
+  lib_assert(request_bytes <= std::numeric_limits<u32>::max() &&
+             response_bytes <= std::numeric_limits<u32>::max(),
+             "storage_owner RPC message is too large for verbs SGEs; reduce batch size or vector dimension");
   const size_t max_inflight = static_cast<size_t>(owner_count) * rpc_depth;
   lib_assert(max_inflight <= static_cast<size_t>(config_.max_send_queue_wr),
              "storage_owner RPC depth exceeds compute send CQ capacity");
@@ -479,6 +482,12 @@ void ComputeService<Distance>::post_storage_owner_batch(
   const size_t response_size = service::storage_owner::insert_batch_response_bytes(item_count);
   auto& state = *storage_insert_owners_[owner_storage];
   auto& slot = state.slots[slot_id];
+  lib_assert(request_size <= slot.request_buffer.size() &&
+             response_size <= slot.response_buffer.size(),
+             "storage_owner RPC slot buffer is too small for this batch");
+  lib_assert(request_size <= std::numeric_limits<u32>::max() &&
+             response_size <= std::numeric_limits<u32>::max(),
+             "storage_owner RPC message is too large for verbs SGEs");
   slot.tasks = std::move(tasks);
   slot.samples.clear();
   slot.samples.reserve(slot.tasks.size());

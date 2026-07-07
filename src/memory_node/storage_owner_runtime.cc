@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <limits>
 
 namespace {
 
@@ -16,6 +17,9 @@ bool storage_owner_local_stitch_mode(const configuration::IndexConfiguration& co
 }  // namespace
 
 void MemoryNode::setup_insert_runtime(const Configuration& config) {
+  lib_assert(static_cast<u64>(config.storage_owner_batch_max) * VamanaNode::R <=
+               std::numeric_limits<u32>::max(),
+             "storage_owner invalidation capacity is too large for the wire format");
   const size_t insert_request_bytes = align_up(std::max(
     service::storage_owner::insert_batch_request_bytes(
       config.storage_owner_batch_max, VamanaNode::DIM,
@@ -27,6 +31,9 @@ void MemoryNode::setup_insert_runtime(const Configuration& config) {
   insert_runtime_.request_slot_count = std::max<u32>(1, config.storage_owner_rpc_depth);
   const size_t insert_response_bytes =
     align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max));
+  lib_assert(insert_request_bytes <= std::numeric_limits<u32>::max() &&
+             insert_response_bytes <= std::numeric_limits<u32>::max(),
+             "storage_owner RPC message is too large for verbs SGEs; reduce batch size or vector dimension");
   const size_t slot_count =
     static_cast<size_t>(num_clients_) * insert_runtime_.request_slot_count;
   lib_assert(slot_count <= static_cast<size_t>(config.max_recv_queue_wr),
@@ -227,6 +234,8 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
     const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(task.payload.data());
     const u32 item_count = item_counts[task_idx];
     const size_t response_size = service::storage_owner::insert_batch_response_bytes(item_count);
+    lib_assert(response_size <= std::numeric_limits<u32>::max(),
+               "storage_owner async response is too large for verbs SGEs");
     vec<byte_t> response_buffer(response_size);
     auto* response = reinterpret_cast<service::storage_owner::InsertBatchResponseHeader*>(response_buffer.data());
     response->magic = response_magics[task_idx];
@@ -492,6 +501,9 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
 
       const size_t response_bytes = handle_storage_insert_request(client_id, payload, bytes, config);
       lib_assert(response_bytes > 0, "invalid storage-owner insert request");
+      lib_assert(response_bytes <= response_slot_bytes(config) &&
+                 response_bytes <= std::numeric_limits<u32>::max(),
+                 "storage_owner response exceeds the registered response slot");
 
       cm_.client_qps[client_id]->post_send(
         *insert_runtime_.region,

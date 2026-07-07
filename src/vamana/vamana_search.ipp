@@ -426,6 +426,11 @@
                     if (pending_K == 0) break;
                     continue;
                 }
+                lib_assert(gate_indices.size() <= gpu.max_batch(),
+                    "RaBitQ exact candidate batch exceeds GPU/RDMA buffer capacity: candidates=" +
+                    std::to_string(gate_indices.size()) + ", capacity=" +
+                    std::to_string(gpu.max_batch()) + ", R=" + std::to_string(R_) +
+                    ", expansion_batch=" + std::to_string(expansion_batch_));
 
                 const auto t_exact_fetch = breakdown_start(thread);
                 const auto credit_waits_before = thread->stats.vector_rdma_credit_waits;
@@ -551,6 +556,11 @@
             }
 
             // ── Phase 2: vector / RaBitQ RDMA ──────────────────────────
+            lib_assert(n_batch <= gpu.max_batch(),
+                "query candidate batch exceeds GPU/RDMA buffer capacity: candidates=" +
+                std::to_string(n_batch) + ", capacity=" + std::to_string(gpu.max_batch()) +
+                ", R=" + std::to_string(R_) +
+                ", expansion_batch=" + std::to_string(expansion_batch_));
             gs.flip_query_candidate_buffer();
             uint8_t* staging = gs.current_query_candidate_vecs();
             const u32 staging_lkey = gs.current_query_candidate_vecs_lkey();
@@ -890,6 +900,11 @@
             }
 
             // Phase 3: vector RDMA for all_unvisited (one batch)
+            lib_assert(distance_n_batch <= gpu.max_batch(),
+                "batched query candidate batch exceeds GPU/RDMA buffer capacity: candidates=" +
+                std::to_string(distance_n_batch) + ", capacity=" +
+                std::to_string(gpu.max_batch()) + ", R=" + std::to_string(R_) +
+                ", expansion_batch=" + std::to_string(expansion_batch_));
             gs.flip_query_candidate_buffer();
             uint8_t* staging = gs.current_query_candidate_vecs();
             const u32 staging_lkey = gs.current_query_candidate_vecs_lkey();

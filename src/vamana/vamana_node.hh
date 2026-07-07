@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <ostream>
 
 #include <library/utils.hh>
@@ -62,11 +63,18 @@ public:
   static void init_static_storage(u32 dim,
                                   u32 max_degree,
                                   VectorDType vector_dtype = VectorDType::float32) {
+    lib_assert(dim > 0, "Vamana dimension must be > 0");
+    lib_assert(max_degree > 0, "Vamana max degree R must be > 0");
+    lib_assert(max_degree <= std::numeric_limits<u8>::max(),
+               "Vamana max degree R must be <= 255 because edge_count is stored in one byte");
+    const size_t bytes = vector_dtype_bytes(vector_dtype, dim);
+    lib_assert(bytes <= std::numeric_limits<u32>::max(),
+               "Vamana vector byte width exceeds the runtime layout limit");
     DIM = dim;
     R = max_degree;
     VECTOR_DTYPE = vector_dtype;
     VECTOR_COMPONENT_SIZE = static_cast<u32>(vector_dtype_component_size(vector_dtype));
-    VECTOR_BYTES = static_cast<u32>(vector_dtype_bytes(vector_dtype, dim));
+    VECTOR_BYTES = static_cast<u32>(bytes);
     NEIGHBORS_SIZE = max_degree * sizeof(u64);
   }
 
