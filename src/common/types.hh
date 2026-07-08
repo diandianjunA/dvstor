@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <unordered_map>
 #include <library/types.hh>
 
 #include "common/fast_hash.hh"
@@ -15,4 +16,4 @@ template <typename T>
 using hashset_t = fast_hash::FlatHashSet<T>;
 
 template <typename K, typename V>
-using hashmap_t = fast_hash::FlatHashMap<K, V>;
+using hashmap_t = std::unordered_map<K, V>;

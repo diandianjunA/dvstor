@@ -178,12 +178,10 @@ public:
         slots_[it.index_].state != State::full) {
       return end();
     }
-    slots_[it.index_].kv = {};
     slots_[it.index_].state = State::deleted;
     --size_;
     ++deleted_;
     iterator next(slots_.data(), slots_.size(), it.index_ + 1);
-    maybe_cleanup_deleted();
     return next;
   }
 
@@ -215,13 +213,7 @@ private:
 
   void ensure_insert_capacity() {
     if ((size_ + deleted_ + 1) * 10 >= slots_.size() * 7) {
-      rehash(slots_.size() * 2);
-    }
-  }
-
-  void maybe_cleanup_deleted() {
-    if (deleted_ > slots_.size() / 4) {
-      rehash(slots_.size());
+      rehash(deleted_ > size_ ? slots_.size() : slots_.size() * 2);
     }
   }
 
@@ -439,11 +431,11 @@ public:
         slots_[it.index_].state != State::full) {
       return end();
     }
+    slots_[it.index_].kv = {};
     slots_[it.index_].state = State::deleted;
     --size_;
     ++deleted_;
     iterator next(slots_.data(), slots_.size(), it.index_ + 1);
-    maybe_cleanup_deleted();
     return next;
   }
 
@@ -475,13 +467,7 @@ private:
 
   void ensure_insert_capacity() {
     if ((size_ + deleted_ + 1) * 10 >= slots_.size() * 7) {
-      rehash(slots_.size() * 2);
-    }
-  }
-
-  void maybe_cleanup_deleted() {
-    if (deleted_ > slots_.size() / 4) {
-      rehash(slots_.size());
+      rehash(deleted_ > size_ ? slots_.size() : slots_.size() * 2);
     }
   }
 
