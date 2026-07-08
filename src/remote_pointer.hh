@@ -50,3 +50,12 @@ struct std::hash<RemotePtr> {
     return h;
   }
 };
+
+template <>
+struct ankerl::unordered_dense::hash<RemotePtr> {
+  using is_avalanching = void;
+
+  size_t operator()(const RemotePtr& r) const noexcept {
+    return ankerl::unordered_dense::hash<u64>{}(r.raw_address);
+  }
+};

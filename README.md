@@ -25,7 +25,7 @@ dvstor/
 │   └── run_recall_test.sh  # Recall evaluation helper
 ├── experiment/             # SIFT100M experiment harness, profiles, and reports
 ├── rdma-library/           # RDMA low-level library (QP management, memory registration)
-├── thirdparty/             # Bundled third-party libraries (httplib, nlohmann/json, xoshiro)
+├── thirdparty/             # Bundled third-party libraries (ankerl, httplib, nlohmann/json, xoshiro)
 ├── structure/              # Architecture documentation (30-course series in Chinese)
 ├── reports/                # Performance reports and analysis scripts
 │   ├── breakdown/          # Breakdown benchmark result JSON/TXT files
@@ -53,6 +53,10 @@ The code also compiles without InfiniBand network cards.
 * numactl
 * vmtouch (to map index files into main memory)
 * axel (a download accelerator for the datasets)
+
+`ankerl::unordered_dense` is vendored under `thirdparty/ankerl` as a
+header-only dependency. It does not require a system package or machine-specific
+include/library path on compute nodes or storage nodes.
 
 For instance, to install the requirements on Debian, run the following command:
 ```

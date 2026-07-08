@@ -811,7 +811,7 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
     }
   }
 
-  std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
+  hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
   vec<StorageOwnerMaintenanceTask> finalized_tasks;
   finalized_tasks.reserve(valid_tasks.size());
   for (size_t item = 0; item < valid_tasks.size(); ++item) {
@@ -856,7 +856,7 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
     }
     unlock_node(task.target);
 
-    std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> task_remote_updates;
+    hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>> task_remote_updates;
     bool local_reverse_ok = true;
     for (const RemotePtr& neighbor : final_neighbors) {
       if (local_shard(neighbor.memory_node())) {
@@ -930,7 +930,7 @@ bool MemoryNode::cleanup_deleted_storage_owner_node(const StorageOwnerMaintenanc
   }
 
   const vec<RemotePtr> old_neighbors = read_preserved_neighbor_list(task.target);
-  std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_cleanup;
+  hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_cleanup;
   bool ok = true;
   for (const RemotePtr& neighbor : old_neighbors) {
     if (neighbor.is_null()) {

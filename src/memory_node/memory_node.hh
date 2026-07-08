@@ -379,8 +379,8 @@ private:
                                   u32 candidate_limit_override = 0);
   auto execute_storage_owner_insert_job_async(StorageOwnerThread& thread,
                                               StorageOwnerInsertJob& job,
-                                              std::unordered_map<u64, vec<RemotePtr>>& local_updates,
-                                              std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>>& remote_updates,
+                                              hashmap_t<u64, vec<RemotePtr>>& local_updates,
+                                              hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>>& remote_updates,
                                               InsertBreakdownCounters& breakdown,
                                               const Configuration& config) -> StorageOwnerInsertCoroutine;
   bool apply_local_reverse_update(RemotePtr target_ptr,
@@ -520,8 +520,8 @@ private:
   std::unique_ptr<vamana::anchor::Index> storage_owner_anchor_index_;
   bool owner_idmap_required_{false};
   std::mutex idmap_mutex_;
-  std::unordered_map<node_t, FreshnessEntry> idmap_;
-  std::unordered_set<node_t> mutations_inflight_;
+  hashmap_t<node_t, FreshnessEntry> idmap_;
+  hashset_t<node_t> mutations_inflight_;
 
   inline static thread_local StorageOwnerThread* current_storage_owner_thread_{nullptr};
 };

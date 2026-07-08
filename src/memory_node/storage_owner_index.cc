@@ -1329,8 +1329,8 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
 
 auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thread,
                                             StorageOwnerInsertJob& job,
-                                            std::unordered_map<u64, vec<RemotePtr>>& local_updates,
-                                            std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>>& remote_updates,
+                                            hashmap_t<u64, vec<RemotePtr>>& local_updates,
+                                            hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>>& remote_updates,
                                             InsertBreakdownCounters& breakdown,
                                             const Configuration& config) -> StorageOwnerInsertCoroutine {
   const auto components = span<const element_t>{reinterpret_cast<const element_t*>(job.vector_data.data()),

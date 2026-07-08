@@ -176,7 +176,7 @@ private:
     vec<StorageOwnerRpcSlot> slots;
     vec<StorageOwnerResponseSlot> response_slots;
     std::deque<u32> free_slots;
-    std::unordered_map<u64, u32> batch_to_slot;
+    hashmap_t<u64, u32> batch_to_slot;
     std::thread thread;
   };
 

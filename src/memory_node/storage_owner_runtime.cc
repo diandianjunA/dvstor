@@ -312,8 +312,8 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
     jobs.push_back(std::move(job));
   }
 
-  std::unordered_map<u64, vec<RemotePtr>> local_updates;
-  std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
+  hashmap_t<u64, vec<RemotePtr>> local_updates;
+  hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
 
   const u32 coroutine_count = static_cast<u32>(std::max<size_t>(1, thread.post_balances.size()));
   lib_assert(thread.id < storage_owner_async_candidates_.size(),
@@ -630,8 +630,8 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   RemotePtr medoid_ptr{};
   bool medoid_loaded = false;
   const bool maintenance_enabled = storage_owner_maintenance_enabled(config);
-  std::unordered_map<u64, vec<RemotePtr>> local_updates;
-  std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
+  hashmap_t<u64, vec<RemotePtr>> local_updates;
+  hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
   if (statuses != nullptr) {
     statuses->assign(item_count, static_cast<u32>(service::storage_owner::MutationStatus::failed));
   }
