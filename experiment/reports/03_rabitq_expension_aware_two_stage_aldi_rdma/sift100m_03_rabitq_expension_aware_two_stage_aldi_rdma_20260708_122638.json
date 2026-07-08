@@ -1,24 +1,24 @@
 {
   "bottleneck_summary": {
-    "insert": "insert breakdown\n  count: 22583\n  latency_ms: mean=22.1347 p50=15.0961 p95=59.924 p99=109.499\n  fine_grained_breakdown: disabled\n",
-    "query": "query breakdown\n  count: 332354\n  latency_ms: mean=2.78333 p50=2.54003 p95=4.57667 p99=6.08354\n  fine_grained_breakdown: disabled\n"
+    "insert": "insert breakdown\n  count: 15600\n  latency_ms: mean=34.4753 p50=25.6883 p95=86.147 p99=130.729\n  fine_grained_breakdown: disabled\n",
+    "query": "query breakdown\n  count: 215370\n  latency_ms: mean=4.36362 p50=4.18154 p95=6.4202 p99=7.85395\n  fine_grained_breakdown: disabled\n"
   },
   "insert_breakdown": {
-    "count": 22583,
+    "count": 15600,
     "fine_grained_breakdown_observed": false,
     "latency": {
-      "end_to_end_ns": 499866853295,
-      "mean_end_to_end_ns": 22134652,
+      "end_to_end_ns": 537814642166,
+      "mean_end_to_end_ns": 34475297,
       "mean_queue_wait_ns": 0,
-      "mean_service_ns": 22134652,
-      "p50_end_to_end_ns": 15096092,
-      "p50_service_ns": 15096092,
-      "p95_end_to_end_ns": 59923982,
-      "p95_service_ns": 59923982,
-      "p99_end_to_end_ns": 109499257,
-      "p99_service_ns": 109499257,
+      "mean_service_ns": 34475297,
+      "p50_end_to_end_ns": 25688345,
+      "p50_service_ns": 25688345,
+      "p95_end_to_end_ns": 86147041,
+      "p95_service_ns": 86147041,
+      "p99_end_to_end_ns": 130728916,
+      "p99_service_ns": 130728916,
       "queue_wait_ns": 0,
-      "service_ns": 499866853295
+      "service_ns": 537814642166
     },
     "operation": "insert",
     "utilization": {
@@ -51,16 +51,16 @@
     "insert_start_id": 101000000,
     "insert_vector_source": "/data/xjs/index/dvstor_sift100m/converted/insert_test.u8bin",
     "measure_mixed": {
-      "completed_deletes": 4530,
-      "completed_inserts": 22583,
-      "completed_reads": 332354,
-      "completed_upserts": 17979,
-      "completed_writes": 45092,
-      "issued_deletes": 4530,
-      "issued_inserts": 22583,
-      "issued_reads": 332354,
-      "issued_upserts": 17979,
-      "issued_writes": 45092
+      "completed_deletes": 3235,
+      "completed_inserts": 15600,
+      "completed_reads": 215370,
+      "completed_upserts": 12506,
+      "completed_writes": 31341,
+      "issued_deletes": 3235,
+      "issued_inserts": 15600,
+      "issued_reads": 215370,
+      "issued_upserts": 12506,
+      "issued_writes": 31341
     },
     "measure_ops": 1000,
     "measure_seconds": 120,
@@ -79,7 +79,7 @@
     "query_data_type": "uint8",
     "query_vector_bytes": 128,
     "rabitq_audit_period": 12,
-    "rabitq_cache_bytes": 1271220256,
+    "rabitq_cache_bytes": 1271220272,
     "rabitq_cache_code_bits": 88,
     "rabitq_cache_dynamic_live": 0,
     "rabitq_cache_dynamic_overflow": 0,
@@ -87,8 +87,8 @@
     "rabitq_cache_entry_bytes": 12,
     "rabitq_cache_max_ratio": 0.1,
     "rabitq_cache_numa_interleaved": true,
-    "rabitq_cache_override_bitmap_bytes": 12500000,
-    "rabitq_cache_ratio": 0.0993140825,
+    "rabitq_cache_override_bitmap_bytes": 12500016,
+    "rabitq_cache_ratio": 0.09931408375,
     "rabitq_coalesce_min": 32,
     "rabitq_coalesce_target": 64,
     "rabitq_coalesce_wait_us": 6,
@@ -108,16 +108,16 @@
     "vector_component_size": 1,
     "vector_data_type": "uint8",
     "warmup_mixed": {
-      "completed_deletes": 775,
-      "completed_inserts": 3836,
-      "completed_reads": 85316,
-      "completed_upserts": 3039,
-      "completed_writes": 7650,
-      "issued_deletes": 775,
-      "issued_inserts": 3836,
-      "issued_reads": 85316,
-      "issued_upserts": 3039,
-      "issued_writes": 7650
+      "completed_deletes": 603,
+      "completed_inserts": 3014,
+      "completed_reads": 55015,
+      "completed_upserts": 2387,
+      "completed_writes": 6004,
+      "issued_deletes": 603,
+      "issued_inserts": 3014,
+      "issued_reads": 55015,
+      "issued_upserts": 2387,
+      "issued_writes": 6004
     },
     "warmup_ops": 100,
     "warmup_seconds": 30,
@@ -127,21 +127,21 @@
     "write_upsert_ratio": 0.4
   },
   "query_breakdown": {
-    "count": 332354,
+    "count": 215370,
     "fine_grained_breakdown_observed": false,
     "latency": {
-      "end_to_end_ns": 925050504191,
-      "mean_end_to_end_ns": 2783328,
-      "mean_queue_wait_ns": 193669,
-      "mean_service_ns": 2589659,
-      "p50_end_to_end_ns": 2540026,
-      "p50_service_ns": 2347111,
-      "p95_end_to_end_ns": 4576671,
-      "p95_service_ns": 4378171,
-      "p99_end_to_end_ns": 6083542,
-      "p99_service_ns": 5884637,
-      "queue_wait_ns": 64366740694,
-      "service_ns": 860683763497
+      "end_to_end_ns": 939793700241,
+      "mean_end_to_end_ns": 4363623,
+      "mean_queue_wait_ns": 194103,
+      "mean_service_ns": 4169520,
+      "p50_end_to_end_ns": 4181542,
+      "p50_service_ns": 3987700,
+      "p95_end_to_end_ns": 6420198,
+      "p95_service_ns": 6224967,
+      "p99_end_to_end_ns": 7853952,
+      "p99_service_ns": 7657645,
+      "queue_wait_ns": 41804006657,
+      "service_ns": 897989693584
     },
     "operation": "query",
     "utilization": {
@@ -161,7 +161,7 @@
     "passed": true,
     "phase": "before_performance",
     "queries": 1000,
-    "recall": 0.8494999999999959
+    "recall": 0.9307999999999947
   },
   "static_gt_post_recall": {
     "groundtruth_file": "/data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin",
@@ -170,7 +170,7 @@
     "passed": true,
     "phase": "after_performance",
     "queries": 1000,
-    "recall": 0.8491999999999956
+    "recall": 0.9304999999999948
   },
   "system_counters": {
     "d2h_bytes": 0,
@@ -179,18 +179,18 @@
     "rdma_write_bytes": 0
   },
   "throughput": {
-    "delete_ops": 4530,
-    "delete_ops_per_sec": 37.75,
+    "delete_ops": 3235,
+    "delete_ops_per_sec": 26.958333333333332,
     "duration_seconds": 120.0,
-    "insert_ops": 22583,
-    "insert_ops_per_sec": 188.19166666666666,
-    "query_ops": 332354,
-    "query_ops_per_sec": 2769.616666666667,
-    "total_ops": 377446,
-    "total_ops_per_sec": 3145.383333333333,
-    "upsert_ops": 17979,
-    "upsert_ops_per_sec": 149.825,
-    "write_ops": 45092,
-    "write_ops_per_sec": 375.76666666666665
+    "insert_ops": 15600,
+    "insert_ops_per_sec": 130.0,
+    "query_ops": 215370,
+    "query_ops_per_sec": 1794.75,
+    "total_ops": 246711,
+    "total_ops_per_sec": 2055.925,
+    "upsert_ops": 12506,
+    "upsert_ops_per_sec": 104.21666666666667,
+    "write_ops": 31341,
+    "write_ops_per_sec": 261.175
   }
 }
