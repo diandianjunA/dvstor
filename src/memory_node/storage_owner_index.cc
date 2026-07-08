@@ -114,7 +114,11 @@ bool MemoryNode::load_owner_idmap(const filepath_t& index_prefix) {
     std::cerr << "[storage-owner] invalid idmap sidecar: " << path << std::endl;
     return false;
   }
-  idmap_.reserve(static_cast<size_t>(header.entry_count));
+  const u64 dynamic_headroom = std::max<u64>(1024ull * 1024ull, header.entry_count / 20);
+  const u64 reserve_count = header.entry_count + dynamic_headroom;
+  // Reserve dynamic-write headroom up front; storage-owner inserts keep adding
+  // idmap entries and dense maps grow by reallocating large contiguous blocks.
+  idmap_.reserve(static_cast<size_t>(reserve_count));
   for (u64 i = 0; i < header.entry_count; ++i) {
     vamana::idmap::Entry entry;
     input.read(reinterpret_cast<char*>(&entry), sizeof(entry));
@@ -124,6 +128,9 @@ bool MemoryNode::load_owner_idmap(const filepath_t& index_prefix) {
       entry.generation,
       (entry.flags & vamana::idmap::kDeleted) != 0};
   }
+  print_status("storage-owner idmap loaded entries=" +
+               std::to_string(idmap_.size()) +
+               " reserved=" + std::to_string(reserve_count));
   return true;
 }
 
