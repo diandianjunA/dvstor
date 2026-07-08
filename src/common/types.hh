@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <unordered_map>
 #include <library/types.hh>
 
 #include "ankerl/unordered_dense.h"
@@ -15,4 +16,7 @@ template <typename T>
 using hashset_t = ankerl::unordered_dense::set<T>;
 
 template <typename K, typename V>
-using hashmap_t = ankerl::unordered_dense::map<K, V>;
+using hashmap_t = std::unordered_map<K, V>;
+
+template <typename K, typename V>
+using dense_hashmap_t = ankerl::unordered_dense::map<K, V>;

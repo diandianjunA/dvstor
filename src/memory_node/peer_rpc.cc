@@ -244,7 +244,7 @@ bool MemoryNode::apply_peer_reverse_update_tasks(const vec<PeerReverseUpdateTask
   }
 
   const auto apply_started = std::chrono::steady_clock::now();
-  hashmap_t<u64, vec<RemotePtr>> grouped;
+  dense_hashmap_t<u64, vec<RemotePtr>> grouped;
   size_t item_count = 0;
   for (const PeerReverseUpdateTask& task : tasks) {
     item_count += task.ops.size();
@@ -332,7 +332,7 @@ bool MemoryNode::handle_peer_cleanup_deleted_request(
     return true;
   }
 
-  hashmap_t<u64, vec<RemotePtr>> grouped;
+  dense_hashmap_t<u64, vec<RemotePtr>> grouped;
   grouped.reserve(header.item_count);
   for (u32 i = 0; i < header.item_count; ++i) {
     const RemotePtr target{ops[i].target_raw};
