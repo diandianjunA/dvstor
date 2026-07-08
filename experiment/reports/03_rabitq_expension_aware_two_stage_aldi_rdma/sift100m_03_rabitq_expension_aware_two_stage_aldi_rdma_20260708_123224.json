@@ -1,24 +1,24 @@
 {
   "bottleneck_summary": {
-    "insert": "insert breakdown\n  count: 20846\n  latency_ms: mean=46.2777 p50=30.9395 p95=132.168 p99=196.656\n  fine_grained_breakdown: disabled\n",
-    "query": "query breakdown\n  count: 42037\n  latency_ms: mean=3.72659 p50=3.52401 p95=5.5018 p99=7.31129\n  fine_grained_breakdown: disabled\n"
+    "insert": "insert breakdown\n  count: 17107\n  latency_ms: mean=57.178 p50=37.5649 p95=160.188 p99=244.678\n  fine_grained_breakdown: disabled\n",
+    "query": "query breakdown\n  count: 34712\n  latency_ms: mean=3.42614 p50=3.27995 p95=4.97117 p99=6.68505\n  fine_grained_breakdown: disabled\n"
   },
   "insert_breakdown": {
-    "count": 20846,
+    "count": 17107,
     "fine_grained_breakdown_observed": false,
     "latency": {
-      "end_to_end_ns": 964704510828,
-      "mean_end_to_end_ns": 46277679,
+      "end_to_end_ns": 978144065087,
+      "mean_end_to_end_ns": 57178001,
       "mean_queue_wait_ns": 0,
-      "mean_service_ns": 46277679,
-      "p50_end_to_end_ns": 30939530,
-      "p50_service_ns": 30939530,
-      "p95_end_to_end_ns": 132167689,
-      "p95_service_ns": 132167689,
-      "p99_end_to_end_ns": 196655588,
-      "p99_service_ns": 196655588,
+      "mean_service_ns": 57178001,
+      "p50_end_to_end_ns": 37564883,
+      "p50_service_ns": 37564883,
+      "p95_end_to_end_ns": 160188474,
+      "p95_service_ns": 160188474,
+      "p99_end_to_end_ns": 244678056,
+      "p99_service_ns": 244678056,
       "queue_wait_ns": 0,
-      "service_ns": 964704510828
+      "service_ns": 978144065087
     },
     "operation": "insert",
     "utilization": {
@@ -51,16 +51,16 @@
     "insert_start_id": 101000000,
     "insert_vector_source": "/data/xjs/index/dvstor_sift100m/converted/insert_test.u8bin",
     "measure_mixed": {
-      "completed_deletes": 4264,
-      "completed_inserts": 20846,
-      "completed_reads": 42037,
-      "completed_upserts": 16634,
-      "completed_writes": 41744,
-      "issued_deletes": 4264,
-      "issued_inserts": 20846,
-      "issued_reads": 42037,
-      "issued_upserts": 16634,
-      "issued_writes": 41744
+      "completed_deletes": 3509,
+      "completed_inserts": 17107,
+      "completed_reads": 34712,
+      "completed_upserts": 13694,
+      "completed_writes": 34310,
+      "issued_deletes": 3509,
+      "issued_inserts": 17107,
+      "issued_reads": 34712,
+      "issued_upserts": 13694,
+      "issued_writes": 34310
     },
     "measure_ops": 1000,
     "measure_seconds": 120,
@@ -104,16 +104,16 @@
     "vector_component_size": 1,
     "vector_data_type": "uint8",
     "warmup_mixed": {
-      "completed_deletes": 747,
-      "completed_inserts": 3578,
-      "completed_reads": 7175,
-      "completed_upserts": 2862,
-      "completed_writes": 7187,
-      "issued_deletes": 747,
-      "issued_inserts": 3578,
-      "issued_reads": 7175,
-      "issued_upserts": 2862,
-      "issued_writes": 7187
+      "completed_deletes": 692,
+      "completed_inserts": 3263,
+      "completed_reads": 6602,
+      "completed_upserts": 2640,
+      "completed_writes": 6595,
+      "issued_deletes": 692,
+      "issued_inserts": 3263,
+      "issued_reads": 6602,
+      "issued_upserts": 2640,
+      "issued_writes": 6595
     },
     "warmup_ops": 100,
     "warmup_seconds": 30,
@@ -123,21 +123,21 @@
     "write_upsert_ratio": 0.4
   },
   "query_breakdown": {
-    "count": 42037,
+    "count": 34712,
     "fine_grained_breakdown_observed": false,
     "latency": {
-      "end_to_end_ns": 156654683056,
-      "mean_end_to_end_ns": 3726590,
-      "mean_queue_wait_ns": 185734,
-      "mean_service_ns": 3540856,
-      "p50_end_to_end_ns": 3524011,
-      "p50_service_ns": 3339107,
-      "p95_end_to_end_ns": 5501796,
-      "p95_service_ns": 5313096,
-      "p99_end_to_end_ns": 7311292,
-      "p99_service_ns": 7125654,
-      "queue_wait_ns": 7807714831,
-      "service_ns": 148846968225
+      "end_to_end_ns": 118928036760,
+      "mean_end_to_end_ns": 3426136,
+      "mean_queue_wait_ns": 193810,
+      "mean_service_ns": 3232326,
+      "p50_end_to_end_ns": 3279952,
+      "p50_service_ns": 3086872,
+      "p95_end_to_end_ns": 4971173,
+      "p95_service_ns": 4775686,
+      "p99_end_to_end_ns": 6685050,
+      "p99_service_ns": 6478233,
+      "queue_wait_ns": 6727532938,
+      "service_ns": 112200503822
     },
     "operation": "query",
     "utilization": {
@@ -157,7 +157,7 @@
     "passed": true,
     "phase": "before_performance",
     "queries": 1000,
-    "recall": 0.8849999999999966
+    "recall": 0.9307999999999947
   },
   "static_gt_post_recall": {
     "groundtruth_file": "/data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin",
@@ -166,7 +166,7 @@
     "passed": true,
     "phase": "after_performance",
     "queries": 1000,
-    "recall": 0.8843999999999964
+    "recall": 0.9300999999999948
   },
   "system_counters": {
     "d2h_bytes": 0,
@@ -175,18 +175,18 @@
     "rdma_write_bytes": 0
   },
   "throughput": {
-    "delete_ops": 4264,
-    "delete_ops_per_sec": 35.53333333333333,
+    "delete_ops": 3509,
+    "delete_ops_per_sec": 29.241666666666667,
     "duration_seconds": 120.0,
-    "insert_ops": 20846,
-    "insert_ops_per_sec": 173.71666666666667,
-    "query_ops": 42037,
-    "query_ops_per_sec": 350.30833333333334,
-    "total_ops": 83781,
-    "total_ops_per_sec": 698.175,
-    "upsert_ops": 16634,
-    "upsert_ops_per_sec": 138.61666666666667,
-    "write_ops": 41744,
-    "write_ops_per_sec": 347.8666666666667
+    "insert_ops": 17107,
+    "insert_ops_per_sec": 142.55833333333334,
+    "query_ops": 34712,
+    "query_ops_per_sec": 289.26666666666665,
+    "total_ops": 69022,
+    "total_ops_per_sec": 575.1833333333333,
+    "upsert_ops": 13694,
+    "upsert_ops_per_sec": 114.11666666666666,
+    "write_ops": 34310,
+    "write_ops_per_sec": 285.9166666666667
   }
 }
