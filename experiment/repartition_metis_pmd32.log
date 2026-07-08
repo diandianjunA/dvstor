@@ -1,0 +1,11 @@
+nohup: ignoring input
+input prefix: "/data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_balanced"
+output prefix: "/data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32"
+storage format: vamana_compact_v1 -> vamana_compact_v1
+nodes: 100000000 shards=5 dim=128 R=96
+partition: metis max_degree=32 imbalance=1.03
+before cross-shard ratio: 0.800051 (3139752842/3924441597)
+partition node counts: 19964894 20600998 19416558 20600992 19416558
+METIS partition edges: input=2896579353 unique=2049023977 edge_cut=299290485 partition_cut_ratio=0.146065
+after cross-shard ratio: 0.158896 (623579187/3924441597)
+repartition finished: 100000000 nodes
