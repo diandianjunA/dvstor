@@ -1507,7 +1507,6 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
                                             : nullptr;
   vec<RemotePtr> local_unique_candidates;
   vec<RemotePtr> local_current_neighbors;
-  vec<RemotePtr> local_base_neighbors;
   vec<RemotePtr> local_filtered_candidates;
   vec<RemotePtr> local_updated_neighbors;
   vec<RemotePtr> local_remote_neighbors;
@@ -1518,7 +1517,6 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
   }
   vec<RemotePtr>& unique_candidates = scratch != nullptr ? scratch->reverse_unique_candidates : local_unique_candidates;
   vec<RemotePtr>& current_neighbors = scratch != nullptr ? scratch->reverse_current_neighbors : local_current_neighbors;
-  vec<RemotePtr>& base_neighbors = scratch != nullptr ? scratch->reverse_base_neighbors : local_base_neighbors;
   vec<RemotePtr>& filtered_candidates =
     scratch != nullptr ? scratch->reverse_filtered_candidates : local_filtered_candidates;
   vec<RemotePtr>& updated_neighbors = scratch != nullptr ? scratch->reverse_updated_neighbors : local_updated_neighbors;
@@ -1558,46 +1556,9 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
     return true;
   }
 
-  auto target_deleted_locked = [&]() {
+  auto target_deleted = [&]() {
     return (*reinterpret_cast<const u64*>(local_node_ptr(target_ptr)) &
             VamanaNode::HEADER_DELETED) != 0;
-  };
-
-  auto lock_target = [&]() {
-    const auto lock_started = std::chrono::steady_clock::now();
-    lock_node(target_ptr);
-    lock_wait_ns += elapsed_ns_since(lock_started);
-  };
-
-  auto same_neighbors = [](const vec<RemotePtr>& lhs, const vec<RemotePtr>& rhs) {
-    if (lhs.size() != rhs.size()) {
-      return false;
-    }
-    for (size_t i = 0; i < lhs.size(); ++i) {
-      if (!(lhs[i] == rhs[i])) {
-        return false;
-      }
-    }
-    return true;
-  };
-
-  auto filter_against_current = [&](const vec<RemotePtr>& candidates,
-                                    const vec<RemotePtr>& existing,
-                                    vec<RemotePtr>& filtered) {
-    filtered.clear();
-    filtered.reserve(candidates.size());
-    for (const RemotePtr& candidate_ptr : candidates) {
-      bool already_present = false;
-      for (const RemotePtr& current : existing) {
-        if (current == candidate_ptr) {
-          already_present = true;
-          break;
-        }
-      }
-      if (!already_present) {
-        filtered.push_back(candidate_ptr);
-      }
-    }
   };
 
   auto vector_ptr = [&](const RemotePtr& rptr) {
@@ -1685,83 +1646,56 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
     }
   };
 
-  auto read_current_neighbors_locked = [&]() {
-    const auto started = std::chrono::steady_clock::now();
-    current_neighbors = read_neighbor_list(target_ptr);
-    neighbor_read_ns += elapsed_ns_since(started);
-    current_count = current_neighbors.size();
-  };
-
-  auto try_apply_once = [&](bool allow_unlock_for_prune) {
-    lock_target();
-    if (target_deleted_locked()) {
-      unlock_node(target_ptr);
-      return true;
-    }
-
-    read_current_neighbors_locked();
-    step_started = std::chrono::steady_clock::now();
-    filter_against_current(unique_candidates, current_neighbors, filtered_candidates);
-    filter_ns += elapsed_ns_since(step_started);
-    filtered_count = filtered_candidates.size();
-    if (filtered_candidates.empty()) {
-      unlock_node(target_ptr);
-      return true;
-    }
-
-    changed = true;
-    if (current_neighbors.size() + filtered_candidates.size() <= config.R) {
-      updated_neighbors = current_neighbors;
-      updated_neighbors.insert(updated_neighbors.end(), filtered_candidates.begin(), filtered_candidates.end());
-      step_started = std::chrono::steady_clock::now();
-      write_neighbor_list(target_ptr, updated_neighbors);
-      write_ns += elapsed_ns_since(step_started);
-      unlock_node(target_ptr);
-      return true;
-    }
-
-    pruned = true;
-    base_neighbors = current_neighbors;
-    if (allow_unlock_for_prune) {
-      unlock_node(target_ptr);
-      step_started = std::chrono::steady_clock::now();
-      build_pruned_neighbors(base_neighbors, filtered_candidates);
-      prune_ns += elapsed_ns_since(step_started);
-
-      lock_target();
-      if (target_deleted_locked()) {
-        unlock_node(target_ptr);
-        return true;
-      }
-      read_current_neighbors_locked();
-      if (!same_neighbors(current_neighbors, base_neighbors)) {
-        unlock_node(target_ptr);
-        return false;
-      }
-    } else {
-      step_started = std::chrono::steady_clock::now();
-      build_pruned_neighbors(base_neighbors, filtered_candidates);
-      prune_ns += elapsed_ns_since(step_started);
-    }
-
-    step_started = std::chrono::steady_clock::now();
-    write_neighbor_list(target_ptr, updated_neighbors);
-    write_ns += elapsed_ns_since(step_started);
+  const auto lock_started = std::chrono::steady_clock::now();
+  lock_node(target_ptr);
+  lock_wait_ns += elapsed_ns_since(lock_started);
+  if (target_deleted()) {
     unlock_node(target_ptr);
     return true;
-  };
+  }
 
-  bool applied = false;
-  constexpr u32 kOptimisticAttempts = 2;
-  for (u32 attempt = 0; attempt < kOptimisticAttempts; ++attempt) {
-    if (try_apply_once(true)) {
-      applied = true;
-      break;
+  step_started = std::chrono::steady_clock::now();
+  current_neighbors = read_neighbor_list(target_ptr);
+  neighbor_read_ns += elapsed_ns_since(step_started);
+  current_count = current_neighbors.size();
+
+  step_started = std::chrono::steady_clock::now();
+  filtered_candidates.clear();
+  filtered_candidates.reserve(unique_candidates.size());
+  for (const RemotePtr& candidate_ptr : unique_candidates) {
+    bool already_present = false;
+    for (const RemotePtr& current : current_neighbors) {
+      if (current == candidate_ptr) {
+        already_present = true;
+        break;
+      }
+    }
+    if (!already_present) {
+      filtered_candidates.push_back(candidate_ptr);
     }
   }
-  if (!applied) {
-    applied = try_apply_once(false);
+  filter_ns += elapsed_ns_since(step_started);
+  filtered_count = filtered_candidates.size();
+  if (filtered_candidates.empty()) {
+    unlock_node(target_ptr);
+    return true;
   }
+
+  changed = true;
+  if (current_neighbors.size() + filtered_candidates.size() <= config.R) {
+    updated_neighbors = current_neighbors;
+    updated_neighbors.insert(updated_neighbors.end(), filtered_candidates.begin(), filtered_candidates.end());
+  } else {
+    pruned = true;
+    step_started = std::chrono::steady_clock::now();
+    build_pruned_neighbors(current_neighbors, filtered_candidates);
+    prune_ns += elapsed_ns_since(step_started);
+  }
+
+  step_started = std::chrono::steady_clock::now();
+  write_neighbor_list(target_ptr, updated_neighbors);
+  write_ns += elapsed_ns_since(step_started);
+  unlock_node(target_ptr);
 
   (void)enqueue_maintenance;
 
