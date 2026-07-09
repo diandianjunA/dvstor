@@ -52,6 +52,39 @@ struct NodeSnapshot {
   vec<byte_t> vector_data;
 };
 
+struct StorageOwnerPruneCandidateInfo {
+  RemotePtr rptr;
+  distance_t dist{};
+  vec<byte_t> vector_data;
+};
+
+struct StorageOwnerCoroutineScratch {
+  hashset_t<RemotePtr> visited;
+  hashset_t<RemotePtr> empty_skip;
+  vec<BeamEntry> beam;
+  vec<RemotePtr> unvisited;
+  vec<RemotePtr> batch;
+  vec<RemotePtr> filtered;
+  vec<RemotePtr> selected;
+  vec<const byte_t*> selected_vectors;
+  vec<StorageOwnerPruneCandidateInfo> prune_infos;
+
+  void clear_search() {
+    visited.clear();
+    beam.clear();
+    unvisited.clear();
+    batch.clear();
+  }
+
+  void clear_prune() {
+    filtered.clear();
+    batch.clear();
+    selected.clear();
+    selected_vectors.clear();
+    prune_infos.clear();
+  }
+};
+
 struct InsertRuntimeState {
   HugePage<byte_t> buffer;
   std::unique_ptr<LocalMemoryRegion> region;
@@ -98,7 +131,10 @@ struct StorageOwnerInsertTask {
 
 struct StorageOwnerThread {
   explicit StorageOwnerThread(u32 id, u32 num_coroutines, i32 max_send_queue_wr)
-      : id(id), send_wcs(std::max<i32>(1, max_send_queue_wr)), post_balances(num_coroutines) {
+      : id(id),
+        send_wcs(std::max<i32>(1, max_send_queue_wr)),
+        post_balances(num_coroutines),
+        coroutine_scratch_states(num_coroutines) {
     for (auto& balance : post_balances) {
       balance.store(0, std::memory_order_relaxed);
     }
@@ -117,9 +153,17 @@ struct StorageOwnerThread {
 
   bool has_peer_scratch() const { return scratch_region != nullptr; }
 
-  void set_current_coroutine(u32 coroutine_id) { running_coroutine = coroutine_id; }
+  void set_current_coroutine(u32 coroutine_id) {
+    lib_assert(coroutine_id < post_balances.size(), "invalid storage-owner coroutine id");
+    running_coroutine = coroutine_id;
+  }
   void track_post() { ++post_balances[running_coroutine]; }
   bool is_ready(u32 coroutine_id) const { return post_balances[coroutine_id] == 0; }
+  StorageOwnerCoroutineScratch& coroutine_scratch_state() {
+    lib_assert(running_coroutine < coroutine_scratch_states.size(),
+               "storage-owner coroutine container scratch is not initialized");
+    return coroutine_scratch_states[running_coroutine];
+  }
   byte_t* coroutine_scratch(size_t extra_offset = 0) {
     const size_t offset = static_cast<size_t>(running_coroutine) * scratch_stride + extra_offset;
     lib_assert(offset < scratch_buffer.buffer_size, "storage-owner coroutine scratch buffer exhausted");
@@ -132,6 +176,7 @@ struct StorageOwnerThread {
   u32 id{};
   vec<ibv_wc> send_wcs;
   vec<std::atomic<i32>> post_balances;
+  vec<StorageOwnerCoroutineScratch> coroutine_scratch_states;
   vec<u_ptr<StorageOwnerInsertCoroutine>> coroutines;
   HugePage<byte_t> scratch_buffer;
   std::unique_ptr<LocalMemoryRegion> scratch_region;

@@ -726,7 +726,12 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       candidates = beam_search_candidates(components, medoid_ptr, config, &breakdown);
       breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
     }
-    hashset_t<RemotePtr> empty_skip;
+    hashset_t<RemotePtr> local_empty_skip;
+    hashset_t<RemotePtr>& empty_skip =
+      current_storage_owner_thread_ != nullptr
+        ? current_storage_owner_thread_->coroutine_scratch_state().empty_skip
+        : local_empty_skip;
+    empty_skip.clear();
     auto t_prune = std::chrono::steady_clock::now();
     vec<RemotePtr> selected_neighbors = robust_prune_cpu(reinterpret_cast<const byte_t*>(components.data()),
                                                          VectorDType::float32, candidates, empty_skip, config, &breakdown);

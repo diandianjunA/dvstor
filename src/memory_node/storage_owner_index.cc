@@ -14,6 +14,8 @@ namespace {
 using Configuration = configuration::IndexConfiguration;
 using BeamEntry = memory_node_detail::BeamEntry;
 using NodeSnapshot = memory_node_detail::NodeSnapshot;
+using StorageOwnerCoroutineScratch = memory_node_detail::StorageOwnerCoroutineScratch;
+using StorageOwnerPruneCandidateInfo = memory_node_detail::StorageOwnerPruneCandidateInfo;
 using StorageOwnerThread = memory_node_detail::StorageOwnerThread;
 
 constexpr size_t kSnapshotPrefixBytes =
@@ -977,8 +979,18 @@ auto MemoryNode::beam_search_candidates_async(const span<const element_t> query,
                                               const Configuration& config,
                                               StorageOwnerThread& thread,
                                               InsertBreakdownCounters* breakdown) -> StorageOwnerInsertCoroutine {
-  hashset_t<RemotePtr> visited;
-  vec<BeamEntry> beam;
+  StorageOwnerCoroutineScratch& scratch = thread.coroutine_scratch_state();
+  scratch.clear_search();
+  hashset_t<RemotePtr>& visited = scratch.visited;
+  vec<BeamEntry>& beam = scratch.beam;
+  vec<RemotePtr>& unvisited_neighbors = scratch.unvisited;
+  vec<RemotePtr>& batch = scratch.batch;
+  const u32 snapshot_batch = storage_owner_snapshot_batch_size(config, &thread);
+  const u32 construction_width = storage_owner_construction_width(config);
+  visited.reserve(static_cast<size_t>(construction_width) * std::max<u32>(1, config.R));
+  beam.reserve(construction_width);
+  unvisited_neighbors.reserve(config.R);
+  batch.reserve(snapshot_batch);
 
   auto t_snapshot = std::chrono::steady_clock::now();
   NodeSnapshot medoid_snapshot = co_await async_read_node_snapshot(medoid, thread);
@@ -1029,8 +1041,7 @@ auto MemoryNode::beam_search_candidates_async(const span<const element_t> query,
     if (breakdown != nullptr) {
       breakdown->storage_owner_search_neighbor_read_ns += elapsed_ns_since(t_neighbor_read);
     }
-    vec<RemotePtr> unvisited_neighbors;
-    unvisited_neighbors.reserve(neighbors.size());
+    unvisited_neighbors.clear();
 #ifdef DVSTOR_DEBUG_SHARD_LOCALITY
     u32 expanded_shard = beam[best_idx].rptr.memory_node();
 #endif
@@ -1049,12 +1060,9 @@ auto MemoryNode::beam_search_candidates_async(const span<const element_t> query,
     ++shard_hist[5];
 #endif
 
-    const u32 snapshot_batch = storage_owner_snapshot_batch_size(config, &thread);
-    const u32 construction_width = storage_owner_construction_width(config);
     for (size_t begin = 0; begin < unvisited_neighbors.size(); begin += snapshot_batch) {
       const size_t end = std::min(unvisited_neighbors.size(), begin + snapshot_batch);
-      vec<RemotePtr> batch;
-      batch.reserve(end - begin);
+      batch.clear();
       batch.insert(batch.end(), unvisited_neighbors.begin() + begin, unvisited_neighbors.begin() + end);
       t_snapshot = std::chrono::steady_clock::now();
       vec<NodeSnapshot> snapshots = co_await async_read_node_snapshots(batch, config, thread);
@@ -1120,18 +1128,27 @@ auto MemoryNode::anchor_search_candidates_async(const span<const element_t> quer
                                                 InsertBreakdownCounters* breakdown,
                                                 bool local_only)
   -> StorageOwnerInsertCoroutine {
-  hashset_t<RemotePtr> visited;
-  vec<BeamEntry> beam;
+  StorageOwnerCoroutineScratch& scratch = thread.coroutine_scratch_state();
+  scratch.clear_search();
+  hashset_t<RemotePtr>& visited = scratch.visited;
+  vec<BeamEntry>& beam = scratch.beam;
+  vec<RemotePtr>& batch = scratch.batch;
+  vec<RemotePtr>& unvisited = scratch.unvisited;
   const u32 beam_width = std::max<u32>(config.R, config.storage_owner_anchor_beam_width);
   const u32 batch_limit = storage_owner_snapshot_batch_size(config, &thread);
+  visited.reserve(anchor_hints.size() +
+                  static_cast<size_t>(config.storage_owner_anchor_expand_cap) *
+                    std::max<u32>(1, config.R));
+  beam.reserve(beam_width);
+  batch.reserve(batch_limit);
+  unvisited.reserve(config.R);
 
   if (breakdown != nullptr) {
     breakdown->storage_owner_anchor_hints += anchor_hints.size();
   }
   for (size_t begin = 0; begin < anchor_hints.size(); begin += batch_limit) {
-    vec<RemotePtr> batch;
     const size_t end = std::min(anchor_hints.size(), begin + batch_limit);
-    batch.reserve(end - begin);
+    batch.clear();
     for (size_t i = begin; i < end; ++i) {
       const RemotePtr hint = anchor_hints[i];
       if (!hint.is_null() && hint.memory_node() < num_storage_nodes_ &&
@@ -1191,8 +1208,7 @@ auto MemoryNode::anchor_search_candidates_async(const span<const element_t> quer
     if (breakdown != nullptr) {
       breakdown->storage_owner_search_neighbor_read_ns += elapsed_ns_since(started);
     }
-    vec<RemotePtr> unvisited;
-    unvisited.reserve(neighbors.size());
+    unvisited.clear();
     for (const RemotePtr neighbor : neighbors) {
       if (!neighbor.is_null() && neighbor.memory_node() < num_storage_nodes_ &&
           (!local_only || local_shard(neighbor.memory_node())) &&
@@ -1203,7 +1219,8 @@ auto MemoryNode::anchor_search_candidates_async(const span<const element_t> quer
 
     for (size_t begin = 0; begin < unvisited.size(); begin += batch_limit) {
       const size_t end = std::min(unvisited.size(), begin + batch_limit);
-      vec<RemotePtr> batch(unvisited.begin() + begin, unvisited.begin() + end);
+      batch.clear();
+      batch.insert(batch.end(), unvisited.begin() + begin, unvisited.begin() + end);
       started = std::chrono::steady_clock::now();
       vec<NodeSnapshot> snapshots = co_await async_read_node_snapshots(batch, config, thread);
       if (breakdown != nullptr) {
@@ -1245,19 +1262,31 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
                                             const Configuration& config,
                                             InsertBreakdownCounters* breakdown,
                                             u32 candidate_limit_override) {
-  struct CandidateInfo {
-    RemotePtr rptr;
-    distance_t dist{};
-    vec<byte_t> vector_data;
-  };
-
-  vec<CandidateInfo> infos;
-  infos.reserve(candidates.size());
-  vec<RemotePtr> filtered;
-  filtered.reserve(std::min<size_t>(candidates.size(), storage_owner_prune_candidate_limit(config)));
+  StorageOwnerCoroutineScratch* scratch = current_storage_owner_thread_ != nullptr
+                                            ? &current_storage_owner_thread_->coroutine_scratch_state()
+                                            : nullptr;
+  vec<StorageOwnerPruneCandidateInfo> local_infos;
+  vec<RemotePtr> local_filtered;
+  vec<RemotePtr> local_batch;
+  vec<RemotePtr> local_selected;
+  vec<const byte_t*> local_selected_vectors;
+  if (scratch != nullptr) {
+    scratch->clear_prune();
+  }
+  vec<StorageOwnerPruneCandidateInfo>& infos = scratch != nullptr ? scratch->prune_infos : local_infos;
+  vec<RemotePtr>& filtered = scratch != nullptr ? scratch->filtered : local_filtered;
+  vec<RemotePtr>& batch = scratch != nullptr ? scratch->batch : local_batch;
+  vec<RemotePtr>& selected = scratch != nullptr ? scratch->selected : local_selected;
+  vec<const byte_t*>& selected_vectors = scratch != nullptr ? scratch->selected_vectors : local_selected_vectors;
   const u32 prune_candidate_limit = candidate_limit_override == 0
                                       ? storage_owner_prune_candidate_limit(config)
                                       : std::max(config.R, candidate_limit_override);
+  infos.reserve(candidates.size());
+  filtered.reserve(std::min<size_t>(candidates.size(), prune_candidate_limit));
+  batch.reserve(storage_owner_snapshot_batch_size(config, current_storage_owner_thread_));
+  selected.reserve(config.R);
+  selected_vectors.reserve(config.R);
+
   for (const RemotePtr& candidate : candidates) {
     if (candidate.is_null() || skip.contains(candidate)) {
       continue;
@@ -1271,8 +1300,7 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
   const u32 snapshot_batch = storage_owner_snapshot_batch_size(config, current_storage_owner_thread_);
   for (size_t begin = 0; begin < filtered.size(); begin += snapshot_batch) {
     const size_t end = std::min(filtered.size(), begin + snapshot_batch);
-    vec<RemotePtr> batch;
-    batch.reserve(end - begin);
+    batch.clear();
     batch.insert(batch.end(), filtered.begin() + begin, filtered.begin() + end);
     auto t_snapshot = std::chrono::steady_clock::now();
     vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
@@ -1294,17 +1322,13 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
   }
 
   auto t_sort = std::chrono::steady_clock::now();
-  std::sort(infos.begin(), infos.end(), [](const CandidateInfo& lhs, const CandidateInfo& rhs) {
+  std::sort(infos.begin(), infos.end(), [](const StorageOwnerPruneCandidateInfo& lhs,
+                                           const StorageOwnerPruneCandidateInfo& rhs) {
     return lhs.dist < rhs.dist;
   });
   if (breakdown != nullptr) {
     breakdown->storage_owner_prune_sort_ns += elapsed_ns_since(t_sort);
   }
-
-  vec<RemotePtr> selected;
-  selected.reserve(config.R);
-  vec<const byte_t*> selected_vectors;
-  selected_vectors.reserve(config.R);
 
   for (const auto& candidate : infos) {
     if (selected.size() >= config.R) {
@@ -1369,7 +1393,6 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   const bool use_anchors = anchor_update_enabled(config, job.anchor_hints);
   RemotePtr medoid_ptr{};
   bool medoid_loaded = false;
-  vec<RemotePtr> owned_candidates;
   const vec<RemotePtr>* candidates = nullptr;
 
   if (use_anchors) {
@@ -1386,8 +1409,7 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
     }
     search.handle.destroy();
     breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
-    owned_candidates = storage_owner_async_candidates_[thread.id][thread.running_coroutine];
-    candidates = &owned_candidates;
+    candidates = &storage_owner_async_candidates_[thread.id][thread.running_coroutine];
   }
 
   if (!use_anchors) {
@@ -1436,10 +1458,11 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   }
 
   lib_assert(candidates != nullptr, "storage-owner insert search produced no candidate set");
-  hashset_t<RemotePtr> empty_skip;
+  StorageOwnerCoroutineScratch& scratch = thread.coroutine_scratch_state();
+  scratch.empty_skip.clear();
   auto t_prune = std::chrono::steady_clock::now();
   vec<RemotePtr> selected_neighbors = robust_prune_cpu(reinterpret_cast<const byte_t*>(components.data()),
-                                                       VectorDType::float32, *candidates, empty_skip, config, &breakdown);
+                                                       VectorDType::float32, *candidates, scratch.empty_skip, config, &breakdown);
   breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
   const RemotePtr new_ptr = allocate_local_node();
   job.new_ptr = new_ptr;
