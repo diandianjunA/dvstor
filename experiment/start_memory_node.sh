@@ -72,6 +72,12 @@ if [[ "$INSERT_EXECUTION" == "storage_owner" ]]; then
     cmd+=(--storage-owner-anchor-beam-width "${STORAGE_OWNER_ANCHOR_BEAM_WIDTH:-64}")
     cmd+=(--storage-owner-anchor-expand-cap "${STORAGE_OWNER_ANCHOR_EXPAND_CAP:-16}")
     cmd+=(--storage-owner-anchor-remote-rescue-cap "${STORAGE_OWNER_ANCHOR_REMOTE_RESCUE_CAP:-4}")
+    if [[ "${STORAGE_OWNER_LOCAL_STITCH_SYNC_FAST_PATH:-1}" == "0" || \
+          "${STORAGE_OWNER_LOCAL_STITCH_SYNC_FAST_PATH:-1}" == "false" ]]; then
+      cmd+=(--storage-owner-local-stitch-sync-fast-path false)
+    else
+      cmd+=(--storage-owner-local-stitch-sync-fast-path true)
+    fi
   fi
   cmd+=(--storage-owner-maintenance-mode "${STORAGE_OWNER_MAINTENANCE_MODE:-off}")
   cmd+=(--storage-owner-maintenance-workers "${STORAGE_OWNER_MAINTENANCE_WORKERS:-0}")

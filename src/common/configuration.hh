@@ -91,6 +91,7 @@ public:
   u32 storage_owner_anchor_beam_width{64};
   u32 storage_owner_anchor_expand_cap{16};
   u32 storage_owner_anchor_remote_rescue_cap{4};
+  bool storage_owner_local_stitch_sync_fast_path{true};
   str storage_owner_maintenance_mode{"off"};
   u32 storage_owner_maintenance_workers{0};
   str storage_owner_reverse_mode{"async"};
@@ -247,6 +248,9 @@ private:
       "storage-owner-anchor-remote-rescue-cap",
       po::value<u32>(&storage_owner_anchor_remote_rescue_cap)->default_value(storage_owner_anchor_remote_rescue_cap),
       "Maximum remote-node expansions in local-stitch foreground search.")(
+      "storage-owner-local-stitch-sync-fast-path",
+      po::value<bool>(&storage_owner_local_stitch_sync_fast_path)->default_value(storage_owner_local_stitch_sync_fast_path),
+      "Use a synchronous worker-local foreground path for local-stitch storage-owner mutations with anchors.")(
       "storage-owner-maintenance-mode",
       po::value<str>(&storage_owner_maintenance_mode)->default_value(storage_owner_maintenance_mode),
       "Storage-owner background graph-quality maintenance: off or finalize.")(
@@ -583,6 +587,9 @@ public:
           os << std::setw(width) << "anchor expand cap: " << config.storage_owner_anchor_expand_cap << std::endl;
           os << std::setw(width) << "anchor remote cap: "
              << config.storage_owner_anchor_remote_rescue_cap << std::endl;
+          os << std::setw(width) << "local stitch sync fast path: "
+             << std::boolalpha << config.storage_owner_local_stitch_sync_fast_path
+             << std::noboolalpha << std::endl;
         }
         os << std::setw(width) << "storage maintenance mode: "
            << config.storage_owner_maintenance_mode << std::endl;

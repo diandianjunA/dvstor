@@ -14,6 +14,40 @@ bool storage_owner_local_stitch_mode(const configuration::IndexConfiguration& co
   return config.storage_owner_update_mode == "local_stitch";
 }
 
+bool storage_owner_batch_prefers_sync_local_stitch(
+    const configuration::IndexConfiguration& config,
+    const vec<service::storage_owner::MutationKind>& kinds,
+    const vec<u64>& anchor_hints,
+    u32 anchor_hint_count,
+    size_t item_count) {
+  if (!storage_owner_local_stitch_mode(config) ||
+      !config.storage_owner_local_stitch_sync_fast_path ||
+      anchor_hint_count == 0) {
+    return false;
+  }
+  if (anchor_hints.size() < item_count * static_cast<size_t>(anchor_hint_count)) {
+    return false;
+  }
+  for (size_t item = 0; item < item_count; ++item) {
+    if (item < kinds.size() &&
+        kinds[item] == service::storage_owner::MutationKind::erase) {
+      continue;
+    }
+    bool has_hint = false;
+    const size_t base = item * static_cast<size_t>(anchor_hint_count);
+    for (u32 hint = 0; hint < anchor_hint_count; ++hint) {
+      if (!RemotePtr{anchor_hints[base + hint]}.is_null()) {
+        has_hint = true;
+        break;
+      }
+    }
+    if (!has_hint) {
+      return false;
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 void MemoryNode::setup_insert_runtime(const Configuration& config) {
@@ -204,7 +238,13 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
   vec<u64> invalidated_neighbors;
   vec<u32> statuses(batch_ids.size(), static_cast<u32>(service::storage_owner::MutationStatus::failed));
   vec<service::storage_owner::MutationResult> mutation_results(batch_ids.size());
-  const bool ok = current_storage_owner_thread_ != nullptr
+  const bool use_sync_local_stitch =
+    storage_owner_batch_prefers_sync_local_stitch(config,
+                                                  batch_kinds,
+                                                  batch_anchor_hints,
+                                                  expected_anchor_hint_count,
+                                                  batch_ids.size());
+  const bool ok = current_storage_owner_thread_ != nullptr && !use_sync_local_stitch
                     ? execute_storage_owner_batch_items_async(batch_ids.data(),
                                                                batch_kinds.data(),
                                                                batch_vectors.data(),

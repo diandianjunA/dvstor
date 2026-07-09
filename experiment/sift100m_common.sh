@@ -327,6 +327,12 @@ write_service_config() {
         echo "storage-owner-anchor-beam-width = ${STORAGE_OWNER_ANCHOR_BEAM_WIDTH:-64}"
         echo "storage-owner-anchor-expand-cap = ${STORAGE_OWNER_ANCHOR_EXPAND_CAP:-16}"
         echo "storage-owner-anchor-remote-rescue-cap = ${STORAGE_OWNER_ANCHOR_REMOTE_RESCUE_CAP:-4}"
+        if [[ "${STORAGE_OWNER_LOCAL_STITCH_SYNC_FAST_PATH:-1}" == "0" || \
+              "${STORAGE_OWNER_LOCAL_STITCH_SYNC_FAST_PATH:-1}" == "false" ]]; then
+          echo "storage-owner-local-stitch-sync-fast-path = false"
+        else
+          echo "storage-owner-local-stitch-sync-fast-path = true"
+        fi
       fi
       echo "storage-owner-maintenance-mode = ${STORAGE_OWNER_MAINTENANCE_MODE:-off}"
       echo "storage-owner-maintenance-workers = ${STORAGE_OWNER_MAINTENANCE_WORKERS:-0}"
