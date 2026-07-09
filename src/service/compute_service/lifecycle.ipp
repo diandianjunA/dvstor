@@ -122,13 +122,6 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                               config_.rabitq_warmup_exact_expansions,
                               config_.rabitq_audit_period,
                               config_.rabitq_strict_recall);
-  vamana_->set_rabitq_exact_safe(config_.rabitq_mode == "exact_safe",
-                                 static_cast<f32>(config_.rabitq_safe_epsilon));
-  vamana_->set_rabitq_speculative_prefetch(
-    config_.rabitq_mode == "speculative_prefetch",
-    config_.rabitq_prefetch_width,
-    config_.rabitq_prefetch_min_samples,
-    static_cast<f32>(config_.rabitq_prefetch_min_hit_ratio));
   vamana_->set_use_rabitq(config_.use_rabitq);
   if (vamana_->use_rabitq() && config_.load_index) {
     const filepath_t startup_prefix = config_.resolved_index_prefix();
@@ -153,14 +146,15 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                  std::to_string(rabitq_cache_->decode_table_bytes()) + " bytes, NUMA " +
                  (rabitq_cache_->numa_interleaved() ? "interleaved" : "local"));
   }
-  if (config_.use_storage_owner_insert() && config_.storage_owner_update_mode == "anchored") {
+  if (config_.use_storage_owner_insert() &&
+      config_.storage_owner_update_mode == "local_stitch") {
     anchor_index_ = std::make_unique<vamana::anchor::Index>();
     str anchor_error;
     if (!have_startup_metadata || startup_metadata.anchor_format != "owner_anchor_v1" ||
         !anchor_index_->load(config_.resolved_index_prefix(), config_.dim, num_servers_, &anchor_error)) {
       anchor_index_.reset();
       throw std::runtime_error(
-        "anchored storage-owner sidecar unavailable; refusing to run ALDI without anchors: " +
+        "local-stitch storage-owner sidecar unavailable; refusing to run ALDI without anchors: " +
         anchor_error);
     } else {
       print_status("storage-owner anchors: entries=" +
@@ -168,9 +162,9 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                    std::to_string(anchor_index_->memory_bytes()) + " bytes");
     }
   }
-  print_status((config_.credit_aware_expansion ? "search: credit-aware " : "search: ") +
+  print_status(str(config_.credit_aware_expansion ? "search: credit-aware " : "search: ") +
     (vamana_->use_rabitq()
-      ? "RFQ5 RaBitQ " + config_.rabitq_mode + " + GPUDirect exact beam"
+      ? "RFQ5 RaBitQ cpu_gate + GPUDirect exact beam"
       : "exact"));
 
   worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,
@@ -186,8 +180,16 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     config_.effective_rdma_qp_pool_size(), rdma_batch_options);
   // Initialize GPU buffers for each compute thread
   const u32 query_batch_factor = std::max<u32>(1, config_.query_batch_size);
-  const u32 max_batch = std::max(config_.beam_width * config_.expansion_batch * query_batch_factor,
-                                   config_.beam_width_construction);
+  const u64 query_frontier_batch =
+    static_cast<u64>(std::max(config_.R, config_.beam_width)) *
+    config_.expansion_batch * query_batch_factor;
+  const u64 construction_batch = config_.beam_width_construction;
+  const u64 overflow_prune_batch = static_cast<u64>(config_.R) + 1u;
+  const u64 max_batch_u64 =
+    std::max(std::max(query_frontier_batch, construction_batch), overflow_prune_batch);
+  lib_assert(max_batch_u64 <= std::numeric_limits<u32>::max(),
+             "GPU candidate batch capacity exceeds u32; reduce R, expansion-batch, or query-batch-size");
+  const u32 max_batch = static_cast<u32>(max_batch_u64);
   const size_t query_buffer_bytes = std::max(
     static_cast<size_t>(config_.dim) * sizeof(element_t) * query_batch_factor,
     static_cast<size_t>(VamanaNode::rabitq_code_bits()) * sizeof(float));

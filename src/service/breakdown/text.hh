@@ -18,6 +18,11 @@ inline std::string aggregate_text_summary(const Aggregate& aggregate) {
      << " p95=" << ns_to_ms(percentile_ns(aggregate.end_to_end_latencies_ns, 0.95))
      << " p99=" << ns_to_ms(percentile_ns(aggregate.end_to_end_latencies_ns, 0.99)) << '\n';
 
+  if (!aggregate.fine_grained_breakdown_observed) {
+    os << "  fine_grained_breakdown: disabled\n";
+    return os.str();
+  }
+
   const u64 cpu_total = aggregate.total_service_ns > (aggregate.category_ns[static_cast<size_t>(Category::gpu)] +
                                                       aggregate.category_ns[static_cast<size_t>(Category::rdma)] +
                                                       aggregate.category_ns[static_cast<size_t>(Category::transfer)])

@@ -2,19 +2,72 @@
 
 #include <algorithm>
 #include <iostream>
+#include <limits>
+
+namespace {
+
+bool storage_owner_anchor_mode(const configuration::IndexConfiguration& config) {
+  return config.storage_owner_update_mode == "local_stitch";
+}
+
+bool storage_owner_local_stitch_mode(const configuration::IndexConfiguration& config) {
+  return config.storage_owner_update_mode == "local_stitch";
+}
+
+bool storage_owner_batch_prefers_sync_local_stitch(
+    const configuration::IndexConfiguration& config,
+    const vec<service::storage_owner::MutationKind>& kinds,
+    const vec<u64>& anchor_hints,
+    u32 anchor_hint_count,
+    size_t item_count) {
+  if (!storage_owner_local_stitch_mode(config) ||
+      !config.storage_owner_local_stitch_sync_fast_path ||
+      anchor_hint_count == 0) {
+    return false;
+  }
+  if (anchor_hints.size() < item_count * static_cast<size_t>(anchor_hint_count)) {
+    return false;
+  }
+  for (size_t item = 0; item < item_count; ++item) {
+    if (item < kinds.size() &&
+        kinds[item] == service::storage_owner::MutationKind::erase) {
+      continue;
+    }
+    bool has_hint = false;
+    const size_t base = item * static_cast<size_t>(anchor_hint_count);
+    for (u32 hint = 0; hint < anchor_hint_count; ++hint) {
+      if (!RemotePtr{anchor_hints[base + hint]}.is_null()) {
+        has_hint = true;
+        break;
+      }
+    }
+    if (!has_hint) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
 
 void MemoryNode::setup_insert_runtime(const Configuration& config) {
+  lib_assert(static_cast<u64>(config.storage_owner_batch_max) * VamanaNode::R <=
+               std::numeric_limits<u32>::max(),
+             "storage_owner invalidation capacity is too large for the wire format");
   const size_t insert_request_bytes = align_up(std::max(
     service::storage_owner::insert_batch_request_bytes(
       config.storage_owner_batch_max, VamanaNode::DIM,
-      config.storage_owner_update_mode == "anchored" ? config.storage_owner_anchor_hints : 0),
+      storage_owner_anchor_mode(config) ? config.storage_owner_anchor_hints : 0),
     service::storage_owner::mutation_batch_request_bytes(
       config.storage_owner_batch_max, VamanaNode::DIM,
-      config.storage_owner_update_mode == "anchored" ? config.storage_owner_anchor_hints : 0)));
+      storage_owner_anchor_mode(config) ? config.storage_owner_anchor_hints : 0)));
   insert_runtime_.request_bytes = insert_request_bytes;
   insert_runtime_.request_slot_count = std::max<u32>(1, config.storage_owner_rpc_depth);
   const size_t insert_response_bytes =
     align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max));
+  lib_assert(insert_request_bytes <= std::numeric_limits<u32>::max() &&
+             insert_response_bytes <= std::numeric_limits<u32>::max(),
+             "storage_owner RPC message is too large for verbs SGEs; reduce batch size or vector dimension");
   const size_t slot_count =
     static_cast<size_t>(num_clients_) * insert_runtime_.request_slot_count;
   lib_assert(slot_count <= static_cast<size_t>(config.max_recv_queue_wr),
@@ -108,7 +161,11 @@ void MemoryNode::storage_owner_insert_worker_loop(u32 worker_id) {
       }
     }
 
+    mark_storage_owner_foreground_activity();
+    storage_owner_insert_active_workers_.fetch_add(1, std::memory_order_acq_rel);
     process_storage_owner_insert_tasks(tasks);
+    storage_owner_insert_active_workers_.fetch_sub(1, std::memory_order_acq_rel);
+    mark_storage_owner_foreground_activity();
   }
 }
 
@@ -122,7 +179,7 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
   vec<service::storage_owner::MutationKind> batch_kinds;
   vec<element_t> batch_vectors;
   vec<u64> batch_anchor_hints;
-  const u32 expected_anchor_hint_count = config.storage_owner_update_mode == "anchored"
+  const u32 expected_anchor_hint_count = storage_owner_anchor_mode(config)
                                            ? config.storage_owner_anchor_hints : 0;
   vec<u32> item_counts;
   vec<u32> response_magics;
@@ -181,7 +238,13 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
   vec<u64> invalidated_neighbors;
   vec<u32> statuses(batch_ids.size(), static_cast<u32>(service::storage_owner::MutationStatus::failed));
   vec<service::storage_owner::MutationResult> mutation_results(batch_ids.size());
-  const bool ok = current_storage_owner_thread_ != nullptr
+  const bool use_sync_local_stitch =
+    storage_owner_batch_prefers_sync_local_stitch(config,
+                                                  batch_kinds,
+                                                  batch_anchor_hints,
+                                                  expected_anchor_hint_count,
+                                                  batch_ids.size());
+  const bool ok = current_storage_owner_thread_ != nullptr && !use_sync_local_stitch
                     ? execute_storage_owner_batch_items_async(batch_ids.data(),
                                                                batch_kinds.data(),
                                                                batch_vectors.data(),
@@ -211,6 +274,8 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
     const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(task.payload.data());
     const u32 item_count = item_counts[task_idx];
     const size_t response_size = service::storage_owner::insert_batch_response_bytes(item_count);
+    lib_assert(response_size <= std::numeric_limits<u32>::max(),
+               "storage_owner async response is too large for verbs SGEs");
     vec<byte_t> response_buffer(response_size);
     auto* response = reinterpret_cast<service::storage_owner::InsertBatchResponseHeader*>(response_buffer.data());
     response->magic = response_magics[task_idx];
@@ -287,8 +352,8 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
     jobs.push_back(std::move(job));
   }
 
-  std::unordered_map<u64, vec<RemotePtr>> local_updates;
-  std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
+  dense_hashmap_t<u64, vec<RemotePtr>> local_updates;
+  dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
 
   const u32 coroutine_count = static_cast<u32>(std::max<size_t>(1, thread.post_balances.size()));
   lib_assert(thread.id < storage_owner_async_candidates_.size(),
@@ -432,7 +497,7 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
         const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(payload);
         const bool magic_ok = request->magic == service::storage_owner::kInsertMagic ||
                               request->magic == service::storage_owner::kMutationMagic;
-        const u32 expected_anchor_hint_count = config.storage_owner_update_mode == "anchored"
+        const u32 expected_anchor_hint_count = storage_owner_anchor_mode(config)
                                                  ? config.storage_owner_anchor_hints : 0;
         const size_t expected_bytes = request->magic == service::storage_owner::kMutationMagic
           ? service::storage_owner::mutation_batch_request_bytes(
@@ -454,6 +519,7 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
           task.batch_id = request->batch_id;
           task.received_at = std::chrono::steady_clock::now();
           task.payload.assign(payload, payload + bytes);
+          mark_storage_owner_foreground_activity();
           {
             std::lock_guard<std::mutex> lock(storage_insert_tasks_mutex_);
             storage_insert_tasks_.push_back(std::move(task));
@@ -475,6 +541,9 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
 
       const size_t response_bytes = handle_storage_insert_request(client_id, payload, bytes, config);
       lib_assert(response_bytes > 0, "invalid storage-owner insert request");
+      lib_assert(response_bytes <= response_slot_bytes(config) &&
+                 response_bytes <= std::numeric_limits<u32>::max(),
+                 "storage_owner response exceeds the registered response slot");
 
       cm_.client_qps[client_id]->post_send(
         *insert_runtime_.region,
@@ -513,7 +582,7 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* pa
       request->item_count > config.storage_owner_batch_max ||
       request->vector_dtype != static_cast<u32>(VamanaNode::vector_dtype()) ||
       request->vector_bytes != VamanaNode::vector_bytes() ||
-      request->anchor_hint_count != (config.storage_owner_update_mode == "anchored"
+      request->anchor_hint_count != (storage_owner_anchor_mode(config)
                                       ? config.storage_owner_anchor_hints : 0) ||
       bytes < expected_bytes) {
     return 0;
@@ -555,11 +624,15 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* pa
   vec<u64> invalidated_neighbors;
   vec<u32> item_statuses(request->item_count, static_cast<u32>(service::storage_owner::MutationStatus::failed));
   vec<service::storage_owner::MutationResult> mutation_results(request->item_count);
+  mark_storage_owner_foreground_activity();
+  storage_owner_insert_active_workers_.fetch_add(1, std::memory_order_acq_rel);
   const bool ok = execute_storage_owner_batch_items(ids, kinds.data(), decoded_vectors.data(),
                                                     anchor_hints, request->anchor_hint_count,
                                                     request->item_count,
                                                     breakdown, config, &invalidated_neighbors,
                                                     &item_statuses, &mutation_results);
+  storage_owner_insert_active_workers_.fetch_sub(1, std::memory_order_acq_rel);
+  mark_storage_owner_foreground_activity();
   for (u32 i = 0; i < request->item_count; ++i) {
     statuses[i] = ok ? item_statuses[i]
                      : static_cast<u32>(service::storage_owner::MutationStatus::failed);
@@ -596,8 +669,9 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
 
   RemotePtr medoid_ptr{};
   bool medoid_loaded = false;
-  std::unordered_map<u64, vec<RemotePtr>> local_updates;
-  std::unordered_map<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
+  const bool maintenance_enabled = storage_owner_maintenance_enabled(config);
+  dense_hashmap_t<u64, vec<RemotePtr>> local_updates;
+  dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
   if (statuses != nullptr) {
     statuses->assign(item_count, static_cast<u32>(service::storage_owner::MutationStatus::failed));
   }
@@ -624,6 +698,9 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       const bool deleted = mark_node_deleted(old_entry.current, old_entry.generation);
       if (deleted) {
         publish_mutation(ids[idx], old_entry.current, old_entry.generation, true);
+        if (maintenance_enabled) {
+          (void)enqueue_deleted_node_cleanup(old_entry.current, config);
+        }
       }
       if (statuses != nullptr) {
         (*statuses)[idx] = static_cast<u32>(deleted ? service::storage_owner::MutationStatus::ok
@@ -641,39 +718,15 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
         if (!ptr.is_null()) item_anchor_hints.push_back(ptr);
       }
     }
-    const bool use_anchors = config.storage_owner_update_mode == "anchored" &&
+    const bool local_stitch = storage_owner_local_stitch_mode(config);
+    const bool use_anchors = storage_owner_anchor_mode(config) &&
                              !item_anchor_hints.empty();
     vec<RemotePtr> candidates;
-    vec<RemotePtr> audit_exact_candidates;
     if (use_anchors) {
       auto t_search = std::chrono::steady_clock::now();
-      candidates = anchor_search_candidates(components, item_anchor_hints, config, &breakdown);
+      candidates = anchor_search_candidates(components, item_anchor_hints, config,
+                                            &breakdown, local_stitch);
       breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
-
-      const u64 sequence = storage_owner_anchor_insert_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
-      const bool audit = config.storage_owner_anchor_audit_rate != 0 &&
-                         sequence % config.storage_owner_anchor_audit_rate == 0;
-      const bool insufficient = candidates.size() < config.R;
-      if (audit || insufficient) {
-        if (!medoid_loaded) {
-          auto t_medoid = std::chrono::steady_clock::now();
-          medoid_ptr = read_global_medoid();
-          medoid_loaded = true;
-          breakdown.storage_owner_medoid_ns += elapsed_ns_since(t_medoid);
-        }
-        if (!medoid_ptr.is_null()) {
-          t_search = std::chrono::steady_clock::now();
-          const vec<RemotePtr> exact = beam_search_candidates(components, medoid_ptr, config, &breakdown);
-          breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
-          if (audit) ++breakdown.storage_owner_anchor_audits;
-          if (insufficient) {
-            candidates = exact;
-            ++breakdown.storage_owner_anchor_fallbacks;
-          } else if (audit) {
-            audit_exact_candidates = exact;
-          }
-        }
-      }
     } else if (!medoid_loaded) {
       auto t_medoid = std::chrono::steady_clock::now();
       medoid_ptr = read_global_medoid();
@@ -693,6 +746,10 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
         mark_node_deleted(old_entry.current, old_entry.generation);
       }
       publish_mutation(ids[idx], new_ptr, generation, false);
+      if (maintenance_enabled) {
+        (void)enqueue_insert_stitch(ids[idx], generation, new_ptr, config);
+        (void)enqueue_deleted_node_cleanup(old_entry.current, config);
+      }
       RemotePtr observed;
       if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
         medoid_ptr = new_ptr;
@@ -709,24 +766,16 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       candidates = beam_search_candidates(components, medoid_ptr, config, &breakdown);
       breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
     }
-    hashset_t<RemotePtr> empty_skip;
+    hashset_t<RemotePtr> local_empty_skip;
+    hashset_t<RemotePtr>& empty_skip =
+      current_storage_owner_thread_ != nullptr
+        ? current_storage_owner_thread_->coroutine_scratch_state().empty_skip
+        : local_empty_skip;
+    empty_skip.clear();
     auto t_prune = std::chrono::steady_clock::now();
     vec<RemotePtr> selected_neighbors = robust_prune_cpu(reinterpret_cast<const byte_t*>(components.data()),
                                                          VectorDType::float32, candidates, empty_skip, config, &breakdown);
     breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
-    if (!audit_exact_candidates.empty()) {
-      t_prune = std::chrono::steady_clock::now();
-      vec<RemotePtr> exact_selected = robust_prune_cpu(
-        reinterpret_cast<const byte_t*>(components.data()), VectorDType::float32,
-        audit_exact_candidates, empty_skip, config, &breakdown);
-      breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
-      if (storage_owner_candidate_overlap(selected_neighbors, exact_selected, config.R) <
-          config.storage_owner_anchor_min_overlap) {
-        selected_neighbors = std::move(exact_selected);
-        ++breakdown.storage_owner_anchor_fallbacks;
-        ++breakdown.storage_owner_anchor_audit_failures;
-      }
-    }
     const RemotePtr new_ptr = allocate_local_node();
     if (results != nullptr) {
       (*results)[idx].new_rptr_raw = new_ptr.raw_address;
@@ -738,16 +787,22 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       mark_node_deleted(old_entry.current, old_entry.generation);
     }
     publish_mutation(ids[idx], new_ptr, generation, false);
+    if (maintenance_enabled) {
+      (void)enqueue_insert_stitch(ids[idx], generation, new_ptr, config);
+      (void)enqueue_deleted_node_cleanup(old_entry.current, config);
+    }
     if (statuses != nullptr) {
       (*statuses)[idx] = static_cast<u32>(service::storage_owner::MutationStatus::ok);
     }
 
-    for (const RemotePtr& neighbor_ptr : selected_neighbors) {
-      if (local_shard(neighbor_ptr.memory_node())) {
-        local_updates[neighbor_ptr.raw_address].push_back(new_ptr);
-      } else {
-        remote_updates[neighbor_ptr.memory_node()].push_back(
-          service::storage_owner::ReverseUpdateOp{neighbor_ptr.raw_address, new_ptr.raw_address});
+    if (!maintenance_enabled || local_stitch) {
+      for (const RemotePtr& neighbor_ptr : selected_neighbors) {
+        if (local_shard(neighbor_ptr.memory_node())) {
+          local_updates[neighbor_ptr.raw_address].push_back(new_ptr);
+        } else if (!local_stitch) {
+          remote_updates[neighbor_ptr.memory_node()].push_back(
+            service::storage_owner::ReverseUpdateOp{neighbor_ptr.raw_address, new_ptr.raw_address});
+        }
       }
     }
   }

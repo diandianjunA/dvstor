@@ -7,7 +7,7 @@ PROFILE="${1:-${PROFILE:-00_baseline}}"
 load_experiment_profile "$PROFILE"
 
 ensure_built dvstor_breakdown_benchmark
-PREPARE_BASE="${PREPARE_BASE:-0}" "$EVALUATION_DIR/prepare_sift100m_data.sh"
+PREPARE_BASE="${PREPARE_BASE:-0}" "$EXPERIMENT_DIR/prepare_sift100m_data.sh"
 
 WORKLOAD="${WORKLOAD:-mixed}"
 READ_RATIO="${READ_RATIO:-0.5}"
@@ -51,4 +51,3 @@ printf '[breakdown] profile=%s command:' "$PROFILE"; printf ' %q' "${cmd[@]}"; e
 "${cmd[@]}"
 echo "json: $JSON_REPORT"
 echo "text: $TEXT_REPORT"
-

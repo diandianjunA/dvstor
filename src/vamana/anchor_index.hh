@@ -54,6 +54,11 @@ public:
   Route route(const span<const element_t> query,
               u32 hint_count,
               std::optional<u32> owner_override = std::nullopt) const;
+  vec<u32> nearest_shards(const span<const element_t> query, u32 count) const;
+  u32 nearest_shard(const span<const element_t> query) const;
+  vec<RemotePtr> nearest_anchors(const span<const element_t> query,
+                                 u32 shard,
+                                 u32 count) const;
 
 private:
   struct Shard {
@@ -61,11 +66,6 @@ private:
     vec<element_t> vectors;
     vec<RemotePtr> pointers;
   };
-
-  u32 nearest_shard(const span<const element_t> query) const;
-  vec<RemotePtr> nearest_anchors(const span<const element_t> query,
-                                 u32 shard,
-                                 u32 count) const;
 
   u32 dim_{};
   size_t total_anchors_{};

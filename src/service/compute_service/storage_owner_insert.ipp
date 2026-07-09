@@ -13,19 +13,17 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
         throw std::invalid_argument("insert dimension mismatch");
       }
 
-      std::shared_ptr<service::breakdown::Sample> sample;
-      if (breakdown_enabled_) {
-        sample = std::make_shared<service::breakdown::Sample>(service::breakdown::Operation::insert);
-        const auto now = std::chrono::steady_clock::now();
-        sample->enqueued_at = now;
-        sample->mark_started(now, now, statistics::ThreadStatistics{});
-      }
+      auto sample = std::make_shared<service::breakdown::Sample>(
+        service::breakdown::Operation::insert, breakdown_enabled_);
+      const auto now = std::chrono::steady_clock::now();
+      sample->enqueued_at = now;
+      sample->mark_started(now, now, statistics::ThreadStatistics{});
 
       auto task = std::make_unique<StorageInsertTask>();
       task->item = item;
       task->kind = service::storage_owner::MutationKind::insert;
       task->sample = sample;
-      task->enqueued_at = std::chrono::steady_clock::now();
+      task->enqueued_at = sample->enqueued_at;
       futures.push_back(task->result.get_future());
       samples.push_back(sample);
       const auto route = route_storage_owner_update(item);
@@ -79,17 +77,16 @@ size_t ComputeService<Distance>::insert(const vec<InsertItem>& batch) {
       throw std::invalid_argument("insert dimension mismatch");
     }
 
-    std::shared_ptr<service::breakdown::Sample> sample;
-    if (breakdown_enabled_) {
-      sample = std::make_shared<service::breakdown::Sample>(service::breakdown::Operation::insert);
-      sample->enqueued_at = std::chrono::steady_clock::now();
-    }
+    auto sample = std::make_shared<service::breakdown::Sample>(
+      service::breakdown::Operation::insert, breakdown_enabled_);
+    const auto enqueued_at = std::chrono::steady_clock::now();
+    sample->enqueued_at = enqueued_at;
 
     auto* request = new service::InsertRequest{};
     request->id = item.id;
     request->components = item.values;
     request->kind = service::storage_owner::MutationKind::insert;
-    request->enqueued_at = std::chrono::steady_clock::now();
+    request->enqueued_at = enqueued_at;
     request->breakdown_sample = sample;
     futures.push_back(request->result.get_future());
     requests.push_back(request);
@@ -145,7 +142,6 @@ size_t ComputeService<Distance>::upsert(const vec<InsertItem>& batch) {
       request->components = item.values;
       request->kind = service::storage_owner::MutationKind::upsert;
       request->old_ptr = old_live ? old_ptr : RemotePtr{};
-      request->enqueued_at = std::chrono::steady_clock::now();
       futures.push_back(request->result.get_future());
       requests.push_back(request);
       insert_queue_.enqueue(request);
@@ -190,7 +186,6 @@ size_t ComputeService<Distance>::upsert(const vec<InsertItem>& batch) {
     auto task = std::make_unique<StorageInsertTask>();
     task->item = item;
     task->kind = service::storage_owner::MutationKind::upsert;
-    task->enqueued_at = std::chrono::steady_clock::now();
     futures.push_back(task->result.get_future());
     const u32 owner_storage = storage_owner_for_id(item.id);
     const auto route = route_storage_owner_update(item, owner_storage);
@@ -240,7 +235,6 @@ size_t ComputeService<Distance>::erase(const vec<node_t>& ids) {
     task->item.id = id;
     task->item.values.assign(config_.dim, 0.0f);
     task->kind = service::storage_owner::MutationKind::erase;
-    task->enqueued_at = std::chrono::steady_clock::now();
     futures.push_back(task->result.get_future());
     const u32 owner_storage = storage_owner_for_id(id);
     auto& state = *storage_insert_owners_[owner_storage];
@@ -265,15 +259,19 @@ void ComputeService<Distance>::start_storage_insert_runtime() {
 
   const u32 owner_count = std::max<u32>(1, num_servers_);
   const u32 rpc_depth = std::max<u32>(1, config_.storage_owner_rpc_depth);
+  const bool anchor_mode = config_.storage_owner_update_mode == "local_stitch";
   const size_t request_bytes = std::max(
     service::storage_owner::insert_batch_request_bytes(
       config_.storage_owner_batch_max, config_.dim,
-      config_.storage_owner_update_mode == "anchored" ? config_.storage_owner_anchor_hints : 0),
+      anchor_mode ? config_.storage_owner_anchor_hints : 0),
     service::storage_owner::mutation_batch_request_bytes(
       config_.storage_owner_batch_max, config_.dim,
-      config_.storage_owner_update_mode == "anchored" ? config_.storage_owner_anchor_hints : 0));
+      anchor_mode ? config_.storage_owner_anchor_hints : 0));
   const size_t response_bytes =
     service::storage_owner::insert_batch_response_bytes(config_.storage_owner_batch_max);
+  lib_assert(request_bytes <= std::numeric_limits<u32>::max() &&
+             response_bytes <= std::numeric_limits<u32>::max(),
+             "storage_owner RPC message is too large for verbs SGEs; reduce batch size or vector dimension");
   const size_t max_inflight = static_cast<size_t>(owner_count) * rpc_depth;
   lib_assert(max_inflight <= static_cast<size_t>(config_.max_send_queue_wr),
              "storage_owner RPC depth exceeds compute send CQ capacity");
@@ -386,7 +384,7 @@ void ComputeService<Distance>::run_storage_insert_sender(u32 owner_storage) {
   for (;;) {
     vec<std::unique_ptr<StorageInsertTask>> owned_tasks;
     u64 batch_wait_ns = 0;
-    auto owner_selected_at = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point owner_selected_at{};
     u32 slot_id = 0;
     {
       std::unique_lock<std::mutex> lock(state.mutex);
@@ -401,21 +399,28 @@ void ComputeService<Distance>::run_storage_insert_sender(u32 owner_storage) {
       if (state.queue.empty() || state.free_slots.empty()) {
         continue;
       }
-      owner_selected_at = std::chrono::steady_clock::now();
+      if (breakdown_enabled_) {
+        owner_selected_at = std::chrono::steady_clock::now();
+      }
 
       if (config_.storage_owner_batch_wait_us > 0 &&
           state.queue.size() < config_.storage_owner_batch_max &&
           !storage_insert_shutdown_.load(std::memory_order_acquire)) {
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::microseconds(config_.storage_owner_batch_wait_us);
-        const auto batch_wait_start = std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point batch_wait_start{};
+        if (breakdown_enabled_) {
+          batch_wait_start = std::chrono::steady_clock::now();
+        }
         while (state.queue.size() < config_.storage_owner_batch_max &&
                !storage_insert_shutdown_.load(std::memory_order_acquire)) {
           if (state.cv.wait_until(lock, deadline) == std::cv_status::timeout) {
             break;
           }
         }
-        batch_wait_ns = duration_ns(batch_wait_start, std::chrono::steady_clock::now());
+        if (breakdown_enabled_) {
+          batch_wait_ns = duration_ns(batch_wait_start, std::chrono::steady_clock::now());
+        }
       }
 
       slot_id = state.free_slots.front();
@@ -423,7 +428,10 @@ void ComputeService<Distance>::run_storage_insert_sender(u32 owner_storage) {
       const size_t batch_size = std::min<size_t>(state.queue.size(), config_.storage_owner_batch_max);
       owned_tasks.reserve(batch_size);
       for (size_t i = 0; i < batch_size; ++i) {
-        state.queue.front()->sender_dequeued_at = owner_selected_at;
+        if (state.queue.front()->sample &&
+            state.queue.front()->sample->collects_breakdown()) {
+          state.queue.front()->sender_dequeued_at = owner_selected_at;
+        }
         owned_tasks.push_back(std::move(state.queue.front()));
         state.queue.pop_front();
       }
@@ -450,10 +458,20 @@ void ComputeService<Distance>::post_storage_owner_batch(
   }
 
   const u32 item_count = static_cast<u32>(tasks.size());
-  const u32 anchor_hint_count = config_.storage_owner_update_mode == "anchored"
+  const bool anchor_mode = config_.storage_owner_update_mode == "local_stitch";
+  const u32 anchor_hint_count = anchor_mode
                                   ? config_.storage_owner_anchor_hints : 0;
   const u64 batch_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
-  const auto prepare_start = std::chrono::steady_clock::now();
+  bool collect_breakdown = false;
+  for (const auto& task : tasks) {
+    if (task->sample && task->sample->collects_breakdown()) {
+      collect_breakdown = true;
+      break;
+    }
+  }
+  const auto prepare_start = collect_breakdown
+    ? std::chrono::steady_clock::now()
+    : std::chrono::steady_clock::time_point{};
   bool mutation_request = false;
   for (const auto& task : tasks) {
     mutation_request = mutation_request || task->kind != service::storage_owner::MutationKind::insert;
@@ -464,6 +482,12 @@ void ComputeService<Distance>::post_storage_owner_batch(
   const size_t response_size = service::storage_owner::insert_batch_response_bytes(item_count);
   auto& state = *storage_insert_owners_[owner_storage];
   auto& slot = state.slots[slot_id];
+  lib_assert(request_size <= slot.request_buffer.size() &&
+             response_size <= slot.response_buffer.size(),
+             "storage_owner RPC slot buffer is too small for this batch");
+  lib_assert(request_size <= std::numeric_limits<u32>::max() &&
+             response_size <= std::numeric_limits<u32>::max(),
+             "storage_owner RPC message is too large for verbs SGEs");
   slot.tasks = std::move(tasks);
   slot.samples.clear();
   slot.samples.reserve(slot.tasks.size());
@@ -513,7 +537,9 @@ void ComputeService<Distance>::post_storage_owner_batch(
     }
   }
 
-  const u64 request_prepare_ns = duration_ns(prepare_start, std::chrono::steady_clock::now());
+  const u64 request_prepare_ns = collect_breakdown
+    ? duration_ns(prepare_start, std::chrono::steady_clock::now())
+    : 0;
   std::memset(slot.response_buffer.data(), 0, response_size);
 
   const u64 wr_id = storage_owner_wr_id(owner_storage, slot_id);
@@ -529,7 +555,9 @@ void ComputeService<Distance>::post_storage_owner_batch(
     slot.request_prepare_ns = request_prepare_ns;
     slot.request_size = request_size;
     slot.response_size = response_size;
-    slot.send_posted_at = std::chrono::steady_clock::now();
+    slot.send_posted_at = collect_breakdown
+      ? std::chrono::steady_clock::now()
+      : std::chrono::steady_clock::time_point{};
     state.batch_to_slot[batch_id] = slot_id;
   }
   storage_insert_inflight_.fetch_add(1, std::memory_order_acq_rel);
@@ -591,8 +619,17 @@ void ComputeService<Distance>::handle_storage_owner_send_completion(u32 owner_st
   if (!slot.in_use) {
     return;
   }
+  bool collect_breakdown = false;
+  for (const auto& sample : slot.samples) {
+    if (sample && sample->collects_breakdown()) {
+      collect_breakdown = true;
+      break;
+    }
+  }
   slot.send_done = true;
-  slot.send_completed_at = std::chrono::steady_clock::now();
+  if (collect_breakdown) {
+    slot.send_completed_at = std::chrono::steady_clock::now();
+  }
   maybe_release_storage_owner_slot_locked(state, slot);
 }
 
@@ -633,8 +670,24 @@ void ComputeService<Distance>::handle_storage_owner_response(u32 owner_storage, 
       const size_t response_size = service::storage_owner::insert_batch_response_bytes(response->item_count);
       if (slot.in_use && response_size <= slot.response_buffer.size()) {
         std::memcpy(slot.response_buffer.data(), response_slot.buffer.data(), response_size);
+        bool collect_breakdown = false;
+        for (const auto& sample : slot.samples) {
+          if (sample && sample->collects_breakdown()) {
+            collect_breakdown = true;
+            break;
+          }
+        }
+        bool collect_latency = false;
+        for (const auto& sample : slot.samples) {
+          if (sample) {
+            collect_latency = true;
+            break;
+          }
+        }
         slot.response_done = true;
-        slot.response_completed_at = std::chrono::steady_clock::now();
+        if (collect_breakdown || collect_latency) {
+          slot.response_completed_at = std::chrono::steady_clock::now();
+        }
         maybe_release_storage_owner_slot_locked(state, slot);
       }
     }
@@ -678,7 +731,14 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
                              response->owner_storage == slot.owner_storage &&
                              response->batch_id == slot.batch_id &&
                              response->item_count == slot.item_count;
-    const auto* breakdown = response_ok
+    bool collect_breakdown = false;
+    for (const auto& sample : slot.samples) {
+      if (sample && sample->collects_breakdown()) {
+        collect_breakdown = true;
+        break;
+      }
+    }
+    const auto* breakdown = collect_breakdown && response_ok
                               ? service::storage_owner::response_breakdown(slot.response_buffer.data(), slot.item_count)
                               : nullptr;
     if (!response_ok) {
@@ -699,10 +759,15 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
       }
     }
     const u64 memory_breakdown_ns = breakdown == nullptr ? 0 : breakdown->total();
-    const u64 send_ns = duration_ns_clamped(slot.send_posted_at, slot.send_completed_at);
-    const u64 response_wait_ns = duration_ns_clamped(slot.send_completed_at, slot.response_completed_at);
-    const u64 response_wait_unaccounted_ns =
-      response_wait_ns > memory_breakdown_ns ? response_wait_ns - memory_breakdown_ns : 0;
+    const u64 send_ns = collect_breakdown
+      ? duration_ns_clamped(slot.send_posted_at, slot.send_completed_at)
+      : 0;
+    const u64 response_wait_ns = collect_breakdown
+      ? duration_ns_clamped(slot.send_completed_at, slot.response_completed_at)
+      : 0;
+    const u64 response_wait_unaccounted_ns = collect_breakdown &&
+        response_wait_ns > memory_breakdown_ns
+      ? response_wait_ns - memory_breakdown_ns : 0;
     const auto finished_at = slot.response_completed_at;
     const bool mutation_response = response->magic == service::storage_owner::kMutationMagic;
     const byte_t* request_vectors = mutation_response
@@ -724,7 +789,7 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
                     << std::endl;
         }
       }
-      if (slot.samples[i]) {
+      if (slot.samples[i] && slot.samples[i]->collects_breakdown()) {
         add_storage_owner_sender_breakdown(
           slot.samples[i],
           duration_ns_clamped(slot.tasks[i]->enqueued_at, slot.tasks[i]->sender_dequeued_at),
@@ -737,6 +802,8 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
           add_storage_owner_breakdown(slot.samples[i], *breakdown, slot.item_count);
           if (i == 0) add_storage_owner_counters(slot.samples[i], *breakdown);
         }
+      }
+      if (slot.samples[i]) {
         slot.samples[i]->mark_finished(finished_at, statistics::ThreadStatistics{});
       }
       if (ok && rabitq_cache_ != nullptr) {

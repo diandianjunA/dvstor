@@ -1,0 +1,6 @@
+sift101m long insert recall
+  inserted: 1000000/1000000 in 3405.108489s (293.676399 inserts/s)
+  baseline recall@10: 0.937220 (10000 queries)
+  post recall@10: 0.937520 (10000 queries)
+  recall drop: -0.000300
+  passed: true

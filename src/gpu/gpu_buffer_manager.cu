@@ -4,6 +4,7 @@
 #include <infiniband/verbs.h>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 #define CUDA_CHECK(call)                                                      \
     do {                                                                       \
@@ -16,6 +17,19 @@
     } while (0)
 
 namespace gpu {
+
+namespace {
+
+size_t checked_mul_size(size_t lhs, size_t rhs, const char* label) {
+    if (rhs != 0 && lhs > std::numeric_limits<size_t>::max() / rhs) {
+        std::fprintf(stderr, "GPU buffer size overflow while sizing %s: %zu * %zu\n",
+                     label, lhs, rhs);
+        std::abort();
+    }
+    return lhs * rhs;
+}
+
+}  // namespace
 
 GpuBufferManager::~GpuBufferManager() {
     if (initialized_) {
@@ -45,7 +59,16 @@ void GpuBufferManager::init(uint32_t num_coroutines,
     kernel_timing_enabled_ = enable_kernel_timing;
 
     const bool try_gpudirect_rdma = enable_gpudirect_rdma && rdma_pd != nullptr;
-    const size_t candidate_bytes = static_cast<size_t>(max_batch) * candidate_vector_bytes_;
+    const size_t candidate_bytes =
+        checked_mul_size(static_cast<size_t>(max_batch), candidate_vector_bytes_, "candidate vectors");
+    const size_t candidate_distance_bytes =
+        checked_mul_size(static_cast<size_t>(max_batch), sizeof(float), "candidate distances");
+    const size_t candidate_order_bytes =
+        checked_mul_size(static_cast<size_t>(max_batch), sizeof(uint32_t), "candidate order");
+    const size_t candidate_pointer_bytes =
+        checked_mul_size(static_cast<size_t>(max_batch), sizeof(void*), "candidate pointers");
+    const size_t pruned_index_bytes =
+        checked_mul_size(static_cast<size_t>(max_R), sizeof(uint32_t), "pruned indices");
     ibv_pd* pd = try_gpudirect_rdma ? rdma_pd : nullptr;
 
     states_ = new CoroutineGpuState[num_coroutines];
@@ -64,22 +87,22 @@ void GpuBufferManager::init(uint32_t num_coroutines,
         }
 
         CUDA_CHECK(cudaMallocHost(&s.h_query, query_vector_bytes_));
-        CUDA_CHECK(cudaMallocHost(&s.h_candidate_vecs, max_batch * candidate_vector_bytes_));
-        CUDA_CHECK(cudaMallocHost(&s.h_candidate_dists, max_batch * sizeof(float)));
-        CUDA_CHECK(cudaMallocHost(&s.h_candidate_order, max_batch * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMallocHost(&s.h_distances, max_batch * sizeof(float)));
-        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&s.h_candidate_ptrs), max_batch * sizeof(void*)));
-        CUDA_CHECK(cudaMallocHost(&s.h_pruned_indices, max_R * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&s.h_candidate_vecs, candidate_bytes));
+        CUDA_CHECK(cudaMallocHost(&s.h_candidate_dists, candidate_distance_bytes));
+        CUDA_CHECK(cudaMallocHost(&s.h_candidate_order, candidate_order_bytes));
+        CUDA_CHECK(cudaMallocHost(&s.h_distances, candidate_distance_bytes));
+        CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&s.h_candidate_ptrs), candidate_pointer_bytes));
+        CUDA_CHECK(cudaMallocHost(&s.h_pruned_indices, pruned_index_bytes));
         CUDA_CHECK(cudaMallocHost(&s.h_pruned_count, sizeof(uint32_t)));
 
         CUDA_CHECK(cudaMalloc(&s.d_query, query_vector_bytes_));
-        CUDA_CHECK(cudaMalloc(&s.d_candidate_vecs, max_batch * candidate_vector_bytes_));
-        CUDA_CHECK(cudaMalloc(&s.d_candidate_vecs_alt, max_batch * candidate_vector_bytes_));
-        CUDA_CHECK(cudaMalloc(&s.d_candidate_dists, max_batch * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&s.d_candidate_order, max_batch * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&s.d_distances, max_batch * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.d_candidate_ptrs), max_batch * sizeof(void*)));
-        CUDA_CHECK(cudaMalloc(&s.d_pruned_indices, max_R * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&s.d_candidate_vecs, candidate_bytes));
+        CUDA_CHECK(cudaMalloc(&s.d_candidate_vecs_alt, candidate_bytes));
+        CUDA_CHECK(cudaMalloc(&s.d_candidate_dists, candidate_distance_bytes));
+        CUDA_CHECK(cudaMalloc(&s.d_candidate_order, candidate_order_bytes));
+        CUDA_CHECK(cudaMalloc(&s.d_distances, candidate_distance_bytes));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&s.d_candidate_ptrs), candidate_pointer_bytes));
+        CUDA_CHECK(cudaMalloc(&s.d_pruned_indices, pruned_index_bytes));
         CUDA_CHECK(cudaMalloc(&s.d_pruned_count, sizeof(uint32_t)));
     }
 

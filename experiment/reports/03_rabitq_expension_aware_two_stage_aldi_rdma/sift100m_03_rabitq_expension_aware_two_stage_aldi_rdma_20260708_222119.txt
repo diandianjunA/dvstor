@@ -1,0 +1,32 @@
+throughput
+  duration_seconds: 120
+  total_ops_per_sec: 2003.09 (ops=240371)
+  query_ops_per_sec: 1743.38 (ops=209205)
+  write_ops_per_sec: 259.717 (ops=31166)
+  write_mix_completed: insert=15534 upsert=12424 delete=3208
+recall
+  recall@10: 0.9308
+  queries: 1000
+  passed: true
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+static_gt_post_recall
+  recall@10: 0.9305
+  queries: 1000
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+insert breakdown
+  count: 15534
+  latency_ms: mean=34.6523 p50=25.5424 p95=87.9744 p99=138.33
+  top_categories:
+    cpu_ns: 530510 ms (98.5548%)
+    rdma_ns: 7779.34 ms (1.4452%)
+    gpu_ns: 0 ms (0%)
+    transfer_ns: 0 ms (0%)
+query breakdown
+  count: 209205
+  latency_ms: mean=4.49729 p50=4.27315 p95=6.79144 p99=8.57037
+  top_categories:
+    cpu_ns: 436737 ms (48.4412%)
+    rdma_ns: 308750 ms (34.2453%)
+    gpu_ns: 104640 ms (11.6063%)
+    transfer_ns: 51455.5 ms (5.70725%)
+  utilization: disabled (set --observe-device-utilization to enable)

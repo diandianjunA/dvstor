@@ -40,6 +40,7 @@ MemoryNode::MemoryNode(Configuration& config)
   const filepath_t index_prefix = config.resolved_index_prefix();
   index_prefix_ = index_prefix;
   VectorDType startup_dtype = config.resolved_vector_dtype();
+  str startup_anchor_format;
   const filepath_t meta_file = filepath_t(index_prefix.string() + ".meta.json");
   if (!index_prefix.empty() && std::filesystem::exists(meta_file)) {
     service::index_metadata::Metadata metadata;
@@ -104,6 +105,7 @@ MemoryNode::MemoryNode(Configuration& config)
       lib_assert(VamanaNode::HAS_HOT_GRAPH, "failed to enable compact hot graph on storage node");
     }
     owner_idmap_required_ = metadata.idmap_format == "owner_sharded_v1";
+    startup_anchor_format = metadata.anchor_format;
     print_status("loaded index metadata from " + index_prefix.string() +
                  " (layout=" + VamanaNode::layout_name() +
                  ", vector_data_type=" + VamanaNode::vector_dtype_name() + ")");
@@ -125,6 +127,21 @@ MemoryNode::MemoryNode(Configuration& config)
     if (owner_idmap_required_) {
       lib_assert(load_owner_idmap(index_prefix_), "failed to load owner-sharded idmap");
     }
+  }
+
+  if (use_storage_owner_insert_ &&
+      config.storage_owner_update_mode == "local_stitch") {
+    storage_owner_anchor_index_ = std::make_unique<vamana::anchor::Index>();
+    str anchor_error;
+    lib_assert(startup_anchor_format == "owner_anchor_v1" &&
+                 storage_owner_anchor_index_->load(index_prefix_, config.dim,
+                                                   num_storage_nodes_, &anchor_error),
+               "storage-owner anchor sidecar unavailable on storage node: " + anchor_error);
+    print_status("storage-owner anchors loaded on shard " + std::to_string(storage_id_) +
+                 ": entries=" +
+                 std::to_string(storage_owner_anchor_index_->anchor_count()) +
+                 " memory=" +
+                 std::to_string(storage_owner_anchor_index_->memory_bytes()) + " bytes");
   }
 
   print_status("register memory and distribute access token");
@@ -164,6 +181,7 @@ MemoryNode::MemoryNode(Configuration& config)
     setup_insert_runtime(config);
     storage_worker_config_ = std::make_unique<Configuration>(config);
     start_peer_reverse_update_runtime(config);
+    start_storage_owner_maintenance_runtime(config);
     start_storage_owner_insert_workers(config);
     service_storage_runtime(config);
 
@@ -181,6 +199,7 @@ MemoryNode::MemoryNode(Configuration& config)
       worker.join();
     }
   }
+  stop_storage_owner_maintenance_runtime();
   stop_peer_reverse_update_runtime();
 
   print_status("memory node shutting down");
@@ -237,10 +256,6 @@ MemoryNode::InsertBreakdownCounters MemoryNode::scale_breakdown(const InsertBrea
   out.storage_owner_anchor_expansions = scale_ns(counters.storage_owner_anchor_expansions, part, total);
   out.storage_owner_anchor_remote_expansions =
     scale_ns(counters.storage_owner_anchor_remote_expansions, part, total);
-  out.storage_owner_anchor_fallbacks = scale_ns(counters.storage_owner_anchor_fallbacks, part, total);
-  out.storage_owner_anchor_audits = scale_ns(counters.storage_owner_anchor_audits, part, total);
-  out.storage_owner_anchor_audit_failures =
-    scale_ns(counters.storage_owner_anchor_audit_failures, part, total);
   return out;
 }
 

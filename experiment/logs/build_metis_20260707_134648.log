@@ -1,0 +1,40 @@
+reading dataset "/data/xjs/index/dvstor_sift100m/converted/base_100000000.u8bin" (dim=128, vectors=100000000/100000000, dtype=uint8, vector_bytes=128)
+Reading raw dataset 11% (11010048/100000000) elapsed 0s
+Reading raw dataset 19% (19922944/100000000) elapsed 0s
+Reading raw dataset 21% (21495808/100000000) elapsed 0s
+Reading raw dataset 25% (25165824/100000000) elapsed 1s
+Reading raw dataset 33% (33030144/100000000) elapsed 1s
+Reading raw dataset 44% (44040192/100000000) elapsed 2s
+Reading raw dataset 55% (55050240/100000000) elapsed 2s
+Reading raw dataset 66% (66060288/100000000) elapsed 2s
+Reading raw dataset 77% (77070336/100000000) elapsed 2s
+Reading raw dataset 88% (88080384/100000000) elapsed 3s
+Reading raw dataset 95% (95944704/100000000) elapsed 3s
+Reading raw dataset 100% (100000000/100000000) elapsed 3s done
+offline dataset memory: raw_vectors=12800000000 bytes, float_expansion=0 bytes
+output prefix: "/data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis"
+memory nodes: 5
+threads: 112
+R=96 construction_beam_width=128 alpha=1.2 vector_data_type=uint8
+partition_strategy=metis partition_max_degree=96 partition_imbalance=1.03
+skip_sanity_check=true
+offline distance execution: cpu-avx2
+offline graph memory: neighbors=38400000000 bytes, degrees=100000000 bytes, lock_stripes=1048576
+computing medoid...
+medoid: node 65610822
+initializing random R-regular graph (degree=96)...
+random graph unique neighbor signature ratio=1 sample=4096
+note: using alpha=1.0 for construction (config alpha=1.2 stored in metadata)
+reverse edge maintenance: cheap append plus bulk consolidation
+Building Vamana graph 0% (91732/100000000) elapsed 15s
+Building Vamana graph 0% (177710/100000000) elapsed 30s
+Building Vamana graph 0% (265406/100000000) elapsed 45s
+Building Vamana graph 0% (357175/100000000) elapsed 1m0s
+Building Vamana graph 0% (447426/100000000) elapsed 1m15s
+Building Vamana graph 0% (536660/100000000) elapsed 1m30s
+Building Vamana graph 0% (625313/100000000) elapsed 1m45s
+Building Vamana graph 0% (719374/100000000) elapsed 2m0s
+Building Vamana graph 0% (814468/100000000) elapsed 2m15s
+Building Vamana graph 0% (911774/100000000) elapsed 2m30s
+Building Vamana graph 1% (1007282/100000000) elapsed 2m45s
+Building Vamana graph 1% (1105615/100000000) elapsed 3m0s

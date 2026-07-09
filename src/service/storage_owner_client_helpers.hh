@@ -40,7 +40,7 @@ inline void add_storage_owner_breakdown(
     const std::shared_ptr<service::breakdown::Sample>& sample,
     const service::storage_owner::InsertBreakdownCounters& counters,
     u32 item_count) {
-  if (!sample) {
+  if (!sample || !sample->collects_breakdown()) {
     return;
   }
   const u64 explained_search_ns =
@@ -100,16 +100,13 @@ inline void add_storage_owner_breakdown(
 inline void add_storage_owner_counters(
     const std::shared_ptr<service::breakdown::Sample>& sample,
     const service::storage_owner::InsertBreakdownCounters& counters) {
-  if (!sample) {
+  if (!sample || !sample->collects_breakdown()) {
     return;
   }
   if (counters.storage_owner_anchor_hints == 0 &&
       counters.storage_owner_anchor_valid_hints == 0 &&
       counters.storage_owner_anchor_expansions == 0 &&
-      counters.storage_owner_anchor_remote_expansions == 0 &&
-      counters.storage_owner_anchor_fallbacks == 0 &&
-      counters.storage_owner_anchor_audits == 0 &&
-      counters.storage_owner_anchor_audit_failures == 0) {
+      counters.storage_owner_anchor_remote_expansions == 0) {
     return;
   }
   if (sample->storage_owner_anchor == nullptr) {
@@ -121,9 +118,6 @@ inline void add_storage_owner_counters(
   anchor.valid_hints += counters.storage_owner_anchor_valid_hints;
   anchor.expansions += counters.storage_owner_anchor_expansions;
   anchor.remote_expansions += counters.storage_owner_anchor_remote_expansions;
-  anchor.fallbacks += counters.storage_owner_anchor_fallbacks;
-  anchor.audits += counters.storage_owner_anchor_audits;
-  anchor.audit_failures += counters.storage_owner_anchor_audit_failures;
 }
 
 inline void add_storage_owner_sender_breakdown(
@@ -134,7 +128,7 @@ inline void add_storage_owner_sender_breakdown(
     u64 send_ns,
     u64 response_wait_unaccounted_ns,
     u32 item_count) {
-  if (!sample) {
+  if (!sample || !sample->collects_breakdown()) {
     return;
   }
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_sender_queue_wait,

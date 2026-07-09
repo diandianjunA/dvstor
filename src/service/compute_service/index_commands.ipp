@@ -85,7 +85,14 @@ bool ComputeService<Distance>::initialize_compute_side_idmap(
     clear_idmap();
     return false;
   }
-  hashmap_t<node_t, ComputeSideIdEntry> loaded;
+  struct IdMapShardToLoad {
+    filepath_t path;
+    u32 owner{};
+    u64 entry_count{};
+  };
+  vec<IdMapShardToLoad> shards;
+  shards.reserve(num_servers_);
+  u64 total_entry_count = 0;
   for (u32 owner = 0; owner < num_servers_; ++owner) {
     const filepath_t path = index_path::owner_idmap_file(index_prefix, owner + 1, num_servers_);
     std::ifstream input(path, std::ios::binary);
@@ -106,6 +113,25 @@ bool ComputeService<Distance>::initialize_compute_side_idmap(
       clear_idmap();
       return false;
     }
+    shards.push_back(IdMapShardToLoad{path, owner, header.entry_count});
+    total_entry_count += header.entry_count;
+  }
+  const u64 dynamic_headroom = std::max<u64>(1024ull * 1024ull, total_entry_count / 20);
+  const u64 reserve_count = total_entry_count + dynamic_headroom;
+  hashmap_t<node_t, ComputeSideIdEntry> loaded;
+  // Reserve dynamic-write headroom up front; growing a 100M-entry dense map
+  // during mixed warmup can require a very large transient allocation.
+  loaded.reserve(static_cast<size_t>(reserve_count));
+  for (const auto& shard : shards) {
+    std::ifstream input(shard.path, std::ios::binary);
+    vamana::idmap::Header header;
+    input.read(reinterpret_cast<char*>(&header), sizeof(header));
+    if (!input.good() || header.entry_count != shard.entry_count) {
+      std::cerr << "[compute-side] invalid idmap sidecar while loading: "
+                << shard.path << std::endl;
+      clear_idmap();
+      return false;
+    }
     for (u64 i = 0; i < header.entry_count; ++i) {
       vamana::idmap::Entry entry;
       input.read(reinterpret_cast<char*>(&entry), sizeof(entry));
@@ -116,14 +142,16 @@ bool ComputeService<Distance>::initialize_compute_side_idmap(
       loaded[entry.id] = ComputeSideIdEntry{
         RemotePtr{entry.rptr_raw},
         (entry.flags & vamana::idmap::kDeleted) != 0,
-        owner};
+        shard.owner};
     }
   }
   {
     std::lock_guard<std::mutex> lock(compute_side_idmap_mutex_);
     compute_side_idmap_ = std::move(loaded);
   }
-  std::cerr << "[compute-side] loaded runtime idmap entries=" << compute_side_idmap_.size() << std::endl;
+  std::cerr << "[compute-side] loaded runtime idmap entries="
+            << compute_side_idmap_.size()
+            << " reserved=" << reserve_count << std::endl;
   return true;
 }
 

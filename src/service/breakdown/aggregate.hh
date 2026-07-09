@@ -17,6 +17,7 @@ struct Aggregate {
   u64 total_rdma_wait_ns{};
   u64 total_gpu_kernel_ns{};
   bool device_utilization_observed{};
+  bool fine_grained_breakdown_observed{};
   std::vector<u64> end_to_end_latencies_ns{};
   std::vector<u64> service_latencies_ns{};
   std::array<u64, kCategoryCount> category_ns{};
@@ -67,12 +68,18 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.total_queue_wait_ns += sample.queue_wait_ns;
   aggregate.total_service_ns += sample.service_ns;
   aggregate.total_end_to_end_ns += sample.end_to_end_ns;
+  aggregate.fine_grained_breakdown_observed = aggregate.fine_grained_breakdown_observed ||
+    sample.collects_breakdown();
+  aggregate.end_to_end_latencies_ns.push_back(sample.end_to_end_ns);
+  aggregate.service_latencies_ns.push_back(sample.service_ns);
+  if (!sample.collects_breakdown()) {
+    return;
+  }
+
   aggregate.total_rdma_wait_ns += sample.rdma_wait_ns;
   aggregate.total_gpu_kernel_ns += sample.gpu_kernel_ns;
   aggregate.device_utilization_observed = aggregate.device_utilization_observed ||
     sample.device_utilization_observed;
-  aggregate.end_to_end_latencies_ns.push_back(sample.end_to_end_ns);
-  aggregate.service_latencies_ns.push_back(sample.service_ns);
   for (size_t i = 0; i < aggregate.category_ns.size(); ++i) {
     aggregate.category_ns[i] += sample.category_ns[i];
   }
@@ -118,13 +125,6 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.rabitq_forced_widen += delta.rabitq_forced_widen;
   aggregate.counters.rabitq_audit_expansions += delta.rabitq_audit_expansions;
   aggregate.counters.rabitq_audit_candidates += delta.rabitq_audit_candidates;
-  aggregate.counters.rabitq_safe_skips += delta.rabitq_safe_skips;
-  aggregate.counters.rabitq_exact_fallbacks += delta.rabitq_exact_fallbacks;
-  aggregate.counters.rabitq_prefetch_issued += delta.rabitq_prefetch_issued;
-  aggregate.counters.rabitq_prefetch_hits += delta.rabitq_prefetch_hits;
-  aggregate.counters.rabitq_prefetch_misses += delta.rabitq_prefetch_misses;
-  aggregate.counters.rabitq_prefetch_disabled_queries +=
-    delta.rabitq_prefetch_disabled_queries;
   aggregate.counters.credit_rounds += delta.credit_rounds;
   aggregate.counters.credit_expansions_issued += delta.credit_expansions_issued;
   aggregate.counters.credit_precommit_expansions += delta.credit_precommit_expansions;
@@ -163,10 +163,6 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   aggregate.counters.storage_owner_anchor_expansions += delta.storage_owner_anchor_expansions;
   aggregate.counters.storage_owner_anchor_remote_expansions +=
     delta.storage_owner_anchor_remote_expansions;
-  aggregate.counters.storage_owner_anchor_fallbacks += delta.storage_owner_anchor_fallbacks;
-  aggregate.counters.storage_owner_anchor_audits += delta.storage_owner_anchor_audits;
-  aggregate.counters.storage_owner_anchor_audit_failures +=
-    delta.storage_owner_anchor_audit_failures;
   aggregate.lock_attempts += sample.lock_attempts;
   aggregate.lock_retries += sample.lock_retries;
   aggregate.cas_failures += sample.cas_failures;

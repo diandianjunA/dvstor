@@ -18,7 +18,7 @@ PORT=$((BASE_PORT + NODE_ID - 1))
 SHARD_FILE="$(shard_file "$NODE_ID")"
 if [[ ! -f "$SHARD_FILE" ]]; then
   echo "missing shard file: $SHARD_FILE" >&2
-  echo "build it first with: $EVALUATION_DIR/build_sift100m_index.sh" >&2
+  echo "build it first with: $EXPERIMENT_DIR/build_sift100m_index.sh" >&2
   exit 1
 fi
 
@@ -60,21 +60,27 @@ if [[ "$INSERT_EXECUTION" == "storage_owner" ]]; then
   cmd+=(--storage-owner-peer-rdma-tokens "${STORAGE_OWNER_PEER_RDMA_TOKENS:-8}")
   cmd+=(--storage-owner-rpc-depth "${STORAGE_OWNER_RPC_DEPTH:-16}")
   cmd+=(--storage-owner-rpc-timeout-ms "${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}")
-  cmd+=(--storage-owner-construction-beam-width "${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-$SEARCH_BEAM}")
+  cmd+=(--storage-owner-construction-beam-width "${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-$BUILD_BEAM}")
   cmd+=(--storage-owner-search-snapshot-batch "${STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH:-64}")
   cmd+=(--storage-owner-prune-max-candidates "${STORAGE_OWNER_PRUNE_MAX_CANDIDATES:-128}")
   update_mode="${STORAGE_OWNER_UPDATE_MODE:-exact}"
   if [[ "$update_mode" != "exact" ]]; then
     cmd+=(--storage-owner-update-mode "$update_mode")
   fi
-  if [[ "$update_mode" == "anchored" ]]; then
+  if [[ "$update_mode" == "local_stitch" ]]; then
     cmd+=(--storage-owner-anchor-hints "${STORAGE_OWNER_ANCHOR_HINTS:-4}")
     cmd+=(--storage-owner-anchor-beam-width "${STORAGE_OWNER_ANCHOR_BEAM_WIDTH:-64}")
     cmd+=(--storage-owner-anchor-expand-cap "${STORAGE_OWNER_ANCHOR_EXPAND_CAP:-16}")
     cmd+=(--storage-owner-anchor-remote-rescue-cap "${STORAGE_OWNER_ANCHOR_REMOTE_RESCUE_CAP:-4}")
-    cmd+=(--storage-owner-anchor-audit-rate "${STORAGE_OWNER_ANCHOR_AUDIT_RATE:-256}")
-    cmd+=(--storage-owner-anchor-min-overlap "${STORAGE_OWNER_ANCHOR_MIN_OVERLAP:-0.5}")
+    if [[ "${STORAGE_OWNER_LOCAL_STITCH_SYNC_FAST_PATH:-1}" == "0" || \
+          "${STORAGE_OWNER_LOCAL_STITCH_SYNC_FAST_PATH:-1}" == "false" ]]; then
+      cmd+=(--storage-owner-local-stitch-sync-fast-path false)
+    else
+      cmd+=(--storage-owner-local-stitch-sync-fast-path true)
+    fi
   fi
+  cmd+=(--storage-owner-maintenance-mode "${STORAGE_OWNER_MAINTENANCE_MODE:-off}")
+  cmd+=(--storage-owner-maintenance-workers "${STORAGE_OWNER_MAINTENANCE_WORKERS:-0}")
   cmd+=(--storage-owner-reverse-mode "${STORAGE_OWNER_REVERSE_MODE:-async}")
   cmd+=(--storage-owner-reverse-queue-depth "${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}")
   cmd+=(--storage-owner-reverse-flush-us "${STORAGE_OWNER_REVERSE_FLUSH_US:-200}")
@@ -85,4 +91,3 @@ printf '[memory-node-%s] command:' "$NODE_ID"; printf ' %q' "${cmd[@]}"; echo
 nohup "${cmd[@]}" > "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
 echo "memory node $NODE_ID started: pid $(cat "$PID_FILE"), log $LOG_FILE"
-

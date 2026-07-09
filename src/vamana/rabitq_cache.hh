@@ -74,12 +74,6 @@ struct Quantization {
   f32 error_max{};  // retained for metadata compatibility; unused by RFQ5
 };
 
-struct Estimate {
-  f32 distance{};
-  f32 lower_bound{};
-  f32 upper_bound{};
-};
-
 struct QueryLut {
   vec<f32> signed_dot;
   vec<f32> mismatch_energy;
@@ -248,34 +242,6 @@ inline f32 lower_bound_lut(const QueryLut& lut, f32 query_norm2,
   const f32 norm_hi = dequantize_norm_upper(norm_q, quantization);
   const f32 r = std::clamp(projection_norm, norm_lo, norm_hi);
   return std::max(query_norm2 + r * r - 2.0f * projection_norm * r, 0.0f);
-}
-
-inline Estimate estimate_interval_lut(const QueryLut& lut, f32 query_norm2,
-                                      const byte_t* entry,
-                                      const Quantization& quantization,
-                                      f32) {
-  const f32 distance = estimate_distance_lut(lut, query_norm2, entry, quantization);
-  const f32 lower = lower_bound_lut(lut, query_norm2, entry, quantization);
-  return {distance, lower, std::numeric_limits<f32>::infinity()};
-}
-
-inline f32 estimate_full_entry(const f32* rotated_query, f32 query_norm2,
-                               const byte_t* entry) {
-  f32 signed_dot = 0.0f;
-  for (u32 bit = 0; bit < VamanaNode::rabitq_code_bits(); ++bit) {
-    const bool positive = (entry[bit >> 3] & (1u << (7u - (bit & 7u)))) != 0;
-    signed_dot += positive ? rotated_query[bit] : -rotated_query[bit];
-  }
-  f32 norm = 0.0f;
-  f32 error = 0.0f;
-  const size_t scalar_offset = VamanaNode::rabitq_code_storage_size();
-  std::memcpy(&norm, entry + scalar_offset, sizeof(norm));
-  std::memcpy(&error, entry + scalar_offset + sizeof(norm), sizeof(error));
-  const f32 inner_product = error > 1e-12f
-    ? norm * signed_dot /
-        (std::sqrt(static_cast<f32>(VamanaNode::rabitq_code_bits())) * error)
-    : 0.0f;
-  return std::max(query_norm2 + norm * norm - 2.0f * inner_product, 0.0f);
 }
 
 inline void select_gate_into(const vec<f32>& distances,

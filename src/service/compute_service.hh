@@ -176,7 +176,7 @@ private:
     vec<StorageOwnerRpcSlot> slots;
     vec<StorageOwnerResponseSlot> response_slots;
     std::deque<u32> free_slots;
-    std::unordered_map<u64, u32> batch_to_slot;
+    dense_hashmap_t<u64, u32> batch_to_slot;
     std::thread thread;
   };
 
@@ -193,6 +193,7 @@ private:
   void resume_workers();
   LocalMainSearchOutput search_local_result(const vec<element_t>& query, u32 k);
   LocalMainSearchOutput search_local_raw_result(VectorDType query_dtype, const byte_t* query_data, u32 k);
+  vec<RemotePtr> storage_owner_query_entry_points(const span<const element_t> query) const;
   vec<node_t> search_local(const vec<element_t>& query, u32 k);
   vec<node_t> search_local_raw(VectorDType query_dtype, const byte_t* query_data, u32 k);
   void start_storage_insert_runtime();

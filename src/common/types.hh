@@ -1,9 +1,10 @@
 #pragma once
 
 #include <filesystem>
-#include <library/types.hh>
 #include <unordered_map>
-#include <unordered_set>
+#include <library/types.hh>
+
+#include "ankerl/unordered_dense.h"
 
 using node_t = u32;
 using element_t = f32;
@@ -12,7 +13,10 @@ using distance_t = f32;
 using filepath_t = std::filesystem::path;
 
 template <typename T>
-using hashset_t = std::unordered_set<T>;  // TODO: replace with faster hashset
+using hashset_t = ankerl::unordered_dense::set<T>;
 
 template <typename K, typename V>
-using hashmap_t = std::unordered_map<K, V>;  // TODO: replace with faster hashmap
+using hashmap_t = std::unordered_map<K, V>;
+
+template <typename K, typename V>
+using dense_hashmap_t = ankerl::unordered_dense::map<K, V>;

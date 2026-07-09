@@ -8,6 +8,7 @@ namespace {
 using Configuration = configuration::IndexConfiguration;
 using BeamEntry = memory_node_detail::BeamEntry;
 using NodeSnapshot = memory_node_detail::NodeSnapshot;
+using StorageOwnerCoroutineScratch = memory_node_detail::StorageOwnerCoroutineScratch;
 using StorageOwnerThread = memory_node_detail::StorageOwnerThread;
 
 u32 snapshot_batch_limit(const Configuration& config, const StorageOwnerThread* thread) {
@@ -50,22 +51,42 @@ vec<RemotePtr> sorted_candidates(vec<BeamEntry>& beam) {
 vec<RemotePtr> MemoryNode::anchor_search_candidates(const span<const element_t> query,
                                                      const vec<RemotePtr>& anchor_hints,
                                                      const Configuration& config,
-                                                     InsertBreakdownCounters* breakdown) {
-  hashset_t<RemotePtr> visited;
-  vec<BeamEntry> beam;
+                                                     InsertBreakdownCounters* breakdown,
+                                                     bool local_only) {
+  StorageOwnerCoroutineScratch* scratch = current_storage_owner_thread_ != nullptr
+                                            ? &current_storage_owner_thread_->coroutine_scratch_state()
+                                            : nullptr;
+  hashset_t<RemotePtr> local_visited;
+  vec<BeamEntry> local_beam;
+  vec<RemotePtr> local_batch;
+  vec<RemotePtr> local_unvisited;
+  if (scratch != nullptr) {
+    scratch->clear_search();
+  }
+  hashset_t<RemotePtr>& visited = scratch != nullptr ? scratch->visited : local_visited;
+  vec<BeamEntry>& beam = scratch != nullptr ? scratch->beam : local_beam;
+  vec<RemotePtr>& batch = scratch != nullptr ? scratch->batch : local_batch;
+  vec<RemotePtr>& unvisited = scratch != nullptr ? scratch->unvisited : local_unvisited;
   const u32 beam_width = std::max<u32>(config.R, config.storage_owner_anchor_beam_width);
   const u32 batch_limit = snapshot_batch_limit(config, current_storage_owner_thread_);
+  visited.reserve(anchor_hints.size() +
+                  static_cast<size_t>(config.storage_owner_anchor_expand_cap) *
+                    std::max<u32>(1, config.R));
+  beam.reserve(beam_width);
+  batch.reserve(batch_limit);
+  unvisited.reserve(config.R);
 
   if (breakdown != nullptr) {
     breakdown->storage_owner_anchor_hints += anchor_hints.size();
   }
   for (size_t begin = 0; begin < anchor_hints.size(); begin += batch_limit) {
-    vec<RemotePtr> batch;
     const size_t end = std::min(anchor_hints.size(), begin + batch_limit);
-    batch.reserve(end - begin);
+    batch.clear();
     for (size_t i = begin; i < end; ++i) {
       const RemotePtr hint = anchor_hints[i];
-      if (!hint.is_null() && hint.memory_node() < num_storage_nodes_ && visited.insert(hint).second) {
+      if (!hint.is_null() && hint.memory_node() < num_storage_nodes_ &&
+          (!local_only || local_shard(hint.memory_node())) &&
+          visited.insert(hint).second) {
         batch.push_back(hint);
       }
     }
@@ -99,6 +120,9 @@ vec<RemotePtr> MemoryNode::anchor_search_candidates(const span<const element_t> 
     BeamEntry& entry = beam[best];
     entry.expanded = true;
     const bool remote = !local_shard(entry.rptr.memory_node());
+    if (local_only && remote) {
+      continue;
+    }
     if (remote && remote_expansions >= config.storage_owner_anchor_remote_rescue_cap) {
       continue;
     }
@@ -110,10 +134,10 @@ vec<RemotePtr> MemoryNode::anchor_search_candidates(const span<const element_t> 
     if (breakdown != nullptr) {
       breakdown->storage_owner_search_neighbor_read_ns += elapsed_ns_since(started);
     }
-    vec<RemotePtr> unvisited;
-    unvisited.reserve(neighbors.size());
+    unvisited.clear();
     for (const RemotePtr neighbor : neighbors) {
       if (!neighbor.is_null() && neighbor.memory_node() < num_storage_nodes_ &&
+          (!local_only || local_shard(neighbor.memory_node())) &&
           visited.insert(neighbor).second) {
         unvisited.push_back(neighbor);
       }
@@ -121,7 +145,8 @@ vec<RemotePtr> MemoryNode::anchor_search_candidates(const span<const element_t> 
 
     for (size_t begin = 0; begin < unvisited.size(); begin += batch_limit) {
       const size_t end = std::min(unvisited.size(), begin + batch_limit);
-      vec<RemotePtr> batch(unvisited.begin() + begin, unvisited.begin() + end);
+      batch.clear();
+      batch.insert(batch.end(), unvisited.begin() + begin, unvisited.begin() + end);
       started = std::chrono::steady_clock::now();
       vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
       if (breakdown != nullptr) {

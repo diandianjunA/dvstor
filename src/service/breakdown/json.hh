@@ -27,6 +27,20 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"p95_service_ns", percentile_ns(aggregate.service_latencies_ns, 0.95)},
     {"p99_service_ns", percentile_ns(aggregate.service_latencies_ns, 0.99)},
   };
+  out["fine_grained_breakdown_observed"] = aggregate.fine_grained_breakdown_observed;
+
+  if (!aggregate.fine_grained_breakdown_observed) {
+    out["utilization"] = {
+      {"device_utilization_observed", false},
+      {"gpu_kernel_busy_ns", 0},
+      {"gpu_kernel_busy_ratio", 0.0},
+      {"gpu_kernel_idle_ratio", 0.0},
+      {"rdma_completion_wait_ns", 0},
+      {"rdma_completion_wait_ratio", 0.0},
+      {"rdma_payload_bytes_per_service_s", 0.0},
+    };
+    return out;
+  }
 
   const u64 cpu_total = aggregate.total_service_ns > (aggregate.category_ns[static_cast<size_t>(Category::gpu)] +
                                                       aggregate.category_ns[static_cast<size_t>(Category::rdma)] +
@@ -160,15 +174,6 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"rabitq_forced_widen", aggregate.counters.rabitq_forced_widen},
     {"rabitq_audit_expansions", aggregate.counters.rabitq_audit_expansions},
     {"rabitq_audit_candidates", aggregate.counters.rabitq_audit_candidates},
-    {"rabitq_safe_skips", aggregate.counters.rabitq_safe_skips},
-    {"rabitq_safe_skip_vector_bytes",
-     aggregate.counters.rabitq_safe_skips * VamanaNode::vector_bytes()},
-    {"rabitq_exact_fallbacks", aggregate.counters.rabitq_exact_fallbacks},
-    {"rabitq_prefetch_issued", aggregate.counters.rabitq_prefetch_issued},
-    {"rabitq_prefetch_hits", aggregate.counters.rabitq_prefetch_hits},
-    {"rabitq_prefetch_misses", aggregate.counters.rabitq_prefetch_misses},
-    {"rabitq_prefetch_disabled_queries",
-     aggregate.counters.rabitq_prefetch_disabled_queries},
     {"credit_rounds", aggregate.counters.credit_rounds},
     {"credit_expansions_issued", aggregate.counters.credit_expansions_issued},
     {"credit_precommit_expansions", aggregate.counters.credit_precommit_expansions},
@@ -197,15 +202,6 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"storage_owner_anchor_expansions", aggregate.counters.storage_owner_anchor_expansions},
     {"storage_owner_anchor_remote_expansions",
      aggregate.counters.storage_owner_anchor_remote_expansions},
-    {"storage_owner_anchor_fallbacks", aggregate.counters.storage_owner_anchor_fallbacks},
-    {"storage_owner_anchor_audits", aggregate.counters.storage_owner_anchor_audits},
-    {"storage_owner_anchor_audit_failures",
-     aggregate.counters.storage_owner_anchor_audit_failures},
-    {"rabitq_prefetch_hit_ratio",
-     aggregate.counters.rabitq_prefetch_issued == 0
-       ? 0.0
-       : static_cast<double>(aggregate.counters.rabitq_prefetch_hits) /
-           static_cast<double>(aggregate.counters.rabitq_prefetch_issued)},
     {"rabitq_local_scores", aggregate.counters.rabitq_l0_candidates},
     {"rabitq_gate_passes", aggregate.counters.rabitq_l1_candidates},
     {"rabitq_exact_vector_reads", aggregate.counters.rabitq_l2_candidates},
@@ -247,7 +243,7 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
 
 
 inline nlohmann::json report_to_json(const Report& report) {
-  nlohmann::json out;
+  nlohmann::json out = nlohmann::json::object();
   if (report.has_query()) {
     out["query_breakdown"] = aggregate_to_json(report.query);
   }
