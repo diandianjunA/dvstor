@@ -68,6 +68,14 @@ struct StorageOwnerCoroutineScratch {
   vec<RemotePtr> selected;
   vec<const byte_t*> selected_vectors;
   vec<StorageOwnerPruneCandidateInfo> prune_infos;
+  vec<RemotePtr> reverse_unique_candidates;
+  vec<RemotePtr> reverse_current_neighbors;
+  vec<RemotePtr> reverse_base_neighbors;
+  vec<RemotePtr> reverse_filtered_candidates;
+  vec<RemotePtr> reverse_updated_neighbors;
+  vec<RemotePtr> reverse_remote_neighbors;
+  vec<RemotePtr> reverse_remote_candidates;
+  vec<distance_t> reverse_neighbor_dists;
 
   void clear_search() {
     visited.clear();
@@ -82,6 +90,17 @@ struct StorageOwnerCoroutineScratch {
     selected.clear();
     selected_vectors.clear();
     prune_infos.clear();
+  }
+
+  void clear_reverse_update() {
+    reverse_unique_candidates.clear();
+    reverse_current_neighbors.clear();
+    reverse_base_neighbors.clear();
+    reverse_filtered_candidates.clear();
+    reverse_updated_neighbors.clear();
+    reverse_remote_neighbors.clear();
+    reverse_remote_candidates.clear();
+    reverse_neighbor_dists.clear();
   }
 };
 

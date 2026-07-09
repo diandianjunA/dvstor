@@ -1502,145 +1502,266 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
   }
 
   const auto update_started = std::chrono::steady_clock::now();
-  const auto lock_started = std::chrono::steady_clock::now();
-  lock_node(target_ptr);
-  const u64 lock_wait_ns = elapsed_ns_since(lock_started);
-  vec<RemotePtr> updated_neighbors;
+  StorageOwnerCoroutineScratch* scratch = current_storage_owner_thread_ != nullptr
+                                            ? &current_storage_owner_thread_->coroutine_scratch_state()
+                                            : nullptr;
+  vec<RemotePtr> local_unique_candidates;
+  vec<RemotePtr> local_current_neighbors;
+  vec<RemotePtr> local_base_neighbors;
+  vec<RemotePtr> local_filtered_candidates;
+  vec<RemotePtr> local_updated_neighbors;
+  vec<RemotePtr> local_remote_neighbors;
+  vec<RemotePtr> local_remote_candidates;
+  vec<distance_t> local_neighbor_dists;
+  if (scratch != nullptr) {
+    scratch->clear_reverse_update();
+  }
+  vec<RemotePtr>& unique_candidates = scratch != nullptr ? scratch->reverse_unique_candidates : local_unique_candidates;
+  vec<RemotePtr>& current_neighbors = scratch != nullptr ? scratch->reverse_current_neighbors : local_current_neighbors;
+  vec<RemotePtr>& base_neighbors = scratch != nullptr ? scratch->reverse_base_neighbors : local_base_neighbors;
+  vec<RemotePtr>& filtered_candidates =
+    scratch != nullptr ? scratch->reverse_filtered_candidates : local_filtered_candidates;
+  vec<RemotePtr>& updated_neighbors = scratch != nullptr ? scratch->reverse_updated_neighbors : local_updated_neighbors;
+  vec<RemotePtr>& remote_neighbors = scratch != nullptr ? scratch->reverse_remote_neighbors : local_remote_neighbors;
+  vec<RemotePtr>& remote_candidates = scratch != nullptr ? scratch->reverse_remote_candidates : local_remote_candidates;
+  vec<distance_t>& neighbor_dists = scratch != nullptr ? scratch->reverse_neighbor_dists : local_neighbor_dists;
+
   bool changed = false;
   bool pruned = false;
   size_t current_count = 0;
   size_t filtered_count = 0;
+  u64 lock_wait_ns = 0;
   u64 snapshot_ns = 0;
   u64 neighbor_read_ns = 0;
   u64 filter_ns = 0;
   u64 prune_ns = 0;
   u64 write_ns = 0;
 
-  NodeSnapshot target_snapshot;
   auto step_started = std::chrono::steady_clock::now();
-  if (!read_node_snapshot(target_ptr, target_snapshot) || target_snapshot.deleted) {
-    unlock_node(target_ptr);
+  const auto target_vector_addr = vamana::StorageLayoutResolver::vector(target_ptr);
+  lib_assert(target_vector_addr.offset + target_vector_addr.size <= mn_memory_bytes_,
+             "local reverse-update target vector exceeds shard bounds");
+  const byte_t* target_node = local_node_ptr(target_ptr);
+  const byte_t* target_vector = index_buffer_.get_full_buffer() + target_vector_addr.offset;
+  if ((*reinterpret_cast<const u64*>(target_node) & VamanaNode::HEADER_DELETED) != 0) {
     return true;
   }
   snapshot_ns = elapsed_ns_since(step_started);
 
-  step_started = std::chrono::steady_clock::now();
-  vec<RemotePtr> current_neighbors = read_neighbor_list(target_ptr);
-  neighbor_read_ns = elapsed_ns_since(step_started);
-  current_count = current_neighbors.size();
-
-  step_started = std::chrono::steady_clock::now();
-  vec<RemotePtr> filtered_candidates;
-  filtered_candidates.reserve(candidate_ptrs.size());
   for (const RemotePtr& candidate_ptr : candidate_ptrs) {
-    if (candidate_ptr.is_null()) {
-      continue;
-    }
-    bool already_present = false;
-    for (const RemotePtr& existing : current_neighbors) {
-      if (existing == candidate_ptr) {
-        already_present = true;
-        break;
-      }
-    }
-    if (!already_present &&
-        std::find(filtered_candidates.begin(), filtered_candidates.end(), candidate_ptr) == filtered_candidates.end()) {
-      filtered_candidates.push_back(candidate_ptr);
+    if (!candidate_ptr.is_null() &&
+        std::find(unique_candidates.begin(), unique_candidates.end(), candidate_ptr) == unique_candidates.end()) {
+      unique_candidates.push_back(candidate_ptr);
     }
   }
-  filter_ns = elapsed_ns_since(step_started);
-  filtered_count = filtered_candidates.size();
+  if (unique_candidates.empty()) {
+    return true;
+  }
 
-  if (!filtered_candidates.empty()) {
+  auto target_deleted_locked = [&]() {
+    return (*reinterpret_cast<const u64*>(local_node_ptr(target_ptr)) &
+            VamanaNode::HEADER_DELETED) != 0;
+  };
+
+  auto lock_target = [&]() {
+    const auto lock_started = std::chrono::steady_clock::now();
+    lock_node(target_ptr);
+    lock_wait_ns += elapsed_ns_since(lock_started);
+  };
+
+  auto same_neighbors = [](const vec<RemotePtr>& lhs, const vec<RemotePtr>& rhs) {
+    if (lhs.size() != rhs.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < lhs.size(); ++i) {
+      if (!(lhs[i] == rhs[i])) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  auto filter_against_current = [&](const vec<RemotePtr>& candidates,
+                                    const vec<RemotePtr>& existing,
+                                    vec<RemotePtr>& filtered) {
+    filtered.clear();
+    filtered.reserve(candidates.size());
+    for (const RemotePtr& candidate_ptr : candidates) {
+      bool already_present = false;
+      for (const RemotePtr& current : existing) {
+        if (current == candidate_ptr) {
+          already_present = true;
+          break;
+        }
+      }
+      if (!already_present) {
+        filtered.push_back(candidate_ptr);
+      }
+    }
+  };
+
+  auto vector_ptr = [&](const RemotePtr& rptr) {
+    const auto addr = vamana::StorageLayoutResolver::vector(rptr);
+    lib_assert(addr.offset + addr.size <= mn_memory_bytes_,
+               "local reverse-update vector read exceeds shard bounds");
+    return index_buffer_.get_full_buffer() + addr.offset;
+  };
+
+  auto push_candidate = [&](const RemotePtr& candidate, distance_t candidate_dist) {
+    if (updated_neighbors.size() < config.R) {
+      updated_neighbors.push_back(candidate);
+      neighbor_dists.push_back(candidate_dist);
+      return;
+    }
+    lib_assert(!neighbor_dists.empty(), "reverse-update neighbor distances are unexpectedly empty");
+    size_t farthest_idx = 0;
+    distance_t farthest_dist = neighbor_dists[0];
+    for (size_t i = 1; i < neighbor_dists.size(); ++i) {
+      if (neighbor_dists[i] > farthest_dist) {
+        farthest_dist = neighbor_dists[i];
+        farthest_idx = i;
+      }
+    }
+    if (candidate_dist < farthest_dist) {
+      updated_neighbors[farthest_idx] = candidate;
+      neighbor_dists[farthest_idx] = candidate_dist;
+    }
+  };
+
+  auto build_pruned_neighbors = [&](const vec<RemotePtr>& source_neighbors,
+                                    const vec<RemotePtr>& source_candidates) {
+    updated_neighbors.clear();
+    neighbor_dists.clear();
+    remote_neighbors.clear();
+    remote_candidates.clear();
+    updated_neighbors.reserve(config.R);
+    neighbor_dists.reserve(config.R);
+    remote_neighbors.reserve(source_neighbors.size());
+    remote_candidates.reserve(source_candidates.size());
+
+    for (const RemotePtr& neighbor : source_neighbors) {
+      if (neighbor.is_null()) {
+        continue;
+      }
+      if (local_shard(neighbor.memory_node())) {
+        updated_neighbors.push_back(neighbor);
+        neighbor_dists.push_back(distance_between_vectors(target_vector, VamanaNode::vector_dtype(),
+                                                          vector_ptr(neighbor), VamanaNode::vector_dtype(), config));
+      } else {
+        remote_neighbors.push_back(neighbor);
+      }
+    }
+    if (!remote_neighbors.empty()) {
+      vec<NodeSnapshot> snapshots = read_node_snapshots_batched(remote_neighbors, config);
+      for (const NodeSnapshot& snapshot : snapshots) {
+        updated_neighbors.push_back(snapshot.rptr);
+        neighbor_dists.push_back(distance_between_vectors(target_vector, VamanaNode::vector_dtype(),
+                                                          snapshot.vector_data.data(), VamanaNode::vector_dtype(),
+                                                          config));
+      }
+    }
+
+    for (const RemotePtr& candidate : source_candidates) {
+      if (candidate.is_null()) {
+        continue;
+      }
+      if (local_shard(candidate.memory_node())) {
+        const distance_t candidate_dist = distance_between_vectors(target_vector, VamanaNode::vector_dtype(),
+                                                                   vector_ptr(candidate), VamanaNode::vector_dtype(),
+                                                                   config);
+        push_candidate(candidate, candidate_dist);
+      } else {
+        remote_candidates.push_back(candidate);
+      }
+    }
+    if (!remote_candidates.empty()) {
+      vec<NodeSnapshot> candidate_snapshots = read_node_snapshots_batched(remote_candidates, config);
+      for (const NodeSnapshot& snapshot : candidate_snapshots) {
+        const distance_t candidate_dist = distance_between_vectors(target_vector, VamanaNode::vector_dtype(),
+                                                                   snapshot.vector_data.data(),
+                                                                   VamanaNode::vector_dtype(), config);
+        push_candidate(snapshot.rptr, candidate_dist);
+      }
+    }
+  };
+
+  auto read_current_neighbors_locked = [&]() {
+    const auto started = std::chrono::steady_clock::now();
+    current_neighbors = read_neighbor_list(target_ptr);
+    neighbor_read_ns += elapsed_ns_since(started);
+    current_count = current_neighbors.size();
+  };
+
+  auto try_apply_once = [&](bool allow_unlock_for_prune) {
+    lock_target();
+    if (target_deleted_locked()) {
+      unlock_node(target_ptr);
+      return true;
+    }
+
+    read_current_neighbors_locked();
+    step_started = std::chrono::steady_clock::now();
+    filter_against_current(unique_candidates, current_neighbors, filtered_candidates);
+    filter_ns += elapsed_ns_since(step_started);
+    filtered_count = filtered_candidates.size();
+    if (filtered_candidates.empty()) {
+      unlock_node(target_ptr);
+      return true;
+    }
+
     changed = true;
-
     if (current_neighbors.size() + filtered_candidates.size() <= config.R) {
-      current_neighbors.insert(current_neighbors.end(), filtered_candidates.begin(), filtered_candidates.end());
-      updated_neighbors = std::move(current_neighbors);
-    } else {
-      // Evict-farthest: for each new candidate, compute distance from target
-      // and replace the farthest existing neighbor if the candidate is closer.
-      // This is O(R) distance calls per candidate instead of O(R²) pair distances
-      // from full RobustPrune, trading a small diversity loss for large speedup.
-      pruned = true;
+      updated_neighbors = current_neighbors;
+      updated_neighbors.insert(updated_neighbors.end(), filtered_candidates.begin(), filtered_candidates.end());
       step_started = std::chrono::steady_clock::now();
-
-      // 1. Collect non-null current neighbors (do this once, reuse below)
-      vec<RemotePtr> non_null_neighbors;
-      non_null_neighbors.reserve(current_neighbors.size());
-      for (const auto& n : current_neighbors) {
-        if (!n.is_null()) non_null_neighbors.push_back(n);
-      }
-
-      // 2. Batch-read all current neighbor snapshots + compute distances (O(R), SIMD)
-      vec<distance_t> neighbor_dists;
-      neighbor_dists.reserve(non_null_neighbors.size());
-      if (!non_null_neighbors.empty()) {
-        vec<NodeSnapshot> neighbor_snapshots =
-            read_node_snapshots_batched(non_null_neighbors, config);
-        for (const auto& snap : neighbor_snapshots) {
-          neighbor_dists.push_back(distance_between_vectors(
-              target_snapshot.vector_data.data(), VamanaNode::vector_dtype(),
-              snap.vector_data.data(), VamanaNode::vector_dtype(), config));
-        }
-      }
-
-      // 3. Initialise updated_neighbors from filtered list (no extra allocation)
-      updated_neighbors = std::move(non_null_neighbors);
-
-      // 4. For each candidate, evict farthest if candidate is closer
-      {
-        vec<RemotePtr> non_null_candidates;
-        non_null_candidates.reserve(filtered_candidates.size());
-        for (const auto& c : filtered_candidates) {
-          if (!c.is_null()) non_null_candidates.push_back(c);
-        }
-
-        vec<NodeSnapshot> candidate_snapshots;
-        if (!non_null_candidates.empty()) {
-          candidate_snapshots = read_node_snapshots_batched(non_null_candidates, config);
-        }
-
-        for (size_t ci = 0; ci < candidate_snapshots.size(); ++ci) {
-          const auto& cand_snap = candidate_snapshots[ci];
-          const distance_t cand_dist = distance_between_vectors(
-              target_snapshot.vector_data.data(), VamanaNode::vector_dtype(),
-              cand_snap.vector_data.data(), VamanaNode::vector_dtype(), config);
-
-          if (updated_neighbors.size() < config.R) {
-            updated_neighbors.push_back(cand_snap.rptr);
-            neighbor_dists.push_back(cand_dist);
-          } else {
-            // updated_neighbors.size() >= R, and neighbor_dists tracks the same
-            // set, so at least one element exists.
-            lib_assert(!neighbor_dists.empty(),
-                       "neighbor_dists non-empty when updated_neighbors >= R");
-            size_t farthest_idx = 0;
-            distance_t farthest_dist = neighbor_dists[0];
-            for (size_t j = 1; j < neighbor_dists.size(); ++j) {
-              if (neighbor_dists[j] > farthest_dist) {
-                farthest_dist = neighbor_dists[j];
-                farthest_idx = j;
-              }
-            }
-            if (cand_dist < farthest_dist) {
-              updated_neighbors[farthest_idx] = cand_snap.rptr;
-              neighbor_dists[farthest_idx] = cand_dist;
-            }
-          }
-        }
-      }
-
-      prune_ns = elapsed_ns_since(step_started);
+      write_neighbor_list(target_ptr, updated_neighbors);
+      write_ns += elapsed_ns_since(step_started);
+      unlock_node(target_ptr);
+      return true;
     }
-  }
 
-  if (changed) {
+    pruned = true;
+    base_neighbors = current_neighbors;
+    if (allow_unlock_for_prune) {
+      unlock_node(target_ptr);
+      step_started = std::chrono::steady_clock::now();
+      build_pruned_neighbors(base_neighbors, filtered_candidates);
+      prune_ns += elapsed_ns_since(step_started);
+
+      lock_target();
+      if (target_deleted_locked()) {
+        unlock_node(target_ptr);
+        return true;
+      }
+      read_current_neighbors_locked();
+      if (!same_neighbors(current_neighbors, base_neighbors)) {
+        unlock_node(target_ptr);
+        return false;
+      }
+    } else {
+      step_started = std::chrono::steady_clock::now();
+      build_pruned_neighbors(base_neighbors, filtered_candidates);
+      prune_ns += elapsed_ns_since(step_started);
+    }
+
     step_started = std::chrono::steady_clock::now();
     write_neighbor_list(target_ptr, updated_neighbors);
-    write_ns = elapsed_ns_since(step_started);
+    write_ns += elapsed_ns_since(step_started);
+    unlock_node(target_ptr);
+    return true;
+  };
+
+  bool applied = false;
+  constexpr u32 kOptimisticAttempts = 2;
+  for (u32 attempt = 0; attempt < kOptimisticAttempts; ++attempt) {
+    if (try_apply_once(true)) {
+      applied = true;
+      break;
+    }
   }
-  unlock_node(target_ptr);
+  if (!applied) {
+    applied = try_apply_once(false);
+  }
 
   (void)enqueue_maintenance;
 
