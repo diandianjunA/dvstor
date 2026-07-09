@@ -23,6 +23,7 @@ struct VamanaBuildConfig {
   double partition_imbalance{1.03};
   bool skip_sanity_check{false};
   bool use_rabitq{false};
+  str rabitq_cache_format{"budget"};
   str storage_format{"vamana_compact_v1"};
   i32 seed{1234};
   size_t max_vectors{std::numeric_limits<u32>::max()};

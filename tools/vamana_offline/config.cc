@@ -51,6 +51,9 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
      "Skip the expensive in-memory brute-force recall sanity check after graph construction.")
     ("use-rabitq", po::bool_switch(&config.use_rabitq),
      "Store dimension-scaled RaBitQ search entries per node for GPU approximate search.")
+    ("rabitq-cache-format",
+     po::value<str>(&config.rabitq_cache_format)->default_value(config.rabitq_cache_format),
+     "RaBitQ compute-side sidecar format: budget or full.")
     ("storage-format", po::value<str>(&config.storage_format)->default_value(config.storage_format),
      "Storage format to write: vamana_aos_v1 or vamana_compact_v1.")
     ("seed", po::value<i32>(&config.seed)->default_value(config.seed), "PRNG seed.")
@@ -95,6 +98,8 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     lib_failure("--partition-imbalance must be >= 1.0");
   if (config.use_rabitq && config.ip_distance)
     lib_failure("--use-rabitq currently supports L2 distance only");
+  if (config.rabitq_cache_format != "budget" && config.rabitq_cache_format != "full")
+    lib_failure("--rabitq-cache-format must be budget or full");
   if (!vamana::parse_storage_format(config.storage_format))
     lib_failure("--storage-format must be vamana_aos_v1 or vamana_compact_v1");
   return config;

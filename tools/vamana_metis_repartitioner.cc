@@ -21,6 +21,7 @@ struct Config {
     << "       [--vector-data-type auto|float32|uint8|int8]\n"
     << "       [--storage-format auto|vamana_aos_v1|vamana_compact_v1]\n"
     << "       [--anchors-per-shard 4096 --anchor-seed 1234]\n"
+    << "       [--rabitq-cache-format auto|budget|full]\n"
     << "       [--partition-max-degree 16 --partition-imbalance 1.03]\n"
     << "       [--overwrite]\n\n"
     << "Repartitions a schema-13 Vamana index with METIS. The output includes\n"
@@ -70,6 +71,8 @@ Config parse_config(int argc, char** argv) {
       options.anchors_per_shard_set = true;
     } else if (argument == "--anchor-seed") {
       options.anchor_seed = std::stoull(require_value(i, argc, argv, argument));
+    } else if (argument == "--rabitq-cache-format") {
+      options.rabitq_cache_format = require_value(i, argc, argv, argument);
     } else if (argument == "--partition-max-degree") {
       config.partition_max_degree = static_cast<u32>(
         std::stoul(require_value(i, argc, argv, argument)));

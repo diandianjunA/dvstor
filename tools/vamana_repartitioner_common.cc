@@ -254,6 +254,14 @@ struct Index::Impl {
     if (!options.anchors_per_shard_set) {
       options.anchors_per_shard = metadata.value("anchor_count_per_shard", 4096u);
     }
+    if (options.rabitq_cache_format == "auto") {
+      options.rabitq_cache_format =
+        rabitq ? metadata.value("rabitq_cache_format", str{"budget"}) : "budget";
+    }
+    if (options.rabitq_cache_format != "budget" &&
+        options.rabitq_cache_format != "full") {
+      throw std::runtime_error("--rabitq-cache-format must be auto, budget, or full");
+    }
     if (metadata.value("distance", str{"l2"}) != "l2" && options.anchors_per_shard != 0) {
       throw std::runtime_error("anchor sidecars currently require an L2 index");
     }
@@ -503,7 +511,8 @@ struct Index::Impl {
   }
 
   void scan_rabitq_quantization() {
-    if (metadata.contains("rabitq_cache_norm_min") &&
+    if (options.rabitq_cache_format != "full" &&
+        metadata.contains("rabitq_cache_norm_min") &&
         metadata.contains("rabitq_cache_norm_max")) {
       rabitq_quantization.norm_min = metadata.at("rabitq_cache_norm_min").get<f32>();
       rabitq_quantization.norm_max = metadata.at("rabitq_cache_norm_max").get<f32>();
@@ -515,16 +524,24 @@ struct Index::Impl {
     }
     rabitq_quantization.norm_min = std::numeric_limits<f32>::max();
     rabitq_quantization.norm_max = std::numeric_limits<f32>::lowest();
+    rabitq_quantization.error_min = std::numeric_limits<f32>::max();
+    rabitq_quantization.error_max = std::numeric_limits<f32>::lowest();
     Node node;
     for (size_t vertex = 0; vertex < total_nodes; ++vertex) {
       const auto [shard, local] = location_for_vertex(vertex);
       read_node(shard, local, true, node);
       f32 norm = 0.0f;
+      f32 error = 0.0f;
       std::memcpy(&norm,
                   node.rabitq.data() + input_layout.rabitq_code_storage_bytes,
                   sizeof(norm));
+      std::memcpy(&error,
+                  node.rabitq.data() + input_layout.rabitq_code_storage_bytes + sizeof(norm),
+                  sizeof(error));
       rabitq_quantization.norm_min = std::min(rabitq_quantization.norm_min, norm);
       rabitq_quantization.norm_max = std::max(rabitq_quantization.norm_max, norm);
+      rabitq_quantization.error_min = std::min(rabitq_quantization.error_min, error);
+      rabitq_quantization.error_max = std::max(rabitq_quantization.error_max, error);
     }
     if (total_nodes == 0) rabitq_quantization = {};
   }
@@ -658,14 +675,20 @@ struct Index::Impl {
     vec<OutputFile> idmap_files(options.memory_nodes);
     vec<OutputFile> rabitq_files(write_rabitq ? options.memory_nodes : 0);
     vec<u64> idmap_counts(options.memory_nodes, 0);
+    const bool full_rabitq_cache =
+      write_rabitq && options.rabitq_cache_format == "full";
     const u32 rabitq_entry_bytes = write_rabitq
-      ? vamana::rabitq::choose_entry_bytes(static_cast<u32>(output_layout.vector_bytes))
+      ? (full_rabitq_cache
+          ? vamana::rabitq::full_entry_bytes()
+          : vamana::rabitq::choose_entry_bytes(static_cast<u32>(output_layout.vector_bytes)))
       : 0;
     const u32 rabitq_code_bits = write_rabitq
-      ? vamana::rabitq::entry_code_bits(rabitq_entry_bytes)
+      ? (full_rabitq_cache
+          ? static_cast<u32>(output_layout.rabitq_code_bits)
+          : vamana::rabitq::entry_code_bits(rabitq_entry_bytes))
       : 0;
     const u32 rabitq_code_bytes = write_rabitq
-      ? vamana::rabitq::entry_code_bytes(rabitq_entry_bytes)
+      ? rabitq_code_bits / 8u
       : 0;
     if (write_rabitq && rabitq_entry_bytes < 2) {
       throw std::runtime_error("RFQ5 sidecar cannot fit within the current vector budget");
@@ -839,12 +862,24 @@ struct Index::Impl {
         std::memcpy(
           rabitq_cache_entry.data(), node.rabitq.data(), rabitq_code_bytes);
         f32 norm = 0.0f;
+        f32 error = 0.0f;
         std::memcpy(
           &norm,
           node.rabitq.data() + input_layout.rabitq_code_storage_bytes,
           sizeof(norm));
-        rabitq_cache_entry[rabitq_code_bytes] = vamana::rabitq::quantize(
-          norm, rabitq_quantization.norm_min, rabitq_quantization.norm_max);
+        std::memcpy(
+          &error,
+          node.rabitq.data() + input_layout.rabitq_code_storage_bytes + sizeof(norm),
+          sizeof(error));
+        if (full_rabitq_cache) {
+          std::memcpy(rabitq_cache_entry.data() + rabitq_code_bytes,
+                      &norm, sizeof(norm));
+          std::memcpy(rabitq_cache_entry.data() + rabitq_code_bytes + sizeof(norm),
+                      &error, sizeof(error));
+        } else {
+          rabitq_cache_entry[rabitq_code_bytes] = vamana::rabitq::quantize(
+            norm, rabitq_quantization.norm_min, rabitq_quantization.norm_max);
+        }
         auto& cache = rabitq_files[placement.memory_node];
         cache.stream.seekp(static_cast<std::streamoff>(
           sizeof(vamana::rabitq::SidecarHeader) + slot * rabitq_entry_bytes));
@@ -1041,18 +1076,20 @@ struct Index::Impl {
         output_layout.rabitq_entry_storage_size;
       output_metadata["rabitq_cache_bits"] = rabitq_code_bits;
       output_metadata["rabitq_cache_entry_size"] = rabitq_entry_bytes;
+      output_metadata["rabitq_cache_format"] = options.rabitq_cache_format;
       output_metadata["rabitq_cache_norm_min"] = rabitq_quantization.norm_min;
       output_metadata["rabitq_cache_norm_max"] = rabitq_quantization.norm_max;
       output_metadata["rabitq_cache_error_min"] = rabitq_quantization.error_min;
       output_metadata["rabitq_cache_error_max"] = rabitq_quantization.error_max;
     } else {
-      static constexpr std::array<const char*, 11> stale_rabitq_keys{
+      static constexpr std::array<const char*, 12> stale_rabitq_keys{
         "rabitq_centroid",
         "rabitq_code_bits",
         "rabitq_entry_size",
         "rabitq_entry_storage_size",
         "rabitq_cache_bits",
         "rabitq_cache_entry_size",
+        "rabitq_cache_format",
         "rabitq_cache_norm_min",
         "rabitq_cache_norm_max",
         "rabitq_cache_error_min",

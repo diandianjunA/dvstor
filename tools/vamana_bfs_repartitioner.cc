@@ -17,6 +17,7 @@ using tools::vamana_repartition::Options;
     << "       [--vector-data-type auto|float32|uint8|int8]\n"
     << "       [--storage-format auto|vamana_aos_v1|vamana_compact_v1]\n"
     << "       [--anchors-per-shard 4096 --anchor-seed 1234]\n"
+    << "       [--rabitq-cache-format auto|budget|full]\n"
     << "       [--overwrite]\n\n"
     << "Repartitions a schema-13 Vamana index with multi-source BFS. The output\n"
     << "includes compact hot-graph data when requested, owner idmaps, anchors,\n"
@@ -64,6 +65,8 @@ Options parse_options(int argc, char** argv) {
       options.anchors_per_shard_set = true;
     } else if (argument == "--anchor-seed") {
       options.anchor_seed = std::stoull(require_value(i, argc, argv, argument));
+    } else if (argument == "--rabitq-cache-format") {
+      options.rabitq_cache_format = require_value(i, argc, argv, argument);
     } else if (argument == "--overwrite") {
       options.overwrite = true;
     } else {

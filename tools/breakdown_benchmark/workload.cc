@@ -255,8 +255,6 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
         ? service.config().rabitq_gate_max_width : 0},
     {"rabitq_gate_margin", service.config().use_rabitq
         ? service.config().rabitq_gate_margin : 0.0},
-    {"rabitq_cache_max_ratio", service.config().use_rabitq
-        ? service.config().rabitq_cache_max_ratio : 0.0},
     {"rabitq_mode", service.config().use_rabitq ? "cpu_gate" : ""},
     {"rabitq_coalesce_target", service.config().use_rabitq
         ? service.config().rabitq_coalesce_target : 0},

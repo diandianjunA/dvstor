@@ -62,7 +62,6 @@ public:
   u32 rabitq_gate_width{18};
   u32 rabitq_gate_max_width{36};
   f64 rabitq_gate_margin{0.08};
-  f64 rabitq_cache_max_ratio{0.10};
   u32 rabitq_dynamic_budget_mb{64};
   u32 rabitq_coalesce_target{64};
   u32 rabitq_coalesce_min{32};
@@ -325,12 +324,9 @@ private:
       "Maximum cached candidates exactified after margin expansion.")(
       "rabitq-gate-margin", po::value<f64>(&rabitq_gate_margin)->default_value(rabitq_gate_margin),
       "Relative margin around the gate-width cutoff.")(
-      "rabitq-cache-max-ratio",
-      po::value<f64>(&rabitq_cache_max_ratio)->default_value(rabitq_cache_max_ratio),
-      "Maximum compute-node RaBitQ bytes as a ratio of raw vector bytes.")(
       "rabitq-dynamic-budget-mb",
       po::value<u32>(&rabitq_dynamic_budget_mb)->default_value(rabitq_dynamic_budget_mb),
-      "Fixed RaBitQ dynamic overlay budget in MiB, capped by --rabitq-cache-max-ratio.")(
+      "Fixed RaBitQ dynamic overlay budget in MiB.")(
       "rabitq-coalesce-target",
       po::value<u32>(&rabitq_coalesce_target)->default_value(rabitq_coalesce_target),
       "Target candidates per RaBitQ exactification flush.")(
@@ -396,7 +392,7 @@ private:
       exit_with_help_message(argv);
     }
     if (rabitq_gate_width == 0 || rabitq_gate_max_width < rabitq_gate_width ||
-        rabitq_gate_margin < 0.0 || rabitq_cache_max_ratio <= 0.0 ||
+        rabitq_gate_margin < 0.0 ||
         rabitq_coalesce_min == 0 || rabitq_coalesce_target < rabitq_coalesce_min) {
       std::cerr << "[ERROR]: invalid RaBitQ gate configuration" << std::endl;
       exit_with_help_message(argv);
@@ -649,7 +645,6 @@ public:
       os << std::setw(width) << "RaBitQ gate width: " << config.rabitq_gate_width << std::endl;
       os << std::setw(width) << "RaBitQ gate max width: " << config.rabitq_gate_max_width << std::endl;
       os << std::setw(width) << "RaBitQ gate margin: " << config.rabitq_gate_margin << std::endl;
-      os << std::setw(width) << "RaBitQ cache max ratio: " << config.rabitq_cache_max_ratio << std::endl;
       os << std::setw(width) << "RaBitQ dynamic budget MB: " << config.rabitq_dynamic_budget_mb << std::endl;
       os << std::setw(width) << "RaBitQ coalesce target: " << config.rabitq_coalesce_target << std::endl;
       os << std::setw(width) << "RaBitQ coalesce min: " << config.rabitq_coalesce_min << std::endl;

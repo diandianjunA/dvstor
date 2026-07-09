@@ -21,6 +21,7 @@ struct Options {
   u32 anchors_per_shard{};
   bool anchors_per_shard_set{false};
   u64 anchor_seed{1234};
+  str rabitq_cache_format{"auto"};
   bool overwrite{false};
 };
 

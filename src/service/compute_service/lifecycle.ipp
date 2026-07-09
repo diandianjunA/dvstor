@@ -130,16 +130,14 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     lib_assert(rabitq_cache_->load(startup_prefix, num_servers_,
                                   static_cast<u32>(VamanaNode::total_size()),
                                   static_cast<size_t>(config_.rabitq_dynamic_budget_mb) << 20,
-                                  &cache_error,
-                                  config_.rabitq_cache_max_ratio),
+                                  &cache_error),
                cache_error);
-    const size_t raw_bytes = rabitq_cache_->entry_count() * VamanaNode::vector_bytes();
-    lib_assert(raw_bytes == 0 ||
-               static_cast<double>(rabitq_cache_->total_size_bytes()) / raw_bytes <=
-                 config_.rabitq_cache_max_ratio,
-               "RaBitQ gate sidecar exceeds --rabitq-cache-max-ratio");
     vamana_->set_rabitq_cache(rabitq_cache_.get());
-    print_status("RaBitQ RFQ5 cache: static " +
+    print_status("RaBitQ RFQ5 cache: format " +
+                 str(rabitq_cache_->full_layout() ? "full" : "budget") +
+                 ", entry " + std::to_string(rabitq_cache_->entry_bytes()) +
+                 " bytes, code " + std::to_string(rabitq_cache_->code_bits()) +
+                 " bits, static " +
                  std::to_string(rabitq_cache_->size_bytes()) + " bytes, dynamic " +
                  std::to_string(rabitq_cache_->dynamic_size_bytes()) + " bytes, overrides " +
                  std::to_string(rabitq_cache_->override_bitmap_bytes()) + " bytes, decode " +

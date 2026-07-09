@@ -294,7 +294,6 @@ write_service_config() {
       echo "rabitq-gate-width = ${RABITQ_GATE_WIDTH:-18}"
       echo "rabitq-gate-max-width = ${RABITQ_GATE_MAX_WIDTH:-36}"
       echo "rabitq-gate-margin = ${RABITQ_GATE_MARGIN:-0.08}"
-      echo "rabitq-cache-max-ratio = ${RABITQ_CACHE_MAX_RATIO:-0.10}"
       echo "rabitq-dynamic-budget-mb = ${RABITQ_DYNAMIC_BUDGET_MB:-64}"
       echo "rabitq-coalesce-target = ${RABITQ_COALESCE_TARGET:-64}"
       echo "rabitq-coalesce-min = ${RABITQ_COALESCE_MIN:-32}"

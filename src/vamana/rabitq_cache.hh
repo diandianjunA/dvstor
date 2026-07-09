@@ -81,6 +81,11 @@ struct QueryLut {
   u32 code_bytes{};
 };
 
+enum class EntryLayout : u32 {
+  legacy_quantized_norm = 0,
+  full_norm_error = 1,
+};
+
 struct SidecarHeader {
   u32 magic{kSidecarMagic};
   u32 version{kSidecarVersion};
@@ -104,6 +109,27 @@ inline u32 entry_code_bytes(u32 entry_bytes) {
 
 inline u32 entry_code_bits(u32 entry_bytes) {
   return entry_code_bytes(entry_bytes) * 8u;
+}
+
+inline u32 full_entry_bytes() {
+  return static_cast<u32>(VamanaNode::rabitq_code_size() + 2u * sizeof(f32));
+}
+
+inline bool is_legacy_layout(u32 entry_bytes, u32 code_bits) {
+  return entry_bytes >= 2 && code_bits == entry_code_bits(entry_bytes);
+}
+
+inline bool is_full_layout(u32 entry_bytes, u32 code_bits) {
+  return code_bits == VamanaNode::rabitq_code_bits() &&
+         entry_bytes == full_entry_bytes();
+}
+
+inline EntryLayout classify_layout(u32 entry_bytes, u32 code_bits) {
+  if (is_full_layout(entry_bytes, code_bits)) return EntryLayout::full_norm_error;
+  if (is_legacy_layout(entry_bytes, code_bits)) return EntryLayout::legacy_quantized_norm;
+  lib_failure("invalid RaBitQ sidecar layout: entry_size=" + std::to_string(entry_bytes) +
+              " code_bits=" + std::to_string(code_bits));
+  return EntryLayout::legacy_quantized_norm;
 }
 
 inline u32 choose_entry_bytes(u32 raw_vector_bytes, f64 ratio = kDefaultCacheRatio) {
@@ -186,6 +212,28 @@ inline vec<byte_t> encode(const byte_t* vector, VectorDType dtype,
   return entry;
 }
 
+inline bool encode_full_into(const byte_t* vector, VectorDType dtype,
+                             u32 code_bits, u32 entry_bytes,
+                             byte_t* entry) {
+  if (!is_full_layout(entry_bytes, code_bits)) return false;
+  VamanaNode::RabitqCode code;
+  f32 norm = 0.0f;
+  f32 error = 0.0f;
+  VamanaNode::compute_rabitq_entry(vector, dtype, code, norm, error);
+  const u32 code_bytes = VamanaNode::rabitq_code_size();
+  std::memcpy(entry, code.data(), code_bytes);
+  std::memcpy(entry + code_bytes, &norm, sizeof(norm));
+  std::memcpy(entry + code_bytes + sizeof(norm), &error, sizeof(error));
+  return true;
+}
+
+inline vec<byte_t> encode_full(const byte_t* vector, VectorDType dtype) {
+  vec<byte_t> entry(full_entry_bytes(), 0);
+  (void)encode_full_into(vector, dtype, VamanaNode::rabitq_code_bits(),
+                         static_cast<u32>(entry.size()), entry.data());
+  return entry;
+}
+
 inline QueryLut build_query_lut(const f32* rotated_query, u32 code_bits) {
   QueryLut lut;
   lut.code_bits = code_bits;
@@ -225,6 +273,23 @@ inline f32 estimate_distance_lut(const QueryLut& lut, f32 query_norm2,
   const f32 norm = dequantize(entry[lut.code_bytes],
                               quantization.norm_min, quantization.norm_max);
   const f32 denom = std::sqrt(static_cast<f32>(std::max<u32>(1, lut.code_bits)));
+  const f32 inner_product = norm * signed_dot / denom;
+  return std::max(query_norm2 + norm * norm - 2.0f * inner_product, 0.0f);
+}
+
+inline f32 estimate_distance_lut_full(const QueryLut& lut, f32 query_norm2,
+                                      const byte_t* entry) {
+  f32 signed_dot = 0.0f;
+  for (u32 byte = 0; byte < lut.code_bytes; ++byte) {
+    signed_dot += lut.signed_dot[byte * 256u + entry[byte]];
+  }
+  f32 norm = 0.0f;
+  f32 error = 1.0f;
+  std::memcpy(&norm, entry + lut.code_bytes, sizeof(norm));
+  std::memcpy(&error, entry + lut.code_bytes + sizeof(norm), sizeof(error));
+  const f32 denom =
+      std::sqrt(static_cast<f32>(std::max<u32>(1, lut.code_bits))) *
+      std::max(error, 1e-6f);
   const f32 inner_product = norm * signed_dot / denom;
   return std::max(query_norm2 + norm * norm - 2.0f * inner_product, 0.0f);
 }
@@ -326,8 +391,7 @@ inline vec<u32> select_gate(const vec<f32>& distances,
 class Cache {
 public:
   bool load(const filepath_t& prefix, u32 num_nodes, u32 expected_node_size,
-            size_t dynamic_budget_bytes, str* error,
-            f64 max_cache_ratio = kDefaultCacheRatio) {
+            size_t dynamic_budget_bytes, str* error) {
     validate_dimension();
     ScopedNumaInterleave interleave;
     numa_interleaved_ = interleave.enabled();
@@ -344,17 +408,20 @@ public:
       input.read(reinterpret_cast<char*>(&header), sizeof(header));
       if (!input.good() || header.magic != kSidecarMagic ||
           header.version != kSidecarVersion || header.node_size != expected_node_size ||
-          header.entry_size < 2 || header.code_bits != entry_code_bits(header.entry_size) ||
+          !(is_legacy_layout(header.entry_size, header.code_bits) ||
+            is_full_layout(header.entry_size, header.code_bits)) ||
           header.raw_vector_bytes != VamanaNode::vector_bytes()) {
         return fail(error, "invalid RFQ5 RaBitQ sidecar header: " + path.string());
       }
       if (node == 0) {
         entry_bytes_ = header.entry_size;
         code_bits_ = header.code_bits;
-        code_bytes_ = entry_code_bytes(entry_bytes_);
+        layout_ = classify_layout(entry_bytes_, code_bits_);
+        code_bytes_ = code_bits_ / 8u;
         quantization_ = header.quantization;
       }
       if (entry_bytes_ != header.entry_size || code_bits_ != header.code_bits ||
+          layout_ != classify_layout(header.entry_size, header.code_bits) ||
           std::memcmp(&quantization_, &header.quantization, sizeof(Quantization)) != 0) {
         return fail(error, "RaBitQ RFQ5 sidecar layout differs across shards");
       }
@@ -368,31 +435,25 @@ public:
       entry_count_ += header.entry_count;
     }
     node_size_ = expected_node_size;
-    const size_t raw_bytes = entry_count_ * VamanaNode::vector_bytes();
-    const size_t total_budget = max_cache_ratio > 0.0
-      ? static_cast<size_t>(std::floor(static_cast<f64>(raw_bytes) * max_cache_ratio))
-      : 0;
     override_bitmap_bytes_ = 0;
     for (const auto& bits : override_bits_) {
       override_bitmap_bytes_ += bits.size() * sizeof(u64);
     }
-    const size_t static_budget_bytes = size_bytes_ + override_bitmap_bytes_;
-    const size_t capped_dynamic_budget =
-      total_budget > static_budget_bytes
-        ? std::min(dynamic_budget_bytes, total_budget - static_budget_bytes)
-        : 0;
-    init_dynamic(capped_dynamic_budget);
+    init_dynamic(dynamic_budget_bytes);
     prewarm();
     return true;
   }
 
   f32 estimate_distance_lut(const QueryLut& lut, f32 query_norm2,
                             const byte_t* entry) const {
-    return rabitq::estimate_distance_lut(lut, query_norm2, entry, quantization_);
+    return layout_ == EntryLayout::full_norm_error
+      ? rabitq::estimate_distance_lut_full(lut, query_norm2, entry)
+      : rabitq::estimate_distance_lut(lut, query_norm2, entry, quantization_);
   }
 
   f32 lower_bound_lut(const QueryLut& lut, f32 query_norm2,
                       const byte_t* entry) const {
+    if (layout_ == EntryLayout::full_norm_error) return 0.0f;
     return rabitq::lower_bound_lut(lut, query_norm2, entry, quantization_);
   }
 
@@ -420,8 +481,7 @@ public:
         const u32 score_index = step - prefetch_distance;
         const byte_t* entry = entries[score_index];
         if (entry != nullptr) {
-          distances[score_index] =
-            rabitq::estimate_distance_lut(lut, query_norm2, entry, quantization_);
+          distances[score_index] = estimate_distance_lut(lut, query_norm2, entry);
         }
       }
     }
@@ -457,7 +517,10 @@ public:
     if (dynamic_slots_.empty() || pointer.is_null() || entry_bytes_ < 2) return false;
     thread_local vec<byte_t> entry;
     entry.assign(entry_bytes_, 0);
-    if (!encode_into(vector, dtype, quantization_, code_bits_, entry_bytes_, entry.data())) {
+    const bool encoded = layout_ == EntryLayout::full_norm_error
+      ? encode_full_into(vector, dtype, code_bits_, entry_bytes_, entry.data())
+      : encode_into(vector, dtype, quantization_, code_bits_, entry_bytes_, entry.data());
+    if (!encoded) {
       ++dynamic_overflow_;
       return false;
     }
@@ -542,6 +605,7 @@ public:
   size_t dynamic_live() const { return dynamic_live_; }
   size_t dynamic_overflow() const { return dynamic_overflow_; }
   bool numa_interleaved() const { return numa_interleaved_; }
+  bool full_layout() const { return layout_ == EntryLayout::full_norm_error; }
 
 private:
   static u64 hash_raw(u64 value) {
@@ -617,6 +681,7 @@ private:
   vec<DynamicSlot> dynamic_slots_;
   vec<byte_t> dynamic_entries_;
   Quantization quantization_{};
+  EntryLayout layout_{EntryLayout::legacy_quantized_norm};
   u32 node_size_{};
   u32 entry_bytes_{};
   u32 code_bits_{};
