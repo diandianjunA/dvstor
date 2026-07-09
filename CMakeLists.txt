@@ -229,6 +229,14 @@ else ()
         )
         dvstor_target_tool_includes(dvstor_breakdown_benchmark)
         target_link_libraries(dvstor_breakdown_benchmark dvstor_runtime)
+
+        add_executable(dvstor_sift101m_long_insert_recall
+            tools/dvstor_sift101m_long_insert_recall.cc
+            tools/breakdown_benchmark/args.cc
+            tools/breakdown_benchmark/progress.cc
+        )
+        dvstor_target_tool_includes(dvstor_sift101m_long_insert_recall)
+        target_link_libraries(dvstor_sift101m_long_insert_recall dvstor_runtime)
     endif ()
 
     if (DVSTOR_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/CMakeLists.txt")
