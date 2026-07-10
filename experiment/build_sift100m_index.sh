@@ -3,6 +3,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/sift100m_common.sh"
 
+BUILD_PROFILE="${1:-${BUILD_PROFILE:-}}"
+if [[ -n "$BUILD_PROFILE" ]]; then
+  PROFILE_FILE="$SCRIPT_DIR/profiles/${BUILD_PROFILE}.env"
+  if [[ ! -f "$PROFILE_FILE" ]]; then
+    echo "unknown build profile: $BUILD_PROFILE" >&2
+    exit 1
+  fi
+  source "$PROFILE_FILE"
+fi
+
 ensure_built vamana_offline_builder
 "$SCRIPT_DIR/prepare_sift100m_data.sh"
 
@@ -26,6 +36,13 @@ cmd=("$BUILD_DIR/vamana_offline_builder"
   --skip-sanity-check
   --use-rabitq
   --rabitq-cache-format "${RABITQ_CACHE_FORMAT:-budget}")
+
+if [[ "${GPU_TIERED_INDEX:-0}" == "1" || "${GPU_TIERED_INDEX:-0}" == "true" ]]; then
+  cmd+=(--gpu-tiered-index
+        --gpu-hot-degree "${GPU_HOT_DEGREE:-16}"
+        --gpu-entry-points "${GPU_ENTRY_POINTS:-256}"
+        --gpu-graph-page-bytes "${GPU_GRAPH_PAGE_BYTES:-4096}")
+fi
 
 echo "[build] index prefix: $INDEX_PREFIX"
 echo "[build] partition: $PARTITION_STRATEGY shards=$SHARDS R=$R build_beam=$BUILD_BEAM dtype=$VECTOR_DATA_TYPE"

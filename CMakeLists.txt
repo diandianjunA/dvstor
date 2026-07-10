@@ -36,6 +36,8 @@ endif ()
 option(DVSTOR_BUILD_EXECUTABLES "Build standalone DVSTOR executables and tools" ON)
 option(DVSTOR_BUILD_TESTS "Build local DVSTOR smoke tests" ON)
 option(DVSTOR_USE_NATIVE_ARCH "Compile C++ sources with -march=native" OFF)
+option(DVSTOR_ENABLE_GPUNETIO "Build the DOCA GPUNetIO query backend when the SDK is available" ON)
+set(DVSTOR_DOCA_ROOT "/opt/mellanox/doca" CACHE PATH "DOCA SDK installation root")
 set(DVSTOR_METIS_PARTITION "AUTO" CACHE STRING "METIS graph partitioning support: AUTO, ON, or OFF")
 set_property(CACHE DVSTOR_METIS_PARTITION PROPERTY STRINGS AUTO ON OFF)
 string(TOUPPER "${DVSTOR_METIS_PARTITION}" DVSTOR_METIS_PARTITION_MODE)
@@ -76,6 +78,7 @@ add_subdirectory(rdma-library)
 add_subdirectory(thirdparty)
 
 set(DVSTOR_MEMORY_NODE_SOURCES
+    src/gpu_search/index_format.cc
     src/memory_node/memory_node.cc
     src/memory_node/peer_rdma.cc
     src/memory_node/peer_rpc.cc
@@ -87,9 +90,11 @@ set(DVSTOR_MEMORY_NODE_SOURCES
 )
 
 set(DVSTOR_OFFLINE_BUILDER_SOURCES
+    src/gpu_search/index_format.cc
     tools/vamana_offline/anchor_builder.cc
     tools/vamana_offline/config.cc
     tools/vamana_offline/dataset_io.cc
+    tools/vamana_offline/gpu_tiered_writer.cc
     tools/vamana_offline/graph.cc
     tools/vamana_offline/partitioning.cc
     tools/vamana_offline/progress.cc
@@ -140,14 +145,54 @@ if (DVSTOR_STORAGE_NODE_ONLY)
         dvstor_target_tool_includes(generate_sift101m_recall_data)
     endif ()
 else ()
+    set(DVSTOR_HAVE_GPUNETIO OFF)
+    if (DVSTOR_ENABLE_GPUNETIO)
+        find_path(DVSTOR_DOCA_INCLUDE_DIR doca_gpunetio.h
+            HINTS "${DVSTOR_DOCA_ROOT}/include")
+        find_library(DVSTOR_DOCA_GPUNETIO_LIBRARY doca_gpunetio
+            HINTS "${DVSTOR_DOCA_ROOT}/lib/x86_64-linux-gnu")
+        find_library(DVSTOR_DOCA_VERBS_LIBRARY doca_verbs
+            HINTS "${DVSTOR_DOCA_ROOT}/lib/x86_64-linux-gnu")
+        find_library(DVSTOR_DOCA_COMMON_LIBRARY doca_common
+            HINTS "${DVSTOR_DOCA_ROOT}/lib/x86_64-linux-gnu")
+        find_library(DVSTOR_DOCA_RDMA_LIBRARY doca_rdma
+            HINTS "${DVSTOR_DOCA_ROOT}/lib/x86_64-linux-gnu")
+        find_library(DVSTOR_MLX5_LIBRARY mlx5)
+        if (DVSTOR_DOCA_INCLUDE_DIR AND
+            DVSTOR_DOCA_GPUNETIO_LIBRARY AND
+            DVSTOR_DOCA_VERBS_LIBRARY AND
+            DVSTOR_DOCA_COMMON_LIBRARY AND
+            DVSTOR_DOCA_RDMA_LIBRARY AND
+            DVSTOR_MLX5_LIBRARY)
+            set(DVSTOR_HAVE_GPUNETIO ON)
+            list(FIND CMAKE_CUDA_ARCHITECTURES 52 DVSTOR_CUDA_SM52_INDEX)
+            if (NOT DVSTOR_CUDA_SM52_INDEX EQUAL -1)
+                message(WARNING "GPUNetIO requires sm_60+; replacing cached sm_52 with sm_80")
+                set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING "CUDA architectures" FORCE)
+            endif ()
+        else ()
+            message(WARNING "DOCA GPUNetIO SDK is incomplete; building verbs_proxy/local backends only")
+        endif ()
+    endif ()
+
     # GPU kernels library (compiled by nvcc)
-    file(GLOB_RECURSE DVSTOR_GPU_SOURCES CONFIGURE_DEPENDS src/gpu/*.cu)
+    file(GLOB_RECURSE DVSTOR_GPU_SOURCES CONFIGURE_DEPENDS
+        src/gpu/*.cu
+        src/gpu_search/*.cu)
+    if (NOT DVSTOR_HAVE_GPUNETIO)
+        list(REMOVE_ITEM DVSTOR_GPU_SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/gpunetio_query_launcher.cu")
+    endif ()
     if (DVSTOR_GPU_SOURCES)
         add_library(dvstor_gpu_kernels STATIC ${DVSTOR_GPU_SOURCES})
         dvstor_target_common_includes(dvstor_gpu_kernels PUBLIC)
         target_link_libraries(dvstor_gpu_kernels
             CUDA::cudart
         )
+        if (DVSTOR_HAVE_GPUNETIO)
+            target_include_directories(dvstor_gpu_kernels PUBLIC ${DVSTOR_DOCA_INCLUDE_DIR})
+            target_compile_definitions(dvstor_gpu_kernels PUBLIC DVSTOR_HAVE_GPUNETIO=1)
+        endif ()
         set_target_properties(dvstor_gpu_kernels PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
             CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -166,6 +211,14 @@ else ()
         "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cc"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/memory_node_main.cc"
     )
+    if (NOT DVSTOR_HAVE_GPUNETIO)
+        list(REMOVE_ITEM DVSTOR_RUNTIME_SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/gpunetio_query_engine.cc")
+    endif ()
+    if (DVSTOR_HAVE_GPUNETIO)
+        set_source_files_properties(src/gpu/gpunetio_query_engine.cc PROPERTIES
+            COMPILE_OPTIONS "-Wno-deprecated-declarations;-Wno-pedantic")
+    endif ()
 
     add_library(dvstor_runtime STATIC ${DVSTOR_RUNTIME_SOURCES})
     dvstor_target_common_includes(dvstor_runtime PUBLIC)
@@ -173,6 +226,17 @@ else ()
         rdma_library
         CUDA::cudart
     )
+    if (DVSTOR_HAVE_GPUNETIO)
+        target_include_directories(dvstor_runtime PUBLIC ${DVSTOR_DOCA_INCLUDE_DIR})
+        target_compile_definitions(dvstor_runtime PUBLIC DVSTOR_HAVE_GPUNETIO=1)
+        target_link_libraries(dvstor_runtime
+            ${DVSTOR_DOCA_GPUNETIO_LIBRARY}
+            ${DVSTOR_DOCA_VERBS_LIBRARY}
+            ${DVSTOR_DOCA_COMMON_LIBRARY}
+            ${DVSTOR_DOCA_RDMA_LIBRARY}
+            ${DVSTOR_MLX5_LIBRARY}
+        )
+    endif ()
     if (DVSTOR_GPU_SOURCES)
         target_link_libraries(dvstor_runtime dvstor_gpu_kernels)
     endif ()
@@ -248,4 +312,5 @@ else ()
     get_target_property(compile_options dvstor_runtime COMPILE_OPTIONS)
     message(STATUS "Compile options: ${compile_options}")
     message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+    message(STATUS "DOCA GPUNetIO backend: ${DVSTOR_HAVE_GPUNETIO}")
 endif ()

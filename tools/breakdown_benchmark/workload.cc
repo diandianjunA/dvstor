@@ -825,6 +825,43 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
 
   const SampleReport report = service.collect_breakdown_report();
   root.update(report_to_json(report));
+  if (service.config().use_gpu_persistent_search()) {
+    const auto telemetry = service.gpu_search_telemetry();
+    root["gpu_persistent"] = {
+      {"queries_submitted", telemetry.queries_submitted},
+      {"queries_completed", telemetry.queries_completed},
+      {"batches", telemetry.batches},
+      {"batch_queries", telemetry.batch_queries},
+      {"average_batch_size", telemetry.batches == 0 ? 0.0
+        : static_cast<double>(telemetry.batch_queries) / static_cast<double>(telemetry.batches)},
+      {"submission_wait_ns", telemetry.submission_wait_ns},
+      {"average_submission_wait_us", telemetry.queries_submitted == 0 ? 0.0
+        : static_cast<double>(telemetry.submission_wait_ns) /
+            static_cast<double>(telemetry.queries_submitted) / 1000.0},
+      {"completion_wait_ns", telemetry.completion_wait_ns},
+      {"gpu_query_residence_ns", telemetry.gpu_active_ns},
+      {"rdma_read_ops", telemetry.rdma_read_ops},
+      {"rdma_read_bytes", telemetry.rdma_read_bytes},
+      {"rdma_merged_requests", telemetry.rdma_merged_requests},
+      {"graph_page_requests", telemetry.graph_page_requests},
+      {"graph_page_cache_hits", telemetry.graph_page_cache_hits},
+      {"graph_page_cache_hit_ratio",
+        telemetry.graph_page_requests + telemetry.graph_page_cache_hits == 0 ? 0.0
+        : static_cast<double>(telemetry.graph_page_cache_hits) /
+            static_cast<double>(telemetry.graph_page_requests +
+                                telemetry.graph_page_cache_hits)},
+      {"exact_vector_reads", telemetry.exact_vector_reads},
+      {"delta_queries", telemetry.delta_queries},
+      {"mutations_published", telemetry.mutations_published},
+      {"delta_compactions", telemetry.delta_compactions},
+      {"base_entries_merged", telemetry.base_entries_merged},
+      {"delta_live_entries", telemetry.delta_live_entries},
+      {"average_visibility_us", telemetry.mutations_published == 0 ? 0.0
+        : static_cast<double>(telemetry.visibility_ns_total) /
+            static_cast<double>(telemetry.mutations_published) / 1000.0},
+      {"max_visibility_us", static_cast<double>(telemetry.visibility_ns_max) / 1000.0},
+    };
+  }
 
 
   const bool has_throughput_duration = use_time_mode && args.measure_seconds > 0;
@@ -904,6 +941,19 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
                  << recall.value("recall", 0.0) << '\n';
     text_summary << "  queries: " << recall.value("queries", 0) << '\n';
     text_summary << "  groundtruth_file: " << recall.value("groundtruth_file", "") << '\n';
+  }
+  if (root.contains("gpu_persistent")) {
+    const auto& gpu = root["gpu_persistent"];
+    text_summary << "gpu_persistent\n";
+    text_summary << "  average_batch_size: " << gpu.value("average_batch_size", 0.0) << '\n';
+    text_summary << "  average_submission_wait_us: "
+                 << gpu.value("average_submission_wait_us", 0.0) << '\n';
+    text_summary << "  rdma_read_bytes: " << gpu.value("rdma_read_bytes", 0ULL) << '\n';
+    text_summary << "  graph_page_cache_hit_ratio: "
+                 << gpu.value("graph_page_cache_hit_ratio", 0.0) << '\n';
+    text_summary << "  average_visibility_us: "
+                 << gpu.value("average_visibility_us", 0.0) << '\n';
+    text_summary << "  delta_live_entries: " << gpu.value("delta_live_entries", 0ULL) << '\n';
   }
   if (report.has_insert()) {
     const auto summary = aggregate_text_summary(report.insert);

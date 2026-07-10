@@ -17,6 +17,7 @@
 
 #include "common/configuration.hh"
 #include "common/core_assignment.hh"
+#include "gpu_search/persistent_engine.hh"
 #include "http/vamana_service_scheduler.hh"
 #include "memory_node/command_protocol.hh"
 #include "service/breakdown.hh"
@@ -110,6 +111,10 @@ public:
   void reset_breakdown_state();
   void clear_thread_statistics();
   service::breakdown::Report collect_breakdown_report() const;
+  gpu_search::TelemetrySnapshot gpu_search_telemetry() const {
+    return persistent_search_ == nullptr
+      ? gpu_search::TelemetrySnapshot{} : persistent_search_->telemetry();
+  }
 
   const Configuration& config() const { return config_; }
   size_t rabitq_cache_bytes() const { return rabitq_cache_ ? rabitq_cache_->total_size_bytes() : 0; }
@@ -269,6 +274,7 @@ private:
   std::unique_ptr<vamana::Vamana<Distance>> vamana_;
   std::unique_ptr<vamana::rabitq::Cache> rabitq_cache_;
   std::unique_ptr<vamana::anchor::Index> anchor_index_;
+  std::unique_ptr<gpu_search::PersistentSearchEngine> persistent_search_;
   std::unique_ptr<WorkerPool> worker_pool_;
   ServiceProfile service_profile_{};
   service::InsertQueue insert_queue_;

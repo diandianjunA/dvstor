@@ -42,4 +42,19 @@ inline filepath_t anchor_file(const filepath_t& prefix) {
   return filepath_t(prefix.string() + ".anchors");
 }
 
+inline filepath_t gpu_tiered_file(const filepath_t& prefix) {
+  return filepath_t(prefix.string() + ".gpu.idx");
+}
+
+inline filepath_t gpu_graph_pages_file(const filepath_t& prefix, size_t node_ordinal, size_t num_nodes) {
+  return filepath_t(prefix.string() + "_node" + std::to_string(node_ordinal) + "_of" +
+                    std::to_string(num_nodes) + ".gpu.pages");
+}
+
+inline filepath_t gpu_graph_pages_for_shard(const filepath_t& shard_file_path) {
+  filepath_t result = shard_file_path;
+  result.replace_extension(".gpu.pages");
+  return result;
+}
+
 }  // namespace index_path

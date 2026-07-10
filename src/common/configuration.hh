@@ -17,9 +17,10 @@ namespace configuration {
 // struct used for sending serialized from CN to MN
 struct Parameters {
   u32 num_threads{};
-  bool reserved{};
+  bool gpu_persistent{};
   bool routing{};
   u32 qp_pool_size{1};
+  u32 gpu_rdma_qps{};
 };
 
 class IndexConfiguration : public Configuration {
@@ -58,6 +59,21 @@ public:
   u32 rdma_read_chain_size{};
   u32 rdma_read_max_inflight_wrs{};
   u32 query_batch_size{1};  // Fuse GPU across N queries (1=single query)
+  str search_engine{"legacy"};
+  str gpu_rdma_backend{"gpunetio"};
+  u32 query_batch_min{16};
+  u32 query_batch_target{64};
+  u32 query_batch_max{256};
+  u32 query_batch_wait_us{20};
+  u32 gpu_page_cache_mb{};
+  f64 gpu_page_cache_ratio{0.35};
+  u32 gpu_hot_degree{16};
+  u32 gpu_cold_expansions{8};
+  u32 gpu_rdma_qps{4};
+  u32 update_visibility_us{10000};
+  f64 delta_max_ratio{0.01};
+  u32 delta_budget_mb{1024};
+  u32 merge_period_ms{60000};
   bool use_rabitq{};        // Use the local RaBitQ gate before exact beam insertion
   u32 rabitq_gate_width{18};
   u32 rabitq_gate_max_width{36};
@@ -126,6 +142,8 @@ public:
     storage_owner_update_mode = normalize_mode(storage_owner_update_mode);
     storage_owner_maintenance_mode = normalize_mode(storage_owner_maintenance_mode);
     rdma_read_batch_mode = normalize_mode(rdma_read_batch_mode);
+    search_engine = normalize_mode(search_engine);
+    gpu_rdma_backend = normalize_mode(gpu_rdma_backend);
 
     validate_common_options(argv);
     if (!is_server) {
@@ -315,6 +333,36 @@ private:
       "Maximum outstanding bulk READ WRs per QP. 0 derives it from the send queue capacity.")(
       "query-batch-size", po::value<u32>(&query_batch_size)->default_value(1),
       "Fuse GPU/D2H across N queries processed in lockstep (1=disabled, 2-4=batch).")(
+      "search-engine", po::value<str>(&search_engine)->default_value(search_engine),
+      "Query execution engine: legacy or gpu_persistent.")(
+      "gpu-rdma-backend", po::value<str>(&gpu_rdma_backend)->default_value(gpu_rdma_backend),
+      "Remote fetch backend for gpu_persistent: gpunetio, verbs_proxy, or local.")(
+      "query-batch-min", po::value<u32>(&query_batch_min)->default_value(query_batch_min),
+      "Minimum query batch admitted to the persistent GPU scheduler under load.")(
+      "query-batch-target", po::value<u32>(&query_batch_target)->default_value(query_batch_target),
+      "Target query batch for the persistent GPU scheduler.")(
+      "query-batch-max", po::value<u32>(&query_batch_max)->default_value(query_batch_max),
+      "Maximum active query slots owned by the persistent GPU scheduler.")(
+      "query-batch-wait-us", po::value<u32>(&query_batch_wait_us)->default_value(query_batch_wait_us),
+      "Maximum admission wait before launching an under-filled GPU query batch.")(
+      "gpu-page-cache-mb", po::value<u32>(&gpu_page_cache_mb)->default_value(gpu_page_cache_mb),
+      "GPU graph-page cache size in MiB. 0 derives it from --gpu-page-cache-ratio.")(
+      "gpu-page-cache-ratio", po::value<f64>(&gpu_page_cache_ratio)->default_value(gpu_page_cache_ratio),
+      "Fraction of currently free GPU memory reserved for graph pages when cache MiB is zero.")(
+      "gpu-hot-degree", po::value<u32>(&gpu_hot_degree)->default_value(gpu_hot_degree),
+      "Per-node navigation edges resident on the GPU.")(
+      "gpu-cold-expansions", po::value<u32>(&gpu_cold_expansions)->default_value(gpu_cold_expansions),
+      "Maximum expanded nodes per query whose full adjacency page may be fetched remotely.")(
+      "gpu-rdma-qps", po::value<u32>(&gpu_rdma_qps)->default_value(gpu_rdma_qps),
+      "GPU data-path QPs created per memory node.")(
+      "update-visibility-us", po::value<u32>(&update_visibility_us)->default_value(update_visibility_us),
+      "Maximum mutation micro-batch visibility delay for the GPU delta index.")(
+      "delta-max-ratio", po::value<f64>(&delta_max_ratio)->default_value(delta_max_ratio),
+      "Trigger base consolidation when delta entries reach this fraction of base nodes.")(
+      "delta-budget-mb", po::value<u32>(&delta_budget_mb)->default_value(delta_budget_mb),
+      "GPU delta-index memory budget in MiB.")(
+      "merge-period-ms", po::value<u32>(&merge_period_ms)->default_value(merge_period_ms),
+      "Maximum interval between delta consolidation attempts.")(
       "use-rabitq", po::bool_switch(&use_rabitq)->default_value(false),
       "Use the local RaBitQ CPU gate; only exact distances enter the beam.")(
       "rabitq-gate-width", po::value<u32>(&rabitq_gate_width)->default_value(rabitq_gate_width),
@@ -368,6 +416,33 @@ private:
 
     if (rdma_read_batch_mode != "adaptive" && rdma_read_batch_mode != "legacy") {
       std::cerr << "[ERROR]: --rdma-read-batch-mode must be adaptive or legacy" << std::endl;
+      exit_with_help_message(argv);
+    }
+
+    if (search_engine != "legacy" && search_engine != "gpu_persistent") {
+      std::cerr << "[ERROR]: --search-engine must be legacy or gpu_persistent" << std::endl;
+      exit_with_help_message(argv);
+    }
+    if (gpu_rdma_backend != "gpunetio" && gpu_rdma_backend != "verbs_proxy" &&
+        gpu_rdma_backend != "local") {
+      std::cerr << "[ERROR]: --gpu-rdma-backend must be gpunetio, verbs_proxy, or local" << std::endl;
+      exit_with_help_message(argv);
+    }
+    if (search_engine == "gpu_persistent" &&
+        (query_batch_min == 0 || query_batch_min > query_batch_target ||
+         query_batch_target > query_batch_max || query_batch_max > 4096 ||
+         gpu_hot_degree == 0 || gpu_hot_degree > R || gpu_hot_degree > 32 ||
+         gpu_cold_expansions > beam_width ||
+         gpu_page_cache_ratio <= 0.0 || gpu_page_cache_ratio >= 0.9 ||
+         gpu_rdma_qps == 0 || gpu_rdma_qps > 32 || update_visibility_us == 0 ||
+         delta_max_ratio <= 0.0 || delta_max_ratio > 0.5 || delta_budget_mb == 0 ||
+         merge_period_ms == 0 || beam_width > 256 || rabitq_gate_max_width > 64 ||
+         !use_rabitq || ip_distance || insert_execution != "storage_owner" || routing)) {
+      std::cerr << "[ERROR]: invalid gpu_persistent engine configuration" << std::endl;
+      exit_with_help_message(argv);
+    }
+    if (search_engine == "gpu_persistent" && !load_index) {
+      std::cerr << "[ERROR]: --search-engine=gpu_persistent currently requires --load-index" << std::endl;
       exit_with_help_message(argv);
     }
 
@@ -529,6 +604,7 @@ public:
   }
 
   bool use_storage_owner_insert() const { return insert_execution == "storage_owner"; }
+  bool use_gpu_persistent_search() const { return search_engine == "gpu_persistent"; }
   u32 effective_rdma_qp_pool_size() const {
     if (rdma_qp_pool_size != 0) return rdma_qp_pool_size;
     return rdma_read_batch_mode == "legacy" ? 1 : MAX_QPS;
@@ -609,6 +685,20 @@ public:
       os << std::setw(width) << "insert coroutines: " << config.insert_coroutines << std::endl;
       os << std::setw(width) << "query coroutines: " << config.query_coroutines << std::endl;
       os << std::setw(width) << "GPU device: " << config.gpu_device << std::endl;
+      os << std::setw(width) << "Search engine: " << config.search_engine << std::endl;
+      if (config.use_gpu_persistent_search()) {
+        os << std::setw(width) << "GPU RDMA backend: " << config.gpu_rdma_backend << std::endl;
+        os << std::setw(width) << "GPU query batch min/target/max: "
+           << config.query_batch_min << "/" << config.query_batch_target << "/"
+           << config.query_batch_max << std::endl;
+        os << std::setw(width) << "GPU query batch wait(us): "
+           << config.query_batch_wait_us << std::endl;
+        os << std::setw(width) << "GPU hot degree: " << config.gpu_hot_degree << std::endl;
+        os << std::setw(width) << "GPU cold expansion budget: "
+           << config.gpu_cold_expansions << std::endl;
+        os << std::setw(width) << "Update visibility(us): "
+           << config.update_visibility_us << std::endl;
+      }
       os << std::setw(width) << "GPUDirect RDMA: " << (config.gpudirect_rdma ? "true" : "false") << std::endl;
       os << std::setw(width) << "Fine-grained breakdown: "
          << (config.enable_breakdown ? "true" : "false") << std::endl;

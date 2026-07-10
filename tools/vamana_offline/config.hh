@@ -29,6 +29,10 @@ struct VamanaBuildConfig {
   size_t max_vectors{std::numeric_limits<u32>::max()};
   bool ip_distance{false};
   u32 anchor_count_per_shard{4096};
+  bool build_gpu_tiered_index{false};
+  u32 gpu_hot_degree{16};
+  u32 gpu_entry_points{256};
+  u32 gpu_graph_page_bytes{4096};
 };
 
 filepath_t default_vamana_prefix(const filepath_t& data_path, u32 R, u32 beam_width);

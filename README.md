@@ -101,6 +101,8 @@ Additional CMake options:
 - `-DDVSTOR_USE_NATIVE_ARCH=ON`: compile with `-march=native` for host-specific optimizations
 - `-DDVSTOR_BUILD_EXECUTABLES=OFF`: skip building standalone executables
 - `-DDVSTOR_BUILD_TESTS=OFF`: skip building tests
+- `-DDVSTOR_ENABLE_GPUNETIO=ON`: enable the DOCA GPUNetIO backend when available
+- `-DDVSTOR_DOCA_ROOT=/opt/mellanox/doca`: set the DOCA SDK root
 
 ## Data Preparation
 
@@ -164,7 +166,15 @@ under `experiment/reports/<profile>/`.
 # RaBitQ + ALDI + adaptive RDMA scheduling
 ./experiment/start_all_memory_nodes.sh 03_rabitq_gpu_pipeline_aldi_rdma
 ./experiment/run_breakdown.sh 03_rabitq_gpu_pipeline_aldi_rdma
+
+# GPU-centric persistent kernel + GPUNetIO data path
+./experiment/build_sift100m_index.sh 04_gpu_persistent_gpunetio
+./experiment/start_all_memory_nodes.sh 04_gpu_persistent_gpunetio
+./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
 ```
+
+See `docs/gpu_persistent_engine.md` for the execution model, index artifacts,
+dynamic-update semantics, and report comparison workflow.
 
 ### Common Overrides
 

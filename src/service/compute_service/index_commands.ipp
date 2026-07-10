@@ -256,10 +256,14 @@ void ComputeService<Distance>::reset_breakdown_state() {
   completed_query_samples_.clear();
   completed_insert_samples_.clear();
   breakdown_enabled_ = config_.enable_breakdown;
+  if (persistent_search_ != nullptr) {
+    persistent_search_->reset_telemetry();
+  }
 }
 
 template <class Distance>
 void ComputeService<Distance>::clear_thread_statistics() {
+  if (worker_pool_ == nullptr) return;
   for (auto& thread : compute_threads()) {
     thread->stats = statistics::ThreadStatistics{};
   }

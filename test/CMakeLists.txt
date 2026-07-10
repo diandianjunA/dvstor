@@ -1,0 +1,14 @@
+add_executable(gpu_search_ring_test gpu_search_ring_test.cc)
+target_link_libraries(gpu_search_ring_test PRIVATE dvstor_runtime)
+target_compile_options(gpu_search_ring_test PRIVATE -UNDEBUG)
+add_test(NAME gpu_search_ring_test COMMAND gpu_search_ring_test)
+
+add_executable(gpu_tiered_index_format_test gpu_tiered_index_format_test.cc)
+target_link_libraries(gpu_tiered_index_format_test PRIVATE dvstor_runtime)
+target_compile_options(gpu_tiered_index_format_test PRIVATE -UNDEBUG)
+add_test(NAME gpu_tiered_index_format_test COMMAND gpu_tiered_index_format_test)
+
+add_executable(gpu_delta_index_test gpu_delta_index_test.cc)
+target_link_libraries(gpu_delta_index_test PRIVATE dvstor_runtime)
+target_compile_options(gpu_delta_index_test PRIVATE -UNDEBUG)
+add_test(NAME gpu_delta_index_test COMMAND gpu_delta_index_test)

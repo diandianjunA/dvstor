@@ -768,15 +768,57 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
     const u64 response_wait_unaccounted_ns = collect_breakdown &&
         response_wait_ns > memory_breakdown_ns
       ? response_wait_ns - memory_breakdown_ns : 0;
-    const auto finished_at = slot.response_completed_at;
     const bool mutation_response = response->magic == service::storage_owner::kMutationMagic;
     const byte_t* request_vectors = mutation_response
       ? service::storage_owner::mutation_request_vectors(slot.request_buffer.data(), slot.item_count)
       : service::storage_owner::request_vectors(slot.request_buffer.data(), slot.item_count);
 
+    vec<bool> storage_ok(slot.item_count, false);
     for (u32 i = 0; i < slot.item_count; ++i) {
-      const bool ok = response_ok && statuses[i] == 0;
-      if (response_ok && !ok) {
+      storage_ok[i] = response_ok && statuses[i] == 0;
+    }
+    bool gpu_visible = true;
+    if (persistent_search_ != nullptr) {
+      std::vector<gpu_search::DeltaMutation> mutations;
+      mutations.reserve(slot.item_count);
+      for (u32 i = 0; i < slot.item_count; ++i) {
+        if (!storage_ok[i]) continue;
+        gpu_search::DeltaMutation mutation;
+        mutation.id = slot.tasks[i]->item.id;
+        mutation.kind = slot.tasks[i]->kind;
+        mutation.generation = mutation_results[i].generation;
+        mutation.remote_node = mutation_results[i].new_rptr_raw;
+        mutation.old_remote_node = mutation_results[i].old_rptr_raw;
+        mutation.enqueued_at = slot.response_completed_at;
+        if (mutation.kind != service::storage_owner::MutationKind::erase) {
+          const byte_t* vector = request_vectors +
+            static_cast<size_t>(i) * VamanaNode::vector_bytes();
+          mutation.vector.assign(vector, vector + VamanaNode::vector_bytes());
+        }
+        mutations.push_back(std::move(mutation));
+      }
+      if (!mutations.empty()) {
+        try {
+          const u64 epoch = persistent_search_->delta().reserve_epoch();
+          gpu_visible = persistent_search_->publish_mutations(std::move(mutations), epoch);
+        } catch (const std::exception& error) {
+          gpu_visible = false;
+          static std::atomic<u32> gpu_delta_failure_logs{0};
+          const u32 log_index = gpu_delta_failure_logs.fetch_add(1, std::memory_order_relaxed);
+          if (log_index < 16) {
+            std::cerr << "[storage-owner] committed mutation batch was not published to GPU delta: "
+                      << error.what() << std::endl;
+          }
+        }
+      }
+    }
+    const auto finished_at = persistent_search_ == nullptr
+      ? slot.response_completed_at : std::chrono::steady_clock::now();
+
+    for (u32 i = 0; i < slot.item_count; ++i) {
+      const bool committed = storage_ok[i];
+      const bool ok = committed && gpu_visible;
+      if (response_ok && !committed) {
         static std::atomic<u32> failed_status_logs{0};
         const u32 log_index = failed_status_logs.fetch_add(1, std::memory_order_relaxed);
         if (log_index < 16) {
@@ -806,7 +848,7 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
       if (slot.samples[i]) {
         slot.samples[i]->mark_finished(finished_at, statistics::ThreadStatistics{});
       }
-      if (ok && rabitq_cache_ != nullptr) {
+      if (committed && rabitq_cache_ != nullptr) {
         const auto& result = mutation_results[i];
         if (result.old_rptr_raw != 0) {
           (void)rabitq_cache_->erase_dynamic(RemotePtr{result.old_rptr_raw});
@@ -819,7 +861,7 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
             VamanaNode::vector_dtype());
         }
       }
-      if (ok) {
+      if (committed) {
         const auto& result = mutation_results[i];
         if (slot.tasks[i]->kind == service::storage_owner::MutationKind::erase) {
           publish_compute_side_id(slot.tasks[i]->item.id,

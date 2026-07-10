@@ -15,8 +15,15 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   }
 
   if (cm_.is_initiator) {
+    const u32 gpu_rdma_qps = config_.use_gpu_persistent_search() &&
+        config_.gpu_rdma_backend != "local"
+      ? config_.gpu_rdma_qps : 0;
     configuration::Parameters p{
-      config_.num_threads, false, config_.routing, config_.effective_rdma_qp_pool_size()};
+      config_.num_threads,
+      config_.use_gpu_persistent_search(),
+      config_.routing,
+      config_.effective_rdma_qp_pool_size(),
+      gpu_rdma_qps};
     for (const QP& qp : cm_.server_qps) {
       qp->post_send_inlined(&p, sizeof(configuration::Parameters), IBV_WR_SEND);
       context_.poll_send_cq_until_completion();
@@ -123,7 +130,7 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                               config_.rabitq_audit_period,
                               config_.rabitq_strict_recall);
   vamana_->set_use_rabitq(config_.use_rabitq);
-  if (vamana_->use_rabitq() && config_.load_index) {
+  if (vamana_->use_rabitq() && config_.load_index && !config_.use_gpu_persistent_search()) {
     const filepath_t startup_prefix = config_.resolved_index_prefix();
     rabitq_cache_ = std::make_unique<vamana::rabitq::Cache>();
     str cache_error;
@@ -165,45 +172,54 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
       ? "RFQ5 RaBitQ cpu_gate + GPUDirect exact beam"
       : "exact"));
 
-  worker_pool_ = std::make_unique<WorkerPool>(config_.num_threads,
-                                              config_.max_send_queue_wr,
-                                              static_cast<u64>(config_.cn_memory_gb) * 1073741824ul);
-  const RdmaReadBatchOptions rdma_batch_options{
-    config_.rdma_read_batch_mode == "adaptive",
-    config_.rdma_read_chain_size,
-    config_.rdma_read_max_inflight_wrs,
-  };
-  worker_pool_->allocate_worker_threads(
-    context_, cm_, remote_access_tokens_, config_.num_coroutines,
-    config_.effective_rdma_qp_pool_size(), rdma_batch_options);
-  // Initialize GPU buffers for each compute thread
-  const u32 query_batch_factor = std::max<u32>(1, config_.query_batch_size);
-  const u64 query_frontier_batch =
-    static_cast<u64>(std::max(config_.R, config_.beam_width)) *
-    config_.expansion_batch * query_batch_factor;
-  const u64 construction_batch = config_.beam_width_construction;
-  const u64 overflow_prune_batch = static_cast<u64>(config_.R) + 1u;
-  const u64 max_batch_u64 =
-    std::max(std::max(query_frontier_batch, construction_batch), overflow_prune_batch);
-  lib_assert(max_batch_u64 <= std::numeric_limits<u32>::max(),
-             "GPU candidate batch capacity exceeds u32; reduce R, expansion-batch, or query-batch-size");
-  const u32 max_batch = static_cast<u32>(max_batch_u64);
-  const size_t query_buffer_bytes = std::max(
-    static_cast<size_t>(config_.dim) * sizeof(element_t) * query_batch_factor,
-    static_cast<size_t>(VamanaNode::rabitq_code_bits()) * sizeof(float));
-  const size_t candidate_buffer_bytes = std::max(
-    VamanaNode::vector_bytes(), VamanaNode::rabitq_entry_size());
-  for (u32 tid = 0; tid < compute_threads().size(); ++tid) {
-    auto& thread = compute_threads()[tid];
-    thread->gpu_buffers.init(config_.num_coroutines,
-                             config_.dim,
-                             max_batch,
-                             config_.R,
-                             query_buffer_bytes,
-                             candidate_buffer_bytes,
-                             thread->ctx->context.get_protection_domain(),
-                             config_.gpudirect_rdma,
-                             config_.enable_breakdown && config_.observe_device_utilization);
+  if (!config_.use_gpu_persistent_search()) {
+    worker_pool_ = std::make_unique<WorkerPool>(
+      config_.num_threads, config_.max_send_queue_wr,
+      static_cast<u64>(config_.cn_memory_gb) * 1073741824ul);
+    const RdmaReadBatchOptions rdma_batch_options{
+      config_.rdma_read_batch_mode == "adaptive",
+      config_.rdma_read_chain_size,
+      config_.rdma_read_max_inflight_wrs,
+    };
+    worker_pool_->allocate_worker_threads(
+      context_, cm_, remote_access_tokens_, config_.num_coroutines,
+      config_.effective_rdma_qp_pool_size(), rdma_batch_options);
+    const u32 query_batch_factor = std::max<u32>(1, config_.query_batch_size);
+    const u64 query_frontier_batch =
+      static_cast<u64>(std::max(config_.R, config_.beam_width)) *
+      config_.expansion_batch * query_batch_factor;
+    const u64 construction_batch = config_.beam_width_construction;
+    const u64 overflow_prune_batch = static_cast<u64>(config_.R) + 1u;
+    const u64 max_batch_u64 =
+      std::max(std::max(query_frontier_batch, construction_batch), overflow_prune_batch);
+    lib_assert(max_batch_u64 <= std::numeric_limits<u32>::max(),
+               "GPU candidate batch capacity exceeds u32; reduce R, expansion-batch, or query-batch-size");
+    const u32 max_batch = static_cast<u32>(max_batch_u64);
+    const size_t query_buffer_bytes = std::max(
+      static_cast<size_t>(config_.dim) * sizeof(element_t) * query_batch_factor,
+      static_cast<size_t>(VamanaNode::rabitq_code_bits()) * sizeof(float));
+    const size_t candidate_buffer_bytes = std::max(
+      VamanaNode::vector_bytes(), VamanaNode::rabitq_entry_size());
+    for (u32 tid = 0; tid < compute_threads().size(); ++tid) {
+      auto& thread = compute_threads()[tid];
+      thread->gpu_buffers.init(config_.num_coroutines,
+                               config_.dim,
+                               max_batch,
+                               config_.R,
+                               query_buffer_bytes,
+                               candidate_buffer_bytes,
+                               thread->ctx->context.get_protection_domain(),
+                               config_.gpudirect_rdma,
+                               config_.enable_breakdown && config_.observe_device_utilization);
+    }
+  }
+  if (config_.use_gpu_persistent_search()) {
+    persistent_search_ = std::make_unique<gpu_search::PersistentSearchEngine>(
+      config_, context_, cm_, remote_access_tokens_);
+    print_status("query engine: gpu_persistent backend=" + config_.gpu_rdma_backend +
+                 " batch=" + std::to_string(config_.query_batch_min) + "/" +
+                 std::to_string(config_.query_batch_target) + "/" +
+                 std::to_string(config_.query_batch_max));
   }
   cm_.synchronize();
   if (have_startup_metadata && !config_.use_storage_owner_insert()) {
@@ -234,9 +250,12 @@ ComputeService<Distance>::~ComputeService() {
   stop_storage_insert_runtime();
   stop_rpc();
   stop_workers();
+  persistent_search_.reset();
   shutdown_remote_if_requested();
-  for (auto& thread : compute_threads()) {
-    thread->gpu_buffers.destroy();
+  if (worker_pool_ != nullptr) {
+    for (auto& thread : compute_threads()) {
+      thread->gpu_buffers.destroy();
+    }
   }
   gpu::gpu_shutdown();
 }
@@ -244,19 +263,20 @@ ComputeService<Distance>::~ComputeService() {
 
 template <class Distance>
 void ComputeService<Distance>::start_workers() {
-  const u32 num_threads = config_.num_threads;
   const u32 dim = config_.dim;
   const u32 num_insert_workers = service_profile_.insert_workers;
-  const u32 num_query_workers = service_profile_.query_workers;
+  const u32 num_query_workers = config_.use_gpu_persistent_search()
+    ? 0 : service_profile_.query_workers;
   const u32 insert_coroutines = service_profile_.insert_coroutines;
   const u32 query_coroutines = service_profile_.query_coroutines;
 
-  print_status("starting " + std::to_string(num_threads) + " service worker threads (Vamana)");
+  const u32 active_worker_count = num_insert_workers + num_query_workers;
+  print_status("starting " + std::to_string(active_worker_count) + " service worker threads (Vamana)");
   print_status("worker split: inserts=" + std::to_string(num_insert_workers) +
                ", queries=" + std::to_string(num_query_workers) +
                " | coroutines: insert=" + std::to_string(insert_coroutines) +
                ", query=" + std::to_string(query_coroutines));
-  workers_.reserve(num_threads);
+  workers_.reserve(active_worker_count);
 
   for (u32 tid = 0; tid < num_insert_workers; ++tid) {
     workers_.emplace_back([this, insert_coroutines, dim, tid]() {
@@ -266,7 +286,7 @@ void ComputeService<Distance>::start_workers() {
     });
   }
 
-  for (u32 tid = num_insert_workers; tid < num_threads; ++tid) {
+  for (u32 tid = num_insert_workers; tid < num_insert_workers + num_query_workers; ++tid) {
     workers_.emplace_back([this, query_coroutines, dim, tid]() {
       gpu::gpu_init(static_cast<int>(config_.gpu_device));
       service::vamana_service_schedule_queries<Distance>(
@@ -275,7 +295,7 @@ void ComputeService<Distance>::start_workers() {
   }
 
   if (!config_.disable_thread_pinning) {
-    for (u32 tid = 0; tid < num_threads; ++tid) {
+    for (u32 tid = 0; tid < workers_.size(); ++tid) {
       const u32 core = core_assignment_.get_available_core();
       cpu_set_t cpuset;
       CPU_ZERO(&cpuset);
@@ -305,7 +325,7 @@ void ComputeService<Distance>::stop_workers() {
 template <class Distance>
 void ComputeService<Distance>::pause_workers() {
   workers_paused_.store(true, std::memory_order_release);
-  while (workers_idle_count_.load(std::memory_order_acquire) < config_.num_threads) {
+  while (workers_idle_count_.load(std::memory_order_acquire) < workers_.size()) {
     std::this_thread::yield();
   }
 }

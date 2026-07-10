@@ -4,6 +4,8 @@
 #include <fstream>
 #include <iostream>
 
+#include "common/index_path.hh"
+#include "gpu_search/index_format.hh"
 #include "vamana/storage_layout_resolver.hh"
 
 MemoryNode::MemoryNode(Configuration& config)
@@ -37,6 +39,7 @@ MemoryNode::MemoryNode(Configuration& config)
 
   num_compute_threads_ = p.num_threads;
   qp_pool_size_ = p.qp_pool_size;
+  const u32 gpu_rdma_qps = p.gpu_persistent ? p.gpu_rdma_qps : 0;
   const filepath_t index_prefix = config.resolved_index_prefix();
   index_prefix_ = index_prefix;
   VectorDType startup_dtype = config.resolved_vector_dtype();
@@ -159,7 +162,13 @@ MemoryNode::MemoryNode(Configuration& config)
   vec<u_ptr<DetachedQP>> qps;
 
   // note: no need for QP sharing on the memory server side
-  const u32 qps_per_node = std::min<u32>(num_compute_threads_, MAX_QPS) * qp_pool_size_;
+  const u32 worker_qps_per_node =
+    (p.gpu_persistent ? 0 : std::min<u32>(num_compute_threads_, MAX_QPS)) * qp_pool_size_;
+  const u32 qps_per_node = worker_qps_per_node + gpu_rdma_qps;
+  if (gpu_rdma_qps > 0) {
+    print_status("reserving " + std::to_string(gpu_rdma_qps) +
+                 " GPU data-path QPs per compute node");
+  }
   qps.reserve(num_clients_ * qps_per_node);
 
   for (QP& client_qp : cm_.client_qps) {
@@ -348,6 +357,42 @@ std::pair<bool, str> MemoryNode::load_index_file(const str& path) {
 
   if (!file) {
     return {false, "read failed for " + path};
+  }
+
+  const filepath_t pages_path = index_path::gpu_graph_pages_for_shard(path);
+  if (std::filesystem::exists(pages_path)) {
+    std::ifstream pages{pages_path, std::ios::binary};
+    gpu_search::format::ShardPageFileHeader header;
+    pages.read(reinterpret_cast<char*>(&header), sizeof(header));
+    const u64 expected_checksum = gpu_search::format::checksum64(
+      reinterpret_cast<const byte_t*>(&header),
+      offsetof(gpu_search::format::ShardPageFileHeader, checksum));
+    if (!pages.good() || header.magic != gpu_search::format::kShardPagesMagic ||
+        header.version != gpu_search::format::kVersion ||
+        header.memory_node != storage_id_ || header.checksum != expected_checksum ||
+        header.remote_offset != gpu_search::format::align_up(file_size, header.page_bytes) ||
+        header.data_bytes % header.page_bytes != 0) {
+      return {false, "invalid GPU graph-page sidecar " + pages_path.string()};
+    }
+    if (header.remote_offset > index_buffer_.buffer_size ||
+        header.data_bytes > index_buffer_.buffer_size - header.remote_offset) {
+      return {false, "buffer too small for GPU graph-page sidecar"};
+    }
+    if (file_size < header.remote_offset + header.data_bytes) {
+      pages.read(reinterpret_cast<char*>(index_buffer_.get_full_buffer() + header.remote_offset),
+                 static_cast<std::streamsize>(header.data_bytes));
+      if (!pages.good()) {
+        return {false, "read failed for " + pages_path.string()};
+      }
+    }
+    const u64 allocation_base = *reinterpret_cast<u64*>(index_buffer_.get_full_buffer());
+    const u64 region_end = header.remote_offset + header.data_bytes;
+    const u64 allocation_stride = VamanaNode::HAS_HOT_GRAPH
+      ? static_cast<u64>(VamanaNode::allocation_size()) : 8ULL;
+    *reinterpret_cast<u64*>(index_buffer_.get_full_buffer()) = allocation_base +
+      gpu_search::format::align_up(region_end - allocation_base, allocation_stride);
+    print_status("loaded GPU graph pages (" + std::to_string(header.data_bytes) +
+                 " Bytes) at remote offset " + std::to_string(header.remote_offset));
   }
 
   return {true, ""};

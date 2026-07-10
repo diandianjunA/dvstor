@@ -7,6 +7,7 @@
 #include <boost/program_options.hpp>
 #include <library/utils.hh>
 
+#include "gpu_search/index_format.hh"
 #include "vamana/storage_format.hh"
 
 namespace po = boost::program_options;
@@ -66,7 +67,16 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
      "Path to ground truth file (.bin) for post-build recall test.")
     ("anchor-count-per-shard",
      po::value<u32>(&config.anchor_count_per_shard)->default_value(config.anchor_count_per_shard),
-     "Representative anchors written per shard. 0 disables the anchor sidecar.");
+     "Representative anchors written per shard. 0 disables the anchor sidecar.")
+    ("gpu-tiered-index", po::bool_switch(&config.build_gpu_tiered_index),
+     "Build the GPU-resident hot/RaBitQ image and remote graph pages.")
+    ("gpu-hot-degree", po::value<u32>(&config.gpu_hot_degree)->default_value(config.gpu_hot_degree),
+     "Number of per-node navigation edges stored in the GPU-resident image.")
+    ("gpu-entry-points", po::value<u32>(&config.gpu_entry_points)->default_value(config.gpu_entry_points),
+     "Number of deterministic shard-balanced GPU search entry points.")
+    ("gpu-graph-page-bytes",
+     po::value<u32>(&config.gpu_graph_page_bytes)->default_value(config.gpu_graph_page_bytes),
+     "Remote cold-graph page size; power of two and at least 4096.");
 
   po::variables_map vm;
   po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -102,6 +112,19 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     lib_failure("--rabitq-cache-format must be budget or full");
   if (!vamana::parse_storage_format(config.storage_format))
     lib_failure("--storage-format must be vamana_aos_v1 or vamana_compact_v1");
+  if (config.build_gpu_tiered_index && !config.use_rabitq)
+    lib_failure("--gpu-tiered-index requires --use-rabitq");
+  if (config.build_gpu_tiered_index &&
+      (config.gpu_hot_degree == 0 || config.gpu_hot_degree > config.R ||
+       config.gpu_hot_degree > gpu_search::format::kMaxHotDegree))
+    lib_failure("--gpu-hot-degree must be in [1, min(R, 32)]");
+  if (config.build_gpu_tiered_index &&
+      (config.gpu_entry_points == 0 || config.gpu_entry_points > 512))
+    lib_failure("--gpu-entry-points must be in [1, 512]");
+  if (config.build_gpu_tiered_index &&
+      (config.gpu_graph_page_bytes < gpu_search::format::kDefaultPageBytes ||
+       (config.gpu_graph_page_bytes & (config.gpu_graph_page_bytes - 1)) != 0))
+    lib_failure("--gpu-graph-page-bytes must be a power of two >= 4096");
   return config;
 }
 

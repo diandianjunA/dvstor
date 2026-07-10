@@ -10,6 +10,7 @@ isolates adaptive RDMA scheduling as the third contribution.
 | `01_rabitq_expension_aware` | Contribution 1 | RaBitQ-aware expansion and GPU query pipeline |
 | `02_rabitq_expension_aware_two_stage_aldi` | Contribution 1 + 2 | add local-stitch two-stage ALDI and METIS/locality-oriented placement |
 | `03_rabitq_expension_aware_two_stage_aldi_rdma` | Contribution 1 + 2 + 3 | add adaptive multi-QP RDMA scheduling |
+| `04_gpu_persistent_gpunetio` | GPU-centric redesign | persistent GPU scheduling, tiered graph cache, GPUNetIO, and MVCC delta |
 
 Contribution 1 includes the compute-side RaBitQ proxy gate because the current
 measurements show it behaves as part of the query execution pipeline: it trades
@@ -31,6 +32,12 @@ already writes RaBitQ and anchor sidecars:
 ./experiment/build_sift100m_index.sh
 ```
 
+The GPU-persistent profile needs its GPU image and graph-page sidecars:
+
+```bash
+./experiment/build_sift100m_index.sh 04_gpu_persistent_gpunetio
+```
+
 If an older index is missing the ALDI anchor sidecar, generate it once for the
 actual index prefix being tested. Profiles `02_*` and `03_*` use the METIS
 prefix by default:
@@ -50,6 +57,12 @@ prefix by default:
 ```
 
 The same pattern works for the other profiles.
+
+```bash
+./experiment/start_all_memory_nodes.sh 04_gpu_persistent_gpunetio
+./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
+./experiment/stop_memory_nodes.sh
+```
 
 ## Run The Full Ablation
 

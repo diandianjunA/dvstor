@@ -22,6 +22,7 @@
 #include "tools/vamana_offline/partitioning.hh"
 #include "tools/vamana_offline/progress.hh"
 #include "tools/vamana_offline/anchor_builder.hh"
+#include "tools/vamana_offline/gpu_tiered_writer.hh"
 
 namespace tools::vamana_offline {
 
@@ -519,6 +520,16 @@ void write_vamana_shards(const VamanaGraph& graph,
     progress.increment();
   }
 
+  GpuTieredWriteResult gpu_tiered;
+  if (config.build_gpu_tiered_index) {
+    gpu_tiered = write_gpu_tiered_index(
+      graph, dataset, config, placements, shard_sizes, output_prefix);
+    std::cerr << "GPU tiered index: " << gpu_tiered.index_file
+              << " hot_degree=" << gpu_tiered.hot_degree
+              << " entry_points=" << gpu_tiered.entry_points
+              << " page_bytes=" << gpu_tiered.page_bytes << "\n";
+  }
+
   nlohmann::json metadata{
     {"data_file", dataset.source_file.string()},
     {"output_prefix", output_prefix.string()},
@@ -550,6 +561,13 @@ void write_vamana_shards(const VamanaGraph& graph,
     {"partition_imbalance", config.partition_imbalance},
     {"partition_edge_cut", placement_result.stats.edge_cut},
     {"partition_cross_shard_ratio", placement_result.cross_shard_ratio},
+    {"gpu_tiered_format", config.build_gpu_tiered_index ? "gpu_tiered_v3" : ""},
+    {"gpu_tiered_file", config.build_gpu_tiered_index ? gpu_tiered.index_file.string() : ""},
+    {"gpu_hot_degree", config.build_gpu_tiered_index ? gpu_tiered.hot_degree : 0},
+    {"gpu_entry_points", config.build_gpu_tiered_index ? gpu_tiered.entry_points : 0},
+    {"gpu_graph_page_bytes", config.build_gpu_tiered_index ? gpu_tiered.page_bytes : 0},
+    {"gpu_graph_page_offsets", config.build_gpu_tiered_index ? gpu_tiered.graph_page_offsets : vec<u64>{}},
+    {"gpu_graph_page_region_bytes", config.build_gpu_tiered_index ? gpu_tiered.graph_page_bytes : vec<u64>{}},
   };
   if (use_hot_graph) {
     metadata["hot_graph_neighbor_read_bytes"] = hot_graph_entry_size;

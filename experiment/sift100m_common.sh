@@ -154,6 +154,19 @@ PY_VALIDATE
       return 1
     fi
   done
+  if [[ "${GPU_TIERED_INDEX:-0}" == "1" || "${GPU_TIERED_INDEX:-0}" == "true" ]]; then
+    if [[ ! -s "${INDEX_PREFIX}.gpu.idx" ]]; then
+      echo "missing GPU tiered index: ${INDEX_PREFIX}.gpu.idx" >&2
+      return 1
+    fi
+    for ((node_id = 1; node_id <= SHARDS; ++node_id)); do
+      shard="${INDEX_PREFIX}_node${node_id}_of${SHARDS}.gpu.pages"
+      if [[ ! -s "$shard" ]]; then
+        echo "missing GPU graph-page sidecar: $shard" >&2
+        return 1
+      fi
+    done
+  fi
 }
 
 server_endpoints() {
@@ -289,6 +302,21 @@ write_service_config() {
     if [[ -n "${RDMA_READ_CHAIN_SIZE:-}" ]]; then echo "rdma-read-chain-size = ${RDMA_READ_CHAIN_SIZE}"; fi
     if [[ -n "${RDMA_READ_MAX_INFLIGHT_WRS:-}" ]]; then echo "rdma-read-max-inflight-wrs = ${RDMA_READ_MAX_INFLIGHT_WRS}"; fi
     if [[ -n "${QUERY_BATCH_SIZE:-}" ]]; then echo "query-batch-size = ${QUERY_BATCH_SIZE}"; fi
+    if [[ -n "${SEARCH_ENGINE:-}" ]]; then echo "search-engine = ${SEARCH_ENGINE}"; fi
+    if [[ -n "${GPU_RDMA_BACKEND:-}" ]]; then echo "gpu-rdma-backend = ${GPU_RDMA_BACKEND}"; fi
+    if [[ -n "${GPU_QUERY_BATCH_MIN:-}" ]]; then echo "query-batch-min = ${GPU_QUERY_BATCH_MIN}"; fi
+    if [[ -n "${GPU_QUERY_BATCH_TARGET:-}" ]]; then echo "query-batch-target = ${GPU_QUERY_BATCH_TARGET}"; fi
+    if [[ -n "${GPU_QUERY_BATCH_MAX:-}" ]]; then echo "query-batch-max = ${GPU_QUERY_BATCH_MAX}"; fi
+    if [[ -n "${GPU_QUERY_BATCH_WAIT_US:-}" ]]; then echo "query-batch-wait-us = ${GPU_QUERY_BATCH_WAIT_US}"; fi
+    if [[ -n "${GPU_PAGE_CACHE_MB:-}" ]]; then echo "gpu-page-cache-mb = ${GPU_PAGE_CACHE_MB}"; fi
+    if [[ -n "${GPU_PAGE_CACHE_RATIO:-}" ]]; then echo "gpu-page-cache-ratio = ${GPU_PAGE_CACHE_RATIO}"; fi
+    if [[ -n "${GPU_HOT_DEGREE:-}" ]]; then echo "gpu-hot-degree = ${GPU_HOT_DEGREE}"; fi
+    if [[ -n "${GPU_COLD_EXPANSIONS:-}" ]]; then echo "gpu-cold-expansions = ${GPU_COLD_EXPANSIONS}"; fi
+    if [[ -n "${GPU_RDMA_QPS:-}" ]]; then echo "gpu-rdma-qps = ${GPU_RDMA_QPS}"; fi
+    if [[ -n "${UPDATE_VISIBILITY_US:-}" ]]; then echo "update-visibility-us = ${UPDATE_VISIBILITY_US}"; fi
+    if [[ -n "${DELTA_MAX_RATIO:-}" ]]; then echo "delta-max-ratio = ${DELTA_MAX_RATIO}"; fi
+    if [[ -n "${DELTA_BUDGET_MB:-}" ]]; then echo "delta-budget-mb = ${DELTA_BUDGET_MB}"; fi
+    if [[ -n "${MERGE_PERIOD_MS:-}" ]]; then echo "merge-period-ms = ${MERGE_PERIOD_MS}"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then echo "use-rabitq = true"; fi
     if [[ "${USE_RABITQ:-0}" == "1" ]]; then
       echo "rabitq-gate-width = ${RABITQ_GATE_WIDTH:-18}"

@@ -35,6 +35,15 @@ typename ComputeService<Distance>::LocalMainSearchOutput ComputeService<Distance
   const auto enqueued_at = std::chrono::steady_clock::now();
   sample->enqueued_at = enqueued_at;
 
+  if (persistent_search_ != nullptr) {
+    statistics::ThreadStatistics counters{};
+    sample->mark_started(enqueued_at, enqueued_at, counters);
+    service::QueryResult results = persistent_search_->search(
+      span<const element_t>{query.data(), query.size()}, k);
+    sample->mark_finished(std::chrono::steady_clock::now(), counters);
+    return {.results = std::move(results), .sample = std::move(sample)};
+  }
+
   auto* request = new service::QueryRequest{};
   request->components = query;
   request->entry_points = storage_owner_query_entry_points(
@@ -85,6 +94,14 @@ typename ComputeService<Distance>::LocalMainSearchOutput ComputeService<Distance
     service::breakdown::Operation::query, breakdown_enabled_);
   const auto enqueued_at = std::chrono::steady_clock::now();
   sample->enqueued_at = enqueued_at;
+
+  if (persistent_search_ != nullptr) {
+    statistics::ThreadStatistics counters{};
+    sample->mark_started(enqueued_at, enqueued_at, counters);
+    service::QueryResult results = persistent_search_->search(query_dtype, query_data, k);
+    sample->mark_finished(std::chrono::steady_clock::now(), counters);
+    return {.results = std::move(results), .sample = std::move(sample)};
+  }
 
   auto* request = new service::QueryRequest{};
   request->raw_components.assign(query_data, query_data + vector_dtype_bytes(query_dtype, config_.dim));
