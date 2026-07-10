@@ -102,6 +102,12 @@ set(DVSTOR_OFFLINE_BUILDER_SOURCES
     tools/vamana_offline/shard_writer.cc
 )
 
+set(DVSTOR_GPU_SIDECAR_CONVERTER_SOURCES
+    src/gpu_search/index_format.cc
+    tools/vamana_offline/gpu_sidecar_converter.cc
+    tools/vamana_offline/progress.cc
+)
+
 set(DVSTOR_BREAKDOWN_BENCHMARK_SOURCES
     tools/breakdown_benchmark/args.cc
     tools/breakdown_benchmark/progress.cc
@@ -138,6 +144,13 @@ if (DVSTOR_STORAGE_NODE_ONLY)
         )
         dvstor_target_common_includes(vamana_rabitq_sidecar_converter)
         target_link_libraries(vamana_rabitq_sidecar_converter rdma_library)
+
+        add_executable(vamana_gpu_sidecar_converter
+            tools/vamana_gpu_sidecar_converter.cc
+            ${DVSTOR_GPU_SIDECAR_CONVERTER_SOURCES}
+        )
+        dvstor_target_tool_includes(vamana_gpu_sidecar_converter)
+        target_link_libraries(vamana_gpu_sidecar_converter rdma_library)
 
         add_executable(generate_sift101m_recall_data
             tools/generate_sift101m_recall_data.cc
@@ -282,10 +295,36 @@ else ()
         dvstor_target_common_includes(vamana_rabitq_sidecar_converter)
         target_link_libraries(vamana_rabitq_sidecar_converter rdma_library)
 
+        add_executable(vamana_gpu_sidecar_converter
+            tools/vamana_gpu_sidecar_converter.cc
+            ${DVSTOR_GPU_SIDECAR_CONVERTER_SOURCES}
+        )
+        dvstor_target_tool_includes(vamana_gpu_sidecar_converter)
+        target_link_libraries(vamana_gpu_sidecar_converter rdma_library)
+
         add_executable(generate_sift101m_recall_data
             tools/generate_sift101m_recall_data.cc
         )
         dvstor_target_tool_includes(generate_sift101m_recall_data)
+
+        if (DVSTOR_HAVE_GPUNETIO)
+            add_executable(dvstor_gpunetio_probe tools/gpunetio_probe.cc)
+            dvstor_target_common_includes(dvstor_gpunetio_probe)
+            target_include_directories(dvstor_gpunetio_probe PRIVATE ${DVSTOR_DOCA_INCLUDE_DIR})
+            target_compile_definitions(dvstor_gpunetio_probe PRIVATE ALLOW_EXPERIMENTAL_API=1)
+            target_compile_options(dvstor_gpunetio_probe PRIVATE
+                -Wno-deprecated-declarations
+                -Wno-pedantic
+            )
+            target_link_libraries(dvstor_gpunetio_probe
+                rdma_library
+                CUDA::cudart
+                ${DVSTOR_DOCA_GPUNETIO_LIBRARY}
+                ${DVSTOR_DOCA_VERBS_LIBRARY}
+                ${DVSTOR_DOCA_COMMON_LIBRARY}
+                ${DVSTOR_MLX5_LIBRARY}
+            )
+        endif ()
 
         add_executable(dvstor_breakdown_benchmark
             tools/dvstor_breakdown_benchmark.cc

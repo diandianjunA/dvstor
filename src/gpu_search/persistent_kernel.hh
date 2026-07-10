@@ -11,7 +11,7 @@ using cudaStream_t = CUstream_st*;
 namespace gpu_search {
 
 inline constexpr u32 kPersistentMaxBeam = 256;
-inline constexpr u32 kPersistentMaxExact = 64;
+inline constexpr u32 kPersistentMaxExact = 128;
 inline constexpr u32 kPersistentMaxCodeBits = 1024;
 inline constexpr u32 kPersistentMaxHotDegree = 32;
 inline constexpr u32 kPersistentMaxEntryPoints = 512;
@@ -85,6 +85,7 @@ struct PersistentKernelParams {
   const u64* base_override_epochs{};
   const u32* delta_count{};
   u32 delta_capacity{};
+  u32 delta_signature_filter{};
   u32* stop{};
   i32* fetch_status{};
   u32 fetch_status_stride{};
@@ -93,6 +94,7 @@ struct PersistentKernelParams {
   u32* graph_page_cache_locks{};
   u32 graph_page_cache_slots{};
   f32* rotated_queries{};
+  f32* query_luts{};
   u32* beam_ids{};
   f32* beam_distances{};
   u8* beam_expanded{};
@@ -104,5 +106,10 @@ struct PersistentKernelParams {
 
 void launch_persistent_search(cudaStream_t stream, const PersistentKernelParams& params,
                               u32 blocks, u32 threads);
+void launch_publish_delta_count(cudaStream_t stream, u32* count, u32 value);
+void launch_supersede_delta_record(cudaStream_t stream, DeviceDeltaRecord* records,
+                                   u32 slot, u64 epoch);
+void launch_publish_base_override(cudaStream_t stream, u64* override_epochs,
+                                  u32 id, u64 epoch);
 
 }  // namespace gpu_search

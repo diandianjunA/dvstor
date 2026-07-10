@@ -162,21 +162,32 @@ char* gpu_pci_address(const uint32_t gpu_device, char (&bus_id)[32]) {
   return bus_id;
 }
 
-doca_devinfo* find_doca_devinfo(const char* ibdev_name) {
-  doca_devinfo** infos = nullptr;
-  uint32_t count = 0;
-  check_doca("doca_devinfo_create_list", doca_devinfo_create_list(&infos, &count));
-  for (uint32_t i = 0; i < count; ++i) {
-    char current_ibdev[DOCA_DEVINFO_IBDEV_NAME_SIZE] = {0};
-    if (doca_devinfo_get_ibdev_name(infos[i], current_ibdev, sizeof(current_ibdev)) != DOCA_SUCCESS) {
-      continue;
-    }
-    if (std::strcmp(current_ibdev, ibdev_name) == 0) {
-      return infos[i];
-    }
+class DocaDevinfoList {
+public:
+  DocaDevinfoList() {
+    check_doca("doca_devinfo_create_list", doca_devinfo_create_list(&infos_, &count_));
   }
-  throw std::runtime_error(std::string("failed to find DOCA device for ibdev ") + ibdev_name);
-}
+
+  ~DocaDevinfoList() {
+    if (infos_ != nullptr) doca_devinfo_destroy_list(infos_);
+  }
+
+  doca_devinfo* find(const char* ibdev_name) const {
+    for (uint32_t i = 0; i < count_; ++i) {
+      char current_ibdev[DOCA_DEVINFO_IBDEV_NAME_SIZE] = {0};
+      if (doca_devinfo_get_ibdev_name(infos_[i], current_ibdev,
+                                     sizeof(current_ibdev)) != DOCA_SUCCESS) {
+        continue;
+      }
+      if (std::strcmp(current_ibdev, ibdev_name) == 0) return infos_[i];
+    }
+    throw std::runtime_error(std::string("failed to find DOCA device for ibdev ") + ibdev_name);
+  }
+
+private:
+  doca_devinfo** infos_{};
+  uint32_t count_{};
+};
 
 void qp_modify_to_init(doca_verbs_qp* qp) {
   doca_verbs_qp_attr* attr = nullptr;
@@ -266,9 +277,13 @@ struct GpuNetioQueryPool::Resource {
     const doca_gpu_dev_verbs_nic_handler nic_handler = persistent_data_bytes == 0
       ? nic_handler_from_env() : DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_DB;
 
-    doca_devinfo* devinfo = find_doca_devinfo(ibdev_name);
-    check_doca("doca_verbs_context_create",
-               doca_verbs_context_create(devinfo, DOCA_VERBS_CONTEXT_CREATE_FLAGS_NONE, &verbs_context));
+    {
+      DocaDevinfoList devinfos;
+      check_doca("doca_verbs_context_create",
+                 doca_verbs_context_create(devinfos.find(ibdev_name),
+                                           DOCA_VERBS_CONTEXT_CREATE_FLAGS_NONE,
+                                           &verbs_context));
+    }
     check_doca("doca_verbs_pd_create", doca_verbs_pd_create(verbs_context, &pd));
     check_doca("doca_verbs_pd_as_doca_dev", doca_verbs_pd_as_doca_dev(pd, &dev));
     check_doca("doca_gpu_create", doca_gpu_create(gpu_pci, &gpu));
@@ -558,14 +573,14 @@ struct GpuNetioQueryPool::Resource {
         doca_gpu_mem_free(gpu, buffer);
       }
     }
+    if (dev != nullptr) {
+      doca_dev_close(dev);
+    }
     if (pd != nullptr) {
       doca_verbs_pd_destroy(pd);
     }
     if (verbs_context != nullptr) {
       doca_verbs_context_destroy(verbs_context);
-    }
-    if (dev != nullptr) {
-      doca_dev_close(dev);
     }
     if (gpu != nullptr) {
       doca_gpu_destroy(gpu);

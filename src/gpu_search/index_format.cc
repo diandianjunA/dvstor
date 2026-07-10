@@ -86,14 +86,15 @@ bool validate_header(const Header& header, std::string* error) {
     set_error(error, "GPU tiered index ID width must be 3 or 4 bytes");
     return false;
   }
-  const u32 code_storage_bytes = ((header.rabitq_code_bits + 7) / 8 + 3) & ~3u;
-  if (header.rabitq_code_bits < header.dim ||
+  if (header.rabitq_code_bits < 8 || header.rabitq_code_bits < header.dim ||
       (header.rabitq_code_bits & (header.rabitq_code_bits - 1)) != 0 ||
-      header.rabitq_entry_bytes < code_storage_bytes + 2 * sizeof(f32)) {
+      header.rabitq_entry_bytes != rabitq_entry_bytes(header.rabitq_code_bits)) {
     set_error(error, "GPU tiered index has invalid RaBitQ dimensions");
     return false;
   }
-  if (header.num_nodes == 0 || header.num_shards == 0 || header.base_generation == 0) {
+  if (header.num_nodes == 0 || header.num_nodes > std::numeric_limits<u32>::max() ||
+      header.num_shards == 0 || header.num_shards > std::numeric_limits<u16>::max() ||
+      header.base_generation == 0) {
     set_error(error, "GPU tiered index has an empty topology");
     return false;
   }
@@ -102,7 +103,11 @@ bool validate_header(const Header& header, std::string* error) {
     return false;
   }
   if (header.node_records_bytes != header.num_nodes * sizeof(NodeRecord) ||
-      header.shard_regions_bytes != header.num_shards * sizeof(ShardRegion)) {
+      header.rabitq_bytes != header.num_nodes * header.rabitq_entry_bytes ||
+      header.shard_regions_bytes != header.num_shards * sizeof(ShardRegion) ||
+      header.centroid_bytes != static_cast<u64>(header.dim) * sizeof(f32) ||
+      header.entry_points_bytes == 0 ||
+      header.entry_points_bytes > 512u * sizeof(u32)) {
     set_error(error, "GPU tiered index section cardinality mismatch");
     return false;
   }
@@ -138,12 +143,13 @@ bool validate_view(const View& view, std::string* error) {
     set_error(error, "GPU tiered index view cardinality mismatch");
     return false;
   }
-  if (view.header.rabitq_entry_bytes == 0 ||
+  if (view.header.rabitq_entry_bytes != rabitq_entry_bytes(view.header.rabitq_code_bits) ||
       view.rabitq_entries.size() !=
         view.nodes.size() * static_cast<size_t>(view.header.rabitq_entry_bytes)) {
     set_error(error, "GPU tiered index RaBitQ section cardinality mismatch");
     return false;
   }
+  u64 shard_nodes = 0;
   for (size_t shard_index = 0; shard_index < view.shards.size(); ++shard_index) {
     const ShardRegion& shard = view.shards[shard_index];
     if (shard.memory_node != shard_index || shard.graph_pages_bytes == 0 ||
@@ -153,6 +159,11 @@ bool validate_view(const View& view, std::string* error) {
       set_error(error, "GPU tiered index contains an invalid shard region");
       return false;
     }
+    shard_nodes += shard.node_count;
+  }
+  if (shard_nodes != view.header.num_nodes) {
+    set_error(error, "GPU tiered index shard node counts do not cover the topology");
+    return false;
   }
   for (const NodeRecord& node : view.nodes) {
     if (node.shard >= view.shards.size() || node.generation == 0 ||
@@ -164,6 +175,7 @@ bool validate_view(const View& view, std::string* error) {
           view.shards[node.shard].graph_pages_bytes ||
         node.cold_page_offset % view.header.page_bytes != 0 ||
         node.cold_record_offset < sizeof(PageHeader) ||
+        node.cold_record_offset % alignof(PageNodeHeader) != 0 ||
         node.cold_record_offset + sizeof(PageNodeHeader) > view.header.page_bytes) {
       set_error(error, "GPU tiered index contains an invalid node record");
       return false;

@@ -8,7 +8,22 @@ target_link_libraries(gpu_tiered_index_format_test PRIVATE dvstor_runtime)
 target_compile_options(gpu_tiered_index_format_test PRIVATE -UNDEBUG)
 add_test(NAME gpu_tiered_index_format_test COMMAND gpu_tiered_index_format_test)
 
+add_executable(gpu_rabitq_layout_test gpu_rabitq_layout_test.cc)
+target_link_libraries(gpu_rabitq_layout_test PRIVATE dvstor_runtime)
+target_compile_options(gpu_rabitq_layout_test PRIVATE -UNDEBUG)
+add_test(NAME gpu_rabitq_layout_test COMMAND gpu_rabitq_layout_test)
+
 add_executable(gpu_delta_index_test gpu_delta_index_test.cc)
 target_link_libraries(gpu_delta_index_test PRIVATE dvstor_runtime)
 target_compile_options(gpu_delta_index_test PRIVATE -UNDEBUG)
 add_test(NAME gpu_delta_index_test COMMAND gpu_delta_index_test)
+
+add_executable(gpu_sidecar_converter_test
+    gpu_sidecar_converter_test.cc
+    ${CMAKE_SOURCE_DIR}/tools/vamana_offline/gpu_sidecar_converter.cc
+    ${CMAKE_SOURCE_DIR}/tools/vamana_offline/progress.cc
+)
+dvstor_target_tool_includes(gpu_sidecar_converter_test)
+target_link_libraries(gpu_sidecar_converter_test PRIVATE dvstor_runtime)
+target_compile_options(gpu_sidecar_converter_test PRIVATE -UNDEBUG)
+add_test(NAME gpu_sidecar_converter_test COMMAND gpu_sidecar_converter_test)

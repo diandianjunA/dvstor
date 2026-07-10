@@ -50,21 +50,27 @@ public:
     const size_t id_bytes = static_cast<size_t>(encoding);
     const size_t degree = std::min<size_t>(neighbors.size(), std::numeric_limits<u16>::max());
     const size_t record_bytes = sizeof(gpu_search::format::PageNodeHeader) + degree * id_bytes;
-    lib_assert(record_bytes + sizeof(gpu_search::format::PageHeader) <= page_bytes_,
+    const size_t padded_record_bytes = gpu_search::format::align_up(
+      record_bytes, alignof(gpu_search::format::PageNodeHeader));
+    lib_assert(padded_record_bytes + sizeof(gpu_search::format::PageHeader) <= page_bytes_,
                "one graph adjacency record does not fit in a GPU graph page");
-    if (cursor_ + record_bytes > page_bytes_) flush_page();
+    if (cursor_ + padded_record_bytes > page_bytes_ ||
+        page_node_count_ == std::numeric_limits<u16>::max()) {
+      flush_page();
+    }
 
     node_record.cold_record_offset = static_cast<u32>(cursor_);
     node_record.cold_page_offset = remote_offset_ + static_cast<u64>(page_index_) * page_bytes_;
-    auto* node_header = reinterpret_cast<gpu_search::format::PageNodeHeader*>(page_.data() + cursor_);
-    node_header->node_id = node_id;
-    node_header->degree = static_cast<u16>(degree);
-    node_header->flags = 0;
-    byte_t* encoded = page_.data() + cursor_ + sizeof(*node_header);
+    gpu_search::format::PageNodeHeader node_header;
+    node_header.node_id = node_id;
+    node_header.degree = static_cast<u16>(degree);
+    node_header.flags = 0;
+    std::memcpy(page_.data() + cursor_, &node_header, sizeof(node_header));
+    byte_t* encoded = page_.data() + cursor_ + sizeof(node_header);
     for (size_t i = 0; i < degree; ++i) {
       gpu_search::format::encode_id(encoded + i * id_bytes, neighbors[i], encoding);
     }
-    cursor_ += record_bytes;
+    cursor_ += padded_record_bytes;
     ++page_node_count_;
   }
 
@@ -86,9 +92,10 @@ public:
 
 private:
   void flush_page() {
-    auto* header = reinterpret_cast<gpu_search::format::PageHeader*>(page_.data());
-    header->node_count = page_node_count_;
-    header->payload_bytes = static_cast<u32>(cursor_ - sizeof(*header));
+    gpu_search::format::PageHeader header;
+    header.node_count = page_node_count_;
+    header.payload_bytes = static_cast<u32>(cursor_ - sizeof(header));
+    std::memcpy(page_.data(), &header, sizeof(header));
     output_.seekp(static_cast<std::streamoff>(
       sizeof(gpu_search::format::ShardPageFileHeader) + static_cast<u64>(page_index_) * page_bytes_));
     output_.write(reinterpret_cast<const char*>(page_.data()), page_.size());
@@ -134,7 +141,11 @@ GpuTieredWriteResult write_gpu_tiered_index(
   view.header.hot_degree = config.gpu_hot_degree;
   view.header.vector_dtype = static_cast<u32>(dataset.dtype);
   view.header.rabitq_code_bits = VamanaNode::rabitq_code_bits();
-  view.header.rabitq_entry_bytes = static_cast<u32>(VamanaNode::rabitq_entry_size());
+  view.header.rabitq_entry_bytes = format::rabitq_entry_bytes(view.header.rabitq_code_bits);
+  lib_assert(view.header.rabitq_entry_bytes == VamanaNode::rabitq_entry_size() &&
+             format::rabitq_code_storage_bytes(view.header.rabitq_code_bits) ==
+               VamanaNode::rabitq_code_storage_size(),
+             "GPU tiered RaBitQ layout diverges from the storage-node layout");
   view.header.id_encoding_bytes = dataset.size() <= 0x00ffffffULL ? 3 : 4;
   view.header.num_shards = config.num_memory_nodes;
   view.header.medoid_id = dataset.id(graph.medoid);
@@ -209,8 +220,10 @@ GpuTieredWriteResult write_gpu_tiered_index(
     VamanaNode::compute_rabitq_entry(dataset.raw_vector(i), dataset.dtype, code, norm, error);
     byte_t* entry = view.rabitq_entries.data() + i * VamanaNode::rabitq_entry_size();
     std::memcpy(entry, code.data(), code.size());
-    std::memcpy(entry + VamanaNode::rabitq_code_storage_size(), &norm, sizeof(norm));
-    std::memcpy(entry + VamanaNode::rabitq_code_storage_size() + sizeof(norm), &error, sizeof(error));
+    std::memcpy(entry + format::rabitq_norm_offset(view.header.rabitq_code_bits),
+                &norm, sizeof(norm));
+    std::memcpy(entry + format::rabitq_error_offset(view.header.rabitq_code_bits),
+                &error, sizeof(error));
   }
 
   vec<EntrySample> selected_entries;

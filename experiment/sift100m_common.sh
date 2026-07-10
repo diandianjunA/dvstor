@@ -313,6 +313,13 @@ write_service_config() {
     if [[ -n "${GPU_HOT_DEGREE:-}" ]]; then echo "gpu-hot-degree = ${GPU_HOT_DEGREE}"; fi
     if [[ -n "${GPU_COLD_EXPANSIONS:-}" ]]; then echo "gpu-cold-expansions = ${GPU_COLD_EXPANSIONS}"; fi
     if [[ -n "${GPU_RDMA_QPS:-}" ]]; then echo "gpu-rdma-qps = ${GPU_RDMA_QPS}"; fi
+    if [[ -n "${GPU_PERSISTENT_BLOCKS_PER_SM:-}" ]]; then
+      echo "gpu-persistent-blocks-per-sm = ${GPU_PERSISTENT_BLOCKS_PER_SM}"
+    fi
+    if [[ "${GPU_DELTA_SIGNATURE_FILTER:-0}" == "1" ||
+          "${GPU_DELTA_SIGNATURE_FILTER:-0}" == "true" ]]; then
+      echo "gpu-delta-signature-filter = true"
+    fi
     if [[ -n "${UPDATE_VISIBILITY_US:-}" ]]; then echo "update-visibility-us = ${UPDATE_VISIBILITY_US}"; fi
     if [[ -n "${DELTA_MAX_RATIO:-}" ]]; then echo "delta-max-ratio = ${DELTA_MAX_RATIO}"; fi
     if [[ -n "${DELTA_BUDGET_MB:-}" ]]; then echo "delta-budget-mb = ${DELTA_BUDGET_MB}"; fi

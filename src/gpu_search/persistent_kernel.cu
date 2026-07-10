@@ -37,6 +37,18 @@ __device__ __forceinline__ u32 hash_page(u64 value) {
   return static_cast<u32>(value ^ (value >> 32));
 }
 
+__device__ __forceinline__ u32 load_global_cg(const u32* address) {
+  u32 value = 0;
+  asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(value) : "l"(address));
+  return value;
+}
+
+__device__ __forceinline__ u64 load_global_cg(const u64* address) {
+  u64 value = 0;
+  asm volatile("ld.global.cg.u64 %0, [%1];" : "=l"(value) : "l"(address));
+  return value;
+}
+
 struct DevicePageHeader {
   u32 magic;
   u16 version;
@@ -72,13 +84,13 @@ __device__ bool insert_visited(u32* table, u32 capacity, u32 id) {
 }
 
 __device__ f32 approximate_entry(const PersistentKernelParams& params,
-                                 const f32* rotated_query,
+                                 const f32* query_lut,
                                  f32 query_norm2,
                                  const u8* entry) {
   f32 signed_dot = 0.0f;
-  for (u32 bit = 0; bit < params.code_bits; ++bit) {
-    const bool positive = (entry[bit >> 3] & static_cast<u8>(1u << (7u - (bit & 7u)))) != 0;
-    signed_dot += positive ? rotated_query[bit] : -rotated_query[bit];
+  const u32 code_bytes = params.code_bits / 8;
+  for (u32 byte = 0; byte < code_bytes; ++byte) {
+    signed_dot += query_lut[static_cast<size_t>(byte) * 256 + entry[byte]];
   }
   f32 norm = 0.0f;
   f32 error = 1.0f;
@@ -90,13 +102,13 @@ __device__ f32 approximate_entry(const PersistentKernelParams& params,
 }
 
 __device__ f32 approximate_distance(const PersistentKernelParams& params,
-                                    const f32* rotated_query,
+                                    const f32* query_lut,
                                     f32 query_norm2,
                                     u32 id) {
   if (id >= params.num_nodes || (params.nodes[id].flags & kDeltaDeleted) != 0) return FLT_MAX;
   const u8* entry = params.rabitq_entries +
     static_cast<size_t>(id) * params.rabitq_entry_bytes;
-  return approximate_entry(params, rotated_query, query_norm2, entry);
+  return approximate_entry(params, query_lut, query_norm2, entry);
 }
 
 __device__ void beam_insert(u32* ids, f32* distances, u8* expanded,
@@ -247,6 +259,20 @@ __device__ void process_query(const PersistentKernelParams& params,
   }
   const f32 scale = rsqrtf(static_cast<f32>(params.code_bits));
   for (u32 d = threadIdx.x; d < params.code_bits; d += blockDim.x) rotated[d] *= scale;
+  const u32 code_bytes = params.code_bits / 8;
+  f32* query_lut = params.query_luts +
+    static_cast<size_t>(slot) * code_bytes * 256;
+  for (u32 index = threadIdx.x; index < code_bytes * 256; index += blockDim.x) {
+    const u32 byte = index / 256;
+    const u32 code = index & 255u;
+    f32 signed_dot = 0.0f;
+    for (u32 bit = 0; bit < 8; ++bit) {
+      const f32 value = rotated[byte * 8 + bit];
+      signed_dot += (code & (1u << (7u - bit))) != 0 ? value : -value;
+    }
+    query_lut[index] = signed_dot;
+  }
+  __syncthreads();
   __shared__ u32 query_signature;
   if (threadIdx.x == 0) {
     query_signature = 0;
@@ -282,7 +308,7 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ f32 entry_distances[kPersistentMaxEntryPoints];
   for (u32 i = threadIdx.x; i < params.entry_point_count; i += blockDim.x) {
     entry_distances[i] = approximate_distance(
-      params, rotated, query_norm2, params.entry_points[i]);
+      params, query_lut, query_norm2, params.entry_points[i]);
   }
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -296,7 +322,7 @@ __device__ void process_query(const PersistentKernelParams& params,
     if (beam_count == 0) {
       beam_insert(beam_ids, beam_distances, beam_expanded, beam_count,
                   params.beam_width, params.medoid_id,
-                  approximate_distance(params, rotated, query_norm2, params.medoid_id));
+                  approximate_distance(params, query_lut, query_norm2, params.medoid_id));
     }
     for (u32 i = 0; i < beam_count; ++i) {
       insert_visited(visited, params.visited_capacity, beam_ids[i]);
@@ -415,7 +441,7 @@ __device__ void process_query(const PersistentKernelParams& params,
       const u32 id = neighbor_ids[i];
       neighbor_distances[i] = id < params.num_nodes &&
           insert_visited(visited, params.visited_capacity, id)
-        ? approximate_distance(params, rotated, query_norm2, id) : FLT_MAX;
+        ? approximate_distance(params, query_lut, query_norm2, id) : FLT_MAX;
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -506,19 +532,20 @@ __device__ void process_query(const PersistentKernelParams& params,
   u32 best_delta_slot = UINT32_MAX;
   f32 best_delta_approximation = FLT_MAX;
   if (params.delta_count != nullptr && params.delta_records != nullptr) {
-    const u32 count = min(*params.delta_count, params.delta_capacity);
+    const u32 count = min(load_global_cg(params.delta_count), params.delta_capacity);
     for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
       const DeviceDeltaRecord& record = params.delta_records[index];
+      const u64 superseded_epoch = load_global_cg(&record.superseded_epoch);
       const bool visible = record.epoch <= query_descriptor.snapshot_epoch &&
-        (record.superseded_epoch == 0 ||
-         record.superseded_epoch > query_descriptor.snapshot_epoch);
+        (superseded_epoch == 0 || superseded_epoch > query_descriptor.snapshot_epoch);
       if (!visible || (record.flags & kDeltaDeleted) != 0) continue;
-      if (count > 65536 && __popc((record.signature ^ query_signature) & 0xffffu) > 4) {
+      if (params.delta_signature_filter != 0 && count > 65536 &&
+          __popc((record.signature ^ query_signature) & 0xffffu) > 4) {
         continue;
       }
       const u8* entry = params.delta_rabitq_entries +
         static_cast<size_t>(index) * params.rabitq_entry_bytes;
-      const f32 approximation = approximate_entry(params, rotated, query_norm2, entry);
+      const f32 approximation = approximate_entry(params, query_lut, query_norm2, entry);
       if (approximation < best_delta_approximation) {
         best_delta_approximation = approximation;
         best_delta_slot = index;
@@ -543,7 +570,7 @@ __device__ void process_query(const PersistentKernelParams& params,
     for (u32 i = 0; i < exact_count; ++i) {
       const u32 id = beam_ids[i];
       if (id < params.num_nodes && params.base_override_epochs != nullptr) {
-        const u64 override_epoch = params.base_override_epochs[id];
+        const u64 override_epoch = load_global_cg(params.base_override_epochs + id);
         if (override_epoch != 0 && override_epoch <= query_descriptor.snapshot_epoch) {
           beam_distances[i] = FLT_MAX;
         }
@@ -561,10 +588,9 @@ __device__ void process_query(const PersistentKernelParams& params,
         duplicate = true;
         break;
       }
-      if (!duplicate && combined_count < params.beam_width) {
-        beam_ids[combined_count] = id;
-        beam_distances[combined_count] = distance;
-        ++combined_count;
+      if (!duplicate) {
+        beam_insert(beam_ids, beam_distances, beam_expanded, combined_count,
+                    params.beam_width, id, distance);
       }
     }
     exact_count = combined_count;
@@ -621,11 +647,43 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
   }
 }
 
+__global__ void publish_delta_count_kernel(u32* count, u32 value) {
+  if (threadIdx.x == 0) atomicExch(count, value);
+}
+
+__global__ void supersede_delta_record_kernel(DeviceDeltaRecord* records,
+                                              u32 slot, u64 epoch) {
+  if (threadIdx.x == 0) {
+    atomicExch(reinterpret_cast<unsigned long long*>(
+                 &records[slot].superseded_epoch), epoch);
+  }
+}
+
+__global__ void publish_base_override_kernel(u64* override_epochs, u32 id, u64 epoch) {
+  if (threadIdx.x == 0) {
+    atomicExch(reinterpret_cast<unsigned long long*>(override_epochs + id), epoch);
+  }
+}
+
 }  // namespace
 
 void launch_persistent_search(cudaStream_t stream, const PersistentKernelParams& params,
                               u32 blocks, u32 threads) {
   persistent_search_kernel<<<blocks, threads, 0, stream>>>(params);
+}
+
+void launch_publish_delta_count(cudaStream_t stream, u32* count, u32 value) {
+  publish_delta_count_kernel<<<1, 1, 0, stream>>>(count, value);
+}
+
+void launch_supersede_delta_record(cudaStream_t stream, DeviceDeltaRecord* records,
+                                   u32 slot, u64 epoch) {
+  supersede_delta_record_kernel<<<1, 1, 0, stream>>>(records, slot, epoch);
+}
+
+void launch_publish_base_override(cudaStream_t stream, u64* override_epochs,
+                                  u32 id, u64 epoch) {
+  publish_base_override_kernel<<<1, 1, 0, stream>>>(override_epochs, id, epoch);
 }
 
 }  // namespace gpu_search

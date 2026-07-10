@@ -20,6 +20,26 @@ inline constexpr u32 kMaxHotDegree = 32;
 inline constexpr u32 kFlagDeleted = 1u;
 inline constexpr u32 kShardPagesMagic = 0x47505344;
 
+inline constexpr u32 rabitq_code_bytes(u32 code_bits) {
+  return code_bits / 8;
+}
+
+inline constexpr u32 rabitq_code_storage_bytes(u32 code_bits) {
+  return (rabitq_code_bytes(code_bits) + 3u) & ~3u;
+}
+
+inline constexpr u32 rabitq_norm_offset(u32 code_bits) {
+  return rabitq_code_storage_bytes(code_bits);
+}
+
+inline constexpr u32 rabitq_error_offset(u32 code_bits) {
+  return rabitq_norm_offset(code_bits) + sizeof(f32);
+}
+
+inline constexpr u32 rabitq_entry_bytes(u32 code_bits) {
+  return (rabitq_error_offset(code_bits) + sizeof(f32) + 7u) & ~7u;
+}
+
 enum class IdEncoding : u8 {
   u24 = 3,
   u32 = 4,

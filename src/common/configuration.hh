@@ -70,6 +70,8 @@ public:
   u32 gpu_hot_degree{16};
   u32 gpu_cold_expansions{8};
   u32 gpu_rdma_qps{4};
+  u32 gpu_persistent_blocks_per_sm{4};
+  bool gpu_delta_signature_filter{};
   u32 update_visibility_us{10000};
   f64 delta_max_ratio{0.01};
   u32 delta_budget_mb{1024};
@@ -355,6 +357,12 @@ private:
       "Maximum expanded nodes per query whose full adjacency page may be fetched remotely.")(
       "gpu-rdma-qps", po::value<u32>(&gpu_rdma_qps)->default_value(gpu_rdma_qps),
       "GPU data-path QPs created per memory node.")(
+      "gpu-persistent-blocks-per-sm",
+      po::value<u32>(&gpu_persistent_blocks_per_sm)->default_value(gpu_persistent_blocks_per_sm),
+      "Persistent query blocks launched per GPU SM to hide RDMA latency.")(
+      "gpu-delta-signature-filter",
+      po::bool_switch(&gpu_delta_signature_filter)->default_value(false),
+      "Enable the lossy 16-bit signature prefilter for very large GPU deltas.")(
       "update-visibility-us", po::value<u32>(&update_visibility_us)->default_value(update_visibility_us),
       "Maximum mutation micro-batch visibility delay for the GPU delta index.")(
       "delta-max-ratio", po::value<f64>(&delta_max_ratio)->default_value(delta_max_ratio),
@@ -434,9 +442,11 @@ private:
          gpu_hot_degree == 0 || gpu_hot_degree > R || gpu_hot_degree > 32 ||
          gpu_cold_expansions > beam_width ||
          gpu_page_cache_ratio <= 0.0 || gpu_page_cache_ratio >= 0.9 ||
-         gpu_rdma_qps == 0 || gpu_rdma_qps > 32 || update_visibility_us == 0 ||
+         gpu_rdma_qps == 0 || gpu_rdma_qps > 32 ||
+         gpu_persistent_blocks_per_sm == 0 || gpu_persistent_blocks_per_sm > 16 ||
+         update_visibility_us == 0 ||
          delta_max_ratio <= 0.0 || delta_max_ratio > 0.5 || delta_budget_mb == 0 ||
-         merge_period_ms == 0 || beam_width > 256 || rabitq_gate_max_width > 64 ||
+         merge_period_ms == 0 || beam_width > 256 || rabitq_gate_max_width > 128 ||
          !use_rabitq || ip_distance || insert_execution != "storage_owner" || routing)) {
       std::cerr << "[ERROR]: invalid gpu_persistent engine configuration" << std::endl;
       exit_with_help_message(argv);
@@ -696,6 +706,10 @@ public:
         os << std::setw(width) << "GPU hot degree: " << config.gpu_hot_degree << std::endl;
         os << std::setw(width) << "GPU cold expansion budget: "
            << config.gpu_cold_expansions << std::endl;
+        os << std::setw(width) << "GPU persistent blocks/SM: "
+           << config.gpu_persistent_blocks_per_sm << std::endl;
+        os << std::setw(width) << "GPU delta signature filter: "
+           << (config.gpu_delta_signature_filter ? "lossy" : "disabled") << std::endl;
         os << std::setw(width) << "Update visibility(us): "
            << config.update_visibility_us << std::endl;
       }

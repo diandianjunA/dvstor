@@ -12,7 +12,7 @@ int main() {
   view.header.hot_degree = 2;
   view.header.vector_dtype = static_cast<u32>(VectorDType::uint8);
   view.header.rabitq_code_bits = 8;
-  view.header.rabitq_entry_bytes = 12;
+  view.header.rabitq_entry_bytes = format::rabitq_entry_bytes(8);
   view.header.id_encoding_bytes = 3;
   view.header.num_shards = 1;
   view.header.num_nodes = 2;
@@ -25,9 +25,9 @@ int main() {
      .shard = 0, .flags = 0},
   };
   view.hot_neighbors = {1, 0};
-  view.rabitq_entries.resize(24, 0);
+  view.rabitq_entries.resize(2 * view.header.rabitq_entry_bytes, 0);
   view.rabitq_entries[0] = 0xaa;
-  view.rabitq_entries[12] = 0x55;
+  view.rabitq_entries[view.header.rabitq_entry_bytes] = 0x55;
   view.shards = {{.graph_pages_offset = 4096, .graph_pages_bytes = 4096,
                   .vector_region_offset = 16, .vector_stride = 64,
                   .node_count = 2, .memory_node = 0}};
@@ -46,6 +46,10 @@ int main() {
   assert(loaded.rabitq_entries == view.rabitq_entries);
   assert(loaded.centroid == view.centroid);
   assert(loaded.entry_points == view.entry_points);
+
+  format::View malformed = view;
+  malformed.header.rabitq_entry_bytes -= sizeof(f32);
+  assert(!format::validate_view(malformed, &error));
 
   byte_t encoded[4]{};
   format::encode_id(encoded, 0x00a1b2c3u, format::IdEncoding::u24);

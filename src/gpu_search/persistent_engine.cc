@@ -7,6 +7,7 @@
 #include <bit>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -166,7 +167,7 @@ struct PersistentSearchEngine::Impl {
     }
     backend_kind = parsed_backend;
     if (config.beam_width > kPersistentMaxBeam || config.rabitq_gate_max_width > kPersistentMaxExact) {
-      throw std::invalid_argument("gpu_persistent supports beam-width <= 256 and rabitq-gate-max-width <= 64");
+      throw std::invalid_argument("gpu_persistent supports beam-width <= 256 and rabitq-gate-max-width <= 128");
     }
 
     std::string load_error;
@@ -174,12 +175,28 @@ struct PersistentSearchEngine::Impl {
                            index, &load_error)) {
       throw std::runtime_error(load_error);
     }
+    const bool centroid_matches =
+      index.centroid.size() == VamanaNode::rabitq_centroid.size() &&
+      std::equal(index.centroid.begin(), index.centroid.end(),
+                 VamanaNode::rabitq_centroid.begin(), [](f32 stored, f32 configured) {
+                   const f32 scale = std::max({1.0f, std::abs(stored), std::abs(configured)});
+                   return std::abs(stored - configured) <= 1e-6f * scale;
+                 });
+    const bool shard_layout_matches = !index.shards.empty() &&
+      std::all_of(index.shards.begin(), index.shards.end(), [](const format::ShardRegion& shard) {
+        return shard.vector_region_offset ==
+                 vamana::hot_graph::kNodeBaseOffset + VamanaNode::offset_vector() &&
+               shard.vector_stride == VamanaNode::total_size();
+      });
     if (index.header.dim != config.dim || index.header.graph_degree != config.R ||
         index.header.hot_degree != config.gpu_hot_degree ||
         index.header.num_shards != remote_regions.size() ||
+        index.header.rabitq_code_bits != VamanaNode::rabitq_code_bits() ||
         index.header.rabitq_code_bits > kPersistentMaxCodeBits ||
+        index.header.rabitq_entry_bytes != VamanaNode::rabitq_entry_size() ||
         index.entry_points.size() > kPersistentMaxEntryPoints ||
-        index.header.vector_dtype != static_cast<u32>(config.resolved_vector_dtype())) {
+        index.header.vector_dtype != static_cast<u32>(config.resolved_vector_dtype()) ||
+        !centroid_matches || !shard_layout_matches) {
       throw std::runtime_error("GPU tiered index metadata does not match runtime configuration");
     }
 
@@ -219,6 +236,9 @@ struct PersistentSearchEngine::Impl {
                "cudaHostAlloc(persistent query staging)");
     device_allocate(d_rotated_queries, static_cast<size_t>(query_slots) * code_bits,
                     "cudaMalloc(persistent rotated queries)");
+    device_allocate(d_query_luts,
+                    static_cast<size_t>(query_slots) * (code_bits / 8) * 256,
+                    "cudaMalloc(persistent RaBitQ query LUTs)");
     device_allocate(d_beam_ids, static_cast<size_t>(query_slots) * config.beam_width,
                     "cudaMalloc(persistent beam ids)");
     device_allocate(d_beam_distances, static_cast<size_t>(query_slots) * config.beam_width,
@@ -295,10 +315,21 @@ struct PersistentSearchEngine::Impl {
                             static_cast<size_t>(graph_page_cache_slots) * sizeof(u32)),
                  "cudaMemset(graph page cache locks)");
     }
-    device_allocate(d_result_ids, static_cast<size_t>(query_slots) * result_capacity,
-                    "cudaMalloc(persistent result ids)");
-    device_allocate(d_result_distances, static_cast<size_t>(query_slots) * result_capacity,
-                    "cudaMalloc(persistent result distances)");
+    const size_t result_elements = static_cast<size_t>(query_slots) * result_capacity;
+    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&result_ids_host),
+                             result_elements * sizeof(u32),
+                             cudaHostAllocMapped | cudaHostAllocPortable),
+               "cudaHostAlloc(persistent result ids)");
+    check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_result_ids),
+                                        result_ids_host, 0),
+               "cudaHostGetDevicePointer(persistent result ids)");
+    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&result_distances_host),
+                             result_elements * sizeof(f32),
+                             cudaHostAllocMapped | cudaHostAllocPortable),
+               "cudaHostAlloc(persistent result distances)");
+    check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&d_result_distances),
+                                        result_distances_host, 0),
+               "cudaHostGetDevicePointer(persistent result distances)");
 
     const u64 delta_budget_bytes = static_cast<u64>(config.delta_budget_mb) << 20;
     const u64 delta_record_bytes = sizeof(DeviceDeltaRecord) +
@@ -357,9 +388,13 @@ struct PersistentSearchEngine::Impl {
     check_cuda(cudaGetDeviceProperties(&properties, static_cast<int>(config.gpu_device)),
                "cudaGetDeviceProperties(persistent kernel)");
     gpu_clock_khz = static_cast<u64>(std::max(1, properties.clockRate));
-    const u32 blocks = std::min<u32>(query_slots,
-      std::max<u32>(1, static_cast<u32>(properties.multiProcessorCount)));
-    PersistentKernelParams params{
+    const u64 requested_blocks = static_cast<u64>(
+      std::max(1, properties.multiProcessorCount)) * config.gpu_persistent_blocks_per_sm;
+    const u32 blocks = static_cast<u32>(std::min<u64>(query_slots, requested_blocks));
+    std::cerr << "[gpu-search] persistent_grid blocks=" << blocks
+              << " threads=128 blocks_per_sm_target="
+              << config.gpu_persistent_blocks_per_sm << std::endl;
+    kernel_params = PersistentKernelParams{
       .submissions = submissions.device_view(),
       .completions = completions.device_view(),
       .fetches = fetches.device_view(),
@@ -373,7 +408,7 @@ struct PersistentSearchEngine::Impl {
       .medoid_id = index.header.medoid_id,
       .dim = config.dim,
       .code_bits = code_bits,
-      .code_storage_bytes = (code_bits / 8 + 3) & ~3u,
+      .code_storage_bytes = format::rabitq_code_storage_bytes(code_bits),
       .rabitq_entry_bytes = index.header.rabitq_entry_bytes,
       .vector_offset = static_cast<u32>(index.shards.front().vector_region_offset - 16),
       .vector_bytes = static_cast<u32>(
@@ -401,6 +436,7 @@ struct PersistentSearchEngine::Impl {
       .base_override_epochs = d_base_override_epochs,
       .delta_count = d_delta_count,
       .delta_capacity = delta_capacity,
+      .delta_signature_filter = config.gpu_delta_signature_filter ? 1u : 0u,
       .stop = stop_device,
       .fetch_status = fetch_status_device,
       .fetch_status_stride = fetch_status_stride,
@@ -409,6 +445,7 @@ struct PersistentSearchEngine::Impl {
       .graph_page_cache_locks = d_graph_page_cache_locks,
       .graph_page_cache_slots = graph_page_cache_slots,
       .rotated_queries = d_rotated_queries,
+      .query_luts = d_query_luts,
       .beam_ids = d_beam_ids,
       .beam_distances = d_beam_distances,
       .beam_expanded = d_beam_expanded,
@@ -422,9 +459,24 @@ struct PersistentSearchEngine::Impl {
     }
     admission_thread = std::thread([this] { admission_loop(); });
     completion_thread = std::thread([this] { completion_loop(); });
-    launch_persistent_search(kernel_stream, params, blocks, 128);
-    check_cuda(cudaPeekAtLastError(), "launch_persistent_search");
+    kernel_blocks = blocks;
+    start_persistent_kernel();
     maintenance_thread = std::thread([this] { maintenance_loop(); });
+  }
+
+  void start_persistent_kernel() {
+    std::atomic_ref<u32>(*stop_host).store(0, std::memory_order_release);
+    launch_persistent_search(kernel_stream, kernel_params, kernel_blocks, 128);
+    check_cuda(cudaPeekAtLastError(), "launch_persistent_search");
+    kernel_running = true;
+  }
+
+  void stop_persistent_kernel() {
+    if (!kernel_running) return;
+    std::atomic_ref<u32>(*stop_host).store(1, std::memory_order_release);
+    const cudaError_t status = cudaStreamSynchronize(kernel_stream);
+    kernel_running = false;
+    check_cuda(status, "cudaStreamSynchronize(persistent maintenance stop)");
   }
 
   ~Impl() {
@@ -435,8 +487,11 @@ struct PersistentSearchEngine::Impl {
     slot_cv.notify_all();
     if (maintenance_thread.joinable()) maintenance_thread.join();
     while (pending_count.load(std::memory_order_acquire) != 0) std::this_thread::yield();
-    std::atomic_ref<u32>(*stop_host).store(1, std::memory_order_release);
-    if (kernel_stream != nullptr) cudaStreamSynchronize(kernel_stream);
+    if (kernel_running) {
+      std::atomic_ref<u32>(*stop_host).store(1, std::memory_order_release);
+      if (kernel_stream != nullptr) cudaStreamSynchronize(kernel_stream);
+      kernel_running = false;
+    }
     shutdown.store(true, std::memory_order_release);
     admission_cv.notify_all();
     if (admission_thread.joinable()) admission_thread.join();
@@ -447,8 +502,8 @@ struct PersistentSearchEngine::Impl {
     if (kernel_stream != nullptr) cudaStreamDestroy(kernel_stream);
     if (fetch_status_host != nullptr) cudaFreeHost(fetch_status_host);
     if (stop_host != nullptr) cudaFreeHost(stop_host);
-    cudaFree(d_result_distances);
-    cudaFree(d_result_ids);
+    if (result_distances_host != nullptr) cudaFreeHost(result_distances_host);
+    if (result_ids_host != nullptr) cudaFreeHost(result_ids_host);
     cudaFree(d_delta_count);
     cudaFree(d_base_override_epochs);
     cudaFree(d_delta_rabitq);
@@ -464,6 +519,7 @@ struct PersistentSearchEngine::Impl {
     cudaFree(d_beam_expanded);
     cudaFree(d_beam_distances);
     cudaFree(d_beam_ids);
+    cudaFree(d_query_luts);
     cudaFree(d_rotated_queries);
     if (query_staging_host != nullptr) cudaFreeHost(query_staging_host);
     cudaFree(d_queries);
@@ -650,6 +706,7 @@ struct PersistentSearchEngine::Impl {
     std::lock_guard<std::mutex> compaction_lock(compaction_mutex);
     pause_admission_for_compaction();
     try {
+      stop_persistent_kernel();
       std::lock_guard<std::mutex> delta_lock(delta_mutex);
       const DeltaSnapshot snapshot = engine.delta_.begin_consolidation();
       if (snapshot.mutations.size() > delta_capacity) {
@@ -658,6 +715,8 @@ struct PersistentSearchEngine::Impl {
 
       std::vector<DeviceDeltaRecord> compact_records;
       compact_records.reserve(snapshot.mutations.size());
+      std::vector<f32> compact_vectors;
+      std::vector<byte_t> compact_entries;
       std::unordered_map<node_t, u32> compact_latest;
       std::unordered_set<node_t> compact_overrides;
       std::vector<node_t> merged_ids;
@@ -685,11 +744,13 @@ struct PersistentSearchEngine::Impl {
             check_cuda(cudaMemcpyAsync(
               d_rabitq_entries +
                 static_cast<size_t>(mutation.id) * index.header.rabitq_entry_bytes,
-              entry.data(), entry.size(), cudaMemcpyHostToDevice, delta_stream),
+              index.rabitq_entries.data() +
+                static_cast<size_t>(mutation.id) * index.header.rabitq_entry_bytes,
+              entry.size(), cudaMemcpyHostToDevice, delta_stream),
               "cudaMemcpyAsync(base RaBitQ merge)");
           }
           index.nodes[mutation.id] = node;
-          check_cuda(cudaMemcpyAsync(d_nodes + mutation.id, &node, sizeof(node),
+          check_cuda(cudaMemcpyAsync(d_nodes + mutation.id, &index.nodes[mutation.id], sizeof(node),
                                      cudaMemcpyHostToDevice, delta_stream),
                      "cudaMemcpyAsync(base node merge)");
           check_cuda(cudaMemcpyAsync(d_base_override_epochs + mutation.id, &zero_epoch,
@@ -709,24 +770,29 @@ struct PersistentSearchEngine::Impl {
           .epoch = mutation.epoch,
         };
         compact_records.push_back(record);
+        compact_vectors.insert(compact_vectors.end(), decoded.begin(), decoded.end());
+        compact_entries.insert(compact_entries.end(), entry.begin(), entry.end());
         compact_latest[mutation.id] = slot;
-        check_cuda(cudaMemcpyAsync(d_delta_records + slot, &record, sizeof(record),
-                                   cudaMemcpyHostToDevice, delta_stream),
-                   "cudaMemcpyAsync(compact delta record)");
-        check_cuda(cudaMemcpyAsync(d_delta_vectors + static_cast<size_t>(slot) * config.dim,
-                                   decoded.data(), decoded.size() * sizeof(f32),
-                                   cudaMemcpyHostToDevice, delta_stream),
-                   "cudaMemcpyAsync(compact delta vector)");
-        check_cuda(cudaMemcpyAsync(
-          d_delta_rabitq + static_cast<size_t>(slot) * index.header.rabitq_entry_bytes,
-          entry.data(), entry.size(), cudaMemcpyHostToDevice, delta_stream),
-          "cudaMemcpyAsync(compact delta RaBitQ)");
         if (mutation.id < index.header.num_nodes) {
           compact_overrides.insert(mutation.id);
           check_cuda(cudaMemcpyAsync(d_base_override_epochs + mutation.id, &mutation.epoch,
                                      sizeof(mutation.epoch), cudaMemcpyHostToDevice, delta_stream),
                      "cudaMemcpyAsync(compact base override)");
         }
+      }
+
+      if (!compact_records.empty()) {
+        check_cuda(cudaMemcpyAsync(d_delta_records, compact_records.data(),
+                                   compact_records.size() * sizeof(DeviceDeltaRecord),
+                                   cudaMemcpyHostToDevice, delta_stream),
+                   "cudaMemcpyAsync(compact delta record batch)");
+        check_cuda(cudaMemcpyAsync(d_delta_vectors, compact_vectors.data(),
+                                   compact_vectors.size() * sizeof(f32),
+                                   cudaMemcpyHostToDevice, delta_stream),
+                   "cudaMemcpyAsync(compact delta vector batch)");
+        check_cuda(cudaMemcpyAsync(d_delta_rabitq, compact_entries.data(),
+                                   compact_entries.size(), cudaMemcpyHostToDevice, delta_stream),
+                   "cudaMemcpyAsync(compact delta RaBitQ batch)");
       }
 
       check_cuda(cudaStreamSynchronize(delta_stream),
@@ -750,7 +816,9 @@ struct PersistentSearchEngine::Impl {
       engine.telemetry_.base_entries_merged.fetch_add(merged_ids.size(),
                                                       std::memory_order_relaxed);
       engine.telemetry_.delta_live_entries.store(count, std::memory_order_relaxed);
+      start_persistent_kernel();
     } catch (...) {
+      if (!kernel_running) start_persistent_kernel();
       resume_admission_after_compaction();
       throw;
     }
@@ -798,9 +866,18 @@ struct PersistentSearchEngine::Impl {
     if (delta_records_host.size() + mutations.size() > delta_capacity) {
       throw std::runtime_error("GPU delta live set exceeds the configured capacity");
     }
+    const u32 first_slot = static_cast<u32>(delta_records_host.size());
+    std::vector<DeviceDeltaRecord> new_records;
+    new_records.reserve(mutations.size());
+    std::vector<f32> new_vectors(static_cast<size_t>(mutations.size()) * config.dim);
+    std::vector<byte_t> new_entries(
+      static_cast<size_t>(mutations.size()) * index.header.rabitq_entry_bytes);
+    std::vector<u32> superseded_existing_slots;
+    std::vector<u32> new_base_overrides;
     std::vector<f32> decoded(config.dim);
     std::vector<byte_t> entry(index.header.rabitq_entry_bytes, 0);
-    for (DeltaMutation& mutation : mutations) {
+    for (size_t mutation_index = 0; mutation_index < mutations.size(); ++mutation_index) {
+      DeltaMutation& mutation = mutations[mutation_index];
       mutation.epoch = epoch;
       encode_mutation_payload(mutation, decoded, entry);
       const u32 slot = static_cast<u32>(delta_records_host.size());
@@ -808,9 +885,11 @@ struct PersistentSearchEngine::Impl {
       if (latest != latest_delta_slot.end()) {
         DeviceDeltaRecord& previous = delta_records_host[latest->second];
         previous.superseded_epoch = epoch;
-        check_cuda(cudaMemcpyAsync(d_delta_records + latest->second, &previous,
-                                   sizeof(previous), cudaMemcpyHostToDevice, delta_stream),
-                   "cudaMemcpyAsync(delta superseded record)");
+        if (latest->second >= first_slot) {
+          new_records[latest->second - first_slot].superseded_epoch = epoch;
+        } else {
+          superseded_existing_slots.push_back(latest->second);
+        }
       }
 
       DeviceDeltaRecord record{
@@ -823,31 +902,41 @@ struct PersistentSearchEngine::Impl {
         .epoch = epoch,
       };
       delta_records_host.push_back(record);
+      new_records.push_back(record);
       latest_delta_slot[mutation.id] = slot;
-      check_cuda(cudaMemcpyAsync(d_delta_records + slot, &record, sizeof(record),
-                                 cudaMemcpyHostToDevice, delta_stream),
-                 "cudaMemcpyAsync(delta record)");
-
-      check_cuda(cudaMemcpyAsync(d_delta_vectors + static_cast<size_t>(slot) * config.dim,
-                                 decoded.data(), decoded.size() * sizeof(f32),
-                                 cudaMemcpyHostToDevice, delta_stream),
-                 "cudaMemcpyAsync(delta vector)");
-      check_cuda(cudaMemcpyAsync(
-        d_delta_rabitq + static_cast<size_t>(slot) * index.header.rabitq_entry_bytes,
-        entry.data(), entry.size(), cudaMemcpyHostToDevice, delta_stream),
-        "cudaMemcpyAsync(delta RaBitQ)");
+      std::copy(decoded.begin(), decoded.end(),
+                new_vectors.begin() + static_cast<size_t>(mutation_index) * config.dim);
+      std::copy(entry.begin(), entry.end(),
+                new_entries.begin() +
+                  static_cast<size_t>(mutation_index) * index.header.rabitq_entry_bytes);
       if (mutation.id < index.header.num_nodes &&
           base_override_ids.insert(mutation.id).second) {
-        check_cuda(cudaMemcpyAsync(d_base_override_epochs + mutation.id, &epoch, sizeof(epoch),
-                                   cudaMemcpyHostToDevice, delta_stream),
-                   "cudaMemcpyAsync(base override epoch)");
+        new_base_overrides.push_back(mutation.id);
       }
     }
-    check_cuda(cudaStreamSynchronize(delta_stream), "cudaStreamSynchronize(delta payload)");
-    const u32 count = static_cast<u32>(delta_records_host.size());
-    check_cuda(cudaMemcpyAsync(d_delta_count, &count, sizeof(count),
+
+    check_cuda(cudaMemcpyAsync(d_delta_records + first_slot, new_records.data(),
+                               new_records.size() * sizeof(DeviceDeltaRecord),
                                cudaMemcpyHostToDevice, delta_stream),
-               "cudaMemcpyAsync(delta publish count)");
+               "cudaMemcpyAsync(delta record batch)");
+    check_cuda(cudaMemcpyAsync(
+      d_delta_vectors + static_cast<size_t>(first_slot) * config.dim,
+      new_vectors.data(), new_vectors.size() * sizeof(f32),
+      cudaMemcpyHostToDevice, delta_stream),
+      "cudaMemcpyAsync(delta vector batch)");
+    check_cuda(cudaMemcpyAsync(
+      d_delta_rabitq + static_cast<size_t>(first_slot) * index.header.rabitq_entry_bytes,
+      new_entries.data(), new_entries.size(), cudaMemcpyHostToDevice, delta_stream),
+      "cudaMemcpyAsync(delta RaBitQ batch)");
+    for (const u32 slot : superseded_existing_slots) {
+      launch_supersede_delta_record(delta_stream, d_delta_records, slot, epoch);
+    }
+    for (const u32 id : new_base_overrides) {
+      launch_publish_base_override(delta_stream, d_base_override_epochs, id, epoch);
+    }
+    const u32 count = static_cast<u32>(delta_records_host.size());
+    launch_publish_delta_count(delta_stream, d_delta_count, count);
+    check_cuda(cudaPeekAtLastError(), "launch GPU delta publication");
     check_cuda(cudaStreamSynchronize(delta_stream), "cudaStreamSynchronize(delta publish)");
     engine.telemetry_.delta_live_entries.store(count, std::memory_order_relaxed);
   }
@@ -919,16 +1008,11 @@ struct PersistentSearchEngine::Impl {
           throw std::runtime_error("persistent GPU query failed with status " +
                                    std::to_string(completion.status));
         }
-        std::vector<u32> ids(completion.result_count);
-        std::vector<f32> distances(completion.result_count);
-        check_cuda(cudaMemcpy(ids.data(),
-          d_result_ids + static_cast<size_t>(pending->slot) * result_capacity,
-          ids.size() * sizeof(u32), cudaMemcpyDeviceToHost),
-          "cudaMemcpy(persistent result ids)");
-        check_cuda(cudaMemcpy(distances.data(),
-          d_result_distances + static_cast<size_t>(pending->slot) * result_capacity,
-          distances.size() * sizeof(f32), cudaMemcpyDeviceToHost),
-          "cudaMemcpy(persistent result distances)");
+        const size_t result_offset = static_cast<size_t>(pending->slot) * result_capacity;
+        std::vector<u32> ids(result_ids_host + result_offset,
+                             result_ids_host + result_offset + completion.result_count);
+        std::vector<f32> distances(result_distances_host + result_offset,
+                                   result_distances_host + result_offset + completion.result_count);
         service::QueryResult result;
         result.reserve(ids.size());
         for (size_t i = 0; i < ids.size(); ++i) result.push_back({ids[i], distances[i]});
@@ -1012,6 +1096,7 @@ struct PersistentSearchEngine::Impl {
   f32* d_queries{};
   f32* query_staging_host{};
   f32* d_rotated_queries{};
+  f32* d_query_luts{};
   u32* d_beam_ids{};
   f32* d_beam_distances{};
   u8* d_beam_expanded{};
@@ -1024,6 +1109,8 @@ struct PersistentSearchEngine::Impl {
   u32 graph_page_cache_slots{};
   size_t graph_page_cache_bytes{};
   bool owns_remote_buffer{};
+  u32* result_ids_host{};
+  f32* result_distances_host{};
   u32* d_result_ids{};
   f32* d_result_distances{};
   DeviceDeltaRecord* d_delta_records{};
@@ -1044,6 +1131,9 @@ struct PersistentSearchEngine::Impl {
   cudaStream_t kernel_stream{};
   cudaStream_t transfer_stream{};
   cudaStream_t delta_stream{};
+  PersistentKernelParams kernel_params{};
+  u32 kernel_blocks{};
+  bool kernel_running{};
   std::atomic<bool> accepting{true};
   std::atomic<bool> shutdown{false};
   std::atomic<bool> maintenance_shutdown{false};
