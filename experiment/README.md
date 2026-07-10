@@ -32,8 +32,9 @@ already writes RaBitQ and anchor sidecars:
 ./experiment/build_sift100m_index.sh
 ```
 
-The GPU-persistent V4 profile needs a small compute-side manifest. If `.dat`
-shards are remote, storage nodes materialize their RaBitQ streams at startup:
+The GPU-persistent V4 runtime uses only compute-side metadata and anchors. It
+synthesizes its control view in memory; `.gpu.idx` is optional. The converter is
+needed only to upgrade older metadata or export a manifest for inspection:
 
 ```bash
 GPU_SIDECAR_OVERWRITE=1 \

@@ -244,10 +244,18 @@ struct PersistentSearchEngine::Impl {
     }
 
     std::string load_error;
-    if (!format::read_file(index_path::gpu_tiered_file(config.resolved_index_prefix()),
-                           index, &load_error)) {
+    bool used_anchor_entry_points = false;
+    if (!format::synthesize_distributed_view(
+          config.resolved_index_prefix(), index,
+          format::SynthesisOptions{
+            .entry_points = 0,
+            .seed = static_cast<u64>(static_cast<u32>(config.seed)),
+          },
+          &used_anchor_entry_points, &load_error)) {
       throw std::runtime_error(load_error);
     }
+    std::cerr << "[gpu-search] synthesized V4 manifest in memory from metadata"
+              << (used_anchor_entry_points ? " and anchors\n" : "\n");
     const bool centroid_matches = index.centroid.size() == VamanaNode::rabitq_centroid.size() &&
       std::equal(index.centroid.begin(), index.centroid.end(),
                  VamanaNode::rabitq_centroid.begin(), [](f32 stored, f32 configured) {
@@ -360,7 +368,22 @@ struct PersistentSearchEngine::Impl {
         .gpu_destination_bytes = remote_buffer_bytes,
       });
     }
-    stream_codes_to_gpu(backend.get());
+    std::unique_ptr<RemoteFetchBackend> bootstrap_backend;
+    RemoteFetchBackend* bootstrap_source = backend.get();
+    if (parsed_backend == RemoteBackendKind::gpunetio) {
+      bootstrap_backend = create_control_qp_bootstrap_backend(RemoteFetchBackendContext{
+        .config = config,
+        .channel_context = channel_context,
+        .connection_manager = connection_manager,
+        .remote_regions = remote_regions,
+        .gpu_destination_base = d_remote_buffer,
+        .gpu_destination_bytes = remote_buffer_bytes,
+      });
+      bootstrap_source = bootstrap_backend.get();
+      std::cerr << "[gpu-search] bootstrap=CPU-posted GPUDirect RDMA; "
+                   "steady_state=GPU-initiated GPUNetIO\n";
+    }
+    stream_codes_to_gpu(bootstrap_source);
 
     device_allocate(d_shards, index.shards.size(), "cudaMalloc(GPU V4 shards)");
     device_allocate(d_centroid, index.centroid.size(), "cudaMalloc(GPU V4 centroid)");
@@ -646,8 +669,17 @@ struct PersistentSearchEngine::Impl {
             check_cuda(cudaStreamSynchronize(bootstrap_stream),
                        "cudaStreamSynchronize(GPUNetIO bootstrap)");
           }
-          for (i32 status : statuses) {
-            if (status <= 0) throw std::runtime_error("RDMA V4 code bootstrap failed");
+          for (size_t request_index = 0; request_index < statuses.size(); ++request_index) {
+            if (statuses[request_index] <= 0) {
+              const FetchDescriptor& request = requests[request_index];
+              throw std::runtime_error(
+                "RDMA V4 code bootstrap failed: status=" +
+                std::to_string(statuses[request_index]) + " shard=" +
+                std::to_string(request.memory_node) + " remote_offset=" +
+                std::to_string(request.remote_offset) + " bytes=" +
+                std::to_string(request.bytes) + " destination=" +
+                std::to_string(request.destination_address));
+            }
           }
           for (const FetchDescriptor& request : requests) streamed += request.bytes;
         }
@@ -663,6 +695,19 @@ struct PersistentSearchEngine::Impl {
     device_free(d_requests);
     const u64 expected = index.header.num_nodes * index.header.rabitq_entry_bytes;
     if (streamed != expected) throw std::runtime_error("GPU V4 code bootstrap size mismatch");
+    if (source != nullptr && source->kind() == RemoteBackendKind::verbs_proxy) {
+      int flush_options = 0;
+      check_cuda(cudaDeviceGetAttribute(
+                   &flush_options, cudaDevAttrGPUDirectRDMAFlushWritesOptions,
+                   static_cast<int>(config.gpu_device)),
+                 "cudaDeviceGetAttribute(GPUDirect flush options)");
+      if ((flush_options & cudaFlushGPUDirectRDMAWritesOptionHost) != 0) {
+        check_cuda(cudaDeviceFlushGPUDirectRDMAWrites(
+                     cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
+                     cudaFlushGPUDirectRDMAWritesToOwner),
+                   "cudaDeviceFlushGPUDirectRDMAWrites(GPU V4 bootstrap)");
+      }
+    }
     check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(GPU V4 bootstrap)");
     std::cerr << "[gpu-search] streamed " << streamed
               << " RaBitQ bytes directly into final GPU storage\n";

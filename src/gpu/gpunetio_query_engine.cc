@@ -448,21 +448,36 @@ struct GpuNetioQueryPool::Resource {
     check_doca("doca_gpu_mem_alloc",
                doca_gpu_mem_alloc(
                  gpu, scratch_allocation_bytes, kGpuPageSize, DOCA_GPU_MEM_TYPE_GPU, &scratch_base, nullptr));
-    check_doca("doca_gpu_dmabuf_fd", doca_gpu_dmabuf_fd(gpu, scratch_base, scratch_allocation_bytes, &dmabuf_fd));
-
     ibv_pd* ibv_pd = doca_verbs_bridge_verbs_pd_get_ibv_pd(pd);
     if (ibv_pd == nullptr) {
       throw std::runtime_error("doca_verbs_bridge_verbs_pd_get_ibv_pd returned null");
     }
-    scratch_mr = mlx5dv_reg_dmabuf_mr(ibv_pd,
-                                      0,
-                                      scratch_allocation_bytes,
-                                      0,
-                                      dmabuf_fd,
-                                      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE,
-                                      0);
+    const int mr_access = IBV_ACCESS_LOCAL_WRITE |
+      IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+    errno = 0;
+    scratch_mr = ibv_reg_mr(ibv_pd, scratch_base, scratch_allocation_bytes, mr_access);
+    const int peer_memory_error = errno;
+    if (scratch_mr != nullptr) {
+      local_iova_base = 0;
+      std::cerr << "[STATUS]: GPUNetIO GPU MR registration=peer_memory bytes="
+                << scratch_allocation_bytes << std::endl;
+    } else {
+      check_doca("doca_gpu_dmabuf_fd",
+                 doca_gpu_dmabuf_fd(
+                   gpu, scratch_base, scratch_allocation_bytes, &dmabuf_fd));
+      scratch_mr = mlx5dv_reg_dmabuf_mr(
+        ibv_pd, 0, scratch_allocation_bytes, 0, dmabuf_fd, mr_access, 0);
+      local_iova_base = reinterpret_cast<uint64_t>(scratch_base);
+    }
     if (scratch_mr == nullptr) {
-      throw std::runtime_error(std::string("mlx5dv_reg_dmabuf_mr(scratch): ") + std::strerror(errno));
+      throw std::runtime_error(
+        std::string("GPU MR registration failed: peer_memory=") +
+        std::strerror(peer_memory_error) + ", dmabuf=" + std::strerror(errno));
+    }
+    if (local_iova_base != 0) {
+      std::cerr << "[STATUS]: GPUNetIO GPU MR registration=dmabuf bytes="
+                << scratch_allocation_bytes << " peer_memory_error="
+                << std::strerror(peer_memory_error) << std::endl;
     }
     local_mkey = scratch_mr->lkey;
     local_mkey_wqe = byte_swap32(local_mkey);
@@ -606,7 +621,7 @@ struct GpuNetioQueryPool::Resource {
       .offset_neighbors = static_cast<uint32_t>(VamanaNode::offset_neighbors()),
       .max_rdma_reads = max_rdma_reads_per_query(max_visited, beam_width, std::min<uint32_t>(requested_k, max_results)),
       .local_mkey = local_mkey_wqe,
-      .local_iova_base = reinterpret_cast<uint64_t>(scratch_base),
+      .local_iova_base = local_iova_base,
       .remote_regions = d_remote_regions,
       .remote_region_count = remote_region_count,
       .qp_array = d_qp_array,
@@ -718,6 +733,7 @@ struct GpuNetioQueryPool::Resource {
   int dmabuf_fd{-1};
   uint32_t local_mkey{};
   uint32_t local_mkey_wqe{};
+  uint64_t local_iova_base{};
   vec<GpuNetioRemoteMemoryRegion> remote_regions_host{};
   GpuNetioRemoteMemoryRegion* d_remote_regions{nullptr};
   float* d_query{nullptr};
@@ -772,7 +788,7 @@ GpuNetioPersistentView GpuNetioPersistentTransport::view() const {
     .remote_region_count = resource.remote_region_count,
     .qps_per_node = impl_->qps_per_node,
     .local_mkey = resource.local_mkey_wqe,
-    .local_iova_base = reinterpret_cast<uint64_t>(resource.scratch_base),
+    .local_iova_base = resource.local_iova_base,
     .data = resource.persistent_data,
     .data_bytes = resource.persistent_data_size,
     .dump = resource.d_dump_ptr,

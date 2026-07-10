@@ -33,5 +33,7 @@ struct RemoteFetchBackendContext {
 
 std::unique_ptr<RemoteFetchBackend> create_remote_fetch_backend(
   RemoteBackendKind kind, const RemoteFetchBackendContext& context);
+std::unique_ptr<RemoteFetchBackend> create_control_qp_bootstrap_backend(
+  const RemoteFetchBackendContext& context);
 
 }  // namespace gpu_search

@@ -24,12 +24,14 @@ without preparing a one-billion-vector dataset.
 The distributed artifacts are:
 
 - `<prefix>.meta.json`: storage layout and V4 metadata.
-- `<prefix>.gpu.idx`: a small V4 manifest containing shard ranges, graph/code
-  offsets, centroid, and entry-point ordinals.
 - `<prefix>_nodeX_ofN.dat`: authoritative fixed nodes, exact vectors, and the
   compact 488-byte Vamana graph records for `R=96`.
 - `<prefix>.anchors`: small routing anchors used for entry routing and dynamic
   candidate buckets.
+
+`<prefix>.gpu.idx` is an optional 2 KiB export/debug cache. The runtime never
+requires or reads it: at startup it synthesizes the same control view in memory
+from `.meta.json` and anchor pointers.
 
 `<prefix>_nodeX_ofN.gpu.codes` is optional. If present on a storage node, its
 header, dimensions, offset, and checksum are validated before loading. If it is
@@ -38,9 +40,9 @@ stream from the authoritative entries already present in its local `.dat`
 shard. The stream occupies a reserved range immediately after the immutable
 static image, and the dynamic allocator starts after that range.
 
-The compute node needs only the manifest, metadata, and anchors on local or
-shared storage. It does not need `.dat`, `.gpu.codes`, `.idmap`, `.rabitq12`, or
-any graph snapshot locally in a distributed run. Storage nodes keep their own
+The compute node needs only metadata and anchors on local or shared storage. It
+does not need `.gpu.idx`, `.dat`, `.gpu.codes`, `.idmap`, `.rabitq12`, or any
+graph snapshot locally in a distributed run. Storage nodes keep their own
 `.dat`; storage-owner updates additionally use their local `.idmap` and anchor
 files.
 
@@ -51,8 +53,8 @@ manually; the converter never deletes old files.
 ## Converting an Existing Index
 
 The converter reuses the existing Vamana/Metis placement and never rebuilds the
-graph. On a compute node where the `.dat` shards are remote, the script detects
-that condition and writes only the small manifest:
+graph. The converter can still export a manifest for inspection, but it is not
+part of the runtime dependency set:
 
 ```bash
 GPU_SIDECAR_OVERWRITE=1 \
@@ -60,7 +62,8 @@ GPU_SIDECAR_RABITQ_SOURCE=nodes \
 ./experiment/convert_sift100m_gpu_sidecars.sh 04_gpu_persistent_gpunetio
 ```
 
-In manifest-only mode no `.gpu.codes` file is created on the compute node. Each
+In manifest-only mode no `.gpu.codes` file is created on the compute node. The
+exported `.gpu.idx` may also be deleted without affecting query startup. Each
 storage node derives the advertised code-stream offset from the same persisted
 `hot_graph_dynamic_base_offsets` metadata and materializes its local stream at
 startup. When shards are local, `nodes` reads the authoritative full RaBitQ
@@ -78,17 +81,26 @@ and is much cheaper than Vamana construction or Metis partitioning.
 2. It either validates and loads a local `.gpu.codes` payload or sequentially
    copies `code + norm + correction` from its authoritative fixed nodes into
    the manifest's reserved remote range.
-3. The compute node allocates the final GPU layout once.
-4. Two 64 MiB GPUDirect RDMA windows stream each shard directly into its final
-   ordinal range. There is no full CPU staging array and no compute-side code
-   snapshot file.
+3. The compute node synthesizes ordinal ranges, remote offsets, centroid, and
+   entry points from metadata/anchors, then allocates the final GPU layout once.
+4. CPU-posted GPUDirect RDMA windows stream each shard directly into its final
+   ordinal range. The CPU submits startup bulk transfers but never copies their
+   payload; there is no host staging array or compute-side code snapshot file.
 5. The persistent GPU kernel starts only after every streamed byte succeeds.
 
 The storage stream consumes 24 bytes per SIFT vector across the storage nodes;
 it consumes no compute-node disk space and is not mirrored in compute host
-memory. The query backend can be `gpunetio`, `verbs_proxy`, or `local`. GPUNetIO owns
-the steady-state query QPs; bootstrap uses the same remote registered regions
-and writes directly to the final GPU allocation.
+memory. The query backend can be `gpunetio`, `verbs_proxy`, or `local`. GPUNetIO
+owns the steady-state query QPs. Bootstrap uses the existing control QPs for
+large GPUDirect reads because the current `SYS` topology makes GPU-issued bulk
+reads fragile; query-time graph and exact-vector reads remain GPU-issued.
+
+Multi-gigabyte GPUNetIO allocations are registered through `nvidia-peermem`
+with `ibv_reg_mr`, matching NVIDIA's Verbs GPUNetIO samples. The runtime falls
+back to a DMA-BUF MR when peer-memory registration is unavailable. On the
+current ConnectX-6/535 driver stack, a single DMA-BUF MR succeeds at 2 GiB but
+fails at 4 GiB, while peer-memory registration has been validated at the full
+36 GiB engine budget.
 
 ## Query Execution
 
@@ -169,6 +181,9 @@ Check local DOCA and GPU-memory registration first:
 
 ```bash
 ./build/dvstor_gpunetio_probe 1 mlx5_0
+
+# Exercise the large peer-memory path used by SIFT100M.
+./build/dvstor_gpunetio_probe 1 mlx5_0 12185894912 12185894912 peer
 ```
 
 The probe validates local capability. A connected storage node is still needed

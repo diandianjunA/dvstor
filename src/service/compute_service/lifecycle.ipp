@@ -167,10 +167,11 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
                    std::to_string(anchor_index_->memory_bytes()) + " bytes");
     }
   }
+  const str search_path = config_.use_gpu_persistent_search()
+    ? "GPU-persistent RaBitQ scoring + RDMA graph/exact rerank"
+    : (vamana_->use_rabitq() ? "RFQ5 RaBitQ cpu_gate + GPUDirect exact beam" : "exact");
   print_status(str(config_.credit_aware_expansion ? "search: credit-aware " : "search: ") +
-    (vamana_->use_rabitq()
-      ? "RFQ5 RaBitQ cpu_gate + GPUDirect exact beam"
-      : "exact"));
+               search_path);
 
   if (!config_.use_gpu_persistent_search()) {
     worker_pool_ = std::make_unique<WorkerPool>(

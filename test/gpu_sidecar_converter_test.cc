@@ -400,6 +400,20 @@ int main() {
     assert(manifest_metadata.at("gpu_entry_point_source") == "anchors_then_shard_hash");
     assert(manifest_metadata.at("gpu_code_files").empty());
   }
+  std::filesystem::remove(manifest_result.index_file);
+  assert(!std::filesystem::exists(manifest_result.index_file));
+  gpu_search::format::View synthesized_view;
+  bool used_anchor_entry_points = false;
+  assert(gpu_search::format::synthesize_distributed_view(
+    prefix, synthesized_view,
+    gpu_search::format::SynthesisOptions{.entry_points = 0, .seed = options.seed},
+    &used_anchor_entry_points, &error));
+  assert(used_anchor_entry_points);
+  assert(synthesized_view.shards == manifest_view.shards);
+  assert(synthesized_view.centroid == manifest_view.centroid);
+  assert(synthesized_view.entry_points == manifest_view.entry_points);
+  assert(synthesized_view.header.num_nodes == manifest_view.header.num_nodes);
+  assert(synthesized_view.header.medoid_ordinal == manifest_view.header.medoid_ordinal);
   std::filesystem::remove_all(directory);
   return 0;
 }

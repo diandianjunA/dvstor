@@ -148,25 +148,29 @@ PY_VALIDATE
 
   local require_local_shards=1
   if [[ "${GPU_TIERED_INDEX:-0}" == "1" || "${GPU_TIERED_INDEX:-0}" == "true" ]]; then
-    local gpu_tiered_source
-    gpu_tiered_source="$(python3 - "$metadata" <<'PY_GPU_V4'
+    python3 - "$metadata" <<'PY_GPU_RUNTIME'
 import json
 import sys
 with open(sys.argv[1], 'r', encoding='utf-8') as f:
     metadata = json.load(f)
-if metadata.get('gpu_tiered_format') != 'gpu_tiered_v4':
-    raise SystemExit('GPU profile requires gpu_tiered_v4; run the V4 sidecar converter')
-if metadata.get('gpu_graph_source') != 'storage_compact_plane':
-    raise SystemExit('GPU V4 metadata must use the authoritative storage compact graph plane')
-print(metadata.get('gpu_tiered_source', ''))
-PY_GPU_V4
-)"
-    if [[ "$gpu_tiered_source" == "distributed_manifest_v1" ]]; then
-      require_local_shards=0
-    fi
+required = (
+    metadata.get('schema_version') == 13 and
+    metadata.get('distance', 'l2') == 'l2' and
+    metadata.get('storage_format') == 'vamana_compact_v1' and
+    metadata.get('node_layout') == 'rabitq'
+)
+shards = metadata.get('num_memory_nodes', 0)
+arrays = (
+    metadata.get('hot_graph_entry_counts'),
+    metadata.get('hot_graph_offsets'),
+    metadata.get('hot_graph_dynamic_base_offsets'),
+)
+if not required or shards <= 0 or any(not isinstance(values, list) or len(values) != shards for values in arrays):
+    raise SystemExit('GPU runtime requires schema-13 compact RaBitQ metadata with complete shard arrays')
+PY_GPU_RUNTIME
+    require_local_shards=0
     if [[ ! -s "${INDEX_PREFIX}.gpu.idx" ]]; then
-      echo "missing GPU tiered index: ${INDEX_PREFIX}.gpu.idx" >&2
-      return 1
+      echo "[validate] .gpu.idx absent; GPU runtime will synthesize its control view in memory"
     fi
   fi
   if (( require_local_shards != 0 )); then

@@ -12,14 +12,12 @@
 #include <queue>
 #include <stdexcept>
 #include <system_error>
-#include <unordered_set>
 #include <unistd.h>
 
 #include "common/index_path.hh"
 #include "gpu_search/index_format.hh"
 #include "nlohmann/json.hh"
 #include "tools/vamana_offline/progress.hh"
-#include "vamana/anchor_index.hh"
 #include "vamana/hot_graph.hh"
 #include "vamana/rabitq_cache.hh"
 #include "vamana/storage_format.hh"
@@ -101,82 +99,6 @@ u64 mix64(u64 value) {
   value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
   value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
   return value ^ (value >> 31);
-}
-
-void read_exact(std::istream& input, void* destination, size_t bytes,
-                const filepath_t& path);
-
-bool append_anchor_entry_points(
-    const filepath_t& prefix, const Layout& layout, u32 shard_count,
-    const vec<u64>& counts, const vec<u64>& ordinal_bases, u32 target,
-    std::unordered_set<u32>& selected, vec<u32>& entry_points) {
-  const filepath_t path = index_path::anchor_file(prefix);
-  std::ifstream input(path, std::ios::binary);
-  if (!input.good()) return false;
-  vamana::anchor::Header header;
-  read_exact(input, &header, sizeof(header), path);
-  if (header.magic != vamana::anchor::kMagic ||
-      header.version != vamana::anchor::kVersion || header.dim != layout.dim ||
-      header.shard_count != shard_count ||
-      header.vector_dtype != static_cast<u32>(layout.dtype) ||
-      header.vector_bytes != layout.vector_bytes ||
-      header.total_anchors > (1u << 24)) {
-    throw std::runtime_error("invalid anchor sidecar for GPU V4 entry points: " +
-                             path.string());
-  }
-  vec<vec<u32>> anchor_ordinals(shard_count);
-  vec<byte_t> vector(header.vector_bytes);
-  u64 loaded = 0;
-  for (u32 shard = 0; shard < shard_count; ++shard) {
-    vamana::anchor::ShardHeader shard_header;
-    read_exact(input, &shard_header, sizeof(shard_header), path);
-    if (shard_header.shard != shard ||
-        shard_header.anchor_count > header.anchors_per_shard ||
-        loaded + shard_header.anchor_count > header.total_anchors) {
-      throw std::runtime_error("invalid anchor shard for GPU V4 entry points: " +
-                               path.string());
-    }
-    vec<f32> shard_centroid(layout.dim);
-    read_exact(input, shard_centroid.data(),
-               shard_centroid.size() * sizeof(f32), path);
-    anchor_ordinals[shard].reserve(shard_header.anchor_count);
-    for (u32 index = 0; index < shard_header.anchor_count; ++index) {
-      vamana::anchor::EntryHeader entry;
-      read_exact(input, &entry, sizeof(entry), path);
-      read_exact(input, vector.data(), vector.size(), path);
-      const RemotePtr pointer{entry.rptr_raw};
-      if (pointer.is_null() || pointer.memory_node() != shard ||
-          pointer.byte_offset() < kShardHeaderBytes) {
-        throw std::runtime_error("anchor points outside its static GPU V4 shard");
-      }
-      const u64 relative = pointer.byte_offset() - kShardHeaderBytes;
-      if (relative % layout.node_bytes != 0 ||
-          relative / layout.node_bytes >= counts[shard]) {
-        throw std::runtime_error("anchor points outside its static GPU V4 range");
-      }
-      anchor_ordinals[shard].push_back(static_cast<u32>(
-        ordinal_bases[shard] + relative / layout.node_bytes));
-      ++loaded;
-    }
-  }
-  if (loaded != header.total_anchors) {
-    throw std::runtime_error("anchor sidecar count mismatch for GPU V4 entry points");
-  }
-  bool appended = false;
-  for (u32 rank = 0; entry_points.size() < target; ++rank) {
-    bool have_rank = false;
-    for (u32 shard = 0; shard < shard_count && entry_points.size() < target; ++shard) {
-      if (rank >= anchor_ordinals[shard].size()) continue;
-      have_rank = true;
-      const u32 ordinal = anchor_ordinals[shard][rank];
-      if (selected.insert(ordinal).second) {
-        entry_points.push_back(ordinal);
-        appended = true;
-      }
-    }
-    if (!have_rank) break;
-  }
-  return appended;
 }
 
 void read_exact(std::istream& input, void* destination, size_t bytes,
@@ -527,112 +449,33 @@ GpuSidecarConversionResult write_manifest_only(
     const filepath_t& metadata_path,
     const nlohmann::json& metadata,
     const Layout& layout) {
+  (void)layout;
   const u32 shard_count = metadata.at("num_memory_nodes").get<u32>();
-  const vec<u64> counts = metadata.at("hot_graph_entry_counts").get<vec<u64>>();
-  const vec<u64> graph_offsets = metadata.at("hot_graph_offsets").get<vec<u64>>();
-  const vec<u64> dynamic_offsets =
-    metadata.at("hot_graph_dynamic_base_offsets").get<vec<u64>>();
-  if (counts.size() != shard_count || graph_offsets.size() != shard_count ||
-      dynamic_offsets.size() != shard_count) {
-    throw std::runtime_error("GPU V4 manifest metadata has invalid shard arrays");
-  }
   const filepath_t manifest_path = index_path::gpu_tiered_file(options.index_prefix);
   if (!options.overwrite && std::filesystem::exists(manifest_path)) {
     throw std::runtime_error(
       "output exists; pass --overwrite to replace " + manifest_path.string());
   }
-  const vec<f32> centroid = metadata.at("rabitq_centroid").get<vec<f32>>();
-  if (centroid.size() != layout.dim ||
-      !std::all_of(centroid.begin(), centroid.end(), [](f32 value) {
-        return std::isfinite(value);
-      })) {
-    throw std::runtime_error("metadata contains an invalid RaBitQ centroid");
-  }
-
   gpu_search::format::View manifest;
-  manifest.header.dim = layout.dim;
-  manifest.header.graph_degree = layout.degree;
-  manifest.header.vector_dtype = static_cast<u32>(layout.dtype);
-  manifest.header.rabitq_code_bits = layout.rabitq_code_bits;
-  manifest.header.rabitq_entry_bytes = layout.rabitq_entry_bytes;
-  manifest.header.num_shards = shard_count;
-  manifest.header.graph_entry_bytes = layout.graph_entry_bytes;
-  manifest.header.graph_pointer_bytes = vamana::hot_graph::kCompactPointerBytes;
-  manifest.header.graph_shard_bits = layout.graph_shard_bits;
-  manifest.header.base_generation = 1;
-  manifest.centroid = centroid;
-  manifest.shards.resize(shard_count);
-  vec<u64> ordinal_bases(shard_count, 0);
-  u64 node_count = 0;
-  for (u32 shard = 0; shard < shard_count; ++shard) {
-    if (counts[shard] == 0 || dynamic_offsets[shard] == 0) {
-      throw std::runtime_error("GPU V4 does not support an empty or invalid shard");
-    }
-    ordinal_bases[shard] = node_count;
-    manifest.shards[shard] = {
-      .ordinal_base = node_count,
-      .node_count = counts[shard],
-      .node_base_offset = kShardHeaderBytes,
-      .node_stride = layout.node_bytes,
-      .graph_base_offset = graph_offsets[shard],
-      .dynamic_base_offset = dynamic_offsets[shard],
-      .code_remote_offset = gpu_search::format::align_up(dynamic_offsets[shard], 64),
-      .code_bytes = counts[shard] * layout.rabitq_entry_bytes,
-      .memory_node = shard,
-      .dynamic_record_bytes = layout.dynamic_record_bytes,
-      .dynamic_hot_offset = layout.dynamic_hot_offset,
-    };
-    node_count += counts[shard];
-  }
-  if (node_count != metadata.at("num_vectors").get<u64>() ||
-      node_count >= (1ull << 30)) {
-    throw std::runtime_error("GPU V4 manifest node count is invalid");
-  }
-  manifest.header.num_nodes = node_count;
-
-  const auto& medoid = metadata.at("medoid");
-  const u32 medoid_shard = medoid.at("memory_node").get<u32>();
-  const u64 medoid_offset = medoid.at("offset").get<u64>();
-  if (medoid_shard >= shard_count || medoid_offset < kShardHeaderBytes ||
-      (medoid_offset - kShardHeaderBytes) % layout.node_bytes != 0) {
-    throw std::runtime_error("metadata contains an invalid medoid pointer");
-  }
-  const u64 medoid_slot = (medoid_offset - kShardHeaderBytes) / layout.node_bytes;
-  if (medoid_slot >= counts[medoid_shard]) {
-    throw std::runtime_error("metadata medoid exceeds its static shard");
-  }
-  manifest.header.medoid_ordinal = static_cast<u32>(
-    ordinal_bases[medoid_shard] + medoid_slot);
-
-  const u32 target = static_cast<u32>(std::min<u64>(options.entry_points, node_count));
-  const u32 quota = (target + shard_count - 1) / shard_count;
-  std::unordered_set<u32> selected;
-  selected.insert(manifest.header.medoid_ordinal);
-  manifest.entry_points.push_back(manifest.header.medoid_ordinal);
-  const bool used_anchor_entry_points = append_anchor_entry_points(
-    options.index_prefix, layout, shard_count, counts, ordinal_bases, target,
-    selected, manifest.entry_points);
-  for (u32 shard = 0; shard < shard_count && manifest.entry_points.size() < target; ++shard) {
-    for (u32 sample = 0; sample < quota * 16 &&
-         manifest.entry_points.size() < target; ++sample) {
-      const u64 slot = mix64(options.seed ^
-        (static_cast<u64>(shard) << 32) ^ sample) % counts[shard];
-      const u32 ordinal = static_cast<u32>(ordinal_bases[shard] + slot);
-      if (selected.insert(ordinal).second) manifest.entry_points.push_back(ordinal);
-    }
-  }
-  for (u32 ordinal = 0; manifest.entry_points.size() < target; ++ordinal) {
-    if (selected.insert(ordinal).second) manifest.entry_points.push_back(ordinal);
+  bool used_anchor_entry_points = false;
+  str error;
+  if (!gpu_search::format::synthesize_distributed_view(
+        options.index_prefix, manifest,
+        gpu_search::format::SynthesisOptions{
+          .entry_points = options.entry_points,
+          .seed = options.seed,
+        },
+        &used_anchor_entry_points, &error)) {
+    throw std::runtime_error(error);
   }
 
   TemporaryPath manifest_output = make_temporary_path(manifest_path);
-  str error;
   if (!gpu_search::format::write_file(manifest_output.temporary_path, manifest, &error)) {
     throw std::runtime_error(error);
   }
   GpuSidecarConversionResult result;
   result.index_file = manifest_path;
-  result.node_count = node_count;
+  result.node_count = manifest.header.num_nodes;
   result.entry_point_count = static_cast<u32>(manifest.entry_points.size());
   for (u32 shard = 0; shard < shard_count; ++shard) {
     result.code_remote_offsets.push_back(manifest.shards[shard].code_remote_offset);

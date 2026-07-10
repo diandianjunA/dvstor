@@ -239,6 +239,67 @@ private:
   std::vector<u32> next_qp_;
 };
 
+class ControlQpBootstrapBackend final : public RemoteFetchBackend {
+public:
+  explicit ControlQpBootstrapBackend(const RemoteFetchBackendContext& context)
+      : channel_context_(context.channel_context),
+        connection_manager_(context.connection_manager),
+        remote_regions_(context.remote_regions),
+        gpu_region_(channel_context_, context.gpu_destination_base,
+                    context.gpu_destination_bytes),
+        gpu_base_(reinterpret_cast<u64>(context.gpu_destination_base)),
+        gpu_bytes_(context.gpu_destination_bytes) {}
+
+  RemoteBackendKind kind() const override { return RemoteBackendKind::verbs_proxy; }
+
+  void fetch(std::span<const FetchDescriptor> requests,
+             std::span<i32> statuses) override {
+    if (requests.size() != statuses.size()) {
+      throw std::invalid_argument("control-QP bootstrap status cardinality mismatch");
+    }
+    size_t posted = 0;
+    for (size_t index = 0; index < requests.size(); ++index) {
+      const FetchDescriptor& request = requests[index];
+      statuses[index] = -EINVAL;
+      const u64 destination_offset = request.destination_address >= gpu_base_
+        ? request.destination_address - gpu_base_ : gpu_bytes_;
+      if (request.memory_node >= remote_regions_.size() || request.bytes == 0 ||
+          request.destination_address < gpu_base_ || destination_offset > gpu_bytes_ ||
+          request.bytes > gpu_bytes_ - destination_offset) {
+        continue;
+      }
+      connection_manager_.server_qps[request.memory_node]->post_send(
+        request.destination_address, request.bytes, gpu_region_.get_lkey(),
+        IBV_WR_RDMA_READ, true, false, remote_regions_[request.memory_node].get(),
+        request.remote_offset, 0, index + 1);
+      ++posted;
+    }
+    if (posted != 0) {
+      channel_context_.poll_send_cq_until_completion(static_cast<i32>(posted));
+    }
+    for (size_t index = 0; index < requests.size(); ++index) {
+      if (statuses[index] == -EINVAL) {
+        const FetchDescriptor& request = requests[index];
+        const u64 destination_offset = request.destination_address >= gpu_base_
+          ? request.destination_address - gpu_base_ : gpu_bytes_;
+        if (request.memory_node < remote_regions_.size() && request.bytes != 0 &&
+            request.destination_address >= gpu_base_ && destination_offset <= gpu_bytes_ &&
+            request.bytes <= gpu_bytes_ - destination_offset) {
+          statuses[index] = 1;
+        }
+      }
+    }
+  }
+
+private:
+  Context& channel_context_;
+  ClientConnectionManager& connection_manager_;
+  const MemoryRegionTokens& remote_regions_;
+  LocalMemoryRegion gpu_region_;
+  u64 gpu_base_{};
+  size_t gpu_bytes_{};
+};
+
 }  // namespace
 
 std::unique_ptr<RemoteFetchBackend> create_remote_fetch_backend(
@@ -256,6 +317,11 @@ std::unique_ptr<RemoteFetchBackend> create_remote_fetch_backend(
 #endif
   }
   throw std::runtime_error("unknown remote fetch backend");
+}
+
+std::unique_ptr<RemoteFetchBackend> create_control_qp_bootstrap_backend(
+    const RemoteFetchBackendContext& context) {
+  return std::make_unique<ControlQpBootstrapBackend>(context);
 }
 
 }  // namespace gpu_search

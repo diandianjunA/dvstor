@@ -762,19 +762,25 @@ public:
          << config.rdma_read_max_inflight_wrs << std::endl;
       os << std::setw(width) << "Query Batch Size: " << config.query_batch_size << std::endl;
       os << std::setw(width) << "Use RaBitQ: " << (config.use_rabitq ? "true" : "false") << std::endl;
-      os << std::setw(width) << "RaBitQ mode: cpu_gate" << std::endl;
-      os << std::setw(width) << "RaBitQ gate width: " << config.rabitq_gate_width << std::endl;
-      os << std::setw(width) << "RaBitQ gate max width: " << config.rabitq_gate_max_width << std::endl;
-      os << std::setw(width) << "RaBitQ gate margin: " << config.rabitq_gate_margin << std::endl;
-      os << std::setw(width) << "RaBitQ dynamic budget MB: " << config.rabitq_dynamic_budget_mb << std::endl;
-      os << std::setw(width) << "RaBitQ coalesce target: " << config.rabitq_coalesce_target << std::endl;
-      os << std::setw(width) << "RaBitQ coalesce min: " << config.rabitq_coalesce_min << std::endl;
-      os << std::setw(width) << "RaBitQ coalesce wait(us): " << config.rabitq_coalesce_wait_us << std::endl;
-      os << std::setw(width) << "RaBitQ warmup exact expansions: "
-         << config.rabitq_warmup_exact_expansions << std::endl;
-      os << std::setw(width) << "RaBitQ audit period: " << config.rabitq_audit_period << std::endl;
-      os << std::setw(width) << "RaBitQ strict recall: "
-         << (config.rabitq_strict_recall ? "true" : "false") << std::endl;
+      if (config.use_gpu_persistent_search()) {
+        os << std::setw(width) << "RaBitQ mode: gpu_resident_scoring" << std::endl;
+        os << std::setw(width) << "GPU exact rerank width: "
+           << std::max(config.k, config.rabitq_gate_max_width) << std::endl;
+      } else {
+        os << std::setw(width) << "RaBitQ mode: cpu_gate" << std::endl;
+        os << std::setw(width) << "RaBitQ gate width: " << config.rabitq_gate_width << std::endl;
+        os << std::setw(width) << "RaBitQ gate max width: " << config.rabitq_gate_max_width << std::endl;
+        os << std::setw(width) << "RaBitQ gate margin: " << config.rabitq_gate_margin << std::endl;
+        os << std::setw(width) << "RaBitQ dynamic budget MB: " << config.rabitq_dynamic_budget_mb << std::endl;
+        os << std::setw(width) << "RaBitQ coalesce target: " << config.rabitq_coalesce_target << std::endl;
+        os << std::setw(width) << "RaBitQ coalesce min: " << config.rabitq_coalesce_min << std::endl;
+        os << std::setw(width) << "RaBitQ coalesce wait(us): " << config.rabitq_coalesce_wait_us << std::endl;
+        os << std::setw(width) << "RaBitQ warmup exact expansions: "
+           << config.rabitq_warmup_exact_expansions << std::endl;
+        os << std::setw(width) << "RaBitQ audit period: " << config.rabitq_audit_period << std::endl;
+        os << std::setw(width) << "RaBitQ strict recall: "
+           << (config.rabitq_strict_recall ? "true" : "false") << std::endl;
+      }
       os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
     } else if (config.is_server && !config.server_index_file.empty()) {
       os << std::left << std::setfill(' ');

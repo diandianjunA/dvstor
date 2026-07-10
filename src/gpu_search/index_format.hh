@@ -119,6 +119,11 @@ struct View {
   std::vector<u32> entry_points;
 };
 
+struct SynthesisOptions {
+  u32 entry_points{};
+  u64 seed{1234};
+};
+
 u64 align_up(u64 value, u64 alignment);
 u64 checksum64(const byte_t* data, size_t bytes);
 u64 checksum64_update(u64 state, const byte_t* data, size_t bytes);
@@ -130,6 +135,11 @@ bool write_file(const std::filesystem::path& path, const View& view,
                 std::string* error = nullptr);
 bool read_file(const std::filesystem::path& path, View& view,
                std::string* error = nullptr);
+bool synthesize_distributed_view(
+  const std::filesystem::path& index_prefix, View& view,
+  const SynthesisOptions& options = {},
+  bool* used_anchor_entry_points = nullptr,
+  std::string* error = nullptr);
 
 bool validate_code_header(const CodeHeader& header, std::string* error = nullptr);
 bool read_code_header(const std::filesystem::path& path, CodeHeader& header,

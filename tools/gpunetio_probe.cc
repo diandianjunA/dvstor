@@ -15,13 +15,16 @@
 
 #include <infiniband/mlx5dv.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 
@@ -39,7 +42,9 @@ void check_doca(const char* operation, doca_error_t status) {
 
 struct ProbeResources {
   ~ProbeResources() {
-    if (memory_region != nullptr) ibv_dereg_mr(memory_region);
+    for (ibv_mr* memory_region : memory_regions) {
+      if (memory_region != nullptr) ibv_dereg_mr(memory_region);
+    }
     if (gpu_umem != nullptr) doca_umem_destroy(gpu_umem);
     if (dmabuf_fd >= 0) close(dmabuf_fd);
     if (gpu_memory != nullptr && gpu != nullptr) doca_gpu_mem_free(gpu, gpu_memory);
@@ -61,7 +66,7 @@ struct ProbeResources {
   void* gpu_memory{};
   doca_umem* gpu_umem{};
   int dmabuf_fd{-1};
-  ibv_mr* memory_region{};
+  std::vector<ibv_mr*> memory_regions{};
 };
 
 doca_devinfo* find_device(ProbeResources& resources, const std::string& requested_name,
@@ -90,6 +95,20 @@ int main(int argc, char** argv) {
   try {
     const int gpu_index = argc > 1 ? std::stoi(argv[1]) : 0;
     const std::string requested_ibdev = argc > 2 ? argv[2] : "";
+    const size_t allocation_bytes = argc > 3
+      ? static_cast<size_t>(std::stoull(argv[3])) : 64 * 1024;
+    const size_t registration_bytes = argc > 4
+      ? static_cast<size_t>(std::stoull(argv[4])) : allocation_bytes;
+    const std::string registration_mode = argc > 5 ? argv[5] : "dmabuf";
+    if (allocation_bytes == 0 || allocation_bytes > std::numeric_limits<size_t>::max() - 65535) {
+      throw std::invalid_argument("allocation size must be a positive byte count");
+    }
+    if (registration_bytes == 0 || registration_bytes % (64 * 1024) != 0) {
+      throw std::invalid_argument("registration chunk must be a positive multiple of 65536 bytes");
+    }
+    if (registration_mode != "dmabuf" && registration_mode != "peer") {
+      throw std::invalid_argument("registration mode must be dmabuf or peer");
+    }
     ProbeResources resources;
 
     check_cuda("cudaSetDevice", cudaSetDevice(gpu_index));
@@ -121,16 +140,19 @@ int main(int argc, char** argv) {
                                          &resources.device));
     check_doca("doca_gpu_create", doca_gpu_create(gpu_bus_id, &resources.gpu));
 
-    constexpr size_t allocation_bytes = 64 * 1024;
+    std::cout << "Registering " << allocation_bytes << " GPU bytes\n";
     check_doca("doca_gpu_mem_alloc",
-               doca_gpu_mem_alloc(resources.gpu, allocation_bytes, allocation_bytes,
+               doca_gpu_mem_alloc(resources.gpu, allocation_bytes, 64 * 1024,
                                   DOCA_GPU_MEM_TYPE_GPU, &resources.gpu_memory, nullptr));
-    check_doca("doca_gpu_dmabuf_fd",
-               doca_gpu_dmabuf_fd(resources.gpu, resources.gpu_memory,
-                                  allocation_bytes, &resources.dmabuf_fd));
+    if (registration_mode == "dmabuf") {
+      check_doca("doca_gpu_dmabuf_fd",
+                 doca_gpu_dmabuf_fd(resources.gpu, resources.gpu_memory,
+                                    allocation_bytes, &resources.dmabuf_fd));
+    }
     check_doca("doca_umem_gpu_create",
                doca_umem_gpu_create(resources.gpu, resources.device,
-                                    resources.gpu_memory, allocation_bytes,
+                                    resources.gpu_memory,
+                                    std::min<size_t>(allocation_bytes, 64 * 1024),
                                     DOCA_ACCESS_FLAG_LOCAL_READ_WRITE,
                                     &resources.gpu_umem));
     check_doca("doca_umem_destroy", doca_umem_destroy(resources.gpu_umem));
@@ -140,12 +162,22 @@ int main(int argc, char** argv) {
     if (verbs_pd == nullptr) {
       throw std::runtime_error("doca_verbs_bridge_verbs_pd_get_ibv_pd returned null");
     }
-    resources.memory_region = mlx5dv_reg_dmabuf_mr(
-      verbs_pd, 0, allocation_bytes, 0, resources.dmabuf_fd,
-      IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE, 0);
-    if (resources.memory_region == nullptr) {
-      throw std::runtime_error(std::string("mlx5dv_reg_dmabuf_mr: ") +
-                               std::strerror(errno));
+    for (size_t offset = 0; offset < allocation_bytes; offset += registration_bytes) {
+      const size_t bytes = std::min(registration_bytes, allocation_bytes - offset);
+      const int access = IBV_ACCESS_LOCAL_WRITE |
+        IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+      ibv_mr* memory_region = registration_mode == "dmabuf"
+        ? mlx5dv_reg_dmabuf_mr(
+            verbs_pd, offset, bytes, offset, resources.dmabuf_fd, access, 0)
+        : ibv_reg_mr(
+            verbs_pd, static_cast<unsigned char*>(resources.gpu_memory) + offset,
+            bytes, access);
+      if (memory_region == nullptr) {
+        throw std::runtime_error(
+          registration_mode + " MR registration(offset=" + std::to_string(offset) +
+          ", bytes=" + std::to_string(bytes) + "): " + std::strerror(errno));
+      }
+      resources.memory_regions.push_back(memory_region);
     }
 
     std::cout << "GPUNetIO probe passed\n"
@@ -153,10 +185,13 @@ int main(int argc, char** argv) {
               << "  RDMA device: " << ibdev_name << "\n"
               << "  GPU external datapath: supported\n"
               << "  RC QP: supported\n"
-              << "  GPU DMA-BUF: supported\n"
               << "  DOCA GPU UMEM registration: passed\n"
-              << "  mlx5 DMA-BUF MR registration: passed\n"
-              << "  local mkey: " << resources.memory_region->lkey << '\n';
+              << "  mlx5 GPU MR registration: passed\n"
+              << "  registration mode: " << registration_mode << '\n'
+              << "  registered bytes: " << allocation_bytes << '\n'
+              << "  registration chunk bytes: " << registration_bytes << '\n'
+              << "  memory regions: " << resources.memory_regions.size() << '\n'
+              << "  first local mkey: " << resources.memory_regions.front()->lkey << '\n';
     return EXIT_SUCCESS;
   } catch (const std::exception& error) {
     std::cerr << "GPUNetIO probe failed: " << error.what() << '\n';
