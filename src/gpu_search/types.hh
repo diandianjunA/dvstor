@@ -89,6 +89,7 @@ struct CompletionDescriptor {
   u32 remote_pages{};
   u32 exact_vectors{};
   u32 cache_hits{};
+  u32 exact_cache_hits{};
 };
 
 enum class FetchKind : u8 {
@@ -132,6 +133,7 @@ struct TelemetrySnapshot {
   u64 graph_page_requests{};
   u64 graph_page_cache_hits{};
   u64 exact_vector_reads{};
+  u64 exact_vector_cache_hits{};
   u64 delta_queries{};
   u64 mutations_published{};
   u64 delta_compactions{};
@@ -160,6 +162,7 @@ public:
   std::atomic<u64> graph_page_requests{0};
   std::atomic<u64> graph_page_cache_hits{0};
   std::atomic<u64> exact_vector_reads{0};
+  std::atomic<u64> exact_vector_cache_hits{0};
   std::atomic<u64> delta_queries{0};
   std::atomic<u64> mutations_published{0};
   std::atomic<u64> delta_compactions{0};

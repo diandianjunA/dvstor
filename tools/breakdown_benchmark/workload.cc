@@ -852,6 +852,13 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
             static_cast<double>(telemetry.graph_page_requests +
                                 telemetry.graph_page_cache_hits)},
       {"exact_vector_reads", telemetry.exact_vector_reads},
+      {"exact_vector_cache_hits", telemetry.exact_vector_cache_hits},
+      {"exact_vector_cache_hit_ratio",
+       telemetry.exact_vector_reads + telemetry.exact_vector_cache_hits == 0
+         ? 0.0
+         : static_cast<double>(telemetry.exact_vector_cache_hits) /
+             static_cast<double>(telemetry.exact_vector_reads +
+                                 telemetry.exact_vector_cache_hits)},
       {"delta_queries", telemetry.delta_queries},
       {"mutations_published", telemetry.mutations_published},
       {"delta_compactions", telemetry.delta_compactions},

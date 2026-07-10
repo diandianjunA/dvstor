@@ -15,7 +15,8 @@ gpu_search::memory_budget::Request sift_request(u64 nodes) {
     .nodes = nodes,
     .max_delta_vectors = nodes,
     .usable_bytes = gib(36),
-    .requested_cache_bytes = gib(7),
+    .requested_cache_bytes = gib(3),
+    .requested_exact_cache_bytes = gib(4),
     .delta_budget_bytes = gib(2),
     .dim = 128,
     .code_bits = 128,
@@ -25,10 +26,12 @@ gpu_search::memory_budget::Request sift_request(u64 nodes) {
     .beam_width = 64,
     .graph_degree = 96,
     .exact_width = 256,
+    .exact_record_bytes = 136,
     .anchor_count = 4096 * 5,
     .shard_count = 5,
     .entry_point_count = 256,
     .cache_ways = 4,
+    .exact_cache_ways = 4,
   };
 }
 
@@ -39,16 +42,19 @@ int main() {
   assert(sift100m.fits);
   assert(sift100m.code_bytes == 2'400'000'000ULL);
   assert(sift100m.delta_bytes <= gib(2));
-  assert(sift100m.cache_total_bytes <= gib(7));
+  assert(sift100m.cache_total_bytes <= gib(3));
+  assert(sift100m.exact_cache_total_bytes <= gib(4));
   assert(sift100m.explicit_bytes <= gib(36));
 
   const auto sift1b = gpu_search::memory_budget::estimate(sift_request(1'000'000'000));
   assert(sift1b.fits);
   assert(sift1b.code_bytes == 24'000'000'000ULL);
   assert(sift1b.delta_bytes <= gib(2));
-  assert(sift1b.cache_total_bytes <= gib(7));
+  assert(sift1b.cache_total_bytes <= gib(3));
+  assert(sift1b.exact_cache_total_bytes <= gib(4));
   assert(sift1b.explicit_bytes <= gib(36));
   assert(sift1b.cache_slots > 1'000'000);
+  assert(sift1b.exact_cache_slots > 1'000'000);
 
   const u64 compute_local_files = sizeof(gpu_search::format::Header) +
     5 * sizeof(gpu_search::format::ShardRegion) + 128 * sizeof(f32) +

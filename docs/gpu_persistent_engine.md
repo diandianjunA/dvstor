@@ -10,7 +10,9 @@ node does not keep a host copy of this array.
 For SIFT1B the configured budget is:
 
 - RaBitQ base codes: 24,000,000,000 bytes (22.35 GiB).
-- Four-way adjacency cache: at most 7 GiB including tags and replacement state.
+- Four-way adjacency cache: at most 3 GiB including tags and replacement state.
+- Four-way immutable exact-vector cache: at most 4 GiB including IDs, tags,
+  reader pins, and replacement state.
 - Dynamic index: at most 2 GiB including vectors and sparse hash tables.
 - Query workspaces, anchors, and metadata: charged by the startup budget model.
 - Explicit engine allocations: at most 36 GiB; 4 GiB remains reserved, so the
@@ -91,11 +93,18 @@ and is much cheaper than Vamana construction or Metis partitioning.
 The storage stream consumes 24 bytes per SIFT vector across the storage nodes;
 it consumes no compute-node disk space and is not mirrored in compute host
 memory. The query backend can be `gpunetio`, `verbs_proxy`, or `local`. GPUNetIO
-owns the steady-state query QPs. Bootstrap and automatic failover use one
-equally sized pool of dedicated CPU-posted GPUDirect Verbs QPs rather than
-sharing a control QP. A bounded GPU CQ poll disables the direct path after an
-error or timeout, after which graph and exact-vector reads continue through the
-fallback pool without copying payloads through host memory.
+owns the steady-state query QPs. Bootstrap uses one equally sized pool of
+dedicated CPU-posted GPUDirect Verbs QPs rather than sharing a control QP. A
+bounded GPU CQ poll fails the query after a direct-path error or timeout; the
+runtime never reports the much slower bootstrap path as GPUNetIO performance.
+Each exported QP owns the non-cached external UAR required by GPU doorbells.
+Startup performs an actual GPU-issued RDMA Read on every direct QP and aborts
+before code streaming unless all probes complete. Steady-state reads use DOCA's
+automatic dump policy so architectures that require a post-read visibility WQE
+cannot expose stale graph or vector bytes to the search kernel.
+After streaming, the runtime also compares the first, middle, and last RaBitQ
+entry of every shard against the authoritative node layout to detect ordinal or
+offset mismatches before accepting queries.
 The benchmark JSON records the lifetime counter
 `gpu_persistent.direct_path_failures`; a GPUNetIO performance result is valid
 only when this value is zero.
@@ -131,12 +140,17 @@ For each admitted query, the CTA:
    checksum failures fail the query instead of silently dropping edges.
 5. Decodes each five-byte remote pointer into a base ordinal or sparse dynamic
    handle and evaluates its full RaBitQ entry only to form a candidate gate.
-6. During warmup and periodic audit rounds it exactifies the complete frontier;
-   otherwise it exactifies the configured RaBitQ gate, including the uncertainty
-   margin. Only exact L2 distances are inserted into and used to order the beam.
-7. Probes the nearest dynamic anchor buckets and exactifies the selected resident
+6. During warmup and periodic audit expansions it exactifies that expansion's
+   complete frontier; otherwise it exactifies the per-expansion RaBitQ gate,
+   including the uncertainty margin. Prefetching four graph records no longer
+   multiplies one audit into four full exact-vector batches.
+7. Resolves immutable base IDs and vectors through a four-way GPU cache. Misses
+   are deduplicated and fetched directly by GPUNetIO; readers pin a line while
+   computing exact L2. Updates remain in the versioned GPU delta, so cached base
+   payloads never require in-place mutation.
+8. Probes the nearest dynamic anchor buckets and exactifies the selected resident
    delta vectors before beam insertion.
-8. Carries the ID and exact distance obtained by the candidate fetch alongside
+9. Carries the ID and exact distance obtained by the candidate fetch alongside
    each beam handle, so final sorting performs no duplicate RDMA read. Dynamic
    finalists use their resident ID and exact vector in the same beam format.
 
@@ -196,7 +210,7 @@ RaBitQ variants, so candidate coverage and final recall must both be reported.
 
 Restart every storage process after upgrading this engine. The GPUNetIO profile
 reserves one configured QP pool for GPU-issued reads and a second equal pool for
-bounded Verbs failover; an old storage process waits for a different QP count
+CPU-posted bootstrap; an old storage process waits for a different QP count
 and cannot complete the startup handshake.
 
 Check local DOCA and GPU-memory registration first:

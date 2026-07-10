@@ -92,6 +92,7 @@ __device__ inline void set_rdma_debug(uint64_t* debug_values,
   debug_values[13] = reinterpret_cast<uint64_t>(local_addr) - local_iova_base;
 }
 
+template <enum doca_gpu_dev_verbs_resource_sharing_mode sharing_mode>
 __device__ inline int poll_cq_at_with_timeout(struct doca_gpu_dev_verbs_cq* cq,
                                               const uint64_t ticket,
                                               uint64_t* cqe_debug) {
@@ -104,19 +105,15 @@ __device__ inline int poll_cq_at_with_timeout(struct doca_gpu_dev_verbs_cq* cq,
   uint8_t opown = 0;
   for (uint64_t spins = 0; spins < kPollSpinLimit; ++spins) {
     curr_cons_index =
-      doca_gpu_dev_verbs_load_relaxed<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE>(&cq->cqe_ci);
+      doca_gpu_dev_verbs_load_relaxed<sharing_mode>(&cq->cqe_ci);
     opown = doca_gpu_dev_verbs_load_relaxed_sys_global(reinterpret_cast<uint8_t*>(&cqe64->op_own));
     if (!((curr_cons_index <= ticket) && ((opown & MLX5_CQE_OWNER_MASK) ^ !!(ticket & cqe_num)))) {
       const uint8_t opcode = opown >> DOCA_GPUNETIO_VERBS_MLX5_CQE_OPCODE_SHIFT;
       const int status = (opcode == MLX5_CQE_REQ_ERR) * -EIO;
       if (status == 0) {
         doca_gpu_dev_verbs_fence_acquire<DOCA_GPUNETIO_VERBS_SYNC_SCOPE_SYS>();
-        doca_gpu_dev_verbs_atomic_max<uint64_t, DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE>(
+        doca_gpu_dev_verbs_atomic_max<uint64_t, sharing_mode>(
           &cq->cqe_ci, ticket + 1);
-        const uint32_t cq_ci = static_cast<uint32_t>((ticket + 1) & DOCA_GPUNETIO_VERBS_CQE_CI_MASK);
-        asm volatile("st.release.gpu.global.L1::no_allocate.b32 [%0], %1;"
-                     :
-                     : "l"(cq->dbrec), "r"(doca_gpu_dev_verbs_bswap32(cq_ci)));
       }
       return status;
     }
@@ -163,11 +160,12 @@ __device__ inline int gpudirect_get(void* qp_handle,
     .key = local_mkey,
   };
 
-  doca_gpu_dev_verbs_get<DOCA_GPUNETIO_VERBS_NODUMP,
+  doca_gpu_dev_verbs_get<DOCA_GPUNETIO_VERBS_DUMP_AUTO,
                          DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE,
                          DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_DB>(qp, raddr, laddr, size, daddr, &ticket);
   auto* cq = doca_gpu_dev_verbs_qp_get_cq_sq(qp);
-  const int status = poll_cq_at_with_timeout(cq, ticket, cqe_debug);
+  const int status = poll_cq_at_with_timeout<
+    DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE>(cq, ticket, cqe_debug);
   if (status != 0 && status != kPollTimeoutStatus && cqe_debug != nullptr) {
     auto* cqe_base = reinterpret_cast<struct mlx5_cqe64*>(cq->cqe_daddr);
     auto* err_cqe = reinterpret_cast<struct mlx5_err_cqe_ex*>(&cqe_base[ticket & (cq->cqe_num - 1)]);
@@ -179,6 +177,43 @@ __device__ inline int gpudirect_get(void* qp_handle,
     cqe_debug[1] = (static_cast<uint64_t>(err_cqe->wqe_counter) << 32) | err_cqe->s_wqe_opcode_qpn;
   }
   return status;
+}
+
+__global__ void gpunetio_read_probe_kernel(GpuNetioReadProbeParams params) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  if (params.remote_region_count == 0 || params.qp_array == nullptr ||
+      params.qp_index >= params.qp_count ||
+      params.remote_region >= params.remote_region_count ||
+      params.qp_array[params.qp_index] == nullptr) {
+    *params.status_code = -EINVAL;
+    return;
+  }
+  const GpuNetioRemoteMemoryRegion& region = params.remote_regions[params.remote_region];
+  params.debug_values[0] = region.address;
+  params.debug_values[1] = region.rkey;
+  params.debug_values[2] = reinterpret_cast<uint64_t>(params.destination) - params.local_iova_base;
+  params.debug_values[3] = params.local_mkey;
+  auto* qp = reinterpret_cast<doca_gpu_dev_verbs_qp*>(params.qp_array[params.qp_index]);
+  doca_gpu_dev_verbs_ticket_t ticket = 0;
+  doca_gpu_dev_verbs_get<DOCA_GPUNETIO_VERBS_DUMP_AUTO,
+                         DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU,
+                         DOCA_GPUNETIO_VERBS_NIC_HANDLER_GPU_SM_DB>(
+    qp,
+    doca_gpu_dev_verbs_addr{.addr = region.address, .key = region.rkey},
+    doca_gpu_dev_verbs_addr{
+      .addr = reinterpret_cast<uint64_t>(params.destination) - params.local_iova_base,
+      .key = params.local_mkey,
+    },
+    sizeof(uint64_t),
+    doca_gpu_dev_verbs_addr{
+      .addr = reinterpret_cast<uint64_t>(params.dump_ptr) - params.local_iova_base,
+      .key = params.local_mkey,
+    },
+    &ticket);
+  params.debug_values[4] = ticket;
+  *params.status_code = poll_cq_at_with_timeout<
+    DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_GPU>(
+      doca_gpu_dev_verbs_qp_get_cq_sq(qp), ticket, params.debug_values + 6);
 }
 
 __global__ void gpunetio_exact_search_kernel(GpuNetioExactSearchParams params) {
@@ -473,5 +508,8 @@ void launch_gpunetio_exact_search(cudaStream_t stream, const GpuNetioExactSearch
   gpunetio_exact_search_kernel<<<1, 1, 0, stream>>>(params);
 }
 
-}  // namespace gpu
+void launch_gpunetio_read_probe(cudaStream_t stream, const GpuNetioReadProbeParams& params) {
+  gpunetio_read_probe_kernel<<<1, 1, 0, stream>>>(params);
+}
 
+}  // namespace gpu

@@ -18,6 +18,7 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .graph_page_requests = graph_page_requests.load(std::memory_order_relaxed),
     .graph_page_cache_hits = graph_page_cache_hits.load(std::memory_order_relaxed),
     .exact_vector_reads = exact_vector_reads.load(std::memory_order_relaxed),
+    .exact_vector_cache_hits = exact_vector_cache_hits.load(std::memory_order_relaxed),
     .delta_queries = delta_queries.load(std::memory_order_relaxed),
     .mutations_published = mutations_published.load(std::memory_order_relaxed),
     .delta_compactions = delta_compactions.load(std::memory_order_relaxed),
@@ -39,9 +40,11 @@ void Telemetry::reset() {
   rdma_read_ops.store(0, std::memory_order_relaxed);
   rdma_read_bytes.store(0, std::memory_order_relaxed);
   rdma_merged_requests.store(0, std::memory_order_relaxed);
+  direct_path_failures.store(0, std::memory_order_relaxed);
   graph_page_requests.store(0, std::memory_order_relaxed);
   graph_page_cache_hits.store(0, std::memory_order_relaxed);
   exact_vector_reads.store(0, std::memory_order_relaxed);
+  exact_vector_cache_hits.store(0, std::memory_order_relaxed);
   delta_queries.store(0, std::memory_order_relaxed);
   mutations_published.store(0, std::memory_order_relaxed);
   delta_compactions.store(0, std::memory_order_relaxed);

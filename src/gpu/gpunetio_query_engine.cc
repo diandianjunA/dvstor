@@ -15,6 +15,7 @@
 #include <doca_gpunetio.h>
 #include <doca_mmap.h>
 #include <doca_rdma_bridge.h>
+#include <doca_uar.h>
 #include <doca_umem.h>
 #include <doca_verbs.h>
 #include <doca_verbs_bridge.h>
@@ -49,7 +50,6 @@ constexpr uint32_t kQueryQueueEntries = 1024;
 constexpr size_t kGpuPageSize = 64 * 1024;
 constexpr size_t kExternalQueueBytes = 128 * 1024;
 constexpr size_t kExternalDbrBytes = 4 * 1024;
-constexpr size_t kGpuQpUmemBytes = 64 * 1024;
 
 uint32_t bounded_search_visits(const configuration::IndexConfiguration& config) {
   const uint64_t expanded_nodes = std::max<uint32_t>(config.beam_width, 1);
@@ -295,10 +295,9 @@ struct GpuNetioQueryPool::Resource {
       doca_verbs_cq* send_cq = nullptr;
       doca_verbs_cq* recv_cq = nullptr;
       doca_verbs_qp* qp = nullptr;
+      doca_uar* external_uar = nullptr;
       doca_gpu_verbs_qp* gpu_qp = nullptr;
       doca_gpu_dev_verbs_qp* gpu_qp_dev = nullptr;
-      void* gpu_qp_umem = nullptr;
-      void* gpu_qp_umem_cpu = nullptr;
       void* send_cq_umem_buf = nullptr;
       void* recv_cq_umem_buf = nullptr;
       void* qp_wq_umem_buf = nullptr;
@@ -312,6 +311,8 @@ struct GpuNetioQueryPool::Resource {
       check_doca("doca_verbs_cq_attr_set_entry_size",
                  doca_verbs_cq_attr_set_entry_size(cq_attr, DOCA_VERBS_CQ_ENTRY_SIZE_64));
       check_doca("doca_verbs_cq_attr_set_cq_size", doca_verbs_cq_attr_set_cq_size(cq_attr, kQueryQueueEntries));
+      check_doca("doca_verbs_cq_attr_set_cq_overrun",
+                 doca_verbs_cq_attr_set_cq_overrun(cq_attr, 1));
       check_doca("doca_gpu_mem_alloc(send_cq_umem)",
                  doca_gpu_mem_alloc(
                    gpu, kExternalQueueBytes, kGpuPageSize, DOCA_GPU_MEM_TYPE_GPU, &send_cq_umem_buf, nullptr));
@@ -325,14 +326,20 @@ struct GpuNetioQueryPool::Resource {
                                       dev,
                                       send_cq_umem_buf,
                                       kExternalQueueBytes,
-                                      DOCA_ACCESS_FLAG_LOCAL_READ_WRITE,
+                                      DOCA_ACCESS_FLAG_LOCAL_READ_WRITE |
+                                        DOCA_ACCESS_FLAG_RDMA_WRITE |
+                                        DOCA_ACCESS_FLAG_RDMA_READ |
+                                        DOCA_ACCESS_FLAG_RDMA_ATOMIC,
                                       &send_cq_umem));
       check_doca("doca_umem_gpu_create(recv_cq)",
                  doca_umem_gpu_create(gpu,
                                       dev,
                                       recv_cq_umem_buf,
                                       kExternalQueueBytes,
-                                      DOCA_ACCESS_FLAG_LOCAL_READ_WRITE,
+                                      DOCA_ACCESS_FLAG_LOCAL_READ_WRITE |
+                                        DOCA_ACCESS_FLAG_RDMA_WRITE |
+                                        DOCA_ACCESS_FLAG_RDMA_READ |
+                                        DOCA_ACCESS_FLAG_RDMA_ATOMIC,
                                       &recv_cq_umem));
       check_doca("doca_verbs_cq_attr_set_external_datapath_en",
                  doca_verbs_cq_attr_set_external_datapath_en(cq_attr, 1));
@@ -369,14 +376,20 @@ struct GpuNetioQueryPool::Resource {
                                       dev,
                                       qp_wq_umem_buf,
                                       kExternalQueueBytes,
-                                      DOCA_ACCESS_FLAG_LOCAL_READ_WRITE,
+                                      DOCA_ACCESS_FLAG_LOCAL_READ_WRITE |
+                                        DOCA_ACCESS_FLAG_RDMA_WRITE |
+                                        DOCA_ACCESS_FLAG_RDMA_READ |
+                                        DOCA_ACCESS_FLAG_RDMA_ATOMIC,
                                       &qp_wq_umem));
       check_doca("doca_umem_gpu_create(qp_dbr)",
                  doca_umem_gpu_create(gpu,
                                       dev,
                                       qp_dbr_umem_buf,
                                       kExternalDbrBytes,
-                                      DOCA_ACCESS_FLAG_LOCAL_READ_WRITE,
+                                      DOCA_ACCESS_FLAG_LOCAL_READ_WRITE |
+                                        DOCA_ACCESS_FLAG_RDMA_WRITE |
+                                        DOCA_ACCESS_FLAG_RDMA_READ |
+                                        DOCA_ACCESS_FLAG_RDMA_ATOMIC,
                                       &qp_dbr_umem));
       check_doca("doca_verbs_qp_init_attr_set_external_datapath_en",
                  doca_verbs_qp_init_attr_set_external_datapath_en(qp_init, 1));
@@ -384,16 +397,20 @@ struct GpuNetioQueryPool::Resource {
                  doca_verbs_qp_init_attr_set_external_umem(qp_init, qp_wq_umem, 0));
       check_doca("doca_verbs_qp_init_attr_set_external_dbr_umem",
                  doca_verbs_qp_init_attr_set_external_dbr_umem(qp_init, qp_dbr_umem, 0));
+      doca_error_t uar_status = doca_uar_create(
+        dev, DOCA_UAR_ALLOCATION_TYPE_NONCACHE_DEDICATED, &external_uar);
+      if (uar_status != DOCA_SUCCESS) {
+        uar_status = doca_uar_create(dev, DOCA_UAR_ALLOCATION_TYPE_NONCACHE, &external_uar);
+      }
+      check_doca("doca_uar_create(GPU doorbell)", uar_status);
+      check_doca("doca_verbs_qp_init_attr_set_external_uar",
+                 doca_verbs_qp_init_attr_set_external_uar(qp_init, external_uar));
       check_doca("doca_verbs_qp_create", doca_verbs_qp_create(verbs_context, qp_init, &qp));
       qp_modify_to_init(qp);
 
       send_cqs.push_back(send_cq);
       recv_cqs.push_back(recv_cq);
       qps.push_back(qp);
-      check_doca("doca_gpu_mem_alloc(qp_umem)",
-                 doca_gpu_mem_alloc(
-                   gpu, kGpuQpUmemBytes, kGpuPageSize, DOCA_GPU_MEM_TYPE_GPU_CPU, &gpu_qp_umem, &gpu_qp_umem_cpu));
-      (void)gpu_qp_umem_cpu;
       std::cerr << "[STATUS]: exporting GPUNetIO QP resource=" << resource_id
                 << " lane=" << lane
                 << " server=" << server << " qpn=" << doca_verbs_qp_get_qpn(qp)
@@ -404,7 +421,7 @@ struct GpuNetioQueryPool::Resource {
                                          dev,
                                          qp,
                                          nic_handler,
-                                         gpu_qp_umem,
+                                         qp_wq_umem_buf,
                                          send_cq,
                                          recv_cq,
                                          &gpu_qp));
@@ -422,9 +439,9 @@ struct GpuNetioQueryPool::Resource {
       qp_modify_to_rts(qp);
 
       gpu_qps.push_back(gpu_qp);
-      gpu_qp_umems.push_back(gpu_qp_umem);
       gpu_qp_devices_host.push_back(gpu_qp_dev);
       gpu_qp_cpu_proxy_enabled.push_back(cpu_proxy_enabled);
+      external_uars.push_back(external_uar);
       external_umems.push_back(send_cq_umem);
       external_umems.push_back(recv_cq_umem);
       external_umems.push_back(qp_wq_umem);
@@ -532,6 +549,57 @@ struct GpuNetioQueryPool::Resource {
                           cudaMemcpyHostToDevice));
 
     check_cuda("cudaStreamCreate", cudaStreamCreate(&stream));
+    if (persistent_data_bytes > 0) {
+      for (uint32_t qp_index = 0; qp_index < gpu_qp_devices_host.size(); ++qp_index) {
+        check_cuda("cudaMemset(GPUNetIO probe status)",
+                   cudaMemset(d_rdma_status_code, 0, sizeof(int)));
+        check_cuda("cudaMemset(GPUNetIO probe debug)",
+                   cudaMemset(d_debug_values, 0,
+                              kGpuNetioDebugValueCount * sizeof(uint64_t)));
+        launch_gpunetio_read_probe(stream, GpuNetioReadProbeParams{
+          .local_mkey = local_mkey_wqe,
+          .local_iova_base = local_iova_base,
+          .remote_regions = d_remote_regions,
+          .remote_region_count = remote_region_count,
+          .qp_array = d_qp_array,
+          .qp_count = static_cast<uint32_t>(gpu_qp_devices_host.size()),
+          .qp_index = qp_index,
+          .remote_region = qp_index % remote_region_count,
+          .destination = reinterpret_cast<unsigned char*>(d_medoid_ptr),
+          .dump_ptr = d_dump_ptr,
+          .status_code = d_rdma_status_code,
+          .debug_values = d_debug_values,
+        });
+        check_cuda("launch_gpunetio_read_probe", cudaGetLastError());
+        check_cuda("cudaStreamSynchronize(GPUNetIO probe)", cudaStreamSynchronize(stream));
+        int probe_status = 0;
+        uint64_t probe_debug[kGpuNetioDebugValueCount]{};
+        check_cuda("cudaMemcpy(GPUNetIO probe status)",
+                   cudaMemcpy(&probe_status, d_rdma_status_code,
+                              sizeof(probe_status), cudaMemcpyDeviceToHost));
+        check_cuda("cudaMemcpy(GPUNetIO probe debug)",
+                   cudaMemcpy(probe_debug, d_debug_values,
+                              sizeof(probe_debug), cudaMemcpyDeviceToHost));
+        if (probe_status != 0) {
+          throw std::runtime_error(
+            "GPUNetIO startup RDMA read probe failed: qp=" +
+            std::to_string(qp_index) +
+            " remote_region=" + std::to_string(qp_index % remote_region_count) +
+            " status=" + std::to_string(probe_status) +
+            " remote=" + hex_u64(probe_debug[0]) +
+            " rkey=" + std::to_string(probe_debug[1]) +
+            " local_iova=" + hex_u64(probe_debug[2]) +
+            " lkey=" + std::to_string(probe_debug[3]) +
+            " ticket=" + std::to_string(probe_debug[4]) +
+            " cqe_debug=" + hex_u64(probe_debug[6]) +
+            " cqe_ticket_index=" + hex_u64(probe_debug[7]) +
+            " cq_consumer=" + std::to_string(probe_debug[8]) +
+            " cq_opown=" + hex_u64(probe_debug[9]));
+        }
+      }
+      std::cerr << "[STATUS]: GPUNetIO startup RDMA read probe passed for "
+                << gpu_qp_devices_host.size() << " QPs\n";
+    }
   }
 
   ~Resource() {
@@ -558,14 +626,14 @@ struct GpuNetioQueryPool::Resource {
         doca_gpu_verbs_unexport_qp(gpu, gpu_qps[i]);
       }
     }
-    for (auto* gpu_qp_umem : gpu_qp_umems) {
-      if (gpu != nullptr && gpu_qp_umem != nullptr) {
-        doca_gpu_mem_free(gpu, gpu_qp_umem);
-      }
-    }
     for (auto* qp : qps) {
       if (qp != nullptr) {
         doca_verbs_qp_destroy(qp);
+      }
+    }
+    for (auto* uar : external_uars) {
+      if (uar != nullptr) {
+        doca_uar_destroy(uar);
       }
     }
     for (auto* cq : send_cqs) {
@@ -721,8 +789,8 @@ struct GpuNetioQueryPool::Resource {
   vec<doca_verbs_cq*> send_cqs{};
   vec<doca_verbs_cq*> recv_cqs{};
   vec<doca_verbs_qp*> qps{};
+  vec<doca_uar*> external_uars{};
   vec<doca_gpu_verbs_qp*> gpu_qps{};
-  vec<void*> gpu_qp_umems{};
   vec<uint8_t> gpu_qp_cpu_proxy_enabled{};
   vec<doca_umem*> external_umems{};
   vec<void*> external_umem_buffers{};

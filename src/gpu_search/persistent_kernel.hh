@@ -98,7 +98,6 @@ struct PersistentKernelParams {
   const DirectRemoteRegion* direct_regions{};
   void* const* direct_qps{};
   u8* direct_dump{};
-  u32* direct_qp_locks{};
   u32* direct_disabled{};
   i32* direct_error{};
   const DeviceDeltaRecord* delta_records{};
@@ -140,6 +139,14 @@ struct PersistentKernelParams {
   u8* beam_expanded{};
   u32* visited_hash{};
   u8* exact_records{};
+  u8* exact_cache{};
+  u32 exact_cache_stride{};
+  u32 exact_cache_sets{};
+  u32 exact_cache_ways{};
+  u32* exact_cache_keys{};
+  u32* exact_cache_states{};
+  u32* exact_cache_readers{};
+  u32* exact_cache_victims{};
   u32* result_ids{};
   f32* result_distances{};
 };

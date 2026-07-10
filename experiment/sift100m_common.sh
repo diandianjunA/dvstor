@@ -328,6 +328,8 @@ write_service_config() {
     if [[ -n "${GPU_MEMORY_RESERVE_GB:-}" ]]; then echo "gpu-memory-reserve-gb = ${GPU_MEMORY_RESERVE_GB}"; fi
     if [[ -n "${GPU_ADJACENCY_CACHE_MB:-}" ]]; then echo "gpu-adjacency-cache-mb = ${GPU_ADJACENCY_CACHE_MB}"; fi
     if [[ -n "${GPU_ADJACENCY_CACHE_WAYS:-}" ]]; then echo "gpu-adjacency-cache-ways = ${GPU_ADJACENCY_CACHE_WAYS}"; fi
+    if [[ -n "${GPU_EXACT_CACHE_MB:-}" ]]; then echo "gpu-exact-cache-mb = ${GPU_EXACT_CACHE_MB}"; fi
+    if [[ -n "${GPU_EXACT_CACHE_WAYS:-}" ]]; then echo "gpu-exact-cache-ways = ${GPU_EXACT_CACHE_WAYS}"; fi
     if [[ -n "${GPU_BOOTSTRAP_WINDOW_MB:-}" ]]; then echo "gpu-bootstrap-window-mb = ${GPU_BOOTSTRAP_WINDOW_MB}"; fi
     if [[ -n "${GPU_BOOTSTRAP_WINDOWS:-}" ]]; then echo "gpu-bootstrap-windows = ${GPU_BOOTSTRAP_WINDOWS}"; fi
     if [[ -n "${GPU_GRAPH_PREFETCH_DEPTH:-}" ]]; then echo "gpu-graph-prefetch-depth = ${GPU_GRAPH_PREFETCH_DEPTH}"; fi

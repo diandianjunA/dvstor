@@ -67,8 +67,10 @@ public:
   u32 query_batch_wait_us{20};
   u32 gpu_memory_limit_gb{40};
   u32 gpu_memory_reserve_gb{4};
-  u32 gpu_adjacency_cache_mb{7168};
+  u32 gpu_adjacency_cache_mb{3072};
   u32 gpu_adjacency_cache_ways{4};
+  u32 gpu_exact_cache_mb{4096};
+  u32 gpu_exact_cache_ways{4};
   u32 gpu_bootstrap_window_mb{64};
   u32 gpu_bootstrap_windows{2};
   u32 gpu_graph_prefetch_depth{4};
@@ -359,6 +361,10 @@ private:
       "Total adjacency-cache budget, including tags and replacement metadata.")(
       "gpu-adjacency-cache-ways", po::value<u32>(&gpu_adjacency_cache_ways)->default_value(gpu_adjacency_cache_ways),
       "Set associativity of the GPU adjacency cache; V4 requires four ways.")(
+      "gpu-exact-cache-mb", po::value<u32>(&gpu_exact_cache_mb)->default_value(gpu_exact_cache_mb),
+      "GPU cache budget for immutable base IDs and exact vectors.")(
+      "gpu-exact-cache-ways", po::value<u32>(&gpu_exact_cache_ways)->default_value(gpu_exact_cache_ways),
+      "Set associativity of the GPU exact-vector cache; V4 requires four ways.")(
       "gpu-bootstrap-window-mb", po::value<u32>(&gpu_bootstrap_window_mb)->default_value(gpu_bootstrap_window_mb),
       "Maximum RDMA read size while streaming RaBitQ codes into final GPU memory.")(
       "gpu-bootstrap-windows", po::value<u32>(&gpu_bootstrap_windows)->default_value(gpu_bootstrap_windows),
@@ -452,6 +458,7 @@ private:
          query_batch_target > query_batch_max || query_batch_max > 4096 ||
          gpu_memory_limit_gb == 0 || gpu_memory_reserve_gb >= gpu_memory_limit_gb ||
          gpu_adjacency_cache_mb == 0 || gpu_adjacency_cache_ways != 4 ||
+         gpu_exact_cache_mb == 0 || gpu_exact_cache_ways != 4 ||
          gpu_bootstrap_window_mb == 0 || gpu_bootstrap_windows == 0 ||
          gpu_bootstrap_windows > 16 || gpu_graph_prefetch_depth == 0 ||
          gpu_graph_prefetch_depth > 8 || gpu_delta_anchor_probes == 0 ||
@@ -712,7 +719,7 @@ public:
       os << std::setw(width) << "Search engine: " << config.search_engine << std::endl;
       if (config.use_gpu_persistent_search()) {
         os << std::setw(width) << "GPU RDMA backend: " << config.gpu_rdma_backend << std::endl;
-        os << std::setw(width) << "GPU RDMA direct/fallback QPs: "
+        os << std::setw(width) << "GPU RDMA direct/bootstrap QPs: "
            << config.gpu_rdma_qps << "/"
            << (config.gpu_rdma_backend == "gpunetio" ? config.gpu_rdma_qps : 0)
            << std::endl;
@@ -725,6 +732,8 @@ public:
            << config.gpu_memory_limit_gb << "/" << config.gpu_memory_reserve_gb << std::endl;
         os << std::setw(width) << "GPU adjacency cache(MB/ways): "
            << config.gpu_adjacency_cache_mb << "/" << config.gpu_adjacency_cache_ways << std::endl;
+        os << std::setw(width) << "GPU exact cache(MB/ways): "
+           << config.gpu_exact_cache_mb << "/" << config.gpu_exact_cache_ways << std::endl;
         os << std::setw(width) << "GPU graph prefetch depth: "
            << config.gpu_graph_prefetch_depth << std::endl;
         os << std::setw(width) << "GPU delta anchor probes: "
@@ -773,8 +782,8 @@ public:
         os << std::setw(width) << "GPU RaBitQ gate max/round: "
            << config.rabitq_gate_max_width *
                 std::max<u32>(1, config.gpu_graph_prefetch_depth) << std::endl;
-        os << std::setw(width) << "GPU exact final width: "
-           << std::max(config.k, config.rabitq_gate_max_width) << std::endl;
+        os << std::setw(width) << "GPU exact beam width: "
+           << config.beam_width << std::endl;
         os << std::setw(width) << "RaBitQ warmup exact expansions: "
            << config.rabitq_warmup_exact_expansions << std::endl;
         os << std::setw(width) << "RaBitQ audit period: "
