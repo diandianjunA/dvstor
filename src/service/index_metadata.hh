@@ -42,6 +42,7 @@ struct Metadata {
   str idmap_format{};
   str anchor_format{};
   u32 anchor_count_per_shard{};
+  str gpu_tiered_format{};
 };
 
 bool load_metadata(const filepath_t& index_prefix, Metadata& metadata, str* error_message = nullptr);

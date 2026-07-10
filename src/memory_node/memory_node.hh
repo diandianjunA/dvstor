@@ -411,6 +411,10 @@ private:
 
   const u32 num_clients_;
   u32 num_compute_threads_{};
+  bool gpu_persistent_{};
+  bool gpu_stream_layout_{};
+  u64 gpu_static_node_count_{};
+  u64 gpu_static_dynamic_base_{};
   u32 qp_pool_size_{1};
   const u32 storage_id_;
   const u32 num_storage_nodes_;

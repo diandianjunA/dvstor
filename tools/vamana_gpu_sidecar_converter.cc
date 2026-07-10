@@ -11,12 +11,11 @@ namespace {
 void usage(const char* program) {
   std::cerr
     << "Usage: " << program << " --index-prefix PATH [options]\n"
-    << "  --gpu-hot-degree N          GPU-resident neighbors per node (default 32)\n"
     << "  --gpu-entry-points N        Deterministic entry points (default 256)\n"
-    << "  --gpu-graph-page-bytes N    Cold graph page bytes (default 4096)\n"
     << "  --threads N                 Parallel shard workers; 0 = auto\n"
     << "  --seed N                    Entry-point sampling seed (default 1234)\n"
     << "  --rabitq-source MODE        auto, sidecar, or nodes (default auto)\n"
+    << "  --manifest-only             Build V4 manifest without local .dat shards\n"
     << "  --overwrite                 Replace existing GPU sidecars\n";
 }
 
@@ -61,14 +60,9 @@ int main(int argc, char** argv) {
       };
       if (argument == "--index-prefix") {
         options.index_prefix = require_value("--index-prefix");
-      } else if (argument == "--gpu-hot-degree") {
-        options.hot_degree = parse_u32("--gpu-hot-degree", require_value("--gpu-hot-degree"));
       } else if (argument == "--gpu-entry-points") {
         options.entry_points = parse_u32(
           "--gpu-entry-points", require_value("--gpu-entry-points"));
-      } else if (argument == "--gpu-graph-page-bytes") {
-        options.page_bytes = parse_u32(
-          "--gpu-graph-page-bytes", require_value("--gpu-graph-page-bytes"));
       } else if (argument == "--threads") {
         options.threads = parse_u32("--threads", require_value("--threads"));
       } else if (argument == "--seed") {
@@ -76,6 +70,8 @@ int main(int argc, char** argv) {
       } else if (argument == "--rabitq-source") {
         options.rabitq_source = tools::vamana_offline::parse_gpu_rabitq_source(
           require_value("--rabitq-source"));
+      } else if (argument == "--manifest-only") {
+        options.manifest_only = true;
       } else if (argument == "--overwrite") {
         options.overwrite = true;
       } else if (argument == "--help" || argument == "-h") {
@@ -94,15 +90,21 @@ int main(int argc, char** argv) {
     std::cout << "GPU sidecar conversion complete\n"
               << "  index: " << result.index_file << "\n"
               << "  nodes: " << result.node_count << "\n"
-              << "  graph edges: " << result.graph_edge_count << "\n"
-              << "  hot edges: " << result.hot_edge_count << "\n"
               << "  entry points: " << result.entry_point_count << "\n"
               << "  RaBitQ source: "
-              << (result.used_rabitq_sidecars ? "full sidecars" : "storage nodes") << "\n";
-    for (size_t shard = 0; shard < result.graph_page_files.size(); ++shard) {
-      std::cout << "  shard " << shard + 1 << ": " << result.graph_page_files[shard]
-                << " remote_offset=" << result.graph_page_offsets[shard]
-                << " bytes=" << result.graph_page_bytes[shard] << "\n";
+              << (options.manifest_only
+                    ? "storage-node startup materialization"
+                    : result.used_rabitq_sidecars ? "full sidecars" : "storage nodes")
+              << "\n";
+    for (size_t shard = 0; shard < result.code_remote_offsets.size(); ++shard) {
+      std::cout << "  shard " << shard + 1;
+      if (shard < result.code_files.size()) {
+        std::cout << ": " << result.code_files[shard];
+      } else {
+        std::cout << ": no persistent code file";
+      }
+      std::cout << " remote_offset=" << result.code_remote_offsets[shard]
+                << " bytes=" << result.code_bytes[shard] << "\n";
     }
     return EXIT_SUCCESS;
   } catch (const std::exception& error) {

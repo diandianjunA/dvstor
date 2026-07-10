@@ -1,5 +1,6 @@
 #include "memory_node/memory_node.hh"
 
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -39,6 +40,7 @@ MemoryNode::MemoryNode(Configuration& config)
 
   num_compute_threads_ = p.num_threads;
   qp_pool_size_ = p.qp_pool_size;
+  gpu_persistent_ = p.gpu_persistent;
   const u32 gpu_rdma_qps = p.gpu_persistent ? p.gpu_rdma_qps : 0;
   const filepath_t index_prefix = config.resolved_index_prefix();
   index_prefix_ = index_prefix;
@@ -52,6 +54,20 @@ MemoryNode::MemoryNode(Configuration& config)
     lib_assert(metadata.dim == config.dim, "index metadata dim mismatch on storage node");
     lib_assert(metadata.R == config.R, "index metadata R mismatch on storage node");
     lib_assert(metadata.num_memory_nodes == num_storage_nodes_, "index metadata storage-node count mismatch");
+    gpu_stream_layout_ = metadata.schema_version == 13 &&
+      metadata.node_layout == "rabitq" &&
+      metadata.storage_format == "vamana_compact_v1";
+    if (gpu_persistent_) {
+      lib_assert(gpu_stream_layout_,
+                 "gpu_persistent requires schema-13 compact RaBitQ storage shards");
+      lib_assert(storage_id_ < num_storage_nodes_, "invalid GPU storage shard id");
+      lib_assert(metadata.hot_graph_entry_counts.size() == num_storage_nodes_,
+                 "GPU storage metadata has invalid static shard counts");
+      lib_assert(metadata.hot_graph_dynamic_base_offsets.size() == num_storage_nodes_,
+                 "GPU storage metadata has invalid dynamic shard offsets");
+      gpu_static_node_count_ = metadata.hot_graph_entry_counts[storage_id_];
+      gpu_static_dynamic_base_ = metadata.hot_graph_dynamic_base_offsets[storage_id_];
+    }
     if (config.vector_data_type != "auto" && config.resolved_vector_dtype() != metadata.vector_dtype) {
       lib_failure("configured vector-data-type=" + config.vector_data_type +
                   " does not match index metadata vector_data_type=" + vector_dtype_name(metadata.vector_dtype));
@@ -358,42 +374,93 @@ std::pair<bool, str> MemoryNode::load_index_file(const str& path) {
   if (!file) {
     return {false, "read failed for " + path};
   }
+  if (!gpu_persistent_) return {true, ""};
+  if (!gpu_stream_layout_ || gpu_static_node_count_ == 0 ||
+      gpu_static_dynamic_base_ == 0) {
+    return {false, "GPU storage metadata cannot materialize the RaBitQ stream"};
+  }
+  const u64 persisted_free_pointer =
+    *reinterpret_cast<const u64*>(index_buffer_.get_full_buffer());
+  if (persisted_free_pointer != gpu_static_dynamic_base_) {
+    return {false, "GPU V4 requires a compacted static shard before startup"};
+  }
+  const u64 fixed_nodes_end = gpu_search::format::kNodeBaseOffset +
+    gpu_static_node_count_ * VamanaNode::total_size();
+  if (fixed_nodes_end > gpu_static_dynamic_base_ ||
+      gpu_static_dynamic_base_ > file_size) {
+    return {false, "GPU storage shard is truncated or has inconsistent static metadata"};
+  }
 
-  const filepath_t pages_path = index_path::gpu_graph_pages_for_shard(path);
-  if (std::filesystem::exists(pages_path)) {
-    std::ifstream pages{pages_path, std::ios::binary};
-    gpu_search::format::ShardPageFileHeader header;
-    pages.read(reinterpret_cast<char*>(&header), sizeof(header));
-    const u64 expected_checksum = gpu_search::format::checksum64(
-      reinterpret_cast<const byte_t*>(&header),
-      offsetof(gpu_search::format::ShardPageFileHeader, checksum));
-    if (!pages.good() || header.magic != gpu_search::format::kShardPagesMagic ||
-        header.version != gpu_search::format::kVersion ||
-        header.memory_node != storage_id_ || header.checksum != expected_checksum ||
-        header.remote_offset != gpu_search::format::align_up(file_size, header.page_bytes) ||
-        header.data_bytes % header.page_bytes != 0) {
-      return {false, "invalid GPU graph-page sidecar " + pages_path.string()};
+  const u64 remote_offset = gpu_search::format::align_up(gpu_static_dynamic_base_, 64);
+  const u64 payload_bytes = gpu_static_node_count_ * VamanaNode::rabitq_entry_size();
+  if (remote_offset == 0 || remote_offset > index_buffer_.buffer_size ||
+      payload_bytes > index_buffer_.buffer_size - remote_offset) {
+    return {false, "buffer too small for GPU V4 RaBitQ stream"};
+  }
+
+  const filepath_t code_path = index_path::gpu_code_for_shard(path);
+  if (std::filesystem::exists(code_path)) {
+    gpu_search::format::CodeHeader header;
+    str error;
+    if (!gpu_search::format::read_code_header(code_path, header, &error) ||
+        header.memory_node != storage_id_ ||
+        header.node_size != VamanaNode::total_size() ||
+        header.code_bits != VamanaNode::rabitq_code_bits() ||
+        header.entry_bytes != VamanaNode::rabitq_entry_size() ||
+        header.entry_count != gpu_static_node_count_ ||
+        header.remote_offset != remote_offset ||
+        header.payload_bytes != payload_bytes) {
+      return {false, error.empty() ? "incompatible GPU V4 code sidecar " + code_path.string()
+                                   : error};
     }
-    if (header.remote_offset > index_buffer_.buffer_size ||
-        header.data_bytes > index_buffer_.buffer_size - header.remote_offset) {
-      return {false, "buffer too small for GPU graph-page sidecar"};
+    std::ifstream codes{code_path, std::ios::binary};
+    codes.seekg(static_cast<std::streamoff>(sizeof(header)));
+    constexpr size_t chunk_bytes = 64ull << 20;
+    u64 checksum = gpu_search::format::checksum64_initial();
+    for (u64 offset = 0; offset < header.payload_bytes; offset += chunk_bytes) {
+      const size_t bytes = static_cast<size_t>(
+        std::min<u64>(chunk_bytes, header.payload_bytes - offset));
+      byte_t* destination = index_buffer_.get_full_buffer() + header.remote_offset + offset;
+      codes.read(reinterpret_cast<char*>(destination), static_cast<std::streamsize>(bytes));
+      if (static_cast<size_t>(codes.gcount()) != bytes) {
+        return {false, "short read from " + code_path.string()};
+      }
+      checksum = gpu_search::format::checksum64_update(checksum, destination, bytes);
     }
-    if (file_size < header.remote_offset + header.data_bytes) {
-      pages.read(reinterpret_cast<char*>(index_buffer_.get_full_buffer() + header.remote_offset),
-                 static_cast<std::streamsize>(header.data_bytes));
-      if (!pages.good()) {
-        return {false, "read failed for " + pages_path.string()};
+    if (checksum != header.payload_checksum) {
+      return {false, "GPU V4 code sidecar payload checksum mismatch: " + code_path.string()};
+    }
+    print_status("loaded GPU V4 codes (" + std::to_string(header.payload_bytes) +
+                 " Bytes) at remote offset " + std::to_string(header.remote_offset));
+  } else {
+    byte_t* destination = index_buffer_.get_full_buffer() + remote_offset;
+    const byte_t* nodes = index_buffer_.get_full_buffer() +
+      gpu_search::format::kNodeBaseOffset;
+    for (u64 slot = 0; slot < gpu_static_node_count_; ++slot) {
+      byte_t* entry = destination + slot * VamanaNode::rabitq_entry_size();
+      std::memcpy(entry,
+                  nodes + slot * VamanaNode::total_size() + VamanaNode::offset_rabitq_code(),
+                  VamanaNode::rabitq_entry_size());
+      f32 norm = 0.0f;
+      f32 correction = 0.0f;
+      std::memcpy(&norm, entry + gpu_search::format::rabitq_norm_offset(
+                    VamanaNode::rabitq_code_bits()), sizeof(norm));
+      std::memcpy(&correction, entry + gpu_search::format::rabitq_error_offset(
+                          VamanaNode::rabitq_code_bits()), sizeof(correction));
+      if (!std::isfinite(norm) || norm < 0.0f ||
+          !std::isfinite(correction) || correction <= 0.0f) {
+        return {false, "authoritative storage node contains an invalid RaBitQ entry"};
       }
     }
-    const u64 allocation_base = *reinterpret_cast<u64*>(index_buffer_.get_full_buffer());
-    const u64 region_end = header.remote_offset + header.data_bytes;
-    const u64 allocation_stride = VamanaNode::HAS_HOT_GRAPH
-      ? static_cast<u64>(VamanaNode::allocation_size()) : 8ULL;
-    *reinterpret_cast<u64*>(index_buffer_.get_full_buffer()) = allocation_base +
-      gpu_search::format::align_up(region_end - allocation_base, allocation_stride);
-    print_status("loaded GPU graph pages (" + std::to_string(header.data_bytes) +
-                 " Bytes) at remote offset " + std::to_string(header.remote_offset));
+    print_status("materialized GPU V4 codes from authoritative nodes (" +
+                 std::to_string(payload_bytes) + " Bytes) at remote offset " +
+                 std::to_string(remote_offset));
   }
+
+  const u64 allocation_stride = static_cast<u64>(VamanaNode::allocation_size());
+  const u64 region_end = remote_offset + payload_bytes;
+  *reinterpret_cast<u64*>(index_buffer_.get_full_buffer()) = gpu_static_dynamic_base_ +
+    gpu_search::format::align_up(region_end - gpu_static_dynamic_base_, allocation_stride);
 
   return {true, ""};
 }

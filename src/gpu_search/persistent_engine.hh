@@ -29,7 +29,8 @@ public:
   service::QueryResult search(VectorDType query_dtype, const byte_t* query_data, u32 k);
   service::QueryResult search(std::span<const element_t> query, u32 k);
 
-  bool publish_mutations(std::vector<DeltaMutation> mutations, u64 epoch);
+  bool publish_mutations(std::vector<DeltaMutation> mutations, u64 epoch,
+                         std::span<const u64> invalidated_graph_nodes = {});
   DeltaCoordinator& delta() { return delta_; }
   const DeltaCoordinator& delta() const { return delta_; }
   TelemetrySnapshot telemetry() const { return telemetry_.snapshot(); }

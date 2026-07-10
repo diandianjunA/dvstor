@@ -12,17 +12,19 @@ if [[ ! -f "$PROFILE_FILE" ]]; then
 fi
 source "$PROFILE_FILE"
 
-missing=0
+local_shards=1
 for ((node_id = 1; node_id <= SHARDS; ++node_id)); do
   shard="$(shard_file "$node_id")"
   if [[ ! -s "$shard" ]]; then
-    echo "missing old shard: $shard" >&2
-    missing=1
+    local_shards=0
+    break
   fi
 done
-if (( missing != 0 )); then
-  echo "The converter needs the original .dat shards because they contain the Vamana graph." >&2
-  exit 1
+manifest_only=0
+if (( local_shards == 0 )); then
+  manifest_only=1
+  echo "[convert] .dat shards are remote; building a compute-side V4 manifest only"
+  echo "[convert] storage nodes will materialize authoritative RaBitQ streams at startup"
 fi
 
 if [[ ! -x "$BUILD_DIR/vamana_gpu_sidecar_converter" ]]; then
@@ -34,11 +36,13 @@ mkdir -p "$(dirname "$INDEX_PREFIX")" "$LOG_DIR"
 LOG_FILE="${CONVERSION_LOG:-$LOG_DIR/convert_gpu_sidecars_$(date +%Y%m%d_%H%M%S).log}"
 cmd=("$BUILD_DIR/vamana_gpu_sidecar_converter"
   --index-prefix "$INDEX_PREFIX"
-  --gpu-hot-degree "${GPU_HOT_DEGREE:-32}"
   --gpu-entry-points "${GPU_ENTRY_POINTS:-256}"
-  --gpu-graph-page-bytes "${GPU_GRAPH_PAGE_BYTES:-4096}"
   --threads "${GPU_SIDECAR_THREADS:-$SHARDS}"
-  --rabitq-source "${GPU_SIDECAR_RABITQ_SOURCE:-auto}")
+  --rabitq-source "${GPU_SIDECAR_RABITQ_SOURCE:-nodes}")
+
+if (( manifest_only != 0 )); then
+  cmd+=(--manifest-only)
+fi
 
 if [[ "${GPU_SIDECAR_OVERWRITE:-0}" == "1" ||
       "${GPU_SIDECAR_OVERWRITE:-0}" == "true" ]]; then

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cassert>
 #include <array>
 #include <cmath>
@@ -11,6 +12,7 @@
 #include "nlohmann/json.hh"
 #include "remote_pointer.hh"
 #include "tools/vamana_offline/gpu_sidecar_converter.hh"
+#include "vamana/anchor_index.hh"
 #include "vamana/hot_graph.hh"
 #include "vamana/idmap.hh"
 #include "vamana/rabitq_cache.hh"
@@ -182,6 +184,8 @@ void create_fixture(const filepath_t& prefix,
     {"num_memory_nodes", kShardCount},
     {"dim", kDimension},
     {"R", kDegree},
+    {"medoid", {{"memory_node", placements[0].shard},
+                {"offset", placements[0].offset}}},
     {"node_layout", "rabitq"},
     {"storage_format", "vamana_compact_v1"},
     {"node_size", node_bytes},
@@ -208,41 +212,49 @@ void create_fixture(const filepath_t& prefix,
   assert(metadata_output.good());
 }
 
-vec<u32> read_cold_neighbors(const filepath_t& prefix,
-                             const gpu_search::format::View& view,
-                             u32 id) {
-  const auto& record = view.nodes[id];
-  const filepath_t path = index_path::gpu_graph_pages_file(
-    prefix, record.shard + 1, view.header.num_shards);
+vec<byte_t> read_code_payload(const filepath_t& path,
+                              gpu_search::format::CodeHeader& header) {
+  str error;
+  assert(gpu_search::format::read_code_header(path, header, &error));
   std::ifstream input(path, std::ios::binary);
-  gpu_search::format::ShardPageFileHeader file_header;
-  input.read(reinterpret_cast<char*>(&file_header), sizeof(file_header));
+  input.seekg(sizeof(header));
+  vec<byte_t> payload(header.payload_bytes);
+  input.read(reinterpret_cast<char*>(payload.data()), payload.size());
   assert(input.good());
-  const u64 page_offset = sizeof(file_header) +
-    record.cold_page_offset - file_header.remote_offset;
-  input.seekg(static_cast<std::streamoff>(page_offset));
-  gpu_search::format::PageHeader page_header;
-  input.read(reinterpret_cast<char*>(&page_header), sizeof(page_header));
-  assert(input.good());
-  assert(page_header.magic == 0x47504750);
-  assert(page_header.version == 1);
-  assert(page_header.node_count > 0);
-  const u64 file_offset = page_offset + record.cold_record_offset;
-  input.seekg(static_cast<std::streamoff>(file_offset));
-  gpu_search::format::PageNodeHeader node_header;
-  input.read(reinterpret_cast<char*>(&node_header), sizeof(node_header));
-  assert(input.good() && node_header.node_id == id);
-  const auto encoding = static_cast<gpu_search::format::IdEncoding>(
-    view.header.id_encoding_bytes);
-  vec<byte_t> encoded(node_header.degree * view.header.id_encoding_bytes);
-  input.read(reinterpret_cast<char*>(encoded.data()), encoded.size());
-  assert(input.good());
-  vec<u32> neighbors(node_header.degree);
-  for (u32 index = 0; index < neighbors.size(); ++index) {
-    neighbors[index] = gpu_search::format::decode_id(
-      encoded.data() + index * view.header.id_encoding_bytes, encoding);
+  assert(gpu_search::format::checksum64(payload.data(), payload.size()) ==
+         header.payload_checksum);
+  return payload;
+}
+
+void create_anchor_fixture(
+    const filepath_t& prefix, const vec<Placement>& placements,
+    const vec<std::array<byte_t, kDimension>>& vectors) {
+  std::ofstream output(index_path::anchor_file(prefix),
+                       std::ios::binary | std::ios::trunc);
+  vamana::anchor::Header header;
+  header.dim = kDimension;
+  header.shard_count = kShardCount;
+  header.vector_dtype = static_cast<u32>(VectorDType::uint8);
+  header.vector_bytes = kDimension;
+  header.anchors_per_shard = 1;
+  header.total_anchors = kShardCount;
+  output.write(reinterpret_cast<const char*>(&header), sizeof(header));
+  const std::array<u32, kShardCount> anchor_ids{1, 0};
+  const std::array<f32, kDimension> shard_centroid{};
+  for (u32 shard = 0; shard < kShardCount; ++shard) {
+    const u32 id = anchor_ids[shard];
+    const vamana::anchor::ShardHeader shard_header{.shard = shard, .anchor_count = 1};
+    const vamana::anchor::EntryHeader entry{
+      .rptr_raw = RemotePtr{placements[id].shard, placements[id].offset}.raw_address,
+      .id = id,
+    };
+    output.write(reinterpret_cast<const char*>(&shard_header), sizeof(shard_header));
+    output.write(reinterpret_cast<const char*>(shard_centroid.data()),
+                 sizeof(shard_centroid));
+    output.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
+    output.write(reinterpret_cast<const char*>(vectors[id].data()), vectors[id].size());
   }
-  return neighbors;
+  assert(output.good());
 }
 
 }
@@ -262,59 +274,61 @@ int main() {
 
   tools::vamana_offline::GpuSidecarConversionOptions options;
   options.index_prefix = prefix;
-  options.hot_degree = 2;
   options.entry_points = 3;
-  options.page_bytes = 4096;
   options.threads = 2;
   const auto result = tools::vamana_offline::convert_gpu_sidecars(options);
   assert(result.node_count == kNodeCount);
-  assert(result.graph_edge_count == 9);
-  assert(result.hot_edge_count == 8);
   assert(result.entry_point_count == 3);
   assert(result.used_rabitq_sidecars);
+  assert(result.code_files.size() == kShardCount);
 
   gpu_search::format::View view;
   str error;
   assert(gpu_search::format::read_file(result.index_file, view, &error));
-  assert(view.header.medoid_id == 0);
+  assert(view.header.medoid_ordinal == 2);
   assert(view.header.rabitq_code_bits == 8);
   assert(view.header.rabitq_entry_bytes == 16);
-  assert(view.hot_neighbors.size() == kNodeCount * options.hot_degree);
-  for (u32 id = 0; id < kNodeCount; ++id) {
-    const auto& record = view.nodes[id];
-    const RemotePtr expected_pointer{
-      placements[id].shard, placements[id].offset};
-    assert(record.remote_node == expected_pointer.raw_address);
-    assert(record.hot_neighbor_begin == id * options.hot_degree);
-    assert(record.hot_neighbor_count == std::min<size_t>(graph[id].size(), 2));
-    assert(record.cold_record_offset % alignof(gpu_search::format::PageNodeHeader) == 0);
-    for (u32 index = 0; index < record.hot_neighbor_count; ++index) {
-      assert(view.hot_neighbors[record.hot_neighbor_begin + index] == graph[id][index]);
+  assert(view.header.graph_entry_bytes == VamanaNode::hot_graph_entry_size());
+  assert(view.shards[0].ordinal_base == 0 && view.shards[0].node_count == 2);
+  assert(view.shards[1].ordinal_base == 2 && view.shards[1].node_count == 2);
+  const vec<vec<u32>> shard_ids{{1, 3}, {0, 2}};
+  vec<vec<byte_t>> sidecar_payloads;
+  for (u32 shard = 0; shard < kShardCount; ++shard) {
+    gpu_search::format::CodeHeader header;
+    sidecar_payloads.push_back(read_code_payload(result.code_files[shard], header));
+    assert(header.memory_node == shard);
+    assert(header.entry_count == 2);
+    assert(header.remote_offset == view.shards[shard].code_remote_offset);
+    for (u32 slot = 0; slot < 2; ++slot) {
+      const u32 id = shard_ids[shard][slot];
+      VamanaNode::RabitqCode code;
+      f32 expected_norm = 0.0f;
+      f32 expected_error = 0.0f;
+      VamanaNode::compute_rabitq_entry(vectors[id].data(), VectorDType::uint8,
+                                       code, expected_norm, expected_error);
+      const byte_t* entry = sidecar_payloads.back().data() + slot * header.entry_bytes;
+      assert(entry[0] == code[0]);
+      for (u32 padding = 1; padding < 4; ++padding) assert(entry[padding] == 0);
+      f32 actual_norm = 0.0f;
+      f32 actual_error = 0.0f;
+      std::memcpy(&actual_norm, entry + gpu_search::format::rabitq_norm_offset(8), sizeof(f32));
+      std::memcpy(&actual_error, entry + gpu_search::format::rabitq_error_offset(8), sizeof(f32));
+      assert(std::abs(actual_norm - expected_norm) < 1e-6f);
+      assert(std::abs(actual_error - expected_error) < 1e-6f);
     }
-    assert(read_cold_neighbors(prefix, view, id) == graph[id]);
-
-    VamanaNode::RabitqCode code;
-    f32 expected_norm = 0.0f;
-    f32 expected_error = 0.0f;
-    VamanaNode::compute_rabitq_entry(vectors[id].data(), VectorDType::uint8,
-                                     code, expected_norm, expected_error);
-    const byte_t* entry = view.rabitq_entries.data() +
-      id * view.header.rabitq_entry_bytes;
-    assert(entry[0] == code[0]);
-    for (u32 padding = 1; padding < 4; ++padding) assert(entry[padding] == 0);
-    f32 actual_norm = 0.0f;
-    f32 actual_error = 0.0f;
-    std::memcpy(&actual_norm, entry + gpu_search::format::rabitq_norm_offset(8), sizeof(f32));
-    std::memcpy(&actual_error, entry + gpu_search::format::rabitq_error_offset(8), sizeof(f32));
-    assert(std::abs(actual_norm - expected_norm) < 1e-6f);
-    assert(std::abs(actual_error - expected_error) < 1e-6f);
   }
+
+  u32 ordinal = 0;
+  assert(gpu_search::format::remote_to_ordinal(
+    view, RemotePtr{placements[0].shard, placements[0].offset}, ordinal));
+  assert(ordinal == 2);
 
   std::ifstream metadata_input(prefix.string() + ".meta.json");
   nlohmann::json metadata;
   metadata_input >> metadata;
-  assert(metadata.at("gpu_tiered_format") == "gpu_tiered_v3");
-  assert(metadata.at("gpu_tiered_source") == "legacy_sidecar_conversion_v1");
+  assert(metadata.at("gpu_tiered_format") == "gpu_tiered_v4");
+  assert(metadata.at("gpu_tiered_source") == "legacy_sidecar_conversion_v2");
+  assert(metadata.at("gpu_graph_source") == "storage_compact_plane");
   assert(metadata.at("gpu_tiered_rabitq_source") == "full_sidecars");
 
   bool rejected_existing_output = false;
@@ -340,10 +354,52 @@ int main() {
   options.rabitq_source = tools::vamana_offline::GpuRabitqSource::automatic;
   const auto node_result = tools::vamana_offline::convert_gpu_sidecars(options);
   assert(!node_result.used_rabitq_sidecars);
-  gpu_search::format::View node_view;
-  assert(gpu_search::format::read_file(node_result.index_file, node_view, &error));
-  assert(node_view.rabitq_entries == view.rabitq_entries);
-  assert(node_view.hot_neighbors == view.hot_neighbors);
+  for (u32 shard = 0; shard < kShardCount; ++shard) {
+    gpu_search::format::CodeHeader header;
+    const auto node_payload = read_code_payload(node_result.code_files[shard], header);
+    assert(node_payload == sidecar_payloads[shard]);
+  }
+
+  create_anchor_fixture(prefix, placements, vectors);
+  for (u32 shard = 0; shard < kShardCount; ++shard) {
+    std::filesystem::remove(index_path::shard_file(prefix, shard + 1, kShardCount));
+    std::filesystem::remove(index_path::gpu_code_file(prefix, shard + 1, kShardCount));
+  }
+  options.manifest_only = true;
+  const auto manifest_result = tools::vamana_offline::convert_gpu_sidecars(options);
+  assert(manifest_result.node_count == kNodeCount);
+  assert(manifest_result.entry_point_count == 3);
+  assert(manifest_result.code_files.empty());
+  assert(manifest_result.code_remote_offsets.size() == kShardCount);
+  assert(manifest_result.code_bytes.size() == kShardCount);
+  assert(std::filesystem::file_size(manifest_result.index_file) < 4096);
+  gpu_search::format::View manifest_view;
+  assert(gpu_search::format::read_file(manifest_result.index_file, manifest_view, &error));
+  assert(manifest_view.entry_points.front() == 2);
+  assert(std::find(manifest_view.entry_points.begin(), manifest_view.entry_points.end(), 0) !=
+         manifest_view.entry_points.end());
+  const u64 expected_graph_header = align64(16 + 2 * VamanaNode::total_size());
+  const u64 expected_graph_offset = align64(
+    expected_graph_header + sizeof(vamana::hot_graph::Header));
+  const u64 expected_dynamic_base = align64(
+    expected_graph_offset + 2 * VamanaNode::hot_graph_entry_size());
+  for (u32 shard = 0; shard < kShardCount; ++shard) {
+    assert(manifest_view.shards[shard].code_remote_offset == expected_dynamic_base);
+    assert(manifest_view.shards[shard].code_bytes ==
+           2 * VamanaNode::rabitq_entry_size());
+    assert(!std::filesystem::exists(
+      index_path::gpu_code_file(prefix, shard + 1, kShardCount)));
+  }
+  {
+    std::ifstream manifest_metadata_input(prefix.string() + ".meta.json");
+    nlohmann::json manifest_metadata;
+    manifest_metadata_input >> manifest_metadata;
+    assert(manifest_metadata.at("gpu_tiered_source") == "distributed_manifest_v1");
+    assert(manifest_metadata.at("gpu_code_materialization") == "storage_startup");
+    assert(manifest_metadata.at("gpu_tiered_rabitq_source") == "authoritative_nodes");
+    assert(manifest_metadata.at("gpu_entry_point_source") == "anchors_then_shard_hash");
+    assert(manifest_metadata.at("gpu_code_files").empty());
+  }
   std::filesystem::remove_all(directory);
   return 0;
 }

@@ -92,8 +92,9 @@ struct CompletionDescriptor {
 };
 
 enum class FetchKind : u8 {
-  graph_page,
-  vector,
+  graph_record,
+  node_record,
+  code,
 };
 
 struct FetchDescriptor {

@@ -65,13 +65,17 @@ public:
   u32 query_batch_target{64};
   u32 query_batch_max{256};
   u32 query_batch_wait_us{20};
-  u32 gpu_page_cache_mb{};
-  f64 gpu_page_cache_ratio{0.35};
-  u32 gpu_hot_degree{16};
-  u32 gpu_cold_expansions{8};
+  u32 gpu_memory_limit_gb{40};
+  u32 gpu_memory_reserve_gb{4};
+  u32 gpu_adjacency_cache_mb{7168};
+  u32 gpu_adjacency_cache_ways{4};
+  u32 gpu_bootstrap_window_mb{64};
+  u32 gpu_bootstrap_windows{2};
+  u32 gpu_graph_prefetch_depth{4};
+  u32 gpu_graph_cache_ttl_us{5000};
+  u32 gpu_delta_anchor_probes{32};
   u32 gpu_rdma_qps{4};
   u32 gpu_persistent_blocks_per_sm{4};
-  bool gpu_delta_signature_filter{};
   u32 update_visibility_us{10000};
   f64 delta_max_ratio{0.01};
   u32 delta_budget_mb{1024};
@@ -347,22 +351,29 @@ private:
       "Maximum active query slots owned by the persistent GPU scheduler.")(
       "query-batch-wait-us", po::value<u32>(&query_batch_wait_us)->default_value(query_batch_wait_us),
       "Maximum admission wait before launching an under-filled GPU query batch.")(
-      "gpu-page-cache-mb", po::value<u32>(&gpu_page_cache_mb)->default_value(gpu_page_cache_mb),
-      "GPU graph-page cache size in MiB. 0 derives it from --gpu-page-cache-ratio.")(
-      "gpu-page-cache-ratio", po::value<f64>(&gpu_page_cache_ratio)->default_value(gpu_page_cache_ratio),
-      "Fraction of currently free GPU memory reserved for graph pages when cache MiB is zero.")(
-      "gpu-hot-degree", po::value<u32>(&gpu_hot_degree)->default_value(gpu_hot_degree),
-      "Per-node navigation edges resident on the GPU.")(
-      "gpu-cold-expansions", po::value<u32>(&gpu_cold_expansions)->default_value(gpu_cold_expansions),
-      "Maximum expanded nodes per query whose full adjacency page may be fetched remotely.")(
+      "gpu-memory-limit-gb", po::value<u32>(&gpu_memory_limit_gb)->default_value(gpu_memory_limit_gb),
+      "Hard upper bound for explicit GPU query-engine allocations.")(
+      "gpu-memory-reserve-gb", po::value<u32>(&gpu_memory_reserve_gb)->default_value(gpu_memory_reserve_gb),
+      "GPU memory held back for CUDA and transport runtime state.")(
+      "gpu-adjacency-cache-mb", po::value<u32>(&gpu_adjacency_cache_mb)->default_value(gpu_adjacency_cache_mb),
+      "Total adjacency-cache budget, including tags and replacement metadata.")(
+      "gpu-adjacency-cache-ways", po::value<u32>(&gpu_adjacency_cache_ways)->default_value(gpu_adjacency_cache_ways),
+      "Set associativity of the GPU adjacency cache; V4 requires four ways.")(
+      "gpu-bootstrap-window-mb", po::value<u32>(&gpu_bootstrap_window_mb)->default_value(gpu_bootstrap_window_mb),
+      "Maximum RDMA read size while streaming RaBitQ codes into final GPU memory.")(
+      "gpu-bootstrap-windows", po::value<u32>(&gpu_bootstrap_windows)->default_value(gpu_bootstrap_windows),
+      "Concurrent RDMA code-stream windows during bootstrap.")(
+      "gpu-graph-prefetch-depth", po::value<u32>(&gpu_graph_prefetch_depth)->default_value(gpu_graph_prefetch_depth),
+      "Full adjacency records prefetched concurrently by each query context.")(
+      "gpu-graph-cache-ttl-us", po::value<u32>(&gpu_graph_cache_ttl_us)->default_value(gpu_graph_cache_ttl_us),
+      "Maximum cached graph-record age before refetch; 0 disables TTL expiry.")(
+      "gpu-delta-anchor-probes", po::value<u32>(&gpu_delta_anchor_probes)->default_value(gpu_delta_anchor_probes),
+      "Nearest anchor buckets probed for dynamic candidates.")(
       "gpu-rdma-qps", po::value<u32>(&gpu_rdma_qps)->default_value(gpu_rdma_qps),
       "GPU data-path QPs created per memory node.")(
       "gpu-persistent-blocks-per-sm",
       po::value<u32>(&gpu_persistent_blocks_per_sm)->default_value(gpu_persistent_blocks_per_sm),
       "Persistent query blocks launched per GPU SM to hide RDMA latency.")(
-      "gpu-delta-signature-filter",
-      po::bool_switch(&gpu_delta_signature_filter)->default_value(false),
-      "Enable the lossy 16-bit signature prefilter for very large GPU deltas.")(
       "update-visibility-us", po::value<u32>(&update_visibility_us)->default_value(update_visibility_us),
       "Maximum mutation micro-batch visibility delay for the GPU delta index.")(
       "delta-max-ratio", po::value<f64>(&delta_max_ratio)->default_value(delta_max_ratio),
@@ -439,9 +450,12 @@ private:
     if (search_engine == "gpu_persistent" &&
         (query_batch_min == 0 || query_batch_min > query_batch_target ||
          query_batch_target > query_batch_max || query_batch_max > 4096 ||
-         gpu_hot_degree == 0 || gpu_hot_degree > R || gpu_hot_degree > 32 ||
-         gpu_cold_expansions > beam_width ||
-         gpu_page_cache_ratio <= 0.0 || gpu_page_cache_ratio >= 0.9 ||
+         gpu_memory_limit_gb == 0 || gpu_memory_reserve_gb >= gpu_memory_limit_gb ||
+         gpu_adjacency_cache_mb == 0 || gpu_adjacency_cache_ways != 4 ||
+         gpu_bootstrap_window_mb == 0 || gpu_bootstrap_windows == 0 ||
+         gpu_bootstrap_windows > 16 || gpu_graph_prefetch_depth == 0 ||
+         gpu_graph_prefetch_depth > 8 || gpu_delta_anchor_probes == 0 ||
+         gpu_delta_anchor_probes > 64 ||
          gpu_rdma_qps == 0 || gpu_rdma_qps > 32 ||
          gpu_persistent_blocks_per_sm == 0 || gpu_persistent_blocks_per_sm > 16 ||
          update_visibility_us == 0 ||
@@ -703,13 +717,16 @@ public:
            << config.query_batch_max << std::endl;
         os << std::setw(width) << "GPU query batch wait(us): "
            << config.query_batch_wait_us << std::endl;
-        os << std::setw(width) << "GPU hot degree: " << config.gpu_hot_degree << std::endl;
-        os << std::setw(width) << "GPU cold expansion budget: "
-           << config.gpu_cold_expansions << std::endl;
+        os << std::setw(width) << "GPU memory limit/reserve(GB): "
+           << config.gpu_memory_limit_gb << "/" << config.gpu_memory_reserve_gb << std::endl;
+        os << std::setw(width) << "GPU adjacency cache(MB/ways): "
+           << config.gpu_adjacency_cache_mb << "/" << config.gpu_adjacency_cache_ways << std::endl;
+        os << std::setw(width) << "GPU graph prefetch depth: "
+           << config.gpu_graph_prefetch_depth << std::endl;
+        os << std::setw(width) << "GPU delta anchor probes: "
+           << config.gpu_delta_anchor_probes << std::endl;
         os << std::setw(width) << "GPU persistent blocks/SM: "
            << config.gpu_persistent_blocks_per_sm << std::endl;
-        os << std::setw(width) << "GPU delta signature filter: "
-           << (config.gpu_delta_signature_filter ? "lossy" : "disabled") << std::endl;
         os << std::setw(width) << "Update visibility(us): "
            << config.update_visibility_us << std::endl;
       }

@@ -32,10 +32,12 @@ already writes RaBitQ and anchor sidecars:
 ./experiment/build_sift100m_index.sh
 ```
 
-The GPU-persistent profile needs its GPU image and graph-page sidecars:
+The GPU-persistent V4 profile needs a small compute-side manifest. If `.dat`
+shards are remote, storage nodes materialize their RaBitQ streams at startup:
 
 ```bash
-./experiment/build_sift100m_index.sh 04_gpu_persistent_gpunetio
+GPU_SIDECAR_OVERWRITE=1 \
+./experiment/convert_sift100m_gpu_sidecars.sh 04_gpu_persistent_gpunetio
 ```
 
 If an older index is missing the ALDI anchor sidecar, generate it once for the

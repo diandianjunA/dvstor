@@ -146,23 +146,35 @@ if errors:
     sys.exit(1)
 PY_VALIDATE
 
-  local node_id shard
-  for ((node_id = 1; node_id <= SHARDS; ++node_id)); do
-    shard="$(shard_file "$node_id")"
-    if [[ ! -s "$shard" ]]; then
-      echo "missing or empty shard file: $shard" >&2
-      return 1
-    fi
-  done
+  local require_local_shards=1
   if [[ "${GPU_TIERED_INDEX:-0}" == "1" || "${GPU_TIERED_INDEX:-0}" == "true" ]]; then
+    local gpu_tiered_source
+    gpu_tiered_source="$(python3 - "$metadata" <<'PY_GPU_V4'
+import json
+import sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    metadata = json.load(f)
+if metadata.get('gpu_tiered_format') != 'gpu_tiered_v4':
+    raise SystemExit('GPU profile requires gpu_tiered_v4; run the V4 sidecar converter')
+if metadata.get('gpu_graph_source') != 'storage_compact_plane':
+    raise SystemExit('GPU V4 metadata must use the authoritative storage compact graph plane')
+print(metadata.get('gpu_tiered_source', ''))
+PY_GPU_V4
+)"
+    if [[ "$gpu_tiered_source" == "distributed_manifest_v1" ]]; then
+      require_local_shards=0
+    fi
     if [[ ! -s "${INDEX_PREFIX}.gpu.idx" ]]; then
       echo "missing GPU tiered index: ${INDEX_PREFIX}.gpu.idx" >&2
       return 1
     fi
+  fi
+  if (( require_local_shards != 0 )); then
+    local node_id shard
     for ((node_id = 1; node_id <= SHARDS; ++node_id)); do
-      shard="${INDEX_PREFIX}_node${node_id}_of${SHARDS}.gpu.pages"
+      shard="$(shard_file "$node_id")"
       if [[ ! -s "$shard" ]]; then
-        echo "missing GPU graph-page sidecar: $shard" >&2
+        echo "missing or empty shard file: $shard" >&2
         return 1
       fi
     done
@@ -308,17 +320,18 @@ write_service_config() {
     if [[ -n "${GPU_QUERY_BATCH_TARGET:-}" ]]; then echo "query-batch-target = ${GPU_QUERY_BATCH_TARGET}"; fi
     if [[ -n "${GPU_QUERY_BATCH_MAX:-}" ]]; then echo "query-batch-max = ${GPU_QUERY_BATCH_MAX}"; fi
     if [[ -n "${GPU_QUERY_BATCH_WAIT_US:-}" ]]; then echo "query-batch-wait-us = ${GPU_QUERY_BATCH_WAIT_US}"; fi
-    if [[ -n "${GPU_PAGE_CACHE_MB:-}" ]]; then echo "gpu-page-cache-mb = ${GPU_PAGE_CACHE_MB}"; fi
-    if [[ -n "${GPU_PAGE_CACHE_RATIO:-}" ]]; then echo "gpu-page-cache-ratio = ${GPU_PAGE_CACHE_RATIO}"; fi
-    if [[ -n "${GPU_HOT_DEGREE:-}" ]]; then echo "gpu-hot-degree = ${GPU_HOT_DEGREE}"; fi
-    if [[ -n "${GPU_COLD_EXPANSIONS:-}" ]]; then echo "gpu-cold-expansions = ${GPU_COLD_EXPANSIONS}"; fi
+    if [[ -n "${GPU_MEMORY_LIMIT_GB:-}" ]]; then echo "gpu-memory-limit-gb = ${GPU_MEMORY_LIMIT_GB}"; fi
+    if [[ -n "${GPU_MEMORY_RESERVE_GB:-}" ]]; then echo "gpu-memory-reserve-gb = ${GPU_MEMORY_RESERVE_GB}"; fi
+    if [[ -n "${GPU_ADJACENCY_CACHE_MB:-}" ]]; then echo "gpu-adjacency-cache-mb = ${GPU_ADJACENCY_CACHE_MB}"; fi
+    if [[ -n "${GPU_ADJACENCY_CACHE_WAYS:-}" ]]; then echo "gpu-adjacency-cache-ways = ${GPU_ADJACENCY_CACHE_WAYS}"; fi
+    if [[ -n "${GPU_BOOTSTRAP_WINDOW_MB:-}" ]]; then echo "gpu-bootstrap-window-mb = ${GPU_BOOTSTRAP_WINDOW_MB}"; fi
+    if [[ -n "${GPU_BOOTSTRAP_WINDOWS:-}" ]]; then echo "gpu-bootstrap-windows = ${GPU_BOOTSTRAP_WINDOWS}"; fi
+    if [[ -n "${GPU_GRAPH_PREFETCH_DEPTH:-}" ]]; then echo "gpu-graph-prefetch-depth = ${GPU_GRAPH_PREFETCH_DEPTH}"; fi
+    if [[ -n "${GPU_GRAPH_CACHE_TTL_US:-}" ]]; then echo "gpu-graph-cache-ttl-us = ${GPU_GRAPH_CACHE_TTL_US}"; fi
+    if [[ -n "${GPU_DELTA_ANCHOR_PROBES:-}" ]]; then echo "gpu-delta-anchor-probes = ${GPU_DELTA_ANCHOR_PROBES}"; fi
     if [[ -n "${GPU_RDMA_QPS:-}" ]]; then echo "gpu-rdma-qps = ${GPU_RDMA_QPS}"; fi
     if [[ -n "${GPU_PERSISTENT_BLOCKS_PER_SM:-}" ]]; then
       echo "gpu-persistent-blocks-per-sm = ${GPU_PERSISTENT_BLOCKS_PER_SM}"
-    fi
-    if [[ "${GPU_DELTA_SIGNATURE_FILTER:-0}" == "1" ||
-          "${GPU_DELTA_SIGNATURE_FILTER:-0}" == "true" ]]; then
-      echo "gpu-delta-signature-filter = true"
     fi
     if [[ -n "${UPDATE_VISIBILITY_US:-}" ]]; then echo "update-visibility-us = ${UPDATE_VISIBILITY_US}"; fi
     if [[ -n "${DELTA_MAX_RATIO:-}" ]]; then echo "delta-max-ratio = ${DELTA_MAX_RATIO}"; fi

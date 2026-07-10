@@ -46,14 +46,14 @@ inline filepath_t gpu_tiered_file(const filepath_t& prefix) {
   return filepath_t(prefix.string() + ".gpu.idx");
 }
 
-inline filepath_t gpu_graph_pages_file(const filepath_t& prefix, size_t node_ordinal, size_t num_nodes) {
+inline filepath_t gpu_code_file(const filepath_t& prefix, size_t node_ordinal, size_t num_nodes) {
   return filepath_t(prefix.string() + "_node" + std::to_string(node_ordinal) + "_of" +
-                    std::to_string(num_nodes) + ".gpu.pages");
+                    std::to_string(num_nodes) + ".gpu.codes");
 }
 
-inline filepath_t gpu_graph_pages_for_shard(const filepath_t& shard_file_path) {
+inline filepath_t gpu_code_for_shard(const filepath_t& shard_file_path) {
   filepath_t result = shard_file_path;
-  result.replace_extension(".gpu.pages");
+  result.replace_extension(".gpu.codes");
   return result;
 }
 

@@ -8,11 +8,10 @@ namespace tools::vamana_offline {
 
 struct GpuTieredWriteResult {
   filepath_t index_file;
-  vec<u64> graph_page_offsets;
-  vec<u64> graph_page_bytes;
-  u32 hot_degree{};
+  vec<filepath_t> code_files;
+  vec<u64> code_remote_offsets;
+  vec<u64> code_bytes;
   u32 entry_points{};
-  u32 page_bytes{};
 };
 
 GpuTieredWriteResult write_gpu_tiered_index(

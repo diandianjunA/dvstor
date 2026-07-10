@@ -726,11 +726,25 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
     const u32* statuses = service::storage_owner::response_statuses(slot.response_buffer.data());
     const auto* mutation_results = service::storage_owner::response_mutation_results(
       slot.response_buffer.data(), slot.item_count);
-    const bool response_ok = (response->magic == service::storage_owner::kInsertMagic ||
-                              response->magic == service::storage_owner::kMutationMagic) &&
-                             response->owner_storage == slot.owner_storage &&
-                             response->batch_id == slot.batch_id &&
-                             response->item_count == slot.item_count;
+    bool response_ok = (response->magic == service::storage_owner::kInsertMagic ||
+                        response->magic == service::storage_owner::kMutationMagic) &&
+                       response->owner_storage == slot.owner_storage &&
+                       response->batch_id == slot.batch_id &&
+                       response->item_count == slot.item_count;
+    u32 invalidation_count = 0;
+    const u64* invalidated_raws = nullptr;
+    if (response_ok) {
+      invalidation_count = *service::storage_owner::response_invalidation_count(
+        slot.response_buffer.data(), slot.item_count);
+      if (invalidation_count >
+          service::storage_owner::response_invalidation_capacity(slot.item_count)) {
+        response_ok = false;
+        invalidation_count = 0;
+      } else {
+        invalidated_raws = service::storage_owner::response_invalidated_raws(
+          slot.response_buffer.data(), slot.item_count);
+      }
+    }
     bool collect_breakdown = false;
     for (const auto& sample : slot.samples) {
       if (sample && sample->collects_breakdown()) {
@@ -800,7 +814,9 @@ void ComputeService<Distance>::maybe_release_storage_owner_slot_locked(
       if (!mutations.empty()) {
         try {
           const u64 epoch = persistent_search_->delta().reserve_epoch();
-          gpu_visible = persistent_search_->publish_mutations(std::move(mutations), epoch);
+          gpu_visible = persistent_search_->publish_mutations(
+            std::move(mutations), epoch,
+            std::span<const u64>{invalidated_raws, invalidation_count});
         } catch (const std::exception& error) {
           gpu_visible = false;
           static std::atomic<u32> gpu_delta_failure_logs{0};

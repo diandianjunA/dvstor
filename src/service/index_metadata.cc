@@ -78,6 +78,7 @@ bool load_metadata(const filepath_t& index_prefix, Metadata& metadata, str* erro
     metadata.idmap_format = json.value("idmap_format", str{});
     metadata.anchor_format = json.value("anchor_format", str{});
     metadata.anchor_count_per_shard = json.value("anchor_count_per_shard", 0u);
+    metadata.gpu_tiered_format = json.value("gpu_tiered_format", str{});
   } catch (const std::exception& e) {
     return fail(error_message, "failed to parse index metadata " + metadata_file.string() + ": " + e.what());
   }

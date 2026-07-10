@@ -18,6 +18,11 @@ target_link_libraries(gpu_delta_index_test PRIVATE dvstor_runtime)
 target_compile_options(gpu_delta_index_test PRIVATE -UNDEBUG)
 add_test(NAME gpu_delta_index_test COMMAND gpu_delta_index_test)
 
+add_executable(gpu_memory_budget_test gpu_memory_budget_test.cc)
+target_link_libraries(gpu_memory_budget_test PRIVATE dvstor_runtime)
+target_compile_options(gpu_memory_budget_test PRIVATE -UNDEBUG)
+add_test(NAME gpu_memory_budget_test COMMAND gpu_memory_budget_test)
+
 add_executable(gpu_sidecar_converter_test
     gpu_sidecar_converter_test.cc
     ${CMAKE_SOURCE_DIR}/tools/vamana_offline/gpu_sidecar_converter.cc

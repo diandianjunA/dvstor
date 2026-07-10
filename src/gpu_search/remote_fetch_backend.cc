@@ -33,8 +33,8 @@ public:
       : config_(context.config) {
     const filepath_t prefix = config_.resolved_index_prefix();
     shard_files_.reserve(config_.num_server_nodes());
-    graph_page_files_.reserve(config_.num_server_nodes());
-    graph_page_headers_.reserve(config_.num_server_nodes());
+    code_files_.reserve(config_.num_server_nodes());
+    code_headers_.reserve(config_.num_server_nodes());
     for (u32 shard = 0; shard < config_.num_server_nodes(); ++shard) {
       auto input = std::make_unique<std::ifstream>(
         index_path::shard_file(prefix, shard + 1, config_.num_server_nodes()),
@@ -45,18 +45,40 @@ public:
       }
       shard_files_.push_back(std::move(input));
 
-      const auto pages_path = index_path::gpu_graph_pages_file(
+      const auto code_path = index_path::gpu_code_file(
         prefix, shard + 1, config_.num_server_nodes());
-      auto pages = std::make_unique<std::ifstream>(pages_path, std::ios::binary);
-      format::ShardPageFileHeader header;
-      pages->read(reinterpret_cast<char*>(&header), sizeof(header));
-      if (!pages->good() || header.magic != format::kShardPagesMagic ||
-          header.version != format::kVersion || header.memory_node != shard) {
-        throw std::runtime_error("failed to open local graph-page shard " +
-                                 pages_path.string());
+      auto codes = std::make_unique<std::ifstream>(code_path, std::ios::binary);
+      format::CodeHeader header;
+      std::string error;
+      if (!format::read_code_header(code_path, header, &error) ||
+          header.memory_node != shard) {
+        throw std::runtime_error(error.empty()
+          ? "failed to open local GPU V4 code shard " + code_path.string() : error);
       }
-      graph_page_headers_.push_back(header);
-      graph_page_files_.push_back(std::move(pages));
+      constexpr size_t checksum_chunk_bytes = 64ull << 20;
+      std::vector<byte_t> checksum_chunk(static_cast<size_t>(
+        std::min<u64>(checksum_chunk_bytes, header.payload_bytes)));
+      u64 checksum = format::checksum64_initial();
+      codes->seekg(static_cast<std::streamoff>(sizeof(header)));
+      for (u64 offset = 0; offset < header.payload_bytes;
+           offset += checksum_chunk_bytes) {
+        const size_t bytes = static_cast<size_t>(
+          std::min<u64>(checksum_chunk_bytes, header.payload_bytes - offset));
+        codes->read(reinterpret_cast<char*>(checksum_chunk.data()),
+                    static_cast<std::streamsize>(bytes));
+        if (static_cast<size_t>(codes->gcount()) != bytes) {
+          throw std::runtime_error("short read from local GPU V4 code shard " +
+                                   code_path.string());
+        }
+        checksum = format::checksum64_update(
+          checksum, checksum_chunk.data(), bytes);
+      }
+      if (checksum != header.payload_checksum) {
+        throw std::runtime_error("local GPU V4 code shard checksum mismatch: " +
+                                 code_path.string());
+      }
+      code_headers_.push_back(header);
+      code_files_.push_back(std::move(codes));
     }
     check_cuda(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking),
                "cudaStreamCreateWithFlags(local fetch)");
@@ -79,19 +101,19 @@ public:
       statuses[i] = -EINVAL;
       if (request.memory_node >= shard_files_.size() || request.bytes == 0) continue;
       staging[i].resize(request.bytes);
-      const bool graph_page = request.kind == static_cast<u8>(FetchKind::graph_page);
-      auto& input = graph_page ? *graph_page_files_[request.memory_node]
-                               : *shard_files_[request.memory_node];
+      const bool code = request.kind == static_cast<u8>(FetchKind::code);
+      auto& input = code ? *code_files_[request.memory_node]
+                         : *shard_files_[request.memory_node];
       u64 file_offset = request.remote_offset;
-      if (graph_page) {
-        const auto& header = graph_page_headers_[request.memory_node];
+      if (code) {
+        const auto& header = code_headers_[request.memory_node];
         if (request.remote_offset < header.remote_offset ||
-            request.remote_offset - header.remote_offset > header.data_bytes ||
-            request.bytes > header.data_bytes -
+            request.remote_offset - header.remote_offset > header.payload_bytes ||
+            request.bytes > header.payload_bytes -
               (request.remote_offset - header.remote_offset)) {
           continue;
         }
-        file_offset = sizeof(format::ShardPageFileHeader) +
+        file_offset = sizeof(format::CodeHeader) +
           request.remote_offset - header.remote_offset;
       }
       {
@@ -115,8 +137,8 @@ public:
 private:
   configuration::IndexConfiguration& config_;
   std::vector<std::unique_ptr<std::ifstream>> shard_files_;
-  std::vector<std::unique_ptr<std::ifstream>> graph_page_files_;
-  std::vector<format::ShardPageFileHeader> graph_page_headers_;
+  std::vector<std::unique_ptr<std::ifstream>> code_files_;
+  std::vector<format::CodeHeader> code_headers_;
   std::mutex file_mutex_;
   cudaStream_t stream_{};
 };

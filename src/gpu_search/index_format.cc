@@ -1,22 +1,25 @@
 #include "gpu_search/index_format.hh"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <limits>
-#include <type_traits>
 
 namespace gpu_search::format {
 namespace {
 
-template <class T>
-bool section_in_file(u64 offset, u64 bytes, u64 file_bytes) {
-  if (bytes % sizeof(T) != 0) return false;
-  return offset <= file_bytes && bytes <= file_bytes - offset;
-}
+constexpr u64 kChecksumOffset = 1469598103934665603ULL;
+constexpr u64 kChecksumPrime = 1099511628211ULL;
+constexpr u64 kRemoteOffsetLimit = 1ull << 48;
 
 void set_error(std::string* error, const std::string& value) {
   if (error != nullptr) *error = value;
+}
+
+template <class T>
+bool section_in_file(u64 offset, u64 bytes, u64 file_bytes) {
+  return bytes % sizeof(T) == 0 && offset <= file_bytes && bytes <= file_bytes - offset;
 }
 
 template <class T>
@@ -37,6 +40,16 @@ bool read_section(std::ifstream& input, u64 offset, u64 bytes, std::vector<T>& v
   return input.good();
 }
 
+u32 shard_bits_for(u32 shard_count) {
+  u32 bits = 0;
+  u32 capacity = 1;
+  while (capacity < shard_count && bits < 31) {
+    capacity <<= 1;
+    ++bits;
+  }
+  return bits;
+}
+
 }  // namespace
 
 u64 align_up(u64 value, u64 alignment) {
@@ -47,169 +60,146 @@ u64 align_up(u64 value, u64 alignment) {
   return value + alignment - remainder;
 }
 
-u64 checksum64(const byte_t* data, size_t bytes) {
-  constexpr u64 kOffset = 1469598103934665603ULL;
-  constexpr u64 kPrime = 1099511628211ULL;
-  u64 hash = kOffset;
-  for (size_t i = 0; i < bytes; ++i) {
-    hash ^= static_cast<u64>(data[i]);
-    hash *= kPrime;
+u64 checksum64_initial() {
+  return kChecksumOffset;
+}
+
+u64 checksum64_update(u64 state, const byte_t* data, size_t bytes) {
+  for (size_t index = 0; index < bytes; ++index) {
+    state ^= static_cast<u64>(data[index]);
+    state *= kChecksumPrime;
   }
-  return hash;
+  return state;
+}
+
+u64 checksum64(const byte_t* data, size_t bytes) {
+  return checksum64_update(checksum64_initial(), data, bytes);
 }
 
 bool validate_header(const Header& header, std::string* error) {
   if (header.magic != kMagic) {
-    set_error(error, "GPU tiered index magic mismatch");
+    set_error(error, header.magic == kLegacyMagic
+      ? "GPU tiered V3 is unsupported; run vamana_gpu_sidecar_converter to create V4 files"
+      : "GPU tiered V4 manifest magic mismatch");
     return false;
   }
   if (header.version != kVersion || header.header_bytes != sizeof(Header)) {
-    set_error(error, "unsupported GPU tiered index version");
+    set_error(error, "unsupported GPU tiered manifest version");
     return false;
   }
   if (header.endian_marker != kEndianMarker) {
-    set_error(error, "GPU tiered index byte order mismatch");
+    set_error(error, "GPU tiered manifest byte order mismatch");
     return false;
   }
-  if (header.page_bytes < sizeof(PageHeader) ||
-      (header.page_bytes & (header.page_bytes - 1)) != 0) {
-    set_error(error, "GPU graph page size must be a power of two");
+  if (header.dim == 0 || header.graph_degree == 0 || header.num_shards == 0 ||
+      header.num_nodes == 0 || header.num_nodes >= (1ull << 30) ||
+      header.num_nodes > std::numeric_limits<u32>::max() || header.base_generation == 0) {
+    set_error(error, "GPU tiered V4 manifest has invalid dimensions");
     return false;
   }
-  if (header.dim == 0 || header.graph_degree == 0 ||
-      header.hot_degree == 0 || header.hot_degree > kMaxHotDegree ||
-      header.hot_degree > header.graph_degree) {
-    set_error(error, "invalid GPU tiered graph dimensions");
-    return false;
-  }
-  if (header.id_encoding_bytes != 3 && header.id_encoding_bytes != 4) {
-    set_error(error, "GPU tiered index ID width must be 3 or 4 bytes");
-    return false;
-  }
-  if (header.rabitq_code_bits < 8 || header.rabitq_code_bits < header.dim ||
+  if (header.rabitq_code_bits < header.dim || header.rabitq_code_bits < 8 ||
       (header.rabitq_code_bits & (header.rabitq_code_bits - 1)) != 0 ||
       header.rabitq_entry_bytes != rabitq_entry_bytes(header.rabitq_code_bits)) {
-    set_error(error, "GPU tiered index has invalid RaBitQ dimensions");
+    set_error(error, "GPU tiered V4 manifest has an invalid RaBitQ layout");
     return false;
   }
-  if (header.num_nodes == 0 || header.num_nodes > std::numeric_limits<u32>::max() ||
-      header.num_shards == 0 || header.num_shards > std::numeric_limits<u16>::max() ||
-      header.base_generation == 0) {
-    set_error(error, "GPU tiered index has an empty topology");
+  if (header.graph_pointer_bytes != kCompactPointerBytes ||
+      header.graph_entry_bytes <
+        8 + static_cast<u64>(header.graph_degree) * kCompactPointerBytes ||
+      header.graph_entry_bytes > kGraphCacheLineBytes ||
+      header.graph_shard_bits != shard_bits_for(header.num_shards) ||
+      header.graph_shard_bits >= 16) {
+    set_error(error, "GPU tiered V4 requires the compact graph plane to fit one cache line");
     return false;
   }
-  if (header.medoid_id >= header.num_nodes) {
-    set_error(error, "GPU tiered index medoid is out of bounds");
-    return false;
-  }
-  if (header.node_records_bytes != header.num_nodes * sizeof(NodeRecord) ||
-      header.rabitq_bytes != header.num_nodes * header.rabitq_entry_bytes ||
+  if (header.medoid_ordinal >= header.num_nodes ||
       header.shard_regions_bytes != header.num_shards * sizeof(ShardRegion) ||
       header.centroid_bytes != static_cast<u64>(header.dim) * sizeof(f32) ||
       header.entry_points_bytes == 0 ||
-      header.entry_points_bytes > 512u * sizeof(u32)) {
-    set_error(error, "GPU tiered index section cardinality mismatch");
+      header.entry_points_bytes > kMaxEntryPoints * sizeof(u32)) {
+    set_error(error, "GPU tiered V4 manifest section cardinality mismatch");
     return false;
   }
-  if (!section_in_file<NodeRecord>(header.node_records_offset,
-                                   header.node_records_bytes,
-                                   header.file_bytes) ||
-      !section_in_file<u32>(header.hot_neighbors_offset,
-                            header.hot_neighbors_bytes,
-                            header.file_bytes) ||
-      !section_in_file<byte_t>(header.rabitq_offset,
-                               header.rabitq_bytes,
-                               header.file_bytes) ||
-      !section_in_file<ShardRegion>(header.shard_regions_offset,
-                                    header.shard_regions_bytes,
-                                    header.file_bytes) ||
+  if (!section_in_file<ShardRegion>(header.shard_regions_offset,
+                                    header.shard_regions_bytes, header.file_bytes) ||
       !section_in_file<f32>(header.centroid_offset,
-                            header.centroid_bytes,
-                            header.file_bytes) ||
+                            header.centroid_bytes, header.file_bytes) ||
       !section_in_file<u32>(header.entry_points_offset,
-                            header.entry_points_bytes,
-                            header.file_bytes)) {
-    set_error(error, "GPU tiered index section exceeds file bounds");
+                            header.entry_points_bytes, header.file_bytes)) {
+    set_error(error, "GPU tiered V4 manifest section exceeds file bounds");
     return false;
   }
   return true;
 }
 
 bool validate_view(const View& view, std::string* error) {
-  if (view.nodes.size() != view.header.num_nodes ||
-      view.shards.size() != view.header.num_shards ||
+  if (view.shards.size() != view.header.num_shards ||
       view.centroid.size() != view.header.dim || view.entry_points.empty() ||
-      view.entry_points.size() > 512) {
-    set_error(error, "GPU tiered index view cardinality mismatch");
+      view.entry_points.size() > kMaxEntryPoints ||
+      !std::all_of(view.centroid.begin(), view.centroid.end(), [](f32 value) {
+        return std::isfinite(value);
+      })) {
+    set_error(error, "GPU tiered V4 view cardinality mismatch");
     return false;
   }
-  if (view.header.rabitq_entry_bytes != rabitq_entry_bytes(view.header.rabitq_code_bits) ||
-      view.rabitq_entries.size() !=
-        view.nodes.size() * static_cast<size_t>(view.header.rabitq_entry_bytes)) {
-    set_error(error, "GPU tiered index RaBitQ section cardinality mismatch");
-    return false;
-  }
-  u64 shard_nodes = 0;
+  u64 next_ordinal = 0;
   for (size_t shard_index = 0; shard_index < view.shards.size(); ++shard_index) {
     const ShardRegion& shard = view.shards[shard_index];
-    if (shard.memory_node != shard_index || shard.graph_pages_bytes == 0 ||
-        shard.graph_pages_offset % view.header.page_bytes != 0 ||
-        shard.graph_pages_bytes % view.header.page_bytes != 0 ||
-        shard.vector_stride == 0) {
-      set_error(error, "GPU tiered index contains an invalid shard region");
+    const bool node_range_overflows = shard.node_base_offset > kRemoteOffsetLimit ||
+      (shard.node_stride != 0 &&
+       shard.node_count >
+         (kRemoteOffsetLimit - shard.node_base_offset) / shard.node_stride);
+    const bool graph_range_overflows = shard.graph_base_offset > kRemoteOffsetLimit ||
+      (view.header.graph_entry_bytes != 0 &&
+       shard.node_count >
+         (kRemoteOffsetLimit - shard.graph_base_offset) / view.header.graph_entry_bytes);
+    const bool code_range_overflows =
+      shard.code_remote_offset > kRemoteOffsetLimit ||
+      shard.code_bytes > kRemoteOffsetLimit - shard.code_remote_offset;
+    const u64 node_end = node_range_overflows ? kRemoteOffsetLimit :
+      shard.node_base_offset + shard.node_count * shard.node_stride;
+    const u64 graph_end = graph_range_overflows ? kRemoteOffsetLimit :
+      shard.graph_base_offset + shard.node_count * view.header.graph_entry_bytes;
+    if (shard.memory_node != shard_index || shard.ordinal_base != next_ordinal ||
+        shard.node_count == 0 || shard.node_base_offset != kNodeBaseOffset ||
+        shard.node_stride == 0 || shard.graph_base_offset == 0 ||
+        shard.dynamic_base_offset == 0 || shard.dynamic_record_bytes == 0 ||
+        shard.dynamic_hot_offset == 0 ||
+        node_range_overflows || graph_range_overflows || code_range_overflows ||
+        node_end > shard.graph_base_offset || graph_end > shard.dynamic_base_offset ||
+        shard.dynamic_hot_offset < shard.node_stride ||
+        shard.dynamic_hot_offset > shard.dynamic_record_bytes ||
+        view.header.graph_entry_bytes >
+          shard.dynamic_record_bytes - shard.dynamic_hot_offset ||
+        shard.code_remote_offset != align_up(shard.dynamic_base_offset, 64) ||
+        shard.code_bytes != shard.node_count * view.header.rabitq_entry_bytes) {
+      set_error(error, "GPU tiered V4 contains an invalid shard region");
       return false;
     }
-    shard_nodes += shard.node_count;
+    next_ordinal += shard.node_count;
   }
-  if (shard_nodes != view.header.num_nodes) {
-    set_error(error, "GPU tiered index shard node counts do not cover the topology");
+  if (next_ordinal != view.header.num_nodes) {
+    set_error(error, "GPU tiered V4 shard ranges do not cover all nodes");
     return false;
   }
-  for (const NodeRecord& node : view.nodes) {
-    if (node.shard >= view.shards.size() || node.generation == 0 ||
-        node.hot_neighbor_count > view.header.hot_degree ||
-        node.hot_neighbor_begin > view.hot_neighbors.size() ||
-        node.hot_neighbor_count > view.hot_neighbors.size() - node.hot_neighbor_begin ||
-        node.cold_page_offset < view.shards[node.shard].graph_pages_offset ||
-        node.cold_page_offset - view.shards[node.shard].graph_pages_offset >=
-          view.shards[node.shard].graph_pages_bytes ||
-        node.cold_page_offset % view.header.page_bytes != 0 ||
-        node.cold_record_offset < sizeof(PageHeader) ||
-        node.cold_record_offset % alignof(PageNodeHeader) != 0 ||
-        node.cold_record_offset + sizeof(PageNodeHeader) > view.header.page_bytes) {
-      set_error(error, "GPU tiered index contains an invalid node record");
-      return false;
-    }
-  }
-  for (const u32 neighbor : view.hot_neighbors) {
-    if (neighbor >= view.header.num_nodes) {
-      set_error(error, "GPU tiered index contains a non-dense node ID");
-      return false;
-    }
-  }
-  for (const u32 entry : view.entry_points) {
+  for (u32 entry : view.entry_points) {
     if (entry >= view.header.num_nodes) {
-      set_error(error, "GPU tiered index contains an invalid entry point");
+      set_error(error, "GPU tiered V4 contains an invalid entry point");
       return false;
     }
   }
   return true;
 }
 
-bool write_file(const std::filesystem::path& path, const View& view, std::string* error) {
-  if (!validate_view(view, error)) return false;
-
+bool write_file(const std::filesystem::path& path, const View& view,
+                std::string* error) {
   Header header = view.header;
+  header.magic = kMagic;
+  header.version = kVersion;
+  header.header_bytes = sizeof(Header);
+  header.endian_marker = kEndianMarker;
+  header.num_shards = static_cast<u32>(view.shards.size());
   u64 cursor = align_up(sizeof(Header), 64);
-  header.node_records_offset = cursor;
-  header.node_records_bytes = view.nodes.size() * sizeof(NodeRecord);
-  cursor = align_up(cursor + header.node_records_bytes, 64);
-  header.hot_neighbors_offset = cursor;
-  header.hot_neighbors_bytes = view.hot_neighbors.size() * sizeof(u32);
-  cursor = align_up(cursor + header.hot_neighbors_bytes, 64);
-  header.rabitq_offset = cursor;
-  header.rabitq_bytes = view.rabitq_entries.size();
-  cursor = align_up(cursor + header.rabitq_bytes, 64);
   header.shard_regions_offset = cursor;
   header.shard_regions_bytes = view.shards.size() * sizeof(ShardRegion);
   cursor = align_up(cursor + header.shard_regions_bytes, 64);
@@ -220,35 +210,43 @@ bool write_file(const std::filesystem::path& path, const View& view, std::string
   header.entry_points_bytes = view.entry_points.size() * sizeof(u32);
   header.file_bytes = cursor + header.entry_points_bytes;
   header.checksum = 0;
-  header.checksum = checksum64(reinterpret_cast<const byte_t*>(&header), sizeof(header));
-
   if (!validate_header(header, error)) return false;
+  View normalized = view;
+  normalized.header = header;
+  if (!validate_view(normalized, error)) return false;
+  u64 checksum = checksum64(reinterpret_cast<const byte_t*>(&header), sizeof(header));
+  checksum = checksum64_update(
+    checksum, reinterpret_cast<const byte_t*>(view.shards.data()),
+    view.shards.size() * sizeof(ShardRegion));
+  checksum = checksum64_update(
+    checksum, reinterpret_cast<const byte_t*>(view.centroid.data()),
+    view.centroid.size() * sizeof(f32));
+  checksum = checksum64_update(
+    checksum, reinterpret_cast<const byte_t*>(view.entry_points.data()),
+    view.entry_points.size() * sizeof(u32));
+  header.checksum = checksum;
+
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
   if (!output.good()) {
-    set_error(error, "failed to create GPU tiered index: " + path.string());
+    set_error(error, "failed to create GPU tiered V4 manifest: " + path.string());
     return false;
   }
-  if (header.file_bytes > 0) {
-    output.seekp(static_cast<std::streamoff>(header.file_bytes - 1));
-    output.put(0);
-  }
+  output.seekp(static_cast<std::streamoff>(header.file_bytes - 1));
+  output.put(0);
   output.seekp(0);
   output.write(reinterpret_cast<const char*>(&header), sizeof(header));
   const bool ok = output.good() &&
-    write_section(output, header.node_records_offset, view.nodes) &&
-    write_section(output, header.hot_neighbors_offset, view.hot_neighbors) &&
-    write_section(output, header.rabitq_offset, view.rabitq_entries) &&
     write_section(output, header.shard_regions_offset, view.shards) &&
     write_section(output, header.centroid_offset, view.centroid) &&
     write_section(output, header.entry_points_offset, view.entry_points);
-  if (!ok) set_error(error, "failed to write GPU tiered index: " + path.string());
+  if (!ok) set_error(error, "failed to write GPU tiered V4 manifest: " + path.string());
   return ok;
 }
 
 bool read_file(const std::filesystem::path& path, View& view, std::string* error) {
   std::ifstream input(path, std::ios::binary);
   if (!input.good()) {
-    set_error(error, "GPU tiered index does not exist: " + path.string());
+    set_error(error, "GPU tiered V4 manifest does not exist: " + path.string());
     return false;
   }
   input.seekg(0, std::ios::end);
@@ -256,49 +254,134 @@ bool read_file(const std::filesystem::path& path, View& view, std::string* error
   input.seekg(0);
   Header header;
   input.read(reinterpret_cast<char*>(&header), sizeof(header));
-  if (!input.good() || actual_bytes != header.file_bytes || !validate_header(header, error)) {
-    if (error != nullptr && error->empty()) *error = "GPU tiered index file size mismatch";
+  if (!input.good()) {
+    set_error(error, "GPU tiered V4 manifest header is truncated");
+    return false;
+  }
+  if (!validate_header(header, error)) return false;
+  if (actual_bytes != header.file_bytes) {
+    set_error(error, "GPU tiered V4 manifest file size mismatch");
     return false;
   }
   const u64 stored_checksum = header.checksum;
   header.checksum = 0;
-  if (checksum64(reinterpret_cast<const byte_t*>(&header), sizeof(header)) != stored_checksum) {
-    set_error(error, "GPU tiered index header checksum mismatch");
-    return false;
-  }
+  u64 checksum = checksum64(reinterpret_cast<const byte_t*>(&header), sizeof(header));
   header.checksum = stored_checksum;
-
   View loaded;
   loaded.header = header;
-  if (!read_section(input, header.node_records_offset, header.node_records_bytes, loaded.nodes) ||
-      !read_section(input, header.hot_neighbors_offset, header.hot_neighbors_bytes,
-                    loaded.hot_neighbors) ||
-      !read_section(input, header.rabitq_offset, header.rabitq_bytes, loaded.rabitq_entries) ||
-      !read_section(input, header.shard_regions_offset, header.shard_regions_bytes, loaded.shards) ||
+  if (!read_section(input, header.shard_regions_offset, header.shard_regions_bytes,
+                    loaded.shards) ||
       !read_section(input, header.centroid_offset, header.centroid_bytes, loaded.centroid) ||
       !read_section(input, header.entry_points_offset, header.entry_points_bytes,
                     loaded.entry_points) ||
       !validate_view(loaded, error)) {
-    if (error != nullptr && error->empty()) *error = "failed to read GPU tiered index sections";
+    if (error != nullptr && error->empty()) {
+      *error = "failed to read GPU tiered V4 manifest sections";
+    }
+    return false;
+  }
+  checksum = checksum64_update(
+    checksum, reinterpret_cast<const byte_t*>(loaded.shards.data()),
+    loaded.shards.size() * sizeof(ShardRegion));
+  checksum = checksum64_update(
+    checksum, reinterpret_cast<const byte_t*>(loaded.centroid.data()),
+    loaded.centroid.size() * sizeof(f32));
+  checksum = checksum64_update(
+    checksum, reinterpret_cast<const byte_t*>(loaded.entry_points.data()),
+    loaded.entry_points.size() * sizeof(u32));
+  if (checksum != stored_checksum) {
+    set_error(error, "GPU tiered V4 manifest checksum mismatch");
     return false;
   }
   view = std::move(loaded);
   return true;
 }
 
-void encode_id(byte_t* destination, u32 id, IdEncoding encoding) {
-  destination[0] = static_cast<byte_t>(id);
-  destination[1] = static_cast<byte_t>(id >> 8);
-  destination[2] = static_cast<byte_t>(id >> 16);
-  if (encoding == IdEncoding::u32) destination[3] = static_cast<byte_t>(id >> 24);
+bool validate_code_header(const CodeHeader& header, std::string* error) {
+  if (header.magic != kCodeMagic || header.version != kVersion ||
+      header.header_bytes != sizeof(CodeHeader) || header.endian_marker != kEndianMarker) {
+    set_error(error, "invalid GPU V4 code sidecar header");
+    return false;
+  }
+  if (header.entry_count == 0 || header.node_size == 0 || header.remote_offset == 0 ||
+      header.code_bits < 8 || (header.code_bits & (header.code_bits - 1)) != 0 ||
+      header.entry_bytes != rabitq_entry_bytes(header.code_bits) ||
+      header.payload_bytes != header.entry_count * header.entry_bytes) {
+    set_error(error, "invalid GPU V4 code sidecar dimensions");
+    return false;
+  }
+  CodeHeader copy = header;
+  const u64 stored_checksum = copy.header_checksum;
+  copy.header_checksum = 0;
+  if (checksum64(reinterpret_cast<const byte_t*>(&copy), sizeof(copy)) != stored_checksum) {
+    set_error(error, "GPU V4 code sidecar header checksum mismatch");
+    return false;
+  }
+  return true;
 }
 
-u32 decode_id(const byte_t* source, IdEncoding encoding) {
-  u32 id = static_cast<u32>(source[0]) |
-           (static_cast<u32>(source[1]) << 8) |
-           (static_cast<u32>(source[2]) << 16);
-  if (encoding == IdEncoding::u32) id |= static_cast<u32>(source[3]) << 24;
-  return id;
+bool read_code_header(const std::filesystem::path& path, CodeHeader& header,
+                      std::string* error) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input.good()) {
+    set_error(error, "GPU V4 code sidecar does not exist: " + path.string());
+    return false;
+  }
+  input.read(reinterpret_cast<char*>(&header), sizeof(header));
+  if (!input.good()) {
+    set_error(error, "GPU V4 code sidecar header is truncated: " + path.string());
+    return false;
+  }
+  if (!validate_code_header(header, error)) return false;
+  const u64 expected = sizeof(CodeHeader) + header.payload_bytes;
+  if (std::filesystem::file_size(path) != expected) {
+    set_error(error, "GPU V4 code sidecar file size mismatch: " + path.string());
+    return false;
+  }
+  return true;
+}
+
+bool write_code_header(std::ostream& output, const CodeHeader& source, std::string* error) {
+  CodeHeader header = source;
+  header.magic = kCodeMagic;
+  header.version = kVersion;
+  header.header_bytes = sizeof(CodeHeader);
+  header.endian_marker = kEndianMarker;
+  header.header_checksum = 0;
+  header.header_checksum = checksum64(reinterpret_cast<const byte_t*>(&header), sizeof(header));
+  if (!validate_code_header(header, error)) return false;
+  output.seekp(0);
+  output.write(reinterpret_cast<const char*>(&header), sizeof(header));
+  if (!output.good()) {
+    set_error(error, "failed to write GPU V4 code sidecar header");
+    return false;
+  }
+  return true;
+}
+
+bool ordinal_to_remote(const View& view, u32 ordinal, RemotePtr& pointer) {
+  if (ordinal >= view.header.num_nodes) return false;
+  const auto it = std::upper_bound(
+    view.shards.begin(), view.shards.end(), ordinal,
+    [](u32 value, const ShardRegion& shard) { return value < shard.ordinal_base; });
+  if (it == view.shards.begin()) return false;
+  const ShardRegion& shard = *(it - 1);
+  const u64 slot = static_cast<u64>(ordinal) - shard.ordinal_base;
+  if (slot >= shard.node_count) return false;
+  pointer = RemotePtr{shard.memory_node, shard.node_base_offset + slot * shard.node_stride};
+  return true;
+}
+
+bool remote_to_ordinal(const View& view, RemotePtr pointer, u32& ordinal) {
+  if (pointer.is_null() || pointer.memory_node() >= view.shards.size()) return false;
+  const ShardRegion& shard = view.shards[pointer.memory_node()];
+  if (pointer.byte_offset() < shard.node_base_offset || shard.node_stride == 0) return false;
+  const u64 relative = pointer.byte_offset() - shard.node_base_offset;
+  if (relative % shard.node_stride != 0) return false;
+  const u64 slot = relative / shard.node_stride;
+  if (slot >= shard.node_count || shard.ordinal_base + slot >= (1ull << 30)) return false;
+  ordinal = static_cast<u32>(shard.ordinal_base + slot);
+  return true;
 }
 
 }  // namespace gpu_search::format

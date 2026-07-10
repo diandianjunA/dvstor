@@ -39,9 +39,7 @@ cmd=("$BUILD_DIR/vamana_offline_builder"
 
 if [[ "${GPU_TIERED_INDEX:-0}" == "1" || "${GPU_TIERED_INDEX:-0}" == "true" ]]; then
   cmd+=(--gpu-tiered-index
-        --gpu-hot-degree "${GPU_HOT_DEGREE:-16}"
-        --gpu-entry-points "${GPU_ENTRY_POINTS:-256}"
-        --gpu-graph-page-bytes "${GPU_GRAPH_PAGE_BYTES:-4096}")
+        --gpu-entry-points "${GPU_ENTRY_POINTS:-256}")
 fi
 
 echo "[build] index prefix: $INDEX_PREFIX"
