@@ -91,9 +91,14 @@ and is much cheaper than Vamana construction or Metis partitioning.
 The storage stream consumes 24 bytes per SIFT vector across the storage nodes;
 it consumes no compute-node disk space and is not mirrored in compute host
 memory. The query backend can be `gpunetio`, `verbs_proxy`, or `local`. GPUNetIO
-owns the steady-state query QPs. Bootstrap uses the existing control QPs for
-large GPUDirect reads because the current `SYS` topology makes GPU-issued bulk
-reads fragile; query-time graph and exact-vector reads remain GPU-issued.
+owns the steady-state query QPs. Bootstrap and automatic failover use one
+equally sized pool of dedicated CPU-posted GPUDirect Verbs QPs rather than
+sharing a control QP. A bounded GPU CQ poll disables the direct path after an
+error or timeout, after which graph and exact-vector reads continue through the
+fallback pool without copying payloads through host memory.
+The benchmark JSON records the lifetime counter
+`gpu_persistent.direct_path_failures`; a GPUNetIO performance result is valid
+only when this value is zero.
 
 Multi-gigabyte GPUNetIO allocations are registered through `nvidia-peermem`
 with `ibv_reg_mr`, matching NVIDIA's Verbs GPUNetIO samples. The runtime falls
@@ -108,23 +113,32 @@ Base nodes use a 30-bit ordinal handle. Dynamic nodes use a tagged delta handle.
 Shard range metadata converts a base ordinal to its fixed-node and compact-graph
 RDMA addresses without a dense node table.
 
-For each admitted query, a persistent CUDA CTA:
+Each persistent CUDA CTA owns at most one query descriptor. Thread 0 claims the
+descriptor, publishes it through shared memory, and the entire CTA enters the
+barrier-heavy search routine together. GPU-owned ring cursors reside in device
+memory; only descriptors and publication sequences use mapped host memory.
+
+For each admitted query, the CTA:
 
 1. Centers and applies the same deterministic signed Hadamard transform used to
    build RaBitQ entries, then creates byte lookup tables.
-2. Seeds a bounded beam from shard-balanced anchor ordinals, with deterministic
-   hash sampling only as a fallback.
+2. RaBitQ-ranks shard-balanced entry ordinals, RDMA-fetches the selected exact
+   vectors, and seeds the beam only with exact L2 distances.
 3. Selects up to four frontier nodes and requests their complete compact graph
    records concurrently.
 4. Reads records through a four-way, set-associative 512-byte GPU cache. Loading
    entries are deduplicated, readers pin a cache line against replacement, and
    checksum failures fail the query instead of silently dropping edges.
 5. Decodes each five-byte remote pointer into a base ordinal or sparse dynamic
-   handle and evaluates its full RaBitQ entry.
-6. Probes the nearest dynamic anchor buckets; small deltas are scanned exactly.
-7. RDMA-reads `id + generation + exact vector` for base finalists. Dynamic
-   finalists use their resident exact vector. Exact L2 reranking publishes the
-   external IDs to the completion ring.
+   handle and evaluates its full RaBitQ entry only to form a candidate gate.
+6. During warmup and periodic audit rounds it exactifies the complete frontier;
+   otherwise it exactifies the configured RaBitQ gate, including the uncertainty
+   margin. Only exact L2 distances are inserted into and used to order the beam.
+7. Probes the nearest dynamic anchor buckets and exactifies the selected resident
+   delta vectors before beam insertion.
+8. Carries the ID and exact distance obtained by the candidate fetch alongside
+   each beam handle, so final sorting performs no duplicate RDMA read. Dynamic
+   finalists use their resident ID and exact vector in the same beam format.
 
 Every expanded live node uses its complete adjacency list. V4 has no
 `gpu_cold_expansions` cutoff and never substitutes a fixed resident hot-edge
@@ -144,9 +158,11 @@ Dynamic candidates are grouped by the nearest storage-shard anchor, avoiding an
 RaBitQ entry, remote mapping, bucket link, override entry, and finally the
 visible count. Superseded records remain visible to older admitted snapshots.
 
-Mutation responses consume the storage invalidation payload and advance the
-adjacency-cache generation. A short TTL bounds staleness from asynchronous
-reverse-edge maintenance that completes after the foreground response.
+Mutation responses consume the storage invalidation payload and invalidate only
+the matching cache sets after their active readers drain; foreground writes no
+longer discard the entire multi-gigabyte adjacency cache. A short TTL bounds
+staleness from asynchronous reverse-edge maintenance that completes after the
+foreground response.
 Compaction drains active queries and rewrites only the live delta in place; it
 does not pretend to merge data into the immutable base code stream. A future
 storage compaction can drain queries and restream regenerated code ranges
@@ -161,12 +177,13 @@ are normalized by the converter, the complete manifest and optional code
 payloads are checksummed, and exact L2 uses the authoritative vector before an
 ID is returned.
 
-This guarantees format and estimator consistency, not perfect ANN recall.
-Recall still depends on graph quality, beam width, entry points, anchor probes,
-and the quality of the one-round deterministic signed Hadamard quantizer. The
-current rotator is weaker than stronger multi-round randomized RaBitQ variants.
-Use `GPU_SIDECAR_RABITQ_SOURCE=nodes` and measure candidate coverage plus final
-recall before making a paper claim.
+This guarantees format and estimator consistency, not perfect ANN recall. RaBitQ
+is never treated as an exact metric and never directly orders the traversal
+beam: it may only exclude candidates before authoritative exact-vector reads.
+Warmup and audit rounds bound sustained navigation drift, but recall still
+depends on graph quality, beam width, entry points, gate width, and anchor probes.
+The current one-round deterministic rotator is weaker than stronger randomized
+RaBitQ variants, so candidate coverage and final recall must both be reported.
 
 ## Running SIFT100M
 
@@ -176,6 +193,11 @@ recall before making a paper claim.
 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
 ./experiment/stop_memory_nodes.sh
 ```
+
+Restart every storage process after upgrading this engine. The GPUNetIO profile
+reserves one configured QP pool for GPU-issued reads and a second equal pool for
+bounded Verbs failover; an old storage process waits for a different QP count
+and cannot complete the startup handshake.
 
 Check local DOCA and GPU-memory registration first:
 

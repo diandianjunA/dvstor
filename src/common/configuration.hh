@@ -712,6 +712,10 @@ public:
       os << std::setw(width) << "Search engine: " << config.search_engine << std::endl;
       if (config.use_gpu_persistent_search()) {
         os << std::setw(width) << "GPU RDMA backend: " << config.gpu_rdma_backend << std::endl;
+        os << std::setw(width) << "GPU RDMA direct/fallback QPs: "
+           << config.gpu_rdma_qps << "/"
+           << (config.gpu_rdma_backend == "gpunetio" ? config.gpu_rdma_qps : 0)
+           << std::endl;
         os << std::setw(width) << "GPU query batch min/target/max: "
            << config.query_batch_min << "/" << config.query_batch_target << "/"
            << config.query_batch_max << std::endl;
@@ -763,9 +767,18 @@ public:
       os << std::setw(width) << "Query Batch Size: " << config.query_batch_size << std::endl;
       os << std::setw(width) << "Use RaBitQ: " << (config.use_rabitq ? "true" : "false") << std::endl;
       if (config.use_gpu_persistent_search()) {
-        os << std::setw(width) << "RaBitQ mode: gpu_resident_scoring" << std::endl;
-        os << std::setw(width) << "GPU exact rerank width: "
+        os << std::setw(width) << "RaBitQ mode: gpu_gate_exact_beam" << std::endl;
+        os << std::setw(width) << "GPU RaBitQ gate width: "
+           << config.rabitq_gate_width << std::endl;
+        os << std::setw(width) << "GPU RaBitQ gate max/round: "
+           << config.rabitq_gate_max_width *
+                std::max<u32>(1, config.gpu_graph_prefetch_depth) << std::endl;
+        os << std::setw(width) << "GPU exact final width: "
            << std::max(config.k, config.rabitq_gate_max_width) << std::endl;
+        os << std::setw(width) << "RaBitQ warmup exact expansions: "
+           << config.rabitq_warmup_exact_expansions << std::endl;
+        os << std::setw(width) << "RaBitQ audit period: "
+           << config.rabitq_audit_period << std::endl;
       } else {
         os << std::setw(width) << "RaBitQ mode: cpu_gate" << std::endl;
         os << std::setw(width) << "RaBitQ gate width: " << config.rabitq_gate_width << std::endl;

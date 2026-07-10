@@ -26,40 +26,49 @@ __device__ __forceinline__ void device_ring_relax(unsigned int cycles = 64) {
 #endif
 }
 
+__device__ __forceinline__ unsigned long long device_ring_load_acquire(
+    const unsigned long long* address) {
+  unsigned long long value = 0;
+  asm volatile("ld.acquire.sys.global.u64 %0, [%1];"
+               : "=l"(value)
+               : "l"(address)
+               : "memory");
+  return value;
+}
+
+__device__ __forceinline__ void device_ring_store_release(
+    unsigned long long* address, unsigned long long value) {
+  asm volatile("st.release.sys.global.u64 [%0], %1;"
+               :
+               : "l"(address), "l"(value)
+               : "memory");
+}
+
 template <class T>
 __device__ __forceinline__ bool device_ring_try_pop(DeviceRingView<T> ring, T& value) {
-  unsigned long long position = atomicAdd(ring.dequeue_position, 0ULL);
-  for (;;) {
-    const unsigned long long published =
-      *reinterpret_cast<volatile unsigned long long*>(ring.enqueue_position);
-    if (position >= published) return false;
-    const unsigned long long observed = atomicCAS(
-      ring.dequeue_position, position, position + 1ULL);
-    if (observed == position) break;
-    position = observed;
-  }
-
+  const unsigned long long position = __ldcg(ring.dequeue_position);
   const unsigned int slot = static_cast<unsigned int>(position) & ring.mask;
-  while (*reinterpret_cast<volatile unsigned long long*>(&ring.sequences[slot]) !=
-         position + 1ULL) {
-    device_ring_relax();
+  const unsigned long long sequence = device_ring_load_acquire(ring.sequences + slot);
+  bool claimed = false;
+  if (sequence == position + 1ULL) {
+    claimed = atomicCAS(ring.dequeue_position, position, position + 1ULL) == position;
+    if (claimed) {
+      value = ring.entries[slot];
+      device_ring_store_release(ring.sequences + slot, position + ring.capacity);
+    }
   }
-  value = ring.entries[slot];
-  __threadfence_system();
-  atomicExch(&ring.sequences[slot], position + ring.capacity);
-  return true;
+  return claimed;
 }
 
 template <class T>
 __device__ __forceinline__ void device_ring_push(DeviceRingView<T> ring, const T& value) {
   const unsigned long long position = atomicAdd(ring.enqueue_position, 1ULL);
   const unsigned int slot = static_cast<unsigned int>(position) & ring.mask;
-  while (*reinterpret_cast<volatile unsigned long long*>(&ring.sequences[slot]) != position) {
+  while (device_ring_load_acquire(ring.sequences + slot) != position) {
     device_ring_relax();
   }
   ring.entries[slot] = value;
-  __threadfence_system();
-  atomicExch(&ring.sequences[slot], position + 1ULL);
+  device_ring_store_release(ring.sequences + slot, position + 1ULL);
 }
 
 #endif

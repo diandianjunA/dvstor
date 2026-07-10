@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -145,14 +146,16 @@ private:
 
 class VerbsProxyFetchBackend final : public RemoteFetchBackend {
 public:
-  explicit VerbsProxyFetchBackend(const RemoteFetchBackendContext& context)
+  explicit VerbsProxyFetchBackend(const RemoteFetchBackendContext& context,
+                                  u32 requested_qps_per_node = 0)
       : config_(context.config), channel_context_(context.channel_context),
         connection_manager_(context.connection_manager), remote_regions_(context.remote_regions),
         data_context_(config_), gpu_region_(data_context_, context.gpu_destination_base,
                                            context.gpu_destination_bytes),
         gpu_base_(reinterpret_cast<u64>(context.gpu_destination_base)),
         gpu_bytes_(context.gpu_destination_bytes), next_qp_(remote_regions_.size(), 0) {
-    const u32 qps_per_node = std::max<u32>(1, config_.gpu_rdma_qps);
+    const u32 qps_per_node = requested_qps_per_node == 0
+      ? std::max<u32>(1, config_.gpu_rdma_qps) : requested_qps_per_node;
     qps_.resize(remote_regions_.size());
     for (u32 node = 0; node < qps_.size(); ++node) {
       qps_[node].reserve(qps_per_node);
@@ -163,6 +166,15 @@ public:
         qps_[node].push_back(std::move(qp));
       }
     }
+    check_cuda(cudaSetDevice(static_cast<int>(config_.gpu_device)),
+               "cudaSetDevice(verbs proxy init)");
+    int flush_options = 0;
+    check_cuda(cudaDeviceGetAttribute(
+                 &flush_options, cudaDevAttrGPUDirectRDMAFlushWritesOptions,
+                 static_cast<int>(config_.gpu_device)),
+               "cudaDeviceGetAttribute(verbs proxy GPUDirect flush)");
+    flush_supported_ =
+      (flush_options & cudaFlushGPUDirectRDMAWritesOptionHost) != 0;
   }
 
   RemoteBackendKind kind() const override { return RemoteBackendKind::verbs_proxy; }
@@ -172,6 +184,7 @@ public:
     if (requests.size() != statuses.size()) {
       throw std::invalid_argument("verbs proxy status cardinality mismatch");
     }
+    if (failed_) throw std::runtime_error("verbs proxy RDMA backend is unavailable");
     struct QpBatch {
       DetachedQP* qp{};
       std::vector<size_t> request_indices;
@@ -207,14 +220,24 @@ public:
     std::vector<ibv_wc> completions(64);
     for (QpBatch& batch : batches) {
       size_t remaining = batch.request_indices.size();
+      const u32 timeout_ms = std::min<u32>(config_.storage_owner_rpc_timeout_ms, 1000);
+      const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeout_ms);
       while (remaining > 0) {
         const i32 count = batch.qp->poll_send_cq(
           completions.data(), static_cast<i32>(std::min<size_t>(completions.size(), remaining)));
         if (count == 0) {
+          if (std::chrono::steady_clock::now() >= deadline) {
+            failed_ = true;
+            throw std::runtime_error("verbs proxy RDMA read timed out");
+          }
           std::this_thread::yield();
           continue;
         }
-        if (count < 0) throw std::runtime_error("verbs proxy CQ polling failed");
+        if (count < 0) {
+          failed_ = true;
+          throw std::runtime_error("verbs proxy CQ polling failed");
+        }
         remaining -= static_cast<size_t>(count);
         for (i32 i = 0; i < count; ++i) {
           const size_t request_index = static_cast<size_t>(completions[i].wr_id - 1);
@@ -223,6 +246,18 @@ public:
           }
         }
       }
+    }
+    thread_local int selected_gpu = -1;
+    if (selected_gpu != static_cast<int>(config_.gpu_device)) {
+      check_cuda(cudaSetDevice(static_cast<int>(config_.gpu_device)),
+                 "cudaSetDevice(verbs proxy fetch)");
+      selected_gpu = static_cast<int>(config_.gpu_device);
+    }
+    if (flush_supported_) {
+      check_cuda(cudaDeviceFlushGPUDirectRDMAWrites(
+                   cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
+                   cudaFlushGPUDirectRDMAWritesToOwner),
+                 "cudaDeviceFlushGPUDirectRDMAWrites(verbs proxy fetch)");
     }
   }
 
@@ -237,67 +272,8 @@ private:
   size_t gpu_bytes_{};
   std::vector<std::vector<std::unique_ptr<DetachedQP>>> qps_;
   std::vector<u32> next_qp_;
-};
-
-class ControlQpBootstrapBackend final : public RemoteFetchBackend {
-public:
-  explicit ControlQpBootstrapBackend(const RemoteFetchBackendContext& context)
-      : channel_context_(context.channel_context),
-        connection_manager_(context.connection_manager),
-        remote_regions_(context.remote_regions),
-        gpu_region_(channel_context_, context.gpu_destination_base,
-                    context.gpu_destination_bytes),
-        gpu_base_(reinterpret_cast<u64>(context.gpu_destination_base)),
-        gpu_bytes_(context.gpu_destination_bytes) {}
-
-  RemoteBackendKind kind() const override { return RemoteBackendKind::verbs_proxy; }
-
-  void fetch(std::span<const FetchDescriptor> requests,
-             std::span<i32> statuses) override {
-    if (requests.size() != statuses.size()) {
-      throw std::invalid_argument("control-QP bootstrap status cardinality mismatch");
-    }
-    size_t posted = 0;
-    for (size_t index = 0; index < requests.size(); ++index) {
-      const FetchDescriptor& request = requests[index];
-      statuses[index] = -EINVAL;
-      const u64 destination_offset = request.destination_address >= gpu_base_
-        ? request.destination_address - gpu_base_ : gpu_bytes_;
-      if (request.memory_node >= remote_regions_.size() || request.bytes == 0 ||
-          request.destination_address < gpu_base_ || destination_offset > gpu_bytes_ ||
-          request.bytes > gpu_bytes_ - destination_offset) {
-        continue;
-      }
-      connection_manager_.server_qps[request.memory_node]->post_send(
-        request.destination_address, request.bytes, gpu_region_.get_lkey(),
-        IBV_WR_RDMA_READ, true, false, remote_regions_[request.memory_node].get(),
-        request.remote_offset, 0, index + 1);
-      ++posted;
-    }
-    if (posted != 0) {
-      channel_context_.poll_send_cq_until_completion(static_cast<i32>(posted));
-    }
-    for (size_t index = 0; index < requests.size(); ++index) {
-      if (statuses[index] == -EINVAL) {
-        const FetchDescriptor& request = requests[index];
-        const u64 destination_offset = request.destination_address >= gpu_base_
-          ? request.destination_address - gpu_base_ : gpu_bytes_;
-        if (request.memory_node < remote_regions_.size() && request.bytes != 0 &&
-            request.destination_address >= gpu_base_ && destination_offset <= gpu_bytes_ &&
-            request.bytes <= gpu_bytes_ - destination_offset) {
-          statuses[index] = 1;
-        }
-      }
-    }
-  }
-
-private:
-  Context& channel_context_;
-  ClientConnectionManager& connection_manager_;
-  const MemoryRegionTokens& remote_regions_;
-  LocalMemoryRegion gpu_region_;
-  u64 gpu_base_{};
-  size_t gpu_bytes_{};
+  bool flush_supported_{};
+  bool failed_{};
 };
 
 }  // namespace
@@ -319,9 +295,10 @@ std::unique_ptr<RemoteFetchBackend> create_remote_fetch_backend(
   throw std::runtime_error("unknown remote fetch backend");
 }
 
-std::unique_ptr<RemoteFetchBackend> create_control_qp_bootstrap_backend(
+std::unique_ptr<RemoteFetchBackend> create_gpunetio_fallback_backend(
     const RemoteFetchBackendContext& context) {
-  return std::make_unique<ControlQpBootstrapBackend>(context);
+  return std::make_unique<VerbsProxyFetchBackend>(
+    context, std::max<u32>(1, context.config.gpu_rdma_qps));
 }
 
 }  // namespace gpu_search

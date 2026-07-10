@@ -11,7 +11,7 @@ using cudaStream_t = CUstream_st*;
 namespace gpu_search {
 
 inline constexpr u32 kPersistentMaxBeam = 256;
-inline constexpr u32 kPersistentMaxExact = 128;
+inline constexpr u32 kPersistentMaxExact = 256;
 inline constexpr u32 kPersistentMaxCodeBits = 1024;
 inline constexpr u32 kPersistentMaxEntryPoints = 512;
 inline constexpr u32 kPersistentMaxGraphDegree = 255;
@@ -80,6 +80,11 @@ struct PersistentKernelParams {
   u32 vector_dtype{};
   u32 beam_width{};
   u32 exact_width{};
+  u32 gate_width{};
+  u32 gate_max_width{};
+  f32 gate_margin{};
+  u32 warmup_exact_expansions{};
+  u32 audit_period{};
   u32 max_expansions{};
   u32 prefetch_depth{};
   u32 visited_capacity{};
@@ -89,9 +94,13 @@ struct PersistentKernelParams {
   u32 direct_qps_per_node{};
   u32 direct_local_mkey{};
   u64 direct_local_iova_base{};
+  u64 direct_timeout_ns{};
   const DirectRemoteRegion* direct_regions{};
   void* const* direct_qps{};
   u8* direct_dump{};
+  u32* direct_qp_locks{};
+  u32* direct_disabled{};
+  i32* direct_error{};
   const DeviceDeltaRecord* delta_records{};
   const f32* delta_vectors{};
   const u8* delta_rabitq_entries{};
@@ -126,6 +135,7 @@ struct PersistentKernelParams {
   f32* rotated_queries{};
   f32* query_luts{};
   u32* beam_handles{};
+  u32* beam_ids{};
   f32* beam_distances{};
   u8* beam_expanded{};
   u32* visited_hash{};
@@ -145,11 +155,9 @@ void launch_insert_delta_remote(cudaStream_t stream, u64* keys, u32* slots,
                                 u32 capacity, u64 remote_node, u32 slot);
 void launch_link_delta_bucket(cudaStream_t stream, u32* bucket_heads, u32* next,
                               u32 bucket, u32 slot);
-void launch_bump_graph_cache_generation(cudaStream_t stream, u64* generation);
-void launch_direct_code_bootstrap(cudaStream_t stream,
-                                  const PersistentKernelParams& params,
-                                  const FetchDescriptor* requests,
-                                  i32* statuses,
-                                  u32 count);
+void launch_invalidate_graph_cache(cudaStream_t stream, const u64* invalidation_keys,
+                                   u32 invalidation_count, const u64* cache_keys,
+                                   u32* cache_states, const u32* cache_readers,
+                                   u32 cache_sets, u32 cache_ways);
 
 }  // namespace gpu_search

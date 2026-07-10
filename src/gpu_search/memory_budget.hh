@@ -101,7 +101,7 @@ inline Result estimate(const Request& request) {
     static_cast<u64>(request.query_slots) * request.code_bits * sizeof(f32) +
     static_cast<u64>(request.query_slots) * (request.code_bits / 8) * 256 * sizeof(f32) +
     static_cast<u64>(request.query_slots) * request.beam_width *
-      (sizeof(u32) + sizeof(f32) + sizeof(u8)) +
+      (2 * sizeof(u32) + sizeof(f32) + sizeof(u8)) +
     static_cast<u64>(request.query_slots) * result.visited_capacity * sizeof(u32) +
     static_cast<u64>(request.query_slots) * request.anchor_count * sizeof(f32);
   result.exact_bytes = static_cast<u64>(request.query_slots) * request.exact_width *

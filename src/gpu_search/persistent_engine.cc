@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <fstream>
 #include <future>
 #include <limits>
@@ -70,7 +71,13 @@ void device_free(T*& pointer) {
 template <class T>
 class MappedRing {
 public:
-  explicit MappedRing(u32 capacity) : capacity_(next_power_of_two(capacity)) {
+  enum class Direction {
+    host_to_device,
+    device_to_host,
+  };
+
+  MappedRing(u32 capacity, Direction direction)
+      : capacity_(next_power_of_two(capacity)), direction_(direction) {
     check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&enqueue_host_), sizeof(u64),
                              cudaHostAllocMapped), "cudaHostAlloc(ring enqueue)");
     check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&dequeue_host_), sizeof(u64),
@@ -96,6 +103,15 @@ public:
                "cudaHostGetDevicePointer(ring sequences)");
     check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&entries_device), entries_host_, 0),
                "cudaHostGetDevicePointer(ring entries)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&device_owned_position_), sizeof(u64)),
+               "cudaMalloc(ring device position)");
+    check_cuda(cudaMemset(device_owned_position_, 0, sizeof(u64)),
+               "cudaMemset(ring device position)");
+    if (direction_ == Direction::host_to_device) {
+      dequeue_device = device_owned_position_;
+    } else {
+      enqueue_device = device_owned_position_;
+    }
     device_view_ = {
       .enqueue_position = reinterpret_cast<unsigned long long*>(enqueue_device),
       .dequeue_position = reinterpret_cast<unsigned long long*>(dequeue_device),
@@ -107,6 +123,7 @@ public:
   }
 
   ~MappedRing() {
+    if (device_owned_position_ != nullptr) cudaFree(device_owned_position_);
     if (entries_host_ != nullptr) cudaFreeHost(entries_host_);
     if (sequences_host_ != nullptr) cudaFreeHost(sequences_host_);
     if (dequeue_host_ != nullptr) cudaFreeHost(dequeue_host_);
@@ -145,6 +162,8 @@ private:
   u64* dequeue_host_{};
   u64* sequences_host_{};
   T* entries_host_{};
+  u64* device_owned_position_{};
+  Direction direction_{};
   DeviceRingView<T> device_view_{};
 };
 
@@ -220,15 +239,27 @@ struct PersistentSearchEngine::Impl {
     std::chrono::steady_clock::time_point enqueued_at{};
   };
 
+  void bind_cuda_device(const char* operation) const {
+    int current_device = -1;
+    check_cuda(cudaGetDevice(&current_device), "cudaGetDevice(GPU V4)");
+    if (current_device != static_cast<int>(config.gpu_device)) {
+      check_cuda(cudaSetDevice(static_cast<int>(config.gpu_device)), operation);
+    }
+  }
+
   Impl(PersistentSearchEngine& owner,
        configuration::IndexConfiguration& config_in,
        Context& channel_context,
        ClientConnectionManager& connection_manager,
        const MemoryRegionTokens& remote_regions)
-      : engine(owner), config(config_in), submissions(config.query_batch_max * 2),
-        completions(config.query_batch_max * 2),
+      : engine(owner), config(config_in),
+        submissions(config.query_batch_max * 2,
+                    MappedRing<QueryDescriptor>::Direction::host_to_device),
+        completions(config.query_batch_max * 2,
+                    MappedRing<CompletionDescriptor>::Direction::device_to_host),
         fetches(config.query_batch_max *
-                (kPersistentMaxExact + kPersistentMaxPrefetch) * 4) {
+                  (kPersistentMaxExact + kPersistentMaxPrefetch) * 4,
+                MappedRing<FetchDescriptor>::Direction::device_to_host) {
     EngineKind engine_kind;
     RemoteBackendKind parsed_backend;
     if (!parse_engine_kind(config.search_engine, engine_kind) ||
@@ -236,6 +267,7 @@ struct PersistentSearchEngine::Impl {
         !parse_remote_backend_kind(config.gpu_rdma_backend, parsed_backend)) {
       throw std::invalid_argument("invalid persistent search engine configuration");
     }
+    bind_cuda_device("cudaSetDevice(GPU V4 construction)");
     backend_kind = parsed_backend;
     if (config.beam_width > kPersistentMaxBeam ||
         config.rabitq_gate_max_width > kPersistentMaxExact ||
@@ -278,7 +310,10 @@ struct PersistentSearchEngine::Impl {
                                      index.header.num_shards);
     query_slots = config.query_batch_max;
     result_capacity = std::max<u32>(config.k, config.rabitq_gate_max_width);
-    exact_width = result_capacity;
+    const u64 scaled_gate_width = static_cast<u64>(config.rabitq_gate_max_width) *
+      std::max<u32>(1, config.gpu_graph_prefetch_depth);
+    exact_width = static_cast<u32>(std::min<u64>(
+      kPersistentMaxExact, std::max<u64>(result_capacity, scaled_gate_width)));
     code_bits = index.header.rabitq_code_bits;
     free_slots.resize(query_slots);
     for (u32 slot = 0; slot < query_slots; ++slot) free_slots[slot] = slot;
@@ -324,6 +359,11 @@ struct PersistentSearchEngine::Impl {
     graph_cache_sets = budget.cache_sets;
     graph_cache_slots = budget.cache_slots;
     graph_cache_bytes = static_cast<size_t>(budget.cache_payload_bytes);
+    const u64 invalidation_capacity = static_cast<u64>(config.storage_owner_batch_max) * config.R;
+    if (invalidation_capacity > std::numeric_limits<u32>::max()) {
+      throw std::runtime_error("GPU V4 graph invalidation capacity exceeds uint32");
+    }
+    graph_invalidation_capacity = static_cast<u32>(std::max<u64>(1, invalidation_capacity));
     explicit_gpu_bytes = budget.explicit_bytes;
     const u64 code_bytes = budget.code_bytes;
     const u64 exact_bytes = budget.exact_bytes;
@@ -358,7 +398,18 @@ struct PersistentSearchEngine::Impl {
     d_exact_records = d_remote_buffer + exact_region_offset;
     d_graph_cache = d_remote_buffer + graph_cache_offset;
 
-    if (parsed_backend != RemoteBackendKind::gpunetio) {
+    if (parsed_backend == RemoteBackendKind::gpunetio) {
+      backend = create_gpunetio_fallback_backend(RemoteFetchBackendContext{
+        .config = config,
+        .channel_context = channel_context,
+        .connection_manager = connection_manager,
+        .remote_regions = remote_regions,
+        .gpu_destination_base = d_remote_buffer,
+        .gpu_destination_bytes = remote_buffer_bytes,
+      });
+      std::cerr << "[gpu-search] bootstrap=CPU-posted GPUDirect RDMA; "
+                   "steady_state=GPU-initiated GPUNetIO with verbs failover\n";
+    } else {
       backend = create_remote_fetch_backend(parsed_backend, RemoteFetchBackendContext{
         .config = config,
         .channel_context = channel_context,
@@ -368,22 +419,7 @@ struct PersistentSearchEngine::Impl {
         .gpu_destination_bytes = remote_buffer_bytes,
       });
     }
-    std::unique_ptr<RemoteFetchBackend> bootstrap_backend;
-    RemoteFetchBackend* bootstrap_source = backend.get();
-    if (parsed_backend == RemoteBackendKind::gpunetio) {
-      bootstrap_backend = create_control_qp_bootstrap_backend(RemoteFetchBackendContext{
-        .config = config,
-        .channel_context = channel_context,
-        .connection_manager = connection_manager,
-        .remote_regions = remote_regions,
-        .gpu_destination_base = d_remote_buffer,
-        .gpu_destination_bytes = remote_buffer_bytes,
-      });
-      bootstrap_source = bootstrap_backend.get();
-      std::cerr << "[gpu-search] bootstrap=CPU-posted GPUDirect RDMA; "
-                   "steady_state=GPU-initiated GPUNetIO\n";
-    }
-    stream_codes_to_gpu(bootstrap_source);
+    stream_codes_to_gpu(*backend);
 
     device_allocate(d_shards, index.shards.size(), "cudaMalloc(GPU V4 shards)");
     device_allocate(d_centroid, index.centroid.size(), "cudaMalloc(GPU V4 centroid)");
@@ -425,6 +461,8 @@ struct PersistentSearchEngine::Impl {
                     "cudaMalloc(GPU V4 query LUTs)");
     device_allocate(d_beam_handles, static_cast<size_t>(query_slots) * config.beam_width,
                     "cudaMalloc(GPU V4 beam handles)");
+    device_allocate(d_beam_ids, static_cast<size_t>(query_slots) * config.beam_width,
+                    "cudaMalloc(GPU V4 beam ids)");
     device_allocate(d_beam_distances, static_cast<size_t>(query_slots) * config.beam_width,
                     "cudaMalloc(GPU V4 beam distances)");
     device_allocate(d_beam_expanded, static_cast<size_t>(query_slots) * config.beam_width,
@@ -441,6 +479,8 @@ struct PersistentSearchEngine::Impl {
     device_allocate(d_graph_cache_readers, graph_cache_slots, "cudaMalloc(V4 cache readers)");
     device_allocate(d_graph_cache_victims, graph_cache_sets, "cudaMalloc(V4 cache victims)");
     device_allocate(d_graph_cache_generation, 1, "cudaMalloc(V4 cache generation)");
+    device_allocate(d_graph_invalidation_keys, graph_invalidation_capacity,
+                    "cudaMalloc(V4 graph invalidation keys)");
     check_cuda(cudaMemset(d_graph_cache_states, 0,
                           static_cast<size_t>(graph_cache_slots) * sizeof(u32)),
                "cudaMemset(V4 cache states)");
@@ -494,6 +534,28 @@ struct PersistentSearchEngine::Impl {
     *stop_host = 0;
     check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&stop_device), stop_host, 0),
                "cudaHostGetDevicePointer(GPU V4 stop)");
+    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&direct_disabled_host), sizeof(u32),
+                             cudaHostAllocMapped),
+               "cudaHostAlloc(GPU V4 direct fallback)");
+    *direct_disabled_host = 0;
+    check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&direct_disabled_device),
+                                        direct_disabled_host, 0),
+               "cudaHostGetDevicePointer(GPU V4 direct fallback)");
+    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&direct_error_host), sizeof(i32),
+                             cudaHostAllocMapped),
+               "cudaHostAlloc(GPU V4 direct error)");
+    *direct_error_host = 0;
+    check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&direct_error_device),
+                                        direct_error_host, 0),
+               "cudaHostGetDevicePointer(GPU V4 direct error)");
+    const size_t direct_qp_count = static_cast<size_t>(direct_view.qps_per_node) *
+      direct_view.remote_region_count;
+    device_allocate(d_direct_qp_locks, direct_qp_count,
+                    "cudaMalloc(GPU V4 direct QP locks)");
+    if (d_direct_qp_locks != nullptr) {
+      check_cuda(cudaMemset(d_direct_qp_locks, 0, direct_qp_count * sizeof(u32)),
+                 "cudaMemset(GPU V4 direct QP locks)");
+    }
     fetch_status_stride = exact_width + config.gpu_graph_prefetch_depth;
     const size_t status_count = static_cast<size_t>(query_slots) * fetch_status_stride;
     check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&fetch_status_host),
@@ -543,6 +605,11 @@ struct PersistentSearchEngine::Impl {
       .vector_dtype = static_cast<u32>(config.resolved_vector_dtype()),
       .beam_width = config.beam_width,
       .exact_width = exact_width,
+      .gate_width = config.rabitq_gate_width,
+      .gate_max_width = config.rabitq_gate_max_width,
+      .gate_margin = static_cast<f32>(config.rabitq_gate_margin),
+      .warmup_exact_expansions = config.rabitq_warmup_exact_expansions,
+      .audit_period = config.rabitq_audit_period,
       .max_expansions = config.beam_width,
       .prefetch_depth = config.gpu_graph_prefetch_depth,
       .visited_capacity = visited_capacity,
@@ -552,9 +619,13 @@ struct PersistentSearchEngine::Impl {
       .direct_qps_per_node = direct_view.qps_per_node,
       .direct_local_mkey = direct_view.local_mkey,
       .direct_local_iova_base = direct_view.local_iova_base,
+      .direct_timeout_ns = 20000000ULL,
       .direct_regions = reinterpret_cast<const DirectRemoteRegion*>(direct_view.remote_regions),
       .direct_qps = direct_view.qp_array,
       .direct_dump = direct_view.dump,
+      .direct_qp_locks = d_direct_qp_locks,
+      .direct_disabled = direct_disabled_device,
+      .direct_error = direct_error_device,
       .delta_records = d_delta_records,
       .delta_vectors = d_delta_vectors,
       .delta_rabitq_entries = d_delta_rabitq,
@@ -589,6 +660,7 @@ struct PersistentSearchEngine::Impl {
       .rotated_queries = d_rotated_queries,
       .query_luts = d_query_luts,
       .beam_handles = d_beam_handles,
+      .beam_ids = d_beam_ids,
       .beam_distances = d_beam_distances,
       .beam_expanded = d_beam_expanded,
       .visited_hash = d_visited,
@@ -596,7 +668,7 @@ struct PersistentSearchEngine::Impl {
       .result_ids = d_result_ids,
       .result_distances = d_result_distances,
     };
-    if (parsed_backend != RemoteBackendKind::gpunetio) {
+    if (backend != nullptr) {
       fetch_thread = std::thread([this] { fetch_loop(); });
     }
     admission_thread = std::thread([this] { admission_loop(); });
@@ -605,115 +677,55 @@ struct PersistentSearchEngine::Impl {
     maintenance_thread = std::thread([this] { maintenance_loop(); });
   }
 
-  void stream_codes_to_gpu(RemoteFetchBackend* source) {
+  void stream_codes_to_gpu(RemoteFetchBackend& source) {
     const u64 window_bytes = static_cast<u64>(config.gpu_bootstrap_window_mb) << 20;
     std::vector<FetchDescriptor> requests;
     std::vector<i32> statuses;
     requests.reserve(config.gpu_bootstrap_windows);
-    FetchDescriptor* d_requests = nullptr;
-    i32* d_statuses = nullptr;
-    cudaStream_t bootstrap_stream = nullptr;
-    PersistentKernelParams bootstrap_params;
-    if (source == nullptr) {
-      device_allocate(d_requests, config.gpu_bootstrap_windows,
-                      "cudaMalloc(GPUNetIO bootstrap requests)");
-      device_allocate(d_statuses, config.gpu_bootstrap_windows,
-                      "cudaMalloc(GPUNetIO bootstrap statuses)");
-      check_cuda(cudaStreamCreateWithFlags(&bootstrap_stream, cudaStreamNonBlocking),
-                 "cudaStreamCreate(GPUNetIO bootstrap)");
-      bootstrap_params.direct_backend = 1;
-      bootstrap_params.direct_region_count = direct_view.remote_region_count;
-      bootstrap_params.direct_qps_per_node = direct_view.qps_per_node;
-      bootstrap_params.direct_local_mkey = direct_view.local_mkey;
-      bootstrap_params.direct_local_iova_base = direct_view.local_iova_base;
-      bootstrap_params.direct_regions =
-        reinterpret_cast<const DirectRemoteRegion*>(direct_view.remote_regions);
-      bootstrap_params.direct_qps = direct_view.qp_array;
-      bootstrap_params.direct_dump = direct_view.dump;
-    }
     u64 streamed = 0;
-    try {
-      for (const format::ShardRegion& shard : index.shards) {
-        for (u64 offset = 0; offset < shard.code_bytes;) {
-          requests.clear();
-          for (u32 window = 0; window < config.gpu_bootstrap_windows &&
-               offset < shard.code_bytes; ++window) {
-            const u32 bytes = static_cast<u32>(std::min<u64>(
-              window_bytes, shard.code_bytes - offset));
-            requests.push_back(FetchDescriptor{
-              .remote_offset = shard.code_remote_offset + offset,
-              .destination_address = reinterpret_cast<u64>(d_rabitq_entries +
-                shard.ordinal_base * index.header.rabitq_entry_bytes + offset),
-              .bytes = bytes,
-              .memory_node = static_cast<u16>(shard.memory_node),
-              .kind = static_cast<u8>(FetchKind::code),
-            });
-            offset += bytes;
-          }
-          statuses.assign(requests.size(), -EIO);
-          if (source != nullptr) {
-            source->fetch(requests, statuses);
-          } else {
-            check_cuda(cudaMemcpyAsync(d_requests, requests.data(),
-                                       requests.size() * sizeof(FetchDescriptor),
-                                       cudaMemcpyHostToDevice, bootstrap_stream),
-                       "cudaMemcpyAsync(GPUNetIO bootstrap requests)");
-            launch_direct_code_bootstrap(
-              bootstrap_stream, bootstrap_params, d_requests, d_statuses,
-              static_cast<u32>(requests.size()));
-            check_cuda(cudaPeekAtLastError(), "launch_direct_code_bootstrap");
-            check_cuda(cudaMemcpyAsync(statuses.data(), d_statuses,
-                                       statuses.size() * sizeof(i32),
-                                       cudaMemcpyDeviceToHost, bootstrap_stream),
-                       "cudaMemcpyAsync(GPUNetIO bootstrap statuses)");
-            check_cuda(cudaStreamSynchronize(bootstrap_stream),
-                       "cudaStreamSynchronize(GPUNetIO bootstrap)");
-          }
-          for (size_t request_index = 0; request_index < statuses.size(); ++request_index) {
-            if (statuses[request_index] <= 0) {
-              const FetchDescriptor& request = requests[request_index];
-              throw std::runtime_error(
-                "RDMA V4 code bootstrap failed: status=" +
-                std::to_string(statuses[request_index]) + " shard=" +
-                std::to_string(request.memory_node) + " remote_offset=" +
-                std::to_string(request.remote_offset) + " bytes=" +
-                std::to_string(request.bytes) + " destination=" +
-                std::to_string(request.destination_address));
-            }
-          }
-          for (const FetchDescriptor& request : requests) streamed += request.bytes;
+    for (const format::ShardRegion& shard : index.shards) {
+      for (u64 offset = 0; offset < shard.code_bytes;) {
+        requests.clear();
+        for (u32 window = 0; window < config.gpu_bootstrap_windows &&
+             offset < shard.code_bytes; ++window) {
+          const u32 bytes = static_cast<u32>(std::min<u64>(
+            window_bytes, shard.code_bytes - offset));
+          requests.push_back(FetchDescriptor{
+            .remote_offset = shard.code_remote_offset + offset,
+            .destination_address = reinterpret_cast<u64>(d_rabitq_entries +
+              shard.ordinal_base * index.header.rabitq_entry_bytes + offset),
+            .bytes = bytes,
+            .memory_node = static_cast<u16>(shard.memory_node),
+            .kind = static_cast<u8>(FetchKind::code),
+          });
+          offset += bytes;
         }
+        statuses.assign(requests.size(), -EIO);
+        source.fetch(requests, statuses);
+        for (size_t request_index = 0; request_index < statuses.size(); ++request_index) {
+          if (statuses[request_index] <= 0) {
+            const FetchDescriptor& request = requests[request_index];
+            throw std::runtime_error(
+              "RDMA V4 code bootstrap failed: status=" +
+              std::to_string(statuses[request_index]) + " shard=" +
+              std::to_string(request.memory_node) + " remote_offset=" +
+              std::to_string(request.remote_offset) + " bytes=" +
+              std::to_string(request.bytes) + " destination=" +
+              std::to_string(request.destination_address));
+          }
+        }
+        for (const FetchDescriptor& request : requests) streamed += request.bytes;
       }
-    } catch (...) {
-      if (bootstrap_stream != nullptr) cudaStreamDestroy(bootstrap_stream);
-      device_free(d_statuses);
-      device_free(d_requests);
-      throw;
     }
-    if (bootstrap_stream != nullptr) cudaStreamDestroy(bootstrap_stream);
-    device_free(d_statuses);
-    device_free(d_requests);
     const u64 expected = index.header.num_nodes * index.header.rabitq_entry_bytes;
     if (streamed != expected) throw std::runtime_error("GPU V4 code bootstrap size mismatch");
-    if (source != nullptr && source->kind() == RemoteBackendKind::verbs_proxy) {
-      int flush_options = 0;
-      check_cuda(cudaDeviceGetAttribute(
-                   &flush_options, cudaDevAttrGPUDirectRDMAFlushWritesOptions,
-                   static_cast<int>(config.gpu_device)),
-                 "cudaDeviceGetAttribute(GPUDirect flush options)");
-      if ((flush_options & cudaFlushGPUDirectRDMAWritesOptionHost) != 0) {
-        check_cuda(cudaDeviceFlushGPUDirectRDMAWrites(
-                     cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
-                     cudaFlushGPUDirectRDMAWritesToOwner),
-                   "cudaDeviceFlushGPUDirectRDMAWrites(GPU V4 bootstrap)");
-      }
-    }
     check_cuda(cudaDeviceSynchronize(), "cudaDeviceSynchronize(GPU V4 bootstrap)");
     std::cerr << "[gpu-search] streamed " << streamed
               << " RaBitQ bytes directly into final GPU storage\n";
   }
 
   void clear_delta_device_state() {
+    bind_cuda_device("cudaSetDevice(GPU V4 delta reset)");
     check_cuda(cudaMemset(d_delta_records, 0,
                           static_cast<size_t>(delta_capacity) * sizeof(DeviceDeltaRecord)),
                "cudaMemset(V4 delta records)");
@@ -741,14 +753,17 @@ struct PersistentSearchEngine::Impl {
   }
 
   void start_persistent_kernel() {
+    bind_cuda_device("cudaSetDevice(GPU V4 kernel start)");
     std::atomic_ref<u32>(*stop_host).store(0, std::memory_order_release);
+    (void)cudaGetLastError();
     launch_persistent_search(kernel_stream, kernel_params, kernel_blocks, 128);
-    check_cuda(cudaPeekAtLastError(), "launch_persistent_search(V4)");
+    check_cuda(cudaGetLastError(), "launch_persistent_search(V4)");
     kernel_running = true;
   }
 
   void stop_persistent_kernel() {
     if (!kernel_running) return;
+    bind_cuda_device("cudaSetDevice(GPU V4 kernel stop)");
     std::atomic_ref<u32>(*stop_host).store(1, std::memory_order_release);
     const cudaError_t status = cudaStreamSynchronize(kernel_stream);
     kernel_running = false;
@@ -756,6 +771,11 @@ struct PersistentSearchEngine::Impl {
   }
 
   ~Impl() {
+    const cudaError_t device_status = cudaSetDevice(static_cast<int>(config.gpu_device));
+    if (device_status != cudaSuccess) {
+      std::cerr << "[gpu-search] failed to bind CUDA device during teardown: "
+                << cudaGetErrorString(device_status) << '\n';
+    }
     accepting.store(false, std::memory_order_release);
     maintenance_shutdown.store(true, std::memory_order_release);
     maintenance_cv.notify_all();
@@ -773,14 +793,18 @@ struct PersistentSearchEngine::Impl {
     if (admission_thread.joinable()) admission_thread.join();
     if (fetch_thread.joinable()) fetch_thread.join();
     if (completion_thread.joinable()) completion_thread.join();
+    backend.reset();
     if (delta_stream != nullptr) cudaStreamDestroy(delta_stream);
     if (transfer_stream != nullptr) cudaStreamDestroy(transfer_stream);
     if (kernel_stream != nullptr) cudaStreamDestroy(kernel_stream);
     if (fetch_status_host != nullptr) cudaFreeHost(fetch_status_host);
+    if (direct_disabled_host != nullptr) cudaFreeHost(direct_disabled_host);
+    if (direct_error_host != nullptr) cudaFreeHost(direct_error_host);
     if (stop_host != nullptr) cudaFreeHost(stop_host);
     if (result_distances_host != nullptr) cudaFreeHost(result_distances_host);
     if (result_ids_host != nullptr) cudaFreeHost(result_ids_host);
     device_free(d_delta_count);
+    device_free(d_direct_qp_locks);
     device_free(d_delta_remote_slots);
     device_free(d_delta_remote_keys);
     device_free(d_base_override_epochs);
@@ -790,6 +814,7 @@ struct PersistentSearchEngine::Impl {
     device_free(d_delta_vectors);
     device_free(d_delta_records);
     device_free(d_graph_cache_generation);
+    device_free(d_graph_invalidation_keys);
     device_free(d_graph_cache_victims);
     device_free(d_graph_cache_states);
     device_free(d_graph_cache_readers);
@@ -803,6 +828,7 @@ struct PersistentSearchEngine::Impl {
     device_free(d_visited);
     device_free(d_beam_expanded);
     device_free(d_beam_distances);
+    device_free(d_beam_ids);
     device_free(d_beam_handles);
     device_free(d_query_luts);
     device_free(d_rotated_queries);
@@ -869,6 +895,7 @@ struct PersistentSearchEngine::Impl {
   }
 
   void admission_loop() {
+    bind_cuda_device("cudaSetDevice(GPU V4 admission)");
     std::vector<PendingSubmission> batch;
     batch.reserve(config.query_batch_target);
     while (!shutdown.load(std::memory_order_acquire)) {
@@ -980,7 +1007,59 @@ struct PersistentSearchEngine::Impl {
     return best;
   }
 
+  u64 graph_cache_key(u64 raw) const {
+    const u32 shard = static_cast<u32>(raw >> 48);
+    const u64 node_offset = (raw << 16) >> 16;
+    if (raw == 0 || shard >= index.shards.size()) {
+      throw std::runtime_error("storage returned an invalid GPU graph-cache invalidation");
+    }
+    const format::ShardRegion& region = index.shards[shard];
+    u64 graph_offset = 0;
+    if (node_offset >= region.node_base_offset && region.node_stride != 0) {
+      const u64 relative = node_offset - region.node_base_offset;
+      if (relative % region.node_stride == 0 &&
+          relative / region.node_stride < region.node_count) {
+        graph_offset = region.graph_base_offset +
+          (relative / region.node_stride) * index.header.graph_entry_bytes;
+      }
+    }
+    if (graph_offset == 0) {
+      if (node_offset < region.dynamic_base_offset || region.dynamic_record_bytes == 0 ||
+          (node_offset - region.dynamic_base_offset) % region.dynamic_record_bytes != 0) {
+        throw std::runtime_error("storage returned a misaligned GPU graph-cache invalidation");
+      }
+      graph_offset = node_offset + region.dynamic_hot_offset;
+    }
+    return (static_cast<u64>(shard) << 48) | graph_offset;
+  }
+
+  void invalidate_graph_cache(std::span<const u64> raw_nodes) {
+    if (raw_nodes.empty()) return;
+    std::vector<u64> keys;
+    keys.reserve(raw_nodes.size());
+    for (u64 raw : raw_nodes) keys.push_back(graph_cache_key(raw));
+    std::sort(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+    if (keys.size() > graph_invalidation_capacity) {
+      throw std::runtime_error("GPU V4 graph invalidation batch exceeds capacity");
+    }
+    bind_cuda_device("cudaSetDevice(GPU V4 graph invalidation)");
+    check_cuda(cudaMemcpyAsync(d_graph_invalidation_keys, keys.data(),
+                               keys.size() * sizeof(u64), cudaMemcpyHostToDevice,
+                               delta_stream),
+               "cudaMemcpyAsync(V4 graph invalidation keys)");
+    launch_invalidate_graph_cache(
+      delta_stream, d_graph_invalidation_keys, static_cast<u32>(keys.size()),
+      d_graph_cache_keys, d_graph_cache_states, d_graph_cache_readers,
+      graph_cache_sets, config.gpu_adjacency_cache_ways);
+    check_cuda(cudaGetLastError(), "launch GPU V4 graph invalidation");
+    check_cuda(cudaStreamSynchronize(delta_stream),
+               "cudaStreamSynchronize(V4 graph invalidation)");
+  }
+
   void upload_records_locked(std::vector<DeltaMutation>& mutations, bool rebuilding) {
+    bind_cuda_device("cudaSetDevice(GPU V4 delta publication)");
+    (void)cudaGetLastError();
     const u32 first_slot = static_cast<u32>(delta_records_host.size());
     if (first_slot + mutations.size() > delta_capacity) {
       throw std::runtime_error("GPU V4 delta live set exceeds its configured capacity");
@@ -1085,9 +1164,8 @@ struct PersistentSearchEngine::Impl {
       }
     }
     const u32 count = static_cast<u32>(delta_records_host.size());
-    launch_bump_graph_cache_generation(delta_stream, d_graph_cache_generation);
     launch_publish_delta_count(delta_stream, d_delta_count, count);
-    check_cuda(cudaPeekAtLastError(), "launch GPU V4 delta publication");
+    check_cuda(cudaGetLastError(), "launch GPU V4 delta publication");
     check_cuda(cudaStreamSynchronize(delta_stream), "cudaStreamSynchronize(V4 delta publish)");
     engine.telemetry_.delta_live_entries.store(count, std::memory_order_relaxed);
   }
@@ -1095,11 +1173,7 @@ struct PersistentSearchEngine::Impl {
   void upload_mutations(std::vector<DeltaMutation>& mutations, u64 epoch,
                         std::span<const u64> invalidated_graph_nodes) {
     if (mutations.empty()) return;
-    for (u64 raw : invalidated_graph_nodes) {
-      if (raw != 0 && static_cast<u32>(raw >> 48) >= index.shards.size()) {
-        throw std::runtime_error("storage returned an invalid GPU graph-cache invalidation");
-      }
-    }
+    for (u64 raw : invalidated_graph_nodes) (void)graph_cache_key(raw);
     if (delta_records_host.size() + mutations.size() >
         static_cast<size_t>(delta_capacity) * 4 / 5) {
       compact_delta();
@@ -1112,6 +1186,7 @@ struct PersistentSearchEngine::Impl {
         mutation.generation, static_cast<u32>(version->generation + 1));
     }
     upload_records_locked(mutations, false);
+    invalidate_graph_cache(invalidated_graph_nodes);
   }
 
   void pause_admission_for_compaction() {
@@ -1152,14 +1227,22 @@ struct PersistentSearchEngine::Impl {
       engine.telemetry_.delta_compactions.fetch_add(1, std::memory_order_relaxed);
       start_persistent_kernel();
     } catch (...) {
-      if (!kernel_running) start_persistent_kernel();
+      const std::exception_ptr compaction_error = std::current_exception();
+      std::exception_ptr restart_error;
+      try {
+        if (!kernel_running) start_persistent_kernel();
+      } catch (...) {
+        restart_error = std::current_exception();
+      }
       resume_admission_after_compaction();
-      throw;
+      if (restart_error != nullptr) std::rethrow_exception(restart_error);
+      std::rethrow_exception(compaction_error);
     }
     resume_admission_after_compaction();
   }
 
   void maintenance_loop() {
+    bind_cuda_device("cudaSetDevice(GPU V4 maintenance)");
     const auto period = std::chrono::milliseconds(config.merge_period_ms);
     while (!maintenance_shutdown.load(std::memory_order_acquire)) {
       {
@@ -1201,6 +1284,15 @@ struct PersistentSearchEngine::Impl {
         64, config.query_batch_target * config.gpu_graph_prefetch_depth);
       while (batch.size() < target && fetches.try_pop(request)) batch.push_back(request);
       statuses.assign(batch.size(), -EIO);
+      if (!fallback_logged && direct_disabled_host != nullptr &&
+          std::atomic_ref<u32>(*direct_disabled_host).load(std::memory_order_acquire) != 0) {
+        const i32 direct_error = direct_error_host == nullptr
+          ? 0 : std::atomic_ref<i32>(*direct_error_host).load(std::memory_order_acquire);
+        std::cerr << "[gpu-search] GPUNetIO read failed with status=" << direct_error << "; "
+                     "switching steady-state fetches to dedicated GPUDirect verbs QPs\n";
+        engine.telemetry_.direct_path_failures.fetch_add(1, std::memory_order_relaxed);
+        fallback_logged = true;
+      }
       try {
         backend->fetch(batch, statuses);
       } catch (...) {
@@ -1216,10 +1308,12 @@ struct PersistentSearchEngine::Impl {
         std::atomic_ref<i32>(fetch_status_host[batch[index].sequence]).store(
           statuses[index], std::memory_order_release);
       }
-      engine.telemetry_.rdma_read_ops.fetch_add(batch.size(), std::memory_order_relaxed);
-      engine.telemetry_.rdma_read_bytes.fetch_add(bytes, std::memory_order_relaxed);
-      engine.telemetry_.graph_page_requests.fetch_add(graph_records, std::memory_order_relaxed);
-      engine.telemetry_.exact_vector_reads.fetch_add(exact_records, std::memory_order_relaxed);
+      if (backend_kind != RemoteBackendKind::gpunetio) {
+        engine.telemetry_.rdma_read_ops.fetch_add(batch.size(), std::memory_order_relaxed);
+        engine.telemetry_.rdma_read_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        engine.telemetry_.graph_page_requests.fetch_add(graph_records, std::memory_order_relaxed);
+        engine.telemetry_.exact_vector_reads.fetch_add(exact_records, std::memory_order_relaxed);
+      }
     }
   }
 
@@ -1333,6 +1427,7 @@ struct PersistentSearchEngine::Impl {
   u32 delta_table_capacity{};
   u32 graph_cache_sets{};
   u32 graph_cache_slots{};
+  u32 graph_invalidation_capacity{};
   size_t graph_cache_bytes{};
   size_t exact_region_offset{};
   size_t graph_cache_offset{};
@@ -1350,6 +1445,7 @@ struct PersistentSearchEngine::Impl {
   f32* d_rotated_queries{};
   f32* d_query_luts{};
   u32* d_beam_handles{};
+  u32* d_beam_ids{};
   f32* d_beam_distances{};
   u8* d_beam_expanded{};
   u32* d_visited{};
@@ -1363,6 +1459,7 @@ struct PersistentSearchEngine::Impl {
   u32* d_graph_cache_readers{};
   u32* d_graph_cache_victims{};
   u64* d_graph_cache_generation{};
+  u64* d_graph_invalidation_keys{};
   bool owns_remote_buffer{};
   u32* result_ids_host{};
   f32* result_distances_host{};
@@ -1383,6 +1480,11 @@ struct PersistentSearchEngine::Impl {
   std::mutex delta_mutex;
   u32* stop_host{};
   u32* stop_device{};
+  u32* direct_disabled_host{};
+  u32* direct_disabled_device{};
+  i32* direct_error_host{};
+  i32* direct_error_device{};
+  u32* d_direct_qp_locks{};
   i32* fetch_status_host{};
   i32* fetch_status_device{};
   u32 fetch_status_stride{};
@@ -1392,6 +1494,7 @@ struct PersistentSearchEngine::Impl {
   PersistentKernelParams kernel_params{};
   u32 kernel_blocks{};
   bool kernel_running{};
+  bool fallback_logged{};
   std::atomic<bool> accepting{true};
   std::atomic<bool> shutdown{false};
   std::atomic<bool> maintenance_shutdown{false};
@@ -1422,6 +1525,8 @@ PersistentSearchEngine::PersistentSearchEngine(
     ClientConnectionManager& connection_manager,
     const MemoryRegionTokens& remote_regions)
     : delta_(1) {
+  check_cuda(cudaSetDevice(static_cast<int>(config.gpu_device)),
+             "cudaSetDevice(GPU V4 engine)");
   impl_ = std::make_unique<Impl>(*this, config, channel_context,
                                  connection_manager, remote_regions);
 }

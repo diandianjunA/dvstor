@@ -128,6 +128,7 @@ struct TelemetrySnapshot {
   u64 rdma_read_ops{};
   u64 rdma_read_bytes{};
   u64 rdma_merged_requests{};
+  u64 direct_path_failures{};
   u64 graph_page_requests{};
   u64 graph_page_cache_hits{};
   u64 exact_vector_reads{};
@@ -155,6 +156,7 @@ public:
   std::atomic<u64> rdma_read_ops{0};
   std::atomic<u64> rdma_read_bytes{0};
   std::atomic<u64> rdma_merged_requests{0};
+  std::atomic<u64> direct_path_failures{0};
   std::atomic<u64> graph_page_requests{0};
   std::atomic<u64> graph_page_cache_hits{0};
   std::atomic<u64> exact_vector_reads{0};

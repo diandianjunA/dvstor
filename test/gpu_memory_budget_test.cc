@@ -24,7 +24,7 @@ gpu_search::memory_budget::Request sift_request(u64 nodes) {
     .query_slots = 256,
     .beam_width = 64,
     .graph_degree = 96,
-    .exact_width = 64,
+    .exact_width = 256,
     .anchor_count = 4096 * 5,
     .shard_count = 5,
     .entry_point_count = 256,

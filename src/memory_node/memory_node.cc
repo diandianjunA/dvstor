@@ -183,7 +183,7 @@ MemoryNode::MemoryNode(Configuration& config)
   const u32 qps_per_node = worker_qps_per_node + gpu_rdma_qps;
   if (gpu_rdma_qps > 0) {
     print_status("reserving " + std::to_string(gpu_rdma_qps) +
-                 " GPU data-path QPs per compute node");
+                 " GPU/fallback QPs per compute node");
   }
   qps.reserve(num_clients_ * qps_per_node);
 

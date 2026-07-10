@@ -3,6 +3,15 @@ target_link_libraries(gpu_search_ring_test PRIVATE dvstor_runtime)
 target_compile_options(gpu_search_ring_test PRIVATE -UNDEBUG)
 add_test(NAME gpu_search_ring_test COMMAND gpu_search_ring_test)
 
+if (TARGET dvstor_gpu_kernels)
+    add_executable(gpu_persistent_dispatch_test gpu_persistent_dispatch_test.cc)
+    target_link_libraries(gpu_persistent_dispatch_test PRIVATE dvstor_runtime)
+    add_test(NAME gpu_persistent_dispatch_test COMMAND gpu_persistent_dispatch_test)
+    set_tests_properties(gpu_persistent_dispatch_test PROPERTIES
+        TIMEOUT 15
+        SKIP_REGULAR_EXPRESSION "^SKIP:")
+endif ()
+
 add_executable(gpu_tiered_index_format_test gpu_tiered_index_format_test.cc)
 target_link_libraries(gpu_tiered_index_format_test PRIVATE dvstor_runtime)
 target_compile_options(gpu_tiered_index_format_test PRIVATE -UNDEBUG)

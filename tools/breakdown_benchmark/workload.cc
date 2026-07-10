@@ -843,6 +843,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
       {"rdma_read_ops", telemetry.rdma_read_ops},
       {"rdma_read_bytes", telemetry.rdma_read_bytes},
       {"rdma_merged_requests", telemetry.rdma_merged_requests},
+      {"direct_path_failures", telemetry.direct_path_failures},
       {"graph_page_requests", telemetry.graph_page_requests},
       {"graph_page_cache_hits", telemetry.graph_page_cache_hits},
       {"graph_page_cache_hit_ratio",

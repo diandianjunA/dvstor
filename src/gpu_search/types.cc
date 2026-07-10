@@ -14,6 +14,7 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .rdma_read_ops = rdma_read_ops.load(std::memory_order_relaxed),
     .rdma_read_bytes = rdma_read_bytes.load(std::memory_order_relaxed),
     .rdma_merged_requests = rdma_merged_requests.load(std::memory_order_relaxed),
+    .direct_path_failures = direct_path_failures.load(std::memory_order_relaxed),
     .graph_page_requests = graph_page_requests.load(std::memory_order_relaxed),
     .graph_page_cache_hits = graph_page_cache_hits.load(std::memory_order_relaxed),
     .exact_vector_reads = exact_vector_reads.load(std::memory_order_relaxed),

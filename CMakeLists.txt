@@ -201,6 +201,7 @@ else ()
         dvstor_target_common_includes(dvstor_gpu_kernels PUBLIC)
         target_link_libraries(dvstor_gpu_kernels
             CUDA::cudart
+            rdma_library
         )
         if (DVSTOR_HAVE_GPUNETIO)
             target_include_directories(dvstor_gpu_kernels PUBLIC ${DVSTOR_DOCA_INCLUDE_DIR})

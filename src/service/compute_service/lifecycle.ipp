@@ -15,9 +15,11 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
   }
 
   if (cm_.is_initiator) {
-    const u32 gpu_rdma_qps = config_.use_gpu_persistent_search() &&
-        config_.gpu_rdma_backend != "local"
-      ? config_.gpu_rdma_qps : 0;
+    const bool gpu_rdma = config_.use_gpu_persistent_search() &&
+      config_.gpu_rdma_backend != "local";
+    const u32 gpu_rdma_qps = gpu_rdma
+      ? config_.gpu_rdma_qps * (config_.gpu_rdma_backend == "gpunetio" ? 2u : 1u)
+      : 0;
     configuration::Parameters p{
       config_.num_threads,
       config_.use_gpu_persistent_search(),
@@ -168,7 +170,7 @@ ComputeService<Distance>::ComputeService(const Configuration& config, bool shutd
     }
   }
   const str search_path = config_.use_gpu_persistent_search()
-    ? "GPU-persistent RaBitQ scoring + RDMA graph/exact rerank"
+    ? "GPU-persistent RaBitQ gate + RDMA exact-distance beam"
     : (vamana_->use_rabitq() ? "RFQ5 RaBitQ cpu_gate + GPUDirect exact beam" : "exact");
   print_status(str(config_.credit_aware_expansion ? "search: credit-aware " : "search: ") +
                search_path);
