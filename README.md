@@ -116,13 +116,15 @@ GPU，也不需要额外重分片可执行文件。`vamana_legacy_index_converte
 复用已有 Vamana/Metis 图，不重新构图或分区：
 
 ```bash
-OVERWRITE_INDEX=1 \
 ./experiment/convert_legacy_sift100m_index.sh 04_gpu_persistent_gpunetio
 ```
 
 迁移会顺序压缩旧 fixed record、重写紧凑图中的 RemotePtr、迁移 idmap 与
-anchors，然后训练/复用 PQ 模型并编码所有向量。源 prefix 与输出 prefix 必须
-不同；迁移器不会修改或删除旧索引。
+anchors；脚本随后在独立进程中训练/复用 PQ 模型并编码所有向量。两个阶段以
+schema-14 metadata 为持久化检查点：迁移完成后 PQ 失败，重新执行脚本不会再次
+迁移 65 GB 分片。`PQ_THREADS` 默认 32，CPU BLAS 固定为非嵌套运行；若已有不完整
+的 `.pq16`/`.pq16.codes`，使用 `OVERWRITE_PQ=1` 重做 PQ 阶段。源 prefix 与输出
+prefix 必须不同；迁移器不会修改或删除旧索引。
 
 ## 运行 SIFT100M
 

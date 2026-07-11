@@ -78,6 +78,8 @@ set(DVSTOR_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
 set(DVSTOR_CONDA_LIB_DIR "/home/xjs/anaconda3/lib" CACHE PATH
     "Optional local libstdc++ search path used on the development machine")
 set(DVSTOR_METIS_ROOT "" CACHE PATH "Optional METIS installation root")
+set(DVSTOR_FAISS_BLAS_VENDOR "Generic" CACHE STRING
+    "BLAS vendor for CPU Faiss offline tools; Generic avoids nested MKL/OpenMP runtimes")
 
 list(APPEND CMAKE_MODULE_PATH
     "${DVSTOR_SOURCE_ROOT}"
@@ -156,11 +158,9 @@ function(dvstor_add_offline_tools)
     add_executable(vamana_legacy_index_converter
         tools/vamana_legacy_index_converter.cc
         tools/legacy_index/migrator.cc
-        ${DVSTOR_PQ_INDEXER_SOURCES}
     )
     dvstor_target_tool_includes(vamana_legacy_index_converter)
-    target_link_libraries(vamana_legacy_index_converter
-        rdma_library FaissCPU::FaissCPU)
+    target_link_libraries(vamana_legacy_index_converter rdma_library)
 
     add_executable(generate_sift101m_recall_data
         tools/generate_sift101m_recall_data.cc

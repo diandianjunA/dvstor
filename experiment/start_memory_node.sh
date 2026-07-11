@@ -2,6 +2,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
+use_storage_build
 
 NODE_ID="${1:?usage: start_memory_node.sh <node-id> [profile]}"
 PROFILE="${2:-${PROFILE:-04_gpu_persistent_gpunetio}}"

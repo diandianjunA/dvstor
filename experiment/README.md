@@ -22,6 +22,9 @@ profile 的 `LEGACY_INDEX_PREFIX` 指向旧索引，`INDEX_PREFIX` 指向新的 
 
 ## 构建新索引
 
+存储节点脚本默认使用独立的 `build-storage`，先按根目录 README 配置 CPU-only
+构建，不能与计算节点的 `build` 共用。
+
 该命令先构建 compact Vamana/Metis 分片，再训练 OPQ/PQ16 并写码流：
 
 ```bash
@@ -33,19 +36,24 @@ profile 的 `LEGACY_INDEX_PREFIX` 指向旧索引，`INDEX_PREFIX` 指向新的 
 已有 Vamana/Metis 索引无需重新构图或分区：
 
 ```bash
-OVERWRITE_INDEX=1 \
 ./experiment/convert_legacy_sift100m_index.sh 04_gpu_persistent_gpunetio
 ```
+
+转换和 PQ 编码是两个独立进程。最终 schema-14 metadata 是迁移检查点；如果迁移
+已经完成而 OPQ/PQ 训练失败，原命令会跳过迁移并直接继续 PQ，不会重复扫描和
+改写全部旧分片。`OVERWRITE_INDEX=1` 仅用于明确要求重新迁移；若 PQ 输出不完整，
+使用 `OVERWRITE_PQ=1`。
 
 可使用已训练模型减少迁移时间：
 
 ```bash
-PQ_REUSE_MODEL=/path/to/compatible.pq16 OVERWRITE_INDEX=1 \
+PQ_REUSE_MODEL=/path/to/compatible.pq16 \
 ./experiment/convert_legacy_sift100m_index.sh 04_gpu_persistent_gpunetio
 ```
 
 模型必须与维度、子空间数和 dtype 对应。转换仍需顺序扫描全部向量生成 16-byte
-code，但不执行昂贵的 Vamana construction 或 METIS partition。
+code，但不执行昂贵的 Vamana construction 或 METIS partition。PQ 默认使用
+`PQ_THREADS=32`，也可显式覆盖；BLAS 线程保持为 1，避免和 Faiss OpenMP 嵌套。
 
 ## 部署文件
 

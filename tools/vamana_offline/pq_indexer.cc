@@ -230,8 +230,17 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
   nlohmann::json metadata;
   metadata_input >> metadata;
   const Layout layout = parse_layout(metadata);
-  omp_set_num_threads(static_cast<int>(options.threads == 0
-    ? std::max(1u, std::thread::hardware_concurrency()) : options.threads));
+  const u32 hardware_threads = std::max(1u, std::thread::hardware_concurrency());
+  const u32 training_threads = options.threads == 0
+    ? std::min<u32>(hardware_threads, 32) : std::min(options.threads, hardware_threads);
+  if (training_threads == 0) {
+    throw std::invalid_argument("PQ training threads must be greater than zero");
+  }
+  omp_set_dynamic(0);
+  omp_set_max_active_levels(1);
+  omp_set_num_threads(static_cast<int>(training_threads));
+  std::cerr << "PQ CPU runtime: threads=" << training_threads
+            << " hardware_threads=" << hardware_threads << '\n';
 
   PqIndexResult result;
   result.model_file = index_path::navigation_model_file(options.index_prefix);

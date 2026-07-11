@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
+use_storage_build
 
 PROFILE="${1:-${PROFILE:-04_gpu_persistent_gpunetio}}"
 load_experiment_profile "$PROFILE"
@@ -37,7 +38,7 @@ pq=("$BUILD_DIR/vamana_pq_indexer"
   --pq-iterations "${PQ_ITERATIONS:-25}"
   --chunk-vectors "${PQ_ENCODE_CHUNK_VECTORS:-32768}"
   --entry-points "${GPU_ENTRY_POINTS:-256}"
-  --threads "$BUILD_THREADS"
+  --threads "${PQ_THREADS:-32}"
   --seed "${SEED:-1234}")
 if [[ -n "${PQ_REUSE_MODEL:-}" ]]; then pq+=(--reuse-model "$PQ_REUSE_MODEL"); fi
 if [[ "${OVERWRITE_INDEX:-0}" == "1" ]]; then pq+=(--overwrite); fi
@@ -47,6 +48,10 @@ if [[ "${OVERWRITE_INDEX:-0}" == "1" ]]; then pq+=(--overwrite); fi
   printf '[build] command:'; printf ' %q' "${builder[@]}"; echo
   "${builder[@]}"
   printf '[pq] command:'; printf ' %q' "${pq[@]}"; echo
+  OMP_NUM_THREADS="${PQ_THREADS:-32}" \
+  OPENBLAS_NUM_THREADS=1 \
+  MKL_NUM_THREADS=1 \
+  OMP_DYNAMIC=FALSE \
   "${pq[@]}"
 } 2>&1 | tee "$LOG_FILE"
 

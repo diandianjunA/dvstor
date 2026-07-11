@@ -3,6 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [[ -n "${BUILD_DIR+x}" ]]; then
+  DVSTOR_BUILD_DIR_EXPLICIT=1
+else
+  DVSTOR_BUILD_DIR_EXPLICIT=0
+fi
 BUILD_DIR="${BUILD_DIR:-$PROJECT_DIR/build}"
 
 DATASET_DIR="${DATASET_DIR:-/data/xjs/datasets/sift1b}"
@@ -220,7 +225,23 @@ common_rdma_args() {
 }
 
 ensure_built() {
+  if [[ ! -f "$BUILD_DIR/CMakeCache.txt" ]]; then
+    echo "build directory is not configured: $BUILD_DIR" >&2
+    return 1
+  fi
   cmake --build "$BUILD_DIR" -j --target "$@"
+}
+
+use_storage_build() {
+  if [[ "$DVSTOR_BUILD_DIR_EXPLICIT" == "0" ]]; then
+    BUILD_DIR="$PROJECT_DIR/build-storage"
+  fi
+  if [[ -f "$BUILD_DIR/CMakeCache.txt" ]] &&
+     ! grep -q '^DVSTOR_STORAGE_NODE_ONLY:BOOL=ON$' "$BUILD_DIR/CMakeCache.txt"; then
+    echo "storage command requires a storage-only build directory: $BUILD_DIR" >&2
+    echo "configure a separate directory with -DDVSTOR_STORAGE_NODE_ONLY=ON" >&2
+    return 1
+  fi
 }
 
 write_service_config() {

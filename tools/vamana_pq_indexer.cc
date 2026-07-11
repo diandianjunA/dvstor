@@ -28,7 +28,7 @@ int main(int argc, char** argv) {
     ("entry-points", po::value<u32>(&options.entry_points)->default_value(options.entry_points),
      "GPU search entry points")
     ("threads", po::value<u32>(&options.threads)->default_value(0),
-     "CPU threads; 0 uses hardware concurrency")
+     "CPU threads; 0 uses at most 32 hardware threads")
     ("seed", po::value<u64>(&options.seed)->default_value(options.seed), "Training seed")
     ("overwrite", po::bool_switch(&options.overwrite), "Replace existing PQ outputs");
   try {
