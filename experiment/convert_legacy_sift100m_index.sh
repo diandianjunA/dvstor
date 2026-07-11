@@ -8,7 +8,7 @@ use_storage_build
 PROFILE="${1:-${PROFILE:-04_gpu_persistent_gpunetio}}"
 load_experiment_profile "$PROFILE"
 
-SOURCE_PREFIX="${SOURCE_PREFIX:-${LEGACY_INDEX_PREFIX:?LEGACY_INDEX_PREFIX is required}}"
+SOURCE_PREFIX="${SOURCE_PREFIX:?SOURCE_PREFIX must point to the legacy index prefix}"
 if [[ "$SOURCE_PREFIX" == "$INDEX_PREFIX" ]]; then
   echo "source and output index prefixes must differ" >&2
   exit 1

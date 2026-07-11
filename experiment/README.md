@@ -17,8 +17,8 @@ export GPU_MEMORY_LIMIT_GB=40
 export GPU_MEMORY_RESERVE_GB=4
 ```
 
-profile 的 `LEGACY_INDEX_PREFIX` 指向旧索引，`INDEX_PREFIX` 指向新的 `_pq32`
-输出。二者不能相同。
+旧索引只在迁移命令中通过 `SOURCE_PREFIX` 显式指定；运行 profile 只维护当前
+`INDEX_PREFIX`，不携带旧索引状态。
 
 ## 构建新索引
 
@@ -31,11 +31,16 @@ profile 的 `LEGACY_INDEX_PREFIX` 指向旧索引，`INDEX_PREFIX` 指向新的 
 ./experiment/build_sift100m_index.sh 04_gpu_persistent_gpunetio
 ```
 
+完整构建会直接生成当前 schema-14 OPQ/PQ32 所需的全部文件，无需随后重编码。
+推荐使用 `PQ_INDEX_PREFIX=/new/prefix` 保留已有索引；只有明确要删除目标 prefix
+下旧产物并原地重建时才设置 `OVERWRITE_INDEX=1`。
+
 ## 转换旧索引
 
 已有 Vamana/Metis 索引无需重新构图或分区：
 
 ```bash
+SOURCE_PREFIX=/path/to/legacy/index_prefix \
 ./experiment/convert_legacy_sift100m_index.sh 04_gpu_persistent_gpunetio
 ```
 
@@ -104,6 +109,11 @@ code，但不执行昂贵的 Vamana construction 或 METIS partition。PQ 默认
 
 ## 召回率与性能
 
+测试负载参数不放在索引/系统 profile 中。`BENCHMARK_CLIENT_THREADS`、
+`WORKLOAD`、`READ_RATIO`、`WARMUP_SECONDS`、`MEASURE_SECONDS` 和
+`RECALL_QUERIES` 由运行脚本读取。`SERVICE_THREADS` 是计算服务 CPU 线程数，
+不等于 benchmark 客户端并发数。
+
 先做 query-only 召回验证：
 
 ```bash
@@ -114,7 +124,7 @@ RECALL_QUERIES=1000 \
 再运行读写混合负载：
 
 ```bash
-WORKLOAD=mixed READ_RATIO=0.5 \
+BENCHMARK_CLIENT_THREADS=128 WORKLOAD=mixed READ_RATIO=0.5 \
 WARMUP_SECONDS=30 MEASURE_SECONDS=120 \
 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
 ```

@@ -8,7 +8,7 @@ use_storage_build
 PROFILE="${1:-${PROFILE:-04_gpu_persistent_gpunetio}}"
 load_experiment_profile "$PROFILE"
 
-SOURCE_PREFIX="${SOURCE_PREFIX:-$INDEX_DIR/sift100m_R${R}_bw${BUILD_BEAM}_metis_pmd32_pq16}"
+SOURCE_PREFIX="${SOURCE_PREFIX:-$INDEX_DIR/sift100m_R${R}_bw${BUILD_BEAM}_${PARTITION_STRATEGY}_pmd${PARTITION_MAX_DEGREE}_pq16}"
 TARGET_PREFIX="$INDEX_PREFIX"
 SOURCE_METADATA="${SOURCE_PREFIX}.meta.json"
 TARGET_METADATA="${TARGET_PREFIX}.meta.json"
