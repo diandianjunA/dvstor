@@ -30,6 +30,7 @@ BUILD_THREADS="${BUILD_THREADS:-112}"
 SERVICE_THREADS="${SERVICE_THREADS:-64}"
 CLIENT_THREADS="${CLIENT_THREADS:-64}"
 GPU_DEVICE="${GPU_DEVICE:-1}"
+PQ_SUBQUANTIZERS="${PQ_SUBQUANTIZERS:-32}"
 MAX_VECTORS="${MAX_VECTORS:-100000000}"
 MAX_QUERIES="${MAX_QUERIES:-10000}"
 GROUNDTRUTH_LABEL="${GROUNDTRUTH_LABEL:-100M}"
@@ -44,7 +45,7 @@ MAX_RECEIVE_WRS="${MAX_RECEIVE_WRS:-4096}"
 MAX_POLL_CQES="${MAX_POLL_CQES:-64}"
 
 PROFILE="${PROFILE:-04_gpu_persistent_gpunetio}"
-INDEX_PREFIX="${INDEX_PREFIX:-$INDEX_DIR/sift100m_R${R}_bw${BUILD_BEAM}_${PARTITION_STRATEGY}_pq16}"
+INDEX_PREFIX="${INDEX_PREFIX:-$INDEX_DIR/sift100m_R${R}_bw${BUILD_BEAM}_${PARTITION_STRATEGY}_pq${PQ_SUBQUANTIZERS}}"
 
 estimate_node_bytes() {
   local component_size=4
@@ -93,7 +94,7 @@ query_bin() { echo "$CONVERTED_DIR/query$(query_suffix).u8bin"; }
 groundtruth_bin() { echo "$CONVERTED_DIR/groundtruth_${GROUNDTRUTH_LABEL}.bin"; }
 insert_bin() { echo "${INSERT_FILE:-$CONVERTED_DIR/insert_test.u8bin}"; }
 metadata_file() { echo "${INDEX_PREFIX}.meta.json"; }
-model_file() { echo "${INDEX_PREFIX}.pq16"; }
+model_file() { echo "${INDEX_PREFIX}.pq${PQ_SUBQUANTIZERS}"; }
 
 shard_file() {
   local node_id="${1:?node id is required}"
@@ -107,7 +108,7 @@ idmap_file() {
 
 navigation_code_file() {
   local node_id="${1:?node id is required}"
-  echo "${INDEX_PREFIX}_node${node_id}_of${SHARDS}.pq16.codes"
+  echo "${INDEX_PREFIX}_node${node_id}_of${SHARDS}.pq${PQ_SUBQUANTIZERS}.codes"
 }
 
 validate_index_metadata() {
@@ -121,11 +122,11 @@ validate_index_metadata() {
   fi
 
   python3 - "$metadata" "$INDEX_PREFIX" "$R" "$BUILD_BEAM" "$DIM" \
-    "$MAX_VECTORS" "$SHARDS" "$VECTOR_DATA_TYPE" <<'PY_VALIDATE'
+    "$MAX_VECTORS" "$SHARDS" "$VECTOR_DATA_TYPE" "$PQ_SUBQUANTIZERS" <<'PY_VALIDATE'
 import json
 import sys
 
-path, prefix, degree, build_beam, dim, vectors, shards, dtype = sys.argv[1:]
+path, prefix, degree, build_beam, dim, vectors, shards, dtype, subquantizers = sys.argv[1:]
 with open(path, 'r', encoding='utf-8') as stream:
     metadata = json.load(stream)
 
@@ -135,8 +136,6 @@ expected = {
     'distance': 'l2',
     'node_layout': 'plain',
     'storage_format': 'vamana_compact_v1',
-    'navigation_quantizer': 'opq_pq16',
-    'navigation_format': 'opq_pq16_graph_v1',
     'navigation_execution': 'gpu_beam_v1',
     'R': int(degree),
     'beam_width_construction': int(build_beam),
@@ -144,14 +143,18 @@ expected = {
     'num_vectors': int(vectors),
     'num_memory_nodes': int(shards),
     'vector_data_type': dtype,
-    'navigation_code_bytes': 16,
-    'pq_subquantizers': 16,
+    'navigation_code_bytes': int(subquantizers),
+    'pq_subquantizers': int(subquantizers),
     'pq_bits': 8,
 }
 errors = [
     f'{key}: metadata={metadata.get(key)!r}, expected={value!r}'
     for key, value in expected.items() if metadata.get(key) != value
 ]
+if metadata.get('navigation_quantizer') not in ('opq_pq', 'opq_pq16'):
+    errors.append('navigation_quantizer must be opq_pq')
+if metadata.get('navigation_format') not in ('opq_pq_graph_v1', 'opq_pq16_graph_v1'):
+    errors.append('navigation_format must be opq_pq_graph_v1')
 if not metadata.get('navigation_model_checksum'):
     errors.append('navigation_model_checksum is missing')
 for key in (
@@ -180,7 +183,7 @@ PY_VALIDATE
 
   if [[ "$role" == "compute" ]]; then
     if [[ ! -s "$(model_file)" ]]; then
-      echo "missing OPQ/PQ16 model: $(model_file)" >&2
+      echo "missing OPQ/PQ${PQ_SUBQUANTIZERS} model: $(model_file)" >&2
       return 1
     fi
   elif [[ "$role" == "storage" ]]; then
@@ -288,11 +291,11 @@ write_service_config() {
     echo "gpu-graph-prefetch-depth = ${GPU_GRAPH_PREFETCH_DEPTH:-8}"
     echo "gpu-graph-cache-ttl-us = ${GPU_GRAPH_CACHE_TTL_US:-0}"
     echo "gpu-traversal-beam-width = ${GPU_TRAVERSAL_BEAM_WIDTH:-128}"
-    echo "gpu-final-rerank-width = ${GPU_FINAL_RERANK_WIDTH:-64}"
+    echo "gpu-final-rerank-width = ${GPU_FINAL_RERANK_WIDTH:-128}"
     echo "gpu-max-expansions = ${GPU_MAX_EXPANSIONS:-384}"
     echo "gpu-entry-seed-count = ${GPU_ENTRY_SEED_COUNT:-32}"
     echo "gpu-delta-anchor-probes = ${GPU_DELTA_ANCHOR_PROBES:-32}"
-    echo "gpu-rdma-qps = ${GPU_RDMA_QPS:-8}"
+    echo "gpu-rdma-qps = ${GPU_RDMA_QPS:-16}"
     echo "gpu-persistent-blocks-per-sm = ${GPU_PERSISTENT_BLOCKS_PER_SM:-2}"
     echo "update-visibility-us = ${UPDATE_VISIBILITY_US:-10000}"
     echo "delta-max-ratio = ${DELTA_MAX_RATIO:-0.01}"
@@ -314,7 +317,7 @@ write_service_config() {
     echo "storage-owner-anchor-beam-width = ${STORAGE_OWNER_ANCHOR_BEAM_WIDTH:-64}"
     echo "storage-owner-anchor-expand-cap = ${STORAGE_OWNER_ANCHOR_EXPAND_CAP:-16}"
     echo "storage-owner-anchor-remote-rescue-cap = ${STORAGE_OWNER_ANCHOR_REMOTE_RESCUE_CAP:-4}"
-    echo "storage-owner-local-stitch-sync-fast-path = ${STORAGE_OWNER_LOCAL_STITCH_SYNC_FAST_PATH:-true}"
+    echo "storage-owner-local-stitch-sync-fast-path = ${STORAGE_OWNER_LOCAL_STITCH_SYNC_FAST_PATH:-false}"
     echo "storage-owner-maintenance-mode = ${STORAGE_OWNER_MAINTENANCE_MODE:-finalize}"
     echo "storage-owner-maintenance-workers = ${STORAGE_OWNER_MAINTENANCE_WORKERS:-8}"
     echo "storage-owner-reverse-mode = ${STORAGE_OWNER_REVERSE_MODE:-async}"

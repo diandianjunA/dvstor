@@ -190,10 +190,10 @@ private:
        "Graph records fetched concurrently by one GPU query.")
       ("gpu-graph-cache-ttl-us",
        po::value<u32>(&gpu_graph_cache_ttl_us)->default_value(gpu_graph_cache_ttl_us),
-       "Maximum graph-cache age; zero relies only on update invalidation.")
+       "Maximum graph-cache age; zero keeps the immutable base-graph snapshot resident.")
       ("gpu-traversal-beam-width",
        po::value<u32>(&gpu_traversal_beam_width)->default_value(gpu_traversal_beam_width),
-       "OPQ/PQ16 beam width for GPU graph navigation.")
+       "OPQ/PQ beam width for GPU graph navigation.")
       ("gpu-final-rerank-width",
        po::value<u32>(&gpu_final_rerank_width)->default_value(gpu_final_rerank_width),
        "Exact vectors fetched for final reranking.")
@@ -422,7 +422,7 @@ public:
       output << std::setfill('-') << std::setw(line_width) << "" << '\n';
       output << std::setfill(' ');
       output << std::setw(width) << "query engine: "
-             << "persistent_gpu_opq_pq16" << '\n';
+             << "persistent_gpu_opq_pq" << '\n';
       output << std::setw(width) << "remote transport: "
              << "GPU-initiated GPUNetIO" << '\n';
       output << std::setw(width) << "GPU device: " << config.gpu_device << '\n';

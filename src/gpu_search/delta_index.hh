@@ -24,6 +24,7 @@ struct DeltaMutation {
   u64 epoch{};
   u64 remote_node{};
   u64 old_remote_node{};
+  u64 anchor_hint{};
   std::vector<byte_t> vector;
   std::vector<node_t> neighbors;
   std::chrono::steady_clock::time_point enqueued_at{};

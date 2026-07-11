@@ -78,6 +78,7 @@ private:
     std::chrono::steady_clock::time_point enqueued_at{};
     std::chrono::steady_clock::time_point sender_dequeued_at{};
     vec<RemotePtr> anchor_hints;
+    RemotePtr anchor_bucket_hint;
   };
 
   struct StorageOwnerRpcSlot {
@@ -87,6 +88,7 @@ private:
     bool send_done{false};
     bool response_done{false};
     bool results_completed{false};
+    bool completion_claimed{false};
     u32 item_count{};
     u64 batch_id{};
     u64 batch_wait_ns{};
@@ -142,8 +144,10 @@ private:
   void handle_storage_owner_send_completion(u32 owner_storage, u32 slot_id);
   void handle_storage_owner_response(u32 owner_storage, u32 response_slot_id);
   void post_storage_owner_response_receive(u32 owner_storage, u32 response_slot_id);
+  void complete_ready_storage_owner_slots();
   void maybe_release_storage_owner_slot_locked(StorageOwnerSenderState& state,
-                                               StorageOwnerRpcSlot& slot);
+                                               StorageOwnerRpcSlot& slot,
+                                               bool gpu_visible);
   void fail_storage_owner_tasks(vec<std::unique_ptr<StorageInsertTask>>& tasks);
   void publish_compute_side_id(node_t id, RemotePtr ptr, bool deleted, u32 owner_storage);
   bool lookup_compute_side_id(node_t id, RemotePtr* ptr, bool* deleted = nullptr) const;

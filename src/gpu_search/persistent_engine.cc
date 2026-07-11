@@ -60,13 +60,45 @@ void device_allocate(T*& pointer, size_t count, const char* operation) {
     pointer = nullptr;
     return;
   }
-  check_cuda(cudaMalloc(reinterpret_cast<void**>(&pointer), count * sizeof(T)), operation);
+  if (count > std::numeric_limits<size_t>::max() / sizeof(T)) {
+    throw std::overflow_error(std::string(operation) + ": allocation size overflow");
+  }
+  const size_t bytes = count * sizeof(T);
+  const cudaError_t status = cudaMalloc(reinterpret_cast<void**>(&pointer), bytes);
+  if (status != cudaSuccess) {
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    (void)cudaMemGetInfo(&free_bytes, &total_bytes);
+    throw std::runtime_error(
+      std::string(operation) + ": " + cudaGetErrorString(status) +
+      " requested=" + std::to_string(bytes) +
+      " free=" + std::to_string(free_bytes) +
+      " total=" + std::to_string(total_bytes));
+  }
 }
 
 template <class T>
 void device_free(T*& pointer) {
   if (pointer != nullptr) cudaFree(pointer);
   pointer = nullptr;
+}
+
+template <class T>
+void mapped_host_allocate(T*& host_pointer, T*& device_pointer,
+                          size_t count, const char* operation) {
+  host_pointer = nullptr;
+  device_pointer = nullptr;
+  if (count == 0) return;
+  if (count > std::numeric_limits<size_t>::max() / sizeof(T)) {
+    throw std::overflow_error(std::string(operation) + ": allocation size overflow");
+  }
+  check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&host_pointer),
+                           count * sizeof(T),
+                           cudaHostAllocMapped | cudaHostAllocPortable),
+             operation);
+  check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&device_pointer),
+                                      host_pointer, 0),
+             "cudaHostGetDevicePointer(delta staging)");
 }
 
 template <class T>
@@ -172,6 +204,7 @@ struct AnchorTable {
   u32 dim{};
   std::vector<f32> vectors;
   std::vector<u32> handles;
+  std::vector<u64> raw_pointers;
   std::vector<u32> shard_offsets;
 
   u32 count() const { return dim == 0 ? 0 : static_cast<u32>(vectors.size() / dim); }
@@ -223,6 +256,7 @@ AnchorTable load_anchor_table(const filepath_t& prefix, u32 expected_dim,
       decode_storage_vector_to_float(raw.data(), dtype, header.dim, decoded.data());
       result.vectors.insert(result.vectors.end(), decoded.begin(), decoded.end());
       result.handles.push_back(handle);
+      result.raw_pointers.push_back(entry.rptr_raw);
     }
   }
   result.shard_offsets.back() = result.count();
@@ -346,7 +380,9 @@ struct PersistentSearchEngine::Impl {
         submissions(config.query_batch_max * 2,
                     MappedRing<QueryDescriptor>::Direction::host_to_device),
         completions(config.query_batch_max * 2,
-                    MappedRing<CompletionDescriptor>::Direction::device_to_host) {
+                    MappedRing<CompletionDescriptor>::Direction::device_to_host),
+        delta_submissions(8, MappedRing<DeltaPublishDescriptor>::Direction::host_to_device),
+        delta_completions(8, MappedRing<DeltaPublishCompletion>::Direction::device_to_host) {
     bind_cuda_device("cudaSetDevice(GPU navigation construction)");
     if (config.gpu_traversal_beam_width > kPersistentMaxBeam ||
         config.gpu_final_rerank_width > kPersistentMaxExact ||
@@ -368,7 +404,8 @@ struct PersistentSearchEngine::Impl {
     std::cerr << "[gpu-search] synthesized navigation manifest in memory from metadata"
               << (used_anchor_entry_points ? " and anchors\n" : "\n");
     if (!pq::read_model(index_path::navigation_model_file(
-          config.resolved_index_prefix()), pq_model, &load_error)) {
+          config.resolved_index_prefix(), index.layout.pq_subquantizers),
+          pq_model, &load_error)) {
       throw std::runtime_error(load_error);
     }
     if (index.layout.dim != config.dim || index.layout.graph_degree != config.R ||
@@ -394,7 +431,14 @@ struct PersistentSearchEngine::Impl {
 
     anchor_table = load_anchor_table(config.resolved_index_prefix(), config.dim,
                                      index.layout.num_shards, index);
+    for (u32 anchor = 0; anchor < anchor_table.raw_pointers.size(); ++anchor) {
+      anchor_buckets_by_raw.emplace(anchor_table.raw_pointers[anchor], anchor);
+    }
     entry_handles = index.entry_points;
+    std::cerr << "[gpu-search] query routing="
+              << (anchor_table.count() == 0 ? "static entry points" : "query-aware GPU anchors")
+              << " anchors=" << anchor_table.count()
+              << " seeds=" << config.gpu_entry_seed_count << '\n';
     query_slots = config.query_batch_max;
     result_capacity = std::max<u32>(config.k, config.gpu_final_rerank_width);
     exact_width = kPersistentMaxExact;
@@ -456,16 +500,18 @@ struct PersistentSearchEngine::Impl {
     }
     graph_invalidation_capacity = static_cast<u32>(std::max<u64>(1, invalidation_capacity));
     explicit_gpu_bytes = budget.explicit_bytes;
-    const u64 code_bytes = budget.code_bytes;
+    const u64 base_code_region_bytes = budget.code_bytes;
     const u64 exact_bytes = budget.exact_bytes;
     std::cerr << "[gpu-search] navigation budget codes=" << budget.code_bytes
               << " delta=" << budget.delta_bytes
+              << " delta_capacity=" << budget.delta_capacity
+              << " delta_codes=" << budget.delta_code_bytes
               << " adjacency_total=" << budget.cache_total_bytes
               << " exact_cache_total=" << budget.exact_cache_total_bytes
               << " explicit=" << explicit_gpu_bytes
               << " limit=" << engine_budget << " bytes\n";
 
-    const size_t code_region_bytes = static_cast<size_t>(code_bytes);
+    const size_t code_region_bytes = static_cast<size_t>(base_code_region_bytes);
     exact_region_offset = static_cast<size_t>(align_up(code_region_bytes, 256));
     exact_cache_offset = static_cast<size_t>(align_up(exact_region_offset + exact_bytes, 256));
     graph_cache_offset = static_cast<size_t>(
@@ -514,10 +560,19 @@ struct PersistentSearchEngine::Impl {
                           entry_handles.size() * sizeof(u32), cudaMemcpyHostToDevice),
                "cudaMemcpy(GPU navigation entries)");
     if (!anchor_table.vectors.empty()) {
+      std::vector<f32> transposed_anchors(anchor_table.vectors.size());
+      for (u32 anchor = 0; anchor < anchor_table.count(); ++anchor) {
+        for (u32 dimension = 0; dimension < anchor_table.dim; ++dimension) {
+          transposed_anchors[
+            static_cast<size_t>(dimension) * anchor_table.count() + anchor] =
+              anchor_table.vectors[
+                static_cast<size_t>(anchor) * anchor_table.dim + dimension];
+        }
+      }
       device_allocate(d_anchor_vectors, anchor_table.vectors.size(),
                       "cudaMalloc(GPU navigation anchors)");
-      check_cuda(cudaMemcpy(d_anchor_vectors, anchor_table.vectors.data(),
-                            anchor_table.vectors.size() * sizeof(f32), cudaMemcpyHostToDevice),
+      check_cuda(cudaMemcpy(d_anchor_vectors, transposed_anchors.data(),
+                            transposed_anchors.size() * sizeof(f32), cudaMemcpyHostToDevice),
                  "cudaMemcpy(GPU navigation anchors)");
       device_allocate(d_anchor_handles, anchor_table.handles.size(),
                       "cudaMalloc(GPU navigation anchor handles)");
@@ -556,8 +611,17 @@ struct PersistentSearchEngine::Impl {
     device_allocate(d_graph_cache_readers, graph_cache_slots, "cudaMalloc(navigation cache readers)");
     device_allocate(d_graph_cache_victims, graph_cache_sets, "cudaMalloc(navigation cache victims)");
     device_allocate(d_graph_cache_generation, 1, "cudaMalloc(navigation cache generation)");
-    device_allocate(d_graph_invalidation_keys, graph_invalidation_capacity,
-                    "cudaMalloc(navigation graph invalidation keys)");
+    delta_command_capacity = std::max({1u, config.storage_owner_batch_max,
+                                       config.query_batch_max});
+    mapped_host_allocate(graph_invalidation_keys_host, d_graph_invalidation_keys,
+                         graph_invalidation_capacity,
+                         "cudaHostAlloc(navigation graph invalidation staging)");
+    mapped_host_allocate(delta_supersede_updates_host, d_delta_supersede_updates,
+                         delta_command_capacity,
+                         "cudaHostAlloc(navigation delta supersede staging)");
+    mapped_host_allocate(delta_override_updates_host, d_delta_override_updates,
+                         delta_command_capacity,
+                         "cudaHostAlloc(navigation delta override staging)");
     check_cuda(cudaMemset(d_graph_cache_states, 0,
                           static_cast<size_t>(graph_cache_slots) * sizeof(u32)),
                "cudaMemset(navigation cache states)");
@@ -609,11 +673,26 @@ struct PersistentSearchEngine::Impl {
                "cudaHostGetDevicePointer(GPU navigation result distances)");
 
     device_allocate(d_delta_records, delta_capacity, "cudaMalloc(navigation delta records)");
-    device_allocate(d_delta_vectors, static_cast<size_t>(delta_capacity) * config.dim,
+    device_allocate(d_delta_vectors,
+                    static_cast<size_t>(delta_capacity) * VamanaNode::vector_bytes(),
                     "cudaMalloc(navigation delta vectors)");
+    if (budget.delta_code_bytes !=
+        static_cast<u64>(delta_capacity) * this->code_bytes) {
+      throw std::logic_error("GPU delta-code budget does not match the PQ code width");
+    }
     device_allocate(d_delta_pq_codes,
-                    static_cast<size_t>(delta_capacity) * code_bytes,
+                    static_cast<size_t>(budget.delta_code_bytes),
                     "cudaMalloc(PQ delta codes)");
+    mapped_host_allocate(delta_staging_records_host, d_delta_staging_records,
+                         delta_command_capacity,
+                         "cudaHostAlloc(navigation delta record staging)");
+    mapped_host_allocate(delta_staging_vectors_host, d_delta_staging_vectors,
+                         static_cast<size_t>(delta_command_capacity) *
+                           VamanaNode::vector_bytes(),
+                         "cudaHostAlloc(navigation delta vector staging)");
+    device_allocate(d_delta_encode_scratch,
+                    static_cast<size_t>(delta_command_capacity) * config.dim,
+                    "cudaMalloc(navigation delta encode scratch)");
     device_allocate(d_delta_next, delta_capacity, "cudaMalloc(navigation delta links)");
     device_allocate(d_base_override_keys, delta_table_capacity,
                     "cudaMalloc(navigation override keys)");
@@ -666,6 +745,8 @@ struct PersistentSearchEngine::Impl {
     kernel_params = PersistentKernelParams{
       .submissions = submissions.device_view(),
       .completions = completions.device_view(),
+      .delta_submissions = delta_submissions.device_view(),
+      .delta_completions = delta_completions.device_view(),
       .shards = d_shards,
       .num_shards = static_cast<u32>(index.shards.size()),
       .pq_codes = d_pq_codes,
@@ -708,6 +789,9 @@ struct PersistentSearchEngine::Impl {
       .delta_records = d_delta_records,
       .delta_vectors = d_delta_vectors,
       .delta_pq_codes = d_delta_pq_codes,
+      .delta_staging_records = d_delta_staging_records,
+      .delta_staging_vectors = d_delta_staging_vectors,
+      .delta_encode_scratch = d_delta_encode_scratch,
       .delta_next = d_delta_next,
       .delta_bucket_heads = d_delta_bucket_heads,
       .delta_count = d_delta_count,
@@ -718,6 +802,9 @@ struct PersistentSearchEngine::Impl {
       .delta_remote_keys = d_delta_remote_keys,
       .delta_remote_slots = d_delta_remote_slots,
       .delta_remote_capacity = delta_table_capacity,
+      .delta_supersede_updates = d_delta_supersede_updates,
+      .delta_override_updates = d_delta_override_updates,
+      .graph_invalidation_keys = d_graph_invalidation_keys,
       .anchor_vectors = d_anchor_vectors,
       .anchor_handles = d_anchor_handles,
       .anchor_count = anchor_table.count(),
@@ -895,18 +982,25 @@ struct PersistentSearchEngine::Impl {
     (void)cudaGetLastError();
     launch_persistent_search(kernel_stream, kernel_params, kernel_blocks, 256);
     check_cuda(cudaGetLastError(), "launch_persistent_search(navigation)");
+    PersistentKernelParams control_params = kernel_params;
+    control_params.submissions = {};
+    control_params.completions = {};
+    launch_persistent_search(delta_stream, control_params, 1, 256);
+    check_cuda(cudaGetLastError(), "launch_persistent_search(delta control)");
     kernel_running = true;
     std::cerr << "[gpu-search] persistent CTAs=" << kernel_blocks
-              << " threads/CTA=256 query_slots=" << query_slots << '\n';
+              << "+1-control threads/CTA=256 query_slots=" << query_slots << '\n';
   }
 
   void stop_persistent_kernel() {
     if (!kernel_running) return;
     bind_cuda_device("cudaSetDevice(GPU navigation kernel stop)");
     std::atomic_ref<u32>(*stop_host).store(1, std::memory_order_release);
-    const cudaError_t status = cudaStreamSynchronize(kernel_stream);
+    const cudaError_t query_status = cudaStreamSynchronize(kernel_stream);
+    const cudaError_t control_status = cudaStreamSynchronize(delta_stream);
     kernel_running = false;
-    check_cuda(status, "cudaStreamSynchronize(GPU navigation stop)");
+    check_cuda(query_status, "cudaStreamSynchronize(GPU navigation stop)");
+    check_cuda(control_status, "cudaStreamSynchronize(GPU delta control stop)");
   }
 
   ~Impl() {
@@ -934,6 +1028,7 @@ struct PersistentSearchEngine::Impl {
     if (kernel_running) {
       std::atomic_ref<u32>(*stop_host).store(1, std::memory_order_release);
       if (kernel_stream != nullptr) cudaStreamSynchronize(kernel_stream);
+      if (delta_stream != nullptr) cudaStreamSynchronize(delta_stream);
       kernel_running = false;
     }
     reject_all_pending("persistent GPU query engine stopped before completion");
@@ -946,6 +1041,11 @@ struct PersistentSearchEngine::Impl {
     if (stop_host != nullptr) cudaFreeHost(stop_host);
     if (result_distances_host != nullptr) cudaFreeHost(result_distances_host);
     if (result_ids_host != nullptr) cudaFreeHost(result_ids_host);
+    if (delta_staging_vectors_host != nullptr) cudaFreeHost(delta_staging_vectors_host);
+    if (delta_staging_records_host != nullptr) cudaFreeHost(delta_staging_records_host);
+    if (delta_override_updates_host != nullptr) cudaFreeHost(delta_override_updates_host);
+    if (delta_supersede_updates_host != nullptr) cudaFreeHost(delta_supersede_updates_host);
+    if (graph_invalidation_keys_host != nullptr) cudaFreeHost(graph_invalidation_keys_host);
     device_free(d_delta_count);
     device_free(d_delta_remote_slots);
     device_free(d_delta_remote_keys);
@@ -953,10 +1053,10 @@ struct PersistentSearchEngine::Impl {
     device_free(d_base_override_keys);
     device_free(d_delta_next);
     device_free(d_delta_pq_codes);
+    device_free(d_delta_encode_scratch);
     device_free(d_delta_vectors);
     device_free(d_delta_records);
     device_free(d_graph_cache_generation);
-    device_free(d_graph_invalidation_keys);
     device_free(d_graph_cache_victims);
     device_free(d_graph_cache_states);
     device_free(d_graph_cache_readers);
@@ -1145,12 +1245,9 @@ struct PersistentSearchEngine::Impl {
     }
   }
 
-  void encode_mutation_payload(const DeltaMutation& mutation,
-                               std::vector<f32>& decoded,
-                               std::vector<byte_t>& code,
-                               std::vector<f32>& transformed) const {
+  void decode_mutation_payload(const DeltaMutation& mutation,
+                               std::vector<f32>& decoded) const {
     std::fill(decoded.begin(), decoded.end(), 0.0f);
-    std::fill(code.begin(), code.end(), 0);
     if (mutation.kind == service::storage_owner::MutationKind::erase) return;
     if (mutation.vector.size() == static_cast<size_t>(config.dim) * sizeof(f32)) {
       std::memcpy(decoded.data(), mutation.vector.data(), mutation.vector.size());
@@ -1161,16 +1258,6 @@ struct PersistentSearchEngine::Impl {
     } else {
       throw std::invalid_argument("GPU delta mutation vector has an invalid size");
     }
-    pq::encode(pq_model, decoded, code, transformed);
-  }
-
-  u32 delta_signature(const std::vector<byte_t>& code) const {
-    u32 signature = 2166136261u;
-    for (byte_t value : code) {
-      signature ^= value;
-      signature *= 16777619u;
-    }
-    return signature;
   }
 
   u32 nearest_anchor(const std::vector<f32>& vector, u64 remote_node) const {
@@ -1224,8 +1311,7 @@ struct PersistentSearchEngine::Impl {
     return (static_cast<u64>(shard) << 48) | graph_offset;
   }
 
-  void invalidate_graph_cache(std::span<const u64> raw_nodes) {
-    if (raw_nodes.empty()) return;
+  std::vector<u64> graph_cache_keys(std::span<const u64> raw_nodes) const {
     std::vector<u64> keys;
     keys.reserve(raw_nodes.size());
     for (u64 raw : raw_nodes) keys.push_back(graph_cache_key(raw));
@@ -1234,40 +1320,67 @@ struct PersistentSearchEngine::Impl {
     if (keys.size() > graph_invalidation_capacity) {
       throw std::runtime_error("GPU navigation graph invalidation batch exceeds capacity");
     }
-    bind_cuda_device("cudaSetDevice(GPU navigation graph invalidation)");
-    check_cuda(cudaMemcpyAsync(d_graph_invalidation_keys, keys.data(),
-                               keys.size() * sizeof(u64), cudaMemcpyHostToDevice,
-                               delta_stream),
-               "cudaMemcpyAsync(navigation graph invalidation keys)");
-    launch_invalidate_graph_cache(
-      delta_stream, d_graph_invalidation_keys, static_cast<u32>(keys.size()),
-      d_graph_cache_keys, d_graph_cache_states, d_graph_cache_readers,
-      graph_cache_sets, config.gpu_adjacency_cache_ways);
-    check_cuda(cudaGetLastError(), "launch GPU navigation graph invalidation");
-    check_cuda(cudaStreamSynchronize(delta_stream),
-               "cudaStreamSynchronize(navigation graph invalidation)");
+    return keys;
   }
 
-  void upload_records_locked(std::vector<DeltaMutation>& mutations, bool rebuilding) {
+  void submit_delta_publication(const DeltaPublishDescriptor& descriptor) {
+    const auto timeout = std::chrono::milliseconds(std::clamp<u32>(
+      config.storage_owner_rpc_timeout_ms, 1000, 5000));
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!delta_submissions.try_push(descriptor)) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw std::runtime_error("persistent GPU delta command queue is not making progress");
+      }
+      std::this_thread::yield();
+    }
+
+    DeltaPublishCompletion completion{};
+    while (!delta_completions.try_pop(completion)) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw std::runtime_error("persistent GPU delta publication timed out");
+      }
+      std::this_thread::yield();
+    }
+    if (completion.command_id != descriptor.command_id || completion.status != 0 ||
+        completion.final_count != descriptor.final_count) {
+      throw std::runtime_error(
+        "persistent GPU delta publication failed: command=" +
+        std::to_string(completion.command_id) + " status=" +
+        std::to_string(completion.status) + " count=" +
+        std::to_string(completion.final_count));
+    }
+  }
+
+  void upload_records_locked(std::vector<DeltaMutation>& mutations, bool rebuilding,
+                             std::span<const u64> invalidation_keys = {}) {
+    const auto prepare_started = std::chrono::steady_clock::now();
     bind_cuda_device("cudaSetDevice(GPU navigation delta publication)");
     (void)cudaGetLastError();
     const u32 first_slot = static_cast<u32>(delta_records_host.size());
     if (first_slot + mutations.size() > delta_capacity) {
       throw std::runtime_error("GPU navigation delta live set exceeds its configured capacity");
     }
+    const size_t vector_bytes = VamanaNode::vector_bytes();
     std::vector<DeviceDeltaRecord> records;
-    std::vector<f32> vectors(static_cast<size_t>(mutations.size()) * config.dim);
+    std::vector<byte_t> vectors(static_cast<size_t>(mutations.size()) * vector_bytes);
     std::vector<byte_t> entries(
       static_cast<size_t>(mutations.size()) * code_bytes);
     records.reserve(mutations.size());
-    std::vector<u32> superseded_slots;
-    std::vector<std::pair<u32, u64>> override_updates;
+    std::vector<DeltaSupersedeUpdate> superseded_updates;
+    std::vector<DeltaOverrideUpdate> override_updates;
     std::vector<f32> decoded(config.dim);
     std::vector<byte_t> entry(code_bytes);
     std::vector<f32> transformed(config.dim);
     for (size_t mutation_index = 0; mutation_index < mutations.size(); ++mutation_index) {
       DeltaMutation& mutation = mutations[mutation_index];
-      encode_mutation_payload(mutation, decoded, entry, transformed);
+      bool decoded_ready = false;
+      std::fill(entry.begin(), entry.end(), 0);
+      if (rebuilding &&
+          mutation.kind != service::storage_owner::MutationKind::erase) {
+        decode_mutation_payload(mutation, decoded);
+        decoded_ready = true;
+        pq::encode(pq_model, decoded, entry, transformed);
+      }
       const u32 slot = static_cast<u32>(delta_records_host.size());
       if (!rebuilding) {
         const auto previous = latest_delta_slot.find(mutation.id);
@@ -1276,19 +1389,34 @@ struct PersistentSearchEngine::Impl {
           if (previous->second >= first_slot) {
             records[previous->second - first_slot].superseded_epoch = mutation.epoch;
           } else {
-            superseded_slots.push_back(previous->second);
+            superseded_updates.push_back(DeltaSupersedeUpdate{
+              .slot = previous->second,
+              .epoch = mutation.epoch,
+            });
           }
         }
       }
       const bool deleted = mutation.kind == service::storage_owner::MutationKind::erase;
       const u64 record_remote = mutation.remote_node != 0
         ? mutation.remote_node : mutation.old_remote_node;
-      const u32 bucket = deleted ? 0 : nearest_anchor(decoded, record_remote);
+      u32 bucket = 0;
+      if (!deleted) {
+        const auto hinted = anchor_buckets_by_raw.find(mutation.anchor_hint);
+        if (hinted == anchor_buckets_by_raw.end()) {
+          if (!decoded_ready) {
+            decode_mutation_payload(mutation, decoded);
+            decoded_ready = true;
+          }
+          bucket = nearest_anchor(decoded, record_remote);
+        } else {
+          bucket = hinted->second;
+        }
+      }
       DeviceDeltaRecord record{
         .id = mutation.id,
         .generation = std::max<u32>(1, mutation.generation),
         .flags = deleted ? kDeltaDeleted : 0u,
-        .signature = deleted ? 0u : delta_signature(entry),
+        .signature = 0,
         .epoch = mutation.epoch,
         .remote_node = record_remote,
         .anchor_bucket = bucket,
@@ -1296,20 +1424,83 @@ struct PersistentSearchEngine::Impl {
       delta_records_host.push_back(record);
       records.push_back(record);
       latest_delta_slot[mutation.id] = slot;
-      std::copy(decoded.begin(), decoded.end(),
-                vectors.begin() + mutation_index * config.dim);
+      byte_t* stored_vector = vectors.data() + mutation_index * vector_bytes;
+      if (deleted) {
+        std::memset(stored_vector, 0, vector_bytes);
+      } else if (mutation.vector.size() == vector_bytes) {
+        std::memcpy(stored_vector, mutation.vector.data(), vector_bytes);
+      } else {
+        if (!decoded_ready) {
+          decode_mutation_payload(mutation, decoded);
+          decoded_ready = true;
+        }
+        encode_float_vector_to_storage(decoded.data(), config.dim,
+                                       config.resolved_vector_dtype(), stored_vector);
+      }
       std::copy(entry.begin(), entry.end(),
                 entries.begin() + mutation_index * code_bytes);
       u32 ordinal = 0;
       if (format::remote_to_ordinal(index, RemotePtr{mutation.old_remote_node}, ordinal)) {
         const auto [it, inserted] = base_override_epochs.emplace(ordinal, mutation.epoch);
         if (inserted) {
-          override_updates.emplace_back(ordinal, mutation.epoch);
+          override_updates.push_back(DeltaOverrideUpdate{
+            .ordinal = ordinal,
+            .epoch = mutation.epoch,
+          });
         } else if (mutation.epoch < it->second) {
           it->second = mutation.epoch;
-          override_updates.emplace_back(ordinal, mutation.epoch);
+          override_updates.push_back(DeltaOverrideUpdate{
+            .ordinal = ordinal,
+            .epoch = mutation.epoch,
+          });
         }
       }
+    }
+
+    if (!rebuilding &&
+        (records.size() > delta_command_capacity ||
+         superseded_updates.size() > delta_command_capacity ||
+         override_updates.size() > delta_command_capacity ||
+         invalidation_keys.size() > graph_invalidation_capacity)) {
+      throw std::runtime_error("GPU navigation delta control batch exceeds capacity");
+    }
+
+    if (!rebuilding) {
+      std::memcpy(delta_staging_records_host, records.data(),
+                  records.size() * sizeof(DeviceDeltaRecord));
+      std::memcpy(delta_staging_vectors_host, vectors.data(), vectors.size());
+      if (!superseded_updates.empty()) {
+        std::memcpy(delta_supersede_updates_host, superseded_updates.data(),
+                    superseded_updates.size() * sizeof(DeltaSupersedeUpdate));
+      }
+      if (!override_updates.empty()) {
+        std::memcpy(delta_override_updates_host, override_updates.data(),
+                    override_updates.size() * sizeof(DeltaOverrideUpdate));
+      }
+      if (!invalidation_keys.empty()) {
+        std::memcpy(graph_invalidation_keys_host, invalidation_keys.data(),
+                    invalidation_keys.size() * sizeof(u64));
+      }
+      const u32 count = static_cast<u32>(delta_records_host.size());
+      const auto command_started = std::chrono::steady_clock::now();
+      engine.telemetry_.publication_prepare_ns_total.fetch_add(
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          command_started - prepare_started).count()), std::memory_order_relaxed);
+      submit_delta_publication(DeltaPublishDescriptor{
+        .command_id = next_delta_command_id.fetch_add(1, std::memory_order_relaxed),
+        .first_slot = first_slot,
+        .record_count = static_cast<u32>(records.size()),
+        .final_count = count,
+        .invalidation_count = static_cast<u32>(invalidation_keys.size()),
+        .superseded_count = static_cast<u32>(superseded_updates.size()),
+        .override_count = static_cast<u32>(override_updates.size()),
+      });
+      engine.telemetry_.publication_command_ns_total.fetch_add(
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - command_started).count()),
+        std::memory_order_relaxed);
+      engine.telemetry_.delta_live_entries.store(count, std::memory_order_relaxed);
+      return;
     }
 
     if (!records.empty()) {
@@ -1318,18 +1509,15 @@ struct PersistentSearchEngine::Impl {
                                  cudaMemcpyHostToDevice, delta_stream),
                  "cudaMemcpyAsync(navigation delta records)");
       check_cuda(cudaMemcpyAsync(
-        d_delta_vectors + static_cast<size_t>(first_slot) * config.dim,
-        vectors.data(), vectors.size() * sizeof(f32), cudaMemcpyHostToDevice, delta_stream),
+        d_delta_vectors + static_cast<size_t>(first_slot) * vector_bytes,
+        vectors.data(), vectors.size(), cudaMemcpyHostToDevice, delta_stream),
         "cudaMemcpyAsync(navigation delta vectors)");
       check_cuda(cudaMemcpyAsync(
         d_delta_pq_codes + static_cast<size_t>(first_slot) * code_bytes,
         entries.data(), entries.size(), cudaMemcpyHostToDevice, delta_stream),
         "cudaMemcpyAsync(navigation delta codes)");
     }
-    for (u32 slot : superseded_slots) {
-      launch_supersede_delta_record(delta_stream, d_delta_records, slot,
-                                    delta_records_host[slot].superseded_epoch);
-    }
+
     for (size_t index_in_batch = 0; index_in_batch < records.size(); ++index_in_batch) {
       const u32 slot = first_slot + static_cast<u32>(index_in_batch);
       const DeviceDeltaRecord& record = records[index_in_batch];
@@ -1342,14 +1530,12 @@ struct PersistentSearchEngine::Impl {
                                  record.anchor_bucket, slot);
       }
     }
+    for (const DeltaSupersedeUpdate& update : superseded_updates) {
+      launch_supersede_delta_record(delta_stream, d_delta_records, update.slot,
+                                    update.epoch);
+    }
     if (rebuilding) {
       for (const auto& [ordinal, override_epoch] : base_override_epochs) {
-        launch_insert_base_override(delta_stream, d_base_override_keys,
-                                    d_base_override_epochs, delta_table_capacity,
-                                    ordinal, override_epoch);
-      }
-    } else {
-      for (const auto& [ordinal, override_epoch] : override_updates) {
         launch_insert_base_override(delta_stream, d_base_override_keys,
                                     d_base_override_epochs, delta_table_capacity,
                                     ordinal, override_epoch);
@@ -1365,7 +1551,7 @@ struct PersistentSearchEngine::Impl {
   void upload_mutations(std::vector<DeltaMutation>& mutations, u64 epoch,
                         std::span<const u64> invalidated_graph_nodes) {
     if (mutations.empty()) return;
-    for (u64 raw : invalidated_graph_nodes) (void)graph_cache_key(raw);
+    const std::vector<u64> invalidation_keys = graph_cache_keys(invalidated_graph_nodes);
     if (delta_records_host.size() + mutations.size() >
         static_cast<size_t>(delta_capacity) * 4 / 5) {
       compact_delta();
@@ -1383,8 +1569,7 @@ struct PersistentSearchEngine::Impl {
         mutation.generation, static_cast<u32>(iterator->second + 1));
       iterator->second = mutation.generation;
     }
-    invalidate_graph_cache(invalidated_graph_nodes);
-    upload_records_locked(mutations, false);
+    upload_records_locked(mutations, false, invalidation_keys);
   }
 
   void pause_admission_for_compaction() {
@@ -1508,6 +1693,9 @@ struct PersistentSearchEngine::Impl {
       }
       const auto completed_at = std::chrono::steady_clock::now();
       const u64 gpu_ns = completion.gpu_cycles * 1000000ULL / gpu_clock_khz;
+      const auto phase_ns = [&](u64 cycles) {
+        return cycles * 1000000ULL / gpu_clock_khz;
+      };
       const u64 end_to_end_ns = static_cast<u64>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
           completed_at - pending->submitted_at).count());
@@ -1521,6 +1709,7 @@ struct PersistentSearchEngine::Impl {
                   << " beam_us=" << completion.beam_cycles * 1000ULL / gpu_clock_khz
                   << " exact_us=" << completion.exact_cycles * 1000ULL / gpu_clock_khz
                   << " graph_reads=" << completion.remote_pages
+                  << " graph_batches=" << completion.remote_batches
                   << " graph_hits=" << completion.cache_hits
                   << " exact_reads=" << completion.exact_vectors
                   << " exact_hits=" << completion.exact_cache_hits << '\n';
@@ -1553,6 +1742,16 @@ struct PersistentSearchEngine::Impl {
       maintenance_cv.notify_all();
       engine.telemetry_.queries_completed.fetch_add(1, std::memory_order_relaxed);
       engine.telemetry_.gpu_active_ns.fetch_add(gpu_ns, std::memory_order_relaxed);
+      engine.telemetry_.gpu_prepare_ns.fetch_add(
+        phase_ns(completion.prepare_cycles), std::memory_order_relaxed);
+      engine.telemetry_.gpu_graph_ns.fetch_add(
+        phase_ns(completion.graph_cycles), std::memory_order_relaxed);
+      engine.telemetry_.gpu_score_ns.fetch_add(
+        phase_ns(completion.score_cycles), std::memory_order_relaxed);
+      engine.telemetry_.gpu_beam_ns.fetch_add(
+        phase_ns(completion.beam_cycles), std::memory_order_relaxed);
+      engine.telemetry_.gpu_exact_ns.fetch_add(
+        phase_ns(completion.exact_cycles), std::memory_order_relaxed);
       engine.telemetry_.completion_wait_ns.fetch_add(end_to_end_ns,
                                                      std::memory_order_relaxed);
       if (completion.snapshot_epoch != 0) {
@@ -1565,6 +1764,11 @@ struct PersistentSearchEngine::Impl {
         static_cast<u64>(completion.exact_vectors) * node_record_bytes +
         static_cast<u64>(completion.remote_pages) * index.layout.graph_entry_bytes,
         std::memory_order_relaxed);
+      if (completion.remote_pages > completion.remote_batches) {
+        engine.telemetry_.rdma_merged_requests.fetch_add(
+          completion.remote_pages - completion.remote_batches,
+          std::memory_order_relaxed);
+      }
       engine.telemetry_.exact_vector_reads.fetch_add(completion.exact_vectors,
                                                      std::memory_order_relaxed);
       engine.telemetry_.graph_page_requests.fetch_add(completion.remote_pages,
@@ -1582,6 +1786,7 @@ struct PersistentSearchEngine::Impl {
   pq::Model pq_model;
   AnchorTable anchor_table;
   std::vector<u32> entry_handles;
+  std::unordered_map<u64, u32> anchor_buckets_by_raw;
 #ifdef DVSTOR_HAVE_GPUNETIO
   std::unique_ptr<gpu::GpuNetioPersistentTransport> direct_transport;
   gpu::GpuNetioPersistentView direct_view{};
@@ -1600,6 +1805,8 @@ struct PersistentSearchEngine::Impl {
 #endif
   MappedRing<QueryDescriptor> submissions;
   MappedRing<CompletionDescriptor> completions;
+  MappedRing<DeltaPublishDescriptor> delta_submissions;
+  MappedRing<DeltaPublishCompletion> delta_completions;
   u32 query_slots{};
   u32 result_capacity{};
   u32 exact_width{};
@@ -1614,6 +1821,7 @@ struct PersistentSearchEngine::Impl {
   u32 exact_cache_slots{};
   u32 exact_cache_stride{};
   u32 graph_invalidation_capacity{};
+  u32 delta_command_capacity{};
   size_t graph_cache_bytes{};
   size_t exact_cache_bytes{};
   size_t exact_region_offset{};
@@ -1646,6 +1854,7 @@ struct PersistentSearchEngine::Impl {
   u32* d_graph_cache_readers{};
   u32* d_graph_cache_victims{};
   u64* d_graph_cache_generation{};
+  u64* graph_invalidation_keys_host{};
   u64* d_graph_invalidation_keys{};
   u32* d_exact_cache_keys{};
   u32* d_exact_cache_states{};
@@ -1657,13 +1866,22 @@ struct PersistentSearchEngine::Impl {
   u32* d_result_ids{};
   f32* d_result_distances{};
   DeviceDeltaRecord* d_delta_records{};
-  f32* d_delta_vectors{};
+  byte_t* d_delta_vectors{};
   byte_t* d_delta_pq_codes{};
+  f32* d_delta_encode_scratch{};
+  DeviceDeltaRecord* delta_staging_records_host{};
+  DeviceDeltaRecord* d_delta_staging_records{};
+  byte_t* delta_staging_vectors_host{};
+  byte_t* d_delta_staging_vectors{};
   u32* d_delta_next{};
   u32* d_base_override_keys{};
   u64* d_base_override_epochs{};
   u64* d_delta_remote_keys{};
   u32* d_delta_remote_slots{};
+  DeltaSupersedeUpdate* delta_supersede_updates_host{};
+  DeltaSupersedeUpdate* d_delta_supersede_updates{};
+  DeltaOverrideUpdate* delta_override_updates_host{};
+  DeltaOverrideUpdate* d_delta_override_updates{};
   u32* d_delta_count{};
   std::vector<DeviceDeltaRecord> delta_records_host;
   std::unordered_map<node_t, u32> latest_delta_slot;
@@ -1689,6 +1907,7 @@ struct PersistentSearchEngine::Impl {
   std::atomic<bool> maintenance_shutdown{false};
   std::atomic<u64> active_gpu_queries{0};
   std::atomic<u64> next_request_id{1};
+  std::atomic<u64> next_delta_command_id{1};
   std::atomic<u64> pending_count{0};
   std::mutex admission_mutex;
   std::condition_variable admission_cv;
@@ -1740,12 +1959,16 @@ bool PersistentSearchEngine::publish_mutations(
     throw std::invalid_argument("GPU mutation publication requires a non-empty epoch batch");
   }
   const size_t mutation_count = mutations.size();
-  auto oldest = std::chrono::steady_clock::now();
+  const auto publication_started = std::chrono::steady_clock::now();
+  u64 publication_queue_ns = 0;
   for (const DeltaMutation& mutation : mutations) {
-    if (mutation.enqueued_at != std::chrono::steady_clock::time_point{}) {
-      oldest = std::min(oldest, mutation.enqueued_at);
-    }
+    if (mutation.enqueued_at == std::chrono::steady_clock::time_point{}) continue;
+    publication_queue_ns += static_cast<u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        publication_started - mutation.enqueued_at).count());
   }
+  telemetry_.publication_queue_ns_total.fetch_add(publication_queue_ns,
+                                                  std::memory_order_relaxed);
   try {
     impl_->upload_mutations(mutations, epoch, invalidated_graph_nodes);
   } catch (const std::exception& error) {
@@ -1753,6 +1976,16 @@ bool PersistentSearchEngine::publish_mutations(
     throw;
   }
   const auto now = std::chrono::steady_clock::now();
+  u64 visibility_ns_total = 0;
+  u64 visibility_ns_max = 0;
+  for (const DeltaMutation& mutation : mutations) {
+    if (mutation.enqueued_at == std::chrono::steady_clock::time_point{}) continue;
+    const u64 visibility_ns = static_cast<u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        now - mutation.enqueued_at).count());
+    visibility_ns_total += visibility_ns;
+    visibility_ns_max = std::max(visibility_ns_max, visibility_ns);
+  }
   try {
     if (!delta_.publish(std::move(mutations), epoch, now)) {
       impl_->mark_unhealthy("GPU mutation publication lost its coordinator epoch");
@@ -1762,15 +1995,14 @@ bool PersistentSearchEngine::publish_mutations(
     impl_->mark_unhealthy(std::string{"GPU epoch publication failed: "} + error.what());
     throw;
   }
-  const u64 visibility_ns = static_cast<u64>(
-    std::chrono::duration_cast<std::chrono::nanoseconds>(now - oldest).count());
   telemetry_.mutations_published.fetch_add(mutation_count, std::memory_order_relaxed);
-  telemetry_.visibility_ns_total.fetch_add(visibility_ns * mutation_count,
+  telemetry_.delta_publications.fetch_add(1, std::memory_order_relaxed);
+  telemetry_.visibility_ns_total.fetch_add(visibility_ns_total,
                                            std::memory_order_relaxed);
   u64 current_max = telemetry_.visibility_ns_max.load(std::memory_order_relaxed);
-  while (current_max < visibility_ns &&
+  while (current_max < visibility_ns_max &&
          !telemetry_.visibility_ns_max.compare_exchange_weak(
-           current_max, visibility_ns, std::memory_order_relaxed)) {}
+           current_max, visibility_ns_max, std::memory_order_relaxed)) {}
   return true;
 }
 

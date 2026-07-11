@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -31,6 +33,8 @@ private:
   const std::atomic<size_t>& completed_ops_;
   std::chrono::steady_clock::time_point start_;
   std::atomic<bool> finished_{false};
+  std::mutex finish_mutex_;
+  std::condition_variable finish_cv_;
   std::thread thread_;
 };
 

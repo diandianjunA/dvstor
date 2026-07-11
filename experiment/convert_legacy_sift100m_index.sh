@@ -27,7 +27,7 @@ if [[ "${OVERWRITE_INDEX:-0}" == "1" ]]; then migration_cmd+=(--overwrite); fi
 pq_threads="${PQ_THREADS:-32}"
 pq_cmd=("$BUILD_DIR/vamana_pq_indexer"
   --index-prefix "$INDEX_PREFIX"
-  --subquantizers "${PQ_SUBQUANTIZERS:-16}"
+  --subquantizers "$PQ_SUBQUANTIZERS"
   --train-samples "${PQ_TRAIN_SAMPLES:-262144}"
   --opq-iterations "${PQ_OPQ_ITERATIONS:-20}"
   --pq-iterations "${PQ_ITERATIONS:-25}"

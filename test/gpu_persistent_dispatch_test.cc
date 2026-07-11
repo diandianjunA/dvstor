@@ -8,13 +8,17 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 #include "gpu_search/persistent_kernel.hh"
+#include "gpu_search/pq_index.hh"
 
 namespace {
 
 using gpu_search::u32;
 using gpu_search::u64;
+using gpu_search::u8;
+using gpu_search::f32;
 
 void check_cuda(cudaError_t status, const char* operation) {
   if (status != cudaSuccess) {
@@ -153,6 +157,181 @@ int main(int argc, char** argv) {
       256, MappedRing<gpu_search::QueryDescriptor>::Direction::host_to_device);
     MappedRing<gpu_search::CompletionDescriptor> completions(
       256, MappedRing<gpu_search::CompletionDescriptor>::Direction::device_to_host);
+    MappedRing<gpu_search::DeltaPublishDescriptor> delta_submissions(
+      8, MappedRing<gpu_search::DeltaPublishDescriptor>::Direction::host_to_device);
+    MappedRing<gpu_search::DeltaPublishCompletion> delta_completions(
+      8, MappedRing<gpu_search::DeltaPublishCompletion>::Direction::device_to_host);
+
+    constexpr u32 kCacheWays = 4;
+    const u64 cache_keys_host[kCacheWays]{11, 22, 33, 44};
+    u32 cache_states_host[kCacheWays]{2, 2, 2, 2};
+    u64* cache_keys_device = nullptr;
+    u32* cache_states_device = nullptr;
+    u64* invalidation_key_device = nullptr;
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&cache_keys_device),
+                          sizeof(cache_keys_host)), "cudaMalloc(cache keys)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&cache_states_device),
+                          sizeof(cache_states_host)), "cudaMalloc(cache states)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&invalidation_key_device), sizeof(u64)),
+               "cudaMalloc(invalidation key)");
+    const u64 invalidation_key_host = 22;
+    check_cuda(cudaMemcpy(cache_keys_device, cache_keys_host, sizeof(cache_keys_host),
+                          cudaMemcpyHostToDevice), "cudaMemcpy(cache keys)");
+    check_cuda(cudaMemcpy(cache_states_device, cache_states_host, sizeof(cache_states_host),
+                          cudaMemcpyHostToDevice), "cudaMemcpy(cache states)");
+    check_cuda(cudaMemcpy(invalidation_key_device, &invalidation_key_host, sizeof(u64),
+                          cudaMemcpyHostToDevice), "cudaMemcpy(invalidation key)");
+
+    gpu_search::DeviceDeltaRecord delta_records_host[2]{};
+    delta_records_host[0].id = 7;
+    delta_records_host[0].epoch = 1;
+    delta_records_host[0].remote_node = 111;
+    delta_records_host[0].anchor_bucket = 0;
+    delta_records_host[1].id = 7;
+    delta_records_host[1].epoch = 2;
+    delta_records_host[1].remote_node = 222;
+    delta_records_host[1].anchor_bucket = 0;
+    gpu_search::DeviceDeltaRecord* delta_records_device = nullptr;
+    gpu_search::DeviceDeltaRecord* delta_staging_host = nullptr;
+    gpu_search::DeviceDeltaRecord* delta_staging_device = nullptr;
+    u8* delta_vector_staging_host = nullptr;
+    u8* delta_vector_staging_device = nullptr;
+    u8* delta_vectors_device = nullptr;
+    u8* delta_codes_device = nullptr;
+    f32* delta_encode_scratch_device = nullptr;
+    f32* opq_matrix_device = nullptr;
+    f32* pq_centroids_device = nullptr;
+    u32* delta_next_device = nullptr;
+    u32* delta_bucket_heads_device = nullptr;
+    u32* delta_count_device = nullptr;
+    u32* override_keys_device = nullptr;
+    u64* override_epochs_device = nullptr;
+    u64* remote_keys_device = nullptr;
+    u32* remote_slots_device = nullptr;
+    gpu_search::DeltaSupersedeUpdate* supersede_updates_device = nullptr;
+    gpu_search::DeltaOverrideUpdate* override_updates_device = nullptr;
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&delta_records_device),
+                          sizeof(delta_records_host)), "cudaMalloc(delta records)");
+    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&delta_staging_host),
+                             sizeof(gpu_search::DeviceDeltaRecord),
+                             cudaHostAllocMapped), "cudaHostAlloc(delta staging)");
+    check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&delta_staging_device),
+                                        delta_staging_host, 0),
+               "cudaHostGetDevicePointer(delta staging)");
+    *delta_staging_host = delta_records_host[1];
+    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&delta_vector_staging_host),
+                             128, cudaHostAllocMapped),
+               "cudaHostAlloc(delta vector staging)");
+    check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&delta_vector_staging_device),
+                                        delta_vector_staging_host, 0),
+               "cudaHostGetDevicePointer(delta vector staging)");
+    for (u32 dimension = 0; dimension < 128; ++dimension) {
+      delta_vector_staging_host[dimension] = static_cast<u8>((dimension * 13 + 7) % 251);
+    }
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&delta_vectors_device), 2 * 128),
+               "cudaMalloc(delta vectors)");
+    const u32 test_subquantizers = argc > 4
+      ? static_cast<u32>(std::max(1, std::atoi(argv[4]))) : 16;
+    if (test_subquantizers > gpu_search::kPersistentMaxSubquantizers ||
+        128 % test_subquantizers != 0) {
+      throw std::invalid_argument("invalid test PQ subquantizer count");
+    }
+    const u32 test_subvector_dim = 128 / test_subquantizers;
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&delta_codes_device),
+                          2 * test_subquantizers),
+               "cudaMalloc(delta codes)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&delta_encode_scratch_device),
+                          128 * sizeof(f32)),
+               "cudaMalloc(delta encode scratch)");
+    gpu_search::pq::Model pq_model;
+    pq_model.dim = 128;
+    pq_model.subquantizers = test_subquantizers;
+    pq_model.rotation.assign(128 * 128, 0.0f);
+    for (u32 row = 0; row < 128; ++row) {
+      pq_model.rotation[static_cast<size_t>(row) * 128 + (row * 17) % 128] = 1.0f;
+    }
+    pq_model.centroids.resize(
+      static_cast<size_t>(test_subquantizers) * 256 * test_subvector_dim);
+    for (u32 subquantizer = 0; subquantizer < test_subquantizers; ++subquantizer) {
+      for (u32 centroid = 0; centroid < 256; ++centroid) {
+        for (u32 dimension = 0; dimension < test_subvector_dim; ++dimension) {
+          pq_model.centroids[
+            (static_cast<size_t>(subquantizer) * 256 + centroid) *
+              test_subvector_dim + dimension] =
+              static_cast<f32>((centroid * 3 + subquantizer * 11 + dimension * 5) % 251);
+        }
+      }
+    }
+    std::vector<f32> decoded_vector(128);
+    for (u32 dimension = 0; dimension < 128; ++dimension) {
+      decoded_vector[dimension] = static_cast<f32>(delta_vector_staging_host[dimension]);
+    }
+    std::vector<u8> expected_delta_code(test_subquantizers);
+    std::vector<f32> transformed_scratch(128);
+    gpu_search::pq::encode(pq_model, decoded_vector, expected_delta_code,
+                           transformed_scratch);
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&opq_matrix_device),
+                          pq_model.rotation.size() * sizeof(f32)),
+               "cudaMalloc(OPQ matrix)");
+    check_cuda(cudaMemcpy(opq_matrix_device, pq_model.rotation.data(),
+                          pq_model.rotation.size() * sizeof(f32), cudaMemcpyHostToDevice),
+               "cudaMemcpy(OPQ matrix)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&pq_centroids_device),
+                          pq_model.centroids.size() * sizeof(f32)),
+               "cudaMalloc(PQ centroids)");
+    check_cuda(cudaMemcpy(pq_centroids_device, pq_model.centroids.data(),
+                          pq_model.centroids.size() * sizeof(f32), cudaMemcpyHostToDevice),
+               "cudaMemcpy(PQ centroids)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&delta_next_device), 2 * sizeof(u32)),
+               "cudaMalloc(delta next)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&delta_bucket_heads_device), sizeof(u32)),
+               "cudaMalloc(delta bucket heads)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&delta_count_device), sizeof(u32)),
+               "cudaMalloc(delta count)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&override_keys_device), 4 * sizeof(u32)),
+               "cudaMalloc(override keys)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&override_epochs_device), 4 * sizeof(u64)),
+               "cudaMalloc(override epochs)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&remote_keys_device), 4 * sizeof(u64)),
+               "cudaMalloc(remote keys)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&remote_slots_device), 4 * sizeof(u32)),
+               "cudaMalloc(remote slots)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&supersede_updates_device),
+                          sizeof(gpu_search::DeltaSupersedeUpdate)),
+               "cudaMalloc(supersede updates)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&override_updates_device),
+                          sizeof(gpu_search::DeltaOverrideUpdate)),
+               "cudaMalloc(override updates)");
+    const u32 initial_next[2]{UINT32_MAX, UINT32_MAX};
+    const u32 initial_bucket = 0;
+    const u32 initial_count = 1;
+    const gpu_search::DeltaSupersedeUpdate supersede_update{.slot = 0, .epoch = 2};
+    const gpu_search::DeltaOverrideUpdate override_update{.ordinal = 7, .epoch = 2};
+    check_cuda(cudaMemset(delta_records_device, 0, sizeof(delta_records_host)),
+               "cudaMemset(delta records)");
+    check_cuda(cudaMemcpy(delta_records_device, delta_records_host,
+                          sizeof(gpu_search::DeviceDeltaRecord),
+                          cudaMemcpyHostToDevice), "cudaMemcpy(delta record zero)");
+    check_cuda(cudaMemcpy(delta_next_device, initial_next, sizeof(initial_next),
+                          cudaMemcpyHostToDevice), "cudaMemcpy(delta next)");
+    check_cuda(cudaMemcpy(delta_bucket_heads_device, &initial_bucket, sizeof(initial_bucket),
+                          cudaMemcpyHostToDevice), "cudaMemcpy(delta bucket head)");
+    check_cuda(cudaMemcpy(delta_count_device, &initial_count, sizeof(initial_count),
+                          cudaMemcpyHostToDevice), "cudaMemcpy(delta count)");
+    check_cuda(cudaMemset(override_keys_device, 0xff, 4 * sizeof(u32)),
+               "cudaMemset(override keys)");
+    check_cuda(cudaMemset(override_epochs_device, 0, 4 * sizeof(u64)),
+               "cudaMemset(override epochs)");
+    check_cuda(cudaMemset(remote_keys_device, 0, 4 * sizeof(u64)),
+               "cudaMemset(remote keys)");
+    check_cuda(cudaMemset(remote_slots_device, 0xff, 4 * sizeof(u32)),
+               "cudaMemset(remote slots)");
+    check_cuda(cudaMemcpy(supersede_updates_device, &supersede_update,
+                          sizeof(supersede_update), cudaMemcpyHostToDevice),
+               "cudaMemcpy(supersede update)");
+    check_cuda(cudaMemcpy(override_updates_device, &override_update,
+                          sizeof(override_update), cudaMemcpyHostToDevice),
+               "cudaMemcpy(override update)");
 
     u32* stop_host = nullptr;
     u32* stop_device = nullptr;
@@ -165,19 +344,140 @@ int main(int argc, char** argv) {
                "cudaHostGetDevicePointer(stop)");
 
     cudaStream_t stream = nullptr;
+    cudaStream_t control_stream = nullptr;
     check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
                "cudaStreamCreateWithFlags");
+    check_cuda(cudaStreamCreateWithFlags(&control_stream, cudaStreamNonBlocking),
+               "cudaStreamCreateWithFlags(control)");
 
     gpu_search::PersistentKernelParams params{};
     params.submissions = submissions.device_view();
     params.completions = completions.device_view();
+    params.delta_submissions = delta_submissions.device_view();
+    params.delta_completions = delta_completions.device_view();
+    params.delta_records = delta_records_device;
+    params.delta_staging_records = delta_staging_device;
+    params.delta_vectors = delta_vectors_device;
+    params.delta_staging_vectors = delta_vector_staging_device;
+    params.delta_pq_codes = delta_codes_device;
+    params.delta_encode_scratch = delta_encode_scratch_device;
+    params.delta_next = delta_next_device;
+    params.delta_bucket_heads = delta_bucket_heads_device;
+    params.delta_count = delta_count_device;
+    params.delta_capacity = 2;
+    params.base_override_keys = override_keys_device;
+    params.base_override_epochs = override_epochs_device;
+    params.base_override_capacity = 4;
+    params.delta_remote_keys = remote_keys_device;
+    params.delta_remote_slots = remote_slots_device;
+    params.delta_remote_capacity = 4;
+    params.delta_supersede_updates = supersede_updates_device;
+    params.delta_override_updates = override_updates_device;
+    params.graph_invalidation_keys = invalidation_key_device;
+    params.graph_cache_keys = cache_keys_device;
+    params.graph_cache_states = cache_states_device;
+    params.graph_cache_sets = 1;
+    params.graph_cache_ways = kCacheWays;
     params.stop = stop_device;
     params.query_slots = 1;
     params.dim = 128;
+    params.vector_bytes = 128;
+    params.vector_dtype = 1;
+    params.pq_subquantizers = test_subquantizers;
+    params.pq_subvector_dim = test_subvector_dim;
+    params.pq_code_bytes = test_subquantizers;
+    params.opq_matrix = opq_matrix_device;
+    params.pq_centroids = pq_centroids_device;
     const u32 block_count = argc > 3
       ? static_cast<u32>(std::max(1, std::atoi(argv[3]))) : 8;
-    gpu_search::launch_persistent_search(stream, params, block_count, 128);
+    auto query_params = params;
+    query_params.delta_submissions = {};
+    query_params.delta_completions = {};
+    gpu_search::launch_persistent_search(stream, query_params, block_count, 128);
     check_cuda(cudaPeekAtLastError(), "launch_persistent_search");
+    auto control_params = params;
+    control_params.submissions = {};
+    control_params.completions = {};
+    gpu_search::launch_persistent_search(control_stream, control_params, 1, 128);
+    check_cuda(cudaPeekAtLastError(), "launch_persistent_delta_control");
+
+    const auto delta_deadline = std::chrono::steady_clock::now() +
+      std::chrono::seconds(10);
+    const gpu_search::DeltaPublishDescriptor delta_descriptor{
+      .command_id = 99,
+      .first_slot = 1,
+      .record_count = 1,
+      .final_count = 2,
+      .invalidation_count = 1,
+      .superseded_count = 1,
+      .override_count = 1,
+    };
+    while (!delta_submissions.try_push(delta_descriptor)) {
+      if (std::chrono::steady_clock::now() >= delta_deadline) {
+        throw std::runtime_error("persistent delta submission ring stopped making progress");
+      }
+      std::this_thread::yield();
+    }
+    gpu_search::DeltaPublishCompletion delta_completion{};
+    while (!delta_completions.try_pop(delta_completion)) {
+      if (std::chrono::steady_clock::now() >= delta_deadline) {
+        throw std::runtime_error("persistent delta command did not complete");
+      }
+      std::this_thread::yield();
+    }
+    if (delta_completion.command_id != 99 || delta_completion.status != 0 ||
+        delta_completion.final_count != 2) {
+      throw std::runtime_error("persistent delta completion is invalid");
+    }
+
+    u32 delta_count_host = 0;
+    u32 delta_next_host[2]{};
+    u32 delta_bucket_head_host = UINT32_MAX;
+    u32 override_keys_host[4]{};
+    u64 override_epochs_host[4]{};
+    u64 remote_keys_host[4]{};
+    u32 remote_slots_host[4]{};
+    std::vector<u8> encoded_delta_code(test_subquantizers);
+    check_cuda(cudaMemcpy(&delta_count_host, delta_count_device, sizeof(delta_count_host),
+                          cudaMemcpyDeviceToHost), "cudaMemcpy(delta count result)");
+    check_cuda(cudaMemcpy(delta_next_host, delta_next_device, sizeof(delta_next_host),
+                          cudaMemcpyDeviceToHost), "cudaMemcpy(delta next result)");
+    check_cuda(cudaMemcpy(&delta_bucket_head_host, delta_bucket_heads_device,
+                          sizeof(delta_bucket_head_host), cudaMemcpyDeviceToHost),
+               "cudaMemcpy(delta bucket result)");
+    check_cuda(cudaMemcpy(delta_records_host, delta_records_device, sizeof(delta_records_host),
+                          cudaMemcpyDeviceToHost), "cudaMemcpy(delta records result)");
+    check_cuda(cudaMemcpy(cache_states_host, cache_states_device, sizeof(cache_states_host),
+                          cudaMemcpyDeviceToHost), "cudaMemcpy(cache states result)");
+    check_cuda(cudaMemcpy(override_keys_host, override_keys_device, sizeof(override_keys_host),
+                          cudaMemcpyDeviceToHost), "cudaMemcpy(override keys result)");
+    check_cuda(cudaMemcpy(override_epochs_host, override_epochs_device,
+                          sizeof(override_epochs_host), cudaMemcpyDeviceToHost),
+               "cudaMemcpy(override epochs result)");
+    check_cuda(cudaMemcpy(remote_keys_host, remote_keys_device, sizeof(remote_keys_host),
+                          cudaMemcpyDeviceToHost), "cudaMemcpy(remote keys result)");
+    check_cuda(cudaMemcpy(remote_slots_host, remote_slots_device, sizeof(remote_slots_host),
+                          cudaMemcpyDeviceToHost), "cudaMemcpy(remote slots result)");
+    check_cuda(cudaMemcpy(encoded_delta_code.data(),
+                          delta_codes_device + test_subquantizers,
+                          encoded_delta_code.size(), cudaMemcpyDeviceToHost),
+               "cudaMemcpy(encoded delta code)");
+    bool override_found = false;
+    bool remote_found = false;
+    for (u32 index = 0; index < 4; ++index) {
+      override_found = override_found ||
+        (override_keys_host[index] == 7 && override_epochs_host[index] == 2);
+      remote_found = remote_found ||
+        (remote_keys_host[index] == 222 && remote_slots_host[index] == 1);
+    }
+    if (delta_count_host != 2 || delta_bucket_head_host != 1 ||
+        delta_next_host[1] != 0 || delta_records_host[0].superseded_epoch != 2 ||
+        encoded_delta_code != expected_delta_code ||
+        !override_found || !remote_found ||
+        cache_states_host[0] != 2 || cache_states_host[1] != 3 ||
+        cache_states_host[2] != 2 || cache_states_host[3] != 2) {
+      throw std::runtime_error("persistent delta publication state is invalid");
+    }
 
     constexpr u64 kRequestBase = 0x1020304050600000ULL;
     constexpr u32 kBatchSize = 64;
@@ -240,50 +540,30 @@ int main(int argc, char** argv) {
 
     std::atomic_ref<u32>(*stop_host).store(1, std::memory_order_release);
     check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+    check_cuda(cudaStreamSynchronize(control_stream), "cudaStreamSynchronize(control)");
 
-    constexpr u32 kCacheWays = 4;
-    const u64 cache_keys_host[kCacheWays]{11, 22, 33, 44};
-    u32 cache_states_host[kCacheWays]{2, 2, 2, 2};
-    const u32 cache_readers_host[kCacheWays]{};
-    const u64 invalidation_key_host = 22;
-    u64* cache_keys_device = nullptr;
-    u32* cache_states_device = nullptr;
-    u32* cache_readers_device = nullptr;
-    u64* invalidation_key_device = nullptr;
-    check_cuda(cudaMalloc(reinterpret_cast<void**>(&cache_keys_device),
-                          sizeof(cache_keys_host)), "cudaMalloc(cache keys)");
-    check_cuda(cudaMalloc(reinterpret_cast<void**>(&cache_states_device),
-                          sizeof(cache_states_host)), "cudaMalloc(cache states)");
-    check_cuda(cudaMalloc(reinterpret_cast<void**>(&cache_readers_device),
-                          sizeof(cache_readers_host)), "cudaMalloc(cache readers)");
-    check_cuda(cudaMalloc(reinterpret_cast<void**>(&invalidation_key_device),
-                          sizeof(invalidation_key_host)), "cudaMalloc(invalidation key)");
-    check_cuda(cudaMemcpy(cache_keys_device, cache_keys_host, sizeof(cache_keys_host),
-                          cudaMemcpyHostToDevice), "cudaMemcpy(cache keys)");
-    check_cuda(cudaMemcpy(cache_states_device, cache_states_host, sizeof(cache_states_host),
-                          cudaMemcpyHostToDevice), "cudaMemcpy(cache states)");
-    check_cuda(cudaMemcpy(cache_readers_device, cache_readers_host, sizeof(cache_readers_host),
-                          cudaMemcpyHostToDevice), "cudaMemcpy(cache readers)");
-    check_cuda(cudaMemcpy(invalidation_key_device, &invalidation_key_host,
-                          sizeof(invalidation_key_host), cudaMemcpyHostToDevice),
-               "cudaMemcpy(invalidation key)");
-    gpu_search::launch_invalidate_graph_cache(
-      stream, invalidation_key_device, 1, cache_keys_device, cache_states_device,
-      cache_readers_device, 1, kCacheWays);
-    check_cuda(cudaGetLastError(), "launch_invalidate_graph_cache");
-    check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize(cache invalidation)");
-    check_cuda(cudaMemcpy(cache_states_host, cache_states_device, sizeof(cache_states_host),
-                          cudaMemcpyDeviceToHost), "cudaMemcpy(cache states result)");
-    if (cache_states_host[0] != 2 || cache_states_host[1] != 0 ||
-        cache_states_host[2] != 2 || cache_states_host[3] != 2) {
-      std::cerr << "targeted graph-cache invalidation cleared the wrong cache line\n";
-      std::_Exit(EXIT_FAILURE);
-    }
+    check_cuda(cudaFree(override_updates_device), "cudaFree(override updates)");
+    check_cuda(cudaFree(supersede_updates_device), "cudaFree(supersede updates)");
+    check_cuda(cudaFree(remote_slots_device), "cudaFree(remote slots)");
+    check_cuda(cudaFree(remote_keys_device), "cudaFree(remote keys)");
+    check_cuda(cudaFree(override_epochs_device), "cudaFree(override epochs)");
+    check_cuda(cudaFree(override_keys_device), "cudaFree(override keys)");
+    check_cuda(cudaFree(delta_count_device), "cudaFree(delta count)");
+    check_cuda(cudaFree(delta_bucket_heads_device), "cudaFree(delta bucket heads)");
+    check_cuda(cudaFree(delta_next_device), "cudaFree(delta next)");
+    check_cuda(cudaFree(delta_records_device), "cudaFree(delta records)");
+    check_cuda(cudaFree(pq_centroids_device), "cudaFree(PQ centroids)");
+    check_cuda(cudaFree(opq_matrix_device), "cudaFree(OPQ matrix)");
+    check_cuda(cudaFree(delta_encode_scratch_device), "cudaFree(delta encode scratch)");
+    check_cuda(cudaFree(delta_codes_device), "cudaFree(delta codes)");
+    check_cuda(cudaFree(delta_vectors_device), "cudaFree(delta vectors)");
+    check_cuda(cudaFreeHost(delta_vector_staging_host), "cudaFreeHost(delta vector staging)");
+    check_cuda(cudaFreeHost(delta_staging_host), "cudaFreeHost(delta staging)");
     check_cuda(cudaFree(invalidation_key_device), "cudaFree(invalidation key)");
-    check_cuda(cudaFree(cache_readers_device), "cudaFree(cache readers)");
     check_cuda(cudaFree(cache_states_device), "cudaFree(cache states)");
     check_cuda(cudaFree(cache_keys_device), "cudaFree(cache keys)");
     check_cuda(cudaStreamDestroy(stream), "cudaStreamDestroy");
+    check_cuda(cudaStreamDestroy(control_stream), "cudaStreamDestroy(control)");
     check_cuda(cudaFreeHost(stop_host), "cudaFreeHost(stop)");
     return 0;
   } catch (const std::exception& error) {

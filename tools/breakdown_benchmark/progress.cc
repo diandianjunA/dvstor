@@ -50,6 +50,7 @@ ProgressReporter::~ProgressReporter() { finish(); }
 
 void ProgressReporter::finish() {
   finished_.store(true, std::memory_order_release);
+  finish_cv_.notify_all();
   if (thread_.joinable()) {
     thread_.join();
   }
@@ -59,7 +60,14 @@ void ProgressReporter::run() {
   size_t last_completed = 0;
   auto last_report = start_;
   while (!finished_.load(std::memory_order_acquire)) {
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+    {
+      std::unique_lock<std::mutex> lock(finish_mutex_);
+      if (finish_cv_.wait_for(lock, std::chrono::seconds(5), [&] {
+            return finished_.load(std::memory_order_acquire);
+          })) {
+        break;
+      }
+    }
     const size_t completed = completed_ops_.load(std::memory_order_relaxed);
     const auto now = std::chrono::steady_clock::now();
     const auto elapsed = std::chrono::duration<double>(now - start_).count();

@@ -8,13 +8,13 @@
 int main(int argc, char** argv) {
   namespace po = boost::program_options;
   tools::vamana_offline::PqIndexOptions options;
-  po::options_description description{"DVSTOR OPQ/PQ16 indexer"};
+  po::options_description description{"DVSTOR OPQ/PQ indexer"};
   description.add_options()
     ("help,h", "Show help")
     ("index-prefix", po::value<filepath_t>(&options.index_prefix)->required(),
      "Schema-14 Vamana index prefix")
     ("reuse-model", po::value<filepath_t>(&options.reuse_model),
-     "Reuse a compatible .pq16 model instead of training")
+     "Reuse a compatible OPQ/PQ model instead of training")
     ("subquantizers", po::value<u32>(&options.subquantizers)->default_value(16),
      "Number of 8-bit product quantizers")
     ("train-samples", po::value<u32>(&options.train_samples)->default_value(options.train_samples),

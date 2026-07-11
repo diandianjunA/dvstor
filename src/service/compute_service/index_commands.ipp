@@ -111,17 +111,20 @@ bool ComputeService::validate_index_metadata(
   if (!service::index_metadata::load_metadata(index_prefix, metadata, error_message)) {
     return false;
   }
+  const bool compatible_quantizer = metadata.navigation_quantizer == "opq_pq" ||
+    metadata.navigation_quantizer == "opq_pq16";
+  const bool compatible_navigation = metadata.navigation_format == "opq_pq_graph_v1" ||
+    metadata.navigation_format == "opq_pq16_graph_v1";
   if (metadata.schema_version != 14 || metadata.node_layout != "plain" ||
       metadata.storage_format != "vamana_compact_v1" ||
-      metadata.navigation_quantizer != "opq_pq16" ||
-      metadata.navigation_format != "opq_pq16_graph_v1" ||
+      !compatible_quantizer || !compatible_navigation ||
       metadata.navigation_code_bytes == 0 ||
       metadata.navigation_code_bytes != metadata.pq_subquantizers ||
       metadata.pq_bits != 8 || metadata.navigation_model_checksum == 0 ||
       metadata.dim != config_.dim || metadata.R != config_.R ||
       metadata.num_memory_nodes != num_servers_) {
     if (error_message != nullptr) {
-      *error_message = "index is not a compatible schema-14 OPQ/PQ16 GPU index";
+      *error_message = "index is not a compatible schema-14 OPQ/PQ GPU index";
     }
     return false;
   }
@@ -162,7 +165,8 @@ bool ComputeService::validate_index_metadata(
     return false;
   }
   print_status("loaded schema-14 GPU index metadata from " + index_prefix.string() +
-               " (OPQ/PQ16, vector_data_type=" +
+               " (OPQ/PQ" + std::to_string(metadata.pq_subquantizers) +
+               ", vector_data_type=" +
                VamanaNode::vector_dtype_name() + ")");
   return true;
 }

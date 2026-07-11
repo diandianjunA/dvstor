@@ -234,13 +234,17 @@ bool synthesize_distributed_view(
     }
     nlohmann::json metadata;
     metadata_input >> metadata;
+    const std::string quantizer = metadata.value("navigation_quantizer", std::string{});
+    const std::string navigation_format = metadata.value("navigation_format", std::string{});
     if (metadata.value("schema_version", 0u) != 14 ||
         metadata.value("distance", std::string{"l2"}) != "l2" ||
         metadata.value("node_layout", std::string{}) != "plain" ||
         metadata.value("storage_format", std::string{}) != "vamana_compact_v1" ||
-        metadata.value("navigation_quantizer", std::string{}) != "opq_pq16") {
+        (quantizer != "opq_pq" && quantizer != "opq_pq16") ||
+        (navigation_format != "opq_pq_graph_v1" &&
+         navigation_format != "opq_pq16_graph_v1")) {
       throw std::runtime_error(
-        "GPU navigation requires schema-14 compact L2 metadata with OPQ/PQ16 codes");
+        "GPU navigation requires schema-14 compact L2 metadata with OPQ/PQ codes");
     }
 
     const u32 shard_count = metadata.at("num_memory_nodes").get<u32>();

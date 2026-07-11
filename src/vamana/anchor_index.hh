@@ -38,6 +38,7 @@ struct EntryHeader {
 struct Route {
   u32 owner{};
   vec<RemotePtr> hints;
+  RemotePtr bucket_hint;
 };
 
 class Index {

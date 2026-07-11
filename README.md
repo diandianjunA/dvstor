@@ -1,7 +1,7 @@
 # DVSTOR
 
 DVSTOR 是面向动态向量检索的存算分离系统。`dev` 分支只保留一条查询路径：
-GPU 常驻 OPQ/PQ16 导航码，持久化 CUDA kernel 维护查询状态，并通过 DOCA
+GPU 常驻 OPQ/PQ32 导航码，持久化 CUDA kernel 维护查询状态，并通过 DOCA
 GPUNetIO 直接读取存储节点上的紧凑图记录与精确向量。CPU 仅负责请求准入、
 启动阶段批量传输、控制面和动态更新 RPC，不参与稳态图遍历。
 
@@ -10,10 +10,10 @@ GPUNetIO 直接读取存储节点上的紧凑图记录与精确向量。CPU 仅�
 ## 查询路径
 
 1. CPU 将请求写入有界提交队列，并按微批分配 GPU 查询槽。
-2. 持久化 GPU block 完成 OPQ 变换并构建 16 个 PQ 查找表。
+2. 持久化 GPU block 完成 OPQ 变换并构建 PQ 查找表。
 3. GPU 对常驻入口点和动态 delta 入口进行打分，初始化 beam。
 4. GPU 通过 GPUNetIO 并发拉取远端 512 字节以内的紧凑图记录。
-5. GPU 使用常驻 PQ16 code 对邻居做近似距离计算并更新 beam。
+5. GPU 使用常驻 PQ code 对邻居做近似距离计算并更新 beam。
 6. GPU 仅为最终候选拉取精确向量，计算 L2 距离并返回 top-k。
 
 查询过程中没有 CPU 驱动的逐轮 RDMA、主机向量中转或本地图副本。GPUNetIO、
@@ -26,31 +26,33 @@ GPUNetIO 直接读取存储节点上的紧凑图记录与精确向量。CPU 仅�
 
 - storage owner 负责 idmap、代际、紧凑图记录和反向边维护；
 - 提交成功的 mutation 以 epoch 批次发布到 GPU delta；
-- GPU delta 保存最新向量、PQ16 code、删除标记和动态候选桶；
-- 发布新 epoch 前失效受影响的 GPU 图缓存项；
+- CPU 将原始存储格式向量写入映射固定内存，专用常驻 control CTA 批量完成
+  OPQ/PQ 编码、hash/bucket 链接和 epoch 发布；
+- GPU delta 保存原始精确向量、PQ code、删除标记和动态候选桶；
+- 基础图缓存保持不可变，动态可见性不依赖逐写缓存失效；
 - delta 超过容量或维护失败时停止接收新查询，避免静默返回陈旧结果。
 
 ## 索引文件
 
 新索引固定为 schema 14、L2、`plain` vector record、compact graph 和
-OPQ/PQ16 导航。运行时不读取任何计算节点图清单文件。
+OPQ/PQ 导航。默认 profile 使用 32 个 8-bit 子空间。运行时不读取任何计算节点图清单文件。
 
 | 文件 | 计算节点 | 存储节点 X | 作用 |
 | --- | --- | --- | --- |
 | `<prefix>.meta.json` | 必需 | 必需 | 分片、远端 offset 和格式契约 |
-| `<prefix>.pq16` | 必需 | 不需要 | OPQ 矩阵与 PQ codebook |
+| `<prefix>.pq32` | 必需 | 不需要 | OPQ 矩阵与 PQ codebook |
 | `<prefix>.anchors` | 必需 | 必需 | 查询入口与动态更新 anchor |
 | `<prefix>_nodeX_ofN.dat` | 不需要 | 必需 | 精确向量、固定记录和紧凑图 |
 | `<prefix>_nodeX_ofN.idmap` | 不需要 | 必需 | storage-owner ID 映射 |
-| `<prefix>_nodeX_ofN.pq16.codes` | 不需要 | 必需 | 启动时注册到远端内存的 PQ16 码流 |
+| `<prefix>_nodeX_ofN.pq32.codes` | 不需要 | 必需 | 启动时注册到远端内存的 PQ32 码流 |
 
 计算节点本地只保存 metadata、PQ 模型和 anchors；不会保存 `.gpu.idx`、图分片、
 精确向量或全量导航码。
 
-PQ16 每个向量占 16 字节：SIFT100M 为 1.6 GB，SIFT1B 为 16 GB
-（约 14.9 GiB）。默认 SIFT1B GPU 预算还包括 3 GiB 图缓存、4 GiB 精确向量
-缓存、2 GiB delta 和查询工作区，显式分配上限为 36 GiB，并为 CUDA/DOCA
-保留 4 GiB。计算节点本地文件远低于 50 GB。
+PQ32 每个向量占 32 字节：SIFT100M 为 3.2 GB，SIFT1B 为 32 GB
+（约 29.8 GiB）。预算器优先保留 PQ 与 2 GiB delta，再按剩余显存自适应缩放
+图缓存和精确向量缓存；显式分配上限为 36 GiB，并为 CUDA/DOCA 保留 4 GiB。
+计算节点本地文件远低于 50 GB。
 
 ## 依赖与构建
 
@@ -69,7 +71,7 @@ cmake --build build -j
 - `dvstor_breakdown_benchmark`：吞吐、延迟、召回率和分解统计；
 - `vamana_offline_builder`：在 CPU 上构建 compact Vamana 图，并执行
   `balanced`、`bfs` 或可选的 `metis` 分片；
-- `vamana_pq_indexer`：训练 OPQ/PQ16 并生成分片码流；
+- `vamana_pq_indexer`：训练 OPQ/PQ 并生成分片码流；
 - `vamana_legacy_index_converter`：复用旧图与分片布局进行迁移。
 
 无 GPU 的存储节点可同时构建存储服务和 CPU 离线索引工具：
@@ -119,11 +121,17 @@ GPU，也不需要额外重分片可执行文件。`vamana_legacy_index_converte
 ./experiment/convert_legacy_sift100m_index.sh 04_gpu_persistent_gpunetio
 ```
 
+已有 schema-14 PQ16 索引时，只重编码为默认 PQ32，不复制或重建图：
+
+```bash
+./experiment/reencode_sift100m_pq.sh 04_gpu_persistent_gpunetio
+```
+
 迁移会顺序压缩旧 fixed record、重写紧凑图中的 RemotePtr、迁移 idmap 与
 anchors；脚本随后在独立进程中训练/复用 PQ 模型并编码所有向量。两个阶段以
 schema-14 metadata 为持久化检查点：迁移完成后 PQ 失败，重新执行脚本不会再次
 迁移 65 GB 分片。`PQ_THREADS` 默认 32，CPU BLAS 固定为非嵌套运行；若已有不完整
-的 `.pq16`/`.pq16.codes`，使用 `OVERWRITE_PQ=1` 重做 PQ 阶段。源 prefix 与输出
+的 `.pq32`/`.pq32.codes`，使用 `OVERWRITE_PQ=1` 重做 PQ 阶段。源 prefix 与输出
 prefix 必须不同；迁移器不会修改或删除旧索引。
 
 ## 运行 SIFT100M
@@ -138,7 +146,7 @@ prefix 必须不同；迁移器不会修改或删除旧索引。
 ./experiment/stop_memory_nodes.sh
 ```
 
-分布式部署时，每台存储节点只需其自身的 `.dat`、`.idmap`、`.pq16.codes`，
+分布式部署时，每台存储节点只需其自身的 `.dat`、`.idmap`、`.pq32.codes`，
 再加共享 metadata 与 anchors。详细流程见 `experiment/README.md`。
 
 ## 验证

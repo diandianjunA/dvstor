@@ -39,9 +39,39 @@ struct CompletionDescriptor {
   u32 result_count{};
   i32 status{};
   u32 remote_pages{};
+  u32 remote_batches{};
   u32 exact_vectors{};
   u32 cache_hits{};
   u32 exact_cache_hits{};
+};
+
+struct DeltaSupersedeUpdate {
+  u32 slot{};
+  u32 reserved{};
+  u64 epoch{};
+};
+
+struct DeltaOverrideUpdate {
+  u32 ordinal{};
+  u32 reserved{};
+  u64 epoch{};
+};
+
+struct DeltaPublishDescriptor {
+  u64 command_id{};
+  u32 first_slot{};
+  u32 record_count{};
+  u32 final_count{};
+  u32 invalidation_count{};
+  u32 superseded_count{};
+  u32 override_count{};
+  u32 reserved{};
+};
+
+struct DeltaPublishCompletion {
+  u64 command_id{};
+  i32 status{};
+  u32 final_count{};
 };
 
 struct TelemetrySnapshot {
@@ -52,6 +82,11 @@ struct TelemetrySnapshot {
   u64 submission_wait_ns{};
   u64 completion_wait_ns{};
   u64 gpu_active_ns{};
+  u64 gpu_prepare_ns{};
+  u64 gpu_graph_ns{};
+  u64 gpu_score_ns{};
+  u64 gpu_beam_ns{};
+  u64 gpu_exact_ns{};
   u64 rdma_read_ops{};
   u64 rdma_read_bytes{};
   u64 rdma_merged_requests{};
@@ -62,11 +97,15 @@ struct TelemetrySnapshot {
   u64 exact_vector_cache_hits{};
   u64 delta_queries{};
   u64 mutations_published{};
+  u64 delta_publications{};
   u64 delta_compactions{};
   u64 base_entries_merged{};
   u64 delta_live_entries{};
   u64 visibility_ns_total{};
   u64 visibility_ns_max{};
+  u64 publication_queue_ns_total{};
+  u64 publication_prepare_ns_total{};
+  u64 publication_command_ns_total{};
 };
 
 class Telemetry {
@@ -81,6 +120,11 @@ public:
   std::atomic<u64> submission_wait_ns{0};
   std::atomic<u64> completion_wait_ns{0};
   std::atomic<u64> gpu_active_ns{0};
+  std::atomic<u64> gpu_prepare_ns{0};
+  std::atomic<u64> gpu_graph_ns{0};
+  std::atomic<u64> gpu_score_ns{0};
+  std::atomic<u64> gpu_beam_ns{0};
+  std::atomic<u64> gpu_exact_ns{0};
   std::atomic<u64> rdma_read_ops{0};
   std::atomic<u64> rdma_read_bytes{0};
   std::atomic<u64> rdma_merged_requests{0};
@@ -91,11 +135,15 @@ public:
   std::atomic<u64> exact_vector_cache_hits{0};
   std::atomic<u64> delta_queries{0};
   std::atomic<u64> mutations_published{0};
+  std::atomic<u64> delta_publications{0};
   std::atomic<u64> delta_compactions{0};
   std::atomic<u64> base_entries_merged{0};
   std::atomic<u64> delta_live_entries{0};
   std::atomic<u64> visibility_ns_total{0};
   std::atomic<u64> visibility_ns_max{0};
+  std::atomic<u64> publication_queue_ns_total{0};
+  std::atomic<u64> publication_prepare_ns_total{0};
+  std::atomic<u64> publication_command_ns_total{0};
 };
 
 }  // namespace gpu_search

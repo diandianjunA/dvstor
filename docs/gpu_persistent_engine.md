@@ -12,17 +12,17 @@
 - L2 距离；
 - fixed record 为 `header + id + generation + exact vector`；
 - 每个紧凑图记录不超过 512 字节，指针宽度为 5 字节；
-- OPQ + 16 个 8-bit PQ 子空间，即每向量 16 字节；
-- 图和精确向量由存储节点持有，PQ16 code 常驻计算 GPU。
+- OPQ + 可配置数量的 8-bit PQ 子空间，默认 PQ32 即每向量 32 字节；
+- 图和精确向量由存储节点持有，PQ code 常驻计算 GPU。
 
 不满足契约的索引在建立任何查询资源前被拒绝。
 
 ## 启动
 
 1. 计算服务读取 metadata、PQ 模型与 anchors，合成内存中的分片布局。
-2. 每个存储节点加载自身 `.dat`，再把 `.pq16.codes` 放入 metadata 指定的
+2. 每个存储节点加载自身 `.dat`，再把 `.pq32.codes` 放入 metadata 指定的
    注册内存区间。
-3. 计算节点按远端区间直接将 PQ16 code 批量 RDMA 到最终 GPU 数组。
+3. 计算节点按远端区间直接将 PQ code 批量 RDMA 到最终 GPU 数组。
 4. 对每个分片抽样首、中、尾 code，与远端权威码流比较。
 5. GPUNetIO 为每个存储节点建立 GPU 可见 QP，并运行真实 RDMA read probe。
 6. 只有布局、码流、QP 和显存预算全部验证成功后才启动持久化 kernel。
@@ -48,17 +48,17 @@ payload 不经过计算节点主机内存。
 一个查询 block 的执行阶段如下：
 
 1. 将 query 转为 float，应用 OPQ 矩阵；
-2. 为 16 个子空间构建 256 项距离表；
+2. 为每个 PQ 子空间构建 256 项距离表；
 3. 对常驻 entry point 和最新动态入口打分；
 4. 从 beam 选择未展开候选；
 5. 以 `gpu-graph-prefetch-depth` 并行发出远端图读取；
-6. 解码 5-byte RemotePtr，并用常驻 PQ16 code 评分；
+6. 解码 5-byte RemotePtr，并用常驻 PQ code 评分；
 7. 去重、合并并裁剪到 traversal beam；
 8. 达到收敛或 `gpu-max-expansions` 后进入精排。
 
-图读取直接落入 GPU adjacency cache。cache key 包含 RemotePtr 和 generation；
-更新发布会显式失效受影响 key。四路组相联缓存使用 reader pin，避免替换仍被
-查询读取的 cache line。
+图读取直接落入 GPU adjacency cache。基础图视为不可变快照；在线 mutation
+通过独立 GPU delta overlay、override epoch 和动态 anchor 桶生效，不逐写清空
+基础图热点。四路组相联缓存使用 reader pin，避免替换仍被查询读取的 cache line。
 
 ## 精确重排
 
@@ -78,9 +78,10 @@ entry point、traversal beam、最大展开数和精排宽度共同决定。
 更新采用 storage-owner commit + GPU epoch publish：
 
 1. storage owner 完成 fixed record、紧凑图、idmap 和反向边更新；
-2. 计算服务收集 commit 结果及需要失效的 RemotePtr；
-3. GPU delta 编码最新向量并分配单调 generation；
-4. 在公开新 epoch 前失效图缓存；
+2. 计算服务按可见性窗口合并 commit 结果；
+3. CPU 把原始 dtype 向量和记录描述符写入 mapped pinned staging，不启动 side kernel，
+   也不执行同步 H2D 拷贝；
+4. 专用常驻 control CTA 批量完成 OPQ/PQ 编码，并更新 delta 哈希、bucket 和 override；
 5. 原子发布 delta count 和 snapshot epoch。
 
 查询在 admission 时绑定 snapshot epoch。upsert/delete 的 base 版本由 override
@@ -91,10 +92,10 @@ epoch 屏蔽，动态版本只在对应 epoch 可见。发布、压缩或 kernel
 
 显式预算由 `gpu-memory-limit-gb - gpu-memory-reserve-gb` 决定，启动前统一核算：
 
-- `N * 16` 字节的常驻 PQ16 code；
+- `N * M` 字节的常驻 PQ code，默认 `M=32`；
 - adjacency cache payload、tag、state、reader pin 和 victim；
 - exact cache payload 与并发控制；
-- delta vector、delta PQ code、hash table 和 bucket；
+- 原始 dtype delta vector、delta PQ code、hash table 和 bucket；
 - query、OPQ 输出、LUT、beam、visited set、anchors 和结果；
 - DOCA/CUDA 外部状态的固定安全余量。
 
@@ -102,9 +103,9 @@ epoch 屏蔽，动态版本只在对应 epoch 可见。发布、压缩或 kernel
 
 | 项目 | 上限 |
 | --- | ---: |
-| PQ16 base codes | 16,000,000,000 B |
-| adjacency cache | 3 GiB |
-| exact cache | 4 GiB |
+| PQ32 base codes | 32,000,000,000 B |
+| adjacency cache | 按剩余预算自适应 |
+| exact cache | 按剩余预算自适应 |
 | delta | 2 GiB |
 | 所有显式分配 | 36 GiB |
 | CUDA/DOCA reserve | 4 GiB |
@@ -120,8 +121,8 @@ epoch 屏蔽，动态版本只在对应 epoch 可见。发布、压缩或 kernel
 - 查询状态、LUT、beam 和缓存均预分配；
 - 多查询并发隐藏远端延迟，而不是同步执行单查询 RDMA 往返；
 - exact cache 与 graph cache 分离，避免大向量挤占导航工作集；
-- telemetry 分别记录图读、精确读、cache hit、GPU phase cycle、direct-path failure
-  和队列等待。
+- telemetry 分别记录图读、精确读、cache hit、GPU phase cycle、direct-path failure、
+  mutation publication queue/prepare/command 和可见性延迟。
 
 要判断是否达到目标吞吐，必须同时检查 QPS、recall、GPU utilization、QP 错误、
 direct-path failure、每查询图读取数和精确读取数。单独看到 GPUNetIO probe 成功
