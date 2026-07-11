@@ -11,6 +11,7 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <random>
 #include <sstream>
@@ -211,8 +212,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"dim", service.config().dim},
     {"threads", service.config().num_threads},
     {"fine_grained_breakdown_enabled", service.config().enable_breakdown},
-    {"search", "gpu_persistent_opq_pq16"},
-    {"navigation_quantizer", "opq_pq16"},
+    {"search", "gpu_persistent_opq_pq"},
+    {"navigation_quantizer", "opq_pq"},
     {"traversal_beam_width", service.config().gpu_traversal_beam_width},
     {"final_rerank_width", service.config().gpu_final_rerank_width},
     {"max_expansions", service.config().gpu_max_expansions},
@@ -371,20 +372,47 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       throw std::runtime_error("invalid recall k");
     }
     const size_t recall_queries = args.recall_queries == 0 ? query_count : std::min<size_t>(args.recall_queries, query_count);
-    double total_recall = 0.0;
     std::atomic<size_t> recall_completed{0};
+    std::atomic<size_t> next_recall_query{0};
+    std::atomic<bool> recall_failed{false};
+    std::vector<double> per_query_recall(recall_queries, 0.0);
+    std::exception_ptr recall_error;
+    std::mutex recall_error_mutex;
     ProgressReporter recall_reporter(key, recall_completed, recall_queries, 0);
-    for (size_t qi = 0; qi < recall_queries; ++qi) {
-      const auto results = service.search_raw(query_rows.dtype, query_rows.raw_row(qi), dim, recall_k);
-      std::vector<uint32_t> result_ids;
-      result_ids.reserve(results.size());
-      for (const auto id : results) {
-        result_ids.push_back(static_cast<uint32_t>(id));
-      }
-      total_recall += recall_at(result_ids, gt.row(qi), recall_k);
-      recall_completed.fetch_add(1, std::memory_order_relaxed);
+    const size_t recall_workers = std::max<size_t>(
+      1, std::min<size_t>(args.client_threads, recall_queries));
+    std::vector<std::thread> workers;
+    workers.reserve(recall_workers);
+    for (size_t worker = 0; worker < recall_workers; ++worker) {
+      workers.emplace_back([&]() {
+        try {
+          while (!recall_failed.load(std::memory_order_acquire)) {
+            const size_t qi = next_recall_query.fetch_add(1, std::memory_order_relaxed);
+            if (qi >= recall_queries) break;
+            const auto results = service.search_raw(
+              query_rows.dtype, query_rows.raw_row(qi), dim, recall_k);
+            std::vector<uint32_t> result_ids;
+            result_ids.reserve(results.size());
+            for (const auto id : results) {
+              result_ids.push_back(static_cast<uint32_t>(id));
+            }
+            per_query_recall[qi] = recall_at(result_ids, gt.row(qi), recall_k);
+            recall_completed.fetch_add(1, std::memory_order_relaxed);
+          }
+        } catch (...) {
+          {
+            std::lock_guard<std::mutex> lock(recall_error_mutex);
+            if (recall_error == nullptr) recall_error = std::current_exception();
+          }
+          recall_failed.store(true, std::memory_order_release);
+        }
+      });
     }
+    for (auto& worker : workers) worker.join();
+    if (recall_error != nullptr) std::rethrow_exception(recall_error);
     recall_reporter.finish();
+    const double total_recall = std::accumulate(
+      per_query_recall.begin(), per_query_recall.end(), 0.0);
     const double recall = recall_queries > 0 ? total_recall / static_cast<double>(recall_queries) : 0.0;
     root[key] = {
       {"phase", phase},
@@ -410,30 +438,47 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
 
   auto run_query_phase_ops = [&](const std::string& label, size_t ops) -> size_t {
     std::atomic<size_t> completed_ops{0};
+    std::atomic<size_t> next_op{0};
     ProgressReporter reporter(label, completed_ops, ops, 0);
-    for (size_t op = 0; op < ops; ++op) {
-      const size_t idx = op % query_count;
-      (void)service.search_raw(query_rows.dtype, query_rows.raw_row(idx), dim, service.config().k);
-      completed_ops.fetch_add(1, std::memory_order_relaxed);
+    const size_t worker_count = std::max<size_t>(1, std::min(args.client_threads, ops));
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    for (size_t worker = 0; worker < worker_count; ++worker) {
+      workers.emplace_back([&]() {
+        for (;;) {
+          const size_t op = next_op.fetch_add(1, std::memory_order_relaxed);
+          if (op >= ops) break;
+          const size_t idx = op % query_count;
+          (void)service.search_raw(
+            query_rows.dtype, query_rows.raw_row(idx), dim, service.config().k);
+          completed_ops.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
     }
+    for (auto& worker : workers) worker.join();
     reporter.finish();
     return completed_ops.load(std::memory_order_relaxed);
   };
 
   auto run_query_phase_seconds = [&](const std::string& label, size_t seconds) -> size_t {
     std::atomic<size_t> completed_ops{0};
+    std::atomic<size_t> next_query{0};
     ProgressReporter reporter(label, completed_ops, 0, seconds);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
-    size_t op = 0;
-    std::chrono::nanoseconds avg_query_duration{0};
-    while (can_start_timed_operation(deadline, avg_query_duration, op)) {
-      const size_t idx = op % query_count;
-      const auto started_at = std::chrono::steady_clock::now();
-      (void)service.search_raw(query_rows.dtype, query_rows.raw_row(idx), dim, service.config().k);
-      update_avg_duration(avg_query_duration, started_at, op);
-      completed_ops.fetch_add(1, std::memory_order_relaxed);
-      ++op;
+    std::vector<std::thread> workers;
+    workers.reserve(args.client_threads);
+    for (size_t worker = 0; worker < args.client_threads; ++worker) {
+      workers.emplace_back([&]() {
+        while (std::chrono::steady_clock::now() < deadline) {
+          const size_t query_index = next_query.fetch_add(1, std::memory_order_relaxed);
+          const size_t idx = query_index % query_count;
+          (void)service.search_raw(
+            query_rows.dtype, query_rows.raw_row(idx), dim, service.config().k);
+          completed_ops.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
     }
+    for (auto& worker : workers) worker.join();
     reporter.finish();
     return completed_ops.load(std::memory_order_relaxed);
   };
@@ -776,6 +821,24 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
             static_cast<double>(telemetry.queries_submitted) / 1000.0},
       {"completion_wait_ns", telemetry.completion_wait_ns},
       {"gpu_query_residence_ns", telemetry.gpu_active_ns},
+      {"average_gpu_query_us", telemetry.queries_completed == 0 ? 0.0
+        : static_cast<double>(telemetry.gpu_active_ns) /
+            static_cast<double>(telemetry.queries_completed) / 1000.0},
+      {"average_gpu_prepare_us", telemetry.queries_completed == 0 ? 0.0
+        : static_cast<double>(telemetry.gpu_prepare_ns) /
+            static_cast<double>(telemetry.queries_completed) / 1000.0},
+      {"average_gpu_graph_us", telemetry.queries_completed == 0 ? 0.0
+        : static_cast<double>(telemetry.gpu_graph_ns) /
+            static_cast<double>(telemetry.queries_completed) / 1000.0},
+      {"average_gpu_score_us", telemetry.queries_completed == 0 ? 0.0
+        : static_cast<double>(telemetry.gpu_score_ns) /
+            static_cast<double>(telemetry.queries_completed) / 1000.0},
+      {"average_gpu_beam_us", telemetry.queries_completed == 0 ? 0.0
+        : static_cast<double>(telemetry.gpu_beam_ns) /
+            static_cast<double>(telemetry.queries_completed) / 1000.0},
+      {"average_gpu_exact_us", telemetry.queries_completed == 0 ? 0.0
+        : static_cast<double>(telemetry.gpu_exact_ns) /
+            static_cast<double>(telemetry.queries_completed) / 1000.0},
       {"rdma_read_ops", telemetry.rdma_read_ops},
       {"rdma_read_bytes", telemetry.rdma_read_bytes},
       {"rdma_merged_requests", telemetry.rdma_merged_requests},
@@ -797,6 +860,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                                  telemetry.exact_vector_cache_hits)},
       {"delta_queries", telemetry.delta_queries},
       {"mutations_published", telemetry.mutations_published},
+      {"delta_publications", telemetry.delta_publications},
+      {"average_mutations_per_publication", telemetry.delta_publications == 0 ? 0.0
+        : static_cast<double>(telemetry.mutations_published) /
+            static_cast<double>(telemetry.delta_publications)},
       {"delta_compactions", telemetry.delta_compactions},
       {"base_entries_merged", telemetry.base_entries_merged},
       {"delta_live_entries", telemetry.delta_live_entries},
@@ -804,6 +871,15 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
         : static_cast<double>(telemetry.visibility_ns_total) /
             static_cast<double>(telemetry.mutations_published) / 1000.0},
       {"max_visibility_us", static_cast<double>(telemetry.visibility_ns_max) / 1000.0},
+      {"average_publication_queue_us", telemetry.mutations_published == 0 ? 0.0
+        : static_cast<double>(telemetry.publication_queue_ns_total) /
+            static_cast<double>(telemetry.mutations_published) / 1000.0},
+      {"average_publication_prepare_us", telemetry.delta_publications == 0 ? 0.0
+        : static_cast<double>(telemetry.publication_prepare_ns_total) /
+            static_cast<double>(telemetry.delta_publications) / 1000.0},
+      {"average_publication_command_us", telemetry.delta_publications == 0 ? 0.0
+        : static_cast<double>(telemetry.publication_command_ns_total) /
+            static_cast<double>(telemetry.delta_publications) / 1000.0},
     };
   }
 
@@ -895,8 +971,21 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     text_summary << "  rdma_read_bytes: " << gpu.value("rdma_read_bytes", 0ULL) << '\n';
     text_summary << "  graph_page_cache_hit_ratio: "
                  << gpu.value("graph_page_cache_hit_ratio", 0.0) << '\n';
+    text_summary << "  GPU query/prepare/graph/score/beam/exact us: "
+                 << gpu.value("average_gpu_query_us", 0.0) << "/"
+                 << gpu.value("average_gpu_prepare_us", 0.0) << "/"
+                 << gpu.value("average_gpu_graph_us", 0.0) << "/"
+                 << gpu.value("average_gpu_score_us", 0.0) << "/"
+                 << gpu.value("average_gpu_beam_us", 0.0) << "/"
+                 << gpu.value("average_gpu_exact_us", 0.0) << '\n';
     text_summary << "  average_visibility_us: "
                  << gpu.value("average_visibility_us", 0.0) << '\n';
+    text_summary << "  publication queue/prepare/command us: "
+                 << gpu.value("average_publication_queue_us", 0.0) << "/"
+                 << gpu.value("average_publication_prepare_us", 0.0) << "/"
+                 << gpu.value("average_publication_command_us", 0.0) << '\n';
+    text_summary << "  average_mutations_per_publication: "
+                 << gpu.value("average_mutations_per_publication", 0.0) << '\n';
     text_summary << "  delta_live_entries: " << gpu.value("delta_live_entries", 0ULL) << '\n';
   }
   if (report.has_insert()) {

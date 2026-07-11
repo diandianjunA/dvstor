@@ -1,6 +1,6 @@
 # SIFT100M Experiment
 
-实验目录只保留 `04_gpu_persistent_gpunetio`：持久化 GPU OPQ/PQ16 图导航、
+实验目录只保留 `04_gpu_persistent_gpunetio`：持久化 GPU OPQ/PQ32 图导航、
 GPUNetIO 远端读取和 storage-owner 动态更新。旧 profile、旧 sidecar 转换器和
 历史输出不属于 `dev` 的运行接口。
 
@@ -17,7 +17,7 @@ export GPU_MEMORY_LIMIT_GB=40
 export GPU_MEMORY_RESERVE_GB=4
 ```
 
-profile 的 `LEGACY_INDEX_PREFIX` 指向旧索引，`INDEX_PREFIX` 指向新的 `_pq16`
+profile 的 `LEGACY_INDEX_PREFIX` 指向旧索引，`INDEX_PREFIX` 指向新的 `_pq32`
 输出。二者不能相同。
 
 ## 构建新索引
@@ -25,7 +25,7 @@ profile 的 `LEGACY_INDEX_PREFIX` 指向旧索引，`INDEX_PREFIX` 指向新的 
 存储节点脚本默认使用独立的 `build-storage`，先按根目录 README 配置 CPU-only
 构建，不能与计算节点的 `build` 共用。
 
-该命令先构建 compact Vamana/Metis 分片，再训练 OPQ/PQ16 并写码流：
+该命令先构建 compact Vamana/Metis 分片，再训练 OPQ/PQ32 并写码流：
 
 ```bash
 ./experiment/build_sift100m_index.sh 04_gpu_persistent_gpunetio
@@ -47,13 +47,20 @@ profile 的 `LEGACY_INDEX_PREFIX` 指向旧索引，`INDEX_PREFIX` 指向新的 
 可使用已训练模型减少迁移时间：
 
 ```bash
-PQ_REUSE_MODEL=/path/to/compatible.pq16 \
+PQ_REUSE_MODEL=/path/to/compatible.pq32 \
 ./experiment/convert_legacy_sift100m_index.sh 04_gpu_persistent_gpunetio
 ```
 
-模型必须与维度、子空间数和 dtype 对应。转换仍需顺序扫描全部向量生成 16-byte
+模型必须与维度、子空间数和 dtype 对应。转换仍需顺序扫描全部向量生成 32-byte
 code，但不执行昂贵的 Vamana construction 或 METIS partition。PQ 默认使用
 `PQ_THREADS=32`，也可显式覆盖；BLAS 线程保持为 1，避免和 Faiss OpenMP 嵌套。
+
+已有 schema-14 PQ16 索引时可直接复用 `.dat`、`.idmap` 和 anchors，仅生成
+默认 PQ32 模型与码流：
+
+```bash
+./experiment/reencode_sift100m_pq.sh 04_gpu_persistent_gpunetio
+```
 
 ## 部署文件
 
@@ -61,7 +68,7 @@ code，但不执行昂贵的 Vamana construction 或 METIS partition。PQ 默认
 
 ```text
 <prefix>.meta.json
-<prefix>.pq16
+<prefix>.pq32
 <prefix>.anchors
 ```
 
@@ -72,11 +79,11 @@ code，但不执行昂贵的 Vamana construction 或 METIS partition。PQ 默认
 <prefix>.anchors
 <prefix>_nodeX_ofN.dat
 <prefix>_nodeX_ofN.idmap
-<prefix>_nodeX_ofN.pq16.codes
+<prefix>_nodeX_ofN.pq32.codes
 ```
 
-计算节点不需要 `.dat`、`.idmap`、`.pq16.codes` 或 `.gpu.idx`。存储节点运行时
-不需要 `.pq16` 模型。
+计算节点不需要 `.dat`、`.idmap`、`.pq32.codes` 或 `.gpu.idx`。存储节点运行时
+不需要 `.pq32` 模型。
 
 ## 启动
 
@@ -92,7 +99,7 @@ code，但不执行昂贵的 Vamana construction 或 METIS partition。PQ 默认
 ./experiment/start_memory_node.sh 1 04_gpu_persistent_gpunetio
 ```
 
-启动脚本会验证 schema、分片数、R、dtype、PQ16 checksum 和角色所需文件，
+启动脚本会验证 schema、分片数、R、dtype、PQ checksum 和角色所需文件，
 不兼容时在申请大块注册内存前退出。
 
 ## 召回率与性能

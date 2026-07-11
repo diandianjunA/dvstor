@@ -194,15 +194,21 @@ Route Index::route(const span<const element_t> query,
   }
   const u32 semantic_shard = nearest_shard(query);
   route.owner = owner_override.has_value() ? *owner_override : semantic_shard;
+  vec<RemotePtr> semantic = nearest_anchors(
+    query, semantic_shard, std::max<u32>(1, hint_count));
+  if (!semantic.empty()) route.bucket_hint = semantic.front();
   if (route.owner == semantic_shard) {
-    route.hints = nearest_anchors(query, semantic_shard, hint_count);
+    route.hints.assign(semantic.begin(), semantic.begin() +
+      std::min<size_t>(semantic.size(), hint_count));
     return route;
   }
 
   const u32 local_count = (hint_count + 1) / 2;
   route.hints = nearest_anchors(query, route.owner, local_count);
-  vec<RemotePtr> semantic = nearest_anchors(query, semantic_shard, hint_count - local_count);
-  for (const RemotePtr hint : semantic) {
+  const size_t semantic_count = std::min<size_t>(
+    semantic.size(), hint_count - local_count);
+  for (size_t index = 0; index < semantic_count; ++index) {
+    const RemotePtr hint = semantic[index];
     if (std::find(route.hints.begin(), route.hints.end(), hint) == route.hints.end()) {
       route.hints.push_back(hint);
     }

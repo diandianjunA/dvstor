@@ -10,6 +10,11 @@ if (TARGET dvstor_gpu_kernels)
     set_tests_properties(gpu_persistent_dispatch_test PROPERTIES
         TIMEOUT 15
         SKIP_REGULAR_EXPRESSION "^SKIP:")
+    add_test(NAME gpu_persistent_dispatch_pq32_test
+        COMMAND gpu_persistent_dispatch_test 1024 10 8 32)
+    set_tests_properties(gpu_persistent_dispatch_pq32_test PROPERTIES
+        TIMEOUT 15
+        SKIP_REGULAR_EXPRESSION "^SKIP:")
 endif ()
 
 add_executable(gpu_navigation_layout_test gpu_navigation_layout_test.cc)

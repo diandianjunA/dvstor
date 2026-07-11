@@ -45,7 +45,9 @@ ComputeService::ComputeService(const Configuration& config)
   const cudaError_t cuda_status = cudaSetDevice(static_cast<int>(config_.gpu_device));
   lib_assert(cuda_status == cudaSuccess,
              str{"failed to select GPU: "} + cudaGetErrorString(cuda_status));
-  print_status("search: GPU-persistent OPQ/PQ16 beam + final RDMA exact rerank");
+  print_status("search: GPU-persistent OPQ/PQ" +
+               std::to_string(metadata.pq_subquantizers) +
+               " beam + final RDMA exact rerank");
   persistent_search_ = std::make_unique<gpu_search::PersistentSearchEngine>(
     config_, context_, cm_, remote_access_tokens_);
   print_status("query engine: persistent GPU + GPUNetIO batch=" +

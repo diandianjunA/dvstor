@@ -196,6 +196,33 @@ void encode_shard(const filepath_t& prefix, const Layout& layout,
                 transformed.begin());
     }
     product.compute_codes(transformed.data(), codes.data(), batch);
+    if (base == 0) {
+      const u32 audit_vectors = std::min<u32>(batch, 64);
+      vec<f32> audit_transformed(layout.dim);
+      vec<byte_t> audit_code(model.code_bytes());
+      u64 mismatched_components = 0;
+      for (u32 index = 0; index < audit_vectors; ++index) {
+        gpu_search::pq::encode(
+          model,
+          span<const f32>{decoded.data() + static_cast<size_t>(index) * layout.dim,
+                          layout.dim},
+          audit_code, audit_transformed);
+        const byte_t* faiss_code =
+          codes.data() + static_cast<size_t>(index) * model.code_bytes();
+        for (u32 component = 0; component < model.code_bytes(); ++component) {
+          mismatched_components += audit_code[component] != faiss_code[component];
+        }
+      }
+      const u64 audited_components =
+        static_cast<u64>(audit_vectors) * model.code_bytes();
+      if (mismatched_components * 100 > audited_components) {
+        throw std::runtime_error(
+          "Faiss and runtime OPQ/PQ encoders disagree on more than 1% of audited components");
+      }
+      std::cerr << "PQ encoder audit shard " << (shard + 1) << "/"
+                << layout.shards << ": vectors=" << audit_vectors
+                << " component_mismatches=" << mismatched_components << '\n';
+    }
     const size_t payload_bytes = static_cast<size_t>(batch) * model.code_bytes();
     output.write(reinterpret_cast<const char*>(codes.data()), payload_bytes);
     if (!output.good()) throw std::runtime_error("failed to write PQ sidecar payload");
@@ -243,12 +270,13 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
             << " hardware_threads=" << hardware_threads << '\n';
 
   PqIndexResult result;
-  result.model_file = index_path::navigation_model_file(options.index_prefix);
+  result.model_file = index_path::navigation_model_file(
+    options.index_prefix, options.subquantizers);
   result.node_count = layout.node_count;
   result.code_files.resize(layout.shards);
   for (u32 shard = 0; shard < layout.shards; ++shard) {
     result.code_files[shard] = index_path::navigation_code_file(
-      options.index_prefix, shard + 1, layout.shards);
+      options.index_prefix, shard + 1, layout.shards, options.subquantizers);
   }
   if (!options.overwrite) {
     if (std::filesystem::exists(result.model_file) ||
@@ -288,13 +316,13 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
     result.code_bytes += region_bytes[shard];
   }
 
-  metadata["navigation_quantizer"] = "opq_pq16";
+  metadata["navigation_quantizer"] = "opq_pq";
   metadata["navigation_code_bytes"] = model.code_bytes();
   metadata["pq_subquantizers"] = model.subquantizers;
   metadata["pq_bits"] = model.bits_per_code;
   metadata["navigation_model_checksum"] = model.checksum();
   metadata["navigation_model_file"] = result.model_file.string();
-  metadata["navigation_format"] = "opq_pq16_graph_v1";
+  metadata["navigation_format"] = "opq_pq_graph_v1";
   metadata["navigation_entry_points"] = options.entry_points;
   metadata["navigation_code_remote_offsets"] = remote_offsets;
   metadata["navigation_code_region_bytes"] = region_bytes;

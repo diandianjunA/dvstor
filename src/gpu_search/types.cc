@@ -11,6 +11,11 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .submission_wait_ns = submission_wait_ns.load(std::memory_order_relaxed),
     .completion_wait_ns = completion_wait_ns.load(std::memory_order_relaxed),
     .gpu_active_ns = gpu_active_ns.load(std::memory_order_relaxed),
+    .gpu_prepare_ns = gpu_prepare_ns.load(std::memory_order_relaxed),
+    .gpu_graph_ns = gpu_graph_ns.load(std::memory_order_relaxed),
+    .gpu_score_ns = gpu_score_ns.load(std::memory_order_relaxed),
+    .gpu_beam_ns = gpu_beam_ns.load(std::memory_order_relaxed),
+    .gpu_exact_ns = gpu_exact_ns.load(std::memory_order_relaxed),
     .rdma_read_ops = rdma_read_ops.load(std::memory_order_relaxed),
     .rdma_read_bytes = rdma_read_bytes.load(std::memory_order_relaxed),
     .rdma_merged_requests = rdma_merged_requests.load(std::memory_order_relaxed),
@@ -21,11 +26,15 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .exact_vector_cache_hits = exact_vector_cache_hits.load(std::memory_order_relaxed),
     .delta_queries = delta_queries.load(std::memory_order_relaxed),
     .mutations_published = mutations_published.load(std::memory_order_relaxed),
+    .delta_publications = delta_publications.load(std::memory_order_relaxed),
     .delta_compactions = delta_compactions.load(std::memory_order_relaxed),
     .base_entries_merged = base_entries_merged.load(std::memory_order_relaxed),
     .delta_live_entries = delta_live_entries.load(std::memory_order_relaxed),
     .visibility_ns_total = visibility_ns_total.load(std::memory_order_relaxed),
     .visibility_ns_max = visibility_ns_max.load(std::memory_order_relaxed),
+    .publication_queue_ns_total = publication_queue_ns_total.load(std::memory_order_relaxed),
+    .publication_prepare_ns_total = publication_prepare_ns_total.load(std::memory_order_relaxed),
+    .publication_command_ns_total = publication_command_ns_total.load(std::memory_order_relaxed),
   };
 }
 
@@ -37,6 +46,11 @@ void Telemetry::reset() {
   submission_wait_ns.store(0, std::memory_order_relaxed);
   completion_wait_ns.store(0, std::memory_order_relaxed);
   gpu_active_ns.store(0, std::memory_order_relaxed);
+  gpu_prepare_ns.store(0, std::memory_order_relaxed);
+  gpu_graph_ns.store(0, std::memory_order_relaxed);
+  gpu_score_ns.store(0, std::memory_order_relaxed);
+  gpu_beam_ns.store(0, std::memory_order_relaxed);
+  gpu_exact_ns.store(0, std::memory_order_relaxed);
   rdma_read_ops.store(0, std::memory_order_relaxed);
   rdma_read_bytes.store(0, std::memory_order_relaxed);
   rdma_merged_requests.store(0, std::memory_order_relaxed);
@@ -47,11 +61,15 @@ void Telemetry::reset() {
   exact_vector_cache_hits.store(0, std::memory_order_relaxed);
   delta_queries.store(0, std::memory_order_relaxed);
   mutations_published.store(0, std::memory_order_relaxed);
+  delta_publications.store(0, std::memory_order_relaxed);
   delta_compactions.store(0, std::memory_order_relaxed);
   base_entries_merged.store(0, std::memory_order_relaxed);
   delta_live_entries.store(0, std::memory_order_relaxed);
   visibility_ns_total.store(0, std::memory_order_relaxed);
   visibility_ns_max.store(0, std::memory_order_relaxed);
+  publication_queue_ns_total.store(0, std::memory_order_relaxed);
+  publication_prepare_ns_total.store(0, std::memory_order_relaxed);
+  publication_command_ns_total.store(0, std::memory_order_relaxed);
 }
 
 }  // namespace gpu_search

@@ -53,13 +53,16 @@ MemoryNode::MemoryNode(Configuration& config)
     lib_assert(metadata.dim == config.dim, "index metadata dim mismatch on storage node");
     lib_assert(metadata.R == config.R, "index metadata R mismatch on storage node");
     lib_assert(metadata.num_memory_nodes == num_storage_nodes_, "index metadata storage-node count mismatch");
+    const bool compatible_quantizer = metadata.navigation_quantizer == "opq_pq" ||
+      metadata.navigation_quantizer == "opq_pq16";
+    const bool compatible_navigation = metadata.navigation_format == "opq_pq_graph_v1" ||
+      metadata.navigation_format == "opq_pq16_graph_v1";
     gpu_stream_layout_ = metadata.schema_version == 14 &&
       metadata.node_layout == "plain" &&
       metadata.storage_format == "vamana_compact_v1" &&
-      metadata.navigation_quantizer == "opq_pq16" &&
-      metadata.navigation_format == "opq_pq16_graph_v1";
+      compatible_quantizer && compatible_navigation;
     lib_assert(gpu_stream_layout_,
-               "storage node requires a schema-14 compact OPQ/PQ16 index");
+               "storage node requires a schema-14 compact OPQ/PQ index");
     lib_assert(storage_id_ < num_storage_nodes_, "invalid GPU storage shard id");
     lib_assert(metadata.hot_graph_entry_counts.size() == num_storage_nodes_,
                "GPU storage metadata has invalid static shard counts");
@@ -321,7 +324,8 @@ std::pair<bool, str> MemoryNode::load_index_file(const str& path) {
     return {false, "buffer too small for GPU PQ stream"};
   }
 
-  const filepath_t code_path = index_path::navigation_code_for_shard(path);
+  const filepath_t code_path = index_path::navigation_code_for_shard(
+    path, gpu_navigation_code_bytes_);
   gpu_search::format::CodeHeader header;
   str error;
   if (!gpu_search::format::read_code_header(code_path, header, &error) ||
