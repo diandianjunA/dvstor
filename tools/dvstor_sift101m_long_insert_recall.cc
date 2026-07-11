@@ -24,7 +24,6 @@
 #include <vector>
 
 #include "common/configuration.hh"
-#include "common/distance.hh"
 #include "common/vector_dtype.hh"
 #include "nlohmann/json.hh"
 #include "service/compute_service.hh"
@@ -440,8 +439,7 @@ Args parse_args(int argc, char** argv) {
   return args;
 }
 
-template <class Distance>
-RecallResult run_recall(ComputeService<Distance>& service,
+RecallResult run_recall(ComputeService& service,
                         const std::string& label,
                         const VectorRows& queries,
                         const GroundTruth& gt,
@@ -487,8 +485,7 @@ RecallResult run_recall(ComputeService<Distance>& service,
   return result;
 }
 
-template <class Distance>
-InsertStats run_insert_phase(ComputeService<Distance>& service,
+InsertStats run_insert_phase(ComputeService& service,
                              const VectorRows& insert_rows,
                              const Args& args,
                              size_t effective_insert_count) {
@@ -523,7 +520,7 @@ InsertStats run_insert_phase(ComputeService<Distance>& service,
       (void)tid;
       try {
         start_barrier.arrive_and_wait();
-        vec<typename ComputeService<Distance>::InsertItem> batch;
+        vec<ComputeService::InsertItem> batch;
         batch.reserve(args.insert_batch_size);
         while (!stop.load(std::memory_order_acquire)) {
           const size_t begin = next_row.fetch_add(args.insert_batch_size, std::memory_order_relaxed);
@@ -621,8 +618,7 @@ nlohmann::json insert_stats_json(const InsertStats& stats) {
   };
 }
 
-template <class Distance>
-int run_with_service(ComputeService<Distance>& service, const Args& args) {
+int run_with_service(ComputeService& service, const Args& args) {
   std::cerr << "[sift101m-long-insert] loading insert vectors: " << args.insert_file << std::endl;
   const VectorRows insert_rows = read_vector_rows(args.insert_file);
   std::cerr << "[sift101m-long-insert] insert rows=" << insert_rows.count
@@ -666,18 +662,14 @@ int run_with_service(ComputeService<Distance>& service, const Args& args) {
     {"reset_breakdown_every", args.reset_breakdown_every},
     {"dim", service.config().dim},
     {"max_vectors_config", service.config().max_vectors},
-    {"insert_execution", service.config().insert_execution},
     {"storage_owner_update_mode", service.config().storage_owner_update_mode},
     {"storage_owner_maintenance_mode", service.config().storage_owner_maintenance_mode},
     {"storage_owner_maintenance_workers", service.config().storage_owner_maintenance_workers},
     {"storage_owner_reverse_mode", service.config().storage_owner_reverse_mode},
     {"storage_owner_local_stitch_sync_fast_path", service.config().storage_owner_local_stitch_sync_fast_path},
     {"fine_grained_breakdown_enabled", service.config().enable_breakdown},
-    {"search", std::string(service.config().credit_aware_expansion ? "credit_aware_" : "") +
-        (service.config().use_rabitq ? "rabitq_cpu_gate" : "exact")},
-    {"use_rabitq", service.config().use_rabitq},
-    {"credit_aware_expansion", service.config().credit_aware_expansion},
-    {"gpudirect_rdma", service.config().gpudirect_rdma},
+    {"search", "gpu_persistent_opq_pq16"},
+    {"navigation_quantizer", "opq_pq16"},
   };
   root["input"] = {
     {"insert_rows", insert_rows.count},
@@ -792,12 +784,7 @@ int main(int argc, char** argv) {
     auto service_argv = tools::breakdown_benchmark::make_argv(service_args);
     configuration::IndexConfiguration config(static_cast<int>(service_argv.size()), service_argv.data());
 
-    if (config.ip_distance) {
-      ComputeService<IPDistance> service(config, false);
-      return run_with_service(service, args);
-    }
-
-    ComputeService<L2Distance> service(config, false);
+    ComputeService service(config);
     return run_with_service(service, args);
   } catch (const std::exception& e) {
     std::cerr << "sift101m long insert recall failed: " << e.what() << std::endl;

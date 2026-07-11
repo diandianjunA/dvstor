@@ -19,7 +19,6 @@
 #include <unordered_set>
 #include <vector>
 
-#include "common/distance.hh"
 #include "common/vector_dtype.hh"
 #include "service/breakdown.hh"
 #include "tools/breakdown_benchmark/progress.hh"
@@ -176,8 +175,7 @@ double recall_at(const std::vector<uint32_t>& results, const uint32_t* gt, uint3
 }
 
 
-template <class Distance>
-nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args) {
+nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   using SampleReport = service::breakdown::Report;
   using service::breakdown::aggregate_text_summary;
   using service::breakdown::report_to_json;
@@ -212,62 +210,13 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     {"insert_start_id", args.insert_start_id},
     {"dim", service.config().dim},
     {"threads", service.config().num_threads},
-    {"coroutines", service.config().num_coroutines},
     {"fine_grained_breakdown_enabled", service.config().enable_breakdown},
-    {"device_utilization_observation_enabled",
-     service.config().enable_breakdown && service.config().observe_device_utilization},
-    {"search", std::string(service.config().credit_aware_expansion ? "credit_aware_" : "") +
-        (service.config().use_rabitq
-          ? "rabitq_rfq5_cpu_gate" : "exact")},
-    {"credit_aware_expansion", service.config().credit_aware_expansion},
-    {"credit_aware_min_k", service.config().credit_aware_expansion
-        ? service.config().credit_aware_min_k : 0},
-    {"credit_aware_max_k", service.config().credit_aware_expansion
-        ? (service.config().credit_aware_max_k == 0
-            ? service.config().expansion_batch : service.config().credit_aware_max_k)
-        : 0},
-    {"credit_aware_target_candidates", service.config().credit_aware_expansion
-        ? service.config().credit_aware_target_candidates : 0},
-    {"credit_aware_max_lookahead", service.config().credit_aware_expansion
-        ? service.config().credit_aware_max_lookahead : 0},
-    {"credit_aware_cost_guard", service.config().credit_aware_expansion
-        ? service.config().credit_aware_cost_guard : false},
-    {"credit_aware_cost_max_extra_ratio", service.config().credit_aware_expansion
-        ? service.config().credit_aware_cost_max_extra_ratio : 0.0},
-    {"credit_aware_cost_probe_rounds", service.config().credit_aware_expansion
-        ? service.config().credit_aware_cost_probe_rounds : 0},
-    {"rabitq_cache_bytes", service.rabitq_cache_bytes()},
-    {"rabitq_cache_entries", service.rabitq_cache_entries()},
-    {"rabitq_cache_numa_interleaved", service.rabitq_cache_numa_interleaved()},
-    {"rabitq_cache_ratio",
-      service.rabitq_cache_entries() == 0 ? 0.0 :
-        static_cast<double>(service.rabitq_cache_bytes()) /
-          (service.rabitq_cache_entries() * VamanaNode::vector_bytes())},
-    {"rabitq_cache_entry_bytes", service.rabitq_cache_entry_bytes()},
-    {"rabitq_cache_code_bits", service.rabitq_cache_code_bits()},
-    {"rabitq_cache_override_bitmap_bytes",
-     service.rabitq_cache_override_bitmap_bytes()},
-    {"rabitq_cache_dynamic_live", service.rabitq_cache_dynamic_live()},
-    {"rabitq_cache_dynamic_overflow", service.rabitq_cache_dynamic_overflow()},
-    {"rabitq_gate_width", service.config().use_rabitq
-        ? service.config().rabitq_gate_width : 0},
-    {"rabitq_gate_max_width", service.config().use_rabitq
-        ? service.config().rabitq_gate_max_width : 0},
-    {"rabitq_gate_margin", service.config().use_rabitq
-        ? service.config().rabitq_gate_margin : 0.0},
-    {"rabitq_mode", service.config().use_rabitq ? "cpu_gate" : ""},
-    {"rabitq_coalesce_target", service.config().use_rabitq
-        ? service.config().rabitq_coalesce_target : 0},
-    {"rabitq_coalesce_min", service.config().use_rabitq
-        ? service.config().rabitq_coalesce_min : 0},
-    {"rabitq_coalesce_wait_us", service.config().use_rabitq
-        ? service.config().rabitq_coalesce_wait_us : 0},
-    {"rabitq_warmup_exact_expansions", service.config().use_rabitq
-        ? service.config().rabitq_warmup_exact_expansions : 0},
-    {"rabitq_audit_period", service.config().use_rabitq
-        ? service.config().rabitq_audit_period : 0},
-    {"rabitq_strict_recall", service.config().use_rabitq
-        ? service.config().rabitq_strict_recall : false},
+    {"search", "gpu_persistent_opq_pq16"},
+    {"navigation_quantizer", "opq_pq16"},
+    {"traversal_beam_width", service.config().gpu_traversal_beam_width},
+    {"final_rerank_width", service.config().gpu_final_rerank_width},
+    {"max_expansions", service.config().gpu_max_expansions},
+    {"entry_seed_count", service.config().gpu_entry_seed_count},
   };
   const size_t dim = service.config().dim;
   const double write_ratio_sum = args.write_insert_ratio + args.write_upsert_ratio + args.write_delete_ratio;
@@ -304,7 +253,6 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   const size_t bootstrap_count = bootstrap_work;
   std::cerr << "[breakdown] preparing workload: bootstrap_count=" << bootstrap_count
             << ", workload=" << args.workload << std::endl;
-  const bool needs_query_data = (args.workload == "query" || args.workload == "both" || args.workload == "mixed");
 
   // Load insert vectors from file if specified, otherwise use synthetic data.
   VectorRows insert_rows;
@@ -338,24 +286,13 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
   const auto bootstrap_vectors = make_dataset(bootstrap_ids, dim);
   std::cerr << "[breakdown] bootstrap vectors ready (synthetic)" << std::endl;
 
-  if (needs_query_data && !service.config().load_index) {
-    vec<typename ComputeService<Distance>::InsertItem> bootstrap_batch;
-    bootstrap_batch.reserve(bootstrap_count);
-    for (size_t i = 0; i < bootstrap_count; ++i) {
-      const auto begin = bootstrap_vectors.begin() + static_cast<std::ptrdiff_t>(i * dim);
-      bootstrap_batch.push_back({bootstrap_ids[i], vec<element_t>(begin, begin + static_cast<std::ptrdiff_t>(dim))});
-    }
-    service.insert(bootstrap_batch);
-    root["meta"]["bootstrap_vectors"] = bootstrap_count;
-  }
-
   auto run_insert_phase_ops = [&](const std::string& label, size_t ops, uint32_t start_id) {
     std::atomic<size_t> completed_ops{0};
     ProgressReporter reporter(label, completed_ops, ops, 0);
     for (size_t op = 0; op < ops; ++op) {
       const uint32_t id = start_id + static_cast<uint32_t>(op);
       vec<element_t> values = get_insert_vector(id);
-      vec<typename ComputeService<Distance>::InsertItem> insert_items;
+      vec<ComputeService::InsertItem> insert_items;
       insert_items.reserve(1);
       insert_items.push_back({id, std::move(values)});
       service.insert(insert_items);
@@ -374,7 +311,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     while (can_start_timed_operation(deadline, avg_insert_duration, local_completed)) {
       const uint32_t id = current_id++;
       vec<element_t> values = get_insert_vector(id);
-      vec<typename ComputeService<Distance>::InsertItem> insert_items;
+      vec<ComputeService::InsertItem> insert_items;
       insert_items.reserve(1);
       insert_items.push_back({id, std::move(values)});
       const auto started_at = std::chrono::steady_clock::now();
@@ -542,7 +479,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
         issued_inserts.fetch_add(1, std::memory_order_relaxed);
         const uint32_t id = next_insert_id.fetch_add(1, std::memory_order_relaxed);
         vec<element_t> values = get_insert_vector(id);
-        vec<typename ComputeService<Distance>::InsertItem> items;
+        vec<ComputeService::InsertItem> items;
         items.push_back({id, std::move(values)});
         completed_inserts.fetch_add(service.insert(items), std::memory_order_relaxed);
         break;
@@ -552,7 +489,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
         const uint32_t id = sample_existing_id(rng);
         const uint32_t version = next_update_version.fetch_add(1, std::memory_order_relaxed);
         vec<element_t> values = get_update_vector(id, version);
-        vec<typename ComputeService<Distance>::InsertItem> items;
+        vec<ComputeService::InsertItem> items;
         items.push_back({id, std::move(values)});
         completed_upserts.fetch_add(service.upsert(items), std::memory_order_relaxed);
         break;
@@ -709,9 +646,8 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
 
   uint32_t next_insert_id = args.insert_start_id;
   if (next_insert_id == 0) {
-    const uint64_t default_start = service.config().load_index
-                                     ? static_cast<uint64_t>(service.config().max_vectors) + 10'000ull
-                                     : static_cast<uint64_t>(bootstrap_count) + 10'000ull;
+    const uint64_t default_start =
+      static_cast<uint64_t>(service.config().max_vectors) + 10'000ull;
     if (default_start > std::numeric_limits<uint32_t>::max()) {
       throw std::runtime_error("default insert start id exceeds uint32_t; pass --insert-start-id explicitly");
     }
@@ -825,7 +761,7 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
 
   const SampleReport report = service.collect_breakdown_report();
   root.update(report_to_json(report));
-  if (service.config().use_gpu_persistent_search()) {
+  {
     const auto telemetry = service.gpu_search_telemetry();
     root["gpu_persistent"] = {
       {"queries_submitted", telemetry.queries_submitted},
@@ -974,13 +910,6 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
     text_summary << summary;
   }
   root["bottleneck_summary"] = std::move(summaries);
-  root["system_counters"] = {
-    {"rdma_read_bytes", report.query.counters.rdma_read_bytes + report.insert.counters.rdma_read_bytes},
-    {"rdma_write_bytes", report.query.counters.rdma_write_bytes + report.insert.counters.rdma_write_bytes},
-    {"h2d_bytes", report.query.counters.h2d_bytes + report.insert.counters.h2d_bytes},
-    {"d2h_bytes", report.query.counters.d2h_bytes + report.insert.counters.d2h_bytes},
-  };
-
   std::ofstream json_output(args.report_json_path);
   json_output << root.dump(2) << '\n';
   if (!json_output) {
@@ -1001,7 +930,5 @@ nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args
 
 
 
-template nlohmann::json run_benchmark<L2Distance>(ComputeService<L2Distance>& service, const Args& args);
-template nlohmann::json run_benchmark<IPDistance>(ComputeService<IPDistance>& service, const Args& args);
 
 }  // namespace tools::breakdown_benchmark

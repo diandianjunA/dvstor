@@ -4,7 +4,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
 NODE_ID="${1:?usage: start_memory_node.sh <node-id> [profile]}"
-PROFILE="${2:-${PROFILE:-00_baseline}}"
+PROFILE="${2:-${PROFILE:-04_gpu_persistent_gpunetio}}"
 load_experiment_profile "$PROFILE"
 
 if (( NODE_ID < 1 || NODE_ID > SHARDS )); then
@@ -15,12 +15,8 @@ fi
 ensure_built dvstor_memory_node
 
 PORT=$((BASE_PORT + NODE_ID - 1))
+validate_index_metadata storage "$NODE_ID"
 SHARD_FILE="$(shard_file "$NODE_ID")"
-if [[ ! -f "$SHARD_FILE" ]]; then
-  echo "missing shard file: $SHARD_FILE" >&2
-  echo "build it first with: $EXPERIMENT_DIR/build_sift100m_index.sh" >&2
-  exit 1
-fi
 
 PID_FILE="$PID_DIR/memory_node_${NODE_ID}.pid"
 LOG_FILE="$LOG_DIR/memory_node_${NODE_ID}_${PROFILE}.log"
@@ -39,53 +35,38 @@ cmd=("$BUILD_DIR/dvstor_memory_node"
   "${RDMA_ARGS[@]}"
   --server-index-file "$SHARD_FILE"
   --index-prefix "$INDEX_PREFIX"
-  --data-path "$(base_bin)"
-  --load-index
+  --threads "$SERVICE_THREADS"
   --dim "$DIM"
   --max-vectors "$MAX_VECTORS"
   --R "$R"
-  --beam-width "$SEARCH_BEAM"
   --beam-width-construction "$BUILD_BEAM"
   --alpha "$ALPHA"
   --k "$K"
   --vector-data-type "$VECTOR_DATA_TYPE"
   --mn-memory "$MN_MEMORY_GB"
-  --insert-execution "$INSERT_EXECUTION"
-  --storage-id "$((NODE_ID - 1))")
-
-if [[ "$INSERT_EXECUTION" == "storage_owner" ]]; then
-  cmd+=(--storage-peers "${SERVER_ARGS[@]}")
-  cmd+=(--storage-owner-batch-max "${STORAGE_OWNER_BATCH_MAX:-32}")
-  cmd+=(--storage-owner-batch-wait-us "${STORAGE_OWNER_BATCH_WAIT_US:-100}")
-  cmd+=(--storage-owner-peer-rdma-tokens "${STORAGE_OWNER_PEER_RDMA_TOKENS:-8}")
-  cmd+=(--storage-owner-rpc-depth "${STORAGE_OWNER_RPC_DEPTH:-16}")
-  cmd+=(--storage-owner-rpc-timeout-ms "${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}")
-  cmd+=(--storage-owner-construction-beam-width "${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-$BUILD_BEAM}")
-  cmd+=(--storage-owner-search-snapshot-batch "${STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH:-64}")
-  cmd+=(--storage-owner-prune-max-candidates "${STORAGE_OWNER_PRUNE_MAX_CANDIDATES:-128}")
-  update_mode="${STORAGE_OWNER_UPDATE_MODE:-exact}"
-  if [[ "$update_mode" != "exact" ]]; then
-    cmd+=(--storage-owner-update-mode "$update_mode")
-  fi
-  if [[ "$update_mode" == "local_stitch" ]]; then
-    cmd+=(--storage-owner-anchor-hints "${STORAGE_OWNER_ANCHOR_HINTS:-4}")
-    cmd+=(--storage-owner-anchor-beam-width "${STORAGE_OWNER_ANCHOR_BEAM_WIDTH:-64}")
-    cmd+=(--storage-owner-anchor-expand-cap "${STORAGE_OWNER_ANCHOR_EXPAND_CAP:-16}")
-    cmd+=(--storage-owner-anchor-remote-rescue-cap "${STORAGE_OWNER_ANCHOR_REMOTE_RESCUE_CAP:-4}")
-    if [[ "${STORAGE_OWNER_LOCAL_STITCH_SYNC_FAST_PATH:-1}" == "0" || \
-          "${STORAGE_OWNER_LOCAL_STITCH_SYNC_FAST_PATH:-1}" == "false" ]]; then
-      cmd+=(--storage-owner-local-stitch-sync-fast-path false)
-    else
-      cmd+=(--storage-owner-local-stitch-sync-fast-path true)
-    fi
-  fi
-  cmd+=(--storage-owner-maintenance-mode "${STORAGE_OWNER_MAINTENANCE_MODE:-off}")
-  cmd+=(--storage-owner-maintenance-workers "${STORAGE_OWNER_MAINTENANCE_WORKERS:-0}")
-  cmd+=(--storage-owner-reverse-mode "${STORAGE_OWNER_REVERSE_MODE:-async}")
-  cmd+=(--storage-owner-reverse-queue-depth "${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}")
-  cmd+=(--storage-owner-reverse-flush-us "${STORAGE_OWNER_REVERSE_FLUSH_US:-200}")
-  cmd+=(--storage-owner-reverse-coalesce-max "${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}")
-fi
+  --storage-id "$((NODE_ID - 1))"
+  --storage-peers "${SERVER_ARGS[@]}"
+  --storage-owner-coroutines "${STORAGE_OWNER_COROUTINES:-4}"
+  --storage-owner-batch-max "${STORAGE_OWNER_BATCH_MAX:-32}"
+  --storage-owner-batch-wait-us "${STORAGE_OWNER_BATCH_WAIT_US:-100}"
+  --storage-owner-peer-rdma-tokens "${STORAGE_OWNER_PEER_RDMA_TOKENS:-8}"
+  --storage-owner-rpc-depth "${STORAGE_OWNER_RPC_DEPTH:-16}"
+  --storage-owner-rpc-timeout-ms "${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}"
+  --storage-owner-construction-beam-width "${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-$BUILD_BEAM}"
+  --storage-owner-search-snapshot-batch "${STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH:-64}"
+  --storage-owner-prune-max-candidates "${STORAGE_OWNER_PRUNE_MAX_CANDIDATES:-128}"
+  --storage-owner-update-mode "${STORAGE_OWNER_UPDATE_MODE:-local_stitch}"
+  --storage-owner-anchor-hints "${STORAGE_OWNER_ANCHOR_HINTS:-4}"
+  --storage-owner-anchor-beam-width "${STORAGE_OWNER_ANCHOR_BEAM_WIDTH:-64}"
+  --storage-owner-anchor-expand-cap "${STORAGE_OWNER_ANCHOR_EXPAND_CAP:-16}"
+  --storage-owner-anchor-remote-rescue-cap "${STORAGE_OWNER_ANCHOR_REMOTE_RESCUE_CAP:-4}"
+  --storage-owner-local-stitch-sync-fast-path "${STORAGE_OWNER_LOCAL_STITCH_SYNC_FAST_PATH:-true}"
+  --storage-owner-maintenance-mode "${STORAGE_OWNER_MAINTENANCE_MODE:-finalize}"
+  --storage-owner-maintenance-workers "${STORAGE_OWNER_MAINTENANCE_WORKERS:-8}"
+  --storage-owner-reverse-mode "${STORAGE_OWNER_REVERSE_MODE:-async}"
+  --storage-owner-reverse-queue-depth "${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
+  --storage-owner-reverse-flush-us "${STORAGE_OWNER_REVERSE_FLUSH_US:-200}"
+  --storage-owner-reverse-coalesce-max "${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}")
 
 printf '[memory-node-%s] command:' "$NODE_ID"; printf ' %q' "${cmd[@]}"; echo
 nohup "${cmd[@]}" > "$LOG_FILE" 2>&1 &

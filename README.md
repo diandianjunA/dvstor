@@ -1,386 +1,139 @@
-# DVSTOR: Disaggregated GPU Vamana Index
+# DVSTOR
 
-Implementation of a GPU-accelerated Vamana index for memory disaggregation.
-This repository is used as a storage-compute disaggregated GPU vector-search baseline.
+DVSTOR 是面向动态向量检索的存算分离系统。`dev` 分支只保留一条查询路径：
+GPU 常驻 OPQ/PQ16 导航码，持久化 CUDA kernel 维护查询状态，并通过 DOCA
+GPUNetIO 直接读取存储节点上的紧凑图记录与精确向量。CPU 仅负责请求准入、
+启动阶段批量传输、控制面和动态更新 RPC，不参与稳态图遍历。
 
-## Project Structure
+历史实现保存在 `main` 分支；`dev` 不提供旧查询引擎或 CPU 查询回退。
 
-```
-dvstor/
-├── src/                    # Core runtime source code
-│   ├── common/             # Shared config, types, distance functions, utilities
-│   ├── gpu/                # CUDA kernels and GPU resource management
-│   ├── http/               # HTTP service interface
-│   ├── io/                 # Data read/write abstraction
-│   ├── memory_node/        # Storage node: index storage, insert, peer RDMA/RPC
-│   ├── rdma/               # RDMA operation wrappers (read/write/atomics)
-│   ├── router/             # Multi-compute-node adaptive query routing
-│   ├── service/            # Compute service orchestration (ComputeService)
-│   └── vamana/             # Vamana graph index core implementation
-├── tools/                  # Standalone binaries and scripts
-│   ├── vamana_offline/     # Offline Vamana graph builder library
-│   ├── breakdown_benchmark/# Performance breakdown benchmark tool
-│   ├── vamana_offline_builder.cc   # Offline index builder
-│   ├── vamana_metis_repartitioner.cc # METIS graph partitioning tool
-│   └── run_recall_test.sh  # Recall evaluation helper
-├── experiment/             # SIFT100M experiment harness, profiles, and reports
-├── rdma-library/           # RDMA low-level library (QP management, memory registration)
-├── thirdparty/             # Bundled third-party libraries (ankerl, httplib, nlohmann/json, xoshiro)
-├── structure/              # Architecture documentation (30-course series in Chinese)
-├── reports/                # Performance reports and analysis scripts
-│   ├── breakdown/          # Breakdown benchmark result JSON/TXT files
-│   ├── analyze/            # Analysis reports and Python scripts
-│   └── python/             # Plotting and visualization scripts
-└── logs/                   # Runtime log output directory
-```
+## 查询路径
 
-For a detailed walkthrough of the architecture, see the course series under `structure/`.
+1. CPU 将请求写入有界提交队列，并按微批分配 GPU 查询槽。
+2. 持久化 GPU block 完成 OPQ 变换并构建 16 个 PQ 查找表。
+3. GPU 对常驻入口点和动态 delta 入口进行打分，初始化 beam。
+4. GPU 通过 GPUNetIO 并发拉取远端 512 字节以内的紧凑图记录。
+5. GPU 使用常驻 PQ16 code 对邻居做近似距离计算并更新 beam。
+6. GPU 仅为最终候选拉取精确向量，计算 L2 距离并返回 top-k。
 
-## Setup
+查询过程中没有 CPU 驱动的逐轮 RDMA、主机向量中转或本地图副本。GPUNetIO、
+持久化 kernel 或更新发布发生系统性错误时，引擎进入 fail-stop 状态，不会把
+降级路径的结果伪装成 GPU 查询结果。
 
-### C++ Libraries and Unix Packages
+## 动态更新
 
-The following C++ libraries and Unix packages are required to compile the code.
-Note that `ibverbs` (the RDMA library) is Linux-only. 
-The code also compiles without InfiniBand network cards.
+存储节点继续拥有 insert、upsert 和 delete 的图维护协议：
 
-* [ibverbs](https://github.com/linux-rdma/rdma-core/tree/master)
-* [boost](https://www.boost.org/doc/libs/1_83_0/doc/html/program_options.html) (to support `boost::program_options` for CLI parsing)
-* pthreads (for multithreading)
-* [oneTBB](https://github.com/oneapi-src/oneTBB) (for concurrent data structures)
-* a C++ compiler that supports C++20 (we have used `g++-12`)
-* cmake
-* numactl
-* vmtouch (to map index files into main memory)
-* axel (a download accelerator for the datasets)
+- storage owner 负责 idmap、代际、紧凑图记录和反向边维护；
+- 提交成功的 mutation 以 epoch 批次发布到 GPU delta；
+- GPU delta 保存最新向量、PQ16 code、删除标记和动态候选桶；
+- 发布新 epoch 前失效受影响的 GPU 图缓存项；
+- delta 超过容量或维护失败时停止接收新查询，避免静默返回陈旧结果。
 
-`ankerl::unordered_dense` is vendored under `thirdparty/ankerl` as a
-header-only dependency. It does not require a system package or machine-specific
-include/library path on compute nodes or storage nodes.
+## 索引文件
 
-For instance, to install the requirements on Debian, run the following command:
-```
-apt-get -y install g++ libboost-all-dev libibverbs1 libibverbs-dev numactl cmake libtbb-dev git python3-venv vmtouch axel
-```
+新索引固定为 schema 14、L2、`plain` vector record、compact graph 和
+OPQ/PQ16 导航。运行时不读取任何计算节点图清单文件。
 
-For METIS-based graph partitioning support (optional), also install:
-```
-apt-get -y install libmetis-dev
-```
+| 文件 | 计算节点 | 存储节点 X | 作用 |
+| --- | --- | --- | --- |
+| `<prefix>.meta.json` | 必需 | 必需 | 分片、远端 offset 和格式契约 |
+| `<prefix>.pq16` | 必需 | 不需要 | OPQ 矩阵与 PQ codebook |
+| `<prefix>.anchors` | 必需 | 必需 | 查询入口与动态更新 anchor |
+| `<prefix>_nodeX_ofN.dat` | 不需要 | 必需 | 精确向量、固定记录和紧凑图 |
+| `<prefix>_nodeX_ofN.idmap` | 不需要 | 必需 | storage-owner ID 映射 |
+| `<prefix>_nodeX_ofN.pq16.codes` | 不需要 | 必需 | 启动时注册到远端内存的 PQ16 码流 |
 
-### Cluster Nodes Configuration
+计算节点本地只保存 metadata、PQ 模型和 anchors；不会保存 `.gpu.idx`、图分片、
+精确向量或全量导航码。
 
-Adjust the IP addresses of the cluster nodes accordingly in `rdma-library/library/utils.cc`.
+PQ16 每个向量占 16 字节：SIFT100M 为 1.6 GB，SIFT1B 为 16 GB
+（约 14.9 GiB）。默认 SIFT1B GPU 预算还包括 3 GiB 图缓存、4 GiB 精确向量
+缓存、2 GiB delta 和查询工作区，显式分配上限为 36 GiB，并为 CUDA/DOCA
+保留 4 GiB。计算节点本地文件远低于 50 GB。
 
-### Compilation
+## 依赖与构建
 
-After cloning the repository and installing the requirements, the code must be compiled on all cluster nodes:
-```
-mkdir build
-cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make
-```
+计算节点需要 C++20、CUDA、RDMA verbs、DOCA GPUNetIO、Boost、TBB、OpenMP
+和 Faiss；离线 METIS 分片可选。默认 DOCA 路径为 `/opt/mellanox/doca`。
 
-This produces these main binaries:
-- `build/dvstor`: online compute node service
-- `build/dvstor_memory_node`: memory-node-only service
-- `build/vamana_offline_builder`: offline Vamana builder that exports DVSTOR shard files plus RaBitQ artifacts
-- `build/vamana_metis_repartitioner`: repartition an existing offline-built index using METIS graph partitioning
-- `build/dvstor_breakdown_benchmark`: performance breakdown benchmark tool for throughput/latency profiling
-
-Storage nodes may not have GPUs. For storage-node-only deployment, build just the memory-node binary:
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDVSTOR_STORAGE_NODE_ONLY=ON
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-Additional CMake options:
-- `-DDVSTOR_METIS_PARTITION=ON`: require METIS partitioning support (default: AUTO)
-- `-DDVSTOR_METIS_PARTITION=OFF`: disable METIS partitioning support
-- `-DDVSTOR_USE_NATIVE_ARCH=ON`: compile with `-march=native` for host-specific optimizations
-- `-DDVSTOR_BUILD_EXECUTABLES=OFF`: skip building standalone executables
-- `-DDVSTOR_BUILD_TESTS=OFF`: skip building tests
-- `-DDVSTOR_ENABLE_GPUNETIO=ON`: enable the DOCA GPUNetIO backend when available
-- `-DDVSTOR_DOCA_ROOT=/opt/mellanox/doca`: set the DOCA SDK root
+主要目标：
 
-## Data Preparation
+- `dvstor_compute_node`：GPU 查询与更新客户端；
+- `dvstor_memory_node`：存储节点；
+- `dvstor_breakdown_benchmark`：吞吐、延迟、召回率和分解统计；
+- `vamana_offline_builder`：构建 compact Vamana/Metis 图；
+- `vamana_pq_indexer`：训练 OPQ/PQ16 并生成分片码流；
+- `vamana_legacy_index_converter`：复用旧图与分片布局进行迁移。
 
-### SIFT100M Dataset
-
-Experiment scripts for SIFT100M are provided under `experiment/`:
+无 GPU 的存储节点可使用：
 
 ```bash
-# Convert SIFT data to DVSTOR format (adjust paths inside the script first)
-python3 experiment/convert_sift100m.py
-
-# Build the offline index
-./experiment/build_sift100m_index.sh
-
-# Quick test with reduced scale:
-MAX_VECTORS=1000000 GROUNDTRUTH_LABEL=1M ./experiment/build_sift100m_index.sh
+cmake -S . -B build-storage \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DDVSTOR_STORAGE_NODE_ONLY=ON \
+  -DDVSTOR_BUILD_EXECUTABLES=OFF \
+  -DDVSTOR_BUILD_TESTS=OFF
+cmake --build build-storage -j --target dvstor_memory_node
 ```
 
-See `experiment/README.md` for experiment profiles, memory defaults, and configuration options.
+## 生成或迁移索引
 
-### Custom Dataset
-
-For custom datasets, use `vamana_offline_builder` directly (see "Offline Build And Online Load" below), or adapt the evaluation scripts to your data paths.
-
-## Run the Experiments
-
-The experiment harness under `experiment/` supports the ablation profiles in
-`experiment/profiles/`. Each run writes the generated service config and reports
-under `experiment/reports/<profile>/`.
-
-### Quick Start: SIFT100M
+完整构建：
 
 ```bash
-# 1. Build the index
-./experiment/build_sift100m_index.sh
+./experiment/build_sift100m_index.sh 04_gpu_persistent_gpunetio
+```
 
-# 2. Start memory nodes with a profile
-./experiment/start_all_memory_nodes.sh 00_baseline
+复用已有 Vamana/Metis 图，不重新构图或分区：
 
-# 3. Run recall evaluation
-./experiment/run_recall.sh 00_baseline
+```bash
+OVERWRITE_INDEX=1 \
+./experiment/convert_legacy_sift100m_index.sh 04_gpu_persistent_gpunetio
+```
 
-# 4. Run breakdown benchmark (throughput/latency profiling)
-./experiment/run_breakdown.sh 00_baseline
+迁移会顺序压缩旧 fixed record、重写紧凑图中的 RemotePtr、迁移 idmap 与
+anchors，然后训练/复用 PQ 模型并编码所有向量。源 prefix 与输出 prefix 必须
+不同；迁移器不会修改或删除旧索引。
 
-# 5. Stop memory nodes
+## 运行 SIFT100M
+
+先在 `experiment/profiles/04_gpu_persistent_gpunetio.env` 或环境变量中配置
+`HOSTS`、`INDEX_DIR`、GPU 与内存预算。在存储节点启动对应分片后，在计算节点运行：
+
+```bash
+./experiment/start_all_memory_nodes.sh 04_gpu_persistent_gpunetio
+./experiment/run_recall.sh 04_gpu_persistent_gpunetio
+./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
 ./experiment/stop_memory_nodes.sh
 ```
 
-### Optimization Profiles
+分布式部署时，每台存储节点只需其自身的 `.dat`、`.idmap`、`.pq16.codes`，
+再加共享 metadata 与 anchors。详细流程见 `experiment/README.md`。
+
+## 验证
 
 ```bash
-# RaBitQ-aware GPU query pipeline
-./experiment/start_all_memory_nodes.sh 01_rabitq_expension_aware
-./experiment/run_breakdown.sh 01_rabitq_expension_aware
-
-# RaBitQ + ALDI + locality-oriented placement
-./experiment/start_all_memory_nodes.sh 02_rabitq_expension_aware_aldi
-./experiment/run_breakdown.sh 02_rabitq_expension_aware_aldi
-
-# RaBitQ + ALDI + adaptive RDMA scheduling
-./experiment/start_all_memory_nodes.sh 03_rabitq_gpu_pipeline_aldi_rdma
-./experiment/run_breakdown.sh 03_rabitq_gpu_pipeline_aldi_rdma
-
-# GPU-centric persistent kernel + GPUNetIO data path
-./experiment/build_sift100m_index.sh 04_gpu_persistent_gpunetio
-./experiment/start_all_memory_nodes.sh 04_gpu_persistent_gpunetio
-./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
+ctest --test-dir build --output-on-failure
+bash -n experiment/*.sh experiment/profiles/*.env
 ```
 
-See `docs/gpu_persistent_engine.md` for the execution model, index artifacts,
-dynamic-update semantics, and report comparison workflow.
+`gpu_memory_budget_test` 覆盖 SIFT100M/SIFT1B 预算；格式、PQ、delta、迁移和
+提交环均有独立测试。硬件吞吐和召回率仍需在真实存储节点启动后通过 profile
+进行验证。
 
-### Common Overrides
+## 代码结构
 
-```bash
-# Specify cluster hosts
-HOSTS="mn1 mn2 mn3 mn4 mn5" BASE_PORT=1234 IB_DEVICE=mlx5_0 \
-  ./experiment/start_all_memory_nodes.sh 00_baseline
-
-# Different partition strategy
-PARTITION_STRATEGY=metis ./experiment/build_sift100m_index.sh
-
-# Query-only workload
-WORKLOAD=query WARMUP_SECONDS=10 MEASURE_SECONDS=60 \
-  ./experiment/run_breakdown.sh 01_rabitq_expension_aware
-```
-
-### Breakdown Benchmark Tool
-
-The `dvstor_breakdown_benchmark` binary provides detailed performance breakdowns for throughput and latency across query and insert workloads. Run it standalone:
-
-```bash
-./build/dvstor_breakdown_benchmark \
-  --service-config ./experiment/reports/00_baseline/service_<timestamp>.ini \
-  --workload mixed \
-  --client-threads 16 \
-  --read-ratio 0.5 \
-  --warmup-seconds 30 \
-  --measure-seconds 60
-```
-
-Results are written under `reports/breakdown/` as JSON and TXT files with per-category (CPU/GPU/RDMA/transfer) timing breakdowns.
-
-## Offline Build And Online Load
-
-The project supports building a Vamana graph offline and exporting it into DVSTOR's native
-memory-node shard format. The offline build also emits RaBitQ search artifacts used by the online
-GPU query path.
-
-### Build an Offline Index
-
-```bash
-./build/vamana_offline_builder \
-  --data-path /path/to/dataset-or-dir \
-  --memory-nodes 2 \
-  --partition-strategy bfs \
-  --threads 32 \
-  --R 32 \
-  --beam-width-construction 128 \
-  --alpha 1.2 \
-  --rabitq-bits 4 \
-  --output-prefix /path/to/index/dvstor_index
-```
-
-The offline builder has only one beam-width knob, and it is the construction/search width used
-while building the Vamana graph. It is separate from the online service's `beam-width` and
-`beam-width-construction` settings used during query and dynamic insert.
-
-This writes files like:
-```text
-/path/to/index/dvstor_index_node1_of2.dat
-/path/to/index/dvstor_index_node2_of2.dat
-/path/to/index/dvstor_index.meta.json
-/path/to/index/dvstor_index.rotation.bin
-```
-
-Offline shard placement supports `--partition-strategy balanced` (default), `bfs`, and `metis`.
-The `bfs` strategy starts from the graph medoid, orders nodes by BFS traversal, and writes contiguous
-balanced BFS ranges into shard files so graph-near nodes are more likely to stay on the same memory node.
-The `metis` strategy additionally requires METIS support at CMake configure time.
-
-### METIS Graph Repartitioning
-
-The `vamana_metis_repartitioner` tool repartitions an existing offline-built index using METIS
-graph partitioning without rebuilding the Vamana graph:
-
-```bash
-./build/vamana_metis_repartitioner \
-  --input-prefix /path/to/index/dvstor_index \
-  --output-prefix /path/to/index/dvstor_metis_index \
-  --num-partitions 5
-```
-
-This reads the existing shard files and meta JSON, builds a METIS graph from the Vamana adjacency
-structure, computes a new balanced partition, and writes repartitioned shard files with a new
-`.meta.json`. The repartitioned index can be used directly in the online cluster without rebuilding.
-
-### Online Load
-
-Start each memory node with its local shard:
-```bash
-./build/dvstor_memory_node --index-file /path/to/index/dvstor_index_node1_of2.dat \
-  --port 1234 --mn-memory 152
-```
-
-Or let the compute node trigger startup loading on all memory nodes:
-```bash
-./build/dvstor --servers mn1:1234 mn2:1235 \
-  --load-index --index-prefix /path/to/index/dvstor_index \
-  --dim 128 --threads 16 --coroutines 16 --k 10 --ef-search 32
-```
-
-In both cases, the online cluster reuses the offline-built graph directly instead of rebuilding it through RDMA.
-When `--search-mode rabitq_gpu` is enabled on the compute side, the online service loads
-`<index_prefix>.rotation.bin` and uploads the rotation matrix, rotated centroid, and `t_const`
-to each GPU worker.
-
-### Search Modes
-
-- `exact_gpu`: GPU exact distance search over remotely fetched full vectors. Useful as an ablation and correctness reference.
-- `rabitq_gpu`: GPU RaBitQ search with final exact rerank. This is the intended paper baseline mode when evaluating
-  the disaggregated GPU index without cache or GPU-direct transport optimizations.
-
-`--servers` can now be specified either as plain node names such as `cluster3` or as explicit `host:port`
-endpoints such as `127.0.0.1:1235`. This allows running multiple memory nodes on the same machine as long as each
-instance uses a distinct port.
-
-### Multi-Node Local Example
-
-Example: five memory nodes on one host with online load:
-
-```bash
-# Build with 5 shards
-./build/vamana_offline_builder \
-  --data-path /path/to/dataset-or-dir \
-  --memory-nodes 5 \
-  --threads 32 \
-  --output-prefix /tmp/dvstor_index
-
-# Start memory nodes on different ports
-for i in $(seq 1 5); do
-  port=$((1233 + i))
-  ./build/dvstor_memory_node --port $port \
-    --index-file /tmp/dvstor_index_node${i}_of5.dat \
-    --mn-memory 10 &
-done
-
-# Start compute node
-./build/dvstor \
-  --servers 127.0.0.1:1234 127.0.0.1:1235 127.0.0.1:1236 127.0.0.1:1237 127.0.0.1:1238 \
-  --load-index \
-  --index-prefix /tmp/dvstor_index \
-  --dim 128 \
-  --threads 16 \
-  --coroutines 16 \
-  --k 10 \
-  --ef-search 32
-```
-
-## Recall Testing
-
-The `tools/run_recall_test.sh` script builds an offline index and evaluates recall against
-ground truth:
-
-```bash
-./tools/run_recall_test.sh \
-  --data-path /path/to/dataset \
-  --output-prefix /path/to/index/output \
-  --query-path /path/to/queries.fbin \
-  --groundtruth-path /path/to/groundtruth.bin \
-  --R 32 \
-  --alpha 1.2 \
-  --threads 32
-```
-
-Environment variable overrides are also supported:
-```bash
-DATA_PATH=/path/to/dataset OUTPUT_PREFIX=/path/to/index ./tools/run_recall_test.sh
-```
-
-## Architecture Documentation
-
-A detailed 30-course architecture series (in Chinese) is available under `structure/`, covering every subsystem:
-
-| # | Topic |
-|---|-------|
-| 01 | Project overview and architecture |
-| 02 | Type system and common infrastructure |
-| 03 | Vamana graph index algorithm basics |
-| 04 | Vamana node and neighbor list data structures |
-| 05 | C++20 coroutines and async scheduler |
-| 06 | Beam-Search search algorithm implementation |
-| 07 | Vamana insert and RobustPrune implementation |
-| 08 | RDMA library low-level implementation |
-| 09 | RDMA read/write/atomic operation wrappers |
-| 10 | Memory management and BufferAllocator |
-| 11 | ComputeService compute service architecture |
-| 12 | ComputeThread thread design and GPU polling |
-| 13 | MemoryNode storage node architecture |
-| 14 | Storage owner insert protocol details |
-| 15 | GPU kernel implementation: distance computation |
-| 16 | GPU kernel implementation: RobustPrune |
-| 17 | GPU resource management and GPU-Direct RDMA |
-| 18 | Multi-compute-node routing system |
-| 19 | Offline Vamana graph builder |
-| 20 | Performance breakdown and statistics system |
-| 21 | Vector data types and quantization storage |
-| 22 | IO and data management layer |
-| 23 | HTTP service and external interface |
-| 24 | Multi-memory-node peer communication |
-| 25 | RPC routing and multi-CN coordination |
-| 26 | Build system and compilation optimization |
-| 27 | Evaluation scripts and experiment workflow |
-| 28 | Key performance optimization techniques |
-| 29 | Testing and debugging methods |
-| 30 | Extension development and future directions |
-
-## License
-
-MIT License — see [LICENSE](LICENSE).
+- `src/gpu_search/`：PQ 模型、索引布局、持久化引擎与 CUDA kernel；
+- `src/gpu/`：DOCA GPUNetIO 传输和探针；
+- `src/memory_node/`：分片加载、更新、维护与 storage peer RPC；
+- `src/service/`：计算服务、索引契约和统计；
+- `src/vamana/`：compact graph、anchor 和 idmap 格式；
+- `tools/legacy_index/`：隔离的旧索引只读迁移器；
+- `tools/vamana_offline/`：离线构图与 PQ sidecar 生成；
+- `experiment/`：唯一支持的 SIFT100M profile。

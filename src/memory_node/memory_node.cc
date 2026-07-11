@@ -14,9 +14,7 @@ MemoryNode::MemoryNode(Configuration& config)
       storage_id_(config.storage_id),
       num_storage_nodes_(config.storage_peers.empty() ? config.num_server_nodes()
                                                       : static_cast<u32>(config.storage_peers.size())),
-      use_storage_owner_insert_(config.use_storage_owner_insert()),
       storage_owner_peer_rdma_tokens_(std::max<u32>(1, config.storage_owner_peer_rdma_tokens)),
-      ip_distance_(config.ip_distance),
       index_region_(context_),
       peer_rdma_read_outstanding_(num_storage_nodes_),
       mn_memory_bytes_(static_cast<u64>(config.mn_memory_gb) * 1073741824ul) {
@@ -39,117 +37,94 @@ MemoryNode::MemoryNode(Configuration& config)
   context_.receive();
 
   num_compute_threads_ = p.num_threads;
-  qp_pool_size_ = p.qp_pool_size;
-  gpu_persistent_ = p.gpu_persistent;
-  const u32 gpu_rdma_qps = p.gpu_persistent ? p.gpu_rdma_qps : 0;
+  const u32 gpu_rdma_qps = p.gpu_rdma_qps;
   const filepath_t index_prefix = config.resolved_index_prefix();
   index_prefix_ = index_prefix;
   VectorDType startup_dtype = config.resolved_vector_dtype();
   str startup_anchor_format;
   const filepath_t meta_file = filepath_t(index_prefix.string() + ".meta.json");
-  if (!index_prefix.empty() && std::filesystem::exists(meta_file)) {
+  lib_assert(!index_prefix.empty(), "GPU storage node requires --index-prefix");
+  lib_assert(std::filesystem::exists(meta_file),
+             "GPU index metadata does not exist: " + meta_file.string());
+  {
     service::index_metadata::Metadata metadata;
     str metadata_error;
     lib_assert(service::index_metadata::load_metadata(index_prefix, metadata, &metadata_error), metadata_error);
     lib_assert(metadata.dim == config.dim, "index metadata dim mismatch on storage node");
     lib_assert(metadata.R == config.R, "index metadata R mismatch on storage node");
     lib_assert(metadata.num_memory_nodes == num_storage_nodes_, "index metadata storage-node count mismatch");
-    gpu_stream_layout_ = metadata.schema_version == 13 &&
-      metadata.node_layout == "rabitq" &&
-      metadata.storage_format == "vamana_compact_v1";
-    if (gpu_persistent_) {
-      lib_assert(gpu_stream_layout_,
-                 "gpu_persistent requires schema-13 compact RaBitQ storage shards");
-      lib_assert(storage_id_ < num_storage_nodes_, "invalid GPU storage shard id");
-      lib_assert(metadata.hot_graph_entry_counts.size() == num_storage_nodes_,
-                 "GPU storage metadata has invalid static shard counts");
-      lib_assert(metadata.hot_graph_dynamic_base_offsets.size() == num_storage_nodes_,
-                 "GPU storage metadata has invalid dynamic shard offsets");
-      gpu_static_node_count_ = metadata.hot_graph_entry_counts[storage_id_];
-      gpu_static_dynamic_base_ = metadata.hot_graph_dynamic_base_offsets[storage_id_];
-    }
+    gpu_stream_layout_ = metadata.schema_version == 14 &&
+      metadata.node_layout == "plain" &&
+      metadata.storage_format == "vamana_compact_v1" &&
+      metadata.navigation_quantizer == "opq_pq16" &&
+      metadata.navigation_format == "opq_pq16_graph_v1";
+    lib_assert(gpu_stream_layout_,
+               "storage node requires a schema-14 compact OPQ/PQ16 index");
+    lib_assert(storage_id_ < num_storage_nodes_, "invalid GPU storage shard id");
+    lib_assert(metadata.hot_graph_entry_counts.size() == num_storage_nodes_,
+               "GPU storage metadata has invalid static shard counts");
+    lib_assert(metadata.hot_graph_dynamic_base_offsets.size() == num_storage_nodes_,
+               "GPU storage metadata has invalid dynamic shard offsets");
+    gpu_static_node_count_ = metadata.hot_graph_entry_counts[storage_id_];
+    gpu_static_dynamic_base_ = metadata.hot_graph_dynamic_base_offsets[storage_id_];
+    gpu_navigation_code_bytes_ = metadata.navigation_code_bytes;
+    gpu_navigation_model_checksum_ = metadata.navigation_model_checksum;
     if (config.vector_data_type != "auto" && config.resolved_vector_dtype() != metadata.vector_dtype) {
       lib_failure("configured vector-data-type=" + config.vector_data_type +
                   " does not match index metadata vector_data_type=" + vector_dtype_name(metadata.vector_dtype));
     }
     startup_dtype = metadata.vector_dtype;
     config.vector_data_type = vector_dtype_name(startup_dtype);
-    VamanaNode::disable_rabitq();
     VamanaNode::disable_hot_graph();
-    const auto storage_format = vamana::parse_storage_format(metadata.storage_format);
-    lib_assert(storage_format.has_value(),
-               "index storage format is obsolete; rebuild with the current offline builder");
-    VamanaNode::set_storage_format(*storage_format);
     VamanaNode::init_static_storage(config.dim, config.R, startup_dtype);
-    lib_assert(metadata.schema_version == 13,
+    lib_assert(metadata.schema_version == 14 && metadata.node_layout == "plain",
                "index storage format is obsolete; rebuild with the current offline builder");
-    if (metadata.node_layout == "rabitq") {
-        lib_assert(metadata.rabitq_centroid.size() == metadata.dim,
-                   "RaBitQ index metadata has a missing or invalid centroid");
-        VamanaNode::enable_rabitq();
-        VamanaNode::set_rabitq_centroid(metadata.rabitq_centroid);
-        lib_assert(metadata.rabitq_code_bits == VamanaNode::rabitq_code_bits() &&
-                   metadata.rabitq_entry_size == VamanaNode::rabitq_entry_size(),
-                   "RaBitQ index code layout does not match the runtime dimension");
-    }
     lib_assert(metadata.vector_component_size == VamanaNode::vector_component_size(),
                "index metadata vector component size mismatch on storage node");
     lib_assert(metadata.vector_bytes == VamanaNode::vector_bytes(),
                "index metadata vector byte size mismatch on storage node");
     lib_assert(metadata.node_size == VamanaNode::total_size(), "index metadata node size mismatch on storage node");
     lib_assert(metadata.graph_hot_bytes == VamanaNode::graph_hot_bytes() &&
-               metadata.vector_offset == VamanaNode::offset_vector() &&
-               metadata.neighbors_offset == VamanaNode::offset_neighbors() &&
-               metadata.rabitq_offset == (VamanaNode::HAS_RABITQ_CODE ? VamanaNode::offset_rabitq_code() : 0),
+               metadata.vector_offset == VamanaNode::offset_vector(),
                "index metadata storage offsets mismatch on storage node");
-    if (*storage_format == vamana::StorageFormat::compact_v1) {
-      lib_assert(metadata.hot_graph_pointer_bytes == vamana::hot_graph::kCompactPointerBytes &&
-                 metadata.hot_graph_entry_size == VamanaNode::hot_graph_entry_size() &&
-                 metadata.hot_graph_offsets.size() == num_storage_nodes_ &&
-                 metadata.hot_graph_entry_counts.size() == num_storage_nodes_,
-                 "index hot graph metadata mismatch on storage node");
-      lib_assert(metadata.hot_graph_dynamic_base_offsets.size() == num_storage_nodes_ &&
-                 metadata.hot_graph_dynamic_record_bytes >=
-                   metadata.hot_graph_dynamic_hot_offset + metadata.hot_graph_entry_size &&
-                 metadata.hot_graph_dynamic_hot_offset >= VamanaNode::total_size(),
-                 "index dynamic hot graph metadata mismatch on storage node");
-      VamanaNode::configure_hot_graph(metadata.hot_graph_offsets,
-                                      metadata.hot_graph_entry_counts,
-                                      metadata.hot_graph_entry_size,
-                                      metadata.hot_graph_shard_bits,
-                                      2u,
-                                      metadata.hot_graph_dynamic_base_offsets,
-                                      metadata.hot_graph_dynamic_record_bytes,
-                                      metadata.hot_graph_dynamic_hot_offset);
-      lib_assert(VamanaNode::HAS_HOT_GRAPH, "failed to enable compact hot graph on storage node");
-    }
+    lib_assert(metadata.hot_graph_pointer_bytes == vamana::hot_graph::kCompactPointerBytes &&
+               metadata.hot_graph_entry_size == VamanaNode::hot_graph_entry_size() &&
+               metadata.hot_graph_offsets.size() == num_storage_nodes_ &&
+               metadata.hot_graph_entry_counts.size() == num_storage_nodes_,
+               "index hot graph metadata mismatch on storage node");
+    lib_assert(metadata.hot_graph_dynamic_base_offsets.size() == num_storage_nodes_ &&
+               metadata.hot_graph_dynamic_record_bytes >=
+                 metadata.hot_graph_dynamic_hot_offset + metadata.hot_graph_entry_size &&
+               metadata.hot_graph_dynamic_hot_offset >= VamanaNode::total_size(),
+               "index dynamic hot graph metadata mismatch on storage node");
+    VamanaNode::configure_hot_graph(metadata.hot_graph_offsets,
+                                    metadata.hot_graph_entry_counts,
+                                    metadata.hot_graph_entry_size,
+                                    metadata.hot_graph_shard_bits,
+                                    metadata.hot_graph_dynamic_base_offsets,
+                                    metadata.hot_graph_dynamic_record_bytes,
+                                    metadata.hot_graph_dynamic_hot_offset);
+    lib_assert(VamanaNode::HAS_HOT_GRAPH, "failed to enable compact hot graph on storage node");
     owner_idmap_required_ = metadata.idmap_format == "owner_sharded_v1";
     startup_anchor_format = metadata.anchor_format;
     print_status("loaded index metadata from " + index_prefix.string() +
                  " (layout=" + VamanaNode::layout_name() +
                  ", vector_data_type=" + VamanaNode::vector_dtype_name() + ")");
-  } else {
-    VamanaNode::disable_rabitq();
-    VamanaNode::disable_hot_graph();
-    VamanaNode::set_storage_format(vamana::StorageFormat::aos_v1);
-    VamanaNode::init_static_storage(config.dim, config.R, startup_dtype);
-    if (config.use_rabitq) VamanaNode::enable_rabitq();
   }
   allocate_memory();
 
   // free-ptr is initialized to 16 (points to first free address in the buffer)
   *reinterpret_cast<u64*>(index_buffer_.get_full_buffer()) = 16;
 
-  if (!config.server_index_file.empty()) {
-    const auto [success, message] = load_index_file(config.server_index_file.string());
-    lib_assert(success, message);
-    if (owner_idmap_required_) {
-      lib_assert(load_owner_idmap(index_prefix_), "failed to load owner-sharded idmap");
-    }
+  lib_assert(!config.server_index_file.empty(),
+             "GPU storage node requires --server-index-file");
+  const auto [success, message] = load_index_file(config.server_index_file.string());
+  lib_assert(success, message);
+  if (owner_idmap_required_) {
+    lib_assert(load_owner_idmap(index_prefix_), "failed to load owner-sharded idmap");
   }
 
-  if (use_storage_owner_insert_ &&
-      config.storage_owner_update_mode == "local_stitch") {
+  if (config.storage_owner_update_mode == "local_stitch") {
     storage_owner_anchor_index_ = std::make_unique<vamana::anchor::Index>();
     str anchor_error;
     lib_assert(startup_anchor_format == "owner_anchor_v1" &&
@@ -178,9 +153,7 @@ MemoryNode::MemoryNode(Configuration& config)
   vec<u_ptr<DetachedQP>> qps;
 
   // note: no need for QP sharing on the memory server side
-  const u32 worker_qps_per_node =
-    (p.gpu_persistent ? 0 : std::min<u32>(num_compute_threads_, MAX_QPS)) * qp_pool_size_;
-  const u32 qps_per_node = worker_qps_per_node + gpu_rdma_qps;
+  const u32 qps_per_node = gpu_rdma_qps;
   if (gpu_rdma_qps > 0) {
     print_status("reserving " + std::to_string(gpu_rdma_qps) +
                  " GPU/bootstrap QPs per compute node");
@@ -197,25 +170,14 @@ MemoryNode::MemoryNode(Configuration& config)
   // notify compute nodes that we are ready
   cm_.synchronize();
 
-  // handle startup command (load/store/noop from CN init)
-  print_status("waiting for commands from compute node...");
-  bool running = handle_command();
-
-  if (running && use_storage_owner_insert_) {
-    setup_storage_peers(config);
-    setup_insert_runtime(config);
-    storage_worker_config_ = std::make_unique<Configuration>(config);
-    start_peer_reverse_update_runtime(config);
-    start_storage_owner_maintenance_runtime(config);
-    start_storage_owner_insert_workers(config);
-    service_storage_runtime(config);
-
-  } else {
-    // service mode: listen for runtime commands
-    while (running) {
-      running = handle_command();
-    }
-  }
+  wait_for_start_signal();
+  setup_storage_peers(config);
+  setup_insert_runtime(config);
+  storage_worker_config_ = std::make_unique<Configuration>(config);
+  start_peer_reverse_update_runtime(config);
+  start_storage_owner_maintenance_runtime(config);
+  start_storage_owner_insert_workers(config);
+  service_storage_runtime(config);
 
   storage_insert_shutdown_.store(true, std::memory_order_release);
   storage_insert_tasks_cv_.notify_all();
@@ -297,57 +259,19 @@ void MemoryNode::allocate_memory() {
   t_allocate->stop();
 }
 
-bool MemoryNode::handle_command() {
-  mn_command::Request req{};
-  LocalMemoryRegion region{context_, &req, sizeof(mn_command::Request)};
+void MemoryNode::wait_for_start_signal() {
+  print_status("waiting for compute-node startup barrier");
+  storage_startup::Request request{};
+  LocalMemoryRegion region{context_, &request, sizeof(request)};
   cm_.initiator_qp->post_receive(region);
   context_.receive();
-
-  // receive path if present
-  str path;
-  if (req.path_length > 0) {
-    path.resize(req.path_length);
-    LocalMemoryRegion path_region{context_, path.data(), req.path_length};
-    cm_.initiator_qp->post_receive(path_region);
-    context_.receive();
-  }
-
-  const auto send_response = [&](bool success, const str& message = "") {
-    mn_command::Response resp{success, message.size()};
-    cm_.initiator_qp->post_send_inlined(&resp, sizeof(mn_command::Response), IBV_WR_SEND);
-    context_.poll_send_cq_until_completion();
-    if (!message.empty()) {
-      cm_.initiator_qp->post_send_inlined(message.data(), message.size(), IBV_WR_SEND);
-      context_.poll_send_cq_until_completion();
-    }
+  const storage_startup::Response response{
+    .ready = request.magic == storage_startup::kMagic,
   };
-
-  switch (req.cmd) {
-    case mn_command::NOOP:
-      send_response(true);
-      return true;
-
-    case mn_command::LOAD: {
-      const auto [success, message] = load_index_file(path);
-      send_response(success, message);
-      return true;
-    }
-
-    case mn_command::STORE: {
-      const auto [success, message] = store_index_file(path);
-      send_response(success, message);
-      return true;
-    }
-
-    case mn_command::SHUTDOWN:
-      print_status("received SHUTDOWN command");
-      send_response(true);
-      return false;
-
-    default:
-      send_response(false, "unknown command");
-      return true;
-  }
+  cm_.initiator_qp->post_send_inlined(
+    &response, sizeof(response), IBV_WR_SEND);
+  context_.poll_send_cq_until_completion();
+  lib_assert(response.ready, "invalid compute-node startup request");
 }
 
 std::pair<bool, str> MemoryNode::load_index_file(const str& path) {
@@ -374,15 +298,14 @@ std::pair<bool, str> MemoryNode::load_index_file(const str& path) {
   if (!file) {
     return {false, "read failed for " + path};
   }
-  if (!gpu_persistent_) return {true, ""};
   if (!gpu_stream_layout_ || gpu_static_node_count_ == 0 ||
       gpu_static_dynamic_base_ == 0) {
-    return {false, "GPU storage metadata cannot materialize the RaBitQ stream"};
+    return {false, "GPU storage metadata cannot materialize the PQ stream"};
   }
   const u64 persisted_free_pointer =
     *reinterpret_cast<const u64*>(index_buffer_.get_full_buffer());
   if (persisted_free_pointer != gpu_static_dynamic_base_) {
-    return {false, "GPU V4 requires a compacted static shard before startup"};
+    return {false, "GPU navigation requires a compacted static shard before startup"};
   }
   const u64 fixed_nodes_end = gpu_search::format::kNodeBaseOffset +
     gpu_static_node_count_ * VamanaNode::total_size();
@@ -392,94 +315,50 @@ std::pair<bool, str> MemoryNode::load_index_file(const str& path) {
   }
 
   const u64 remote_offset = gpu_search::format::align_up(gpu_static_dynamic_base_, 64);
-  const u64 payload_bytes = gpu_static_node_count_ * VamanaNode::rabitq_entry_size();
+  const u64 payload_bytes = gpu_static_node_count_ * gpu_navigation_code_bytes_;
   if (remote_offset == 0 || remote_offset > index_buffer_.buffer_size ||
       payload_bytes > index_buffer_.buffer_size - remote_offset) {
-    return {false, "buffer too small for GPU V4 RaBitQ stream"};
+    return {false, "buffer too small for GPU PQ stream"};
   }
 
-  const filepath_t code_path = index_path::gpu_code_for_shard(path);
-  if (std::filesystem::exists(code_path)) {
-    gpu_search::format::CodeHeader header;
-    str error;
-    if (!gpu_search::format::read_code_header(code_path, header, &error) ||
-        header.memory_node != storage_id_ ||
-        header.node_size != VamanaNode::total_size() ||
-        header.code_bits != VamanaNode::rabitq_code_bits() ||
-        header.entry_bytes != VamanaNode::rabitq_entry_size() ||
-        header.entry_count != gpu_static_node_count_ ||
-        header.remote_offset != remote_offset ||
-        header.payload_bytes != payload_bytes) {
-      return {false, error.empty() ? "incompatible GPU V4 code sidecar " + code_path.string()
-                                   : error};
-    }
-    std::ifstream codes{code_path, std::ios::binary};
-    codes.seekg(static_cast<std::streamoff>(sizeof(header)));
-    constexpr size_t chunk_bytes = 64ull << 20;
-    u64 checksum = gpu_search::format::checksum64_initial();
-    for (u64 offset = 0; offset < header.payload_bytes; offset += chunk_bytes) {
-      const size_t bytes = static_cast<size_t>(
-        std::min<u64>(chunk_bytes, header.payload_bytes - offset));
-      byte_t* destination = index_buffer_.get_full_buffer() + header.remote_offset + offset;
-      codes.read(reinterpret_cast<char*>(destination), static_cast<std::streamsize>(bytes));
-      if (static_cast<size_t>(codes.gcount()) != bytes) {
-        return {false, "short read from " + code_path.string()};
-      }
-      checksum = gpu_search::format::checksum64_update(checksum, destination, bytes);
-    }
-    if (checksum != header.payload_checksum) {
-      return {false, "GPU V4 code sidecar payload checksum mismatch: " + code_path.string()};
-    }
-    print_status("loaded GPU V4 codes (" + std::to_string(header.payload_bytes) +
-                 " Bytes) at remote offset " + std::to_string(header.remote_offset));
-  } else {
-    byte_t* destination = index_buffer_.get_full_buffer() + remote_offset;
-    const byte_t* nodes = index_buffer_.get_full_buffer() +
-      gpu_search::format::kNodeBaseOffset;
-    for (u64 slot = 0; slot < gpu_static_node_count_; ++slot) {
-      byte_t* entry = destination + slot * VamanaNode::rabitq_entry_size();
-      std::memcpy(entry,
-                  nodes + slot * VamanaNode::total_size() + VamanaNode::offset_rabitq_code(),
-                  VamanaNode::rabitq_entry_size());
-      f32 norm = 0.0f;
-      f32 correction = 0.0f;
-      std::memcpy(&norm, entry + gpu_search::format::rabitq_norm_offset(
-                    VamanaNode::rabitq_code_bits()), sizeof(norm));
-      std::memcpy(&correction, entry + gpu_search::format::rabitq_error_offset(
-                          VamanaNode::rabitq_code_bits()), sizeof(correction));
-      if (!std::isfinite(norm) || norm < 0.0f ||
-          !std::isfinite(correction) || correction <= 0.0f) {
-        return {false, "authoritative storage node contains an invalid RaBitQ entry"};
-      }
-    }
-    print_status("materialized GPU V4 codes from authoritative nodes (" +
-                 std::to_string(payload_bytes) + " Bytes) at remote offset " +
-                 std::to_string(remote_offset));
+  const filepath_t code_path = index_path::navigation_code_for_shard(path);
+  gpu_search::format::CodeHeader header;
+  str error;
+  if (!gpu_search::format::read_code_header(code_path, header, &error) ||
+      header.memory_node != storage_id_ ||
+      header.node_size != VamanaNode::total_size() ||
+      header.code_bytes != gpu_navigation_code_bytes_ ||
+      header.model_checksum != gpu_navigation_model_checksum_ ||
+      header.entry_count != gpu_static_node_count_ ||
+      header.remote_offset != remote_offset ||
+      header.payload_bytes != payload_bytes) {
+    return {false, error.empty() ? "incompatible GPU PQ sidecar " + code_path.string()
+                                 : error};
   }
+  std::ifstream codes{code_path, std::ios::binary};
+  codes.seekg(static_cast<std::streamoff>(sizeof(header)));
+  constexpr size_t chunk_bytes = 64ull << 20;
+  u64 checksum = gpu_search::format::checksum64_initial();
+  for (u64 offset = 0; offset < header.payload_bytes; offset += chunk_bytes) {
+    const size_t bytes = static_cast<size_t>(
+      std::min<u64>(chunk_bytes, header.payload_bytes - offset));
+    byte_t* destination = index_buffer_.get_full_buffer() + header.remote_offset + offset;
+    codes.read(reinterpret_cast<char*>(destination), static_cast<std::streamsize>(bytes));
+    if (static_cast<size_t>(codes.gcount()) != bytes) {
+      return {false, "short read from " + code_path.string()};
+    }
+    checksum = gpu_search::format::checksum64_update(checksum, destination, bytes);
+  }
+  if (checksum != header.payload_checksum) {
+    return {false, "GPU PQ code sidecar payload checksum mismatch: " + code_path.string()};
+  }
+  print_status("loaded GPU PQ codes (" + std::to_string(header.payload_bytes) +
+               " Bytes) at remote offset " + std::to_string(header.remote_offset));
 
   const u64 allocation_stride = static_cast<u64>(VamanaNode::allocation_size());
   const u64 region_end = remote_offset + payload_bytes;
   *reinterpret_cast<u64*>(index_buffer_.get_full_buffer()) = gpu_static_dynamic_base_ +
     gpu_search::format::align_up(region_end - gpu_static_dynamic_base_, allocation_stride);
-
-  return {true, ""};
-}
-
-std::pair<bool, str> MemoryNode::store_index_file(const str& path) {
-  const size_t index_size = *reinterpret_cast<u64*>(index_buffer_.get_full_buffer());
-  print_status("storing index (" + std::to_string(index_size) + " Bytes) to " + path);
-
-  create_directory(filepath_t{path}.parent_path());
-  std::ofstream output_s{path, std::ios::out | std::ios::binary};
-
-  auto t_store = timing_.create_enroll("store_index_buffer");
-  t_store->start();
-  if (!output_s.write(reinterpret_cast<char*>(index_buffer_.get_full_buffer()), index_size)) {
-    t_store->stop();
-    return {false, "write failed for " + path};
-  }
-  t_store->stop();
-  output_s.close();
 
   return {true, ""};
 }
@@ -494,7 +373,8 @@ size_t MemoryNode::align_up(size_t value, size_t alignment) {
 distance_t MemoryNode::distance_to_stored_vector(const span<const element_t> query,
                                                 const byte_t* stored,
                                                 const Configuration& config) const {
-  return typed_distance_float_query(query, stored, VamanaNode::vector_dtype(), config.dim, ip_distance_);
+  return typed_l2_distance_float_query(
+    query, stored, VamanaNode::vector_dtype(), config.dim);
 }
 
 distance_t MemoryNode::distance_between_vectors(const byte_t* lhs,
@@ -502,8 +382,7 @@ distance_t MemoryNode::distance_between_vectors(const byte_t* lhs,
                                                 const byte_t* rhs,
                                                 VectorDType rhs_dtype,
                                                 const Configuration& config) const {
-  return ip_distance_ ? typed_ip_distance(lhs, lhs_dtype, rhs, rhs_dtype, config.dim)
-                      : typed_l2_distance(lhs, lhs_dtype, rhs, rhs_dtype, config.dim);
+  return typed_l2_distance(lhs, lhs_dtype, rhs, rhs_dtype, config.dim);
 }
 
 bool MemoryNode::local_shard(u32 shard_id) const { return shard_id == storage_id_; }
@@ -523,172 +402,4 @@ void MemoryNode::insert_into_beam(vec<BeamEntry>& beam, const RemotePtr& rptr, d
   if (beam.size() > max_beam_width) {
     beam.resize(max_beam_width);
   }
-}
-
-void MemoryNode::route_queries(i32 max_cqes) {
-  print_status("route queries");
-  size_t num_routings = 0;
-
-  // receive routing message size
-  size_t message_size;
-  {
-    LocalMemoryRegion region{context_, &message_size, sizeof(message_size)};
-    cm_.initiator_qp->post_receive(region);
-    context_.receive();
-
-    std::cerr << "routing message size: " << message_size << " B\n";
-  }
-
-  const size_t buffer_entries = num_clients_ * query_router::LIMIT_PER_CN * (num_clients_ - 1) * 2;
-
-  HugePage<byte_t> routing_buffer(buffer_entries * message_size);
-  routing_buffer.touch_memory();
-
-  LocalMemoryRegion lmr{
-    context_, routing_buffer.get_full_buffer(), routing_buffer.buffer_size};  // register memory region
-
-  vec<idx_t> freelist;  // offsets
-  freelist.reserve(buffer_entries);
-
-  for (idx_t i = 0; i < buffer_entries; ++i) {
-    freelist.push_back(i * message_size);
-  }
-
-  constexpr u32 termination_signal_mn = static_cast<u32>(-1);
-  constexpr u32 termination_signal_cn = static_cast<u32>(-2);
-  u32 received_termination_signals = 0;
-
-  vec<ibv_wc> recv_wcs(max_cqes);
-  vec<ibv_wc> send_wcs(max_cqes);
-
-  i32 posted_sends = 0;
-  i32 posted_recvs = 0;
-
-  cm_.synchronize();  // synchronize with CNs
-
-  const auto post_receive = [&](u32 client) {
-    lib_assert(!freelist.empty(), "empty freelist");
-    const idx_t offset = freelist.back();
-    freelist.pop_back();
-
-    lib_assert(posted_recvs < max_cqes, "?-?-?(3)");
-
-    const u64 wr_id = encode_64bit(client, offset);
-    cm_.client_qps[client]->post_receive(lmr, message_size, wr_id, offset);
-    ++posted_recvs;
-  };
-
-  const auto poll_send_cq = [&]() {
-    Context::poll_send_cq(send_wcs.data(), max_cqes, context_.get_send_cq(), [&](u64 wr_id) {
-      const auto [_, offset] = decode_64bit(wr_id);
-      freelist.push_back(offset);
-      --posted_sends;
-    });
-  };
-
-  // post initial receives
-  for (u32 client = 0; client < num_clients_; ++client) {
-    post_receive(client);
-  }
-
-  while (received_termination_signals < num_clients_) {
-    // poll for receive completion events: route query
-    const u32 num_received = context_.poll_recv_cq(recv_wcs.data(), max_cqes);
-    posted_recvs -= static_cast<i32>(num_received);
-
-    for (u32 i = 0; i < num_received; ++i) {
-      const auto [client, offset] = decode_64bit(recv_wcs[i].wr_id);
-      const u32 destination = *reinterpret_cast<u32*>(routing_buffer.get_full_buffer() + offset);
-
-      if (destination == termination_signal_mn) {
-        std::cerr << "received termination signal from CN" << client << std::endl;
-        ++received_termination_signals;
-
-        for (idx_t cn_id = 0; cn_id < num_clients_; ++cn_id) {
-          if (client != cn_id) {
-            lib_assert(!freelist.empty(), "empty freelist");
-            const idx_t offset_term = freelist.back();
-            freelist.pop_back();
-            *reinterpret_cast<u32*>(routing_buffer.get_full_buffer() + offset_term) = termination_signal_cn;
-
-            lib_assert(posted_sends < max_cqes, "?-?-?(1)");
-
-            cm_.client_qps[cn_id]->post_send_with_id(
-              lmr, message_size, IBV_WR_SEND, encode_64bit(cn_id, offset_term), true, nullptr, 0, offset_term);
-            ++posted_sends;
-            std::cerr << " send termination message to CN" << cn_id << std::endl;
-          }
-        }
-
-        freelist.push_back(offset);
-
-      } else {
-        // std::cerr << "route query " << *reinterpret_cast<node_t*>(routing_buffer.data() + offset + sizeof(u32))
-        //           << " from CN" << client << " to CN" << destination << std::endl;
-        lib_assert(destination < num_clients_, "invalid route " + std::to_string(destination));
-        lib_assert(client != destination, "invalid route (client == destination)");
-
-        // possibly unable to send, because receiver side hasn't taken the request yet
-        do {
-          poll_send_cq();
-        } while (posted_sends >= max_cqes);
-
-        lib_assert(posted_sends < max_cqes, "too many posts...");  // TODO: remove
-        cm_.client_qps[destination]->post_send_with_id(
-          lmr, message_size, IBV_WR_SEND, encode_64bit(destination, offset), true, nullptr, 0, offset);
-        ++posted_sends;
-        ++num_routings;
-
-        lib_assert(posted_recvs < max_cqes, "too many recv posts...");  // TODO: remove
-        post_receive(client);
-      }
-    }
-
-    poll_send_cq();  // poll for send completion events and push offset(s) back to freelist
-  }
-
-  // poll remaining send completion events
-  while (posted_sends > 0) {
-    poll_send_cq();
-  }
-
-  lib_assert(posted_recvs == 0, "uncompleted posted receives");
-  lib_assert(posted_sends == 0, "uncompleted posted sends");
-  print_status("received all termination messages");
-
-  // finally, send termination message to all CNs
-  {
-    const idx_t offset = freelist.back();
-    freelist.pop_back();
-    *reinterpret_cast<u32*>(routing_buffer.get_full_buffer() + offset) = termination_signal_mn;
-
-    for (idx_t cn_id = 0; cn_id < num_clients_; ++cn_id) {
-      std::cerr << "send final termination messages to CN" << cn_id << std::endl;
-      for (idx_t b = 0; b < query_router::INITIAL_RECVS; ++b) {
-        lib_assert(posted_sends < max_cqes, "?-?-?(2)");
-        cm_.client_qps[cn_id]->post_send(lmr, message_size, IBV_WR_SEND, true, nullptr, 0, offset);
-      }
-    }
-
-    context_.poll_send_cq_until_completion(num_clients_ * query_router::INITIAL_RECVS);
-    freelist.push_back(offset);
-  }
-
-  print_status("done with routing (num routings: " + std::to_string(num_routings) + ')');
-  lib_assert(freelist.size() == buffer_entries, "unfreed messages in buffer");
-}
-
-void MemoryNode::idle() {
-  print_status("idle: queries");
-
-  // dummy region
-  bool done;
-  LocalMemoryRegion region{context_, &done, sizeof(bool)};
-
-  for (const QP& qp : cm_.client_qps) {
-    qp->post_receive(region);
-  }
-
-  // wait
-  context_.receive(num_clients_);
 }

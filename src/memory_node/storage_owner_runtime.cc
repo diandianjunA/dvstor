@@ -80,9 +80,6 @@ void MemoryNode::setup_insert_runtime(const Configuration& config) {
 }
 
 void MemoryNode::start_storage_owner_insert_workers(const Configuration& config) {
-  if (!use_storage_owner_insert_) {
-    return;
-  }
   print_status("storage-owner peer RDMA read credits per peer: " +
                std::to_string(peer_rdma_read_credit_limit()) +
                " per QP: " + std::to_string(peer_rdma_read_credit_limit_per_qp()) +
@@ -96,8 +93,7 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
                " prune_max_candidates=" + std::to_string(config.storage_owner_prune_max_candidates) +
                " update_mode=" + config.storage_owner_update_mode);
   const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
-  const u32 coroutines_per_worker = std::max<u32>(1, config.insert_coroutines == 0 ? config.num_coroutines
-                                                                                    : config.insert_coroutines);
+  const u32 coroutines_per_worker = std::max<u32>(1, config.storage_owner_coroutines);
   const size_t snapshot_bytes = memory_node_detail::storage_owner_snapshot_bytes();
   const size_t snapshot_stride = memory_node_detail::storage_owner_snapshot_stride();
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());

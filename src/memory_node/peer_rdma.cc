@@ -3,7 +3,7 @@
 #include <algorithm>
 
 void MemoryNode::setup_storage_peers(Configuration& config) {
-  if (!use_storage_owner_insert_ || num_storage_nodes_ <= 1) {
+  if (num_storage_nodes_ <= 1) {
     return;
   }
 
@@ -17,7 +17,8 @@ void MemoryNode::setup_storage_peers(Configuration& config) {
   peer_context_ = std::make_unique<Context>(*peer_config_);
   peer_context_->bind_to_port(self_endpoint.port);
 
-  peer_qps_per_peer_ = std::max<u32>(1, std::min<u32>(MAX_QPS, std::max<u32>(1, num_compute_threads_)));
+  peer_qps_per_peer_ = std::max<u32>(
+    1, std::min<u32>(kMaxPeerQps, std::max<u32>(1, num_compute_threads_)));
   peer_qps_.resize(num_storage_nodes_);
   peer_qp_send_mutexes_.resize(num_storage_nodes_);
   peer_remote_tokens_.resize(num_storage_nodes_);

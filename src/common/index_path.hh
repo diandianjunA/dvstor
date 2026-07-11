@@ -28,11 +28,6 @@ inline filepath_t shard_file(const filepath_t& prefix, size_t node_ordinal, size
                     ".dat");
 }
 
-inline filepath_t rabitq_cache_file(const filepath_t& prefix, size_t node_ordinal, size_t num_nodes) {
-  return filepath_t(prefix.string() + "_node" + std::to_string(node_ordinal) + "_of" +
-                    std::to_string(num_nodes) + ".rabitq12");
-}
-
 inline filepath_t owner_idmap_file(const filepath_t& prefix, size_t node_ordinal, size_t num_nodes) {
   return filepath_t(prefix.string() + "_node" + std::to_string(node_ordinal) + "_of" +
                     std::to_string(num_nodes) + ".idmap");
@@ -42,18 +37,20 @@ inline filepath_t anchor_file(const filepath_t& prefix) {
   return filepath_t(prefix.string() + ".anchors");
 }
 
-inline filepath_t gpu_tiered_file(const filepath_t& prefix) {
-  return filepath_t(prefix.string() + ".gpu.idx");
+inline filepath_t navigation_model_file(const filepath_t& prefix) {
+  return filepath_t(prefix.string() + ".pq16");
 }
 
-inline filepath_t gpu_code_file(const filepath_t& prefix, size_t node_ordinal, size_t num_nodes) {
+inline filepath_t navigation_code_file(const filepath_t& prefix,
+                                       size_t node_ordinal,
+                                       size_t num_nodes) {
   return filepath_t(prefix.string() + "_node" + std::to_string(node_ordinal) + "_of" +
-                    std::to_string(num_nodes) + ".gpu.codes");
+                    std::to_string(num_nodes) + ".pq16.codes");
 }
 
-inline filepath_t gpu_code_for_shard(const filepath_t& shard_file_path) {
+inline filepath_t navigation_code_for_shard(const filepath_t& shard_file_path) {
   filepath_t result = shard_file_path;
-  result.replace_extension(".gpu.codes");
+  result.replace_extension(".pq16.codes");
   return result;
 }
 

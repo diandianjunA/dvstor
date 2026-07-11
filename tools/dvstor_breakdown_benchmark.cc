@@ -5,7 +5,6 @@
 #include <unistd.h>
 
 #include "common/configuration.hh"
-#include "common/distance.hh"
 #include "service/compute_service.hh"
 #include "tools/breakdown_benchmark/args.hh"
 #include "tools/breakdown_benchmark/workload.hh"
@@ -34,13 +33,8 @@ int main(int argc, char** argv) {
   configuration::IndexConfiguration config(static_cast<int>(service_argv.size()), service_argv.data());
 
   try {
-    if (config.ip_distance) {
-      ComputeService<IPDistance> service(config, false);
-      (void)run_benchmark(service, args);
-    } else {
-      ComputeService<L2Distance> service(config, false);
-      (void)run_benchmark(service, args);
-    }
+    ComputeService service(config);
+    (void)run_benchmark(service, args);
   } catch (const std::exception& e) {
     std::cerr << "breakdown benchmark failed: " << e.what() << std::endl;
     return EXIT_FAILURE;

@@ -28,8 +28,7 @@
 #include "common/distance.hh"
 #include "common/timing.hh"
 #include "coroutine.hh"
-#include "http/service_types.hh"
-#include "memory_node/command_protocol.hh"
+#include "memory_node/startup_protocol.hh"
 #include "memory_node/storage_owner_state.hh"
 #include "service/index_metadata.hh"
 #include "service/storage_owner_protocol.hh"
@@ -37,25 +36,10 @@
 #include "vamana/vamana_node.hh"
 
 /**
- *  Memory layout:
- *  -----------------------------
- *    buffer: [ free-ptr(8) | entry-ptr(8) | node_a | node_b | ... ]
- *  -----------------------------
- *  Node layout: [
- *     header: 8B                           | ... | ... | is_entry_node(1b) | ... | new_lvl_lock(1b) | ... | lock(1b) |
- *                                                  ^--------- 1B ---------^ ^--------- 1B ---------^ ^----- 1B -----^
- *     meta: 2 * 4B                         | uid(4) | level(4) |
- *     components: d * 4B                   | d_1(4) | ... | d_d(4) |
- *     base-layer: 4B + M_max_0 * 8B        | #neighbors(4) | l_0_1(8) | ... | l_0_M(8) |
- *     upper layer(s) l * (4B + M_max * 8B) | ... |                                        <- only if node's level > 0
- *   ]
- */
-
-/**
- * @brief Establishes a connection to all involved compute nodes.
- *        Allocates a huge memory block and forwards access tokens.
- *        Creates a QP per compute thread and connects them.
- *        Waits until a termination signal is received.
+ * Owns one static vector/compact-graph shard, its PQ navigation-code stream,
+ * and the mutable storage-owner region used by online updates. Compute nodes
+ * access these regions directly; storage workers only execute update and
+ * maintenance protocols.
  */
 class MemoryNode {
   using Configuration = configuration::IndexConfiguration;
@@ -130,9 +114,8 @@ private:
                                                  const u32 part,
                                                  const u32 total);
   void allocate_memory();
-  bool handle_command();
+  void wait_for_start_signal();
   std::pair<bool, str> load_index_file(const str& path);
-  std::pair<bool, str> store_index_file(const str& path);
 
   // Peer RDMA transport
   void setup_storage_peers(Configuration& config);
@@ -331,7 +314,6 @@ private:
   void write_global_medoid(const RemotePtr& medoid);
   bool try_set_global_medoid(const RemotePtr& expected, const RemotePtr& desired, RemotePtr& observed);
   bool read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot);
-  vec<RemotePtr> read_neighbor_list_aos(RemotePtr rptr);
   vec<RemotePtr> read_neighbor_list(RemotePtr rptr);
   auto async_read_node_snapshot(RemotePtr rptr, StorageOwnerThread& thread);
   auto async_read_node_snapshots(const vec<RemotePtr>& rptrs,
@@ -339,7 +321,7 @@ private:
                                  StorageOwnerThread& thread);
   vec<NodeSnapshot> read_node_snapshots_batched(const vec<RemotePtr>& rptrs, const Configuration& config);
   auto async_read_neighbor_list(RemotePtr rptr, StorageOwnerThread& thread);
-  void write_hot_graph_entry(RemotePtr rptr, u32 id, const vec<RemotePtr>& neighbors);
+  void write_hot_graph_entry(RemotePtr rptr, const vec<RemotePtr>& neighbors);
   void write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neighbors);
   void write_new_node(RemotePtr rptr,
                       node_t id,
@@ -389,7 +371,7 @@ private:
                                   bool enqueue_maintenance = true);
 
   // Misc helpers
-  static size_t align_up(size_t value, size_t alignment = CACHELINE_SIZE);
+  static size_t align_up(size_t value, size_t alignment = kCacheLineBytes);
   distance_t distance_to_stored_vector(const span<const element_t> query,
                                         const byte_t* stored,
                                         const Configuration& config) const;
@@ -402,8 +384,6 @@ private:
   byte_t* local_node_ptr(const RemotePtr& rptr);
   const byte_t* local_node_ptr(const RemotePtr& rptr) const;
   static void insert_into_beam(vec<BeamEntry>& beam, const RemotePtr& rptr, distance_t dist, u32 max_beam_width);
-  void route_queries(i32 max_cqes);
-  void idle();
 private:
   Context context_;
   ServerConnectionManager cm_;
@@ -411,16 +391,14 @@ private:
 
   const u32 num_clients_;
   u32 num_compute_threads_{};
-  bool gpu_persistent_{};
   bool gpu_stream_layout_{};
   u64 gpu_static_node_count_{};
   u64 gpu_static_dynamic_base_{};
-  u32 qp_pool_size_{1};
+  u32 gpu_navigation_code_bytes_{};
+  u64 gpu_navigation_model_checksum_{};
   const u32 storage_id_;
   const u32 num_storage_nodes_;
-  const bool use_storage_owner_insert_;
   const u32 storage_owner_peer_rdma_tokens_;
-  const bool ip_distance_;
 
   HugePage<byte_t> index_buffer_;
   MemoryRegion index_region_;

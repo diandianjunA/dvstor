@@ -14,38 +14,22 @@ struct Aggregate {
   u64 total_queue_wait_ns{};
   u64 total_service_ns{};
   u64 total_end_to_end_ns{};
-  u64 total_rdma_wait_ns{};
-  u64 total_gpu_kernel_ns{};
-  bool device_utilization_observed{};
   bool fine_grained_breakdown_observed{};
-  std::vector<u64> end_to_end_latencies_ns{};
-  std::vector<u64> service_latencies_ns{};
+  std::vector<u64> end_to_end_latencies_ns;
+  std::vector<u64> service_latencies_ns;
   std::array<u64, kCategoryCount> category_ns{};
   std::array<u64, kSubcategoryCount> subcategory_ns{};
-  ThreadCounterDelta counters{};
-  u64 lock_attempts{};
-  u64 lock_retries{};
-  u64 cas_failures{};
-
-  [[nodiscard]] u64 measured_total_ns() const {
-    u64 total = 0;
-    for (const u64 value : category_ns) {
-      total += value;
-    }
-    return total;
-  }
+  SampleCounters counters{};
 
   [[nodiscard]] u64 cpu_other_ns() const {
     u64 explicit_cpu = 0;
-    for (size_t i = 0; i < subcategory_ns.size(); ++i) {
-      const auto sub = static_cast<Subcategory>(i);
-      if (parent_category(sub) == Category::cpu) {
-        explicit_cpu += subcategory_ns[i];
+    for (size_t index = 0; index < subcategory_ns.size(); ++index) {
+      if (parent_category(static_cast<Subcategory>(index)) == Category::cpu) {
+        explicit_cpu += subcategory_ns[index];
       }
     }
-    const u64 cpu_total = total_service_ns > (category_ns[1] + category_ns[2] + category_ns[3])
-                            ? total_service_ns - (category_ns[1] + category_ns[2] + category_ns[3])
-                            : 0;
+    const u64 rdma = category_ns[static_cast<size_t>(Category::rdma)];
+    const u64 cpu_total = total_service_ns > rdma ? total_service_ns - rdma : 0;
     return cpu_total > explicit_cpu ? cpu_total - explicit_cpu : 0;
   }
 };
@@ -59,124 +43,42 @@ struct Report {
 };
 
 inline void add_sample(Aggregate& aggregate, const Sample& sample) {
-  if (!sample.finished_flag) {
-    return;
-  }
-
+  if (!sample.finished_flag) return;
   aggregate.operation = sample.operation;
   ++aggregate.count;
   aggregate.total_queue_wait_ns += sample.queue_wait_ns;
   aggregate.total_service_ns += sample.service_ns;
   aggregate.total_end_to_end_ns += sample.end_to_end_ns;
-  aggregate.fine_grained_breakdown_observed = aggregate.fine_grained_breakdown_observed ||
-    sample.collects_breakdown();
   aggregate.end_to_end_latencies_ns.push_back(sample.end_to_end_ns);
   aggregate.service_latencies_ns.push_back(sample.service_ns);
-  if (!sample.collects_breakdown()) {
-    return;
+  aggregate.fine_grained_breakdown_observed =
+    aggregate.fine_grained_breakdown_observed || sample.collects_breakdown();
+  if (!sample.collects_breakdown()) return;
+  for (size_t index = 0; index < aggregate.category_ns.size(); ++index) {
+    aggregate.category_ns[index] += sample.category_ns[index];
   }
-
-  aggregate.total_rdma_wait_ns += sample.rdma_wait_ns;
-  aggregate.total_gpu_kernel_ns += sample.gpu_kernel_ns;
-  aggregate.device_utilization_observed = aggregate.device_utilization_observed ||
-    sample.device_utilization_observed;
-  for (size_t i = 0; i < aggregate.category_ns.size(); ++i) {
-    aggregate.category_ns[i] += sample.category_ns[i];
+  for (size_t index = 0; index < aggregate.subcategory_ns.size(); ++index) {
+    aggregate.subcategory_ns[index] += sample.subcategory_ns[index];
   }
-  for (size_t i = 0; i < aggregate.subcategory_ns.size(); ++i) {
-    aggregate.subcategory_ns[i] += sample.subcategory_ns[i];
-  }
-
-  const ThreadCounterDelta delta = sample.counters();
-  aggregate.counters.rdma_read_bytes += delta.rdma_read_bytes;
-  aggregate.counters.rdma_write_bytes += delta.rdma_write_bytes;
-  aggregate.counters.rdma_read_ops += delta.rdma_read_ops;
-  aggregate.counters.rdma_write_ops += delta.rdma_write_ops;
-  aggregate.counters.neighbor_rdma_bytes += delta.neighbor_rdma_bytes;
-  aggregate.counters.vector_rdma_bytes += delta.vector_rdma_bytes;
-  aggregate.counters.neighbor_rdma_read_ops += delta.neighbor_rdma_read_ops;
-  aggregate.counters.vector_rdma_read_ops += delta.vector_rdma_read_ops;
-  aggregate.counters.vector_rdma_batch_calls += delta.vector_rdma_batch_calls;
-  aggregate.counters.vector_rdma_cqes += delta.vector_rdma_cqes;
-  aggregate.counters.vector_rdma_active_nodes += delta.vector_rdma_active_nodes;
-  aggregate.counters.vector_rdma_active_qps += delta.vector_rdma_active_qps;
-  aggregate.counters.vector_rdma_chain_wrs += delta.vector_rdma_chain_wrs;
-  aggregate.counters.vector_rdma_max_chain_wrs = std::max(
-    aggregate.counters.vector_rdma_max_chain_wrs, delta.vector_rdma_max_chain_wrs);
-  aggregate.counters.vector_rdma_qp_high_water_wrs = std::max(
-    aggregate.counters.vector_rdma_qp_high_water_wrs,
-    delta.vector_rdma_qp_high_water_wrs);
-  aggregate.counters.vector_rdma_credit_waits += delta.vector_rdma_credit_waits;
-  aggregate.counters.vector_rdma_credit_wait_ns += delta.vector_rdma_credit_wait_ns;
-  aggregate.counters.vector_rdma_completion_token_waits +=
-    delta.vector_rdma_completion_token_waits;
-  aggregate.counters.vector_rdma_post_send_calls += delta.vector_rdma_post_send_calls;
-  aggregate.counters.vector_rdma_post_send_retries += delta.vector_rdma_post_send_retries;
-  aggregate.counters.vector_rdma_post_send_errors += delta.vector_rdma_post_send_errors;
-  aggregate.counters.h2d_bytes += delta.h2d_bytes;
-  aggregate.counters.d2h_bytes += delta.d2h_bytes;
-  aggregate.counters.l2_kernels += delta.l2_kernels;
-  aggregate.counters.prune_kernels += delta.prune_kernels;
-  aggregate.counters.exact_reranks += delta.exact_reranks;
-  aggregate.counters.rabitq_l0_candidates += delta.rabitq_l0_candidates;
-  aggregate.counters.rabitq_cache_misses += delta.rabitq_cache_misses;
-  aggregate.counters.rabitq_l1_candidates += delta.rabitq_l1_candidates;
-  aggregate.counters.rabitq_l2_candidates += delta.rabitq_l2_candidates;
-  aggregate.counters.rabitq_forced_widen += delta.rabitq_forced_widen;
-  aggregate.counters.rabitq_audit_expansions += delta.rabitq_audit_expansions;
-  aggregate.counters.rabitq_audit_candidates += delta.rabitq_audit_candidates;
-  aggregate.counters.credit_rounds += delta.credit_rounds;
-  aggregate.counters.credit_expansions_issued += delta.credit_expansions_issued;
-  aggregate.counters.credit_precommit_expansions += delta.credit_precommit_expansions;
-  aggregate.counters.credit_postcommit_expansions += delta.credit_postcommit_expansions;
-  aggregate.counters.credit_grow_events += delta.credit_grow_events;
-  aggregate.counters.credit_shrink_events += delta.credit_shrink_events;
-  aggregate.counters.credit_credit_stalls += delta.credit_credit_stalls;
-  aggregate.counters.credit_no_progress_rounds += delta.credit_no_progress_rounds;
-  aggregate.counters.credit_underfilled_rounds += delta.credit_underfilled_rounds;
-  aggregate.counters.credit_overfilled_rounds += delta.credit_overfilled_rounds;
-  aggregate.counters.credit_cost_guard_events += delta.credit_cost_guard_events;
-  aggregate.counters.credit_cost_growth_blocked += delta.credit_cost_growth_blocked;
-  aggregate.counters.credit_cost_baseline_samples += delta.credit_cost_baseline_samples;
-  aggregate.counters.visited_nodes += delta.visited_nodes;
-  aggregate.counters.visited_neighborlists += delta.visited_neighborlists;
-  aggregate.counters.remote_allocations += delta.remote_allocations;
-  aggregate.counters.overflow_prunes += delta.overflow_prunes;
-  aggregate.counters.overflow_prune_candidates += delta.overflow_prune_candidates;
-  aggregate.counters.overflow_prune_max_candidates =
-    std::max(aggregate.counters.overflow_prune_max_candidates, delta.overflow_prune_max_candidates);
-  aggregate.counters.overflow_prune_max_candidates =
-    std::max(aggregate.counters.overflow_prune_max_candidates, sample.overflow_prune_max_candidates);
-  aggregate.counters.overflow_prune_pair_checks_upper_bound += delta.overflow_prune_pair_checks_upper_bound;
-  aggregate.counters.overflow_prune_global_load_bytes_upper_bound +=
-    delta.overflow_prune_global_load_bytes_upper_bound;
-  aggregate.counters.overflow_prune_kernel_blocks += delta.overflow_prune_kernel_blocks;
-  aggregate.counters.overflow_prune_kernel_threads += delta.overflow_prune_kernel_threads;
-  aggregate.counters.overflow_prune_max_kernel_threads =
-    std::max(aggregate.counters.overflow_prune_max_kernel_threads, delta.overflow_prune_max_kernel_threads);
-  aggregate.counters.overflow_prune_max_kernel_threads =
-    std::max(aggregate.counters.overflow_prune_max_kernel_threads, sample.overflow_prune_max_kernel_threads);
-  aggregate.counters.query_rdma_to_staging_bytes += delta.query_rdma_to_staging_bytes;
-  aggregate.counters.query_host_staging_fallback_bytes += delta.query_host_staging_fallback_bytes;
-  aggregate.counters.storage_owner_anchor_hints += delta.storage_owner_anchor_hints;
-  aggregate.counters.storage_owner_anchor_valid_hints += delta.storage_owner_anchor_valid_hints;
-  aggregate.counters.storage_owner_anchor_expansions += delta.storage_owner_anchor_expansions;
+  const SampleCounters counters = sample.counters();
+  aggregate.counters.storage_owner_anchor_hints += counters.storage_owner_anchor_hints;
+  aggregate.counters.storage_owner_anchor_valid_hints +=
+    counters.storage_owner_anchor_valid_hints;
+  aggregate.counters.storage_owner_anchor_expansions +=
+    counters.storage_owner_anchor_expansions;
   aggregate.counters.storage_owner_anchor_remote_expansions +=
-    delta.storage_owner_anchor_remote_expansions;
-  aggregate.lock_attempts += sample.lock_attempts;
-  aggregate.lock_retries += sample.lock_retries;
-  aggregate.cas_failures += sample.cas_failures;
+    counters.storage_owner_anchor_remote_expansions;
 }
 
-inline double ns_to_ms(const u64 ns) { return static_cast<double>(ns) / 1'000'000.0; }
+inline double ns_to_ms(u64 nanoseconds) {
+  return static_cast<double>(nanoseconds) / 1'000'000.0;
+}
 
-inline u64 percentile_ns(std::vector<u64> values, const double percentile) {
-  if (values.empty()) {
-    return 0;
-  }
+inline u64 percentile_ns(std::vector<u64> values, double percentile) {
+  if (values.empty()) return 0;
   std::sort(values.begin(), values.end());
-  const double idx = percentile * static_cast<double>(values.size() - 1);
-  return values[static_cast<size_t>(idx)];
+  const double index = percentile * static_cast<double>(values.size() - 1);
+  return values[static_cast<size_t>(index)];
 }
 
 }  // namespace service::breakdown

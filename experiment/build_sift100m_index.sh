@@ -1,25 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$SCRIPT_DIR/sift100m_common.sh"
+source "$SCRIPT_DIR/common.sh"
 
-BUILD_PROFILE="${1:-${BUILD_PROFILE:-}}"
-if [[ -n "$BUILD_PROFILE" ]]; then
-  PROFILE_FILE="$SCRIPT_DIR/profiles/${BUILD_PROFILE}.env"
-  if [[ ! -f "$PROFILE_FILE" ]]; then
-    echo "unknown build profile: $BUILD_PROFILE" >&2
-    exit 1
-  fi
-  source "$PROFILE_FILE"
-fi
+PROFILE="${1:-${PROFILE:-04_gpu_persistent_gpunetio}}"
+load_experiment_profile "$PROFILE"
 
-ensure_built vamana_offline_builder
-"$SCRIPT_DIR/prepare_sift100m_data.sh"
+ensure_built vamana_offline_builder vamana_pq_indexer
+"$EXPERIMENT_DIR/prepare_sift100m_data.sh"
 
 mkdir -p "$(dirname "$INDEX_PREFIX")"
 LOG_FILE="${BUILD_LOG:-$LOG_DIR/build_${PARTITION_STRATEGY}_$(date +%Y%m%d_%H%M%S).log}"
 
-cmd=("$BUILD_DIR/vamana_offline_builder"
+builder=("$BUILD_DIR/vamana_offline_builder"
   --data-path "$(base_bin)"
   --output-prefix "$INDEX_PREFIX"
   --memory-nodes "$SHARDS"
@@ -30,22 +24,32 @@ cmd=("$BUILD_DIR/vamana_offline_builder"
   --threads "$BUILD_THREADS"
   --max-vectors "$MAX_VECTORS"
   --vector-data-type "$VECTOR_DATA_TYPE"
-  --storage-format "$STORAGE_FORMAT"
   --partition-max-degree "${PARTITION_MAX_DEGREE:-16}"
   --partition-imbalance "${PARTITION_IMBALANCE:-1.03}"
-  --skip-sanity-check
-  --use-rabitq
-  --rabitq-cache-format "${RABITQ_CACHE_FORMAT:-budget}")
+  --anchor-count-per-shard "${ANCHORS_PER_SHARD:-4096}"
+  --skip-sanity-check)
 
-if [[ "${GPU_TIERED_INDEX:-0}" == "1" || "${GPU_TIERED_INDEX:-0}" == "true" ]]; then
-  cmd+=(--gpu-tiered-index
-        --gpu-entry-points "${GPU_ENTRY_POINTS:-256}")
-fi
+pq=("$BUILD_DIR/vamana_pq_indexer"
+  --index-prefix "$INDEX_PREFIX"
+  --subquantizers "${PQ_SUBQUANTIZERS:-16}"
+  --train-samples "${PQ_TRAIN_SAMPLES:-262144}"
+  --opq-iterations "${PQ_OPQ_ITERATIONS:-20}"
+  --pq-iterations "${PQ_ITERATIONS:-25}"
+  --chunk-vectors "${PQ_ENCODE_CHUNK_VECTORS:-32768}"
+  --entry-points "${GPU_ENTRY_POINTS:-256}"
+  --threads "$BUILD_THREADS"
+  --seed "${SEED:-1234}")
+if [[ -n "${PQ_REUSE_MODEL:-}" ]]; then pq+=(--reuse-model "$PQ_REUSE_MODEL"); fi
+if [[ "${OVERWRITE_INDEX:-0}" == "1" ]]; then pq+=(--overwrite); fi
 
-echo "[build] index prefix: $INDEX_PREFIX"
-echo "[build] partition: $PARTITION_STRATEGY shards=$SHARDS R=$R build_beam=$BUILD_BEAM dtype=$VECTOR_DATA_TYPE"
-echo "[build] distance execution: cpu-avx2"
-printf '[build] command:'; printf ' %q' "${cmd[@]}"; echo
-"${cmd[@]}" 2>&1 | tee "$LOG_FILE"
-validate_index_metadata
+{
+  echo "[build] schema-14 compact graph: $INDEX_PREFIX"
+  printf '[build] command:'; printf ' %q' "${builder[@]}"; echo
+  "${builder[@]}"
+  printf '[pq] command:'; printf ' %q' "${pq[@]}"; echo
+  "${pq[@]}"
+} 2>&1 | tee "$LOG_FILE"
+
+validate_index_metadata storage
+echo "[build] complete: $INDEX_PREFIX"
 echo "[build] log: $LOG_FILE"

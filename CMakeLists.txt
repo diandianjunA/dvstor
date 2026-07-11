@@ -2,9 +2,9 @@ cmake_minimum_required(VERSION 3.18)
 
 option(DVSTOR_STORAGE_NODE_ONLY "Build storage-node-only binary without CUDA/GPU dependencies" OFF)
 if (DVSTOR_STORAGE_NODE_ONLY)
-    project(rdma-vamana CXX)
+    project(dvstor CXX)
 else ()
-    project(rdma-vamana CXX CUDA)
+    project(dvstor CXX CUDA)
 endif ()
 
 set(CMAKE_CXX_STANDARD 20)
@@ -36,7 +36,6 @@ endif ()
 option(DVSTOR_BUILD_EXECUTABLES "Build standalone DVSTOR executables and tools" ON)
 option(DVSTOR_BUILD_TESTS "Build local DVSTOR smoke tests" ON)
 option(DVSTOR_USE_NATIVE_ARCH "Compile C++ sources with -march=native" OFF)
-option(DVSTOR_ENABLE_GPUNETIO "Build the DOCA GPUNetIO query backend when the SDK is available" ON)
 set(DVSTOR_DOCA_ROOT "/opt/mellanox/doca" CACHE PATH "DOCA SDK installation root")
 set(DVSTOR_METIS_PARTITION "AUTO" CACHE STRING "METIS graph partitioning support: AUTO, ON, or OFF")
 set_property(CACHE DVSTOR_METIS_PARTITION PROPERTY STRINGS AUTO ON OFF)
@@ -71,6 +70,7 @@ list(APPEND CMAKE_MODULE_PATH
 
 include(DvstorDependencies)
 include(DvstorTargetHelpers)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
 
 include_directories(${DVSTOR_SOURCE_ROOT}/src)
 include_directories(${DVSTOR_SOURCE_ROOT}/thirdparty)
@@ -90,11 +90,9 @@ set(DVSTOR_MEMORY_NODE_SOURCES
 )
 
 set(DVSTOR_OFFLINE_BUILDER_SOURCES
-    src/gpu_search/index_format.cc
     tools/vamana_offline/anchor_builder.cc
     tools/vamana_offline/config.cc
     tools/vamana_offline/dataset_io.cc
-    tools/vamana_offline/gpu_tiered_writer.cc
     tools/vamana_offline/graph.cc
     tools/vamana_offline/partitioning.cc
     tools/vamana_offline/progress.cc
@@ -102,10 +100,11 @@ set(DVSTOR_OFFLINE_BUILDER_SOURCES
     tools/vamana_offline/shard_writer.cc
 )
 
-set(DVSTOR_GPU_SIDECAR_CONVERTER_SOURCES
+set(DVSTOR_PQ_INDEXER_SOURCES
     src/gpu_search/index_format.cc
-    tools/vamana_offline/gpu_sidecar_converter.cc
-    tools/vamana_offline/progress.cc
+    src/gpu_search/pq_index.cc
+    src/vamana/anchor_index.cc
+    tools/vamana_offline/pq_indexer.cc
 )
 
 set(DVSTOR_BREAKDOWN_BENCHMARK_SOURCES
@@ -136,21 +135,22 @@ if (DVSTOR_STORAGE_NODE_ONLY)
         )
         target_link_metis(vamana_offline_builder)
 
-        add_vamana_metis_repartitioner_target()
-        add_vamana_bfs_repartitioner_target()
-
-        add_executable(vamana_rabitq_sidecar_converter
-            tools/vamana_rabitq_sidecar_converter.cc
+        find_package(faiss CONFIG REQUIRED PATHS /usr/local/share/faiss)
+        add_executable(vamana_pq_indexer
+            tools/vamana_pq_indexer.cc
+            ${DVSTOR_PQ_INDEXER_SOURCES}
         )
-        dvstor_target_common_includes(vamana_rabitq_sidecar_converter)
-        target_link_libraries(vamana_rabitq_sidecar_converter rdma_library)
+        dvstor_target_tool_includes(vamana_pq_indexer)
+        target_link_libraries(vamana_pq_indexer rdma_library faiss OpenMP::OpenMP_CXX)
 
-        add_executable(vamana_gpu_sidecar_converter
-            tools/vamana_gpu_sidecar_converter.cc
-            ${DVSTOR_GPU_SIDECAR_CONVERTER_SOURCES}
+        add_executable(vamana_legacy_index_converter
+            tools/vamana_legacy_index_converter.cc
+            tools/legacy_index/migrator.cc
+            ${DVSTOR_PQ_INDEXER_SOURCES}
         )
-        dvstor_target_tool_includes(vamana_gpu_sidecar_converter)
-        target_link_libraries(vamana_gpu_sidecar_converter rdma_library)
+        dvstor_target_tool_includes(vamana_legacy_index_converter)
+        target_link_libraries(vamana_legacy_index_converter
+            rdma_library faiss OpenMP::OpenMP_CXX)
 
         add_executable(generate_sift101m_recall_data
             tools/generate_sift101m_recall_data.cc
@@ -158,43 +158,40 @@ if (DVSTOR_STORAGE_NODE_ONLY)
         dvstor_target_tool_includes(generate_sift101m_recall_data)
     endif ()
 else ()
-    set(DVSTOR_HAVE_GPUNETIO OFF)
-    if (DVSTOR_ENABLE_GPUNETIO)
-        find_path(DVSTOR_DOCA_INCLUDE_DIR doca_gpunetio.h
-            HINTS "${DVSTOR_DOCA_ROOT}/include")
-        find_library(DVSTOR_DOCA_GPUNETIO_LIBRARY doca_gpunetio
-            HINTS "${DVSTOR_DOCA_ROOT}/lib/x86_64-linux-gnu")
-        find_library(DVSTOR_DOCA_VERBS_LIBRARY doca_verbs
-            HINTS "${DVSTOR_DOCA_ROOT}/lib/x86_64-linux-gnu")
-        find_library(DVSTOR_DOCA_COMMON_LIBRARY doca_common
-            HINTS "${DVSTOR_DOCA_ROOT}/lib/x86_64-linux-gnu")
-        find_library(DVSTOR_DOCA_RDMA_LIBRARY doca_rdma
-            HINTS "${DVSTOR_DOCA_ROOT}/lib/x86_64-linux-gnu")
-        find_library(DVSTOR_MLX5_LIBRARY mlx5)
-        if (DVSTOR_DOCA_INCLUDE_DIR AND
-            DVSTOR_DOCA_GPUNETIO_LIBRARY AND
-            DVSTOR_DOCA_VERBS_LIBRARY AND
-            DVSTOR_DOCA_COMMON_LIBRARY AND
-            DVSTOR_DOCA_RDMA_LIBRARY AND
-            DVSTOR_MLX5_LIBRARY)
-            set(DVSTOR_HAVE_GPUNETIO ON)
-            list(FIND CMAKE_CUDA_ARCHITECTURES 52 DVSTOR_CUDA_SM52_INDEX)
-            if (NOT DVSTOR_CUDA_SM52_INDEX EQUAL -1)
-                message(WARNING "GPUNetIO requires sm_60+; replacing cached sm_52 with sm_80")
-                set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING "CUDA architectures" FORCE)
-            endif ()
-        else ()
-            message(WARNING "DOCA GPUNetIO SDK is incomplete; building verbs_proxy/local backends only")
-        endif ()
+    find_path(DVSTOR_DOCA_INCLUDE_DIR doca_gpunetio.h
+        HINTS "${DVSTOR_DOCA_ROOT}/include")
+    find_library(DVSTOR_DOCA_GPUNETIO_LIBRARY doca_gpunetio
+        HINTS "${DVSTOR_DOCA_ROOT}/lib/x86_64-linux-gnu")
+    find_library(DVSTOR_DOCA_VERBS_LIBRARY doca_verbs
+        HINTS "${DVSTOR_DOCA_ROOT}/lib/x86_64-linux-gnu")
+    find_library(DVSTOR_DOCA_COMMON_LIBRARY doca_common
+        HINTS "${DVSTOR_DOCA_ROOT}/lib/x86_64-linux-gnu")
+    find_library(DVSTOR_DOCA_RDMA_LIBRARY doca_rdma
+        HINTS "${DVSTOR_DOCA_ROOT}/lib/x86_64-linux-gnu")
+    find_library(DVSTOR_MLX5_LIBRARY mlx5)
+    if (NOT DVSTOR_DOCA_INCLUDE_DIR OR
+        NOT DVSTOR_DOCA_GPUNETIO_LIBRARY OR
+        NOT DVSTOR_DOCA_VERBS_LIBRARY OR
+        NOT DVSTOR_DOCA_COMMON_LIBRARY OR
+        NOT DVSTOR_DOCA_RDMA_LIBRARY OR
+        NOT DVSTOR_MLX5_LIBRARY)
+        message(FATAL_ERROR
+            "The compute-node runtime requires a complete DOCA GPUNetIO installation")
+    endif ()
+    set(DVSTOR_HAVE_GPUNETIO ON)
+    list(FIND CMAKE_CUDA_ARCHITECTURES 52 DVSTOR_CUDA_SM52_INDEX)
+    if (NOT DVSTOR_CUDA_SM52_INDEX EQUAL -1)
+        message(WARNING "GPUNetIO requires sm_60+; replacing cached sm_52 with sm_80")
+        set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING "CUDA architectures" FORCE)
     endif ()
 
-    # GPU kernels library (compiled by nvcc)
-    file(GLOB_RECURSE DVSTOR_GPU_SOURCES CONFIGURE_DEPENDS
-        src/gpu/*.cu
-        src/gpu_search/*.cu)
-    if (NOT DVSTOR_HAVE_GPUNETIO)
-        list(REMOVE_ITEM DVSTOR_GPU_SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/gpunetio_query_launcher.cu")
+    # GPU-centric query engine kernels. Keep this list explicit so retired
+    # CPU-driven CUDA paths cannot silently re-enter the runtime.
+    set(DVSTOR_GPU_SOURCES
+        src/gpu_search/persistent_kernel.cu
+    )
+    if (DVSTOR_HAVE_GPUNETIO)
+        list(APPEND DVSTOR_GPU_SOURCES src/gpu/gpunetio_probe.cu)
     endif ()
     if (DVSTOR_GPU_SOURCES)
         add_library(dvstor_gpu_kernels STATIC ${DVSTOR_GPU_SOURCES})
@@ -219,18 +216,24 @@ else ()
         )
     endif ()
 
-    # Main runtime library (compiled by host compiler, C++20 with coroutines)
-    file(GLOB_RECURSE DVSTOR_RUNTIME_SOURCES CONFIGURE_DEPENDS src/*.cc)
-    list(REMOVE_ITEM DVSTOR_RUNTIME_SOURCES
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cc"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/memory_node_main.cc"
+    # Compute-node runtime. This is intentionally explicit: the dev branch has
+    # one query engine, with CPU threads limited to admission and update RPCs.
+    set(DVSTOR_RUNTIME_SOURCES
+        src/common/core_assignment.cc
+        src/common/timing.cc
+        src/gpu_search/delta_index.cc
+        src/gpu_search/navigation_bootstrapper.cc
+        src/gpu_search/index_format.cc
+        src/gpu_search/persistent_engine.cc
+        src/gpu_search/pq_index.cc
+        src/gpu_search/types.cc
+        src/service/compute_service.cc
+        src/service/index_metadata.cc
+        src/vamana/anchor_index.cc
     )
-    if (NOT DVSTOR_HAVE_GPUNETIO)
-        list(REMOVE_ITEM DVSTOR_RUNTIME_SOURCES
-            "${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/gpunetio_query_engine.cc")
-    endif ()
     if (DVSTOR_HAVE_GPUNETIO)
-        set_source_files_properties(src/gpu/gpunetio_query_engine.cc PROPERTIES
+        list(APPEND DVSTOR_RUNTIME_SOURCES src/gpu/gpunetio_transport.cc)
+        set_source_files_properties(src/gpu/gpunetio_transport.cc PROPERTIES
             COMPILE_OPTIONS "-Wno-deprecated-declarations;-Wno-pedantic")
     endif ()
 
@@ -267,8 +270,8 @@ else ()
     target_link_libraries(dvstor_memory_node rdma_library)
 
     if (DVSTOR_BUILD_EXECUTABLES)
-        add_executable(dvstor src/main.cc)
-        target_link_libraries(dvstor dvstor_runtime)
+        add_executable(dvstor_compute_node src/main.cc)
+        target_link_libraries(dvstor_compute_node dvstor_runtime)
 
         add_executable(vamana_offline_builder
             tools/vamana_offline_builder.cc
@@ -287,21 +290,22 @@ else ()
         dvstor_target_tool_includes(vamana_anchor_sidecar_builder)
         target_link_libraries(vamana_anchor_sidecar_builder rdma_library)
 
-        add_vamana_metis_repartitioner_target()
-        add_vamana_bfs_repartitioner_target()
-
-        add_executable(vamana_rabitq_sidecar_converter
-            tools/vamana_rabitq_sidecar_converter.cc
+        find_package(faiss CONFIG REQUIRED PATHS /usr/local/share/faiss)
+        add_executable(vamana_pq_indexer
+            tools/vamana_pq_indexer.cc
+            ${DVSTOR_PQ_INDEXER_SOURCES}
         )
-        dvstor_target_common_includes(vamana_rabitq_sidecar_converter)
-        target_link_libraries(vamana_rabitq_sidecar_converter rdma_library)
+        dvstor_target_tool_includes(vamana_pq_indexer)
+        target_link_libraries(vamana_pq_indexer rdma_library faiss OpenMP::OpenMP_CXX)
 
-        add_executable(vamana_gpu_sidecar_converter
-            tools/vamana_gpu_sidecar_converter.cc
-            ${DVSTOR_GPU_SIDECAR_CONVERTER_SOURCES}
+        add_executable(vamana_legacy_index_converter
+            tools/vamana_legacy_index_converter.cc
+            tools/legacy_index/migrator.cc
+            ${DVSTOR_PQ_INDEXER_SOURCES}
         )
-        dvstor_target_tool_includes(vamana_gpu_sidecar_converter)
-        target_link_libraries(vamana_gpu_sidecar_converter rdma_library)
+        dvstor_target_tool_includes(vamana_legacy_index_converter)
+        target_link_libraries(vamana_legacy_index_converter
+            rdma_library faiss OpenMP::OpenMP_CXX)
 
         add_executable(generate_sift101m_recall_data
             tools/generate_sift101m_recall_data.cc
@@ -325,6 +329,10 @@ else ()
                 ${DVSTOR_DOCA_COMMON_LIBRARY}
                 ${DVSTOR_MLX5_LIBRARY}
             )
+
+            add_executable(dvstor_gpunetio_loopback_probe tools/gpunetio_loopback_probe.cc)
+            dvstor_target_common_includes(dvstor_gpunetio_loopback_probe)
+            target_link_libraries(dvstor_gpunetio_loopback_probe dvstor_runtime)
         endif ()
 
         add_executable(dvstor_breakdown_benchmark

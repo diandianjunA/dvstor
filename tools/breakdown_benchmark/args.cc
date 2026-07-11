@@ -79,8 +79,7 @@ std::vector<std::string> build_service_argv(const std::string& service_config_pa
 
   static const std::vector<std::string> multi_keys = {"servers", "clients", "storage-peers"};
   static const std::vector<std::string> flag_keys = {
-    "initiator", "routing", "load-index", "store-index", "disable-thread-pinning", "no-recall", "ip-dist",
-    "gpudirect-rdma", "observe-device-utilization"};
+    "initiator", "disable-thread-pinning"};
   static const std::vector<std::string> benchmark_only_keys = {"insert-start-id", "write-id-base"};
 
   for (const auto& [key, value] : config) {

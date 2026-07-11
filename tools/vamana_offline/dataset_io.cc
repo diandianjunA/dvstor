@@ -31,14 +31,6 @@ float l2_float_query_to_raw(const float* query, const byte_t* rhs, VectorDType d
   return sum;
 }
 
-float ip_float_query_to_raw(const float* query, const byte_t* rhs, VectorDType dtype, u32 dim) {
-  float dot = 0.0f;
-  for (u32 i = 0; i < dim; ++i) {
-    dot += query[i] * vector_component_as_float(rhs, dtype, i);
-  }
-  return -dot;
-}
-
 }  // namespace
 
 filepath_t resolve_dataset_file(const filepath_t& input_path) {
@@ -133,23 +125,12 @@ float dataset_l2_distance(const Dataset& dataset, size_t lhs, size_t rhs) {
   return 0.0f;
 }
 
-float dataset_ip_distance(const Dataset& dataset, size_t lhs, size_t rhs) {
-  const byte_t* a = dataset.raw_vector(lhs);
-  const byte_t* b = dataset.raw_vector(rhs);
-  float dot = 0.0f;
-  for (u32 i = 0; i < dataset.dim; ++i) {
-    dot += vector_component_as_float(a, dataset.dtype, i) * vector_component_as_float(b, dataset.dtype, i);
-  }
-  return -dot;
+float dataset_distance(const Dataset& dataset, size_t lhs, size_t rhs) {
+  return dataset_l2_distance(dataset, lhs, rhs);
 }
 
-float dataset_distance(const Dataset& dataset, size_t lhs, size_t rhs, bool ip_distance) {
-  return ip_distance ? dataset_ip_distance(dataset, lhs, rhs) : dataset_l2_distance(dataset, lhs, rhs);
-}
-
-float dataset_distance_float_query(const Dataset& dataset, const float* query, size_t rhs, bool ip_distance) {
-  return ip_distance ? ip_float_query_to_raw(query, dataset.raw_vector(rhs), dataset.dtype, dataset.dim)
-                     : l2_float_query_to_raw(query, dataset.raw_vector(rhs), dataset.dtype, dataset.dim);
+float dataset_distance_float_query(const Dataset& dataset, const float* query, size_t rhs) {
+  return l2_float_query_to_raw(query, dataset.raw_vector(rhs), dataset.dtype, dataset.dim);
 }
 
 void dataset_decode_vector(const Dataset& dataset, size_t row, float* dst) {

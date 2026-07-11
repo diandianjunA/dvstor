@@ -14,22 +14,20 @@
 #include "common/types.hh"
 #include "coroutine.hh"
 #include "remote_pointer.hh"
+#include "service/storage_owner_protocol.hh"
 #include "vamana/vamana_node.hh"
 
 namespace memory_node_detail {
 
 inline size_t align_to_cacheline(size_t value) {
-  while (value % CACHELINE_SIZE != 0) {
+  while (value % kCacheLineBytes != 0) {
     ++value;
   }
   return value;
 }
 
 inline size_t storage_owner_snapshot_bytes() {
-  return VamanaNode::compact_storage()
-    ? VamanaNode::size_until_vector_end()
-    : VamanaNode::HEADER_SIZE + VamanaNode::COMPACT_META_SIZE +
-        VamanaNode::vector_bytes();
+  return VamanaNode::size_until_vector_end();
 }
 
 inline size_t storage_owner_snapshot_stride() {
@@ -47,7 +45,6 @@ struct NodeSnapshot {
   u64 header{};
   node_t id{};
   u32 generation{};
-  u8 edge_count{};
   bool deleted{};
   vec<byte_t> vector_data;
 };

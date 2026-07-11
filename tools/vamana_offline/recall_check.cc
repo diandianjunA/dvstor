@@ -65,12 +65,11 @@ size_t count_hits(VamanaGraph& graph,
                   const QuerySet& queries,
                   const GroundTruth& groundtruth,
                   u32 eval_k,
-                  u32 search_beam,
-                  bool ip_distance) {
+                  u32 search_beam) {
   size_t total_hits = 0;
   for (u32 qi = 0; qi < queries.count; ++qi) {
     const float* qvec = queries.vectors.data() + static_cast<size_t>(qi) * queries.dim;
-    const auto results = beam_search_float_query(graph, dataset, qvec, search_beam, ip_distance);
+    const auto results = beam_search_float_query(graph, dataset, qvec, search_beam);
     const u32* gt_row = groundtruth.ids.data() + static_cast<size_t>(qi) * groundtruth.topk;
     const std::unordered_set<u32> gt_set(gt_row, gt_row + eval_k);
 
@@ -105,7 +104,7 @@ void run_optional_recall_check(VamanaGraph& graph,
     }
 
     const size_t total_hits =
-        count_hits(graph, dataset, queries, groundtruth, eval_k, config.beam_width, config.ip_distance);
+        count_hits(graph, dataset, queries, groundtruth, eval_k, config.beam_width);
     const double recall = static_cast<double>(total_hits) / (static_cast<double>(queries.count) * eval_k);
     std::cerr << "recall@" << eval_k << " = " << std::fixed << std::setprecision(4) << recall
               << " (" << total_hits << "/" << (queries.count * eval_k) << ")\n";

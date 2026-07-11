@@ -3,7 +3,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
-PROFILE="${1:-${PROFILE:-00_baseline}}"
+PROFILE="${1:-${PROFILE:-04_gpu_persistent_gpunetio}}"
 load_experiment_profile "$PROFILE"
 
 ensure_built dvstor_breakdown_benchmark

@@ -36,7 +36,6 @@ int main(int argc, char** argv) {
   const auto build_start = std::chrono::steady_clock::now();
 
   // Initialize VamanaNode static storage
-  VamanaNode::disable_rabitq();
   VamanaNode::init_static_storage(dataset.dim, config.R, dataset.dtype);
 
   std::cerr << "offline distance execution: cpu-avx2\n";

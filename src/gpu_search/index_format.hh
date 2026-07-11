@@ -14,46 +14,26 @@
 
 namespace gpu_search::format {
 
-inline constexpr std::array<char, 8> kMagic{'D', 'V', 'G', 'P', 'U', 'V', '4', '\0'};
-inline constexpr std::array<char, 8> kLegacyMagic{'D', 'V', 'G', 'P', 'U', 'I', 'D', 'X'};
-inline constexpr std::array<char, 8> kCodeMagic{'D', 'V', 'G', 'P', 'U', 'C', '4', '\0'};
-inline constexpr u32 kVersion = 4;
+inline constexpr std::array<char, 8> kCodeMagic{'D', 'V', 'G', 'P', 'U', 'C', '5', '\0'};
+inline constexpr u32 kVersion = 5;
 inline constexpr u32 kEndianMarker = 0x01020304;
 inline constexpr u32 kMaxEntryPoints = 512;
 inline constexpr u32 kGraphCacheLineBytes = 512;
 inline constexpr u32 kCompactPointerBytes = 5;
 inline constexpr u64 kNodeBaseOffset = 16;
 
-inline constexpr u32 rabitq_code_bytes(u32 code_bits) {
-  return code_bits / 8;
-}
+enum class QuantizerKind : u32 {
+  opq_pq = 1,
+};
 
-inline constexpr u32 rabitq_code_storage_bytes(u32 code_bits) {
-  return (rabitq_code_bytes(code_bits) + 3u) & ~3u;
-}
-
-inline constexpr u32 rabitq_norm_offset(u32 code_bits) {
-  return rabitq_code_storage_bytes(code_bits);
-}
-
-inline constexpr u32 rabitq_error_offset(u32 code_bits) {
-  return rabitq_norm_offset(code_bits) + sizeof(f32);
-}
-
-inline constexpr u32 rabitq_entry_bytes(u32 code_bits) {
-  return (rabitq_error_offset(code_bits) + sizeof(f32) + 7u) & ~7u;
-}
-
-struct Header {
-  std::array<char, 8> magic{kMagic};
-  u32 version{kVersion};
-  u32 header_bytes{sizeof(Header)};
-  u32 endian_marker{kEndianMarker};
+struct NavigationLayout {
   u32 dim{};
   u32 graph_degree{};
   u32 vector_dtype{};
-  u32 rabitq_code_bits{};
-  u32 rabitq_entry_bytes{};
+  u32 quantizer_kind{static_cast<u32>(QuantizerKind::opq_pq)};
+  u32 pq_subquantizers{};
+  u32 pq_bits{};
+  u32 code_bytes{};
   u32 num_shards{};
   u32 graph_entry_bytes{};
   u32 graph_pointer_bytes{kCompactPointerBytes};
@@ -62,15 +42,7 @@ struct Header {
   u32 reserved0{};
   u64 num_nodes{};
   u64 base_generation{1};
-  u64 shard_regions_offset{};
-  u64 shard_regions_bytes{};
-  u64 centroid_offset{};
-  u64 centroid_bytes{};
-  u64 entry_points_offset{};
-  u64 entry_points_bytes{};
-  u64 file_bytes{};
-  u64 checksum{};
-  std::array<u64, 4> reserved{};
+  u64 model_checksum{};
 };
 
 struct ShardRegion {
@@ -96,26 +68,25 @@ struct CodeHeader {
   u32 header_bytes{sizeof(CodeHeader)};
   u32 endian_marker{kEndianMarker};
   u32 memory_node{};
-  u32 code_bits{};
-  u32 entry_bytes{};
+  u32 quantizer_kind{static_cast<u32>(QuantizerKind::opq_pq)};
+  u32 code_bytes{};
   u32 node_size{};
   u32 reserved0{};
   u64 entry_count{};
   u64 remote_offset{};
   u64 payload_bytes{};
+  u64 model_checksum{};
   u64 payload_checksum{};
   u64 header_checksum{};
   std::array<u64, 4> reserved{};
 };
 
-static_assert(sizeof(Header) == 176);
 static_assert(sizeof(ShardRegion) == 80);
-static_assert(sizeof(CodeHeader) == 112);
+static_assert(sizeof(CodeHeader) == 120);
 
 struct View {
-  Header header{};
+  NavigationLayout layout{};
   std::vector<ShardRegion> shards;
-  std::vector<f32> centroid;
   std::vector<u32> entry_points;
 };
 
@@ -129,12 +100,8 @@ u64 checksum64(const byte_t* data, size_t bytes);
 u64 checksum64_update(u64 state, const byte_t* data, size_t bytes);
 u64 checksum64_initial();
 
-bool validate_header(const Header& header, std::string* error = nullptr);
+bool validate_layout(const NavigationLayout& layout, std::string* error = nullptr);
 bool validate_view(const View& view, std::string* error = nullptr);
-bool write_file(const std::filesystem::path& path, const View& view,
-                std::string* error = nullptr);
-bool read_file(const std::filesystem::path& path, View& view,
-               std::string* error = nullptr);
 bool synthesize_distributed_view(
   const std::filesystem::path& index_prefix, View& view,
   const SynthesisOptions& options = {},

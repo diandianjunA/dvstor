@@ -83,7 +83,7 @@ bool MemoryNode::storage_owner_maintenance_enabled(const Configuration& config) 
 }
 
 void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& config) {
-  if (!use_storage_owner_insert_ || !storage_owner_maintenance_enabled(config)) {
+  if (!storage_owner_maintenance_enabled(config)) {
     return;
   }
 
@@ -633,10 +633,6 @@ vec<RemotePtr> MemoryNode::read_preserved_neighbor_list(RemotePtr rptr) {
   if (rptr.is_null()) {
     return {};
   }
-  if (!VamanaNode::compact_storage()) {
-    return read_neighbor_list(rptr);
-  }
-
   vec<byte_t> entry(VamanaNode::hot_graph_entry_size());
   const u64 hot_offset = VamanaNode::hot_graph_entry_offset(rptr);
   if (local_shard(rptr.memory_node())) {
@@ -647,42 +643,23 @@ vec<RemotePtr> MemoryNode::read_preserved_neighbor_list(RemotePtr rptr) {
     remote_read_bytes(rptr.memory_node(), hot_offset, entry.data(), entry.size(), 0);
   }
 
-  if (VamanaNode::HOT_GRAPH_FORMAT_VERSION >= 2) {
-    const u8 edge_count = entry[0];
-    if (edge_count > VamanaNode::R) {
-      return {};
-    }
-    const u16 expected = vamana::hot_graph::load_u16_le(entry.data() + 2);
-    const u16 actual = vamana::hot_graph::checksum16(entry.data(), entry.size());
-    if (expected != actual) {
-      return {};
-    }
-    vec<RemotePtr> neighbors;
-    neighbors.reserve(edge_count);
-    for (u32 i = 0; i < edge_count; ++i) {
-      RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
-        entry.data() + vamana::hot_graph::neighbor_offset(i),
-        VamanaNode::HOT_GRAPH_SHARD_BITS);
-      if (!neighbor.is_null()) {
-        neighbors.push_back(neighbor);
-      }
-    }
-    return neighbors;
-  }
-
-  vec<byte_t> decoded(VamanaNode::neighbor_read_size());
-  if (!VamanaNode::decode_hot_graph_entry(entry.data(), decoded.data())) {
+  const u8 edge_count = entry[0];
+  if (edge_count > VamanaNode::R) {
     return {};
   }
-  const u8 edge_count =
-    *reinterpret_cast<const u8*>(decoded.data() + VamanaNode::neighbor_count_offset_in_read());
-  const auto* slots = reinterpret_cast<const RemotePtr*>(
-    decoded.data() + VamanaNode::neighbor_payload_offset_in_read());
+  const u16 expected = vamana::hot_graph::load_u16_le(entry.data() + 2);
+  const u16 actual = vamana::hot_graph::checksum16(entry.data(), entry.size());
+  if (expected != actual) {
+    return {};
+  }
   vec<RemotePtr> neighbors;
   neighbors.reserve(edge_count);
-  for (u32 i = 0; i < edge_count && i < VamanaNode::R; ++i) {
-    if (!slots[i].is_null()) {
-      neighbors.push_back(slots[i]);
+  for (u32 i = 0; i < edge_count; ++i) {
+    RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
+      entry.data() + vamana::hot_graph::neighbor_offset(i),
+      VamanaNode::HOT_GRAPH_SHARD_BITS);
+    if (!neighbor.is_null()) {
+      neighbors.push_back(neighbor);
     }
   }
   return neighbors;

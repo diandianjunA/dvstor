@@ -39,23 +39,20 @@ struct NodeLockGuard {
   ~NodeLockGuard() { graph.unlock_node(node); }
 };
 
-size_t compute_medoid(const Dataset& dataset, bool ip_distance);
+size_t compute_medoid(const Dataset& dataset);
 vec<std::pair<float, u32>> beam_search(VamanaGraph& graph,
                                        const Dataset& dataset,
                                        u32 query_id,
-                                       u32 beam_width,
-                                       bool ip_distance);
+                                       u32 beam_width);
 vec<std::pair<float, u32>> beam_search_float_query(VamanaGraph& graph,
                                                    const Dataset& dataset,
                                                    const float* query,
-                                                   u32 beam_width,
-                                                   bool ip_distance);
+                                                   u32 beam_width);
 vec<u32> robust_prune(const Dataset& dataset,
                       u32 source,
                       const vec<std::pair<float, u32>>& sorted_candidates,
                       float alpha,
-                      u32 R,
-                      bool ip_distance);
+                      u32 R);
 void build_vamana_graph(VamanaGraph& graph,
                         const Dataset& dataset,
                         const VamanaBuildConfig& config);

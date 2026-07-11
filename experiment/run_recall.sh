@@ -3,7 +3,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
-PROFILE="${1:-${PROFILE:-00_baseline}}"
+PROFILE="${1:-${PROFILE:-04_gpu_persistent_gpunetio}}"
 load_experiment_profile "$PROFILE"
 
 ensure_built dvstor_breakdown_benchmark
@@ -25,7 +25,7 @@ cmd=("$BUILD_DIR/dvstor_breakdown_benchmark"
   --workload query
   --warmup-ops 0
   --measure-ops 1
-  --client-threads 1
+  --client-threads "${RECALL_CLIENT_THREADS:-$CLIENT_THREADS}"
   --query-file "$(query_bin)"
   --groundtruth-file "$(groundtruth_bin)"
   --recall-queries "$RECALL_QUERIES"

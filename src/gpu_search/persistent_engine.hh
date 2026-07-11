@@ -11,7 +11,7 @@
 #include "common/vector_dtype.hh"
 #include "gpu_search/delta_index.hh"
 #include "gpu_search/types.hh"
-#include "http/service_types.hh"
+#include "service/query_result.hh"
 
 namespace gpu_search {
 
@@ -35,7 +35,6 @@ public:
   const DeltaCoordinator& delta() const { return delta_; }
   TelemetrySnapshot telemetry() const { return telemetry_.snapshot(); }
   void reset_telemetry();
-  RemoteBackendKind backend_kind() const;
 
 private:
   struct Impl;

@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
-PROFILE="${1:-${PROFILE:-03_rabitq_expension_aware_two_stage_aldi_rdma}}"
+PROFILE="${1:-${PROFILE:-04_gpu_persistent_gpunetio}}"
 load_experiment_profile "$PROFILE"
 
 ensure_built dvstor_sift101m_long_insert_recall
