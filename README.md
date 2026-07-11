@@ -67,20 +67,43 @@ cmake --build build -j
 - `dvstor_compute_node`：GPU 查询与更新客户端；
 - `dvstor_memory_node`：存储节点；
 - `dvstor_breakdown_benchmark`：吞吐、延迟、召回率和分解统计；
-- `vamana_offline_builder`：构建 compact Vamana/Metis 图；
+- `vamana_offline_builder`：在 CPU 上构建 compact Vamana 图，并执行
+  `balanced`、`bfs` 或可选的 `metis` 分片；
 - `vamana_pq_indexer`：训练 OPQ/PQ16 并生成分片码流；
 - `vamana_legacy_index_converter`：复用旧图与分片布局进行迁移。
 
-无 GPU 的存储节点可使用：
+无 GPU 的存储节点可同时构建存储服务和 CPU 离线索引工具：
 
 ```bash
 cmake -S . -B build-storage \
   -DCMAKE_BUILD_TYPE=Release \
   -DDVSTOR_STORAGE_NODE_ONLY=ON \
-  -DDVSTOR_BUILD_EXECUTABLES=OFF \
-  -DDVSTOR_BUILD_TESTS=OFF
-cmake --build build-storage -j --target dvstor_memory_node
+  -DCMAKE_CXX_COMPILER=/usr/bin/g++-11
+cmake --build build-storage -j --target \
+  dvstor_memory_node vamana_offline_builder vamana_anchor_sidecar_builder \
+  vamana_pq_indexer vamana_legacy_index_converter
 ```
+
+存储服务本身只依赖 CPU、RDMA、Boost 和 TBB。离线工具使用 CPU Faiss、BLAS、
+LAPACK、OpenMP 和可选 METIS，但不依赖 CUDA 或 DOCA。CMake 直接链接
+`libfaiss` CPU 库，不加载可能包含 `faiss_gpu_objs` 的 Faiss CMake 导出。
+动态更新运行时使用标准 C++20 coroutine 和 `atomic_ref`，因此要求 GCC 11+
+或等价的现代 Clang。若节点只运行存储服务，可增加
+`-DDVSTOR_BUILD_OFFLINE_TOOLS=OFF`。
+
+必须使用独立的 `build-storage` 目录；不要把已经配置为 CUDA 计算节点的 `build`
+目录切换成存储模式。`DVSTOR_METIS_PARTITION=AUTO` 会先验证 METIS/GKlib 能否
+在本机真实链接；若仓库内预编译库与本机 glibc 不兼容，会先回退到系统 CPU
+METIS，没有兼容版本时才保留 `balanced/bfs` 并禁用 `metis`。需要强制 METIS
+时，安装本机 CPU 版本并设置
+`-DDVSTOR_METIS_ROOT=/path/to/metis -DDVSTOR_METIS_PARTITION=ON`。
+
+新建索引的分片由 `vamana_offline_builder --partition-strategy ...` 完成，不需要
+GPU，也不需要额外重分片可执行文件。`vamana_legacy_index_converter` 的职责是
+低成本复用旧图，因此保持旧索引的分片数与节点布局；已删除的 schema-13
+`vamana_bfs_repartitioner`/`vamana_metis_repartitioner` 依赖旧 RaBitQ 记录格式，
+不能用于 schema 14。若要改变旧索引的分片布局，应先在旧格式下完成分片，再
+执行迁移；不要把旧重分片器重新链接进新运行时。
 
 ## 生成或迁移索引
 

@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.18)
 
-option(DVSTOR_STORAGE_NODE_ONLY "Build storage-node-only binary without CUDA/GPU dependencies" OFF)
+option(DVSTOR_STORAGE_NODE_ONLY
+    "Build storage-host runtime and CPU offline tools without CUDA/GPU dependencies" OFF)
 if (DVSTOR_STORAGE_NODE_ONLY)
     project(dvstor CXX)
 else ()
@@ -11,6 +12,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_FLAGS_DEBUG "-g -fno-omit-frame-pointer -fno-inline -fsanitize=address")
+
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 11)
+    message(FATAL_ERROR
+        "DVSTOR requires GCC 11 or newer for standard C++20 coroutines and atomic_ref. "
+        "Select a newer compiler with -DCMAKE_CXX_COMPILER=/path/to/g++.")
+endif ()
 
 # Use RPATH (not RUNPATH) so that custom METIS/GKlib paths take priority
 # over system library paths at runtime.
@@ -35,8 +42,16 @@ endif ()
 
 option(DVSTOR_BUILD_EXECUTABLES "Build standalone DVSTOR executables and tools" ON)
 option(DVSTOR_BUILD_TESTS "Build local DVSTOR smoke tests" ON)
+option(DVSTOR_BUILD_OFFLINE_TOOLS
+    "Build CPU-only index construction, partitioning, conversion, and PQ tools" ON)
 option(DVSTOR_USE_NATIVE_ARCH "Compile C++ sources with -march=native" OFF)
-set(DVSTOR_DOCA_ROOT "/opt/mellanox/doca" CACHE PATH "DOCA SDK installation root")
+if (DVSTOR_STORAGE_NODE_ONLY)
+    set(Boost_NO_BOOST_CMAKE ON CACHE BOOL
+        "Use CMake's FindBoost module on CPU-only storage hosts to avoid Conda RPATH injection")
+endif ()
+if (NOT DVSTOR_STORAGE_NODE_ONLY)
+    set(DVSTOR_DOCA_ROOT "/opt/mellanox/doca" CACHE PATH "DOCA SDK installation root")
+endif ()
 set(DVSTOR_METIS_PARTITION "AUTO" CACHE STRING "METIS graph partitioning support: AUTO, ON, or OFF")
 set_property(CACHE DVSTOR_METIS_PARTITION PROPERTY STRINGS AUTO ON OFF)
 string(TOUPPER "${DVSTOR_METIS_PARTITION}" DVSTOR_METIS_PARTITION_MODE)
@@ -70,7 +85,9 @@ list(APPEND CMAKE_MODULE_PATH
 
 include(DvstorDependencies)
 include(DvstorTargetHelpers)
-find_package(OpenMP REQUIRED COMPONENTS CXX)
+if (DVSTOR_BUILD_OFFLINE_TOOLS)
+    find_package(FaissCPU REQUIRED)
+endif ()
 
 include_directories(${DVSTOR_SOURCE_ROOT}/src)
 include_directories(${DVSTOR_SOURCE_ROOT}/thirdparty)
@@ -113,7 +130,46 @@ set(DVSTOR_BREAKDOWN_BENCHMARK_SOURCES
     tools/breakdown_benchmark/workload.cc
 )
 
+function(dvstor_add_offline_tools)
+    add_executable(vamana_offline_builder
+        tools/vamana_offline_builder.cc
+        ${DVSTOR_OFFLINE_BUILDER_SOURCES}
+    )
+    dvstor_target_tool_includes(vamana_offline_builder)
+    target_link_libraries(vamana_offline_builder rdma_library)
+    target_link_metis(vamana_offline_builder)
+
+    add_executable(vamana_anchor_sidecar_builder
+        tools/vamana_anchor_sidecar_builder.cc
+        src/vamana/anchor_index.cc
+    )
+    dvstor_target_tool_includes(vamana_anchor_sidecar_builder)
+    target_link_libraries(vamana_anchor_sidecar_builder rdma_library)
+
+    add_executable(vamana_pq_indexer
+        tools/vamana_pq_indexer.cc
+        ${DVSTOR_PQ_INDEXER_SOURCES}
+    )
+    dvstor_target_tool_includes(vamana_pq_indexer)
+    target_link_libraries(vamana_pq_indexer rdma_library FaissCPU::FaissCPU)
+
+    add_executable(vamana_legacy_index_converter
+        tools/vamana_legacy_index_converter.cc
+        tools/legacy_index/migrator.cc
+        ${DVSTOR_PQ_INDEXER_SOURCES}
+    )
+    dvstor_target_tool_includes(vamana_legacy_index_converter)
+    target_link_libraries(vamana_legacy_index_converter
+        rdma_library FaissCPU::FaissCPU)
+
+    add_executable(generate_sift101m_recall_data
+        tools/generate_sift101m_recall_data.cc
+    )
+    dvstor_target_tool_includes(generate_sift101m_recall_data)
+endfunction()
+
 if (DVSTOR_STORAGE_NODE_ONLY)
+    message(STATUS "Storage-node build: CUDA and DOCA are disabled; CPU offline tools=${DVSTOR_BUILD_OFFLINE_TOOLS}")
     add_executable(dvstor_memory_node
         src/memory_node_main.cc
         ${DVSTOR_MEMORY_NODE_SOURCES}
@@ -123,39 +179,8 @@ if (DVSTOR_STORAGE_NODE_ONLY)
     )
     dvstor_target_common_includes(dvstor_memory_node)
     target_link_libraries(dvstor_memory_node rdma_library)
-
-    if (DVSTOR_BUILD_EXECUTABLES)
-        add_executable(vamana_offline_builder
-            tools/vamana_offline_builder.cc
-            ${DVSTOR_OFFLINE_BUILDER_SOURCES}
-        )
-        dvstor_target_tool_includes(vamana_offline_builder)
-        target_link_libraries(vamana_offline_builder
-            rdma_library
-        )
-        target_link_metis(vamana_offline_builder)
-
-        find_package(faiss CONFIG REQUIRED PATHS /usr/local/share/faiss)
-        add_executable(vamana_pq_indexer
-            tools/vamana_pq_indexer.cc
-            ${DVSTOR_PQ_INDEXER_SOURCES}
-        )
-        dvstor_target_tool_includes(vamana_pq_indexer)
-        target_link_libraries(vamana_pq_indexer rdma_library faiss OpenMP::OpenMP_CXX)
-
-        add_executable(vamana_legacy_index_converter
-            tools/vamana_legacy_index_converter.cc
-            tools/legacy_index/migrator.cc
-            ${DVSTOR_PQ_INDEXER_SOURCES}
-        )
-        dvstor_target_tool_includes(vamana_legacy_index_converter)
-        target_link_libraries(vamana_legacy_index_converter
-            rdma_library faiss OpenMP::OpenMP_CXX)
-
-        add_executable(generate_sift101m_recall_data
-            tools/generate_sift101m_recall_data.cc
-        )
-        dvstor_target_tool_includes(generate_sift101m_recall_data)
+    if (DVSTOR_BUILD_OFFLINE_TOOLS)
+        dvstor_add_offline_tools()
     endif ()
 else ()
     find_path(DVSTOR_DOCA_INCLUDE_DIR doca_gpunetio.h
@@ -273,45 +298,6 @@ else ()
         add_executable(dvstor_compute_node src/main.cc)
         target_link_libraries(dvstor_compute_node dvstor_runtime)
 
-        add_executable(vamana_offline_builder
-            tools/vamana_offline_builder.cc
-            ${DVSTOR_OFFLINE_BUILDER_SOURCES}
-        )
-        dvstor_target_tool_includes(vamana_offline_builder)
-        target_link_libraries(vamana_offline_builder
-            rdma_library
-        )
-        target_link_metis(vamana_offline_builder)
-
-        add_executable(vamana_anchor_sidecar_builder
-            tools/vamana_anchor_sidecar_builder.cc
-            src/vamana/anchor_index.cc
-        )
-        dvstor_target_tool_includes(vamana_anchor_sidecar_builder)
-        target_link_libraries(vamana_anchor_sidecar_builder rdma_library)
-
-        find_package(faiss CONFIG REQUIRED PATHS /usr/local/share/faiss)
-        add_executable(vamana_pq_indexer
-            tools/vamana_pq_indexer.cc
-            ${DVSTOR_PQ_INDEXER_SOURCES}
-        )
-        dvstor_target_tool_includes(vamana_pq_indexer)
-        target_link_libraries(vamana_pq_indexer rdma_library faiss OpenMP::OpenMP_CXX)
-
-        add_executable(vamana_legacy_index_converter
-            tools/vamana_legacy_index_converter.cc
-            tools/legacy_index/migrator.cc
-            ${DVSTOR_PQ_INDEXER_SOURCES}
-        )
-        dvstor_target_tool_includes(vamana_legacy_index_converter)
-        target_link_libraries(vamana_legacy_index_converter
-            rdma_library faiss OpenMP::OpenMP_CXX)
-
-        add_executable(generate_sift101m_recall_data
-            tools/generate_sift101m_recall_data.cc
-        )
-        dvstor_target_tool_includes(generate_sift101m_recall_data)
-
         if (DVSTOR_HAVE_GPUNETIO)
             add_executable(dvstor_gpunetio_probe tools/gpunetio_probe.cc)
             dvstor_target_common_includes(dvstor_gpunetio_probe)
@@ -349,6 +335,10 @@ else ()
         )
         dvstor_target_tool_includes(dvstor_sift101m_long_insert_recall)
         target_link_libraries(dvstor_sift101m_long_insert_recall dvstor_runtime)
+    endif ()
+
+    if (DVSTOR_BUILD_OFFLINE_TOOLS)
+        dvstor_add_offline_tools()
     endif ()
 
     if (DVSTOR_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/CMakeLists.txt")
