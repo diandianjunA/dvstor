@@ -232,18 +232,6 @@ ensure_built() {
   cmake --build "$BUILD_DIR" -j --target "$@"
 }
 
-use_storage_build() {
-  if [[ "$DVSTOR_BUILD_DIR_EXPLICIT" == "0" ]]; then
-    BUILD_DIR="$PROJECT_DIR/build-storage"
-  fi
-  if [[ -f "$BUILD_DIR/CMakeCache.txt" ]] &&
-     ! grep -q '^DVSTOR_STORAGE_NODE_ONLY:BOOL=ON$' "$BUILD_DIR/CMakeCache.txt"; then
-    echo "storage command requires a storage-only build directory: $BUILD_DIR" >&2
-    echo "configure a separate directory with -DDVSTOR_STORAGE_NODE_ONLY=ON" >&2
-    return 1
-  fi
-}
-
 write_service_config() {
   local output="${1:?output path is required}"
   local endpoints
