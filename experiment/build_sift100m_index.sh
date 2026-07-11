@@ -14,6 +14,32 @@ ensure_built vamana_offline_builder vamana_pq_indexer
 mkdir -p "$(dirname "$INDEX_PREFIX")"
 LOG_FILE="${BUILD_LOG:-$LOG_DIR/build_${PARTITION_STRATEGY}_$(date +%Y%m%d_%H%M%S).log}"
 
+artifacts=(
+  "${INDEX_PREFIX}.meta.json"
+  "${INDEX_PREFIX}.anchors"
+  "${INDEX_PREFIX}.pq${PQ_SUBQUANTIZERS}"
+)
+for ((node = 1; node <= SHARDS; ++node)); do
+  artifacts+=(
+    "${INDEX_PREFIX}_node${node}_of${SHARDS}.dat"
+    "${INDEX_PREFIX}_node${node}_of${SHARDS}.idmap"
+    "${INDEX_PREFIX}_node${node}_of${SHARDS}.pq${PQ_SUBQUANTIZERS}.codes"
+  )
+done
+existing=()
+for artifact in "${artifacts[@]}"; do
+  if [[ -e "$artifact" || -L "$artifact" ]]; then existing+=("$artifact"); fi
+done
+if ((${#existing[@]} != 0)); then
+  if [[ "${OVERWRITE_INDEX:-0}" != "1" ]]; then
+    echo "index output already exists; choose a new PQ_INDEX_PREFIX or set OVERWRITE_INDEX=1:" >&2
+    printf '  %s\n' "${existing[@]}" >&2
+    exit 1
+  fi
+  echo "[build] removing ${#existing[@]} old target artifacts before rebuild"
+  rm -f -- "${existing[@]}"
+fi
+
 builder=("$BUILD_DIR/vamana_offline_builder"
   --data-path "$(base_bin)"
   --output-prefix "$INDEX_PREFIX"
@@ -25,14 +51,14 @@ builder=("$BUILD_DIR/vamana_offline_builder"
   --threads "$BUILD_THREADS"
   --max-vectors "$MAX_VECTORS"
   --vector-data-type "$VECTOR_DATA_TYPE"
-  --partition-max-degree "${PARTITION_MAX_DEGREE:-16}"
+  --partition-max-degree "${PARTITION_MAX_DEGREE:-32}"
   --partition-imbalance "${PARTITION_IMBALANCE:-1.03}"
   --anchor-count-per-shard "${ANCHORS_PER_SHARD:-4096}"
   --skip-sanity-check)
 
 pq=("$BUILD_DIR/vamana_pq_indexer"
   --index-prefix "$INDEX_PREFIX"
-  --subquantizers "${PQ_SUBQUANTIZERS:-16}"
+  --subquantizers "${PQ_SUBQUANTIZERS:-32}"
   --train-samples "${PQ_TRAIN_SAMPLES:-262144}"
   --opq-iterations "${PQ_OPQ_ITERATIONS:-20}"
   --pq-iterations "${PQ_ITERATIONS:-25}"

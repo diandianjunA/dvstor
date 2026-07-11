@@ -10,6 +10,7 @@ ensure_built dvstor_breakdown_benchmark
 PREPARE_BASE="${PREPARE_BASE:-0}" "$EXPERIMENT_DIR/prepare_sift100m_data.sh"
 
 RECALL_QUERIES="${RECALL_QUERIES:-1000}"
+RECALL_CLIENT_THREADS="${RECALL_CLIENT_THREADS:-128}"
 RECALL_K="${RECALL_K:-$K}"
 MIN_RECALL="${MIN_RECALL:--1}"
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -25,7 +26,7 @@ cmd=("$BUILD_DIR/dvstor_breakdown_benchmark"
   --workload query
   --warmup-ops 0
   --measure-ops 1
-  --client-threads "${RECALL_CLIENT_THREADS:-$CLIENT_THREADS}"
+  --client-threads "$RECALL_CLIENT_THREADS"
   --query-file "$(query_bin)"
   --groundtruth-file "$(groundtruth_bin)"
   --recall-queries "$RECALL_QUERIES"

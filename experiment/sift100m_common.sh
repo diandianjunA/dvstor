@@ -28,7 +28,6 @@ DIM="${DIM:-128}"
 VECTOR_DATA_TYPE="${VECTOR_DATA_TYPE:-uint8}"
 BUILD_THREADS="${BUILD_THREADS:-112}"
 SERVICE_THREADS="${SERVICE_THREADS:-64}"
-CLIENT_THREADS="${CLIENT_THREADS:-64}"
 GPU_DEVICE="${GPU_DEVICE:-1}"
 PQ_SUBQUANTIZERS="${PQ_SUBQUANTIZERS:-32}"
 MAX_VECTORS="${MAX_VECTORS:-100000000}"
@@ -122,11 +121,13 @@ validate_index_metadata() {
   fi
 
   python3 - "$metadata" "$INDEX_PREFIX" "$R" "$BUILD_BEAM" "$DIM" \
-    "$MAX_VECTORS" "$SHARDS" "$VECTOR_DATA_TYPE" "$PQ_SUBQUANTIZERS" <<'PY_VALIDATE'
+    "$MAX_VECTORS" "$SHARDS" "$VECTOR_DATA_TYPE" "$PQ_SUBQUANTIZERS" \
+    "$PARTITION_STRATEGY" "${PARTITION_MAX_DEGREE:-32}" <<'PY_VALIDATE'
 import json
 import sys
 
-path, prefix, degree, build_beam, dim, vectors, shards, dtype, subquantizers = sys.argv[1:]
+path, prefix, degree, build_beam, dim, vectors, shards, dtype, subquantizers, \
+    partition_strategy, partition_max_degree = sys.argv[1:]
 with open(path, 'r', encoding='utf-8') as stream:
     metadata = json.load(stream)
 
@@ -146,6 +147,8 @@ expected = {
     'navigation_code_bytes': int(subquantizers),
     'pq_subquantizers': int(subquantizers),
     'pq_bits': 8,
+    'partition_strategy': partition_strategy,
+    'partition_max_degree': int(partition_max_degree),
 }
 errors = [
     f'{key}: metadata={metadata.get(key)!r}, expected={value!r}'

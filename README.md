@@ -115,9 +115,16 @@ GPU，也不需要额外重分片可执行文件。`vamana_legacy_index_converte
 ./experiment/build_sift100m_index.sh 04_gpu_persistent_gpunetio
 ```
 
+该命令直接产出 schema-14 compact 分片、owner idmap、anchors、OPQ/PQ32 模型和
+每分片 PQ32 码流，不需要再运行重编码脚本。默认目标已存在时脚本会在昂贵构建前
+拒绝覆盖；建议通过 `PQ_INDEX_PREFIX=/new/prefix` 构建新版本，确认需要原地重建时
+才设置 `OVERWRITE_INDEX=1`。覆盖模式会先解除目标 prefix 下可能存在的迁移软链接，
+避免误写其源分片。
+
 复用已有 Vamana/Metis 图，不重新构图或分区：
 
 ```bash
+SOURCE_PREFIX=/path/to/legacy/index_prefix \
 ./experiment/convert_legacy_sift100m_index.sh 04_gpu_persistent_gpunetio
 ```
 
@@ -145,6 +152,9 @@ prefix 必须不同；迁移器不会修改或删除旧索引。
 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
 ./experiment/stop_memory_nodes.sh
 ```
+
+Benchmark 并发使用独立的 `BENCHMARK_CLIENT_THREADS`，不写入索引/系统 profile；
+例如 `BENCHMARK_CLIENT_THREADS=128 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio`。
 
 分布式部署时，每台存储节点只需其自身的 `.dat`、`.idmap`、`.pq32.codes`，
 再加共享 metadata 与 anchors。详细流程见 `experiment/README.md`。
