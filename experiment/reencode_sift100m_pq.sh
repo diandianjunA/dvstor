@@ -3,7 +3,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
-use_storage_build
 
 PROFILE="${1:-${PROFILE:-04_gpu_persistent_gpunetio}}"
 load_experiment_profile "$PROFILE"
