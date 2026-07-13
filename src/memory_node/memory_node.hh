@@ -279,7 +279,7 @@ private:
                                                StorageOwnerThread& thread,
                                                InsertBreakdownCounters& breakdown,
                                                const Configuration& config,
-                                               vec<u64>* invalidated_neighbors = nullptr,
+                                               vec<vec<u64>>* invalidated_neighbors = nullptr,
                                                vec<u32>* statuses = nullptr,
                                                vec<service::storage_owner::MutationResult>* results = nullptr);
   static StorageOwnerInsertCoroutine dummy_storage_owner_insert_coroutine();
@@ -296,7 +296,7 @@ private:
                                          size_t item_count,
                                          InsertBreakdownCounters& breakdown,
                                          const Configuration& config,
-                                         vec<u64>* invalidated_neighbors = nullptr,
+                                         vec<vec<u64>>* invalidated_neighbors = nullptr,
                                          vec<u32>* statuses = nullptr,
                                          vec<service::storage_owner::MutationResult>* results = nullptr);
 

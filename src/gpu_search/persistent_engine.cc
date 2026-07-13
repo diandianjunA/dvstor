@@ -494,12 +494,23 @@ struct PersistentSearchEngine::Impl {
     exact_cache_slots = budget.exact_cache_slots;
     exact_cache_stride = budget.exact_cache_stride;
     exact_cache_bytes = static_cast<size_t>(budget.exact_cache_payload_bytes);
-    const u64 invalidation_capacity = static_cast<u64>(config.storage_owner_batch_max) * config.R;
+    const u64 invalidation_capacity = static_cast<u64>(
+      std::max(config.storage_owner_batch_max, config.query_batch_max)) * config.R;
     if (invalidation_capacity > std::numeric_limits<u32>::max()) {
       throw std::runtime_error("GPU navigation graph invalidation capacity exceeds uint32");
     }
     graph_invalidation_capacity = static_cast<u32>(std::max<u64>(1, invalidation_capacity));
     explicit_gpu_bytes = budget.explicit_bytes;
+    engine.telemetry_.gpu_memory_explicit_bytes.store(
+      budget.explicit_bytes, std::memory_order_relaxed);
+    engine.telemetry_.gpu_memory_base_pq_bytes.store(
+      budget.code_bytes, std::memory_order_relaxed);
+    engine.telemetry_.gpu_memory_delta_reserved_bytes.store(
+      budget.delta_bytes, std::memory_order_relaxed);
+    engine.telemetry_.gpu_memory_graph_cache_bytes.store(
+      budget.cache_total_bytes, std::memory_order_relaxed);
+    engine.telemetry_.gpu_memory_exact_cache_bytes.store(
+      budget.exact_cache_total_bytes, std::memory_order_relaxed);
     const u64 base_code_region_bytes = budget.code_bytes;
     const u64 exact_bytes = budget.exact_bytes;
     std::cerr << "[gpu-search] navigation budget codes=" << budget.code_bytes
@@ -1548,9 +1559,9 @@ struct PersistentSearchEngine::Impl {
     engine.telemetry_.delta_live_entries.store(count, std::memory_order_relaxed);
   }
 
-  void upload_mutations(std::vector<DeltaMutation>& mutations, u64 epoch,
-                        std::span<const u64> invalidated_graph_nodes) {
-    if (mutations.empty()) return;
+  size_t upload_mutations(std::vector<DeltaMutation>& mutations, u64 epoch,
+                          std::span<const u64> invalidated_graph_nodes) {
+    if (mutations.empty()) return 0;
     const std::vector<u64> invalidation_keys = graph_cache_keys(invalidated_graph_nodes);
     if (delta_records_host.size() + mutations.size() >
         static_cast<size_t>(delta_capacity) * 4 / 5) {
@@ -1570,6 +1581,7 @@ struct PersistentSearchEngine::Impl {
       iterator->second = mutation.generation;
     }
     upload_records_locked(mutations, false, invalidation_keys);
+    return invalidation_keys.size();
   }
 
   void pause_admission_for_compaction() {
@@ -1969,8 +1981,10 @@ bool PersistentSearchEngine::publish_mutations(
   }
   telemetry_.publication_queue_ns_total.fetch_add(publication_queue_ns,
                                                   std::memory_order_relaxed);
+  size_t graph_cache_invalidations = 0;
   try {
-    impl_->upload_mutations(mutations, epoch, invalidated_graph_nodes);
+    graph_cache_invalidations =
+      impl_->upload_mutations(mutations, epoch, invalidated_graph_nodes);
   } catch (const std::exception& error) {
     impl_->mark_unhealthy(std::string{"GPU mutation publication failed: "} + error.what());
     throw;
@@ -1997,6 +2011,8 @@ bool PersistentSearchEngine::publish_mutations(
   }
   telemetry_.mutations_published.fetch_add(mutation_count, std::memory_order_relaxed);
   telemetry_.delta_publications.fetch_add(1, std::memory_order_relaxed);
+  telemetry_.graph_cache_invalidations.fetch_add(
+    graph_cache_invalidations, std::memory_order_relaxed);
   telemetry_.visibility_ns_total.fetch_add(visibility_ns_total,
                                            std::memory_order_relaxed);
   u64 current_max = telemetry_.visibility_ns_max.load(std::memory_order_relaxed);

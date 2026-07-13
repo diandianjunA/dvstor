@@ -1325,9 +1325,11 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
     for (const RemotePtr& neighbor_ptr : selected_neighbors) {
       if (local_shard(neighbor_ptr.memory_node())) {
         local_updates[neighbor_ptr.raw_address].push_back(new_ptr);
+        job.invalidated_neighbors.push_back(neighbor_ptr.raw_address);
       } else if (!local_stitch) {
         remote_updates[neighbor_ptr.memory_node()].push_back(
           service::storage_owner::ReverseUpdateOp{neighbor_ptr.raw_address, new_ptr.raw_address});
+        job.invalidated_neighbors.push_back(neighbor_ptr.raw_address);
       }
     }
   }

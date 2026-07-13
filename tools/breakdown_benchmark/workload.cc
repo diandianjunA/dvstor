@@ -809,6 +809,11 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   {
     const auto telemetry = service.gpu_search_telemetry();
     root["gpu_persistent"] = {
+      {"gpu_memory_explicit_bytes", telemetry.gpu_memory_explicit_bytes},
+      {"gpu_memory_base_pq_bytes", telemetry.gpu_memory_base_pq_bytes},
+      {"gpu_memory_delta_reserved_bytes", telemetry.gpu_memory_delta_reserved_bytes},
+      {"gpu_memory_graph_cache_bytes", telemetry.gpu_memory_graph_cache_bytes},
+      {"gpu_memory_exact_cache_bytes", telemetry.gpu_memory_exact_cache_bytes},
       {"queries_submitted", telemetry.queries_submitted},
       {"queries_completed", telemetry.queries_completed},
       {"batches", telemetry.batches},
@@ -845,6 +850,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       {"direct_path_failures", telemetry.direct_path_failures},
       {"graph_page_requests", telemetry.graph_page_requests},
       {"graph_page_cache_hits", telemetry.graph_page_cache_hits},
+      {"graph_cache_invalidations", telemetry.graph_cache_invalidations},
       {"graph_page_cache_hit_ratio",
         telemetry.graph_page_requests + telemetry.graph_page_cache_hits == 0 ? 0.0
         : static_cast<double>(telemetry.graph_page_cache_hits) /
@@ -965,12 +971,21 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   if (root.contains("gpu_persistent")) {
     const auto& gpu = root["gpu_persistent"];
     text_summary << "gpu_persistent\n";
+    constexpr double bytes_per_gib = 1024.0 * 1024.0 * 1024.0;
+    text_summary << "  GPU memory explicit/base_pq/delta/graph_cache/exact_cache GiB: "
+                 << static_cast<double>(gpu.value("gpu_memory_explicit_bytes", 0ULL)) / bytes_per_gib << "/"
+                 << static_cast<double>(gpu.value("gpu_memory_base_pq_bytes", 0ULL)) / bytes_per_gib << "/"
+                 << static_cast<double>(gpu.value("gpu_memory_delta_reserved_bytes", 0ULL)) / bytes_per_gib << "/"
+                 << static_cast<double>(gpu.value("gpu_memory_graph_cache_bytes", 0ULL)) / bytes_per_gib << "/"
+                 << static_cast<double>(gpu.value("gpu_memory_exact_cache_bytes", 0ULL)) / bytes_per_gib << '\n';
     text_summary << "  average_batch_size: " << gpu.value("average_batch_size", 0.0) << '\n';
     text_summary << "  average_submission_wait_us: "
                  << gpu.value("average_submission_wait_us", 0.0) << '\n';
     text_summary << "  rdma_read_bytes: " << gpu.value("rdma_read_bytes", 0ULL) << '\n';
     text_summary << "  graph_page_cache_hit_ratio: "
                  << gpu.value("graph_page_cache_hit_ratio", 0.0) << '\n';
+    text_summary << "  graph_cache_invalidations: "
+                 << gpu.value("graph_cache_invalidations", 0ULL) << '\n';
     text_summary << "  GPU query/prepare/graph/score/beam/exact us: "
                  << gpu.value("average_gpu_query_us", 0.0) << "/"
                  << gpu.value("average_gpu_prepare_us", 0.0) << "/"

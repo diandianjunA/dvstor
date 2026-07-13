@@ -611,6 +611,8 @@ void ComputeService::complete_ready_storage_owner_slots() {
 
     std::vector<gpu_search::DeltaMutation> mutations;
     mutations.reserve(ready_items);
+    std::vector<u64> invalidated_graph_nodes;
+    invalidated_graph_nodes.reserve(static_cast<size_t>(ready_items) * config_.R);
     for (const auto& [owner_storage, slot_id] : ready_slots) {
       const auto& slot = storage_insert_owners_[owner_storage]->slots[slot_id];
       const auto* response =
@@ -634,6 +636,17 @@ void ComputeService::complete_ready_storage_owner_slots() {
           service::storage_owner::response_invalidation_capacity(slot.item_count);
       }
       if (!response_ok) continue;
+      const u32 invalidation_count =
+        *service::storage_owner::response_invalidation_count(
+          slot.response_buffer.data(), slot.item_count);
+      const u64* invalidated_raws =
+        service::storage_owner::response_invalidated_raws(
+          slot.response_buffer.data(), slot.item_count);
+      for (u32 index = 0; index < invalidation_count; ++index) {
+        if (invalidated_raws[index] != 0) {
+          invalidated_graph_nodes.push_back(invalidated_raws[index]);
+        }
+      }
       const u32* statuses = service::storage_owner::response_statuses(
         slot.response_buffer.data());
       const auto* results = service::storage_owner::response_mutation_results(
@@ -668,7 +681,7 @@ void ComputeService::complete_ready_storage_owner_slots() {
       try {
         const u64 epoch = persistent_search_->delta().reserve_epoch();
         gpu_visible = persistent_search_->publish_mutations(
-          std::move(mutations), epoch);
+          std::move(mutations), epoch, invalidated_graph_nodes);
       } catch (const std::exception& error) {
         gpu_visible = false;
         static std::atomic<u32> gpu_delta_failure_logs{0};
