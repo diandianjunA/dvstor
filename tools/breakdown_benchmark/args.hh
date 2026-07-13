@@ -21,12 +21,14 @@ struct Args {
   size_t client_threads{4};
   double read_ratio{0.5};
   std::string mixed_mode{"probability"};
-  std::string query_file;
+  std::string recall_query_file;
+  std::string performance_query_file;
   std::string insert_file;
   std::string groundtruth_file;
   size_t recall_queries{1000};
   uint32_t recall_k{0};
   double min_recall{-1.0};
+  bool recall_only{false};
   bool synthetic{false};
   std::string report_json_path;
   std::string report_text_path;

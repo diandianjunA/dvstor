@@ -92,6 +92,7 @@ base_bin() { echo "$CONVERTED_DIR/base$(base_suffix).u8bin"; }
 query_bin() { echo "$CONVERTED_DIR/query$(query_suffix).u8bin"; }
 groundtruth_bin() { echo "$CONVERTED_DIR/groundtruth_${GROUNDTRUTH_LABEL}.bin"; }
 insert_bin() { echo "${INSERT_FILE:-$CONVERTED_DIR/insert_test.u8bin}"; }
+performance_query_bin() { echo "${PERFORMANCE_QUERY_FILE:-$(insert_bin)}"; }
 metadata_file() { echo "${INDEX_PREFIX}.meta.json"; }
 model_file() { echo "${INDEX_PREFIX}.pq${PQ_SUBQUANTIZERS}"; }
 

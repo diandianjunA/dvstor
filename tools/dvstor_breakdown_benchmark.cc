@@ -27,12 +27,12 @@ using namespace tools::breakdown_benchmark;
 
 int main(int argc, char** argv) {
   signal(SIGSEGV, segfault_handler);
-  const Args args = parse_args(argc, argv);
-  auto service_args = build_service_argv(args.service_config_path);
-  auto service_argv = make_argv(service_args);
-  configuration::IndexConfiguration config(static_cast<int>(service_argv.size()), service_argv.data());
-
   try {
+    const Args args = parse_args(argc, argv);
+    auto service_args = build_service_argv(args.service_config_path);
+    auto service_argv = make_argv(service_args);
+    configuration::IndexConfiguration config(
+      static_cast<int>(service_argv.size()), service_argv.data());
     ComputeService service(config);
     (void)run_benchmark(service, args);
   } catch (const std::exception& e) {
