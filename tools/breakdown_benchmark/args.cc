@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -140,8 +141,21 @@ Args parse_args(int argc, char** argv) {
       args.read_ratio = std::stod(require_value("--read-ratio"));
     } else if (flag == "--mixed-mode") {
       args.mixed_mode = require_value("--mixed-mode");
+    } else if (flag == "--recall-query-file") {
+      if (!args.recall_query_file.empty()) {
+        throw std::runtime_error("--recall-query-file was specified more than once");
+      }
+      args.recall_query_file = require_value("--recall-query-file");
+    } else if (flag == "--performance-query-file") {
+      if (!args.performance_query_file.empty()) {
+        throw std::runtime_error("--performance-query-file was specified more than once");
+      }
+      args.performance_query_file = require_value("--performance-query-file");
     } else if (flag == "--query-file") {
-      args.query_file = require_value("--query-file");
+      if (!args.recall_query_file.empty()) {
+        throw std::runtime_error("--query-file and --recall-query-file cannot both be specified");
+      }
+      args.recall_query_file = require_value("--query-file");
     } else if (flag == "--insert-file") {
       args.insert_file = require_value("--insert-file");
     } else if (flag == "--groundtruth-file") {
@@ -152,6 +166,8 @@ Args parse_args(int argc, char** argv) {
       args.recall_k = static_cast<uint32_t>(std::stoul(require_value("--recall-k")));
     } else if (flag == "--min-recall") {
       args.min_recall = std::stod(require_value("--min-recall"));
+    } else if (flag == "--recall-only") {
+      args.recall_only = true;
     } else if (flag == "--synthetic") {
       args.synthetic = true;
     } else if (flag == "--report-json") {
@@ -198,6 +214,30 @@ Args parse_args(int argc, char** argv) {
   }
   if (args.min_recall > 1.0) {
     throw std::runtime_error("--min-recall must be <= 1");
+  }
+  if (!args.groundtruth_file.empty() && args.recall_query_file.empty()) {
+    throw std::runtime_error("--recall-query-file is required with --groundtruth-file");
+  }
+  if (args.recall_only && args.groundtruth_file.empty()) {
+    throw std::runtime_error("--recall-only requires --groundtruth-file");
+  }
+  const bool workload_has_queries =
+    !args.recall_only &&
+    (args.workload == "query" || args.workload == "both" ||
+     (args.workload == "mixed" && args.read_ratio > 0.0));
+  if (workload_has_queries && args.performance_query_file.empty()) {
+    throw std::runtime_error(
+      "--performance-query-file is required for query performance phases; "
+      "the recall query file is intentionally not reused");
+  }
+  if (workload_has_queries && !args.recall_query_file.empty()) {
+    std::error_code error;
+    const bool same_file = std::filesystem::equivalent(
+      args.recall_query_file, args.performance_query_file, error);
+    if (!error && same_file) {
+      throw std::runtime_error(
+        "--recall-query-file and --performance-query-file must refer to different files");
+    }
   }
   if (args.insert_start_id == 0) {
     const auto service_config = read_config(args.service_config_path);

@@ -4,15 +4,16 @@
 #include <atomic>
 #include <barrier>
 #include <chrono>
-#include <cstring>
 #include <cstdint>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -79,7 +80,7 @@ struct VectorRows {
   }
 };
 
-VectorRows read_vector_rows(const std::string& path) {
+VectorRows read_vector_rows(const std::string& path, bool decode_rows) {
   std::ifstream input(path, std::ios::binary);
   if (!input) {
     throw std::runtime_error("failed to open " + path);
@@ -92,6 +93,9 @@ VectorRows read_vector_rows(const std::string& path) {
   if (!input) {
     throw std::runtime_error("failed to read vector file header: " + path);
   }
+  if (count == 0 || dim == 0) {
+    throw std::runtime_error("vector file must contain at least one non-empty row: " + path);
+  }
 
   VectorRows rows;
   rows.dtype = resolve_vector_dtype_config("auto", filepath_t{path});
@@ -99,32 +103,55 @@ VectorRows read_vector_rows(const std::string& path) {
   rows.count = count;
   rows.vector_bytes = vector_dtype_bytes(rows.dtype, dim);
   rows.raw.resize(static_cast<size_t>(count) * rows.vector_bytes);
-  rows.decoded.resize(static_cast<size_t>(count) * dim);
 
   input.read(reinterpret_cast<char*>(rows.raw.data()), static_cast<std::streamsize>(rows.raw.size()));
   if (!input) {
     throw std::runtime_error("failed to read vector payload: " + path);
   }
 
-  for (size_t row = 0; row < rows.count; ++row) {
-    decode_storage_vector_to_float(rows.raw_row(row), rows.dtype, rows.dim,
-                                   rows.decoded.data() + row * rows.dim);
+  if (decode_rows) {
+    rows.decoded.resize(static_cast<size_t>(count) * dim);
+    for (size_t row = 0; row < rows.count; ++row) {
+      decode_storage_vector_to_float(rows.raw_row(row), rows.dtype, rows.dim,
+                                     rows.decoded.data() + row * rows.dim);
+    }
   }
   return rows;
 }
 
-VectorRows make_float_query_rows(const std::vector<float>& values, uint32_t dim) {
-  VectorRows rows;
-  rows.dtype = VectorDType::float32;
-  rows.dim = dim;
-  rows.count = dim == 0 ? 0 : values.size() / dim;
-  rows.vector_bytes = vector_dtype_bytes(rows.dtype, dim);
-  rows.decoded = values;
-  rows.raw.resize(values.size() * sizeof(float));
-  std::memcpy(rows.raw.data(), values.data(), rows.raw.size());
-  return rows;
-}
+class SinglePassRowStream {
+ public:
+  explicit SinglePassRowStream(size_t row_count) : row_count_(row_count) {}
 
+  std::optional<size_t> try_claim() {
+    if (exhausted_.load(std::memory_order_acquire)) {
+      return std::nullopt;
+    }
+    const size_t row = next_row_.fetch_add(1, std::memory_order_relaxed);
+    if (row >= row_count_) {
+      exhausted_.store(true, std::memory_order_release);
+      return std::nullopt;
+    }
+    return row;
+  }
+
+  bool exhausted() const {
+    return exhausted_.load(std::memory_order_acquire);
+  }
+
+  size_t consumed() const {
+    return std::min(next_row_.load(std::memory_order_relaxed), row_count_);
+  }
+
+  size_t capacity() const {
+    return row_count_;
+  }
+
+ private:
+  size_t row_count_{};
+  std::atomic<size_t> next_row_{0};
+  std::atomic<bool> exhausted_{false};
+};
 
 struct GroundTruth {
   uint32_t rows{};
@@ -182,6 +209,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   using service::breakdown::report_to_json;
 
   const bool use_insert_file = !args.insert_file.empty();
+  const bool workload_has_queries =
+    !args.recall_only &&
+    (args.workload == "query" || args.workload == "both" ||
+     (args.workload == "mixed" && args.read_ratio > 0.0));
 
   nlohmann::json root;
   root["meta"] = {
@@ -191,6 +222,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"warmup_seconds", args.warmup_seconds},
     {"measure_seconds", args.measure_seconds},
     {"run_mode", (args.warmup_seconds > 0 || args.measure_seconds > 0) ? "time" : "ops"},
+    {"recall_only", args.recall_only},
     {"time_completion_policy", "drain"},
     {"time_issue_policy", args.mixed_mode == "fixed_threads" ? "fixed_read_write_threads_until_deadline"
                                                         : "probabilistic_read_write_per_thread_until_deadline"},
@@ -258,7 +290,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   // Load insert vectors from file if specified, otherwise use synthetic data.
   VectorRows insert_rows;
   if (use_insert_file) {
-    insert_rows = read_vector_rows(args.insert_file);
+    insert_rows = read_vector_rows(args.insert_file, true);
     if (insert_rows.dim != dim) {
       throw std::runtime_error("insert-file dim mismatch: " + std::to_string(insert_rows.dim)
                                + " vs config " + std::to_string(dim));
@@ -325,32 +357,65 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     return current_id;
   };
 
-  VectorRows query_rows;
-  size_t query_count = 0;
-  if (!args.query_file.empty()) {
-    std::ifstream probe(args.query_file, std::ios::binary);
-    if (!probe.good()) {
-      throw std::runtime_error("query file does not exist: " + args.query_file);
+  VectorRows recall_query_rows;
+  if (!args.recall_query_file.empty()) {
+    recall_query_rows = read_vector_rows(args.recall_query_file, false);
+    if (recall_query_rows.dim != dim) {
+      throw std::runtime_error("recall-query-file dim mismatch with service config");
     }
-    query_rows = read_vector_rows(args.query_file);
-    query_count = query_rows.count;
-    if (query_rows.dim != dim) {
-      throw std::runtime_error("query dim mismatch with service config");
-    }
-  } else {
-    query_count = std::max<size_t>(
-      bootstrap_count,
-      args.measure_seconds > 0 ? args.client_threads * 4096 : args.measure_ops * args.client_threads);
-    std::vector<uint32_t> query_ids(query_count);
-    std::iota(query_ids.begin(), query_ids.end(), bootstrap_count + 1);
-    query_rows = make_float_query_rows(make_dataset(query_ids, dim), static_cast<uint32_t>(dim));
-    root["meta"]["synthetic_query_vectors"] = query_count;
+    std::cerr << "[breakdown] recall query data ready: count=" << recall_query_rows.count
+              << " dtype=" << vector_dtype_name(recall_query_rows.dtype)
+              << " vector_bytes=" << recall_query_rows.vector_bytes << std::endl;
   }
-  root["meta"]["query_data_type"] = vector_dtype_name(query_rows.dtype);
-  root["meta"]["query_vector_bytes"] = query_rows.vector_bytes;
-  std::cerr << "[breakdown] query data ready: count=" << query_count
-            << " dtype=" << vector_dtype_name(query_rows.dtype)
-            << " vector_bytes=" << query_rows.vector_bytes << std::endl;
+
+  VectorRows performance_query_rows;
+  if (workload_has_queries) {
+    performance_query_rows = read_vector_rows(args.performance_query_file, false);
+    if (performance_query_rows.dim != dim) {
+      throw std::runtime_error("performance-query-file dim mismatch with service config");
+    }
+    std::cerr << "[breakdown] performance query data ready: count="
+              << performance_query_rows.count
+              << " dtype=" << vector_dtype_name(performance_query_rows.dtype)
+              << " vector_bytes=" << performance_query_rows.vector_bytes
+              << " policy=single_pass_no_reuse" << std::endl;
+  }
+
+  if (!args.recall_query_file.empty() && workload_has_queries &&
+      std::filesystem::canonical(args.recall_query_file) ==
+        std::filesystem::canonical(args.performance_query_file)) {
+    throw std::runtime_error(
+      "recall and performance query files must be different; the 10K recall set "
+      "must not be reused for throughput measurement");
+  }
+
+  root["meta"]["recall_query"] = {
+    {"source", args.recall_query_file},
+    {"rows", recall_query_rows.count},
+    {"data_type", recall_query_rows.count == 0 ? "" : vector_dtype_name(recall_query_rows.dtype)},
+    {"vector_bytes", recall_query_rows.vector_bytes},
+    {"purpose", "recall_only"},
+  };
+  root["meta"]["performance_query"] = {
+    {"source", args.performance_query_file},
+    {"rows", performance_query_rows.count},
+    {"data_type", performance_query_rows.count == 0 ? "" : vector_dtype_name(performance_query_rows.dtype)},
+    {"vector_bytes", performance_query_rows.vector_bytes},
+    {"row_reuse_policy", "single_pass_no_reuse"},
+    {"row_reuse_count", 0},
+  };
+
+  SinglePassRowStream performance_query_stream(performance_query_rows.count);
+  auto throw_if_performance_queries_exhausted = [&](const std::string& phase) {
+    if (!performance_query_stream.exhausted()) {
+      return;
+    }
+    throw std::runtime_error(
+      "performance query file exhausted during " + phase + " after " +
+      std::to_string(performance_query_stream.capacity()) +
+      " rows; rows are never reused. Provide a larger --performance-query-file "
+      "or shorten the warmup/measurement duration");
+  };
 
   bool recall_below_threshold = false;
   auto run_recall_check = [&](const char* phase,
@@ -360,18 +425,20 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     if (args.groundtruth_file.empty()) {
       return;
     }
-    if (query_count == 0) {
+    if (recall_query_rows.count == 0) {
       throw std::runtime_error("recall requires query vectors");
     }
     const GroundTruth gt = read_groundtruth_bin(args.groundtruth_file);
-    if (gt.rows != query_count) {
-      throw std::runtime_error("query/groundtruth row count mismatch");
+    if (gt.rows != recall_query_rows.count) {
+      throw std::runtime_error("recall-query/groundtruth row count mismatch");
     }
     const uint32_t recall_k = args.recall_k == 0 ? std::min<uint32_t>(service.config().k, gt.top_k) : args.recall_k;
     if (recall_k == 0 || recall_k > gt.top_k) {
       throw std::runtime_error("invalid recall k");
     }
-    const size_t recall_queries = args.recall_queries == 0 ? query_count : std::min<size_t>(args.recall_queries, query_count);
+    const size_t recall_queries = args.recall_queries == 0
+      ? recall_query_rows.count
+      : std::min<size_t>(args.recall_queries, recall_query_rows.count);
     std::atomic<size_t> recall_completed{0};
     std::atomic<size_t> next_recall_query{0};
     std::atomic<bool> recall_failed{false};
@@ -390,7 +457,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
             const size_t qi = next_recall_query.fetch_add(1, std::memory_order_relaxed);
             if (qi >= recall_queries) break;
             const auto results = service.search_raw(
-              query_rows.dtype, query_rows.raw_row(qi), dim, recall_k);
+              recall_query_rows.dtype, recall_query_rows.raw_row(qi), dim, recall_k);
             std::vector<uint32_t> result_ids;
             result_ids.reserve(results.size());
             for (const auto id : results) {
@@ -416,6 +483,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     const double recall = recall_queries > 0 ? total_recall / static_cast<double>(recall_queries) : 0.0;
     root[key] = {
       {"phase", phase},
+      {"query_file", args.recall_query_file},
       {"groundtruth_file", args.groundtruth_file},
       {"queries", recall_queries},
       {"k", recall_k},
@@ -446,40 +514,46 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     for (size_t worker = 0; worker < worker_count; ++worker) {
       workers.emplace_back([&]() {
         for (;;) {
+          if (performance_query_stream.exhausted()) break;
           const size_t op = next_op.fetch_add(1, std::memory_order_relaxed);
           if (op >= ops) break;
-          const size_t idx = op % query_count;
+          const auto query_row = performance_query_stream.try_claim();
+          if (!query_row.has_value()) break;
           (void)service.search_raw(
-            query_rows.dtype, query_rows.raw_row(idx), dim, service.config().k);
+            performance_query_rows.dtype,
+            performance_query_rows.raw_row(*query_row), dim, service.config().k);
           completed_ops.fetch_add(1, std::memory_order_relaxed);
         }
       });
     }
     for (auto& worker : workers) worker.join();
     reporter.finish();
+    throw_if_performance_queries_exhausted(label);
     return completed_ops.load(std::memory_order_relaxed);
   };
 
   auto run_query_phase_seconds = [&](const std::string& label, size_t seconds) -> size_t {
     std::atomic<size_t> completed_ops{0};
-    std::atomic<size_t> next_query{0};
     ProgressReporter reporter(label, completed_ops, 0, seconds);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
     std::vector<std::thread> workers;
     workers.reserve(args.client_threads);
     for (size_t worker = 0; worker < args.client_threads; ++worker) {
       workers.emplace_back([&]() {
-        while (std::chrono::steady_clock::now() < deadline) {
-          const size_t query_index = next_query.fetch_add(1, std::memory_order_relaxed);
-          const size_t idx = query_index % query_count;
+        while (!performance_query_stream.exhausted() &&
+               std::chrono::steady_clock::now() < deadline) {
+          const auto query_row = performance_query_stream.try_claim();
+          if (!query_row.has_value()) break;
           (void)service.search_raw(
-            query_rows.dtype, query_rows.raw_row(idx), dim, service.config().k);
+            performance_query_rows.dtype,
+            performance_query_rows.raw_row(*query_row), dim, service.config().k);
           completed_ops.fetch_add(1, std::memory_order_relaxed);
         }
       });
     }
     for (auto& worker : workers) worker.join();
     reporter.finish();
+    throw_if_performance_queries_exhausted(label);
     return completed_ops.load(std::memory_order_relaxed);
   };
 
@@ -553,7 +627,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   auto run_mixed_phase_ops = [&](const std::string& label, size_t ops, uint32_t start_id) -> MixedPhaseStats {
     std::atomic<size_t> completed_ops{0};
     std::atomic<uint32_t> next_insert_id{start_id};
-    std::atomic<size_t> next_query_idx{0};
     std::atomic<size_t> issued_reads{0};
     std::atomic<size_t> issued_writes{0};
     std::atomic<size_t> issued_inserts{0};
@@ -578,6 +651,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                             static_cast<uint64_t>(std::hash<std::string>{}(label)));
         start_barrier.arrive_and_wait();
         for (;;) {
+          if (performance_query_stream.exhausted()) break;
           const size_t op_index = next_op.fetch_add(1, std::memory_order_relaxed);
           if (op_index >= ops) {
             break;
@@ -585,9 +659,12 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
 
           const bool read_op = args.mixed_mode == "fixed_threads" ? tid < fixed_read_threads : choose_mixed_read(rng);
           if (read_op) {
+            const auto query_row = performance_query_stream.try_claim();
+            if (!query_row.has_value()) break;
             issued_reads.fetch_add(1, std::memory_order_relaxed);
-            const size_t query_idx = next_query_idx.fetch_add(1, std::memory_order_relaxed) % query_count;
-            (void)service.search_raw(query_rows.dtype, query_rows.raw_row(query_idx), dim, service.config().k);
+            (void)service.search_raw(
+              performance_query_rows.dtype,
+              performance_query_rows.raw_row(*query_row), dim, service.config().k);
             completed_reads.fetch_add(1, std::memory_order_relaxed);
           } else {
             issued_writes.fetch_add(1, std::memory_order_relaxed);
@@ -605,6 +682,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       thread.join();
     }
     reporter.finish();
+    throw_if_performance_queries_exhausted(label);
     return MixedPhaseStats{
       .next_insert_id = next_insert_id.load(std::memory_order_relaxed),
       .issued_reads = issued_reads.load(std::memory_order_relaxed),
@@ -623,7 +701,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   auto run_mixed_phase_seconds = [&](const std::string& label, size_t seconds, uint32_t start_id) -> MixedPhaseStats {
     std::atomic<size_t> completed_ops{0};
     std::atomic<uint32_t> next_insert_id{start_id};
-    std::atomic<size_t> next_query_idx{0};
     std::atomic<size_t> issued_reads{0};
     std::atomic<size_t> issued_writes{0};
     std::atomic<size_t> issued_inserts{0};
@@ -648,15 +725,19 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                             static_cast<uint64_t>(std::hash<std::string>{}(label)));
         start_barrier.arrive_and_wait();
         for (;;) {
-          if (std::chrono::steady_clock::now() >= deadline) {
+          if (performance_query_stream.exhausted() ||
+              std::chrono::steady_clock::now() >= deadline) {
             break;
           }
 
           const bool read_op = args.mixed_mode == "fixed_threads" ? tid < fixed_read_threads : choose_mixed_read(rng);
           if (read_op) {
+            const auto query_row = performance_query_stream.try_claim();
+            if (!query_row.has_value()) break;
             issued_reads.fetch_add(1, std::memory_order_relaxed);
-            const size_t query_idx = next_query_idx.fetch_add(1, std::memory_order_relaxed) % query_count;
-            (void)service.search_raw(query_rows.dtype, query_rows.raw_row(query_idx), dim, service.config().k);
+            (void)service.search_raw(
+              performance_query_rows.dtype,
+              performance_query_rows.raw_row(*query_row), dim, service.config().k);
             completed_reads.fetch_add(1, std::memory_order_relaxed);
           } else {
             issued_writes.fetch_add(1, std::memory_order_relaxed);
@@ -674,6 +755,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       thread.join();
     }
     reporter.finish();
+    throw_if_performance_queries_exhausted(label);
     return MixedPhaseStats{
       .next_insert_id = next_insert_id.load(std::memory_order_relaxed),
       .issued_reads = issued_reads.load(std::memory_order_relaxed),
@@ -704,7 +786,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   MixedPhaseStats warmup_mixed_stats{};
   MixedPhaseStats measure_mixed_stats{};
 
-  if (args.workload == "insert" || args.workload == "both") {
+  if (!args.recall_only && (args.workload == "insert" || args.workload == "both")) {
     std::cerr << "[breakdown] starting warmup insert" << std::endl;
     if (use_time_mode) {
       next_insert_id = run_insert_phase_seconds("warmup-insert", args.warmup_seconds, next_insert_id) + 1024;
@@ -713,7 +795,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       next_insert_id += static_cast<uint32_t>(args.warmup_ops + 1024);
     }
   }
-  if (args.workload == "query" || args.workload == "both") {
+  if (!args.recall_only && (args.workload == "query" || args.workload == "both")) {
     std::cerr << "[breakdown] starting warmup query" << std::endl;
     if (use_time_mode) {
       (void)run_query_phase_seconds("warmup-query", args.warmup_seconds);
@@ -721,7 +803,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       (void)run_query_phase_ops("warmup-query", args.warmup_ops);
     }
   }
-  if (args.workload == "mixed") {
+  if (!args.recall_only && args.workload == "mixed") {
     std::cerr << "[breakdown] starting warmup mixed" << std::endl;
     if (use_time_mode) {
       warmup_mixed_stats = run_mixed_phase_seconds("warmup-mixed", args.warmup_seconds, next_insert_id);
@@ -732,13 +814,14 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     }
   }
 
+  const size_t performance_queries_after_warmup = performance_query_stream.consumed();
   service.clear_thread_statistics();
   service.reset_breakdown_state();
   std::cerr << "[breakdown] starting measure phase" << std::endl;
   size_t measured_query_operations = 0;
   size_t measured_insert_operations = 0;
 
-  if (args.workload == "insert" || args.workload == "both") {
+  if (!args.recall_only && (args.workload == "insert" || args.workload == "both")) {
     if (use_time_mode) {
       const uint32_t start_id = next_insert_id;
       next_insert_id = run_insert_phase_seconds("measure-insert", args.measure_seconds, next_insert_id);
@@ -748,14 +831,14 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       measured_insert_operations = args.measure_ops;
     }
   }
-  if (args.workload == "query" || args.workload == "both") {
+  if (!args.recall_only && (args.workload == "query" || args.workload == "both")) {
     if (use_time_mode) {
       measured_query_operations = run_query_phase_seconds("measure-query", args.measure_seconds);
     } else {
       measured_query_operations = run_query_phase_ops("measure-query", args.measure_ops);
     }
   }
-  if (args.workload == "mixed") {
+  if (!args.recall_only && args.workload == "mixed") {
     if (use_time_mode) {
       measure_mixed_stats = run_mixed_phase_seconds("measure-mixed", args.measure_seconds, next_insert_id);
       next_insert_id = measure_mixed_stats.next_insert_id;
@@ -765,7 +848,17 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     }
   }
 
-  if (args.workload == "mixed") {
+  const size_t total_performance_queries = performance_query_stream.consumed();
+  root["meta"]["performance_query"]["warmup_rows_consumed"] =
+    performance_queries_after_warmup;
+  root["meta"]["performance_query"]["measure_rows_consumed"] =
+    total_performance_queries - performance_queries_after_warmup;
+  root["meta"]["performance_query"]["total_rows_consumed"] =
+    total_performance_queries;
+  root["meta"]["performance_query"]["remaining_rows"] =
+    performance_query_stream.capacity() - total_performance_queries;
+
+  if (!args.recall_only && args.workload == "mixed") {
     root["meta"]["warmup_mixed"] = {
       {"issued_reads", warmup_mixed_stats.issued_reads},
       {"issued_writes", warmup_mixed_stats.issued_writes},
@@ -932,10 +1025,27 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       : 0.0},
   };
 
-  run_recall_check("after_performance", "static_gt_post_recall", false, false);
+  if (!args.recall_only) {
+    run_recall_check("after_performance", "static_gt_post_recall", false, false);
+  }
 
   nlohmann::json summaries = nlohmann::json::object();
   std::ostringstream text_summary;
+  const auto& recall_query_meta = root["meta"]["recall_query"];
+  const auto& performance_query_meta = root["meta"]["performance_query"];
+  text_summary << "query_inputs\n";
+  text_summary << "  recall_source: " << recall_query_meta.value("source", "") << '\n';
+  text_summary << "  recall_rows: " << recall_query_meta.value("rows", 0ULL) << '\n';
+  text_summary << "  performance_source: "
+               << performance_query_meta.value("source", "") << '\n';
+  text_summary << "  performance_rows: "
+               << performance_query_meta.value("rows", 0ULL) << '\n';
+  text_summary << "  performance_row_reuse_policy: "
+               << performance_query_meta.value("row_reuse_policy", "") << '\n';
+  text_summary << "  performance_warmup/measure/total_rows_consumed: "
+               << performance_query_meta.value("warmup_rows_consumed", 0ULL) << "/"
+               << performance_query_meta.value("measure_rows_consumed", 0ULL) << "/"
+               << performance_query_meta.value("total_rows_consumed", 0ULL) << '\n';
   if (has_throughput_duration) {
     text_summary << "throughput\n";
     text_summary << "  duration_seconds: " << throughput_duration << '\n';
@@ -958,6 +1068,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                  << recall.value("recall", 0.0) << '\n';
     text_summary << "  queries: " << recall.value("queries", 0) << '\n';
     text_summary << "  passed: " << (recall.value("passed", false) ? "true" : "false") << '\n';
+    text_summary << "  query_file: " << recall.value("query_file", "") << '\n';
     text_summary << "  groundtruth_file: " << recall.value("groundtruth_file", "") << '\n';
   }
   if (root.contains("static_gt_post_recall")) {
@@ -966,6 +1077,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     text_summary << "  recall@" << recall.value("k", 0) << ": "
                  << recall.value("recall", 0.0) << '\n';
     text_summary << "  queries: " << recall.value("queries", 0) << '\n';
+    text_summary << "  query_file: " << recall.value("query_file", "") << '\n';
     text_summary << "  groundtruth_file: " << recall.value("groundtruth_file", "") << '\n';
   }
   if (root.contains("gpu_persistent")) {

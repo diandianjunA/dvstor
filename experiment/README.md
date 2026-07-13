@@ -114,12 +114,25 @@ code，但不执行昂贵的 Vamana construction 或 METIS partition。PQ 默认
 `RECALL_QUERIES` 由运行脚本读取。`SERVICE_THREADS` 是计算服务 CPU 线程数，
 不等于 benchmark 客户端并发数。
 
+`query.u8bin` 的 10K 标准查询仅供 recall 使用。性能阶段由
+`PERFORMANCE_QUERY_FILE` 提供独立查询流，warmup 与 measure 共用一个单遍游标，
+同一行不会再次执行；查询池耗尽时 benchmark 会失败而不是取模回绕。默认使用
+一百万行的 `insert_test.u8bin`，长时间或更高 QPS 测试应显式指定更大的 held-out
+`.u8bin` 文件，例如：
+
+```bash
+PERFORMANCE_QUERY_FILE=/data/xjs/datasets/sift/perf_queries_2m.u8bin \
+./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
+```
+
 先做 query-only 召回验证：
 
 ```bash
 RECALL_QUERIES=1000 \
 ./experiment/run_recall.sh 04_gpu_persistent_gpunetio
 ```
+
+该脚本使用 `--recall-only`，不会执行 warmup/measure，也不会加载性能查询池。
 
 再运行读写混合负载：
 

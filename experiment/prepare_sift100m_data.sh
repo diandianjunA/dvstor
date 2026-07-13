@@ -45,8 +45,12 @@ with open('$INSERT_SRC', 'rb') as fin, open('$INSERT_BIN', 'wb') as fout:
     fout.write(struct.pack('<II', len(vectors), dim))
     for v in vectors: fout.write(v)
     print(f'OK: {len(vectors)} vectors, dim={dim}')
-" && echo "insert:      $INSERT_BIN"
+"
   else
     echo "WARNING: insert source not found at $INSERT_SRC — benchmark will use synthetic vectors"
   fi
+fi
+if [[ "$PREPARE_INSERT" == "1" ]]; then
+  if [[ -f "$INSERT_BIN" ]]; then echo "insert:      $INSERT_BIN"; fi
+  echo "performance: $(performance_query_bin)"
 fi

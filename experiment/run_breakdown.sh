@@ -19,6 +19,17 @@ MEASURE_SECONDS="${MEASURE_SECONDS:-120}"
 RECALL_QUERIES="${RECALL_QUERIES:-1000}"
 RECALL_K="${RECALL_K:-$K}"
 MIN_RECALL="${MIN_RECALL:--1}"
+RECALL_QUERY_FILE="$(query_bin)"
+PERFORMANCE_QUERY_PATH="$(performance_query_bin)"
+if [[ ! -s "$PERFORMANCE_QUERY_PATH" ]]; then
+  echo "missing performance query file: $PERFORMANCE_QUERY_PATH" >&2
+  echo "set PERFORMANCE_QUERY_FILE to a large held-out .u8bin query set" >&2
+  exit 1
+fi
+if [[ "$(readlink -f "$RECALL_QUERY_FILE")" == "$(readlink -f "$PERFORMANCE_QUERY_PATH")" ]]; then
+  echo "recall and performance query files must be different" >&2
+  exit 1
+fi
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="$REPORT_DIR/$PROFILE"
 mkdir -p "$OUT_DIR"
@@ -38,7 +49,8 @@ cmd=("$BUILD_DIR/dvstor_breakdown_benchmark"
   --write-insert-ratio "${WRITE_INSERT_RATIO:-0.5}"
   --write-upsert-ratio "${WRITE_UPSERT_RATIO:-0.4}"
   --write-delete-ratio "${WRITE_DELETE_RATIO:-0.1}"
-  --query-file "$(query_bin)"
+  --recall-query-file "$RECALL_QUERY_FILE"
+  --performance-query-file "$PERFORMANCE_QUERY_PATH"
   --groundtruth-file "$(groundtruth_bin)"
   --recall-queries "$RECALL_QUERIES"
   --recall-k "$RECALL_K"
