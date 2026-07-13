@@ -1,6 +1,7 @@
 #include "gpu_search/persistent_kernel.hh"
 
 #include <cuda_runtime.h>
+#include <cub/block/block_radix_sort.cuh>
 
 #include <algorithm>
 #include <cfloat>
@@ -20,11 +21,73 @@
 namespace gpu_search {
 namespace {
 
+inline constexpr u32 kApproximateSortThreadsWide = 256;
+inline constexpr u32 kApproximateSortItemsWide =
+  kPersistentMaxMergeCandidates / kApproximateSortThreadsWide;
+inline constexpr u32 kApproximateSortThreadsCompact = 128;
+inline constexpr u32 kApproximateSortItemsCompactPass = 8;
+inline constexpr u32 kApproximateSortItemsCompactFinal = 2;
+using ApproximateBlockSortWide = cub::BlockRadixSort<
+  f32, kApproximateSortThreadsWide, kApproximateSortItemsWide, u64>;
+using ApproximateBlockSortCompactPass = cub::BlockRadixSort<
+  f32, kApproximateSortThreadsCompact, kApproximateSortItemsCompactPass, u64>;
+using ApproximateBlockSortCompactFinal = cub::BlockRadixSort<
+  f32, kApproximateSortThreadsCompact, kApproximateSortItemsCompactFinal, u64>;
+
+struct CandidateWorkspaceArrays {
+  u32 handles[kPersistentMaxExact * 2];
+  f32 distances[kPersistentMaxExact * 2];
+  u32 ids[kPersistentMaxExact * 2];
+  u8 expanded[kPersistentMaxExact * 2];
+};
+
+union CandidateSortWorkspace {
+  ApproximateBlockSortWide::TempStorage radix_sort_wide;
+  ApproximateBlockSortCompactPass::TempStorage radix_sort_compact_pass;
+  ApproximateBlockSortCompactFinal::TempStorage radix_sort_compact_final;
+};
+
+struct CandidateWorkspace {
+  CandidateWorkspaceArrays arrays;
+  CandidateSortWorkspace sort;
+};
+
+__device__ void unlink_mutable_delta(const PersistentKernelParams& params,
+                                     u32 slot) {
+  if (slot >= params.delta_capacity || params.delta_prev == nullptr ||
+      params.delta_next == nullptr || params.delta_bucket_heads == nullptr) {
+    return;
+  }
+  const DeviceDeltaRecord record = params.delta_records[slot];
+  if (record.anchor_bucket >= params.anchor_count) return;
+  const u32 previous = params.delta_prev[slot];
+  const u32 next = params.delta_next[slot];
+  if (previous == UINT32_MAX) {
+    atomicCAS(params.delta_bucket_heads + record.anchor_bucket, slot, next);
+  } else if (previous < params.delta_capacity) {
+    atomicCAS(params.delta_next + previous, slot, next);
+  }
+  if (next < params.delta_capacity) {
+    atomicCAS(params.delta_prev + next, slot, previous);
+  }
+  params.delta_prev[slot] = UINT32_MAX;
+  params.delta_next[slot] = UINT32_MAX;
+}
+
 constexpr u32 kGraphCacheEmpty = 0;
 constexpr u32 kGraphCacheFilling = 1;
 constexpr u32 kGraphCacheReady = 2;
 constexpr u32 kGraphCacheStale = 3;
 constexpr u32 kGraphCacheFillInvalidated = 4;
+constexpr u32 kGraphScratchBit = 0x80000000u;
+constexpr u32 kGraphRouteBit = 0x40000000u;
+constexpr u32 kGraphSlotMask = ~(kGraphScratchBit | kGraphRouteBit);
+constexpr u32 kCacheAdmissionWays = 4;
+constexpr u32 kCacheWaitRounds = 64;
+constexpr u64 kNodeLockMask = 1ull;
+constexpr u64 kNodeDeletedMask = 1ull << 24;
+constexpr u32 kNodeIdOffset = 8;
+constexpr u32 kNodeVectorOffset = 16;
 
 __device__ __forceinline__ u32 hash32(u32 value) {
   value ^= value >> 16;
@@ -56,10 +119,55 @@ __device__ __forceinline__ u32 load_cg(const u32* address) {
   return value;
 }
 
+__device__ u32 anchor_graph_slot(const PersistentKernelParams& params, u64 key) {
+  if (params.anchor_graph_keys == nullptr || params.anchor_graph_count == 0) {
+    return UINT32_MAX;
+  }
+  u32 begin = 0;
+  u32 end = params.anchor_graph_count;
+  while (begin < end) {
+    const u32 middle = begin + (end - begin) / 2;
+    const u64 candidate = load_cg(params.anchor_graph_keys + middle);
+    if (candidate < key) begin = middle + 1;
+    else end = middle;
+  }
+  return begin < params.anchor_graph_count &&
+      load_cg(params.anchor_graph_keys + begin) == key
+    ? begin : UINT32_MAX;
+}
+
+__device__ void release_graph_record(const PersistentKernelParams& params,
+                                     u32 acquired_slot) {
+  if (acquired_slot == UINT32_MAX ||
+      (acquired_slot & kGraphScratchBit) != 0) {
+    return;
+  }
+  if ((acquired_slot & kGraphRouteBit) != 0) {
+    const u32 slot = acquired_slot & kGraphSlotMask;
+    atomicSub(params.anchor_graph_readers + slot, 1u);
+    return;
+  }
+  atomicSub(params.graph_cache_readers + acquired_slot, 1u);
+}
+
 __device__ __forceinline__ u64 global_time_ns() {
   u64 value = 0;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
   return value;
+}
+
+__device__ __forceinline__ f32 query_component(const u8* query, u8 dtype,
+                                                u32 index) {
+  switch (dtype) {
+    case 0:
+      return reinterpret_cast<const f32*>(query)[index];
+    case 1:
+      return static_cast<f32>(query[index]);
+    case 2:
+      return static_cast<f32>(reinterpret_cast<const std::int8_t*>(query)[index]);
+    default:
+      return 0.0f;
+  }
 }
 
 #ifdef DVSTOR_HAVE_GPUNETIO
@@ -175,7 +283,7 @@ __device__ u32 delta_slot_from_raw(const PersistentKernelParams& params, u64 raw
   for (u32 probe = 0; probe < params.delta_remote_capacity; ++probe) {
     const u64 key = load_cg(params.delta_remote_keys + position);
     if (key == raw) return load_cg(params.delta_remote_slots + position);
-    if (key == 0) return UINT32_MAX;
+    if (key == kDeltaRemoteEmpty) return UINT32_MAX;
     position = (position + 1) & mask;
   }
   return UINT32_MAX;
@@ -184,8 +292,21 @@ __device__ u32 delta_slot_from_raw(const PersistentKernelParams& params, u64 raw
 __device__ u32 handle_from_raw(const PersistentKernelParams& params, u64 raw) {
   u32 handle = UINT32_MAX;
   if (static_handle_from_raw(params, raw, handle)) return handle;
-  const u32 slot = delta_slot_from_raw(params, raw);
-  return slot == UINT32_MAX ? UINT32_MAX : kDeltaHandleBit | slot;
+  const u32 shard = static_cast<u32>(raw >> 48);
+  const u64 offset = (raw << 16) >> 16;
+  if (shard >= params.num_shards || params.graph_shard_bits >= 31) return UINT32_MAX;
+  const DeviceShardRegion& region = params.shards[shard];
+  if (offset < region.dynamic_base_offset || region.dynamic_record_bytes == 0) {
+    return UINT32_MAX;
+  }
+  const u64 relative = offset - region.dynamic_base_offset;
+  if (relative % region.dynamic_record_bytes != 0) return UINT32_MAX;
+  const u64 slot = relative / region.dynamic_record_bytes;
+  const u32 slot_bits = 31 - params.graph_shard_bits;
+  const u64 slot_limit = 1ull << slot_bits;
+  if (slot >= slot_limit || shard >= (1u << params.graph_shard_bits)) return UINT32_MAX;
+  return kDeltaHandleBit |
+    (shard << slot_bits) | static_cast<u32>(slot);
 }
 
 __device__ bool resolve_handle(const PersistentKernelParams& params, u32 handle,
@@ -200,45 +321,56 @@ __device__ bool resolve_handle(const PersistentKernelParams& params, u32 handle,
     graph_offset = region->graph_base_offset + slot * params.graph_entry_bytes;
     return true;
   }
-  const u32 delta_slot = handle & kDeltaHandleMask;
-  if (delta_slot >= min(load_cg(params.delta_count), params.delta_capacity)) return false;
-  raw = load_cg(&params.delta_records[delta_slot].remote_node);
-  if (raw == 0) return false;
-  shard = static_cast<u32>(raw >> 48);
-  const u64 node_offset = (raw << 16) >> 16;
+  if (params.graph_shard_bits >= 31) return false;
+  const u32 slot_bits = 31 - params.graph_shard_bits;
+  const u32 slot_mask = slot_bits == 31 ? kDeltaHandleMask : (1u << slot_bits) - 1u;
+  shard = params.graph_shard_bits == 0
+    ? 0u : (handle & kDeltaHandleMask) >> slot_bits;
   if (shard >= params.num_shards) return false;
   const DeviceShardRegion& region = params.shards[shard];
-  if (node_offset >= region.node_base_offset) {
-    const u64 relative = node_offset - region.node_base_offset;
-    if (region.node_stride != 0 && relative % region.node_stride == 0 &&
-        relative / region.node_stride < region.node_count) {
-      graph_offset = region.graph_base_offset +
-        (relative / region.node_stride) * params.graph_entry_bytes;
-      return true;
-    }
-  }
-  if (node_offset < region.dynamic_base_offset || region.dynamic_record_bytes == 0 ||
-      (node_offset - region.dynamic_base_offset) % region.dynamic_record_bytes != 0) {
-    return false;
-  }
+  if (region.dynamic_record_bytes == 0) return false;
+  const u64 dynamic_slot = handle & slot_mask;
+  const u64 node_offset = region.dynamic_base_offset +
+    dynamic_slot * region.dynamic_record_bytes;
+  if (node_offset < region.dynamic_base_offset || node_offset >= (1ull << 48)) return false;
+  raw = (static_cast<u64>(shard) << 48) | node_offset;
   graph_offset = node_offset + region.dynamic_hot_offset;
   return true;
 }
 
-__device__ u64 base_override_epoch(const PersistentKernelParams& params, u32 ordinal) {
-  if (params.base_override_capacity == 0) return 0;
+__device__ bool base_overridden(const PersistentKernelParams& params,
+                                u32 ordinal, u64 snapshot_epoch) {
+  const u32 word = ordinal / 32;
+  if (params.permanent_override_bits != nullptr &&
+      word < params.permanent_override_words &&
+      (load_cg(params.permanent_override_bits + word) &
+       (1u << (ordinal % 32))) != 0) {
+    return true;
+  }
+  if (params.base_override_capacity == 0) return false;
   const u32 mask = params.base_override_capacity - 1;
   u32 position = hash32(ordinal) & mask;
   for (u32 probe = 0; probe < params.base_override_capacity; ++probe) {
     const u32 key = load_cg(params.base_override_keys + position);
-    if (key == ordinal) return load_cg(params.base_override_epochs + position);
-    if (key == UINT32_MAX) return 0;
+    if (key == ordinal) {
+      const u64 epoch = load_cg(params.base_override_epochs + position);
+      return epoch != 0 && epoch <= snapshot_epoch;
+    }
+    if (key == kBaseOverrideEmpty) return false;
     position = (position + 1) & mask;
   }
-  return 0;
+  return false;
 }
 
 __device__ bool delta_visible(const DeviceDeltaRecord& record, u64 snapshot_epoch) {
+  const u64 superseded = load_cg(&record.superseded_epoch);
+  return record.epoch <= snapshot_epoch &&
+    (superseded == 0 || superseded > snapshot_epoch) &&
+    (record.flags & (kDeltaDeleted | kDeltaDurable)) == 0;
+}
+
+__device__ bool delta_code_visible(const DeviceDeltaRecord& record,
+                                   u64 snapshot_epoch) {
   const u64 superseded = load_cg(&record.superseded_epoch);
   return record.epoch <= snapshot_epoch &&
     (superseded == 0 || superseded > snapshot_epoch) &&
@@ -262,15 +394,18 @@ __device__ f32 approximate_handle(const PersistentKernelParams& params,
                                   u32 handle, u64 snapshot_epoch) {
   if ((handle & kDeltaHandleBit) == 0) {
     if (handle >= params.num_nodes) return FLT_MAX;
-    const u64 override_epoch = base_override_epoch(params, handle);
-    if (override_epoch != 0 && override_epoch <= snapshot_epoch) return FLT_MAX;
     return approximate_entry(params, query_lut,
       params.pq_codes + static_cast<size_t>(handle) * params.pq_code_bytes);
   }
-  const u32 slot = handle & kDeltaHandleMask;
+  u64 raw = 0;
+  u64 graph_offset = 0;
+  u32 shard = 0;
+  if (!resolve_handle(params, handle, raw, shard, graph_offset)) return FLT_MAX;
+  const u32 slot = delta_slot_from_raw(params, raw);
   if (slot >= min(load_cg(params.delta_count), params.delta_capacity)) return FLT_MAX;
   const DeviceDeltaRecord& record = params.delta_records[slot];
-  if (!delta_visible(record, snapshot_epoch)) return FLT_MAX;
+  if (record.remote_node != raw) return FLT_MAX;
+  if (!delta_code_visible(record, snapshot_epoch)) return FLT_MAX;
   return approximate_entry(params, query_lut,
     params.delta_pq_codes + static_cast<size_t>(slot) * params.pq_code_bytes);
 }
@@ -351,46 +486,191 @@ __device__ void sort_candidates(u32* handles, u32* ids, f32* distances,
   }
 }
 
+template <class BlockSort, u32 ItemsPerThread>
+__device__ void merge_approximate_radix(
+    u32* candidate_handles, f32* candidate_distances, u32 candidate_count,
+    u32* beam_handles, u32* beam_ids, f32* beam_distances,
+    u8* beam_expanded, u32& beam_count, u32 beam_capacity,
+    u32 existing_count, u32 merge_count,
+    typename BlockSort::TempStorage& radix_storage) {
+  f32 local_distances[ItemsPerThread];
+  u64 local_values[ItemsPerThread];
+  for (u32 item = 0; item < ItemsPerThread; ++item) {
+    const u32 index = threadIdx.x * ItemsPerThread + item;
+    u32 handle = UINT32_MAX;
+    u32 expanded = 0;
+    f32 distance = FLT_MAX;
+    if (index < existing_count) {
+      handle = beam_handles[index];
+      expanded = beam_expanded[index];
+      distance = beam_distances[index];
+    } else if (index < merge_count) {
+      const u32 candidate = index - existing_count;
+      handle = candidate_handles[candidate];
+      distance = candidate_distances[candidate];
+    }
+    if (handle == UINT32_MAX || !isfinite(distance)) {
+      handle = UINT32_MAX;
+      expanded = 0;
+      distance = FLT_MAX;
+    }
+    local_distances[item] = distance;
+    local_values[item] = static_cast<u64>(handle) |
+      (static_cast<u64>(expanded != 0) << 32);
+  }
+  __syncthreads();
+  BlockSort(radix_storage).Sort(local_distances, local_values);
+  for (u32 item = 0; item < ItemsPerThread; ++item) {
+    const u32 output = threadIdx.x * ItemsPerThread + item;
+    if (output >= beam_capacity) continue;
+    beam_handles[output] = static_cast<u32>(local_values[item]);
+    beam_ids[output] = UINT32_MAX;
+    beam_distances[output] = local_distances[item];
+    beam_expanded[output] = static_cast<u8>((local_values[item] >> 32) != 0);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    u32 valid = 0;
+    const u32 limit = min(merge_count, beam_capacity);
+    while (valid < limit && beam_handles[valid] != UINT32_MAX &&
+           isfinite(beam_distances[valid]) && beam_distances[valid] != FLT_MAX) {
+      ++valid;
+    }
+    beam_count = valid;
+  }
+  __syncthreads();
+}
+
+__device__ void merge_approximate_compact(
+    u32* candidate_handles, f32* candidate_distances,
+    u32* beam_handles, u32* beam_ids, f32* beam_distances,
+    u8* beam_expanded, u32& beam_count, u32 beam_capacity,
+    u32 existing_count, u32 merge_count,
+    u32* scratch_handles, u32* scratch_expanded, f32* scratch_distances,
+    CandidateWorkspace& workspace) {
+  constexpr u32 pass_items =
+    kApproximateSortThreadsCompact * kApproximateSortItemsCompactPass;
+  for (u32 pass = 0; pass < 2; ++pass) {
+    f32 local_distances[kApproximateSortItemsCompactPass];
+    u64 local_values[kApproximateSortItemsCompactPass];
+    for (u32 item = 0; item < kApproximateSortItemsCompactPass; ++item) {
+      const u32 index = pass * pass_items +
+        threadIdx.x * kApproximateSortItemsCompactPass + item;
+      u32 handle = UINT32_MAX;
+      u32 expanded = 0;
+      f32 distance = FLT_MAX;
+      if (index < existing_count) {
+        handle = beam_handles[index];
+        expanded = beam_expanded[index];
+        distance = beam_distances[index];
+      } else if (index < merge_count) {
+        const u32 candidate = index - existing_count;
+        handle = candidate_handles[candidate];
+        distance = candidate_distances[candidate];
+      }
+      if (handle == UINT32_MAX || !isfinite(distance)) {
+        handle = UINT32_MAX;
+        expanded = 0;
+        distance = FLT_MAX;
+      }
+      local_distances[item] = distance;
+      local_values[item] = static_cast<u64>(handle) |
+        (static_cast<u64>(expanded != 0) << 32);
+    }
+    __syncthreads();
+    ApproximateBlockSortCompactPass(workspace.sort.radix_sort_compact_pass)
+      .Sort(local_distances, local_values);
+    for (u32 item = 0; item < kApproximateSortItemsCompactPass; ++item) {
+      const u32 output =
+        threadIdx.x * kApproximateSortItemsCompactPass + item;
+      if (output >= beam_capacity) continue;
+      const u32 destination = pass * beam_capacity + output;
+      scratch_handles[destination] = static_cast<u32>(local_values[item]);
+      scratch_expanded[destination] =
+        static_cast<u32>((local_values[item] >> 32) != 0);
+      scratch_distances[destination] = local_distances[item];
+    }
+    __syncthreads();
+  }
+
+  f32 final_distances[kApproximateSortItemsCompactFinal];
+  u64 final_values[kApproximateSortItemsCompactFinal];
+  const u32 scratch_count = beam_capacity * 2;
+  for (u32 item = 0; item < kApproximateSortItemsCompactFinal; ++item) {
+    const u32 index =
+      threadIdx.x * kApproximateSortItemsCompactFinal + item;
+    u32 handle = UINT32_MAX;
+    u32 expanded = 0;
+    f32 distance = FLT_MAX;
+    if (index < scratch_count) {
+      handle = scratch_handles[index];
+      expanded = scratch_expanded[index];
+      distance = scratch_distances[index];
+    }
+    final_distances[item] = distance;
+    final_values[item] = static_cast<u64>(handle) |
+      (static_cast<u64>(expanded != 0) << 32);
+  }
+  __syncthreads();
+  ApproximateBlockSortCompactFinal(workspace.sort.radix_sort_compact_final)
+    .Sort(final_distances, final_values);
+  for (u32 item = 0; item < kApproximateSortItemsCompactFinal; ++item) {
+    const u32 output =
+      threadIdx.x * kApproximateSortItemsCompactFinal + item;
+    if (output >= beam_capacity) continue;
+    beam_handles[output] = static_cast<u32>(final_values[item]);
+    beam_ids[output] = UINT32_MAX;
+    beam_distances[output] = final_distances[item];
+    beam_expanded[output] =
+      static_cast<u8>((final_values[item] >> 32) != 0);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    u32 valid = 0;
+    while (valid < beam_capacity && beam_handles[valid] != UINT32_MAX &&
+           isfinite(beam_distances[valid]) && beam_distances[valid] != FLT_MAX) {
+      ++valid;
+    }
+    beam_count = valid;
+  }
+  __syncthreads();
+}
+
 __device__ void merge_approximate_into_beam(
     u32* candidate_handles, f32* candidate_distances, u32 candidate_count,
     u32* beam_handles, u32* beam_ids, f32* beam_distances,
     u8* beam_expanded, u32& beam_count, u32 beam_capacity,
     u32* merge_handles, u32* merge_ids, f32* merge_distances,
-    u8* merge_expanded) {
+    u8* merge_expanded, u32* compact_scratch_handles,
+    u32* compact_scratch_expanded, f32* compact_scratch_distances,
+    CandidateWorkspace& workspace) {
   const u32 existing_count = beam_count;
   const u32 merge_count = existing_count + candidate_count;
-  for (u32 index = threadIdx.x; index < existing_count; index += blockDim.x) {
-    merge_handles[index] = beam_handles[index];
-    merge_ids[index] = beam_ids[index];
-    merge_distances[index] = beam_distances[index];
-    merge_expanded[index] = beam_expanded[index];
+  if (blockDim.x != kApproximateSortThreadsWide &&
+      blockDim.x != kApproximateSortThreadsCompact) {
+    if (threadIdx.x == 0) beam_count = 0;
+    __syncthreads();
+    return;
   }
-  for (u32 index = threadIdx.x; index < candidate_count; index += blockDim.x) {
-    const u32 destination = existing_count + index;
-    merge_handles[destination] = candidate_handles[index];
-    merge_ids[destination] = UINT32_MAX;
-    merge_distances[destination] = candidate_distances[index];
-    merge_expanded[destination] = 0;
+  if (blockDim.x == kApproximateSortThreadsWide) {
+    merge_approximate_radix<ApproximateBlockSortWide,
+                            kApproximateSortItemsWide>(
+      candidate_handles, candidate_distances, candidate_count,
+      beam_handles, beam_ids, beam_distances, beam_expanded,
+      beam_count, beam_capacity, existing_count, merge_count,
+      workspace.sort.radix_sort_wide);
+  } else {
+    merge_approximate_compact(
+      candidate_handles, candidate_distances,
+      beam_handles, beam_ids, beam_distances, beam_expanded,
+      beam_count, beam_capacity, existing_count, merge_count,
+      compact_scratch_handles, compact_scratch_expanded,
+      compact_scratch_distances, workspace);
   }
-  __syncthreads();
-  sort_candidates(merge_handles, merge_ids, merge_distances, merge_expanded,
-                  merge_count);
-  if (threadIdx.x == 0) {
-    u32 valid = 0;
-    while (valid < merge_count && merge_handles[valid] != UINT32_MAX &&
-           isfinite(merge_distances[valid]) && merge_distances[valid] != FLT_MAX) {
-      ++valid;
-    }
-    beam_count = min(valid, beam_capacity);
-  }
-  __syncthreads();
-  for (u32 index = threadIdx.x; index < beam_count; index += blockDim.x) {
-    beam_handles[index] = merge_handles[index];
-    beam_ids[index] = merge_ids[index];
-    beam_distances[index] = merge_distances[index];
-    beam_expanded[index] = merge_expanded[index];
-  }
-  __syncthreads();
+  (void)merge_handles;
+  (void)merge_ids;
+  (void)merge_distances;
+  (void)merge_expanded;
 }
 
 __device__ __forceinline__ f32 storage_component(
@@ -506,7 +786,9 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
                                   const u64* remote_offsets, u32 request_count,
                                   u8* destination_base, u32 destination_stride,
                                   u32 bytes, u32 lane,
-                                  const u64* local_iova_offsets = nullptr) {
+                                  const u64* local_iova_offsets = nullptr,
+                                  i32* owner_completion = nullptr,
+                                  bool defer_owner_wait = false) {
 #ifdef DVSTOR_HAVE_GPUNETIO
   if (memory_node >= params.direct_region_count || params.direct_qps == nullptr ||
       params.direct_qp_locks == nullptr || params.direct_qps_per_node == 0 ||
@@ -520,6 +802,38 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
   const u32 qp_index = (lane % params.direct_qps_per_node) *
     params.direct_region_count + memory_node;
   if (params.direct_qps[qp_index] == nullptr) return -EINVAL;
+  if (params.direct_batch_queues != nullptr && owner_completion != nullptr) {
+    if (qp_index >= params.direct_batch_queue_count) return -EINVAL;
+    atomicExch(owner_completion, -EINPROGRESS);
+    __threadfence();
+    device_ring_push(params.direct_batch_queues[qp_index], DirectBatchDescriptor{
+      .request_shards = request_shards,
+      .remote_offsets = remote_offsets,
+      .local_iova_offsets = local_iova_offsets,
+      .completion_status = owner_completion,
+      .request_count = request_count,
+      .memory_node = memory_node,
+      .bytes = bytes,
+    });
+    if (defer_owner_wait) return -EINPROGRESS;
+    const u64 started = global_time_ns();
+    for (;;) {
+      const i32 status = *reinterpret_cast<volatile i32*>(owner_completion);
+      if (status != -EINPROGRESS) return status;
+      if (*reinterpret_cast<const volatile u32*>(params.stop) != 0) return -ECANCELED;
+      if (*reinterpret_cast<const volatile u32*>(params.direct_disabled) != 0) {
+        return -EHOSTDOWN;
+      }
+      if (global_time_ns() - started >= params.direct_timeout_ns) {
+        if (params.direct_error != nullptr) {
+          atomicCAS(params.direct_error, 0, -ETIMEDOUT);
+        }
+        atomicExch(params.direct_disabled, 1u);
+        return -ETIMEDOUT;
+      }
+      device_ring_relax(128);
+    }
+  }
   auto* qp = reinterpret_cast<doca_gpu_dev_verbs_qp*>(params.direct_qps[qp_index]);
   if (bytes > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE ||
       matching + (qp->need_dump ? 1u : 0u) > qp->sq_wqe_num) return -E2BIG;
@@ -582,8 +896,168 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
   (void)bytes;
   (void)lane;
   (void)local_iova_offsets;
+  (void)owner_completion;
   return -ENOTSUP;
 #endif
+}
+
+__device__ i32 wait_direct_batch(const PersistentKernelParams& params,
+                                 i32* owner_completion) {
+#ifdef DVSTOR_HAVE_GPUNETIO
+  if (owner_completion == nullptr) return -EINVAL;
+  const u64 started = global_time_ns();
+  for (;;) {
+    const i32 status = *reinterpret_cast<volatile i32*>(owner_completion);
+    if (status != -EINPROGRESS) return status;
+    if (*reinterpret_cast<const volatile u32*>(params.stop) != 0) {
+      return -ECANCELED;
+    }
+    if (*reinterpret_cast<const volatile u32*>(params.direct_disabled) != 0) {
+      return -EHOSTDOWN;
+    }
+    if (global_time_ns() - started >= params.direct_timeout_ns) {
+      if (params.direct_error != nullptr) {
+        atomicCAS(params.direct_error, 0, -ETIMEDOUT);
+      }
+      atomicExch(params.direct_disabled, 1u);
+      return -ETIMEDOUT;
+    }
+    device_ring_relax(128);
+  }
+#else
+  (void)params;
+  (void)owner_completion;
+  return -ENOTSUP;
+#endif
+}
+
+__device__ bool exact_record_visible(const u8* record) {
+  const u64 header = *reinterpret_cast<const u64*>(record);
+  return (header & (kNodeLockMask | kNodeDeletedMask)) == 0;
+}
+
+__device__ bool admit_graph_cache(const PersistentKernelParams& params, u64 key) {
+  if (params.graph_admission_sets == 0 || params.graph_admission_keys == nullptr ||
+      params.graph_admission_victims == nullptr) return true;
+  const u32 set = hash64(key) % params.graph_admission_sets;
+  const u32 base = set * kCacheAdmissionWays;
+  for (u32 way = 0; way < kCacheAdmissionWays; ++way) {
+    if (load_cg(params.graph_admission_keys + base + way) == key) return true;
+  }
+  const u32 way = atomicAdd(params.graph_admission_victims + set, 1u) %
+    kCacheAdmissionWays;
+  atomicExch(reinterpret_cast<unsigned long long*>(
+               params.graph_admission_keys + base + way), key);
+  return false;
+}
+
+__device__ bool admit_exact_cache(const PersistentKernelParams& params, u32 key) {
+  if (params.exact_admission_sets == 0 || params.exact_admission_keys == nullptr ||
+      params.exact_admission_victims == nullptr) return true;
+  const u32 set = hash32(key) % params.exact_admission_sets;
+  const u32 base = set * kCacheAdmissionWays;
+  for (u32 way = 0; way < kCacheAdmissionWays; ++way) {
+    if (load_cg(params.exact_admission_keys + base + way) == key) return true;
+  }
+  const u32 way = atomicAdd(params.exact_admission_victims + set, 1u) %
+    kCacheAdmissionWays;
+  atomicExch(params.exact_admission_keys + base + way, key);
+  return false;
+}
+
+__device__ bool approximate_handles_batch(const PersistentKernelParams& params,
+                                          const QueryDescriptor& descriptor,
+                                          const f32* query_lut,
+                                          u32* handles,
+                                          u32 count,
+                                          f32* distances) {
+  __shared__ i32 shard_status[kPersistentMaxShards];
+  __shared__ u32 failed;
+  const size_t request_base =
+    static_cast<size_t>(descriptor.query_slot) * kPersistentMaxMergeCandidates;
+  u32* request_shards = params.dynamic_code_request_shards + request_base;
+  u64* request_offsets = params.dynamic_code_request_offsets + request_base;
+  u64* request_local_iova_offsets =
+    params.dynamic_code_request_local_iovas + request_base;
+  if (threadIdx.x == 0) failed = 0;
+  for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
+    const u32 handle = handles[index];
+    request_shards[index] = UINT32_MAX;
+    request_offsets[index] = 0;
+    request_local_iova_offsets[index] = 0;
+    distances[index] = FLT_MAX;
+    if (handle == UINT32_MAX) continue;
+    if ((handle & kDeltaHandleBit) == 0) {
+      distances[index] = approximate_handle(
+        params, query_lut, handle, descriptor.snapshot_epoch);
+      continue;
+    }
+
+    u64 raw = 0;
+    u64 graph_offset = 0;
+    u32 shard = 0;
+    if (!resolve_handle(params, handle, raw, shard, graph_offset)) continue;
+    const u32 delta_slot = delta_slot_from_raw(params, raw);
+    const u32 delta_count = min(load_cg(params.delta_count), params.delta_capacity);
+    if (delta_slot < delta_count &&
+        params.delta_records[delta_slot].remote_node == raw) {
+      const DeviceDeltaRecord& record = params.delta_records[delta_slot];
+      if (delta_code_visible(record, descriptor.snapshot_epoch)) {
+        distances[index] = approximate_entry(
+          params, query_lut,
+          params.delta_pq_codes +
+            static_cast<size_t>(delta_slot) * params.pq_code_bytes);
+        continue;
+      }
+    }
+
+    if (params.dynamic_code_records == nullptr || shard >= params.num_shards) continue;
+    const u64 node_offset = (raw << 16) >> 16;
+    request_shards[index] = shard;
+    request_offsets[index] = node_offset + params.shards[shard].dynamic_code_offset;
+    u8* destination = params.dynamic_code_records +
+      (request_base + index) * params.pq_code_bytes;
+    request_local_iova_offsets[index] =
+      reinterpret_cast<u64>(destination) - params.direct_local_iova_base;
+  }
+  for (u32 shard = threadIdx.x; shard < params.num_shards; shard += blockDim.x) {
+    shard_status[shard] = 0;
+  }
+  __syncthreads();
+
+  for (u32 shard = threadIdx.x; shard < params.num_shards; shard += blockDim.x) {
+    i32* owner_completion = params.direct_batch_statuses == nullptr ? nullptr :
+      params.direct_batch_statuses +
+        static_cast<size_t>(descriptor.query_slot) * params.num_shards + shard;
+    shard_status[shard] = direct_fetch_batch(
+        params, shard, request_shards, request_offsets, count,
+        params.dynamic_code_records + request_base * params.pq_code_bytes,
+        params.pq_code_bytes, params.pq_code_bytes,
+        (descriptor.query_slot + shard) % params.direct_qps_per_node,
+        request_local_iova_offsets, owner_completion, true);
+  }
+  __syncthreads();
+  for (u32 shard = threadIdx.x; shard < params.num_shards; shard += blockDim.x) {
+    if (shard_status[shard] != -EINPROGRESS) continue;
+    i32* owner_completion = params.direct_batch_statuses +
+      static_cast<size_t>(descriptor.query_slot) * params.num_shards + shard;
+    shard_status[shard] = wait_direct_batch(params, owner_completion);
+  }
+  __syncthreads();
+
+  for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
+    const u32 shard = request_shards[index];
+    if (shard == UINT32_MAX) continue;
+    if (shard_status[shard] != 0) {
+      atomicExch(&failed, 1u);
+      continue;
+    }
+    const u8* code = params.dynamic_code_records +
+      (request_base + index) * params.pq_code_bytes;
+    distances[index] = approximate_entry(params, query_lut, code);
+  }
+  __syncthreads();
+  return failed == 0;
 }
 
 __device__ void exactify_into_beam(const PersistentKernelParams& params,
@@ -597,34 +1071,45 @@ __device__ void exactify_into_beam(const PersistentKernelParams& params,
                                    u32 beam_capacity, bool reset_beam,
                                    u32* merge_handles, u32* merge_ids,
                                    f32* merge_distances, u8* merge_expanded) {
-    constexpr u32 warp_width = 32;
-    const u32 warp = threadIdx.x / warp_width;
-    const u32 lane_in_warp = threadIdx.x % warp_width;
-    const u32 warp_count = max(1u, blockDim.x / warp_width);
-    __shared__ u32 request_shards[kPersistentMaxExact];
-    __shared__ u64 request_offsets[kPersistentMaxExact];
-    __shared__ u64 request_local_iova_offsets[kPersistentMaxExact];
     __shared__ u32 request_cache_slots[kPersistentMaxExact];
+    __shared__ u32 request_delta_slots[kPersistentMaxExact];
     __shared__ u8 request_cache_owned[kPersistentMaxExact];
     __shared__ i32 shard_status[kPersistentMaxShards];
+    const size_t request_base =
+      static_cast<size_t>(descriptor.query_slot) * kPersistentMaxMergeCandidates;
+    u32* request_shards = params.dynamic_code_request_shards + request_base;
+    u64* request_offsets = params.dynamic_code_request_offsets + request_base;
+    u64* request_local_iova_offsets =
+      params.dynamic_code_request_local_iovas + request_base;
     for (u32 index = threadIdx.x; index < candidate_count; index += blockDim.x) {
       request_shards[index] = UINT32_MAX;
       request_offsets[index] = 0;
       request_cache_slots[index] = UINT32_MAX;
+      request_delta_slots[index] = UINT32_MAX;
       request_cache_owned[index] = 0;
       candidate_ids[index] = UINT32_MAX;
       candidate_distances[index] = FLT_MAX;
       const u32 handle = candidate_handles[index];
-      if ((handle & kDeltaHandleBit) != 0) continue;
-      const u64 override_epoch = base_override_epoch(params, handle);
-      if (override_epoch != 0 && override_epoch <= descriptor.snapshot_epoch) continue;
+      const bool dynamic = (handle & kDeltaHandleBit) != 0;
+      if (!dynamic && base_overridden(params, handle, descriptor.snapshot_epoch)) continue;
       u64 raw = 0;
       u64 graph_offset = 0;
       u32 shard = 0;
       if (!resolve_handle(params, handle, raw, shard, graph_offset)) continue;
+      if (dynamic) {
+        const u32 delta_slot = delta_slot_from_raw(params, raw);
+        const u32 delta_count = min(load_cg(params.delta_count), params.delta_capacity);
+        if (delta_slot < delta_count &&
+            params.delta_records[delta_slot].remote_node == raw &&
+            delta_code_visible(params.delta_records[delta_slot],
+                               descriptor.snapshot_epoch)) {
+          request_delta_slots[index] = delta_slot;
+          continue;
+        }
+      }
       request_offsets[index] = ((raw << 16) >> 16) + params.node_meta_offset;
       u32 cache_slot = UINT32_MAX;
-      if (params.exact_cache_sets != 0 && params.exact_cache_ways != 0) {
+      if (!dynamic && params.exact_cache_sets != 0 && params.exact_cache_ways != 0) {
         const u32 set = hash32(handle) % params.exact_cache_sets;
         bool cache_hit = false;
         for (u32 way = 0; way < params.exact_cache_ways; ++way) {
@@ -638,17 +1123,21 @@ __device__ void exactify_into_beam(const PersistentKernelParams& params,
                 load_cg(params.exact_cache_keys + slot) == handle) {
               const u8* record = params.exact_cache +
                 static_cast<size_t>(slot) * params.exact_cache_stride;
-              candidate_ids[index] = *reinterpret_cast<const u32*>(record);
-              candidate_distances[index] = exact_storage_distance(params, query, record + 8);
-              atomicAdd(exact_cache_hits, 1u);
-              cache_hit = true;
+              if (exact_record_visible(record)) {
+                candidate_ids[index] =
+                  *reinterpret_cast<const u32*>(record + kNodeIdOffset);
+                candidate_distances[index] = exact_storage_distance(
+                  params, query, record + kNodeVectorOffset);
+                atomicAdd(exact_cache_hits, 1u);
+                cache_hit = true;
+              }
             }
             atomicSub(params.exact_cache_readers + slot, 1u);
             if (cache_hit) break;
           }
         }
         if (cache_hit) continue;
-        if (cache_slot == UINT32_MAX) {
+        if (cache_slot == UINT32_MAX && admit_exact_cache(params, handle)) {
           const u32 start_way = atomicAdd(params.exact_cache_victims + set, 1u) %
             params.exact_cache_ways;
           for (u32 attempt = 0; attempt < params.exact_cache_ways; ++attempt) {
@@ -660,12 +1149,18 @@ __device__ void exactify_into_beam(const PersistentKernelParams& params,
                 atomicCAS(params.exact_cache_states + slot, state, 1u) != state) {
               continue;
             }
-            params.exact_cache_keys[slot] = handle;
-            __threadfence();
+            u32 wait = 0;
             while (*reinterpret_cast<volatile u32*>(params.exact_cache_readers + slot) != 0 &&
-                   *reinterpret_cast<volatile u32*>(params.stop) == 0) {
+                   *reinterpret_cast<volatile u32*>(params.stop) == 0 &&
+                   wait++ < kCacheWaitRounds) {
               device_ring_relax(128);
             }
+            if (*reinterpret_cast<volatile u32*>(params.exact_cache_readers + slot) != 0) {
+              atomicCAS(params.exact_cache_states + slot, 1u, state);
+              continue;
+            }
+            params.exact_cache_keys[slot] = handle;
+            __threadfence();
             cache_slot = slot;
             request_cache_owned[index] = 1;
             break;
@@ -686,29 +1181,37 @@ __device__ void exactify_into_beam(const PersistentKernelParams& params,
       shard_status[shard] = 0;
     }
     __syncthreads();
-    for (u32 base = 0; base < params.num_shards; base += warp_count) {
-      if (lane_in_warp == 0 && warp < warp_count && base + warp < params.num_shards) {
-        const u32 shard = base + warp;
-        shard_status[shard] = direct_fetch_batch(
+    for (u32 shard = threadIdx.x; shard < params.num_shards; shard += blockDim.x) {
+      i32* owner_completion = params.direct_batch_statuses == nullptr ? nullptr :
+        params.direct_batch_statuses +
+          static_cast<size_t>(descriptor.query_slot) * params.num_shards + shard;
+      shard_status[shard] = direct_fetch_batch(
           params, shard, request_shards, request_offsets, candidate_count,
           params.exact_records + static_cast<size_t>(descriptor.query_slot) *
             params.exact_width * params.node_record_bytes,
           params.node_record_bytes, params.node_record_bytes,
           (descriptor.query_slot + shard) % params.direct_qps_per_node,
-          request_local_iova_offsets);
-      }
-      __syncthreads();
+          request_local_iova_offsets, owner_completion, true);
     }
+    __syncthreads();
+    for (u32 shard = threadIdx.x; shard < params.num_shards; shard += blockDim.x) {
+      if (shard_status[shard] != -EINPROGRESS) continue;
+      i32* owner_completion = params.direct_batch_statuses +
+        static_cast<size_t>(descriptor.query_slot) * params.num_shards + shard;
+      shard_status[shard] = wait_direct_batch(params, owner_completion);
+    }
+    __syncthreads();
     for (u32 index = threadIdx.x; index < candidate_count; index += blockDim.x) {
-      const u32 handle = candidate_handles[index];
-      if ((handle & kDeltaHandleBit) != 0) {
-        const u32 slot = handle & kDeltaHandleMask;
-        if (slot < min(load_cg(params.delta_count), params.delta_capacity) &&
-            delta_visible(params.delta_records[slot], descriptor.snapshot_epoch)) {
-          candidate_ids[index] = params.delta_records[slot].id;
+      const u32 delta_slot = request_delta_slots[index];
+      if (delta_slot != UINT32_MAX) {
+        if (delta_slot < min(load_cg(params.delta_count), params.delta_capacity) &&
+            delta_code_visible(params.delta_records[delta_slot],
+                               descriptor.snapshot_epoch)) {
+          candidate_ids[index] = params.delta_records[delta_slot].id;
           candidate_distances[index] = exact_storage_distance(
             params, query,
-            params.delta_vectors + static_cast<size_t>(slot) * params.vector_bytes);
+            params.delta_vectors +
+              static_cast<size_t>(delta_slot) * params.vector_bytes);
         }
         continue;
       }
@@ -728,8 +1231,12 @@ __device__ void exactify_into_beam(const PersistentKernelParams& params,
         : params.exact_records +
             (static_cast<size_t>(descriptor.query_slot) * params.exact_width + index) *
               params.node_record_bytes;
-      candidate_ids[index] = *reinterpret_cast<const u32*>(record);
-      candidate_distances[index] = exact_storage_distance(params, query, record + 8);
+      if (exact_record_visible(record)) {
+        candidate_ids[index] =
+          *reinterpret_cast<const u32*>(record + kNodeIdOffset);
+        candidate_distances[index] = exact_storage_distance(
+          params, query, record + kNodeVectorOffset);
+      }
       if (shard != UINT32_MAX) atomicAdd(exact_reads, 1u);
       if (cache_owned) {
         __threadfence();
@@ -793,27 +1300,48 @@ __device__ bool valid_graph_record(const PersistentKernelParams& params, const u
 
 __device__ bool prepare_graph_record(const PersistentKernelParams& params,
                                      u32 handle,
+                                     u32 query_slot,
+                                     u32 request_index,
                                      u32& acquired_slot,
                                      u32& request_shard,
                                      u64& request_offset,
                                      u64& request_local_iova,
-                                     bool& cache_hit) {
+                                     bool& cache_hit,
+                                     bool& route_hit) {
   acquired_slot = UINT32_MAX;
   request_shard = UINT32_MAX;
   request_offset = 0;
   request_local_iova = 0;
   cache_hit = false;
+  route_hit = false;
   u64 raw = 0;
   u64 graph_offset = 0;
   u32 shard = 0;
-  if (!resolve_handle(params, handle, raw, shard, graph_offset) ||
-      params.graph_cache_sets == 0) return false;
+  if (!resolve_handle(params, handle, raw, shard, graph_offset)) return false;
   const u64 graph_key = (static_cast<u64>(shard) << 48) | graph_offset;
+  const u32 route_slot = anchor_graph_slot(params, graph_key);
+  if (route_slot != UINT32_MAX && params.anchor_graph_states != nullptr &&
+      params.anchor_graph_readers != nullptr &&
+      load_cg(params.anchor_graph_states + route_slot) == kGraphCacheReady) {
+    atomicAdd(params.anchor_graph_readers + route_slot, 1u);
+    __threadfence();
+    if (load_cg(params.anchor_graph_states + route_slot) == kGraphCacheReady &&
+        load_cg(params.anchor_graph_keys + route_slot) == graph_key) {
+      acquired_slot = kGraphRouteBit | route_slot;
+      route_hit = true;
+      return true;
+    }
+    atomicSub(params.anchor_graph_readers + route_slot, 1u);
+  }
   const u64 generation = load_cg(params.graph_cache_generation);
-  const u32 set = hash64(graph_key) % params.graph_cache_sets;
+  const u32 set = params.graph_cache_sets == 0
+    ? 0 : hash64(graph_key) % params.graph_cache_sets;
   const u32 way_count = params.graph_cache_ways;
 
-  for (;;) {
+  bool contended = false;
+  for (u32 lookup_round = 0;
+       lookup_round < 2 && params.graph_cache_sets != 0 && way_count != 0;
+       ++lookup_round) {
     bool retry_lookup = false;
     for (u32 way = 0; way < way_count; ++way) {
       const u32 slot = set * way_count + way;
@@ -839,7 +1367,8 @@ __device__ bool prepare_graph_record(const PersistentKernelParams& params,
       if ((state == kGraphCacheFilling || state == kGraphCacheFillInvalidated) &&
           load_cg(params.graph_cache_keys + slot) == graph_key &&
           load_cg(params.graph_cache_generations + slot) == generation) {
-        for (;;) {
+        u32 wait = 0;
+        for (; wait < kCacheWaitRounds; ++wait) {
           const u32 current = *reinterpret_cast<volatile u32*>(
             params.graph_cache_states + slot);
           if ((current != kGraphCacheFilling &&
@@ -847,12 +1376,20 @@ __device__ bool prepare_graph_record(const PersistentKernelParams& params,
               *reinterpret_cast<volatile u32*>(params.stop) != 0) break;
           device_ring_relax(128);
         }
-        retry_lookup = true;
+        const u32 current = *reinterpret_cast<volatile u32*>(
+          params.graph_cache_states + slot);
+        retry_lookup = current != kGraphCacheFilling &&
+          current != kGraphCacheFillInvalidated;
+        contended = !retry_lookup;
         break;
       }
     }
     if (retry_lookup) continue;
+    break;
+  }
 
+  if (!contended && params.graph_cache_sets != 0 && way_count != 0 &&
+      admit_graph_cache(params, graph_key)) {
     const u32 start_way = atomicAdd(params.graph_cache_victims + set, 1u) % way_count;
     for (u32 attempt = 0; attempt < way_count; ++attempt) {
       const u32 slot = set * way_count + (start_way + attempt) % way_count;
@@ -860,13 +1397,26 @@ __device__ bool prepare_graph_record(const PersistentKernelParams& params,
       if (state == kGraphCacheFilling || state == kGraphCacheFillInvalidated ||
           atomicCAS(params.graph_cache_states + slot, state,
                     kGraphCacheFilling) != state) continue;
+      u32 wait = 0;
       while (*reinterpret_cast<volatile u32*>(params.graph_cache_readers + slot) != 0 &&
-             *reinterpret_cast<volatile u32*>(params.stop) == 0) {
+             *reinterpret_cast<volatile u32*>(params.stop) == 0 &&
+             wait++ < kCacheWaitRounds) {
         device_ring_relax(128);
       }
       if (*reinterpret_cast<volatile u32*>(params.stop) != 0) {
         atomicExch(params.graph_cache_states + slot, kGraphCacheEmpty);
         return false;
+      }
+      if (*reinterpret_cast<volatile u32*>(params.graph_cache_readers + slot) != 0) {
+        const u32 current = *reinterpret_cast<volatile u32*>(
+          params.graph_cache_states + slot);
+        if (current == kGraphCacheFilling) {
+          atomicCAS(params.graph_cache_states + slot, kGraphCacheFilling, state);
+        } else if (current == kGraphCacheFillInvalidated) {
+          atomicCAS(params.graph_cache_states + slot,
+                    kGraphCacheFillInvalidated, kGraphCacheStale);
+        }
+        continue;
       }
       params.graph_cache_keys[slot] = graph_key;
       params.graph_cache_generations[slot] = generation;
@@ -880,9 +1430,38 @@ __device__ bool prepare_graph_record(const PersistentKernelParams& params,
         params.direct_local_iova_base;
       return true;
     }
-    if (*reinterpret_cast<volatile u32*>(params.stop) != 0) return false;
-    device_ring_relax(128);
   }
+
+  if (*reinterpret_cast<volatile u32*>(params.stop) != 0 ||
+      params.graph_scratch == nullptr || request_index >= kPersistentMaxPrefetch) {
+    return false;
+  }
+  u8* destination = params.graph_scratch +
+    (static_cast<size_t>(query_slot) * kPersistentMaxPrefetch + request_index) *
+      kPersistentGraphCacheLineBytes;
+  acquired_slot = kGraphScratchBit | request_index;
+  request_shard = shard;
+  request_offset = graph_offset;
+  request_local_iova = reinterpret_cast<u64>(destination) -
+    params.direct_local_iova_base;
+  return true;
+}
+
+__device__ u8* graph_record_pointer(const PersistentKernelParams& params,
+                                    u32 query_slot, u32 acquired_slot) {
+  if ((acquired_slot & kGraphRouteBit) != 0) {
+    const u32 route_slot = acquired_slot & kGraphSlotMask;
+    return const_cast<u8*>(params.anchor_graph_records) +
+      static_cast<size_t>(route_slot) * params.graph_entry_bytes;
+  }
+  if ((acquired_slot & kGraphScratchBit) != 0) {
+    const u32 request_index = acquired_slot & kGraphSlotMask;
+    return params.graph_scratch +
+      (static_cast<size_t>(query_slot) * kPersistentMaxPrefetch + request_index) *
+        kPersistentGraphCacheLineBytes;
+  }
+  return params.graph_cache +
+    static_cast<size_t>(acquired_slot) * kPersistentGraphCacheLineBytes;
 }
 
 __device__ bool fetch_graph_records_batch(
@@ -893,12 +1472,16 @@ __device__ bool fetch_graph_records_batch(
     u32* acquired_slots,
     u32* remote_reads,
     u32* cache_hits,
+    u32* route_hits,
     u32* remote_batches) {
-  __shared__ u32 request_shards[kPersistentMaxPrefetch];
-  __shared__ u64 request_offsets[kPersistentMaxPrefetch];
-  __shared__ u64 request_local_iovas[kPersistentMaxPrefetch];
   __shared__ i32 shard_status[kPersistentMaxShards];
   __shared__ u32 failed;
+  const size_t request_base =
+    static_cast<size_t>(descriptor.query_slot) * kPersistentMaxMergeCandidates;
+  u32* request_shards = params.dynamic_code_request_shards + request_base;
+  u64* request_offsets = params.dynamic_code_request_offsets + request_base;
+  u64* request_local_iovas =
+    params.dynamic_code_request_local_iovas + request_base;
 
   if (threadIdx.x == 0) failed = 0;
   for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
@@ -908,6 +1491,7 @@ __device__ bool fetch_graph_records_batch(
     request_local_iovas[index] = 0;
     remote_reads[index] = 0;
     cache_hits[index] = 0;
+    route_hits[index] = 0;
   }
   for (u32 shard = threadIdx.x; shard < params.num_shards; shard += blockDim.x) {
     shard_status[shard] = 0;
@@ -918,16 +1502,23 @@ __device__ bool fetch_graph_records_batch(
   const u32 warp = threadIdx.x / warp_width;
   const u32 lane_in_warp = threadIdx.x % warp_width;
   const u32 warp_count = max(1u, blockDim.x / warp_width);
-  if (lane_in_warp == 0 && warp < count) {
-    bool cache_hit = false;
-    if (!prepare_graph_record(params, handles[warp], acquired_slots[warp],
-                              request_shards[warp], request_offsets[warp],
-                              request_local_iovas[warp], cache_hit)) {
-      atomicExch(&failed, 1u);
-    } else if (cache_hit) {
-      cache_hits[warp] = 1;
-    } else {
-      remote_reads[warp] = 1;
+  if (lane_in_warp == 0) {
+    for (u32 index = warp; index < count; index += warp_count) {
+      bool cache_hit = false;
+      bool route_hit = false;
+      if (!prepare_graph_record(params, handles[index], descriptor.query_slot,
+                                index, acquired_slots[index],
+                                request_shards[index], request_offsets[index],
+                                request_local_iovas[index], cache_hit,
+                                route_hit)) {
+        atomicExch(&failed, 1u);
+      } else if (route_hit) {
+        route_hits[index] = 1;
+      } else if (cache_hit) {
+        cache_hits[index] = 1;
+      } else {
+        remote_reads[index] = 1;
+      }
     }
   }
   __syncthreads();
@@ -935,8 +1526,12 @@ __device__ bool fetch_graph_records_batch(
     for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
       const u32 slot = acquired_slots[index];
       if (slot == UINT32_MAX) continue;
-      if (cache_hits[index] != 0) {
-        atomicSub(params.graph_cache_readers + slot, 1u);
+      if ((slot & kGraphRouteBit) != 0) {
+        release_graph_record(params, slot);
+      } else if ((slot & kGraphScratchBit) != 0) {
+        acquired_slots[index] = UINT32_MAX;
+      } else if (cache_hits[index] != 0) {
+        release_graph_record(params, slot);
       } else {
         atomicExch(params.graph_cache_states + slot, kGraphCacheEmpty);
       }
@@ -946,32 +1541,39 @@ __device__ bool fetch_graph_records_batch(
     return false;
   }
 
-  for (u32 base = 0; base < params.num_shards; base += warp_count) {
-    if (lane_in_warp == 0 && warp < warp_count && base + warp < params.num_shards) {
-      const u32 shard = base + warp;
-      u32 matching = 0;
-      for (u32 index = 0; index < count; ++index) {
-        matching += request_shards[index] == shard ? 1u : 0u;
-      }
-      if (matching != 0) atomicAdd(remote_batches, 1u);
-      shard_status[shard] = direct_fetch_batch(
+  for (u32 shard = threadIdx.x; shard < params.num_shards; shard += blockDim.x) {
+    u32 matching = 0;
+    for (u32 index = 0; index < count; ++index) {
+      matching += request_shards[index] == shard ? 1u : 0u;
+    }
+    if (matching != 0) atomicAdd(remote_batches, 1u);
+    i32* owner_completion = params.direct_batch_statuses == nullptr ? nullptr :
+      params.direct_batch_statuses +
+        static_cast<size_t>(descriptor.query_slot) * params.num_shards + shard;
+    shard_status[shard] = direct_fetch_batch(
         params, shard, request_shards, request_offsets, count,
         params.graph_cache, kPersistentGraphCacheLineBytes,
         params.graph_entry_bytes,
         (descriptor.query_slot + shard) % params.direct_qps_per_node,
-        request_local_iovas);
-    }
-    __syncthreads();
+        request_local_iovas, owner_completion, true);
   }
+  __syncthreads();
+  for (u32 shard = threadIdx.x; shard < params.num_shards; shard += blockDim.x) {
+    if (shard_status[shard] != -EINPROGRESS) continue;
+    i32* owner_completion = params.direct_batch_statuses +
+      static_cast<size_t>(descriptor.query_slot) * params.num_shards + shard;
+    shard_status[shard] = wait_direct_batch(params, owner_completion);
+  }
+  __syncthreads();
 
   for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
     const u32 shard = request_shards[index];
     if (shard == UINT32_MAX) continue;
     const u32 slot = acquired_slots[index];
-    u8* record = params.graph_cache +
-      static_cast<size_t>(slot) * kPersistentGraphCacheLineBytes;
+    const bool scratch = (slot & kGraphScratchBit) != 0;
+    u8* record = graph_record_pointer(params, descriptor.query_slot, slot);
     const bool ready = shard_status[shard] == 0 && valid_graph_record(params, record);
-    if (ready) {
+    if (ready && !scratch) {
       params.graph_cache_timestamps[slot] = global_time_ns();
       params.graph_cache_readers[slot] = 1;
       __threadfence();
@@ -983,15 +1585,28 @@ __device__ bool fetch_graph_records_batch(
       } else if (state != kGraphCacheFilling) {
         atomicExch(&failed, 1u);
       }
-    } else {
+    } else if (!ready) {
       __threadfence();
-      atomicExch(params.graph_cache_states + slot, kGraphCacheEmpty);
+      if (!scratch) atomicExch(params.graph_cache_states + slot, kGraphCacheEmpty);
       acquired_slots[index] = UINT32_MAX;
       atomicExch(&failed, 1u);
       if (shard_status[shard] == 0) {
         if (params.direct_error != nullptr) atomicCAS(params.direct_error, 0, -EBADMSG);
         atomicExch(params.direct_disabled, 1u);
       }
+    }
+  }
+  for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
+    if (route_hits[index] == 0) continue;
+    const u32 slot = acquired_slots[index];
+    const u8* record = graph_record_pointer(
+      params, descriptor.query_slot, slot);
+    if (!valid_graph_record(params, record)) {
+      atomicExch(&failed, 1u);
+      if (params.direct_error != nullptr) {
+        atomicCAS(params.direct_error, 0, -EBADMSG);
+      }
+      atomicExch(params.direct_disabled, 1u);
     }
   }
   __syncthreads();
@@ -1016,8 +1631,8 @@ __device__ void add_delta_candidates(const PersistentKernelParams& params,
                                      u32* beam_ids, f32* beam_distances,
                                      u8* beam_expanded, u32& beam_count,
                                      u32 beam_capacity,
-                                     u32* anchor_best_indices,
-                                     f32* anchor_best_distances) {
+                                     const u32* selected_anchors,
+                                     u32 selected_anchor_count) {
   __shared__ u32 delta_count_snapshot;
   if (threadIdx.x == 0) {
     delta_count_snapshot = min(load_cg(params.delta_count), params.delta_capacity);
@@ -1026,6 +1641,7 @@ __device__ void add_delta_candidates(const PersistentKernelParams& params,
   const u32 count = delta_count_snapshot;
   if (count == 0) return;
   __shared__ u32 candidate_handles[256];
+  __shared__ u32 candidate_slots[256];
   __shared__ f32 candidate_distances[256];
   u32 local_slot = UINT32_MAX;
   f32 local_approximation = FLT_MAX;
@@ -1042,61 +1658,12 @@ __device__ void add_delta_candidates(const PersistentKernelParams& params,
         local_slot = slot;
       }
     }
-  } else {
-    f32* anchor_distances = params.anchor_distances +
-      static_cast<size_t>(descriptor.query_slot) * params.anchor_count;
-    for (u32 anchor = threadIdx.x; anchor < params.anchor_count; anchor += blockDim.x) {
-      anchor_distances[anchor] = exact_anchor_distance(params, query, anchor);
-    }
-    __syncthreads();
-    __shared__ u32 selected[kPersistentMaxAnchorProbes];
-    __shared__ u32 selected_count;
-    if (threadIdx.x == 0) {
-      selected_count = min(params.delta_anchor_probes,
-                           min(params.anchor_count, kPersistentMaxAnchorProbes));
-    }
-    __syncthreads();
-    for (u32 index = 0; index < selected_count; ++index) {
-      u32 local_anchor = UINT32_MAX;
-      f32 local_distance = FLT_MAX;
-      for (u32 anchor = threadIdx.x; anchor < params.anchor_count;
-           anchor += blockDim.x) {
-        const f32 distance = anchor_distances[anchor];
-        if (distance < local_distance ||
-            (distance == local_distance && anchor < local_anchor)) {
-          local_distance = distance;
-          local_anchor = anchor;
-        }
-      }
-      anchor_best_indices[threadIdx.x] = local_anchor;
-      anchor_best_distances[threadIdx.x] = local_distance;
-      __syncthreads();
-      for (u32 stride = blockDim.x / 2; stride != 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-          const f32 candidate_distance = anchor_best_distances[threadIdx.x + stride];
-          const u32 candidate_anchor = anchor_best_indices[threadIdx.x + stride];
-          if (candidate_distance < anchor_best_distances[threadIdx.x] ||
-              (candidate_distance == anchor_best_distances[threadIdx.x] &&
-               candidate_anchor < anchor_best_indices[threadIdx.x])) {
-            anchor_best_distances[threadIdx.x] = candidate_distance;
-            anchor_best_indices[threadIdx.x] = candidate_anchor;
-          }
-        }
-        __syncthreads();
-      }
-      if (threadIdx.x == 0) {
-        selected[index] = anchor_best_indices[0];
-        if (selected[index] != UINT32_MAX) {
-          anchor_distances[selected[index]] = FLT_MAX;
-        }
-      }
-      __syncthreads();
-    }
-    if (selected_count != 0) {
-      const u32 probe = threadIdx.x % selected_count;
-      const u32 partition = threadIdx.x / selected_count;
-      const u32 partitions = (blockDim.x - 1 - probe) / selected_count + 1;
-      const u32 selected_anchor = selected[probe];
+  } else if (selected_anchor_count != 0) {
+      const u32 probe = threadIdx.x % selected_anchor_count;
+      const u32 partition = threadIdx.x / selected_anchor_count;
+      const u32 partitions =
+        (blockDim.x - 1 - probe) / selected_anchor_count + 1;
+      const u32 selected_anchor = selected_anchors[probe];
       u32 slot = selected_anchor == UINT32_MAX
         ? UINT32_MAX : load_cg(params.delta_bucket_heads + selected_anchor);
       u32 traversed = 0;
@@ -1116,10 +1683,11 @@ __device__ void add_delta_candidates(const PersistentKernelParams& params,
         slot = load_cg(params.delta_next + slot);
         ++position;
       }
-    }
   }
+  candidate_slots[threadIdx.x] = local_slot;
   candidate_handles[threadIdx.x] = local_slot == UINT32_MAX
-    ? UINT32_MAX : kDeltaHandleBit | local_slot;
+    ? UINT32_MAX
+    : handle_from_raw(params, params.delta_records[local_slot].remote_node);
   candidate_distances[threadIdx.x] = local_slot == UINT32_MAX
     ? FLT_MAX
     : exact_storage_distance(params, query,
@@ -1134,7 +1702,7 @@ __device__ void add_delta_candidates(const PersistentKernelParams& params,
         if (beam_handles[beam] == handle) duplicate = true;
       }
       if (!duplicate) {
-        const u32 slot = handle & kDeltaHandleMask;
+        const u32 slot = candidate_slots[index];
         beam_insert(beam_handles, beam_ids, beam_distances, beam_expanded, beam_count,
                     beam_capacity, handle, params.delta_records[slot].id,
                     candidate_distances[index]);
@@ -1156,6 +1724,9 @@ __device__ void process_query(const PersistentKernelParams& params,
     .query_slot = query_slot,
   };
   if (query_slot >= params.query_slots || descriptor.dim != params.dim ||
+      descriptor.query_dtype > 2 || params.decoded_queries == nullptr ||
+      params.navigation_candidate_handles == nullptr ||
+      params.navigation_candidate_distances == nullptr ||
       descriptor.k == 0 || descriptor.k > descriptor.result_capacity) {
     if (threadIdx.x == 0) {
       completion.status = -EINVAL;
@@ -1166,7 +1737,7 @@ __device__ void process_query(const PersistentKernelParams& params,
     return;
   }
 
-  const f32* query = reinterpret_cast<const f32*>(descriptor.query_device_address);
+  const u8* query_input = reinterpret_cast<const u8*>(descriptor.query_device_address);
   __shared__ u64 prepare_started_cycles;
   __shared__ u64 graph_phase_cycles;
   __shared__ u64 score_phase_cycles;
@@ -1179,6 +1750,11 @@ __device__ void process_query(const PersistentKernelParams& params,
     score_phase_cycles = 0;
     beam_phase_cycles = 0;
     exact_phase_cycles = 0;
+  }
+  __syncthreads();
+  f32* query = params.decoded_queries + static_cast<size_t>(query_slot) * params.dim;
+  for (u32 dimension = threadIdx.x; dimension < params.dim; dimension += blockDim.x) {
+    query[dimension] = query_component(query_input, descriptor.query_dtype, dimension);
   }
   __syncthreads();
   f32* transformed = params.transformed_queries +
@@ -1218,10 +1794,15 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ u32 shared_beam_ids[kPersistentMaxBeam];
   __shared__ f32 shared_beam_distances[kPersistentMaxBeam];
   __shared__ u8 shared_beam_expanded[kPersistentMaxBeam];
-  __shared__ u32 merge_handles[kPersistentMaxMergeCandidates];
-  __shared__ u32 merge_ids[kPersistentMaxMergeCandidates];
-  __shared__ f32 merge_distances[kPersistentMaxMergeCandidates];
-  __shared__ u8 merge_expanded[kPersistentMaxMergeCandidates];
+  __shared__ CandidateWorkspace candidate_workspace;
+  u32* merge_handles = candidate_workspace.arrays.handles;
+  u32* merge_ids = candidate_workspace.arrays.ids;
+  f32* merge_distances = candidate_workspace.arrays.distances;
+  u8* merge_expanded = candidate_workspace.arrays.expanded;
+  u32* navigation_handles = params.navigation_candidate_handles +
+    static_cast<size_t>(query_slot) * kPersistentMaxMergeCandidates;
+  f32* navigation_distances = params.navigation_candidate_distances +
+    static_cast<size_t>(query_slot) * kPersistentMaxMergeCandidates;
   u32* beam_handles = shared_beam_handles;
   u32* beam_ids = shared_beam_ids;
   f32* beam_distances = shared_beam_distances;
@@ -1248,63 +1829,94 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ u32 total_exact_reads;
   __shared__ u32 total_exact_cache_hits;
   __shared__ u32 seed_count;
+  __shared__ u32 selected_anchor_count;
   __shared__ u32 anchor_best_indices[256];
-  __shared__ f32 anchor_best_distances[256];
   if (params.anchor_count != 0 && params.anchor_vectors != nullptr &&
-      params.anchor_handles != nullptr && params.anchor_distances != nullptr) {
-    f32* anchor_distances = params.anchor_distances +
-      static_cast<size_t>(query_slot) * params.anchor_count;
-    for (u32 anchor = threadIdx.x; anchor < params.anchor_count; anchor += blockDim.x) {
-      anchor_distances[anchor] = exact_anchor_distance(params, query, anchor);
+      params.anchor_handles != nullptr && params.anchor_pq_codes != nullptr) {
+    constexpr u32 local_anchor_candidates = 2;
+    const u32 candidates_per_thread =
+      blockDim.x == kApproximateSortThreadsCompact ? 2u : 1u;
+    u32 local_anchors[local_anchor_candidates];
+    u32 local_handles[local_anchor_candidates];
+    f32 local_distances[local_anchor_candidates];
+    for (u32 index = 0; index < local_anchor_candidates; ++index) {
+      local_anchors[index] = UINT32_MAX;
+      local_handles[index] = UINT32_MAX;
+      local_distances[index] = FLT_MAX;
     }
-    if (threadIdx.x == 0) {
-      seed_count = min(params.entry_seed_count, params.anchor_count);
+    for (u32 anchor = threadIdx.x; anchor < params.anchor_count; anchor += blockDim.x) {
+      const u32 handle = params.anchor_handles[anchor];
+      const f32 distance = approximate_entry(
+        params, query_lut,
+        params.anchor_pq_codes + static_cast<size_t>(anchor) * params.pq_code_bytes);
+      u32 worst = 0;
+      for (u32 index = 1; index < candidates_per_thread; ++index) {
+        if (candidate_less(local_handles[worst], local_distances[worst],
+                           local_handles[index], local_distances[index])) {
+          worst = index;
+        }
+      }
+      if (candidate_less(handle, distance,
+                         local_handles[worst], local_distances[worst])) {
+        local_anchors[worst] = anchor;
+        local_handles[worst] = handle;
+        local_distances[worst] = distance;
+      }
+    }
+    for (u32 index = 0; index < candidates_per_thread; ++index) {
+      const u32 output = threadIdx.x * candidates_per_thread + index;
+      merge_handles[output] = local_handles[index];
+      merge_ids[output] = local_anchors[index];
+      merge_distances[output] = local_distances[index];
+      merge_expanded[output] = 0;
     }
     __syncthreads();
-    for (u32 seed = 0; seed < seed_count; ++seed) {
-      u32 local_anchor = UINT32_MAX;
-      f32 local_distance = FLT_MAX;
-      for (u32 anchor = threadIdx.x; anchor < params.anchor_count;
-           anchor += blockDim.x) {
-        const f32 distance = anchor_distances[anchor];
-        if (distance < local_distance ||
-            (distance == local_distance && anchor < local_anchor)) {
-          local_distance = distance;
-          local_anchor = anchor;
-        }
+    const u32 approximate_anchor_candidates =
+      blockDim.x * candidates_per_thread;
+    sort_candidates(merge_handles, merge_ids, merge_distances, merge_expanded,
+                    approximate_anchor_candidates);
+    if (threadIdx.x == 0) {
+      u32 valid = 0;
+      while (valid < approximate_anchor_candidates &&
+             merge_ids[valid] != UINT32_MAX &&
+             isfinite(merge_distances[valid]) &&
+             merge_distances[valid] != FLT_MAX) {
+        ++valid;
       }
-      anchor_best_indices[threadIdx.x] = local_anchor;
-      anchor_best_distances[threadIdx.x] = local_distance;
-      __syncthreads();
-      for (u32 stride = blockDim.x / 2; stride != 0; stride >>= 1) {
-        if (threadIdx.x < stride) {
-          const f32 candidate_distance = anchor_best_distances[threadIdx.x + stride];
-          const u32 candidate_anchor = anchor_best_indices[threadIdx.x + stride];
-          if (candidate_distance < anchor_best_distances[threadIdx.x] ||
-              (candidate_distance == anchor_best_distances[threadIdx.x] &&
-               candidate_anchor < anchor_best_indices[threadIdx.x])) {
-            anchor_best_distances[threadIdx.x] = candidate_distance;
-            anchor_best_indices[threadIdx.x] = candidate_anchor;
-          }
-        }
-        __syncthreads();
+      selected_anchor_count = min(valid, 256u);
+    }
+    __syncthreads();
+    for (u32 index = threadIdx.x; index < selected_anchor_count;
+         index += blockDim.x) {
+      merge_distances[index] = exact_anchor_distance(params, query, merge_ids[index]);
+      merge_expanded[index] = 0;
+    }
+    __syncthreads();
+    sort_candidates(merge_handles, merge_ids, merge_distances, merge_expanded,
+                    selected_anchor_count);
+    if (threadIdx.x == 0) {
+      selected_anchor_count = min(
+        selected_anchor_count,
+        max(min(params.entry_seed_count, traversal_capacity),
+            min(params.delta_anchor_probes, kPersistentMaxAnchorProbes)));
+      seed_count = min(selected_anchor_count,
+                       min(params.entry_seed_count, traversal_capacity));
+      for (u32 index = 0; index < selected_anchor_count; ++index) {
+        anchor_best_indices[index] = merge_ids[index];
       }
-      if (threadIdx.x == 0) {
-        const u32 anchor = anchor_best_indices[0];
-        const u32 handle = anchor == UINT32_MAX
-          ? UINT32_MAX : params.anchor_handles[anchor];
-        merge_handles[seed] = handle;
-        merge_distances[seed] = handle == UINT32_MAX
-          ? FLT_MAX
-          : approximate_handle(params, query_lut, handle, descriptor.snapshot_epoch);
-        merge_expanded[seed] = 0;
-        if (anchor != UINT32_MAX) anchor_distances[anchor] = FLT_MAX;
-      }
-      __syncthreads();
+    }
+    __syncthreads();
+    for (u32 seed = threadIdx.x; seed < seed_count; seed += blockDim.x) {
+      const u32 handle = params.anchor_handles[anchor_best_indices[seed]];
+      merge_handles[seed] = handle;
+      merge_distances[seed] = approximate_handle(
+        params, query_lut, handle, descriptor.snapshot_epoch);
+      merge_expanded[seed] = 0;
     }
   } else {
     if (threadIdx.x == 0) {
       seed_count = min(params.entry_point_count, params.entry_seed_count);
+      selected_anchor_count = 0;
     }
     for (u32 index = threadIdx.x; index < seed_count; index += blockDim.x) {
       const u32 handle = params.entry_points[index];
@@ -1344,19 +1956,24 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ u32 selected_handles[kPersistentMaxPrefetch];
   __shared__ u32 selected_count;
   __shared__ u32 neighbor_counts[kPersistentMaxPrefetch];
+  __shared__ u32 neighbor_offsets[kPersistentMaxPrefetch + 1];
+  __shared__ u32 flattened_neighbors;
   __shared__ u32 remote_reads_by_lane[kPersistentMaxPrefetch];
   __shared__ u32 cache_hits_by_lane[kPersistentMaxPrefetch];
+  __shared__ u32 route_hits_by_lane[kPersistentMaxPrefetch];
   __shared__ u32 graph_cache_slots[kPersistentMaxPrefetch];
-  __shared__ u32 neighbor_handles[kPersistentMaxPrefetch * kPersistentMaxGraphDegree];
-  __shared__ f32 neighbor_distances[kPersistentMaxPrefetch * kPersistentMaxGraphDegree];
   __shared__ u32 total_remote_reads;
   __shared__ u32 total_remote_batches;
+  __shared__ u32 total_graph_rounds;
   __shared__ u32 total_cache_hits;
+  __shared__ u32 total_route_hits;
   __shared__ u32 graph_failed;
   if (threadIdx.x == 0) {
     total_remote_reads = 0;
     total_remote_batches = 0;
+    total_graph_rounds = 0;
     total_cache_hits = 0;
+    total_route_hits = 0;
     graph_failed = 0;
   }
   __syncthreads();
@@ -1375,67 +1992,56 @@ __device__ void process_query(const PersistentKernelParams& params,
       selected_count = 0;
       graph_failed = 0;
       const u32 target = min(params.prefetch_depth, params.max_expansions - expansions);
-      while (selected_count < target) {
-        i32 best = -1;
-        f32 best_distance = FLT_MAX;
-        for (u32 index = 0; index < beam_count; ++index) {
-          if (beam_expanded[index] == 0 && beam_distances[index] < best_distance) {
-            best = static_cast<i32>(index);
-            best_distance = beam_distances[index];
-          }
-        }
-        if (best < 0) break;
-        beam_expanded[best] = 1;
-        selected_handles[selected_count++] = beam_handles[best];
+      for (u32 index = 0; index < beam_count && selected_count < target; ++index) {
+        if (beam_expanded[index] != 0) continue;
+        beam_expanded[index] = 1;
+        selected_handles[selected_count++] = beam_handles[index];
       }
     }
     __syncthreads();
     if (selected_count == 0) break;
+    if (threadIdx.x == 0) ++total_graph_rounds;
+    __syncthreads();
     constexpr u32 warp_width = 32;
     const u32 warp = threadIdx.x / warp_width;
     const u32 lane_in_warp = threadIdx.x % warp_width;
     if (!fetch_graph_records_batch(
           params, descriptor, selected_handles, selected_count,
           graph_cache_slots, remote_reads_by_lane, cache_hits_by_lane,
+          route_hits_by_lane,
           &total_remote_batches)) {
       if (threadIdx.x == 0) graph_failed = 1;
     }
     __syncthreads();
-    if (warp < selected_count) {
-      const u32 slot = graph_cache_slots[warp];
-      const u8* record = slot == UINT32_MAX ? nullptr :
-        params.graph_cache + static_cast<size_t>(slot) * kPersistentGraphCacheLineBytes;
-      if (lane_in_warp == 0) {
-        neighbor_counts[warp] = record != nullptr && (record[1] & 1u) == 0
-          ? min(static_cast<u32>(record[0]), params.graph_degree) : 0;
-      }
-      __syncwarp();
-      const u32 count = neighbor_counts[warp];
-      for (u32 neighbor = lane_in_warp; neighbor < count; neighbor += warp_width) {
-        const u64 raw = decode_compact_raw(record + 8 + neighbor * 5,
-                                           params.graph_shard_bits);
-        neighbor_handles[warp * kPersistentMaxGraphDegree + neighbor] =
-          handle_from_raw(params, raw);
-      }
-      __syncwarp();
-      if (lane_in_warp == 0 && slot != UINT32_MAX) {
-        __threadfence();
-        atomicSub(params.graph_cache_readers + slot, 1u);
-      }
-    }
-    __syncthreads();
     if (threadIdx.x == 0) {
       graph_phase_cycles += clock64() - phase_started_cycles;
-      phase_started_cycles = clock64();
+      for (u32 selected = 0; selected < selected_count; ++selected) {
+        total_remote_reads += remote_reads_by_lane[selected];
+        total_cache_hits += cache_hits_by_lane[selected];
+        total_route_hits += route_hits_by_lane[selected];
+      }
     }
     __syncthreads();
     if (graph_failed != 0) {
+      for (u32 selected = warp; selected < selected_count;
+           selected += blockDim.x / warp_width) {
+        const u32 slot = graph_cache_slots[selected];
+        if (lane_in_warp == 0 && slot != UINT32_MAX &&
+            (slot & kGraphScratchBit) == 0) {
+          __threadfence();
+          release_graph_record(params, slot);
+        }
+        if (lane_in_warp == 0) graph_cache_slots[selected] = UINT32_MAX;
+      }
+      __syncthreads();
       if (threadIdx.x == 0) {
         completion.status = -EIO;
         completion.gpu_cycles = clock64() - query_started_cycles;
         completion.remote_pages = total_remote_reads;
         completion.remote_batches = total_remote_batches;
+        completion.graph_rounds = total_graph_rounds;
         completion.cache_hits = total_cache_hits;
+        completion.route_hits = total_route_hits;
         completion.exact_vectors = total_exact_reads;
         completion.exact_cache_hits = total_exact_cache_hits;
         device_ring_push(params.completions, completion);
@@ -1443,56 +2049,117 @@ __device__ void process_query(const PersistentKernelParams& params,
       __syncthreads();
       return;
     }
-    u32 flattened = 0;
-    for (u32 lane = 0; lane < selected_count; ++lane) flattened += neighbor_counts[lane];
-    for (u32 flat = threadIdx.x; flat < flattened; flat += blockDim.x) {
-      u32 lane = 0;
-      u32 relative = flat;
-      while (lane < selected_count && relative >= neighbor_counts[lane]) {
-        relative -= neighbor_counts[lane++];
+
+    for (u32 chunk_begin = 0; chunk_begin < selected_count;
+         chunk_begin += kPersistentScoreChunk) {
+      const u32 chunk_count = min(kPersistentScoreChunk,
+                                  selected_count - chunk_begin);
+      for (u32 local = warp; local < chunk_count;
+           local += blockDim.x / warp_width) {
+        const u32 selected = chunk_begin + local;
+        const u32 slot = graph_cache_slots[selected];
+        const u8* record = slot == UINT32_MAX ? nullptr :
+          graph_record_pointer(params, descriptor.query_slot, slot);
+        if (lane_in_warp == 0) {
+          neighbor_counts[local] = record != nullptr && (record[1] & 1u) == 0
+            ? min(static_cast<u32>(record[0]), params.graph_degree) : 0;
+        }
       }
-      const u32 offset = lane * kPersistentMaxGraphDegree + relative;
-      const u32 handle = neighbor_handles[offset];
-      neighbor_distances[offset] = handle != UINT32_MAX &&
-          insert_visited(visited, params.visited_capacity, handle)
-        ? approximate_handle(params, query_lut, handle,
-                             descriptor.snapshot_epoch)
-        : FLT_MAX;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      score_phase_cycles += clock64() - phase_started_cycles;
-      phase_started_cycles = clock64();
-    }
-    __syncthreads();
-    const u32 candidate_count = flattened;
-    const u32 candidate_base = beam_count;
-    for (u32 index = threadIdx.x; index < candidate_count; index += blockDim.x) {
-      u32 lane = 0;
-      u32 relative = index;
-      while (lane < selected_count && relative >= neighbor_counts[lane]) {
-        relative -= neighbor_counts[lane++];
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        neighbor_offsets[0] = 0;
+        for (u32 local = 0; local < chunk_count; ++local) {
+          neighbor_offsets[local + 1] =
+            neighbor_offsets[local] + neighbor_counts[local];
+        }
+        flattened_neighbors = neighbor_offsets[chunk_count];
+        phase_started_cycles = clock64();
       }
-      const u32 offset = lane * kPersistentMaxGraphDegree + relative;
-      merge_handles[candidate_base + index] = neighbor_handles[offset];
-      merge_distances[candidate_base + index] = neighbor_distances[offset];
-      merge_expanded[candidate_base + index] = 0;
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      for (u32 lane = 0; lane < selected_count; ++lane) {
-        total_remote_reads += remote_reads_by_lane[lane];
-        total_cache_hits += cache_hits_by_lane[lane];
+      __syncthreads();
+      for (u32 local = warp; local < chunk_count;
+           local += blockDim.x / warp_width) {
+        const u32 selected = chunk_begin + local;
+        const u32 slot = graph_cache_slots[selected];
+        const u8* record = slot == UINT32_MAX ? nullptr :
+          graph_record_pointer(params, descriptor.query_slot, slot);
+        __syncwarp();
+        const u32 count = neighbor_counts[local];
+        for (u32 neighbor = lane_in_warp; neighbor < count; neighbor += warp_width) {
+          const u64 raw = decode_compact_raw(record + 8 + neighbor * 5,
+                                             params.graph_shard_bits);
+          navigation_handles[neighbor_offsets[local] + neighbor] =
+            handle_from_raw(params, raw);
+        }
+        __syncwarp();
+        if (lane_in_warp == 0 && slot != UINT32_MAX &&
+            (slot & kGraphScratchBit) == 0) {
+          __threadfence();
+          release_graph_record(params, slot);
+        }
+        if (lane_in_warp == 0) graph_cache_slots[selected] = UINT32_MAX;
       }
+      __syncthreads();
+      const u32 candidate_count = flattened_neighbors;
+      for (u32 flat = threadIdx.x; flat < candidate_count; flat += blockDim.x) {
+        const u32 handle = navigation_handles[flat];
+        if (handle == UINT32_MAX ||
+            !insert_visited(visited, params.visited_capacity, handle)) {
+          navigation_handles[flat] = UINT32_MAX;
+        }
+      }
+      __syncthreads();
+      if (!approximate_handles_batch(params, descriptor, query_lut,
+                                     navigation_handles,
+                                     candidate_count,
+                                     navigation_distances)) {
+        if (threadIdx.x == 0) graph_failed = 1;
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        score_phase_cycles += clock64() - phase_started_cycles;
+        phase_started_cycles = clock64();
+      }
+      __syncthreads();
+      if (graph_failed != 0) break;
+      merge_approximate_into_beam(
+        navigation_handles, navigation_distances,
+        candidate_count, beam_handles, beam_ids, beam_distances,
+        beam_expanded, beam_count, traversal_capacity,
+        merge_handles, merge_ids, merge_distances, merge_expanded,
+        rerank_handles, rerank_ids, rerank_distances,
+        candidate_workspace);
+      if (threadIdx.x == 0) {
+        beam_phase_cycles += clock64() - phase_started_cycles;
+      }
+      __syncthreads();
     }
-    __syncthreads();
-    merge_approximate_into_beam(
-      merge_handles + candidate_base, merge_distances + candidate_base,
-      candidate_count, beam_handles, beam_ids, beam_distances,
-      beam_expanded, beam_count, traversal_capacity,
-      merge_handles, merge_ids, merge_distances, merge_expanded);
+    if (graph_failed != 0) {
+      for (u32 selected = warp; selected < selected_count;
+           selected += blockDim.x / warp_width) {
+        const u32 slot = graph_cache_slots[selected];
+        if (lane_in_warp == 0 && slot != UINT32_MAX &&
+            (slot & kGraphScratchBit) == 0) {
+          __threadfence();
+          release_graph_record(params, slot);
+        }
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        completion.status = -EIO;
+        completion.gpu_cycles = clock64() - query_started_cycles;
+        completion.remote_pages = total_remote_reads;
+        completion.remote_batches = total_remote_batches;
+        completion.graph_rounds = total_graph_rounds;
+        completion.cache_hits = total_cache_hits;
+        completion.route_hits = total_route_hits;
+        completion.exact_vectors = total_exact_reads;
+        completion.exact_cache_hits = total_exact_cache_hits;
+        device_ring_push(params.completions, completion);
+      }
+      __syncthreads();
+      return;
+    }
     if (threadIdx.x == 0) {
-      beam_phase_cycles += clock64() - phase_started_cycles;
       expansions += selected_count;
     }
     __syncthreads();
@@ -1506,11 +2173,19 @@ __device__ void process_query(const PersistentKernelParams& params,
   __syncthreads();
   sort_candidates(merge_handles, nullptr, merge_distances, merge_expanded, beam_count);
   if (threadIdx.x == 0) {
-    rerank_count = min(beam_count, params.final_rerank_width);
-    for (u32 index = 0; index < rerank_count; ++index) {
-      rerank_handles[index] = merge_handles[index];
-      rerank_ids[index] = UINT32_MAX;
-      rerank_distances[index] = merge_distances[index];
+    rerank_count = 0;
+    for (u32 index = 0;
+         index < beam_count && rerank_count < params.final_rerank_width;
+         ++index) {
+      const u32 handle = merge_handles[index];
+      if ((handle & kDeltaHandleBit) == 0 &&
+          base_overridden(params, handle, descriptor.snapshot_epoch)) {
+        continue;
+      }
+      rerank_handles[rerank_count] = handle;
+      rerank_ids[rerank_count] = UINT32_MAX;
+      rerank_distances[rerank_count] = merge_distances[index];
+      ++rerank_count;
     }
     phase_started_cycles = clock64();
   }
@@ -1528,14 +2203,16 @@ __device__ void process_query(const PersistentKernelParams& params,
   add_delta_candidates(params, descriptor, query, query_lut,
                        beam_handles, beam_ids, beam_distances, beam_expanded, beam_count,
                        params.final_rerank_width,
-                       anchor_best_indices, anchor_best_distances);
+                       anchor_best_indices, selected_anchor_count);
   if (beam_count == 0) {
     if (threadIdx.x == 0) {
       completion.status = -EIO;
       completion.gpu_cycles = clock64() - query_started_cycles;
       completion.remote_pages = total_remote_reads;
       completion.remote_batches = total_remote_batches;
+      completion.graph_rounds = total_graph_rounds;
       completion.cache_hits = total_cache_hits;
+      completion.route_hits = total_route_hits;
       completion.exact_vectors = total_exact_reads;
       completion.exact_cache_hits = total_exact_cache_hits;
       device_ring_push(params.completions, completion);
@@ -1543,24 +2220,9 @@ __device__ void process_query(const PersistentKernelParams& params,
     __syncthreads();
     return;
   }
+  sort_candidates(beam_handles, beam_ids, beam_distances, beam_expanded,
+                  beam_count);
   if (threadIdx.x == 0) {
-    for (u32 index = 0; index < beam_count; ++index) {
-      u32 best = index;
-      for (u32 candidate = index + 1; candidate < beam_count; ++candidate) {
-        if (beam_distances[candidate] < beam_distances[best]) best = candidate;
-      }
-      if (best != index) {
-        const u32 handle = beam_handles[index];
-        beam_handles[index] = beam_handles[best];
-        beam_handles[best] = handle;
-        const u32 id = beam_ids[index];
-        beam_ids[index] = beam_ids[best];
-        beam_ids[best] = id;
-        const f32 distance = beam_distances[index];
-        beam_distances[index] = beam_distances[best];
-        beam_distances[best] = distance;
-      }
-    }
     u32 valid = 0;
     while (valid < beam_count && beam_ids[valid] != UINT32_MAX &&
            isfinite(beam_distances[valid])) ++valid;
@@ -1581,7 +2243,9 @@ __device__ void process_query(const PersistentKernelParams& params,
     completion.exact_cycles = exact_phase_cycles;
     completion.remote_pages = total_remote_reads;
     completion.remote_batches = total_remote_batches;
+    completion.graph_rounds = total_graph_rounds;
     completion.cache_hits = total_cache_hits;
+    completion.route_hits = total_route_hits;
     completion.exact_vectors = total_exact_reads;
     completion.exact_cache_hits = total_exact_cache_hits;
     device_ring_push(params.completions, completion);
@@ -1610,37 +2274,151 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
     if (have_delta_submission != 0) {
       if (threadIdx.x == 0) {
         delta_status = 0;
-        if (delta_descriptor.first_slot > params.delta_capacity ||
-            delta_descriptor.record_count >
-              params.delta_capacity - delta_descriptor.first_slot ||
-            delta_descriptor.final_count !=
-              delta_descriptor.first_slot + delta_descriptor.record_count ||
+        const bool reset = (delta_descriptor.flags & kDeltaCommandReset) != 0;
+        const bool promote =
+          (delta_descriptor.flags & kDeltaCommandPromoteOverrides) != 0;
+        constexpr u32 known_flags =
+          kDeltaCommandReset | kDeltaCommandPromoteOverrides;
+        if ((delta_descriptor.flags & ~known_flags) != 0 ||
+            (reset && promote) ||
+            (reset && (delta_descriptor.first_slot != 0 ||
+                       delta_descriptor.record_count > params.delta_capacity ||
+                       delta_descriptor.final_count != 0 ||
+                       delta_descriptor.invalidation_count != 0 ||
+                       delta_descriptor.superseded_count != 0 ||
+                       delta_descriptor.override_count != 0 ||
+                       delta_descriptor.durable_count != 0 ||
+                       params.delta_records == nullptr ||
+                       params.delta_next == nullptr ||
+                       params.delta_prev == nullptr ||
+                       params.delta_remote_positions == nullptr ||
+                       params.delta_count == nullptr ||
+                       params.base_override_keys == nullptr ||
+                       params.base_override_epochs == nullptr ||
+                       params.base_override_capacity == 0 ||
+                       params.delta_remote_keys == nullptr ||
+                       params.delta_remote_slots == nullptr ||
+                       params.delta_remote_capacity == 0 ||
+                       (params.anchor_count != 0 &&
+                        params.delta_bucket_heads == nullptr))) ||
+            (!reset && (delta_descriptor.final_count > params.delta_capacity ||
+            delta_descriptor.record_count > params.delta_capacity ||
             (delta_descriptor.record_count != 0 &&
-             params.delta_staging_records == nullptr) ||
+             (params.delta_staging_slots == nullptr ||
+              params.delta_staging_records == nullptr)) ||
+            (delta_descriptor.record_count != 0 &&
+             (params.delta_remote_positions == nullptr ||
+              params.delta_remote_capacity == 0)) ||
             (delta_descriptor.record_count != 0 && params.vector_bytes != 0 &&
              (params.delta_staging_vectors == nullptr || params.delta_vectors == nullptr)) ||
             (delta_descriptor.record_count != 0 && params.pq_code_bytes != 0 &&
              (params.delta_pq_codes == nullptr || params.delta_encode_scratch == nullptr ||
-              params.pq_centroids == nullptr))) {
+              params.pq_centroids == nullptr)) ||
+            (delta_descriptor.durable_count != 0 &&
+             params.delta_durable_updates == nullptr) ||
+            (promote && delta_descriptor.override_count != 0 &&
+             (params.delta_override_updates == nullptr ||
+              params.permanent_override_bits == nullptr ||
+              params.permanent_override_words == 0)) ||
+            (!promote && delta_descriptor.override_count != 0 &&
+             (params.delta_override_updates == nullptr ||
+              params.base_override_keys == nullptr ||
+              params.base_override_epochs == nullptr ||
+              params.base_override_capacity == 0))))) {
           delta_status = -EINVAL;
         }
       }
       __syncthreads();
 
+      if ((delta_descriptor.flags & kDeltaCommandReset) != 0) {
+        if (delta_status == 0) {
+          for (u32 index = threadIdx.x; index < delta_descriptor.record_count;
+               index += blockDim.x) {
+            const DeviceDeltaRecord record = params.delta_records[index];
+            const u32 remote_position = params.delta_remote_positions[index];
+            if (record.remote_node != 0 &&
+                remote_position < params.delta_remote_capacity &&
+                load_cg(params.delta_remote_slots + remote_position) == index) {
+              atomicCAS(reinterpret_cast<unsigned long long*>(
+                          params.delta_remote_keys + remote_position),
+                        record.remote_node, kDeltaRemoteTombstone);
+              atomicExch(params.delta_remote_slots + remote_position, UINT32_MAX);
+            }
+            if (record.base_ordinal < params.num_nodes) {
+              const u32 mask = params.base_override_capacity - 1;
+              u32 position = hash32(record.base_ordinal) & mask;
+              for (u32 probe = 0; probe < params.base_override_capacity; ++probe) {
+                const u32 key = load_cg(params.base_override_keys + position);
+                if (key == record.base_ordinal) {
+                  if (atomicCAS(params.base_override_keys + position,
+                                record.base_ordinal,
+                                kBaseOverrideTombstone) == record.base_ordinal) {
+                    params.base_override_epochs[position] = 0;
+                  }
+                  break;
+                }
+                if (key == kBaseOverrideEmpty) break;
+                position = (position + 1) & mask;
+              }
+            }
+            params.delta_records[index] = {};
+            params.delta_records[index].base_ordinal = kBaseOverrideEmpty;
+            params.delta_next[index] = UINT32_MAX;
+            params.delta_prev[index] = UINT32_MAX;
+            params.delta_remote_positions[index] = UINT32_MAX;
+          }
+          for (u32 index = threadIdx.x; index < params.anchor_count;
+               index += blockDim.x) {
+            params.delta_bucket_heads[index] = UINT32_MAX;
+          }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0 && delta_status == 0) {
+          __threadfence();
+          atomicExch(params.delta_count, 0u);
+          __threadfence_system();
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          device_ring_push(params.delta_completions, DeltaPublishCompletion{
+            .command_id = delta_descriptor.command_id,
+            .status = delta_status,
+            .final_count = 0,
+          });
+        }
+        __syncthreads();
+        continue;
+      }
+
       if (delta_status == 0) {
         for (u32 index = threadIdx.x;
              index < delta_descriptor.record_count;
              index += blockDim.x) {
-          const u32 slot = delta_descriptor.first_slot + index;
+          const u32 slot = params.delta_staging_slots[index];
+          if (slot >= delta_descriptor.final_count || slot >= params.delta_capacity) {
+            atomicExch(&delta_status, -EINVAL);
+          }
+        }
+        __syncthreads();
+      }
+
+      if (delta_status == 0) {
+        for (u32 index = threadIdx.x;
+             index < delta_descriptor.record_count;
+             index += blockDim.x) {
+          const u32 slot = params.delta_staging_slots[index];
           params.delta_records[slot] = params.delta_staging_records[index];
           params.delta_next[slot] = UINT32_MAX;
+          params.delta_prev[slot] = UINT32_MAX;
         }
         for (u64 index = threadIdx.x;
              index < static_cast<u64>(delta_descriptor.record_count) * params.vector_bytes;
              index += blockDim.x) {
-          params.delta_vectors[
-            static_cast<u64>(delta_descriptor.first_slot) * params.vector_bytes + index] =
-              params.delta_staging_vectors[index];
+          const u32 record_index = static_cast<u32>(index / params.vector_bytes);
+          const u32 byte = static_cast<u32>(index % params.vector_bytes);
+          const u32 slot = params.delta_staging_slots[record_index];
+          params.delta_vectors[static_cast<u64>(slot) * params.vector_bytes + byte] =
+            params.delta_staging_vectors[index];
         }
         __syncthreads();
 
@@ -1649,7 +2427,7 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
              index += blockDim.x) {
           const u32 record_index = static_cast<u32>(index / params.dim);
           const u32 row = static_cast<u32>(index % params.dim);
-          const u32 slot = delta_descriptor.first_slot + record_index;
+          const u32 slot = params.delta_staging_slots[record_index];
           const DeviceDeltaRecord record = params.delta_records[slot];
           f32 transformed = 0.0f;
           if ((record.flags & kDeltaDeleted) == 0) {
@@ -1675,7 +2453,7 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
              index += blockDim.x) {
           const u32 record_index = static_cast<u32>(index / params.pq_code_bytes);
           const u32 subquantizer = static_cast<u32>(index % params.pq_code_bytes);
-          const u32 slot = delta_descriptor.first_slot + record_index;
+          const u32 slot = params.delta_staging_slots[record_index];
           u8 best_code = 0;
           if ((params.delta_records[slot].flags & kDeltaDeleted) == 0) {
             const f32* transformed = params.delta_encode_scratch +
@@ -1706,6 +2484,17 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
              index < delta_descriptor.invalidation_count;
              index += blockDim.x) {
           const u64 key = params.graph_invalidation_keys[index];
+          const u32 route_slot = anchor_graph_slot(params, key);
+          if (route_slot != UINT32_MAX &&
+              params.anchor_graph_states != nullptr) {
+            atomicCAS(params.anchor_graph_states + route_slot,
+                      kGraphCacheReady, kGraphCacheStale);
+          }
+          if (params.graph_cache_sets == 0 ||
+              params.graph_cache_states == nullptr ||
+              params.graph_cache_keys == nullptr) {
+            continue;
+          }
           const u32 set = hash64(key) % params.graph_cache_sets;
           for (u32 way = 0; way < params.graph_cache_ways; ++way) {
             const u32 slot = set * params.graph_cache_ways + way;
@@ -1736,70 +2525,175 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
           }
         }
 
-        for (u32 index = threadIdx.x;
-             index < delta_descriptor.superseded_count;
-             index += blockDim.x) {
-          const DeltaSupersedeUpdate update = params.delta_supersede_updates[index];
-          if (update.slot >= delta_descriptor.first_slot) {
-            atomicExch(&delta_status, -EINVAL);
-            continue;
+        if (threadIdx.x == 0) {
+          for (u32 index = 0; index < delta_descriptor.superseded_count; ++index) {
+            const DeltaSupersedeUpdate update = params.delta_supersede_updates[index];
+            if (update.slot >= delta_descriptor.final_count) {
+              delta_status = -EINVAL;
+              continue;
+            }
+            DeviceDeltaRecord& record = params.delta_records[update.slot];
+            record.superseded_epoch = update.epoch;
+            unlink_mutable_delta(params, update.slot);
           }
-          atomicExch(reinterpret_cast<unsigned long long*>(
-                       &params.delta_records[update.slot].superseded_epoch),
-                     update.epoch);
         }
 
-        for (u32 index = threadIdx.x;
-             index < delta_descriptor.override_count;
-             index += blockDim.x) {
-          const DeltaOverrideUpdate update = params.delta_override_updates[index];
-          const u32 mask = params.base_override_capacity - 1;
-          u32 position = hash32(update.ordinal) & mask;
-          for (u32 probe = 0; probe < params.base_override_capacity; ++probe) {
-            const u32 old = atomicCAS(params.base_override_keys + position,
-                                      UINT32_MAX, update.ordinal);
-            if (old == UINT32_MAX || old == update.ordinal) {
-              if (old == UINT32_MAX) {
-                atomicExch(reinterpret_cast<unsigned long long*>(
-                             params.base_override_epochs + position),
-                           update.epoch);
-              } else {
-                atomicMin(reinterpret_cast<unsigned long long*>(
-                            params.base_override_epochs + position),
-                          update.epoch);
-              }
-              break;
+        if ((delta_descriptor.flags & kDeltaCommandPromoteOverrides) != 0) {
+          for (u32 index = threadIdx.x;
+               index < delta_descriptor.override_count;
+               index += blockDim.x) {
+            const u32 ordinal = params.delta_override_updates[index].ordinal;
+            if (ordinal >= params.num_nodes) {
+              atomicExch(&delta_status, -EINVAL);
+              continue;
             }
-            position = (position + 1) & mask;
+            atomicOr(params.permanent_override_bits + ordinal / 32,
+                     1u << (ordinal % 32));
+          }
+        } else if (threadIdx.x == 0) {
+          const u32 mask = params.base_override_capacity - 1;
+          for (u32 index = 0; index < delta_descriptor.override_count; ++index) {
+            const DeltaOverrideUpdate update = params.delta_override_updates[index];
+            u32 position = hash32(update.ordinal) & mask;
+            u32 first_tombstone = UINT32_MAX;
+            bool inserted = false;
+            for (u32 probe = 0; probe < params.base_override_capacity; ++probe) {
+              const u32 key = params.base_override_keys[position];
+              if (key == update.ordinal) {
+                params.base_override_epochs[position] = min(
+                  params.base_override_epochs[position], update.epoch);
+                inserted = true;
+                break;
+              }
+              if (key == kBaseOverrideTombstone && first_tombstone == UINT32_MAX) {
+                first_tombstone = position;
+              }
+              if (key == kBaseOverrideEmpty) {
+                const u32 destination = first_tombstone == UINT32_MAX
+                  ? position : first_tombstone;
+                params.base_override_epochs[destination] = update.epoch;
+                __threadfence();
+                params.base_override_keys[destination] = update.ordinal;
+                inserted = true;
+                break;
+              }
+              position = (position + 1) & mask;
+            }
+            if (!inserted && first_tombstone != UINT32_MAX) {
+              params.base_override_epochs[first_tombstone] = update.epoch;
+              __threadfence();
+              params.base_override_keys[first_tombstone] = update.ordinal;
+              inserted = true;
+            }
+            if (!inserted) delta_status = -ENOSPC;
+          }
+        }
+
+        if (threadIdx.x == 0) {
+          for (u32 index = 0; index < delta_descriptor.durable_count; ++index) {
+            const DeltaDurableUpdate update = params.delta_durable_updates[index];
+            if (update.slot >= delta_descriptor.final_count) {
+              delta_status = -EINVAL;
+              continue;
+            }
+            DeviceDeltaRecord& record = params.delta_records[update.slot];
+            if (record.epoch == update.epoch) {
+              if (record.superseded_epoch == 0) {
+                record.superseded_epoch = update.epoch;
+              }
+              unlink_mutable_delta(params, update.slot);
+              const u32 remote_position = params.delta_remote_positions[update.slot];
+              if (record.remote_node != 0 &&
+                  remote_position < params.delta_remote_capacity &&
+                  load_cg(params.delta_remote_slots + remote_position) == update.slot) {
+                atomicCAS(reinterpret_cast<unsigned long long*>(
+                            params.delta_remote_keys + remote_position),
+                          record.remote_node, kDeltaRemoteTombstone);
+                atomicExch(params.delta_remote_slots + remote_position, UINT32_MAX);
+              }
+              params.delta_remote_positions[update.slot] = UINT32_MAX;
+              if (record.base_ordinal < params.num_nodes) {
+                atomicOr(params.permanent_override_bits + record.base_ordinal / 32,
+                         1u << (record.base_ordinal % 32));
+                const u32 mask = params.base_override_capacity - 1;
+                u32 position = hash32(record.base_ordinal) & mask;
+                for (u32 probe = 0; probe < params.base_override_capacity; ++probe) {
+                  const u32 key = load_cg(params.base_override_keys + position);
+                  if (key == record.base_ordinal) {
+                    if (atomicCAS(params.base_override_keys + position,
+                                  record.base_ordinal,
+                                  kBaseOverrideTombstone) == record.base_ordinal) {
+                      params.base_override_epochs[position] = 0;
+                    }
+                    break;
+                  }
+                  if (key == kBaseOverrideEmpty) break;
+                  position = (position + 1) & mask;
+                }
+              }
+            }
           }
         }
       }
       __syncthreads();
 
       if (delta_status == 0) {
-        for (u32 index = threadIdx.x;
-             index < delta_descriptor.record_count;
-             index += blockDim.x) {
-          const u32 slot = delta_descriptor.first_slot + index;
-          const DeviceDeltaRecord record = params.delta_records[slot];
-          if (record.remote_node != 0 && params.delta_remote_capacity != 0) {
-            const u32 mask = params.delta_remote_capacity - 1;
-            u32 position = hash64(record.remote_node) & mask;
-            for (u32 probe = 0; probe < params.delta_remote_capacity; ++probe) {
-              const u64 old = atomicCAS(
-                reinterpret_cast<unsigned long long*>(params.delta_remote_keys + position),
-                0ULL, record.remote_node);
-              if (old == 0 || old == record.remote_node) {
-                atomicExch(params.delta_remote_slots + position, slot);
+        if (threadIdx.x == 0) {
+          const u32 mask = params.delta_remote_capacity - 1;
+          for (u32 index = 0; index < delta_descriptor.record_count; ++index) {
+            const u32 slot = params.delta_staging_slots[index];
+            const DeviceDeltaRecord record = params.delta_records[slot];
+            params.delta_remote_positions[slot] = UINT32_MAX;
+            if (record.remote_node != 0 && params.delta_remote_capacity != 0) {
+              u32 position = hash64(record.remote_node) & mask;
+              u32 first_tombstone = UINT32_MAX;
+              bool inserted = false;
+              for (u32 probe = 0; probe < params.delta_remote_capacity; ++probe) {
+                const u64 key = params.delta_remote_keys[position];
+                if (key == record.remote_node) {
+                  params.delta_remote_slots[position] = slot;
+                  params.delta_remote_positions[slot] = position;
+                  inserted = true;
+                  break;
+                }
+                if (key == kDeltaRemoteTombstone && first_tombstone == UINT32_MAX) {
+                  first_tombstone = position;
+                }
+                if (key == kDeltaRemoteEmpty) {
+                  const u32 destination = first_tombstone == UINT32_MAX
+                    ? position : first_tombstone;
+                  params.delta_remote_slots[destination] = slot;
+                  __threadfence();
+                  params.delta_remote_keys[destination] = record.remote_node;
+                  params.delta_remote_positions[slot] = destination;
+                  inserted = true;
+                  break;
+                }
+                position = (position + 1) & mask;
+              }
+              if (!inserted && first_tombstone != UINT32_MAX) {
+                params.delta_remote_slots[first_tombstone] = slot;
+                __threadfence();
+                params.delta_remote_keys[first_tombstone] = record.remote_node;
+                params.delta_remote_positions[slot] = first_tombstone;
+                inserted = true;
+              }
+              if (!inserted) {
+                delta_status = -ENOSPC;
                 break;
               }
-              position = (position + 1) & mask;
             }
-          }
-          if ((record.flags & kDeltaDeleted) == 0 &&
-              params.delta_bucket_heads != nullptr) {
-              params.delta_next[slot] =
-                atomicExch(params.delta_bucket_heads + record.anchor_bucket, slot);
+            if ((record.flags & (kDeltaDeleted | kDeltaDurable)) == 0 &&
+                record.superseded_epoch == 0 &&
+                params.delta_bucket_heads != nullptr) {
+              const u32 old_head = params.delta_bucket_heads[record.anchor_bucket];
+              params.delta_prev[slot] = UINT32_MAX;
+              params.delta_next[slot] = old_head;
+              if (old_head < params.delta_capacity) {
+                params.delta_prev[old_head] = slot;
+              }
+              params.delta_bucket_heads[record.anchor_bucket] = slot;
+            }
           }
         }
       }
@@ -1835,84 +2729,186 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
   }
 }
 
-__global__ void publish_delta_count_kernel(u32* count, u32 value) {
-  if (threadIdx.x == 0) atomicExch(count, value);
+__device__ void complete_direct_batch(const DirectBatchDescriptor& descriptor,
+                                      i32 status) {
+  if (descriptor.completion_status == nullptr) return;
+  __threadfence_system();
+  atomicExch(descriptor.completion_status, status);
 }
 
-__global__ void supersede_delta_record_kernel(DeviceDeltaRecord* records,
-                                              u32 slot, u64 epoch) {
-  if (threadIdx.x == 0) {
-    atomicExch(reinterpret_cast<unsigned long long*>(&records[slot].superseded_epoch), epoch);
-  }
-}
+__global__ void direct_read_owner_kernel(PersistentKernelParams params,
+                                         u32 queue_count) {
+#ifdef DVSTOR_HAVE_GPUNETIO
+  constexpr u32 warp_width = 32;
+  constexpr u32 max_warps_per_block = 8;
+  constexpr u32 max_submit_batches = 8;
+  const u32 lane = threadIdx.x % warp_width;
+  const u32 warps_per_block = blockDim.x / warp_width;
+  const u32 warp_in_block = threadIdx.x / warp_width;
+  const u32 warp = blockIdx.x * warps_per_block + warp_in_block;
+  if (warps_per_block == 0 || warps_per_block > max_warps_per_block ||
+      warp >= queue_count) return;
+  if (params.direct_batch_queues == nullptr || params.direct_qps == nullptr ||
+      params.direct_regions == nullptr || params.direct_disabled == nullptr ||
+      params.direct_region_count == 0 || params.direct_qps_per_node == 0 ||
+      warp >= params.direct_batch_queue_count) return;
 
-__global__ void insert_override_kernel(u32* keys, u64* epochs, u32 capacity,
-                                       u32 ordinal, u64 epoch) {
-  if (threadIdx.x != 0 || capacity == 0) return;
-  const u32 mask = capacity - 1;
-  u32 position = hash32(ordinal) & mask;
-  for (u32 probe = 0; probe < capacity; ++probe) {
-    const u32 old = atomicCAS(keys + position, UINT32_MAX, ordinal);
-    if (old == UINT32_MAX || old == ordinal) {
-      if (old == UINT32_MAX) atomicExch(
-        reinterpret_cast<unsigned long long*>(epochs + position), epoch);
-      else atomicMin(reinterpret_cast<unsigned long long*>(epochs + position), epoch);
-      return;
-    }
-    position = (position + 1) & mask;
-  }
-}
+  __shared__ DirectBatchDescriptor shared_batches
+    [max_warps_per_block][max_submit_batches];
+  __shared__ u32 shared_matching_counts
+    [max_warps_per_block][max_submit_batches];
+  __shared__ u32 shared_wqe_offsets
+    [max_warps_per_block][max_submit_batches];
+  __shared__ u32 shared_batch_counts[max_warps_per_block];
+  __shared__ u32 shared_total_wqes[max_warps_per_block];
 
-__global__ void insert_remote_kernel(u64* keys, u32* slots, u32 capacity,
-                                     u64 remote_node, u32 slot) {
-  if (threadIdx.x != 0 || capacity == 0 || remote_node == 0) return;
-  const u32 mask = capacity - 1;
-  u32 position = hash64(remote_node) & mask;
-  for (u32 probe = 0; probe < capacity; ++probe) {
-    const u64 old = atomicCAS(reinterpret_cast<unsigned long long*>(keys + position),
-                              0ULL, remote_node);
-    if (old == 0 || old == remote_node) {
-      atomicExch(slots + position, slot);
-      return;
-    }
-    position = (position + 1) & mask;
-  }
-}
+  const u32 memory_node = warp % params.direct_region_count;
+  auto* qp = reinterpret_cast<doca_gpu_dev_verbs_qp*>(params.direct_qps[warp]);
+  if (qp == nullptr) return;
+  auto* completion_queue = doca_gpu_dev_verbs_qp_get_cq_sq(qp);
+  const DirectRemoteRegion& region = params.direct_regions[memory_node];
+  const DeviceRingView<DirectBatchDescriptor> queue =
+    params.direct_batch_queues[warp];
+  DirectBatchDescriptor deferred{};
+  u32 deferred_matching = 0;
+  bool have_deferred = false;
 
-__global__ void link_bucket_kernel(u32* heads, u32* next, u32 bucket, u32 slot) {
-  if (threadIdx.x == 0) next[slot] = atomicExch(heads + bucket, slot);
-}
+  while (*reinterpret_cast<const volatile u32*>(params.stop) == 0) {
+    const bool need_dump = qp->need_dump;
 
-__global__ void invalidate_graph_cache_kernel(const u64* invalidation_keys,
-                                              u32 invalidation_count,
-                                              const u64* cache_keys,
-                                              u32* cache_states,
-                                              const u32* cache_readers,
-                                              u32 cache_sets, u32 cache_ways) {
-  for (u32 index = blockIdx.x * blockDim.x + threadIdx.x;
-       index < invalidation_count; index += blockDim.x * gridDim.x) {
-    const u64 key = invalidation_keys[index];
-    const u32 set = hash64(key) % cache_sets;
-    for (u32 way = 0; way < cache_ways; ++way) {
-      const u32 slot = set * cache_ways + way;
-      for (;;) {
-        const u32 state = *reinterpret_cast<volatile u32*>(cache_states + slot);
-        if (load_cg(cache_keys + slot) != key || state == kGraphCacheEmpty ||
-            state == kGraphCacheStale || state == kGraphCacheFillInvalidated) break;
-        if (state == kGraphCacheReady) {
-          if (atomicCAS(cache_states + slot, kGraphCacheReady,
-                        kGraphCacheStale) == kGraphCacheReady) break;
+    if (lane == 0) {
+      u32 batch_count = 0;
+      u32 total_wqes = 0;
+      while (batch_count < max_submit_batches) {
+        DirectBatchDescriptor descriptor{};
+        u32 matching = 0;
+        if (have_deferred) {
+          descriptor = deferred;
+          matching = deferred_matching;
+          have_deferred = false;
+        } else if (!device_ring_try_pop(queue, descriptor)) {
+          break;
+        } else {
+          if (descriptor.memory_node == memory_node &&
+              descriptor.request_shards != nullptr &&
+              descriptor.remote_offsets != nullptr &&
+              descriptor.local_iova_offsets != nullptr &&
+              descriptor.bytes != 0 &&
+              descriptor.bytes <= DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE) {
+            for (u32 index = 0; index < descriptor.request_count; ++index) {
+              matching += descriptor.request_shards[index] == memory_node ? 1u : 0u;
+            }
+          }
+        }
+
+        if (descriptor.memory_node != memory_node || matching == 0 ||
+            descriptor.bytes == 0 ||
+            descriptor.bytes > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE) {
+          complete_direct_batch(descriptor, -EINVAL);
           continue;
         }
-        if (state == kGraphCacheFilling) {
-          if (atomicCAS(cache_states + slot, kGraphCacheFilling,
-                        kGraphCacheFillInvalidated) == kGraphCacheFilling) break;
+        if (*reinterpret_cast<const volatile u32*>(params.direct_disabled) != 0) {
+          complete_direct_batch(descriptor, -EHOSTDOWN);
           continue;
         }
-        break;
+        const u32 needed = matching + (need_dump ? 1u : 0u);
+        if (needed > qp->sq_wqe_num) {
+          complete_direct_batch(descriptor, -E2BIG);
+          continue;
+        }
+        if (batch_count != 0 && total_wqes + needed > qp->sq_wqe_num) {
+          deferred = descriptor;
+          deferred_matching = matching;
+          have_deferred = true;
+          break;
+        }
+        shared_batches[warp_in_block][batch_count] = descriptor;
+        shared_matching_counts[warp_in_block][batch_count] = matching;
+        shared_wqe_offsets[warp_in_block][batch_count] = total_wqes;
+        ++batch_count;
+        total_wqes += needed;
+      }
+      shared_batch_counts[warp_in_block] = batch_count;
+      shared_total_wqes[warp_in_block] = total_wqes;
+    }
+    __syncwarp();
+
+    const u32 batch_count = shared_batch_counts[warp_in_block];
+    if (batch_count == 0) {
+      device_ring_relax(256);
+      continue;
+    }
+
+    const doca_gpu_dev_verbs_ticket_t first_wqe = qp->sq_wqe_pi;
+    const doca_gpu_dev_verbs_ticket_t first_completion =
+      doca_gpu_dev_verbs_load_relaxed<
+        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE>(
+          &completion_queue->cqe_ci);
+    for (u32 batch = 0; batch < batch_count; ++batch) {
+      const DirectBatchDescriptor descriptor =
+        shared_batches[warp_in_block][batch];
+      const u32 matching = shared_matching_counts[warp_in_block][batch];
+      const u32 batch_offset = shared_wqe_offsets[warp_in_block][batch];
+      u32 matched_before = 0;
+      for (u32 base = 0; base < descriptor.request_count; base += warp_width) {
+        const u32 index = base + lane;
+        const bool matching_request = index < descriptor.request_count &&
+          descriptor.request_shards[index] == memory_node;
+        const u32 matching_mask = __ballot_sync(0xffffffffu, matching_request);
+        if (matching_request) {
+          const u32 lower_lanes = lane == 0 ? 0u : ((1u << lane) - 1u);
+          const u32 rank = __popc(matching_mask & lower_lanes);
+          const u32 matched = matched_before + rank;
+          const doca_gpu_dev_verbs_ticket_t ticket =
+            first_wqe + batch_offset + matched;
+          auto* wqe = doca_gpu_dev_verbs_get_wqe_ptr(qp, ticket);
+          const bool last_read = matched + 1 == matching;
+          const auto flags = !need_dump && last_read
+            ? DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_UPDATE
+            : DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_ERROR_UPDATE;
+          doca_gpu_dev_verbs_wqe_prepare_read(
+            qp, wqe, ticket, flags,
+            region.address + descriptor.remote_offsets[index], region.rkey,
+            descriptor.local_iova_offsets[index], params.direct_local_mkey,
+            descriptor.bytes);
+        }
+        matched_before += __popc(matching_mask);
+      }
+      if (need_dump && lane == 0) {
+        const doca_gpu_dev_verbs_ticket_t ticket =
+          first_wqe + batch_offset + matching;
+        auto* dump_wqe = doca_gpu_dev_verbs_get_wqe_ptr(qp, ticket);
+        doca_gpu_dev_verbs_wqe_prepare_dump(
+          qp, dump_wqe, ticket, DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_UPDATE,
+          reinterpret_cast<u64>(params.direct_dump) - params.direct_local_iova_base,
+          params.direct_local_mkey, 1);
       }
     }
+    __syncwarp();
+    if (lane == 0) {
+      doca_gpu_dev_verbs_submit<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE>(
+        qp, first_wqe + shared_total_wqes[warp_in_block]);
+
+      i32 status = 0;
+      for (u32 batch = 0; batch < batch_count; ++batch) {
+        if (status == 0) {
+          status = poll_direct_cq(completion_queue, first_completion + batch,
+                                  params.direct_timeout_ns, params.stop,
+                                  params.direct_disabled);
+        }
+        complete_direct_batch(shared_batches[warp_in_block][batch], status);
+      }
+      if (status != 0 && status != -ECANCELED) {
+        if (params.direct_error != nullptr) atomicCAS(params.direct_error, 0, status);
+        atomicExch(params.direct_disabled, 1u);
+      }
+    }
+    __syncwarp();
   }
+#else
+  (void)params;
+  (void)queue_count;
+#endif
 }
 
 __global__ void gpunetio_locked_read_probe_kernel(PersistentKernelParams params,
@@ -1968,11 +2964,48 @@ __global__ void gpunetio_batched_read_probe_kernel(PersistentKernelParams params
   }
 }
 
+__global__ void gather_anchor_codes_kernel(const u8* base_codes,
+                                           const u32* anchor_handles,
+                                           u8* anchor_codes,
+                                           u32 anchor_count,
+                                           u32 code_bytes,
+                                           u32 node_count) {
+  const u64 byte = static_cast<u64>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const u64 total = static_cast<u64>(anchor_count) * code_bytes;
+  if (byte >= total) return;
+  const u32 anchor = static_cast<u32>(byte / code_bytes);
+  const u32 code_byte = static_cast<u32>(byte % code_bytes);
+  const u32 handle = anchor_handles[anchor];
+  anchor_codes[byte] = handle < node_count
+    ? base_codes[static_cast<u64>(handle) * code_bytes + code_byte]
+    : 0;
+}
+
 }  // namespace
 
 void launch_persistent_search(cudaStream_t stream, const PersistentKernelParams& params,
                               u32 blocks, u32 threads) {
   persistent_search_kernel<<<blocks, threads, 0, stream>>>(params);
+}
+
+void launch_direct_read_owners(cudaStream_t stream,
+                               const PersistentKernelParams& params,
+                               u32 queue_count, u32 threads) {
+  const u32 warps_per_block = max(1u, threads / 32);
+  const u32 blocks = (queue_count + warps_per_block - 1) / warps_per_block;
+  direct_read_owner_kernel<<<blocks, threads, 0, stream>>>(params, queue_count);
+}
+
+void launch_gather_anchor_codes(cudaStream_t stream, const u8* base_codes,
+                                const u32* anchor_handles, u8* anchor_codes,
+                                u32 anchor_count, u32 code_bytes,
+                                u32 node_count) {
+  const u64 bytes = static_cast<u64>(anchor_count) * code_bytes;
+  if (bytes == 0) return;
+  constexpr u32 threads = 256;
+  const u32 blocks = static_cast<u32>((bytes + threads - 1) / threads);
+  gather_anchor_codes_kernel<<<blocks, threads, 0, stream>>>(
+    base_codes, anchor_handles, anchor_codes, anchor_count, code_bytes, node_count);
 }
 
 void launch_gpunetio_locked_read_probe(cudaStream_t stream,
@@ -1991,42 +3024,6 @@ void launch_gpunetio_batched_read_probe(cudaStream_t stream,
                                         u32 blocks, u32 batch_size) {
   gpunetio_batched_read_probe_kernel<<<blocks, 128, 0, stream>>>(
     params, destinations, destination_stride, statuses, completed, batch_size);
-}
-
-void launch_publish_delta_count(cudaStream_t stream, u32* count, u32 value) {
-  publish_delta_count_kernel<<<1, 1, 0, stream>>>(count, value);
-}
-
-void launch_supersede_delta_record(cudaStream_t stream, DeviceDeltaRecord* records,
-                                   u32 slot, u64 epoch) {
-  supersede_delta_record_kernel<<<1, 1, 0, stream>>>(records, slot, epoch);
-}
-
-void launch_insert_base_override(cudaStream_t stream, u32* keys, u64* epochs,
-                                 u32 capacity, u32 ordinal, u64 epoch) {
-  insert_override_kernel<<<1, 1, 0, stream>>>(keys, epochs, capacity, ordinal, epoch);
-}
-
-void launch_insert_delta_remote(cudaStream_t stream, u64* keys, u32* slots,
-                                u32 capacity, u64 remote_node, u32 slot) {
-  insert_remote_kernel<<<1, 1, 0, stream>>>(keys, slots, capacity, remote_node, slot);
-}
-
-void launch_link_delta_bucket(cudaStream_t stream, u32* bucket_heads, u32* next,
-                              u32 bucket, u32 slot) {
-  link_bucket_kernel<<<1, 1, 0, stream>>>(bucket_heads, next, bucket, slot);
-}
-
-void launch_invalidate_graph_cache(cudaStream_t stream, const u64* invalidation_keys,
-                                   u32 invalidation_count, const u64* cache_keys,
-                                   u32* cache_states, const u32* cache_readers,
-                                   u32 cache_sets, u32 cache_ways) {
-  if (invalidation_count == 0 || cache_sets == 0 || cache_ways == 0) return;
-  constexpr u32 threads = 128;
-  const u32 blocks = std::min<u32>(256, (invalidation_count + threads - 1) / threads);
-  invalidate_graph_cache_kernel<<<blocks, threads, 0, stream>>>(
-    invalidation_keys, invalidation_count, cache_keys, cache_states,
-    cache_readers, cache_sets, cache_ways);
 }
 
 }  // namespace gpu_search

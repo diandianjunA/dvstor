@@ -166,6 +166,10 @@ Args parse_args(int argc, char** argv) {
       args.recall_k = static_cast<uint32_t>(std::stoul(require_value("--recall-k")));
     } else if (flag == "--min-recall") {
       args.min_recall = std::stod(require_value("--min-recall"));
+    } else if (flag == "--min-query-qps") {
+      args.min_query_qps = std::stod(require_value("--min-query-qps"));
+    } else if (flag == "--min-stability-ratio") {
+      args.min_stability_ratio = std::stod(require_value("--min-stability-ratio"));
     } else if (flag == "--recall-only") {
       args.recall_only = true;
     } else if (flag == "--synthetic") {
@@ -214,6 +218,12 @@ Args parse_args(int argc, char** argv) {
   }
   if (args.min_recall > 1.0) {
     throw std::runtime_error("--min-recall must be <= 1");
+  }
+  if (args.min_query_qps < -1.0) {
+    throw std::runtime_error("--min-query-qps must be -1 or non-negative");
+  }
+  if (args.min_stability_ratio > 1.0 || args.min_stability_ratio < -1.0) {
+    throw std::runtime_error("--min-stability-ratio must be -1 or in [0, 1]");
   }
   if (!args.groundtruth_file.empty() && args.recall_query_file.empty()) {
     throw std::runtime_error("--recall-query-file is required with --groundtruth-file");

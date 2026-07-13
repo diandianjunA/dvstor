@@ -431,7 +431,8 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
         job.new_ptr.raw_address,
         job.old_ptr.raw_address,
         job.generation,
-        0};
+        0,
+        job.maintenance_sequence};
     }
     if (invalidated_neighbors != nullptr) {
       (*invalidated_neighbors)[i] = job.invalidated_neighbors;
@@ -717,8 +718,10 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       const bool deleted = mark_node_deleted(old_entry.current, old_entry.generation);
       if (deleted) {
         publish_mutation(ids[idx], old_entry.current, old_entry.generation, true);
-        if (maintenance_enabled) {
-          (void)enqueue_deleted_node_cleanup(old_entry.current, config);
+        const u64 maintenance_sequence = schedule_storage_owner_maintenance(
+          ids[idx], old_entry.generation, kind, RemotePtr{}, old_entry.current, config);
+        if (results != nullptr) {
+          (*results)[idx].maintenance_sequence = maintenance_sequence;
         }
       }
       if (statuses != nullptr) {
@@ -765,9 +768,10 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
         mark_node_deleted(old_entry.current, old_entry.generation);
       }
       publish_mutation(ids[idx], new_ptr, generation, false);
-      if (maintenance_enabled) {
-        (void)enqueue_insert_stitch(ids[idx], generation, new_ptr, config);
-        (void)enqueue_deleted_node_cleanup(old_entry.current, config);
+      const u64 maintenance_sequence = schedule_storage_owner_maintenance(
+        ids[idx], generation, kind, new_ptr, old_entry.current, config);
+      if (results != nullptr) {
+        (*results)[idx].maintenance_sequence = maintenance_sequence;
       }
       RemotePtr observed;
       if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
@@ -806,9 +810,10 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       mark_node_deleted(old_entry.current, old_entry.generation);
     }
     publish_mutation(ids[idx], new_ptr, generation, false);
-    if (maintenance_enabled) {
-      (void)enqueue_insert_stitch(ids[idx], generation, new_ptr, config);
-      (void)enqueue_deleted_node_cleanup(old_entry.current, config);
+    const u64 maintenance_sequence = schedule_storage_owner_maintenance(
+      ids[idx], generation, kind, new_ptr, old_entry.current, config);
+    if (results != nullptr) {
+      (*results)[idx].maintenance_sequence = maintenance_sequence;
     }
     if (statuses != nullptr) {
       (*statuses)[idx] = static_cast<u32>(service::storage_owner::MutationStatus::ok);

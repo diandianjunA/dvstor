@@ -25,19 +25,26 @@ int main() {
   view.shards = {
     {.ordinal_base = 0, .node_count = 2, .node_base_offset = 16,
      .node_stride = 64, .graph_base_offset = 4096,
-     .dynamic_base_offset = 8192, .code_remote_offset = 8192,
-     .code_bytes = 32, .memory_node = 0, .dynamic_record_bytes = 96,
-     .dynamic_hot_offset = 64},
+     .dynamic_base_offset = 16384, .control_remote_offset = 8192,
+     .code_remote_offset = 12288,
+     .code_bytes = 32, .memory_node = 0, .dynamic_record_bytes = 112,
+     .dynamic_hot_offset = 64, .dynamic_code_offset = 88},
     {.ordinal_base = 2, .node_count = 2, .node_base_offset = 16,
      .node_stride = 64, .graph_base_offset = 4096,
-     .dynamic_base_offset = 8192, .code_remote_offset = 8192,
-     .code_bytes = 32, .memory_node = 1, .dynamic_record_bytes = 96,
-     .dynamic_hot_offset = 64},
+     .dynamic_base_offset = 16384, .control_remote_offset = 8192,
+     .code_remote_offset = 12288,
+     .code_bytes = 32, .memory_node = 1, .dynamic_record_bytes = 112,
+     .dynamic_hot_offset = 64, .dynamic_code_offset = 88},
   };
   view.entry_points = {2, 0, 3};
 
   std::string error;
   assert(format::validate_view(view, &error));
+  format::StorageControlBlock control;
+  assert(control.version == format::kStorageControlVersion);
+  assert(control.header_bytes == sizeof(format::StorageControlBlock));
+  assert(sizeof(format::StorageControlBlock) <= format::kStorageControlBytes);
+  for (u64 ack : control.reclaim_ack_sequences) assert(ack == 0);
 
   RemotePtr pointer;
   assert(format::ordinal_to_remote(view, 0, pointer));
@@ -47,7 +54,7 @@ int main() {
   u32 ordinal = 0;
   assert(format::remote_to_ordinal(view, RemotePtr(1, 16), ordinal));
   assert(ordinal == 2);
-  assert(!format::remote_to_ordinal(view, RemotePtr(1, 8192), ordinal));
+  assert(!format::remote_to_ordinal(view, RemotePtr(1, 16384), ordinal));
 
   format::View malformed = view;
   malformed.shards[1].ordinal_base = 3;
@@ -64,7 +71,7 @@ int main() {
   code_header.code_bytes = 16;
   code_header.node_size = 64;
   code_header.entry_count = 2;
-  code_header.remote_offset = 8192;
+  code_header.remote_offset = 12288;
   code_header.payload_bytes = payload.size();
   code_header.model_checksum = view.layout.model_checksum;
   code_header.payload_checksum = format::checksum64(payload.data(), payload.size());

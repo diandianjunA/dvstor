@@ -41,6 +41,11 @@ fi
 
 metadata_path="${INDEX_PREFIX}.meta.json"
 if [[ "${OVERWRITE_INDEX:-0}" != "1" && -f "$metadata_path" ]]; then
+  if grep -Eq '"schema_version"[[:space:]]*:[[:space:]]*15' "$metadata_path"; then
+    validate_index_metadata storage
+    echo "[migrate] current schema-15 index already exists: $INDEX_PREFIX"
+    exit 0
+  fi
   if ! grep -Eq '"schema_version"[[:space:]]*:[[:space:]]*14' "$metadata_path"; then
     echo "existing output metadata is not a schema-14 migration checkpoint: $metadata_path" >&2
     exit 1
@@ -58,4 +63,4 @@ MKL_NUM_THREADS=1 \
 OMP_DYNAMIC=FALSE \
 "${pq_cmd[@]}"
 validate_index_metadata storage
-echo "[migrate] complete: $INDEX_PREFIX"
+echo "[migrate] complete: schema-15 persistent OPQ/PQ index $INDEX_PREFIX"

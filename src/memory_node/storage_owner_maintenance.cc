@@ -7,14 +7,15 @@
 #include <thread>
 #include <unordered_map>
 
+#include "gpu_search/index_format.hh"
 #include "vamana/hot_graph.hh"
 #include "vamana/storage_layout_resolver.hh"
 
 namespace {
 
 constexpr u64 kMaintenanceObservationPeriodNs = 5ull * 1000ull * 1000ull * 1000ull;
-constexpr u64 kStitchCompactionMaxDelayNs = 3ull * 1000ull * 1000ull * 1000ull;
-constexpr u64 kStitchCompactionPaceSlotNs = 80ull * 1000ull * 1000ull;
+constexpr u64 kStitchCompactionMaxDelayNs = 10ull * 1000ull * 1000ull;
+constexpr u64 kStitchCompactionPaceSlotNs = 1ull * 1000ull * 1000ull;
 constexpr size_t kForegroundQueueYieldMultiplier = 2;
 
 u64 steady_now_ns() {
@@ -49,7 +50,11 @@ double ratio_or_zero(u64 numerator, u64 denominator) {
   return static_cast<double>(numerator) / static_cast<double>(denominator);
 }
 
-u64 stitch_compaction_round_ns(u32 shard_count) {
+u64 stitch_compaction_round_ns(u32 shard_count, size_t backlog,
+                               size_t batch_limit, u32 worker_count) {
+  const size_t saturation_backlog = std::max<size_t>(
+    batch_limit, batch_limit * std::max<u32>(1, worker_count));
+  if (backlog >= saturation_backlog) return 0;
   return kStitchCompactionPaceSlotNs * std::max<u32>(1, shard_count);
 }
 
@@ -85,6 +90,11 @@ bool MemoryNode::storage_owner_maintenance_enabled(const Configuration& config) 
 void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& config) {
   if (!storage_owner_maintenance_enabled(config)) {
     return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(storage_owner_maintenance_sequence_mutex_);
+    storage_owner_maintenance_sequence_remaining_.clear();
   }
 
   storage_owner_maintenance_shutdown_.store(false, std::memory_order_release);
@@ -144,8 +154,8 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                " compaction_batch_target=" + std::to_string(config.storage_owner_batch_max) +
                " compaction_max_delay_ms=" +
                std::to_string(kStitchCompactionMaxDelayNs / 1000000ull) +
-               " compaction_pace_slot_ms=" +
-               std::to_string(kStitchCompactionPaceSlotNs / 1000000ull));
+               " compaction_pace=adaptive backlog_limit=" +
+               std::to_string(config.storage_owner_maintenance_queue_depth));
 }
 
 void MemoryNode::stop_storage_owner_maintenance_runtime() {
@@ -214,6 +224,15 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
                                     ? static_cast<double>(peer_stitch_items) / elapsed_s
                                     : 0.0;
   const size_t remaining = stitch_remaining + cleanup_remaining;
+  auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
+    index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+  const u64 reclaim_pending =
+    std::atomic_ref<u64>(control->reclaim_pending_nodes).load(std::memory_order_acquire);
+  const u64 reclaim_reused =
+    std::atomic_ref<u64>(control->reclaim_reused_nodes).load(std::memory_order_acquire);
+  const u64 dynamic_high_watermark =
+    std::atomic_ref<u64>(control->dynamic_high_watermark).load(std::memory_order_acquire);
+  const u64 reclaim_ack = minimum_compute_reclaim_ack();
 
   print_status(str("storage-owner maintenance ") + (final ? "summary" : "observation") +
                ": enqueued=" +
@@ -272,6 +291,14 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
                std::to_string(peer_stitch_rate) +
                " peer_stitch_max_queue=" +
                std::to_string(peer_stitch_search_max_queue_.load(std::memory_order_relaxed)) +
+               " reclaim_ack=" +
+               std::to_string(reclaim_ack) +
+               " reclaim_pending=" +
+               std::to_string(reclaim_pending) +
+               " reclaim_reused=" +
+               std::to_string(reclaim_reused) +
+               " dynamic_high_watermark=" +
+               std::to_string(dynamic_high_watermark) +
                " stitch_remaining=" +
                std::to_string(stitch_remaining) +
                " cleanup_remaining=" +
@@ -307,7 +334,12 @@ bool MemoryNode::enqueue_storage_owner_maintenance(StorageOwnerMaintenanceTask&&
   task.queued_at = std::chrono::steady_clock::now();
   size_t backlog = 0;
   {
-    std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
+    std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+    storage_owner_maintenance_cv_.wait(lock, [&]() {
+      return storage_owner_maintenance_shutdown_.load(std::memory_order_acquire) ||
+             storage_owner_stitch_tasks_.size() + storage_owner_cleanup_tasks_.size() <
+               config.storage_owner_maintenance_queue_depth;
+    });
     if (storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
       return false;
     }
@@ -327,11 +359,13 @@ bool MemoryNode::enqueue_storage_owner_maintenance(StorageOwnerMaintenanceTask&&
 bool MemoryNode::enqueue_insert_stitch(node_t id,
                                        u32 generation,
                                        RemotePtr target,
+                                       u64 maintenance_sequence,
                                        const Configuration& config) {
   StorageOwnerMaintenanceTask task;
   task.kind = StorageOwnerMaintenanceKind::stitch_insert;
   task.id = id;
   task.generation = generation;
+  task.maintenance_sequence = maintenance_sequence;
   task.target = target;
   const bool queued = enqueue_storage_owner_maintenance(std::move(task), config);
   if (queued) {
@@ -340,15 +374,90 @@ bool MemoryNode::enqueue_insert_stitch(node_t id,
   return queued;
 }
 
-bool MemoryNode::enqueue_deleted_node_cleanup(RemotePtr deleted_ptr, const Configuration& config) {
+bool MemoryNode::enqueue_deleted_node_cleanup(RemotePtr deleted_ptr,
+                                              u64 maintenance_sequence,
+                                              const Configuration& config) {
   StorageOwnerMaintenanceTask task;
   task.kind = StorageOwnerMaintenanceKind::cleanup_deleted_node;
+  task.maintenance_sequence = maintenance_sequence;
   task.target = deleted_ptr;
   const bool queued = enqueue_storage_owner_maintenance(std::move(task), config);
   if (queued) {
     storage_owner_maintenance_cleanup_enqueued_.fetch_add(1, std::memory_order_relaxed);
   }
   return queued;
+}
+
+u64 MemoryNode::begin_storage_owner_maintenance_sequence(u32 work_items) {
+  auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
+    index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+  lib_assert(control->magic == gpu_search::format::kStorageControlMagic &&
+               control->version == gpu_search::format::kStorageControlVersion,
+             "storage-owner maintenance control block is not initialized");
+  std::atomic_ref<u64> next_sequence(control->next_maintenance_sequence);
+  const u64 sequence = next_sequence.fetch_add(1, std::memory_order_acq_rel);
+  {
+    std::lock_guard<std::mutex> lock(storage_owner_maintenance_sequence_mutex_);
+    const auto [iterator, inserted] =
+      storage_owner_maintenance_sequence_remaining_.emplace(sequence, work_items);
+    lib_assert(inserted && iterator->second == work_items,
+               "duplicate storage-owner maintenance sequence");
+    advance_storage_owner_durable_sequence_locked();
+  }
+  return sequence;
+}
+
+void MemoryNode::advance_storage_owner_durable_sequence_locked() {
+  auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
+    index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+  std::atomic_ref<u64> durable(control->durable_maintenance_sequence);
+  u64 watermark = durable.load(std::memory_order_acquire);
+  for (;;) {
+    const auto iterator = storage_owner_maintenance_sequence_remaining_.find(watermark + 1);
+    if (iterator == storage_owner_maintenance_sequence_remaining_.end() ||
+        iterator->second != 0) {
+      break;
+    }
+    storage_owner_maintenance_sequence_remaining_.erase(iterator);
+    ++watermark;
+  }
+  durable.store(watermark, std::memory_order_release);
+}
+
+void MemoryNode::complete_storage_owner_maintenance_sequence(u64 sequence) {
+  if (sequence == 0) return;
+  std::lock_guard<std::mutex> lock(storage_owner_maintenance_sequence_mutex_);
+  const auto iterator = storage_owner_maintenance_sequence_remaining_.find(sequence);
+  lib_assert(iterator != storage_owner_maintenance_sequence_remaining_.end() &&
+               iterator->second != 0,
+             "invalid storage-owner maintenance completion sequence");
+  --iterator->second;
+  advance_storage_owner_durable_sequence_locked();
+}
+
+u64 MemoryNode::schedule_storage_owner_maintenance(
+    node_t id,
+    u32 generation,
+    service::storage_owner::MutationKind kind,
+    RemotePtr new_ptr,
+    RemotePtr old_ptr,
+    const Configuration& config) {
+  const bool maintenance_enabled = storage_owner_maintenance_enabled(config);
+  const bool needs_stitch = maintenance_enabled &&
+    kind != service::storage_owner::MutationKind::erase && !new_ptr.is_null();
+  const bool needs_cleanup = maintenance_enabled &&
+    kind != service::storage_owner::MutationKind::insert && !old_ptr.is_null();
+  const u64 sequence = begin_storage_owner_maintenance_sequence(
+    static_cast<u32>(needs_stitch) + static_cast<u32>(needs_cleanup));
+  if (needs_stitch &&
+      !enqueue_insert_stitch(id, generation, new_ptr, sequence, config)) {
+    lib_failure("failed to enqueue storage-owner stitch maintenance");
+  }
+  if (needs_cleanup &&
+      !enqueue_deleted_node_cleanup(old_ptr, sequence, config)) {
+    lib_failure("failed to enqueue storage-owner cleanup maintenance");
+  }
+  return sequence;
 }
 
 void MemoryNode::mark_storage_owner_foreground_activity() {
@@ -416,11 +525,9 @@ bool MemoryNode::storage_owner_maintenance_foreground_busy(const Configuration&)
 }
 
 bool MemoryNode::try_acquire_storage_owner_maintenance_slot(const Configuration& config) {
-  if (storage_owner_maintenance_foreground_busy(config)) {
-    return false;
-  }
-
-  const u32 max_workers = std::max<u32>(1, config.storage_owner_maintenance_workers);
+  const bool foreground_busy = storage_owner_maintenance_foreground_busy(config);
+  const u32 max_workers = foreground_busy
+    ? 1 : std::max<u32>(1, config.storage_owner_maintenance_workers);
   u32 active = storage_owner_maintenance_active_workers_.load(std::memory_order_acquire);
   while (active < max_workers) {
     if (storage_owner_maintenance_active_workers_.compare_exchange_weak(
@@ -466,9 +573,14 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         const auto now = std::chrono::steady_clock::now();
         const bool candidate_ready =
           storage_owner_stitch_tasks_.size() >= batch_limit || now >= ready_at;
+        const size_t backlog =
+          storage_owner_stitch_tasks_.size() + storage_owner_cleanup_tasks_.size();
+        const u64 pace_ns = stitch_compaction_round_ns(
+          num_storage_nodes_, backlog, batch_limit,
+          std::max<u32>(1, config.storage_owner_maintenance_workers));
         const u64 now_ns = steady_now_ns();
         const u64 release_ns = storage_owner_next_stitch_release_ns_.load(std::memory_order_acquire);
-        if (candidate_ready && now_ns < release_ns) {
+        if (candidate_ready && pace_ns != 0 && now_ns < release_ns) {
           storage_owner_maintenance_cv_.wait_for(lock,
                                                  std::chrono::nanoseconds(release_ns - now_ns),
                                                  [&]() {
@@ -510,10 +622,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       if (storage_owner_stitch_tasks_.empty() && storage_owner_cleanup_tasks_.empty()) {
         continue;
       }
-      if (storage_owner_maintenance_foreground_busy(config)) {
-        storage_owner_maintenance_pressure_yields_.fetch_add(1, std::memory_order_relaxed);
-        continue;
-      }
       const auto now = std::chrono::steady_clock::now();
       const size_t batch_limit = std::max<u32>(1, config.storage_owner_batch_max);
       const bool stitch_batch_full = storage_owner_stitch_tasks_.size() >= batch_limit;
@@ -521,12 +629,17 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         !storage_owner_stitch_tasks_.empty() &&
         now >= storage_owner_stitch_tasks_.front().queued_at +
                  std::chrono::nanoseconds(kStitchCompactionMaxDelayNs);
+      const size_t backlog =
+        storage_owner_stitch_tasks_.size() + storage_owner_cleanup_tasks_.size();
+      const u64 pace_ns = stitch_compaction_round_ns(
+        num_storage_nodes_, backlog, batch_limit,
+        std::max<u32>(1, config.storage_owner_maintenance_workers));
       const u64 now_ns = steady_now_ns();
       const u64 release_ns = storage_owner_next_stitch_release_ns_.load(std::memory_order_acquire);
       if (!storage_owner_stitch_tasks_.empty() && (stitch_batch_full || stitch_wait_expired) &&
-          now_ns >= release_ns) {
+          (pace_ns == 0 || now_ns >= release_ns)) {
         storage_owner_next_stitch_release_ns_.store(
-          std::max(now_ns, release_ns) + stitch_compaction_round_ns(num_storage_nodes_),
+          (pace_ns == 0 ? now_ns : std::max(now_ns, release_ns)) + pace_ns,
           std::memory_order_release);
         stitch_batch.reserve(batch_limit);
         while (!storage_owner_stitch_tasks_.empty() && stitch_batch.size() < batch_limit) {
@@ -546,6 +659,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         continue;
       }
     }
+    storage_owner_maintenance_cv_.notify_all();
 
     if (!stitch_batch.empty()) {
       vec<StorageOwnerMaintenanceTask> retry_tasks;
@@ -577,6 +691,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     if (has_cleanup_task) {
       const bool ok = cleanup_deleted_storage_owner_node(cleanup_task, config);
       if (ok) {
+        complete_storage_owner_maintenance_sequence(
+          cleanup_task.maintenance_sequence);
         storage_owner_maintenance_cleanup_processed_.fetch_add(1, std::memory_order_relaxed);
       } else {
         storage_owner_maintenance_failed_.fetch_add(1, std::memory_order_relaxed);
@@ -716,11 +832,13 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
 
   for (const StorageOwnerMaintenanceTask& task : tasks) {
     if (!local_shard(task.target.memory_node())) {
+      complete_storage_owner_maintenance_sequence(task.maintenance_sequence);
       ++processed_count;
       continue;
     }
     if (!storage_owner_task_current(task.id, task.generation, task.target)) {
       storage_owner_maintenance_stale_.fetch_add(1, std::memory_order_relaxed);
+      complete_storage_owner_maintenance_sequence(task.maintenance_sequence);
       ++processed_count;
       continue;
     }
@@ -732,6 +850,7 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
     }
     if (target_snapshot.deleted) {
       storage_owner_maintenance_stale_.fetch_add(1, std::memory_order_relaxed);
+      complete_storage_owner_maintenance_sequence(task.maintenance_sequence);
       ++processed_count;
       continue;
     }
@@ -812,6 +931,7 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
     if (!storage_owner_task_current(task.id, task.generation, task.target)) {
       unlock_node(task.target);
       storage_owner_maintenance_stale_.fetch_add(1, std::memory_order_relaxed);
+      complete_storage_owner_maintenance_sequence(task.maintenance_sequence);
       ++processed_count;
       continue;
     }
@@ -824,6 +944,7 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
     if (latest_snapshot.deleted) {
       unlock_node(task.target);
       storage_owner_maintenance_stale_.fetch_add(1, std::memory_order_relaxed);
+      complete_storage_owner_maintenance_sequence(task.maintenance_sequence);
       ++processed_count;
       continue;
     }
@@ -866,6 +987,7 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
   }
 
   for (const StorageOwnerMaintenanceTask& task : finalized_tasks) {
+    complete_storage_owner_maintenance_sequence(task.maintenance_sequence);
     const u64 finalize_latency_ns = static_cast<u64>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - task.queued_at).count());
@@ -922,6 +1044,9 @@ bool MemoryNode::cleanup_deleted_storage_owner_node(const StorageOwnerMaintenanc
   }
   for (auto& [target_shard, ops] : remote_cleanup) {
     ok &= send_cleanup_deleted_batch(target_shard, ops, config);
+  }
+  if (ok) {
+    retire_local_dynamic_node(task.target, task.maintenance_sequence);
   }
   return ok;
 }

@@ -32,6 +32,11 @@ target_link_libraries(gpu_delta_index_test PRIVATE dvstor_runtime)
 target_compile_options(gpu_delta_index_test PRIVATE -UNDEBUG)
 add_test(NAME gpu_delta_index_test COMMAND gpu_delta_index_test)
 
+add_executable(storage_reclaim_test storage_reclaim_test.cc)
+target_link_libraries(storage_reclaim_test PRIVATE dvstor_runtime)
+target_compile_options(storage_reclaim_test PRIVATE -UNDEBUG)
+add_test(NAME storage_reclaim_test COMMAND storage_reclaim_test)
+
 add_executable(gpu_memory_budget_test gpu_memory_budget_test.cc)
 target_link_libraries(gpu_memory_budget_test PRIVATE dvstor_runtime)
 target_compile_options(gpu_memory_budget_test PRIVATE -UNDEBUG)

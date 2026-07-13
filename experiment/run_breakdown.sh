@@ -19,6 +19,27 @@ MEASURE_SECONDS="${MEASURE_SECONDS:-120}"
 RECALL_QUERIES="${RECALL_QUERIES:-1000}"
 RECALL_K="${RECALL_K:-$K}"
 MIN_RECALL="${MIN_RECALL:--1}"
+MIN_QUERY_QPS="${MIN_QUERY_QPS:-5000}"
+MIN_STABILITY_RATIO="${MIN_STABILITY_RATIO:-0.90}"
+REQUIRE_COLD_BASELINE="${REQUIRE_COLD_BASELINE:-1}"
+if [[ "$REQUIRE_COLD_BASELINE" == "1" ]]; then
+  if (( ${GPU_ADJACENCY_CACHE_MB:-0} != 0 || ${GPU_EXACT_CACHE_MB:-0} != 0 )); then
+    echo "cold baseline requires GPU_ADJACENCY_CACHE_MB=0 and GPU_EXACT_CACHE_MB=0" >&2
+    exit 1
+  fi
+  [[ "${GPU_GRAPH_PREFETCH_DEPTH:-0}" == "32" ]] || {
+    echo "official cold baseline requires GPU_GRAPH_PREFETCH_DEPTH=32" >&2
+    exit 1
+  }
+  [[ "${GPU_PERSISTENT_BLOCKS_PER_SM:-0}" == "4" ]] || {
+    echo "official cold baseline requires GPU_PERSISTENT_BLOCKS_PER_SM=4" >&2
+    exit 1
+  }
+  [[ "${GPU_RDMA_QPS:-0}" == "32" ]] || {
+    echo "official cold baseline requires GPU_RDMA_QPS=32" >&2
+    exit 1
+  }
+fi
 RECALL_QUERY_FILE="$(query_bin)"
 PERFORMANCE_QUERY_PATH="$(performance_query_bin)"
 INSERT_PATH="$(insert_bin)"
@@ -65,6 +86,8 @@ cmd=("$BUILD_DIR/dvstor_breakdown_benchmark"
   --recall-queries "$RECALL_QUERIES"
   --recall-k "$RECALL_K"
   --min-recall "$MIN_RECALL"
+  --min-query-qps "$MIN_QUERY_QPS"
+  --min-stability-ratio "$MIN_STABILITY_RATIO"
   --insert-start-id "${INSERT_START_ID:-$((MAX_VECTORS + 1000000))}"
   --insert-file "$INSERT_PATH"
   --report-json "$JSON_REPORT"

@@ -30,7 +30,11 @@ int main(int argc, char** argv) {
     ("threads", po::value<u32>(&options.threads)->default_value(0),
      "CPU threads; 0 uses at most 32 hardware threads")
     ("seed", po::value<u64>(&options.seed)->default_value(options.seed), "Training seed")
-    ("overwrite", po::bool_switch(&options.overwrite), "Replace existing PQ outputs");
+    ("overwrite", po::bool_switch(&options.overwrite), "Replace existing PQ outputs")
+    ("upgrade-layout-only", po::bool_switch(&options.upgrade_layout_only),
+     "Upgrade an existing OPQ/PQ index to the current persistent layout without re-encoding")
+    ("local-shard", po::value<u32>(&options.local_shard)->default_value(0),
+     "One-based local sidecar to rewrite; 0 rewrites all sidecars present");
   try {
     po::variables_map variables;
     po::store(po::parse_command_line(argc, argv, description), variables);
@@ -39,7 +43,11 @@ int main(int argc, char** argv) {
       return EXIT_SUCCESS;
     }
     po::notify(variables);
-    (void)tools::vamana_offline::build_pq_index(options);
+    if (options.upgrade_layout_only) {
+      (void)tools::vamana_offline::upgrade_pq_layout(options);
+    } else {
+      (void)tools::vamana_offline::build_pq_index(options);
+    }
     return EXIT_SUCCESS;
   } catch (const std::exception& error) {
     std::cerr << "vamana_pq_indexer: " << error.what() << '\n';

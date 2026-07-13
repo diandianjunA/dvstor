@@ -57,19 +57,24 @@ MemoryNode::MemoryNode(Configuration& config)
       metadata.navigation_quantizer == "opq_pq16";
     const bool compatible_navigation = metadata.navigation_format == "opq_pq_graph_v1" ||
       metadata.navigation_format == "opq_pq16_graph_v1";
-    gpu_stream_layout_ = metadata.schema_version == 14 &&
+    gpu_stream_layout_ = metadata.schema_version == gpu_search::format::kMetadataSchemaVersion &&
       metadata.node_layout == "plain" &&
       metadata.storage_format == "vamana_compact_v1" &&
       compatible_quantizer && compatible_navigation;
     lib_assert(gpu_stream_layout_,
-               "storage node requires a schema-14 compact OPQ/PQ index");
+               "storage node requires a schema-15 compact OPQ/PQ index");
     lib_assert(storage_id_ < num_storage_nodes_, "invalid GPU storage shard id");
     lib_assert(metadata.hot_graph_entry_counts.size() == num_storage_nodes_,
                "GPU storage metadata has invalid static shard counts");
     lib_assert(metadata.hot_graph_dynamic_base_offsets.size() == num_storage_nodes_,
                "GPU storage metadata has invalid dynamic shard offsets");
+    lib_assert(metadata.storage_control_remote_offsets.size() == num_storage_nodes_ &&
+                 metadata.dynamic_node_base_offsets.size() == num_storage_nodes_,
+               "GPU storage metadata has invalid control/dynamic-node offsets");
     gpu_static_node_count_ = metadata.hot_graph_entry_counts[storage_id_];
     gpu_static_dynamic_base_ = metadata.hot_graph_dynamic_base_offsets[storage_id_];
+    gpu_storage_control_offset_ = metadata.storage_control_remote_offsets[storage_id_];
+    gpu_dynamic_node_base_ = metadata.dynamic_node_base_offsets[storage_id_];
     gpu_navigation_code_bytes_ = metadata.navigation_code_bytes;
     gpu_navigation_model_checksum_ = metadata.navigation_model_checksum;
     if (config.vector_data_type != "auto" && config.resolved_vector_dtype() != metadata.vector_dtype) {
@@ -80,7 +85,8 @@ MemoryNode::MemoryNode(Configuration& config)
     config.vector_data_type = vector_dtype_name(startup_dtype);
     VamanaNode::disable_hot_graph();
     VamanaNode::init_static_storage(config.dim, config.R, startup_dtype);
-    lib_assert(metadata.schema_version == 14 && metadata.node_layout == "plain",
+    lib_assert(metadata.schema_version == gpu_search::format::kMetadataSchemaVersion &&
+                 metadata.node_layout == "plain",
                "index storage format is obsolete; rebuild with the current offline builder");
     lib_assert(metadata.vector_component_size == VamanaNode::vector_component_size(),
                "index metadata vector component size mismatch on storage node");
@@ -96,18 +102,34 @@ MemoryNode::MemoryNode(Configuration& config)
                metadata.hot_graph_entry_counts.size() == num_storage_nodes_,
                "index hot graph metadata mismatch on storage node");
     lib_assert(metadata.hot_graph_dynamic_base_offsets.size() == num_storage_nodes_ &&
+               metadata.dynamic_node_base_offsets.size() == num_storage_nodes_ &&
                metadata.hot_graph_dynamic_record_bytes >=
                  metadata.hot_graph_dynamic_hot_offset + metadata.hot_graph_entry_size &&
-               metadata.hot_graph_dynamic_hot_offset >= VamanaNode::total_size(),
+               metadata.hot_graph_dynamic_hot_offset >= VamanaNode::total_size() &&
+               metadata.dynamic_navigation_code_offset >=
+                 metadata.hot_graph_dynamic_hot_offset + metadata.hot_graph_entry_size &&
+               metadata.hot_graph_dynamic_record_bytes >=
+                 metadata.dynamic_navigation_code_offset + metadata.navigation_code_bytes,
                "index dynamic hot graph metadata mismatch on storage node");
     VamanaNode::configure_hot_graph(metadata.hot_graph_offsets,
                                     metadata.hot_graph_entry_counts,
                                     metadata.hot_graph_entry_size,
                                     metadata.hot_graph_shard_bits,
-                                    metadata.hot_graph_dynamic_base_offsets,
+                                    metadata.dynamic_node_base_offsets,
                                     metadata.hot_graph_dynamic_record_bytes,
-                                    metadata.hot_graph_dynamic_hot_offset);
+                                    metadata.hot_graph_dynamic_hot_offset,
+                                    metadata.dynamic_navigation_code_offset,
+                                    metadata.navigation_code_bytes);
     lib_assert(VamanaNode::HAS_HOT_GRAPH, "failed to enable compact hot graph on storage node");
+    lib_assert(gpu_search::pq::read_model(
+                 index_path::navigation_model_file(index_prefix,
+                                                   metadata.pq_subquantizers),
+                 gpu_navigation_model_, &metadata_error),
+               metadata_error);
+    lib_assert(gpu_navigation_model_.checksum() == metadata.navigation_model_checksum &&
+                 gpu_navigation_model_.code_bytes() == metadata.navigation_code_bytes &&
+                 gpu_navigation_model_.dim == metadata.dim,
+               "storage-node PQ model does not match index metadata");
     owner_idmap_required_ = metadata.idmap_format == "owner_sharded_v1";
     startup_anchor_format = metadata.anchor_format;
     print_status("loaded index metadata from " + index_prefix.string() +
@@ -317,7 +339,8 @@ std::pair<bool, str> MemoryNode::load_index_file(const str& path) {
     return {false, "GPU storage shard is truncated or has inconsistent static metadata"};
   }
 
-  const u64 remote_offset = gpu_search::format::align_up(gpu_static_dynamic_base_, 64);
+  const u64 remote_offset = gpu_storage_control_offset_ +
+    gpu_search::format::kStorageControlBytes;
   const u64 payload_bytes = gpu_static_node_count_ * gpu_navigation_code_bytes_;
   if (remote_offset == 0 || remote_offset > index_buffer_.buffer_size ||
       payload_bytes > index_buffer_.buffer_size - remote_offset) {
@@ -359,10 +382,32 @@ std::pair<bool, str> MemoryNode::load_index_file(const str& path) {
   print_status("loaded GPU PQ codes (" + std::to_string(header.payload_bytes) +
                " Bytes) at remote offset " + std::to_string(header.remote_offset));
 
-  const u64 allocation_stride = static_cast<u64>(VamanaNode::allocation_size());
   const u64 region_end = remote_offset + payload_bytes;
-  *reinterpret_cast<u64*>(index_buffer_.get_full_buffer()) = gpu_static_dynamic_base_ +
-    gpu_search::format::align_up(region_end - gpu_static_dynamic_base_, allocation_stride);
+  if (gpu_storage_control_offset_ !=
+        gpu_search::format::align_up(gpu_static_dynamic_base_, 64) ||
+      gpu_dynamic_node_base_ < region_end ||
+      (gpu_dynamic_node_base_ - gpu_static_dynamic_base_) %
+        VamanaNode::allocation_size() != 0 ||
+      gpu_dynamic_node_base_ > index_buffer_.buffer_size) {
+    return {false, "GPU storage control/dynamic-node layout is inconsistent"};
+  }
+  std::memset(index_buffer_.get_full_buffer() + gpu_storage_control_offset_, 0,
+              gpu_search::format::kStorageControlBytes);
+  auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
+    index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+  *control = gpu_search::format::StorageControlBlock{
+    .shard_id = storage_id_,
+    .dynamic_record_bytes = static_cast<u32>(VamanaNode::allocation_size()),
+    .dynamic_hot_offset = VamanaNode::HOT_GRAPH_DYNAMIC_HOT_OFFSET,
+    .dynamic_code_offset = VamanaNode::HOT_GRAPH_DYNAMIC_CODE_OFFSET,
+    .code_bytes = VamanaNode::HOT_GRAPH_DYNAMIC_CODE_BYTES,
+    .compute_client_count = num_clients_,
+    .dynamic_high_watermark = gpu_dynamic_node_base_,
+  };
+  if (num_clients_ == 0 || num_clients_ > gpu_search::format::kMaxComputeClients) {
+    return {false, "compute client count exceeds the storage reclaim control capacity"};
+  }
+  *reinterpret_cast<u64*>(index_buffer_.get_full_buffer()) = gpu_dynamic_node_base_;
 
   return {true, ""};
 }

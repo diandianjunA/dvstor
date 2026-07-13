@@ -193,15 +193,23 @@ bool validate_view(const View& view, std::string* error) {
     if (shard.memory_node != shard_index || shard.ordinal_base != next_ordinal ||
         shard.node_count == 0 || shard.node_base_offset != kNodeBaseOffset ||
         shard.node_stride == 0 || shard.graph_base_offset == 0 ||
-        shard.dynamic_base_offset == 0 || shard.dynamic_record_bytes == 0 ||
+        shard.dynamic_base_offset == 0 || shard.control_remote_offset == 0 ||
+        shard.dynamic_record_bytes == 0 ||
         shard.dynamic_hot_offset == 0 || node_range_overflows || graph_range_overflows ||
         code_range_overflows || node_end > shard.graph_base_offset ||
-        graph_end > shard.dynamic_base_offset ||
+        graph_end > shard.control_remote_offset ||
         shard.dynamic_hot_offset < shard.node_stride ||
         shard.dynamic_hot_offset > shard.dynamic_record_bytes ||
         view.layout.graph_entry_bytes >
           shard.dynamic_record_bytes - shard.dynamic_hot_offset ||
-        shard.code_remote_offset != align_up(shard.dynamic_base_offset, 64) ||
+        shard.dynamic_code_offset <
+          shard.dynamic_hot_offset + view.layout.graph_entry_bytes ||
+        shard.dynamic_code_offset > shard.dynamic_record_bytes ||
+        view.layout.code_bytes >
+          shard.dynamic_record_bytes - shard.dynamic_code_offset ||
+        shard.code_remote_offset !=
+          shard.control_remote_offset + kStorageControlBytes ||
+        shard.dynamic_base_offset < shard.code_remote_offset + shard.code_bytes ||
         shard.code_bytes != shard.node_count * view.layout.code_bytes) {
       set_error(error, "GPU navigation layout contains an invalid shard region");
       return false;
@@ -236,7 +244,7 @@ bool synthesize_distributed_view(
     metadata_input >> metadata;
     const std::string quantizer = metadata.value("navigation_quantizer", std::string{});
     const std::string navigation_format = metadata.value("navigation_format", std::string{});
-    if (metadata.value("schema_version", 0u) != 14 ||
+    if (metadata.value("schema_version", 0u) != kMetadataSchemaVersion ||
         metadata.value("distance", std::string{"l2"}) != "l2" ||
         metadata.value("node_layout", std::string{}) != "plain" ||
         metadata.value("storage_format", std::string{}) != "vamana_compact_v1" ||
@@ -244,7 +252,7 @@ bool synthesize_distributed_view(
         (navigation_format != "opq_pq_graph_v1" &&
          navigation_format != "opq_pq16_graph_v1")) {
       throw std::runtime_error(
-        "GPU navigation requires schema-14 compact L2 metadata with OPQ/PQ codes");
+        "GPU navigation requires schema-15 compact L2 metadata with persistent dynamic PQ codes");
     }
 
     const u32 shard_count = metadata.at("num_memory_nodes").get<u32>();
@@ -254,12 +262,17 @@ bool synthesize_distributed_view(
       metadata.at("hot_graph_offsets").get<std::vector<u64>>();
     const std::vector<u64> dynamic_offsets =
       metadata.at("hot_graph_dynamic_base_offsets").get<std::vector<u64>>();
+    const std::vector<u64> control_offsets =
+      metadata.at("storage_control_remote_offsets").get<std::vector<u64>>();
+    const std::vector<u64> dynamic_node_offsets =
+      metadata.at("dynamic_node_base_offsets").get<std::vector<u64>>();
     const std::vector<u64> code_offsets =
       metadata.at("navigation_code_remote_offsets").get<std::vector<u64>>();
     const std::vector<u64> code_sizes =
       metadata.at("navigation_code_region_bytes").get<std::vector<u64>>();
     if (shard_count == 0 || counts.size() != shard_count ||
         graph_offsets.size() != shard_count || dynamic_offsets.size() != shard_count ||
+        control_offsets.size() != shard_count || dynamic_node_offsets.size() != shard_count ||
         code_offsets.size() != shard_count || code_sizes.size() != shard_count) {
       throw std::runtime_error("GPU navigation metadata has invalid shard arrays");
     }
@@ -286,13 +299,18 @@ bool synthesize_distributed_view(
     const u64 node_stride = metadata.at("node_size").get<u64>();
     const u32 dynamic_record_bytes = metadata.at("hot_graph_dynamic_record_bytes").get<u32>();
     const u32 dynamic_hot_offset = metadata.at("hot_graph_dynamic_hot_offset").get<u32>();
+    const u32 dynamic_code_offset = metadata.at("dynamic_navigation_code_offset").get<u32>();
     u64 node_count = 0;
     for (u32 shard = 0; shard < shard_count; ++shard) {
-      const u64 expected_code_offset = align_up(dynamic_offsets[shard], 64);
+      const u64 expected_control_offset = align_up(dynamic_offsets[shard], 64);
+      const u64 expected_code_offset = expected_control_offset + kStorageControlBytes;
       const u64 expected_code_bytes = counts[shard] * synthesized.layout.code_bytes;
       if (counts[shard] == 0 || graph_offsets[shard] == 0 ||
-          dynamic_offsets[shard] == 0 || code_offsets[shard] != expected_code_offset ||
+          dynamic_offsets[shard] == 0 ||
+          control_offsets[shard] != expected_control_offset ||
+          code_offsets[shard] != expected_code_offset ||
           code_sizes[shard] != expected_code_bytes ||
+          dynamic_node_offsets[shard] < expected_code_offset + expected_code_bytes ||
           counts[shard] >= (1ull << 30) - node_count) {
         throw std::runtime_error("GPU navigation metadata contains an invalid shard");
       }
@@ -302,12 +320,14 @@ bool synthesize_distributed_view(
         .node_base_offset = kNodeBaseOffset,
         .node_stride = node_stride,
         .graph_base_offset = graph_offsets[shard],
-        .dynamic_base_offset = dynamic_offsets[shard],
+        .dynamic_base_offset = dynamic_node_offsets[shard],
+        .control_remote_offset = control_offsets[shard],
         .code_remote_offset = code_offsets[shard],
         .code_bytes = code_sizes[shard],
         .memory_node = shard,
         .dynamic_record_bytes = dynamic_record_bytes,
         .dynamic_hot_offset = dynamic_hot_offset,
+        .dynamic_code_offset = dynamic_code_offset,
       };
       node_count += counts[shard];
     }

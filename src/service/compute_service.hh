@@ -89,6 +89,7 @@ private:
     bool response_done{false};
     bool results_completed{false};
     bool completion_claimed{false};
+    u32 gpu_reserved_items{};
     u32 item_count{};
     u64 batch_id{};
     u64 batch_wait_ns{};

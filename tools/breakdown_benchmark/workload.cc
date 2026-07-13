@@ -406,6 +406,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   };
 
   SinglePassRowStream performance_query_stream(performance_query_rows.count);
+  std::vector<ProgressSample> measure_windows;
   auto throw_if_performance_queries_exhausted = [&](const std::string& phase) {
     if (!performance_query_stream.exhausted()) {
       return;
@@ -418,6 +419,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   };
 
   bool recall_below_threshold = false;
+  bool performance_below_threshold = false;
   auto run_recall_check = [&](const char* phase,
                               const char* key,
                               bool reset_after,
@@ -507,7 +509,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   auto run_query_phase_ops = [&](const std::string& label, size_t ops) -> size_t {
     std::atomic<size_t> completed_ops{0};
     std::atomic<size_t> next_op{0};
-    ProgressReporter reporter(label, completed_ops, ops, 0);
+    ProgressReporter reporter(label, completed_ops, ops, 0, &completed_ops, nullptr);
     const size_t worker_count = std::max<size_t>(1, std::min(args.client_threads, ops));
     std::vector<std::thread> workers;
     workers.reserve(worker_count);
@@ -528,13 +530,14 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     }
     for (auto& worker : workers) worker.join();
     reporter.finish();
+    if (label.starts_with("measure-")) measure_windows = reporter.samples();
     throw_if_performance_queries_exhausted(label);
     return completed_ops.load(std::memory_order_relaxed);
   };
 
   auto run_query_phase_seconds = [&](const std::string& label, size_t seconds) -> size_t {
     std::atomic<size_t> completed_ops{0};
-    ProgressReporter reporter(label, completed_ops, 0, seconds);
+    ProgressReporter reporter(label, completed_ops, 0, seconds, &completed_ops, nullptr);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
     std::vector<std::thread> workers;
     workers.reserve(args.client_threads);
@@ -553,6 +556,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     }
     for (auto& worker : workers) worker.join();
     reporter.finish();
+    if (label.starts_with("measure-")) measure_windows = reporter.samples();
     throw_if_performance_queries_exhausted(label);
     return completed_ops.load(std::memory_order_relaxed);
   };
@@ -592,7 +596,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                                std::atomic<size_t>& issued_deletes,
                                std::atomic<size_t>& completed_inserts,
                                std::atomic<size_t>& completed_upserts,
-                               std::atomic<size_t>& completed_deletes) {
+                               std::atomic<size_t>& completed_deletes) -> bool {
     switch (choose_write_kind(rng)) {
       case WriteKind::insert: {
         issued_inserts.fetch_add(1, std::memory_order_relaxed);
@@ -600,8 +604,9 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
         vec<element_t> values = get_insert_vector(id);
         vec<ComputeService::InsertItem> items;
         items.push_back({id, std::move(values)});
-        completed_inserts.fetch_add(service.insert(items), std::memory_order_relaxed);
-        break;
+        const bool succeeded = service.insert(items) == 1;
+        if (succeeded) completed_inserts.fetch_add(1, std::memory_order_relaxed);
+        return succeeded;
       }
       case WriteKind::upsert: {
         issued_upserts.fetch_add(1, std::memory_order_relaxed);
@@ -610,18 +615,21 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
         vec<element_t> values = get_update_vector(id, version);
         vec<ComputeService::InsertItem> items;
         items.push_back({id, std::move(values)});
-        completed_upserts.fetch_add(service.upsert(items), std::memory_order_relaxed);
-        break;
+        const bool succeeded = service.upsert(items) == 1;
+        if (succeeded) completed_upserts.fetch_add(1, std::memory_order_relaxed);
+        return succeeded;
       }
       case WriteKind::erase: {
         issued_deletes.fetch_add(1, std::memory_order_relaxed);
         const uint32_t id = sample_existing_id(rng);
         vec<node_t> ids;
         ids.push_back(id);
-        completed_deletes.fetch_add(service.erase(ids), std::memory_order_relaxed);
-        break;
+        const bool succeeded = service.erase(ids) == 1;
+        if (succeeded) completed_deletes.fetch_add(1, std::memory_order_relaxed);
+        return succeeded;
       }
     }
+    return false;
   };
 
   auto run_mixed_phase_ops = [&](const std::string& label, size_t ops, uint32_t start_id) -> MixedPhaseStats {
@@ -642,7 +650,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(args.client_threads));
     std::vector<std::thread> threads;
     threads.reserve(args.client_threads);
-    ProgressReporter reporter(label, completed_ops, ops, 0);
+    ProgressReporter reporter(label, completed_ops, ops, 0,
+                              &completed_reads, &completed_writes);
 
     for (size_t tid = 0; tid < args.client_threads; ++tid) {
       threads.emplace_back([&, tid]() {
@@ -658,6 +667,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
           }
 
           const bool read_op = args.mixed_mode == "fixed_threads" ? tid < fixed_read_threads : choose_mixed_read(rng);
+          bool succeeded = true;
           if (read_op) {
             const auto query_row = performance_query_stream.try_claim();
             if (!query_row.has_value()) break;
@@ -668,12 +678,13 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
             completed_reads.fetch_add(1, std::memory_order_relaxed);
           } else {
             issued_writes.fetch_add(1, std::memory_order_relaxed);
-            issue_mixed_write(rng, next_insert_id, next_update_version,
-                              issued_inserts, issued_upserts, issued_deletes,
-                              completed_inserts, completed_upserts, completed_deletes);
-            completed_writes.fetch_add(1, std::memory_order_relaxed);
+            succeeded = issue_mixed_write(
+              rng, next_insert_id, next_update_version,
+              issued_inserts, issued_upserts, issued_deletes,
+              completed_inserts, completed_upserts, completed_deletes);
+            if (succeeded) completed_writes.fetch_add(1, std::memory_order_relaxed);
           }
-          completed_ops.fetch_add(1, std::memory_order_relaxed);
+          if (succeeded) completed_ops.fetch_add(1, std::memory_order_relaxed);
         }
       });
     }
@@ -682,6 +693,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       thread.join();
     }
     reporter.finish();
+    if (label.starts_with("measure-")) measure_windows = reporter.samples();
     throw_if_performance_queries_exhausted(label);
     return MixedPhaseStats{
       .next_insert_id = next_insert_id.load(std::memory_order_relaxed),
@@ -715,7 +727,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(args.client_threads));
     std::vector<std::thread> threads;
     threads.reserve(args.client_threads);
-    ProgressReporter reporter(label, completed_ops, 0, seconds);
+    ProgressReporter reporter(label, completed_ops, 0, seconds,
+                              &completed_reads, &completed_writes);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
 
     for (size_t tid = 0; tid < args.client_threads; ++tid) {
@@ -731,6 +744,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
           }
 
           const bool read_op = args.mixed_mode == "fixed_threads" ? tid < fixed_read_threads : choose_mixed_read(rng);
+          bool succeeded = true;
           if (read_op) {
             const auto query_row = performance_query_stream.try_claim();
             if (!query_row.has_value()) break;
@@ -741,12 +755,13 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
             completed_reads.fetch_add(1, std::memory_order_relaxed);
           } else {
             issued_writes.fetch_add(1, std::memory_order_relaxed);
-            issue_mixed_write(rng, next_insert_id, next_update_version,
-                              issued_inserts, issued_upserts, issued_deletes,
-                              completed_inserts, completed_upserts, completed_deletes);
-            completed_writes.fetch_add(1, std::memory_order_relaxed);
+            succeeded = issue_mixed_write(
+              rng, next_insert_id, next_update_version,
+              issued_inserts, issued_upserts, issued_deletes,
+              completed_inserts, completed_upserts, completed_deletes);
+            if (succeeded) completed_writes.fetch_add(1, std::memory_order_relaxed);
           }
-          completed_ops.fetch_add(1, std::memory_order_relaxed);
+          if (succeeded) completed_ops.fetch_add(1, std::memory_order_relaxed);
         }
       });
     }
@@ -755,6 +770,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       thread.join();
     }
     reporter.finish();
+    if (label.starts_with("measure-")) measure_windows = reporter.samples();
     throw_if_performance_queries_exhausted(label);
     return MixedPhaseStats{
       .next_insert_id = next_insert_id.load(std::memory_order_relaxed),
@@ -904,6 +920,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     root["gpu_persistent"] = {
       {"gpu_memory_explicit_bytes", telemetry.gpu_memory_explicit_bytes},
       {"gpu_memory_base_pq_bytes", telemetry.gpu_memory_base_pq_bytes},
+      {"gpu_memory_route_graph_bytes", telemetry.gpu_memory_route_graph_bytes},
       {"gpu_memory_delta_reserved_bytes", telemetry.gpu_memory_delta_reserved_bytes},
       {"gpu_memory_graph_cache_bytes", telemetry.gpu_memory_graph_cache_bytes},
       {"gpu_memory_exact_cache_bytes", telemetry.gpu_memory_exact_cache_bytes},
@@ -942,13 +959,23 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       {"rdma_merged_requests", telemetry.rdma_merged_requests},
       {"direct_path_failures", telemetry.direct_path_failures},
       {"graph_page_requests", telemetry.graph_page_requests},
+      {"graph_dependency_rounds", telemetry.graph_dependency_rounds},
       {"graph_page_cache_hits", telemetry.graph_page_cache_hits},
+      {"graph_route_hits", telemetry.graph_route_hits},
+      {"graph_route_refreshes", telemetry.graph_route_refreshes},
       {"graph_cache_invalidations", telemetry.graph_cache_invalidations},
       {"graph_page_cache_hit_ratio",
         telemetry.graph_page_requests + telemetry.graph_page_cache_hits == 0 ? 0.0
         : static_cast<double>(telemetry.graph_page_cache_hits) /
             static_cast<double>(telemetry.graph_page_requests +
                                 telemetry.graph_page_cache_hits)},
+      {"graph_route_hit_ratio",
+        telemetry.graph_page_requests + telemetry.graph_page_cache_hits +
+            telemetry.graph_route_hits == 0 ? 0.0
+        : static_cast<double>(telemetry.graph_route_hits) /
+            static_cast<double>(telemetry.graph_page_requests +
+                                telemetry.graph_page_cache_hits +
+                                telemetry.graph_route_hits)},
       {"exact_vector_reads", telemetry.exact_vector_reads},
       {"exact_vector_cache_hits", telemetry.exact_vector_cache_hits},
       {"exact_vector_cache_hit_ratio",
@@ -964,8 +991,16 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
         : static_cast<double>(telemetry.mutations_published) /
             static_cast<double>(telemetry.delta_publications)},
       {"delta_compactions", telemetry.delta_compactions},
-      {"base_entries_merged", telemetry.base_entries_merged},
+      {"delta_entries_retired", telemetry.delta_entries_retired},
+      {"storage_reclaim_ack_writes", telemetry.storage_reclaim_ack_writes},
+      {"storage_reclaim_ack_sequence", telemetry.storage_reclaim_ack_sequence},
       {"delta_live_entries", telemetry.delta_live_entries},
+      {"delta_physical_entries", telemetry.delta_physical_entries},
+      {"delta_mutable_entries", telemetry.delta_mutable_entries},
+      {"delta_durable_entries", telemetry.delta_durable_entries},
+      {"mutation_capacity_rejections", telemetry.mutation_capacity_rejections},
+      {"mutation_capacity_reserved", telemetry.mutation_capacity_reserved},
+      {"mutation_capacity_reserved_max", telemetry.mutation_capacity_reserved_max},
       {"average_visibility_us", telemetry.mutations_published == 0 ? 0.0
         : static_cast<double>(telemetry.visibility_ns_total) /
             static_cast<double>(telemetry.mutations_published) / 1000.0},
@@ -984,7 +1019,12 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
 
 
   const bool has_throughput_duration = use_time_mode && args.measure_seconds > 0;
-  const double throughput_duration = has_throughput_duration ? static_cast<double>(args.measure_seconds) : 0.0;
+  const double observed_measure_seconds = measure_windows.empty()
+    ? static_cast<double>(args.measure_seconds)
+    : measure_windows.back().elapsed_seconds;
+  const double throughput_duration = has_throughput_duration
+    ? std::max(static_cast<double>(args.measure_seconds), observed_measure_seconds)
+    : 0.0;
   const size_t throughput_query_ops = args.workload == "mixed"
     ? measure_mixed_stats.completed_reads
     : (service.config().enable_breakdown ? report.query.count : measured_query_operations);
@@ -999,6 +1039,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                                     : 0.0;
   const double total_throughput = query_throughput + write_throughput;
   root["throughput"] = {
+    {"configured_measure_seconds", args.measure_seconds},
+    {"effective_measure_seconds", throughput_duration},
     {"duration_seconds", throughput_duration},
     {"total_ops", throughput_query_ops + throughput_write_ops},
     {"total_ops_per_sec", total_throughput},
@@ -1023,6 +1065,89 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"delete_ops_per_sec", has_throughput_duration && args.workload == "mixed"
       ? static_cast<double>(measure_mixed_stats.completed_deletes) / throughput_duration
       : 0.0},
+  };
+
+  nlohmann::json window_json = nlohmann::json::array();
+  std::vector<double> total_window_rates;
+  std::vector<double> query_window_rates;
+  size_t zero_completion_windows = 0;
+  for (const ProgressSample& sample : measure_windows) {
+    window_json.push_back({
+      {"elapsed_seconds", sample.elapsed_seconds},
+      {"interval_seconds", sample.interval_seconds},
+      {"completed_ops", sample.completed_ops},
+      {"interval_ops", sample.interval_ops},
+      {"interval_reads", sample.interval_reads},
+      {"interval_writes", sample.interval_writes},
+      {"total_ops_per_sec", sample.total_ops_per_sec},
+      {"query_ops_per_sec", sample.query_ops_per_sec},
+      {"write_ops_per_sec", sample.write_ops_per_sec},
+    });
+    if (sample.interval_seconds >= 2.5) {
+      total_window_rates.push_back(sample.total_ops_per_sec);
+      query_window_rates.push_back(sample.query_ops_per_sec);
+      if (sample.interval_ops == 0) ++zero_completion_windows;
+    }
+  }
+  auto edge_mean = [](const std::vector<double>& values, bool tail) {
+    if (values.empty()) return 0.0;
+    const size_t count = std::min<size_t>(3, values.size());
+    const size_t begin = tail ? values.size() - count : 0;
+    return std::accumulate(values.begin() + begin,
+                           values.begin() + begin + count, 0.0) /
+      static_cast<double>(count);
+  };
+  const double total_head_qps = edge_mean(total_window_rates, false);
+  const double total_tail_qps = edge_mean(total_window_rates, true);
+  const double query_head_qps = edge_mean(query_window_rates, false);
+  const double query_tail_qps = edge_mean(query_window_rates, true);
+  root["stability"] = {
+    {"window_seconds", 5},
+    {"windows", std::move(window_json)},
+    {"zero_completion_windows", zero_completion_windows},
+    {"total_head_ops_per_sec", total_head_qps},
+    {"total_tail_ops_per_sec", total_tail_qps},
+    {"total_tail_to_head_ratio", total_head_qps == 0.0 ? 0.0
+      : total_tail_qps / total_head_qps},
+    {"query_head_ops_per_sec", query_head_qps},
+    {"query_tail_ops_per_sec", query_tail_qps},
+    {"query_tail_to_head_ratio", query_head_qps == 0.0 ? 0.0
+      : query_tail_qps / query_head_qps},
+    {"single_pass_no_reuse", true},
+    {"cache_independent_baseline",
+      service.config().gpu_adjacency_cache_mb == 0 &&
+      service.config().gpu_exact_cache_mb == 0},
+  };
+  const bool query_acceptance_applies = has_throughput_duration && throughput_query_ops != 0;
+  const double query_stability_ratio = query_head_qps == 0.0
+    ? 0.0 : query_tail_qps / query_head_qps;
+  const bool query_qps_passed = !query_acceptance_applies || args.min_query_qps < 0.0 ||
+    query_throughput >= args.min_query_qps;
+  const bool stability_passed = !query_acceptance_applies ||
+    args.min_stability_ratio < 0.0 ||
+    (query_stability_ratio >= args.min_stability_ratio && zero_completion_windows == 0);
+  const bool write_acceptance_applies = args.workload == "mixed" && args.read_ratio < 1.0;
+  const bool writes_all_succeeded = !write_acceptance_applies ||
+    measure_mixed_stats.issued_writes == measure_mixed_stats.completed_writes;
+  const u64 mutation_capacity_rejections = root["gpu_persistent"].value(
+    "mutation_capacity_rejections", 0ULL);
+  const bool mutation_capacity_passed = !write_acceptance_applies ||
+    mutation_capacity_rejections == 0;
+  performance_below_threshold = !query_qps_passed || !stability_passed ||
+    !writes_all_succeeded || !mutation_capacity_passed;
+  root["acceptance"] = {
+    {"applies", query_acceptance_applies},
+    {"min_query_ops_per_sec", args.min_query_qps},
+    {"observed_query_ops_per_sec", query_throughput},
+    {"query_ops_per_sec_passed", query_qps_passed},
+    {"min_query_tail_to_head_ratio", args.min_stability_ratio},
+    {"observed_query_tail_to_head_ratio", query_stability_ratio},
+    {"zero_completion_windows", zero_completion_windows},
+    {"stability_passed", stability_passed},
+    {"writes_all_succeeded", writes_all_succeeded},
+    {"mutation_capacity_rejections", mutation_capacity_rejections},
+    {"mutation_capacity_passed", mutation_capacity_passed},
+    {"passed", !performance_below_threshold},
   };
 
   if (!args.recall_only) {
@@ -1060,6 +1185,17 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                    << " upsert=" << measure_mixed_stats.completed_upserts
                    << " delete=" << measure_mixed_stats.completed_deletes << '\n';
     }
+    const auto& stability = root["stability"];
+    text_summary << "  query_head/tail_qps: "
+                 << stability.value("query_head_ops_per_sec", 0.0) << "/"
+                 << stability.value("query_tail_ops_per_sec", 0.0) << '\n';
+    text_summary << "  query_tail_to_head_ratio: "
+                 << stability.value("query_tail_to_head_ratio", 0.0) << '\n';
+    text_summary << "  zero_completion_windows: "
+                 << stability.value("zero_completion_windows", 0ULL) << '\n';
+    text_summary << "  acceptance_passed: "
+                 << (root["acceptance"].value("passed", false) ? "true" : "false")
+                 << '\n';
   }
   if (root.contains("recall")) {
     const auto& recall = root["recall"];
@@ -1084,9 +1220,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     const auto& gpu = root["gpu_persistent"];
     text_summary << "gpu_persistent\n";
     constexpr double bytes_per_gib = 1024.0 * 1024.0 * 1024.0;
-    text_summary << "  GPU memory explicit/base_pq/delta/graph_cache/exact_cache GiB: "
+    text_summary << "  GPU memory explicit/base_pq/route/delta/graph_cache/exact_cache GiB: "
                  << static_cast<double>(gpu.value("gpu_memory_explicit_bytes", 0ULL)) / bytes_per_gib << "/"
                  << static_cast<double>(gpu.value("gpu_memory_base_pq_bytes", 0ULL)) / bytes_per_gib << "/"
+                 << static_cast<double>(gpu.value("gpu_memory_route_graph_bytes", 0ULL)) / bytes_per_gib << "/"
                  << static_cast<double>(gpu.value("gpu_memory_delta_reserved_bytes", 0ULL)) / bytes_per_gib << "/"
                  << static_cast<double>(gpu.value("gpu_memory_graph_cache_bytes", 0ULL)) / bytes_per_gib << "/"
                  << static_cast<double>(gpu.value("gpu_memory_exact_cache_bytes", 0ULL)) / bytes_per_gib << '\n';
@@ -1096,6 +1233,9 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     text_summary << "  rdma_read_bytes: " << gpu.value("rdma_read_bytes", 0ULL) << '\n';
     text_summary << "  graph_page_cache_hit_ratio: "
                  << gpu.value("graph_page_cache_hit_ratio", 0.0) << '\n';
+    text_summary << "  graph_route_hit_ratio/refreshes: "
+                 << gpu.value("graph_route_hit_ratio", 0.0) << "/"
+                 << gpu.value("graph_route_refreshes", 0ULL) << '\n';
     text_summary << "  graph_cache_invalidations: "
                  << gpu.value("graph_cache_invalidations", 0ULL) << '\n';
     text_summary << "  GPU query/prepare/graph/score/beam/exact us: "
@@ -1113,7 +1253,15 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                  << gpu.value("average_publication_command_us", 0.0) << '\n';
     text_summary << "  average_mutations_per_publication: "
                  << gpu.value("average_mutations_per_publication", 0.0) << '\n';
-    text_summary << "  delta_live_entries: " << gpu.value("delta_live_entries", 0ULL) << '\n';
+    text_summary << "  delta logical/physical/L0/L1 entries: "
+                 << gpu.value("delta_live_entries", 0ULL) << "/"
+                 << gpu.value("delta_physical_entries", 0ULL) << "/"
+                 << gpu.value("delta_mutable_entries", 0ULL) << "/"
+                 << gpu.value("delta_durable_entries", 0ULL) << '\n';
+    text_summary << "  mutation capacity rejected/current/peak: "
+                 << gpu.value("mutation_capacity_rejections", 0ULL) << "/"
+                 << gpu.value("mutation_capacity_reserved", 0ULL) << "/"
+                 << gpu.value("mutation_capacity_reserved_max", 0ULL) << '\n';
   }
   if (report.has_insert()) {
     const auto summary = aggregate_text_summary(report.insert);
@@ -1140,6 +1288,9 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   std::cout << text_summary.str();
   if (recall_below_threshold) {
     throw std::runtime_error("recall below threshold");
+  }
+  if (performance_below_threshold) {
+    throw std::runtime_error("cold-query throughput or stability below threshold");
   }
   return root;
 }

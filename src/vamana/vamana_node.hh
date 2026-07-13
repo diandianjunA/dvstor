@@ -95,6 +95,8 @@ public:
   inline static vec<u64> HOT_GRAPH_DYNAMIC_BASE_OFFSETS;
   inline static u32 HOT_GRAPH_DYNAMIC_RECORD_BYTES = 0;
   inline static u32 HOT_GRAPH_DYNAMIC_HOT_OFFSET = 0;
+  inline static u32 HOT_GRAPH_DYNAMIC_CODE_OFFSET = 0;
+  inline static u32 HOT_GRAPH_DYNAMIC_CODE_BYTES = 0;
 
   static size_t hot_graph_entry_size() { return vamana::hot_graph::entry_bytes(R); }
   static size_t dynamic_record_size() {
@@ -113,6 +115,8 @@ public:
     HOT_GRAPH_DYNAMIC_BASE_OFFSETS.clear();
     HOT_GRAPH_DYNAMIC_RECORD_BYTES = 0;
     HOT_GRAPH_DYNAMIC_HOT_OFFSET = 0;
+    HOT_GRAPH_DYNAMIC_CODE_OFFSET = 0;
+    HOT_GRAPH_DYNAMIC_CODE_BYTES = 0;
   }
 
   static void configure_hot_graph(const vec<u64>& entry_offsets,
@@ -121,7 +125,9 @@ public:
                                   u32 shard_bits,
                                   const vec<u64>& dynamic_base_offsets = {},
                                   u32 dynamic_record_bytes = 0,
-                                  u32 dynamic_hot_offset = 0) {
+                                  u32 dynamic_hot_offset = 0,
+                                  u32 dynamic_code_offset = 0,
+                                  u32 dynamic_code_bytes = 0) {
     if (entry_offsets.empty() || entry_offsets.size() != entry_counts.size()) {
       disable_hot_graph();
       return;
@@ -137,10 +143,16 @@ public:
     HOT_GRAPH_DYNAMIC_HOT_OFFSET = dynamic_hot_offset == 0
       ? static_cast<u32>(total_size())
       : dynamic_hot_offset;
+    HOT_GRAPH_DYNAMIC_CODE_OFFSET = dynamic_code_offset;
+    HOT_GRAPH_DYNAMIC_CODE_BYTES = dynamic_code_bytes;
     HAS_HOT_GRAPH = entry_bytes >= hot_graph_entry_size() &&
       HOT_GRAPH_DYNAMIC_BASE_OFFSETS.size() == HOT_GRAPH_ENTRY_OFFSETS.size() &&
       HOT_GRAPH_DYNAMIC_RECORD_BYTES >= HOT_GRAPH_DYNAMIC_HOT_OFFSET + HOT_GRAPH_ENTRY_BYTES &&
-      HOT_GRAPH_DYNAMIC_HOT_OFFSET >= total_size();
+      HOT_GRAPH_DYNAMIC_HOT_OFFSET >= total_size() &&
+      (HOT_GRAPH_DYNAMIC_CODE_BYTES == 0 ||
+       (HOT_GRAPH_DYNAMIC_CODE_OFFSET >= HOT_GRAPH_DYNAMIC_HOT_OFFSET + HOT_GRAPH_ENTRY_BYTES &&
+        HOT_GRAPH_DYNAMIC_RECORD_BYTES >=
+          HOT_GRAPH_DYNAMIC_CODE_OFFSET + HOT_GRAPH_DYNAMIC_CODE_BYTES));
     if (!HAS_HOT_GRAPH) disable_hot_graph();
   }
 
@@ -174,6 +186,13 @@ public:
       }
     }
     return ptr.byte_offset() + HOT_GRAPH_DYNAMIC_HOT_OFFSET;
+  }
+
+  static u64 dynamic_navigation_code_offset(RemotePtr ptr) {
+    lib_assert(HAS_HOT_GRAPH && HOT_GRAPH_DYNAMIC_CODE_BYTES != 0 &&
+                 hot_graph_entry_available(ptr),
+               "dynamic navigation code requested for an invalid node");
+    return ptr.byte_offset() + HOT_GRAPH_DYNAMIC_CODE_OFFSET;
   }
 
   static void encode_hot_graph_entry(byte_t* out,

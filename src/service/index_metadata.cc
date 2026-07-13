@@ -62,10 +62,20 @@ bool load_metadata(const filepath_t& index_prefix, Metadata& metadata, str* erro
       metadata.hot_graph_dynamic_base_offsets =
         json["hot_graph_dynamic_base_offsets"].get<vec<u64>>();
     }
+    if (json.contains("storage_control_remote_offsets")) {
+      metadata.storage_control_remote_offsets =
+        json["storage_control_remote_offsets"].get<vec<u64>>();
+    }
+    if (json.contains("dynamic_node_base_offsets")) {
+      metadata.dynamic_node_base_offsets =
+        json["dynamic_node_base_offsets"].get<vec<u64>>();
+    }
     metadata.hot_graph_dynamic_record_bytes =
       json.value("hot_graph_dynamic_record_bytes", 0u);
     metadata.hot_graph_dynamic_hot_offset =
       json.value("hot_graph_dynamic_hot_offset", 0u);
+    metadata.dynamic_navigation_code_offset =
+      json.value("dynamic_navigation_code_offset", 0u);
     metadata.allocation_size = json.value("allocation_size", metadata.node_size);
     metadata.idmap_format = json.value("idmap_format", str{});
     metadata.anchor_format = json.value("anchor_format", str{});

@@ -40,8 +40,10 @@ struct CompletionDescriptor {
   i32 status{};
   u32 remote_pages{};
   u32 remote_batches{};
+  u32 graph_rounds{};
   u32 exact_vectors{};
   u32 cache_hits{};
+  u32 route_hits{};
   u32 exact_cache_hits{};
 };
 
@@ -57,6 +59,15 @@ struct DeltaOverrideUpdate {
   u64 epoch{};
 };
 
+struct DeltaDurableUpdate {
+  u32 slot{};
+  u32 reserved{};
+  u64 epoch{};
+};
+
+inline constexpr u32 kDeltaCommandReset = 1u;
+inline constexpr u32 kDeltaCommandPromoteOverrides = 1u << 1;
+
 struct DeltaPublishDescriptor {
   u64 command_id{};
   u32 first_slot{};
@@ -65,7 +76,8 @@ struct DeltaPublishDescriptor {
   u32 invalidation_count{};
   u32 superseded_count{};
   u32 override_count{};
-  u32 reserved{};
+  u32 durable_count{};
+  u32 flags{};
 };
 
 struct DeltaPublishCompletion {
@@ -77,6 +89,7 @@ struct DeltaPublishCompletion {
 struct TelemetrySnapshot {
   u64 gpu_memory_explicit_bytes{};
   u64 gpu_memory_base_pq_bytes{};
+  u64 gpu_memory_route_graph_bytes{};
   u64 gpu_memory_delta_reserved_bytes{};
   u64 gpu_memory_graph_cache_bytes{};
   u64 gpu_memory_exact_cache_bytes{};
@@ -97,7 +110,10 @@ struct TelemetrySnapshot {
   u64 rdma_merged_requests{};
   u64 direct_path_failures{};
   u64 graph_page_requests{};
+  u64 graph_dependency_rounds{};
   u64 graph_page_cache_hits{};
+  u64 graph_route_hits{};
+  u64 graph_route_refreshes{};
   u64 graph_cache_invalidations{};
   u64 exact_vector_reads{};
   u64 exact_vector_cache_hits{};
@@ -105,8 +121,16 @@ struct TelemetrySnapshot {
   u64 mutations_published{};
   u64 delta_publications{};
   u64 delta_compactions{};
-  u64 base_entries_merged{};
+  u64 delta_entries_retired{};
+  u64 storage_reclaim_ack_writes{};
+  u64 storage_reclaim_ack_sequence{};
   u64 delta_live_entries{};
+  u64 delta_physical_entries{};
+  u64 delta_mutable_entries{};
+  u64 delta_durable_entries{};
+  u64 mutation_capacity_rejections{};
+  u64 mutation_capacity_reserved{};
+  u64 mutation_capacity_reserved_max{};
   u64 visibility_ns_total{};
   u64 visibility_ns_max{};
   u64 publication_queue_ns_total{};
@@ -121,6 +145,7 @@ public:
 
   std::atomic<u64> gpu_memory_explicit_bytes{0};
   std::atomic<u64> gpu_memory_base_pq_bytes{0};
+  std::atomic<u64> gpu_memory_route_graph_bytes{0};
   std::atomic<u64> gpu_memory_delta_reserved_bytes{0};
   std::atomic<u64> gpu_memory_graph_cache_bytes{0};
   std::atomic<u64> gpu_memory_exact_cache_bytes{0};
@@ -141,7 +166,10 @@ public:
   std::atomic<u64> rdma_merged_requests{0};
   std::atomic<u64> direct_path_failures{0};
   std::atomic<u64> graph_page_requests{0};
+  std::atomic<u64> graph_dependency_rounds{0};
   std::atomic<u64> graph_page_cache_hits{0};
+  std::atomic<u64> graph_route_hits{0};
+  std::atomic<u64> graph_route_refreshes{0};
   std::atomic<u64> graph_cache_invalidations{0};
   std::atomic<u64> exact_vector_reads{0};
   std::atomic<u64> exact_vector_cache_hits{0};
@@ -149,8 +177,16 @@ public:
   std::atomic<u64> mutations_published{0};
   std::atomic<u64> delta_publications{0};
   std::atomic<u64> delta_compactions{0};
-  std::atomic<u64> base_entries_merged{0};
+  std::atomic<u64> delta_entries_retired{0};
+  std::atomic<u64> storage_reclaim_ack_writes{0};
+  std::atomic<u64> storage_reclaim_ack_sequence{0};
   std::atomic<u64> delta_live_entries{0};
+  std::atomic<u64> delta_physical_entries{0};
+  std::atomic<u64> delta_mutable_entries{0};
+  std::atomic<u64> delta_durable_entries{0};
+  std::atomic<u64> mutation_capacity_rejections{0};
+  std::atomic<u64> mutation_capacity_reserved{0};
+  std::atomic<u64> mutation_capacity_reserved_max{0};
   std::atomic<u64> visibility_ns_total{0};
   std::atomic<u64> visibility_ns_max{0};
   std::atomic<u64> publication_queue_ns_total{0};

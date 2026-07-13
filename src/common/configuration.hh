@@ -37,19 +37,16 @@ public:
 
   u32 gpu_device{};
   bool enable_breakdown{true};
-  u32 query_batch_min{16};
-  u32 query_batch_target{64};
-  u32 query_batch_max{256};
-  u32 query_batch_wait_us{20};
+  u32 gpu_query_slots{256};
   u32 gpu_memory_limit_gb{40};
   u32 gpu_memory_reserve_gb{4};
-  u32 gpu_adjacency_cache_mb{3072};
+  u32 gpu_adjacency_cache_mb{0};
   u32 gpu_adjacency_cache_ways{4};
-  u32 gpu_exact_cache_mb{4096};
+  u32 gpu_exact_cache_mb{0};
   u32 gpu_exact_cache_ways{4};
   u32 gpu_bootstrap_window_mb{64};
   u32 gpu_bootstrap_windows{2};
-  u32 gpu_graph_prefetch_depth{4};
+  u32 gpu_graph_prefetch_depth{32};
   u32 gpu_graph_cache_ttl_us{5000};
   u32 gpu_traversal_beam_width{128};
   u32 gpu_final_rerank_width{64};
@@ -60,7 +57,7 @@ public:
   u32 gpu_persistent_blocks_per_sm{4};
   u32 update_visibility_us{10'000};
   f64 delta_max_ratio{0.01};
-  u32 delta_budget_mb{1024};
+  u32 delta_budget_mb{256};
   u32 merge_period_ms{60'000};
 
   u32 storage_id{};
@@ -82,6 +79,7 @@ public:
   bool storage_owner_local_stitch_sync_fast_path{true};
   str storage_owner_maintenance_mode{"off"};
   u32 storage_owner_maintenance_workers{};
+  u32 storage_owner_maintenance_queue_depth{65'536};
   str storage_owner_reverse_mode{"async"};
   u32 storage_owner_reverse_queue_depth{65'536};
   u32 storage_owner_reverse_flush_us{200};
@@ -149,18 +147,9 @@ private:
       ("enable-breakdown",
        po::value<bool>(&enable_breakdown)->default_value(enable_breakdown),
        "Collect per-request breakdown samples.")
-      ("query-batch-min",
-       po::value<u32>(&query_batch_min)->default_value(query_batch_min),
-       "Minimum admission batch under load.")
-      ("query-batch-target",
-       po::value<u32>(&query_batch_target)->default_value(query_batch_target),
-       "Target persistent-GPU admission batch.")
-      ("query-batch-max",
-       po::value<u32>(&query_batch_max)->default_value(query_batch_max),
+      ("gpu-query-slots",
+       po::value<u32>(&gpu_query_slots)->default_value(gpu_query_slots),
        "Maximum concurrent GPU query slots.")
-      ("query-batch-wait-us",
-       po::value<u32>(&query_batch_wait_us)->default_value(query_batch_wait_us),
-       "Maximum wait before dispatching an under-filled batch.")
       ("gpu-memory-limit-gb",
        po::value<u32>(&gpu_memory_limit_gb)->default_value(gpu_memory_limit_gb),
        "Hard limit for explicit query-engine GPU allocations.")
@@ -291,6 +280,10 @@ private:
        po::value<u32>(&storage_owner_maintenance_workers)
          ->default_value(storage_owner_maintenance_workers),
        "Background exact-finalization workers.")
+      ("storage-owner-maintenance-queue-depth",
+       po::value<u32>(&storage_owner_maintenance_queue_depth)
+         ->default_value(storage_owner_maintenance_queue_depth),
+       "Bounded graph-maintenance backlog; writers backpressure at the limit.")
       ("storage-owner-reverse-mode",
        po::value<str>(&storage_owner_reverse_mode)
          ->default_value(storage_owner_reverse_mode),
@@ -334,15 +327,15 @@ private:
       fail(str{"invalid --vector-data-type: "} + error.what());
     }
 
-    if (query_batch_min == 0 || query_batch_min > query_batch_target ||
-        query_batch_target > query_batch_max || query_batch_max > 4096 ||
+    if (gpu_query_slots == 0 || gpu_query_slots > 4096 ||
         gpu_memory_limit_gb == 0 ||
         gpu_memory_reserve_gb >= gpu_memory_limit_gb ||
-        gpu_adjacency_cache_mb == 0 || gpu_adjacency_cache_ways != 4 ||
-        gpu_exact_cache_mb == 0 || gpu_exact_cache_ways != 4 ||
+        gpu_adjacency_cache_ways != 4 ||
+        gpu_exact_cache_ways != 4 ||
         gpu_bootstrap_window_mb == 0 || gpu_bootstrap_windows == 0 ||
         gpu_bootstrap_windows > 16 ||
-        gpu_graph_prefetch_depth == 0 || gpu_graph_prefetch_depth > 8 ||
+        gpu_graph_prefetch_depth == 0 ||
+        gpu_graph_prefetch_depth > 32 ||
         gpu_traversal_beam_width < k || gpu_traversal_beam_width > 256 ||
         gpu_final_rerank_width < k || gpu_final_rerank_width > 256 ||
         gpu_max_expansions < gpu_traversal_beam_width ||
@@ -367,6 +360,7 @@ private:
         storage_owner_rpc_depth == 0 ||
         storage_owner_rpc_timeout_ms == 0 ||
         storage_owner_search_snapshot_batch == 0 ||
+        storage_owner_maintenance_queue_depth == 0 ||
         storage_owner_reverse_queue_depth == 0 ||
         storage_owner_reverse_coalesce_max == 0) {
       fail("invalid storage-side update configuration");
@@ -426,9 +420,8 @@ public:
       output << std::setw(width) << "remote transport: "
              << "GPU-initiated GPUNetIO" << '\n';
       output << std::setw(width) << "GPU device: " << config.gpu_device << '\n';
-      output << std::setw(width) << "GPU batch min/target/max: "
-             << config.query_batch_min << "/" << config.query_batch_target
-             << "/" << config.query_batch_max << '\n';
+      output << std::setw(width) << "GPU concurrent query slots: "
+             << config.gpu_query_slots << '\n';
       output << std::setw(width) << "GPU memory limit/reserve GiB: "
              << config.gpu_memory_limit_gb << "/"
              << config.gpu_memory_reserve_gb << '\n';
@@ -459,7 +452,8 @@ public:
              << config.storage_owner_batch_max << '\n';
       output << std::setw(width) << "storage maintenance: "
              << config.storage_owner_maintenance_mode << " ("
-             << config.storage_owner_maintenance_workers << " workers)\n";
+             << config.storage_owner_maintenance_workers << " workers, backlog "
+             << config.storage_owner_maintenance_queue_depth << ")\n";
       output << std::setfill('=') << std::setw(line_width) << "" << '\n';
     } else if (config.is_server) {
       output << std::setw(width) << "index prefix: " << config.index_prefix << '\n';

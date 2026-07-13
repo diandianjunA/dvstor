@@ -243,6 +243,10 @@ void ComputeService::stop_storage_insert_runtime() {
       if (slot.in_use && !slot.results_completed) {
         fail_storage_owner_tasks(slot.tasks);
       }
+      if (persistent_search_ != nullptr && slot.gpu_reserved_items != 0) {
+        persistent_search_->release_mutation_capacity(slot.gpu_reserved_items);
+        slot.gpu_reserved_items = 0;
+      }
       slot.in_use = false;
       slot.send_done = true;
       slot.response_done = true;
@@ -348,6 +352,23 @@ void ComputeService::post_storage_owner_batch(
   }
 
   const u32 item_count = static_cast<u32>(tasks.size());
+  if (persistent_search_ != nullptr &&
+      !persistent_search_->try_reserve_mutation_capacity(item_count)) {
+    static std::atomic<u32> capacity_rejection_logs{0};
+    const u32 log_index = capacity_rejection_logs.fetch_add(1, std::memory_order_relaxed);
+    if (log_index < 16) {
+      std::cerr << "[storage-owner] write rejected before remote commit: "
+                << "bounded GPU mutation tier is full" << std::endl;
+    }
+    fail_storage_owner_tasks(tasks);
+    auto& state = *storage_insert_owners_[owner_storage];
+    {
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.free_slots.push_back(slot_id);
+    }
+    state.cv.notify_one();
+    return;
+  }
   const bool anchor_mode = config_.storage_owner_update_mode == "local_stitch";
   const u32 anchor_hint_count = anchor_mode
                                   ? config_.storage_owner_anchor_hints : 0;
@@ -440,6 +461,7 @@ void ComputeService::post_storage_owner_batch(
     slot.response_done = false;
     slot.results_completed = false;
     slot.completion_claimed = false;
+    slot.gpu_reserved_items = persistent_search_ == nullptr ? 0 : item_count;
     slot.item_count = item_count;
     slot.batch_id = batch_id;
     slot.batch_wait_ns = batch_wait_ns;
@@ -583,7 +605,7 @@ void ComputeService::post_storage_owner_response_receive(u32 owner_storage, u32 
 }
 
 void ComputeService::complete_ready_storage_owner_slots() {
-  const u32 publication_capacity = std::max<u32>(1, config_.query_batch_max);
+  const u32 publication_capacity = std::max<u32>(1, config_.gpu_query_slots);
   for (;;) {
     vec<std::pair<u32, u32>> ready_slots;
     u32 ready_items = 0;
@@ -666,6 +688,8 @@ void ComputeService::complete_ready_storage_owner_slots() {
         mutation.remote_node = results[item].new_rptr_raw;
         mutation.old_remote_node = results[item].old_rptr_raw;
         mutation.anchor_hint = slot.tasks[item]->anchor_bucket_hint.raw_address;
+        mutation.maintenance_sequence = results[item].maintenance_sequence;
+        mutation.owner_storage = owner_storage;
         mutation.enqueued_at = slot.response_completed_at;
         if (mutation.kind != service::storage_owner::MutationKind::erase) {
           const byte_t* vector = request_vectors +
@@ -684,6 +708,7 @@ void ComputeService::complete_ready_storage_owner_slots() {
           std::move(mutations), epoch, invalidated_graph_nodes);
       } catch (const std::exception& error) {
         gpu_visible = false;
+        persistent_search_->mark_committed_mutation_gap(error.what());
         static std::atomic<u32> gpu_delta_failure_logs{0};
         const u32 log_index = gpu_delta_failure_logs.fetch_add(1, std::memory_order_relaxed);
         if (log_index < 16) {
@@ -827,11 +852,15 @@ void ComputeService::maybe_release_storage_owner_slot_locked(
 
   const u32 slot_id = slot.slot_id;
   const u64 batch_id = slot.batch_id;
+  if (persistent_search_ != nullptr && slot.gpu_reserved_items != 0) {
+    persistent_search_->release_mutation_capacity(slot.gpu_reserved_items);
+  }
   slot.in_use = false;
   slot.send_done = false;
   slot.response_done = false;
   slot.results_completed = false;
   slot.completion_claimed = false;
+  slot.gpu_reserved_items = 0;
   slot.item_count = 0;
   slot.batch_id = 0;
   slot.batch_wait_ns = 0;

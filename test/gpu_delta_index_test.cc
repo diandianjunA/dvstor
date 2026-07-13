@@ -50,5 +50,36 @@ int main() {
   delta.complete_consolidation(9, next_epoch);
   assert(delta.base_generation() == 9);
   assert(delta.delta_size() == 0);
+
+  gpu_search::DeltaCoordinator durable_delta(1);
+  gpu_search::DeltaMutation durable;
+  durable.id = 99;
+  durable.kind = service::storage_owner::MutationKind::insert;
+  durable.owner_storage = 1;
+  durable.maintenance_sequence = 7;
+  durable.remote_node = 12345;
+  gpu_search::DeltaMutation second_durable = durable;
+  second_durable.id = 100;
+  second_durable.remote_node = 54321;
+  const u64 durable_epoch = durable_delta.reserve_epoch();
+  assert(durable_delta.publish({durable, second_durable}, durable_epoch));
+  assert(durable_delta.delta_size() == 2);
+  const std::vector<u64> incomplete_watermarks{100, 6};
+  assert(durable_delta.retire_durable(incomplete_watermarks).empty());
+  assert(durable_delta.delta_size() == 2);
+  const std::vector<u64> complete_watermarks{100, 7};
+  const auto newly_durable = durable_delta.retire_durable(complete_watermarks, 1);
+  assert(newly_durable.size() == 1);
+  assert(newly_durable.front().durable);
+  assert(durable_delta.delta_size() == 1);
+  const auto final_durable = durable_delta.retire_durable(complete_watermarks, 1);
+  assert(final_durable.size() == 1);
+  assert(final_durable.front().durable);
+  assert(final_durable.front().id != newly_durable.front().id);
+  assert(durable_delta.retire_durable(complete_watermarks, 1).empty());
+  assert(durable_delta.delta_size() == 0);
+  const auto durable_snapshot = durable_delta.snapshot();
+  assert(durable_snapshot.mutations.empty());
+  assert(!durable_delta.version(99)->in_delta);
   return 0;
 }

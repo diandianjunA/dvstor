@@ -115,7 +115,8 @@ bool ComputeService::validate_index_metadata(
     metadata.navigation_quantizer == "opq_pq16";
   const bool compatible_navigation = metadata.navigation_format == "opq_pq_graph_v1" ||
     metadata.navigation_format == "opq_pq16_graph_v1";
-  if (metadata.schema_version != 14 || metadata.node_layout != "plain" ||
+  if (metadata.schema_version != gpu_search::format::kMetadataSchemaVersion ||
+      metadata.node_layout != "plain" ||
       metadata.storage_format != "vamana_compact_v1" ||
       !compatible_quantizer || !compatible_navigation ||
       metadata.navigation_code_bytes == 0 ||
@@ -124,7 +125,7 @@ bool ComputeService::validate_index_metadata(
       metadata.dim != config_.dim || metadata.R != config_.R ||
       metadata.num_memory_nodes != num_servers_) {
     if (error_message != nullptr) {
-      *error_message = "index is not a compatible schema-14 OPQ/PQ GPU index";
+      *error_message = "index is not a compatible schema-15 OPQ/PQ GPU index";
     }
     return false;
   }
@@ -146,25 +147,33 @@ bool ComputeService::validate_index_metadata(
       metadata.hot_graph_offsets.size() != num_servers_ ||
       metadata.hot_graph_entry_counts.size() != num_servers_ ||
       metadata.hot_graph_dynamic_base_offsets.size() != num_servers_ ||
+      metadata.storage_control_remote_offsets.size() != num_servers_ ||
+      metadata.dynamic_node_base_offsets.size() != num_servers_ ||
       metadata.navigation_code_remote_offsets.size() != num_servers_ ||
       metadata.navigation_code_region_bytes.size() != num_servers_ ||
       metadata.hot_graph_dynamic_record_bytes <
         metadata.hot_graph_dynamic_hot_offset + metadata.hot_graph_entry_size ||
-      metadata.hot_graph_dynamic_hot_offset < VamanaNode::total_size()) {
+      metadata.hot_graph_dynamic_hot_offset < VamanaNode::total_size() ||
+      metadata.dynamic_navigation_code_offset <
+        metadata.hot_graph_dynamic_hot_offset + metadata.hot_graph_entry_size ||
+      metadata.hot_graph_dynamic_record_bytes <
+        metadata.dynamic_navigation_code_offset + metadata.navigation_code_bytes) {
     if (error_message != nullptr) *error_message = "index storage layout mismatch";
     return false;
   }
   VamanaNode::configure_hot_graph(
     metadata.hot_graph_offsets, metadata.hot_graph_entry_counts,
     metadata.hot_graph_entry_size, metadata.hot_graph_shard_bits,
-    metadata.hot_graph_dynamic_base_offsets,
+    metadata.dynamic_node_base_offsets,
     metadata.hot_graph_dynamic_record_bytes,
-    metadata.hot_graph_dynamic_hot_offset);
+    metadata.hot_graph_dynamic_hot_offset,
+    metadata.dynamic_navigation_code_offset,
+    metadata.navigation_code_bytes);
   if (!VamanaNode::HAS_HOT_GRAPH) {
     if (error_message != nullptr) *error_message = "failed to enable compact graph layout";
     return false;
   }
-  print_status("loaded schema-14 GPU index metadata from " + index_prefix.string() +
+  print_status("loaded schema-15 GPU index metadata from " + index_prefix.string() +
                " (OPQ/PQ" + std::to_string(metadata.pq_subquantizers) +
                ", vector_data_type=" +
                VamanaNode::vector_dtype_name() + ")");

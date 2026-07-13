@@ -31,7 +31,8 @@ export GPU_MEMORY_RESERVE_GB=4
 ./experiment/build_sift100m_index.sh 04_gpu_persistent_gpunetio
 ```
 
-完整构建会直接生成当前 schema-14 OPQ/PQ32 所需的全部文件，无需随后重编码。
+完整构建以 schema-14 compact 图为中间态，最终直接生成 schema-15
+OPQ/PQ32 运行索引，无需随后重编码。
 推荐使用 `PQ_INDEX_PREFIX=/new/prefix` 保留已有索引；只有明确要删除目标 prefix
 下旧产物并原地重建时才设置 `OVERWRITE_INDEX=1`。
 
@@ -44,7 +45,8 @@ SOURCE_PREFIX=/path/to/legacy/index_prefix \
 ./experiment/convert_legacy_sift100m_index.sh 04_gpu_persistent_gpunetio
 ```
 
-转换和 PQ 编码是两个独立进程。最终 schema-14 metadata 是迁移检查点；如果迁移
+转换和 PQ 编码是两个独立进程。schema-14 metadata 是离线迁移检查点，PQ 阶段
+完成后会原子写成 schema-15；如果迁移
 已经完成而 OPQ/PQ 训练失败，原命令会跳过迁移并直接继续 PQ，不会重复扫描和
 改写全部旧分片。`OVERWRITE_INDEX=1` 仅用于明确要求重新迁移；若 PQ 输出不完整，
 使用 `OVERWRITE_PQ=1`。
@@ -65,6 +67,15 @@ code，但不执行昂贵的 Vamana construction 或 METIS partition。PQ 默认
 
 ```bash
 ./experiment/reencode_sift100m_pq.sh 04_gpu_persistent_gpunetio
+```
+
+已有 schema-14 OPQ/PQ32 sidecar 时可原地升级，不读取 `.dat` payload，也不重新
+训练或编码。计算节点运行 metadata-only 模式；每个存储节点传自己的分片号：
+
+```bash
+INDEX_ROLE=compute ./experiment/upgrade_pq_schema15.sh 04_gpu_persistent_gpunetio
+INDEX_ROLE=storage LOCAL_SHARD=1 \
+  ./experiment/upgrade_pq_schema15.sh 04_gpu_persistent_gpunetio
 ```
 
 ## 部署文件
@@ -106,6 +117,10 @@ code，但不执行昂贵的 Vamana construction 或 METIS partition。PQ 默认
 
 启动脚本会验证 schema、分片数、R、dtype、PQ checksum 和角色所需文件，
 不兼容时在申请大块注册内存前退出。
+
+schema-15 存储控制区使用版本 2：每个计算节点拥有独立 reclaim ACK。只有存储
+维护完成、可见性窗口结束且旧查询 RCU 屏障退出后，upsert/delete 留下的动态
+死槽才可复用。升级后必须重新编译并重启全部计算、存储节点；PQ code 无需重编码。
 
 ## 召回率与性能
 

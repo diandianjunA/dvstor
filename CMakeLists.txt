@@ -98,6 +98,7 @@ add_subdirectory(thirdparty)
 
 set(DVSTOR_MEMORY_NODE_SOURCES
     src/gpu_search/index_format.cc
+    src/gpu_search/pq_index.cc
     src/memory_node/memory_node.cc
     src/memory_node/peer_rdma.cc
     src/memory_node/peer_rpc.cc

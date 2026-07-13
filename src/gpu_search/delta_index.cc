@@ -120,6 +120,36 @@ DeltaSnapshot DeltaCoordinator::snapshot(u64 epoch) const {
   return result;
 }
 
+std::vector<DeltaMutation> DeltaCoordinator::retire_durable(
+    std::span<const u64> durable_sequences, size_t max_items) {
+  std::unique_lock<std::shared_mutex> lock(state_mutex_);
+  std::vector<DeltaMutation> retired;
+  retired.reserve(std::min(max_items, delta_.size()));
+  for (auto iterator = delta_.begin(); iterator != delta_.end();) {
+    if (retired.size() >= max_items) break;
+    DeltaMutation& mutation = iterator->second;
+    if (mutation.durable || mutation.maintenance_sequence == 0 ||
+        mutation.owner_storage >= durable_sequences.size() ||
+        mutation.maintenance_sequence > durable_sequences[mutation.owner_storage]) {
+      ++iterator;
+      continue;
+    }
+    mutation.durable = true;
+    const auto version = versions_.find(mutation.id);
+    if (version != versions_.end() &&
+        version->second.epoch <= mutation.epoch) {
+      version->second.in_delta = false;
+    }
+    delta_bytes_ -= mutation_bytes(mutation);
+    retired.push_back(std::move(mutation));
+    iterator = delta_.erase(iterator);
+  }
+  if (!retired.empty()) {
+    last_consolidation_ = std::chrono::steady_clock::now();
+  }
+  return retired;
+}
+
 bool DeltaCoordinator::should_consolidate(u64 base_nodes, size_t delta_budget_bytes,
                                           f64 max_ratio, f64 budget_high_watermark,
                                           std::chrono::milliseconds max_age) const {

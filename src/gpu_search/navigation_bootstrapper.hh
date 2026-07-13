@@ -19,6 +19,13 @@ struct NavigationRead {
   u16 memory_node{};
 };
 
+struct NavigationWrite {
+  u64 remote_offset{};
+  u64 source_address{};
+  u32 bytes{};
+  u16 memory_node{};
+};
+
 class NavigationBootstrapper {
 public:
   NavigationBootstrapper(
@@ -35,6 +42,8 @@ public:
 
   void read(std::span<const NavigationRead> requests,
             std::span<i32> statuses);
+  void write(std::span<const NavigationWrite> requests,
+             std::span<i32> statuses);
 
 private:
   struct Impl;

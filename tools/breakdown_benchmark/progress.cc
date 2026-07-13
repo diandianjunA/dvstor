@@ -38,11 +38,15 @@ void update_avg_duration(std::chrono::nanoseconds& avg_duration,
 
 /* class declaration lives in progress.hh */
 ProgressReporter::ProgressReporter(std::string label, const std::atomic<size_t>& completed_ops, size_t total_ops,
-                                   size_t total_seconds)
+                                   size_t total_seconds,
+                                   const std::atomic<size_t>* completed_reads,
+                                   const std::atomic<size_t>* completed_writes)
     : label_(std::move(label)),
       total_ops_(total_ops),
       total_seconds_(total_seconds),
       completed_ops_(completed_ops),
+      completed_reads_(completed_reads),
+      completed_writes_(completed_writes),
       start_(std::chrono::steady_clock::now()),
       thread_([this]() { run(); }) {}
 
@@ -56,9 +60,37 @@ void ProgressReporter::finish() {
   }
 }
 
+std::vector<ProgressSample> ProgressReporter::samples() const {
+  std::lock_guard<std::mutex> lock(samples_mutex_);
+  return samples_;
+}
+
 void ProgressReporter::run() {
   size_t last_completed = 0;
+  size_t last_reads = 0;
+  size_t last_writes = 0;
   auto last_report = start_;
+  auto record_sample = [&](size_t completed, size_t reads, size_t writes,
+                           std::chrono::steady_clock::time_point now) {
+    const double elapsed = std::chrono::duration<double>(now - start_).count();
+    const double interval = std::chrono::duration<double>(now - last_report).count();
+    if (interval <= 0.0) return;
+    const size_t interval_ops = completed - last_completed;
+    const size_t interval_reads = reads - last_reads;
+    const size_t interval_writes = writes - last_writes;
+    std::lock_guard<std::mutex> lock(samples_mutex_);
+    samples_.push_back(ProgressSample{
+      .elapsed_seconds = elapsed,
+      .interval_seconds = interval,
+      .completed_ops = completed,
+      .interval_ops = interval_ops,
+      .interval_reads = interval_reads,
+      .interval_writes = interval_writes,
+      .total_ops_per_sec = static_cast<double>(interval_ops) / interval,
+      .query_ops_per_sec = static_cast<double>(interval_reads) / interval,
+      .write_ops_per_sec = static_cast<double>(interval_writes) / interval,
+    });
+  };
   while (!finished_.load(std::memory_order_acquire)) {
     {
       std::unique_lock<std::mutex> lock(finish_mutex_);
@@ -69,6 +101,10 @@ void ProgressReporter::run() {
       }
     }
     const size_t completed = completed_ops_.load(std::memory_order_relaxed);
+    const size_t reads = completed_reads_ == nullptr
+      ? 0 : completed_reads_->load(std::memory_order_relaxed);
+    const size_t writes = completed_writes_ == nullptr
+      ? 0 : completed_writes_->load(std::memory_order_relaxed);
     const auto now = std::chrono::steady_clock::now();
     const auto elapsed = std::chrono::duration<double>(now - start_).count();
     const auto interval = std::chrono::duration<double>(now - last_report).count();
@@ -76,15 +112,25 @@ void ProgressReporter::run() {
     const double interval_rate = interval <= 0.0
                                    ? 0.0
                                    : static_cast<double>(completed - last_completed) / interval;
+    const double interval_read_rate = interval <= 0.0
+      ? 0.0 : static_cast<double>(reads - last_reads) / interval;
+    const double interval_write_rate = interval <= 0.0
+      ? 0.0 : static_cast<double>(writes - last_writes) / interval;
+    record_sample(completed, reads, writes, now);
     if (total_seconds_ > 0) {
       std::cerr << "[breakdown][" << label_ << "] progress elapsed=" << elapsed << "s/" << total_seconds_
                 << "s, completed=" << completed << " ops, rate=" << rate
-                << " ops/s, interval_rate=" << interval_rate << " ops/s" << std::endl;
+                << " ops/s, interval_rate=" << interval_rate << " ops/s";
     } else {
       std::cerr << "[breakdown][" << label_ << "] progress " << completed << "/" << std::max<size_t>(total_ops_, 1)
                 << " ops, rate=" << rate << " ops/s, interval_rate=" << interval_rate
-                << " ops/s" << std::endl;
+                << " ops/s";
     }
+    if (completed_reads_ != nullptr && completed_writes_ != nullptr) {
+      std::cerr << ", interval_read_qps=" << interval_read_rate
+                << ", interval_write_qps=" << interval_write_rate;
+    }
+    std::cerr << std::endl;
     if (total_seconds_ == 0 && completed >= total_ops_) {
       break;
     }
@@ -93,11 +139,21 @@ void ProgressReporter::run() {
                 << std::endl;
     }
     last_completed = completed;
+    last_reads = reads;
+    last_writes = writes;
     last_report = now;
   }
 
   const size_t completed = completed_ops_.load(std::memory_order_relaxed);
-  const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+  const size_t reads = completed_reads_ == nullptr
+    ? 0 : completed_reads_->load(std::memory_order_relaxed);
+  const size_t writes = completed_writes_ == nullptr
+    ? 0 : completed_writes_->load(std::memory_order_relaxed);
+  const auto finished_at = std::chrono::steady_clock::now();
+  const auto elapsed = std::chrono::duration<double>(finished_at - start_).count();
+  if (completed != last_completed || samples().empty()) {
+    record_sample(completed, reads, writes, finished_at);
+  }
   const double rate = elapsed <= 0.0 ? 0.0 : static_cast<double>(completed) / elapsed;
   if (total_seconds_ > 0) {
     std::cerr << "[breakdown][" << label_ << "] done elapsed=" << elapsed << "s/" << total_seconds_

@@ -143,7 +143,7 @@ with open(path, 'r', encoding='utf-8') as stream:
 
 expected = {
     'output_prefix': prefix,
-    'schema_version': 14,
+    'schema_version': 15,
     'distance': 'l2',
     'node_layout': 'plain',
     'storage_format': 'vamana_compact_v1',
@@ -176,12 +176,22 @@ for key in (
     'hot_graph_dynamic_base_offsets',
     'navigation_code_remote_offsets',
     'navigation_code_region_bytes',
+    'storage_control_remote_offsets',
+    'dynamic_node_base_offsets',
 ):
     value = metadata.get(key)
     if not isinstance(value, list) or len(value) != int(shards):
         errors.append(f'{key} must contain one value per storage shard')
 if metadata.get('anchor_format') != 'owner_anchor_v1':
     errors.append('owner_anchor_v1 sidecar is required for dynamic updates')
+dynamic_hot = metadata.get('hot_graph_dynamic_hot_offset', 0)
+graph_entry = metadata.get('hot_graph_entry_size', 0)
+dynamic_code = metadata.get('dynamic_navigation_code_offset', 0)
+dynamic_record = metadata.get('hot_graph_dynamic_record_bytes', 0)
+if dynamic_code < dynamic_hot + graph_entry:
+    errors.append('dynamic PQ code overlaps the compact graph record')
+if dynamic_record < dynamic_code + int(subquantizers):
+    errors.append('persistent dynamic record is too small for PQ codes')
 if errors:
     print(f'incompatible GPU index metadata: {path}', file=sys.stderr)
     for error in errors:
@@ -277,30 +287,27 @@ write_service_config() {
     echo "mn-memory = $MN_MEMORY_GB"
     echo "gpu-device = $GPU_DEVICE"
     echo "enable-breakdown = ${ENABLE_BREAKDOWN:-true}"
-    echo "query-batch-min = ${GPU_QUERY_BATCH_MIN:-8}"
-    echo "query-batch-target = ${GPU_QUERY_BATCH_TARGET:-64}"
-    echo "query-batch-max = ${GPU_QUERY_BATCH_MAX:-256}"
-    echo "query-batch-wait-us = ${GPU_QUERY_BATCH_WAIT_US:-10}"
+    echo "gpu-query-slots = ${GPU_QUERY_SLOTS:-256}"
     echo "gpu-memory-limit-gb = ${GPU_MEMORY_LIMIT_GB:-40}"
     echo "gpu-memory-reserve-gb = ${GPU_MEMORY_RESERVE_GB:-4}"
-    echo "gpu-adjacency-cache-mb = ${GPU_ADJACENCY_CACHE_MB:-3072}"
+    echo "gpu-adjacency-cache-mb = ${GPU_ADJACENCY_CACHE_MB:-0}"
     echo "gpu-adjacency-cache-ways = ${GPU_ADJACENCY_CACHE_WAYS:-4}"
-    echo "gpu-exact-cache-mb = ${GPU_EXACT_CACHE_MB:-4096}"
+    echo "gpu-exact-cache-mb = ${GPU_EXACT_CACHE_MB:-0}"
     echo "gpu-exact-cache-ways = ${GPU_EXACT_CACHE_WAYS:-4}"
     echo "gpu-bootstrap-window-mb = ${GPU_BOOTSTRAP_WINDOW_MB:-64}"
     echo "gpu-bootstrap-windows = ${GPU_BOOTSTRAP_WINDOWS:-4}"
-    echo "gpu-graph-prefetch-depth = ${GPU_GRAPH_PREFETCH_DEPTH:-8}"
+    echo "gpu-graph-prefetch-depth = ${GPU_GRAPH_PREFETCH_DEPTH:-32}"
     echo "gpu-graph-cache-ttl-us = ${GPU_GRAPH_CACHE_TTL_US:-0}"
     echo "gpu-traversal-beam-width = ${GPU_TRAVERSAL_BEAM_WIDTH:-128}"
     echo "gpu-final-rerank-width = ${GPU_FINAL_RERANK_WIDTH:-128}"
     echo "gpu-max-expansions = ${GPU_MAX_EXPANSIONS:-384}"
     echo "gpu-entry-seed-count = ${GPU_ENTRY_SEED_COUNT:-32}"
     echo "gpu-delta-anchor-probes = ${GPU_DELTA_ANCHOR_PROBES:-32}"
-    echo "gpu-rdma-qps = ${GPU_RDMA_QPS:-16}"
-    echo "gpu-persistent-blocks-per-sm = ${GPU_PERSISTENT_BLOCKS_PER_SM:-2}"
+    echo "gpu-rdma-qps = ${GPU_RDMA_QPS:-32}"
+    echo "gpu-persistent-blocks-per-sm = ${GPU_PERSISTENT_BLOCKS_PER_SM:-4}"
     echo "update-visibility-us = ${UPDATE_VISIBILITY_US:-10000}"
     echo "delta-max-ratio = ${DELTA_MAX_RATIO:-0.01}"
-    echo "delta-budget-mb = ${DELTA_BUDGET_MB:-2048}"
+    echo "delta-budget-mb = ${DELTA_BUDGET_MB:-256}"
     echo "merge-period-ms = ${MERGE_PERIOD_MS:-60000}"
     echo "storage-id = 0"
     echo "storage-peers = $endpoints"
@@ -321,6 +328,7 @@ write_service_config() {
     echo "storage-owner-local-stitch-sync-fast-path = ${STORAGE_OWNER_LOCAL_STITCH_SYNC_FAST_PATH:-false}"
     echo "storage-owner-maintenance-mode = ${STORAGE_OWNER_MAINTENANCE_MODE:-finalize}"
     echo "storage-owner-maintenance-workers = ${STORAGE_OWNER_MAINTENANCE_WORKERS:-8}"
+    echo "storage-owner-maintenance-queue-depth = ${STORAGE_OWNER_MAINTENANCE_QUEUE_DEPTH:-65536}"
     echo "storage-owner-reverse-mode = ${STORAGE_OWNER_REVERSE_MODE:-async}"
     echo "storage-owner-reverse-queue-depth = ${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
     echo "storage-owner-reverse-flush-us = ${STORAGE_OWNER_REVERSE_FLUSH_US:-200}"

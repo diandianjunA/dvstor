@@ -50,10 +50,8 @@ ComputeService::ComputeService(const Configuration& config)
                " beam + final RDMA exact rerank");
   persistent_search_ = std::make_unique<gpu_search::PersistentSearchEngine>(
     config_, context_, cm_, remote_access_tokens_);
-  print_status("query engine: persistent GPU + GPUNetIO batch=" +
-               std::to_string(config_.query_batch_min) + "/" +
-               std::to_string(config_.query_batch_target) + "/" +
-               std::to_string(config_.query_batch_max));
+  print_status("query engine: persistent GPU + GPUNetIO slots=" +
+               std::to_string(config_.gpu_query_slots));
 
   cm_.synchronize();
   start_storage_nodes();

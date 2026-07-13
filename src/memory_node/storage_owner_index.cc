@@ -6,6 +6,7 @@
 #include <iostream>
 
 #include "common/index_path.hh"
+#include "gpu_search/index_format.hh"
 #include "vamana/idmap.hh"
 #include "vamana/storage_layout_resolver.hh"
 
@@ -84,11 +85,75 @@ RemotePtr MemoryNode::allocate_local_node() {
     node_size += 4;
   }
 
+  if (storage_owner_reclaim_candidates_.load(std::memory_order_acquire) != 0) {
+    std::lock_guard<std::mutex> lock(storage_owner_reclaim_mutex_);
+    auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
+      index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+    std::atomic_ref<u64> durable(control->durable_maintenance_sequence);
+    const auto reclaimed = storage_owner_reclaim_queue_.acquire(
+      durable.load(std::memory_order_acquire), minimum_compute_reclaim_ack());
+    if (reclaimed.has_value()) {
+      lib_assert(reclaimed->memory_node() == storage_id_ &&
+                   reclaimed->byte_offset() >= gpu_dynamic_node_base_ &&
+                   (reclaimed->byte_offset() - gpu_dynamic_node_base_) % node_size == 0,
+                 "storage-owner reclaim queue returned an invalid dynamic node");
+      storage_owner_reclaim_candidates_.store(
+        storage_owner_reclaim_queue_.size(), std::memory_order_release);
+      std::atomic_ref<u64>(control->reclaim_pending_nodes).store(
+        storage_owner_reclaim_queue_.size(), std::memory_order_release);
+      std::atomic_ref<u64>(control->reclaim_reused_nodes).store(
+        storage_owner_reclaim_queue_.reused(), std::memory_order_release);
+      return *reclaimed;
+    }
+  }
+
   auto* free_ptr = reinterpret_cast<u64*>(index_buffer_.get_full_buffer());
   std::atomic_ref<u64> alloc_ref(*free_ptr);
   const u64 offset = alloc_ref.fetch_add(node_size, std::memory_order_acq_rel);
   lib_assert(offset + node_size <= mn_memory_bytes_, "storage node out of memory");
+  auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
+    index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+  std::atomic_ref<u64> high_watermark(control->dynamic_high_watermark);
+  u64 observed = high_watermark.load(std::memory_order_relaxed);
+  while (observed < offset + node_size &&
+         !high_watermark.compare_exchange_weak(
+           observed, offset + node_size,
+           std::memory_order_release, std::memory_order_relaxed)) {}
   return RemotePtr{storage_id_, offset};
+}
+
+void MemoryNode::retire_local_dynamic_node(RemotePtr pointer,
+                                           u64 maintenance_sequence) {
+  if (pointer.is_null() || pointer.memory_node() != storage_id_ ||
+      pointer.byte_offset() < gpu_dynamic_node_base_ || maintenance_sequence == 0) {
+    return;
+  }
+  const u64 node_size = VamanaNode::allocation_size();
+  lib_assert((pointer.byte_offset() - gpu_dynamic_node_base_) % node_size == 0,
+             "cannot retire a misaligned storage-owner dynamic node");
+  std::lock_guard<std::mutex> lock(storage_owner_reclaim_mutex_);
+  storage_owner_reclaim_queue_.retire(pointer, maintenance_sequence);
+  storage_owner_reclaim_candidates_.store(
+    storage_owner_reclaim_queue_.size(), std::memory_order_release);
+  auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
+    index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+  std::atomic_ref<u64>(control->reclaim_pending_nodes).store(
+    storage_owner_reclaim_queue_.size(), std::memory_order_release);
+}
+
+u64 MemoryNode::minimum_compute_reclaim_ack() const {
+  auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
+    index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+  const u32 client_count = control->compute_client_count;
+  if (client_count == 0 || client_count > gpu_search::format::kMaxComputeClients) {
+    return 0;
+  }
+  u64 minimum = std::numeric_limits<u64>::max();
+  for (u32 client = 0; client < client_count; ++client) {
+    std::atomic_ref<u64> ack(control->reclaim_ack_sequences[client]);
+    minimum = std::min(minimum, ack.load(std::memory_order_acquire));
+  }
+  return minimum;
 }
 
 bool MemoryNode::load_owner_idmap(const filepath_t& index_prefix) {
@@ -620,18 +685,34 @@ void MemoryNode::write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neigh
   write_hot_graph_entry(rptr, neighbors);
 }
 
+void MemoryNode::write_dynamic_navigation_code(
+    RemotePtr rptr, const span<const element_t> components) {
+  lib_assert(local_shard(rptr.memory_node()) &&
+               rptr.byte_offset() >= gpu_dynamic_node_base_,
+             "dynamic PQ code must be written to a local dynamic node");
+  thread_local vec<f32> transformed;
+  transformed.resize(gpu_navigation_model_.dim);
+  byte_t* destination = index_buffer_.get_full_buffer() +
+    VamanaNode::dynamic_navigation_code_offset(rptr);
+  gpu_search::pq::encode(
+    gpu_navigation_model_,
+    std::span<const f32>{components.data(), components.size()},
+    std::span<u8>{destination, gpu_navigation_model_.code_bytes()}, transformed);
+}
+
 void MemoryNode::write_new_node(RemotePtr rptr,
                     node_t id,
                     const span<const element_t> components,
                     const vec<RemotePtr>& neighbors,
                     u32 generation) {
   byte_t* ptr = local_node_ptr(rptr);
-  std::memset(ptr, 0, VamanaNode::total_size());
+  std::memset(ptr, 0, VamanaNode::allocation_size());
   *reinterpret_cast<u64*>(ptr) = 0;
   *reinterpret_cast<u32*>(ptr + VamanaNode::offset_id()) = id;
   *reinterpret_cast<u32*>(ptr + VamanaNode::offset_generation()) = generation;
   encode_float_vector_to_storage(components.data(), VamanaNode::DIM, VamanaNode::vector_dtype(),
                                  ptr + VamanaNode::offset_vector());
+  write_dynamic_navigation_code(rptr, components);
   write_hot_graph_entry(rptr, neighbors);
 }
 
@@ -1226,9 +1307,8 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
                         : service::storage_owner::MutationStatus::failed;
     if (job.ok) {
       publish_mutation(job.id, old_entry.current, old_entry.generation, true);
-      if (maintenance_enabled) {
-        (void)enqueue_deleted_node_cleanup(old_entry.current, config);
-      }
+      job.maintenance_sequence = schedule_storage_owner_maintenance(
+        job.id, old_entry.generation, job.kind, RemotePtr{}, old_entry.current, config);
     }
     co_return;
   }
@@ -1275,10 +1355,8 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
         mark_node_deleted(old_entry.current, old_entry.generation);
       }
       publish_mutation(job.id, new_ptr, generation, false);
-      if (maintenance_enabled) {
-        (void)enqueue_insert_stitch(job.id, generation, new_ptr, config);
-        (void)enqueue_deleted_node_cleanup(old_entry.current, config);
-      }
+      job.maintenance_sequence = schedule_storage_owner_maintenance(
+        job.id, generation, job.kind, new_ptr, old_entry.current, config);
       co_return;
     }
     medoid_ptr = observed;
@@ -1316,10 +1394,8 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
     mark_node_deleted(old_entry.current, old_entry.generation);
   }
   publish_mutation(job.id, new_ptr, generation, false);
-  if (maintenance_enabled) {
-    (void)enqueue_insert_stitch(job.id, generation, new_ptr, config);
-    (void)enqueue_deleted_node_cleanup(old_entry.current, config);
-  }
+  job.maintenance_sequence = schedule_storage_owner_maintenance(
+    job.id, generation, job.kind, new_ptr, old_entry.current, config);
 
   if (!maintenance_enabled || local_stitch) {
     for (const RemotePtr& neighbor_ptr : selected_neighbors) {

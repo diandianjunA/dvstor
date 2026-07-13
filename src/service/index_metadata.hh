@@ -6,7 +6,7 @@
 namespace service::index_metadata {
 
 struct Metadata {
-  u32 schema_version{14};
+  u32 schema_version{15};
   u32 dim{};
   u32 R{};
   u32 beam_width_construction{};
@@ -30,8 +30,11 @@ struct Metadata {
   vec<u64> hot_graph_offsets;
   vec<u64> hot_graph_entry_counts;
   vec<u64> hot_graph_dynamic_base_offsets;
+  vec<u64> storage_control_remote_offsets;
+  vec<u64> dynamic_node_base_offsets;
   u32 hot_graph_dynamic_record_bytes{};
   u32 hot_graph_dynamic_hot_offset{};
+  u32 dynamic_navigation_code_offset{};
   u32 allocation_size{};
   str idmap_format{};
   str anchor_format{};

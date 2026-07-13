@@ -34,7 +34,8 @@ GPUNetIO 直接读取存储节点上的紧凑图记录与精确向量。CPU 仅�
 
 ## 索引文件
 
-新索引固定为 schema 14、L2、`plain` vector record、compact graph 和
+运行索引固定为 schema 15、L2、`plain` vector record、compact graph、持久化
+storage control block 和
 OPQ/PQ 导航。默认 profile 使用 32 个 8-bit 子空间。运行时不读取任何计算节点图清单文件。
 
 | 文件 | 计算节点 | 存储节点 X | 作用 |
@@ -50,8 +51,9 @@ OPQ/PQ 导航。默认 profile 使用 32 个 8-bit 子空间。运行时不读�
 精确向量或全量导航码。
 
 PQ32 每个向量占 32 字节：SIFT100M 为 3.2 GB，SIFT1B 为 32 GB
-（约 29.8 GiB）。预算器优先保留 PQ 与 2 GiB delta，再按剩余显存自适应缩放
-图缓存和精确向量缓存；显式分配上限为 36 GiB，并为 CUDA/DOCA 保留 4 GiB。
+（约 29.8 GiB）。默认预算保留 256 MiB 有界 mutable L0、1 GiB graph cache，
+并关闭对冷查询无收益的 exact cache；显式分配上限为 36 GiB，并为 CUDA/DOCA
+保留 4 GiB。
 计算节点本地文件远低于 50 GB。
 
 ## 依赖与构建
@@ -115,7 +117,8 @@ GPU，也不需要额外重分片可执行文件。`vamana_legacy_index_converte
 ./experiment/build_sift100m_index.sh 04_gpu_persistent_gpunetio
 ```
 
-该命令直接产出 schema-14 compact 分片、owner idmap、anchors、OPQ/PQ32 模型和
+该命令先产出 schema-14 compact 图中间态，再由 PQ indexer 原子升级并产出最终
+schema-15 分片契约、owner idmap、anchors、OPQ/PQ32 模型和
 每分片 PQ32 码流，不需要再运行重编码脚本。默认目标已存在时脚本会在昂贵构建前
 拒绝覆盖；建议通过 `PQ_INDEX_PREFIX=/new/prefix` 构建新版本，确认需要原地重建时
 才设置 `OVERWRITE_INDEX=1`。覆盖模式会先解除目标 prefix 下可能存在的迁移软链接，
@@ -134,9 +137,19 @@ SOURCE_PREFIX=/path/to/legacy/index_prefix \
 ./experiment/reencode_sift100m_pq.sh 04_gpu_persistent_gpunetio
 ```
 
+已有 schema-14 OPQ/PQ32 码流时，不需要重新训练或重编码。计算节点执行一次
+metadata-only 升级，每个存储节点只重写本地 120-byte sidecar 头：
+
+```bash
+INDEX_ROLE=compute ./experiment/upgrade_pq_schema15.sh 04_gpu_persistent_gpunetio
+INDEX_ROLE=storage LOCAL_SHARD=1 \
+  ./experiment/upgrade_pq_schema15.sh 04_gpu_persistent_gpunetio
+```
+
 迁移会顺序压缩旧 fixed record、重写紧凑图中的 RemotePtr、迁移 idmap 与
 anchors；脚本随后在独立进程中训练/复用 PQ 模型并编码所有向量。两个阶段以
-schema-14 metadata 为持久化检查点：迁移完成后 PQ 失败，重新执行脚本不会再次
+schema-14 metadata 仅为离线迁移检查点；最终运行格式是 schema-15。迁移完成后
+PQ 失败，重新执行脚本不会再次
 迁移 65 GB 分片。`PQ_THREADS` 默认 32，CPU BLAS 固定为非嵌套运行；若已有不完整
 的 `.pq32`/`.pq32.codes`，使用 `OVERWRITE_PQ=1` 重做 PQ 阶段。源 prefix 与输出
 prefix 必须不同；迁移器不会修改或删除旧索引。

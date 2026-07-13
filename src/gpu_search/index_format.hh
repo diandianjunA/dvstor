@@ -21,6 +21,11 @@ inline constexpr u32 kMaxEntryPoints = 512;
 inline constexpr u32 kGraphCacheLineBytes = 512;
 inline constexpr u32 kCompactPointerBytes = 5;
 inline constexpr u64 kNodeBaseOffset = 16;
+inline constexpr u32 kMetadataSchemaVersion = 15;
+inline constexpr u32 kStorageControlBytes = 4096;
+inline constexpr u64 kStorageControlMagic = 0x314c525443565344ULL;  // "DSVCTRL1"
+inline constexpr u32 kStorageControlVersion = 2;
+inline constexpr u32 kMaxComputeClients = 64;
 
 enum class QuantizerKind : u32 {
   opq_pq = 1,
@@ -52,14 +57,35 @@ struct ShardRegion {
   u64 node_stride{};
   u64 graph_base_offset{};
   u64 dynamic_base_offset{};
+  u64 control_remote_offset{};
   u64 code_remote_offset{};
   u64 code_bytes{};
   u32 memory_node{};
   u32 dynamic_record_bytes{};
   u32 dynamic_hot_offset{};
-  u32 reserved{};
+  u32 dynamic_code_offset{};
 
   bool operator==(const ShardRegion&) const = default;
+};
+
+struct alignas(64) StorageControlBlock {
+  u64 magic{kStorageControlMagic};
+  u32 version{kStorageControlVersion};
+  u32 header_bytes{sizeof(StorageControlBlock)};
+  u32 shard_id{};
+  u32 dynamic_record_bytes{};
+  u32 dynamic_hot_offset{};
+  u32 dynamic_code_offset{};
+  u32 code_bytes{};
+  u32 compute_client_count{};
+  u32 reserved0{};
+  u64 next_maintenance_sequence{1};
+  u64 durable_maintenance_sequence{};
+  u64 dynamic_high_watermark{};
+  u64 reclaim_pending_nodes{};
+  u64 reclaim_reused_nodes{};
+  u64 reserved1{};
+  std::array<u64, kMaxComputeClients> reclaim_ack_sequences{};
 };
 
 struct CodeHeader {
@@ -81,7 +107,9 @@ struct CodeHeader {
   std::array<u64, 4> reserved{};
 };
 
-static_assert(sizeof(ShardRegion) == 80);
+static_assert(sizeof(ShardRegion) == 88);
+static_assert(sizeof(StorageControlBlock) == 640);
+static_assert(sizeof(StorageControlBlock) <= kStorageControlBytes);
 static_assert(sizeof(CodeHeader) == 120);
 
 struct View {

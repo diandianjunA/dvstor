@@ -6,9 +6,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <unordered_map>
 #include <vector>
 
@@ -25,6 +27,9 @@ struct DeltaMutation {
   u64 remote_node{};
   u64 old_remote_node{};
   u64 anchor_hint{};
+  u64 maintenance_sequence{};
+  u32 owner_storage{};
+  bool durable{};
   std::vector<byte_t> vector;
   std::vector<node_t> neighbors;
   std::chrono::steady_clock::time_point enqueued_at{};
@@ -61,6 +66,9 @@ public:
   size_t pending_size() const;
   std::optional<VersionEntry> version(node_t id) const;
   DeltaSnapshot snapshot(u64 epoch = 0) const;
+  std::vector<DeltaMutation> retire_durable(
+    std::span<const u64> durable_sequences,
+    size_t max_items = std::numeric_limits<size_t>::max());
 
   bool should_consolidate(u64 base_nodes, size_t delta_budget_bytes,
                           f64 max_ratio, f64 budget_high_watermark,

@@ -207,6 +207,7 @@ struct StorageOwnerInsertJob {
   RemotePtr new_ptr{};
   RemotePtr old_ptr{};
   u32 generation{};
+  u64 maintenance_sequence{};
   vec<RemotePtr> anchor_hints;
   vec<u64> invalidated_neighbors;
 };

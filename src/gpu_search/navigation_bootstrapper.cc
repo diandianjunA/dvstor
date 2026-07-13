@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -66,6 +67,7 @@ struct NavigationBootstrapper::Impl {
 
   void read(std::span<const NavigationRead> requests,
             std::span<i32> statuses) {
+    std::lock_guard<std::mutex> lock(io_mutex_);
     if (requests.size() != statuses.size()) {
       throw std::invalid_argument("PQ bootstrap status cardinality mismatch");
     }
@@ -146,6 +148,77 @@ struct NavigationBootstrapper::Impl {
     }
   }
 
+  void write(std::span<const NavigationWrite> requests,
+             std::span<i32> statuses) {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    if (requests.size() != statuses.size()) {
+      throw std::invalid_argument("navigation write status cardinality mismatch");
+    }
+    if (failed_) throw std::runtime_error("navigation RDMA backend is unavailable");
+    struct QpBatch {
+      DetachedQP* qp{};
+      std::vector<size_t> request_indices;
+    };
+    std::unordered_map<DetachedQP*, size_t> batch_by_qp;
+    std::vector<QpBatch> batches;
+    for (size_t i = 0; i < requests.size(); ++i) {
+      const NavigationWrite& request = requests[i];
+      statuses[i] = -EINVAL;
+      const u64 source_offset = request.source_address >= gpu_base_
+        ? request.source_address - gpu_base_ : gpu_bytes_;
+      if (request.memory_node >= qps_.size() || request.bytes == 0 ||
+          request.source_address < gpu_base_ ||
+          source_offset > gpu_bytes_ || request.bytes > gpu_bytes_ - source_offset) {
+        continue;
+      }
+      auto& node_qps = qps_[request.memory_node];
+      DetachedQP* qp = node_qps[next_qp_[request.memory_node]++ % node_qps.size()].get();
+      auto [iterator, inserted] = batch_by_qp.emplace(qp, batches.size());
+      if (inserted) batches.push_back(QpBatch{.qp = qp, .request_indices = {}});
+      batches[iterator->second].request_indices.push_back(i);
+    }
+
+    for (QpBatch& batch : batches) {
+      for (size_t request_index : batch.request_indices) {
+        const NavigationWrite& request = requests[request_index];
+        batch.qp->qp->post_send(
+          request.source_address, request.bytes, gpu_region_.get_lkey(),
+          IBV_WR_RDMA_WRITE, true, false, remote_regions_[request.memory_node].get(),
+          request.remote_offset, 0, request_index + 1);
+      }
+    }
+    std::vector<ibv_wc> completions(64);
+    for (QpBatch& batch : batches) {
+      size_t remaining = batch.request_indices.size();
+      const u32 timeout_ms = std::min<u32>(config_.storage_owner_rpc_timeout_ms, 1000);
+      const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeout_ms);
+      while (remaining > 0) {
+        const i32 count = batch.qp->poll_send_cq(
+          completions.data(), static_cast<i32>(std::min<size_t>(completions.size(), remaining)));
+        if (count == 0) {
+          if (std::chrono::steady_clock::now() >= deadline) {
+            failed_ = true;
+            throw std::runtime_error("navigation RDMA write timed out");
+          }
+          std::this_thread::yield();
+          continue;
+        }
+        if (count < 0) {
+          failed_ = true;
+          throw std::runtime_error("navigation write CQ polling failed");
+        }
+        remaining -= static_cast<size_t>(count);
+        for (i32 i = 0; i < count; ++i) {
+          const size_t request_index = static_cast<size_t>(completions[i].wr_id - 1);
+          if (request_index < statuses.size()) {
+            statuses[request_index] = completions[i].status == IBV_WC_SUCCESS ? 1 : -EIO;
+          }
+        }
+      }
+    }
+  }
+
   configuration::IndexConfiguration& config_;
   Context& channel_context_;
   ClientConnectionManager& connection_manager_;
@@ -156,6 +229,7 @@ struct NavigationBootstrapper::Impl {
   size_t gpu_bytes_{};
   std::vector<std::vector<std::unique_ptr<DetachedQP>>> qps_;
   std::vector<u32> next_qp_;
+  std::mutex io_mutex_;
   bool flush_supported_{};
   bool failed_{};
 };
@@ -182,6 +256,12 @@ void NavigationBootstrapper::read(
     const std::span<const NavigationRead> requests,
     const std::span<i32> statuses) {
   impl_->read(requests, statuses);
+}
+
+void NavigationBootstrapper::write(
+    const std::span<const NavigationWrite> requests,
+    const std::span<i32> statuses) {
+  impl_->write(requests, statuses);
 }
 
 }  // namespace gpu_search

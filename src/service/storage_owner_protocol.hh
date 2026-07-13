@@ -74,6 +74,7 @@ struct MutationResult {
   u64 old_rptr_raw{};
   u32 generation{};
   u32 reserved{};
+  u64 maintenance_sequence{};
 };
 
 struct InsertBreakdownCounters {

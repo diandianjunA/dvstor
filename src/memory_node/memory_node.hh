@@ -8,6 +8,7 @@
 #include <deque>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -28,7 +29,9 @@
 #include "common/distance.hh"
 #include "common/timing.hh"
 #include "coroutine.hh"
+#include "gpu_search/pq_index.hh"
 #include "memory_node/startup_protocol.hh"
+#include "memory_node/storage_reclaim.hh"
 #include "memory_node/storage_owner_state.hh"
 #include "service/index_metadata.hh"
 #include "service/storage_owner_protocol.hh"
@@ -82,6 +85,7 @@ class MemoryNode {
     StorageOwnerMaintenanceKind kind{StorageOwnerMaintenanceKind::stitch_insert};
     node_t id{};
     u32 generation{};
+    u64 maintenance_sequence{};
     RemotePtr target;
     std::chrono::steady_clock::time_point queued_at{};
   };
@@ -242,8 +246,20 @@ private:
   bool enqueue_insert_stitch(node_t id,
                              u32 generation,
                              RemotePtr target,
+                             u64 maintenance_sequence,
                              const Configuration& config);
-  bool enqueue_deleted_node_cleanup(RemotePtr deleted_ptr, const Configuration& config);
+  bool enqueue_deleted_node_cleanup(RemotePtr deleted_ptr,
+                                    u64 maintenance_sequence,
+                                    const Configuration& config);
+  u64 schedule_storage_owner_maintenance(node_t id,
+                                         u32 generation,
+                                         service::storage_owner::MutationKind kind,
+                                         RemotePtr new_ptr,
+                                         RemotePtr old_ptr,
+                                         const Configuration& config);
+  u64 begin_storage_owner_maintenance_sequence(u32 work_items);
+  void complete_storage_owner_maintenance_sequence(u64 sequence);
+  void advance_storage_owner_durable_sequence_locked();
   void mark_storage_owner_foreground_activity();
   void log_storage_owner_maintenance_observation(size_t stitch_remaining,
                                                  size_t cleanup_remaining,
@@ -302,6 +318,8 @@ private:
 
   // Storage-owner index operations
   RemotePtr allocate_local_node();
+  void retire_local_dynamic_node(RemotePtr pointer, u64 maintenance_sequence);
+  u64 minimum_compute_reclaim_ack() const;
   bool load_owner_idmap(const filepath_t& index_prefix);
   bool mark_node_deleted(RemotePtr rptr, u32 generation);
   service::storage_owner::MutationStatus prepare_mutation(node_t id,
@@ -323,6 +341,8 @@ private:
   auto async_read_neighbor_list(RemotePtr rptr, StorageOwnerThread& thread);
   void write_hot_graph_entry(RemotePtr rptr, const vec<RemotePtr>& neighbors);
   void write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neighbors);
+  void write_dynamic_navigation_code(RemotePtr rptr,
+                                     const span<const element_t> components);
   void write_new_node(RemotePtr rptr,
                       node_t id,
                       const span<const element_t> components,
@@ -394,8 +414,11 @@ private:
   bool gpu_stream_layout_{};
   u64 gpu_static_node_count_{};
   u64 gpu_static_dynamic_base_{};
+  u64 gpu_storage_control_offset_{};
+  u64 gpu_dynamic_node_base_{};
   u32 gpu_navigation_code_bytes_{};
   u64 gpu_navigation_model_checksum_{};
+  gpu_search::pq::Model gpu_navigation_model_;
   const u32 storage_id_;
   const u32 num_storage_nodes_;
   const u32 storage_owner_peer_rdma_tokens_;
@@ -485,6 +508,11 @@ private:
   std::atomic<u64> storage_owner_maintenance_finalize_latency_ns_{0};
   std::atomic<u64> storage_owner_maintenance_finalize_max_latency_ns_{0};
   std::atomic<u64> storage_owner_foreground_last_active_ns_{0};
+  std::mutex storage_owner_maintenance_sequence_mutex_;
+  std::map<u64, u32> storage_owner_maintenance_sequence_remaining_;
+  mutable std::mutex storage_owner_reclaim_mutex_;
+  memory_node_detail::StorageReclaimQueue storage_owner_reclaim_queue_;
+  std::atomic<u64> storage_owner_reclaim_candidates_{0};
   InsertRuntimeState insert_runtime_;
   std::unique_ptr<Configuration> storage_worker_config_;
   std::mutex storage_send_mutex_;

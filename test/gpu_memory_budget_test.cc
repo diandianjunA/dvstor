@@ -26,7 +26,7 @@ gpu_search::memory_budget::Request sift_request(u64 nodes) {
     .beam_width = 64,
     .graph_degree = 96,
     .exact_width = 256,
-    .exact_record_bytes = 136,
+    .exact_record_bytes = 144,
     .anchor_count = 4096 * 5,
     .shard_count = 5,
     .entry_point_count = 256,
@@ -46,6 +46,7 @@ int main() {
          static_cast<u64>(sift100m.delta_capacity) * 16);
   assert(sift100m.delta_code_bytes < sift100m.delta_bytes);
   assert(sift100m.delta_capacity > 7'000'000);
+  assert(sift100m.exact_bytes == 256ULL * 256 * 144);
   assert(sift100m.cache_total_bytes <= gib(3));
   assert(sift100m.exact_cache_total_bytes <= gib(4));
   assert(sift100m.explicit_bytes <= gib(36));
@@ -75,6 +76,27 @@ int main() {
   assert(sift1b_pq32.cache_sets >= sift1b_pq32_request.query_slots);
   assert(sift1b_pq32.exact_cache_sets >= sift1b_pq32_request.query_slots);
   assert(sift1b_pq32.explicit_bytes <= gib(36));
+
+  auto steady_state_1b = sift1b_pq32_request;
+  steady_state_1b.requested_cache_bytes = gib(1);
+  steady_state_1b.requested_exact_cache_bytes = 0;
+  steady_state_1b.delta_budget_bytes = gib(1) / 4;
+  const auto bounded_1b = gpu_search::memory_budget::estimate(steady_state_1b);
+  assert(bounded_1b.fits);
+  assert(bounded_1b.delta_bytes <= gib(1) / 4);
+  assert(bounded_1b.cache_total_bytes <= gib(1));
+  assert(bounded_1b.exact_cache_total_bytes == 0);
+  assert(bounded_1b.permanent_override_bytes == 125'000'000ULL);
+  assert(bounded_1b.explicit_bytes <= gib(36));
+
+  auto cold_path_1b = steady_state_1b;
+  cold_path_1b.requested_cache_bytes = 0;
+  const auto no_cache_1b = gpu_search::memory_budget::estimate(cold_path_1b);
+  assert(no_cache_1b.fits);
+  assert(no_cache_1b.cache_sets == 0);
+  assert(no_cache_1b.cache_slots == 0);
+  assert(no_cache_1b.cache_total_bytes == 0);
+  assert(no_cache_1b.explicit_bytes < bounded_1b.explicit_bytes);
 
   const u64 pq_model_bytes =
     (128ull * 128 + 128ull * 256) * sizeof(f32);

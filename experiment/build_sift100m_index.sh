@@ -69,7 +69,7 @@ if [[ -n "${PQ_REUSE_MODEL:-}" ]]; then pq+=(--reuse-model "$PQ_REUSE_MODEL"); f
 if [[ "${OVERWRITE_INDEX:-0}" == "1" ]]; then pq+=(--overwrite); fi
 
 {
-  echo "[build] schema-14 compact graph: $INDEX_PREFIX"
+  echo "[build] schema-14 compact graph intermediate: $INDEX_PREFIX"
   printf '[build] command:'; printf ' %q' "${builder[@]}"; echo
   "${builder[@]}"
   printf '[pq] command:'; printf ' %q' "${pq[@]}"; echo
@@ -81,5 +81,5 @@ if [[ "${OVERWRITE_INDEX:-0}" == "1" ]]; then pq+=(--overwrite); fi
 } 2>&1 | tee "$LOG_FILE"
 
 validate_index_metadata storage
-echo "[build] complete: $INDEX_PREFIX"
+echo "[build] complete: schema-15 persistent OPQ/PQ index $INDEX_PREFIX"
 echo "[build] log: $LOG_FILE"

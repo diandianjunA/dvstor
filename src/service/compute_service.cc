@@ -10,6 +10,7 @@
 #include <stdexcept>
 
 #include "common/index_path.hh"
+#include "gpu_search/index_format.hh"
 #include "service/storage_owner_client_helpers.hh"
 #include "vamana/idmap.hh"
 

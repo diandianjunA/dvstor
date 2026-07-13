@@ -28,6 +28,8 @@ struct Args {
   size_t recall_queries{1000};
   uint32_t recall_k{0};
   double min_recall{-1.0};
+  double min_query_qps{-1.0};
+  double min_stability_ratio{-1.0};
   bool recall_only{false};
   bool synthetic{false};
   std::string report_json_path;

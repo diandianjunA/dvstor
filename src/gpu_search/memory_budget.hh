@@ -39,6 +39,7 @@ struct Result {
   u64 query_workspace_bytes{};
   u64 exact_bytes{};
   u64 metadata_bytes{};
+  u64 permanent_override_bytes{};
   u64 fixed_bytes{};
   u64 cache_total_bytes{};
   u64 cache_payload_bytes{};
@@ -66,7 +67,7 @@ inline u64 delta_footprint(u32 capacity, u32 vector_bytes, u32 code_bytes) {
   const u32 table_capacity = next_power_of_two(static_cast<u64>(capacity) * 2);
   return static_cast<u64>(capacity) *
       (sizeof(DeviceDeltaRecord) + vector_bytes +
-       code_bytes + sizeof(u32)) +
+       code_bytes + 3 * sizeof(u32)) +
     static_cast<u64>(table_capacity) *
       (sizeof(u32) + sizeof(u64) + sizeof(u64) + sizeof(u32));
 }
@@ -115,10 +116,9 @@ inline Result estimate(const Request& request) {
     static_cast<u64>(request.query_slots) * request.dim * sizeof(f32) +
     static_cast<u64>(request.query_slots) * request.dim * sizeof(f32) +
     static_cast<u64>(request.query_slots) * request.pq_subquantizers * 256 * sizeof(f32) +
-    static_cast<u64>(request.query_slots) * result.visited_capacity * sizeof(u32) +
-    static_cast<u64>(request.query_slots) * request.anchor_count * sizeof(f32);
+    static_cast<u64>(request.query_slots) * result.visited_capacity * sizeof(u32);
   result.exact_bytes = static_cast<u64>(request.query_slots) * request.exact_width *
-    (8 + request.vector_bytes);
+    request.exact_record_bytes;
   result.metadata_bytes = static_cast<u64>(request.shard_count) *
       sizeof(DeviceShardRegion) +
     (static_cast<u64>(request.dim) * request.dim +
@@ -126,9 +126,13 @@ inline Result estimate(const Request& request) {
     static_cast<u64>(request.entry_point_count) * sizeof(u32) +
     static_cast<u64>(request.anchor_count) * request.dim * sizeof(f32) +
     static_cast<u64>(request.anchor_count) * sizeof(u32) +
+    static_cast<u64>(request.anchor_count) * request.code_bytes +
     (64ull << 20);
+  result.permanent_override_bytes =
+    ((request.nodes + 31) / 32) * sizeof(u32);
   result.fixed_bytes = result.code_bytes + result.delta_bytes +
-    result.query_workspace_bytes + result.exact_bytes + result.metadata_bytes;
+    result.query_workspace_bytes + result.exact_bytes + result.metadata_bytes +
+    result.permanent_override_bytes;
   if (result.fixed_bytes >= request.usable_bytes) return result;
 
   result.exact_cache_stride = static_cast<u32>(
