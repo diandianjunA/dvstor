@@ -75,6 +75,11 @@ struct DeltaPublishCompletion {
 };
 
 struct TelemetrySnapshot {
+  u64 gpu_memory_explicit_bytes{};
+  u64 gpu_memory_base_pq_bytes{};
+  u64 gpu_memory_delta_reserved_bytes{};
+  u64 gpu_memory_graph_cache_bytes{};
+  u64 gpu_memory_exact_cache_bytes{};
   u64 queries_submitted{};
   u64 queries_completed{};
   u64 batches{};
@@ -93,6 +98,7 @@ struct TelemetrySnapshot {
   u64 direct_path_failures{};
   u64 graph_page_requests{};
   u64 graph_page_cache_hits{};
+  u64 graph_cache_invalidations{};
   u64 exact_vector_reads{};
   u64 exact_vector_cache_hits{};
   u64 delta_queries{};
@@ -113,6 +119,11 @@ public:
   TelemetrySnapshot snapshot() const;
   void reset();
 
+  std::atomic<u64> gpu_memory_explicit_bytes{0};
+  std::atomic<u64> gpu_memory_base_pq_bytes{0};
+  std::atomic<u64> gpu_memory_delta_reserved_bytes{0};
+  std::atomic<u64> gpu_memory_graph_cache_bytes{0};
+  std::atomic<u64> gpu_memory_exact_cache_bytes{0};
   std::atomic<u64> queries_submitted{0};
   std::atomic<u64> queries_completed{0};
   std::atomic<u64> batches{0};
@@ -131,6 +142,7 @@ public:
   std::atomic<u64> direct_path_failures{0};
   std::atomic<u64> graph_page_requests{0};
   std::atomic<u64> graph_page_cache_hits{0};
+  std::atomic<u64> graph_cache_invalidations{0};
   std::atomic<u64> exact_vector_reads{0};
   std::atomic<u64> exact_vector_cache_hits{0};
   std::atomic<u64> delta_queries{0};

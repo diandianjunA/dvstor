@@ -4,6 +4,11 @@ namespace gpu_search {
 
 TelemetrySnapshot Telemetry::snapshot() const {
   return {
+    .gpu_memory_explicit_bytes = gpu_memory_explicit_bytes.load(std::memory_order_relaxed),
+    .gpu_memory_base_pq_bytes = gpu_memory_base_pq_bytes.load(std::memory_order_relaxed),
+    .gpu_memory_delta_reserved_bytes = gpu_memory_delta_reserved_bytes.load(std::memory_order_relaxed),
+    .gpu_memory_graph_cache_bytes = gpu_memory_graph_cache_bytes.load(std::memory_order_relaxed),
+    .gpu_memory_exact_cache_bytes = gpu_memory_exact_cache_bytes.load(std::memory_order_relaxed),
     .queries_submitted = queries_submitted.load(std::memory_order_relaxed),
     .queries_completed = queries_completed.load(std::memory_order_relaxed),
     .batches = batches.load(std::memory_order_relaxed),
@@ -22,6 +27,7 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .direct_path_failures = direct_path_failures.load(std::memory_order_relaxed),
     .graph_page_requests = graph_page_requests.load(std::memory_order_relaxed),
     .graph_page_cache_hits = graph_page_cache_hits.load(std::memory_order_relaxed),
+    .graph_cache_invalidations = graph_cache_invalidations.load(std::memory_order_relaxed),
     .exact_vector_reads = exact_vector_reads.load(std::memory_order_relaxed),
     .exact_vector_cache_hits = exact_vector_cache_hits.load(std::memory_order_relaxed),
     .delta_queries = delta_queries.load(std::memory_order_relaxed),
@@ -57,6 +63,7 @@ void Telemetry::reset() {
   direct_path_failures.store(0, std::memory_order_relaxed);
   graph_page_requests.store(0, std::memory_order_relaxed);
   graph_page_cache_hits.store(0, std::memory_order_relaxed);
+  graph_cache_invalidations.store(0, std::memory_order_relaxed);
   exact_vector_reads.store(0, std::memory_order_relaxed);
   exact_vector_cache_hits.store(0, std::memory_order_relaxed);
   delta_queries.store(0, std::memory_order_relaxed);
