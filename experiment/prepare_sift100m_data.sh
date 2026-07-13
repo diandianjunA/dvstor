@@ -25,32 +25,23 @@ if [[ "$PREPARE_BASE" == "1" ]]; then echo "base:        $(base_bin)"; fi
 if [[ "$PREPARE_QUERY" == "1" ]]; then echo "query:       $(query_bin)"; fi
 if [[ "$PREPARE_GROUNDTRUTH" == "1" ]]; then echo "groundtruth: $(groundtruth_bin)"; fi
 
-# Insert test vectors (real SIFT data for benchmark, not synthetic)
-INSERT_SRC="${INSERT_SRC:-/data/xjs/datasets/sift1b/sift100m_insert_test.bvecs}"
-INSERT_BIN="$(insert_bin)"
-PREPARE_INSERT="${PREPARE_INSERT:-1}"
-if [[ "$PREPARE_INSERT" == "1" && ! -f "$INSERT_BIN" ]]; then
-  if [[ -f "$INSERT_SRC" ]]; then
-    echo "converting insert vectors: $INSERT_SRC → $INSERT_BIN"
-    python3 -c "
-import struct, sys
-with open('$INSERT_SRC', 'rb') as fin, open('$INSERT_BIN', 'wb') as fout:
-    vectors, dim = [], None
-    while True:
-        h = fin.read(4)
-        if not h: break
-        d = struct.unpack('<I', h)[0]
-        if dim is None: dim = d
-        vectors.append(fin.read(d))
-    fout.write(struct.pack('<II', len(vectors), dim))
-    for v in vectors: fout.write(v)
-    print(f'OK: {len(vectors)} vectors, dim={dim}')
-"
-  else
-    echo "WARNING: insert source not found at $INSERT_SRC — benchmark will use synthetic vectors"
+# Real, non-overlapping SIFT vectors for throughput queries and inserts.
+# PREPARE_INSERT remains an alias for backward compatibility.
+PREPARE_BENCHMARK_DATA="${PREPARE_BENCHMARK_DATA:-${PREPARE_INSERT:-1}}"
+if [[ "$PREPARE_BENCHMARK_DATA" == "1" ]]; then
+  benchmark_args=(
+    --source "$BENCHMARK_VECTOR_SOURCE"
+    --query-output "$(performance_query_bin)"
+    --query-start "$PERFORMANCE_QUERY_START"
+    --query-end "$PERFORMANCE_QUERY_END"
+    --insert-output "$(insert_bin)"
+    --insert-start "$INSERT_VECTOR_START"
+    --insert-end "$INSERT_VECTOR_END"
+    --chunk-rows "${BENCHMARK_CONVERT_CHUNK_ROWS:-1000000}")
+  if [[ "${OVERWRITE_BENCHMARK_DATA:-0}" == "1" ]]; then
+    benchmark_args+=(--overwrite)
   fi
-fi
-if [[ "$PREPARE_INSERT" == "1" ]]; then
-  if [[ -f "$INSERT_BIN" ]]; then echo "insert:      $INSERT_BIN"; fi
-  echo "performance: $(performance_query_bin)"
+  python3 "$SCRIPT_DIR/prepare_sift_benchmark_data.py" "${benchmark_args[@]}"
+  echo "performance: $(performance_query_bin) [$PERFORMANCE_QUERY_START,$PERFORMANCE_QUERY_END)"
+  echo "insert:      $(insert_bin) [$INSERT_VECTOR_START,$INSERT_VECTOR_END)"
 fi

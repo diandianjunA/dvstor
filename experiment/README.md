@@ -116,12 +116,24 @@ code，但不执行昂贵的 Vamana construction 或 METIS partition。PQ 默认
 
 `query.u8bin` 的 10K 标准查询仅供 recall 使用。性能阶段由
 `PERFORMANCE_QUERY_FILE` 提供独立查询流，warmup 与 measure 共用一个单遍游标，
-同一行不会再次执行；查询池耗尽时 benchmark 会失败而不是取模回绕。默认使用
-一百万行的 `insert_test.u8bin`，长时间或更高 QPS 测试应显式指定更大的 held-out
-`.u8bin` 文件，例如：
+同一行不会再次执行；查询池耗尽时 benchmark 会失败而不是取模回绕。默认从
+`bigann_base.bvecs` 提取两个不重叠的半开区间：性能查询使用 `[100M,103M)` 的
+300 万行，插入使用 `[103M,105M)` 的 200 万行。生成文件默认位于
+`/data/xjs/datasets/sift1b`：
+
+```text
+sift100m_to_103m_query.u8bin
+sift103m_to_105m_insert.u8bin
+```
+
+`prepare_sift100m_data.sh` 会按需生成并校验这两个文件；已有且头部、大小正确时会
+直接复用。可通过 `PERFORMANCE_QUERY_FILE`、`INSERT_FILE` 覆盖路径，或用以下变量
+调整源区间：`PERFORMANCE_QUERY_START`、`PERFORMANCE_QUERY_END`、
+`INSERT_VECTOR_START`、`INSERT_VECTOR_END`。例如：
 
 ```bash
 PERFORMANCE_QUERY_FILE=/data/xjs/datasets/sift/perf_queries_2m.u8bin \
+INSERT_FILE=/data/xjs/datasets/sift/inserts_2m.u8bin \
 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
 ```
 

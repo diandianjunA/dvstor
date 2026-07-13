@@ -239,6 +239,15 @@ Args parse_args(int argc, char** argv) {
         "--recall-query-file and --performance-query-file must refer to different files");
     }
   }
+  if (!args.performance_query_file.empty() && !args.insert_file.empty()) {
+    std::error_code error;
+    const bool same_file = std::filesystem::equivalent(
+      args.performance_query_file, args.insert_file, error);
+    if (!error && same_file) {
+      throw std::runtime_error(
+        "--performance-query-file and --insert-file must refer to different files");
+    }
+  }
   if (args.insert_start_id == 0) {
     const auto service_config = read_config(args.service_config_path);
     auto it = service_config.find("insert-start-id");

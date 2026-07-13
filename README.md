@@ -157,7 +157,8 @@ Benchmark 并发使用独立的 `BENCHMARK_CLIENT_THREADS`，不写入索引/系
 例如 `BENCHMARK_CLIENT_THREADS=128 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio`。
 标准的 10K `query.u8bin` 只用于 recall 检查。吞吐阶段使用独立的
 `PERFORMANCE_QUERY_FILE`，并从 warmup 到 measure 单遍消费；文件耗尽会直接失败，
-不会回绕重复。未设置时脚本使用一百万条 `insert_test.u8bin` 作为默认性能查询池。
+不会回绕重复。默认性能查询集是 `bigann_base.bvecs` 的 `[100M,103M)`，插入集是
+不重叠的 `[103M,105M)`；生成的 `.u8bin` 文件位于 SIFT1B 数据集目录。
 
 分布式部署时，每台存储节点只需其自身的 `.dat`、`.idmap`、`.pq32.codes`，
 再加共享 metadata 与 anchors。详细流程见 `experiment/README.md`。

@@ -21,13 +21,23 @@ RECALL_K="${RECALL_K:-$K}"
 MIN_RECALL="${MIN_RECALL:--1}"
 RECALL_QUERY_FILE="$(query_bin)"
 PERFORMANCE_QUERY_PATH="$(performance_query_bin)"
+INSERT_PATH="$(insert_bin)"
 if [[ ! -s "$PERFORMANCE_QUERY_PATH" ]]; then
   echo "missing performance query file: $PERFORMANCE_QUERY_PATH" >&2
   echo "set PERFORMANCE_QUERY_FILE to a large held-out .u8bin query set" >&2
   exit 1
 fi
+if [[ ! -s "$INSERT_PATH" ]]; then
+  echo "missing insert file: $INSERT_PATH" >&2
+  echo "set INSERT_FILE to a held-out .u8bin insert set" >&2
+  exit 1
+fi
 if [[ "$(readlink -f "$RECALL_QUERY_FILE")" == "$(readlink -f "$PERFORMANCE_QUERY_PATH")" ]]; then
   echo "recall and performance query files must be different" >&2
+  exit 1
+fi
+if [[ "$(readlink -f "$PERFORMANCE_QUERY_PATH")" == "$(readlink -f "$INSERT_PATH")" ]]; then
+  echo "performance query and insert files must be different" >&2
   exit 1
 fi
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -56,7 +66,7 @@ cmd=("$BUILD_DIR/dvstor_breakdown_benchmark"
   --recall-k "$RECALL_K"
   --min-recall "$MIN_RECALL"
   --insert-start-id "${INSERT_START_ID:-$((MAX_VECTORS + 1000000))}"
-  --insert-file "$(insert_bin)"
+  --insert-file "$INSERT_PATH"
   --report-json "$JSON_REPORT"
   --report-text "$TEXT_REPORT")
 
