@@ -48,8 +48,7 @@ vamana::anchor::Route ComputeService::route_storage_owner_update(
 
 void ComputeService::reset_breakdown_state() {
   std::lock_guard<std::mutex> lock(breakdown_mutex_);
-  completed_query_samples_.clear();
-  completed_insert_samples_.clear();
+  completed_breakdown_report_ = {};
   breakdown_enabled_ = config_.enable_breakdown;
   persistent_search_->reset_telemetry();
 }
@@ -58,15 +57,8 @@ void ComputeService::clear_thread_statistics() {
 }
 
 service::breakdown::Report ComputeService::collect_breakdown_report() const {
-  service::breakdown::Report report;
   std::lock_guard<std::mutex> lock(breakdown_mutex_);
-  for (const auto& sample : completed_query_samples_) {
-    service::breakdown::add_sample(report.query, sample);
-  }
-  for (const auto& sample : completed_insert_samples_) {
-    service::breakdown::add_sample(report.insert, sample);
-  }
-  return report;
+  return completed_breakdown_report_;
 }
 
 void ComputeService::init_remote_tokens() {

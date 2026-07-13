@@ -136,6 +136,7 @@ private:
   vec<node_t> search_local_raw(VectorDType query_dtype, const byte_t* query_data, u32 k);
   void start_storage_insert_runtime();
   void stop_storage_insert_runtime();
+  void release_storage_insert_runtime();
   void run_storage_insert_sender(u32 owner_storage);
   void run_storage_insert_completion_loop();
   void post_storage_owner_batch(u32 owner_storage,
@@ -187,6 +188,5 @@ private:
 
   mutable std::mutex breakdown_mutex_;
   bool breakdown_enabled_{false};
-  std::vector<service::breakdown::Sample> completed_query_samples_;
-  std::vector<service::breakdown::Sample> completed_insert_samples_;
+  service::breakdown::Report completed_breakdown_report_;
 };

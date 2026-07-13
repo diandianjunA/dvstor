@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract disjoint query/insert ranges from a bvecs dataset into u8bin files."""
+"""Extract query/insert ranges from a bvecs dataset into u8bin files."""
 
 import argparse
 import os
@@ -122,7 +122,7 @@ def extract_bvecs_range(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Extract non-overlapping performance-query and insert ranges from "
+            "Extract performance-query and insert ranges from "
             "SIFT1B bigann_base.bvecs. All ranges are half-open [start,end)."
         )
     )
@@ -131,7 +131,7 @@ def main() -> None:
     )
     parser.add_argument("--query-output", required=True)
     parser.add_argument("--query-start", type=int, default=100_000_000)
-    parser.add_argument("--query-end", type=int, default=103_000_000)
+    parser.add_argument("--query-end", type=int, default=105_000_000)
     parser.add_argument("--insert-output", required=True)
     parser.add_argument("--insert-start", type=int, default=103_000_000)
     parser.add_argument("--insert-end", type=int, default=105_000_000)
@@ -153,13 +153,6 @@ def main() -> None:
 
     validate_range("query", args.query_start, args.query_end)
     validate_range("insert", args.insert_start, args.insert_end)
-    if max(args.query_start, args.insert_start) < min(args.query_end, args.insert_end):
-        raise RuntimeError(
-            "query and insert source ranges overlap: "
-            f"[{args.query_start}, {args.query_end}) vs "
-            f"[{args.insert_start}, {args.insert_end})"
-        )
-
     outputs = (
         ("query", query_output, args.query_start, args.query_end),
         ("insert", insert_output, args.insert_start, args.insert_end),

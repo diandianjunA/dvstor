@@ -3,6 +3,11 @@ target_link_libraries(gpu_search_ring_test PRIVATE dvstor_runtime)
 target_compile_options(gpu_search_ring_test PRIVATE -UNDEBUG)
 add_test(NAME gpu_search_ring_test COMMAND gpu_search_ring_test)
 
+add_executable(breakdown_aggregate_test breakdown_aggregate_test.cc)
+target_link_libraries(breakdown_aggregate_test PRIVATE dvstor_runtime)
+target_compile_options(breakdown_aggregate_test PRIVATE -UNDEBUG)
+add_test(NAME breakdown_aggregate_test COMMAND breakdown_aggregate_test)
+
 if (TARGET dvstor_gpu_kernels)
     add_executable(gpu_persistent_dispatch_test gpu_persistent_dispatch_test.cc)
     target_link_libraries(gpu_persistent_dispatch_test PRIVATE dvstor_runtime)

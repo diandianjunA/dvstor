@@ -6,6 +6,8 @@ TelemetrySnapshot Telemetry::snapshot() const {
   return {
     .gpu_memory_explicit_bytes = gpu_memory_explicit_bytes.load(std::memory_order_relaxed),
     .gpu_memory_base_pq_bytes = gpu_memory_base_pq_bytes.load(std::memory_order_relaxed),
+    .gpu_memory_resident_pq_bytes =
+      gpu_memory_resident_pq_bytes.load(std::memory_order_relaxed),
     .gpu_memory_route_graph_bytes = gpu_memory_route_graph_bytes.load(std::memory_order_relaxed),
     .gpu_memory_delta_reserved_bytes = gpu_memory_delta_reserved_bytes.load(std::memory_order_relaxed),
     .gpu_memory_graph_cache_bytes = gpu_memory_graph_cache_bytes.load(std::memory_order_relaxed),
@@ -45,6 +47,10 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .delta_physical_entries = delta_physical_entries.load(std::memory_order_relaxed),
     .delta_mutable_entries = delta_mutable_entries.load(std::memory_order_relaxed),
     .delta_durable_entries = delta_durable_entries.load(std::memory_order_relaxed),
+    .resident_pq_capacity = resident_pq_capacity.load(std::memory_order_relaxed),
+    .resident_pq_entries = resident_pq_entries.load(std::memory_order_relaxed),
+    .resident_pq_peak_entries = resident_pq_peak_entries.load(std::memory_order_relaxed),
+    .resident_pq_reclaimed = resident_pq_reclaimed.load(std::memory_order_relaxed),
     .mutation_capacity_rejections = mutation_capacity_rejections.load(std::memory_order_relaxed),
     .mutation_capacity_reserved = mutation_capacity_reserved.load(std::memory_order_relaxed),
     .mutation_capacity_reserved_max = mutation_capacity_reserved_max.load(std::memory_order_relaxed),
@@ -91,6 +97,10 @@ void Telemetry::reset() {
   delta_physical_entries.store(0, std::memory_order_relaxed);
   delta_mutable_entries.store(0, std::memory_order_relaxed);
   delta_durable_entries.store(0, std::memory_order_relaxed);
+  resident_pq_peak_entries.store(
+    resident_pq_entries.load(std::memory_order_relaxed),
+    std::memory_order_relaxed);
+  resident_pq_reclaimed.store(0, std::memory_order_relaxed);
   mutation_capacity_rejections.store(0, std::memory_order_relaxed);
   mutation_capacity_reserved_max.store(
     mutation_capacity_reserved.load(std::memory_order_relaxed),

@@ -18,6 +18,8 @@ namespace {
 using gpu_search::u32;
 using gpu_search::u64;
 using gpu_search::u8;
+using gpu_search::u16;
+using gpu_search::i32;
 using gpu_search::f32;
 
 void check_cuda(cudaError_t status, const char* operation) {
@@ -141,6 +143,270 @@ private:
   gpu_search::DeviceRingView<T> device_view_{};
 };
 
+template <class T>
+class DeviceBuffer {
+public:
+  explicit DeviceBuffer(size_t count = 1) : count_(count) {
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&data_), count_ * sizeof(T)),
+               "cudaMalloc(valid query buffer)");
+  }
+
+  ~DeviceBuffer() {
+    if (data_ != nullptr) cudaFree(data_);
+  }
+
+  DeviceBuffer(const DeviceBuffer&) = delete;
+  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+  T* get() const { return data_; }
+  size_t bytes() const { return count_ * sizeof(T); }
+
+private:
+  T* data_{};
+  size_t count_{};
+};
+
+template <class T>
+class MappedValue {
+public:
+  MappedValue() {
+    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&host_), sizeof(T),
+                             cudaHostAllocMapped),
+               "cudaHostAlloc(valid query value)");
+    *host_ = {};
+    check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&device_), host_, 0),
+               "cudaHostGetDevicePointer(valid query value)");
+  }
+
+  ~MappedValue() {
+    if (host_ != nullptr) cudaFreeHost(host_);
+  }
+
+  T* host() const { return host_; }
+  T* device() const { return device_; }
+
+private:
+  T* host_{};
+  T* device_{};
+};
+
+u16 graph_checksum(const u8* data, size_t bytes) {
+  u32 hash = 2166136261u;
+  for (size_t index = 0; index < bytes; ++index) {
+    if (index == 2 || index == 3) continue;
+    hash ^= data[index];
+    hash *= 16777619u;
+  }
+  hash ^= hash >> 16;
+  return static_cast<u16>(hash);
+}
+
+void run_valid_resident_query_test(u32 subquantizers, u32 query_threads) {
+  constexpr u32 dim = 128;
+  constexpr u32 graph_entry_bytes = 16;
+  constexpr u32 node_record_bytes = 16 + dim;
+  constexpr u32 visited_capacity = 256;
+  constexpr u32 request_capacity = gpu_search::kPersistentMaxMergeCandidates;
+
+  MappedRing<gpu_search::QueryDescriptor> submissions(
+    8, MappedRing<gpu_search::QueryDescriptor>::Direction::host_to_device);
+  MappedRing<gpu_search::CompletionDescriptor> completions(
+    8, MappedRing<gpu_search::CompletionDescriptor>::Direction::device_to_host);
+  MappedValue<u32> stop;
+  MappedValue<u32> direct_disabled;
+  MappedValue<i32> direct_error;
+
+  DeviceBuffer<gpu_search::DeviceShardRegion> shards;
+  DeviceBuffer<u8> pq_codes(subquantizers);
+  DeviceBuffer<f32> centroids(static_cast<size_t>(subquantizers) * 256 *
+                              (dim / subquantizers));
+  DeviceBuffer<u32> entry_points;
+  DeviceBuffer<u64> route_keys;
+  DeviceBuffer<u8> route_records(graph_entry_bytes);
+  DeviceBuffer<u32> route_states;
+  DeviceBuffer<u32> route_readers;
+  DeviceBuffer<u8> query(dim);
+  DeviceBuffer<u32> result_ids;
+  DeviceBuffer<f32> result_distances;
+  DeviceBuffer<f32> decoded(dim);
+  DeviceBuffer<f32> transformed(dim);
+  DeviceBuffer<f32> query_lut(static_cast<size_t>(subquantizers) * 256);
+  DeviceBuffer<u32> navigation_handles(request_capacity);
+  DeviceBuffer<f32> navigation_distances(request_capacity);
+  DeviceBuffer<u32> visited(visited_capacity);
+  DeviceBuffer<u8> dynamic_codes(static_cast<size_t>(request_capacity) * subquantizers);
+  DeviceBuffer<u32> request_shards(request_capacity);
+  DeviceBuffer<u64> request_offsets(request_capacity);
+  DeviceBuffer<u64> request_iovas(request_capacity);
+  DeviceBuffer<u8> exact_records(node_record_bytes);
+  DeviceBuffer<u8> exact_cache(node_record_bytes);
+  DeviceBuffer<u32> exact_cache_keys;
+  DeviceBuffer<u32> exact_cache_states;
+  DeviceBuffer<u32> exact_cache_readers;
+  DeviceBuffer<u32> exact_cache_victims;
+  DeviceBuffer<u32> delta_count;
+
+  const gpu_search::DeviceShardRegion shard{
+    .ordinal_base = 0,
+    .node_count = 1,
+    .node_base_offset = 64,
+    .node_stride = node_record_bytes,
+    .graph_base_offset = 512,
+    .memory_node = 0,
+  };
+  const u32 entry_point = 0;
+  const u64 route_key = 512;
+  const u32 ready = 2;
+  const u32 zero = 0;
+  std::vector<u8> route_record(graph_entry_bytes, 0);
+  const u16 checksum = graph_checksum(route_record.data(), route_record.size());
+  route_record[2] = static_cast<u8>(checksum);
+  route_record[3] = static_cast<u8>(checksum >> 8);
+  std::vector<u8> exact_record(node_record_bytes, 0);
+  const u32 expected_id = 42;
+  std::memcpy(exact_record.data() + 8, &expected_id, sizeof(expected_id));
+
+  check_cuda(cudaMemcpy(shards.get(), &shard, sizeof(shard), cudaMemcpyHostToDevice),
+             "cudaMemcpy(valid query shard)");
+  check_cuda(cudaMemset(pq_codes.get(), 0, pq_codes.bytes()),
+             "cudaMemset(valid query codes)");
+  check_cuda(cudaMemset(centroids.get(), 0, centroids.bytes()),
+             "cudaMemset(valid query centroids)");
+  check_cuda(cudaMemcpy(entry_points.get(), &entry_point, sizeof(entry_point),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy(valid query entry point)");
+  check_cuda(cudaMemcpy(route_keys.get(), &route_key, sizeof(route_key),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy(valid query route key)");
+  check_cuda(cudaMemcpy(route_records.get(), route_record.data(), route_record.size(),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy(valid query route record)");
+  check_cuda(cudaMemcpy(route_states.get(), &ready, sizeof(ready), cudaMemcpyHostToDevice),
+             "cudaMemcpy(valid query route state)");
+  check_cuda(cudaMemset(route_readers.get(), 0, route_readers.bytes()),
+             "cudaMemset(valid query route readers)");
+  check_cuda(cudaMemset(query.get(), 0, query.bytes()), "cudaMemset(valid query)");
+  check_cuda(cudaMemcpy(exact_cache.get(), exact_record.data(), exact_record.size(),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy(valid query exact cache)");
+  check_cuda(cudaMemcpy(exact_cache_keys.get(), &entry_point, sizeof(entry_point),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy(valid query exact key)");
+  check_cuda(cudaMemcpy(exact_cache_states.get(), &ready, sizeof(ready),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy(valid query exact state)");
+  check_cuda(cudaMemset(exact_cache_readers.get(), 0, exact_cache_readers.bytes()),
+             "cudaMemset(valid query exact readers)");
+  check_cuda(cudaMemset(exact_cache_victims.get(), 0, exact_cache_victims.bytes()),
+             "cudaMemset(valid query exact victims)");
+  check_cuda(cudaMemcpy(delta_count.get(), &zero, sizeof(zero), cudaMemcpyHostToDevice),
+             "cudaMemcpy(valid query delta count)");
+
+  gpu_search::PersistentKernelParams params{
+    .submissions = submissions.device_view(),
+    .completions = completions.device_view(),
+    .shards = shards.get(),
+    .num_shards = 1,
+    .pq_codes = pq_codes.get(),
+    .pq_centroids = centroids.get(),
+    .entry_points = entry_points.get(),
+    .entry_point_count = 1,
+    .num_nodes = 1,
+    .dim = dim,
+    .pq_subquantizers = subquantizers,
+    .pq_subvector_dim = dim / subquantizers,
+    .pq_code_bytes = subquantizers,
+    .graph_entry_bytes = graph_entry_bytes,
+    .graph_degree = 1,
+    .node_record_bytes = node_record_bytes,
+    .vector_bytes = dim,
+    .vector_dtype = 1,
+    .traversal_beam_width = 1,
+    .final_rerank_width = 1,
+    .entry_seed_count = 1,
+    .exact_width = 1,
+    .max_expansions = 1,
+    .prefetch_depth = 1,
+    .visited_capacity = visited_capacity,
+    .query_slots = 1,
+    .direct_region_count = 1,
+    .direct_disabled = direct_disabled.device(),
+    .direct_error = direct_error.device(),
+    .delta_count = delta_count.get(),
+    .anchor_graph_keys = route_keys.get(),
+    .anchor_graph_records = route_records.get(),
+    .anchor_graph_states = route_states.get(),
+    .anchor_graph_readers = route_readers.get(),
+    .anchor_graph_count = 1,
+    .stop = stop.device(),
+    .decoded_queries = decoded.get(),
+    .transformed_queries = transformed.get(),
+    .query_luts = query_lut.get(),
+    .navigation_candidate_handles = navigation_handles.get(),
+    .navigation_candidate_distances = navigation_distances.get(),
+    .visited_hash = visited.get(),
+    .exact_records = exact_records.get(),
+    .dynamic_code_records = dynamic_codes.get(),
+    .dynamic_code_request_shards = request_shards.get(),
+    .dynamic_code_request_offsets = request_offsets.get(),
+    .dynamic_code_request_local_iovas = request_iovas.get(),
+    .exact_cache = exact_cache.get(),
+    .exact_cache_stride = node_record_bytes,
+    .exact_cache_sets = 1,
+    .exact_cache_ways = 1,
+    .exact_cache_keys = exact_cache_keys.get(),
+    .exact_cache_states = exact_cache_states.get(),
+    .exact_cache_readers = exact_cache_readers.get(),
+    .exact_cache_victims = exact_cache_victims.get(),
+    .result_ids = result_ids.get(),
+    .result_distances = result_distances.get(),
+  };
+
+  cudaStream_t stream = nullptr;
+  check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+             "cudaStreamCreate(valid query)");
+  gpu_search::launch_persistent_search(stream, params, 1, query_threads);
+  check_cuda(cudaPeekAtLastError(), "launch_persistent_search(valid query)");
+
+  const gpu_search::QueryDescriptor descriptor{
+    .request_id = 1,
+    .query_device_address = reinterpret_cast<u64>(query.get()),
+    .result_device_address = reinterpret_cast<u64>(result_ids.get()),
+    .query_slot = 0,
+    .result_capacity = 1,
+    .dim = dim,
+    .k = 1,
+    .query_dtype = 1,
+  };
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!submissions.try_push(descriptor)) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      std::cerr << "valid resident query submission stalled\n";
+      std::_Exit(EXIT_FAILURE);
+    }
+    std::this_thread::yield();
+  }
+  gpu_search::CompletionDescriptor completion{};
+  while (!completions.try_pop(completion)) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      std::cerr << "valid resident query did not complete\n";
+      std::_Exit(EXIT_FAILURE);
+    }
+    std::this_thread::yield();
+  }
+  u32 result_id = 0;
+  check_cuda(cudaMemcpy(&result_id, result_ids.get(), sizeof(result_id),
+                        cudaMemcpyDeviceToHost),
+             "cudaMemcpy(valid query result)");
+  if (completion.status != 0 || completion.result_count != 1 ||
+      completion.route_hits != 1 || result_id != expected_id) {
+    throw std::runtime_error("valid resident query produced an invalid result");
+  }
+  std::atomic_ref<u32>(*stop.host()).store(1, std::memory_order_release);
+  check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize(valid query)");
+  check_cuda(cudaStreamDestroy(stream), "cudaStreamDestroy(valid query)");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -208,6 +474,7 @@ int main(int argc, char** argv) {
     delta_records_host[1].remote_node = 222;
     delta_records_host[1].anchor_bucket = 0;
     delta_records_host[1].base_ordinal = 7;
+    delta_records_host[1].resident_pq_slot = 0;
     gpu_search::DeviceDeltaRecord* delta_records_device = nullptr;
     u32* delta_staging_slot_host = nullptr;
     u32* delta_staging_slot_device = nullptr;
@@ -230,9 +497,14 @@ int main(int argc, char** argv) {
     u32* permanent_override_bits_device = nullptr;
     u64* remote_keys_device = nullptr;
     u32* remote_slots_device = nullptr;
+    u8* resident_pq_codes_device = nullptr;
+    u64* resident_pq_keys_device = nullptr;
+    u32* resident_pq_slots_device = nullptr;
+    u32* resident_pq_positions_device = nullptr;
     gpu_search::DeltaSupersedeUpdate* supersede_updates_device = nullptr;
     gpu_search::DeltaOverrideUpdate* override_updates_device = nullptr;
     gpu_search::DeltaDurableUpdate* durable_updates_device = nullptr;
+    gpu_search::ResidentPqEraseUpdate* resident_pq_erase_updates_device = nullptr;
     check_cuda(cudaMalloc(reinterpret_cast<void**>(&delta_records_device),
                           sizeof(delta_records_host)), "cudaMalloc(delta records)");
     check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&delta_staging_slot_host),
@@ -271,6 +543,18 @@ int main(int argc, char** argv) {
     check_cuda(cudaMalloc(reinterpret_cast<void**>(&delta_codes_device),
                           2 * test_subquantizers),
                "cudaMalloc(delta codes)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&resident_pq_codes_device),
+                          2 * test_subquantizers),
+               "cudaMalloc(resident PQ codes)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&resident_pq_keys_device),
+                          4 * sizeof(u64)),
+               "cudaMalloc(resident PQ keys)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&resident_pq_slots_device),
+                          4 * sizeof(u32)),
+               "cudaMalloc(resident PQ slots)");
+    check_cuda(cudaMalloc(reinterpret_cast<void**>(&resident_pq_positions_device),
+                          2 * sizeof(u32)),
+               "cudaMalloc(resident PQ positions)");
     check_cuda(cudaMalloc(reinterpret_cast<void**>(&delta_encode_scratch_device),
                           128 * sizeof(f32)),
                "cudaMalloc(delta encode scratch)");
@@ -344,6 +628,10 @@ int main(int argc, char** argv) {
     check_cuda(cudaMalloc(reinterpret_cast<void**>(&durable_updates_device),
                           sizeof(gpu_search::DeltaDurableUpdate)),
                "cudaMalloc(durable updates)");
+    check_cuda(cudaMalloc(
+                 reinterpret_cast<void**>(&resident_pq_erase_updates_device),
+                 sizeof(gpu_search::ResidentPqEraseUpdate)),
+               "cudaMalloc(resident PQ erase updates)");
     const u32 initial_next[2]{UINT32_MAX, UINT32_MAX};
     const u32 initial_prev[2]{UINT32_MAX, UINT32_MAX};
     const u32 initial_bucket = 0;
@@ -351,6 +639,10 @@ int main(int argc, char** argv) {
     const gpu_search::DeltaSupersedeUpdate supersede_update{.slot = 0, .epoch = 2};
     const gpu_search::DeltaOverrideUpdate override_update{.ordinal = 7, .epoch = 2};
     const gpu_search::DeltaDurableUpdate durable_update{.slot = 1, .epoch = 2};
+    const gpu_search::ResidentPqEraseUpdate resident_pq_erase_update{
+      .remote_node = 222,
+      .slot = 0,
+    };
     check_cuda(cudaMemset(delta_records_device, 0, sizeof(delta_records_host)),
                "cudaMemset(delta records)");
     check_cuda(cudaMemcpy(delta_records_device, delta_records_host,
@@ -376,6 +668,15 @@ int main(int argc, char** argv) {
                "cudaMemset(remote keys)");
     check_cuda(cudaMemset(remote_slots_device, 0xff, 4 * sizeof(u32)),
                "cudaMemset(remote slots)");
+    check_cuda(cudaMemset(resident_pq_codes_device, 0,
+                          2 * test_subquantizers),
+               "cudaMemset(resident PQ codes)");
+    check_cuda(cudaMemset(resident_pq_keys_device, 0, 4 * sizeof(u64)),
+               "cudaMemset(resident PQ keys)");
+    check_cuda(cudaMemset(resident_pq_slots_device, 0xff, 4 * sizeof(u32)),
+               "cudaMemset(resident PQ slots)");
+    check_cuda(cudaMemset(resident_pq_positions_device, 0xff, 2 * sizeof(u32)),
+               "cudaMemset(resident PQ positions)");
     check_cuda(cudaMemcpy(supersede_updates_device, &supersede_update,
                           sizeof(supersede_update), cudaMemcpyHostToDevice),
                "cudaMemcpy(supersede update)");
@@ -385,6 +686,11 @@ int main(int argc, char** argv) {
     check_cuda(cudaMemcpy(durable_updates_device, &durable_update,
                           sizeof(durable_update), cudaMemcpyHostToDevice),
                "cudaMemcpy(durable update)");
+    check_cuda(cudaMemcpy(resident_pq_erase_updates_device,
+                          &resident_pq_erase_update,
+                          sizeof(resident_pq_erase_update),
+                          cudaMemcpyHostToDevice),
+               "cudaMemcpy(resident PQ erase update)");
 
     u32* stop_host = nullptr;
     u32* stop_device = nullptr;
@@ -429,10 +735,17 @@ int main(int argc, char** argv) {
     params.delta_remote_keys = remote_keys_device;
     params.delta_remote_slots = remote_slots_device;
     params.delta_remote_capacity = 4;
+    params.resident_pq_codes = resident_pq_codes_device;
+    params.resident_pq_keys = resident_pq_keys_device;
+    params.resident_pq_slots = resident_pq_slots_device;
+    params.resident_pq_positions = resident_pq_positions_device;
+    params.resident_pq_capacity = 2;
+    params.resident_pq_table_capacity = 4;
     params.anchor_count = 1;
     params.delta_supersede_updates = supersede_updates_device;
     params.delta_override_updates = override_updates_device;
     params.delta_durable_updates = durable_updates_device;
+    params.resident_pq_erase_updates = resident_pq_erase_updates_device;
     params.graph_invalidation_keys = invalidation_key_device;
     params.anchor_graph_keys = anchor_graph_key_device;
     params.anchor_graph_states = anchor_graph_state_device;
@@ -460,16 +773,17 @@ int main(int argc, char** argv) {
     if (query_threads != 128 && query_threads != 256) {
       throw std::invalid_argument("query threads must be 128 or 256");
     }
+    run_valid_resident_query_test(test_subquantizers, query_threads);
     auto query_params = params;
     query_params.delta_submissions = {};
     query_params.delta_completions = {};
-    gpu_search::launch_persistent_search(stream, query_params, block_count, query_threads);
-    check_cuda(cudaPeekAtLastError(), "launch_persistent_search");
     auto control_params = params;
     control_params.submissions = {};
     control_params.completions = {};
     gpu_search::launch_persistent_search(control_stream, control_params, 1, 128);
     check_cuda(cudaPeekAtLastError(), "launch_persistent_delta_control");
+    gpu_search::launch_persistent_search(stream, query_params, block_count, query_threads);
+    check_cuda(cudaPeekAtLastError(), "launch_persistent_search");
 
     const auto delta_deadline = std::chrono::steady_clock::now() +
       std::chrono::seconds(10);
@@ -508,7 +822,11 @@ int main(int argc, char** argv) {
     u64 override_epochs_host[4]{};
     u64 remote_keys_host[4]{};
     u32 remote_slots_host[4]{};
+    u64 resident_pq_keys_host[4]{};
+    u32 resident_pq_slots_host[4]{};
+    u32 resident_pq_positions_host[2]{};
     std::vector<u8> encoded_delta_code(test_subquantizers);
+    std::vector<u8> encoded_resident_pq_code(test_subquantizers);
     u32 anchor_graph_state_host = 0;
     check_cuda(cudaMemcpy(&delta_count_host, delta_count_device, sizeof(delta_count_host),
                           cudaMemcpyDeviceToHost), "cudaMemcpy(delta count result)");
@@ -535,24 +853,45 @@ int main(int argc, char** argv) {
                           cudaMemcpyDeviceToHost), "cudaMemcpy(remote keys result)");
     check_cuda(cudaMemcpy(remote_slots_host, remote_slots_device, sizeof(remote_slots_host),
                           cudaMemcpyDeviceToHost), "cudaMemcpy(remote slots result)");
+    check_cuda(cudaMemcpy(resident_pq_keys_host, resident_pq_keys_device,
+                          sizeof(resident_pq_keys_host), cudaMemcpyDeviceToHost),
+               "cudaMemcpy(resident PQ keys result)");
+    check_cuda(cudaMemcpy(resident_pq_slots_host, resident_pq_slots_device,
+                          sizeof(resident_pq_slots_host), cudaMemcpyDeviceToHost),
+               "cudaMemcpy(resident PQ slots result)");
+    check_cuda(cudaMemcpy(resident_pq_positions_host,
+                          resident_pq_positions_device,
+                          sizeof(resident_pq_positions_host),
+                          cudaMemcpyDeviceToHost),
+               "cudaMemcpy(resident PQ positions result)");
     check_cuda(cudaMemcpy(encoded_delta_code.data(),
                           delta_codes_device + test_subquantizers,
                           encoded_delta_code.size(), cudaMemcpyDeviceToHost),
                "cudaMemcpy(encoded delta code)");
+    check_cuda(cudaMemcpy(encoded_resident_pq_code.data(),
+                          resident_pq_codes_device,
+                          encoded_resident_pq_code.size(), cudaMemcpyDeviceToHost),
+               "cudaMemcpy(encoded resident PQ code)");
     bool override_found = false;
     bool remote_found = false;
+    bool resident_pq_found = false;
     for (u32 index = 0; index < 4; ++index) {
       override_found = override_found ||
         (override_keys_host[index] == 7 && override_epochs_host[index] == 2);
       remote_found = remote_found ||
         (remote_keys_host[index] == 222 && remote_slots_host[index] == 1);
+      resident_pq_found = resident_pq_found ||
+        (resident_pq_keys_host[index] == 222 &&
+         resident_pq_slots_host[index] == 0);
     }
     if (delta_count_host != 2 || delta_bucket_head_host != 1 ||
         delta_next_host[0] != UINT32_MAX || delta_next_host[1] != UINT32_MAX ||
         delta_prev_host[0] != UINT32_MAX || delta_prev_host[1] != UINT32_MAX ||
         delta_records_host[0].superseded_epoch != 2 ||
         encoded_delta_code != expected_delta_code ||
-        !override_found || !remote_found ||
+        encoded_resident_pq_code != expected_delta_code ||
+        !override_found || !remote_found || !resident_pq_found ||
+        resident_pq_positions_host[0] >= 4 ||
         anchor_graph_state_host != 3 ||
         cache_states_host[0] != 2 || cache_states_host[1] != 3 ||
         cache_states_host[2] != 2 || cache_states_host[3] != 2) {
@@ -600,20 +939,31 @@ int main(int argc, char** argv) {
     check_cuda(cudaMemcpy(override_keys_host, override_keys_device,
                           sizeof(override_keys_host), cudaMemcpyDeviceToHost),
                "cudaMemcpy(durable override keys)");
+    check_cuda(cudaMemcpy(resident_pq_keys_host, resident_pq_keys_device,
+                          sizeof(resident_pq_keys_host), cudaMemcpyDeviceToHost),
+               "cudaMemcpy(durable resident PQ keys)");
+    check_cuda(cudaMemcpy(resident_pq_slots_host, resident_pq_slots_device,
+                          sizeof(resident_pq_slots_host), cudaMemcpyDeviceToHost),
+               "cudaMemcpy(durable resident PQ slots)");
     u32 durable_override_bits = 0;
     check_cuda(cudaMemcpy(&durable_override_bits, permanent_override_bits_device,
                           sizeof(durable_override_bits), cudaMemcpyDeviceToHost),
                "cudaMemcpy(durable override bits)");
     bool durable_remote_present = false;
     bool transient_override_present = false;
+    bool durable_resident_pq_present = false;
     for (u32 index = 0; index < 4; ++index) {
       durable_remote_present = durable_remote_present ||
         (remote_keys_host[index] == 222 && remote_slots_host[index] == 1);
       transient_override_present = transient_override_present ||
         override_keys_host[index] == 7;
+      durable_resident_pq_present = durable_resident_pq_present ||
+        (resident_pq_keys_host[index] == 222 &&
+         resident_pq_slots_host[index] == 0);
     }
     if (delta_bucket_head_host != UINT32_MAX || durable_remote_present ||
-        transient_override_present || (durable_override_bits & (1u << 7)) == 0) {
+        transient_override_present || !durable_resident_pq_present ||
+        (durable_override_bits & (1u << 7)) == 0) {
       throw std::runtime_error("durable delta was not retired from mutable navigation");
     }
 
@@ -705,6 +1055,58 @@ int main(int argc, char** argv) {
         delta_records_host[1].remote_node != 0) {
       throw std::runtime_error("persistent reset delta state is invalid");
     }
+    check_cuda(cudaMemcpy(resident_pq_keys_host, resident_pq_keys_device,
+                          sizeof(resident_pq_keys_host), cudaMemcpyDeviceToHost),
+               "cudaMemcpy(reset resident PQ keys)");
+    check_cuda(cudaMemcpy(resident_pq_slots_host, resident_pq_slots_device,
+                          sizeof(resident_pq_slots_host), cudaMemcpyDeviceToHost),
+               "cudaMemcpy(reset resident PQ slots)");
+    bool reset_retained_resident_pq = false;
+    for (u32 index = 0; index < 4; ++index) {
+      reset_retained_resident_pq = reset_retained_resident_pq ||
+        (resident_pq_keys_host[index] == 222 &&
+         resident_pq_slots_host[index] == 0);
+    }
+    if (!reset_retained_resident_pq) {
+      throw std::runtime_error("L0 reset incorrectly discarded durable resident PQ");
+    }
+
+    const gpu_search::DeltaPublishDescriptor resident_pq_erase_descriptor{
+      .command_id = 103,
+      .resident_pq_erase_count = 1,
+    };
+    while (!delta_submissions.try_push(resident_pq_erase_descriptor)) {
+      if (std::chrono::steady_clock::now() >= reset_deadline) {
+        throw std::runtime_error("resident PQ erase command queue stopped making progress");
+      }
+      std::this_thread::yield();
+    }
+    while (!delta_completions.try_pop(delta_completion)) {
+      if (std::chrono::steady_clock::now() >= reset_deadline) {
+        throw std::runtime_error("resident PQ erase command did not complete");
+      }
+      std::this_thread::yield();
+    }
+    if (delta_completion.command_id != 103 || delta_completion.status != 0 ||
+        delta_completion.final_count != 0) {
+      throw std::runtime_error("resident PQ erase completion is invalid");
+    }
+    check_cuda(cudaMemcpy(resident_pq_keys_host, resident_pq_keys_device,
+                          sizeof(resident_pq_keys_host), cudaMemcpyDeviceToHost),
+               "cudaMemcpy(erased resident PQ keys)");
+    check_cuda(cudaMemcpy(resident_pq_positions_host,
+                          resident_pq_positions_device,
+                          sizeof(resident_pq_positions_host),
+                          cudaMemcpyDeviceToHost),
+               "cudaMemcpy(erased resident PQ positions)");
+    for (u64 key : resident_pq_keys_host) {
+      if (key == 222) {
+        throw std::runtime_error("resident PQ erase left a live remote mapping");
+      }
+    }
+    if (resident_pq_positions_host[0] != UINT32_MAX) {
+      throw std::runtime_error("resident PQ erase did not recycle its slot");
+    }
 
     constexpr u64 kRequestBase = 0x1020304050600000ULL;
     constexpr u32 kBatchSize = 64;
@@ -778,11 +1180,18 @@ int main(int argc, char** argv) {
       throw std::runtime_error("persistent override bitmap was not retained");
     }
 
+    check_cuda(cudaFree(resident_pq_erase_updates_device),
+               "cudaFree(resident PQ erase updates)");
     check_cuda(cudaFree(override_updates_device), "cudaFree(override updates)");
     check_cuda(cudaFree(durable_updates_device), "cudaFree(durable updates)");
     check_cuda(cudaFree(supersede_updates_device), "cudaFree(supersede updates)");
     check_cuda(cudaFree(remote_slots_device), "cudaFree(remote slots)");
     check_cuda(cudaFree(remote_keys_device), "cudaFree(remote keys)");
+    check_cuda(cudaFree(resident_pq_positions_device),
+               "cudaFree(resident PQ positions)");
+    check_cuda(cudaFree(resident_pq_slots_device), "cudaFree(resident PQ slots)");
+    check_cuda(cudaFree(resident_pq_keys_device), "cudaFree(resident PQ keys)");
+    check_cuda(cudaFree(resident_pq_codes_device), "cudaFree(resident PQ codes)");
     check_cuda(cudaFree(override_epochs_device), "cudaFree(override epochs)");
     check_cuda(cudaFree(permanent_override_bits_device),
                "cudaFree(permanent override bits)");

@@ -62,4 +62,6 @@ ComputeService::ComputeService(const Configuration& config)
 ComputeService::~ComputeService() {
   stop_storage_insert_runtime();
   persistent_search_.reset();
+  cm_.server_qps.clear();
+  release_storage_insert_runtime();
 }

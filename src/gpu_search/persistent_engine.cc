@@ -17,11 +17,13 @@
 #include <fstream>
 #include <future>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "common/index_path.hh"
@@ -291,9 +293,23 @@ struct PersistentSearchEngine::Impl {
     std::vector<u32> slots;
   };
 
+  struct RetiredResidentPqBatch {
+    u64 query_ticket_barrier{};
+    std::vector<ResidentPqEraseUpdate> entries;
+  };
+
   struct PendingStorageReclaimAck {
     u64 maintenance_sequence{};
     u64 query_ticket_barrier{};
+  };
+
+  struct DurableRetirement {
+    node_t id{};
+    service::storage_owner::MutationKind kind{
+      service::storage_owner::MutationKind::insert};
+    u64 epoch{};
+    u64 remote_node{};
+    u64 old_remote_node{};
   };
 
   std::string unhealthy_message() {
@@ -489,6 +505,7 @@ struct PersistentSearchEngine::Impl {
               << " anchors=" << anchor_table.count()
               << " seeds=" << config.gpu_entry_seed_count << '\n';
     query_slots = config.gpu_query_slots;
+    query_dispatch_capacity = next_power_of_two(query_slots * 2);
     result_capacity = std::max<u32>(config.k, config.gpu_final_rerank_width);
     exact_width = kPersistentMaxExact;
     code_bytes = index.layout.code_bytes;
@@ -568,6 +585,9 @@ struct PersistentSearchEngine::Impl {
       (sizeof(u32) + sizeof(f32));
     const u64 estimated_direct_queue_count =
       static_cast<u64>(config.gpu_rdma_qps) * index.shards.size();
+    const u64 query_dispatch_bytes = 2 * sizeof(u64) +
+      static_cast<u64>(query_dispatch_capacity) *
+        (sizeof(u64) + sizeof(QueryDescriptor));
     const u64 direct_queue_bytes = estimated_direct_queue_count *
       (2 * sizeof(u64) + sizeof(DeviceRingView<DirectBatchDescriptor>) +
        static_cast<u64>(kDirectBatchQueueCapacity) *
@@ -589,17 +609,40 @@ struct PersistentSearchEngine::Impl {
     route_graph_bytes = route_graph_record_bytes + route_graph_metadata_bytes;
     const u64 additional_scratch_bytes =
       dynamic_code_scratch_bytes + dynamic_request_scratch_bytes +
-      navigation_candidate_bytes + direct_queue_bytes + graph_scratch_bytes +
+      navigation_candidate_bytes + query_dispatch_bytes + direct_queue_bytes +
+      graph_scratch_bytes +
       cache_admission_bytes + route_graph_bytes;
     if (additional_scratch_bytes > usable_budget - budget.explicit_bytes) {
       throw std::runtime_error(
         "GPU navigation dynamic-code scratch exceeds the configured memory budget");
     }
-    explicit_gpu_bytes = budget.explicit_bytes + additional_scratch_bytes;
+    const u64 available_resident_pq_bytes =
+      usable_budget - budget.explicit_bytes - additional_scratch_bytes;
+    const u64 requested_resident_pq_bytes =
+      static_cast<u64>(config.gpu_resident_pq_budget_mb) << 20;
+    const u64 resident_pq_budget_bytes = std::min(
+      requested_resident_pq_bytes, available_resident_pq_bytes);
+    resident_pq_capacity = memory_budget::choose_resident_pq_capacity(
+      resident_pq_budget_bytes, kDeltaHandleMask, code_bytes);
+    if (resident_pq_capacity < delta_capacity) {
+      throw std::runtime_error(
+        "GPU resident dynamic-PQ budget is too small for the bounded update tier; "
+        "increase --gpu-resident-pq-budget-mb or reduce --delta-budget-mb");
+    }
+    resident_pq_table_capacity = memory_budget::next_power_of_two(
+      static_cast<u64>(resident_pq_capacity) * 2);
+    resident_pq_bytes = memory_budget::resident_pq_footprint(
+      resident_pq_capacity, code_bytes);
+    explicit_gpu_bytes = budget.explicit_bytes + additional_scratch_bytes +
+      resident_pq_bytes;
     engine.telemetry_.gpu_memory_explicit_bytes.store(
       explicit_gpu_bytes, std::memory_order_relaxed);
     engine.telemetry_.gpu_memory_base_pq_bytes.store(
       budget.code_bytes, std::memory_order_relaxed);
+    engine.telemetry_.gpu_memory_resident_pq_bytes.store(
+      resident_pq_bytes, std::memory_order_relaxed);
+    engine.telemetry_.resident_pq_capacity.store(
+      resident_pq_capacity, std::memory_order_relaxed);
     engine.telemetry_.gpu_memory_route_graph_bytes.store(
       route_graph_bytes, std::memory_order_relaxed);
     engine.telemetry_.gpu_memory_delta_reserved_bytes.store(
@@ -614,6 +657,8 @@ struct PersistentSearchEngine::Impl {
               << " delta=" << budget.delta_bytes
               << " delta_capacity=" << budget.delta_capacity
               << " delta_codes=" << budget.delta_code_bytes
+              << " resident_pq=" << resident_pq_bytes
+              << " resident_pq_capacity=" << resident_pq_capacity
               << " permanent_overrides=" << budget.permanent_override_bytes
               << " adjacency_total=" << budget.cache_total_bytes
               << " exact_cache_total=" << budget.exact_cache_total_bytes
@@ -792,6 +837,28 @@ struct PersistentSearchEngine::Impl {
     device_allocate(d_dynamic_code_request_local_iovas, dynamic_request_elements,
                     "cudaMalloc(dynamic PQ request local IOVAs)");
 
+    device_allocate(d_query_dispatch_enqueue, 1,
+                    "cudaMalloc(GPU query dispatch enqueue)");
+    device_allocate(d_query_dispatch_dequeue, 1,
+                    "cudaMalloc(GPU query dispatch dequeue)");
+    device_allocate(d_query_dispatch_sequences, query_dispatch_capacity,
+                    "cudaMalloc(GPU query dispatch sequences)");
+    device_allocate(d_query_dispatch_entries, query_dispatch_capacity,
+                    "cudaMalloc(GPU query dispatch entries)");
+    check_cuda(cudaMemset(d_query_dispatch_enqueue, 0, sizeof(u64)),
+               "cudaMemset(GPU query dispatch enqueue)");
+    check_cuda(cudaMemset(d_query_dispatch_dequeue, 0, sizeof(u64)),
+               "cudaMemset(GPU query dispatch dequeue)");
+    std::vector<u64> query_dispatch_sequences(query_dispatch_capacity);
+    for (u32 slot = 0; slot < query_dispatch_capacity; ++slot) {
+      query_dispatch_sequences[slot] = slot;
+    }
+    check_cuda(cudaMemcpy(d_query_dispatch_sequences,
+                          query_dispatch_sequences.data(),
+                          query_dispatch_sequences.size() * sizeof(u64),
+                          cudaMemcpyHostToDevice),
+               "cudaMemcpy(GPU query dispatch sequences)");
+
     direct_batch_queue_count = direct_view.qps_per_node * direct_view.remote_region_count;
     if (direct_batch_queue_count == 0 ||
         direct_batch_queue_count != estimated_direct_queue_count) {
@@ -812,6 +879,9 @@ struct PersistentSearchEngine::Impl {
     device_allocate(d_direct_batch_statuses,
                     static_cast<size_t>(query_slots) * index.shards.size(),
                     "cudaMalloc(GPUNetIO owner completion statuses)");
+    mapped_host_allocate(direct_owner_phases_host, d_direct_owner_phases,
+                         direct_batch_queue_count,
+                         "cudaHostAlloc(GPUNetIO owner runtime phases)");
     check_cuda(cudaMemset(d_direct_batch_enqueue, 0,
                           static_cast<size_t>(direct_batch_queue_count) * sizeof(u64)),
                "cudaMemset(GPUNetIO owner enqueue positions)");
@@ -875,6 +945,10 @@ struct PersistentSearchEngine::Impl {
     mapped_host_allocate(delta_durable_updates_host, d_delta_durable_updates,
                          delta_command_capacity,
                          "cudaHostAlloc(navigation delta durable staging)");
+    mapped_host_allocate(resident_pq_erase_updates_host,
+                         d_resident_pq_erase_updates,
+                         delta_command_capacity,
+                         "cudaHostAlloc(resident dynamic PQ erase staging)");
     if (graph_cache_slots != 0) {
       check_cuda(cudaMemset(d_graph_cache_states, 0,
                             static_cast<size_t>(graph_cache_slots) * sizeof(u32)),
@@ -985,28 +1059,59 @@ struct PersistentSearchEngine::Impl {
                     "cudaMalloc(navigation delta remote keys)");
     device_allocate(d_delta_remote_slots, delta_table_capacity,
                     "cudaMalloc(navigation delta remote slots)");
+    device_allocate(d_resident_pq_codes,
+                    static_cast<size_t>(resident_pq_capacity) * code_bytes,
+                    "cudaMalloc(resident dynamic PQ codes)");
+    device_allocate(d_resident_pq_keys, resident_pq_table_capacity,
+                    "cudaMalloc(resident dynamic PQ keys)");
+    device_allocate(d_resident_pq_slots, resident_pq_table_capacity,
+                    "cudaMalloc(resident dynamic PQ slots)");
+    device_allocate(d_resident_pq_positions, resident_pq_capacity,
+                    "cudaMalloc(resident dynamic PQ positions)");
+    check_cuda(cudaMemset(d_resident_pq_keys, 0,
+                          static_cast<size_t>(resident_pq_table_capacity) *
+                            sizeof(u64)),
+               "cudaMemset(resident dynamic PQ keys)");
+    check_cuda(cudaMemset(d_resident_pq_slots, 0xff,
+                          static_cast<size_t>(resident_pq_table_capacity) *
+                            sizeof(u32)),
+               "cudaMemset(resident dynamic PQ slots)");
+    check_cuda(cudaMemset(d_resident_pq_positions, 0xff,
+                          static_cast<size_t>(resident_pq_capacity) * sizeof(u32)),
+               "cudaMemset(resident dynamic PQ positions)");
     device_allocate(d_delta_count, 1, "cudaMalloc(navigation delta count)");
     clear_delta_device_state();
 
     check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&stop_host), sizeof(u32),
-                             cudaHostAllocMapped), "cudaHostAlloc(GPU navigation stop)");
+                             cudaHostAllocPortable),
+               "cudaHostAlloc(GPU navigation stop staging)");
     *stop_host = 0;
-    check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&stop_device), stop_host, 0),
-               "cudaHostGetDevicePointer(GPU navigation stop)");
+    device_allocate(stop_device, 1, "cudaMalloc(GPU navigation stop)");
+    check_cuda(cudaMemset(stop_device, 0, sizeof(u32)),
+               "cudaMemset(GPU navigation stop)");
     check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&direct_disabled_host), sizeof(u32),
-                             cudaHostAllocMapped),
-               "cudaHostAlloc(GPU navigation direct failure flag)");
+                             cudaHostAllocPortable),
+               "cudaHostAlloc(GPU navigation direct failure staging)");
     *direct_disabled_host = 0;
-    check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&direct_disabled_device),
-                                        direct_disabled_host, 0),
-               "cudaHostGetDevicePointer(GPU navigation direct failure flag)");
+    device_allocate(direct_disabled_device, 1,
+                    "cudaMalloc(GPU navigation direct failure flag)");
+    check_cuda(cudaMemset(direct_disabled_device, 0, sizeof(u32)),
+               "cudaMemset(GPU navigation direct failure flag)");
     check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&direct_error_host), sizeof(i32),
-                             cudaHostAllocMapped),
-               "cudaHostAlloc(GPU navigation direct error)");
+                             cudaHostAllocPortable),
+               "cudaHostAlloc(GPU navigation direct error staging)");
     *direct_error_host = 0;
-    check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&direct_error_device),
-                                        direct_error_host, 0),
-               "cudaHostGetDevicePointer(GPU navigation direct error)");
+    device_allocate(direct_error_device, 1,
+                    "cudaMalloc(GPU navigation direct error)");
+    check_cuda(cudaMemset(direct_error_device, 0, sizeof(i32)),
+               "cudaMemset(GPU navigation direct error)");
+    mapped_host_allocate(query_kernel_ready_host, d_query_kernel_ready, 1,
+                         "cudaHostAlloc(GPU query kernel readiness)");
+    mapped_host_allocate(dispatcher_kernel_ready_host,
+                         d_dispatcher_kernel_ready, 1,
+                         "cudaHostAlloc(GPU dispatcher kernel readiness)");
+    mapped_host_allocate(control_kernel_ready_host, d_control_kernel_ready, 1,
+                         "cudaHostAlloc(GPU control kernel readiness)");
     check_cuda(cudaStreamCreateWithFlags(&kernel_stream, cudaStreamNonBlocking),
                "cudaStreamCreate(GPU navigation kernel)");
     check_cuda(cudaStreamCreateWithFlags(&delta_stream, cudaStreamNonBlocking),
@@ -1020,14 +1125,40 @@ struct PersistentSearchEngine::Impl {
     check_cuda(cudaGetDeviceProperties(&properties, static_cast<int>(config.gpu_device)),
                "cudaGetDeviceProperties(GPU navigation)");
     gpu_clock_khz = static_cast<u64>(std::max(1, properties.clockRate));
+    constexpr u32 warp_width = 32;
+    const u32 owner_warps_per_block = kPersistentQueryThreads / warp_width;
+    owner_kernel_blocks =
+      (direct_batch_queue_count + owner_warps_per_block - 1) /
+      owner_warps_per_block;
+    const u32 resident_blocks = static_cast<u32>(
+      std::max(1, properties.multiProcessorCount));
+    constexpr u32 control_blocks = 2;
+    if (owner_kernel_blocks + control_blocks >= resident_blocks) {
+      throw std::runtime_error(
+        "GPU has too few SMs to keep GPUNetIO owners and control resident");
+    }
     const u64 requested_blocks = static_cast<u64>(
       std::max(1, properties.multiProcessorCount)) * config.gpu_persistent_blocks_per_sm;
     const u64 useful_blocks = std::max<u64>(1, config.num_threads);
+    const u64 resident_query_blocks =
+      resident_blocks - owner_kernel_blocks - control_blocks;
     kernel_blocks = static_cast<u32>(std::min({
-      static_cast<u64>(query_slots), requested_blocks, useful_blocks}));
+      static_cast<u64>(query_slots), requested_blocks, useful_blocks,
+      resident_query_blocks}));
 
     kernel_params = PersistentKernelParams{
       .submissions = submissions.device_view(),
+      .device_submissions = {
+        .enqueue_position = reinterpret_cast<unsigned long long*>(
+          d_query_dispatch_enqueue),
+        .dequeue_position = reinterpret_cast<unsigned long long*>(
+          d_query_dispatch_dequeue),
+        .sequences = reinterpret_cast<unsigned long long*>(
+          d_query_dispatch_sequences),
+        .entries = d_query_dispatch_entries,
+        .capacity = query_dispatch_capacity,
+        .mask = query_dispatch_capacity - 1,
+      },
       .completions = completions.device_view(),
       .delta_submissions = delta_submissions.device_view(),
       .delta_completions = delta_completions.device_view(),
@@ -1070,6 +1201,7 @@ struct PersistentSearchEngine::Impl {
       .direct_batch_queues = d_direct_batch_queues,
       .direct_batch_statuses = d_direct_batch_statuses,
       .direct_batch_queue_count = direct_batch_queue_count,
+      .direct_owner_phases = d_direct_owner_phases,
       .direct_dump = direct_view.dump,
       .direct_disabled = direct_disabled_device,
       .direct_error = direct_error_device,
@@ -1094,9 +1226,16 @@ struct PersistentSearchEngine::Impl {
       .delta_remote_keys = d_delta_remote_keys,
       .delta_remote_slots = d_delta_remote_slots,
       .delta_remote_capacity = delta_table_capacity,
+      .resident_pq_codes = d_resident_pq_codes,
+      .resident_pq_keys = d_resident_pq_keys,
+      .resident_pq_slots = d_resident_pq_slots,
+      .resident_pq_positions = d_resident_pq_positions,
+      .resident_pq_capacity = resident_pq_capacity,
+      .resident_pq_table_capacity = resident_pq_table_capacity,
       .delta_supersede_updates = d_delta_supersede_updates,
       .delta_override_updates = d_delta_override_updates,
       .delta_durable_updates = d_delta_durable_updates,
+      .resident_pq_erase_updates = d_resident_pq_erase_updates,
       .graph_invalidation_keys = d_graph_invalidation_keys,
       .anchor_vectors = d_anchor_vectors,
       .anchor_handles = d_anchor_handles,
@@ -1153,9 +1292,9 @@ struct PersistentSearchEngine::Impl {
       .result_ids = d_result_ids,
       .result_distances = d_result_distances,
     };
+    start_persistent_kernel();
     admission_thread = std::thread([this] { admission_loop(); });
     completion_thread = std::thread([this] { completion_loop(); });
-    start_persistent_kernel();
     maintenance_thread = std::thread([this] { maintenance_loop(); });
   }
 
@@ -1373,25 +1512,85 @@ struct PersistentSearchEngine::Impl {
 
   void start_persistent_kernel() {
     bind_cuda_device("cudaSetDevice(GPU navigation kernel start)");
-    std::atomic_ref<u32>(*stop_host).store(0, std::memory_order_release);
+    *stop_host = 0;
+    *direct_disabled_host = 0;
+    *direct_error_host = 0;
+    check_cuda(cudaMemset(stop_device, 0, sizeof(u32)),
+               "cudaMemset(GPU navigation start flag)");
+    check_cuda(cudaMemset(direct_disabled_device, 0, sizeof(u32)),
+               "cudaMemset(GPU navigation direct failure flag)");
+    check_cuda(cudaMemset(direct_error_device, 0, sizeof(i32)),
+               "cudaMemset(GPU navigation direct error)");
     (void)cudaGetLastError();
-    PersistentKernelParams control_params = kernel_params;
-    control_params.submissions = {};
-    control_params.completions = {};
-    launch_persistent_search(delta_stream, control_params, 1, 256);
-    check_cuda(cudaGetLastError(), "launch_persistent_search(delta control)");
-    launch_direct_read_owners(rdma_stream, kernel_params,
-                              direct_batch_queue_count, 256);
-    check_cuda(cudaGetLastError(), "launch_direct_read_owners(navigation)");
-    PersistentKernelParams query_params = kernel_params;
-    query_params.delta_submissions = {};
-    query_params.delta_completions = {};
-    launch_persistent_search(kernel_stream, query_params, kernel_blocks,
+    std::fill_n(direct_owner_phases_host, direct_batch_queue_count, 0u);
+    *query_kernel_ready_host = 0;
+    *dispatcher_kernel_ready_host = 0;
+    *control_kernel_ready_host = 0;
+    std::atomic_thread_fence(std::memory_order_release);
+    PersistentKernelParams launch_params = kernel_params;
+    launch_params.direct_owner_block_count = owner_kernel_blocks;
+    launch_params.query_block_count = kernel_blocks;
+    launch_params.query_kernel_ready_count = d_query_kernel_ready;
+    launch_params.dispatcher_kernel_ready_count = d_dispatcher_kernel_ready;
+    launch_params.control_kernel_ready_count = d_control_kernel_ready;
+    const u32 total_blocks = owner_kernel_blocks + kernel_blocks + 2;
+    launch_persistent_search(kernel_stream, launch_params, total_blocks,
                              kPersistentQueryThreads);
-    check_cuda(cudaGetLastError(), "launch_persistent_search(navigation)");
+    check_cuda(cudaGetLastError(), "launch_persistent_search(unified navigation)");
+
+    const auto ready_deadline = std::chrono::steady_clock::now() +
+      std::chrono::seconds(3);
+    u32 ready_owners = 0;
+    for (;;) {
+      ready_owners = 0;
+      for (u32 qp = 0; qp < direct_batch_queue_count; ++qp) {
+        ready_owners +=
+          *reinterpret_cast<volatile u32*>(direct_owner_phases_host + qp) == 1
+            ? 1u : 0u;
+      }
+      const u32 ready_queries =
+        *reinterpret_cast<volatile u32*>(query_kernel_ready_host);
+      const u32 ready_dispatchers =
+        *reinterpret_cast<volatile u32*>(dispatcher_kernel_ready_host);
+      const u32 ready_controls =
+        *reinterpret_cast<volatile u32*>(control_kernel_ready_host);
+      if (ready_owners == direct_batch_queue_count &&
+          ready_queries == kernel_blocks && ready_dispatchers == 1 &&
+          ready_controls == 1) {
+        break;
+      }
+      if (std::chrono::steady_clock::now() >= ready_deadline) {
+        u32 first_owner_phase = 0;
+        for (u32 qp = 0; qp < direct_batch_queue_count; ++qp) {
+          const u32 phase =
+            *reinterpret_cast<volatile u32*>(direct_owner_phases_host + qp);
+          if (phase != 1) {
+            first_owner_phase = phase;
+            break;
+          }
+        }
+        *stop_host = 1;
+        (void)cudaMemcpyAsync(stop_device, stop_host, sizeof(u32),
+                              cudaMemcpyHostToDevice, rdma_stream);
+        (void)cudaStreamSynchronize(rdma_stream);
+        (void)cudaStreamSynchronize(kernel_stream);
+        throw std::runtime_error(
+          "unified GPU grid did not become fully resident: owners=" +
+          std::to_string(ready_owners) + "/" +
+          std::to_string(direct_batch_queue_count) +
+          " queries=" + std::to_string(ready_queries) + "/" +
+          std::to_string(kernel_blocks) +
+          " dispatcher=" + std::to_string(ready_dispatchers) + "/1" +
+          " control=" + std::to_string(ready_controls) + "/1" +
+          " first_owner_phase=" + std::to_string(first_owner_phase));
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     kernel_running = true;
-    std::cerr << "[gpu-search] persistent CTAs=" << kernel_blocks
-              << "+1-control QP-owner-warps=" << direct_batch_queue_count
+    std::cerr << "[gpu-search] unified persistent CTAs=" << owner_kernel_blocks
+              << "-owner+" << kernel_blocks
+              << "-query+1-dispatch+1-control"
+              << " QP-owner-warps=" << direct_batch_queue_count
               << " threads/CTA=" << kPersistentQueryThreads
               << " query_slots=" << query_slots << '\n';
   }
@@ -1399,7 +1598,12 @@ struct PersistentSearchEngine::Impl {
   void stop_persistent_kernel() {
     if (!kernel_running) return;
     bind_cuda_device("cudaSetDevice(GPU navigation kernel stop)");
-    std::atomic_ref<u32>(*stop_host).store(1, std::memory_order_release);
+    *stop_host = 1;
+    check_cuda(cudaMemcpyAsync(stop_device, stop_host, sizeof(u32),
+                               cudaMemcpyHostToDevice, rdma_stream),
+               "cudaMemcpyAsync(GPU navigation stop)");
+    check_cuda(cudaStreamSynchronize(rdma_stream),
+               "cudaStreamSynchronize(GPU navigation stop signal)");
     const cudaError_t query_status = cudaStreamSynchronize(kernel_stream);
     const cudaError_t control_status = cudaStreamSynchronize(delta_stream);
     const cudaError_t rdma_status = cudaStreamSynchronize(rdma_stream);
@@ -1432,7 +1636,12 @@ struct PersistentSearchEngine::Impl {
       std::this_thread::yield();
     }
     if (kernel_running) {
-      std::atomic_ref<u32>(*stop_host).store(1, std::memory_order_release);
+      *stop_host = 1;
+      if (rdma_stream != nullptr) {
+        (void)cudaMemcpyAsync(stop_device, stop_host, sizeof(u32),
+                              cudaMemcpyHostToDevice, rdma_stream);
+        (void)cudaStreamSynchronize(rdma_stream);
+      }
       if (kernel_stream != nullptr) cudaStreamSynchronize(kernel_stream);
       if (delta_stream != nullptr) cudaStreamSynchronize(delta_stream);
       if (rdma_stream != nullptr) cudaStreamSynchronize(rdma_stream);
@@ -1446,6 +1655,12 @@ struct PersistentSearchEngine::Impl {
     if (kernel_stream != nullptr) cudaStreamDestroy(kernel_stream);
     if (direct_disabled_host != nullptr) cudaFreeHost(direct_disabled_host);
     if (direct_error_host != nullptr) cudaFreeHost(direct_error_host);
+    if (direct_owner_phases_host != nullptr) cudaFreeHost(direct_owner_phases_host);
+    if (control_kernel_ready_host != nullptr) cudaFreeHost(control_kernel_ready_host);
+    if (dispatcher_kernel_ready_host != nullptr) {
+      cudaFreeHost(dispatcher_kernel_ready_host);
+    }
+    if (query_kernel_ready_host != nullptr) cudaFreeHost(query_kernel_ready_host);
     if (stop_host != nullptr) cudaFreeHost(stop_host);
     if (result_distances_host != nullptr) cudaFreeHost(result_distances_host);
     if (result_ids_host != nullptr) cudaFreeHost(result_ids_host);
@@ -1454,12 +1669,18 @@ struct PersistentSearchEngine::Impl {
     if (delta_staging_slots_host != nullptr) cudaFreeHost(delta_staging_slots_host);
     if (delta_override_updates_host != nullptr) cudaFreeHost(delta_override_updates_host);
     if (delta_durable_updates_host != nullptr) cudaFreeHost(delta_durable_updates_host);
+    if (resident_pq_erase_updates_host != nullptr) {
+      cudaFreeHost(resident_pq_erase_updates_host);
+    }
     if (delta_supersede_updates_host != nullptr) cudaFreeHost(delta_supersede_updates_host);
     if (graph_invalidation_keys_host != nullptr) cudaFreeHost(graph_invalidation_keys_host);
     if (anchor_graph_validation_host != nullptr) {
       cudaFreeHost(anchor_graph_validation_host);
     }
     if (anchor_graph_readers_host != nullptr) cudaFreeHost(anchor_graph_readers_host);
+    device_free(direct_error_device);
+    device_free(direct_disabled_device);
+    device_free(stop_device);
     device_free(d_delta_count);
     device_free(d_direct_batch_statuses);
     device_free(d_direct_batch_queues);
@@ -1467,6 +1688,14 @@ struct PersistentSearchEngine::Impl {
     device_free(d_direct_batch_sequences);
     device_free(d_direct_batch_dequeue);
     device_free(d_direct_batch_enqueue);
+    device_free(d_query_dispatch_entries);
+    device_free(d_query_dispatch_sequences);
+    device_free(d_query_dispatch_dequeue);
+    device_free(d_query_dispatch_enqueue);
+    device_free(d_resident_pq_positions);
+    device_free(d_resident_pq_slots);
+    device_free(d_resident_pq_keys);
+    device_free(d_resident_pq_codes);
     device_free(d_delta_remote_slots);
     device_free(d_delta_remote_keys);
     device_free(d_base_override_epochs);
@@ -1876,6 +2105,41 @@ struct PersistentSearchEngine::Impl {
     }
   }
 
+  size_t active_resident_pq_slots_locked() const {
+    return resident_pq_slots_by_remote.size();
+  }
+
+  u32 allocate_resident_pq_slot_locked(u64 remote_node) {
+    if (remote_node == 0) {
+      throw std::runtime_error(
+        "cannot allocate resident GPU PQ for a null remote node");
+    }
+    if (resident_pq_slots_by_remote.contains(remote_node)) {
+      throw std::runtime_error(
+        "storage reused a dynamic remote node before its resident GPU PQ was reclaimed");
+    }
+    u32 slot = UINT32_MAX;
+    if (!free_resident_pq_slots.empty()) {
+      slot = free_resident_pq_slots.back();
+      free_resident_pq_slots.pop_back();
+    } else if (resident_pq_high_watermark < resident_pq_capacity) {
+      slot = resident_pq_high_watermark++;
+    } else {
+      throw MutationCapacityError(
+        "resident GPU PQ tier is full; increase --gpu-resident-pq-budget-mb "
+        "or consolidate dynamic vectors into a new base generation");
+    }
+    resident_pq_slots_by_remote.emplace(remote_node, slot);
+    const u64 live = active_resident_pq_slots_locked();
+    engine.telemetry_.resident_pq_entries.store(live, std::memory_order_relaxed);
+    u64 peak = engine.telemetry_.resident_pq_peak_entries.load(
+      std::memory_order_relaxed);
+    while (peak < live &&
+           !engine.telemetry_.resident_pq_peak_entries.compare_exchange_weak(
+             peak, live, std::memory_order_relaxed)) {}
+    return slot;
+  }
+
   void upload_records_locked(std::vector<DeltaMutation>& mutations,
                              std::span<const u64> invalidation_keys = {}) {
     const auto prepare_started = std::chrono::steady_clock::now();
@@ -1975,6 +2239,8 @@ struct PersistentSearchEngine::Impl {
         .epoch = mutation.epoch,
         .remote_node = record_remote,
         .anchor_bucket = bucket,
+        .resident_pq_slot = deleted
+          ? UINT32_MAX : allocate_resident_pq_slot_locked(record_remote),
       };
       delta_records_host[slot] = record;
       records.push_back(record);
@@ -2116,11 +2382,51 @@ struct PersistentSearchEngine::Impl {
       free_delta_slots.insert(free_delta_slots.end(),
                               batch.slots.begin(), batch.slots.end());
     }
+    u64 resident_pq_reclaimed = 0;
+    while (!retired_resident_pq_batches.empty() &&
+           query_ticket_barrier_passed(
+             retired_resident_pq_batches.front().query_ticket_barrier)) {
+      RetiredResidentPqBatch batch =
+        std::move(retired_resident_pq_batches.front());
+      retired_resident_pq_batches.pop_front();
+      for (size_t begin = 0; begin < batch.entries.size();
+           begin += delta_command_capacity) {
+        const size_t count = std::min<size_t>(
+          delta_command_capacity, batch.entries.size() - begin);
+        std::memcpy(resident_pq_erase_updates_host,
+                    batch.entries.data() + begin,
+                    count * sizeof(ResidentPqEraseUpdate));
+        submit_delta_publication(DeltaPublishDescriptor{
+          .command_id = next_delta_command_id.fetch_add(
+            1, std::memory_order_relaxed),
+          .final_count = static_cast<u32>(delta_records_host.size()),
+          .resident_pq_erase_count = static_cast<u32>(count),
+        });
+        for (size_t index = 0; index < count; ++index) {
+          const ResidentPqEraseUpdate& update = batch.entries[begin + index];
+          const auto resident = resident_pq_slots_by_remote.find(
+            update.remote_node);
+          if (resident == resident_pq_slots_by_remote.end() ||
+              resident->second != update.slot) {
+            continue;
+          }
+          resident_pq_slots_by_remote.erase(resident);
+          free_resident_pq_slots.push_back(update.slot);
+          ++resident_pq_reclaimed;
+        }
+      }
+    }
     if (reclaimed != 0) {
       engine.telemetry_.delta_compactions.fetch_add(1, std::memory_order_relaxed);
     }
+    if (resident_pq_reclaimed != 0) {
+      engine.telemetry_.resident_pq_reclaimed.fetch_add(
+        resident_pq_reclaimed, std::memory_order_relaxed);
+    }
     engine.telemetry_.delta_physical_entries.store(
       active_delta_slots_locked(), std::memory_order_relaxed);
+    engine.telemetry_.resident_pq_entries.store(
+      active_resident_pq_slots_locked(), std::memory_order_relaxed);
   }
 
   void validate_storage_control(const format::StorageControlBlock& control,
@@ -2253,6 +2559,7 @@ struct PersistentSearchEngine::Impl {
 
   void publish_ready_storage_reclaim_acks() {
     if (!healthy.load(std::memory_order_acquire)) return;
+    if (!retired_resident_pq_batches.empty()) return;
     std::vector<u64> targets = published_reclaim_ack_sequences;
     bool advanced = false;
     for (size_t shard = 0; shard < pending_storage_reclaim_acks.size(); ++shard) {
@@ -2306,10 +2613,28 @@ struct PersistentSearchEngine::Impl {
   }
 
   void mark_durable_delta_records_locked(
-      std::span<const DeltaMutation> retired) {
+      std::span<const DurableRetirement> retired) {
     std::vector<DeltaDurableUpdate> updates;
     std::vector<u32> retiring_slots;
-    for (const DeltaMutation& mutation : retired) {
+    std::vector<ResidentPqEraseUpdate> retiring_resident_pq;
+    std::unordered_set<u64> retained_resident_pq;
+    retained_resident_pq.reserve(retired.size());
+    for (const DurableRetirement& mutation : retired) {
+      if (mutation.kind != service::storage_owner::MutationKind::erase &&
+          mutation.remote_node != 0) {
+        retained_resident_pq.insert(mutation.remote_node);
+      }
+      if (mutation.old_remote_node != 0 &&
+          mutation.old_remote_node != mutation.remote_node) {
+        const auto resident = resident_pq_slots_by_remote.find(
+          mutation.old_remote_node);
+        if (resident != resident_pq_slots_by_remote.end()) {
+          retiring_resident_pq.push_back(ResidentPqEraseUpdate{
+            .remote_node = mutation.old_remote_node,
+            .slot = resident->second,
+          });
+        }
+      }
       std::vector<u32> retained_superseded;
       const auto superseded = superseded_delta_slots.find(mutation.id);
       if (superseded != superseded_delta_slots.end()) {
@@ -2348,6 +2673,33 @@ struct PersistentSearchEngine::Impl {
     retiring_slots.erase(
       std::unique(retiring_slots.begin(), retiring_slots.end()),
       retiring_slots.end());
+    for (u32 slot : retiring_slots) {
+      const u64 remote_node = delta_records_host[slot].remote_node;
+      if (remote_node == 0 || retained_resident_pq.contains(remote_node)) continue;
+      const auto resident = resident_pq_slots_by_remote.find(remote_node);
+      if (resident != resident_pq_slots_by_remote.end()) {
+        retiring_resident_pq.push_back(ResidentPqEraseUpdate{
+          .remote_node = remote_node,
+          .slot = resident->second,
+        });
+      }
+    }
+    std::sort(retiring_resident_pq.begin(), retiring_resident_pq.end(),
+              [](const ResidentPqEraseUpdate& lhs,
+                 const ResidentPqEraseUpdate& rhs) {
+                if (lhs.remote_node != rhs.remote_node) {
+                  return lhs.remote_node < rhs.remote_node;
+                }
+                return lhs.slot < rhs.slot;
+              });
+    retiring_resident_pq.erase(
+      std::unique(retiring_resident_pq.begin(), retiring_resident_pq.end(),
+                  [](const ResidentPqEraseUpdate& lhs,
+                     const ResidentPqEraseUpdate& rhs) {
+                    return lhs.remote_node == rhs.remote_node &&
+                      lhs.slot == rhs.slot;
+                  }),
+      retiring_resident_pq.end());
     updates.reserve(retiring_slots.size());
     for (u32 slot : retiring_slots) {
       DeviceDeltaRecord& record = delta_records_host[slot];
@@ -2368,7 +2720,7 @@ struct PersistentSearchEngine::Impl {
         .durable_count = static_cast<u32>(count),
       });
     }
-    if (!retiring_slots.empty()) {
+    if (!retiring_slots.empty() || !retiring_resident_pq.empty()) {
       for (u32 slot : retiring_slots) {
         DeviceDeltaRecord& record = delta_records_host[slot];
         record.flags |= kDeltaDurable;
@@ -2387,6 +2739,12 @@ struct PersistentSearchEngine::Impl {
         .query_ticket_barrier = barrier,
         .slots = std::move(retiring_slots),
       });
+      if (!retiring_resident_pq.empty()) {
+        retired_resident_pq_batches.push_back(RetiredResidentPqBatch{
+          .query_ticket_barrier = barrier,
+          .entries = std::move(retiring_resident_pq),
+        });
+      }
       reclaim_retired_delta_slots_locked();
     }
     engine.telemetry_.delta_mutable_entries.store(
@@ -2412,28 +2770,30 @@ struct PersistentSearchEngine::Impl {
       try {
         std::lock_guard<std::mutex> publish_lock(engine.mutation_publish_mutex_);
         retired = retire_durable_delta();
-        if (!retired.empty()) {
-          pending_durable_retirements.insert(
-            pending_durable_retirements.end(),
-            std::make_move_iterator(retired.begin()),
-            std::make_move_iterator(retired.end()));
+        for (const DeltaMutation& mutation : retired) {
+          pending_durable_retirements.emplace(
+            mutation.epoch,
+            DurableRetirement{
+              .id = mutation.id,
+              .kind = mutation.kind,
+              .epoch = mutation.epoch,
+              .remote_node = mutation.remote_node,
+              .old_remote_node = mutation.old_remote_node,
+            });
         }
-        std::vector<DeltaMutation> snapshot_safe;
-        std::vector<DeltaMutation> deferred;
-        snapshot_safe.reserve(pending_durable_retirements.size());
-        deferred.reserve(pending_durable_retirements.size());
+        std::vector<DurableRetirement> snapshot_safe;
+        snapshot_safe.reserve(std::min<size_t>(
+          delta_command_capacity, pending_durable_retirements.size()));
         {
           std::lock_guard<std::mutex> snapshot_lock(query_snapshot_mutex);
-          for (DeltaMutation& mutation : pending_durable_retirements) {
-            if (snapshot_safe.size() < delta_command_capacity &&
-                durable_snapshot_safe(mutation.epoch)) {
-              snapshot_safe.push_back(std::move(mutation));
-            } else {
-              deferred.push_back(std::move(mutation));
-            }
+          while (!pending_durable_retirements.empty() &&
+                 snapshot_safe.size() < delta_command_capacity) {
+            auto oldest = pending_durable_retirements.begin();
+            if (!durable_snapshot_safe(oldest->first)) break;
+            snapshot_safe.push_back(std::move(oldest->second));
+            pending_durable_retirements.erase(oldest);
           }
         }
-        pending_durable_retirements = std::move(deferred);
         {
           std::lock_guard<std::mutex> delta_lock(delta_mutex);
           if (!snapshot_safe.empty()) {
@@ -2450,15 +2810,21 @@ struct PersistentSearchEngine::Impl {
   }
 
   void report_direct_path_failure() {
-    if (direct_disabled_host == nullptr ||
-        std::atomic_ref<u32>(*direct_disabled_host).load(std::memory_order_acquire) == 0) {
-      return;
-    }
+    if (direct_disabled_host == nullptr || direct_disabled_device == nullptr ||
+        direct_error_host == nullptr || direct_error_device == nullptr) return;
+    check_cuda(cudaMemcpyAsync(direct_disabled_host, direct_disabled_device,
+                               sizeof(u32), cudaMemcpyDeviceToHost, rdma_stream),
+               "cudaMemcpyAsync(GPUNetIO failure flag)");
+    check_cuda(cudaMemcpyAsync(direct_error_host, direct_error_device,
+                               sizeof(i32), cudaMemcpyDeviceToHost, rdma_stream),
+               "cudaMemcpyAsync(GPUNetIO failure status)");
+    check_cuda(cudaStreamSynchronize(rdma_stream),
+               "cudaStreamSynchronize(GPUNetIO failure status)");
+    if (*direct_disabled_host == 0) return;
     bool expected = false;
     if (!direct_failure_logged.compare_exchange_strong(
           expected, true, std::memory_order_acq_rel)) return;
-    const i32 direct_error = direct_error_host == nullptr
-      ? 0 : std::atomic_ref<i32>(*direct_error_host).load(std::memory_order_acquire);
+    const i32 direct_error = *direct_error_host;
     std::cerr << "[gpu-search] GPUNetIO direct read failed with status=" << direct_error
               << "; strict GPUNetIO mode rejects the query\n";
     engine.telemetry_.direct_path_failures.fetch_add(1, std::memory_order_relaxed);
@@ -2474,7 +2840,7 @@ struct PersistentSearchEngine::Impl {
         std::this_thread::yield();
         continue;
       }
-      report_direct_path_failure();
+      if (completion.status != 0) report_direct_path_failure();
       std::shared_ptr<PendingQuery> pending;
       {
         std::lock_guard<std::mutex> lock(pending_mutex);
@@ -2628,6 +2994,8 @@ struct PersistentSearchEngine::Impl {
   u32 node_record_bytes{};
   u32 delta_capacity{};
   u32 delta_table_capacity{};
+  u32 resident_pq_capacity{};
+  u32 resident_pq_table_capacity{};
   u32 permanent_override_words{};
   u32 graph_cache_sets{};
   u32 graph_cache_slots{};
@@ -2638,6 +3006,7 @@ struct PersistentSearchEngine::Impl {
   u32 exact_admission_sets{};
   u32 graph_invalidation_capacity{};
   u32 delta_command_capacity{};
+  u32 query_dispatch_capacity{};
   u32 direct_batch_queue_count{};
   size_t graph_cache_bytes{};
   size_t exact_cache_bytes{};
@@ -2649,6 +3018,7 @@ struct PersistentSearchEngine::Impl {
   size_t graph_scratch_offset{};
   size_t control_region_offset{};
   u64 route_graph_bytes{};
+  u64 resident_pq_bytes{};
   u64 explicit_gpu_bytes{};
   u64 gpu_clock_khz{1};
   DeviceShardRegion* d_shards{};
@@ -2680,12 +3050,24 @@ struct PersistentSearchEngine::Impl {
   u32* d_dynamic_code_request_shards{};
   u64* d_dynamic_code_request_offsets{};
   u64* d_dynamic_code_request_local_iovas{};
+  u64* d_query_dispatch_enqueue{};
+  u64* d_query_dispatch_dequeue{};
+  u64* d_query_dispatch_sequences{};
+  QueryDescriptor* d_query_dispatch_entries{};
   u64* d_direct_batch_enqueue{};
   u64* d_direct_batch_dequeue{};
   u64* d_direct_batch_sequences{};
   DirectBatchDescriptor* d_direct_batch_entries{};
   DeviceRingView<DirectBatchDescriptor>* d_direct_batch_queues{};
   i32* d_direct_batch_statuses{};
+  u32* direct_owner_phases_host{};
+  u32* d_direct_owner_phases{};
+  u32* query_kernel_ready_host{};
+  u32* d_query_kernel_ready{};
+  u32* dispatcher_kernel_ready_host{};
+  u32* d_dispatcher_kernel_ready{};
+  u32* control_kernel_ready_host{};
+  u32* d_control_kernel_ready{};
   byte_t* d_exact_records{};
   byte_t* d_exact_cache{};
   byte_t* d_remote_buffer{};
@@ -2733,19 +3115,29 @@ struct PersistentSearchEngine::Impl {
   u32* d_permanent_override_bits{};
   u64* d_delta_remote_keys{};
   u32* d_delta_remote_slots{};
+  byte_t* d_resident_pq_codes{};
+  u64* d_resident_pq_keys{};
+  u32* d_resident_pq_slots{};
+  u32* d_resident_pq_positions{};
   DeltaSupersedeUpdate* delta_supersede_updates_host{};
   DeltaSupersedeUpdate* d_delta_supersede_updates{};
   DeltaOverrideUpdate* delta_override_updates_host{};
   DeltaOverrideUpdate* d_delta_override_updates{};
   DeltaDurableUpdate* delta_durable_updates_host{};
   DeltaDurableUpdate* d_delta_durable_updates{};
+  ResidentPqEraseUpdate* resident_pq_erase_updates_host{};
+  ResidentPqEraseUpdate* d_resident_pq_erase_updates{};
   u32* d_delta_count{};
   std::vector<DeviceDeltaRecord> delta_records_host;
   std::vector<u32> free_delta_slots;
   std::unordered_map<node_t, std::vector<u32>> superseded_delta_slots;
   std::deque<RetiredDeltaBatch> retired_delta_batches;
-  std::vector<DeltaMutation> pending_durable_retirements;
+  std::deque<RetiredResidentPqBatch> retired_resident_pq_batches;
+  std::multimap<u64, DurableRetirement> pending_durable_retirements;
   std::unordered_map<node_t, u32> latest_delta_slot;
+  std::unordered_map<u64, u32> resident_pq_slots_by_remote;
+  std::vector<u32> free_resident_pq_slots;
+  u32 resident_pq_high_watermark{};
   std::unordered_map<u32, u64> base_override_epochs;
   std::vector<std::deque<std::pair<u64, std::chrono::steady_clock::time_point>>>
     durable_sequence_history;
@@ -2771,6 +3163,7 @@ struct PersistentSearchEngine::Impl {
   cudaStream_t rdma_stream{};
   cudaStream_t route_refresh_stream{};
   PersistentKernelParams kernel_params{};
+  u32 owner_kernel_blocks{};
   u32 kernel_blocks{};
   bool kernel_running{};
   std::atomic<bool> direct_failure_logged{false};
@@ -2815,7 +3208,9 @@ PersistentSearchEngine::PersistentSearchEngine(
                                  connection_manager, remote_regions);
 }
 
-PersistentSearchEngine::~PersistentSearchEngine() = default;
+PersistentSearchEngine::~PersistentSearchEngine() {
+  impl_.reset();
+}
 
 service::QueryResult PersistentSearchEngine::search(
     VectorDType query_dtype, const byte_t* query_data, u32 k) {
@@ -2896,10 +3291,17 @@ bool PersistentSearchEngine::try_reserve_mutation_capacity(size_t mutation_count
   impl_->reclaim_retired_delta_slots_locked();
   const size_t active_slots = impl_->active_delta_slots_locked();
   const size_t hard_watermark = static_cast<size_t>(impl_->delta_capacity) * 9 / 10;
+  const size_t active_resident_pq = impl_->active_resident_pq_slots_locked();
+  const size_t resident_pq_hard_watermark =
+    std::max<size_t>(1, static_cast<size_t>(impl_->resident_pq_capacity) * 95 / 100);
   if (mutation_count > hard_watermark ||
       active_slots > hard_watermark - mutation_count ||
       impl_->reserved_mutation_capacity >
-        hard_watermark - mutation_count - active_slots) {
+        hard_watermark - mutation_count - active_slots ||
+      mutation_count > resident_pq_hard_watermark ||
+      active_resident_pq > resident_pq_hard_watermark - mutation_count ||
+      impl_->reserved_mutation_capacity >
+        resident_pq_hard_watermark - mutation_count - active_resident_pq) {
     telemetry_.mutation_capacity_rejections.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
@@ -2944,6 +3346,12 @@ void PersistentSearchEngine::reset_telemetry() {
     impl_->mutable_delta_entries, std::memory_order_relaxed);
   telemetry_.delta_durable_entries.store(
     impl_->durable_delta_entries, std::memory_order_relaxed);
+  telemetry_.resident_pq_capacity.store(
+    impl_->resident_pq_capacity, std::memory_order_relaxed);
+  telemetry_.resident_pq_entries.store(
+    impl_->active_resident_pq_slots_locked(), std::memory_order_relaxed);
+  telemetry_.resident_pq_peak_entries.store(
+    impl_->active_resident_pq_slots_locked(), std::memory_order_relaxed);
   telemetry_.mutation_capacity_reserved.store(
     impl_->reserved_mutation_capacity, std::memory_order_relaxed);
 }

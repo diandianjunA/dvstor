@@ -20,7 +20,7 @@ inline constexpr u32 kPersistentScoreChunk = 16;
 inline constexpr u32 kPersistentMaxMergeCandidates = 2048;
 inline constexpr u32 kPersistentMaxShards = 16;
 inline constexpr u32 kPersistentMaxAnchorProbes = 64;
-inline constexpr u32 kPersistentQueryThreads = 128;
+inline constexpr u32 kPersistentQueryThreads = 256;
 inline constexpr u32 kPersistentGraphCacheLineBytes = 512;
 inline constexpr u32 kDeltaHandleBit = 0x80000000u;
 inline constexpr u32 kDeltaHandleMask = 0x7fffffffu;
@@ -62,7 +62,7 @@ struct DeviceDeltaRecord {
   u64 superseded_epoch{};
   u64 remote_node{};
   u32 anchor_bucket{};
-  u32 reserved{};
+  u32 resident_pq_slot{UINT32_MAX};
 };
 
 struct DirectBatchDescriptor {
@@ -78,6 +78,7 @@ struct DirectBatchDescriptor {
 
 struct PersistentKernelParams {
   DeviceRingView<QueryDescriptor> submissions;
+  DeviceRingView<QueryDescriptor> device_submissions;
   DeviceRingView<CompletionDescriptor> completions;
   DeviceRingView<DeltaPublishDescriptor> delta_submissions;
   DeviceRingView<DeltaPublishCompletion> delta_completions;
@@ -120,6 +121,7 @@ struct PersistentKernelParams {
   const DeviceRingView<DirectBatchDescriptor>* direct_batch_queues{};
   i32* direct_batch_statuses{};
   u32 direct_batch_queue_count{};
+  u32* direct_owner_phases{};
   u8* direct_dump{};
   u32* direct_disabled{};
   i32* direct_error{};
@@ -144,9 +146,16 @@ struct PersistentKernelParams {
   u64* delta_remote_keys{};
   u32* delta_remote_slots{};
   u32 delta_remote_capacity{};
+  u8* resident_pq_codes{};
+  u64* resident_pq_keys{};
+  u32* resident_pq_slots{};
+  u32* resident_pq_positions{};
+  u32 resident_pq_capacity{};
+  u32 resident_pq_table_capacity{};
   const DeltaSupersedeUpdate* delta_supersede_updates{};
   const DeltaOverrideUpdate* delta_override_updates{};
   const DeltaDurableUpdate* delta_durable_updates{};
+  const ResidentPqEraseUpdate* resident_pq_erase_updates{};
   const u64* graph_invalidation_keys{};
   const f32* anchor_vectors{};
   const u32* anchor_handles{};
@@ -159,6 +168,12 @@ struct PersistentKernelParams {
   u32 anchor_count{};
   u32 delta_anchor_probes{};
   u32* stop{};
+  u32* kernel_ready_count{};
+  u32 direct_owner_block_count{};
+  u32 query_block_count{};
+  u32* query_kernel_ready_count{};
+  u32* dispatcher_kernel_ready_count{};
+  u32* control_kernel_ready_count{};
   u8* graph_cache{};
   u8* graph_scratch{};
   u64* graph_cache_keys{};
@@ -205,6 +220,11 @@ void launch_persistent_search(cudaStream_t stream, const PersistentKernelParams&
 void launch_direct_read_owners(cudaStream_t stream,
                                const PersistentKernelParams& params,
                                u32 queue_count, u32 threads);
+void launch_gpunetio_owner_read_probe(
+  cudaStream_t stream, const PersistentKernelParams& params,
+  u32* request_shards, u64* remote_offsets, u64* local_iova_offsets,
+  u8* destinations, u32 destination_stride, i32* statuses,
+  u32* completed, u32* phases, u32 queue_count);
 void launch_gather_anchor_codes(cudaStream_t stream, const u8* base_codes,
                                 const u32* anchor_handles, u8* anchor_codes,
                                 u32 anchor_count, u32 code_bytes,

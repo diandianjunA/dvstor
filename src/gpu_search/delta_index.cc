@@ -68,7 +68,19 @@ bool DeltaCoordinator::publish(std::vector<DeltaMutation> mutations, u64 epoch,
       .in_delta = true,
     };
     delta_bytes_ += mutation_bytes(mutation);
-    delta_[mutation.id] = std::move(mutation);
+    const node_t id = mutation.id;
+    DeltaMutation& stored = delta_[id] = std::move(mutation);
+    if (stored.maintenance_sequence != 0) {
+      if (durable_candidates_.size() <= stored.owner_storage) {
+        durable_candidates_.resize(static_cast<size_t>(stored.owner_storage) + 1);
+      }
+      durable_candidates_[stored.owner_storage].push(DurableCandidate{
+        .maintenance_sequence = stored.maintenance_sequence,
+        .epoch = stored.epoch,
+        .id = stored.id,
+        .generation = stored.generation,
+      });
+    }
   }
   u64 current = published_epoch_.load(std::memory_order_relaxed);
   while (current < epoch &&
@@ -124,26 +136,42 @@ std::vector<DeltaMutation> DeltaCoordinator::retire_durable(
     std::span<const u64> durable_sequences, size_t max_items) {
   std::unique_lock<std::shared_mutex> lock(state_mutex_);
   std::vector<DeltaMutation> retired;
+  if (max_items == 0 || durable_sequences.empty() ||
+      durable_candidates_.empty()) return retired;
   retired.reserve(std::min(max_items, delta_.size()));
-  for (auto iterator = delta_.begin(); iterator != delta_.end();) {
-    if (retired.size() >= max_items) break;
-    DeltaMutation& mutation = iterator->second;
-    if (mutation.durable || mutation.maintenance_sequence == 0 ||
-        mutation.owner_storage >= durable_sequences.size() ||
-        mutation.maintenance_sequence > durable_sequences[mutation.owner_storage]) {
-      ++iterator;
-      continue;
+  const size_t owner_count = std::min(
+    durable_sequences.size(), durable_candidates_.size());
+  const size_t first_owner = durable_owner_cursor_ % owner_count;
+  for (size_t offset = 0;
+       offset < owner_count && retired.size() < max_items; ++offset) {
+    const size_t owner = (first_owner + offset) % owner_count;
+    DurableQueue& candidates = durable_candidates_[owner];
+    const u64 durable_sequence = durable_sequences[owner];
+    while (!candidates.empty() && retired.size() < max_items &&
+           candidates.top().maintenance_sequence <= durable_sequence) {
+      const DurableCandidate candidate = candidates.top();
+      candidates.pop();
+      const auto mutation_iterator = delta_.find(candidate.id);
+      if (mutation_iterator == delta_.end()) continue;
+      DeltaMutation& mutation = mutation_iterator->second;
+      if (mutation.durable || mutation.owner_storage != owner ||
+          mutation.maintenance_sequence != candidate.maintenance_sequence ||
+          mutation.epoch != candidate.epoch ||
+          mutation.generation != candidate.generation) {
+        continue;
+      }
+      mutation.durable = true;
+      const auto version = versions_.find(mutation.id);
+      if (version != versions_.end() &&
+          version->second.epoch <= mutation.epoch) {
+        version->second.in_delta = false;
+      }
+      delta_bytes_ -= mutation_bytes(mutation);
+      retired.push_back(std::move(mutation));
+      delta_.erase(mutation_iterator);
     }
-    mutation.durable = true;
-    const auto version = versions_.find(mutation.id);
-    if (version != versions_.end() &&
-        version->second.epoch <= mutation.epoch) {
-      version->second.in_delta = false;
-    }
-    delta_bytes_ -= mutation_bytes(mutation);
-    retired.push_back(std::move(mutation));
-    iterator = delta_.erase(iterator);
   }
+  durable_owner_cursor_ = (first_owner + 1) % owner_count;
   if (!retired.empty()) {
     last_consolidation_ = std::chrono::steady_clock::now();
   }

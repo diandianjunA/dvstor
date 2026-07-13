@@ -40,6 +40,7 @@ public:
   u32 gpu_query_slots{256};
   u32 gpu_memory_limit_gb{40};
   u32 gpu_memory_reserve_gb{4};
+  u32 gpu_resident_pq_budget_mb{4096};
   u32 gpu_adjacency_cache_mb{0};
   u32 gpu_adjacency_cache_ways{4};
   u32 gpu_exact_cache_mb{0};
@@ -156,6 +157,10 @@ private:
       ("gpu-memory-reserve-gb",
        po::value<u32>(&gpu_memory_reserve_gb)->default_value(gpu_memory_reserve_gb),
        "GPU memory reserved for CUDA and transport runtime state.")
+      ("gpu-resident-pq-budget-mb",
+       po::value<u32>(&gpu_resident_pq_budget_mb)
+         ->default_value(gpu_resident_pq_budget_mb),
+       "GPU memory budget for PQ codes of durable dynamically inserted vectors.")
       ("gpu-adjacency-cache-mb",
        po::value<u32>(&gpu_adjacency_cache_mb)->default_value(gpu_adjacency_cache_mb),
        "GPU compact-graph cache budget.")
@@ -330,6 +335,7 @@ private:
     if (gpu_query_slots == 0 || gpu_query_slots > 4096 ||
         gpu_memory_limit_gb == 0 ||
         gpu_memory_reserve_gb >= gpu_memory_limit_gb ||
+        gpu_resident_pq_budget_mb == 0 ||
         gpu_adjacency_cache_ways != 4 ||
         gpu_exact_cache_ways != 4 ||
         gpu_bootstrap_window_mb == 0 || gpu_bootstrap_windows == 0 ||
@@ -425,6 +431,8 @@ public:
       output << std::setw(width) << "GPU memory limit/reserve GiB: "
              << config.gpu_memory_limit_gb << "/"
              << config.gpu_memory_reserve_gb << '\n';
+      output << std::setw(width) << "GPU resident dynamic PQ MiB: "
+             << config.gpu_resident_pq_budget_mb << '\n';
       output << std::setw(width) << "GPU graph cache MiB/ways: "
              << config.gpu_adjacency_cache_mb << "/"
              << config.gpu_adjacency_cache_ways << '\n';

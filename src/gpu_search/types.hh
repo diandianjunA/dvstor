@@ -65,6 +65,12 @@ struct DeltaDurableUpdate {
   u64 epoch{};
 };
 
+struct ResidentPqEraseUpdate {
+  u64 remote_node{};
+  u32 slot{};
+  u32 reserved{};
+};
+
 inline constexpr u32 kDeltaCommandReset = 1u;
 inline constexpr u32 kDeltaCommandPromoteOverrides = 1u << 1;
 
@@ -77,6 +83,7 @@ struct DeltaPublishDescriptor {
   u32 superseded_count{};
   u32 override_count{};
   u32 durable_count{};
+  u32 resident_pq_erase_count{};
   u32 flags{};
 };
 
@@ -89,6 +96,7 @@ struct DeltaPublishCompletion {
 struct TelemetrySnapshot {
   u64 gpu_memory_explicit_bytes{};
   u64 gpu_memory_base_pq_bytes{};
+  u64 gpu_memory_resident_pq_bytes{};
   u64 gpu_memory_route_graph_bytes{};
   u64 gpu_memory_delta_reserved_bytes{};
   u64 gpu_memory_graph_cache_bytes{};
@@ -128,6 +136,10 @@ struct TelemetrySnapshot {
   u64 delta_physical_entries{};
   u64 delta_mutable_entries{};
   u64 delta_durable_entries{};
+  u64 resident_pq_capacity{};
+  u64 resident_pq_entries{};
+  u64 resident_pq_peak_entries{};
+  u64 resident_pq_reclaimed{};
   u64 mutation_capacity_rejections{};
   u64 mutation_capacity_reserved{};
   u64 mutation_capacity_reserved_max{};
@@ -145,6 +157,7 @@ public:
 
   std::atomic<u64> gpu_memory_explicit_bytes{0};
   std::atomic<u64> gpu_memory_base_pq_bytes{0};
+  std::atomic<u64> gpu_memory_resident_pq_bytes{0};
   std::atomic<u64> gpu_memory_route_graph_bytes{0};
   std::atomic<u64> gpu_memory_delta_reserved_bytes{0};
   std::atomic<u64> gpu_memory_graph_cache_bytes{0};
@@ -184,6 +197,10 @@ public:
   std::atomic<u64> delta_physical_entries{0};
   std::atomic<u64> delta_mutable_entries{0};
   std::atomic<u64> delta_durable_entries{0};
+  std::atomic<u64> resident_pq_capacity{0};
+  std::atomic<u64> resident_pq_entries{0};
+  std::atomic<u64> resident_pq_peak_entries{0};
+  std::atomic<u64> resident_pq_reclaimed{0};
   std::atomic<u64> mutation_capacity_rejections{0};
   std::atomic<u64> mutation_capacity_reserved{0};
   std::atomic<u64> mutation_capacity_reserved_max{0};

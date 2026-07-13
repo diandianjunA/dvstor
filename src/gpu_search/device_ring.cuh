@@ -61,6 +61,20 @@ __device__ __forceinline__ bool device_ring_try_pop(DeviceRingView<T> ring, T& v
 }
 
 template <class T>
+__device__ __forceinline__ bool device_ring_try_push(DeviceRingView<T> ring,
+                                                     const T& value) {
+  const unsigned long long position = atomicAdd(ring.enqueue_position, 0ULL);
+  const unsigned int slot = static_cast<unsigned int>(position) & ring.mask;
+  if (device_ring_load_acquire(ring.sequences + slot) != position) return false;
+  if (atomicCAS(ring.enqueue_position, position, position + 1ULL) != position) {
+    return false;
+  }
+  ring.entries[slot] = value;
+  device_ring_store_release(ring.sequences + slot, position + 1ULL);
+  return true;
+}
+
+template <class T>
 __device__ __forceinline__ void device_ring_push(DeviceRingView<T> ring, const T& value) {
   const unsigned long long position = atomicAdd(ring.enqueue_position, 1ULL);
   const unsigned int slot = static_cast<unsigned int>(position) & ring.mask;

@@ -85,6 +85,13 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
     return;
   }
 
+  {
+    std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
+    peer_rpc_pending_responses_.clear();
+    peer_rpc_responses_.clear();
+    peer_rpc_response_payloads_.clear();
+  }
+
   peer_reverse_shutdown_.store(false, std::memory_order_release);
   peer_reverse_workers_done_.store(false, std::memory_order_release);
   peer_reverse_task_queue_limit_ =
@@ -166,6 +173,12 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
   peer_stitch_search_workers_.clear();
   peer_reverse_worker_states_.clear();
   peer_stitch_search_worker_states_.clear();
+  {
+    std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
+    peer_rpc_pending_responses_.clear();
+    peer_rpc_responses_.clear();
+    peer_rpc_response_payloads_.clear();
+  }
 }
 
 size_t MemoryNode::peer_rpc_receive_offset(u32 peer_id, u32 slot_id) const {
@@ -588,18 +601,27 @@ void MemoryNode::peer_rpc_progress_loop() {
           }
         }
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response)) {
+        bool accepted = false;
         {
           std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
-          peer_rpc_responses_[header->request_id] = *header;
+          if (peer_rpc_pending_responses_.contains(header->request_id)) {
+            peer_rpc_responses_[header->request_id] = *header;
+            accepted = true;
+          }
         }
-        peer_rpc_responses_cv_.notify_all();
+        if (accepted) peer_rpc_responses_cv_.notify_all();
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_response)) {
+        bool accepted = false;
         {
           std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
-          peer_rpc_responses_[header->request_id] = *header;
-          peer_rpc_response_payloads_[header->request_id].assign(payload, payload + bytes);
+          if (peer_rpc_pending_responses_.contains(header->request_id)) {
+            peer_rpc_responses_[header->request_id] = *header;
+            peer_rpc_response_payloads_[header->request_id].assign(
+              payload, payload + bytes);
+            accepted = true;
+          }
         }
-        peer_rpc_responses_cv_.notify_all();
+        if (accepted) peer_rpc_responses_cv_.notify_all();
       }
 
       repost_peer_rpc_receive(peer_id, slot_id);
@@ -886,10 +908,15 @@ bool MemoryNode::pump_peer_rpcs_locked(const Configuration&,
         request.payload.assign(payload, payload + bytes);
         requests.push_back(std::move(request));
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response)) {
-        peer_rpc_responses_[header->request_id] = *header;
+        if (peer_rpc_pending_responses_.contains(header->request_id)) {
+          peer_rpc_responses_[header->request_id] = *header;
+        }
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_response)) {
-        peer_rpc_responses_[header->request_id] = *header;
-        peer_rpc_response_payloads_[header->request_id].assign(payload, payload + bytes);
+        if (peer_rpc_pending_responses_.contains(header->request_id)) {
+          peer_rpc_responses_[header->request_id] = *header;
+          peer_rpc_response_payloads_[header->request_id].assign(
+            payload, payload + bytes);
+        }
       }
 
       repost_peer_rpc_receive(peer_id, slot_id);
@@ -925,12 +952,16 @@ bool MemoryNode::wait_for_peer_reverse_update_response(u64 request_id,
     if (it != peer_rpc_responses_.end()) {
       const bool success = it->second.status == static_cast<u32>(service::storage_owner::InsertStatus::ok);
       peer_rpc_responses_.erase(it);
+      peer_rpc_pending_responses_.erase(request_id);
       lock.unlock();
       log_slow_peer_reverse_update_response(wait_started, request_id, target_shard, item_count, success);
       return success;
     }
 
     if (peer_rpc_responses_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+      peer_rpc_pending_responses_.erase(request_id);
+      peer_rpc_responses_.erase(request_id);
+      peer_rpc_response_payloads_.erase(request_id);
       static std::atomic<u32> timeout_logs{0};
       const u32 log_index = timeout_logs.fetch_add(1, std::memory_order_relaxed);
       if (log_index < 8) {
@@ -983,10 +1014,14 @@ bool MemoryNode::wait_for_peer_stitch_search_response(u64 request_id,
       if (payload_it != peer_rpc_response_payloads_.end()) {
         peer_rpc_response_payloads_.erase(payload_it);
       }
+      peer_rpc_pending_responses_.erase(request_id);
       return success;
     }
 
     if (peer_rpc_responses_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+      peer_rpc_pending_responses_.erase(request_id);
+      peer_rpc_responses_.erase(request_id);
+      peer_rpc_response_payloads_.erase(request_id);
       static std::atomic<u32> timeout_logs{0};
       const u32 log_index = timeout_logs.fetch_add(1, std::memory_order_relaxed);
       if (log_index < 8) {
@@ -1024,6 +1059,10 @@ bool MemoryNode::post_stitch_search_request(u32 target_shard,
   header->item_count = item_count;
   header->request_id = next_peer_request_id_.fetch_add(1, std::memory_order_relaxed);
   request_id = header->request_id;
+  {
+    std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
+    peer_rpc_pending_responses_.insert(request_id);
+  }
 
   auto* items = service::storage_owner::stitch_search_items(message.data());
   byte_t* vectors = service::storage_owner::stitch_search_vectors(message.data(), item_count);
@@ -1119,6 +1158,9 @@ bool MemoryNode::send_peer_op_batch_direct(u32 target_shard,
     header->request_id = next_peer_request_id_.fetch_add(1, std::memory_order_relaxed);
     if (!wait_for_response) {
       header->reserved |= kPeerRpcFlagNoResponse;
+    } else if (rpc_type == service::storage_owner::PeerRpcType::reverse_update_request) {
+      std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
+      peer_rpc_pending_responses_.insert(header->request_id);
     }
     auto* payload_ops = service::storage_owner::reverse_update_ops(message.data());
     std::memcpy(payload_ops,

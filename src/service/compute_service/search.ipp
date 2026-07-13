@@ -38,7 +38,8 @@ vec<node_t> ComputeService::search_local(const vec<element_t>& query, u32 k) {
   }
   if (output.sample && output.sample->finished_flag) {
     std::lock_guard<std::mutex> lock(breakdown_mutex_);
-    completed_query_samples_.push_back(*output.sample);
+    service::breakdown::add_sample(
+      completed_breakdown_report_.query, *output.sample);
   }
   return ids;
 }
@@ -54,7 +55,8 @@ vec<node_t> ComputeService::search_local_raw(
   }
   if (output.sample && output.sample->finished_flag) {
     std::lock_guard<std::mutex> lock(breakdown_mutex_);
-    completed_query_samples_.push_back(*output.sample);
+    service::breakdown::add_sample(
+      completed_breakdown_report_.query, *output.sample);
   }
   return ids;
 }

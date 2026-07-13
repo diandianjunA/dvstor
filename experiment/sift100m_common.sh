@@ -35,12 +35,11 @@ MAX_QUERIES="${MAX_QUERIES:-10000}"
 GROUNDTRUTH_LABEL="${GROUNDTRUTH_LABEL:-100M}"
 GROUNDTRUTH_TOPK="${GROUNDTRUTH_TOPK:-10}"
 
-# Benchmark vectors are disjoint half-open slices of bigann_base.bvecs. The
-# first 100M rows remain the indexed base; query and insert traffic use held-out
-# rows [100M,103M) and [103M,105M), respectively.
+# The first 100M rows remain the indexed base. The performance query stream
+# uses five million held-out rows [100M,105M).
 BENCHMARK_VECTOR_SOURCE="${BENCHMARK_VECTOR_SOURCE:-$DATASET_DIR/bigann_base.bvecs}"
 PERFORMANCE_QUERY_START="${PERFORMANCE_QUERY_START:-100000000}"
-PERFORMANCE_QUERY_END="${PERFORMANCE_QUERY_END:-103000000}"
+PERFORMANCE_QUERY_END="${PERFORMANCE_QUERY_END:-105000000}"
 INSERT_VECTOR_START="${INSERT_VECTOR_START:-103000000}"
 INSERT_VECTOR_END="${INSERT_VECTOR_END:-105000000}"
 
@@ -101,7 +100,7 @@ base_bin() { echo "$CONVERTED_DIR/base$(base_suffix).u8bin"; }
 query_bin() { echo "$CONVERTED_DIR/query$(query_suffix).u8bin"; }
 groundtruth_bin() { echo "$CONVERTED_DIR/groundtruth_${GROUNDTRUTH_LABEL}.bin"; }
 insert_bin() { echo "${INSERT_FILE:-$DATASET_DIR/sift103m_to_105m_insert.u8bin}"; }
-performance_query_bin() { echo "${PERFORMANCE_QUERY_FILE:-$DATASET_DIR/sift100m_to_103m_query.u8bin}"; }
+performance_query_bin() { echo "${PERFORMANCE_QUERY_FILE:-$DATASET_DIR/sift100m_to_105m_query.u8bin}"; }
 metadata_file() { echo "${INDEX_PREFIX}.meta.json"; }
 model_file() { echo "${INDEX_PREFIX}.pq${PQ_SUBQUANTIZERS}"; }
 
@@ -290,6 +289,7 @@ write_service_config() {
     echo "gpu-query-slots = ${GPU_QUERY_SLOTS:-256}"
     echo "gpu-memory-limit-gb = ${GPU_MEMORY_LIMIT_GB:-40}"
     echo "gpu-memory-reserve-gb = ${GPU_MEMORY_RESERVE_GB:-4}"
+    echo "gpu-resident-pq-budget-mb = ${GPU_RESIDENT_PQ_BUDGET_MB:-4096}"
     echo "gpu-adjacency-cache-mb = ${GPU_ADJACENCY_CACHE_MB:-0}"
     echo "gpu-adjacency-cache-ways = ${GPU_ADJACENCY_CACHE_WAYS:-4}"
     echo "gpu-exact-cache-mb = ${GPU_EXACT_CACHE_MB:-0}"

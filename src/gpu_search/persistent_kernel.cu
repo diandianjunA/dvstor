@@ -289,6 +289,87 @@ __device__ u32 delta_slot_from_raw(const PersistentKernelParams& params, u64 raw
   return UINT32_MAX;
 }
 
+__device__ u32 resident_pq_slot_from_raw(const PersistentKernelParams& params,
+                                         u64 raw) {
+  if (raw == 0 || params.resident_pq_table_capacity == 0 ||
+      params.resident_pq_keys == nullptr || params.resident_pq_slots == nullptr) {
+    return UINT32_MAX;
+  }
+  const u32 mask = params.resident_pq_table_capacity - 1;
+  u32 position = hash64(raw) & mask;
+  for (u32 probe = 0; probe < params.resident_pq_table_capacity; ++probe) {
+    const u64 key = load_cg(params.resident_pq_keys + position);
+    if (key == raw) {
+      const u32 slot = load_cg(params.resident_pq_slots + position);
+      return slot < params.resident_pq_capacity ? slot : UINT32_MAX;
+    }
+    if (key == kDeltaRemoteEmpty) return UINT32_MAX;
+    position = (position + 1) & mask;
+  }
+  return UINT32_MAX;
+}
+
+__device__ bool insert_resident_pq(const PersistentKernelParams& params,
+                                   u64 raw, u32 slot) {
+  if (raw == 0 || slot >= params.resident_pq_capacity ||
+      params.resident_pq_table_capacity == 0 ||
+      params.resident_pq_keys == nullptr || params.resident_pq_slots == nullptr ||
+      params.resident_pq_positions == nullptr) {
+    return false;
+  }
+  const u32 mask = params.resident_pq_table_capacity - 1;
+  u32 position = hash64(raw) & mask;
+  u32 first_tombstone = UINT32_MAX;
+  for (u32 probe = 0; probe < params.resident_pq_table_capacity; ++probe) {
+    const u64 key = load_cg(params.resident_pq_keys + position);
+    if (key == raw) {
+      atomicExch(params.resident_pq_slots + position, slot);
+      params.resident_pq_positions[slot] = position;
+      __threadfence();
+      return true;
+    }
+    if (key == kDeltaRemoteTombstone && first_tombstone == UINT32_MAX) {
+      first_tombstone = position;
+    }
+    if (key == kDeltaRemoteEmpty) {
+      const u32 destination = first_tombstone == UINT32_MAX
+        ? position : first_tombstone;
+      params.resident_pq_positions[slot] = destination;
+      params.resident_pq_slots[destination] = slot;
+      __threadfence();
+      atomicExch(reinterpret_cast<unsigned long long*>(
+                   params.resident_pq_keys + destination), raw);
+      return true;
+    }
+    position = (position + 1) & mask;
+  }
+  if (first_tombstone == UINT32_MAX) return false;
+  params.resident_pq_positions[slot] = first_tombstone;
+  params.resident_pq_slots[first_tombstone] = slot;
+  __threadfence();
+  atomicExch(reinterpret_cast<unsigned long long*>(
+               params.resident_pq_keys + first_tombstone), raw);
+  return true;
+}
+
+__device__ void erase_resident_pq(const PersistentKernelParams& params,
+                                  const ResidentPqEraseUpdate& update) {
+  if (update.remote_node == 0 || update.slot >= params.resident_pq_capacity ||
+      params.resident_pq_positions == nullptr) {
+    return;
+  }
+  const u32 position = params.resident_pq_positions[update.slot];
+  if (position >= params.resident_pq_table_capacity ||
+      load_cg(params.resident_pq_keys + position) != update.remote_node ||
+      load_cg(params.resident_pq_slots + position) != update.slot) {
+    return;
+  }
+  atomicCAS(reinterpret_cast<unsigned long long*>(params.resident_pq_keys + position),
+            update.remote_node, kDeltaRemoteTombstone);
+  atomicExch(params.resident_pq_slots + position, UINT32_MAX);
+  atomicExch(params.resident_pq_positions + update.slot, UINT32_MAX);
+}
+
 __device__ u32 handle_from_raw(const PersistentKernelParams& params, u64 raw) {
   u32 handle = UINT32_MAX;
   if (static_handle_from_raw(params, raw, handle)) return handle;
@@ -402,12 +483,27 @@ __device__ f32 approximate_handle(const PersistentKernelParams& params,
   u32 shard = 0;
   if (!resolve_handle(params, handle, raw, shard, graph_offset)) return FLT_MAX;
   const u32 slot = delta_slot_from_raw(params, raw);
-  if (slot >= min(load_cg(params.delta_count), params.delta_capacity)) return FLT_MAX;
-  const DeviceDeltaRecord& record = params.delta_records[slot];
-  if (record.remote_node != raw) return FLT_MAX;
-  if (!delta_code_visible(record, snapshot_epoch)) return FLT_MAX;
+  if (slot < min(load_cg(params.delta_count), params.delta_capacity) &&
+      params.delta_records[slot].remote_node == raw) {
+    const DeviceDeltaRecord& record = params.delta_records[slot];
+    if (delta_code_visible(record, snapshot_epoch)) {
+      return approximate_entry(params, query_lut,
+        params.delta_pq_codes + static_cast<size_t>(slot) * params.pq_code_bytes);
+    }
+    const u64 superseded = load_cg(&record.superseded_epoch);
+    if (record.epoch <= snapshot_epoch &&
+        ((record.flags & kDeltaDeleted) != 0 ||
+         (superseded != 0 && superseded <= snapshot_epoch))) {
+      return FLT_MAX;
+    }
+  }
+  const u32 resident_slot = resident_pq_slot_from_raw(params, raw);
+  if (resident_slot == UINT32_MAX || params.resident_pq_codes == nullptr) {
+    return FLT_MAX;
+  }
   return approximate_entry(params, query_lut,
-    params.delta_pq_codes + static_cast<size_t>(slot) * params.pq_code_bytes);
+    params.resident_pq_codes +
+      static_cast<size_t>(resident_slot) * params.pq_code_bytes);
 }
 
 __device__ void beam_insert(u32* handles, u32* ids, f32* distances, u8* expanded,
@@ -788,25 +884,31 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
                                   u32 bytes, u32 lane,
                                   const u64* local_iova_offsets = nullptr,
                                   i32* owner_completion = nullptr,
-                                  bool defer_owner_wait = false) {
+                                  bool defer_owner_wait = false,
+                                  u32* owner_progress = nullptr) {
 #ifdef DVSTOR_HAVE_GPUNETIO
-  if (memory_node >= params.direct_region_count || params.direct_qps == nullptr ||
-      params.direct_qp_locks == nullptr || params.direct_qps_per_node == 0 ||
-      params.direct_disabled == nullptr ||
-      *reinterpret_cast<volatile u32*>(params.direct_disabled) != 0) return -EHOSTDOWN;
   u32 matching = 0;
   for (u32 index = 0; index < request_count; ++index) {
     if (request_shards[index] == memory_node) ++matching;
   }
   if (matching == 0) return 0;
+  if (memory_node >= params.direct_region_count || params.direct_qps == nullptr ||
+      params.direct_qp_locks == nullptr || params.direct_qps_per_node == 0 ||
+      params.direct_disabled == nullptr ||
+      *reinterpret_cast<volatile u32*>(params.direct_disabled) != 0) return -EHOSTDOWN;
   const u32 qp_index = (lane % params.direct_qps_per_node) *
     params.direct_region_count + memory_node;
   if (params.direct_qps[qp_index] == nullptr) return -EINVAL;
   if (params.direct_batch_queues != nullptr && owner_completion != nullptr) {
     if (qp_index >= params.direct_batch_queue_count) return -EINVAL;
+    const u64 started = global_time_ns();
+    if (owner_progress != nullptr) {
+      *reinterpret_cast<volatile u32*>(owner_progress) = 2;
+      __threadfence_system();
+    }
     atomicExch(owner_completion, -EINPROGRESS);
     __threadfence();
-    device_ring_push(params.direct_batch_queues[qp_index], DirectBatchDescriptor{
+    const DirectBatchDescriptor descriptor{
       .request_shards = request_shards,
       .remote_offsets = remote_offsets,
       .local_iova_offsets = local_iova_offsets,
@@ -814,9 +916,31 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
       .request_count = request_count,
       .memory_node = memory_node,
       .bytes = bytes,
-    });
+    };
+    while (!device_ring_try_push(params.direct_batch_queues[qp_index], descriptor)) {
+      if (*reinterpret_cast<const volatile u32*>(params.stop) != 0) {
+        atomicExch(owner_completion, -ECANCELED);
+        return -ECANCELED;
+      }
+      if (*reinterpret_cast<const volatile u32*>(params.direct_disabled) != 0) {
+        atomicExch(owner_completion, -EHOSTDOWN);
+        return -EHOSTDOWN;
+      }
+      if (global_time_ns() - started >= params.direct_timeout_ns) {
+        atomicExch(owner_completion, -ETIMEDOUT);
+        if (params.direct_error != nullptr) {
+          atomicCAS(params.direct_error, 0, -ETIMEDOUT);
+        }
+        atomicExch(params.direct_disabled, 1u);
+        return -ETIMEDOUT;
+      }
+      device_ring_relax(128);
+    }
+    if (owner_progress != nullptr) {
+      *reinterpret_cast<volatile u32*>(owner_progress) = 3;
+      __threadfence_system();
+    }
     if (defer_owner_wait) return -EINPROGRESS;
-    const u64 started = global_time_ns();
     for (;;) {
       const i32 status = *reinterpret_cast<volatile i32*>(owner_completion);
       if (status != -EINPROGRESS) return status;
@@ -897,6 +1021,7 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
   (void)lane;
   (void)local_iova_offsets;
   (void)owner_completion;
+  (void)owner_progress;
   return -ENOTSUP;
 #endif
 }
@@ -1009,6 +1134,21 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
             static_cast<size_t>(delta_slot) * params.pq_code_bytes);
         continue;
       }
+      const u64 superseded = load_cg(&record.superseded_epoch);
+      if (record.epoch <= descriptor.snapshot_epoch &&
+          ((record.flags & kDeltaDeleted) != 0 ||
+           (superseded != 0 && superseded <= descriptor.snapshot_epoch))) {
+        continue;
+      }
+    }
+
+    const u32 resident_slot = resident_pq_slot_from_raw(params, raw);
+    if (resident_slot != UINT32_MAX && params.resident_pq_codes != nullptr) {
+      distances[index] = approximate_entry(
+        params, query_lut,
+        params.resident_pq_codes +
+          static_cast<size_t>(resident_slot) * params.pq_code_bytes);
+      continue;
     }
 
     if (params.dynamic_code_records == nullptr || shard >= params.num_shards) continue;
@@ -2252,21 +2392,84 @@ __device__ void process_query(const PersistentKernelParams& params,
   }
 }
 
+__device__ void direct_read_owner_loop(PersistentKernelParams params,
+                                       u32 queue_count,
+                                       u32 owner_block);
+
 __global__ void persistent_search_kernel(PersistentKernelParams params) {
+  const bool unified_dispatch = params.direct_owner_block_count != 0;
+  if (unified_dispatch && blockIdx.x < params.direct_owner_block_count) {
+    direct_read_owner_loop(params, params.direct_batch_queue_count, blockIdx.x);
+    return;
+  }
+
+  bool enable_queries = true;
+  bool enable_dispatcher = false;
+  bool enable_delta = true;
+  if (unified_dispatch) {
+    const u32 role_block = blockIdx.x - params.direct_owner_block_count;
+    enable_queries = role_block < params.query_block_count;
+    enable_dispatcher = role_block == params.query_block_count;
+    enable_delta = role_block == params.query_block_count + 1;
+    if (!enable_queries && !enable_dispatcher && !enable_delta) return;
+    if (threadIdx.x == 0) {
+      u32* ready_count = enable_queries ? params.query_kernel_ready_count
+        : enable_dispatcher ? params.dispatcher_kernel_ready_count
+                           : params.control_kernel_ready_count;
+      if (ready_count != nullptr) atomicAdd(ready_count, 1u);
+      __threadfence_system();
+    }
+  } else if (threadIdx.x == 0 && params.kernel_ready_count != nullptr) {
+    atomicAdd(params.kernel_ready_count, 1u);
+    __threadfence_system();
+  }
   __shared__ QueryDescriptor descriptor;
+  __shared__ QueryDescriptor dispatch_descriptor;
   __shared__ DeltaPublishDescriptor delta_descriptor;
   __shared__ u32 have_submission;
+  __shared__ u32 dispatch_pending;
   __shared__ u32 have_delta_submission;
   __shared__ u32 stop_requested;
+  __shared__ u32 idle_cycles;
   __shared__ i32 delta_status;
+  if (threadIdx.x == 0) {
+    dispatch_pending = 0;
+    idle_cycles = 256u + ((blockIdx.x * 131u) & 1023u);
+  }
+  __syncthreads();
   for (;;) {
     if (threadIdx.x == 0) {
       stop_requested = *reinterpret_cast<volatile u32*>(params.stop);
     }
     __syncthreads();
     if (stop_requested != 0) return;
+    if (enable_dispatcher) {
+      if (threadIdx.x == 0) {
+        bool progressed = false;
+        if (dispatch_pending == 0 && params.submissions.entries != nullptr &&
+            device_ring_try_pop(params.submissions, dispatch_descriptor)) {
+          dispatch_pending = 1;
+          progressed = true;
+        }
+        if (dispatch_pending != 0 &&
+            params.device_submissions.entries != nullptr &&
+            device_ring_try_push(params.device_submissions,
+                                 dispatch_descriptor)) {
+          dispatch_pending = 0;
+          progressed = true;
+        }
+        if (progressed) {
+          idle_cycles = 256u + ((blockIdx.x * 131u) & 1023u);
+        } else {
+          device_ring_relax(idle_cycles);
+          idle_cycles = min(idle_cycles * 2, 16384u);
+        }
+      }
+      __syncthreads();
+      continue;
+    }
     if (threadIdx.x == 0) {
-      have_delta_submission =
+      have_delta_submission = enable_delta &&
         params.delta_submissions.entries != nullptr &&
         device_ring_try_pop(params.delta_submissions, delta_descriptor) ? 1u : 0u;
     }
@@ -2288,6 +2491,7 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
                        delta_descriptor.superseded_count != 0 ||
                        delta_descriptor.override_count != 0 ||
                        delta_descriptor.durable_count != 0 ||
+                       delta_descriptor.resident_pq_erase_count != 0 ||
                        params.delta_records == nullptr ||
                        params.delta_next == nullptr ||
                        params.delta_prev == nullptr ||
@@ -2313,9 +2517,21 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
              (params.delta_staging_vectors == nullptr || params.delta_vectors == nullptr)) ||
             (delta_descriptor.record_count != 0 && params.pq_code_bytes != 0 &&
              (params.delta_pq_codes == nullptr || params.delta_encode_scratch == nullptr ||
-              params.pq_centroids == nullptr)) ||
+              params.pq_centroids == nullptr || params.resident_pq_codes == nullptr ||
+              params.resident_pq_keys == nullptr ||
+              params.resident_pq_slots == nullptr ||
+              params.resident_pq_positions == nullptr ||
+              params.resident_pq_capacity == 0 ||
+              params.resident_pq_table_capacity == 0)) ||
             (delta_descriptor.durable_count != 0 &&
              params.delta_durable_updates == nullptr) ||
+            (delta_descriptor.resident_pq_erase_count != 0 &&
+             (params.resident_pq_erase_updates == nullptr ||
+              params.resident_pq_keys == nullptr ||
+              params.resident_pq_slots == nullptr ||
+              params.resident_pq_positions == nullptr ||
+              params.resident_pq_capacity == 0 ||
+              params.resident_pq_table_capacity == 0)) ||
             (promote && delta_descriptor.override_count != 0 &&
              (params.delta_override_updates == nullptr ||
               params.permanent_override_bits == nullptr ||
@@ -2477,7 +2693,18 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
           }
           params.delta_pq_codes[
             static_cast<size_t>(slot) * params.pq_code_bytes + subquantizer] = best_code;
+          const u32 resident_slot = params.delta_records[slot].resident_pq_slot;
+          if ((params.delta_records[slot].flags & kDeltaDeleted) == 0) {
+            if (resident_slot >= params.resident_pq_capacity) {
+              atomicExch(&delta_status, -ENOSPC);
+            } else {
+              params.resident_pq_codes[
+                static_cast<size_t>(resident_slot) * params.pq_code_bytes +
+                subquantizer] = best_code;
+            }
+          }
         }
+        __threadfence();
         __syncthreads();
 
         for (u32 index = threadIdx.x;
@@ -2633,6 +2860,10 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
               }
             }
           }
+          for (u32 index = 0;
+               index < delta_descriptor.resident_pq_erase_count; ++index) {
+            erase_resident_pq(params, params.resident_pq_erase_updates[index]);
+          }
         }
       }
       __syncthreads();
@@ -2643,6 +2874,12 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
           for (u32 index = 0; index < delta_descriptor.record_count; ++index) {
             const u32 slot = params.delta_staging_slots[index];
             const DeviceDeltaRecord record = params.delta_records[slot];
+            if ((record.flags & kDeltaDeleted) == 0 &&
+                !insert_resident_pq(
+                  params, record.remote_node, record.resident_pq_slot)) {
+              delta_status = -ENOSPC;
+              break;
+            }
             params.delta_remote_positions[slot] = UINT32_MAX;
             if (record.remote_node != 0 && params.delta_remote_capacity != 0) {
               u32 position = hash64(record.remote_node) & mask;
@@ -2712,18 +2949,31 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
         });
       }
       __syncthreads();
+      if (threadIdx.x == 0) idle_cycles = 256u;
+      __syncthreads();
       continue;
     }
 
     if (threadIdx.x == 0) {
-      have_submission = params.submissions.entries != nullptr &&
-        device_ring_try_pop(params.submissions, descriptor) ? 1u : 0u;
+      const DeviceRingView<QueryDescriptor> query_queue =
+        params.device_submissions.entries != nullptr
+          ? params.device_submissions : params.submissions;
+      have_submission = enable_queries && query_queue.entries != nullptr &&
+        device_ring_try_pop(query_queue, descriptor) ? 1u : 0u;
     }
     __syncthreads();
     if (have_submission == 0) {
-      device_ring_relax(256);
+      if (threadIdx.x == 0) {
+        device_ring_relax(idle_cycles);
+        idle_cycles = min(idle_cycles * 2, 16384u);
+      }
+      __syncthreads();
       continue;
     }
+    if (threadIdx.x == 0) {
+      idle_cycles = 256u + ((blockIdx.x * 131u) & 1023u);
+    }
+    __syncthreads();
     process_query(params, descriptor);
     __syncthreads();
   }
@@ -2736,8 +2986,9 @@ __device__ void complete_direct_batch(const DirectBatchDescriptor& descriptor,
   atomicExch(descriptor.completion_status, status);
 }
 
-__global__ void direct_read_owner_kernel(PersistentKernelParams params,
-                                         u32 queue_count) {
+__device__ void direct_read_owner_loop(PersistentKernelParams params,
+                                       u32 queue_count,
+                                       u32 owner_block) {
 #ifdef DVSTOR_HAVE_GPUNETIO
   constexpr u32 warp_width = 32;
   constexpr u32 max_warps_per_block = 8;
@@ -2745,13 +2996,28 @@ __global__ void direct_read_owner_kernel(PersistentKernelParams params,
   const u32 lane = threadIdx.x % warp_width;
   const u32 warps_per_block = blockDim.x / warp_width;
   const u32 warp_in_block = threadIdx.x / warp_width;
-  const u32 warp = blockIdx.x * warps_per_block + warp_in_block;
+  const u32 warp = owner_block * warps_per_block + warp_in_block;
   if (warps_per_block == 0 || warps_per_block > max_warps_per_block ||
       warp >= queue_count) return;
-  if (params.direct_batch_queues == nullptr || params.direct_qps == nullptr ||
-      params.direct_regions == nullptr || params.direct_disabled == nullptr ||
-      params.direct_region_count == 0 || params.direct_qps_per_node == 0 ||
-      warp >= params.direct_batch_queue_count) return;
+  if (lane == 0 && params.direct_owner_phases != nullptr) {
+    params.direct_owner_phases[warp] = 10;
+    __threadfence_system();
+  }
+  u32 invalid = 0;
+  invalid |= params.direct_batch_queues == nullptr ? 1u : 0u;
+  invalid |= params.direct_qps == nullptr ? 2u : 0u;
+  invalid |= params.direct_regions == nullptr ? 4u : 0u;
+  invalid |= params.direct_disabled == nullptr ? 8u : 0u;
+  invalid |= params.direct_region_count == 0 ? 16u : 0u;
+  invalid |= params.direct_qps_per_node == 0 ? 32u : 0u;
+  invalid |= warp >= params.direct_batch_queue_count ? 64u : 0u;
+  if (invalid != 0) {
+    if (lane == 0 && params.direct_owner_phases != nullptr) {
+      params.direct_owner_phases[warp] = 0x100u | invalid;
+      __threadfence_system();
+    }
+    return;
+  }
 
   __shared__ DirectBatchDescriptor shared_batches
     [max_warps_per_block][max_submit_batches];
@@ -2764,17 +3030,35 @@ __global__ void direct_read_owner_kernel(PersistentKernelParams params,
 
   const u32 memory_node = warp % params.direct_region_count;
   auto* qp = reinterpret_cast<doca_gpu_dev_verbs_qp*>(params.direct_qps[warp]);
-  if (qp == nullptr) return;
+  if (qp == nullptr) {
+    if (lane == 0 && params.direct_owner_phases != nullptr) {
+      params.direct_owner_phases[warp] = 0x200u;
+      __threadfence_system();
+    }
+    return;
+  }
   auto* completion_queue = doca_gpu_dev_verbs_qp_get_cq_sq(qp);
+  const bool need_dump = qp->need_dump;
   const DirectRemoteRegion& region = params.direct_regions[memory_node];
   const DeviceRingView<DirectBatchDescriptor> queue =
     params.direct_batch_queues[warp];
   DirectBatchDescriptor deferred{};
   u32 deferred_matching = 0;
   bool have_deferred = false;
+  bool trace_first_batch = true;
 
-  while (*reinterpret_cast<const volatile u32*>(params.stop) == 0) {
-    const bool need_dump = qp->need_dump;
+  if (lane == 0 && params.direct_owner_phases != nullptr) {
+    params.direct_owner_phases[warp] = 1;
+    __threadfence_system();
+  }
+
+  const u32 initial_idle_cycles = 256u + ((warp * 97u) & 2047u);
+  u32 idle_cycles = initial_idle_cycles;
+  for (;;) {
+    const u32 stop_requested = lane == 0
+      ? *reinterpret_cast<const volatile u32*>(params.stop)
+      : 0u;
+    if (__shfl_sync(0xffffffffu, stop_requested, 0) != 0) break;
 
     if (lane == 0) {
       u32 batch_count = 0;
@@ -2789,6 +3073,10 @@ __global__ void direct_read_owner_kernel(PersistentKernelParams params,
         } else if (!device_ring_try_pop(queue, descriptor)) {
           break;
         } else {
+          if (trace_first_batch && params.direct_owner_phases != nullptr) {
+            params.direct_owner_phases[warp] = 2;
+            __threadfence_system();
+          }
           if (descriptor.memory_node == memory_node &&
               descriptor.request_shards != nullptr &&
               descriptor.remote_offsets != nullptr &&
@@ -2835,9 +3123,12 @@ __global__ void direct_read_owner_kernel(PersistentKernelParams params,
 
     const u32 batch_count = shared_batch_counts[warp_in_block];
     if (batch_count == 0) {
-      device_ring_relax(256);
+      if (lane == 0) device_ring_relax(idle_cycles);
+      __syncwarp();
+      idle_cycles = min(idle_cycles * 2, 16384u);
       continue;
     }
+    idle_cycles = initial_idle_cycles;
 
     const doca_gpu_dev_verbs_ticket_t first_wqe = qp->sq_wqe_pi;
     const doca_gpu_dev_verbs_ticket_t first_completion =
@@ -2886,8 +3177,16 @@ __global__ void direct_read_owner_kernel(PersistentKernelParams params,
     }
     __syncwarp();
     if (lane == 0) {
+      if (trace_first_batch && params.direct_owner_phases != nullptr) {
+        params.direct_owner_phases[warp] = 3;
+        __threadfence_system();
+      }
       doca_gpu_dev_verbs_submit<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE>(
         qp, first_wqe + shared_total_wqes[warp_in_block]);
+      if (trace_first_batch && params.direct_owner_phases != nullptr) {
+        params.direct_owner_phases[warp] = 4;
+        __threadfence_system();
+      }
 
       i32 status = 0;
       for (u32 batch = 0; batch < batch_count; ++batch) {
@@ -2897,6 +3196,11 @@ __global__ void direct_read_owner_kernel(PersistentKernelParams params,
                                   params.direct_disabled);
         }
         complete_direct_batch(shared_batches[warp_in_block][batch], status);
+      }
+      if (trace_first_batch && params.direct_owner_phases != nullptr) {
+        params.direct_owner_phases[warp] = status == 0 ? 6u : 5u;
+        __threadfence_system();
+        trace_first_batch = false;
       }
       if (status != 0 && status != -ECANCELED) {
         if (params.direct_error != nullptr) atomicCAS(params.direct_error, 0, status);
@@ -2908,7 +3212,13 @@ __global__ void direct_read_owner_kernel(PersistentKernelParams params,
 #else
   (void)params;
   (void)queue_count;
+  (void)owner_block;
 #endif
+}
+
+__global__ void direct_read_owner_kernel(PersistentKernelParams params,
+                                         u32 queue_count) {
+  direct_read_owner_loop(params, queue_count, blockIdx.x);
 }
 
 __global__ void gpunetio_locked_read_probe_kernel(PersistentKernelParams params,
@@ -2964,6 +3274,39 @@ __global__ void gpunetio_batched_read_probe_kernel(PersistentKernelParams params
   }
 }
 
+__global__ void gpunetio_owner_read_probe_kernel(
+    PersistentKernelParams params, u32* request_shards,
+    u64* remote_offsets, u64* local_iova_offsets, u8* destinations,
+    u32 destination_stride, i32* statuses, u32* completed,
+    u32* phases, u32 queue_count) {
+  const u32 qp_index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (qp_index >= queue_count || params.direct_region_count == 0) return;
+  phases[qp_index] = 1;
+  __threadfence_system();
+  const u32 memory_node = qp_index % params.direct_region_count;
+  const u32 lane = qp_index / params.direct_region_count;
+  request_shards[qp_index] = memory_node;
+  remote_offsets[qp_index] = 0;
+  local_iova_offsets[qp_index] =
+    reinterpret_cast<u64>(destinations +
+      static_cast<size_t>(qp_index) * destination_stride) -
+    params.direct_local_iova_base;
+  __threadfence();
+  i32* completion_status = statuses + qp_index;
+  const i32 status = direct_fetch_batch(
+    params, memory_node, request_shards + qp_index,
+    remote_offsets + qp_index, 1,
+    destinations + static_cast<size_t>(qp_index) * destination_stride,
+    destination_stride, sizeof(u64), lane,
+    local_iova_offsets + qp_index, completion_status, false,
+    phases + qp_index);
+  statuses[qp_index] = status;
+  if (status == 0) atomicAdd(completed, 1u);
+  __threadfence_system();
+  phases[qp_index] = 4;
+  __threadfence_system();
+}
+
 __global__ void gather_anchor_codes_kernel(const u8* base_codes,
                                            const u32* anchor_handles,
                                            u8* anchor_codes,
@@ -2994,6 +3337,18 @@ void launch_direct_read_owners(cudaStream_t stream,
   const u32 warps_per_block = max(1u, threads / 32);
   const u32 blocks = (queue_count + warps_per_block - 1) / warps_per_block;
   direct_read_owner_kernel<<<blocks, threads, 0, stream>>>(params, queue_count);
+}
+
+void launch_gpunetio_owner_read_probe(
+    cudaStream_t stream, const PersistentKernelParams& params,
+    u32* request_shards, u64* remote_offsets, u64* local_iova_offsets,
+    u8* destinations, u32 destination_stride, i32* statuses,
+    u32* completed, u32* phases, u32 queue_count) {
+  constexpr u32 threads = 128;
+  const u32 blocks = (queue_count + threads - 1) / threads;
+  gpunetio_owner_read_probe_kernel<<<blocks, threads, 0, stream>>>(
+    params, request_shards, remote_offsets, local_iova_offsets,
+    destinations, destination_stride, statuses, completed, phases, queue_count);
 }
 
 void launch_gather_anchor_codes(cudaStream_t stream, const u8* base_codes,

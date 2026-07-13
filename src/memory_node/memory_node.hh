@@ -434,6 +434,7 @@ private:
   HugePage<byte_t> peer_scratch_buffer_;
   std::unique_ptr<LocalMemoryRegion> peer_scratch_region_;
   PeerRpcRuntimeState peer_rpc_runtime_;
+  std::unordered_set<u64> peer_rpc_pending_responses_;
   std::unordered_map<u64, service::storage_owner::PeerRpcHeader> peer_rpc_responses_;
   std::unordered_map<u64, vec<byte_t>> peer_rpc_response_payloads_;
   std::mutex peer_rpc_mutex_;

@@ -920,6 +920,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     root["gpu_persistent"] = {
       {"gpu_memory_explicit_bytes", telemetry.gpu_memory_explicit_bytes},
       {"gpu_memory_base_pq_bytes", telemetry.gpu_memory_base_pq_bytes},
+      {"gpu_memory_resident_pq_bytes", telemetry.gpu_memory_resident_pq_bytes},
       {"gpu_memory_route_graph_bytes", telemetry.gpu_memory_route_graph_bytes},
       {"gpu_memory_delta_reserved_bytes", telemetry.gpu_memory_delta_reserved_bytes},
       {"gpu_memory_graph_cache_bytes", telemetry.gpu_memory_graph_cache_bytes},
@@ -998,6 +999,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       {"delta_physical_entries", telemetry.delta_physical_entries},
       {"delta_mutable_entries", telemetry.delta_mutable_entries},
       {"delta_durable_entries", telemetry.delta_durable_entries},
+      {"resident_pq_capacity", telemetry.resident_pq_capacity},
+      {"resident_pq_entries", telemetry.resident_pq_entries},
+      {"resident_pq_peak_entries", telemetry.resident_pq_peak_entries},
+      {"resident_pq_reclaimed", telemetry.resident_pq_reclaimed},
       {"mutation_capacity_rejections", telemetry.mutation_capacity_rejections},
       {"mutation_capacity_reserved", telemetry.mutation_capacity_reserved},
       {"mutation_capacity_reserved_max", telemetry.mutation_capacity_reserved_max},
@@ -1220,9 +1225,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     const auto& gpu = root["gpu_persistent"];
     text_summary << "gpu_persistent\n";
     constexpr double bytes_per_gib = 1024.0 * 1024.0 * 1024.0;
-    text_summary << "  GPU memory explicit/base_pq/route/delta/graph_cache/exact_cache GiB: "
+    text_summary << "  GPU memory explicit/base_pq/resident_pq/route/delta/graph_cache/exact_cache GiB: "
                  << static_cast<double>(gpu.value("gpu_memory_explicit_bytes", 0ULL)) / bytes_per_gib << "/"
                  << static_cast<double>(gpu.value("gpu_memory_base_pq_bytes", 0ULL)) / bytes_per_gib << "/"
+                 << static_cast<double>(gpu.value("gpu_memory_resident_pq_bytes", 0ULL)) / bytes_per_gib << "/"
                  << static_cast<double>(gpu.value("gpu_memory_route_graph_bytes", 0ULL)) / bytes_per_gib << "/"
                  << static_cast<double>(gpu.value("gpu_memory_delta_reserved_bytes", 0ULL)) / bytes_per_gib << "/"
                  << static_cast<double>(gpu.value("gpu_memory_graph_cache_bytes", 0ULL)) / bytes_per_gib << "/"
@@ -1258,6 +1264,11 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                  << gpu.value("delta_physical_entries", 0ULL) << "/"
                  << gpu.value("delta_mutable_entries", 0ULL) << "/"
                  << gpu.value("delta_durable_entries", 0ULL) << '\n';
+    text_summary << "  resident PQ current/peak/capacity/reclaimed: "
+                 << gpu.value("resident_pq_entries", 0ULL) << "/"
+                 << gpu.value("resident_pq_peak_entries", 0ULL) << "/"
+                 << gpu.value("resident_pq_capacity", 0ULL) << "/"
+                 << gpu.value("resident_pq_reclaimed", 0ULL) << '\n';
     text_summary << "  mutation capacity rejected/current/peak: "
                  << gpu.value("mutation_capacity_rejections", 0ULL) << "/"
                  << gpu.value("mutation_capacity_reserved", 0ULL) << "/"

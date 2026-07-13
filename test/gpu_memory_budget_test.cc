@@ -98,6 +98,24 @@ int main() {
   assert(no_cache_1b.cache_total_bytes == 0);
   assert(no_cache_1b.explicit_bytes < bounded_1b.explicit_bytes);
 
+  const u64 resident_pq_budget = gib(4);
+  const u32 resident_pq32_capacity =
+    gpu_search::memory_budget::choose_resident_pq_capacity(
+      resident_pq_budget, 1'000'000'000, 32);
+  const u32 resident_pq16_capacity =
+    gpu_search::memory_budget::choose_resident_pq_capacity(
+      resident_pq_budget, 1'000'000'000, 16);
+  assert(resident_pq32_capacity > 50'000'000);
+  assert(resident_pq16_capacity >= resident_pq32_capacity);
+  assert(gpu_search::memory_budget::resident_pq_footprint(
+           resident_pq32_capacity, 16) <
+         gpu_search::memory_budget::resident_pq_footprint(
+           resident_pq32_capacity, 32));
+  assert(gpu_search::memory_budget::resident_pq_footprint(
+           resident_pq32_capacity, 32) <= resident_pq_budget);
+  assert(gpu_search::memory_budget::resident_pq_footprint(
+           resident_pq32_capacity + 1, 32) > resident_pq_budget);
+
   const u64 pq_model_bytes =
     (128ull * 128 + 128ull * 256) * sizeof(f32);
   const u64 compute_local_files = pq_model_bytes;

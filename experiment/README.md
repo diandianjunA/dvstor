@@ -15,6 +15,7 @@ export INDEX_DIR=/data/xjs/index/dvstor_sift100m/index
 export GPU_DEVICE=1
 export GPU_MEMORY_LIMIT_GB=40
 export GPU_MEMORY_RESERVE_GB=4
+export GPU_RESIDENT_PQ_BUDGET_MB=4096
 ```
 
 旧索引只在迁移命令中通过 `SOURCE_PREFIX` 显式指定；运行 profile 只维护当前
@@ -122,6 +123,13 @@ schema-15 存储控制区使用版本 2：每个计算节点拥有独立 reclaim
 维护完成、可见性窗口结束且旧查询 RCU 屏障退出后，upsert/delete 留下的动态
 死槽才可复用。升级后必须重新编译并重启全部计算、存储节点；PQ code 无需重编码。
 
+新插入或 upsert 产生的 PQ code 在发布时由 GPU 编码一次，并进入独立的常驻
+dynamic-PQ 层。短期 L0 中的原始向量和可变图记录退休后，该 PQ code 仍留在
+GPU，查询导航不会退化为逐 code RDMA。只有对应版本被 upsert/delete 淘汰、旧查询
+RCU 屏障退出后才回收常驻槽；存储 reclaim ACK 又晚于该回收，因此远端地址不会在
+GPU 映射仍可见时被复用。容量由 `GPU_RESIDENT_PQ_BUDGET_MB` 显式限制，报告中的
+`resident_pq_entries/peak/capacity/reclaimed` 用于观察长期运行水位。
+
 ## 召回率与性能
 
 测试负载参数不放在索引/系统 profile 中。`BENCHMARK_CLIENT_THREADS`、
@@ -131,13 +139,13 @@ schema-15 存储控制区使用版本 2：每个计算节点拥有独立 reclaim
 
 `query.u8bin` 的 10K 标准查询仅供 recall 使用。性能阶段由
 `PERFORMANCE_QUERY_FILE` 提供独立查询流，warmup 与 measure 共用一个单遍游标，
-同一行不会再次执行；查询池耗尽时 benchmark 会失败而不是取模回绕。默认从
-`bigann_base.bvecs` 提取两个不重叠的半开区间：性能查询使用 `[100M,103M)` 的
-300 万行，插入使用 `[103M,105M)` 的 200 万行。生成文件默认位于
+同一行不会再次执行；查询池耗尽时 benchmark 会失败而不是取模回绕。当前默认
+性能查询池为 `[100M,105M)` 的 500 万行，插入向量池为 `[103M,105M)` 的
+200 万行。生成文件默认位于
 `/data/xjs/datasets/sift1b`：
 
 ```text
-sift100m_to_103m_query.u8bin
+sift100m_to_105m_query.u8bin
 sift103m_to_105m_insert.u8bin
 ```
 

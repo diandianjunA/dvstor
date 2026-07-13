@@ -9,6 +9,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <queue>
 #include <shared_mutex>
 #include <span>
 #include <unordered_map>
@@ -80,9 +81,32 @@ public:
   void mark_compacted();
 
 private:
+  struct DurableCandidate {
+    u64 maintenance_sequence{};
+    u64 epoch{};
+    node_t id{};
+    u32 generation{};
+  };
+
+  struct DurableCandidateGreater {
+    bool operator()(const DurableCandidate& lhs,
+                    const DurableCandidate& rhs) const {
+      if (lhs.maintenance_sequence != rhs.maintenance_sequence) {
+        return lhs.maintenance_sequence > rhs.maintenance_sequence;
+      }
+      if (lhs.epoch != rhs.epoch) return lhs.epoch > rhs.epoch;
+      return lhs.id > rhs.id;
+    }
+  };
+
+  using DurableQueue = std::priority_queue<
+    DurableCandidate, std::vector<DurableCandidate>, DurableCandidateGreater>;
+
   mutable std::shared_mutex state_mutex_;
   std::unordered_map<node_t, DeltaMutation> delta_;
   std::unordered_map<node_t, VersionEntry> versions_;
+  std::vector<DurableQueue> durable_candidates_;
+  size_t durable_owner_cursor_{};
   u64 base_generation_{1};
   std::atomic<u64> next_epoch_{1};
   std::atomic<u64> published_epoch_{0};

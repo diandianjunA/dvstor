@@ -57,7 +57,8 @@ size_t ComputeService::insert(const vec<InsertItem>& batch) {
     for (const auto& sample : samples) {
       if (sample && sample->finished_flag) {
         std::lock_guard<std::mutex> lock(breakdown_mutex_);
-        completed_insert_samples_.push_back(*sample);
+        service::breakdown::add_sample(
+          completed_breakdown_report_.insert, *sample);
       }
     }
     vectors_inserted_.fetch_add(inserted, std::memory_order_relaxed);
@@ -260,14 +261,23 @@ void ComputeService::stop_storage_insert_runtime() {
     storage_insert_completion_thread_.join();
   }
 
+}
+
+void ComputeService::release_storage_insert_runtime() {
   for (auto& state : storage_insert_owners_) {
     if (!state) {
       continue;
     }
     std::lock_guard<std::mutex> lock(state->mutex);
     for (auto& slot : state->slots) {
-      slot = StorageOwnerRpcSlot{};
+      slot.request_region.reset();
+      slot.response_region.reset();
     }
+    for (auto& response_slot : state->response_slots) {
+      response_slot.region.reset();
+    }
+    state->slots.clear();
+    state->response_slots.clear();
     state->batch_to_slot.clear();
     state->free_slots.clear();
   }

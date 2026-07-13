@@ -87,6 +87,28 @@ inline u32 choose_delta_capacity(u64 budget, u64 max_vectors,
   return delta_footprint(low, vector_bytes, code_bytes) <= budget ? low : 0;
 }
 
+inline u64 resident_pq_footprint(u32 capacity, u32 code_bytes) {
+  if (capacity == 0 || code_bytes == 0) return 0;
+  const u32 table_capacity = next_power_of_two(static_cast<u64>(capacity) * 2);
+  return static_cast<u64>(capacity) * (code_bytes + sizeof(u32)) +
+    static_cast<u64>(table_capacity) * (sizeof(u64) + sizeof(u32));
+}
+
+inline u32 choose_resident_pq_capacity(u64 budget, u64 max_vectors,
+                                       u32 code_bytes) {
+  if (budget == 0 || max_vectors == 0 || code_bytes == 0) return 0;
+  u32 low = 1;
+  u32 high = static_cast<u32>(std::min<u64>(
+    std::min<u64>(max_vectors, kDeltaHandleMask), budget / code_bytes));
+  if (high == 0) return 0;
+  while (low < high) {
+    const u32 middle = low + (high - low + 1) / 2;
+    if (resident_pq_footprint(middle, code_bytes) <= budget) low = middle;
+    else high = middle - 1;
+  }
+  return resident_pq_footprint(low, code_bytes) <= budget ? low : 0;
+}
+
 inline Result estimate(const Request& request) {
   Result result;
   if (request.nodes == 0 || request.nodes >= (1ull << 30) || request.dim == 0 ||

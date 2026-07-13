@@ -217,6 +217,9 @@ service::storage_owner::MutationStatus MemoryNode::prepare_mutation(
   const bool live = exists && !it->second.deleted;
   if (old_entry != nullptr) {
     *old_entry = exists ? it->second : FreshnessEntry{};
+    if (old_entry->deleted) {
+      old_entry->current = RemotePtr{};
+    }
   }
   const u32 previous_generation = exists ? it->second.generation : 0;
   if (new_generation != nullptr) {
