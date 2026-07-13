@@ -4,14 +4,17 @@
 import argparse
 import os
 import struct
+import sys
 from pathlib import Path
 
-try:
-    import numpy as np
-except ImportError as exc:
-    raise SystemExit(
-        "prepare_sift_benchmark_data.py requires numpy for practical SIFT1B extraction"
-    ) from exc
+def require_numpy():
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError(
+            "numpy is required only when benchmark data must be generated"
+        ) from exc
+    return np
 
 
 def infer_bvecs(path: Path) -> tuple[int, int]:
@@ -33,12 +36,14 @@ def infer_bvecs(path: Path) -> tuple[int, int]:
     return dim, size // record_bytes
 
 
-def validate_range(label: str, start: int, end: int, available_rows: int) -> None:
+def validate_range(
+    label: str, start: int, end: int, available_rows: int | None = None
+) -> None:
     if start < 0 or end <= start:
         raise RuntimeError(
             f"invalid {label} range [{start}, {end}); expected 0 <= start < end"
         )
-    if end > available_rows:
+    if available_rows is not None and end > available_rows:
         raise RuntimeError(
             f"{label} range [{start}, {end}) exceeds source row count {available_rows}"
         )
@@ -57,7 +62,8 @@ def existing_u8bin_matches(path: Path, rows: int, dim: int) -> bool:
 
 def extract_bvecs_range(
     source: Path,
-    data: np.memmap,
+    data,
+    numpy,
     destination: Path,
     start: int,
     end: int,
@@ -91,10 +97,10 @@ def extract_bvecs_range(
             while done < end:
                 chunk_end = min(done + chunk_rows, end)
                 dims = data["dim"][done:chunk_end]
-                if not np.all(dims == dim):
-                    bad = done + int(np.nonzero(dims != dim)[0][0])
+                if not numpy.all(dims == dim):
+                    bad = done + int(numpy.nonzero(dims != dim)[0][0])
                     raise RuntimeError(f"inconsistent bvecs dim at source row {bad}")
-                vectors = np.ascontiguousarray(data["vec"][done:chunk_end])
+                vectors = numpy.ascontiguousarray(data["vec"][done:chunk_end])
                 output.write(vectors.tobytes(order="C"))
                 done = chunk_end
                 print(
@@ -129,12 +135,15 @@ def main() -> None:
     parser.add_argument("--insert-output", required=True)
     parser.add_argument("--insert-start", type=int, default=103_000_000)
     parser.add_argument("--insert-end", type=int, default=105_000_000)
+    parser.add_argument("--dim", type=int, default=128)
     parser.add_argument("--chunk-rows", type=int, default=1_000_000)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
     if args.chunk_rows <= 0:
         raise RuntimeError("--chunk-rows must be > 0")
+    if args.dim <= 0:
+        raise RuntimeError("--dim must be > 0")
 
     source = Path(args.source)
     query_output = Path(args.query_output)
@@ -142,9 +151,8 @@ def main() -> None:
     if query_output.resolve() == insert_output.resolve():
         raise RuntimeError("query and insert outputs must be different files")
 
-    dim, source_rows = infer_bvecs(source)
-    validate_range("query", args.query_start, args.query_end, source_rows)
-    validate_range("insert", args.insert_start, args.insert_end, source_rows)
+    validate_range("query", args.query_start, args.query_end)
+    validate_range("insert", args.insert_start, args.insert_end)
     if max(args.query_start, args.insert_start) < min(args.query_end, args.insert_end):
         raise RuntimeError(
             "query and insert source ranges overlap: "
@@ -152,11 +160,60 @@ def main() -> None:
             f"[{args.insert_start}, {args.insert_end})"
         )
 
+    outputs = (
+        ("query", query_output, args.query_start, args.query_end),
+        ("insert", insert_output, args.insert_start, args.insert_end),
+    )
+    ready = {
+        label: existing_u8bin_matches(path, end - start, args.dim)
+        for label, path, start, end in outputs
+    }
+    if not args.overwrite:
+        invalid = [
+            str(path)
+            for label, path, _, _ in outputs
+            if path.exists() and not ready[label]
+        ]
+        if invalid:
+            raise RuntimeError(
+                "existing output has an unexpected header or size: "
+                + ", ".join(invalid)
+            )
+        if all(ready.values()):
+            for label, path, start, end in outputs:
+                print(
+                    f"[benchmark-data] exists: {path} "
+                    f"source_rows=[{start},{end}) rows={end - start} dim={args.dim}"
+                )
+            print("[benchmark-data] all outputs validated; source bvecs is not required")
+            return
+
+    if not source.is_file():
+        pending = [
+            label
+            for label, _, _, _ in outputs
+            if args.overwrite or not ready[label]
+        ]
+        pending_text = ", ".join(pending)
+        raise RuntimeError(
+            f"source bvecs is required to generate {pending_text} data but was not found: "
+            f"{source}. Copy the pre-generated u8bin files to the configured output paths "
+            "or provide --source on a data-preparation node"
+        )
+
+    dim, source_rows = infer_bvecs(source)
+    if dim != args.dim:
+        raise RuntimeError(f"source dim {dim} does not match expected dim {args.dim}")
+    validate_range("query", args.query_start, args.query_end, source_rows)
+    validate_range("insert", args.insert_start, args.insert_end, source_rows)
+
+    np = require_numpy()
     dtype = np.dtype([("dim", "<i4"), ("vec", "u1", (dim,))])
     data = np.memmap(source, dtype=dtype, mode="r", shape=(source_rows,))
     extract_bvecs_range(
         source,
         data,
+        np,
         query_output,
         args.query_start,
         args.query_end,
@@ -167,6 +224,7 @@ def main() -> None:
     extract_bvecs_range(
         source,
         data,
+        np,
         insert_output,
         args.insert_start,
         args.insert_end,
@@ -177,4 +235,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as error:
+        print(f"prepare_sift_benchmark_data.py: error: {error}", file=sys.stderr)
+        raise SystemExit(1) from None

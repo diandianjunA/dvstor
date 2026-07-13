@@ -37,6 +37,7 @@ if [[ "$PREPARE_BENCHMARK_DATA" == "1" ]]; then
     --insert-output "$(insert_bin)"
     --insert-start "$INSERT_VECTOR_START"
     --insert-end "$INSERT_VECTOR_END"
+    --dim "$DIM"
     --chunk-rows "${BENCHMARK_CONVERT_CHUNK_ROWS:-1000000}")
   if [[ "${OVERWRITE_BENCHMARK_DATA:-0}" == "1" ]]; then
     benchmark_args+=(--overwrite)

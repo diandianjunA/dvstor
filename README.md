@@ -159,6 +159,7 @@ Benchmark 并发使用独立的 `BENCHMARK_CLIENT_THREADS`，不写入索引/系
 `PERFORMANCE_QUERY_FILE`，并从 warmup 到 measure 单遍消费；文件耗尽会直接失败，
 不会回绕重复。默认性能查询集是 `bigann_base.bvecs` 的 `[100M,103M)`，插入集是
 不重叠的 `[103M,105M)`；生成的 `.u8bin` 文件位于 SIFT1B 数据集目录。
+计算节点只需这两份生成文件，不需要完整的 `bigann_base.bvecs`。
 
 分布式部署时，每台存储节点只需其自身的 `.dat`、`.idmap`、`.pq32.codes`，
 再加共享 metadata 与 anchors。详细流程见 `experiment/README.md`。

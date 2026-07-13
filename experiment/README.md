@@ -127,7 +127,9 @@ sift103m_to_105m_insert.u8bin
 ```
 
 `prepare_sift100m_data.sh` 会按需生成并校验这两个文件；已有且头部、大小正确时会
-直接复用。可通过 `PERFORMANCE_QUERY_FILE`、`INSERT_FILE` 覆盖路径，或用以下变量
+直接复用，此时计算节点不需要 `bigann_base.bvecs`。只有文件缺失或设置
+`OVERWRITE_BENCHMARK_DATA=1` 时才需要完整源数据。可通过
+`PERFORMANCE_QUERY_FILE`、`INSERT_FILE` 覆盖路径，或用以下变量
 调整源区间：`PERFORMANCE_QUERY_START`、`PERFORMANCE_QUERY_END`、
 `INSERT_VECTOR_START`、`INSERT_VECTOR_END`。例如：
 
