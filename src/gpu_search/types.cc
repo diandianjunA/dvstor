@@ -39,7 +39,7 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .delta_queries = delta_queries.load(std::memory_order_relaxed),
     .mutations_published = mutations_published.load(std::memory_order_relaxed),
     .delta_publications = delta_publications.load(std::memory_order_relaxed),
-    .delta_compactions = delta_compactions.load(std::memory_order_relaxed),
+    .delta_reclaim_batches = delta_reclaim_batches.load(std::memory_order_relaxed),
     .delta_entries_retired = delta_entries_retired.load(std::memory_order_relaxed),
     .storage_reclaim_ack_writes = storage_reclaim_ack_writes.load(std::memory_order_relaxed),
     .storage_reclaim_ack_sequence = storage_reclaim_ack_sequence.load(std::memory_order_relaxed),
@@ -90,7 +90,7 @@ void Telemetry::reset() {
   delta_queries.store(0, std::memory_order_relaxed);
   mutations_published.store(0, std::memory_order_relaxed);
   delta_publications.store(0, std::memory_order_relaxed);
-  delta_compactions.store(0, std::memory_order_relaxed);
+  delta_reclaim_batches.store(0, std::memory_order_relaxed);
   delta_entries_retired.store(0, std::memory_order_relaxed);
   storage_reclaim_ack_writes.store(0, std::memory_order_relaxed);
   delta_live_entries.store(0, std::memory_order_relaxed);

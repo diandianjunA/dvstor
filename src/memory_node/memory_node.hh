@@ -106,6 +106,11 @@ private:
   using StorageOwnerInsertJob = memory_node_detail::StorageOwnerInsertJob;
   using FreshnessEntry = memory_node_detail::FreshnessEntry;
 
+  struct GlobalMedoidReadAwaitable;
+  struct NodeSnapshotReadAwaitable;
+  struct NodeSnapshotsReadAwaitable;
+  struct NeighborListReadAwaitable;
+
   static constexpr u32 kPeerSyncWrOwner = std::numeric_limits<u32>::max();
   static constexpr u32 kPeerAsyncWrOwner = std::numeric_limits<u32>::max() - 1;
   static constexpr u32 kPeerSafeRdAtomic = 8;
@@ -328,17 +333,20 @@ private:
                                                           u32* new_generation);
   void publish_mutation(node_t id, RemotePtr ptr, u32 generation, bool deleted);
   RemotePtr read_global_medoid();
-  auto async_read_global_medoid(StorageOwnerThread& thread);
+  GlobalMedoidReadAwaitable async_read_global_medoid(StorageOwnerThread& thread);
   void write_global_medoid(const RemotePtr& medoid);
   bool try_set_global_medoid(const RemotePtr& expected, const RemotePtr& desired, RemotePtr& observed);
   bool read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot);
   vec<RemotePtr> read_neighbor_list(RemotePtr rptr);
-  auto async_read_node_snapshot(RemotePtr rptr, StorageOwnerThread& thread);
-  auto async_read_node_snapshots(const vec<RemotePtr>& rptrs,
-                                 const Configuration& config,
-                                 StorageOwnerThread& thread);
+  NodeSnapshotReadAwaitable async_read_node_snapshot(
+    RemotePtr rptr, StorageOwnerThread& thread);
+  NodeSnapshotsReadAwaitable async_read_node_snapshots(
+    const vec<RemotePtr>& rptrs,
+    const Configuration& config,
+    StorageOwnerThread& thread);
   vec<NodeSnapshot> read_node_snapshots_batched(const vec<RemotePtr>& rptrs, const Configuration& config);
-  auto async_read_neighbor_list(RemotePtr rptr, StorageOwnerThread& thread);
+  NeighborListReadAwaitable async_read_neighbor_list(
+    RemotePtr rptr, StorageOwnerThread& thread);
   void write_hot_graph_entry(RemotePtr rptr, const vec<RemotePtr>& neighbors);
   void write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neighbors);
   void write_dynamic_navigation_code(RemotePtr rptr,

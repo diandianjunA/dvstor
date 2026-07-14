@@ -96,7 +96,10 @@ int main(int argc, char** argv) {
   check_cuda("cudaStreamCreate", cudaStreamCreate(&stream));
   gpu_search::PersistentKernelParams probe_params{
     .submissions = {},
+    .device_submissions = {},
     .completions = {},
+    .delta_submissions = {},
+    .delta_completions = {},
     .direct_region_count = view.remote_region_count,
     .direct_qps_per_node = view.qps_per_node,
     .direct_local_mkey = view.local_mkey,

@@ -128,7 +128,7 @@ struct TelemetrySnapshot {
   u64 delta_queries{};
   u64 mutations_published{};
   u64 delta_publications{};
-  u64 delta_compactions{};
+  u64 delta_reclaim_batches{};
   u64 delta_entries_retired{};
   u64 storage_reclaim_ack_writes{};
   u64 storage_reclaim_ack_sequence{};
@@ -189,7 +189,7 @@ public:
   std::atomic<u64> delta_queries{0};
   std::atomic<u64> mutations_published{0};
   std::atomic<u64> delta_publications{0};
-  std::atomic<u64> delta_compactions{0};
+  std::atomic<u64> delta_reclaim_batches{0};
   std::atomic<u64> delta_entries_retired{0};
   std::atomic<u64> storage_reclaim_ack_writes{0};
   std::atomic<u64> storage_reclaim_ack_sequence{0};

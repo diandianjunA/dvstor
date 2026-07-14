@@ -127,6 +127,11 @@ set(DVSTOR_PQ_INDEXER_SOURCES
     tools/vamana_offline/pq_indexer.cc
 )
 
+set(DVSTOR_BREAKDOWN_SUPPORT_SOURCES
+    tools/breakdown_benchmark/dataset.cc
+    tools/breakdown_benchmark/report.cc
+)
+
 set(DVSTOR_BREAKDOWN_BENCHMARK_SOURCES
     tools/breakdown_benchmark/args.cc
     tools/breakdown_benchmark/progress.cc
@@ -285,6 +290,12 @@ else ()
     endif ()
     target_compile_options(dvstor_runtime PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-fcoroutines>)
 
+    if (DVSTOR_BUILD_EXECUTABLES OR DVSTOR_BUILD_TESTS)
+        add_library(dvstor_breakdown_support STATIC ${DVSTOR_BREAKDOWN_SUPPORT_SOURCES})
+        dvstor_target_tool_includes(dvstor_breakdown_support)
+        target_link_libraries(dvstor_breakdown_support PUBLIC dvstor_runtime)
+    endif ()
+
     add_executable(dvstor_memory_node
         src/memory_node_main.cc
         ${DVSTOR_MEMORY_NODE_SOURCES}
@@ -327,7 +338,7 @@ else ()
             ${DVSTOR_BREAKDOWN_BENCHMARK_SOURCES}
         )
         dvstor_target_tool_includes(dvstor_breakdown_benchmark)
-        target_link_libraries(dvstor_breakdown_benchmark dvstor_runtime)
+        target_link_libraries(dvstor_breakdown_benchmark dvstor_breakdown_support)
 
         add_executable(dvstor_sift101m_long_insert_recall
             tools/dvstor_sift101m_long_insert_recall.cc

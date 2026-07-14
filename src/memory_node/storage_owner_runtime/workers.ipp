@@ -1,0 +1,157 @@
+void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsertTask>& tasks) {
+  if (tasks.empty()) {
+    return;
+  }
+
+  const Configuration& config = *storage_worker_config_;
+  vec<node_t> batch_ids;
+  vec<service::storage_owner::MutationKind> batch_kinds;
+  vec<element_t> batch_vectors;
+  vec<u64> batch_anchor_hints;
+  const u32 expected_anchor_hint_count = storage_owner_local_stitch_mode(config)
+                                           ? config.storage_owner_anchor_hints : 0;
+  vec<u32> item_counts;
+  vec<u32> response_magics;
+  batch_ids.reserve(std::max<u32>(config.storage_owner_batch_max, 64));
+  batch_kinds.reserve(std::max<u32>(config.storage_owner_batch_max, 64));
+  batch_vectors.reserve(static_cast<size_t>(std::max<u32>(config.storage_owner_batch_max, 64)) * config.dim);
+  item_counts.reserve(tasks.size());
+  response_magics.reserve(tasks.size());
+
+  for (const auto& task : tasks) {
+    const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(task.payload.data());
+    const bool mutation = request->magic == service::storage_owner::kMutationMagic;
+    const node_t* ids = mutation
+      ? service::storage_owner::mutation_request_ids(task.payload.data())
+      : service::storage_owner::request_ids(task.payload.data());
+    const byte_t* vectors = mutation
+      ? service::storage_owner::mutation_request_vectors(task.payload.data(), request->item_count)
+      : service::storage_owner::request_vectors(task.payload.data(), request->item_count);
+    const u32* kinds = mutation ? service::storage_owner::mutation_request_kinds(task.payload.data())
+                                : nullptr;
+    const u64* hints = mutation
+      ? service::storage_owner::mutation_request_anchor_hints(task.payload.data(), request->item_count)
+      : service::storage_owner::request_anchor_hints(task.payload.data(), request->item_count);
+    item_counts.push_back(request->item_count);
+    response_magics.push_back(request->magic);
+    batch_ids.insert(batch_ids.end(), ids, ids + request->item_count);
+    for (u32 i = 0; i < request->item_count; ++i) {
+      batch_kinds.push_back(kinds == nullptr
+        ? service::storage_owner::MutationKind::insert
+        : static_cast<service::storage_owner::MutationKind>(kinds[i]));
+    }
+    const size_t kind_base = batch_kinds.size() - request->item_count;
+    for (u32 i = 0; i < request->item_count; ++i) {
+      for (u32 hint = 0; hint < request->anchor_hint_count; ++hint) {
+        batch_anchor_hints.push_back(hints[static_cast<size_t>(i) * request->anchor_hint_count + hint]);
+      }
+    }
+    const size_t old_size = batch_vectors.size();
+    batch_vectors.resize(old_size + static_cast<size_t>(request->item_count) * config.dim);
+    for (u32 i = 0; i < request->item_count; ++i) {
+      if (batch_kinds[kind_base + i] == service::storage_owner::MutationKind::erase) continue;
+      decode_storage_vector_to_float(vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes(),
+                                     VamanaNode::vector_dtype(),
+                                     config.dim,
+                                     batch_vectors.data() + old_size + static_cast<size_t>(i) * config.dim);
+    }
+  }
+
+  InsertBreakdownCounters breakdown{};
+  const auto process_started = std::chrono::steady_clock::now();
+  for (const auto& task : tasks) {
+    breakdown.storage_owner_queue_wait_ns += static_cast<u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(process_started - task.received_at).count());
+  }
+
+  vec<vec<u64>> invalidated_neighbors;
+  vec<u32> statuses(batch_ids.size(), static_cast<u32>(service::storage_owner::MutationStatus::failed));
+  vec<service::storage_owner::MutationResult> mutation_results(batch_ids.size());
+  const bool use_sync_local_stitch =
+    storage_owner_batch_prefers_sync_local_stitch(config,
+                                                  batch_kinds,
+                                                  batch_anchor_hints,
+                                                  expected_anchor_hint_count,
+                                                  batch_ids.size());
+  const bool ok = current_storage_owner_thread_ != nullptr && !use_sync_local_stitch
+                    ? execute_storage_owner_batch_items_async(batch_ids.data(),
+                                                               batch_kinds.data(),
+                                                               batch_vectors.data(),
+                                                               batch_anchor_hints.empty() ? nullptr : batch_anchor_hints.data(),
+                                                               expected_anchor_hint_count,
+                                                               batch_ids.size(),
+                                                               *current_storage_owner_thread_,
+                                                               breakdown,
+                                                               config,
+                                                               &invalidated_neighbors,
+                                                               &statuses,
+                                                               &mutation_results)
+                    : execute_storage_owner_batch_items(batch_ids.data(),
+                                                        batch_kinds.data(),
+                                                        batch_vectors.data(),
+                                                        batch_anchor_hints.empty() ? nullptr : batch_anchor_hints.data(),
+                                                        expected_anchor_hint_count,
+                                                        batch_ids.size(),
+                                                        breakdown,
+                                                        config,
+                                                        &invalidated_neighbors,
+                                                        &statuses,
+                                                        &mutation_results);
+  size_t status_base = 0;
+  for (size_t task_idx = 0; task_idx < tasks.size(); ++task_idx) {
+    const auto& task = tasks[task_idx];
+    const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(task.payload.data());
+    const u32 item_count = item_counts[task_idx];
+    const size_t response_size = service::storage_owner::insert_batch_response_bytes(item_count);
+    lib_assert(response_size <= std::numeric_limits<u32>::max(),
+               "storage_owner async response is too large for verbs SGEs");
+    vec<byte_t> response_buffer(response_size);
+    auto* response = reinterpret_cast<service::storage_owner::InsertBatchResponseHeader*>(response_buffer.data());
+    response->magic = response_magics[task_idx];
+    response->owner_storage = storage_id_;
+    response->item_count = item_count;
+    response->batch_id = request->batch_id;
+    u32* response_statuses = service::storage_owner::response_statuses(response_buffer.data());
+    for (u32 i = 0; i < item_count; ++i) {
+      response_statuses[i] = ok ? statuses[status_base + i]
+                                : static_cast<u32>(service::storage_owner::MutationStatus::failed);
+    }
+    auto* response_results = service::storage_owner::response_mutation_results(
+      response_buffer.data(), item_count);
+    for (u32 i = 0; i < item_count; ++i) {
+      response_results[i] = ok ? mutation_results[status_base + i]
+                               : service::storage_owner::MutationResult{};
+    }
+    *service::storage_owner::response_breakdown(response_buffer.data(), item_count) =
+      scale_breakdown(breakdown, item_count, static_cast<u32>(std::max<size_t>(1, batch_ids.size())));
+    const u32 invalidation_capacity = service::storage_owner::response_invalidation_capacity(item_count);
+    vec<u64> task_invalidations;
+    task_invalidations.reserve(invalidation_capacity);
+    for (u32 item = 0; item < item_count; ++item) {
+      const auto& item_invalidations = invalidated_neighbors[status_base + item];
+      task_invalidations.insert(task_invalidations.end(),
+                                item_invalidations.begin(), item_invalidations.end());
+    }
+    std::sort(task_invalidations.begin(), task_invalidations.end());
+    task_invalidations.erase(
+      std::unique(task_invalidations.begin(), task_invalidations.end()),
+      task_invalidations.end());
+    lib_assert(task_invalidations.size() <= invalidation_capacity,
+               "storage_owner async invalidation response exceeds its capacity");
+    const u32 invalidation_count = static_cast<u32>(task_invalidations.size());
+    *service::storage_owner::response_invalidation_count(response_buffer.data(), item_count) = invalidation_count;
+    u64* invalidated = service::storage_owner::response_invalidated_raws(response_buffer.data(), item_count);
+    for (u32 i = 0; i < invalidation_count; ++i) {
+      invalidated[i] = task_invalidations[i];
+    }
+    status_base += item_count;
+
+    LocalMemoryRegion response_region{context_, response_buffer.data(), response_buffer.size()};
+    {
+      std::lock_guard<std::mutex> lock(storage_send_mutex_);
+      cm_.client_qps[task.client_id]->post_send(
+        response_region, static_cast<u32>(response_size), IBV_WR_SEND, true, nullptr, 0, 0);
+      context_.poll_send_cq_until_completion();
+    }
+  }
+}

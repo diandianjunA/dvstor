@@ -8,22 +8,20 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
-#include <functional>
 #include <iostream>
 #include <limits>
 #include <mutex>
 #include <numeric>
-#include <optional>
 #include <random>
-#include <sstream>
 #include <stdexcept>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 
 #include "common/vector_dtype.hh"
 #include "service/breakdown.hh"
+#include "tools/breakdown_benchmark/dataset.hh"
 #include "tools/breakdown_benchmark/progress.hh"
+#include "tools/breakdown_benchmark/report.hh"
 #include "vamana/vamana_node.hh"
 
 namespace tools::breakdown_benchmark {
@@ -42,170 +40,8 @@ struct MixedPhaseStats {
   size_t completed_deletes{};
 };
 
-std::vector<float> make_deterministic_vector(uint32_t seed, size_t dim) {
-  std::vector<float> vector(dim, 0.0f);
-  uint64_t state = 1469598103934665603ull ^ static_cast<uint64_t>(seed);
-  for (size_t i = 0; i < dim; ++i) {
-    state ^= state >> 12;
-    state ^= state << 25;
-    state ^= state >> 27;
-    const uint32_t value = static_cast<uint32_t>((state * 2685821657736338717ull) >> 32);
-    vector[i] = static_cast<float>(value % 10000) / 10000.0f;
-  }
-  vector[seed % dim] += 4.0f;
-  vector[(seed * 17 + 3) % dim] += 1.0f;
-  return vector;
-}
-
-std::vector<float> make_dataset(const std::vector<uint32_t>& ids, size_t dim) {
-  std::vector<float> vectors;
-  vectors.reserve(ids.size() * dim);
-  for (uint32_t id : ids) {
-    auto vec = make_deterministic_vector(id, dim);
-    vectors.insert(vectors.end(), vec.begin(), vec.end());
-  }
-  return vectors;
-}
-
-struct VectorRows {
-  VectorDType dtype{VectorDType::float32};
-  uint32_t dim{};
-  size_t count{};
-  size_t vector_bytes{};
-  std::vector<byte_t> raw;
-  std::vector<float> decoded;
-
-  const byte_t* raw_row(size_t index) const {
-    return raw.data() + index * vector_bytes;
-  }
-};
-
-VectorRows read_vector_rows(const std::string& path, bool decode_rows) {
-  std::ifstream input(path, std::ios::binary);
-  if (!input) {
-    throw std::runtime_error("failed to open " + path);
-  }
-
-  uint32_t count = 0;
-  uint32_t dim = 0;
-  input.read(reinterpret_cast<char*>(&count), sizeof(count));
-  input.read(reinterpret_cast<char*>(&dim), sizeof(dim));
-  if (!input) {
-    throw std::runtime_error("failed to read vector file header: " + path);
-  }
-  if (count == 0 || dim == 0) {
-    throw std::runtime_error("vector file must contain at least one non-empty row: " + path);
-  }
-
-  VectorRows rows;
-  rows.dtype = resolve_vector_dtype_config("auto", filepath_t{path});
-  rows.dim = dim;
-  rows.count = count;
-  rows.vector_bytes = vector_dtype_bytes(rows.dtype, dim);
-  rows.raw.resize(static_cast<size_t>(count) * rows.vector_bytes);
-
-  input.read(reinterpret_cast<char*>(rows.raw.data()), static_cast<std::streamsize>(rows.raw.size()));
-  if (!input) {
-    throw std::runtime_error("failed to read vector payload: " + path);
-  }
-
-  if (decode_rows) {
-    rows.decoded.resize(static_cast<size_t>(count) * dim);
-    for (size_t row = 0; row < rows.count; ++row) {
-      decode_storage_vector_to_float(rows.raw_row(row), rows.dtype, rows.dim,
-                                     rows.decoded.data() + row * rows.dim);
-    }
-  }
-  return rows;
-}
-
-class SinglePassRowStream {
- public:
-  explicit SinglePassRowStream(size_t row_count) : row_count_(row_count) {}
-
-  std::optional<size_t> try_claim() {
-    if (exhausted_.load(std::memory_order_acquire)) {
-      return std::nullopt;
-    }
-    const size_t row = next_row_.fetch_add(1, std::memory_order_relaxed);
-    if (row >= row_count_) {
-      exhausted_.store(true, std::memory_order_release);
-      return std::nullopt;
-    }
-    return row;
-  }
-
-  bool exhausted() const {
-    return exhausted_.load(std::memory_order_acquire);
-  }
-
-  size_t consumed() const {
-    return std::min(next_row_.load(std::memory_order_relaxed), row_count_);
-  }
-
-  size_t capacity() const {
-    return row_count_;
-  }
-
- private:
-  size_t row_count_{};
-  std::atomic<size_t> next_row_{0};
-  std::atomic<bool> exhausted_{false};
-};
-
-struct GroundTruth {
-  uint32_t rows{};
-  uint32_t top_k{};
-  std::vector<uint32_t> ids;
-
-  const uint32_t* row(size_t index) const {
-    return ids.data() + index * top_k;
-  }
-};
-
-GroundTruth read_groundtruth_bin(const std::string& path) {
-  std::ifstream input(path, std::ios::binary);
-  if (!input) {
-    throw std::runtime_error("failed to open groundtruth file: " + path);
-  }
-
-  GroundTruth gt;
-  input.read(reinterpret_cast<char*>(&gt.rows), sizeof(gt.rows));
-  input.read(reinterpret_cast<char*>(&gt.top_k), sizeof(gt.top_k));
-  if (!input || gt.rows == 0 || gt.top_k == 0) {
-    throw std::runtime_error("failed to read groundtruth header: " + path);
-  }
-
-  gt.ids.resize(static_cast<size_t>(gt.rows) * gt.top_k);
-  input.read(reinterpret_cast<char*>(gt.ids.data()),
-             static_cast<std::streamsize>(gt.ids.size() * sizeof(uint32_t)));
-  if (!input) {
-    throw std::runtime_error("failed to read groundtruth ids: " + path);
-  }
-  return gt;
-}
-
-double recall_at(const std::vector<uint32_t>& results, const uint32_t* gt, uint32_t k) {
-  std::unordered_set<uint32_t> truth;
-  truth.reserve(k);
-  for (uint32_t i = 0; i < k; ++i) {
-    truth.insert(gt[i]);
-  }
-
-  uint32_t hits = 0;
-  const size_t result_count = std::min<size_t>(results.size(), k);
-  for (size_t i = 0; i < result_count; ++i) {
-    if (truth.find(results[i]) != truth.end()) {
-      ++hits;
-    }
-  }
-  return static_cast<double>(hits) / static_cast<double>(k);
-}
-
-
 nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   using SampleReport = service::breakdown::Report;
-  using service::breakdown::aggregate_text_summary;
   using service::breakdown::report_to_json;
 
   const bool use_insert_file = !args.insert_file.empty();
@@ -915,112 +751,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
 
   const SampleReport report = service.collect_breakdown_report();
   root.update(report_to_json(report));
-  {
-    const auto telemetry = service.gpu_search_telemetry();
-    root["gpu_persistent"] = {
-      {"gpu_memory_explicit_bytes", telemetry.gpu_memory_explicit_bytes},
-      {"gpu_memory_base_pq_bytes", telemetry.gpu_memory_base_pq_bytes},
-      {"gpu_memory_resident_pq_bytes", telemetry.gpu_memory_resident_pq_bytes},
-      {"gpu_memory_route_graph_bytes", telemetry.gpu_memory_route_graph_bytes},
-      {"gpu_memory_delta_reserved_bytes", telemetry.gpu_memory_delta_reserved_bytes},
-      {"gpu_memory_graph_cache_bytes", telemetry.gpu_memory_graph_cache_bytes},
-      {"gpu_memory_exact_cache_bytes", telemetry.gpu_memory_exact_cache_bytes},
-      {"queries_submitted", telemetry.queries_submitted},
-      {"queries_completed", telemetry.queries_completed},
-      {"batches", telemetry.batches},
-      {"batch_queries", telemetry.batch_queries},
-      {"average_batch_size", telemetry.batches == 0 ? 0.0
-        : static_cast<double>(telemetry.batch_queries) / static_cast<double>(telemetry.batches)},
-      {"submission_wait_ns", telemetry.submission_wait_ns},
-      {"average_submission_wait_us", telemetry.queries_submitted == 0 ? 0.0
-        : static_cast<double>(telemetry.submission_wait_ns) /
-            static_cast<double>(telemetry.queries_submitted) / 1000.0},
-      {"completion_wait_ns", telemetry.completion_wait_ns},
-      {"gpu_query_residence_ns", telemetry.gpu_active_ns},
-      {"average_gpu_query_us", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.gpu_active_ns) /
-            static_cast<double>(telemetry.queries_completed) / 1000.0},
-      {"average_gpu_prepare_us", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.gpu_prepare_ns) /
-            static_cast<double>(telemetry.queries_completed) / 1000.0},
-      {"average_gpu_graph_us", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.gpu_graph_ns) /
-            static_cast<double>(telemetry.queries_completed) / 1000.0},
-      {"average_gpu_score_us", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.gpu_score_ns) /
-            static_cast<double>(telemetry.queries_completed) / 1000.0},
-      {"average_gpu_beam_us", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.gpu_beam_ns) /
-            static_cast<double>(telemetry.queries_completed) / 1000.0},
-      {"average_gpu_exact_us", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.gpu_exact_ns) /
-            static_cast<double>(telemetry.queries_completed) / 1000.0},
-      {"rdma_read_ops", telemetry.rdma_read_ops},
-      {"rdma_read_bytes", telemetry.rdma_read_bytes},
-      {"rdma_merged_requests", telemetry.rdma_merged_requests},
-      {"direct_path_failures", telemetry.direct_path_failures},
-      {"graph_page_requests", telemetry.graph_page_requests},
-      {"graph_dependency_rounds", telemetry.graph_dependency_rounds},
-      {"graph_page_cache_hits", telemetry.graph_page_cache_hits},
-      {"graph_route_hits", telemetry.graph_route_hits},
-      {"graph_route_refreshes", telemetry.graph_route_refreshes},
-      {"graph_cache_invalidations", telemetry.graph_cache_invalidations},
-      {"graph_page_cache_hit_ratio",
-        telemetry.graph_page_requests + telemetry.graph_page_cache_hits == 0 ? 0.0
-        : static_cast<double>(telemetry.graph_page_cache_hits) /
-            static_cast<double>(telemetry.graph_page_requests +
-                                telemetry.graph_page_cache_hits)},
-      {"graph_route_hit_ratio",
-        telemetry.graph_page_requests + telemetry.graph_page_cache_hits +
-            telemetry.graph_route_hits == 0 ? 0.0
-        : static_cast<double>(telemetry.graph_route_hits) /
-            static_cast<double>(telemetry.graph_page_requests +
-                                telemetry.graph_page_cache_hits +
-                                telemetry.graph_route_hits)},
-      {"exact_vector_reads", telemetry.exact_vector_reads},
-      {"exact_vector_cache_hits", telemetry.exact_vector_cache_hits},
-      {"exact_vector_cache_hit_ratio",
-       telemetry.exact_vector_reads + telemetry.exact_vector_cache_hits == 0
-         ? 0.0
-         : static_cast<double>(telemetry.exact_vector_cache_hits) /
-             static_cast<double>(telemetry.exact_vector_reads +
-                                 telemetry.exact_vector_cache_hits)},
-      {"delta_queries", telemetry.delta_queries},
-      {"mutations_published", telemetry.mutations_published},
-      {"delta_publications", telemetry.delta_publications},
-      {"average_mutations_per_publication", telemetry.delta_publications == 0 ? 0.0
-        : static_cast<double>(telemetry.mutations_published) /
-            static_cast<double>(telemetry.delta_publications)},
-      {"delta_compactions", telemetry.delta_compactions},
-      {"delta_entries_retired", telemetry.delta_entries_retired},
-      {"storage_reclaim_ack_writes", telemetry.storage_reclaim_ack_writes},
-      {"storage_reclaim_ack_sequence", telemetry.storage_reclaim_ack_sequence},
-      {"delta_live_entries", telemetry.delta_live_entries},
-      {"delta_physical_entries", telemetry.delta_physical_entries},
-      {"delta_mutable_entries", telemetry.delta_mutable_entries},
-      {"delta_durable_entries", telemetry.delta_durable_entries},
-      {"resident_pq_capacity", telemetry.resident_pq_capacity},
-      {"resident_pq_entries", telemetry.resident_pq_entries},
-      {"resident_pq_peak_entries", telemetry.resident_pq_peak_entries},
-      {"resident_pq_reclaimed", telemetry.resident_pq_reclaimed},
-      {"mutation_capacity_rejections", telemetry.mutation_capacity_rejections},
-      {"mutation_capacity_reserved", telemetry.mutation_capacity_reserved},
-      {"mutation_capacity_reserved_max", telemetry.mutation_capacity_reserved_max},
-      {"average_visibility_us", telemetry.mutations_published == 0 ? 0.0
-        : static_cast<double>(telemetry.visibility_ns_total) /
-            static_cast<double>(telemetry.mutations_published) / 1000.0},
-      {"max_visibility_us", static_cast<double>(telemetry.visibility_ns_max) / 1000.0},
-      {"average_publication_queue_us", telemetry.mutations_published == 0 ? 0.0
-        : static_cast<double>(telemetry.publication_queue_ns_total) /
-            static_cast<double>(telemetry.mutations_published) / 1000.0},
-      {"average_publication_prepare_us", telemetry.delta_publications == 0 ? 0.0
-        : static_cast<double>(telemetry.publication_prepare_ns_total) /
-            static_cast<double>(telemetry.delta_publications) / 1000.0},
-      {"average_publication_command_us", telemetry.delta_publications == 0 ? 0.0
-        : static_cast<double>(telemetry.publication_command_ns_total) /
-            static_cast<double>(telemetry.delta_publications) / 1000.0},
-    };
-  }
+  root["gpu_persistent"] = telemetry_to_json(service.gpu_search_telemetry());
 
 
   const bool has_throughput_duration = use_time_mode && args.measure_seconds > 0;
@@ -1159,132 +890,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     run_recall_check("after_performance", "static_gt_post_recall", false, false);
   }
 
-  nlohmann::json summaries = nlohmann::json::object();
-  std::ostringstream text_summary;
-  const auto& recall_query_meta = root["meta"]["recall_query"];
-  const auto& performance_query_meta = root["meta"]["performance_query"];
-  text_summary << "query_inputs\n";
-  text_summary << "  recall_source: " << recall_query_meta.value("source", "") << '\n';
-  text_summary << "  recall_rows: " << recall_query_meta.value("rows", 0ULL) << '\n';
-  text_summary << "  performance_source: "
-               << performance_query_meta.value("source", "") << '\n';
-  text_summary << "  performance_rows: "
-               << performance_query_meta.value("rows", 0ULL) << '\n';
-  text_summary << "  performance_row_reuse_policy: "
-               << performance_query_meta.value("row_reuse_policy", "") << '\n';
-  text_summary << "  performance_warmup/measure/total_rows_consumed: "
-               << performance_query_meta.value("warmup_rows_consumed", 0ULL) << "/"
-               << performance_query_meta.value("measure_rows_consumed", 0ULL) << "/"
-               << performance_query_meta.value("total_rows_consumed", 0ULL) << '\n';
-  if (has_throughput_duration) {
-    text_summary << "throughput\n";
-    text_summary << "  duration_seconds: " << throughput_duration << '\n';
-    text_summary << "  total_ops_per_sec: " << total_throughput
-                 << " (ops=" << (throughput_query_ops + throughput_write_ops) << ")\n";
-    text_summary << "  query_ops_per_sec: " << query_throughput
-                 << " (ops=" << throughput_query_ops << ")\n";
-    text_summary << "  write_ops_per_sec: " << write_throughput
-                 << " (ops=" << throughput_write_ops << ")\n";
-    if (args.workload == "mixed") {
-      text_summary << "  write_mix_completed: insert=" << measure_mixed_stats.completed_inserts
-                   << " upsert=" << measure_mixed_stats.completed_upserts
-                   << " delete=" << measure_mixed_stats.completed_deletes << '\n';
-    }
-    const auto& stability = root["stability"];
-    text_summary << "  query_head/tail_qps: "
-                 << stability.value("query_head_ops_per_sec", 0.0) << "/"
-                 << stability.value("query_tail_ops_per_sec", 0.0) << '\n';
-    text_summary << "  query_tail_to_head_ratio: "
-                 << stability.value("query_tail_to_head_ratio", 0.0) << '\n';
-    text_summary << "  zero_completion_windows: "
-                 << stability.value("zero_completion_windows", 0ULL) << '\n';
-    text_summary << "  acceptance_passed: "
-                 << (root["acceptance"].value("passed", false) ? "true" : "false")
-                 << '\n';
-  }
-  if (root.contains("recall")) {
-    const auto& recall = root["recall"];
-    text_summary << "recall\n";
-    text_summary << "  recall@" << recall.value("k", 0) << ": "
-                 << recall.value("recall", 0.0) << '\n';
-    text_summary << "  queries: " << recall.value("queries", 0) << '\n';
-    text_summary << "  passed: " << (recall.value("passed", false) ? "true" : "false") << '\n';
-    text_summary << "  query_file: " << recall.value("query_file", "") << '\n';
-    text_summary << "  groundtruth_file: " << recall.value("groundtruth_file", "") << '\n';
-  }
-  if (root.contains("static_gt_post_recall")) {
-    const auto& recall = root["static_gt_post_recall"];
-    text_summary << "static_gt_post_recall\n";
-    text_summary << "  recall@" << recall.value("k", 0) << ": "
-                 << recall.value("recall", 0.0) << '\n';
-    text_summary << "  queries: " << recall.value("queries", 0) << '\n';
-    text_summary << "  query_file: " << recall.value("query_file", "") << '\n';
-    text_summary << "  groundtruth_file: " << recall.value("groundtruth_file", "") << '\n';
-  }
-  if (root.contains("gpu_persistent")) {
-    const auto& gpu = root["gpu_persistent"];
-    text_summary << "gpu_persistent\n";
-    constexpr double bytes_per_gib = 1024.0 * 1024.0 * 1024.0;
-    text_summary << "  GPU memory explicit/base_pq/resident_pq/route/delta/graph_cache/exact_cache GiB: "
-                 << static_cast<double>(gpu.value("gpu_memory_explicit_bytes", 0ULL)) / bytes_per_gib << "/"
-                 << static_cast<double>(gpu.value("gpu_memory_base_pq_bytes", 0ULL)) / bytes_per_gib << "/"
-                 << static_cast<double>(gpu.value("gpu_memory_resident_pq_bytes", 0ULL)) / bytes_per_gib << "/"
-                 << static_cast<double>(gpu.value("gpu_memory_route_graph_bytes", 0ULL)) / bytes_per_gib << "/"
-                 << static_cast<double>(gpu.value("gpu_memory_delta_reserved_bytes", 0ULL)) / bytes_per_gib << "/"
-                 << static_cast<double>(gpu.value("gpu_memory_graph_cache_bytes", 0ULL)) / bytes_per_gib << "/"
-                 << static_cast<double>(gpu.value("gpu_memory_exact_cache_bytes", 0ULL)) / bytes_per_gib << '\n';
-    text_summary << "  average_batch_size: " << gpu.value("average_batch_size", 0.0) << '\n';
-    text_summary << "  average_submission_wait_us: "
-                 << gpu.value("average_submission_wait_us", 0.0) << '\n';
-    text_summary << "  rdma_read_bytes: " << gpu.value("rdma_read_bytes", 0ULL) << '\n';
-    text_summary << "  graph_page_cache_hit_ratio: "
-                 << gpu.value("graph_page_cache_hit_ratio", 0.0) << '\n';
-    text_summary << "  graph_route_hit_ratio/refreshes: "
-                 << gpu.value("graph_route_hit_ratio", 0.0) << "/"
-                 << gpu.value("graph_route_refreshes", 0ULL) << '\n';
-    text_summary << "  graph_cache_invalidations: "
-                 << gpu.value("graph_cache_invalidations", 0ULL) << '\n';
-    text_summary << "  GPU query/prepare/graph/score/beam/exact us: "
-                 << gpu.value("average_gpu_query_us", 0.0) << "/"
-                 << gpu.value("average_gpu_prepare_us", 0.0) << "/"
-                 << gpu.value("average_gpu_graph_us", 0.0) << "/"
-                 << gpu.value("average_gpu_score_us", 0.0) << "/"
-                 << gpu.value("average_gpu_beam_us", 0.0) << "/"
-                 << gpu.value("average_gpu_exact_us", 0.0) << '\n';
-    text_summary << "  average_visibility_us: "
-                 << gpu.value("average_visibility_us", 0.0) << '\n';
-    text_summary << "  publication queue/prepare/command us: "
-                 << gpu.value("average_publication_queue_us", 0.0) << "/"
-                 << gpu.value("average_publication_prepare_us", 0.0) << "/"
-                 << gpu.value("average_publication_command_us", 0.0) << '\n';
-    text_summary << "  average_mutations_per_publication: "
-                 << gpu.value("average_mutations_per_publication", 0.0) << '\n';
-    text_summary << "  delta logical/physical/L0/L1 entries: "
-                 << gpu.value("delta_live_entries", 0ULL) << "/"
-                 << gpu.value("delta_physical_entries", 0ULL) << "/"
-                 << gpu.value("delta_mutable_entries", 0ULL) << "/"
-                 << gpu.value("delta_durable_entries", 0ULL) << '\n';
-    text_summary << "  resident PQ current/peak/capacity/reclaimed: "
-                 << gpu.value("resident_pq_entries", 0ULL) << "/"
-                 << gpu.value("resident_pq_peak_entries", 0ULL) << "/"
-                 << gpu.value("resident_pq_capacity", 0ULL) << "/"
-                 << gpu.value("resident_pq_reclaimed", 0ULL) << '\n';
-    text_summary << "  mutation capacity rejected/current/peak: "
-                 << gpu.value("mutation_capacity_rejections", 0ULL) << "/"
-                 << gpu.value("mutation_capacity_reserved", 0ULL) << "/"
-                 << gpu.value("mutation_capacity_reserved_max", 0ULL) << '\n';
-  }
-  if (report.has_insert()) {
-    const auto summary = aggregate_text_summary(report.insert);
-    summaries["insert"] = summary;
-    text_summary << summary;
-  }
-  if (report.has_query()) {
-    const auto summary = aggregate_text_summary(report.query);
-    summaries["query"] = summary;
-    text_summary << summary;
-  }
-  root["bottleneck_summary"] = std::move(summaries);
+  FormattedReport formatted_report = format_report(root, report);
+  root["bottleneck_summary"] = std::move(formatted_report.bottleneck_summary);
   std::ofstream json_output(args.report_json_path);
   json_output << root.dump(2) << '\n';
   if (!json_output) {
@@ -1293,10 +900,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
 
   if (!args.report_text_path.empty()) {
     std::ofstream text_output(args.report_text_path);
-    text_output << text_summary.str();
+    text_output << formatted_report.text;
   }
 
-  std::cout << text_summary.str();
+  std::cout << formatted_report.text;
   if (recall_below_threshold) {
     throw std::runtime_error("recall below threshold");
   }

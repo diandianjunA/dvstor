@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "gpu_search/persistent_kernel.hh"
+#include "gpu_search/mapped_ring.hh"
 #include "gpu_search/pq_index.hh"
 
 namespace {
@@ -21,127 +22,13 @@ using gpu_search::u8;
 using gpu_search::u16;
 using gpu_search::i32;
 using gpu_search::f32;
+using gpu_search::MappedRing;
 
 void check_cuda(cudaError_t status, const char* operation) {
   if (status != cudaSuccess) {
     throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(status));
   }
 }
-
-template <class T>
-class MappedRing {
-public:
-  enum class Direction {
-    host_to_device,
-    device_to_host,
-  };
-
-  MappedRing(u32 capacity, Direction direction)
-      : capacity_(capacity), direction_(direction) {
-    if (capacity_ < 2 || (capacity_ & (capacity_ - 1)) != 0) {
-      throw std::invalid_argument("mapped ring capacity must be a power of two");
-    }
-    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&enqueue_host_), sizeof(u64),
-                             cudaHostAllocMapped),
-               "cudaHostAlloc(enqueue)");
-    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&dequeue_host_), sizeof(u64),
-                             cudaHostAllocMapped),
-               "cudaHostAlloc(dequeue)");
-    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&sequences_host_),
-                             static_cast<size_t>(capacity_) * sizeof(u64),
-                             cudaHostAllocMapped),
-               "cudaHostAlloc(sequences)");
-    check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&entries_host_),
-                             static_cast<size_t>(capacity_) * sizeof(T),
-                             cudaHostAllocMapped),
-               "cudaHostAlloc(entries)");
-
-    *enqueue_host_ = 0;
-    *dequeue_host_ = 0;
-    for (u32 index = 0; index < capacity_; ++index) sequences_host_[index] = index;
-
-    u64* enqueue_device = nullptr;
-    u64* dequeue_device = nullptr;
-    u64* sequences_device = nullptr;
-    T* entries_device = nullptr;
-    check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&enqueue_device),
-                                        enqueue_host_, 0),
-               "cudaHostGetDevicePointer(enqueue)");
-    check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&dequeue_device),
-                                        dequeue_host_, 0),
-               "cudaHostGetDevicePointer(dequeue)");
-    check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&sequences_device),
-                                        sequences_host_, 0),
-               "cudaHostGetDevicePointer(sequences)");
-    check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&entries_device),
-                                        entries_host_, 0),
-               "cudaHostGetDevicePointer(entries)");
-    check_cuda(cudaMalloc(reinterpret_cast<void**>(&device_owned_position_), sizeof(u64)),
-               "cudaMalloc(device position)");
-    check_cuda(cudaMemset(device_owned_position_, 0, sizeof(u64)),
-               "cudaMemset(device position)");
-    if (direction_ == Direction::host_to_device) {
-      dequeue_device = device_owned_position_;
-    } else {
-      enqueue_device = device_owned_position_;
-    }
-    device_view_ = {
-      .enqueue_position = reinterpret_cast<unsigned long long*>(enqueue_device),
-      .dequeue_position = reinterpret_cast<unsigned long long*>(dequeue_device),
-      .sequences = reinterpret_cast<unsigned long long*>(sequences_device),
-      .entries = entries_device,
-      .capacity = capacity_,
-      .mask = capacity_ - 1,
-    };
-  }
-
-  ~MappedRing() {
-    if (device_owned_position_ != nullptr) cudaFree(device_owned_position_);
-    if (entries_host_ != nullptr) cudaFreeHost(entries_host_);
-    if (sequences_host_ != nullptr) cudaFreeHost(sequences_host_);
-    if (dequeue_host_ != nullptr) cudaFreeHost(dequeue_host_);
-    if (enqueue_host_ != nullptr) cudaFreeHost(enqueue_host_);
-  }
-
-  MappedRing(const MappedRing&) = delete;
-  MappedRing& operator=(const MappedRing&) = delete;
-
-  bool try_push(const T& value) {
-    std::atomic_ref<u64> enqueue(*enqueue_host_);
-    const u64 position = enqueue.load(std::memory_order_relaxed);
-    const u32 slot = static_cast<u32>(position) & (capacity_ - 1);
-    std::atomic_ref<u64> sequence(sequences_host_[slot]);
-    if (sequence.load(std::memory_order_acquire) != position) return false;
-    entries_host_[slot] = value;
-    sequence.store(position + 1, std::memory_order_release);
-    enqueue.store(position + 1, std::memory_order_release);
-    return true;
-  }
-
-  bool try_pop(T& value) {
-    std::atomic_ref<u64> dequeue(*dequeue_host_);
-    const u64 position = dequeue.load(std::memory_order_relaxed);
-    const u32 slot = static_cast<u32>(position) & (capacity_ - 1);
-    std::atomic_ref<u64> sequence(sequences_host_[slot]);
-    if (sequence.load(std::memory_order_acquire) != position + 1) return false;
-    value = entries_host_[slot];
-    sequence.store(position + capacity_, std::memory_order_release);
-    dequeue.store(position + 1, std::memory_order_release);
-    return true;
-  }
-
-  gpu_search::DeviceRingView<T> device_view() const { return device_view_; }
-
-private:
-  u32 capacity_{};
-  u64* enqueue_host_{};
-  u64* dequeue_host_{};
-  u64* sequences_host_{};
-  T* entries_host_{};
-  u64* device_owned_position_{};
-  Direction direction_{};
-  gpu_search::DeviceRingView<T> device_view_{};
-};
 
 template <class T>
 class DeviceBuffer {
@@ -304,7 +191,10 @@ void run_valid_resident_query_test(u32 subquantizers, u32 query_threads) {
 
   gpu_search::PersistentKernelParams params{
     .submissions = submissions.device_view(),
+    .device_submissions = {},
     .completions = completions.device_view(),
+    .delta_submissions = {},
+    .delta_completions = {},
     .shards = shards.get(),
     .num_shards = 1,
     .pq_codes = pq_codes.get(),

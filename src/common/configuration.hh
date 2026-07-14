@@ -57,9 +57,8 @@ public:
   u32 gpu_rdma_qps{4};
   u32 gpu_persistent_blocks_per_sm{4};
   u32 update_visibility_us{10'000};
-  f64 delta_max_ratio{0.01};
   u32 delta_budget_mb{256};
-  u32 merge_period_ms{60'000};
+  u32 gpu_delta_maintenance_period_ms{10};
 
   u32 storage_id{};
   vec<str> storage_peers;
@@ -209,15 +208,13 @@ private:
       ("update-visibility-us",
        po::value<u32>(&update_visibility_us)->default_value(update_visibility_us),
        "Maximum update publication delay to the GPU delta.")
-      ("delta-max-ratio",
-       po::value<f64>(&delta_max_ratio)->default_value(delta_max_ratio),
-       "Delta consolidation threshold relative to base size.")
       ("delta-budget-mb",
        po::value<u32>(&delta_budget_mb)->default_value(delta_budget_mb),
        "GPU delta-index memory budget.")
-      ("merge-period-ms",
-       po::value<u32>(&merge_period_ms)->default_value(merge_period_ms),
-       "Maximum interval between delta consolidation checks.")
+      ("gpu-delta-maintenance-period-ms",
+       po::value<u32>(&gpu_delta_maintenance_period_ms)
+         ->default_value(gpu_delta_maintenance_period_ms),
+       "GPU delta retirement and storage-watermark polling period.")
 
       ("storage-id", po::value<u32>(&storage_id)->default_value(storage_id),
        "Zero-based storage shard identifier.")
@@ -351,9 +348,8 @@ private:
         gpu_rdma_qps == 0 || gpu_rdma_qps > 32 ||
         gpu_persistent_blocks_per_sm == 0 ||
         gpu_persistent_blocks_per_sm > 16 ||
-        update_visibility_us == 0 || delta_max_ratio <= 0.0 ||
-        delta_max_ratio > 0.5 || delta_budget_mb == 0 ||
-        merge_period_ms == 0) {
+        update_visibility_us == 0 || delta_budget_mb == 0 ||
+        gpu_delta_maintenance_period_ms == 0) {
       fail("invalid persistent GPU query configuration");
     }
 

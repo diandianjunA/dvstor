@@ -141,7 +141,7 @@ epoch 屏蔽，动态版本只在对应 epoch 可见。发布、压缩或 kernel
 - 多查询并发隐藏远端延迟，而不是同步执行单查询 RDMA 往返；
 - exact cache 与 graph cache 分离，避免大向量挤占导航工作集；
 - telemetry 分别记录图读、精确读、cache hit、GPU phase cycle、direct-path failure、
-  mutation publication queue/prepare/command、可见性延迟、L0 退休量和存储回收 ACK。
+  mutation publication queue/prepare/command、可见性延迟、L0 回收批次、退休量和存储回收 ACK。
 
 要判断是否达到目标吞吐，必须同时检查 QPS、recall、GPU utilization、QP 错误、
 direct-path failure、每查询图读取数和精确读取数。单独看到 GPUNetIO probe 成功
@@ -153,7 +153,7 @@ direct-path failure、每查询图读取数和精确读取数。单独看到 GPU
 
 - GPUNetIO QP probe 或稳态 read 失败；
 - 持久化 kernel 返回非零状态；
-- delta publish、cache invalidation 或 consolidation 失败；
+- delta publish、cache invalidation 或安全退休失败；
 - ring/slot 状态不一致；
 - 索引 checksum、ordinal 或远端 offset 校验失败。
 

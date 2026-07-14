@@ -1,12 +1,18 @@
-add_executable(gpu_search_ring_test gpu_search_ring_test.cc)
-target_link_libraries(gpu_search_ring_test PRIVATE dvstor_runtime)
-target_compile_options(gpu_search_ring_test PRIVATE -UNDEBUG)
-add_test(NAME gpu_search_ring_test COMMAND gpu_search_ring_test)
-
 add_executable(breakdown_aggregate_test breakdown_aggregate_test.cc)
 target_link_libraries(breakdown_aggregate_test PRIVATE dvstor_runtime)
 target_compile_options(breakdown_aggregate_test PRIVATE -UNDEBUG)
 add_test(NAME breakdown_aggregate_test COMMAND breakdown_aggregate_test)
+
+add_executable(breakdown_benchmark_support_test breakdown_benchmark_support_test.cc)
+dvstor_target_tool_includes(breakdown_benchmark_support_test)
+target_link_libraries(breakdown_benchmark_support_test PRIVATE dvstor_breakdown_support)
+target_compile_options(breakdown_benchmark_support_test PRIVATE -UNDEBUG)
+add_test(NAME breakdown_benchmark_support_test COMMAND breakdown_benchmark_support_test)
+
+add_executable(common_atomic_utils_test common_atomic_utils_test.cc)
+target_link_libraries(common_atomic_utils_test PRIVATE dvstor_runtime)
+target_compile_options(common_atomic_utils_test PRIVATE -UNDEBUG)
+add_test(NAME common_atomic_utils_test COMMAND common_atomic_utils_test)
 
 if (TARGET dvstor_gpu_kernels)
     add_executable(gpu_persistent_dispatch_test gpu_persistent_dispatch_test.cc)
