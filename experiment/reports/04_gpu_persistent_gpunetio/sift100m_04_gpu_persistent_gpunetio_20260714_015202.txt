@@ -1,0 +1,53 @@
+query_inputs
+  recall_source: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  recall_rows: 10000
+  performance_source: /data/xjs/datasets/sift1b/sift100m_to_105m_query.u8bin
+  performance_rows: 5000000
+  performance_row_reuse_policy: single_pass_no_reuse
+  performance_warmup/measure/total_rows_consumed: 600646/2801299/3401945
+throughput
+  duration_seconds: 120.3
+  total_ops_per_sec: 23622.8 (ops=2841829)
+  query_ops_per_sec: 23285.9 (ops=2801299)
+  write_ops_per_sec: 336.907 (ops=40530)
+  write_mix_completed: insert=20222 upsert=16068 delete=4240
+  query_head/tail_qps: 23606.2/23525.7
+  query_tail_to_head_ratio: 0.996591
+  zero_completion_windows: 0
+  acceptance_passed: true
+recall
+  recall@10: 0.9424
+  queries: 1000
+  passed: true
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+static_gt_post_recall
+  recall@10: 0.9423
+  queries: 1000
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+gpu_persistent
+  GPU memory explicit/base_pq/resident_pq/route/delta/graph_cache/exact_cache GiB: 7.25025/2.98023/3.75/0.00961304/0.25/0/0
+  average_batch_size: 1.00004
+  average_submission_wait_us: 2.53009
+  rdma_read_bytes: 305039692152
+  graph_page_cache_hit_ratio: 0
+  graph_route_hit_ratio/refreshes: 0.147212/2096
+  graph_cache_invalidations: 770344
+  GPU query/prepare/graph/score/beam/exact us: 2590.28/319.972/912.841/557.602/373.001/137.369
+  average_visibility_us: 6597.28
+  publication queue/prepare/command us: 5974.45/8.60456/391.715
+  average_mutations_per_publication: 5.92977
+  delta logical/physical/L0/L1 entries: 4090/0/0/0
+  resident PQ current/peak/capacity/reclaimed: 42351/42351/67108864/2
+  mutation capacity rejected/current/peak: 0/0/88
+insert breakdown
+  count: 20222
+  latency_ms: mean=200.316 p50=117.369 p95=645.109 p99=1156.61
+  cpu_ms: 3.99153e+06
+  rdma_ms: 59260.4
+query breakdown
+  count: 2801299
+  latency_ms: mean=2.71245 p50=2.64793 p95=3.25087 p99=4.12165
+  cpu_ms: 7.59837e+06
+  rdma_ms: 0

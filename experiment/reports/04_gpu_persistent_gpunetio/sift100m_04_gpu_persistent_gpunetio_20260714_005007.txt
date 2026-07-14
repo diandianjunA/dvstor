@@ -1,0 +1,52 @@
+query_inputs
+  recall_source: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  recall_rows: 10000
+  performance_source: /data/xjs/datasets/sift1b/sift100m_to_105m_query.u8bin
+  performance_rows: 5000000
+  performance_row_reuse_policy: single_pass_no_reuse
+  performance_warmup/measure/total_rows_consumed: 589810/2548830/3138640
+throughput
+  duration_seconds: 120.547
+  total_ops_per_sec: 21494.9 (ops=2591149)
+  query_ops_per_sec: 21143.8 (ops=2548830)
+  write_ops_per_sec: 351.058 (ops=42319)
+  write_mix_completed: insert=21101 upsert=16800 delete=4418
+  query_head/tail_qps: 17891.5/21032
+  query_tail_to_head_ratio: 1.17553
+  zero_completion_windows: 0
+  acceptance_passed: true
+recall
+  recall@10: 0.9424
+  queries: 1000
+  passed: true
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+static_gt_post_recall
+  recall@10: 0.9422
+  queries: 1000
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+gpu_persistent
+  GPU memory explicit/base_pq/route/delta/graph_cache/exact_cache GiB: 3.50025/2.98023/0.00961304/0.25/0/0
+  average_batch_size: 1.00005
+  average_submission_wait_us: 2.64772
+  rdma_read_bytes: 277539269920
+  graph_page_cache_hit_ratio: 0
+  graph_route_hit_ratio/refreshes: 0.147215/2085
+  graph_cache_invalidations: 805084
+  GPU query/prepare/graph/score/beam/exact us: 2866.7/319.177/912.411/699.224/373.079/136.493
+  average_visibility_us: 6530.79
+  publication queue/prepare/command us: 5927.23/6.84986/393.654
+  average_mutations_per_publication: 6.10488
+  delta logical/physical/L0/L1 entries: 12257/0/0/0
+  mutation capacity rejected/current/peak: 0/0/89
+insert breakdown
+  count: 21101
+  latency_ms: mean=191.365 p50=112.059 p95=598.626 p99=1113.96
+  cpu_ms: 3.97638e+06
+  rdma_ms: 61613.6
+query breakdown
+  count: 2548830
+  latency_ms: mean=2.97915 p50=2.87142 p95=3.95005 p99=4.51183
+  cpu_ms: 7.59336e+06
+  rdma_ms: 0
