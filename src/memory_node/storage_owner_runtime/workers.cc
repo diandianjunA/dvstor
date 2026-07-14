@@ -92,6 +92,7 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
         &scratch.statuses,
         &scratch.results);
 
+  const auto response_build_started = std::chrono::steady_clock::now();
   const u32 item_count = request->item_count;
   const size_t response_size = service::storage_owner::insert_batch_response_bytes(item_count);
   lib_assert(response_size <= std::numeric_limits<u32>::max(),
@@ -115,8 +116,6 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
       ? scratch.results[item]
       : service::storage_owner::MutationResult{};
   }
-  *service::storage_owner::response_breakdown(response_buffer, item_count) = breakdown;
-
   const u32 invalidation_capacity =
     service::storage_owner::response_invalidation_capacity(item_count);
   scratch.response_invalidations.reserve(invalidation_capacity);
@@ -143,17 +142,48 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
   std::copy(scratch.response_invalidations.begin(),
             scratch.response_invalidations.end(),
             invalidated);
-  enqueue_storage_owner_response(
+  breakdown.storage_owner_response_build_ns += elapsed_ns_since(response_build_started);
+  *service::storage_owner::response_breakdown(response_buffer, item_count) = breakdown;
+  post_storage_owner_response(
     {task.client_id,
      task.slot_id,
      static_cast<u32>(response_size),
      std::chrono::steady_clock::now()});
 }
 
-void MemoryNode::enqueue_storage_owner_response(StorageOwnerResponseReady response) {
+void MemoryNode::post_storage_owner_response(StorageOwnerResponseReady response) {
   if (response.queued_at == std::chrono::steady_clock::time_point{}) {
     response.queued_at = std::chrono::steady_clock::now();
   }
-  std::lock_guard<std::mutex> lock(storage_responses_mutex_);
-  storage_responses_ready_.push_back(response);
+  lib_assert(response.client_id < num_clients_ &&
+               response.slot_id < insert_runtime_.request_slot_count &&
+               response.client_id < storage_client_send_mutexes_.size(),
+             "storage-owner response references an invalid RPC slot");
+
+  const Configuration& config = *storage_worker_config_;
+  byte_t* response_buffer = insert_runtime_.buffer.get_full_buffer() +
+    insert_response_slot_offset(config, response.client_id, response.slot_id);
+  const auto* response_header =
+    reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(
+      response_buffer);
+
+  std::lock_guard<std::mutex> send_lock(
+    *storage_client_send_mutexes_[response.client_id]);
+  if (response_header->item_count > 0 &&
+      response_header->item_count <= config.storage_owner_batch_max) {
+    auto* breakdown = service::storage_owner::response_breakdown(
+      response_buffer, response_header->item_count);
+    breakdown->storage_owner_response_send_ns += static_cast<u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - response.queued_at).count());
+  }
+  cm_.client_qps[response.client_id]->post_send_with_id(
+    *insert_runtime_.region,
+    response.byte_len,
+    IBV_WR_SEND,
+    encode_64bit(response.client_id, response.slot_id),
+    true,
+    nullptr,
+    0,
+    insert_response_slot_offset(config, response.client_id, response.slot_id));
 }

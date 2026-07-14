@@ -19,42 +19,6 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
 
   for (;;) {
     bool progressed = false;
-    for (;;) {
-      StorageOwnerResponseReady response;
-      {
-        std::lock_guard<std::mutex> lock(storage_responses_mutex_);
-        if (storage_responses_ready_.empty()) {
-          break;
-        }
-        response = storage_responses_ready_.front();
-        storage_responses_ready_.pop_front();
-      }
-      byte_t* response_buffer = insert_runtime_.buffer.get_full_buffer() +
-        insert_response_slot_offset(config, response.client_id, response.slot_id);
-      const auto* response_header =
-        reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(
-          response_buffer);
-      if (response.queued_at != std::chrono::steady_clock::time_point{} &&
-          response_header->item_count > 0 &&
-          response_header->item_count <= config.storage_owner_batch_max) {
-        auto* breakdown = service::storage_owner::response_breakdown(
-          response_buffer, response_header->item_count);
-        breakdown->storage_owner_response_send_ns += static_cast<u64>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - response.queued_at).count());
-      }
-      cm_.client_qps[response.client_id]->post_send_with_id(
-        *insert_runtime_.region,
-        response.byte_len,
-        IBV_WR_SEND,
-        encode_64bit(response.client_id, response.slot_id),
-        true,
-        nullptr,
-        0,
-        insert_response_slot_offset(config, response.client_id, response.slot_id));
-      progressed = true;
-    }
-
     const i32 num_sent = context_.poll_send_cq(
       send_wcs.data(), static_cast<i32>(send_wcs.size()));
     progressed = progressed || num_sent > 0;
@@ -130,7 +94,7 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
       lib_assert(response_bytes <= response_slot_bytes(config) &&
                  response_bytes <= std::numeric_limits<u32>::max(),
                  "storage_owner response exceeds the registered response slot");
-      enqueue_storage_owner_response(
+      post_storage_owner_response(
         {client_id,
          slot_id,
          static_cast<u32>(response_bytes),
@@ -221,6 +185,7 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id,
                                                     &item_statuses, &mutation_results);
   storage_owner_insert_active_workers_.fetch_sub(1, std::memory_order_acq_rel);
   mark_storage_owner_foreground_activity();
+  const auto response_build_started = std::chrono::steady_clock::now();
   for (u32 i = 0; i < request->item_count; ++i) {
     statuses[i] = ok ? item_statuses[i]
                      : static_cast<u32>(service::storage_owner::MutationStatus::failed);
@@ -229,7 +194,6 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id,
   for (u32 i = 0; i < request->item_count; ++i) {
     response_results[i] = ok ? mutation_results[i] : service::storage_owner::MutationResult{};
   }
-  *service::storage_owner::response_breakdown(response_ptr, request->item_count) = breakdown;
   const u32 invalidation_capacity = service::storage_owner::response_invalidation_capacity(request->item_count);
   vec<u64> response_invalidations;
   response_invalidations.reserve(invalidation_capacity);
@@ -249,6 +213,8 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id,
   for (u32 i = 0; i < invalidation_count; ++i) {
     invalidated[i] = response_invalidations[i];
   }
+  breakdown.storage_owner_response_build_ns += elapsed_ns_since(response_build_started);
+  *service::storage_owner::response_breakdown(response_ptr, request->item_count) = breakdown;
   return service::storage_owner::insert_batch_response_bytes(request->item_count);
 }
 
@@ -282,11 +248,36 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     invalidated_neighbors->assign(item_count, {});
   }
 
+  const auto allocate_node = [&]() {
+    const auto started = std::chrono::steady_clock::now();
+    const RemotePtr pointer = allocate_local_node();
+    breakdown.storage_owner_allocate_node_ns += elapsed_ns_since(started);
+    return pointer;
+  };
+  const auto publish = [&](node_t id, RemotePtr pointer, u32 generation, bool deleted) {
+    const auto started = std::chrono::steady_clock::now();
+    publish_mutation(id, pointer, generation, deleted);
+    breakdown.storage_owner_publish_mutation_ns += elapsed_ns_since(started);
+  };
+  const auto schedule = [&](node_t id,
+                            u32 generation,
+                            service::storage_owner::MutationKind kind,
+                            RemotePtr new_pointer,
+                            RemotePtr old_pointer) {
+    const auto started = std::chrono::steady_clock::now();
+    const u64 sequence = schedule_storage_owner_maintenance(
+      id, generation, kind, new_pointer, old_pointer, config);
+    breakdown.storage_owner_schedule_maintenance_ns += elapsed_ns_since(started);
+    return sequence;
+  };
+
   for (size_t idx = 0; idx < item_count; ++idx) {
     const auto kind = kinds == nullptr ? service::storage_owner::MutationKind::insert : kinds[idx];
     FreshnessEntry old_entry{};
     u32 generation = 0;
+    const auto prepare_started = std::chrono::steady_clock::now();
     const auto status = prepare_mutation(ids[idx], kind, &old_entry, &generation);
+    breakdown.storage_owner_prepare_mutation_ns += elapsed_ns_since(prepare_started);
     if (results != nullptr) {
       (*results)[idx].old_rptr_raw = old_entry.current.raw_address;
       (*results)[idx].generation = generation;
@@ -300,9 +291,9 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     if (kind == service::storage_owner::MutationKind::erase) {
       const bool deleted = mark_node_deleted(old_entry.current, old_entry.generation);
       if (deleted) {
-        publish_mutation(ids[idx], old_entry.current, old_entry.generation, true);
-        const u64 maintenance_sequence = schedule_storage_owner_maintenance(
-          ids[idx], old_entry.generation, kind, RemotePtr{}, old_entry.current, config);
+        publish(ids[idx], old_entry.current, old_entry.generation, true);
+        const u64 maintenance_sequence = schedule(
+          ids[idx], old_entry.generation, kind, RemotePtr{}, old_entry.current);
         if (results != nullptr) {
           (*results)[idx].maintenance_sequence = maintenance_sequence;
         }
@@ -350,7 +341,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
 
     if (medoid_loaded && medoid_ptr.is_null()) {
-      const RemotePtr new_ptr = allocate_local_node();
+      const RemotePtr new_ptr = allocate_node();
       if (results != nullptr) {
         (*results)[idx].new_rptr_raw = new_ptr.raw_address;
       }
@@ -360,9 +351,9 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       if (kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
         mark_node_deleted(old_entry.current, old_entry.generation);
       }
-      publish_mutation(ids[idx], new_ptr, generation, false);
-      const u64 maintenance_sequence = schedule_storage_owner_maintenance(
-        ids[idx], generation, kind, new_ptr, old_entry.current, config);
+      publish(ids[idx], new_ptr, generation, false);
+      const u64 maintenance_sequence = schedule(
+        ids[idx], generation, kind, new_ptr, old_entry.current);
       if (results != nullptr) {
         (*results)[idx].maintenance_sequence = maintenance_sequence;
       }
@@ -392,7 +383,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     vec<RemotePtr> selected_neighbors = robust_prune_cpu(reinterpret_cast<const byte_t*>(components.data()),
                                                          VectorDType::float32, candidates, empty_skip, config, &breakdown);
     breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
-    const RemotePtr new_ptr = allocate_local_node();
+    const RemotePtr new_ptr = allocate_node();
     if (results != nullptr) {
       (*results)[idx].new_rptr_raw = new_ptr.raw_address;
     }
@@ -402,9 +393,9 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     if (kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
       mark_node_deleted(old_entry.current, old_entry.generation);
     }
-    publish_mutation(ids[idx], new_ptr, generation, false);
-    const u64 maintenance_sequence = schedule_storage_owner_maintenance(
-      ids[idx], generation, kind, new_ptr, old_entry.current, config);
+    publish(ids[idx], new_ptr, generation, false);
+    const u64 maintenance_sequence = schedule(
+      ids[idx], generation, kind, new_ptr, old_entry.current);
     if (results != nullptr) {
       (*results)[idx].maintenance_sequence = maintenance_sequence;
     }

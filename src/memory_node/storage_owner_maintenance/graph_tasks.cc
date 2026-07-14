@@ -24,12 +24,20 @@ bool MemoryNode::try_lock_node(RemotePtr rptr) {
 }
 
 bool MemoryNode::storage_owner_task_current(node_t id, u32 generation, RemotePtr target) {
-  std::lock_guard<std::mutex> lock(idmap_mutex_);
-  const auto it = idmap_.find(id);
-  return it != idmap_.end() &&
-         !it->second.deleted &&
-         it->second.generation == generation &&
-         it->second.current == target;
+  DynamicFreshnessShard& shard = dynamic_freshness_shard(id);
+  std::lock_guard<std::mutex> lock(shard.mutex);
+  const auto dynamic = shard.entries.find(id);
+  if (dynamic != shard.entries.end()) {
+    return !dynamic->second.deleted &&
+           dynamic->second.generation == generation &&
+           dynamic->second.current == target;
+  }
+  const auto& immutable_base = base_idmap_;
+  const auto base = immutable_base.find(id);
+  return base != immutable_base.end() &&
+         !base->second.deleted &&
+         base->second.generation == generation &&
+         base->second.current == target;
 }
 
 vec<RemotePtr> MemoryNode::read_preserved_neighbor_list(RemotePtr rptr) {

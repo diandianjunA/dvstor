@@ -80,8 +80,11 @@ u64 MemoryNode::minimum_compute_reclaim_ack() const {
 }
 
 bool MemoryNode::load_owner_idmap(const filepath_t& index_prefix) {
-  idmap_.clear();
-  mutations_inflight_.clear();
+  base_idmap_.clear();
+  for (DynamicFreshnessShard& shard : dynamic_freshness_shards_) {
+    shard.entries.clear();
+    shard.mutations_inflight.clear();
+  }
   if (index_prefix.empty()) {
     return true;
   }
@@ -101,29 +104,36 @@ bool MemoryNode::load_owner_idmap(const filepath_t& index_prefix) {
     return false;
   }
   const u64 dynamic_headroom = std::max<u64>(1024ull * 1024ull, header.entry_count / 20);
-  const u64 reserve_count = header.entry_count + dynamic_headroom;
-  // Reserve dynamic-write headroom up front; storage-owner inserts keep adding
-  // idmap entries and dense maps grow by reallocating large contiguous blocks.
-  idmap_.reserve(static_cast<size_t>(reserve_count));
+  base_idmap_.reserve(static_cast<size_t>(header.entry_count));
+  const size_t dynamic_reserve_per_shard = static_cast<size_t>(
+    (dynamic_headroom + kDynamicFreshnessShardCount - 1) /
+    kDynamicFreshnessShardCount);
+  for (DynamicFreshnessShard& shard : dynamic_freshness_shards_) {
+    shard.entries.reserve(dynamic_reserve_per_shard);
+    shard.mutations_inflight.reserve(64);
+  }
   for (u64 i = 0; i < header.entry_count; ++i) {
     vamana::idmap::Entry entry;
     input.read(reinterpret_cast<char*>(&entry), sizeof(entry));
     if (!input.good()) return false;
-    idmap_[entry.id] = FreshnessEntry{
+    base_idmap_[entry.id] = FreshnessEntry{
       RemotePtr{entry.rptr_raw},
       entry.generation,
       (entry.flags & vamana::idmap::kDeleted) != 0};
   }
   print_status("storage-owner idmap loaded entries=" +
-               std::to_string(idmap_.size()) +
-               " reserved=" + std::to_string(reserve_count));
+               std::to_string(base_idmap_.size()) +
+               " immutable_base=true dynamic_shards=" +
+               std::to_string(kDynamicFreshnessShardCount) +
+               " dynamic_reserved=" + std::to_string(dynamic_headroom));
   return true;
 }
 
 void MemoryNode::publish_mutation(node_t id, RemotePtr ptr, u32 generation, bool deleted) {
-  std::lock_guard<std::mutex> lock(idmap_mutex_);
-  idmap_[id] = FreshnessEntry{ptr, generation, deleted};
-  mutations_inflight_.erase(id);
+  DynamicFreshnessShard& shard = dynamic_freshness_shard(id);
+  std::lock_guard<std::mutex> lock(shard.mutex);
+  shard.entries[id] = FreshnessEntry{ptr, generation, deleted};
+  shard.mutations_inflight.erase(id);
 }
 
 service::storage_owner::MutationStatus MemoryNode::prepare_mutation(
@@ -131,20 +141,30 @@ service::storage_owner::MutationStatus MemoryNode::prepare_mutation(
     service::storage_owner::MutationKind kind,
     FreshnessEntry* old_entry,
     u32* new_generation) {
-  std::lock_guard<std::mutex> lock(idmap_mutex_);
-  if (mutations_inflight_.contains(id)) {
+  DynamicFreshnessShard& shard = dynamic_freshness_shard(id);
+  std::lock_guard<std::mutex> lock(shard.mutex);
+  if (shard.mutations_inflight.contains(id)) {
     return service::storage_owner::MutationStatus::failed;
   }
-  auto it = idmap_.find(id);
-  const bool exists = it != idmap_.end();
-  const bool live = exists && !it->second.deleted;
+  const auto dynamic = shard.entries.find(id);
+  const auto& immutable_base = base_idmap_;
+  const auto base = dynamic == shard.entries.end()
+                      ? immutable_base.find(id)
+                      : immutable_base.end();
+  const bool exists = dynamic != shard.entries.end() || base != immutable_base.end();
+  const FreshnessEntry current = dynamic != shard.entries.end()
+                                   ? dynamic->second
+                                   : (base != immutable_base.end()
+                                        ? base->second
+                                        : FreshnessEntry{});
+  const bool live = exists && !current.deleted;
   if (old_entry != nullptr) {
-    *old_entry = exists ? it->second : FreshnessEntry{};
+    *old_entry = current;
     if (old_entry->deleted) {
       old_entry->current = RemotePtr{};
     }
   }
-  const u32 previous_generation = exists ? it->second.generation : 0;
+  const u32 previous_generation = exists ? current.generation : 0;
   if (new_generation != nullptr) {
     *new_generation = previous_generation + 1;
   }
@@ -155,7 +175,7 @@ service::storage_owner::MutationStatus MemoryNode::prepare_mutation(
     if (!exists) return service::storage_owner::MutationStatus::not_found;
     if (!live) return service::storage_owner::MutationStatus::already_deleted;
   }
-  mutations_inflight_.insert(id);
+  shard.mutations_inflight.insert(id);
   return service::storage_owner::MutationStatus::ok;
 }
 

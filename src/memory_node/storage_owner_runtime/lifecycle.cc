@@ -29,6 +29,11 @@ void MemoryNode::setup_insert_runtime(const Configuration& config) {
   insert_runtime_.buffer.touch_memory();
   insert_runtime_.region = std::make_unique<LocalMemoryRegion>(
     context_, insert_runtime_.buffer.get_full_buffer(), insert_runtime_.buffer.buffer_size);
+  storage_client_send_mutexes_.clear();
+  storage_client_send_mutexes_.reserve(num_clients_);
+  for (u32 client_id = 0; client_id < num_clients_; ++client_id) {
+    storage_client_send_mutexes_.push_back(std::make_unique<std::mutex>());
+  }
 }
 
 void MemoryNode::start_storage_owner_insert_workers(const Configuration& config) {
@@ -48,6 +53,8 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
     print_status("storage-owner stage1=direct local commit without peer RDMA; "
                  "reverse edges=batched stage2");
   }
+  print_status("storage-owner responses=foreground direct post; "
+               "completion=repost by service poller");
   const u32 cpu_parallelism = std::max<u32>(1, num_compute_threads_ / 2);
   const u32 rpc_parallelism = std::max<u32>(
     1, static_cast<u32>(num_clients_) * insert_runtime_.request_slot_count);

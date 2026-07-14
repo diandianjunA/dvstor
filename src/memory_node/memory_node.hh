@@ -110,6 +110,21 @@ private:
   using StorageOwnerInsertJob = memory_node_detail::StorageOwnerInsertJob;
   using FreshnessEntry = memory_node_detail::FreshnessEntry;
 
+  static constexpr size_t kDynamicFreshnessShardCount = 256;
+  static_assert((kDynamicFreshnessShardCount &
+                 (kDynamicFreshnessShardCount - 1)) == 0);
+
+  struct DynamicFreshnessShard {
+    std::mutex mutex;
+    dense_hashmap_t<node_t, FreshnessEntry> entries;
+    hashset_t<node_t> mutations_inflight;
+  };
+
+  DynamicFreshnessShard& dynamic_freshness_shard(node_t id) {
+    return dynamic_freshness_shards_[
+      std::hash<node_t>{}(id) & (kDynamicFreshnessShardCount - 1)];
+  }
+
   struct GlobalMedoidReadAwaitable;
   struct NodeSnapshotReadAwaitable;
   struct NodeSnapshotsReadAwaitable;
@@ -310,7 +325,7 @@ private:
   void start_storage_owner_insert_workers(const Configuration& config);
   void storage_owner_insert_worker_loop(u32 worker_id);
   void process_storage_owner_insert_task(const StorageOwnerInsertTask& task);
-  void enqueue_storage_owner_response(StorageOwnerResponseReady response);
+  void post_storage_owner_response(StorageOwnerResponseReady response);
   bool execute_storage_owner_batch_items_async(const node_t* ids,
                                                const service::storage_owner::MutationKind* kinds,
                                                const element_t* vectors,
@@ -590,8 +605,7 @@ private:
   std::mutex storage_insert_tasks_mutex_;
   std::condition_variable storage_insert_tasks_cv_;
   std::deque<StorageOwnerInsertTask> storage_insert_tasks_;
-  std::mutex storage_responses_mutex_;
-  std::deque<StorageOwnerResponseReady> storage_responses_ready_;
+  vec<u_ptr<std::mutex>> storage_client_send_mutexes_;
   vec<u_ptr<StorageOwnerThread>> storage_owner_threads_;
   vec<vec<vec<RemotePtr>>> storage_owner_async_candidates_;
   vec<std::thread> storage_insert_workers_;
@@ -602,9 +616,9 @@ private:
   filepath_t index_prefix_;
   std::unique_ptr<vamana::anchor::Index> storage_owner_anchor_index_;
   bool owner_idmap_required_{false};
-  std::mutex idmap_mutex_;
-  hashmap_t<node_t, FreshnessEntry> idmap_;
-  hashset_t<node_t> mutations_inflight_;
+  hashmap_t<node_t, FreshnessEntry> base_idmap_;
+  std::array<DynamicFreshnessShard, kDynamicFreshnessShardCount>
+    dynamic_freshness_shards_;
 
   inline static thread_local StorageOwnerThread* current_storage_owner_thread_{nullptr};
   inline static thread_local bool current_peer_rpc_progress_thread_{false};

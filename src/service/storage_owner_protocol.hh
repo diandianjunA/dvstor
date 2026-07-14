@@ -89,6 +89,11 @@ struct InsertBreakdownCounters {
   u64 storage_owner_remote_reverse_ns{};
   u64 storage_owner_peer_reverse_apply_ns{};
   u64 storage_owner_response_send_ns{};
+  u64 storage_owner_prepare_mutation_ns{};
+  u64 storage_owner_allocate_node_ns{};
+  u64 storage_owner_publish_mutation_ns{};
+  u64 storage_owner_schedule_maintenance_ns{};
+  u64 storage_owner_response_build_ns{};
 
   u64 storage_owner_search_select_ns{};
   u64 storage_owner_search_neighbor_read_ns{};
@@ -115,7 +120,12 @@ struct InsertBreakdownCounters {
            storage_owner_local_reverse_ns +
            storage_owner_remote_reverse_ns +
            storage_owner_peer_reverse_apply_ns +
-           storage_owner_response_send_ns;
+           storage_owner_response_send_ns +
+           storage_owner_prepare_mutation_ns +
+           storage_owner_allocate_node_ns +
+           storage_owner_publish_mutation_ns +
+           storage_owner_schedule_maintenance_ns +
+           storage_owner_response_build_ns;
   }
 };
 

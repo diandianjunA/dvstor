@@ -76,6 +76,16 @@ inline void add_storage_owner_breakdown(
                           per_item_ns(counters.storage_owner_peer_reverse_apply_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_response_send,
                           per_item_ns(counters.storage_owner_response_send_ns, item_count));
+  sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_prepare_mutation,
+                          per_item_ns(counters.storage_owner_prepare_mutation_ns, item_count));
+  sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_allocate_node,
+                          per_item_ns(counters.storage_owner_allocate_node_ns, item_count));
+  sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_publish_mutation,
+                          per_item_ns(counters.storage_owner_publish_mutation_ns, item_count));
+  sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_schedule_maintenance,
+                          per_item_ns(counters.storage_owner_schedule_maintenance_ns, item_count));
+  sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_response_build,
+                          per_item_ns(counters.storage_owner_response_build_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_search_select,
                           per_item_ns(counters.storage_owner_search_select_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_search_neighbor_read,

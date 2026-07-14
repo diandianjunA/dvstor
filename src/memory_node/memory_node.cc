@@ -261,6 +261,16 @@ MemoryNode::InsertBreakdownCounters MemoryNode::scale_breakdown(const InsertBrea
   out.storage_owner_peer_reverse_apply_ns =
     scale_ns(counters.storage_owner_peer_reverse_apply_ns, part, total);
   out.storage_owner_response_send_ns = scale_ns(counters.storage_owner_response_send_ns, part, total);
+  out.storage_owner_prepare_mutation_ns =
+    scale_ns(counters.storage_owner_prepare_mutation_ns, part, total);
+  out.storage_owner_allocate_node_ns =
+    scale_ns(counters.storage_owner_allocate_node_ns, part, total);
+  out.storage_owner_publish_mutation_ns =
+    scale_ns(counters.storage_owner_publish_mutation_ns, part, total);
+  out.storage_owner_schedule_maintenance_ns =
+    scale_ns(counters.storage_owner_schedule_maintenance_ns, part, total);
+  out.storage_owner_response_build_ns =
+    scale_ns(counters.storage_owner_response_build_ns, part, total);
   out.storage_owner_search_select_ns = scale_ns(counters.storage_owner_search_select_ns, part, total);
   out.storage_owner_search_neighbor_read_ns =
     scale_ns(counters.storage_owner_search_neighbor_read_ns, part, total);
