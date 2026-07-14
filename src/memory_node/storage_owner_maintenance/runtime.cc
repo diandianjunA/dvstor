@@ -47,8 +47,7 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   const size_t coroutine_scratch_stride =
     align_up(snapshot_stride * snapshot_batch +
              std::max(VamanaNode::total_size(), neighbor_stride));
-  const size_t scratch_bytes =
-    std::max<size_t>(64ull * 1024ull * 1024ull, coroutine_scratch_stride);
+  const size_t scratch_bytes = coroutine_scratch_stride;
 
   storage_owner_maintenance_worker_states_.reserve(worker_count);
   for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {

@@ -29,6 +29,20 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
         response = storage_responses_ready_.front();
         storage_responses_ready_.pop_front();
       }
+      byte_t* response_buffer = insert_runtime_.buffer.get_full_buffer() +
+        insert_response_slot_offset(config, response.client_id, response.slot_id);
+      const auto* response_header =
+        reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(
+          response_buffer);
+      if (response.queued_at != std::chrono::steady_clock::time_point{} &&
+          response_header->item_count > 0 &&
+          response_header->item_count <= config.storage_owner_batch_max) {
+        auto* breakdown = service::storage_owner::response_breakdown(
+          response_buffer, response_header->item_count);
+        breakdown->storage_owner_response_send_ns += static_cast<u64>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - response.queued_at).count());
+      }
       cm_.client_qps[response.client_id]->post_send_with_id(
         *insert_runtime_.region,
         response.byte_len,
@@ -117,7 +131,10 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
                  response_bytes <= std::numeric_limits<u32>::max(),
                  "storage_owner response exceeds the registered response slot");
       enqueue_storage_owner_response(
-        {client_id, slot_id, static_cast<u32>(response_bytes)});
+        {client_id,
+         slot_id,
+         static_cast<u32>(response_bytes),
+         std::chrono::steady_clock::now()});
     }
 
     if (!progressed) {
@@ -299,16 +316,26 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     const element_t* vec_ptr = vectors + idx * VamanaNode::DIM;
     const auto components = span<const element_t>{vec_ptr, VamanaNode::DIM};
     vec<RemotePtr> item_anchor_hints;
+    const bool local_stitch = storage_owner_local_stitch_mode(config);
     if (anchor_hints != nullptr) {
       item_anchor_hints.reserve(anchor_hint_count);
       for (u32 hint = 0; hint < anchor_hint_count; ++hint) {
         const RemotePtr ptr{anchor_hints[idx * anchor_hint_count + hint]};
-        if (!ptr.is_null()) item_anchor_hints.push_back(ptr);
+        if (!ptr.is_null() &&
+            (!local_stitch || local_shard(ptr.memory_node()))) {
+          item_anchor_hints.push_back(ptr);
+        }
       }
     }
-    const bool local_stitch = storage_owner_local_stitch_mode(config);
-    const bool use_anchors = storage_owner_local_stitch_mode(config) &&
-                             !item_anchor_hints.empty();
+    if (local_stitch && item_anchor_hints.empty() &&
+        storage_owner_anchor_index_ != nullptr &&
+        !storage_owner_anchor_index_->empty()) {
+      item_anchor_hints = storage_owner_anchor_index_->nearest_anchors(
+        components,
+        storage_id_,
+        std::max<u32>(1, config.storage_owner_anchor_hints));
+    }
+    const bool use_anchors = local_stitch && !item_anchor_hints.empty();
     vec<RemotePtr> candidates;
     if (use_anchors) {
       auto t_search = std::chrono::steady_clock::now();

@@ -1,0 +1,54 @@
+query_inputs
+  recall_source: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  recall_rows: 10000
+  performance_source: /data/xjs/datasets/sift1b/sift100m_to_105m_query.u8bin
+  performance_rows: 5000000
+  performance_row_reuse_policy: single_pass_no_reuse
+  performance_warmup/measure/total_rows_consumed: 712332/2349094/3061426
+throughput
+  duration_seconds: 120.124
+  total_ops_per_sec: 20382.6 (ops=2448436)
+  query_ops_per_sec: 19555.6 (ops=2349094)
+  write_ops_per_sec: 826.995 (ops=99342)
+  insert_ops_per_sec: 414.396 (ops=49779)
+  write_mix_completed: insert=49779 upsert=39469 delete=10094
+  query_head/tail_qps: 21946.9/17883.5
+  query_tail_to_head_ratio: 0.814854
+  zero_completion_windows: 0
+  acceptance_passed: false
+recall
+  recall@10: 0.9424
+  queries: 1000
+  passed: true
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+static_gt_post_recall
+  recall@10: 0.9416
+  queries: 1000
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+gpu_persistent
+  GPU memory explicit/base_pq/resident_pq/route/delta/graph_cache/exact_cache GiB: 7.25025/2.98023/3.75/0.00961304/0.25/0/0
+  average_batch_size: 1
+  average_submission_wait_us: 2.41484
+  rdma_read_bytes: 255783839896
+  graph_page_cache_hit_ratio: 0
+  graph_route_hit_ratio/refreshes: 0.147208/0
+  graph_cache_invalidations: 0
+  GPU query/prepare/graph/score/beam/exact us: 3049.24/318.032/900.742/545.596/372.724/133.59
+  average_visibility_us: 4391.45
+  publication queue/prepare/command us: 3727.92/14.8417/486.294
+  average_mutations_per_publication: 9.02344
+  delta logical/physical/L0/L1 entries: 111001/110995/99719/0
+  resident PQ current/peak/capacity/reclaimed: 101566/101566/67108864/0
+  mutation capacity rejected/current/peak: 0/0/113
+insert breakdown
+  count: 49779
+  latency_ms: mean=64.7535 p50=28.6921 p95=247.056 p99=507.391
+  cpu_ms: 3.16453e+06
+  rdma_ms: 58837.4
+query breakdown
+  count: 2349094
+  latency_ms: mean=3.26865 p50=3.18786 p95=4.19494 p99=5.19334
+  cpu_ms: 7.67837e+06
+  rdma_ms: 0

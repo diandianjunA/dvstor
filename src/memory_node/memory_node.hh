@@ -167,6 +167,8 @@ private:
   size_t peer_rpc_sync_send_offset(u32 peer_id) const;
   size_t peer_rpc_async_send_offset(u32 peer_id, u32 slot_id) const;
   size_t peer_rpc_receive_offset(u32 peer_id, u32 slot_id) const;
+  u32 acquire_peer_rpc_send_slot(u32 peer_id);
+  void release_peer_rpc_send_slot(u32 peer_id, u32 slot_id);
   void repost_peer_rpc_receive(u32 peer_id, u32 slot_id);
   void send_peer_rpc_message(u32 peer_id, const void* payload, size_t bytes);
   service::storage_owner::PeerRpcHeader make_peer_reverse_update_response(
@@ -307,7 +309,7 @@ private:
   void setup_insert_runtime(const Configuration& config);
   void start_storage_owner_insert_workers(const Configuration& config);
   void storage_owner_insert_worker_loop(u32 worker_id);
-  void process_storage_owner_insert_tasks(const vec<StorageOwnerInsertTask>& tasks);
+  void process_storage_owner_insert_task(const StorageOwnerInsertTask& task);
   void enqueue_storage_owner_response(StorageOwnerResponseReady response);
   bool execute_storage_owner_batch_items_async(const node_t* ids,
                                                const service::storage_owner::MutationKind* kinds,
@@ -500,16 +502,21 @@ private:
   std::condition_variable peer_rpc_responses_cv_;
   std::mutex peer_send_cq_mutex_;
   std::mutex peer_completion_mutex_;
+  std::condition_variable peer_completion_cv_;
   vec<ibv_wc> peer_send_wcs_;
   std::unordered_set<u64> peer_sync_completions_;
   std::unordered_map<u64, PeerPendingSend> peer_pending_sends_;
   vec<std::atomic<u32>> peer_rdma_read_outstanding_;
   vec<vec<std::atomic<u32>>> peer_rdma_read_qp_outstanding_;
   vec<vec<std::unique_ptr<std::mutex>>> peer_qp_send_mutexes_;
+  std::mutex peer_rpc_send_slots_mutex_;
+  std::condition_variable peer_rpc_send_slots_cv_;
+  vec<std::deque<u32>> peer_rpc_free_send_slots_;
   std::atomic<u32> peer_sync_wr_id_counter_{1};
   std::atomic<u32> peer_async_wr_id_counter_{1};
   std::atomic<u32> peer_async_rdma_outstanding_{0};
   std::atomic<u64> next_peer_request_id_{1};
+  std::atomic<bool> peer_rpc_progress_running_{false};
   std::thread peer_rpc_progress_thread_;
   vec<std::thread> peer_reverse_workers_;
   vec<std::thread> peer_stitch_search_workers_;
@@ -600,4 +607,5 @@ private:
   hashset_t<node_t> mutations_inflight_;
 
   inline static thread_local StorageOwnerThread* current_storage_owner_thread_{nullptr};
+  inline static thread_local bool current_peer_rpc_progress_thread_{false};
 };

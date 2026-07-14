@@ -218,8 +218,11 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
 
   const auto [owner, id] = decode_64bit(wr_id);
   if (owner == kPeerSyncWrOwner) {
-    std::lock_guard<std::mutex> lock(peer_completion_mutex_);
-    peer_sync_completions_.insert(wr_id);
+    {
+      std::lock_guard<std::mutex> lock(peer_completion_mutex_);
+      peer_sync_completions_.insert(wr_id);
+    }
+    peer_completion_cv_.notify_all();
     return;
   }
   if (owner < storage_owner_threads_.size() && storage_owner_threads_[owner]) {
@@ -251,6 +254,19 @@ bool MemoryNode::consume_peer_sync_completion(u64 wr_id) {
 }
 
 void MemoryNode::wait_peer_sync_completion(u64 wr_id) {
+  if (peer_rpc_progress_running_.load(std::memory_order_acquire) &&
+      !current_peer_rpc_progress_thread_) {
+    std::unique_lock<std::mutex> lock(peer_completion_mutex_);
+    peer_completion_cv_.wait(lock, [&]() {
+      return peer_sync_completions_.contains(wr_id) ||
+             !peer_rpc_progress_running_.load(std::memory_order_acquire);
+    });
+    const auto completion = peer_sync_completions_.find(wr_id);
+    if (completion != peer_sync_completions_.end()) {
+      peer_sync_completions_.erase(completion);
+      return;
+    }
+  }
   while (!consume_peer_sync_completion(wr_id)) {
     poll_peer_send_cq();
     std::this_thread::yield();

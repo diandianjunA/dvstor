@@ -1,15 +1,31 @@
 #include "memory_node/peer_rpc/detail.hh"
 
 void MemoryNode::peer_rpc_progress_loop() {
+  current_peer_rpc_progress_thread_ = true;
+  peer_rpc_progress_running_.store(true, std::memory_order_release);
   vec<ibv_wc> recv_wcs(std::max<i32>(1, peer_context_->get_config().max_recv_queue_wr));
   for (;;) {
     poll_peer_send_cq();
     const i32 num_received =
       peer_context_->poll_recv_cq(recv_wcs.data(), static_cast<i32>(recv_wcs.size()));
     if (num_received <= 0) {
+      bool responses_empty = false;
+      bool outgoing_empty = false;
+      if (peer_reverse_workers_done_.load(std::memory_order_acquire)) {
+        {
+          std::lock_guard<std::mutex> lock(peer_reverse_responses_mutex_);
+          responses_empty = peer_reverse_responses_.empty();
+        }
+        {
+          std::lock_guard<std::mutex> lock(peer_reverse_outgoing_mutex_);
+          outgoing_empty = peer_reverse_outgoing_.empty();
+        }
+      }
       if (peer_reverse_workers_done_.load(std::memory_order_acquire) &&
-          peer_reverse_responses_.empty() &&
-          peer_reverse_outgoing_.empty()) {
+          responses_empty && outgoing_empty) {
+        peer_rpc_progress_running_.store(false, std::memory_order_release);
+        peer_completion_cv_.notify_all();
+        current_peer_rpc_progress_thread_ = false;
         return;
       }
       std::this_thread::yield();

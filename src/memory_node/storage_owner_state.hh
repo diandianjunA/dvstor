@@ -161,6 +161,25 @@ struct StorageOwnerResponseReady {
   u32 client_id{};
   u32 slot_id{};
   u32 byte_len{};
+  std::chrono::steady_clock::time_point queued_at{};
+};
+
+struct StorageOwnerRequestScratch {
+  vec<service::storage_owner::MutationKind> kinds;
+  vec<element_t> decoded_vectors;
+  vec<vec<u64>> invalidated_neighbors;
+  vec<u32> statuses;
+  vec<service::storage_owner::MutationResult> results;
+  vec<u64> response_invalidations;
+
+  void clear() {
+    kinds.clear();
+    decoded_vectors.clear();
+    invalidated_neighbors.clear();
+    statuses.clear();
+    results.clear();
+    response_invalidations.clear();
+  }
 };
 
 struct StorageOwnerThread {
@@ -211,6 +230,7 @@ struct StorageOwnerThread {
   vec<ibv_wc> send_wcs;
   vec<std::atomic<i32>> post_balances;
   vec<StorageOwnerCoroutineScratch> coroutine_scratch_states;
+  StorageOwnerRequestScratch request_scratch;
   vec<u_ptr<StorageOwnerInsertCoroutine>> coroutines;
   HugePage<byte_t> scratch_buffer;
   std::unique_ptr<LocalMemoryRegion> scratch_region;

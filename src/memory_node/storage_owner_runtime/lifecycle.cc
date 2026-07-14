@@ -45,7 +45,8 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
                " prune_max_candidates=" + std::to_string(config.storage_owner_prune_max_candidates) +
                " update_mode=" + config.storage_owner_update_mode);
   if (storage_owner_local_stitch_mode(config)) {
-    print_status("storage-owner stage1=local outgoing graph only; reverse edges=batched stage2");
+    print_status("storage-owner stage1=direct local commit without peer RDMA; "
+                 "reverse edges=batched stage2");
   }
   const u32 cpu_parallelism = std::max<u32>(1, num_compute_threads_ / 2);
   const u32 rpc_parallelism = std::max<u32>(
@@ -63,8 +64,7 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
     align_up(snapshot_stride * snapshot_batch +
              std::max(VamanaNode::total_size(), neighbor_stride));
   const size_t scratch_bytes =
-    std::max<size_t>(64ull * 1024ull * 1024ull,
-                     coroutine_scratch_stride * std::max<u32>(1, coroutines_per_worker));
+    coroutine_scratch_stride * std::max<u32>(1, coroutines_per_worker);
   print_status("storage-owner coroutine scratch: snapshot_bytes=" +
                std::to_string(snapshot_bytes) +
                " snapshot_stride=" + std::to_string(snapshot_stride) +
@@ -77,7 +77,7 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
   storage_owner_threads_.reserve(worker_count);
   for (u32 i = 0; i < worker_count; ++i) {
     auto thread = std::make_unique<StorageOwnerThread>(i, coroutines_per_worker, config.max_send_queue_wr);
-    if (peer_context_) {
+    if (peer_context_ && !storage_owner_local_stitch_mode(config)) {
       thread->init_peer_scratch(*peer_context_, scratch_bytes, coroutine_scratch_stride);
     }
     storage_owner_threads_.push_back(std::move(thread));
@@ -95,7 +95,7 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
 void MemoryNode::storage_owner_insert_worker_loop(u32 worker_id) {
   current_storage_owner_thread_ = storage_owner_threads_[worker_id].get();
   for (;;) {
-    vec<StorageOwnerInsertTask> tasks;
+    StorageOwnerInsertTask task;
     {
       std::unique_lock<std::mutex> lock(storage_insert_tasks_mutex_);
       storage_insert_tasks_cv_.wait(lock, [&]() {
@@ -106,13 +106,13 @@ void MemoryNode::storage_owner_insert_worker_loop(u32 worker_id) {
         return;
       }
 
-      tasks.push_back(std::move(storage_insert_tasks_.front()));
+      task = std::move(storage_insert_tasks_.front());
       storage_insert_tasks_.pop_front();
     }
 
     mark_storage_owner_foreground_activity();
     storage_owner_insert_active_workers_.fetch_add(1, std::memory_order_acq_rel);
-    process_storage_owner_insert_tasks(tasks);
+    process_storage_owner_insert_task(task);
     storage_owner_insert_active_workers_.fetch_sub(1, std::memory_order_acq_rel);
     mark_storage_owner_foreground_activity();
   }
