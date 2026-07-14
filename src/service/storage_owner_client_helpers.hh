@@ -43,15 +43,16 @@ inline void add_storage_owner_breakdown(
   if (!sample || !sample->collects_breakdown()) {
     return;
   }
+  const bool has_peer_reads = counters.storage_owner_anchor_remote_expansions != 0;
   const u64 explained_search_ns =
     counters.storage_owner_search_select_ns +
-    counters.storage_owner_search_neighbor_read_ns +
-    counters.storage_owner_search_snapshot_read_ns +
+    (has_peer_reads ? counters.storage_owner_search_neighbor_read_ns : 0) +
+    (has_peer_reads ? counters.storage_owner_search_snapshot_read_ns : 0) +
     counters.storage_owner_search_distance_ns +
     counters.storage_owner_search_beam_update_ns +
     counters.storage_owner_search_result_sort_ns;
   const u64 explained_prune_ns =
-    counters.storage_owner_prune_snapshot_read_ns +
+    (has_peer_reads ? counters.storage_owner_prune_snapshot_read_ns : 0) +
     counters.storage_owner_prune_distance_ns +
     counters.storage_owner_prune_sort_ns +
     counters.storage_owner_prune_pair_distance_ns;
@@ -78,9 +79,13 @@ inline void add_storage_owner_breakdown(
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_search_select,
                           per_item_ns(counters.storage_owner_search_select_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_search_neighbor_read,
-                          per_item_ns(counters.storage_owner_search_neighbor_read_ns, item_count));
+                          per_item_ns(has_peer_reads
+                                        ? counters.storage_owner_search_neighbor_read_ns : 0,
+                                      item_count));
   sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_search_snapshot_read,
-                          per_item_ns(counters.storage_owner_search_snapshot_read_ns, item_count));
+                          per_item_ns(has_peer_reads
+                                        ? counters.storage_owner_search_snapshot_read_ns : 0,
+                                      item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_search_distance,
                           per_item_ns(counters.storage_owner_search_distance_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_search_beam_update,
@@ -88,7 +93,9 @@ inline void add_storage_owner_breakdown(
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_search_result_sort,
                           per_item_ns(counters.storage_owner_search_result_sort_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_prune_snapshot_read,
-                          per_item_ns(counters.storage_owner_prune_snapshot_read_ns, item_count));
+                          per_item_ns(has_peer_reads
+                                        ? counters.storage_owner_prune_snapshot_read_ns : 0,
+                                      item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_prune_distance,
                           per_item_ns(counters.storage_owner_prune_distance_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_prune_sort,

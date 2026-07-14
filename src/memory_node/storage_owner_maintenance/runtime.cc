@@ -33,13 +33,11 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   storage_owner_stitch_batches_.store(0, std::memory_order_relaxed);
   storage_owner_stitch_batched_items_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_active_workers_.store(0, std::memory_order_relaxed);
-  storage_owner_next_stitch_release_ns_.store(
-    steady_now_ns() +
-      (static_cast<u64>(storage_id_ % std::max<u32>(1, num_storage_nodes_)) *
-       kStitchCompactionPaceSlotNs),
-    std::memory_order_relaxed);
   storage_owner_maintenance_finalize_latency_ns_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_finalize_max_latency_ns_.store(0, std::memory_order_relaxed);
+  for (auto& bucket : storage_owner_maintenance_finalize_latency_buckets_) {
+    bucket.store(0, std::memory_order_relaxed);
+  }
   storage_owner_maintenance_started_ns_.store(steady_now_ns(), std::memory_order_release);
   storage_owner_maintenance_last_observation_ns_.store(0, std::memory_order_relaxed);
   const u32 worker_count = std::max<u32>(1, config.storage_owner_maintenance_workers);
@@ -68,13 +66,13 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
 
   print_status("storage-owner maintenance workers: " + std::to_string(worker_count) +
                " (configured=" + std::to_string(config.storage_owner_maintenance_workers) +
-               ", resource_gated_parallel_stitching=true)");
+               ", work_conserving=true)");
   print_status("storage-owner maintenance tuning: mode=" + config.storage_owner_maintenance_mode +
                " local_stitch=" + (config.storage_owner_update_mode == "local_stitch" ? "true" : "false") +
                " compaction_batch_target=" + std::to_string(config.storage_owner_batch_max) +
                " compaction_max_delay_ms=" +
                std::to_string(kStitchCompactionMaxDelayNs / 1000000ull) +
-               " compaction_pace=adaptive backlog_limit=" +
+               " backlog_limit=" +
                std::to_string(config.storage_owner_maintenance_queue_depth));
 }
 
@@ -134,15 +132,44 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
                                    ? 0.0
                                    : static_cast<double>(total_finalize_latency_ns) /
                                        static_cast<double>(finalized_live) / 1e6;
+  u64 p99_target = finalized_live == 0 ? 0 : (finalized_live * 99 + 99) / 100;
+  u64 p99_accumulated = 0;
+  size_t p99_bucket = 0;
+  for (; p99_bucket < storage_owner_maintenance_finalize_latency_buckets_.size();
+       ++p99_bucket) {
+    p99_accumulated += storage_owner_maintenance_finalize_latency_buckets_[p99_bucket].load(
+      std::memory_order_relaxed);
+    if (p99_accumulated >= p99_target) {
+      break;
+    }
+  }
+  const double p99_finalize_ms = finalized_live == 0
+    ? 0.0
+    : static_cast<double>(kFinalizeLatencyBucketUpperNs[
+        std::min(p99_bucket, kFinalizeLatencyBucketUpperNs.size() - 1)]) / 1e6;
   const u64 stitch_batches = storage_owner_stitch_batches_.load(std::memory_order_relaxed);
   const u64 stitch_batched_items =
     storage_owner_stitch_batched_items_.load(std::memory_order_relaxed);
   const u64 peer_stitch_enqueued = peer_stitch_search_enqueued_.load(std::memory_order_relaxed);
   const u64 peer_stitch_processed = peer_stitch_search_processed_.load(std::memory_order_relaxed);
   const u64 peer_stitch_items = peer_stitch_search_items_.load(std::memory_order_relaxed);
+  const u64 peer_reverse_enqueued =
+    peer_reverse_update_enqueued_.load(std::memory_order_relaxed);
+  const u64 peer_reverse_processed =
+    peer_reverse_update_processed_.load(std::memory_order_relaxed);
+  const u64 peer_reverse_items_enqueued =
+    peer_reverse_update_items_enqueued_.load(std::memory_order_relaxed);
+  const u64 peer_reverse_items_processed =
+    peer_reverse_update_items_processed_.load(std::memory_order_relaxed);
+  const u64 peer_reverse_remaining = peer_reverse_enqueued > peer_reverse_processed
+    ? peer_reverse_enqueued - peer_reverse_processed
+    : 0;
   const double peer_stitch_rate = elapsed_s > 0.0
                                     ? static_cast<double>(peer_stitch_items) / elapsed_s
                                     : 0.0;
+  const double peer_reverse_rate = elapsed_s > 0.0
+    ? static_cast<double>(peer_reverse_items_processed) / elapsed_s
+    : 0.0;
   const size_t remaining = stitch_remaining + cleanup_remaining;
   auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
     index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
@@ -175,6 +202,8 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
                std::to_string(ratio_or_zero(finalized_live, live_required)) +
                " avg_stitch_delay_ms=" +
                std::to_string(avg_finalize_ms) +
+               " p99_stitch_delay_upper_ms=" +
+               std::to_string(p99_finalize_ms) +
                " max_stitch_delay_ms=" +
                std::to_string(static_cast<double>(max_finalize_latency_ns) / 1e6) +
                " compaction_batch_target=" +
@@ -183,8 +212,6 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
                                 : 0) +
                " compaction_max_delay_ms=" +
                std::to_string(kStitchCompactionMaxDelayNs / 1000000ull) +
-               " compaction_pace_slot_ms=" +
-               std::to_string(kStitchCompactionPaceSlotNs / 1000000ull) +
                " stitch_rate_per_sec=" +
                std::to_string(repair_rate) +
                " failed=" +
@@ -211,6 +238,22 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
                std::to_string(peer_stitch_rate) +
                " peer_stitch_max_queue=" +
                std::to_string(peer_stitch_search_max_queue_.load(std::memory_order_relaxed)) +
+               " peer_reverse_enqueued=" +
+               std::to_string(peer_reverse_enqueued) +
+               " peer_reverse_processed=" +
+               std::to_string(peer_reverse_processed) +
+               " peer_reverse_remaining=" +
+               std::to_string(peer_reverse_remaining) +
+               " peer_reverse_items_enqueued=" +
+               std::to_string(peer_reverse_items_enqueued) +
+               " peer_reverse_items_processed=" +
+               std::to_string(peer_reverse_items_processed) +
+               " peer_reverse_rate_per_sec=" +
+               std::to_string(peer_reverse_rate) +
+               " peer_reverse_failed=" +
+               std::to_string(peer_reverse_update_failed_.load(std::memory_order_relaxed)) +
+               " peer_reverse_max_queue=" +
+               std::to_string(peer_reverse_update_max_queue_.load(std::memory_order_relaxed)) +
                " reclaim_ack=" +
                std::to_string(reclaim_ack) +
                " reclaim_pending=" +

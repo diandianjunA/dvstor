@@ -3,6 +3,7 @@
 #include "memory_node/memory_node.hh"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <iostream>
@@ -20,9 +21,33 @@ inline constexpr u64 kMaintenanceObservationPeriodNs =
   5ull * 1000ull * 1000ull * 1000ull;
 inline constexpr u64 kStitchCompactionMaxDelayNs =
   10ull * 1000ull * 1000ull;
-inline constexpr u64 kStitchCompactionPaceSlotNs =
-  1ull * 1000ull * 1000ull;
 inline constexpr size_t kForegroundQueueYieldMultiplier = 2;
+inline constexpr std::array<u64, 17> kFinalizeLatencyBucketUpperNs{
+  1ull * 1000ull * 1000ull,
+  2ull * 1000ull * 1000ull,
+  4ull * 1000ull * 1000ull,
+  8ull * 1000ull * 1000ull,
+  16ull * 1000ull * 1000ull,
+  32ull * 1000ull * 1000ull,
+  64ull * 1000ull * 1000ull,
+  128ull * 1000ull * 1000ull,
+  256ull * 1000ull * 1000ull,
+  512ull * 1000ull * 1000ull,
+  1ull * 1000ull * 1000ull * 1000ull,
+  2ull * 1000ull * 1000ull * 1000ull,
+  4ull * 1000ull * 1000ull * 1000ull,
+  8ull * 1000ull * 1000ull * 1000ull,
+  16ull * 1000ull * 1000ull * 1000ull,
+  30ull * 1000ull * 1000ull * 1000ull,
+  std::numeric_limits<u64>::max(),
+};
+
+inline size_t finalize_latency_bucket(u64 latency_ns) {
+  const auto it = std::lower_bound(kFinalizeLatencyBucketUpperNs.begin(),
+                                   kFinalizeLatencyBucketUpperNs.end(),
+                                   latency_ns);
+  return static_cast<size_t>(it - kFinalizeLatencyBucketUpperNs.begin());
+}
 
 inline u64 steady_now_ns() {
   return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -42,14 +67,6 @@ inline double ratio_or_zero(u64 numerator, u64 denominator) {
   return denominator == 0
            ? 0.0
            : static_cast<double>(numerator) / static_cast<double>(denominator);
-}
-
-inline u64 stitch_compaction_round_ns(u32 shard_count, size_t backlog,
-                                      size_t batch_limit, u32 worker_count) {
-  const size_t saturation_backlog = std::max<size_t>(
-    batch_limit, batch_limit * std::max<u32>(1, worker_count));
-  if (backlog >= saturation_backlog) return 0;
-  return kStitchCompactionPaceSlotNs * std::max<u32>(1, shard_count);
 }
 
 inline bool queue_near_limit(size_t size, size_t limit) {

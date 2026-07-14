@@ -139,6 +139,7 @@ private:
   void release_storage_insert_runtime();
   void run_storage_insert_sender(u32 owner_storage);
   void run_storage_insert_completion_loop();
+  void run_storage_insert_publication_loop();
   void post_storage_owner_batch(u32 owner_storage,
                                 u32 slot_id,
                                 vec<std::unique_ptr<StorageInsertTask>>&& tasks,
@@ -147,6 +148,8 @@ private:
   void handle_storage_owner_response(u32 owner_storage, u32 response_slot_id);
   void post_storage_owner_response_receive(u32 owner_storage, u32 response_slot_id);
   void complete_ready_storage_owner_slots();
+  void publish_ready_storage_owner_slots(
+      const vec<std::pair<u32, u32>>& ready_slots);
   void maybe_release_storage_owner_slot_locked(StorageOwnerSenderState& state,
                                                StorageOwnerRpcSlot& slot,
                                                bool gpu_visible);
@@ -171,6 +174,10 @@ private:
   std::unique_ptr<vamana::anchor::Index> anchor_index_;
   std::unique_ptr<gpu_search::PersistentSearchEngine> persistent_search_;
   std::thread storage_insert_completion_thread_;
+  std::thread storage_insert_publication_thread_;
+  std::mutex storage_insert_publication_mutex_;
+  std::condition_variable storage_insert_publication_cv_;
+  std::deque<vec<std::pair<u32, u32>>> storage_insert_publication_queue_;
   std::atomic<bool> storage_insert_shutdown_{false};
   std::atomic<bool> storage_insert_senders_done_{false};
   std::atomic<u32> storage_insert_inflight_{0};

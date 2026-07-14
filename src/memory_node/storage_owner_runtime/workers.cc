@@ -23,19 +23,33 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
   response_magics.reserve(tasks.size());
 
   for (const auto& task : tasks) {
-    const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(task.payload.data());
+    lib_assert(task.client_id < num_clients_ &&
+                 task.slot_id < insert_runtime_.request_slot_count,
+               "storage-owner task references an invalid request slot");
+    const byte_t* payload = insert_runtime_.buffer.get_full_buffer() +
+      insert_request_slot_offset(task.client_id, task.slot_id);
+    const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(payload);
     const bool mutation = request->magic == service::storage_owner::kMutationMagic;
+    const size_t expected_bytes = mutation
+      ? service::storage_owner::mutation_batch_request_bytes(
+          request->item_count, config.dim, request->anchor_hint_count)
+      : service::storage_owner::insert_batch_request_bytes(
+          request->item_count, config.dim, request->anchor_hint_count);
+    lib_assert(request->item_count == task.item_count &&
+                 request->batch_id == task.batch_id &&
+                 task.byte_len >= expected_bytes,
+               "storage-owner request slot changed before task execution");
     const node_t* ids = mutation
-      ? service::storage_owner::mutation_request_ids(task.payload.data())
-      : service::storage_owner::request_ids(task.payload.data());
+      ? service::storage_owner::mutation_request_ids(payload)
+      : service::storage_owner::request_ids(payload);
     const byte_t* vectors = mutation
-      ? service::storage_owner::mutation_request_vectors(task.payload.data(), request->item_count)
-      : service::storage_owner::request_vectors(task.payload.data(), request->item_count);
-    const u32* kinds = mutation ? service::storage_owner::mutation_request_kinds(task.payload.data())
+      ? service::storage_owner::mutation_request_vectors(payload, request->item_count)
+      : service::storage_owner::request_vectors(payload, request->item_count);
+    const u32* kinds = mutation ? service::storage_owner::mutation_request_kinds(payload)
                                 : nullptr;
     const u64* hints = mutation
-      ? service::storage_owner::mutation_request_anchor_hints(task.payload.data(), request->item_count)
-      : service::storage_owner::request_anchor_hints(task.payload.data(), request->item_count);
+      ? service::storage_owner::mutation_request_anchor_hints(payload, request->item_count)
+      : service::storage_owner::request_anchor_hints(payload, request->item_count);
     item_counts.push_back(request->item_count);
     response_magics.push_back(request->magic);
     batch_ids.insert(batch_ids.end(), ids, ids + request->item_count);
@@ -104,29 +118,32 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
   size_t status_base = 0;
   for (size_t task_idx = 0; task_idx < tasks.size(); ++task_idx) {
     const auto& task = tasks[task_idx];
-    const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(task.payload.data());
+    const byte_t* payload = insert_runtime_.buffer.get_full_buffer() +
+      insert_request_slot_offset(task.client_id, task.slot_id);
+    const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(payload);
     const u32 item_count = item_counts[task_idx];
     const size_t response_size = service::storage_owner::insert_batch_response_bytes(item_count);
     lib_assert(response_size <= std::numeric_limits<u32>::max(),
                "storage_owner async response is too large for verbs SGEs");
-    vec<byte_t> response_buffer(response_size);
-    auto* response = reinterpret_cast<service::storage_owner::InsertBatchResponseHeader*>(response_buffer.data());
+    byte_t* response_buffer = insert_runtime_.buffer.get_full_buffer() +
+      insert_response_slot_offset(config, task.client_id, task.slot_id);
+    auto* response = reinterpret_cast<service::storage_owner::InsertBatchResponseHeader*>(response_buffer);
     response->magic = response_magics[task_idx];
     response->owner_storage = storage_id_;
     response->item_count = item_count;
     response->batch_id = request->batch_id;
-    u32* response_statuses = service::storage_owner::response_statuses(response_buffer.data());
+    u32* response_statuses = service::storage_owner::response_statuses(response_buffer);
     for (u32 i = 0; i < item_count; ++i) {
       response_statuses[i] = ok ? statuses[status_base + i]
                                 : static_cast<u32>(service::storage_owner::MutationStatus::failed);
     }
     auto* response_results = service::storage_owner::response_mutation_results(
-      response_buffer.data(), item_count);
+      response_buffer, item_count);
     for (u32 i = 0; i < item_count; ++i) {
       response_results[i] = ok ? mutation_results[status_base + i]
                                : service::storage_owner::MutationResult{};
     }
-    *service::storage_owner::response_breakdown(response_buffer.data(), item_count) =
+    *service::storage_owner::response_breakdown(response_buffer, item_count) =
       scale_breakdown(breakdown, item_count, static_cast<u32>(std::max<size_t>(1, batch_ids.size())));
     const u32 invalidation_capacity = service::storage_owner::response_invalidation_capacity(item_count);
     vec<u64> task_invalidations;
@@ -143,19 +160,18 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
     lib_assert(task_invalidations.size() <= invalidation_capacity,
                "storage_owner async invalidation response exceeds its capacity");
     const u32 invalidation_count = static_cast<u32>(task_invalidations.size());
-    *service::storage_owner::response_invalidation_count(response_buffer.data(), item_count) = invalidation_count;
-    u64* invalidated = service::storage_owner::response_invalidated_raws(response_buffer.data(), item_count);
+    *service::storage_owner::response_invalidation_count(response_buffer, item_count) = invalidation_count;
+    u64* invalidated = service::storage_owner::response_invalidated_raws(response_buffer, item_count);
     for (u32 i = 0; i < invalidation_count; ++i) {
       invalidated[i] = task_invalidations[i];
     }
     status_base += item_count;
-
-    LocalMemoryRegion response_region{context_, response_buffer.data(), response_buffer.size()};
-    {
-      std::lock_guard<std::mutex> lock(storage_send_mutex_);
-      cm_.client_qps[task.client_id]->post_send(
-        response_region, static_cast<u32>(response_size), IBV_WR_SEND, true, nullptr, 0, 0);
-      context_.poll_send_cq_until_completion();
-    }
+    enqueue_storage_owner_response(
+      {task.client_id, task.slot_id, static_cast<u32>(response_size)});
   }
+}
+
+void MemoryNode::enqueue_storage_owner_response(StorageOwnerResponseReady response) {
+  std::lock_guard<std::mutex> lock(storage_responses_mutex_);
+  storage_responses_ready_.push_back(response);
 }

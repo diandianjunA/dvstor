@@ -112,10 +112,10 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
 
   vec<StorageOwnerMaintenanceTask> valid_tasks;
   vec<NodeSnapshot> targets;
-  vec<vec<RemotePtr>> candidate_pools;
+  vec<vec<NodeSnapshot>> candidate_snapshots;
   valid_tasks.reserve(tasks.size());
   targets.reserve(tasks.size());
-  candidate_pools.reserve(tasks.size());
+  candidate_snapshots.reserve(tasks.size());
 
   for (const StorageOwnerMaintenanceTask& task : tasks) {
     if (!local_shard(task.target.memory_node())) {
@@ -144,7 +144,8 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
 
     valid_tasks.push_back(task);
     targets.push_back(std::move(target_snapshot));
-    candidate_pools.push_back(read_neighbor_list(task.target));
+    candidate_snapshots.push_back(
+      read_node_snapshots_batched(read_neighbor_list(task.target), config));
   }
 
   if (valid_tasks.empty()) {
@@ -175,18 +176,19 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
       }
     }
     for (const PendingStitchRequest& request : pending) {
-      vec<vec<RemotePtr>> shard_candidates;
+      vec<vec<NodeSnapshot>> shard_candidates;
       if (!wait_for_peer_stitch_search_response(request.request_id, request.shard,
                                                 request.item_count, shard_candidates, config)) {
         retry_tasks.insert(retry_tasks.end(), valid_tasks.begin(), valid_tasks.end());
         return false;
       }
       u64 candidate_count = 0;
-      for (size_t i = 0; i < shard_candidates.size() && i < candidate_pools.size(); ++i) {
+      for (size_t i = 0; i < shard_candidates.size() && i < candidate_snapshots.size(); ++i) {
         candidate_count += shard_candidates[i].size();
-        candidate_pools[i].insert(candidate_pools[i].end(),
-                                  shard_candidates[i].begin(),
-                                  shard_candidates[i].end());
+        candidate_snapshots[i].insert(
+          candidate_snapshots[i].end(),
+          std::make_move_iterator(shard_candidates[i].begin()),
+          std::make_move_iterator(shard_candidates[i].end()));
       }
       storage_owner_stitch_external_requests_.fetch_add(1, std::memory_order_relaxed);
       storage_owner_stitch_external_candidates_.fetch_add(candidate_count,
@@ -200,19 +202,16 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
   for (size_t item = 0; item < valid_tasks.size(); ++item) {
     const StorageOwnerMaintenanceTask& task = valid_tasks[item];
     const NodeSnapshot& target_snapshot = targets[item];
-    vec<RemotePtr>& candidates = candidate_pools[item];
+    const vec<NodeSnapshot>& candidates = candidate_snapshots[item];
 
     hashset_t<RemotePtr> skip;
     skip.insert(task.target);
-    const u32 candidate_limit = static_cast<u32>(
-      std::max<size_t>(config.R, candidates.size()));
-    vec<RemotePtr> final_neighbors = robust_prune_cpu(target_snapshot.vector_data.data(),
-                                                      VamanaNode::vector_dtype(),
-                                                      candidates,
-                                                      skip,
-                                                      config,
-                                                      nullptr,
-                                                      candidate_limit);
+    vec<RemotePtr> final_neighbors = robust_prune_snapshots_cpu(
+      target_snapshot.vector_data.data(),
+      VamanaNode::vector_dtype(),
+      candidates,
+      skip,
+      config);
 
     lock_node(task.target);
     if (!storage_owner_task_current(task.id, task.generation, task.target)) {
@@ -242,22 +241,11 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
     unlock_node(task.target);
 
     dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>> task_remote_updates;
-    bool local_reverse_ok = true;
     for (const RemotePtr& neighbor : final_neighbors) {
-      if (local_shard(neighbor.memory_node())) {
-        vec<RemotePtr> reverse_candidate{task.target};
-        if (!apply_local_reverse_update(neighbor, reverse_candidate, config, false)) {
-          local_reverse_ok = false;
-          break;
-        }
-      } else {
+      if (!local_shard(neighbor.memory_node())) {
         task_remote_updates[neighbor.memory_node()].push_back(
           service::storage_owner::ReverseUpdateOp{neighbor.raw_address, task.target.raw_address});
       }
-    }
-    if (!local_reverse_ok) {
-      retry_tasks.push_back(task);
-      continue;
     }
     for (auto& [target_shard, ops] : task_remote_updates) {
       auto& merged = remote_updates[target_shard];
@@ -266,11 +254,9 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
     finalized_tasks.push_back(task);
   }
 
-  for (auto& [target_shard, ops] : remote_updates) {
-    if (!send_reverse_update_batch(target_shard, ops, config)) {
-      retry_tasks.insert(retry_tasks.end(), finalized_tasks.begin(), finalized_tasks.end());
-      return false;
-    }
+  if (!send_reverse_update_fanout_and_wait(remote_updates, config)) {
+    retry_tasks.insert(retry_tasks.end(), finalized_tasks.begin(), finalized_tasks.end());
+    return false;
   }
 
   for (const StorageOwnerMaintenanceTask& task : finalized_tasks) {
@@ -280,6 +266,8 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
         std::chrono::steady_clock::now() - task.queued_at).count());
     storage_owner_maintenance_finalize_latency_ns_.fetch_add(finalize_latency_ns,
                                                              std::memory_order_relaxed);
+    storage_owner_maintenance_finalize_latency_buckets_[
+      finalize_latency_bucket(finalize_latency_ns)].fetch_add(1, std::memory_order_relaxed);
     atomic_utils::update_max_relaxed(
       storage_owner_maintenance_finalize_max_latency_ns_, finalize_latency_ns);
   }

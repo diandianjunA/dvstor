@@ -203,9 +203,7 @@ bool MemoryNode::storage_owner_maintenance_foreground_busy(const Configuration&)
 }
 
 bool MemoryNode::try_acquire_storage_owner_maintenance_slot(const Configuration& config) {
-  const bool foreground_busy = storage_owner_maintenance_foreground_busy(config);
-  const u32 max_workers = foreground_busy
-    ? 1 : std::max<u32>(1, config.storage_owner_maintenance_workers);
+  const u32 max_workers = std::max<u32>(1, config.storage_owner_maintenance_workers);
   u32 active = storage_owner_maintenance_active_workers_.load(std::memory_order_acquire);
   while (active < max_workers) {
     if (storage_owner_maintenance_active_workers_.compare_exchange_weak(

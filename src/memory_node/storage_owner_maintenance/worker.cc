@@ -37,23 +37,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         const auto now = std::chrono::steady_clock::now();
         const bool candidate_ready =
           storage_owner_stitch_tasks_.size() >= batch_limit || now >= ready_at;
-        const size_t backlog =
-          storage_owner_stitch_tasks_.size() + storage_owner_cleanup_tasks_.size();
-        const u64 pace_ns = stitch_compaction_round_ns(
-          num_storage_nodes_, backlog, batch_limit,
-          std::max<u32>(1, config.storage_owner_maintenance_workers));
-        const u64 now_ns = steady_now_ns();
-        const u64 release_ns = storage_owner_next_stitch_release_ns_.load(std::memory_order_acquire);
-        if (candidate_ready && pace_ns != 0 && now_ns < release_ns) {
-          storage_owner_maintenance_cv_.wait_for(lock,
-                                                 std::chrono::nanoseconds(release_ns - now_ns),
-                                                 [&]() {
-                                                   return storage_owner_maintenance_shutdown_.load(
-                                                            std::memory_order_acquire) ||
-                                                          !storage_owner_cleanup_tasks_.empty();
-                                                 });
-          continue;
-        }
         if (!candidate_ready) {
           storage_owner_maintenance_cv_.wait_until(lock, ready_at, [&]() {
             return storage_owner_maintenance_shutdown_.load(std::memory_order_acquire) ||
@@ -94,18 +77,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         !storage_owner_stitch_tasks_.empty() &&
         now >= storage_owner_stitch_tasks_.front().queued_at +
                  std::chrono::nanoseconds(kStitchCompactionMaxDelayNs);
-      const size_t backlog =
-        storage_owner_stitch_tasks_.size() + storage_owner_cleanup_tasks_.size();
-      const u64 pace_ns = stitch_compaction_round_ns(
-        num_storage_nodes_, backlog, batch_limit,
-        std::max<u32>(1, config.storage_owner_maintenance_workers));
-      const u64 now_ns = steady_now_ns();
-      const u64 release_ns = storage_owner_next_stitch_release_ns_.load(std::memory_order_acquire);
-      if (!storage_owner_stitch_tasks_.empty() && (stitch_batch_full || stitch_wait_expired) &&
-          (pace_ns == 0 || now_ns >= release_ns)) {
-        storage_owner_next_stitch_release_ns_.store(
-          (pace_ns == 0 ? now_ns : std::max(now_ns, release_ns)) + pace_ns,
-          std::memory_order_release);
+      if (!storage_owner_stitch_tasks_.empty() &&
+          (stitch_batch_full || stitch_wait_expired)) {
         stitch_batch.reserve(batch_limit);
         while (!storage_owner_stitch_tasks_.empty() && stitch_batch.size() < batch_limit) {
           stitch_batch.push_back(std::move(storage_owner_stitch_tasks_.front()));

@@ -168,6 +168,8 @@ Args parse_args(int argc, char** argv) {
       args.min_recall = std::stod(require_value("--min-recall"));
     } else if (flag == "--min-query-qps") {
       args.min_query_qps = std::stod(require_value("--min-query-qps"));
+    } else if (flag == "--min-insert-qps") {
+      args.min_insert_qps = std::stod(require_value("--min-insert-qps"));
     } else if (flag == "--min-stability-ratio") {
       args.min_stability_ratio = std::stod(require_value("--min-stability-ratio"));
     } else if (flag == "--recall-only") {
@@ -221,6 +223,9 @@ Args parse_args(int argc, char** argv) {
   }
   if (args.min_query_qps < -1.0) {
     throw std::runtime_error("--min-query-qps must be -1 or non-negative");
+  }
+  if (args.min_insert_qps < -1.0) {
+    throw std::runtime_error("--min-insert-qps must be -1 or non-negative");
   }
   if (args.min_stability_ratio > 1.0 || args.min_stability_ratio < -1.0) {
     throw std::runtime_error("--min-stability-ratio must be -1 or in [0, 1]");

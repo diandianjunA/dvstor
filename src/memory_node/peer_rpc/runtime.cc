@@ -74,6 +74,12 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
     std::max<size_t>(1024, static_cast<size_t>(config.storage_owner_reverse_queue_depth));
   peer_stitch_search_task_queue_limit_ = peer_reverse_task_queue_limit_;
   peer_reverse_outgoing_queue_limit_ = peer_reverse_task_queue_limit_;
+  peer_reverse_update_enqueued_.store(0, std::memory_order_relaxed);
+  peer_reverse_update_processed_.store(0, std::memory_order_relaxed);
+  peer_reverse_update_items_enqueued_.store(0, std::memory_order_relaxed);
+  peer_reverse_update_items_processed_.store(0, std::memory_order_relaxed);
+  peer_reverse_update_failed_.store(0, std::memory_order_relaxed);
+  peer_reverse_update_max_queue_.store(0, std::memory_order_relaxed);
   peer_stitch_search_enqueued_.store(0, std::memory_order_relaxed);
   peer_stitch_search_processed_.store(0, std::memory_order_relaxed);
   peer_stitch_search_items_.store(0, std::memory_order_relaxed);
@@ -212,6 +218,7 @@ service::storage_owner::PeerRpcHeader MemoryNode::make_peer_reverse_update_respo
     bool success) const {
   service::storage_owner::PeerRpcHeader response{};
   response.magic = service::storage_owner::kPeerRpcMagic;
+  response.version = service::storage_owner::kPeerRpcVersion;
   response.type = static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response);
   response.source_shard = storage_id_;
   response.item_count = request.item_count;

@@ -31,7 +31,8 @@ void MemoryNode::peer_rpc_progress_loop() {
       }
 
       const auto* header = reinterpret_cast<const service::storage_owner::PeerRpcHeader*>(payload);
-      if (header->magic != service::storage_owner::kPeerRpcMagic) {
+      if (header->magic != service::storage_owner::kPeerRpcMagic ||
+          header->version != service::storage_owner::kPeerRpcVersion) {
         repost_peer_rpc_receive(peer_id, slot_id);
         continue;
       }
@@ -134,7 +135,17 @@ void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
     }
     peer_reverse_tasks_cv_.notify_one();
 
+    u64 processed_items = 0;
+    for (const PeerReverseUpdateTask& task : tasks) {
+      processed_items += task.ops.size();
+    }
     const bool success = apply_peer_reverse_update_tasks(tasks, config);
+    peer_reverse_update_processed_.fetch_add(tasks.size(), std::memory_order_relaxed);
+    peer_reverse_update_items_processed_.fetch_add(
+      processed_items, std::memory_order_relaxed);
+    if (!success) {
+      peer_reverse_update_failed_.fetch_add(1, std::memory_order_relaxed);
+    }
     for (const PeerReverseUpdateTask& task : tasks) {
       if ((task.header.reserved & kPeerRpcFlagNoResponse) == 0) {
         enqueue_peer_reverse_update_response(task.source_shard, task.header, success);
@@ -146,8 +157,6 @@ void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
 void MemoryNode::peer_stitch_search_worker_loop(u32 worker_id) {
   current_storage_owner_thread_ = peer_stitch_search_worker_states_[worker_id].get();
   const Configuration& config = *storage_worker_config_;
-  const u32 worker_count =
-    static_cast<u32>(std::max<size_t>(1, peer_stitch_search_worker_states_.size()));
   for (;;) {
     {
       std::unique_lock<std::mutex> lock(peer_stitch_search_tasks_mutex_);
@@ -162,52 +171,7 @@ void MemoryNode::peer_stitch_search_worker_loop(u32 worker_id) {
       }
     }
 
-    bool foreground_active =
-      storage_owner_insert_active_workers_.load(std::memory_order_acquire) != 0;
-    {
-      std::unique_lock<std::mutex> lock(storage_insert_tasks_mutex_, std::try_to_lock);
-      foreground_active = foreground_active || !lock.owns_lock() || !storage_insert_tasks_.empty();
-    }
-    u32 worker_limit = foreground_active
-                         ? std::max<u32>(1, worker_count / 4)
-                         : worker_count;
-    u32 active = peer_stitch_search_active_workers_.load(std::memory_order_acquire);
-    while (active >= worker_limit) {
-      std::unique_lock<std::mutex> lock(peer_stitch_search_tasks_mutex_);
-      peer_stitch_search_tasks_cv_.wait_for(lock, std::chrono::milliseconds(1), [&]() {
-        return peer_reverse_shutdown_.load(std::memory_order_acquire);
-      });
-      if (peer_reverse_shutdown_.load(std::memory_order_acquire) &&
-          peer_stitch_search_tasks_.empty()) {
-        current_storage_owner_thread_ = nullptr;
-        return;
-      }
-      foreground_active =
-        storage_owner_insert_active_workers_.load(std::memory_order_acquire) != 0;
-      {
-        std::unique_lock<std::mutex> insert_lock(storage_insert_tasks_mutex_, std::try_to_lock);
-        foreground_active = foreground_active || !insert_lock.owns_lock() ||
-                            !storage_insert_tasks_.empty();
-      }
-      const u32 refreshed_limit = foreground_active
-                                    ? std::max<u32>(1, worker_count / 4)
-                                    : worker_count;
-      worker_limit = refreshed_limit;
-      active = peer_stitch_search_active_workers_.load(std::memory_order_acquire);
-      if (active < refreshed_limit) {
-        break;
-      }
-    }
-    active = peer_stitch_search_active_workers_.load(std::memory_order_acquire);
-    while (active < worker_limit) {
-      if (peer_stitch_search_active_workers_.compare_exchange_weak(
-            active, active + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
-        break;
-      }
-    }
-    if (active >= worker_limit) {
-      continue;
-    }
+    peer_stitch_search_active_workers_.fetch_add(1, std::memory_order_acq_rel);
     atomic_utils::CounterDecrementGuard active_slot(
       peer_stitch_search_active_workers_);
 

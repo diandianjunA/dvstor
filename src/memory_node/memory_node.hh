@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <cfloat>
 #include <chrono>
 #include <cmath>
@@ -102,6 +103,7 @@ private:
   using PeerPendingSend = memory_node_detail::PeerPendingSend;
   using PeerRpcMessage = memory_node_detail::PeerRpcMessage;
   using StorageOwnerInsertTask = memory_node_detail::StorageOwnerInsertTask;
+  using StorageOwnerResponseReady = memory_node_detail::StorageOwnerResponseReady;
   using StorageOwnerThread = memory_node_detail::StorageOwnerThread;
   using StorageOwnerInsertJob = memory_node_detail::StorageOwnerInsertJob;
   using FreshnessEntry = memory_node_detail::FreshnessEntry;
@@ -209,7 +211,7 @@ private:
   bool wait_for_peer_stitch_search_response(u64 request_id,
                                             u32 target_shard,
                                             u32 item_count,
-                                            vec<vec<RemotePtr>>& candidates_by_item,
+                                            vec<vec<NodeSnapshot>>& candidates_by_item,
                                             const Configuration& config);
   bool post_stitch_search_request(u32 target_shard,
                                   const vec<NodeSnapshot>& targets,
@@ -234,6 +236,9 @@ private:
   bool send_reverse_update_batch(u32 target_shard,
                                  const vec<service::storage_owner::ReverseUpdateOp>& ops,
                                  const Configuration& config);
+  bool send_reverse_update_fanout_and_wait(
+      const dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>>& updates,
+      const Configuration& config);
   bool send_cleanup_deleted_batch(u32 target_shard,
                                   const vec<service::storage_owner::ReverseUpdateOp>& ops,
                                   const Configuration& config);
@@ -291,6 +296,7 @@ private:
   void start_storage_owner_insert_workers(const Configuration& config);
   void storage_owner_insert_worker_loop(u32 worker_id);
   void process_storage_owner_insert_tasks(const vec<StorageOwnerInsertTask>& tasks);
+  void enqueue_storage_owner_response(StorageOwnerResponseReady response);
   bool execute_storage_owner_batch_items_async(const node_t* ids,
                                                const service::storage_owner::MutationKind* kinds,
                                                const element_t* vectors,
@@ -308,7 +314,11 @@ private:
   size_t insert_response_slot_offset(const Configuration& config, u32 client_id, u32 slot_id) const;
   void service_storage_runtime(const Configuration& config);
   size_t response_slot_bytes(const Configuration& config) const;
-  size_t handle_storage_insert_request(u32 client_id, const byte_t* payload, size_t bytes, const Configuration& config);
+  size_t handle_storage_insert_request(u32 client_id,
+                                       u32 slot_id,
+                                       const byte_t* payload,
+                                       size_t bytes,
+                                       const Configuration& config);
   bool execute_storage_owner_batch_items(const node_t* ids,
                                          const service::storage_owner::MutationKind* kinds,
                                          const element_t* vectors,
@@ -386,7 +396,15 @@ private:
                                   const hashset_t<RemotePtr>& skip,
                                   const Configuration& config,
                                   InsertBreakdownCounters* breakdown = nullptr,
-                                  u32 candidate_limit_override = 0);
+                                  u32 candidate_limit_override = 0,
+                                  u32 result_limit_override = 0);
+  vec<RemotePtr> robust_prune_snapshots_cpu(
+      const byte_t* source,
+      VectorDType source_dtype,
+      const vec<NodeSnapshot>& candidates,
+      const hashset_t<RemotePtr>& skip,
+      const Configuration& config,
+      u32 result_limit_override = 0);
   auto execute_storage_owner_insert_job_async(StorageOwnerThread& thread,
                                               StorageOwnerInsertJob& job,
                                               dense_hashmap_t<u64, vec<RemotePtr>>& local_updates,
@@ -397,6 +415,12 @@ private:
                                   const vec<RemotePtr>& candidate_ptrs,
                                   const Configuration& config,
                                   bool enqueue_maintenance = true);
+  bool apply_local_reverse_updates_batched(
+      const dense_hashmap_t<u64, vec<RemotePtr>>& updates,
+      const Configuration& config);
+  bool apply_partition_local_reverse_update(RemotePtr target_ptr,
+                                            const vec<RemotePtr>& candidate_ptrs,
+                                            const Configuration& config);
 
   // Misc helpers
   static size_t align_up(size_t value, size_t alignment = kCacheLineBytes);
@@ -484,6 +508,12 @@ private:
   size_t peer_reverse_task_queue_limit_{1024};
   size_t peer_stitch_search_task_queue_limit_{1024};
   size_t peer_reverse_outgoing_queue_limit_{1024};
+  std::atomic<u64> peer_reverse_update_enqueued_{0};
+  std::atomic<u64> peer_reverse_update_processed_{0};
+  std::atomic<u64> peer_reverse_update_items_enqueued_{0};
+  std::atomic<u64> peer_reverse_update_items_processed_{0};
+  std::atomic<u64> peer_reverse_update_failed_{0};
+  std::atomic<u64> peer_reverse_update_max_queue_{0};
   std::atomic<u64> peer_stitch_search_enqueued_{0};
   std::atomic<u64> peer_stitch_search_processed_{0};
   std::atomic<u64> peer_stitch_search_items_{0};
@@ -511,11 +541,11 @@ private:
   std::atomic<u64> storage_owner_stitch_batches_{0};
   std::atomic<u64> storage_owner_stitch_batched_items_{0};
   std::atomic<u32> storage_owner_maintenance_active_workers_{0};
-  std::atomic<u64> storage_owner_next_stitch_release_ns_{0};
   std::atomic<u64> storage_owner_maintenance_started_ns_{0};
   std::atomic<u64> storage_owner_maintenance_last_observation_ns_{0};
   std::atomic<u64> storage_owner_maintenance_finalize_latency_ns_{0};
   std::atomic<u64> storage_owner_maintenance_finalize_max_latency_ns_{0};
+  std::array<std::atomic<u64>, 17> storage_owner_maintenance_finalize_latency_buckets_{};
   std::atomic<u64> storage_owner_foreground_last_active_ns_{0};
   std::mutex storage_owner_maintenance_sequence_mutex_;
   std::map<u64, u32> storage_owner_maintenance_sequence_remaining_;
@@ -524,10 +554,11 @@ private:
   std::atomic<u64> storage_owner_reclaim_candidates_{0};
   InsertRuntimeState insert_runtime_;
   std::unique_ptr<Configuration> storage_worker_config_;
-  std::mutex storage_send_mutex_;
   std::mutex storage_insert_tasks_mutex_;
   std::condition_variable storage_insert_tasks_cv_;
   std::deque<StorageOwnerInsertTask> storage_insert_tasks_;
+  std::mutex storage_responses_mutex_;
+  std::deque<StorageOwnerResponseReady> storage_responses_ready_;
   vec<u_ptr<StorageOwnerThread>> storage_owner_threads_;
   vec<vec<vec<RemotePtr>>> storage_owner_async_candidates_;
   vec<std::thread> storage_insert_workers_;

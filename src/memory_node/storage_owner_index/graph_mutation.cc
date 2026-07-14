@@ -8,7 +8,8 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
                                             const hashset_t<RemotePtr>& skip,
                                             const Configuration& config,
                                             InsertBreakdownCounters* breakdown,
-                                            u32 candidate_limit_override) {
+                                            u32 candidate_limit_override,
+                                            u32 result_limit_override) {
   StorageOwnerCoroutineScratch* scratch = current_storage_owner_thread_ != nullptr
                                             ? &current_storage_owner_thread_->coroutine_scratch_state()
                                             : nullptr;
@@ -28,11 +29,14 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
   const u32 prune_candidate_limit = candidate_limit_override == 0
                                       ? storage_owner_prune_candidate_limit(config)
                                       : std::max(config.R, candidate_limit_override);
+  const u32 result_limit = result_limit_override == 0
+                             ? config.R
+                             : std::min(config.R, result_limit_override);
   infos.reserve(candidates.size());
   filtered.reserve(std::min<size_t>(candidates.size(), prune_candidate_limit));
   batch.reserve(storage_owner_snapshot_batch_size(config, current_storage_owner_thread_));
-  selected.reserve(config.R);
-  selected_vectors.reserve(config.R);
+  selected.reserve(result_limit);
+  selected_vectors.reserve(result_limit);
 
   for (const RemotePtr& candidate : candidates) {
     if (candidate.is_null() || skip.contains(candidate)) {
@@ -78,7 +82,7 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
   }
 
   for (const auto& candidate : infos) {
-    if (selected.size() >= config.R) {
+    if (selected.size() >= result_limit) {
       break;
     }
 
@@ -103,6 +107,173 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
   }
 
   return selected;
+}
+
+vec<RemotePtr> MemoryNode::robust_prune_snapshots_cpu(
+    const byte_t* source,
+    VectorDType source_dtype,
+    const vec<NodeSnapshot>& candidates,
+    const hashset_t<RemotePtr>& skip,
+    const Configuration& config,
+    u32 result_limit_override) {
+  struct ScoredSnapshot {
+    const NodeSnapshot* snapshot{};
+    distance_t distance{};
+  };
+
+  const u32 result_limit = result_limit_override == 0
+                             ? config.R
+                             : std::min(config.R, result_limit_override);
+  vec<ScoredSnapshot> scored;
+  scored.reserve(candidates.size());
+  hashset_t<RemotePtr> seen;
+  for (const NodeSnapshot& candidate : candidates) {
+    if (candidate.rptr.is_null() || candidate.deleted ||
+        candidate.vector_data.size() < VamanaNode::vector_bytes() ||
+        skip.contains(candidate.rptr) || !seen.insert(candidate.rptr).second) {
+      continue;
+    }
+    scored.push_back({
+      &candidate,
+      distance_between_vectors(source,
+                               source_dtype,
+                               candidate.vector_data.data(),
+                               VamanaNode::vector_dtype(),
+                               config)});
+  }
+  std::sort(scored.begin(), scored.end(),
+            [](const ScoredSnapshot& lhs, const ScoredSnapshot& rhs) {
+              return lhs.distance < rhs.distance;
+            });
+
+  vec<RemotePtr> selected;
+  vec<const byte_t*> selected_vectors;
+  selected.reserve(result_limit);
+  selected_vectors.reserve(result_limit);
+  for (const ScoredSnapshot& candidate : scored) {
+    if (selected.size() >= result_limit) {
+      break;
+    }
+    bool pruned = false;
+    for (const byte_t* selected_vector : selected_vectors) {
+      const distance_t pair_distance = distance_between_vectors(
+        candidate.snapshot->vector_data.data(),
+        VamanaNode::vector_dtype(),
+        selected_vector,
+        VamanaNode::vector_dtype(),
+        config);
+      if (config.alpha * pair_distance <= candidate.distance) {
+        pruned = true;
+        break;
+      }
+    }
+    if (!pruned) {
+      selected.push_back(candidate.snapshot->rptr);
+      selected_vectors.push_back(candidate.snapshot->vector_data.data());
+    }
+  }
+  return selected;
+}
+
+bool MemoryNode::apply_partition_local_reverse_update(
+    RemotePtr target_ptr,
+    const vec<RemotePtr>& candidate_ptrs,
+    const Configuration& config) {
+  lib_assert(local_shard(target_ptr.memory_node()),
+             "partition-local reverse-update target must be local");
+  if (candidate_ptrs.empty()) {
+    return true;
+  }
+
+  vec<RemotePtr> unique_candidates;
+  unique_candidates.reserve(candidate_ptrs.size());
+  for (const RemotePtr& candidate : candidate_ptrs) {
+    if (candidate.is_null()) {
+      continue;
+    }
+    lib_assert(local_shard(candidate.memory_node()),
+               "foreground reverse-update candidate must be partition-local");
+    if (std::find(unique_candidates.begin(), unique_candidates.end(), candidate) ==
+        unique_candidates.end()) {
+      unique_candidates.push_back(candidate);
+    }
+  }
+  if (unique_candidates.empty()) {
+    return true;
+  }
+
+  lock_node(target_ptr);
+  const byte_t* target_node = local_node_ptr(target_ptr);
+  if ((*reinterpret_cast<const u64*>(target_node) & VamanaNode::HEADER_DELETED) != 0) {
+    unlock_node(target_ptr);
+    return true;
+  }
+
+  vec<RemotePtr> current_neighbors = read_neighbor_list(target_ptr);
+  vec<RemotePtr> preserved_external;
+  vec<RemotePtr> local_candidates;
+  preserved_external.reserve(current_neighbors.size());
+  local_candidates.reserve(current_neighbors.size() + unique_candidates.size());
+  for (const RemotePtr& neighbor : current_neighbors) {
+    if (neighbor.is_null()) {
+      continue;
+    }
+    if (local_shard(neighbor.memory_node())) {
+      local_candidates.push_back(neighbor);
+    } else {
+      preserved_external.push_back(neighbor);
+    }
+  }
+
+  bool changed = false;
+  for (const RemotePtr& candidate : unique_candidates) {
+    if (std::find(local_candidates.begin(), local_candidates.end(), candidate) ==
+        local_candidates.end()) {
+      local_candidates.push_back(candidate);
+      changed = true;
+    }
+  }
+  if (!changed) {
+    unlock_node(target_ptr);
+    return true;
+  }
+
+  const u32 local_capacity = preserved_external.size() >= config.R
+                               ? 0
+                               : config.R - static_cast<u32>(preserved_external.size());
+  vec<RemotePtr> selected_local;
+  if (local_candidates.size() <= local_capacity) {
+    selected_local = std::move(local_candidates);
+  } else if (local_capacity > 0) {
+    const auto target_vector_addr = vamana::StorageLayoutResolver::vector(target_ptr);
+    lib_assert(target_vector_addr.offset + target_vector_addr.size <= mn_memory_bytes_,
+               "partition-local reverse-update target vector exceeds shard bounds");
+    const byte_t* target_vector =
+      index_buffer_.get_full_buffer() + target_vector_addr.offset;
+    hashset_t<RemotePtr> skip;
+    selected_local = robust_prune_cpu(target_vector,
+                                      VamanaNode::vector_dtype(),
+                                      local_candidates,
+                                      skip,
+                                      config,
+                                      nullptr,
+                                      static_cast<u32>(local_candidates.size()),
+                                      local_capacity);
+  }
+
+  vec<RemotePtr> updated_neighbors;
+  updated_neighbors.reserve(preserved_external.size() + selected_local.size());
+  updated_neighbors.insert(updated_neighbors.end(),
+                           preserved_external.begin(),
+                           preserved_external.end());
+  updated_neighbors.insert(updated_neighbors.end(),
+                           selected_local.begin(),
+                           selected_local.end());
+  lib_assert(updated_neighbors.size() <= config.R,
+             "partition-local reverse-update exceeded graph degree");
+  write_neighbor_list(target_ptr, updated_neighbors);
+  unlock_node(target_ptr);
+  return true;
 }
 
 auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thread,

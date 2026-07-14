@@ -8,6 +8,7 @@ namespace service::storage_owner {
 constexpr u32 kInsertMagic = 0x53494e54;  // "SINT"
 constexpr u32 kMutationMagic = 0x4d555444;  // D T U M / "DUTM"
 constexpr u32 kPeerRpcMagic = 0x53505250;  // "SPRP"
+constexpr u32 kPeerRpcVersion = 2;
 
 enum class InsertStatus : u32 {
   ok = 0,
@@ -119,6 +120,7 @@ struct InsertBreakdownCounters {
 
 struct PeerRpcHeader {
   u32 magic{kPeerRpcMagic};
+  u32 version{kPeerRpcVersion};
   u32 type{};
   u32 source_shard{};
   u32 item_count{};
@@ -136,6 +138,12 @@ struct StitchSearchItem {
   u64 target_raw{};
   u32 id{};
   u32 generation{};
+};
+
+struct StitchSearchCandidate {
+  u64 raw{};
+  u32 generation{};
+  u32 reserved{};
 };
 
 constexpr size_t align_wire_u64(size_t value) {
@@ -331,9 +339,16 @@ inline size_t stitch_search_candidates_offset(u32 item_count) {
                         static_cast<size_t>(item_count) * sizeof(u32));
 }
 
+inline size_t stitch_search_candidate_vectors_offset(u32 item_count) {
+  return align_wire_u64(stitch_search_candidates_offset(item_count) +
+                        static_cast<size_t>(item_count) * VamanaNode::R *
+                          sizeof(StitchSearchCandidate));
+}
+
 inline size_t stitch_search_response_bytes(u32 item_count) {
-  return stitch_search_candidates_offset(item_count) +
-         static_cast<size_t>(item_count) * VamanaNode::R * sizeof(u64);
+  return stitch_search_candidate_vectors_offset(item_count) +
+         static_cast<size_t>(item_count) * VamanaNode::R *
+           VamanaNode::vector_bytes();
 }
 
 inline ReverseUpdateOp* reverse_update_ops(void* payload) {
@@ -369,14 +384,30 @@ inline const u32* stitch_search_response_counts(const void* payload) {
   return reinterpret_cast<const u32*>(reinterpret_cast<const byte_t*>(payload) + sizeof(PeerRpcHeader));
 }
 
-inline u64* stitch_search_response_candidates(void* payload, u32 item_count) {
-  return reinterpret_cast<u64*>(reinterpret_cast<byte_t*>(payload) +
-                                stitch_search_candidates_offset(item_count));
+inline StitchSearchCandidate* stitch_search_response_candidates(void* payload,
+                                                                 u32 item_count) {
+  return reinterpret_cast<StitchSearchCandidate*>(
+    reinterpret_cast<byte_t*>(payload) + stitch_search_candidates_offset(item_count));
 }
 
-inline const u64* stitch_search_response_candidates(const void* payload, u32 item_count) {
-  return reinterpret_cast<const u64*>(reinterpret_cast<const byte_t*>(payload) +
-                                      stitch_search_candidates_offset(item_count));
+inline const StitchSearchCandidate* stitch_search_response_candidates(
+    const void* payload,
+    u32 item_count) {
+  return reinterpret_cast<const StitchSearchCandidate*>(
+    reinterpret_cast<const byte_t*>(payload) + stitch_search_candidates_offset(item_count));
+}
+
+inline byte_t* stitch_search_response_candidate_vectors(void* payload,
+                                                         u32 item_count) {
+  return reinterpret_cast<byte_t*>(payload) +
+         stitch_search_candidate_vectors_offset(item_count);
+}
+
+inline const byte_t* stitch_search_response_candidate_vectors(
+    const void* payload,
+    u32 item_count) {
+  return reinterpret_cast<const byte_t*>(payload) +
+         stitch_search_candidate_vectors_offset(item_count);
 }
 
 }  // namespace service::storage_owner

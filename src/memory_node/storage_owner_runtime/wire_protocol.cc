@@ -5,6 +5,7 @@ using namespace memory_node_storage_owner_runtime_detail;
 void MemoryNode::service_storage_runtime(const Configuration& config) {
   print_status("storage-owner insert runtime enabled on shard " + std::to_string(storage_id_));
   vec<ibv_wc> recv_wcs(std::max<i32>(1, config.max_recv_queue_wr));
+  vec<ibv_wc> send_wcs(std::max<i32>(1, config.max_send_queue_wr));
 
   for (u32 client_id = 0; client_id < num_clients_; ++client_id) {
     for (u32 slot_id = 0; slot_id < insert_runtime_.request_slot_count; ++slot_id) {
@@ -17,11 +18,46 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
   }
 
   for (;;) {
-    const i32 num_received = context_.poll_recv_cq(recv_wcs.data(), static_cast<i32>(recv_wcs.size()));
-    if (num_received == 0) {
-      std::this_thread::yield();
-      continue;
+    bool progressed = false;
+    for (;;) {
+      StorageOwnerResponseReady response;
+      {
+        std::lock_guard<std::mutex> lock(storage_responses_mutex_);
+        if (storage_responses_ready_.empty()) {
+          break;
+        }
+        response = storage_responses_ready_.front();
+        storage_responses_ready_.pop_front();
+      }
+      cm_.client_qps[response.client_id]->post_send_with_id(
+        *insert_runtime_.region,
+        response.byte_len,
+        IBV_WR_SEND,
+        encode_64bit(response.client_id, response.slot_id),
+        true,
+        nullptr,
+        0,
+        insert_response_slot_offset(config, response.client_id, response.slot_id));
+      progressed = true;
     }
+
+    const i32 num_sent = context_.poll_send_cq(
+      send_wcs.data(), static_cast<i32>(send_wcs.size()));
+    progressed = progressed || num_sent > 0;
+    for (i32 i = 0; i < num_sent; ++i) {
+      const auto [client_id, slot_id] = decode_64bit(send_wcs[i].wr_id);
+      if (client_id >= num_clients_ || slot_id >= insert_runtime_.request_slot_count) {
+        continue;
+      }
+      cm_.client_qps[client_id]->post_receive(
+        *insert_runtime_.region,
+        static_cast<u32>(insert_runtime_.request_bytes),
+        encode_64bit(client_id, slot_id),
+        insert_request_slot_offset(client_id, slot_id));
+    }
+
+    const i32 num_received = context_.poll_recv_cq(recv_wcs.data(), static_cast<i32>(recv_wcs.size()));
+    progressed = progressed || num_received > 0;
 
     for (i32 i = 0; i < num_received; ++i) {
       const auto [client_id, slot_id] = decode_64bit(recv_wcs[i].wr_id);
@@ -55,10 +91,11 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
             bytes >= expected_bytes) {
           StorageOwnerInsertTask task;
           task.client_id = client_id;
+          task.slot_id = slot_id;
           task.item_count = request->item_count;
           task.batch_id = request->batch_id;
+          task.byte_len = bytes;
           task.received_at = std::chrono::steady_clock::now();
-          task.payload.assign(payload, payload + bytes);
           mark_storage_owner_foreground_activity();
           {
             std::lock_guard<std::mutex> lock(storage_insert_tasks_mutex_);
@@ -69,31 +106,22 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
         }
       }
 
-      cm_.client_qps[client_id]->post_receive(
-        *insert_runtime_.region,
-        static_cast<u32>(insert_runtime_.request_bytes),
-        encode_64bit(client_id, slot_id),
-        insert_request_slot_offset(client_id, slot_id));
-
       if (handled_async) {
         continue;
       }
 
-      const size_t response_bytes = handle_storage_insert_request(client_id, payload, bytes, config);
+      const size_t response_bytes = handle_storage_insert_request(
+        client_id, slot_id, payload, bytes, config);
       lib_assert(response_bytes > 0, "invalid storage-owner insert request");
       lib_assert(response_bytes <= response_slot_bytes(config) &&
                  response_bytes <= std::numeric_limits<u32>::max(),
                  "storage_owner response exceeds the registered response slot");
+      enqueue_storage_owner_response(
+        {client_id, slot_id, static_cast<u32>(response_bytes)});
+    }
 
-      cm_.client_qps[client_id]->post_send(
-        *insert_runtime_.region,
-        static_cast<u32>(response_bytes),
-        IBV_WR_SEND,
-        true,
-        nullptr,
-        0,
-        insert_response_slot_offset(config, client_id, slot_id));
-      context_.poll_send_cq_until_completion();
+    if (!progressed) {
+      std::this_thread::yield();
     }
   }
 }
@@ -102,7 +130,11 @@ size_t MemoryNode::response_slot_bytes(const Configuration& config) const {
   return align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max));
 }
 
-size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* payload, size_t bytes, const Configuration& config) {
+size_t MemoryNode::handle_storage_insert_request(u32 client_id,
+                                                 u32 slot_id,
+                                                 const byte_t* payload,
+                                                 size_t bytes,
+                                                 const Configuration& config) {
   if (bytes < sizeof(service::storage_owner::InsertBatchRequestHeader)) {
     return 0;
   }
@@ -129,9 +161,8 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id, const byte_t* pa
   }
 
   auto* response_ptr = reinterpret_cast<service::storage_owner::InsertBatchResponseHeader*>(
-    insert_runtime_.buffer.get_full_buffer() + insert_runtime_.response_offset +
-    static_cast<size_t>(client_id) *
-      response_slot_bytes(config));
+    insert_runtime_.buffer.get_full_buffer() +
+    insert_response_slot_offset(config, client_id, slot_id));
   response_ptr->magic = request->magic;
   response_ptr->owner_storage = storage_id_;
   response_ptr->item_count = request->item_count;
@@ -374,7 +405,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
 
   auto t_local_reverse = std::chrono::steady_clock::now();
   for (auto& [target_raw, candidates] : local_updates) {
-    if (!apply_local_reverse_update(RemotePtr{target_raw}, candidates, config)) {
+    if (!apply_partition_local_reverse_update(RemotePtr{target_raw}, candidates, config)) {
       return false;
     }
   }

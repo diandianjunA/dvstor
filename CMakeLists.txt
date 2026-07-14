@@ -110,6 +110,7 @@ set(DVSTOR_MEMORY_NODE_SOURCES
     src/memory_node/storage_owner_index/candidate_search.cc
     src/memory_node/storage_owner_index/graph_access.cc
     src/memory_node/storage_owner_index/graph_mutation.cc
+    src/memory_node/storage_owner_index/reverse_batch.cc
     src/memory_node/storage_owner_maintenance/graph_tasks.cc
     src/memory_node/storage_owner_maintenance/queue.cc
     src/memory_node/storage_owner_maintenance/runtime.cc

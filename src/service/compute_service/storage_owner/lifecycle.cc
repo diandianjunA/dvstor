@@ -31,6 +31,10 @@ void ComputeService::start_storage_insert_runtime() {
   storage_insert_shutdown_.store(false, std::memory_order_release);
   storage_insert_senders_done_.store(false, std::memory_order_release);
   storage_insert_inflight_.store(0, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(storage_insert_publication_mutex_);
+    storage_insert_publication_queue_.clear();
+  }
   storage_insert_owners_.reserve(owner_count);
   for (u32 owner = 0; owner < owner_count; ++owner) {
     auto state = std::make_unique<StorageOwnerSenderState>();
@@ -64,6 +68,8 @@ void ComputeService::start_storage_insert_runtime() {
     }
   }
 
+  storage_insert_publication_thread_ =
+    std::thread([this]() { run_storage_insert_publication_loop(); });
   storage_insert_completion_thread_ =
     std::thread([this]() { run_storage_insert_completion_loop(); });
   for (u32 owner = 0; owner < owner_count; ++owner) {
@@ -84,6 +90,16 @@ void ComputeService::stop_storage_insert_runtime() {
     if (state && state->thread.joinable()) {
       state->thread.join();
     }
+  }
+
+  storage_insert_senders_done_.store(true, std::memory_order_release);
+  storage_insert_publication_cv_.notify_all();
+  if (storage_insert_completion_thread_.joinable()) {
+    storage_insert_completion_thread_.join();
+  }
+  storage_insert_publication_cv_.notify_all();
+  if (storage_insert_publication_thread_.joinable()) {
+    storage_insert_publication_thread_.join();
   }
 
   for (auto& state : storage_insert_owners_) {
@@ -113,11 +129,10 @@ void ComputeService::stop_storage_insert_runtime() {
     }
   }
   storage_insert_inflight_.store(0, std::memory_order_release);
-  storage_insert_senders_done_.store(true, std::memory_order_release);
-  if (storage_insert_completion_thread_.joinable()) {
-    storage_insert_completion_thread_.join();
+  {
+    std::lock_guard<std::mutex> lock(storage_insert_publication_mutex_);
+    storage_insert_publication_queue_.clear();
   }
-
 }
 
 void ComputeService::release_storage_insert_runtime() {

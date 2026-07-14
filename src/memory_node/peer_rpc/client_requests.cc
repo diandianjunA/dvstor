@@ -38,7 +38,8 @@ bool MemoryNode::pump_peer_rpcs_locked(const Configuration&,
         continue;
       }
       const auto* header = reinterpret_cast<const service::storage_owner::PeerRpcHeader*>(payload);
-      if (header->magic != service::storage_owner::kPeerRpcMagic) {
+      if (header->magic != service::storage_owner::kPeerRpcMagic ||
+          header->version != service::storage_owner::kPeerRpcVersion) {
         repost_peer_rpc_receive(peer_id, slot_id);
         continue;
       }
@@ -93,7 +94,15 @@ bool MemoryNode::wait_for_peer_reverse_update_response(u64 request_id,
   for (;;) {
     const auto it = peer_rpc_responses_.find(request_id);
     if (it != peer_rpc_responses_.end()) {
-      const bool success = it->second.status == static_cast<u32>(service::storage_owner::InsertStatus::ok);
+      const auto& header = it->second;
+      const bool success =
+        header.magic == service::storage_owner::kPeerRpcMagic &&
+        header.version == service::storage_owner::kPeerRpcVersion &&
+        header.type == static_cast<u32>(
+          service::storage_owner::PeerRpcType::reverse_update_response) &&
+        header.source_shard == target_shard &&
+        header.item_count == item_count &&
+        header.status == static_cast<u32>(service::storage_owner::InsertStatus::ok);
       peer_rpc_responses_.erase(it);
       peer_rpc_pending_responses_.erase(request_id);
       lock.unlock();
@@ -123,7 +132,7 @@ bool MemoryNode::wait_for_peer_reverse_update_response(u64 request_id,
 bool MemoryNode::wait_for_peer_stitch_search_response(u64 request_id,
                                                       u32 target_shard,
                                                       u32 item_count,
-                                                      vec<vec<RemotePtr>>& candidates_by_item,
+                                                      vec<vec<NodeSnapshot>>& candidates_by_item,
                                                       const Configuration& config) {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(config.storage_owner_rpc_timeout_ms);
@@ -134,6 +143,12 @@ bool MemoryNode::wait_for_peer_stitch_search_response(u64 request_id,
       const auto header = it->second;
       auto payload_it = peer_rpc_response_payloads_.find(request_id);
       const bool success =
+        header.magic == service::storage_owner::kPeerRpcMagic &&
+        header.version == service::storage_owner::kPeerRpcVersion &&
+        header.type == static_cast<u32>(
+          service::storage_owner::PeerRpcType::stitch_search_response) &&
+        header.source_shard == target_shard &&
+        header.item_count == item_count &&
         header.status == static_cast<u32>(service::storage_owner::InsertStatus::ok) &&
         payload_it != peer_rpc_response_payloads_.end() &&
         payload_it->second.size() >= service::storage_owner::stitch_search_response_bytes(item_count);
@@ -141,14 +156,25 @@ bool MemoryNode::wait_for_peer_stitch_search_response(u64 request_id,
         candidates_by_item.assign(item_count, {});
         const byte_t* payload = payload_it->second.data();
         const u32* counts = service::storage_owner::stitch_search_response_counts(payload);
-        const u64* raws = service::storage_owner::stitch_search_response_candidates(payload, item_count);
+        const auto* candidates =
+          service::storage_owner::stitch_search_response_candidates(payload, item_count);
+        const byte_t* vectors =
+          service::storage_owner::stitch_search_response_candidate_vectors(payload, item_count);
         for (u32 item = 0; item < item_count; ++item) {
           const u32 count = std::min<u32>(counts[item], VamanaNode::R);
           candidates_by_item[item].reserve(count);
           for (u32 i = 0; i < count; ++i) {
-            const u64 raw = raws[static_cast<size_t>(item) * VamanaNode::R + i];
-            if (raw != 0) {
-              candidates_by_item[item].emplace_back(raw);
+            const size_t slot = static_cast<size_t>(item) * VamanaNode::R + i;
+            const auto& candidate = candidates[slot];
+            if (candidate.raw != 0) {
+              NodeSnapshot snapshot;
+              snapshot.rptr = RemotePtr{candidate.raw};
+              snapshot.generation = candidate.generation;
+              snapshot.vector_data.resize(VamanaNode::vector_bytes());
+              std::memcpy(snapshot.vector_data.data(),
+                          vectors + slot * VamanaNode::vector_bytes(),
+                          VamanaNode::vector_bytes());
+              candidates_by_item[item].push_back(std::move(snapshot));
             }
           }
         }
@@ -197,6 +223,7 @@ bool MemoryNode::post_stitch_search_request(u32 target_shard,
   vec<byte_t> message(bytes, 0);
   auto* header = reinterpret_cast<service::storage_owner::PeerRpcHeader*>(message.data());
   header->magic = service::storage_owner::kPeerRpcMagic;
+  header->version = service::storage_owner::kPeerRpcVersion;
   header->type = static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_request);
   header->source_shard = storage_id_;
   header->item_count = item_count;
@@ -295,6 +322,7 @@ bool MemoryNode::send_peer_op_batch_direct(u32 target_shard,
     vec<byte_t> message(bytes);
     auto* header = reinterpret_cast<service::storage_owner::PeerRpcHeader*>(message.data());
     header->magic = service::storage_owner::kPeerRpcMagic;
+    header->version = service::storage_owner::kPeerRpcVersion;
     header->type = static_cast<u32>(rpc_type);
     header->source_shard = storage_id_;
     header->item_count = item_count;
@@ -353,6 +381,67 @@ bool MemoryNode::send_reverse_update_batch(u32 target_shard,
     return enqueue_reverse_update_batch(target_shard, ops, config);
   }
   return send_reverse_update_batch_direct(target_shard, ops, true, config);
+}
+
+bool MemoryNode::send_reverse_update_fanout_and_wait(
+    const dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>>& updates,
+    const Configuration& config) {
+  struct PendingResponse {
+    u64 request_id{};
+    u32 target_shard{};
+    u32 item_count{};
+  };
+
+  const u64 max_items_u64 =
+    std::max<u64>(1, static_cast<u64>(config.R) * config.storage_owner_batch_max);
+  lib_assert(max_items_u64 <= std::numeric_limits<u32>::max(),
+             "storage-owner reverse-update RPC batch is too large for the wire format");
+  const u32 max_items = static_cast<u32>(max_items_u64);
+  vec<PendingResponse> pending;
+
+  for (const auto& [target_shard, ops] : updates) {
+    lib_assert(target_shard < num_storage_nodes_ && target_shard != storage_id_,
+               "reverse-update fanout target must be a remote storage shard");
+    for (size_t begin = 0; begin < ops.size(); begin += max_items) {
+      const u32 item_count = static_cast<u32>(
+        std::min<size_t>(ops.size() - begin, max_items));
+      const size_t bytes = service::storage_owner::reverse_update_request_bytes(item_count);
+      lib_assert(bytes <= peer_rpc_runtime_.message_bytes,
+                 "storage-owner reverse-update fanout exceeds the registered slot size");
+      vec<byte_t> message(bytes, 0);
+      auto* header = reinterpret_cast<service::storage_owner::PeerRpcHeader*>(
+        message.data());
+      header->magic = service::storage_owner::kPeerRpcMagic;
+      header->version = service::storage_owner::kPeerRpcVersion;
+      header->type = static_cast<u32>(
+        service::storage_owner::PeerRpcType::reverse_update_request);
+      header->source_shard = storage_id_;
+      header->item_count = item_count;
+      header->request_id = next_peer_request_id_.fetch_add(
+        1, std::memory_order_relaxed);
+      {
+        std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
+        peer_rpc_pending_responses_.insert(header->request_id);
+      }
+      auto* payload_ops = service::storage_owner::reverse_update_ops(message.data());
+      std::memcpy(payload_ops,
+                  ops.data() + begin,
+                  static_cast<size_t>(item_count) *
+                    sizeof(service::storage_owner::ReverseUpdateOp));
+      send_peer_rpc_message(target_shard, message.data(), bytes);
+      pending.push_back({header->request_id, target_shard, item_count});
+    }
+  }
+
+  bool success = true;
+  for (const PendingResponse& response : pending) {
+    success &= wait_for_peer_reverse_update_response(
+      response.request_id,
+      response.target_shard,
+      response.item_count,
+      config);
+  }
+  return success;
 }
 
 bool MemoryNode::send_cleanup_deleted_batch(

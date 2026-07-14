@@ -137,10 +137,17 @@ struct PeerRpcMessage {
 
 struct StorageOwnerInsertTask {
   u32 client_id{};
+  u32 slot_id{};
   u32 item_count{};
   u64 batch_id{};
+  size_t byte_len{};
   std::chrono::steady_clock::time_point received_at{};
-  vec<byte_t> payload;
+};
+
+struct StorageOwnerResponseReady {
+  u32 client_id{};
+  u32 slot_id{};
+  u32 byte_len{};
 };
 
 struct StorageOwnerThread {

@@ -143,6 +143,8 @@ FormattedReport format_report(const nlohmann::json& root,
            << " (ops=" << query_ops << ")\n";
     output << "  write_ops_per_sec: " << throughput.value("write_ops_per_sec", 0.0)
            << " (ops=" << write_ops << ")\n";
+    output << "  insert_ops_per_sec: " << throughput.value("insert_ops_per_sec", 0.0)
+           << " (ops=" << throughput.value("insert_ops", 0ULL) << ")\n";
     if (root["meta"].value("workload", "") == "mixed") {
       output << "  write_mix_completed: insert=" << throughput.value("insert_ops", 0ULL)
              << " upsert=" << throughput.value("upsert_ops", 0ULL)

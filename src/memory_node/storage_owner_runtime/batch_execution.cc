@@ -119,7 +119,7 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
   }
   auto t_local_reverse = std::chrono::steady_clock::now();
   for (auto& [target_raw, candidates] : local_updates) {
-    ok &= apply_local_reverse_update(RemotePtr{target_raw}, candidates, config);
+    ok &= apply_partition_local_reverse_update(RemotePtr{target_raw}, candidates, config);
   }
   breakdown.storage_owner_local_reverse_ns += elapsed_ns_since(t_local_reverse);
   auto t_remote_reverse = std::chrono::steady_clock::now();

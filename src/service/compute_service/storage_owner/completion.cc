@@ -27,11 +27,6 @@ void ComputeService::run_storage_insert_completion_loop() {
   for (;;) {
     bool progressed = poll_completions();
     if (progressed) {
-      const auto deadline = std::chrono::steady_clock::now() +
-        std::chrono::microseconds(config_.update_visibility_us);
-      while (std::chrono::steady_clock::now() < deadline) {
-        if (!poll_completions()) std::this_thread::yield();
-      }
       complete_ready_storage_owner_slots();
     }
 
@@ -43,6 +38,27 @@ void ComputeService::run_storage_insert_completion_loop() {
     if (!progressed) {
       std::this_thread::yield();
     }
+  }
+}
+
+void ComputeService::run_storage_insert_publication_loop() {
+  for (;;) {
+    vec<std::pair<u32, u32>> ready_slots;
+    {
+      std::unique_lock<std::mutex> lock(storage_insert_publication_mutex_);
+      storage_insert_publication_cv_.wait(lock, [&]() {
+        return !storage_insert_publication_queue_.empty() ||
+               (storage_insert_shutdown_.load(std::memory_order_acquire) &&
+                storage_insert_senders_done_.load(std::memory_order_acquire) &&
+                storage_insert_inflight_.load(std::memory_order_acquire) == 0);
+      });
+      if (storage_insert_publication_queue_.empty()) {
+        return;
+      }
+      ready_slots = std::move(storage_insert_publication_queue_.front());
+      storage_insert_publication_queue_.pop_front();
+    }
+    publish_ready_storage_owner_slots(ready_slots);
   }
 }
 
@@ -150,98 +166,112 @@ void ComputeService::complete_ready_storage_owner_slots() {
     }
     if (ready_slots.empty()) return;
 
-    std::vector<gpu_search::DeltaMutation> mutations;
-    mutations.reserve(ready_items);
-    std::vector<u64> invalidated_graph_nodes;
-    invalidated_graph_nodes.reserve(static_cast<size_t>(ready_items) * config_.R);
-    for (const auto& [owner_storage, slot_id] : ready_slots) {
-      const auto& slot = storage_insert_owners_[owner_storage]->slots[slot_id];
-      const auto* response =
-        reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(
-          slot.response_buffer.data());
-      const auto* request =
-        reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(
-          slot.request_buffer.data());
-      bool response_ok =
-        (response->magic == service::storage_owner::kInsertMagic ||
-         response->magic == service::storage_owner::kMutationMagic) &&
-        response->magic == request->magic &&
-        response->owner_storage == slot.owner_storage &&
-        response->batch_id == slot.batch_id &&
-        response->item_count == slot.item_count;
-      if (response_ok) {
-        const u32 invalidation_count =
-          *service::storage_owner::response_invalidation_count(
-            slot.response_buffer.data(), slot.item_count);
-        response_ok = invalidation_count <=
-          service::storage_owner::response_invalidation_capacity(slot.item_count);
-      }
-      if (!response_ok) continue;
+    {
+      std::lock_guard<std::mutex> lock(storage_insert_publication_mutex_);
+      storage_insert_publication_queue_.push_back(std::move(ready_slots));
+    }
+    storage_insert_publication_cv_.notify_one();
+  }
+}
+
+void ComputeService::publish_ready_storage_owner_slots(
+    const vec<std::pair<u32, u32>>& ready_slots) {
+  u32 ready_items = 0;
+  for (const auto& [owner_storage, slot_id] : ready_slots) {
+    ready_items += storage_insert_owners_[owner_storage]->slots[slot_id].item_count;
+  }
+
+  std::vector<gpu_search::DeltaMutation> mutations;
+  mutations.reserve(ready_items);
+  std::vector<u64> invalidated_graph_nodes;
+  invalidated_graph_nodes.reserve(static_cast<size_t>(ready_items) * config_.R);
+  for (const auto& [owner_storage, slot_id] : ready_slots) {
+    const auto& slot = storage_insert_owners_[owner_storage]->slots[slot_id];
+    const auto* response =
+      reinterpret_cast<const service::storage_owner::InsertBatchResponseHeader*>(
+        slot.response_buffer.data());
+    const auto* request =
+      reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(
+        slot.request_buffer.data());
+    bool response_ok =
+      (response->magic == service::storage_owner::kInsertMagic ||
+       response->magic == service::storage_owner::kMutationMagic) &&
+      response->magic == request->magic &&
+      response->owner_storage == slot.owner_storage &&
+      response->batch_id == slot.batch_id &&
+      response->item_count == slot.item_count;
+    if (response_ok) {
       const u32 invalidation_count =
         *service::storage_owner::response_invalidation_count(
           slot.response_buffer.data(), slot.item_count);
-      const u64* invalidated_raws =
-        service::storage_owner::response_invalidated_raws(
-          slot.response_buffer.data(), slot.item_count);
-      for (u32 index = 0; index < invalidation_count; ++index) {
-        if (invalidated_raws[index] != 0) {
-          invalidated_graph_nodes.push_back(invalidated_raws[index]);
-        }
-      }
-      const u32* statuses = service::storage_owner::response_statuses(
-        slot.response_buffer.data());
-      const auto* results = service::storage_owner::response_mutation_results(
+      response_ok = invalidation_count <=
+        service::storage_owner::response_invalidation_capacity(slot.item_count);
+    }
+    if (!response_ok) continue;
+    const u32 invalidation_count =
+      *service::storage_owner::response_invalidation_count(
         slot.response_buffer.data(), slot.item_count);
-      const bool mutation_request = request->magic == service::storage_owner::kMutationMagic;
-      const byte_t* request_vectors = mutation_request
-        ? service::storage_owner::mutation_request_vectors(
-            slot.request_buffer.data(), slot.item_count)
-        : service::storage_owner::request_vectors(
-            slot.request_buffer.data(), slot.item_count);
-      for (u32 item = 0; item < slot.item_count; ++item) {
-        if (statuses[item] != 0) continue;
-        gpu_search::DeltaMutation mutation;
-        mutation.id = slot.tasks[item]->item.id;
-        mutation.kind = slot.tasks[item]->kind;
-        mutation.generation = results[item].generation;
-        mutation.remote_node = results[item].new_rptr_raw;
-        mutation.old_remote_node = results[item].old_rptr_raw;
-        mutation.anchor_hint = slot.tasks[item]->anchor_bucket_hint.raw_address;
-        mutation.maintenance_sequence = results[item].maintenance_sequence;
-        mutation.owner_storage = owner_storage;
-        mutation.enqueued_at = slot.response_completed_at;
-        if (mutation.kind != service::storage_owner::MutationKind::erase) {
-          const byte_t* vector = request_vectors +
-            static_cast<size_t>(item) * VamanaNode::vector_bytes();
-          mutation.vector.assign(vector, vector + VamanaNode::vector_bytes());
-        }
-        mutations.push_back(std::move(mutation));
+    const u64* invalidated_raws =
+      service::storage_owner::response_invalidated_raws(
+        slot.response_buffer.data(), slot.item_count);
+    for (u32 index = 0; index < invalidation_count; ++index) {
+      if (invalidated_raws[index] != 0) {
+        invalidated_graph_nodes.push_back(invalidated_raws[index]);
       }
     }
+    const u32* statuses = service::storage_owner::response_statuses(
+      slot.response_buffer.data());
+    const auto* results = service::storage_owner::response_mutation_results(
+      slot.response_buffer.data(), slot.item_count);
+    const bool mutation_request = request->magic == service::storage_owner::kMutationMagic;
+    const byte_t* request_vectors = mutation_request
+      ? service::storage_owner::mutation_request_vectors(
+          slot.request_buffer.data(), slot.item_count)
+      : service::storage_owner::request_vectors(
+          slot.request_buffer.data(), slot.item_count);
+    for (u32 item = 0; item < slot.item_count; ++item) {
+      if (statuses[item] != 0) continue;
+      gpu_search::DeltaMutation mutation;
+      mutation.id = slot.tasks[item]->item.id;
+      mutation.kind = slot.tasks[item]->kind;
+      mutation.generation = results[item].generation;
+      mutation.remote_node = results[item].new_rptr_raw;
+      mutation.old_remote_node = results[item].old_rptr_raw;
+      mutation.anchor_hint = slot.tasks[item]->anchor_bucket_hint.raw_address;
+      mutation.maintenance_sequence = results[item].maintenance_sequence;
+      mutation.owner_storage = owner_storage;
+      mutation.enqueued_at = slot.response_completed_at;
+      if (mutation.kind != service::storage_owner::MutationKind::erase) {
+        const byte_t* vector = request_vectors +
+          static_cast<size_t>(item) * VamanaNode::vector_bytes();
+        mutation.vector.assign(vector, vector + VamanaNode::vector_bytes());
+      }
+      mutations.push_back(std::move(mutation));
+    }
+  }
 
-    bool gpu_visible = true;
-    if (persistent_search_ != nullptr && !mutations.empty()) {
-      try {
-        const u64 epoch = persistent_search_->delta().reserve_epoch();
-        gpu_visible = persistent_search_->publish_mutations(
-          std::move(mutations), epoch, invalidated_graph_nodes);
-      } catch (const std::exception& error) {
-        gpu_visible = false;
-        persistent_search_->mark_committed_mutation_gap(error.what());
-        static std::atomic<u32> gpu_delta_failure_logs{0};
-        const u32 log_index = gpu_delta_failure_logs.fetch_add(1, std::memory_order_relaxed);
-        if (log_index < 16) {
-          std::cerr << "[storage-owner] committed mutation batch was not published to GPU delta: "
-                    << error.what() << std::endl;
-        }
+  bool gpu_visible = true;
+  if (persistent_search_ != nullptr && !mutations.empty()) {
+    try {
+      const u64 epoch = persistent_search_->delta().reserve_epoch();
+      gpu_visible = persistent_search_->publish_mutations(
+        std::move(mutations), epoch, invalidated_graph_nodes);
+    } catch (const std::exception& error) {
+      gpu_visible = false;
+      persistent_search_->mark_committed_mutation_gap(error.what());
+      static std::atomic<u32> gpu_delta_failure_logs{0};
+      const u32 log_index = gpu_delta_failure_logs.fetch_add(1, std::memory_order_relaxed);
+      if (log_index < 16) {
+        std::cerr << "[storage-owner] committed mutation batch was not published to GPU delta: "
+                  << error.what() << std::endl;
       }
     }
+  }
 
-    for (const auto& [owner_storage, slot_id] : ready_slots) {
-      auto& state = *storage_insert_owners_[owner_storage];
-      std::lock_guard<std::mutex> lock(state.mutex);
-      maybe_release_storage_owner_slot_locked(state, state.slots[slot_id], gpu_visible);
-    }
+  for (const auto& [owner_storage, slot_id] : ready_slots) {
+    auto& state = *storage_insert_owners_[owner_storage];
+    std::lock_guard<std::mutex> lock(state.mutex);
+    maybe_release_storage_owner_slot_locked(state, state.slots[slot_id], gpu_visible);
   }
 }
 

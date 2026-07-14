@@ -767,12 +767,18 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   const size_t throughput_write_ops = args.workload == "mixed"
     ? measure_mixed_stats.completed_writes
     : (service.config().enable_breakdown ? report.insert.count : measured_insert_operations);
+  const size_t throughput_insert_ops = args.workload == "mixed"
+    ? measure_mixed_stats.completed_inserts
+    : (service.config().enable_breakdown ? report.insert.count : measured_insert_operations);
   const double query_throughput = has_throughput_duration
                                     ? static_cast<double>(throughput_query_ops) / throughput_duration
                                     : 0.0;
   const double write_throughput = has_throughput_duration
                                     ? static_cast<double>(throughput_write_ops) / throughput_duration
                                     : 0.0;
+  const double insert_throughput = has_throughput_duration
+                                     ? static_cast<double>(throughput_insert_ops) / throughput_duration
+                                     : 0.0;
   const double total_throughput = query_throughput + write_throughput;
   root["throughput"] = {
     {"configured_measure_seconds", args.measure_seconds},
@@ -784,15 +790,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"query_ops_per_sec", query_throughput},
     {"write_ops", throughput_write_ops},
     {"write_ops_per_sec", write_throughput},
-    {"insert_ops", args.workload == "mixed" ? measure_mixed_stats.completed_inserts
-                                                : (service.config().enable_breakdown
-                                                    ? report.insert.count : measured_insert_operations)},
-    {"insert_ops_per_sec", has_throughput_duration
-      ? static_cast<double>(args.workload == "mixed"
-          ? measure_mixed_stats.completed_inserts
-          : (service.config().enable_breakdown ? report.insert.count
-                                               : measured_insert_operations)) / throughput_duration
-      : 0.0},
+    {"insert_ops", throughput_insert_ops},
+    {"insert_ops_per_sec", insert_throughput},
     {"upsert_ops", args.workload == "mixed" ? measure_mixed_stats.completed_upserts : 0},
     {"upsert_ops_per_sec", has_throughput_duration && args.workload == "mixed"
       ? static_cast<double>(measure_mixed_stats.completed_upserts) / throughput_duration
@@ -859,6 +858,9 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     ? 0.0 : query_tail_qps / query_head_qps;
   const bool query_qps_passed = !query_acceptance_applies || args.min_query_qps < 0.0 ||
     query_throughput >= args.min_query_qps;
+  const bool insert_acceptance_applies = has_throughput_duration && throughput_insert_ops != 0;
+  const bool insert_qps_passed = !insert_acceptance_applies || args.min_insert_qps < 0.0 ||
+    insert_throughput >= args.min_insert_qps;
   const bool stability_passed = !query_acceptance_applies ||
     args.min_stability_ratio < 0.0 ||
     (query_stability_ratio >= args.min_stability_ratio && zero_completion_windows == 0);
@@ -869,13 +871,16 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     "mutation_capacity_rejections", 0ULL);
   const bool mutation_capacity_passed = !write_acceptance_applies ||
     mutation_capacity_rejections == 0;
-  performance_below_threshold = !query_qps_passed || !stability_passed ||
+  performance_below_threshold = !query_qps_passed || !insert_qps_passed || !stability_passed ||
     !writes_all_succeeded || !mutation_capacity_passed;
   root["acceptance"] = {
     {"applies", query_acceptance_applies},
     {"min_query_ops_per_sec", args.min_query_qps},
     {"observed_query_ops_per_sec", query_throughput},
     {"query_ops_per_sec_passed", query_qps_passed},
+    {"min_insert_ops_per_sec", args.min_insert_qps},
+    {"observed_insert_ops_per_sec", insert_throughput},
+    {"insert_ops_per_sec_passed", insert_qps_passed},
     {"min_query_tail_to_head_ratio", args.min_stability_ratio},
     {"observed_query_tail_to_head_ratio", query_stability_ratio},
     {"zero_completion_windows", zero_completion_windows},
@@ -908,7 +913,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     throw std::runtime_error("recall below threshold");
   }
   if (performance_below_threshold) {
-    throw std::runtime_error("cold-query throughput or stability below threshold");
+    throw std::runtime_error("throughput or stability below threshold");
   }
   return root;
 }
