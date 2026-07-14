@@ -14,7 +14,9 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
   const size_t stitch_request_bytes =
     service::storage_owner::stitch_search_request_bytes(config.storage_owner_batch_max);
   const size_t stitch_response_bytes =
-    service::storage_owner::stitch_search_response_bytes(config.storage_owner_batch_max);
+    service::storage_owner::stitch_search_response_bytes(
+      config.storage_owner_batch_max,
+      std::max<u32>(1, storage_owner_cross_shard_degree_));
   peer_rpc_runtime_.message_bytes = align_up(
     std::max({reverse_update_bytes,
               service::storage_owner::reverse_update_response_bytes(),
@@ -196,20 +198,17 @@ void MemoryNode::send_peer_rpc_message(u32 peer_id, const void* payload, size_t 
   lib_assert(bytes <= peer_rpc_runtime_.message_bytes, "peer rpc message too large");
   const u64 wr_id = next_peer_sync_wr_id();
   const size_t offset = peer_rpc_sync_send_offset(peer_id);
-  std::lock_guard<std::mutex> rpc_send_lock(peer_rpc_send_mutex_);
+  std::lock_guard<std::mutex> send_lock(*peer_qp_send_mutexes_[peer_id][0]);
   std::memcpy(peer_rpc_runtime_.buffer.get_full_buffer() + offset, payload, bytes);
-  {
-    std::lock_guard<std::mutex> send_lock(*peer_qp_send_mutexes_[peer_id][0]);
-    peer_control_qp(peer_id)->post_send_with_id(
-      *peer_rpc_runtime_.region,
-      static_cast<u32>(bytes),
-      IBV_WR_SEND,
-      wr_id,
-      true,
-      nullptr,
-      0,
-      offset);
-  }
+  peer_control_qp(peer_id)->post_send_with_id(
+    *peer_rpc_runtime_.region,
+    static_cast<u32>(bytes),
+    IBV_WR_SEND,
+    wr_id,
+    true,
+    nullptr,
+    0,
+    offset);
   wait_peer_sync_completion(wr_id);
 }
 
@@ -219,7 +218,12 @@ service::storage_owner::PeerRpcHeader MemoryNode::make_peer_reverse_update_respo
   service::storage_owner::PeerRpcHeader response{};
   response.magic = service::storage_owner::kPeerRpcMagic;
   response.version = service::storage_owner::kPeerRpcVersion;
-  response.type = static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response);
+  const auto request_type = static_cast<service::storage_owner::PeerRpcType>(request.type);
+  const auto response_type =
+    request_type == service::storage_owner::PeerRpcType::cleanup_deleted_request
+      ? service::storage_owner::PeerRpcType::cleanup_deleted_response
+      : service::storage_owner::PeerRpcType::reverse_update_response;
+  response.type = static_cast<u32>(response_type);
   response.source_shard = storage_id_;
   response.item_count = request.item_count;
   response.request_id = request.request_id;

@@ -207,6 +207,7 @@ private:
   bool wait_for_peer_reverse_update_response(u64 request_id,
                                              u32 target_shard,
                                              u32 item_count,
+                                             service::storage_owner::PeerRpcType response_type,
                                              const Configuration& config);
   bool wait_for_peer_stitch_search_response(u64 request_id,
                                             u32 target_shard,
@@ -221,9 +222,6 @@ private:
   bool enqueue_reverse_update_batch(u32 target_shard,
                                     const vec<service::storage_owner::ReverseUpdateOp>& ops,
                                     const Configuration& config);
-  bool enqueue_cleanup_deleted_batch(u32 target_shard,
-                                     const vec<service::storage_owner::ReverseUpdateOp>& ops,
-                                     const Configuration& config);
   bool send_peer_op_batch_direct(u32 target_shard,
                                  const vec<service::storage_owner::ReverseUpdateOp>& ops,
                                  service::storage_owner::PeerRpcType rpc_type,
@@ -239,9 +237,14 @@ private:
   bool send_reverse_update_fanout_and_wait(
       const dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>>& updates,
       const Configuration& config);
-  bool send_cleanup_deleted_batch(u32 target_shard,
-                                  const vec<service::storage_owner::ReverseUpdateOp>& ops,
-                                  const Configuration& config);
+  bool send_peer_op_fanout_and_wait(
+      const dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>>& updates,
+      service::storage_owner::PeerRpcType request_type,
+      service::storage_owner::PeerRpcType response_type,
+      const Configuration& config);
+  bool send_cleanup_deleted_fanout_and_wait(
+      const dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>>& updates,
+      const Configuration& config);
   void log_slow_peer_reverse_update_response(std::chrono::steady_clock::time_point wait_started,
                                              u64 request_id,
                                              u32 target_shard,
@@ -282,14 +285,20 @@ private:
   bool storage_owner_task_current(node_t id, u32 generation, RemotePtr target);
   vec<RemotePtr> read_preserved_neighbor_list(RemotePtr rptr);
   bool remove_local_neighbor(RemotePtr target_ptr, RemotePtr deleted_ptr, const Configuration& config);
+  bool remove_local_neighbors_batched(
+      const dense_hashmap_t<u64, vec<RemotePtr>>& removals,
+      const Configuration& config);
   bool stitch_inserted_storage_owner_nodes(const vec<StorageOwnerMaintenanceTask>& tasks,
                                            const Configuration& config,
                                            vec<StorageOwnerMaintenanceTask>& retry_tasks,
                                            u64& processed_count);
   bool stitch_inserted_storage_owner_node(const StorageOwnerMaintenanceTask& task,
                                           const Configuration& config);
-  bool cleanup_deleted_storage_owner_node(const StorageOwnerMaintenanceTask& task,
-                                          const Configuration& config);
+  bool cleanup_deleted_storage_owner_nodes(
+      const vec<StorageOwnerMaintenanceTask>& tasks,
+      const Configuration& config,
+      vec<StorageOwnerMaintenanceTask>& retry_tasks,
+      u64& processed_count);
 
   // Storage-owner RPC runtime
   void setup_insert_runtime(const Configuration& config);
@@ -420,7 +429,8 @@ private:
       const Configuration& config);
   bool apply_partition_local_reverse_update(RemotePtr target_ptr,
                                             const vec<RemotePtr>& candidate_ptrs,
-                                            const Configuration& config);
+                                            const Configuration& config,
+                                            bool* graph_changed = nullptr);
 
   // Misc helpers
   static size_t align_up(size_t value, size_t alignment = kCacheLineBytes);
@@ -450,6 +460,7 @@ private:
   u64 gpu_dynamic_node_base_{};
   u32 gpu_navigation_code_bytes_{};
   u64 gpu_navigation_model_checksum_{};
+  u32 storage_owner_cross_shard_degree_{};
   gpu_search::pq::Model gpu_navigation_model_;
   const u32 storage_id_;
   const u32 num_storage_nodes_;
@@ -471,7 +482,6 @@ private:
   std::unordered_map<u64, vec<byte_t>> peer_rpc_response_payloads_;
   std::mutex peer_rpc_mutex_;
   std::condition_variable peer_rpc_responses_cv_;
-  std::mutex peer_rpc_send_mutex_;
   std::mutex peer_send_cq_mutex_;
   std::mutex peer_completion_mutex_;
   vec<ibv_wc> peer_send_wcs_;

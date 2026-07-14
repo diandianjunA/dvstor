@@ -12,9 +12,16 @@ bool MemoryNode::apply_peer_reverse_update_tasks(const vec<PeerReverseUpdateTask
   }
 
   const auto apply_started = std::chrono::steady_clock::now();
+  const auto request_type = static_cast<service::storage_owner::PeerRpcType>(
+    tasks.front().header.type);
+  lib_assert(request_type == service::storage_owner::PeerRpcType::reverse_update_request ||
+               request_type == service::storage_owner::PeerRpcType::cleanup_deleted_request,
+             "invalid peer graph-update request type");
   dense_hashmap_t<u64, vec<RemotePtr>> grouped;
   size_t item_count = 0;
   for (const PeerReverseUpdateTask& task : tasks) {
+    lib_assert(task.header.type == tasks.front().header.type,
+               "mixed peer graph-update request types in one apply batch");
     item_count += task.ops.size();
   }
   grouped.reserve(item_count);
@@ -27,14 +34,18 @@ bool MemoryNode::apply_peer_reverse_update_tasks(const vec<PeerReverseUpdateTask
     }
   }
 
-  const bool success = apply_local_reverse_updates_batched(grouped, config);
+  const bool success =
+    request_type == service::storage_owner::PeerRpcType::cleanup_deleted_request
+      ? remove_local_neighbors_batched(grouped, config)
+      : apply_local_reverse_updates_batched(grouped, config);
   const u64 apply_ns = elapsed_ns_since(apply_started);
   if (apply_ns > 1000ull * 1000ull * 1000ull) {
     static std::atomic<u32> slow_apply_logs{0};
     const u32 log_index = slow_apply_logs.fetch_add(1, std::memory_order_relaxed);
     if (log_index < 16) {
-      std::cerr << "[storage-peer] slow reverse-update apply"
+      std::cerr << "[storage-peer] slow graph-update apply"
                 << " self_shard=" << storage_id_
+                << " rpc_type=" << static_cast<u32>(request_type)
                 << " task_count=" << tasks.size()
                 << " item_count=" << item_count
                 << " grouped_targets=" << grouped.size()
@@ -92,25 +103,22 @@ bool MemoryNode::handle_peer_cleanup_deleted_request(
     const service::storage_owner::PeerRpcHeader& header,
     const service::storage_owner::ReverseUpdateOp* ops,
     const Configuration& config) {
-  (void)source_shard;
   if (ops == nullptr || header.item_count == 0) {
     return true;
   }
 
-  dense_hashmap_t<u64, vec<RemotePtr>> grouped;
-  grouped.reserve(header.item_count);
-  for (u32 i = 0; i < header.item_count; ++i) {
-    const RemotePtr target{ops[i].target_raw};
-    const RemotePtr deleted{ops[i].candidate_raw};
-    lib_assert(local_shard(target.memory_node()), "cleanup-deleted target routed to wrong shard");
-    grouped[target.raw_address].push_back(deleted);
-  }
-
-  bool success = true;
-  for (auto& [target_raw, deleted_ptrs] : grouped) {
-    for (const RemotePtr& deleted : deleted_ptrs) {
-      success &= remove_local_neighbor(RemotePtr{target_raw}, deleted, config);
-    }
+  PeerReverseUpdateTask task;
+  task.source_shard = source_shard;
+  task.header = header;
+  task.received_at = std::chrono::steady_clock::now();
+  task.ops.assign(ops, ops + header.item_count);
+  const bool success = apply_peer_reverse_update_task(task, config);
+  if ((header.reserved & kPeerRpcFlagNoResponse) == 0) {
+    PeerReverseUpdateResponse response;
+    response.destination_shard = source_shard;
+    response.header = make_peer_reverse_update_response(header, success);
+    response.queued_at = std::chrono::steady_clock::now();
+    send_peer_reverse_update_response(response);
   }
   return success;
 }
@@ -120,7 +128,13 @@ bool MemoryNode::handle_peer_stitch_search_request(
     const service::storage_owner::PeerRpcHeader& header,
     const byte_t* payload,
     const Configuration& config) {
-  const size_t response_bytes = service::storage_owner::stitch_search_response_bytes(header.item_count);
+  const u32 candidate_capacity = header.reserved;
+  if (candidate_capacity == 0 || candidate_capacity > VamanaNode::R) {
+    send_peer_stitch_search_failed_response(source_shard, header);
+    return false;
+  }
+  const size_t response_bytes = service::storage_owner::stitch_search_response_bytes(
+    header.item_count, candidate_capacity);
   vec<byte_t> response(response_bytes, 0);
   auto* response_header =
     reinterpret_cast<service::storage_owner::PeerRpcHeader*>(response.data());
@@ -131,6 +145,7 @@ bool MemoryNode::handle_peer_stitch_search_request(
   response_header->item_count = header.item_count;
   response_header->request_id = header.request_id;
   response_header->status = static_cast<u32>(service::storage_owner::InsertStatus::ok);
+  response_header->reserved = candidate_capacity;
 
   if (storage_owner_anchor_index_ == nullptr || storage_owner_anchor_index_->empty()) {
     response_header->status = static_cast<u32>(service::storage_owner::InsertStatus::failed);
@@ -144,7 +159,8 @@ bool MemoryNode::handle_peer_stitch_search_request(
   auto* candidate_slots =
     service::storage_owner::stitch_search_response_candidates(response.data(), header.item_count);
   byte_t* candidate_vectors =
-    service::storage_owner::stitch_search_response_candidate_vectors(response.data(), header.item_count);
+    service::storage_owner::stitch_search_response_candidate_vectors(
+      response.data(), header.item_count, candidate_capacity);
 
   for (u32 i = 0; i < header.item_count; ++i) {
     const byte_t* raw_vector = vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes();
@@ -164,7 +180,7 @@ bool MemoryNode::handle_peer_stitch_search_request(
     u32 written = 0;
     hashset_t<RemotePtr> seen;
     for (const RemotePtr& candidate : candidates) {
-      if (written >= config.R) {
+      if (written >= candidate_capacity) {
         break;
       }
       if (candidate.is_null() || !local_shard(candidate.memory_node()) ||
@@ -176,7 +192,7 @@ bool MemoryNode::handle_peer_stitch_search_request(
       if (!read_node_snapshot(candidate, snapshot) || snapshot.deleted) {
         continue;
       }
-      const size_t slot = static_cast<size_t>(i) * VamanaNode::R + written;
+      const size_t slot = static_cast<size_t>(i) * candidate_capacity + written;
       candidate_slots[slot].raw = candidate.raw_address;
       candidate_slots[slot].generation = snapshot.generation;
       std::memcpy(candidate_vectors + slot * VamanaNode::vector_bytes(),
@@ -194,8 +210,10 @@ bool MemoryNode::handle_peer_stitch_search_request(
 void MemoryNode::send_peer_stitch_search_failed_response(
     u32 destination_shard,
     const service::storage_owner::PeerRpcHeader& request) {
+  const u32 candidate_capacity = std::clamp<u32>(request.reserved, 1, VamanaNode::R);
   const size_t response_bytes =
-    service::storage_owner::stitch_search_response_bytes(request.item_count);
+    service::storage_owner::stitch_search_response_bytes(
+      request.item_count, candidate_capacity);
   vec<byte_t> response(response_bytes, 0);
   auto* response_header =
     reinterpret_cast<service::storage_owner::PeerRpcHeader*>(response.data());
@@ -207,6 +225,7 @@ void MemoryNode::send_peer_stitch_search_failed_response(
   response_header->item_count = request.item_count;
   response_header->request_id = request.request_id;
   response_header->status = static_cast<u32>(service::storage_owner::InsertStatus::failed);
+  response_header->reserved = candidate_capacity;
   send_peer_rpc_message(destination_shard, response.data(), response.size());
 }
 

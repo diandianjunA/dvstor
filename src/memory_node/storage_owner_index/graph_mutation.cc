@@ -178,7 +178,11 @@ vec<RemotePtr> MemoryNode::robust_prune_snapshots_cpu(
 bool MemoryNode::apply_partition_local_reverse_update(
     RemotePtr target_ptr,
     const vec<RemotePtr>& candidate_ptrs,
-    const Configuration& config) {
+    const Configuration& config,
+    bool* graph_changed) {
+  if (graph_changed != nullptr) {
+    *graph_changed = false;
+  }
   lib_assert(local_shard(target_ptr.memory_node()),
              "partition-local reverse-update target must be local");
   if (candidate_ptrs.empty()) {
@@ -271,8 +275,17 @@ bool MemoryNode::apply_partition_local_reverse_update(
                            selected_local.end());
   lib_assert(updated_neighbors.size() <= config.R,
              "partition-local reverse-update exceeded graph degree");
-  write_neighbor_list(target_ptr, updated_neighbors);
+  const bool changed_neighbors =
+    updated_neighbors.size() != current_neighbors.size() ||
+    !std::equal(updated_neighbors.begin(), updated_neighbors.end(),
+                current_neighbors.begin());
+  if (changed_neighbors) {
+    write_neighbor_list(target_ptr, updated_neighbors);
+  }
   unlock_node(target_ptr);
+  if (graph_changed != nullptr) {
+    *graph_changed = changed_neighbors;
+  }
   return true;
 }
 

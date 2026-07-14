@@ -59,8 +59,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       storage_owner_maintenance_active_workers_);
 
     vec<StorageOwnerMaintenanceTask> stitch_batch;
-    StorageOwnerMaintenanceTask cleanup_task;
-    bool has_cleanup_task = false;
+    vec<StorageOwnerMaintenanceTask> cleanup_batch;
     {
       std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
       if (storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
@@ -70,29 +69,25 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       if (storage_owner_stitch_tasks_.empty() && storage_owner_cleanup_tasks_.empty()) {
         continue;
       }
-      const auto now = std::chrono::steady_clock::now();
       const size_t batch_limit = std::max<u32>(1, config.storage_owner_batch_max);
-      const bool stitch_batch_full = storage_owner_stitch_tasks_.size() >= batch_limit;
-      const bool stitch_wait_expired =
+      const bool choose_stitch =
         !storage_owner_stitch_tasks_.empty() &&
-        now >= storage_owner_stitch_tasks_.front().queued_at +
-                 std::chrono::nanoseconds(kStitchCompactionMaxDelayNs);
-      if (!storage_owner_stitch_tasks_.empty() &&
-          (stitch_batch_full || stitch_wait_expired)) {
+        (storage_owner_cleanup_tasks_.empty() ||
+         storage_owner_stitch_tasks_.front().queued_at <=
+           storage_owner_cleanup_tasks_.front().queued_at);
+      if (choose_stitch) {
         stitch_batch.reserve(batch_limit);
         while (!storage_owner_stitch_tasks_.empty() && stitch_batch.size() < batch_limit) {
           stitch_batch.push_back(std::move(storage_owner_stitch_tasks_.front()));
           storage_owner_stitch_tasks_.pop_front();
         }
-        if (!storage_owner_cleanup_tasks_.empty()) {
-          cleanup_task = std::move(storage_owner_cleanup_tasks_.front());
-          storage_owner_cleanup_tasks_.pop_front();
-          has_cleanup_task = true;
-        }
       } else if (!storage_owner_cleanup_tasks_.empty()) {
-        cleanup_task = std::move(storage_owner_cleanup_tasks_.front());
-        storage_owner_cleanup_tasks_.pop_front();
-        has_cleanup_task = true;
+        cleanup_batch.reserve(batch_limit);
+        while (!storage_owner_cleanup_tasks_.empty() &&
+               cleanup_batch.size() < batch_limit) {
+          cleanup_batch.push_back(std::move(storage_owner_cleanup_tasks_.front()));
+          storage_owner_cleanup_tasks_.pop_front();
+        }
       } else {
         continue;
       }
@@ -127,20 +122,25 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         }
       }
     }
-    if (has_cleanup_task) {
-      const bool ok = cleanup_deleted_storage_owner_node(cleanup_task, config);
-      if (ok) {
-        complete_storage_owner_maintenance_sequence(
-          cleanup_task.maintenance_sequence);
-        storage_owner_maintenance_cleanup_processed_.fetch_add(1, std::memory_order_relaxed);
-      } else {
+    if (!cleanup_batch.empty()) {
+      vec<StorageOwnerMaintenanceTask> retry_tasks;
+      u64 processed_count = 0;
+      const bool ok = cleanup_deleted_storage_owner_nodes(
+        cleanup_batch, config, retry_tasks, processed_count);
+      if (processed_count != 0) {
+        storage_owner_maintenance_cleanup_processed_.fetch_add(
+          processed_count, std::memory_order_relaxed);
+      }
+      if (!ok || !retry_tasks.empty()) {
         storage_owner_maintenance_failed_.fetch_add(1, std::memory_order_relaxed);
         if (!storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
           size_t backlog = 0;
           {
             std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
             if (!storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
-              storage_owner_cleanup_tasks_.push_back(std::move(cleanup_task));
+              for (auto& task : retry_tasks) {
+                storage_owner_cleanup_tasks_.push_back(std::move(task));
+              }
               backlog = storage_owner_stitch_tasks_.size() + storage_owner_cleanup_tasks_.size();
             }
           }

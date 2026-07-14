@@ -73,7 +73,15 @@ u64 PersistentSearchEngine::Impl::graph_cache_key(u64 raw) const {
 std::vector<u64> PersistentSearchEngine::Impl::graph_cache_keys(std::span<const u64> raw_nodes) const {
   std::vector<u64> keys;
   keys.reserve(raw_nodes.size());
-  for (u64 raw : raw_nodes) keys.push_back(graph_cache_key(raw));
+  for (u64 raw : raw_nodes) {
+    const u64 key = graph_cache_key(raw);
+    if (graph_cache_sets == 0 &&
+        !std::binary_search(anchor_graph_keys_host.begin(),
+                            anchor_graph_keys_host.end(), key)) {
+      continue;
+    }
+    keys.push_back(key);
+  }
   std::sort(keys.begin(), keys.end());
   keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
   if (keys.size() > graph_invalidation_capacity) {

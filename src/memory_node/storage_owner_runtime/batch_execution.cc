@@ -113,13 +113,16 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
         0,
         job.maintenance_sequence};
     }
-    if (invalidated_neighbors != nullptr) {
-      (*invalidated_neighbors)[i] = job.invalidated_neighbors;
-    }
   }
+  hashset_t<u64> changed_local_nodes;
   auto t_local_reverse = std::chrono::steady_clock::now();
   for (auto& [target_raw, candidates] : local_updates) {
-    ok &= apply_partition_local_reverse_update(RemotePtr{target_raw}, candidates, config);
+    bool graph_changed = false;
+    ok &= apply_partition_local_reverse_update(
+      RemotePtr{target_raw}, candidates, config, &graph_changed);
+    if (graph_changed) {
+      changed_local_nodes.insert(target_raw);
+    }
   }
   breakdown.storage_owner_local_reverse_ns += elapsed_ns_since(t_local_reverse);
   auto t_remote_reverse = std::chrono::steady_clock::now();
@@ -127,6 +130,16 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
     ok &= send_reverse_update_batch(target_shard, ops, config);
   }
   breakdown.storage_owner_remote_reverse_ns += elapsed_ns_since(t_remote_reverse);
+  if (invalidated_neighbors != nullptr) {
+    for (size_t i = 0; i < jobs.size(); ++i) {
+      for (const u64 raw : jobs[i].invalidated_neighbors) {
+        const RemotePtr pointer{raw};
+        if (!local_shard(pointer.memory_node()) || changed_local_nodes.contains(raw)) {
+          (*invalidated_neighbors)[i].push_back(raw);
+        }
+      }
+    }
+  }
   return ok;
 }
 

@@ -77,6 +77,17 @@ MemoryNode::MemoryNode(Configuration& config)
     gpu_dynamic_node_base_ = metadata.dynamic_node_base_offsets[storage_id_];
     gpu_navigation_code_bytes_ = metadata.navigation_code_bytes;
     gpu_navigation_model_checksum_ = metadata.navigation_model_checksum;
+    lib_assert(std::isfinite(metadata.partition_cross_shard_ratio) &&
+                 metadata.partition_cross_shard_ratio >= 0.0 &&
+                 metadata.partition_cross_shard_ratio <= 1.0,
+               "index metadata partition_cross_shard_ratio is invalid");
+    if (num_storage_nodes_ > 1) {
+      storage_owner_cross_shard_degree_ = std::clamp<u32>(
+        static_cast<u32>(std::ceil(
+          static_cast<double>(metadata.R) * metadata.partition_cross_shard_ratio)),
+        1,
+        metadata.R);
+    }
     if (config.vector_data_type != "auto" && config.resolved_vector_dtype() != metadata.vector_dtype) {
       lib_failure("configured vector-data-type=" + config.vector_data_type +
                   " does not match index metadata vector_data_type=" + vector_dtype_name(metadata.vector_dtype));
@@ -135,6 +146,10 @@ MemoryNode::MemoryNode(Configuration& config)
     print_status("loaded index metadata from " + index_prefix.string() +
                  " (layout=" + VamanaNode::layout_name() +
                  ", vector_data_type=" + VamanaNode::vector_dtype_name() + ")");
+    print_status("storage-owner online cross-shard degree: " +
+                 std::to_string(storage_owner_cross_shard_degree_) +
+                 " (base ratio=" +
+                 std::to_string(metadata.partition_cross_shard_ratio) + ")");
   }
   allocate_memory();
 

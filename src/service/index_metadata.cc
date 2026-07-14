@@ -33,6 +33,9 @@ bool load_metadata(const filepath_t& index_prefix, Metadata& metadata, str* erro
     metadata.dim = json.at("dim").get<u32>();
     metadata.R = json.at("R").get<u32>();
     metadata.beam_width_construction = json.value("beam_width_construction", 0u);
+    metadata.partition_max_degree = json.value("partition_max_degree", metadata.R);
+    metadata.partition_cross_shard_ratio =
+      json.value("partition_cross_shard_ratio", 0.0);
     metadata.num_memory_nodes = json.at("num_memory_nodes").get<u32>();
     metadata.node_size = json.at("node_size").get<u32>();
     metadata.node_layout = json.value("node_layout", str{"plain"});

@@ -1,7 +1,6 @@
 #include "memory_node/peer_rpc/detail.hh"
 
 void MemoryNode::peer_rpc_progress_loop() {
-  const Configuration& config = *storage_worker_config_;
   vec<ibv_wc> recv_wcs(std::max<i32>(1, peer_context_->get_config().max_recv_queue_wr));
   for (;;) {
     poll_peer_send_cq();
@@ -52,7 +51,12 @@ void MemoryNode::peer_rpc_progress_loop() {
         const size_t expected_bytes = service::storage_owner::reverse_update_request_bytes(header->item_count);
         if (bytes >= expected_bytes) {
           const auto* ops = service::storage_owner::reverse_update_ops(payload);
-          (void)handle_peer_cleanup_deleted_request(peer_id, *header, ops, config);
+          PeerReverseUpdateTask task;
+          task.source_shard = peer_id;
+          task.header = *header;
+          task.received_at = std::chrono::steady_clock::now();
+          task.ops.assign(ops, ops + header->item_count);
+          enqueue_peer_reverse_update_task(std::move(task));
         }
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_request)) {
         const size_t expected_bytes = service::storage_owner::stitch_search_request_bytes(header->item_count);
@@ -66,7 +70,8 @@ void MemoryNode::peer_rpc_progress_loop() {
             send_peer_stitch_search_failed_response(peer_id, *header);
           }
         }
-      } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response)) {
+      } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response) ||
+                 header->type == static_cast<u32>(service::storage_owner::PeerRpcType::cleanup_deleted_response)) {
         bool accepted = false;
         {
           std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
@@ -112,6 +117,7 @@ void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
       }
       tasks.push_back(std::move(peer_reverse_tasks_.front()));
       peer_reverse_tasks_.pop_front();
+      const u32 request_type = tasks.back().header.type;
       size_t coalesced_ops = tasks.back().ops.size();
       if (config.storage_owner_reverse_flush_us > 0 && peer_reverse_tasks_.empty() &&
           !peer_reverse_shutdown_.load(std::memory_order_acquire)) {
@@ -124,6 +130,9 @@ void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
       }
       while (!peer_reverse_tasks_.empty() &&
              coalesced_ops < config.storage_owner_reverse_coalesce_max) {
+        if (peer_reverse_tasks_.front().header.type != request_type) {
+          break;
+        }
         const size_t next_ops = peer_reverse_tasks_.front().ops.size();
         if (!tasks.empty() && coalesced_ops + next_ops > config.storage_owner_reverse_coalesce_max) {
           break;

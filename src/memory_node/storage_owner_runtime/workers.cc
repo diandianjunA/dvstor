@@ -16,9 +16,9 @@ void MemoryNode::process_storage_owner_insert_tasks(const vec<StorageOwnerInsert
                                            ? config.storage_owner_anchor_hints : 0;
   vec<u32> item_counts;
   vec<u32> response_magics;
-  batch_ids.reserve(std::max<u32>(config.storage_owner_batch_max, 64));
-  batch_kinds.reserve(std::max<u32>(config.storage_owner_batch_max, 64));
-  batch_vectors.reserve(static_cast<size_t>(std::max<u32>(config.storage_owner_batch_max, 64)) * config.dim);
+  batch_ids.reserve(config.storage_owner_batch_max);
+  batch_kinds.reserve(config.storage_owner_batch_max);
+  batch_vectors.reserve(static_cast<size_t>(config.storage_owner_batch_max) * config.dim);
   item_counts.reserve(tasks.size());
   response_magics.reserve(tasks.size());
 

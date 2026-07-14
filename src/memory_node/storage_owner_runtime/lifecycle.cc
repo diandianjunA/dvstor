@@ -100,7 +100,8 @@ void MemoryNode::storage_owner_insert_worker_loop(u32 worker_id) {
 
       while (!storage_insert_tasks_.empty()) {
         const u32 next_items = storage_insert_tasks_.front().item_count;
-        if (!tasks.empty() && total_items + next_items > std::max<u32>(config.storage_owner_batch_max, 64)) {
+        if (!tasks.empty() &&
+            total_items + next_items > config.storage_owner_batch_max) {
           break;
         }
         total_items += next_items;

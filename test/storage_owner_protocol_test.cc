@@ -9,18 +9,21 @@ int main() {
   VamanaNode::init_static_storage(128, 96, VectorDType::uint8);
 
   constexpr u32 item_count = 2;
-  const size_t response_bytes = protocol::stitch_search_response_bytes(item_count);
+  constexpr u32 candidate_capacity = 16;
+  const size_t response_bytes = protocol::stitch_search_response_bytes(
+    item_count, candidate_capacity);
   std::vector<byte_t> response(response_bytes, 0);
   auto* header = reinterpret_cast<protocol::PeerRpcHeader*>(response.data());
   header->magic = protocol::kPeerRpcMagic;
   header->version = protocol::kPeerRpcVersion;
   header->item_count = item_count;
+  header->reserved = candidate_capacity;
 
   u32* counts = protocol::stitch_search_response_counts(response.data());
   auto* candidates = protocol::stitch_search_response_candidates(
     response.data(), item_count);
   byte_t* vectors = protocol::stitch_search_response_candidate_vectors(
-    response.data(), item_count);
+    response.data(), item_count, candidate_capacity);
 
   counts[0] = 1;
   candidates[0].raw = 0x1234;
@@ -31,8 +34,8 @@ int main() {
   assert(reinterpret_cast<byte_t*>(candidates) >=
          reinterpret_cast<byte_t*>(counts + item_count));
   assert(vectors >= reinterpret_cast<byte_t*>(
-                      candidates + static_cast<size_t>(item_count) * VamanaNode::R));
-  assert(vectors + static_cast<size_t>(item_count) * VamanaNode::R *
+                      candidates + static_cast<size_t>(item_count) * candidate_capacity));
+  assert(vectors + static_cast<size_t>(item_count) * candidate_capacity *
                      VamanaNode::vector_bytes() ==
          response.data() + response.size());
   assert(candidates[0].raw == 0x1234);

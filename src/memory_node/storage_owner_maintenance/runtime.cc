@@ -143,10 +143,14 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
       break;
     }
   }
+  const bool p99_finalize_over_30s = finalized_live != 0 &&
+    p99_bucket >= kFinalizeLatencyBucketUpperNs.size() - 1;
+  const size_t p99_finite_bucket = std::min(
+    p99_bucket, kFinalizeLatencyBucketUpperNs.size() - 2);
   const double p99_finalize_ms = finalized_live == 0
     ? 0.0
-    : static_cast<double>(kFinalizeLatencyBucketUpperNs[
-        std::min(p99_bucket, kFinalizeLatencyBucketUpperNs.size() - 1)]) / 1e6;
+    : static_cast<double>(
+        kFinalizeLatencyBucketUpperNs[p99_finite_bucket]) / 1e6;
   const u64 stitch_batches = storage_owner_stitch_batches_.load(std::memory_order_relaxed);
   const u64 stitch_batched_items =
     storage_owner_stitch_batched_items_.load(std::memory_order_relaxed);
@@ -204,6 +208,8 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
                std::to_string(avg_finalize_ms) +
                " p99_stitch_delay_upper_ms=" +
                std::to_string(p99_finalize_ms) +
+               " p99_stitch_delay_over_30s=" +
+               (p99_finalize_over_30s ? "true" : "false") +
                " max_stitch_delay_ms=" +
                std::to_string(static_cast<double>(max_finalize_latency_ns) / 1e6) +
                " compaction_batch_target=" +

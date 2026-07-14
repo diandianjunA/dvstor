@@ -403,13 +403,31 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
   }
 
+  hashset_t<u64> changed_local_nodes;
   auto t_local_reverse = std::chrono::steady_clock::now();
   for (auto& [target_raw, candidates] : local_updates) {
-    if (!apply_partition_local_reverse_update(RemotePtr{target_raw}, candidates, config)) {
+    bool graph_changed = false;
+    if (!apply_partition_local_reverse_update(
+          RemotePtr{target_raw}, candidates, config, &graph_changed)) {
       return false;
+    }
+    if (graph_changed) {
+      changed_local_nodes.insert(target_raw);
     }
   }
   breakdown.storage_owner_local_reverse_ns += elapsed_ns_since(t_local_reverse);
+  if (invalidated_neighbors != nullptr) {
+    for (auto& item_invalidations : *invalidated_neighbors) {
+      item_invalidations.erase(
+        std::remove_if(item_invalidations.begin(), item_invalidations.end(),
+                       [&](u64 raw) {
+                         const RemotePtr pointer{raw};
+                         return local_shard(pointer.memory_node()) &&
+                                !changed_local_nodes.contains(raw);
+                       }),
+        item_invalidations.end());
+    }
+  }
   auto t_remote_reverse = std::chrono::steady_clock::now();
   for (auto& [target_shard, ops] : remote_updates) {
     if (!send_reverse_update_batch(target_shard, ops, config)) {
