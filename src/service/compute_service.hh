@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -123,12 +124,15 @@ private:
   struct StorageOwnerSenderState {
     std::mutex mutex;
     std::condition_variable cv;
+    std::condition_variable completion_cv;
     std::deque<std::unique_ptr<StorageInsertTask>> queue;
     vec<StorageOwnerRpcSlot> slots;
     vec<StorageOwnerResponseSlot> response_slots;
     std::deque<u32> free_slots;
+    std::deque<u32> ready_slots;
     dense_hashmap_t<u64, u32> batch_to_slot;
-    std::thread thread;
+    std::thread sender_thread;
+    std::thread completion_thread;
   };
 
   void init_remote_tokens();
@@ -144,7 +148,8 @@ private:
   void stop_storage_insert_runtime();
   void release_storage_insert_runtime();
   void run_storage_insert_sender(u32 owner_storage);
-  void run_storage_insert_completion_loop();
+  void run_storage_insert_cq_loop();
+  void run_storage_owner_completion(u32 owner_storage);
   void run_storage_insert_publication_loop();
   void post_storage_owner_batch(u32 owner_storage,
                                 u32 slot_id,
@@ -153,10 +158,12 @@ private:
   void handle_storage_owner_send_completion(u32 owner_storage, u32 slot_id);
   void handle_storage_owner_response(u32 owner_storage, u32 response_slot_id);
   void post_storage_owner_response_receive(u32 owner_storage, u32 response_slot_id);
-  void complete_ready_storage_owner_slots();
-  void commit_ready_storage_owner_slots(
-      const vec<std::pair<u32, u32>>& ready_slots,
-      StorageOwnerPublicationBatch& publication);
+  bool queue_storage_owner_completion_locked(StorageOwnerSenderState& state,
+                                             StorageOwnerRpcSlot& slot);
+  void commit_storage_owner_slot(u32 owner_storage,
+                                 u32 slot_id,
+                                 StorageOwnerPublicationBatch& publication);
+  void release_storage_owner_slot(u32 owner_storage, u32 slot_id);
   void publish_storage_owner_mutations(StorageOwnerPublicationBatch&& publication);
   void fail_storage_owner_tasks(vec<std::unique_ptr<StorageInsertTask>>& tasks);
   void publish_compute_side_id(node_t id, RemotePtr ptr, bool deleted,
@@ -179,7 +186,7 @@ private:
 
   std::unique_ptr<vamana::anchor::Index> anchor_index_;
   std::unique_ptr<gpu_search::PersistentSearchEngine> persistent_search_;
-  std::thread storage_insert_completion_thread_;
+  std::thread storage_insert_cq_thread_;
   std::thread storage_insert_publication_thread_;
   std::mutex storage_insert_publication_mutex_;
   std::condition_variable storage_insert_publication_cv_;
@@ -196,8 +203,12 @@ private:
     u32 owner_storage{};
     u32 generation{};
   };
-  mutable std::mutex compute_side_idmap_mutex_;
-  hashmap_t<node_t, ComputeSideIdEntry> compute_side_idmap_;
+  static constexpr size_t kComputeSideIdShardCount = 256;
+  struct ComputeSideIdShard {
+    mutable std::mutex mutex;
+    hashmap_t<node_t, ComputeSideIdEntry> entries;
+  };
+  std::array<ComputeSideIdShard, kComputeSideIdShardCount> compute_side_idmap_;
 
   std::atomic<u64> next_request_id_{1};
 

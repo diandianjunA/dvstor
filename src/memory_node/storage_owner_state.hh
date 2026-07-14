@@ -141,6 +141,8 @@ struct PeerPendingSend {
   StorageOwnerThread* thread{};
   bool async{};
   bool rdma_read_credit{};
+  bool release_rpc_slot{};
+  u32 rpc_slot_id{};
 };
 
 struct PeerRpcMessage {

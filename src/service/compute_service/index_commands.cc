@@ -16,21 +16,23 @@ void ComputeService::publish_compute_side_id(node_t id,
                                              bool deleted,
                                              u32 owner_storage,
                                              u32 generation) {
-  std::lock_guard<std::mutex> lock(compute_side_idmap_mutex_);
-  const auto existing = compute_side_idmap_.find(id);
-  if (existing != compute_side_idmap_.end() &&
+  auto& shard = compute_side_idmap_[static_cast<size_t>(id) % kComputeSideIdShardCount];
+  std::lock_guard<std::mutex> lock(shard.mutex);
+  const auto existing = shard.entries.find(id);
+  if (existing != shard.entries.end() &&
       existing->second.generation >= generation) {
     return;
   }
-  compute_side_idmap_[id] = ComputeSideIdEntry{
+  shard.entries[id] = ComputeSideIdEntry{
     ptr, deleted, owner_storage, generation};
 }
 
 bool ComputeService::lookup_compute_side_id(
     node_t id, RemotePtr* ptr, bool* deleted) const {
-  std::lock_guard<std::mutex> lock(compute_side_idmap_mutex_);
-  const auto it = compute_side_idmap_.find(id);
-  if (it == compute_side_idmap_.end()) return false;
+  const auto& shard = compute_side_idmap_[static_cast<size_t>(id) % kComputeSideIdShardCount];
+  std::lock_guard<std::mutex> lock(shard.mutex);
+  const auto it = shard.entries.find(id);
+  if (it == shard.entries.end()) return false;
   if (ptr != nullptr) *ptr = it->second.ptr;
   if (deleted != nullptr) *deleted = it->second.deleted;
   return true;
@@ -38,9 +40,10 @@ bool ComputeService::lookup_compute_side_id(
 
 u32 ComputeService::storage_owner_for_id(node_t id) const {
   {
-    std::lock_guard<std::mutex> lock(compute_side_idmap_mutex_);
-    const auto it = compute_side_idmap_.find(id);
-    if (it != compute_side_idmap_.end()) return it->second.owner_storage;
+    const auto& shard = compute_side_idmap_[static_cast<size_t>(id) % kComputeSideIdShardCount];
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    const auto it = shard.entries.find(id);
+    if (it != shard.entries.end()) return it->second.owner_storage;
   }
   return num_servers_ == 0 ? 0 : static_cast<u32>(id % num_servers_);
 }

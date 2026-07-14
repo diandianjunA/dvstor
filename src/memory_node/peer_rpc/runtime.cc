@@ -256,9 +256,17 @@ void MemoryNode::send_peer_rpc_message(u32 peer_id, const void* payload, size_t 
   lib_assert(peer_context_ != nullptr, "peer context not initialized");
   lib_assert(bytes <= peer_rpc_runtime_.message_bytes, "peer rpc message too large");
   const u32 slot_id = acquire_peer_rpc_send_slot(peer_id);
-  const u64 wr_id = next_peer_sync_wr_id();
+  const u64 wr_id = next_peer_async_wr_id();
   const size_t offset = peer_rpc_async_send_offset(peer_id, slot_id);
   std::memcpy(peer_rpc_runtime_.buffer.get_full_buffer() + offset, payload, bytes);
+  register_peer_pending_send_locked(
+    wr_id,
+    PeerPendingSend{
+      .target_shard = peer_id,
+      .target_qp_idx = 0,
+      .release_rpc_slot = true,
+      .rpc_slot_id = slot_id,
+    });
   {
     std::lock_guard<std::mutex> send_lock(*peer_qp_send_mutexes_[peer_id][0]);
     peer_control_qp(peer_id)->post_send_with_id(
@@ -271,8 +279,6 @@ void MemoryNode::send_peer_rpc_message(u32 peer_id, const void* payload, size_t 
       0,
       offset);
   }
-  wait_peer_sync_completion(wr_id);
-  release_peer_rpc_send_slot(peer_id, slot_id);
 }
 
 service::storage_owner::PeerRpcHeader MemoryNode::make_peer_reverse_update_response(

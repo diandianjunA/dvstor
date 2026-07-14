@@ -11,6 +11,7 @@ void MemoryNode::peer_rpc_progress_loop() {
     if (num_received <= 0) {
       bool responses_empty = false;
       bool outgoing_empty = false;
+      bool sends_empty = false;
       if (peer_reverse_workers_done_.load(std::memory_order_acquire)) {
         {
           std::lock_guard<std::mutex> lock(peer_reverse_responses_mutex_);
@@ -20,9 +21,13 @@ void MemoryNode::peer_rpc_progress_loop() {
           std::lock_guard<std::mutex> lock(peer_reverse_outgoing_mutex_);
           outgoing_empty = peer_reverse_outgoing_.empty();
         }
+        {
+          std::lock_guard<std::mutex> lock(peer_completion_mutex_);
+          sends_empty = peer_pending_sends_.empty();
+        }
       }
       if (peer_reverse_workers_done_.load(std::memory_order_acquire) &&
-          responses_empty && outgoing_empty) {
+          responses_empty && outgoing_empty && sends_empty) {
         peer_rpc_progress_running_.store(false, std::memory_order_release);
         peer_completion_cv_.notify_all();
         current_peer_rpc_progress_thread_ = false;

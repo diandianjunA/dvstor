@@ -197,6 +197,10 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
     }
   }
   if (has_pending) {
+    if (pending.release_rpc_slot) {
+      release_peer_rpc_send_slot(pending.target_shard, pending.rpc_slot_id);
+      return;
+    }
     if (pending.rdma_read_credit) {
       peer_rdma_read_outstanding_[pending.target_shard].fetch_sub(1, std::memory_order_acq_rel);
       if (pending.target_shard < peer_rdma_read_qp_outstanding_.size() &&

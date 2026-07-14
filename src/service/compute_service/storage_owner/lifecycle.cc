@@ -71,13 +71,18 @@ void ComputeService::start_storage_insert_runtime() {
 
   storage_insert_publication_thread_ =
     std::thread([this]() { run_storage_insert_publication_loop(); });
-  storage_insert_completion_thread_ =
-    std::thread([this]() { run_storage_insert_completion_loop(); });
+  for (u32 owner = 0; owner < owner_count; ++owner) {
+    storage_insert_owners_[owner]->completion_thread =
+      std::thread([this, owner]() { run_storage_owner_completion(owner); });
+  }
+  storage_insert_cq_thread_ =
+    std::thread([this]() { run_storage_insert_cq_loop(); });
   print_status(
     "storage-owner acknowledgement=durable stage1 commit; "
-    "GPU visibility=ordered asynchronous publication");
+    "GPU visibility=ordered asynchronous publication; "
+    "completion=per-owner parallel executors");
   for (u32 owner = 0; owner < owner_count; ++owner) {
-    storage_insert_owners_[owner]->thread =
+    storage_insert_owners_[owner]->sender_thread =
       std::thread([this, owner]() { run_storage_insert_sender(owner); });
   }
 }
@@ -87,19 +92,30 @@ void ComputeService::stop_storage_insert_runtime() {
   for (auto& state : storage_insert_owners_) {
     if (state) {
       state->cv.notify_all();
+      state->completion_cv.notify_all();
     }
   }
 
   for (auto& state : storage_insert_owners_) {
-    if (state && state->thread.joinable()) {
-      state->thread.join();
+    if (state && state->sender_thread.joinable()) {
+      state->sender_thread.join();
     }
   }
 
   storage_insert_senders_done_.store(true, std::memory_order_release);
   storage_insert_publication_cv_.notify_all();
-  if (storage_insert_completion_thread_.joinable()) {
-    storage_insert_completion_thread_.join();
+  if (storage_insert_cq_thread_.joinable()) {
+    storage_insert_cq_thread_.join();
+  }
+  for (auto& state : storage_insert_owners_) {
+    if (state) {
+      state->completion_cv.notify_all();
+    }
+  }
+  for (auto& state : storage_insert_owners_) {
+    if (state && state->completion_thread.joinable()) {
+      state->completion_thread.join();
+    }
   }
   storage_insert_publication_cv_.notify_all();
   if (storage_insert_publication_thread_.joinable()) {
@@ -157,6 +173,7 @@ void ComputeService::release_storage_insert_runtime() {
     state->response_slots.clear();
     state->batch_to_slot.clear();
     state->free_slots.clear();
+    state->ready_slots.clear();
   }
   storage_insert_owners_.clear();
 }
