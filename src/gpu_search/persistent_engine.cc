@@ -6,6 +6,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 #include "gpu_search/persistent_engine/cuda_helpers.hh"
@@ -47,6 +48,26 @@ bool PersistentSearchEngine::publish_mutations(
   std::lock_guard<std::mutex> publish_lock(mutation_publish_mutex_);
   if (mutations.empty() || epoch == 0) {
     throw std::invalid_argument("GPU mutation publication requires a non-empty epoch batch");
+  }
+  std::unordered_map<node_t, u32> accepted_generations;
+  mutations.erase(
+    std::remove_if(mutations.begin(), mutations.end(), [&](DeltaMutation& mutation) {
+      auto [entry, inserted] = accepted_generations.emplace(mutation.id, 0);
+      if (inserted) {
+        const auto current = delta_.version(mutation.id);
+        entry->second = current ? current->generation : 0;
+      }
+      if (mutation.generation == 0) {
+        mutation.generation = entry->second + 1;
+      } else if (mutation.generation <= entry->second) {
+        return true;
+      }
+      entry->second = mutation.generation;
+      return false;
+    }),
+    mutations.end());
+  if (mutations.empty()) {
+    return true;
   }
   const size_t mutation_count = mutations.size();
   const auto publication_started = std::chrono::steady_clock::now();

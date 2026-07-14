@@ -385,7 +385,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       (*statuses)[idx] = static_cast<u32>(service::storage_owner::MutationStatus::ok);
     }
 
-    if (!maintenance_enabled || local_stitch) {
+    if (!maintenance_enabled) {
       for (const RemotePtr& neighbor_ptr : selected_neighbors) {
         if (local_shard(neighbor_ptr.memory_node())) {
           local_updates[neighbor_ptr.raw_address].push_back(new_ptr);

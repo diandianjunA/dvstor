@@ -25,12 +25,18 @@ size_t ComputeService::insert(const vec<InsertItem>& batch) {
       task->item = item;
       task->kind = service::storage_owner::MutationKind::insert;
       task->sample = sample;
-      task->enqueued_at = sample->enqueued_at;
       futures.push_back(task->result.get_future());
       samples.push_back(sample);
+      const auto route_started = std::chrono::steady_clock::now();
       const auto route = route_storage_owner_update(item);
+      const auto route_finished = std::chrono::steady_clock::now();
+      sample->add_subcategory(
+        service::breakdown::Subcategory::cpu_storage_owner_route,
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          route_finished - route_started).count()));
       task->anchor_hints = route.hints;
       task->anchor_bucket_hint = route.bucket_hint;
+      task->enqueued_at = route_finished;
       const u32 owner_storage = route.owner;
       auto& state = *storage_insert_owners_[owner_storage];
       {

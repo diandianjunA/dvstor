@@ -69,26 +69,40 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       if (storage_owner_stitch_tasks_.empty() && storage_owner_cleanup_tasks_.empty()) {
         continue;
       }
+      const auto ready_cleanup = std::find_if(
+        storage_owner_cleanup_tasks_.begin(),
+        storage_owner_cleanup_tasks_.end(),
+        [&](const StorageOwnerMaintenanceTask& task) {
+          return storage_owner_cleanup_ready(task.maintenance_sequence);
+        });
+      const bool cleanup_ready = ready_cleanup != storage_owner_cleanup_tasks_.end();
       const size_t batch_limit = std::max<u32>(1, config.storage_owner_batch_max);
       const bool choose_stitch =
         !storage_owner_stitch_tasks_.empty() &&
-        (storage_owner_cleanup_tasks_.empty() ||
+        (!cleanup_ready ||
          storage_owner_stitch_tasks_.front().queued_at <=
-           storage_owner_cleanup_tasks_.front().queued_at);
+           ready_cleanup->queued_at);
       if (choose_stitch) {
         stitch_batch.reserve(batch_limit);
         while (!storage_owner_stitch_tasks_.empty() && stitch_batch.size() < batch_limit) {
           stitch_batch.push_back(std::move(storage_owner_stitch_tasks_.front()));
           storage_owner_stitch_tasks_.pop_front();
         }
-      } else if (!storage_owner_cleanup_tasks_.empty()) {
+      } else if (cleanup_ready) {
         cleanup_batch.reserve(batch_limit);
-        while (!storage_owner_cleanup_tasks_.empty() &&
-               cleanup_batch.size() < batch_limit) {
-          cleanup_batch.push_back(std::move(storage_owner_cleanup_tasks_.front()));
-          storage_owner_cleanup_tasks_.pop_front();
+        for (auto iterator = storage_owner_cleanup_tasks_.begin();
+             iterator != storage_owner_cleanup_tasks_.end() &&
+               cleanup_batch.size() < batch_limit;) {
+          if (!storage_owner_cleanup_ready(iterator->maintenance_sequence)) {
+            ++iterator;
+            continue;
+          }
+          cleanup_batch.push_back(std::move(*iterator));
+          iterator = storage_owner_cleanup_tasks_.erase(iterator);
         }
       } else {
+        storage_owner_maintenance_cv_.wait_for(
+          lock, std::chrono::milliseconds(1));
         continue;
       }
     }

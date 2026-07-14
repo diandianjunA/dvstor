@@ -146,49 +146,69 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
   storage_owner_stitch_batches_.fetch_add(1, std::memory_order_relaxed);
   storage_owner_stitch_batched_items_.fetch_add(tasks.size(), std::memory_order_relaxed);
 
-  vec<StorageOwnerMaintenanceTask> valid_tasks;
+  struct PendingFinalization {
+    StorageOwnerMaintenanceTask task;
+  };
+
+  vec<StorageOwnerMaintenanceTask> search_tasks;
   vec<NodeSnapshot> targets;
   vec<vec<NodeSnapshot>> candidate_snapshots;
-  valid_tasks.reserve(tasks.size());
+  vec<PendingFinalization> pending_finalizations;
+  search_tasks.reserve(tasks.size());
   targets.reserve(tasks.size());
   candidate_snapshots.reserve(tasks.size());
+  pending_finalizations.reserve(tasks.size());
 
-  for (const StorageOwnerMaintenanceTask& task : tasks) {
+  const auto persist_prepared_neighbors = [&](const StorageOwnerMaintenanceTask& task) {
+    if (!task.stitch_prepared) {
+      return;
+    }
+    lock_node(task.target);
+    write_neighbor_list(task.target, task.stitch_neighbors);
+    unlock_node(task.target);
+  };
+
+  const auto complete_stale_task = [&](const StorageOwnerMaintenanceTask& task) {
+    persist_prepared_neighbors(task);
+    storage_owner_maintenance_stale_.fetch_add(1, std::memory_order_relaxed);
+    complete_storage_owner_maintenance_sequence(task.maintenance_sequence);
+    ++processed_count;
+  };
+
+  for (StorageOwnerMaintenanceTask task : tasks) {
     if (!local_shard(task.target.memory_node())) {
       complete_storage_owner_maintenance_sequence(task.maintenance_sequence);
       ++processed_count;
       continue;
     }
     if (!storage_owner_task_current(task.id, task.generation, task.target)) {
-      storage_owner_maintenance_stale_.fetch_add(1, std::memory_order_relaxed);
-      complete_storage_owner_maintenance_sequence(task.maintenance_sequence);
-      ++processed_count;
+      complete_stale_task(task);
       continue;
     }
 
     NodeSnapshot target_snapshot;
     if (!read_node_snapshot(task.target, target_snapshot)) {
-      retry_tasks.push_back(task);
+      retry_tasks.push_back(std::move(task));
       continue;
     }
     if (target_snapshot.deleted) {
-      storage_owner_maintenance_stale_.fetch_add(1, std::memory_order_relaxed);
-      complete_storage_owner_maintenance_sequence(task.maintenance_sequence);
-      ++processed_count;
+      complete_stale_task(task);
       continue;
     }
 
-    valid_tasks.push_back(task);
+    if (task.stitch_prepared) {
+      pending_finalizations.push_back(PendingFinalization{std::move(task)});
+      continue;
+    }
+
+    search_tasks.push_back(std::move(task));
     targets.push_back(std::move(target_snapshot));
     candidate_snapshots.push_back(
-      read_node_snapshots_batched(read_neighbor_list(task.target), config));
+      read_node_snapshots_batched(
+        read_neighbor_list(search_tasks.back().target), config));
   }
 
-  if (valid_tasks.empty()) {
-    return retry_tasks.empty();
-  }
-
-  if (peer_context_ != nullptr && num_storage_nodes_ > 1) {
+  if (!search_tasks.empty() && peer_context_ != nullptr && num_storage_nodes_ > 1) {
     struct PendingStitchRequest {
       u32 shard{};
       u64 request_id{};
@@ -204,7 +224,12 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
       request.shard = shard;
       if (!post_stitch_search_request(shard, targets, request.request_id,
                                       request.item_count, config)) {
-        retry_tasks.insert(retry_tasks.end(), valid_tasks.begin(), valid_tasks.end());
+        for (PendingFinalization& pending_task : pending_finalizations) {
+          retry_tasks.push_back(std::move(pending_task.task));
+        }
+        retry_tasks.insert(retry_tasks.end(),
+                           std::make_move_iterator(search_tasks.begin()),
+                           std::make_move_iterator(search_tasks.end()));
         return false;
       }
       if (request.item_count != 0) {
@@ -215,7 +240,12 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
       vec<vec<NodeSnapshot>> shard_candidates;
       if (!wait_for_peer_stitch_search_response(request.request_id, request.shard,
                                                 request.item_count, shard_candidates, config)) {
-        retry_tasks.insert(retry_tasks.end(), valid_tasks.begin(), valid_tasks.end());
+        for (PendingFinalization& pending_task : pending_finalizations) {
+          retry_tasks.push_back(std::move(pending_task.task));
+        }
+        retry_tasks.insert(retry_tasks.end(),
+                           std::make_move_iterator(search_tasks.begin()),
+                           std::make_move_iterator(search_tasks.end()));
         return false;
       }
       u64 candidate_count = 0;
@@ -232,119 +262,87 @@ bool MemoryNode::stitch_inserted_storage_owner_nodes(
     }
   }
 
-  dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
-  vec<StorageOwnerMaintenanceTask> finalized_tasks;
-  finalized_tasks.reserve(valid_tasks.size());
-  for (size_t item = 0; item < valid_tasks.size(); ++item) {
-    const StorageOwnerMaintenanceTask& task = valid_tasks[item];
+  for (size_t item = 0; item < search_tasks.size(); ++item) {
+    StorageOwnerMaintenanceTask task = std::move(search_tasks[item]);
     const NodeSnapshot& target_snapshot = targets[item];
     const vec<NodeSnapshot>& candidates = candidate_snapshots[item];
 
     hashset_t<RemotePtr> skip;
     skip.insert(task.target);
-    vec<NodeSnapshot> local_candidates;
-    vec<NodeSnapshot> external_candidates;
-    local_candidates.reserve(candidates.size());
-    external_candidates.reserve(candidates.size());
-    for (const NodeSnapshot& candidate : candidates) {
-      if (candidate.rptr.is_null()) {
-        continue;
-      }
-      if (local_shard(candidate.rptr.memory_node())) {
-        local_candidates.push_back(candidate);
-      } else {
-        external_candidates.push_back(candidate);
-      }
-    }
-
-    vec<RemotePtr> external_neighbors = robust_prune_snapshots_cpu(
+    vec<RemotePtr> final_neighbors = robust_prune_snapshots_cpu(
       target_snapshot.vector_data.data(),
       VamanaNode::vector_dtype(),
-      external_candidates,
+      candidates,
       skip,
       config,
-      storage_owner_cross_shard_degree_);
-    const u32 local_degree = external_neighbors.size() >= config.R
-                               ? 0
-                               : config.R - static_cast<u32>(external_neighbors.size());
-    vec<RemotePtr> final_neighbors;
-    if (local_degree != 0) {
-      final_neighbors = robust_prune_snapshots_cpu(
-        target_snapshot.vector_data.data(),
-        VamanaNode::vector_dtype(),
-        local_candidates,
-        skip,
-        config,
-        local_degree);
-    }
-    final_neighbors.insert(final_neighbors.end(),
-                           external_neighbors.begin(),
-                           external_neighbors.end());
+      config.R);
     lib_assert(final_neighbors.size() <= config.R,
                "online stitch exceeded graph degree");
-
-    lock_node(task.target);
-    if (!storage_owner_task_current(task.id, task.generation, task.target)) {
-      unlock_node(task.target);
-      storage_owner_maintenance_stale_.fetch_add(1, std::memory_order_relaxed);
-      complete_storage_owner_maintenance_sequence(task.maintenance_sequence);
-      ++processed_count;
-      continue;
-    }
-    NodeSnapshot latest_snapshot;
-    if (!read_node_snapshot(task.target, latest_snapshot)) {
-      unlock_node(task.target);
-      retry_tasks.push_back(task);
-      continue;
-    }
-    if (latest_snapshot.deleted) {
-      unlock_node(task.target);
-      storage_owner_maintenance_stale_.fetch_add(1, std::memory_order_relaxed);
-      complete_storage_owner_maintenance_sequence(task.maintenance_sequence);
-      ++processed_count;
-      continue;
-    }
-    const vec<RemotePtr> current_neighbors = read_neighbor_list(task.target);
-    if (!same_neighbors(current_neighbors, final_neighbors)) {
-      write_neighbor_list(task.target, final_neighbors);
-    }
-    unlock_node(task.target);
-
-    dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>> task_remote_updates;
-    for (const RemotePtr& neighbor : final_neighbors) {
-      if (!local_shard(neighbor.memory_node())) {
-        task_remote_updates[neighbor.memory_node()].push_back(
-          service::storage_owner::ReverseUpdateOp{neighbor.raw_address, task.target.raw_address});
-      }
-    }
-    for (auto& [target_shard, ops] : task_remote_updates) {
-      auto& merged = remote_updates[target_shard];
-      merged.insert(merged.end(), ops.begin(), ops.end());
-    }
-    finalized_tasks.push_back(task);
+    task.stitch_prepared = true;
+    task.stitch_neighbors = std::move(final_neighbors);
+    pending_finalizations.push_back(PendingFinalization{std::move(task)});
   }
 
-  if (!send_reverse_update_fanout_and_wait(remote_updates, config)) {
-    retry_tasks.insert(retry_tasks.end(), finalized_tasks.begin(), finalized_tasks.end());
+  if (pending_finalizations.empty()) {
+    return retry_tasks.empty();
+  }
+
+  dense_hashmap_t<u64, vec<RemotePtr>> local_updates;
+  dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>> remote_updates;
+  for (const PendingFinalization& pending : pending_finalizations) {
+    for (const RemotePtr& neighbor : pending.task.stitch_neighbors) {
+      if (local_shard(neighbor.memory_node())) {
+        local_updates[neighbor.raw_address].push_back(pending.task.target);
+      } else {
+        remote_updates[neighbor.memory_node()].push_back(
+          service::storage_owner::ReverseUpdateOp{
+            neighbor.raw_address, pending.task.target.raw_address});
+      }
+    }
+  }
+
+  if (!apply_local_reverse_updates_batched(local_updates, config) ||
+      !send_reverse_update_fanout_and_wait(remote_updates, config)) {
+    for (PendingFinalization& pending : pending_finalizations) {
+      persist_prepared_neighbors(pending.task);
+      retry_tasks.push_back(std::move(pending.task));
+    }
     return false;
   }
 
-  for (const StorageOwnerMaintenanceTask& task : finalized_tasks) {
+  u64 finalized_live = 0;
+  for (PendingFinalization& pending : pending_finalizations) {
+    StorageOwnerMaintenanceTask& task = pending.task;
+    lock_node(task.target);
+    const bool target_deleted =
+      (*reinterpret_cast<const u64*>(local_node_ptr(task.target)) &
+       VamanaNode::HEADER_DELETED) != 0;
+    const bool current = !target_deleted &&
+      storage_owner_task_current(task.id, task.generation, task.target);
+    write_neighbor_list(task.target, task.stitch_neighbors);
+    unlock_node(task.target);
+
+    if (!current) {
+      storage_owner_maintenance_stale_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      const u64 finalize_latency_ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - task.queued_at).count());
+      storage_owner_maintenance_finalize_latency_ns_.fetch_add(finalize_latency_ns,
+                                                               std::memory_order_relaxed);
+      storage_owner_maintenance_finalize_latency_buckets_[
+        finalize_latency_bucket(finalize_latency_ns)].fetch_add(
+          1, std::memory_order_relaxed);
+      atomic_utils::update_max_relaxed(
+        storage_owner_maintenance_finalize_max_latency_ns_, finalize_latency_ns);
+      ++finalized_live;
+    }
     complete_storage_owner_maintenance_sequence(task.maintenance_sequence);
-    const u64 finalize_latency_ns = static_cast<u64>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now() - task.queued_at).count());
-    storage_owner_maintenance_finalize_latency_ns_.fetch_add(finalize_latency_ns,
-                                                             std::memory_order_relaxed);
-    storage_owner_maintenance_finalize_latency_buckets_[
-      finalize_latency_bucket(finalize_latency_ns)].fetch_add(1, std::memory_order_relaxed);
-    atomic_utils::update_max_relaxed(
-      storage_owner_maintenance_finalize_max_latency_ns_, finalize_latency_ns);
+    ++processed_count;
   }
-  if (!finalized_tasks.empty()) {
-    storage_owner_maintenance_finalized_live_.fetch_add(finalized_tasks.size(),
+  if (finalized_live != 0) {
+    storage_owner_maintenance_finalized_live_.fetch_add(finalized_live,
                                                         std::memory_order_relaxed);
-    processed_count += finalized_tasks.size();
   }
   return retry_tasks.empty();
 }

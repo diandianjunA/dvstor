@@ -104,13 +104,28 @@ void MemoryNode::advance_storage_owner_durable_sequence_locked() {
 
 void MemoryNode::complete_storage_owner_maintenance_sequence(u64 sequence) {
   if (sequence == 0) return;
-  std::lock_guard<std::mutex> lock(storage_owner_maintenance_sequence_mutex_);
-  const auto iterator = storage_owner_maintenance_sequence_remaining_.find(sequence);
-  lib_assert(iterator != storage_owner_maintenance_sequence_remaining_.end() &&
-               iterator->second != 0,
-             "invalid storage-owner maintenance completion sequence");
-  --iterator->second;
-  advance_storage_owner_durable_sequence_locked();
+  {
+    std::lock_guard<std::mutex> lock(storage_owner_maintenance_sequence_mutex_);
+    const auto iterator = storage_owner_maintenance_sequence_remaining_.find(sequence);
+    lib_assert(iterator != storage_owner_maintenance_sequence_remaining_.end() &&
+                 iterator->second != 0,
+               "invalid storage-owner maintenance completion sequence");
+    --iterator->second;
+    advance_storage_owner_durable_sequence_locked();
+  }
+  storage_owner_maintenance_cv_.notify_all();
+}
+
+bool MemoryNode::storage_owner_cleanup_ready(u64 sequence) const {
+  if (sequence <= 1) {
+    return true;
+  }
+  const auto* control = reinterpret_cast<const gpu_search::format::StorageControlBlock*>(
+    index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+  auto& durable_storage = const_cast<u64&>(control->durable_maintenance_sequence);
+  const u64 durable = std::atomic_ref<u64>(durable_storage).load(
+    std::memory_order_acquire);
+  return durable >= sequence - 1;
 }
 
 u64 MemoryNode::schedule_storage_owner_maintenance(

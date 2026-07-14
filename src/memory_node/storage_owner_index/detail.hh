@@ -22,6 +22,8 @@ using StorageOwnerCoroutineScratch =
   memory_node_detail::StorageOwnerCoroutineScratch;
 using StorageOwnerPruneCandidateInfo =
   memory_node_detail::StorageOwnerPruneCandidateInfo;
+using StorageOwnerScoredSnapshot =
+  memory_node_detail::StorageOwnerScoredSnapshot;
 using StorageOwnerThread = memory_node_detail::StorageOwnerThread;
 
 inline size_t snapshot_buffer_bytes() {

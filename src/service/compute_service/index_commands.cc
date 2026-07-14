@@ -12,11 +12,18 @@ ComputeService::Status ComputeService::status() const {
 }
 
 void ComputeService::publish_compute_side_id(node_t id,
-                                                       RemotePtr ptr,
-                                                       bool deleted,
-                                                       u32 owner_storage) {
+                                             RemotePtr ptr,
+                                             bool deleted,
+                                             u32 owner_storage,
+                                             u32 generation) {
   std::lock_guard<std::mutex> lock(compute_side_idmap_mutex_);
-  compute_side_idmap_[id] = ComputeSideIdEntry{ptr, deleted, owner_storage};
+  const auto existing = compute_side_idmap_.find(id);
+  if (existing != compute_side_idmap_.end() &&
+      existing->second.generation >= generation) {
+    return;
+  }
+  compute_side_idmap_[id] = ComputeSideIdEntry{
+    ptr, deleted, owner_storage, generation};
 }
 
 bool ComputeService::lookup_compute_side_id(

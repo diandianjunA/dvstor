@@ -26,6 +26,15 @@ int main() {
   assert(version->deleted);
   assert(version->epoch == erase_epoch);
 
+  gpu_search::DeltaMutation stale = erase;
+  stale.kind = service::storage_owner::MutationKind::upsert;
+  stale.generation = version->generation;
+  const u64 stale_epoch = delta.reserve_epoch();
+  assert(delta.publish({stale}, stale_epoch));
+  version = delta.version(42);
+  assert(version->deleted);
+  assert(version->epoch == erase_epoch);
+
   gpu_search::DeltaCoordinator durable_delta;
   gpu_search::DeltaMutation durable;
   durable.id = 99;

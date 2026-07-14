@@ -30,6 +30,7 @@ void ComputeService::start_storage_insert_runtime() {
 
   storage_insert_shutdown_.store(false, std::memory_order_release);
   storage_insert_senders_done_.store(false, std::memory_order_release);
+  storage_insert_completion_done_.store(false, std::memory_order_release);
   storage_insert_inflight_.store(0, std::memory_order_release);
   {
     std::lock_guard<std::mutex> lock(storage_insert_publication_mutex_);
@@ -72,6 +73,9 @@ void ComputeService::start_storage_insert_runtime() {
     std::thread([this]() { run_storage_insert_publication_loop(); });
   storage_insert_completion_thread_ =
     std::thread([this]() { run_storage_insert_completion_loop(); });
+  print_status(
+    "storage-owner acknowledgement=durable stage1 commit; "
+    "GPU visibility=ordered asynchronous publication");
   for (u32 owner = 0; owner < owner_count; ++owner) {
     storage_insert_owners_[owner]->thread =
       std::thread([this, owner]() { run_storage_insert_sender(owner); });
@@ -129,6 +133,7 @@ void ComputeService::stop_storage_insert_runtime() {
     }
   }
   storage_insert_inflight_.store(0, std::memory_order_release);
+  storage_insert_completion_done_.store(true, std::memory_order_release);
   {
     std::lock_guard<std::mutex> lock(storage_insert_publication_mutex_);
     storage_insert_publication_queue_.clear();

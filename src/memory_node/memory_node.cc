@@ -449,6 +449,22 @@ distance_t MemoryNode::distance_between_vectors(const byte_t* lhs,
   return typed_l2_distance(lhs, lhs_dtype, rhs, rhs_dtype, config.dim);
 }
 
+const byte_t* MemoryNode::local_live_vector(RemotePtr rptr) const {
+  lib_assert(local_shard(rptr.memory_node()),
+             "local vector lookup received a remote pointer");
+  const auto vector = vamana::StorageLayoutResolver::vector(rptr);
+  lib_assert(vector.offset + vector.size <= mn_memory_bytes_,
+             "local vector lookup exceeds shard bounds");
+  const byte_t* node = local_node_ptr(rptr);
+  auto& header_storage = *reinterpret_cast<u64*>(const_cast<byte_t*>(node));
+  const u64 header = std::atomic_ref<u64>(header_storage).load(
+    std::memory_order_acquire);
+  if ((header & VamanaNode::HEADER_DELETED) != 0) {
+    return nullptr;
+  }
+  return index_buffer_.get_full_buffer() + vector.offset;
+}
+
 bool MemoryNode::local_shard(u32 shard_id) const { return shard_id == storage_id_; }
 
 byte_t* MemoryNode::local_node_ptr(const RemotePtr& rptr) {

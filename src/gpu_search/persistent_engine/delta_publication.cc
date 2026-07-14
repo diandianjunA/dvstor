@@ -259,17 +259,8 @@ size_t PersistentSearchEngine::Impl::upload_mutations(std::vector<DeltaMutation>
       "bounded GPU update tier reached its hard watermark; "
       "storage maintenance has not retired updates quickly enough");
   }
-  std::unordered_map<node_t, u32> batch_generations;
   for (DeltaMutation& mutation : mutations) {
     mutation.epoch = epoch;
-    auto [iterator, inserted] = batch_generations.emplace(mutation.id, 0);
-    if (inserted) {
-      const auto version = engine.delta_.version(mutation.id);
-      iterator->second = version ? version->generation : 0;
-    }
-    mutation.generation = std::max(
-      mutation.generation, static_cast<u32>(iterator->second + 1));
-    iterator->second = mutation.generation;
   }
   upload_records_locked(mutations, invalidation_keys);
   return invalidation_keys.size();

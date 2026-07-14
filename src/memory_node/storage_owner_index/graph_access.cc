@@ -98,6 +98,48 @@ vec<RemotePtr> MemoryNode::read_neighbor_list(RemotePtr rptr) {
   return neighbors;
 }
 
+bool MemoryNode::read_local_neighbor_list(RemotePtr rptr,
+                                          vec<RemotePtr>& neighbors,
+                                          vec<byte_t>& entry,
+                                          vec<byte_t>& decoded) const {
+  lib_assert(local_shard(rptr.memory_node()),
+             "local neighbor lookup received a remote pointer");
+  const u64 hot_offset = VamanaNode::hot_graph_entry_offset(rptr);
+  const size_t entry_size = VamanaNode::hot_graph_entry_size();
+  lib_assert(hot_offset + entry_size <= mn_memory_bytes_,
+             "local neighbor lookup exceeds shard bounds");
+
+  entry.resize(entry_size);
+  decoded.resize(VamanaNode::neighbor_read_size());
+  neighbors.clear();
+  constexpr u32 kMaxReadAttempts = 3;
+  bool decoded_ok = false;
+  for (u32 attempt = 0; attempt < kMaxReadAttempts; ++attempt) {
+    std::memcpy(entry.data(), index_buffer_.get_full_buffer() + hot_offset,
+                entry_size);
+    decoded_ok = VamanaNode::decode_hot_graph_entry(entry.data(), decoded.data());
+    if (decoded_ok) {
+      break;
+    }
+    std::this_thread::yield();
+  }
+  if (!decoded_ok) {
+    return false;
+  }
+
+  const u8 edge_count = *reinterpret_cast<const u8*>(
+    decoded.data() + VamanaNode::neighbor_count_offset_in_read());
+  const auto* slots = reinterpret_cast<const RemotePtr*>(
+    decoded.data() + VamanaNode::neighbor_payload_offset_in_read());
+  neighbors.reserve(edge_count);
+  for (u32 index = 0; index < edge_count && index < VamanaNode::R; ++index) {
+    if (!slots[index].is_null()) {
+      neighbors.push_back(slots[index]);
+    }
+  }
+  return true;
+}
+
 MemoryNode::NodeSnapshotReadAwaitable MemoryNode::async_read_node_snapshot(
     RemotePtr rptr, StorageOwnerThread& thread) {
   if (local_shard(rptr.memory_node())) {

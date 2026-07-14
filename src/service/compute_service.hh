@@ -114,6 +114,12 @@ private:
     std::unique_ptr<LocalMemoryRegion> region;
   };
 
+  struct StorageOwnerPublicationBatch {
+    std::vector<gpu_search::DeltaMutation> mutations;
+    std::vector<u64> invalidated_graph_nodes;
+    u32 reserved_items{};
+  };
+
   struct StorageOwnerSenderState {
     std::mutex mutex;
     std::condition_variable cv;
@@ -148,13 +154,13 @@ private:
   void handle_storage_owner_response(u32 owner_storage, u32 response_slot_id);
   void post_storage_owner_response_receive(u32 owner_storage, u32 response_slot_id);
   void complete_ready_storage_owner_slots();
-  void publish_ready_storage_owner_slots(
-      const vec<std::pair<u32, u32>>& ready_slots);
-  void maybe_release_storage_owner_slot_locked(StorageOwnerSenderState& state,
-                                               StorageOwnerRpcSlot& slot,
-                                               bool gpu_visible);
+  void commit_ready_storage_owner_slots(
+      const vec<std::pair<u32, u32>>& ready_slots,
+      StorageOwnerPublicationBatch& publication);
+  void publish_storage_owner_mutations(StorageOwnerPublicationBatch&& publication);
   void fail_storage_owner_tasks(vec<std::unique_ptr<StorageInsertTask>>& tasks);
-  void publish_compute_side_id(node_t id, RemotePtr ptr, bool deleted, u32 owner_storage);
+  void publish_compute_side_id(node_t id, RemotePtr ptr, bool deleted,
+                               u32 owner_storage, u32 generation);
   bool lookup_compute_side_id(node_t id, RemotePtr* ptr, bool* deleted = nullptr) const;
   u32 storage_owner_for_id(node_t id) const;
   vamana::anchor::Route route_storage_owner_update(const InsertItem& item,
@@ -177,9 +183,10 @@ private:
   std::thread storage_insert_publication_thread_;
   std::mutex storage_insert_publication_mutex_;
   std::condition_variable storage_insert_publication_cv_;
-  std::deque<vec<std::pair<u32, u32>>> storage_insert_publication_queue_;
+  std::deque<StorageOwnerPublicationBatch> storage_insert_publication_queue_;
   std::atomic<bool> storage_insert_shutdown_{false};
   std::atomic<bool> storage_insert_senders_done_{false};
+  std::atomic<bool> storage_insert_completion_done_{false};
   std::atomic<u32> storage_insert_inflight_{0};
   std::atomic<u32> storage_insert_timeout_logs_{0};
   vec<std::unique_ptr<StorageOwnerSenderState>> storage_insert_owners_;
@@ -187,6 +194,7 @@ private:
     RemotePtr ptr;
     bool deleted{};
     u32 owner_storage{};
+    u32 generation{};
   };
   mutable std::mutex compute_side_idmap_mutex_;
   hashmap_t<node_t, ComputeSideIdEntry> compute_side_idmap_;

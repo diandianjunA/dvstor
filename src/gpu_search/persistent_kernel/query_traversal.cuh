@@ -37,7 +37,7 @@ __device__ void add_delta_candidates(const PersistentKernelParams& params,
   u32 local_slot = UINT32_MAX;
   f32 local_approximation = FLT_MAX;
 
-  if (params.anchor_count == 0 || count <= 4096) {
+  if (params.anchor_count == 0 || selected_anchor_count == 0) {
     for (u32 slot = threadIdx.x; slot < count; slot += blockDim.x) {
       const DeviceDeltaRecord& record = params.delta_records[slot];
       if (!delta_visible(record, descriptor.snapshot_epoch)) continue;

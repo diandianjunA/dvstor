@@ -55,16 +55,26 @@ struct StorageOwnerPruneCandidateInfo {
   vec<byte_t> vector_data;
 };
 
+struct StorageOwnerScoredSnapshot {
+  const NodeSnapshot* snapshot{};
+  distance_t distance{};
+};
+
 struct StorageOwnerCoroutineScratch {
   hashset_t<RemotePtr> visited;
   hashset_t<RemotePtr> empty_skip;
   vec<BeamEntry> beam;
+  vec<RemotePtr> neighbors;
   vec<RemotePtr> unvisited;
   vec<RemotePtr> batch;
+  vec<byte_t> neighbor_entry;
+  vec<byte_t> neighbor_decoded;
   vec<RemotePtr> filtered;
   vec<RemotePtr> selected;
   vec<const byte_t*> selected_vectors;
   vec<StorageOwnerPruneCandidateInfo> prune_infos;
+  hashset_t<RemotePtr> prune_seen;
+  vec<StorageOwnerScoredSnapshot> scored_snapshots;
   vec<RemotePtr> reverse_unique_candidates;
   vec<RemotePtr> reverse_current_neighbors;
   vec<RemotePtr> reverse_filtered_candidates;
@@ -76,6 +86,7 @@ struct StorageOwnerCoroutineScratch {
   void clear_search() {
     visited.clear();
     beam.clear();
+    neighbors.clear();
     unvisited.clear();
     batch.clear();
   }
@@ -86,6 +97,8 @@ struct StorageOwnerCoroutineScratch {
     selected.clear();
     selected_vectors.clear();
     prune_infos.clear();
+    prune_seen.clear();
+    scored_snapshots.clear();
   }
 
   void clear_reverse_update() {

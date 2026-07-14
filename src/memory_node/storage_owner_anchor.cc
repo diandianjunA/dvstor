@@ -48,6 +48,40 @@ vec<RemotePtr> sorted_candidates(vec<BeamEntry>& beam) {
 
 }  // namespace
 
+void MemoryNode::score_local_candidates_into_beam(
+    const span<const element_t> query,
+    const vec<RemotePtr>& candidates,
+    const Configuration& config,
+    vec<BeamEntry>& beam,
+    u32 beam_width,
+    InsertBreakdownCounters* breakdown,
+    bool count_valid_hints) const {
+  for (const RemotePtr candidate : candidates) {
+    auto started = std::chrono::steady_clock::now();
+    const byte_t* vector = local_live_vector(candidate);
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(started);
+    }
+    if (vector == nullptr) {
+      continue;
+    }
+
+    started = std::chrono::steady_clock::now();
+    const distance_t distance = distance_to_stored_vector(query, vector, config);
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_distance_ns += elapsed_ns_since(started);
+      if (count_valid_hints) {
+        ++breakdown->storage_owner_anchor_valid_hints;
+      }
+    }
+    started = std::chrono::steady_clock::now();
+    insert_into_beam(beam, candidate, distance, beam_width);
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_beam_update_ns += elapsed_ns_since(started);
+    }
+  }
+}
+
 vec<RemotePtr> MemoryNode::anchor_search_candidates(const span<const element_t> query,
                                                      const vec<RemotePtr>& anchor_hints,
                                                      const Configuration& config,
@@ -58,15 +92,25 @@ vec<RemotePtr> MemoryNode::anchor_search_candidates(const span<const element_t> 
                                             : nullptr;
   hashset_t<RemotePtr> local_visited;
   vec<BeamEntry> local_beam;
+  vec<RemotePtr> local_neighbors;
   vec<RemotePtr> local_batch;
   vec<RemotePtr> local_unvisited;
+  vec<byte_t> local_neighbor_entry;
+  vec<byte_t> local_neighbor_decoded;
   if (scratch != nullptr) {
     scratch->clear_search();
   }
   hashset_t<RemotePtr>& visited = scratch != nullptr ? scratch->visited : local_visited;
   vec<BeamEntry>& beam = scratch != nullptr ? scratch->beam : local_beam;
+  vec<RemotePtr>& neighbors = scratch != nullptr ? scratch->neighbors : local_neighbors;
   vec<RemotePtr>& batch = scratch != nullptr ? scratch->batch : local_batch;
   vec<RemotePtr>& unvisited = scratch != nullptr ? scratch->unvisited : local_unvisited;
+  vec<byte_t>& neighbor_entry = scratch != nullptr
+                                  ? scratch->neighbor_entry
+                                  : local_neighbor_entry;
+  vec<byte_t>& neighbor_decoded = scratch != nullptr
+                                    ? scratch->neighbor_decoded
+                                    : local_neighbor_decoded;
   const u32 beam_width = std::max<u32>(config.R, config.storage_owner_anchor_beam_width);
   const u32 batch_limit = snapshot_batch_limit(config, current_storage_owner_thread_);
   visited.reserve(anchor_hints.size() +
@@ -90,20 +134,30 @@ vec<RemotePtr> MemoryNode::anchor_search_candidates(const span<const element_t> 
         batch.push_back(hint);
       }
     }
-    auto started = std::chrono::steady_clock::now();
-    vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
-    if (breakdown != nullptr) {
-      breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(started);
-    }
-    for (const NodeSnapshot& snapshot : snapshots) {
-      if (snapshot.deleted) continue;
-      started = std::chrono::steady_clock::now();
-      const distance_t distance = distance_to_stored_vector(query, snapshot.vector_data.data(), config);
+    if (local_only) {
+      score_local_candidates_into_beam(query, batch, config, beam, beam_width,
+                                       breakdown, true);
+    } else {
+      auto started = std::chrono::steady_clock::now();
+      vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
       if (breakdown != nullptr) {
-        breakdown->storage_owner_search_distance_ns += elapsed_ns_since(started);
-        ++breakdown->storage_owner_anchor_valid_hints;
+        breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(started);
       }
-      insert_into_beam(beam, snapshot.rptr, distance, beam_width);
+      for (const NodeSnapshot& snapshot : snapshots) {
+        if (snapshot.deleted) continue;
+        started = std::chrono::steady_clock::now();
+        const distance_t distance = distance_to_stored_vector(
+          query, snapshot.vector_data.data(), config);
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_distance_ns += elapsed_ns_since(started);
+          ++breakdown->storage_owner_anchor_valid_hints;
+        }
+        started = std::chrono::steady_clock::now();
+        insert_into_beam(beam, snapshot.rptr, distance, beam_width);
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_beam_update_ns += elapsed_ns_since(started);
+        }
+      }
     }
   }
 
@@ -130,7 +184,12 @@ vec<RemotePtr> MemoryNode::anchor_search_candidates(const span<const element_t> 
     if (remote) ++remote_expansions;
 
     started = std::chrono::steady_clock::now();
-    const vec<RemotePtr> neighbors = read_neighbor_list(entry.rptr);
+    if (local_only) {
+      read_local_neighbor_list(entry.rptr, neighbors, neighbor_entry,
+                               neighbor_decoded);
+    } else {
+      neighbors = read_neighbor_list(entry.rptr);
+    }
     if (breakdown != nullptr) {
       breakdown->storage_owner_search_neighbor_read_ns += elapsed_ns_since(started);
     }
@@ -147,19 +206,29 @@ vec<RemotePtr> MemoryNode::anchor_search_candidates(const span<const element_t> 
       const size_t end = std::min(unvisited.size(), begin + batch_limit);
       batch.clear();
       batch.insert(batch.end(), unvisited.begin() + begin, unvisited.begin() + end);
-      started = std::chrono::steady_clock::now();
-      vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
-      if (breakdown != nullptr) {
-        breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(started);
-      }
-      for (const NodeSnapshot& snapshot : snapshots) {
-        if (snapshot.deleted) continue;
+      if (local_only) {
+        score_local_candidates_into_beam(query, batch, config, beam, beam_width,
+                                         breakdown, false);
+      } else {
         started = std::chrono::steady_clock::now();
-        const distance_t distance = distance_to_stored_vector(query, snapshot.vector_data.data(), config);
+        vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
         if (breakdown != nullptr) {
-          breakdown->storage_owner_search_distance_ns += elapsed_ns_since(started);
+          breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(started);
         }
-        insert_into_beam(beam, snapshot.rptr, distance, beam_width);
+        for (const NodeSnapshot& snapshot : snapshots) {
+          if (snapshot.deleted) continue;
+          started = std::chrono::steady_clock::now();
+          const distance_t distance = distance_to_stored_vector(
+            query, snapshot.vector_data.data(), config);
+          if (breakdown != nullptr) {
+            breakdown->storage_owner_search_distance_ns += elapsed_ns_since(started);
+          }
+          started = std::chrono::steady_clock::now();
+          insert_into_beam(beam, snapshot.rptr, distance, beam_width);
+          if (breakdown != nullptr) {
+            breakdown->storage_owner_search_beam_update_ns += elapsed_ns_since(started);
+          }
+        }
       }
     }
   }

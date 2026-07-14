@@ -116,17 +116,35 @@ vec<RemotePtr> MemoryNode::robust_prune_snapshots_cpu(
     const hashset_t<RemotePtr>& skip,
     const Configuration& config,
     u32 result_limit_override) {
-  struct ScoredSnapshot {
-    const NodeSnapshot* snapshot{};
-    distance_t distance{};
-  };
-
   const u32 result_limit = result_limit_override == 0
                              ? config.R
                              : std::min(config.R, result_limit_override);
-  vec<ScoredSnapshot> scored;
+  StorageOwnerCoroutineScratch* scratch = current_storage_owner_thread_ != nullptr
+                                            ? &current_storage_owner_thread_->coroutine_scratch_state()
+                                            : nullptr;
+  vec<StorageOwnerScoredSnapshot> local_scored;
+  hashset_t<RemotePtr> local_seen;
+  vec<RemotePtr> local_selected;
+  vec<const byte_t*> local_selected_vectors;
+  if (scratch != nullptr) {
+    scratch->clear_prune();
+  }
+  vec<StorageOwnerScoredSnapshot>& scored = scratch != nullptr
+                                              ? scratch->scored_snapshots
+                                              : local_scored;
+  hashset_t<RemotePtr>& seen = scratch != nullptr
+                                ? scratch->prune_seen
+                                : local_seen;
+  vec<RemotePtr>& selected = scratch != nullptr
+                               ? scratch->selected
+                               : local_selected;
+  vec<const byte_t*>& selected_vectors = scratch != nullptr
+                                           ? scratch->selected_vectors
+                                           : local_selected_vectors;
   scored.reserve(candidates.size());
-  hashset_t<RemotePtr> seen;
+  seen.reserve(candidates.size());
+  selected.reserve(result_limit);
+  selected_vectors.reserve(result_limit);
   for (const NodeSnapshot& candidate : candidates) {
     if (candidate.rptr.is_null() || candidate.deleted ||
         candidate.vector_data.size() < VamanaNode::vector_bytes() ||
@@ -142,15 +160,11 @@ vec<RemotePtr> MemoryNode::robust_prune_snapshots_cpu(
                                config)});
   }
   std::sort(scored.begin(), scored.end(),
-            [](const ScoredSnapshot& lhs, const ScoredSnapshot& rhs) {
+            [](const StorageOwnerScoredSnapshot& lhs,
+               const StorageOwnerScoredSnapshot& rhs) {
               return lhs.distance < rhs.distance;
             });
-
-  vec<RemotePtr> selected;
-  vec<const byte_t*> selected_vectors;
-  selected.reserve(result_limit);
-  selected_vectors.reserve(result_limit);
-  for (const ScoredSnapshot& candidate : scored) {
+  for (const StorageOwnerScoredSnapshot& candidate : scored) {
     if (selected.size() >= result_limit) {
       break;
     }
@@ -404,7 +418,7 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   job.maintenance_sequence = schedule_storage_owner_maintenance(
     job.id, generation, job.kind, new_ptr, old_entry.current, config);
 
-  if (!maintenance_enabled || local_stitch) {
+  if (!maintenance_enabled) {
     for (const RemotePtr& neighbor_ptr : selected_neighbors) {
       if (local_shard(neighbor_ptr.memory_node())) {
         local_updates[neighbor_ptr.raw_address].push_back(new_ptr);

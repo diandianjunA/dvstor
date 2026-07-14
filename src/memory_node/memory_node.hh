@@ -88,6 +88,8 @@ class MemoryNode {
     u32 generation{};
     u64 maintenance_sequence{};
     RemotePtr target;
+    bool stitch_prepared{};
+    vec<RemotePtr> stitch_neighbors;
     std::chrono::steady_clock::time_point queued_at{};
   };
 
@@ -272,6 +274,7 @@ private:
                                          const Configuration& config);
   u64 begin_storage_owner_maintenance_sequence(u32 work_items);
   void complete_storage_owner_maintenance_sequence(u64 sequence);
+  bool storage_owner_cleanup_ready(u64 sequence) const;
   void advance_storage_owner_durable_sequence_locked();
   void mark_storage_owner_foreground_activity();
   void log_storage_owner_maintenance_observation(size_t stitch_remaining,
@@ -357,6 +360,10 @@ private:
   bool try_set_global_medoid(const RemotePtr& expected, const RemotePtr& desired, RemotePtr& observed);
   bool read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot);
   vec<RemotePtr> read_neighbor_list(RemotePtr rptr);
+  bool read_local_neighbor_list(RemotePtr rptr,
+                                vec<RemotePtr>& neighbors,
+                                vec<byte_t>& entry,
+                                vec<byte_t>& decoded) const;
   NodeSnapshotReadAwaitable async_read_node_snapshot(
     RemotePtr rptr, StorageOwnerThread& thread);
   NodeSnapshotsReadAwaitable async_read_node_snapshots(
@@ -442,6 +449,15 @@ private:
                                       const byte_t* rhs,
                                       VectorDType rhs_dtype,
                                       const Configuration& config) const;
+  const byte_t* local_live_vector(RemotePtr rptr) const;
+  void score_local_candidates_into_beam(
+      const span<const element_t> query,
+      const vec<RemotePtr>& candidates,
+      const Configuration& config,
+      vec<BeamEntry>& beam,
+      u32 beam_width,
+      InsertBreakdownCounters* breakdown,
+      bool count_valid_hints) const;
   bool local_shard(u32 shard_id) const;
   byte_t* local_node_ptr(const RemotePtr& rptr);
   const byte_t* local_node_ptr(const RemotePtr& rptr) const;

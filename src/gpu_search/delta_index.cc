@@ -12,9 +12,14 @@ bool DeltaCoordinator::publish(std::vector<DeltaMutation> mutations, u64 epoch) 
   std::unique_lock<std::shared_mutex> lock(state_mutex_);
   for (DeltaMutation& mutation : mutations) {
     mutation.epoch = epoch;
-    mutation.generation = std::max<u32>(
-      mutation.generation,
-      versions_.contains(mutation.id) ? versions_[mutation.id].generation + 1 : 1);
+    const auto current = versions_.find(mutation.id);
+    const u32 current_generation = current == versions_.end()
+                                     ? 0 : current->second.generation;
+    if (mutation.generation == 0) {
+      mutation.generation = current_generation + 1;
+    } else if (mutation.generation <= current_generation) {
+      continue;
+    }
     const bool deleted = mutation.kind == service::storage_owner::MutationKind::erase;
     versions_[mutation.id] = VersionEntry{
       .generation = mutation.generation,

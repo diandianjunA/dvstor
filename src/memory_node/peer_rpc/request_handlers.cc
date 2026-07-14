@@ -162,10 +162,12 @@ bool MemoryNode::handle_peer_stitch_search_request(
     service::storage_owner::stitch_search_response_candidate_vectors(
       response.data(), header.item_count, candidate_capacity);
 
+  thread_local vec<element_t> query;
+  query.resize(VamanaNode::DIM);
   for (u32 i = 0; i < header.item_count; ++i) {
     const byte_t* raw_vector = vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes();
-    vec<element_t> query = decode_storage_vector_to_float(
-      raw_vector, VamanaNode::vector_dtype(), VamanaNode::DIM);
+    decode_storage_vector_to_float(
+      raw_vector, VamanaNode::vector_dtype(), VamanaNode::DIM, query.data());
     vec<RemotePtr> anchors =
       storage_owner_anchor_index_->nearest_anchors(
         span<const element_t>{query.data(), query.size()},
@@ -188,15 +190,17 @@ bool MemoryNode::handle_peer_stitch_search_request(
           !seen.insert(candidate).second) {
         continue;
       }
-      NodeSnapshot snapshot;
-      if (!read_node_snapshot(candidate, snapshot) || snapshot.deleted) {
+      const byte_t* candidate_vector = local_live_vector(candidate);
+      if (candidate_vector == nullptr) {
         continue;
       }
+      const byte_t* candidate_node = local_node_ptr(candidate);
       const size_t slot = static_cast<size_t>(i) * candidate_capacity + written;
       candidate_slots[slot].raw = candidate.raw_address;
-      candidate_slots[slot].generation = snapshot.generation;
+      candidate_slots[slot].generation = *reinterpret_cast<const u32*>(
+        candidate_node + VamanaNode::offset_generation());
       std::memcpy(candidate_vectors + slot * VamanaNode::vector_bytes(),
-                  snapshot.vector_data.data(),
+                  candidate_vector,
                   VamanaNode::vector_bytes());
       ++written;
     }

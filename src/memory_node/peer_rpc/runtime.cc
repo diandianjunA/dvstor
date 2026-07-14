@@ -88,7 +88,12 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   peer_stitch_search_max_queue_.store(0, std::memory_order_relaxed);
   peer_stitch_search_active_workers_.store(0, std::memory_order_relaxed);
 
-  const u32 worker_count = std::max<u32>(1, std::min<u32>(8, std::max<u32>(1, num_compute_threads_ / 2)));
+  const u32 cpu_parallelism = std::max<u32>(1, num_compute_threads_ / 2);
+  const u32 reverse_worker_count = std::min<u32>(8, cpu_parallelism);
+  const u32 stitch_fanout = std::max<u32>(1, num_storage_nodes_ - 1);
+  const u32 stitch_worker_count = std::min(
+    cpu_parallelism,
+    std::max<u32>(1, config.storage_owner_maintenance_workers) * stitch_fanout);
   const size_t snapshot_stride = align_up(VamanaNode::vector_bytes());
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
   const size_t coroutine_scratch_stride =
@@ -97,27 +102,33 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
                                        snapshot_stride *
                                          std::max<u32>(1, config.storage_owner_search_snapshot_batch))));
   const size_t scratch_bytes = std::max<size_t>(64ull * 1024ull * 1024ull, coroutine_scratch_stride);
-  peer_reverse_worker_states_.reserve(worker_count);
-  peer_stitch_search_worker_states_.reserve(worker_count);
-  for (u32 i = 0; i < worker_count; ++i) {
+  peer_reverse_worker_states_.reserve(reverse_worker_count);
+  for (u32 i = 0; i < reverse_worker_count; ++i) {
     auto worker = std::make_unique<StorageOwnerThread>(i, 1, config.max_send_queue_wr);
     worker->init_peer_scratch(*peer_context_, scratch_bytes, coroutine_scratch_stride);
     peer_reverse_worker_states_.push_back(std::move(worker));
-
-    auto stitch_worker = std::make_unique<StorageOwnerThread>(worker_count + i, 1, config.max_send_queue_wr);
-    stitch_worker->init_peer_scratch(*peer_context_, scratch_bytes, coroutine_scratch_stride);
+  }
+  peer_stitch_search_worker_states_.reserve(stitch_worker_count);
+  for (u32 i = 0; i < stitch_worker_count; ++i) {
+    auto stitch_worker = std::make_unique<StorageOwnerThread>(
+      reverse_worker_count + i, 1, config.max_send_queue_wr);
     peer_stitch_search_worker_states_.push_back(std::move(stitch_worker));
   }
 
   peer_rpc_progress_thread_ = std::thread([this]() { peer_rpc_progress_loop(); });
   peer_reverse_response_thread_ = std::thread([this]() { peer_reverse_response_loop(); });
   peer_reverse_outgoing_thread_ = std::thread([this]() { peer_reverse_outgoing_loop(); });
-  for (u32 i = 0; i < worker_count; ++i) {
+  for (u32 i = 0; i < reverse_worker_count; ++i) {
     peer_reverse_workers_.emplace_back([this, i]() { peer_reverse_update_worker_loop(i); });
+  }
+  for (u32 i = 0; i < stitch_worker_count; ++i) {
     peer_stitch_search_workers_.emplace_back([this, i]() { peer_stitch_search_worker_loop(i); });
   }
-  print_status("storage-owner peer reverse-update workers: " + std::to_string(worker_count));
-  print_status("storage-owner peer stitch-search workers: " + std::to_string(worker_count));
+  print_status("storage-owner peer reverse-update workers: " +
+               std::to_string(reverse_worker_count));
+  print_status("storage-owner peer stitch-search workers: " +
+               std::to_string(stitch_worker_count) +
+               " (partition fanout=" + std::to_string(stitch_fanout) + ")");
   print_status("storage-owner peer reverse-update tuning: mode=" + config.storage_owner_reverse_mode +
                " queue_depth=" + std::to_string(peer_reverse_task_queue_limit_) +
                " flush_us=" + std::to_string(config.storage_owner_reverse_flush_us) +
