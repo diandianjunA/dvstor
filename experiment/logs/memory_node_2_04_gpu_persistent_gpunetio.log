@@ -1,0 +1,192 @@
+============================================================
+                        SERVER
+============================================================
+num clients:                  1
+TCP port:                     1235
+IB device:                    <auto>
+IB port:                      1
+max outstanding CQEs:         64
+max send work requests:       4096
+max receive work requests:    4096
+============================================================
+index prefix:                     "/data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32"
+storage shard:                    "/data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32_node2_of5.dat"
+storage id:                       1
+registered memory GiB:            19
+====================================================================
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+num_cores: 112
+physical cores per socket: 28
+hyperthreading enabled
+interleaved policy
+pairing: 72890 -- 31246
+[STATUS]: pinned main thread to core 28
+[STATUS]: loaded index metadata from /data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32 (layout=plain, vector_data_type=uint8)
+allocation size: 20401094656
+allocated ALIGNED MEM (no hugepage) at 136164017176640 with buffer size 20401094656
+[STATUS]: loading index (13019830848 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32_node2_of5.dat
+[STATUS]: loaded GPU PQ codes (659231936 Bytes) at remote offset 13019834944
+[STATUS]: storage-owner idmap loaded entries=20000000 reserved=21048576
+[STATUS]: storage-owner anchors loaded on shard 1: entries=20480 memory=10652160 bytes
+[STATUS]: register memory and distribute access token
+[STATUS]: connect QPs of compute threads
+[STATUS]: reserving 64 GPU/bootstrap QPs per compute node
+pairing: 72895 -- 31251
+pairing: 72900 -- 31256
+pairing: 72905 -- 31261
+pairing: 72910 -- 31266
+pairing: 72915 -- 31271
+pairing: 72920 -- 31276
+pairing: 72925 -- 31281
+pairing: 72928 -- 31286
+pairing: 72936 -- 31291
+pairing: 72940 -- 31296
+pairing: 72945 -- 31301
+pairing: 72950 -- 31306
+pairing: 72955 -- 31311
+pairing: 72959 -- 31316
+pairing: 72965 -- 31321
+pairing: 72970 -- 31326
+pairing: 72975 -- 31331
+pairing: 72979 -- 31336
+pairing: 72984 -- 31341
+pairing: 72990 -- 31346
+pairing: 72995 -- 31351
+pairing: 72998 -- 31356
+pairing: 73006 -- 31361
+pairing: 73010 -- 31366
+pairing: 73014 -- 31371
+pairing: 73020 -- 31376
+pairing: 73025 -- 31381
+pairing: 73031 -- 31386
+pairing: 73034 -- 31391
+pairing: 73040 -- 31396
+pairing: 73045 -- 31401
+pairing: 73050 -- 31406
+pairing: 73055 -- 31442
+pairing: 73090 -- 31443
+pairing: 73091 -- 31444
+pairing: 73092 -- 31445
+pairing: 73093 -- 31446
+pairing: 73094 -- 31447
+pairing: 73095 -- 31448
+pairing: 73096 -- 31449
+pairing: 73097 -- 31450
+pairing: 73098 -- 31451
+pairing: 73099 -- 31452
+pairing: 73100 -- 31453
+pairing: 73101 -- 31454
+pairing: 73102 -- 31455
+pairing: 73103 -- 31456
+pairing: 73104 -- 31457
+pairing: 73105 -- 31458
+pairing: 73106 -- 31459
+pairing: 73107 -- 31460
+pairing: 73108 -- 31461
+pairing: 73109 -- 31462
+pairing: 73110 -- 31463
+pairing: 73111 -- 31464
+pairing: 73112 -- 31465
+pairing: 73113 -- 31466
+pairing: 73114 -- 31467
+pairing: 73115 -- 31468
+pairing: 73116 -- 31469
+pairing: 73117 -- 31470
+pairing: 73118 -- 31471
+pairing: 73119 -- 31472
+pairing: 73120 -- 31473
+[STATUS]: waiting for compute-node startup barrier
+1 device(s) found
+Selected device: ibp86s0
+Selected port state: 4, lid: 8
+pairing: 73215 -- 73214
+pairing: 73219 -- 73224
+pairing: 73225 -- 73232
+pairing: 73233 -- 73239
+pairing: 73242 -- 73244
+pairing: 73248 -- 73246
+pairing: 73251 -- 73247
+pairing: 73255 -- 73252
+pairing: 73256 -- 73253
+pairing: 73258 -- 73254
+pairing: 73260 -- 73257
+pairing: 73262 -- 73259
+pairing: 73264 -- 73261
+pairing: 73266 -- 73263
+pairing: 73268 -- 73267
+pairing: 73270 -- 73271
+[STATUS]: storage-owner peer RDMA QPs per peer: 4
+[STATUS]: storage-owner peer QP0 reserved for RPC; data RDMA uses QP1..3
+allocated ALIGNED MEM (no hugepage) at 136163409002560 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136163388031040 with buffer size 19932480
+[STATUS]: storage-owner peer RPC receive slots per peer: 64 (requested=64)
+allocated ALIGNED MEM (no hugepage) at 136163611185216 with buffer size 502784
+allocated ALIGNED MEM (no hugepage) at 136163318825024 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136163249619008 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136163180412992 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136163111206976 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136163042000960 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136162972794944 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136162903588928 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136162834382912 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136162765176896 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136162695970880 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136162626764864 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136162557558848 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136162488352832 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136162419146816 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136162349940800 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136162280734784 with buffer size 67108864
+[STATUS]: storage-owner peer reverse-update workers: 8
+[STATUS]: storage-owner peer stitch-search workers: 8
+[STATUS]: storage-owner peer reverse-update tuning: mode=async queue_depth=65536 flush_us=200 coalesce_max=256
+allocated ALIGNED MEM (no hugepage) at 136162012299328 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136161064386624 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136160995180608 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136160925974592 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136160856768576 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136160787562560 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136160718356544 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136160649150528 with buffer size 67108864
+[STATUS]: storage-owner maintenance workers: 8 (configured=8, resource_gated_parallel_stitching=true)
+[STATUS]: storage-owner maintenance tuning: mode=finalize local_stitch=true compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace=adaptive backlog_limit=65536
+[STATUS]: storage-owner peer RDMA read credits per peer: 8 per QP: 8 (requested=8)
+[STATUS]: storage-owner online insert tuning: construction_beam=128 snapshot_batch=64 prune_max_candidates=128 update_mode=local_stitch
+[STATUS]: storage-owner coroutine scratch: snapshot_bytes=144 snapshot_stride=192 batch=64 per_coroutine=13120
+allocated ALIGNED MEM (no hugepage) at 136160579944512 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136160510738496 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136160441532480 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136160372326464 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136160303120448 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136160233914432 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136160164708416 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136160095502400 with buffer size 67108864
+[STATUS]: storage-owner insert runtime enabled on shard 1
+[STATUS]: storage-owner maintenance observation: enqueued=1 stitch_enqueued=0 cleanup_enqueued=1 stitch_tasks_done=0 stitched_live=0 cleanup_processed=0 stale=0 stitch_completion_ratio=0.000000 live_stitch_completion_ratio=0.000000 avg_stitch_delay_ms=0.000000 max_stitch_delay_ms=0.000000 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=0.000000 failed=0 max_backlog=1 pressure_yields=0 external_search_requests=0 external_candidates=0 stitch_batches=0 avg_stitch_batch_size=0.000000 peer_stitch_enqueued=5 peer_stitch_processed=4 peer_stitch_items=12 peer_stitch_rate_per_sec=1.409582 peer_stitch_max_queue=1 reclaim_ack=0 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13679067552 stitch_remaining=0 cleanup_remaining=1 remaining=1
+[STATUS]: storage-owner maintenance observation: enqueued=594 stitch_enqueued=372 cleanup_enqueued=222 stitch_tasks_done=164 stitched_live=164 cleanup_processed=69 stale=0 stitch_completion_ratio=0.440860 live_stitch_completion_ratio=0.440860 avg_stitch_delay_ms=1494.104493 max_stitch_delay_ms=2657.885862 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=12.133060 failed=0 max_backlog=229 pressure_yields=0 external_search_requests=142 external_candidates=91112 stitch_batches=40 avg_stitch_batch_size=9.150000 peer_stitch_enqueued=158 peer_stitch_processed=144 peer_stitch_items=1306 peer_stitch_rate_per_sec=96.620585 peer_stitch_max_queue=16 reclaim_ack=92 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13679317536 stitch_remaining=6 cleanup_remaining=146 remaining=152
+[STATUS]: storage-owner maintenance observation: enqueued=936 stitch_enqueued=604 cleanup_enqueued=332 stitch_tasks_done=528 stitched_live=528 cleanup_processed=147 stale=0 stitch_completion_ratio=0.874172 live_stitch_completion_ratio=0.874172 avg_stitch_delay_ms=2859.103448 max_stitch_delay_ms=4757.738358 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=28.452725 failed=0 max_backlog=299 pressure_yields=0 external_search_requests=224 external_candidates=221597 stitch_batches=60 avg_stitch_batch_size=10.000000 peer_stitch_enqueued=230 peer_stitch_processed=213 peer_stitch_items=2501 peer_stitch_rate_per_sec=134.773232 peer_stitch_max_queue=18 reclaim_ack=117 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13679472768 stitch_remaining=4 cleanup_remaining=178 remaining=182
+[STATUS]: storage-owner maintenance observation: enqueued=1504 stitch_enqueued=965 cleanup_enqueued=539 stitch_tasks_done=788 stitched_live=788 cleanup_processed=225 stale=0 stitch_completion_ratio=0.816580 live_stitch_completion_ratio=0.816580 avg_stitch_delay_ms=2561.607011 max_stitch_delay_ms=4757.738358 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=33.236723 failed=0 max_backlog=369 pressure_yields=2 external_search_requests=325 external_candidates=319357 stitch_batches=86 avg_stitch_batch_size=10.511628 peer_stitch_enqueued=326 peer_stitch_processed=325 peer_stitch_items=3884 peer_stitch_rate_per_sec=163.821615 peer_stitch_max_queue=18 reclaim_ack=368 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13679715360 stitch_remaining=61 cleanup_remaining=307 remaining=368
+[STATUS]: storage-owner maintenance observation: enqueued=1994 stitch_enqueued=1275 cleanup_enqueued=719 stitch_tasks_done=1116 stitched_live=1116 cleanup_processed=535 stale=0 stitch_completion_ratio=0.875294 live_stitch_completion_ratio=0.875294 avg_stitch_delay_ms=2645.951597 max_stitch_delay_ms=4757.738358 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=37.987942 failed=0 max_backlog=410 pressure_yields=6 external_search_requests=422 external_candidates=454023 stitch_batches=109 avg_stitch_batch_size=11.376147 peer_stitch_enqueued=426 peer_stitch_processed=425 peer_stitch_items=5502 peer_stitch_rate_per_sec=187.284638 peer_stitch_max_queue=18 reclaim_ack=675 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13679925024 stitch_remaining=35 cleanup_remaining=177 remaining=212
+[STATUS]: storage-owner maintenance observation: enqueued=2552 stitch_enqueued=1628 cleanup_enqueued=924 stitch_tasks_done=1409 stitched_live=1409 cleanup_processed=583 stale=0 stitch_completion_ratio=0.865479 live_stitch_completion_ratio=0.865479 avg_stitch_delay_ms=2729.419710 max_stitch_delay_ms=4757.738358 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=40.868197 failed=0 max_backlog=434 pressure_yields=8 external_search_requests=490 external_candidates=569719 stitch_batches=127 avg_stitch_batch_size=12.818898 peer_stitch_enqueued=496 peer_stitch_processed=487 peer_stitch_items=6783 peer_stitch_rate_per_sec=196.741647 peer_stitch_max_queue=18 reclaim_ack=1088 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13680160896 stitch_remaining=0 cleanup_remaining=334 remaining=334
+[STATUS]: storage-owner maintenance observation: enqueued=3005 stitch_enqueued=1911 cleanup_enqueued=1094 stitch_tasks_done=1726 stitched_live=1726 cleanup_processed=730 stale=0 stitch_completion_ratio=0.903192 live_stitch_completion_ratio=0.903192 avg_stitch_delay_ms=2891.658378 max_stitch_delay_ms=4757.738358 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=43.679956 failed=0 max_backlog=434 pressure_yields=12 external_search_requests=550 external_candidates=698361 stitch_batches=139 avg_stitch_batch_size=13.302158 peer_stitch_enqueued=560 peer_stitch_processed=548 peer_stitch_items=7917 peer_stitch_rate_per_sec=200.355859 peer_stitch_max_queue=18 reclaim_ack=1436 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13680351072 stitch_remaining=62 cleanup_remaining=357 remaining=419
+[STATUS]: storage-owner maintenance observation: enqueued=3549 stitch_enqueued=2285 cleanup_enqueued=1264 stitch_tasks_done=1939 stitched_live=1939 cleanup_processed=786 stale=0 stitch_completion_ratio=0.848578 live_stitch_completion_ratio=0.848578 avg_stitch_delay_ms=2944.164810 max_stitch_delay_ms=5125.390351 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=43.463453 failed=0 max_backlog=596 pressure_yields=12 external_search_requests=598 external_candidates=784362 stitch_batches=153 avg_stitch_batch_size=14.130719 peer_stitch_enqueued=625 peer_stitch_processed=616 peer_stitch_items=9192 peer_stitch_rate_per_sec=206.042322 peer_stitch_max_queue=18 reclaim_ack=1451 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13680602400 stitch_remaining=123 cleanup_remaining=471 remaining=594
+[STATUS]: storage-owner maintenance observation: enqueued=4402 stitch_enqueued=2851 cleanup_enqueued=1551 stitch_tasks_done=2258 stitched_live=2258 cleanup_processed=796 stale=0 stitch_completion_ratio=0.792003 live_stitch_completion_ratio=0.792003 avg_stitch_delay_ms=3350.967071 max_stitch_delay_ms=7172.738055 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=44.029434 failed=0 max_backlog=1117 pressure_yields=12 external_search_requests=644 external_candidates=923659 stitch_batches=163 avg_stitch_batch_size=15.226994 peer_stitch_enqueued=674 peer_stitch_processed=667 peer_stitch_items=10739 peer_stitch_rate_per_sec=209.403052 peer_stitch_max_queue=18 reclaim_ack=1581 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13680982752 stitch_remaining=369 cleanup_remaining=748 remaining=1117
+[STATUS]: storage-owner maintenance observation: enqueued=4947 stitch_enqueued=3207 cleanup_enqueued=1740 stitch_tasks_done=2578 stitched_live=2578 cleanup_processed=806 stale=0 stitch_completion_ratio=0.803867 live_stitch_completion_ratio=0.803867 avg_stitch_delay_ms=3932.284804 max_stitch_delay_ms=9105.316160 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=45.458350 failed=0 max_backlog=1332 pressure_yields=12 external_search_requests=678 external_candidates=1027115 stitch_batches=173 avg_stitch_batch_size=16.196532 peer_stitch_enqueued=716 peer_stitch_processed=708 peer_stitch_items=12030 peer_stitch_rate_per_sec=212.127210 peer_stitch_max_queue=18 reclaim_ack=1602 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13681221984 stitch_remaining=405 cleanup_remaining=927 remaining=1332
+[STATUS]: storage-owner maintenance observation: enqueued=5272 stitch_enqueued=3406 cleanup_enqueued=1866 stitch_tasks_done=3026 stitched_live=3026 cleanup_processed=820 stale=0 stitch_completion_ratio=0.888432 live_stitch_completion_ratio=0.888432 avg_stitch_delay_ms=4649.732980 max_stitch_delay_ms=10225.685644 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=48.622034 failed=0 max_backlog=1336 pressure_yields=12 external_search_requests=728 external_candidates=1179157 stitch_batches=187 avg_stitch_batch_size=17.379679 peer_stitch_enqueued=769 peer_stitch_processed=756 peer_stitch_items=13436 peer_stitch_rate_per_sec=215.890830 peer_stitch_max_queue=18 reclaim_ack=1629 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13681356384 stitch_remaining=156 cleanup_remaining=1039 remaining=1195
+[STATUS]: storage-owner maintenance observation: enqueued=5731 stitch_enqueued=3698 cleanup_enqueued=2033 stitch_tasks_done=3410 stitched_live=3410 cleanup_processed=832 stale=0 stitch_completion_ratio=0.922120 live_stitch_completion_ratio=0.922120 avg_stitch_delay_ms=4978.801820 max_stitch_delay_ms=10225.685644 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=50.554256 failed=0 max_backlog=1336 pressure_yields=12 external_search_requests=790 external_candidates=1368118 stitch_batches=199 avg_stitch_batch_size=18.261307 peer_stitch_enqueued=833 peer_stitch_processed=822 peer_stitch_items=14807 peer_stitch_rate_per_sec=219.518145 peer_stitch_max_queue=20 reclaim_ack=1655 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13681552608 stitch_remaining=64 cleanup_remaining=1194 remaining=1258
+[STATUS]: storage-owner maintenance observation: enqueued=6214 stitch_enqueued=4011 cleanup_enqueued=2203 stitch_tasks_done=3782 stitched_live=3782 cleanup_processed=979 stale=0 stitch_completion_ratio=0.942907 live_stitch_completion_ratio=0.942907 avg_stitch_delay_ms=4849.258613 max_stitch_delay_ms=10225.685644 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=52.149659 failed=0 max_backlog=1336 pressure_yields=12 external_search_requests=872 external_candidates=1500568 stitch_batches=218 avg_stitch_batch_size=18.036697 peer_stitch_enqueued=944 peer_stitch_processed=926 peer_stitch_items=15934 peer_stitch_rate_per_sec=219.712497 peer_stitch_max_queue=20 reclaim_ack=1773 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13681763616 stitch_remaining=79 cleanup_remaining=1217 remaining=1296
+[STATUS]: storage-owner maintenance observation: enqueued=6891 stitch_enqueued=4424 cleanup_enqueued=2467 stitch_tasks_done=4119 stitched_live=4119 cleanup_processed=994 stale=0 stitch_completion_ratio=0.931058 live_stitch_completion_ratio=0.931058 avg_stitch_delay_ms=4709.901336 max_stitch_delay_ms=10225.685644 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=53.064185 failed=0 max_backlog=1550 pressure_yields=13 external_search_requests=919 external_candidates=1617265 stitch_batches=233 avg_stitch_batch_size=18.626609 peer_stitch_enqueued=991 peer_stitch_processed=983 peer_stitch_items=17240 peer_stitch_rate_per_sec=222.099185 peer_stitch_max_queue=24 reclaim_ack=1954 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13682040480 stitch_remaining=84 cleanup_remaining=1466 remaining=1550
+[STATUS]: storage-owner maintenance observation: enqueued=7373 stitch_enqueued=4733 cleanup_enqueued=2640 stitch_tasks_done=4501 stitched_live=4501 cleanup_processed=1015 stale=0 stitch_completion_ratio=0.950982 live_stitch_completion_ratio=0.950982 avg_stitch_delay_ms=4677.140969 max_stitch_delay_ms=10225.685644 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=54.221648 failed=0 max_backlog=1680 pressure_yields=14 external_search_requests=972 external_candidates=1762510 stitch_batches=246 avg_stitch_batch_size=19.158537 peer_stitch_enqueued=1038 peer_stitch_processed=1029 peer_stitch_items=18611 peer_stitch_rate_per_sec=224.198863 peer_stitch_max_queue=24 reclaim_ack=1978 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13682247456 stitch_remaining=20 cleanup_remaining=1618 remaining=1638
+[STATUS]: storage-owner maintenance observation: enqueued=7965 stitch_enqueued=5126 cleanup_enqueued=2839 stitch_tasks_done=4817 stitched_live=4817 cleanup_processed=1056 stale=0 stitch_completion_ratio=0.939719 live_stitch_completion_ratio=0.939719 avg_stitch_delay_ms=4630.238520 max_stitch_delay_ms=10225.685644 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=54.484207 failed=0 max_backlog=1861 pressure_yields=14 external_search_requests=1020 external_candidates=1887808 stitch_batches=258 avg_stitch_batch_size=19.538760 peer_stitch_enqueued=1094 peer_stitch_processed=1082 peer_stitch_items=19977 peer_stitch_rate_per_sec=225.956197 peer_stitch_max_queue=24 reclaim_ack=2003 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13682511552 stitch_remaining=85 cleanup_remaining=1776 remaining=1861
+[STATUS]: storage-owner maintenance observation: enqueued=9029 stitch_enqueued=5831 cleanup_enqueued=3198 stitch_tasks_done=5041 stitched_live=5041 cleanup_processed=1063 stale=0 stitch_completion_ratio=0.864517 live_stitch_completion_ratio=0.864517 avg_stitch_delay_ms=4701.703468 max_stitch_delay_ms=10225.685644 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=52.807887 failed=0 max_backlog=2694 pressure_yields=14 external_search_requests=1056 external_candidates=1998092 stitch_batches=265 avg_stitch_batch_size=19.867925 peer_stitch_enqueued=1139 peer_stitch_processed=1135 peer_stitch_items=21619 peer_stitch_rate_per_sec=226.473656 peer_stitch_max_queue=24 reclaim_ack=2076 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13682985312 stitch_remaining=566 cleanup_remaining=2128 remaining=2694
+[STATUS]: storage-owner maintenance observation: enqueued=9563 stitch_enqueued=6163 cleanup_enqueued=3400 stitch_tasks_done=5361 stitched_live=5361 cleanup_processed=1073 stale=0 stitch_completion_ratio=0.869869 live_stitch_completion_ratio=0.869869 avg_stitch_delay_ms=4969.272859 max_stitch_delay_ms=10673.708742 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=52.949803 failed=0 max_backlog=2898 pressure_yields=14 external_search_requests=1096 external_candidates=2120708 stitch_batches=275 avg_stitch_batch_size=20.309091 peer_stitch_enqueued=1181 peer_stitch_processed=1177 peer_stitch_items=22963 peer_stitch_rate_per_sec=226.802150 peer_stitch_max_queue=24 reclaim_ack=2095 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13683208416 stitch_remaining=578 cleanup_remaining=2320 remaining=2898
+[STATUS]: storage-owner maintenance observation: enqueued=9947 stitch_enqueued=6407 cleanup_enqueued=3540 stitch_tasks_done=5745 stitched_live=5745 cleanup_processed=1085 stale=0 stitch_completion_ratio=0.896676 live_stitch_completion_ratio=0.896676 avg_stitch_delay_ms=5406.647547 max_stitch_delay_ms=12659.182991 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=54.066648 failed=0 max_backlog=2928 pressure_yields=14 external_search_requests=1132 external_candidates=2230854 stitch_batches=287 avg_stitch_batch_size=20.797909 peer_stitch_enqueued=1223 peer_stitch_processed=1215 peer_stitch_items=24179 peer_stitch_rate_per_sec=227.550475 peer_stitch_max_queue=24 reclaim_ack=2114 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13683372384 stitch_remaining=438 cleanup_remaining=2448 remaining=2886
+[STATUS]: storage-owner maintenance observation: enqueued=10232 stitch_enqueued=6591 cleanup_enqueued=3641 stitch_tasks_done=6129 stitched_live=6129 cleanup_processed=1097 stale=0 stitch_completion_ratio=0.929904 live_stitch_completion_ratio=0.929904 avg_stitch_delay_ms=5810.684465 max_stitch_delay_ms=13068.175880 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=54.987582 failed=0 max_backlog=2928 pressure_yields=14 external_search_requests=1187 external_candidates=2399258 stitch_batches=299 avg_stitch_batch_size=21.247492 peer_stitch_enqueued=1271 peer_stitch_processed=1263 peer_stitch_items=25702 peer_stitch_rate_per_sec=230.590770 peer_stitch_max_queue=24 reclaim_ack=2139 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13683496704 stitch_remaining=238 cleanup_remaining=2537 remaining=2775
+[STATUS]: storage-owner maintenance observation: enqueued=10698 stitch_enqueued=6878 cleanup_enqueued=3820 stitch_tasks_done=6417 stitched_live=6417 cleanup_processed=1106 stale=0 stitch_completion_ratio=0.932975 live_stitch_completion_ratio=0.932975 avg_stitch_delay_ms=6007.426421 max_stitch_delay_ms=13068.175880 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=54.967567 failed=0 max_backlog=2963 pressure_yields=14 external_search_requests=1230 external_candidates=2530967 stitch_batches=308 avg_stitch_batch_size=21.561688 peer_stitch_enqueued=1324 peer_stitch_processed=1320 peer_stitch_items=27252 peer_stitch_rate_per_sec=233.438700 peer_stitch_max_queue=24 reclaim_ack=2162 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13683689568 stitch_remaining=237 cleanup_remaining=2707 remaining=2944
+[STATUS]: storage-owner maintenance observation: enqueued=11096 stitch_enqueued=7105 cleanup_enqueued=3991 stitch_tasks_done=6869 stitched_live=6869 cleanup_processed=1199 stale=0 stitch_completion_ratio=0.966784 live_stitch_completion_ratio=0.966784 avg_stitch_delay_ms=6125.243233 max_stitch_delay_ms=13068.175880 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=56.228281 failed=0 max_backlog=3023 pressure_yields=15 external_search_requests=1284 external_candidates=2679588 stitch_batches=323 avg_stitch_batch_size=21.860681 peer_stitch_enqueued=1386 peer_stitch_processed=1380 peer_stitch_items=28509 peer_stitch_rate_per_sec=233.369057 peer_stitch_max_queue=24 reclaim_ack=2196 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13683841440 stitch_remaining=44 cleanup_remaining=2785 remaining=2829
+[STATUS]: storage-owner maintenance observation: enqueued=11554 stitch_enqueued=7379 cleanup_enqueued=4175 stitch_tasks_done=7190 stitched_live=7190 cleanup_processed=2818 stale=0 stitch_completion_ratio=0.974387 live_stitch_completion_ratio=0.974387 avg_stitch_delay_ms=6031.432458 max_stitch_delay_ms=13068.175880 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=56.409727 failed=0 max_backlog=3023 pressure_yields=40 external_search_requests=1366 external_candidates=2756309 stitch_batches=345 avg_stitch_batch_size=20.976812 peer_stitch_enqueued=1483 peer_stitch_processed=1479 peer_stitch_items=29796 peer_stitch_rate_per_sec=233.766928 peer_stitch_max_queue=24 reclaim_ack=5269 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13684026240 stitch_remaining=142 cleanup_remaining=1350 remaining=1492
+[STATUS]: storage-owner maintenance observation: enqueued=12263 stitch_enqueued=7853 cleanup_enqueued=4410 stitch_tasks_done=7493 stitched_live=7493 cleanup_processed=2833 stale=0 stitch_completion_ratio=0.954158 live_stitch_completion_ratio=0.954158 avg_stitch_delay_ms=5964.316552 max_stitch_delay_ms=13068.175880 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=56.045336 failed=0 max_backlog=3023 pressure_yields=40 external_search_requests=1432 external_candidates=2924347 stitch_batches=360 avg_stitch_batch_size=21.436111 peer_stitch_enqueued=1541 peer_stitch_processed=1532 peer_stitch_items=31393 peer_stitch_rate_per_sec=234.809987 peer_stitch_max_queue=24 reclaim_ack=5704 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13684345440 stitch_remaining=136 cleanup_remaining=1570 remaining=1706
+[STATUS]: storage-owner maintenance observation: enqueued=13012 stitch_enqueued=8417 cleanup_enqueued=4595 stitch_tasks_done=7877 stitched_live=7877 cleanup_processed=2845 stale=0 stitch_completion_ratio=0.935844 live_stitch_completion_ratio=0.935844 avg_stitch_delay_ms=5922.945537 max_stitch_delay_ms=13068.175880 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=56.702024 failed=0 max_backlog=3023 pressure_yields=40 external_search_requests=1476 external_candidates=3058954 stitch_batches=372 avg_stitch_batch_size=21.776882 peer_stitch_enqueued=1606 peer_stitch_processed=1595 peer_stitch_items=32646 peer_stitch_rate_per_sec=234.999909 peer_stitch_max_queue=24 reclaim_ack=5730 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13684723104 stitch_remaining=316 cleanup_remaining=1743 remaining=2059
+[STATUS]: storage-owner maintenance observation: enqueued=13496 stitch_enqueued=8707 cleanup_enqueued=4789 stitch_tasks_done=8325 stitched_live=8325 cleanup_processed=2859 stale=0 stitch_completion_ratio=0.956127 live_stitch_completion_ratio=0.956127 avg_stitch_delay_ms=5909.231916 max_stitch_delay_ms=13068.175880 compaction_batch_target=32 compaction_max_delay_ms=10 compaction_pace_slot_ms=1 stitch_rate_per_sec=57.578971 failed=0 max_backlog=3023 pressure_yields=40 external_search_requests=1536 external_candidates=3242972 stitch_batches=386 avg_stitch_batch_size=22.147668 peer_stitch_enqueued=1694 peer_stitch_processed=1685 peer_stitch_items=34070 peer_stitch_rate_per_sec=235.641506 peer_stitch_max_queue=24 reclaim_ack=5768 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=13684918656 stitch_remaining=158 cleanup_remaining=1923 remaining=2081
