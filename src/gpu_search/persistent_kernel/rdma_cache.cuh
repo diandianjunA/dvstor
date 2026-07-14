@@ -1,3 +1,9 @@
+#pragma once
+
+#include "gpu_search/persistent_kernel/candidate_scoring.cuh"
+
+namespace gpu_search::persistent_kernel_detail {
+
 __device__ __forceinline__ f32 storage_component(
     const PersistentKernelParams& params, const u8* vector, u32 dimension) {
   if (params.vector_dtype == 0) return reinterpret_cast<const f32*>(vector)[dimension];
@@ -982,3 +988,4 @@ __device__ bool fetch_graph_records_batch(
   return failed == 0;
 }
 
+}  // namespace gpu_search::persistent_kernel_detail

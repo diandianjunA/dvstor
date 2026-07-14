@@ -1,3 +1,9 @@
+#pragma once
+
+#include "gpu_search/persistent_kernel/query_traversal.cuh"
+
+namespace gpu_search::persistent_kernel_detail {
+
 __device__ void direct_read_owner_loop(PersistentKernelParams params,
                                        u32 queue_count,
                                        u32 owner_block);
@@ -929,3 +935,5 @@ __global__ void gather_anchor_codes_kernel(const u8* base_codes,
     ? base_codes[static_cast<u64>(handle) * code_bytes + code_byte]
     : 0;
 }
+
+}  // namespace gpu_search::persistent_kernel_detail

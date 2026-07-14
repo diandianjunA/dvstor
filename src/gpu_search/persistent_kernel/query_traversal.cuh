@@ -1,3 +1,9 @@
+#pragma once
+
+#include "gpu_search/persistent_kernel/rdma_cache.cuh"
+
+namespace gpu_search::persistent_kernel_detail {
+
 __device__ u64 decode_compact_raw(const u8* source, u32 shard_bits) {
   u64 packed = 0;
   for (u32 byte = 0; byte < 5; ++byte) packed |= static_cast<u64>(source[byte]) << (8 * byte);
@@ -637,3 +643,4 @@ __device__ void process_query(const PersistentKernelParams& params,
   }
 }
 
+}  // namespace gpu_search::persistent_kernel_detail

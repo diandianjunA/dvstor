@@ -101,11 +101,23 @@ set(DVSTOR_MEMORY_NODE_SOURCES
     src/gpu_search/pq_index.cc
     src/memory_node/memory_node.cc
     src/memory_node/peer_rdma.cc
-    src/memory_node/peer_rpc.cc
+    src/memory_node/peer_rpc/client_requests.cc
+    src/memory_node/peer_rpc/request_handlers.cc
+    src/memory_node/peer_rpc/runtime.cc
+    src/memory_node/peer_rpc/workers.cc
     src/memory_node/storage_owner_anchor.cc
-    src/memory_node/storage_owner_index.cc
-    src/memory_node/storage_owner_maintenance.cc
-    src/memory_node/storage_owner_runtime.cc
+    src/memory_node/storage_owner_index/allocation.cc
+    src/memory_node/storage_owner_index/candidate_search.cc
+    src/memory_node/storage_owner_index/graph_access.cc
+    src/memory_node/storage_owner_index/graph_mutation.cc
+    src/memory_node/storage_owner_maintenance/graph_tasks.cc
+    src/memory_node/storage_owner_maintenance/queue.cc
+    src/memory_node/storage_owner_maintenance/runtime.cc
+    src/memory_node/storage_owner_maintenance/worker.cc
+    src/memory_node/storage_owner_runtime/batch_execution.cc
+    src/memory_node/storage_owner_runtime/lifecycle.cc
+    src/memory_node/storage_owner_runtime/wire_protocol.cc
+    src/memory_node/storage_owner_runtime/workers.cc
     src/vamana/anchor_index.cc
 )
 
@@ -256,9 +268,23 @@ else ()
         src/gpu_search/navigation_bootstrapper.cc
         src/gpu_search/index_format.cc
         src/gpu_search/persistent_engine.cc
+        src/gpu_search/persistent_engine/completion.cc
+        src/gpu_search/persistent_engine/construction.cc
+        src/gpu_search/persistent_engine/delta_publication.cc
+        src/gpu_search/persistent_engine/health.cc
+        src/gpu_search/persistent_engine/lifecycle.cc
+        src/gpu_search/persistent_engine/query_execution.cc
+        src/gpu_search/persistent_engine/routing.cc
+        src/gpu_search/persistent_engine/storage_reclaim.cc
         src/gpu_search/pq_index.cc
         src/gpu_search/types.cc
-        src/service/compute_service.cc
+        src/service/compute_service/index_commands.cc
+        src/service/compute_service/lifecycle.cc
+        src/service/compute_service/search.cc
+        src/service/compute_service/storage_owner/completion.cc
+        src/service/compute_service/storage_owner/lifecycle.cc
+        src/service/compute_service/storage_owner/public_mutations.cc
+        src/service/compute_service/storage_owner/sender.cc
         src/service/index_metadata.cc
         src/vamana/anchor_index.cc
     )

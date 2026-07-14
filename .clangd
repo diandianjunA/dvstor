@@ -1,0 +1,31 @@
+CompileFlags:
+  CompilationDatabase: build
+
+---
+If:
+  PathMatch: 'src/.*\.(cu|cuh)'
+CompileFlags:
+  Compiler: clang++
+  Remove:
+    - -forward-unknown-to-host-compiler
+    - --options-file
+    - 'CMakeFiles/*'
+    - '--generate-code=*'
+    - '-Xcompiler=*'
+    - --expt-relaxed-constexpr
+    - --expt-extended-lambda
+    - '-rdc=*'
+    - -x
+  Add:
+    - -xcuda
+    - --cuda-path=/usr/local/cuda
+    - --cuda-gpu-arch=sm_80
+    - --no-cuda-version-check
+    - -I../src
+    - -I../thirdparty
+    - -I../rdma-library
+    - -I../rdma-library/.
+    - -I/opt/mellanox/doca/include
+    - -I/usr/local/cuda/include
+    - -isystem
+    - /home/xjs/anaconda3/include

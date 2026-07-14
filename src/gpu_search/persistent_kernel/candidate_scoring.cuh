@@ -1,3 +1,9 @@
+#pragma once
+
+#include "gpu_search/persistent_kernel/context.cuh"
+
+namespace gpu_search::persistent_kernel_detail {
+
 struct CandidateWorkspaceArrays {
   u32 handles[kPersistentMaxExact * 2];
   f32 distances[kPersistentMaxExact * 2];
@@ -733,3 +739,4 @@ __device__ void merge_approximate_into_beam(
   (void)merge_expanded;
 }
 
+}  // namespace gpu_search::persistent_kernel_detail

@@ -16,15 +16,16 @@
 - `src/service/compute_service/storage_owner/`：计算侧更新入口、发送和完成处理；
 - `tools/breakdown_benchmark/`：数据集、进度、报表和工作负载编排。
 
-## 同编译单元拆分
+## 实现单元
 
-查询和更新热路径使用 `.ipp`/`.cuh` 责任片段，由一个 `.cc`/`.cu` 聚合编译。这一
-选择是有意的：既把数千行实现拆成可导航模块，又不增加跨 translation unit 调用、
-不暴露 PImpl 私有状态，也不阻断编译器对热路径的内联和常量传播。
+CPU 运行时使用普通 `.hh`/`.cc`：每个 `.cc` 是可独立编译、可被 clangd 直接解析的
+职责单元。模块共享的非公开声明放在本目录的 `detail.hh`；GPU 查询引擎通过
+`impl.hh` 定义 PImpl 状态，公开门面只保留装配和转发。项目不使用 `.ipp` 文本片段，
+也不依赖 `__INCLUDE_LEVEL__` 改变源码语义。
 
-新代码应放入最小责任片段。聚合文件只保留 include、共享类型和装配顺序；不得把
-业务实现重新写回聚合文件。只有需要跨 subsystem 复用且拥有稳定接口的能力，才
-提取为普通 `.hh`/`.cc`，例如 `mapped_ring.hh`、benchmark dataset 和 report。
+CUDA 设备代码仍由 `persistent_kernel.cu` 形成一个 translation unit，以保留设备端
+内联与常量传播；目录内 `.cuh` 是带 `#pragma once`、显式依赖和命名空间的正常 CUDA
+头文件，而不是可独立切换行为的 include 片段。
 
 ## 动态更新语义
 
@@ -38,5 +39,5 @@ generation 的重建与切换属于独立的离线/控制面过程。
 - 不在查询热路径分配内存、创建 stream、创建 QP 或同步等待 CPU fallback；
 - 不新增 CPU 图导航或隐式传输回退；
 - 索引格式和 RPC wire protocol 必须由显式 schema/version 保护；
-- 结构重构优先保持同一编译单元和公开 ABI；
+- 结构重构保持公开 ABI，并通过构建与性能测试确认跨实现单元边界；
 - 修改职责边界时同步更新单元测试与本文档。
