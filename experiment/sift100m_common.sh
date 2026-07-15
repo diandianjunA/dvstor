@@ -35,13 +35,14 @@ MAX_QUERIES="${MAX_QUERIES:-10000}"
 GROUNDTRUTH_LABEL="${GROUNDTRUTH_LABEL:-100M}"
 GROUNDTRUTH_TOPK="${GROUNDTRUTH_TOPK:-10}"
 
-# The first 100M rows remain the indexed base. The performance query stream
-# uses five million held-out rows [100M,105M).
+# The first 100M rows remain the indexed base. Performance queries and writes
+# use disjoint held-out ranges so an inserted vector can never become an exact
+# throughput-query hit during the mixed acceptance run.
 BENCHMARK_VECTOR_SOURCE="${BENCHMARK_VECTOR_SOURCE:-$DATASET_DIR/bigann_base.bvecs}"
 PERFORMANCE_QUERY_START="${PERFORMANCE_QUERY_START:-100000000}"
 PERFORMANCE_QUERY_END="${PERFORMANCE_QUERY_END:-105000000}"
-INSERT_VECTOR_START="${INSERT_VECTOR_START:-103000000}"
-INSERT_VECTOR_END="${INSERT_VECTOR_END:-105000000}"
+INSERT_VECTOR_START="${INSERT_VECTOR_START:-105000000}"
+INSERT_VECTOR_END="${INSERT_VECTOR_END:-107000000}"
 
 BASE_PORT="${BASE_PORT:-1234}"
 HOSTS="${HOSTS:-192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202}"
@@ -99,7 +100,7 @@ query_suffix() {
 base_bin() { echo "$CONVERTED_DIR/base$(base_suffix).u8bin"; }
 query_bin() { echo "$CONVERTED_DIR/query$(query_suffix).u8bin"; }
 groundtruth_bin() { echo "$CONVERTED_DIR/groundtruth_${GROUNDTRUTH_LABEL}.bin"; }
-insert_bin() { echo "${INSERT_FILE:-$DATASET_DIR/sift103m_to_105m_insert.u8bin}"; }
+insert_bin() { echo "${INSERT_FILE:-$DATASET_DIR/sift105m_to_107m_insert.u8bin}"; }
 performance_query_bin() { echo "${PERFORMANCE_QUERY_FILE:-$DATASET_DIR/sift100m_to_105m_query.u8bin}"; }
 metadata_file() { echo "${INDEX_PREFIX}.meta.json"; }
 model_file() { echo "${INDEX_PREFIX}.pq${PQ_SUBQUANTIZERS}"; }
@@ -158,6 +159,7 @@ expected = {
     'pq_bits': 8,
     'partition_strategy': partition_strategy,
     'partition_max_degree': int(partition_max_degree),
+    'idmap_format': 'owner_sharded_v1',
 }
 errors = [
     f'{key}: metadata={metadata.get(key)!r}, expected={value!r}'
@@ -206,6 +208,19 @@ PY_VALIDATE
   if [[ "$role" == "compute" ]]; then
     if [[ ! -s "$(model_file)" ]]; then
       echo "missing OPQ/PQ${PQ_SUBQUANTIZERS} model: $(model_file)" >&2
+      return 1
+    fi
+    local missing_idmaps=()
+    local current
+    for ((current = 1; current <= SHARDS; ++current)); do
+      if [[ ! -s "$(idmap_file "$current")" ]]; then
+        missing_idmaps+=("$(idmap_file "$current")")
+      fi
+    done
+    if ((${#missing_idmaps[@]} != 0)); then
+      echo "missing compute owner-idmap sidecars:" >&2
+      printf '  - %s\n' "${missing_idmaps[@]}" >&2
+      echo "copy all ${SHARDS} owner idmap sidecars to the resolved index prefix; index rebuild is not required" >&2
       return 1
     fi
   elif [[ "$role" == "storage" ]]; then

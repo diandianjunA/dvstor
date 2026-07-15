@@ -75,11 +75,11 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
           task.byte_len = bytes;
           task.received_at = std::chrono::steady_clock::now();
           mark_storage_owner_foreground_activity();
-          {
-            std::lock_guard<std::mutex> lock(storage_insert_tasks_mutex_);
-            storage_insert_tasks_.push_back(std::move(task));
-          }
-          storage_insert_tasks_cv_.notify_one();
+          // At most one descriptor exists per occupied receive slot. The
+          // queue is preallocated to that exact protocol bound, so ingress
+          // never blocks the CQ progress loop.
+          lib_assert(storage_insert_tasks_->try_push(std::move(task)),
+                     "storage-owner ingress queue exhausted despite RPC-slot bound");
           handled_async = true;
         }
       }
@@ -248,6 +248,23 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     invalidated_neighbors->assign(item_count, {});
   }
 
+  // Reserve the entire RPC batch before the first node or ID-map mutation.
+  // Configuration guarantees that one maximum batch fits in the window.
+  vec<u32> reserved_maintenance_work_items(item_count);
+  vec<u64> reserved_maintenance_sequences(item_count);
+  for (size_t idx = 0; idx < item_count; ++idx) {
+    const auto kind = kinds == nullptr
+      ? service::storage_owner::MutationKind::insert : kinds[idx];
+    reserved_maintenance_work_items[idx] =
+      storage_owner_maintenance_work_items(kind, config);
+  }
+  const u64 first_reserved_maintenance_sequence =
+    begin_storage_owner_maintenance_batch(reserved_maintenance_work_items);
+  for (size_t idx = 0; idx < item_count; ++idx) {
+    reserved_maintenance_sequences[idx] =
+      first_reserved_maintenance_sequence + static_cast<u64>(idx);
+  }
+
   const auto allocate_node = [&]() {
     const auto started = std::chrono::steady_clock::now();
     const RemotePtr pointer = allocate_local_node();
@@ -263,16 +280,23 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
                             u32 generation,
                             service::storage_owner::MutationKind kind,
                             RemotePtr new_pointer,
-                            RemotePtr old_pointer) {
+                            RemotePtr old_pointer,
+                            u64 reserved_sequence,
+                            u32 reserved_work_items) {
     const auto started = std::chrono::steady_clock::now();
     const u64 sequence = schedule_storage_owner_maintenance(
-      id, generation, kind, new_pointer, old_pointer, config);
+      id, generation, kind, new_pointer, old_pointer,
+      reserved_sequence, reserved_work_items, config);
     breakdown.storage_owner_schedule_maintenance_ns += elapsed_ns_since(started);
     return sequence;
   };
 
   for (size_t idx = 0; idx < item_count; ++idx) {
     const auto kind = kinds == nullptr ? service::storage_owner::MutationKind::insert : kinds[idx];
+    const u32 reserved_maintenance_work =
+      reserved_maintenance_work_items[idx];
+    const u64 reserved_maintenance_sequence =
+      reserved_maintenance_sequences[idx];
     FreshnessEntry old_entry{};
     u32 generation = 0;
     const auto prepare_started = std::chrono::steady_clock::now();
@@ -283,20 +307,27 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       (*results)[idx].generation = generation;
     }
     if (status != service::storage_owner::MutationStatus::ok) {
+      complete_storage_owner_maintenance_sequence(
+        reserved_maintenance_sequence, reserved_maintenance_work);
       if (statuses != nullptr) {
         (*statuses)[idx] = static_cast<u32>(status);
       }
       continue;
     }
     if (kind == service::storage_owner::MutationKind::erase) {
-      const bool deleted = mark_node_deleted(old_entry.current, old_entry.generation);
+      const bool deleted = mark_node_deleted(old_entry.current, generation);
       if (deleted) {
-        publish(ids[idx], old_entry.current, old_entry.generation, true);
+        publish(ids[idx], old_entry.current, generation, true);
         const u64 maintenance_sequence = schedule(
-          ids[idx], old_entry.generation, kind, RemotePtr{}, old_entry.current);
+          ids[idx], generation, kind, RemotePtr{}, old_entry.current,
+          reserved_maintenance_sequence, reserved_maintenance_work);
         if (results != nullptr) {
           (*results)[idx].maintenance_sequence = maintenance_sequence;
         }
+      }
+      if (!deleted) {
+        complete_storage_owner_maintenance_sequence(
+          reserved_maintenance_sequence, reserved_maintenance_work);
       }
       if (statuses != nullptr) {
         (*statuses)[idx] = static_cast<u32>(deleted ? service::storage_owner::MutationStatus::ok
@@ -353,19 +384,21 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       }
       publish(ids[idx], new_ptr, generation, false);
       const u64 maintenance_sequence = schedule(
-        ids[idx], generation, kind, new_ptr, old_entry.current);
+        ids[idx], generation, kind, new_ptr, old_entry.current,
+        reserved_maintenance_sequence, reserved_maintenance_work);
       if (results != nullptr) {
         (*results)[idx].maintenance_sequence = maintenance_sequence;
       }
       RemotePtr observed;
       if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
         medoid_ptr = new_ptr;
-        if (statuses != nullptr) {
-          (*statuses)[idx] = static_cast<u32>(service::storage_owner::MutationStatus::ok);
-        }
-        continue;
+      } else {
+        medoid_ptr = observed;
       }
-      medoid_ptr = observed;
+      if (statuses != nullptr) {
+        (*statuses)[idx] = static_cast<u32>(service::storage_owner::MutationStatus::ok);
+      }
+      continue;
     }
 
     if (!use_anchors) {
@@ -395,7 +428,8 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
     publish(ids[idx], new_ptr, generation, false);
     const u64 maintenance_sequence = schedule(
-      ids[idx], generation, kind, new_ptr, old_entry.current);
+      ids[idx], generation, kind, new_ptr, old_entry.current,
+      reserved_maintenance_sequence, reserved_maintenance_work);
     if (results != nullptr) {
       (*results)[idx].maintenance_sequence = maintenance_sequence;
     }

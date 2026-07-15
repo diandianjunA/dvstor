@@ -37,7 +37,7 @@ inline u64 storage_owner_wr_id(u32 owner_storage, u32 slot_id) {
 }
 
 inline void add_storage_owner_breakdown(
-    const std::shared_ptr<service::breakdown::Sample>& sample,
+    service::breakdown::Sample* sample,
     const service::storage_owner::InsertBreakdownCounters& counters,
     u32 item_count) {
   if (!sample || !sample->collects_breakdown()) {
@@ -115,7 +115,7 @@ inline void add_storage_owner_breakdown(
 }
 
 inline void add_storage_owner_counters(
-    const std::shared_ptr<service::breakdown::Sample>& sample,
+    service::breakdown::Sample* sample,
     const service::storage_owner::InsertBreakdownCounters& counters) {
   if (!sample || !sample->collects_breakdown()) {
     return;
@@ -138,7 +138,7 @@ inline void add_storage_owner_counters(
 }
 
 inline void add_storage_owner_sender_breakdown(
-    const std::shared_ptr<service::breakdown::Sample>& sample,
+    service::breakdown::Sample* sample,
     u64 sender_queue_wait_ns,
     u64 batch_wait_ns,
     u64 request_prepare_ns,

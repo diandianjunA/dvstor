@@ -25,6 +25,8 @@ void MemoryNode::setup_insert_runtime(const Configuration& config) {
   lib_assert(slot_count <= static_cast<size_t>(config.max_recv_queue_wr),
              "storage_owner RPC receive slots exceed memory-node receive CQ capacity");
   insert_runtime_.response_offset = insert_runtime_.request_bytes * slot_count;
+  storage_insert_tasks_ =
+    std::make_unique<bounded::Queue<StorageOwnerInsertTask>>(slot_count);
   insert_runtime_.buffer.allocate(insert_runtime_.response_offset + insert_response_bytes * slot_count);
   insert_runtime_.buffer.touch_memory();
   insert_runtime_.region = std::make_unique<LocalMemoryRegion>(
@@ -96,6 +98,10 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
   }
   for (u32 i = 0; i < worker_count; ++i) {
     storage_insert_workers_.emplace_back([this, i]() { storage_owner_insert_worker_loop(i); });
+    if (!config.disable_thread_pinning) {
+      pin_thread(storage_insert_workers_.back(),
+                 core_assignment_.get_available_core());
+    }
   }
 }
 
@@ -103,18 +109,9 @@ void MemoryNode::storage_owner_insert_worker_loop(u32 worker_id) {
   current_storage_owner_thread_ = storage_owner_threads_[worker_id].get();
   for (;;) {
     StorageOwnerInsertTask task;
-    {
-      std::unique_lock<std::mutex> lock(storage_insert_tasks_mutex_);
-      storage_insert_tasks_cv_.wait(lock, [&]() {
-        return storage_insert_shutdown_.load(std::memory_order_acquire) || !storage_insert_tasks_.empty();
-      });
-      if (storage_insert_shutdown_.load(std::memory_order_acquire) && storage_insert_tasks_.empty()) {
-        current_storage_owner_thread_ = nullptr;
-        return;
-      }
-
-      task = std::move(storage_insert_tasks_.front());
-      storage_insert_tasks_.pop_front();
+    if (!storage_insert_tasks_->pop_wait(task, storage_insert_shutdown_)) {
+      current_storage_owner_thread_ = nullptr;
+      return;
     }
 
     mark_storage_owner_foreground_activity();

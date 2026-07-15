@@ -1,8 +1,113 @@
 #include "tools/breakdown_benchmark/report.hh"
 
+#include <algorithm>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 
 namespace tools::breakdown_benchmark {
+
+std::string normalize_acceptance_path(const std::string& path) {
+  if (path.empty()) return {};
+  std::error_code error;
+  const auto absolute = std::filesystem::absolute(path, error);
+  if (error) {
+    throw std::runtime_error(
+      "failed to make acceptance path absolute: " + path);
+  }
+  const auto canonical = std::filesystem::weakly_canonical(absolute, error);
+  if (error) return absolute.lexically_normal().string();
+  return canonical.string();
+}
+
+VerifiedQueryBaseline load_verified_query_baseline(
+    const std::string& report_path,
+    const nlohmann::json& expected_fingerprint) {
+  std::ifstream input(report_path);
+  if (!input) {
+    throw std::runtime_error(
+      "failed to open query baseline report: " + report_path);
+  }
+  nlohmann::json baseline;
+  try {
+    input >> baseline;
+  } catch (const std::exception& error) {
+    throw std::runtime_error(
+      "failed to parse query baseline report '" + report_path +
+      "': " + error.what());
+  }
+
+  if (!baseline.is_object() || !baseline.contains("meta") ||
+      !baseline["meta"].is_object()) {
+    throw std::runtime_error(
+      "query baseline report has no metadata object: " + report_path);
+  }
+  const auto& meta = baseline["meta"];
+  if (meta.value("workload", std::string{}) != "query") {
+    throw std::runtime_error(
+      "query baseline report must be produced by --workload query");
+  }
+  if (!meta.contains("acceptance_fingerprint") ||
+      !meta["acceptance_fingerprint"].is_object()) {
+    throw std::runtime_error(
+      "query baseline report has no acceptance fingerprint");
+  }
+  const auto& actual_fingerprint = meta["acceptance_fingerprint"];
+  if (actual_fingerprint != expected_fingerprint) {
+    throw std::runtime_error(
+      "query baseline fingerprint mismatch; expected=" +
+      expected_fingerprint.dump() + " actual=" +
+      actual_fingerprint.dump());
+  }
+  if (!expected_fingerprint.value("cold_cache", false) ||
+      !baseline.contains("stability") ||
+      !baseline["stability"].value("cache_independent_baseline", false)) {
+    throw std::runtime_error(
+      "query baseline report is not a cold-cache baseline");
+  }
+  if (!baseline.contains("acceptance") ||
+      !baseline["acceptance"].value("passed", false)) {
+    throw std::runtime_error(
+      "query baseline report did not pass its own acceptance checks");
+  }
+  if (!baseline.contains("throughput") ||
+      !baseline["throughput"].is_object()) {
+    throw std::runtime_error(
+      "query baseline report has no throughput object");
+  }
+  const auto& throughput = baseline["throughput"];
+  const double effective_qps = throughput.value(
+    "effective_query_ops_per_sec",
+    std::numeric_limits<double>::quiet_NaN());
+  if (!std::isfinite(effective_qps) || effective_qps <= 0.0 ||
+      throughput.value("query_ops", 0ULL) == 0 ||
+      throughput.value("write_ops", 0ULL) != 0) {
+    throw std::runtime_error(
+      "query baseline report has invalid effective query throughput");
+  }
+  return VerifiedQueryBaseline{
+    .report_path = normalize_acceptance_path(report_path),
+    .effective_query_qps = effective_qps,
+    .fingerprint = actual_fingerprint,
+  };
+}
+
+std::vector<uint32_t> filter_base_only_recall_ids(
+    const std::vector<node_t>& results,
+    uint32_t base_id_limit,
+    size_t result_limit) {
+  std::vector<uint32_t> filtered;
+  filtered.reserve(std::min(results.size(), result_limit));
+  for (const node_t id : results) {
+    if (id >= base_id_limit) continue;
+    filtered.push_back(static_cast<uint32_t>(id));
+    if (filtered.size() == result_limit) break;
+  }
+  return filtered;
+}
 
 nlohmann::json telemetry_to_json(const gpu_search::TelemetrySnapshot& telemetry) {
   return {
@@ -92,6 +197,9 @@ nlohmann::json telemetry_to_json(const gpu_search::TelemetrySnapshot& telemetry)
       {"resident_pq_peak_entries", telemetry.resident_pq_peak_entries},
       {"resident_pq_reclaimed", telemetry.resident_pq_reclaimed},
       {"mutation_capacity_rejections", telemetry.mutation_capacity_rejections},
+      {"mutation_capacity_wait_events", telemetry.mutation_capacity_wait_events},
+      {"mutation_capacity_wait_ns", telemetry.mutation_capacity_wait_ns},
+      {"mutation_capacity_wait_ms", static_cast<double>(telemetry.mutation_capacity_wait_ns) / 1e6},
       {"mutation_capacity_reserved", telemetry.mutation_capacity_reserved},
       {"mutation_capacity_reserved_max", telemetry.mutation_capacity_reserved_max},
       {"average_visibility_us", telemetry.mutations_published == 0 ? 0.0
@@ -141,10 +249,25 @@ FormattedReport format_report(const nlohmann::json& root,
            << " (ops=" << (query_ops + write_ops) << ")\n";
     output << "  query_ops_per_sec: " << throughput.value("query_ops_per_sec", 0.0)
            << " (ops=" << query_ops << ")\n";
+    output << "  effective_query_ops_per_sec: "
+           << throughput.value("effective_query_ops_per_sec", 0.0) << '\n';
     output << "  write_ops_per_sec: " << throughput.value("write_ops_per_sec", 0.0)
            << " (ops=" << write_ops << ")\n";
+    output << "  effective_write_ops_per_sec: "
+           << throughput.value("effective_write_ops_per_sec", 0.0) << '\n';
     output << "  insert_ops_per_sec: " << throughput.value("insert_ops_per_sec", 0.0)
            << " (ops=" << throughput.value("insert_ops", 0ULL) << ")\n";
+    output << "  client_drain_seconds: "
+           << throughput.value("client_drain_seconds", 0.0) << '\n';
+    output << "  scheduled_query/write_ops: "
+           << throughput.value("scheduled_query_ops", 0ULL) << "/"
+           << throughput.value("scheduled_write_ops", 0ULL) << '\n';
+    output << "  query/write_rate_attainment_ratio: "
+           << throughput.value("query_rate_attainment_ratio", 1.0) << "/"
+           << throughput.value("write_rate_attainment_ratio", 1.0) << '\n';
+    output << "  nominal/effective_rate_basis: "
+           << throughput.value("nominal_rate_basis", "") << "/"
+           << throughput.value("effective_rate_basis", "") << '\n';
     if (root["meta"].value("workload", "") == "mixed") {
       output << "  write_mix_completed: insert=" << throughput.value("insert_ops", 0ULL)
              << " upsert=" << throughput.value("upsert_ops", 0ULL)
@@ -156,10 +279,81 @@ FormattedReport format_report(const nlohmann::json& root,
            << stability.value("query_tail_ops_per_sec", 0.0) << '\n';
     output << "  query_tail_to_head_ratio: "
            << stability.value("query_tail_to_head_ratio", 0.0) << '\n';
+    output << "  write_head/tail_qps: "
+           << stability.value("write_head_ops_per_sec", 0.0) << "/"
+           << stability.value("write_tail_ops_per_sec", 0.0) << '\n';
+    output << "  write_tail_to_head_ratio: "
+           << stability.value("write_tail_to_head_ratio", 0.0) << '\n';
     output << "  zero_completion_windows: "
            << stability.value("zero_completion_windows", 0ULL) << '\n';
+    output << "  zero_query/write_windows: "
+           << stability.value("zero_query_windows", 0ULL) << "/"
+           << stability.value("zero_write_windows", 0ULL) << '\n';
     output << "  acceptance_passed: "
            << (root["acceptance"].value("passed", false) ? "true" : "false") << '\n';
+    const auto& acceptance = root["acceptance"];
+    output << "  baseline_source/verified/effective_qps/ratio: "
+           << acceptance.value("query_baseline_source", "disabled") << "/"
+           << (acceptance.value("query_baseline_fingerprint_verified", false)
+                 ? "true" : "false") << "/"
+           << acceptance.value("query_baseline_effective_ops_per_sec", -1.0)
+           << "/" << acceptance.value("observed_query_baseline_ratio", 0.0)
+           << '\n';
+    output << "  GPU visibility_ms/final_reserved/final_mutable/late_rpc: "
+           << acceptance.value("observed_max_gpu_visibility_ms", 0.0) << "/"
+           << acceptance.value(
+                "observed_final_mutation_capacity_reserved", 0ULL) << "/"
+           << acceptance.value("observed_final_delta_mutable_entries", 0ULL)
+           << "/"
+           << acceptance.value("observed_late_storage_owner_rpcs", 0ULL)
+           << '\n';
+    output << "  GPU visible mutations observed/expected, final drain s/timeout: "
+           << acceptance.value("observed_gpu_mutations_published", 0ULL)
+           << "/" << acceptance.value("expected_gpu_mutations", 0ULL)
+           << ", " << acceptance.value("gpu_final_state_drain_seconds", 0.0)
+           << "/"
+           << (acceptance.value("gpu_final_state_drain_timed_out", false)
+                 ? "true" : "false")
+           << '\n';
+  }
+
+  if (root.contains("stage2") &&
+      root["stage2"].value("requested_logs", 0ULL) != 0) {
+    const auto& stage2 = root["stage2"];
+    output << "stage2\n";
+    output << "  logs observed/requested: "
+           << stage2.value("logs_with_observations", 0ULL) << "/"
+           << stage2.value("requested_logs", 0ULL) << '\n';
+    output << "  p99_stitch_delay_upper_ms: ";
+    if (stage2.value("p99_stitch_delay_available", false)) {
+      output << stage2.value("p99_stitch_delay_upper_ms", 0.0)
+             << " (samples="
+             << stage2.value("p99_stitch_delay_samples", 0ULL) << ")\n";
+    } else {
+      output << "unavailable\n";
+    }
+    output << "  remaining/max_backlog: "
+           << stage2.value("remaining", 0ULL) << "/"
+           << stage2.value("max_backlog_observed", 0ULL) << '\n';
+    output << "  backlog_slope_per_sec: "
+           << stage2.value("backlog_slope_per_sec", 0.0) << '\n';
+    output << "  failures: " << stage2.value("failures", 0ULL) << '\n';
+    output << "  drain_seconds/timed_out: "
+           << stage2.value("drain_seconds", 0.0) << "/"
+           << (stage2.value("drain_timed_out", false) ? "true" : "false")
+           << '\n';
+    if (stage2.contains("load")) {
+      const auto& load = stage2["load"];
+      output << "  load_observations/slope: "
+             << load.value("observations", 0ULL) << "/"
+             << load.value("backlog_slope_per_sec", 0.0) << '\n';
+    }
+    if (stage2.contains("post_stop_drain")) {
+      const auto& drain = stage2["post_stop_drain"];
+      output << "  post_stop_observations/remaining: "
+             << drain.value("observations", 0ULL) << "/"
+             << drain.value("remaining", 0ULL) << '\n';
+    }
   }
 
   if (root.contains("recall")) {
@@ -168,6 +362,12 @@ FormattedReport format_report(const nlohmann::json& root,
     output << "  recall@" << recall.value("k", 0) << ": "
            << recall.value("recall", 0.0) << '\n';
     output << "  queries: " << recall.value("queries", 0) << '\n';
+    output << "  mode/base_id_limit/search_width/insufficient_queries: "
+           << recall.value("mode", "all") << "/"
+           << recall.value("base_id_limit", 0ULL) << "/"
+           << recall.value("search_result_width", 0ULL) << "/"
+           << recall.value(
+                "queries_with_insufficient_base_results", 0ULL) << '\n';
     output << "  passed: " << (recall.value("passed", false) ? "true" : "false") << '\n';
     output << "  query_file: " << recall.value("query_file", "") << '\n';
     output << "  groundtruth_file: " << recall.value("groundtruth_file", "") << '\n';
@@ -178,6 +378,12 @@ FormattedReport format_report(const nlohmann::json& root,
     output << "  recall@" << recall.value("k", 0) << ": "
            << recall.value("recall", 0.0) << '\n';
     output << "  queries: " << recall.value("queries", 0) << '\n';
+    output << "  mode/base_id_limit/search_width/insufficient_queries: "
+           << recall.value("mode", "all") << "/"
+           << recall.value("base_id_limit", 0ULL) << "/"
+           << recall.value("search_result_width", 0ULL) << "/"
+           << recall.value(
+                "queries_with_insufficient_base_results", 0ULL) << '\n';
     output << "  query_file: " << recall.value("query_file", "") << '\n';
     output << "  groundtruth_file: " << recall.value("groundtruth_file", "") << '\n';
   }
@@ -229,8 +435,10 @@ FormattedReport format_report(const nlohmann::json& root,
            << gpu.value("resident_pq_peak_entries", 0ULL) << "/"
            << gpu.value("resident_pq_capacity", 0ULL) << "/"
            << gpu.value("resident_pq_reclaimed", 0ULL) << '\n';
-    output << "  mutation capacity rejected/current/peak: "
+    output << "  mutation capacity rejected/wait_events/wait_ms/current/peak: "
            << gpu.value("mutation_capacity_rejections", 0ULL) << "/"
+           << gpu.value("mutation_capacity_wait_events", 0ULL) << "/"
+           << gpu.value("mutation_capacity_wait_ms", 0.0) << "/"
            << gpu.value("mutation_capacity_reserved", 0ULL) << "/"
            << gpu.value("mutation_capacity_reserved_max", 0ULL) << '\n';
   }

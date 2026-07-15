@@ -12,11 +12,9 @@ void MemoryNode::peer_rpc_progress_loop() {
       bool responses_empty = false;
       bool outgoing_empty = false;
       bool sends_empty = false;
-      if (peer_reverse_workers_done_.load(std::memory_order_acquire)) {
-        {
-          std::lock_guard<std::mutex> lock(peer_reverse_responses_mutex_);
-          responses_empty = peer_reverse_responses_.empty();
-        }
+      if (peer_reverse_response_done_.load(std::memory_order_acquire)) {
+        responses_empty = peer_reverse_responses_ == nullptr ||
+                          peer_reverse_responses_->empty();
         {
           std::lock_guard<std::mutex> lock(peer_reverse_outgoing_mutex_);
           outgoing_empty = peer_reverse_outgoing_.empty();
@@ -26,7 +24,7 @@ void MemoryNode::peer_rpc_progress_loop() {
           sends_empty = peer_pending_sends_.empty();
         }
       }
-      if (peer_reverse_workers_done_.load(std::memory_order_acquire) &&
+      if (peer_reverse_response_done_.load(std::memory_order_acquire) &&
           responses_empty && outgoing_empty && sends_empty) {
         peer_rpc_progress_running_.store(false, std::memory_order_release);
         peer_completion_cv_.notify_all();
@@ -38,6 +36,7 @@ void MemoryNode::peer_rpc_progress_loop() {
     }
 
     for (i32 i = 0; i < num_received; ++i) {
+      bool hold_receive_slot = false;
       const auto [peer_id, slot_id] = decode_64bit(recv_wcs[i].wr_id);
       if (peer_id >= num_storage_nodes_ || slot_id >= peer_rpc_runtime_.recv_slots_per_peer) {
         continue;
@@ -52,7 +51,21 @@ void MemoryNode::peer_rpc_progress_loop() {
 
       const auto* header = reinterpret_cast<const service::storage_owner::PeerRpcHeader*>(payload);
       if (header->magic != service::storage_owner::kPeerRpcMagic ||
-          header->version != service::storage_owner::kPeerRpcVersion) {
+          header->version != service::storage_owner::kPeerRpcVersion ||
+          header->source_shard != peer_id) {
+        repost_peer_rpc_receive(peer_id, slot_id);
+        continue;
+      }
+
+      const bool is_request =
+        header->type == static_cast<u32>(
+          service::storage_owner::PeerRpcType::reverse_update_request) ||
+        header->type == static_cast<u32>(
+          service::storage_owner::PeerRpcType::cleanup_deleted_request) ||
+        header->type == static_cast<u32>(
+          service::storage_owner::PeerRpcType::stitch_search_request);
+      if (is_request &&
+          peer_reverse_shutdown_.load(std::memory_order_acquire)) {
         repost_peer_rpc_receive(peer_id, slot_id);
         continue;
       }
@@ -60,63 +73,125 @@ void MemoryNode::peer_rpc_progress_loop() {
       if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_request)) {
         const size_t expected_bytes = service::storage_owner::reverse_update_request_bytes(header->item_count);
         if (bytes >= expected_bytes) {
-          const auto* ops = service::storage_owner::reverse_update_ops(payload);
-          PeerReverseUpdateTask task;
-          task.source_shard = peer_id;
-          task.header = *header;
-          task.received_at = std::chrono::steady_clock::now();
-          task.ops.assign(ops, ops + header->item_count);
-          enqueue_peer_reverse_update_task(std::move(task));
+          const auto decision = peer_request_deduplicator_->begin(
+            peer_id, *header, true);
+          if (decision.action == memory_node_detail::PeerRequestAction::execute) {
+            const auto* ops = service::storage_owner::reverse_update_ops(payload);
+            PeerReverseUpdateTask task;
+            task.source_shard = peer_id;
+            task.header = *header;
+            task.received_at = std::chrono::steady_clock::now();
+            task.ops.assign(ops, ops + header->item_count);
+            if (!enqueue_peer_reverse_update_task(std::move(task))) {
+              peer_request_deduplicator_->abandon(peer_id, *header);
+              if ((header->reserved & kPeerRpcFlagNoResponse) == 0) {
+                enqueue_peer_reverse_update_response(peer_id, *header, false);
+              }
+            }
+          } else if (decision.action ==
+                       memory_node_detail::PeerRequestAction::replay &&
+                     (header->reserved & kPeerRpcFlagNoResponse) == 0) {
+            PeerReverseUpdateResponse response;
+            response.destination_shard = peer_id;
+            response.header = decision.response;
+            response.queued_at = std::chrono::steady_clock::now();
+            (void)try_enqueue_peer_reverse_update_response(
+              std::move(response));
+          }
         }
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::cleanup_deleted_request)) {
         const size_t expected_bytes = service::storage_owner::reverse_update_request_bytes(header->item_count);
         if (bytes >= expected_bytes) {
-          const auto* ops = service::storage_owner::reverse_update_ops(payload);
-          PeerReverseUpdateTask task;
-          task.source_shard = peer_id;
-          task.header = *header;
-          task.received_at = std::chrono::steady_clock::now();
-          task.ops.assign(ops, ops + header->item_count);
-          enqueue_peer_reverse_update_task(std::move(task));
+          const auto decision = peer_request_deduplicator_->begin(
+            peer_id, *header, true);
+          if (decision.action == memory_node_detail::PeerRequestAction::execute) {
+            const auto* ops = service::storage_owner::reverse_update_ops(payload);
+            PeerReverseUpdateTask task;
+            task.source_shard = peer_id;
+            task.header = *header;
+            task.received_at = std::chrono::steady_clock::now();
+            task.ops.assign(ops, ops + header->item_count);
+            if (!enqueue_peer_reverse_update_task(std::move(task))) {
+              peer_request_deduplicator_->abandon(peer_id, *header);
+              if ((header->reserved & kPeerRpcFlagNoResponse) == 0) {
+                enqueue_peer_reverse_update_response(peer_id, *header, false);
+              }
+            }
+          } else if (decision.action ==
+                       memory_node_detail::PeerRequestAction::replay &&
+                     (header->reserved & kPeerRpcFlagNoResponse) == 0) {
+            PeerReverseUpdateResponse response;
+            response.destination_shard = peer_id;
+            response.header = decision.response;
+            response.queued_at = std::chrono::steady_clock::now();
+            (void)try_enqueue_peer_reverse_update_response(
+              std::move(response));
+          }
         }
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_request)) {
         const size_t expected_bytes = service::storage_owner::stitch_search_request_bytes(header->item_count);
         if (bytes >= expected_bytes) {
-          PeerStitchSearchTask task;
-          task.source_shard = peer_id;
-          task.header = *header;
-          task.received_at = std::chrono::steady_clock::now();
-          task.payload.assign(payload, payload + expected_bytes);
-          if (!enqueue_peer_stitch_search_task(std::move(task))) {
-            send_peer_stitch_search_failed_response(peer_id, *header);
+          const auto decision = peer_request_deduplicator_->begin(
+            peer_id, *header, false);
+          if (decision.action == memory_node_detail::PeerRequestAction::execute) {
+            PeerStitchSearchTask task;
+            task.source_shard = peer_id;
+            task.header = *header;
+            task.received_at = std::chrono::steady_clock::now();
+            task.payload.assign(payload, payload + expected_bytes);
+            if (!enqueue_peer_stitch_search_task(std::move(task))) {
+              // Keep CQ progress nonblocking. The source retries the same ID;
+              // abandoning here lets that retry execute once capacity returns.
+              peer_request_deduplicator_->abandon(peer_id, *header);
+            }
           }
         }
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response) ||
                  header->type == static_cast<u32>(service::storage_owner::PeerRpcType::cleanup_deleted_response)) {
-        bool accepted = false;
-        {
-          std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
-          if (peer_rpc_pending_responses_.contains(header->request_id)) {
-            peer_rpc_responses_[header->request_id] = *header;
-            accepted = true;
+        const bool valid_response = bytes >=
+          service::storage_owner::reverse_update_response_bytes();
+        if (valid_response && peer_async_responses_ != nullptr &&
+            peer_async_responses_->try_deliver(
+              peer_id, slot_id, bytes, *header)) {
+          hold_receive_slot = true;
+          storage_owner_maintenance_cv_.notify_all();
+        } else {
+          bool accepted = false;
+          {
+            std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
+            if (peer_rpc_pending_responses_.contains(header->request_id)) {
+              peer_rpc_responses_[header->request_id] = *header;
+              accepted = true;
+            }
           }
+          if (accepted) peer_rpc_responses_cv_.notify_all();
         }
-        if (accepted) peer_rpc_responses_cv_.notify_all();
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_response)) {
-        bool accepted = false;
-        {
-          std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
-          if (peer_rpc_pending_responses_.contains(header->request_id)) {
-            peer_rpc_responses_[header->request_id] = *header;
-            peer_rpc_response_payloads_[header->request_id].assign(
-              payload, payload + bytes);
-            accepted = true;
+        const bool valid_response =
+          header->reserved == storage_owner_cross_shard_degree_ &&
+          bytes >= service::storage_owner::stitch_search_response_bytes(
+            header->item_count, header->reserved);
+        if (valid_response && peer_async_responses_ != nullptr &&
+            peer_async_responses_->try_deliver(
+              peer_id, slot_id, bytes, *header)) {
+          hold_receive_slot = true;
+          storage_owner_maintenance_cv_.notify_all();
+        } else {
+          bool accepted = false;
+          {
+            std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
+            if (peer_rpc_pending_responses_.contains(header->request_id)) {
+              peer_rpc_responses_[header->request_id] = *header;
+              peer_rpc_response_payloads_[header->request_id].assign(
+                payload, payload + bytes);
+              accepted = true;
+            }
           }
+          if (accepted) peer_rpc_responses_cv_.notify_all();
         }
-        if (accepted) peer_rpc_responses_cv_.notify_all();
       }
 
-      repost_peer_rpc_receive(peer_id, slot_id);
+      if (!hold_receive_slot) repost_peer_rpc_receive(peer_id, slot_id);
     }
   }
 }
@@ -140,15 +215,6 @@ void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
       peer_reverse_tasks_.pop_front();
       const u32 request_type = tasks.back().header.type;
       size_t coalesced_ops = tasks.back().ops.size();
-      if (config.storage_owner_reverse_flush_us > 0 && peer_reverse_tasks_.empty() &&
-          !peer_reverse_shutdown_.load(std::memory_order_acquire)) {
-        peer_reverse_tasks_cv_.wait_for(lock,
-                                        std::chrono::microseconds(config.storage_owner_reverse_flush_us),
-                                        [&]() {
-                                          return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
-                                                 !peer_reverse_tasks_.empty();
-                                        });
-      }
       while (!peer_reverse_tasks_.empty() &&
              coalesced_ops < config.storage_owner_reverse_coalesce_max) {
         if (peer_reverse_tasks_.front().header.type != request_type) {
@@ -177,6 +243,10 @@ void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
       peer_reverse_update_failed_.fetch_add(1, std::memory_order_relaxed);
     }
     for (const PeerReverseUpdateTask& task : tasks) {
+      const auto response_header = make_peer_reverse_update_response(
+        task.header, success);
+      peer_request_deduplicator_->complete(
+        task.source_shard, task.header, response_header);
       if ((task.header.reserved & kPeerRpcFlagNoResponse) == 0) {
         enqueue_peer_reverse_update_response(task.source_shard, task.header, success);
       }
@@ -218,6 +288,10 @@ void MemoryNode::peer_stitch_search_worker_loop(u32 worker_id) {
 
     const bool success = handle_peer_stitch_search_request(
       task.source_shard, task.header, task.payload.data(), config);
+    // Stitch responses are not cached because their payload is large. The
+    // request is read-only, so a same-ID retry after this response may safely
+    // recompute it; duplicates that arrived while it ran were coalesced.
+    peer_request_deduplicator_->abandon(task.source_shard, task.header);
     peer_stitch_search_processed_.fetch_add(1, std::memory_order_relaxed);
     if (success) {
       peer_stitch_search_items_.fetch_add(task.header.item_count, std::memory_order_relaxed);
@@ -229,16 +303,12 @@ void MemoryNode::peer_stitch_search_worker_loop(u32 worker_id) {
 void MemoryNode::peer_reverse_response_loop() {
   for (;;) {
     PeerReverseUpdateResponse response;
-    {
-      std::unique_lock<std::mutex> lock(peer_reverse_responses_mutex_);
-      peer_reverse_responses_cv_.wait(lock, [&]() {
-        return peer_reverse_workers_done_.load(std::memory_order_acquire) || !peer_reverse_responses_.empty();
-      });
-      if (peer_reverse_workers_done_.load(std::memory_order_acquire) && peer_reverse_responses_.empty()) {
-        return;
-      }
-      response = std::move(peer_reverse_responses_.front());
-      peer_reverse_responses_.pop_front();
+    lib_assert(peer_reverse_responses_ != nullptr,
+               "peer reverse response queue is not initialized");
+    if (!peer_reverse_responses_->pop_wait(
+          response, peer_reverse_workers_done_)) {
+      peer_reverse_response_done_.store(true, std::memory_order_release);
+      return;
     }
     send_peer_reverse_update_response(response);
   }
@@ -246,7 +316,13 @@ void MemoryNode::peer_reverse_response_loop() {
 
 void MemoryNode::peer_reverse_outgoing_loop() {
   const Configuration& config = *storage_worker_config_;
-  const u32 coalesce_max = std::max<u32>(1, config.storage_owner_reverse_coalesce_max);
+  const u64 wire_max_u64 = std::max<u64>(
+    1, static_cast<u64>(config.R) * config.storage_owner_batch_max);
+  const u32 wire_max = static_cast<u32>(std::min<u64>(
+    wire_max_u64, std::numeric_limits<u32>::max()));
+  const u32 coalesce_max = std::min(
+    wire_max,
+    std::max<u32>(1, config.storage_owner_reverse_coalesce_max));
   for (;;) {
     PeerReverseOutgoingTask task;
     {
@@ -261,16 +337,6 @@ void MemoryNode::peer_reverse_outgoing_loop() {
       task = std::move(peer_reverse_outgoing_.front());
       peer_reverse_outgoing_.pop_front();
       size_t coalesced_ops = task.ops.size();
-      if (config.storage_owner_reverse_flush_us > 0 && peer_reverse_outgoing_.empty() &&
-          !peer_reverse_shutdown_.load(std::memory_order_acquire)) {
-        peer_reverse_outgoing_cv_.wait_for(lock,
-                                           std::chrono::microseconds(config.storage_owner_reverse_flush_us),
-                                           [&]() {
-                                             return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
-                                                    !peer_reverse_outgoing_.empty();
-                                           });
-      }
-
       size_t scanned = 0;
       constexpr size_t kOutboxCoalesceScanLimit = 64;
       for (auto it = peer_reverse_outgoing_.begin();

@@ -25,14 +25,18 @@
 #include <library/utils.hh>
 
 #include "common/configuration.hh"
+#include "common/bounded_queue.hh"
+#include "common/sliding_completion_ring.hh"
 #include "common/constants.hh"
 #include "common/core_assignment.hh"
 #include "common/distance.hh"
 #include "common/timing.hh"
 #include "coroutine.hh"
 #include "gpu_search/pq_index.hh"
+#include "memory_node/peer_rpc/async_response.hh"
 #include "memory_node/startup_protocol.hh"
 #include "memory_node/storage_reclaim.hh"
+#include "memory_node/storage_owner_maintenance/reverse_outbox.hh"
 #include "memory_node/storage_owner_state.hh"
 #include "service/index_metadata.hh"
 #include "service/storage_owner_protocol.hh"
@@ -89,8 +93,28 @@ class MemoryNode {
     u64 maintenance_sequence{};
     RemotePtr target;
     bool stitch_prepared{};
+    // Adjacency observed before remote search. Final commit uses it to
+    // distinguish concurrent reverse-edge additions from stage1 edges that
+    // the global prune intentionally replaced.
+    vec<RemotePtr> stitch_base_neighbors;
     vec<RemotePtr> stitch_neighbors;
+    // A stitch that becomes stale after applying reverse edges transfers its
+    // maintenance sequence to a cleanup task. These supplemental neighbors
+    // must all be removed; pruning them would leave dangling reverse edges.
+    bool cleanup_repair_only{};
+    vec<RemotePtr> cleanup_neighbors;
     std::chrono::steady_clock::time_point queued_at{};
+  };
+
+  struct StorageOwnerMaintenanceIntent {
+    std::atomic<u64> sequence{0};
+    node_t id{};
+    u32 generation{};
+    service::storage_owner::MutationKind kind{
+      service::storage_owner::MutationKind::insert};
+    RemotePtr new_ptr;
+    RemotePtr old_ptr;
+    std::chrono::steady_clock::time_point published_at{};
   };
 
 public:
@@ -104,6 +128,15 @@ private:
   using PeerRpcRuntimeState = memory_node_detail::PeerRpcRuntimeState;
   using PeerPendingSend = memory_node_detail::PeerPendingSend;
   using PeerRpcMessage = memory_node_detail::PeerRpcMessage;
+  using PeerAsyncResponseRegistry =
+    memory_node_detail::PeerAsyncResponseRegistry;
+  using PeerRequestDeduplicator =
+    memory_node_detail::PeerRequestDeduplicator;
+  using TryPeerResponse = memory_node_detail::TryPeerResponse;
+  using Stage2ReverseOutbox =
+    memory_node_storage_owner_maintenance_detail::Stage2ReverseOutbox;
+  using Stage2ReverseCompletion =
+    memory_node_storage_owner_maintenance_detail::Stage2ReverseCompletion;
   using StorageOwnerInsertTask = memory_node_detail::StorageOwnerInsertTask;
   using StorageOwnerResponseReady = memory_node_detail::StorageOwnerResponseReady;
   using StorageOwnerThread = memory_node_detail::StorageOwnerThread;
@@ -134,6 +167,12 @@ private:
   static constexpr u32 kPeerAsyncWrOwner = std::numeric_limits<u32>::max() - 1;
   static constexpr u32 kPeerSafeRdAtomic = 8;
   static constexpr u32 kPeerRpcFlagNoResponse = 1u;
+
+  enum class PeerRpcSendClass : u8 {
+    stitch_search,
+    graph_update,
+    control,
+  };
 
   // Lifecycle and commands
   static u64 elapsed_ns_since(const std::chrono::steady_clock::time_point start);
@@ -182,9 +221,13 @@ private:
   size_t peer_rpc_sync_send_offset(u32 peer_id) const;
   size_t peer_rpc_async_send_offset(u32 peer_id, u32 slot_id) const;
   size_t peer_rpc_receive_offset(u32 peer_id, u32 slot_id) const;
-  u32 acquire_peer_rpc_send_slot(u32 peer_id);
+  bool try_acquire_peer_rpc_send_slot(u32 peer_id,
+                                      PeerRpcSendClass send_class,
+                                      u32& slot_id);
+  PeerRpcSendClass peer_rpc_send_slot_class(u32 slot_id) const;
   void release_peer_rpc_send_slot(u32 peer_id, u32 slot_id);
   void repost_peer_rpc_receive(u32 peer_id, u32 slot_id);
+  void post_peer_rpc_send_slot(u32 peer_id, u32 slot_id, size_t bytes);
   void send_peer_rpc_message(u32 peer_id, const void* payload, size_t bytes);
   service::storage_owner::PeerRpcHeader make_peer_reverse_update_response(
       const service::storage_owner::PeerRpcHeader& request,
@@ -192,6 +235,8 @@ private:
   bool apply_peer_reverse_update_task(const PeerReverseUpdateTask& task, const Configuration& config);
   bool apply_peer_reverse_update_tasks(const vec<PeerReverseUpdateTask>& tasks, const Configuration& config);
   void send_peer_reverse_update_response(const PeerReverseUpdateResponse& response);
+  bool try_enqueue_peer_reverse_update_response(
+    PeerReverseUpdateResponse&& response);
   bool handle_peer_reverse_update_request(u32 source_shard,
                                           const service::storage_owner::PeerRpcHeader& header,
                                           const service::storage_owner::ReverseUpdateOp* ops,
@@ -238,6 +283,32 @@ private:
                                   u64& request_id,
                                   u32& item_count,
                                   const Configuration& config);
+  bool post_stitch_search_request_async(u32 target_shard,
+                                        const vec<NodeSnapshot>& targets,
+                                        u64 request_id,
+                                        u32& item_count,
+                                        const Configuration& config);
+  bool post_peer_op_batch_async(
+    u32 target_shard,
+    const vec<service::storage_owner::ReverseUpdateOp>& ops,
+    service::storage_owner::PeerRpcType request_type,
+    u64 request_id,
+    u32& item_count,
+    const Configuration& config);
+  TryPeerResponse try_consume_peer_rpc_response(
+    u64 request_id,
+    u32 expected_shard,
+    service::storage_owner::PeerRpcType expected_type,
+    u32 expected_item_count,
+    service::storage_owner::PeerRpcHeader& header,
+    vec<byte_t>& payload);
+  bool rearm_peer_rpc_response(
+    u64 request_id,
+    u32 expected_shard,
+    service::storage_owner::PeerRpcType expected_type,
+    u32 expected_item_count);
+  void cancel_peer_rpc_response(u64 request_id);
+  u64 allocate_peer_request_id();
   bool enqueue_reverse_update_batch(u32 target_shard,
                                     const vec<service::storage_owner::ReverseUpdateOp>& ops,
                                     const Configuration& config);
@@ -288,11 +359,19 @@ private:
                                          service::storage_owner::MutationKind kind,
                                          RemotePtr new_ptr,
                                          RemotePtr old_ptr,
+                                         u64 reserved_sequence,
+                                         u32 reserved_work_items,
                                          const Configuration& config);
+  u32 storage_owner_maintenance_work_items(
+    service::storage_owner::MutationKind kind,
+    const Configuration& config) const;
   u64 begin_storage_owner_maintenance_sequence(u32 work_items);
+  u64 begin_storage_owner_maintenance_batch(span<const u32> work_items);
   void complete_storage_owner_maintenance_sequence(u64 sequence);
+  void complete_storage_owner_maintenance_sequence(u64 sequence,
+                                                   u32 work_items);
   bool storage_owner_cleanup_ready(u64 sequence) const;
-  void advance_storage_owner_durable_sequence_locked();
+  void publish_storage_owner_maintenance_watermarks();
   void mark_storage_owner_foreground_activity();
   void log_storage_owner_maintenance_observation(size_t stitch_remaining,
                                                  size_t cleanup_remaining,
@@ -375,7 +454,9 @@ private:
   GlobalMedoidReadAwaitable async_read_global_medoid(StorageOwnerThread& thread);
   void write_global_medoid(const RemotePtr& medoid);
   bool try_set_global_medoid(const RemotePtr& expected, const RemotePtr& desired, RemotePtr& observed);
+  u64 load_local_node_header_acquire(RemotePtr rptr) const;
   bool read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot);
+  bool storage_owner_node_live(RemotePtr rptr);
   vec<RemotePtr> read_neighbor_list(RemotePtr rptr);
   bool read_local_neighbor_list(RemotePtr rptr,
                                 vec<RemotePtr>& neighbors,
@@ -390,7 +471,11 @@ private:
   vec<NodeSnapshot> read_node_snapshots_batched(const vec<RemotePtr>& rptrs, const Configuration& config);
   NeighborListReadAwaitable async_read_neighbor_list(
     RemotePtr rptr, StorageOwnerThread& thread);
-  void write_hot_graph_entry(RemotePtr rptr, const vec<RemotePtr>& neighbors);
+  void write_hot_graph_entry(
+    RemotePtr rptr,
+    const vec<RemotePtr>& neighbors,
+    std::optional<u32> generation_override = std::nullopt,
+    std::optional<bool> deleted_override = std::nullopt);
   void write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neighbors);
   void write_dynamic_navigation_code(RemotePtr rptr,
                                      const span<const element_t> components);
@@ -434,7 +519,7 @@ private:
   vec<RemotePtr> robust_prune_snapshots_cpu(
       const byte_t* source,
       VectorDType source_dtype,
-      const vec<NodeSnapshot>& candidates,
+      span<const NodeSnapshot> candidates,
       const hashset_t<RemotePtr>& skip,
       const Configuration& config,
       u32 result_limit_override = 0);
@@ -510,6 +595,8 @@ private:
   HugePage<byte_t> peer_scratch_buffer_;
   std::unique_ptr<LocalMemoryRegion> peer_scratch_region_;
   PeerRpcRuntimeState peer_rpc_runtime_;
+  std::unique_ptr<PeerAsyncResponseRegistry> peer_async_responses_;
+  std::unique_ptr<PeerRequestDeduplicator> peer_request_deduplicator_;
   std::unordered_set<u64> peer_rpc_pending_responses_;
   std::unordered_map<u64, service::storage_owner::PeerRpcHeader> peer_rpc_responses_;
   std::unordered_map<u64, vec<byte_t>> peer_rpc_response_payloads_;
@@ -524,9 +611,9 @@ private:
   vec<std::atomic<u32>> peer_rdma_read_outstanding_;
   vec<vec<std::atomic<u32>>> peer_rdma_read_qp_outstanding_;
   vec<vec<std::unique_ptr<std::mutex>>> peer_qp_send_mutexes_;
+  vec<std::unique_ptr<std::mutex>> peer_rpc_sync_send_mutexes_;
   std::mutex peer_rpc_send_slots_mutex_;
-  std::condition_variable peer_rpc_send_slots_cv_;
-  vec<std::deque<u32>> peer_rpc_free_send_slots_;
+  vec<std::array<std::deque<u32>, 3>> peer_rpc_free_send_slots_;
   std::atomic<u32> peer_sync_wr_id_counter_{1};
   std::atomic<u32> peer_async_wr_id_counter_{1};
   std::atomic<u32> peer_async_rdma_outstanding_{0};
@@ -545,14 +632,14 @@ private:
   std::mutex peer_stitch_search_tasks_mutex_;
   std::condition_variable peer_stitch_search_tasks_cv_;
   std::deque<PeerStitchSearchTask> peer_stitch_search_tasks_;
-  std::mutex peer_reverse_responses_mutex_;
-  std::condition_variable peer_reverse_responses_cv_;
-  std::deque<PeerReverseUpdateResponse> peer_reverse_responses_;
+  std::unique_ptr<bounded::Queue<PeerReverseUpdateResponse>>
+    peer_reverse_responses_;
   std::mutex peer_reverse_outgoing_mutex_;
   std::condition_variable peer_reverse_outgoing_cv_;
   std::deque<PeerReverseOutgoingTask> peer_reverse_outgoing_;
   std::atomic<bool> peer_reverse_shutdown_{false};
   std::atomic<bool> peer_reverse_workers_done_{false};
+  std::atomic<bool> peer_reverse_response_done_{false};
   size_t peer_reverse_task_queue_limit_{1024};
   size_t peer_stitch_search_task_queue_limit_{1024};
   size_t peer_reverse_outgoing_queue_limit_{1024};
@@ -573,6 +660,11 @@ private:
   std::condition_variable storage_owner_maintenance_cv_;
   std::deque<StorageOwnerMaintenanceTask> storage_owner_stitch_tasks_;
   std::deque<StorageOwnerMaintenanceTask> storage_owner_cleanup_tasks_;
+  std::unique_ptr<bounded::Queue<StorageOwnerMaintenanceTask>>
+    storage_owner_repair_tasks_;
+  std::unique_ptr<Stage2ReverseOutbox> storage_owner_reverse_outbox_;
+  vec<std::unique_ptr<bounded::Queue<Stage2ReverseCompletion>>>
+    storage_owner_reverse_completions_;
   std::atomic<bool> storage_owner_maintenance_shutdown_{false};
   std::atomic<u64> storage_owner_maintenance_enqueued_{0};
   std::atomic<u64> storage_owner_maintenance_finalize_enqueued_{0};
@@ -580,6 +672,10 @@ private:
   std::atomic<u64> storage_owner_maintenance_processed_{0};
   std::atomic<u64> storage_owner_maintenance_finalized_live_{0};
   std::atomic<u64> storage_owner_maintenance_failed_{0};
+  std::atomic<u64> storage_owner_maintenance_rpc_timeouts_{0};
+  std::atomic<u64> storage_owner_reverse_aggregate_batches_{0};
+  std::atomic<u64> storage_owner_reverse_aggregate_logical_requests_{0};
+  std::atomic<u64> storage_owner_reverse_aggregate_ops_{0};
   std::atomic<u64> storage_owner_maintenance_stale_{0};
   std::atomic<u64> storage_owner_maintenance_cleanup_processed_{0};
   std::atomic<u64> storage_owner_maintenance_max_backlog_{0};
@@ -593,18 +689,19 @@ private:
   std::atomic<u64> storage_owner_maintenance_last_observation_ns_{0};
   std::atomic<u64> storage_owner_maintenance_finalize_latency_ns_{0};
   std::atomic<u64> storage_owner_maintenance_finalize_max_latency_ns_{0};
-  std::array<std::atomic<u64>, 17> storage_owner_maintenance_finalize_latency_buckets_{};
+  std::array<std::atomic<u64>, 18> storage_owner_maintenance_finalize_latency_buckets_{};
   std::atomic<u64> storage_owner_foreground_last_active_ns_{0};
-  std::mutex storage_owner_maintenance_sequence_mutex_;
-  std::map<u64, u32> storage_owner_maintenance_sequence_remaining_;
+  std::unique_ptr<bounded::SlidingCompletionRing>
+    storage_owner_maintenance_completion_ring_;
+  size_t storage_owner_maintenance_intent_capacity_{};
+  std::unique_ptr<StorageOwnerMaintenanceIntent[]>
+    storage_owner_maintenance_intents_;
   mutable std::mutex storage_owner_reclaim_mutex_;
   memory_node_detail::StorageReclaimQueue storage_owner_reclaim_queue_;
   std::atomic<u64> storage_owner_reclaim_candidates_{0};
   InsertRuntimeState insert_runtime_;
   std::unique_ptr<Configuration> storage_worker_config_;
-  std::mutex storage_insert_tasks_mutex_;
-  std::condition_variable storage_insert_tasks_cv_;
-  std::deque<StorageOwnerInsertTask> storage_insert_tasks_;
+  std::unique_ptr<bounded::Queue<StorageOwnerInsertTask>> storage_insert_tasks_;
   vec<u_ptr<std::mutex>> storage_client_send_mutexes_;
   vec<u_ptr<StorageOwnerThread>> storage_owner_threads_;
   vec<vec<vec<RemotePtr>>> storage_owner_async_candidates_;

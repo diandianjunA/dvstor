@@ -3,11 +3,10 @@
 #include <atomic>
 #include <array>
 #include <chrono>
-#include <condition_variable>
-#include <deque>
-#include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -16,9 +15,12 @@
 #include <library/memory_region.hh>
 
 #include "common/configuration.hh"
+#include "common/bounded_queue.hh"
+#include "common/completion_pool.hh"
 #include "common/core_assignment.hh"
 #include "gpu_search/persistent_engine.hh"
 #include "memory_node/startup_protocol.hh"
+#include "service/base_owner_map.hh"
 #include "service/breakdown.hh"
 #include "service/storage_owner_protocol.hh"
 #include "service/index_metadata.hh"
@@ -68,14 +70,17 @@ public:
     return persistent_search_ == nullptr
       ? gpu_search::TelemetrySnapshot{} : persistent_search_->telemetry();
   }
+  u64 late_storage_owner_rpc_completions() const {
+    return storage_insert_late_rpc_completions_.load(
+      std::memory_order_relaxed);
+  }
 
   const Configuration& config() const { return config_; }
 private:
   struct StorageInsertTask {
     InsertItem item;
     service::storage_owner::MutationKind kind{service::storage_owner::MutationKind::insert};
-    std::shared_ptr<service::breakdown::Sample> sample;
-    std::promise<bool> result;
+    u32 completion_id{std::numeric_limits<u32>::max()};
     std::chrono::steady_clock::time_point enqueued_at{};
     std::chrono::steady_clock::time_point sender_dequeued_at{};
     vec<RemotePtr> anchor_hints;
@@ -90,22 +95,20 @@ private:
     bool response_done{false};
     bool results_completed{false};
     bool completion_claimed{false};
+    u32 response_slot_id{std::numeric_limits<u32>::max()};
     u32 gpu_reserved_items{};
     u32 item_count{};
     u64 batch_id{};
-    u64 batch_wait_ns{};
     u64 request_prepare_ns{};
+    u64 cq_progress_gap_ns{};
     size_t request_size{};
     size_t response_size{};
     std::chrono::steady_clock::time_point send_posted_at{};
     std::chrono::steady_clock::time_point send_completed_at{};
     std::chrono::steady_clock::time_point response_completed_at{};
     vec<byte_t> request_buffer;
-    vec<byte_t> response_buffer;
     std::unique_ptr<LocalMemoryRegion> request_region;
-    std::unique_ptr<LocalMemoryRegion> response_region;
-    vec<std::unique_ptr<StorageInsertTask>> tasks;
-    vec<std::shared_ptr<service::breakdown::Sample>> samples;
+    vec<u32> tasks;
   };
 
   struct StorageOwnerResponseSlot {
@@ -122,17 +125,24 @@ private:
   };
 
   struct StorageOwnerSenderState {
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::condition_variable completion_cv;
-    std::deque<std::unique_ptr<StorageInsertTask>> queue;
+    u32 task_capacity{};
+    std::unique_ptr<bounded::Queue<u32>> queue;
+    std::unique_ptr<bounded::Queue<u32>> free_tasks;
+    std::unique_ptr<StorageInsertTask[]> tasks;
     vec<StorageOwnerRpcSlot> slots;
     vec<StorageOwnerResponseSlot> response_slots;
-    std::deque<u32> free_slots;
-    std::deque<u32> ready_slots;
-    dense_hashmap_t<u64, u32> batch_to_slot;
-    std::thread sender_thread;
-    std::thread completion_thread;
+    vec<u32> free_slots;
+  };
+
+  struct StorageOwnerReadySlot {
+    u32 owner_storage{};
+    u32 slot_id{};
+  };
+
+  struct StorageOwnerReleasedSlot {
+    u32 owner_storage{};
+    u32 slot_id{};
+    u32 response_slot_id{};
   };
 
   void init_remote_tokens();
@@ -147,28 +157,31 @@ private:
   void start_storage_insert_runtime();
   void stop_storage_insert_runtime();
   void release_storage_insert_runtime();
-  void run_storage_insert_sender(u32 owner_storage);
-  void run_storage_insert_cq_loop();
-  void run_storage_owner_completion(u32 owner_storage);
-  void run_storage_insert_publication_loop();
+  void run_storage_insert_progress_loop();
+  void run_storage_insert_completion_loop();
+  bool drain_storage_owner_submissions(u32& first_owner);
+  void reclaim_storage_owner_slots();
   void post_storage_owner_batch(u32 owner_storage,
-                                u32 slot_id,
-                                vec<std::unique_ptr<StorageInsertTask>>&& tasks,
-                                u64 batch_wait_ns);
+                                u32 slot_id);
   void handle_storage_owner_send_completion(u32 owner_storage, u32 slot_id);
   void handle_storage_owner_response(u32 owner_storage, u32 response_slot_id);
   void post_storage_owner_response_receive(u32 owner_storage, u32 response_slot_id);
-  bool queue_storage_owner_completion_locked(StorageOwnerSenderState& state,
-                                             StorageOwnerRpcSlot& slot);
+  bool queue_storage_owner_completion(StorageOwnerRpcSlot& slot);
   void commit_storage_owner_slot(u32 owner_storage,
                                  u32 slot_id,
                                  StorageOwnerPublicationBatch& publication);
   void release_storage_owner_slot(u32 owner_storage, u32 slot_id);
   void publish_storage_owner_mutations(StorageOwnerPublicationBatch&& publication);
-  void fail_storage_owner_tasks(vec<std::unique_ptr<StorageInsertTask>>& tasks);
+  void complete_storage_owner_task(u32 owner_storage, u32 task_id, bool success);
+  void fail_storage_owner_tasks(u32 owner_storage, vec<u32>& tasks);
+  size_t submit_storage_owner_mutations(
+    const vec<InsertItem>& items,
+    service::storage_owner::MutationKind kind);
   void publish_compute_side_id(node_t id, RemotePtr ptr, bool deleted,
                                u32 owner_storage, u32 generation);
   bool lookup_compute_side_id(node_t id, RemotePtr* ptr, bool* deleted = nullptr) const;
+  std::optional<u32> known_storage_owner_for_id(node_t id) const;
+  u32 claim_storage_owner_for_mutation(node_t id, u32 proposed_owner);
   u32 storage_owner_for_id(node_t id) const;
   vamana::anchor::Route route_storage_owner_update(const InsertItem& item,
                                                     std::optional<u32> owner_override = std::nullopt) const;
@@ -186,16 +199,17 @@ private:
 
   std::unique_ptr<vamana::anchor::Index> anchor_index_;
   std::unique_ptr<gpu_search::PersistentSearchEngine> persistent_search_;
-  std::thread storage_insert_cq_thread_;
-  std::thread storage_insert_publication_thread_;
-  std::mutex storage_insert_publication_mutex_;
-  std::condition_variable storage_insert_publication_cv_;
-  std::deque<StorageOwnerPublicationBatch> storage_insert_publication_queue_;
+  std::thread storage_insert_progress_thread_;
+  std::thread storage_insert_completion_thread_;
   std::atomic<bool> storage_insert_shutdown_{false};
-  std::atomic<bool> storage_insert_senders_done_{false};
-  std::atomic<bool> storage_insert_completion_done_{false};
+  std::atomic<bool> storage_insert_progress_done_{false};
   std::atomic<u32> storage_insert_inflight_{0};
-  std::atomic<u32> storage_insert_timeout_logs_{0};
+  std::atomic<u64> storage_insert_late_rpc_completions_{0};
+  u64 storage_insert_current_cq_gap_ns_{};
+  std::unique_ptr<bounded::Queue<StorageOwnerReadySlot>> storage_ready_slots_;
+  std::unique_ptr<bounded::Queue<StorageOwnerReleasedSlot>> storage_released_slots_;
+  std::unique_ptr<bounded::CompletionPool> storage_completion_pool_;
+  std::unique_ptr<service::breakdown::Sample[]> storage_completion_samples_;
   vec<std::unique_ptr<StorageOwnerSenderState>> storage_insert_owners_;
   struct ComputeSideIdEntry {
     RemotePtr ptr;
@@ -209,10 +223,11 @@ private:
     hashmap_t<node_t, ComputeSideIdEntry> entries;
   };
   std::array<ComputeSideIdShard, kComputeSideIdShardCount> compute_side_idmap_;
+  service::BaseOwnerMap base_owner_map_;
 
   std::atomic<u64> next_request_id_{1};
 
   mutable std::mutex breakdown_mutex_;
-  bool breakdown_enabled_{false};
+  std::atomic<bool> breakdown_enabled_{false};
   service::breakdown::Report completed_breakdown_report_;
 };

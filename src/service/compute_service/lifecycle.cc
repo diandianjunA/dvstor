@@ -10,11 +10,10 @@ ComputeService::ComputeService(const Configuration& config)
   init_remote_tokens();
   cm_.connect();
 
-  if (!config_.disable_thread_pinning) {
-    const u32 core = core_assignment_.get_available_core();
-    pin_main_thread(core);
-    print_status("pinned main thread to core " + std::to_string(core));
-  }
+  // Do not pin the constructor thread. POSIX threads inherit their creator's
+  // affinity mask, so pinning here used to serialize every later query,
+  // update, and benchmark worker onto the same CPU. Dedicated runtime threads
+  // are pinned after creation by their owning subsystems instead.
 
   if (cm_.is_initiator) {
     const u32 gpu_rdma_qps = config_.gpu_rdma_qps * 2u;
@@ -37,6 +36,12 @@ ComputeService::ComputeService(const Configuration& config)
   service::index_metadata::Metadata metadata;
   lib_assert(service::index_metadata::load_metadata(
                startup_prefix, metadata, &metadata_error), metadata_error);
+  lib_assert(base_owner_map_.load(startup_prefix, num_servers_,
+                                  metadata.idmap_format, &metadata_error),
+             metadata_error);
+  print_status("storage-owner base idmap: entries=" +
+               std::to_string(base_owner_map_.entry_count()) + " memory=" +
+               std::to_string(base_owner_map_.memory_bytes()) + " bytes");
   anchor_index_ = std::make_unique<vamana::anchor::Index>();
   str anchor_error;
   lib_assert(metadata.anchor_format == "owner_anchor_v1" &&

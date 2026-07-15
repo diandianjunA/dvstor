@@ -47,22 +47,45 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
     std::lock_guard<std::mutex> lock(peer_rpc_send_slots_mutex_);
     peer_rpc_free_send_slots_.clear();
     peer_rpc_free_send_slots_.resize(num_storage_nodes_);
+    peer_rpc_sync_send_mutexes_.clear();
+    peer_rpc_sync_send_mutexes_.resize(num_storage_nodes_);
     for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
       if (peer_id == storage_id_) {
         continue;
       }
+      peer_rpc_sync_send_mutexes_[peer_id] = std::make_unique<std::mutex>();
       for (u32 slot_id = 0;
            slot_id < peer_rpc_runtime_.send_slots_per_peer;
            ++slot_id) {
-        peer_rpc_free_send_slots_[peer_id].push_back(slot_id);
+        const size_t send_class = static_cast<size_t>(
+          peer_rpc_send_slot_class(slot_id));
+        peer_rpc_free_send_slots_[peer_id][send_class].push_back(slot_id);
       }
     }
   }
+  const size_t registry_peer_count = std::max<u32>(1, num_storage_nodes_ - 1);
+  const size_t response_capacity = std::max<size_t>(
+    1024,
+    static_cast<size_t>(config.storage_owner_rpc_depth) *
+      std::max<u32>(1, config.storage_owner_maintenance_workers) *
+      registry_peer_count * 4);
+  peer_async_responses_ =
+    std::make_unique<PeerAsyncResponseRegistry>(response_capacity);
+  const size_t dedup_capacity = std::max<size_t>(
+    1024,
+    static_cast<size_t>(config.storage_owner_reverse_queue_depth) *
+      registry_peer_count * 2);
+  peer_request_deduplicator_ =
+    std::make_unique<PeerRequestDeduplicator>(dedup_capacity);
   print_status("storage-owner peer RPC receive slots per peer: " +
                std::to_string(peer_rpc_runtime_.recv_slots_per_peer) +
                " (requested=" + std::to_string(desired_slots_per_peer) + ")");
   print_status("storage-owner peer RPC concurrent sends per peer: " +
                std::to_string(peer_rpc_runtime_.send_slots_per_peer));
+  print_status("storage-owner peer RPC send credits: search/graph are split "
+               "at depth >= 2; responses use a dedicated sync buffer");
+  print_status("storage-owner peer async response capacity: " +
+               std::to_string(peer_async_responses_->capacity()));
   for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
     if (peer_id == storage_id_) continue;
     for (u32 slot_id = 0; slot_id < peer_rpc_runtime_.recv_slots_per_peer; ++slot_id) {
@@ -89,10 +112,14 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
 
   peer_reverse_shutdown_.store(false, std::memory_order_release);
   peer_reverse_workers_done_.store(false, std::memory_order_release);
+  peer_reverse_response_done_.store(false, std::memory_order_release);
   peer_reverse_task_queue_limit_ =
     std::max<size_t>(1024, static_cast<size_t>(config.storage_owner_reverse_queue_depth));
   peer_stitch_search_task_queue_limit_ = peer_reverse_task_queue_limit_;
   peer_reverse_outgoing_queue_limit_ = peer_reverse_task_queue_limit_;
+  peer_reverse_responses_ =
+    std::make_unique<bounded::Queue<PeerReverseUpdateResponse>>(
+      peer_reverse_task_queue_limit_);
   peer_reverse_update_enqueued_.store(0, std::memory_order_relaxed);
   peer_reverse_update_processed_.store(0, std::memory_order_relaxed);
   peer_reverse_update_items_enqueued_.store(0, std::memory_order_relaxed);
@@ -134,11 +161,24 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   peer_rpc_progress_thread_ = std::thread([this]() { peer_rpc_progress_loop(); });
   peer_reverse_response_thread_ = std::thread([this]() { peer_reverse_response_loop(); });
   peer_reverse_outgoing_thread_ = std::thread([this]() { peer_reverse_outgoing_loop(); });
+  if (!config.disable_thread_pinning) {
+    pin_thread(peer_rpc_progress_thread_, core_assignment_.get_available_core());
+    pin_thread(peer_reverse_response_thread_, core_assignment_.get_available_core());
+    pin_thread(peer_reverse_outgoing_thread_, core_assignment_.get_available_core());
+  }
   for (u32 i = 0; i < reverse_worker_count; ++i) {
     peer_reverse_workers_.emplace_back([this, i]() { peer_reverse_update_worker_loop(i); });
+    if (!config.disable_thread_pinning) {
+      pin_thread(peer_reverse_workers_.back(),
+                 core_assignment_.get_available_core());
+    }
   }
   for (u32 i = 0; i < stitch_worker_count; ++i) {
     peer_stitch_search_workers_.emplace_back([this, i]() { peer_stitch_search_worker_loop(i); });
+    if (!config.disable_thread_pinning) {
+      pin_thread(peer_stitch_search_workers_.back(),
+                 core_assignment_.get_available_core());
+    }
   }
   print_status("storage-owner peer reverse-update workers: " +
                std::to_string(reverse_worker_count));
@@ -155,10 +195,9 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
   peer_reverse_shutdown_.store(true, std::memory_order_release);
   peer_reverse_tasks_cv_.notify_all();
   peer_stitch_search_tasks_cv_.notify_all();
-  peer_reverse_responses_cv_.notify_all();
+  if (peer_reverse_responses_) peer_reverse_responses_->notify_all();
   peer_reverse_outgoing_cv_.notify_all();
   peer_rpc_responses_cv_.notify_all();
-  peer_rpc_send_slots_cv_.notify_all();
   peer_completion_cv_.notify_all();
 
   if (peer_reverse_outgoing_thread_.joinable()) {
@@ -175,17 +214,23 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
     }
   }
   peer_reverse_workers_done_.store(true, std::memory_order_release);
-  peer_reverse_responses_cv_.notify_all();
+  if (peer_reverse_responses_) peer_reverse_responses_->notify_all();
   if (peer_reverse_response_thread_.joinable()) {
     peer_reverse_response_thread_.join();
   }
   if (peer_rpc_progress_thread_.joinable()) {
     peer_rpc_progress_thread_.join();
   }
+  if (peer_async_responses_ != nullptr) {
+    for (const auto& response : peer_async_responses_->drain_completed()) {
+      repost_peer_rpc_receive(response.peer_id, response.receive_slot);
+    }
+  }
   peer_reverse_workers_.clear();
   peer_stitch_search_workers_.clear();
   peer_reverse_worker_states_.clear();
   peer_stitch_search_worker_states_.clear();
+  peer_reverse_responses_.reset();
   {
     std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
     peer_rpc_pending_responses_.clear();
@@ -211,23 +256,38 @@ size_t MemoryNode::peer_rpc_async_send_offset(u32 peer_id, u32 slot_id) const {
   return peer_rpc_runtime_.async_send_offset + slot_index * peer_rpc_runtime_.message_bytes;
 }
 
-u32 MemoryNode::acquire_peer_rpc_send_slot(u32 peer_id) {
+MemoryNode::PeerRpcSendClass MemoryNode::peer_rpc_send_slot_class(
+    u32 slot_id) const {
+  const u32 slot_count = peer_rpc_runtime_.send_slots_per_peer;
+  if (slot_count <= 1) return PeerRpcSendClass::control;
+  return slot_id % 2 == 0 ? PeerRpcSendClass::stitch_search
+                          : PeerRpcSendClass::graph_update;
+}
+
+bool MemoryNode::try_acquire_peer_rpc_send_slot(
+    u32 peer_id,
+    PeerRpcSendClass send_class,
+    u32& slot_id) {
   lib_assert(peer_id < peer_rpc_free_send_slots_.size() && peer_id != storage_id_,
              "invalid peer RPC send-slot owner");
-  std::unique_lock<std::mutex> lock(peer_rpc_send_slots_mutex_);
-  while (peer_rpc_free_send_slots_[peer_id].empty()) {
-    if (!current_peer_rpc_progress_thread_) {
-      peer_rpc_send_slots_cv_.wait(lock);
-      continue;
-    }
-    lock.unlock();
-    poll_peer_send_cq();
-    std::this_thread::yield();
-    lock.lock();
+  std::lock_guard<std::mutex> lock(peer_rpc_send_slots_mutex_);
+  auto& lanes = peer_rpc_free_send_slots_[peer_id];
+  auto try_lane = [&](PeerRpcSendClass lane) {
+    auto& free_slots = lanes[static_cast<size_t>(lane)];
+    if (free_slots.empty()) return false;
+    slot_id = free_slots.front();
+    free_slots.pop_front();
+    return true;
+  };
+
+  if (peer_rpc_runtime_.send_slots_per_peer == 1) {
+    return try_lane(PeerRpcSendClass::control);
   }
-  const u32 slot_id = peer_rpc_free_send_slots_[peer_id].front();
-  peer_rpc_free_send_slots_[peer_id].pop_front();
-  return slot_id;
+  if (send_class == PeerRpcSendClass::control) {
+    return try_lane(PeerRpcSendClass::stitch_search) ||
+           try_lane(PeerRpcSendClass::graph_update);
+  }
+  return try_lane(send_class);
 }
 
 void MemoryNode::release_peer_rpc_send_slot(u32 peer_id, u32 slot_id) {
@@ -236,9 +296,10 @@ void MemoryNode::release_peer_rpc_send_slot(u32 peer_id, u32 slot_id) {
     lib_assert(peer_id < peer_rpc_free_send_slots_.size() &&
                  slot_id < peer_rpc_runtime_.send_slots_per_peer,
                "invalid peer RPC send-slot release");
-    peer_rpc_free_send_slots_[peer_id].push_back(slot_id);
+    const size_t send_class = static_cast<size_t>(
+      peer_rpc_send_slot_class(slot_id));
+    peer_rpc_free_send_slots_[peer_id][send_class].push_back(slot_id);
   }
-  peer_rpc_send_slots_cv_.notify_one();
 }
 
 void MemoryNode::repost_peer_rpc_receive(u32 peer_id, u32 slot_id) {
@@ -252,13 +313,13 @@ void MemoryNode::repost_peer_rpc_receive(u32 peer_id, u32 slot_id) {
     peer_rpc_receive_offset(peer_id, slot_id));
 }
 
-void MemoryNode::send_peer_rpc_message(u32 peer_id, const void* payload, size_t bytes) {
+void MemoryNode::post_peer_rpc_send_slot(u32 peer_id,
+                                         u32 slot_id,
+                                         size_t bytes) {
   lib_assert(peer_context_ != nullptr, "peer context not initialized");
   lib_assert(bytes <= peer_rpc_runtime_.message_bytes, "peer rpc message too large");
-  const u32 slot_id = acquire_peer_rpc_send_slot(peer_id);
   const u64 wr_id = next_peer_async_wr_id();
   const size_t offset = peer_rpc_async_send_offset(peer_id, slot_id);
-  std::memcpy(peer_rpc_runtime_.buffer.get_full_buffer() + offset, payload, bytes);
   register_peer_pending_send_locked(
     wr_id,
     PeerPendingSend{
@@ -279,6 +340,41 @@ void MemoryNode::send_peer_rpc_message(u32 peer_id, const void* payload, size_t 
       0,
       offset);
   }
+}
+
+void MemoryNode::send_peer_rpc_message(u32 peer_id, const void* payload, size_t bytes) {
+  lib_assert(peer_context_ != nullptr, "peer context not initialized");
+  lib_assert(peer_id < peer_rpc_sync_send_mutexes_.size() &&
+               peer_rpc_sync_send_mutexes_[peer_id] != nullptr,
+             "peer RPC sync send buffer is not initialized");
+  lib_assert(bytes <= peer_rpc_runtime_.message_bytes,
+             "peer rpc message too large");
+  lib_assert(!current_peer_rpc_progress_thread_,
+             "peer CQ progress thread must not execute a blocking response send");
+  std::lock_guard<std::mutex> sync_lock(
+    *peer_rpc_sync_send_mutexes_[peer_id]);
+  const size_t offset = peer_rpc_sync_send_offset(peer_id);
+  std::memcpy(peer_rpc_runtime_.buffer.get_full_buffer() + offset, payload, bytes);
+  const u64 wr_id = next_peer_sync_wr_id();
+  register_peer_pending_send_locked(
+    wr_id,
+    PeerPendingSend{
+      .target_shard = peer_id,
+      .target_qp_idx = 0,
+    });
+  {
+    std::lock_guard<std::mutex> send_lock(*peer_qp_send_mutexes_[peer_id][0]);
+    peer_control_qp(peer_id)->post_send_with_id(
+      *peer_rpc_runtime_.region,
+      static_cast<u32>(bytes),
+      IBV_WR_SEND,
+      wr_id,
+      true,
+      nullptr,
+      0,
+      offset);
+  }
+  wait_peer_sync_completion(wr_id);
 }
 
 service::storage_owner::PeerRpcHeader MemoryNode::make_peer_reverse_update_response(

@@ -393,6 +393,11 @@ private:
         storage_owner_maintenance_workers == 0) {
       fail("finalize maintenance requires storage-owner-maintenance-workers > 0");
     }
+    if (storage_owner_maintenance_mode == "finalize" &&
+        static_cast<u64>(storage_owner_maintenance_queue_depth) <
+          static_cast<u64>(storage_owner_batch_max) * 2) {
+      fail("finalize maintenance queue depth must cover two intents per RPC batch");
+    }
     if (is_server && server_index_file.empty()) {
       fail("storage node requires --server-index-file");
     }

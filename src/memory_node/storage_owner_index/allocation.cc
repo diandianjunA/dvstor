@@ -8,27 +8,11 @@ RemotePtr MemoryNode::allocate_local_node() {
     node_size += 4;
   }
 
-  if (storage_owner_reclaim_candidates_.load(std::memory_order_acquire) != 0) {
-    std::lock_guard<std::mutex> lock(storage_owner_reclaim_mutex_);
-    auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
-      index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
-    std::atomic_ref<u64> durable(control->durable_maintenance_sequence);
-    const auto reclaimed = storage_owner_reclaim_queue_.acquire(
-      durable.load(std::memory_order_acquire), minimum_compute_reclaim_ack());
-    if (reclaimed.has_value()) {
-      lib_assert(reclaimed->memory_node() == storage_id_ &&
-                   reclaimed->byte_offset() >= gpu_dynamic_node_base_ &&
-                   (reclaimed->byte_offset() - gpu_dynamic_node_base_) % node_size == 0,
-                 "storage-owner reclaim queue returned an invalid dynamic node");
-      storage_owner_reclaim_candidates_.store(
-        storage_owner_reclaim_queue_.size(), std::memory_order_release);
-      std::atomic_ref<u64>(control->reclaim_pending_nodes).store(
-        storage_owner_reclaim_queue_.size(), std::memory_order_release);
-      std::atomic_ref<u64>(control->reclaim_reused_nodes).store(
-        storage_owner_reclaim_queue_.reused(), std::memory_order_release);
-      return *reclaimed;
-    }
-  }
+  // Schema-15 reverse-update operations carry physical pointers but no target
+  // generation. Reusing a tombstoned address while an old cross-shard request
+  // can still retry would let that stale operation mutate an unrelated node.
+  // Keep vector/PQ/node storage generation-stable in this protocol version;
+  // only bounded stage2/GPU-delta metadata is reclaimed.
 
   auto* free_ptr = reinterpret_cast<u64*>(index_buffer_.get_full_buffer());
   std::atomic_ref<u64> alloc_ref(*free_ptr);
@@ -54,14 +38,12 @@ void MemoryNode::retire_local_dynamic_node(RemotePtr pointer,
   const u64 node_size = VamanaNode::allocation_size();
   lib_assert((pointer.byte_offset() - gpu_dynamic_node_base_) % node_size == 0,
              "cannot retire a misaligned storage-owner dynamic node");
-  std::lock_guard<std::mutex> lock(storage_owner_reclaim_mutex_);
-  storage_owner_reclaim_queue_.retire(pointer, maintenance_sequence);
-  storage_owner_reclaim_candidates_.store(
-    storage_owner_reclaim_queue_.size(), std::memory_order_release);
+  (void)maintenance_sequence;
+  storage_owner_reclaim_candidates_.store(0, std::memory_order_release);
   auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
     index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
   std::atomic_ref<u64>(control->reclaim_pending_nodes).store(
-    storage_owner_reclaim_queue_.size(), std::memory_order_release);
+    0, std::memory_order_release);
 }
 
 u64 MemoryNode::minimum_compute_reclaim_ack() const {

@@ -8,13 +8,31 @@ bool MemoryNode::storage_owner_maintenance_enabled(const Configuration& config) 
 }
 
 void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& config) {
+  auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
+    index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+  lib_assert(control->magic == gpu_search::format::kStorageControlMagic &&
+               control->version == gpu_search::format::kStorageControlVersion,
+             "storage-owner maintenance control block is not initialized");
+  std::atomic_ref<u64> next(control->next_maintenance_sequence);
+  std::atomic_ref<u64> durable(control->durable_maintenance_sequence);
+  const u64 initial_next = next.load(std::memory_order_acquire);
+  const u64 initial_durable = durable.load(std::memory_order_acquire);
+  lib_assert(initial_next == initial_durable + 1,
+             "storage-owner cannot restart with unfinished in-memory maintenance");
+  // Upserts can reserve stitch plus cleanup. Halving the descriptor bound
+  // guarantees that every admitted sequence can publish all of its intents.
+  const size_t completion_capacity = std::max<size_t>(
+    std::max<size_t>(1, config.storage_owner_batch_max),
+    config.storage_owner_maintenance_queue_depth / 2);
+  storage_owner_maintenance_completion_ring_ =
+    std::make_unique<bounded::SlidingCompletionRing>(
+      completion_capacity, initial_next, initial_durable);
+  storage_owner_maintenance_intent_capacity_ = completion_capacity;
+  storage_owner_maintenance_intents_ =
+    std::make_unique<StorageOwnerMaintenanceIntent[]>(completion_capacity);
+
   if (!storage_owner_maintenance_enabled(config)) {
     return;
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(storage_owner_maintenance_sequence_mutex_);
-    storage_owner_maintenance_sequence_remaining_.clear();
   }
 
   storage_owner_maintenance_shutdown_.store(false, std::memory_order_release);
@@ -24,6 +42,11 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   storage_owner_maintenance_processed_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_finalized_live_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_failed_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_rpc_timeouts_.store(0, std::memory_order_relaxed);
+  storage_owner_reverse_aggregate_batches_.store(0, std::memory_order_relaxed);
+  storage_owner_reverse_aggregate_logical_requests_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_reverse_aggregate_ops_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_stale_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_cleanup_processed_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_max_backlog_.store(0, std::memory_order_relaxed);
@@ -41,6 +64,45 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   storage_owner_maintenance_started_ns_.store(steady_now_ns(), std::memory_order_release);
   storage_owner_maintenance_last_observation_ns_.store(0, std::memory_order_relaxed);
   const u32 worker_count = std::max<u32>(1, config.storage_owner_maintenance_workers);
+  const size_t contexts_per_worker =
+    std::max<size_t>(1, config.storage_owner_rpc_depth);
+  const size_t remote_peer_count =
+    num_storage_nodes_ > 1 ? static_cast<size_t>(num_storage_nodes_ - 1) : 1;
+  lib_assert(static_cast<size_t>(worker_count) <=
+               std::numeric_limits<size_t>::max() / contexts_per_worker,
+             "stage2 reverse outbox worker/context capacity overflow");
+  const size_t worker_context_capacity =
+    static_cast<size_t>(worker_count) * contexts_per_worker;
+  lib_assert(worker_context_capacity <=
+               std::numeric_limits<size_t>::max() / remote_peer_count,
+             "stage2 reverse outbox peer capacity overflow");
+  const size_t reverse_outbox_capacity =
+    worker_context_capacity * remote_peer_count;
+  const u64 reverse_wire_max_u64 = std::max<u64>(
+    1, static_cast<u64>(config.R) * config.storage_owner_batch_max);
+  lib_assert(reverse_wire_max_u64 <= std::numeric_limits<u32>::max(),
+             "stage2 reverse aggregate exceeds schema-15 item_count");
+  const u32 reverse_wire_max = static_cast<u32>(reverse_wire_max_u64);
+  storage_owner_reverse_outbox_ = std::make_unique<Stage2ReverseOutbox>(
+    reverse_outbox_capacity, reverse_outbox_capacity, num_storage_nodes_,
+    reverse_wire_max);
+  storage_owner_reverse_completions_.clear();
+  storage_owner_reverse_completions_.reserve(worker_count);
+  const size_t completions_per_worker =
+    contexts_per_worker * remote_peer_count;
+  for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {
+    storage_owner_reverse_completions_.push_back(
+      std::make_unique<bounded::Queue<Stage2ReverseCompletion>>(
+        completions_per_worker));
+  }
+  const size_t repair_capacity = std::max<size_t>(
+    completion_capacity,
+    2 * static_cast<size_t>(worker_count) *
+      std::max<size_t>(1, config.storage_owner_rpc_depth) *
+      std::max<size_t>(1, config.storage_owner_batch_max));
+  storage_owner_repair_tasks_ =
+    std::make_unique<bounded::Queue<StorageOwnerMaintenanceTask>>(
+      repair_capacity);
   const size_t snapshot_stride = memory_node_detail::storage_owner_snapshot_stride();
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
   const size_t snapshot_batch = std::max<u32>(1, config.storage_owner_search_snapshot_batch);
@@ -61,21 +123,56 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {
     storage_owner_maintenance_workers_.emplace_back(
       [this, worker_id]() { storage_owner_maintenance_worker_loop(worker_id); });
+    if (!config.disable_thread_pinning) {
+      pin_thread(storage_owner_maintenance_workers_.back(),
+                 core_assignment_.get_available_core());
+    }
   }
 
   print_status("storage-owner maintenance workers: " + std::to_string(worker_count) +
                " (configured=" + std::to_string(config.storage_owner_maintenance_workers) +
                ", work_conserving=true)");
+  print_status("storage-owner stage2 reverse outbox descriptors: " +
+               std::to_string(storage_owner_reverse_outbox_->capacity()) +
+               " aggregates=" +
+               std::to_string(storage_owner_reverse_outbox_->aggregate_capacity()) +
+               " wire_max_ops=" + std::to_string(reverse_wire_max) +
+               " (shared per-peer work-conserving aggregation)");
   print_status("storage-owner maintenance tuning: mode=" + config.storage_owner_maintenance_mode +
                " local_stitch=" + (config.storage_owner_update_mode == "local_stitch" ? "true" : "false") +
                " compaction_batch_target=" + std::to_string(config.storage_owner_batch_max) +
-               " compaction_max_delay_ms=" +
-               std::to_string(kStitchCompactionMaxDelayNs / 1000000ull) +
                " backlog_limit=" +
                std::to_string(config.storage_owner_maintenance_queue_depth));
 }
 
 void MemoryNode::stop_storage_owner_maintenance_runtime() {
+  // Foreground insert workers are joined before this call, so no new intent
+  // can appear.  Keep peer progress alive and drain every queued/active stage2
+  // context before asking executors to exit. The wait is bounded because peer
+  // runtimes have no cross-shard shutdown barrier in schema-15: one shard may
+  // already be offline, in which case infinite same-ID retry must not deadlock
+  // process shutdown. A non-drained summary remains an acceptance failure.
+  if (!storage_owner_maintenance_workers_.empty()) {
+    std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+    const u64 rpc_timeout_ms = storage_worker_config_ == nullptr
+      ? 1000 : storage_worker_config_->storage_owner_rpc_timeout_ms;
+    const auto drain_timeout = std::chrono::milliseconds(
+      std::max<u64>(5000, std::min<u64>(60'000, rpc_timeout_ms * 3)));
+    const bool drained = storage_owner_maintenance_cv_.wait_for(
+      lock, drain_timeout, [&]() {
+      return storage_owner_stitch_tasks_.empty() &&
+             storage_owner_cleanup_tasks_.empty() &&
+             (storage_owner_repair_tasks_ == nullptr ||
+              storage_owner_repair_tasks_->empty()) &&
+             storage_owner_maintenance_active_workers_.load(
+               std::memory_order_acquire) == 0;
+    });
+    if (!drained) {
+      std::cerr << "[storage-owner] maintenance shutdown drain timed out; "
+                   "final summary will report unfinished stage2 work"
+                << std::endl;
+    }
+  }
   storage_owner_maintenance_shutdown_.store(true, std::memory_order_release);
   storage_owner_maintenance_cv_.notify_all();
 
@@ -94,8 +191,18 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
     storage_owner_stitch_tasks_.clear();
     storage_owner_cleanup_tasks_.clear();
   }
+  if (storage_owner_repair_tasks_ != nullptr) {
+    StorageOwnerMaintenanceTask abandoned;
+    while (storage_owner_repair_tasks_->try_pop(abandoned)) {
+      ++cleanup_remaining;
+      abandoned = StorageOwnerMaintenanceTask{};
+    }
+  }
   storage_owner_maintenance_workers_.clear();
   storage_owner_maintenance_worker_states_.clear();
+  storage_owner_repair_tasks_.reset();
+  storage_owner_reverse_outbox_.reset();
+  storage_owner_reverse_completions_.clear();
 
   log_storage_owner_maintenance_observation(stitch_remaining, cleanup_remaining, true);
 }
@@ -150,9 +257,25 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
     ? 0.0
     : static_cast<double>(
         kFinalizeLatencyBucketUpperNs[p99_finite_bucket]) / 1e6;
+  std::string stitch_delay_histogram;
+  for (size_t bucket = 0;
+       bucket < storage_owner_maintenance_finalize_latency_buckets_.size();
+       ++bucket) {
+    if (bucket != 0) stitch_delay_histogram.push_back(',');
+    stitch_delay_histogram += std::to_string(
+      storage_owner_maintenance_finalize_latency_buckets_[bucket].load(
+        std::memory_order_relaxed));
+  }
   const u64 stitch_batches = storage_owner_stitch_batches_.load(std::memory_order_relaxed);
   const u64 stitch_batched_items =
     storage_owner_stitch_batched_items_.load(std::memory_order_relaxed);
+  const u64 reverse_aggregate_batches =
+    storage_owner_reverse_aggregate_batches_.load(std::memory_order_relaxed);
+  const u64 reverse_aggregate_logical_requests =
+    storage_owner_reverse_aggregate_logical_requests_.load(
+      std::memory_order_relaxed);
+  const u64 reverse_aggregate_ops =
+    storage_owner_reverse_aggregate_ops_.load(std::memory_order_relaxed);
   const u64 peer_stitch_enqueued = peer_stitch_search_enqueued_.load(std::memory_order_relaxed);
   const u64 peer_stitch_processed = peer_stitch_search_processed_.load(std::memory_order_relaxed);
   const u64 peer_stitch_items = peer_stitch_search_items_.load(std::memory_order_relaxed);
@@ -173,7 +296,26 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
   const double peer_reverse_rate = elapsed_s > 0.0
     ? static_cast<double>(peer_reverse_items_processed) / elapsed_s
     : 0.0;
-  const size_t remaining = stitch_remaining + cleanup_remaining;
+  const u64 active_contexts =
+    storage_owner_maintenance_active_workers_.load(std::memory_order_acquire);
+  const u64 repair_remaining = storage_owner_repair_tasks_ == nullptr
+    ? 0
+    : static_cast<u64>(storage_owner_repair_tasks_->approximate_size());
+  const u64 maintenance_done =
+    storage_owner_maintenance_processed_.load(std::memory_order_relaxed) +
+    storage_owner_maintenance_cleanup_processed_.load(
+      std::memory_order_relaxed);
+  const u64 maintenance_enqueued =
+    storage_owner_maintenance_enqueued_.load(std::memory_order_relaxed);
+  const u64 counter_remaining = maintenance_enqueued > maintenance_done
+    ? maintenance_enqueued - maintenance_done : 0;
+  // Queue cardinality alone becomes zero as soon as work enters a context,
+  // even if that context is still waiting on remote shards. Keep the log SLO
+  // conservative so MAX_STAGE2_REMAINING=0 cannot pass on pending RPCs.
+  const u64 remaining = std::max<u64>(
+    counter_remaining,
+    static_cast<u64>(stitch_remaining + cleanup_remaining) +
+      active_contexts + repair_remaining);
   auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
     index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
   const u64 reclaim_pending =
@@ -209,6 +351,7 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
                std::to_string(p99_finalize_ms) +
                " p99_stitch_delay_over_30s=" +
                (p99_finalize_over_30s ? "true" : "false") +
+               " stitch_delay_histogram=" + stitch_delay_histogram +
                " max_stitch_delay_ms=" +
                std::to_string(static_cast<double>(max_finalize_latency_ns) / 1e6) +
                " compaction_batch_target=" +
@@ -221,6 +364,22 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
                std::to_string(repair_rate) +
                " failed=" +
                std::to_string(storage_owner_maintenance_failed_.load(std::memory_order_relaxed)) +
+               " rpc_timeouts=" +
+               std::to_string(storage_owner_maintenance_rpc_timeouts_.load(
+                 std::memory_order_relaxed)) +
+               " reverse_aggregate_batches=" +
+               std::to_string(reverse_aggregate_batches) +
+               " reverse_aggregate_logical_requests=" +
+               std::to_string(reverse_aggregate_logical_requests) +
+               " reverse_aggregate_ops=" +
+               std::to_string(reverse_aggregate_ops) +
+               " avg_reverse_aggregate_logicals=" +
+               std::to_string(ratio_or_zero(
+                 reverse_aggregate_logical_requests,
+                 reverse_aggregate_batches)) +
+               " avg_reverse_aggregate_ops=" +
+               std::to_string(ratio_or_zero(
+                 reverse_aggregate_ops, reverse_aggregate_batches)) +
                " max_backlog=" +
                std::to_string(storage_owner_maintenance_max_backlog_.load(std::memory_order_relaxed)) +
                " pressure_yields=" +
@@ -271,6 +430,10 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
                std::to_string(stitch_remaining) +
                " cleanup_remaining=" +
                std::to_string(cleanup_remaining) +
+               " active_contexts=" +
+               std::to_string(active_contexts) +
+               " repair_remaining=" +
+               std::to_string(repair_remaining) +
                " remaining=" + std::to_string(remaining));
 }
 

@@ -112,7 +112,7 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
 vec<RemotePtr> MemoryNode::robust_prune_snapshots_cpu(
     const byte_t* source,
     VectorDType source_dtype,
-    const vec<NodeSnapshot>& candidates,
+    span<const NodeSnapshot> candidates,
     const hashset_t<RemotePtr>& skip,
     const Configuration& config,
     u32 result_limit_override) {
@@ -221,8 +221,8 @@ bool MemoryNode::apply_partition_local_reverse_update(
   }
 
   lock_node(target_ptr);
-  const byte_t* target_node = local_node_ptr(target_ptr);
-  if ((*reinterpret_cast<const u64*>(target_node) & VamanaNode::HEADER_DELETED) != 0) {
+  if ((load_local_node_header_acquire(target_ptr) &
+       VamanaNode::HEADER_DELETED) != 0) {
     unlock_node(target_ptr);
     return true;
   }
@@ -232,8 +232,14 @@ bool MemoryNode::apply_partition_local_reverse_update(
   vec<RemotePtr> local_candidates;
   preserved_external.reserve(current_neighbors.size());
   local_candidates.reserve(current_neighbors.size() + unique_candidates.size());
+  bool changed = false;
   for (const RemotePtr& neighbor : current_neighbors) {
     if (neighbor.is_null()) {
+      changed = true;
+      continue;
+    }
+    if (!storage_owner_node_live(neighbor)) {
+      changed = true;
       continue;
     }
     if (local_shard(neighbor.memory_node())) {
@@ -243,8 +249,10 @@ bool MemoryNode::apply_partition_local_reverse_update(
     }
   }
 
-  bool changed = false;
   for (const RemotePtr& candidate : unique_candidates) {
+    if (!storage_owner_node_live(candidate)) {
+      continue;
+    }
     if (std::find(local_candidates.begin(), local_candidates.end(), candidate) ==
         local_candidates.end()) {
       local_candidates.push_back(candidate);
@@ -318,18 +326,24 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   job.generation = generation;
   const bool maintenance_enabled = storage_owner_maintenance_enabled(config);
   if (status != service::storage_owner::MutationStatus::ok) {
+    complete_storage_owner_maintenance_sequence(
+      job.maintenance_sequence, job.reserved_maintenance_work);
     job.status = status;
     job.ok = false;
     co_return;
   }
   if (job.kind == service::storage_owner::MutationKind::erase) {
-    job.ok = mark_node_deleted(old_entry.current, old_entry.generation);
+    job.ok = mark_node_deleted(old_entry.current, generation);
     job.status = job.ok ? service::storage_owner::MutationStatus::ok
                         : service::storage_owner::MutationStatus::failed;
     if (job.ok) {
-      publish_mutation(job.id, old_entry.current, old_entry.generation, true);
+      publish_mutation(job.id, old_entry.current, generation, true);
       job.maintenance_sequence = schedule_storage_owner_maintenance(
-        job.id, old_entry.generation, job.kind, RemotePtr{}, old_entry.current, config);
+        job.id, generation, job.kind, RemotePtr{}, old_entry.current,
+        job.maintenance_sequence, job.reserved_maintenance_work, config);
+    } else {
+      complete_storage_owner_maintenance_sequence(
+        job.maintenance_sequence, job.reserved_maintenance_work);
     }
     co_return;
   }
@@ -377,7 +391,8 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
       }
       publish_mutation(job.id, new_ptr, generation, false);
       job.maintenance_sequence = schedule_storage_owner_maintenance(
-        job.id, generation, job.kind, new_ptr, old_entry.current, config);
+        job.id, generation, job.kind, new_ptr, old_entry.current,
+        job.maintenance_sequence, job.reserved_maintenance_work, config);
       co_return;
     }
     medoid_ptr = observed;
@@ -416,7 +431,8 @@ auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thre
   }
   publish_mutation(job.id, new_ptr, generation, false);
   job.maintenance_sequence = schedule_storage_owner_maintenance(
-    job.id, generation, job.kind, new_ptr, old_entry.current, config);
+    job.id, generation, job.kind, new_ptr, old_entry.current,
+    job.maintenance_sequence, job.reserved_maintenance_work, config);
 
   if (!maintenance_enabled) {
     for (const RemotePtr& neighbor_ptr : selected_neighbors) {
@@ -481,9 +497,9 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
   const auto target_vector_addr = vamana::StorageLayoutResolver::vector(target_ptr);
   lib_assert(target_vector_addr.offset + target_vector_addr.size <= mn_memory_bytes_,
              "local reverse-update target vector exceeds shard bounds");
-  const byte_t* target_node = local_node_ptr(target_ptr);
   const byte_t* target_vector = index_buffer_.get_full_buffer() + target_vector_addr.offset;
-  if ((*reinterpret_cast<const u64*>(target_node) & VamanaNode::HEADER_DELETED) != 0) {
+  if ((load_local_node_header_acquire(target_ptr) &
+       VamanaNode::HEADER_DELETED) != 0) {
     return true;
   }
   snapshot_ns = elapsed_ns_since(step_started);
@@ -499,7 +515,7 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
   }
 
   auto target_deleted = [&]() {
-    return (*reinterpret_cast<const u64*>(local_node_ptr(target_ptr)) &
+    return (load_local_node_header_acquire(target_ptr) &
             VamanaNode::HEADER_DELETED) != 0;
   };
 
@@ -547,6 +563,9 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
         continue;
       }
       if (local_shard(neighbor.memory_node())) {
+        if (!storage_owner_node_live(neighbor)) {
+          continue;
+        }
         updated_neighbors.push_back(neighbor);
         neighbor_dists.push_back(distance_between_vectors(target_vector, VamanaNode::vector_dtype(),
                                                           vector_ptr(neighbor), VamanaNode::vector_dtype(), config));
@@ -557,6 +576,9 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
     if (!remote_neighbors.empty()) {
       vec<NodeSnapshot> snapshots = read_node_snapshots_batched(remote_neighbors, config);
       for (const NodeSnapshot& snapshot : snapshots) {
+        if (snapshot.deleted) {
+          continue;
+        }
         updated_neighbors.push_back(snapshot.rptr);
         neighbor_dists.push_back(distance_between_vectors(target_vector, VamanaNode::vector_dtype(),
                                                           snapshot.vector_data.data(), VamanaNode::vector_dtype(),
@@ -569,6 +591,9 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
         continue;
       }
       if (local_shard(candidate.memory_node())) {
+        if (!storage_owner_node_live(candidate)) {
+          continue;
+        }
         const distance_t candidate_dist = distance_between_vectors(target_vector, VamanaNode::vector_dtype(),
                                                                    vector_ptr(candidate), VamanaNode::vector_dtype(),
                                                                    config);
@@ -580,6 +605,9 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
     if (!remote_candidates.empty()) {
       vec<NodeSnapshot> candidate_snapshots = read_node_snapshots_batched(remote_candidates, config);
       for (const NodeSnapshot& snapshot : candidate_snapshots) {
+        if (snapshot.deleted) {
+          continue;
+        }
         const distance_t candidate_dist = distance_between_vectors(target_vector, VamanaNode::vector_dtype(),
                                                                    snapshot.vector_data.data(),
                                                                    VamanaNode::vector_dtype(), config);
@@ -605,6 +633,9 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
   filtered_candidates.clear();
   filtered_candidates.reserve(unique_candidates.size());
   for (const RemotePtr& candidate_ptr : unique_candidates) {
+    if (!storage_owner_node_live(candidate_ptr)) {
+      continue;
+    }
     bool already_present = false;
     for (const RemotePtr& current : current_neighbors) {
       if (current == candidate_ptr) {

@@ -141,6 +141,8 @@ struct TelemetrySnapshot {
   u64 resident_pq_peak_entries{};
   u64 resident_pq_reclaimed{};
   u64 mutation_capacity_rejections{};
+  u64 mutation_capacity_wait_events{};
+  u64 mutation_capacity_wait_ns{};
   u64 mutation_capacity_reserved{};
   u64 mutation_capacity_reserved_max{};
   u64 visibility_ns_total{};
@@ -202,6 +204,8 @@ public:
   std::atomic<u64> resident_pq_peak_entries{0};
   std::atomic<u64> resident_pq_reclaimed{0};
   std::atomic<u64> mutation_capacity_rejections{0};
+  std::atomic<u64> mutation_capacity_wait_events{0};
+  std::atomic<u64> mutation_capacity_wait_ns{0};
   std::atomic<u64> mutation_capacity_reserved{0};
   std::atomic<u64> mutation_capacity_reserved_max{0};
   std::atomic<u64> visibility_ns_total{0};

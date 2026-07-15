@@ -142,6 +142,7 @@ set(DVSTOR_PQ_INDEXER_SOURCES
 
 set(DVSTOR_BREAKDOWN_SUPPORT_SOURCES
     tools/breakdown_benchmark/dataset.cc
+    tools/breakdown_benchmark/maintenance_log.cc
     tools/breakdown_benchmark/report.cc
 )
 
@@ -279,6 +280,7 @@ else ()
         src/gpu_search/persistent_engine/storage_reclaim.cc
         src/gpu_search/pq_index.cc
         src/gpu_search/types.cc
+        src/service/base_owner_map.cc
         src/service/compute_service/index_commands.cc
         src/service/compute_service/lifecycle.cc
         src/service/compute_service/search.cc

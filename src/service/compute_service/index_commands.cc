@@ -38,13 +38,43 @@ bool ComputeService::lookup_compute_side_id(
   return true;
 }
 
-u32 ComputeService::storage_owner_for_id(node_t id) const {
+std::optional<u32> ComputeService::known_storage_owner_for_id(
+    node_t id) const {
   {
-    const auto& shard = compute_side_idmap_[static_cast<size_t>(id) % kComputeSideIdShardCount];
+    const auto& shard =
+      compute_side_idmap_[static_cast<size_t>(id) % kComputeSideIdShardCount];
     std::lock_guard<std::mutex> lock(shard.mutex);
     const auto it = shard.entries.find(id);
     if (it != shard.entries.end()) return it->second.owner_storage;
   }
+  return base_owner_map_.owner_for(id);
+}
+
+u32 ComputeService::claim_storage_owner_for_mutation(
+    node_t id, u32 proposed_owner) {
+  auto& shard =
+    compute_side_idmap_[static_cast<size_t>(id) % kComputeSideIdShardCount];
+  std::lock_guard<std::mutex> lock(shard.mutex);
+  const auto existing = shard.entries.find(id);
+  if (existing != shard.entries.end()) {
+    return existing->second.owner_storage;
+  }
+  // An immutable base owner is authoritative even before this compute
+  // process has observed a runtime mutation for the ID.
+  if (const auto base_owner = base_owner_map_.owner_for(id)) {
+    return *base_owner;
+  }
+  // Generation zero is a local routing claim, not a published mutation. The
+  // first successful storage response starts at generation one and replaces
+  // it. This closes the window in which concurrent first mutations for the
+  // same ID could choose different owners on this compute service.
+  shard.entries.emplace(
+    id, ComputeSideIdEntry{RemotePtr{}, true, proposed_owner, 0});
+  return proposed_owner;
+}
+
+u32 ComputeService::storage_owner_for_id(node_t id) const {
+  if (const auto owner = known_storage_owner_for_id(id)) return *owner;
   return num_servers_ == 0 ? 0 : static_cast<u32>(id % num_servers_);
 }
 
@@ -63,8 +93,10 @@ vamana::anchor::Route ComputeService::route_storage_owner_update(
 void ComputeService::reset_breakdown_state() {
   std::lock_guard<std::mutex> lock(breakdown_mutex_);
   completed_breakdown_report_ = {};
-  breakdown_enabled_ = config_.enable_breakdown;
+  breakdown_enabled_.store(config_.enable_breakdown,
+                           std::memory_order_release);
   persistent_search_->reset_telemetry();
+  storage_insert_late_rpc_completions_.store(0, std::memory_order_relaxed);
 }
 
 void ComputeService::clear_thread_statistics() {

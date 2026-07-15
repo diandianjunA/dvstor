@@ -25,6 +25,7 @@ struct SampleCounters {
 };
 
 struct Sample {
+  Sample() : Sample(Operation::insert, false) {}
   explicit Sample(Operation operation, bool collect_fine_grained = true)
       : operation(operation), collect_fine_grained_breakdown(collect_fine_grained) {}
 

@@ -284,11 +284,8 @@ bool MemoryNode::enqueue_peer_reverse_update_task(PeerReverseUpdateTask&& task) 
   const u64 item_count = task.ops.size();
   size_t queue_size = 0;
   std::unique_lock<std::mutex> lock(peer_reverse_tasks_mutex_);
-  peer_reverse_tasks_cv_.wait(lock, [&]() {
-    return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
-           peer_reverse_tasks_.size() < peer_reverse_task_queue_limit_;
-  });
-  if (peer_reverse_shutdown_.load(std::memory_order_acquire)) {
+  if (peer_reverse_shutdown_.load(std::memory_order_acquire) ||
+      peer_reverse_tasks_.size() >= peer_reverse_task_queue_limit_) {
     return false;
   }
   peer_reverse_tasks_.push_back(std::move(task));
@@ -318,15 +315,31 @@ bool MemoryNode::enqueue_peer_stitch_search_task(PeerStitchSearchTask&& task) {
 }
 
 void MemoryNode::enqueue_peer_reverse_update_response(u32 destination_shard,
-                                          const service::storage_owner::PeerRpcHeader& request,
-                                          bool success) {
+                                                      const service::storage_owner::PeerRpcHeader& request,
+                                                      bool success) {
   PeerReverseUpdateResponse response;
   response.destination_shard = destination_shard;
   response.header = make_peer_reverse_update_response(request, success);
   response.queued_at = std::chrono::steady_clock::now();
-  {
-    std::lock_guard<std::mutex> lock(peer_reverse_responses_mutex_);
-    peer_reverse_responses_.push_back(std::move(response));
+  (void)try_enqueue_peer_reverse_update_response(std::move(response));
+}
+
+bool MemoryNode::try_enqueue_peer_reverse_update_response(
+    PeerReverseUpdateResponse&& response) {
+  if (peer_reverse_responses_ != nullptr &&
+      peer_reverse_responses_->try_push(std::move(response))) {
+    return true;
   }
-  peer_reverse_responses_cv_.notify_one();
+  // A successful reverse operation remains in the bounded receiver dedup
+  // cache. Dropping only this ACK is safe: the source retries the identical
+  // request ID and receives a replay without applying the graph operation
+  // twice. Failed operations are retryable by definition as well.
+  static std::atomic<u32> dropped_response_logs{0};
+  const u32 log_index = dropped_response_logs.fetch_add(
+    1, std::memory_order_relaxed);
+  if (log_index < 16) {
+    std::cerr << "[storage-peer] bounded response queue full; "
+                 "dropping ACK for same-ID replay" << std::endl;
+  }
+  return false;
 }

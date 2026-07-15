@@ -23,11 +23,8 @@ MemoryNode::MemoryNode(Configuration& config)
   }
   cm_.connect_to_clients();
 
-  if (!config.disable_thread_pinning) {
-    const u32 core = core_assignment_.get_available_core();
-    pin_main_thread(core);
-    print_status("pinned main thread to core " + std::to_string(core));
-  }
+  // Keep the lifecycle thread unpinned. Storage workers are created later and
+  // must not inherit a one-CPU affinity mask.
 
   // receive runtimes parameters from initiator
   configuration::Parameters p{};
@@ -220,7 +217,7 @@ MemoryNode::MemoryNode(Configuration& config)
   service_storage_runtime(config);
 
   storage_insert_shutdown_.store(true, std::memory_order_release);
-  storage_insert_tasks_cv_.notify_all();
+  if (storage_insert_tasks_) storage_insert_tasks_->notify_all();
   for (auto& worker : storage_insert_workers_) {
     if (worker.joinable()) {
       worker.join();
@@ -459,16 +456,25 @@ distance_t MemoryNode::distance_between_vectors(const byte_t* lhs,
   return typed_l2_distance(lhs, lhs_dtype, rhs, rhs_dtype, config.dim);
 }
 
+u64 MemoryNode::load_local_node_header_acquire(RemotePtr rptr) const {
+  lib_assert(local_shard(rptr.memory_node()),
+             "local header lookup received a remote pointer");
+  const auto header = vamana::StorageLayoutResolver::header(rptr);
+  lib_assert(header.offset <= mn_memory_bytes_ &&
+               sizeof(u64) <= mn_memory_bytes_ - header.offset,
+             "local header lookup exceeds shard bounds");
+  auto* storage = reinterpret_cast<u64*>(
+    const_cast<byte_t*>(index_buffer_.get_full_buffer()) + header.offset);
+  return std::atomic_ref<u64>(*storage).load(std::memory_order_acquire);
+}
+
 const byte_t* MemoryNode::local_live_vector(RemotePtr rptr) const {
   lib_assert(local_shard(rptr.memory_node()),
              "local vector lookup received a remote pointer");
   const auto vector = vamana::StorageLayoutResolver::vector(rptr);
   lib_assert(vector.offset + vector.size <= mn_memory_bytes_,
              "local vector lookup exceeds shard bounds");
-  const byte_t* node = local_node_ptr(rptr);
-  auto& header_storage = *reinterpret_cast<u64*>(const_cast<byte_t*>(node));
-  const u64 header = std::atomic_ref<u64>(header_storage).load(
-    std::memory_order_acquire);
+  const u64 header = load_local_node_header_acquire(rptr);
   if ((header & VamanaNode::HEADER_DELETED) != 0) {
     return nullptr;
   }

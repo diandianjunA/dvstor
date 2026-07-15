@@ -9,10 +9,31 @@ target_link_libraries(breakdown_benchmark_support_test PRIVATE dvstor_breakdown_
 target_compile_options(breakdown_benchmark_support_test PRIVATE -UNDEBUG)
 add_test(NAME breakdown_benchmark_support_test COMMAND breakdown_benchmark_support_test)
 
+add_executable(breakdown_benchmark_control_test
+    breakdown_benchmark_control_test.cc
+    ${CMAKE_SOURCE_DIR}/tools/breakdown_benchmark/args.cc
+    ${CMAKE_SOURCE_DIR}/tools/breakdown_benchmark/progress.cc)
+dvstor_target_tool_includes(breakdown_benchmark_control_test)
+target_link_libraries(breakdown_benchmark_control_test PRIVATE dvstor_breakdown_support)
+target_compile_options(breakdown_benchmark_control_test PRIVATE -UNDEBUG)
+add_test(NAME breakdown_benchmark_control_test COMMAND breakdown_benchmark_control_test)
+
 add_executable(common_atomic_utils_test common_atomic_utils_test.cc)
 target_link_libraries(common_atomic_utils_test PRIVATE dvstor_runtime)
 target_compile_options(common_atomic_utils_test PRIVATE -UNDEBUG)
 add_test(NAME common_atomic_utils_test COMMAND common_atomic_utils_test)
+
+add_executable(bounded_update_primitives_test bounded_update_primitives_test.cc)
+target_link_libraries(bounded_update_primitives_test PRIVATE dvstor_runtime)
+target_compile_options(bounded_update_primitives_test PRIVATE -UNDEBUG)
+add_test(NAME bounded_update_primitives_test COMMAND bounded_update_primitives_test)
+
+add_executable(base_owner_map_test
+    base_owner_map_test.cc
+    ${CMAKE_SOURCE_DIR}/src/service/base_owner_map.cc)
+dvstor_target_common_includes(base_owner_map_test)
+target_compile_options(base_owner_map_test PRIVATE -UNDEBUG)
+add_test(NAME base_owner_map_test COMMAND base_owner_map_test)
 
 if (TARGET dvstor_gpu_kernels)
     add_executable(gpu_persistent_dispatch_test gpu_persistent_dispatch_test.cc)
@@ -52,6 +73,26 @@ add_executable(storage_owner_protocol_test storage_owner_protocol_test.cc)
 target_link_libraries(storage_owner_protocol_test PRIVATE dvstor_runtime)
 target_compile_options(storage_owner_protocol_test PRIVATE -UNDEBUG)
 add_test(NAME storage_owner_protocol_test COMMAND storage_owner_protocol_test)
+
+add_executable(storage_owner_stage2_tracker_test
+    storage_owner_stage2_tracker_test.cc)
+target_compile_options(storage_owner_stage2_tracker_test PRIVATE -UNDEBUG)
+add_test(NAME storage_owner_stage2_tracker_test
+    COMMAND storage_owner_stage2_tracker_test)
+
+add_executable(storage_owner_reverse_outbox_test
+    storage_owner_reverse_outbox_test.cc)
+dvstor_target_common_includes(storage_owner_reverse_outbox_test)
+target_compile_options(storage_owner_reverse_outbox_test PRIVATE -UNDEBUG)
+add_test(NAME storage_owner_reverse_outbox_test
+    COMMAND storage_owner_reverse_outbox_test)
+
+add_executable(peer_async_response_registry_test
+    peer_async_response_registry_test.cc)
+dvstor_target_common_includes(peer_async_response_registry_test)
+target_compile_options(peer_async_response_registry_test PRIVATE -UNDEBUG)
+add_test(NAME peer_async_response_registry_test
+    COMMAND peer_async_response_registry_test)
 
 add_executable(gpu_memory_budget_test gpu_memory_budget_test.cc)
 target_link_libraries(gpu_memory_budget_test PRIVATE dvstor_runtime)

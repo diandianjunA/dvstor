@@ -39,6 +39,7 @@ public:
   bool publish_mutations(std::vector<DeltaMutation> mutations, u64 epoch,
                          std::span<const u64> invalidated_graph_nodes = {});
   bool try_reserve_mutation_capacity(size_t mutation_count);
+  void reserve_mutation_capacity(size_t mutation_count);
   void release_mutation_capacity(size_t mutation_count);
   void mark_committed_mutation_gap(const std::string& reason);
   DeltaCoordinator& delta() { return delta_; }

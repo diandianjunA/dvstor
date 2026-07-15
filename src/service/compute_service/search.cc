@@ -8,7 +8,8 @@ ComputeService::search_local_result(const vec<element_t>& query, u32 k) {
     throw std::invalid_argument("search dimension mismatch");
   }
   auto sample = std::make_shared<service::breakdown::Sample>(
-    service::breakdown::Operation::query, breakdown_enabled_);
+    service::breakdown::Operation::query,
+    breakdown_enabled_.load(std::memory_order_acquire));
   const auto started = std::chrono::steady_clock::now();
   sample->enqueued_at = started;
   sample->mark_started(started, started);
@@ -23,7 +24,8 @@ ComputeService::search_local_raw_result(
     VectorDType query_dtype, const byte_t* query_data, u32 k) {
   if (query_data == nullptr) throw std::invalid_argument("raw query pointer is null");
   auto sample = std::make_shared<service::breakdown::Sample>(
-    service::breakdown::Operation::query, breakdown_enabled_);
+    service::breakdown::Operation::query,
+    breakdown_enabled_.load(std::memory_order_acquire));
   const auto started = std::chrono::steady_clock::now();
   sample->enqueued_at = started;
   sample->mark_started(started, started);

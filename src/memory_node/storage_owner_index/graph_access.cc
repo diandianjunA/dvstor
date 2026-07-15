@@ -19,7 +19,7 @@ bool MemoryNode::read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
   if (local_shard(rptr.memory_node())) {
     const byte_t* base = index_buffer_.get_full_buffer();
     const byte_t* ptr = base + rptr.byte_offset();
-    snapshot.header = *reinterpret_cast<const u64*>(ptr);
+    snapshot.header = load_local_node_header_acquire(rptr);
     snapshot.id = *reinterpret_cast<const u32*>(ptr + VamanaNode::offset_id());
     snapshot.generation =
       *reinterpret_cast<const u32*>(ptr + VamanaNode::offset_generation());
@@ -47,6 +47,26 @@ bool MemoryNode::read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
     *reinterpret_cast<const u32*>(prefix + VamanaNode::offset_generation());
   snapshot.deleted = (snapshot.header & VamanaNode::HEADER_DELETED) != 0;
   return true;
+}
+
+bool MemoryNode::storage_owner_node_live(RemotePtr rptr) {
+  if (rptr.is_null() || rptr.memory_node() >= num_storage_nodes_) {
+    return false;
+  }
+  const auto header_address = vamana::StorageLayoutResolver::header(rptr);
+  if (header_address.offset > mn_memory_bytes_ ||
+      sizeof(u64) > mn_memory_bytes_ - header_address.offset) {
+    return false;
+  }
+
+  u64 header = 0;
+  if (local_shard(rptr.memory_node())) {
+    header = load_local_node_header_acquire(rptr);
+  } else {
+    remote_read_bytes(rptr.memory_node(), header_address.offset,
+                      &header, sizeof(header), 0);
+  }
+  return (header & VamanaNode::HEADER_DELETED) == 0;
 }
 
 vec<RemotePtr> MemoryNode::read_neighbor_list(RemotePtr rptr) {
@@ -295,19 +315,70 @@ MemoryNode::NeighborListReadAwaitable MemoryNode::async_read_neighbor_list(
   return NeighborListReadAwaitable{false, rptr, buffer, {}, this};
 }
 
-void MemoryNode::write_hot_graph_entry(RemotePtr rptr, const vec<RemotePtr>& neighbors) {
+void MemoryNode::write_hot_graph_entry(
+    RemotePtr rptr,
+    const vec<RemotePtr>& neighbors,
+    std::optional<u32> generation_override,
+    std::optional<bool> deleted_override) {
   if (!VamanaNode::hot_graph_entry_available(rptr)) {
     return;
   }
   const size_t entry_size = VamanaNode::hot_graph_entry_size();
-  vec<byte_t> entry(entry_size, 0);
-  const u8 edge_count = static_cast<u8>(std::min<size_t>(neighbors.size(), VamanaNode::R));
-  VamanaNode::encode_hot_graph_entry(entry.data(), edge_count,
-                                     neighbors.data(), edge_count);
   const u64 hot_offset = VamanaNode::hot_graph_entry_offset(rptr);
+  vec<byte_t> previous(entry_size, 0);
   if (local_shard(rptr.memory_node())) {
     lib_assert(hot_offset + entry_size <= mn_memory_bytes_,
                "hot graph write exceeds shard bounds");
+    std::memcpy(previous.data(),
+                index_buffer_.get_full_buffer() + hot_offset, entry_size);
+  } else {
+    remote_read_bytes(
+      rptr.memory_node(), hot_offset, previous.data(), previous.size(), 0);
+  }
+
+  const bool previous_valid =
+    vamana::hot_graph::load_u16_le(previous.data() + 2) ==
+      vamana::hot_graph::checksum16(previous.data(), previous.size());
+  u32 generation = previous_valid
+    ? vamana::hot_graph::load_u32_le(previous.data() + 4) : 0;
+  bool deleted = previous_valid &&
+    (previous[1] & VamanaNode::HOT_GRAPH_DELETED) != 0;
+  if (!previous_valid) {
+    byte_t prefix[VamanaNode::HEADER_SIZE + VamanaNode::COMPACT_META_SIZE]{};
+    if (local_shard(rptr.memory_node())) {
+      const u64 header = load_local_node_header_acquire(rptr);
+      std::memcpy(prefix, &header, sizeof(header));
+      std::memcpy(prefix + VamanaNode::HEADER_SIZE,
+                  index_buffer_.get_full_buffer() + rptr.byte_offset() +
+                    VamanaNode::HEADER_SIZE,
+                  VamanaNode::COMPACT_META_SIZE);
+    } else {
+      remote_read_bytes(
+        rptr.memory_node(), rptr.byte_offset(), prefix, sizeof(prefix), 0);
+    }
+    deleted = (*reinterpret_cast<const u64*>(prefix) &
+               VamanaNode::HEADER_DELETED) != 0;
+    generation = *reinterpret_cast<const u32*>(
+      prefix + VamanaNode::offset_generation());
+  }
+  if (generation_override.has_value()) generation = *generation_override;
+  if (deleted_override.has_value()) deleted = *deleted_override;
+
+  vec<byte_t> entry(entry_size, 0);
+  const u8 edge_count = static_cast<u8>(std::min<size_t>(neighbors.size(), VamanaNode::R));
+  VamanaNode::encode_hot_graph_entry(entry.data(), edge_count,
+                                     neighbors.data(), edge_count,
+                                     VamanaNode::HOT_GRAPH_SHARD_BITS,
+                                     generation, false);
+  if (deleted) {
+    // Deleted nodes retain their preserved adjacency for cleanup, while GPU
+    // readers still observe the tombstone and ignore the payload.
+    entry[1] |= VamanaNode::HOT_GRAPH_DELETED;
+    const u16 checksum =
+      vamana::hot_graph::checksum16(entry.data(), entry.size());
+    vamana::hot_graph::store_u16_le(entry.data() + 2, checksum);
+  }
+  if (local_shard(rptr.memory_node())) {
     std::memcpy(index_buffer_.get_full_buffer() + hot_offset, entry.data(), entry_size);
     return;
   }
@@ -354,7 +425,7 @@ void MemoryNode::write_new_node(RemotePtr rptr,
   encode_float_vector_to_storage(components.data(), VamanaNode::DIM, VamanaNode::vector_dtype(),
                                  ptr + VamanaNode::offset_vector());
   write_dynamic_navigation_code(rptr, components);
-  write_hot_graph_entry(rptr, neighbors);
+  write_hot_graph_entry(rptr, neighbors, generation, false);
 }
 
 void MemoryNode::lock_node(RemotePtr rptr) {

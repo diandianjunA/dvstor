@@ -344,6 +344,7 @@ struct PersistentSearchEngine::Impl {
   std::vector<u64> enqueued_reclaim_ack_sequences;
   std::vector<u64> published_reclaim_ack_sequences;
   std::mutex delta_mutex;
+  std::condition_variable delta_capacity_cv;
   size_t reserved_mutation_capacity{};
   u64 mutable_delta_entries{};
   u64 durable_delta_entries{};

@@ -6,11 +6,13 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "tools/breakdown_benchmark/dataset.hh"
+#include "tools/breakdown_benchmark/maintenance_log.hh"
 #include "tools/breakdown_benchmark/report.hh"
 
 namespace {
@@ -82,8 +84,12 @@ void test_recall_and_report_formatting() {
 
   gpu_search::TelemetrySnapshot telemetry;
   telemetry.delta_reclaim_batches = 7;
+  telemetry.mutation_capacity_wait_events = 3;
+  telemetry.mutation_capacity_wait_ns = 2'000'000;
   const auto telemetry_json = tools::breakdown_benchmark::telemetry_to_json(telemetry);
   assert(telemetry_json.at("delta_reclaim_batches") == 7);
+  assert(telemetry_json.at("mutation_capacity_wait_events") == 3);
+  assert(telemetry_json.at("mutation_capacity_wait_ms") == 2.0);
 
   nlohmann::json root;
   root["meta"] = {
@@ -109,6 +115,195 @@ void test_recall_and_report_formatting() {
   assert(formatted.text.find("query breakdown") != std::string::npos);
 }
 
+void test_base_only_recall_filter() {
+  const std::vector<node_t> results{
+    100'000'001u, 7u, 100'000'002u, 9u, 11u, 13u};
+  const auto filtered =
+    tools::breakdown_benchmark::filter_base_only_recall_ids(
+      results, 100'000'000u, 3);
+  assert((filtered == std::vector<uint32_t>{7u, 9u, 11u}));
+}
+
+void test_verified_query_baseline() {
+  const auto path = std::filesystem::temp_directory_path() /
+    "dvstor_verified_query_baseline.json";
+  const nlohmann::json fingerprint = {
+    {"version", 1},
+    {"index_prefix", "/index"},
+    {"performance_query_file", "/queries.u8bin"},
+    {"cold_cache", true},
+  };
+  nlohmann::json baseline = {
+    {"meta", {
+      {"workload", "query"},
+      {"acceptance_fingerprint", fingerprint},
+    }},
+    {"stability", {{"cache_independent_baseline", true}}},
+    {"acceptance", {{"passed", true}}},
+    {"throughput", {
+      {"effective_query_ops_per_sec", 6000.0},
+      {"query_ops", 60000},
+      {"write_ops", 0},
+    }},
+  };
+  {
+    std::ofstream output(path, std::ios::trunc);
+    output << baseline.dump(2) << '\n';
+  }
+  const auto verified =
+    tools::breakdown_benchmark::load_verified_query_baseline(
+      path.string(), fingerprint);
+  assert(verified.effective_query_qps == 6000.0);
+  assert(verified.fingerprint == fingerprint);
+
+  bool rejected = false;
+  auto mismatch = fingerprint;
+  mismatch["performance_query_file"] = "/other.u8bin";
+  try {
+    (void)tools::breakdown_benchmark::load_verified_query_baseline(
+      path.string(), mismatch);
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  assert(rejected);
+  std::filesystem::remove(path);
+}
+
+void test_maintenance_log_window() {
+  using tools::breakdown_benchmark::kMaintenanceLatencyBucketCount;
+  using Histogram = std::array<uint64_t, kMaintenanceLatencyBucketCount>;
+  auto histogram_text = [](const Histogram& histogram) {
+    std::string text;
+    for (size_t index = 0; index < histogram.size(); ++index) {
+      if (index != 0) text.push_back(',');
+      text += std::to_string(histogram[index]);
+    }
+    return text;
+  };
+  auto write_observation = [&](std::ostream& output,
+                               uint64_t enqueued,
+                               uint64_t completed,
+                               uint64_t remaining,
+                               uint64_t failed,
+                               uint64_t peer_failed,
+                               const Histogram& histogram) {
+    output << "[STATUS]: storage-owner maintenance observation: "
+           << "stitch_enqueued=" << enqueued << ' '
+           << "stitched_live=" << completed << " stale=0 "
+           << "remaining=" << remaining << ' '
+           << "peer_reverse_remaining=0 "
+           << "failed=" << failed << ' '
+           << "peer_reverse_failed=" << peer_failed << ' '
+           // Deliberately stale cumulative p99 fields: the parser must use
+           // only the histogram delta from the cursor baseline.
+           << "p99_stitch_delay_upper_ms=30000 "
+           << "p99_stitch_delay_over_30s=true "
+           << "stitch_delay_histogram=" << histogram_text(histogram)
+           << '\n';
+  };
+
+  const auto path = std::filesystem::temp_directory_path() /
+    "dvstor_breakdown_maintenance_test.log";
+  Histogram histogram{};
+  histogram.back() = 5;
+  {
+    std::ofstream output(path, std::ios::trunc);
+    write_observation(output, 9, 0, 9, 9, 3, histogram);
+  }
+  const auto load_begin =
+    tools::breakdown_benchmark::snapshot_maintenance_logs({path.string()});
+  {
+    std::ofstream output(path, std::ios::app);
+    histogram[2] = 20;
+    write_observation(output, 100, 90, 10, 9, 3, histogram);
+    histogram[2] = 60;
+    write_observation(output, 200, 195, 5, 9, 3, histogram);
+    histogram[2] = 100;
+    write_observation(output, 300, 300, 0, 10, 3, histogram);
+  }
+
+  const auto post_stop =
+    tools::breakdown_benchmark::snapshot_maintenance_logs({path.string()});
+  const auto summary = tools::breakdown_benchmark::
+    summarize_maintenance_log_window(load_begin, post_stop);
+  assert(summary.requested_logs == 1);
+  assert(summary.readable_logs == 1);
+  assert(summary.logs_with_observations == 1);
+  assert(summary.observations == 3);
+  assert(summary.remaining == 0);
+  assert(summary.max_backlog_observed == 10);
+  assert(summary.failures == 1);
+  assert(summary.failure_delta_available);
+  assert(summary.p99_stitch_delay_available);
+  assert(summary.p99_stitch_delay_samples == 100);
+  assert(summary.p99_stitch_delay_upper_ms == 4.0);
+  assert(!summary.p99_stitch_delay_over_30s);
+  assert(summary.backlog_slope_available);
+  assert(summary.backlog_slope_per_sec < 0.0);
+
+  // A new post-stop cursor has no observation yet. Its default remaining=0
+  // must not be mistaken for a completed drain.
+  const auto empty_post_stop =
+    tools::breakdown_benchmark::summarize_maintenance_logs(post_stop);
+  assert(empty_post_stop.logs_with_observations == 0);
+  assert(!empty_post_stop.failure_delta_available);
+  assert(!empty_post_stop.p99_stitch_delay_available);
+
+  {
+    std::ofstream output(path, std::ios::app);
+    write_observation(output, 303, 300, 3, 10, 3, histogram);
+  }
+  const auto post_stop_without_completion =
+    tools::breakdown_benchmark::summarize_maintenance_logs(post_stop);
+  assert(post_stop_without_completion.logs_with_observations == 1);
+  assert(post_stop_without_completion.failure_delta_available);
+  assert(post_stop_without_completion.failures == 0);
+  assert(post_stop_without_completion.p99_stitch_delay_samples == 0);
+  assert(!post_stop_without_completion.p99_stitch_delay_available);
+
+  // Appending drain observations cannot change the frozen load window.
+  const auto frozen_again = tools::breakdown_benchmark::
+    summarize_maintenance_log_window(load_begin, post_stop);
+  assert(frozen_again.observations == 3);
+  assert(frozen_again.backlog_slope_per_sec == summary.backlog_slope_per_sec);
+
+  // The 5-second SLO needs its own bucket. A p99 at exactly this boundary
+  // passes as 5000 ms, while the next bucket remains conservatively 8000 ms.
+  {
+    std::ofstream output(path, std::ios::trunc);
+  }
+  const auto exact_5s_begin =
+    tools::breakdown_benchmark::snapshot_maintenance_logs({path.string()});
+  histogram = {};
+  histogram[13] = 100;
+  {
+    std::ofstream output(path, std::ios::app);
+    write_observation(output, 100, 100, 0, 0, 0, histogram);
+  }
+  const auto exact_5s =
+    tools::breakdown_benchmark::summarize_maintenance_logs(exact_5s_begin);
+  assert(exact_5s.p99_stitch_delay_available);
+  assert(exact_5s.p99_stitch_delay_upper_ms == 5000.0);
+
+  {
+    std::ofstream output(path, std::ios::trunc);
+  }
+  const auto over_5s_begin =
+    tools::breakdown_benchmark::snapshot_maintenance_logs({path.string()});
+  histogram = {};
+  histogram[14] = 100;
+  {
+    std::ofstream output(path, std::ios::app);
+    write_observation(output, 100, 100, 0, 0, 0, histogram);
+  }
+  const auto over_5s =
+    tools::breakdown_benchmark::summarize_maintenance_logs(over_5s_begin);
+  assert(over_5s.p99_stitch_delay_available);
+  assert(over_5s.p99_stitch_delay_upper_ms == 8000.0);
+
+  std::filesystem::remove(path);
+}
+
 }  // namespace
 
 int main() {
@@ -116,5 +311,8 @@ int main() {
   test_vector_file_reader();
   test_single_pass_stream();
   test_recall_and_report_formatting();
+  test_base_only_recall_filter();
+  test_verified_query_baseline();
+  test_maintenance_log_window();
   return 0;
 }

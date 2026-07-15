@@ -18,12 +18,25 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
     return true;
   }
 
+  vec<u32> reserved_maintenance_work_items(item_count);
+  for (size_t idx = 0; idx < item_count; ++idx) {
+    const auto kind = kinds == nullptr
+      ? service::storage_owner::MutationKind::insert : kinds[idx];
+    reserved_maintenance_work_items[idx] =
+      storage_owner_maintenance_work_items(kind, config);
+  }
+  const u64 first_reserved_maintenance_sequence =
+    begin_storage_owner_maintenance_batch(reserved_maintenance_work_items);
+
   vec<StorageOwnerInsertJob> jobs;
   jobs.reserve(item_count);
   for (size_t idx = 0; idx < item_count; ++idx) {
     StorageOwnerInsertJob job;
     job.id = ids[idx];
     job.kind = kinds == nullptr ? service::storage_owner::MutationKind::insert : kinds[idx];
+    job.reserved_maintenance_work = reserved_maintenance_work_items[idx];
+    job.maintenance_sequence =
+      first_reserved_maintenance_sequence + static_cast<u64>(idx);
     job.vector_data.resize(static_cast<size_t>(VamanaNode::DIM) * sizeof(element_t));
     std::memcpy(job.vector_data.data(),
                 vectors + idx * VamanaNode::DIM,

@@ -3,6 +3,12 @@
 namespace gpu_search {
 
 TelemetrySnapshot Telemetry::snapshot() const {
+  // A zero reservation observed with acquire means every mutation publisher
+  // whose reservation contributed to that zero has completed its telemetry
+  // updates. release_mutation_capacity() serializes publishers under the
+  // delta mutex and publishes the final reservation count with release.
+  const u64 reserved = mutation_capacity_reserved.load(
+    std::memory_order_acquire);
   return {
     .gpu_memory_explicit_bytes = gpu_memory_explicit_bytes.load(std::memory_order_relaxed),
     .gpu_memory_base_pq_bytes = gpu_memory_base_pq_bytes.load(std::memory_order_relaxed),
@@ -52,7 +58,9 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .resident_pq_peak_entries = resident_pq_peak_entries.load(std::memory_order_relaxed),
     .resident_pq_reclaimed = resident_pq_reclaimed.load(std::memory_order_relaxed),
     .mutation_capacity_rejections = mutation_capacity_rejections.load(std::memory_order_relaxed),
-    .mutation_capacity_reserved = mutation_capacity_reserved.load(std::memory_order_relaxed),
+    .mutation_capacity_wait_events = mutation_capacity_wait_events.load(std::memory_order_relaxed),
+    .mutation_capacity_wait_ns = mutation_capacity_wait_ns.load(std::memory_order_relaxed),
+    .mutation_capacity_reserved = reserved,
     .mutation_capacity_reserved_max = mutation_capacity_reserved_max.load(std::memory_order_relaxed),
     .visibility_ns_total = visibility_ns_total.load(std::memory_order_relaxed),
     .visibility_ns_max = visibility_ns_max.load(std::memory_order_relaxed),
@@ -102,6 +110,8 @@ void Telemetry::reset() {
     std::memory_order_relaxed);
   resident_pq_reclaimed.store(0, std::memory_order_relaxed);
   mutation_capacity_rejections.store(0, std::memory_order_relaxed);
+  mutation_capacity_wait_events.store(0, std::memory_order_relaxed);
+  mutation_capacity_wait_ns.store(0, std::memory_order_relaxed);
   mutation_capacity_reserved_max.store(
     mutation_capacity_reserved.load(std::memory_order_relaxed),
     std::memory_order_relaxed);

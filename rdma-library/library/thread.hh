@@ -60,8 +60,18 @@ inline void pin_main_thread(u32 core_id) {
   lib_assert(sched_setaffinity(0, sizeof(cpuset), &cpuset) == 0,
              "cannot pin main thread");
 }
+
+inline void pin_thread(std::thread& thread, u32 core_id) {
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(core_id, &cpuset);
+  lib_assert(pthread_setaffinity_np(
+               thread.native_handle(), sizeof(cpu_set_t), &cpuset) == 0,
+             "cannot pin worker thread");
+}
 #else
 inline void pin_main_thread(u32) {}
+inline void pin_thread(std::thread&, u32) {}
 #endif
 
 #endif  // RDMA_LIBRARY_THREAD_HH

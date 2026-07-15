@@ -22,7 +22,7 @@ inline constexpr u64 kMaintenanceObservationPeriodNs =
 inline constexpr u64 kStitchCompactionMaxDelayNs =
   10ull * 1000ull * 1000ull;
 inline constexpr size_t kForegroundQueueYieldMultiplier = 2;
-inline constexpr std::array<u64, 17> kFinalizeLatencyBucketUpperNs{
+inline constexpr std::array<u64, 18> kFinalizeLatencyBucketUpperNs{
   1ull * 1000ull * 1000ull,
   2ull * 1000ull * 1000ull,
   4ull * 1000ull * 1000ull,
@@ -36,6 +36,7 @@ inline constexpr std::array<u64, 17> kFinalizeLatencyBucketUpperNs{
   1ull * 1000ull * 1000ull * 1000ull,
   2ull * 1000ull * 1000ull * 1000ull,
   4ull * 1000ull * 1000ull * 1000ull,
+  5ull * 1000ull * 1000ull * 1000ull,
   8ull * 1000ull * 1000ull * 1000ull,
   16ull * 1000ull * 1000ull * 1000ull,
   30ull * 1000ull * 1000ull * 1000ull,
