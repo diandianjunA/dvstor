@@ -7,14 +7,11 @@ void ComputeService::start_storage_insert_runtime() {
 
   const u32 owner_count = std::max<u32>(1, num_servers_);
   const u32 rpc_depth = std::max<u32>(1, config_.storage_owner_rpc_depth);
-  const bool anchor_mode = config_.storage_owner_update_mode == "local_stitch";
   const size_t request_bytes = std::max(
     service::storage_owner::insert_batch_request_bytes(
-      config_.storage_owner_batch_max, config_.dim,
-      anchor_mode ? config_.storage_owner_anchor_hints : 0),
+      config_.storage_owner_batch_max),
     service::storage_owner::mutation_batch_request_bytes(
-      config_.storage_owner_batch_max, config_.dim,
-      anchor_mode ? config_.storage_owner_anchor_hints : 0));
+      config_.storage_owner_batch_max));
   const size_t response_bytes =
     service::storage_owner::insert_batch_response_bytes(
       config_.storage_owner_batch_max);
@@ -64,7 +61,6 @@ void ComputeService::start_storage_insert_runtime() {
     for (u32 task_id = 0; task_id < task_capacity; ++task_id) {
       auto& task = state->tasks[task_id];
       task.item.values.reserve(config_.dim);
-      task.anchor_hints.reserve(config_.storage_owner_anchor_hints);
       lib_assert(state->free_tasks->try_push(task_id),
                  "failed to initialize storage-owner task pool");
     }
@@ -79,6 +75,12 @@ void ComputeService::start_storage_insert_runtime() {
       slot.request_region = std::make_unique<LocalMemoryRegion>(
         context_, slot.request_buffer.data(), slot.request_buffer.size());
       slot.tasks.reserve(config_.storage_owner_batch_max);
+      slot.publication_mutations.resize(config_.storage_owner_batch_max);
+      for (auto& mutation : slot.publication_mutations) {
+        mutation.vector.resize(VamanaNode::vector_bytes());
+      }
+      slot.publication_invalidated_graph_nodes.reserve(
+        static_cast<size_t>(config_.storage_owner_batch_max) * config_.R);
       state->free_slots.push_back(slot_id);
     }
     state->response_slots.resize(rpc_depth);
@@ -166,6 +168,8 @@ void ComputeService::release_storage_insert_runtime() {
     for (auto& slot : state->slots) {
       slot.request_region.reset();
       slot.tasks.clear();
+      slot.publication_mutations.clear();
+      slot.publication_invalidated_graph_nodes.clear();
     }
     for (auto& response_slot : state->response_slots) {
       response_slot.region.reset();

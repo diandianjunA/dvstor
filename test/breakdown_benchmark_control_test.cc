@@ -56,7 +56,7 @@ void test_write_only_mixed_args(const std::string& config_path) {
   assert(args.performance_query_file.empty());
 }
 
-void test_invalid_acceptance_args(const std::string& config_path) {
+void test_removed_threshold_args_are_rejected(const std::string& config_path) {
   bool threw = false;
   try {
     (void)parse({
@@ -104,8 +104,7 @@ void test_invalid_acceptance_args(const std::string& config_path) {
   assert(threw);
 }
 
-void test_verified_baseline_gpu_and_base_recall_args(
-    const std::string& config_path) {
+void test_base_only_recall_args(const std::string& config_path) {
   const auto args = parse({
     "benchmark",
     "--service-config", config_path,
@@ -117,22 +116,10 @@ void test_verified_baseline_gpu_and_base_recall_args(
     "--groundtruth-file", "truth.bin",
     "--recall-mode", "base_only",
     "--recall-base-id-limit", "100000000",
-    "--query-baseline-report", "query-only.json",
-    "--query-baseline-qps", "1",
-    "--min-query-baseline-ratio", "0.9",
-    "--max-gpu-visibility-ms", "10",
-    "--max-final-mutation-capacity-reserved", "0",
-    "--max-final-delta-mutable-entries", "0",
-    "--max-late-storage-owner-rpcs", "0",
     "--report-json", "report.json",
   });
-  assert(args.query_baseline_report == "query-only.json");
   assert(args.recall_mode == "base_only");
   assert(args.recall_base_id_limit == 100000000u);
-  assert(args.max_gpu_visibility_ms == 10.0);
-  assert(args.max_final_mutation_capacity_reserved == 0);
-  assert(args.max_final_delta_mutable_entries == 0);
-  assert(args.max_late_storage_owner_rpcs == 0);
 }
 
 void test_paced_dispatcher() {
@@ -201,8 +188,8 @@ int main() {
   }
   test_rate_limited_args(config_path.string());
   test_write_only_mixed_args(config_path.string());
-  test_invalid_acceptance_args(config_path.string());
-  test_verified_baseline_gpu_and_base_recall_args(config_path.string());
+  test_removed_threshold_args_are_rejected(config_path.string());
+  test_base_only_recall_args(config_path.string());
   test_paced_dispatcher();
   test_progress_deadline_records_zero_tail_and_excludes_drain();
   std::filesystem::remove(config_path);

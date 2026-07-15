@@ -131,134 +131,6 @@ bool MemoryNode::wait_for_peer_reverse_update_response(u64 request_id,
   }
 }
 
-bool MemoryNode::wait_for_peer_stitch_search_response(u64 request_id,
-                                                      u32 target_shard,
-                                                      u32 item_count,
-                                                      vec<vec<NodeSnapshot>>& candidates_by_item,
-                                                      const Configuration& config) {
-  const u32 candidate_capacity = storage_owner_cross_shard_degree_;
-  lib_assert(candidate_capacity > 0 && candidate_capacity <= VamanaNode::R,
-             "invalid online cross-shard stitch degree");
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(config.storage_owner_rpc_timeout_ms);
-  std::unique_lock<std::mutex> lock(peer_rpc_mutex_);
-  for (;;) {
-    const auto it = peer_rpc_responses_.find(request_id);
-    if (it != peer_rpc_responses_.end()) {
-      const auto header = it->second;
-      auto payload_it = peer_rpc_response_payloads_.find(request_id);
-      const bool success =
-        header.magic == service::storage_owner::kPeerRpcMagic &&
-        header.version == service::storage_owner::kPeerRpcVersion &&
-        header.type == static_cast<u32>(
-          service::storage_owner::PeerRpcType::stitch_search_response) &&
-        header.source_shard == target_shard &&
-        header.item_count == item_count &&
-        header.reserved == candidate_capacity &&
-        header.status == static_cast<u32>(service::storage_owner::InsertStatus::ok) &&
-        payload_it != peer_rpc_response_payloads_.end() &&
-        payload_it->second.size() >= service::storage_owner::stitch_search_response_bytes(
-          item_count, candidate_capacity);
-      if (success) {
-        candidates_by_item.assign(item_count, {});
-        const byte_t* payload = payload_it->second.data();
-        const u32* counts = service::storage_owner::stitch_search_response_counts(payload);
-        const auto* candidates =
-          service::storage_owner::stitch_search_response_candidates(payload, item_count);
-        const byte_t* vectors =
-          service::storage_owner::stitch_search_response_candidate_vectors(
-            payload, item_count, candidate_capacity);
-        for (u32 item = 0; item < item_count; ++item) {
-          const u32 count = std::min<u32>(counts[item], candidate_capacity);
-          candidates_by_item[item].reserve(count);
-          for (u32 i = 0; i < count; ++i) {
-            const size_t slot = static_cast<size_t>(item) * candidate_capacity + i;
-            const auto& candidate = candidates[slot];
-            if (candidate.raw != 0) {
-              NodeSnapshot snapshot;
-              snapshot.rptr = RemotePtr{candidate.raw};
-              snapshot.generation = candidate.generation;
-              snapshot.vector_data.resize(VamanaNode::vector_bytes());
-              std::memcpy(snapshot.vector_data.data(),
-                          vectors + slot * VamanaNode::vector_bytes(),
-                          VamanaNode::vector_bytes());
-              candidates_by_item[item].push_back(std::move(snapshot));
-            }
-          }
-        }
-      }
-      peer_rpc_responses_.erase(it);
-      if (payload_it != peer_rpc_response_payloads_.end()) {
-        peer_rpc_response_payloads_.erase(payload_it);
-      }
-      peer_rpc_pending_responses_.erase(request_id);
-      return success;
-    }
-
-    if (peer_rpc_responses_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
-      peer_rpc_pending_responses_.erase(request_id);
-      peer_rpc_responses_.erase(request_id);
-      peer_rpc_response_payloads_.erase(request_id);
-      static std::atomic<u32> timeout_logs{0};
-      const u32 log_index = timeout_logs.fetch_add(1, std::memory_order_relaxed);
-      if (log_index < 8) {
-        std::cerr << "[storage-peer] stitch-search RPC timed out after "
-                  << config.storage_owner_rpc_timeout_ms << " ms"
-                  << " self_shard=" << storage_id_
-                  << " target_shard=" << target_shard
-                  << " request_id=" << request_id
-                  << " item_count=" << item_count << std::endl;
-      }
-      return false;
-    }
-  }
-}
-
-bool MemoryNode::post_stitch_search_request(u32 target_shard,
-                                            const vec<NodeSnapshot>& targets,
-                                            u64& request_id,
-                                            u32& item_count,
-                                            const Configuration& config) {
-  if (targets.empty() || target_shard == storage_id_) {
-    return true;
-  }
-
-  const u32 max_items = std::max<u32>(1, config.storage_owner_batch_max);
-  lib_assert(targets.size() <= max_items,
-             "stitch-search request batch exceeds storage_owner_batch_max");
-  item_count = static_cast<u32>(std::min<size_t>(targets.size(), max_items));
-  const size_t bytes = service::storage_owner::stitch_search_request_bytes(item_count);
-  vec<byte_t> message(bytes, 0);
-  auto* header = reinterpret_cast<service::storage_owner::PeerRpcHeader*>(message.data());
-  header->magic = service::storage_owner::kPeerRpcMagic;
-  header->version = service::storage_owner::kPeerRpcVersion;
-  header->type = static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_request);
-  header->source_shard = storage_id_;
-  header->item_count = item_count;
-  header->request_id = next_peer_request_id_.fetch_add(1, std::memory_order_relaxed);
-  header->reserved = storage_owner_cross_shard_degree_;
-  request_id = header->request_id;
-  {
-    std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
-    peer_rpc_pending_responses_.insert(request_id);
-  }
-
-  auto* items = service::storage_owner::stitch_search_items(message.data());
-  byte_t* vectors = service::storage_owner::stitch_search_vectors(message.data(), item_count);
-  for (u32 i = 0; i < item_count; ++i) {
-    const NodeSnapshot& snapshot = targets[i];
-    items[i].target_raw = snapshot.rptr.raw_address;
-    items[i].id = snapshot.id;
-    items[i].generation = snapshot.generation;
-    std::memcpy(vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes(),
-                snapshot.vector_data.data(),
-                VamanaNode::vector_bytes());
-  }
-
-  send_peer_rpc_message(target_shard, message.data(), bytes);
-  return true;
-}
-
 u64 MemoryNode::allocate_peer_request_id() {
   for (;;) {
     const u64 request_id = next_peer_request_id_.fetch_add(
@@ -318,7 +190,7 @@ bool MemoryNode::post_stitch_search_request_async(
   header->source_shard = storage_id_;
   header->item_count = item_count;
   header->request_id = request_id;
-  header->reserved = storage_owner_cross_shard_degree_;
+  header->reserved = config.resolved_storage_owner_construction_width();
 
   auto* items = service::storage_owner::stitch_search_items(message);
   byte_t* vectors = service::storage_owner::stitch_search_vectors(

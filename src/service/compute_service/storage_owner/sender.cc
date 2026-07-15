@@ -30,7 +30,8 @@ void ComputeService::run_storage_insert_progress_loop() {
     progressed = progressed || recv_count > 0;
     for (i32 i = 0; i < recv_count; ++i) {
       const auto [owner_storage, slot_id] = decode_64bit(recv_wcs[i].wr_id);
-      handle_storage_owner_response(owner_storage, slot_id);
+      handle_storage_owner_response(
+        owner_storage, slot_id, recv_wcs[i].byte_len);
     }
 
     progressed = drain_storage_owner_submissions(first_owner) || progressed;
@@ -102,8 +103,12 @@ void ComputeService::reclaim_storage_owner_slots() {
     slot.response_done = false;
     slot.results_completed = false;
     slot.completion_claimed = false;
+    slot.response_valid = false;
     slot.response_slot_id = std::numeric_limits<u32>::max();
     slot.gpu_reserved_items = 0;
+    slot.publication_mutation_count = 0;
+    slot.publication_reserved_items = 0;
+    slot.publication_invalidated_graph_nodes.clear();
     slot.item_count = 0;
     slot.batch_id = 0;
     slot.request_prepare_ns = 0;
@@ -129,9 +134,6 @@ void ComputeService::post_storage_owner_batch(
   if (slot.tasks.empty()) return;
 
   const u32 item_count = static_cast<u32>(slot.tasks.size());
-  const bool anchor_mode = config_.storage_owner_update_mode == "local_stitch";
-  const u32 anchor_hint_count = anchor_mode
-    ? config_.storage_owner_anchor_hints : 0;
   const u64 batch_id = next_request_id_.fetch_add(1, std::memory_order_relaxed);
   bool collect_breakdown = false;
   bool mutation_request = false;
@@ -146,10 +148,8 @@ void ComputeService::post_storage_owner_batch(
     ? std::chrono::steady_clock::now()
     : std::chrono::steady_clock::time_point{};
   const size_t request_size = mutation_request
-    ? service::storage_owner::mutation_batch_request_bytes(
-        item_count, config_.dim, anchor_hint_count)
-    : service::storage_owner::insert_batch_request_bytes(
-        item_count, config_.dim, anchor_hint_count);
+    ? service::storage_owner::mutation_batch_request_bytes(item_count)
+    : service::storage_owner::insert_batch_request_bytes(item_count);
   const size_t response_size =
     service::storage_owner::insert_batch_response_bytes(item_count);
   lib_assert(request_size <= slot.request_buffer.size(),
@@ -169,7 +169,7 @@ void ComputeService::post_storage_owner_batch(
   request->item_count = item_count;
   request->vector_dtype = static_cast<u32>(VamanaNode::vector_dtype());
   request->vector_bytes = static_cast<u32>(VamanaNode::vector_bytes());
-  request->anchor_hint_count = anchor_hint_count;
+  request->anchor_hint_count = 0;
   request->batch_id = batch_id;
 
   node_t* ids = mutation_request
@@ -183,11 +183,6 @@ void ComputeService::post_storage_owner_batch(
   u32* kinds = mutation_request
     ? service::storage_owner::mutation_request_kinds(slot.request_buffer.data())
     : nullptr;
-  u64* anchor_hints = mutation_request
-    ? service::storage_owner::mutation_request_anchor_hints(
-        slot.request_buffer.data(), item_count)
-    : service::storage_owner::request_anchor_hints(
-        slot.request_buffer.data(), item_count);
   for (u32 i = 0; i < item_count; ++i) {
     const auto& task = state.tasks[slot.tasks[i]];
     ids[i] = task.item.id;
@@ -201,11 +196,6 @@ void ComputeService::post_storage_owner_batch(
         task.item.values.data(), config_.dim,
         VamanaNode::vector_dtype(), vector_output);
     }
-    for (u32 hint = 0; hint < anchor_hint_count; ++hint) {
-      anchor_hints[static_cast<size_t>(i) * anchor_hint_count + hint] =
-        hint < task.anchor_hints.size()
-          ? task.anchor_hints[hint].raw_address : 0;
-    }
   }
 
   slot.in_use = true;
@@ -213,8 +203,12 @@ void ComputeService::post_storage_owner_batch(
   slot.response_done = false;
   slot.results_completed = false;
   slot.completion_claimed = false;
+  slot.response_valid = false;
   slot.response_slot_id = std::numeric_limits<u32>::max();
   slot.gpu_reserved_items = item_count;
+  slot.publication_mutation_count = 0;
+  slot.publication_reserved_items = 0;
+  slot.publication_invalidated_graph_nodes.clear();
   slot.item_count = item_count;
   slot.batch_id = batch_id;
   slot.request_prepare_ns = collect_breakdown

@@ -3,6 +3,10 @@
 
 int main() {
   gpu_search::DeltaCoordinator delta;
+  const u64 route_epoch = delta.reserve_epoch();
+  delta.publish_barrier(route_epoch);
+  assert(delta.published_epoch() == route_epoch);
+  assert(delta.delta_size() == 0);
   gpu_search::DeltaMutation insert;
   insert.id = 42;
   insert.kind = service::storage_owner::MutationKind::insert;

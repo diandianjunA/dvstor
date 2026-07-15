@@ -67,7 +67,7 @@ u32 PersistentSearchEngine::Impl::allocate_resident_pq_slot_locked(u64 remote_no
   return slot;
 }
 
-void PersistentSearchEngine::Impl::upload_records_locked(std::vector<DeltaMutation>& mutations,
+void PersistentSearchEngine::Impl::upload_records_locked(std::span<DeltaMutation> mutations,
                            std::span<const u64> invalidation_keys) {
   const auto prepare_started = std::chrono::steady_clock::now();
   bind_cuda_device("cudaSetDevice(GPU navigation delta publication)");
@@ -124,6 +124,15 @@ void PersistentSearchEngine::Impl::upload_records_locked(std::vector<DeltaMutati
     const bool deleted = mutation.kind == service::storage_owner::MutationKind::erase;
     const u64 record_remote = mutation.remote_node != 0
       ? mutation.remote_node : mutation.old_remote_node;
+    const u32 route_shard = static_cast<u32>(record_remote >> 48);
+    if (record_remote == 0 || route_shard >= index.shards.size() ||
+        route_shard != mutation.owner_storage) {
+      throw std::runtime_error(
+        "storage returned an invalid physical owner for GPU dynamic routing");
+    }
+    // Reuse the graph-address validator so an acknowledged but misaligned
+    // dynamic pointer can never enter either the delta map or route overlay.
+    (void)graph_cache_key(record_remote);
     u32 bucket = 0;
     if (!deleted) {
       const auto hinted = anchor_buckets_by_raw.find(mutation.anchor_hint);
@@ -246,7 +255,7 @@ void PersistentSearchEngine::Impl::upload_records_locked(std::vector<DeltaMutati
     durable_delta_entries, std::memory_order_relaxed);
 }
 
-size_t PersistentSearchEngine::Impl::upload_mutations(std::vector<DeltaMutation>& mutations, u64 epoch,
+size_t PersistentSearchEngine::Impl::upload_mutations(std::span<DeltaMutation> mutations, u64 epoch,
                         std::span<const u64> invalidated_graph_nodes) {
   if (mutations.empty()) return 0;
   const std::vector<u64> invalidation_keys = graph_cache_keys(invalidated_graph_nodes);

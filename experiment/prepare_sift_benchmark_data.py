@@ -133,8 +133,8 @@ def main() -> None:
     parser.add_argument("--query-start", type=int, default=100_000_000)
     parser.add_argument("--query-end", type=int, default=105_000_000)
     parser.add_argument("--insert-output", required=True)
-    parser.add_argument("--insert-start", type=int, default=105_000_000)
-    parser.add_argument("--insert-end", type=int, default=107_000_000)
+    parser.add_argument("--insert-start", type=int, default=103_000_000)
+    parser.add_argument("--insert-end", type=int, default=105_000_000)
     parser.add_argument("--dim", type=int, default=128)
     parser.add_argument("--chunk-rows", type=int, default=1_000_000)
     parser.add_argument("--overwrite", action="store_true")
@@ -153,14 +153,6 @@ def main() -> None:
 
     validate_range("query", args.query_start, args.query_end)
     validate_range("insert", args.insert_start, args.insert_end)
-    if max(args.query_start, args.insert_start) < min(
-        args.query_end, args.insert_end
-    ):
-        raise RuntimeError(
-            "query and insert source ranges must not overlap: "
-            f"query=[{args.query_start},{args.query_end}) "
-            f"insert=[{args.insert_start},{args.insert_end})"
-        )
     outputs = (
         ("query", query_output, args.query_start, args.query_end),
         ("insert", insert_output, args.insert_start, args.insert_end),

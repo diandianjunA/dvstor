@@ -105,7 +105,6 @@ set(DVSTOR_MEMORY_NODE_SOURCES
     src/memory_node/peer_rpc/request_handlers.cc
     src/memory_node/peer_rpc/runtime.cc
     src/memory_node/peer_rpc/workers.cc
-    src/memory_node/storage_owner_anchor.cc
     src/memory_node/storage_owner_index/allocation.cc
     src/memory_node/storage_owner_index/candidate_search.cc
     src/memory_node/storage_owner_index/graph_access.cc
@@ -120,6 +119,7 @@ set(DVSTOR_MEMORY_NODE_SOURCES
     src/memory_node/storage_owner_runtime/wire_protocol.cc
     src/memory_node/storage_owner_runtime/workers.cc
     src/vamana/anchor_index.cc
+    src/vamana/adaptive_route_table.cc
 )
 
 set(DVSTOR_OFFLINE_BUILDER_SOURCES
@@ -267,6 +267,7 @@ else ()
         src/common/core_assignment.cc
         src/common/timing.cc
         src/gpu_search/delta_index.cc
+        src/gpu_search/dynamic_route_overlay.cc
         src/gpu_search/navigation_bootstrapper.cc
         src/gpu_search/index_format.cc
         src/gpu_search/persistent_engine.cc
@@ -290,6 +291,7 @@ else ()
         src/service/compute_service/storage_owner/sender.cc
         src/service/index_metadata.cc
         src/vamana/anchor_index.cc
+        src/vamana/adaptive_route_table.cc
     )
     if (DVSTOR_HAVE_GPUNETIO)
         list(APPEND DVSTOR_RUNTIME_SOURCES src/gpu/gpunetio_transport.cc)

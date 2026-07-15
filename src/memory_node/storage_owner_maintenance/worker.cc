@@ -43,14 +43,15 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   const size_t context_capacity =
     std::max<size_t>(1, config.storage_owner_rpc_depth);
   const size_t remote_peer_count = num_storage_nodes_ - 1;
+  const u32 construction_width =
+    config.resolved_storage_owner_construction_width();
   const size_t request_capacity =
     context_capacity * std::max<size_t>(1, remote_peer_count);
   Stage2StateTracker states(context_capacity, num_storage_nodes_);
   Stage2RequestTracker requests(request_capacity);
   vec<Stage2Context> contexts(context_capacity);
   const size_t candidate_capacity_per_item =
-    static_cast<size_t>(config.R) +
-    remote_peer_count * storage_owner_cross_shard_degree_;
+    static_cast<size_t>(num_storage_nodes_) * construction_width;
   for (Stage2Context& context : contexts) {
     context.tasks.reserve(config.storage_owner_batch_max);
     context.targets.reserve(config.storage_owner_batch_max);
@@ -151,21 +152,15 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     // newer insert may therefore have already installed a reverse edge into
     // this node. Rebase the pruned result on exactly the neighbors added since
     // our stage1 snapshot, then run the same robust-prune rule while locked.
-    vec<RemotePtr> rebased_candidates = task.stitch_neighbors;
     const vec<RemotePtr> observed_neighbors =
       read_neighbor_list(task.target);
-    for (const RemotePtr& neighbor : observed_neighbors) {
-      const bool existed_at_stage1 = std::find(
-        task.stitch_base_neighbors.begin(),
-        task.stitch_base_neighbors.end(), neighbor) !=
-          task.stitch_base_neighbors.end();
-      const bool already_selected = std::find(
-        rebased_candidates.begin(), rebased_candidates.end(), neighbor) !=
-          rebased_candidates.end();
-      if (!existed_at_stage1 && !already_selected) {
-        rebased_candidates.push_back(neighbor);
-      }
-    }
+    vec<RemotePtr> rebased_candidates = merge_stage2_rebase_candidates(
+      span<const RemotePtr>{task.stitch_neighbors.data(),
+                            task.stitch_neighbors.size()},
+      span<const RemotePtr>{task.stitch_base_neighbors.data(),
+                            task.stitch_base_neighbors.size()},
+      span<const RemotePtr>{observed_neighbors.data(),
+                            observed_neighbors.size()});
     vec<NodeSnapshot> rebased_snapshots =
       read_node_snapshots_batched(rebased_candidates, config);
     hashset_t<RemotePtr> skip;
@@ -584,10 +579,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         context.tasks[ready] = std::move(task);
       }
       context.targets.push_back(std::move(target_snapshot));
-      context.tasks[ready].stitch_base_neighbors =
-        read_neighbor_list(context.tasks[ready].target);
+      lib_assert(context.tasks[ready].stage1_candidates.size() <=
+                   construction_width,
+                 "stage1 candidate beam exceeds construction width L");
       vec<NodeSnapshot> local_candidates = read_node_snapshots_batched(
-        context.tasks[ready].stitch_base_neighbors, config);
+        context.tasks[ready].stage1_candidates, config);
       lib_assert(local_candidates.size() <= candidate_capacity_per_item,
                  "stage2 local candidate capacity invariant failed");
       for (const NodeSnapshot& source : local_candidates) {
@@ -628,8 +624,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   const auto parse_search_response = [&](Stage2Context& context,
                                          const service::storage_owner::PeerRpcHeader& header,
                                          const vec<byte_t>& payload) {
-    const u32 candidate_capacity = storage_owner_cross_shard_degree_;
-    if (candidate_capacity == 0 || candidate_capacity > VamanaNode::R ||
+    const u32 candidate_capacity = construction_width;
+    if (candidate_capacity == 0 ||
         header.reserved != candidate_capacity ||
         header.item_count != context.tasks.size()) {
       return false;

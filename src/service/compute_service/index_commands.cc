@@ -11,7 +11,7 @@ ComputeService::Status ComputeService::status() const {
   };
 }
 
-void ComputeService::publish_compute_side_id(node_t id,
+bool ComputeService::publish_compute_side_id(node_t id,
                                              RemotePtr ptr,
                                              bool deleted,
                                              u32 owner_storage,
@@ -21,10 +21,11 @@ void ComputeService::publish_compute_side_id(node_t id,
   const auto existing = shard.entries.find(id);
   if (existing != shard.entries.end() &&
       existing->second.generation >= generation) {
-    return;
+    return false;
   }
   shard.entries[id] = ComputeSideIdEntry{
     ptr, deleted, owner_storage, generation};
+  return true;
 }
 
 bool ComputeService::lookup_compute_side_id(
@@ -71,23 +72,6 @@ u32 ComputeService::claim_storage_owner_for_mutation(
   shard.entries.emplace(
     id, ComputeSideIdEntry{RemotePtr{}, true, proposed_owner, 0});
   return proposed_owner;
-}
-
-u32 ComputeService::storage_owner_for_id(node_t id) const {
-  if (const auto owner = known_storage_owner_for_id(id)) return *owner;
-  return num_servers_ == 0 ? 0 : static_cast<u32>(id % num_servers_);
-}
-
-vamana::anchor::Route ComputeService::route_storage_owner_update(
-    const InsertItem& item, std::optional<u32> owner_override) const {
-  if (anchor_index_ == nullptr || anchor_index_->empty()) {
-    vamana::anchor::Route route;
-    route.owner = owner_override.value_or(
-      num_servers_ == 0 ? 0 : static_cast<u32>(item.id % num_servers_));
-    return route;
-  }
-  return anchor_index_->route(item.values, config_.storage_owner_anchor_hints,
-                              owner_override);
 }
 
 void ComputeService::reset_breakdown_state() {

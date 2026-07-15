@@ -11,6 +11,7 @@
 #include "common/completion_pool.hh"
 #include "common/sliding_completion_ring.hh"
 #include "memory_node/storage_owner_index/reverse_batch_policy.hh"
+#include "memory_node/storage_owner_index/robust_prune_policy.hh"
 #include "memory_node/storage_owner_maintenance/admission_policy.hh"
 #include "memory_node/storage_owner_maintenance/cleanup_policy.hh"
 
@@ -322,6 +323,72 @@ void test_reverse_candidate_is_revalidated_at_locked_write_boundary() {
   assert(selected.size() == 1 && selected.front() == candidate);
 }
 
+void test_reverse_overflow_uses_alpha_robust_prune_not_nearest_r() {
+  struct Candidate {
+    RemotePtr rptr;
+    distance_t source_distance;
+    distance_t coordinate;
+  };
+
+  // A and B are the two nearest candidates to the reverse target, but are
+  // almost duplicates of one another.  Alpha RobustPrune must retain the
+  // diverse C instead of producing nearest-R = {A, B}.
+  const Candidate a{RemotePtr{0, 4096}, 1.0f, 0.0f};
+  const Candidate b{RemotePtr{0, 8192}, 1.1f, 0.1f};
+  const Candidate c{RemotePtr{0, 12288}, 2.0f, 10.0f};
+  const Candidate d{RemotePtr{0, 16384}, 3.0f, 20.0f};
+  const vec<Candidate> sorted{a, b, c, d};
+  vec<RemotePtr> selected;
+  vec<size_t> selected_indices;
+
+  memory_node_storage_owner_index_detail::
+    select_alpha_robust_pruned_sorted(
+      span<const Candidate>{sorted.data(), sorted.size()},
+      2,
+      1.2,
+      [](const Candidate& candidate) { return candidate.rptr; },
+      [](const Candidate& candidate) {
+        return candidate.source_distance;
+      },
+      [](const Candidate& lhs, const Candidate& rhs) {
+        const distance_t delta = lhs.coordinate - rhs.coordinate;
+        return delta * delta;
+      },
+      selected,
+      selected_indices);
+
+  assert(selected.size() == 2);
+  assert(selected[0] == a.rptr);
+  assert(selected[1] == c.rptr);
+}
+
+void test_stage2_rebase_preserves_post_stage1_reverse_edge() {
+  const RemotePtr stage1_a{0, 4096};
+  const RemotePtr stage1_b{0, 8192};
+  const RemotePtr globally_selected{1, 4096};
+  const RemotePtr concurrent_reverse{0, 12288};
+  const vec<RemotePtr> stage1_neighbors{stage1_a, stage1_b};
+  const vec<RemotePtr> global_neighbors{globally_selected};
+  const vec<RemotePtr> observed_neighbors{
+    stage1_a, concurrent_reverse, globally_selected};
+
+  const vec<RemotePtr> rebased =
+    memory_node_storage_owner_maintenance_detail::
+      merge_stage2_rebase_candidates(
+        span<const RemotePtr>{global_neighbors.data(),
+                              global_neighbors.size()},
+        span<const RemotePtr>{stage1_neighbors.data(),
+                              stage1_neighbors.size()},
+        span<const RemotePtr>{observed_neighbors.data(),
+                              observed_neighbors.size()});
+
+  // The old stage1-only edge may be replaced by global prune, while the edge
+  // acknowledged after stage1 must enter the final locked re-prune.
+  assert(rebased.size() == 2);
+  assert(rebased[0] == globally_selected);
+  assert(rebased[1] == concurrent_reverse);
+}
+
 }  // namespace
 
 int main() {
@@ -334,5 +401,7 @@ int main() {
   test_stale_stitch_repair_keeps_schema15_payload_bound();
   test_stage2_admission_yields_only_for_live_foreground_pressure();
   test_reverse_candidate_is_revalidated_at_locked_write_boundary();
+  test_reverse_overflow_uses_alpha_robust_prune_not_nearest_r();
+  test_stage2_rebase_preserves_post_stage1_reverse_edge();
   return 0;
 }

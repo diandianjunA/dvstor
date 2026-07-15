@@ -88,7 +88,8 @@ u16 graph_checksum(const u8* data, size_t bytes) {
   return static_cast<u16>(hash);
 }
 
-void run_valid_resident_query_test(u32 subquantizers, u32 query_threads) {
+void run_valid_resident_query_test(u32 subquantizers, u32 query_threads,
+                                   bool dynamic_route_only = false) {
   constexpr u32 dim = 128;
   constexpr u32 graph_entry_bytes = 16;
   constexpr u32 node_record_bytes = 16 + dim;
@@ -99,6 +100,10 @@ void run_valid_resident_query_test(u32 subquantizers, u32 query_threads) {
     8, MappedRing<gpu_search::QueryDescriptor>::Direction::host_to_device);
   MappedRing<gpu_search::CompletionDescriptor> completions(
     8, MappedRing<gpu_search::CompletionDescriptor>::Direction::device_to_host);
+  MappedRing<gpu_search::DeltaPublishDescriptor> delta_submissions(
+    8, MappedRing<gpu_search::DeltaPublishDescriptor>::Direction::host_to_device);
+  MappedRing<gpu_search::DeltaPublishCompletion> delta_completions(
+    8, MappedRing<gpu_search::DeltaPublishCompletion>::Direction::device_to_host);
   MappedValue<u32> stop;
   MappedValue<u32> direct_disabled;
   MappedValue<i32> direct_error;
@@ -131,26 +136,65 @@ void run_valid_resident_query_test(u32 subquantizers, u32 query_threads) {
   DeviceBuffer<u32> exact_cache_states;
   DeviceBuffer<u32> exact_cache_readers;
   DeviceBuffer<u32> exact_cache_victims;
+  DeviceBuffer<gpu_search::DeviceDeltaRecord> delta_records;
+  DeviceBuffer<u8> delta_vectors(dim);
+  DeviceBuffer<u8> delta_pq_codes(subquantizers);
+  DeviceBuffer<u64> delta_remote_keys;
+  DeviceBuffer<u32> delta_remote_slots;
   DeviceBuffer<u32> delta_count;
+  DeviceBuffer<gpu_search::DynamicRouteUpdate> dynamic_route_updates;
+  DeviceBuffer<u8> dynamic_route_code_updates(subquantizers);
+  DeviceBuffer<gpu_search::DeviceDynamicRouteSlot> dynamic_route_slots;
+  DeviceBuffer<u8> dynamic_route_pq_codes(subquantizers);
+  DeviceBuffer<u8> resident_pq_codes(subquantizers);
+  DeviceBuffer<u64> resident_pq_keys;
+  DeviceBuffer<u32> resident_pq_slots;
 
+  constexpr u64 dynamic_base_offset = 4096;
+  constexpr u32 dynamic_record_bytes = 256;
+  constexpr u32 dynamic_hot_offset = 160;
   const gpu_search::DeviceShardRegion shard{
     .ordinal_base = 0,
     .node_count = 1,
     .node_base_offset = 64,
     .node_stride = node_record_bytes,
     .graph_base_offset = 512,
+    .dynamic_base_offset = dynamic_base_offset,
     .memory_node = 0,
+    .dynamic_record_bytes = dynamic_record_bytes,
+    .dynamic_hot_offset = dynamic_hot_offset,
   };
   const u32 entry_point = 0;
-  const u64 route_key = 512;
+  const u64 dynamic_remote_node = dynamic_base_offset;
+  const u32 dynamic_handle = gpu_search::kDeltaHandleBit;
+  const u64 route_key = dynamic_route_only
+    ? dynamic_base_offset + dynamic_hot_offset : 512;
+  const u32 exact_cache_key = dynamic_route_only ? dynamic_handle : entry_point;
   const u32 ready = 2;
   const u32 zero = 0;
+  const u32 resident_slot = 0;
+  const u32 expected_id = 42;
+  const gpu_search::DeviceDeltaRecord dynamic_delta_record{
+    .id = expected_id,
+    .generation = 1,
+    .epoch = 1,
+    .remote_node = dynamic_remote_node,
+    .resident_pq_slot = 0,
+  };
+  const gpu_search::DynamicRouteUpdate dynamic_route_update{
+    .epoch = 1,
+    .remote_node = dynamic_remote_node,
+    .slot = 0,
+    .shard = 0,
+    .id = expected_id,
+    .generation = 1,
+    .flags = gpu_search::kDynamicRouteLive,
+  };
   std::vector<u8> route_record(graph_entry_bytes, 0);
   const u16 checksum = graph_checksum(route_record.data(), route_record.size());
   route_record[2] = static_cast<u8>(checksum);
   route_record[3] = static_cast<u8>(checksum >> 8);
   std::vector<u8> exact_record(node_record_bytes, 0);
-  const u32 expected_id = 42;
   std::memcpy(exact_record.data() + 8, &expected_id, sizeof(expected_id));
 
   check_cuda(cudaMemcpy(shards.get(), &shard, sizeof(shard), cudaMemcpyHostToDevice),
@@ -176,7 +220,8 @@ void run_valid_resident_query_test(u32 subquantizers, u32 query_threads) {
   check_cuda(cudaMemcpy(exact_cache.get(), exact_record.data(), exact_record.size(),
                         cudaMemcpyHostToDevice),
              "cudaMemcpy(valid query exact cache)");
-  check_cuda(cudaMemcpy(exact_cache_keys.get(), &entry_point, sizeof(entry_point),
+  check_cuda(cudaMemcpy(exact_cache_keys.get(), &exact_cache_key,
+                        sizeof(exact_cache_key),
                         cudaMemcpyHostToDevice),
              "cudaMemcpy(valid query exact key)");
   check_cuda(cudaMemcpy(exact_cache_states.get(), &ready, sizeof(ready),
@@ -186,21 +231,58 @@ void run_valid_resident_query_test(u32 subquantizers, u32 query_threads) {
              "cudaMemset(valid query exact readers)");
   check_cuda(cudaMemset(exact_cache_victims.get(), 0, exact_cache_victims.bytes()),
              "cudaMemset(valid query exact victims)");
-  check_cuda(cudaMemcpy(delta_count.get(), &zero, sizeof(zero), cudaMemcpyHostToDevice),
+  const u32 delta_count_value = dynamic_route_only ? 1u : 0u;
+  const u64 delta_remote_key = dynamic_route_only ? dynamic_remote_node : 0;
+  check_cuda(cudaMemcpy(delta_records.get(), &dynamic_delta_record,
+                        sizeof(dynamic_delta_record), cudaMemcpyHostToDevice),
+             "cudaMemcpy(valid dynamic delta record)");
+  check_cuda(cudaMemset(delta_vectors.get(), 0, delta_vectors.bytes()),
+             "cudaMemset(valid dynamic delta vector)");
+  check_cuda(cudaMemset(delta_pq_codes.get(), 0, delta_pq_codes.bytes()),
+             "cudaMemset(valid dynamic delta PQ code)");
+  check_cuda(cudaMemcpy(delta_remote_keys.get(), &delta_remote_key,
+                        sizeof(delta_remote_key), cudaMemcpyHostToDevice),
+             "cudaMemcpy(valid dynamic delta remote key)");
+  check_cuda(cudaMemcpy(delta_remote_slots.get(), &zero, sizeof(zero),
+                        cudaMemcpyHostToDevice),
+             "cudaMemcpy(valid dynamic delta remote slot)");
+  check_cuda(cudaMemcpy(delta_count.get(), &delta_count_value,
+                        sizeof(delta_count_value), cudaMemcpyHostToDevice),
              "cudaMemcpy(valid query delta count)");
+  check_cuda(cudaMemcpy(dynamic_route_updates.get(), &dynamic_route_update,
+                        sizeof(dynamic_route_update), cudaMemcpyHostToDevice),
+             "cudaMemcpy(valid dynamic route update)");
+  check_cuda(cudaMemset(dynamic_route_slots.get(), 0,
+                        dynamic_route_slots.bytes()),
+             "cudaMemset(valid dynamic route slots)");
+  check_cuda(cudaMemset(dynamic_route_code_updates.get(), 0,
+                        dynamic_route_code_updates.bytes()),
+             "cudaMemset(valid dynamic route code update)");
+  check_cuda(cudaMemset(dynamic_route_pq_codes.get(), 0,
+                        dynamic_route_pq_codes.bytes()),
+             "cudaMemset(valid dynamic route PQ code)");
+  check_cuda(cudaMemset(resident_pq_codes.get(), 0, resident_pq_codes.bytes()),
+             "cudaMemset(valid resident dynamic PQ code)");
+  const u64 resident_key = dynamic_route_only ? dynamic_remote_node : 0;
+  check_cuda(cudaMemcpy(resident_pq_keys.get(), &resident_key,
+                        sizeof(resident_key), cudaMemcpyHostToDevice),
+             "cudaMemcpy(valid resident dynamic PQ key)");
+  check_cuda(cudaMemcpy(resident_pq_slots.get(), &resident_slot,
+                        sizeof(resident_slot), cudaMemcpyHostToDevice),
+             "cudaMemcpy(valid resident dynamic PQ slot)");
 
   gpu_search::PersistentKernelParams params{
     .submissions = submissions.device_view(),
     .device_submissions = {},
     .completions = completions.device_view(),
-    .delta_submissions = {},
-    .delta_completions = {},
+    .delta_submissions = delta_submissions.device_view(),
+    .delta_completions = delta_completions.device_view(),
     .shards = shards.get(),
     .num_shards = 1,
     .pq_codes = pq_codes.get(),
     .pq_centroids = centroids.get(),
     .entry_points = entry_points.get(),
-    .entry_point_count = 1,
+    .entry_point_count = dynamic_route_only ? 0u : 1u,
     .num_nodes = 1,
     .dim = dim,
     .pq_subquantizers = subquantizers,
@@ -222,7 +304,24 @@ void run_valid_resident_query_test(u32 subquantizers, u32 query_threads) {
     .direct_region_count = 1,
     .direct_disabled = direct_disabled.device(),
     .direct_error = direct_error.device(),
+    .delta_records = delta_records.get(),
+    .delta_vectors = delta_vectors.get(),
+    .delta_pq_codes = delta_pq_codes.get(),
     .delta_count = delta_count.get(),
+    .delta_capacity = 1,
+    .delta_remote_keys = delta_remote_keys.get(),
+    .delta_remote_slots = delta_remote_slots.get(),
+    .delta_remote_capacity = 1,
+    .resident_pq_codes = resident_pq_codes.get(),
+    .resident_pq_keys = resident_pq_keys.get(),
+    .resident_pq_slots = resident_pq_slots.get(),
+    .resident_pq_capacity = 1,
+    .resident_pq_table_capacity = 1,
+    .dynamic_route_updates = dynamic_route_updates.get(),
+    .dynamic_route_code_updates = dynamic_route_code_updates.get(),
+    .dynamic_route_slots = dynamic_route_slots.get(),
+    .dynamic_route_pq_codes = dynamic_route_pq_codes.get(),
+    .dynamic_route_capacity = 1,
     .anchor_graph_keys = route_keys.get(),
     .anchor_graph_records = route_records.get(),
     .anchor_graph_states = route_states.get(),
@@ -258,8 +357,39 @@ void run_valid_resident_query_test(u32 subquantizers, u32 query_threads) {
   gpu_search::launch_persistent_search(stream, params, 1, query_threads);
   check_cuda(cudaPeekAtLastError(), "launch_persistent_search(valid query)");
 
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  if (dynamic_route_only) {
+    // Publish through the control path, then query a true dynamic handle.  The
+    // visible delta supplies its exact vector so this unit does not require a
+    // GPUNetIO peer.  A durable-retired dynamic node needs a storage exact-read
+    // during rerank and therefore belongs in the GPUNetIO integration test.
+    const gpu_search::DeltaPublishDescriptor route_descriptor{
+      .command_id = 1,
+      .final_count = 1,
+      .dynamic_route_count = 1,
+    };
+    while (!delta_submissions.try_push(route_descriptor)) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw std::runtime_error("dynamic route publication stalled");
+      }
+      std::this_thread::yield();
+    }
+    gpu_search::DeltaPublishCompletion route_completion{};
+    while (!delta_completions.try_pop(route_completion)) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw std::runtime_error("dynamic route publication did not complete");
+      }
+      std::this_thread::yield();
+    }
+    if (route_completion.command_id != 1 || route_completion.status != 0 ||
+        route_completion.final_count != 1) {
+      throw std::runtime_error("dynamic route publication is invalid");
+    }
+  }
+
   const gpu_search::QueryDescriptor descriptor{
     .request_id = 1,
+    .snapshot_epoch = 1,
     .query_device_address = reinterpret_cast<u64>(query.get()),
     .result_device_address = reinterpret_cast<u64>(result_ids.get()),
     .query_slot = 0,
@@ -268,7 +398,6 @@ void run_valid_resident_query_test(u32 subquantizers, u32 query_threads) {
     .k = 1,
     .query_dtype = 1,
   };
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
   while (!submissions.try_push(descriptor)) {
     if (std::chrono::steady_clock::now() >= deadline) {
       std::cerr << "valid resident query submission stalled\n";
@@ -395,6 +524,12 @@ int main(int argc, char** argv) {
     gpu_search::DeltaOverrideUpdate* override_updates_device = nullptr;
     gpu_search::DeltaDurableUpdate* durable_updates_device = nullptr;
     gpu_search::ResidentPqEraseUpdate* resident_pq_erase_updates_device = nullptr;
+    gpu_search::DynamicRouteUpdate* dynamic_route_update_host = nullptr;
+    gpu_search::DynamicRouteUpdate* dynamic_route_update_device = nullptr;
+    u8* dynamic_route_code_update_host = nullptr;
+    u8* dynamic_route_code_update_device = nullptr;
+    gpu_search::DeviceDynamicRouteSlot* dynamic_route_slots_device = nullptr;
+    u8* dynamic_route_pq_codes_device = nullptr;
     check_cuda(cudaMalloc(reinterpret_cast<void**>(&delta_records_device),
                           sizeof(delta_records_host)), "cudaMalloc(delta records)");
     check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&delta_staging_slot_host),
@@ -522,6 +657,51 @@ int main(int argc, char** argv) {
                  reinterpret_cast<void**>(&resident_pq_erase_updates_device),
                  sizeof(gpu_search::ResidentPqEraseUpdate)),
                "cudaMalloc(resident PQ erase updates)");
+    check_cuda(cudaHostAlloc(
+                 reinterpret_cast<void**>(&dynamic_route_update_host),
+                 sizeof(gpu_search::DynamicRouteUpdate), cudaHostAllocMapped),
+               "cudaHostAlloc(dynamic route update)");
+    check_cuda(cudaHostGetDevicePointer(
+                 reinterpret_cast<void**>(&dynamic_route_update_device),
+                 dynamic_route_update_host, 0),
+               "cudaHostGetDevicePointer(dynamic route update)");
+    check_cuda(cudaHostAlloc(
+                 reinterpret_cast<void**>(&dynamic_route_code_update_host),
+                 test_subquantizers, cudaHostAllocMapped),
+               "cudaHostAlloc(dynamic route code update)");
+    check_cuda(cudaHostGetDevicePointer(
+                 reinterpret_cast<void**>(&dynamic_route_code_update_device),
+                 dynamic_route_code_update_host, 0),
+               "cudaHostGetDevicePointer(dynamic route code update)");
+    check_cuda(cudaMalloc(
+                 reinterpret_cast<void**>(&dynamic_route_slots_device),
+                 gpu_search::kDynamicRouteSlotsPerShard *
+                   sizeof(gpu_search::DeviceDynamicRouteSlot)),
+               "cudaMalloc(dynamic route slots)");
+    check_cuda(cudaMemset(
+                 dynamic_route_slots_device, 0,
+                 gpu_search::kDynamicRouteSlotsPerShard *
+                   sizeof(gpu_search::DeviceDynamicRouteSlot)),
+               "cudaMemset(dynamic route slots)");
+    check_cuda(cudaMalloc(
+                 reinterpret_cast<void**>(&dynamic_route_pq_codes_device),
+                 gpu_search::kDynamicRouteSlotsPerShard * test_subquantizers),
+               "cudaMalloc(dynamic route PQ codes)");
+    check_cuda(cudaMemset(
+                 dynamic_route_pq_codes_device, 0,
+                 gpu_search::kDynamicRouteSlotsPerShard * test_subquantizers),
+               "cudaMemset(dynamic route PQ codes)");
+    *dynamic_route_update_host = gpu_search::DynamicRouteUpdate{
+      .epoch = 2,
+      .remote_node = 222,
+      .slot = 0,
+      .shard = 0,
+      .id = 7,
+      .generation = 2,
+      .flags = gpu_search::kDynamicRouteLive,
+    };
+    std::memcpy(dynamic_route_code_update_host,
+                expected_delta_code.data(), test_subquantizers);
     const u32 initial_next[2]{UINT32_MAX, UINT32_MAX};
     const u32 initial_prev[2]{UINT32_MAX, UINT32_MAX};
     const u32 initial_bucket = 0;
@@ -636,6 +816,11 @@ int main(int argc, char** argv) {
     params.delta_override_updates = override_updates_device;
     params.delta_durable_updates = durable_updates_device;
     params.resident_pq_erase_updates = resident_pq_erase_updates_device;
+    params.dynamic_route_updates = dynamic_route_update_device;
+    params.dynamic_route_code_updates = dynamic_route_code_update_device;
+    params.dynamic_route_slots = dynamic_route_slots_device;
+    params.dynamic_route_pq_codes = dynamic_route_pq_codes_device;
+    params.dynamic_route_capacity = gpu_search::kDynamicRouteSlotsPerShard;
     params.graph_invalidation_keys = invalidation_key_device;
     params.anchor_graph_keys = anchor_graph_key_device;
     params.anchor_graph_states = anchor_graph_state_device;
@@ -647,6 +832,7 @@ int main(int argc, char** argv) {
     params.graph_cache_ways = kCacheWays;
     params.stop = stop_device;
     params.query_slots = 1;
+    params.num_shards = 1;
     params.num_nodes = 32;
     params.dim = 128;
     params.vector_bytes = 128;
@@ -664,6 +850,7 @@ int main(int argc, char** argv) {
       throw std::invalid_argument("query threads must be 128 or 256");
     }
     run_valid_resident_query_test(test_subquantizers, query_threads);
+    run_valid_resident_query_test(test_subquantizers, query_threads, true);
     auto query_params = params;
     query_params.delta_submissions = {};
     query_params.delta_completions = {};
@@ -685,6 +872,7 @@ int main(int argc, char** argv) {
       .invalidation_count = 1,
       .superseded_count = 1,
       .override_count = 1,
+      .dynamic_route_count = 1,
     };
     while (!delta_submissions.try_push(delta_descriptor)) {
       if (std::chrono::steady_clock::now() >= delta_deadline) {
@@ -717,7 +905,9 @@ int main(int argc, char** argv) {
     u32 resident_pq_positions_host[2]{};
     std::vector<u8> encoded_delta_code(test_subquantizers);
     std::vector<u8> encoded_resident_pq_code(test_subquantizers);
+    std::vector<u8> encoded_dynamic_route_code(test_subquantizers);
     u32 anchor_graph_state_host = 0;
+    gpu_search::DeviceDynamicRouteSlot dynamic_route_slot_host{};
     check_cuda(cudaMemcpy(&delta_count_host, delta_count_device, sizeof(delta_count_host),
                           cudaMemcpyDeviceToHost), "cudaMemcpy(delta count result)");
     check_cuda(cudaMemcpy(delta_next_host, delta_next_device, sizeof(delta_next_host),
@@ -762,6 +952,16 @@ int main(int argc, char** argv) {
                           resident_pq_codes_device,
                           encoded_resident_pq_code.size(), cudaMemcpyDeviceToHost),
                "cudaMemcpy(encoded resident PQ code)");
+    check_cuda(cudaMemcpy(encoded_dynamic_route_code.data(),
+                          dynamic_route_pq_codes_device,
+                          encoded_dynamic_route_code.size(),
+                          cudaMemcpyDeviceToHost),
+               "cudaMemcpy(dynamic route PQ code)");
+    check_cuda(cudaMemcpy(&dynamic_route_slot_host,
+                          dynamic_route_slots_device,
+                          sizeof(dynamic_route_slot_host),
+                          cudaMemcpyDeviceToHost),
+               "cudaMemcpy(dynamic route slot)");
     bool override_found = false;
     bool remote_found = false;
     bool resident_pq_found = false;
@@ -780,18 +980,34 @@ int main(int argc, char** argv) {
         delta_records_host[0].superseded_epoch != 2 ||
         encoded_delta_code != expected_delta_code ||
         encoded_resident_pq_code != expected_delta_code ||
+        encoded_dynamic_route_code != expected_delta_code ||
         !override_found || !remote_found || !resident_pq_found ||
         resident_pq_positions_host[0] >= 4 ||
+        dynamic_route_slot_host.sequence != 2 ||
+        dynamic_route_slot_host.command_id != 99 ||
+        dynamic_route_slot_host.epoch != 2 ||
+        dynamic_route_slot_host.remote_node != 222 ||
+        dynamic_route_slot_host.id != 7 ||
+        dynamic_route_slot_host.generation != 2 ||
+        dynamic_route_slot_host.flags != gpu_search::kDynamicRouteLive ||
         anchor_graph_state_host != 3 ||
         cache_states_host[0] != 2 || cache_states_host[1] != 3 ||
         cache_states_host[2] != 2 || cache_states_host[3] != 2) {
       throw std::runtime_error("persistent delta publication state is invalid");
     }
+    *dynamic_route_update_host = gpu_search::DynamicRouteUpdate{
+      .epoch = 3,
+      .slot = 0,
+      .shard = 0,
+      .id = 7,
+      .generation = 3,
+    };
     const gpu_search::DeltaPublishDescriptor durable_descriptor{
       .command_id = 100,
       .first_slot = 2,
       .final_count = 2,
       .durable_count = 1,
+      .dynamic_route_count = 1,
     };
     while (!delta_submissions.try_push(durable_descriptor)) {
       if (std::chrono::steady_clock::now() >= delta_deadline) {
@@ -816,6 +1032,20 @@ int main(int argc, char** argv) {
         delta_records_host[1].superseded_epoch != delta_records_host[1].epoch ||
         (delta_records_host[0].flags & gpu_search::kDeltaDurable) != 0) {
       throw std::runtime_error("persistent durable delta retirement is invalid");
+    }
+    check_cuda(cudaMemcpy(&dynamic_route_slot_host,
+                          dynamic_route_slots_device,
+                          sizeof(dynamic_route_slot_host),
+                          cudaMemcpyDeviceToHost),
+               "cudaMemcpy(dynamic route tombstone)");
+    if (dynamic_route_slot_host.sequence != 4 ||
+        dynamic_route_slot_host.command_id != 100 ||
+        dynamic_route_slot_host.epoch != 3 ||
+        dynamic_route_slot_host.remote_node != 0 ||
+        dynamic_route_slot_host.id != 7 ||
+        dynamic_route_slot_host.generation != 3 ||
+        dynamic_route_slot_host.flags != 0) {
+      throw std::runtime_error("persistent dynamic route tombstone is invalid");
     }
     check_cuda(cudaMemcpy(&delta_bucket_head_host, delta_bucket_heads_device,
                           sizeof(delta_bucket_head_host), cudaMemcpyDeviceToHost),
@@ -1072,6 +1302,14 @@ int main(int argc, char** argv) {
 
     check_cuda(cudaFree(resident_pq_erase_updates_device),
                "cudaFree(resident PQ erase updates)");
+    check_cuda(cudaFree(dynamic_route_slots_device),
+               "cudaFree(dynamic route slots)");
+    check_cuda(cudaFree(dynamic_route_pq_codes_device),
+               "cudaFree(dynamic route PQ codes)");
+    check_cuda(cudaFreeHost(dynamic_route_code_update_host),
+               "cudaFreeHost(dynamic route code update)");
+    check_cuda(cudaFreeHost(dynamic_route_update_host),
+               "cudaFreeHost(dynamic route update)");
     check_cuda(cudaFree(override_updates_device), "cudaFree(override updates)");
     check_cuda(cudaFree(durable_updates_device), "cudaFree(durable updates)");
     check_cuda(cudaFree(supersede_updates_device), "cudaFree(supersede updates)");

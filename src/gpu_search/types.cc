@@ -39,6 +39,14 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .graph_page_cache_hits = graph_page_cache_hits.load(std::memory_order_relaxed),
     .graph_route_hits = graph_route_hits.load(std::memory_order_relaxed),
     .graph_route_refreshes = graph_route_refreshes.load(std::memory_order_relaxed),
+    .dynamic_route_publications =
+      dynamic_route_publications.load(std::memory_order_relaxed),
+    .dynamic_route_slot_updates =
+      dynamic_route_slot_updates.load(std::memory_order_relaxed),
+    .dynamic_route_live_slots =
+      dynamic_route_live_slots.load(std::memory_order_relaxed),
+    .dynamic_route_snapshot_skips =
+      dynamic_route_snapshot_skips.load(std::memory_order_relaxed),
     .graph_cache_invalidations = graph_cache_invalidations.load(std::memory_order_relaxed),
     .exact_vector_reads = exact_vector_reads.load(std::memory_order_relaxed),
     .exact_vector_cache_hits = exact_vector_cache_hits.load(std::memory_order_relaxed),
@@ -92,6 +100,9 @@ void Telemetry::reset() {
   graph_page_cache_hits.store(0, std::memory_order_relaxed);
   graph_route_hits.store(0, std::memory_order_relaxed);
   graph_route_refreshes.store(0, std::memory_order_relaxed);
+  dynamic_route_publications.store(0, std::memory_order_relaxed);
+  dynamic_route_slot_updates.store(0, std::memory_order_relaxed);
+  dynamic_route_snapshot_skips.store(0, std::memory_order_relaxed);
   graph_cache_invalidations.store(0, std::memory_order_relaxed);
   exact_vector_reads.store(0, std::memory_order_relaxed);
   exact_vector_cache_hits.store(0, std::memory_order_relaxed);

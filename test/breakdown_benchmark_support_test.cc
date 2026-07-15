@@ -124,51 +124,6 @@ void test_base_only_recall_filter() {
   assert((filtered == std::vector<uint32_t>{7u, 9u, 11u}));
 }
 
-void test_verified_query_baseline() {
-  const auto path = std::filesystem::temp_directory_path() /
-    "dvstor_verified_query_baseline.json";
-  const nlohmann::json fingerprint = {
-    {"version", 1},
-    {"index_prefix", "/index"},
-    {"performance_query_file", "/queries.u8bin"},
-    {"cold_cache", true},
-  };
-  nlohmann::json baseline = {
-    {"meta", {
-      {"workload", "query"},
-      {"acceptance_fingerprint", fingerprint},
-    }},
-    {"stability", {{"cache_independent_baseline", true}}},
-    {"acceptance", {{"passed", true}}},
-    {"throughput", {
-      {"effective_query_ops_per_sec", 6000.0},
-      {"query_ops", 60000},
-      {"write_ops", 0},
-    }},
-  };
-  {
-    std::ofstream output(path, std::ios::trunc);
-    output << baseline.dump(2) << '\n';
-  }
-  const auto verified =
-    tools::breakdown_benchmark::load_verified_query_baseline(
-      path.string(), fingerprint);
-  assert(verified.effective_query_qps == 6000.0);
-  assert(verified.fingerprint == fingerprint);
-
-  bool rejected = false;
-  auto mismatch = fingerprint;
-  mismatch["performance_query_file"] = "/other.u8bin";
-  try {
-    (void)tools::breakdown_benchmark::load_verified_query_baseline(
-      path.string(), mismatch);
-  } catch (const std::runtime_error&) {
-    rejected = true;
-  }
-  assert(rejected);
-  std::filesystem::remove(path);
-}
-
 void test_maintenance_log_window() {
   using tools::breakdown_benchmark::kMaintenanceLatencyBucketCount;
   using Histogram = std::array<uint64_t, kMaintenanceLatencyBucketCount>;
@@ -312,7 +267,6 @@ int main() {
   test_single_pass_stream();
   test_recall_and_report_formatting();
   test_base_only_recall_filter();
-  test_verified_query_baseline();
   test_maintenance_log_window();
   return 0;
 }

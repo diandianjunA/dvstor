@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+
 #include "common/types.hh"
 #include "vamana/vamana_node.hh"
 
@@ -63,6 +65,15 @@ struct MutationBatchRequestHeader {
   u64 batch_id{};
 };
 
+// Schema 15 compatibility: anchor_hint_count remains in both request headers
+// at the original byte offset, but this implementation only accepts zero.
+static_assert(sizeof(InsertBatchRequestHeader) == 40);
+static_assert(sizeof(MutationBatchRequestHeader) == 40);
+static_assert(offsetof(InsertBatchRequestHeader, anchor_hint_count) == 28);
+static_assert(offsetof(MutationBatchRequestHeader, anchor_hint_count) == 28);
+static_assert(offsetof(InsertBatchRequestHeader, batch_id) == 32);
+static_assert(offsetof(MutationBatchRequestHeader, batch_id) == 32);
+
 struct InsertBatchResponseHeader {
   u32 magic{kInsertMagic};
   u32 owner_storage{};
@@ -106,10 +117,9 @@ struct InsertBreakdownCounters {
   u64 storage_owner_prune_sort_ns{};
   u64 storage_owner_prune_pair_distance_ns{};
 
-  u64 storage_owner_anchor_hints{};
-  u64 storage_owner_anchor_valid_hints{};
-  u64 storage_owner_anchor_expansions{};
-  u64 storage_owner_anchor_remote_expansions{};
+  // Preserve the schema-15 response size and all following field offsets.
+  // These four words used to carry anchor-hint telemetry and are now ignored.
+  u64 reserved_schema15[4]{};
 
   u64 total() const {
     return storage_owner_queue_wait_ns +
@@ -128,6 +138,9 @@ struct InsertBreakdownCounters {
            storage_owner_response_build_ns;
   }
 };
+
+static_assert(sizeof(InsertBreakdownCounters) == 224);
+static_assert(offsetof(InsertBreakdownCounters, reserved_schema15) == 192);
 
 struct PeerRpcHeader {
   u32 magic{kPeerRpcMagic};
@@ -164,40 +177,17 @@ constexpr size_t align_wire_u64(size_t value) {
 static_assert(align_wire_u64(1) == 8);
 static_assert(align_wire_u64(8) == 8);
 
-inline size_t insert_anchor_offset(u32 item_count) {
-  return align_wire_u64(sizeof(InsertBatchRequestHeader) +
-                        static_cast<size_t>(item_count) * sizeof(node_t) +
-                        static_cast<size_t>(item_count) * VamanaNode::vector_bytes());
+inline size_t insert_batch_request_bytes(u32 item_count) {
+  return sizeof(InsertBatchRequestHeader) +
+         static_cast<size_t>(item_count) * sizeof(node_t) +
+         static_cast<size_t>(item_count) * VamanaNode::vector_bytes();
 }
 
-inline size_t mutation_anchor_offset(u32 item_count) {
-  return align_wire_u64(sizeof(MutationBatchRequestHeader) +
-                        static_cast<size_t>(item_count) * sizeof(u32) +
-                        static_cast<size_t>(item_count) * sizeof(node_t) +
-                        static_cast<size_t>(item_count) * VamanaNode::vector_bytes());
-}
-
-inline size_t insert_batch_request_bytes(u32 item_count, u32 dim, u32 anchor_hint_count = 0) {
-  (void)dim;
-  const size_t vector_end = sizeof(InsertBatchRequestHeader) +
-                            static_cast<size_t>(item_count) * sizeof(node_t) +
-                            static_cast<size_t>(item_count) * VamanaNode::vector_bytes();
-  return anchor_hint_count == 0
-    ? vector_end
-    : insert_anchor_offset(item_count) +
-        static_cast<size_t>(item_count) * anchor_hint_count * sizeof(u64);
-}
-
-inline size_t mutation_batch_request_bytes(u32 item_count, u32 dim, u32 anchor_hint_count = 0) {
-  (void)dim;
-  const size_t vector_end = sizeof(MutationBatchRequestHeader) +
-                            static_cast<size_t>(item_count) * sizeof(u32) +
-                            static_cast<size_t>(item_count) * sizeof(node_t) +
-                            static_cast<size_t>(item_count) * VamanaNode::vector_bytes();
-  return anchor_hint_count == 0
-    ? vector_end
-    : mutation_anchor_offset(item_count) +
-        static_cast<size_t>(item_count) * anchor_hint_count * sizeof(u64);
+inline size_t mutation_batch_request_bytes(u32 item_count) {
+  return sizeof(MutationBatchRequestHeader) +
+         static_cast<size_t>(item_count) * sizeof(u32) +
+         static_cast<size_t>(item_count) * sizeof(node_t) +
+         static_cast<size_t>(item_count) * VamanaNode::vector_bytes();
 }
 
 inline size_t insert_batch_response_bytes(u32 item_count) {
@@ -257,28 +247,6 @@ inline byte_t* request_vector(void* payload, u32 item_count, u32 index) {
 
 inline const byte_t* request_vector(const void* payload, u32 item_count, u32 index) {
   return request_vectors(payload, item_count) + static_cast<size_t>(index) * VamanaNode::vector_bytes();
-}
-
-inline u64* request_anchor_hints(void* payload, u32 item_count) {
-  if (reinterpret_cast<InsertBatchRequestHeader*>(payload)->anchor_hint_count == 0) return nullptr;
-  return reinterpret_cast<u64*>(reinterpret_cast<byte_t*>(payload) + insert_anchor_offset(item_count));
-}
-
-inline const u64* request_anchor_hints(const void* payload, u32 item_count) {
-  if (reinterpret_cast<const InsertBatchRequestHeader*>(payload)->anchor_hint_count == 0) return nullptr;
-  return reinterpret_cast<const u64*>(reinterpret_cast<const byte_t*>(payload) +
-                                      insert_anchor_offset(item_count));
-}
-
-inline u64* mutation_request_anchor_hints(void* payload, u32 item_count) {
-  if (reinterpret_cast<MutationBatchRequestHeader*>(payload)->anchor_hint_count == 0) return nullptr;
-  return reinterpret_cast<u64*>(reinterpret_cast<byte_t*>(payload) + mutation_anchor_offset(item_count));
-}
-
-inline const u64* mutation_request_anchor_hints(const void* payload, u32 item_count) {
-  if (reinterpret_cast<const MutationBatchRequestHeader*>(payload)->anchor_hint_count == 0) return nullptr;
-  return reinterpret_cast<const u64*>(reinterpret_cast<const byte_t*>(payload) +
-                                      mutation_anchor_offset(item_count));
 }
 
 inline u32* response_statuses(void* payload) {

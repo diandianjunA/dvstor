@@ -43,6 +43,13 @@ class DeltaCoordinator {
 public:
   u64 reserve_epoch();
   bool publish(std::vector<DeltaMutation> mutations, u64 epoch);
+  // The synchronous GPU publication path owns reusable per-RPC mutation
+  // buffers. Persist only coordinator metadata so those vector buffers remain
+  // with their RPC slot and can be reused without another allocation.
+  bool publish_metadata(std::span<DeltaMutation> mutations, u64 epoch);
+  // Route-only GPU publications still need to become visible at one ordered
+  // query snapshot, but they must not create a synthetic mutation/delta row.
+  void publish_barrier(u64 epoch);
 
   u64 published_epoch() const;
   size_t delta_size() const;
@@ -52,6 +59,10 @@ public:
     size_t max_items = std::numeric_limits<size_t>::max());
 
 private:
+  bool publish_impl(std::span<DeltaMutation> mutations,
+                    u64 epoch,
+                    bool retain_vectors);
+
   struct DurableCandidate {
     u64 maintenance_sequence{};
     u64 epoch{};

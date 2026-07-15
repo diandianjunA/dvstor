@@ -1,8 +1,11 @@
 #include "memory_node/storage_owner_index/detail.hh"
 #include "memory_node/storage_owner_index/reverse_batch_policy.hh"
+#include "memory_node/storage_owner_index/robust_prune_policy.hh"
 
 using memory_node_storage_owner_index_detail::
   select_fresh_reverse_candidates_locked;
+using memory_node_storage_owner_index_detail::
+  select_alpha_robust_pruned_sorted;
 
 namespace {
 
@@ -10,6 +13,13 @@ struct PendingReverseUpdate {
   RemotePtr target;
   vec<RemotePtr> candidates;
   vec<RemotePtr> current_neighbors;
+  vec<RemotePtr> selected_neighbors;
+};
+
+struct ScoredReverseCandidate {
+  RemotePtr rptr;
+  const byte_t* vector{};
+  distance_t distance{};
 };
 
 bool same_neighbors(const vec<RemotePtr>& lhs, const vec<RemotePtr>& rhs) {
@@ -50,7 +60,7 @@ bool MemoryNode::apply_local_reverse_updates_batched(
   std::sort(target_raws.begin(), target_raws.end());
 
   vec<PendingReverseUpdate> pending;
-  vec<RemotePtr> remote_snapshots_needed;
+  vec<RemotePtr> snapshots_needed;
   dense_hashmap_t<u64, vec<RemotePtr>> conflicted;
   pending.reserve(target_raws.size());
 
@@ -109,13 +119,13 @@ bool MemoryNode::apply_local_reverse_updates_batched(
     update.candidates = std::move(filtered_candidates);
     update.current_neighbors = std::move(current_neighbors);
     for (const RemotePtr& neighbor : update.current_neighbors) {
-      if (!neighbor.is_null() && !local_shard(neighbor.memory_node())) {
-        remote_snapshots_needed.push_back(neighbor);
+      if (!neighbor.is_null()) {
+        snapshots_needed.push_back(neighbor);
       }
     }
     for (const RemotePtr& candidate : update.candidates) {
-      if (!candidate.is_null() && !local_shard(candidate.memory_node())) {
-        remote_snapshots_needed.push_back(candidate);
+      if (!candidate.is_null()) {
+        snapshots_needed.push_back(candidate);
       }
     }
     pending.push_back(std::move(update));
@@ -125,38 +135,104 @@ bool MemoryNode::apply_local_reverse_updates_batched(
     return true;
   }
 
-  std::sort(remote_snapshots_needed.begin(), remote_snapshots_needed.end(),
+  std::sort(snapshots_needed.begin(), snapshots_needed.end(),
             [](const RemotePtr& lhs, const RemotePtr& rhs) {
               return lhs.raw_address < rhs.raw_address;
             });
-  remote_snapshots_needed.erase(
-    std::unique(remote_snapshots_needed.begin(), remote_snapshots_needed.end()),
-    remote_snapshots_needed.end());
-  vec<NodeSnapshot> remote_snapshots =
-    read_node_snapshots_batched(remote_snapshots_needed, config);
+  snapshots_needed.erase(
+    std::unique(snapshots_needed.begin(), snapshots_needed.end()),
+    snapshots_needed.end());
+  // Snapshot all vectors before reacquiring any target lock.  The final
+  // locked pass only needs its narrow liveness-boundary header checks; bulk
+  // remote vector reads and alpha pruning stay outside the critical section.
+  vec<NodeSnapshot> snapshots =
+    read_node_snapshots_batched(snapshots_needed, config);
   dense_hashmap_t<u64, size_t> snapshot_index;
-  snapshot_index.reserve(remote_snapshots.size());
-  for (size_t index = 0; index < remote_snapshots.size(); ++index) {
-    snapshot_index[remote_snapshots[index].rptr.raw_address] = index;
+  snapshot_index.reserve(snapshots.size());
+  for (size_t index = 0; index < snapshots.size(); ++index) {
+    snapshot_index[snapshots[index].rptr.raw_address] = index;
   }
 
-  auto vector_for = [&](const RemotePtr& pointer) -> const byte_t* {
-    if (local_shard(pointer.memory_node())) {
-      if (!storage_owner_node_live(pointer)) {
-        return nullptr;
+  vec<ScoredReverseCandidate> scored;
+  vec<size_t> selected_indices;
+  const auto robust_prune_cached = [&](const RemotePtr target,
+                                       const vec<RemotePtr>& current_neighbors,
+                                       const vec<RemotePtr>& fresh_candidates,
+                                       vec<RemotePtr>& selected) {
+    const auto target_vector_address =
+      vamana::StorageLayoutResolver::vector(target);
+    lib_assert(target_vector_address.offset + target_vector_address.size <=
+                 mn_memory_bytes_,
+               "batched reverse-update target vector exceeds shard bounds");
+    const byte_t* target_vector =
+      index_buffer_.get_full_buffer() + target_vector_address.offset;
+
+    scored.clear();
+    scored.reserve(current_neighbors.size() + fresh_candidates.size());
+    const auto score = [&](const RemotePtr pointer) {
+      if (pointer.is_null() || pointer == target ||
+          std::find_if(scored.begin(), scored.end(),
+                       [&](const ScoredReverseCandidate& candidate) {
+                         return candidate.rptr == pointer;
+                       }) != scored.end()) {
+        return;
       }
-      const auto address = vamana::StorageLayoutResolver::vector(pointer);
-      lib_assert(address.offset + address.size <= mn_memory_bytes_,
-                 "batched reverse-update local vector exceeds shard bounds");
-      return index_buffer_.get_full_buffer() + address.offset;
+      const auto iterator = snapshot_index.find(pointer.raw_address);
+      if (iterator == snapshot_index.end()) {
+        return;
+      }
+      const NodeSnapshot& snapshot = snapshots[iterator->second];
+      if (snapshot.deleted ||
+          snapshot.vector_data.size() < VamanaNode::vector_bytes()) {
+        return;
+      }
+      scored.push_back({
+        pointer,
+        snapshot.vector_data.data(),
+        distance_between_vectors(
+          target_vector, VamanaNode::vector_dtype(),
+          snapshot.vector_data.data(), VamanaNode::vector_dtype(), config)});
+    };
+    for (const RemotePtr neighbor : current_neighbors) {
+      score(neighbor);
     }
-    const auto iterator = snapshot_index.find(pointer.raw_address);
-    if (iterator == snapshot_index.end()) {
-      return nullptr;
+    for (const RemotePtr candidate : fresh_candidates) {
+      score(candidate);
     }
-    const NodeSnapshot& snapshot = remote_snapshots[iterator->second];
-    return snapshot.deleted ? nullptr : snapshot.vector_data.data();
+    std::sort(scored.begin(), scored.end(),
+              [](const ScoredReverseCandidate& lhs,
+                 const ScoredReverseCandidate& rhs) {
+                return lhs.distance < rhs.distance;
+              });
+    select_alpha_robust_pruned_sorted(
+      span<const ScoredReverseCandidate>{scored.data(), scored.size()},
+      config.R,
+      config.alpha,
+      [](const ScoredReverseCandidate& candidate) {
+        return candidate.rptr;
+      },
+      [](const ScoredReverseCandidate& candidate) {
+        return candidate.distance;
+      },
+      [&](const ScoredReverseCandidate& candidate,
+          const ScoredReverseCandidate& retained) {
+        return distance_between_vectors(
+          candidate.vector, VamanaNode::vector_dtype(),
+          retained.vector, VamanaNode::vector_dtype(), config);
+      },
+      selected,
+      selected_indices);
   };
+
+  // Compute the common-case result without holding target locks.  If a
+  // candidate dies before the final write boundary, the locked pass below
+  // recomputes from the cached snapshots after removing it.
+  for (PendingReverseUpdate& update : pending) {
+    robust_prune_cached(update.target,
+                        update.current_neighbors,
+                        update.candidates,
+                        update.selected_neighbors);
+  }
 
   for (PendingReverseUpdate& update : pending) {
     lock_node(update.target);
@@ -185,53 +261,13 @@ bool MemoryNode::apply_local_reverse_updates_batched(
       unlock_node(update.target);
       continue;
     }
-
-    const auto target_vector_address =
-      vamana::StorageLayoutResolver::vector(update.target);
-    lib_assert(target_vector_address.offset + target_vector_address.size <= mn_memory_bytes_,
-               "batched reverse-update target vector exceeds shard bounds");
-    const byte_t* target_vector =
-      index_buffer_.get_full_buffer() + target_vector_address.offset;
-    vec<RemotePtr> selected;
-    vec<distance_t> selected_distances;
-    selected.reserve(config.R);
-    selected_distances.reserve(config.R);
-
-    auto retain_nearest = [&](const RemotePtr& pointer) {
-      const byte_t* vector = vector_for(pointer);
-      if (pointer.is_null() || vector == nullptr) {
-        return;
-      }
-      const distance_t distance = distance_between_vectors(
-        target_vector,
-        VamanaNode::vector_dtype(),
-        vector,
-        VamanaNode::vector_dtype(),
-        config);
-      if (selected.size() < config.R) {
-        selected.push_back(pointer);
-        selected_distances.push_back(distance);
-        return;
-      }
-      size_t farthest_index = 0;
-      for (size_t index = 1; index < selected_distances.size(); ++index) {
-        if (selected_distances[index] > selected_distances[farthest_index]) {
-          farthest_index = index;
-        }
-      }
-      if (distance < selected_distances[farthest_index]) {
-        selected[farthest_index] = pointer;
-        selected_distances[farthest_index] = distance;
-      }
-    };
-
-    for (const RemotePtr& neighbor : update.current_neighbors) {
-      retain_nearest(neighbor);
+    if (!same_neighbors(fresh_candidates, update.candidates)) {
+      robust_prune_cached(update.target,
+                          observed_neighbors,
+                          fresh_candidates,
+                          update.selected_neighbors);
     }
-    for (const RemotePtr& candidate : fresh_candidates) {
-      retain_nearest(candidate);
-    }
-    write_neighbor_list(update.target, selected);
+    write_neighbor_list(update.target, update.selected_neighbors);
     unlock_node(update.target);
   }
 

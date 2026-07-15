@@ -36,20 +36,23 @@ ComputeService::ComputeService(const Configuration& config)
   service::index_metadata::Metadata metadata;
   lib_assert(service::index_metadata::load_metadata(
                startup_prefix, metadata, &metadata_error), metadata_error);
-  lib_assert(base_owner_map_.load(startup_prefix, num_servers_,
-                                  metadata.idmap_format, &metadata_error),
-             metadata_error);
-  print_status("storage-owner base idmap: entries=" +
-               std::to_string(base_owner_map_.entry_count()) + " memory=" +
-               std::to_string(base_owner_map_.memory_bytes()) + " bytes");
-  anchor_index_ = std::make_unique<vamana::anchor::Index>();
-  str anchor_error;
-  lib_assert(metadata.anchor_format == "owner_anchor_v1" &&
-               anchor_index_->load(startup_prefix, config_.dim, num_servers_, &anchor_error),
-             "storage-owner anchor sidecar unavailable: " + anchor_error);
-  print_status("storage-owner anchors: entries=" +
-               std::to_string(anchor_index_->anchor_count()) + " memory=" +
-               std::to_string(anchor_index_->memory_bytes()) + " bytes");
+  if (config_.enable_updates) {
+    lib_assert(base_owner_map_.load(startup_prefix, num_servers_,
+                                    metadata.idmap_format, &metadata_error),
+               metadata_error);
+    print_status("storage-owner base idmap: entries=" +
+                 std::to_string(base_owner_map_.entry_count()) + " memory=" +
+                 std::to_string(base_owner_map_.memory_bytes()) + " bytes");
+    // Logical-ID placement must be identical on every compute node. Dynamic
+    // routes are intentionally used for graph/search entry selection, not for
+    // authoritative identity ownership; otherwise independently evolving
+    // compute-local centers could create the same generation on two owners.
+    print_status(
+      "storage-owner placement: base idmap for existing IDs; "
+      "deterministic ID shard for new IDs");
+  } else {
+    print_status("compute updates disabled: owner idmaps and update executor are not loaded");
+  }
 
   const cudaError_t cuda_status = cudaSetDevice(static_cast<int>(config_.gpu_device));
   lib_assert(cuda_status == cudaSuccess,
@@ -65,12 +68,12 @@ ComputeService::ComputeService(const Configuration& config)
   cm_.synchronize();
   start_storage_nodes();
   synchronize_clients_after_startup();
-  start_storage_insert_runtime();
+  if (config_.enable_updates) start_storage_insert_runtime();
 }
 
 ComputeService::~ComputeService() {
-  stop_storage_insert_runtime();
+  if (config_.enable_updates) stop_storage_insert_runtime();
   persistent_search_.reset();
   cm_.server_qps.clear();
-  release_storage_insert_runtime();
+  if (config_.enable_updates) release_storage_insert_runtime();
 }

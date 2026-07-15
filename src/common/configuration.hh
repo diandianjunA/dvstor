@@ -56,6 +56,10 @@ public:
   u32 gpu_delta_anchor_probes{32};
   u32 gpu_rdma_qps{4};
   u32 gpu_persistent_blocks_per_sm{4};
+  // Compute-side mutation support is optional for query-only deployments.
+  // Keep it enabled by default so existing service configurations preserve
+  // their insert/upsert/erase behavior.
+  bool enable_updates{true};
   u32 update_visibility_us{10'000};
   u32 delta_budget_mb{256};
   u32 gpu_delta_maintenance_period_ms{10};
@@ -64,25 +68,16 @@ public:
   vec<str> storage_peers;
   u32 storage_owner_coroutines{4};
   u32 storage_owner_batch_max{16};
-  u32 storage_owner_batch_wait_us{250};
   u32 storage_owner_peer_rdma_tokens{8};
   u32 storage_owner_rpc_depth{8};
   u32 storage_owner_rpc_timeout_ms{30'000};
-  u32 storage_owner_construction_beam_width{128};
   u32 storage_owner_search_snapshot_batch{64};
-  u32 storage_owner_prune_max_candidates{128};
   str storage_owner_update_mode{"exact"};
-  u32 storage_owner_anchor_hints{4};
-  u32 storage_owner_anchor_beam_width{64};
-  u32 storage_owner_anchor_expand_cap{16};
-  u32 storage_owner_anchor_remote_rescue_cap{4};
-  bool storage_owner_local_stitch_sync_fast_path{true};
   str storage_owner_maintenance_mode{"off"};
   u32 storage_owner_maintenance_workers{};
   u32 storage_owner_maintenance_queue_depth{65'536};
   str storage_owner_reverse_mode{"async"};
   u32 storage_owner_reverse_queue_depth{65'536};
-  u32 storage_owner_reverse_flush_us{200};
   u32 storage_owner_reverse_coalesce_max{256};
 
   u32 mn_memory_gb{10};
@@ -105,6 +100,10 @@ public:
   VectorDType resolved_vector_dtype() const {
     return vector_data_type == "auto"
       ? VectorDType::float32 : parse_vector_dtype(vector_data_type);
+  }
+
+  u32 resolved_storage_owner_construction_width() const {
+    return beam_width_construction;
   }
 
 private:
@@ -205,6 +204,9 @@ private:
       ("gpu-persistent-blocks-per-sm",
        po::value<u32>(&gpu_persistent_blocks_per_sm)->default_value(gpu_persistent_blocks_per_sm),
        "Persistent query blocks launched per GPU SM.")
+      ("enable-updates",
+       po::value<bool>(&enable_updates)->default_value(enable_updates),
+       "Enable compute-side insert, upsert, and erase submission.")
       ("update-visibility-us",
        po::value<u32>(&update_visibility_us)->default_value(update_visibility_us),
        "Maximum update publication delay to the GPU delta.")
@@ -226,9 +228,6 @@ private:
       ("storage-owner-batch-max",
        po::value<u32>(&storage_owner_batch_max)->default_value(storage_owner_batch_max),
        "Maximum mutations in one storage RPC batch.")
-      ("storage-owner-batch-wait-us",
-       po::value<u32>(&storage_owner_batch_wait_us)->default_value(storage_owner_batch_wait_us),
-       "Maximum mutation micro-batch wait.")
       ("storage-owner-peer-rdma-tokens",
        po::value<u32>(&storage_owner_peer_rdma_tokens)->default_value(storage_owner_peer_rdma_tokens),
        "Outstanding peer reads allowed per storage data QP.")
@@ -238,42 +237,14 @@ private:
       ("storage-owner-rpc-timeout-ms",
        po::value<u32>(&storage_owner_rpc_timeout_ms)->default_value(storage_owner_rpc_timeout_ms),
        "Mutation RPC timeout.")
-      ("storage-owner-construction-beam-width",
-       po::value<u32>(&storage_owner_construction_beam_width)
-         ->default_value(storage_owner_construction_beam_width),
-       "Storage-side online construction beam.")
       ("storage-owner-search-snapshot-batch",
        po::value<u32>(&storage_owner_search_snapshot_batch)
          ->default_value(storage_owner_search_snapshot_batch),
        "Concurrent node snapshots during update search.")
-      ("storage-owner-prune-max-candidates",
-       po::value<u32>(&storage_owner_prune_max_candidates)
-         ->default_value(storage_owner_prune_max_candidates),
-       "Maximum RobustPrune candidates.")
       ("storage-owner-update-mode",
        po::value<str>(&storage_owner_update_mode)
          ->default_value(storage_owner_update_mode),
        "Dynamic graph update strategy: exact or local_stitch.")
-      ("storage-owner-anchor-hints",
-       po::value<u32>(&storage_owner_anchor_hints)
-         ->default_value(storage_owner_anchor_hints),
-       "Anchor hints attached to each mutation.")
-      ("storage-owner-anchor-beam-width",
-       po::value<u32>(&storage_owner_anchor_beam_width)
-         ->default_value(storage_owner_anchor_beam_width),
-       "Foreground local-stitch beam width.")
-      ("storage-owner-anchor-expand-cap",
-       po::value<u32>(&storage_owner_anchor_expand_cap)
-         ->default_value(storage_owner_anchor_expand_cap),
-       "Foreground local-stitch expansion cap.")
-      ("storage-owner-anchor-remote-rescue-cap",
-       po::value<u32>(&storage_owner_anchor_remote_rescue_cap)
-         ->default_value(storage_owner_anchor_remote_rescue_cap),
-       "Foreground local-stitch remote rescue cap.")
-      ("storage-owner-local-stitch-sync-fast-path",
-       po::value<bool>(&storage_owner_local_stitch_sync_fast_path)
-         ->default_value(storage_owner_local_stitch_sync_fast_path),
-       "Use synchronous worker-local foreground stitching.")
       ("storage-owner-maintenance-mode",
        po::value<str>(&storage_owner_maintenance_mode)
          ->default_value(storage_owner_maintenance_mode),
@@ -294,10 +265,6 @@ private:
        po::value<u32>(&storage_owner_reverse_queue_depth)
          ->default_value(storage_owner_reverse_queue_depth),
        "Maximum queued reverse updates.")
-      ("storage-owner-reverse-flush-us",
-       po::value<u32>(&storage_owner_reverse_flush_us)
-         ->default_value(storage_owner_reverse_flush_us),
-       "Reverse-update coalescing wait.")
       ("storage-owner-reverse-coalesce-max",
        po::value<u32>(&storage_owner_reverse_coalesce_max)
          ->default_value(storage_owner_reverse_coalesce_max),
@@ -383,11 +350,12 @@ private:
       fail("--storage-owner-maintenance-mode must be off or finalize");
     }
     if (storage_owner_update_mode == "local_stitch" &&
-        (storage_owner_anchor_hints == 0 ||
-         storage_owner_anchor_beam_width == 0 ||
-         storage_owner_anchor_expand_cap == 0 ||
-         storage_owner_maintenance_mode != "finalize")) {
-      fail("local_stitch requires anchors and finalize maintenance");
+        storage_owner_maintenance_mode != "finalize") {
+      fail("local_stitch requires finalize maintenance");
+    }
+    if (storage_owner_maintenance_mode == "finalize" &&
+        storage_owner_update_mode != "local_stitch") {
+      fail("finalize maintenance is the stage2 of local_stitch updates");
     }
     if (storage_owner_maintenance_mode == "finalize" &&
         storage_owner_maintenance_workers == 0) {
@@ -450,6 +418,8 @@ public:
              << config.gpu_rdma_qps << '\n';
       output << std::setw(width) << "GPU persistent blocks/SM: "
              << config.gpu_persistent_blocks_per_sm << '\n';
+      output << std::setw(width) << "compute updates enabled: "
+             << std::boolalpha << config.enable_updates << '\n';
       output << std::setw(width) << "update visibility us: "
              << config.update_visibility_us << '\n';
       output << std::setw(width) << "storage update mode: "

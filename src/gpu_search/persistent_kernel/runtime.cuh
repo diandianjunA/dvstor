@@ -104,6 +104,7 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
                        delta_descriptor.override_count != 0 ||
                        delta_descriptor.durable_count != 0 ||
                        delta_descriptor.resident_pq_erase_count != 0 ||
+                       delta_descriptor.dynamic_route_count != 0 ||
                        params.delta_records == nullptr ||
                        params.delta_next == nullptr ||
                        params.delta_prev == nullptr ||
@@ -144,6 +145,15 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
               params.resident_pq_positions == nullptr ||
               params.resident_pq_capacity == 0 ||
               params.resident_pq_table_capacity == 0)) ||
+            (delta_descriptor.dynamic_route_count != 0 &&
+             (params.dynamic_route_updates == nullptr ||
+              params.dynamic_route_code_updates == nullptr ||
+              params.dynamic_route_slots == nullptr ||
+              params.dynamic_route_pq_codes == nullptr ||
+              params.pq_code_bytes == 0 ||
+              params.dynamic_route_capacity == 0 ||
+              delta_descriptor.dynamic_route_count >
+                params.dynamic_route_capacity)) ||
             (promote && delta_descriptor.override_count != 0 &&
              (params.delta_override_updates == nullptr ||
               params.permanent_override_bits == nullptr ||
@@ -225,6 +235,46 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
           const u32 slot = params.delta_staging_slots[index];
           if (slot >= delta_descriptor.final_count || slot >= params.delta_capacity) {
             atomicExch(&delta_status, -EINVAL);
+          }
+        }
+        __syncthreads();
+      }
+
+      if (delta_status == 0) {
+        for (u32 index = threadIdx.x;
+             index < delta_descriptor.dynamic_route_count;
+             index += blockDim.x) {
+          const DynamicRouteUpdate update =
+            params.dynamic_route_updates[index];
+          const bool live = (update.flags & kDynamicRouteLive) != 0;
+          bool duplicate_slot = false;
+          for (u32 prior = 0; prior < index; ++prior) {
+            duplicate_slot = duplicate_slot ||
+              params.dynamic_route_updates[prior].slot == update.slot;
+          }
+          if (update.slot >= params.dynamic_route_capacity ||
+              update.shard >= params.num_shards ||
+              update.epoch == 0 ||
+              update.slot / kDynamicRouteSlotsPerShard != update.shard ||
+              (update.flags & ~kDynamicRouteLive) != 0 ||
+              (live &&
+               (update.remote_node == 0 ||
+                static_cast<u32>(update.remote_node >> 48) != update.shard)) ||
+              (!live && update.remote_node != 0) || duplicate_slot) {
+            atomicExch(&delta_status, -EINVAL);
+            continue;
+          }
+          const DeviceDynamicRouteSlot& current =
+            params.dynamic_route_slots[update.slot];
+          const u64 current_command =
+            dynamic_route_atomic_load(current.command_id);
+          const u32 current_id = dynamic_route_atomic_load(current.id);
+          const u32 current_generation =
+            dynamic_route_atomic_load(current.generation);
+          if (current_command >= delta_descriptor.command_id ||
+              (current_id == update.id &&
+               current_generation > update.generation)) {
+            atomicExch(&delta_status, -ESTALE);
           }
         }
         __syncthreads();
@@ -544,6 +594,65 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
               params.delta_bucket_heads[record.anchor_bucket] = slot;
             }
           }
+        }
+      }
+      __syncthreads();
+      if (delta_status == 0) {
+        // Canonical storage-route codes become visible before a route slot can
+        // point at them. Mark every changing slot odd before touching either
+        // its code or metadata; query scoring rechecks the same sequence after
+        // consuming both.
+        for (u32 index = threadIdx.x;
+             index < delta_descriptor.dynamic_route_count;
+             index += blockDim.x) {
+          const DynamicRouteUpdate update =
+            params.dynamic_route_updates[index];
+          DeviceDynamicRouteSlot& destination =
+            params.dynamic_route_slots[update.slot];
+          cuda::atomic_ref<u64, cuda::thread_scope_device> sequence(
+            destination.sequence);
+          sequence.fetch_add(1, cuda::memory_order_acq_rel);
+        }
+        __syncthreads();
+        for (u64 byte = threadIdx.x;
+             byte < static_cast<u64>(delta_descriptor.dynamic_route_count) *
+                      params.pq_code_bytes;
+             byte += blockDim.x) {
+          const u32 update_index = static_cast<u32>(
+            byte / params.pq_code_bytes);
+          const u32 code_byte = static_cast<u32>(
+            byte % params.pq_code_bytes);
+          const DynamicRouteUpdate update =
+            params.dynamic_route_updates[update_index];
+          if ((update.flags & kDynamicRouteLive) != 0) {
+            params.dynamic_route_pq_codes[
+              static_cast<size_t>(update.slot) * params.pq_code_bytes +
+              code_byte] = params.dynamic_route_code_updates[byte];
+          }
+        }
+        __threadfence();
+        __syncthreads();
+        for (u32 index = threadIdx.x;
+             index < delta_descriptor.dynamic_route_count;
+             index += blockDim.x) {
+          const DynamicRouteUpdate update =
+            params.dynamic_route_updates[index];
+          DeviceDynamicRouteSlot& destination =
+            params.dynamic_route_slots[update.slot];
+          cuda::atomic_ref<u64, cuda::thread_scope_device> sequence(
+            destination.sequence);
+          dynamic_route_atomic_store(
+            destination.command_id, delta_descriptor.command_id);
+          dynamic_route_atomic_store(destination.epoch, update.epoch);
+          dynamic_route_atomic_store(
+            destination.remote_node, update.remote_node);
+          dynamic_route_atomic_store(destination.id, update.id);
+          dynamic_route_atomic_store(
+            destination.generation, update.generation);
+          dynamic_route_atomic_store(destination.shard, update.shard);
+          dynamic_route_atomic_store(destination.flags, update.flags);
+          __threadfence();
+          sequence.fetch_add(1, cuda::memory_order_release);
         }
       }
       __syncthreads();

@@ -7,8 +7,18 @@ source "$SCRIPT_DIR/common.sh"
 PROFILE="${1:-${PROFILE:-04_gpu_persistent_gpunetio}}"
 load_experiment_profile "$PROFILE"
 
+# Offline OPQ/PQ construction settings. They are deliberately kept here rather
+# than in the online GPUNetIO profile: changing any of them requires rebuilding
+# the schema-15 index and has no effect on an already-built index at runtime.
+PQ_TRAIN_SAMPLES="${PQ_TRAIN_SAMPLES:-262144}"
+PQ_OPQ_ITERATIONS="${PQ_OPQ_ITERATIONS:-20}"
+PQ_ITERATIONS="${PQ_ITERATIONS:-25}"
+PQ_ENCODE_CHUNK_VECTORS="${PQ_ENCODE_CHUNK_VECTORS:-32768}"
+PQ_THREADS="${PQ_THREADS:-32}"
+GPU_ENTRY_POINTS="${GPU_ENTRY_POINTS:-256}"
+
 ensure_built vamana_offline_builder vamana_pq_indexer
-"$EXPERIMENT_DIR/prepare_sift100m_data.sh"
+PREPARE_BENCHMARK_DATA=0 "$EXPERIMENT_DIR/prepare_sift100m_data.sh"
 
 mkdir -p "$(dirname "$INDEX_PREFIX")"
 LOG_FILE="${BUILD_LOG:-$LOG_DIR/build_${PARTITION_STRATEGY}_$(date +%Y%m%d_%H%M%S).log}"
@@ -58,12 +68,12 @@ builder=("$BUILD_DIR/vamana_offline_builder"
 pq=("$BUILD_DIR/vamana_pq_indexer"
   --index-prefix "$INDEX_PREFIX"
   --subquantizers "${PQ_SUBQUANTIZERS:-32}"
-  --train-samples "${PQ_TRAIN_SAMPLES:-262144}"
-  --opq-iterations "${PQ_OPQ_ITERATIONS:-20}"
-  --pq-iterations "${PQ_ITERATIONS:-25}"
-  --chunk-vectors "${PQ_ENCODE_CHUNK_VECTORS:-32768}"
-  --entry-points "${GPU_ENTRY_POINTS:-256}"
-  --threads "${PQ_THREADS:-32}"
+  --train-samples "$PQ_TRAIN_SAMPLES"
+  --opq-iterations "$PQ_OPQ_ITERATIONS"
+  --pq-iterations "$PQ_ITERATIONS"
+  --chunk-vectors "$PQ_ENCODE_CHUNK_VECTORS"
+  --entry-points "$GPU_ENTRY_POINTS"
+  --threads "$PQ_THREADS"
   --seed "${SEED:-1234}")
 if [[ -n "${PQ_REUSE_MODEL:-}" ]]; then pq+=(--reuse-model "$PQ_REUSE_MODEL"); fi
 if [[ "${OVERWRITE_INDEX:-0}" == "1" ]]; then pq+=(--overwrite); fi
@@ -73,7 +83,7 @@ if [[ "${OVERWRITE_INDEX:-0}" == "1" ]]; then pq+=(--overwrite); fi
   printf '[build] command:'; printf ' %q' "${builder[@]}"; echo
   "${builder[@]}"
   printf '[pq] command:'; printf ' %q' "${pq[@]}"; echo
-  OMP_NUM_THREADS="${PQ_THREADS:-32}" \
+  OMP_NUM_THREADS="$PQ_THREADS" \
   OPENBLAS_NUM_THREADS=1 \
   MKL_NUM_THREADS=1 \
   OMP_DYNAMIC=FALSE \

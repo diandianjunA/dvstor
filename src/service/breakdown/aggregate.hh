@@ -29,7 +29,6 @@ struct Aggregate {
   std::vector<u64> service_latencies_ns;
   std::array<u64, kCategoryCount> category_ns{};
   std::array<u64, kSubcategoryCount> subcategory_ns{};
-  SampleCounters counters{};
 
   [[nodiscard]] u64 cpu_other_ns() const {
     u64 explicit_cpu = 0;
@@ -79,14 +78,6 @@ inline void add_sample(Aggregate& aggregate, const Sample& sample) {
   for (size_t index = 0; index < aggregate.subcategory_ns.size(); ++index) {
     aggregate.subcategory_ns[index] += sample.subcategory_ns[index];
   }
-  const SampleCounters counters = sample.counters();
-  aggregate.counters.storage_owner_anchor_hints += counters.storage_owner_anchor_hints;
-  aggregate.counters.storage_owner_anchor_valid_hints +=
-    counters.storage_owner_anchor_valid_hints;
-  aggregate.counters.storage_owner_anchor_expansions +=
-    counters.storage_owner_anchor_expansions;
-  aggregate.counters.storage_owner_anchor_remote_expansions +=
-    counters.storage_owner_anchor_remote_expansions;
 }
 
 inline double ns_to_ms(u64 nanoseconds) {

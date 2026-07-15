@@ -111,7 +111,7 @@ void PersistentSearchEngine::Impl::stream_codes_to_gpu(NavigationBootstrapper& s
 
 void PersistentSearchEngine::Impl::stream_anchor_graph_to_gpu(NavigationBootstrapper& source) {
   if (anchor_graph_keys_host.empty()) {
-    std::cerr << "[gpu-search] anchor route graph disabled: no anchors\n";
+    std::cerr << "[gpu-search] static fallback route graph disabled\n";
     return;
   }
   constexpr size_t kBootstrapBatch = 4096;
@@ -167,7 +167,7 @@ void PersistentSearchEngine::Impl::stream_anchor_graph_to_gpu(NavigationBootstra
         "anchor route graph audit failed at slot " + std::to_string(slot));
     }
   }
-  std::cerr << "[gpu-search] resident anchor route graph records="
+  std::cerr << "[gpu-search] resident static fallback graph records="
             << anchor_graph_keys_host.size() << " bytes="
             << anchor_graph_keys_host.size() * index.layout.graph_entry_bytes
             << " audit=" << audit_count << '\n';
@@ -378,6 +378,12 @@ PersistentSearchEngine::Impl::~Impl() {
   if (resident_pq_erase_updates_host != nullptr) {
     cudaFreeHost(resident_pq_erase_updates_host);
   }
+  if (dynamic_route_updates_host != nullptr) {
+    cudaFreeHost(dynamic_route_updates_host);
+  }
+  if (dynamic_route_code_updates_host != nullptr) {
+    cudaFreeHost(dynamic_route_code_updates_host);
+  }
   if (delta_supersede_updates_host != nullptr) cudaFreeHost(delta_supersede_updates_host);
   if (graph_invalidation_keys_host != nullptr) cudaFreeHost(graph_invalidation_keys_host);
   if (anchor_graph_validation_host != nullptr) {
@@ -387,6 +393,8 @@ PersistentSearchEngine::Impl::~Impl() {
   device_free(direct_error_device);
   device_free(direct_disabled_device);
   device_free(stop_device);
+  device_free(d_dynamic_route_pq_codes);
+  device_free(d_dynamic_route_slots);
   device_free(d_delta_count);
   device_free(d_direct_batch_statuses);
   device_free(d_direct_batch_queues);

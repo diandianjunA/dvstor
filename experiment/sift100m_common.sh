@@ -35,14 +35,19 @@ MAX_QUERIES="${MAX_QUERIES:-10000}"
 GROUNDTRUTH_LABEL="${GROUNDTRUTH_LABEL:-100M}"
 GROUNDTRUTH_TOPK="${GROUNDTRUTH_TOPK:-10}"
 
-# The first 100M rows remain the indexed base. Performance queries and writes
-# use disjoint held-out ranges so an inserted vector can never become an exact
-# throughput-query hit during the mixed acceptance run.
+# Benchmark input files. These are the only settings normally changed when
+# moving the benchmark to another machine. Source row ranges describe how each
+# pre-generated u8bin was extracted.
 BENCHMARK_VECTOR_SOURCE="${BENCHMARK_VECTOR_SOURCE:-$DATASET_DIR/bigann_base.bvecs}"
+PERFORMANCE_QUERY_FILE="${PERFORMANCE_QUERY_FILE:-$DATASET_DIR/sift100m_to_105m_query.u8bin}"
 PERFORMANCE_QUERY_START="${PERFORMANCE_QUERY_START:-100000000}"
 PERFORMANCE_QUERY_END="${PERFORMANCE_QUERY_END:-105000000}"
-INSERT_VECTOR_START="${INSERT_VECTOR_START:-105000000}"
-INSERT_VECTOR_END="${INSERT_VECTOR_END:-107000000}"
+INSERT_FILE="${INSERT_FILE:-$DATASET_DIR/sift103m_to_105m_insert.u8bin}"
+INSERT_VECTOR_START="${INSERT_VECTOR_START:-103000000}"
+INSERT_VECTOR_END="${INSERT_VECTOR_END:-105000000}"
+
+# The convenient local defaults overlap. The script records the declared ranges
+# but leaves dataset-split choices to the experimenter.
 
 BASE_PORT="${BASE_PORT:-1234}"
 HOSTS="${HOSTS:-192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202}"
@@ -100,8 +105,8 @@ query_suffix() {
 base_bin() { echo "$CONVERTED_DIR/base$(base_suffix).u8bin"; }
 query_bin() { echo "$CONVERTED_DIR/query$(query_suffix).u8bin"; }
 groundtruth_bin() { echo "$CONVERTED_DIR/groundtruth_${GROUNDTRUTH_LABEL}.bin"; }
-insert_bin() { echo "${INSERT_FILE:-$DATASET_DIR/sift105m_to_107m_insert.u8bin}"; }
-performance_query_bin() { echo "${PERFORMANCE_QUERY_FILE:-$DATASET_DIR/sift100m_to_105m_query.u8bin}"; }
+insert_bin() { echo "$INSERT_FILE"; }
+performance_query_bin() { echo "$PERFORMANCE_QUERY_FILE"; }
 metadata_file() { echo "${INDEX_PREFIX}.meta.json"; }
 model_file() { echo "${INDEX_PREFIX}.pq${PQ_SUBQUANTIZERS}"; }
 
@@ -123,7 +128,13 @@ navigation_code_file() {
 validate_index_metadata() {
   local role="${1:-compute}"
   local node_id="${2:-0}"
+  local require_update_sidecars="${3:-true}"
   local metadata
+  if [[ "$require_update_sidecars" != "true" &&
+        "$require_update_sidecars" != "false" ]]; then
+    echo "require_update_sidecars must be true or false: $require_update_sidecars" >&2
+    return 1
+  fi
   metadata="$(metadata_file)"
   if [[ ! -s "$metadata" ]]; then
     echo "missing index metadata: $metadata" >&2
@@ -184,7 +195,7 @@ for key in (
     if not isinstance(value, list) or len(value) != int(shards):
         errors.append(f'{key} must contain one value per storage shard')
 if metadata.get('anchor_format') != 'owner_anchor_v1':
-    errors.append('owner_anchor_v1 sidecar is required for dynamic updates')
+    errors.append('owner_anchor_v1 static query bootstrap format is required')
 dynamic_hot = metadata.get('hot_graph_dynamic_hot_offset', 0)
 graph_entry = metadata.get('hot_graph_entry_size', 0)
 dynamic_code = metadata.get('dynamic_navigation_code_offset', 0)
@@ -200,28 +211,29 @@ if errors:
     raise SystemExit(1)
 PY_VALIDATE
 
-  if [[ ! -s "${INDEX_PREFIX}.anchors" ]]; then
-    echo "missing dynamic-update anchors: ${INDEX_PREFIX}.anchors" >&2
-    return 1
-  fi
-
   if [[ "$role" == "compute" ]]; then
     if [[ ! -s "$(model_file)" ]]; then
       echo "missing OPQ/PQ${PQ_SUBQUANTIZERS} model: $(model_file)" >&2
       return 1
     fi
-    local missing_idmaps=()
-    local current
-    for ((current = 1; current <= SHARDS; ++current)); do
-      if [[ ! -s "$(idmap_file "$current")" ]]; then
-        missing_idmaps+=("$(idmap_file "$current")")
-      fi
-    done
-    if ((${#missing_idmaps[@]} != 0)); then
-      echo "missing compute owner-idmap sidecars:" >&2
-      printf '  - %s\n' "${missing_idmaps[@]}" >&2
-      echo "copy all ${SHARDS} owner idmap sidecars to the resolved index prefix; index rebuild is not required" >&2
+    if [[ ! -s "${INDEX_PREFIX}.anchors" ]]; then
+      echo "missing static query bootstrap routes: ${INDEX_PREFIX}.anchors" >&2
       return 1
+    fi
+    if [[ "$require_update_sidecars" == "true" ]]; then
+      local missing_idmaps=()
+      local current
+      for ((current = 1; current <= SHARDS; ++current)); do
+        if [[ ! -s "$(idmap_file "$current")" ]]; then
+          missing_idmaps+=("$(idmap_file "$current")")
+        fi
+      done
+      if ((${#missing_idmaps[@]} != 0)); then
+        echo "missing compute owner-idmap sidecars:" >&2
+        printf '  - %s\n' "${missing_idmaps[@]}" >&2
+        echo "copy all ${SHARDS} owner idmap sidecars to the resolved index prefix; index rebuild is not required" >&2
+        return 1
+      fi
     fi
   elif [[ "$role" == "storage" ]]; then
     local first=1 last="$SHARDS"
@@ -275,8 +287,13 @@ ensure_built() {
 write_service_config() {
   local output="${1:?output path is required}"
   local endpoints
+  local enable_updates="${ENABLE_UPDATES:-true}"
+  if [[ "$enable_updates" != "true" && "$enable_updates" != "false" ]]; then
+    echo "ENABLE_UPDATES must be true or false: $enable_updates" >&2
+    return 1
+  fi
   endpoints="$(server_endpoints)"
-  validate_index_metadata compute
+  validate_index_metadata compute 0 "$enable_updates"
 
   {
     echo "servers = $endpoints"
@@ -301,18 +318,14 @@ write_service_config() {
     echo "mn-memory = $MN_MEMORY_GB"
     echo "gpu-device = $GPU_DEVICE"
     echo "enable-breakdown = ${ENABLE_BREAKDOWN:-true}"
+    echo "enable-updates = $enable_updates"
     echo "gpu-query-slots = ${GPU_QUERY_SLOTS:-256}"
     echo "gpu-memory-limit-gb = ${GPU_MEMORY_LIMIT_GB:-40}"
     echo "gpu-memory-reserve-gb = ${GPU_MEMORY_RESERVE_GB:-4}"
     echo "gpu-resident-pq-budget-mb = ${GPU_RESIDENT_PQ_BUDGET_MB:-4096}"
-    echo "gpu-adjacency-cache-mb = ${GPU_ADJACENCY_CACHE_MB:-0}"
-    echo "gpu-adjacency-cache-ways = ${GPU_ADJACENCY_CACHE_WAYS:-4}"
-    echo "gpu-exact-cache-mb = ${GPU_EXACT_CACHE_MB:-0}"
-    echo "gpu-exact-cache-ways = ${GPU_EXACT_CACHE_WAYS:-4}"
     echo "gpu-bootstrap-window-mb = ${GPU_BOOTSTRAP_WINDOW_MB:-64}"
     echo "gpu-bootstrap-windows = ${GPU_BOOTSTRAP_WINDOWS:-4}"
     echo "gpu-graph-prefetch-depth = ${GPU_GRAPH_PREFETCH_DEPTH:-32}"
-    echo "gpu-graph-cache-ttl-us = ${GPU_GRAPH_CACHE_TTL_US:-0}"
     echo "gpu-traversal-beam-width = ${GPU_TRAVERSAL_BEAM_WIDTH:-128}"
     echo "gpu-final-rerank-width = ${GPU_FINAL_RERANK_WIDTH:-128}"
     echo "gpu-max-expansions = ${GPU_MAX_EXPANSIONS:-384}"
@@ -325,27 +338,16 @@ write_service_config() {
     echo "gpu-delta-maintenance-period-ms = ${GPU_DELTA_MAINTENANCE_PERIOD_MS:-10}"
     echo "storage-id = 0"
     echo "storage-peers = $endpoints"
-    echo "storage-owner-coroutines = ${STORAGE_OWNER_COROUTINES:-4}"
     echo "storage-owner-batch-max = ${STORAGE_OWNER_BATCH_MAX:-32}"
-    echo "storage-owner-batch-wait-us = ${STORAGE_OWNER_BATCH_WAIT_US:-100}"
     echo "storage-owner-peer-rdma-tokens = ${STORAGE_OWNER_PEER_RDMA_TOKENS:-8}"
     echo "storage-owner-rpc-depth = ${STORAGE_OWNER_RPC_DEPTH:-16}"
     echo "storage-owner-rpc-timeout-ms = ${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}"
-    echo "storage-owner-construction-beam-width = ${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-$BUILD_BEAM}"
     echo "storage-owner-search-snapshot-batch = ${STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH:-64}"
-    echo "storage-owner-prune-max-candidates = ${STORAGE_OWNER_PRUNE_MAX_CANDIDATES:-128}"
     echo "storage-owner-update-mode = ${STORAGE_OWNER_UPDATE_MODE:-local_stitch}"
-    echo "storage-owner-anchor-hints = ${STORAGE_OWNER_ANCHOR_HINTS:-4}"
-    echo "storage-owner-anchor-beam-width = ${STORAGE_OWNER_ANCHOR_BEAM_WIDTH:-64}"
-    echo "storage-owner-anchor-expand-cap = ${STORAGE_OWNER_ANCHOR_EXPAND_CAP:-16}"
-    echo "storage-owner-anchor-remote-rescue-cap = ${STORAGE_OWNER_ANCHOR_REMOTE_RESCUE_CAP:-4}"
-    echo "storage-owner-local-stitch-sync-fast-path = ${STORAGE_OWNER_LOCAL_STITCH_SYNC_FAST_PATH:-false}"
     echo "storage-owner-maintenance-mode = ${STORAGE_OWNER_MAINTENANCE_MODE:-finalize}"
     echo "storage-owner-maintenance-workers = ${STORAGE_OWNER_MAINTENANCE_WORKERS:-8}"
-    echo "storage-owner-maintenance-queue-depth = ${STORAGE_OWNER_MAINTENANCE_QUEUE_DEPTH:-65536}"
     echo "storage-owner-reverse-mode = ${STORAGE_OWNER_REVERSE_MODE:-async}"
     echo "storage-owner-reverse-queue-depth = ${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
-    echo "storage-owner-reverse-flush-us = ${STORAGE_OWNER_REVERSE_FLUSH_US:-200}"
     echo "storage-owner-reverse-coalesce-max = ${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}"
   } > "$output"
 }

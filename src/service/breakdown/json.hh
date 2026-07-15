@@ -54,15 +54,6 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     ? "cpu_query_runtime_overhead_ns" : "cpu_insert_runtime_overhead_ns"] =
       aggregate.cpu_other_ns();
   output["sub_breakdown"] = std::move(subcategories);
-  output["counters"] = {
-    {"storage_owner_anchor_hints", aggregate.counters.storage_owner_anchor_hints},
-    {"storage_owner_anchor_valid_hints",
-     aggregate.counters.storage_owner_anchor_valid_hints},
-    {"storage_owner_anchor_expansions",
-     aggregate.counters.storage_owner_anchor_expansions},
-    {"storage_owner_anchor_remote_expansions",
-     aggregate.counters.storage_owner_anchor_remote_expansions},
-  };
   return output;
 }
 

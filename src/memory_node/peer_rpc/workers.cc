@@ -1,6 +1,9 @@
 #include "memory_node/peer_rpc/detail.hh"
 
 void MemoryNode::peer_rpc_progress_loop() {
+  lib_assert(storage_worker_config_ != nullptr,
+             "peer RPC progress started without storage configuration");
+  const Configuration& config = *storage_worker_config_;
   current_peer_rpc_progress_thread_ = true;
   peer_rpc_progress_running_.store(true, std::memory_order_release);
   vec<ibv_wc> recv_wcs(std::max<i32>(1, peer_context_->get_config().max_recv_queue_wr));
@@ -168,7 +171,8 @@ void MemoryNode::peer_rpc_progress_loop() {
         }
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::stitch_search_response)) {
         const bool valid_response =
-          header->reserved == storage_owner_cross_shard_degree_ &&
+          header->reserved ==
+            config.resolved_storage_owner_construction_width() &&
           bytes >= service::storage_owner::stitch_search_response_bytes(
             header->item_count, header->reserved);
         if (valid_response && peer_async_responses_ != nullptr &&

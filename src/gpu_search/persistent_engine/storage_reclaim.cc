@@ -71,6 +71,199 @@ std::vector<format::StorageControlBlock> PersistentSearchEngine::Impl::read_stor
   return controls;
 }
 
+std::vector<format::StorageRoutePublication>
+PersistentSearchEngine::Impl::read_storage_route_publications() {
+  if (control_bootstrapper == nullptr || index.shards.empty()) return {};
+  std::vector<NavigationRead> requests(index.shards.size());
+  std::vector<i32> before_statuses(index.shards.size(), -EIO);
+  std::vector<i32> body_statuses(index.shards.size(), -EIO);
+  std::vector<i32> after_statuses(index.shards.size(), -EIO);
+  std::vector<format::StorageRoutePublication> publications(
+    index.shards.size());
+  std::vector<u64> sequences_before(index.shards.size());
+  std::vector<u64> sequences_after(index.shards.size());
+  std::string last_error;
+  bool last_failure_was_transient = false;
+  bool saw_nontransient_failure = false;
+  for (u32 attempt = 0; attempt < 2; ++attempt) {
+    last_failure_was_transient = false;
+    for (size_t shard = 0; shard < index.shards.size(); ++shard) {
+      requests[shard] = NavigationRead{
+        .remote_offset = index.shards[shard].control_remote_offset +
+          format::kStorageRoutePublicationOffset +
+          offsetof(format::StorageRoutePublication, sequence_begin),
+        .destination_address = reinterpret_cast<u64>(
+          d_storage_route_sequence_before + shard),
+        .bytes = sizeof(u64),
+        .memory_node = static_cast<u16>(shard),
+      };
+      before_statuses[shard] = -EIO;
+    }
+    control_bootstrapper->read(requests, before_statuses);
+    for (size_t shard = 0; shard < index.shards.size(); ++shard) {
+      requests[shard] = NavigationRead{
+        .remote_offset = index.shards[shard].control_remote_offset +
+          format::kStorageRoutePublicationOffset,
+        .destination_address = reinterpret_cast<u64>(
+          d_storage_route_snapshots + shard),
+        .bytes = sizeof(format::StorageRoutePublication),
+        .memory_node = static_cast<u16>(shard),
+      };
+      body_statuses[shard] = -EIO;
+    }
+    control_bootstrapper->read(requests, body_statuses);
+    for (size_t shard = 0; shard < index.shards.size(); ++shard) {
+      requests[shard] = NavigationRead{
+        .remote_offset = index.shards[shard].control_remote_offset +
+          format::kStorageRoutePublicationOffset +
+          offsetof(format::StorageRoutePublication, sequence_begin),
+        .destination_address = reinterpret_cast<u64>(
+          d_storage_route_sequence_after + shard),
+        .bytes = sizeof(u64),
+        .memory_node = static_cast<u16>(shard),
+      };
+      after_statuses[shard] = -EIO;
+    }
+    control_bootstrapper->read(requests, after_statuses);
+    check_cuda(cudaMemcpy(
+                 publications.data(), d_storage_route_snapshots,
+                 publications.size() * sizeof(format::StorageRoutePublication),
+                 cudaMemcpyDeviceToHost),
+               "cudaMemcpy(storage route publications)");
+    check_cuda(cudaMemcpy(sequences_before.data(),
+                          d_storage_route_sequence_before,
+                          sequences_before.size() * sizeof(u64),
+                          cudaMemcpyDeviceToHost),
+               "cudaMemcpy(storage route sequence before)");
+    check_cuda(cudaMemcpy(sequences_after.data(),
+                          d_storage_route_sequence_after,
+                          sequences_after.size() * sizeof(u64),
+                          cudaMemcpyDeviceToHost),
+               "cudaMemcpy(storage route sequence after)");
+    bool valid = true;
+    for (size_t shard = 0; shard < publications.size(); ++shard) {
+      if (before_statuses[shard] <= 0 || body_statuses[shard] <= 0 ||
+          after_statuses[shard] <= 0) {
+        last_error = "RDMA read failed for shard " + std::to_string(shard);
+        saw_nontransient_failure = true;
+        valid = false;
+        break;
+      }
+      if (sequences_before[shard] != sequences_after[shard] ||
+          sequences_before[shard] != publications[shard].sequence_begin) {
+        last_error = "shard " + std::to_string(shard) +
+          ": storage route changed across RDMA snapshot";
+        last_failure_was_transient = true;
+        valid = false;
+        break;
+      }
+      std::string error;
+      if (!format::validate_storage_route_publication(
+            publications[shard], static_cast<u32>(shard), &error)) {
+        last_error = "shard " + std::to_string(shard) + ": " + error;
+        last_failure_was_transient =
+          error == "storage route snapshot overlaps publication" ||
+          error == "storage route publication checksum mismatch";
+        saw_nontransient_failure = saw_nontransient_failure ||
+          !last_failure_was_transient;
+        valid = false;
+        break;
+      }
+      if (publications[shard].code_bytes != code_bytes) {
+        last_error = "shard " + std::to_string(shard) +
+          ": route PQ width does not match the compute index";
+        valid = false;
+        saw_nontransient_failure = true;
+        break;
+      }
+    }
+    if (valid) return publications;
+  }
+  if (last_failure_was_transient && !saw_nontransient_failure) {
+    // Route metadata is advisory. A torn low-frequency control-page read must
+    // never fail queries or the mutation engine; retain the previous GPU
+    // snapshot and retry on the next maintenance tick.
+    engine.telemetry_.dynamic_route_snapshot_skips.fetch_add(
+      1, std::memory_order_relaxed);
+    return {};
+  }
+  throw std::runtime_error(
+    "storage route snapshot unavailable after retry: " + last_error +
+    ". Deploy the current binary on every storage node before starting "
+    "multi-compute routing.");
+}
+
+bool PersistentSearchEngine::Impl::synchronize_storage_routes() {
+  const std::vector<format::StorageRoutePublication> publications =
+    read_storage_route_publications();
+  if (publications.empty()) return false;
+  if (dynamic_route_snapshot.size() != dynamic_route_capacity) {
+    throw std::logic_error("canonical storage route snapshot capacity mismatch");
+  }
+  for (u32 shard = 0; shard < publications.size(); ++shard) {
+    for (u32 local_slot = 0; local_slot < format::kStorageRouteSlots;
+         ++local_slot) {
+      const auto& source = publications[shard].slots[local_slot];
+      const u32 slot = shard * format::kStorageRouteSlots + local_slot;
+      dynamic_route_snapshot[slot] =
+        vamana::routing::AdaptiveRouteTable::RouteSlotSnapshot{
+          .shard = shard,
+          .slot = local_slot,
+          .initialized = source.remote_node != 0 || source.generation != 0,
+          .live = source.remote_node != 0,
+          .id = source.id,
+          .generation = source.generation,
+          .entry = RemotePtr{source.remote_node},
+        };
+    }
+  }
+  const u64 live_routes = static_cast<u64>(std::count_if(
+    dynamic_route_snapshot.begin(), dynamic_route_snapshot.end(),
+    [](const auto& slot) { return slot.live; }));
+  engine.telemetry_.dynamic_route_live_slots.store(
+    live_routes, std::memory_order_relaxed);
+
+  // prepare() compares only canonical slot contents.  Epoch 1 is a harmless
+  // placeholder; reserve the real ordered query epoch only when something
+  // actually changed.
+  dynamic_route_diff->prepare(
+    dynamic_route_snapshot, 1, dynamic_route_update_scratch);
+  if (dynamic_route_update_scratch.empty()) return true;
+
+  const u64 epoch = engine.delta_.reserve_epoch();
+  for (size_t update_index = 0;
+       update_index < dynamic_route_update_scratch.size(); ++update_index) {
+    DynamicRouteUpdate& update = dynamic_route_update_scratch[update_index];
+    update.epoch = epoch;
+    std::memcpy(
+      dynamic_route_code_updates_host + update_index * code_bytes,
+      publications[update.shard]
+        .slots[update.slot % format::kStorageRouteSlots]
+        .navigation_code.data(),
+      code_bytes);
+  }
+  std::memcpy(dynamic_route_updates_host,
+              dynamic_route_update_scratch.data(),
+              dynamic_route_update_scratch.size() *
+                sizeof(DynamicRouteUpdate));
+  submit_delta_publication(DeltaPublishDescriptor{
+    .command_id = next_delta_command_id.fetch_add(
+      1, std::memory_order_relaxed),
+    .final_count = static_cast<u32>(delta_records_host.size()),
+    .dynamic_route_count = static_cast<u32>(
+      dynamic_route_update_scratch.size()),
+  });
+  dynamic_route_diff->commit(dynamic_route_update_scratch);
+  engine.telemetry_.dynamic_route_publications.fetch_add(
+    1, std::memory_order_relaxed);
+  engine.telemetry_.dynamic_route_slot_updates.fetch_add(
+    dynamic_route_update_scratch.size(), std::memory_order_relaxed);
+  // Queries acquire this epoch only after the control CTA has made both the
+  // PQ bytes and route seqlocks visible.
+  engine.delta_.publish_barrier(epoch);
+  return true;
+}
+
 void PersistentSearchEngine::Impl::write_storage_reclaim_acks(std::span<const u64> sequences) {
   if (sequences.size() != index.shards.size()) {
     throw std::invalid_argument("storage reclaim ACK cardinality mismatch");
@@ -182,7 +375,6 @@ std::vector<DeltaMutation> PersistentSearchEngine::Impl::retire_durable_delta() 
       history.pop_front();
     }
   }
-  enqueue_storage_reclaim_barriers();
   return engine.delta_.retire_durable(
     safe_durable_sequences, delta_command_capacity);
 }
@@ -376,7 +568,15 @@ void PersistentSearchEngine::Impl::maintenance_loop() {
         }
         reclaim_retired_delta_slots_locked();
       }
-      publish_ready_storage_reclaim_acks();
+      // A reclaim ACK may allow storage to reuse a dynamic address. Publish
+      // the canonical route tombstone/replacement first, then capture a query
+      // ticket barrier that covers every query which could have read the old
+      // route. A torn route snapshot therefore advances neither the barrier
+      // nor the remote ACK.
+      if (synchronize_storage_routes()) {
+        enqueue_storage_reclaim_barriers();
+        publish_ready_storage_reclaim_acks();
+      }
     } catch (const std::exception& error) {
       mark_unhealthy(std::string{"storage maintenance watermark failed: "} + error.what());
       break;

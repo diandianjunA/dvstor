@@ -29,8 +29,40 @@ GPUNetIO 直接读取存储节点上的紧凑图记录与精确向量。CPU 仅�
 - CPU 将原始存储格式向量写入映射固定内存，专用常驻 control CTA 批量完成
   OPQ/PQ 编码、hash/bucket 链接和 epoch 发布；
 - GPU delta 保存原始精确向量、PQ code、删除标记和动态候选桶；
-- 基础图缓存保持不可变，动态可见性不依赖逐写缓存失效；
+- 基础图数据视为不可变；可选缓存即使启用，动态可见性也不依赖逐写失效；
 - delta 超过容量或维护失败时停止接收新查询，避免静默返回陈旧结果。
+
+在线路由不是静态 anchor 的延续。新 ID 的权威 owner 仍由确定性的 `ID % N`
+选择（已有基础 ID 查 owner idmap），避免多个计算节点各自演化路由后把同一 ID
+写到不同分片。每个存储分片维护 8 个固定容量的 EMA 中心/活代表，已提交的
+insert/upsert 会更新代表，delete 会使对应代表失效；这些槽负责选择该分片内的
+构建入口，并通过已有 RDMA control page 向所有计算节点发布同一份固定快照和
+PQ code。GPU 查询侧
+拉取这份 storage-canonical 快照维护每分片 8 个动态入口，与离线静态入口共同竞争
+初始 beam；它不再根据“本 CN 恰好提交过哪些写入”独立演化。静态入口只承担冷
+启动和召回兜底，不再是长期运行时唯一的路由依据。
+
+`local_stitch` 的两阶段插入语义为：
+
+1. stage1 在 owner 分片从当前可用路由入口执行完整的宽度 `L` 构建搜索，直到
+   beam 中没有未展开节点；不存在独立的扩展次数/深度上限。它只写新节点及临时
+   出边，不写权威反向边，然后即可 ACK。
+2. stage2 并发请求每个外部分片的完整 `L` 候选，将 owner beam 与所有外部分片
+   beam 合并后只执行一次相同的 alpha RobustPrune。本次最终选中的所有本地、远端
+   邻居完成权威反向边 ACK，且最终邻居再次通过存活性校验后，才覆盖临时出边并
+   推进 finalized watermark。
+
+在所有分片观察同一逻辑图快照，并使用相同的 `L`、距离和 RobustPrune 规则时，
+该结果与“逐分片完成相同在线构建搜索后统一剪枝”的直接分布式参考算法相同。
+这个 reference 不是离线 builder 的全候选构图，也不表示邻接表逐字节一致。持续
+并发更新时系统不冻结整个图，因此也不声称线性化历史一致；应在停写后等待
+maintenance 收敛，再用相同数据流实测前后 recall 和长期稳定性。
+
+上述反向边保证只覆盖 insert 任务在 stage2 最终选出的邻居。当前 schema-15 没有
+完整的入边索引，delete/upsert 无法枚举并立即移除所有历史未知入边；删除版本会被
+tombstone/generation 可见性过滤，但残留指针仍可能增加后续导航开销并影响长期图
+质量。因此本文不把 insert-only 的收敛语义扩张成 delete/upsert 下“全图无悬空
+入边”的保证，混合更新的长期质量仍需单独测试或由后续全图整理机制解决。
 
 ## 索引文件
 
@@ -42,18 +74,19 @@ OPQ/PQ 导航。默认 profile 使用 32 个 8-bit 子空间。运行时不读�
 | --- | --- | --- | --- |
 | `<prefix>.meta.json` | 必需 | 必需 | 分片、远端 offset 和格式契约 |
 | `<prefix>.pq32` | 必需 | 不需要 | OPQ 矩阵与 PQ codebook |
-| `<prefix>.anchors` | 必需 | 必需 | 查询入口与动态更新 anchor |
+| `<prefix>.anchors` | 必需 | 不需要 | GPU 静态冷启动/召回兜底入口 |
 | `<prefix>_nodeX_ofN.dat` | 不需要 | 必需 | 精确向量、固定记录和紧凑图 |
-| `<prefix>_nodeX_ofN.idmap` | 不需要 | 必需 | storage-owner ID 映射 |
+| `<prefix>_nodeX_ofN.idmap` | 更新模式需全部分片；纯查询不需要 | 必需 | base ID 的真实 owner/版本映射 |
 | `<prefix>_nodeX_ofN.pq32.codes` | 不需要 | 必需 | 启动时注册到远端内存的 PQ32 码流 |
 
-计算节点本地只保存 metadata、PQ 模型和 anchors；不会保存 `.gpu.idx`、图分片、
-精确向量或全量导航码。
+计算节点本地保存 metadata、PQ 模型和静态启动入口；启用更新时还需全部分片的
+`.idmap`，因为 METIS 分区下 base ID 的 owner 不能由 ID 推导。纯查询模式不加载
+这些 idmap。计算节点不会保存 `.gpu.idx`、图分片、精确向量或全量导航码。
 
 PQ32 每个向量占 32 字节：SIFT100M 为 3.2 GB，SIFT1B 为 32 GB
-（约 29.8 GiB）。默认预算保留 256 MiB 有界 mutable L0、1 GiB graph cache，
-并关闭对冷查询无收益的 exact cache；显式分配上限为 36 GiB，并为 CUDA/DOCA
-保留 4 GiB。
+（约 29.8 GiB）。默认运行配置保留 256 MiB 有界 mutable L0，并将 graph cache
+和 exact cache 都关闭；可选缓存实现仍可显式启用，但当前冷态正确路径和最佳性能
+不依赖缓存命中。显式分配上限为 36 GiB，并为 CUDA/DOCA 保留 4 GiB。
 计算节点本地文件远低于 50 GB。
 
 ## 依赖与构建
@@ -170,12 +203,14 @@ Benchmark 并发使用独立的 `BENCHMARK_CLIENT_THREADS`，不写入索引/系
 例如 `BENCHMARK_CLIENT_THREADS=128 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio`。
 标准的 10K `query.u8bin` 只用于 recall 检查。吞吐阶段使用独立的
 `PERFORMANCE_QUERY_FILE`，并从 warmup 到 measure 单遍消费；文件耗尽会直接失败，
-不会回绕重复。默认性能查询集是 `bigann_base.bvecs` 的 `[100M,103M)`，插入集是
-不重叠的 `[103M,105M)`；生成的 `.u8bin` 文件位于 SIFT1B 数据集目录。
-计算节点只需这两份生成文件，不需要完整的 `bigann_base.bvecs`。
+不会回绕重复。默认性能查询集是 `bigann_base.bvecs` 的 `[100M,105M)`，插入集是
+`[103M,105M)`；生成的 `.u8bin` 文件位于 SIFT1B 数据集目录。两个流按你的当前
+压测设置有重叠，适合直接复用预生成数据做吞吐测试，但不能当作严格 held-out 的
+质量证据。计算节点只需这两份生成文件，不需要完整的 `bigann_base.bvecs`。
 
 分布式部署时，每台存储节点只需其自身的 `.dat`、`.idmap`、`.pq32.codes`，
-再加共享 metadata 与 anchors。详细流程见 `experiment/README.md`。
+再加共享 metadata；静态 anchors 只由计算节点使用。详细流程见
+`experiment/README.md`。
 
 ## 验证
 

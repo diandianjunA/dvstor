@@ -40,7 +40,7 @@
 #include "memory_node/storage_owner_state.hh"
 #include "service/index_metadata.hh"
 #include "service/storage_owner_protocol.hh"
-#include "vamana/anchor_index.hh"
+#include "vamana/adaptive_route_table.hh"
 #include "vamana/vamana_node.hh"
 
 /**
@@ -93,9 +93,13 @@ class MemoryNode {
     u64 maintenance_sequence{};
     RemotePtr target;
     bool stitch_prepared{};
-    // Adjacency observed before remote search. Final commit uses it to
-    // distinguish concurrent reverse-edge additions from stage1 edges that
-    // the global prune intentionally replaced.
+    // Complete owner-partition construction beam captured by stage1. The
+    // temporary adjacency below is already pruned to R and is therefore not
+    // a sufficient input for an algorithmically equivalent final prune.
+    vec<RemotePtr> stage1_candidates;
+    // Exact temporary adjacency written by stage1. Final commit compares the
+    // then-current adjacency against this captured baseline, so reverse edges
+    // added while stage2 was queued/in flight are rebased instead of lost.
     vec<RemotePtr> stitch_base_neighbors;
     vec<RemotePtr> stitch_neighbors;
     // A stitch that becomes stale after applying reverse edges transfers its
@@ -251,7 +255,8 @@ private:
                                          const Configuration& config);
   void send_peer_stitch_search_failed_response(
       u32 destination_shard,
-      const service::storage_owner::PeerRpcHeader& request);
+      const service::storage_owner::PeerRpcHeader& request,
+      const Configuration& config);
   bool handle_peer_rpc_request(const PeerRpcMessage& message, const Configuration& config);
   bool enqueue_peer_reverse_update_task(PeerReverseUpdateTask&& task);
   bool enqueue_peer_stitch_search_task(PeerStitchSearchTask&& task);
@@ -273,16 +278,6 @@ private:
                                              u32 item_count,
                                              service::storage_owner::PeerRpcType response_type,
                                              const Configuration& config);
-  bool wait_for_peer_stitch_search_response(u64 request_id,
-                                            u32 target_shard,
-                                            u32 item_count,
-                                            vec<vec<NodeSnapshot>>& candidates_by_item,
-                                            const Configuration& config);
-  bool post_stitch_search_request(u32 target_shard,
-                                  const vec<NodeSnapshot>& targets,
-                                  u64& request_id,
-                                  u32& item_count,
-                                  const Configuration& config);
   bool post_stitch_search_request_async(u32 target_shard,
                                         const vec<NodeSnapshot>& targets,
                                         u64 request_id,
@@ -350,6 +345,8 @@ private:
                              u32 generation,
                              RemotePtr target,
                              u64 maintenance_sequence,
+                             const vec<RemotePtr>* stage1_candidates,
+                             const vec<RemotePtr>* stage1_neighbors,
                              const Configuration& config);
   bool enqueue_deleted_node_cleanup(RemotePtr deleted_ptr,
                                     u64 maintenance_sequence,
@@ -361,7 +358,9 @@ private:
                                          RemotePtr old_ptr,
                                          u64 reserved_sequence,
                                          u32 reserved_work_items,
-                                         const Configuration& config);
+                                         const Configuration& config,
+                                         const vec<RemotePtr>* stage1_candidates = nullptr,
+                                         const vec<RemotePtr>* stage1_neighbors = nullptr);
   u32 storage_owner_maintenance_work_items(
     service::storage_owner::MutationKind kind,
     const Configuration& config) const;
@@ -408,8 +407,6 @@ private:
   bool execute_storage_owner_batch_items_async(const node_t* ids,
                                                const service::storage_owner::MutationKind* kinds,
                                                const element_t* vectors,
-                                               const u64* anchor_hints,
-                                               u32 anchor_hint_count,
                                                size_t item_count,
                                                StorageOwnerThread& thread,
                                                InsertBreakdownCounters& breakdown,
@@ -430,8 +427,6 @@ private:
   bool execute_storage_owner_batch_items(const node_t* ids,
                                          const service::storage_owner::MutationKind* kinds,
                                          const element_t* vectors,
-                                         const u64* anchor_hints,
-                                         u32 anchor_hint_count,
                                          size_t item_count,
                                          InsertBreakdownCounters& breakdown,
                                          const Configuration& config,
@@ -455,6 +450,7 @@ private:
   void write_global_medoid(const RemotePtr& medoid);
   bool try_set_global_medoid(const RemotePtr& expected, const RemotePtr& desired, RemotePtr& observed);
   u64 load_local_node_header_acquire(RemotePtr rptr) const;
+  bool valid_local_storage_node_pointer(RemotePtr rptr) const;
   bool read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot);
   bool storage_owner_node_live(RemotePtr rptr);
   vec<RemotePtr> read_neighbor_list(RemotePtr rptr);
@@ -496,25 +492,29 @@ private:
                                     const Configuration& config,
                                     StorageOwnerThread& thread,
                                     InsertBreakdownCounters* breakdown = nullptr) -> StorageOwnerInsertCoroutine;
-  vec<RemotePtr> anchor_search_candidates(const span<const element_t> query,
-                                          const vec<RemotePtr>& anchor_hints,
-                                          const Configuration& config,
-                                          InsertBreakdownCounters* breakdown = nullptr,
-                                          bool local_only = false);
-  auto anchor_search_candidates_async(const span<const element_t> query,
-                                      const vec<RemotePtr>& anchor_hints,
-                                      const Configuration& config,
-                                      StorageOwnerThread& thread,
-                                      InsertBreakdownCounters* breakdown = nullptr,
-                                      bool local_only = false)
-    -> StorageOwnerInsertCoroutine;
+  // Synchronous CPU construction search. It deliberately has no "async"
+  // facade: callers must place it on an executor where a complete local graph
+  // walk may run without blocking CQ/RPC progress.
+  vec<RemotePtr> partition_local_search_candidates(
+      const span<const element_t> query,
+      const vec<RemotePtr>& entry_points,
+      const Configuration& config,
+      InsertBreakdownCounters* breakdown = nullptr);
+  vec<RemotePtr> storage_owner_route_entries(
+      const span<const element_t> query);
+  void initialize_storage_owner_route_table();
+  void publish_storage_owner_route_table();
+  void observe_storage_owner_route(node_t id,
+                                   u32 generation,
+                                   RemotePtr entry,
+                                   const span<const element_t> vector);
+  void invalidate_storage_owner_route(node_t id, u32 generation);
   vec<RemotePtr> robust_prune_cpu(const byte_t* source,
                                   VectorDType source_dtype,
                                   const vec<RemotePtr>& candidates,
                                   const hashset_t<RemotePtr>& skip,
                                   const Configuration& config,
                                   InsertBreakdownCounters* breakdown = nullptr,
-                                  u32 candidate_limit_override = 0,
                                   u32 result_limit_override = 0);
   vec<RemotePtr> robust_prune_snapshots_cpu(
       const byte_t* source,
@@ -552,14 +552,6 @@ private:
                                       VectorDType rhs_dtype,
                                       const Configuration& config) const;
   const byte_t* local_live_vector(RemotePtr rptr) const;
-  void score_local_candidates_into_beam(
-      const span<const element_t> query,
-      const vec<RemotePtr>& candidates,
-      const Configuration& config,
-      vec<BeamEntry>& beam,
-      u32 beam_width,
-      InsertBreakdownCounters* breakdown,
-      bool count_valid_hints) const;
   bool local_shard(u32 shard_id) const;
   byte_t* local_node_ptr(const RemotePtr& rptr);
   const byte_t* local_node_ptr(const RemotePtr& rptr) const;
@@ -578,7 +570,6 @@ private:
   u64 gpu_dynamic_node_base_{};
   u32 gpu_navigation_code_bytes_{};
   u64 gpu_navigation_model_checksum_{};
-  u32 storage_owner_cross_shard_degree_{};
   gpu_search::pq::Model gpu_navigation_model_;
   const u32 storage_id_;
   const u32 num_storage_nodes_;
@@ -711,7 +702,11 @@ private:
   const u64 mn_memory_bytes_;
   timing::Timing timing_;
   filepath_t index_prefix_;
-  std::unique_ptr<vamana::anchor::Index> storage_owner_anchor_index_;
+  std::unique_ptr<vamana::routing::AdaptiveRouteTable>
+    storage_owner_route_table_;
+  vec<vamana::routing::AdaptiveRouteTable::RouteSlotSnapshot>
+    storage_owner_route_snapshot_;
+  std::mutex storage_owner_route_publication_mutex_;
   bool owner_idmap_required_{false};
   hashmap_t<node_t, FreshnessEntry> base_idmap_;
   std::array<DynamicFreshnessShard, kDynamicFreshnessShardCount>

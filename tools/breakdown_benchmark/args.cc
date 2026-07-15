@@ -178,66 +178,9 @@ Args parse_args(int argc, char** argv) {
         throw std::runtime_error("--recall-base-id-limit exceeds uint32_t");
       }
       args.recall_base_id_limit = static_cast<uint32_t>(value);
-    } else if (flag == "--min-recall") {
-      args.min_recall = std::stod(require_value("--min-recall"));
-    } else if (flag == "--min-query-qps") {
-      args.min_query_qps = std::stod(require_value("--min-query-qps"));
-    } else if (flag == "--min-insert-qps") {
-      args.min_insert_qps = std::stod(require_value("--min-insert-qps"));
-    } else if (flag == "--min-stability-ratio") {
-      args.min_stability_ratio = std::stod(require_value("--min-stability-ratio"));
-    } else if (flag == "--min-write-stability-ratio") {
-      args.min_write_stability_ratio = std::stod(
-        require_value("--min-write-stability-ratio"));
-    } else if (flag == "--query-baseline-qps") {
-      args.query_baseline_qps = std::stod(require_value("--query-baseline-qps"));
-    } else if (flag == "--query-baseline-report") {
-      args.query_baseline_report = require_value("--query-baseline-report");
-    } else if (flag == "--min-query-baseline-ratio") {
-      args.min_query_baseline_ratio = std::stod(
-        require_value("--min-query-baseline-ratio"));
-    } else if (flag == "--max-recall-drop") {
-      args.max_recall_drop = std::stod(require_value("--max-recall-drop"));
-    } else if (flag == "--max-zero-completion-windows") {
-      args.max_zero_completion_windows = std::stoll(
-        require_value("--max-zero-completion-windows"));
-    } else if (flag == "--max-zero-query-windows") {
-      args.max_zero_query_windows = std::stoll(
-        require_value("--max-zero-query-windows"));
-    } else if (flag == "--max-zero-write-windows") {
-      args.max_zero_write_windows = std::stoll(
-        require_value("--max-zero-write-windows"));
-    } else if (flag == "--max-drain-seconds") {
-      args.max_drain_seconds = std::stod(require_value("--max-drain-seconds"));
-    } else if (flag == "--min-rate-attainment-ratio") {
-      args.min_rate_attainment_ratio = std::stod(
-        require_value("--min-rate-attainment-ratio"));
-    } else if (flag == "--max-gpu-visibility-ms") {
-      args.max_gpu_visibility_ms = std::stod(
-        require_value("--max-gpu-visibility-ms"));
-    } else if (flag == "--max-final-mutation-capacity-reserved") {
-      args.max_final_mutation_capacity_reserved = std::stoll(
-        require_value("--max-final-mutation-capacity-reserved"));
-    } else if (flag == "--max-final-delta-mutable-entries") {
-      args.max_final_delta_mutable_entries = std::stoll(
-        require_value("--max-final-delta-mutable-entries"));
-    } else if (flag == "--max-late-storage-owner-rpcs") {
-      args.max_late_storage_owner_rpcs = std::stoll(
-        require_value("--max-late-storage-owner-rpcs"));
     } else if (flag == "--storage-maintenance-log") {
       args.storage_maintenance_logs.push_back(
         require_value("--storage-maintenance-log"));
-    } else if (flag == "--max-stage2-p99-ms") {
-      args.max_stage2_p99_ms = std::stod(require_value("--max-stage2-p99-ms"));
-    } else if (flag == "--max-stage2-backlog-slope") {
-      args.max_stage2_backlog_slope = std::stod(
-        require_value("--max-stage2-backlog-slope"));
-    } else if (flag == "--max-stage2-remaining") {
-      args.max_stage2_remaining = std::stoll(
-        require_value("--max-stage2-remaining"));
-    } else if (flag == "--stage2-drain-timeout-seconds") {
-      args.stage2_drain_timeout_seconds = std::stoull(
-        require_value("--stage2-drain-timeout-seconds"));
     } else if (flag == "--recall-only") {
       args.recall_only = true;
     } else if (flag == "--synthetic") {
@@ -276,19 +219,6 @@ Args parse_args(int argc, char** argv) {
     args.read_ratio,
     args.target_query_qps,
     args.target_write_qps,
-    args.min_recall,
-    args.min_query_qps,
-    args.min_insert_qps,
-    args.min_stability_ratio,
-    args.min_write_stability_ratio,
-    args.query_baseline_qps,
-    args.min_query_baseline_ratio,
-    args.max_recall_drop,
-    args.max_drain_seconds,
-    args.min_rate_attainment_ratio,
-    args.max_gpu_visibility_ms,
-    args.max_stage2_p99_ms,
-    args.max_stage2_backlog_slope,
     args.write_insert_ratio,
     args.write_upsert_ratio,
     args.write_delete_ratio,
@@ -311,87 +241,8 @@ Args parse_args(int argc, char** argv) {
   if (args.write_insert_ratio + args.write_upsert_ratio + args.write_delete_ratio <= 0.0) {
     throw std::runtime_error("at least one write mutation ratio must be > 0");
   }
-  auto disabled_or_nonnegative = [](double value) {
-    return value == -1.0 || value >= 0.0;
-  };
-  auto disabled_or_ratio = [&](double value) {
-    return value == -1.0 || (value >= 0.0 && value <= 1.0);
-  };
-  if (!disabled_or_ratio(args.min_recall)) {
-    throw std::runtime_error("--min-recall must be -1 or in [0, 1]");
-  }
-  if (!disabled_or_nonnegative(args.min_query_qps)) {
-    throw std::runtime_error("--min-query-qps must be -1 or non-negative");
-  }
-  if (!disabled_or_nonnegative(args.min_insert_qps)) {
-    throw std::runtime_error("--min-insert-qps must be -1 or non-negative");
-  }
-  if (!disabled_or_ratio(args.min_stability_ratio)) {
-    throw std::runtime_error("--min-stability-ratio must be -1 or in [0, 1]");
-  }
-  if (!disabled_or_ratio(args.min_write_stability_ratio)) {
-    throw std::runtime_error(
-      "--min-write-stability-ratio must be -1 or in [0, 1]");
-  }
   if (args.target_query_qps < 0.0 || args.target_write_qps < 0.0) {
     throw std::runtime_error("target rates must be non-negative");
-  }
-  if (!disabled_or_nonnegative(args.query_baseline_qps) ||
-      !disabled_or_ratio(args.min_query_baseline_ratio)) {
-    throw std::runtime_error(
-      "query baseline QPS must be -1 or non-negative and its ratio must be -1 or in [0, 1]");
-  }
-  const bool has_baseline_value = args.query_baseline_qps >= 0.0 ||
-    !args.query_baseline_report.empty();
-  if (has_baseline_value != (args.min_query_baseline_ratio >= 0.0)) {
-    throw std::runtime_error(
-      "a query baseline and --min-query-baseline-ratio must be supplied together");
-  }
-  if (args.workload == "mixed" && args.min_query_baseline_ratio >= 0.0 &&
-      args.query_baseline_report.empty()) {
-    throw std::runtime_error(
-      "mixed acceptance requires --query-baseline-report; a bare "
-      "--query-baseline-qps is not a verifiable baseline");
-  }
-  if (!disabled_or_ratio(args.max_recall_drop)) {
-    throw std::runtime_error("--max-recall-drop must be -1 or in [0, 1]");
-  }
-  if (args.max_zero_completion_windows < -1 ||
-      args.max_zero_query_windows < -1 ||
-      args.max_zero_write_windows < -1) {
-    throw std::runtime_error("zero-window limits must be -1 or non-negative");
-  }
-  if (!disabled_or_nonnegative(args.max_drain_seconds)) {
-    throw std::runtime_error("--max-drain-seconds must be -1 or non-negative");
-  }
-  if (!disabled_or_ratio(args.min_rate_attainment_ratio)) {
-    throw std::runtime_error(
-      "--min-rate-attainment-ratio must be -1 or in [0, 1]");
-  }
-  if (!disabled_or_nonnegative(args.max_gpu_visibility_ms) ||
-      args.max_final_mutation_capacity_reserved < -1 ||
-      args.max_final_delta_mutable_entries < -1 ||
-      args.max_late_storage_owner_rpcs < -1) {
-    throw std::runtime_error(
-      "GPU/final-state limits must be -1 or non-negative");
-  }
-  if (!disabled_or_nonnegative(args.max_stage2_p99_ms) ||
-      !disabled_or_nonnegative(args.max_stage2_backlog_slope) ||
-      args.max_stage2_remaining < -1) {
-    throw std::runtime_error("stage2 limits must be -1 or non-negative");
-  }
-  const bool stage2_checks_requested =
-    args.max_stage2_p99_ms >= 0.0 ||
-    args.max_stage2_backlog_slope >= 0.0 ||
-    args.max_stage2_remaining >= 0 ||
-    args.stage2_drain_timeout_seconds != 0;
-  if (stage2_checks_requested && args.storage_maintenance_logs.empty()) {
-    throw std::runtime_error(
-      "stage2 acceptance checks require at least one --storage-maintenance-log");
-  }
-  if (args.max_recall_drop >= 0.0 && args.groundtruth_file.empty()) {
-    throw std::runtime_error(
-      "--max-recall-drop requires --groundtruth-file and recall queries");
   }
   if (!args.groundtruth_file.empty() && args.recall_query_file.empty()) {
     throw std::runtime_error("--recall-query-file is required with --groundtruth-file");

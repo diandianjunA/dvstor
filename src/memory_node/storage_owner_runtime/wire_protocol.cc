@@ -51,13 +51,9 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
         const auto* request = reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(payload);
         const bool magic_ok = request->magic == service::storage_owner::kInsertMagic ||
                               request->magic == service::storage_owner::kMutationMagic;
-        const u32 expected_anchor_hint_count = storage_owner_local_stitch_mode(config)
-                                                 ? config.storage_owner_anchor_hints : 0;
         const size_t expected_bytes = request->magic == service::storage_owner::kMutationMagic
-          ? service::storage_owner::mutation_batch_request_bytes(
-              request->item_count, config.dim, request->anchor_hint_count)
-          : service::storage_owner::insert_batch_request_bytes(
-              request->item_count, config.dim, request->anchor_hint_count);
+          ? service::storage_owner::mutation_batch_request_bytes(request->item_count)
+          : service::storage_owner::insert_batch_request_bytes(request->item_count);
         if (magic_ok &&
             request->dim == config.dim &&
             request->owner_storage == storage_id_ &&
@@ -65,7 +61,7 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
             request->item_count <= config.storage_owner_batch_max &&
             request->vector_dtype == static_cast<u32>(VamanaNode::vector_dtype()) &&
             request->vector_bytes == VamanaNode::vector_bytes() &&
-            request->anchor_hint_count == expected_anchor_hint_count &&
+            request->anchor_hint_count == 0 &&
             bytes >= expected_bytes) {
           StorageOwnerInsertTask task;
           task.client_id = client_id;
@@ -124,10 +120,8 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id,
   const bool mutation = request->magic == service::storage_owner::kMutationMagic;
   const bool magic_ok = request->magic == service::storage_owner::kInsertMagic || mutation;
   const size_t expected_bytes = mutation
-    ? service::storage_owner::mutation_batch_request_bytes(
-        request->item_count, config.dim, request->anchor_hint_count)
-    : service::storage_owner::insert_batch_request_bytes(
-        request->item_count, config.dim, request->anchor_hint_count);
+    ? service::storage_owner::mutation_batch_request_bytes(request->item_count)
+    : service::storage_owner::insert_batch_request_bytes(request->item_count);
   if (!magic_ok ||
       request->dim != config.dim ||
       request->owner_storage != storage_id_ ||
@@ -135,8 +129,7 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id,
       request->item_count > config.storage_owner_batch_max ||
       request->vector_dtype != static_cast<u32>(VamanaNode::vector_dtype()) ||
       request->vector_bytes != VamanaNode::vector_bytes() ||
-      request->anchor_hint_count != (storage_owner_local_stitch_mode(config)
-                                      ? config.storage_owner_anchor_hints : 0) ||
+      request->anchor_hint_count != 0 ||
       bytes < expected_bytes) {
     return 0;
   }
@@ -157,9 +150,6 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id,
   const byte_t* raw_vectors = mutation
     ? service::storage_owner::mutation_request_vectors(payload, request->item_count)
     : service::storage_owner::request_vectors(payload, request->item_count);
-  const u64* anchor_hints = mutation
-    ? service::storage_owner::mutation_request_anchor_hints(payload, request->item_count)
-    : service::storage_owner::request_anchor_hints(payload, request->item_count);
   vec<service::storage_owner::MutationKind> kinds(request->item_count, service::storage_owner::MutationKind::insert);
   for (u32 i = 0; i < request->item_count && kinds_raw != nullptr; ++i) {
     kinds[i] = static_cast<service::storage_owner::MutationKind>(kinds_raw[i]);
@@ -179,7 +169,6 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id,
   mark_storage_owner_foreground_activity();
   storage_owner_insert_active_workers_.fetch_add(1, std::memory_order_acq_rel);
   const bool ok = execute_storage_owner_batch_items(ids, kinds.data(), decoded_vectors.data(),
-                                                    anchor_hints, request->anchor_hint_count,
                                                     request->item_count,
                                                     breakdown, config, &invalidated_neighbors,
                                                     &item_statuses, &mutation_results);
@@ -221,8 +210,6 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id,
 bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
                                        const service::storage_owner::MutationKind* kinds,
                                        const element_t* vectors,
-                                       const u64* anchor_hints,
-                                       u32 anchor_hint_count,
                                        size_t item_count,
                                        InsertBreakdownCounters& breakdown,
                                        const Configuration& config,
@@ -282,11 +269,14 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
                             RemotePtr new_pointer,
                             RemotePtr old_pointer,
                             u64 reserved_sequence,
-                            u32 reserved_work_items) {
+                            u32 reserved_work_items,
+                            const vec<RemotePtr>* stage1_candidates = nullptr,
+                            const vec<RemotePtr>* stage1_neighbors = nullptr) {
     const auto started = std::chrono::steady_clock::now();
     const u64 sequence = schedule_storage_owner_maintenance(
       id, generation, kind, new_pointer, old_pointer,
-      reserved_sequence, reserved_work_items, config);
+      reserved_sequence, reserved_work_items, config,
+      stage1_candidates, stage1_neighbors);
     breakdown.storage_owner_schedule_maintenance_ns += elapsed_ns_since(started);
     return sequence;
   };
@@ -318,6 +308,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       const bool deleted = mark_node_deleted(old_entry.current, generation);
       if (deleted) {
         publish(ids[idx], old_entry.current, generation, true);
+        invalidate_storage_owner_route(ids[idx], generation);
         const u64 maintenance_sequence = schedule(
           ids[idx], generation, kind, RemotePtr{}, old_entry.current,
           reserved_maintenance_sequence, reserved_maintenance_work);
@@ -337,32 +328,16 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
     const element_t* vec_ptr = vectors + idx * VamanaNode::DIM;
     const auto components = span<const element_t>{vec_ptr, VamanaNode::DIM};
-    vec<RemotePtr> item_anchor_hints;
     const bool local_stitch = storage_owner_local_stitch_mode(config);
-    if (anchor_hints != nullptr) {
-      item_anchor_hints.reserve(anchor_hint_count);
-      for (u32 hint = 0; hint < anchor_hint_count; ++hint) {
-        const RemotePtr ptr{anchor_hints[idx * anchor_hint_count + hint]};
-        if (!ptr.is_null() &&
-            (!local_stitch || local_shard(ptr.memory_node()))) {
-          item_anchor_hints.push_back(ptr);
-        }
-      }
-    }
-    if (local_stitch && item_anchor_hints.empty() &&
-        storage_owner_anchor_index_ != nullptr &&
-        !storage_owner_anchor_index_->empty()) {
-      item_anchor_hints = storage_owner_anchor_index_->nearest_anchors(
-        components,
-        storage_id_,
-        std::max<u32>(1, config.storage_owner_anchor_hints));
-    }
-    const bool use_anchors = local_stitch && !item_anchor_hints.empty();
     vec<RemotePtr> candidates;
-    if (use_anchors) {
+    if (local_stitch) {
+      const vec<RemotePtr> route_entries =
+        storage_owner_route_entries(components);
+      lib_assert(!route_entries.empty(),
+                 "stage1 adaptive route produced no local entry");
       auto t_search = std::chrono::steady_clock::now();
-      candidates = anchor_search_candidates(components, item_anchor_hints, config,
-                                            &breakdown, local_stitch);
+      candidates = partition_local_search_candidates(
+        components, route_entries, config, &breakdown);
       breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
     } else if (!medoid_loaded) {
       auto t_medoid = std::chrono::steady_clock::now();
@@ -383,6 +358,8 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
         mark_node_deleted(old_entry.current, old_entry.generation);
       }
       publish(ids[idx], new_ptr, generation, false);
+      observe_storage_owner_route(
+        ids[idx], generation, new_ptr, components);
       const u64 maintenance_sequence = schedule(
         ids[idx], generation, kind, new_ptr, old_entry.current,
         reserved_maintenance_sequence, reserved_maintenance_work);
@@ -401,7 +378,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       continue;
     }
 
-    if (!use_anchors) {
+    if (!local_stitch) {
       auto t_search = std::chrono::steady_clock::now();
       candidates = beam_search_candidates(components, medoid_ptr, config, &breakdown);
       breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
@@ -427,9 +404,12 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       mark_node_deleted(old_entry.current, old_entry.generation);
     }
     publish(ids[idx], new_ptr, generation, false);
+    observe_storage_owner_route(ids[idx], generation, new_ptr, components);
     const u64 maintenance_sequence = schedule(
       ids[idx], generation, kind, new_ptr, old_entry.current,
-      reserved_maintenance_sequence, reserved_maintenance_work);
+      reserved_maintenance_sequence, reserved_maintenance_work,
+      local_stitch ? &candidates : nullptr,
+      local_stitch ? &selected_neighbors : nullptr);
     if (results != nullptr) {
       (*results)[idx].maintenance_sequence = maintenance_sequence;
     }

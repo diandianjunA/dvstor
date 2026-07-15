@@ -8,11 +8,9 @@ void MemoryNode::setup_insert_runtime(const Configuration& config) {
              "storage_owner invalidation capacity is too large for the wire format");
   const size_t insert_request_bytes = align_up(std::max(
     service::storage_owner::insert_batch_request_bytes(
-      config.storage_owner_batch_max, VamanaNode::DIM,
-      storage_owner_local_stitch_mode(config) ? config.storage_owner_anchor_hints : 0),
+      config.storage_owner_batch_max),
     service::storage_owner::mutation_batch_request_bytes(
-      config.storage_owner_batch_max, VamanaNode::DIM,
-      storage_owner_local_stitch_mode(config) ? config.storage_owner_anchor_hints : 0)));
+      config.storage_owner_batch_max)));
   insert_runtime_.request_bytes = insert_request_bytes;
   insert_runtime_.request_slot_count = std::max<u32>(1, config.storage_owner_rpc_depth);
   const size_t insert_response_bytes =
@@ -44,12 +42,8 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
                " per QP: " + std::to_string(peer_rdma_read_credit_limit_per_qp()) +
                " (requested=" + std::to_string(storage_owner_peer_rdma_tokens_) + ")");
   print_status("storage-owner online insert tuning: construction_beam=" +
-               std::to_string(config.storage_owner_construction_beam_width == 0
-                                ? config.beam_width_construction
-                                : std::min(config.beam_width_construction,
-                                           config.storage_owner_construction_beam_width)) +
+               std::to_string(config.resolved_storage_owner_construction_width()) +
                " snapshot_batch=" + std::to_string(config.storage_owner_search_snapshot_batch) +
-               " prune_max_candidates=" + std::to_string(config.storage_owner_prune_max_candidates) +
                " update_mode=" + config.storage_owner_update_mode);
   if (storage_owner_local_stitch_mode(config)) {
     print_status("storage-owner stage1=direct local commit without peer RDMA; "

@@ -1,0 +1,68 @@
+query_inputs
+  recall_source: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  recall_rows: 10000
+  performance_source: /data/xjs/datasets/sift1b/sift100m_to_105m_query.u8bin
+  performance_rows: 5000000
+  performance_row_reuse_policy: single_pass_no_reuse
+  performance_warmup/measure/total_rows_consumed: 692245/2761223/3453468
+throughput
+  duration_seconds: 120.011
+  total_ops_per_sec: 28446 (ops=3413822)
+  query_ops_per_sec: 23008.1 (ops=2761223)
+  effective_query_ops_per_sec: 23008.1
+  write_ops_per_sec: 5437.84 (ops=652599)
+  effective_write_ops_per_sec: 5437.84
+  insert_ops_per_sec: 5437.84 (ops=652599)
+  client_drain_seconds: 0.0107827
+  scheduled_query/write_ops: 0/0
+  query/write_rate_attainment_ratio: 1/1
+  nominal/effective_rate_basis: effective_wall_clock/wall_clock_including_client_drain
+  write_mix_completed: insert=652599 upsert=0 delete=0
+  query_head/tail_qps: 23004.5/23177.9
+  query_tail_to_head_ratio: 1.00754
+  write_head/tail_qps: 5574.53/5395.53
+  write_tail_to_head_ratio: 0.96789
+  zero_completion_windows: 0
+  zero_query/write_windows: 0/0
+  acceptance_passed: true
+  baseline_source/verified/effective_qps/ratio: disabled/false/-1/0
+  GPU visibility_ms/final_reserved/final_mutable/late_rpc: 172.051/0/8254/0
+  GPU visible mutations observed/expected, final drain s/timeout: 652599/652599, 0/false
+recall
+  recall@10: 0.9424
+  queries: 1000
+  mode/base_id_limit/search_width/insufficient_queries: all/0/10/0
+  passed: true
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+static_gt_post_recall
+  recall@10: 0.9376
+  queries: 1000
+  mode/base_id_limit/search_width/insufficient_queries: all/0/10/0
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+gpu_persistent
+  GPU memory explicit/base_pq/resident_pq/route/delta/graph_cache/exact_cache GiB: 7.25025/2.98023/3.75/0.00961304/0.25/0/0
+  average_batch_size: 1.21327
+  average_submission_wait_us: 10.1002
+  rdma_read_bytes: 300344245800
+  graph_page_cache_hit_ratio: 0
+  graph_route_hit_ratio/refreshes: 0.147379/0
+  graph_cache_invalidations: 0
+  GPU query/prepare/graph/score/beam/exact us: 2707.45/320.038/905.785/606.827/372.338/137.191
+  average_visibility_us: 8884.1
+  publication queue/prepare/command us: 8679.68/1.47364/178.098
+  average_mutations_per_publication: 1.11036
+  delta logical/physical/L0/L1 entries: 8254/8254/8254/0
+  resident PQ current/peak/capacity/reclaimed: 820653/820653/67108864/0
+  mutation capacity rejected/wait_events/wait_ms/current/peak: 0/0/0/0/96
+insert breakdown
+  count: 652599
+  latency_ms: mean=11.7626 p50=11.3664 p95=16.5906 p99=21.3718
+  cpu_ms: 7.67295e+06
+  rdma_ms: 3328.65
+query breakdown
+  count: 2761223
+  latency_ms: mean=2.7794 p50=2.75983 p95=3.1603 p99=3.37049
+  cpu_ms: 7.67454e+06
+  rdma_ms: 0

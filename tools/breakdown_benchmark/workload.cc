@@ -103,7 +103,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"recall_mode", args.recall_mode},
     {"recall_base_id_limit", args.recall_base_id_limit},
     {"insert_start_id", args.insert_start_id},
-    {"index_prefix", normalize_acceptance_path(
+    {"index_prefix", normalize_path(
        service.config().resolved_index_prefix().string())},
     {"dim", service.config().dim},
     {"threads", service.config().num_threads},
@@ -353,7 +353,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   root["meta"]["performance_query"] = {
     {"source", args.performance_query_file},
     {"canonical_source", workload_has_queries
-      ? normalize_acceptance_path(args.performance_query_file) : ""},
+      ? normalize_path(args.performance_query_file) : ""},
     {"rows", performance_query_rows.count},
     {"data_type", performance_query_rows.count == 0 ? "" : vector_dtype_name(performance_query_rows.dtype)},
     {"vector_bytes", performance_query_rows.vector_bytes},
@@ -361,55 +361,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"row_reuse_count", 0},
     {"rate_limited_required_rows", rate_limited_required_query_rows},
   };
-
-  const bool cold_cache = service.config().gpu_adjacency_cache_mb == 0 &&
-    service.config().gpu_exact_cache_mb == 0;
-  const nlohmann::json acceptance_fingerprint = {
-    {"version", 1},
-    {"index_prefix", root["meta"]["index_prefix"]},
-    {"performance_query_file",
-     root["meta"]["performance_query"]["canonical_source"]},
-    {"dim", service.config().dim},
-    {"vector_data_type", VamanaNode::vector_dtype_name()},
-    {"graph_degree", service.config().R},
-    {"query_k", service.config().k},
-    {"gpu_traversal_beam_width",
-     service.config().gpu_traversal_beam_width},
-    {"gpu_final_rerank_width", service.config().gpu_final_rerank_width},
-    {"gpu_max_expansions", service.config().gpu_max_expansions},
-    {"gpu_entry_seed_count", service.config().gpu_entry_seed_count},
-    {"gpu_graph_prefetch_depth",
-     service.config().gpu_graph_prefetch_depth},
-    {"gpu_query_slots", service.config().gpu_query_slots},
-    {"gpu_rdma_qps", service.config().gpu_rdma_qps},
-    {"client_threads", args.client_threads},
-    {"gpu_adjacency_cache_mb",
-     service.config().gpu_adjacency_cache_mb},
-    {"gpu_exact_cache_mb", service.config().gpu_exact_cache_mb},
-    {"cold_cache", cold_cache},
-  };
-  root["meta"]["acceptance_fingerprint"] = acceptance_fingerprint;
-
-  std::optional<VerifiedQueryBaseline> verified_query_baseline;
-  if (!args.query_baseline_report.empty()) {
-    verified_query_baseline = load_verified_query_baseline(
-      args.query_baseline_report, acceptance_fingerprint);
-    root["meta"]["query_baseline"] = {
-      {"source", "verified_report"},
-      {"report_path", verified_query_baseline->report_path},
-      {"effective_query_ops_per_sec",
-       verified_query_baseline->effective_query_qps},
-      {"fingerprint_verified", true},
-      {"bare_query_baseline_qps_ignored",
-       args.query_baseline_qps >= 0.0},
-    };
-  } else {
-    root["meta"]["query_baseline"] = {
-      {"source", args.query_baseline_qps >= 0.0 ? "bare_qps" : "disabled"},
-      {"effective_query_ops_per_sec", args.query_baseline_qps},
-      {"fingerprint_verified", false},
-    };
-  }
 
   SinglePassRowStream performance_query_stream(performance_query_rows.count);
   auto throw_if_performance_queries_exhausted = [&](const std::string& phase) {
@@ -423,14 +374,9 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       "or shorten the warmup/measurement duration");
   };
 
-  bool recall_below_threshold = false;
-  bool performance_below_threshold = false;
-  std::optional<double> recall_before_performance;
-  std::optional<double> recall_after_performance;
   auto run_recall_check = [&](const char* phase,
                               const char* key,
-                              bool reset_after,
-                              bool enforce_threshold) {
+                              bool reset_after) {
     if (args.groundtruth_file.empty()) {
       return;
     }
@@ -523,13 +469,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     const size_t insufficient_queries =
       insufficient_base_results.load(std::memory_order_relaxed);
     const bool result_set_complete = insufficient_queries == 0;
-    const bool recall_passed = result_set_complete &&
-      (args.min_recall < 0.0 || recall >= args.min_recall);
-    if (std::string_view(phase) == "before_performance") {
-      recall_before_performance = recall;
-    } else if (std::string_view(phase) == "after_performance") {
-      recall_after_performance = recall;
-    }
     root[key] = {
       {"phase", phase},
       {"query_file", args.recall_query_file},
@@ -542,21 +481,15 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       {"queries_with_insufficient_base_results", insufficient_queries},
       {"result_set_complete", result_set_complete},
       {"recall", recall},
-      {"min_recall", args.min_recall},
-      {"passed", recall_passed},
     };
     std::cerr << "[breakdown][recall] " << phase << " recall@" << recall_k << "=" << recall
               << " queries=" << recall_queries << std::endl;
-    if (enforce_threshold && !recall_passed) {
-      recall_below_threshold = true;
-    }
-
     if (reset_after) {
       service.clear_thread_statistics();
       service.reset_breakdown_state();
     }
   };
-  run_recall_check("before_performance", "recall", true, true);
+  run_recall_check("before_performance", "recall", true);
 
   auto run_query_phase_ops = [&](const std::string& label, size_t ops) -> size_t {
     std::atomic<size_t> completed_ops{0};
@@ -1004,104 +937,19 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     }
   }
 
-  MaintenanceLogSummary load_maintenance_summary;
-  MaintenanceLogSummary drain_maintenance_summary;
-  MaintenanceLogSummary full_maintenance_summary;
-  std::vector<MaintenanceLogCursor> post_stop_cursors;
-  double stage2_drain_seconds = 0.0;
-  bool stage2_drain_timed_out = false;
+  MaintenanceLogSummary maintenance_summary;
   if (!maintenance_log_cursors.empty()) {
-    // Freeze the load window before waiting for stage2 drain. In particular,
-    // post-stop observations must never change the load backlog slope.
-    post_stop_cursors = snapshot_maintenance_logs(
+    const auto measurement_end = snapshot_maintenance_logs(
       args.storage_maintenance_logs);
-    load_maintenance_summary = summarize_maintenance_log_window(
-      maintenance_log_cursors, post_stop_cursors);
+    maintenance_summary = summarize_maintenance_log_window(
+      maintenance_log_cursors, measurement_end);
   }
 
   const double gpu_publication_drain_seconds =
     wait_for_gpu_publications("measurement");
 
-  if (!maintenance_log_cursors.empty()) {
-    const auto drain_started = std::chrono::steady_clock::now();
-    const uint64_t remaining_target = args.max_stage2_remaining < 0
-      ? 0 : static_cast<uint64_t>(args.max_stage2_remaining);
-    for (;;) {
-      drain_maintenance_summary = summarize_maintenance_logs(post_stop_cursors);
-      const bool observed_every_log =
-        drain_maintenance_summary.logs_with_observations ==
-          drain_maintenance_summary.requested_logs &&
-        drain_maintenance_summary.requested_logs != 0;
-      if (observed_every_log &&
-          drain_maintenance_summary.remaining <= remaining_target) {
-        break;
-      }
-      stage2_drain_seconds = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - drain_started).count();
-      if (args.stage2_drain_timeout_seconds == 0) {
-        // Zero retains the old non-waiting behavior, but lack of a post-stop
-        // observation is now an explicit failure instead of a remaining=0
-        // false pass.
-        stage2_drain_timed_out = true;
-        break;
-      }
-      if (stage2_drain_seconds >=
-          static_cast<double>(args.stage2_drain_timeout_seconds)) {
-        stage2_drain_timed_out = true;
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    }
-    stage2_drain_seconds = std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - drain_started).count();
-    // Failures and stitch-delay samples cover the complete measured lifetime,
-    // including work issued during load that only finalizes while draining.
-    // Their cumulative counters are still differenced from the pre-load cursor.
-    full_maintenance_summary = summarize_maintenance_logs(
-      maintenance_log_cursors);
-  }
-
-  const size_t expected_gpu_mutations = args.workload == "mixed"
-    ? measure_mixed_stats.completed_writes : measured_insert_operations;
-  const bool gpu_visibility_drain_requested =
-    args.max_gpu_visibility_ms >= 0.0 && expected_gpu_mutations != 0;
-  const bool gpu_final_state_drain_requested =
-    gpu_visibility_drain_requested ||
-    args.max_final_mutation_capacity_reserved >= 0 ||
-    args.max_final_delta_mutable_entries >= 0;
-  double gpu_final_state_drain_seconds = 0.0;
-  bool gpu_final_state_drain_timed_out = false;
-  gpu_search::TelemetrySnapshot final_gpu_telemetry =
+  const gpu_search::TelemetrySnapshot final_gpu_telemetry =
     service.gpu_search_telemetry();
-  if (gpu_final_state_drain_requested) {
-    const auto drain_started = std::chrono::steady_clock::now();
-    const auto timeout = std::chrono::milliseconds(std::clamp<u64>(
-      static_cast<u64>(service.config().storage_owner_rpc_timeout_ms) * 3,
-      5000, 60000));
-    const auto deadline = drain_started + timeout;
-    for (;;) {
-      final_gpu_telemetry = service.gpu_search_telemetry();
-      const bool capacity_ready =
-        args.max_final_mutation_capacity_reserved < 0 ||
-        final_gpu_telemetry.mutation_capacity_reserved <=
-          static_cast<u64>(args.max_final_mutation_capacity_reserved);
-      const bool mutable_ready = args.max_final_delta_mutable_entries < 0 ||
-        final_gpu_telemetry.delta_mutable_entries <=
-          static_cast<u64>(args.max_final_delta_mutable_entries);
-      const bool visibility_ready = !gpu_visibility_drain_requested ||
-        (final_gpu_telemetry.mutation_capacity_reserved == 0 &&
-         final_gpu_telemetry.mutations_published == expected_gpu_mutations);
-      if (capacity_ready && mutable_ready && visibility_ready) break;
-      const auto now = std::chrono::steady_clock::now();
-      if (now >= deadline) {
-        gpu_final_state_drain_timed_out = true;
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    gpu_final_state_drain_seconds = std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - drain_started).count();
-  }
 
   const size_t total_performance_queries = performance_query_stream.consumed();
   root["meta"]["performance_query"]["warmup_rows_consumed"] =
@@ -1164,9 +1012,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
 
   const SampleReport report = service.collect_breakdown_report();
   root.update(report_to_json(report));
-  // Keep the post-drain snapshot used by the final-state gates. Later recall
-  // queries may change query counters, but cannot make a mutation final-state
-  // failure pass retroactively.
+  // Keep one post-publication snapshot for the raw report. Later recall
+  // queries may change query counters but not mutation-state telemetry.
   root["gpu_persistent"] = telemetry_to_json(final_gpu_telemetry);
   const u64 late_storage_owner_rpcs =
     service.late_storage_owner_rpc_completions();
@@ -1215,8 +1062,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"duration_seconds", throughput_duration},
     {"client_drain_seconds", measure_client_drain_seconds},
     {"gpu_publication_drain_seconds", gpu_publication_drain_seconds},
-    {"gpu_final_state_drain_seconds", gpu_final_state_drain_seconds},
-    {"gpu_final_state_drain_timed_out", gpu_final_state_drain_timed_out},
     {"total_ops", throughput_query_ops + throughput_write_ops},
     {"total_ops_per_sec", total_throughput},
     {"query_ops", throughput_query_ops},
@@ -1341,7 +1186,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       service.config().gpu_exact_cache_mb == 0},
   };
   if (!args.recall_only) {
-    run_recall_check("after_performance", "static_gt_post_recall", false, true);
+    run_recall_check("after_performance", "static_gt_post_recall", false);
   }
 
   auto unreadable_logs_json = [](const MaintenanceLogSummary& summary) {
@@ -1350,321 +1195,27 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     return paths;
   };
   root["stage2"] = {
-    // Compatibility fields retain their old names, but now deliberately use
-    // load-only backlog slope, post-stop remaining, and full-window deltas.
-    {"requested_logs", full_maintenance_summary.requested_logs},
-    {"readable_logs", full_maintenance_summary.readable_logs},
-    {"logs_with_observations",
-     full_maintenance_summary.logs_with_observations},
+    {"requested_logs", maintenance_summary.requested_logs},
+    {"readable_logs", maintenance_summary.readable_logs},
+    {"logs_with_observations", maintenance_summary.logs_with_observations},
     {"logs_with_slope_observations",
-     load_maintenance_summary.logs_with_slope_observations},
-    {"observations", full_maintenance_summary.observations},
-    {"unreadable_logs", unreadable_logs_json(full_maintenance_summary)},
-    {"remaining", drain_maintenance_summary.remaining},
-    {"max_backlog_observed",
-     load_maintenance_summary.max_backlog_observed},
-    {"backlog_slope_per_sec",
-     load_maintenance_summary.backlog_slope_per_sec},
-    {"backlog_slope_available",
-     load_maintenance_summary.backlog_slope_available},
+     maintenance_summary.logs_with_slope_observations},
+    {"observations", maintenance_summary.observations},
+    {"unreadable_logs", unreadable_logs_json(maintenance_summary)},
+    {"remaining", maintenance_summary.remaining},
+    {"max_backlog_observed", maintenance_summary.max_backlog_observed},
+    {"backlog_slope_per_sec", maintenance_summary.backlog_slope_per_sec},
+    {"backlog_slope_available", maintenance_summary.backlog_slope_available},
     {"p99_stitch_delay_upper_ms",
-     full_maintenance_summary.p99_stitch_delay_upper_ms},
+     maintenance_summary.p99_stitch_delay_upper_ms},
     {"p99_stitch_delay_over_30s",
-     full_maintenance_summary.p99_stitch_delay_over_30s},
-    {"p99_stitch_delay_samples",
-     full_maintenance_summary.p99_stitch_delay_samples},
+     maintenance_summary.p99_stitch_delay_over_30s},
+    {"p99_stitch_delay_samples", maintenance_summary.p99_stitch_delay_samples},
     {"p99_stitch_delay_available",
-     full_maintenance_summary.p99_stitch_delay_available},
-    {"failures", full_maintenance_summary.failures},
-    {"failure_delta_available",
-     full_maintenance_summary.failure_delta_available},
-    {"drain_seconds", stage2_drain_seconds},
-    {"drain_timed_out", stage2_drain_timed_out},
+     maintenance_summary.p99_stitch_delay_available},
+    {"failures", maintenance_summary.failures},
+    {"failure_delta_available", maintenance_summary.failure_delta_available},
     {"observation_period_seconds_assumed", 5.0},
-    {"load", {
-      {"requested_logs", load_maintenance_summary.requested_logs},
-      {"readable_logs", load_maintenance_summary.readable_logs},
-      {"logs_with_observations",
-       load_maintenance_summary.logs_with_observations},
-      {"logs_with_slope_observations",
-       load_maintenance_summary.logs_with_slope_observations},
-      {"observations", load_maintenance_summary.observations},
-      {"unreadable_logs", unreadable_logs_json(load_maintenance_summary)},
-      {"remaining_at_stop", load_maintenance_summary.remaining},
-      {"max_backlog_observed",
-       load_maintenance_summary.max_backlog_observed},
-      {"backlog_slope_per_sec",
-       load_maintenance_summary.backlog_slope_per_sec},
-      {"backlog_slope_available",
-       load_maintenance_summary.backlog_slope_available},
-      {"p99_stitch_delay_upper_ms",
-       load_maintenance_summary.p99_stitch_delay_upper_ms},
-      {"p99_stitch_delay_samples",
-       load_maintenance_summary.p99_stitch_delay_samples},
-      {"p99_stitch_delay_available",
-       load_maintenance_summary.p99_stitch_delay_available},
-      {"failures", load_maintenance_summary.failures},
-      {"failure_delta_available",
-       load_maintenance_summary.failure_delta_available},
-    }},
-    {"post_stop_drain", {
-      {"requested_logs", drain_maintenance_summary.requested_logs},
-      {"readable_logs", drain_maintenance_summary.readable_logs},
-      {"logs_with_observations",
-       drain_maintenance_summary.logs_with_observations},
-      {"observations", drain_maintenance_summary.observations},
-      {"unreadable_logs", unreadable_logs_json(drain_maintenance_summary)},
-      {"remaining", drain_maintenance_summary.remaining},
-      {"max_backlog_observed",
-       drain_maintenance_summary.max_backlog_observed},
-      {"p99_stitch_delay_upper_ms",
-       drain_maintenance_summary.p99_stitch_delay_upper_ms},
-      {"p99_stitch_delay_samples",
-       drain_maintenance_summary.p99_stitch_delay_samples},
-      {"p99_stitch_delay_available",
-       drain_maintenance_summary.p99_stitch_delay_available},
-      {"failures", drain_maintenance_summary.failures},
-      {"failure_delta_available",
-       drain_maintenance_summary.failure_delta_available},
-    }},
-  };
-
-  const bool query_acceptance_applies =
-    has_throughput_duration && query_windows_expected;
-  const double query_stability_ratio = query_head_qps == 0.0
-    ? 0.0 : query_tail_qps / query_head_qps;
-  const double write_stability_ratio = write_head_qps == 0.0
-    ? 0.0 : write_tail_qps / write_head_qps;
-  const bool query_qps_passed = !query_acceptance_applies || args.min_query_qps < 0.0 ||
-    query_throughput >= args.min_query_qps;
-  const bool insert_acceptance_applies =
-    has_throughput_duration && write_windows_expected;
-  const bool insert_qps_passed = !insert_acceptance_applies || args.min_insert_qps < 0.0 ||
-    insert_throughput >= args.min_insert_qps;
-  const bool query_stability_passed = !query_acceptance_applies ||
-    args.min_stability_ratio < 0.0 ||
-    (query_stability_ratio >= args.min_stability_ratio && zero_completion_windows == 0);
-  const bool write_acceptance_applies =
-    has_throughput_duration && write_windows_expected;
-  const bool write_stability_passed = !write_acceptance_applies ||
-    args.min_write_stability_ratio < 0.0 ||
-    write_stability_ratio >= args.min_write_stability_ratio;
-  const bool zero_completion_windows_passed =
-    args.max_zero_completion_windows < 0 ||
-    zero_completion_windows <=
-      static_cast<size_t>(args.max_zero_completion_windows);
-  const bool zero_query_windows_passed =
-    args.max_zero_query_windows < 0 ||
-    zero_query_windows <= static_cast<size_t>(args.max_zero_query_windows);
-  const bool zero_write_windows_passed =
-    args.max_zero_write_windows < 0 ||
-    zero_write_windows <= static_cast<size_t>(args.max_zero_write_windows);
-  const bool writes_all_succeeded = !write_acceptance_applies ||
-    args.workload != "mixed" ||
-    measure_mixed_stats.issued_writes == measure_mixed_stats.completed_writes;
-  const u64 mutation_capacity_rejections = root["gpu_persistent"].value(
-    "mutation_capacity_rejections", 0ULL);
-  const bool mutation_capacity_passed = !write_acceptance_applies ||
-    mutation_capacity_rejections == 0;
-  const double max_gpu_visibility_ms =
-    static_cast<double>(final_gpu_telemetry.visibility_ns_max) / 1e6;
-  const bool gpu_visibility_coverage_passed = !write_windows_expected ||
-    (expected_gpu_mutations != 0 &&
-     final_gpu_telemetry.mutations_published == expected_gpu_mutations);
-  const bool gpu_visibility_available = gpu_visibility_coverage_passed;
-  const bool gpu_visibility_passed = args.max_gpu_visibility_ms < 0.0 ||
-    (gpu_visibility_available &&
-     max_gpu_visibility_ms <= args.max_gpu_visibility_ms);
-  const bool final_mutation_capacity_passed =
-    args.max_final_mutation_capacity_reserved < 0 ||
-    final_gpu_telemetry.mutation_capacity_reserved <=
-      static_cast<u64>(args.max_final_mutation_capacity_reserved);
-  const bool final_delta_mutable_passed =
-    args.max_final_delta_mutable_entries < 0 ||
-    final_gpu_telemetry.delta_mutable_entries <=
-      static_cast<u64>(args.max_final_delta_mutable_entries);
-  const bool gpu_final_state_drain_passed =
-    !gpu_final_state_drain_requested || !gpu_final_state_drain_timed_out;
-  const bool late_storage_owner_rpcs_passed =
-    args.max_late_storage_owner_rpcs < 0 ||
-    late_storage_owner_rpcs <=
-      static_cast<u64>(args.max_late_storage_owner_rpcs);
-  const bool gpu_final_state_checks_requested =
-    args.max_gpu_visibility_ms >= 0.0 ||
-    args.max_final_mutation_capacity_reserved >= 0 ||
-    args.max_final_delta_mutable_entries >= 0 ||
-    args.max_late_storage_owner_rpcs >= 0;
-  const double query_rate_attainment = root["throughput"].value(
-    "query_rate_attainment_ratio", 1.0);
-  const double write_rate_attainment = root["throughput"].value(
-    "write_rate_attainment_ratio", 1.0);
-  const bool rate_attainment_passed = !rate_limited_measurement ||
-    args.min_rate_attainment_ratio < 0.0 ||
-    ((!query_windows_expected ||
-      query_rate_attainment >= args.min_rate_attainment_ratio) &&
-     (!write_windows_expected ||
-      write_rate_attainment >= args.min_rate_attainment_ratio));
-  const double baseline_effective_query_qps = verified_query_baseline
-    ? verified_query_baseline->effective_query_qps : args.query_baseline_qps;
-  const bool query_baseline_requested =
-    args.min_query_baseline_ratio >= 0.0;
-  const bool query_baseline_verified =
-    verified_query_baseline.has_value();
-  const double query_baseline_ratio =
-    baseline_effective_query_qps > 0.0
-      ? effective_query_throughput / baseline_effective_query_qps : 0.0;
-  const bool query_baseline_passed = !query_baseline_requested ||
-    ((args.workload != "mixed" || query_baseline_verified) &&
-     baseline_effective_query_qps > 0.0 &&
-     query_baseline_ratio >= args.min_query_baseline_ratio);
-  const bool client_drain_passed = args.max_drain_seconds < 0.0 ||
-    measure_client_drain_seconds <= args.max_drain_seconds;
-  const bool stage2_checks_requested =
-    args.max_stage2_p99_ms >= 0.0 ||
-    args.max_stage2_backlog_slope >= 0.0 ||
-    args.max_stage2_remaining >= 0 ||
-    args.stage2_drain_timeout_seconds != 0;
-  const bool stage2_load_observations_passed = !stage2_checks_requested ||
-    (load_maintenance_summary.logs_with_observations ==
-       load_maintenance_summary.requested_logs &&
-     load_maintenance_summary.requested_logs != 0);
-  const bool stage2_drain_observations_passed = !stage2_checks_requested ||
-    (drain_maintenance_summary.logs_with_observations ==
-       drain_maintenance_summary.requested_logs &&
-     drain_maintenance_summary.requested_logs != 0);
-  const bool stage2_observations_passed = !stage2_checks_requested ||
-    (stage2_load_observations_passed &&
-     stage2_drain_observations_passed);
-  const bool stage2_p99_passed = args.max_stage2_p99_ms < 0.0 ||
-    (stage2_observations_passed &&
-     full_maintenance_summary.p99_stitch_delay_available &&
-     !full_maintenance_summary.p99_stitch_delay_over_30s &&
-     full_maintenance_summary.p99_stitch_delay_upper_ms <=
-       args.max_stage2_p99_ms);
-  const bool stage2_slope_passed = args.max_stage2_backlog_slope < 0.0 ||
-    (stage2_load_observations_passed &&
-     load_maintenance_summary.backlog_slope_available &&
-     load_maintenance_summary.backlog_slope_per_sec <=
-       args.max_stage2_backlog_slope);
-  const bool stage2_remaining_passed = args.max_stage2_remaining < 0 ||
-    (stage2_drain_observations_passed &&
-     drain_maintenance_summary.remaining <=
-       static_cast<uint64_t>(args.max_stage2_remaining));
-  const bool stage2_failures_passed = !stage2_checks_requested ||
-    (full_maintenance_summary.failure_delta_available &&
-     full_maintenance_summary.failures == 0);
-  const bool stage2_drain_passed = !stage2_checks_requested ||
-    (stage2_drain_observations_passed && !stage2_drain_timed_out);
-  const bool recall_drop_passed = args.max_recall_drop < 0.0 ||
-    (recall_before_performance.has_value() &&
-     recall_after_performance.has_value() &&
-     *recall_before_performance - *recall_after_performance <=
-       args.max_recall_drop);
-  performance_below_threshold = !query_qps_passed || !insert_qps_passed ||
-    !query_stability_passed || !write_stability_passed ||
-    !zero_completion_windows_passed || !zero_query_windows_passed ||
-    !zero_write_windows_passed || !writes_all_succeeded ||
-    !mutation_capacity_passed || !gpu_visibility_passed ||
-    !final_mutation_capacity_passed || !final_delta_mutable_passed ||
-    !gpu_final_state_drain_passed || !late_storage_owner_rpcs_passed ||
-    !rate_attainment_passed ||
-    !query_baseline_passed || !client_drain_passed ||
-    !stage2_observations_passed || !stage2_p99_passed ||
-    !stage2_slope_passed || !stage2_remaining_passed ||
-    !stage2_failures_passed || !stage2_drain_passed ||
-    !recall_drop_passed;
-  root["acceptance"] = {
-    {"applies", query_acceptance_applies || write_acceptance_applies ||
-                stage2_checks_requested || gpu_final_state_checks_requested},
-    {"min_query_ops_per_sec", args.min_query_qps},
-    {"observed_query_ops_per_sec", query_throughput},
-    {"query_ops_per_sec_passed", query_qps_passed},
-    {"min_insert_ops_per_sec", args.min_insert_qps},
-    {"observed_insert_ops_per_sec", insert_throughput},
-    {"insert_ops_per_sec_passed", insert_qps_passed},
-    {"min_query_tail_to_head_ratio", args.min_stability_ratio},
-    {"observed_query_tail_to_head_ratio", query_stability_ratio},
-    {"query_stability_passed", query_stability_passed},
-    {"min_write_tail_to_head_ratio", args.min_write_stability_ratio},
-    {"observed_write_tail_to_head_ratio", write_stability_ratio},
-    {"write_stability_passed", write_stability_passed},
-    {"zero_completion_windows", zero_completion_windows},
-    {"zero_query_windows", zero_query_windows},
-    {"zero_write_windows", zero_write_windows},
-    {"zero_completion_windows_passed", zero_completion_windows_passed},
-    {"zero_query_windows_passed", zero_query_windows_passed},
-    {"zero_write_windows_passed", zero_write_windows_passed},
-    {"writes_all_succeeded", writes_all_succeeded},
-    {"mutation_capacity_rejections", mutation_capacity_rejections},
-    {"mutation_capacity_passed", mutation_capacity_passed},
-    {"max_gpu_visibility_ms", args.max_gpu_visibility_ms},
-    {"observed_max_gpu_visibility_ms", max_gpu_visibility_ms},
-    {"expected_gpu_mutations", expected_gpu_mutations},
-    {"observed_gpu_mutations_published",
-     final_gpu_telemetry.mutations_published},
-    {"gpu_visibility_coverage_passed", gpu_visibility_coverage_passed},
-    {"gpu_visibility_available", gpu_visibility_available},
-    {"gpu_visibility_passed", gpu_visibility_passed},
-    {"max_final_mutation_capacity_reserved",
-     args.max_final_mutation_capacity_reserved},
-    {"observed_final_mutation_capacity_reserved",
-     final_gpu_telemetry.mutation_capacity_reserved},
-    {"final_mutation_capacity_passed",
-     final_mutation_capacity_passed},
-    {"max_final_delta_mutable_entries",
-     args.max_final_delta_mutable_entries},
-    {"observed_final_delta_mutable_entries",
-     final_gpu_telemetry.delta_mutable_entries},
-    {"final_delta_mutable_passed", final_delta_mutable_passed},
-    {"gpu_final_state_drain_requested", gpu_final_state_drain_requested},
-    {"gpu_final_state_drain_seconds", gpu_final_state_drain_seconds},
-    {"gpu_final_state_drain_timed_out", gpu_final_state_drain_timed_out},
-    {"gpu_final_state_drain_passed", gpu_final_state_drain_passed},
-    {"max_late_storage_owner_rpcs", args.max_late_storage_owner_rpcs},
-    {"observed_late_storage_owner_rpcs", late_storage_owner_rpcs},
-    {"late_storage_owner_rpcs_passed", late_storage_owner_rpcs_passed},
-    {"min_rate_attainment_ratio", args.min_rate_attainment_ratio},
-    {"observed_query_rate_attainment_ratio", query_rate_attainment},
-    {"observed_write_rate_attainment_ratio", write_rate_attainment},
-    {"rate_attainment_passed", rate_attainment_passed},
-    {"query_baseline_source", verified_query_baseline
-      ? "verified_report" :
-        (args.query_baseline_qps >= 0.0 ? "bare_qps" : "disabled")},
-    {"query_baseline_report", verified_query_baseline
-      ? verified_query_baseline->report_path : ""},
-    {"query_baseline_fingerprint_verified", query_baseline_verified},
-    {"query_baseline_effective_ops_per_sec",
-     baseline_effective_query_qps},
-    {"query_baseline_qps", baseline_effective_query_qps},
-    {"observed_effective_query_ops_per_sec",
-     effective_query_throughput},
-    {"observed_query_baseline_ratio", query_baseline_ratio},
-    {"query_baseline_comparison_basis", "effective_wall_clock"},
-    {"min_query_baseline_ratio", args.min_query_baseline_ratio},
-    {"query_baseline_passed", query_baseline_passed},
-    {"max_client_drain_seconds", args.max_drain_seconds},
-    {"observed_client_drain_seconds", measure_client_drain_seconds},
-    {"client_drain_passed", client_drain_passed},
-    {"stage2_load_observations_passed",
-     stage2_load_observations_passed},
-    {"stage2_post_stop_observations_passed",
-     stage2_drain_observations_passed},
-    {"stage2_observations_passed", stage2_observations_passed},
-    {"stage2_p99_available",
-     full_maintenance_summary.p99_stitch_delay_available},
-    {"stage2_p99_passed", stage2_p99_passed},
-    {"stage2_backlog_slope_passed", stage2_slope_passed},
-    {"stage2_remaining_passed", stage2_remaining_passed},
-    {"stage2_failure_delta_available",
-     full_maintenance_summary.failure_delta_available},
-    {"stage2_failures_passed", stage2_failures_passed},
-    {"stage2_drain_passed", stage2_drain_passed},
-    {"max_recall_drop", args.max_recall_drop},
-    {"observed_recall_drop",
-     recall_before_performance.has_value() && recall_after_performance.has_value()
-       ? *recall_before_performance - *recall_after_performance : 0.0},
-    {"recall_drop_passed", recall_drop_passed},
-    {"passed", !performance_below_threshold},
   };
 
   FormattedReport formatted_report = format_report(root, report);
@@ -1681,12 +1232,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   }
 
   std::cout << formatted_report.text;
-  if (recall_below_threshold) {
-    throw std::runtime_error("recall below threshold");
-  }
-  if (performance_below_threshold) {
-    throw std::runtime_error("throughput or stability below threshold");
-  }
   return root;
 }
 

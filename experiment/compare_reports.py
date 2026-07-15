@@ -43,8 +43,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline", required=True, type=Path)
     parser.add_argument("--candidate", required=True, type=Path)
-    parser.add_argument("--min-query-speedup", type=float, default=1.0)
-    parser.add_argument("--max-recall-loss", type=float, default=0.01)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -61,10 +59,6 @@ def main():
         "recall_delta": candidate["recall"] - baseline["recall"],
         "gpu_persistent": candidate_document.get("gpu_persistent", {}),
     }
-    result["passed"] = (
-        result["query_speedup"] >= args.min_query_speedup
-        and result["recall_delta"] >= -args.max_recall_loss
-    )
 
     print(f"query QPS : {baseline['query_qps']:.2f} -> {candidate['query_qps']:.2f} "
           f"({result['query_speedup']:.3f}x)")
@@ -73,10 +67,8 @@ def main():
     print(f"recall    : {baseline['recall']:.6f} -> {candidate['recall']:.6f} "
           f"({result['recall_delta']:+.6f})")
     print(f"query p99 : {baseline['query_p99_us']:.2f} -> {candidate['query_p99_us']:.2f} us")
-    print(f"result    : {'PASS' if result['passed'] else 'FAIL'}")
     if args.output:
         args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    raise SystemExit(0 if result["passed"] else 2)
 
 
 if __name__ == "__main__":

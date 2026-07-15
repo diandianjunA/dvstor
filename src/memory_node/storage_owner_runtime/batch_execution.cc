@@ -5,8 +5,6 @@ using namespace memory_node_storage_owner_runtime_detail;
 bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
                                              const service::storage_owner::MutationKind* kinds,
                                              const element_t* vectors,
-                                             const u64* anchor_hints,
-                                             u32 anchor_hint_count,
                                              size_t item_count,
                                              StorageOwnerThread& thread,
                                              InsertBreakdownCounters& breakdown,
@@ -41,15 +39,6 @@ bool MemoryNode::execute_storage_owner_batch_items_async(const node_t* ids,
     std::memcpy(job.vector_data.data(),
                 vectors + idx * VamanaNode::DIM,
                 static_cast<size_t>(VamanaNode::DIM) * sizeof(element_t));
-    if (anchor_hints != nullptr) {
-      job.anchor_hints.reserve(anchor_hint_count);
-      for (u32 hint = 0; hint < anchor_hint_count; ++hint) {
-        const RemotePtr ptr{anchor_hints[idx * anchor_hint_count + hint]};
-        if (!ptr.is_null()) {
-          job.anchor_hints.push_back(ptr);
-        }
-      }
-    }
     jobs.push_back(std::move(job));
   }
 

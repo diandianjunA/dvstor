@@ -1,4 +1,5 @@
 #include "service/compute_service/detail.hh"
+#include "service/compute_service/storage_owner/response_validation.hh"
 
 using namespace compute_service_detail;
 
@@ -15,7 +16,7 @@ void ComputeService::handle_storage_owner_send_completion(
 }
 
 void ComputeService::handle_storage_owner_response(
-    u32 owner_storage, u32 response_slot_id) {
+    u32 owner_storage, u32 response_slot_id, u32 received_bytes) {
   if (owner_storage >= storage_insert_owners_.size()) return;
   auto& state = *storage_insert_owners_[owner_storage];
   if (response_slot_id >= state.response_slots.size()) return;
@@ -24,13 +25,9 @@ void ComputeService::handle_storage_owner_response(
   const auto* response = reinterpret_cast<const
     service::storage_owner::InsertBatchResponseHeader*>(
       response_slot.buffer.data());
-  const bool header_ok =
-    (response->magic == service::storage_owner::kInsertMagic ||
-     response->magic == service::storage_owner::kMutationMagic) &&
-    response->owner_storage == owner_storage;
-
   StorageOwnerRpcSlot* matched = nullptr;
-  if (header_ok) {
+  if (received_bytes >=
+      sizeof(service::storage_owner::InsertBatchResponseHeader)) {
     for (auto& slot : state.slots) {
       if (slot.in_use && !slot.response_done &&
           slot.batch_id == response->batch_id) {
@@ -50,19 +47,30 @@ void ComputeService::handle_storage_owner_response(
                 << " magic=0x" << std::hex << response->magic << std::dec
                 << " response_owner=" << response->owner_storage
                 << " batch_id=" << response->batch_id
-                << " item_count=" << response->item_count << std::endl;
+                << " item_count=" << response->item_count
+                << " received_bytes=" << received_bytes << std::endl;
     }
     post_storage_owner_response_receive(owner_storage, response_slot_id);
     return;
   }
 
-  const size_t response_size =
-    service::storage_owner::insert_batch_response_bytes(response->item_count);
-  if (response_size > response_slot.buffer.size()) {
-    post_storage_owner_response_receive(owner_storage, response_slot_id);
-    return;
-  }
+  const auto* request = reinterpret_cast<const
+    service::storage_owner::InsertBatchRequestHeader*>(
+      matched->request_buffer.data());
+  const auto validation = validate_storage_owner_response(
+    *response,
+    received_bytes,
+    response_slot.buffer.size(),
+    request->magic,
+    owner_storage,
+    matched->item_count,
+    matched->batch_id,
+    matched->response_size);
+  lib_assert(validation != StorageOwnerResponseValidation::unmatched,
+             "batch-id matched response was classified as unmatched");
   matched->response_done = true;
+  matched->response_valid =
+    validation == StorageOwnerResponseValidation::matched_valid;
   matched->response_slot_id = response_slot_id;
   matched->response_completed_at = std::chrono::steady_clock::now();
   matched->cq_progress_gap_ns = storage_insert_current_cq_gap_ns_;
@@ -105,26 +113,27 @@ void ComputeService::run_storage_insert_completion_loop() {
       return;
     }
 
-    StorageOwnerPublicationBatch publication;
-    commit_storage_owner_slot(
-      ready.owner_storage, ready.slot_id, publication);
-    release_storage_owner_slot(ready.owner_storage, ready.slot_id);
+    auto& state = *storage_insert_owners_[ready.owner_storage];
+    auto& slot = state.slots[ready.slot_id];
+    commit_storage_owner_slot(ready.owner_storage, ready.slot_id);
 
-    if (publication.mutations.empty()) {
-      if (persistent_search_ != nullptr && publication.reserved_items != 0) {
+    if (slot.publication_mutation_count == 0) {
+      if (persistent_search_ != nullptr &&
+          slot.publication_reserved_items != 0) {
         persistent_search_->release_mutation_capacity(
-          publication.reserved_items);
+          slot.publication_reserved_items);
       }
     } else {
-      publish_storage_owner_mutations(std::move(publication));
+      publish_storage_owner_mutations(slot);
     }
+    // Publication consumes slot-owned spans synchronously. Reuse is safe only
+    // after the GPU command and coordinator handoff have both returned.
+    release_storage_owner_slot(ready.owner_storage, ready.slot_id);
   }
 }
 
 void ComputeService::commit_storage_owner_slot(
-    u32 owner_storage,
-    u32 slot_id,
-    StorageOwnerPublicationBatch& publication) {
+    u32 owner_storage, u32 slot_id) {
   auto& state = *storage_insert_owners_[owner_storage];
   lib_assert(slot_id < state.slots.size(),
              "storage-owner completion references an invalid slot");
@@ -143,7 +152,7 @@ void ComputeService::commit_storage_owner_slot(
   const auto* request = reinterpret_cast<const
     service::storage_owner::InsertBatchRequestHeader*>(
       slot.request_buffer.data());
-  bool response_ok =
+  bool response_ok = slot.response_valid &&
     (response->magic == service::storage_owner::kInsertMagic ||
      response->magic == service::storage_owner::kMutationMagic) &&
     response->magic == request->magic &&
@@ -213,16 +222,16 @@ void ComputeService::commit_storage_owner_slot(
     collect_breakdown && response_wait_ns > memory_breakdown_ns
       ? response_wait_ns - memory_breakdown_ns : 0;
 
-  publication.mutations.reserve(slot.item_count);
-  publication.invalidated_graph_nodes.reserve(
-    static_cast<size_t>(slot.item_count) * config_.R);
+  slot.publication_mutation_count = 0;
+  slot.publication_reserved_items = 0;
+  slot.publication_invalidated_graph_nodes.clear();
   if (persistent_search_ != nullptr && response_ok) {
     const u64* invalidated_raws =
       service::storage_owner::response_invalidated_raws(
         response_buffer, slot.item_count);
     for (u32 index = 0; index < invalidation_count; ++index) {
       if (invalidated_raws[index] != 0) {
-        publication.invalidated_graph_nodes.push_back(
+        slot.publication_invalidated_graph_nodes.push_back(
           invalidated_raws[index]);
       }
     }
@@ -251,7 +260,6 @@ void ComputeService::commit_storage_owner_slot(
       add_storage_owner_sender_breakdown(
         &sample,
         duration_ns_clamped(task.enqueued_at, task.sender_dequeued_at),
-        0,
         slot.request_prepare_ns,
         send_ns,
         response_wait_unaccounted_ns,
@@ -268,37 +276,48 @@ void ComputeService::commit_storage_owner_slot(
           slot.response_completed_at, response_executor_started));
       if (breakdown != nullptr) {
         add_storage_owner_breakdown(&sample, *breakdown, slot.item_count);
-        if (i == 0) add_storage_owner_counters(&sample, *breakdown);
       }
     }
 
     if (committed) {
       const auto& result = results[i];
-      publish_compute_side_id(
+      const bool newest_generation = publish_compute_side_id(
         task.item.id,
         RemotePtr{task.kind == service::storage_owner::MutationKind::erase
                     ? result.old_rptr_raw : result.new_rptr_raw},
         task.kind == service::storage_owner::MutationKind::erase,
         slot.owner_storage,
         result.generation);
-      if (persistent_search_ != nullptr) {
-        gpu_search::DeltaMutation mutation;
+      // Responses from different owner RPC slots may complete out of order.
+      // Only the newest generation may enter the ordered GPU publication
+      // stream; publishing an older completion after a newer one could revive
+      // a tombstoned/upserted route representative.
+      if (persistent_search_ != nullptr && newest_generation) {
+        lib_assert(slot.publication_mutation_count <
+                     slot.publication_mutations.size(),
+                   "storage-owner publication slot overflow");
+        gpu_search::DeltaMutation& mutation =
+          slot.publication_mutations[slot.publication_mutation_count];
         mutation.id = task.item.id;
         mutation.kind = task.kind;
         mutation.generation = result.generation;
         mutation.remote_node = result.new_rptr_raw;
         mutation.old_remote_node = result.old_rptr_raw;
-        mutation.anchor_hint = task.anchor_bucket_hint.raw_address;
+        mutation.anchor_hint = 0;
         mutation.maintenance_sequence = result.maintenance_sequence;
         mutation.owner_storage = owner_storage;
+        mutation.durable = false;
+        mutation.epoch = 0;
         mutation.enqueued_at = slot.response_completed_at;
         if (mutation.kind != service::storage_owner::MutationKind::erase) {
           const byte_t* vector = request_vectors +
             static_cast<size_t>(i) * VamanaNode::vector_bytes();
-          mutation.vector.assign(
-            vector, vector + VamanaNode::vector_bytes());
+          lib_assert(mutation.vector.size() == VamanaNode::vector_bytes(),
+                     "storage-owner publication vector was not preallocated");
+          std::memcpy(
+            mutation.vector.data(), vector, VamanaNode::vector_bytes());
         }
-        publication.mutations.push_back(std::move(mutation));
+        ++slot.publication_mutation_count;
         ++committed_items;
       }
     }
@@ -324,7 +343,7 @@ void ComputeService::commit_storage_owner_slot(
 
   lib_assert(committed_items <= slot.gpu_reserved_items,
              "committed storage mutations exceeded reserved GPU capacity");
-  publication.reserved_items = committed_items;
+  slot.publication_reserved_items = committed_items;
   const u32 release_reserved_items =
     slot.gpu_reserved_items - committed_items;
   if (persistent_search_ != nullptr && release_reserved_items != 0) {
@@ -349,26 +368,25 @@ void ComputeService::release_storage_owner_slot(
 }
 
 void ComputeService::publish_storage_owner_mutations(
-    StorageOwnerPublicationBatch&& publication) {
-  if (persistent_search_ == nullptr || publication.mutations.empty()) {
-    if (persistent_search_ != nullptr && publication.reserved_items != 0) {
+    StorageOwnerRpcSlot& slot) {
+  const std::span<gpu_search::DeltaMutation> mutations{
+    slot.publication_mutations.data(), slot.publication_mutation_count};
+  if (persistent_search_ == nullptr || mutations.empty()) {
+    if (persistent_search_ != nullptr &&
+        slot.publication_reserved_items != 0) {
       persistent_search_->release_mutation_capacity(
-        publication.reserved_items);
+        slot.publication_reserved_items);
     }
     return;
   }
 
-  std::sort(publication.invalidated_graph_nodes.begin(),
-            publication.invalidated_graph_nodes.end());
-  publication.invalidated_graph_nodes.erase(
-    std::unique(publication.invalidated_graph_nodes.begin(),
-                publication.invalidated_graph_nodes.end()),
-    publication.invalidated_graph_nodes.end());
+  auto& invalidated = slot.publication_invalidated_graph_nodes;
+  std::sort(invalidated.begin(), invalidated.end());
+  invalidated.erase(
+    std::unique(invalidated.begin(), invalidated.end()), invalidated.end());
   try {
-    const u64 epoch = persistent_search_->delta().reserve_epoch();
     if (!persistent_search_->publish_mutations(
-          std::move(publication.mutations), epoch,
-          publication.invalidated_graph_nodes)) {
+          mutations, invalidated)) {
       persistent_search_->mark_committed_mutation_gap(
         "persistent GPU mutation publication returned false");
     }
@@ -383,7 +401,8 @@ void ComputeService::publish_storage_owner_mutations(
                 << error.what() << std::endl;
     }
   }
-  persistent_search_->release_mutation_capacity(publication.reserved_items);
+  persistent_search_->release_mutation_capacity(
+    slot.publication_reserved_items);
 }
 
 void ComputeService::complete_storage_owner_task(
@@ -394,8 +413,6 @@ void ComputeService::complete_storage_owner_task(
   auto& task = state.tasks[task_id];
   const u32 completion_id = task.completion_id;
   task.item.values.clear();
-  task.anchor_hints.clear();
-  task.anchor_bucket_hint = {};
   task.enqueued_at = {};
   task.sender_dequeued_at = {};
   task.completion_id = std::numeric_limits<u32>::max();

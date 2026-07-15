@@ -3,96 +3,22 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
-#include <fstream>
-#include <limits>
 #include <sstream>
 #include <stdexcept>
 
 namespace tools::breakdown_benchmark {
 
-std::string normalize_acceptance_path(const std::string& path) {
+std::string normalize_path(const std::string& path) {
   if (path.empty()) return {};
   std::error_code error;
   const auto absolute = std::filesystem::absolute(path, error);
   if (error) {
     throw std::runtime_error(
-      "failed to make acceptance path absolute: " + path);
+      "failed to make path absolute: " + path);
   }
   const auto canonical = std::filesystem::weakly_canonical(absolute, error);
   if (error) return absolute.lexically_normal().string();
   return canonical.string();
-}
-
-VerifiedQueryBaseline load_verified_query_baseline(
-    const std::string& report_path,
-    const nlohmann::json& expected_fingerprint) {
-  std::ifstream input(report_path);
-  if (!input) {
-    throw std::runtime_error(
-      "failed to open query baseline report: " + report_path);
-  }
-  nlohmann::json baseline;
-  try {
-    input >> baseline;
-  } catch (const std::exception& error) {
-    throw std::runtime_error(
-      "failed to parse query baseline report '" + report_path +
-      "': " + error.what());
-  }
-
-  if (!baseline.is_object() || !baseline.contains("meta") ||
-      !baseline["meta"].is_object()) {
-    throw std::runtime_error(
-      "query baseline report has no metadata object: " + report_path);
-  }
-  const auto& meta = baseline["meta"];
-  if (meta.value("workload", std::string{}) != "query") {
-    throw std::runtime_error(
-      "query baseline report must be produced by --workload query");
-  }
-  if (!meta.contains("acceptance_fingerprint") ||
-      !meta["acceptance_fingerprint"].is_object()) {
-    throw std::runtime_error(
-      "query baseline report has no acceptance fingerprint");
-  }
-  const auto& actual_fingerprint = meta["acceptance_fingerprint"];
-  if (actual_fingerprint != expected_fingerprint) {
-    throw std::runtime_error(
-      "query baseline fingerprint mismatch; expected=" +
-      expected_fingerprint.dump() + " actual=" +
-      actual_fingerprint.dump());
-  }
-  if (!expected_fingerprint.value("cold_cache", false) ||
-      !baseline.contains("stability") ||
-      !baseline["stability"].value("cache_independent_baseline", false)) {
-    throw std::runtime_error(
-      "query baseline report is not a cold-cache baseline");
-  }
-  if (!baseline.contains("acceptance") ||
-      !baseline["acceptance"].value("passed", false)) {
-    throw std::runtime_error(
-      "query baseline report did not pass its own acceptance checks");
-  }
-  if (!baseline.contains("throughput") ||
-      !baseline["throughput"].is_object()) {
-    throw std::runtime_error(
-      "query baseline report has no throughput object");
-  }
-  const auto& throughput = baseline["throughput"];
-  const double effective_qps = throughput.value(
-    "effective_query_ops_per_sec",
-    std::numeric_limits<double>::quiet_NaN());
-  if (!std::isfinite(effective_qps) || effective_qps <= 0.0 ||
-      throughput.value("query_ops", 0ULL) == 0 ||
-      throughput.value("write_ops", 0ULL) != 0) {
-    throw std::runtime_error(
-      "query baseline report has invalid effective query throughput");
-  }
-  return VerifiedQueryBaseline{
-    .report_path = normalize_acceptance_path(report_path),
-    .effective_query_qps = effective_qps,
-    .fingerprint = actual_fingerprint,
-  };
 }
 
 std::vector<uint32_t> filter_base_only_recall_ids(
@@ -157,6 +83,10 @@ nlohmann::json telemetry_to_json(const gpu_search::TelemetrySnapshot& telemetry)
       {"graph_page_cache_hits", telemetry.graph_page_cache_hits},
       {"graph_route_hits", telemetry.graph_route_hits},
       {"graph_route_refreshes", telemetry.graph_route_refreshes},
+      {"dynamic_route_publications", telemetry.dynamic_route_publications},
+      {"dynamic_route_slot_updates", telemetry.dynamic_route_slot_updates},
+      {"dynamic_route_live_slots", telemetry.dynamic_route_live_slots},
+      {"dynamic_route_snapshot_skips", telemetry.dynamic_route_snapshot_skips},
       {"graph_cache_invalidations", telemetry.graph_cache_invalidations},
       {"graph_page_cache_hit_ratio",
         telemetry.graph_page_requests + telemetry.graph_page_cache_hits == 0 ? 0.0
@@ -289,32 +219,6 @@ FormattedReport format_report(const nlohmann::json& root,
     output << "  zero_query/write_windows: "
            << stability.value("zero_query_windows", 0ULL) << "/"
            << stability.value("zero_write_windows", 0ULL) << '\n';
-    output << "  acceptance_passed: "
-           << (root["acceptance"].value("passed", false) ? "true" : "false") << '\n';
-    const auto& acceptance = root["acceptance"];
-    output << "  baseline_source/verified/effective_qps/ratio: "
-           << acceptance.value("query_baseline_source", "disabled") << "/"
-           << (acceptance.value("query_baseline_fingerprint_verified", false)
-                 ? "true" : "false") << "/"
-           << acceptance.value("query_baseline_effective_ops_per_sec", -1.0)
-           << "/" << acceptance.value("observed_query_baseline_ratio", 0.0)
-           << '\n';
-    output << "  GPU visibility_ms/final_reserved/final_mutable/late_rpc: "
-           << acceptance.value("observed_max_gpu_visibility_ms", 0.0) << "/"
-           << acceptance.value(
-                "observed_final_mutation_capacity_reserved", 0ULL) << "/"
-           << acceptance.value("observed_final_delta_mutable_entries", 0ULL)
-           << "/"
-           << acceptance.value("observed_late_storage_owner_rpcs", 0ULL)
-           << '\n';
-    output << "  GPU visible mutations observed/expected, final drain s/timeout: "
-           << acceptance.value("observed_gpu_mutations_published", 0ULL)
-           << "/" << acceptance.value("expected_gpu_mutations", 0ULL)
-           << ", " << acceptance.value("gpu_final_state_drain_seconds", 0.0)
-           << "/"
-           << (acceptance.value("gpu_final_state_drain_timed_out", false)
-                 ? "true" : "false")
-           << '\n';
   }
 
   if (root.contains("stage2") &&
@@ -338,22 +242,6 @@ FormattedReport format_report(const nlohmann::json& root,
     output << "  backlog_slope_per_sec: "
            << stage2.value("backlog_slope_per_sec", 0.0) << '\n';
     output << "  failures: " << stage2.value("failures", 0ULL) << '\n';
-    output << "  drain_seconds/timed_out: "
-           << stage2.value("drain_seconds", 0.0) << "/"
-           << (stage2.value("drain_timed_out", false) ? "true" : "false")
-           << '\n';
-    if (stage2.contains("load")) {
-      const auto& load = stage2["load"];
-      output << "  load_observations/slope: "
-             << load.value("observations", 0ULL) << "/"
-             << load.value("backlog_slope_per_sec", 0.0) << '\n';
-    }
-    if (stage2.contains("post_stop_drain")) {
-      const auto& drain = stage2["post_stop_drain"];
-      output << "  post_stop_observations/remaining: "
-             << drain.value("observations", 0ULL) << "/"
-             << drain.value("remaining", 0ULL) << '\n';
-    }
   }
 
   if (root.contains("recall")) {
@@ -368,7 +256,6 @@ FormattedReport format_report(const nlohmann::json& root,
            << recall.value("search_result_width", 0ULL) << "/"
            << recall.value(
                 "queries_with_insufficient_base_results", 0ULL) << '\n';
-    output << "  passed: " << (recall.value("passed", false) ? "true" : "false") << '\n';
     output << "  query_file: " << recall.value("query_file", "") << '\n';
     output << "  groundtruth_file: " << recall.value("groundtruth_file", "") << '\n';
   }
@@ -408,6 +295,11 @@ FormattedReport format_report(const nlohmann::json& root,
     output << "  graph_route_hit_ratio/refreshes: "
            << gpu.value("graph_route_hit_ratio", 0.0) << "/"
            << gpu.value("graph_route_refreshes", 0ULL) << '\n';
+    output << "  dynamic route publications/slot_updates/live/snapshot_skips: "
+           << gpu.value("dynamic_route_publications", 0ULL) << "/"
+           << gpu.value("dynamic_route_slot_updates", 0ULL) << "/"
+           << gpu.value("dynamic_route_live_slots", 0ULL) << "/"
+           << gpu.value("dynamic_route_snapshot_skips", 0ULL) << '\n';
     output << "  graph_cache_invalidations: "
            << gpu.value("graph_cache_invalidations", 0ULL) << '\n';
     output << "  GPU query/prepare/graph/score/beam/exact us: "

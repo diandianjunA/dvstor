@@ -1,4 +1,5 @@
 #include "memory_node/storage_owner_index/detail.hh"
+#include "memory_node/storage_owner_index/partition_local_search.hh"
 
 using namespace memory_node_storage_owner_index_detail;
 
@@ -286,162 +287,101 @@ auto MemoryNode::beam_search_candidates_async(const span<const element_t> query,
   }
 }
 
-auto MemoryNode::anchor_search_candidates_async(const span<const element_t> query,
-                                                const vec<RemotePtr>& anchor_hints,
-                                                const Configuration& config,
-                                                StorageOwnerThread& thread,
-                                                InsertBreakdownCounters* breakdown,
-                                                bool local_only)
-  -> StorageOwnerInsertCoroutine {
-  StorageOwnerCoroutineScratch& scratch = thread.coroutine_scratch_state();
-  scratch.clear_search();
-  hashset_t<RemotePtr>& visited = scratch.visited;
-  vec<BeamEntry>& beam = scratch.beam;
-  vec<RemotePtr>& neighbors = scratch.neighbors;
-  vec<RemotePtr>& batch = scratch.batch;
-  vec<RemotePtr>& unvisited = scratch.unvisited;
-  const u32 beam_width = std::max<u32>(config.R, config.storage_owner_anchor_beam_width);
-  const u32 batch_limit = storage_owner_snapshot_batch_size(config, &thread);
-  visited.reserve(anchor_hints.size() +
-                  static_cast<size_t>(config.storage_owner_anchor_expand_cap) *
-                    std::max<u32>(1, config.R));
-  beam.reserve(beam_width);
-  batch.reserve(batch_limit);
-  unvisited.reserve(config.R);
-
-  if (breakdown != nullptr) {
-    breakdown->storage_owner_anchor_hints += anchor_hints.size();
+vec<RemotePtr> MemoryNode::partition_local_search_candidates(
+    const span<const element_t> query,
+    const vec<RemotePtr>& entry_points,
+    const Configuration& config,
+    InsertBreakdownCounters* breakdown) {
+  StorageOwnerCoroutineScratch* scratch = current_storage_owner_thread_ != nullptr
+                                            ? &current_storage_owner_thread_->coroutine_scratch_state()
+                                            : nullptr;
+  vec<RemotePtr> local_neighbors;
+  vec<byte_t> local_neighbor_entry;
+  vec<byte_t> local_neighbor_decoded;
+  if (scratch != nullptr) {
+    scratch->neighbors.clear();
   }
-  for (size_t begin = 0; begin < anchor_hints.size(); begin += batch_limit) {
-    const size_t end = std::min(anchor_hints.size(), begin + batch_limit);
-    batch.clear();
-    for (size_t i = begin; i < end; ++i) {
-      const RemotePtr hint = anchor_hints[i];
-      if (!hint.is_null() && hint.memory_node() < num_storage_nodes_ &&
-          (!local_only || local_shard(hint.memory_node())) &&
-          visited.insert(hint).second) {
-        batch.push_back(hint);
-      }
-    }
-    if (local_only) {
-      score_local_candidates_into_beam(query, batch, config, beam, beam_width,
-                                       breakdown, true);
-    } else {
-      auto started = std::chrono::steady_clock::now();
-      vec<NodeSnapshot> snapshots = co_await async_read_node_snapshots(batch, config, thread);
-      if (breakdown != nullptr) {
-        breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(started);
-      }
-      for (const NodeSnapshot& snapshot : snapshots) {
-        if (snapshot.deleted) continue;
-        started = std::chrono::steady_clock::now();
-        const distance_t distance = distance_to_stored_vector(
-          query, snapshot.vector_data.data(), config);
-        if (breakdown != nullptr) {
-          breakdown->storage_owner_search_distance_ns += elapsed_ns_since(started);
-          ++breakdown->storage_owner_anchor_valid_hints;
-        }
-        started = std::chrono::steady_clock::now();
-        insert_into_beam(beam, snapshot.rptr, distance, beam_width);
-        if (breakdown != nullptr) {
-          breakdown->storage_owner_search_beam_update_ns += elapsed_ns_since(started);
-        }
-      }
-    }
-  }
+  vec<RemotePtr>& neighbors = scratch != nullptr ? scratch->neighbors : local_neighbors;
+  vec<byte_t>& neighbor_entry = scratch != nullptr
+                                  ? scratch->neighbor_entry
+                                  : local_neighbor_entry;
+  vec<byte_t>& neighbor_decoded = scratch != nullptr
+                                    ? scratch->neighbor_decoded
+                                    : local_neighbor_decoded;
+  neighbors.reserve(config.R);
 
-  u32 expansions = 0;
-  u32 remote_expansions = 0;
-  while (expansions < config.storage_owner_anchor_expand_cap) {
+  const u32 construction_width = storage_owner_construction_width(config);
+  auto score = [&](RemotePtr candidate) -> std::optional<distance_t> {
     auto started = std::chrono::steady_clock::now();
-    i32 best = -1;
-    distance_t best_distance = std::numeric_limits<distance_t>::max();
-    for (i32 i = 0; i < static_cast<i32>(beam.size()); ++i) {
-      if (!beam[i].expanded && beam[i].distance < best_distance) {
-        best = i;
-        best_distance = beam[i].distance;
-      }
-    }
+    const byte_t* vector = local_live_vector(candidate);
     if (breakdown != nullptr) {
-      breakdown->storage_owner_search_select_ns += elapsed_ns_since(started);
+      breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(started);
     }
-    if (best < 0) break;
-
-    BeamEntry& entry = beam[best];
-    entry.expanded = true;
-    const bool remote = !local_shard(entry.rptr.memory_node());
-    if (local_only && remote) {
-      continue;
+    if (vector == nullptr) {
+      return std::nullopt;
     }
-    if (remote && remote_expansions >= config.storage_owner_anchor_remote_rescue_cap) {
-      continue;
-    }
-    ++expansions;
-    if (remote) ++remote_expansions;
 
     started = std::chrono::steady_clock::now();
-    if (local_only) {
-      read_local_neighbor_list(entry.rptr, neighbors, scratch.neighbor_entry,
-                               scratch.neighbor_decoded);
-    } else {
-      neighbors = co_await async_read_neighbor_list(entry.rptr, thread);
+    const distance_t distance = distance_to_stored_vector(query, vector, config);
+    if (breakdown != nullptr) {
+      breakdown->storage_owner_search_distance_ns += elapsed_ns_since(started);
+    }
+    return distance;
+  };
+  auto expand = [&](RemotePtr candidate, auto&& visit) {
+    const auto started = std::chrono::steady_clock::now();
+    bool decoded = read_local_neighbor_list(
+      candidate, neighbors, neighbor_entry, neighbor_decoded);
+    if (!decoded) {
+      // Concurrent adjacency publication can invalidate all optimistic
+      // checksum attempts. Falling back to the node lock is rare, but avoids
+      // silently treating a hot node as a leaf and permanently reducing the
+      // construction candidate set.
+      lock_node(candidate);
+      decoded = read_local_neighbor_list(
+        candidate, neighbors, neighbor_entry, neighbor_decoded);
+      unlock_node(candidate);
+      lib_assert(decoded,
+                 "partition-local construction search could not decode a "
+                 "locked adjacency snapshot");
     }
     if (breakdown != nullptr) {
       breakdown->storage_owner_search_neighbor_read_ns += elapsed_ns_since(started);
     }
-    unvisited.clear();
     for (const RemotePtr neighbor : neighbors) {
-      if (!neighbor.is_null() && neighbor.memory_node() < num_storage_nodes_ &&
-          (!local_only || local_shard(neighbor.memory_node())) &&
-          visited.insert(neighbor).second) {
-        unvisited.push_back(neighbor);
-      }
+      visit(neighbor);
     }
+  };
 
-    for (size_t begin = 0; begin < unvisited.size(); begin += batch_limit) {
-      const size_t end = std::min(unvisited.size(), begin + batch_limit);
-      batch.clear();
-      batch.insert(batch.end(), unvisited.begin() + begin, unvisited.begin() + end);
-      if (local_only) {
-        score_local_candidates_into_beam(query, batch, config, beam, beam_width,
-                                         breakdown, false);
-      } else {
-        started = std::chrono::steady_clock::now();
-        vec<NodeSnapshot> snapshots = co_await async_read_node_snapshots(batch, config, thread);
-        if (breakdown != nullptr) {
-          breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(started);
-        }
-        for (const NodeSnapshot& snapshot : snapshots) {
-          if (snapshot.deleted) continue;
-          started = std::chrono::steady_clock::now();
-          const distance_t distance = distance_to_stored_vector(
-            query, snapshot.vector_data.data(), config);
-          if (breakdown != nullptr) {
-            breakdown->storage_owner_search_distance_ns += elapsed_ns_since(started);
-          }
-          started = std::chrono::steady_clock::now();
-          insert_into_beam(beam, snapshot.rptr, distance, beam_width);
-          if (breakdown != nullptr) {
-            breakdown->storage_owner_search_beam_update_ns += elapsed_ns_since(started);
-          }
-        }
+  // This wrapper never suspends, so one reusable state per OS thread cannot
+  // be observed by another coroutine while a search is in progress.
+  thread_local PartitionLocalSearchBeam reusable_search(0, 1);
+  vec<PartitionLocalSearchEntry>& final_beam =
+    partition_local_construction_search_into(
+      reusable_search, span<const RemotePtr>{entry_points}, storage_id_,
+      construction_width, score, expand);
+
+  filter_final_partition_local_beam(
+    final_beam, [&](RemotePtr candidate) {
+      const auto validation_started = std::chrono::steady_clock::now();
+      const bool live = storage_owner_node_live(candidate);
+      if (breakdown != nullptr) {
+        breakdown->storage_owner_search_snapshot_read_ns +=
+          elapsed_ns_since(validation_started);
       }
-    }
-  }
+      return live;
+    });
 
-  if (breakdown != nullptr) {
-    breakdown->storage_owner_anchor_expansions += expansions;
-    breakdown->storage_owner_anchor_remote_expansions += remote_expansions;
+  const auto started = std::chrono::steady_clock::now();
+  vec<RemotePtr> candidates;
+  candidates.reserve(final_beam.size());
+  for (const PartitionLocalSearchEntry& entry : final_beam) {
+    candidates.push_back(entry.rptr);
   }
-  auto& out = storage_owner_async_candidates_[thread.id][thread.running_coroutine];
-  out.clear();
-  out.reserve(beam.size());
-  auto started = std::chrono::steady_clock::now();
-  std::sort(beam.begin(), beam.end(), [](const BeamEntry& lhs, const BeamEntry& rhs) {
-    return lhs.distance < rhs.distance;
-  });
   if (breakdown != nullptr) {
+    // Beam insertion keeps results ordered, so this field now covers only the
+    // final result materialization rather than a redundant sort.
     breakdown->storage_owner_search_result_sort_ns += elapsed_ns_since(started);
   }
-  for (const BeamEntry& entry : beam) out.push_back(entry.rptr);
+  return candidates;
 }

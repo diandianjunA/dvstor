@@ -5,6 +5,10 @@ using namespace compute_service_detail;
 size_t ComputeService::submit_storage_owner_mutations(
     const vec<InsertItem>& items,
     service::storage_owner::MutationKind kind) {
+  if (!config_.enable_updates) {
+    throw std::runtime_error(
+      "compute updates are disabled by enable-updates=false");
+  }
   if (storage_insert_owners_.empty()) {
     throw std::runtime_error("storage_owner mutation runtime is not initialized");
   }
@@ -59,42 +63,20 @@ size_t ComputeService::submit_storage_owner_mutations(
 
   for (const auto& item : items) {
     const auto operation_started = std::chrono::steady_clock::now();
-    vamana::anchor::Route route;
     u32 owner_storage = 0;
     const std::optional<u32> known_owner =
       known_storage_owner_for_id(item.id);
     if (known_owner.has_value()) {
       owner_storage = *known_owner;
-      if (kind == service::storage_owner::MutationKind::erase) {
-        route.owner = owner_storage;
-      } else {
-        route = route_storage_owner_update(item, owner_storage);
-      }
     } else {
-      // Every first mutation claims an owner while holding the ID-map shard
-      // lock. Inserts may propose the anchor-selected owner; upserts and
-      // erases use the deterministic ID fallback. A racing mutation observes
-      // the existing claim and routes to that actual owner, keeping generation
-      // a single monotonic stream even across tombstones.
-      if (kind == service::storage_owner::MutationKind::insert) {
-        route = route_storage_owner_update(item, std::nullopt);
-        owner_storage = claim_storage_owner_for_mutation(
-          item.id, route.owner);
-        if (owner_storage != route.owner) {
-          route = route_storage_owner_update(item, owner_storage);
-        }
-      } else {
-        const u32 proposed_owner = num_servers_ == 0
-          ? 0
-          : static_cast<u32>(item.id % num_servers_);
-        owner_storage = claim_storage_owner_for_mutation(
-          item.id, proposed_owner);
-        if (kind == service::storage_owner::MutationKind::erase) {
-          route.owner = owner_storage;
-        } else {
-          route = route_storage_owner_update(item, owner_storage);
-        }
-      }
+      // Every compute node proposes the same owner for an unseen ID. The
+      // process-local claim still serializes racing mutations here, while the
+      // deterministic proposal prevents split ownership across compute nodes.
+      const u32 proposed_owner = num_servers_ == 0
+        ? 0
+        : static_cast<u32>(item.id % num_servers_);
+      owner_storage = claim_storage_owner_for_mutation(
+        item.id, proposed_owner);
     }
     lib_assert(owner_storage < storage_insert_owners_.size(),
                "storage-owner route selected an invalid owner");
@@ -136,8 +118,6 @@ size_t ComputeService::submit_storage_owner_mutations(
     }
     task.kind = kind;
     task.completion_id = completion_id;
-    task.anchor_hints.assign(route.hints.begin(), route.hints.end());
-    task.anchor_bucket_hint = route.bucket_hint;
     task.enqueued_at = std::chrono::steady_clock::now();
     task.sender_dequeued_at = {};
     state.queue->push_wait(task_id);

@@ -6,7 +6,6 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <utility>
 
 #include "gpu_search/persistent_engine/cuda_helpers.hh"
@@ -43,29 +42,41 @@ service::QueryResult PersistentSearchEngine::search(std::span<const element_t> q
 }
 
 bool PersistentSearchEngine::publish_mutations(
-    std::vector<DeltaMutation> mutations, u64 epoch,
+    std::span<DeltaMutation> mutations,
     std::span<const u64> invalidated_graph_nodes) {
   std::lock_guard<std::mutex> publish_lock(mutation_publish_mutex_);
-  if (mutations.empty() || epoch == 0) {
+  if (mutations.empty()) {
     throw std::invalid_argument("GPU mutation publication requires a non-empty epoch batch");
   }
-  std::unordered_map<node_t, u32> accepted_generations;
-  mutations.erase(
-    std::remove_if(mutations.begin(), mutations.end(), [&](DeltaMutation& mutation) {
-      auto [entry, inserted] = accepted_generations.emplace(mutation.id, 0);
-      if (inserted) {
-        const auto current = delta_.version(mutation.id);
-        entry->second = current ? current->generation : 0;
+  // Epoch reservation and publication share this mutex with route-only
+  // maintenance commands.  Therefore a later route barrier can never overtake
+  // an earlier mutation whose GPU records have not been committed yet.
+  const u64 epoch = delta_.reserve_epoch();
+  // Batches are protocol-bounded and normally contain only a few mutations.
+  // Compact with swaps rather than remove_if/move-assignment so every
+  // preallocated vector buffer remains owned by one RPC-slot element.
+  size_t accepted_count = 0;
+  for (size_t index = 0; index < mutations.size(); ++index) {
+    DeltaMutation& candidate = mutations[index];
+    const auto current = delta_.version(candidate.id);
+    u32 accepted_generation = current ? current->generation : 0;
+    for (size_t accepted = 0; accepted < accepted_count; ++accepted) {
+      if (mutations[accepted].id == candidate.id) {
+        accepted_generation = std::max(
+          accepted_generation, mutations[accepted].generation);
       }
-      if (mutation.generation == 0) {
-        mutation.generation = entry->second + 1;
-      } else if (mutation.generation <= entry->second) {
-        return true;
-      }
-      entry->second = mutation.generation;
-      return false;
-    }),
-    mutations.end());
+    }
+    if (candidate.generation == 0) {
+      candidate.generation = accepted_generation + 1;
+    } else if (candidate.generation <= accepted_generation) {
+      continue;
+    }
+    if (accepted_count != index) {
+      std::swap(mutations[accepted_count], mutations[index]);
+    }
+    ++accepted_count;
+  }
+  mutations = mutations.first(accepted_count);
   if (mutations.empty()) {
     return true;
   }
@@ -105,7 +116,7 @@ bool PersistentSearchEngine::publish_mutations(
     ++visibility_sample_count;
   }
   try {
-    if (!delta_.publish(std::move(mutations), epoch)) {
+    if (!delta_.publish_metadata(mutations, epoch)) {
       impl_->mark_unhealthy("GPU mutation publication lost its coordinator epoch");
       return false;
     }

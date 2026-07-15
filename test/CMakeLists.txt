@@ -28,12 +28,50 @@ target_link_libraries(bounded_update_primitives_test PRIVATE dvstor_runtime)
 target_compile_options(bounded_update_primitives_test PRIVATE -UNDEBUG)
 add_test(NAME bounded_update_primitives_test COMMAND bounded_update_primitives_test)
 
+add_executable(compute_update_hot_path_test compute_update_hot_path_test.cc)
+target_link_libraries(compute_update_hot_path_test PRIVATE dvstor_runtime)
+target_compile_options(compute_update_hot_path_test PRIVATE -UNDEBUG)
+add_test(NAME compute_update_hot_path_test COMMAND compute_update_hot_path_test)
+
 add_executable(base_owner_map_test
     base_owner_map_test.cc
     ${CMAKE_SOURCE_DIR}/src/service/base_owner_map.cc)
 dvstor_target_common_includes(base_owner_map_test)
 target_compile_options(base_owner_map_test PRIVATE -UNDEBUG)
 add_test(NAME base_owner_map_test COMMAND base_owner_map_test)
+
+add_executable(adaptive_route_table_test
+    adaptive_route_table_test.cc
+    ${CMAKE_SOURCE_DIR}/src/vamana/adaptive_route_table.cc)
+dvstor_target_common_includes(adaptive_route_table_test)
+target_link_libraries(adaptive_route_table_test PRIVATE rdma_library)
+target_compile_options(adaptive_route_table_test PRIVATE -UNDEBUG)
+add_test(NAME adaptive_route_table_test COMMAND adaptive_route_table_test)
+
+add_executable(gpu_dynamic_route_overlay_test
+    gpu_dynamic_route_overlay_test.cc
+    ${CMAKE_SOURCE_DIR}/src/gpu_search/dynamic_route_overlay.cc
+    ${CMAKE_SOURCE_DIR}/src/vamana/adaptive_route_table.cc)
+dvstor_target_common_includes(gpu_dynamic_route_overlay_test)
+target_link_libraries(gpu_dynamic_route_overlay_test PRIVATE rdma_library)
+target_compile_options(gpu_dynamic_route_overlay_test PRIVATE -UNDEBUG)
+add_test(NAME gpu_dynamic_route_overlay_test COMMAND gpu_dynamic_route_overlay_test)
+
+add_executable(configuration_update_mode_test configuration_update_mode_test.cc)
+dvstor_target_common_includes(configuration_update_mode_test)
+target_link_libraries(configuration_update_mode_test PRIVATE rdma_library)
+target_compile_options(configuration_update_mode_test PRIVATE -UNDEBUG)
+add_test(NAME configuration_update_mode_test COMMAND configuration_update_mode_test)
+
+add_executable(partition_local_search_test partition_local_search_test.cc)
+dvstor_target_common_includes(partition_local_search_test)
+target_compile_options(partition_local_search_test PRIVATE -UNDEBUG)
+add_test(NAME partition_local_search_test COMMAND partition_local_search_test)
+
+add_executable(two_stage_insert_oracle_test two_stage_insert_oracle_test.cc)
+dvstor_target_common_includes(two_stage_insert_oracle_test)
+target_compile_options(two_stage_insert_oracle_test PRIVATE -UNDEBUG)
+add_test(NAME two_stage_insert_oracle_test COMMAND two_stage_insert_oracle_test)
 
 if (TARGET dvstor_gpu_kernels)
     add_executable(gpu_persistent_dispatch_test gpu_persistent_dispatch_test.cc)

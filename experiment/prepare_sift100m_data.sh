@@ -25,9 +25,10 @@ if [[ "$PREPARE_BASE" == "1" ]]; then echo "base:        $(base_bin)"; fi
 if [[ "$PREPARE_QUERY" == "1" ]]; then echo "query:       $(query_bin)"; fi
 if [[ "$PREPARE_GROUNDTRUTH" == "1" ]]; then echo "groundtruth: $(groundtruth_bin)"; fi
 
-# Real, non-overlapping SIFT vectors for throughput queries and inserts.
-# PREPARE_INSERT remains an alias for backward compatibility.
-PREPARE_BENCHMARK_DATA="${PREPARE_BENCHMARK_DATA:-${PREPARE_INSERT:-1}}"
+# Large benchmark streams are prepared only when explicitly requested by the
+# caller. run_breakdown.sh defaults this to 0, so compute nodes only consume the
+# pre-generated u8bin files.
+PREPARE_BENCHMARK_DATA="${PREPARE_BENCHMARK_DATA:-1}"
 if [[ "$PREPARE_BENCHMARK_DATA" == "1" ]]; then
   benchmark_args=(
     --source "$BENCHMARK_VECTOR_SOURCE"

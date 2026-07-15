@@ -30,6 +30,8 @@ inline constexpr u32 kBaseOverrideEmpty = UINT32_MAX;
 inline constexpr u32 kBaseOverrideTombstone = UINT32_MAX - 1;
 inline constexpr u64 kDeltaRemoteEmpty = 0;
 inline constexpr u64 kDeltaRemoteTombstone = UINT64_MAX;
+static_assert(kPersistentMaxShards * kDynamicRouteSlotsPerShard <=
+              kPersistentMaxExact * 2);
 
 struct DeviceShardRegion {
   u64 ordinal_base{};
@@ -156,6 +158,11 @@ struct PersistentKernelParams {
   const DeltaOverrideUpdate* delta_override_updates{};
   const DeltaDurableUpdate* delta_durable_updates{};
   const ResidentPqEraseUpdate* resident_pq_erase_updates{};
+  const DynamicRouteUpdate* dynamic_route_updates{};
+  const u8* dynamic_route_code_updates{};
+  DeviceDynamicRouteSlot* dynamic_route_slots{};
+  u8* dynamic_route_pq_codes{};
+  u32 dynamic_route_capacity{};
   const u64* graph_invalidation_keys{};
   const f32* anchor_vectors{};
   const u32* anchor_handles{};

@@ -3,6 +3,10 @@
 
 namespace gpu_search {
 
+static_assert(kDynamicRouteSlotsPerShard == format::kStorageRouteSlots);
+static_assert(kPersistentMaxSubquantizers ==
+              format::kStorageRouteMaxCodeBytes);
+
 using namespace persistent_engine_detail;
 
 namespace {
@@ -134,6 +138,16 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
 
   anchor_table = load_anchor_table(config.resolved_index_prefix(), config.dim,
                                    index.layout.num_shards, index);
+  dynamic_route_capacity = static_cast<u32>(index.shards.size()) *
+    kDynamicRouteSlotsPerShard;
+  dynamic_route_diff =
+    std::make_unique<DynamicRouteOverlayDiff>(
+      static_cast<u32>(index.shards.size()));
+  if (dynamic_route_diff->capacity() != dynamic_route_capacity) {
+    throw std::logic_error("GPU dynamic route capacity mismatch");
+  }
+  dynamic_route_snapshot.resize(dynamic_route_capacity);
+  dynamic_route_update_scratch.reserve(dynamic_route_capacity);
   for (u32 anchor = 0; anchor < anchor_table.raw_pointers.size(); ++anchor) {
     anchor_buckets_by_raw.emplace(anchor_table.raw_pointers[anchor], anchor);
     anchor_graph_keys_host.push_back(
@@ -147,9 +161,10 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     throw std::runtime_error("GPU anchor route table exceeds uint32 capacity");
   }
   entry_handles = index.entry_points;
-  std::cerr << "[gpu-search] query routing="
-            << (anchor_table.count() == 0 ? "static entry points" : "query-aware GPU anchors")
-            << " anchors=" << anchor_table.count()
+  std::cerr << "[gpu-search] query routing=storage-canonical adaptive routes"
+            << "+static recall fallback"
+            << " static_fallback_entries=" << anchor_table.count()
+            << " adaptive_slots_per_shard=" << kDynamicRouteSlotsPerShard
             << " seeds=" << config.gpu_entry_seed_count << '\n';
   query_slots = config.gpu_query_slots;
   query_dispatch_capacity = memory_budget::next_power_of_two(query_slots * 2);
@@ -253,7 +268,15 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   const u64 route_graph_metadata_bytes =
     static_cast<u64>(anchor_graph_keys_host.size()) *
     (sizeof(u64) + 2 * sizeof(u32));
-  route_graph_bytes = route_graph_record_bytes + route_graph_metadata_bytes;
+  const u64 dynamic_route_bytes =
+    static_cast<u64>(dynamic_route_capacity) *
+    sizeof(DeviceDynamicRouteSlot);
+  const u64 dynamic_route_code_bytes =
+    static_cast<u64>(dynamic_route_capacity) * index.layout.code_bytes;
+  const u64 anchor_route_bytes =
+    route_graph_record_bytes + route_graph_metadata_bytes;
+  route_graph_bytes = anchor_route_bytes + dynamic_route_bytes +
+    dynamic_route_code_bytes;
   const u64 additional_scratch_bytes =
     dynamic_code_scratch_bytes + dynamic_request_scratch_bytes +
     navigation_candidate_bytes + query_dispatch_bytes + direct_queue_bytes +
@@ -315,7 +338,9 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
             << " direct_queue_scratch=" << direct_queue_bytes
             << " graph_scratch=" << graph_scratch_bytes
             << " cache_admission=" << cache_admission_bytes
-            << " anchor_route=" << route_graph_bytes
+            << " anchor_route=" << anchor_route_bytes
+            << " dynamic_route=" << dynamic_route_bytes
+            << " dynamic_route_codes=" << dynamic_route_code_bytes
             << " explicit=" << explicit_gpu_bytes
             << " limit=" << engine_budget << " bytes\n";
 
@@ -334,8 +359,18 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     align_up(exact_cache_offset + exact_cache_bytes, 512));
   control_region_offset = static_cast<size_t>(
     align_up(graph_cache_offset + graph_cache_bytes, 256));
-  const size_t control_region_bytes =
+  const size_t control_snapshot_bytes =
     index.shards.size() * sizeof(format::StorageControlBlock);
+  const size_t route_snapshot_offset = static_cast<size_t>(align_up(
+    control_snapshot_bytes, alignof(format::StorageRoutePublication)));
+  const size_t route_snapshot_bytes =
+    index.shards.size() * sizeof(format::StorageRoutePublication);
+  const size_t route_sequence_before_offset = static_cast<size_t>(align_up(
+    route_snapshot_offset + route_snapshot_bytes, alignof(u64)));
+  const size_t route_sequence_after_offset = route_sequence_before_offset +
+    index.shards.size() * sizeof(u64);
+  const size_t control_region_bytes = route_sequence_after_offset +
+    index.shards.size() * sizeof(u64);
   const size_t remote_buffer_bytes = control_region_offset + control_region_bytes;
 #ifdef DVSTOR_HAVE_GPUNETIO
   direct_transport = std::make_unique<gpu::GpuNetioPersistentTransport>(
@@ -358,6 +393,13 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   d_graph_cache = d_remote_buffer + graph_cache_offset;
   d_control_snapshots = reinterpret_cast<format::StorageControlBlock*>(
     d_remote_buffer + control_region_offset);
+  d_storage_route_snapshots = reinterpret_cast<
+    format::StorageRoutePublication*>(
+      d_remote_buffer + control_region_offset + route_snapshot_offset);
+  d_storage_route_sequence_before = reinterpret_cast<u64*>(
+    d_remote_buffer + control_region_offset + route_sequence_before_offset);
+  d_storage_route_sequence_after = reinterpret_cast<u64*>(
+    d_remote_buffer + control_region_offset + route_sequence_after_offset);
 
   control_bootstrapper = std::make_unique<NavigationBootstrapper>(
     config, channel_context, connection_manager, remote_regions,
@@ -365,6 +407,10 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   std::cerr << "[gpu-search] bootstrap=CPU-posted GPUDirect RDMA; "
                "queries=strict GPU-initiated GPUNetIO\n";
   initialize_storage_reclaim_ack();
+  // Fail before accepting queries when storage nodes do not expose the
+  // canonical fixed-route extension. A concurrent publication may produce a
+  // transient empty result and will simply be retried by maintenance.
+  (void)read_storage_route_publications();
   stream_codes_to_gpu(*control_bootstrapper);
   stream_anchor_graph_to_gpu(*control_bootstrapper);
 
@@ -596,6 +642,15 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                        d_resident_pq_erase_updates,
                        delta_command_capacity,
                        "cudaHostAlloc(resident dynamic PQ erase staging)");
+  mapped_host_allocate(dynamic_route_updates_host,
+                       d_dynamic_route_updates,
+                       dynamic_route_capacity,
+                       "cudaHostAlloc(dynamic query route staging)");
+  mapped_host_allocate(dynamic_route_code_updates_host,
+                       d_dynamic_route_code_updates,
+                       static_cast<size_t>(dynamic_route_capacity) *
+                         index.layout.code_bytes,
+                       "cudaHostAlloc(dynamic query route code staging)");
   if (graph_cache_slots != 0) {
     check_cuda(cudaMemset(d_graph_cache_states, 0,
                           static_cast<size_t>(graph_cache_slots) * sizeof(u32)),
@@ -727,6 +782,19 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                         static_cast<size_t>(resident_pq_capacity) * sizeof(u32)),
              "cudaMemset(resident dynamic PQ positions)");
   device_allocate(d_delta_count, 1, "cudaMalloc(navigation delta count)");
+  device_allocate(d_dynamic_route_slots, dynamic_route_capacity,
+                  "cudaMalloc(dynamic query route slots)");
+  device_allocate(d_dynamic_route_pq_codes,
+                  static_cast<size_t>(dynamic_route_capacity) * code_bytes,
+                  "cudaMalloc(dynamic query route PQ codes)");
+  check_cuda(cudaMemset(d_dynamic_route_slots, 0,
+                        static_cast<size_t>(dynamic_route_capacity) *
+                          sizeof(DeviceDynamicRouteSlot)),
+             "cudaMemset(dynamic query route slots)");
+  check_cuda(cudaMemset(d_dynamic_route_pq_codes, 0,
+                        static_cast<size_t>(dynamic_route_capacity) *
+                          code_bytes),
+             "cudaMemset(dynamic query route PQ codes)");
   clear_delta_device_state();
 
   check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&stop_host), sizeof(u32),
@@ -883,6 +951,11 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .delta_override_updates = d_delta_override_updates,
     .delta_durable_updates = d_delta_durable_updates,
     .resident_pq_erase_updates = d_resident_pq_erase_updates,
+    .dynamic_route_updates = d_dynamic_route_updates,
+    .dynamic_route_code_updates = d_dynamic_route_code_updates,
+    .dynamic_route_slots = d_dynamic_route_slots,
+    .dynamic_route_pq_codes = d_dynamic_route_pq_codes,
+    .dynamic_route_capacity = dynamic_route_capacity,
     .graph_invalidation_keys = d_graph_invalidation_keys,
     .anchor_vectors = d_anchor_vectors,
     .anchor_handles = d_anchor_handles,

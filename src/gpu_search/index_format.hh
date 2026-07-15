@@ -26,6 +26,15 @@ inline constexpr u32 kStorageControlBytes = 4096;
 inline constexpr u64 kStorageControlMagic = 0x314c525443565344ULL;  // "DSVCTRL1"
 inline constexpr u32 kStorageControlVersion = 2;
 inline constexpr u32 kMaxComputeClients = 64;
+// The route publication lives in the unused tail of the existing 4 KiB
+// storage control page.  It is runtime metadata, not an on-disk index record,
+// so adding it neither changes schema-15 nor moves any dynamic node offset.
+inline constexpr u32 kStorageRoutePublicationOffset = 1024;
+inline constexpr u64 kStorageRoutePublicationMagic =
+  0x3154554f52565344ULL;  // "DSVROUT1"
+inline constexpr u32 kStorageRoutePublicationVersion = 1;
+inline constexpr u32 kStorageRouteSlots = 8;
+inline constexpr u32 kStorageRouteMaxCodeBytes = 32;
 
 enum class QuantizerKind : u32 {
   opq_pq = 1,
@@ -88,6 +97,32 @@ struct alignas(64) StorageControlBlock {
   std::array<u64, kMaxComputeClients> reclaim_ack_sequences{};
 };
 
+struct StorageRouteSlot {
+  u64 remote_node{};
+  u32 id{};
+  u32 generation{};
+  std::array<u8, kStorageRouteMaxCodeBytes> navigation_code{};
+};
+
+// A begin/end sequence plus a body checksum makes a torn body detectable.
+// Compute readers additionally bracket the body RDMA with two completed reads
+// of sequence_begin, which rules out a coherent old body paired with a newly
+// observed sequence. On any mismatch they keep the previous snapshot; no
+// query or update thread waits for a route refresh.
+struct alignas(64) StorageRoutePublication {
+  u64 sequence_begin{};
+  u64 magic{kStorageRoutePublicationMagic};
+  u32 version{kStorageRoutePublicationVersion};
+  u32 header_bytes{sizeof(StorageRoutePublication)};
+  u32 shard_id{};
+  u32 slot_count{kStorageRouteSlots};
+  u32 code_bytes{};
+  u32 reserved{};
+  u64 body_checksum{};
+  std::array<StorageRouteSlot, kStorageRouteSlots> slots{};
+  u64 sequence_end{};
+};
+
 struct CodeHeader {
   std::array<char, 8> magic{kCodeMagic};
   u32 version{kVersion};
@@ -110,7 +145,17 @@ struct CodeHeader {
 static_assert(sizeof(ShardRegion) == 88);
 static_assert(sizeof(StorageControlBlock) == 640);
 static_assert(sizeof(StorageControlBlock) <= kStorageControlBytes);
+static_assert(sizeof(StorageRouteSlot) == 48);
+static_assert(sizeof(StorageRoutePublication) == 448);
+static_assert(kStorageRoutePublicationOffset >= sizeof(StorageControlBlock));
+static_assert(kStorageRoutePublicationOffset +
+                sizeof(StorageRoutePublication) <= kStorageControlBytes);
 static_assert(sizeof(CodeHeader) == 120);
+
+u64 storage_route_body_checksum(const StorageRoutePublication& publication);
+bool validate_storage_route_publication(
+  const StorageRoutePublication& publication, u32 expected_shard,
+  std::string* error = nullptr);
 
 struct View {
   NavigationLayout layout{};

@@ -6,7 +6,6 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
-#include <limits>
 
 #include "common/index_path.hh"
 #include "gpu_search/index_format.hh"
@@ -35,10 +34,7 @@ inline size_t aligned_snapshot_bytes() {
 }
 
 inline u32 storage_owner_construction_width(const Configuration& config) {
-  const u32 configured = config.storage_owner_construction_beam_width == 0
-                           ? config.beam_width_construction
-                           : config.storage_owner_construction_beam_width;
-  return std::max<u32>(1, std::min(config.beam_width_construction, configured));
+  return config.resolved_storage_owner_construction_width();
 }
 
 inline u32 storage_owner_snapshot_batch_size(
@@ -56,18 +52,6 @@ inline u32 storage_owner_snapshot_batch_size(
                std::to_string(stride) + " scratch_stride=" +
                std::to_string(thread->scratch_stride));
   return static_cast<u32>(std::min<size_t>(configured, capacity));
-}
-
-inline u32 storage_owner_prune_candidate_limit(const Configuration& config) {
-  if (config.storage_owner_prune_max_candidates == 0) {
-    return std::numeric_limits<u32>::max();
-  }
-  return std::max(config.R, config.storage_owner_prune_max_candidates);
-}
-
-inline bool anchor_update_enabled(const Configuration& config,
-                                  const vec<RemotePtr>& hints) {
-  return config.storage_owner_update_mode == "local_stitch" && !hints.empty();
 }
 
 inline bool local_stitch_enabled(const Configuration& config) {

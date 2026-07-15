@@ -81,7 +81,7 @@ INDEX_ROLE=storage LOCAL_SHARD=1 \
 
 ## 部署文件
 
-计算节点：
+计算节点（查询与更新）：
 
 ```text
 <prefix>.meta.json
@@ -90,19 +90,26 @@ INDEX_ROLE=storage LOCAL_SHARD=1 \
 <prefix>_node1_ofN.idmap ... <prefix>_nodeN_ofN.idmap
 ```
 
+纯查询配置使用 `enable-updates = false`，需要 `<prefix>.meta.json`、
+`<prefix>.pq32` 和 `<prefix>.anchors`；不会加载 owner idmap，也不会启动更新执行器。
+这里的 anchors 只作为 GPU 冷启动/召回兜底。在线 mutation 会持续更新 storage
+owner 的固定容量动态入口；每个计算节点从 control page 拉取同一 canonical 快照，
+因此其他计算节点写入的新代表节点同样可见。
+
 存储节点 X：
 
 ```text
 <prefix>.meta.json
-<prefix>.anchors
 <prefix>_nodeX_ofN.dat
 <prefix>_nodeX_ofN.idmap
 <prefix>_nodeX_ofN.pq32.codes
 ```
 
-计算节点不需要 `.dat`、`.pq32.codes` 或 `.gpu.idx`，但更新路由必须能读取全部
-owner-sharded `.idmap`。已有 schema-15 索引只需把各存储分片的 idmap sidecar
-复制到计算节点的同一 prefix，无需重建索引。存储节点运行时不需要 `.pq32` 模型。
+计算节点不需要 `.dat`、`.pq32.codes` 或 `.gpu.idx`。启用更新时，它必须能读取全部
+owner-sharded `.idmap`：METIS 分片的 owner 不能由 `ID % N` 推导，基础 ID 的
+upsert/delete 和重复写必须先找到真实 owner。每个存储节点仍只需自己的 idmap。
+已有 schema-15 索引只需复制 sidecar，无需重建索引。存储节点运行时不需要
+`.pq32` 模型或 `.anchors`。
 
 ## 启动
 
@@ -128,6 +135,16 @@ schema-15 存储控制区使用版本 2：每个计算节点拥有独立 reclaim
 空间，部署时必须为预期写入量预留 memory-node 容量；这项限制要等独立的协议升级
 后才能解除。
 
+stage2 finalized 的等价边界是同一逻辑快照下的分片在线 reference：每个分片完成
+相同宽度 `L` 的构建搜索，合并全部 beam 后执行一次相同 RobustPrune，并等待本次
+insert 所选邻居的反向边完成。它不等价于离线 builder 的全候选构图。当前也没有
+完整入边索引，所以 delete/upsert 不能同步清除所有历史未知入边；报告中的 durable
+或 drained 仅表示已声明的 maintenance 任务完成，不应解释为全图整理已经完成。
+
+同一 4 KiB 控制页的 offset 1024 还发布固定 8 槽 canonical route 快照；它不改变
+`StorageControlBlock`、索引文件或任何 RPC 布局。旧存储二进制没有该运行时扩展，
+因此新计算节点会在启动校验时拒绝混合部署；同步升级二进制即可，不需要重建索引。
+
 新插入或 upsert 产生的 PQ code 在发布时由 GPU 编码一次，并进入独立的常驻
 dynamic-PQ 层。短期 L0 中的原始向量和可变图记录退休后，该 PQ code 仍留在
 GPU，查询导航不会退化为逐 code RDMA。只有对应版本被 upsert/delete 淘汰、旧查询
@@ -146,21 +163,22 @@ RCU 屏障退出后才回收常驻 PQ 槽。stage2 context、GPU delta 元数据
 `query.u8bin` 的 10K 标准查询仅供 recall 使用。性能阶段由
 `PERFORMANCE_QUERY_FILE` 提供独立查询流，warmup 与 measure 共用一个单遍游标，
 同一行不会再次执行；查询池耗尽时 benchmark 会失败而不是取模回绕。当前默认
-性能查询池为 `[100M,105M)` 的 500 万行，插入向量池为 `[105M,107M)` 的
-200 万行。生成文件默认位于
+性能查询池为 `[100M,105M)` 的 500 万行。为便于当前机器直接预跑，默认插入池
+为已有的 `[103M,105M)` 200 万行。文件默认位于
 `/data/xjs/datasets/sift1b`：
 
 ```text
 sift100m_to_105m_query.u8bin
-sift105m_to_107m_insert.u8bin
+sift103m_to_105m_insert.u8bin
 ```
 
-`prepare_sift100m_data.sh` 会按需生成并校验这两个文件；已有且头部、大小正确时会
-直接复用，此时计算节点不需要 `bigann_base.bvecs`。只有文件缺失或设置
-`OVERWRITE_BENCHMARK_DATA=1` 时才需要完整源数据。可通过
+`run_breakdown.sh` 默认只校验并读取预生成文件，不会在计算节点寻找
+`bigann_base.bvecs`。只有显式设置 `PREPARE_BENCHMARK_DATA=1` 时才会调用数据准备。
+可通过
 `PERFORMANCE_QUERY_FILE`、`INSERT_FILE` 覆盖路径，或用以下变量
 调整源区间：`PERFORMANCE_QUERY_START`、`PERFORMANCE_QUERY_END`、
-`INSERT_VECTOR_START`、`INSERT_VECTOR_END`。例如：
+`INSERT_VECTOR_START`、`INSERT_VECTOR_END`。常用选项可直接查看
+`./experiment/run_breakdown.sh --help`。例如：
 
 ```bash
 PERFORMANCE_QUERY_FILE=/data/xjs/datasets/sift/perf_queries_2m.u8bin \
@@ -185,37 +203,8 @@ WARMUP_SECONDS=30 MEASURE_SECONDS=120 \
 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
 ```
 
-两阶段更新验收使用固定 profile，且必须先把同一新二进制部署到全部五个存储节点，
-并确认五个进程均已启动完成。
-每轮独立 profile 前都要重启五个存储进程，以同一份 schema-15 基础文件恢复内存图；
-这只是重新加载现有索引，不需要重建或升级索引。query-only 基线和 `mixed15m` 都
-必须从这份干净基础状态启动，两者之间不得运行写负载。基线 JSON 会绑定索引、查询
-文件、dtype、GPU 搜索参数和冷缓存设置；`mixed15m` 不接受手填的裸 QPS：
-
-```bash
-# 先重启全部五个存储进程，确认均已从同一份基础索引启动
-UPDATE_ACCEPTANCE_PROFILE=insert24 \
-./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
-
-# 重启全部五个存储进程，恢复同一份基础索引
-
-UPDATE_ACCEPTANCE_PROFILE=insert64 \
-./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
-
-# 再次重启全部五个存储进程；随后先跑基线且不要插入其他写负载
-UPDATE_ACCEPTANCE_PROFILE=querybaseline \
-./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
-
-# 基线退出后再次重启五个存储进程，从同一份基础索引启动 mixed15m
-QUERY_BASELINE_REPORT=/path/to/querybaseline.json \
-STORAGE_MAINTENANCE_LOGS="/path/node1.log /path/node2.log /path/node3.log /path/node4.log /path/node5.log" \
-UPDATE_ACCEPTANCE_PROFILE=mixed15m \
-./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
-```
-
-三个更新 profile 会 fail-closed 检查各自的吞吐和零完成窗口；15 分钟混合负载还会
-检查 5K query/s、1K insert/s、query-only 基线的 90%、base-only recall、
-stage2 p99/积压/排空、10ms GPU 可见性、容量拒绝、最终 delta 和迟到 RPC。
+如需比较不同运行，保持相同的索引、查询/插入文件、GPU 参数和缓存配置即可。
+报告只提供吞吐、延迟、召回、GPU 内存与 stage2 遥测；不包含自动验收结论。
 
 短跑示例：
 
@@ -225,10 +214,11 @@ WARMUP_SECONDS=1 MEASURE_SECONDS=5 \
 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
 ```
 
-结果写入 `experiment/reports/04_gpu_persistent_gpunetio/`。有效结果应同时满足：
+结果写入 `experiment/reports/04_gpu_persistent_gpunetio/`。报告保留下列原始指标，
+由实验者结合目标负载自行分析：
 
 - `gpu_persistent.direct_path_failures == 0`；
-- recall 达到论文设定阈值；
+- 前后 recall 及其变化；
 - 没有 unhealthy/fail-stop 日志；
 - GPU 和 RDMA 指标显示多查询并发，而非单查询串行等待。
 
@@ -237,10 +227,10 @@ WARMUP_SECONDS=1 MEASURE_SECONDS=5 \
 ```bash
 python3 experiment/compare_reports.py \
   --baseline /path/to/odinann.json \
-  --candidate experiment/reports/04_gpu_persistent_gpunetio/latest.json \
-  --min-query-speedup 1.0 \
-  --max-recall-loss 0.01
+  --candidate experiment/reports/04_gpu_persistent_gpunetio/latest.json
 ```
+
+比较工具只输出原始吞吐、延迟、加速比和 recall 差值，不给出自动通过/失败结论。
 
 停止本机启动的存储进程：
 

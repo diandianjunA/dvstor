@@ -38,6 +38,8 @@ bool MemoryNode::enqueue_insert_stitch(node_t id,
                                        u32 generation,
                                        RemotePtr target,
                                        u64 maintenance_sequence,
+                                       const vec<RemotePtr>* stage1_candidates,
+                                       const vec<RemotePtr>* stage1_neighbors,
                                        const Configuration& config) {
   StorageOwnerMaintenanceTask task;
   task.kind = StorageOwnerMaintenanceKind::stitch_insert;
@@ -45,6 +47,12 @@ bool MemoryNode::enqueue_insert_stitch(node_t id,
   task.generation = generation;
   task.maintenance_sequence = maintenance_sequence;
   task.target = target;
+  if (stage1_candidates != nullptr) {
+    task.stage1_candidates = *stage1_candidates;
+  }
+  if (stage1_neighbors != nullptr) {
+    task.stitch_base_neighbors = *stage1_neighbors;
+  }
   const bool queued = enqueue_storage_owner_maintenance(std::move(task), config);
   if (queued) {
     storage_owner_maintenance_finalize_enqueued_.fetch_add(1, std::memory_order_relaxed);
@@ -160,7 +168,9 @@ u64 MemoryNode::schedule_storage_owner_maintenance(
     RemotePtr old_ptr,
     u64 reserved_sequence,
     u32 reserved_work_items,
-    const Configuration& config) {
+    const Configuration& config,
+    const vec<RemotePtr>* stage1_candidates,
+    const vec<RemotePtr>* stage1_neighbors) {
   const bool maintenance_enabled = storage_owner_maintenance_enabled(config);
   const bool needs_stitch = maintenance_enabled &&
     kind != service::storage_owner::MutationKind::erase && !new_ptr.is_null();
@@ -185,7 +195,8 @@ u64 MemoryNode::schedule_storage_owner_maintenance(
   intent.sequence.store(reserved_sequence, std::memory_order_release);
   if (needs_stitch &&
       !enqueue_insert_stitch(
-        id, generation, new_ptr, reserved_sequence, config)) {
+        id, generation, new_ptr, reserved_sequence,
+        stage1_candidates, stage1_neighbors, config)) {
     lib_failure("failed to enqueue storage-owner stitch maintenance");
   }
   if (needs_cleanup &&

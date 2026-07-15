@@ -16,7 +16,7 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
   const size_t stitch_response_bytes =
     service::storage_owner::stitch_search_response_bytes(
       config.storage_owner_batch_max,
-      std::max<u32>(1, storage_owner_cross_shard_degree_));
+      config.resolved_storage_owner_construction_width());
   peer_rpc_runtime_.message_bytes = align_up(
     std::max({reverse_update_bytes,
               service::storage_owner::reverse_update_response_bytes(),
@@ -187,7 +187,6 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
                " (dedicated background CPU partition)");
   print_status("storage-owner peer reverse-update tuning: mode=" + config.storage_owner_reverse_mode +
                " queue_depth=" + std::to_string(peer_reverse_task_queue_limit_) +
-               " flush_us=" + std::to_string(config.storage_owner_reverse_flush_us) +
                " coalesce_max=" + std::to_string(config.storage_owner_reverse_coalesce_max));
 }
 

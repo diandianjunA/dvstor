@@ -26,7 +26,6 @@ inline constexpr u32 kInitialRpcRecvsPerPeer = 8;
 inline constexpr u32 kMaxRpcResults = 512;
 
 using service::storage_owner_client::add_storage_owner_breakdown;
-using service::storage_owner_client::add_storage_owner_counters;
 using service::storage_owner_client::add_storage_owner_sender_breakdown;
 using service::storage_owner_client::duration_ns;
 using service::storage_owner_client::duration_ns_clamped;

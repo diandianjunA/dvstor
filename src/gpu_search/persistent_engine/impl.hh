@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "common/index_path.hh"
+#include "gpu_search/dynamic_route_overlay.hh"
 #include "gpu_search/persistent_engine.hh"
 #include "gpu_search/navigation_bootstrapper.hh"
 #ifdef DVSTOR_HAVE_GPUNETIO
@@ -134,9 +135,9 @@ struct PersistentSearchEngine::Impl {
   void submit_delta_publication(const DeltaPublishDescriptor& descriptor);
   size_t active_resident_pq_slots_locked() const;
   u32 allocate_resident_pq_slot_locked(u64 remote_node);
-  void upload_records_locked(std::vector<DeltaMutation>& mutations,
+  void upload_records_locked(std::span<DeltaMutation> mutations,
                              std::span<const u64> invalidation_keys = {});
-  size_t upload_mutations(std::vector<DeltaMutation>& mutations, u64 epoch,
+  size_t upload_mutations(std::span<DeltaMutation> mutations, u64 epoch,
                           std::span<const u64> invalidated_graph_nodes);
   size_t active_delta_slots_locked() const;
   bool query_ticket_barrier_passed(u64 barrier) const;
@@ -146,6 +147,9 @@ struct PersistentSearchEngine::Impl {
   void validate_storage_control(const format::StorageControlBlock& control,
                                 size_t shard) const;
   std::vector<format::StorageControlBlock> read_storage_controls();
+  std::vector<format::StorageRoutePublication>
+    read_storage_route_publications();
+  bool synchronize_storage_routes();
   void write_storage_reclaim_acks(std::span<const u64> sequences);
   void initialize_storage_reclaim_ack();
   void enqueue_storage_reclaim_barriers();
@@ -160,6 +164,10 @@ struct PersistentSearchEngine::Impl {
   format::View index;
   pq::Model pq_model;
   persistent_engine_detail::AnchorTable anchor_table;
+  std::unique_ptr<DynamicRouteOverlayDiff> dynamic_route_diff;
+  std::vector<vamana::routing::AdaptiveRouteTable::RouteSlotSnapshot>
+    dynamic_route_snapshot;
+  std::vector<DynamicRouteUpdate> dynamic_route_update_scratch;
   std::vector<u32> entry_handles;
   std::unordered_map<u64, u32> anchor_buckets_by_raw;
 #ifdef DVSTOR_HAVE_GPUNETIO
@@ -203,6 +211,7 @@ struct PersistentSearchEngine::Impl {
   u32 exact_admission_sets{};
   u32 graph_invalidation_capacity{};
   u32 delta_command_capacity{};
+  u32 dynamic_route_capacity{};
   u32 query_dispatch_capacity{};
   u32 direct_batch_queue_count{};
   size_t graph_cache_bytes{};
@@ -272,6 +281,9 @@ struct PersistentSearchEngine::Impl {
   byte_t* d_graph_cache{};
   byte_t* d_graph_scratch{};
   format::StorageControlBlock* d_control_snapshots{};
+  format::StorageRoutePublication* d_storage_route_snapshots{};
+  u64* d_storage_route_sequence_before{};
+  u64* d_storage_route_sequence_after{};
   u64* d_graph_cache_keys{};
   u64* d_graph_cache_generations{};
   u64* d_graph_cache_timestamps{};
@@ -324,6 +336,12 @@ struct PersistentSearchEngine::Impl {
   DeltaDurableUpdate* d_delta_durable_updates{};
   ResidentPqEraseUpdate* resident_pq_erase_updates_host{};
   ResidentPqEraseUpdate* d_resident_pq_erase_updates{};
+  DynamicRouteUpdate* dynamic_route_updates_host{};
+  DynamicRouteUpdate* d_dynamic_route_updates{};
+  u8* dynamic_route_code_updates_host{};
+  u8* d_dynamic_route_code_updates{};
+  DeviceDynamicRouteSlot* d_dynamic_route_slots{};
+  u8* d_dynamic_route_pq_codes{};
   u32* d_delta_count{};
   std::vector<DeviceDeltaRecord> delta_records_host;
   std::vector<u32> free_delta_slots;

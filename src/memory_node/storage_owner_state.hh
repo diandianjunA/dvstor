@@ -72,6 +72,7 @@ struct StorageOwnerCoroutineScratch {
   vec<RemotePtr> filtered;
   vec<RemotePtr> selected;
   vec<const byte_t*> selected_vectors;
+  vec<size_t> prune_selected_indices;
   vec<StorageOwnerPruneCandidateInfo> prune_infos;
   hashset_t<RemotePtr> prune_seen;
   vec<StorageOwnerScoredSnapshot> scored_snapshots;
@@ -96,6 +97,7 @@ struct StorageOwnerCoroutineScratch {
     batch.clear();
     selected.clear();
     selected_vectors.clear();
+    prune_selected_indices.clear();
     prune_infos.clear();
     prune_seen.clear();
     scored_snapshots.clear();
@@ -251,7 +253,6 @@ struct StorageOwnerInsertJob {
   u32 generation{};
   u64 maintenance_sequence{};
   u32 reserved_maintenance_work{};
-  vec<RemotePtr> anchor_hints;
   vec<u64> invalidated_neighbors;
 };
 

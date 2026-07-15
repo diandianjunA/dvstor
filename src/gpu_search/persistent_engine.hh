@@ -36,8 +36,9 @@ public:
   service::QueryResult search(VectorDType query_dtype, const byte_t* query_data, u32 k);
   service::QueryResult search(std::span<const element_t> query, u32 k);
 
-  bool publish_mutations(std::vector<DeltaMutation> mutations, u64 epoch,
-                         std::span<const u64> invalidated_graph_nodes = {});
+  bool publish_mutations(
+    std::span<DeltaMutation> mutations,
+    std::span<const u64> invalidated_graph_nodes = {});
   bool try_reserve_mutation_capacity(size_t mutation_count);
   void reserve_mutation_capacity(size_t mutation_count);
   void release_mutation_capacity(size_t mutation_count);

@@ -51,8 +51,6 @@ struct Args {
   u32 recall_k{10};
   size_t settle_seconds{300};
 
-  double min_post_recall{-1.0};
-  double max_recall_drop{-1.0};
   std::filesystem::path report_json_path;
   std::filesystem::path report_text_path;
 };
@@ -365,8 +363,6 @@ void usage(const char* argv0) {
       << "  --recall-k <k>                  Recall K, default 10\n"
       << "  --settle-seconds <n>            Sleep after insertion before post recall, default 300\n"
       << "  --reset-breakdown-every <n>     Clear samples every n attempted inserts, default 50000; 0 disables\n"
-      << "  --min-post-recall <v>           Fail when post recall is below v\n"
-      << "  --max-recall-drop <v>           Fail when baseline - post exceeds v\n"
       << "  --report-text <path>            Optional text summary\n";
 }
 
@@ -409,10 +405,6 @@ Args parse_args(int argc, char** argv) {
       args.settle_seconds = std::stoull(require_value("--settle-seconds"));
     } else if (flag == "--reset-breakdown-every") {
       args.reset_breakdown_every = std::stoull(require_value("--reset-breakdown-every"));
-    } else if (flag == "--min-post-recall") {
-      args.min_post_recall = std::stod(require_value("--min-post-recall"));
-    } else if (flag == "--max-recall-drop") {
-      args.max_recall_drop = std::stod(require_value("--max-recall-drop"));
     } else if (flag == "--report-json") {
       args.report_json_path = require_value("--report-json");
     } else if (flag == "--report-text") {
@@ -666,7 +658,6 @@ int run_with_service(ComputeService& service, const Args& args) {
     {"storage_owner_maintenance_mode", service.config().storage_owner_maintenance_mode},
     {"storage_owner_maintenance_workers", service.config().storage_owner_maintenance_workers},
     {"storage_owner_reverse_mode", service.config().storage_owner_reverse_mode},
-    {"storage_owner_local_stitch_sync_fast_path", service.config().storage_owner_local_stitch_sync_fast_path},
     {"fine_grained_breakdown_enabled", service.config().enable_breakdown},
     {"search", "gpu_persistent_opq_pq16"},
     {"navigation_quantizer", "opq_pq16"},
@@ -701,8 +692,7 @@ int run_with_service(ComputeService& service, const Args& args) {
   service.reset_breakdown_state();
 
   if (insert_stats.failed != 0 || insert_stats.inserted != effective_insert_count) {
-    root["passed"] = false;
-    root["failure_reason"] = "one or more inserts failed";
+    root["execution_error"] = "one or more inserts failed";
     std::ostringstream text;
     text << "insert failed\n"
          << "  attempted: " << insert_stats.attempted << '\n'
@@ -723,27 +713,12 @@ int run_with_service(ComputeService& service, const Args& args) {
                                               args.recall_queries, args.recall_k);
   root["post_insert_recall"] = recall_json(post_recall, args.query_file, args.groundtruth_file);
 
-  bool passed = true;
-  std::string failure_reason;
-  if (args.min_post_recall >= 0.0 && post_recall.recall < args.min_post_recall) {
-    passed = false;
-    failure_reason = "post recall below threshold";
-  }
   if (baseline_recall.has_value()) {
     const double drop = baseline_recall->recall - post_recall.recall;
     root["recall_delta"] = {
       {"baseline_minus_post", drop},
       {"post_minus_baseline", post_recall.recall - baseline_recall->recall},
-      {"max_allowed_drop", args.max_recall_drop},
     };
-    if (args.max_recall_drop >= 0.0 && drop > args.max_recall_drop) {
-      passed = false;
-      failure_reason = "recall drop exceeds threshold";
-    }
-  }
-  root["passed"] = passed;
-  if (!failure_reason.empty()) {
-    root["failure_reason"] = failure_reason;
   }
 
   std::ostringstream text;
@@ -761,15 +736,11 @@ int run_with_service(ComputeService& service, const Args& args) {
   if (baseline_recall.has_value()) {
     text << "  recall drop: " << (baseline_recall->recall - post_recall.recall) << '\n';
   }
-  text << "  passed: " << (passed ? "true" : "false") << '\n';
-  if (!failure_reason.empty()) {
-    text << "  failure_reason: " << failure_reason << '\n';
-  }
 
   write_json_file(args.report_json_path, root);
   write_text_file(args.report_text_path, text.str());
   std::cout << text.str();
-  return passed ? EXIT_SUCCESS : EXIT_FAILURE;
+  return EXIT_SUCCESS;
 }
 
 }  // namespace

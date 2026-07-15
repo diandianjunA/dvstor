@@ -1,6 +1,10 @@
 #pragma once
 
+#include "gpu_search/dynamic_route_consistency.hh"
+#include "gpu_search/initial_seed_quota.hh"
 #include "gpu_search/persistent_kernel/rdma_cache.cuh"
+
+#include <cuda/atomic>
 
 namespace gpu_search::persistent_kernel_detail {
 
@@ -13,6 +17,82 @@ __device__ u64 decode_compact_raw(const u8* source, u32 shard_bits) {
   const u32 shard = static_cast<u32>(packed >> offset_bits);
   const u64 offset = (packed & offset_mask) * 8;
   return (static_cast<u64>(shard) << 48) | offset;
+}
+
+struct DynamicRouteSnapshot {
+  u64 epoch{};
+  u64 remote_node{};
+  u32 id{};
+  u32 generation{};
+  u32 shard{};
+  u32 flags{};
+};
+
+template <typename T>
+__device__ T dynamic_route_atomic_load(const T& value) {
+  cuda::atomic_ref<T, cuda::thread_scope_device> reference(
+    const_cast<T&>(value));
+  return reference.load(cuda::memory_order_relaxed);
+}
+
+template <typename T>
+__device__ void dynamic_route_atomic_store(T& destination, T value) {
+  cuda::atomic_ref<T, cuda::thread_scope_device> reference(destination);
+  reference.store(value, cuda::memory_order_relaxed);
+}
+
+__device__ bool score_dynamic_route_slot(
+    const PersistentKernelParams& params, u32 slot_index,
+    u64 snapshot_epoch, const f32* query_lut,
+    DynamicRouteSnapshot& result, f32& distance) {
+  if (params.dynamic_route_slots == nullptr ||
+      params.dynamic_route_pq_codes == nullptr ||
+      params.pq_code_bytes == 0 ||
+      slot_index >= params.dynamic_route_capacity) {
+    return false;
+  }
+  const DeviceDynamicRouteSlot& source =
+    params.dynamic_route_slots[slot_index];
+  cuda::atomic_ref<u64, cuda::thread_scope_device> sequence(
+    const_cast<u64&>(source.sequence));
+  // A writer window is very short.  Two attempts recover from the common
+  // boundary race without ever making a query wait on mutation publication.
+  for (u32 attempt = 0; attempt < 2; ++attempt) {
+    const u64 before = sequence.load(cuda::memory_order_acquire);
+    if ((before & 1u) != 0) continue;
+    DynamicRouteSnapshot candidate{
+      .epoch = dynamic_route_atomic_load(source.epoch),
+      .remote_node = dynamic_route_atomic_load(source.remote_node),
+      .id = dynamic_route_atomic_load(source.id),
+      .generation = dynamic_route_atomic_load(source.generation),
+      .shard = dynamic_route_atomic_load(source.shard),
+      .flags = dynamic_route_atomic_load(source.flags),
+    };
+    const u64 after = sequence.load(cuda::memory_order_acquire);
+    if (!dynamic_route_window_stable(before, after)) continue;
+    const bool live = (candidate.flags & kDynamicRouteLive) != 0;
+    if (!live || (candidate.flags & ~kDynamicRouteLive) != 0 ||
+        candidate.epoch == 0 || candidate.epoch > snapshot_epoch ||
+        candidate.remote_node == 0 ||
+        candidate.shard >= params.num_shards ||
+        slot_index / kDynamicRouteSlotsPerShard != candidate.shard ||
+        static_cast<u32>(candidate.remote_node >> 48) != candidate.shard) {
+      return false;
+    }
+    const f32 candidate_distance = approximate_entry(
+      params, query_lut,
+      params.dynamic_route_pq_codes +
+        static_cast<size_t>(slot_index) * params.pq_code_bytes);
+    // PQ bytes are part of the same slot transaction. A writer marks the
+    // sequence odd before changing either code or metadata; revalidate only
+    // after scoring so an old pointer can never be paired with a new code.
+    const u64 scored_after = sequence.load(cuda::memory_order_acquire);
+    if (!dynamic_route_window_stable(before, scored_after)) continue;
+    result = candidate;
+    distance = candidate_distance;
+    return true;
+  }
+  return false;
 }
 
 __device__ void add_delta_candidates(const PersistentKernelParams& params,
@@ -220,6 +300,7 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ u32 total_exact_reads;
   __shared__ u32 total_exact_cache_hits;
   __shared__ u32 seed_count;
+  __shared__ u32 dynamic_seed_count;
   __shared__ u32 selected_anchor_count;
   __shared__ u32 anchor_best_indices[256];
   if (params.anchor_count != 0 && params.anchor_vectors != nullptr &&
@@ -306,7 +387,9 @@ __device__ void process_query(const PersistentKernelParams& params,
     }
   } else {
     if (threadIdx.x == 0) {
-      seed_count = min(params.entry_point_count, params.entry_seed_count);
+      seed_count = min(
+        min(params.entry_point_count, params.entry_seed_count),
+        traversal_capacity);
       selected_anchor_count = 0;
     }
     for (u32 index = threadIdx.x; index < seed_count; index += blockDim.x) {
@@ -316,6 +399,69 @@ __device__ void process_query(const PersistentKernelParams& params,
         params, query_lut, handle, descriptor.snapshot_epoch);
       merge_expanded[index] = 0;
     }
+  }
+  __syncthreads();
+  const u32 static_seed_count = seed_count;
+  if (threadIdx.x == 0) dynamic_seed_count = 0;
+  __syncthreads();
+  for (u32 slot = threadIdx.x; slot < params.dynamic_route_capacity;
+       slot += blockDim.x) {
+    DynamicRouteSnapshot dynamic_route;
+    f32 distance = FLT_MAX;
+    if (!score_dynamic_route_slot(
+          params, slot, descriptor.snapshot_epoch, query_lut,
+          dynamic_route, distance)) {
+      continue;
+    }
+    const u32 handle = handle_from_raw(params, dynamic_route.remote_node);
+    if (handle == UINT32_MAX) continue;
+    if (!isfinite(distance) || distance == FLT_MAX) {
+      continue;
+    }
+    const u32 rank = atomicAdd(&dynamic_seed_count, 1u);
+    const u32 destination = static_seed_count + rank;
+    if (destination >= kPersistentMaxExact * 2) continue;
+    merge_handles[destination] = handle;
+    merge_ids[destination] = dynamic_route.id;
+    merge_distances[destination] = distance;
+    merge_expanded[destination] = 0;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    // atomicAdd counts every valid canonical slot, including ranks that did
+    // not fit in the fixed merge scratch.  Only the contiguous prefix below
+    // was materialized and may participate in either tier-local sort.
+    dynamic_seed_count = min(
+      dynamic_seed_count,
+      static_cast<u32>(kPersistentMaxExact * 2) - static_seed_count);
+  }
+  __syncthreads();
+  if (static_seed_count + dynamic_seed_count > traversal_capacity) {
+    // The normal path still performs only the original union sort.  Tier-local
+    // sorts are needed solely when the bounded beam forces a quota decision.
+    sort_candidates(merge_handles, nullptr, merge_distances, merge_expanded,
+                    static_seed_count);
+    sort_candidates(merge_handles + static_seed_count, nullptr,
+                    merge_distances + static_seed_count,
+                    merge_expanded + static_seed_count,
+                    dynamic_seed_count);
+    if (threadIdx.x == 0) {
+      const InitialSeedQuota quota = choose_initial_seed_quota(
+        static_seed_count, dynamic_seed_count, traversal_capacity);
+      // The dynamic source range begins after the complete static range.  A
+      // forward copy is overlap-safe because every destination is no greater
+      // than its source and all overwritten source elements were already read.
+      for (u32 index = 0; index < quota.dynamic_count; ++index) {
+        const u32 source = static_seed_count + index;
+        const u32 destination = quota.static_count + index;
+        merge_handles[destination] = merge_handles[source];
+        merge_distances[destination] = merge_distances[source];
+        merge_expanded[destination] = merge_expanded[source];
+      }
+      seed_count = quota.static_count + quota.dynamic_count;
+    }
+  } else if (threadIdx.x == 0) {
+    seed_count = static_seed_count + dynamic_seed_count;
   }
   __syncthreads();
   sort_candidates(merge_handles, nullptr, merge_distances, merge_expanded,

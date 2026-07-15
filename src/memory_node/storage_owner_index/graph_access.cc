@@ -49,8 +49,38 @@ bool MemoryNode::read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
   return true;
 }
 
+bool MemoryNode::valid_local_storage_node_pointer(RemotePtr rptr) const {
+  if (rptr.is_null() || !local_shard(rptr.memory_node()) ||
+      !VamanaNode::hot_graph_entry_available(rptr)) {
+    return false;
+  }
+  const auto header_address = vamana::StorageLayoutResolver::header(rptr);
+  if (header_address.offset > mn_memory_bytes_ ||
+      sizeof(u64) > mn_memory_bytes_ - header_address.offset) {
+    return false;
+  }
+  if (rptr.byte_offset() < gpu_dynamic_node_base_) {
+    return true;
+  }
+  const auto* control = reinterpret_cast<const
+    gpu_search::format::StorageControlBlock*>(
+      index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+  const u64 high_watermark = std::atomic_ref<const u64>(
+    control->dynamic_high_watermark).load(std::memory_order_acquire);
+  const u64 node_bytes = VamanaNode::allocation_size();
+  return rptr.byte_offset() <= high_watermark &&
+         node_bytes <= high_watermark - rptr.byte_offset();
+}
+
 bool MemoryNode::storage_owner_node_live(RemotePtr rptr) {
   if (rptr.is_null() || rptr.memory_node() >= num_storage_nodes_) {
+    return false;
+  }
+  if (!VamanaNode::hot_graph_entry_available(rptr)) {
+    return false;
+  }
+  if (local_shard(rptr.memory_node()) &&
+      !valid_local_storage_node_pointer(rptr)) {
     return false;
   }
   const auto header_address = vamana::StorageLayoutResolver::header(rptr);

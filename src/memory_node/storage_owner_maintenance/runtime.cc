@@ -151,7 +151,7 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
   // context before asking executors to exit. The wait is bounded because peer
   // runtimes have no cross-shard shutdown barrier in schema-15: one shard may
   // already be offline, in which case infinite same-ID retry must not deadlock
-  // process shutdown. A non-drained summary remains an acceptance failure.
+  // process shutdown. A non-drained summary is reported as an incomplete drain.
   if (!storage_owner_maintenance_workers_.empty()) {
     std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
     const u64 rpc_timeout_ms = storage_worker_config_ == nullptr

@@ -12,6 +12,61 @@
 #include "vamana/anchor_index.hh"
 
 namespace gpu_search::format {
+
+u64 storage_route_body_checksum(
+    const StorageRoutePublication& publication) {
+  u64 checksum = checksum64_initial();
+  checksum = checksum64_update(
+    checksum, reinterpret_cast<const byte_t*>(&publication.magic),
+    offsetof(StorageRoutePublication, body_checksum) -
+      offsetof(StorageRoutePublication, magic));
+  checksum = checksum64_update(
+    checksum, reinterpret_cast<const byte_t*>(publication.slots.data()),
+    publication.slots.size() * sizeof(StorageRouteSlot));
+  return checksum;
+}
+
+bool validate_storage_route_publication(
+    const StorageRoutePublication& publication, u32 expected_shard,
+    std::string* error) {
+  const auto fail = [&](const char* message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  if (publication.sequence_begin == 0 ||
+      (publication.sequence_begin & 1u) != 0 ||
+      publication.sequence_begin != publication.sequence_end) {
+    return fail("storage route snapshot overlaps publication");
+  }
+  if (publication.magic != kStorageRoutePublicationMagic ||
+      publication.version != kStorageRoutePublicationVersion ||
+      publication.header_bytes != sizeof(StorageRoutePublication) ||
+      publication.shard_id != expected_shard ||
+      publication.slot_count != kStorageRouteSlots ||
+      publication.code_bytes == 0 ||
+      publication.code_bytes > kStorageRouteMaxCodeBytes) {
+    return fail("storage route publication header mismatch");
+  }
+  if (publication.body_checksum !=
+      storage_route_body_checksum(publication)) {
+    return fail("storage route publication checksum mismatch");
+  }
+  for (const StorageRouteSlot& slot : publication.slots) {
+    if (slot.remote_node == 0) {
+      if (slot.generation == 0 && slot.id != 0) {
+        return fail("storage route publication contains an invalid empty slot");
+      }
+      continue;
+    }
+    // Schema-15 immutable base nodes store generation zero; online versions
+    // start at one. Both are valid canonical route representatives.
+    if (static_cast<u32>(slot.remote_node >> 48) != expected_shard) {
+      return fail("storage route publication contains an invalid live slot");
+    }
+  }
+  if (error != nullptr) error->clear();
+  return true;
+}
 namespace {
 
 constexpr u64 kChecksumOffset = 1469598103934665603ULL;
@@ -358,11 +413,15 @@ bool synthesize_distributed_view(
       index_prefix, synthesized.layout.dim, dtype,
       metadata.at("vector_bytes").get<u32>(), synthesized, target,
       selected, synthesized.entry_points);
+    // The anchor-free fallback must not fill the table from the first shard
+    // before later shards get a chance to contribute.  Walk shards at every
+    // sample rank so the fixed entry set remains balanced even when the
+    // requested count is smaller than one shard's sampling budget.
     const u32 quota = (target + shard_count - 1) / shard_count;
-    for (u32 shard = 0; shard < shard_count &&
-         synthesized.entry_points.size() < target; ++shard) {
-      for (u32 sample = 0; sample < quota * 16 &&
-           synthesized.entry_points.size() < target; ++sample) {
+    for (u32 sample = 0; sample < quota * 16 &&
+         synthesized.entry_points.size() < target; ++sample) {
+      for (u32 shard = 0; shard < shard_count &&
+           synthesized.entry_points.size() < target; ++shard) {
         const u64 slot = mix64(options.seed ^
           (static_cast<u64>(shard) << 32) ^ sample) % counts[shard];
         const u32 ordinal = static_cast<u32>(

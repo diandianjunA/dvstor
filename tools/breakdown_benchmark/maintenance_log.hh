@@ -9,7 +9,7 @@
 namespace tools::breakdown_benchmark {
 
 // Keep this in sync with kFinalizeLatencyBucketUpperNs. The explicit 5000 ms
-// bucket makes the acceptance predicate p99 <= 5 s exact instead of rounding
+// bucket keeps p99 reporting precise without rounding
 // every latency in (4 s, 8 s] up to 8 s.
 inline constexpr size_t kMaintenanceLatencyBucketCount = 18;
 

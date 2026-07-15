@@ -9,8 +9,6 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
   auto& scratch = current_storage_owner_thread_->request_scratch;
   scratch.clear();
 
-  const u32 expected_anchor_hint_count = storage_owner_local_stitch_mode(config)
-                                           ? config.storage_owner_anchor_hints : 0;
   lib_assert(task.client_id < num_clients_ &&
                task.slot_id < insert_runtime_.request_slot_count,
              "storage-owner task references an invalid request slot");
@@ -20,12 +18,11 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
     reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(payload);
   const bool mutation = request->magic == service::storage_owner::kMutationMagic;
   const size_t expected_bytes = mutation
-    ? service::storage_owner::mutation_batch_request_bytes(
-        request->item_count, config.dim, request->anchor_hint_count)
-    : service::storage_owner::insert_batch_request_bytes(
-        request->item_count, config.dim, request->anchor_hint_count);
+    ? service::storage_owner::mutation_batch_request_bytes(request->item_count)
+    : service::storage_owner::insert_batch_request_bytes(request->item_count);
   lib_assert(request->item_count == task.item_count &&
                request->batch_id == task.batch_id &&
+               request->anchor_hint_count == 0 &&
                task.byte_len >= expected_bytes,
              "storage-owner request slot changed before task execution");
 
@@ -37,10 +34,6 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
     : service::storage_owner::request_vectors(payload, request->item_count);
   const u32* wire_kinds = mutation
     ? service::storage_owner::mutation_request_kinds(payload) : nullptr;
-  const u64* anchor_hints = mutation
-    ? service::storage_owner::mutation_request_anchor_hints(payload, request->item_count)
-    : service::storage_owner::request_anchor_hints(payload, request->item_count);
-
   scratch.kinds.resize(request->item_count, service::storage_owner::MutationKind::insert);
   scratch.decoded_vectors.resize(static_cast<size_t>(request->item_count) * config.dim);
   for (u32 item = 0; item < request->item_count; ++item) {
@@ -70,8 +63,6 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
         ids,
         scratch.kinds.data(),
         scratch.decoded_vectors.data(),
-        anchor_hints,
-        expected_anchor_hint_count,
         request->item_count,
         breakdown,
         config,
@@ -82,8 +73,6 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
         ids,
         scratch.kinds.data(),
         scratch.decoded_vectors.data(),
-        anchor_hints,
-        expected_anchor_hint_count,
         request->item_count,
         *current_storage_owner_thread_,
         breakdown,

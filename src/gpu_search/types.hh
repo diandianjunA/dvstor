@@ -71,6 +71,42 @@ struct ResidentPqEraseUpdate {
   u32 reserved{};
 };
 
+// The dynamic query-route overlay is deliberately tiny and fixed-capacity.
+// Static anchors remain the bootstrap/fallback. Storage owners publish the
+// canonical live representatives, so every compute node installs identical
+// slot identities even when mutations originate from different clients.
+inline constexpr u32 kDynamicRouteSlotsPerShard = 8;
+inline constexpr u32 kDynamicRouteLive = 1u;
+
+struct DynamicRouteUpdate {
+  u64 epoch{};
+  u64 remote_node{};
+  u32 slot{};
+  u32 shard{};
+  u32 id{};
+  u32 generation{};
+  u32 flags{};
+  u32 reserved{};
+};
+
+// sequence is a device-scope seqlock.  The control CTA is the only writer:
+// odd means an update is in progress, even means the remaining fields form a
+// stable snapshot.  Query CTAs never wait for a writer; they skip an unstable
+// dynamic seed and continue with the static route.
+struct DeviceDynamicRouteSlot {
+  u64 sequence{};
+  u64 command_id{};
+  u64 epoch{};
+  u64 remote_node{};
+  u32 id{};
+  u32 generation{};
+  u32 shard{};
+  u32 flags{};
+};
+
+static_assert(sizeof(DynamicRouteUpdate) == 40);
+static_assert(sizeof(DeviceDynamicRouteSlot) == 48);
+
 inline constexpr u32 kDeltaCommandReset = 1u;
 inline constexpr u32 kDeltaCommandPromoteOverrides = 1u << 1;
 
@@ -84,6 +120,7 @@ struct DeltaPublishDescriptor {
   u32 override_count{};
   u32 durable_count{};
   u32 resident_pq_erase_count{};
+  u32 dynamic_route_count{};
   u32 flags{};
 };
 
@@ -122,6 +159,10 @@ struct TelemetrySnapshot {
   u64 graph_page_cache_hits{};
   u64 graph_route_hits{};
   u64 graph_route_refreshes{};
+  u64 dynamic_route_publications{};
+  u64 dynamic_route_slot_updates{};
+  u64 dynamic_route_live_slots{};
+  u64 dynamic_route_snapshot_skips{};
   u64 graph_cache_invalidations{};
   u64 exact_vector_reads{};
   u64 exact_vector_cache_hits{};
@@ -185,6 +226,10 @@ public:
   std::atomic<u64> graph_page_cache_hits{0};
   std::atomic<u64> graph_route_hits{0};
   std::atomic<u64> graph_route_refreshes{0};
+  std::atomic<u64> dynamic_route_publications{0};
+  std::atomic<u64> dynamic_route_slot_updates{0};
+  std::atomic<u64> dynamic_route_live_slots{0};
+  std::atomic<u64> dynamic_route_snapshot_skips{0};
   std::atomic<u64> graph_cache_invalidations{0};
   std::atomic<u64> exact_vector_reads{0};
   std::atomic<u64> exact_vector_cache_hits{0};

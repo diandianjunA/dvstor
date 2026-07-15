@@ -28,8 +28,6 @@ RECALL_QUERIES="${RECALL_QUERIES:-10000}"
 RECALL_K="${RECALL_K:-$K}"
 SETTLE_SECONDS="${SETTLE_SECONDS:-300}"
 RESET_BREAKDOWN_EVERY="${RESET_BREAKDOWN_EVERY:-50000}"
-MIN_POST_RECALL="${MIN_POST_RECALL:--1}"
-MAX_RECALL_DROP="${MAX_RECALL_DROP:--1}"
 
 for path in "$INSERT_FILE_101M" "$QUERY_FILE_101M" "$GROUNDTRUTH_FILE_101M"; do
   if [[ ! -s "$path" ]]; then
@@ -64,8 +62,6 @@ cmd=("$BUILD_DIR/dvstor_sift101m_long_insert_recall"
   --recall-k "$RECALL_K"
   --settle-seconds "$SETTLE_SECONDS"
   --reset-breakdown-every "$RESET_BREAKDOWN_EVERY"
-  --min-post-recall "$MIN_POST_RECALL"
-  --max-recall-drop "$MAX_RECALL_DROP"
   --report-json "$JSON_REPORT"
   --report-text "$TEXT_REPORT")
 

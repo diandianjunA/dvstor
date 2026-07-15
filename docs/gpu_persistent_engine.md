@@ -52,27 +52,34 @@ thread 只做以下工作：
 
 1. 将 query 转为 float，应用 OPQ 矩阵；
 2. 为每个 PQ 子空间构建 256 项距离表；
-3. 对连续存放的 anchor PQ 路由层和最新动态入口打分；
+3. 对连续存放的静态启动入口和固定容量在线动态入口共同打分；
 4. 从 beam 选择未展开候选；
 5. 以 `gpu-graph-prefetch-depth` 并行发出远端图读取；
 6. 解码 5-byte RemotePtr，并用常驻 PQ code 评分；
 7. 去重、合并并裁剪到 traversal beam；
 8. 达到收敛或 `gpu-max-expansions` 后进入精排。
 
-anchor PQ code 在启动时从完整 code 表聚集成连续的小型路由层。这只是相同 code
+静态入口 PQ code 在启动时从完整 code 表聚集成连续的小型兜底层。这只是相同 code
 的无损重排，既不引入新的量化误差，也避免每次入口选择在大规模 PQ 表中随机读。
+每个分片另有 8 个 storage-owner 权威固定槽位。owner 用在线 mutation 持续更新
+代表节点，并在既有 4 KiB control page 的保留区发布带 checksum/seqlock 的快照；
+所有计算节点低频拉取同一快照，再由 control CTA 按 epoch 更新 GPU 槽位。每槽同时
+携带最多 32B 的权威 PQ code，所以其他计算节点写入的动态节点也能直接参与入口
+评分，不需要逐 mutation 广播或每查询额外 RDMA。动态表内存固定，不会随运行时间
+或 mutation 数量增长。
 
-图读取 miss 直接落入每查询 scratch，只有重复访问才准入有界 GPU adjacency
-cache；因此冷态正确路径和吞吐不依赖缓存命中。基础图视为不可变快照；在线 mutation
-通过独立 GPU delta overlay、override epoch 和动态 anchor 桶生效，不逐写清空
-基础图热点。四路组相联缓存使用 reader pin，避免替换仍被查询读取的 cache line。
+图读取 miss 直接落入每查询 scratch；显式启用可选 GPU adjacency cache 时，只有
+重复访问才准入该有界缓存。默认 graph cache 容量为 0，因此冷态正确路径和当前
+最佳吞吐不依赖缓存命中。基础图视为不可变快照；在线 mutation 通过独立 GPU
+delta overlay、override epoch 和动态候选桶生效，不逐写清空基础图热点。启用时，
+四路组相联缓存使用 reader pin，避免替换仍被查询读取的 cache line。
 
 ## 精确重排
 
 近似导航只决定候选覆盖，最终结果始终使用原始 L2 距离：
 
 1. 选择最多 `gpu-final-rerank-width` 个候选；
-2. 从 GPU exact cache 命中，或通过 GPUNetIO 拉取远端 fixed record；
+2. 默认通过 GPUNetIO 拉取远端 fixed record；显式启用 exact cache 时可先尝试命中；
 3. 按 metadata dtype 解码 uint8、int8 或 float32；
 4. 计算精确 L2，合并动态 delta，过滤 delete/旧 generation；
 5. 按距离返回 top-k。
@@ -84,28 +91,47 @@ entry point、traversal beam、最大展开数和精排宽度共同决定。
 
 更新采用 storage-owner commit + GPU epoch publish：
 
-1. storage owner 完成 fixed record、紧凑图、idmap 和反向边更新；
-2. 计算服务按可见性窗口合并 commit 结果；
+1. stage1 在 storage owner 发布 fixed record、临时出边、idmap 和 maintenance intent，
+   但不等待 GPU 发布，也不写权威反向边；
+2. owner-memory ACK 返回后，计算服务按可见性窗口合并 commit 结果；
 3. CPU 把原始 dtype 向量和记录描述符写入 mapped pinned staging，不启动 side kernel，
    也不执行同步 H2D 拷贝；
 4. 专用常驻 control CTA 批量完成 OPQ/PQ 编码，并更新 delta 哈希、bucket 和 override；
-5. 原子发布 delta count 和 snapshot epoch。
+5. 原子发布 delta count 和 snapshot epoch；
+6. stage2 完成所有分片的在线构建搜索、统一 RobustPrune 和所选邻居的权威反向边，
+   再写最终出边并推进 durable sequence。
 
 查询在 admission 时绑定 snapshot epoch。upsert/delete 的 base 版本由 override
 epoch 屏蔽，动态版本只在对应 epoch 可见。发布、压缩或 kernel 失败会把引擎
 标记为 unhealthy；后续查询立即失败，而不是继续使用可能陈旧的状态。
 
-动态层不是单调增长日志。storage maintenance 完成新节点 stitch 和旧节点反向边
-清理后推进 durable sequence；计算节点再等待可见性窗口和所有旧 query ticket
-退出，随后退休 GPU L0 记录，并把该 sequence 写入自己的远端 ACK 槽。存储节点
-只在所有计算节点 ACK 的最小值覆盖删除记录后复用动态物理槽。因此 upsert/delete
-产生的死记录有界回收，旧查询不会读到已复用地址，多计算节点也不会互相越过 RCU
-屏障。前台持续写入时至少保留一个维护 worker，避免 durable watermark 被永久饿死。
+本 CN 的 mutation delta 仍在 stage1 ACK 后立即异步发布，保证短期可见性；查询
+路由则只接受 storage owner 的 canonical 8-slot 快照，避免多计算节点分别观察局部
+写流后产生不同槽位。route-only command 先写该槽的 PQ code，再用 device-scope
+seqlock 发布 `{epoch, pointer, id, generation}`，最后推进查询 snapshot epoch；若
+正好与写入冲突，查询跳过该槽并继续使用静态启动入口。storage control snapshot
+若被 RDMA 读到撕裂，checksum 校验失败后保留旧 GPU 快照并在下一周期重试。
+
+动态 GPU 元数据不是单调增长日志。storage maintenance 完成任务已声明的 stage2
+操作后推进 durable sequence；计算节点再等待可见性窗口和所有旧 query ticket
+退出，随后退休 GPU L0 记录，并把该 sequence 写入自己的远端 ACK 槽。这个 RCU
+流程只保证 GPU 可变元数据和被淘汰的常驻 PQ 槽可安全回收，不表示存储端物理节点
+地址可复用。前台持续写入时至少保留一个 maintenance worker，避免 durable
+watermark 被永久饿死。
 
 这里的“退休”不是伪装成静态索引重写：静态 PQ/图 generation 在线保持不变，
-已 stitch 的存活动态节点继续由存储节点持有并按需 RDMA 访问。净新增数据必然占用
-新增存储容量；只有更新和删除产生的死槽可以复用。若数据规模超过预留容量，需要
-构建下一静态 generation 并切换，而不能覆盖仍存活的远端记录。
+已 stitch 的存活动态节点继续由存储节点持有并按需 RDMA 访问。schema-15 反向边
+请求只有物理指针、没有 generation；为使迟到重试不可能命中另一个节点，动态物理
+地址不会复用。净新增和每次 upsert 的新版本会分配新地址，delete 也不会释放旧
+地址；它们都会持续占用预留的存储节点容量。若容量不足，需要协议升级或构建下一
+静态 generation 并切换。
+
+当前实现也没有完整入边索引。insert 的 stage2 会等待它最终选择的全部反向边操作
+完成，但 delete/upsert 只能处理协议已知的边，不能证明所有历史未知入边已经从全图
+移除；查询会按 tombstone/generation 过滤失效版本，残留指针仍可能增加遍历开销和
+影响长期质量。因而“两阶段最终等价”仅指同一逻辑快照下：每个分片执行相同宽度
+`L` 的在线构建搜索、合并所有 beam，并执行一次相同 RobustPrune 的分片 reference；
+它不等价于离线 builder 的全候选构图，也不覆盖 delete/upsert 的全图整理语义。
 
 ## 内存预算
 
@@ -115,7 +141,7 @@ epoch 屏蔽，动态版本只在对应 epoch 可见。发布、压缩或 kernel
 - adjacency cache payload、tag、state、reader pin 和 victim；
 - exact cache payload 与并发控制；
 - 原始 dtype delta vector、delta PQ code、hash table 和 bucket；
-- query、OPQ 输出、LUT、beam、visited set、anchors 和结果；
+- query、OPQ 输出、LUT、beam、visited set、静态/动态路由入口和结果；
 - DOCA/CUDA 外部状态的固定安全余量。
 
 默认 SIFT1B：
@@ -137,9 +163,9 @@ epoch 屏蔽，动态版本只在对应 epoch 可见。发布、压缩或 kernel
 - 连续 PQ code 只在启动时传输一次；
 - 稳态只按需读取 512 B 图记录和最终精确向量；
 - 每个 storage node 使用多条长期存活的 GPU QP；
-- 查询状态、LUT、beam 和缓存均预分配；
+- 查询状态、LUT 和 beam 均预分配；可选缓存启用时也使用固定容量；
 - 多查询并发隐藏远端延迟，而不是同步执行单查询 RDMA 往返；
-- exact cache 与 graph cache 分离，避免大向量挤占导航工作集；
+- exact cache 与 graph cache 是默认关闭的独立可选项；启用时二者容量互不挤占；
 - telemetry 分别记录图读、精确读、cache hit、GPU phase cycle、direct-path failure、
   mutation publication queue/prepare/command、可见性延迟、L0 回收批次、退休量和存储回收 ACK。
 

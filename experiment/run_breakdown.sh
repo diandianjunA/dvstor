@@ -1,5 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+# 普通用户只需修改 sift100m_common.sh 的 "Benchmark input files" 配置块，
+# 或在命令行用同名环境变量覆盖。
+show_help() {
+  cat <<'EOF'
+Usage: ./experiment/run_breakdown.sh [PROFILE]
+
+常用负载：
+  WORKLOAD=query|insert|both|mixed        默认 mixed
+
+数据文件与声明范围（在 sift100m_common.sh 集中配置，也可用环境变量覆盖）：
+  PERFORMANCE_QUERY_FILE                 默认 sift100m_to_105m_query.u8bin
+  PERFORMANCE_QUERY_START/END            默认 [100000000,105000000)
+  INSERT_FILE                            默认 sift103m_to_105m_insert.u8bin
+  INSERT_VECTOR_START/END                默认 [103000000,105000000)
+
+数据准备：
+  PREPARE_BENCHMARK_DATA=0                默认；只读取预生成 u8bin，不需要 bigann_base.bvecs
+  PREPARE_BENCHMARK_DATA=1                从 BENCHMARK_VECTOR_SOURCE 生成 benchmark 文件
+  PREPARE_QUERY=1 PREPARE_GROUNDTRUTH=1   显式生成 recall 输入；默认也只读取
+
+示例：
+  WORKLOAD=insert BENCHMARK_CLIENT_THREADS=24 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
+  WORKLOAD=mixed BENCHMARK_CLIENT_THREADS=128 READ_RATIO=0.5 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
+  WORKLOAD=mixed MIXED_MODE=rate_limited TARGET_QUERY_QPS=5000 TARGET_WRITE_QPS=1000 \
+    ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
+
+脚本只记录原始结果，不对 QPS、召回、稳定性或后台维护做通过/失败判断。
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) show_help; exit 0 ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
@@ -15,197 +50,10 @@ WARMUP_SECONDS="${WARMUP_SECONDS:-30}"
 MEASURE_SECONDS="${MEASURE_SECONDS:-120}"
 RECALL_QUERIES="${RECALL_QUERIES:-1000}"
 RECALL_K="${RECALL_K:-$K}"
-MIN_RECALL="${MIN_RECALL:--1}"
-MIN_QUERY_QPS="${MIN_QUERY_QPS:-5000}"
-MIN_INSERT_QPS="${MIN_INSERT_QPS:--1}"
-MIN_STABILITY_RATIO="${MIN_STABILITY_RATIO:-0.90}"
-MIN_WRITE_STABILITY_RATIO="${MIN_WRITE_STABILITY_RATIO:--1}"
 TARGET_QUERY_QPS="${TARGET_QUERY_QPS:-0}"
 TARGET_WRITE_QPS="${TARGET_WRITE_QPS:-0}"
-QUERY_BASELINE_QPS="${QUERY_BASELINE_QPS:--1}"
-QUERY_BASELINE_REPORT="${QUERY_BASELINE_REPORT:-}"
-MIN_QUERY_BASELINE_RATIO="${MIN_QUERY_BASELINE_RATIO:--1}"
-MAX_RECALL_DROP="${MAX_RECALL_DROP:--1}"
-MAX_ZERO_COMPLETION_WINDOWS="${MAX_ZERO_COMPLETION_WINDOWS:--1}"
-MAX_ZERO_QUERY_WINDOWS="${MAX_ZERO_QUERY_WINDOWS:--1}"
-MAX_ZERO_WRITE_WINDOWS="${MAX_ZERO_WRITE_WINDOWS:--1}"
-MAX_DRAIN_SECONDS="${MAX_DRAIN_SECONDS:--1}"
-MIN_RATE_ATTAINMENT_RATIO="${MIN_RATE_ATTAINMENT_RATIO:--1}"
 RECALL_MODE="${RECALL_MODE:-all}"
 RECALL_BASE_ID_LIMIT="${RECALL_BASE_ID_LIMIT:-0}"
-MAX_GPU_VISIBILITY_MS="${MAX_GPU_VISIBILITY_MS:--1}"
-MAX_FINAL_MUTATION_CAPACITY_RESERVED="${MAX_FINAL_MUTATION_CAPACITY_RESERVED:--1}"
-MAX_FINAL_DELTA_MUTABLE_ENTRIES="${MAX_FINAL_DELTA_MUTABLE_ENTRIES:--1}"
-MAX_LATE_STORAGE_OWNER_RPCS="${MAX_LATE_STORAGE_OWNER_RPCS:--1}"
-MAX_STAGE2_P99_MS="${MAX_STAGE2_P99_MS:--1}"
-MAX_STAGE2_BACKLOG_SLOPE="${MAX_STAGE2_BACKLOG_SLOPE:--1}"
-MAX_STAGE2_REMAINING="${MAX_STAGE2_REMAINING:--1}"
-STAGE2_DRAIN_TIMEOUT_SECONDS="${STAGE2_DRAIN_TIMEOUT_SECONDS:-0}"
-REQUIRE_COLD_BASELINE="${REQUIRE_COLD_BASELINE:-1}"
-
-configure_insert_acceptance() {
-  local client_threads="${1:?client thread count is required}"
-  local min_insert_qps="${2:?minimum insert QPS is required}"
-  WORKLOAD=insert
-  BENCHMARK_CLIENT_THREADS="$client_threads"
-  READ_RATIO=0
-  MIXED_MODE=fixed_threads
-  WARMUP_SECONDS=30
-  MEASURE_SECONDS=120
-  TARGET_QUERY_QPS=0
-  TARGET_WRITE_QPS=0
-  WRITE_INSERT_RATIO=1
-  WRITE_UPSERT_RATIO=0
-  WRITE_DELETE_RATIO=0
-  RECALL_K=10
-  MIN_RECALL=-1
-  MIN_QUERY_QPS=-1
-  MIN_INSERT_QPS="$min_insert_qps"
-  MIN_STABILITY_RATIO=-1
-  MIN_WRITE_STABILITY_RATIO=-1
-  QUERY_BASELINE_QPS=-1
-  QUERY_BASELINE_REPORT=""
-  MIN_QUERY_BASELINE_RATIO=-1
-  MAX_RECALL_DROP=-1
-  MAX_ZERO_COMPLETION_WINDOWS=0
-  MAX_ZERO_QUERY_WINDOWS=0
-  MAX_ZERO_WRITE_WINDOWS=0
-  MAX_DRAIN_SECONDS=-1
-  MIN_RATE_ATTAINMENT_RATIO=-1
-  RECALL_MODE=all
-  RECALL_BASE_ID_LIMIT=0
-  MAX_GPU_VISIBILITY_MS=10
-  # ACK intentionally precedes GPU publication; this post-load gate waits for
-  # the response executor so visibility_ns_max includes the final batch.
-  MAX_FINAL_MUTATION_CAPACITY_RESERVED=0
-  MAX_FINAL_DELTA_MUTABLE_ENTRIES=-1
-  MAX_LATE_STORAGE_OWNER_RPCS=0
-  MAX_STAGE2_P99_MS=-1
-  MAX_STAGE2_BACKLOG_SLOPE=-1
-  MAX_STAGE2_REMAINING=-1
-  STAGE2_DRAIN_TIMEOUT_SECONDS=0
-  REQUIRE_COLD_BASELINE=1
-}
-
-# UPDATE_ACCEPTANCE_PROFILE is deliberately separate from the experiment PROFILE:
-# the former fixes workload/acceptance gates, while the latter selects service config.
-UPDATE_ACCEPTANCE_PROFILE="${UPDATE_ACCEPTANCE_PROFILE:-}"
-INSERT_ACCEPTANCE_SEGMENT_SIZE=1000000
-case "$UPDATE_ACCEPTANCE_PROFILE" in
-  "") ;;
-  querybaseline)
-    WORKLOAD=query
-    BENCHMARK_CLIENT_THREADS=64
-    READ_RATIO=1
-    MIXED_MODE=fixed_threads
-    WARMUP_SECONDS=30
-    MEASURE_SECONDS=120
-    RECALL_QUERIES=0
-    MIN_RECALL=-1
-    MIN_QUERY_QPS=5000
-    MIN_INSERT_QPS=-1
-    MIN_STABILITY_RATIO=0.90
-    MIN_WRITE_STABILITY_RATIO=-1
-    QUERY_BASELINE_QPS=-1
-    QUERY_BASELINE_REPORT=""
-    MIN_QUERY_BASELINE_RATIO=-1
-    MAX_RECALL_DROP=-1
-    MAX_ZERO_COMPLETION_WINDOWS=0
-    MAX_ZERO_QUERY_WINDOWS=0
-    MAX_ZERO_WRITE_WINDOWS=-1
-    MAX_DRAIN_SECONDS=-1
-    MIN_RATE_ATTAINMENT_RATIO=-1
-    RECALL_MODE=all
-    RECALL_BASE_ID_LIMIT=0
-    MAX_GPU_VISIBILITY_MS=-1
-    MAX_FINAL_MUTATION_CAPACITY_RESERVED=-1
-    MAX_FINAL_DELTA_MUTABLE_ENTRIES=-1
-    MAX_LATE_STORAGE_OWNER_RPCS=-1
-    MAX_STAGE2_P99_MS=-1
-    MAX_STAGE2_BACKLOG_SLOPE=-1
-    MAX_STAGE2_REMAINING=-1
-    STAGE2_DRAIN_TIMEOUT_SECONDS=0
-    REQUIRE_COLD_BASELINE=1
-    ;;
-  insert24)
-    # The checker uses >=, so the next representable decimal threshold encodes >760.
-    configure_insert_acceptance 24 760.000001
-    # Keep the two write-only runs disjoint even when they are executed against
-    # the same deployed index. Acceptance profiles intentionally override any
-    # ambient INSERT_START_ID.
-    INSERT_START_ID="$MAX_VECTORS"
-    ;;
-  insert64)
-    configure_insert_acceptance 64 1000
-    INSERT_START_ID=$((MAX_VECTORS + INSERT_ACCEPTANCE_SEGMENT_SIZE))
-    ;;
-  mixed15m)
-    WORKLOAD=mixed
-    BENCHMARK_CLIENT_THREADS=64
-    READ_RATIO=0.5
-    MIXED_MODE=rate_limited
-    WARMUP_SECONDS=60
-    MEASURE_SECONDS=900
-    TARGET_QUERY_QPS=5000
-    TARGET_WRITE_QPS=1000
-    WRITE_INSERT_RATIO=1
-    WRITE_UPSERT_RATIO=0
-    WRITE_DELETE_RATIO=0
-    RECALL_QUERIES=1000
-    RECALL_K=10
-    MIN_RECALL=0.93
-    MIN_QUERY_QPS=5000
-    MIN_INSERT_QPS=1000
-    MIN_STABILITY_RATIO=0.90
-    MIN_WRITE_STABILITY_RATIO=0.90
-    MIN_QUERY_BASELINE_RATIO=0.90
-    MAX_RECALL_DROP=0.002
-    MAX_ZERO_COMPLETION_WINDOWS=0
-    MAX_ZERO_QUERY_WINDOWS=0
-    MAX_ZERO_WRITE_WINDOWS=0
-    MAX_DRAIN_SECONDS=5
-    MIN_RATE_ATTAINMENT_RATIO=1
-    RECALL_MODE=base_only
-    RECALL_BASE_ID_LIMIT="$MAX_VECTORS"
-    MAX_GPU_VISIBILITY_MS=10
-    MAX_FINAL_MUTATION_CAPACITY_RESERVED=0
-    MAX_FINAL_DELTA_MUTABLE_ENTRIES=0
-    MAX_LATE_STORAGE_OWNER_RPCS=0
-    MAX_STAGE2_P99_MS=5000
-    MAX_STAGE2_BACKLOG_SLOPE=0
-    MAX_STAGE2_REMAINING=0
-    STAGE2_DRAIN_TIMEOUT_SECONDS=60
-    REQUIRE_COLD_BASELINE=1
-    ;;
-  *)
-    echo "unknown UPDATE_ACCEPTANCE_PROFILE=$UPDATE_ACCEPTANCE_PROFILE" >&2
-    echo "expected one of: querybaseline, insert24, insert64, mixed15m" >&2
-    exit 1
-    ;;
-esac
-
-if [[ -n "$UPDATE_ACCEPTANCE_PROFILE" && "$SHARDS" != "5" ]]; then
-  echo "$UPDATE_ACCEPTANCE_PROFILE acceptance requires the five-node deployment (SHARDS=5, got $SHARDS)" >&2
-  exit 1
-fi
-if [[ -n "$UPDATE_ACCEPTANCE_PROFILE" ]]; then
-  [[ "${STORAGE_OWNER_UPDATE_MODE:-local_stitch}" == "local_stitch" ]] || {
-    echo "$UPDATE_ACCEPTANCE_PROFILE acceptance requires STORAGE_OWNER_UPDATE_MODE=local_stitch" >&2
-    exit 1
-  }
-  [[ "${STORAGE_OWNER_MAINTENANCE_MODE:-finalize}" == "finalize" ]] || {
-    echo "$UPDATE_ACCEPTANCE_PROFILE acceptance requires STORAGE_OWNER_MAINTENANCE_MODE=finalize" >&2
-    exit 1
-  }
-  [[ "${STORAGE_OWNER_REVERSE_MODE:-async}" == "async" ]] || {
-    echo "$UPDATE_ACCEPTANCE_PROFILE acceptance requires STORAGE_OWNER_REVERSE_MODE=async" >&2
-    exit 1
-  }
-  [[ "${ENABLE_BREAKDOWN:-true}" == "true" ]] || {
-    echo "$UPDATE_ACCEPTANCE_PROFILE acceptance requires ENABLE_BREAKDOWN=true" >&2
-    exit 1
-  }
-fi
 
 number_is_positive() {
   local value="$1"
@@ -250,10 +98,12 @@ case "$WORKLOAD" in
     ;;
 esac
 
-if [[ "$UPDATE_ACCEPTANCE_PROFILE" == "querybaseline" ||
-      "$UPDATE_ACCEPTANCE_PROFILE" == "insert24" ||
-      "$UPDATE_ACCEPTANCE_PROFILE" == "insert64" ]]; then
-  needs_recall_data=0
+# Pure-query clients do not initialize update ownership state. Any workload
+# with writes additionally validates owner idmaps and starts the update runtime.
+if (( needs_insert_data )); then
+  ENABLE_UPDATES=true
+else
+  ENABLE_UPDATES=false
 fi
 
 maintenance_logs=()
@@ -261,64 +111,11 @@ if [[ -n "${STORAGE_MAINTENANCE_LOGS:-}" ]]; then
   read -r -a maintenance_logs <<< "$STORAGE_MAINTENANCE_LOGS"
 fi
 
-if [[ "$UPDATE_ACCEPTANCE_PROFILE" == "mixed15m" ]]; then
-  if [[ -z "$QUERY_BASELINE_REPORT" || ! -f "$QUERY_BASELINE_REPORT" ||
-        ! -r "$QUERY_BASELINE_REPORT" ]]; then
-    echo "mixed15m acceptance requires QUERY_BASELINE_REPORT=<readable querybaseline JSON report>" >&2
-    echo "first run UPDATE_ACCEPTANCE_PROFILE=querybaseline and pass its json path" >&2
-    exit 1
-  fi
-  if (( PERFORMANCE_QUERY_START < INSERT_VECTOR_END &&
-        INSERT_VECTOR_START < PERFORMANCE_QUERY_END )); then
-    echo "mixed15m acceptance requires disjoint declared query/insert source ranges" >&2
-    echo "query=[$PERFORMANCE_QUERY_START,$PERFORMANCE_QUERY_END) insert=[$INSERT_VECTOR_START,$INSERT_VECTOR_END)" >&2
-    exit 1
-  fi
-  if (( ${#maintenance_logs[@]} != 5 )); then
-    echo "mixed15m acceptance requires STORAGE_MAINTENANCE_LOGS with five local log paths" >&2
-    echo "got ${#maintenance_logs[@]} path(s)" >&2
-    exit 1
-  fi
-  declare -A seen_maintenance_logs=()
-  for maintenance_log in "${maintenance_logs[@]}"; do
-    if [[ ! -f "$maintenance_log" || ! -r "$maintenance_log" ]]; then
-      echo "mixed15m acceptance requires a readable storage maintenance log: $maintenance_log" >&2
-      exit 1
-    fi
-    resolved_log="$(readlink -f -- "$maintenance_log")"
-    if [[ -n "${seen_maintenance_logs[$resolved_log]:-}" ]]; then
-      echo "mixed15m acceptance requires five distinct maintenance logs; duplicate: $maintenance_log" >&2
-      exit 1
-    fi
-    seen_maintenance_logs[$resolved_log]=1
-  done
-fi
-
-if [[ "$REQUIRE_COLD_BASELINE" == "1" ]]; then
-  if (( ${GPU_ADJACENCY_CACHE_MB:-0} != 0 || ${GPU_EXACT_CACHE_MB:-0} != 0 )); then
-    echo "cold baseline requires GPU_ADJACENCY_CACHE_MB=0 and GPU_EXACT_CACHE_MB=0" >&2
-    exit 1
-  fi
-  [[ "${GPU_GRAPH_PREFETCH_DEPTH:-0}" == "32" ]] || {
-    echo "official cold baseline requires GPU_GRAPH_PREFETCH_DEPTH=32" >&2
-    exit 1
-  }
-  [[ "${GPU_PERSISTENT_BLOCKS_PER_SM:-0}" == "4" ]] || {
-    echo "official cold baseline requires GPU_PERSISTENT_BLOCKS_PER_SM=4" >&2
-    exit 1
-  }
-  [[ "${GPU_RDMA_QPS:-0}" == "32" ]] || {
-    echo "official cold baseline requires GPU_RDMA_QPS=32" >&2
-    exit 1
-  }
-fi
-
-# Fixed acceptance runs must fail before building or materializing large input
-# files when the compute deployment is missing any schema-15 routing sidecar.
-# write_service_config() validates again immediately before launching the client.
-if [[ -n "$UPDATE_ACCEPTANCE_PROFILE" ]]; then
-  validate_index_metadata compute
-fi
+# Validate the deployed index before preparing inputs or rebuilding the client.
+# Query-only workloads still use static GPU bootstrap routes but skip owner
+# idmaps; write workloads validate the idmaps as well. write_service_config()
+# validates once more immediately before launch.
+validate_index_metadata compute 0 "$ENABLE_UPDATES"
 
 RECALL_QUERY_FILE=""
 GROUNDTRUTH_PATH=""
@@ -331,39 +128,44 @@ fi
 if (( needs_performance_query )); then PERFORMANCE_QUERY_PATH="$(performance_query_bin)"; fi
 if (( needs_insert_data )); then INSERT_PATH="$(insert_bin)"; fi
 
-ensure_built dvstor_breakdown_benchmark
-
-# The current data preparer generates query and insert files together. If the one
-# file needed by a pure workload already exists, skip that coupled step so an
-# unused 5M query/insert file is neither required nor regenerated. Explicit
-# PREPARE_BENCHMARK_DATA/PREPARE_INSERT still takes precedence.
-prepare_benchmark_data="${PREPARE_BENCHMARK_DATA:-${PREPARE_INSERT:-1}}"
-prepare_recall_query="${PREPARE_QUERY:-1}"
-prepare_groundtruth="${PREPARE_GROUNDTRUTH:-1}"
+# Benchmark inputs are runtime inputs, not compute-node build products. They are
+# never generated unless the corresponding PREPARE_* switch is explicitly 1.
+prepare_benchmark_data="${PREPARE_BENCHMARK_DATA:-0}"
+prepare_recall_query="${PREPARE_QUERY:-0}"
+prepare_groundtruth="${PREPARE_GROUNDTRUTH:-0}"
 if (( !needs_recall_data )); then
   prepare_recall_query=0
   prepare_groundtruth=0
 fi
-if [[ -z "${PREPARE_BENCHMARK_DATA+x}" && -z "${PREPARE_INSERT+x}" &&
-      "${OVERWRITE_BENCHMARK_DATA:-0}" != "1" ]]; then
-  if [[ "$UPDATE_ACCEPTANCE_PROFILE" == "insert24" ||
-        "$UPDATE_ACCEPTANCE_PROFILE" == "insert64" ]]; then
-    # Insert acceptance consumes only the held-out insert stream. Missing input
-    # must fail explicitly rather than materializing an unrelated 5M query set.
-    prepare_benchmark_data=0
-  elif (( needs_performance_query && !needs_insert_data )) &&
-     [[ -s "$PERFORMANCE_QUERY_PATH" ]]; then
-    prepare_benchmark_data=0
-  elif (( needs_insert_data && !needs_performance_query )) &&
-       [[ -s "$INSERT_PATH" ]]; then
-    prepare_benchmark_data=0
-  fi
+if [[ "$prepare_recall_query" == "1" ||
+      "$prepare_groundtruth" == "1" ||
+      "$prepare_benchmark_data" == "1" ]]; then
+  PREPARE_BASE=0 \
+  PREPARE_QUERY="$prepare_recall_query" \
+  PREPARE_GROUNDTRUTH="$prepare_groundtruth" \
+  PREPARE_BENCHMARK_DATA="$prepare_benchmark_data" \
+    "$EXPERIMENT_DIR/prepare_sift100m_data.sh"
 fi
-PREPARE_BASE="${PREPARE_BASE:-0}" \
-PREPARE_QUERY="$prepare_recall_query" \
-PREPARE_GROUNDTRUTH="$prepare_groundtruth" \
-PREPARE_BENCHMARK_DATA="$prepare_benchmark_data" \
-  "$EXPERIMENT_DIR/prepare_sift100m_data.sh"
+
+if (( needs_performance_query )); then
+  echo "[breakdown] performance query: $PERFORMANCE_QUERY_PATH [$PERFORMANCE_QUERY_START,$PERFORMANCE_QUERY_END)"
+fi
+if (( needs_insert_data )); then
+  echo "[breakdown] insert: $INSERT_PATH [$INSERT_VECTOR_START,$INSERT_VECTOR_END)"
+fi
+
+if (( needs_recall_data )); then
+  [[ -s "$RECALL_QUERY_FILE" ]] || {
+    echo "missing recall query file: $RECALL_QUERY_FILE" >&2
+    echo "run PREPARE_QUERY=1 ./experiment/prepare_sift100m_data.sh once on a data-preparation node" >&2
+    exit 1
+  }
+  [[ -s "$GROUNDTRUTH_PATH" ]] || {
+    echo "missing groundtruth file: $GROUNDTRUTH_PATH" >&2
+    echo "run PREPARE_GROUNDTRUTH=1 ./experiment/prepare_sift100m_data.sh once on a data-preparation node" >&2
+    exit 1
+  }
+fi
 
 if (( needs_performance_query )); then
   if [[ ! -s "$PERFORMANCE_QUERY_PATH" ]]; then
@@ -388,21 +190,6 @@ if (( needs_performance_query && needs_insert_data )) &&
   exit 1
 fi
 
-if [[ "$UPDATE_ACCEPTANCE_PROFILE" == "mixed15m" ||
-      "$UPDATE_ACCEPTANCE_PROFILE" == "querybaseline" ]]; then
-  read -r performance_query_rows performance_query_dim < <(
-    od -An -tu4 -N8 -- "$PERFORMANCE_QUERY_PATH")
-  performance_query_bytes="$(stat -c %s -- "$PERFORMANCE_QUERY_PATH")"
-  expected_query_bytes=$((8 + 5000000 * DIM))
-  if [[ "${performance_query_rows:-}" != "5000000" ||
-        "${performance_query_dim:-}" != "$DIM" ||
-        "$performance_query_bytes" != "$expected_query_bytes" ]]; then
-    echo "$UPDATE_ACCEPTANCE_PROFILE acceptance requires one 5,000,000-row u8bin performance query file" >&2
-    echo "file=$PERFORMANCE_QUERY_PATH rows=${performance_query_rows:-unknown} dim=${performance_query_dim:-unknown} bytes=$performance_query_bytes" >&2
-    exit 1
-  fi
-fi
-
 effective_insert_start_id=""
 if (( needs_insert_data )); then
   default_insert_start_id=$((MAX_VECTORS + 1000000))
@@ -425,16 +212,9 @@ if (( needs_insert_data )); then
     echo "INSERT_START_ID must not overlap base IDs [0,$MAX_VECTORS): $effective_insert_start_id" >&2
     exit 1
   fi
-  if [[ "$UPDATE_ACCEPTANCE_PROFILE" == "insert24" ||
-        "$UPDATE_ACCEPTANCE_PROFILE" == "insert64" ]]; then
-    acceptance_segment_end=$((effective_insert_start_id + INSERT_ACCEPTANCE_SEGMENT_SIZE))
-    if (( acceptance_segment_end > 4294967296 )); then
-      echo "$UPDATE_ACCEPTANCE_PROFILE ID segment exceeds uint32: [$effective_insert_start_id,$acceptance_segment_end)" >&2
-      exit 1
-    fi
-    echo "[breakdown] $UPDATE_ACCEPTANCE_PROFILE ID segment=[$effective_insert_start_id,$acceptance_segment_end)"
-  fi
 fi
+
+ensure_built dvstor_breakdown_benchmark
 
 TS="$(date +%Y%m%d_%H%M%S)"
 OUT_DIR="$REPORT_DIR/$PROFILE"
@@ -457,32 +237,8 @@ cmd=("$BUILD_DIR/dvstor_breakdown_benchmark"
   --write-insert-ratio "${WRITE_INSERT_RATIO:-1}"
   --write-upsert-ratio "${WRITE_UPSERT_RATIO:-0}"
   --write-delete-ratio "${WRITE_DELETE_RATIO:-0}"
-  --min-query-qps "$MIN_QUERY_QPS"
-  --min-insert-qps "$MIN_INSERT_QPS"
-  --min-stability-ratio "$MIN_STABILITY_RATIO"
-  --min-write-stability-ratio "$MIN_WRITE_STABILITY_RATIO"
-  --query-baseline-qps "$QUERY_BASELINE_QPS"
-  --min-query-baseline-ratio "$MIN_QUERY_BASELINE_RATIO"
-  --max-recall-drop "$MAX_RECALL_DROP"
-  --max-zero-completion-windows "$MAX_ZERO_COMPLETION_WINDOWS"
-  --max-zero-query-windows "$MAX_ZERO_QUERY_WINDOWS"
-  --max-zero-write-windows "$MAX_ZERO_WRITE_WINDOWS"
-  --max-drain-seconds "$MAX_DRAIN_SECONDS"
-  --min-rate-attainment-ratio "$MIN_RATE_ATTAINMENT_RATIO"
-  --max-gpu-visibility-ms "$MAX_GPU_VISIBILITY_MS"
-  --max-final-mutation-capacity-reserved "$MAX_FINAL_MUTATION_CAPACITY_RESERVED"
-  --max-final-delta-mutable-entries "$MAX_FINAL_DELTA_MUTABLE_ENTRIES"
-  --max-late-storage-owner-rpcs "$MAX_LATE_STORAGE_OWNER_RPCS"
-  --max-stage2-p99-ms "$MAX_STAGE2_P99_MS"
-  --max-stage2-backlog-slope "$MAX_STAGE2_BACKLOG_SLOPE"
-  --max-stage2-remaining "$MAX_STAGE2_REMAINING"
-  --stage2-drain-timeout-seconds "$STAGE2_DRAIN_TIMEOUT_SECONDS"
   --report-json "$JSON_REPORT"
   --report-text "$TEXT_REPORT")
-
-if [[ -n "$QUERY_BASELINE_REPORT" ]]; then
-  cmd+=(--query-baseline-report "$QUERY_BASELINE_REPORT")
-fi
 
 if (( needs_recall_data )); then
   cmd+=(--recall-query-file "$RECALL_QUERY_FILE"
@@ -490,8 +246,7 @@ if (( needs_recall_data )); then
         --recall-queries "$RECALL_QUERIES"
         --recall-k "$RECALL_K"
         --recall-mode "$RECALL_MODE"
-        --recall-base-id-limit "$RECALL_BASE_ID_LIMIT"
-        --min-recall "$MIN_RECALL")
+        --recall-base-id-limit "$RECALL_BASE_ID_LIMIT")
 fi
 if (( needs_performance_query )); then
   cmd+=(--performance-query-file "$PERFORMANCE_QUERY_PATH")
@@ -502,10 +257,6 @@ fi
 for maintenance_log in "${maintenance_logs[@]}"; do
   cmd+=(--storage-maintenance-log "$maintenance_log")
 done
-
-if [[ -n "$UPDATE_ACCEPTANCE_PROFILE" ]]; then
-  echo "[breakdown] update acceptance profile=$UPDATE_ACCEPTANCE_PROFILE"
-fi
 
 printf '[breakdown] profile=%s command:' "$PROFILE"; printf ' %q' "${cmd[@]}"; echo
 "${cmd[@]}"

@@ -25,7 +25,6 @@
 #include "service/storage_owner_protocol.hh"
 #include "service/index_metadata.hh"
 #include "service/query_result.hh"
-#include "vamana/anchor_index.hh"
 
 class ComputeService {
 private:
@@ -83,8 +82,6 @@ private:
     u32 completion_id{std::numeric_limits<u32>::max()};
     std::chrono::steady_clock::time_point enqueued_at{};
     std::chrono::steady_clock::time_point sender_dequeued_at{};
-    vec<RemotePtr> anchor_hints;
-    RemotePtr anchor_bucket_hint;
   };
 
   struct StorageOwnerRpcSlot {
@@ -95,6 +92,7 @@ private:
     bool response_done{false};
     bool results_completed{false};
     bool completion_claimed{false};
+    bool response_valid{false};
     u32 response_slot_id{std::numeric_limits<u32>::max()};
     u32 gpu_reserved_items{};
     u32 item_count{};
@@ -109,6 +107,10 @@ private:
     vec<byte_t> request_buffer;
     std::unique_ptr<LocalMemoryRegion> request_region;
     vec<u32> tasks;
+    vec<gpu_search::DeltaMutation> publication_mutations;
+    vec<u64> publication_invalidated_graph_nodes;
+    u32 publication_mutation_count{};
+    u32 publication_reserved_items{};
   };
 
   struct StorageOwnerResponseSlot {
@@ -116,12 +118,6 @@ private:
     u32 slot_id{};
     vec<byte_t> buffer;
     std::unique_ptr<LocalMemoryRegion> region;
-  };
-
-  struct StorageOwnerPublicationBatch {
-    std::vector<gpu_search::DeltaMutation> mutations;
-    std::vector<u64> invalidated_graph_nodes;
-    u32 reserved_items{};
   };
 
   struct StorageOwnerSenderState {
@@ -164,27 +160,24 @@ private:
   void post_storage_owner_batch(u32 owner_storage,
                                 u32 slot_id);
   void handle_storage_owner_send_completion(u32 owner_storage, u32 slot_id);
-  void handle_storage_owner_response(u32 owner_storage, u32 response_slot_id);
+  void handle_storage_owner_response(u32 owner_storage,
+                                     u32 response_slot_id,
+                                     u32 received_bytes);
   void post_storage_owner_response_receive(u32 owner_storage, u32 response_slot_id);
   bool queue_storage_owner_completion(StorageOwnerRpcSlot& slot);
-  void commit_storage_owner_slot(u32 owner_storage,
-                                 u32 slot_id,
-                                 StorageOwnerPublicationBatch& publication);
+  void commit_storage_owner_slot(u32 owner_storage, u32 slot_id);
   void release_storage_owner_slot(u32 owner_storage, u32 slot_id);
-  void publish_storage_owner_mutations(StorageOwnerPublicationBatch&& publication);
+  void publish_storage_owner_mutations(StorageOwnerRpcSlot& slot);
   void complete_storage_owner_task(u32 owner_storage, u32 task_id, bool success);
   void fail_storage_owner_tasks(u32 owner_storage, vec<u32>& tasks);
   size_t submit_storage_owner_mutations(
     const vec<InsertItem>& items,
     service::storage_owner::MutationKind kind);
-  void publish_compute_side_id(node_t id, RemotePtr ptr, bool deleted,
+  bool publish_compute_side_id(node_t id, RemotePtr ptr, bool deleted,
                                u32 owner_storage, u32 generation);
   bool lookup_compute_side_id(node_t id, RemotePtr* ptr, bool* deleted = nullptr) const;
   std::optional<u32> known_storage_owner_for_id(node_t id) const;
   u32 claim_storage_owner_for_mutation(node_t id, u32 proposed_owner);
-  u32 storage_owner_for_id(node_t id) const;
-  vamana::anchor::Route route_storage_owner_update(const InsertItem& item,
-                                                    std::optional<u32> owner_override = std::nullopt) const;
 
 private:
   Configuration config_;
@@ -197,7 +190,6 @@ private:
 
   std::atomic<size_t> vectors_inserted_{0};
 
-  std::unique_ptr<vamana::anchor::Index> anchor_index_;
   std::unique_ptr<gpu_search::PersistentSearchEngine> persistent_search_;
   std::thread storage_insert_progress_thread_;
   std::thread storage_insert_completion_thread_;
