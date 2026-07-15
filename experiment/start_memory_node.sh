@@ -27,6 +27,28 @@ fi
 
 read -r -a SERVER_ARGS <<< "$(server_endpoints)"
 read -r -a RDMA_ARGS <<< "$(common_rdma_args)"
+
+# Several logical shards may intentionally share one storage host. Each
+# process otherwise starts CoreAssignment at the same CPU and all shards pile
+# onto an identical core set. Derive an internal local rank from equal endpoint
+# hosts; a host that owns only one shard keeps the complete machine.
+read -r -a CONFIGURED_HOSTS <<< "$HOSTS"
+NODE_HOST="${CONFIGURED_HOSTS[NODE_ID - 1]}"
+LOCAL_PROCESS_RANK=0
+LOCAL_PROCESS_COUNT=0
+for ((index = 0; index < SHARDS; ++index)); do
+  if [[ "${CONFIGURED_HOSTS[index]}" == "$NODE_HOST" ]]; then
+    if ((index < NODE_ID - 1)); then
+      ((LOCAL_PROCESS_RANK += 1))
+    fi
+    ((LOCAL_PROCESS_COUNT += 1))
+  fi
+done
+if ((LOCAL_PROCESS_COUNT == 0)); then
+  echo "cannot derive the local storage process CPU partition" >&2
+  exit 1
+fi
+
 cmd=("$BUILD_DIR/dvstor_memory_node"
   --is-server
   --num-clients 1
@@ -59,6 +81,9 @@ cmd=("$BUILD_DIR/dvstor_memory_node"
   --storage-owner-reverse-coalesce-max "${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}")
 
 printf '[memory-node-%s] command:' "$NODE_ID"; printf ' %q' "${cmd[@]}"; echo
-nohup "${cmd[@]}" > "$LOG_FILE" 2>&1 &
+echo "[memory-node-$NODE_ID] local CPU partition rank=$LOCAL_PROCESS_RANK/$LOCAL_PROCESS_COUNT host=$NODE_HOST"
+DVSTOR_LOCAL_PROCESS_RANK="$LOCAL_PROCESS_RANK" \
+DVSTOR_LOCAL_PROCESS_COUNT="$LOCAL_PROCESS_COUNT" \
+  nohup "${cmd[@]}" > "$LOG_FILE" 2>&1 &
 echo $! > "$PID_FILE"
 echo "memory node $NODE_ID started: pid $(cat "$PID_FILE"), log $LOG_FILE"

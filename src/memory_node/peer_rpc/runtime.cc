@@ -1,4 +1,5 @@
 #include "memory_node/peer_rpc/detail.hh"
+#include "memory_node/storage_owner_cpu_plan.hh"
 
 void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
   if (!peer_context_ || num_storage_nodes_ <= 1) {
@@ -132,11 +133,15 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   peer_stitch_search_max_queue_.store(0, std::memory_order_relaxed);
   peer_stitch_search_active_workers_.store(0, std::memory_order_relaxed);
 
-  const u32 cpu_parallelism = std::max<u32>(1, num_compute_threads_ / 2);
-  const u32 reverse_worker_count = std::min<u32>(8, cpu_parallelism);
-  const u32 stitch_worker_count = std::min(
-    cpu_parallelism,
-    std::max<u32>(1, config.storage_owner_maintenance_workers));
+  const u32 rpc_parallelism = std::max<u32>(
+    1, static_cast<u32>(num_clients_) *
+       std::max<u32>(1, config.storage_owner_rpc_depth));
+  const auto cpu_plan = memory_node_detail::derive_storage_owner_cpu_plan(
+    core_assignment_.available_core_count(), num_compute_threads_,
+    rpc_parallelism, config.storage_owner_maintenance_workers,
+    num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
+  const u32 reverse_worker_count = cpu_plan.peer_reverse_workers;
+  const u32 stitch_worker_count = cpu_plan.peer_search_workers;
   const size_t snapshot_stride = align_up(VamanaNode::vector_bytes());
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
   const size_t coroutine_scratch_stride =

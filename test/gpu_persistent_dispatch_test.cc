@@ -421,6 +421,13 @@ void run_valid_resident_query_test(u32 subquantizers, u32 query_threads,
       completion.route_hits != 1 || result_id != expected_id) {
     throw std::runtime_error("valid resident query produced an invalid result");
   }
+  if (dynamic_route_only &&
+      (completion.delta_scan_cycles == 0 ||
+       completion.delta_scan_records != 1 ||
+       completion.delta_scan_scored != 1 ||
+       completion.delta_scan_truncated_buckets != 0)) {
+    throw std::runtime_error("dynamic delta scan telemetry is invalid");
+  }
   std::atomic_ref<u32>(*stop.host()).store(1, std::memory_order_release);
   check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize(valid query)");
   check_cuda(cudaStreamDestroy(stream), "cudaStreamDestroy(valid query)");

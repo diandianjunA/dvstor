@@ -499,7 +499,8 @@ private:
       const span<const element_t> query,
       const vec<RemotePtr>& entry_points,
       const Configuration& config,
-      InsertBreakdownCounters* breakdown = nullptr);
+      InsertBreakdownCounters* breakdown = nullptr,
+      const byte_t* integral_raw_query = nullptr);
   vec<RemotePtr> storage_owner_route_entries(
       const span<const element_t> query);
   void initialize_storage_owner_route_table();
@@ -684,6 +685,7 @@ private:
   std::atomic<u64> storage_owner_foreground_last_active_ns_{0};
   std::unique_ptr<bounded::SlidingCompletionRing>
     storage_owner_maintenance_completion_ring_;
+  size_t storage_owner_maintenance_admission_limit_{};
   size_t storage_owner_maintenance_intent_capacity_{};
   std::unique_ptr<StorageOwnerMaintenanceIntent[]>
     storage_owner_maintenance_intents_;

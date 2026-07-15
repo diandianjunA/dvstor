@@ -291,7 +291,8 @@ vec<RemotePtr> MemoryNode::partition_local_search_candidates(
     const span<const element_t> query,
     const vec<RemotePtr>& entry_points,
     const Configuration& config,
-    InsertBreakdownCounters* breakdown) {
+    InsertBreakdownCounters* breakdown,
+    const byte_t* integral_raw_query) {
   StorageOwnerCoroutineScratch* scratch = current_storage_owner_thread_ != nullptr
                                             ? &current_storage_owner_thread_->coroutine_scratch_state()
                                             : nullptr;
@@ -311,6 +312,10 @@ vec<RemotePtr> MemoryNode::partition_local_search_candidates(
   neighbors.reserve(config.R);
 
   const u32 construction_width = storage_owner_construction_width(config);
+  const VectorDType dtype = VamanaNode::vector_dtype();
+  const bool exact_integral_query = integral_raw_query != nullptr &&
+    integral_byte_l2_sum_exact_in_float(config.dim) &&
+    (dtype == VectorDType::uint8 || dtype == VectorDType::int8);
   auto score = [&](RemotePtr candidate) -> std::optional<distance_t> {
     auto started = std::chrono::steady_clock::now();
     const byte_t* vector = local_live_vector(candidate);
@@ -322,7 +327,15 @@ vec<RemotePtr> MemoryNode::partition_local_search_candidates(
     }
 
     started = std::chrono::steady_clock::now();
-    const distance_t distance = distance_to_stored_vector(query, vector, config);
+    // Peer stage2 already carries the exact uint8/int8 bytes. Integer squared
+    // L2 through DIM=258 is exactly representable in float even at the maximum
+    // byte difference, so the same-dtype AVX2 path preserves candidate ordering
+    // while avoiding repeated byte-to-float conversion in every expansion.
+    // Wider and float indexes retain the established decoded-query reduction.
+    const distance_t distance = exact_integral_query
+      ? typed_l2_distance(
+          integral_raw_query, dtype, vector, dtype, config.dim)
+      : distance_to_stored_vector(query, vector, config);
     if (breakdown != nullptr) {
       breakdown->storage_owner_search_distance_ns += elapsed_ns_since(started);
     }

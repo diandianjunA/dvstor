@@ -83,8 +83,11 @@ u64 MemoryNode::begin_storage_owner_maintenance_batch(
     span<const u32> work_items) {
   lib_assert(storage_owner_maintenance_completion_ring_ != nullptr,
              "storage-owner completion ring is not initialized");
+  lib_assert(storage_owner_maintenance_admission_limit_ != 0,
+             "storage-owner completion admission window is not initialized");
   const u64 sequence =
-    storage_owner_maintenance_completion_ring_->reserve_batch(work_items);
+    storage_owner_maintenance_completion_ring_->reserve_batch(
+      work_items, storage_owner_maintenance_admission_limit_);
   publish_storage_owner_maintenance_watermarks();
   return sequence;
 }
@@ -277,7 +280,8 @@ bool MemoryNode::try_acquire_storage_owner_maintenance_slot(const Configuration&
   // of physical workers. Each maintenance executor owns a fixed rpc-depth
   // context pool; peer send credits are independently bounded and try-only.
   const u64 configured_contexts =
-    static_cast<u64>(std::max<u32>(1, config.storage_owner_maintenance_workers)) *
+    static_cast<u64>(std::max<size_t>(
+      1, storage_owner_maintenance_worker_states_.size())) *
     std::max<u32>(1, config.storage_owner_rpc_depth);
   const u32 max_contexts = static_cast<u32>(std::min<u64>(
     configured_contexts, std::numeric_limits<u32>::max()));

@@ -28,6 +28,7 @@ Usage: ./experiment/run_breakdown.sh [PROFILE]
     ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
 
 脚本只记录原始结果，不对 QPS、召回、稳定性或后台维护做通过/失败判断。
+当前 profile 的各分片 memory-node 日志会被自动采集到 stage2 报告。
 EOF
 }
 
@@ -109,6 +110,17 @@ fi
 maintenance_logs=()
 if [[ -n "${STORAGE_MAINTENANCE_LOGS:-}" ]]; then
   read -r -a maintenance_logs <<< "$STORAGE_MAINTENANCE_LOGS"
+else
+  # start_memory_node.sh uses this deterministic name for every shard. Feed
+  # those logs to the benchmark automatically so the report contains the raw
+  # stage2 observations from the measurement window. Missing/unreadable logs
+  # remain visible as such in the report instead of silently disabling stage2
+  # telemetry.
+  for ((node_id = 1; node_id <= SHARDS; ++node_id)); do
+    maintenance_logs+=(
+      "$LOG_DIR/memory_node_${node_id}_${PROFILE}.log"
+    )
+  done
 fi
 
 # Validate the deployed index before preparing inputs or rebuilding the client.

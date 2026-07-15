@@ -58,11 +58,22 @@ public:
   // reached stage2 yet, so the finalized watermark cannot free the window.
   // This call waits without claiming anything until every item fits.
   u64 reserve_batch(span<const u32> work_items) {
+    return reserve_batch(work_items, capacity_);
+  }
+
+  // admission_limit may be smaller than the physical ring. This keeps the
+  // descriptor/intent allocation large while bounding the amount of visible,
+  // not-yet-finalized stage2 work. Producers all recheck capacity when the
+  // contiguous watermark advances; compare/exchange still admits only the
+  // batches that fit, including mixed batch sizes without head-of-line idling.
+  u64 reserve_batch(span<const u32> work_items, size_t admission_limit) {
     if (work_items.empty()) {
       throw std::invalid_argument("completion ring batch must not be empty");
     }
-    if (work_items.size() > capacity_) {
-      throw std::invalid_argument("completion ring batch exceeds capacity");
+    if (admission_limit == 0 || admission_limit > capacity_ ||
+        work_items.size() > admission_limit) {
+      throw std::invalid_argument(
+        "completion ring batch exceeds its admission window");
     }
 
     const u64 count = static_cast<u64>(work_items.size());
@@ -78,7 +89,7 @@ public:
         throw std::overflow_error("completion ring sequence overflow");
       }
       const u64 next_after_batch = sequence + count;
-      if (next_after_batch - done - 1 > capacity_) {
+      if (next_after_batch - done - 1 > admission_limit) {
         finalized_.wait(done, std::memory_order_relaxed);
         continue;
       }

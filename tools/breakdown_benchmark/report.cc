@@ -74,6 +74,10 @@ nlohmann::json telemetry_to_json(const gpu_search::TelemetrySnapshot& telemetry)
       {"average_gpu_exact_us", telemetry.queries_completed == 0 ? 0.0
         : static_cast<double>(telemetry.gpu_exact_ns) /
             static_cast<double>(telemetry.queries_completed) / 1000.0},
+      {"gpu_delta_scan_ns", telemetry.gpu_delta_scan_ns},
+      {"average_gpu_delta_scan_us", telemetry.queries_completed == 0 ? 0.0
+        : static_cast<double>(telemetry.gpu_delta_scan_ns) /
+            static_cast<double>(telemetry.queries_completed) / 1000.0},
       {"rdma_read_ops", telemetry.rdma_read_ops},
       {"rdma_read_bytes", telemetry.rdma_read_bytes},
       {"rdma_merged_requests", telemetry.rdma_merged_requests},
@@ -109,6 +113,20 @@ nlohmann::json telemetry_to_json(const gpu_search::TelemetrySnapshot& telemetry)
              static_cast<double>(telemetry.exact_vector_reads +
                                  telemetry.exact_vector_cache_hits)},
       {"delta_queries", telemetry.delta_queries},
+      {"delta_scan_records", telemetry.delta_scan_records},
+      {"delta_scan_scored", telemetry.delta_scan_scored},
+      {"delta_scan_truncated_buckets",
+       telemetry.delta_scan_truncated_buckets},
+      {"average_delta_scan_records", telemetry.queries_completed == 0 ? 0.0
+        : static_cast<double>(telemetry.delta_scan_records) /
+            static_cast<double>(telemetry.queries_completed)},
+      {"average_delta_scan_scored", telemetry.queries_completed == 0 ? 0.0
+        : static_cast<double>(telemetry.delta_scan_scored) /
+            static_cast<double>(telemetry.queries_completed)},
+      {"average_delta_scan_truncated_buckets",
+       telemetry.queries_completed == 0 ? 0.0
+        : static_cast<double>(telemetry.delta_scan_truncated_buckets) /
+            static_cast<double>(telemetry.queries_completed)},
       {"mutations_published", telemetry.mutations_published},
       {"delta_publications", telemetry.delta_publications},
       {"average_mutations_per_publication", telemetry.delta_publications == 0 ? 0.0
@@ -239,6 +257,17 @@ FormattedReport format_report(const nlohmann::json& root,
     output << "  remaining/max_backlog: "
            << stage2.value("remaining", 0ULL) << "/"
            << stage2.value("max_backlog_observed", 0ULL) << '\n';
+    output << "  completion_outstanding/admission_window: ";
+    if (stage2.value("completion_window_available", false)) {
+      output << stage2.value("completion_outstanding", 0ULL) << "/"
+             << stage2.value("admission_window", 0ULL)
+             << " (max_per_shard="
+             << stage2.value(
+                  "max_completion_outstanding_per_shard", 0ULL)
+             << ")\n";
+    } else {
+      output << "unavailable\n";
+    }
     output << "  backlog_slope_per_sec: "
            << stage2.value("backlog_slope_per_sec", 0.0) << '\n';
     output << "  failures: " << stage2.value("failures", 0ULL) << '\n';
@@ -302,13 +331,20 @@ FormattedReport format_report(const nlohmann::json& root,
            << gpu.value("dynamic_route_snapshot_skips", 0ULL) << '\n';
     output << "  graph_cache_invalidations: "
            << gpu.value("graph_cache_invalidations", 0ULL) << '\n';
-    output << "  GPU query/prepare/graph/score/beam/exact us: "
+    output << "  GPU query/prepare/graph/score/beam/exact/delta_scan us: "
            << gpu.value("average_gpu_query_us", 0.0) << "/"
            << gpu.value("average_gpu_prepare_us", 0.0) << "/"
            << gpu.value("average_gpu_graph_us", 0.0) << "/"
            << gpu.value("average_gpu_score_us", 0.0) << "/"
            << gpu.value("average_gpu_beam_us", 0.0) << "/"
-           << gpu.value("average_gpu_exact_us", 0.0) << '\n';
+           << gpu.value("average_gpu_exact_us", 0.0) << "/"
+           << gpu.value("average_gpu_delta_scan_us", 0.0) << '\n';
+    output << "  delta scan records/scored per query: "
+           << gpu.value("average_delta_scan_records", 0.0) << "/"
+           << gpu.value("average_delta_scan_scored", 0.0) << '\n';
+    output << "  delta scan structurally truncated bucket prefixes per query: "
+           << gpu.value("average_delta_scan_truncated_buckets", 0.0)
+           << '\n';
     output << "  average_visibility_us: "
            << gpu.value("average_visibility_us", 0.0) << '\n';
     output << "  publication queue/prepare/command us: "

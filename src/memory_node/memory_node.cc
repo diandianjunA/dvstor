@@ -199,6 +199,9 @@ MemoryNode::MemoryNode(Configuration& config)
   start_peer_reverse_update_runtime(config);
   start_storage_owner_maintenance_runtime(config);
   start_storage_owner_insert_workers(config);
+  if (!config.disable_thread_pinning) {
+    pin_main_thread(core_assignment_.get_available_core());
+  }
   service_storage_runtime(config);
 
   storage_insert_shutdown_.store(true, std::memory_order_release);

@@ -10,6 +10,7 @@
 #include "common/bounded_queue.hh"
 #include "common/completion_pool.hh"
 #include "common/sliding_completion_ring.hh"
+#include "common/vector_dtype.hh"
 #include "memory_node/storage_owner_index/reverse_batch_policy.hh"
 #include "memory_node/storage_owner_index/robust_prune_policy.hh"
 #include "memory_node/storage_owner_maintenance/admission_policy.hh"
@@ -174,6 +175,117 @@ void test_sliding_completion_ring_atomic_batch_admission() {
   assert(ring.reserve_batch(
            span<const u32>{zero_work.data(), zero_work.size()}) == 6);
   assert(ring.finalized() == 7);
+}
+
+void test_sliding_completion_ring_bounded_smooth_admission() {
+  {
+    bounded::SlidingCompletionRing ring(8);
+    const std::array<u32, 2> initial_work{1, 1};
+    assert(ring.reserve_batch(
+             span<const u32>{initial_work.data(), initial_work.size()}, 2) == 1);
+    auto waiter = std::async(std::launch::async, [&]() {
+      const std::array<u32, 1> work{1};
+      return ring.reserve_batch(span<const u32>{work.data(), work.size()}, 2);
+    });
+    assert(waiter.wait_for(std::chrono::milliseconds(10)) ==
+           std::future_status::timeout);
+    // Out-of-order completion does not release admission credit.
+    ring.complete(2);
+    assert(waiter.wait_for(std::chrono::milliseconds(10)) ==
+           std::future_status::timeout);
+    ring.complete(1);
+    assert(waiter.wait_for(std::chrono::seconds(1)) ==
+           std::future_status::ready);
+    ring.complete(waiter.get());
+  }
+
+  {
+    bounded::SlidingCompletionRing ring(8);
+    const std::array<u32, 2> initial_work{1, 1};
+    assert(ring.reserve_batch(
+             span<const u32>{initial_work.data(), initial_work.size()}, 2) == 1);
+    auto first_waiter = std::async(std::launch::async, [&]() {
+      const std::array<u32, 1> work{1};
+      return ring.reserve_batch(span<const u32>{work.data(), work.size()}, 2);
+    });
+    auto second_waiter = std::async(std::launch::async, [&]() {
+      const std::array<u32, 1> work{1};
+      return ring.reserve_batch(span<const u32>{work.data(), work.size()}, 2);
+    });
+    assert(first_waiter.wait_for(std::chrono::milliseconds(10)) ==
+           std::future_status::timeout);
+    assert(second_waiter.wait_for(std::chrono::milliseconds(10)) ==
+           std::future_status::timeout);
+
+    // One newly available sequence can be claimed by only one producer even
+    // though notify_all keeps mixed-size admission work-conserving.
+    ring.complete(1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const bool first_ready =
+      first_waiter.wait_for(std::chrono::milliseconds(0)) ==
+      std::future_status::ready;
+    const bool second_ready =
+      second_waiter.wait_for(std::chrono::milliseconds(0)) ==
+      std::future_status::ready;
+    assert(first_ready != second_ready);
+
+    const u64 admitted = first_ready ? first_waiter.get() : second_waiter.get();
+    ring.complete(2);
+    auto& remaining_waiter = first_ready ? second_waiter : first_waiter;
+    assert(remaining_waiter.wait_for(std::chrono::seconds(1)) ==
+           std::future_status::ready);
+    ring.complete(admitted);
+    ring.complete(remaining_waiter.get());
+  }
+}
+
+void test_integral_raw_stage2_distance_is_exact() {
+  constexpr u32 dim = 128;
+  assert(integral_byte_l2_sum_exact_in_float(258));
+  assert(!integral_byte_l2_sum_exact_in_float(259));
+
+  auto verify = [](const std::array<byte_t, dim>& lhs,
+                   const std::array<byte_t, dim>& rhs,
+                   VectorDType dtype) {
+    std::array<float, dim> decoded{};
+    decode_storage_vector_to_float(lhs.data(), dtype, dim, decoded.data());
+    const float raw = typed_l2_distance(
+      lhs.data(), dtype, rhs.data(), dtype, dim);
+    const float established = typed_l2_distance_float_query(
+      span<const float>{decoded.data(), decoded.size()},
+      rhs.data(), dtype, dim);
+    assert(raw == established);
+  };
+
+  std::array<byte_t, dim> lhs{};
+  std::array<byte_t, dim> rhs{};
+  for (u32 i = 0; i < dim; ++i) {
+    lhs[i] = static_cast<byte_t>((i & 1u) == 0 ? 0 : 255);
+    rhs[i] = static_cast<byte_t>((i & 1u) == 0 ? 255 : 0);
+  }
+  verify(lhs, rhs, VectorDType::uint8);
+
+  auto* signed_lhs = reinterpret_cast<i8*>(lhs.data());
+  auto* signed_rhs = reinterpret_cast<i8*>(rhs.data());
+  for (u32 i = 0; i < dim; ++i) {
+    signed_lhs[i] = (i & 1u) == 0 ? static_cast<i8>(-128)
+                                  : static_cast<i8>(127);
+    signed_rhs[i] = (i & 1u) == 0 ? static_cast<i8>(127)
+                                  : static_cast<i8>(-128);
+  }
+  verify(lhs, rhs, VectorDType::int8);
+
+  u32 state = 0x9e3779b9u;
+  for (u32 sample = 0; sample < 32; ++sample) {
+    for (u32 i = 0; i < dim; ++i) {
+      state = state * 1664525u + 1013904223u;
+      lhs[i] = static_cast<byte_t>(state >> 24);
+      state = state * 1664525u + 1013904223u;
+      rhs[i] = static_cast<byte_t>(state >> 24);
+    }
+    verify(lhs, rhs, VectorDType::uint8);
+    verify(lhs, rhs, VectorDType::int8);
+  }
 }
 
 void test_stale_stitch_sequence_handoff_to_bounded_repair() {
@@ -397,6 +509,8 @@ int main() {
   test_completion_pool_reuse_and_abandon();
   test_sliding_completion_ring();
   test_sliding_completion_ring_atomic_batch_admission();
+  test_sliding_completion_ring_bounded_smooth_admission();
+  test_integral_raw_stage2_distance_is_exact();
   test_stale_stitch_sequence_handoff_to_bounded_repair();
   test_stale_stitch_repair_keeps_schema15_payload_bound();
   test_stage2_admission_yields_only_for_live_foreground_pressure();

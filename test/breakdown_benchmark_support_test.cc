@@ -149,6 +149,8 @@ void test_maintenance_log_window() {
            << "peer_reverse_remaining=0 "
            << "failed=" << failed << ' '
            << "peer_reverse_failed=" << peer_failed << ' '
+           << "admission_window=512 "
+           << "completion_outstanding=" << remaining << ' '
            // Deliberately stale cumulative p99 fields: the parser must use
            // only the histogram delta from the cursor baseline.
            << "p99_stitch_delay_upper_ms=30000 "
@@ -188,6 +190,10 @@ void test_maintenance_log_window() {
   assert(summary.remaining == 0);
   assert(summary.max_backlog_observed == 10);
   assert(summary.failures == 1);
+  assert(summary.completion_window_available);
+  assert(summary.admission_window == 512);
+  assert(summary.completion_outstanding == 0);
+  assert(summary.max_completion_outstanding_per_shard == 10);
   assert(summary.failure_delta_available);
   assert(summary.p99_stitch_delay_available);
   assert(summary.p99_stitch_delay_samples == 100);
@@ -222,8 +228,8 @@ void test_maintenance_log_window() {
   assert(frozen_again.observations == 3);
   assert(frozen_again.backlog_slope_per_sec == summary.backlog_slope_per_sec);
 
-  // The 5-second SLO needs its own bucket. A p99 at exactly this boundary
-  // passes as 5000 ms, while the next bucket remains conservatively 8000 ms.
+  // Keep an explicit 5-second bucket so the raw p99 report distinguishes an
+  // exact 5000 ms boundary from the following 8000 ms bucket.
   {
     std::ofstream output(path, std::ios::trunc);
   }

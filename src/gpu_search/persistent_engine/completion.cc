@@ -73,6 +73,12 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << " score_us=" << completion.score_cycles * 1000ULL / gpu_clock_khz
                 << " beam_us=" << completion.beam_cycles * 1000ULL / gpu_clock_khz
                 << " exact_us=" << completion.exact_cycles * 1000ULL / gpu_clock_khz
+                << " delta_scan_us="
+                << completion.delta_scan_cycles * 1000ULL / gpu_clock_khz
+                << " delta_scan_records=" << completion.delta_scan_records
+                << " delta_scan_scored=" << completion.delta_scan_scored
+                << " delta_scan_truncated_buckets="
+                << completion.delta_scan_truncated_buckets
                 << " graph_reads=" << completion.remote_pages
                 << " graph_batches=" << completion.remote_batches
                 << " graph_rounds=" << completion.graph_rounds
@@ -121,11 +127,19 @@ void PersistentSearchEngine::Impl::completion_loop() {
       phase_ns(completion.beam_cycles), std::memory_order_relaxed);
     engine.telemetry_.gpu_exact_ns.fetch_add(
       phase_ns(completion.exact_cycles), std::memory_order_relaxed);
+    engine.telemetry_.gpu_delta_scan_ns.fetch_add(
+      phase_ns(completion.delta_scan_cycles), std::memory_order_relaxed);
     engine.telemetry_.completion_wait_ns.fetch_add(end_to_end_ns,
                                                    std::memory_order_relaxed);
     if (completion.snapshot_epoch != 0) {
       engine.telemetry_.delta_queries.fetch_add(1, std::memory_order_relaxed);
     }
+    engine.telemetry_.delta_scan_records.fetch_add(
+      completion.delta_scan_records, std::memory_order_relaxed);
+    engine.telemetry_.delta_scan_scored.fetch_add(
+      completion.delta_scan_scored, std::memory_order_relaxed);
+    engine.telemetry_.delta_scan_truncated_buckets.fetch_add(
+      completion.delta_scan_truncated_buckets, std::memory_order_relaxed);
     engine.telemetry_.rdma_read_ops.fetch_add(
       static_cast<u64>(completion.exact_vectors) + completion.remote_pages,
       std::memory_order_relaxed);

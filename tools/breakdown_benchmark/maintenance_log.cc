@@ -116,6 +116,9 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
   }
   const auto failed = parse_u64(fields, "failed");
   const auto peer_reverse_failed = parse_u64(fields, "peer_reverse_failed");
+  const auto admission_window = parse_u64(fields, "admission_window");
+  const auto completion_outstanding =
+    parse_u64(fields, "completion_outstanding");
   const auto histogram = parse_histogram(fields);
   return MaintenanceObservation{
     .stitch_enqueued = *stitch_enqueued,
@@ -126,6 +129,8 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
       parse_u64(fields, "peer_reverse_remaining").value_or(0),
     .failed = failed.value_or(0),
     .peer_reverse_failed = peer_reverse_failed.value_or(0),
+    .admission_window = admission_window.value_or(0),
+    .completion_outstanding = completion_outstanding.value_or(0),
     .p99_stitch_delay_upper_ms =
       parse_double(fields, "p99_stitch_delay_upper_ms").value_or(0.0),
     .p99_stitch_delay_over_30s =
@@ -136,6 +141,8 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
     .failure_counters_available = failed.has_value() &&
       peer_reverse_failed.has_value(),
     .stitch_delay_histogram_available = histogram.has_value(),
+    .completion_window_available = admission_window.has_value() &&
+      completion_outstanding.has_value(),
   };
 }
 
@@ -309,9 +316,19 @@ MaintenanceLogSummary summarize_impl(
     for (const auto& observation : slice.observations) {
       summary.max_backlog_observed =
         std::max(summary.max_backlog_observed, observation.backlog());
+      if (observation.completion_window_available) {
+        summary.max_completion_outstanding_per_shard = std::max(
+          summary.max_completion_outstanding_per_shard,
+          observation.completion_outstanding);
+      }
     }
     const auto& latest = slice.observations.back();
     summary.remaining += latest.backlog();
+    if (latest.completion_window_available) {
+      ++summary.logs_with_completion_window;
+      summary.admission_window += latest.admission_window;
+      summary.completion_outstanding += latest.completion_outstanding;
+    }
 
     if (!slice.rotated && cursor.baseline_available &&
         cursor.baseline.failure_counters_available &&
@@ -341,6 +358,8 @@ MaintenanceLogSummary summarize_impl(
     summary.logs_with_slope_observations == summary.requested_logs;
   summary.failure_delta_available = summary.requested_logs != 0 &&
     summary.logs_with_failure_deltas == summary.requested_logs;
+  summary.completion_window_available = summary.requested_logs != 0 &&
+    summary.logs_with_completion_window == summary.requested_logs;
   summary.p99_stitch_delay_available = summary.requested_logs != 0 &&
     summary.logs_with_histogram_deltas == summary.requested_logs &&
     summary.p99_stitch_delay_samples != 0;

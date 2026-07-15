@@ -30,6 +30,7 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .gpu_score_ns = gpu_score_ns.load(std::memory_order_relaxed),
     .gpu_beam_ns = gpu_beam_ns.load(std::memory_order_relaxed),
     .gpu_exact_ns = gpu_exact_ns.load(std::memory_order_relaxed),
+    .gpu_delta_scan_ns = gpu_delta_scan_ns.load(std::memory_order_relaxed),
     .rdma_read_ops = rdma_read_ops.load(std::memory_order_relaxed),
     .rdma_read_bytes = rdma_read_bytes.load(std::memory_order_relaxed),
     .rdma_merged_requests = rdma_merged_requests.load(std::memory_order_relaxed),
@@ -51,6 +52,10 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .exact_vector_reads = exact_vector_reads.load(std::memory_order_relaxed),
     .exact_vector_cache_hits = exact_vector_cache_hits.load(std::memory_order_relaxed),
     .delta_queries = delta_queries.load(std::memory_order_relaxed),
+    .delta_scan_records = delta_scan_records.load(std::memory_order_relaxed),
+    .delta_scan_scored = delta_scan_scored.load(std::memory_order_relaxed),
+    .delta_scan_truncated_buckets =
+      delta_scan_truncated_buckets.load(std::memory_order_relaxed),
     .mutations_published = mutations_published.load(std::memory_order_relaxed),
     .delta_publications = delta_publications.load(std::memory_order_relaxed),
     .delta_reclaim_batches = delta_reclaim_batches.load(std::memory_order_relaxed),
@@ -91,6 +96,7 @@ void Telemetry::reset() {
   gpu_score_ns.store(0, std::memory_order_relaxed);
   gpu_beam_ns.store(0, std::memory_order_relaxed);
   gpu_exact_ns.store(0, std::memory_order_relaxed);
+  gpu_delta_scan_ns.store(0, std::memory_order_relaxed);
   rdma_read_ops.store(0, std::memory_order_relaxed);
   rdma_read_bytes.store(0, std::memory_order_relaxed);
   rdma_merged_requests.store(0, std::memory_order_relaxed);
@@ -107,6 +113,9 @@ void Telemetry::reset() {
   exact_vector_reads.store(0, std::memory_order_relaxed);
   exact_vector_cache_hits.store(0, std::memory_order_relaxed);
   delta_queries.store(0, std::memory_order_relaxed);
+  delta_scan_records.store(0, std::memory_order_relaxed);
+  delta_scan_scored.store(0, std::memory_order_relaxed);
+  delta_scan_truncated_buckets.store(0, std::memory_order_relaxed);
   mutations_published.store(0, std::memory_order_relaxed);
   delta_publications.store(0, std::memory_order_relaxed);
   delta_reclaim_batches.store(0, std::memory_order_relaxed);

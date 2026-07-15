@@ -1,4 +1,5 @@
 #include "memory_node/storage_owner_runtime/detail.hh"
+#include "memory_node/storage_owner_cpu_plan.hh"
 
 using namespace memory_node_storage_owner_runtime_detail;
 
@@ -51,10 +52,13 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
   }
   print_status("storage-owner responses=foreground direct post; "
                "completion=repost by service poller");
-  const u32 cpu_parallelism = std::max<u32>(1, num_compute_threads_ / 2);
   const u32 rpc_parallelism = std::max<u32>(
     1, static_cast<u32>(num_clients_) * insert_runtime_.request_slot_count);
-  const u32 worker_count = std::min(cpu_parallelism, rpc_parallelism);
+  const auto cpu_plan = memory_node_detail::derive_storage_owner_cpu_plan(
+    core_assignment_.available_core_count(), num_compute_threads_,
+    rpc_parallelism, config.storage_owner_maintenance_workers,
+    num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
+  const u32 worker_count = cpu_plan.foreground_workers;
   const u32 coroutines_per_worker = std::max<u32>(1, config.storage_owner_coroutines);
   const size_t snapshot_bytes = memory_node_detail::storage_owner_snapshot_bytes();
   const size_t snapshot_stride = memory_node_detail::storage_owner_snapshot_stride();
@@ -75,8 +79,21 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
                " per_coroutine=" + std::to_string(coroutine_scratch_stride));
   print_status("storage-owner foreground workers: " +
                std::to_string(worker_count) +
-               " (cpu_parallelism=" + std::to_string(cpu_parallelism) +
+               " (assigned_cpus=" +
+               std::to_string(core_assignment_.available_core_count()) +
                ", rpc_parallelism=" + std::to_string(rpc_parallelism) + ")");
+  print_status("storage-owner CPU plan: foreground=" +
+               std::to_string(cpu_plan.foreground_workers) +
+               " maintenance=" +
+               std::to_string(cpu_plan.maintenance_workers) +
+               " peer_search=" +
+               std::to_string(cpu_plan.peer_search_workers) +
+               " peer_reverse=" +
+               std::to_string(cpu_plan.peer_reverse_workers) +
+               " peer_progress=" +
+               std::to_string(cpu_plan.peer_progress_threads) +
+               " foreground_progress=" +
+               std::to_string(cpu_plan.foreground_progress_threads));
   storage_owner_threads_.reserve(worker_count);
   for (u32 i = 0; i < worker_count; ++i) {
     auto thread = std::make_unique<StorageOwnerThread>(i, coroutines_per_worker, config.max_send_queue_wr);

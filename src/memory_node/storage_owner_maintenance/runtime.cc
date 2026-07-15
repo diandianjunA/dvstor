@@ -1,4 +1,5 @@
 #include "memory_node/storage_owner_maintenance/detail.hh"
+#include "memory_node/storage_owner_cpu_plan.hh"
 
 using namespace memory_node_storage_owner_maintenance_detail;
 
@@ -27,6 +28,15 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   storage_owner_maintenance_completion_ring_ =
     std::make_unique<bounded::SlidingCompletionRing>(
       completion_capacity, initial_next, initial_durable);
+  const u64 requested_admission_limit = storage_owner_maintenance_enabled(config)
+    ? std::max<u64>(
+        std::max<u32>(1, config.storage_owner_batch_max),
+        static_cast<u64>(std::max<u32>(
+          1, config.storage_owner_maintenance_workers)) *
+          std::max<u32>(1, config.storage_owner_rpc_depth) * 4)
+    : completion_capacity;
+  storage_owner_maintenance_admission_limit_ = static_cast<size_t>(
+    std::min<u64>(completion_capacity, requested_admission_limit));
   storage_owner_maintenance_intent_capacity_ = completion_capacity;
   storage_owner_maintenance_intents_ =
     std::make_unique<StorageOwnerMaintenanceIntent[]>(completion_capacity);
@@ -63,7 +73,14 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   }
   storage_owner_maintenance_started_ns_.store(steady_now_ns(), std::memory_order_release);
   storage_owner_maintenance_last_observation_ns_.store(0, std::memory_order_relaxed);
-  const u32 worker_count = std::max<u32>(1, config.storage_owner_maintenance_workers);
+  const u32 rpc_parallelism = std::max<u32>(
+    1, static_cast<u32>(num_clients_) *
+       std::max<u32>(1, config.storage_owner_rpc_depth));
+  const auto cpu_plan = memory_node_detail::derive_storage_owner_cpu_plan(
+    core_assignment_.available_core_count(), num_compute_threads_,
+    rpc_parallelism, config.storage_owner_maintenance_workers,
+    num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
+  const u32 worker_count = cpu_plan.maintenance_workers;
   const size_t contexts_per_worker =
     std::max<size_t>(1, config.storage_owner_rpc_depth);
   const size_t remote_peer_count =
@@ -142,7 +159,11 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                " local_stitch=" + (config.storage_owner_update_mode == "local_stitch" ? "true" : "false") +
                " compaction_batch_target=" + std::to_string(config.storage_owner_batch_max) +
                " backlog_limit=" +
-               std::to_string(config.storage_owner_maintenance_queue_depth));
+               std::to_string(config.storage_owner_maintenance_queue_depth) +
+               " admission_window=" +
+               std::to_string(storage_owner_maintenance_admission_limit_) +
+               " physical_completion_capacity=" +
+               std::to_string(completion_capacity));
 }
 
 void MemoryNode::stop_storage_owner_maintenance_runtime() {
@@ -309,9 +330,14 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
     storage_owner_maintenance_enqueued_.load(std::memory_order_relaxed);
   const u64 counter_remaining = maintenance_enqueued > maintenance_done
     ? maintenance_enqueued - maintenance_done : 0;
+  const u64 completion_outstanding =
+    storage_owner_maintenance_completion_ring_ == nullptr
+      ? 0
+      : static_cast<u64>(
+          storage_owner_maintenance_completion_ring_->outstanding());
   // Queue cardinality alone becomes zero as soon as work enters a context,
-  // even if that context is still waiting on remote shards. Keep the log SLO
-  // conservative so MAX_STAGE2_REMAINING=0 cannot pass on pending RPCs.
+  // even if that context is still waiting on remote shards. Report the larger
+  // raw count so an observation does not hide pending RPC work.
   const u64 remaining = std::max<u64>(
     counter_remaining,
     static_cast<u64>(stitch_remaining + cleanup_remaining) +
@@ -382,6 +408,10 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
                  reverse_aggregate_ops, reverse_aggregate_batches)) +
                " max_backlog=" +
                std::to_string(storage_owner_maintenance_max_backlog_.load(std::memory_order_relaxed)) +
+               " admission_window=" +
+               std::to_string(storage_owner_maintenance_admission_limit_) +
+               " completion_outstanding=" +
+               std::to_string(completion_outstanding) +
                " pressure_yields=" +
                std::to_string(storage_owner_maintenance_pressure_yields_.load(std::memory_order_relaxed)) +
                " external_search_requests=" +

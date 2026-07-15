@@ -187,7 +187,7 @@ bool MemoryNode::handle_peer_stitch_search_request(
     }
     vec<RemotePtr> candidates =
       partition_local_search_candidates(
-        components, entries, config, nullptr);
+        components, entries, config, nullptr, raw_vector);
     u32 written = 0;
     hashset_t<RemotePtr> seen;
     for (const RemotePtr& candidate : candidates) {

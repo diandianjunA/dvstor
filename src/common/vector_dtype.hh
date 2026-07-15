@@ -134,6 +134,14 @@ inline vec<float> decode_storage_vector_to_float(const byte_t* src, VectorDType 
   return out;
 }
 
+// For byte vectors, every squared component difference is at most 255^2.
+// Integer sums through this dimension remain exactly representable in IEEE-754
+// float, so integer and decoded-float L2 paths cannot differ by reduction
+// rounding. Wider dimensions must keep the established reduction order.
+inline constexpr bool integral_byte_l2_sum_exact_in_float(u32 dim) {
+  return static_cast<u64>(dim) * 255ull * 255ull <= (1ull << 24) - 1;
+}
+
 // =========================================================================
 // SIMD-accelerated distance functions for same-dtype vector pairs (AVX2)
 // =========================================================================

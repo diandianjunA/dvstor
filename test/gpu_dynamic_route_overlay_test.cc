@@ -2,9 +2,10 @@
 #include <stdexcept>
 #include <vector>
 
+#include "gpu_search/delta_scan_budget.hh"
 #include "gpu_search/dynamic_route_overlay.hh"
 #include "gpu_search/dynamic_route_consistency.hh"
-#include "gpu_search/initial_seed_quota.hh"
+#include "gpu_search/initial_seed_budget.hh"
 
 namespace {
 
@@ -22,36 +23,36 @@ int main() {
   using gpu_search::kDynamicRouteSlotsPerShard;
   using vamana::routing::AdaptiveRouteTable;
 
+  // Static and dynamic routes compete inside this total. They must never turn
+  // the configured 32-entry route into the old 32+40=72-entry traversal.
+  static_assert(gpu_search::initial_seed_budget(32, 128) == 32);
+  static_assert(gpu_search::initial_seed_budget(256, 128) == 128);
+
+  // Fixed query work is divided without gaps or overlap. It is independent of
+  // the number of live delta records behind each anchor.
+  {
+    u32 end = 0;
+    for (u32 anchor = 0; anchor < 32; ++anchor) {
+      const auto segment = gpu_search::delta_scan_segment(anchor, 32);
+      assert(segment.offset == end);
+      end += segment.count;
+    }
+    assert(end == gpu_search::kDeltaScanRecordBudget);
+    const auto first = gpu_search::delta_scan_segment(0, 3, 8);
+    const auto second = gpu_search::delta_scan_segment(1, 3, 8);
+    const auto third = gpu_search::delta_scan_segment(2, 3, 8);
+    assert(first.offset == 0 && first.count == 3);
+    assert(second.offset == 3 && second.count == 3);
+    assert(third.offset == 6 && third.count == 2);
+    assert(gpu_search::delta_scan_segment(3, 3, 8).count == 0);
+  }
+
   // The score itself must remain inside the seqlock window. An odd writer
   // window or a completed update to a different even generation is rejected.
   static_assert(gpu_search::dynamic_route_window_stable(2, 2));
   static_assert(!gpu_search::dynamic_route_window_stable(2, 3));
   static_assert(!gpu_search::dynamic_route_window_stable(2, 4));
   static_assert(!gpu_search::dynamic_route_window_stable(3, 3));
-
-  // No quality fallback is displaced when both tiers fit.  Under pressure,
-  // the established route keeps every slot except the one required to make
-  // the adaptive route effective.
-  {
-    const auto unconstrained = gpu_search::choose_initial_seed_quota(32, 40, 128);
-    assert(unconstrained.static_count == 32);
-    assert(unconstrained.dynamic_count == 40);
-    const auto static_heavy = gpu_search::choose_initial_seed_quota(32, 40, 16);
-    assert(static_heavy.static_count == 15);
-    assert(static_heavy.dynamic_count == 1);
-    const auto dynamic_heavy = gpu_search::choose_initial_seed_quota(1, 40, 16);
-    assert(dynamic_heavy.static_count == 1);
-    assert(dynamic_heavy.dynamic_count == 15);
-    const auto static_only = gpu_search::choose_initial_seed_quota(40, 0, 16);
-    assert(static_only.static_count == 16);
-    assert(static_only.dynamic_count == 0);
-    const auto dynamic_only = gpu_search::choose_initial_seed_quota(0, 40, 16);
-    assert(dynamic_only.static_count == 0);
-    assert(dynamic_only.dynamic_count == 16);
-    const auto one_slot = gpu_search::choose_initial_seed_quota(4, 4, 1);
-    assert(one_slot.static_count == 1);
-    assert(one_slot.dynamic_count == 0);
-  }
 
   // Immutable schema-15 base records use generation zero. Canonical storage
   // routing must be able to publish them as bootstrap representatives.

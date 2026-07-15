@@ -1,7 +1,8 @@
 #pragma once
 
+#include "gpu_search/delta_scan_budget.hh"
 #include "gpu_search/dynamic_route_consistency.hh"
-#include "gpu_search/initial_seed_quota.hh"
+#include "gpu_search/initial_seed_budget.hh"
 #include "gpu_search/persistent_kernel/rdma_cache.cuh"
 
 #include <cuda/atomic>
@@ -103,10 +104,17 @@ __device__ void add_delta_candidates(const PersistentKernelParams& params,
                                      u8* beam_expanded, u32& beam_count,
                                      u32 beam_capacity,
                                      const u32* selected_anchors,
-                                     u32 selected_anchor_count) {
+                                     u32 selected_anchor_count,
+                                     u32* scan_slots,
+                                     u32& scanned_records,
+                                     u32& scored_records,
+                                     u32& truncated_buckets) {
   __shared__ u32 delta_count_snapshot;
   if (threadIdx.x == 0) {
     delta_count_snapshot = min(load_cg(params.delta_count), params.delta_capacity);
+    scanned_records = 0;
+    scored_records = 0;
+    truncated_buckets = 0;
   }
   __syncthreads();
   const u32 count = delta_count_snapshot;
@@ -114,13 +122,98 @@ __device__ void add_delta_candidates(const PersistentKernelParams& params,
   __shared__ u32 candidate_handles[256];
   __shared__ u32 candidate_slots[256];
   __shared__ f32 candidate_distances[256];
+  __shared__ u32 selected_bucket_nonempty;
   u32 local_slot = UINT32_MAX;
   f32 local_approximation = FLT_MAX;
 
+  // delta_count is a reused-slot high watermark and can remain nonzero after
+  // every mutable record has been unlinked.  In the normal anchor-backed
+  // configuration, avoid touching the fixed scan scratch when none of this
+  // query's selected buckets currently has a linked prefix. Publication that
+  // races a query carries a newer epoch and is not visible to its snapshot.
+  if (params.anchor_count != 0 && selected_anchor_count != 0) {
+    if (threadIdx.x == 0) selected_bucket_nonempty = 0;
+    __syncthreads();
+    for (u32 probe = threadIdx.x; probe < selected_anchor_count;
+         probe += blockDim.x) {
+      const u32 selected_anchor = selected_anchors[probe];
+      if (selected_anchor != UINT32_MAX) {
+        const u32 head = load_cg(
+          params.delta_bucket_heads + selected_anchor);
+        if (head != UINT32_MAX && head < count) {
+          atomicExch(&selected_bucket_nonempty, 1u);
+        }
+      }
+    }
+    __syncthreads();
+    if (selected_bucket_nonempty == 0) return;
+  }
+
+  static_assert(kDeltaScanRecordBudget <= kPersistentMaxMergeCandidates);
+  for (u32 index = threadIdx.x; index < kDeltaScanRecordBudget;
+       index += blockDim.x) {
+    scan_slots[index] = UINT32_MAX;
+  }
+  __syncthreads();
+
   if (params.anchor_count == 0 || selected_anchor_count == 0) {
-    for (u32 slot = threadIdx.x; slot < count; slot += blockDim.x) {
+    const u32 scan_count = min(count, kDeltaScanRecordBudget);
+    // Without anchor buckets, prefer the append-most-recent high-watermark
+    // window. Slot reuse can make this approximate, but the work remains
+    // bounded and the graph/dynamic route remain the authoritative paths.
+    const u32 scan_begin = count - scan_count;
+    for (u32 index = threadIdx.x; index < scan_count;
+         index += blockDim.x) {
+      scan_slots[index] = scan_begin + index;
+    }
+    if (threadIdx.x == 0) {
+      scanned_records = scan_count;
+      truncated_buckets = count > scan_count ? 1 : 0;
+    }
+  } else {
+    // Bucket insertion is at the head, so this covers the newest fixed-budget
+    // prefix of every selected anchor. One thread follows each singly-linked
+    // list; unlike the old partitioned loop, links are never redundantly
+    // traversed by every worker assigned to the same anchor.
+    u32 local_discovered = 0;
+    u32 local_truncated = 0;
+    for (u32 probe = threadIdx.x; probe < selected_anchor_count;
+         probe += blockDim.x) {
+      const DeltaScanSegment segment = delta_scan_segment(
+        probe, selected_anchor_count, kDeltaScanRecordBudget);
+      const u32 selected_anchor = selected_anchors[probe];
+      u32 slot = selected_anchor == UINT32_MAX
+        ? UINT32_MAX : load_cg(params.delta_bucket_heads + selected_anchor);
+      u32 discovered = 0;
+      while (slot != UINT32_MAX && slot < count && discovered < segment.count) {
+        scan_slots[segment.offset + discovered] = slot;
+        slot = load_cg(params.delta_next + slot);
+        ++discovered;
+      }
+      local_discovered += discovered;
+      if (discovered == segment.count && slot != UINT32_MAX && slot < count) {
+        ++local_truncated;
+      }
+    }
+    if (local_discovered != 0) {
+      atomicAdd(&scanned_records, local_discovered);
+    }
+    // This is structural prefix truncation, not a claim that every record
+    // beyond the prefix would be visible to this query snapshot.
+    if (local_truncated != 0) {
+      atomicAdd(&truncated_buckets, local_truncated);
+    }
+  }
+  __syncthreads();
+
+  u32 local_scored = 0;
+  for (u32 index = threadIdx.x; index < kDeltaScanRecordBudget;
+       index += blockDim.x) {
+      const u32 slot = scan_slots[index];
+      if (slot == UINT32_MAX || slot >= count) continue;
       const DeviceDeltaRecord& record = params.delta_records[slot];
       if (!delta_visible(record, descriptor.snapshot_epoch)) continue;
+      ++local_scored;
       const f32 approximation = approximate_entry(
         params, query_lut,
         params.delta_pq_codes + static_cast<size_t>(slot) * params.pq_code_bytes);
@@ -128,32 +221,9 @@ __device__ void add_delta_candidates(const PersistentKernelParams& params,
         local_approximation = approximation;
         local_slot = slot;
       }
-    }
-  } else if (selected_anchor_count != 0) {
-      const u32 probe = threadIdx.x % selected_anchor_count;
-      const u32 partition = threadIdx.x / selected_anchor_count;
-      const u32 partitions =
-        (blockDim.x - 1 - probe) / selected_anchor_count + 1;
-      const u32 selected_anchor = selected_anchors[probe];
-      u32 slot = selected_anchor == UINT32_MAX
-        ? UINT32_MAX : load_cg(params.delta_bucket_heads + selected_anchor);
-      u32 traversed = 0;
-      u32 position = 0;
-      while (slot != UINT32_MAX && slot < count && traversed++ < count) {
-        const DeviceDeltaRecord& record = params.delta_records[slot];
-        if (position % partitions == partition &&
-            delta_visible(record, descriptor.snapshot_epoch)) {
-          const f32 approximation = approximate_entry(
-            params, query_lut,
-            params.delta_pq_codes + static_cast<size_t>(slot) * params.pq_code_bytes);
-          if (approximation < local_approximation) {
-            local_approximation = approximation;
-            local_slot = slot;
-          }
-        }
-        slot = load_cg(params.delta_next + slot);
-        ++position;
-      }
+  }
+  if (local_scored != 0) {
+    atomicAdd(&scored_records, local_scored);
   }
   candidate_slots[threadIdx.x] = local_slot;
   candidate_handles[threadIdx.x] = local_slot == UINT32_MAX
@@ -214,6 +284,7 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ u64 score_phase_cycles;
   __shared__ u64 beam_phase_cycles;
   __shared__ u64 exact_phase_cycles;
+  __shared__ u64 delta_scan_started_cycles;
   __shared__ u64 phase_started_cycles;
   if (threadIdx.x == 0) {
     prepare_started_cycles = clock64();
@@ -430,44 +501,54 @@ __device__ void process_query(const PersistentKernelParams& params,
   if (threadIdx.x == 0) {
     // atomicAdd counts every valid canonical slot, including ranks that did
     // not fit in the fixed merge scratch.  Only the contiguous prefix below
-    // was materialized and may participate in either tier-local sort.
+    // was materialized and may participate in the combined route ranking.
     dynamic_seed_count = min(
       dynamic_seed_count,
       static_cast<u32>(kPersistentMaxExact * 2) - static_seed_count);
   }
   __syncthreads();
-  if (static_seed_count + dynamic_seed_count > traversal_capacity) {
-    // The normal path still performs only the original union sort.  Tier-local
-    // sorts are needed solely when the bounded beam forces a quota decision.
-    sort_candidates(merge_handles, nullptr, merge_distances, merge_expanded,
-                    static_seed_count);
-    sort_candidates(merge_handles + static_seed_count, nullptr,
-                    merge_distances + static_seed_count,
-                    merge_expanded + static_seed_count,
-                    dynamic_seed_count);
-    if (threadIdx.x == 0) {
-      const InitialSeedQuota quota = choose_initial_seed_quota(
-        static_seed_count, dynamic_seed_count, traversal_capacity);
-      // The dynamic source range begins after the complete static range.  A
-      // forward copy is overlap-safe because every destination is no greater
-      // than its source and all overwritten source elements were already read.
-      for (u32 index = 0; index < quota.dynamic_count; ++index) {
-        const u32 source = static_seed_count + index;
-        const u32 destination = quota.static_count + index;
-        merge_handles[destination] = merge_handles[source];
-        merge_distances[destination] = merge_distances[source];
-        merge_expanded[destination] = merge_expanded[source];
-      }
-      seed_count = quota.static_count + quota.dynamic_count;
-    }
-  } else if (threadIdx.x == 0) {
+  if (threadIdx.x == 0) {
     seed_count = static_seed_count + dynamic_seed_count;
   }
   __syncthreads();
+
+  // Adaptive routes are replacements inside the configured entry-seed
+  // budget, not an extra tier which can silently enlarge the query beam.  Rank
+  // the static fallback and canonical dynamic entries in the same PQ distance
+  // space, then keep the best unique handles.  This retains the immutable
+  // fallback whenever it is more useful while allowing a closer dynamic entry
+  // to displace it.  In particular, the usual 32-static + 40-dynamic setup
+  // still starts traversal with at most 32 entries rather than 72.
   sort_candidates(merge_handles, nullptr, merge_distances, merge_expanded,
                   seed_count);
   if (threadIdx.x == 0) {
-    beam_count = min(seed_count, traversal_capacity);
+    const u32 initial_seed_capacity = initial_seed_budget(
+      params.entry_seed_count, traversal_capacity);
+    u32 unique_count = 0;
+    for (u32 input = 0;
+         input < seed_count && unique_count < initial_seed_capacity; ++input) {
+      const u32 handle = merge_handles[input];
+      if (handle == UINT32_MAX || !isfinite(merge_distances[input]) ||
+          merge_distances[input] == FLT_MAX) {
+        continue;
+      }
+      bool duplicate = false;
+      for (u32 prior = 0; prior < unique_count; ++prior) {
+        if (merge_handles[prior] == handle) {
+          duplicate = true;
+          break;
+        }
+      }
+      if (duplicate) continue;
+      if (unique_count != input) {
+        merge_handles[unique_count] = handle;
+        merge_distances[unique_count] = merge_distances[input];
+        merge_expanded[unique_count] = 0;
+      }
+      ++unique_count;
+    }
+    seed_count = unique_count;
+    beam_count = unique_count;
     rerank_count = 0;
     total_exact_reads = 0;
     total_exact_cache_hits = 0;
@@ -737,10 +818,24 @@ __device__ void process_query(const PersistentKernelParams& params,
   }
   __syncthreads();
 
+  __shared__ u32 delta_scan_records;
+  __shared__ u32 delta_scan_scored;
+  __shared__ u32 delta_scan_truncated_buckets;
+  if (threadIdx.x == 0) delta_scan_started_cycles = clock64();
+  __syncthreads();
   add_delta_candidates(params, descriptor, query, query_lut,
                        beam_handles, beam_ids, beam_distances, beam_expanded, beam_count,
                        params.final_rerank_width,
-                       anchor_best_indices, selected_anchor_count);
+                       anchor_best_indices, selected_anchor_count,
+                       navigation_handles, delta_scan_records,
+                       delta_scan_scored, delta_scan_truncated_buckets);
+  if (threadIdx.x == 0) {
+    completion.delta_scan_cycles = clock64() - delta_scan_started_cycles;
+    completion.delta_scan_records = delta_scan_records;
+    completion.delta_scan_scored = delta_scan_scored;
+    completion.delta_scan_truncated_buckets = delta_scan_truncated_buckets;
+  }
+  __syncthreads();
   if (beam_count == 0) {
     if (threadIdx.x == 0) {
       completion.status = -EIO;

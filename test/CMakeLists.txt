@@ -23,6 +23,11 @@ target_link_libraries(common_atomic_utils_test PRIVATE dvstor_runtime)
 target_compile_options(common_atomic_utils_test PRIVATE -UNDEBUG)
 add_test(NAME common_atomic_utils_test COMMAND common_atomic_utils_test)
 
+add_executable(core_partition_test core_partition_test.cc)
+dvstor_target_common_includes(core_partition_test)
+target_compile_options(core_partition_test PRIVATE -UNDEBUG)
+add_test(NAME core_partition_test COMMAND core_partition_test)
+
 add_executable(bounded_update_primitives_test bounded_update_primitives_test.cc)
 target_link_libraries(bounded_update_primitives_test PRIVATE dvstor_runtime)
 target_compile_options(bounded_update_primitives_test PRIVATE -UNDEBUG)

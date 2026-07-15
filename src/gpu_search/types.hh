@@ -35,6 +35,7 @@ struct CompletionDescriptor {
   u64 score_cycles{};
   u64 beam_cycles{};
   u64 exact_cycles{};
+  u64 delta_scan_cycles{};
   u32 query_slot{};
   u32 result_count{};
   i32 status{};
@@ -45,6 +46,9 @@ struct CompletionDescriptor {
   u32 cache_hits{};
   u32 route_hits{};
   u32 exact_cache_hits{};
+  u32 delta_scan_records{};
+  u32 delta_scan_scored{};
+  u32 delta_scan_truncated_buckets{};
 };
 
 struct DeltaSupersedeUpdate {
@@ -150,6 +154,7 @@ struct TelemetrySnapshot {
   u64 gpu_score_ns{};
   u64 gpu_beam_ns{};
   u64 gpu_exact_ns{};
+  u64 gpu_delta_scan_ns{};
   u64 rdma_read_ops{};
   u64 rdma_read_bytes{};
   u64 rdma_merged_requests{};
@@ -167,6 +172,9 @@ struct TelemetrySnapshot {
   u64 exact_vector_reads{};
   u64 exact_vector_cache_hits{};
   u64 delta_queries{};
+  u64 delta_scan_records{};
+  u64 delta_scan_scored{};
+  u64 delta_scan_truncated_buckets{};
   u64 mutations_published{};
   u64 delta_publications{};
   u64 delta_reclaim_batches{};
@@ -217,6 +225,7 @@ public:
   std::atomic<u64> gpu_score_ns{0};
   std::atomic<u64> gpu_beam_ns{0};
   std::atomic<u64> gpu_exact_ns{0};
+  std::atomic<u64> gpu_delta_scan_ns{0};
   std::atomic<u64> rdma_read_ops{0};
   std::atomic<u64> rdma_read_bytes{0};
   std::atomic<u64> rdma_merged_requests{0};
@@ -234,6 +243,9 @@ public:
   std::atomic<u64> exact_vector_reads{0};
   std::atomic<u64> exact_vector_cache_hits{0};
   std::atomic<u64> delta_queries{0};
+  std::atomic<u64> delta_scan_records{0};
+  std::atomic<u64> delta_scan_scored{0};
+  std::atomic<u64> delta_scan_truncated_buckets{0};
   std::atomic<u64> mutations_published{0};
   std::atomic<u64> delta_publications{0};
   std::atomic<u64> delta_reclaim_batches{0};

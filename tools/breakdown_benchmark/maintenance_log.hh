@@ -21,12 +21,15 @@ struct MaintenanceObservation {
   uint64_t peer_reverse_remaining{};
   uint64_t failed{};
   uint64_t peer_reverse_failed{};
+  uint64_t admission_window{};
+  uint64_t completion_outstanding{};
   double p99_stitch_delay_upper_ms{};
   bool p99_stitch_delay_over_30s{};
   std::array<uint64_t, kMaintenanceLatencyBucketCount>
     stitch_delay_histogram{};
   bool failure_counters_available{};
   bool stitch_delay_histogram_available{};
+  bool completion_window_available{};
 
   uint64_t backlog() const;
 };
@@ -47,13 +50,18 @@ struct MaintenanceLogSummary {
   uint64_t remaining{};
   uint64_t max_backlog_observed{};
   uint64_t failures{};
+  uint64_t admission_window{};
+  uint64_t completion_outstanding{};
+  uint64_t max_completion_outstanding_per_shard{};
   double p99_stitch_delay_upper_ms{};
   bool p99_stitch_delay_over_30s{};
   uint64_t p99_stitch_delay_samples{};
   bool p99_stitch_delay_available{};
   size_t logs_with_failure_deltas{};
   size_t logs_with_histogram_deltas{};
+  size_t logs_with_completion_window{};
   bool failure_delta_available{};
+  bool completion_window_available{};
   double backlog_slope_per_sec{};
   bool backlog_slope_available{};
   std::vector<std::string> unreadable_logs;

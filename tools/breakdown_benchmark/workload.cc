@@ -1215,6 +1215,12 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
      maintenance_summary.p99_stitch_delay_available},
     {"failures", maintenance_summary.failures},
     {"failure_delta_available", maintenance_summary.failure_delta_available},
+    {"admission_window", maintenance_summary.admission_window},
+    {"completion_outstanding", maintenance_summary.completion_outstanding},
+    {"max_completion_outstanding_per_shard",
+     maintenance_summary.max_completion_outstanding_per_shard},
+    {"completion_window_available",
+     maintenance_summary.completion_window_available},
     {"observation_period_seconds_assumed", 5.0},
   };
 
