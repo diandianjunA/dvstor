@@ -1,6 +1,8 @@
 #include "gpu_search/persistent_engine/impl.hh"
 #include "gpu_search/persistent_engine/cuda_helpers.hh"
 
+#include <cerrno>
+
 namespace gpu_search {
 
 using namespace persistent_engine_detail;
@@ -20,10 +22,17 @@ void PersistentSearchEngine::Impl::report_direct_path_failure() {
   if (!direct_failure_logged.compare_exchange_strong(
         expected, true, std::memory_order_acq_rel)) return;
   const i32 direct_error = *direct_error_host;
-  std::cerr << "[gpu-search] GPUNetIO direct read failed with status=" << direct_error
-            << "; strict GPUNetIO mode rejects the query\n";
+  const bool graph_snapshot_error = direct_error == -EBADMSG;
+  std::cerr << "[gpu-search] "
+            << (graph_snapshot_error
+                  ? "graph snapshot validation failed after bounded rereads"
+                  : "GPUNetIO direct read failed")
+            << " with status=" << direct_error
+            << "; strict query mode rejects the query\n";
   engine.telemetry_.direct_path_failures.fetch_add(1, std::memory_order_relaxed);
-  mark_unhealthy("GPUNetIO direct read failed with status " +
+  mark_unhealthy(std::string(graph_snapshot_error
+                 ? "graph snapshot validation failed with status "
+                 : "GPUNetIO direct read failed with status ") +
                  std::to_string(direct_error));
 }
 
@@ -80,12 +89,11 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << " delta_scan_truncated_buckets="
                 << completion.delta_scan_truncated_buckets
                 << " graph_reads=" << completion.remote_pages
+                << " graph_rereads=" << completion.graph_read_retries
                 << " graph_batches=" << completion.remote_batches
                 << " graph_rounds=" << completion.graph_rounds
-                << " graph_hits=" << completion.cache_hits
                 << " route_hits=" << completion.route_hits
-                << " exact_reads=" << completion.exact_vectors
-                << " exact_hits=" << completion.exact_cache_hits << '\n';
+                << " exact_reads=" << completion.exact_vectors << '\n';
     }
     try {
       if (completion.status != 0) {
@@ -140,30 +148,30 @@ void PersistentSearchEngine::Impl::completion_loop() {
       completion.delta_scan_scored, std::memory_order_relaxed);
     engine.telemetry_.delta_scan_truncated_buckets.fetch_add(
       completion.delta_scan_truncated_buckets, std::memory_order_relaxed);
+    const u64 physical_graph_reads =
+      static_cast<u64>(completion.remote_pages) + completion.graph_read_retries;
     engine.telemetry_.rdma_read_ops.fetch_add(
-      static_cast<u64>(completion.exact_vectors) + completion.remote_pages,
+      static_cast<u64>(completion.exact_vectors) + physical_graph_reads,
       std::memory_order_relaxed);
     engine.telemetry_.rdma_read_bytes.fetch_add(
       static_cast<u64>(completion.exact_vectors) * node_record_bytes +
-      static_cast<u64>(completion.remote_pages) * index.layout.graph_entry_bytes,
+      physical_graph_reads * index.layout.graph_entry_bytes,
       std::memory_order_relaxed);
-    if (completion.remote_pages > completion.remote_batches) {
+    if (physical_graph_reads > completion.remote_batches) {
       engine.telemetry_.rdma_merged_requests.fetch_add(
-        completion.remote_pages - completion.remote_batches,
+        physical_graph_reads - completion.remote_batches,
         std::memory_order_relaxed);
     }
     engine.telemetry_.exact_vector_reads.fetch_add(completion.exact_vectors,
                                                    std::memory_order_relaxed);
     engine.telemetry_.graph_page_requests.fetch_add(completion.remote_pages,
                                                     std::memory_order_relaxed);
+    engine.telemetry_.graph_read_retries.fetch_add(
+      completion.graph_read_retries, std::memory_order_relaxed);
     engine.telemetry_.graph_dependency_rounds.fetch_add(
       completion.graph_rounds, std::memory_order_relaxed);
-    engine.telemetry_.graph_page_cache_hits.fetch_add(completion.cache_hits,
-                                                      std::memory_order_relaxed);
     engine.telemetry_.graph_route_hits.fetch_add(completion.route_hits,
                                                  std::memory_order_relaxed);
-    engine.telemetry_.exact_vector_cache_hits.fetch_add(completion.exact_cache_hits,
-                                                        std::memory_order_relaxed);
   }
 }
 

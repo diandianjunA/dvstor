@@ -91,9 +91,9 @@ bool PersistentSearchEngine::publish_mutations(
   }
   telemetry_.publication_queue_ns_total.fetch_add(publication_queue_ns,
                                                   std::memory_order_relaxed);
-  size_t graph_cache_invalidations = 0;
+  size_t graph_route_invalidations = 0;
   try {
-    graph_cache_invalidations =
+    graph_route_invalidations =
       impl_->upload_mutations(mutations, epoch, invalidated_graph_nodes);
   } catch (const MutationCapacityError&) {
     telemetry_.mutation_capacity_rejections.fetch_add(1, std::memory_order_relaxed);
@@ -135,8 +135,8 @@ bool PersistentSearchEngine::publish_mutations(
   }
   telemetry_.mutations_published.fetch_add(mutation_count, std::memory_order_relaxed);
   telemetry_.delta_publications.fetch_add(1, std::memory_order_relaxed);
-  telemetry_.graph_cache_invalidations.fetch_add(
-    graph_cache_invalidations, std::memory_order_relaxed);
+  telemetry_.graph_route_invalidations.fetch_add(
+    graph_route_invalidations, std::memory_order_relaxed);
   telemetry_.visibility_ns_total.fetch_add(visibility_ns_total,
                                            std::memory_order_relaxed);
   telemetry_.delta_live_entries.store(delta_.delta_size(), std::memory_order_relaxed);

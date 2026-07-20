@@ -131,11 +131,6 @@ void run_valid_resident_query_test(u32 subquantizers, u32 query_threads,
   DeviceBuffer<u64> request_offsets(request_capacity);
   DeviceBuffer<u64> request_iovas(request_capacity);
   DeviceBuffer<u8> exact_records(node_record_bytes);
-  DeviceBuffer<u8> exact_cache(node_record_bytes);
-  DeviceBuffer<u32> exact_cache_keys;
-  DeviceBuffer<u32> exact_cache_states;
-  DeviceBuffer<u32> exact_cache_readers;
-  DeviceBuffer<u32> exact_cache_victims;
   DeviceBuffer<gpu_search::DeviceDeltaRecord> delta_records;
   DeviceBuffer<u8> delta_vectors(dim);
   DeviceBuffer<u8> delta_pq_codes(subquantizers);
@@ -166,10 +161,8 @@ void run_valid_resident_query_test(u32 subquantizers, u32 query_threads,
   };
   const u32 entry_point = 0;
   const u64 dynamic_remote_node = dynamic_base_offset;
-  const u32 dynamic_handle = gpu_search::kDeltaHandleBit;
   const u64 route_key = dynamic_route_only
     ? dynamic_base_offset + dynamic_hot_offset : 512;
-  const u32 exact_cache_key = dynamic_route_only ? dynamic_handle : entry_point;
   const u32 ready = 2;
   const u32 zero = 0;
   const u32 resident_slot = 0;
@@ -194,8 +187,6 @@ void run_valid_resident_query_test(u32 subquantizers, u32 query_threads,
   const u16 checksum = graph_checksum(route_record.data(), route_record.size());
   route_record[2] = static_cast<u8>(checksum);
   route_record[3] = static_cast<u8>(checksum >> 8);
-  std::vector<u8> exact_record(node_record_bytes, 0);
-  std::memcpy(exact_record.data() + 8, &expected_id, sizeof(expected_id));
 
   check_cuda(cudaMemcpy(shards.get(), &shard, sizeof(shard), cudaMemcpyHostToDevice),
              "cudaMemcpy(valid query shard)");
@@ -217,20 +208,6 @@ void run_valid_resident_query_test(u32 subquantizers, u32 query_threads,
   check_cuda(cudaMemset(route_readers.get(), 0, route_readers.bytes()),
              "cudaMemset(valid query route readers)");
   check_cuda(cudaMemset(query.get(), 0, query.bytes()), "cudaMemset(valid query)");
-  check_cuda(cudaMemcpy(exact_cache.get(), exact_record.data(), exact_record.size(),
-                        cudaMemcpyHostToDevice),
-             "cudaMemcpy(valid query exact cache)");
-  check_cuda(cudaMemcpy(exact_cache_keys.get(), &exact_cache_key,
-                        sizeof(exact_cache_key),
-                        cudaMemcpyHostToDevice),
-             "cudaMemcpy(valid query exact key)");
-  check_cuda(cudaMemcpy(exact_cache_states.get(), &ready, sizeof(ready),
-                        cudaMemcpyHostToDevice),
-             "cudaMemcpy(valid query exact state)");
-  check_cuda(cudaMemset(exact_cache_readers.get(), 0, exact_cache_readers.bytes()),
-             "cudaMemset(valid query exact readers)");
-  check_cuda(cudaMemset(exact_cache_victims.get(), 0, exact_cache_victims.bytes()),
-             "cudaMemset(valid query exact victims)");
   const u32 delta_count_value = dynamic_route_only ? 1u : 0u;
   const u64 delta_remote_key = dynamic_route_only ? dynamic_remote_node : 0;
   check_cuda(cudaMemcpy(delta_records.get(), &dynamic_delta_record,
@@ -339,14 +316,6 @@ void run_valid_resident_query_test(u32 subquantizers, u32 query_threads,
     .dynamic_code_request_shards = request_shards.get(),
     .dynamic_code_request_offsets = request_offsets.get(),
     .dynamic_code_request_local_iovas = request_iovas.get(),
-    .exact_cache = exact_cache.get(),
-    .exact_cache_stride = node_record_bytes,
-    .exact_cache_sets = 1,
-    .exact_cache_ways = 1,
-    .exact_cache_keys = exact_cache_keys.get(),
-    .exact_cache_states = exact_cache_states.get(),
-    .exact_cache_readers = exact_cache_readers.get(),
-    .exact_cache_victims = exact_cache_victims.get(),
     .result_ids = result_ids.get(),
     .result_distances = result_distances.get(),
   };
@@ -454,19 +423,10 @@ int main(int argc, char** argv) {
     MappedRing<gpu_search::DeltaPublishCompletion> delta_completions(
       8, MappedRing<gpu_search::DeltaPublishCompletion>::Direction::device_to_host);
 
-    constexpr u32 kCacheWays = 4;
-    const u64 cache_keys_host[kCacheWays]{11, 22, 33, 44};
-    u32 cache_states_host[kCacheWays]{2, 2, 2, 2};
-    u64* cache_keys_device = nullptr;
-    u32* cache_states_device = nullptr;
     u64* invalidation_key_device = nullptr;
     u64* anchor_graph_key_device = nullptr;
     u32* anchor_graph_state_device = nullptr;
     u32* anchor_graph_reader_device = nullptr;
-    check_cuda(cudaMalloc(reinterpret_cast<void**>(&cache_keys_device),
-                          sizeof(cache_keys_host)), "cudaMalloc(cache keys)");
-    check_cuda(cudaMalloc(reinterpret_cast<void**>(&cache_states_device),
-                          sizeof(cache_states_host)), "cudaMalloc(cache states)");
     check_cuda(cudaMalloc(reinterpret_cast<void**>(&invalidation_key_device), sizeof(u64)),
                "cudaMalloc(invalidation key)");
     check_cuda(cudaMalloc(reinterpret_cast<void**>(&anchor_graph_key_device), sizeof(u64)),
@@ -476,10 +436,6 @@ int main(int argc, char** argv) {
     check_cuda(cudaMalloc(reinterpret_cast<void**>(&anchor_graph_reader_device), sizeof(u32)),
                "cudaMalloc(anchor route reader)");
     const u64 invalidation_key_host = 22;
-    check_cuda(cudaMemcpy(cache_keys_device, cache_keys_host, sizeof(cache_keys_host),
-                          cudaMemcpyHostToDevice), "cudaMemcpy(cache keys)");
-    check_cuda(cudaMemcpy(cache_states_device, cache_states_host, sizeof(cache_states_host),
-                          cudaMemcpyHostToDevice), "cudaMemcpy(cache states)");
     check_cuda(cudaMemcpy(invalidation_key_device, &invalidation_key_host, sizeof(u64),
                           cudaMemcpyHostToDevice), "cudaMemcpy(invalidation key)");
     const u32 anchor_graph_ready = 2;
@@ -833,10 +789,6 @@ int main(int argc, char** argv) {
     params.anchor_graph_states = anchor_graph_state_device;
     params.anchor_graph_readers = anchor_graph_reader_device;
     params.anchor_graph_count = 1;
-    params.graph_cache_keys = cache_keys_device;
-    params.graph_cache_states = cache_states_device;
-    params.graph_cache_sets = 1;
-    params.graph_cache_ways = kCacheWays;
     params.stop = stop_device;
     params.query_slots = 1;
     params.num_shards = 1;
@@ -856,7 +808,6 @@ int main(int argc, char** argv) {
     if (query_threads != 128 && query_threads != 256) {
       throw std::invalid_argument("query threads must be 128 or 256");
     }
-    run_valid_resident_query_test(test_subquantizers, query_threads);
     run_valid_resident_query_test(test_subquantizers, query_threads, true);
     auto query_params = params;
     query_params.delta_submissions = {};
@@ -926,8 +877,6 @@ int main(int argc, char** argv) {
                "cudaMemcpy(delta bucket result)");
     check_cuda(cudaMemcpy(delta_records_host, delta_records_device, sizeof(delta_records_host),
                           cudaMemcpyDeviceToHost), "cudaMemcpy(delta records result)");
-    check_cuda(cudaMemcpy(cache_states_host, cache_states_device, sizeof(cache_states_host),
-                          cudaMemcpyDeviceToHost), "cudaMemcpy(cache states result)");
     check_cuda(cudaMemcpy(&anchor_graph_state_host, anchor_graph_state_device,
                           sizeof(anchor_graph_state_host), cudaMemcpyDeviceToHost),
                "cudaMemcpy(anchor route state result)");
@@ -997,9 +946,7 @@ int main(int argc, char** argv) {
         dynamic_route_slot_host.id != 7 ||
         dynamic_route_slot_host.generation != 2 ||
         dynamic_route_slot_host.flags != gpu_search::kDynamicRouteLive ||
-        anchor_graph_state_host != 3 ||
-        cache_states_host[0] != 2 || cache_states_host[1] != 3 ||
-        cache_states_host[2] != 2 || cache_states_host[3] != 2) {
+        anchor_graph_state_host != 3) {
       throw std::runtime_error("persistent delta publication state is invalid");
     }
     *dynamic_route_update_host = gpu_search::DynamicRouteUpdate{
@@ -1351,8 +1298,6 @@ int main(int argc, char** argv) {
     check_cuda(cudaFree(anchor_graph_reader_device), "cudaFree(anchor route reader)");
     check_cuda(cudaFree(anchor_graph_state_device), "cudaFree(anchor route state)");
     check_cuda(cudaFree(anchor_graph_key_device), "cudaFree(anchor route key)");
-    check_cuda(cudaFree(cache_states_device), "cudaFree(cache states)");
-    check_cuda(cudaFree(cache_keys_device), "cudaFree(cache keys)");
     check_cuda(cudaStreamDestroy(stream), "cudaStreamDestroy");
     check_cuda(cudaStreamDestroy(control_stream), "cudaStreamDestroy(control)");
     check_cuda(cudaFreeHost(stop_host), "cudaFreeHost(stop)");

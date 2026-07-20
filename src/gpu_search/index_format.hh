@@ -18,7 +18,7 @@ inline constexpr std::array<char, 8> kCodeMagic{'D', 'V', 'G', 'P', 'U', 'C', '5
 inline constexpr u32 kVersion = 5;
 inline constexpr u32 kEndianMarker = 0x01020304;
 inline constexpr u32 kMaxEntryPoints = 512;
-inline constexpr u32 kGraphCacheLineBytes = 512;
+inline constexpr u32 kMaxGraphEntryBytes = 512;
 inline constexpr u32 kCompactPointerBytes = 5;
 inline constexpr u64 kNodeBaseOffset = 16;
 inline constexpr u32 kMetadataSchemaVersion = 15;

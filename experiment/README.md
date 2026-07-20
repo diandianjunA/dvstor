@@ -1,8 +1,7 @@
 # SIFT100M Experiment
 
 实验目录只保留 `04_gpu_persistent_gpunetio`：持久化 GPU OPQ/PQ32 图导航、
-GPUNetIO 远端读取和 storage-owner 动态更新。旧 profile、旧 sidecar 转换器和
-历史输出不属于 `dev` 的运行接口。
+GPUNetIO 远端读取和 storage-owner 动态更新。
 
 ## 配置
 
@@ -17,9 +16,6 @@ export GPU_MEMORY_LIMIT_GB=40
 export GPU_MEMORY_RESERVE_GB=4
 export GPU_RESIDENT_PQ_BUDGET_MB=4096
 ```
-
-旧索引只在迁移命令中通过 `SOURCE_PREFIX` 显式指定；运行 profile 只维护当前
-`INDEX_PREFIX`，不携带旧索引状态。
 
 ## 构建新索引
 
@@ -36,48 +32,6 @@ export GPU_RESIDENT_PQ_BUDGET_MB=4096
 OPQ/PQ32 运行索引，无需随后重编码。
 推荐使用 `PQ_INDEX_PREFIX=/new/prefix` 保留已有索引；只有明确要删除目标 prefix
 下旧产物并原地重建时才设置 `OVERWRITE_INDEX=1`。
-
-## 转换旧索引
-
-已有 Vamana/Metis 索引无需重新构图或分区：
-
-```bash
-SOURCE_PREFIX=/path/to/legacy/index_prefix \
-./experiment/convert_legacy_sift100m_index.sh 04_gpu_persistent_gpunetio
-```
-
-转换和 PQ 编码是两个独立进程。schema-14 metadata 是离线迁移检查点，PQ 阶段
-完成后会原子写成 schema-15；如果迁移
-已经完成而 OPQ/PQ 训练失败，原命令会跳过迁移并直接继续 PQ，不会重复扫描和
-改写全部旧分片。`OVERWRITE_INDEX=1` 仅用于明确要求重新迁移；若 PQ 输出不完整，
-使用 `OVERWRITE_PQ=1`。
-
-可使用已训练模型减少迁移时间：
-
-```bash
-PQ_REUSE_MODEL=/path/to/compatible.pq32 \
-./experiment/convert_legacy_sift100m_index.sh 04_gpu_persistent_gpunetio
-```
-
-模型必须与维度、子空间数和 dtype 对应。转换仍需顺序扫描全部向量生成 32-byte
-code，但不执行昂贵的 Vamana construction 或 METIS partition。PQ 默认使用
-`PQ_THREADS=32`，也可显式覆盖；BLAS 线程保持为 1，避免和 Faiss OpenMP 嵌套。
-
-已有 schema-14 PQ16 索引时可直接复用 `.dat`、`.idmap` 和 anchors，仅生成
-默认 PQ32 模型与码流：
-
-```bash
-./experiment/reencode_sift100m_pq.sh 04_gpu_persistent_gpunetio
-```
-
-已有 schema-14 OPQ/PQ32 sidecar 时可原地升级，不读取 `.dat` payload，也不重新
-训练或编码。计算节点运行 metadata-only 模式；每个存储节点传自己的分片号：
-
-```bash
-INDEX_ROLE=compute ./experiment/upgrade_pq_schema15.sh 04_gpu_persistent_gpunetio
-INDEX_ROLE=storage LOCAL_SHARD=1 \
-  ./experiment/upgrade_pq_schema15.sh 04_gpu_persistent_gpunetio
-```
 
 ## 部署文件
 
@@ -203,7 +157,7 @@ WARMUP_SECONDS=30 MEASURE_SECONDS=120 \
 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
 ```
 
-如需比较不同运行，保持相同的索引、查询/插入文件、GPU 参数和缓存配置即可。
+如需比较不同运行，保持相同的索引、查询/插入文件和 GPU 参数即可。
 报告只提供吞吐、延迟、召回、GPU 内存与 stage2 遥测；不包含自动验收结论。
 
 短跑示例：

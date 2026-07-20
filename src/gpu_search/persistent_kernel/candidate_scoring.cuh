@@ -44,16 +44,11 @@ __device__ void unlink_mutable_delta(const PersistentKernelParams& params,
   params.delta_next[slot] = UINT32_MAX;
 }
 
-constexpr u32 kGraphCacheEmpty = 0;
-constexpr u32 kGraphCacheFilling = 1;
-constexpr u32 kGraphCacheReady = 2;
-constexpr u32 kGraphCacheStale = 3;
-constexpr u32 kGraphCacheFillInvalidated = 4;
+constexpr u32 kAnchorGraphReady = 2;
+constexpr u32 kAnchorGraphStale = 3;
 constexpr u32 kGraphScratchBit = 0x80000000u;
 constexpr u32 kGraphRouteBit = 0x40000000u;
 constexpr u32 kGraphSlotMask = ~(kGraphScratchBit | kGraphRouteBit);
-constexpr u32 kCacheAdmissionWays = 4;
-constexpr u32 kCacheWaitRounds = 64;
 constexpr u64 kNodeLockMask = 1ull;
 constexpr u64 kNodeDeletedMask = 1ull << 24;
 constexpr u32 kNodeIdOffset = 8;
@@ -109,15 +104,11 @@ __device__ u32 anchor_graph_slot(const PersistentKernelParams& params, u64 key) 
 __device__ void release_graph_record(const PersistentKernelParams& params,
                                      u32 acquired_slot) {
   if (acquired_slot == UINT32_MAX ||
-      (acquired_slot & kGraphScratchBit) != 0) {
+      (acquired_slot & kGraphRouteBit) == 0) {
     return;
   }
-  if ((acquired_slot & kGraphRouteBit) != 0) {
-    const u32 slot = acquired_slot & kGraphSlotMask;
-    atomicSub(params.anchor_graph_readers + slot, 1u);
-    return;
-  }
-  atomicSub(params.graph_cache_readers + acquired_slot, 1u);
+  const u32 slot = acquired_slot & kGraphSlotMask;
+  atomicSub(params.anchor_graph_readers + slot, 1u);
 }
 
 __device__ __forceinline__ u64 global_time_ns() {

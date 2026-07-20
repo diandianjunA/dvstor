@@ -132,7 +132,7 @@ void PersistentSearchEngine::Impl::upload_records_locked(std::span<DeltaMutation
     }
     // Reuse the graph-address validator so an acknowledged but misaligned
     // dynamic pointer can never enter either the delta map or route overlay.
-    (void)graph_cache_key(record_remote);
+    (void)graph_record_key(record_remote);
     u32 bucket = 0;
     if (!deleted) {
       const auto hinted = anchor_buckets_by_raw.find(mutation.anchor_hint);
@@ -258,7 +258,8 @@ void PersistentSearchEngine::Impl::upload_records_locked(std::span<DeltaMutation
 size_t PersistentSearchEngine::Impl::upload_mutations(std::span<DeltaMutation> mutations, u64 epoch,
                         std::span<const u64> invalidated_graph_nodes) {
   if (mutations.empty()) return 0;
-  const std::vector<u64> invalidation_keys = graph_cache_keys(invalidated_graph_nodes);
+  const std::vector<u64> invalidation_keys =
+    anchor_graph_invalidation_keys(invalidated_graph_nodes);
   std::lock_guard<std::mutex> lock(delta_mutex);
   reclaim_retired_delta_slots_locked();
   const size_t active_slots = active_delta_slots_locked();

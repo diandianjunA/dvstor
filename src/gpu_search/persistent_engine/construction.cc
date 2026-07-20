@@ -151,7 +151,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   for (u32 anchor = 0; anchor < anchor_table.raw_pointers.size(); ++anchor) {
     anchor_buckets_by_raw.emplace(anchor_table.raw_pointers[anchor], anchor);
     anchor_graph_keys_host.push_back(
-      graph_cache_key(anchor_table.raw_pointers[anchor]));
+      graph_record_key(anchor_table.raw_pointers[anchor]));
   }
   std::sort(anchor_graph_keys_host.begin(), anchor_graph_keys_host.end());
   anchor_graph_keys_host.erase(
@@ -194,8 +194,6 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .nodes = index.layout.num_nodes,
     .max_delta_vectors = config.max_vectors,
     .usable_bytes = usable_budget,
-    .requested_cache_bytes = static_cast<u64>(config.gpu_adjacency_cache_mb) << 20,
-    .requested_exact_cache_bytes = static_cast<u64>(config.gpu_exact_cache_mb) << 20,
     .delta_budget_bytes = static_cast<u64>(config.delta_budget_mb) << 20,
     .dim = config.dim,
     .pq_subquantizers = pq_model.subquantizers,
@@ -209,8 +207,6 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .anchor_count = anchor_table.count(),
     .shard_count = static_cast<u32>(index.shards.size()),
     .entry_point_count = static_cast<u32>(entry_handles.size()),
-    .cache_ways = config.gpu_adjacency_cache_ways,
-    .exact_cache_ways = config.gpu_exact_cache_ways,
   });
   if (!budget.fits) {
     throw std::runtime_error(
@@ -222,15 +218,6 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   delta_table_capacity = budget.delta_table_capacity;
   permanent_override_words = static_cast<u32>((index.layout.num_nodes + 31) / 32);
   visited_capacity = budget.visited_capacity;
-  graph_cache_sets = budget.cache_sets;
-  graph_cache_slots = budget.cache_slots;
-  graph_cache_bytes = static_cast<size_t>(budget.cache_payload_bytes);
-  exact_cache_sets = budget.exact_cache_sets;
-  exact_cache_slots = budget.exact_cache_slots;
-  exact_cache_stride = budget.exact_cache_stride;
-  exact_cache_bytes = static_cast<size_t>(budget.exact_cache_payload_bytes);
-  graph_admission_sets = std::min(graph_cache_sets, kMaxCacheAdmissionSets);
-  exact_admission_sets = std::min(exact_cache_sets, kMaxCacheAdmissionSets);
   const u64 invalidation_capacity = static_cast<u64>(
     std::max(config.storage_owner_batch_max, config.gpu_query_slots)) * config.R;
   if (invalidation_capacity > std::numeric_limits<u32>::max()) {
@@ -256,12 +243,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
        (sizeof(u64) + sizeof(DirectBatchDescriptor))) +
     static_cast<u64>(query_slots) * index.shards.size() * sizeof(i32);
   const u64 graph_scratch_bytes = static_cast<u64>(query_slots) *
-    kPersistentMaxPrefetch * kPersistentGraphCacheLineBytes;
-  const u64 cache_admission_bytes =
-    static_cast<u64>(graph_admission_sets) *
-      (kCacheAdmissionWays * sizeof(u64) + sizeof(u32)) +
-    static_cast<u64>(exact_admission_sets) *
-      (kCacheAdmissionWays * sizeof(u32) + sizeof(u32));
+    kPersistentMaxPrefetch * kPersistentGraphReadBytes;
   const u64 route_graph_record_bytes =
     static_cast<u64>(anchor_graph_keys_host.size()) *
     index.layout.graph_entry_bytes;
@@ -280,8 +262,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   const u64 additional_scratch_bytes =
     dynamic_code_scratch_bytes + dynamic_request_scratch_bytes +
     navigation_candidate_bytes + query_dispatch_bytes + direct_queue_bytes +
-    graph_scratch_bytes +
-    cache_admission_bytes + route_graph_bytes;
+    graph_scratch_bytes + route_graph_bytes;
   if (additional_scratch_bytes > usable_budget - budget.explicit_bytes) {
     throw std::runtime_error(
       "GPU navigation dynamic-code scratch exceeds the configured memory budget");
@@ -317,10 +298,6 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     route_graph_bytes, std::memory_order_relaxed);
   engine.telemetry_.gpu_memory_delta_reserved_bytes.store(
     budget.delta_bytes, std::memory_order_relaxed);
-  engine.telemetry_.gpu_memory_graph_cache_bytes.store(
-    budget.cache_total_bytes, std::memory_order_relaxed);
-  engine.telemetry_.gpu_memory_exact_cache_bytes.store(
-    budget.exact_cache_total_bytes, std::memory_order_relaxed);
   const u64 base_code_region_bytes = budget.code_bytes;
   const u64 exact_bytes = budget.exact_bytes;
   std::cerr << "[gpu-search] navigation budget codes=" << budget.code_bytes
@@ -330,14 +307,11 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
             << " resident_pq=" << resident_pq_bytes
             << " resident_pq_capacity=" << resident_pq_capacity
             << " permanent_overrides=" << budget.permanent_override_bytes
-            << " adjacency_total=" << budget.cache_total_bytes
-            << " exact_cache_total=" << budget.exact_cache_total_bytes
             << " dynamic_code_scratch=" << dynamic_code_scratch_bytes
             << " dynamic_request_scratch=" << dynamic_request_scratch_bytes
             << " navigation_candidates=" << navigation_candidate_bytes
             << " direct_queue_scratch=" << direct_queue_bytes
             << " graph_scratch=" << graph_scratch_bytes
-            << " cache_admission=" << cache_admission_bytes
             << " anchor_route=" << anchor_route_bytes
             << " dynamic_route=" << dynamic_route_bytes
             << " dynamic_route_codes=" << dynamic_route_code_bytes
@@ -353,12 +327,8 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     dynamic_code_region_offset + dynamic_code_scratch_bytes, 256));
   graph_scratch_offset = static_cast<size_t>(align_up(
     exact_region_offset + exact_bytes, 512));
-  exact_cache_offset = static_cast<size_t>(align_up(
-    graph_scratch_offset + graph_scratch_bytes, 256));
-  graph_cache_offset = static_cast<size_t>(
-    align_up(exact_cache_offset + exact_cache_bytes, 512));
   control_region_offset = static_cast<size_t>(
-    align_up(graph_cache_offset + graph_cache_bytes, 256));
+    align_up(graph_scratch_offset + graph_scratch_bytes, 256));
   const size_t control_snapshot_bytes =
     index.shards.size() * sizeof(format::StorageControlBlock);
   const size_t route_snapshot_offset = static_cast<size_t>(align_up(
@@ -389,8 +359,6 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   d_dynamic_code_records = d_remote_buffer + dynamic_code_region_offset;
   d_exact_records = d_remote_buffer + exact_region_offset;
   d_graph_scratch = d_remote_buffer + graph_scratch_offset;
-  d_exact_cache = d_remote_buffer + exact_cache_offset;
-  d_graph_cache = d_remote_buffer + graph_cache_offset;
   d_control_snapshots = reinterpret_cast<format::StorageControlBlock*>(
     d_remote_buffer + control_region_offset);
   d_storage_route_snapshots = reinterpret_cast<
@@ -610,20 +578,6 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                         cudaMemcpyHostToDevice),
              "cudaMemcpy(GPUNetIO owner queue views)");
 
-  device_allocate(d_graph_cache_keys, graph_cache_slots, "cudaMalloc(navigation cache keys)");
-  device_allocate(d_graph_cache_generations, graph_cache_slots,
-                  "cudaMalloc(navigation cache generations)");
-  device_allocate(d_graph_cache_timestamps, graph_cache_slots,
-                  "cudaMalloc(navigation cache timestamps)");
-  device_allocate(d_graph_cache_states, graph_cache_slots, "cudaMalloc(navigation cache states)");
-  device_allocate(d_graph_cache_readers, graph_cache_slots, "cudaMalloc(navigation cache readers)");
-  device_allocate(d_graph_cache_victims, graph_cache_sets, "cudaMalloc(navigation cache victims)");
-  device_allocate(d_graph_admission_keys,
-                  static_cast<size_t>(graph_admission_sets) * kCacheAdmissionWays,
-                  "cudaMalloc(navigation admission keys)");
-  device_allocate(d_graph_admission_victims, graph_admission_sets,
-                  "cudaMalloc(navigation admission victims)");
-  device_allocate(d_graph_cache_generation, 1, "cudaMalloc(navigation cache generation)");
   delta_command_capacity = std::max({1u, config.storage_owner_batch_max,
                                      config.gpu_query_slots});
   mapped_host_allocate(graph_invalidation_keys_host, d_graph_invalidation_keys,
@@ -651,61 +605,6 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                        static_cast<size_t>(dynamic_route_capacity) *
                          index.layout.code_bytes,
                        "cudaHostAlloc(dynamic query route code staging)");
-  if (graph_cache_slots != 0) {
-    check_cuda(cudaMemset(d_graph_cache_states, 0,
-                          static_cast<size_t>(graph_cache_slots) * sizeof(u32)),
-               "cudaMemset(navigation cache states)");
-    check_cuda(cudaMemset(d_graph_cache_readers, 0,
-                          static_cast<size_t>(graph_cache_slots) * sizeof(u32)),
-               "cudaMemset(navigation cache readers)");
-    check_cuda(cudaMemset(d_graph_cache_victims, 0,
-                          static_cast<size_t>(graph_cache_sets) * sizeof(u32)),
-               "cudaMemset(navigation cache victims)");
-    check_cuda(cudaMemset(d_graph_admission_keys, 0xff,
-                          static_cast<size_t>(graph_admission_sets) *
-                            kCacheAdmissionWays * sizeof(u64)),
-               "cudaMemset(navigation admission keys)");
-    check_cuda(cudaMemset(d_graph_admission_victims, 0,
-                          static_cast<size_t>(graph_admission_sets) * sizeof(u32)),
-               "cudaMemset(navigation admission victims)");
-  }
-  const u64 initial_cache_generation = 1;
-  check_cuda(cudaMemcpy(d_graph_cache_generation, &initial_cache_generation,
-                        sizeof(initial_cache_generation), cudaMemcpyHostToDevice),
-             "cudaMemcpy(navigation cache generation)");
-
-  device_allocate(d_exact_cache_keys, exact_cache_slots,
-                  "cudaMalloc(navigation exact-cache keys)");
-  device_allocate(d_exact_cache_states, exact_cache_slots,
-                  "cudaMalloc(navigation exact-cache states)");
-  device_allocate(d_exact_cache_readers, exact_cache_slots,
-                  "cudaMalloc(navigation exact-cache readers)");
-  device_allocate(d_exact_cache_victims, exact_cache_sets,
-                  "cudaMalloc(navigation exact-cache victims)");
-  device_allocate(d_exact_admission_keys,
-                  static_cast<size_t>(exact_admission_sets) * kCacheAdmissionWays,
-                  "cudaMalloc(navigation exact admission keys)");
-  device_allocate(d_exact_admission_victims, exact_admission_sets,
-                  "cudaMalloc(navigation exact admission victims)");
-  if (exact_cache_slots != 0) {
-    check_cuda(cudaMemset(d_exact_cache_states, 0,
-                          static_cast<size_t>(exact_cache_slots) * sizeof(u32)),
-               "cudaMemset(navigation exact-cache states)");
-    check_cuda(cudaMemset(d_exact_cache_readers, 0,
-                          static_cast<size_t>(exact_cache_slots) * sizeof(u32)),
-               "cudaMemset(navigation exact-cache readers)");
-    check_cuda(cudaMemset(d_exact_cache_victims, 0,
-                          static_cast<size_t>(exact_cache_sets) * sizeof(u32)),
-               "cudaMemset(navigation exact-cache victims)");
-    check_cuda(cudaMemset(d_exact_admission_keys, 0xff,
-                          static_cast<size_t>(exact_admission_sets) *
-                            kCacheAdmissionWays * sizeof(u32)),
-               "cudaMemset(navigation exact admission keys)");
-    check_cuda(cudaMemset(d_exact_admission_victims, 0,
-                          static_cast<size_t>(exact_admission_sets) * sizeof(u32)),
-               "cudaMemset(navigation exact admission victims)");
-  }
-
   const size_t result_elements = static_cast<size_t>(query_slots) * result_capacity;
   check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&result_ids_host),
                            result_elements * sizeof(u32),
@@ -968,25 +867,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .anchor_count = anchor_table.count(),
     .delta_anchor_probes = config.gpu_delta_anchor_probes,
     .stop = stop_device,
-    .graph_cache = d_graph_cache,
     .graph_scratch = d_graph_scratch,
-    .graph_cache_keys = d_graph_cache_keys,
-    .graph_cache_generations = d_graph_cache_generations,
-    .graph_cache_timestamps = d_graph_cache_timestamps,
-    .graph_cache_states = d_graph_cache_states,
-    .graph_cache_readers = d_graph_cache_readers,
-    .graph_cache_victims = d_graph_cache_victims,
-    .graph_admission_keys = d_graph_admission_keys,
-    .graph_admission_victims = d_graph_admission_victims,
-    .graph_admission_sets = graph_admission_sets,
-    .graph_cache_generation = d_graph_cache_generation,
-    .graph_cache_sets = graph_cache_sets,
-    .graph_cache_ways = config.gpu_adjacency_cache_ways,
-    .graph_cache_ttl_ns = static_cast<u64>(
-      config.gpu_graph_cache_ttl_us == 0
-        ? config.update_visibility_us
-        : std::min(config.gpu_graph_cache_ttl_us,
-                   config.update_visibility_us)) * 1000,
     .decoded_queries = d_queries,
     .transformed_queries = d_transformed_queries,
     .query_luts = d_query_luts,
@@ -998,17 +879,6 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .dynamic_code_request_shards = d_dynamic_code_request_shards,
     .dynamic_code_request_offsets = d_dynamic_code_request_offsets,
     .dynamic_code_request_local_iovas = d_dynamic_code_request_local_iovas,
-    .exact_cache = d_exact_cache,
-    .exact_cache_stride = exact_cache_stride,
-    .exact_cache_sets = exact_cache_sets,
-    .exact_cache_ways = config.gpu_exact_cache_ways,
-    .exact_cache_keys = d_exact_cache_keys,
-    .exact_cache_states = d_exact_cache_states,
-    .exact_cache_readers = d_exact_cache_readers,
-    .exact_cache_victims = d_exact_cache_victims,
-    .exact_admission_keys = d_exact_admission_keys,
-    .exact_admission_victims = d_exact_admission_victims,
-    .exact_admission_sets = exact_admission_sets,
     .result_ids = d_result_ids,
     .result_distances = d_result_distances,
   };

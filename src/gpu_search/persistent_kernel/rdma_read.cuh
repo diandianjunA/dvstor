@@ -296,35 +296,6 @@ __device__ bool exact_record_visible(const u8* record) {
   return (header & (kNodeLockMask | kNodeDeletedMask)) == 0;
 }
 
-__device__ bool admit_graph_cache(const PersistentKernelParams& params, u64 key) {
-  if (params.graph_admission_sets == 0 || params.graph_admission_keys == nullptr ||
-      params.graph_admission_victims == nullptr) return true;
-  const u32 set = hash64(key) % params.graph_admission_sets;
-  const u32 base = set * kCacheAdmissionWays;
-  for (u32 way = 0; way < kCacheAdmissionWays; ++way) {
-    if (load_cg(params.graph_admission_keys + base + way) == key) return true;
-  }
-  const u32 way = atomicAdd(params.graph_admission_victims + set, 1u) %
-    kCacheAdmissionWays;
-  atomicExch(reinterpret_cast<unsigned long long*>(
-               params.graph_admission_keys + base + way), key);
-  return false;
-}
-
-__device__ bool admit_exact_cache(const PersistentKernelParams& params, u32 key) {
-  if (params.exact_admission_sets == 0 || params.exact_admission_keys == nullptr ||
-      params.exact_admission_victims == nullptr) return true;
-  const u32 set = hash32(key) % params.exact_admission_sets;
-  const u32 base = set * kCacheAdmissionWays;
-  for (u32 way = 0; way < kCacheAdmissionWays; ++way) {
-    if (load_cg(params.exact_admission_keys + base + way) == key) return true;
-  }
-  const u32 way = atomicAdd(params.exact_admission_victims + set, 1u) %
-    kCacheAdmissionWays;
-  atomicExch(params.exact_admission_keys + base + way, key);
-  return false;
-}
-
 __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
                                           const QueryDescriptor& descriptor,
                                           const f32* query_lut,
@@ -442,13 +413,11 @@ __device__ void exactify_into_beam(const PersistentKernelParams& params,
                                    u32 candidate_count, u32* beam_handles,
                                    u32* beam_ids, f32* beam_distances,
                                    u8* beam_expanded, u32& beam_count,
-                                   u32* exact_reads, u32* exact_cache_hits,
+                                   u32* exact_reads,
                                    u32 beam_capacity, bool reset_beam,
                                    u32* merge_handles, u32* merge_ids,
                                    f32* merge_distances, u8* merge_expanded) {
-    __shared__ u32 request_cache_slots[kPersistentMaxExact];
     __shared__ u32 request_delta_slots[kPersistentMaxExact];
-    __shared__ u8 request_cache_owned[kPersistentMaxExact];
     __shared__ i32 shard_status[kPersistentMaxShards];
     const size_t request_base =
       static_cast<size_t>(descriptor.query_slot) * kPersistentMaxMergeCandidates;
@@ -459,9 +428,7 @@ __device__ void exactify_into_beam(const PersistentKernelParams& params,
     for (u32 index = threadIdx.x; index < candidate_count; index += blockDim.x) {
       request_shards[index] = UINT32_MAX;
       request_offsets[index] = 0;
-      request_cache_slots[index] = UINT32_MAX;
       request_delta_slots[index] = UINT32_MAX;
-      request_cache_owned[index] = 0;
       candidate_ids[index] = UINT32_MAX;
       candidate_distances[index] = FLT_MAX;
       const u32 handle = candidate_handles[index];
@@ -483,72 +450,10 @@ __device__ void exactify_into_beam(const PersistentKernelParams& params,
         }
       }
       request_offsets[index] = ((raw << 16) >> 16) + params.node_meta_offset;
-      u32 cache_slot = UINT32_MAX;
-      if (!dynamic && params.exact_cache_sets != 0 && params.exact_cache_ways != 0) {
-        const u32 set = hash32(handle) % params.exact_cache_sets;
-        bool cache_hit = false;
-        for (u32 way = 0; way < params.exact_cache_ways; ++way) {
-          const u32 slot = set * params.exact_cache_ways + way;
-          const u32 state = *reinterpret_cast<volatile u32*>(
-            params.exact_cache_states + slot);
-          if (state == 2 && load_cg(params.exact_cache_keys + slot) == handle) {
-            atomicAdd(params.exact_cache_readers + slot, 1u);
-            __threadfence();
-            if (*reinterpret_cast<volatile u32*>(params.exact_cache_states + slot) == 2 &&
-                load_cg(params.exact_cache_keys + slot) == handle) {
-              const u8* record = params.exact_cache +
-                static_cast<size_t>(slot) * params.exact_cache_stride;
-              if (exact_record_visible(record)) {
-                candidate_ids[index] =
-                  *reinterpret_cast<const u32*>(record + kNodeIdOffset);
-                candidate_distances[index] = exact_storage_distance(
-                  params, query, record + kNodeVectorOffset);
-                atomicAdd(exact_cache_hits, 1u);
-                cache_hit = true;
-              }
-            }
-            atomicSub(params.exact_cache_readers + slot, 1u);
-            if (cache_hit) break;
-          }
-        }
-        if (cache_hit) continue;
-        if (cache_slot == UINT32_MAX && admit_exact_cache(params, handle)) {
-          const u32 start_way = atomicAdd(params.exact_cache_victims + set, 1u) %
-            params.exact_cache_ways;
-          for (u32 attempt = 0; attempt < params.exact_cache_ways; ++attempt) {
-            const u32 slot = set * params.exact_cache_ways +
-              (start_way + attempt) % params.exact_cache_ways;
-            const u32 state = *reinterpret_cast<volatile u32*>(
-              params.exact_cache_states + slot);
-            if (state == 1 ||
-                atomicCAS(params.exact_cache_states + slot, state, 1u) != state) {
-              continue;
-            }
-            u32 wait = 0;
-            while (*reinterpret_cast<volatile u32*>(params.exact_cache_readers + slot) != 0 &&
-                   *reinterpret_cast<volatile u32*>(params.stop) == 0 &&
-                   wait++ < kCacheWaitRounds) {
-              device_ring_relax(128);
-            }
-            if (*reinterpret_cast<volatile u32*>(params.exact_cache_readers + slot) != 0) {
-              atomicCAS(params.exact_cache_states + slot, 1u, state);
-              continue;
-            }
-            params.exact_cache_keys[slot] = handle;
-            __threadfence();
-            cache_slot = slot;
-            request_cache_owned[index] = 1;
-            break;
-          }
-        }
-      }
-      request_cache_slots[index] = cache_slot;
       request_shards[index] = shard;
-      const u8* destination = cache_slot != UINT32_MAX
-        ? params.exact_cache + static_cast<size_t>(cache_slot) * params.exact_cache_stride
-        : params.exact_records +
-            (static_cast<size_t>(descriptor.query_slot) * params.exact_width + index) *
-              params.node_record_bytes;
+      const u8* destination = params.exact_records +
+        (static_cast<size_t>(descriptor.query_slot) * params.exact_width + index) *
+          params.node_record_bytes;
       request_local_iova_offsets[index] =
         reinterpret_cast<u64>(destination) - params.direct_local_iova_base;
     }
@@ -591,21 +496,13 @@ __device__ void exactify_into_beam(const PersistentKernelParams& params,
         continue;
       }
       const u32 shard = request_shards[index];
-      const u32 cache_slot = request_cache_slots[index];
-      const bool cache_owned = request_cache_owned[index] != 0;
       if (shard != UINT32_MAX && shard_status[shard] != 0) {
-        if (cache_owned) {
-          __threadfence();
-          atomicExch(params.exact_cache_states + cache_slot, 0u);
-        }
         continue;
       }
-      if (shard == UINT32_MAX && cache_slot == UINT32_MAX) continue;
-      const u8* record = cache_slot != UINT32_MAX
-        ? params.exact_cache + static_cast<size_t>(cache_slot) * params.exact_cache_stride
-        : params.exact_records +
-            (static_cast<size_t>(descriptor.query_slot) * params.exact_width + index) *
-              params.node_record_bytes;
+      if (shard == UINT32_MAX) continue;
+      const u8* record = params.exact_records +
+        (static_cast<size_t>(descriptor.query_slot) * params.exact_width + index) *
+          params.node_record_bytes;
       if (exact_record_visible(record)) {
         candidate_ids[index] =
           *reinterpret_cast<const u32*>(record + kNodeIdOffset);
@@ -613,10 +510,6 @@ __device__ void exactify_into_beam(const PersistentKernelParams& params,
           params, query, record + kNodeVectorOffset);
       }
       if (shard != UINT32_MAX) atomicAdd(exact_reads, 1u);
-      if (cache_owned) {
-        __threadfence();
-        atomicExch(params.exact_cache_states + cache_slot, 2u);
-      }
     }
   __syncthreads();
   const u32 existing_count = reset_beam ? 0 : beam_count;
@@ -681,13 +574,11 @@ __device__ bool prepare_graph_record(const PersistentKernelParams& params,
                                      u32& request_shard,
                                      u64& request_offset,
                                      u64& request_local_iova,
-                                     bool& cache_hit,
                                      bool& route_hit) {
   acquired_slot = UINT32_MAX;
   request_shard = UINT32_MAX;
   request_offset = 0;
   request_local_iova = 0;
-  cache_hit = false;
   route_hit = false;
   u64 raw = 0;
   u64 graph_offset = 0;
@@ -697,10 +588,10 @@ __device__ bool prepare_graph_record(const PersistentKernelParams& params,
   const u32 route_slot = anchor_graph_slot(params, graph_key);
   if (route_slot != UINT32_MAX && params.anchor_graph_states != nullptr &&
       params.anchor_graph_readers != nullptr &&
-      load_cg(params.anchor_graph_states + route_slot) == kGraphCacheReady) {
+      load_cg(params.anchor_graph_states + route_slot) == kAnchorGraphReady) {
     atomicAdd(params.anchor_graph_readers + route_slot, 1u);
     __threadfence();
-    if (load_cg(params.anchor_graph_states + route_slot) == kGraphCacheReady &&
+    if (load_cg(params.anchor_graph_states + route_slot) == kAnchorGraphReady &&
         load_cg(params.anchor_graph_keys + route_slot) == graph_key) {
       acquired_slot = kGraphRouteBit | route_slot;
       route_hit = true;
@@ -708,112 +599,13 @@ __device__ bool prepare_graph_record(const PersistentKernelParams& params,
     }
     atomicSub(params.anchor_graph_readers + route_slot, 1u);
   }
-  const u64 generation = load_cg(params.graph_cache_generation);
-  const u32 set = params.graph_cache_sets == 0
-    ? 0 : hash64(graph_key) % params.graph_cache_sets;
-  const u32 way_count = params.graph_cache_ways;
-
-  bool contended = false;
-  for (u32 lookup_round = 0;
-       lookup_round < 2 && params.graph_cache_sets != 0 && way_count != 0;
-       ++lookup_round) {
-    bool retry_lookup = false;
-    for (u32 way = 0; way < way_count; ++way) {
-      const u32 slot = set * way_count + way;
-      const u32 state = *reinterpret_cast<volatile u32*>(params.graph_cache_states + slot);
-      if (state == kGraphCacheReady &&
-          load_cg(params.graph_cache_keys + slot) == graph_key &&
-          load_cg(params.graph_cache_generations + slot) == generation) {
-        atomicAdd(params.graph_cache_readers + slot, 1u);
-        __threadfence();
-        const u64 timestamp = load_cg(params.graph_cache_timestamps + slot);
-        const u64 now = global_time_ns();
-        if (*reinterpret_cast<volatile u32*>(params.graph_cache_states + slot) ==
-              kGraphCacheReady &&
-            load_cg(params.graph_cache_keys + slot) == graph_key &&
-            load_cg(params.graph_cache_generations + slot) == generation &&
-            (params.graph_cache_ttl_ns == 0 || now - timestamp <= params.graph_cache_ttl_ns)) {
-          acquired_slot = slot;
-          cache_hit = true;
-          return true;
-        }
-        atomicSub(params.graph_cache_readers + slot, 1u);
-      }
-      if ((state == kGraphCacheFilling || state == kGraphCacheFillInvalidated) &&
-          load_cg(params.graph_cache_keys + slot) == graph_key &&
-          load_cg(params.graph_cache_generations + slot) == generation) {
-        u32 wait = 0;
-        for (; wait < kCacheWaitRounds; ++wait) {
-          const u32 current = *reinterpret_cast<volatile u32*>(
-            params.graph_cache_states + slot);
-          if ((current != kGraphCacheFilling &&
-               current != kGraphCacheFillInvalidated) ||
-              *reinterpret_cast<volatile u32*>(params.stop) != 0) break;
-          device_ring_relax(128);
-        }
-        const u32 current = *reinterpret_cast<volatile u32*>(
-          params.graph_cache_states + slot);
-        retry_lookup = current != kGraphCacheFilling &&
-          current != kGraphCacheFillInvalidated;
-        contended = !retry_lookup;
-        break;
-      }
-    }
-    if (retry_lookup) continue;
-    break;
-  }
-
-  if (!contended && params.graph_cache_sets != 0 && way_count != 0 &&
-      admit_graph_cache(params, graph_key)) {
-    const u32 start_way = atomicAdd(params.graph_cache_victims + set, 1u) % way_count;
-    for (u32 attempt = 0; attempt < way_count; ++attempt) {
-      const u32 slot = set * way_count + (start_way + attempt) % way_count;
-      u32 state = *reinterpret_cast<volatile u32*>(params.graph_cache_states + slot);
-      if (state == kGraphCacheFilling || state == kGraphCacheFillInvalidated ||
-          atomicCAS(params.graph_cache_states + slot, state,
-                    kGraphCacheFilling) != state) continue;
-      u32 wait = 0;
-      while (*reinterpret_cast<volatile u32*>(params.graph_cache_readers + slot) != 0 &&
-             *reinterpret_cast<volatile u32*>(params.stop) == 0 &&
-             wait++ < kCacheWaitRounds) {
-        device_ring_relax(128);
-      }
-      if (*reinterpret_cast<volatile u32*>(params.stop) != 0) {
-        atomicExch(params.graph_cache_states + slot, kGraphCacheEmpty);
-        return false;
-      }
-      if (*reinterpret_cast<volatile u32*>(params.graph_cache_readers + slot) != 0) {
-        const u32 current = *reinterpret_cast<volatile u32*>(
-          params.graph_cache_states + slot);
-        if (current == kGraphCacheFilling) {
-          atomicCAS(params.graph_cache_states + slot, kGraphCacheFilling, state);
-        } else if (current == kGraphCacheFillInvalidated) {
-          atomicCAS(params.graph_cache_states + slot,
-                    kGraphCacheFillInvalidated, kGraphCacheStale);
-        }
-        continue;
-      }
-      params.graph_cache_keys[slot] = graph_key;
-      params.graph_cache_generations[slot] = generation;
-      __threadfence();
-      u8* destination = params.graph_cache +
-        static_cast<size_t>(slot) * kPersistentGraphCacheLineBytes;
-      acquired_slot = slot;
-      request_shard = shard;
-      request_offset = graph_offset;
-      request_local_iova = reinterpret_cast<u64>(destination) -
-        params.direct_local_iova_base;
-      return true;
-    }
-  }
-
   if (*reinterpret_cast<volatile u32*>(params.stop) != 0 ||
       params.graph_scratch == nullptr || request_index >= kPersistentMaxPrefetch) {
     return false;
   }
   u8* destination = params.graph_scratch +
     (static_cast<size_t>(query_slot) * kPersistentMaxPrefetch + request_index) *
-      kPersistentGraphCacheLineBytes;
+      kPersistentGraphReadBytes;
   acquired_slot = kGraphScratchBit | request_index;
   request_shard = shard;
   request_offset = graph_offset;
@@ -833,10 +625,9 @@ __device__ u8* graph_record_pointer(const PersistentKernelParams& params,
     const u32 request_index = acquired_slot & kGraphSlotMask;
     return params.graph_scratch +
       (static_cast<size_t>(query_slot) * kPersistentMaxPrefetch + request_index) *
-        kPersistentGraphCacheLineBytes;
+        kPersistentGraphReadBytes;
   }
-  return params.graph_cache +
-    static_cast<size_t>(acquired_slot) * kPersistentGraphCacheLineBytes;
+  return nullptr;
 }
 
 __device__ bool fetch_graph_records_batch(
@@ -846,11 +637,12 @@ __device__ bool fetch_graph_records_batch(
     u32 count,
     u32* acquired_slots,
     u32* remote_reads,
-    u32* cache_hits,
     u32* route_hits,
-    u32* remote_batches) {
+    u32* remote_batches,
+    u32* graph_read_retries) {
   __shared__ i32 shard_status[kPersistentMaxShards];
   __shared__ u32 failed;
+  __shared__ u32 retry_pending;
   const size_t request_base =
     static_cast<size_t>(descriptor.query_slot) * kPersistentMaxMergeCandidates;
   u32* request_shards = params.dynamic_code_request_shards + request_base;
@@ -865,7 +657,6 @@ __device__ bool fetch_graph_records_batch(
     request_offsets[index] = 0;
     request_local_iovas[index] = 0;
     remote_reads[index] = 0;
-    cache_hits[index] = 0;
     route_hits[index] = 0;
   }
   for (u32 shard = threadIdx.x; shard < params.num_shards; shard += blockDim.x) {
@@ -879,18 +670,14 @@ __device__ bool fetch_graph_records_batch(
   const u32 warp_count = max(1u, blockDim.x / warp_width);
   if (lane_in_warp == 0) {
     for (u32 index = warp; index < count; index += warp_count) {
-      bool cache_hit = false;
       bool route_hit = false;
       if (!prepare_graph_record(params, handles[index], descriptor.query_slot,
                                 index, acquired_slots[index],
                                 request_shards[index], request_offsets[index],
-                                request_local_iovas[index], cache_hit,
-                                route_hit)) {
+                                request_local_iovas[index], route_hit)) {
         atomicExch(&failed, 1u);
       } else if (route_hit) {
         route_hits[index] = 1;
-      } else if (cache_hit) {
-        cache_hits[index] = 1;
       } else {
         remote_reads[index] = 1;
       }
@@ -903,12 +690,6 @@ __device__ bool fetch_graph_records_batch(
       if (slot == UINT32_MAX) continue;
       if ((slot & kGraphRouteBit) != 0) {
         release_graph_record(params, slot);
-      } else if ((slot & kGraphScratchBit) != 0) {
-        acquired_slots[index] = UINT32_MAX;
-      } else if (cache_hits[index] != 0) {
-        release_graph_record(params, slot);
-      } else {
-        atomicExch(params.graph_cache_states + slot, kGraphCacheEmpty);
       }
       acquired_slots[index] = UINT32_MAX;
     }
@@ -916,61 +697,88 @@ __device__ bool fetch_graph_records_batch(
     return false;
   }
 
-  for (u32 shard = threadIdx.x; shard < params.num_shards; shard += blockDim.x) {
-    u32 matching = 0;
-    for (u32 index = 0; index < count; ++index) {
-      matching += request_shards[index] == shard ? 1u : 0u;
+  // A compact graph entry is updated in-place by stage2/reverse-edge workers.
+  // Its checksum is therefore an optimistic snapshot validator: a successful
+  // RDMA completion can still overlap a legal publication and contain a torn
+  // mix of the old and new entry. Storage CPU readers already retry this same
+  // condition. Re-read only invalid entries and reserve fail-stop for a record
+  // that remains invalid after the bounded snapshot attempts.
+  constexpr u32 kGraphSnapshotAttempts = 3;
+  for (u32 attempt = 0; attempt < kGraphSnapshotAttempts; ++attempt) {
+    if (threadIdx.x == 0) retry_pending = 0;
+    for (u32 shard = threadIdx.x; shard < params.num_shards;
+         shard += blockDim.x) {
+      shard_status[shard] = 0;
     }
-    if (matching != 0) atomicAdd(remote_batches, 1u);
-    i32* owner_completion = params.direct_batch_statuses == nullptr ? nullptr :
-      params.direct_batch_statuses +
-        static_cast<size_t>(descriptor.query_slot) * params.num_shards + shard;
-    shard_status[shard] = direct_fetch_batch(
-        params, shard, request_shards, request_offsets, count,
-        params.graph_cache, kPersistentGraphCacheLineBytes,
-        params.graph_entry_bytes,
-        (descriptor.query_slot + shard) % params.direct_qps_per_node,
-        request_local_iovas, owner_completion, true);
-  }
-  __syncthreads();
-  for (u32 shard = threadIdx.x; shard < params.num_shards; shard += blockDim.x) {
-    if (shard_status[shard] != -EINPROGRESS) continue;
-    i32* owner_completion = params.direct_batch_statuses +
-      static_cast<size_t>(descriptor.query_slot) * params.num_shards + shard;
-    shard_status[shard] = wait_direct_batch(params, owner_completion);
-  }
-  __syncthreads();
+    __syncthreads();
 
-  for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
-    const u32 shard = request_shards[index];
-    if (shard == UINT32_MAX) continue;
-    const u32 slot = acquired_slots[index];
-    const bool scratch = (slot & kGraphScratchBit) != 0;
-    u8* record = graph_record_pointer(params, descriptor.query_slot, slot);
-    const bool ready = shard_status[shard] == 0 && valid_graph_record(params, record);
-    if (ready && !scratch) {
-      params.graph_cache_timestamps[slot] = global_time_ns();
-      params.graph_cache_readers[slot] = 1;
-      __threadfence();
-      const u32 state = atomicCAS(params.graph_cache_states + slot,
-                                  kGraphCacheFilling, kGraphCacheReady);
-      if (state == kGraphCacheFillInvalidated) {
-        atomicCAS(params.graph_cache_states + slot,
-                  kGraphCacheFillInvalidated, kGraphCacheStale);
-      } else if (state != kGraphCacheFilling) {
-        atomicExch(&failed, 1u);
+    for (u32 shard = threadIdx.x; shard < params.num_shards;
+         shard += blockDim.x) {
+      u32 matching = 0;
+      for (u32 index = 0; index < count; ++index) {
+        matching += request_shards[index] == shard ? 1u : 0u;
       }
-    } else if (!ready) {
-      __threadfence();
-      if (!scratch) atomicExch(params.graph_cache_states + slot, kGraphCacheEmpty);
+      if (matching != 0) {
+        atomicAdd(remote_batches, 1u);
+        if (attempt != 0 && graph_read_retries != nullptr) {
+          atomicAdd(graph_read_retries, matching);
+        }
+      }
+      i32* owner_completion = params.direct_batch_statuses == nullptr ? nullptr :
+        params.direct_batch_statuses +
+          static_cast<size_t>(descriptor.query_slot) * params.num_shards + shard;
+      shard_status[shard] = direct_fetch_batch(
+          params, shard, request_shards, request_offsets, count,
+          params.graph_scratch, kPersistentGraphReadBytes,
+          params.graph_entry_bytes,
+          (descriptor.query_slot + shard) % params.direct_qps_per_node,
+          request_local_iovas, owner_completion, true);
+    }
+    __syncthreads();
+    for (u32 shard = threadIdx.x; shard < params.num_shards;
+         shard += blockDim.x) {
+      if (shard_status[shard] != -EINPROGRESS) continue;
+      i32* owner_completion = params.direct_batch_statuses +
+        static_cast<size_t>(descriptor.query_slot) * params.num_shards + shard;
+      shard_status[shard] = wait_direct_batch(params, owner_completion);
+    }
+    __syncthreads();
+
+    for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
+      const u32 shard = request_shards[index];
+      if (shard == UINT32_MAX) continue;
+      const u32 slot = acquired_slots[index];
+      u8* record = graph_record_pointer(params, descriptor.query_slot, slot);
+      const i32 status = shard_status[shard];
+      const bool valid = status == 0 && valid_graph_record(params, record);
+      if (valid) {
+        // UINT32_MAX removes this entry from subsequent per-shard retry
+        // batches while leaving acquired_slots intact for traversal.
+        request_shards[index] = UINT32_MAX;
+        continue;
+      }
+
+      if (status == 0 && attempt + 1 < kGraphSnapshotAttempts) {
+        atomicAdd(&retry_pending, 1u);
+        continue;
+      }
+
       acquired_slots[index] = UINT32_MAX;
+      request_shards[index] = UINT32_MAX;
       atomicExch(&failed, 1u);
-      if (shard_status[shard] == 0) {
-        if (params.direct_error != nullptr) atomicCAS(params.direct_error, 0, -EBADMSG);
+      if (status == 0) {
+        if (params.direct_error != nullptr) {
+          atomicCAS(params.direct_error, 0, -EBADMSG);
+        }
         atomicExch(params.direct_disabled, 1u);
       }
     }
+    __syncthreads();
+    if (retry_pending == 0) break;
+    if (threadIdx.x == 0) device_ring_relax(128);
+    __syncthreads();
   }
+
   for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
     if (route_hits[index] == 0) continue;
     const u32 slot = acquired_slots[index];

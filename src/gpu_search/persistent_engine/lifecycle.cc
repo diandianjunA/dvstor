@@ -422,24 +422,9 @@ PersistentSearchEngine::Impl::~Impl() {
   device_free(d_delta_encode_scratch);
   device_free(d_delta_vectors);
   device_free(d_delta_records);
-  device_free(d_graph_cache_generation);
   device_free(d_anchor_graph_readers);
   device_free(d_anchor_graph_states);
   device_free(d_anchor_graph_keys);
-  device_free(d_graph_admission_victims);
-  device_free(d_graph_admission_keys);
-  device_free(d_graph_cache_victims);
-  device_free(d_graph_cache_states);
-  device_free(d_graph_cache_readers);
-  device_free(d_graph_cache_timestamps);
-  device_free(d_graph_cache_generations);
-  device_free(d_graph_cache_keys);
-  device_free(d_exact_cache_victims);
-  device_free(d_exact_admission_victims);
-  device_free(d_exact_admission_keys);
-  device_free(d_exact_cache_readers);
-  device_free(d_exact_cache_states);
-  device_free(d_exact_cache_keys);
   control_bootstrapper.reset();
   if (owns_remote_buffer) device_free(d_remote_buffer);
 #ifdef DVSTOR_HAVE_GPUNETIO

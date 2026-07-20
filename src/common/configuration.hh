@@ -41,14 +41,9 @@ public:
   u32 gpu_memory_limit_gb{40};
   u32 gpu_memory_reserve_gb{4};
   u32 gpu_resident_pq_budget_mb{4096};
-  u32 gpu_adjacency_cache_mb{0};
-  u32 gpu_adjacency_cache_ways{4};
-  u32 gpu_exact_cache_mb{0};
-  u32 gpu_exact_cache_ways{4};
   u32 gpu_bootstrap_window_mb{64};
   u32 gpu_bootstrap_windows{2};
   u32 gpu_graph_prefetch_depth{32};
-  u32 gpu_graph_cache_ttl_us{5000};
   u32 gpu_traversal_beam_width{128};
   u32 gpu_final_rerank_width{64};
   u32 gpu_max_expansions{384};
@@ -159,18 +154,6 @@ private:
        po::value<u32>(&gpu_resident_pq_budget_mb)
          ->default_value(gpu_resident_pq_budget_mb),
        "GPU memory budget for PQ codes of durable dynamically inserted vectors.")
-      ("gpu-adjacency-cache-mb",
-       po::value<u32>(&gpu_adjacency_cache_mb)->default_value(gpu_adjacency_cache_mb),
-       "GPU compact-graph cache budget.")
-      ("gpu-adjacency-cache-ways",
-       po::value<u32>(&gpu_adjacency_cache_ways)->default_value(gpu_adjacency_cache_ways),
-       "GPU compact-graph cache associativity.")
-      ("gpu-exact-cache-mb",
-       po::value<u32>(&gpu_exact_cache_mb)->default_value(gpu_exact_cache_mb),
-       "GPU exact-vector cache budget.")
-      ("gpu-exact-cache-ways",
-       po::value<u32>(&gpu_exact_cache_ways)->default_value(gpu_exact_cache_ways),
-       "GPU exact-vector cache associativity.")
       ("gpu-bootstrap-window-mb",
        po::value<u32>(&gpu_bootstrap_window_mb)->default_value(gpu_bootstrap_window_mb),
        "Maximum one-time PQ bootstrap RDMA read size.")
@@ -180,9 +163,6 @@ private:
       ("gpu-graph-prefetch-depth",
        po::value<u32>(&gpu_graph_prefetch_depth)->default_value(gpu_graph_prefetch_depth),
        "Graph records fetched concurrently by one GPU query.")
-      ("gpu-graph-cache-ttl-us",
-       po::value<u32>(&gpu_graph_cache_ttl_us)->default_value(gpu_graph_cache_ttl_us),
-       "Maximum graph-cache age; zero keeps the immutable base-graph snapshot resident.")
       ("gpu-traversal-beam-width",
        po::value<u32>(&gpu_traversal_beam_width)->default_value(gpu_traversal_beam_width),
        "OPQ/PQ beam width for GPU graph navigation.")
@@ -300,8 +280,6 @@ private:
         gpu_memory_limit_gb == 0 ||
         gpu_memory_reserve_gb >= gpu_memory_limit_gb ||
         gpu_resident_pq_budget_mb == 0 ||
-        gpu_adjacency_cache_ways != 4 ||
-        gpu_exact_cache_ways != 4 ||
         gpu_bootstrap_window_mb == 0 || gpu_bootstrap_windows == 0 ||
         gpu_bootstrap_windows > 16 ||
         gpu_graph_prefetch_depth == 0 ||
@@ -402,12 +380,6 @@ public:
              << config.gpu_memory_reserve_gb << '\n';
       output << std::setw(width) << "GPU resident dynamic PQ MiB: "
              << config.gpu_resident_pq_budget_mb << '\n';
-      output << std::setw(width) << "GPU graph cache MiB/ways: "
-             << config.gpu_adjacency_cache_mb << "/"
-             << config.gpu_adjacency_cache_ways << '\n';
-      output << std::setw(width) << "GPU exact cache MiB/ways: "
-             << config.gpu_exact_cache_mb << "/"
-             << config.gpu_exact_cache_ways << '\n';
       output << std::setw(width) << "GPU traversal/rerank width: "
              << config.gpu_traversal_beam_width << "/"
              << config.gpu_final_rerank_width << '\n';

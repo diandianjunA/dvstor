@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
-#include <limits>
-
 #include "gpu_search/persistent_kernel.hh"
 
 namespace gpu_search::memory_budget {
@@ -13,8 +11,6 @@ struct Request {
   u64 nodes{};
   u64 max_delta_vectors{};
   u64 usable_bytes{};
-  u64 requested_cache_bytes{};
-  u64 requested_exact_cache_bytes{};
   u64 delta_budget_bytes{};
   u32 dim{};
   u32 pq_subquantizers{};
@@ -28,8 +24,6 @@ struct Request {
   u32 anchor_count{};
   u32 shard_count{};
   u32 entry_point_count{};
-  u32 cache_ways{4};
-  u32 exact_cache_ways{4};
 };
 
 struct Result {
@@ -41,19 +35,10 @@ struct Result {
   u64 metadata_bytes{};
   u64 permanent_override_bytes{};
   u64 fixed_bytes{};
-  u64 cache_total_bytes{};
-  u64 cache_payload_bytes{};
-  u64 exact_cache_total_bytes{};
-  u64 exact_cache_payload_bytes{};
   u64 explicit_bytes{};
   u32 delta_capacity{};
   u32 delta_table_capacity{};
   u32 visited_capacity{};
-  u32 cache_sets{};
-  u32 cache_slots{};
-  u32 exact_cache_sets{};
-  u32 exact_cache_slots{};
-  u32 exact_cache_stride{};
   bool fits{};
 };
 
@@ -118,8 +103,7 @@ inline Result estimate(const Request& request) {
       request.dim % request.pq_subquantizers != 0 ||
       request.query_slots == 0 || request.beam_width == 0 ||
       request.graph_degree == 0 || request.exact_width == 0 ||
-      request.exact_record_bytes == 0 || request.cache_ways == 0 ||
-      request.exact_cache_ways == 0) {
+      request.exact_record_bytes == 0) {
     return result;
   }
   result.delta_capacity = choose_delta_capacity(
@@ -155,55 +139,7 @@ inline Result estimate(const Request& request) {
   result.fixed_bytes = result.code_bytes + result.delta_bytes +
     result.query_workspace_bytes + result.exact_bytes + result.metadata_bytes +
     result.permanent_override_bytes;
-  if (result.fixed_bytes >= request.usable_bytes) return result;
-
-  result.exact_cache_stride = static_cast<u32>(
-    (static_cast<u64>(request.exact_record_bytes) + 15) & ~15ull);
-  const u64 bytes_per_set = static_cast<u64>(request.cache_ways) *
-      (kPersistentGraphCacheLineBytes + 3 * sizeof(u64) + 2 * sizeof(u32)) +
-    sizeof(u32);
-  const u64 exact_bytes_per_set = static_cast<u64>(request.exact_cache_ways) *
-      (result.exact_cache_stride + 3 * sizeof(u32)) + sizeof(u32);
-  const u64 minimum_cache_bytes = request.requested_cache_bytes == 0
-    ? 0 : static_cast<u64>(request.query_slots) * bytes_per_set;
-  const u64 minimum_exact_cache_bytes = request.requested_exact_cache_bytes == 0
-    ? 0 : static_cast<u64>(request.query_slots) * exact_bytes_per_set;
-  u64 available_cache_bytes = request.usable_bytes - result.fixed_bytes;
-  if (available_cache_bytes < minimum_cache_bytes + minimum_exact_cache_bytes) {
-    return result;
-  }
-
-  const u64 cache_budget = std::min(
-    request.requested_cache_bytes,
-    available_cache_bytes - minimum_exact_cache_bytes);
-  const u64 max_cache_sets = std::numeric_limits<u32>::max() / request.cache_ways;
-  result.cache_sets = static_cast<u32>(std::min<u64>(
-    cache_budget / bytes_per_set, max_cache_sets));
-  if (request.requested_cache_bytes != 0) {
-    if (result.cache_sets < request.query_slots) return result;
-    result.cache_slots = result.cache_sets * request.cache_ways;
-    result.cache_total_bytes = static_cast<u64>(result.cache_sets) * bytes_per_set;
-    result.cache_payload_bytes = static_cast<u64>(result.cache_slots) *
-      kPersistentGraphCacheLineBytes;
-  }
-  available_cache_bytes -= result.cache_total_bytes;
-
-  const u64 exact_cache_budget = std::min(
-    request.requested_exact_cache_bytes, available_cache_bytes);
-  const u64 max_exact_sets = std::numeric_limits<u32>::max() /
-    request.exact_cache_ways;
-  result.exact_cache_sets = static_cast<u32>(std::min<u64>(
-    exact_cache_budget / exact_bytes_per_set, max_exact_sets));
-  if (request.requested_exact_cache_bytes != 0) {
-    if (result.exact_cache_sets < request.query_slots) return result;
-    result.exact_cache_slots = result.exact_cache_sets * request.exact_cache_ways;
-    result.exact_cache_payload_bytes = static_cast<u64>(result.exact_cache_slots) *
-      result.exact_cache_stride;
-    result.exact_cache_total_bytes = static_cast<u64>(result.exact_cache_sets) *
-      exact_bytes_per_set;
-  }
-  result.explicit_bytes = result.fixed_bytes + result.cache_total_bytes +
-    result.exact_cache_total_bytes;
+  result.explicit_bytes = result.fixed_bytes;
   result.fits = result.explicit_bytes <= request.usable_bytes;
   return result;
 }

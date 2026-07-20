@@ -9,6 +9,7 @@
 #include <doca_dev.h>
 #include <doca_error.h>
 #include <doca_gpunetio.h>
+#include <doca_log.h>
 #include <doca_umem.h>
 #include <doca_verbs.h>
 #include <doca_verbs_bridge.h>
@@ -92,6 +93,11 @@ doca_devinfo* find_device(ProbeResources& resources, const std::string& requeste
 }  // namespace
 
 int main(int argc, char** argv) {
+  doca_log_backend* sdk_log_backend = nullptr;
+  (void)doca_log_backend_create_with_file_sdk(stderr, &sdk_log_backend);
+  if (sdk_log_backend != nullptr) {
+    (void)doca_log_backend_set_sdk_level(sdk_log_backend, DOCA_LOG_LEVEL_TRACE);
+  }
   try {
     const int gpu_index = argc > 1 ? std::stoi(argv[1]) : 0;
     const std::string requested_ibdev = argc > 2 ? argv[2] : "";
@@ -144,19 +150,13 @@ int main(int argc, char** argv) {
     check_doca("doca_gpu_mem_alloc",
                doca_gpu_mem_alloc(resources.gpu, allocation_bytes, 64 * 1024,
                                   DOCA_GPU_MEM_TYPE_GPU, &resources.gpu_memory, nullptr));
+    std::cout << "  doca_gpu_mem_alloc: passed" << std::endl;
     if (registration_mode == "dmabuf") {
       check_doca("doca_gpu_dmabuf_fd",
                  doca_gpu_dmabuf_fd(resources.gpu, resources.gpu_memory,
                                     allocation_bytes, &resources.dmabuf_fd));
+      std::cout << "  doca_gpu_dmabuf_fd: passed" << std::endl;
     }
-    check_doca("doca_umem_gpu_create",
-               doca_umem_gpu_create(resources.gpu, resources.device,
-                                    resources.gpu_memory,
-                                    std::min<size_t>(allocation_bytes, 64 * 1024),
-                                    DOCA_ACCESS_FLAG_LOCAL_READ_WRITE,
-                                    &resources.gpu_umem));
-    check_doca("doca_umem_destroy", doca_umem_destroy(resources.gpu_umem));
-    resources.gpu_umem = nullptr;
 
     ibv_pd* verbs_pd = doca_verbs_bridge_verbs_pd_get_ibv_pd(resources.protection_domain);
     if (verbs_pd == nullptr) {
@@ -179,6 +179,67 @@ int main(int argc, char** argv) {
       }
       resources.memory_regions.push_back(memory_region);
     }
+    const size_t registered_mr_count = resources.memory_regions.size();
+    const uint32_t first_lkey = resources.memory_regions.front()->lkey;
+    std::cout << "  mlx5 GPU MR registration: passed" << std::endl;
+    for (ibv_mr* memory_region : resources.memory_regions) {
+      if (ibv_dereg_mr(memory_region) != 0) {
+        throw std::runtime_error(std::string("ibv_dereg_mr: ") + std::strerror(errno));
+      }
+    }
+    resources.memory_regions.clear();
+    std::cout << "  mlx5 GPU MR deregistration: passed" << std::endl;
+
+    if (registration_mode == "dmabuf") {
+      ibv_context* verbs_context =
+        doca_verbs_bridge_get_ibv_ctx(resources.verbs_context);
+      if (verbs_context == nullptr) {
+        throw std::runtime_error("doca_verbs_bridge_get_ibv_ctx returned null");
+      }
+      mlx5dv_devx_umem_in devx_umem_input{};
+      devx_umem_input.addr = nullptr;
+      devx_umem_input.size = std::min<size_t>(allocation_bytes, 64 * 1024);
+      devx_umem_input.access = IBV_ACCESS_LOCAL_WRITE;
+      devx_umem_input.comp_mask = MLX5DV_UMEM_MASK_DMABUF;
+      devx_umem_input.dmabuf_fd = resources.dmabuf_fd;
+      errno = 0;
+      mlx5dv_devx_umem* devx_umem =
+        mlx5dv_devx_umem_reg_ex(verbs_context, &devx_umem_input);
+      if (devx_umem == nullptr) {
+        const int saved_errno = errno;
+        std::cout << "  mlx5 DevX DMA-BUF UMEM registration: failed: errno="
+                  << saved_errno << " (" << std::strerror(saved_errno) << ')'
+                  << std::endl;
+      } else {
+        std::cout << "  mlx5 DevX DMA-BUF UMEM registration: passed" << std::endl;
+        if (mlx5dv_devx_umem_dereg(devx_umem) != 0) {
+          throw std::runtime_error(std::string("mlx5dv_devx_umem_dereg: ") +
+                                   std::strerror(errno));
+        }
+        std::cout << "  mlx5 DevX DMA-BUF UMEM deregistration: passed" << std::endl;
+      }
+    }
+
+    // Some DOCA failure paths populate the output pointer before reporting an
+    // error. Keep that partial handle out of ProbeResources so stack unwinding
+    // does not call doca_umem_destroy() on an invalid object and hide the
+    // original registration error with a segmentation fault.
+    doca_umem* created_gpu_umem = nullptr;
+    check_doca("doca_umem_gpu_create",
+               doca_umem_gpu_create(resources.gpu, resources.device,
+                                    resources.gpu_memory,
+                                    std::min<size_t>(allocation_bytes, 64 * 1024),
+                                    DOCA_ACCESS_FLAG_LOCAL_READ_WRITE,
+                                    &created_gpu_umem));
+    resources.gpu_umem = created_gpu_umem;
+    std::cout << "  doca_umem_gpu_create: passed" << std::endl;
+
+    // Relinquish ownership before destruction so an error return cannot cause
+    // the resource destructor to attempt a second destroy during unwinding.
+    created_gpu_umem = resources.gpu_umem;
+    resources.gpu_umem = nullptr;
+    check_doca("doca_umem_destroy", doca_umem_destroy(created_gpu_umem));
+    std::cout << "  doca_umem_destroy: passed" << std::endl;
 
     std::cout << "GPUNetIO probe passed\n"
               << "  GPU: " << gpu_index << " (" << gpu_bus_id << ")\n"
@@ -190,8 +251,8 @@ int main(int argc, char** argv) {
               << "  registration mode: " << registration_mode << '\n'
               << "  registered bytes: " << allocation_bytes << '\n'
               << "  registration chunk bytes: " << registration_bytes << '\n'
-              << "  memory regions: " << resources.memory_regions.size() << '\n'
-              << "  first local mkey: " << resources.memory_regions.front()->lkey << '\n';
+              << "  memory regions: " << registered_mr_count << '\n'
+              << "  first local mkey: " << first_lkey << '\n';
     return EXIT_SUCCESS;
   } catch (const std::exception& error) {
     std::cerr << "GPUNetIO probe failed: " << error.what() << '\n';

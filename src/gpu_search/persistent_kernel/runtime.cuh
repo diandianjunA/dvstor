@@ -377,40 +377,7 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
           if (route_slot != UINT32_MAX &&
               params.anchor_graph_states != nullptr) {
             atomicCAS(params.anchor_graph_states + route_slot,
-                      kGraphCacheReady, kGraphCacheStale);
-          }
-          if (params.graph_cache_sets == 0 ||
-              params.graph_cache_states == nullptr ||
-              params.graph_cache_keys == nullptr) {
-            continue;
-          }
-          const u32 set = hash64(key) % params.graph_cache_sets;
-          for (u32 way = 0; way < params.graph_cache_ways; ++way) {
-            const u32 slot = set * params.graph_cache_ways + way;
-            for (;;) {
-              const u32 state = *reinterpret_cast<volatile u32*>(
-                params.graph_cache_states + slot);
-              if (load_cg(params.graph_cache_keys + slot) != key ||
-                  state == kGraphCacheEmpty || state == kGraphCacheStale ||
-                  state == kGraphCacheFillInvalidated) {
-                break;
-              }
-              if (state == kGraphCacheReady) {
-                if (atomicCAS(params.graph_cache_states + slot, kGraphCacheReady,
-                              kGraphCacheStale) == kGraphCacheReady) {
-                  break;
-                }
-                continue;
-              }
-              if (state == kGraphCacheFilling) {
-                if (atomicCAS(params.graph_cache_states + slot, kGraphCacheFilling,
-                              kGraphCacheFillInvalidated) == kGraphCacheFilling) {
-                  break;
-                }
-                continue;
-              }
-              break;
-            }
+                      kAnchorGraphReady, kAnchorGraphStale);
           }
         }
 

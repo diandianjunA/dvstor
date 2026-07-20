@@ -42,8 +42,6 @@ nlohmann::json telemetry_to_json(const gpu_search::TelemetrySnapshot& telemetry)
       {"gpu_memory_resident_pq_bytes", telemetry.gpu_memory_resident_pq_bytes},
       {"gpu_memory_route_graph_bytes", telemetry.gpu_memory_route_graph_bytes},
       {"gpu_memory_delta_reserved_bytes", telemetry.gpu_memory_delta_reserved_bytes},
-      {"gpu_memory_graph_cache_bytes", telemetry.gpu_memory_graph_cache_bytes},
-      {"gpu_memory_exact_cache_bytes", telemetry.gpu_memory_exact_cache_bytes},
       {"queries_submitted", telemetry.queries_submitted},
       {"queries_completed", telemetry.queries_completed},
       {"batches", telemetry.batches},
@@ -83,35 +81,24 @@ nlohmann::json telemetry_to_json(const gpu_search::TelemetrySnapshot& telemetry)
       {"rdma_merged_requests", telemetry.rdma_merged_requests},
       {"direct_path_failures", telemetry.direct_path_failures},
       {"graph_page_requests", telemetry.graph_page_requests},
+      {"graph_read_retries", telemetry.graph_read_retries},
+      {"average_graph_read_retries", telemetry.queries_completed == 0 ? 0.0
+        : static_cast<double>(telemetry.graph_read_retries) /
+            static_cast<double>(telemetry.queries_completed)},
       {"graph_dependency_rounds", telemetry.graph_dependency_rounds},
-      {"graph_page_cache_hits", telemetry.graph_page_cache_hits},
       {"graph_route_hits", telemetry.graph_route_hits},
       {"graph_route_refreshes", telemetry.graph_route_refreshes},
       {"dynamic_route_publications", telemetry.dynamic_route_publications},
       {"dynamic_route_slot_updates", telemetry.dynamic_route_slot_updates},
       {"dynamic_route_live_slots", telemetry.dynamic_route_live_slots},
       {"dynamic_route_snapshot_skips", telemetry.dynamic_route_snapshot_skips},
-      {"graph_cache_invalidations", telemetry.graph_cache_invalidations},
-      {"graph_page_cache_hit_ratio",
-        telemetry.graph_page_requests + telemetry.graph_page_cache_hits == 0 ? 0.0
-        : static_cast<double>(telemetry.graph_page_cache_hits) /
-            static_cast<double>(telemetry.graph_page_requests +
-                                telemetry.graph_page_cache_hits)},
+      {"graph_route_invalidations", telemetry.graph_route_invalidations},
       {"graph_route_hit_ratio",
-        telemetry.graph_page_requests + telemetry.graph_page_cache_hits +
-            telemetry.graph_route_hits == 0 ? 0.0
+        telemetry.graph_page_requests + telemetry.graph_route_hits == 0 ? 0.0
         : static_cast<double>(telemetry.graph_route_hits) /
             static_cast<double>(telemetry.graph_page_requests +
-                                telemetry.graph_page_cache_hits +
                                 telemetry.graph_route_hits)},
       {"exact_vector_reads", telemetry.exact_vector_reads},
-      {"exact_vector_cache_hits", telemetry.exact_vector_cache_hits},
-      {"exact_vector_cache_hit_ratio",
-       telemetry.exact_vector_reads + telemetry.exact_vector_cache_hits == 0
-         ? 0.0
-         : static_cast<double>(telemetry.exact_vector_cache_hits) /
-             static_cast<double>(telemetry.exact_vector_reads +
-                                 telemetry.exact_vector_cache_hits)},
       {"delta_queries", telemetry.delta_queries},
       {"delta_scan_records", telemetry.delta_scan_records},
       {"delta_scan_scored", telemetry.delta_scan_scored},
@@ -307,30 +294,29 @@ FormattedReport format_report(const nlohmann::json& root,
     const auto& gpu = root["gpu_persistent"];
     constexpr double bytes_per_gib = 1024.0 * 1024.0 * 1024.0;
     output << "gpu_persistent\n";
-    output << "  GPU memory explicit/base_pq/resident_pq/route/delta/graph_cache/exact_cache GiB: "
+    output << "  GPU memory explicit/base_pq/resident_pq/route/delta GiB: "
            << static_cast<double>(gpu.value("gpu_memory_explicit_bytes", 0ULL)) / bytes_per_gib << "/"
            << static_cast<double>(gpu.value("gpu_memory_base_pq_bytes", 0ULL)) / bytes_per_gib << "/"
            << static_cast<double>(gpu.value("gpu_memory_resident_pq_bytes", 0ULL)) / bytes_per_gib << "/"
            << static_cast<double>(gpu.value("gpu_memory_route_graph_bytes", 0ULL)) / bytes_per_gib << "/"
-           << static_cast<double>(gpu.value("gpu_memory_delta_reserved_bytes", 0ULL)) / bytes_per_gib << "/"
-           << static_cast<double>(gpu.value("gpu_memory_graph_cache_bytes", 0ULL)) / bytes_per_gib << "/"
-           << static_cast<double>(gpu.value("gpu_memory_exact_cache_bytes", 0ULL)) / bytes_per_gib << '\n';
+           << static_cast<double>(gpu.value("gpu_memory_delta_reserved_bytes", 0ULL)) / bytes_per_gib << '\n';
     output << "  average_batch_size: " << gpu.value("average_batch_size", 0.0) << '\n';
     output << "  average_submission_wait_us: "
            << gpu.value("average_submission_wait_us", 0.0) << '\n';
     output << "  rdma_read_bytes: " << gpu.value("rdma_read_bytes", 0ULL) << '\n';
-    output << "  graph_page_cache_hit_ratio: "
-           << gpu.value("graph_page_cache_hit_ratio", 0.0) << '\n';
     output << "  graph_route_hit_ratio/refreshes: "
            << gpu.value("graph_route_hit_ratio", 0.0) << "/"
            << gpu.value("graph_route_refreshes", 0ULL) << '\n';
+    output << "  graph snapshot reread records total/per_query: "
+           << gpu.value("graph_read_retries", 0ULL) << "/"
+           << gpu.value("average_graph_read_retries", 0.0) << '\n';
     output << "  dynamic route publications/slot_updates/live/snapshot_skips: "
            << gpu.value("dynamic_route_publications", 0ULL) << "/"
            << gpu.value("dynamic_route_slot_updates", 0ULL) << "/"
            << gpu.value("dynamic_route_live_slots", 0ULL) << "/"
            << gpu.value("dynamic_route_snapshot_skips", 0ULL) << '\n';
-    output << "  graph_cache_invalidations: "
-           << gpu.value("graph_cache_invalidations", 0ULL) << '\n';
+    output << "  graph_route_invalidations: "
+           << gpu.value("graph_route_invalidations", 0ULL) << '\n';
     output << "  GPU query/prepare/graph/score/beam/exact/delta_scan us: "
            << gpu.value("average_gpu_query_us", 0.0) << "/"
            << gpu.value("average_gpu_prepare_us", 0.0) << "/"

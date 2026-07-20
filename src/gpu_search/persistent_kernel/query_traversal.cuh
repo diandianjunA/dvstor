@@ -3,7 +3,7 @@
 #include "gpu_search/delta_scan_budget.hh"
 #include "gpu_search/dynamic_route_consistency.hh"
 #include "gpu_search/initial_seed_budget.hh"
-#include "gpu_search/persistent_kernel/rdma_cache.cuh"
+#include "gpu_search/persistent_kernel/rdma_read.cuh"
 
 #include <cuda/atomic>
 
@@ -369,7 +369,6 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ f32 rerank_distances[kPersistentMaxExact];
   __shared__ u32 rerank_count;
   __shared__ u32 total_exact_reads;
-  __shared__ u32 total_exact_cache_hits;
   __shared__ u32 seed_count;
   __shared__ u32 dynamic_seed_count;
   __shared__ u32 selected_anchor_count;
@@ -551,7 +550,6 @@ __device__ void process_query(const PersistentKernelParams& params,
     beam_count = unique_count;
     rerank_count = 0;
     total_exact_reads = 0;
-    total_exact_cache_hits = 0;
     for (u32 index = 0; index < beam_count; ++index) {
       beam_handles[index] = merge_handles[index];
       beam_ids[index] = UINT32_MAX;
@@ -577,20 +575,19 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ u32 neighbor_offsets[kPersistentMaxPrefetch + 1];
   __shared__ u32 flattened_neighbors;
   __shared__ u32 remote_reads_by_lane[kPersistentMaxPrefetch];
-  __shared__ u32 cache_hits_by_lane[kPersistentMaxPrefetch];
   __shared__ u32 route_hits_by_lane[kPersistentMaxPrefetch];
-  __shared__ u32 graph_cache_slots[kPersistentMaxPrefetch];
+  __shared__ u32 graph_record_slots[kPersistentMaxPrefetch];
   __shared__ u32 total_remote_reads;
   __shared__ u32 total_remote_batches;
+  __shared__ u32 total_graph_read_retries;
   __shared__ u32 total_graph_rounds;
-  __shared__ u32 total_cache_hits;
   __shared__ u32 total_route_hits;
   __shared__ u32 graph_failed;
   if (threadIdx.x == 0) {
     total_remote_reads = 0;
     total_remote_batches = 0;
+    total_graph_read_retries = 0;
     total_graph_rounds = 0;
-    total_cache_hits = 0;
     total_route_hits = 0;
     graph_failed = 0;
   }
@@ -625,9 +622,8 @@ __device__ void process_query(const PersistentKernelParams& params,
     const u32 lane_in_warp = threadIdx.x % warp_width;
     if (!fetch_graph_records_batch(
           params, descriptor, selected_handles, selected_count,
-          graph_cache_slots, remote_reads_by_lane, cache_hits_by_lane,
-          route_hits_by_lane,
-          &total_remote_batches)) {
+          graph_record_slots, remote_reads_by_lane, route_hits_by_lane,
+          &total_remote_batches, &total_graph_read_retries)) {
       if (threadIdx.x == 0) graph_failed = 1;
     }
     __syncthreads();
@@ -635,7 +631,6 @@ __device__ void process_query(const PersistentKernelParams& params,
       graph_phase_cycles += clock64() - phase_started_cycles;
       for (u32 selected = 0; selected < selected_count; ++selected) {
         total_remote_reads += remote_reads_by_lane[selected];
-        total_cache_hits += cache_hits_by_lane[selected];
         total_route_hits += route_hits_by_lane[selected];
       }
     }
@@ -643,13 +638,13 @@ __device__ void process_query(const PersistentKernelParams& params,
     if (graph_failed != 0) {
       for (u32 selected = warp; selected < selected_count;
            selected += blockDim.x / warp_width) {
-        const u32 slot = graph_cache_slots[selected];
+        const u32 slot = graph_record_slots[selected];
         if (lane_in_warp == 0 && slot != UINT32_MAX &&
             (slot & kGraphScratchBit) == 0) {
           __threadfence();
           release_graph_record(params, slot);
         }
-        if (lane_in_warp == 0) graph_cache_slots[selected] = UINT32_MAX;
+        if (lane_in_warp == 0) graph_record_slots[selected] = UINT32_MAX;
       }
       __syncthreads();
       if (threadIdx.x == 0) {
@@ -657,11 +652,10 @@ __device__ void process_query(const PersistentKernelParams& params,
         completion.gpu_cycles = clock64() - query_started_cycles;
         completion.remote_pages = total_remote_reads;
         completion.remote_batches = total_remote_batches;
+        completion.graph_read_retries = total_graph_read_retries;
         completion.graph_rounds = total_graph_rounds;
-        completion.cache_hits = total_cache_hits;
         completion.route_hits = total_route_hits;
         completion.exact_vectors = total_exact_reads;
-        completion.exact_cache_hits = total_exact_cache_hits;
         device_ring_push(params.completions, completion);
       }
       __syncthreads();
@@ -675,7 +669,7 @@ __device__ void process_query(const PersistentKernelParams& params,
       for (u32 local = warp; local < chunk_count;
            local += blockDim.x / warp_width) {
         const u32 selected = chunk_begin + local;
-        const u32 slot = graph_cache_slots[selected];
+        const u32 slot = graph_record_slots[selected];
         const u8* record = slot == UINT32_MAX ? nullptr :
           graph_record_pointer(params, descriptor.query_slot, slot);
         if (lane_in_warp == 0) {
@@ -697,7 +691,7 @@ __device__ void process_query(const PersistentKernelParams& params,
       for (u32 local = warp; local < chunk_count;
            local += blockDim.x / warp_width) {
         const u32 selected = chunk_begin + local;
-        const u32 slot = graph_cache_slots[selected];
+        const u32 slot = graph_record_slots[selected];
         const u8* record = slot == UINT32_MAX ? nullptr :
           graph_record_pointer(params, descriptor.query_slot, slot);
         __syncwarp();
@@ -714,7 +708,7 @@ __device__ void process_query(const PersistentKernelParams& params,
           __threadfence();
           release_graph_record(params, slot);
         }
-        if (lane_in_warp == 0) graph_cache_slots[selected] = UINT32_MAX;
+        if (lane_in_warp == 0) graph_record_slots[selected] = UINT32_MAX;
       }
       __syncthreads();
       const u32 candidate_count = flattened_neighbors;
@@ -754,7 +748,7 @@ __device__ void process_query(const PersistentKernelParams& params,
     if (graph_failed != 0) {
       for (u32 selected = warp; selected < selected_count;
            selected += blockDim.x / warp_width) {
-        const u32 slot = graph_cache_slots[selected];
+        const u32 slot = graph_record_slots[selected];
         if (lane_in_warp == 0 && slot != UINT32_MAX &&
             (slot & kGraphScratchBit) == 0) {
           __threadfence();
@@ -767,11 +761,10 @@ __device__ void process_query(const PersistentKernelParams& params,
         completion.gpu_cycles = clock64() - query_started_cycles;
         completion.remote_pages = total_remote_reads;
         completion.remote_batches = total_remote_batches;
+        completion.graph_read_retries = total_graph_read_retries;
         completion.graph_rounds = total_graph_rounds;
-        completion.cache_hits = total_cache_hits;
         completion.route_hits = total_route_hits;
         completion.exact_vectors = total_exact_reads;
-        completion.exact_cache_hits = total_exact_cache_hits;
         device_ring_push(params.completions, completion);
       }
       __syncthreads();
@@ -810,7 +803,7 @@ __device__ void process_query(const PersistentKernelParams& params,
   __syncthreads();
   exactify_into_beam(params, descriptor, query, rerank_handles, rerank_ids, rerank_distances,
                      rerank_count, beam_handles, beam_ids, beam_distances, beam_expanded,
-                     beam_count, &total_exact_reads, &total_exact_cache_hits,
+                     beam_count, &total_exact_reads,
                      params.final_rerank_width, true, merge_handles, merge_ids,
                      merge_distances, merge_expanded);
   if (threadIdx.x == 0) {
@@ -842,11 +835,10 @@ __device__ void process_query(const PersistentKernelParams& params,
       completion.gpu_cycles = clock64() - query_started_cycles;
       completion.remote_pages = total_remote_reads;
       completion.remote_batches = total_remote_batches;
+      completion.graph_read_retries = total_graph_read_retries;
       completion.graph_rounds = total_graph_rounds;
-      completion.cache_hits = total_cache_hits;
       completion.route_hits = total_route_hits;
       completion.exact_vectors = total_exact_reads;
-      completion.exact_cache_hits = total_exact_cache_hits;
       device_ring_push(params.completions, completion);
     }
     __syncthreads();
@@ -875,11 +867,10 @@ __device__ void process_query(const PersistentKernelParams& params,
     completion.exact_cycles = exact_phase_cycles;
     completion.remote_pages = total_remote_reads;
     completion.remote_batches = total_remote_batches;
+    completion.graph_read_retries = total_graph_read_retries;
     completion.graph_rounds = total_graph_rounds;
-    completion.cache_hits = total_cache_hits;
     completion.route_hits = total_route_hits;
     completion.exact_vectors = total_exact_reads;
-    completion.exact_cache_hits = total_exact_cache_hits;
     device_ring_push(params.completions, completion);
   }
 }

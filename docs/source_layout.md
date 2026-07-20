@@ -8,7 +8,8 @@
 - `src/gpu_search/persistent_engine/`：构造、生命周期、查询、路由、增量发布、
   存储回收、完成处理和状态；
 - `src/gpu_search/persistent_kernel.cu`：单一持久化 CUDA translation unit；
-- `src/gpu_search/persistent_kernel/`：PQ 评分、RDMA/cache、图遍历和 kernel runtime；
+- `src/gpu_search/persistent_kernel/`：PQ 评分、GPUNetIO/RDMA 读取、anchor 路由记录、
+  图遍历和 kernel runtime；
 - `src/memory_node/storage_owner_index/`：存储分配、图访问、候选搜索和图修改；
 - `src/memory_node/peer_rpc/`：peer RPC 生命周期、请求处理、worker 和客户端请求；
 - `src/memory_node/storage_owner_maintenance/`：维护队列、worker 和图任务；

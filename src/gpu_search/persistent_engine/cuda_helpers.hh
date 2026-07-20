@@ -12,8 +12,6 @@
 namespace gpu_search::persistent_engine_detail {
 
 inline constexpr u32 kDirectBatchQueueCapacity = 64;
-inline constexpr u32 kCacheAdmissionWays = 4;
-inline constexpr u32 kMaxCacheAdmissionSets = 1u << 18;
 inline constexpr u32 kResidentRouteReady = 2;
 
 inline void check_cuda(cudaError_t status, const char* operation) {

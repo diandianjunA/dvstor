@@ -43,15 +43,18 @@ endif ()
 option(DVSTOR_BUILD_EXECUTABLES "Build standalone DVSTOR executables and tools" ON)
 option(DVSTOR_BUILD_TESTS "Build local DVSTOR smoke tests" ON)
 option(DVSTOR_BUILD_OFFLINE_TOOLS
-    "Build CPU-only index construction, partitioning, conversion, and PQ tools" ON)
+    "Build CPU-only index construction, partitioning, and PQ tools" ON)
 option(DVSTOR_USE_NATIVE_ARCH "Compile C++ sources with -march=native" OFF)
+
 if (DVSTOR_STORAGE_NODE_ONLY)
     set(Boost_NO_BOOST_CMAKE ON CACHE BOOL
         "Use CMake's FindBoost module on CPU-only storage hosts to avoid Conda RPATH injection")
 endif ()
+
 if (NOT DVSTOR_STORAGE_NODE_ONLY)
     set(DVSTOR_DOCA_ROOT "/opt/mellanox/doca" CACHE PATH "DOCA SDK installation root")
 endif ()
+
 set(DVSTOR_METIS_PARTITION "AUTO" CACHE STRING "METIS graph partitioning support: AUTO, ON, or OFF")
 set_property(CACHE DVSTOR_METIS_PARTITION PROPERTY STRINGS AUTO ON OFF)
 string(TOUPPER "${DVSTOR_METIS_PARTITION}" DVSTOR_METIS_PARTITION_MODE)
@@ -75,8 +78,10 @@ add_compile_options(-DNOHUGEPAGES)
 #add_compile_options(-g -fno-omit-frame-pointer -fno-inline)  # for profiling
 
 set(DVSTOR_SOURCE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}")
-set(DVSTOR_CONDA_LIB_DIR "/home/xjs/anaconda3/lib" CACHE PATH
-    "Optional local libstdc++ search path used on the development machine")
+set(DVSTOR_CONDA_LIB_DIR "" CACHE PATH
+    "Optional libstdc++ search path (e.g. a conda env lib dir) for hosts whose "
+    "system libstdc++ is too old for CUDA; empty disables. Provide per-host via "
+    "-D or a gitignored CMakeUserPresets.json rather than committing a path here.")
 set(DVSTOR_METIS_ROOT "" CACHE PATH "Optional METIS installation root")
 set(DVSTOR_FAISS_BLAS_VENDOR "Generic" CACHE STRING
     "BLAS vendor for CPU Faiss offline tools; Generic avoids nested MKL/OpenMP runtimes")
@@ -161,13 +166,6 @@ function(dvstor_add_offline_tools)
     target_link_libraries(vamana_offline_builder rdma_library)
     target_link_metis(vamana_offline_builder)
 
-    add_executable(vamana_anchor_sidecar_builder
-        tools/vamana_anchor_sidecar_builder.cc
-        src/vamana/anchor_index.cc
-    )
-    dvstor_target_tool_includes(vamana_anchor_sidecar_builder)
-    target_link_libraries(vamana_anchor_sidecar_builder rdma_library)
-
     add_executable(vamana_pq_indexer
         tools/vamana_pq_indexer.cc
         ${DVSTOR_PQ_INDEXER_SOURCES}
@@ -175,17 +173,6 @@ function(dvstor_add_offline_tools)
     dvstor_target_tool_includes(vamana_pq_indexer)
     target_link_libraries(vamana_pq_indexer rdma_library FaissCPU::FaissCPU)
 
-    add_executable(vamana_legacy_index_converter
-        tools/vamana_legacy_index_converter.cc
-        tools/legacy_index/migrator.cc
-    )
-    dvstor_target_tool_includes(vamana_legacy_index_converter)
-    target_link_libraries(vamana_legacy_index_converter rdma_library)
-
-    add_executable(generate_sift101m_recall_data
-        tools/generate_sift101m_recall_data.cc
-    )
-    dvstor_target_tool_includes(generate_sift101m_recall_data)
 endfunction()
 
 if (DVSTOR_STORAGE_NODE_ONLY)

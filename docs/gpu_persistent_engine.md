@@ -3,7 +3,7 @@
 ## 设计边界
 
 查询数据面只有 GPU：持久化 kernel 保存 beam、visited set、PQ lookup table、
-缓存状态和 RDMA 请求状态。CPU 不执行图导航，不逐层提交 RDMA，也不计算候选
+路由记录状态和 RDMA 请求状态。CPU 不执行图导航，不逐层提交 RDMA，也不计算候选
 距离。存储节点只暴露注册内存并执行动态更新协议。
 
 支持的索引契约固定为：
@@ -68,18 +68,19 @@ thread 只做以下工作：
 评分，不需要逐 mutation 广播或每查询额外 RDMA。动态表内存固定，不会随运行时间
 或 mutation 数量增长。
 
-图读取 miss 直接落入每查询 scratch；显式启用可选 GPU adjacency cache 时，只有
-重复访问才准入该有界缓存。默认 graph cache 容量为 0，因此冷态正确路径和当前
-最佳吞吐不依赖缓存命中。基础图视为不可变快照；在线 mutation 通过独立 GPU
-delta overlay、override epoch 和动态候选桶生效，不逐写清空基础图热点。启用时，
-四路组相联缓存使用 reader pin，避免替换仍被查询读取的 cache line。
+离线 anchors 对应的固定数量路由图记录在启动时批量放入 GPU 常驻路由区，供初始
+扩展使用；在线 mutation 修改这些记录时，刷新流程等待活跃 reader 退出后再发布
+新版本。除此之外，每次图扩展都通过 GPUNetIO/RDMA 将存储节点上的紧凑图记录
+直接读入每查询 scratch，不在 GPU 上保留普通图记录供后续查询复用。基础图视为
+不可变快照；在线 mutation 通过独立 GPU delta overlay、override epoch 和动态
+候选桶生效。
 
 ## 精确重排
 
 近似导航只决定候选覆盖，最终结果始终使用原始 L2 距离：
 
 1. 选择最多 `gpu-final-rerank-width` 个候选；
-2. 默认通过 GPUNetIO 拉取远端 fixed record；显式启用 exact cache 时可先尝试命中；
+2. 通过 GPUNetIO/RDMA 从存储节点直接拉取远端 fixed record；
 3. 按 metadata dtype 解码 uint8、int8 或 float32；
 4. 计算精确 L2，合并动态 delta，过滤 delete/旧 generation；
 5. 按距离返回 top-k。
@@ -138,8 +139,7 @@ watermark 被永久饿死。
 显式预算由 `gpu-memory-limit-gb - gpu-memory-reserve-gb` 决定，启动前统一核算：
 
 - `N * M` 字节的常驻 PQ code，默认 `M=32`；
-- adjacency cache payload、tag、state、reader pin 和 victim；
-- exact cache payload 与并发控制；
+- anchors 对应的固定数量常驻路由图记录及其状态；
 - 原始 dtype delta vector、delta PQ code、hash table 和 bucket；
 - query、OPQ 输出、LUT、beam、visited set、静态/动态路由入口和结果；
 - DOCA/CUDA 外部状态的固定安全余量。
@@ -149,13 +149,12 @@ watermark 被永久饿死。
 | 项目 | 上限 |
 | --- | ---: |
 | PQ32 base codes | 32,000,000,000 B |
-| adjacency cache | 官方冷态基线为 0，可选缓存仅接纳重复访问 |
-| exact cache | 默认关闭 |
+| anchor 路由图记录 | 由 anchors 数量和单条图记录大小确定，固定常驻 |
 | mutable L0 | 默认 256 MiB |
 | 所有显式分配 | 36 GiB |
 | CUDA/DOCA reserve | 4 GiB |
 
-若任一数组溢出、cache set 少于并发 slot、delta 容量为零或总预算超限，启动直接
+若任一数组溢出、delta 容量为零或总预算超限，启动直接
 失败。计算节点主机内存不保存全量 code，磁盘也不保存远端图副本。
 
 ## 性能原则
@@ -163,10 +162,9 @@ watermark 被永久饿死。
 - 连续 PQ code 只在启动时传输一次；
 - 稳态只按需读取 512 B 图记录和最终精确向量；
 - 每个 storage node 使用多条长期存活的 GPU QP；
-- 查询状态、LUT 和 beam 均预分配；可选缓存启用时也使用固定容量；
+- 查询状态、LUT、beam 和 anchor 路由图记录均预分配；
 - 多查询并发隐藏远端延迟，而不是同步执行单查询 RDMA 往返；
-- exact cache 与 graph cache 是默认关闭的独立可选项；启用时二者容量互不挤占；
-- telemetry 分别记录图读、精确读、cache hit、GPU phase cycle、direct-path failure、
+- telemetry 分别记录图读、精确读、GPU phase cycle、direct-path failure、
   mutation publication queue/prepare/command、可见性延迟、L0 回收批次、退休量和存储回收 ACK。
 
 要判断是否达到目标吞吐，必须同时检查 QPS、recall、GPU utilization、QP 错误、
@@ -179,7 +177,7 @@ direct-path failure、每查询图读取数和精确读取数。单独看到 GPU
 
 - GPUNetIO QP probe 或稳态 read 失败；
 - 持久化 kernel 返回非零状态；
-- delta publish、cache invalidation 或安全退休失败；
+- delta publish、anchor 路由记录刷新或安全退休失败；
 - ring/slot 状态不一致；
 - 索引 checksum、ordinal 或远端 offset 校验失败。
 

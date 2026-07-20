@@ -16,8 +16,6 @@ TelemetrySnapshot Telemetry::snapshot() const {
       gpu_memory_resident_pq_bytes.load(std::memory_order_relaxed),
     .gpu_memory_route_graph_bytes = gpu_memory_route_graph_bytes.load(std::memory_order_relaxed),
     .gpu_memory_delta_reserved_bytes = gpu_memory_delta_reserved_bytes.load(std::memory_order_relaxed),
-    .gpu_memory_graph_cache_bytes = gpu_memory_graph_cache_bytes.load(std::memory_order_relaxed),
-    .gpu_memory_exact_cache_bytes = gpu_memory_exact_cache_bytes.load(std::memory_order_relaxed),
     .queries_submitted = queries_submitted.load(std::memory_order_relaxed),
     .queries_completed = queries_completed.load(std::memory_order_relaxed),
     .batches = batches.load(std::memory_order_relaxed),
@@ -36,8 +34,8 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .rdma_merged_requests = rdma_merged_requests.load(std::memory_order_relaxed),
     .direct_path_failures = direct_path_failures.load(std::memory_order_relaxed),
     .graph_page_requests = graph_page_requests.load(std::memory_order_relaxed),
+    .graph_read_retries = graph_read_retries.load(std::memory_order_relaxed),
     .graph_dependency_rounds = graph_dependency_rounds.load(std::memory_order_relaxed),
-    .graph_page_cache_hits = graph_page_cache_hits.load(std::memory_order_relaxed),
     .graph_route_hits = graph_route_hits.load(std::memory_order_relaxed),
     .graph_route_refreshes = graph_route_refreshes.load(std::memory_order_relaxed),
     .dynamic_route_publications =
@@ -48,9 +46,8 @@ TelemetrySnapshot Telemetry::snapshot() const {
       dynamic_route_live_slots.load(std::memory_order_relaxed),
     .dynamic_route_snapshot_skips =
       dynamic_route_snapshot_skips.load(std::memory_order_relaxed),
-    .graph_cache_invalidations = graph_cache_invalidations.load(std::memory_order_relaxed),
+    .graph_route_invalidations = graph_route_invalidations.load(std::memory_order_relaxed),
     .exact_vector_reads = exact_vector_reads.load(std::memory_order_relaxed),
-    .exact_vector_cache_hits = exact_vector_cache_hits.load(std::memory_order_relaxed),
     .delta_queries = delta_queries.load(std::memory_order_relaxed),
     .delta_scan_records = delta_scan_records.load(std::memory_order_relaxed),
     .delta_scan_scored = delta_scan_scored.load(std::memory_order_relaxed),
@@ -102,16 +99,15 @@ void Telemetry::reset() {
   rdma_merged_requests.store(0, std::memory_order_relaxed);
   direct_path_failures.store(0, std::memory_order_relaxed);
   graph_page_requests.store(0, std::memory_order_relaxed);
+  graph_read_retries.store(0, std::memory_order_relaxed);
   graph_dependency_rounds.store(0, std::memory_order_relaxed);
-  graph_page_cache_hits.store(0, std::memory_order_relaxed);
   graph_route_hits.store(0, std::memory_order_relaxed);
   graph_route_refreshes.store(0, std::memory_order_relaxed);
   dynamic_route_publications.store(0, std::memory_order_relaxed);
   dynamic_route_slot_updates.store(0, std::memory_order_relaxed);
   dynamic_route_snapshot_skips.store(0, std::memory_order_relaxed);
-  graph_cache_invalidations.store(0, std::memory_order_relaxed);
+  graph_route_invalidations.store(0, std::memory_order_relaxed);
   exact_vector_reads.store(0, std::memory_order_relaxed);
-  exact_vector_cache_hits.store(0, std::memory_order_relaxed);
   delta_queries.store(0, std::memory_order_relaxed);
   delta_scan_records.store(0, std::memory_order_relaxed);
   delta_scan_scored.store(0, std::memory_order_relaxed);

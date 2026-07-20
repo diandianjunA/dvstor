@@ -16,8 +16,6 @@ struct PqIndexOptions {
   u32 threads{};
   u64 seed{1234};
   bool overwrite{};
-  bool upgrade_layout_only{};
-  u32 local_shard{};
 };
 
 struct PqIndexResult {
@@ -29,6 +27,5 @@ struct PqIndexResult {
 };
 
 PqIndexResult build_pq_index(const PqIndexOptions& options);
-PqIndexResult upgrade_pq_layout(const PqIndexOptions& options);
 
 }  // namespace tools::vamana_offline

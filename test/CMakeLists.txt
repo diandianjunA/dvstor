@@ -141,12 +141,3 @@ add_executable(gpu_memory_budget_test gpu_memory_budget_test.cc)
 target_link_libraries(gpu_memory_budget_test PRIVATE dvstor_runtime)
 target_compile_options(gpu_memory_budget_test PRIVATE -UNDEBUG)
 add_test(NAME gpu_memory_budget_test COMMAND gpu_memory_budget_test)
-
-add_executable(legacy_index_migrator_test
-    legacy_index_migrator_test.cc
-    ${CMAKE_SOURCE_DIR}/tools/legacy_index/migrator.cc
-)
-dvstor_target_tool_includes(legacy_index_migrator_test)
-target_link_libraries(legacy_index_migrator_test PRIVATE dvstor_runtime)
-target_compile_options(legacy_index_migrator_test PRIVATE -UNDEBUG)
-add_test(NAME legacy_index_migrator_test COMMAND legacy_index_migrator_test)

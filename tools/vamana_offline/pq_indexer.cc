@@ -45,7 +45,7 @@ struct PersistentLayout {
 
 Layout parse_layout(const nlohmann::json& metadata) {
   const u32 schema_version = metadata.value("schema_version", 0u);
-  if ((schema_version != 14 && schema_version != gpu_search::format::kMetadataSchemaVersion) ||
+  if (schema_version != 14 ||
       metadata.value("node_layout", str{}) != "plain" ||
       metadata.value("storage_format", str{}) != "vamana_compact_v1" ||
       metadata.value("distance", str{"l2"}) != "l2") {
@@ -162,7 +162,7 @@ void write_metadata_atomic(const filepath_t& path,
     output << std::setw(2) << metadata << '\n';
     if (!output.good()) {
       std::filesystem::remove(temporary);
-      throw std::runtime_error("failed to write upgraded index metadata");
+      throw std::runtime_error("failed to write final index metadata");
     }
   }
   std::filesystem::rename(temporary, path);
@@ -437,102 +437,6 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
             << " model_checksum=" << result.model_checksum
             << " entry_points=" << manifest.entry_points.size()
             << " anchors=" << (used_anchors ? "yes" : "no") << '\n';
-  return result;
-}
-
-PqIndexResult upgrade_pq_layout(const PqIndexOptions& options) {
-  if (options.index_prefix.empty()) throw std::invalid_argument("index prefix is required");
-  const filepath_t metadata_path{options.index_prefix.string() + ".meta.json"};
-  std::ifstream metadata_input(metadata_path);
-  if (!metadata_input.good()) {
-    throw std::runtime_error("missing metadata: " + metadata_path.string());
-  }
-  nlohmann::json metadata;
-  metadata_input >> metadata;
-  const Layout layout = parse_layout(metadata);
-  if (options.local_shard > layout.shards) {
-    throw std::invalid_argument("local shard must be zero or a valid one-based shard");
-  }
-  const u32 code_bytes = metadata.at("navigation_code_bytes").get<u32>();
-  const u32 subquantizers = metadata.at("pq_subquantizers").get<u32>();
-  const u32 bits = metadata.at("pq_bits").get<u32>();
-  const u64 model_checksum = metadata.at("navigation_model_checksum").get<u64>();
-  if (code_bytes != subquantizers || bits != 8 || model_checksum == 0 ||
-      metadata.value("navigation_quantizer", str{}) != "opq_pq") {
-    throw std::runtime_error("layout upgrade requires an existing 8-bit OPQ/PQ index");
-  }
-  const PersistentLayout persistent = make_persistent_layout(
-    metadata, layout, code_bytes);
-
-  struct RewrittenHeader {
-    filepath_t path;
-    gpu_search::format::CodeHeader original;
-  };
-  vec<RewrittenHeader> rewritten;
-  PqIndexResult result;
-  result.model_file = index_path::navigation_model_file(
-    options.index_prefix, subquantizers);
-  result.model_checksum = model_checksum;
-  result.node_count = layout.node_count;
-  result.code_bytes = layout.node_count * code_bytes;
-  try {
-    for (u32 shard = 0; shard < layout.shards; ++shard) {
-      if (options.local_shard != 0 && shard + 1 != options.local_shard) continue;
-      const filepath_t code_path = index_path::navigation_code_file(
-        options.index_prefix, shard + 1, layout.shards, subquantizers);
-      if (!std::filesystem::exists(code_path)) {
-        if (options.local_shard != 0) {
-          throw std::runtime_error("missing local PQ sidecar: " + code_path.string());
-        }
-        continue;
-      }
-      gpu_search::format::CodeHeader header;
-      str error;
-      if (!gpu_search::format::read_code_header(code_path, header, &error)) {
-        throw std::runtime_error(error);
-      }
-      if (header.memory_node != shard || header.code_bytes != code_bytes ||
-          header.node_size != layout.node_bytes ||
-          header.entry_count != layout.counts[shard] ||
-          header.payload_bytes != persistent.code_region_bytes[shard] ||
-          header.model_checksum != model_checksum) {
-        throw std::runtime_error("incompatible local PQ sidecar: " + code_path.string());
-      }
-      rewritten.push_back({.path = code_path, .original = header});
-      header.remote_offset = persistent.code_offsets[shard];
-      std::fstream output(code_path, std::ios::binary | std::ios::in | std::ios::out);
-      if (!output.good() ||
-          !gpu_search::format::write_code_header(output, header, &error)) {
-        throw std::runtime_error(error.empty()
-          ? "failed to rewrite local PQ sidecar header: " + code_path.string()
-          : error);
-      }
-      result.code_files.push_back(code_path);
-    }
-
-    const filepath_t backup{metadata_path.string() + ".schema14.bak"};
-    if (metadata.value("schema_version", 0u) == 14u &&
-        !std::filesystem::exists(backup)) {
-      std::filesystem::copy_file(metadata_path, backup);
-    }
-    apply_persistent_layout(metadata, persistent, code_bytes);
-    write_metadata_atomic(metadata_path, metadata);
-  } catch (...) {
-    for (const RewrittenHeader& item : rewritten) {
-      std::fstream output(item.path, std::ios::binary | std::ios::in | std::ios::out);
-      str ignored;
-      if (output.good()) {
-        (void)gpu_search::format::write_code_header(output, item.original, &ignored);
-      }
-    }
-    throw;
-  }
-
-  std::cerr << "persistent layout upgraded: schema="
-            << gpu_search::format::kMetadataSchemaVersion
-            << " nodes=" << result.node_count
-            << " local_sidecars=" << result.code_files.size()
-            << " dynamic_record_bytes=" << persistent.dynamic_record_bytes << '\n';
   return result;
 }
 

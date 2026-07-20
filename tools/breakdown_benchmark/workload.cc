@@ -117,8 +117,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"gpu_query_slots", service.config().gpu_query_slots},
     {"gpu_rdma_qps", service.config().gpu_rdma_qps},
     {"gpu_graph_prefetch_depth", service.config().gpu_graph_prefetch_depth},
-    {"gpu_adjacency_cache_mb", service.config().gpu_adjacency_cache_mb},
-    {"gpu_exact_cache_mb", service.config().gpu_exact_cache_mb},
   };
   const size_t dim = service.config().dim;
   const double write_ratio_sum = args.write_insert_ratio + args.write_upsert_ratio + args.write_delete_ratio;
@@ -1181,9 +1179,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"write_tail_to_head_ratio", write_head_qps == 0.0 ? 0.0
       : write_tail_qps / write_head_qps},
     {"single_pass_no_reuse", true},
-    {"cache_independent_baseline",
-      service.config().gpu_adjacency_cache_mb == 0 &&
-      service.config().gpu_exact_cache_mb == 0},
+    {"direct_remote_read_baseline", true},
   };
   if (!args.recall_only) {
     run_recall_check("after_performance", "static_gt_post_recall", false);

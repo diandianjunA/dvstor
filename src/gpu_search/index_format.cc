@@ -211,10 +211,10 @@ bool validate_layout(const NavigationLayout& layout, std::string* error) {
   if (layout.graph_pointer_bytes != kCompactPointerBytes ||
       layout.graph_entry_bytes <
         8 + static_cast<u64>(layout.graph_degree) * kCompactPointerBytes ||
-      layout.graph_entry_bytes > kGraphCacheLineBytes ||
+      layout.graph_entry_bytes > kMaxGraphEntryBytes ||
       layout.graph_shard_bits != shard_bits_for(layout.num_shards) ||
       layout.graph_shard_bits >= 16) {
-    set_error(error, "GPU navigation requires one-cache-line compact graph records");
+    set_error(error, "GPU navigation requires compact graph records within one read block");
     return false;
   }
   if (layout.medoid_ordinal >= layout.num_nodes) {

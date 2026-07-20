@@ -84,10 +84,12 @@ void test_recall_and_report_formatting() {
 
   gpu_search::TelemetrySnapshot telemetry;
   telemetry.delta_reclaim_batches = 7;
+  telemetry.graph_read_retries = 11;
   telemetry.mutation_capacity_wait_events = 3;
   telemetry.mutation_capacity_wait_ns = 2'000'000;
   const auto telemetry_json = tools::breakdown_benchmark::telemetry_to_json(telemetry);
   assert(telemetry_json.at("delta_reclaim_batches") == 7);
+  assert(telemetry_json.at("graph_read_retries") == 11);
   assert(telemetry_json.at("mutation_capacity_wait_events") == 3);
   assert(telemetry_json.at("mutation_capacity_wait_ms") == 2.0);
 

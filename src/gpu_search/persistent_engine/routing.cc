@@ -44,11 +44,11 @@ u32 PersistentSearchEngine::Impl::nearest_anchor(const std::vector<f32>& vector,
   return best;
 }
 
-u64 PersistentSearchEngine::Impl::graph_cache_key(u64 raw) const {
+u64 PersistentSearchEngine::Impl::graph_record_key(u64 raw) const {
   const u32 shard = static_cast<u32>(raw >> 48);
   const u64 node_offset = (raw << 16) >> 16;
   if (raw == 0 || shard >= index.shards.size()) {
-    throw std::runtime_error("storage returned an invalid GPU graph-cache invalidation");
+    throw std::runtime_error("storage returned an invalid GPU graph-record invalidation");
   }
   const format::ShardRegion& region = index.shards[shard];
   u64 graph_offset = 0;
@@ -63,20 +63,20 @@ u64 PersistentSearchEngine::Impl::graph_cache_key(u64 raw) const {
   if (graph_offset == 0) {
     if (node_offset < region.dynamic_base_offset || region.dynamic_record_bytes == 0 ||
         (node_offset - region.dynamic_base_offset) % region.dynamic_record_bytes != 0) {
-      throw std::runtime_error("storage returned a misaligned GPU graph-cache invalidation");
+      throw std::runtime_error("storage returned a misaligned GPU graph-record invalidation");
     }
     graph_offset = node_offset + region.dynamic_hot_offset;
   }
   return (static_cast<u64>(shard) << 48) | graph_offset;
 }
 
-std::vector<u64> PersistentSearchEngine::Impl::graph_cache_keys(std::span<const u64> raw_nodes) const {
+std::vector<u64> PersistentSearchEngine::Impl::anchor_graph_invalidation_keys(
+    std::span<const u64> raw_nodes) const {
   std::vector<u64> keys;
   keys.reserve(raw_nodes.size());
   for (u64 raw : raw_nodes) {
-    const u64 key = graph_cache_key(raw);
-    if (graph_cache_sets == 0 &&
-        !std::binary_search(anchor_graph_keys_host.begin(),
+    const u64 key = graph_record_key(raw);
+    if (!std::binary_search(anchor_graph_keys_host.begin(),
                             anchor_graph_keys_host.end(), key)) {
       continue;
     }

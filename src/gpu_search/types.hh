@@ -43,13 +43,15 @@ struct CompletionDescriptor {
   u32 remote_batches{};
   u32 graph_rounds{};
   u32 exact_vectors{};
-  u32 cache_hits{};
   u32 route_hits{};
-  u32 exact_cache_hits{};
   u32 delta_scan_records{};
   u32 delta_scan_scored{};
   u32 delta_scan_truncated_buckets{};
+  u32 graph_read_retries{};
+  u32 reserved[2]{};
 };
+
+static_assert(sizeof(CompletionDescriptor) == 128);
 
 struct DeltaSupersedeUpdate {
   u32 slot{};
@@ -140,8 +142,6 @@ struct TelemetrySnapshot {
   u64 gpu_memory_resident_pq_bytes{};
   u64 gpu_memory_route_graph_bytes{};
   u64 gpu_memory_delta_reserved_bytes{};
-  u64 gpu_memory_graph_cache_bytes{};
-  u64 gpu_memory_exact_cache_bytes{};
   u64 queries_submitted{};
   u64 queries_completed{};
   u64 batches{};
@@ -160,17 +160,16 @@ struct TelemetrySnapshot {
   u64 rdma_merged_requests{};
   u64 direct_path_failures{};
   u64 graph_page_requests{};
+  u64 graph_read_retries{};
   u64 graph_dependency_rounds{};
-  u64 graph_page_cache_hits{};
   u64 graph_route_hits{};
   u64 graph_route_refreshes{};
   u64 dynamic_route_publications{};
   u64 dynamic_route_slot_updates{};
   u64 dynamic_route_live_slots{};
   u64 dynamic_route_snapshot_skips{};
-  u64 graph_cache_invalidations{};
+  u64 graph_route_invalidations{};
   u64 exact_vector_reads{};
-  u64 exact_vector_cache_hits{};
   u64 delta_queries{};
   u64 delta_scan_records{};
   u64 delta_scan_scored{};
@@ -211,8 +210,6 @@ public:
   std::atomic<u64> gpu_memory_resident_pq_bytes{0};
   std::atomic<u64> gpu_memory_route_graph_bytes{0};
   std::atomic<u64> gpu_memory_delta_reserved_bytes{0};
-  std::atomic<u64> gpu_memory_graph_cache_bytes{0};
-  std::atomic<u64> gpu_memory_exact_cache_bytes{0};
   std::atomic<u64> queries_submitted{0};
   std::atomic<u64> queries_completed{0};
   std::atomic<u64> batches{0};
@@ -231,17 +228,16 @@ public:
   std::atomic<u64> rdma_merged_requests{0};
   std::atomic<u64> direct_path_failures{0};
   std::atomic<u64> graph_page_requests{0};
+  std::atomic<u64> graph_read_retries{0};
   std::atomic<u64> graph_dependency_rounds{0};
-  std::atomic<u64> graph_page_cache_hits{0};
   std::atomic<u64> graph_route_hits{0};
   std::atomic<u64> graph_route_refreshes{0};
   std::atomic<u64> dynamic_route_publications{0};
   std::atomic<u64> dynamic_route_slot_updates{0};
   std::atomic<u64> dynamic_route_live_slots{0};
   std::atomic<u64> dynamic_route_snapshot_skips{0};
-  std::atomic<u64> graph_cache_invalidations{0};
+  std::atomic<u64> graph_route_invalidations{0};
   std::atomic<u64> exact_vector_reads{0};
-  std::atomic<u64> exact_vector_cache_hits{0};
   std::atomic<u64> delta_queries{0};
   std::atomic<u64> delta_scan_records{0};
   std::atomic<u64> delta_scan_scored{0};

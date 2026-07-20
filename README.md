@@ -5,20 +5,15 @@ GPU 常驻 OPQ/PQ32 导航码，持久化 CUDA kernel 维护查询状态，并�
 GPUNetIO 直接读取存储节点上的紧凑图记录与精确向量。CPU 仅负责请求准入、
 启动阶段批量传输、控制面和动态更新 RPC，不参与稳态图遍历。
 
-历史实现保存在 `main` 分支；`dev` 不提供旧查询引擎或 CPU 查询回退。
-
 ## 查询路径
 
 1. CPU 将请求写入有界提交队列，并按微批分配 GPU 查询槽。
 2. 持久化 GPU block 完成 OPQ 变换并构建 PQ 查找表。
-3. GPU 对常驻入口点和动态 delta 入口进行打分，初始化 beam。
-4. GPU 通过 GPUNetIO 并发拉取远端 512 字节以内的紧凑图记录。
+3. GPU 对常驻 anchor 路由入口和动态 delta 入口进行打分，初始化 beam。
+4. 除常驻的 anchor 路由图记录外，GPU 通过 GPUNetIO 并发直接拉取远端
+   512 字节以内的紧凑图记录。
 5. GPU 使用常驻 PQ code 对邻居做近似距离计算并更新 beam。
 6. GPU 仅为最终候选拉取精确向量，计算 L2 距离并返回 top-k。
-
-查询过程中没有 CPU 驱动的逐轮 RDMA、主机向量中转或本地图副本。GPUNetIO、
-持久化 kernel 或更新发布发生系统性错误时，引擎进入 fail-stop 状态，不会把
-降级路径的结果伪装成 GPU 查询结果。
 
 ## 动态更新
 
@@ -29,40 +24,23 @@ GPUNetIO 直接读取存储节点上的紧凑图记录与精确向量。CPU 仅�
 - CPU 将原始存储格式向量写入映射固定内存，专用常驻 control CTA 批量完成
   OPQ/PQ 编码、hash/bucket 链接和 epoch 发布；
 - GPU delta 保存原始精确向量、PQ code、删除标记和动态候选桶；
-- 基础图数据视为不可变；可选缓存即使启用，动态可见性也不依赖逐写失效；
+- 基础图数据视为不可变；动态可见性由 GPU delta 和 override epoch 保证；
 - delta 超过容量或维护失败时停止接收新查询，避免静默返回陈旧结果。
 
-在线路由不是静态 anchor 的延续。新 ID 的权威 owner 仍由确定性的 `ID % N`
+新 ID 的权威 owner 仍由确定性的 `ID % N`
 选择（已有基础 ID 查 owner idmap），避免多个计算节点各自演化路由后把同一 ID
 写到不同分片。每个存储分片维护 8 个固定容量的 EMA 中心/活代表，已提交的
-insert/upsert 会更新代表，delete 会使对应代表失效；这些槽负责选择该分片内的
-构建入口，并通过已有 RDMA control page 向所有计算节点发布同一份固定快照和
+insert/upsert 会更新代表，delete 会使对应代表失效；这些槽负责选择该分片内的构建入口，并通过已有 RDMA control page 向所有计算节点发布同一份固定快照和
 PQ code。GPU 查询侧
-拉取这份 storage-canonical 快照维护每分片 8 个动态入口，与离线静态入口共同竞争
-初始 beam；它不再根据“本 CN 恰好提交过哪些写入”独立演化。静态入口只承担冷
-启动和召回兜底，不再是长期运行时唯一的路由依据。
+拉取这份 storage-canonical 快照维护每分片 8 个动态入口，与离线静态入口共同竞争初始 beam；
 
 `local_stitch` 的两阶段插入语义为：
 
 1. stage1 在 owner 分片从当前可用路由入口执行完整的宽度 `L` 构建搜索，直到
-   beam 中没有未展开节点；不存在独立的扩展次数/深度上限。它只写新节点及临时
+   beam 中没有未展开节点。它只写新节点及临时
    出边，不写权威反向边，然后即可 ACK。
 2. stage2 并发请求每个外部分片的完整 `L` 候选，将 owner beam 与所有外部分片
-   beam 合并后只执行一次相同的 alpha RobustPrune。本次最终选中的所有本地、远端
-   邻居完成权威反向边 ACK，且最终邻居再次通过存活性校验后，才覆盖临时出边并
-   推进 finalized watermark。
-
-在所有分片观察同一逻辑图快照，并使用相同的 `L`、距离和 RobustPrune 规则时，
-该结果与“逐分片完成相同在线构建搜索后统一剪枝”的直接分布式参考算法相同。
-这个 reference 不是离线 builder 的全候选构图，也不表示邻接表逐字节一致。持续
-并发更新时系统不冻结整个图，因此也不声称线性化历史一致；应在停写后等待
-maintenance 收敛，再用相同数据流实测前后 recall 和长期稳定性。
-
-上述反向边保证只覆盖 insert 任务在 stage2 最终选出的邻居。当前 schema-15 没有
-完整的入边索引，delete/upsert 无法枚举并立即移除所有历史未知入边；删除版本会被
-tombstone/generation 可见性过滤，但残留指针仍可能增加后续导航开销并影响长期图
-质量。因此本文不把 insert-only 的收敛语义扩张成 delete/upsert 下“全图无悬空
-入边”的保证，混合更新的长期质量仍需单独测试或由后续全图整理机制解决。
+   beam 合并后只执行一次相同的 alpha RobustPrune。本次最终选中的所有本地、远端邻居完成权威反向边 ACK，且最终邻居再次通过存活性校验后，才覆盖临时出边并推进 finalized watermark。
 
 ## 索引文件
 
@@ -70,24 +48,23 @@ tombstone/generation 可见性过滤，但残留指针仍可能增加后续导�
 storage control block 和
 OPQ/PQ 导航。默认 profile 使用 32 个 8-bit 子空间。运行时不读取任何计算节点图清单文件。
 
-| 文件 | 计算节点 | 存储节点 X | 作用 |
-| --- | --- | --- | --- |
-| `<prefix>.meta.json` | 必需 | 必需 | 分片、远端 offset 和格式契约 |
-| `<prefix>.pq32` | 必需 | 不需要 | OPQ 矩阵与 PQ codebook |
-| `<prefix>.anchors` | 必需 | 不需要 | GPU 静态冷启动/召回兜底入口 |
-| `<prefix>_nodeX_ofN.dat` | 不需要 | 必需 | 精确向量、固定记录和紧凑图 |
-| `<prefix>_nodeX_ofN.idmap` | 更新模式需全部分片；纯查询不需要 | 必需 | base ID 的真实 owner/版本映射 |
-| `<prefix>_nodeX_ofN.pq32.codes` | 不需要 | 必需 | 启动时注册到远端内存的 PQ32 码流 |
+| 文件                              | 计算节点             | 存储节点 X | 作用                     |
+| ------------------------------- | ---------------- | ------ | ---------------------- |
+| `<prefix>.meta.json`            | 必需               | 必需     | 分片、远端 offset 和格式契约     |
+| `<prefix>.pq32`                 | 必需               | 不需要    | OPQ 矩阵与 PQ codebook    |
+| `<prefix>.anchors`              | 必需               | 不需要    | GPU 静态冷启动/召回兜底入口       |
+| `<prefix>_nodeX_ofN.dat`        | 不需要              | 必需     | 精确向量、固定记录和紧凑图          |
+| `<prefix>_nodeX_ofN.idmap`      | 更新模式需全部分片；纯查询不需要 | 必需     | base ID 的真实 owner/版本映射 |
+| `<prefix>_nodeX_ofN.pq32.codes` | 不需要              | 必需     | 启动时注册到远端内存的 PQ32 码流    |
 
 计算节点本地保存 metadata、PQ 模型和静态启动入口；启用更新时还需全部分片的
 `.idmap`，因为 METIS 分区下 base ID 的 owner 不能由 ID 推导。纯查询模式不加载
 这些 idmap。计算节点不会保存 `.gpu.idx`、图分片、精确向量或全量导航码。
 
 PQ32 每个向量占 32 字节：SIFT100M 为 3.2 GB，SIFT1B 为 32 GB
-（约 29.8 GiB）。默认运行配置保留 256 MiB 有界 mutable L0，并将 graph cache
-和 exact cache 都关闭；可选缓存实现仍可显式启用，但当前冷态正确路径和最佳性能
-不依赖缓存命中。显式分配上限为 36 GiB，并为 CUDA/DOCA 保留 4 GiB。
-计算节点本地文件远低于 50 GB。
+（约 29.8 GiB）。默认运行配置保留 256 MiB 有界 mutable L0。除固定数量的
+anchor 路由图记录外，计算 GPU 不保存基础图记录或精确向量；稳态查询通过
+GPUNetIO/RDMA 按需直接读取它们。
 
 ## 依赖与构建
 
@@ -106,8 +83,7 @@ cmake --build build -j
 - `dvstor_breakdown_benchmark`：吞吐、延迟、召回率和分解统计；
 - `vamana_offline_builder`：在 CPU 上构建 compact Vamana 图，并执行
   `balanced`、`bfs` 或可选的 `metis` 分片；
-- `vamana_pq_indexer`：训练 OPQ/PQ 并生成分片码流；
-- `vamana_legacy_index_converter`：复用旧图与分片布局进行迁移。
+- `vamana_pq_indexer`：训练 OPQ/PQ 并生成分片码流。
 
 无 GPU 的存储节点可同时构建存储服务和 CPU 离线索引工具：
 
@@ -117,8 +93,7 @@ cmake -S . -B build-storage \
   -DDVSTOR_STORAGE_NODE_ONLY=ON \
   -DCMAKE_CXX_COMPILER=/usr/bin/g++-11
 cmake --build build-storage -j --target \
-  dvstor_memory_node vamana_offline_builder vamana_anchor_sidecar_builder \
-  vamana_pq_indexer vamana_legacy_index_converter
+  dvstor_memory_node vamana_offline_builder vamana_pq_indexer
 ```
 
 存储服务本身只依赖 CPU、RDMA、Boost 和 TBB。离线工具使用 CPU Faiss、BLAS、
@@ -128,21 +103,16 @@ LAPACK、OpenMP 和可选 METIS，但不依赖 CUDA 或 DOCA。CMake 直接链�
 或等价的现代 Clang。若节点只运行存储服务，可增加
 `-DDVSTOR_BUILD_OFFLINE_TOOLS=OFF`。
 
-必须使用独立的 `build-storage` 目录；不要把已经配置为 CUDA 计算节点的 `build`
-目录切换成存储模式。`DVSTOR_METIS_PARTITION=AUTO` 会先验证 METIS/GKlib 能否
+`DVSTOR_METIS_PARTITION=AUTO` 会先验证 METIS/GKlib 能否
 在本机真实链接；若仓库内预编译库与本机 glibc 不兼容，会先回退到系统 CPU
 METIS，没有兼容版本时才保留 `balanced/bfs` 并禁用 `metis`。需要强制 METIS
 时，安装本机 CPU 版本并设置
 `-DDVSTOR_METIS_ROOT=/path/to/metis -DDVSTOR_METIS_PARTITION=ON`。
 
 新建索引的分片由 `vamana_offline_builder --partition-strategy ...` 完成，不需要
-GPU，也不需要额外重分片可执行文件。`vamana_legacy_index_converter` 的职责是
-低成本复用旧图，因此保持旧索引的分片数与节点布局；已删除的 schema-13
-`vamana_bfs_repartitioner`/`vamana_metis_repartitioner` 依赖旧 RaBitQ 记录格式，
-不能用于 schema 14。若要改变旧索引的分片布局，应先在旧格式下完成分片，再
-执行迁移；不要把旧重分片器重新链接进新运行时。
+GPU，也不需要额外重分片可执行文件。
 
-## 生成或迁移索引
+## 生成索引
 
 完整构建：
 
@@ -154,38 +124,7 @@ GPU，也不需要额外重分片可执行文件。`vamana_legacy_index_converte
 schema-15 分片契约、owner idmap、anchors、OPQ/PQ32 模型和
 每分片 PQ32 码流，不需要再运行重编码脚本。默认目标已存在时脚本会在昂贵构建前
 拒绝覆盖；建议通过 `PQ_INDEX_PREFIX=/new/prefix` 构建新版本，确认需要原地重建时
-才设置 `OVERWRITE_INDEX=1`。覆盖模式会先解除目标 prefix 下可能存在的迁移软链接，
-避免误写其源分片。
-
-复用已有 Vamana/Metis 图，不重新构图或分区：
-
-```bash
-SOURCE_PREFIX=/path/to/legacy/index_prefix \
-./experiment/convert_legacy_sift100m_index.sh 04_gpu_persistent_gpunetio
-```
-
-已有 schema-14 PQ16 索引时，只重编码为默认 PQ32，不复制或重建图：
-
-```bash
-./experiment/reencode_sift100m_pq.sh 04_gpu_persistent_gpunetio
-```
-
-已有 schema-14 OPQ/PQ32 码流时，不需要重新训练或重编码。计算节点执行一次
-metadata-only 升级，每个存储节点只重写本地 120-byte sidecar 头：
-
-```bash
-INDEX_ROLE=compute ./experiment/upgrade_pq_schema15.sh 04_gpu_persistent_gpunetio
-INDEX_ROLE=storage LOCAL_SHARD=1 \
-  ./experiment/upgrade_pq_schema15.sh 04_gpu_persistent_gpunetio
-```
-
-迁移会顺序压缩旧 fixed record、重写紧凑图中的 RemotePtr、迁移 idmap 与
-anchors；脚本随后在独立进程中训练/复用 PQ 模型并编码所有向量。两个阶段以
-schema-14 metadata 仅为离线迁移检查点；最终运行格式是 schema-15。迁移完成后
-PQ 失败，重新执行脚本不会再次
-迁移 65 GB 分片。`PQ_THREADS` 默认 32，CPU BLAS 固定为非嵌套运行；若已有不完整
-的 `.pq32`/`.pq32.codes`，使用 `OVERWRITE_PQ=1` 重做 PQ 阶段。源 prefix 与输出
-prefix 必须不同；迁移器不会修改或删除旧索引。
+才设置 `OVERWRITE_INDEX=1`。
 
 ## 运行 SIFT100M
 
@@ -219,7 +158,7 @@ ctest --test-dir build --output-on-failure
 bash -n experiment/*.sh experiment/profiles/*.env
 ```
 
-`gpu_memory_budget_test` 覆盖 SIFT100M/SIFT1B 预算；格式、PQ、delta、迁移和
+`gpu_memory_budget_test` 覆盖 SIFT100M/SIFT1B 预算；格式、PQ、delta 和
 提交环均有独立测试。硬件吞吐和召回率仍需在真实存储节点启动后通过 profile
 进行验证。
 
@@ -230,6 +169,5 @@ bash -n experiment/*.sh experiment/profiles/*.env
 - `src/memory_node/`：分片加载、更新、维护与 storage peer RPC；
 - `src/service/`：计算服务、索引契约和统计；
 - `src/vamana/`：compact graph、anchor 和 idmap 格式；
-- `tools/legacy_index/`：隔离的旧索引只读迁移器；
 - `tools/vamana_offline/`：离线构图与 PQ sidecar 生成；
 - `experiment/`：唯一支持的 SIFT100M profile。
