@@ -234,6 +234,9 @@ struct StorageOwnerThread {
   HugePage<byte_t> scratch_buffer;
   std::unique_ptr<LocalMemoryRegion> scratch_region;
   u32 running_coroutine{};
+  // Used only by the owning OS thread. Async reads rotate across every data
+  // QP instead of pinning a low worker count to a strict subset of the lanes.
+  u32 next_peer_data_qp_ticket{};
   size_t scratch_stride{};
 };
 

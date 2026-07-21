@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -39,6 +40,7 @@
 #include "memory_node/storage_owner_index/incarnation_lock.hh"
 #include "memory_node/storage_owner_maintenance/reverse_outbox.hh"
 #include "memory_node/storage_owner_state.hh"
+#include "memory_node/peer_rdma_credit_policy.hh"
 #include "service/index_metadata.hh"
 #include "service/storage_owner_protocol.hh"
 #include "vamana/centroid_router.hh"
@@ -77,14 +79,18 @@ class MemoryNode {
 
   struct PeerStage1Task {
     u32 source_shard{};
-    // Monotonic within source_shard and assigned in RC receive order. A
-    // release waits for every smaller sequence from that authority to finish
-    // before erasing a semantic receipt; this closes the gap between ordered
-    // wire delivery and parallel Stage1 worker completion.
+    // Monotonic within source_shard and assigned in RC receive order. It is
+    // retained for completion telemetry; receipt safety is keyed by the
+    // semantic operation token, so an unrelated slow request cannot block a
+    // release.
     u64 source_sequence{};
     service::storage_owner::PeerRpcHeader header{};
     memory_node_detail::PeerRequestLease dedup_lease{};
     vec<byte_t> payload;
+    // Execute/arm/abort tokens tracked by the bounded per-operation in-flight
+    // table. Release tokens are deliberately excluded: a release waits for
+    // this table to become empty before erasing the semantic receipt.
+    vec<service::storage_owner::AuthorityOperationToken> operation_tokens;
     std::chrono::steady_clock::time_point received_at{};
   };
 
@@ -142,6 +148,7 @@ class MemoryNode {
     vec<memory_node_detail::BeamEntry> beam;
     vec<RemotePtr> remote_frontier;
     vec<RemotePtr> backlink_targets;
+    u64 execute_initial_placement_version{};
     u64 initial_placement_version{};
     bool prepared{};
     bool arming{};
@@ -157,6 +164,13 @@ class MemoryNode {
     std::mutex mutex;
     std::unordered_map<Stage1OperationKey, Stage1PreparedResult,
                        Stage1OperationKeyHash> records;
+  };
+
+  struct Stage1InflightRequestShard {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::unordered_map<Stage1OperationKey, u32,
+                       Stage1OperationKeyHash> counts;
   };
 
   struct CleanupActivationRecord {
@@ -200,6 +214,10 @@ class MemoryNode {
     bool placement_committed{};
     bool allocation_settled{};
     bool centroid_committed{};
+    // The authority hands receipt lifetime off with an ordered same-QP release
+    // fence after commit. Stage2 records whether that responsibility has been
+    // resolved; it never infers a remote transport watermark locally.
+    bool stage1_receipt_released{};
     bool stage2_prepared{};
     bool stage2_source_frozen{};
     // The physical home becomes immutable once its complete outgoing record
@@ -318,6 +336,7 @@ private:
 
   struct DynamicFreshnessShard {
     std::mutex mutex;
+    std::condition_variable changed;
     dense_hashmap_t<node_t, FreshnessEntry> entries;
     dense_hashmap_t<node_t, AuthorityMutationLease> mutation_leases;
   };
@@ -353,6 +372,10 @@ private:
   u32 peer_data_qp_index(u32 worker_id) const;
   QP& peer_data_qp(u32 shard_id, u32 qp_idx);
   static u64 peer_coroutine_wr_id(u32 thread_id, u32 coroutine_id);
+  memory_node_detail::PeerRdmaReadCreditPlan
+  derive_peer_rdma_read_credit_plan() const;
+  const memory_node_detail::PeerRdmaReadCreditPlan&
+  peer_rdma_read_credit_plan() const;
   u32 peer_rdma_read_credit_limit_per_qp() const;
   u32 peer_rdma_read_credit_limit() const;
   u32 peer_rdma_read_global_credit_limit() const;
@@ -414,6 +437,19 @@ private:
       const byte_t* raw_vector,
       const Configuration& config,
       InsertBreakdownCounters* breakdown = nullptr);
+  service::storage_owner::Stage1ExecuteResult
+  prepare_and_maybe_arm_local_stage1_item(
+      u32 authority_shard,
+      const service::storage_owner::Stage1ExecuteItem& item,
+      const byte_t* raw_vector,
+      const Configuration& config,
+      InsertBreakdownCounters* breakdown = nullptr);
+  bool try_track_stage1_inflight_request(const Stage1OperationKey& key);
+  void finish_stage1_inflight_request(const Stage1OperationKey& key);
+  bool wait_for_stage1_inflight_quiescence(const Stage1OperationKey& key);
+  bool release_resolved_local_stage1_receipt(
+      const StorageOwnerMaintenanceTask& task,
+      const Configuration& config);
   bool handle_peer_stage1_arm_request(
       u32 source_shard,
       const service::storage_owner::PeerRpcHeader& header,
@@ -507,6 +543,7 @@ private:
       const dense_hashmap_t<u32, vec<byte_t>>& vectors_by_home,
       dense_hashmap_t<
         u32, vec<service::storage_owner::Stage1ExecuteResult>>& results_by_home,
+      const std::function<bool()>& overlap_work,
       const Configuration& config);
   bool arm_remote_stage1_batch(
       u32 stage1_home,
@@ -522,6 +559,11 @@ private:
       u32 authority_shard,
       const service::storage_owner::AuthorityPlacementItem& item,
       service::storage_owner::AuthorityPlacementResult& result,
+      const Configuration& config);
+  bool relocate_batch_via_authority(
+      span<const u32> authority_shards,
+      span<const service::storage_owner::AuthorityPlacementItem> items,
+      vec<service::storage_owner::AuthorityPlacementResult>& results,
       const Configuration& config);
   bool control_dynamic_node_on_shard(
       u32 physical_shard,
@@ -669,8 +711,20 @@ private:
   bool storage_owner_node_live(RemotePtr rptr);
   bool storage_owner_node_stable(RemotePtr rptr);
   bool read_stable_node_identity(RemotePtr rptr);
+  size_t read_node_identity_headers_batched_into(
+      span<const RemotePtr> rptrs,
+      const configuration::IndexConfiguration& config,
+      vec<std::pair<RemotePtr, u64>>& identities);
   bool read_graph_adjacency(RemotePtr rptr,
                             GraphAdjacency& adjacency);
+  vec<std::pair<RemotePtr, GraphAdjacency>>
+    read_graph_adjacencies_batched(
+      span<const RemotePtr> rptrs,
+      const Configuration& config);
+  size_t read_graph_adjacencies_batched_into(
+      span<const RemotePtr> rptrs,
+      const Configuration& config,
+      vec<std::pair<RemotePtr, GraphAdjacency>>& results);
   vec<RemotePtr> read_neighbor_list(RemotePtr rptr);
   vec<RemotePtr> read_stable_neighbor_list(RemotePtr rptr);
   bool read_local_neighbor_list(RemotePtr rptr,
@@ -678,6 +732,10 @@ private:
                                 vec<byte_t>& entry,
                                 vec<byte_t>& decoded) const;
   vec<NodeSnapshot> read_node_snapshots_batched(const vec<RemotePtr>& rptrs, const Configuration& config);
+  size_t read_node_snapshots_batched_into(
+      span<const RemotePtr> rptrs,
+      const Configuration& config,
+      vec<NodeSnapshot>& snapshots);
   const vec<BeamEntry>& score_stable_node_vectors_batched(
       span<const RemotePtr> rptrs,
       const byte_t* stored_query,
@@ -729,6 +787,11 @@ private:
       const StorageOwnerMaintenanceTask& task,
       const NodeSnapshot& target,
       const Configuration& config);
+  void continue_stage2_search_candidates_batched(
+      span<const StorageOwnerMaintenanceTask> tasks,
+      span<const NodeSnapshot> targets,
+      vec<vec<RemotePtr>>& candidates_by_task,
+      const Configuration& config);
   vec<RemotePtr> local_centroid_route_entries() const;
   void initialize_storage_centroid_route();
   void publish_storage_centroid_route();
@@ -748,6 +811,13 @@ private:
       const byte_t* source,
       VectorDType source_dtype,
       span<const NodeSnapshot> candidates,
+      const hashset_t<RemotePtr>& skip,
+      const Configuration& config,
+      u32 result_limit_override = 0);
+  vec<RemotePtr> robust_prune_snapshot_refs_cpu(
+      const byte_t* source,
+      VectorDType source_dtype,
+      span<const NodeSnapshot* const> candidates,
       const hashset_t<RemotePtr>& skip,
       const Configuration& config,
       u32 result_limit_override = 0);
@@ -835,6 +905,8 @@ private:
   std::unordered_map<u64, PeerPendingSend> peer_pending_sends_;
   vec<std::atomic<u32>> peer_rdma_read_outstanding_;
   vec<vec<std::atomic<u32>>> peer_rdma_read_qp_outstanding_;
+  memory_node_detail::PeerRdmaReadCreditPlan peer_rdma_read_credits_{
+    1, 1, 1, 1, 1};
   vec<vec<std::unique_ptr<std::mutex>>> peer_qp_send_mutexes_;
   vec<std::unique_ptr<std::mutex>> peer_rpc_sync_send_mutexes_;
   std::mutex peer_rpc_send_slots_mutex_;
@@ -859,8 +931,8 @@ private:
   std::condition_variable peer_stage1_tasks_cv_;
   std::deque<PeerStage1Task> peer_stage1_tasks_;
   // next sequence is protected by peer_stage1_tasks_mutex_. Completion state
-  // is separate per authority so one busy peer cannot serialize releases from
-  // unrelated RC QPs.
+  // is diagnostic only; semantic receipt lifetime uses the bounded per-token
+  // table below rather than a global per-authority prefix.
   vec<u64> peer_stage1_next_source_sequences_;
   vec<u_ptr<PeerOrderedCompletionState>> peer_stage1_completion_states_;
   std::mutex peer_cleanup_control_tasks_mutex_;
@@ -895,6 +967,8 @@ private:
   std::atomic<u32> peer_stage1_active_workers_{0};
   std::array<Stage1PreparedResultShard,
              kStage1PreparedShardCount> stage1_prepared_results_;
+  std::array<Stage1InflightRequestShard,
+             kStage1PreparedShardCount> stage1_inflight_requests_;
   size_t stage1_prepared_results_limit_{1024};
   size_t stage1_prepared_results_limit_per_shard_{16};
   std::array<CleanupActivationDedupeShard,
@@ -948,6 +1022,10 @@ private:
   std::atomic<u64> storage_owner_stage2_remote_frontier_items_{0};
   std::atomic<u64> storage_owner_stage2_remote_expansions_{0};
   std::atomic<u64> storage_owner_stage2_scored_candidates_{0};
+  std::atomic<u64> storage_owner_stage2_graph_read_waves_{0};
+  std::atomic<u64> storage_owner_stage2_graph_unique_reads_{0};
+  std::atomic<u64> storage_owner_stage2_vector_read_waves_{0};
+  std::atomic<u64> storage_owner_stage2_vector_unique_reads_{0};
   std::atomic<u64> storage_owner_stage2_migrations_{0};
   std::atomic<u64> storage_owner_stage2_final_edges_{0};
   std::atomic<u64> storage_owner_stage2_cross_edges_stage1_home_{0};

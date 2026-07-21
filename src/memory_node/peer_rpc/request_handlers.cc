@@ -133,6 +133,48 @@ bool MemoryNode::enqueue_peer_reverse_update_task(PeerReverseUpdateTask&& task) 
 }
 
 bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
+  using namespace service::storage_owner;
+  const auto request_type = static_cast<PeerRpcType>(task.header.type);
+  task.operation_tokens.clear();
+  task.operation_tokens.reserve(task.header.item_count);
+  if (request_type == PeerRpcType::stage1_execute_request) {
+    const Stage1ExecuteItem* items = stage1_execute_items(
+      task.payload.data());
+    for (u32 item = 0; item < task.header.item_count; ++item) {
+      task.operation_tokens.push_back(AuthorityOperationToken{
+        .source_client = items[item].source_client,
+        .item_index = items[item].item_index,
+        .client_batch_id = items[item].client_batch_id,
+      });
+    }
+  } else if (request_type == PeerRpcType::stage1_arm_request) {
+    const Stage1ArmItem* items = stage1_arm_items(task.payload.data());
+    bool saw_release = false;
+    bool saw_non_release = false;
+    for (u32 item = 0; item < task.header.item_count; ++item) {
+      const auto action = static_cast<Stage1ArmAction>(items[item].action);
+      if (action != Stage1ArmAction::arm &&
+          action != Stage1ArmAction::abort &&
+          action != Stage1ArmAction::release) {
+        return false;
+      }
+      saw_release |= action == Stage1ArmAction::release;
+      saw_non_release |= action != Stage1ArmAction::release;
+      // A release is a quiescence observer, not work that can recreate or
+      // mutate the receipt. Excluding it prevents duplicate releases from
+      // waiting on one another forever.
+      if (action != Stage1ArmAction::release) {
+        task.operation_tokens.push_back(items[item].token);
+      }
+    }
+    // Production callers send homogeneous control batches. Reject a mixed
+    // release/mutation message at the trust boundary so its wait semantics
+    // cannot be ambiguous.
+    if (saw_release && saw_non_release) return false;
+  } else {
+    return false;
+  }
+
   std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
   if (peer_reverse_shutdown_.load(std::memory_order_acquire) ||
       peer_stage1_tasks_.size() >= peer_stage1_task_queue_limit_ ||
@@ -140,6 +182,27 @@ bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
       peer_stage1_next_source_sequences_[task.source_shard] ==
         std::numeric_limits<u64>::max()) {
     return false;
+  }
+  vec<Stage1OperationKey> tracked_keys;
+  tracked_keys.reserve(task.operation_tokens.size());
+  for (const AuthorityOperationToken& token : task.operation_tokens) {
+    const Stage1OperationKey key{
+      .authority_shard = task.source_shard,
+      .source_client = token.source_client,
+      .item_index = token.item_index,
+      .client_batch_id = token.client_batch_id,
+    };
+    if (!try_track_stage1_inflight_request(key)) {
+      for (auto position = tracked_keys.rbegin();
+           position != tracked_keys.rend(); ++position) {
+        finish_stage1_inflight_request(*position);
+      }
+      // Reject the entire RPC before assigning a receive-order sequence.
+      // The authority retains the same semantic token and retries after
+      // bounded Stage1 state drains.
+      return false;
+    }
+    tracked_keys.push_back(key);
   }
   task.source_sequence =
     ++peer_stage1_next_source_sequences_[task.source_shard];

@@ -212,6 +212,14 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     align_up(graph_scratch_offset + graph_scratch_bytes, 256));
   const size_t control_snapshot_bytes =
     index.shards.size() * sizeof(format::StorageControlBlock);
+  const size_t maintenance_snapshot_offset = static_cast<size_t>(align_up(
+    control_snapshot_bytes, alignof(maintenance_telemetry::Snapshot)));
+  const size_t maintenance_snapshot_bytes =
+    index.shards.size() * sizeof(maintenance_telemetry::Snapshot);
+  const size_t maintenance_sequence_after_offset = static_cast<size_t>(align_up(
+    maintenance_snapshot_offset + maintenance_snapshot_bytes, alignof(u64)));
+  const size_t maintenance_sequence_after_bytes =
+    index.shards.size() * sizeof(u64);
   storage_route_snapshot_stride = static_cast<size_t>(
     format::storage_centroid_route_publication_bytes(
       config.dim, format::CentroidScalarType::float32,
@@ -224,7 +232,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     throw std::runtime_error("centroid route snapshot allocation overflows size_t");
   }
   const size_t route_snapshot_offset = static_cast<size_t>(align_up(
-    control_snapshot_bytes, 64));
+    maintenance_sequence_after_offset + maintenance_sequence_after_bytes, 64));
   const size_t route_snapshot_bytes =
     index.shards.size() * storage_route_snapshot_stride;
   const size_t route_sequence_after_offset = static_cast<size_t>(align_up(
@@ -250,6 +258,12 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   d_graph_scratch = d_remote_buffer + graph_scratch_offset;
   d_control_snapshots = reinterpret_cast<format::StorageControlBlock*>(
     d_remote_buffer + control_region_offset);
+  d_maintenance_snapshots =
+    reinterpret_cast<maintenance_telemetry::Snapshot*>(
+      d_remote_buffer + control_region_offset + maintenance_snapshot_offset);
+  d_maintenance_sequence_after = reinterpret_cast<u64*>(
+    d_remote_buffer + control_region_offset +
+      maintenance_sequence_after_offset);
   d_storage_route_snapshots =
     d_remote_buffer + control_region_offset + route_snapshot_offset;
   d_storage_route_sequence_after = reinterpret_cast<u64*>(

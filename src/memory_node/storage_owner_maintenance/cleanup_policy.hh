@@ -1,12 +1,60 @@
 #pragma once
 
 #include <algorithm>
+#include <limits>
 
 #include "common/types.hh"
 #include "remote_pointer.hh"
 #include "vamana/vamana_node.hh"
 
 namespace memory_node_storage_owner_maintenance_detail {
+
+// One maintenance worker builds a single snapshot wave for every Stage2 task
+// that has crossed the same frozen graph boundary. Physical records shared by
+// several tasks are read once, while task_target_indices retains each task's
+// exact candidate order (including repeated candidates). Keeping the plan in
+// worker-owned scratch makes its capacity O(batch * L), independent of the
+// number of in-flight Stage2 contexts.
+struct Stage2SnapshotWavePlan {
+  static constexpr u32 missing = std::numeric_limits<u32>::max();
+
+  vec<RemotePtr> targets;
+  vec<vec<u32>> task_target_indices;
+  dense_hashmap_t<RemotePtr, u32> target_indices;
+  size_t task_count{};
+
+  void build(span<const vec<RemotePtr>> candidates_by_task) {
+    size_t candidate_count = 0;
+    for (const vec<RemotePtr>& candidates : candidates_by_task) {
+      candidate_count += candidates.size();
+    }
+    targets.clear();
+    targets.reserve(candidate_count);
+    target_indices.clear();
+    target_indices.reserve(candidate_count);
+    task_count = candidates_by_task.size();
+    if (task_target_indices.size() < task_count) {
+      task_target_indices.resize(task_count);
+    }
+    for (vec<u32>& indices : task_target_indices) indices.clear();
+
+    for (size_t task = 0; task < task_count; ++task) {
+      vec<u32>& indices = task_target_indices[task];
+      indices.reserve(candidates_by_task[task].size());
+      for (const RemotePtr candidate : candidates_by_task[task]) {
+        if (candidate.is_null()) continue;
+        lib_assert(targets.size() < missing,
+                   "Stage2 snapshot wave target index overflow");
+        const auto [position, inserted] = target_indices.emplace(
+          candidate, static_cast<u32>(targets.size()));
+        if (inserted) {
+          targets.push_back(candidate);
+        }
+        indices.push_back(position->second);
+      }
+    }
+  }
+};
 
 struct Stage2StableBacklinkTarget {
   RemotePtr target;
@@ -19,6 +67,35 @@ struct Stage2BacklinkPlan {
   vec<Stage2StableBacklinkTarget> ordinary_stable_targets;
   vec<RemotePtr> obsolete_stage1_bridges;
 };
+
+// Finalization only needs to revalidate records that can carry one of its
+// reachability postconditions: an original provisional Stage1 bridge, the
+// already-ACKed promotion certificate, or the deterministic promotion target
+// whose response may have been lost. Ordinary final neighbors cannot contain
+// either edge as a consequence of this insertion.
+inline vec<RemotePtr> stage2_revalidation_parents(
+    span<const RemotePtr> stage1_bridges,
+    RemotePtr acknowledged_certificate,
+    RemotePtr planned_promotion_target) {
+  vec<RemotePtr> parents(stage1_bridges.begin(), stage1_bridges.end());
+  if (!acknowledged_certificate.is_null()) {
+    parents.push_back(acknowledged_certificate);
+  }
+  if (!planned_promotion_target.is_null()) {
+    parents.push_back(planned_promotion_target);
+  }
+  std::sort(parents.begin(), parents.end(),
+            [](RemotePtr lhs, RemotePtr rhs) {
+              return lhs.raw_address < rhs.raw_address;
+            });
+  parents.erase(std::remove_if(parents.begin(), parents.end(),
+                               [](RemotePtr value) {
+                                 return value.is_null();
+                               }),
+                parents.end());
+  parents.erase(std::unique(parents.begin(), parents.end()), parents.end());
+  return parents;
+}
 
 // Final Stage2 parents must be durable members of the already-published graph,
 // not merely readable records.  In particular, excluding an unaccounted

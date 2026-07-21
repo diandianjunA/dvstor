@@ -95,6 +95,40 @@ void test_bounded_prune_rejection_is_a_terminal_ordinary_postcondition() {
            reconcile_reverse_postcondition_holds(promotion, promoted));
 }
 
+void test_retired_target_completes_only_non_reachability_work() {
+  using memory_node_storage_owner_index_detail::
+    reconcile_retired_target_result;
+  using memory_node_storage_owner_index_detail::
+    reconcile_reverse_postcondition_holds;
+  const RemotePtr target = pointer(0, 0x1000);
+  const RemotePtr old_candidate = pointer(0, 0x2000);
+  const RemotePtr new_candidate = pointer(1, 0x3000);
+
+  for (const ReconcileReverseOpKind kind : {
+         ReconcileReverseOpKind::add,
+         ReconcileReverseOpKind::remove_if_present,
+         ReconcileReverseOpKind::replace_or_add}) {
+    const ReconcileReverseOp op = operation(
+      kind, target,
+      kind == ReconcileReverseOpKind::add ? RemotePtr{} : old_candidate,
+      kind == ReconcileReverseOpKind::remove_if_present
+        ? RemotePtr{} : new_candidate);
+    const auto result = reconcile_retired_target_result(op);
+    assert(!result.stale);
+    assert(reconcile_reverse_postcondition_holds(op, result));
+  }
+
+  for (const ReconcileReverseOpKind kind : {
+         ReconcileReverseOpKind::ensure_reachable,
+         ReconcileReverseOpKind::promote_stable_bridge}) {
+    const ReconcileReverseOp op = operation(
+      kind, target, old_candidate, new_candidate);
+    const auto result = reconcile_retired_target_result(op);
+    assert(result.stale);
+    assert(!reconcile_reverse_postcondition_holds(op, result));
+  }
+}
+
 void test_stage2_backlink_plan_cleans_selected_and_unselected_bridges() {
   const RemotePtr stage1_first = pointer(0, 0x1000);
   const RemotePtr stage1_second = pointer(0, 0x2000);
@@ -197,6 +231,81 @@ void test_final_parent_eligibility_rejects_churn_and_dependency_cycles() {
   // satisfy reachability solely by pointing at one another.
   const u64 fresh_uncommitted = VamanaNode::make_header(5);
   assert(!stage2_parent_is_stable(fresh_uncommitted, false));
+}
+
+void test_stage2_snapshot_wave_deduplicates_without_losing_task_order() {
+  using memory_node_storage_owner_maintenance_detail::
+    Stage2SnapshotWavePlan;
+  const RemotePtr a = pointer(0, 0x1000);
+  const RemotePtr b = pointer(1, 0x2000);
+  const RemotePtr c = pointer(2, 0x3000);
+  const RemotePtr d = pointer(3, 0x4000);
+  const vec<vec<RemotePtr>> candidates{
+    {a, b, a, RemotePtr{}},
+    {b, c},
+    {d, a},
+  };
+  Stage2SnapshotWavePlan plan;
+  plan.build(span<const vec<RemotePtr>>{candidates});
+
+  // Physical reads follow first appearance and are shared by all tasks.
+  assert((plan.targets == vec<RemotePtr>{a, b, c, d}));
+  // Per-task indices retain exact logical order and repeated candidates. A
+  // missing snapshot can therefore be omitted during scatter without moving
+  // any other candidate across task boundaries.
+  assert((plan.task_target_indices[0] == vec<u32>{0, 1, 0}));
+  assert((plan.task_target_indices[1] == vec<u32>{1, 2}));
+  assert((plan.task_target_indices[2] == vec<u32>{3, 0}));
+
+  const vec<vec<RemotePtr>> retry{{c, a}};
+  plan.build(span<const vec<RemotePtr>>{retry});
+  assert((plan.targets == vec<RemotePtr>{c, a}));
+  assert(plan.task_count == 1);
+  assert((plan.task_target_indices[0] == vec<u32>{0, 1}));
+  assert(plan.task_target_indices[1].empty());
+}
+
+void test_promotion_retry_skips_dead_first_sealed_neighbor() {
+  using memory_node_storage_owner_maintenance_detail::
+    plan_stage2_backlink_reconciliation;
+  const RemotePtr dead_first = pointer(0, 0x1000);
+  const RemotePtr live_second = pointer(1, 0x2000);
+
+  // The outgoing adjacency is sealed and is not rewritten merely because its
+  // first edge retired. Promotion planning consumes the independently
+  // revalidated view, so a retry advances to the next durable parent.
+  const vec<RemotePtr> live_planner_view{live_second};
+  const auto plan = plan_stage2_backlink_reconciliation(
+    span<const RemotePtr>{}, span<const RemotePtr>{live_planner_view});
+  assert(plan.promotion_target == live_second);
+  assert(plan.promotion_target != dead_first);
+
+  // A lost ACK is not trusted blindly: after its certificate fails parent
+  // validation the retry clears it and makes the same live fallback choice.
+  const auto after_dead_certificate = plan_stage2_backlink_reconciliation(
+    span<const RemotePtr>{}, span<const RemotePtr>{live_planner_view},
+    RemotePtr{});
+  assert(after_dead_certificate.promotion_target == live_second);
+}
+
+void test_stage2_revalidation_scans_only_reachability_holders() {
+  using memory_node_storage_owner_maintenance_detail::
+    stage2_revalidation_parents;
+  const RemotePtr bridge_a = pointer(0, 0x1000);
+  const RemotePtr bridge_b = pointer(1, 0x2000);
+  const RemotePtr acknowledged = pointer(2, 0x3000);
+  const RemotePtr planned = pointer(3, 0x4000);
+  const vec<RemotePtr> bridges{bridge_b, bridge_a, bridge_a, RemotePtr{}};
+  const vec<RemotePtr> parents = stage2_revalidation_parents(
+    span<const RemotePtr>{bridges}, acknowledged, planned);
+  assert(parents ==
+         (vec<RemotePtr>{bridge_a, bridge_b, acknowledged, planned}));
+
+  // Hundreds of ordinary final neighbors are intentionally absent: they
+  // cannot own either the provisional bridge or the promoted certificate.
+  const RemotePtr unrelated = pointer(4, 0x5000);
+  assert(std::find(parents.begin(), parents.end(), unrelated) ==
+         parents.end());
 }
 
 void test_stage2_freeze_closes_the_ack_to_publish_window() {
@@ -376,6 +485,168 @@ void test_add_uses_robust_prune_only_at_the_degree_bound() {
   assert(result.accepted && !result.stale);
   assert((neighbors == vec<RemotePtr>{first, new_candidate}));
   assert(prune_calls == 1);
+}
+
+void test_add_batch_prunes_the_hot_target_union_once() {
+  const RemotePtr target = pointer(0, 0x1000);
+  const RemotePtr stable_first = pointer(0, 0x2000);
+  const RemotePtr stable_second = pointer(0, 0x3000);
+  const RemotePtr rejected = pointer(1, 0x4000);
+  const RemotePtr accepted_first = pointer(1, 0x5000);
+  const RemotePtr accepted_second = pointer(1, 0x6000);
+  const RemotePtr unrelated_provisional = pointer(1, 0x7000);
+  const RemotePtr invalid_prune_output = pointer(1, 0x8000);
+  const vec<ReconcileReverseOp> ops{
+    operation(ReconcileReverseOpKind::add, target, RemotePtr{}, rejected,
+              11),
+    operation(ReconcileReverseOpKind::add, target, RemotePtr{},
+              accepted_first, 12),
+    operation(ReconcileReverseOpKind::add, target, RemotePtr{},
+              accepted_second, 13),
+  };
+  const vec<u8> identity_live{1, 1, 1};
+  vec<RemotePtr> stable{stable_first, stable_second};
+  vec<RemotePtr> provisional{unrelated_provisional, rejected};
+  u32 prune_calls = 0;
+  const auto prune = [&](const vec<RemotePtr>& candidates) {
+    ++prune_calls;
+    assert((candidates == vec<RemotePtr>{
+                            stable_first, stable_second, rejected,
+                            accepted_first, accepted_second}));
+    // The batch policy retains the existing defensive filtering contract:
+    // candidates outside the input and duplicate outputs cannot enter the
+    // bounded graph.
+    return vec<RemotePtr>{accepted_first, invalid_prune_output,
+                          accepted_first, stable_first, accepted_second};
+  };
+
+  vec<service::storage_owner::ReconcileReverseResult> results;
+  memory_node_storage_owner_index_detail::reconcile_reverse_add_batch(
+    span<const ReconcileReverseOp>{ops}, span<const u8>{identity_live}, true,
+    3, 2, stable, provisional, results, prune);
+
+  assert(prune_calls == 1);
+  assert((stable == vec<RemotePtr>{
+                    accepted_first, stable_first, accepted_second}));
+  assert((provisional == vec<RemotePtr>{unrelated_provisional}));
+  assert(results.size() == ops.size());
+  assert(!results[0].accepted && !results[0].stale &&
+         results[0].placement_sequence == 11);
+  assert(results[1].accepted && !results[1].stale &&
+         results[1].placement_sequence == 12);
+  assert(results[2].accepted && !results[2].stale &&
+         results[2].placement_sequence == 13);
+  for (size_t index = 0; index < ops.size(); ++index) {
+    assert(memory_node_storage_owner_index_detail::
+             reconcile_reverse_postcondition_holds(ops[index],
+                                                    results[index]));
+  }
+}
+
+void test_add_batch_keeps_per_operation_identity_and_sequence_fences() {
+  const RemotePtr target = pointer(0, 0x1000);
+  const RemotePtr live = pointer(1, 0x2000);
+  const RemotePtr wrong_identity = pointer(1, 0x3000);
+  const RemotePtr zero_sequence = pointer(1, 0x4000);
+  const RemotePtr wrong_target_candidate = pointer(1, 0x5000);
+  const vec<ReconcileReverseOp> ops{
+    operation(ReconcileReverseOpKind::add, target, RemotePtr{}, live, 21),
+    operation(ReconcileReverseOpKind::add, target, RemotePtr{},
+              wrong_identity, 22),
+    operation(ReconcileReverseOpKind::add, target, RemotePtr{},
+              zero_sequence, 0),
+    operation(ReconcileReverseOpKind::add, pointer(0, 0x9000), RemotePtr{},
+              wrong_target_candidate, 24),
+  };
+  const vec<u8> identity_live{1, 0, 1, 1};
+  vec<RemotePtr> stable;
+  vec<RemotePtr> provisional{
+    live, wrong_identity, zero_sequence, wrong_target_candidate};
+  const auto never_prune = [](const vec<RemotePtr>&) -> vec<RemotePtr> {
+    assert(false);
+    return {};
+  };
+
+  vec<service::storage_owner::ReconcileReverseResult> results;
+  memory_node_storage_owner_index_detail::reconcile_reverse_add_batch(
+    span<const ReconcileReverseOp>{ops}, span<const u8>{identity_live}, true,
+    4, 2, stable, provisional, results, never_prune);
+
+  assert((stable == vec<RemotePtr>{live}));
+  assert((provisional == vec<RemotePtr>{
+                         wrong_identity, zero_sequence,
+                         wrong_target_candidate}));
+  assert(results[0].accepted && !results[0].stale &&
+         results[0].placement_sequence == 21);
+  assert(results[1].stale && results[1].placement_sequence == 22);
+  assert(results[2].stale && results[2].placement_sequence == 0);
+  assert(results[3].stale && results[3].placement_sequence == 24);
+}
+
+void test_promotion_is_a_pruning_boundary_for_same_target_adds() {
+  const RemotePtr target = pointer(0, 0x1000);
+  const RemotePtr stable_first = pointer(0, 0x2000);
+  const RemotePtr stable_second = pointer(0, 0x3000);
+  const RemotePtr promoted = pointer(1, 0x4000);
+  const RemotePtr ordinary_first = pointer(1, 0x5000);
+  const RemotePtr ordinary_second = pointer(1, 0x6000);
+  const vec<ReconcileReverseOp> ops{
+    operation(ReconcileReverseOpKind::promote_stable_bridge, target,
+              promoted, promoted, 31),
+    operation(ReconcileReverseOpKind::add, target, RemotePtr{},
+              ordinary_first, 32),
+    operation(ReconcileReverseOpKind::add, target, RemotePtr{},
+              ordinary_second, 33),
+  };
+  const vec<size_t> op_indices{0, 1, 2};
+  assert(memory_node_storage_owner_index_detail::
+           reconcile_reverse_add_run_end(
+             span<const ReconcileReverseOp>{ops},
+             span<const size_t>{op_indices}, 0) == 0);
+  assert(memory_node_storage_owner_index_detail::
+           reconcile_reverse_add_run_end(
+             span<const ReconcileReverseOp>{ops},
+             span<const size_t>{op_indices}, 1) == 3);
+
+  vec<RemotePtr> stable{stable_first, stable_second};
+  vec<RemotePtr> provisional{promoted};
+  u32 prune_calls = 0;
+  const auto prune = [&](const vec<RemotePtr>& candidates) {
+    ++prune_calls;
+    if (prune_calls == 1) {
+      // Promotion is scored alone. Ordinary proposals are not allowed to
+      // enter the mandatory-certificate invocation.
+      assert((candidates == vec<RemotePtr>{
+                              stable_first, stable_second, promoted}));
+      return vec<RemotePtr>{stable_first, stable_second};
+    }
+    assert(prune_calls == 2);
+    // Only the following compatible add run is union-pruned.
+    assert((candidates == vec<RemotePtr>{
+                            stable_first, promoted,
+                            ordinary_first, ordinary_second}));
+    return vec<RemotePtr>{stable_first, ordinary_first};
+  };
+
+  const auto promotion_result =
+    memory_node_storage_owner_index_detail::reconcile_reverse_adjacency(
+      ops[0], true, true, true, true, 2, 2,
+      stable, provisional, prune);
+  assert(promotion_result.accepted && promotion_result.removed &&
+         !promotion_result.stale);
+  assert((stable == vec<RemotePtr>{stable_first, promoted}));
+  assert(provisional.empty());
+
+  const vec<ReconcileReverseOp> add_ops{ops[1], ops[2]};
+  const vec<u8> identities{1, 1};
+  vec<service::storage_owner::ReconcileReverseResult> add_results;
+  memory_node_storage_owner_index_detail::reconcile_reverse_add_batch(
+    span<const ReconcileReverseOp>{add_ops}, span<const u8>{identities},
+    true, 2, 2, stable, provisional, add_results, prune);
+  assert(prune_calls == 2);
+  assert(add_results.size() == 2);
+  assert(add_results[0].accepted && !add_results[0].stale);
+  assert(!add_results[1].accepted && !add_results[1].stale);
 }
 
 void test_replace_conflict_reenters_robust_prune() {
@@ -907,14 +1178,21 @@ void test_ordinary_rejection_cannot_substitute_for_promotion_ack() {
 int main() {
   test_protocol_layout_is_additive();
   test_bounded_prune_rejection_is_a_terminal_ordinary_postcondition();
+  test_retired_target_completes_only_non_reachability_work();
   test_stage2_backlink_plan_cleans_selected_and_unselected_bridges();
   test_final_parent_eligibility_rejects_churn_and_dependency_cycles();
+  test_stage2_snapshot_wave_deduplicates_without_losing_task_order();
+  test_promotion_retry_skips_dead_first_sealed_neighbor();
+  test_stage2_revalidation_scans_only_reachability_holders();
   test_stage2_freeze_closes_the_ack_to_publish_window();
   test_stage2_freeze_lifecycle_has_one_mutation_boundary();
   test_stale_stage2_retires_only_an_authority_detached_source();
   test_equivalent_replace_is_in_place_and_idempotent();
   test_remove_if_present_has_an_idempotent_postcondition();
   test_add_uses_robust_prune_only_at_the_degree_bound();
+  test_add_batch_prunes_the_hot_target_union_once();
+  test_add_batch_keeps_per_operation_identity_and_sequence_fences();
+  test_promotion_is_a_pruning_boundary_for_same_target_adds();
   test_replace_conflict_reenters_robust_prune();
   test_identity_or_liveness_mismatch_is_stale_and_non_mutating();
   test_stage1_provisional_reconciles_to_final_stable_with_free_slot();

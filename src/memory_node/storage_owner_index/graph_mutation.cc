@@ -79,10 +79,9 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
     breakdown->storage_owner_prune_sort_ns += elapsed_ns_since(t_sort);
   }
 
-  select_alpha_robust_pruned_sorted(
+  select_alpha_robust_pruned_sorted_by_pair_predicate(
     span<const StorageOwnerPruneCandidateInfo>{infos.data(), infos.size()},
     result_limit,
-    config.alpha,
     [](const StorageOwnerPruneCandidateInfo& candidate) {
       return candidate.rptr;
     },
@@ -90,15 +89,17 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
       return candidate.dist;
     },
     [&](const StorageOwnerPruneCandidateInfo& candidate,
-        const StorageOwnerPruneCandidateInfo& retained) {
+        const StorageOwnerPruneCandidateInfo& retained,
+        const distance_t source_distance) {
       auto t_pair_distance = std::chrono::steady_clock::now();
-      const distance_t pair_dist = distance_between_vectors(
+      const bool pruned = typed_l2_distance_alpha_leq_source(
         candidate.vector_data.data(), VamanaNode::vector_dtype(),
-        retained.vector_data.data(), VamanaNode::vector_dtype(), config);
+        retained.vector_data.data(), VamanaNode::vector_dtype(),
+        config.dim, config.alpha, source_distance);
       if (breakdown != nullptr) {
         breakdown->storage_owner_prune_pair_distance_ns += elapsed_ns_since(t_pair_distance);
       }
-      return pair_dist;
+      return pruned;
     },
     selected,
     selected_indices);
@@ -110,6 +111,24 @@ vec<RemotePtr> MemoryNode::robust_prune_snapshots_cpu(
     const byte_t* source,
     VectorDType source_dtype,
     span<const NodeSnapshot> candidates,
+    const hashset_t<RemotePtr>& skip,
+    const Configuration& config,
+    u32 result_limit_override) {
+  thread_local vec<const NodeSnapshot*> references;
+  references.clear();
+  references.reserve(candidates.size());
+  for (const NodeSnapshot& candidate : candidates) {
+    references.push_back(&candidate);
+  }
+  return robust_prune_snapshot_refs_cpu(
+    source, source_dtype, span<const NodeSnapshot* const>{references}, skip,
+    config, result_limit_override);
+}
+
+vec<RemotePtr> MemoryNode::robust_prune_snapshot_refs_cpu(
+    const byte_t* source,
+    VectorDType source_dtype,
+    span<const NodeSnapshot* const> candidates,
     const hashset_t<RemotePtr>& skip,
     const Configuration& config,
     u32 result_limit_override) {
@@ -141,7 +160,9 @@ vec<RemotePtr> MemoryNode::robust_prune_snapshots_cpu(
   scored.reserve(candidates.size());
   seen.reserve(candidates.size());
   selected.reserve(result_limit);
-  for (const NodeSnapshot& candidate : candidates) {
+  for (const NodeSnapshot* candidate_pointer : candidates) {
+    if (candidate_pointer == nullptr) continue;
+    const NodeSnapshot& candidate = *candidate_pointer;
     if (candidate.rptr.is_null() || candidate.deleted ||
         (candidate.header & VamanaNode::HEADER_PROVISIONAL) != 0 ||
         candidate.vector_data.size() < VamanaNode::vector_bytes() ||
@@ -161,10 +182,9 @@ vec<RemotePtr> MemoryNode::robust_prune_snapshots_cpu(
                const StorageOwnerScoredSnapshot& rhs) {
               return lhs.distance < rhs.distance;
             });
-  select_alpha_robust_pruned_sorted(
+  select_alpha_robust_pruned_sorted_by_pair_predicate(
     span<const StorageOwnerScoredSnapshot>{scored.data(), scored.size()},
     result_limit,
-    config.alpha,
     [](const StorageOwnerScoredSnapshot& candidate) {
       return candidate.snapshot->rptr;
     },
@@ -172,13 +192,16 @@ vec<RemotePtr> MemoryNode::robust_prune_snapshots_cpu(
       return candidate.distance;
     },
     [&](const StorageOwnerScoredSnapshot& candidate,
-        const StorageOwnerScoredSnapshot& retained) {
-      return distance_between_vectors(
+        const StorageOwnerScoredSnapshot& retained,
+        const distance_t source_distance) {
+      return typed_l2_distance_alpha_leq_source(
         candidate.snapshot->vector_data.data(),
         VamanaNode::vector_dtype(),
         retained.snapshot->vector_data.data(),
         VamanaNode::vector_dtype(),
-        config);
+        config.dim,
+        config.alpha,
+        source_distance);
     },
     selected,
     selected_indices);

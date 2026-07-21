@@ -20,6 +20,7 @@ inline constexpr std::array<std::string_view, kCategoryCount> kCategoryNames = {
 
 enum class Subcategory : u8 {
   cpu_storage_owner_queue_wait = 0,
+  cpu_storage_owner_stage1_execute_wait,
   cpu_storage_owner_search,
   cpu_storage_owner_prune,
   cpu_storage_owner_write_node,
@@ -32,6 +33,9 @@ enum class Subcategory : u8 {
   cpu_storage_owner_publish_mutation,
   cpu_storage_owner_schedule_maintenance,
   cpu_storage_owner_response_build,
+  cpu_storage_owner_stage1_arm_wait,
+  cpu_storage_owner_stage1_release_wait,
+  cpu_storage_owner_cleanup_control_wait,
   cpu_storage_owner_sender_queue_wait,
   cpu_storage_owner_request_prepare,
   cpu_storage_owner_route,
@@ -59,6 +63,7 @@ constexpr size_t kSubcategoryCount = static_cast<size_t>(Subcategory::count);
 
 inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNames = {
   "cpu_storage_owner_queue_wait_ns",
+  "cpu_storage_owner_stage1_execute_wait_ns",
   "cpu_storage_owner_search_ns",
   "cpu_storage_owner_prune_ns",
   "cpu_storage_owner_write_node_ns",
@@ -71,6 +76,9 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "cpu_storage_owner_publish_mutation_ns",
   "cpu_storage_owner_schedule_maintenance_ns",
   "cpu_storage_owner_response_build_ns",
+  "cpu_storage_owner_stage1_arm_wait_ns",
+  "cpu_storage_owner_stage1_release_wait_ns",
+  "cpu_storage_owner_cleanup_control_wait_ns",
   "cpu_storage_owner_sender_queue_wait_ns",
   "cpu_storage_owner_request_prepare_ns",
   "cpu_storage_owner_route_ns",

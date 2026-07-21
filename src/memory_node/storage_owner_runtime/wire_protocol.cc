@@ -1,3 +1,5 @@
+#include <stdexcept>
+
 #include "memory_node/storage_owner_runtime/detail.hh"
 
 using namespace memory_node_storage_owner_runtime_detail;
@@ -341,9 +343,20 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
     if (plan.kind == MutationKind::erase) continue;
 
+    const bool fuse_prepare_and_arm =
+      plan.kind == MutationKind::insert &&
+      plan.begin.previous.current.is_null();
+    if (fuse_prepare_and_arm) {
+      lib_assert(plan.begin.previous.placement_version !=
+                   std::numeric_limits<u64>::max(),
+                 "authority placement version overflow");
+    }
+
     plan.stage1_item = Stage1ExecuteItem{
       .client_batch_id = client_batch_id,
       .old_raw = plan.begin.previous.current.raw_address,
+      .initial_placement_version = fuse_prepare_and_arm
+        ? plan.begin.previous.placement_version + 1 : 0,
       .source_client = source_client,
       .item_index = static_cast<u32>(index),
       .id = ids[index],
@@ -357,17 +370,16 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   // Group each item by its one centroid-selected home. Distinct remote-home
   // groups in the batch are posted as one fanout before waiting for any
   // response, so centroid skew does not turn the batch into a serial RPC
-  // chain. Local work uses the identical semantic operation table.
+  // chain. Local work uses the identical semantic operation table and runs
+  // only after those remote messages have been primed, overlapping both
+  // physical-home execution paths.
   dense_hashmap_t<u32, vec<Stage1ExecuteItem>> remote_stage1_items;
   dense_hashmap_t<u32, vec<byte_t>> remote_stage1_vectors;
+  vec<size_t> local_stage1_indices;
   for (const auto& [home, indices] : stage1_groups) {
     if (home == storage_id_) {
-      for (const size_t index : indices) {
-        plans[index].stage1_result = prepare_local_stage1_item(
-          storage_id_, plans[index].stage1_item,
-          raw_vectors + index * VamanaNode::vector_bytes(), config,
-          &breakdown);
-      }
+      local_stage1_indices.insert(
+        local_stage1_indices.end(), indices.begin(), indices.end());
       continue;
     }
     vec<Stage1ExecuteItem>& wire_items = remote_stage1_items[home];
@@ -383,16 +395,87 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
         VamanaNode::vector_bytes());
     }
   }
+
+  u64 local_stage1_elapsed_ns = 0;
+  const auto execute_local_stage1 = [&]() {
+    const auto local_started = std::chrono::steady_clock::now();
+    const auto finish_local_timing = [&]() {
+      local_stage1_elapsed_ns += elapsed_ns_since(local_started);
+    };
+    for (const size_t index : local_stage1_indices) {
+      const Stage1OperationKey key{
+        .authority_shard = storage_id_,
+        .source_client = plans[index].stage1_item.source_client,
+        .item_index = plans[index].stage1_item.item_index,
+        .client_batch_id = plans[index].stage1_item.client_batch_id,
+      };
+      do {
+        while (!try_track_stage1_inflight_request(key)) {
+          if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+            finish_local_timing();
+            return false;
+          }
+          std::unique_lock<std::mutex> lock(
+            storage_owner_maintenance_mutex_);
+          storage_owner_maintenance_cv_.wait_for(
+            lock, std::chrono::microseconds(100));
+        }
+        try {
+          plans[index].stage1_result =
+            prepare_and_maybe_arm_local_stage1_item(
+              storage_id_, plans[index].stage1_item,
+              raw_vectors + index * VamanaNode::vector_bytes(), config,
+              &breakdown);
+        } catch (...) {
+          finish_stage1_inflight_request(key);
+          throw;
+        }
+        finish_stage1_inflight_request(key);
+        if (plans[index].stage1_result.status ==
+            static_cast<u32>(MutationStatus::retry)) {
+          if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+            finish_local_timing();
+            return false;
+          }
+          std::unique_lock<std::mutex> lock(
+            storage_owner_maintenance_mutex_);
+          storage_owner_maintenance_cv_.wait_for(
+            lock, std::chrono::microseconds(100));
+        }
+      } while (plans[index].stage1_result.status ==
+               static_cast<u32>(MutationStatus::retry));
+    }
+    finish_local_timing();
+    return true;
+  };
   dense_hashmap_t<u32, vec<Stage1ExecuteResult>> remote_stage1_results;
-  (void)execute_remote_stage1_fanout_and_wait(
+  const auto stage1_execute_started = std::chrono::steady_clock::now();
+  const bool stage1_transport_ok = execute_remote_stage1_fanout_and_wait(
     remote_stage1_items, remote_stage1_vectors,
-    remote_stage1_results, config);
+    remote_stage1_results, execute_local_stage1, config);
+  // Local search/prune time is already represented by its detailed counters.
+  // Subtract the overlapped interval so the aggregate breakdown remains a
+  // partition rather than double-counting concurrent local and remote work.
+  const u64 stage1_critical_path_ns = elapsed_ns_since(stage1_execute_started);
+  breakdown.storage_owner_stage1_execute_wait_ns +=
+    stage1_critical_path_ns > local_stage1_elapsed_ns
+      ? stage1_critical_path_ns - local_stage1_elapsed_ns : 0;
+  if (!stage1_transport_ok) {
+    // A fused request may already own a runnable Stage2 descriptor at its
+    // physical home. Transport uncertainty is not a semantic prepare failure.
+    if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    throw std::runtime_error(
+      "Stage1 transport stopped before every semantic token resolved");
+  }
   for (const auto& [home, indices] : stage1_groups) {
     if (home == storage_id_) continue;
     const auto found = remote_stage1_results.find(home);
     if (found == remote_stage1_results.end() ||
         found->second.size() != indices.size()) {
-      continue;
+      throw std::runtime_error(
+        "Stage1 fanout resolved without a complete home result set");
     }
     for (size_t slot = 0; slot < indices.size(); ++slot) {
       plans[indices[slot]].stage1_result = found->second[slot];
@@ -418,6 +501,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     };
     vec<Stage1ArmResult> control_results;
     bool transported = false;
+    const auto control_started = std::chrono::steady_clock::now();
     if (plan.stage1_home == storage_id_) {
       transported = arm_local_stage1_items(
         storage_id_, span<const Stage1ArmItem>{&item, 1},
@@ -426,6 +510,12 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       transported = arm_remote_stage1_batch(
         plan.stage1_home, source_client,
         span<const Stage1ArmItem>{&item, 1}, control_results, config);
+    }
+    const u64 control_ns = elapsed_ns_since(control_started);
+    if (action == Stage1ArmAction::release) {
+      breakdown.storage_owner_stage1_release_wait_ns += control_ns;
+    } else {
+      breakdown.storage_owner_stage1_arm_wait_ns += control_ns;
     }
     if (!transported || control_results.size() != 1) return false;
     const Stage1ArmResult& output = control_results.front();
@@ -449,21 +539,27 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   const auto release_stage1 = [&](size_t index, u64 placement_version) {
     while (!control_stage1(
       index, Stage1ArmAction::release, placement_version, nullptr)) {
+      if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+        return false;
+      }
       std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
       storage_owner_maintenance_cv_.wait_for(
         lock, std::chrono::microseconds(100));
     }
+    return true;
   };
 
   const auto release_cleanup = [&](span<const CleanupActivateItem> activated) {
-    if (activated.empty()) return;
+    if (activated.empty()) return true;
+    const auto release_started = std::chrono::steady_clock::now();
     vec<CleanupActivateItem> releases(activated.begin(), activated.end());
     for (CleanupActivateItem& item : releases) {
       item.action = static_cast<u32>(CleanupActivateAction::release);
     }
     vec<CleanupActivateResult> release_results;
     bool released = false;
-    while (!released) {
+    while (!released &&
+           !storage_insert_shutdown_.load(std::memory_order_acquire)) {
       released = activate_cleanup_fanout_and_wait(
         span<const CleanupActivateItem>{releases}, release_results, config);
       if (!released) {
@@ -472,6 +568,9 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
           lock, std::chrono::microseconds(100));
       }
     }
+    breakdown.storage_owner_cleanup_control_wait_ns +=
+      elapsed_ns_since(release_started);
+    return released;
   };
 
   // A failed physical prepare has no authority-visible side effect. Abort by
@@ -485,6 +584,9 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
     while (!control_stage1(
       index, Stage1ArmAction::abort, 0, nullptr)) {
+      if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+        return false;
+      }
       std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
       storage_owner_maintenance_cv_.wait_for(
         lock, std::chrono::microseconds(100));
@@ -492,7 +594,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     // Keep the authority lease closed until the abort fence itself has been
     // released. A fresh retry of the same public token can then acquire the
     // lease without racing a stale physical receipt.
-    release_stage1(index, 0);
+    if (!release_stage1(index, 0)) return false;
     (void)abort_authority_mutation(ids[index], plan.operation);
     plan.active = false;
   }
@@ -519,7 +621,9 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   }
   vec<CleanupActivateResult> cleanup_results;
   bool cleanup_ok = cleanup_items.empty();
-  while (!cleanup_ok) {
+  const auto cleanup_started = std::chrono::steady_clock::now();
+  while (!cleanup_ok &&
+         !storage_insert_shutdown_.load(std::memory_order_acquire)) {
     cleanup_ok = activate_cleanup_fanout_and_wait(
       span<const CleanupActivateItem>{cleanup_items}, cleanup_results,
       config);
@@ -535,10 +639,15 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
         lock, std::chrono::microseconds(100));
     }
   }
+  if (!cleanup_ok) return false;
   if (cleanup_results.size() == cleanup_indices.size()) {
     for (size_t slot = 0; slot < cleanup_indices.size(); ++slot) {
       plans[cleanup_indices[slot]].cleanup_result = cleanup_results[slot];
     }
+  }
+  if (!cleanup_items.empty()) {
+    breakdown.storage_owner_cleanup_control_wait_ns +=
+      elapsed_ns_since(cleanup_started);
   }
 
   // Arm only after old-generation cleanup is runnable. Arm itself reserves a
@@ -554,13 +663,18 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
          plan.cleanup_result.maintenance_sequence == 0)) {
       while (!control_stage1(
         index, Stage1ArmAction::abort, 0, nullptr)) {
+        if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+          return false;
+        }
         std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
         storage_owner_maintenance_cv_.wait_for(
           lock, std::chrono::microseconds(100));
       }
-      release_stage1(index, 0);
-      release_cleanup(span<const CleanupActivateItem>{
-        &plan.cleanup_item, 1});
+      if (!release_stage1(index, 0)) return false;
+      if (!release_cleanup(span<const CleanupActivateItem>{
+            &plan.cleanup_item, 1})) {
+        return false;
+      }
       (void)abort_authority_mutation(ids[index], plan.operation);
       plan.active = false;
       continue;
@@ -574,8 +688,17 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   // their cached sequences without allocating another descriptor.
   dense_hashmap_t<u32, vec<size_t>> arm_groups;
   for (size_t index = 0; index < item_count; ++index) {
-    const MutationPlan& plan = plans[index];
-    if (plan.active && plan.kind != MutationKind::erase) {
+    MutationPlan& plan = plans[index];
+    if (!plan.active || plan.kind == MutationKind::erase) continue;
+    if (plan.stage1_result.maintenance_sequence != 0) {
+      plan.arm_result = Stage1ArmResult{
+        .token = plan.operation,
+        .target_raw = plan.stage1_result.target_raw,
+        .maintenance_sequence =
+          plan.stage1_result.maintenance_sequence,
+        .status = static_cast<u32>(MutationStatus::ok),
+      };
+    } else {
       arm_groups[plan.stage1_home].push_back(index);
     }
   }
@@ -599,7 +722,11 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
 
     bool armed = false;
+    const auto arm_started = std::chrono::steady_clock::now();
     while (!armed) {
+      if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+        return false;
+      }
       vec<Stage1ArmResult> arm_results;
       const bool transported = home == storage_id_
         ? arm_local_stage1_items(
@@ -629,6 +756,8 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       storage_owner_maintenance_cv_.wait_for(
         lock, std::chrono::microseconds(100));
     }
+    breakdown.storage_owner_stage1_arm_wait_ns +=
+      elapsed_ns_since(arm_started);
   }
 
   // Directory commit is the sole logical linearization point. Old cleanup is
@@ -669,29 +798,32 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
   }
 
-  // A committed public replay terminates at the authority directory and never
-  // needs the physical Stage1 receipt again. Release in the same per-home
-  // batches used by arm so high update rates pay one bounded control RTT per
-  // centroid home, not one RTT per vector. A lost response is harmless: the
-  // release postcondition (missing receipt) is itself ACKed on retry.
-  for (const auto& [home, indices] : arm_groups) {
-    vec<Stage1ArmItem> release_items;
-    release_items.reserve(indices.size());
-    for (const size_t index : indices) {
-      const MutationPlan& plan = plans[index];
-      release_items.push_back(Stage1ArmItem{
-        .token = plan.operation,
-        .target_raw = plan.stage1_result.target_raw,
-        .initial_placement_version =
-          plan.begin.previous.placement_version + 1,
-        .id = ids[index],
-        .generation = plan.begin.generation,
-        .action = static_cast<u32>(Stage1ArmAction::release),
-      });
-    }
-
+  // Release compact Stage1 receipts only after the authority commit.  For a
+  // remote home the release RPC uses the same RC control QP as every execute
+  // retry.  Its ACK is therefore an ordered watermark: all older retries were
+  // received, registered as in-flight, and quiesced before the receipt was
+  // erased.  A Stage2-local "count is currently zero" observation cannot
+  // establish that transport fact.  Batch by home so this costs at most one
+  // control RTT per participating shard rather than one RTT per item.
+  dense_hashmap_t<u32, vec<Stage1ArmItem>> committed_release_groups;
+  for (size_t index = 0; index < item_count; ++index) {
+    const MutationPlan& plan = plans[index];
+    if (!plan.active || plan.kind == MutationKind::erase) continue;
+    committed_release_groups[plan.stage1_home].push_back(Stage1ArmItem{
+      .token = plan.operation,
+      .target_raw = plan.stage1_result.target_raw,
+      .initial_placement_version =
+        plan.begin.previous.placement_version + 1,
+      .id = ids[index],
+      .generation = plan.begin.generation,
+      .action = static_cast<u32>(Stage1ArmAction::release),
+    });
+  }
+  for (const auto& [home, release_items] : committed_release_groups) {
+    const auto release_started = std::chrono::steady_clock::now();
     bool released = false;
-    while (!released) {
+    while (!released &&
+           !storage_insert_shutdown_.load(std::memory_order_acquire)) {
       vec<Stage1ArmResult> release_results;
       const bool transported = home == storage_id_
         ? arm_local_stage1_items(
@@ -702,20 +834,31 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
             release_results, config);
       released = transported &&
         release_results.size() == release_items.size();
-      for (size_t slot = 0; released && slot < release_items.size(); ++slot) {
+      for (size_t slot = 0;
+           released && slot < release_items.size(); ++slot) {
         const Stage1ArmItem& input = release_items[slot];
         const Stage1ArmResult& output = release_results[slot];
-        released = output.token.source_client == input.token.source_client &&
+        released = output.token.source_client ==
+                     input.token.source_client &&
           output.token.item_index == input.token.item_index &&
           output.token.client_batch_id == input.token.client_batch_id &&
-          output.target_raw == input.target_raw && output.reserved == 0 &&
+          output.reserved == 0 &&
           output.status == static_cast<u32>(MutationStatus::ok);
       }
       if (!released) {
-        std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+        std::unique_lock<std::mutex> lock(
+          storage_owner_maintenance_mutex_);
         storage_owner_maintenance_cv_.wait_for(
           lock, std::chrono::microseconds(100));
       }
+    }
+    breakdown.storage_owner_stage1_release_wait_ns +=
+      elapsed_ns_since(release_started);
+    if (!released) {
+      // The directory commit is already durable.  Returning a transport
+      // failure is safe: replay of this public token observes committed_replay
+      // and never performs physical work twice.
+      return false;
     }
   }
 
@@ -726,7 +869,6 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       committed_cleanup_items.push_back(plan.cleanup_item);
     }
   }
-  release_cleanup(
+  return release_cleanup(
     span<const CleanupActivateItem>{committed_cleanup_items});
-  return true;
 }

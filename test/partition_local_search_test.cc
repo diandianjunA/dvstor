@@ -357,6 +357,132 @@ void test_stage2_budget_reserves_exactly_l_remote_expansions() {
   assert(!result[0].expanded);
 }
 
+void test_stage2_batch_wavefront_preserves_independent_searches() {
+  const RemotePtr a0{1, 128};
+  const RemotePtr a1{1, 256};
+  const RemotePtr a2{1, 384};
+  const RemotePtr b0{3, 128};
+  const RemotePtr b1{3, 256};
+  const RemotePtr b2{3, 384};
+  const vec<detail::PartitionLocalSearchEntry> local_a{
+    {local(0), 20.0F, true}};
+  const vec<detail::PartitionLocalSearchEntry> local_b{
+    {local(1), 20.0F, true}};
+  const vec<RemotePtr> frontier_a{a0};
+  const vec<RemotePtr> frontier_b{b0};
+  const std::array<detail::PartitionContinuationSeed, 2> seeds{{
+    {span<const detail::PartitionLocalSearchEntry>{local_a},
+     span<const RemotePtr>{frontier_a}},
+    {span<const detail::PartitionLocalSearchEntry>{local_b},
+     span<const RemotePtr>{frontier_b}},
+  }};
+  dense_hashmap_t<u64, distance_t> distances{
+    {a0.raw_address, 6.0F}, {a1.raw_address, 4.0F},
+    {a2.raw_address, 2.0F}, {b0.raw_address, 7.0F},
+    {b1.raw_address, 5.0F}, {b2.raw_address, 3.0F},
+  };
+  dense_hashmap_t<u64, RemotePtr> next{
+    {a0.raw_address, a1}, {a1.raw_address, a2},
+    {b0.raw_address, b1}, {b1.raw_address, b2},
+  };
+
+  size_t score_waves = 0;
+  size_t expansion_waves = 0;
+  size_t max_score_wave = 0;
+  size_t max_expansion_wave = 0;
+  detail::PartitionContinuationBatch batch;
+  vec<bool> exhausted;
+  vec<u64> expansions;
+  const auto& results = batch.run(
+    span<const detail::PartitionContinuationSeed>{seeds.data(), seeds.size()},
+    kPartition, 2,
+    detail::stage2_partition_search_budget(2, 4),
+    [&](span<const detail::PartitionContinuationScoreRequest> requests,
+        auto&& emit) {
+      ++score_waves;
+      max_score_wave = std::max(max_score_wave, requests.size());
+      for (const auto& request : requests) {
+        emit(request.search_index, request.pointer,
+             distances.at(request.pointer.raw_address));
+      }
+    },
+    [&](span<const detail::PartitionContinuationExpandRequest> requests,
+        auto&& emit) {
+      ++expansion_waves;
+      max_expansion_wave = std::max(max_expansion_wave, requests.size());
+      for (const auto& request : requests) {
+        const auto found = next.find(request.pointer.raw_address);
+        if (found != next.end()) {
+          emit(request.search_index, found->second);
+        }
+      }
+    },
+    &exhausted, &expansions);
+
+  assert(results.size() == 2);
+  assert(results[0][0].rptr == a2);
+  assert(results[1][0].rptr == b2);
+  assert(expansions[0] == 2 && expansions[1] == 2);
+  assert(exhausted[0] && exhausted[1]);
+  // Two independent searches share each physical I/O wave. Their expansion
+  // budgets remain per-search rather than becoming one shared batch budget.
+  assert(score_waves == 3);
+  assert(expansion_waves == 2);
+  assert(max_score_wave == 2);
+  assert(max_expansion_wave == 2);
+}
+
+void test_stage2_batch_missing_snapshot_is_isolated() {
+  const RemotePtr unreadable{1, 128};
+  const RemotePtr healthy0{3, 128};
+  const RemotePtr healthy1{3, 256};
+  const vec<detail::PartitionLocalSearchEntry> local_a{
+    {local(0), 20.0F, true}};
+  const vec<detail::PartitionLocalSearchEntry> local_b{
+    {local(1), 20.0F, true}};
+  const vec<RemotePtr> frontier_a{unreadable};
+  const vec<RemotePtr> frontier_b{healthy0};
+  const std::array<detail::PartitionContinuationSeed, 2> seeds{{
+    {span<const detail::PartitionLocalSearchEntry>{local_a},
+     span<const RemotePtr>{frontier_a}},
+    {span<const detail::PartitionLocalSearchEntry>{local_b},
+     span<const RemotePtr>{frontier_b}},
+  }};
+
+  detail::PartitionContinuationBatch batch;
+  vec<u64> expansions;
+  const auto& results = batch.run(
+    span<const detail::PartitionContinuationSeed>{seeds.data(), seeds.size()},
+    kPartition, 2,
+    detail::stage2_partition_search_budget(2, 4),
+    [&](span<const detail::PartitionContinuationScoreRequest> requests,
+        auto&& emit) {
+      for (const auto& request : requests) {
+        // Model one failed/stale vector snapshot by omitting its callback.
+        if (request.pointer == unreadable) continue;
+        emit(request.search_index, request.pointer,
+             request.pointer == healthy0 ? 4.0F : 1.0F);
+      }
+    },
+    [&](span<const detail::PartitionContinuationExpandRequest> requests,
+        auto&& emit) {
+      for (const auto& request : requests) {
+        if (request.pointer == healthy0) {
+          emit(request.search_index, healthy1);
+        }
+      }
+    },
+    nullptr, &expansions);
+
+  // A partial read failure rejects only that physical candidate. It neither
+  // retries/discards the healthy task nor consumes the healthy task's budget.
+  assert(results[0].size() == 1);
+  assert(results[0][0].rptr == local(0));
+  assert(expansions[0] == 0);
+  assert(results[1][0].rptr == healthy1);
+  assert(expansions[1] == 2);
+}
+
 void test_final_home_strictly_reduces_cross_shard_edges() {
   const vec<RemotePtr> neighbors{
     RemotePtr{0, 64}, RemotePtr{2, 64}, RemotePtr{2, 128},
@@ -386,6 +512,8 @@ int main() {
   test_stage1_frontier_is_bounded_and_deterministic();
   test_stage2_continues_stage1_without_restarting_local_search();
   test_stage2_budget_reserves_exactly_l_remote_expansions();
+  test_stage2_batch_wavefront_preserves_independent_searches();
+  test_stage2_batch_missing_snapshot_is_isolated();
   test_final_home_strictly_reduces_cross_shard_edges();
   return 0;
 }

@@ -128,6 +128,76 @@ std::vector<format::StorageControlBlock> PersistentSearchEngine::Impl::read_stor
   return controls;
 }
 
+std::vector<std::optional<maintenance_telemetry::Snapshot>>
+PersistentSearchEngine::Impl::read_maintenance_telemetry() {
+  std::lock_guard<std::mutex> read_lock(storage_control_read_mutex);
+  const size_t shard_count = index.shards.size();
+  std::vector<std::optional<maintenance_telemetry::Snapshot>> result(
+    shard_count);
+  if (control_bootstrapper == nullptr || shard_count == 0) return result;
+
+  std::vector<NavigationRead> requests(shard_count);
+  std::vector<i32> statuses(shard_count, -EIO);
+  std::vector<i32> snapshot_statuses(shard_count, -EIO);
+  std::vector<maintenance_telemetry::Snapshot> snapshots(shard_count);
+  std::vector<u64> sequences_after(shard_count);
+  // A collision with the 5-second writer is rare. Keep retry count fixed so
+  // benchmark telemetry can never turn into an unbounded control-plane stall.
+  for (u32 attempt = 0; attempt < 3; ++attempt) {
+    for (size_t shard = 0; shard < shard_count; ++shard) {
+      requests[shard] = NavigationRead{
+        .remote_offset = index.shards[shard].control_remote_offset +
+          maintenance_telemetry::kSnapshotOffset,
+        .destination_address = reinterpret_cast<u64>(
+          d_maintenance_snapshots + shard),
+        .bytes = sizeof(maintenance_telemetry::Snapshot),
+        .memory_node = static_cast<u16>(shard),
+      };
+      statuses[shard] = -EIO;
+    }
+    control_bootstrapper->read(requests, statuses);
+    snapshot_statuses = statuses;
+    check_cuda(cudaMemcpy(
+      snapshots.data(), d_maintenance_snapshots,
+      snapshots.size() * sizeof(maintenance_telemetry::Snapshot),
+      cudaMemcpyDeviceToHost),
+      "cudaMemcpy(storage maintenance telemetry snapshots)");
+
+    for (size_t shard = 0; shard < shard_count; ++shard) {
+      requests[shard] = NavigationRead{
+        .remote_offset = index.shards[shard].control_remote_offset +
+          maintenance_telemetry::kSnapshotOffset,
+        .destination_address = reinterpret_cast<u64>(
+          d_maintenance_sequence_after + shard),
+        .bytes = sizeof(u64),
+        .memory_node = static_cast<u16>(shard),
+      };
+      statuses[shard] = -EIO;
+    }
+    control_bootstrapper->read(requests, statuses);
+    check_cuda(cudaMemcpy(
+      sequences_after.data(), d_maintenance_sequence_after,
+      sequences_after.size() * sizeof(u64), cudaMemcpyDeviceToHost),
+      "cudaMemcpy(storage maintenance telemetry sequences)");
+
+    bool needs_retry = false;
+    for (size_t shard = 0; shard < shard_count; ++shard) {
+      if (snapshot_statuses[shard] <= 0 || statuses[shard] <= 0) continue;
+      if (maintenance_telemetry::validate(
+            snapshots[shard], sequences_after[shard],
+            static_cast<u32>(shard))) {
+        result[shard] = snapshots[shard];
+      } else if (snapshots[shard].sequence != 0 &&
+                 (snapshots[shard].magic == maintenance_telemetry::kMagic ||
+                  (snapshots[shard].sequence & 1u) != 0)) {
+        needs_retry = true;
+      }
+    }
+    if (!needs_retry) break;
+  }
+  return result;
+}
+
 bool PersistentSearchEngine::Impl::wait_for_maintenance(
     std::span<const u64> target_sequences,
     std::chrono::milliseconds timeout,

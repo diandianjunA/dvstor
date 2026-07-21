@@ -14,6 +14,7 @@
 
 #include "common/configuration.hh"
 #include "common/vector_dtype.hh"
+#include "gpu_search/maintenance_telemetry.hh"
 #include "gpu_search/types.hh"
 #include "service/query_result.hh"
 
@@ -39,6 +40,8 @@ public:
     std::chrono::milliseconds timeout,
     std::vector<u64>* durable_sequences = nullptr,
     std::vector<u64>* effective_target_sequences = nullptr);
+  std::vector<std::optional<maintenance_telemetry::Snapshot>>
+    read_maintenance_telemetry();
 
   TelemetrySnapshot telemetry() const { return telemetry_.snapshot(); }
   void reset_telemetry();

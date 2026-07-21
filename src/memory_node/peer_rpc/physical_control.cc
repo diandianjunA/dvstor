@@ -942,6 +942,95 @@ bool MemoryNode::relocate_via_authority(
   return false;
 }
 
+bool MemoryNode::relocate_batch_via_authority(
+    span<const u32> authority_shards,
+    span<const protocol::AuthorityPlacementItem> items,
+    vec<protocol::AuthorityPlacementResult>& results,
+    const Configuration& config) {
+  results.assign(items.size(), {});
+  if (items.empty() || authority_shards.size() != items.size() ||
+      items.size() > config.storage_owner_batch_max) {
+    return false;
+  }
+
+  std::map<u32, vec<size_t>> groups;
+  for (size_t index = 0; index < items.size(); ++index) {
+    if (authority_shards[index] >= num_storage_nodes_) return false;
+    groups[authority_shards[index]].push_back(index);
+  }
+
+  for (const auto& [authority_shard, indices] : groups) {
+    vec<protocol::AuthorityPlacementItem> group_items;
+    group_items.reserve(indices.size());
+    for (const size_t index : indices) group_items.push_back(items[index]);
+
+    vec<protocol::AuthorityPlacementResult> group_results;
+    if (authority_shard == storage_id_) {
+      if (!apply_local_authority_placement_items(
+            span<const protocol::AuthorityPlacementItem>{group_items},
+            group_results) || group_results.size() != group_items.size()) {
+        return false;
+      }
+    } else {
+      const u32 item_count = static_cast<u32>(group_items.size());
+      const u64 request_id = allocate_peer_request_id();
+      constexpr u32 kTransportAttempts = 3;
+      bool posted = false;
+      bool complete = false;
+      for (u32 attempt = 0;
+           attempt < kTransportAttempts && !complete; ++attempt) {
+        if (!posted) {
+          posted = post_peer_control_request_attempt(
+            authority_shard,
+            protocol::PeerRpcType::authority_placement_request,
+            protocol::PeerRpcType::authority_placement_response,
+            request_id, item_count, group_items.data(),
+            group_items.size() * sizeof(group_items[0]),
+            protocol::authority_placement_request_bytes(item_count), config);
+          if (!posted) continue;
+        }
+        protocol::PeerRpcHeader header;
+        vec<byte_t> payload;
+        PeerResponseLease response_lease{};
+        const TryPeerResponse state = wait_peer_control_response(
+          request_id, authority_shard,
+          protocol::PeerRpcType::authority_placement_response,
+          item_count, header, payload, response_lease, config);
+        if (state == TryPeerResponse::success &&
+            payload.size() ==
+              protocol::authority_placement_response_bytes(item_count)) {
+          const auto* wire =
+            protocol::authority_placement_results(payload.data());
+          bool valid = true;
+          for (u32 item = 0; item < item_count; ++item) {
+            valid &= wire[item].reserved == 0 &&
+              wire[item].status <= static_cast<u32>(
+                protocol::AuthorityPlacementStatus::conflict);
+          }
+          if (valid && acknowledge_peer_rpc_response(response_lease)) {
+            group_results.assign(wire, wire + item_count);
+            complete = true;
+            break;
+          }
+        }
+        posted = false;
+        if (response_lease.valid()) {
+          (void)rearm_peer_rpc_response(response_lease);
+        }
+      }
+      if (!complete) {
+        cancel_peer_rpc_response(request_id);
+        return false;
+      }
+    }
+
+    for (size_t slot = 0; slot < indices.size(); ++slot) {
+      results[indices[slot]] = group_results[slot];
+    }
+  }
+  return true;
+}
+
 bool MemoryNode::control_dynamic_node_on_shard(
     u32 physical_shard,
     const protocol::DynamicNodeControlItem& item,

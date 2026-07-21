@@ -50,6 +50,11 @@ bool PersistentSearchEngine::wait_for_maintenance(
     effective_target_sequences);
 }
 
+std::vector<std::optional<maintenance_telemetry::Snapshot>>
+PersistentSearchEngine::read_maintenance_telemetry() {
+  return impl_->read_maintenance_telemetry();
+}
+
 void PersistentSearchEngine::reset_telemetry() {
   telemetry_.reset();
 }

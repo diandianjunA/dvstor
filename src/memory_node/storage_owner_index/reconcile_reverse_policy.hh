@@ -57,6 +57,35 @@ inline bool reconcile_reverse_postcondition_holds(
   return false;
 }
 
+// A tagged target whose physical incarnation has already retired cannot
+// contain any edge owned by that incarnation.  Ordinary reverse additions
+// are only bounded-degree proposals, so losing their target is a completed
+// rejection; removals and replacements have also reached their required
+// old-edge-absent postcondition.  The two reachability operations are
+// deliberately different: they must force the caller to choose another live
+// parent before any provisional bridge may be removed.
+inline service::storage_owner::ReconcileReverseResult
+reconcile_retired_target_result(
+    const service::storage_owner::ReconcileReverseOp& op) {
+  using service::storage_owner::ReconcileReverseOpKind;
+  service::storage_owner::ReconcileReverseResult result{
+    .placement_sequence = op.placement_sequence,
+  };
+  switch (static_cast<ReconcileReverseOpKind>(op.kind)) {
+    case ReconcileReverseOpKind::add:
+      break;
+    case ReconcileReverseOpKind::remove_if_present:
+    case ReconcileReverseOpKind::replace_or_add:
+      result.removed = 1;
+      break;
+    case ReconcileReverseOpKind::ensure_reachable:
+    case ReconcileReverseOpKind::promote_stable_bridge:
+      result.stale = 1;
+      break;
+  }
+  return result;
+}
+
 // Applies one already-validated reconciliation operation to a target's
 // in-memory neighbor list. The caller owns the target lock for the complete
 // invocation. Identity/liveness booleans are supplied by the storage-backed
@@ -515,6 +544,132 @@ service::storage_owner::ReconcileReverseResult reconcile_reverse_adjacency(
     }
   }
   return stale_result();
+}
+
+// Returns the maximal per-target run of ordinary proposals beginning at
+// `begin`. Stronger operations return an empty run and therefore remain an
+// explicit execution/pruning boundary. `op_indices` preserves the original
+// order of operations for one target while allowing unrelated targets to be
+// grouped independently.
+inline size_t reconcile_reverse_add_run_end(
+    const span<const service::storage_owner::ReconcileReverseOp> ops,
+    const span<const size_t> op_indices,
+    const size_t begin) {
+  using service::storage_owner::ReconcileReverseOpKind;
+  if (begin >= op_indices.size()) return begin;
+  lib_assert(op_indices[begin] < ops.size(),
+             "reverse add run index exceeds operation batch");
+  if (static_cast<ReconcileReverseOpKind>(
+        ops[op_indices[begin]].kind) != ReconcileReverseOpKind::add) {
+    return begin;
+  }
+  size_t end = begin + 1;
+  while (end < op_indices.size()) {
+    lib_assert(op_indices[end] < ops.size(),
+               "reverse add run index exceeds operation batch");
+    if (static_cast<ReconcileReverseOpKind>(
+          ops[op_indices[end]].kind) != ReconcileReverseOpKind::add) {
+      break;
+    }
+    ++end;
+  }
+  return end;
+}
+
+// Applies one compatible run of ordinary reverse-edge proposals to the same
+// target. Ordinary `add` is deliberately a proposal: RobustPrune may reject
+// it and the RPC postcondition is still complete. This lets a receiver score
+// the union of a hot target's proposals once instead of repeatedly pruning
+// after every arrival in the same RPC.
+//
+// The caller has already read and locked the target adjacency. Per-operation
+// identity/liveness decisions remain explicit inputs so batching cannot blur
+// incarnation or placement-sequence fences. Non-add operations are excluded:
+// promotion/replace/remove have stronger ordered postconditions and therefore
+// form barriers between compatible add runs.
+template <class RobustPrune>
+void reconcile_reverse_add_batch(
+    const span<const service::storage_owner::ReconcileReverseOp> ops,
+    const span<const u8> new_identity_stable,
+    const bool target_stable,
+    const u32 degree_limit,
+    const u32 protected_limit,
+    vec<RemotePtr>& stable,
+    vec<RemotePtr>& provisional,
+    vec<service::storage_owner::ReconcileReverseResult>& results,
+    RobustPrune&& robust_prune) {
+  using service::storage_owner::ReconcileReverseOpKind;
+  using service::storage_owner::ReconcileReverseResult;
+
+  lib_assert(ops.size() == new_identity_stable.size(),
+             "reverse add batch identity cardinality mismatch");
+  results.assign(ops.size(), {});
+  if (ops.empty()) return;
+
+  const RemotePtr target{ops[0].target_raw};
+  vec<RemotePtr> proposals;
+  proposals.reserve(ops.size());
+  vec<u8> valid(ops.size(), 0);
+  const auto contains = [](const vec<RemotePtr>& values, RemotePtr value) {
+    return std::find(values.begin(), values.end(), value) != values.end();
+  };
+  const auto erase_all = [](vec<RemotePtr>& values, RemotePtr value) {
+    values.erase(std::remove(values.begin(), values.end(), value),
+                 values.end());
+  };
+
+  for (size_t index = 0; index < ops.size(); ++index) {
+    const auto& op = ops[index];
+    ReconcileReverseResult& result = results[index];
+    result.placement_sequence = op.placement_sequence;
+    const RemotePtr candidate{op.new_candidate_raw};
+    if (!target_stable || degree_limit == 0 || protected_limit == 0 ||
+        op.placement_sequence == 0 || op.target_raw != target.raw_address ||
+        static_cast<ReconcileReverseOpKind>(op.kind) !=
+          ReconcileReverseOpKind::add ||
+        op.old_candidate_raw != 0 || candidate.is_null() ||
+        candidate == target || new_identity_stable[index] == 0) {
+      result.stale = 1;
+      continue;
+    }
+
+    valid[index] = 1;
+    // A final stable proposal consumes an obsolete provisional copy even if
+    // the bounded stable plane ultimately rejects that ordinary proposal.
+    erase_all(provisional, candidate);
+    if (!contains(stable, candidate) && !contains(proposals, candidate)) {
+      proposals.push_back(candidate);
+    }
+  }
+
+  if (!proposals.empty()) {
+    vec<RemotePtr> candidates = stable;
+    candidates.insert(candidates.end(), proposals.begin(), proposals.end());
+    if (candidates.size() <= degree_limit) {
+      stable = std::move(candidates);
+    } else {
+      vec<RemotePtr> selected = robust_prune(candidates);
+      vec<RemotePtr> bounded;
+      bounded.reserve(std::min<size_t>(degree_limit, selected.size()));
+      for (const RemotePtr candidate : selected) {
+        if (candidate.is_null() ||
+            std::find(candidates.begin(), candidates.end(), candidate) ==
+              candidates.end() ||
+            contains(bounded, candidate)) {
+          continue;
+        }
+        bounded.push_back(candidate);
+        if (bounded.size() == degree_limit) break;
+      }
+      stable = std::move(bounded);
+    }
+  }
+
+  for (size_t index = 0; index < ops.size(); ++index) {
+    if (valid[index] == 0) continue;
+    results[index].accepted = contains(
+      stable, RemotePtr{ops[index].new_candidate_raw}) ? 1 : 0;
+  }
 }
 
 }  // namespace memory_node_storage_owner_index_detail

@@ -38,10 +38,17 @@ void MemoryNode::setup_insert_runtime(const Configuration& config) {
 }
 
 void MemoryNode::start_storage_owner_insert_workers(const Configuration& config) {
-  print_status("storage-owner peer RDMA read credits per peer: " +
-               std::to_string(peer_rdma_read_credit_limit()) +
-               " per QP: " + std::to_string(peer_rdma_read_credit_limit_per_qp()) +
-               " (requested=" + std::to_string(storage_owner_peer_rdma_tokens_) + ")");
+  const auto peer_read_credits = peer_rdma_read_credit_plan();
+  print_status("storage-owner peer RDMA read credits: per_data_qp=" +
+               std::to_string(peer_read_credits.per_qp) +
+               " data_qps_per_peer=" +
+               std::to_string(peer_read_credits.data_qps_per_peer) +
+               " per_peer=" + std::to_string(peer_read_credits.per_peer) +
+               " global=" + std::to_string(peer_read_credits.global) +
+               " shared_cq_read_budget=" +
+               std::to_string(peer_read_credits.shared_cq_read_budget) +
+               " (requested_per_data_qp=" +
+               std::to_string(storage_owner_peer_rdma_tokens_) + ")");
   print_status("storage-owner online insert tuning: construction_beam=" +
                std::to_string(config.resolved_storage_owner_construction_width()) +
                " snapshot_batch=" + std::to_string(config.storage_owner_search_snapshot_batch) +
@@ -56,14 +63,18 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
     core_assignment_.available_core_count(), num_compute_threads_,
     rpc_parallelism, config.storage_owner_maintenance_workers,
     num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
-  const u32 worker_count = cpu_plan.foreground_workers;
-  print_status("storage-owner foreground workers: " +
+  const u32 worker_count = cpu_plan.foreground_coordinators;
+  print_status("storage-owner foreground pipeline: coordinators=" +
                std::to_string(worker_count) +
+               " cpu_lanes=" +
+               std::to_string(cpu_plan.foreground_workers) +
                " (assigned_cpus=" +
                std::to_string(core_assignment_.available_core_count()) +
                ", rpc_parallelism=" + std::to_string(rpc_parallelism) + ")");
-  print_status("storage-owner CPU plan: foreground=" +
+  print_status("storage-owner CPU plan: foreground_cpu=" +
                std::to_string(cpu_plan.foreground_workers) +
+               " foreground_coordinators=" +
+               std::to_string(cpu_plan.foreground_coordinators) +
                " maintenance=" +
                std::to_string(cpu_plan.maintenance_workers) +
                " peer_stage1=" +
@@ -87,11 +98,23 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
       i, 1, config.max_send_queue_wr);
     storage_owner_threads_.push_back(std::move(thread));
   }
+  vec<u32> foreground_cpus;
+  if (!config.disable_thread_pinning) {
+    foreground_cpus.reserve(cpu_plan.foreground_workers);
+    for (u32 lane = 0; lane < cpu_plan.foreground_workers; ++lane) {
+      foreground_cpus.push_back(core_assignment_.get_available_core());
+    }
+  }
   for (u32 i = 0; i < worker_count; ++i) {
     storage_insert_workers_.emplace_back([this, i]() { storage_owner_insert_worker_loop(i); });
     if (!config.disable_thread_pinning) {
+      lib_assert(!foreground_cpus.empty(),
+                 "foreground coordinator has no assigned CPU lane");
+      // Coordinators blocked on peer responses do not consume an additional
+      // process CPU.  Reusing this fixed lane set preserves the CPU plan while
+      // allowing the registered request window to remain in flight.
       pin_thread(storage_insert_workers_.back(),
-                 core_assignment_.get_available_core());
+                 foreground_cpus[i % foreground_cpus.size()]);
     }
   }
 }

@@ -184,7 +184,9 @@ FormattedReport format_report(const nlohmann::json& root,
       root["stage2"].value("requested_logs", 0ULL) != 0) {
     const auto& stage2 = root["stage2"];
     output << "stage2\n";
-    output << "  logs observed/requested: "
+    output << "  source: "
+           << stage2.value("source", "storage_logs") << '\n';
+    output << "  shards observed/requested: "
            << stage2.value("logs_with_observations", 0ULL) << "/"
            << stage2.value("requested_logs", 0ULL) << '\n';
     output << "  p99_stage2_delay_upper_ms: ";

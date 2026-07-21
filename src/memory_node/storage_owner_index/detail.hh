@@ -56,7 +56,6 @@ inline u32 storage_owner_snapshot_batch_size(
 
 inline bool parse_remote_snapshot(RemotePtr remote_pointer, const byte_t* data,
                                   NodeSnapshot& snapshot) {
-  snapshot = NodeSnapshot{};
   snapshot.rptr = remote_pointer;
   snapshot.header = *reinterpret_cast<const u64*>(data);
   snapshot.id = *reinterpret_cast<const u32*>(data + VamanaNode::offset_id());
@@ -67,9 +66,15 @@ inline bool parse_remote_snapshot(RemotePtr remote_pointer, const byte_t* data,
   snapshot.deleted = (snapshot.header & VamanaNode::HEADER_DELETED) != 0;
   if ((snapshot.header & VamanaNode::HEADER_NODE_LOCK) != 0 ||
       VamanaNode::header_incarnation(snapshot.header) !=
-        remote_pointer.incarnation() ||
+      remote_pointer.incarnation() ||
       snapshot.slot_incarnation != remote_pointer.incarnation()) {
-    snapshot = NodeSnapshot{};
+    snapshot.rptr.reset();
+    snapshot.header = 0;
+    snapshot.id = 0;
+    snapshot.generation = 0;
+    snapshot.slot_incarnation = 0;
+    snapshot.deleted = false;
+    snapshot.vector_data.clear();
     return false;
   }
   snapshot.vector_data.resize(VamanaNode::vector_bytes());

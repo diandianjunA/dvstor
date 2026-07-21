@@ -199,7 +199,7 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   const u32 stage1_rpc_worker_count = cpu_plan.peer_stage1_workers;
   const u32 cleanup_worker_count = cpu_plan.peer_cleanup_workers;
   const size_t stage1_total_worker_count =
-    static_cast<size_t>(cpu_plan.foreground_workers) +
+    static_cast<size_t>(cpu_plan.foreground_coordinators) +
     static_cast<size_t>(stage1_rpc_worker_count);
   lib_assert(stage1_total_worker_count <=
                std::numeric_limits<size_t>::max() /
@@ -221,6 +221,11 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
     std::lock_guard<std::mutex> lock(shard.mutex);
     shard.records.clear();
     shard.records.reserve(stage1_prepared_results_limit_per_shard_);
+  }
+  for (Stage1InflightRequestShard& shard : stage1_inflight_requests_) {
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    shard.counts.clear();
+    shard.counts.reserve(stage1_prepared_results_limit_per_shard_);
   }
   const size_t cleanup_dedupe_total = std::max<size_t>(
     1024,

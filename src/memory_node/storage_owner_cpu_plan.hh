@@ -2,11 +2,19 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 namespace memory_node_detail {
 
 struct StorageOwnerCpuPlan {
+  // CPU lanes reserved for foreground graph work.  This value participates
+  // in the strict process-wide CPU partition below.
   std::uint32_t foreground_workers{};
+  // Synchronous authority requests spend most of their lifetime waiting for
+  // a physical-home response.  Coordinators are therefore allowed to
+  // multiplex over the foreground CPU lanes, but remain bounded by both the
+  // registered RPC window and a small per-lane factor.
+  std::uint32_t foreground_coordinators{};
   std::uint32_t maintenance_workers{};
   std::uint32_t peer_stage1_workers{};
   std::uint32_t peer_reverse_workers{};
@@ -67,12 +75,40 @@ inline StorageOwnerCpuPlan derive_storage_owner_cpu_plan(
     plan.peer_cleanup_workers + plan.peer_placement_workers;
   const std::uint32_t stage1_budget = reserved < budget
     ? static_cast<std::uint32_t>(budget - reserved) : 0;
+  // A foreground coordinator performs authority bookkeeping and local work,
+  // while the physical-home executor performs the full graph construction.
+  // Do not let adding compute clients continuously transfer CPU lanes from
+  // the latter to the former.  Once the coordinator side reaches half of the
+  // configured CPU parallelism, extra RPC slots are multiplexed as waiting
+  // coordinators below instead of changing the CPU partition.
+  const std::uint32_t foreground_cpu_limit =
+    std::max<std::uint32_t>(1, cpu_parallelism / 2);
   const std::uint32_t foreground_limit = std::min(
-    std::max<std::uint32_t>(1, rpc_parallelism), cpu_parallelism);
+    std::max<std::uint32_t>(1, rpc_parallelism), foreground_cpu_limit);
+
+  const auto finish_foreground_coordinators = [&]() {
+    if (remote_peer_count == 0) {
+      // A local-only coordinator executes graph work continuously, so
+      // oversubscribing it cannot hide any transport wait.
+      plan.foreground_coordinators = plan.foreground_workers;
+      return;
+    }
+    constexpr std::uint32_t kCoordinatorMultiplexPerCpu = 4;
+    const std::uint64_t cpu_bounded =
+      static_cast<std::uint64_t>(plan.foreground_workers) *
+      kCoordinatorMultiplexPerCpu;
+    plan.foreground_coordinators = std::max<std::uint32_t>(
+      plan.foreground_workers,
+      std::min<std::uint32_t>(
+        foreground_limit,
+        static_cast<std::uint32_t>(std::min<std::uint64_t>(
+          cpu_bounded, std::numeric_limits<std::uint32_t>::max()))));
+  };
 
   if (remote_peer_count == 0) {
     plan.foreground_workers = std::min(
       foreground_limit, std::max<std::uint32_t>(1, stage1_budget));
+    finish_foreground_coordinators();
     return plan;
   }
 
@@ -86,6 +122,7 @@ inline StorageOwnerCpuPlan derive_storage_owner_cpu_plan(
   if (usable_stage1_budget >= combined_limit) {
     plan.foreground_workers = foreground_limit;
     plan.peer_stage1_workers = cpu_parallelism;
+    finish_foreground_coordinators();
     return plan;
   }
 
@@ -98,6 +135,7 @@ inline StorageOwnerCpuPlan derive_storage_owner_cpu_plan(
     usable_stage1_budget - plan.foreground_workers;
   plan.peer_stage1_workers = std::min(
     cpu_parallelism, std::max<std::uint32_t>(1, peer_stage1_budget));
+  finish_foreground_coordinators();
   return plan;
 }
 

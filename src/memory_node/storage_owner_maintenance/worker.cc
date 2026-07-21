@@ -33,8 +33,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       StorageOwnerMaintenanceKind::finalize_insert};
     vec<StorageOwnerMaintenanceTask> tasks;
     vec<NodeSnapshot> targets;
-    vec<NodeSnapshot> candidate_storage;
-    vec<u32> candidate_counts;
     vec<vec<ReverseUpdateOp>> remote_ops_by_peer;
     vec<u64> reverse_request_ids;
   };
@@ -59,13 +57,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   for (Stage2Context& context : contexts) {
     context.tasks.reserve(config.storage_owner_batch_max);
     context.targets.reserve(config.storage_owner_batch_max);
-    context.candidate_storage.resize(
-      static_cast<size_t>(config.storage_owner_batch_max) *
-      candidate_capacity_per_item);
-    for (NodeSnapshot& candidate : context.candidate_storage) {
-      candidate.vector_data.resize(VamanaNode::vector_bytes());
-    }
-    context.candidate_counts.resize(config.storage_owner_batch_max);
     context.remote_ops_by_peer.resize(num_storage_nodes_);
     for (auto& ops : context.remote_ops_by_peer) {
       ops.reserve(static_cast<size_t>(config.R) *
@@ -73,6 +64,39 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     }
     context.reverse_request_ids.resize(num_storage_nodes_);
   }
+  // Continuation pointers and all later snapshot waves are consumed
+  // synchronously by this worker. Reusing their O(batch*L) capacity here avoids
+  // multiplying full-vector scratch by every in-flight state-machine context.
+  const size_t continuation_capacity =
+    static_cast<size_t>(config.storage_owner_batch_max) *
+    candidate_capacity_per_item;
+  vec<vec<RemotePtr>> continued_candidates_by_task;
+  continued_candidates_by_task.resize(config.storage_owner_batch_max);
+  // Only the authoritative source-freeze boundary materializes continuation
+  // vectors. Shared physical candidates are read once across the whole batch;
+  // ordered pointer references are then scattered into per-task prune views.
+  vec<vec<RemotePtr>> snapshot_candidates_by_task(
+    config.storage_owner_batch_max);
+  vec<vec<const NodeSnapshot*>> snapshots_by_task(
+    config.storage_owner_batch_max);
+  vec<bool> snapshot_task_active(config.storage_owner_batch_max);
+  Stage2SnapshotWavePlan snapshot_plan;
+  vec<NodeSnapshot> snapshot_storage;
+  snapshot_storage.reserve(
+    continuation_capacity +
+    static_cast<size_t>(config.storage_owner_batch_max) * config.R);
+  dense_hashmap_t<u64, const NodeSnapshot*> snapshot_by_raw;
+  snapshot_by_raw.reserve(
+    continuation_capacity +
+    static_cast<size_t>(config.storage_owner_batch_max) * config.R);
+  vec<vec<RemotePtr>> live_stage2_neighbors_by_task(
+    config.storage_owner_batch_max);
+  vec<std::pair<RemotePtr, u64>> identity_storage;
+  identity_storage.reserve(
+    static_cast<size_t>(config.storage_owner_batch_max) * config.R);
+  hashset_t<RemotePtr> stable_identity_targets;
+  stable_identity_targets.reserve(
+    static_cast<size_t>(config.storage_owner_batch_max) * config.R);
 
   const u64 rpc_timeout_ns =
     static_cast<u64>(config.storage_owner_rpc_timeout_ms) * 1000ull * 1000ull;
@@ -95,13 +119,80 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     context.tasks.clear();
     context.targets.clear();
     context.targets.resize(context.tasks.size());
-    std::fill(context.candidate_counts.begin(),
-              context.candidate_counts.end(), 0);
     for (auto& ops : context.remote_ops_by_peer) {
       ops.clear();
     }
     std::fill(context.reverse_request_ids.begin(),
               context.reverse_request_ids.end(), 0);
+  };
+
+  const auto materialize_stable_snapshot_wave = [&](size_t task_count) {
+    lib_assert(task_count <= snapshot_candidates_by_task.size(),
+               "Stage2 snapshot wave exceeded worker batch capacity");
+    snapshot_plan.build(span<const vec<RemotePtr>>{
+      snapshot_candidates_by_task.data(), task_count});
+    const size_t snapshot_count = read_node_snapshots_batched_into(
+      span<const RemotePtr>{snapshot_plan.targets}, config,
+      snapshot_storage);
+    snapshot_by_raw.clear();
+    snapshot_by_raw.reserve(snapshot_count);
+    for (size_t snapshot_index = 0; snapshot_index < snapshot_count;
+         ++snapshot_index) {
+      const NodeSnapshot& snapshot = snapshot_storage[snapshot_index];
+      if (stage2_parent_is_stable(snapshot.header, snapshot.deleted)) {
+        snapshot_by_raw.emplace(snapshot.rptr.raw_address, &snapshot);
+      }
+    }
+
+    if (snapshots_by_task.size() < task_count) {
+      snapshots_by_task.resize(task_count);
+    }
+    for (size_t task = 0; task < task_count; ++task) {
+      vec<const NodeSnapshot*>& snapshots = snapshots_by_task[task];
+      snapshots.clear();
+      snapshots.reserve(snapshot_plan.task_target_indices[task].size());
+      for (const u32 target_index :
+           snapshot_plan.task_target_indices[task]) {
+        lib_assert(target_index < snapshot_plan.targets.size(),
+                   "Stage2 snapshot wave task index is invalid");
+        const RemotePtr target = snapshot_plan.targets[target_index];
+        const auto found = snapshot_by_raw.find(target.raw_address);
+        if (found != snapshot_by_raw.end()) snapshots.push_back(found->second);
+      }
+    }
+  };
+
+  const auto materialize_stable_identity_wave = [&](size_t task_count) {
+    lib_assert(task_count <= snapshot_candidates_by_task.size(),
+               "Stage2 identity wave exceeded worker batch capacity");
+    snapshot_plan.build(span<const vec<RemotePtr>>{
+      snapshot_candidates_by_task.data(), task_count});
+    const size_t identity_count = read_node_identity_headers_batched_into(
+      span<const RemotePtr>{snapshot_plan.targets}, config,
+      identity_storage);
+    stable_identity_targets.clear();
+    stable_identity_targets.reserve(identity_count);
+    for (size_t index = 0; index < identity_count; ++index) {
+      const auto& [pointer, header] = identity_storage[index];
+      if (stage2_parent_is_stable(
+            header, (header & VamanaNode::HEADER_DELETED) != 0)) {
+        stable_identity_targets.insert(pointer);
+      }
+    }
+    for (size_t task = 0; task < task_count; ++task) {
+      vec<RemotePtr>& live = live_stage2_neighbors_by_task[task];
+      live.clear();
+      live.reserve(snapshot_plan.task_target_indices[task].size());
+      for (const u32 target_index :
+           snapshot_plan.task_target_indices[task]) {
+        lib_assert(target_index < snapshot_plan.targets.size(),
+                   "Stage2 identity wave task index is invalid");
+        const RemotePtr target = snapshot_plan.targets[target_index];
+        if (stable_identity_targets.contains(target)) {
+          live.push_back(target);
+        }
+      }
+    }
   };
 
   const auto record_finalized_live = [this](
@@ -408,12 +499,13 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
 
   const auto append_stage2_reconcile_ops = [&](
       auto& task,
+      span<const RemotePtr> live_final_neighbors,
       vec<ReconcileReverseOp>& promotion_ops,
       vec<ReconcileReverseOp>& stable_ops,
       vec<ReconcileReverseOp>& removal_ops) {
     const auto plan = plan_stage2_backlink_reconciliation(
       span<const RemotePtr>{task.stage1_backlink_targets},
-      span<const RemotePtr>{task.stage2_neighbors},
+      live_final_neighbors,
       task.stage2_promotion_committed
         ? task.stage2_promotion_parent : RemotePtr{});
     if (plan.promotion_target.is_null()) return false;
@@ -494,6 +586,42 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   };
 
   const auto complete_stale_stage2 = [&](StorageOwnerMaintenanceTask& task) {
+    if (!task.stage1_receipt_released) {
+      const RemotePtr gate_target = task.placement_committed
+        ? task.final_target : task.target;
+      const u64 gate_version = task.initial_placement_version +
+        static_cast<u64>(task.placement_committed &&
+                         task.final_target != task.target);
+      const protocol::AuthorityPlacementItem gate{
+        .token = {
+          .source_client = task.source_client,
+          .item_index = task.operation_item_index,
+          .client_batch_id = task.operation_batch_id,
+        },
+        .id = task.id,
+        .generation = task.generation,
+        .expected_raw = gate_target.raw_address,
+        .desired_raw = gate_target.raw_address,
+        .expected_placement_version = gate_version,
+      };
+      protocol::AuthorityPlacementResult gate_result;
+      if (!relocate_via_authority(
+            task.authority_shard, gate, gate_result, config)) {
+        return false;
+      }
+      const auto status = static_cast<
+        protocol::AuthorityPlacementStatus>(gate_result.status);
+      if (status == protocol::AuthorityPlacementStatus::busy) return false;
+      if (status != protocol::AuthorityPlacementStatus::committed &&
+          status != protocol::AuthorityPlacementStatus::replay &&
+          status != protocol::AuthorityPlacementStatus::stale) {
+        return false;
+      }
+      if (!release_resolved_local_stage1_receipt(task, config)) {
+        return false;
+      }
+      task.stage1_receipt_released = true;
+    }
     // A successor can win while Stage2 is searching or after part of an
     // idempotent reconciliation retry. Remove both physical incarnations
     // before retiring an uncommitted migrated record. Unlike the legacy
@@ -858,8 +986,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
 
     context.targets.clear();
     context.targets.resize(context.tasks.size());
-    std::fill(context.candidate_counts.begin(),
-              context.candidate_counts.end(), 0);
 
     // Retire stale Stage1 records before issuing any remote continuation
     // reads. Failed cleanup remains in this context and is retried
@@ -901,36 +1027,17 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     context.tasks.resize(ready);
     context.targets.resize(ready);
 
-    for (size_t item = 0; item < context.tasks.size(); ++item) {
-      lib_assert(!context.tasks[item].stage1_beam.empty(),
-                 "stage2 task lost its Stage1 continuation beam");
-      const vec<RemotePtr>& continued_candidates =
-        continue_stage2_search_candidates(
-          context.tasks[item], context.targets[item], config);
-      lib_assert(continued_candidates.size() <= construction_width,
+    // Advance every independent continuation by one dependency step per
+    // wave. Graph and vector reads that are ready at the same time are issued
+    // across the complete context batch, eliminating the per-task RDMA RTT
+    // chain while preserving each task's private beam and bounded budget.
+    continue_stage2_search_candidates_batched(
+      span<const StorageOwnerMaintenanceTask>{context.tasks},
+      span<const NodeSnapshot>{context.targets},
+      continued_candidates_by_task, config);
+    for (const vec<RemotePtr>& candidates : continued_candidates_by_task) {
+      lib_assert(candidates.size() <= construction_width,
                  "stage2 continuation exceeded construction width L");
-      vec<NodeSnapshot> continued_snapshots = read_node_snapshots_batched(
-        continued_candidates, config);
-      lib_assert(continued_snapshots.size() <= candidate_capacity_per_item,
-                 "stage2 continuation candidate capacity invariant failed");
-      for (const NodeSnapshot& source : continued_snapshots) {
-        if (source.deleted ||
-            (source.header & VamanaNode::HEADER_PROVISIONAL) != 0) {
-          continue;
-        }
-        const size_t slot = item * candidate_capacity_per_item +
-                            context.candidate_counts[item]++;
-        NodeSnapshot& destination = context.candidate_storage[slot];
-        destination.rptr = source.rptr;
-        destination.header = source.header;
-        destination.id = source.id;
-        destination.generation = source.generation;
-        destination.deleted = source.deleted;
-        lib_assert(source.vector_data.size() >= VamanaNode::vector_bytes(),
-                   "stage2 local candidate vector is incomplete");
-        std::memcpy(destination.vector_data.data(),
-                    source.vector_data.data(), VamanaNode::vector_bytes());
-      }
     }
 
     // The Stage1 owner continues one logical beam through one-sided RDMA.
@@ -944,25 +1051,34 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     return true;
   };
 
+  const auto defer_stage2_retry = [](Stage2Context& context) {
+    const auto retry_at = std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(1);
+    for (StorageOwnerMaintenanceTask& task : context.tasks) {
+      task.retry_not_before = retry_at;
+    }
+  };
+
   const auto prepare_stage2_reverse = [&](Stage2Context& context) {
     // First finish every node record. No reverse edge or directory entry is
     // allowed to expose a destination whose vector/graph/PQ record is partial.
+    vec<u32> gate_authorities;
+    vec<protocol::AuthorityPlacementItem> gates;
+    vec<size_t> gate_task_indices;
+    gate_authorities.reserve(context.tasks.size());
+    gates.reserve(context.tasks.size());
+    gate_task_indices.reserve(context.tasks.size());
     for (size_t item = 0; item < context.tasks.size(); ++item) {
-      StorageOwnerMaintenanceTask& task = context.tasks[item];
+      const StorageOwnerMaintenanceTask& task = context.tasks[item];
       if (task.maintenance_sequence == 0) continue;
-
-      // Arm publishes a runnable descriptor before the foreground authority
-      // commit. Use a no-op placement CAS as the gate: while that mutation's
-      // lease is pending it returns busy; after abort it returns stale; only a
-      // committed current generation may perform any Stage2-visible graph
-      // mutation. On retries after a real relocation, validate the resulting
-      // physical pointer/version instead of the original Stage1 address.
       const RemotePtr gate_target = task.placement_committed
         ? task.final_target : task.target;
       const u64 gate_version = task.initial_placement_version +
         static_cast<u64>(task.placement_committed &&
                          task.final_target != task.target);
-      const service::storage_owner::AuthorityPlacementItem gate{
+      gate_authorities.push_back(task.authority_shard);
+      gate_task_indices.push_back(item);
+      gates.push_back(protocol::AuthorityPlacementItem{
         .token = {
           .source_client = task.source_client,
           .item_index = task.operation_item_index,
@@ -973,14 +1089,47 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         .expected_raw = gate_target.raw_address,
         .desired_raw = gate_target.raw_address,
         .expected_placement_version = gate_version,
-      };
-      service::storage_owner::AuthorityPlacementResult gate_result;
-      if (!relocate_via_authority(
-            task.authority_shard, gate, gate_result, config)) {
-        storage_owner_maintenance_failed_.fetch_add(
-          1, std::memory_order_relaxed);
-        return false;
-      }
+      });
+    }
+    vec<protocol::AuthorityPlacementResult> gate_results;
+    if (!gates.empty() && !relocate_batch_via_authority(
+          span<const u32>{gate_authorities},
+          span<const protocol::AuthorityPlacementItem>{gates},
+          gate_results, config)) {
+      storage_owner_maintenance_failed_.fetch_add(
+        1, std::memory_order_relaxed);
+      return false;
+    }
+    lib_assert(gate_results.size() == gate_task_indices.size(),
+               "batched Stage2 gate lost a task result");
+    if (snapshots_by_task.size() < context.tasks.size()) {
+      snapshots_by_task.resize(context.tasks.size());
+    }
+    if (snapshot_task_active.size() < context.tasks.size()) {
+      snapshot_task_active.resize(context.tasks.size());
+    }
+    for (size_t item = 0; item < context.tasks.size(); ++item) {
+      snapshot_candidates_by_task[item].clear();
+      snapshots_by_task[item].clear();
+      snapshot_task_active[item] = false;
+    }
+
+    for (size_t gate_slot = 0;
+         gate_slot < gate_task_indices.size(); ++gate_slot) {
+      const size_t item = gate_task_indices[gate_slot];
+      StorageOwnerMaintenanceTask& task = context.tasks[item];
+
+      // Arm publishes a runnable descriptor before the foreground authority
+      // commit. Use a no-op placement CAS as the gate: while that mutation's
+      // lease is pending it returns busy; after abort it returns stale; only a
+      // committed current generation may perform any Stage2-visible graph
+      // mutation. On retries after a real relocation, validate the resulting
+      // physical pointer/version instead of the original Stage1 address.
+      const u64 gate_version = task.initial_placement_version +
+        static_cast<u64>(task.placement_committed &&
+                         task.final_target != task.target);
+      const protocol::AuthorityPlacementResult& gate_result =
+        gate_results[gate_slot];
       const auto gate_status = static_cast<
         service::storage_owner::AuthorityPlacementStatus>(
           gate_result.status);
@@ -988,10 +1137,17 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           service::storage_owner::AuthorityPlacementStatus::busy) {
         storage_owner_maintenance_pressure_yields_.fetch_add(
           1, std::memory_order_relaxed);
+        defer_stage2_retry(context);
         return false;
       }
       if (gate_status ==
           service::storage_owner::AuthorityPlacementStatus::stale) {
+        if (!task.stage1_receipt_released) {
+          if (!release_resolved_local_stage1_receipt(task, config)) {
+            return false;
+          }
+          task.stage1_receipt_released = true;
+        }
         if (!complete_stale_stage2(task)) return false;
         task.maintenance_sequence = 0;
         continue;
@@ -1006,6 +1162,12 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       }
       lib_assert(gate_result.resulting_placement_version == gate_version,
                  "authority Stage2 gate returned an unexpected version");
+      if (!task.stage1_receipt_released) {
+        if (!release_resolved_local_stage1_receipt(task, config)) {
+          return false;
+        }
+        task.stage1_receipt_released = true;
+      }
 
       const RemotePtr current_physical = task.placement_committed
         ? task.final_target : task.target;
@@ -1018,18 +1180,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       }
 
       if (!task.stage2_prepared) {
-        hashset_t<RemotePtr> skip;
-        skip.insert(task.target);
-        vec<RemotePtr> globally_pruned = robust_prune_snapshots_cpu(
-          context.targets[item].vector_data.data(),
-          VamanaNode::vector_dtype(),
-          span<const NodeSnapshot>{
-            context.candidate_storage.data() +
-              item * candidate_capacity_per_item,
-            context.candidate_counts[item]},
-          skip,
-          config, config.R);
-
         // Freeze the graph mutation plane at the same locked boundary as the
         // rebase snapshot. Queries still traverse this record, but every
         // ordinary reverse mutation retries after observing FROZEN. Thus an
@@ -1086,36 +1236,49 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           continue;
         }
 
-        const vec<RemotePtr> rebase_candidates =
-          merge_stage2_rebase_candidates(
-            span<const RemotePtr>{globally_pruned},
-            span<const RemotePtr>{task.stage1_base_neighbors},
-            span<const RemotePtr>{observed_adjacency.stable});
-        vec<NodeSnapshot> rebase_snapshots =
-          read_node_snapshots_batched(rebase_candidates, config);
-        rebase_snapshots.erase(
-          std::remove_if(
-            rebase_snapshots.begin(), rebase_snapshots.end(),
-            [](const NodeSnapshot& candidate) {
-              return !stage2_parent_is_stable(
-                candidate.header, candidate.deleted);
-            }),
-          rebase_snapshots.end());
-        task.stage2_neighbors = robust_prune_snapshots_cpu(
-          context.targets[item].vector_data.data(),
-          VamanaNode::vector_dtype(),
-          span<const NodeSnapshot>{rebase_snapshots}, skip,
-          config, config.R);
-        lib_assert(task.stage2_neighbors.size() <= config.R,
-                   "online Stage2 finalization exceeded graph degree");
-        task.final_home =
-          memory_node_storage_owner_index_detail::choose_min_cross_shard_home(
-          span<const RemotePtr>{task.stage2_neighbors},
-          num_storage_nodes_, task.target.memory_node());
-        task.stage2_revalidated_home = task.final_home;
-        task.stage2_prepared = true;
+        // Build this task's exact ordered candidate set while its source is
+        // frozen. The batch-wide wave below reads every shared physical
+        // record once, but RobustPrune still receives this task's own order.
+        snapshot_candidates_by_task[item] = merge_stage2_rebase_candidates(
+          span<const RemotePtr>{continued_candidates_by_task[item]},
+          span<const RemotePtr>{task.stage1_base_neighbors},
+          span<const RemotePtr>{observed_adjacency.stable});
+        snapshot_task_active[item] = true;
       }
 
+    }
+
+    materialize_stable_snapshot_wave(context.tasks.size());
+    for (size_t item = 0; item < context.tasks.size(); ++item) {
+      if (!snapshot_task_active[item]) continue;
+      StorageOwnerMaintenanceTask& task = context.tasks[item];
+      if (task.maintenance_sequence == 0) continue;
+      hashset_t<RemotePtr> skip;
+      skip.insert(task.target);
+      task.stage2_neighbors = robust_prune_snapshot_refs_cpu(
+        context.targets[item].vector_data.data(),
+        VamanaNode::vector_dtype(),
+        span<const NodeSnapshot* const>{snapshots_by_task[item]}, skip,
+        config, config.R);
+      lib_assert(task.stage2_neighbors.size() <= config.R,
+                 "online Stage2 finalization exceeded graph degree");
+      task.final_home =
+        memory_node_storage_owner_index_detail::choose_min_cross_shard_home(
+          span<const RemotePtr>{task.stage2_neighbors},
+          num_storage_nodes_, task.target.memory_node());
+      task.stage2_revalidated_home = task.final_home;
+      task.stage2_prepared = true;
+    }
+
+    // Allocation and outgoing publication run only after every newly frozen
+    // task has consumed the shared authoritative snapshot wave. A migrated
+    // destination is still unreachable through the authority directory here;
+    // an in-place destination clears FROZEN only after its adjacency write.
+    for (size_t item = 0; item < context.tasks.size(); ++item) {
+      StorageOwnerMaintenanceTask& task = context.tasks[item];
+      if (task.maintenance_sequence == 0) continue;
+      lib_assert(task.stage2_prepared,
+                 "Stage2 outgoing publication bypassed frozen prune");
       if (task.final_target.is_null()) {
         if (task.final_home == task.target.memory_node()) {
           task.final_target = task.target;
@@ -1145,6 +1308,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                 protocol::DynamicNodeControlStatus::ok) {
             storage_owner_maintenance_pressure_yields_.fetch_add(
               1, std::memory_order_relaxed);
+            defer_stage2_retry(context);
             return false;
           }
           const RemotePtr allocated{allocation_result.node_raw};
@@ -1159,28 +1323,22 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       }
 
       if (!task.outgoing_committed) {
-        vec<element_t> components(VamanaNode::DIM);
-        decode_storage_vector_to_float(
-          context.targets[item].vector_data.data(),
-          VamanaNode::vector_dtype(), VamanaNode::DIM,
-          components.data());
-
         if (task.final_target != task.target) {
-          // The destination remains provisional until its complete contiguous
-          // record is globally visible. Only then may reconciliation publish
-          // pointers to it from existing graph nodes.
+          vec<element_t> components(VamanaNode::DIM);
+          decode_storage_vector_to_float(
+            context.targets[item].vector_data.data(),
+            VamanaNode::vector_dtype(), VamanaNode::DIM,
+            components.data());
+          // The allocation header remains the publication lock until vector,
+          // graph and PQ code are complete. The authority directory still
+          // names the frozen source, so ordinary graph updates cannot discover
+          // this destination during materialization.
           write_new_node_on_shard(
             task.final_target, task.id,
             span<const element_t>{components}, task.stage2_neighbors,
-            task.generation, true);
-          // The source may itself protect concurrent Stage1 children. The
-          // freeze captured that bounded plane; transfer it before publishing
-          // the migrated destination so source retirement cannot orphan them.
-          write_graph_adjacency(
-            task.final_target, task.stage2_neighbors,
-            task.stage2_protected_children, task.generation, false);
-          lib_assert(set_node_provisional(task.final_target, false),
-                     "failed to publish migrated Stage2 destination");
+            task.generation, false);
+          lib_assert(task.stage2_protected_children.empty(),
+                     "migration cannot bypass protected Stage1 children");
         } else {
           lock_node(task.target);
           const u64 locked_header =
@@ -1211,10 +1369,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
             task.target, task.stage2_neighbors,
             task.stage2_protected_children,
             task.generation, false);
-          // Publish the stable in-place record and reopen graph mutations in
-          // one locked header transition. Do not call set_node_provisional()
-          // while owning NODE_LOCK: that helper correctly refuses to race a
-          // lock holder.
           auto* header_ptr = reinterpret_cast<u64*>(
             index_buffer_.get_full_buffer() +
             vamana::StorageLayoutResolver::header(task.target).offset);
@@ -1228,7 +1382,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         task.outgoing_committed = true;
         task.stage2_plan_sealed = true;
       }
-
     }
 
     size_t ready = 0;
@@ -1243,207 +1396,75 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     context.tasks.resize(ready);
     context.targets.resize(ready);
 
-    // Re-read the complete bounded continuation set at the final publication
-    // boundary.  Cached snapshots may now name deleted, retiring, provisional,
-    // or ABA-reused slots.  Freeze the already materialized child graph while
-    // rebasing concurrent stable additions, then RobustPrune only exact,
-    // durable parents.  This is O(L) batched validation and runs once on the
-    // normal path; retries repeat it only while Stage2 is already active.
-    for (size_t item = 0; item < context.tasks.size(); ++item) {
-      StorageOwnerMaintenanceTask& task = context.tasks[item];
-      if (task.reverse_reconciled) continue;
+    // There is exactly one outgoing-graph mutation boundary: the source lock
+    // above freezes concurrent additions, captures them, prunes the complete
+    // continuation union, and publishes that result. A second freeze/prune of
+    // the same sealed plan cannot make parent liveness persistent; it only
+    // repeats O((L+R)*R*D) work. Reachability churn is instead handled by the
+    // independently ACKed promotion certificate below.
+    for (const StorageOwnerMaintenanceTask& task : context.tasks) {
       lib_assert(task.stage2_plan_sealed && task.outgoing_committed &&
                    !task.final_target.is_null(),
-                 "Stage2 reached final validation with an open placement plan");
-
-      const IncarnationLockResult final_lock =
-        try_lock_node(task.final_target);
-      if (final_lock == IncarnationLockResult::busy) return false;
-      if (final_lock == IncarnationLockResult::stale) {
-        if (!complete_stale_stage2(task)) return false;
-        task.maintenance_sequence = 0;
-        continue;
-      }
-      u64 final_header = 0;
-      node_t final_id = 0;
-      u32 final_generation = 0;
-      const bool final_identity_matches =
-        read_locked_node_identity(task.final_target, final_header,
-                                  final_id, final_generation) &&
-        final_id == task.id && final_generation == task.generation &&
-        (final_header & (VamanaNode::HEADER_DELETED |
-                         VamanaNode::HEADER_PROVISIONAL |
-                         VamanaNode::HEADER_RETIRING)) == 0;
-      GraphAdjacency published_adjacency;
-      const bool final_current = final_identity_matches &&
-        read_graph_adjacency(task.final_target, published_adjacency) &&
-        !published_adjacency.deleted &&
-        published_adjacency.generation == task.generation;
-      if (!final_current) {
-        // We own the incarnation lock acquired above, but final_target may be
-        // remote.  Release it with the exact header observed while locked;
-        // the legacy one-byte remote unlock could otherwise clear NODE_LOCK
-        // in an ABA-reused slot if identity validation failed because the
-        // record changed unexpectedly.
-        lib_assert(publish_locked_node_header(
-                     task.final_target, final_header, 0, 0),
-                   "failed to release invalid final Stage2 owner record");
-        if (!complete_stale_stage2(task)) return false;
-        task.maintenance_sequence = 0;
-        continue;
-      }
-      lib_assert(publish_locked_node_header(
-                   task.final_target, final_header,
-                   VamanaNode::HEADER_STAGE2_FROZEN, 0),
-                 "failed to freeze final Stage2 owner record");
-
-      vec<RemotePtr> candidates;
-      candidates.reserve(
-        task.stage2_neighbors.size() + task.stage1_base_neighbors.size() +
-        task.stage1_backlink_targets.size() +
-        task.stage1_beam.size() + task.stage1_remote_frontier.size() +
-        published_adjacency.stable.size());
-      const auto append_candidates = [&](span<const RemotePtr> source) {
-        candidates.insert(candidates.end(), source.begin(), source.end());
-      };
-      append_candidates(span<const RemotePtr>{task.stage2_neighbors});
-      append_candidates(span<const RemotePtr>{task.stage1_base_neighbors});
-      append_candidates(span<const RemotePtr>{task.stage1_backlink_targets});
-      append_candidates(span<const RemotePtr>{task.stage1_remote_frontier});
-      append_candidates(span<const RemotePtr>{published_adjacency.stable});
-      for (const memory_node_detail::BeamEntry& entry : task.stage1_beam) {
-        candidates.push_back(entry.rptr);
-      }
-      std::sort(candidates.begin(), candidates.end(),
-                [](RemotePtr lhs, RemotePtr rhs) {
-                  return lhs.raw_address < rhs.raw_address;
-                });
-      candidates.erase(
-        std::remove_if(candidates.begin(), candidates.end(),
-                       [](RemotePtr candidate) {
-                         return candidate.is_null();
-                       }),
-        candidates.end());
-      candidates.erase(
-        std::unique(candidates.begin(), candidates.end()), candidates.end());
-
-      vec<NodeSnapshot> fresh_candidates =
-        read_node_snapshots_batched(candidates, config);
-      fresh_candidates.erase(
-        std::remove_if(
-          fresh_candidates.begin(), fresh_candidates.end(),
-          [](const NodeSnapshot& candidate) {
-            return !stage2_parent_is_stable(
-              candidate.header, candidate.deleted);
-          }),
-        fresh_candidates.end());
-      hashset_t<RemotePtr> skip;
-      skip.insert(task.target);
-      skip.insert(task.final_target);
-      vec<RemotePtr> refreshed_neighbors = robust_prune_snapshots_cpu(
-        context.targets[item].vector_data.data(), VamanaNode::vector_dtype(),
-        span<const NodeSnapshot>{fresh_candidates}, skip, config, config.R);
-      lib_assert(refreshed_neighbors.size() <= config.R,
-                 "final Stage2 revalidation exceeded graph degree");
-
-      task.stage2_revalidated_home =
-        memory_node_storage_owner_index_detail::choose_min_cross_shard_home(
-          span<const RemotePtr>{refreshed_neighbors}, num_storage_nodes_,
-          task.target.memory_node());
-      // The allocation receipt and complete outgoing record form the seal.
-      // Parent churn after this point is repaired in place; opening a second
-      // migration for the same authority token would create ambiguous replay
-      // ownership.  The first selection was made from the same durable-parent
-      // predicate immediately before materialization, so this branch is only a
-      // bounded churn repair, not a static placement shortcut.
-      task.final_home = task.final_target.memory_node();
-
-      const IncarnationLockResult rebase_lock =
-        try_lock_node(task.final_target);
-      if (rebase_lock != IncarnationLockResult::locked) return false;
-      u64 rebased_header = 0;
-      node_t rebased_id = 0;
-      u32 rebased_generation = 0;
-      GraphAdjacency rebased_adjacency;
-      const bool can_publish_rebase =
-        read_locked_node_identity(task.final_target, rebased_header,
-                                  rebased_id, rebased_generation) &&
-        rebased_id == task.id &&
-        rebased_generation == task.generation &&
-        (rebased_header & VamanaNode::HEADER_STAGE2_FROZEN) != 0 &&
-        (rebased_header & (VamanaNode::HEADER_DELETED |
-                           VamanaNode::HEADER_PROVISIONAL |
-                           VamanaNode::HEADER_RETIRING)) == 0 &&
-        read_graph_adjacency(task.final_target, rebased_adjacency) &&
-        !rebased_adjacency.deleted;
-      if (!can_publish_rebase) {
-        lib_assert(publish_locked_node_header(
-                     task.final_target, rebased_header, 0, 0),
-                   "failed to release invalid rebased Stage2 owner record");
-        return false;
-      }
-      write_graph_adjacency(
-        task.final_target, refreshed_neighbors,
-        rebased_adjacency.provisional, task.generation, false);
-      lib_assert(publish_locked_node_header(
-                   task.final_target, rebased_header, 0,
-                   VamanaNode::HEADER_STAGE2_FROZEN),
-                 "failed to publish rebased Stage2 owner record");
-      task.stage2_neighbors = std::move(refreshed_neighbors);
-      if (task.final_target == task.target) {
-        task.stage2_source_frozen = false;
-      }
+                 "Stage2 reached parent validation with an open placement plan");
+      lib_assert(task.final_target != task.target ||
+                   !task.stage2_source_frozen,
+                 "in-place Stage2 publication left its source frozen");
     }
 
-    ready = 0;
+    // A sealed outgoing edge may retire before reverse reconciliation. It
+    // remains part of the already-published adjacency (normal cleanup owns
+    // that stale edge), but it cannot be selected as the mandatory promotion
+    // parent. Revalidate all sealed neighbors in one shared wave and retain a
+    // worker-local, order-preserving planner view. This also guarantees that a
+    // retry advances past a dead first choice instead of livelocking on it.
+    if (snapshots_by_task.size() < context.tasks.size()) {
+      snapshots_by_task.resize(context.tasks.size());
+    }
+    if (snapshot_task_active.size() < context.tasks.size()) {
+      snapshot_task_active.resize(context.tasks.size());
+    }
+    if (live_stage2_neighbors_by_task.size() < context.tasks.size()) {
+      live_stage2_neighbors_by_task.resize(context.tasks.size());
+    }
     for (size_t item = 0; item < context.tasks.size(); ++item) {
-      if (context.tasks[item].maintenance_sequence == 0) continue;
-      if (ready != item) {
-        context.tasks[ready] = std::move(context.tasks[item]);
-        context.targets[ready] = std::move(context.targets[item]);
+      snapshot_candidates_by_task[item].clear();
+      snapshots_by_task[item].clear();
+      live_stage2_neighbors_by_task[item].clear();
+      snapshot_task_active[item] = !context.tasks[item].reverse_reconciled;
+      if (snapshot_task_active[item]) {
+        snapshot_candidates_by_task[item] =
+          context.tasks[item].stage2_neighbors;
       }
-      ++ready;
     }
-    context.tasks.resize(ready);
-    context.targets.resize(ready);
+    // Liveness revalidation needs only the coherent header/incarnation pair,
+    // not another copy of every D-byte vector. The compact identity wave also
+    // fits several times more requests in the same registered scratch plane.
+    materialize_stable_identity_wave(context.tasks.size());
 
     // A Stage1 parent can be tombstoned while Stage2 is queued. Revalidate the
     // acknowledged protected slots before atomically promoting one final
     // stable bridge. No protected slot survives finalization, and Stage2 must
     // never silently commit an unreachable node.
-    for (StorageOwnerMaintenanceTask& task : context.tasks) {
+    for (size_t item = 0; item < context.tasks.size(); ++item) {
+      StorageOwnerMaintenanceTask& task = context.tasks[item];
       if (task.reverse_reconciled) continue;
       const auto expected_plan = plan_stage2_backlink_reconciliation(
         span<const RemotePtr>{task.stage1_backlink_targets},
-        span<const RemotePtr>{task.stage2_neighbors},
+        span<const RemotePtr>{live_stage2_neighbors_by_task[item]},
         task.stage2_promotion_committed
           ? task.stage2_promotion_parent : RemotePtr{});
-      vec<RemotePtr> candidate_parents = task.stage1_backlink_targets;
-      if (task.stage2_promotion_committed &&
-          !task.stage2_promotion_parent.is_null()) {
-        candidate_parents.push_back(task.stage2_promotion_parent);
-      }
-      candidate_parents.insert(candidate_parents.end(),
-                               task.stage1_base_neighbors.begin(),
-                               task.stage1_base_neighbors.end());
-      candidate_parents.insert(candidate_parents.end(),
-                               task.stage2_neighbors.begin(),
-                               task.stage2_neighbors.end());
-      GraphAdjacency current_child_adjacency;
-      if (read_graph_adjacency(task.final_target, current_child_adjacency) &&
-          !current_child_adjacency.deleted) {
-        candidate_parents.insert(
-          candidate_parents.end(),
-          current_child_adjacency.stable.begin(),
-          current_child_adjacency.stable.end());
-      }
-      std::sort(candidate_parents.begin(), candidate_parents.end(),
-                [](RemotePtr lhs, RemotePtr rhs) {
-                  return lhs.raw_address < rhs.raw_address;
-                });
-      candidate_parents.erase(
-        std::unique(candidate_parents.begin(), candidate_parents.end()),
-        candidate_parents.end());
+      const vec<RemotePtr> candidate_parents =
+        stage2_revalidation_parents(
+          span<const RemotePtr>{task.stage1_backlink_targets},
+          task.stage2_promotion_committed
+            ? task.stage2_promotion_parent : RemotePtr{},
+          expected_plan.promotion_target);
+      // Only Stage1 backlink targets can own a provisional reachability slot.
+      // On a retry, the one selected promotion target may instead already own
+      // the final stable certificate.  Ordinary base/final neighbors cannot
+      // satisfy either postcondition, so scanning O(2R+L) of them (including a
+      // full vector snapshot and a synchronous adjacency read apiece) was
+      // pure work and dominated Stage2 latency.
       const vec<NodeSnapshot> parent_snapshots =
         read_node_snapshots_batched(candidate_parents, config);
       vec<RemotePtr> protected_parents;
@@ -1497,18 +1518,21 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       // remains the gate for all later cleanup.
     }
 
-    // Reconcile in three explicit barriers: atomically promote one protected
-    // certificate into an R-bounded stable edge, publish all remaining final
-    // backlink proposals, then remove every obsolete Stage1 protected edge.
-    // A timeout replays only idempotent postconditions; the mandatory stable
-    // bridge is ACKed before any operation may remove the last temporary edge.
+    // Promotion is the durable reachability certificate.  It must be ACKed
+    // before ordinary additions are allowed to RobustPrune the same target:
+    // an ordinary add can legitimately evict the promoted child, and removing
+    // the Stage1 bridge after such a combined wave would make the new node
+    // unreachable.  Keep this first barrier explicit; stable additions and
+    // obsolete-bridge removals remain separate ordered phases below.
     vec<ReconcileReverseOp> promotion_ops;
     vec<ReconcileReverseOp> stable_ops;
     vec<ReconcileReverseOp> removal_ops;
-    for (StorageOwnerMaintenanceTask& task : context.tasks) {
+    for (size_t item = 0; item < context.tasks.size(); ++item) {
+      StorageOwnerMaintenanceTask& task = context.tasks[item];
       if (task.reverse_reconciled) continue;
       if (!append_stage2_reconcile_ops(
-            task, promotion_ops, stable_ops, removal_ops)) {
+            task, span<const RemotePtr>{live_stage2_neighbors_by_task[item]},
+            promotion_ops, stable_ops, removal_ops)) {
         storage_owner_maintenance_pressure_yields_.fetch_add(
           1, std::memory_order_relaxed);
         return false;
@@ -1530,8 +1554,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     }
     // Ordinary proposals are allowed to lose RobustPrune, but a target that
     // retires between validation and RPC is retried with a newly filtered
-    // payload.  Temporary bridges remain intact because this barrier precedes
-    // every removal.
+    // payload.  Only after the promotion certificate and all ordinary adds
+    // have completed may cleanup remove temporary Stage1 bridges.
     if (!apply_phase(stable_ops) || !apply_phase(removal_ops)) {
       storage_owner_maintenance_failed_.fetch_add(
         1, std::memory_order_relaxed);
@@ -1545,61 +1569,77 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     // was armed and before graph publication. This token-fenced placement CAS
     // changes only its physical home, after every final reverse-edge
     // destination has ACKed the idempotent handoff.
+    vec<u32> placement_authorities;
+    vec<protocol::AuthorityPlacementItem> placements;
+    vec<size_t> placement_task_indices;
+    placement_authorities.reserve(context.tasks.size());
+    placements.reserve(context.tasks.size());
+    placement_task_indices.reserve(context.tasks.size());
     for (size_t item = 0; item < context.tasks.size(); ++item) {
-      StorageOwnerMaintenanceTask& task = context.tasks[item];
-      if (!task.placement_committed) {
-        const service::storage_owner::AuthorityPlacementItem placement{
-          .token = {
-            .source_client = task.source_client,
-            .item_index = task.operation_item_index,
-            .client_batch_id = task.operation_batch_id,
-          },
-          .id = task.id,
-          .generation = task.generation,
-          .expected_raw = task.target.raw_address,
-          .desired_raw = task.final_target.raw_address,
-          .expected_placement_version = task.initial_placement_version,
-        };
-        service::storage_owner::AuthorityPlacementResult result;
-        if (!relocate_via_authority(
-              task.authority_shard, placement, result, config)) {
-          storage_owner_maintenance_failed_.fetch_add(
-            1, std::memory_order_relaxed);
-          return false;
-        }
-        const auto status = static_cast<
-          service::storage_owner::AuthorityPlacementStatus>(result.status);
-        if (status ==
-              service::storage_owner::AuthorityPlacementStatus::busy) {
-          // A successor owns the authority lease. It will either abort (this
-          // exact CAS may then proceed) or commit (the next attempt is stale).
-          storage_owner_maintenance_pressure_yields_.fetch_add(
-            1, std::memory_order_relaxed);
-          return false;
-        }
-        if (status ==
-              service::storage_owner::AuthorityPlacementStatus::stale) {
-          if (!complete_stale_stage2(task)) return false;
-          task.maintenance_sequence = 0;
-          continue;
-        }
-        lib_assert(
-          status == service::storage_owner::AuthorityPlacementStatus::committed ||
-            status == service::storage_owner::AuthorityPlacementStatus::replay,
-          "authority rejected a structurally valid Stage2 placement token");
-        const u64 expected_resulting_version =
-          task.final_target == task.target
-            ? task.initial_placement_version
-            : task.initial_placement_version + 1;
-        lib_assert(result.resulting_placement_version ==
-                     expected_resulting_version,
-                   "authority placement returned an unexpected version");
-        // Remember the authority result before any fallible membership RPC.
-        // The final identity is now the only authority-visible placement, but
-        // the old Stage1 source remains readable until the final identity has
-        // been added to and published by its physical centroid owner.
-        task.placement_committed = true;
+      const StorageOwnerMaintenanceTask& task = context.tasks[item];
+      if (task.placement_committed) continue;
+      placement_authorities.push_back(task.authority_shard);
+      placement_task_indices.push_back(item);
+      placements.push_back(protocol::AuthorityPlacementItem{
+        .token = {
+          .source_client = task.source_client,
+          .item_index = task.operation_item_index,
+          .client_batch_id = task.operation_batch_id,
+        },
+        .id = task.id,
+        .generation = task.generation,
+        .expected_raw = task.target.raw_address,
+        .desired_raw = task.final_target.raw_address,
+        .expected_placement_version = task.initial_placement_version,
+      });
+    }
+    vec<protocol::AuthorityPlacementResult> placement_results;
+    if (!placements.empty() && !relocate_batch_via_authority(
+          span<const u32>{placement_authorities},
+          span<const protocol::AuthorityPlacementItem>{placements},
+          placement_results, config)) {
+      storage_owner_maintenance_failed_.fetch_add(
+        1, std::memory_order_relaxed);
+      return false;
+    }
+    lib_assert(placement_results.size() == placement_task_indices.size(),
+               "batched Stage2 placement lost a task result");
+    for (size_t slot = 0; slot < placement_task_indices.size(); ++slot) {
+      StorageOwnerMaintenanceTask& task =
+        context.tasks[placement_task_indices[slot]];
+      const protocol::AuthorityPlacementResult& result =
+        placement_results[slot];
+      const auto status = static_cast<
+        protocol::AuthorityPlacementStatus>(result.status);
+      if (status == protocol::AuthorityPlacementStatus::busy) {
+        // A successor owns the authority lease. It will either abort (this
+        // exact CAS may then proceed) or commit (the next attempt is stale).
+        storage_owner_maintenance_pressure_yields_.fetch_add(
+          1, std::memory_order_relaxed);
+        defer_stage2_retry(context);
+        return false;
       }
+      if (status == protocol::AuthorityPlacementStatus::stale) {
+        if (!complete_stale_stage2(task)) return false;
+        task.maintenance_sequence = 0;
+        continue;
+      }
+      lib_assert(
+        status == protocol::AuthorityPlacementStatus::committed ||
+          status == protocol::AuthorityPlacementStatus::replay,
+        "authority rejected a structurally valid Stage2 placement token");
+      const u64 expected_resulting_version =
+        task.final_target == task.target
+          ? task.initial_placement_version
+          : task.initial_placement_version + 1;
+      lib_assert(result.resulting_placement_version ==
+                   expected_resulting_version,
+                 "authority placement returned an unexpected version");
+      // Remember the authority result before any fallible membership RPC.
+      // The final identity is now the only authority-visible placement, but
+      // the old Stage1 source remains readable until the final identity has
+      // been added to and published by its physical centroid owner.
+      task.placement_committed = true;
     }
     ready = 0;
     for (size_t item = 0; item < context.tasks.size(); ++item) {
@@ -1651,6 +1691,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       if (!settle_dynamic_allocation(task)) {
         storage_owner_maintenance_pressure_yields_.fetch_add(
           1, std::memory_order_relaxed);
+        defer_stage2_retry(context);
         return false;
       }
       task.allocation_settled = true;
@@ -2011,6 +2052,15 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   const auto drive_context = [&](Stage2Context& context) {
     bool progressed = false;
     for (;;) {
+      if (context.kind == StorageOwnerMaintenanceKind::finalize_insert) {
+        const auto now = std::chrono::steady_clock::now();
+        const bool deferred = std::any_of(
+          context.tasks.begin(), context.tasks.end(),
+          [&](const StorageOwnerMaintenanceTask& task) {
+            return task.retry_not_before > now;
+          });
+        if (deferred) return progressed;
+      }
       const auto snapshot = states.snapshot(context.handle);
       lib_assert(snapshot.has_value(), "active stage2 context became stale");
       switch (snapshot->phase) {

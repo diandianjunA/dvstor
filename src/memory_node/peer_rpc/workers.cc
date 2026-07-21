@@ -523,23 +523,29 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
                "peer Stage1 task omitted its RC receive-order sequence");
     PeerOrderedCompletionState& completion =
       *peer_stage1_completion_states_[task.source_shard];
+    bool release_quiesced = true;
     if (release_barrier) {
-      std::unique_lock<std::mutex> lock(completion.mutex);
-      // RC preserves receive order, but several Stage1 workers may finish out
-      // of order after dequeue. A release is therefore an explicit per-peer
-      // completion barrier: every execute/arm/abort posted before it must have
-      // observed the semantic table before the receipt can disappear.
-      completion.changed.wait(lock, [&]() {
-        return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
-          completion.completed_prefix + 1 == task.source_sequence;
-      });
+      const auto* items = service::storage_owner::stage1_arm_items(
+        task.payload.data());
+      for (u32 item = 0; item < task.header.item_count; ++item) {
+        const Stage1OperationKey key{
+          .authority_shard = task.source_shard,
+          .source_client = items[item].token.source_client,
+          .item_index = items[item].token.item_index,
+          .client_batch_id = items[item].token.client_batch_id,
+        };
+        if (!wait_for_stage1_inflight_quiescence(key)) {
+          release_quiesced = false;
+          break;
+        }
+      }
     }
     bool success = false;
-    if (request_type ==
+    if (release_quiesced && request_type ==
         service::storage_owner::PeerRpcType::stage1_execute_request) {
       success = handle_peer_stage1_execute_request(
         task.source_shard, task.header, task.payload.data(), config);
-    } else if (request_type ==
+    } else if (release_quiesced && request_type ==
                service::storage_owner::PeerRpcType::stage1_arm_request) {
       success = handle_peer_stage1_arm_request(
         task.source_shard, task.header,
@@ -553,6 +559,15 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
     lib_assert(peer_request_deduplicator_->abandon(
                  task.dedup_lease, task.source_shard, task.header),
                "Stage1 completion lost its dedup lease");
+    for (const auto& token : task.operation_tokens) {
+      const Stage1OperationKey key{
+        .authority_shard = task.source_shard,
+        .source_client = token.source_client,
+        .item_index = token.item_index,
+        .client_batch_id = token.client_batch_id,
+      };
+      finish_stage1_inflight_request(key);
+    }
     {
       std::lock_guard<std::mutex> lock(completion.mutex);
       if (task.source_sequence == completion.completed_prefix + 1) {

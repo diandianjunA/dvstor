@@ -572,6 +572,97 @@ inline float typed_l2_distance(const byte_t* lhs,
   return saturate_squared_l2(sum);
 }
 
+// Evaluate the exact predicate used by alpha RobustPrune while avoiding the
+// rest of an integral byte-vector distance once the predicate can no longer
+// hold.  For equal uint8/int8 dtypes every squared component difference is a
+// non-negative integer.  Consequently the exact partial sum and its rounded
+// float representation are monotone.  With a finite positive alpha,
+//
+//   alpha * float(partial_sum) > source_distance
+//
+// proves that alpha * float(final_sum) <= source_distance is impossible.
+// The completed path rounds the exact integer sum once, exactly as
+// typed_l2_distance() does.  Float, mixed-dtype, and unusual-alpha cases use
+// typed_l2_distance() directly so their established behavior is unchanged.
+// evaluated_components is optional test/telemetry output; it has no bearing
+// on the result.
+inline bool typed_l2_distance_alpha_leq_source(
+    const byte_t* lhs,
+    VectorDType lhs_dtype,
+    const byte_t* rhs,
+    VectorDType rhs_dtype,
+    u32 dim,
+    f64 alpha,
+    distance_t source_distance,
+    u32* evaluated_components = nullptr) {
+  if (evaluated_components != nullptr) {
+    *evaluated_components = 0;
+  }
+  const bool same_integral_dtype =
+    lhs_dtype == rhs_dtype &&
+    (lhs_dtype == VectorDType::uint8 || lhs_dtype == VectorDType::int8);
+  if (!same_integral_dtype || !(alpha > 0.0) ||
+      !floating_value_is_finite(alpha)) {
+    if (evaluated_components != nullptr) {
+      *evaluated_components = dim;
+    }
+    return alpha * static_cast<f64>(
+                     typed_l2_distance(lhs, lhs_dtype, rhs, rhs_dtype, dim)) <=
+      static_cast<f64>(source_distance);
+  }
+
+  // A 32-component chunk is small enough that its largest possible sum
+  // (32 * 255^2) is represented exactly by float.  This preserves exact
+  // accumulation while providing four early-exit opportunities for the
+  // common 128-dimensional vectors.
+  constexpr u32 kThresholdChunkComponents = 32;
+  f64 exact_sum = 0.0;
+  u32 offset = 0;
+  while (offset < dim) {
+    const u32 chunk = std::min<u32>(
+      kThresholdChunkComponents, dim - offset);
+#ifdef __AVX2__
+    exact_sum += lhs_dtype == VectorDType::uint8
+      ? static_cast<f64>(typed_l2_distance_uint8_simd_chunk(
+          lhs + offset, rhs + offset, chunk))
+      : static_cast<f64>(typed_l2_distance_int8_simd_chunk(
+          lhs + offset, rhs + offset, chunk));
+#else
+    if (lhs_dtype == VectorDType::uint8) {
+      const auto* a = reinterpret_cast<const u8*>(lhs + offset);
+      const auto* b = reinterpret_cast<const u8*>(rhs + offset);
+      for (u32 index = 0; index < chunk; ++index) {
+        const i32 diff = static_cast<i32>(a[index]) -
+          static_cast<i32>(b[index]);
+        exact_sum += static_cast<f64>(diff * diff);
+      }
+    } else {
+      const auto* a = reinterpret_cast<const i8*>(lhs + offset);
+      const auto* b = reinterpret_cast<const i8*>(rhs + offset);
+      for (u32 index = 0; index < chunk; ++index) {
+        const i32 diff = static_cast<i32>(a[index]) -
+          static_cast<i32>(b[index]);
+        exact_sum += static_cast<f64>(diff * diff);
+      }
+    }
+#endif
+    offset += chunk;
+    if (evaluated_components != nullptr) {
+      *evaluated_components = offset;
+    }
+
+    const distance_t rounded_partial = static_cast<distance_t>(exact_sum);
+    if (alpha * static_cast<f64>(rounded_partial) >
+        static_cast<f64>(source_distance)) {
+      return false;
+    }
+  }
+
+  const distance_t rounded_distance = static_cast<distance_t>(exact_sum);
+  return alpha * static_cast<f64>(rounded_distance) <=
+    static_cast<f64>(source_distance);
+}
+
 inline float typed_l2_distance_float_query(const span<const element_t> query,
                                            const byte_t* stored,
                                            VectorDType stored_dtype,

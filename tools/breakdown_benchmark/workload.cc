@@ -902,6 +902,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     return elapsed;
   };
   std::vector<MaintenanceLogCursor> maintenance_log_cursors;
+  std::vector<std::optional<gpu_search::maintenance_telemetry::Snapshot>>
+    maintenance_snapshot_begin;
   if (!args.recall_only && (args.workload == "insert" || args.workload == "both")) {
     std::cerr << "[breakdown] starting warmup insert" << std::endl;
     if (use_time_mode) {
@@ -934,6 +936,14 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   (void)drain_storage_maintenance("warmup");
 
   const size_t performance_queries_after_warmup = performance_query_stream.consumed();
+  if (workload_has_writes) {
+    try {
+      maintenance_snapshot_begin = service.storage_maintenance_telemetry();
+    } catch (const std::exception& error) {
+      std::cerr << "[breakdown] in-band Stage2 telemetry baseline unavailable: "
+                << error.what() << std::endl;
+    }
+  }
   if (!args.storage_maintenance_logs.empty()) {
     maintenance_log_cursors = snapshot_maintenance_logs(
       args.storage_maintenance_logs);
@@ -984,7 +994,26 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     drain_storage_maintenance("measure");
 
   MaintenanceLogSummary maintenance_summary;
-  if (!maintenance_log_cursors.empty()) {
+  bool in_band_maintenance_telemetry = false;
+  if (!maintenance_snapshot_begin.empty()) {
+    try {
+      const auto maintenance_snapshot_end =
+        service.storage_maintenance_telemetry();
+      MaintenanceLogSummary in_band_summary =
+        summarize_maintenance_snapshot_window(
+          maintenance_snapshot_begin, maintenance_snapshot_end);
+      if (in_band_summary.requested_logs != 0 &&
+          in_band_summary.logs_with_observations ==
+            in_band_summary.requested_logs) {
+        maintenance_summary = std::move(in_band_summary);
+        in_band_maintenance_telemetry = true;
+      }
+    } catch (const std::exception& error) {
+      std::cerr << "[breakdown] in-band Stage2 telemetry final snapshot "
+                   "unavailable: " << error.what() << std::endl;
+    }
+  }
+  if (!in_band_maintenance_telemetry && !maintenance_log_cursors.empty()) {
     const auto measurement_end = snapshot_maintenance_logs(
       args.storage_maintenance_logs);
     maintenance_summary = summarize_maintenance_log_window(
@@ -1325,6 +1354,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     return paths;
   };
   root["stage2"] = {
+    {"source", in_band_maintenance_telemetry
+      ? "in_band_control_page" : "storage_logs"},
     {"requested_logs", maintenance_summary.requested_logs},
     {"readable_logs", maintenance_summary.readable_logs},
     {"logs_with_observations", maintenance_summary.logs_with_observations},

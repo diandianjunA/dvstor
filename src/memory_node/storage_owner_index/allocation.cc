@@ -357,16 +357,46 @@ MemoryNode::AuthorityBeginResult MemoryNode::begin_authority_mutation(
     AuthorityOperationToken operation,
     u32 stage1_home) {
   DynamicFreshnessShard& shard = dynamic_freshness_shard(id);
-  std::lock_guard<std::mutex> lock(shard.mutex);
-  AuthorityDirectoryState state =
-    load_authority_directory_state_locked(shard, id);
-  const AuthorityBeginResult result =
-    memory_node_storage_owner_index_detail::begin_authority_mutation(
-      state, kind, operation, stage1_home);
-  if (result.acquired()) {
-    store_authority_directory_state_locked(shard, id, state);
+  for (;;) {
+    std::unique_lock<std::mutex> lock(shard.mutex);
+    AuthorityDirectoryState state =
+      load_authority_directory_state_locked(shard, id);
+    const AuthorityBeginResult result =
+      memory_node_storage_owner_index_detail::begin_authority_mutation(
+        state, kind, operation, stage1_home);
+    if (result.state !=
+        memory_node_storage_owner_index_detail::AuthorityBeginState::replay) {
+      if (result.acquired()) {
+        store_authority_directory_state_locked(shard, id, state);
+      }
+      return result;
+    }
+
+    // Exactly one foreground executor may perform physical Stage1 work for a
+    // semantic token. A duplicate request that arrived before the original
+    // commit waits on this ID shard and then observes committed_replay (or
+    // legitimately re-acquires after abort). This closes the otherwise
+    // unbounded "future replay after receipt release" race without retaining
+    // per-client deltas or duplicating graph work.
+    shard.changed.wait(lock, [&]() {
+      if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+        return true;
+      }
+      const auto active = shard.mutation_leases.find(id);
+      return active == shard.mutation_leases.end() ||
+        !memory_node_storage_owner_index_detail::same_authority_operation(
+          active->second.operation, operation);
+    });
+    if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+      return {
+        .state = memory_node_storage_owner_index_detail::
+          AuthorityBeginState::busy,
+        .previous = {},
+        .generation = 0,
+        .replay_result = {},
+      };
+    }
   }
-  return result;
 }
 
 MemoryNode::AuthorityCommitState MemoryNode::commit_authority_mutation(
@@ -377,16 +407,23 @@ MemoryNode::AuthorityCommitState MemoryNode::commit_authority_mutation(
     bool deleted,
     u64 maintenance_sequence) {
   DynamicFreshnessShard& shard = dynamic_freshness_shard(id);
-  std::lock_guard<std::mutex> lock(shard.mutex);
-  AuthorityDirectoryState state =
-    load_authority_directory_state_locked(shard, id);
-  const AuthorityCommitState result =
-    memory_node_storage_owner_index_detail::commit_authority_mutation(
-      state, operation, desired, generation, deleted,
-      maintenance_sequence);
+  AuthorityCommitState result;
+  {
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    AuthorityDirectoryState state =
+      load_authority_directory_state_locked(shard, id);
+    result = memory_node_storage_owner_index_detail::
+      commit_authority_mutation(
+        state, operation, desired, generation, deleted,
+        maintenance_sequence);
+    if (result == AuthorityCommitState::committed ||
+        result == AuthorityCommitState::replay) {
+      store_authority_directory_state_locked(shard, id, state);
+    }
+  }
   if (result == AuthorityCommitState::committed ||
       result == AuthorityCommitState::replay) {
-    store_authority_directory_state_locked(shard, id, state);
+    shard.changed.notify_all();
   }
   return result;
 }
@@ -395,15 +432,18 @@ MemoryNode::AuthorityAbortState MemoryNode::abort_authority_mutation(
     node_t id,
     AuthorityOperationToken operation) {
   DynamicFreshnessShard& shard = dynamic_freshness_shard(id);
-  std::lock_guard<std::mutex> lock(shard.mutex);
-  AuthorityDirectoryState state =
-    load_authority_directory_state_locked(shard, id);
-  const AuthorityAbortState result =
-    memory_node_storage_owner_index_detail::abort_authority_mutation(
-      state, operation);
-  if (result == AuthorityAbortState::aborted) {
-    store_authority_directory_state_locked(shard, id, state);
+  AuthorityAbortState result;
+  {
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    AuthorityDirectoryState state =
+      load_authority_directory_state_locked(shard, id);
+    result = memory_node_storage_owner_index_detail::
+      abort_authority_mutation(state, operation);
+    if (result == AuthorityAbortState::aborted) {
+      store_authority_directory_state_locked(shard, id, state);
+    }
   }
+  if (result == AuthorityAbortState::aborted) shard.changed.notify_all();
   return result;
 }
 

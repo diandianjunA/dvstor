@@ -38,6 +38,7 @@ int main() {
   const auto colocated = memory_node_detail::derive_storage_owner_cpu_plan(
     22, 64, 16, 8, 4);
   assert(colocated.foreground_workers == 3);
+  assert(colocated.foreground_coordinators == 12);
   assert(colocated.maintenance_workers == 2);
   assert(colocated.peer_reverse_workers == 4);
   assert(colocated.peer_stage1_workers == 7);
@@ -55,6 +56,7 @@ int main() {
   const auto dedicated = memory_node_detail::derive_storage_owner_cpu_plan(
     112, 64, 16, 8, 4);
   assert(dedicated.foreground_workers == 16);
+  assert(dedicated.foreground_coordinators == 16);
   assert(dedicated.maintenance_workers == 8);
   assert(dedicated.peer_reverse_workers == 8);
   assert(dedicated.peer_stage1_workers == 32);
@@ -67,12 +69,32 @@ int main() {
   const auto one_remote = memory_node_detail::derive_storage_owner_cpu_plan(
     22, 64, 16, 8, 1);
   assert(one_remote.foreground_workers == colocated.foreground_workers);
+  assert(one_remote.foreground_coordinators ==
+         colocated.foreground_coordinators);
   assert(one_remote.peer_stage1_workers == colocated.peer_stage1_workers);
 
   const auto local_only = memory_node_detail::derive_storage_owner_cpu_plan(
     22, 64, 16, 8, 0);
   assert(local_only.foreground_workers == 16);
+  assert(local_only.foreground_coordinators ==
+         local_only.foreground_workers);
   assert(local_only.peer_stage1_workers == 0);
   assert(local_only.peer_cleanup_workers == 0);
   assert(local_only.peer_placement_workers == 0);
+
+  // Compute-node scale changes the registered RPC window, not the number of
+  // CPU lanes or an unbounded thread pool. Waiting coordinators are capped at
+  // four per foreground CPU and never exceed the configured thread ceiling.
+  const auto many_clients = memory_node_detail::derive_storage_owner_cpu_plan(
+    22, 64, 4096, 8, 4);
+  assert(many_clients.foreground_workers == 3);
+  assert(many_clients.foreground_coordinators == 12);
+  assert(many_clients.foreground_coordinators <=
+         many_clients.foreground_workers * 4);
+
+  const auto shallow_rpc = memory_node_detail::derive_storage_owner_cpu_plan(
+    22, 64, 2, 8, 4);
+  assert(shallow_rpc.foreground_coordinators <= 2);
+  assert(shallow_rpc.foreground_coordinators >=
+         shallow_rpc.foreground_workers);
 }

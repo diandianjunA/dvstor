@@ -77,6 +77,113 @@ void test_integer_simd_matches_canonical_distance_for_arbitrary_dimensions() {
   }
 }
 
+void test_integral_alpha_threshold_matches_complete_distance() {
+  constexpr u32 dim = 128;
+  vec<byte_t> lhs(dim);
+  vec<byte_t> rhs(dim);
+
+  const auto verify = [&](VectorDType dtype,
+                          f64 alpha,
+                          distance_t source_distance) {
+    const distance_t complete = typed_l2_distance(
+      lhs.data(), dtype, rhs.data(), dtype, dim);
+    const distance_t scalar = scalar_same_dtype_distance(
+      lhs, rhs, dtype, dim);
+    assert(complete == scalar);
+    const bool expected =
+      alpha * static_cast<f64>(scalar) <=
+      static_cast<f64>(source_distance);
+    const bool actual = typed_l2_distance_alpha_leq_source(
+      lhs.data(), dtype, rhs.data(), dtype, dim, alpha, source_distance);
+    assert(actual == expected);
+  };
+
+  for (const VectorDType dtype :
+       {VectorDType::uint8, VectorDType::int8}) {
+    u32 state = dtype == VectorDType::uint8 ? 0x12345678u : 0x87654321u;
+    for (u32 sample = 0; sample < 512; ++sample) {
+      for (u32 index = 0; index < dim; ++index) {
+        state = state * 1664525u + 1013904223u;
+        lhs[index] = static_cast<byte_t>(state >> 24);
+        state = state * 1664525u + 1013904223u;
+        rhs[index] = static_cast<byte_t>(state >> 24);
+      }
+      const distance_t complete = typed_l2_distance(
+        lhs.data(), dtype, rhs.data(), dtype, dim);
+      verify(dtype, 1.0, complete);
+      verify(dtype, 1.0,
+             std::nextafter(complete,
+                            -std::numeric_limits<distance_t>::infinity()));
+      verify(dtype, 1.0,
+             std::nextafter(complete,
+                            std::numeric_limits<distance_t>::infinity()));
+      verify(dtype, 1.2, static_cast<distance_t>(
+        1.2 * static_cast<f64>(complete)));
+      verify(dtype, 0.73, static_cast<distance_t>(
+        0.73 * static_cast<f64>(complete)));
+      verify(dtype, 2.5, static_cast<distance_t>(state & 0x00ffffffu));
+    }
+  }
+}
+
+void test_integral_alpha_threshold_exits_early_and_fallbacks_are_unchanged() {
+  constexpr u32 dim = 128;
+  vec<byte_t> lhs(dim, static_cast<byte_t>(0));
+  vec<byte_t> rhs(dim, static_cast<byte_t>(255));
+
+  for (const VectorDType dtype :
+       {VectorDType::uint8, VectorDType::int8}) {
+    if (dtype == VectorDType::int8) {
+      std::fill(reinterpret_cast<i8*>(lhs.data()),
+                reinterpret_cast<i8*>(lhs.data()) + dim,
+                static_cast<i8>(-128));
+      std::fill(reinterpret_cast<i8*>(rhs.data()),
+                reinterpret_cast<i8*>(rhs.data()) + dim,
+                static_cast<i8>(127));
+    }
+    u32 evaluated = 0;
+    assert(!typed_l2_distance_alpha_leq_source(
+      lhs.data(), dtype, rhs.data(), dtype, dim, 1.2, 1.0F,
+      &evaluated));
+    assert(evaluated == 32);
+  }
+
+  std::array<f32, 4> float_lhs{0.0F, 1.0F, 2.0F, 3.0F};
+  std::array<f32, 4> float_rhs{3.0F, 2.0F, 1.0F, 0.0F};
+  u32 evaluated = 0;
+  const bool expected = 1.2 * static_cast<f64>(typed_l2_distance(
+    reinterpret_cast<const byte_t*>(float_lhs.data()),
+    VectorDType::float32,
+    reinterpret_cast<const byte_t*>(float_rhs.data()),
+    VectorDType::float32,
+    static_cast<u32>(float_lhs.size()))) <= 10.0;
+  const bool actual = typed_l2_distance_alpha_leq_source(
+    reinterpret_cast<const byte_t*>(float_lhs.data()),
+    VectorDType::float32,
+    reinterpret_cast<const byte_t*>(float_rhs.data()),
+    VectorDType::float32,
+    static_cast<u32>(float_lhs.size()), 1.2, 10.0F, &evaluated);
+  assert(actual == expected);
+  assert(evaluated == float_lhs.size());
+
+  vec<byte_t> mixed_lhs(dim, static_cast<byte_t>(200));
+  vec<byte_t> mixed_rhs(dim, static_cast<byte_t>(-50));
+  const distance_t mixed_distance = typed_l2_distance(
+    mixed_lhs.data(), VectorDType::uint8,
+    mixed_rhs.data(), VectorDType::int8, dim);
+  evaluated = 0;
+  const distance_t mixed_source = std::nextafter(
+    mixed_distance, std::numeric_limits<distance_t>::infinity());
+  const bool mixed_expected =
+    1.0 * static_cast<f64>(mixed_distance) <= mixed_source;
+  const bool mixed_actual = typed_l2_distance_alpha_leq_source(
+    mixed_lhs.data(), VectorDType::uint8,
+    mixed_rhs.data(), VectorDType::int8,
+    dim, 1.0, mixed_source, &evaluated);
+  assert(mixed_actual == mixed_expected);
+  assert(evaluated == dim);
+}
+
 }  // namespace
 
 int main() {
@@ -136,5 +243,7 @@ int main() {
     assert(rejected);
   }
   test_integer_simd_matches_canonical_distance_for_arbitrary_dimensions();
+  test_integral_alpha_threshold_matches_complete_distance();
+  test_integral_alpha_threshold_exits_early_and_fallbacks_are_unchanged();
   return 0;
 }

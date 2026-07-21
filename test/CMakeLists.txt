@@ -42,6 +42,11 @@ dvstor_target_common_includes(core_partition_test)
 target_compile_options(core_partition_test PRIVATE -UNDEBUG)
 add_test(NAME core_partition_test COMMAND core_partition_test)
 
+add_executable(peer_rdma_credit_policy_test peer_rdma_credit_policy_test.cc)
+dvstor_target_common_includes(peer_rdma_credit_policy_test)
+target_compile_options(peer_rdma_credit_policy_test PRIVATE -UNDEBUG)
+add_test(NAME peer_rdma_credit_policy_test COMMAND peer_rdma_credit_policy_test)
+
 add_executable(bounded_update_primitives_test bounded_update_primitives_test.cc)
 target_link_libraries(bounded_update_primitives_test PRIVATE dvstor_runtime)
 target_compile_options(bounded_update_primitives_test PRIVATE -UNDEBUG)
@@ -165,6 +170,11 @@ add_executable(maintenance_fence_test maintenance_fence_test.cc)
 dvstor_target_common_includes(maintenance_fence_test)
 target_compile_options(maintenance_fence_test PRIVATE -UNDEBUG)
 add_test(NAME maintenance_fence_test COMMAND maintenance_fence_test)
+
+add_executable(maintenance_telemetry_test maintenance_telemetry_test.cc)
+dvstor_target_common_includes(maintenance_telemetry_test)
+target_compile_options(maintenance_telemetry_test PRIVATE -UNDEBUG)
+add_test(NAME maintenance_telemetry_test COMMAND maintenance_telemetry_test)
 
 if (TARGET dvstor_gpu_kernels)
     add_executable(gpu_centroid_route_ranking_test

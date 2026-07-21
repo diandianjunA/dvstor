@@ -1,5 +1,4 @@
 #include <cassert>
-#include <deque>
 
 #include "service/compute_service/storage_owner/batch_policy.hh"
 #include "service/compute_service/storage_owner/response_validation.hh"
@@ -7,8 +6,7 @@
 namespace {
 
 using compute_service_detail::StorageOwnerResponseValidation;
-using compute_service_detail::drain_concurrent_storage_owner_batch;
-using compute_service_detail::kConcurrentProducerBatchRounds;
+using compute_service_detail::decide_storage_owner_batch;
 using compute_service_detail::validate_storage_owner_response;
 
 void test_matched_malformed_response_fails() {
@@ -61,106 +59,63 @@ void test_matched_malformed_response_fails() {
          StorageOwnerResponseValidation::matched_invalid);
 }
 
-void test_batch_policy_drains_ready_items_without_waiting() {
-  std::deque<u32> ready{11, 12, 13};
-  vec<u32> output{10};
-  u32 relaxations = 0;
-  const auto result = drain_concurrent_storage_owner_batch(
-    1, 4,
-    [&](u32& item) {
-      if (ready.empty()) return false;
-      item = ready.front();
-      ready.pop_front();
-      return true;
-    },
-    []() { return false; },
-    [&](u32 item) { output.push_back(item); },
-    [&]() { ++relaxations; });
-  assert(result.item_count == 4);
-  assert(result.wait_rounds == 0);
-  assert(relaxations == 0);
-  assert((output == vec<u32>{10, 11, 12, 13}));
+void test_batch_policy_is_immediate_below_saturation() {
+  const auto decision = decide_storage_owner_batch(
+    false, 3, 4, 12, 7, 32);
+  assert(!decision.saturated);
+  assert(!decision.tail_escape);
+  assert(decision.take == 3);
 }
 
-void test_batch_policy_waits_only_for_announced_concurrency() {
-  std::deque<u32> ready;
-  vec<u32> output{20};
-  bool pending = true;
-  u32 relaxations = 0;
-  const auto result = drain_concurrent_storage_owner_batch(
-    1, 4,
-    [&](u32& item) {
-      if (ready.empty()) return false;
-      item = ready.front();
-      ready.pop_front();
-      return true;
-    },
-    [&]() { return pending; },
-    [&](u32 item) { output.push_back(item); },
-    [&]() {
-      ++relaxations;
-      ready.push_back(21);
-      ready.push_back(22);
-      pending = false;
-    });
-  assert(result.item_count == 3);
-  assert(result.wait_rounds == 1);
-  assert(relaxations == 1);
-  assert((output == vec<u32>{20, 21, 22}));
+void test_batch_policy_latches_and_forms_full_batches() {
+  const auto latch = decide_storage_owner_batch(
+    false, 7, 16, 0, 9, 32);
+  assert(latch.saturated);
+  assert(latch.take == 0);
 
-  ready.clear();
-  output.assign(1, 30);
-  relaxations = 0;
-  const auto isolated = drain_concurrent_storage_owner_batch(
-    1, 4,
-    [&](u32&) { return false; },
-    []() { return false; },
-    [&](u32 item) { output.push_back(item); },
-    [&]() { ++relaxations; });
-  assert(isolated.item_count == 1);
-  assert(isolated.wait_rounds == 0);
-  assert(relaxations == 0);
+  const auto hold_tail = decide_storage_owner_batch(
+    true, 31, 5, 11, 3, 32);
+  assert(hold_tail.saturated);
+  assert(!hold_tail.tail_escape);
+  assert(hold_tail.take == 0);
+
+  const auto full = decide_storage_owner_batch(
+    true, 41, 5, 11, 3, 32);
+  assert(full.saturated);
+  assert(!full.tail_escape);
+  assert(full.take == 32);
 }
 
-void test_batch_policy_has_a_hard_wait_bound() {
-  u32 relaxations = 0;
-  const auto result = drain_concurrent_storage_owner_batch(
-    1, 32,
-    [&](u32&) { return false; },
-    []() { return true; },
-    [&](u32) { assert(false); },
-    [&]() { ++relaxations; });
-  assert(result.item_count == 1);
-  assert(result.wait_rounds == kConcurrentProducerBatchRounds);
-  assert(relaxations == kConcurrentProducerBatchRounds);
-}
+void test_batch_policy_tail_is_self_clocked_and_epoch_exits() {
+  const auto tail = decide_storage_owner_batch(
+    true, 9, 0, 16, 0, 32);
+  assert(tail.saturated);
+  assert(tail.tail_escape);
+  assert(tail.take == 9);
 
-void test_batch_policy_reprobes_after_producer_closes() {
-  vec<u32> output{40};
-  u32 probes = 0;
-  const auto result = drain_concurrent_storage_owner_batch(
-    1, 4,
-    [&](u32& item) {
-      ++probes;
-      if (probes != 2) return false;
-      item = 41;
-      return true;
-    },
-    []() { return false; },
-    [&](u32 item) { output.push_back(item); },
-    []() { assert(false); });
-  assert(result.item_count == 2);
-  assert(result.wait_rounds == 0);
-  assert((output == vec<u32>{40, 41}));
+  const auto producer_gap = decide_storage_owner_batch(
+    true, 0, 0, 16, 1, 32);
+  assert(producer_gap.saturated);
+  assert(producer_gap.take == 0);
+
+  const auto announced_tail = decide_storage_owner_batch(
+    true, 9, 0, 16, 3, 32);
+  assert(announced_tail.saturated);
+  assert(!announced_tail.tail_escape);
+  assert(announced_tail.take == 0);
+
+  const auto drained = decide_storage_owner_batch(
+    true, 0, 0, 16, 0, 32);
+  assert(!drained.saturated);
+  assert(drained.take == 0);
 }
 
 }  // namespace
 
 int main() {
   test_matched_malformed_response_fails();
-  test_batch_policy_drains_ready_items_without_waiting();
-  test_batch_policy_waits_only_for_announced_concurrency();
-  test_batch_policy_has_a_hard_wait_bound();
-  test_batch_policy_reprobes_after_producer_closes();
+  test_batch_policy_is_immediate_below_saturation();
+  test_batch_policy_latches_and_forms_full_batches();
+  test_batch_policy_tail_is_self_clocked_and_epoch_exits();
   return 0;
 }

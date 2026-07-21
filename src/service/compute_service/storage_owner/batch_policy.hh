@@ -1,59 +1,61 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
-#include <utility>
-
 #include "common/types.hh"
 
 namespace compute_service_detail {
 
-// The storage-owner sender normally observes a one-item queue because the
-// public mutation API is synchronous and its dedicated CQ thread can dequeue
-// faster than the other application threads finish centroid routing.  Waiting
-// for a fixed time would penalize an isolated mutation and introduce a
-// workload-specific tuning knob.  Instead, admit a few scheduler handoff
-// rounds only when another producer has explicitly announced work for this
-// same logical owner.
-inline constexpr u32 kConcurrentProducerBatchRounds = 4;
-
-struct ConcurrentBatchDrainResult {
-  u32 item_count{};
-  u32 wait_rounds{};
+struct StorageOwnerBatchDecision {
+  bool saturated{};
+  bool tail_escape{};
+  u32 take{};
 };
 
-template <class TryPop, class HasPendingProducer,
-          class Append, class Relax>
-ConcurrentBatchDrainResult drain_concurrent_storage_owner_batch(
-    u32 initial_items,
-    u32 max_items,
-    TryPop&& try_pop,
-    HasPendingProducer&& has_pending_producer,
-    Append&& append,
-    Relax&& relax) {
-  ConcurrentBatchDrainResult result{.item_count = initial_items};
-  while (result.item_count < max_items) {
-    u32 task_id = 0;
-    if (try_pop(task_id)) {
-      append(task_id);
-      ++result.item_count;
-      continue;
-    }
-    if (result.wait_rounds >= kConcurrentProducerBatchRounds ||
-        !has_pending_producer()) {
-      // Closing an announcement is release-ordered after queue publication.
-      // Re-probe once after observing that closure so the producer cannot
-      // strand a just-published task in the next singleton RPC.
-      if (try_pop(task_id)) {
-        append(task_id);
-        ++result.item_count;
-        continue;
-      }
-      break;
-    }
-    ++result.wait_rounds;
-    relax();
+// A synchronous caller population forms a closed queueing loop. If every RPC
+// slot consumes the first item it sees, N callers are permanently fragmented
+// across rpc_depth tiny requests (N / rpc_depth items each). This policy keeps
+// isolated writes immediate, then latches a saturated epoch once every lane is
+// busy or a full batch is already ready. During that epoch only full batches
+// open additional lanes; the last active lane is the progress escape for a
+// finite tail. No timer, scheduler yield, or dataset-specific threshold is
+// involved, and the CQ progress thread never waits for a producer.
+inline StorageOwnerBatchDecision decide_storage_owner_batch(
+    bool saturated,
+    u32 ready_tasks,
+    u32 active_rpcs,
+    u32 free_rpc_slots,
+    u32 pending_producers,
+    u32 batch_max) {
+  if (batch_max == 0) return {};
+  if (!saturated &&
+      (ready_tasks >= batch_max ||
+       (free_rpc_slots == 0 && ready_tasks != 0))) {
+    saturated = true;
   }
-  return result;
+  if (saturated && active_rpcs == 0 && ready_tasks == 0 &&
+      pending_producers == 0) {
+    saturated = false;
+  }
+  if (free_rpc_slots == 0 || ready_tasks == 0) {
+    return {.saturated = saturated};
+  }
+  // A producer increments pending_producers before publishing its queue
+  // entry.  When no RPC is active, wait for those already-announced entries
+  // to become visible instead of prematurely sending the currently visible
+  // tail.  Once every producer closes its announcement, the tail escape below
+  // guarantees progress without a timer.
+  if (saturated && ready_tasks < batch_max &&
+      (active_rpcs != 0 || pending_producers != 0)) {
+    return {.saturated = true};
+  }
+  const bool tail_escape = saturated && active_rpcs == 0 &&
+    ready_tasks < batch_max;
+  return {
+    .saturated = saturated,
+    .tail_escape = tail_escape,
+    .take = std::min(ready_tasks, batch_max),
+  };
 }
 
 }  // namespace compute_service_detail

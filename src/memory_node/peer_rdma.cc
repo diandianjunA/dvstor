@@ -86,6 +86,12 @@ void MemoryNode::setup_storage_peers(Configuration& config) {
   peer_send_wcs_.resize(std::max<i32>(1, peer_context_->get_config().max_send_queue_wr));
 
   setup_peer_rpc_runtime(config);
+  peer_rdma_read_credits_ = derive_peer_rdma_read_credit_plan();
+  lib_assert(peer_rdma_read_credits_.per_qp != 0 &&
+               peer_rdma_read_credits_.per_peer != 0 &&
+               peer_rdma_read_credits_.global != 0,
+             "peer send CQ is too small for one RDMA read credit per peer "
+             "after reserving peer control traffic");
 
   for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
     if (peer_id == storage_id_) continue;
@@ -121,18 +127,74 @@ u64 MemoryNode::peer_coroutine_wr_id(u32 thread_id, u32 coroutine_id) {
   return encode_64bit(thread_id, coroutine_id);
 }
 
+memory_node_detail::PeerRdmaReadCreditPlan
+MemoryNode::derive_peer_rdma_read_credit_plan() const {
+  const u32 remote_peer_count =
+    num_storage_nodes_ > 1 ? num_storage_nodes_ - 1 : 1;
+  const u32 data_qp_count =
+    memory_node_detail::peer_data_qps_per_peer(peer_qps_per_peer_);
+
+  u32 max_qp_send_wr = std::numeric_limits<u32>::max();
+  bool observed_data_qp = false;
+  const u32 first_data_qp = peer_qps_per_peer_ <= 1 ? 0 : 1;
+  for (u32 peer_id = 0; peer_id < peer_qps_.size(); ++peer_id) {
+    if (peer_id == storage_id_) continue;
+    for (u32 qp_idx = first_data_qp; qp_idx < peer_qps_per_peer_; ++qp_idx) {
+      if (qp_idx >= peer_qps_[peer_id].size() ||
+          peer_qps_[peer_id][qp_idx] == nullptr) {
+        continue;
+      }
+      observed_data_qp = true;
+      max_qp_send_wr = std::min(
+        max_qp_send_wr, peer_qps_[peer_id][qp_idx]->max_send_wr());
+    }
+  }
+  if (!observed_data_qp) {
+    max_qp_send_wr = static_cast<u32>(std::max<i32>(
+      1, peer_context_ != nullptr
+           ? peer_context_->get_config().max_send_queue_wr : 1));
+  }
+
+  const u32 device_rd_atomic = peer_context_ != nullptr
+    ? std::min<u32>(kPeerSafeRdAtomic,
+                    peer_context_->max_qp_read_atomic())
+    : kPeerSafeRdAtomic;
+  const u32 send_cq_entries = peer_context_ != nullptr &&
+      peer_context_->get_send_cq() != nullptr
+    ? static_cast<u32>(std::max<i32>(
+        1, peer_context_->get_send_cq()->cqe))
+    : max_qp_send_wr;
+
+  // Async peer RPC slots can all own a signaled SEND concurrently.  Keep one
+  // additional synchronous control completion per peer and one non-read data
+  // completion per data QP out of the read-CQE budget.
+  const u64 non_read_reserve = static_cast<u64>(remote_peer_count) *
+    (static_cast<u64>(peer_rpc_runtime_.send_slots_per_peer) + 1 +
+     data_qp_count);
+  const u32 reserved_non_read_cq_entries = static_cast<u32>(
+    std::min<u64>(non_read_reserve, std::numeric_limits<u32>::max()));
+
+  return memory_node_detail::derive_peer_rdma_read_credit_plan(
+    storage_owner_peer_rdma_tokens_, peer_qps_per_peer_, remote_peer_count,
+    device_rd_atomic, max_qp_send_wr, send_cq_entries,
+    reserved_non_read_cq_entries);
+}
+
+const memory_node_detail::PeerRdmaReadCreditPlan&
+MemoryNode::peer_rdma_read_credit_plan() const {
+  return peer_rdma_read_credits_;
+}
+
 u32 MemoryNode::peer_rdma_read_credit_limit_per_qp() const {
-  return std::max<u32>(1, std::min<u32>(storage_owner_peer_rdma_tokens_, kPeerSafeRdAtomic));
+  return peer_rdma_read_credits_.per_qp;
 }
 
 u32 MemoryNode::peer_rdma_read_credit_limit() const {
-  const u32 per_peer_safe = std::max<u32>(1, peer_qps_per_peer_) * kPeerSafeRdAtomic;
-  return std::max<u32>(1, std::min<u32>(storage_owner_peer_rdma_tokens_, per_peer_safe));
+  return peer_rdma_read_credits_.per_peer;
 }
 
 u32 MemoryNode::peer_rdma_read_global_credit_limit() const {
-  const u32 remote_peer_count = num_storage_nodes_ > 1 ? num_storage_nodes_ - 1 : 1;
-  return std::max<u32>(1, peer_rdma_read_credit_limit() * remote_peer_count);
+  return peer_rdma_read_credits_.global;
 }
 
 bool MemoryNode::try_acquire_counter(std::atomic<u32>& counter, u32 limit) {
@@ -292,7 +354,8 @@ void MemoryNode::post_peer_read_async(StorageOwnerThread& thread,
   lib_assert(peer_remote_tokens_[shard_id] != nullptr,
              "peer token is not initialized for shard " + std::to_string(shard_id));
   lib_assert(remote_offset + bytes <= mn_memory_bytes_, "peer RDMA read exceeds shard bounds");
-  const u32 qp_idx = peer_data_qp_index(thread.id);
+  const u32 qp_idx = memory_node_detail::select_peer_data_qp(
+    peer_qps_per_peer_, thread.id + thread.next_peer_data_qp_ticket++);
   QP& qp = peer_data_qp(shard_id, qp_idx);
   acquire_peer_rdma_read_credit(shard_id, qp_idx);
   while (peer_async_rdma_outstanding_.load(std::memory_order_acquire) >= peer_rdma_read_global_credit_limit()) {

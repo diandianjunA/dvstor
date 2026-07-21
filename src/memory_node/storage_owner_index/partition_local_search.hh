@@ -459,6 +459,143 @@ private:
   bool budget_exhausted_{};
 };
 
+// One logical Stage2 continuation in a worker-local batch.  The spans only
+// need to remain valid for the duration of PartitionContinuationBatch::run().
+struct PartitionContinuationSeed {
+  span<const PartitionLocalSearchEntry> local_beam;
+  span<const RemotePtr> remote_frontier;
+};
+
+struct PartitionContinuationScoreRequest {
+  size_t search_index{};
+  RemotePtr pointer;
+};
+
+struct PartitionContinuationExpandRequest {
+  size_t search_index{};
+  RemotePtr pointer;
+};
+
+// Interleave independent Stage2 continuations at their natural dependency
+// boundary.  Each search still expands exactly one closest beam entry and
+// scores all of its newly discovered neighbors before selecting its next
+// entry, so this is algorithmically identical to running every continuation
+// serially.  The only difference is that adjacency/vector callbacks receive
+// the ready work from every search in one wave and can issue one bounded RDMA
+// batch instead of paying one round trip per insertion.
+//
+// A callback may omit an expansion or score result when its physical snapshot
+// is stale/unreadable.  That omission affects only the corresponding search,
+// just as the serial continuation treats an unreadable expansion as a leaf or
+// an unreadable vector as a rejected candidate.  Budgets and visited sets are
+// deliberately owned per search; one pathological insertion can never spend
+// another insertion's bounded work allowance.
+class PartitionContinuationBatch {
+public:
+  template <typename ScoreBatch, typename ExpandBatch>
+  const vec<vec<PartitionLocalSearchEntry>>& run(
+      span<const PartitionContinuationSeed> seeds,
+      u32 partition_id,
+      u32 beam_width,
+      PartitionSearchBudget budget,
+      ScoreBatch&& score_batch,
+      ExpandBatch&& expand_batch,
+      vec<bool>* budget_exhausted = nullptr,
+      vec<u64>* expansion_counts = nullptr) {
+    while (searches_.size() < seeds.size()) {
+      searches_.emplace_back(0, 1);
+    }
+    results_.resize(seeds.size());
+    score_requests_.clear();
+    expand_requests_.clear();
+
+    for (size_t search_index = 0; search_index < seeds.size();
+         ++search_index) {
+      PartitionContinuationBeam& search = searches_[search_index];
+      search.reset(partition_id, beam_width, budget);
+      search.seed_local(seeds[search_index].local_beam);
+      const size_t admitted_frontier = std::min(
+        seeds[search_index].remote_frontier.size(),
+        budget.max_remote_frontier);
+      if (admitted_frontier !=
+          seeds[search_index].remote_frontier.size()) {
+        search.mark_budget_exhausted();
+      }
+      for (size_t item = 0; item < admitted_frontier; ++item) {
+        const RemotePtr pointer =
+          seeds[search_index].remote_frontier[item];
+        if (search.try_visit_remote(pointer)) {
+          score_requests_.push_back({search_index, pointer});
+        }
+      }
+    }
+
+    const auto score_ready_wave = [&]() {
+      if (score_requests_.empty()) return;
+      std::invoke(
+        score_batch,
+        span<const PartitionContinuationScoreRequest>{score_requests_},
+        [&](size_t search_index, RemotePtr pointer, distance_t distance) {
+          if (search_index >= seeds.size() || pointer.is_null()) return;
+          searches_[search_index].add_remote(pointer, distance);
+        });
+      score_requests_.clear();
+    };
+    score_ready_wave();
+
+    for (;;) {
+      expand_requests_.clear();
+      for (size_t search_index = 0; search_index < seeds.size();
+           ++search_index) {
+        if (const std::optional<RemotePtr> current =
+              searches_[search_index].take_closest_unexpanded()) {
+          expand_requests_.push_back({search_index, *current});
+        }
+      }
+      if (expand_requests_.empty()) break;
+
+      score_requests_.clear();
+      std::invoke(
+        expand_batch,
+        span<const PartitionContinuationExpandRequest>{expand_requests_},
+        [&](size_t search_index, RemotePtr pointer) {
+          if (search_index >= seeds.size()) return;
+          if (searches_[search_index].try_visit_remote(pointer)) {
+            score_requests_.push_back({search_index, pointer});
+          }
+        });
+      score_ready_wave();
+    }
+
+    if (budget_exhausted != nullptr) {
+      budget_exhausted->resize(seeds.size());
+    }
+    if (expansion_counts != nullptr) {
+      expansion_counts->resize(seeds.size());
+    }
+    for (size_t search_index = 0; search_index < seeds.size();
+         ++search_index) {
+      const auto& beam = searches_[search_index].final_beam();
+      results_[search_index].assign(beam.begin(), beam.end());
+      if (budget_exhausted != nullptr) {
+        (*budget_exhausted)[search_index] =
+          searches_[search_index].budget_exhausted();
+      }
+      if (expansion_counts != nullptr) {
+        (*expansion_counts)[search_index] =
+          searches_[search_index].expansion_count();
+      }
+    }
+    return results_;
+  }
+
+private:
+  vec<PartitionContinuationBeam> searches_;
+  vec<PartitionContinuationScoreRequest> score_requests_;
+  vec<PartitionContinuationExpandRequest> expand_requests_;
+  vec<vec<PartitionLocalSearchEntry>> results_;
+};
+
 // Continue Stage1 using its exact local beam and the cross-partition frontier
 // discovered during local expansion. score_batch must invoke emit(ptr, dist)
 // for every live input pointer. expand enumerates one remote node's neighbors.

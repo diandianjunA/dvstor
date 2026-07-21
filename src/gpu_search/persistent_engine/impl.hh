@@ -129,6 +129,8 @@ struct PersistentSearchEngine::Impl {
   void validate_storage_control(const format::StorageControlBlock& control,
                                 size_t shard) const;
   std::vector<format::StorageControlBlock> read_storage_controls();
+  std::vector<std::optional<maintenance_telemetry::Snapshot>>
+    read_maintenance_telemetry();
   CentroidRouteReadResult
     read_storage_centroid_route_publications();
   StorageRouteSyncResult synchronize_storage_routes();
@@ -234,6 +236,8 @@ struct PersistentSearchEngine::Impl {
   byte_t* d_remote_buffer{};
   byte_t* d_graph_scratch{};
   format::StorageControlBlock* d_control_snapshots{};
+  maintenance_telemetry::Snapshot* d_maintenance_snapshots{};
+  u64* d_maintenance_sequence_after{};
   byte_t* d_storage_route_snapshots{};
   size_t storage_route_snapshot_stride{};
   u64* d_storage_route_sequence_after{};

@@ -54,6 +54,9 @@ inline void add_storage_owner_breakdown(
     counters.storage_owner_prune_pair_distance_ns;
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_queue_wait,
                           per_item_ns(counters.storage_owner_queue_wait_ns, item_count));
+  sample->add_subcategory(
+    service::breakdown::Subcategory::cpu_storage_owner_stage1_execute_wait,
+    per_item_ns(counters.storage_owner_stage1_execute_wait_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_search,
                           per_item_ns(saturating_sub(counters.storage_owner_search_ns, explained_search_ns),
                                       item_count));
@@ -80,6 +83,15 @@ inline void add_storage_owner_breakdown(
                           per_item_ns(counters.storage_owner_schedule_maintenance_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_response_build,
                           per_item_ns(counters.storage_owner_response_build_ns, item_count));
+  sample->add_subcategory(
+    service::breakdown::Subcategory::cpu_storage_owner_stage1_arm_wait,
+    per_item_ns(counters.storage_owner_stage1_arm_wait_ns, item_count));
+  sample->add_subcategory(
+    service::breakdown::Subcategory::cpu_storage_owner_stage1_release_wait,
+    per_item_ns(counters.storage_owner_stage1_release_wait_ns, item_count));
+  sample->add_subcategory(
+    service::breakdown::Subcategory::cpu_storage_owner_cleanup_control_wait,
+    per_item_ns(counters.storage_owner_cleanup_control_wait_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_search_select,
                           per_item_ns(counters.storage_owner_search_select_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_search_distance,

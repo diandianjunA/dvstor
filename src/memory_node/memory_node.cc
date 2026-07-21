@@ -235,6 +235,15 @@ MemoryNode::MemoryNode(Configuration& config)
 
   storage_insert_shutdown_.store(true, std::memory_order_release);
   if (storage_insert_tasks_) storage_insert_tasks_->notify_all();
+  // Foreground mutations can be waiting on a same-token authority lease or
+  // on peer/send/maintenance capacity.  Wake every such wait before joining
+  // the foreground pool; peer_reverse_shutdown_ is intentionally set only
+  // after these workers have stopped, so it cannot be the only exit signal.
+  for (auto& shard : dynamic_freshness_shards_) {
+    shard.changed.notify_all();
+  }
+  peer_completion_cv_.notify_all();
+  storage_owner_maintenance_cv_.notify_all();
   for (auto& worker : storage_insert_workers_) {
     if (worker.joinable()) {
       worker.join();
@@ -266,6 +275,8 @@ MemoryNode::InsertBreakdownCounters MemoryNode::scale_breakdown(const InsertBrea
                                                const u32 total) {
   InsertBreakdownCounters out{};
   out.storage_owner_queue_wait_ns = scale_ns(counters.storage_owner_queue_wait_ns, part, total);
+  out.storage_owner_stage1_execute_wait_ns =
+    scale_ns(counters.storage_owner_stage1_execute_wait_ns, part, total);
   out.storage_owner_search_ns = scale_ns(counters.storage_owner_search_ns, part, total);
   out.storage_owner_prune_ns = scale_ns(counters.storage_owner_prune_ns, part, total);
   out.storage_owner_write_node_ns = scale_ns(counters.storage_owner_write_node_ns, part, total);
@@ -284,6 +295,12 @@ MemoryNode::InsertBreakdownCounters MemoryNode::scale_breakdown(const InsertBrea
     scale_ns(counters.storage_owner_schedule_maintenance_ns, part, total);
   out.storage_owner_response_build_ns =
     scale_ns(counters.storage_owner_response_build_ns, part, total);
+  out.storage_owner_stage1_arm_wait_ns =
+    scale_ns(counters.storage_owner_stage1_arm_wait_ns, part, total);
+  out.storage_owner_stage1_release_wait_ns =
+    scale_ns(counters.storage_owner_stage1_release_wait_ns, part, total);
+  out.storage_owner_cleanup_control_wait_ns =
+    scale_ns(counters.storage_owner_cleanup_control_wait_ns, part, total);
   out.storage_owner_search_select_ns = scale_ns(counters.storage_owner_search_select_ns, part, total);
   out.storage_owner_search_neighbor_read_ns =
     scale_ns(counters.storage_owner_search_neighbor_read_ns, part, total);

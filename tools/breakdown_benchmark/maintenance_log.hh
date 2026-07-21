@@ -3,8 +3,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
+
+#include "gpu_search/maintenance_telemetry.hh"
 
 namespace tools::breakdown_benchmark {
 
@@ -105,5 +108,11 @@ MaintenanceLogSummary summarize_maintenance_log_window(
   const std::vector<MaintenanceLogCursor>& begin_cursors,
   const std::vector<MaintenanceLogCursor>& end_cursors,
   double observation_period_seconds = 5.0);
+
+MaintenanceLogSummary summarize_maintenance_snapshot_window(
+  const std::vector<std::optional<
+    gpu_search::maintenance_telemetry::Snapshot>>& begin,
+  const std::vector<std::optional<
+    gpu_search::maintenance_telemetry::Snapshot>>& end);
 
 }  // namespace tools::breakdown_benchmark

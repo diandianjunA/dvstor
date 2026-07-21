@@ -18,7 +18,9 @@ MemoryNode::prepare_local_stage1_item(
   const auto kind = static_cast<MutationKind>(item.kind);
   if (raw_vector == nullptr || authority_shard >= num_storage_nodes_ ||
       item.authority_shard != authority_shard || item.generation == 0 ||
-      (kind != MutationKind::insert && kind != MutationKind::upsert)) {
+      (kind != MutationKind::insert && kind != MutationKind::upsert) ||
+      (item.initial_placement_version != 0 &&
+       kind != MutationKind::insert)) {
     result.status = static_cast<u32>(MutationStatus::failed);
     return result;
   }
@@ -52,7 +54,9 @@ MemoryNode::prepare_local_stage1_item(
       }
       const bool same_operation = prepared.id == item.id &&
         prepared.generation == item.generation && prepared.kind == kind &&
-        prepared.old_ptr.raw_address == item.old_raw;
+        prepared.old_ptr.raw_address == item.old_raw &&
+        prepared.execute_initial_placement_version ==
+          item.initial_placement_version;
       if (!same_operation) {
         result.status = static_cast<u32>(MutationStatus::failed);
         return result;
@@ -74,7 +78,7 @@ MemoryNode::prepare_local_stage1_item(
         // Another transport request for this semantic operation is already
         // computing. Return bounded backpressure; the authority retries the
         // same token and receives the cached result once it is ready.
-        result.status = static_cast<u32>(MutationStatus::failed);
+        result.status = static_cast<u32>(MutationStatus::retry);
         return result;
       }
       return prepared.result;
@@ -84,7 +88,7 @@ MemoryNode::prepare_local_stage1_item(
     // ACK from their authority.
     if (prepared_records.size() >=
         stage1_prepared_results_limit_per_shard_) {
-      result.status = static_cast<u32>(MutationStatus::failed);
+      result.status = static_cast<u32>(MutationStatus::retry);
       return result;
     }
     Stage1PreparedResult reservation;
@@ -93,16 +97,23 @@ MemoryNode::prepare_local_stage1_item(
     reservation.generation = item.generation;
     reservation.kind = kind;
     reservation.old_ptr = RemotePtr{item.old_raw};
+    reservation.execute_initial_placement_version =
+      item.initial_placement_version;
     reservation.vector_data = std::move(receipt_vector);
     prepared_records.emplace(key, std::move(reservation));
   }
 
-  const auto erase_reservation = [&]() {
+  const auto seal_failed_reservation = [&]() {
     std::lock_guard<std::mutex> lock(prepared_shard.mutex);
     const auto position = prepared_records.find(key);
     if (position != prepared_records.end() &&
         !position->second.prepared) {
-      prepared_records.erase(position);
+      Stage1PreparedResult& prepared = position->second;
+      prepared.result = result;
+      prepared.result.status = static_cast<u32>(MutationStatus::failed);
+      prepared.prepared = true;
+      prepared.aborted = true;
+      vec<byte_t>{}.swap(prepared.vector_data);
     }
   };
 
@@ -112,8 +123,8 @@ MemoryNode::prepare_local_stage1_item(
     components.data());
   const vec<RemotePtr> entries = local_centroid_route_entries();
   if (entries.empty()) {
-    erase_reservation();
     result.status = static_cast<u32>(MutationStatus::failed);
+    seal_failed_reservation();
     return result;
   }
 
@@ -160,8 +171,8 @@ MemoryNode::prepare_local_stage1_item(
     (void)mark_node_deleted(target, item.generation);
     retire_local_dynamic_node(target, retirement_sequence);
     complete_storage_owner_maintenance_sequence(retirement_sequence);
-    erase_reservation();
     result.status = static_cast<u32>(MutationStatus::failed);
+    seal_failed_reservation();
     return result;
   }
 
@@ -182,6 +193,109 @@ MemoryNode::prepare_local_stage1_item(
     prepared.prepared = true;
   }
   return result;
+}
+
+service::storage_owner::Stage1ExecuteResult
+MemoryNode::prepare_and_maybe_arm_local_stage1_item(
+    u32 authority_shard,
+    const service::storage_owner::Stage1ExecuteItem& item,
+    const byte_t* raw_vector,
+    const Configuration& config,
+    InsertBreakdownCounters* breakdown) {
+  using namespace service::storage_owner;
+  Stage1ExecuteResult result = prepare_local_stage1_item(
+    authority_shard, item, raw_vector, config, breakdown);
+  if (result.status != static_cast<u32>(MutationStatus::ok) ||
+      item.initial_placement_version == 0) {
+    return result;
+  }
+
+  const Stage1ArmItem arm{
+    .token = {
+      .source_client = item.source_client,
+      .item_index = item.item_index,
+      .client_batch_id = item.client_batch_id,
+    },
+    .target_raw = result.target_raw,
+    .initial_placement_version = item.initial_placement_version,
+    .id = item.id,
+    .generation = item.generation,
+    .action = static_cast<u32>(Stage1ArmAction::arm),
+  };
+  vec<Stage1ArmResult> arm_results;
+  const auto arm_started = std::chrono::steady_clock::now();
+  const bool transported = arm_local_stage1_items(
+    authority_shard, span<const Stage1ArmItem>{&arm, 1},
+    arm_results, config);
+  if (breakdown != nullptr) {
+    breakdown->storage_owner_schedule_maintenance_ns +=
+      elapsed_ns_since(arm_started);
+  }
+  const bool armed = transported && arm_results.size() == 1 &&
+    arm_results.front().token.source_client == item.source_client &&
+    arm_results.front().token.item_index == item.item_index &&
+    arm_results.front().token.client_batch_id == item.client_batch_id &&
+    arm_results.front().target_raw == result.target_raw &&
+    arm_results.front().maintenance_sequence != 0 &&
+    arm_results.front().status == static_cast<u32>(MutationStatus::ok) &&
+    arm_results.front().reserved == 0;
+  if (!armed) {
+    // The prepared semantic receipt remains intact. Retrying the identical
+    // execute token resumes at arm without allocating another physical node.
+    result.status = static_cast<u32>(MutationStatus::retry);
+    result.maintenance_sequence = 0;
+    return result;
+  }
+  result.maintenance_sequence = arm_results.front().maintenance_sequence;
+  return result;
+}
+
+bool MemoryNode::try_track_stage1_inflight_request(
+    const Stage1OperationKey& key) {
+  Stage1InflightRequestShard& inflight = stage1_inflight_requests_[
+    Stage1OperationKeyHash{}(key) & (kStage1PreparedShardCount - 1)];
+  std::lock_guard<std::mutex> lock(inflight.mutex);
+  auto position = inflight.counts.find(key);
+  if (position == inflight.counts.end()) {
+    // Use the same per-shard bound as the semantic receipt table. Queue
+    // admission is therefore item-bounded, not merely RPC-bounded.
+    if (inflight.counts.size() >=
+        stage1_prepared_results_limit_per_shard_) {
+      return false;
+    }
+    position = inflight.counts.emplace(key, 0).first;
+  }
+  lib_assert(position->second != std::numeric_limits<u32>::max(),
+             "Stage1 per-operation in-flight count overflow");
+  ++position->second;
+  return true;
+}
+
+void MemoryNode::finish_stage1_inflight_request(
+    const Stage1OperationKey& key) {
+  Stage1InflightRequestShard& inflight = stage1_inflight_requests_[
+    Stage1OperationKeyHash{}(key) & (kStage1PreparedShardCount - 1)];
+  {
+    std::lock_guard<std::mutex> lock(inflight.mutex);
+    const auto position = inflight.counts.find(key);
+    lib_assert(position != inflight.counts.end() && position->second != 0,
+               "Stage1 completion lost its per-operation request count");
+    if (--position->second == 0) inflight.counts.erase(position);
+  }
+  inflight.changed.notify_all();
+}
+
+bool MemoryNode::wait_for_stage1_inflight_quiescence(
+    const Stage1OperationKey& key) {
+  Stage1InflightRequestShard& inflight = stage1_inflight_requests_[
+    Stage1OperationKeyHash{}(key) & (kStage1PreparedShardCount - 1)];
+  std::unique_lock<std::mutex> lock(inflight.mutex);
+  inflight.changed.wait(lock, [&]() {
+    return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
+      storage_owner_maintenance_shutdown_.load(std::memory_order_acquire) ||
+      inflight.counts.find(key) == inflight.counts.end();
+  });
+  return inflight.counts.find(key) == inflight.counts.end();
 }
 
 bool MemoryNode::handle_peer_stage1_execute_request(
@@ -218,7 +332,7 @@ bool MemoryNode::handle_peer_stage1_execute_request(
     const Stage1ExecuteItem& item = items[index];
     const byte_t* raw_vector = vectors +
       static_cast<size_t>(index) * VamanaNode::vector_bytes();
-    output[index] = prepare_local_stage1_item(
+    output[index] = prepare_and_maybe_arm_local_stage1_item(
       source_shard, item, raw_vector, config);
     if (output[index].status != static_cast<u32>(MutationStatus::ok)) {
       response_header->status = static_cast<u32>(InsertStatus::overloaded);
@@ -325,8 +439,9 @@ bool MemoryNode::arm_local_stage1_items(
       if (position == prepared_records.end()) {
         // A lost release response is retried with the same token. Missing is
         // therefore the successful idempotent postcondition. Remote release
-        // tasks first cross the per-authority worker-completion barrier, so an
-        // earlier queued execute cannot appear after this ACK.
+        // arrives after every same-token execute retry on the authority's RC
+        // QP and waits for the tracked requests, so an older retry cannot
+        // recreate the receipt after this ACK.
         output.status = static_cast<u32>(MutationStatus::ok);
         continue;
       }
@@ -463,7 +578,10 @@ bool MemoryNode::arm_local_stage1_items(
       }
       if (prepared.result.status != static_cast<u32>(MutationStatus::ok) ||
           prepared.result.target_raw != item.target_raw ||
-          prepared.id != item.id || prepared.generation != item.generation) {
+          prepared.id != item.id || prepared.generation != item.generation ||
+          (prepared.execute_initial_placement_version != 0 &&
+           prepared.execute_initial_placement_version !=
+             item.initial_placement_version)) {
         continue;
       }
       if (prepared.armed) {
@@ -527,6 +645,7 @@ bool MemoryNode::arm_local_stage1_items(
       position->second.arming = false;
       position->second.armed = true;
       position->second.maintenance_sequence = maintenance_sequence;
+      position->second.result.maintenance_sequence = maintenance_sequence;
       // The maintenance task now owns the continuation artifact. Retain only
       // the compact semantic replay receipt until the authority explicitly
       // releases it; no vector or O(L + R) search state is retained.
@@ -536,4 +655,57 @@ bool MemoryNode::arm_local_stage1_items(
     output.status = static_cast<u32>(MutationStatus::ok);
   }
   return structurally_valid;
+}
+
+bool MemoryNode::release_resolved_local_stage1_receipt(
+    const StorageOwnerMaintenanceTask& task,
+    const Configuration& config) {
+  using namespace service::storage_owner;
+  if (task.authority_shard >= num_storage_nodes_ ||
+      task.operation_batch_id == 0 || task.generation == 0 ||
+      task.target.is_null() || !local_shard(task.target.memory_node())) {
+    return false;
+  }
+
+  // A remote authority may have an older same-token execute retry that has
+  // not reached this process's receive CQ yet.  A local in-flight count of
+  // zero cannot prove that transport watermark.  The authority therefore
+  // sends a release marker after commit on the same RC QP as every execute;
+  // the peer Stage1 worker performs the actual quiescence wait and erase.
+  // Stage2 must not race that ordered marker with a locally inferred erase.
+  if (task.authority_shard != storage_id_) return true;
+
+  const Stage1OperationKey key{
+    .authority_shard = task.authority_shard,
+    .source_client = task.source_client,
+    .item_index = task.operation_item_index,
+    .client_batch_id = task.operation_batch_id,
+  };
+  if (!wait_for_stage1_inflight_quiescence(key)) return false;
+
+  const Stage1ArmItem release{
+    .token = {
+      .source_client = task.source_client,
+      .item_index = task.operation_item_index,
+      .client_batch_id = task.operation_batch_id,
+    },
+    .target_raw = task.target.raw_address,
+    .initial_placement_version = task.initial_placement_version,
+    .id = task.id,
+    .generation = task.generation,
+    .action = static_cast<u32>(Stage1ArmAction::release),
+  };
+  vec<Stage1ArmResult> results;
+  if (!arm_local_stage1_items(
+        task.authority_shard, span<const Stage1ArmItem>{&release, 1},
+        results, config) ||
+      results.size() != 1) {
+    return false;
+  }
+  const Stage1ArmResult& output = results.front();
+  return output.token.source_client == release.token.source_client &&
+    output.token.item_index == release.token.item_index &&
+    output.token.client_batch_id == release.token.client_batch_id &&
+    output.target_raw == release.target_raw && output.reserved == 0 &&
+    output.status == static_cast<u32>(MutationStatus::ok);
 }

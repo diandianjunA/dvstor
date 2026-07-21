@@ -1,5 +1,6 @@
 #include "memory_node/storage_owner_maintenance/detail.hh"
 #include "memory_node/storage_owner_cpu_plan.hh"
+#include "gpu_search/maintenance_telemetry.hh"
 
 using namespace memory_node_storage_owner_maintenance_detail;
 
@@ -82,6 +83,17 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   }
   storage_owner_maintenance_started_ns_.store(steady_now_ns(), std::memory_order_release);
   storage_owner_maintenance_last_observation_ns_.store(0, std::memory_order_relaxed);
+  // Replace any telemetry tail left by an earlier process before accepting
+  // the first mutation.  A benchmark with a zero-length write warmup still
+  // needs a valid all-zero baseline; waiting for the first five-second
+  // observation would otherwise force it back to host-local log files.
+  gpu_search::maintenance_telemetry::publish(
+    reinterpret_cast<byte_t*>(control),
+    gpu_search::maintenance_telemetry::Snapshot{
+      .shard_id = storage_id_,
+      .published_steady_ns = steady_now_ns(),
+      .admission_window = storage_owner_maintenance_admission_limit_,
+    });
   const size_t contexts_per_worker =
     std::max<size_t>(1, config.storage_owner_rpc_depth);
   const size_t remote_peer_count =
@@ -197,6 +209,9 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
   }
   storage_owner_maintenance_shutdown_.store(true, std::memory_order_release);
   storage_owner_maintenance_cv_.notify_all();
+  for (Stage1InflightRequestShard& inflight : stage1_inflight_requests_) {
+    inflight.changed.notify_all();
+  }
 
   for (auto& worker : storage_owner_maintenance_workers_) {
     if (worker.joinable()) {
@@ -306,6 +321,15 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
     storage_owner_stage2_remote_expansions_.load(std::memory_order_relaxed);
   const u64 stage2_scored_candidates =
     storage_owner_stage2_scored_candidates_.load(std::memory_order_relaxed);
+  const u64 stage2_graph_read_waves =
+    storage_owner_stage2_graph_read_waves_.load(std::memory_order_relaxed);
+  const u64 stage2_graph_unique_reads =
+    storage_owner_stage2_graph_unique_reads_.load(std::memory_order_relaxed);
+  const u64 stage2_vector_read_waves =
+    storage_owner_stage2_vector_read_waves_.load(std::memory_order_relaxed);
+  const u64 stage2_vector_unique_reads =
+    storage_owner_stage2_vector_unique_reads_.load(
+      std::memory_order_relaxed);
   const u64 stage2_migrations =
     storage_owner_stage2_migrations_.load(std::memory_order_relaxed);
   const u64 stage2_final_edges =
@@ -380,6 +404,50 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   const u64 dynamic_high_watermark =
     std::atomic_ref<u64>(control->dynamic_high_watermark).load(std::memory_order_acquire);
 
+  gpu_search::maintenance_telemetry::Snapshot telemetry_snapshot{
+    .shard_id = storage_id_,
+    .published_steady_ns = steady_now_ns(),
+    .stage2_enqueued = finalize_enqueued,
+    .stage2_finalized_live = finalized_live,
+    .stale = stale,
+    .remaining = remaining,
+    .peer_reverse_remaining = peer_reverse_remaining,
+    .failed = storage_owner_maintenance_failed_.load(
+      std::memory_order_relaxed),
+    .peer_reverse_failed = peer_reverse_update_failed_.load(
+      std::memory_order_relaxed),
+    .admission_window = storage_owner_maintenance_admission_limit_,
+    .completion_outstanding = completion_outstanding,
+    .max_backlog = storage_owner_maintenance_max_backlog_.load(
+      std::memory_order_relaxed),
+    .stage1_search_budget_exhausted = stage1_search_budget_exhausted,
+    .stage2_search_budget_exhausted = stage2_search_budget_exhausted,
+    .stage2_continuations = stage2_continuations,
+    .stage2_remote_frontier_items = stage2_remote_frontier_items,
+    .stage2_remote_expansions = stage2_remote_expansions,
+    .stage2_scored_candidates = stage2_scored_candidates,
+    .stage2_migrations = stage2_migrations,
+    .stage2_final_edges = stage2_final_edges,
+    .stage2_cross_edges_stage1_home = stage2_cross_edges_stage1_home,
+    .stage2_cross_edges_final_home = stage2_cross_edges_final_home,
+    .pressure_yields = storage_owner_maintenance_pressure_yields_.load(
+      std::memory_order_relaxed),
+    .stage2_batches = stage2_batches,
+    .stage2_batched_items = stage2_batched_items,
+    .stage2_graph_read_waves = stage2_graph_read_waves,
+    .stage2_graph_unique_reads = stage2_graph_unique_reads,
+    .stage2_vector_read_waves = stage2_vector_read_waves,
+    .stage2_vector_unique_reads = stage2_vector_unique_reads,
+  };
+  for (size_t bucket = 0;
+       bucket < telemetry_snapshot.stage2_delay_histogram.size(); ++bucket) {
+    telemetry_snapshot.stage2_delay_histogram[bucket] =
+      storage_owner_maintenance_finalize_latency_buckets_[bucket].load(
+        std::memory_order_relaxed);
+  }
+  gpu_search::maintenance_telemetry::publish(
+    reinterpret_cast<byte_t*>(control), telemetry_snapshot);
+
   print_status(str("storage-owner maintenance ") + (final ? "summary" : "observation") +
                ": enqueued=" +
                std::to_string(storage_owner_maintenance_enqueued_.load(std::memory_order_relaxed)) +
@@ -437,6 +505,20 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                " avg_stage2_scored_candidates=" +
                std::to_string(ratio_or_zero(
                  stage2_scored_candidates, stage2_continuations)) +
+               " stage2_graph_read_waves=" +
+               std::to_string(stage2_graph_read_waves) +
+               " avg_stage2_expansions_per_graph_wave=" +
+               std::to_string(ratio_or_zero(
+                 stage2_remote_expansions, stage2_graph_read_waves)) +
+               " stage2_graph_unique_reads=" +
+               std::to_string(stage2_graph_unique_reads) +
+               " stage2_vector_read_waves=" +
+               std::to_string(stage2_vector_read_waves) +
+               " avg_stage2_scores_per_vector_wave=" +
+               std::to_string(ratio_or_zero(
+                 stage2_scored_candidates, stage2_vector_read_waves)) +
+               " stage2_vector_unique_reads=" +
+               std::to_string(stage2_vector_unique_reads) +
                " stage2_migrations=" +
                std::to_string(stage2_migrations) +
                " home_match_rate=" +

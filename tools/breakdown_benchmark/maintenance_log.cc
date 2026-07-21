@@ -534,4 +534,143 @@ MaintenanceLogSummary summarize_maintenance_log_window(
     begin_cursors, &end_cursors, observation_period_seconds);
 }
 
+MaintenanceLogSummary summarize_maintenance_snapshot_window(
+    const std::vector<std::optional<
+      gpu_search::maintenance_telemetry::Snapshot>>& begin,
+    const std::vector<std::optional<
+      gpu_search::maintenance_telemetry::Snapshot>>& end) {
+  MaintenanceLogSummary summary;
+  summary.requested_logs = std::max(begin.size(), end.size());
+  for (size_t shard = 0; shard < summary.requested_logs; ++shard) {
+    if (shard >= begin.size() || shard >= end.size() ||
+        !begin[shard].has_value() || !end[shard].has_value()) {
+      summary.unreadable_logs.push_back(
+        "in-band-control-page:shard-" + std::to_string(shard));
+      continue;
+    }
+    const auto& first = *begin[shard];
+    const auto& latest = *end[shard];
+    ++summary.readable_logs;
+    ++summary.logs_with_observations;
+    summary.observations += 2;
+
+    const auto backlog = [](const auto& snapshot) {
+      const uint64_t completed = snapshot.stage2_finalized_live +
+        snapshot.stale;
+      const uint64_t unfinished = snapshot.stage2_enqueued > completed
+        ? snapshot.stage2_enqueued - completed : 0;
+      return std::max({unfinished, snapshot.remaining,
+                       snapshot.peer_reverse_remaining});
+    };
+    const uint64_t first_backlog = backlog(first);
+    const uint64_t latest_backlog = backlog(latest);
+    summary.remaining += latest_backlog;
+    summary.max_backlog_observed = std::max({
+      summary.max_backlog_observed, first_backlog, latest_backlog,
+      latest.max_backlog});
+    if (latest.published_steady_ns > first.published_steady_ns) {
+      const double elapsed_s = static_cast<double>(
+        latest.published_steady_ns - first.published_steady_ns) / 1e9;
+      summary.backlog_slope_per_sec +=
+        (static_cast<double>(latest_backlog) -
+         static_cast<double>(first_backlog)) / elapsed_s;
+      ++summary.logs_with_slope_observations;
+    }
+
+    ++summary.logs_with_completion_window;
+    summary.admission_window += latest.admission_window;
+    summary.completion_outstanding += latest.completion_outstanding;
+    summary.max_completion_outstanding_per_shard = std::max(
+      summary.max_completion_outstanding_per_shard,
+      latest.completion_outstanding);
+
+    uint64_t failed = 0;
+    uint64_t peer_failed = 0;
+    if (counter_delta(first.failed, latest.failed, &failed) &&
+        counter_delta(first.peer_reverse_failed,
+                      latest.peer_reverse_failed, &peer_failed)) {
+      ++summary.logs_with_failure_deltas;
+      summary.failures += failed + peer_failed;
+    }
+
+    std::array<uint64_t, kMaintenanceLatencyBucketCount> latency_delta{};
+    static_assert(kMaintenanceLatencyBucketCount ==
+      gpu_search::maintenance_telemetry::kLatencyBucketCount);
+    if (histogram_delta(first.stage2_delay_histogram,
+                        latest.stage2_delay_histogram, &latency_delta)) {
+      ++summary.logs_with_histogram_deltas;
+      include_histogram_p99(latency_delta, &summary);
+    }
+
+    uint64_t finalized = 0;
+    uint64_t continuations = 0;
+    uint64_t frontier = 0;
+    uint64_t expansions = 0;
+    uint64_t scored = 0;
+    uint64_t migrations = 0;
+    uint64_t final_edges = 0;
+    uint64_t cross_before = 0;
+    uint64_t cross_after = 0;
+    const bool locality_valid =
+      counter_delta(first.stage2_finalized_live,
+                    latest.stage2_finalized_live, &finalized) &&
+      counter_delta(first.stage2_continuations,
+                    latest.stage2_continuations, &continuations) &&
+      counter_delta(first.stage2_remote_frontier_items,
+                    latest.stage2_remote_frontier_items, &frontier) &&
+      counter_delta(first.stage2_remote_expansions,
+                    latest.stage2_remote_expansions, &expansions) &&
+      counter_delta(first.stage2_scored_candidates,
+                    latest.stage2_scored_candidates, &scored) &&
+      counter_delta(first.stage2_migrations,
+                    latest.stage2_migrations, &migrations) &&
+      counter_delta(first.stage2_final_edges,
+                    latest.stage2_final_edges, &final_edges) &&
+      counter_delta(first.stage2_cross_edges_stage1_home,
+                    latest.stage2_cross_edges_stage1_home,
+                    &cross_before) &&
+      counter_delta(first.stage2_cross_edges_final_home,
+                    latest.stage2_cross_edges_final_home, &cross_after);
+    if (locality_valid) {
+      ++summary.logs_with_locality_deltas;
+      summary.stage2_finalized_live += finalized;
+      summary.stage2_continuations += continuations;
+      summary.stage2_remote_frontier_items += frontier;
+      summary.stage2_remote_expansions += expansions;
+      summary.stage2_scored_candidates += scored;
+      summary.stage2_migrations += migrations;
+      summary.stage2_final_edges += final_edges;
+      summary.stage2_cross_edges_stage1_home += cross_before;
+      summary.stage2_cross_edges_final_home += cross_after;
+    }
+
+    uint64_t stage1_exhausted = 0;
+    uint64_t stage2_exhausted = 0;
+    if (counter_delta(first.stage1_search_budget_exhausted,
+                      latest.stage1_search_budget_exhausted,
+                      &stage1_exhausted) &&
+        counter_delta(first.stage2_search_budget_exhausted,
+                      latest.stage2_search_budget_exhausted,
+                      &stage2_exhausted)) {
+      ++summary.logs_with_search_budget_deltas;
+      summary.stage1_search_budget_exhausted += stage1_exhausted;
+      summary.stage2_search_budget_exhausted += stage2_exhausted;
+    }
+  }
+  summary.backlog_slope_available = summary.requested_logs != 0 &&
+    summary.logs_with_slope_observations == summary.requested_logs;
+  summary.failure_delta_available = summary.requested_logs != 0 &&
+    summary.logs_with_failure_deltas == summary.requested_logs;
+  summary.completion_window_available = summary.requested_logs != 0 &&
+    summary.logs_with_completion_window == summary.requested_logs;
+  summary.locality_delta_available = summary.requested_logs != 0 &&
+    summary.logs_with_locality_deltas == summary.requested_logs;
+  summary.search_budget_delta_available = summary.requested_logs != 0 &&
+    summary.logs_with_search_budget_deltas == summary.requested_logs;
+  summary.p99_stage2_delay_available = summary.requested_logs != 0 &&
+    summary.logs_with_histogram_deltas == summary.requested_logs &&
+    summary.p99_stage2_delay_samples != 0;
+  return summary;
+}
+
 }  // namespace tools::breakdown_benchmark

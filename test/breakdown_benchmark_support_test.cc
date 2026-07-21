@@ -302,6 +302,86 @@ void test_maintenance_log_window() {
   std::filesystem::remove(path);
 }
 
+void test_in_band_maintenance_snapshot_window() {
+  namespace telemetry = gpu_search::maintenance_telemetry;
+  using Snapshot = telemetry::Snapshot;
+  std::vector<std::optional<Snapshot>> begin(2);
+  std::vector<std::optional<Snapshot>> end(2);
+  for (uint32_t shard = 0; shard < 2; ++shard) {
+    begin[shard] = Snapshot{
+      .sequence = 2,
+      .shard_id = shard,
+      .published_steady_ns = 10'000'000'000ull,
+      .stage2_enqueued = 10,
+      .stage2_finalized_live = 8,
+      .remaining = 2,
+      .failed = 3,
+      .admission_window = 128,
+      .completion_outstanding = 2,
+      .max_backlog = 2,
+      .stage1_search_budget_exhausted = 1,
+      .stage2_search_budget_exhausted = 2,
+      .stage2_continuations = 8,
+      .stage2_remote_frontier_items = 80,
+      .stage2_remote_expansions = 24,
+      .stage2_scored_candidates = 800,
+      .stage2_migrations = 1,
+      .stage2_final_edges = 64,
+      .stage2_cross_edges_stage1_home = 20,
+      .stage2_cross_edges_final_home = 18,
+    };
+    end[shard] = *begin[shard];
+    auto& latest = *end[shard];
+    latest.sequence = 4;
+    latest.published_steady_ns = 20'000'000'000ull;
+    latest.stage2_enqueued = 30;
+    latest.stage2_finalized_live = 28;
+    latest.remaining = 2;
+    latest.failed = 4;
+    latest.completion_outstanding = 2;
+    latest.max_backlog = 7;
+    latest.stage1_search_budget_exhausted = 3;
+    latest.stage2_search_budget_exhausted = 5;
+    latest.stage2_continuations = 28;
+    latest.stage2_remote_frontier_items = 280;
+    latest.stage2_remote_expansions = 84;
+    latest.stage2_scored_candidates = 2800;
+    latest.stage2_migrations = 3;
+    latest.stage2_final_edges = 224;
+    latest.stage2_cross_edges_stage1_home = 70;
+    latest.stage2_cross_edges_final_home = 60;
+    latest.stage2_delay_histogram[8] = 20;
+  }
+  const auto summary = tools::breakdown_benchmark::
+    summarize_maintenance_snapshot_window(begin, end);
+  assert(summary.requested_logs == 2);
+  assert(summary.readable_logs == 2);
+  assert(summary.logs_with_observations == 2);
+  assert(summary.observations == 4);
+  assert(summary.remaining == 4);
+  assert(summary.max_backlog_observed == 7);
+  assert(summary.failures == 2);
+  assert(summary.failure_delta_available);
+  assert(summary.completion_window_available);
+  assert(summary.admission_window == 256);
+  assert(summary.completion_outstanding == 4);
+  assert(summary.locality_delta_available);
+  assert(summary.stage2_finalized_live == 40);
+  assert(summary.stage2_remote_expansions == 120);
+  assert(summary.stage2_scored_candidates == 4000);
+  assert(summary.stage2_migrations == 4);
+  assert(summary.stage2_cross_edges_stage1_home == 100);
+  assert(summary.stage2_cross_edges_final_home == 84);
+  assert(summary.search_budget_delta_available);
+  assert(summary.stage1_search_budget_exhausted == 4);
+  assert(summary.stage2_search_budget_exhausted == 6);
+  assert(summary.p99_stage2_delay_available);
+  assert(summary.p99_stage2_delay_samples == 40);
+  assert(summary.p99_stage2_delay_upper_ms == 256.0);
+  assert(summary.backlog_slope_available);
+  assert(summary.backlog_slope_per_sec == 0.0);
+}
+
 }  // namespace
 
 int main() {
@@ -311,5 +391,6 @@ int main() {
   test_recall_and_report_formatting();
   test_base_only_recall_filter();
   test_maintenance_log_window();
+  test_in_band_maintenance_snapshot_window();
   return 0;
 }

@@ -10,9 +10,9 @@ namespace service::storage_owner {
 
 constexpr u32 kInsertMagic = 0x53494e54;  // "SINT"
 constexpr u32 kMutationMagic = 0x4d555444;  // D T U M / "DUTM"
-constexpr u32 kMutationProtocolVersion = 2;
+constexpr u32 kMutationProtocolVersion = 3;
 constexpr u32 kPeerRpcMagic = 0x53505250;  // "SPRP"
-constexpr u32 kPeerRpcVersion = 11;
+constexpr u32 kPeerRpcVersion = 12;
 
 enum class InsertStatus : u32 {
   ok = 0,
@@ -32,6 +32,10 @@ enum class MutationStatus : u32 {
   already_exists = 2,
   already_deleted = 3,
   failed = 4,
+  // Internal Stage1 backpressure/duplicate-in-progress signal. It is never a
+  // public mutation result: the authority must replay the same semantic token
+  // until it observes either ok or a definitive pre-arm failure.
+  retry = 5,
 };
 
 enum class PeerRpcType : u32 {
@@ -104,7 +108,7 @@ struct MutationResult {
 
 struct InsertBreakdownCounters {
   u64 storage_owner_queue_wait_ns{};
-  u64 reserved0{};
+  u64 storage_owner_stage1_execute_wait_ns{};
   u64 storage_owner_search_ns{};
   u64 storage_owner_prune_ns{};
   u64 storage_owner_write_node_ns{};
@@ -129,10 +133,14 @@ struct InsertBreakdownCounters {
   u64 storage_owner_prune_sort_ns{};
   u64 storage_owner_prune_pair_distance_ns{};
 
-  u64 reserved_words[4]{};
+  u64 storage_owner_stage1_arm_wait_ns{};
+  u64 storage_owner_stage1_release_wait_ns{};
+  u64 storage_owner_cleanup_control_wait_ns{};
+  u64 reserved_word{};
 
   u64 total() const {
     return storage_owner_queue_wait_ns +
+           storage_owner_stage1_execute_wait_ns +
            storage_owner_search_ns +
            storage_owner_prune_ns +
            storage_owner_write_node_ns +
@@ -144,12 +152,16 @@ struct InsertBreakdownCounters {
            storage_owner_allocate_node_ns +
            storage_owner_publish_mutation_ns +
            storage_owner_schedule_maintenance_ns +
-           storage_owner_response_build_ns;
+           storage_owner_response_build_ns +
+           storage_owner_stage1_arm_wait_ns +
+           storage_owner_stage1_release_wait_ns +
+           storage_owner_cleanup_control_wait_ns;
   }
 };
 
 static_assert(sizeof(InsertBreakdownCounters) == 224);
-static_assert(offsetof(InsertBreakdownCounters, reserved_words) == 192);
+static_assert(offsetof(InsertBreakdownCounters,
+                       storage_owner_stage1_arm_wait_ns) == 192);
 
 struct PeerRpcHeader {
   u32 magic{kPeerRpcMagic};
@@ -264,6 +276,11 @@ static_assert(sizeof(CentroidMembershipOp) == 32);
 struct Stage1ExecuteItem {
   u64 client_batch_id{};
   u64 old_raw{};
+  // A non-zero version asks the physical home to atomically turn a successful
+  // prepare into a runnable Stage2 task before replying. Inserts have no old
+  // generation cleanup dependency and therefore use this fused path; upserts
+  // keep it zero until cleanup activation has completed.
+  u64 initial_placement_version{};
   u32 source_client{};
   u32 item_index{};
   node_t id{};
@@ -275,6 +292,9 @@ struct Stage1ExecuteItem {
 struct Stage1ExecuteResult {
   u64 client_batch_id{};
   u64 target_raw{};
+  // Non-zero only after the fused prepare+arm path owns a runnable bounded
+  // maintenance descriptor. The authority must never commit without it.
+  u64 maintenance_sequence{};
   u32 source_client{};
   u32 item_index{};
   u32 status{static_cast<u32>(MutationStatus::failed)};
@@ -300,9 +320,10 @@ struct Stage1ArmItem {
   u32 reserved{};
 };
 
-// Arm is the only operation that allocates a Stage2 maintenance sequence.
-// Its response is the authority's durable proof that the sequence already
-// belongs to a runnable task; Stage1 execute deliberately returns no fence.
+// A standalone arm allocates a Stage2 maintenance sequence for upserts after
+// old-generation cleanup is active. Pure inserts normally allocate the same
+// fence in fused Stage1 execute. Either response is durable proof that the
+// sequence already belongs to a runnable bounded task.
 struct Stage1ArmResult {
   AuthorityOperationToken token{};
   u64 target_raw{};
@@ -311,8 +332,19 @@ struct Stage1ArmResult {
   u32 reserved{};
 };
 
-static_assert(sizeof(Stage1ExecuteItem) == 40);
-static_assert(sizeof(Stage1ExecuteResult) == 32);
+static_assert(sizeof(Stage1ExecuteItem) == 48);
+static_assert(offsetof(Stage1ExecuteItem, client_batch_id) == 0);
+static_assert(offsetof(Stage1ExecuteItem, old_raw) == 8);
+static_assert(offsetof(Stage1ExecuteItem, initial_placement_version) == 16);
+static_assert(offsetof(Stage1ExecuteItem, source_client) == 24);
+static_assert(offsetof(Stage1ExecuteItem, id) == 32);
+static_assert(offsetof(Stage1ExecuteItem, authority_shard) == 44);
+static_assert(sizeof(Stage1ExecuteResult) == 40);
+static_assert(offsetof(Stage1ExecuteResult, client_batch_id) == 0);
+static_assert(offsetof(Stage1ExecuteResult, target_raw) == 8);
+static_assert(offsetof(Stage1ExecuteResult, maintenance_sequence) == 16);
+static_assert(offsetof(Stage1ExecuteResult, source_client) == 24);
+static_assert(offsetof(Stage1ExecuteResult, status) == 32);
 static_assert(sizeof(Stage1ArmItem) == 48);
 static_assert(offsetof(Stage1ArmItem, token) == 0);
 static_assert(offsetof(Stage1ArmItem, target_raw) == 16);

@@ -8,7 +8,8 @@ namespace {
 void test_authority_extension_rpc_layouts() {
   namespace protocol = service::storage_owner;
 
-  static_assert(protocol::kPeerRpcVersion == 11);
+  static_assert(protocol::kMutationProtocolVersion == 3);
+  static_assert(protocol::kPeerRpcVersion == 12);
   static_assert(static_cast<u32>(
                   protocol::PeerRpcType::stage1_arm_response) == 14);
   static_assert(static_cast<u32>(
@@ -27,7 +28,12 @@ void test_authority_extension_rpc_layouts() {
                   protocol::DynamicNodeControlAction::settle_allocation) == 3);
   static_assert(sizeof(protocol::DynamicNodeControlItem) == 48);
   static_assert(sizeof(protocol::ReverseUpdateOp) == 32);
-  static_assert(sizeof(protocol::Stage1ExecuteResult) == 32);
+  static_assert(sizeof(protocol::Stage1ExecuteItem) == 48);
+  static_assert(sizeof(protocol::Stage1ExecuteResult) == 40);
+  static_assert(offsetof(protocol::Stage1ExecuteItem,
+                         initial_placement_version) == 16);
+  static_assert(offsetof(protocol::Stage1ExecuteResult,
+                         maintenance_sequence) == 16);
   static_assert(static_cast<u32>(protocol::Stage1ArmAction::arm) == 1);
   static_assert(static_cast<u32>(protocol::Stage1ArmAction::abort) == 2);
   static_assert(static_cast<u32>(protocol::Stage1ArmAction::release) == 3);

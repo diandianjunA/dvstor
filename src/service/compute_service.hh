@@ -4,6 +4,7 @@
 #include <chrono>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -69,6 +70,13 @@ public:
     return persistent_search_ == nullptr
       ? gpu_search::TelemetrySnapshot{} : persistent_search_->telemetry();
   }
+  std::vector<std::optional<gpu_search::maintenance_telemetry::Snapshot>>
+    storage_maintenance_telemetry() {
+    return persistent_search_ == nullptr
+      ? std::vector<std::optional<
+          gpu_search::maintenance_telemetry::Snapshot>>{}
+      : persistent_search_->read_maintenance_telemetry();
+  }
   u64 late_storage_owner_rpc_completions() const {
     return storage_insert_late_rpc_completions_.load(
       std::memory_order_relaxed);
@@ -127,20 +135,24 @@ private:
     // the sender distinguish real concurrent demand from an isolated write
     // without a time-based batching delay.
     std::atomic<u32> pending_producers{0};
+    // Exact number of fully published queue cells. Producers increment only
+    // after Queue::push_wait; the single progress consumer decrements after
+    // popping an exact batch. This avoids approximate-size publication races.
+    std::atomic<u32> published_tasks{0};
     std::unique_ptr<bounded::Queue<u32>> queue;
     std::unique_ptr<bounded::Queue<u32>> free_tasks;
     std::unique_ptr<StorageInsertTask[]> tasks;
     vec<StorageOwnerRpcSlot> slots;
     vec<StorageOwnerResponseSlot> response_slots;
     vec<u32> free_slots;
+    bool saturated_batch_epoch{};
     // Written only by the progress thread. Power-of-two snapshots are logged
     // so a benchmark can verify that batching is real rather than inferred
     // from submitted operation counts.
     u64 rpc_batches{};
     u64 rpc_items{};
-    u64 concurrent_wait_batches{};
-    u64 concurrent_wait_rounds{};
-    u64 concurrent_wait_ns{};
+    u64 full_batches{};
+    u64 tail_escape_batches{};
   };
 
   struct StorageOwnerReadySlot {
