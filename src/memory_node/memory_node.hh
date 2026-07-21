@@ -706,6 +706,7 @@ private:
                                   u64 observed_header,
                                   u64 set_flags,
                                   u64 clear_flags);
+  bool storage_node_pointer_addressable(RemotePtr rptr) const;
   bool valid_local_storage_node_pointer(RemotePtr rptr) const;
   bool read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot);
   bool storage_owner_node_live(RemotePtr rptr);
