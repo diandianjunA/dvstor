@@ -37,6 +37,13 @@ dvstor_target_common_includes(storage_owner_wire_size_test)
 target_compile_options(storage_owner_wire_size_test PRIVATE -UNDEBUG)
 add_test(NAME storage_owner_wire_size_test COMMAND storage_owner_wire_size_test)
 
+add_executable(storage_owner_graph_pointer_validation_test
+    storage_owner_graph_pointer_validation_test.cc)
+dvstor_target_common_includes(storage_owner_graph_pointer_validation_test)
+target_compile_options(storage_owner_graph_pointer_validation_test PRIVATE -UNDEBUG)
+add_test(NAME storage_owner_graph_pointer_validation_test
+         COMMAND storage_owner_graph_pointer_validation_test)
+
 add_executable(core_partition_test core_partition_test.cc)
 dvstor_target_common_includes(core_partition_test)
 target_compile_options(core_partition_test PRIVATE -UNDEBUG)

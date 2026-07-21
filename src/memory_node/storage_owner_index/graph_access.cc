@@ -4,11 +4,11 @@
 
 using namespace memory_node_storage_owner_index_detail;
 
-namespace {
-
-void report_rejected_graph_pointer(const char* boundary,
-                                   RemotePtr pointer,
-                                   u32 shard_count) {
+void MemoryNode::report_rejected_graph_pointer(
+    const char* boundary,
+    RemotePtr pointer,
+    RemotePtr parent,
+    u64 context) const {
   static std::atomic<u64> rejected{0};
   const u64 count = rejected.fetch_add(1, std::memory_order_relaxed) + 1;
   // Malformed pointers are never a normal churn outcome. Keep diagnostics
@@ -18,12 +18,24 @@ void report_rejected_graph_pointer(const char* boundary,
               << " boundary=" << boundary
               << " raw=0x" << std::hex << pointer.raw_address << std::dec
               << " shard=" << pointer.memory_node()
-              << " configured_shards=" << shard_count
+              << " offset=" << pointer.byte_offset()
+              << " incarnation=" << pointer.incarnation()
+              << " configured_shards=" << num_storage_nodes_
+              << " shard_bytes=" << mn_memory_bytes_;
+    if (!parent.is_null()) {
+      std::cerr << " parent_raw=0x" << std::hex << parent.raw_address
+                << std::dec
+                << " parent_shard=" << parent.memory_node()
+                << " parent_offset=" << parent.byte_offset()
+                << " parent_incarnation=" << parent.incarnation();
+    }
+    if (context != std::numeric_limits<u64>::max()) {
+      std::cerr << " context=" << context;
+    }
+    std::cerr
               << " count=" << count << '\n';
   }
 }
-
-}  // namespace
 
 IncarnationLockResult MemoryNode::try_lock_node(RemotePtr rptr) {
   if (rptr.is_null() || !rptr.is_well_formed() ||
@@ -155,19 +167,8 @@ bool MemoryNode::publish_locked_node_header(RemotePtr rptr,
 }
 
 bool MemoryNode::storage_node_pointer_addressable(RemotePtr rptr) const {
-  if (rptr.is_null() || !rptr.is_well_formed() ||
-      rptr.memory_node() >= num_storage_nodes_ ||
-      !VamanaNode::hot_graph_entry_available(rptr)) {
-    return false;
-  }
-  const auto vector = vamana::StorageLayoutResolver::vector(rptr);
-  if (vector.offset > mn_memory_bytes_ ||
-      vector.size > mn_memory_bytes_ - vector.offset) {
-    return false;
-  }
-  const u64 hot_offset = VamanaNode::hot_graph_entry_offset(rptr);
-  return hot_offset <= mn_memory_bytes_ &&
-    VamanaNode::hot_graph_entry_size() <= mn_memory_bytes_ - hot_offset;
+  return memory_node_storage_owner_index_detail::storage_pointer_addressable(
+    rptr, num_storage_nodes_, mn_memory_bytes_);
 }
 
 bool MemoryNode::read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
@@ -181,11 +182,8 @@ bool MemoryNode::read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
     snapshot.vector_data.clear();
   };
   if (!storage_node_pointer_addressable(rptr)) {
-    if (!rptr.is_null() &&
-        (!rptr.is_well_formed() ||
-         rptr.memory_node() >= num_storage_nodes_)) {
-      report_rejected_graph_pointer(
-        "read_node_snapshot", rptr, num_storage_nodes_);
+    if (!rptr.is_null()) {
+      report_rejected_graph_pointer("read_node_snapshot", rptr);
     }
     clear_snapshot();
     return false;
@@ -628,8 +626,10 @@ bool MemoryNode::read_graph_adjacency(RemotePtr rptr,
   adjacency.provisional.clear();
   adjacency.generation = 0;
   adjacency.deleted = false;
-  if (rptr.is_null() || rptr.memory_node() >= num_storage_nodes_ ||
-      !VamanaNode::hot_graph_entry_available(rptr)) {
+  if (!storage_node_pointer_addressable(rptr)) {
+    if (!rptr.is_null()) {
+      report_rejected_graph_pointer("read_graph_adjacency/input", rptr);
+    }
     return false;
   }
   thread_local vec<byte_t> local_entry;
@@ -643,7 +643,6 @@ bool MemoryNode::read_graph_adjacency(RemotePtr rptr,
                     ? owner_thread->scratch_buffer.get_full_buffer()
                     : peer_scratch_buffer_.get_full_buffer();
   }
-  bool entry_ok = false;
   constexpr u32 kMaxReadAttempts = 3;
   for (u32 attempt = 0; attempt < kMaxReadAttempts; ++attempt) {
     if (local_shard(rptr.memory_node())) {
@@ -663,7 +662,7 @@ bool MemoryNode::read_graph_adjacency(RemotePtr rptr,
     const u16 expected = vamana::hot_graph::load_u16_le(read_buffer + 2);
     const u16 actual = vamana::hot_graph::checksum16(
       read_buffer, VamanaNode::hot_graph_entry_size());
-    entry_ok = stable_count <= VamanaNode::R &&
+    const bool entry_ok = stable_count <= VamanaNode::R &&
       provisional_count <= VamanaNode::provisional_slots() &&
       static_cast<u32>(stable_count) + provisional_count <=
         VamanaNode::graph_entry_capacity() &&
@@ -671,42 +670,58 @@ bool MemoryNode::read_graph_adjacency(RemotePtr rptr,
         rptr.incarnation() &&
       vamana::hot_graph::load_u32_le(read_buffer + 12) == 0 &&
       expected == actual;
-    if (entry_ok) {
-      break;
+    if (!entry_ok) {
+      std::this_thread::yield();
+      continue;
+    }
+
+    adjacency.stable.clear();
+    adjacency.provisional.clear();
+    adjacency.generation = vamana::hot_graph::load_u32_le(read_buffer + 4);
+    adjacency.deleted =
+      (read_buffer[1] & VamanaNode::HOT_GRAPH_DELETED) != 0;
+    adjacency.stable.reserve(stable_count);
+    adjacency.provisional.reserve(provisional_count);
+    bool malformed_neighbor = false;
+    for (u32 index = 0; index < stable_count; ++index) {
+      const RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
+        read_buffer + vamana::hot_graph::neighbor_offset(index),
+        VamanaNode::HOT_GRAPH_SHARD_BITS);
+      if (neighbor.is_null()) continue;
+      if (!storage_node_pointer_addressable(neighbor)) {
+        malformed_neighbor = true;
+        report_rejected_graph_pointer(
+          "read_graph_adjacency/stable", neighbor, rptr, index);
+        continue;
+      }
+      adjacency.stable.push_back(neighbor);
+    }
+    for (u32 index = 0; index < provisional_count; ++index) {
+      const RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
+        read_buffer + vamana::hot_graph::neighbor_offset(stable_count + index),
+        VamanaNode::HOT_GRAPH_SHARD_BITS);
+      if (neighbor.is_null()) continue;
+      if (!storage_node_pointer_addressable(neighbor)) {
+        malformed_neighbor = true;
+        report_rejected_graph_pointer(
+          "read_graph_adjacency/provisional", neighbor, rptr, index);
+        continue;
+      }
+      adjacency.provisional.push_back(neighbor);
+    }
+    // A malformed pointer can be a transient torn graph snapshot. Re-read it
+    // before accepting a filtered entry. On the final attempt, retain the
+    // valid neighbors so one damaged edge cannot disconnect the whole node.
+    if (!malformed_neighbor || attempt + 1 == kMaxReadAttempts) {
+      return true;
     }
     std::this_thread::yield();
   }
-  if (!entry_ok) {
-    return false;
-  }
-
-  const u8 stable_count = read_buffer[0];
-  const u8 provisional_count =
-    vamana::hot_graph::provisional_count(read_buffer);
-  adjacency.generation = vamana::hot_graph::load_u32_le(read_buffer + 4);
-  adjacency.deleted =
-    (read_buffer[1] & VamanaNode::HOT_GRAPH_DELETED) != 0;
-  adjacency.stable.reserve(stable_count);
-  adjacency.provisional.reserve(provisional_count);
-  for (u32 index = 0; index < stable_count; ++index) {
-    const RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
-      read_buffer + vamana::hot_graph::neighbor_offset(index),
-      VamanaNode::HOT_GRAPH_SHARD_BITS);
-    if (!neighbor.is_null() && neighbor.is_well_formed() &&
-        neighbor.memory_node() < num_storage_nodes_) {
-      adjacency.stable.push_back(neighbor);
-    }
-  }
-  for (u32 index = 0; index < provisional_count; ++index) {
-    const RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
-      read_buffer + vamana::hot_graph::neighbor_offset(stable_count + index),
-      VamanaNode::HOT_GRAPH_SHARD_BITS);
-    if (!neighbor.is_null() && neighbor.is_well_formed() &&
-        neighbor.memory_node() < num_storage_nodes_) {
-      adjacency.provisional.push_back(neighbor);
-    }
-  }
-  return true;
+  adjacency.stable.clear();
+  adjacency.provisional.clear();
+  adjacency.generation = 0;
+  adjacency.deleted = false;
+  return false;
 }
 
 vec<std::pair<RemotePtr, MemoryNode::GraphAdjacency>>
@@ -752,6 +767,11 @@ size_t MemoryNode::read_graph_adjacencies_batched_into(
     byte_t* buffer{};
   };
 
+  enum class GraphDecodeResult : u8 {
+    invalid_snapshot,
+    valid,
+    malformed_pointer,
+  };
   const auto decode = [&](RemotePtr rptr, const byte_t* entry,
                           GraphAdjacency& adjacency) {
     adjacency.stable.clear();
@@ -772,36 +792,47 @@ size_t MemoryNode::read_graph_adjacencies_batched_into(
           rptr.incarnation() ||
         vamana::hot_graph::load_u32_le(entry + 12) != 0 ||
         expected != actual) {
-      return false;
+      return GraphDecodeResult::invalid_snapshot;
     }
     adjacency.generation = vamana::hot_graph::load_u32_le(entry + 4);
     adjacency.deleted =
       (entry[1] & VamanaNode::HOT_GRAPH_DELETED) != 0;
     adjacency.stable.reserve(stable_count);
     adjacency.provisional.reserve(provisional_count);
+    bool malformed_neighbor = false;
     for (u32 index = 0; index < stable_count; ++index) {
       const RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
         entry + vamana::hot_graph::neighbor_offset(index),
         VamanaNode::HOT_GRAPH_SHARD_BITS);
-      if (!neighbor.is_null() && neighbor.is_well_formed() &&
-          neighbor.memory_node() < num_storage_nodes_) {
-        adjacency.stable.push_back(neighbor);
+      if (neighbor.is_null()) continue;
+      if (!storage_node_pointer_addressable(neighbor)) {
+        malformed_neighbor = true;
+        report_rejected_graph_pointer(
+          "read_graph_adjacencies_batched/stable", neighbor, rptr, index);
+        continue;
       }
+      adjacency.stable.push_back(neighbor);
     }
     for (u32 index = 0; index < provisional_count; ++index) {
       const RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
         entry + vamana::hot_graph::neighbor_offset(stable_count + index),
         VamanaNode::HOT_GRAPH_SHARD_BITS);
-      if (!neighbor.is_null() && neighbor.is_well_formed() &&
-          neighbor.memory_node() < num_storage_nodes_) {
-        adjacency.provisional.push_back(neighbor);
+      if (neighbor.is_null()) continue;
+      if (!storage_node_pointer_addressable(neighbor)) {
+        malformed_neighbor = true;
+        report_rejected_graph_pointer(
+          "read_graph_adjacencies_batched/provisional", neighbor, rptr,
+          index);
+        continue;
       }
+      adjacency.provisional.push_back(neighbor);
     }
-    return true;
+    return malformed_neighbor ? GraphDecodeResult::malformed_pointer
+                              : GraphDecodeResult::valid;
   };
 
-  const size_t scratch_stride = aligned_snapshot_bytes();
-  const size_t max_batch = storage_owner_snapshot_batch_size(config, thread);
+  const size_t scratch_stride = aligned_graph_entry_bytes();
+  const size_t max_batch = storage_owner_graph_batch_size(config, thread);
   constexpr u32 kMaxReadAttempts = 3;
   thread_local vec<PendingRead> pending;
   thread_local vec<PendingRead> retry;
@@ -813,8 +844,11 @@ size_t MemoryNode::read_graph_adjacencies_batched_into(
     u32 remote_slot = 0;
     for (size_t index = begin; index < end; ++index) {
       const RemotePtr rptr = rptrs[index];
-      if (rptr.is_null() || rptr.memory_node() >= num_storage_nodes_ ||
-          !VamanaNode::hot_graph_entry_available(rptr)) {
+      if (!storage_node_pointer_addressable(rptr)) {
+        if (!rptr.is_null()) {
+          report_rejected_graph_pointer(
+            "read_graph_adjacencies_batched/input", rptr);
+        }
         continue;
       }
       if (local_shard(rptr.memory_node())) {
@@ -849,7 +883,11 @@ size_t MemoryNode::read_graph_adjacencies_batched_into(
       retry.clear();
       for (const PendingRead& read : pending) {
         auto& slot = next_result();
-        if (decode(read.rptr, read.buffer, slot.second)) {
+        const GraphDecodeResult decoded =
+          decode(read.rptr, read.buffer, slot.second);
+        if (decoded == GraphDecodeResult::valid ||
+            (decoded == GraphDecodeResult::malformed_pointer &&
+             attempt + 1 == kMaxReadAttempts)) {
           slot.first = read.rptr;
           ++result_count;
         } else if (attempt + 1 < kMaxReadAttempts) {
@@ -924,7 +962,7 @@ bool MemoryNode::read_local_neighbor_list(RemotePtr rptr,
     if (neighbor.is_null()) continue;
     if (!storage_node_pointer_addressable(neighbor)) {
       report_rejected_graph_pointer(
-        "read_local_neighbor_list", neighbor, num_storage_nodes_);
+        "read_local_neighbor_list", neighbor, rptr, index);
       continue;
     }
     neighbors.push_back(neighbor);
@@ -993,8 +1031,7 @@ size_t MemoryNode::read_node_snapshots_batched_into(
       }
 
       if (!storage_node_pointer_addressable(rptr)) {
-        report_rejected_graph_pointer(
-          boundary, rptr, num_storage_nodes_);
+        report_rejected_graph_pointer(boundary, rptr);
         continue;
       }
 
@@ -1108,15 +1145,11 @@ MemoryNode::score_stable_node_vectors_batched(
       : distance_to_stored_vector(decoded_query, vector, config);
   };
   const auto validate_pointer = [&](RemotePtr rptr) {
-    if (rptr.is_null() || !rptr.is_well_formed()) return false;
-    lib_assert(rptr.memory_node() < num_storage_nodes_,
-               "invalid remote shard id in stage2 vector scoring: " +
-                 std::to_string(rptr.memory_node()));
-    const auto vector = vamana::StorageLayoutResolver::vector(rptr);
-    lib_assert(vector.offset <= mn_memory_bytes_ &&
-                 vector.size <= mn_memory_bytes_ - vector.offset,
-               "stage2 vector scoring exceeds shard bounds");
-    return true;
+    if (storage_node_pointer_addressable(rptr)) return true;
+    if (!rptr.is_null()) {
+      report_rejected_graph_pointer("stage2_vector_scoring", rptr);
+    }
+    return false;
   };
   const auto score_local = [&](RemotePtr rptr) {
     const byte_t* record = index_buffer_.get_full_buffer() +
@@ -1365,7 +1398,7 @@ void MemoryNode::write_graph_adjacency(
     }
     if (!storage_node_pointer_addressable(candidate)) {
       report_rejected_graph_pointer(
-        "write_graph_adjacency/stable", candidate, num_storage_nodes_);
+        "write_graph_adjacency/stable", candidate, rptr);
       continue;
     }
     bounded_stable.push_back(candidate);
@@ -1384,8 +1417,7 @@ void MemoryNode::write_graph_adjacency(
     }
     if (!storage_node_pointer_addressable(candidate)) {
       report_rejected_graph_pointer(
-        "write_graph_adjacency/provisional", candidate,
-        num_storage_nodes_);
+        "write_graph_adjacency/provisional", candidate, rptr);
       continue;
     }
     bounded_provisional.push_back(candidate);
@@ -1518,7 +1550,7 @@ void MemoryNode::write_new_node_on_shard(
     }
     if (!storage_node_pointer_addressable(neighbor)) {
       report_rejected_graph_pointer(
-        "write_new_node_on_shard", neighbor, num_storage_nodes_);
+        "write_new_node_on_shard", neighbor, rptr);
       continue;
     }
     bounded_neighbors.push_back(neighbor);

@@ -377,9 +377,13 @@ void MemoryNode::continue_stage2_search_candidates_batched(
       u32 remote_slot = 0;
       for (size_t group = begin; group < end; ++group) {
         const RemotePtr pointer = score_unique[group];
-        lib_assert(!pointer.is_null() && pointer.is_well_formed() &&
-                     pointer.memory_node() < num_storage_nodes_,
-                   "batched Stage2 score received an invalid pointer");
+        if (!storage_node_pointer_addressable(pointer)) {
+          if (!pointer.is_null()) {
+            report_rejected_graph_pointer(
+              "stage2_continuation_score", pointer, RemotePtr{}, group);
+          }
+          continue;
+        }
         if (local_shard(pointer.memory_node())) {
           NodeSnapshot snapshot;
           if (read_node_snapshot(pointer, snapshot) && !snapshot.deleted &&
@@ -389,12 +393,6 @@ void MemoryNode::continue_stage2_search_candidates_batched(
           }
           continue;
         }
-        const auto vector_address =
-          vamana::StorageLayoutResolver::vector(pointer);
-        lib_assert(vector_address.offset <= mn_memory_bytes_ &&
-                     vector_address.size <=
-                       mn_memory_bytes_ - vector_address.offset,
-                   "batched Stage2 vector read exceeds shard bounds");
         const size_t scratch_offset =
           static_cast<size_t>(remote_slot++) * snapshot_stride;
         lib_assert(scratch_offset + snapshot_size <= thread->scratch_stride,

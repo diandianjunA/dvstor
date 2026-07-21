@@ -1,5 +1,6 @@
 #include "memory_node/storage_owner_maintenance/detail.hh"
 #include "memory_node/storage_owner_cpu_plan.hh"
+#include "memory_node/storage_owner_index/graph_pointer_validation.hh"
 #include "gpu_search/maintenance_telemetry.hh"
 
 using namespace memory_node_storage_owner_maintenance_detail;
@@ -135,9 +136,13 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
       repair_capacity);
   const size_t snapshot_stride = memory_node_detail::storage_owner_snapshot_stride();
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
+  const size_t graph_stride = align_up(VamanaNode::hot_graph_entry_size());
   const size_t snapshot_batch = std::max<u32>(1, config.storage_owner_search_snapshot_batch);
+  const size_t batch_slot_stride =
+    memory_node_storage_owner_index_detail::batched_read_slot_stride(
+      snapshot_stride);
   const size_t coroutine_scratch_stride =
-    align_up(snapshot_stride * snapshot_batch +
+    align_up(batch_slot_stride * snapshot_batch +
              std::max(VamanaNode::total_size(), neighbor_stride));
   const size_t scratch_bytes = coroutine_scratch_stride;
 
@@ -149,6 +154,12 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     }
     storage_owner_maintenance_worker_states_.push_back(std::move(worker));
   }
+
+  print_status("storage-owner peer scratch: snapshot_slot=" +
+               std::to_string(snapshot_stride) + " graph_slot=" +
+               std::to_string(graph_stride) + " batch=" +
+               std::to_string(snapshot_batch) + " bytes_per_worker=" +
+               std::to_string(coroutine_scratch_stride));
 
   for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {
     storage_owner_maintenance_workers_.emplace_back(

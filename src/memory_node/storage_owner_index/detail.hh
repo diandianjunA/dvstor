@@ -9,6 +9,7 @@
 
 #include "common/index_path.hh"
 #include "gpu_search/index_format.hh"
+#include "memory_node/storage_owner_index/graph_pointer_validation.hh"
 #include "vamana/idmap.hh"
 #include "vamana/storage_layout_resolver.hh"
 
@@ -33,6 +34,10 @@ inline size_t aligned_snapshot_bytes() {
   return memory_node_detail::storage_owner_snapshot_stride();
 }
 
+inline size_t aligned_graph_entry_bytes() {
+  return memory_node_storage_owner_index_detail::graph_read_slot_stride();
+}
+
 inline u32 storage_owner_construction_width(const Configuration& config) {
   return config.resolved_storage_owner_construction_width();
 }
@@ -49,6 +54,23 @@ inline u32 storage_owner_snapshot_batch_size(
   lib_assert(capacity > 0,
              "storage-owner coroutine scratch cannot hold one snapshot: "
              "snapshot_stride=" +
+               std::to_string(stride) + " scratch_stride=" +
+               std::to_string(thread->scratch_stride));
+  return static_cast<u32>(std::min<size_t>(configured, capacity));
+}
+
+inline u32 storage_owner_graph_batch_size(
+    const Configuration& config, const StorageOwnerThread* thread = nullptr) {
+  const u32 configured =
+    std::max<u32>(1, config.storage_owner_search_snapshot_batch);
+  if (thread == nullptr || !thread->has_peer_scratch()) {
+    return configured;
+  }
+  const size_t stride = aligned_graph_entry_bytes();
+  const size_t capacity = stride == 0 ? 0 : thread->scratch_stride / stride;
+  lib_assert(capacity > 0,
+             "storage-owner coroutine scratch cannot hold one graph entry: "
+             "graph_stride=" +
                std::to_string(stride) + " scratch_stride=" +
                std::to_string(thread->scratch_stride));
   return static_cast<u32>(std::min<size_t>(configured, capacity));

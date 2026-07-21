@@ -706,6 +706,11 @@ private:
                                   u64 observed_header,
                                   u64 set_flags,
                                   u64 clear_flags);
+  void report_rejected_graph_pointer(
+    const char* boundary,
+    RemotePtr pointer,
+    RemotePtr parent = RemotePtr{},
+    u64 context = std::numeric_limits<u64>::max()) const;
   bool storage_node_pointer_addressable(RemotePtr rptr) const;
   bool valid_local_storage_node_pointer(RemotePtr rptr) const;
   bool read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot);

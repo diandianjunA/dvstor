@@ -1,5 +1,6 @@
 #include "memory_node/peer_rpc/detail.hh"
 #include "memory_node/storage_owner_cpu_plan.hh"
+#include "memory_node/storage_owner_index/graph_pointer_validation.hh"
 
 void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
   if (!peer_context_ || num_storage_nodes_ <= 1) {
@@ -243,10 +244,13 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   dynamic_allocation_receipts_.reset(dynamic_allocation_dedupe_limit_);
   const size_t snapshot_stride = align_up(VamanaNode::vector_bytes());
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
+  const size_t batched_read_stride =
+    memory_node_storage_owner_index_detail::batched_read_slot_stride(
+      snapshot_stride);
   const size_t coroutine_scratch_stride =
     align_up(std::max<size_t>(VamanaNode::total_size(),
                               std::max(neighbor_stride,
-                                       snapshot_stride *
+                                       batched_read_stride *
                                          std::max<u32>(1, config.storage_owner_search_snapshot_batch))));
   const size_t scratch_bytes = coroutine_scratch_stride;
   peer_reverse_worker_states_.reserve(reverse_worker_count);

@@ -30,7 +30,10 @@ bool MemoryNode::storage_owner_physical_node_matches(
 }
 
 vec<RemotePtr> MemoryNode::read_preserved_neighbor_list(RemotePtr rptr) {
-  if (rptr.is_null()) {
+  if (!storage_node_pointer_addressable(rptr)) {
+    if (!rptr.is_null()) {
+      report_rejected_graph_pointer("read_preserved_neighbor_list/input", rptr);
+    }
     return {};
   }
   vec<byte_t> entry(VamanaNode::hot_graph_entry_size());
@@ -61,9 +64,13 @@ vec<RemotePtr> MemoryNode::read_preserved_neighbor_list(RemotePtr rptr) {
     RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
       entry.data() + vamana::hot_graph::neighbor_offset(i),
       VamanaNode::HOT_GRAPH_SHARD_BITS);
-    if (!neighbor.is_null()) {
-      neighbors.push_back(neighbor);
+    if (neighbor.is_null()) continue;
+    if (!storage_node_pointer_addressable(neighbor)) {
+      report_rejected_graph_pointer(
+        "read_preserved_neighbor_list/neighbor", neighbor, rptr, i);
+      continue;
     }
+    neighbors.push_back(neighbor);
   }
   return neighbors;
 }
