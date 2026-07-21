@@ -14,7 +14,6 @@ export INDEX_DIR=/data/xjs/index/dvstor_sift100m/index
 export GPU_DEVICE=1
 export GPU_MEMORY_LIMIT_GB=40
 export GPU_MEMORY_RESERVE_GB=4
-export GPU_RESIDENT_PQ_BUDGET_MB=4096
 ```
 
 ## 构建新索引
@@ -28,10 +27,45 @@ export GPU_RESIDENT_PQ_BUDGET_MB=4096
 ./experiment/build_sift100m_index.sh 04_gpu_persistent_gpunetio
 ```
 
-完整构建以 schema-14 compact 图为中间态，最终直接生成 schema-15
+完整构建以 schema-15 tagged graph 为中间态，最终直接生成 schema-16
 OPQ/PQ32 运行索引，无需随后重编码。
 推荐使用 `PQ_INDEX_PREFIX=/new/prefix` 保留已有索引；只有明确要删除目标 prefix
 下旧产物并原地重建时才设置 `OVERWRITE_INDEX=1`。
+
+## 转换旧 compact-v1 索引
+
+完整、未包含在线 mutation 的旧 schema-15 `vamana_compact_v1` 基图可以流式
+转换，不需要重新运行 Vamana 或 METIS，也不需要重新训练 OPQ/PQ。转换保持每个
+物理分片的 slot 顺序，因此保留原始向量字节、图拓扑、METIS placement 和跨分片边；
+它会重写 fixed record、5-byte compact edge、所有 `RemotePtr`，并重新生成 bound
+idmap v2 和物理分片 centroid v2。旧 PQ model 被复用，base PQ codes 从精确向量
+重新编码。
+
+先执行只读的全量校验：
+
+```bash
+./build/vamana_legacy_index_converter \
+  --input-prefix "$OLD_PREFIX" \
+  --output-prefix "$NEW_PREFIX" \
+  --dry-run
+```
+
+校验通过后写到新的 prefix：
+
+```bash
+./build/vamana_legacy_index_converter \
+  --input-prefix "$OLD_PREFIX" \
+  --output-prefix "$NEW_PREFIX" \
+  --chunk-vectors 65536 \
+  --threads 32
+```
+
+转换器禁止原地执行或覆盖已有输出，并在所有分片、idmap 和 centroid 完成后最后
+发布 metadata。输入至少需要 metadata、全部旧 `.dat` 和旧 `.pqM` model；旧
+`.codes`、`.anchors`、原始 dataset 和旧 idmap 都不是恢复静态基图所必需的。
+`--graph-only` 可停在新的 tagged schema-15 中间态。转换器拒绝 deleted、非零
+generation 或含动态 slot 的运行时快照；这类在线状态没有足够的旧持久化语义可安全
+映射到 incarnation/provisional/centroid 新契约，只能从一致的静态快照重新生成。
 
 ## 部署文件
 
@@ -40,15 +74,12 @@ OPQ/PQ32 运行索引，无需随后重编码。
 ```text
 <prefix>.meta.json
 <prefix>.pq32
-<prefix>.anchors
-<prefix>_node1_ofN.idmap ... <prefix>_nodeN_ofN.idmap
 ```
 
-纯查询配置使用 `enable-updates = false`，需要 `<prefix>.meta.json`、
-`<prefix>.pq32` 和 `<prefix>.anchors`；不会加载 owner idmap，也不会启动更新执行器。
-这里的 anchors 只作为 GPU 冷启动/召回兜底。在线 mutation 会持续更新 storage
-owner 的固定容量动态入口；每个计算节点从 control page 拉取同一 canonical 快照，
-因此其他计算节点写入的新代表节点同样可见。
+纯查询配置使用 `enable-updates = false`，需要 `<prefix>.meta.json` 和
+`<prefix>.pq32`；不会启动更新执行器。在线 mutation 会持续
+更新 storage owner 的 centroid publication；每个计算节点从 storage 拉取同一版本化
+快照，因此其他计算节点写入的新代表节点同样可见。
 
 存储节点 X：
 
@@ -56,14 +87,24 @@ owner 的固定容量动态入口；每个计算节点从 control page 拉取同
 <prefix>.meta.json
 <prefix>_nodeX_ofN.dat
 <prefix>_nodeX_ofN.idmap
+<prefix>_nodeX_ofN.centroid
 <prefix>_nodeX_ofN.pq32.codes
 ```
 
-计算节点不需要 `.dat`、`.pq32.codes` 或 `.gpu.idx`。启用更新时，它必须能读取全部
-owner-sharded `.idmap`：METIS 分片的 owner 不能由 `ID % N` 推导，基础 ID 的
-upsert/delete 和重复写必须先找到真实 owner。每个存储节点仍只需自己的 idmap。
-已有 schema-15 索引只需复制 sidecar，无需重建索引。存储节点运行时不需要
-`.pq32` 模型或 `.anchors`。
+计算节点不需要 `.dat`、`.idmap`、`.pq32.codes` 或 `.gpu.idx`。METIS 只决定物理
+placement；基础和动态 ID 的逻辑 authority 都由 `ID % N` 确定，其存储端 idmap
+负责解析当前物理记录。因而增加计算节点不会复制一份 O(N) 的 ID 目录；每个存储
+节点只加载自己的 `owner_sharded_v2_bound` idmap。该文件与整次构建和 owner
+分片指纹强绑定，并校验完整长度、payload/header checksum、`ID % N`、tagged
+`RemotePtr` 静态范围及重复 ID；旧 v1 会被直接拒绝。
+加载后基础项只保留紧凑的 `ID -> RemotePtr`，完整的代际、提交回执和迁移状态仅为
+实际参与 mutation 的 ID 分配。离线 writer 同样以每 owner 临时流单遍分桶，不在
+内存中复制一份全量 idmap payload。
+旧索引不能通过复制或改名 sidecar 升级：schema-16 运行格式、8-byte tagged
+`RemotePtr`、构建/分片指纹、centroid sidecar v2 和 PQ code header 是同一次构建的
+绑定契约。完整的 compact-v1 静态 `.dat` 可使用上面的转换器重写这些契约；缺失
+`.dat` 或只有 anchor/idmap/PQ model 时信息不足，才必须重新构图。存储节点运行时
+不需要 `.pq32` 模型。
 
 ## 启动
 
@@ -82,30 +123,36 @@ upsert/delete 和重复写必须先找到真实 owner。每个存储节点仍只
 启动脚本会验证 schema、分片数、R、dtype、PQ checksum 和角色所需文件，
 不兼容时在申请大块注册内存前退出。
 
-schema-15 存储控制区使用版本 2：每个计算节点拥有独立 reclaim ACK。升级后必须
-重新编译并重启全部计算、存储节点；PQ code 无需重编码。当前 schema-15 的反向边
-请求只携带物理指针、没有 generation，因此存储端不会复用已删除动态节点的物理
-地址，避免迟到重试修改另一个节点。每次成功 insert/upsert 都会消耗新的节点/向量
-空间，部署时必须为预期写入量预留 memory-node 容量；这项限制要等独立的协议升级
-后才能解除。
+运行格式固定为 schema 16，peer RPC 协议固定为版本 11。所有动态图指针携带
+`{shard, offset, incarnation}`，记录头在读取和修改前都校验 incarnation；删除地址只在
+对应维护序列 durable 后进入复用流程。查询采用 incarnation-tagged read-committed
+语义，不要求动态加入的计算节点参与全局 ACK；incarnation 耗尽的槽位永久退休而不回绕。
+动态目标分配使用无超时驱逐的 receipt：只有源记录进入终态且目标记录的精确身份已
+确认后才结算，避免迟到重试把新对象误认为旧对象。混用旧二进制、旧分片、旧
+centroid 或旧 PQ code 会在启动校验时失败。
 
-stage2 finalized 的等价边界是同一逻辑快照下的分片在线 reference：每个分片完成
-相同宽度 `L` 的构建搜索，合并全部 beam 后执行一次相同 RobustPrune，并等待本次
-insert 所选邻居的反向边完成。它不等价于离线 builder 的全候选构图。当前也没有
+Stage2 finalized 的等价边界是同一逻辑快照下延续 Stage1 的宽度 `L`
+beam/visited/frontier，沿图中实际跨分片边完成 one-sided-RDMA 扩展后执行一次相同
+RobustPrune，并等待本次 insert 所选邻居的反向边完成；它不会为每个分片重启独立
+搜索，也不等价于离线 builder 的全候选构图。当前也没有
 完整入边索引，所以 delete/upsert 不能同步清除所有历史未知入边；报告中的 durable
 或 drained 仅表示已声明的 maintenance 任务完成，不应解释为全图整理已经完成。
 
-同一 4 KiB 控制页的 offset 1024 还发布固定 8 槽 canonical route 快照；它不改变
-`StorageControlBlock`、索引文件或任何 RPC 布局。旧存储二进制没有该运行时扩展，
-因此新计算节点会在启动校验时拒绝混合部署；同步升级二进制即可，不需要重建索引。
+控制页通过 descriptor 指向独立、可变长度的 centroid route publication；容量由
+维度、标量类型和 live-entry 上限计算，不受 4 KiB 控制页固定槽位约束。旧存储
+二进制没有该运行时扩展，因此新计算节点会在启动校验时拒绝混合部署；必须同步
+升级全部二进制，并使用新 builder 重建或用上述工具完整转换索引。
 
-新插入或 upsert 产生的 PQ code 在发布时由 GPU 编码一次，并进入独立的常驻
-dynamic-PQ 层。短期 L0 中的原始向量和可变图记录退休后，该 PQ code 仍留在
-GPU，查询导航不会退化为逐 code RDMA。只有对应版本被 upsert/delete 淘汰、旧查询
-RCU 屏障退出后才回收常驻 PQ 槽。stage2 context、GPU delta 元数据和被淘汰的 PQ
-都保持有界并可回收，但上述存储节点/真实向量地址在 schema-15 内保持 generation
-稳定。PQ 容量由 `GPU_RESIDENT_PQ_BUDGET_MB` 显式限制，报告中的
-`resident_pq_entries/peak/capacity/reclaimed` 用于观察长期运行水位。
+maintenance observation 同时输出窗口可差分的 locality 计数器：Stage2 continuation
+次数、远端 frontier/展开/评分记录数、迁移数，以及以 Stage1 home 和最终 home 计算的
+跨分片边数。benchmark 只对测量窗口前后的单调累积值做差，报告
+`home_match_rate`、`cross_edge_reduction_ratio` 和每次 continuation 的平均远端工作量；
+这些指标包含窗口内全部请求，不使用请求抽样或数据集专用捷径。
+
+动态节点的 PQ code 和图记录都以存储节点上的权威记录为准，GPU 查询通过
+one-sided RDMA 按需读取，不维护需要广播、同步或回收的计算侧 dynamic-PQ 副本。
+stage2 context 有界回收；存储节点记录同时保持逻辑 generation 与物理 incarnation
+稳定，并在 durable watermark 后以 header-last 方式发布复用后的新 incarnation。
 
 ## 召回率与性能
 

@@ -45,11 +45,9 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
   print_status("storage-owner online insert tuning: construction_beam=" +
                std::to_string(config.resolved_storage_owner_construction_width()) +
                " snapshot_batch=" + std::to_string(config.storage_owner_search_snapshot_batch) +
-               " update_mode=" + config.storage_owner_update_mode);
-  if (storage_owner_local_stitch_mode(config)) {
-    print_status("storage-owner stage1=direct local commit without peer RDMA; "
-                 "reverse edges=batched stage2");
-  }
+               " protocol=centroid-home-two-stage");
+  print_status("storage-owner stage1=physical-home local search and backlinks; "
+               "stage2=one-sided-RDMA continuation");
   print_status("storage-owner responses=foreground direct post; "
                "completion=repost by service poller");
   const u32 rpc_parallelism = std::max<u32>(
@@ -59,24 +57,6 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
     rpc_parallelism, config.storage_owner_maintenance_workers,
     num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
   const u32 worker_count = cpu_plan.foreground_workers;
-  const u32 coroutines_per_worker = std::max<u32>(1, config.storage_owner_coroutines);
-  const size_t snapshot_bytes = memory_node_detail::storage_owner_snapshot_bytes();
-  const size_t snapshot_stride = memory_node_detail::storage_owner_snapshot_stride();
-  const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
-  const size_t snapshot_batch =
-    std::max<u32>(1, config.storage_owner_search_snapshot_batch);
-  // Keep one general-purpose slot beyond the batch area. This prevents a
-  // neighbor/node fallback in the same coroutine from aliasing batched reads.
-  const size_t coroutine_scratch_stride =
-    align_up(snapshot_stride * snapshot_batch +
-             std::max(VamanaNode::total_size(), neighbor_stride));
-  const size_t scratch_bytes =
-    coroutine_scratch_stride * std::max<u32>(1, coroutines_per_worker);
-  print_status("storage-owner coroutine scratch: snapshot_bytes=" +
-               std::to_string(snapshot_bytes) +
-               " snapshot_stride=" + std::to_string(snapshot_stride) +
-               " batch=" + std::to_string(snapshot_batch) +
-               " per_coroutine=" + std::to_string(coroutine_scratch_stride));
   print_status("storage-owner foreground workers: " +
                std::to_string(worker_count) +
                " (assigned_cpus=" +
@@ -86,26 +66,26 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
                std::to_string(cpu_plan.foreground_workers) +
                " maintenance=" +
                std::to_string(cpu_plan.maintenance_workers) +
-               " peer_search=" +
-               std::to_string(cpu_plan.peer_search_workers) +
+               " peer_stage1=" +
+               std::to_string(cpu_plan.peer_stage1_workers) +
                " peer_reverse=" +
                std::to_string(cpu_plan.peer_reverse_workers) +
+               " peer_cleanup=" +
+               std::to_string(cpu_plan.peer_cleanup_workers) +
+               " peer_placement=" +
+               std::to_string(cpu_plan.peer_placement_workers) +
                " peer_progress=" +
                std::to_string(cpu_plan.peer_progress_threads) +
                " foreground_progress=" +
                std::to_string(cpu_plan.foreground_progress_threads));
   storage_owner_threads_.reserve(worker_count);
   for (u32 i = 0; i < worker_count; ++i) {
-    auto thread = std::make_unique<StorageOwnerThread>(i, coroutines_per_worker, config.max_send_queue_wr);
-    if (peer_context_ && !storage_owner_local_stitch_mode(config)) {
-      thread->init_peer_scratch(*peer_context_, scratch_bytes, coroutine_scratch_stride);
-    }
+    // Foreground Stage1 is synchronous and partition-local. Cross-shard reads
+    // belong exclusively to the Stage2 executor, so one scratch state per
+    // worker is sufficient and no foreground peer-RDMA scratch is allocated.
+    auto thread = std::make_unique<StorageOwnerThread>(
+      i, 1, config.max_send_queue_wr);
     storage_owner_threads_.push_back(std::move(thread));
-  }
-  storage_owner_async_candidates_.clear();
-  storage_owner_async_candidates_.resize(worker_count);
-  for (auto& worker_candidates : storage_owner_async_candidates_) {
-    worker_candidates.resize(coroutines_per_worker);
   }
   for (u32 i = 0; i < worker_count; ++i) {
     storage_insert_workers_.emplace_back([this, i]() { storage_owner_insert_worker_loop(i); });

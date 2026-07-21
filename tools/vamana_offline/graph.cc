@@ -10,6 +10,7 @@
 
 #include <library/utils.hh>
 
+#include "common/constants.hh"
 #include "tools/vamana_offline/progress.hh"
 
 namespace tools::vamana_offline {
@@ -102,7 +103,8 @@ void insert_sorted_beam(vec<std::pair<float, u32>>& beam,
 }  // namespace
 
 void VamanaGraph::init(size_t n, u32 d, u32 max_degree, size_t requested_lock_stripes) {
-  lib_assert(max_degree <= std::numeric_limits<u8>::max(), "offline graph degree must fit in u8");
+  lib_assert(max_degree > 0 && max_degree <= kMaxSupportedGraphDegree,
+             "offline graph degree exceeds the system-wide limit");
   num_nodes = n;
   dim = d;
   R = max_degree;

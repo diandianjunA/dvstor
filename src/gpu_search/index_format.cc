@@ -1,67 +1,278 @@
 #include "gpu_search/index_format.hh"
 
 #include <algorithm>
+#include <bit>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
-#include <unordered_set>
 
-#include "common/index_path.hh"
 #include "nlohmann/json.hh"
-#include "vamana/anchor_index.hh"
+#include "vamana/hot_graph.hh"
+#include "vamana/vamana_node.hh"
 
 namespace gpu_search::format {
 
-u64 storage_route_body_checksum(
-    const StorageRoutePublication& publication) {
+u32 centroid_scalar_bytes(CentroidScalarType type) {
+  switch (type) {
+    case CentroidScalarType::float32: return sizeof(f32);
+    case CentroidScalarType::float64: return sizeof(f64);
+  }
+  return 0;
+}
+
+u64 storage_centroid_route_publication_bytes(
+    u32 dim, CentroidScalarType scalar_type, u32 live_entry_capacity) {
+  const u64 scalar_bytes = centroid_scalar_bytes(scalar_type);
+  if (dim == 0 || scalar_bytes == 0 || live_entry_capacity == 0 ||
+      live_entry_capacity > kStorageCentroidRouteMaxLiveEntries ||
+      dim > (std::numeric_limits<u64>::max() -
+             sizeof(StorageCentroidRoutePublicationHeader)) / scalar_bytes) {
+    return 0;
+  }
+  const u64 centroid_end =
+    sizeof(StorageCentroidRoutePublicationHeader) +
+    static_cast<u64>(dim) * scalar_bytes;
+  const u64 entries_offset = align_up(
+    centroid_end, alignof(StorageCentroidRouteEntry));
+  const u64 entry_bytes = static_cast<u64>(live_entry_capacity) *
+    sizeof(StorageCentroidRouteEntry);
+  if (entries_offset > std::numeric_limits<u64>::max() - entry_bytes) return 0;
+  return align_up(entries_offset + entry_bytes, 64);
+}
+
+bool validate_storage_centroid_route_descriptor(
+    const StorageCentroidRouteDescriptor& descriptor,
+    u32 expected_dim, u32 expected_shards, std::string* error) {
+  const auto fail = [&](const char* message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  const auto scalar_type =
+    static_cast<CentroidScalarType>(descriptor.centroid_scalar_type);
+  const u64 expected_bytes = storage_centroid_route_publication_bytes(
+    descriptor.dim, scalar_type, descriptor.live_entry_capacity);
+  if (descriptor.magic != kStorageCentroidRouteDescriptorMagic ||
+      descriptor.version != kStorageCentroidRouteDescriptorVersion ||
+      descriptor.descriptor_bytes != sizeof(StorageCentroidRouteDescriptor) ||
+      descriptor.layout_version == 0 || descriptor.remote_offset == 0 ||
+      descriptor.remote_offset % 64 != 0 || descriptor.dim != expected_dim ||
+      descriptor.shard_count != expected_shards || expected_bytes == 0 ||
+      descriptor.publication_bytes != expected_bytes ||
+      descriptor.reserved != 0 ||
+      descriptor.remote_offset > std::numeric_limits<u64>::max() -
+        descriptor.publication_bytes) {
+    return fail("storage centroid route descriptor mismatch");
+  }
+  if (error != nullptr) error->clear();
+  return true;
+}
+
+u64 storage_centroid_route_body_checksum(span<const byte_t> publication) {
+  if (publication.size() < sizeof(StorageCentroidRoutePublicationHeader)) {
+    return 0;
+  }
+  const auto* header = reinterpret_cast<
+    const StorageCentroidRoutePublicationHeader*>(publication.data());
+  if (header->header_bytes != sizeof(StorageCentroidRoutePublicationHeader) ||
+      header->total_bytes < header->header_bytes ||
+      header->total_bytes > publication.size()) {
+    return 0;
+  }
   u64 checksum = checksum64_initial();
   checksum = checksum64_update(
-    checksum, reinterpret_cast<const byte_t*>(&publication.magic),
-    offsetof(StorageRoutePublication, body_checksum) -
-      offsetof(StorageRoutePublication, magic));
+    checksum, reinterpret_cast<const byte_t*>(&header->magic),
+    offsetof(StorageCentroidRoutePublicationHeader, body_checksum) -
+      offsetof(StorageCentroidRoutePublicationHeader, magic));
   checksum = checksum64_update(
-    checksum, reinterpret_cast<const byte_t*>(publication.slots.data()),
-    publication.slots.size() * sizeof(StorageRouteSlot));
+    checksum, publication.data() + header->header_bytes,
+    header->total_bytes - header->header_bytes);
   return checksum;
 }
 
-bool validate_storage_route_publication(
-    const StorageRoutePublication& publication, u32 expected_shard,
+const void* storage_centroid_route_centroid_data(
+    span<const byte_t> publication) {
+  if (publication.size() < sizeof(StorageCentroidRoutePublicationHeader)) {
+    return nullptr;
+  }
+  const auto* header = reinterpret_cast<
+    const StorageCentroidRoutePublicationHeader*>(publication.data());
+  if (header->centroid_offset > publication.size() ||
+      header->centroid_bytes > publication.size() - header->centroid_offset) {
+    return nullptr;
+  }
+  return publication.data() + header->centroid_offset;
+}
+
+span<const StorageCentroidRouteEntry> storage_centroid_route_entries(
+    span<const byte_t> publication) {
+  if (publication.size() < sizeof(StorageCentroidRoutePublicationHeader)) {
+    return {};
+  }
+  const auto* header = reinterpret_cast<
+    const StorageCentroidRoutePublicationHeader*>(publication.data());
+  const u64 bytes = static_cast<u64>(header->live_entry_count) *
+    sizeof(StorageCentroidRouteEntry);
+  if (header->entries_offset % alignof(StorageCentroidRouteEntry) != 0 ||
+      header->entries_offset > publication.size() ||
+      bytes > publication.size() - header->entries_offset) {
+    return {};
+  }
+  return {reinterpret_cast<const StorageCentroidRouteEntry*>(
+            publication.data() + header->entries_offset),
+          header->live_entry_count};
+}
+
+bool prepare_storage_centroid_route_publication(
+    span<byte_t> publication, u32 shard, u32 dim,
+    CentroidScalarType scalar_type, u32 live_entry_capacity,
+    u64 shard_version, u64 vector_count, const void* centroid_data,
+    span<const StorageCentroidRouteEntry> live_entries,
     std::string* error) {
   const auto fail = [&](const char* message) {
     if (error != nullptr) *error = message;
     return false;
   };
-  if (publication.sequence_begin == 0 ||
-      (publication.sequence_begin & 1u) != 0 ||
-      publication.sequence_begin != publication.sequence_end) {
-    return fail("storage route snapshot overlaps publication");
+  const u64 expected_bytes = storage_centroid_route_publication_bytes(
+    dim, scalar_type, live_entry_capacity);
+  if (expected_bytes == 0 || publication.size() != expected_bytes ||
+      shard_version == 0 || live_entries.size() > live_entry_capacity ||
+      (vector_count == 0) != live_entries.empty() ||
+      (vector_count != 0 && centroid_data == nullptr)) {
+    return fail("invalid storage centroid route publication input");
   }
-  if (publication.magic != kStorageRoutePublicationMagic ||
-      publication.version != kStorageRoutePublicationVersion ||
-      publication.header_bytes != sizeof(StorageRoutePublication) ||
-      publication.shard_id != expected_shard ||
-      publication.slot_count != kStorageRouteSlots ||
-      publication.code_bytes == 0 ||
-      publication.code_bytes > kStorageRouteMaxCodeBytes) {
-    return fail("storage route publication header mismatch");
-  }
-  if (publication.body_checksum !=
-      storage_route_body_checksum(publication)) {
-    return fail("storage route publication checksum mismatch");
-  }
-  for (const StorageRouteSlot& slot : publication.slots) {
-    if (slot.remote_node == 0) {
-      if (slot.generation == 0 && slot.id != 0) {
-        return fail("storage route publication contains an invalid empty slot");
-      }
-      continue;
+  for (size_t index = 0; index < live_entries.size(); ++index) {
+    const StorageCentroidRouteEntry& entry = live_entries[index];
+    const RemotePtr pointer{entry.remote_node};
+    if (pointer.is_null() || !pointer.is_well_formed() ||
+        pointer.memory_node() != shard ||
+        entry.flags != kStorageCentroidRouteLive) {
+      return fail("invalid storage centroid route live entry");
     }
-    // Schema-15 immutable base nodes store generation zero; online versions
-    // start at one. Both are valid canonical route representatives.
-    if (static_cast<u32>(slot.remote_node >> 48) != expected_shard) {
-      return fail("storage route publication contains an invalid live slot");
+    for (size_t prior = 0; prior < index; ++prior) {
+      if (live_entries[prior].remote_node == entry.remote_node) {
+        return fail("duplicate storage centroid route live entry");
+      }
+    }
+  }
+
+  std::fill(publication.begin(), publication.end(), byte_t{0});
+  auto* header = reinterpret_cast<
+    StorageCentroidRoutePublicationHeader*>(publication.data());
+  header->sequence = 2;
+  header->magic = kStorageCentroidRoutePublicationMagic;
+  header->version = kStorageCentroidRoutePublicationVersion;
+  header->header_bytes = sizeof(StorageCentroidRoutePublicationHeader);
+  header->total_bytes = expected_bytes;
+  header->shard_id = shard;
+  header->dim = dim;
+  header->centroid_scalar_type = static_cast<u32>(scalar_type);
+  header->live_entry_count = static_cast<u32>(live_entries.size());
+  header->live_entry_capacity = live_entry_capacity;
+  header->shard_version = shard_version;
+  header->vector_count = vector_count;
+  header->centroid_offset = sizeof(StorageCentroidRoutePublicationHeader);
+  header->centroid_bytes =
+    static_cast<u64>(dim) * centroid_scalar_bytes(scalar_type);
+  header->entries_offset = align_up(
+    static_cast<u64>(header->centroid_offset) + header->centroid_bytes,
+    alignof(StorageCentroidRouteEntry));
+  header->entries_bytes =
+    static_cast<u64>(live_entry_capacity) *
+      sizeof(StorageCentroidRouteEntry);
+  if (centroid_data != nullptr) {
+    std::memcpy(publication.data() + header->centroid_offset,
+                centroid_data, header->centroid_bytes);
+  }
+  if (!live_entries.empty()) {
+    std::memcpy(publication.data() + header->entries_offset,
+                live_entries.data(), live_entries.size() *
+                  sizeof(StorageCentroidRouteEntry));
+  }
+  header->body_checksum = storage_centroid_route_body_checksum(publication);
+  if (error != nullptr) error->clear();
+  return true;
+}
+
+bool validate_storage_centroid_route_publication(
+    span<const byte_t> publication,
+    const StorageCentroidRouteDescriptor& descriptor,
+    u32 expected_shard, std::string* error) {
+  const auto fail = [&](const char* message) {
+    if (error != nullptr) *error = message;
+    return false;
+  };
+  if (publication.size() != descriptor.publication_bytes ||
+      publication.size() < sizeof(StorageCentroidRoutePublicationHeader)) {
+    return fail("storage centroid route publication size mismatch");
+  }
+  const auto* header = reinterpret_cast<
+    const StorageCentroidRoutePublicationHeader*>(publication.data());
+  const auto scalar_type =
+    static_cast<CentroidScalarType>(header->centroid_scalar_type);
+  const u32 scalar_bytes = centroid_scalar_bytes(scalar_type);
+  const u64 expected_bytes = storage_centroid_route_publication_bytes(
+    header->dim, scalar_type, header->live_entry_capacity);
+  const u64 expected_entries_offset = align_up(
+    sizeof(StorageCentroidRoutePublicationHeader) +
+      static_cast<u64>(header->dim) * scalar_bytes,
+    alignof(StorageCentroidRouteEntry));
+  if (header->sequence == 0 || (header->sequence & 1u) != 0) {
+    return fail("storage centroid route snapshot overlaps publication");
+  }
+  if (header->magic != kStorageCentroidRoutePublicationMagic ||
+      header->version != kStorageCentroidRoutePublicationVersion ||
+      header->header_bytes != sizeof(StorageCentroidRoutePublicationHeader) ||
+      header->total_bytes != publication.size() ||
+      header->shard_id != expected_shard ||
+      header->dim != descriptor.dim ||
+      header->centroid_scalar_type != descriptor.centroid_scalar_type ||
+      header->live_entry_capacity != descriptor.live_entry_capacity ||
+      header->live_entry_count > header->live_entry_capacity ||
+      header->reserved0 != 0 || header->reserved[0] != 0 ||
+      header->reserved[1] != 0 || header->shard_version == 0 ||
+      expected_bytes != publication.size() ||
+      header->centroid_offset != sizeof(StorageCentroidRoutePublicationHeader) ||
+      header->centroid_bytes != header->dim * scalar_bytes ||
+      header->entries_offset != expected_entries_offset ||
+      header->entries_bytes != header->live_entry_capacity *
+        sizeof(StorageCentroidRouteEntry) ||
+      (header->vector_count == 0) != (header->live_entry_count == 0)) {
+    return fail("storage centroid route publication header mismatch");
+  }
+  if (header->body_checksum !=
+      storage_centroid_route_body_checksum(publication)) {
+    return fail("storage centroid route publication checksum mismatch");
+  }
+
+  const void* centroid = storage_centroid_route_centroid_data(publication);
+  if (centroid == nullptr) {
+    return fail("storage centroid route centroid range mismatch");
+  }
+  for (u32 dimension = 0; dimension < header->dim; ++dimension) {
+    const f64 value = scalar_type == CentroidScalarType::float32
+      ? static_cast<const f32*>(centroid)[dimension]
+      : static_cast<const f64*>(centroid)[dimension];
+    if (!floating_value_is_finite(value)) {
+      return fail("storage centroid route contains a non-finite centroid");
+    }
+  }
+  const auto entries = storage_centroid_route_entries(publication);
+  if (entries.size() != header->live_entry_count) {
+    return fail("storage centroid route entry range mismatch");
+  }
+  for (size_t index = 0; index < entries.size(); ++index) {
+    const RemotePtr pointer{entries[index].remote_node};
+    if (pointer.is_null() || !pointer.is_well_formed() ||
+        pointer.memory_node() != expected_shard ||
+        entries[index].flags != kStorageCentroidRouteLive) {
+      return fail("storage centroid route contains an invalid live entry");
+    }
+    for (size_t prior = 0; prior < index; ++prior) {
+      if (entries[prior].remote_node == entries[index].remote_node) {
+        return fail("storage centroid route contains duplicate live entries");
+      }
     }
   }
   if (error != nullptr) error->clear();
@@ -71,7 +282,7 @@ namespace {
 
 constexpr u64 kChecksumOffset = 1469598103934665603ULL;
 constexpr u64 kChecksumPrime = 1099511628211ULL;
-constexpr u64 kRemoteOffsetLimit = 1ull << 48;
+constexpr u64 kRemoteOffsetLimit = RemotePtr::BYTE_OFFSET_CAPACITY;
 
 void set_error(std::string* error, const std::string& value) {
   if (error != nullptr) *error = value;
@@ -85,87 +296,6 @@ u32 shard_bits_for(u32 shard_count) {
     ++bits;
   }
   return bits;
-}
-
-u64 mix64(u64 value) {
-  value += 0x9e3779b97f4a7c15ULL;
-  value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
-  value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
-  return value ^ (value >> 31);
-}
-
-void read_exact_or_throw(std::istream& input, void* destination, size_t bytes,
-                         const std::filesystem::path& path) {
-  input.read(reinterpret_cast<char*>(destination), static_cast<std::streamsize>(bytes));
-  if (static_cast<size_t>(input.gcount()) != bytes) {
-    throw std::runtime_error("short read from " + path.string());
-  }
-}
-
-bool append_anchor_entry_points(
-    const std::filesystem::path& prefix, u32 dim, VectorDType dtype,
-    u32 vector_bytes, const View& view, u32 target,
-    std::unordered_set<u32>& selected, std::vector<u32>& entry_points) {
-  const std::filesystem::path path = index_path::anchor_file(prefix);
-  std::ifstream input(path, std::ios::binary);
-  if (!input.good()) return false;
-  vamana::anchor::Header header;
-  read_exact_or_throw(input, &header, sizeof(header), path);
-  if (header.magic != vamana::anchor::kMagic ||
-      header.version != vamana::anchor::kVersion || header.dim != dim ||
-      header.shard_count != view.shards.size() ||
-      header.vector_dtype != static_cast<u32>(dtype) ||
-      header.vector_bytes != vector_bytes || header.total_anchors > (1u << 24)) {
-    throw std::runtime_error("invalid anchor sidecar for GPU entry points: " + path.string());
-  }
-  std::vector<std::vector<u32>> anchor_ordinals(view.shards.size());
-  std::vector<f32> shard_centroid(dim);
-  std::vector<byte_t> vector(vector_bytes);
-  u64 loaded = 0;
-  for (u32 shard = 0; shard < view.shards.size(); ++shard) {
-    vamana::anchor::ShardHeader shard_header;
-    read_exact_or_throw(input, &shard_header, sizeof(shard_header), path);
-    if (shard_header.shard != shard ||
-        shard_header.anchor_count > header.anchors_per_shard ||
-        loaded + shard_header.anchor_count > header.total_anchors) {
-      throw std::runtime_error("invalid anchor shard for GPU entry points: " + path.string());
-    }
-    read_exact_or_throw(input, shard_centroid.data(),
-                        shard_centroid.size() * sizeof(f32), path);
-    anchor_ordinals[shard].reserve(shard_header.anchor_count);
-    for (u32 index = 0; index < shard_header.anchor_count; ++index) {
-      vamana::anchor::EntryHeader entry;
-      read_exact_or_throw(input, &entry, sizeof(entry), path);
-      read_exact_or_throw(input, vector.data(), vector.size(), path);
-      const RemotePtr pointer{entry.rptr_raw};
-      u32 ordinal = 0;
-      if (pointer.is_null() || pointer.memory_node() != shard ||
-          !remote_to_ordinal(view, pointer, ordinal)) {
-        throw std::runtime_error("anchor points outside its static GPU shard");
-      }
-      anchor_ordinals[shard].push_back(ordinal);
-      ++loaded;
-    }
-  }
-  if (loaded != header.total_anchors) {
-    throw std::runtime_error("anchor sidecar count mismatch for GPU entry points");
-  }
-  bool appended = false;
-  for (u32 rank = 0; entry_points.size() < target; ++rank) {
-    bool have_rank = false;
-    for (u32 shard = 0; shard < anchor_ordinals.size() &&
-         entry_points.size() < target; ++shard) {
-      if (rank >= anchor_ordinals[shard].size()) continue;
-      have_rank = true;
-      const u32 ordinal = anchor_ordinals[shard][rank];
-      if (selected.insert(ordinal).second) {
-        entry_points.push_back(ordinal);
-        appended = true;
-      }
-    }
-    if (!have_rank) break;
-  }
-  return appended;
 }
 
 }  // namespace
@@ -201,6 +331,14 @@ bool validate_layout(const NavigationLayout& layout, std::string* error) {
     set_error(error, "GPU navigation layout has invalid dimensions");
     return false;
   }
+  if (layout.graph_degree > kMaxSupportedGraphDegree) {
+    set_error(error, "GPU navigation graph degree exceeds the system-wide limit");
+    return false;
+  }
+  if (layout.num_shards > RemotePtr::MEMORY_NODE_MASK + 1) {
+    set_error(error, "GPU navigation shard count exceeds tagged RemotePtr capacity");
+    return false;
+  }
   if (layout.quantizer_kind != static_cast<u32>(QuantizerKind::opq_pq) ||
       layout.pq_bits != 8 || layout.pq_subquantizers == 0 ||
       layout.dim % layout.pq_subquantizers != 0 ||
@@ -210,23 +348,20 @@ bool validate_layout(const NavigationLayout& layout, std::string* error) {
   }
   if (layout.graph_pointer_bytes != kCompactPointerBytes ||
       layout.graph_entry_bytes <
-        8 + static_cast<u64>(layout.graph_degree) * kCompactPointerBytes ||
+        vamana::hot_graph::kTaggedNeighborBaseOffset +
+          static_cast<u64>(layout.graph_degree) * kCompactPointerBytes ||
       layout.graph_entry_bytes > kMaxGraphEntryBytes ||
       layout.graph_shard_bits != shard_bits_for(layout.num_shards) ||
-      layout.graph_shard_bits >= 16) {
-    set_error(error, "GPU navigation requires compact graph records within one read block");
-    return false;
-  }
-  if (layout.medoid_ordinal >= layout.num_nodes) {
-    set_error(error, "GPU navigation layout has an invalid medoid");
+      layout.graph_shard_bits > RemotePtr::MEMORY_NODE_BITS) {
+    set_error(error, "GPU navigation requires tagged graph records within one read block");
     return false;
   }
   return true;
 }
 
 bool validate_view(const View& view, std::string* error) {
-  if (view.shards.size() != view.layout.num_shards || view.entry_points.empty() ||
-      view.entry_points.size() > kMaxEntryPoints || !validate_layout(view.layout, error)) {
+  if (view.shards.size() != view.layout.num_shards ||
+      !validate_layout(view.layout, error)) {
     if (error != nullptr && error->empty()) *error = "GPU navigation view cardinality mismatch";
     return false;
   }
@@ -260,7 +395,8 @@ bool validate_view(const View& view, std::string* error) {
         shard.dynamic_code_offset <
           shard.dynamic_hot_offset + view.layout.graph_entry_bytes ||
         shard.dynamic_code_offset > shard.dynamic_record_bytes ||
-        view.layout.code_bytes >
+        VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
+          static_cast<u64>(view.layout.code_bytes) >
           shard.dynamic_record_bytes - shard.dynamic_code_offset ||
         shard.code_remote_offset !=
           shard.control_remote_offset + kStorageControlBytes ||
@@ -275,20 +411,12 @@ bool validate_view(const View& view, std::string* error) {
     set_error(error, "GPU navigation shard ranges do not cover all nodes");
     return false;
   }
-  for (u32 entry : view.entry_points) {
-    if (entry >= view.layout.num_nodes) {
-      set_error(error, "GPU navigation layout contains an invalid entry point");
-      return false;
-    }
-  }
   return true;
 }
 
 bool synthesize_distributed_view(
     const std::filesystem::path& index_prefix, View& view,
-    const SynthesisOptions& options, bool* used_anchor_entry_points,
     std::string* error) {
-  if (used_anchor_entry_points != nullptr) *used_anchor_entry_points = false;
   try {
     const std::filesystem::path metadata_path{index_prefix.string() + ".meta.json"};
     std::ifstream metadata_input(metadata_path);
@@ -302,12 +430,18 @@ bool synthesize_distributed_view(
     if (metadata.value("schema_version", 0u) != kMetadataSchemaVersion ||
         metadata.value("distance", std::string{"l2"}) != "l2" ||
         metadata.value("node_layout", std::string{}) != "plain" ||
-        metadata.value("storage_format", std::string{}) != "vamana_compact_v1" ||
-        (quantizer != "opq_pq" && quantizer != "opq_pq16") ||
-        (navigation_format != "opq_pq_graph_v1" &&
-         navigation_format != "opq_pq16_graph_v1")) {
+        metadata.value("storage_format", std::string{}) != "vamana_tagged_v2" ||
+        metadata.value("remote_ptr_format", std::string{}) !=
+          "tagged_inc24_shard6_off34x16_v1" ||
+        metadata.value("centroid_state_format", std::string{}) !=
+          "physical_shard_centroid_v2_bound" ||
+        metadata.value("index_build_fingerprint", 0ull) == 0 ||
+        metadata.value("slot_incarnation_offset", 0u) !=
+          VamanaNode::offset_slot_incarnation() ||
+        quantizer != "opq_pq" ||
+        navigation_format != "opq_pq_graph_v1") {
       throw std::runtime_error(
-        "GPU navigation requires schema-15 compact L2 metadata with persistent dynamic PQ codes");
+        "GPU navigation requires schema-16 tagged L2 metadata with persistent dynamic PQ codes");
     }
 
     const u32 shard_count = metadata.at("num_memory_nodes").get<u32>();
@@ -325,19 +459,23 @@ bool synthesize_distributed_view(
       metadata.at("navigation_code_remote_offsets").get<std::vector<u64>>();
     const std::vector<u64> code_sizes =
       metadata.at("navigation_code_region_bytes").get<std::vector<u64>>();
+    const std::vector<u64> shard_fingerprints =
+      metadata.at("shard_build_fingerprints").get<std::vector<u64>>();
     if (shard_count == 0 || counts.size() != shard_count ||
         graph_offsets.size() != shard_count || dynamic_offsets.size() != shard_count ||
         control_offsets.size() != shard_count || dynamic_node_offsets.size() != shard_count ||
-        code_offsets.size() != shard_count || code_sizes.size() != shard_count) {
+        code_offsets.size() != shard_count || code_sizes.size() != shard_count ||
+        shard_fingerprints.size() != shard_count ||
+        std::find(shard_fingerprints.begin(), shard_fingerprints.end(), 0) !=
+          shard_fingerprints.end()) {
       throw std::runtime_error("GPU navigation metadata has invalid shard arrays");
     }
 
     View synthesized;
     synthesized.layout.dim = metadata.at("dim").get<u32>();
     synthesized.layout.graph_degree = metadata.at("R").get<u32>();
-    const VectorDType dtype = parse_vector_dtype(
-      metadata.value("vector_data_type", std::string{"float32"}));
-    synthesized.layout.vector_dtype = static_cast<u32>(dtype);
+    synthesized.layout.vector_dtype = static_cast<u32>(parse_vector_dtype(
+      metadata.value("vector_data_type", std::string{"float32"})));
     synthesized.layout.quantizer_kind = static_cast<u32>(QuantizerKind::opq_pq);
     synthesized.layout.pq_subquantizers = metadata.at("pq_subquantizers").get<u32>();
     synthesized.layout.pq_bits = metadata.at("pq_bits").get<u32>();
@@ -355,6 +493,11 @@ bool synthesize_distributed_view(
     const u32 dynamic_record_bytes = metadata.at("hot_graph_dynamic_record_bytes").get<u32>();
     const u32 dynamic_hot_offset = metadata.at("hot_graph_dynamic_hot_offset").get<u32>();
     const u32 dynamic_code_offset = metadata.at("dynamic_navigation_code_offset").get<u32>();
+    if (metadata.value("dynamic_navigation_code_validation_bytes", 0u) !=
+        VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES) {
+      throw std::runtime_error(
+        "GPU navigation metadata lacks dynamic slot-incarnation validation");
+    }
     u64 node_count = 0;
     for (u32 shard = 0; shard < shard_count; ++shard) {
       const u64 expected_control_offset = align_up(dynamic_offsets[shard], 64);
@@ -392,52 +535,10 @@ bool synthesize_distributed_view(
     }
     synthesized.layout.num_nodes = node_count;
 
-    const auto& medoid = metadata.at("medoid");
-    const RemotePtr medoid_pointer{
-      medoid.at("memory_node").get<u32>(), medoid.at("offset").get<u64>()};
-    if (!remote_to_ordinal(synthesized, medoid_pointer,
-                           synthesized.layout.medoid_ordinal)) {
-      throw std::runtime_error("GPU navigation metadata has an invalid medoid");
-    }
-
-    const u32 requested_entry_points = options.entry_points == 0
-      ? metadata.value("navigation_entry_points", 256u) : options.entry_points;
-    if (requested_entry_points == 0 || requested_entry_points > kMaxEntryPoints) {
-      throw std::runtime_error("GPU entry-point count must be in [1, 512]");
-    }
-    const u32 target = static_cast<u32>(std::min<u64>(requested_entry_points, node_count));
-    std::unordered_set<u32> selected;
-    selected.insert(synthesized.layout.medoid_ordinal);
-    synthesized.entry_points.push_back(synthesized.layout.medoid_ordinal);
-    const bool used_anchors = append_anchor_entry_points(
-      index_prefix, synthesized.layout.dim, dtype,
-      metadata.at("vector_bytes").get<u32>(), synthesized, target,
-      selected, synthesized.entry_points);
-    // The anchor-free fallback must not fill the table from the first shard
-    // before later shards get a chance to contribute.  Walk shards at every
-    // sample rank so the fixed entry set remains balanced even when the
-    // requested count is smaller than one shard's sampling budget.
-    const u32 quota = (target + shard_count - 1) / shard_count;
-    for (u32 sample = 0; sample < quota * 16 &&
-         synthesized.entry_points.size() < target; ++sample) {
-      for (u32 shard = 0; shard < shard_count &&
-           synthesized.entry_points.size() < target; ++shard) {
-        const u64 slot = mix64(options.seed ^
-          (static_cast<u64>(shard) << 32) ^ sample) % counts[shard];
-        const u32 ordinal = static_cast<u32>(
-          synthesized.shards[shard].ordinal_base + slot);
-        if (selected.insert(ordinal).second) synthesized.entry_points.push_back(ordinal);
-      }
-    }
-    for (u32 ordinal = 0; synthesized.entry_points.size() < target &&
-         ordinal < node_count; ++ordinal) {
-      if (selected.insert(ordinal).second) synthesized.entry_points.push_back(ordinal);
-    }
     std::string validation_error;
     if (!validate_view(synthesized, &validation_error)) {
       throw std::runtime_error(validation_error);
     }
-    if (used_anchor_entry_points != nullptr) *used_anchor_entry_points = used_anchors;
     view = std::move(synthesized);
     return true;
   } catch (const std::exception& exception) {
@@ -454,7 +555,13 @@ bool validate_code_header(const CodeHeader& header, std::string* error) {
   }
   if (header.quantizer_kind != static_cast<u32>(QuantizerKind::opq_pq) ||
       header.entry_count == 0 || header.node_size == 0 || header.remote_offset == 0 ||
-      header.code_bytes == 0 || header.model_checksum == 0 ||
+      header.code_bytes == 0 ||
+      header.vector_dtype > static_cast<u32>(VectorDType::int8) ||
+      header.model_checksum == 0 || header.build_fingerprint == 0 ||
+      header.shard_fingerprint == 0 || header.reserved[0] != 0 ||
+      header.reserved[1] != 0 ||
+      header.entry_count >
+        std::numeric_limits<u64>::max() / header.code_bytes ||
       header.payload_bytes != header.entry_count * header.code_bytes) {
     set_error(error, "invalid GPU PQ code sidecar dimensions");
     return false;
@@ -520,7 +627,8 @@ bool ordinal_to_remote(const View& view, u32 ordinal, RemotePtr& pointer) {
 }
 
 bool remote_to_ordinal(const View& view, RemotePtr pointer, u32& ordinal) {
-  if (pointer.is_null() || pointer.memory_node() >= view.shards.size()) return false;
+  if (pointer.is_null() || pointer.incarnation() != 0 ||
+      pointer.memory_node() >= view.shards.size()) return false;
   const ShardRegion& shard = view.shards[pointer.memory_node()];
   if (pointer.byte_offset() < shard.node_base_offset || shard.node_stride == 0) return false;
   const u64 relative = pointer.byte_offset() - shard.node_base_offset;

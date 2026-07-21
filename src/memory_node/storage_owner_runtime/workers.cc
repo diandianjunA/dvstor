@@ -22,13 +22,19 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
     : service::storage_owner::insert_batch_request_bytes(request->item_count);
   lib_assert(request->item_count == task.item_count &&
                request->batch_id == task.batch_id &&
-               request->anchor_hint_count == 0 &&
+               request->protocol_version ==
+                 service::storage_owner::kMutationProtocolVersion &&
                task.byte_len >= expected_bytes,
              "storage-owner request slot changed before task execution");
 
   const node_t* ids = mutation
     ? service::storage_owner::mutation_request_ids(payload)
     : service::storage_owner::request_ids(payload);
+  const u32* stage1_homes = mutation
+    ? service::storage_owner::mutation_request_stage1_homes(
+        payload, request->item_count)
+    : service::storage_owner::request_stage1_homes(
+        payload, request->item_count);
   const byte_t* vectors = mutation
     ? service::storage_owner::mutation_request_vectors(payload, request->item_count)
     : service::storage_owner::request_vectors(payload, request->item_count);
@@ -57,24 +63,15 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
     std::chrono::duration_cast<std::chrono::nanoseconds>(
       process_started - task.received_at).count());
 
-  const bool local_stage1 = storage_owner_batch_is_local_stage1(config);
-  const bool ok = local_stage1
-    ? execute_storage_owner_batch_items(
+  const bool ok = execute_storage_owner_batch_items(
         ids,
         scratch.kinds.data(),
         scratch.decoded_vectors.data(),
+        vectors,
+        stage1_homes,
+        request->source_client,
+        request->batch_id,
         request->item_count,
-        breakdown,
-        config,
-        &scratch.invalidated_neighbors,
-        &scratch.statuses,
-        &scratch.results)
-    : execute_storage_owner_batch_items_async(
-        ids,
-        scratch.kinds.data(),
-        scratch.decoded_vectors.data(),
-        request->item_count,
-        *current_storage_owner_thread_,
         breakdown,
         config,
         &scratch.invalidated_neighbors,

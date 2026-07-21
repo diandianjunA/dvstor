@@ -120,6 +120,11 @@ idmap_file() {
   echo "${INDEX_PREFIX}_node${node_id}_of${SHARDS}.idmap"
 }
 
+centroid_file() {
+  local node_id="${1:?node id is required}"
+  echo "${INDEX_PREFIX}_node${node_id}_of${SHARDS}.centroid"
+}
+
 navigation_code_file() {
   local node_id="${1:?node id is required}"
   echo "${INDEX_PREFIX}_node${node_id}_of${SHARDS}.pq${PQ_SUBQUANTIZERS}.codes"
@@ -128,13 +133,7 @@ navigation_code_file() {
 validate_index_metadata() {
   local role="${1:-compute}"
   local node_id="${2:-0}"
-  local require_update_sidecars="${3:-true}"
   local metadata
-  if [[ "$require_update_sidecars" != "true" &&
-        "$require_update_sidecars" != "false" ]]; then
-    echo "require_update_sidecars must be true or false: $require_update_sidecars" >&2
-    return 1
-  fi
   metadata="$(metadata_file)"
   if [[ ! -s "$metadata" ]]; then
     echo "missing index metadata: $metadata" >&2
@@ -154,10 +153,11 @@ with open(path, 'r', encoding='utf-8') as stream:
 
 expected = {
     'output_prefix': prefix,
-    'schema_version': 15,
+    'schema_version': 16,
     'distance': 'l2',
     'node_layout': 'plain',
-    'storage_format': 'vamana_compact_v1',
+    'storage_format': 'vamana_tagged_v2',
+    'remote_ptr_format': 'tagged_inc24_shard6_off34x16_v1',
     'navigation_execution': 'gpu_beam_v1',
     'R': int(degree),
     'beam_width_construction': int(build_beam),
@@ -170,18 +170,30 @@ expected = {
     'pq_bits': 8,
     'partition_strategy': partition_strategy,
     'partition_max_degree': int(partition_max_degree),
-    'idmap_format': 'owner_sharded_v1',
+    'idmap_format': 'owner_sharded_v2_bound',
+    'centroid_state_format': 'physical_shard_centroid_v2_bound',
+    'hot_graph_pointer_bytes': 8,
 }
 errors = [
     f'{key}: metadata={metadata.get(key)!r}, expected={value!r}'
     for key, value in expected.items() if metadata.get(key) != value
 ]
-if metadata.get('navigation_quantizer') not in ('opq_pq', 'opq_pq16'):
+if metadata.get('navigation_quantizer') != 'opq_pq':
     errors.append('navigation_quantizer must be opq_pq')
-if metadata.get('navigation_format') not in ('opq_pq_graph_v1', 'opq_pq16_graph_v1'):
+if metadata.get('navigation_format') != 'opq_pq_graph_v1':
     errors.append('navigation_format must be opq_pq_graph_v1')
 if not metadata.get('navigation_model_checksum'):
     errors.append('navigation_model_checksum is missing')
+if not metadata.get('index_build_fingerprint'):
+    errors.append('index_build_fingerprint is missing')
+shard_fingerprints = metadata.get('shard_build_fingerprints')
+if (not isinstance(shard_fingerprints, list) or
+        len(shard_fingerprints) != int(shards) or
+        any(not isinstance(value, int) or value == 0
+            for value in shard_fingerprints)):
+    errors.append('shard_build_fingerprints must bind every storage shard')
+if 'medoid' in metadata or 'navigation_entry_points' in metadata:
+    errors.append('runtime metadata must not contain static query entry state')
 for key in (
     'hot_graph_offsets',
     'hot_graph_entry_counts',
@@ -194,8 +206,6 @@ for key in (
     value = metadata.get(key)
     if not isinstance(value, list) or len(value) != int(shards):
         errors.append(f'{key} must contain one value per storage shard')
-if metadata.get('anchor_format') != 'owner_anchor_v1':
-    errors.append('owner_anchor_v1 static query bootstrap format is required')
 dynamic_hot = metadata.get('hot_graph_dynamic_hot_offset', 0)
 graph_entry = metadata.get('hot_graph_entry_size', 0)
 dynamic_code = metadata.get('dynamic_navigation_code_offset', 0)
@@ -216,31 +226,13 @@ PY_VALIDATE
       echo "missing OPQ/PQ${PQ_SUBQUANTIZERS} model: $(model_file)" >&2
       return 1
     fi
-    if [[ ! -s "${INDEX_PREFIX}.anchors" ]]; then
-      echo "missing static query bootstrap routes: ${INDEX_PREFIX}.anchors" >&2
-      return 1
-    fi
-    if [[ "$require_update_sidecars" == "true" ]]; then
-      local missing_idmaps=()
-      local current
-      for ((current = 1; current <= SHARDS; ++current)); do
-        if [[ ! -s "$(idmap_file "$current")" ]]; then
-          missing_idmaps+=("$(idmap_file "$current")")
-        fi
-      done
-      if ((${#missing_idmaps[@]} != 0)); then
-        echo "missing compute owner-idmap sidecars:" >&2
-        printf '  - %s\n' "${missing_idmaps[@]}" >&2
-        echo "copy all ${SHARDS} owner idmap sidecars to the resolved index prefix; index rebuild is not required" >&2
-        return 1
-      fi
-    fi
   elif [[ "$role" == "storage" ]]; then
     local first=1 last="$SHARDS"
     if ((node_id > 0)); then first="$node_id"; last="$node_id"; fi
     local current
     for ((current = first; current <= last; ++current)); do
       for artifact in "$(shard_file "$current")" "$(idmap_file "$current")" \
+                      "$(centroid_file "$current")" \
                       "$(navigation_code_file "$current")"; do
         if [[ ! -s "$artifact" ]]; then
           echo "missing storage artifact: $artifact" >&2
@@ -293,7 +285,7 @@ write_service_config() {
     return 1
   fi
   endpoints="$(server_endpoints)"
-  validate_index_metadata compute 0 "$enable_updates"
+  validate_index_metadata compute
 
   {
     echo "servers = $endpoints"
@@ -322,20 +314,14 @@ write_service_config() {
     echo "gpu-query-slots = ${GPU_QUERY_SLOTS:-256}"
     echo "gpu-memory-limit-gb = ${GPU_MEMORY_LIMIT_GB:-40}"
     echo "gpu-memory-reserve-gb = ${GPU_MEMORY_RESERVE_GB:-4}"
-    echo "gpu-resident-pq-budget-mb = ${GPU_RESIDENT_PQ_BUDGET_MB:-4096}"
     echo "gpu-bootstrap-window-mb = ${GPU_BOOTSTRAP_WINDOW_MB:-64}"
     echo "gpu-bootstrap-windows = ${GPU_BOOTSTRAP_WINDOWS:-4}"
     echo "gpu-graph-prefetch-depth = ${GPU_GRAPH_PREFETCH_DEPTH:-32}"
     echo "gpu-traversal-beam-width = ${GPU_TRAVERSAL_BEAM_WIDTH:-128}"
     echo "gpu-final-rerank-width = ${GPU_FINAL_RERANK_WIDTH:-128}"
     echo "gpu-max-expansions = ${GPU_MAX_EXPANSIONS:-384}"
-    echo "gpu-entry-seed-count = ${GPU_ENTRY_SEED_COUNT:-32}"
-    echo "gpu-delta-anchor-probes = ${GPU_DELTA_ANCHOR_PROBES:-32}"
     echo "gpu-rdma-qps = ${GPU_RDMA_QPS:-32}"
     echo "gpu-persistent-blocks-per-sm = ${GPU_PERSISTENT_BLOCKS_PER_SM:-4}"
-    echo "update-visibility-us = ${UPDATE_VISIBILITY_US:-10000}"
-    echo "delta-budget-mb = ${DELTA_BUDGET_MB:-256}"
-    echo "gpu-delta-maintenance-period-ms = ${GPU_DELTA_MAINTENANCE_PERIOD_MS:-10}"
     echo "storage-id = 0"
     echo "storage-peers = $endpoints"
     echo "storage-owner-batch-max = ${STORAGE_OWNER_BATCH_MAX:-32}"
@@ -343,10 +329,7 @@ write_service_config() {
     echo "storage-owner-rpc-depth = ${STORAGE_OWNER_RPC_DEPTH:-16}"
     echo "storage-owner-rpc-timeout-ms = ${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}"
     echo "storage-owner-search-snapshot-batch = ${STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH:-64}"
-    echo "storage-owner-update-mode = ${STORAGE_OWNER_UPDATE_MODE:-local_stitch}"
-    echo "storage-owner-maintenance-mode = ${STORAGE_OWNER_MAINTENANCE_MODE:-finalize}"
     echo "storage-owner-maintenance-workers = ${STORAGE_OWNER_MAINTENANCE_WORKERS:-8}"
-    echo "storage-owner-reverse-mode = ${STORAGE_OWNER_REVERSE_MODE:-async}"
     echo "storage-owner-reverse-queue-depth = ${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
     echo "storage-owner-reverse-coalesce-max = ${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}"
   } > "$output"

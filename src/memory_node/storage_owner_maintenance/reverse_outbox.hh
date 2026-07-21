@@ -46,7 +46,7 @@ struct Stage2ReverseCompletion {
   std::uint32_t peer_index{};
 };
 
-// One schema-15 request. A locally retained member list maps its single wire
+// One bounded peer request. A locally retained member list maps its single wire
 // request_id back to every contributing stage2 context when the aggregate ACK
 // arrives. Retries resend this exact ID and exact copied payload.
 struct Stage2ReverseAggregate {

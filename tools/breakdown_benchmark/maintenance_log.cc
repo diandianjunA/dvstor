@@ -52,7 +52,7 @@ std::optional<double> parse_double(const Fields& fields, const char* key) {
 
 std::optional<std::array<uint64_t, kMaintenanceLatencyBucketCount>>
 parse_histogram(const Fields& fields) {
-  const auto iterator = fields.find("stitch_delay_histogram");
+  const auto iterator = fields.find("stage2_delay_histogram");
   if (iterator == fields.end()) return std::nullopt;
 
   std::array<uint64_t, kMaintenanceLatencyBucketCount> histogram{};
@@ -108,10 +108,10 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
     position = end + 1;
   }
 
-  const auto stitch_enqueued = parse_u64(fields, "stitch_enqueued");
-  const auto stitched_live = parse_u64(fields, "stitched_live");
+  const auto stage2_enqueued = parse_u64(fields, "stage2_enqueued");
+  const auto stage2_finalized_live = parse_u64(fields, "stage2_finalized_live");
   const auto remaining = parse_u64(fields, "remaining");
-  if (!stitch_enqueued || !stitched_live || !remaining) {
+  if (!stage2_enqueued || !stage2_finalized_live || !remaining) {
     return std::nullopt;
   }
   const auto failed = parse_u64(fields, "failed");
@@ -119,10 +119,30 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
   const auto admission_window = parse_u64(fields, "admission_window");
   const auto completion_outstanding =
     parse_u64(fields, "completion_outstanding");
+  const auto stage2_continuations =
+    parse_u64(fields, "stage2_continuations");
+  const auto stage2_remote_frontier_items =
+    parse_u64(fields, "stage2_remote_frontier_items");
+  const auto stage2_remote_expansions =
+    parse_u64(fields, "stage2_remote_expansions");
+  const auto stage2_scored_candidates =
+    parse_u64(fields, "stage2_scored_candidates");
+  const auto stage2_migrations =
+    parse_u64(fields, "stage2_migrations");
+  const auto stage2_final_edges =
+    parse_u64(fields, "stage2_final_edges");
+  const auto stage2_cross_edges_stage1_home =
+    parse_u64(fields, "stage2_cross_edges_stage1_home");
+  const auto stage2_cross_edges_final_home =
+    parse_u64(fields, "stage2_cross_edges_final_home");
+  const auto stage1_search_budget_exhausted =
+    parse_u64(fields, "stage1_search_budget_exhausted");
+  const auto stage2_search_budget_exhausted =
+    parse_u64(fields, "stage2_search_budget_exhausted");
   const auto histogram = parse_histogram(fields);
   return MaintenanceObservation{
-    .stitch_enqueued = *stitch_enqueued,
-    .stitched_live = *stitched_live,
+    .stage2_enqueued = *stage2_enqueued,
+    .stage2_finalized_live = *stage2_finalized_live,
     .stale = parse_u64(fields, "stale").value_or(0),
     .remaining = *remaining,
     .peer_reverse_remaining =
@@ -131,18 +151,43 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
     .peer_reverse_failed = peer_reverse_failed.value_or(0),
     .admission_window = admission_window.value_or(0),
     .completion_outstanding = completion_outstanding.value_or(0),
-    .p99_stitch_delay_upper_ms =
-      parse_double(fields, "p99_stitch_delay_upper_ms").value_or(0.0),
-    .p99_stitch_delay_over_30s =
-      fields.contains("p99_stitch_delay_over_30s") &&
-      fields.at("p99_stitch_delay_over_30s") == "true",
-    .stitch_delay_histogram = histogram.value_or(
+    .stage2_continuations = stage2_continuations.value_or(0),
+    .stage2_remote_frontier_items =
+      stage2_remote_frontier_items.value_or(0),
+    .stage2_remote_expansions = stage2_remote_expansions.value_or(0),
+    .stage2_scored_candidates = stage2_scored_candidates.value_or(0),
+    .stage2_migrations = stage2_migrations.value_or(0),
+    .stage2_final_edges = stage2_final_edges.value_or(0),
+    .stage2_cross_edges_stage1_home =
+      stage2_cross_edges_stage1_home.value_or(0),
+    .stage2_cross_edges_final_home =
+      stage2_cross_edges_final_home.value_or(0),
+    .stage1_search_budget_exhausted =
+      stage1_search_budget_exhausted.value_or(0),
+    .stage2_search_budget_exhausted =
+      stage2_search_budget_exhausted.value_or(0),
+    .p99_stage2_delay_upper_ms =
+      parse_double(fields, "p99_stage2_delay_upper_ms").value_or(0.0),
+    .p99_stage2_delay_over_30s =
+      fields.contains("p99_stage2_delay_over_30s") &&
+      fields.at("p99_stage2_delay_over_30s") == "true",
+    .stage2_delay_histogram = histogram.value_or(
       std::array<uint64_t, kMaintenanceLatencyBucketCount>{}),
     .failure_counters_available = failed.has_value() &&
       peer_reverse_failed.has_value(),
-    .stitch_delay_histogram_available = histogram.has_value(),
+    .stage2_delay_histogram_available = histogram.has_value(),
     .completion_window_available = admission_window.has_value() &&
       completion_outstanding.has_value(),
+    .locality_counters_available = stage2_continuations.has_value() &&
+      stage2_remote_frontier_items.has_value() &&
+      stage2_remote_expansions.has_value() &&
+      stage2_scored_candidates.has_value() &&
+      stage2_migrations.has_value() && stage2_final_edges.has_value() &&
+      stage2_cross_edges_stage1_home.has_value() &&
+      stage2_cross_edges_final_home.has_value(),
+    .search_budget_counters_available =
+      stage1_search_budget_exhausted.has_value() &&
+      stage2_search_budget_exhausted.has_value(),
   };
 }
 
@@ -259,7 +304,7 @@ void include_histogram_p99(
     const std::array<uint64_t, kMaintenanceLatencyBucketCount>& histogram,
     MaintenanceLogSummary* summary) {
   const uint64_t samples = histogram_sample_count(histogram);
-  summary->p99_stitch_delay_samples += samples;
+  summary->p99_stage2_delay_samples += samples;
   if (samples == 0) return;
 
   const uint64_t target = samples - samples / 100;
@@ -271,11 +316,11 @@ void include_histogram_p99(
   }
   const bool over_30s = bucket >= histogram.size() - 1;
   const size_t finite_bucket = std::min(bucket, histogram.size() - 2);
-  summary->p99_stitch_delay_upper_ms = std::max(
-    summary->p99_stitch_delay_upper_ms,
+  summary->p99_stage2_delay_upper_ms = std::max(
+    summary->p99_stage2_delay_upper_ms,
     kMaintenanceLatencyBucketUpperMs[finite_bucket]);
-  summary->p99_stitch_delay_over_30s =
-    summary->p99_stitch_delay_over_30s || over_30s;
+  summary->p99_stage2_delay_over_30s =
+    summary->p99_stage2_delay_over_30s || over_30s;
 }
 
 std::optional<uint64_t> find_end_offset(
@@ -344,13 +389,76 @@ MaintenanceLogSummary summarize_impl(
     }
 
     if (!slice.rotated && cursor.baseline_available &&
-        cursor.baseline.stitch_delay_histogram_available &&
-        latest.stitch_delay_histogram_available) {
+        cursor.baseline.stage2_delay_histogram_available &&
+        latest.stage2_delay_histogram_available) {
       std::array<uint64_t, kMaintenanceLatencyBucketCount> delta{};
-      if (histogram_delta(cursor.baseline.stitch_delay_histogram,
-                          latest.stitch_delay_histogram, &delta)) {
+      if (histogram_delta(cursor.baseline.stage2_delay_histogram,
+                          latest.stage2_delay_histogram, &delta)) {
         ++summary.logs_with_histogram_deltas;
         include_histogram_p99(delta, &summary);
+      }
+    }
+
+    if (!slice.rotated && cursor.baseline_available &&
+        cursor.baseline.locality_counters_available &&
+        latest.locality_counters_available) {
+      uint64_t finalized = 0;
+      uint64_t continuations = 0;
+      uint64_t frontier = 0;
+      uint64_t expansions = 0;
+      uint64_t scored = 0;
+      uint64_t migrations = 0;
+      uint64_t final_edges = 0;
+      uint64_t cross_before = 0;
+      uint64_t cross_after = 0;
+      const bool valid =
+        counter_delta(cursor.baseline.stage2_finalized_live,
+                      latest.stage2_finalized_live, &finalized) &&
+        counter_delta(cursor.baseline.stage2_continuations,
+                      latest.stage2_continuations, &continuations) &&
+        counter_delta(cursor.baseline.stage2_remote_frontier_items,
+                      latest.stage2_remote_frontier_items, &frontier) &&
+        counter_delta(cursor.baseline.stage2_remote_expansions,
+                      latest.stage2_remote_expansions, &expansions) &&
+        counter_delta(cursor.baseline.stage2_scored_candidates,
+                      latest.stage2_scored_candidates, &scored) &&
+        counter_delta(cursor.baseline.stage2_migrations,
+                      latest.stage2_migrations, &migrations) &&
+        counter_delta(cursor.baseline.stage2_final_edges,
+                      latest.stage2_final_edges, &final_edges) &&
+        counter_delta(cursor.baseline.stage2_cross_edges_stage1_home,
+                      latest.stage2_cross_edges_stage1_home,
+                      &cross_before) &&
+        counter_delta(cursor.baseline.stage2_cross_edges_final_home,
+                      latest.stage2_cross_edges_final_home, &cross_after);
+      if (valid) {
+        ++summary.logs_with_locality_deltas;
+        summary.stage2_finalized_live += finalized;
+        summary.stage2_continuations += continuations;
+        summary.stage2_remote_frontier_items += frontier;
+        summary.stage2_remote_expansions += expansions;
+        summary.stage2_scored_candidates += scored;
+        summary.stage2_migrations += migrations;
+        summary.stage2_final_edges += final_edges;
+        summary.stage2_cross_edges_stage1_home += cross_before;
+        summary.stage2_cross_edges_final_home += cross_after;
+      }
+    }
+
+    if (!slice.rotated && cursor.baseline_available &&
+        cursor.baseline.search_budget_counters_available &&
+        latest.search_budget_counters_available) {
+      uint64_t stage1_exhausted = 0;
+      uint64_t stage2_exhausted = 0;
+      if (counter_delta(cursor.baseline.stage1_search_budget_exhausted,
+                        latest.stage1_search_budget_exhausted,
+                        &stage1_exhausted) &&
+          counter_delta(cursor.baseline.stage2_search_budget_exhausted,
+                        latest.stage2_search_budget_exhausted,
+                        &stage2_exhausted)) {
+        ++summary.logs_with_search_budget_deltas;
+        summary.stage1_search_budget_exhausted += stage1_exhausted;
+        summary.stage2_search_budget_exhausted += stage2_exhausted;
       }
     }
   }
@@ -360,21 +468,25 @@ MaintenanceLogSummary summarize_impl(
     summary.logs_with_failure_deltas == summary.requested_logs;
   summary.completion_window_available = summary.requested_logs != 0 &&
     summary.logs_with_completion_window == summary.requested_logs;
-  summary.p99_stitch_delay_available = summary.requested_logs != 0 &&
+  summary.locality_delta_available = summary.requested_logs != 0 &&
+    summary.logs_with_locality_deltas == summary.requested_logs;
+  summary.search_budget_delta_available = summary.requested_logs != 0 &&
+    summary.logs_with_search_budget_deltas == summary.requested_logs;
+  summary.p99_stage2_delay_available = summary.requested_logs != 0 &&
     summary.logs_with_histogram_deltas == summary.requested_logs &&
-    summary.p99_stitch_delay_samples != 0;
+    summary.p99_stage2_delay_samples != 0;
   return summary;
 }
 
 }  // namespace
 
 uint64_t MaintenanceObservation::backlog() const {
-  const uint64_t completed = stitched_live + stale;
-  const uint64_t unfinished_stitches =
-    stitch_enqueued > completed ? stitch_enqueued - completed : 0;
+  const uint64_t completed = stage2_finalized_live + stale;
+  const uint64_t unfinished_stage2 =
+    stage2_enqueued > completed ? stage2_enqueued - completed : 0;
   // These counters overlap for in-flight work. Taking the maximum avoids
   // double-counting while still covering queued, in-flight, and reverse work.
-  return std::max({unfinished_stitches, remaining, peer_reverse_remaining});
+  return std::max({unfinished_stage2, remaining, peer_reverse_remaining});
 }
 
 std::vector<MaintenanceLogCursor> snapshot_maintenance_logs(
@@ -398,7 +510,8 @@ std::vector<MaintenanceLogCursor> snapshot_maintenance_logs(
       } else if (cursor.offset == 0) {
         // An empty, readable log represents a fresh zero-counter baseline.
         cursor.baseline.failure_counters_available = true;
-        cursor.baseline.stitch_delay_histogram_available = true;
+        cursor.baseline.stage2_delay_histogram_available = true;
+        cursor.baseline.locality_counters_available = true;
         cursor.baseline_available = true;
       }
     }

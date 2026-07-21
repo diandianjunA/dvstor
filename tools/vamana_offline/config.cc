@@ -7,6 +7,9 @@
 #include <boost/program_options.hpp>
 #include <library/utils.hh>
 
+#include "common/constants.hh"
+#include "remote_pointer.hh"
+
 namespace po = boost::program_options;
 
 namespace tools::vamana_offline {
@@ -53,10 +56,7 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     ("query-path", po::value<filepath_t>(&config.query_path),
      "Path to query file (.fbin) for post-build recall test.")
     ("groundtruth-path", po::value<filepath_t>(&config.groundtruth_path),
-     "Path to ground truth file (.bin) for post-build recall test.")
-    ("anchor-count-per-shard",
-     po::value<u32>(&config.anchor_count_per_shard)->default_value(config.anchor_count_per_shard),
-     "Representative anchors written per shard. 0 disables the anchor sidecar.");
+     "Path to ground truth file (.bin) for post-build recall test.");
 
   po::variables_map vm;
   po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -70,7 +70,12 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
 
   if (config.data_path.empty()) lib_failure("--data-path is required");
   if (config.num_memory_nodes == 0) lib_failure("--memory-nodes must be > 0");
+  if (config.num_memory_nodes > RemotePtr::MEMORY_NODE_MASK + 1)
+    lib_failure("--memory-nodes exceeds the 64-shard tagged pointer limit");
   if (config.R == 0) lib_failure("--R must be > 0");
+  if (config.R > kMaxSupportedGraphDegree)
+    lib_failure("--R exceeds the system-wide degree limit of " +
+                std::to_string(kMaxSupportedGraphDegree));
   if (config.vector_data_type != "auto") {
     try {
       (void)parse_vector_dtype(config.vector_data_type);

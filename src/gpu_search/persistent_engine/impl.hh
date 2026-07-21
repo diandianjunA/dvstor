@@ -30,8 +30,9 @@
 #include <vector>
 
 #include "common/index_path.hh"
-#include "gpu_search/dynamic_route_overlay.hh"
+#include "gpu_search/centroid_route_poll_policy.hh"
 #include "gpu_search/persistent_engine.hh"
+#include "gpu_search/centroid_home_selector.hh"
 #include "gpu_search/navigation_bootstrapper.hh"
 #ifdef DVSTOR_HAVE_GPUNETIO
 #include "gpu/gpunetio_transport.hh"
@@ -41,26 +42,9 @@
 #include "gpu_search/memory_budget.hh"
 #include "gpu_search/pq_index.hh"
 #include "gpu_search/persistent_kernel.hh"
-#include "vamana/anchor_index.hh"
 #include "vamana/vamana_node.hh"
 
 namespace gpu_search {
-
-namespace persistent_engine_detail {
-
-struct AnchorTable {
-  u32 dim{};
-  std::vector<f32> vectors;
-  std::vector<u32> handles;
-  std::vector<u64> raw_pointers;
-  std::vector<u32> shard_offsets;
-
-  u32 count() const {
-    return dim == 0 ? 0 : static_cast<u32>(vectors.size() / dim);
-  }
-};
-
-}  // namespace persistent_engine_detail
 
 struct PersistentSearchEngine::Impl {
   struct PendingQuery {
@@ -74,28 +58,29 @@ struct PersistentSearchEngine::Impl {
     std::chrono::steady_clock::time_point enqueued_at{};
   };
 
-  struct RetiredDeltaBatch {
-    u64 query_ticket_barrier{};
-    std::vector<u32> slots;
+  struct CentroidRouteSnapshot {
+    u64 publication_sequence{};
+    u64 body_checksum{};
+    u64 version{};
+    u64 vector_count{};
+    // Canonical route representation shared by CPU update routing and GPU
+    // query routing. Storage-side centroid maintenance still uses FP64 sums.
+    std::vector<f32> centroid;
+    std::array<DeviceCentroidRouteEntry,
+               kCentroidRouteMaxLiveEntries> entries{};
+    u32 live_entry_count{};
   };
 
-  struct RetiredResidentPqBatch {
-    u64 query_ticket_barrier{};
-    std::vector<ResidentPqEraseUpdate> entries;
+  struct CentroidRouteReadResult {
+    std::vector<u32> shards;
+    std::vector<CentroidRouteSnapshot> snapshots;
+    bool transient{};
   };
 
-  struct PendingStorageReclaimAck {
-    u64 maintenance_sequence{};
-    u64 query_ticket_barrier{};
-  };
-
-  struct DurableRetirement {
-    node_t id{};
-    service::storage_owner::MutationKind kind{
-      service::storage_owner::MutationKind::insert};
-    u64 epoch{};
-    u64 remote_node{};
-    u64 old_remote_node{};
+  enum class StorageRouteSyncResult : u8 {
+    unchanged,
+    changed,
+    transient,
   };
 
   Impl(PersistentSearchEngine& owner,
@@ -114,63 +99,41 @@ struct PersistentSearchEngine::Impl {
   void bind_cuda_device(const char* operation) const;
 
   void stream_codes_to_gpu(NavigationBootstrapper& source);
-  void stream_anchor_graph_to_gpu(NavigationBootstrapper& source);
-  void clear_delta_device_state(cudaStream_t stream = nullptr);
   void start_persistent_kernel();
   void stop_persistent_kernel();
 
   service::QueryResult search(VectorDType query_dtype,
                               const byte_t* query_data, u32 k);
+  std::optional<u32> select_centroid_home(
+    std::span<const f32> vector) const;
   void admission_loop();
   void report_direct_path_failure();
   void completion_loop();
 
-  void decode_mutation_payload(const DeltaMutation& mutation,
-                               std::vector<f32>& decoded) const;
-  u32 nearest_anchor(const std::vector<f32>& vector, u64 remote_node) const;
-  u64 graph_record_key(u64 raw) const;
-  std::vector<u64> anchor_graph_invalidation_keys(
-    std::span<const u64> raw_nodes) const;
-  void refresh_anchor_graph_records(std::span<const u64> invalidation_keys);
-
-  void submit_delta_publication(const DeltaPublishDescriptor& descriptor);
-  size_t active_resident_pq_slots_locked() const;
-  u32 allocate_resident_pq_slot_locked(u64 remote_node);
-  void upload_records_locked(std::span<DeltaMutation> mutations,
-                             std::span<const u64> invalidation_keys = {});
-  size_t upload_mutations(std::span<DeltaMutation> mutations, u64 epoch,
-                          std::span<const u64> invalidated_graph_nodes);
-  size_t active_delta_slots_locked() const;
-  bool query_ticket_barrier_passed(u64 barrier) const;
-  bool durable_snapshot_safe(u64 durable_epoch) const;
-  void reclaim_retired_delta_slots_locked();
+  void submit_centroid_route_publication(
+    const CentroidRoutePublishDescriptor& descriptor);
 
   void validate_storage_control(const format::StorageControlBlock& control,
                                 size_t shard) const;
   std::vector<format::StorageControlBlock> read_storage_controls();
-  std::vector<format::StorageRoutePublication>
-    read_storage_route_publications();
-  bool synchronize_storage_routes();
-  void write_storage_reclaim_acks(std::span<const u64> sequences);
-  void initialize_storage_reclaim_ack();
-  void enqueue_storage_reclaim_barriers();
-  void publish_ready_storage_reclaim_acks();
-  std::vector<DeltaMutation> retire_durable_delta();
-  void mark_durable_delta_records_locked(
-    std::span<const DurableRetirement> retired);
+  CentroidRouteReadResult
+    read_storage_centroid_route_publications();
+  StorageRouteSyncResult synchronize_storage_routes();
+  void initialize_storage_route_descriptors();
   void maintenance_loop();
 
   PersistentSearchEngine& engine;
   configuration::IndexConfiguration& config;
   format::View index;
   pq::Model pq_model;
-  persistent_engine_detail::AnchorTable anchor_table;
-  std::unique_ptr<DynamicRouteOverlayDiff> dynamic_route_diff;
-  std::vector<vamana::routing::AdaptiveRouteTable::RouteSlotSnapshot>
-    dynamic_route_snapshot;
-  std::vector<DynamicRouteUpdate> dynamic_route_update_scratch;
-  std::vector<u32> entry_handles;
-  std::unordered_map<u64, u32> anchor_buckets_by_raw;
+  std::vector<u64> centroid_route_versions;
+  std::vector<CentroidRouteSnapshot> centroid_route_snapshots;
+  // Use the C++11 atomic shared_ptr free functions.  std::atomic<shared_ptr<T>>
+  // is a C++20 library specialization that is not provided by every supported
+  // host toolchain (notably the GCC 11 libstdc++ used by the target system).
+  std::shared_ptr<const centroid_home::Snapshot> centroid_home_snapshot;
+  std::vector<format::StorageCentroidRouteDescriptor>
+    storage_centroid_route_descriptors;
 #ifdef DVSTOR_HAVE_GPUNETIO
   std::unique_ptr<gpu::GpuNetioPersistentTransport> direct_transport;
   gpu::GpuNetioPersistentView direct_view{};
@@ -190,58 +153,41 @@ struct PersistentSearchEngine::Impl {
   std::unique_ptr<NavigationBootstrapper> control_bootstrapper;
   MappedRing<QueryDescriptor> submissions;
   MappedRing<CompletionDescriptor> completions;
-  MappedRing<DeltaPublishDescriptor> delta_submissions;
-  MappedRing<DeltaPublishCompletion> delta_completions;
+  MappedRing<CentroidRoutePublishDescriptor> route_submissions;
+  MappedRing<CentroidRoutePublishCompletion> route_completions;
   u32 query_slots{};
   u32 result_capacity{};
   u32 exact_width{};
   u32 code_bytes{};
+  u32 dynamic_code_record_bytes{};
   u32 visited_capacity{};
   u32 node_record_bytes{};
-  u32 delta_capacity{};
-  u32 delta_table_capacity{};
-  u32 resident_pq_capacity{};
-  u32 resident_pq_table_capacity{};
-  u32 permanent_override_words{};
-  u32 graph_invalidation_capacity{};
-  u32 delta_command_capacity{};
-  u32 dynamic_route_capacity{};
+  u32 node_record_stride{};
+  u32 centroid_route_shard_capacity{};
+  u32 centroid_route_entry_capacity{kCentroidRouteMaxLiveEntries};
   u32 query_dispatch_capacity{};
   u32 direct_batch_queue_count{};
-  size_t anchor_graph_region_offset{};
   size_t dynamic_code_region_offset{};
   size_t exact_region_offset{};
   size_t graph_scratch_offset{};
   size_t control_region_offset{};
   u64 route_graph_bytes{};
-  u64 resident_pq_bytes{};
   u64 explicit_gpu_bytes{};
   u64 gpu_clock_khz{1};
   DeviceShardRegion* d_shards{};
   byte_t* d_pq_codes{};
   f32* d_opq_matrix{};
   f32* d_pq_centroids{};
-  u32* d_entry_points{};
-  f32* d_anchor_vectors{};
-  u32* d_anchor_handles{};
-  u8* d_anchor_pq_codes{};
-  std::vector<u64> anchor_graph_keys_host;
-  std::vector<u32> anchor_graph_ready_states_host;
-  u32* anchor_graph_readers_host{};
-  byte_t* anchor_graph_validation_host{};
-  u64* d_anchor_graph_keys{};
-  u32* d_anchor_graph_states{};
-  u32* d_anchor_graph_readers{};
-  u32* d_delta_bucket_heads{};
+  f32* d_shard_centroids{};
   size_t query_input_stride{};
   f32* d_queries{};
   byte_t* query_input_host{};
   byte_t* d_query_input{};
   f32* d_transformed_queries{};
   f32* d_query_luts{};
-  u32* d_navigation_candidate_handles{};
+  u64* d_navigation_candidate_handles{};
   f32* d_navigation_candidate_distances{};
-  u32* d_visited{};
+  u64* d_visited{};
   byte_t* d_dynamic_code_records{};
   u32* d_dynamic_code_request_shards{};
   u64* d_dynamic_code_request_offsets{};
@@ -266,81 +212,24 @@ struct PersistentSearchEngine::Impl {
   u32* d_control_kernel_ready{};
   byte_t* d_exact_records{};
   byte_t* d_remote_buffer{};
-  byte_t* d_anchor_graph_records{};
   byte_t* d_graph_scratch{};
   format::StorageControlBlock* d_control_snapshots{};
-  format::StorageRoutePublication* d_storage_route_snapshots{};
-  u64* d_storage_route_sequence_before{};
+  byte_t* d_storage_route_snapshots{};
+  size_t storage_route_snapshot_stride{};
   u64* d_storage_route_sequence_after{};
-  u64* graph_invalidation_keys_host{};
-  u64* d_graph_invalidation_keys{};
   bool owns_remote_buffer{};
   u32* result_ids_host{};
   f32* result_distances_host{};
   u32* d_result_ids{};
   f32* d_result_distances{};
-  DeviceDeltaRecord* d_delta_records{};
-  byte_t* d_delta_vectors{};
-  byte_t* d_delta_pq_codes{};
-  f32* d_delta_encode_scratch{};
-  u32* delta_staging_slots_host{};
-  u32* d_delta_staging_slots{};
-  DeviceDeltaRecord* delta_staging_records_host{};
-  DeviceDeltaRecord* d_delta_staging_records{};
-  byte_t* delta_staging_vectors_host{};
-  byte_t* d_delta_staging_vectors{};
-  u32* d_delta_next{};
-  u32* d_delta_prev{};
-  u32* d_delta_remote_positions{};
-  u32* d_base_override_keys{};
-  u64* d_base_override_epochs{};
-  u32* d_permanent_override_bits{};
-  u64* d_delta_remote_keys{};
-  u32* d_delta_remote_slots{};
-  byte_t* d_resident_pq_codes{};
-  u64* d_resident_pq_keys{};
-  u32* d_resident_pq_slots{};
-  u32* d_resident_pq_positions{};
-  DeltaSupersedeUpdate* delta_supersede_updates_host{};
-  DeltaSupersedeUpdate* d_delta_supersede_updates{};
-  DeltaOverrideUpdate* delta_override_updates_host{};
-  DeltaOverrideUpdate* d_delta_override_updates{};
-  DeltaDurableUpdate* delta_durable_updates_host{};
-  DeltaDurableUpdate* d_delta_durable_updates{};
-  ResidentPqEraseUpdate* resident_pq_erase_updates_host{};
-  ResidentPqEraseUpdate* d_resident_pq_erase_updates{};
-  DynamicRouteUpdate* dynamic_route_updates_host{};
-  DynamicRouteUpdate* d_dynamic_route_updates{};
-  u8* dynamic_route_code_updates_host{};
-  u8* d_dynamic_route_code_updates{};
-  DeviceDynamicRouteSlot* d_dynamic_route_slots{};
-  u8* d_dynamic_route_pq_codes{};
-  u32* d_delta_count{};
-  std::vector<DeviceDeltaRecord> delta_records_host;
-  std::vector<u32> free_delta_slots;
-  std::unordered_map<node_t, std::vector<u32>> superseded_delta_slots;
-  std::deque<RetiredDeltaBatch> retired_delta_batches;
-  std::deque<RetiredResidentPqBatch> retired_resident_pq_batches;
-  std::multimap<u64, DurableRetirement> pending_durable_retirements;
-  std::unordered_map<node_t, u32> latest_delta_slot;
-  std::unordered_map<u64, u32> resident_pq_slots_by_remote;
-  std::vector<u32> free_resident_pq_slots;
-  u32 resident_pq_high_watermark{};
-  std::unordered_map<u32, u64> base_override_epochs;
-  std::vector<std::deque<std::pair<u64, std::chrono::steady_clock::time_point>>>
-    durable_sequence_history;
-  std::vector<u64> observed_durable_sequences;
-  std::vector<u64> safe_durable_sequences;
-  std::vector<std::deque<PendingStorageReclaimAck>> pending_storage_reclaim_acks;
-  std::vector<u64> enqueued_reclaim_ack_sequences;
-  std::vector<u64> published_reclaim_ack_sequences;
-  std::mutex delta_mutex;
-  std::condition_variable delta_capacity_cv;
-  size_t reserved_mutation_capacity{};
-  u64 mutable_delta_entries{};
-  u64 durable_delta_entries{};
-  u32 compute_client_id{};
-  u32 compute_client_count{};
+  CentroidRouteUpdate* centroid_route_updates_host{};
+  CentroidRouteUpdate* d_centroid_route_updates{};
+  f32* centroid_route_centroid_updates_host{};
+  f32* d_centroid_route_centroid_updates{};
+  DeviceCentroidRouteShard* d_centroid_route_shards{};
+  DeviceCentroidRouteEntry* d_centroid_route_entries{};
+  u64* d_centroid_route_epoch{};
+  u32 route_poll_salt{};
   u32* stop_host{};
   u32* stop_device{};
   u32* direct_disabled_host{};
@@ -348,9 +237,8 @@ struct PersistentSearchEngine::Impl {
   i32* direct_error_host{};
   i32* direct_error_device{};
   cudaStream_t kernel_stream{};
-  cudaStream_t delta_stream{};
+  cudaStream_t route_stream{};
   cudaStream_t rdma_stream{};
-  cudaStream_t route_refresh_stream{};
   PersistentKernelParams kernel_params{};
   u32 owner_kernel_blocks{};
   u32 kernel_blocks{};
@@ -361,10 +249,8 @@ struct PersistentSearchEngine::Impl {
   std::atomic<bool> healthy{true};
   std::atomic<bool> shutdown{false};
   std::atomic<bool> maintenance_shutdown{false};
-  std::atomic<u64> active_gpu_queries{0};
-  std::atomic<u64> next_query_ticket{1};
   std::atomic<u64> next_request_id{1};
-  std::atomic<u64> next_delta_command_id{1};
+  std::atomic<u64> next_route_command_id{1};
   std::atomic<u64> pending_count{0};
   std::mutex admission_mutex;
   std::condition_variable admission_cv;
@@ -373,9 +259,6 @@ struct PersistentSearchEngine::Impl {
   std::mutex slot_mutex;
   std::condition_variable slot_cv;
   std::vector<u32> free_slots;
-  std::unique_ptr<std::atomic<u64>[]> active_query_tickets;
-  std::unique_ptr<std::atomic<u64>[]> active_query_snapshots;
-  std::mutex query_snapshot_mutex;
   std::mutex pending_mutex;
   std::unordered_map<u64, std::shared_ptr<PendingQuery>> pending_queries;
   std::thread admission_thread;

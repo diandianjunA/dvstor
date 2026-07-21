@@ -1,6 +1,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include "memory_node/peer_rpc/async_response.hh"
 
@@ -32,8 +33,8 @@ protocol::PeerRpcHeader request(u64 request_id,
                                 u32 item_count,
                                 u32 reserved = 0) {
   protocol::PeerRpcHeader header{};
-  assert(header.magic == protocol::kPeerRpcMagic);
-  assert(header.version == protocol::kPeerRpcVersion);
+  header.magic = protocol::kPeerRpcMagic;
+  header.version = protocol::kPeerRpcVersion;
   header.type = static_cast<u32>(type);
   header.source_shard = shard;
   header.item_count = item_count;
@@ -42,9 +43,9 @@ protocol::PeerRpcHeader request(u64 request_id,
   return header;
 }
 
-void test_registration_delivery_and_stale_suppression() {
+void test_registration_delivery_and_explicit_consumption() {
   detail::PeerAsyncResponseRegistry registry(2);
-  constexpr auto type = protocol::PeerRpcType::stitch_search_response;
+  constexpr auto type = protocol::PeerRpcType::stage1_execute_response;
 
   assert(registry.register_request(11, 2, type, 3) ==
          detail::PeerResponseRegistration::registered);
@@ -64,35 +65,68 @@ void test_registration_delivery_and_stale_suppression() {
   auto wrong_count = ok;
   wrong_count.item_count = 4;
   assert(!registry.try_deliver(2, 1, sizeof(ok), wrong_count));
-  auto unknown = response(999, 2, type, 3);
-  assert(!registry.try_deliver(2, 1, sizeof(unknown), unknown));
+  assert(!registry.try_deliver(
+    2, 1, sizeof(ok), response(999, 2, type, 3)));
 
   assert(registry.try_deliver(2, 7, 128, ok));
   assert(!registry.try_deliver(2, 8, 128, ok));
   detail::PeerResponseDescriptor descriptor;
-  assert(registry.try_take(11, 3, type, 3, descriptor) ==
+  detail::PeerResponseLease lease;
+  assert(registry.try_take(11, 3, type, 3, descriptor, lease) ==
          detail::TryPeerResponse::stale);
-  assert(registry.try_take(11, 2, type, 3, descriptor) ==
+  assert(registry.try_take(11, 2, type, 3, descriptor, lease) ==
          detail::TryPeerResponse::success);
   assert(descriptor.peer_id == 2);
   assert(descriptor.receive_slot == 7);
   assert(descriptor.bytes == 128);
-  assert(descriptor.header.request_id == 11);
+  assert(lease.valid());
 
-  // A late duplicate cannot resurrect a successfully consumed request, and a
-  // completed ID cannot accidentally be reused as a new logical operation.
+  // A second poll cannot take ownership while the parser holds the lease.
+  detail::PeerResponseLease duplicate_lease;
+  assert(registry.try_take(
+           11, 2, type, 3, descriptor, duplicate_lease) ==
+         detail::TryPeerResponse::pending);
+  assert(!duplicate_lease.valid());
+  assert(!registry.ack_consumed(lease));
+  assert(registry.mark_receive_reposted(lease));
+  assert(registry.ack_consumed(lease));
+  assert(registry.size() == 1);
+
+  // Deletion removes the key entirely. A late packet cannot find a tombstone
+  // or resurrect a completed request.
   assert(!registry.try_deliver(2, 9, 128, ok));
-  assert(registry.register_request(11, 2, type, 3) ==
-         detail::PeerResponseRegistration::retired);
-  assert(registry.mark_retryable(11, 2, type, 3));
-  assert(registry.register_request(11, 2, type, 3) ==
-         detail::PeerResponseRegistration::retry);
-  assert(registry.try_deliver(2, 10, 128, ok));
-  assert(registry.try_take(11, 2, type, 3, descriptor) ==
-         detail::TryPeerResponse::success);
+  assert(registry.try_take(11, 2, type, 3, descriptor, lease) ==
+         detail::TryPeerResponse::stale);
 }
 
-void test_retryable_failure_and_cancelled_descriptor() {
+void test_shutdown_drain_respects_receive_ownership() {
+  constexpr auto type = protocol::PeerRpcType::reverse_update_response;
+  detail::PeerAsyncResponseRegistry registry(2);
+  detail::PeerResponseDescriptor descriptor;
+  detail::PeerResponseLease lease;
+
+  assert(registry.register_request(91, 1, type, 1) ==
+         detail::PeerResponseRegistration::registered);
+  const auto consumed = response(91, 1, type, 1);
+  assert(registry.try_deliver(1, 5, sizeof(consumed), consumed));
+  assert(registry.try_take(91, 1, type, 1, descriptor, lease) ==
+         detail::TryPeerResponse::success);
+  assert(registry.mark_receive_reposted(lease));
+  // The receive WR is already back on the QP even though semantic parsing is
+  // still leased. Shutdown must not repost it a second time.
+  assert(registry.drain_completed().empty());
+  assert(!registry.ack_consumed(lease));
+
+  assert(registry.register_request(92, 1, type, 1) ==
+         detail::PeerResponseRegistration::registered);
+  const auto held = response(92, 1, type, 1);
+  assert(registry.try_deliver(1, 6, sizeof(held), held));
+  const auto drain = registry.drain_completed();
+  assert(drain.size() == 1);
+  assert(drain.front().receive_slot == 6);
+}
+
+void test_retry_generation_and_cancelled_descriptor() {
   detail::PeerAsyncResponseRegistry registry(4);
   constexpr auto type = protocol::PeerRpcType::reverse_update_response;
   assert(registry.register_request(21, 1, type, 5) ==
@@ -102,21 +136,28 @@ void test_retryable_failure_and_cancelled_descriptor() {
     21, 1, type, 5, protocol::InsertStatus::overloaded);
   assert(registry.try_deliver(1, 2, sizeof(failed), failed));
   detail::PeerResponseDescriptor descriptor;
-  assert(registry.try_take(21, 1, type, 5, descriptor) ==
+  detail::PeerResponseLease rejected_lease;
+  assert(registry.try_take(21, 1, type, 5, descriptor, rejected_lease) ==
          detail::TryPeerResponse::failure);
-  // Until the sender explicitly rearms, a late duplicate failure is dropped.
+  assert(registry.mark_receive_reposted(rejected_lease));
+  assert(registry.retry(rejected_lease));
+  assert(!registry.ack_consumed(rejected_lease));
+  // Until the sender explicitly rearms, a late duplicate is dropped.
   assert(!registry.try_deliver(1, 3, sizeof(failed), failed));
-  // Polling between the failure and its retry deadline must not classify the
-  // still-live logical request as stale and cancel its same-ID retry state.
-  assert(registry.try_take(21, 1, type, 5, descriptor) ==
+  assert(registry.try_take(21, 1, type, 5, descriptor, rejected_lease) ==
          detail::TryPeerResponse::pending);
-  assert(registry.register_request(21, 1, type, 5) ==
+  assert(registry.register_send_attempt(21, 1, type, 5) ==
          detail::PeerResponseRegistration::retry);
+
   auto ok = response(21, 1, type, 5);
   assert(registry.try_deliver(1, 4, sizeof(ok), ok));
-  assert(registry.try_take(21, 1, type, 5, descriptor) ==
+  detail::PeerResponseLease accepted_lease;
+  assert(registry.try_take(21, 1, type, 5, descriptor, accepted_lease) ==
          detail::TryPeerResponse::success);
-  assert(descriptor.receive_slot == 4);
+  assert(accepted_lease.generation != rejected_lease.generation);
+  assert(!registry.retry(rejected_lease));
+  assert(registry.mark_receive_reposted(accepted_lease));
+  assert(registry.ack_consumed(accepted_lease));
 
   assert(registry.register_request(22, 1, type, 1) ==
          detail::PeerResponseRegistration::registered);
@@ -132,126 +173,183 @@ void test_retryable_failure_and_cancelled_descriptor() {
   assert(!registry.cancel(23).has_value());
 }
 
-void test_capacity_churn_and_slot_wrap() {
+void test_response_slab_aba_and_late_response() {
   detail::PeerAsyncResponseRegistry registry(2);
   constexpr auto type = protocol::PeerRpcType::cleanup_deleted_response;
   detail::PeerResponseDescriptor descriptor;
-  for (u64 request_id = 100; request_id < 10'000; ++request_id) {
-    assert(registry.register_request(request_id, 3, type, 1) ==
-           detail::PeerResponseRegistration::registered);
-    auto ok = response(request_id, 3, type, 1);
-    assert(registry.try_deliver(
-      3, static_cast<u32>(request_id & 7), sizeof(ok), ok));
-    assert(registry.try_take(request_id, 3, type, 1, descriptor) ==
-           detail::TryPeerResponse::success);
-    assert(registry.size() == 0);
-  }
+
+  assert(registry.register_request(101, 3, type, 1) ==
+         detail::PeerResponseRegistration::registered);
+  auto first = response(101, 3, type, 1);
+  assert(registry.try_deliver(3, 1, sizeof(first), first));
+  detail::PeerResponseLease stale_lease;
+  assert(registry.try_take(101, 3, type, 1, descriptor, stale_lease) ==
+         detail::TryPeerResponse::success);
+  assert(registry.mark_receive_reposted(stale_lease));
+  assert(registry.ack_consumed(stale_lease));
+
+  // The LIFO free list intentionally reuses the slab slot immediately. The
+  // old delayed lease must not acknowledge or rearm the new owner.
+  assert(registry.register_request(102, 3, type, 1) ==
+         detail::PeerResponseRegistration::registered);
+  auto second = response(102, 3, type, 1);
+  assert(registry.try_deliver(3, 2, sizeof(second), second));
+  detail::PeerResponseLease current_lease;
+  assert(registry.try_take(102, 3, type, 1, descriptor, current_lease) ==
+         detail::TryPeerResponse::success);
+  assert(stale_lease.slot == current_lease.slot);
+  assert(stale_lease.generation != current_lease.generation);
+  assert(!registry.ack_consumed(stale_lease));
+  assert(!registry.retry(stale_lease));
+  assert(registry.mark_receive_reposted(current_lease));
+  assert(registry.ack_consumed(current_lease));
+
+  // The first request ID is absent even after its former slab slot was reused.
+  assert(!registry.try_deliver(3, 3, sizeof(first), first));
 }
 
-void test_send_attempt_recovers_reused_retired_tombstone() {
-  constexpr auto type = protocol::PeerRpcType::reverse_update_response;
+void test_response_high_churn_has_no_probe_cliff() {
+  constexpr size_t capacity = 64;
+  detail::PeerAsyncResponseRegistry registry(capacity);
+  constexpr auto type = protocol::PeerRpcType::cleanup_deleted_response;
   detail::PeerResponseDescriptor descriptor;
 
-  // A live logical request may explicitly retry the same ID after consuming
-  // and rejecting a structurally valid response.
-  detail::PeerAsyncResponseRegistry direct(2);
-  assert(direct.register_request(201, 1, type, 2) ==
-         detail::PeerResponseRegistration::registered);
-  auto first_ok = response(201, 1, type, 2);
-  assert(direct.try_deliver(1, 1, sizeof(first_ok), first_ok));
-  assert(direct.try_take(201, 1, type, 2, descriptor) ==
-         detail::TryPeerResponse::success);
-  assert(direct.register_request(201, 1, type, 2) ==
-         detail::PeerResponseRegistration::retired);
-  assert(direct.register_send_attempt(201, 1, type, 2) ==
-         detail::PeerResponseRegistration::retry);
+  u64 next_request = 1'000;
+  constexpr size_t rounds = 24;  // 24C unique IDs (>10C).
+  for (size_t round = 0; round < rounds; ++round) {
+    std::vector<u64> ids;
+    ids.reserve(capacity);
+    for (size_t index = 0; index < capacity; ++index) {
+      const u64 id = next_request++;
+      ids.push_back(id);
+      assert(registry.register_request(id, 3, type, 1) ==
+             detail::PeerResponseRegistration::registered);
+    }
+    assert(registry.size() == capacity);
+    for (size_t index = 0; index < capacity; ++index) {
+      const u64 id = ids[(index * 17) & (capacity - 1)];
+      auto ok = response(id, 3, type, 1);
+      assert(registry.try_deliver(
+        3, static_cast<u32>(id & 7), sizeof(ok), ok));
+      detail::PeerResponseLease lease;
+      assert(registry.try_take(id, 3, type, 1, descriptor, lease) ==
+             detail::TryPeerResponse::success);
+      assert(registry.mark_receive_reposted(lease));
+      assert(registry.ack_consumed(lease));
+    }
+    assert(registry.size() == 0);
+  }
 
-  // Under concurrency the retired slot may be reused before a best-effort
-  // rearm. Capacity pressure is transient: the same send attempt installs the
-  // missing ID once one bounded slot becomes available.
-  detail::PeerAsyncResponseRegistry reused(2);
-  assert(reused.register_request(211, 1, type, 2) ==
-         detail::PeerResponseRegistration::registered);
-  auto reused_ok = response(211, 1, type, 2);
-  assert(reused.try_deliver(1, 2, sizeof(reused_ok), reused_ok));
-  assert(reused.try_take(211, 1, type, 2, descriptor) ==
-         detail::TryPeerResponse::success);
-  assert(reused.register_request(212, 1, type, 1) ==
-         detail::PeerResponseRegistration::registered);
-  assert(reused.register_request(213, 1, type, 1) ==
-         detail::PeerResponseRegistration::registered);
-  assert(!reused.mark_retryable(211, 1, type, 2));
-  assert(reused.register_send_attempt(211, 1, type, 2) ==
-         detail::PeerResponseRegistration::full);
-  assert(!reused.cancel(212).has_value());
-  assert(reused.register_send_attempt(211, 1, type, 2) ==
-         detail::PeerResponseRegistration::registered);
-  assert(reused.try_deliver(1, 3, sizeof(reused_ok), reused_ok));
-  assert(reused.try_take(211, 1, type, 2, descriptor) ==
-         detail::TryPeerResponse::success);
+  const auto probes = registry.probe_telemetry();
+  assert(probes.lookups != 0);
+  assert(probes.probes / probes.lookups < 8);
+  // At most half of the separate bucket table is occupied. This deterministic
+  // churn must remain far below the old capacity-sized miss scan.
+  assert(probes.max_probe < capacity / 2);
 }
 
-void test_receiver_request_dedup_and_replay() {
+void test_receiver_request_dedup_and_generation() {
   detail::PeerRequestDeduplicator dedup(2);
   auto reverse = request(
     31, 2, protocol::PeerRpcType::reverse_update_request, 4);
-  assert(dedup.begin(2, reverse, true).action ==
-         detail::PeerRequestAction::execute);
+  auto execute = dedup.begin(2, reverse, true);
+  assert(execute.action == detail::PeerRequestAction::execute);
+  assert(execute.lease.valid());
   assert(dedup.begin(2, reverse, true).action ==
          detail::PeerRequestAction::duplicate_inflight);
 
   auto reverse_ok = response(
     31, 0, protocol::PeerRpcType::reverse_update_response, 4);
-  dedup.complete(2, reverse, reverse_ok);
+  assert(dedup.complete(execute.lease, 2, reverse, reverse_ok));
   const auto replay = dedup.begin(2, reverse, true);
   assert(replay.action == detail::PeerRequestAction::replay);
   assert(replay.response.request_id == 31);
-  assert(replay.response.status ==
-         static_cast<u32>(protocol::InsertStatus::ok));
 
-  // A retryable failure/queue rejection may execute again with the exact ID.
+  // A non-replayable payload executes the same idempotent semantic operation
+  // again, but with a fresh lease generation.
+  auto second_execute = dedup.begin(2, reverse, false);
+  assert(second_execute.action == detail::PeerRequestAction::execute);
+  assert(second_execute.lease.generation != execute.lease.generation);
+  assert(!dedup.complete(execute.lease, 2, reverse, reverse_ok));
+  assert(dedup.complete(second_execute.lease, 2, reverse, reverse_ok));
+
+  // Failed completion is removed and the identical request may execute again.
   auto cleanup = request(
     32, 3, protocol::PeerRpcType::cleanup_deleted_request, 2);
-  assert(dedup.begin(3, cleanup, true).action ==
-         detail::PeerRequestAction::execute);
+  auto cleanup_execute = dedup.begin(3, cleanup, true);
+  assert(cleanup_execute.action == detail::PeerRequestAction::execute);
   auto cleanup_failed = response(
     32, 0, protocol::PeerRpcType::cleanup_deleted_response, 2,
     protocol::InsertStatus::failed);
-  dedup.complete(3, cleanup, cleanup_failed);
-  assert(dedup.begin(3, cleanup, true).action ==
-         detail::PeerRequestAction::execute);
-  dedup.abandon(3, cleanup);
-  assert(dedup.begin(3, cleanup, true).action ==
-         detail::PeerRequestAction::execute);
+  assert(dedup.complete(
+    cleanup_execute.lease, 3, cleanup, cleanup_failed));
+  cleanup_execute = dedup.begin(3, cleanup, true);
+  assert(cleanup_execute.action == detail::PeerRequestAction::execute);
+  assert(dedup.abandon(cleanup_execute.lease, 3, cleanup));
 
-  // Stitch payloads are not cached: concurrent duplicates coalesce, while a
-  // completed read-only search can be recomputed with the same ID.
-  detail::PeerRequestDeduplicator stitch_dedup(2);
-  auto stitch = request(
-    41, 1, protocol::PeerRpcType::stitch_search_request, 3, 8);
-  assert(stitch_dedup.begin(1, stitch, false).action ==
-         detail::PeerRequestAction::execute);
-  assert(stitch_dedup.begin(1, stitch, false).action ==
+  // A stale delayed lease cannot affect the next occupant of the same slab.
+  auto newer = request(
+    33, 3, protocol::PeerRpcType::cleanup_deleted_request, 2);
+  const auto newer_execute = dedup.begin(3, newer, true);
+  assert(newer_execute.action == detail::PeerRequestAction::execute);
+  assert(!dedup.abandon(cleanup_execute.lease, 3, cleanup));
+  assert(dedup.begin(3, newer, true).action ==
          detail::PeerRequestAction::duplicate_inflight);
-  auto stitch_ok = response(
-    41, 0, protocol::PeerRpcType::stitch_search_response, 3);
-  stitch_dedup.complete(1, stitch, stitch_ok);
-  assert(stitch_dedup.begin(1, stitch, false).action ==
-         detail::PeerRequestAction::execute);
+  assert(dedup.abandon(newer_execute.lease, 3, newer));
+}
 
-  auto conflicting = stitch;
-  conflicting.item_count = 4;
-  assert(stitch_dedup.begin(1, conflicting, false).action ==
-         detail::PeerRequestAction::conflict);
+void test_dedup_inflight_capacity_and_high_churn_fifo() {
+  {
+    detail::PeerRequestDeduplicator inflight(2);
+    const auto first = request(
+      1, 1, protocol::PeerRpcType::reverse_update_request, 1);
+    const auto second = request(
+      2, 1, protocol::PeerRpcType::reverse_update_request, 1);
+    const auto third = request(
+      3, 1, protocol::PeerRpcType::reverse_update_request, 1);
+    assert(inflight.begin(1, first, true).action ==
+           detail::PeerRequestAction::execute);
+    assert(inflight.begin(1, second, true).action ==
+           detail::PeerRequestAction::execute);
+    // Inflight work is never evicted to manufacture apparent capacity.
+    assert(inflight.begin(1, third, true).action ==
+           detail::PeerRequestAction::full);
+  }
+
+  constexpr size_t capacity = 64;
+  detail::PeerRequestDeduplicator dedup(capacity);
+  constexpr size_t operations = capacity * 24;  // >10C unique requests.
+  for (size_t index = 0; index < operations; ++index) {
+    const u64 id = 10'000 + index;
+    const u32 shard = static_cast<u32>(index & 7);
+    const auto req = request(
+      id, shard, protocol::PeerRpcType::reverse_update_request, 1);
+    const auto decision = dedup.begin(shard, req, true);
+    assert(decision.action == detail::PeerRequestAction::execute);
+    const auto ok = response(
+      id, 0, protocol::PeerRpcType::reverse_update_response, 1);
+    assert(dedup.complete(decision.lease, shard, req, ok));
+    assert(dedup.size() <= capacity);
+    const auto replay = dedup.begin(shard, req, true);
+    assert(replay.action == detail::PeerRequestAction::replay);
+  }
+  assert(dedup.size() == capacity);
+
+  const auto probes = dedup.probe_telemetry();
+  assert(probes.lookups != 0);
+  assert(probes.probes / probes.lookups < 8);
+  assert(probes.max_probe < capacity / 2);
 }
 
 }  // namespace
 
 int main() {
-  test_registration_delivery_and_stale_suppression();
-  test_retryable_failure_and_cancelled_descriptor();
-  test_capacity_churn_and_slot_wrap();
-  test_send_attempt_recovers_reused_retired_tombstone();
-  test_receiver_request_dedup_and_replay();
+  test_registration_delivery_and_explicit_consumption();
+  test_retry_generation_and_cancelled_descriptor();
+  test_response_slab_aba_and_late_response();
+  test_shutdown_drain_respects_receive_ownership();
+  test_response_high_churn_has_no_probe_cliff();
+  test_receiver_request_dedup_and_generation();
+  test_dedup_inflight_capacity_and_high_churn_fifo();
   return 0;
 }

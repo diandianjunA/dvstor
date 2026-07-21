@@ -12,17 +12,43 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
              "storage-owner reverse-update RPC batch is too large for the wire format");
   const size_t reverse_update_bytes =
     service::storage_owner::reverse_update_request_bytes(static_cast<u32>(max_reverse_update_ops));
-  const size_t stitch_request_bytes =
-    service::storage_owner::stitch_search_request_bytes(config.storage_owner_batch_max);
-  const size_t stitch_response_bytes =
-    service::storage_owner::stitch_search_response_bytes(
-      config.storage_owner_batch_max,
-      config.resolved_storage_owner_construction_width());
+  const size_t cleanup_activate_request_bytes =
+    service::storage_owner::cleanup_activate_request_bytes(
+      config.storage_owner_batch_max);
+  const size_t cleanup_activate_response_bytes =
+    service::storage_owner::cleanup_activate_response_bytes(
+      config.storage_owner_batch_max);
+  const size_t authority_placement_request_bytes =
+    service::storage_owner::authority_placement_request_bytes(
+      config.storage_owner_batch_max);
+  const size_t authority_placement_response_bytes =
+    service::storage_owner::authority_placement_response_bytes(
+      config.storage_owner_batch_max);
+  const size_t stage1_request_bytes =
+    service::storage_owner::stage1_execute_request_bytes(
+      config.storage_owner_batch_max);
+  const size_t stage1_response_bytes =
+    service::storage_owner::stage1_execute_response_bytes(
+      config.storage_owner_batch_max);
+  const size_t stage1_arm_request_bytes =
+    service::storage_owner::stage1_arm_request_bytes(
+      config.storage_owner_batch_max);
+  const size_t stage1_arm_response_bytes =
+    service::storage_owner::stage1_arm_response_bytes(
+      config.storage_owner_batch_max);
   peer_rpc_runtime_.message_bytes = align_up(
     std::max({reverse_update_bytes,
+              service::storage_owner::reconcile_reverse_request_bytes(1),
+              service::storage_owner::centroid_membership_request_bytes(1),
+              cleanup_activate_request_bytes,
+              cleanup_activate_response_bytes,
+              authority_placement_request_bytes,
+              authority_placement_response_bytes,
               service::storage_owner::reverse_update_response_bytes(),
-              stitch_request_bytes,
-              stitch_response_bytes}));
+              stage1_request_bytes,
+              stage1_response_bytes,
+              stage1_arm_request_bytes,
+              stage1_arm_response_bytes}));
   lib_assert(peer_rpc_runtime_.message_bytes <= std::numeric_limits<u32>::max(),
              "storage-owner peer RPC message is too large for verbs SGEs");
   const u32 remote_peer_count = num_storage_nodes_ - 1;
@@ -65,11 +91,20 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
     }
   }
   const size_t registry_peer_count = std::max<u32>(1, num_storage_nodes_ - 1);
+  const size_t response_producers =
+    static_cast<size_t>(std::max<u32>(1, config.storage_owner_maintenance_workers)) +
+    static_cast<size_t>(std::max<u32>(1, num_compute_threads_));
+  lib_assert(response_producers <=
+               std::numeric_limits<size_t>::max() /
+                 std::max<size_t>(1, config.storage_owner_rpc_depth),
+             "peer control response registry producer capacity overflow");
+  const size_t producer_depth = response_producers *
+    std::max<size_t>(1, config.storage_owner_rpc_depth);
+  lib_assert(producer_depth <=
+               std::numeric_limits<size_t>::max() / registry_peer_count / 4,
+             "peer control response registry peer capacity overflow");
   const size_t response_capacity = std::max<size_t>(
-    1024,
-    static_cast<size_t>(config.storage_owner_rpc_depth) *
-      std::max<u32>(1, config.storage_owner_maintenance_workers) *
-      registry_peer_count * 4);
+    1024, producer_depth * registry_peer_count * 4);
   peer_async_responses_ =
     std::make_unique<PeerAsyncResponseRegistry>(response_capacity);
   const size_t dedup_capacity = std::max<size_t>(
@@ -83,7 +118,7 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
                " (requested=" + std::to_string(desired_slots_per_peer) + ")");
   print_status("storage-owner peer RPC concurrent sends per peer: " +
                std::to_string(peer_rpc_runtime_.send_slots_per_peer));
-  print_status("storage-owner peer RPC send credits: search/graph are split "
+  print_status("storage-owner peer RPC send credits: Stage1/graph are split "
                "at depth >= 2; responses use a dedicated sync buffer");
   print_status("storage-owner peer async response capacity: " +
                std::to_string(peer_async_responses_->capacity()));
@@ -104,20 +139,23 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
     return;
   }
 
-  {
-    std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
-    peer_rpc_pending_responses_.clear();
-    peer_rpc_responses_.clear();
-    peer_rpc_response_payloads_.clear();
-  }
-
   peer_reverse_shutdown_.store(false, std::memory_order_release);
   peer_reverse_workers_done_.store(false, std::memory_order_release);
   peer_reverse_response_done_.store(false, std::memory_order_release);
   peer_reverse_task_queue_limit_ =
     std::max<size_t>(1024, static_cast<size_t>(config.storage_owner_reverse_queue_depth));
-  peer_stitch_search_task_queue_limit_ = peer_reverse_task_queue_limit_;
-  peer_reverse_outgoing_queue_limit_ = peer_reverse_task_queue_limit_;
+  peer_stage1_task_queue_limit_ = peer_reverse_task_queue_limit_;
+  peer_physical_control_task_queue_limit_ =
+    peer_reverse_task_queue_limit_;
+  {
+    std::lock_guard<std::mutex> lock(peer_cleanup_control_tasks_mutex_);
+    peer_cleanup_control_tasks_.clear();
+    peer_cleanup_next_source_sequences_.assign(num_storage_nodes_, 0);
+  }
+  {
+    std::lock_guard<std::mutex> lock(peer_placement_control_tasks_mutex_);
+    peer_placement_control_tasks_.clear();
+  }
   peer_reverse_responses_ =
     std::make_unique<bounded::Queue<PeerReverseUpdateResponse>>(
       peer_reverse_task_queue_limit_);
@@ -127,11 +165,28 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   peer_reverse_update_items_processed_.store(0, std::memory_order_relaxed);
   peer_reverse_update_failed_.store(0, std::memory_order_relaxed);
   peer_reverse_update_max_queue_.store(0, std::memory_order_relaxed);
-  peer_stitch_search_enqueued_.store(0, std::memory_order_relaxed);
-  peer_stitch_search_processed_.store(0, std::memory_order_relaxed);
-  peer_stitch_search_items_.store(0, std::memory_order_relaxed);
-  peer_stitch_search_max_queue_.store(0, std::memory_order_relaxed);
-  peer_stitch_search_active_workers_.store(0, std::memory_order_relaxed);
+  peer_stage1_enqueued_.store(0, std::memory_order_relaxed);
+  peer_stage1_processed_.store(0, std::memory_order_relaxed);
+  peer_stage1_items_.store(0, std::memory_order_relaxed);
+  peer_stage1_max_queue_.store(0, std::memory_order_relaxed);
+  peer_stage1_active_workers_.store(0, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
+    peer_stage1_tasks_.clear();
+    peer_stage1_next_source_sequences_.assign(num_storage_nodes_, 0);
+  }
+  peer_stage1_completion_states_.clear();
+  peer_stage1_completion_states_.reserve(num_storage_nodes_);
+  for (u32 shard = 0; shard < num_storage_nodes_; ++shard) {
+    peer_stage1_completion_states_.push_back(
+      std::make_unique<PeerOrderedCompletionState>());
+  }
+  peer_cleanup_completion_states_.clear();
+  peer_cleanup_completion_states_.reserve(num_storage_nodes_);
+  for (u32 shard = 0; shard < num_storage_nodes_; ++shard) {
+    peer_cleanup_completion_states_.push_back(
+      std::make_unique<PeerOrderedCompletionState>());
+  }
 
   const u32 rpc_parallelism = std::max<u32>(
     1, static_cast<u32>(num_clients_) *
@@ -141,7 +196,46 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
     rpc_parallelism, config.storage_owner_maintenance_workers,
     num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
   const u32 reverse_worker_count = cpu_plan.peer_reverse_workers;
-  const u32 stitch_worker_count = cpu_plan.peer_search_workers;
+  const u32 stage1_rpc_worker_count = cpu_plan.peer_stage1_workers;
+  const u32 cleanup_worker_count = cpu_plan.peer_cleanup_workers;
+  const size_t stage1_total_worker_count =
+    static_cast<size_t>(cpu_plan.foreground_workers) +
+    static_cast<size_t>(stage1_rpc_worker_count);
+  lib_assert(stage1_total_worker_count <=
+               std::numeric_limits<size_t>::max() /
+                 std::max<size_t>(1, config.storage_owner_batch_max) / 4,
+             "Stage1 artifact table worker capacity overflow");
+  const size_t stage1_active_capacity = stage1_total_worker_count *
+    std::max<size_t>(1, config.storage_owner_batch_max) * 4;
+  lib_assert(static_cast<size_t>(config.storage_owner_maintenance_queue_depth) <=
+               std::numeric_limits<size_t>::max() - stage1_active_capacity,
+             "Stage1 artifact table queue capacity overflow");
+  stage1_prepared_results_limit_ = std::max<size_t>(
+    1024,
+    static_cast<size_t>(config.storage_owner_maintenance_queue_depth) +
+      stage1_active_capacity);
+  stage1_prepared_results_limit_per_shard_ = std::max<size_t>(
+    16, (stage1_prepared_results_limit_ + kStage1PreparedShardCount - 1) /
+      kStage1PreparedShardCount);
+  for (Stage1PreparedResultShard& shard : stage1_prepared_results_) {
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    shard.records.clear();
+    shard.records.reserve(stage1_prepared_results_limit_per_shard_);
+  }
+  const size_t cleanup_dedupe_total = std::max<size_t>(
+    1024,
+    static_cast<size_t>(config.storage_owner_maintenance_queue_depth) * 2);
+  cleanup_activation_dedupe_limit_per_shard_ = std::max<size_t>(
+    16, (cleanup_dedupe_total + kCleanupActivationShardCount - 1) /
+      kCleanupActivationShardCount);
+  for (CleanupActivationDedupeShard& shard :
+       cleanup_activation_dedupe_) {
+    std::lock_guard<std::mutex> lock(shard.mutex);
+    shard.records.clear();
+    shard.records.reserve(cleanup_activation_dedupe_limit_per_shard_);
+  }
+  dynamic_allocation_dedupe_limit_ = cleanup_dedupe_total;
+  dynamic_allocation_receipts_.reset(dynamic_allocation_dedupe_limit_);
   const size_t snapshot_stride = align_up(VamanaNode::vector_bytes());
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
   const size_t coroutine_scratch_stride =
@@ -156,20 +250,32 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
     worker->init_peer_scratch(*peer_context_, scratch_bytes, coroutine_scratch_stride);
     peer_reverse_worker_states_.push_back(std::move(worker));
   }
-  peer_stitch_search_worker_states_.reserve(stitch_worker_count);
-  for (u32 i = 0; i < stitch_worker_count; ++i) {
-    auto stitch_worker = std::make_unique<StorageOwnerThread>(
+  peer_stage1_worker_states_.reserve(stage1_rpc_worker_count);
+  for (u32 i = 0; i < stage1_rpc_worker_count; ++i) {
+    auto stage1_worker = std::make_unique<StorageOwnerThread>(
       reverse_worker_count + i, 1, config.max_send_queue_wr);
-    peer_stitch_search_worker_states_.push_back(std::move(stitch_worker));
+    peer_stage1_worker_states_.push_back(std::move(stage1_worker));
   }
 
   peer_rpc_progress_thread_ = std::thread([this]() { peer_rpc_progress_loop(); });
   peer_reverse_response_thread_ = std::thread([this]() { peer_reverse_response_loop(); });
-  peer_reverse_outgoing_thread_ = std::thread([this]() { peer_reverse_outgoing_loop(); });
+  peer_cleanup_control_workers_.reserve(cleanup_worker_count);
+  for (u32 i = 0; i < cleanup_worker_count; ++i) {
+    peer_cleanup_control_workers_.emplace_back(
+      [this]() { peer_cleanup_control_worker_loop(); });
+  }
+  peer_placement_control_thread_ =
+    std::thread([this]() { peer_placement_control_worker_loop(); });
   if (!config.disable_thread_pinning) {
     pin_thread(peer_rpc_progress_thread_, core_assignment_.get_available_core());
     pin_thread(peer_reverse_response_thread_, core_assignment_.get_available_core());
-    pin_thread(peer_reverse_outgoing_thread_, core_assignment_.get_available_core());
+    pin_thread(peer_placement_control_thread_,
+               core_assignment_.get_available_core());
+  }
+  for (auto& worker : peer_cleanup_control_workers_) {
+    if (!config.disable_thread_pinning) {
+      pin_thread(worker, core_assignment_.get_available_core());
+    }
   }
   for (u32 i = 0; i < reverse_worker_count; ++i) {
     peer_reverse_workers_.emplace_back([this, i]() { peer_reverse_update_worker_loop(i); });
@@ -178,44 +284,68 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
                  core_assignment_.get_available_core());
     }
   }
-  for (u32 i = 0; i < stitch_worker_count; ++i) {
-    peer_stitch_search_workers_.emplace_back([this, i]() { peer_stitch_search_worker_loop(i); });
+  for (u32 i = 0; i < stage1_rpc_worker_count; ++i) {
+    peer_stage1_workers_.emplace_back([this, i]() {
+      peer_stage1_worker_loop(i);
+    });
     if (!config.disable_thread_pinning) {
-      pin_thread(peer_stitch_search_workers_.back(),
+      pin_thread(peer_stage1_workers_.back(),
                  core_assignment_.get_available_core());
     }
   }
   print_status("storage-owner peer reverse-update workers: " +
                std::to_string(reverse_worker_count));
-  print_status("storage-owner peer stitch-search workers: " +
-               std::to_string(stitch_worker_count) +
-               " (dedicated background CPU partition)");
-  print_status("storage-owner peer reverse-update tuning: mode=" + config.storage_owner_reverse_mode +
-               " queue_depth=" + std::to_string(peer_reverse_task_queue_limit_) +
+  print_status("storage-owner peer Stage1 workers: " +
+               std::to_string(stage1_rpc_worker_count) +
+               " (dedicated physical-home CPU partition)");
+  print_status("storage-owner physical control workers: cleanup=" +
+               std::to_string(cleanup_worker_count) + " placement=" +
+               std::to_string(cpu_plan.peer_placement_workers) +
+               " (separate blocking domains)");
+  print_status("storage-owner Stage1 artifact capacity: " +
+               std::to_string(stage1_prepared_results_limit_) +
+               " (64-way, per shard=" +
+               std::to_string(stage1_prepared_results_limit_per_shard_) + ")" +
+               " cleanup replay per shard=" +
+               std::to_string(cleanup_activation_dedupe_limit_per_shard_) +
+               " active migration receipts=" +
+               std::to_string(dynamic_allocation_dedupe_limit_));
+  print_status("storage-owner peer reverse-update tuning: queue_depth=" +
+               std::to_string(peer_reverse_task_queue_limit_) +
                " coalesce_max=" + std::to_string(config.storage_owner_reverse_coalesce_max));
 }
 
 void MemoryNode::stop_peer_reverse_update_runtime() {
   peer_reverse_shutdown_.store(true, std::memory_order_release);
   peer_reverse_tasks_cv_.notify_all();
-  peer_stitch_search_tasks_cv_.notify_all();
-  if (peer_reverse_responses_) peer_reverse_responses_->notify_all();
-  peer_reverse_outgoing_cv_.notify_all();
-  peer_rpc_responses_cv_.notify_all();
-  peer_completion_cv_.notify_all();
-
-  if (peer_reverse_outgoing_thread_.joinable()) {
-    peer_reverse_outgoing_thread_.join();
+  peer_stage1_tasks_cv_.notify_all();
+  for (const auto& completion : peer_stage1_completion_states_) {
+    if (completion != nullptr) completion->changed.notify_all();
   }
+  for (const auto& completion : peer_cleanup_completion_states_) {
+    if (completion != nullptr) completion->changed.notify_all();
+  }
+  peer_cleanup_control_tasks_cv_.notify_all();
+  peer_placement_control_tasks_cv_.notify_all();
+  if (peer_reverse_responses_) peer_reverse_responses_->notify_all();
+  peer_completion_cv_.notify_all();
   for (auto& worker : peer_reverse_workers_) {
     if (worker.joinable()) {
       worker.join();
     }
   }
-  for (auto& worker : peer_stitch_search_workers_) {
+  for (auto& worker : peer_stage1_workers_) {
     if (worker.joinable()) {
       worker.join();
     }
+  }
+  for (auto& worker : peer_cleanup_control_workers_) {
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
+  if (peer_placement_control_thread_.joinable()) {
+    peer_placement_control_thread_.join();
   }
   peer_reverse_workers_done_.store(true, std::memory_order_release);
   if (peer_reverse_responses_) peer_reverse_responses_->notify_all();
@@ -226,21 +356,40 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
     peer_rpc_progress_thread_.join();
   }
   if (peer_async_responses_ != nullptr) {
+    const auto probes = peer_async_responses_->probe_telemetry();
+    const double average = probes.lookups == 0
+      ? 0.0
+      : static_cast<double>(probes.probes) /
+          static_cast<double>(probes.lookups);
+    print_status("storage-owner peer response hash probes: average=" +
+                 std::to_string(average) +
+                 " max=" + std::to_string(probes.max_probe) +
+                 " buckets=" +
+                 std::to_string(peer_async_responses_->bucket_capacity()));
+  }
+  if (peer_request_deduplicator_ != nullptr) {
+    const auto probes = peer_request_deduplicator_->probe_telemetry();
+    const double average = probes.lookups == 0
+      ? 0.0
+      : static_cast<double>(probes.probes) /
+          static_cast<double>(probes.lookups);
+    print_status("storage-owner peer dedup hash probes: average=" +
+                 std::to_string(average) +
+                 " max=" + std::to_string(probes.max_probe) +
+                 " buckets=" +
+                 std::to_string(peer_request_deduplicator_->bucket_capacity()));
+  }
+  if (peer_async_responses_ != nullptr) {
     for (const auto& response : peer_async_responses_->drain_completed()) {
       repost_peer_rpc_receive(response.peer_id, response.receive_slot);
     }
   }
   peer_reverse_workers_.clear();
-  peer_stitch_search_workers_.clear();
+  peer_stage1_workers_.clear();
+  peer_cleanup_control_workers_.clear();
   peer_reverse_worker_states_.clear();
-  peer_stitch_search_worker_states_.clear();
+  peer_stage1_worker_states_.clear();
   peer_reverse_responses_.reset();
-  {
-    std::lock_guard<std::mutex> lock(peer_rpc_mutex_);
-    peer_rpc_pending_responses_.clear();
-    peer_rpc_responses_.clear();
-    peer_rpc_response_payloads_.clear();
-  }
 }
 
 size_t MemoryNode::peer_rpc_receive_offset(u32 peer_id, u32 slot_id) const {
@@ -264,7 +413,10 @@ MemoryNode::PeerRpcSendClass MemoryNode::peer_rpc_send_slot_class(
     u32 slot_id) const {
   const u32 slot_count = peer_rpc_runtime_.send_slots_per_peer;
   if (slot_count <= 1) return PeerRpcSendClass::control;
-  return slot_id % 2 == 0 ? PeerRpcSendClass::stitch_search
+  if (slot_count >= 3 && slot_id == slot_count - 1) {
+    return PeerRpcSendClass::control;
+  }
+  return slot_id % 2 == 0 ? PeerRpcSendClass::stage1
                           : PeerRpcSendClass::graph_update;
 }
 
@@ -288,7 +440,8 @@ bool MemoryNode::try_acquire_peer_rpc_send_slot(
     return try_lane(PeerRpcSendClass::control);
   }
   if (send_class == PeerRpcSendClass::control) {
-    return try_lane(PeerRpcSendClass::stitch_search) ||
+    return try_lane(PeerRpcSendClass::control) ||
+           try_lane(PeerRpcSendClass::stage1) ||
            try_lane(PeerRpcSendClass::graph_update);
   }
   return try_lane(send_class);
@@ -388,10 +541,21 @@ service::storage_owner::PeerRpcHeader MemoryNode::make_peer_reverse_update_respo
   response.magic = service::storage_owner::kPeerRpcMagic;
   response.version = service::storage_owner::kPeerRpcVersion;
   const auto request_type = static_cast<service::storage_owner::PeerRpcType>(request.type);
-  const auto response_type =
-    request_type == service::storage_owner::PeerRpcType::cleanup_deleted_request
-      ? service::storage_owner::PeerRpcType::cleanup_deleted_response
-      : service::storage_owner::PeerRpcType::reverse_update_response;
+  service::storage_owner::PeerRpcType response_type =
+    service::storage_owner::PeerRpcType::reverse_update_response;
+  if (request_type ==
+      service::storage_owner::PeerRpcType::cleanup_deleted_request) {
+    response_type =
+      service::storage_owner::PeerRpcType::cleanup_deleted_response;
+  } else if (request_type ==
+             service::storage_owner::PeerRpcType::reconcile_reverse_request) {
+    response_type =
+      service::storage_owner::PeerRpcType::reconcile_reverse_response;
+  } else if (request_type ==
+             service::storage_owner::PeerRpcType::centroid_membership_request) {
+    response_type =
+      service::storage_owner::PeerRpcType::centroid_membership_response;
+  }
   response.type = static_cast<u32>(response_type);
   response.source_shard = storage_id_;
   response.item_count = request.item_count;

@@ -40,38 +40,30 @@ public:
   u32 gpu_query_slots{256};
   u32 gpu_memory_limit_gb{40};
   u32 gpu_memory_reserve_gb{4};
-  u32 gpu_resident_pq_budget_mb{4096};
   u32 gpu_bootstrap_window_mb{64};
   u32 gpu_bootstrap_windows{2};
   u32 gpu_graph_prefetch_depth{32};
   u32 gpu_traversal_beam_width{128};
   u32 gpu_final_rerank_width{64};
   u32 gpu_max_expansions{384};
-  u32 gpu_entry_seed_count{16};
-  u32 gpu_delta_anchor_probes{32};
   u32 gpu_rdma_qps{4};
   u32 gpu_persistent_blocks_per_sm{4};
   // Compute-side mutation support is optional for query-only deployments.
   // Keep it enabled by default so existing service configurations preserve
   // their insert/upsert/erase behavior.
   bool enable_updates{true};
-  u32 update_visibility_us{10'000};
-  u32 delta_budget_mb{256};
-  u32 gpu_delta_maintenance_period_ms{10};
 
   u32 storage_id{};
   vec<str> storage_peers;
-  u32 storage_owner_coroutines{4};
   u32 storage_owner_batch_max{16};
   u32 storage_owner_peer_rdma_tokens{8};
   u32 storage_owner_rpc_depth{8};
   u32 storage_owner_rpc_timeout_ms{30'000};
   u32 storage_owner_search_snapshot_batch{64};
-  str storage_owner_update_mode{"exact"};
-  str storage_owner_maintenance_mode{"off"};
-  u32 storage_owner_maintenance_workers{};
+  // Stage2 is part of the only supported update protocol, so at least one
+  // maintenance executor must exist even when the caller does not tune it.
+  u32 storage_owner_maintenance_workers{1};
   u32 storage_owner_maintenance_queue_depth{65'536};
-  str storage_owner_reverse_mode{"async"};
   u32 storage_owner_reverse_queue_depth{65'536};
   u32 storage_owner_reverse_coalesce_max{256};
 
@@ -81,9 +73,6 @@ public:
     add_options();
     process_program_options(argc, argv);
     vector_data_type = normalize_mode(vector_data_type);
-    storage_owner_update_mode = normalize_mode(storage_owner_update_mode);
-    storage_owner_maintenance_mode = normalize_mode(storage_owner_maintenance_mode);
-    storage_owner_reverse_mode = normalize_mode(storage_owner_reverse_mode);
     validate(argv);
     operator<<(std::cerr, *this);
   }
@@ -150,10 +139,6 @@ private:
       ("gpu-memory-reserve-gb",
        po::value<u32>(&gpu_memory_reserve_gb)->default_value(gpu_memory_reserve_gb),
        "GPU memory reserved for CUDA and transport runtime state.")
-      ("gpu-resident-pq-budget-mb",
-       po::value<u32>(&gpu_resident_pq_budget_mb)
-         ->default_value(gpu_resident_pq_budget_mb),
-       "GPU memory budget for PQ codes of durable dynamically inserted vectors.")
       ("gpu-bootstrap-window-mb",
        po::value<u32>(&gpu_bootstrap_window_mb)->default_value(gpu_bootstrap_window_mb),
        "Maximum one-time PQ bootstrap RDMA read size.")
@@ -172,12 +157,6 @@ private:
       ("gpu-max-expansions",
        po::value<u32>(&gpu_max_expansions)->default_value(gpu_max_expansions),
        "Maximum graph expansions per query.")
-      ("gpu-entry-seed-count",
-       po::value<u32>(&gpu_entry_seed_count)->default_value(gpu_entry_seed_count),
-       "Resident entry points scored at query start.")
-      ("gpu-delta-anchor-probes",
-       po::value<u32>(&gpu_delta_anchor_probes)->default_value(gpu_delta_anchor_probes),
-       "Dynamic anchor buckets probed per query.")
       ("gpu-rdma-qps",
        po::value<u32>(&gpu_rdma_qps)->default_value(gpu_rdma_qps),
        "GPU-initiated GPUNetIO QPs per storage node.")
@@ -187,24 +166,11 @@ private:
       ("enable-updates",
        po::value<bool>(&enable_updates)->default_value(enable_updates),
        "Enable compute-side insert, upsert, and erase submission.")
-      ("update-visibility-us",
-       po::value<u32>(&update_visibility_us)->default_value(update_visibility_us),
-       "Maximum update publication delay to the GPU delta.")
-      ("delta-budget-mb",
-       po::value<u32>(&delta_budget_mb)->default_value(delta_budget_mb),
-       "GPU delta-index memory budget.")
-      ("gpu-delta-maintenance-period-ms",
-       po::value<u32>(&gpu_delta_maintenance_period_ms)
-         ->default_value(gpu_delta_maintenance_period_ms),
-       "GPU delta retirement and storage-watermark polling period.")
 
       ("storage-id", po::value<u32>(&storage_id)->default_value(storage_id),
        "Zero-based storage shard identifier.")
       ("storage-peers", po::value<vec<str>>(&storage_peers)->multitoken(),
        "Ordered storage-node endpoints.")
-      ("storage-owner-coroutines",
-       po::value<u32>(&storage_owner_coroutines)->default_value(storage_owner_coroutines),
-       "Coroutines per storage-side update worker.")
       ("storage-owner-batch-max",
        po::value<u32>(&storage_owner_batch_max)->default_value(storage_owner_batch_max),
        "Maximum mutations in one storage RPC batch.")
@@ -221,14 +187,6 @@ private:
        po::value<u32>(&storage_owner_search_snapshot_batch)
          ->default_value(storage_owner_search_snapshot_batch),
        "Concurrent node snapshots during update search.")
-      ("storage-owner-update-mode",
-       po::value<str>(&storage_owner_update_mode)
-         ->default_value(storage_owner_update_mode),
-       "Dynamic graph update strategy: exact or local_stitch.")
-      ("storage-owner-maintenance-mode",
-       po::value<str>(&storage_owner_maintenance_mode)
-         ->default_value(storage_owner_maintenance_mode),
-       "Background graph maintenance: off or finalize.")
       ("storage-owner-maintenance-workers",
        po::value<u32>(&storage_owner_maintenance_workers)
          ->default_value(storage_owner_maintenance_workers),
@@ -237,10 +195,6 @@ private:
        po::value<u32>(&storage_owner_maintenance_queue_depth)
          ->default_value(storage_owner_maintenance_queue_depth),
        "Bounded graph-maintenance backlog; writers backpressure at the limit.")
-      ("storage-owner-reverse-mode",
-       po::value<str>(&storage_owner_reverse_mode)
-         ->default_value(storage_owner_reverse_mode),
-       "Reverse-update completion mode: async or sync.")
       ("storage-owner-reverse-queue-depth",
        po::value<u32>(&storage_owner_reverse_queue_depth)
          ->default_value(storage_owner_reverse_queue_depth),
@@ -264,8 +218,8 @@ private:
         R == 0 || beam_width_construction == 0 || mn_memory_gb == 0) {
       fail("threads, dim, max-vectors, k, R, beam-width-construction, and mn-memory must be > 0");
     }
-    if (R > std::numeric_limits<u8>::max()) {
-      fail("--R must be <= 255");
+    if (R > kMaxSupportedGraphDegree) {
+      fail("--R must be <= " + std::to_string(kMaxSupportedGraphDegree));
     }
     if (k > gpu_final_rerank_width) {
       fail("--k must not exceed --gpu-final-rerank-width");
@@ -279,7 +233,6 @@ private:
     if (gpu_query_slots == 0 || gpu_query_slots > 4096 ||
         gpu_memory_limit_gb == 0 ||
         gpu_memory_reserve_gb >= gpu_memory_limit_gb ||
-        gpu_resident_pq_budget_mb == 0 ||
         gpu_bootstrap_window_mb == 0 || gpu_bootstrap_windows == 0 ||
         gpu_bootstrap_windows > 16 ||
         gpu_graph_prefetch_depth == 0 ||
@@ -288,25 +241,22 @@ private:
         gpu_final_rerank_width < k || gpu_final_rerank_width > 256 ||
         gpu_max_expansions < gpu_traversal_beam_width ||
         gpu_max_expansions > 4096 ||
-        gpu_entry_seed_count == 0 || gpu_entry_seed_count > 512 ||
-        gpu_delta_anchor_probes == 0 || gpu_delta_anchor_probes > 64 ||
         gpu_rdma_qps == 0 || gpu_rdma_qps > 32 ||
         gpu_persistent_blocks_per_sm == 0 ||
-        gpu_persistent_blocks_per_sm > 16 ||
-        update_visibility_us == 0 || delta_budget_mb == 0 ||
-        gpu_delta_maintenance_period_ms == 0) {
+        gpu_persistent_blocks_per_sm > 16) {
       fail("invalid persistent GPU query configuration");
     }
 
     if (storage_peers.size() != num_server_nodes()) {
       fail("--storage-peers must list exactly one endpoint per storage node");
     }
-    if (storage_id >= num_server_nodes() || storage_owner_coroutines == 0 ||
+    if (storage_id >= num_server_nodes() ||
         storage_owner_batch_max == 0 ||
         storage_owner_peer_rdma_tokens == 0 ||
         storage_owner_rpc_depth == 0 ||
         storage_owner_rpc_timeout_ms == 0 ||
         storage_owner_search_snapshot_batch == 0 ||
+        storage_owner_maintenance_workers == 0 ||
         storage_owner_maintenance_queue_depth == 0 ||
         storage_owner_reverse_queue_depth == 0 ||
         storage_owner_reverse_coalesce_max == 0) {
@@ -315,34 +265,9 @@ private:
     if (storage_owner_batch_max > std::numeric_limits<u32>::max() / R) {
       fail("storage-owner batch invalidation capacity exceeds u32");
     }
-    if (storage_owner_update_mode != "exact" &&
-        storage_owner_update_mode != "local_stitch") {
-      fail("--storage-owner-update-mode must be exact or local_stitch");
-    }
-    if (storage_owner_reverse_mode != "async" &&
-        storage_owner_reverse_mode != "sync") {
-      fail("--storage-owner-reverse-mode must be async or sync");
-    }
-    if (storage_owner_maintenance_mode != "off" &&
-        storage_owner_maintenance_mode != "finalize") {
-      fail("--storage-owner-maintenance-mode must be off or finalize");
-    }
-    if (storage_owner_update_mode == "local_stitch" &&
-        storage_owner_maintenance_mode != "finalize") {
-      fail("local_stitch requires finalize maintenance");
-    }
-    if (storage_owner_maintenance_mode == "finalize" &&
-        storage_owner_update_mode != "local_stitch") {
-      fail("finalize maintenance is the stage2 of local_stitch updates");
-    }
-    if (storage_owner_maintenance_mode == "finalize" &&
-        storage_owner_maintenance_workers == 0) {
-      fail("finalize maintenance requires storage-owner-maintenance-workers > 0");
-    }
-    if (storage_owner_maintenance_mode == "finalize" &&
-        static_cast<u64>(storage_owner_maintenance_queue_depth) <
-          static_cast<u64>(storage_owner_batch_max) * 2) {
-      fail("finalize maintenance queue depth must cover two intents per RPC batch");
+    if (static_cast<u64>(storage_owner_maintenance_queue_depth) <
+        static_cast<u64>(storage_owner_batch_max) * 2) {
+      fail("stage2 maintenance queue depth must cover two intents per RPC batch");
     }
     if (is_server && server_index_file.empty()) {
       fail("storage node requires --server-index-file");
@@ -378,33 +303,25 @@ public:
       output << std::setw(width) << "GPU memory limit/reserve GiB: "
              << config.gpu_memory_limit_gb << "/"
              << config.gpu_memory_reserve_gb << '\n';
-      output << std::setw(width) << "GPU resident dynamic PQ MiB: "
-             << config.gpu_resident_pq_budget_mb << '\n';
       output << std::setw(width) << "GPU traversal/rerank width: "
              << config.gpu_traversal_beam_width << "/"
              << config.gpu_final_rerank_width << '\n';
-      output << std::setw(width) << "GPU max expansions/entry seeds: "
-             << config.gpu_max_expansions << "/"
-             << config.gpu_entry_seed_count << '\n';
+      output << std::setw(width) << "GPU max expansions: "
+             << config.gpu_max_expansions << '\n';
       output << std::setw(width) << "GPU RDMA QPs per storage node: "
              << config.gpu_rdma_qps << '\n';
       output << std::setw(width) << "GPU persistent blocks/SM: "
              << config.gpu_persistent_blocks_per_sm << '\n';
       output << std::setw(width) << "compute updates enabled: "
              << std::boolalpha << config.enable_updates << '\n';
-      output << std::setw(width) << "update visibility us: "
-             << config.update_visibility_us << '\n';
-      output << std::setw(width) << "storage update mode: "
-             << config.storage_owner_update_mode << '\n';
-      output << std::setw(width) << "storage update coroutines: "
-             << config.storage_owner_coroutines << '\n';
+      output << std::setw(width) << "storage update protocol: "
+             << "centroid-home two-stage" << '\n';
       output << std::setw(width) << "storage RPC depth/batch: "
              << config.storage_owner_rpc_depth << "/"
              << config.storage_owner_batch_max << '\n';
-      output << std::setw(width) << "storage maintenance: "
-             << config.storage_owner_maintenance_mode << " ("
+      output << std::setw(width) << "storage stage2 maintenance: "
              << config.storage_owner_maintenance_workers << " workers, backlog "
-             << config.storage_owner_maintenance_queue_depth << ")\n";
+             << config.storage_owner_maintenance_queue_depth << '\n';
       output << std::setfill('=') << std::setw(line_width) << "" << '\n';
     } else if (config.is_server) {
       output << std::setw(width) << "index prefix: " << config.index_prefix << '\n';

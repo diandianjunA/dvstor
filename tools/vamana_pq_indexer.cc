@@ -12,7 +12,7 @@ int main(int argc, char** argv) {
   description.add_options()
     ("help,h", "Show help")
     ("index-prefix", po::value<filepath_t>(&options.index_prefix)->required(),
-     "Schema-14 Vamana index prefix")
+     "Schema-15 tagged Vamana intermediate index prefix")
     ("reuse-model", po::value<filepath_t>(&options.reuse_model),
      "Reuse a compatible OPQ/PQ model instead of training")
     ("subquantizers", po::value<u32>(&options.subquantizers)->default_value(16),
@@ -25,8 +25,6 @@ int main(int argc, char** argv) {
      "PQ k-means iterations")
     ("chunk-vectors", po::value<u32>(&options.chunk_vectors)->default_value(options.chunk_vectors),
      "Vectors encoded per sequential shard chunk")
-    ("entry-points", po::value<u32>(&options.entry_points)->default_value(options.entry_points),
-     "GPU search entry points")
     ("threads", po::value<u32>(&options.threads)->default_value(0),
      "CPU threads; 0 uses at most 32 hardware threads")
     ("seed", po::value<u64>(&options.seed)->default_value(options.seed), "Training seed")

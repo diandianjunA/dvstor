@@ -17,17 +17,17 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
 
   bool enable_queries = true;
   bool enable_dispatcher = false;
-  bool enable_delta = true;
+  bool enable_route_control = true;
   if (unified_dispatch) {
     const u32 role_block = blockIdx.x - params.direct_owner_block_count;
     enable_queries = role_block < params.query_block_count;
     enable_dispatcher = role_block == params.query_block_count;
-    enable_delta = role_block == params.query_block_count + 1;
-    if (!enable_queries && !enable_dispatcher && !enable_delta) return;
+    enable_route_control = role_block == params.query_block_count + 1;
+    if (!enable_queries && !enable_dispatcher && !enable_route_control) return;
     if (threadIdx.x == 0) {
       u32* ready_count = enable_queries ? params.query_kernel_ready_count
         : enable_dispatcher ? params.dispatcher_kernel_ready_count
-                           : params.control_kernel_ready_count;
+                            : params.control_kernel_ready_count;
       if (ready_count != nullptr) atomicAdd(ready_count, 1u);
       __threadfence_system();
     }
@@ -35,26 +35,29 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
     atomicAdd(params.kernel_ready_count, 1u);
     __threadfence_system();
   }
+
   __shared__ QueryDescriptor descriptor;
   __shared__ QueryDescriptor dispatch_descriptor;
-  __shared__ DeltaPublishDescriptor delta_descriptor;
+  __shared__ CentroidRoutePublishDescriptor route_descriptor;
   __shared__ u32 have_submission;
   __shared__ u32 dispatch_pending;
-  __shared__ u32 have_delta_submission;
+  __shared__ u32 have_route_submission;
   __shared__ u32 stop_requested;
   __shared__ u32 idle_cycles;
-  __shared__ i32 delta_status;
+  __shared__ i32 route_status;
   if (threadIdx.x == 0) {
     dispatch_pending = 0;
     idle_cycles = 256u + ((blockIdx.x * 131u) & 1023u);
   }
   __syncthreads();
+
   for (;;) {
     if (threadIdx.x == 0) {
       stop_requested = *reinterpret_cast<volatile u32*>(params.stop);
     }
     __syncthreads();
     if (stop_requested != 0) return;
+
     if (enable_dispatcher) {
       if (threadIdx.x == 0) {
         bool progressed = false;
@@ -80,564 +83,193 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
       __syncthreads();
       continue;
     }
+
     if (threadIdx.x == 0) {
-      have_delta_submission = enable_delta &&
-        params.delta_submissions.entries != nullptr &&
-        device_ring_try_pop(params.delta_submissions, delta_descriptor) ? 1u : 0u;
+      have_route_submission = enable_route_control &&
+        params.route_submissions.entries != nullptr &&
+        device_ring_try_pop(params.route_submissions, route_descriptor)
+          ? 1u : 0u;
     }
     __syncthreads();
-    if (have_delta_submission != 0) {
+    if (have_route_submission != 0) {
       if (threadIdx.x == 0) {
-        delta_status = 0;
-        const bool reset = (delta_descriptor.flags & kDeltaCommandReset) != 0;
-        const bool promote =
-          (delta_descriptor.flags & kDeltaCommandPromoteOverrides) != 0;
-        constexpr u32 known_flags =
-          kDeltaCommandReset | kDeltaCommandPromoteOverrides;
-        if ((delta_descriptor.flags & ~known_flags) != 0 ||
-            (reset && promote) ||
-            (reset && (delta_descriptor.first_slot != 0 ||
-                       delta_descriptor.record_count > params.delta_capacity ||
-                       delta_descriptor.final_count != 0 ||
-                       delta_descriptor.invalidation_count != 0 ||
-                       delta_descriptor.superseded_count != 0 ||
-                       delta_descriptor.override_count != 0 ||
-                       delta_descriptor.durable_count != 0 ||
-                       delta_descriptor.resident_pq_erase_count != 0 ||
-                       delta_descriptor.dynamic_route_count != 0 ||
-                       params.delta_records == nullptr ||
-                       params.delta_next == nullptr ||
-                       params.delta_prev == nullptr ||
-                       params.delta_remote_positions == nullptr ||
-                       params.delta_count == nullptr ||
-                       params.base_override_keys == nullptr ||
-                       params.base_override_epochs == nullptr ||
-                       params.base_override_capacity == 0 ||
-                       params.delta_remote_keys == nullptr ||
-                       params.delta_remote_slots == nullptr ||
-                       params.delta_remote_capacity == 0 ||
-                       (params.anchor_count != 0 &&
-                        params.delta_bucket_heads == nullptr))) ||
-            (!reset && (delta_descriptor.final_count > params.delta_capacity ||
-            delta_descriptor.record_count > params.delta_capacity ||
-            (delta_descriptor.record_count != 0 &&
-             (params.delta_staging_slots == nullptr ||
-              params.delta_staging_records == nullptr)) ||
-            (delta_descriptor.record_count != 0 &&
-             (params.delta_remote_positions == nullptr ||
-              params.delta_remote_capacity == 0)) ||
-            (delta_descriptor.record_count != 0 && params.vector_bytes != 0 &&
-             (params.delta_staging_vectors == nullptr || params.delta_vectors == nullptr)) ||
-            (delta_descriptor.record_count != 0 && params.pq_code_bytes != 0 &&
-             (params.delta_pq_codes == nullptr || params.delta_encode_scratch == nullptr ||
-              params.pq_centroids == nullptr || params.resident_pq_codes == nullptr ||
-              params.resident_pq_keys == nullptr ||
-              params.resident_pq_slots == nullptr ||
-              params.resident_pq_positions == nullptr ||
-              params.resident_pq_capacity == 0 ||
-              params.resident_pq_table_capacity == 0)) ||
-            (delta_descriptor.durable_count != 0 &&
-             params.delta_durable_updates == nullptr) ||
-            (delta_descriptor.resident_pq_erase_count != 0 &&
-             (params.resident_pq_erase_updates == nullptr ||
-              params.resident_pq_keys == nullptr ||
-              params.resident_pq_slots == nullptr ||
-              params.resident_pq_positions == nullptr ||
-              params.resident_pq_capacity == 0 ||
-              params.resident_pq_table_capacity == 0)) ||
-            (delta_descriptor.dynamic_route_count != 0 &&
-             (params.dynamic_route_updates == nullptr ||
-              params.dynamic_route_code_updates == nullptr ||
-              params.dynamic_route_slots == nullptr ||
-              params.dynamic_route_pq_codes == nullptr ||
-              params.pq_code_bytes == 0 ||
-              params.dynamic_route_capacity == 0 ||
-              delta_descriptor.dynamic_route_count >
-                params.dynamic_route_capacity)) ||
-            (promote && delta_descriptor.override_count != 0 &&
-             (params.delta_override_updates == nullptr ||
-              params.permanent_override_bits == nullptr ||
-              params.permanent_override_words == 0)) ||
-            (!promote && delta_descriptor.override_count != 0 &&
-             (params.delta_override_updates == nullptr ||
-              params.base_override_keys == nullptr ||
-              params.base_override_epochs == nullptr ||
-              params.base_override_capacity == 0))))) {
-          delta_status = -EINVAL;
+        route_status = 0;
+        if (route_descriptor.command_id == 0 ||
+            route_descriptor.update_count == 0 ||
+            route_descriptor.update_count >
+              params.centroid_route_shard_capacity ||
+            params.centroid_route_updates == nullptr ||
+            params.centroid_route_centroid_updates == nullptr ||
+            params.centroid_route_shards == nullptr ||
+            params.centroid_route_entries == nullptr ||
+            params.shard_centroids == nullptr ||
+            params.centroid_route_epoch == nullptr ||
+            params.centroid_route_shard_capacity == 0 ||
+            params.centroid_route_entry_capacity == 0 ||
+            params.centroid_route_entry_capacity >
+              kCentroidRouteMaxLiveEntries) {
+          route_status = -EINVAL;
         }
       }
       __syncthreads();
 
-      if ((delta_descriptor.flags & kDeltaCommandReset) != 0) {
-        if (delta_status == 0) {
-          for (u32 index = threadIdx.x; index < delta_descriptor.record_count;
-               index += blockDim.x) {
-            const DeviceDeltaRecord record = params.delta_records[index];
-            const u32 remote_position = params.delta_remote_positions[index];
-            if (record.remote_node != 0 &&
-                remote_position < params.delta_remote_capacity &&
-                load_cg(params.delta_remote_slots + remote_position) == index) {
-              atomicCAS(reinterpret_cast<unsigned long long*>(
-                          params.delta_remote_keys + remote_position),
-                        record.remote_node, kDeltaRemoteTombstone);
-              atomicExch(params.delta_remote_slots + remote_position, UINT32_MAX);
-            }
-            if (record.base_ordinal < params.num_nodes) {
-              const u32 mask = params.base_override_capacity - 1;
-              u32 position = hash32(record.base_ordinal) & mask;
-              for (u32 probe = 0; probe < params.base_override_capacity; ++probe) {
-                const u32 key = load_cg(params.base_override_keys + position);
-                if (key == record.base_ordinal) {
-                  if (atomicCAS(params.base_override_keys + position,
-                                record.base_ordinal,
-                                kBaseOverrideTombstone) == record.base_ordinal) {
-                    params.base_override_epochs[position] = 0;
-                  }
-                  break;
-                }
-                if (key == kBaseOverrideEmpty) break;
-                position = (position + 1) & mask;
-              }
-            }
-            params.delta_records[index] = {};
-            params.delta_records[index].base_ordinal = kBaseOverrideEmpty;
-            params.delta_next[index] = UINT32_MAX;
-            params.delta_prev[index] = UINT32_MAX;
-            params.delta_remote_positions[index] = UINT32_MAX;
-          }
-          for (u32 index = threadIdx.x; index < params.anchor_count;
-               index += blockDim.x) {
-            params.delta_bucket_heads[index] = UINT32_MAX;
-          }
-        }
-        __syncthreads();
-        if (threadIdx.x == 0 && delta_status == 0) {
-          __threadfence();
-          atomicExch(params.delta_count, 0u);
-          __threadfence_system();
-        }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-          device_ring_push(params.delta_completions, DeltaPublishCompletion{
-            .command_id = delta_descriptor.command_id,
-            .status = delta_status,
-            .final_count = 0,
-          });
-        }
-        __syncthreads();
-        continue;
-      }
-
-      if (delta_status == 0) {
+      if (route_status == 0) {
         for (u32 index = threadIdx.x;
-             index < delta_descriptor.record_count;
+             index < route_descriptor.update_count;
              index += blockDim.x) {
-          const u32 slot = params.delta_staging_slots[index];
-          if (slot >= delta_descriptor.final_count || slot >= params.delta_capacity) {
-            atomicExch(&delta_status, -EINVAL);
-          }
-        }
-        __syncthreads();
-      }
-
-      if (delta_status == 0) {
-        for (u32 index = threadIdx.x;
-             index < delta_descriptor.dynamic_route_count;
-             index += blockDim.x) {
-          const DynamicRouteUpdate update =
-            params.dynamic_route_updates[index];
-          const bool live = (update.flags & kDynamicRouteLive) != 0;
-          bool duplicate_slot = false;
+          const CentroidRouteUpdate update =
+            params.centroid_route_updates[index];
+          bool duplicate_shard = false;
           for (u32 prior = 0; prior < index; ++prior) {
-            duplicate_slot = duplicate_slot ||
-              params.dynamic_route_updates[prior].slot == update.slot;
+            duplicate_shard = duplicate_shard ||
+              params.centroid_route_updates[prior].shard == update.shard;
           }
-          if (update.slot >= params.dynamic_route_capacity ||
-              update.shard >= params.num_shards ||
-              update.epoch == 0 ||
-              update.slot / kDynamicRouteSlotsPerShard != update.shard ||
-              (update.flags & ~kDynamicRouteLive) != 0 ||
-              (live &&
-               (update.remote_node == 0 ||
-                static_cast<u32>(update.remote_node >> 48) != update.shard)) ||
-              (!live && update.remote_node != 0) || duplicate_slot) {
-            atomicExch(&delta_status, -EINVAL);
+          bool invalid_entry = false;
+          for (u32 entry = 0; entry < update.live_entry_count; ++entry) {
+            const DeviceCentroidRouteEntry& candidate = update.entries[entry];
+            invalid_entry = invalid_entry || candidate.remote_node == 0 ||
+              candidate.flags != kCentroidRouteLive ||
+              remote_shard(candidate.remote_node) != update.shard;
+            for (u32 prior = 0; prior < entry; ++prior) {
+              invalid_entry = invalid_entry ||
+                update.entries[prior].remote_node == candidate.remote_node;
+            }
+          }
+          if (update.shard >= params.num_shards ||
+              update.shard >= params.centroid_route_shard_capacity ||
+              update.version == 0 ||
+              update.live_entry_count > params.centroid_route_entry_capacity ||
+              ((update.vector_count == 0) !=
+               (update.live_entry_count == 0)) ||
+              duplicate_shard || invalid_entry) {
+            atomicExch(&route_status, -EINVAL);
             continue;
           }
-          const DeviceDynamicRouteSlot& current =
-            params.dynamic_route_slots[update.slot];
+          const DeviceCentroidRouteShard& current =
+            params.centroid_route_shards[update.shard];
           const u64 current_command =
-            dynamic_route_atomic_load(current.command_id);
-          const u32 current_id = dynamic_route_atomic_load(current.id);
-          const u32 current_generation =
-            dynamic_route_atomic_load(current.generation);
-          if (current_command >= delta_descriptor.command_id ||
-              (current_id == update.id &&
-               current_generation > update.generation)) {
-            atomicExch(&delta_status, -ESTALE);
-          }
-        }
-        __syncthreads();
-      }
-
-      if (delta_status == 0) {
-        for (u32 index = threadIdx.x;
-             index < delta_descriptor.record_count;
-             index += blockDim.x) {
-          const u32 slot = params.delta_staging_slots[index];
-          params.delta_records[slot] = params.delta_staging_records[index];
-          params.delta_next[slot] = UINT32_MAX;
-          params.delta_prev[slot] = UINT32_MAX;
-        }
-        for (u64 index = threadIdx.x;
-             index < static_cast<u64>(delta_descriptor.record_count) * params.vector_bytes;
-             index += blockDim.x) {
-          const u32 record_index = static_cast<u32>(index / params.vector_bytes);
-          const u32 byte = static_cast<u32>(index % params.vector_bytes);
-          const u32 slot = params.delta_staging_slots[record_index];
-          params.delta_vectors[static_cast<u64>(slot) * params.vector_bytes + byte] =
-            params.delta_staging_vectors[index];
-        }
-        __syncthreads();
-
-        for (u64 index = threadIdx.x;
-             index < static_cast<u64>(delta_descriptor.record_count) * params.dim;
-             index += blockDim.x) {
-          const u32 record_index = static_cast<u32>(index / params.dim);
-          const u32 row = static_cast<u32>(index % params.dim);
-          const u32 slot = params.delta_staging_slots[record_index];
-          const DeviceDeltaRecord record = params.delta_records[slot];
-          f32 transformed = 0.0f;
-          if ((record.flags & kDeltaDeleted) == 0) {
-            const u8* vector = params.delta_vectors +
-              static_cast<size_t>(slot) * params.vector_bytes;
-            if (params.opq_matrix == nullptr) {
-              transformed = storage_component(params, vector, row);
-            } else {
-              const f32* matrix_row = params.opq_matrix +
-                static_cast<size_t>(row) * params.dim;
-              for (u32 column = 0; column < params.dim; ++column) {
-                transformed += matrix_row[column] *
-                  storage_component(params, vector, column);
-              }
-            }
-          }
-          params.delta_encode_scratch[index] = transformed;
-        }
-        __syncthreads();
-
-        for (u64 index = threadIdx.x;
-             index < static_cast<u64>(delta_descriptor.record_count) * params.pq_code_bytes;
-             index += blockDim.x) {
-          const u32 record_index = static_cast<u32>(index / params.pq_code_bytes);
-          const u32 subquantizer = static_cast<u32>(index % params.pq_code_bytes);
-          const u32 slot = params.delta_staging_slots[record_index];
-          u8 best_code = 0;
-          if ((params.delta_records[slot].flags & kDeltaDeleted) == 0) {
-            const f32* transformed = params.delta_encode_scratch +
-              static_cast<size_t>(record_index) * params.dim +
-              static_cast<size_t>(subquantizer) * params.pq_subvector_dim;
-            const f32* centroids = params.pq_centroids +
-              static_cast<size_t>(subquantizer) * 256 * params.pq_subvector_dim;
-            f32 best_distance = FLT_MAX;
-            for (u32 centroid = 0; centroid < 256; ++centroid) {
-              f32 distance = 0.0f;
-              for (u32 dimension = 0; dimension < params.pq_subvector_dim; ++dimension) {
-                const f32 difference = transformed[dimension] -
-                  centroids[static_cast<size_t>(centroid) * params.pq_subvector_dim + dimension];
-                distance += difference * difference;
-              }
-              if (distance < best_distance) {
-                best_distance = distance;
-                best_code = static_cast<u8>(centroid);
-              }
-            }
-          }
-          params.delta_pq_codes[
-            static_cast<size_t>(slot) * params.pq_code_bytes + subquantizer] = best_code;
-          const u32 resident_slot = params.delta_records[slot].resident_pq_slot;
-          if ((params.delta_records[slot].flags & kDeltaDeleted) == 0) {
-            if (resident_slot >= params.resident_pq_capacity) {
-              atomicExch(&delta_status, -ENOSPC);
-            } else {
-              params.resident_pq_codes[
-                static_cast<size_t>(resident_slot) * params.pq_code_bytes +
-                subquantizer] = best_code;
-            }
-          }
-        }
-        __threadfence();
-        __syncthreads();
-
-        for (u32 index = threadIdx.x;
-             index < delta_descriptor.invalidation_count;
-             index += blockDim.x) {
-          const u64 key = params.graph_invalidation_keys[index];
-          const u32 route_slot = anchor_graph_slot(params, key);
-          if (route_slot != UINT32_MAX &&
-              params.anchor_graph_states != nullptr) {
-            atomicCAS(params.anchor_graph_states + route_slot,
-                      kAnchorGraphReady, kAnchorGraphStale);
-          }
-        }
-
-        if (threadIdx.x == 0) {
-          for (u32 index = 0; index < delta_descriptor.superseded_count; ++index) {
-            const DeltaSupersedeUpdate update = params.delta_supersede_updates[index];
-            if (update.slot >= delta_descriptor.final_count) {
-              delta_status = -EINVAL;
-              continue;
-            }
-            DeviceDeltaRecord& record = params.delta_records[update.slot];
-            record.superseded_epoch = update.epoch;
-            unlink_mutable_delta(params, update.slot);
-          }
-        }
-
-        if ((delta_descriptor.flags & kDeltaCommandPromoteOverrides) != 0) {
-          for (u32 index = threadIdx.x;
-               index < delta_descriptor.override_count;
-               index += blockDim.x) {
-            const u32 ordinal = params.delta_override_updates[index].ordinal;
-            if (ordinal >= params.num_nodes) {
-              atomicExch(&delta_status, -EINVAL);
-              continue;
-            }
-            atomicOr(params.permanent_override_bits + ordinal / 32,
-                     1u << (ordinal % 32));
-          }
-        } else if (threadIdx.x == 0) {
-          const u32 mask = params.base_override_capacity - 1;
-          for (u32 index = 0; index < delta_descriptor.override_count; ++index) {
-            const DeltaOverrideUpdate update = params.delta_override_updates[index];
-            u32 position = hash32(update.ordinal) & mask;
-            u32 first_tombstone = UINT32_MAX;
-            bool inserted = false;
-            for (u32 probe = 0; probe < params.base_override_capacity; ++probe) {
-              const u32 key = params.base_override_keys[position];
-              if (key == update.ordinal) {
-                params.base_override_epochs[position] = min(
-                  params.base_override_epochs[position], update.epoch);
-                inserted = true;
-                break;
-              }
-              if (key == kBaseOverrideTombstone && first_tombstone == UINT32_MAX) {
-                first_tombstone = position;
-              }
-              if (key == kBaseOverrideEmpty) {
-                const u32 destination = first_tombstone == UINT32_MAX
-                  ? position : first_tombstone;
-                params.base_override_epochs[destination] = update.epoch;
-                __threadfence();
-                params.base_override_keys[destination] = update.ordinal;
-                inserted = true;
-                break;
-              }
-              position = (position + 1) & mask;
-            }
-            if (!inserted && first_tombstone != UINT32_MAX) {
-              params.base_override_epochs[first_tombstone] = update.epoch;
-              __threadfence();
-              params.base_override_keys[first_tombstone] = update.ordinal;
-              inserted = true;
-            }
-            if (!inserted) delta_status = -ENOSPC;
-          }
-        }
-
-        if (threadIdx.x == 0) {
-          for (u32 index = 0; index < delta_descriptor.durable_count; ++index) {
-            const DeltaDurableUpdate update = params.delta_durable_updates[index];
-            if (update.slot >= delta_descriptor.final_count) {
-              delta_status = -EINVAL;
-              continue;
-            }
-            DeviceDeltaRecord& record = params.delta_records[update.slot];
-            if (record.epoch == update.epoch) {
-              if (record.superseded_epoch == 0) {
-                record.superseded_epoch = update.epoch;
-              }
-              unlink_mutable_delta(params, update.slot);
-              const u32 remote_position = params.delta_remote_positions[update.slot];
-              if (record.remote_node != 0 &&
-                  remote_position < params.delta_remote_capacity &&
-                  load_cg(params.delta_remote_slots + remote_position) == update.slot) {
-                atomicCAS(reinterpret_cast<unsigned long long*>(
-                            params.delta_remote_keys + remote_position),
-                          record.remote_node, kDeltaRemoteTombstone);
-                atomicExch(params.delta_remote_slots + remote_position, UINT32_MAX);
-              }
-              params.delta_remote_positions[update.slot] = UINT32_MAX;
-              if (record.base_ordinal < params.num_nodes) {
-                atomicOr(params.permanent_override_bits + record.base_ordinal / 32,
-                         1u << (record.base_ordinal % 32));
-                const u32 mask = params.base_override_capacity - 1;
-                u32 position = hash32(record.base_ordinal) & mask;
-                for (u32 probe = 0; probe < params.base_override_capacity; ++probe) {
-                  const u32 key = load_cg(params.base_override_keys + position);
-                  if (key == record.base_ordinal) {
-                    if (atomicCAS(params.base_override_keys + position,
-                                  record.base_ordinal,
-                                  kBaseOverrideTombstone) == record.base_ordinal) {
-                      params.base_override_epochs[position] = 0;
-                    }
-                    break;
-                  }
-                  if (key == kBaseOverrideEmpty) break;
-                  position = (position + 1) & mask;
-                }
-              }
-            }
-          }
-          for (u32 index = 0;
-               index < delta_descriptor.resident_pq_erase_count; ++index) {
-            erase_resident_pq(params, params.resident_pq_erase_updates[index]);
+            centroid_route_atomic_load(current.command_id);
+          const u64 current_version =
+            centroid_route_atomic_load(current.version);
+          if (current_command >= route_descriptor.command_id ||
+              current_version > update.version) {
+            atomicExch(&route_status, -ESTALE);
           }
         }
       }
       __syncthreads();
 
-      if (delta_status == 0) {
+      if (route_status == 0) {
         if (threadIdx.x == 0) {
-          const u32 mask = params.delta_remote_capacity - 1;
-          for (u32 index = 0; index < delta_descriptor.record_count; ++index) {
-            const u32 slot = params.delta_staging_slots[index];
-            const DeviceDeltaRecord record = params.delta_records[slot];
-            if ((record.flags & kDeltaDeleted) == 0 &&
-                !insert_resident_pq(
-                  params, record.remote_node, record.resident_pq_slot)) {
-              delta_status = -ENOSPC;
-              break;
-            }
-            params.delta_remote_positions[slot] = UINT32_MAX;
-            if (record.remote_node != 0 && params.delta_remote_capacity != 0) {
-              u32 position = hash64(record.remote_node) & mask;
-              u32 first_tombstone = UINT32_MAX;
-              bool inserted = false;
-              for (u32 probe = 0; probe < params.delta_remote_capacity; ++probe) {
-                const u64 key = params.delta_remote_keys[position];
-                if (key == record.remote_node) {
-                  params.delta_remote_slots[position] = slot;
-                  params.delta_remote_positions[slot] = position;
-                  inserted = true;
-                  break;
-                }
-                if (key == kDeltaRemoteTombstone && first_tombstone == UINT32_MAX) {
-                  first_tombstone = position;
-                }
-                if (key == kDeltaRemoteEmpty) {
-                  const u32 destination = first_tombstone == UINT32_MAX
-                    ? position : first_tombstone;
-                  params.delta_remote_slots[destination] = slot;
-                  __threadfence();
-                  params.delta_remote_keys[destination] = record.remote_node;
-                  params.delta_remote_positions[slot] = destination;
-                  inserted = true;
-                  break;
-                }
-                position = (position + 1) & mask;
-              }
-              if (!inserted && first_tombstone != UINT32_MAX) {
-                params.delta_remote_slots[first_tombstone] = slot;
-                __threadfence();
-                params.delta_remote_keys[first_tombstone] = record.remote_node;
-                params.delta_remote_positions[slot] = first_tombstone;
-                inserted = true;
-              }
-              if (!inserted) {
-                delta_status = -ENOSPC;
-                break;
-              }
-            }
-            if ((record.flags & (kDeltaDeleted | kDeltaDurable)) == 0 &&
-                record.superseded_epoch == 0 &&
-                params.delta_bucket_heads != nullptr) {
-              const u32 old_head = params.delta_bucket_heads[record.anchor_bucket];
-              params.delta_prev[slot] = UINT32_MAX;
-              params.delta_next[slot] = old_head;
-              if (old_head < params.delta_capacity) {
-                params.delta_prev[old_head] = slot;
-              }
-              params.delta_bucket_heads[record.anchor_bucket] = slot;
-            }
+          cuda::atomic_ref<u64, cuda::thread_scope_device> route_epoch(
+            *params.centroid_route_epoch);
+          const u64 previous = route_epoch.fetch_add(
+            1, cuda::memory_order_acq_rel);
+          // Only the dedicated control CTA writes this epoch, so observing an
+          // odd value indicates memory corruption rather than contention.
+          if ((previous & 1u) != 0) {
+            atomicExch(&route_status, -EIO);
           }
         }
+        __syncthreads();
       }
-      __syncthreads();
-      if (delta_status == 0) {
-        // Canonical storage-route codes become visible before a route slot can
-        // point at them. Mark every changing slot odd before touching either
-        // its code or metadata; query scoring rechecks the same sequence after
-        // consuming both.
+
+      if (route_status == 0) {
+        // One shard seqlock covers its centroid and complete live-entry set.
         for (u32 index = threadIdx.x;
-             index < delta_descriptor.dynamic_route_count;
+             index < route_descriptor.update_count;
              index += blockDim.x) {
-          const DynamicRouteUpdate update =
-            params.dynamic_route_updates[index];
-          DeviceDynamicRouteSlot& destination =
-            params.dynamic_route_slots[update.slot];
+          const CentroidRouteUpdate update =
+            params.centroid_route_updates[index];
+          DeviceCentroidRouteShard& destination =
+            params.centroid_route_shards[update.shard];
           cuda::atomic_ref<u64, cuda::thread_scope_device> sequence(
             destination.sequence);
           sequence.fetch_add(1, cuda::memory_order_acq_rel);
         }
         __syncthreads();
-        for (u64 byte = threadIdx.x;
-             byte < static_cast<u64>(delta_descriptor.dynamic_route_count) *
-                      params.pq_code_bytes;
-             byte += blockDim.x) {
+
+        for (u64 item = threadIdx.x;
+             item < static_cast<u64>(route_descriptor.update_count) *
+                      params.dim;
+             item += blockDim.x) {
+          const u32 update_index = static_cast<u32>(item / params.dim);
+          const u32 dimension = static_cast<u32>(item % params.dim);
+          const CentroidRouteUpdate update =
+            params.centroid_route_updates[update_index];
+          params.shard_centroids[
+            static_cast<size_t>(update.shard) * params.dim + dimension] =
+              params.centroid_route_centroid_updates[item];
+        }
+        for (u64 item = threadIdx.x;
+             item < static_cast<u64>(route_descriptor.update_count) *
+                      params.centroid_route_entry_capacity;
+             item += blockDim.x) {
           const u32 update_index = static_cast<u32>(
-            byte / params.pq_code_bytes);
-          const u32 code_byte = static_cast<u32>(
-            byte % params.pq_code_bytes);
-          const DynamicRouteUpdate update =
-            params.dynamic_route_updates[update_index];
-          if ((update.flags & kDynamicRouteLive) != 0) {
-            params.dynamic_route_pq_codes[
-              static_cast<size_t>(update.slot) * params.pq_code_bytes +
-              code_byte] = params.dynamic_route_code_updates[byte];
-          }
+            item / params.centroid_route_entry_capacity);
+          const u32 entry = static_cast<u32>(
+            item % params.centroid_route_entry_capacity);
+          const CentroidRouteUpdate update =
+            params.centroid_route_updates[update_index];
+          params.centroid_route_entries[
+            static_cast<size_t>(update.shard) *
+              params.centroid_route_entry_capacity + entry] =
+            entry < update.live_entry_count
+              ? update.entries[entry] : DeviceCentroidRouteEntry{};
         }
         __threadfence();
         __syncthreads();
+
         for (u32 index = threadIdx.x;
-             index < delta_descriptor.dynamic_route_count;
+             index < route_descriptor.update_count;
              index += blockDim.x) {
-          const DynamicRouteUpdate update =
-            params.dynamic_route_updates[index];
-          DeviceDynamicRouteSlot& destination =
-            params.dynamic_route_slots[update.slot];
+          const CentroidRouteUpdate update =
+            params.centroid_route_updates[index];
+          DeviceCentroidRouteShard& destination =
+            params.centroid_route_shards[update.shard];
           cuda::atomic_ref<u64, cuda::thread_scope_device> sequence(
             destination.sequence);
-          dynamic_route_atomic_store(
-            destination.command_id, delta_descriptor.command_id);
-          dynamic_route_atomic_store(destination.epoch, update.epoch);
-          dynamic_route_atomic_store(
-            destination.remote_node, update.remote_node);
-          dynamic_route_atomic_store(destination.id, update.id);
-          dynamic_route_atomic_store(
-            destination.generation, update.generation);
-          dynamic_route_atomic_store(destination.shard, update.shard);
-          dynamic_route_atomic_store(destination.flags, update.flags);
+          centroid_route_atomic_store(
+            destination.command_id, route_descriptor.command_id);
+          centroid_route_atomic_store(destination.version, update.version);
+          centroid_route_atomic_store(
+            destination.vector_count, update.vector_count);
+          centroid_route_atomic_store(
+            destination.live_entry_count, update.live_entry_count);
           __threadfence();
           sequence.fetch_add(1, cuda::memory_order_release);
         }
-      }
-      __syncthreads();
-      if (threadIdx.x == 0 && delta_status == 0) {
         __threadfence();
-        atomicExch(params.delta_count, delta_descriptor.final_count);
-        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+          cuda::atomic_ref<u64, cuda::thread_scope_device> route_epoch(
+            *params.centroid_route_epoch);
+          route_epoch.fetch_add(1, cuda::memory_order_release);
+        }
+      } else if (params.centroid_route_epoch != nullptr && threadIdx.x == 0) {
+        // Restore an epoch opened above if a defensive consistency check ever
+        // fails after validation. No partially written shard is published by
+        // that path, but leaving the epoch odd would stop all future queries.
+        cuda::atomic_ref<u64, cuda::thread_scope_device> route_epoch(
+          *params.centroid_route_epoch);
+        const u64 current = route_epoch.load(cuda::memory_order_relaxed);
+        if ((current & 1u) != 0) {
+          route_epoch.fetch_add(1, cuda::memory_order_release);
+        }
       }
       __syncthreads();
+
       if (threadIdx.x == 0) {
-        device_ring_push(params.delta_completions, DeltaPublishCompletion{
-          .command_id = delta_descriptor.command_id,
-          .status = delta_status,
-          .final_count = delta_status == 0 ? delta_descriptor.final_count : 0u,
-        });
+        device_ring_push(
+          params.route_completions,
+          CentroidRoutePublishCompletion{
+            .command_id = route_descriptor.command_id,
+            .status = route_status,
+            .update_count =
+              route_status == 0 ? route_descriptor.update_count : 0u,
+          });
+        idle_cycles = 256u;
       }
-      __syncthreads();
-      if (threadIdx.x == 0) idle_cycles = 256u;
       __syncthreads();
       continue;
     }
@@ -993,23 +625,6 @@ __global__ void gpunetio_owner_read_probe_kernel(
   __threadfence_system();
   phases[qp_index] = 4;
   __threadfence_system();
-}
-
-__global__ void gather_anchor_codes_kernel(const u8* base_codes,
-                                           const u32* anchor_handles,
-                                           u8* anchor_codes,
-                                           u32 anchor_count,
-                                           u32 code_bytes,
-                                           u32 node_count) {
-  const u64 byte = static_cast<u64>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const u64 total = static_cast<u64>(anchor_count) * code_bytes;
-  if (byte >= total) return;
-  const u32 anchor = static_cast<u32>(byte / code_bytes);
-  const u32 code_byte = static_cast<u32>(byte % code_bytes);
-  const u32 handle = anchor_handles[anchor];
-  anchor_codes[byte] = handle < node_count
-    ? base_codes[static_cast<u64>(handle) * code_bytes + code_byte]
-    : 0;
 }
 
 }  // namespace gpu_search::persistent_kernel_detail

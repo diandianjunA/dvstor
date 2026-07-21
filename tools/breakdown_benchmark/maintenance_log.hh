@@ -14,8 +14,8 @@ namespace tools::breakdown_benchmark {
 inline constexpr size_t kMaintenanceLatencyBucketCount = 18;
 
 struct MaintenanceObservation {
-  uint64_t stitch_enqueued{};
-  uint64_t stitched_live{};
+  uint64_t stage2_enqueued{};
+  uint64_t stage2_finalized_live{};
   uint64_t stale{};
   uint64_t remaining{};
   uint64_t peer_reverse_remaining{};
@@ -23,13 +23,25 @@ struct MaintenanceObservation {
   uint64_t peer_reverse_failed{};
   uint64_t admission_window{};
   uint64_t completion_outstanding{};
-  double p99_stitch_delay_upper_ms{};
-  bool p99_stitch_delay_over_30s{};
+  uint64_t stage2_continuations{};
+  uint64_t stage2_remote_frontier_items{};
+  uint64_t stage2_remote_expansions{};
+  uint64_t stage2_scored_candidates{};
+  uint64_t stage2_migrations{};
+  uint64_t stage2_final_edges{};
+  uint64_t stage2_cross_edges_stage1_home{};
+  uint64_t stage2_cross_edges_final_home{};
+  uint64_t stage1_search_budget_exhausted{};
+  uint64_t stage2_search_budget_exhausted{};
+  double p99_stage2_delay_upper_ms{};
+  bool p99_stage2_delay_over_30s{};
   std::array<uint64_t, kMaintenanceLatencyBucketCount>
-    stitch_delay_histogram{};
+    stage2_delay_histogram{};
   bool failure_counters_available{};
-  bool stitch_delay_histogram_available{};
+  bool stage2_delay_histogram_available{};
   bool completion_window_available{};
+  bool locality_counters_available{};
+  bool search_budget_counters_available{};
 
   uint64_t backlog() const;
 };
@@ -53,15 +65,30 @@ struct MaintenanceLogSummary {
   uint64_t admission_window{};
   uint64_t completion_outstanding{};
   uint64_t max_completion_outstanding_per_shard{};
-  double p99_stitch_delay_upper_ms{};
-  bool p99_stitch_delay_over_30s{};
-  uint64_t p99_stitch_delay_samples{};
-  bool p99_stitch_delay_available{};
+  uint64_t stage2_finalized_live{};
+  uint64_t stage2_continuations{};
+  uint64_t stage2_remote_frontier_items{};
+  uint64_t stage2_remote_expansions{};
+  uint64_t stage2_scored_candidates{};
+  uint64_t stage2_migrations{};
+  uint64_t stage2_final_edges{};
+  uint64_t stage2_cross_edges_stage1_home{};
+  uint64_t stage2_cross_edges_final_home{};
+  uint64_t stage1_search_budget_exhausted{};
+  uint64_t stage2_search_budget_exhausted{};
+  double p99_stage2_delay_upper_ms{};
+  bool p99_stage2_delay_over_30s{};
+  uint64_t p99_stage2_delay_samples{};
+  bool p99_stage2_delay_available{};
   size_t logs_with_failure_deltas{};
   size_t logs_with_histogram_deltas{};
   size_t logs_with_completion_window{};
+  size_t logs_with_locality_deltas{};
+  size_t logs_with_search_budget_deltas{};
   bool failure_delta_available{};
   bool completion_window_available{};
+  bool locality_delta_available{};
+  bool search_budget_delta_available{};
   double backlog_slope_per_sec{};
   bool backlog_slope_available{};
   std::vector<std::string> unreadable_logs;

@@ -21,12 +21,6 @@ void PersistentSearchEngine::Impl::reject_submission(const PendingSubmission& su
     }
   }
   if (!pending) return;
-  if (active_query_tickets != nullptr) {
-    active_query_tickets[pending->slot].store(0, std::memory_order_release);
-  }
-  if (active_query_snapshots != nullptr) {
-    active_query_snapshots[pending->slot].store(0, std::memory_order_release);
-  }
   pending->promise.set_exception(
     std::make_exception_ptr(std::runtime_error(message)));
   {
@@ -35,7 +29,6 @@ void PersistentSearchEngine::Impl::reject_submission(const PendingSubmission& su
   }
   slot_cv.notify_one();
   pending_count.fetch_sub(1, std::memory_order_release);
-  maintenance_cv.notify_all();
 }
 
 void PersistentSearchEngine::Impl::mark_unhealthy(const std::string& message) {
@@ -82,12 +75,6 @@ void PersistentSearchEngine::Impl::reject_all_pending(const std::string& message
   {
     std::lock_guard<std::mutex> lock(slot_mutex);
     for (const auto& pending : rejected) {
-      if (active_query_tickets != nullptr) {
-        active_query_tickets[pending->slot].store(0, std::memory_order_release);
-      }
-      if (active_query_snapshots != nullptr) {
-        active_query_snapshots[pending->slot].store(0, std::memory_order_release);
-      }
       free_slots.push_back(pending->slot);
     }
   }
@@ -100,7 +87,6 @@ void PersistentSearchEngine::Impl::reject_all_pending(const std::string& message
   }
   pending_count.fetch_sub(rejected.size(), std::memory_order_release);
   slot_cv.notify_all();
-  maintenance_cv.notify_all();
 }
 
 void PersistentSearchEngine::Impl::bind_cuda_device(const char* operation) const {

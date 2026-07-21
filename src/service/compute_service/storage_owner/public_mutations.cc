@@ -12,6 +12,12 @@ size_t ComputeService::submit_storage_owner_mutations(
   if (storage_insert_owners_.empty()) {
     throw std::runtime_error("storage_owner mutation runtime is not initialized");
   }
+  for (const auto& item : items) {
+    if (item.id >= config_.max_vectors) {
+      throw std::out_of_range(
+        "mutation id exceeds the configured bounded vector namespace");
+    }
+  }
   if (kind != service::storage_owner::MutationKind::erase) {
     for (const auto& item : items) {
       if (item.values.size() != config_.dim) {
@@ -24,6 +30,8 @@ size_t ComputeService::submit_storage_owner_mutations(
   // calls so the synchronous API does not allocate on every operation while
   // still supporting arbitrary public batch sizes.
   thread_local vec<u32> pending;
+  thread_local vec<byte_t> canonical_bytes;
+  thread_local vec<element_t> canonical_vector;
   pending.clear();
   pending.reserve(std::min<size_t>(
     items.size(), storage_completion_pool_->capacity()));
@@ -63,23 +71,34 @@ size_t ComputeService::submit_storage_owner_mutations(
 
   for (const auto& item : items) {
     const auto operation_started = std::chrono::steady_clock::now();
-    u32 owner_storage = 0;
-    const std::optional<u32> known_owner =
-      known_storage_owner_for_id(item.id);
-    if (known_owner.has_value()) {
-      owner_storage = *known_owner;
-    } else {
-      // Every compute node proposes the same owner for an unseen ID. The
-      // process-local claim still serializes racing mutations here, while the
-      // deterministic proposal prevents split ownership across compute nodes.
-      const u32 proposed_owner = num_servers_ == 0
-        ? 0
-        : static_cast<u32>(item.id % num_servers_);
-      owner_storage = claim_storage_owner_for_mutation(
-        item.id, proposed_owner);
-    }
+    // Logical authority never follows physical placement. Every compute node
+    // derives the same shard for base and dynamic IDs, while that authority's
+    // storage-side directory resolves the current centroid-selected record.
+    const u32 owner_storage = static_cast<u32>(item.id % num_servers_);
     lib_assert(owner_storage < storage_insert_owners_.size(),
                "storage-owner route selected an invalid owner");
+    u32 stage1_home = owner_storage;
+    if (kind != service::storage_owner::MutationKind::erase) {
+      if (persistent_search_ == nullptr) {
+        throw std::runtime_error(
+          "centroid home selection requires the persistent query engine");
+      }
+      canonical_bytes.resize(VamanaNode::vector_bytes());
+      encode_float_vector_to_storage(
+        item.values.data(), config_.dim, VamanaNode::vector_dtype(),
+        canonical_bytes.data());
+      canonical_vector.resize(config_.dim);
+      decode_storage_vector_to_float(
+        canonical_bytes.data(), VamanaNode::vector_dtype(), config_.dim,
+        canonical_vector.data());
+      const auto selected = persistent_search_->select_centroid_home(
+        span<const element_t>{canonical_vector});
+      if (!selected.has_value() || *selected >= num_servers_) {
+        throw std::runtime_error(
+          "no live physical-shard centroid is available for mutation");
+      }
+      stage1_home = *selected;
+    }
 
     u32 completion_id = 0;
     while (!storage_completion_pool_->try_acquire(completion_id)) {
@@ -100,24 +119,20 @@ size_t ComputeService::submit_storage_owner_mutations(
       service::breakdown::Subcategory::cpu_storage_owner_route,
       duration_ns(operation_started, route_finished));
 
-    // Capacity is acquired before the descriptor can reach storage stage1.
-    // Backpressure happens here, never after owner memory has been mutated.
-    if (persistent_search_ != nullptr) {
-      persistent_search_->reserve_mutation_capacity(1);
-    }
-
     auto& state = *storage_insert_owners_[owner_storage];
     u32 task_id = 0;
     state.free_tasks->pop_wait(task_id);
     auto& task = state.tasks[task_id];
-    task.item.id = item.id;
+    task.id = item.id;
     if (kind == service::storage_owner::MutationKind::erase) {
-      task.item.values.clear();
+      task.encoded_vector.clear();
     } else {
-      task.item.values.assign(item.values.begin(), item.values.end());
+      task.encoded_vector.assign(
+        canonical_bytes.begin(), canonical_bytes.end());
     }
     task.kind = kind;
     task.completion_id = completion_id;
+    task.stage1_home = stage1_home;
     task.enqueued_at = std::chrono::steady_clock::now();
     task.sender_dequeued_at = {};
     state.queue->push_wait(task_id);

@@ -5,7 +5,7 @@
 namespace gpu_search::persistent_kernel_detail {
 
 struct CandidateWorkspaceArrays {
-  u32 handles[kPersistentMaxExact * 2];
+  u64 handles[kPersistentMaxExact * 2];
   f32 distances[kPersistentMaxExact * 2];
   u32 ids[kPersistentMaxExact * 2];
   u8 expanded[kPersistentMaxExact * 2];
@@ -22,37 +22,27 @@ struct CandidateWorkspace {
   CandidateSortWorkspace sort;
 };
 
-__device__ void unlink_mutable_delta(const PersistentKernelParams& params,
-                                     u32 slot) {
-  if (slot >= params.delta_capacity || params.delta_prev == nullptr ||
-      params.delta_next == nullptr || params.delta_bucket_heads == nullptr) {
-    return;
-  }
-  const DeviceDeltaRecord record = params.delta_records[slot];
-  if (record.anchor_bucket >= params.anchor_count) return;
-  const u32 previous = params.delta_prev[slot];
-  const u32 next = params.delta_next[slot];
-  if (previous == UINT32_MAX) {
-    atomicCAS(params.delta_bucket_heads + record.anchor_bucket, slot, next);
-  } else if (previous < params.delta_capacity) {
-    atomicCAS(params.delta_next + previous, slot, next);
-  }
-  if (next < params.delta_capacity) {
-    atomicCAS(params.delta_prev + next, slot, previous);
-  }
-  params.delta_prev[slot] = UINT32_MAX;
-  params.delta_next[slot] = UINT32_MAX;
-}
-
-constexpr u32 kAnchorGraphReady = 2;
-constexpr u32 kAnchorGraphStale = 3;
 constexpr u32 kGraphScratchBit = 0x80000000u;
-constexpr u32 kGraphRouteBit = 0x40000000u;
-constexpr u32 kGraphSlotMask = ~(kGraphScratchBit | kGraphRouteBit);
 constexpr u64 kNodeLockMask = 1ull;
 constexpr u64 kNodeDeletedMask = 1ull << 24;
 constexpr u32 kNodeIdOffset = 8;
-constexpr u32 kNodeVectorOffset = 16;
+constexpr f32 kDeviceMaxValidSquaredL2 = 0x1.fffffcp+127f;
+
+__device__ __forceinline__ bool finite_f32_bits(f32 value) {
+  return (__float_as_uint(value) & 0x7f800000u) != 0x7f800000u;
+}
+
+__device__ __forceinline__ f32 saturate_device_squared_l2(double value) {
+  return value >= static_cast<double>(kDeviceMaxValidSquaredL2)
+    ? kDeviceMaxValidSquaredL2 : static_cast<f32>(value);
+}
+
+__device__ __forceinline__ f32 saturate_device_component(double value) {
+  constexpr double maximum = static_cast<double>(FLT_MAX);
+  if (value >= maximum) return FLT_MAX;
+  if (value <= -maximum) return -FLT_MAX;
+  return static_cast<f32>(value);
+}
 
 __device__ __forceinline__ u32 hash32(u32 value) {
   value ^= value >> 16;
@@ -82,33 +72,6 @@ __device__ __forceinline__ u32 load_cg(const u32* address) {
   u32 value = 0;
   asm volatile("ld.global.cg.u32 %0, [%1];" : "=r"(value) : "l"(address));
   return value;
-}
-
-__device__ u32 anchor_graph_slot(const PersistentKernelParams& params, u64 key) {
-  if (params.anchor_graph_keys == nullptr || params.anchor_graph_count == 0) {
-    return UINT32_MAX;
-  }
-  u32 begin = 0;
-  u32 end = params.anchor_graph_count;
-  while (begin < end) {
-    const u32 middle = begin + (end - begin) / 2;
-    const u64 candidate = load_cg(params.anchor_graph_keys + middle);
-    if (candidate < key) begin = middle + 1;
-    else end = middle;
-  }
-  return begin < params.anchor_graph_count &&
-      load_cg(params.anchor_graph_keys + begin) == key
-    ? begin : UINT32_MAX;
-}
-
-__device__ void release_graph_record(const PersistentKernelParams& params,
-                                     u32 acquired_slot) {
-  if (acquired_slot == UINT32_MAX ||
-      (acquired_slot & kGraphRouteBit) == 0) {
-    return;
-  }
-  const u32 slot = acquired_slot & kGraphSlotMask;
-  atomicSub(params.anchor_graph_readers + slot, 1u);
 }
 
 __device__ __forceinline__ u64 global_time_ns() {
@@ -197,12 +160,15 @@ __device__ void unlock_direct_qp(i32* lock) {
 }
 #endif
 
-__device__ bool insert_visited(u32* table, u32 capacity, u32 handle) {
+__device__ bool insert_visited(u64* table, u32 capacity, u64 handle) {
   const u32 mask = capacity - 1;
-  u32 slot = hash32(handle) & mask;
+  u32 slot = hash64(handle) & mask;
   for (u32 probe = 0; probe < capacity; ++probe) {
-    const u32 old = atomicCAS(table + slot, UINT32_MAX, handle);
-    if (old == UINT32_MAX) return true;
+    const u64 old = atomicCAS(
+      reinterpret_cast<unsigned long long*>(table + slot),
+      static_cast<unsigned long long>(kInvalidDeviceHandle),
+      static_cast<unsigned long long>(handle));
+    if (old == kInvalidDeviceHandle) return true;
     if (old == handle) return false;
     slot = (slot + 1) & mask;
   }
@@ -222,10 +188,29 @@ __device__ const DeviceShardRegion* shard_for_ordinal(
   return nullptr;
 }
 
-__device__ bool static_handle_from_raw(const PersistentKernelParams& params,
-                                       u64 raw, u32& handle) {
-  const u32 shard = static_cast<u32>(raw >> 48);
-  const u64 offset = (raw << 16) >> 16;
+__device__ __forceinline__ u32 remote_shard(u64 raw) {
+  return static_cast<u32>((raw >> kRemoteOffsetUnitBits) & kRemoteShardMask);
+}
+
+__device__ __forceinline__ u64 remote_byte_offset(u64 raw) {
+  return (raw & kRemoteOffsetUnitMask) << 4;
+}
+
+__device__ __forceinline__ u32 remote_incarnation(u64 raw) {
+  return static_cast<u32>(raw >> kRemoteIncarnationShift);
+}
+
+__device__ __forceinline__ u64 make_remote_raw(u32 shard, u64 offset,
+                                                u32 incarnation) {
+  return (static_cast<u64>(incarnation) << kRemoteIncarnationShift) |
+    (static_cast<u64>(shard) << kRemoteOffsetUnitBits) | (offset >> 4);
+}
+
+__device__ bool static_ordinal_from_raw(const PersistentKernelParams& params,
+                                        u64 raw, u32& ordinal) {
+  if (raw == 0 || remote_incarnation(raw) != 0) return false;
+  const u32 shard = remote_shard(raw);
+  const u64 offset = remote_byte_offset(raw);
   if (shard >= params.num_shards) return false;
   const DeviceShardRegion& region = params.shards[shard];
   if (offset < region.node_base_offset || region.node_stride == 0) return false;
@@ -233,190 +218,50 @@ __device__ bool static_handle_from_raw(const PersistentKernelParams& params,
   if (relative % region.node_stride != 0) return false;
   const u64 slot = relative / region.node_stride;
   if (slot >= region.node_count) return false;
-  handle = static_cast<u32>(region.ordinal_base + slot);
+  ordinal = static_cast<u32>(region.ordinal_base + slot);
   return true;
 }
 
-__device__ u32 delta_slot_from_raw(const PersistentKernelParams& params, u64 raw) {
-  if (raw == 0 || params.delta_remote_capacity == 0) return UINT32_MAX;
-  const u32 mask = params.delta_remote_capacity - 1;
-  u32 position = hash64(raw) & mask;
-  for (u32 probe = 0; probe < params.delta_remote_capacity; ++probe) {
-    const u64 key = load_cg(params.delta_remote_keys + position);
-    if (key == raw) return load_cg(params.delta_remote_slots + position);
-    if (key == kDeltaRemoteEmpty) return UINT32_MAX;
-    position = (position + 1) & mask;
+__device__ u64 handle_from_raw(const PersistentKernelParams& params, u64 raw) {
+  u32 ordinal = 0;
+  if (static_ordinal_from_raw(params, raw, ordinal)) return raw;
+  const u32 shard = remote_shard(raw);
+  const u64 offset = remote_byte_offset(raw);
+  const u32 incarnation = remote_incarnation(raw);
+  if (raw == 0 || raw == kInvalidDeviceHandle ||
+      incarnation == 0 || incarnation > kRemoteMaxIncarnation ||
+      shard >= params.num_shards) {
+    return kInvalidDeviceHandle;
   }
-  return UINT32_MAX;
-}
-
-__device__ u32 resident_pq_slot_from_raw(const PersistentKernelParams& params,
-                                         u64 raw) {
-  if (raw == 0 || params.resident_pq_table_capacity == 0 ||
-      params.resident_pq_keys == nullptr || params.resident_pq_slots == nullptr) {
-    return UINT32_MAX;
-  }
-  const u32 mask = params.resident_pq_table_capacity - 1;
-  u32 position = hash64(raw) & mask;
-  for (u32 probe = 0; probe < params.resident_pq_table_capacity; ++probe) {
-    const u64 key = load_cg(params.resident_pq_keys + position);
-    if (key == raw) {
-      const u32 slot = load_cg(params.resident_pq_slots + position);
-      return slot < params.resident_pq_capacity ? slot : UINT32_MAX;
-    }
-    if (key == kDeltaRemoteEmpty) return UINT32_MAX;
-    position = (position + 1) & mask;
-  }
-  return UINT32_MAX;
-}
-
-__device__ bool insert_resident_pq(const PersistentKernelParams& params,
-                                   u64 raw, u32 slot) {
-  if (raw == 0 || slot >= params.resident_pq_capacity ||
-      params.resident_pq_table_capacity == 0 ||
-      params.resident_pq_keys == nullptr || params.resident_pq_slots == nullptr ||
-      params.resident_pq_positions == nullptr) {
-    return false;
-  }
-  const u32 mask = params.resident_pq_table_capacity - 1;
-  u32 position = hash64(raw) & mask;
-  u32 first_tombstone = UINT32_MAX;
-  for (u32 probe = 0; probe < params.resident_pq_table_capacity; ++probe) {
-    const u64 key = load_cg(params.resident_pq_keys + position);
-    if (key == raw) {
-      atomicExch(params.resident_pq_slots + position, slot);
-      params.resident_pq_positions[slot] = position;
-      __threadfence();
-      return true;
-    }
-    if (key == kDeltaRemoteTombstone && first_tombstone == UINT32_MAX) {
-      first_tombstone = position;
-    }
-    if (key == kDeltaRemoteEmpty) {
-      const u32 destination = first_tombstone == UINT32_MAX
-        ? position : first_tombstone;
-      params.resident_pq_positions[slot] = destination;
-      params.resident_pq_slots[destination] = slot;
-      __threadfence();
-      atomicExch(reinterpret_cast<unsigned long long*>(
-                   params.resident_pq_keys + destination), raw);
-      return true;
-    }
-    position = (position + 1) & mask;
-  }
-  if (first_tombstone == UINT32_MAX) return false;
-  params.resident_pq_positions[slot] = first_tombstone;
-  params.resident_pq_slots[first_tombstone] = slot;
-  __threadfence();
-  atomicExch(reinterpret_cast<unsigned long long*>(
-               params.resident_pq_keys + first_tombstone), raw);
-  return true;
-}
-
-__device__ void erase_resident_pq(const PersistentKernelParams& params,
-                                  const ResidentPqEraseUpdate& update) {
-  if (update.remote_node == 0 || update.slot >= params.resident_pq_capacity ||
-      params.resident_pq_positions == nullptr) {
-    return;
-  }
-  const u32 position = params.resident_pq_positions[update.slot];
-  if (position >= params.resident_pq_table_capacity ||
-      load_cg(params.resident_pq_keys + position) != update.remote_node ||
-      load_cg(params.resident_pq_slots + position) != update.slot) {
-    return;
-  }
-  atomicCAS(reinterpret_cast<unsigned long long*>(params.resident_pq_keys + position),
-            update.remote_node, kDeltaRemoteTombstone);
-  atomicExch(params.resident_pq_slots + position, UINT32_MAX);
-  atomicExch(params.resident_pq_positions + update.slot, UINT32_MAX);
-}
-
-__device__ u32 handle_from_raw(const PersistentKernelParams& params, u64 raw) {
-  u32 handle = UINT32_MAX;
-  if (static_handle_from_raw(params, raw, handle)) return handle;
-  const u32 shard = static_cast<u32>(raw >> 48);
-  const u64 offset = (raw << 16) >> 16;
-  if (shard >= params.num_shards || params.graph_shard_bits >= 31) return UINT32_MAX;
   const DeviceShardRegion& region = params.shards[shard];
   if (offset < region.dynamic_base_offset || region.dynamic_record_bytes == 0) {
-    return UINT32_MAX;
+    return kInvalidDeviceHandle;
   }
   const u64 relative = offset - region.dynamic_base_offset;
-  if (relative % region.dynamic_record_bytes != 0) return UINT32_MAX;
-  const u64 slot = relative / region.dynamic_record_bytes;
-  const u32 slot_bits = 31 - params.graph_shard_bits;
-  const u64 slot_limit = 1ull << slot_bits;
-  if (slot >= slot_limit || shard >= (1u << params.graph_shard_bits)) return UINT32_MAX;
-  return kDeltaHandleBit |
-    (shard << slot_bits) | static_cast<u32>(slot);
+  if (relative % region.dynamic_record_bytes != 0) {
+    return kInvalidDeviceHandle;
+  }
+  return raw;
 }
 
-__device__ bool resolve_handle(const PersistentKernelParams& params, u32 handle,
+__device__ bool resolve_handle(const PersistentKernelParams& params, u64 handle,
                                u64& raw, u32& shard, u64& graph_offset) {
-  if ((handle & kDeltaHandleBit) == 0) {
+  raw = handle;
+  u32 ordinal = 0;
+  if (static_ordinal_from_raw(params, raw, ordinal)) {
     u64 slot = 0;
-    const DeviceShardRegion* region = shard_for_ordinal(params, handle, &slot);
+    const DeviceShardRegion* region = shard_for_ordinal(params, ordinal, &slot);
     if (region == nullptr) return false;
     shard = region->memory_node;
-    const u64 node_offset = region->node_base_offset + slot * region->node_stride;
-    raw = (static_cast<u64>(shard) << 48) | node_offset;
-    graph_offset = region->graph_base_offset + slot * params.graph_entry_bytes;
+    graph_offset = region->graph_base_offset +
+      slot * params.graph_entry_bytes;
     return true;
   }
-  if (params.graph_shard_bits >= 31) return false;
-  const u32 slot_bits = 31 - params.graph_shard_bits;
-  const u32 slot_mask = slot_bits == 31 ? kDeltaHandleMask : (1u << slot_bits) - 1u;
-  shard = params.graph_shard_bits == 0
-    ? 0u : (handle & kDeltaHandleMask) >> slot_bits;
-  if (shard >= params.num_shards) return false;
+  if (handle_from_raw(params, raw) == kInvalidDeviceHandle) return false;
+  shard = remote_shard(raw);
   const DeviceShardRegion& region = params.shards[shard];
-  if (region.dynamic_record_bytes == 0) return false;
-  const u64 dynamic_slot = handle & slot_mask;
-  const u64 node_offset = region.dynamic_base_offset +
-    dynamic_slot * region.dynamic_record_bytes;
-  if (node_offset < region.dynamic_base_offset || node_offset >= (1ull << 48)) return false;
-  raw = (static_cast<u64>(shard) << 48) | node_offset;
-  graph_offset = node_offset + region.dynamic_hot_offset;
+  graph_offset = remote_byte_offset(raw) + region.dynamic_hot_offset;
   return true;
-}
-
-__device__ bool base_overridden(const PersistentKernelParams& params,
-                                u32 ordinal, u64 snapshot_epoch) {
-  const u32 word = ordinal / 32;
-  if (params.permanent_override_bits != nullptr &&
-      word < params.permanent_override_words &&
-      (load_cg(params.permanent_override_bits + word) &
-       (1u << (ordinal % 32))) != 0) {
-    return true;
-  }
-  if (params.base_override_capacity == 0) return false;
-  const u32 mask = params.base_override_capacity - 1;
-  u32 position = hash32(ordinal) & mask;
-  for (u32 probe = 0; probe < params.base_override_capacity; ++probe) {
-    const u32 key = load_cg(params.base_override_keys + position);
-    if (key == ordinal) {
-      const u64 epoch = load_cg(params.base_override_epochs + position);
-      return epoch != 0 && epoch <= snapshot_epoch;
-    }
-    if (key == kBaseOverrideEmpty) return false;
-    position = (position + 1) & mask;
-  }
-  return false;
-}
-
-__device__ bool delta_visible(const DeviceDeltaRecord& record, u64 snapshot_epoch) {
-  const u64 superseded = load_cg(&record.superseded_epoch);
-  return record.epoch <= snapshot_epoch &&
-    (superseded == 0 || superseded > snapshot_epoch) &&
-    (record.flags & (kDeltaDeleted | kDeltaDurable)) == 0;
-}
-
-__device__ bool delta_code_visible(const DeviceDeltaRecord& record,
-                                   u64 snapshot_epoch) {
-  const u64 superseded = load_cg(&record.superseded_epoch);
-  return record.epoch <= snapshot_epoch &&
-    (superseded == 0 || superseded > snapshot_epoch) &&
-    (record.flags & kDeltaDeleted) == 0;
 }
 
 __device__ f32 approximate_entry(const PersistentKernelParams& params,
@@ -428,48 +273,20 @@ __device__ f32 approximate_entry(const PersistentKernelParams& params,
     distance += query_lut[static_cast<size_t>(subquantizer) * 256 +
                           code[subquantizer]];
   }
-  return distance;
+  if (finite_f32_bits(distance) && distance < FLT_MAX) return distance;
+  double wide_distance = 0.0;
+  for (u32 subquantizer = 0; subquantizer < params.pq_subquantizers;
+       ++subquantizer) {
+    wide_distance += static_cast<double>(
+      query_lut[static_cast<size_t>(subquantizer) * 256 +
+                code[subquantizer]]);
+  }
+  return saturate_device_squared_l2(wide_distance);
 }
 
-__device__ f32 approximate_handle(const PersistentKernelParams& params,
-                                  const f32* query_lut,
-                                  u32 handle, u64 snapshot_epoch) {
-  if ((handle & kDeltaHandleBit) == 0) {
-    if (handle >= params.num_nodes) return FLT_MAX;
-    return approximate_entry(params, query_lut,
-      params.pq_codes + static_cast<size_t>(handle) * params.pq_code_bytes);
-  }
-  u64 raw = 0;
-  u64 graph_offset = 0;
-  u32 shard = 0;
-  if (!resolve_handle(params, handle, raw, shard, graph_offset)) return FLT_MAX;
-  const u32 slot = delta_slot_from_raw(params, raw);
-  if (slot < min(load_cg(params.delta_count), params.delta_capacity) &&
-      params.delta_records[slot].remote_node == raw) {
-    const DeviceDeltaRecord& record = params.delta_records[slot];
-    if (delta_code_visible(record, snapshot_epoch)) {
-      return approximate_entry(params, query_lut,
-        params.delta_pq_codes + static_cast<size_t>(slot) * params.pq_code_bytes);
-    }
-    const u64 superseded = load_cg(&record.superseded_epoch);
-    if (record.epoch <= snapshot_epoch &&
-        ((record.flags & kDeltaDeleted) != 0 ||
-         (superseded != 0 && superseded <= snapshot_epoch))) {
-      return FLT_MAX;
-    }
-  }
-  const u32 resident_slot = resident_pq_slot_from_raw(params, raw);
-  if (resident_slot == UINT32_MAX || params.resident_pq_codes == nullptr) {
-    return FLT_MAX;
-  }
-  return approximate_entry(params, query_lut,
-    params.resident_pq_codes +
-      static_cast<size_t>(resident_slot) * params.pq_code_bytes);
-}
-
-__device__ void beam_insert(u32* handles, u32* ids, f32* distances, u8* expanded,
-                            u32& count, u32 capacity, u32 handle, u32 id, f32 distance) {
-  if (handle == UINT32_MAX || !isfinite(distance) || distance == FLT_MAX) return;
+__device__ void beam_insert(u64* handles, u32* ids, f32* distances, u8* expanded,
+                            u32& count, u32 capacity, u64 handle, u32 id, f32 distance) {
+  if (handle == kInvalidDeviceHandle || !isfinite(distance) || distance == FLT_MAX) return;
   if (count < capacity) {
     handles[count] = handle;
     ids[count] = id;
@@ -489,8 +306,8 @@ __device__ void beam_insert(u32* handles, u32* ids, f32* distances, u8* expanded
   expanded[worst] = 0;
 }
 
-__device__ __forceinline__ bool candidate_less(u32 lhs_handle, f32 lhs_distance,
-                                               u32 rhs_handle, f32 rhs_distance) {
+__device__ __forceinline__ bool candidate_less(u64 lhs_handle, f32 lhs_distance,
+                                               u64 rhs_handle, f32 rhs_distance) {
   return lhs_distance < rhs_distance ||
     (lhs_distance == rhs_distance && lhs_handle < rhs_handle);
 }
@@ -501,11 +318,11 @@ __device__ u32 candidate_sort_capacity(u32 count) {
   return capacity;
 }
 
-__device__ void sort_candidates(u32* handles, u32* ids, f32* distances,
+__device__ void sort_candidates(u64* handles, u32* ids, f32* distances,
                                 u8* expanded, u32 count) {
   const u32 capacity = candidate_sort_capacity(max(1u, count));
   for (u32 index = count + threadIdx.x; index < capacity; index += blockDim.x) {
-    handles[index] = UINT32_MAX;
+    handles[index] = kInvalidDeviceHandle;
     if (ids != nullptr) ids[index] = UINT32_MAX;
     distances[index] = FLT_MAX;
     expanded[index] = 0;
@@ -523,7 +340,7 @@ __device__ void sort_candidates(u32* handles, u32* ids, f32* distances,
           : candidate_less(handles[index], distances[index],
                            handles[partner], distances[partner]);
         if (!exchange) continue;
-        const u32 handle = handles[index];
+        const u64 handle = handles[index];
         handles[index] = handles[partner];
         handles[partner] = handle;
         if (ids != nullptr) {
@@ -545,51 +362,58 @@ __device__ void sort_candidates(u32* handles, u32* ids, f32* distances,
 
 template <class BlockSort, u32 ItemsPerThread>
 __device__ void merge_approximate_radix(
-    u32* candidate_handles, f32* candidate_distances, u32 candidate_count,
-    u32* beam_handles, u32* beam_ids, f32* beam_distances,
+    u64* candidate_handles, f32* candidate_distances, u32 candidate_count,
+    u64* beam_handles, u32* beam_ids, f32* beam_distances,
     u8* beam_expanded, u32& beam_count, u32 beam_capacity,
     u32 existing_count, u32 merge_count,
     typename BlockSort::TempStorage& radix_storage) {
   f32 local_distances[ItemsPerThread];
   u64 local_values[ItemsPerThread];
+  u8 sorted_expanded[ItemsPerThread];
   for (u32 item = 0; item < ItemsPerThread; ++item) {
     const u32 index = threadIdx.x * ItemsPerThread + item;
-    u32 handle = UINT32_MAX;
-    u32 expanded = 0;
+    u64 handle = kInvalidDeviceHandle;
     f32 distance = FLT_MAX;
     if (index < existing_count) {
       handle = beam_handles[index];
-      expanded = beam_expanded[index];
       distance = beam_distances[index];
     } else if (index < merge_count) {
       const u32 candidate = index - existing_count;
       handle = candidate_handles[candidate];
       distance = candidate_distances[candidate];
     }
-    if (handle == UINT32_MAX || !isfinite(distance)) {
-      handle = UINT32_MAX;
-      expanded = 0;
+    if (handle == kInvalidDeviceHandle || !isfinite(distance)) {
+      handle = kInvalidDeviceHandle;
       distance = FLT_MAX;
     }
     local_distances[item] = distance;
-    local_values[item] = static_cast<u64>(handle) |
-      (static_cast<u64>(expanded != 0) << 32);
+    local_values[item] = handle;
   }
   __syncthreads();
   BlockSort(radix_storage).Sort(local_distances, local_values);
   for (u32 item = 0; item < ItemsPerThread; ++item) {
+    sorted_expanded[item] = 0;
+    for (u32 prior = 0; prior < existing_count; ++prior) {
+      if (beam_handles[prior] == local_values[item]) {
+        sorted_expanded[item] = beam_expanded[prior];
+        break;
+      }
+    }
+  }
+  __syncthreads();
+  for (u32 item = 0; item < ItemsPerThread; ++item) {
     const u32 output = threadIdx.x * ItemsPerThread + item;
     if (output >= beam_capacity) continue;
-    beam_handles[output] = static_cast<u32>(local_values[item]);
+    beam_handles[output] = local_values[item];
     beam_ids[output] = UINT32_MAX;
     beam_distances[output] = local_distances[item];
-    beam_expanded[output] = static_cast<u8>((local_values[item] >> 32) != 0);
+    beam_expanded[output] = sorted_expanded[item];
   }
   __syncthreads();
   if (threadIdx.x == 0) {
     u32 valid = 0;
     const u32 limit = min(merge_count, beam_capacity);
-    while (valid < limit && beam_handles[valid] != UINT32_MAX &&
+    while (valid < limit && beam_handles[valid] != kInvalidDeviceHandle &&
            isfinite(beam_distances[valid]) && beam_distances[valid] != FLT_MAX) {
       ++valid;
     }
@@ -599,52 +423,59 @@ __device__ void merge_approximate_radix(
 }
 
 __device__ void merge_approximate_compact(
-    u32* candidate_handles, f32* candidate_distances,
-    u32* beam_handles, u32* beam_ids, f32* beam_distances,
+    u64* candidate_handles, f32* candidate_distances,
+    u64* beam_handles, u32* beam_ids, f32* beam_distances,
     u8* beam_expanded, u32& beam_count, u32 beam_capacity,
     u32 existing_count, u32 merge_count,
-    u32* scratch_handles, u32* scratch_expanded, f32* scratch_distances,
+    u64* scratch_handles, u32* scratch_expanded, f32* scratch_distances,
     CandidateWorkspace& workspace) {
   constexpr u32 pass_items =
     kApproximateSortThreadsCompact * kApproximateSortItemsCompactPass;
   for (u32 pass = 0; pass < 2; ++pass) {
     f32 local_distances[kApproximateSortItemsCompactPass];
     u64 local_values[kApproximateSortItemsCompactPass];
+    u8 sorted_expanded[kApproximateSortItemsCompactPass];
     for (u32 item = 0; item < kApproximateSortItemsCompactPass; ++item) {
       const u32 index = pass * pass_items +
         threadIdx.x * kApproximateSortItemsCompactPass + item;
-      u32 handle = UINT32_MAX;
-      u32 expanded = 0;
+      u64 handle = kInvalidDeviceHandle;
       f32 distance = FLT_MAX;
       if (index < existing_count) {
         handle = beam_handles[index];
-        expanded = beam_expanded[index];
         distance = beam_distances[index];
       } else if (index < merge_count) {
         const u32 candidate = index - existing_count;
         handle = candidate_handles[candidate];
         distance = candidate_distances[candidate];
       }
-      if (handle == UINT32_MAX || !isfinite(distance)) {
-        handle = UINT32_MAX;
-        expanded = 0;
+      if (handle == kInvalidDeviceHandle || !isfinite(distance)) {
+        handle = kInvalidDeviceHandle;
         distance = FLT_MAX;
       }
       local_distances[item] = distance;
-      local_values[item] = static_cast<u64>(handle) |
-        (static_cast<u64>(expanded != 0) << 32);
+      local_values[item] = handle;
     }
     __syncthreads();
     ApproximateBlockSortCompactPass(workspace.sort.radix_sort_compact_pass)
       .Sort(local_distances, local_values);
     for (u32 item = 0; item < kApproximateSortItemsCompactPass; ++item) {
+      sorted_expanded[item] = 0;
+      for (u32 prior = 0; prior < existing_count; ++prior) {
+        if (beam_handles[prior] == local_values[item]) {
+          sorted_expanded[item] = beam_expanded[prior];
+          break;
+        }
+      }
+    }
+    __syncthreads();
+    for (u32 item = 0; item < kApproximateSortItemsCompactPass; ++item) {
       const u32 output =
         threadIdx.x * kApproximateSortItemsCompactPass + item;
       if (output >= beam_capacity) continue;
       const u32 destination = pass * beam_capacity + output;
-      scratch_handles[destination] = static_cast<u32>(local_values[item]);
+      scratch_handles[destination] = local_values[item];
       scratch_expanded[destination] =
-        static_cast<u32>((local_values[item] >> 32) != 0);
+        sorted_expanded[item];
       scratch_distances[destination] = local_distances[item];
     }
     __syncthreads();
@@ -652,39 +483,49 @@ __device__ void merge_approximate_compact(
 
   f32 final_distances[kApproximateSortItemsCompactFinal];
   u64 final_values[kApproximateSortItemsCompactFinal];
+  u8 final_expanded[kApproximateSortItemsCompactFinal];
   const u32 scratch_count = beam_capacity * 2;
   for (u32 item = 0; item < kApproximateSortItemsCompactFinal; ++item) {
     const u32 index =
       threadIdx.x * kApproximateSortItemsCompactFinal + item;
-    u32 handle = UINT32_MAX;
-    u32 expanded = 0;
+    u64 handle = kInvalidDeviceHandle;
     f32 distance = FLT_MAX;
     if (index < scratch_count) {
       handle = scratch_handles[index];
-      expanded = scratch_expanded[index];
       distance = scratch_distances[index];
     }
     final_distances[item] = distance;
-    final_values[item] = static_cast<u64>(handle) |
-      (static_cast<u64>(expanded != 0) << 32);
+    final_values[item] = handle;
   }
   __syncthreads();
   ApproximateBlockSortCompactFinal(workspace.sort.radix_sort_compact_final)
     .Sort(final_distances, final_values);
   for (u32 item = 0; item < kApproximateSortItemsCompactFinal; ++item) {
+    final_expanded[item] = 0;
+    for (u32 prior = 0; prior < scratch_count; ++prior) {
+      if (scratch_handles[prior] == final_values[item]) {
+        final_expanded[item] = static_cast<u8>(
+          scratch_expanded[prior] != 0);
+        break;
+      }
+    }
+  }
+  __syncthreads();
+  for (u32 item = 0; item < kApproximateSortItemsCompactFinal; ++item) {
     const u32 output =
       threadIdx.x * kApproximateSortItemsCompactFinal + item;
     if (output >= beam_capacity) continue;
-    beam_handles[output] = static_cast<u32>(final_values[item]);
+    beam_handles[output] = final_values[item];
     beam_ids[output] = UINT32_MAX;
     beam_distances[output] = final_distances[item];
     beam_expanded[output] =
-      static_cast<u8>((final_values[item] >> 32) != 0);
+      final_expanded[item];
   }
   __syncthreads();
   if (threadIdx.x == 0) {
     u32 valid = 0;
-    while (valid < beam_capacity && beam_handles[valid] != UINT32_MAX &&
+    while (valid < beam_capacity &&
+           beam_handles[valid] != kInvalidDeviceHandle &&
            isfinite(beam_distances[valid]) && beam_distances[valid] != FLT_MAX) {
       ++valid;
     }
@@ -694,11 +535,11 @@ __device__ void merge_approximate_compact(
 }
 
 __device__ void merge_approximate_into_beam(
-    u32* candidate_handles, f32* candidate_distances, u32 candidate_count,
-    u32* beam_handles, u32* beam_ids, f32* beam_distances,
+    u64* candidate_handles, f32* candidate_distances, u32 candidate_count,
+    u64* beam_handles, u32* beam_ids, f32* beam_distances,
     u8* beam_expanded, u32& beam_count, u32 beam_capacity,
-    u32* merge_handles, u32* merge_ids, f32* merge_distances,
-    u8* merge_expanded, u32* compact_scratch_handles,
+    u64* merge_handles, u32* merge_ids, f32* merge_distances,
+    u8* merge_expanded, u64* compact_scratch_handles,
     u32* compact_scratch_expanded, f32* compact_scratch_distances,
     CandidateWorkspace& workspace) {
   const u32 existing_count = beam_count;

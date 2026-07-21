@@ -1,12 +1,18 @@
 #include "memory_node/memory_node.hh"
 
+#include <bit>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
+#include <unordered_set>
 
 #include "common/index_path.hh"
 #include "gpu_search/index_format.hh"
+#include "memory_node/storage_owner_maintenance/centroid_lifecycle_policy.hh"
+#include "vamana/centroid_seed_policy.hh"
+#include "vamana/centroid_state.hh"
 #include "vamana/storage_layout_resolver.hh"
 
 MemoryNode::MemoryNode(Configuration& config)
@@ -14,10 +20,17 @@ MemoryNode::MemoryNode(Configuration& config)
       storage_id_(config.storage_id),
       num_storage_nodes_(config.storage_peers.empty() ? config.num_server_nodes()
                                                       : static_cast<u32>(config.storage_peers.size())),
+      max_vectors_(config.max_vectors),
       storage_owner_peer_rdma_tokens_(std::max<u32>(1, config.storage_owner_peer_rdma_tokens)),
       index_region_(context_),
       peer_rdma_read_outstanding_(num_storage_nodes_),
       mn_memory_bytes_(static_cast<u64>(config.mn_memory_gb) * 1073741824ul) {
+  lib_assert(num_storage_nodes_ > 0 &&
+               num_storage_nodes_ <= RemotePtr::MEMORY_NODE_MASK + 1,
+             "tagged RemotePtr supports between 1 and 64 storage shards");
+  lib_assert(mn_memory_bytes_ > 0 &&
+               mn_memory_bytes_ <= RemotePtr::BYTE_OFFSET_CAPACITY,
+             "storage region exceeds the 256 GiB tagged RemotePtr capacity");
   for (auto& credit : peer_rdma_read_outstanding_) {
     credit.store(0, std::memory_order_relaxed);
   }
@@ -49,21 +62,23 @@ MemoryNode::MemoryNode(Configuration& config)
     lib_assert(metadata.dim == config.dim, "index metadata dim mismatch on storage node");
     lib_assert(metadata.R == config.R, "index metadata R mismatch on storage node");
     lib_assert(metadata.num_memory_nodes == num_storage_nodes_, "index metadata storage-node count mismatch");
-    const bool compatible_quantizer = metadata.navigation_quantizer == "opq_pq" ||
-      metadata.navigation_quantizer == "opq_pq16";
-    const bool compatible_navigation = metadata.navigation_format == "opq_pq_graph_v1" ||
-      metadata.navigation_format == "opq_pq16_graph_v1";
     gpu_stream_layout_ = metadata.schema_version == gpu_search::format::kMetadataSchemaVersion &&
       metadata.node_layout == "plain" &&
-      metadata.storage_format == "vamana_compact_v1" &&
-      compatible_quantizer && compatible_navigation;
+      metadata.storage_format == "vamana_tagged_v2" &&
+      metadata.navigation_quantizer == "opq_pq" &&
+      metadata.navigation_format == "opq_pq_graph_v1";
     lib_assert(gpu_stream_layout_,
-               "storage node requires a schema-15 compact OPQ/PQ index");
+               "storage node requires a schema-16 tagged OPQ/PQ index");
     lib_assert(storage_id_ < num_storage_nodes_, "invalid GPU storage shard id");
     lib_assert(metadata.hot_graph_entry_counts.size() == num_storage_nodes_,
                "GPU storage metadata has invalid static shard counts");
     lib_assert(metadata.hot_graph_dynamic_base_offsets.size() == num_storage_nodes_,
                "GPU storage metadata has invalid dynamic shard offsets");
+    lib_assert(metadata.index_build_fingerprint != 0 &&
+                 metadata.shard_build_fingerprints.size() ==
+                   num_storage_nodes_ &&
+                 metadata.shard_build_fingerprints[storage_id_] != 0,
+               "GPU storage metadata has no bound build identity");
     lib_assert(metadata.storage_control_remote_offsets.size() == num_storage_nodes_ &&
                  metadata.dynamic_node_base_offsets.size() == num_storage_nodes_,
                "GPU storage metadata has invalid control/dynamic-node offsets");
@@ -72,12 +87,13 @@ MemoryNode::MemoryNode(Configuration& config)
     gpu_storage_control_offset_ = metadata.storage_control_remote_offsets[storage_id_];
     gpu_dynamic_node_base_ = metadata.dynamic_node_base_offsets[storage_id_];
     gpu_navigation_code_bytes_ = metadata.navigation_code_bytes;
-    lib_assert(gpu_navigation_code_bytes_ > 0 &&
-                 gpu_navigation_code_bytes_ <=
-                   gpu_search::format::kStorageRouteMaxCodeBytes,
-               "navigation PQ width exceeds the fixed storage route publication");
+    lib_assert(gpu_navigation_code_bytes_ > 0,
+               "navigation PQ width must be positive");
     gpu_navigation_model_checksum_ = metadata.navigation_model_checksum;
-    lib_assert(std::isfinite(metadata.partition_cross_shard_ratio) &&
+    gpu_index_build_fingerprint_ = metadata.index_build_fingerprint;
+    gpu_shard_build_fingerprint_ =
+      metadata.shard_build_fingerprints[storage_id_];
+    lib_assert(floating_value_is_finite(metadata.partition_cross_shard_ratio) &&
                  metadata.partition_cross_shard_ratio >= 0.0 &&
                  metadata.partition_cross_shard_ratio <= 1.0,
                "index metadata partition_cross_shard_ratio is invalid");
@@ -98,7 +114,11 @@ MemoryNode::MemoryNode(Configuration& config)
                "index metadata vector byte size mismatch on storage node");
     lib_assert(metadata.node_size == VamanaNode::total_size(), "index metadata node size mismatch on storage node");
     lib_assert(metadata.graph_hot_bytes == VamanaNode::graph_hot_bytes() &&
-               metadata.vector_offset == VamanaNode::offset_vector(),
+               metadata.vector_offset == VamanaNode::offset_vector() &&
+               metadata.slot_incarnation_offset ==
+                 VamanaNode::offset_slot_incarnation() &&
+               metadata.remote_ptr_format ==
+                 "tagged_inc24_shard6_off34x16_v1",
                "index metadata storage offsets mismatch on storage node");
     lib_assert(metadata.hot_graph_pointer_bytes == vamana::hot_graph::kCompactPointerBytes &&
                metadata.hot_graph_entry_size == VamanaNode::hot_graph_entry_size() &&
@@ -112,8 +132,12 @@ MemoryNode::MemoryNode(Configuration& config)
                metadata.hot_graph_dynamic_hot_offset >= VamanaNode::total_size() &&
                metadata.dynamic_navigation_code_offset >=
                  metadata.hot_graph_dynamic_hot_offset + metadata.hot_graph_entry_size &&
+               metadata.dynamic_navigation_code_validation_bytes ==
+                 VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES &&
                metadata.hot_graph_dynamic_record_bytes >=
-                 metadata.dynamic_navigation_code_offset + metadata.navigation_code_bytes,
+                 metadata.dynamic_navigation_code_offset +
+                   metadata.dynamic_navigation_code_validation_bytes +
+                   metadata.navigation_code_bytes,
                "index dynamic hot graph metadata mismatch on storage node");
     VamanaNode::configure_hot_graph(metadata.hot_graph_offsets,
                                     metadata.hot_graph_entry_counts,
@@ -134,7 +158,12 @@ MemoryNode::MemoryNode(Configuration& config)
                  gpu_navigation_model_.code_bytes() == metadata.navigation_code_bytes &&
                  gpu_navigation_model_.dim == metadata.dim,
                "storage-node PQ model does not match index metadata");
-    owner_idmap_required_ = metadata.idmap_format == "owner_sharded_v1";
+    lib_assert(metadata.idmap_format == "owner_sharded_v2_bound",
+               "index has no build-bound owner idmap v2; rebuild it");
+    owner_idmap_required_ = true;
+    lib_assert(metadata.centroid_state_format ==
+                 "physical_shard_centroid_v2_bound",
+               "index has no exact physical-shard centroid state; rebuild it");
     print_status("loaded index metadata from " + index_prefix.string() +
                  " (layout=" + VamanaNode::layout_name() +
                  ", vector_data_type=" + VamanaNode::vector_dtype_name() + ")");
@@ -156,9 +185,7 @@ MemoryNode::MemoryNode(Configuration& config)
     lib_assert(load_owner_idmap(index_prefix_), "failed to load owner-sharded idmap");
   }
 
-  if (config.storage_owner_update_mode == "local_stitch") {
-    initialize_storage_owner_route_table();
-  }
+  initialize_storage_centroid_route();
 
   print_status("register memory and distribute access token");
   index_region_.register_memory(index_buffer_.get_full_buffer(), index_buffer_.buffer_size, true);
@@ -237,7 +264,6 @@ MemoryNode::InsertBreakdownCounters MemoryNode::scale_breakdown(const InsertBrea
                                                const u32 total) {
   InsertBreakdownCounters out{};
   out.storage_owner_queue_wait_ns = scale_ns(counters.storage_owner_queue_wait_ns, part, total);
-  out.storage_owner_medoid_ns = scale_ns(counters.storage_owner_medoid_ns, part, total);
   out.storage_owner_search_ns = scale_ns(counters.storage_owner_search_ns, part, total);
   out.storage_owner_prune_ns = scale_ns(counters.storage_owner_prune_ns, part, total);
   out.storage_owner_write_node_ns = scale_ns(counters.storage_owner_write_node_ns, part, total);
@@ -337,6 +363,13 @@ std::pair<bool, str> MemoryNode::load_index_file(const str& path) {
   if (persisted_free_pointer != gpu_static_dynamic_base_) {
     return {false, "GPU navigation requires a compacted static shard before startup"};
   }
+  const u64 persisted_shard_fingerprint = *reinterpret_cast<const u64*>(
+    index_buffer_.get_full_buffer() +
+      vamana::centroid_state::kShardFingerprintOffset);
+  if (persisted_shard_fingerprint == 0 ||
+      persisted_shard_fingerprint != gpu_shard_build_fingerprint_) {
+    return {false, "index shard does not belong to the loaded metadata build"};
+  }
   const u64 fixed_nodes_end = gpu_search::format::kNodeBaseOffset +
     gpu_static_node_count_ * VamanaNode::total_size();
   if (fixed_nodes_end > gpu_static_dynamic_base_ ||
@@ -360,7 +393,11 @@ std::pair<bool, str> MemoryNode::load_index_file(const str& path) {
       header.memory_node != storage_id_ ||
       header.node_size != VamanaNode::total_size() ||
       header.code_bytes != gpu_navigation_code_bytes_ ||
+      header.vector_dtype != static_cast<u32>(VamanaNode::vector_dtype()) ||
       header.model_checksum != gpu_navigation_model_checksum_ ||
+      header.build_fingerprint != gpu_index_build_fingerprint_ ||
+      header.shard_fingerprint != gpu_shard_build_fingerprint_ ||
+      header.shard_fingerprint != persisted_shard_fingerprint ||
       header.entry_count != gpu_static_node_count_ ||
       header.remote_offset != remote_offset ||
       header.payload_bytes != payload_bytes) {
@@ -396,6 +433,32 @@ std::pair<bool, str> MemoryNode::load_index_file(const str& path) {
       gpu_dynamic_node_base_ > index_buffer_.buffer_size) {
     return {false, "GPU storage control/dynamic-node layout is inconsistent"};
   }
+
+  // CentroidRouter retains compensated FP64 sums for stable maintenance. The
+  // published route is canonical FP32 because GPU queries consume FP32 and
+  // update-home selection must make the identical routing decision.
+  const auto centroid_scalar =
+    gpu_search::format::CentroidScalarType::float32;
+  const u64 centroid_publication_bytes =
+    gpu_search::format::storage_centroid_route_publication_bytes(
+      VamanaNode::DIM, centroid_scalar,
+      gpu_search::format::kStorageCentroidRouteMaxLiveEntries);
+  if (centroid_publication_bytes == 0 ||
+      centroid_publication_bytes > index_buffer_.buffer_size) {
+    return {false, "invalid variable-length centroid publication layout"};
+  }
+  const u64 centroid_publication_offset =
+    (index_buffer_.buffer_size - centroid_publication_bytes) & ~u64{63};
+  const u64 dynamic_stride =
+    (VamanaNode::allocation_size() + alignof(u64) - 1) &
+    ~u64{alignof(u64) - 1};
+  if (centroid_publication_offset < gpu_dynamic_node_base_ ||
+      dynamic_stride > centroid_publication_offset - gpu_dynamic_node_base_) {
+    return {false,
+            "storage memory has no dynamic-node headroom before the centroid publication"};
+  }
+  dynamic_allocation_limit_ = centroid_publication_offset;
+
   std::memset(index_buffer_.get_full_buffer() + gpu_storage_control_offset_, 0,
               gpu_search::format::kStorageControlBytes);
   auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
@@ -406,286 +469,684 @@ std::pair<bool, str> MemoryNode::load_index_file(const str& path) {
     .dynamic_hot_offset = VamanaNode::HOT_GRAPH_DYNAMIC_HOT_OFFSET,
     .dynamic_code_offset = VamanaNode::HOT_GRAPH_DYNAMIC_CODE_OFFSET,
     .code_bytes = VamanaNode::HOT_GRAPH_DYNAMIC_CODE_BYTES,
-    .compute_client_count = num_clients_,
     .dynamic_high_watermark = gpu_dynamic_node_base_,
+    .centroid_route = {
+      .remote_offset = centroid_publication_offset,
+      .publication_bytes = centroid_publication_bytes,
+      .dim = VamanaNode::DIM,
+      .centroid_scalar_type = static_cast<u32>(centroid_scalar),
+      .shard_count = num_storage_nodes_,
+    },
   };
-  auto* route_publication = reinterpret_cast<
-    gpu_search::format::StorageRoutePublication*>(
-      index_buffer_.get_full_buffer() + gpu_storage_control_offset_ +
-      gpu_search::format::kStorageRoutePublicationOffset);
-  *route_publication = gpu_search::format::StorageRoutePublication{
-    .sequence_begin = 2,
-    .shard_id = storage_id_,
-    .code_bytes = gpu_navigation_code_bytes_,
-    .sequence_end = 2,
-  };
-  route_publication->body_checksum =
-    gpu_search::format::storage_route_body_checksum(*route_publication);
-  if (num_clients_ == 0 || num_clients_ > gpu_search::format::kMaxComputeClients) {
-    return {false, "compute client count exceeds the storage reclaim control capacity"};
+  str centroid_error;
+  const bool initialized_centroid_publication =
+    gpu_search::format::prepare_storage_centroid_route_publication(
+      span<byte_t>{index_buffer_.get_full_buffer() +
+                     centroid_publication_offset,
+                   static_cast<size_t>(centroid_publication_bytes)},
+      storage_id_, VamanaNode::DIM, centroid_scalar,
+      gpu_search::format::kStorageCentroidRouteMaxLiveEntries,
+      1, 0, nullptr,
+      span<const gpu_search::format::StorageCentroidRouteEntry>{},
+      &centroid_error);
+  if (!initialized_centroid_publication) {
+    return {false, centroid_error};
   }
   *reinterpret_cast<u64*>(index_buffer_.get_full_buffer()) = gpu_dynamic_node_base_;
 
   return {true, ""};
 }
 
-void MemoryNode::initialize_storage_owner_route_table() {
-  storage_owner_route_table_ =
-    std::make_unique<vamana::routing::AdaptiveRouteTable>(
-      VamanaNode::DIM, num_storage_nodes_);
-  storage_owner_route_snapshot_.resize(
-    storage_owner_route_table_->capacity());
+void MemoryNode::initialize_storage_centroid_route() {
+  const filepath_t path = index_path::centroid_state_file(
+    index_prefix_, storage_id_ + 1, num_storage_nodes_);
+  std::ifstream input(path, std::ios::binary);
+  lib_assert(input.good(), "missing physical centroid sidecar: " +
+                                path.string());
 
-  // Static graph nodes are bootstrap representatives only. Every committed
-  // mutation below updates the fixed-capacity centers/representatives, so the
-  // route is not frozen to the offline sample. Sampling the midpoint of each
-  // equal shard interval avoids another sidecar and gives every slot a live
-  // graph entry before the first online mutation.
-  const u32 bootstrap_count = static_cast<u32>(std::min<u64>(
-    gpu_static_node_count_,
-    vamana::routing::AdaptiveRouteTable::kSlotsPerShard));
-  vec<element_t> decoded(VamanaNode::DIM);
-  u32 installed = 0;
-  for (u32 rank = 0; rank < bootstrap_count; ++rank) {
-    const u64 slot =
-      ((static_cast<u64>(rank) * 2 + 1) * gpu_static_node_count_) /
-      (static_cast<u64>(bootstrap_count) * 2);
-    const RemotePtr pointer{
-      storage_id_,
-      gpu_search::format::kNodeBaseOffset + slot * VamanaNode::total_size()};
-    const byte_t* vector = local_live_vector(pointer);
-    if (vector == nullptr) continue;
-    const byte_t* node = local_node_ptr(pointer);
-    const node_t id = *reinterpret_cast<const node_t*>(
-      node + VamanaNode::offset_id());
-    const u32 generation = *reinterpret_cast<const u32*>(
-      node + VamanaNode::offset_generation());
-    decode_storage_vector_to_float(
-      vector, VamanaNode::vector_dtype(), VamanaNode::DIM, decoded.data());
-    installed += storage_owner_route_table_->observe(
-      storage_id_, id, generation, pointer,
-      span<const element_t>{decoded.data(), decoded.size()}) ? 1u : 0u;
+  vamana::centroid_state::Header header;
+  input.read(reinterpret_cast<char*>(&header), sizeof(header));
+  lib_assert(input.gcount() == static_cast<std::streamsize>(sizeof(header)) &&
+               header.magic == vamana::centroid_state::kMagic &&
+               header.version == vamana::centroid_state::kVersion &&
+               header.header_bytes == sizeof(header) &&
+               vamana::centroid_state::valid_header_checksum(header),
+             "invalid physical centroid sidecar envelope: " +
+               path.string());
+
+  const u64 shard_fingerprint = *reinterpret_cast<const u64*>(
+    index_buffer_.get_full_buffer() +
+      vamana::centroid_state::kShardFingerprintOffset);
+  const u64 expected_payload_bytes =
+    vamana::centroid_state::payload_bytes(
+      header.dim, header.entry_count);
+  const u64 file_bytes = std::filesystem::file_size(path);
+  lib_assert(header.build_fingerprint == gpu_index_build_fingerprint_ &&
+               header.shard_fingerprint == gpu_shard_build_fingerprint_ &&
+               header.shard_fingerprint == shard_fingerprint &&
+               header.shard == storage_id_ &&
+               header.shard_count == num_storage_nodes_ &&
+               header.dim == VamanaNode::DIM &&
+               header.max_degree == VamanaNode::R &&
+               header.vector_count == gpu_static_node_count_ &&
+               header.entry_count >= 1 &&
+               header.entry_count <=
+                 vamana::centroid_state::kMaxLiveEntries &&
+               header.entry_count <= header.vector_count &&
+               header.node_base_offset ==
+                 gpu_search::format::kNodeBaseOffset &&
+               header.vector_dtype ==
+                 static_cast<u32>(VamanaNode::vector_dtype()) &&
+               header.vector_component_size ==
+                 VamanaNode::vector_component_size() &&
+               header.metadata_schema_version ==
+                 gpu_search::format::kMetadataSchemaVersion &&
+               header.node_size == VamanaNode::total_size() &&
+               header.vector_offset == VamanaNode::offset_vector() &&
+               header.vector_bytes == VamanaNode::vector_bytes() &&
+               header.slot_incarnation_offset ==
+                 VamanaNode::offset_slot_incarnation() &&
+               header.hot_graph_version == vamana::hot_graph::kVersion3 &&
+               header.hot_graph_entry_size ==
+                 VamanaNode::hot_graph_entry_size() &&
+               header.hot_graph_pointer_bytes ==
+                 vamana::hot_graph::kCompactPointerBytes &&
+               header.hot_graph_shard_bits ==
+                 VamanaNode::HOT_GRAPH_SHARD_BITS &&
+               header.remote_ptr_format_version ==
+                 vamana::centroid_state::kRemotePtrFormatVersion &&
+               header.remote_ptr_alignment_log2 ==
+                 RemotePtr::OFFSET_ALIGNMENT_LOG2 &&
+               header.remote_ptr_offset_bits == RemotePtr::OFFSET_UNIT_BITS &&
+               header.remote_ptr_shard_bits == RemotePtr::MEMORY_NODE_BITS &&
+               header.remote_ptr_incarnation_bits ==
+                 RemotePtr::INCARNATION_BITS &&
+               header.static_incarnation == 0 &&
+               header.payload_bytes == expected_payload_bytes &&
+               header.payload_bytes <=
+                 std::numeric_limits<size_t>::max() &&
+               header.payload_bytes <= static_cast<u64>(
+                 std::numeric_limits<std::streamsize>::max()) &&
+               header.payload_bytes <=
+                 std::numeric_limits<u64>::max() - sizeof(header) &&
+               file_bytes == sizeof(header) + header.payload_bytes,
+             "physical centroid sidecar does not match the loaded index "
+             "build/layout: " + path.string());
+  vec<byte_t> payload(static_cast<size_t>(header.payload_bytes));
+  input.read(reinterpret_cast<char*>(payload.data()),
+             static_cast<std::streamsize>(payload.size()));
+  lib_assert(input.gcount() == static_cast<std::streamsize>(payload.size()) &&
+               vamana::centroid_state::checksum(payload) ==
+                 header.payload_checksum,
+             "physical centroid sidecar checksum mismatch: " +
+               path.string());
+
+  const auto* sums = reinterpret_cast<const f64*>(payload.data());
+  for (u32 dimension = 0; dimension < header.dim; ++dimension) {
+    lib_assert(floating_value_is_finite(sums[dimension]),
+               "centroid sidecar contains a non-finite sum");
   }
-  lib_assert(installed != 0,
-             "adaptive storage-owner route has no live bootstrap entry");
+  const auto* stored_entries = reinterpret_cast<
+    const vamana::centroid_state::Entry*>(
+      payload.data() + static_cast<size_t>(header.dim) * sizeof(f64));
+  vec<vamana::routing::CentroidRouter::LiveEntry> entries;
+  entries.reserve(header.entry_count);
+  std::unordered_set<u64> unique_entries;
+  unique_entries.reserve(header.entry_count);
+  vec<byte_t> decoded_graph(VamanaNode::neighbor_read_size());
+  for (u32 index = 0; index < header.entry_count; ++index) {
+    const RemotePtr pointer{stored_entries[index].remote_node};
+    const bool valid_static_slot = !pointer.is_null() &&
+      pointer.is_well_formed() && pointer.incarnation() == 0 &&
+      pointer.memory_node() == storage_id_ &&
+      pointer.byte_offset() >= header.node_base_offset &&
+      (pointer.byte_offset() - header.node_base_offset) %
+          header.node_size == 0 &&
+      (pointer.byte_offset() - header.node_base_offset) /
+          header.node_size < gpu_static_node_count_;
+    lib_assert(valid_static_slot && stored_entries[index].generation == 0 &&
+                 stored_entries[index].reserved == 0 &&
+                 unique_entries.insert(pointer.raw_address).second &&
+                 pointer.memory_node() == storage_id_ &&
+                 local_live_vector(pointer) != nullptr,
+               "centroid sidecar contains a stale graph entry");
+
+    const byte_t* node = local_node_ptr(pointer);
+    const u64 node_header = load_local_node_header_acquire(pointer);
+    const u32 node_generation = *reinterpret_cast<const u32*>(
+      node + VamanaNode::offset_generation());
+    const u64 disallowed_flags = VamanaNode::HEADER_NODE_LOCK |
+      VamanaNode::HEADER_DELETED | VamanaNode::HEADER_PROVISIONAL |
+      VamanaNode::HEADER_RETIRING;
+    const u64 compact_offset = VamanaNode::hot_graph_entry_offset(pointer);
+    lib_assert((node_header & disallowed_flags) == 0 &&
+                 (node_header & VamanaNode::HEADER_CENTROID_ACCOUNTED) != 0 &&
+                 VamanaNode::header_incarnation(node_header) == 0 &&
+                 node_generation == stored_entries[index].generation &&
+                 VamanaNode::hot_graph_entry_available(pointer) &&
+                 compact_offset <= mn_memory_bytes_ &&
+                 VamanaNode::hot_graph_entry_size() <=
+                   mn_memory_bytes_ - compact_offset &&
+                 (index_buffer_.get_full_buffer()[compact_offset + 1] &
+                    VamanaNode::HOT_GRAPH_DELETED) == 0 &&
+                 VamanaNode::decode_hot_graph_entry(
+                   index_buffer_.get_full_buffer() + compact_offset,
+                   decoded_graph.data(), 0),
+               "centroid sidecar entry has an invalid static graph record");
+    entries.push_back({pointer, stored_entries[index].generation});
+  }
+
+  storage_centroid_router_ =
+    std::make_unique<vamana::routing::CentroidRouter>(
+      VamanaNode::DIM, num_storage_nodes_);
+  storage_centroid_static_live_bitmap_.assign(
+    static_cast<size_t>((gpu_static_node_count_ + 63) / 64), ~u64{0});
+  if (!storage_centroid_static_live_bitmap_.empty() &&
+      gpu_static_node_count_ % 64 != 0) {
+    storage_centroid_static_live_bitmap_.back() =
+      (u64{1} << (gpu_static_node_count_ % 64)) - 1;
+  }
+  storage_centroid_dynamic_live_bitmap_.clear();
+  storage_centroid_static_cursor_ = 0;
+  storage_centroid_dynamic_cursor_ = 0;
+  lib_assert(storage_centroid_router_->restore_shard_state(
+               storage_id_, header.vector_count,
+               span<const f64>{sums, header.dim}, entries, 1),
+             "failed to restore compensated physical centroid state");
+  lib_assert(storage_centroid_router_->publish(),
+             "failed to publish restored physical centroid state");
+  publish_storage_centroid_route();
   print_status(
-    "storage-owner adaptive route initialized on shard " +
-    std::to_string(storage_id_) + ": live_entries=" +
-    std::to_string(installed) + " fixed_capacity=" +
-    std::to_string(vamana::routing::AdaptiveRouteTable::kSlotsPerShard));
-  publish_storage_owner_route_table();
+    "compensated physical centroid restored on shard " +
+    std::to_string(storage_id_) + ": vectors=" +
+    std::to_string(header.vector_count) + " entries=" +
+    std::to_string(header.entry_count));
 }
 
-void MemoryNode::publish_storage_owner_route_table() {
-  if (storage_owner_route_table_ == nullptr ||
-      storage_owner_route_snapshot_.size() !=
-        storage_owner_route_table_->capacity()) {
-    return;
-  }
-  std::lock_guard<std::mutex> publication_lock(
-    storage_owner_route_publication_mutex_);
-  storage_owner_route_table_->snapshot_route_slots(
-    span<vamana::routing::AdaptiveRouteTable::RouteSlotSnapshot>{
-      storage_owner_route_snapshot_.data(),
-      storage_owner_route_snapshot_.size()});
+void MemoryNode::publish_storage_centroid_route() {
+  if (storage_centroid_router_ == nullptr) return;
+  const auto snapshot = storage_centroid_router_->snapshot();
+  lib_assert(snapshot != nullptr && storage_id_ < snapshot->shards.size(),
+             "physical centroid snapshot is unavailable");
+  const auto& shard = snapshot->shards[storage_id_];
 
-  gpu_search::format::StorageRoutePublication next{
-    .shard_id = storage_id_,
-    .code_bytes = gpu_navigation_code_bytes_,
-  };
-  const size_t begin = static_cast<size_t>(storage_id_) *
-    vamana::routing::AdaptiveRouteTable::kSlotsPerShard;
-  for (u32 slot = 0;
-       slot < vamana::routing::AdaptiveRouteTable::kSlotsPerShard;
-       ++slot) {
-    const auto& source = storage_owner_route_snapshot_[begin + slot];
-    auto& destination_slot = next.slots[slot];
-    if (!source.initialized) continue;
-    destination_slot = gpu_search::format::StorageRouteSlot{
-      .remote_node = source.live ? source.entry.raw_address : 0,
-      .id = source.id,
+  thread_local vec<gpu_search::format::StorageCentroidRouteEntry> entries;
+  entries.clear();
+  entries.reserve(shard.live_entry_count);
+  for (const auto& source : shard.entries()) {
+    entries.push_back({
+      .remote_node = source.pointer.raw_address,
       .generation = source.generation,
-    };
-    if (!source.live) continue;
-    const u64 node_offset = source.entry.byte_offset();
-    const byte_t* navigation_code = nullptr;
-    if (node_offset >= gpu_dynamic_node_base_) {
-      navigation_code = index_buffer_.get_full_buffer() + node_offset +
-        VamanaNode::HOT_GRAPH_DYNAMIC_CODE_OFFSET;
-    } else if (node_offset >= gpu_search::format::kNodeBaseOffset) {
-      const u64 relative = node_offset - gpu_search::format::kNodeBaseOffset;
-      if (relative % VamanaNode::total_size() == 0) {
-        const u64 ordinal = relative / VamanaNode::total_size();
-        if (ordinal < gpu_static_node_count_) {
-          navigation_code = index_buffer_.get_full_buffer() +
-            gpu_storage_control_offset_ +
-            gpu_search::format::kStorageControlBytes +
-            ordinal * gpu_navigation_code_bytes_;
-        }
-      }
-    }
-    lib_assert(navigation_code != nullptr &&
-                 gpu_navigation_code_bytes_ <=
-                   gpu_search::format::kStorageRouteMaxCodeBytes,
-               "adaptive route entry has no publishable navigation code");
-    std::memcpy(destination_slot.navigation_code.data(), navigation_code,
-                gpu_navigation_code_bytes_);
+    });
   }
-  next.body_checksum =
-    gpu_search::format::storage_route_body_checksum(next);
 
-  auto* destination = reinterpret_cast<
-    gpu_search::format::StorageRoutePublication*>(
-      index_buffer_.get_full_buffer() + gpu_storage_control_offset_ +
-      gpu_search::format::kStorageRoutePublicationOffset);
-  std::atomic_ref<u64> begin_sequence(destination->sequence_begin);
-  std::atomic_ref<u64> end_sequence(destination->sequence_end);
-  const u64 current = begin_sequence.load(std::memory_order_relaxed);
+  const auto* control = reinterpret_cast<
+    const gpu_search::format::StorageControlBlock*>(
+      index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+  const auto descriptor = control->centroid_route;
+  lib_assert(descriptor.centroid_scalar_type == static_cast<u32>(
+               gpu_search::format::CentroidScalarType::float32) &&
+               (shard.count == 0 || shard.centroid.size() == VamanaNode::DIM),
+             "centroid route publication is not canonical FP32");
+  thread_local vec<byte_t> next;
+  next.resize(static_cast<size_t>(descriptor.publication_bytes));
+  thread_local vec<f32> route_centroid;
+  route_centroid.clear();
+  if (shard.count != 0) {
+    route_centroid.reserve(shard.centroid.size());
+    for (f64 coordinate : shard.centroid) {
+      route_centroid.push_back(static_cast<f32>(coordinate));
+    }
+  }
+  thread_local str error;
+  error.clear();
+  lib_assert(gpu_search::format::prepare_storage_centroid_route_publication(
+               next, storage_id_, VamanaNode::DIM,
+               static_cast<gpu_search::format::CentroidScalarType>(
+                 descriptor.centroid_scalar_type),
+               descriptor.live_entry_capacity,
+               std::max<u64>(1, shard.version), shard.count,
+               shard.count == 0 ? nullptr : route_centroid.data(), entries,
+               &error),
+             error);
+
+  std::lock_guard<std::mutex> lock(storage_centroid_publication_mutex_);
+  auto* destination = index_buffer_.get_full_buffer() +
+    descriptor.remote_offset;
+  auto* destination_header = reinterpret_cast<
+    gpu_search::format::StorageCentroidRoutePublicationHeader*>(destination);
+  std::atomic_ref<u64> sequence(destination_header->sequence);
+  const u64 current = sequence.load(std::memory_order_relaxed);
   const u64 odd = (current & ~u64{1}) + 1;
   const u64 even = odd + 1;
-  begin_sequence.store(odd, std::memory_order_release);
-  end_sequence.store(odd, std::memory_order_release);
+  sequence.store(odd, std::memory_order_release);
   std::memcpy(
-    reinterpret_cast<byte_t*>(destination) +
-      offsetof(gpu_search::format::StorageRoutePublication, magic),
-    reinterpret_cast<const byte_t*>(&next) +
-      offsetof(gpu_search::format::StorageRoutePublication, magic),
-    offsetof(gpu_search::format::StorageRoutePublication, sequence_end) -
-      offsetof(gpu_search::format::StorageRoutePublication, magic));
+    destination + sizeof(u64), next.data() + sizeof(u64),
+    next.size() - sizeof(u64));
   std::atomic_thread_fence(std::memory_order_release);
-  end_sequence.store(even, std::memory_order_release);
-  begin_sequence.store(even, std::memory_order_release);
+  sequence.store(even, std::memory_order_release);
 }
 
-vec<RemotePtr> MemoryNode::storage_owner_route_entries(
-    const span<const element_t> query) {
+vec<RemotePtr> MemoryNode::local_centroid_route_entries() const {
   vec<RemotePtr> entries;
-  if (storage_owner_route_table_ == nullptr) return entries;
-  const auto routes = storage_owner_route_table_->routes_in_shard(
-    query, storage_id_);
-  entries.reserve(routes.size());
-  for (const auto& route : routes) entries.push_back(route.entry);
-  if (!entries.empty()) return entries;
-
-  // Exceptional slow path only: long delete/upsert churn can retire every
-  // current representative. Search the authoritative live set rather than a
-  // fixed sample so a non-empty shard can never become unreachable. A newly
-  // found entry is installed back into an empty adaptive slot before return.
-  entries.reserve(vamana::routing::AdaptiveRouteTable::kSlotsPerShard);
-  const auto append_live = [&](RemotePtr pointer) {
-    if (entries.size() >=
-          vamana::routing::AdaptiveRouteTable::kSlotsPerShard ||
-        pointer.is_null() || pointer.memory_node() != storage_id_ ||
-        local_live_vector(pointer) == nullptr ||
-        std::find(entries.begin(), entries.end(), pointer) != entries.end()) {
-      return;
+  if (storage_centroid_router_ == nullptr) return entries;
+  const auto snapshot = storage_centroid_router_->snapshot();
+  if (snapshot == nullptr || storage_id_ >= snapshot->shards.size()) {
+    return entries;
+  }
+  const auto& shard = snapshot->shards[storage_id_];
+  entries.reserve(shard.live_entry_count);
+  for (const auto& entry : shard.entries()) {
+    if (local_live_vector(entry.pointer) != nullptr) {
+      entries.push_back(entry.pointer);
     }
-    entries.push_back(pointer);
-  };
-
-  for (DynamicFreshnessShard& freshness : dynamic_freshness_shards_) {
-    vec<RemotePtr> live;
-    {
-      std::lock_guard<std::mutex> lock(freshness.mutex);
-      live.reserve(std::min<size_t>(
-        freshness.entries.size(),
-        vamana::routing::AdaptiveRouteTable::kSlotsPerShard));
-      for (const auto& [id, entry] : freshness.entries) {
-        (void)id;
-        if (!entry.deleted && !entry.current.is_null()) {
-          live.push_back(entry.current);
-          if (live.size() ==
-              vamana::routing::AdaptiveRouteTable::kSlotsPerShard) break;
-        }
-      }
-    }
-    for (const RemotePtr pointer : live) append_live(pointer);
-    if (entries.size() ==
-        vamana::routing::AdaptiveRouteTable::kSlotsPerShard) break;
-  }
-
-  for (u64 slot = 0; slot < gpu_static_node_count_ &&
-       entries.size() < vamana::routing::AdaptiveRouteTable::kSlotsPerShard;
-       ++slot) {
-    append_live(RemotePtr{
-      storage_id_,
-      gpu_search::format::kNodeBaseOffset + slot * VamanaNode::total_size()});
-  }
-
-  vec<element_t> decoded(VamanaNode::DIM);
-  for (const RemotePtr pointer : entries) {
-    const byte_t* vector = local_live_vector(pointer);
-    if (vector == nullptr) continue;
-    const byte_t* node = local_node_ptr(pointer);
-    const node_t id = *reinterpret_cast<const node_t*>(
-      node + VamanaNode::offset_id());
-    const u32 generation = *reinterpret_cast<const u32*>(
-      node + VamanaNode::offset_generation());
-    decode_storage_vector_to_float(
-      vector, VamanaNode::vector_dtype(), VamanaNode::DIM, decoded.data());
-    observe_storage_owner_route(
-      id, generation, pointer,
-      span<const element_t>{decoded.data(), decoded.size()});
-  }
-
-  const auto refreshed = storage_owner_route_table_->routes_in_shard(
-    query, storage_id_);
-  if (!refreshed.empty()) {
-    entries.clear();
-    entries.reserve(refreshed.size());
-    for (const auto& route : refreshed) entries.push_back(route.entry);
   }
   return entries;
 }
 
-void MemoryNode::observe_storage_owner_route(
-    node_t id,
-    u32 generation,
-    RemotePtr entry,
-    const span<const element_t> vector) {
-  if (storage_owner_route_table_ == nullptr) return;
-  // publish_mutation releases the per-ID in-flight claim before this route
-  // update. A newer mutation can therefore win in the small intervening
-  // window; never let the older completion move a center or revive an entry.
-  DynamicFreshnessShard& shard = dynamic_freshness_shard(id);
-  std::lock_guard<std::mutex> lock(shard.mutex);
-  if (shard.mutations_inflight.contains(id)) return;
-  const auto current = shard.entries.find(id);
-  if (current != shard.entries.end()) {
-    if (current->second.deleted ||
-        current->second.generation != generation ||
-        current->second.current != entry) {
-      return;
+vec<vamana::routing::CentroidRouter::LiveEntry>
+MemoryNode::select_local_centroid_live_entries(
+    span<const RemotePtr> preferred) {
+  using LiveEntry = vamana::routing::CentroidRouter::LiveEntry;
+  thread_local vec<LiveEntry> candidates;
+  candidates.clear();
+  candidates.reserve(
+    preferred.size() + vamana::routing::CentroidRouter::kMaxLiveEntries);
+  thread_local hashset_t<RemotePtr> seen;
+  seen.clear();
+  seen.reserve(candidates.capacity());
+  const auto append = [&](RemotePtr pointer) {
+    if (pointer.is_null() || pointer.memory_node() != storage_id_ ||
+        !valid_local_storage_node_pointer(pointer)) {
+      return false;
     }
-  } else {
-    const auto base = base_idmap_.find(id);
-    if (base == base_idmap_.end() || base->second.deleted ||
-        base->second.generation != generation ||
-        base->second.current != entry) {
-      return;
+    if (seen.contains(pointer)) return true;
+    const u64 header = load_local_node_header_acquire(pointer);
+    if ((header & (VamanaNode::HEADER_DELETED |
+                   VamanaNode::HEADER_PROVISIONAL |
+                   VamanaNode::HEADER_RETIRING)) != 0 ||
+        VamanaNode::header_incarnation(header) != pointer.incarnation() ||
+        (header & VamanaNode::HEADER_CENTROID_ACCOUNTED) == 0) {
+      return false;
+    }
+    const byte_t* node = local_node_ptr(pointer);
+    if (*reinterpret_cast<const u32*>(
+          node + VamanaNode::offset_slot_incarnation()) !=
+        pointer.incarnation()) {
+      return false;
+    }
+    seen.insert(pointer);
+    candidates.push_back(LiveEntry{
+      pointer,
+      *reinterpret_cast<const u32*>(
+        node + VamanaNode::offset_generation()),
+    });
+    return true;
+  };
+
+  for (const RemotePtr pointer : preferred) append(pointer);
+  if (storage_centroid_router_ != nullptr) {
+    const auto snapshot = storage_centroid_router_->snapshot();
+    if (snapshot != nullptr && storage_id_ < snapshot->shards.size()) {
+      for (const LiveEntry& entry :
+           snapshot->shards[storage_id_].entries()) {
+        append(entry.pointer);
+      }
     }
   }
-  lib_assert(entry.memory_node() == storage_id_,
-             "adaptive storage-owner route observed a non-local entry");
-  if (storage_owner_route_table_->observe(
-        storage_id_, id, generation, entry, vector)) {
-    publish_storage_owner_route_table();
+
+  const u64 authoritative_count =
+    storage_centroid_router_->authoritative_count(storage_id_);
+  const size_t desired_entries = static_cast<size_t>(std::min<u64>(
+    authoritative_count, vamana::routing::CentroidRouter::kMaxLiveEntries));
+  if (desired_entries == 0) return {};
+
+  const auto sample_bitmap = [&](vec<u64>& bitmap,
+                                 u64 valid_bits,
+                                 u64 base,
+                                 u64 stride,
+                                 bool dynamic,
+                                 u64& cursor,
+                                 size_t sample_budget) {
+    if (bitmap.empty() || valid_bits == 0 || sample_budget == 0) {
+      return size_t{0};
+    }
+    const size_t before = candidates.size();
+    // Up to four existing roots can be encountered first. Probe past those
+    // duplicates, but retain a fixed per-plane word and set-bit budget.
+    const size_t candidate_probe_budget = sample_budget +
+      vamana::routing::CentroidRouter::kMaxLiveEntries;
+    thread_local vec<u64> ordinals;
+    vamana::routing::bounded_rotating_live_samples_into(
+      span<const u64>{bitmap}, valid_bits, cursor,
+      candidate_probe_budget, ordinals);
+    for (const u64 ordinal : ordinals) {
+      if (candidates.size() - before >= sample_budget) break;
+      const u64 mask = u64{1} << (ordinal % 64);
+      const u64 offset = base + ordinal * stride;
+      const u32 incarnation = dynamic
+        ? *reinterpret_cast<const u32*>(
+            index_buffer_.get_full_buffer() + offset +
+            VamanaNode::offset_slot_incarnation())
+        : 0;
+      if (!append(RemotePtr{storage_id_, offset, incarnation})) {
+        // Membership metadata is authoritative. Repair a stale bit lazily;
+        // the fixed probe budget still bounds this batch under sparse reuse.
+        bitmap[ordinal / 64] &= ~mask;
+      }
+    }
+    return candidates.size() - before;
+  };
+
+  const u64 dynamic_bits = static_cast<u64>(
+    storage_centroid_dynamic_live_bitmap_.size()) * 64;
+  const u64 dynamic_stride =
+    (VamanaNode::allocation_size() + alignof(u64) - 1) &
+    ~u64{alignof(u64) - 1};
+  // Explore four additional live identities on every membership batch even
+  // when all four published roots remain valid. Split the first probes across
+  // immutable and dynamic planes so neither population can starve, then spend
+  // any unused quota on whichever plane can supply it. All scans are bounded
+  // by constants and advance independent cursors through sparse regions.
+  constexpr size_t kInitialPlaneQuota =
+    vamana::routing::kLiveSeedExplorationSamples / 2;
+  size_t sampled = sample_bitmap(
+    storage_centroid_static_live_bitmap_, gpu_static_node_count_,
+    gpu_search::format::kNodeBaseOffset, VamanaNode::total_size(), false,
+    storage_centroid_static_cursor_, kInitialPlaneQuota);
+  sampled += sample_bitmap(
+    storage_centroid_dynamic_live_bitmap_, dynamic_bits,
+    gpu_dynamic_node_base_, dynamic_stride, true,
+    storage_centroid_dynamic_cursor_, kInitialPlaneQuota);
+  size_t remaining = vamana::routing::kLiveSeedExplorationSamples - sampled;
+  if (remaining != 0) {
+    const size_t extra_static = sample_bitmap(
+      storage_centroid_static_live_bitmap_, gpu_static_node_count_,
+      gpu_search::format::kNodeBaseOffset, VamanaNode::total_size(), false,
+      storage_centroid_static_cursor_, remaining);
+    remaining -= extra_static;
   }
+  if (remaining != 0) {
+    (void)sample_bitmap(
+      storage_centroid_dynamic_live_bitmap_, dynamic_bits,
+      gpu_dynamic_node_base_, dynamic_stride, true,
+      storage_centroid_dynamic_cursor_, remaining);
+  }
+
+  thread_local vec<f64> centroid;
+  centroid.resize(VamanaNode::DIM);
+  const bool have_centroid =
+    storage_centroid_router_->copy_authoritative_centroid(
+      storage_id_, span<f64>{centroid});
+  lib_assert(have_centroid &&
+               candidates.size() >= desired_entries,
+             "non-empty centroid membership lost every live route seed");
+  struct RankedEntry {
+    LiveEntry entry;
+    vamana::routing::CentroidSeedRank rank;
+  };
+  thread_local vec<RankedEntry> ranked;
+  ranked.clear();
+  ranked.reserve(candidates.size());
+  thread_local vec<element_t> decoded;
+  decoded.resize(VamanaNode::DIM);
+  for (const LiveEntry& candidate : candidates) {
+    const byte_t* node = local_node_ptr(candidate.pointer);
+    decode_storage_vector_to_float(
+      node + VamanaNode::offset_vector(), VamanaNode::vector_dtype(),
+      VamanaNode::DIM, decoded.data());
+    ranked.push_back({
+      .entry = candidate,
+      .rank = {
+        .squared_l2 = vamana::routing::centroid_seed_squared_l2(
+          span<const f32>{decoded}, span<const f64>{centroid}),
+        .pointer_raw = candidate.pointer.raw_address,
+      },
+    });
+  }
+  std::sort(ranked.begin(), ranked.end(),
+            [](const RankedEntry& lhs, const RankedEntry& rhs) {
+              return vamana::routing::centroid_seed_rank_less(
+                lhs.rank, rhs.rank);
+            });
+  vec<LiveEntry> entries;
+  entries.reserve(desired_entries);
+  for (size_t index = 0; index < desired_entries; ++index) {
+    entries.push_back(ranked[index].entry);
+  }
+  return entries;
 }
 
-void MemoryNode::invalidate_storage_owner_route(node_t id, u32 generation) {
-  if (storage_owner_route_table_ == nullptr) return;
-  DynamicFreshnessShard& shard = dynamic_freshness_shard(id);
-  std::lock_guard<std::mutex> lock(shard.mutex);
-  const auto current = shard.entries.find(id);
-  if (current == shard.entries.end() ||
-      current->second.generation != generation ||
-      !current->second.deleted) {
-    return;
+bool MemoryNode::apply_local_centroid_membership_ops(
+    span<const service::storage_owner::CentroidMembershipOp> ops) {
+  using Kind = service::storage_owner::CentroidMembershipKind;
+  if (ops.empty()) return true;
+  std::lock_guard<std::mutex> update_lock(
+    storage_centroid_update_mutex_);
+  thread_local vec<RemotePtr> preferred;
+  preferred.clear();
+  preferred.reserve(ops.size());
+  bool changed = false;
+  bool success = true;
+  thread_local vec<element_t> decoded;
+  decoded.resize(VamanaNode::DIM);
+  const auto valid_centroid_slot_address = [&](RemotePtr pointer) {
+    if (pointer.is_null() || !pointer.is_well_formed() ||
+        pointer.memory_node() != storage_id_ ||
+        !VamanaNode::hot_graph_entry_available(pointer)) {
+      return false;
+    }
+    const auto header_address =
+      vamana::StorageLayoutResolver::header(pointer);
+    if (header_address.offset > mn_memory_bytes_ ||
+        sizeof(u64) > mn_memory_bytes_ - header_address.offset) {
+      return false;
+    }
+    const u64 offset = pointer.byte_offset();
+    if (offset < gpu_dynamic_node_base_) {
+      return pointer.incarnation() == 0 &&
+        offset >= gpu_search::format::kNodeBaseOffset &&
+        (offset - gpu_search::format::kNodeBaseOffset) %
+            VamanaNode::total_size() == 0 &&
+        (offset - gpu_search::format::kNodeBaseOffset) /
+            VamanaNode::total_size() < gpu_static_node_count_;
+    }
+    if (pointer.incarnation() == 0) return false;
+    const u64 stride =
+      (VamanaNode::allocation_size() + alignof(u64) - 1) &
+      ~u64{alignof(u64) - 1};
+    if ((offset - gpu_dynamic_node_base_) % stride != 0) return false;
+    const auto* control = reinterpret_cast<const
+      gpu_search::format::StorageControlBlock*>(
+        index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+    const u64 high_watermark = std::atomic_ref<const u64>(
+      control->dynamic_high_watermark).load(std::memory_order_acquire);
+    return offset <= high_watermark &&
+      VamanaNode::allocation_size() <= high_watermark - offset;
+  };
+  const auto update_live_bitmap = [&](RemotePtr pointer, bool live) {
+    const u64 offset = pointer.byte_offset();
+    u64 ordinal = 0;
+    vec<u64>* bitmap = nullptr;
+    if (offset >= gpu_dynamic_node_base_) {
+      const u64 stride =
+        (VamanaNode::allocation_size() + alignof(u64) - 1) &
+        ~u64{alignof(u64) - 1};
+      lib_assert((offset - gpu_dynamic_node_base_) % stride == 0,
+                 "centroid membership references a misaligned dynamic node");
+      ordinal = (offset - gpu_dynamic_node_base_) / stride;
+      bitmap = &storage_centroid_dynamic_live_bitmap_;
+      const size_t required_words = static_cast<size_t>(ordinal / 64 + 1);
+      if (bitmap->size() < required_words) bitmap->resize(required_words, 0);
+    } else {
+      lib_assert(offset >= gpu_search::format::kNodeBaseOffset &&
+                   (offset - gpu_search::format::kNodeBaseOffset) %
+                     VamanaNode::total_size() == 0,
+                 "centroid membership references a misaligned static node");
+      ordinal = (offset - gpu_search::format::kNodeBaseOffset) /
+        VamanaNode::total_size();
+      lib_assert(ordinal < gpu_static_node_count_,
+                 "centroid membership static ordinal exceeds the shard");
+      bitmap = &storage_centroid_static_live_bitmap_;
+    }
+    const u64 mask = u64{1} << (ordinal % 64);
+    if (live) {
+      (*bitmap)[ordinal / 64] |= mask;
+    } else {
+      (*bitmap)[ordinal / 64] &= ~mask;
+    }
+  };
+
+  // Reject malformed envelopes before touching any node. Identity races are
+  // handled independently below: valid operations in the same wire batch are
+  // still published, while the caller retries the stale item idempotently.
+  for (const auto& op : ops) {
+    const RemotePtr pointer{op.node_raw};
+    const auto kind = static_cast<Kind>(op.kind);
+    if (op.maintenance_sequence == 0 || op.reserved != 0 ||
+        (kind != Kind::add && kind != Kind::remove) ||
+        !valid_centroid_slot_address(pointer)) {
+      return false;
+    }
   }
-  if (storage_owner_route_table_->invalidate(id, generation)) {
-    publish_storage_owner_route_table();
+
+  for (const auto& op : ops) {
+    const RemotePtr pointer{op.node_raw};
+    const auto kind = static_cast<Kind>(op.kind);
+
+    const auto pointer_lock = try_lock_node(pointer);
+    if (pointer_lock != memory_node_storage_owner_index_detail::
+                          IncarnationLockResult::locked) {
+      // A structurally valid remove whose tagged incarnation is already gone
+      // has reached its postcondition.  It must not retry forever and, most
+      // importantly, must never debit the slot's new occupant.
+      bool old_incarnation_absent = false;
+      if (kind == Kind::remove &&
+          pointer_lock == memory_node_storage_owner_index_detail::
+                            IncarnationLockResult::stale) {
+        const u64 before = load_local_node_header_acquire(pointer);
+        const byte_t* observed = local_node_ptr(pointer);
+        const node_t observed_id = *reinterpret_cast<const node_t*>(
+          observed + VamanaNode::offset_id());
+        const u32 observed_generation = *reinterpret_cast<const u32*>(
+          observed + VamanaNode::offset_generation());
+        const u32 observed_slot_incarnation =
+          *reinterpret_cast<const u32*>(
+            observed + VamanaNode::offset_slot_incarnation());
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const u64 after = load_local_node_header_acquire(pointer);
+        if (before == after &&
+            (after & VamanaNode::HEADER_NODE_LOCK) == 0) {
+          old_incarnation_absent =
+            memory_node_storage_owner_maintenance_detail::
+              classify_centroid_remove_identity(
+                pointer.incarnation(),
+                VamanaNode::header_incarnation(after),
+                observed_slot_incarnation,
+                observed_id == op.id &&
+                  observed_generation == op.generation) ==
+              memory_node_storage_owner_maintenance_detail::
+                CentroidRemoveIdentityDecision::already_absent;
+        }
+      }
+      if (!old_incarnation_absent) success = false;
+      continue;
+    }
+    auto* node = local_node_ptr(pointer);
+    auto* header_storage = reinterpret_cast<u64*>(node);
+    std::atomic_ref<u64> header_ref(*header_storage);
+    const u64 header = header_ref.load(std::memory_order_acquire);
+    const node_t id = *reinterpret_cast<const node_t*>(
+      node + VamanaNode::offset_id());
+    const u32 generation = *reinterpret_cast<const u32*>(
+      node + VamanaNode::offset_generation());
+    const u32 slot_incarnation = *reinterpret_cast<const u32*>(
+      node + VamanaNode::offset_slot_incarnation());
+    const bool accounted =
+      (header & VamanaNode::HEADER_CENTROID_ACCOUNTED) != 0;
+    const bool id_and_generation_match =
+      id == op.id && generation == op.generation;
+    const bool identity_matches = id_and_generation_match &&
+      VamanaNode::header_incarnation(header) == pointer.incarnation() &&
+      slot_incarnation == pointer.incarnation();
+    const bool addable =
+      (header & (VamanaNode::HEADER_DELETED |
+                 VamanaNode::HEADER_PROVISIONAL |
+                 VamanaNode::HEADER_RETIRING)) == 0;
+    if (kind == Kind::remove) {
+      const auto decision =
+        memory_node_storage_owner_maintenance_detail::
+          classify_centroid_remove_identity(
+            pointer.incarnation(), VamanaNode::header_incarnation(header),
+            slot_incarnation, id_and_generation_match);
+      if (decision == memory_node_storage_owner_maintenance_detail::
+                        CentroidRemoveIdentityDecision::already_absent) {
+        unlock_node(pointer);
+        continue;
+      }
+      if (decision != memory_node_storage_owner_maintenance_detail::
+                        CentroidRemoveIdentityDecision::apply_exact) {
+        unlock_node(pointer);
+        success = false;
+        continue;
+      }
+    } else if (!identity_matches || !addable) {
+      unlock_node(pointer);
+      success = false;
+      continue;
+    }
+    if ((kind == Kind::add && accounted) ||
+        (kind == Kind::remove && !accounted)) {
+      unlock_node(pointer);
+      continue;
+    }
+
+    decode_storage_vector_to_float(
+      node + VamanaNode::offset_vector(), VamanaNode::vector_dtype(),
+      VamanaNode::DIM, decoded.data());
+    const bool applied = kind == Kind::add
+      ? storage_centroid_router_->insert(
+          storage_id_, span<const element_t>{decoded})
+      : storage_centroid_router_->erase(
+          storage_id_, span<const element_t>{decoded});
+    if (!applied) {
+      unlock_node(pointer);
+      success = false;
+      continue;
+    }
+    if (kind == Kind::add) {
+      header_ref.fetch_or(
+        static_cast<u64>(VamanaNode::HEADER_CENTROID_ACCOUNTED),
+        std::memory_order_release);
+      update_live_bitmap(pointer, true);
+      preferred.push_back(pointer);
+    } else {
+      header_ref.fetch_and(
+        ~static_cast<u64>(VamanaNode::HEADER_CENTROID_ACCOUNTED),
+        std::memory_order_release);
+      update_live_bitmap(pointer, false);
+    }
+    unlock_node(pointer);
+    changed = true;
   }
+
+  if (!changed) return success;
+  const auto entries = select_local_centroid_live_entries(
+    span<const RemotePtr>{preferred});
+  // Empty membership is legal only when the authoritative count became zero;
+  // erase() canonicalizes that state and clears its entries itself.
+  if (!entries.empty()) {
+    (void)storage_centroid_router_->replace_live_entries(
+      storage_id_, entries);
+  }
+  const u64 authoritative_count =
+    storage_centroid_router_->authoritative_count(storage_id_);
+  lib_assert(!entries.empty() || authoritative_count == 0,
+             "non-empty shard lost every dynamic centroid route entry");
+  lib_assert(storage_centroid_router_->publish(),
+             "centroid membership mutation was not publishable");
+  publish_storage_centroid_route();
+  return success;
 }
 
 size_t MemoryNode::align_up(size_t value, size_t alignment) {
@@ -729,7 +1190,15 @@ const byte_t* MemoryNode::local_live_vector(RemotePtr rptr) const {
   lib_assert(vector.offset + vector.size <= mn_memory_bytes_,
              "local vector lookup exceeds shard bounds");
   const u64 header = load_local_node_header_acquire(rptr);
-  if ((header & VamanaNode::HEADER_DELETED) != 0) {
+  if ((header & (VamanaNode::HEADER_NODE_LOCK |
+                 VamanaNode::HEADER_DELETED)) != 0 ||
+      VamanaNode::header_incarnation(header) != rptr.incarnation()) {
+    return nullptr;
+  }
+  const byte_t* node = index_buffer_.get_full_buffer() + rptr.byte_offset();
+  if (*reinterpret_cast<const u32*>(
+        node + VamanaNode::offset_slot_incarnation()) !=
+      rptr.incarnation()) {
     return nullptr;
   }
   return index_buffer_.get_full_buffer() + vector.offset;

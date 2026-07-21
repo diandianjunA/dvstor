@@ -109,113 +109,6 @@ void PersistentSearchEngine::Impl::stream_codes_to_gpu(NavigationBootstrapper& s
             << samples.size() << " entries\n";
 }
 
-void PersistentSearchEngine::Impl::stream_anchor_graph_to_gpu(NavigationBootstrapper& source) {
-  if (anchor_graph_keys_host.empty()) {
-    std::cerr << "[gpu-search] static fallback route graph disabled\n";
-    return;
-  }
-  constexpr size_t kBootstrapBatch = 4096;
-  std::vector<NavigationRead> requests;
-  std::vector<i32> statuses;
-  requests.reserve(kBootstrapBatch);
-  for (size_t begin = 0; begin < anchor_graph_keys_host.size();
-       begin += kBootstrapBatch) {
-    const size_t end = std::min(begin + kBootstrapBatch,
-                                anchor_graph_keys_host.size());
-    requests.clear();
-    for (size_t slot = begin; slot < end; ++slot) {
-      const u64 key = anchor_graph_keys_host[slot];
-      const u32 shard = static_cast<u32>(key >> 48);
-      if (shard >= index.shards.size()) {
-        throw std::runtime_error("anchor route graph key has an invalid shard");
-      }
-      requests.push_back(NavigationRead{
-        .remote_offset = (key << 16) >> 16,
-        .destination_address = reinterpret_cast<u64>(
-          d_anchor_graph_records +
-          slot * index.layout.graph_entry_bytes),
-        .bytes = index.layout.graph_entry_bytes,
-        .memory_node = static_cast<u16>(shard),
-      });
-    }
-    statuses.assign(requests.size(), -EIO);
-    source.read(requests, statuses);
-    for (size_t request = 0; request < statuses.size(); ++request) {
-      if (statuses[request] <= 0) {
-        throw std::runtime_error(
-          "anchor route graph bootstrap failed: slot=" +
-          std::to_string(begin + request) + " status=" +
-          std::to_string(statuses[request]));
-      }
-    }
-  }
-
-  const size_t audit_count = std::min<size_t>(15, anchor_graph_keys_host.size());
-  std::vector<byte_t> record(index.layout.graph_entry_bytes);
-  for (size_t audit = 0; audit < audit_count; ++audit) {
-    const size_t slot = audit_count == 1 ? 0 :
-      audit * (anchor_graph_keys_host.size() - 1) / (audit_count - 1);
-    check_cuda(cudaMemcpy(
-                 record.data(),
-                 d_anchor_graph_records + slot * index.layout.graph_entry_bytes,
-                 record.size(), cudaMemcpyDeviceToHost),
-               "cudaMemcpy(anchor route graph audit)");
-    const u16 expected = vamana::hot_graph::load_u16_le(record.data() + 2);
-    const u16 actual = vamana::hot_graph::checksum16(record.data(), record.size());
-    if (record[0] > index.layout.graph_degree || expected != actual) {
-      throw std::runtime_error(
-        "anchor route graph audit failed at slot " + std::to_string(slot));
-    }
-  }
-  std::cerr << "[gpu-search] resident static fallback graph records="
-            << anchor_graph_keys_host.size() << " bytes="
-            << anchor_graph_keys_host.size() * index.layout.graph_entry_bytes
-            << " audit=" << audit_count << '\n';
-}
-
-void PersistentSearchEngine::Impl::clear_delta_device_state(cudaStream_t stream) {
-  bind_cuda_device("cudaSetDevice(GPU navigation delta reset)");
-  check_cuda(cudaMemsetAsync(d_delta_records, 0,
-                             static_cast<size_t>(delta_capacity) * sizeof(DeviceDeltaRecord),
-                             stream),
-             "cudaMemset(navigation delta records)");
-  check_cuda(cudaMemsetAsync(d_delta_next, 0xff,
-                             static_cast<size_t>(delta_capacity) * sizeof(u32), stream),
-             "cudaMemset(navigation delta links)");
-  check_cuda(cudaMemsetAsync(d_delta_prev, 0xff,
-                             static_cast<size_t>(delta_capacity) * sizeof(u32), stream),
-             "cudaMemset(navigation delta reverse links)");
-  check_cuda(cudaMemsetAsync(d_delta_remote_positions, 0xff,
-                             static_cast<size_t>(delta_capacity) * sizeof(u32), stream),
-             "cudaMemset(navigation delta remote positions)");
-  check_cuda(cudaMemsetAsync(d_base_override_keys, 0xff,
-                             static_cast<size_t>(delta_table_capacity) * sizeof(u32), stream),
-             "cudaMemset(navigation override keys)");
-  check_cuda(cudaMemsetAsync(d_base_override_epochs, 0,
-                             static_cast<size_t>(delta_table_capacity) * sizeof(u64), stream),
-             "cudaMemset(navigation override epochs)");
-  check_cuda(cudaMemsetAsync(d_permanent_override_bits, 0,
-                             static_cast<size_t>(permanent_override_words) * sizeof(u32),
-                             stream),
-             "cudaMemset(navigation permanent override bits)");
-  check_cuda(cudaMemsetAsync(d_delta_remote_keys, 0,
-                             static_cast<size_t>(delta_table_capacity) * sizeof(u64), stream),
-             "cudaMemset(navigation remote keys)");
-  check_cuda(cudaMemsetAsync(d_delta_remote_slots, 0xff,
-                             static_cast<size_t>(delta_table_capacity) * sizeof(u32), stream),
-             "cudaMemset(navigation remote slots)");
-  check_cuda(cudaMemsetAsync(d_delta_count, 0, sizeof(u32), stream),
-             "cudaMemset(navigation delta count)");
-  if (d_delta_bucket_heads != nullptr) {
-    check_cuda(cudaMemsetAsync(d_delta_bucket_heads, 0xff,
-                               static_cast<size_t>(anchor_table.count()) * sizeof(u32),
-                               stream),
-               "cudaMemset(navigation delta buckets)");
-  }
-  check_cuda(cudaStreamSynchronize(stream),
-             "cudaStreamSynchronize(navigation delta reset)");
-}
-
 void PersistentSearchEngine::Impl::start_persistent_kernel() {
   bind_cuda_device("cudaSetDevice(GPU navigation kernel start)");
   *stop_host = 0;
@@ -311,11 +204,11 @@ void PersistentSearchEngine::Impl::stop_persistent_kernel() {
   check_cuda(cudaStreamSynchronize(rdma_stream),
              "cudaStreamSynchronize(GPU navigation stop signal)");
   const cudaError_t query_status = cudaStreamSynchronize(kernel_stream);
-  const cudaError_t control_status = cudaStreamSynchronize(delta_stream);
+  const cudaError_t control_status = cudaStreamSynchronize(route_stream);
   const cudaError_t rdma_status = cudaStreamSynchronize(rdma_stream);
   kernel_running = false;
   check_cuda(query_status, "cudaStreamSynchronize(GPU navigation stop)");
-  check_cuda(control_status, "cudaStreamSynchronize(GPU delta control stop)");
+  check_cuda(control_status, "cudaStreamSynchronize(GPU route control stop)");
   check_cuda(rdma_status, "cudaStreamSynchronize(GPU RDMA owner stop)");
 }
 
@@ -349,15 +242,14 @@ PersistentSearchEngine::Impl::~Impl() {
       (void)cudaStreamSynchronize(rdma_stream);
     }
     if (kernel_stream != nullptr) cudaStreamSynchronize(kernel_stream);
-    if (delta_stream != nullptr) cudaStreamSynchronize(delta_stream);
+    if (route_stream != nullptr) cudaStreamSynchronize(route_stream);
     if (rdma_stream != nullptr) cudaStreamSynchronize(rdma_stream);
     kernel_running = false;
   }
   reject_all_pending("persistent GPU query engine stopped before completion");
   if (completion_thread.joinable()) completion_thread.join();
-  if (route_refresh_stream != nullptr) cudaStreamDestroy(route_refresh_stream);
   if (rdma_stream != nullptr) cudaStreamDestroy(rdma_stream);
-  if (delta_stream != nullptr) cudaStreamDestroy(delta_stream);
+  if (route_stream != nullptr) cudaStreamDestroy(route_stream);
   if (kernel_stream != nullptr) cudaStreamDestroy(kernel_stream);
   if (direct_disabled_host != nullptr) cudaFreeHost(direct_disabled_host);
   if (direct_error_host != nullptr) cudaFreeHost(direct_error_host);
@@ -370,32 +262,18 @@ PersistentSearchEngine::Impl::~Impl() {
   if (stop_host != nullptr) cudaFreeHost(stop_host);
   if (result_distances_host != nullptr) cudaFreeHost(result_distances_host);
   if (result_ids_host != nullptr) cudaFreeHost(result_ids_host);
-  if (delta_staging_vectors_host != nullptr) cudaFreeHost(delta_staging_vectors_host);
-  if (delta_staging_records_host != nullptr) cudaFreeHost(delta_staging_records_host);
-  if (delta_staging_slots_host != nullptr) cudaFreeHost(delta_staging_slots_host);
-  if (delta_override_updates_host != nullptr) cudaFreeHost(delta_override_updates_host);
-  if (delta_durable_updates_host != nullptr) cudaFreeHost(delta_durable_updates_host);
-  if (resident_pq_erase_updates_host != nullptr) {
-    cudaFreeHost(resident_pq_erase_updates_host);
+  if (centroid_route_centroid_updates_host != nullptr) {
+    cudaFreeHost(centroid_route_centroid_updates_host);
   }
-  if (dynamic_route_updates_host != nullptr) {
-    cudaFreeHost(dynamic_route_updates_host);
+  if (centroid_route_updates_host != nullptr) {
+    cudaFreeHost(centroid_route_updates_host);
   }
-  if (dynamic_route_code_updates_host != nullptr) {
-    cudaFreeHost(dynamic_route_code_updates_host);
-  }
-  if (delta_supersede_updates_host != nullptr) cudaFreeHost(delta_supersede_updates_host);
-  if (graph_invalidation_keys_host != nullptr) cudaFreeHost(graph_invalidation_keys_host);
-  if (anchor_graph_validation_host != nullptr) {
-    cudaFreeHost(anchor_graph_validation_host);
-  }
-  if (anchor_graph_readers_host != nullptr) cudaFreeHost(anchor_graph_readers_host);
   device_free(direct_error_device);
   device_free(direct_disabled_device);
   device_free(stop_device);
-  device_free(d_dynamic_route_pq_codes);
-  device_free(d_dynamic_route_slots);
-  device_free(d_delta_count);
+  device_free(d_centroid_route_epoch);
+  device_free(d_centroid_route_shards);
+  device_free(d_centroid_route_entries);
   device_free(d_direct_batch_statuses);
   device_free(d_direct_batch_queues);
   device_free(d_direct_batch_entries);
@@ -406,25 +284,6 @@ PersistentSearchEngine::Impl::~Impl() {
   device_free(d_query_dispatch_sequences);
   device_free(d_query_dispatch_dequeue);
   device_free(d_query_dispatch_enqueue);
-  device_free(d_resident_pq_positions);
-  device_free(d_resident_pq_slots);
-  device_free(d_resident_pq_keys);
-  device_free(d_resident_pq_codes);
-  device_free(d_delta_remote_slots);
-  device_free(d_delta_remote_keys);
-  device_free(d_base_override_epochs);
-  device_free(d_base_override_keys);
-  device_free(d_permanent_override_bits);
-  device_free(d_delta_remote_positions);
-  device_free(d_delta_prev);
-  device_free(d_delta_next);
-  device_free(d_delta_pq_codes);
-  device_free(d_delta_encode_scratch);
-  device_free(d_delta_vectors);
-  device_free(d_delta_records);
-  device_free(d_anchor_graph_readers);
-  device_free(d_anchor_graph_states);
-  device_free(d_anchor_graph_keys);
   control_bootstrapper.reset();
   if (owns_remote_buffer) device_free(d_remote_buffer);
 #ifdef DVSTOR_HAVE_GPUNETIO
@@ -440,11 +299,7 @@ PersistentSearchEngine::Impl::~Impl() {
   device_free(d_transformed_queries);
   if (query_input_host != nullptr) cudaFreeHost(query_input_host);
   device_free(d_queries);
-  device_free(d_delta_bucket_heads);
-  device_free(d_anchor_handles);
-  device_free(d_anchor_pq_codes);
-  device_free(d_anchor_vectors);
-  device_free(d_entry_points);
+  device_free(d_shard_centroids);
   device_free(d_pq_centroids);
   device_free(d_opq_matrix);
   device_free(d_shards);

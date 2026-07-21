@@ -48,7 +48,6 @@ enum class Subcategory : u8 {
   cpu_storage_owner_prune_distance,
   cpu_storage_owner_prune_sort,
   cpu_storage_owner_prune_pair_distance,
-  rdma_storage_owner_medoid,
   rdma_storage_owner_send,
   rdma_storage_owner_search_neighbor_read,
   rdma_storage_owner_search_snapshot_read,
@@ -88,7 +87,6 @@ inline constexpr std::array<std::string_view, kSubcategoryCount> kSubcategoryNam
   "cpu_storage_owner_prune_distance_ns",
   "cpu_storage_owner_prune_sort_ns",
   "cpu_storage_owner_prune_pair_distance_ns",
-  "rdma_storage_owner_medoid_ns",
   "rdma_storage_owner_send_ns",
   "rdma_storage_owner_search_neighbor_read_ns",
   "rdma_storage_owner_search_snapshot_read_ns",
@@ -100,7 +98,7 @@ inline constexpr std::string_view operation_name(Operation operation) {
 }
 
 inline constexpr Category parent_category(Subcategory subcategory) {
-  return subcategory >= Subcategory::rdma_storage_owner_medoid &&
+  return subcategory >= Subcategory::rdma_storage_owner_send &&
          subcategory < Subcategory::count
     ? Category::rdma : Category::cpu;
 }

@@ -37,21 +37,11 @@ ComputeService::ComputeService(const Configuration& config)
   lib_assert(service::index_metadata::load_metadata(
                startup_prefix, metadata, &metadata_error), metadata_error);
   if (config_.enable_updates) {
-    lib_assert(base_owner_map_.load(startup_prefix, num_servers_,
-                                    metadata.idmap_format, &metadata_error),
-               metadata_error);
-    print_status("storage-owner base idmap: entries=" +
-                 std::to_string(base_owner_map_.entry_count()) + " memory=" +
-                 std::to_string(base_owner_map_.memory_bytes()) + " bytes");
-    // Logical-ID placement must be identical on every compute node. Dynamic
-    // routes are intentionally used for graph/search entry selection, not for
-    // authoritative identity ownership; otherwise independently evolving
-    // compute-local centers could create the same generation on two owners.
     print_status(
-      "storage-owner placement: base idmap for existing IDs; "
-      "deterministic ID shard for new IDs");
+      "storage-owner authority: deterministic ID shard; "
+      "physical placement: storage directory + centroid home");
   } else {
-    print_status("compute updates disabled: owner idmaps and update executor are not loaded");
+    print_status("compute updates disabled: update executor is not started");
   }
 
   const cudaError_t cuda_status = cudaSetDevice(static_cast<int>(config_.gpu_device));

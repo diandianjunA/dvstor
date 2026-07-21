@@ -11,69 +11,6 @@ ComputeService::Status ComputeService::status() const {
   };
 }
 
-bool ComputeService::publish_compute_side_id(node_t id,
-                                             RemotePtr ptr,
-                                             bool deleted,
-                                             u32 owner_storage,
-                                             u32 generation) {
-  auto& shard = compute_side_idmap_[static_cast<size_t>(id) % kComputeSideIdShardCount];
-  std::lock_guard<std::mutex> lock(shard.mutex);
-  const auto existing = shard.entries.find(id);
-  if (existing != shard.entries.end() &&
-      existing->second.generation >= generation) {
-    return false;
-  }
-  shard.entries[id] = ComputeSideIdEntry{
-    ptr, deleted, owner_storage, generation};
-  return true;
-}
-
-bool ComputeService::lookup_compute_side_id(
-    node_t id, RemotePtr* ptr, bool* deleted) const {
-  const auto& shard = compute_side_idmap_[static_cast<size_t>(id) % kComputeSideIdShardCount];
-  std::lock_guard<std::mutex> lock(shard.mutex);
-  const auto it = shard.entries.find(id);
-  if (it == shard.entries.end()) return false;
-  if (ptr != nullptr) *ptr = it->second.ptr;
-  if (deleted != nullptr) *deleted = it->second.deleted;
-  return true;
-}
-
-std::optional<u32> ComputeService::known_storage_owner_for_id(
-    node_t id) const {
-  {
-    const auto& shard =
-      compute_side_idmap_[static_cast<size_t>(id) % kComputeSideIdShardCount];
-    std::lock_guard<std::mutex> lock(shard.mutex);
-    const auto it = shard.entries.find(id);
-    if (it != shard.entries.end()) return it->second.owner_storage;
-  }
-  return base_owner_map_.owner_for(id);
-}
-
-u32 ComputeService::claim_storage_owner_for_mutation(
-    node_t id, u32 proposed_owner) {
-  auto& shard =
-    compute_side_idmap_[static_cast<size_t>(id) % kComputeSideIdShardCount];
-  std::lock_guard<std::mutex> lock(shard.mutex);
-  const auto existing = shard.entries.find(id);
-  if (existing != shard.entries.end()) {
-    return existing->second.owner_storage;
-  }
-  // An immutable base owner is authoritative even before this compute
-  // process has observed a runtime mutation for the ID.
-  if (const auto base_owner = base_owner_map_.owner_for(id)) {
-    return *base_owner;
-  }
-  // Generation zero is a local routing claim, not a published mutation. The
-  // first successful storage response starts at generation one and replaces
-  // it. This closes the window in which concurrent first mutations for the
-  // same ID could choose different owners on this compute service.
-  shard.entries.emplace(
-    id, ComputeSideIdEntry{RemotePtr{}, true, proposed_owner, 0});
-  return proposed_owner;
-}
-
 void ComputeService::reset_breakdown_state() {
   std::lock_guard<std::mutex> lock(breakdown_mutex_);
   completed_breakdown_report_ = {};
@@ -133,21 +70,27 @@ bool ComputeService::validate_index_metadata(
   if (!service::index_metadata::load_metadata(index_prefix, metadata, error_message)) {
     return false;
   }
-  const bool compatible_quantizer = metadata.navigation_quantizer == "opq_pq" ||
-    metadata.navigation_quantizer == "opq_pq16";
-  const bool compatible_navigation = metadata.navigation_format == "opq_pq_graph_v1" ||
-    metadata.navigation_format == "opq_pq16_graph_v1";
-  if (metadata.schema_version != gpu_search::format::kMetadataSchemaVersion ||
+  if (num_servers_ == 0 ||
+      num_servers_ > RemotePtr::MEMORY_NODE_MASK + 1 ||
+      metadata.schema_version != gpu_search::format::kMetadataSchemaVersion ||
       metadata.node_layout != "plain" ||
-      metadata.storage_format != "vamana_compact_v1" ||
-      !compatible_quantizer || !compatible_navigation ||
+      metadata.storage_format != "vamana_tagged_v2" ||
+      metadata.centroid_state_format !=
+        "physical_shard_centroid_v2_bound" ||
+      metadata.navigation_quantizer != "opq_pq" ||
+      metadata.navigation_format != "opq_pq_graph_v1" ||
       metadata.navigation_code_bytes == 0 ||
       metadata.navigation_code_bytes != metadata.pq_subquantizers ||
       metadata.pq_bits != 8 || metadata.navigation_model_checksum == 0 ||
+      metadata.index_build_fingerprint == 0 ||
+      metadata.shard_build_fingerprints.size() != num_servers_ ||
+      std::find(metadata.shard_build_fingerprints.begin(),
+                metadata.shard_build_fingerprints.end(), 0) !=
+        metadata.shard_build_fingerprints.end() ||
       metadata.dim != config_.dim || metadata.R != config_.R ||
       metadata.num_memory_nodes != num_servers_) {
     if (error_message != nullptr) {
-      *error_message = "index is not a compatible schema-15 OPQ/PQ GPU index";
+      *error_message = "index is not a compatible schema-16 OPQ/PQ GPU index";
     }
     return false;
   }
@@ -164,6 +107,10 @@ bool ComputeService::validate_index_metadata(
       metadata.node_size != VamanaNode::total_size() ||
       metadata.graph_hot_bytes != VamanaNode::graph_hot_bytes() ||
       metadata.vector_offset != VamanaNode::offset_vector() ||
+      metadata.slot_incarnation_offset !=
+        VamanaNode::offset_slot_incarnation() ||
+      metadata.remote_ptr_format !=
+        "tagged_inc24_shard6_off34x16_v1" ||
       metadata.hot_graph_pointer_bytes != vamana::hot_graph::kCompactPointerBytes ||
       metadata.hot_graph_entry_size != VamanaNode::hot_graph_entry_size() ||
       metadata.hot_graph_offsets.size() != num_servers_ ||
@@ -178,8 +125,12 @@ bool ComputeService::validate_index_metadata(
       metadata.hot_graph_dynamic_hot_offset < VamanaNode::total_size() ||
       metadata.dynamic_navigation_code_offset <
         metadata.hot_graph_dynamic_hot_offset + metadata.hot_graph_entry_size ||
+      metadata.dynamic_navigation_code_validation_bytes !=
+        VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES ||
       metadata.hot_graph_dynamic_record_bytes <
-        metadata.dynamic_navigation_code_offset + metadata.navigation_code_bytes) {
+        metadata.dynamic_navigation_code_offset +
+          metadata.dynamic_navigation_code_validation_bytes +
+          metadata.navigation_code_bytes) {
     if (error_message != nullptr) *error_message = "index storage layout mismatch";
     return false;
   }
@@ -195,7 +146,7 @@ bool ComputeService::validate_index_metadata(
     if (error_message != nullptr) *error_message = "failed to enable compact graph layout";
     return false;
   }
-  print_status("loaded schema-15 GPU index metadata from " + index_prefix.string() +
+  print_status("loaded schema-16 GPU index metadata from " + index_prefix.string() +
                " (OPQ/PQ" + std::to_string(metadata.pq_subquantizers) +
                ", vector_data_type=" +
                VamanaNode::vector_dtype_name() + ")");

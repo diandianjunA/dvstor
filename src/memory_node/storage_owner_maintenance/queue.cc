@@ -1,77 +1,133 @@
 #include "memory_node/storage_owner_maintenance/detail.hh"
+#include "memory_node/storage_owner_maintenance/admission_policy.hh"
+#include "memory_node/storage_owner_maintenance/cleanup_scheduler.hh"
 
 using namespace memory_node_storage_owner_maintenance_detail;
 
-bool MemoryNode::enqueue_storage_owner_maintenance(StorageOwnerMaintenanceTask&& task,
-                                                   const Configuration& config) {
-  if (!storage_owner_maintenance_enabled(config) || task.target.is_null()) {
-    return false;
+u64 MemoryNode::arm_storage_owner_maintenance(
+    StorageOwnerMaintenanceTask&& task, const Configuration& config) {
+  if (!storage_owner_maintenance_enabled(config) || task.target.is_null() ||
+      task.kind != StorageOwnerMaintenanceKind::finalize_insert) {
+    return 0;
   }
 
-  task.queued_at = std::chrono::steady_clock::now();
-  size_t backlog = 0;
+  // Reserve queue capacity before reserving a completion sequence. The
+  // permit is visible to every other queue producer, while workers remain
+  // free to drain existing runnable work if completion-ring admission blocks.
   {
     std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
     storage_owner_maintenance_cv_.wait(lock, [&]() {
-      return storage_owner_maintenance_shutdown_.load(std::memory_order_acquire) ||
-             storage_owner_stitch_tasks_.size() + storage_owner_cleanup_tasks_.size() <
-               config.storage_owner_maintenance_queue_depth;
+      return storage_owner_maintenance_shutdown_.load(
+               std::memory_order_acquire) ||
+        maintenance_queue_permit_available(
+          storage_owner_stage2_tasks_.size() +
+            storage_owner_cleanup_tasks_.size(),
+          storage_owner_maintenance_reserved_slots_,
+          config.storage_owner_maintenance_queue_depth);
     });
-    if (storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
-      return false;
+    if (storage_owner_maintenance_shutdown_.load(
+          std::memory_order_acquire)) {
+      return 0;
     }
-    if (task.kind == StorageOwnerMaintenanceKind::stitch_insert) {
-      storage_owner_stitch_tasks_.push_back(std::move(task));
-    } else {
-      storage_owner_cleanup_tasks_.push_back(std::move(task));
-    }
-    backlog = storage_owner_stitch_tasks_.size() + storage_owner_cleanup_tasks_.size();
+    ++storage_owner_maintenance_reserved_slots_;
   }
-  storage_owner_maintenance_enqueued_.fetch_add(1, std::memory_order_relaxed);
+
+  const u64 sequence = begin_storage_owner_maintenance_sequence(1);
+  task.maintenance_sequence = sequence;
+  task.queued_at = std::chrono::steady_clock::now();
+  size_t backlog = 0;
+  bool enqueued = false;
+  {
+    std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
+    lib_assert(storage_owner_maintenance_reserved_slots_ != 0,
+               "Stage1 arm lost its reserved maintenance queue slot");
+    --storage_owner_maintenance_reserved_slots_;
+    if (!storage_owner_maintenance_shutdown_.load(
+          std::memory_order_acquire)) {
+      storage_owner_stage2_tasks_.push_back(std::move(task));
+      backlog = storage_owner_stage2_tasks_.size() +
+        storage_owner_cleanup_tasks_.size();
+      enqueued = true;
+    }
+  }
+  if (!enqueued) {
+    // Shutdown is the only failure after sequence allocation. Finalize the
+    // unused ticket synchronously so it cannot pin the durable watermark.
+    complete_storage_owner_maintenance_sequence(sequence);
+    storage_owner_maintenance_cv_.notify_all();
+    return 0;
+  }
+
+  storage_owner_maintenance_enqueued_.fetch_add(
+    1, std::memory_order_relaxed);
+  storage_owner_maintenance_finalize_enqueued_.fetch_add(
+    1, std::memory_order_relaxed);
   atomic_utils::update_max_relaxed(
     storage_owner_maintenance_max_backlog_, static_cast<u64>(backlog));
   storage_owner_maintenance_cv_.notify_one();
-  return true;
+  return sequence;
 }
 
-bool MemoryNode::enqueue_insert_stitch(node_t id,
-                                       u32 generation,
-                                       RemotePtr target,
-                                       u64 maintenance_sequence,
-                                       const vec<RemotePtr>* stage1_candidates,
-                                       const vec<RemotePtr>* stage1_neighbors,
-                                       const Configuration& config) {
-  StorageOwnerMaintenanceTask task;
-  task.kind = StorageOwnerMaintenanceKind::stitch_insert;
-  task.id = id;
-  task.generation = generation;
-  task.maintenance_sequence = maintenance_sequence;
-  task.target = target;
-  if (stage1_candidates != nullptr) {
-    task.stage1_candidates = *stage1_candidates;
+u64 MemoryNode::activate_storage_owner_cleanup(
+    StorageOwnerMaintenanceTask&& task, const Configuration& config) {
+  if (!storage_owner_maintenance_enabled(config) || task.target.is_null() ||
+      task.kind != StorageOwnerMaintenanceKind::cleanup_deleted_node) {
+    return 0;
   }
-  if (stage1_neighbors != nullptr) {
-    task.stitch_base_neighbors = *stage1_neighbors;
-  }
-  const bool queued = enqueue_storage_owner_maintenance(std::move(task), config);
-  if (queued) {
-    storage_owner_maintenance_finalize_enqueued_.fetch_add(1, std::memory_order_relaxed);
-  }
-  return queued;
-}
 
-bool MemoryNode::enqueue_deleted_node_cleanup(RemotePtr deleted_ptr,
-                                              u64 maintenance_sequence,
-                                              const Configuration& config) {
-  StorageOwnerMaintenanceTask task;
-  task.kind = StorageOwnerMaintenanceKind::cleanup_deleted_node;
-  task.maintenance_sequence = maintenance_sequence;
-  task.target = deleted_ptr;
-  const bool queued = enqueue_storage_owner_maintenance(std::move(task), config);
-  if (queued) {
-    storage_owner_maintenance_cleanup_enqueued_.fetch_add(1, std::memory_order_relaxed);
+  {
+    std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+    storage_owner_maintenance_cv_.wait(lock, [&]() {
+      return storage_owner_maintenance_shutdown_.load(
+               std::memory_order_acquire) ||
+        maintenance_queue_permit_available(
+          storage_owner_stage2_tasks_.size() +
+            storage_owner_cleanup_tasks_.size(),
+          storage_owner_maintenance_reserved_slots_,
+          config.storage_owner_maintenance_queue_depth);
+    });
+    if (storage_owner_maintenance_shutdown_.load(
+          std::memory_order_acquire)) {
+      return 0;
+    }
+    ++storage_owner_maintenance_reserved_slots_;
   }
-  return queued;
+
+  const u64 sequence = begin_storage_owner_maintenance_sequence(1);
+  task.maintenance_sequence = sequence;
+  task.queued_at = std::chrono::steady_clock::now();
+  size_t backlog = 0;
+  bool enqueued = false;
+  {
+    std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
+    lib_assert(storage_owner_maintenance_reserved_slots_ != 0,
+               "cleanup activation lost its reserved maintenance queue slot");
+    --storage_owner_maintenance_reserved_slots_;
+    if (!storage_owner_maintenance_shutdown_.load(
+          std::memory_order_acquire)) {
+      // The task becomes runnable before the physical node is quiesced or
+      // tombstoned. Its worker must first reparent every protected child and
+      // may publish DELETED only after those reservations are ACKed.
+      cleanup_schedule_push(storage_owner_cleanup_tasks_, std::move(task));
+      backlog = storage_owner_stage2_tasks_.size() +
+        storage_owner_cleanup_tasks_.size();
+      enqueued = true;
+    }
+  }
+  if (!enqueued) {
+    complete_storage_owner_maintenance_sequence(sequence);
+    storage_owner_maintenance_cv_.notify_all();
+    return 0;
+  }
+
+  storage_owner_maintenance_enqueued_.fetch_add(
+    1, std::memory_order_relaxed);
+  storage_owner_maintenance_cleanup_enqueued_.fetch_add(
+    1, std::memory_order_relaxed);
+  atomic_utils::update_max_relaxed(
+    storage_owner_maintenance_max_backlog_, static_cast<u64>(backlog));
+  storage_owner_maintenance_cv_.notify_one();
+  return sequence;
 }
 
 u64 MemoryNode::begin_storage_owner_maintenance_sequence(u32 work_items) {
@@ -134,84 +190,14 @@ void MemoryNode::complete_storage_owner_maintenance_sequence(
 
 bool MemoryNode::storage_owner_cleanup_ready(u64 sequence) const {
   if (sequence <= 1) {
-    return true;
+    return cleanup_predecessors_durable(sequence, 0);
   }
   const auto* control = reinterpret_cast<const gpu_search::format::StorageControlBlock*>(
     index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
   auto& durable_storage = const_cast<u64&>(control->durable_maintenance_sequence);
   const u64 durable = std::atomic_ref<u64>(durable_storage).load(
     std::memory_order_acquire);
-  return durable >= sequence - 1;
-}
-
-u32 MemoryNode::storage_owner_maintenance_work_items(
-    service::storage_owner::MutationKind kind,
-    const Configuration& config) const {
-  // Even when stage2 is disabled, keep one completion unit until the
-  // maintenance intent has been published.  Returning zero lets reserve_batch
-  // finalize and recycle the modulo slot before schedule_storage_owner_maintenance
-  // writes the intent, so concurrent foreground workers can race while writing
-  // the same non-atomic intent fields.
-  if (!storage_owner_maintenance_enabled(config)) return 1;
-  switch (kind) {
-    case service::storage_owner::MutationKind::insert:
-    case service::storage_owner::MutationKind::erase:
-      return 1;
-    case service::storage_owner::MutationKind::upsert:
-      return 2;
-  }
-  return 0;
-}
-
-u64 MemoryNode::schedule_storage_owner_maintenance(
-    node_t id,
-    u32 generation,
-    service::storage_owner::MutationKind kind,
-    RemotePtr new_ptr,
-    RemotePtr old_ptr,
-    u64 reserved_sequence,
-    u32 reserved_work_items,
-    const Configuration& config,
-    const vec<RemotePtr>* stage1_candidates,
-    const vec<RemotePtr>* stage1_neighbors) {
-  const bool maintenance_enabled = storage_owner_maintenance_enabled(config);
-  const bool needs_stitch = maintenance_enabled &&
-    kind != service::storage_owner::MutationKind::erase && !new_ptr.is_null();
-  const bool needs_cleanup = maintenance_enabled &&
-    kind != service::storage_owner::MutationKind::insert && !old_ptr.is_null();
-  const u32 actual_work_items =
-    static_cast<u32>(needs_stitch) + static_cast<u32>(needs_cleanup);
-  lib_assert(reserved_sequence != 0 && actual_work_items <= reserved_work_items,
-             "storage-owner maintenance exceeded its pre-stage1 reservation");
-  lib_assert(storage_owner_maintenance_intents_ != nullptr &&
-               storage_owner_maintenance_intent_capacity_ != 0,
-             "storage-owner maintenance intent ring is not initialized");
-  auto& intent = storage_owner_maintenance_intents_[
-    static_cast<size_t>((reserved_sequence - 1) %
-                        storage_owner_maintenance_intent_capacity_)];
-  intent.id = id;
-  intent.generation = generation;
-  intent.kind = kind;
-  intent.new_ptr = new_ptr;
-  intent.old_ptr = old_ptr;
-  intent.published_at = std::chrono::steady_clock::now();
-  intent.sequence.store(reserved_sequence, std::memory_order_release);
-  if (needs_stitch &&
-      !enqueue_insert_stitch(
-        id, generation, new_ptr, reserved_sequence,
-        stage1_candidates, stage1_neighbors, config)) {
-    lib_failure("failed to enqueue storage-owner stitch maintenance");
-  }
-  if (needs_cleanup &&
-      !enqueue_deleted_node_cleanup(
-        old_ptr, reserved_sequence, config)) {
-    lib_failure("failed to enqueue storage-owner cleanup maintenance");
-  }
-  if (reserved_work_items > actual_work_items) {
-    complete_storage_owner_maintenance_sequence(
-      reserved_sequence, reserved_work_items - actual_work_items);
-  }
-  return reserved_sequence;
+  return cleanup_predecessors_durable(sequence, durable);
 }
 
 void MemoryNode::mark_storage_owner_foreground_activity() {
@@ -237,16 +223,6 @@ bool MemoryNode::storage_owner_maintenance_foreground_busy(const Configuration&)
       return true;
     }
     if (queue_near_limit(peer_reverse_tasks_.size(), peer_reverse_task_queue_limit_)) {
-      return true;
-    }
-  }
-
-  {
-    std::unique_lock<std::mutex> lock(peer_reverse_outgoing_mutex_, std::try_to_lock);
-    if (!lock.owns_lock()) {
-      return true;
-    }
-    if (queue_near_limit(peer_reverse_outgoing_.size(), peer_reverse_outgoing_queue_limit_)) {
       return true;
     }
   }

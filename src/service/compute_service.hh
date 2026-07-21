@@ -1,12 +1,10 @@
 #pragma once
 
 #include <atomic>
-#include <array>
 #include <chrono>
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -20,7 +18,6 @@
 #include "common/core_assignment.hh"
 #include "gpu_search/persistent_engine.hh"
 #include "memory_node/startup_protocol.hh"
-#include "service/base_owner_map.hh"
 #include "service/breakdown.hh"
 #include "service/storage_owner_protocol.hh"
 #include "service/index_metadata.hh"
@@ -77,9 +74,14 @@ public:
   const Configuration& config() const { return config_; }
 private:
   struct StorageInsertTask {
-    InsertItem item;
+    node_t id{};
+    // Canonical storage bytes are produced before centroid routing. Keeping
+    // the exact bytes here prevents uint8/int8 home selection from happening
+    // in a different vector space and avoids a second quantization in sender.
+    vec<byte_t> encoded_vector;
     service::storage_owner::MutationKind kind{service::storage_owner::MutationKind::insert};
     u32 completion_id{std::numeric_limits<u32>::max()};
+    u32 stage1_home{};
     std::chrono::steady_clock::time_point enqueued_at{};
     std::chrono::steady_clock::time_point sender_dequeued_at{};
   };
@@ -94,7 +96,6 @@ private:
     bool completion_claimed{false};
     bool response_valid{false};
     u32 response_slot_id{std::numeric_limits<u32>::max()};
-    u32 gpu_reserved_items{};
     u32 item_count{};
     u64 batch_id{};
     u64 request_prepare_ns{};
@@ -107,10 +108,6 @@ private:
     vec<byte_t> request_buffer;
     std::unique_ptr<LocalMemoryRegion> request_region;
     vec<u32> tasks;
-    vec<gpu_search::DeltaMutation> publication_mutations;
-    vec<u64> publication_invalidated_graph_nodes;
-    u32 publication_mutation_count{};
-    u32 publication_reserved_items{};
   };
 
   struct StorageOwnerResponseSlot {
@@ -167,17 +164,11 @@ private:
   bool queue_storage_owner_completion(StorageOwnerRpcSlot& slot);
   void commit_storage_owner_slot(u32 owner_storage, u32 slot_id);
   void release_storage_owner_slot(u32 owner_storage, u32 slot_id);
-  void publish_storage_owner_mutations(StorageOwnerRpcSlot& slot);
   void complete_storage_owner_task(u32 owner_storage, u32 task_id, bool success);
   void fail_storage_owner_tasks(u32 owner_storage, vec<u32>& tasks);
   size_t submit_storage_owner_mutations(
     const vec<InsertItem>& items,
     service::storage_owner::MutationKind kind);
-  bool publish_compute_side_id(node_t id, RemotePtr ptr, bool deleted,
-                               u32 owner_storage, u32 generation);
-  bool lookup_compute_side_id(node_t id, RemotePtr* ptr, bool* deleted = nullptr) const;
-  std::optional<u32> known_storage_owner_for_id(node_t id) const;
-  u32 claim_storage_owner_for_mutation(node_t id, u32 proposed_owner);
 
 private:
   Configuration config_;
@@ -203,20 +194,6 @@ private:
   std::unique_ptr<bounded::CompletionPool> storage_completion_pool_;
   std::unique_ptr<service::breakdown::Sample[]> storage_completion_samples_;
   vec<std::unique_ptr<StorageOwnerSenderState>> storage_insert_owners_;
-  struct ComputeSideIdEntry {
-    RemotePtr ptr;
-    bool deleted{};
-    u32 owner_storage{};
-    u32 generation{};
-  };
-  static constexpr size_t kComputeSideIdShardCount = 256;
-  struct ComputeSideIdShard {
-    mutable std::mutex mutex;
-    hashmap_t<node_t, ComputeSideIdEntry> entries;
-  };
-  std::array<ComputeSideIdShard, kComputeSideIdShardCount> compute_side_idmap_;
-  service::BaseOwnerMap base_owner_map_;
-
   std::atomic<u64> next_request_id_{1};
 
   mutable std::mutex breakdown_mutex_;

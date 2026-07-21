@@ -1,8 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 
@@ -80,6 +82,35 @@ inline size_t vector_dtype_bytes(VectorDType dtype, u32 dim) {
   return static_cast<size_t>(dim) * vector_dtype_component_size(dtype);
 }
 
+// Inspect IEEE-754 exponent bits at external-data boundaries. This is cheap
+// and keeps validation stable across supported compilers and math-library
+// implementations without depending on optimizer treatment of isfinite.
+inline bool floating_value_is_finite(f32 value) {
+  return (std::bit_cast<u32>(value) & 0x7f800000u) != 0x7f800000u;
+}
+
+inline bool floating_value_is_finite(f64 value) {
+  return (std::bit_cast<u64>(value) & 0x7ff0000000000000ull) !=
+    0x7ff0000000000000ull;
+}
+
+inline bool vector_component_is_finite(float value) {
+  return floating_value_is_finite(value);
+}
+
+// FLT_MAX remains the internal invalid/uninitialized sentinel in the GPU
+// beam.  Saturate legal squared-L2 results to the immediately preceding float
+// so even finite extreme inputs remain sortable and cannot be mistaken for an
+// RDMA or record-validation failure.
+inline constexpr f32 kMaxValidSquaredL2 = 0x1.fffffcp+127f;
+
+inline f32 saturate_squared_l2(f64 value) {
+  if (!(value < static_cast<f64>(kMaxValidSquaredL2))) {
+    return kMaxValidSquaredL2;
+  }
+  return value <= 0.0 ? 0.0f : static_cast<f32>(value);
+}
+
 inline float vector_component_as_float(const byte_t* data, VectorDType dtype, size_t index) {
   switch (dtype) {
     case VectorDType::float32:
@@ -93,32 +124,53 @@ inline float vector_component_as_float(const byte_t* data, VectorDType dtype, si
 }
 
 inline void encode_float_vector_to_storage(const float* src, u32 dim, VectorDType dtype, byte_t* dst) {
+  if (src == nullptr || dst == nullptr) {
+    throw std::invalid_argument("vector encoding requires non-null storage");
+  }
   switch (dtype) {
     case VectorDType::float32:
+      for (u32 i = 0; i < dim; ++i) {
+        if (!vector_component_is_finite(src[i])) {
+          throw std::invalid_argument("vector components must be finite");
+        }
+      }
       std::memcpy(dst, src, static_cast<size_t>(dim) * sizeof(float));
       return;
     case VectorDType::uint8: {
       auto* out = reinterpret_cast<u8*>(dst);
       for (u32 i = 0; i < dim; ++i) {
-        const long rounded = std::lround(src[i]);
-        out[i] = static_cast<u8>(std::clamp<long>(rounded, 0, 255));
+        if (!vector_component_is_finite(src[i])) {
+          throw std::invalid_argument("vector components must be finite");
+        }
+        // Clamp in float before lround. A finite float can still exceed the
+        // range of long, for which lround has a domain error.
+        const float bounded = std::clamp(src[i], 0.0f, 255.0f);
+        out[i] = static_cast<u8>(std::lround(bounded));
       }
       return;
     }
     case VectorDType::int8: {
       auto* out = reinterpret_cast<i8*>(dst);
       for (u32 i = 0; i < dim; ++i) {
-        const long rounded = std::lround(src[i]);
-        out[i] = static_cast<i8>(std::clamp<long>(rounded, -128, 127));
+        if (!vector_component_is_finite(src[i])) {
+          throw std::invalid_argument("vector components must be finite");
+        }
+        const float bounded = std::clamp(src[i], -128.0f, 127.0f);
+        out[i] = static_cast<i8>(std::lround(bounded));
       }
       return;
     }
   }
+  throw std::invalid_argument("unknown vector dtype");
 }
 
 inline vec<byte_t> encode_float_vector_to_storage(const span<const element_t> src, VectorDType dtype) {
-  vec<byte_t> out(vector_dtype_bytes(dtype, static_cast<u32>(src.size())));
-  encode_float_vector_to_storage(src.data(), static_cast<u32>(src.size()), dtype, out.data());
+  if (src.size() > std::numeric_limits<u32>::max()) {
+    throw std::length_error("vector dimension exceeds the storage layout limit");
+  }
+  const u32 dim = static_cast<u32>(src.size());
+  vec<byte_t> out(vector_dtype_bytes(dtype, dim));
+  encode_float_vector_to_storage(src.data(), dim, dtype, out.data());
   return out;
 }
 
@@ -134,12 +186,16 @@ inline vec<float> decode_storage_vector_to_float(const byte_t* src, VectorDType 
   return out;
 }
 
-// For byte vectors, every squared component difference is at most 255^2.
-// Integer sums through this dimension remain exactly representable in IEEE-754
-// float, so integer and decoded-float L2 paths cannot differ by reduction
-// rounding. Wider dimensions must keep the established reduction order.
-inline constexpr bool integral_byte_l2_sum_exact_in_float(u32 dim) {
-  return static_cast<u64>(dim) * 255ull * 255ull <= (1ull << 24) - 1;
+inline float typed_l2_distance_float_query_scalar(
+    const span<const element_t> query, const byte_t* stored,
+    VectorDType stored_dtype, u32 dim) {
+  f64 sum = 0.0;
+  for (u32 i = 0; i < dim; ++i) {
+    const f64 diff = static_cast<f64>(query[i]) -
+      static_cast<f64>(vector_component_as_float(stored, stored_dtype, i));
+    sum += diff * diff;
+  }
+  return saturate_squared_l2(sum);
 }
 
 // =========================================================================
@@ -148,7 +204,8 @@ inline constexpr bool integral_byte_l2_sum_exact_in_float(u32 dim) {
 
 #ifdef __AVX2__
 
-inline float typed_l2_distance_uint8_simd(const byte_t* lhs, const byte_t* rhs, u32 dim) {
+inline float typed_l2_distance_uint8_simd_chunk(
+    const byte_t* lhs, const byte_t* rhs, u32 dim) {
   const u8* a = reinterpret_cast<const u8*>(lhs);
   const u8* b = reinterpret_cast<const u8*>(rhs);
 
@@ -250,7 +307,8 @@ inline float typed_l2_distance_uint8_simd(const byte_t* lhs, const byte_t* rhs, 
   return result;
 }
 
-inline float typed_l2_distance_int8_simd(const byte_t* lhs, const byte_t* rhs, u32 dim) {
+inline float typed_l2_distance_int8_simd_chunk(
+    const byte_t* lhs, const byte_t* rhs, u32 dim) {
   const i8* a = reinterpret_cast<const i8*>(lhs);
   const i8* b = reinterpret_cast<const i8*>(rhs);
 
@@ -349,7 +407,37 @@ inline float typed_l2_distance_int8_simd(const byte_t* lhs, const byte_t* rhs, u
   return result;
 }
 
+// Keep every signed epi32 reduction and its float conversion exact.
+// 256*255^2=16,646,400 is below both INT32_MAX and float's exact-integer
+// range. Wider vectors retain SIMD throughput, accumulate exact chunk totals
+// in FP64, and round only once at the public float result.
+inline constexpr u32 kIntegralByteSimdExactChunk = 256;
 
+inline float typed_l2_distance_uint8_simd(
+    const byte_t* lhs, const byte_t* rhs, u32 dim) {
+  f64 total = 0.0;
+  for (u32 offset = 0; offset < dim;) {
+    const u32 chunk = std::min<u32>(
+      kIntegralByteSimdExactChunk, dim - offset);
+    total += typed_l2_distance_uint8_simd_chunk(
+      lhs + offset, rhs + offset, chunk);
+    offset += chunk;
+  }
+  return static_cast<float>(total);
+}
+
+inline float typed_l2_distance_int8_simd(
+    const byte_t* lhs, const byte_t* rhs, u32 dim) {
+  f64 total = 0.0;
+  for (u32 offset = 0; offset < dim;) {
+    const u32 chunk = std::min<u32>(
+      kIntegralByteSimdExactChunk, dim - offset);
+    total += typed_l2_distance_int8_simd_chunk(
+      lhs + offset, rhs + offset, chunk);
+    offset += chunk;
+  }
+  return static_cast<float>(total);
+}
 
 inline float horizontal_sum_ps(__m256 value) {
   __m128 lo = _mm256_castps256_ps128(value);
@@ -403,7 +491,10 @@ inline float typed_l2_distance_float_query_uint8_simd(const span<const element_t
     const float diff = q[i] - static_cast<float>(s[i]);
     sum += diff * diff;
   }
-  return sum;
+  return floating_value_is_finite(sum)
+    ? std::min(sum, kMaxValidSquaredL2)
+    : typed_l2_distance_float_query_scalar(
+        query, stored, VectorDType::uint8, dim);
 }
 inline float typed_l2_distance_float_query_int8_simd(const span<const element_t> query,
                                                      const byte_t* stored,
@@ -448,7 +539,10 @@ inline float typed_l2_distance_float_query_int8_simd(const span<const element_t>
     const float diff = q[i] - static_cast<float>(s[i]);
     sum += diff * diff;
   }
-  return sum;
+  return floating_value_is_finite(sum)
+    ? std::min(sum, kMaxValidSquaredL2)
+    : typed_l2_distance_float_query_scalar(
+        query, stored, VectorDType::int8, dim);
 }
 
 #endif  // __AVX2__
@@ -468,13 +562,14 @@ inline float typed_l2_distance(const byte_t* lhs,
     }
   }
 #endif
-  float sum = 0.0f;
+  f64 sum = 0.0;
   for (u32 i = 0; i < dim; ++i) {
-    const float diff = vector_component_as_float(lhs, lhs_dtype, i) -
-                       vector_component_as_float(rhs, rhs_dtype, i);
+    const f64 diff =
+      static_cast<f64>(vector_component_as_float(lhs, lhs_dtype, i)) -
+      static_cast<f64>(vector_component_as_float(rhs, rhs_dtype, i));
     sum += diff * diff;
   }
-  return sum;
+  return saturate_squared_l2(sum);
 }
 
 inline float typed_l2_distance_float_query(const span<const element_t> query,
@@ -489,10 +584,6 @@ inline float typed_l2_distance_float_query(const span<const element_t> query,
     return typed_l2_distance_float_query_int8_simd(query, stored, dim);
   }
 #endif
-  float sum = 0.0f;
-  for (u32 i = 0; i < dim; ++i) {
-    const float diff = query[i] - vector_component_as_float(stored, stored_dtype, i);
-    sum += diff * diff;
-  }
-  return sum;
+  return typed_l2_distance_float_query_scalar(
+    query, stored, stored_dtype, dim);
 }

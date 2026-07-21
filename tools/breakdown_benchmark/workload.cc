@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "common/vector_dtype.hh"
+#include "gpu_search/persistent_kernel.hh"
 #include "service/breakdown.hh"
 #include "tools/breakdown_benchmark/dataset.hh"
 #include "tools/breakdown_benchmark/maintenance_log.hh"
@@ -113,7 +114,9 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"traversal_beam_width", service.config().gpu_traversal_beam_width},
     {"final_rerank_width", service.config().gpu_final_rerank_width},
     {"max_expansions", service.config().gpu_max_expansions},
-    {"entry_seed_count", service.config().gpu_entry_seed_count},
+    {"entry_seed_policy", "nearest_centroid_shard_live_entries"},
+    {"entry_seed_shards", 1},
+    {"entry_seed_capacity", gpu_search::kCentroidRouteMaxLiveEntries},
     {"gpu_query_slots", service.config().gpu_query_slots},
     {"gpu_rdma_qps", service.config().gpu_rdma_qps},
     {"gpu_graph_prefetch_depth", service.config().gpu_graph_prefetch_depth},
@@ -839,27 +842,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   MixedPhaseStats measure_mixed_stats{};
   double measure_client_drain_seconds = 0.0;
   std::vector<MaintenanceLogCursor> maintenance_log_cursors;
-  const auto wait_for_gpu_publications = [&](const char* phase) {
-    const auto started = std::chrono::steady_clock::now();
-    const auto timeout = std::chrono::milliseconds(std::clamp<u64>(
-      static_cast<u64>(service.config().storage_owner_rpc_timeout_ms) * 3,
-      5000, 60000));
-    const auto deadline = started + timeout;
-    for (;;) {
-      const auto telemetry = service.gpu_search_telemetry();
-      if (telemetry.mutation_capacity_reserved == 0) {
-        return std::chrono::duration<double>(
-          std::chrono::steady_clock::now() - started).count();
-      }
-      if (std::chrono::steady_clock::now() >= deadline) {
-        throw std::runtime_error(
-          std::string{"GPU mutation publication did not drain during "} +
-          phase);
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-  };
-
   if (!args.recall_only && (args.workload == "insert" || args.workload == "both")) {
     std::cerr << "[breakdown] starting warmup insert" << std::endl;
     if (use_time_mode) {
@@ -891,7 +873,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   }
 
   const size_t performance_queries_after_warmup = performance_query_stream.consumed();
-  (void)wait_for_gpu_publications("warmup");
   if (!args.storage_maintenance_logs.empty()) {
     maintenance_log_cursors = snapshot_maintenance_logs(
       args.storage_maintenance_logs);
@@ -942,9 +923,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     maintenance_summary = summarize_maintenance_log_window(
       maintenance_log_cursors, measurement_end);
   }
-
-  const double gpu_publication_drain_seconds =
-    wait_for_gpu_publications("measurement");
 
   const gpu_search::TelemetrySnapshot final_gpu_telemetry =
     service.gpu_search_telemetry();
@@ -1059,7 +1037,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"effective_measure_seconds", throughput_duration},
     {"duration_seconds", throughput_duration},
     {"client_drain_seconds", measure_client_drain_seconds},
-    {"gpu_publication_drain_seconds", gpu_publication_drain_seconds},
     {"total_ops", throughput_query_ops + throughput_write_ops},
     {"total_ops_per_sec", total_throughput},
     {"query_ops", throughput_query_ops},
@@ -1202,13 +1179,13 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"max_backlog_observed", maintenance_summary.max_backlog_observed},
     {"backlog_slope_per_sec", maintenance_summary.backlog_slope_per_sec},
     {"backlog_slope_available", maintenance_summary.backlog_slope_available},
-    {"p99_stitch_delay_upper_ms",
-     maintenance_summary.p99_stitch_delay_upper_ms},
-    {"p99_stitch_delay_over_30s",
-     maintenance_summary.p99_stitch_delay_over_30s},
-    {"p99_stitch_delay_samples", maintenance_summary.p99_stitch_delay_samples},
-    {"p99_stitch_delay_available",
-     maintenance_summary.p99_stitch_delay_available},
+    {"p99_stage2_delay_upper_ms",
+     maintenance_summary.p99_stage2_delay_upper_ms},
+    {"p99_stage2_delay_over_30s",
+     maintenance_summary.p99_stage2_delay_over_30s},
+    {"p99_stage2_delay_samples", maintenance_summary.p99_stage2_delay_samples},
+    {"p99_stage2_delay_available",
+     maintenance_summary.p99_stage2_delay_available},
     {"failures", maintenance_summary.failures},
     {"failure_delta_available", maintenance_summary.failure_delta_available},
     {"admission_window", maintenance_summary.admission_window},
@@ -1217,6 +1194,51 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
      maintenance_summary.max_completion_outstanding_per_shard},
     {"completion_window_available",
      maintenance_summary.completion_window_available},
+    {"locality_delta_available",
+     maintenance_summary.locality_delta_available},
+    {"stage2_finalized_live_delta",
+     maintenance_summary.stage2_finalized_live},
+    {"stage2_continuations", maintenance_summary.stage2_continuations},
+    {"stage2_remote_frontier_items",
+     maintenance_summary.stage2_remote_frontier_items},
+    {"avg_stage2_remote_frontier",
+     maintenance_summary.stage2_continuations == 0 ? 0.0 :
+       static_cast<double>(maintenance_summary.stage2_remote_frontier_items) /
+       static_cast<double>(maintenance_summary.stage2_continuations)},
+    {"stage2_remote_expansions",
+     maintenance_summary.stage2_remote_expansions},
+    {"avg_stage2_remote_expansions",
+     maintenance_summary.stage2_continuations == 0 ? 0.0 :
+       static_cast<double>(maintenance_summary.stage2_remote_expansions) /
+       static_cast<double>(maintenance_summary.stage2_continuations)},
+    {"stage2_scored_candidates",
+     maintenance_summary.stage2_scored_candidates},
+    {"avg_stage2_scored_candidates",
+     maintenance_summary.stage2_continuations == 0 ? 0.0 :
+       static_cast<double>(maintenance_summary.stage2_scored_candidates) /
+       static_cast<double>(maintenance_summary.stage2_continuations)},
+    {"stage2_migrations", maintenance_summary.stage2_migrations},
+    {"home_match_rate",
+     maintenance_summary.stage2_finalized_live == 0 ? 0.0 :
+       1.0 - static_cast<double>(maintenance_summary.stage2_migrations) /
+       static_cast<double>(maintenance_summary.stage2_finalized_live)},
+    {"stage2_final_edges", maintenance_summary.stage2_final_edges},
+    {"stage2_cross_edges_stage1_home",
+     maintenance_summary.stage2_cross_edges_stage1_home},
+    {"stage2_cross_edges_final_home",
+     maintenance_summary.stage2_cross_edges_final_home},
+    {"cross_edge_reduction_ratio",
+     maintenance_summary.stage2_cross_edges_stage1_home == 0 ? 0.0 :
+       1.0 - static_cast<double>(
+         maintenance_summary.stage2_cross_edges_final_home) /
+       static_cast<double>(
+         maintenance_summary.stage2_cross_edges_stage1_home)},
+    {"search_budget_delta_available",
+     maintenance_summary.search_budget_delta_available},
+    {"stage1_search_budget_exhausted",
+     maintenance_summary.stage1_search_budget_exhausted},
+    {"stage2_search_budget_exhausted",
+     maintenance_summary.stage2_search_budget_exhausted},
     {"observation_period_seconds_assumed", 5.0},
   };
 

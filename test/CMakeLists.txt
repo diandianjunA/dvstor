@@ -23,6 +23,16 @@ target_link_libraries(common_atomic_utils_test PRIVATE dvstor_runtime)
 target_compile_options(common_atomic_utils_test PRIVATE -UNDEBUG)
 add_test(NAME common_atomic_utils_test COMMAND common_atomic_utils_test)
 
+add_executable(vector_dtype_test vector_dtype_test.cc)
+dvstor_target_common_includes(vector_dtype_test)
+target_compile_options(vector_dtype_test PRIVATE -UNDEBUG)
+add_test(NAME vector_dtype_test COMMAND vector_dtype_test)
+
+add_executable(storage_owner_wire_size_test storage_owner_wire_size_test.cc)
+dvstor_target_common_includes(storage_owner_wire_size_test)
+target_compile_options(storage_owner_wire_size_test PRIVATE -UNDEBUG)
+add_test(NAME storage_owner_wire_size_test COMMAND storage_owner_wire_size_test)
+
 add_executable(core_partition_test core_partition_test.cc)
 dvstor_target_common_includes(core_partition_test)
 target_compile_options(core_partition_test PRIVATE -UNDEBUG)
@@ -38,47 +48,117 @@ target_link_libraries(compute_update_hot_path_test PRIVATE dvstor_runtime)
 target_compile_options(compute_update_hot_path_test PRIVATE -UNDEBUG)
 add_test(NAME compute_update_hot_path_test COMMAND compute_update_hot_path_test)
 
-add_executable(base_owner_map_test
-    base_owner_map_test.cc
-    ${CMAKE_SOURCE_DIR}/src/service/base_owner_map.cc)
-dvstor_target_common_includes(base_owner_map_test)
-target_compile_options(base_owner_map_test PRIVATE -UNDEBUG)
-add_test(NAME base_owner_map_test COMMAND base_owner_map_test)
+add_executable(authority_directory_policy_test
+    authority_directory_policy_test.cc)
+dvstor_target_common_includes(authority_directory_policy_test)
+target_compile_options(authority_directory_policy_test PRIVATE -UNDEBUG)
+add_test(NAME authority_directory_policy_test
+         COMMAND authority_directory_policy_test)
 
-add_executable(adaptive_route_table_test
-    adaptive_route_table_test.cc
-    ${CMAKE_SOURCE_DIR}/src/vamana/adaptive_route_table.cc)
-dvstor_target_common_includes(adaptive_route_table_test)
-target_link_libraries(adaptive_route_table_test PRIVATE rdma_library)
-target_compile_options(adaptive_route_table_test PRIVATE -UNDEBUG)
-add_test(NAME adaptive_route_table_test COMMAND adaptive_route_table_test)
+add_executable(idmap_v2_test idmap_v2_test.cc)
+dvstor_target_common_includes(idmap_v2_test)
+target_compile_options(idmap_v2_test PRIVATE -UNDEBUG)
+add_test(NAME idmap_v2_test COMMAND idmap_v2_test)
 
-add_executable(gpu_dynamic_route_overlay_test
-    gpu_dynamic_route_overlay_test.cc
-    ${CMAKE_SOURCE_DIR}/src/gpu_search/dynamic_route_overlay.cc
-    ${CMAKE_SOURCE_DIR}/src/vamana/adaptive_route_table.cc)
-dvstor_target_common_includes(gpu_dynamic_route_overlay_test)
-target_link_libraries(gpu_dynamic_route_overlay_test PRIVATE rdma_library)
-target_compile_options(gpu_dynamic_route_overlay_test PRIVATE -UNDEBUG)
-add_test(NAME gpu_dynamic_route_overlay_test COMMAND gpu_dynamic_route_overlay_test)
+if (TARGET FaissCPU::FaissCPU)
+    add_executable(legacy_index_converter_test
+        legacy_index_converter_test.cc
+        ${CMAKE_SOURCE_DIR}/tools/vamana_offline/legacy_index_converter.cc
+        ${CMAKE_SOURCE_DIR}/tools/vamana_offline/pq_indexer.cc
+        ${CMAKE_SOURCE_DIR}/src/gpu_search/index_format.cc
+        ${CMAKE_SOURCE_DIR}/src/gpu_search/pq_index.cc)
+    dvstor_target_tool_includes(legacy_index_converter_test)
+    target_link_libraries(legacy_index_converter_test PRIVATE
+        rdma_library FaissCPU::FaissCPU)
+    target_compile_options(legacy_index_converter_test PRIVATE -UNDEBUG)
+    add_test(NAME legacy_index_converter_test
+             COMMAND legacy_index_converter_test)
+endif ()
 
-add_executable(configuration_update_mode_test configuration_update_mode_test.cc)
-dvstor_target_common_includes(configuration_update_mode_test)
-target_link_libraries(configuration_update_mode_test PRIVATE rdma_library)
-target_compile_options(configuration_update_mode_test PRIVATE -UNDEBUG)
-add_test(NAME configuration_update_mode_test COMMAND configuration_update_mode_test)
+add_executable(dynamic_allocation_receipt_policy_test
+    dynamic_allocation_receipt_policy_test.cc)
+dvstor_target_common_includes(dynamic_allocation_receipt_policy_test)
+target_compile_options(dynamic_allocation_receipt_policy_test PRIVATE -UNDEBUG)
+add_test(NAME dynamic_allocation_receipt_policy_test
+         COMMAND dynamic_allocation_receipt_policy_test)
+
+add_executable(centroid_router_test
+    centroid_router_test.cc
+    ${CMAKE_SOURCE_DIR}/src/vamana/centroid_router.cc)
+dvstor_target_common_includes(centroid_router_test)
+target_link_libraries(centroid_router_test PRIVATE rdma_library)
+target_compile_options(centroid_router_test PRIVATE -UNDEBUG)
+add_test(NAME centroid_router_test COMMAND centroid_router_test)
+
+add_executable(centroid_home_selector_test centroid_home_selector_test.cc)
+dvstor_target_common_includes(centroid_home_selector_test)
+target_compile_options(centroid_home_selector_test PRIVATE -UNDEBUG)
+add_test(NAME centroid_home_selector_test COMMAND centroid_home_selector_test)
+
+add_executable(centroid_route_poll_policy_test
+    centroid_route_poll_policy_test.cc)
+dvstor_target_common_includes(centroid_route_poll_policy_test)
+target_compile_options(centroid_route_poll_policy_test PRIVATE -UNDEBUG)
+add_test(NAME centroid_route_poll_policy_test
+         COMMAND centroid_route_poll_policy_test)
+
+add_executable(centroid_membership_lifecycle_test
+    centroid_membership_lifecycle_test.cc)
+dvstor_target_common_includes(centroid_membership_lifecycle_test)
+target_compile_options(centroid_membership_lifecycle_test PRIVATE -UNDEBUG)
+add_test(NAME centroid_membership_lifecycle_test
+         COMMAND centroid_membership_lifecycle_test)
+
+add_executable(centroid_seed_policy_test centroid_seed_policy_test.cc)
+dvstor_target_common_includes(centroid_seed_policy_test)
+target_compile_options(centroid_seed_policy_test PRIVATE -UNDEBUG)
+add_test(NAME centroid_seed_policy_test COMMAND centroid_seed_policy_test)
+
+add_executable(centroid_route_ranking_test centroid_route_ranking_test.cc)
+dvstor_target_common_includes(centroid_route_ranking_test)
+target_compile_options(centroid_route_ranking_test PRIVATE -UNDEBUG)
+add_test(NAME centroid_route_ranking_test COMMAND centroid_route_ranking_test)
+
+add_executable(storage_owner_reconcile_reverse_test
+    storage_owner_reconcile_reverse_test.cc)
+dvstor_target_common_includes(storage_owner_reconcile_reverse_test)
+target_link_libraries(storage_owner_reconcile_reverse_test PRIVATE rdma_library)
+target_compile_options(storage_owner_reconcile_reverse_test PRIVATE -UNDEBUG)
+add_test(NAME storage_owner_reconcile_reverse_test
+         COMMAND storage_owner_reconcile_reverse_test)
+
+add_executable(stage1_reachability_policy_test
+    stage1_reachability_policy_test.cc)
+dvstor_target_common_includes(stage1_reachability_policy_test)
+target_compile_options(stage1_reachability_policy_test PRIVATE -UNDEBUG)
+add_test(NAME stage1_reachability_policy_test
+         COMMAND stage1_reachability_policy_test)
+
+add_executable(configuration_update_protocol_test configuration_update_protocol_test.cc)
+dvstor_target_common_includes(configuration_update_protocol_test)
+target_link_libraries(configuration_update_protocol_test PRIVATE rdma_library)
+target_compile_options(configuration_update_protocol_test PRIVATE -UNDEBUG)
+add_test(NAME configuration_update_protocol_test COMMAND configuration_update_protocol_test)
 
 add_executable(partition_local_search_test partition_local_search_test.cc)
 dvstor_target_common_includes(partition_local_search_test)
 target_compile_options(partition_local_search_test PRIVATE -UNDEBUG)
 add_test(NAME partition_local_search_test COMMAND partition_local_search_test)
 
-add_executable(two_stage_insert_oracle_test two_stage_insert_oracle_test.cc)
-dvstor_target_common_includes(two_stage_insert_oracle_test)
-target_compile_options(two_stage_insert_oracle_test PRIVATE -UNDEBUG)
-add_test(NAME two_stage_insert_oracle_test COMMAND two_stage_insert_oracle_test)
-
 if (TARGET dvstor_gpu_kernels)
+    add_executable(gpu_centroid_route_ranking_test
+        gpu_centroid_route_ranking_test.cu)
+    dvstor_target_common_includes(gpu_centroid_route_ranking_test)
+    target_link_libraries(gpu_centroid_route_ranking_test PRIVATE CUDA::cudart)
+    target_compile_options(gpu_centroid_route_ranking_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+    add_test(NAME gpu_centroid_route_ranking_test
+        COMMAND gpu_centroid_route_ranking_test)
+    set_tests_properties(gpu_centroid_route_ranking_test PROPERTIES
+        TIMEOUT 15
+        SKIP_REGULAR_EXPRESSION "^SKIP:")
+
     add_executable(gpu_persistent_dispatch_test gpu_persistent_dispatch_test.cc)
     target_link_libraries(gpu_persistent_dispatch_test PRIVATE dvstor_runtime)
     add_test(NAME gpu_persistent_dispatch_test COMMAND gpu_persistent_dispatch_test)
@@ -102,20 +182,29 @@ target_link_libraries(gpu_pq_index_test PRIVATE dvstor_runtime)
 target_compile_options(gpu_pq_index_test PRIVATE -UNDEBUG)
 add_test(NAME gpu_pq_index_test COMMAND gpu_pq_index_test)
 
-add_executable(gpu_delta_index_test gpu_delta_index_test.cc)
-target_link_libraries(gpu_delta_index_test PRIVATE dvstor_runtime)
-target_compile_options(gpu_delta_index_test PRIVATE -UNDEBUG)
-add_test(NAME gpu_delta_index_test COMMAND gpu_delta_index_test)
-
 add_executable(storage_reclaim_test storage_reclaim_test.cc)
 target_link_libraries(storage_reclaim_test PRIVATE dvstor_runtime)
 target_compile_options(storage_reclaim_test PRIVATE -UNDEBUG)
 add_test(NAME storage_reclaim_test COMMAND storage_reclaim_test)
 
+find_package(Threads REQUIRED)
+add_executable(incarnation_lock_test incarnation_lock_test.cc)
+dvstor_target_common_includes(incarnation_lock_test)
+target_link_libraries(incarnation_lock_test PRIVATE Threads::Threads)
+target_compile_options(incarnation_lock_test PRIVATE -UNDEBUG)
+add_test(NAME incarnation_lock_test COMMAND incarnation_lock_test)
+
 add_executable(storage_owner_protocol_test storage_owner_protocol_test.cc)
 target_link_libraries(storage_owner_protocol_test PRIVATE dvstor_runtime)
 target_compile_options(storage_owner_protocol_test PRIVATE -UNDEBUG)
 add_test(NAME storage_owner_protocol_test COMMAND storage_owner_protocol_test)
+
+add_executable(explicit_release_replay_test
+    explicit_release_replay_test.cc)
+dvstor_target_common_includes(explicit_release_replay_test)
+target_compile_options(explicit_release_replay_test PRIVATE -UNDEBUG)
+add_test(NAME explicit_release_replay_test
+         COMMAND explicit_release_replay_test)
 
 add_executable(storage_owner_stage2_tracker_test
     storage_owner_stage2_tracker_test.cc)

@@ -54,8 +54,6 @@ inline void add_storage_owner_breakdown(
     counters.storage_owner_prune_pair_distance_ns;
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_queue_wait,
                           per_item_ns(counters.storage_owner_queue_wait_ns, item_count));
-  sample->add_subcategory(service::breakdown::Subcategory::rdma_storage_owner_medoid,
-                          per_item_ns(counters.storage_owner_medoid_ns, item_count));
   sample->add_subcategory(service::breakdown::Subcategory::cpu_storage_owner_search,
                           per_item_ns(saturating_sub(counters.storage_owner_search_ns, explained_search_ns),
                                       item_count));

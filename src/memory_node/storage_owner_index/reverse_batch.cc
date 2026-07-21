@@ -6,6 +6,7 @@ using memory_node_storage_owner_index_detail::
   select_fresh_reverse_candidates_locked;
 using memory_node_storage_owner_index_detail::
   select_alpha_robust_pruned_sorted;
+using memory_node_storage_owner_index_detail::IncarnationLockResult;
 
 namespace {
 
@@ -46,7 +47,7 @@ bool MemoryNode::apply_local_reverse_updates_batched(
     if (found != candidate_liveness.end()) {
       return found->second;
     }
-    const bool live = storage_owner_node_live(candidate);
+    const bool live = storage_owner_node_stable(candidate);
     candidate_liveness.emplace(candidate.raw_address, live);
     return live;
   };
@@ -83,21 +84,33 @@ bool MemoryNode::apply_local_reverse_updates_batched(
       continue;
     }
 
-    lock_node(target);
+    const IncarnationLockResult target_lock = try_lock_node(target);
+    if (target_lock == IncarnationLockResult::stale) {
+      // The old target incarnation no longer exists; adding an edge to it is
+      // already an idempotent no-op and must not touch the replacement slot.
+      continue;
+    }
+    if (target_lock == IncarnationLockResult::busy) return false;
+    const u64 target_header = load_local_node_header_acquire(target);
     const bool target_deleted =
-      (load_local_node_header_acquire(target) &
-       VamanaNode::HEADER_DELETED) != 0;
+      (target_header & VamanaNode::HEADER_DELETED) != 0;
+    const bool target_unavailable =
+      !VamanaNode::stable_graph_mutation_allowed(target_header);
     if (target_deleted) {
       unlock_node(target);
       continue;
     }
+    if (target_unavailable) {
+      unlock_node(target);
+      return false;
+    }
 
-    vec<RemotePtr> current_neighbors = read_neighbor_list(target);
+    vec<RemotePtr> current_neighbors = read_stable_neighbor_list(target);
     vec<RemotePtr> filtered_candidates;
     select_fresh_reverse_candidates_locked(
       current_neighbors, unique_candidates,
       [this](const RemotePtr& candidate) {
-        return storage_owner_node_live(candidate);
+        return storage_owner_node_stable(candidate);
       },
       filtered_candidates);
     if (filtered_candidates.empty()) {
@@ -183,6 +196,7 @@ bool MemoryNode::apply_local_reverse_updates_batched(
       }
       const NodeSnapshot& snapshot = snapshots[iterator->second];
       if (snapshot.deleted ||
+          (snapshot.header & VamanaNode::HEADER_PROVISIONAL) != 0 ||
           snapshot.vector_data.size() < VamanaNode::vector_bytes()) {
         return;
       }
@@ -235,15 +249,24 @@ bool MemoryNode::apply_local_reverse_updates_batched(
   }
 
   for (PendingReverseUpdate& update : pending) {
-    lock_node(update.target);
+    const IncarnationLockResult target_lock = try_lock_node(update.target);
+    if (target_lock == IncarnationLockResult::stale) continue;
+    if (target_lock == IncarnationLockResult::busy) return false;
+    const u64 target_header = load_local_node_header_acquire(update.target);
     const bool target_deleted =
-      (load_local_node_header_acquire(update.target) &
-       VamanaNode::HEADER_DELETED) != 0;
+      (target_header & VamanaNode::HEADER_DELETED) != 0;
+    const bool target_unavailable =
+      !VamanaNode::stable_graph_mutation_allowed(target_header);
     if (target_deleted) {
       unlock_node(update.target);
       continue;
     }
-    const vec<RemotePtr> observed_neighbors = read_neighbor_list(update.target);
+    if (target_unavailable) {
+      unlock_node(update.target);
+      return false;
+    }
+    const vec<RemotePtr> observed_neighbors =
+      read_stable_neighbor_list(update.target);
     if (!same_neighbors(observed_neighbors, update.current_neighbors)) {
       unlock_node(update.target);
       conflicted[update.target.raw_address] = std::move(update.candidates);
@@ -254,7 +277,7 @@ bool MemoryNode::apply_local_reverse_updates_batched(
     select_fresh_reverse_candidates_locked(
       observed_neighbors, update.candidates,
       [this](const RemotePtr& candidate) {
-        return storage_owner_node_live(candidate);
+        return storage_owner_node_stable(candidate);
       },
       fresh_candidates);
     if (fresh_candidates.empty()) {
