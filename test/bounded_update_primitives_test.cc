@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <future>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -19,6 +20,47 @@
 #include "memory_node/storage_owner_maintenance/cleanup_policy.hh"
 
 namespace {
+
+struct PausedQueueValue {
+  unsigned value{};
+  std::atomic<bool>* assignment_entered{};
+  std::atomic<bool>* assignment_release{};
+  bool pause_assignment{};
+
+  PausedQueueValue() = default;
+  PausedQueueValue(
+      unsigned value_in,
+      std::atomic<bool>* entered,
+      std::atomic<bool>* release,
+      bool pause)
+      : value(value_in),
+        assignment_entered(entered),
+        assignment_release(release),
+        pause_assignment(pause) {}
+
+  PausedQueueValue(const PausedQueueValue&) = default;
+  PausedQueueValue(PausedQueueValue&&) = default;
+  PausedQueueValue& operator=(const PausedQueueValue&) = default;
+
+  PausedQueueValue& operator=(PausedQueueValue&& other) noexcept {
+    value = other.value;
+    assignment_entered = other.assignment_entered;
+    assignment_release = other.assignment_release;
+    const bool pause = other.pause_assignment;
+    // A cell blocks only while the producer is publishing into it. Moving the
+    // already-published cell into a consumer must not block a second time.
+    pause_assignment = false;
+    other.pause_assignment = false;
+    if (pause) {
+      assignment_entered->store(true, std::memory_order_release);
+      assignment_entered->notify_all();
+      while (!assignment_release->load(std::memory_order_acquire)) {
+        assignment_release->wait(false, std::memory_order_relaxed);
+      }
+    }
+    return *this;
+  }
+};
 
 void test_queue_wrap_and_capacity() {
   bounded::Queue<unsigned> queue(3);
@@ -65,6 +107,33 @@ void test_queue_multiple_producers() {
   for (unsigned item = 0; item < received.size(); ++item) {
     assert(received[item] == item);
   }
+}
+
+void test_queue_later_publication_can_be_blocked_by_reserved_head() {
+  bounded::Queue<PausedQueueValue> queue(4);
+  std::atomic<bool> first_assignment_entered{false};
+  std::atomic<bool> release_first_assignment{false};
+
+  std::thread first([&]() {
+    assert(queue.try_push(PausedQueueValue{
+      1, &first_assignment_entered, &release_first_assignment, true}));
+  });
+  while (!first_assignment_entered.load(std::memory_order_acquire)) {
+    first_assignment_entered.wait(false, std::memory_order_relaxed);
+  }
+
+  // Producer one has reserved FIFO position zero but has not published its
+  // sequence. Producer two can reserve and fully publish position one.
+  assert(queue.try_push(PausedQueueValue{2, nullptr, nullptr, false}));
+  PausedQueueValue value;
+  assert(!queue.try_pop(value));
+
+  release_first_assignment.store(true, std::memory_order_release);
+  release_first_assignment.notify_all();
+  first.join();
+  assert(queue.try_pop(value) && value.value == 1);
+  assert(queue.try_pop(value) && value.value == 2);
+  assert(!queue.try_pop(value));
 }
 
 void test_queue_stopped_producer_does_not_overwrite_full_queue() {
@@ -584,6 +653,62 @@ void test_stage2_pressure_retains_a_dedicated_progress_floor() {
   assert(stage2_context_admission_limit(0, 0, false) == 1);
 }
 
+void test_stage2_sequence_window_tracks_service_capacity_not_lane_rebalance() {
+  using memory_node_storage_owner_maintenance_detail::
+    saturating_admission_multiply;
+  using memory_node_storage_owner_maintenance_detail::
+    stage2_sequence_admission_limit;
+
+  // The current colocated deployment keeps exactly four wire batches of
+  // bounded debt whether two or four Stage2 workers service it.  Reassigning
+  // idle CPUs therefore cannot manufacture short-term ACK throughput by
+  // silently doubling the backlog window.
+  assert(stage2_sequence_admission_limit(2, 16, 32) == 128);
+  assert(stage2_sequence_admission_limit(4, 16, 32) == 128);
+  assert(stage2_sequence_admission_limit(8, 16, 32) == 128);
+
+  // A larger wire batch used to expose a hidden dependency on the actual
+  // post-rebalance worker count (2 workers -> 128, 4 workers -> 256).  Runtime
+  // passes the CPU plan's two-worker admission baseline, so the window stays
+  // at the legacy two-worker bound for every batch size.
+  assert(stage2_sequence_admission_limit(2, 16, 64) == 128);
+
+  // A genuinely larger executor/context population may expose one task per
+  // context, while tiny settings retain a nonzero, batch-safe bound.
+  assert(stage2_sequence_admission_limit(16, 16, 32) == 256);
+  assert(stage2_sequence_admission_limit(1, 1, 32) == 32);
+  assert(stage2_sequence_admission_limit(4, 16, 1) == 64);
+  assert(stage2_sequence_admission_limit(0, 0, 0) == 4);
+
+  // Every finite policy point is no larger than the previous four-task-per-
+  // context bound (except that one complete wire batch is always admitted),
+  // and hostile configuration arithmetic saturates instead of wrapping to a
+  // tiny, unsafe window.
+  for (std::size_t workers = 0; workers <= 32; ++workers) {
+    for (std::size_t depth = 0; depth <= 32; ++depth) {
+      for (std::size_t batch = 0; batch <= 128; batch += 8) {
+        const std::size_t normalized_workers = std::max<std::size_t>(1, workers);
+        const std::size_t normalized_depth = std::max<std::size_t>(1, depth);
+        const std::size_t normalized_batch = std::max<std::size_t>(1, batch);
+        const std::size_t legacy_limit = std::max(
+          normalized_batch,
+          saturating_admission_multiply(
+            saturating_admission_multiply(
+              normalized_workers, normalized_depth),
+            4));
+        const std::size_t limit = stage2_sequence_admission_limit(
+          workers, depth, batch);
+        assert(limit >= normalized_batch);
+        assert(limit <= legacy_limit);
+      }
+    }
+  }
+  const std::size_t max_size = std::numeric_limits<std::size_t>::max();
+  assert(stage2_sequence_admission_limit(max_size, max_size, max_size) ==
+         max_size);
+  assert(stage2_sequence_admission_limit(max_size, 2, 1) == max_size);
+}
+
 void test_stage1_arm_queue_permit_cannot_be_stolen() {
   using memory_node_storage_owner_maintenance_detail::
     maintenance_queue_permit_available;
@@ -802,6 +927,7 @@ void test_protected_reparent_capacity_never_evicts_existing_work() {
 int main() {
   test_queue_wrap_and_capacity();
   test_queue_multiple_producers();
+  test_queue_later_publication_can_be_blocked_by_reserved_head();
   test_queue_stopped_producer_does_not_overwrite_full_queue();
   test_queue_publication_precedes_slot_reuse();
   test_completion_pool_reuse_and_abandon();
@@ -816,6 +942,7 @@ int main() {
   test_stale_stage2_repair_keeps_wire_payload_bound();
   test_stage2_admission_yields_only_for_live_foreground_pressure();
   test_stage2_pressure_retains_a_dedicated_progress_floor();
+  test_stage2_sequence_window_tracks_service_capacity_not_lane_rebalance();
   test_stage1_arm_queue_permit_cannot_be_stolen();
   test_stage1_arm_batch_queue_permit_is_atomic_and_bounded();
   test_reverse_candidate_is_revalidated_at_locked_write_boundary();

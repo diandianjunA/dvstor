@@ -47,6 +47,10 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
                " global=" + std::to_string(peer_read_credits.global) +
                " shared_cq_read_budget=" +
                std::to_string(peer_read_credits.shared_cq_read_budget) +
+               " ordered_snapshot_pairs_per_chain=" +
+               std::to_string(
+                 memory_node_detail::peer_rdma_read_pair_group_limit(
+                   peer_read_credits)) +
                " (requested_per_data_qp=" +
                std::to_string(storage_owner_peer_rdma_tokens_) + ")");
   print_status("storage-owner online insert tuning: construction_beam=" +

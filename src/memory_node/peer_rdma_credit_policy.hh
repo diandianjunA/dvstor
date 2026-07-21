@@ -25,6 +25,45 @@ constexpr std::uint32_t peer_rdma_read_batch_group_limit(
   return std::min({plan.per_qp, plan.per_peer, plan.global});
 }
 
+// A stable vector snapshot is one logical operation but two ordered RDMA
+// READs: the full record prefix followed by an independent after-header.  A
+// pair may never straddle QPs or linked chains, otherwise the after-header can
+// overtake the body read and cease to be a seqlock validation.  Return the
+// number of complete pairs that fit in every credit domain; zero tells the
+// caller to retain the existing two-wave fallback on extremely constrained
+// transports that cannot reserve two READ credits atomically.
+constexpr std::uint32_t peer_rdma_read_pair_group_limit(
+    const PeerRdmaReadCreditPlan& plan) {
+  return peer_rdma_read_batch_group_limit(plan) / 2;
+}
+
+struct PeerRdmaReadPairChainItem {
+  std::uint32_t pair_index{};
+  bool after_header{};
+};
+
+// Production and tests share this mapping.  One chain is laid out as
+// [full_0 .. full_N-1, after_0(FENCE) .. after_N-1], not as interleaved pairs:
+// the single fence delays the complete validation half until every body read
+// has finished, while both halves remain internally batchable.  The tail CQE
+// is consumed only after all 2*N WRs.
+constexpr PeerRdmaReadPairChainItem peer_rdma_read_pair_chain_item(
+    const std::uint32_t work_request_index,
+    const std::uint32_t pair_count) {
+  return PeerRdmaReadPairChainItem{
+    .pair_index = work_request_index < pair_count
+      ? work_request_index : work_request_index - pair_count,
+    .after_header = work_request_index >= pair_count,
+  };
+}
+
+constexpr std::uint32_t peer_rdma_read_pair_work_request_count(
+    const std::uint32_t pair_count) {
+  return pair_count <= std::numeric_limits<std::uint32_t>::max() / 2
+    ? pair_count * 2
+    : 0;
+}
+
 constexpr std::uint32_t peer_rdma_read_batch_completion_count(
     const std::uint32_t read_count,
     const PeerRdmaReadCreditPlan& plan) {

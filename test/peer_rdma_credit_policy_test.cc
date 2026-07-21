@@ -12,6 +12,9 @@
 using memory_node_detail::derive_peer_rdma_read_credit_plan;
 using memory_node_detail::peer_rdma_read_batch_completion_count;
 using memory_node_detail::peer_rdma_read_batch_group_limit;
+using memory_node_detail::peer_rdma_read_pair_chain_item;
+using memory_node_detail::peer_rdma_read_pair_group_limit;
+using memory_node_detail::peer_rdma_read_pair_work_request_count;
 using memory_node_detail::select_peer_data_qp;
 using memory_node_detail::try_reserve_peer_rdma_read_group;
 
@@ -115,6 +118,47 @@ void test_linked_read_batches_stay_inside_every_credit_domain() {
   assert(4 * peer_rdma_read_batch_completion_count(16, qp_limited) == 8);
 }
 
+void test_ordered_snapshot_pairs_never_split_a_credit_chain() {
+  const memory_node_detail::PeerRdmaReadCreditPlan plan{
+    .data_qps_per_peer = 3,
+    .per_qp = 8,
+    .per_peer = 16,
+    .global = 32,
+    .shared_cq_read_budget = 32,
+  };
+  assert(peer_rdma_read_pair_group_limit(plan) == 4);
+  assert(peer_rdma_read_pair_work_request_count(4) == 8);
+  for (std::uint32_t pair = 0; pair < 4; ++pair) {
+    const auto full = peer_rdma_read_pair_chain_item(pair, 4);
+    const auto after = peer_rdma_read_pair_chain_item(4 + pair, 4);
+    assert(full.pair_index == pair);
+    assert(!full.after_header);
+    assert(after.pair_index == pair);
+    assert(after.after_header);
+  }
+  std::atomic<std::uint32_t> peer{0};
+  std::atomic<std::uint32_t> qp{0};
+  std::atomic<std::uint32_t> global{0};
+  const std::uint32_t pair_wr_count =
+    peer_rdma_read_pair_work_request_count(4);
+  assert(try_reserve_peer_rdma_read_group(
+    peer, qp, global, plan, pair_wr_count));
+  assert(peer.load() == 8);
+  assert(qp.load() == 8);
+  assert(global.load() == 8);
+
+  // A one-credit transport cannot atomically preserve the pair. Production
+  // must use its two-wave fallback instead of weakening validation.
+  const memory_node_detail::PeerRdmaReadCreditPlan single{
+    .data_qps_per_peer = 1,
+    .per_qp = 1,
+    .per_peer = 1,
+    .global = 1,
+    .shared_cq_read_budget = 1,
+  };
+  assert(peer_rdma_read_pair_group_limit(single) == 0);
+}
+
 void test_group_reservation_rolls_back_every_partial_domain() {
   const memory_node_detail::PeerRdmaReadCreditPlan plan{
     .data_qps_per_peer = 1,
@@ -186,6 +230,7 @@ int main() {
   test_shared_cq_caps_all_peer_read_credits();
   test_large_inputs_do_not_overflow_aggregate_limits();
   test_linked_read_batches_stay_inside_every_credit_domain();
+  test_ordered_snapshot_pairs_never_split_a_credit_chain();
   test_group_reservation_rolls_back_every_partial_domain();
   test_concurrent_group_reservation_never_overcommits();
   return 0;

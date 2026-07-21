@@ -1,4 +1,6 @@
 #include <cassert>
+#include <deque>
+#include <vector>
 
 #include "service/compute_service/storage_owner/batch_policy.hh"
 #include "service/compute_service/storage_owner/response_validation.hh"
@@ -6,8 +8,22 @@
 namespace {
 
 using compute_service_detail::StorageOwnerResponseValidation;
+using compute_service_detail::dequeue_storage_owner_visible_prefix;
 using compute_service_detail::decide_storage_owner_batch;
 using compute_service_detail::validate_storage_owner_response;
+
+struct ScriptedPrefixQueue {
+  std::deque<u32> entries;
+  u32 visible{};
+
+  bool try_pop(u32& value) {
+    if (visible == 0 || entries.empty()) return false;
+    value = entries.front();
+    entries.pop_front();
+    --visible;
+    return true;
+  }
+};
 
 void test_matched_malformed_response_fails() {
   constexpr u32 kOwner = 2;
@@ -110,6 +126,27 @@ void test_batch_policy_tail_is_self_clocked_and_epoch_exits() {
   assert(drained.take == 0);
 }
 
+void test_sender_consumes_only_the_queue_visible_prefix() {
+  ScriptedPrefixQueue queue{{10, 11, 12}, 0};
+  std::vector<u32> output;
+
+  // The external published count may describe a later cell while the FIFO
+  // head is still being published. No RPC slot or counter credit is consumed.
+  assert(dequeue_storage_owner_visible_prefix(queue, 3, output) == 0);
+  assert(output.empty());
+
+  // If a hole follows a visible prefix, charge and send only that prefix.
+  queue.visible = 2;
+  assert(dequeue_storage_owner_visible_prefix(queue, 3, output) == 2);
+  assert((output == std::vector<u32>{10, 11}));
+  assert(queue.entries.size() == 1 && queue.entries.front() == 12);
+
+  // Once the reserved head is published, a later progress pass drains it.
+  queue.visible = 1;
+  assert(dequeue_storage_owner_visible_prefix(queue, 1, output) == 1);
+  assert((output == std::vector<u32>{10, 11, 12}));
+}
+
 }  // namespace
 
 int main() {
@@ -117,5 +154,6 @@ int main() {
   test_batch_policy_is_immediate_below_saturation();
   test_batch_policy_latches_and_forms_full_batches();
   test_batch_policy_tail_is_self_clocked_and_epoch_exits();
+  test_sender_consumes_only_the_queue_visible_prefix();
   return 0;
 }

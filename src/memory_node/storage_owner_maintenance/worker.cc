@@ -39,6 +39,53 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     vec<vec<RemotePtr>> continued_candidates_by_task;
     vec<vec<ReverseUpdateOp>> remote_ops_by_peer;
     vec<u64> reverse_request_ids;
+    // Timestamped only after synchronous reverse reconciliation and placement
+    // have completed.  The current protocol has no outstanding reverse ACK
+    // mask at this point; this measures only the state-machine/context handoff
+    // into finalization, not remote reverse-RPC latency (which belongs to the
+    // reverse_prepare phase).
+    u64 completion_handoff_started_ns{};
+  };
+
+  // One timer update represents a whole context phase attempt.  In
+  // particular, no timing atomic appears in a candidate, edge, or RDMA-read
+  // loop.  The destructor records failed/deferred attempts as well, which is
+  // essential when diagnosing a phase that never reaches finalization.
+  struct Stage2PhaseAttemptTimer {
+    StorageOwnerStage2TimingCounters* counters{};
+    u64 started_ns{};
+    u64 task_attempts{};
+
+    Stage2PhaseAttemptTimer(StorageOwnerStage2TimingCounters& value,
+                            size_t tasks)
+        : counters(&value),
+          started_ns(steady_now_ns()),
+          task_attempts(static_cast<u64>(tasks)) {}
+
+    Stage2PhaseAttemptTimer(const Stage2PhaseAttemptTimer&) = delete;
+    Stage2PhaseAttemptTimer& operator=(
+      const Stage2PhaseAttemptTimer&) = delete;
+
+    ~Stage2PhaseAttemptTimer() { finish(); }
+
+    void transition(StorageOwnerStage2TimingCounters& next,
+                    size_t tasks) {
+      finish();
+      counters = &next;
+      started_ns = steady_now_ns();
+      task_attempts = static_cast<u64>(tasks);
+    }
+
+    void finish() {
+      if (counters == nullptr) return;
+      const u64 elapsed_ns = steady_now_ns() - started_ns;
+      counters->attempts.fetch_add(1, std::memory_order_relaxed);
+      counters->task_attempts.fetch_add(
+        task_attempts, std::memory_order_relaxed);
+      counters->elapsed_ns.fetch_add(elapsed_ns,
+                                     std::memory_order_relaxed);
+      counters = nullptr;
+    }
   };
 
   // A worker owns its contexts and both trackers, so the response path needs
@@ -132,6 +179,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     }
     std::fill(context.reverse_request_ids.begin(),
               context.reverse_request_ids.end(), 0);
+    context.completion_handoff_started_ns = 0;
   };
 
   const auto materialize_stable_snapshot_wave = [&](size_t task_count) {
@@ -992,6 +1040,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       return true;
     }
 
+    Stage2PhaseAttemptTimer search_timer(
+      storage_owner_stage2_phase_timing_[static_cast<size_t>(
+        StorageOwnerStage2TimingPhase::continuation_search)],
+      context.tasks.size());
+
     context.targets.clear();
     context.targets.resize(context.tasks.size());
 
@@ -1072,6 +1125,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   };
 
   const auto prepare_stage2_reverse = [&](Stage2Context& context) {
+    Stage2PhaseAttemptTimer phase_timer(
+      storage_owner_stage2_phase_timing_[static_cast<size_t>(
+        StorageOwnerStage2TimingPhase::freeze_prune)],
+      context.tasks.size());
     // First finish every node record. No reverse edge or directory entry is
     // allowed to expose a destination whose vector/graph/PQ record is partial.
     vec<u32> gate_authorities;
@@ -1460,6 +1517,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     context.tasks.resize(ready);
     context.targets.resize(ready);
 
+    phase_timer.transition(
+      storage_owner_stage2_phase_timing_[static_cast<size_t>(
+        StorageOwnerStage2TimingPhase::reverse_prepare)],
+      context.tasks.size());
+
     // There is exactly one outgoing-graph mutation boundary: the source lock
     // above freezes concurrent additions, captures them, prunes the complete
     // continuation union, and publishes that result. A second freeze/prune of
@@ -1794,6 +1856,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       task.reverse_reconciled = true;
     }
 
+    phase_timer.transition(
+      storage_owner_stage2_phase_timing_[static_cast<size_t>(
+        StorageOwnerStage2TimingPhase::placement_authority)],
+      context.tasks.size());
+
     // The no-op gate above confirmed the public generation after this task
     // was armed and before graph publication. This token-fenced placement CAS
     // changes only its physical home, after every final reverse-edge
@@ -1926,6 +1993,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       task.allocation_settled = true;
     }
 
+    context.completion_handoff_started_ns = steady_now_ns();
     constexpr u64 expected_mask = 0;
     const Stage2EventResult transition =
       states.begin_reverse(context.handle, expected_mask);
@@ -2189,6 +2257,23 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                "stage2 finalized before all reverse ACKs");
 
     if (context.kind == StorageOwnerMaintenanceKind::finalize_insert) {
+      lib_assert(context.completion_handoff_started_ns != 0,
+                 "Stage2 finalization lost its completion-handoff timestamp");
+      auto& completion_handoff_timing =
+        storage_owner_stage2_phase_timing_[static_cast<size_t>(
+          StorageOwnerStage2TimingPhase::completion_handoff)];
+      completion_handoff_timing.attempts.fetch_add(
+        1, std::memory_order_relaxed);
+      completion_handoff_timing.task_attempts.fetch_add(
+        context.tasks.size(), std::memory_order_relaxed);
+      completion_handoff_timing.elapsed_ns.fetch_add(
+        steady_now_ns() - context.completion_handoff_started_ns,
+        std::memory_order_relaxed);
+      context.completion_handoff_started_ns = 0;
+      Stage2PhaseAttemptTimer finalize_timer(
+        storage_owner_stage2_phase_timing_[static_cast<size_t>(
+          StorageOwnerStage2TimingPhase::finalize)],
+        context.tasks.size());
       for (StorageOwnerMaintenanceTask& task : context.tasks) {
         lib_assert(task.outgoing_committed && task.reverse_reconciled &&
                      task.placement_committed && task.centroid_committed &&
@@ -2456,8 +2541,21 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     return &context;
   };
 
+  u64 unpublished_idle_wait_ns = 0;
+  u64 unpublished_idle_waits = 0;
+  const auto flush_idle_timing = [&]() {
+    if (unpublished_idle_waits == 0) return;
+    storage_owner_maintenance_worker_idle_ns_.fetch_add(
+      unpublished_idle_wait_ns, std::memory_order_relaxed);
+    storage_owner_maintenance_worker_idle_waits_.fetch_add(
+      unpublished_idle_waits, std::memory_order_relaxed);
+    unpublished_idle_wait_ns = 0;
+    unpublished_idle_waits = 0;
+  };
+
   for (;;) {
     if (storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
+      flush_idle_timing();
       if (storage_owner_reverse_outbox_ != nullptr) {
         (void)storage_owner_reverse_outbox_->erase_queued_worker(worker_id);
         for (;;) {
@@ -2500,8 +2598,15 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     maybe_log_storage_owner_maintenance_observation();
     if (!progressed) {
       std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+      const u64 idle_started_ns = steady_now_ns();
       storage_owner_maintenance_cv_.wait_for(
         lock, std::chrono::milliseconds(1));
+      unpublished_idle_wait_ns += steady_now_ns() - idle_started_ns;
+      ++unpublished_idle_waits;
+      // Publishing in small batches avoids an atomic operation on every idle
+      // loop while keeping the five-second observation error below one worker
+      // times 64 ms.
+      if (unpublished_idle_waits >= 64) flush_idle_timing();
     }
   }
 }

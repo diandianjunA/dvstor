@@ -361,21 +361,31 @@ void MemoryNode::continue_stage2_search_candidates_batched(
       size_t group_index{};
       RemotePtr pointer;
       byte_t* buffer{};
+      byte_t* after_header{};
       u64 before{};
       u32 slot_incarnation{};
     };
     thread_local vec<PendingVectorRead> pending;
     thread_local vec<PeerReadRequest> read_requests;
-    const size_t snapshot_size = snapshot_buffer_bytes();
+    thread_local vec<PeerReadPairRequest> read_pairs;
     const size_t snapshot_stride = aligned_snapshot_bytes();
+    const size_t validation_offset =
+      memory_node_detail::storage_owner_snapshot_validation_offset();
     const size_t max_batch =
       storage_owner_snapshot_batch_size(config, thread);
+    const bool ordered_pair_supported =
+      memory_node_detail::peer_rdma_read_pair_group_limit(
+        peer_rdma_read_credit_plan()) != 0;
+    lib_assert(validation_offset + VamanaNode::HEADER_SIZE <=
+                 snapshot_stride,
+               "storage-owner snapshot slot lost after-header scratch");
     pending.reserve(max_batch);
     for (size_t begin = 0; begin < score_unique.size();
          begin += max_batch) {
       const size_t end = std::min(score_unique.size(), begin + max_batch);
       pending.clear();
       read_requests.clear();
+      read_pairs.clear();
       u32 remote_slot = 0;
       for (size_t group = begin; group < end; ++group) {
         const RemotePtr pointer = score_unique[group];
@@ -397,18 +407,39 @@ void MemoryNode::continue_stage2_search_candidates_batched(
         }
         const size_t scratch_offset =
           static_cast<size_t>(remote_slot++) * snapshot_stride;
-        lib_assert(scratch_offset + snapshot_size <= thread->scratch_stride,
+        lib_assert(scratch_offset + validation_offset +
+                     VamanaNode::HEADER_SIZE <= thread->scratch_stride,
                    "storage-owner scratch cannot hold Stage2 score wave");
         byte_t* buffer = thread->coroutine_scratch(scratch_offset);
-        read_requests.push_back(PeerReadRequest{
+        const PeerReadRequest full_snapshot{
           .shard_id = pointer.memory_node(),
           .remote_offset = pointer.byte_offset(),
           .destination = buffer,
           .bytes = VamanaNode::size_until_vector_end(),
-        });
-        pending.push_back({group, pointer, buffer});
+        };
+        byte_t* after_header = buffer + validation_offset;
+        if (ordered_pair_supported) {
+          read_pairs.push_back(PeerReadPairRequest{
+            .full_snapshot = full_snapshot,
+            .after_header = PeerReadRequest{
+              .shard_id = pointer.memory_node(),
+              .remote_offset = pointer.byte_offset(),
+              .destination = after_header,
+              .bytes = VamanaNode::HEADER_SIZE,
+            },
+          });
+        } else {
+          read_requests.push_back(full_snapshot);
+        }
+        pending.push_back({group, pointer, buffer, after_header});
       }
-      post_peer_reads_async(*thread, span<const PeerReadRequest>{read_requests});
+      if (ordered_pair_supported) {
+        post_peer_read_pairs_async(
+          *thread, span<const PeerReadPairRequest>{read_pairs});
+      } else {
+        post_peer_reads_async(
+          *thread, span<const PeerReadRequest>{read_requests});
+      }
       while (!thread->is_ready(thread->running_coroutine)) {
         poll_peer_send_cq();
         std::this_thread::yield();
@@ -429,14 +460,33 @@ void MemoryNode::continue_stage2_search_candidates_batched(
           pending[valid_count] = read;
         }
         PendingVectorRead& accepted = pending[valid_count++];
-        read_requests.push_back(PeerReadRequest{
-          .shard_id = accepted.pointer.memory_node(),
-          .remote_offset = accepted.pointer.byte_offset(),
-          .destination = accepted.buffer,
-          .bytes = VamanaNode::HEADER_SIZE,
-        });
+        if (!ordered_pair_supported) {
+          read_requests.push_back(PeerReadRequest{
+            .shard_id = accepted.pointer.memory_node(),
+            .remote_offset = accepted.pointer.byte_offset(),
+            .destination = accepted.buffer,
+            .bytes = VamanaNode::HEADER_SIZE,
+          });
+        }
       }
       pending.resize(valid_count);
+      if (ordered_pair_supported) {
+        for (const PendingVectorRead& read : pending) {
+          const u64 after = *reinterpret_cast<const u64*>(
+            read.after_header);
+          if (stable_vector_snapshot_valid(
+                read.pointer, read.before, after,
+                read.slot_incarnation)) {
+            emit_group(read.group_index,
+                       read.buffer + VamanaNode::offset_vector());
+          }
+        }
+        continue;
+      }
+
+      // A transport with only one atomic/WQE credit cannot reserve an
+      // ordered two-read chain. Preserve the original two-wave validation;
+      // never weaken a stable snapshot to a single read.
       post_peer_reads_async(*thread, span<const PeerReadRequest>{read_requests});
       while (!thread->is_ready(thread->running_coroutine)) {
         poll_peer_send_cq();

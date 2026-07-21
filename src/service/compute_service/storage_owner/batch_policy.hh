@@ -12,6 +12,29 @@ struct StorageOwnerBatchDecision {
   u32 take{};
 };
 
+// Queue::push_wait() is linearizable, but a Vyukov MPMC producer reserves its
+// FIFO position before publishing that cell.  A later producer may therefore
+// publish position N+1 (and increment the external published-task count) while
+// a preempted producer still owns the invisible position N.  The single
+// consumer must treat the counter as an admission/batching hint, not as proof
+// that the whole requested FIFO prefix is immediately dequeue-visible.
+//
+// Return the exact visible prefix.  In particular, an invisible first cell
+// consumes neither an RPC slot nor published-task credit; a partial prefix is
+// safe to send and is charged by its actual size.
+template <class Queue, class Output>
+inline u32 dequeue_storage_owner_visible_prefix(
+    Queue& queue, u32 requested, Output& output) {
+  u32 popped = 0;
+  while (popped < requested) {
+    u32 task_id = 0;
+    if (!queue.try_pop(task_id)) break;
+    output.push_back(task_id);
+    ++popped;
+  }
+  return popped;
+}
+
 // A synchronous caller population forms a closed queueing loop. If every RPC
 // slot consumes the first item it sees, N callers are permanently fragmented
 // across rpc_depth tiny requests (N / rpc_depth items each). This policy keeps

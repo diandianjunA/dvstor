@@ -1,4 +1,5 @@
 #include "memory_node/storage_owner_maintenance/detail.hh"
+#include "memory_node/storage_owner_maintenance/admission_policy.hh"
 #include "memory_node/storage_owner_cpu_plan.hh"
 #include "memory_node/storage_owner_index/graph_pointer_validation.hh"
 #include "gpu_search/maintenance_telemetry.hh"
@@ -44,12 +45,13 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   storage_owner_maintenance_completion_ring_ =
     std::make_unique<bounded::SlidingCompletionRing>(
       completion_capacity, initial_next, initial_durable);
-  const u64 requested_admission_limit = std::max<u64>(
-    std::max<u32>(1, config.storage_owner_batch_max),
-    static_cast<u64>(worker_count) *
-      std::max<u32>(1, config.storage_owner_rpc_depth) * 4);
+  const size_t requested_admission_limit =
+    stage2_sequence_admission_limit(
+      cpu_plan.maintenance_admission_workers,
+      config.storage_owner_rpc_depth,
+      config.storage_owner_batch_max);
   storage_owner_maintenance_admission_limit_ = static_cast<size_t>(
-    std::min<u64>(completion_capacity, requested_admission_limit));
+    std::min(completion_capacity, requested_admission_limit));
   storage_owner_maintenance_intent_capacity_ = completion_capacity;
   storage_owner_maintenance_intents_ =
     std::make_unique<StorageOwnerMaintenanceIntent[]>(completion_capacity);
@@ -76,6 +78,15 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   storage_owner_maintenance_pressure_yields_.store(0, std::memory_order_relaxed);
   storage_owner_stage2_batches_.store(0, std::memory_order_relaxed);
   storage_owner_stage2_batched_items_.store(0, std::memory_order_relaxed);
+  for (auto& timing : storage_owner_stage2_phase_timing_) {
+    timing.attempts.store(0, std::memory_order_relaxed);
+    timing.task_attempts.store(0, std::memory_order_relaxed);
+    timing.elapsed_ns.store(0, std::memory_order_relaxed);
+  }
+  storage_owner_maintenance_worker_idle_waits_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_maintenance_worker_idle_ns_.store(
+    0, std::memory_order_relaxed);
   storage_owner_maintenance_active_workers_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_finalize_latency_ns_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_finalize_max_latency_ns_.store(0, std::memory_order_relaxed);
@@ -172,6 +183,8 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
 
   print_status("storage-owner maintenance workers: " + std::to_string(worker_count) +
                " (configured=" + std::to_string(config.storage_owner_maintenance_workers) +
+               ", admission_baseline_workers=" +
+               std::to_string(cpu_plan.maintenance_admission_workers) +
                ", work_conserving=true)");
   print_status("storage-owner stage2 reverse outbox descriptors: " +
                std::to_string(storage_owner_reverse_outbox_->capacity()) +
@@ -246,13 +259,18 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
       abandoned = StorageOwnerMaintenanceTask{};
     }
   }
+
+  // Keep the joined worker vector intact until after the final observation:
+  // its size is the denominator for cumulative worker-idle time.  Clearing it
+  // first would report idle_ratio=0 and busy_ratio=1 for every shutdown
+  // summary, regardless of the observed waits.
+  log_storage_owner_maintenance_observation(
+    stage2_remaining, cleanup_remaining, true);
   storage_owner_maintenance_workers_.clear();
   storage_owner_maintenance_worker_states_.clear();
   storage_owner_repair_tasks_.reset();
   storage_owner_reverse_outbox_.reset();
   storage_owner_reverse_completions_.clear();
-
-  log_storage_owner_maintenance_observation(stage2_remaining, cleanup_remaining, true);
 }
 
 void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaining,
@@ -317,6 +335,89 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   const u64 stage2_batches = storage_owner_stage2_batches_.load(std::memory_order_relaxed);
   const u64 stage2_batched_items =
     storage_owner_stage2_batched_items_.load(std::memory_order_relaxed);
+  std::array<u64, kStorageOwnerStage2TimingPhaseCount>
+    stage2_phase_attempts{};
+  std::array<u64, kStorageOwnerStage2TimingPhaseCount>
+    stage2_phase_task_attempts{};
+  std::array<u64, kStorageOwnerStage2TimingPhaseCount>
+    stage2_phase_elapsed_ns{};
+  for (size_t phase = 0;
+       phase < kStorageOwnerStage2TimingPhaseCount; ++phase) {
+    stage2_phase_attempts[phase] =
+      storage_owner_stage2_phase_timing_[phase].attempts.load(
+        std::memory_order_relaxed);
+    stage2_phase_task_attempts[phase] =
+      storage_owner_stage2_phase_timing_[phase].task_attempts.load(
+        std::memory_order_relaxed);
+    stage2_phase_elapsed_ns[phase] =
+      storage_owner_stage2_phase_timing_[phase].elapsed_ns.load(
+        std::memory_order_relaxed);
+  }
+  const auto phase_index = [](StorageOwnerStage2TimingPhase phase) {
+    return static_cast<size_t>(phase);
+  };
+  const auto avg_phase_us_per_task = [&](
+      StorageOwnerStage2TimingPhase phase) {
+    const size_t index = phase_index(phase);
+    return stage2_phase_task_attempts[index] == 0
+      ? 0.0
+      : static_cast<double>(stage2_phase_elapsed_ns[index]) /
+          static_cast<double>(stage2_phase_task_attempts[index]) / 1e3;
+  };
+  const auto phase_elapsed_ms = [&](StorageOwnerStage2TimingPhase phase) {
+    return static_cast<double>(stage2_phase_elapsed_ns[phase_index(phase)]) /
+      1e6;
+  };
+  const u64 worker_idle_waits =
+    storage_owner_maintenance_worker_idle_waits_.load(
+      std::memory_order_relaxed);
+  const u64 worker_idle_ns =
+    storage_owner_maintenance_worker_idle_ns_.load(
+      std::memory_order_relaxed);
+  const double worker_observed_idle_ratio =
+    elapsed_ns == 0 || storage_owner_maintenance_workers_.empty()
+      ? 0.0
+      : std::min(
+          1.0,
+          static_cast<double>(worker_idle_ns) /
+            (static_cast<double>(elapsed_ns) *
+             static_cast<double>(storage_owner_maintenance_workers_.size())));
+  std::string stage2_phase_timing_log;
+  const auto append_phase_timing = [&](
+      const char* name, StorageOwnerStage2TimingPhase phase) {
+    const size_t index = phase_index(phase);
+    stage2_phase_timing_log += " stage2_phase_" + std::string(name) +
+      "_attempts=" + std::to_string(stage2_phase_attempts[index]) +
+      " stage2_phase_" + std::string(name) + "_task_attempts=" +
+      std::to_string(stage2_phase_task_attempts[index]) +
+      " stage2_phase_" + std::string(name) + "_elapsed_ms=" +
+      std::to_string(phase_elapsed_ms(phase)) +
+      " avg_stage2_phase_" + std::string(name) + "_us_per_task=" +
+      std::to_string(avg_phase_us_per_task(phase));
+  };
+  append_phase_timing(
+    "search", StorageOwnerStage2TimingPhase::continuation_search);
+  append_phase_timing(
+    "freeze_prune", StorageOwnerStage2TimingPhase::freeze_prune);
+  append_phase_timing(
+    "reverse_prepare", StorageOwnerStage2TimingPhase::reverse_prepare);
+  append_phase_timing(
+    "placement_authority",
+    StorageOwnerStage2TimingPhase::placement_authority);
+  append_phase_timing(
+    "completion_handoff",
+    StorageOwnerStage2TimingPhase::completion_handoff);
+  append_phase_timing(
+    "finalize", StorageOwnerStage2TimingPhase::finalize);
+  stage2_phase_timing_log +=
+    " maintenance_worker_idle_waits=" +
+      std::to_string(worker_idle_waits) +
+    " maintenance_worker_idle_ms=" +
+      std::to_string(static_cast<double>(worker_idle_ns) / 1e6) +
+    " maintenance_worker_observed_idle_ratio=" +
+      std::to_string(worker_observed_idle_ratio) +
+    " maintenance_worker_observed_busy_ratio=" +
+      std::to_string(1.0 - worker_observed_idle_ratio);
   const u64 stage1_search_budget_exhausted =
     storage_owner_stage1_search_budget_exhausted_.load(
       std::memory_order_relaxed);
@@ -575,6 +676,7 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(stage2_batches) +
                " avg_stage2_batch_size=" +
                std::to_string(ratio_or_zero(stage2_batched_items, stage2_batches)) +
+               stage2_phase_timing_log +
                " peer_stage1_enqueued=" +
                std::to_string(peer_stage1_enqueued) +
                " peer_stage1_processed=" +

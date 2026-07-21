@@ -16,6 +16,11 @@ struct StorageOwnerCpuPlan {
   // registered RPC window and a small per-lane factor.
   std::uint32_t foreground_coordinators{};
   std::uint32_t maintenance_workers{};
+  // Admission debt is sized from the pre-rebalance Stage2 lane count.  This
+  // keeps a CPU transfer from reverse processing to Stage2 from silently
+  // increasing acknowledged-but-unfinished work; only the executor count
+  // above changes.
+  std::uint32_t maintenance_admission_workers{};
   std::uint32_t peer_stage1_workers{};
   std::uint32_t peer_reverse_workers{};
   std::uint32_t peer_cleanup_workers{};
@@ -49,12 +54,51 @@ inline StorageOwnerCpuPlan derive_storage_owner_cpu_plan(
   // the foreground send/receive CQs, so it needs its own CPU just like the
   // explicit worker threads below.
   plan.foreground_progress_threads = 1;
-  plan.maintenance_workers = std::min(
+  // Stage2 executes several synchronous one-sided-RDMA waves for every
+  // inserted vector, while reverse updates are coalesced before they reach a
+  // peer worker.  Giving the latter twice as many CPUs as Stage2 therefore
+  // leaves the latency-bearing side unable to keep enough reads in flight on
+  // a colocated shard.  Rebalance the same fixed CPU pool; do not enlarge it:
+  // transfer at most two reverse lanes above a two-worker service floor to
+  // Stage2, up to a conservative one-fifth-of-the-process Stage2 target.  The
+  // transfer cap keeps reverse-heavy upsert/delete workloads provisioned on
+  // larger hosts where the insert-only headroom observation does not justify
+  // draining the full reverse pool.  The configured maintenance value remains
+  // a hard upper bound, and the Stage1 budget below is unchanged.
+  const std::uint32_t baseline_maintenance_workers = std::min(
     std::max<std::uint32_t>(1, configured_maintenance_workers),
     std::max<std::uint32_t>(1, budget >= 8 ? budget / 10 : 1));
-  plan.peer_reverse_workers = remote_peer_count == 0 ? 0 : std::min(
-    std::uint32_t{8},
+  const std::uint32_t desired_maintenance_workers = std::min(
+    std::max<std::uint32_t>(1, configured_maintenance_workers),
     std::max<std::uint32_t>(1, budget >= 8 ? budget / 5 : 1));
+  plan.maintenance_admission_workers = baseline_maintenance_workers;
+  if (remote_peer_count == 0) {
+    // There is no reverse pool from which to transfer a lane.  Retain the
+    // baseline split: raising Stage2 here would consume foreground CPUs on
+    // mid-sized local-only deployments and would no longer be a fixed-pool
+    // rebalance.
+    plan.maintenance_workers = baseline_maintenance_workers;
+    plan.peer_reverse_workers = 0;
+  } else {
+    const std::uint32_t baseline_reverse_workers = std::min(
+      std::uint32_t{8},
+      std::max<std::uint32_t>(1, budget >= 8 ? budget / 5 : 1));
+    const std::uint32_t reverse_service_floor = std::min(
+      std::uint32_t{2}, baseline_reverse_workers);
+    const std::uint32_t transferable_reverse_workers =
+      baseline_reverse_workers - reverse_service_floor;
+    const std::uint32_t requested_transfer =
+      desired_maintenance_workers - baseline_maintenance_workers;
+    constexpr std::uint32_t kMaxReverseToMaintenanceTransfer = 2;
+    const std::uint32_t transferred_workers = std::min({
+      transferable_reverse_workers,
+      requested_transfer,
+      kMaxReverseToMaintenanceTransfer});
+    plan.maintenance_workers =
+      baseline_maintenance_workers + transferred_workers;
+    plan.peer_reverse_workers =
+      baseline_reverse_workers - transferred_workers;
+  }
   // Cleanup activation is on every replacement/deletion path and may wait
   // behind an in-progress same-token retry. Give it a bounded CPU-scaled
   // pool so an unrelated token is never forced through one process-wide

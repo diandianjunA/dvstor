@@ -540,6 +540,189 @@ void MemoryNode::post_peer_reads_async(
   }
 }
 
+void MemoryNode::post_peer_read_pairs_async(
+    StorageOwnerThread& thread,
+    span<const PeerReadPairRequest> requests) {
+  if (requests.empty()) return;
+  lib_assert(peer_context_ != nullptr,
+             "storage peer context is not initialized");
+  lib_assert(thread.has_peer_scratch(),
+             "storage-owner thread scratch is not initialized");
+
+  const u32 pair_chain_limit =
+    memory_node_detail::peer_rdma_read_pair_group_limit(
+      peer_rdma_read_credit_plan());
+  lib_assert(pair_chain_limit != 0,
+             "ordered peer snapshot pair has fewer than two transport "
+             "credits; caller must use the two-wave fallback");
+
+  struct AssignedPair {
+    PeerReadPairRequest request;
+    u32 qp_idx{};
+  };
+  thread_local vec<vec<AssignedPair>> groups;
+  const size_t group_count =
+    static_cast<size_t>(num_storage_nodes_) * peer_qps_per_peer_;
+  groups.resize(group_count);
+  for (vec<AssignedPair>& group : groups) group.clear();
+
+  thread_local vec<u32> active_qp_by_shard;
+  thread_local vec<u32> active_fill_by_shard;
+  active_qp_by_shard.resize(num_storage_nodes_);
+  active_fill_by_shard.assign(num_storage_nodes_, 0);
+
+  const uintptr_t scratch_begin = reinterpret_cast<uintptr_t>(
+    thread.scratch_buffer.get_full_buffer());
+  lib_assert(thread.scratch_buffer.buffer_size <=
+               std::numeric_limits<uintptr_t>::max() - scratch_begin,
+             "storage-owner scratch address range overflow");
+  const uintptr_t scratch_end =
+    scratch_begin + thread.scratch_buffer.buffer_size;
+  const auto local_range = [&](const PeerReadRequest& request) {
+    const uintptr_t destination =
+      reinterpret_cast<uintptr_t>(request.destination);
+    lib_assert(request.local_offset <=
+                 std::numeric_limits<uintptr_t>::max() - destination,
+               "ordered peer snapshot local offset overflow");
+    const uintptr_t begin = destination + request.local_offset;
+    lib_assert(request.bytes <=
+                 std::numeric_limits<uintptr_t>::max() - begin,
+               "ordered peer snapshot local range overflow");
+    return std::pair<uintptr_t, uintptr_t>{begin, begin + request.bytes};
+  };
+
+  for (const PeerReadPairRequest& pair : requests) {
+    const PeerReadRequest& full = pair.full_snapshot;
+    const PeerReadRequest& after = pair.after_header;
+    lib_assert(full.destination != nullptr && after.destination != nullptr,
+               "ordered peer snapshot pair has a null destination");
+    lib_assert(full.bytes >= VamanaNode::HEADER_SIZE &&
+                 after.bytes == VamanaNode::HEADER_SIZE,
+               "ordered peer snapshot pair has invalid read sizes");
+    lib_assert(full.shard_id == after.shard_id &&
+                 full.remote_offset == after.remote_offset,
+               "ordered peer snapshot pair crossed a remote record");
+    lib_assert(full.shard_id < num_storage_nodes_ &&
+                 full.shard_id != storage_id_,
+               "ordered peer snapshot pair has an invalid remote shard");
+    lib_assert(peer_remote_tokens_[full.shard_id] != nullptr,
+               "ordered peer snapshot pair has no remote token");
+    lib_assert(full.remote_offset <= mn_memory_bytes_ &&
+                 full.bytes <= mn_memory_bytes_ - full.remote_offset &&
+                 after.bytes <= mn_memory_bytes_ - after.remote_offset,
+               "ordered peer snapshot pair exceeds shard bounds");
+    lib_assert(full.bytes <= std::numeric_limits<u32>::max(),
+               "ordered peer full snapshot exceeds verbs SGE length");
+
+    const auto [full_begin, full_end] = local_range(full);
+    const auto [after_begin, after_end] = local_range(after);
+    lib_assert(full_begin >= scratch_begin && full_end <= scratch_end &&
+                 after_begin >= scratch_begin && after_end <= scratch_end,
+               "ordered peer snapshot pair exceeds registered scratch");
+    lib_assert(full_end <= after_begin || after_end <= full_begin,
+               "ordered peer after-header overlaps the before snapshot");
+
+    if (active_fill_by_shard[full.shard_id] == 0 ||
+        active_fill_by_shard[full.shard_id] == pair_chain_limit) {
+      active_qp_by_shard[full.shard_id] =
+        memory_node_detail::select_peer_data_qp(
+          peer_qps_per_peer_, thread.id + thread.next_peer_data_qp_ticket++);
+      active_fill_by_shard[full.shard_id] = 0;
+    }
+    const u32 qp_idx = active_qp_by_shard[full.shard_id];
+    ++active_fill_by_shard[full.shard_id];
+    const size_t group_index =
+      static_cast<size_t>(full.shard_id) * peer_qps_per_peer_ + qp_idx;
+    groups[group_index].push_back({pair, qp_idx});
+  }
+
+  thread_local vec<ibv_send_wr> work_requests;
+  thread_local vec<ibv_sge> scatter_gather_entries;
+  for (vec<AssignedPair>& group : groups) {
+    if (group.empty()) continue;
+    const u32 shard_id = group.front().request.full_snapshot.shard_id;
+    const u32 qp_idx = group.front().qp_idx;
+    QP& qp = peer_data_qp(shard_id, qp_idx);
+    for (size_t begin = 0; begin < group.size();
+         begin += pair_chain_limit) {
+      const size_t end = std::min(
+        group.size(), begin + static_cast<size_t>(pair_chain_limit));
+      const u32 pair_count = static_cast<u32>(end - begin);
+      const u32 read_count =
+        memory_node_detail::peer_rdma_read_pair_work_request_count(
+          pair_count);
+      lib_assert(read_count != 0,
+                 "ordered peer snapshot pair WR count overflow");
+
+      // Reserve both reads of every pair in one all-or-nothing credit group.
+      // A pair is never split across QPs/chains, and the only signaled WR is
+      // the chain tail.  RC ordering therefore guarantees full snapshot ->
+      // after-header before the caller observes completion.
+      acquire_peer_rdma_read_group(shard_id, qp_idx, read_count);
+      work_requests.resize(read_count);
+      scatter_gather_entries.resize(read_count);
+      const MemoryRegionToken& token = *peer_remote_tokens_[shard_id];
+      for (u32 wr_index = 0; wr_index < read_count; ++wr_index) {
+        const auto chain_item =
+          memory_node_detail::peer_rdma_read_pair_chain_item(
+            wr_index, pair_count);
+        const PeerReadPairRequest& pair =
+          group[begin + chain_item.pair_index].request;
+        const PeerReadRequest& request = chain_item.after_header
+          ? pair.after_header : pair.full_snapshot;
+        ibv_sge& sge = scatter_gather_entries[wr_index];
+        ibv_send_wr& wr = work_requests[wr_index];
+        sge = {};
+        wr = {};
+        sge.addr = reinterpret_cast<u64>(request.destination) +
+          request.local_offset;
+        sge.length = static_cast<u32>(request.bytes);
+        sge.lkey = thread.scratch_region->get_lkey();
+        wr.opcode = IBV_WR_RDMA_READ;
+        wr.sg_list = &sge;
+        wr.num_sge = 1;
+        wr.wr.rdma.remote_addr = token.address + request.remote_offset;
+        wr.wr.rdma.rkey = token.rkey;
+        // The first validation READ fences the complete preceding full-body
+        // half of this chain.  Later headers remain after that boundary while
+        // the HCA can batch them together; fencing every pair would serialize
+        // the chain into N dependent READ round trips.
+        if (wr_index == pair_count) {
+          wr.send_flags = IBV_SEND_FENCE;
+        }
+        wr.next = wr_index + 1 < read_count
+          ? &work_requests[wr_index + 1] : nullptr;
+      }
+
+      const u64 wr_id = next_peer_async_wr_id();
+      work_requests.back().send_flags |= IBV_SEND_SIGNALED;
+      work_requests.back().wr_id = wr_id;
+      thread.track_post();
+      register_peer_pending_send_locked(
+        wr_id,
+        PeerPendingSend{
+          .target_shard = shard_id,
+          .target_qp_idx = qp_idx,
+          .thread_id = thread.id,
+          .coroutine_id = thread.running_coroutine,
+          .thread = &thread,
+          .async = true,
+          .rdma_read_credit = true,
+          .rdma_read_count = read_count,
+        });
+      ibv_send_wr* bad_work_request = nullptr;
+      {
+        std::lock_guard<std::mutex> send_lock(
+          *peer_qp_send_mutexes_[shard_id][qp_idx]);
+        lib_assert(
+          ibv_post_send(qp->get_ibv_qp(), work_requests.data(),
+                        &bad_work_request) == 0,
+          "cannot post ordered peer snapshot pair batch");
+      }
+    }
+  }
+}
+
 void MemoryNode::remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, size_t bytes, size_t scratch_offset) {
   if (bytes == 0) return;
   lib_assert(peer_context_ != nullptr, "storage peer context is not initialized");

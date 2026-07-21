@@ -1,5 +1,6 @@
 #include <cassert>
 
+#include "memory_node/storage_owner_state.hh"
 #include "memory_node/storage_owner_index/graph_pointer_validation.hh"
 #include "vamana/hot_graph.hh"
 
@@ -30,8 +31,12 @@ int main() {
   // than a uint8 D128 vector snapshot. Consecutive graph slots must be spaced
   // by the graph size, never by the snapshot stride.
   const size_t snapshot_stride =
-    (VamanaNode::size_until_vector_end() + kCacheLineBytes - 1) &
-    ~(kCacheLineBytes - 1);
+    memory_node_detail::storage_owner_snapshot_stride();
+  const size_t validation_offset =
+    memory_node_detail::storage_owner_snapshot_validation_offset();
+  assert(validation_offset >= VamanaNode::size_until_vector_end());
+  assert(validation_offset % alignof(u64) == 0);
+  assert(validation_offset + VamanaNode::HEADER_SIZE <= snapshot_stride);
   const size_t graph_stride =
     memory_node_storage_owner_index_detail::graph_read_slot_stride();
   const size_t batch_slot_stride =
@@ -106,6 +111,23 @@ int main() {
   assert(!memory_node_storage_owner_index_detail::
            local_storage_pointer_addressable(
              out_of_bounds, 1, kShardCount, kShardBytes));
+
+  // Validation scratch must stay naturally aligned for arbitrary integral
+  // dimensions, not only the common D128 shape.  The paired RDMA path reads
+  // this location as a u64 after-header.
+  for (const auto& [dim, dtype] : {
+         std::pair<u32, VectorDType>{127, VectorDType::uint8},
+         std::pair<u32, VectorDType>{129, VectorDType::int8}}) {
+    VamanaNode::init_static_storage(dim, 96, dtype);
+    const size_t odd_validation_offset =
+      memory_node_detail::storage_owner_snapshot_validation_offset();
+    const size_t odd_snapshot_stride =
+      memory_node_detail::storage_owner_snapshot_stride();
+    assert(odd_validation_offset >= VamanaNode::size_until_vector_end());
+    assert(odd_validation_offset % alignof(u64) == 0);
+    assert(odd_validation_offset + VamanaNode::HEADER_SIZE <=
+           odd_snapshot_stride);
+  }
 
   VamanaNode::disable_hot_graph();
   return 0;

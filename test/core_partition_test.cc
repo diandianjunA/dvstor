@@ -8,6 +8,14 @@
 #include "memory_node/storage_owner_cpu_plan.hh"
 
 int main() {
+  const auto pinned_cpu_lanes = [](const auto& plan) {
+    return static_cast<std::uint64_t>(plan.foreground_workers) +
+      plan.maintenance_workers + plan.peer_stage1_workers +
+      plan.peer_reverse_workers + plan.peer_cleanup_workers +
+      plan.peer_placement_workers + plan.peer_progress_threads +
+      plan.foreground_progress_threads;
+  };
+
   // Strict order for four physical cores followed by their four SMT siblings.
   const std::vector<std::uint32_t> ordered{4, 5, 0, 1, 12, 13, 8, 9};
   std::set<std::uint32_t> union_cpus;
@@ -39,8 +47,9 @@ int main() {
     22, 64, 16, 8, 4);
   assert(colocated.foreground_workers == 3);
   assert(colocated.foreground_coordinators == 12);
-  assert(colocated.maintenance_workers == 2);
-  assert(colocated.peer_reverse_workers == 4);
+  assert(colocated.maintenance_workers == 4);
+  assert(colocated.maintenance_admission_workers == 2);
+  assert(colocated.peer_reverse_workers == 2);
   assert(colocated.peer_stage1_workers == 7);
   assert(colocated.peer_cleanup_workers == 2);
   assert(colocated.peer_placement_workers == 1);
@@ -53,6 +62,50 @@ int main() {
            colocated.peer_progress_threads +
            colocated.foreground_progress_threads == 22);
 
+  // The five-way colocated deployment gives some shard ranks 24 logical
+  // CPUs.  The rebalanced plan must spend exactly that budget as well: two
+  // reverse lanes move to latency-bearing Stage2 without taking a Stage1,
+  // cleanup, placement, or progress lane.
+  const auto colocated_24 = memory_node_detail::derive_storage_owner_cpu_plan(
+    24, 64, 16, 8, 4);
+  assert(colocated_24.foreground_workers == 3);
+  assert(colocated_24.foreground_coordinators == 12);
+  assert(colocated_24.maintenance_workers == 4);
+  assert(colocated_24.maintenance_admission_workers == 2);
+  assert(colocated_24.peer_reverse_workers == 2);
+  assert(colocated_24.peer_stage1_workers == 8);
+  assert(colocated_24.peer_cleanup_workers == 3);
+  assert(colocated_24.peer_placement_workers == 1);
+  assert(colocated_24.peer_progress_threads == 2);
+  assert(colocated_24.foreground_progress_threads == 1);
+  assert(colocated_24.foreground_workers +
+           colocated_24.maintenance_workers +
+           colocated_24.peer_reverse_workers +
+           colocated_24.peer_stage1_workers +
+           colocated_24.peer_cleanup_workers +
+           colocated_24.peer_placement_workers +
+           colocated_24.peer_progress_threads +
+           colocated_24.foreground_progress_threads == 24);
+
+  // Configuration is still authoritative.  Transferring one worker at a
+  // time preserves the combined Stage2/reverse CPU pool and the reverse
+  // service floor instead of silently expanding the process CPU budget.
+  const auto maintenance_two =
+    memory_node_detail::derive_storage_owner_cpu_plan(22, 64, 16, 2, 4);
+  const auto maintenance_three =
+    memory_node_detail::derive_storage_owner_cpu_plan(22, 64, 16, 3, 4);
+  assert(maintenance_two.maintenance_workers == 2);
+  assert(maintenance_two.maintenance_admission_workers == 2);
+  assert(maintenance_two.peer_reverse_workers == 4);
+  assert(maintenance_three.maintenance_workers == 3);
+  assert(maintenance_three.maintenance_admission_workers == 2);
+  assert(maintenance_three.peer_reverse_workers == 3);
+  assert(maintenance_two.maintenance_workers +
+           maintenance_two.peer_reverse_workers == 6);
+  assert(maintenance_three.maintenance_workers +
+           maintenance_three.peer_reverse_workers == 6);
+  assert(colocated.maintenance_workers + colocated.peer_reverse_workers == 6);
+
   const auto dedicated = memory_node_detail::derive_storage_owner_cpu_plan(
     112, 64, 16, 8, 4);
   assert(dedicated.foreground_workers == 16);
@@ -63,6 +116,24 @@ int main() {
   assert(dedicated.peer_cleanup_workers == 8);
   assert(dedicated.peer_placement_workers == 1);
   assert(dedicated.foreground_progress_threads == 1);
+
+  // A high operator ceiling on a larger host must not be interpreted as
+  // permission to collapse the incoming reverse-update pool.  Only the same
+  // two-lane conservative transfer is allowed; admission remains tied to the
+  // pre-transfer count.  The common 112-CPU/configured-8 plan above remains
+  // unchanged at 8/8 because it already reaches its configured Stage2 bound.
+  const auto large_high_maintenance =
+    memory_node_detail::derive_storage_owner_cpu_plan(
+      64, 128, 64, 64, 4);
+  assert(large_high_maintenance.maintenance_admission_workers == 6);
+  assert(large_high_maintenance.maintenance_workers == 8);
+  assert(large_high_maintenance.peer_reverse_workers == 6);
+  const auto dedicated_high_maintenance =
+    memory_node_detail::derive_storage_owner_cpu_plan(
+      112, 128, 64, 64, 4);
+  assert(dedicated_high_maintenance.maintenance_admission_workers == 11);
+  assert(dedicated_high_maintenance.maintenance_workers == 13);
+  assert(dedicated_high_maintenance.peer_reverse_workers == 6);
 
   // Stage1 chooses one physical home. Adding shards does not fan out its
   // coordinator work and must not reduce foreground concurrency.
@@ -78,6 +149,8 @@ int main() {
   assert(local_only.foreground_workers == 16);
   assert(local_only.foreground_coordinators ==
          local_only.foreground_workers);
+  assert(local_only.maintenance_workers == 2);
+  assert(local_only.maintenance_admission_workers == 2);
   assert(local_only.peer_stage1_workers == 0);
   assert(local_only.peer_cleanup_workers == 0);
   assert(local_only.peer_placement_workers == 0);
@@ -97,4 +170,75 @@ int main() {
   assert(shallow_rpc.foreground_coordinators <= 2);
   assert(shallow_rpc.foreground_coordinators >=
          shallow_rpc.foreground_workers);
+
+  // Exercise the policy, not only the production 22/24-CPU points.  Nine
+  // CPUs are the functional minimum for a remote plan's independently pinned
+  // progress, maintenance, reverse, control, and two Stage1 lanes.  At and
+  // above that minimum the plan must never invent CPUs, regardless of shard
+  // count or operator concurrency bounds.
+  for (std::uint32_t cpus = 9; cpus <= 160; ++cpus) {
+    for (const std::uint32_t configured_threads : {1u, 8u, 64u, 256u}) {
+      for (const std::uint32_t rpc_parallelism : {1u, 2u, 16u, 4096u}) {
+        for (const std::uint32_t configured_maintenance :
+             {1u, 2u, 3u, 8u, 64u}) {
+          const auto one_peer =
+            memory_node_detail::derive_storage_owner_cpu_plan(
+              cpus, configured_threads, rpc_parallelism,
+              configured_maintenance, 1);
+          const auto many_peers =
+            memory_node_detail::derive_storage_owner_cpu_plan(
+              cpus, configured_threads, rpc_parallelism,
+              configured_maintenance, 64);
+          assert(pinned_cpu_lanes(one_peer) <= cpus);
+          assert(one_peer.maintenance_admission_workers >= 1);
+          assert(one_peer.maintenance_admission_workers <=
+                 one_peer.maintenance_workers);
+          assert(one_peer.maintenance_workers <= configured_maintenance);
+          assert(one_peer.peer_reverse_workers >= 1);
+          assert(one_peer.peer_reverse_workers <= 8);
+          assert(one_peer.foreground_workers >= 1);
+          assert(one_peer.peer_stage1_workers >= 1);
+          assert(one_peer.foreground_coordinators >=
+                 one_peer.foreground_workers);
+          assert(one_peer.foreground_coordinators <=
+                 one_peer.foreground_workers * 4);
+
+          // Worker pools service all peer queues; adding shards must not
+          // divide the fixed CPU partition or grow it per peer.
+          assert(one_peer.foreground_workers ==
+                 many_peers.foreground_workers);
+          assert(one_peer.foreground_coordinators ==
+                 many_peers.foreground_coordinators);
+          assert(one_peer.maintenance_workers ==
+                 many_peers.maintenance_workers);
+          assert(one_peer.maintenance_admission_workers ==
+                 many_peers.maintenance_admission_workers);
+          assert(one_peer.peer_stage1_workers ==
+                 many_peers.peer_stage1_workers);
+          assert(one_peer.peer_reverse_workers ==
+                 many_peers.peer_reverse_workers);
+          assert(pinned_cpu_lanes(one_peer) ==
+                 pinned_cpu_lanes(many_peers));
+        }
+      }
+    }
+  }
+
+  // Local-only plans have no reverse/control pool to donate.  Their actual
+  // and admission Stage2 counts therefore remain identical, and a viable
+  // three-CPU plan also stays inside its physical budget.
+  for (std::uint32_t cpus = 3; cpus <= 160; ++cpus) {
+    for (const std::uint32_t configured_maintenance : {1u, 2u, 8u, 64u}) {
+      const auto plan = memory_node_detail::derive_storage_owner_cpu_plan(
+        cpus, 64, 16, configured_maintenance, 0);
+      assert(pinned_cpu_lanes(plan) <= cpus);
+      assert(plan.maintenance_workers ==
+             plan.maintenance_admission_workers);
+      assert(plan.peer_stage1_workers == 0);
+      assert(plan.peer_reverse_workers == 0);
+      assert(plan.peer_cleanup_workers == 0);
+      assert(plan.peer_placement_workers == 0);
+      assert(plan.peer_progress_threads == 0);
+    }
+  }
 }

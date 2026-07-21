@@ -309,6 +309,10 @@ private:
     size_t bytes{};
     size_t local_offset{};
   };
+  struct PeerReadPairRequest {
+    PeerReadRequest full_snapshot;
+    PeerReadRequest after_header;
+  };
   using AuthorityOperationToken =
     memory_node_storage_owner_index_detail::AuthorityOperationToken;
   using AuthorityMutationLease =
@@ -408,6 +412,9 @@ private:
                             size_t local_offset = 0);
   void post_peer_reads_async(StorageOwnerThread& thread,
                              span<const PeerReadRequest> requests);
+  void post_peer_read_pairs_async(
+    StorageOwnerThread& thread,
+    span<const PeerReadPairRequest> requests);
   void remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, size_t bytes, size_t scratch_offset);
   void remote_write_bytes(u32 shard_id, u64 remote_offset, const void* src, size_t bytes, size_t scratch_offset);
   u64 remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 expected, u64 desired, size_t scratch_offset);
@@ -1059,6 +1066,30 @@ private:
   std::atomic<u64> storage_owner_stage2_final_edges_{0};
   std::atomic<u64> storage_owner_stage2_cross_edges_stage1_home_{0};
   std::atomic<u64> storage_owner_stage2_cross_edges_final_home_{0};
+  // Stage2 timings are aggregated once per context phase/attempt.  Keeping
+  // these counters at the batch boundary makes the diagnostic cost
+  // independent of L, R, vector dimension, and the number of RDMA reads.
+  enum class StorageOwnerStage2TimingPhase : size_t {
+    continuation_search,
+    freeze_prune,
+    reverse_prepare,
+    placement_authority,
+    completion_handoff,
+    finalize,
+    count,
+  };
+  static constexpr size_t kStorageOwnerStage2TimingPhaseCount =
+    static_cast<size_t>(StorageOwnerStage2TimingPhase::count);
+  struct StorageOwnerStage2TimingCounters {
+    std::atomic<u64> attempts{0};
+    std::atomic<u64> task_attempts{0};
+    std::atomic<u64> elapsed_ns{0};
+  };
+  std::array<StorageOwnerStage2TimingCounters,
+             kStorageOwnerStage2TimingPhaseCount>
+    storage_owner_stage2_phase_timing_{};
+  std::atomic<u64> storage_owner_maintenance_worker_idle_waits_{0};
+  std::atomic<u64> storage_owner_maintenance_worker_idle_ns_{0};
   std::atomic<u32> storage_owner_maintenance_active_workers_{0};
   std::atomic<u64> storage_owner_maintenance_started_ns_{0};
   std::atomic<u64> storage_owner_maintenance_last_observation_ns_{0};

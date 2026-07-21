@@ -30,8 +30,18 @@ inline size_t storage_owner_snapshot_bytes() {
   return VamanaNode::size_until_vector_end();
 }
 
+inline size_t storage_owner_snapshot_validation_offset() {
+  const size_t alignment = alignof(u64);
+  return (storage_owner_snapshot_bytes() + alignment - 1) &
+    ~(alignment - 1);
+}
+
 inline size_t storage_owner_snapshot_stride() {
-  return align_to_cacheline(storage_owner_snapshot_bytes());
+  // Keep an independent after-header in every registered snapshot slot.  It
+  // must not overwrite the before-header at byte zero when both reads are
+  // submitted in one ordered RC chain.
+  return align_to_cacheline(
+    storage_owner_snapshot_validation_offset() + VamanaNode::HEADER_SIZE);
 }
 
 struct BeamEntry {

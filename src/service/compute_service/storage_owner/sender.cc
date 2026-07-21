@@ -86,19 +86,26 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
       state.free_slots.pop_back();
       auto& slot = state.slots[slot_id];
       slot.tasks.clear();
-      for (u32 item = 0; item < decision.take; ++item) {
-        u32 task_id = 0;
-        lib_assert(state.queue->try_pop(task_id),
-                   "published storage-owner task was not queue-visible");
-        slot.tasks.push_back(task_id);
+      const u32 dequeued = dequeue_storage_owner_visible_prefix(
+        *state.queue, decision.take, slot.tasks);
+      if (dequeued == 0) {
+        // A producer can be preempted after reserving the FIFO head but before
+        // publishing it. Later cells may already contribute to
+        // published_tasks, yet they cannot be popped past that transient
+        // hole. Preserve both slot and counter and retry on a later progress
+        // pass; blocking here would also stop CQ progress.
+        ++state.queue_visibility_stalls;
+        state.free_slots.push_back(slot_id);
+        break;
       }
+      state.partial_visible_batches += dequeued < decision.take;
       const u32 previous = state.published_tasks.fetch_sub(
-        decision.take, std::memory_order_acq_rel);
-      lib_assert(previous >= decision.take,
+        dequeued, std::memory_order_acq_rel);
+      lib_assert(previous >= dequeued,
                  "storage-owner published task counter underflow");
       ++state.rpc_batches;
-      state.rpc_items += decision.take;
-      state.full_batches += decision.take == batch_max;
+      state.rpc_items += dequeued;
+      state.full_batches += dequeued == batch_max;
       state.tail_escape_batches += decision.tail_escape;
       if (state.rpc_batches >= 32 &&
           (state.rpc_batches & (state.rpc_batches - 1)) == 0) {
@@ -111,6 +118,10 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
                   << " avg_batch=" << average_batch
                   << " full_batches=" << state.full_batches
                   << " tail_escape_batches=" << state.tail_escape_batches
+                  << " queue_visibility_stalls="
+                  << state.queue_visibility_stalls
+                  << " partial_visible_batches="
+                  << state.partial_visible_batches
                   << " saturated=" << std::boolalpha
                   << state.saturated_batch_epoch << std::noboolalpha
                   << " published="

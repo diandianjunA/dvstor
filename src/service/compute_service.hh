@@ -135,9 +135,11 @@ private:
     // the sender distinguish real concurrent demand from an isolated write
     // without a time-based batching delay.
     std::atomic<u32> pending_producers{0};
-    // Exact number of fully published queue cells. Producers increment only
-    // after Queue::push_wait; the single progress consumer decrements after
-    // popping an exact batch. This avoids approximate-size publication races.
+    // Accounting credit for cells whose Queue::push_wait has returned.
+    // Multiple producers can publish out of FIFO-reservation order, so this
+    // is an exact total credit but only a batching hint for the immediately
+    // dequeue-visible prefix. The single progress consumer subtracts only the
+    // prefix it actually popped.
     std::atomic<u32> published_tasks{0};
     std::unique_ptr<bounded::Queue<u32>> queue;
     std::unique_ptr<bounded::Queue<u32>> free_tasks;
@@ -153,6 +155,11 @@ private:
     u64 rpc_items{};
     u64 full_batches{};
     u64 tail_escape_batches{};
+    // A later producer may publish behind a reserved-but-invisible FIFO head.
+    // These counters distinguish that transient MPMC condition from remote
+    // RPC or storage-maintenance stalls.
+    u64 queue_visibility_stalls{};
+    u64 partial_visible_batches{};
   };
 
   struct StorageOwnerReadySlot {

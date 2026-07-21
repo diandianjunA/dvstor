@@ -14,6 +14,40 @@ enum class Stage2AdmissionDecision : std::uint8_t {
   foreground_pressure,
 };
 
+inline std::size_t saturating_admission_multiply(
+    std::size_t lhs, std::size_t rhs) {
+  if (lhs != 0 && rhs > std::numeric_limits<std::size_t>::max() / lhs) {
+    return std::numeric_limits<std::size_t>::max();
+  }
+  return lhs * rhs;
+}
+
+// Bound acknowledged-but-unfinished Stage2 debt.  The caller supplies the
+// pre-rebalance Stage2 lane count, so moving CPUs from reverse processing to
+// Stage2 cannot alter this window for any wire batch size.  Four wire batches
+// are enough to absorb burst and batch-formation jitter; at larger dedicated
+// deployments, one task per available worker/RPC context keeps every executor
+// feedable.  The legacy four-tasks-per-context bound remains a ceiling unless
+// one complete wire batch itself is larger.
+//
+// In particular, moving two CPUs from an idle reverse pool to Stage2 on the
+// five-way colocated deployment must improve the rate at which debt is paid,
+// not double the amount of debt hidden before backpressure starts.
+inline std::size_t stage2_sequence_admission_limit(
+    std::size_t maintenance_workers,
+    std::size_t rpc_depth,
+    std::size_t batch_max) {
+  const std::size_t workers = std::max<std::size_t>(1, maintenance_workers);
+  const std::size_t depth = std::max<std::size_t>(1, rpc_depth);
+  const std::size_t batch = std::max<std::size_t>(1, batch_max);
+  const std::size_t contexts = saturating_admission_multiply(workers, depth);
+  const std::size_t legacy_limit =
+    saturating_admission_multiply(contexts, 4);
+  const std::size_t batch_burst = saturating_admission_multiply(batch, 4);
+  const std::size_t service_demand = std::max(contexts, batch_burst);
+  return std::max(batch, std::min(legacy_limit, service_demand));
+}
+
 // Foreground pressure may reduce asynchronous Stage2 concurrency, but it must
 // never suppress every dedicated maintenance executor. Stage1 publication
 // reserves an ordered completion ticket before replying to the compute node;
