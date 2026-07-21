@@ -595,8 +595,14 @@ private:
   void stop_storage_owner_maintenance_runtime();
   u64 arm_storage_owner_maintenance(
       StorageOwnerMaintenanceTask&& task, const Configuration& config);
+  u64 arm_storage_owner_maintenance_batch(
+      vec<StorageOwnerMaintenanceTask>& tasks,
+      const Configuration& config);
   u64 activate_storage_owner_cleanup(
       StorageOwnerMaintenanceTask&& task, const Configuration& config);
+  u64 activate_storage_owner_cleanup_batch(
+      vec<StorageOwnerMaintenanceTask>& tasks,
+      const Configuration& config);
   u64 begin_storage_owner_maintenance_sequence(u32 work_items);
   u64 begin_storage_owner_maintenance_batch(span<const u32> work_items);
   void complete_storage_owner_maintenance_sequence(u64 sequence);

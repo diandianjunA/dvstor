@@ -580,8 +580,7 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
     for (const Stage1ExecuteItem& item : items) {
       if (item.authority_shard != storage_id_ ||
           item.client_batch_id == 0 ||
-          (item.initial_placement_version != 0 &&
-           item.kind != static_cast<u32>(MutationKind::insert))) {
+          item.initial_placement_version != 0) {
         return false;
       }
     }
@@ -702,9 +701,9 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
         response_header, response, response_lease);
       if (state == TryPeerResponse::pending) {
         if (std::chrono::steady_clock::now() >= request.deadline) {
-          // The request may already have fused prepare+arm at the home.  Do
-          // not cancel or semantically abort it; post the identical request ID
-          // again so either the old or new response resolves the same entry.
+          // Prepare is token-idempotent. Do not cancel or semantically abort
+          // an uncertain request; repost the identical request ID so either
+          // response resolves the same registry entry.
           request.posted = false;
           made_progress = true;
         }
@@ -735,7 +734,7 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
         }
         cancel_peer_rpc_response(request.request_id);
         throw std::runtime_error(
-          "invalid Stage1 response under an uncertain fused mutation");
+          "invalid Stage1 response under an uncertain prepare");
       }
 
       const auto* output = stage1_execute_results(response.data());
@@ -759,8 +758,7 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
           const RemotePtr target{shard_results[index].target_raw};
           valid &= !target.is_null() &&
             target.memory_node() == request.home &&
-            (input[index].initial_placement_version == 0 ||
-             shard_results[index].maintenance_sequence != 0);
+            shard_results[index].maintenance_sequence == 0;
         }
       }
       if (!valid) {
@@ -769,7 +767,7 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
         }
         cancel_peer_rpc_response(request.request_id);
         throw std::runtime_error(
-          "malformed Stage1 result under an uncertain fused mutation");
+          "malformed Stage1 result under an uncertain prepare");
       }
       if (!acknowledge_peer_rpc_response(response_lease)) {
         request.posted = false;

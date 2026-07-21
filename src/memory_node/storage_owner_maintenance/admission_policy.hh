@@ -44,6 +44,24 @@ inline bool maintenance_queue_permit_available(
     reserved_slots < capacity - runnable_tasks;
 }
 
+// A control RPC is one admission transaction.  Claiming its queue permits
+// item-by-item can leave a partial batch runnable while the caller is still
+// waiting for the remaining items.  Those runnable tasks may in turn wait for
+// the caller's authority commit, creating a closed wait cycle.  Admit all
+// items together or leave the queue unchanged.
+inline bool maintenance_queue_batch_permit_available(
+    std::size_t runnable_tasks,
+    std::size_t reserved_slots,
+    std::size_t requested_slots,
+    std::size_t capacity) {
+  if (requested_slots == 0 || runnable_tasks > capacity ||
+      reserved_slots > capacity - runnable_tasks) {
+    return false;
+  }
+  return requested_slots <=
+    capacity - runnable_tasks - reserved_slots;
+}
+
 // Avoid calling the pressure probe when this executor cannot admit work at
 // all. The production probe may poll a shared peer CQ, so shutdown/full paths
 // must remain side-effect free.

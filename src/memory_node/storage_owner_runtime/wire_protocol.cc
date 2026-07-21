@@ -268,6 +268,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     CleanupActivateResult cleanup_result;
     bool active{};
     bool committed_replay{};
+    bool authority_committed{};
   };
   vec<MutationPlan> plans(item_count);
   dense_hashmap_t<u32, vec<size_t>> stage1_groups;
@@ -343,20 +344,14 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
     if (plan.kind == MutationKind::erase) continue;
 
-    const bool fuse_prepare_and_arm =
-      plan.kind == MutationKind::insert &&
-      plan.begin.previous.current.is_null();
-    if (fuse_prepare_and_arm) {
-      lib_assert(plan.begin.previous.placement_version !=
-                   std::numeric_limits<u64>::max(),
-                 "authority placement version overflow");
-    }
-
     plan.stage1_item = Stage1ExecuteItem{
       .client_batch_id = client_batch_id,
       .old_raw = plan.begin.previous.current.raw_address,
-      .initial_placement_version = fuse_prepare_and_arm
-        ? plan.begin.previous.placement_version + 1 : 0,
+      // Execute prepares the query-visible local node and continuation only.
+      // Arm is a separate, batch-atomic control transaction; fusing arm here
+      // lets a multi-item execute RPC partially consume the completion window
+      // before its authority can receive any sequence and commit the leases.
+      .initial_placement_version = 0,
       .source_client = source_client,
       .item_index = static_cast<u32>(index),
       .id = ids[index],
@@ -682,25 +677,60 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
 
   }
 
+  const auto commit_plan = [&](size_t index) {
+    MutationPlan& plan = plans[index];
+    if (!plan.active || plan.authority_committed) return;
+    const bool deleted = plan.kind == MutationKind::erase;
+    const RemotePtr desired = deleted
+      ? RemotePtr{} : RemotePtr{plan.stage1_result.target_raw};
+    const u64 maintenance_sequence = deleted
+      ? plan.cleanup_result.maintenance_sequence
+      : plan.arm_result.maintenance_sequence;
+    lib_assert(maintenance_sequence != 0,
+               "authority commit omitted its runnable maintenance fence");
+    const auto commit_started = std::chrono::steady_clock::now();
+    const AuthorityCommitState commit = commit_authority_mutation(
+      ids[index], plan.operation, desired, plan.begin.generation, deleted,
+      maintenance_sequence);
+    breakdown.storage_owner_publish_mutation_ns +=
+      elapsed_ns_since(commit_started);
+    lib_assert(commit == AuthorityCommitState::committed ||
+                 commit == AuthorityCommitState::replay,
+               "token-fenced authority commit lost its active lease");
+    plan.authority_committed = true;
+
+    if (statuses != nullptr) {
+      (*statuses)[index] = static_cast<u32>(MutationStatus::ok);
+    }
+    if (results != nullptr) {
+      (*results)[index] = MutationResult{
+        .new_rptr_raw = desired.raw_address,
+        .old_rptr_raw = plan.begin.previous.current.raw_address,
+        .generation = plan.begin.generation,
+        .maintenance_sequence = maintenance_sequence,
+      };
+    }
+  };
+
+  // Cleanup-only mutations do not participate in a Stage1 arm group. Commit
+  // them now so they cannot retain authority leases while an unrelated home
+  // waits for completion credit.
+  for (size_t index = 0; index < item_count; ++index) {
+    if (plans[index].active && plans[index].kind == MutationKind::erase) {
+      commit_plan(index);
+    }
+  }
+
   // Batch arm by physical home. A skewed centroid assignment therefore costs
-  // one bounded control message rather than one RTT per item. Partial arm is
-  // safe: the whole semantic batch is replayed and already-armed items return
-  // their cached sequences without allocating another descriptor.
+  // one bounded control message rather than one RTT per item. The physical
+  // home atomically reserves every new sequence in this message. Commit this
+  // home immediately after its ACK, before attempting another potentially
+  // blocking home, which removes the cross-shard hold-and-wait edge.
   dense_hashmap_t<u32, vec<size_t>> arm_groups;
   for (size_t index = 0; index < item_count; ++index) {
     MutationPlan& plan = plans[index];
     if (!plan.active || plan.kind == MutationKind::erase) continue;
-    if (plan.stage1_result.maintenance_sequence != 0) {
-      plan.arm_result = Stage1ArmResult{
-        .token = plan.operation,
-        .target_raw = plan.stage1_result.target_raw,
-        .maintenance_sequence =
-          plan.stage1_result.maintenance_sequence,
-        .status = static_cast<u32>(MutationStatus::ok),
-      };
-    } else {
-      arm_groups[plan.stage1_home].push_back(index);
-    }
+    arm_groups[plan.stage1_home].push_back(index);
   }
   for (const auto& [home, indices] : arm_groups) {
     vec<Stage1ArmItem> arm_items;
@@ -750,6 +780,9 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
         for (size_t slot = 0; slot < indices.size(); ++slot) {
           plans[indices[slot]].arm_result = arm_results[slot];
         }
+        for (const size_t index : indices) {
+          commit_plan(index);
+        }
         break;
       }
       std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
@@ -760,42 +793,12 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       elapsed_ns_since(arm_started);
   }
 
-  // Directory commit is the sole logical linearization point. Old cleanup is
-  // runnable and the new Stage1 record is both query-visible and armed before
-  // this point. A prematurely scheduled Stage2 observes the authority lease
-  // as busy at its placement CAS and retries until this commit releases it.
+  // Every active mutation must have crossed its own physical admission
+  // transaction and authority linearization point. Keeping this audit here
+  // makes it impossible to reintroduce a global commit barrier accidentally.
   for (size_t index = 0; index < item_count; ++index) {
-    MutationPlan& plan = plans[index];
-    if (!plan.active) continue;
-    const bool deleted = plan.kind == MutationKind::erase;
-    const RemotePtr desired = deleted
-      ? RemotePtr{} : RemotePtr{plan.stage1_result.target_raw};
-    const u64 maintenance_sequence = deleted
-      ? plan.cleanup_result.maintenance_sequence
-      : plan.arm_result.maintenance_sequence;
-    lib_assert(maintenance_sequence != 0,
-               "authority commit omitted its runnable maintenance fence");
-    const auto commit_started = std::chrono::steady_clock::now();
-    const AuthorityCommitState commit = commit_authority_mutation(
-      ids[index], plan.operation, desired, plan.begin.generation, deleted,
-      maintenance_sequence);
-    breakdown.storage_owner_publish_mutation_ns +=
-      elapsed_ns_since(commit_started);
-    lib_assert(commit == AuthorityCommitState::committed ||
-                 commit == AuthorityCommitState::replay,
-               "token-fenced authority commit lost its active lease");
-
-    if (statuses != nullptr) {
-      (*statuses)[index] = static_cast<u32>(MutationStatus::ok);
-    }
-    if (results != nullptr) {
-      (*results)[index] = MutationResult{
-        .new_rptr_raw = desired.raw_address,
-        .old_rptr_raw = plan.begin.previous.current.raw_address,
-        .generation = plan.begin.generation,
-        .maintenance_sequence = maintenance_sequence,
-      };
-    }
+    lib_assert(!plans[index].active || plans[index].authority_committed,
+               "active mutation escaped per-home authority commit");
   }
 
   // Release compact Stage1 receipts only after the authority commit.  For a

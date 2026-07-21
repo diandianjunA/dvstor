@@ -19,8 +19,7 @@ MemoryNode::prepare_local_stage1_item(
   if (raw_vector == nullptr || authority_shard >= num_storage_nodes_ ||
       item.authority_shard != authority_shard || item.generation == 0 ||
       (kind != MutationKind::insert && kind != MutationKind::upsert) ||
-      (item.initial_placement_version != 0 &&
-       kind != MutationKind::insert)) {
+      item.initial_placement_version != 0) {
     result.status = static_cast<u32>(MutationStatus::failed);
     return result;
   }
@@ -203,51 +202,12 @@ MemoryNode::prepare_and_maybe_arm_local_stage1_item(
     const Configuration& config,
     InsertBreakdownCounters* breakdown) {
   using namespace service::storage_owner;
-  Stage1ExecuteResult result = prepare_local_stage1_item(
+  // Stage1 execute is deliberately prepare-only.  A multi-item execute RPC
+  // cannot safely arm item-by-item because its authority receives no sequence
+  // until the whole response is returned.  The subsequent homogeneous arm
+  // RPC reserves all new completion credits atomically.
+  return prepare_local_stage1_item(
     authority_shard, item, raw_vector, config, breakdown);
-  if (result.status != static_cast<u32>(MutationStatus::ok) ||
-      item.initial_placement_version == 0) {
-    return result;
-  }
-
-  const Stage1ArmItem arm{
-    .token = {
-      .source_client = item.source_client,
-      .item_index = item.item_index,
-      .client_batch_id = item.client_batch_id,
-    },
-    .target_raw = result.target_raw,
-    .initial_placement_version = item.initial_placement_version,
-    .id = item.id,
-    .generation = item.generation,
-    .action = static_cast<u32>(Stage1ArmAction::arm),
-  };
-  vec<Stage1ArmResult> arm_results;
-  const auto arm_started = std::chrono::steady_clock::now();
-  const bool transported = arm_local_stage1_items(
-    authority_shard, span<const Stage1ArmItem>{&arm, 1},
-    arm_results, config);
-  if (breakdown != nullptr) {
-    breakdown->storage_owner_schedule_maintenance_ns +=
-      elapsed_ns_since(arm_started);
-  }
-  const bool armed = transported && arm_results.size() == 1 &&
-    arm_results.front().token.source_client == item.source_client &&
-    arm_results.front().token.item_index == item.item_index &&
-    arm_results.front().token.client_batch_id == item.client_batch_id &&
-    arm_results.front().target_raw == result.target_raw &&
-    arm_results.front().maintenance_sequence != 0 &&
-    arm_results.front().status == static_cast<u32>(MutationStatus::ok) &&
-    arm_results.front().reserved == 0;
-  if (!armed) {
-    // The prepared semantic receipt remains intact. Retrying the identical
-    // execute token resumes at arm without allocating another physical node.
-    result.status = static_cast<u32>(MutationStatus::retry);
-    result.maintenance_sequence = 0;
-    return result;
-  }
-  result.maintenance_sequence = arm_results.front().maintenance_sequence;
-  return result;
 }
 
 bool MemoryNode::try_track_stage1_inflight_request(
@@ -396,6 +356,184 @@ bool MemoryNode::arm_local_stage1_items(
     vec<RemotePtr>{}.swap(prepared.remote_frontier);
     vec<RemotePtr>{}.swap(prepared.backlink_targets);
   };
+
+  const bool arm_batch = std::all_of(
+    items.begin(), items.end(), [](const Stage1ArmItem& item) {
+      return static_cast<Stage1ArmAction>(item.action) ==
+        Stage1ArmAction::arm;
+    });
+  if (arm_batch) {
+    struct ClaimedArm {
+      size_t result_index{};
+      Stage1OperationKey key;
+      StorageOwnerMaintenanceTask task;
+    };
+    vec<ClaimedArm> claimed;
+    claimed.reserve(items.size());
+    bool structurally_valid = true;
+    bool whole_batch_claimed = true;
+
+    const auto restore_claims = [&]() {
+      for (ClaimedArm& claim : claimed) {
+        Stage1PreparedResultShard& prepared_shard =
+          stage1_prepared_results_[
+            Stage1OperationKeyHash{}(claim.key) &
+              (kStage1PreparedShardCount - 1)];
+        std::lock_guard<std::mutex> lock(prepared_shard.mutex);
+        const auto position = prepared_shard.records.find(claim.key);
+        lib_assert(position != prepared_shard.records.end() &&
+                     position->second.arming &&
+                     !position->second.armed,
+                   "atomic Stage1 arm lost its claimed receipt");
+        Stage1PreparedResult& prepared = position->second;
+        prepared.neighbors = std::move(claim.task.stage1_base_neighbors);
+        prepared.beam = std::move(claim.task.stage1_beam);
+        prepared.remote_frontier = std::move(
+          claim.task.stage1_remote_frontier);
+        prepared.backlink_targets = std::move(
+          claim.task.stage1_backlink_targets);
+        prepared.arming = false;
+        prepared.initial_placement_version = 0;
+      }
+    };
+
+    for (size_t result_index = 0; result_index < items.size();
+         ++result_index) {
+      const Stage1ArmItem& item = items[result_index];
+      Stage1ArmResult& output = results[result_index];
+      output.token = item.token;
+      output.target_raw = item.target_raw;
+      const RemotePtr declared_target{item.target_raw};
+      if (!authority::valid_authority_operation(item.token) ||
+          item.generation == 0 || item.reserved != 0 ||
+          item.initial_placement_version == 0 ||
+          !valid_local_storage_node_pointer(declared_target)) {
+        structurally_valid = false;
+        whole_batch_claimed = false;
+        continue;
+      }
+
+      const Stage1OperationKey key{
+        .authority_shard = authority_shard,
+        .source_client = item.token.source_client,
+        .item_index = item.token.item_index,
+        .client_batch_id = item.token.client_batch_id,
+      };
+      Stage1PreparedResultShard& prepared_shard =
+        stage1_prepared_results_[
+          Stage1OperationKeyHash{}(key) &
+            (kStage1PreparedShardCount - 1)];
+      std::lock_guard<std::mutex> lock(prepared_shard.mutex);
+      const auto position = prepared_shard.records.find(key);
+      if (position == prepared_shard.records.end()) {
+        whole_batch_claimed = false;
+        continue;
+      }
+      Stage1PreparedResult& prepared = position->second;
+      if (prepared.aborted ||
+          prepared.result.status != static_cast<u32>(MutationStatus::ok) ||
+          prepared.result.target_raw != item.target_raw ||
+          prepared.id != item.id ||
+          prepared.generation != item.generation ||
+          (prepared.execute_initial_placement_version != 0 &&
+           prepared.execute_initial_placement_version !=
+             item.initial_placement_version)) {
+        whole_batch_claimed = false;
+        continue;
+      }
+      if (prepared.armed) {
+        if (prepared.initial_placement_version ==
+              item.initial_placement_version &&
+            prepared.maintenance_sequence != 0) {
+          output.maintenance_sequence = prepared.maintenance_sequence;
+          output.status = static_cast<u32>(MutationStatus::ok);
+        } else {
+          whole_batch_claimed = false;
+        }
+        continue;
+      }
+      if (!prepared.prepared || prepared.arming) {
+        whole_batch_claimed = false;
+        continue;
+      }
+
+      prepared.arming = true;
+      prepared.initial_placement_version = item.initial_placement_version;
+      StorageOwnerMaintenanceTask task;
+      task.kind = StorageOwnerMaintenanceKind::finalize_insert;
+      task.id = prepared.id;
+      task.generation = prepared.generation;
+      task.target = RemotePtr{prepared.result.target_raw};
+      task.authority_shard = authority_shard;
+      task.source_client = item.token.source_client;
+      task.operation_item_index = item.token.item_index;
+      task.operation_batch_id = item.token.client_batch_id;
+      task.initial_placement_version = item.initial_placement_version;
+      task.stage1_base_neighbors = std::move(prepared.neighbors);
+      task.stage1_beam = std::move(prepared.beam);
+      task.stage1_remote_frontier = std::move(prepared.remote_frontier);
+      task.stage1_backlink_targets = std::move(
+        prepared.backlink_targets);
+      claimed.push_back(ClaimedArm{
+        .result_index = result_index,
+        .key = key,
+        .task = std::move(task),
+      });
+    }
+
+    // A semantic control RPC is all-or-nothing with respect to new
+    // completion credits.  Replays consume no credit; if any new item could
+    // not be claimed, restore every artifact and let the authority retry the
+    // same token set.
+    if (!whole_batch_claimed) {
+      restore_claims();
+      return structurally_valid;
+    }
+
+    vec<StorageOwnerMaintenanceTask> tasks;
+    tasks.reserve(claimed.size());
+    for (ClaimedArm& claim : claimed) {
+      tasks.push_back(std::move(claim.task));
+    }
+    u64 first_sequence = 0;
+    if (!tasks.empty()) {
+      first_sequence = arm_storage_owner_maintenance_batch(tasks, config);
+      if (first_sequence == 0) {
+        for (size_t item = 0; item < claimed.size(); ++item) {
+          claimed[item].task = std::move(tasks[item]);
+        }
+        restore_claims();
+        return structurally_valid;
+      }
+    }
+
+    for (size_t item = 0; item < claimed.size(); ++item) {
+      ClaimedArm& claim = claimed[item];
+      const u64 sequence = first_sequence + static_cast<u64>(item);
+      Stage1PreparedResultShard& prepared_shard =
+        stage1_prepared_results_[
+          Stage1OperationKeyHash{}(claim.key) &
+            (kStage1PreparedShardCount - 1)];
+      {
+        std::lock_guard<std::mutex> lock(prepared_shard.mutex);
+        const auto position = prepared_shard.records.find(claim.key);
+        lib_assert(position != prepared_shard.records.end() &&
+                     position->second.arming &&
+                     !position->second.armed,
+                   "atomic Stage1 arm lost its admitted receipt");
+        Stage1PreparedResult& prepared = position->second;
+        prepared.arming = false;
+        prepared.armed = true;
+        prepared.maintenance_sequence = sequence;
+        prepared.result.maintenance_sequence = sequence;
+        clear_heavy_artifact(prepared);
+      }
+      Stage1ArmResult& output = results[claim.result_index];
+      output.maintenance_sequence = sequence;
+      output.status = static_cast<u32>(MutationStatus::ok);
+    }
+    return structurally_valid;
+  }
 
   bool structurally_valid = true;
   for (size_t result_index = 0; result_index < items.size();

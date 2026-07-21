@@ -31,6 +31,206 @@ bool MemoryNode::activate_local_cleanup_items(
   results.assign(items.size(), {});
   if (authority_shard >= num_storage_nodes_ || items.empty()) return false;
 
+  const bool activation_batch = std::all_of(
+    items.begin(), items.end(), [](const protocol::CleanupActivateItem& item) {
+      return static_cast<protocol::CleanupActivateAction>(item.action) ==
+        protocol::CleanupActivateAction::activate;
+    });
+  if (activation_batch) {
+    struct CleanupClaim {
+      size_t result_index{};
+      Stage1OperationKey key;
+      protocol::CleanupActivateItem item;
+    };
+    vec<CleanupClaim> claims;
+    claims.reserve(items.size());
+    bool structurally_valid = true;
+    bool whole_batch_claimed = true;
+
+    const auto rollback_claims = [&]() {
+      for (const CleanupClaim& claim : claims) {
+        CleanupActivationDedupeShard& dedupe = cleanup_activation_dedupe_[
+          Stage1OperationKeyHash{}(claim.key) &
+            (kCleanupActivationShardCount - 1)];
+        {
+          std::lock_guard<std::mutex> lock(dedupe.mutex);
+          const auto position = dedupe.records.find(claim.key);
+          lib_assert(position != dedupe.records.end() &&
+                       position->second.in_progress &&
+                       same_cleanup_identity(position->second.item,
+                                             claim.item),
+                     "atomic cleanup activation lost its dedupe claim");
+          dedupe.records.erase(position);
+        }
+        dedupe.changed.notify_all();
+      }
+    };
+
+    for (size_t index = 0; index < items.size(); ++index) {
+      const protocol::CleanupActivateItem& item = items[index];
+      protocol::CleanupActivateResult& output = results[index];
+      output.target_raw = item.old_raw;
+      output.token = item.token;
+      output.status = static_cast<u32>(protocol::MutationStatus::failed);
+      const RemotePtr target{item.old_raw};
+      if (!authority::valid_authority_operation(item.token) ||
+          item.authority_shard != authority_shard ||
+          !valid_local_storage_node_pointer(target)) {
+        structurally_valid = false;
+        whole_batch_claimed = false;
+        continue;
+      }
+
+      const Stage1OperationKey key{
+        .authority_shard = authority_shard,
+        .source_client = item.token.source_client,
+        .item_index = item.token.item_index,
+        .client_batch_id = item.token.client_batch_id,
+      };
+      CleanupActivationDedupeShard& dedupe = cleanup_activation_dedupe_[
+        Stage1OperationKeyHash{}(key) &
+          (kCleanupActivationShardCount - 1)];
+      std::lock_guard<std::mutex> lock(dedupe.mutex);
+      auto existing = dedupe.records.find(key);
+      if (existing != dedupe.records.end() &&
+          existing->second.in_progress) {
+        // Never wait while this batch owns claims for earlier keys. Two
+        // overlapping batches with opposite key order would otherwise hold a
+        // dedupe claim each and wait for the other. Roll this batch back and
+        // let the authority retry after the in-progress owner publishes.
+        whole_batch_claimed = false;
+        continue;
+      }
+      if (existing != dedupe.records.end()) {
+        if (!same_cleanup_identity(existing->second.item, item) ||
+            existing->second.in_progress) {
+          whole_batch_claimed = false;
+        } else {
+          output = existing->second.result;
+          whole_batch_claimed &= output.status ==
+            static_cast<u32>(protocol::MutationStatus::ok);
+        }
+        continue;
+      }
+      if (dedupe.records.size() >=
+          cleanup_activation_dedupe_limit_per_shard_) {
+        whole_batch_claimed = false;
+        continue;
+      }
+      const auto [position, inserted] = dedupe.records.emplace(
+        key, CleanupActivationRecord{
+          .item = item,
+          .result = output,
+          .in_progress = true,
+        });
+      lib_assert(inserted && position->second.in_progress,
+                 "atomic cleanup activation dedupe claim failed");
+      claims.push_back(CleanupClaim{
+        .result_index = index,
+        .key = key,
+        .item = item,
+      });
+    }
+
+    if (!whole_batch_claimed) {
+      rollback_claims();
+      return structurally_valid;
+    }
+
+    vec<StorageOwnerMaintenanceTask> cleanup_tasks;
+    vec<size_t> task_claim_indices;
+    cleanup_tasks.reserve(claims.size());
+    task_claim_indices.reserve(claims.size());
+    for (size_t claim_index = 0; claim_index < claims.size();
+         ++claim_index) {
+      const CleanupClaim& claim = claims[claim_index];
+      protocol::CleanupActivateResult& output =
+        results[claim.result_index];
+      const RemotePtr target{claim.item.old_raw};
+      NodeSnapshot snapshot;
+      const bool snapshot_read = read_node_snapshot(target, snapshot);
+      if (!snapshot_read || snapshot.id != claim.item.id ||
+          snapshot.generation != claim.item.old_generation) {
+        output.status = static_cast<u32>(
+          protocol::MutationStatus::not_found);
+        continue;
+      }
+      if (snapshot.deleted) {
+        const u64 next = storage_owner_maintenance_completion_ring_ == nullptr
+          ? 0 : storage_owner_maintenance_completion_ring_->next_sequence();
+        if (next > 1) {
+          output.maintenance_sequence = next - 1;
+          output.status = static_cast<u32>(protocol::MutationStatus::ok);
+        } else {
+          output.status = static_cast<u32>(
+            protocol::MutationStatus::already_deleted);
+        }
+        continue;
+      }
+      if (!storage_owner_maintenance_enabled(config) ||
+          storage_owner_maintenance_completion_ring_ == nullptr ||
+          storage_owner_maintenance_shutdown_.load(
+            std::memory_order_acquire)) {
+        continue;
+      }
+      StorageOwnerMaintenanceTask task;
+      task.kind = StorageOwnerMaintenanceKind::cleanup_deleted_node;
+      task.id = claim.item.id;
+      task.generation = claim.item.old_generation;
+      task.target = target;
+      task.authority_shard = claim.item.authority_shard;
+      task.source_client = claim.item.token.source_client;
+      task.operation_item_index = claim.item.token.item_index;
+      task.operation_batch_id = claim.item.token.client_batch_id;
+      cleanup_tasks.push_back(std::move(task));
+      task_claim_indices.push_back(claim_index);
+    }
+
+    if (!cleanup_tasks.empty()) {
+      const u64 first_sequence = activate_storage_owner_cleanup_batch(
+        cleanup_tasks, config);
+      if (first_sequence == 0) {
+        rollback_claims();
+        return structurally_valid;
+      }
+      for (size_t task_index = 0;
+           task_index < task_claim_indices.size(); ++task_index) {
+        protocol::CleanupActivateResult& output = results[
+          claims[task_claim_indices[task_index]].result_index];
+        output.maintenance_sequence =
+          first_sequence + static_cast<u64>(task_index);
+        output.status = static_cast<u32>(protocol::MutationStatus::ok);
+      }
+    }
+
+    bool success = true;
+    for (const CleanupClaim& claim : claims) {
+      protocol::CleanupActivateResult& output =
+        results[claim.result_index];
+      const auto item_status = static_cast<protocol::MutationStatus>(
+        output.status);
+      CleanupActivationDedupeShard& dedupe = cleanup_activation_dedupe_[
+        Stage1OperationKeyHash{}(claim.key) &
+          (kCleanupActivationShardCount - 1)];
+      {
+        std::lock_guard<std::mutex> lock(dedupe.mutex);
+        const auto position = dedupe.records.find(claim.key);
+        lib_assert(position != dedupe.records.end() &&
+                     position->second.in_progress,
+                   "atomic cleanup activation lost its result receipt");
+        if (item_status != protocol::MutationStatus::failed) {
+          position->second.result = output;
+          position->second.in_progress = false;
+        } else {
+          dedupe.records.erase(position);
+        }
+      }
+      dedupe.changed.notify_all();
+      success &= item_status == protocol::MutationStatus::ok;
+    }
+    return success;
+  }
+
   bool success = true;
   for (size_t index = 0; index < items.size(); ++index) {
     const protocol::CleanupActivateItem& item = items[index];

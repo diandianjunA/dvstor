@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -314,6 +315,78 @@ void test_sliding_completion_ring_bounded_smooth_admission() {
   }
 }
 
+void test_sliding_completion_ring_concurrent_batches_never_partially_admit() {
+  constexpr size_t kBatches = 4;
+  constexpr size_t kBatchItems = 2;
+  constexpr size_t kAdmissionWindow = kBatchItems;
+  bounded::SlidingCompletionRing ring(kBatches * kBatchItems);
+  const std::array<u32, kBatchItems> work{1, 1};
+
+  // All producers enter reserve_batch together.  The admission window can
+  // hold exactly one foreground RPC batch, so a per-item reservation scheme
+  // could let two producers retain one sequence each and deadlock forever.
+  // Atomic batch admission must instead publish exactly one complete pair.
+  std::barrier start(static_cast<std::ptrdiff_t>(kBatches + 1));
+  std::array<std::future<u64>, kBatches> reservations;
+  for (auto& reservation : reservations) {
+    reservation = std::async(std::launch::async, [&]() {
+      start.arrive_and_wait();
+      return ring.reserve_batch(
+        span<const u32>{work.data(), work.size()}, kAdmissionWindow);
+    });
+  }
+  start.arrive_and_wait();
+
+  std::array<bool, kBatches> consumed{};
+  for (size_t admitted_batches = 0;
+       admitted_batches < kBatches;
+       ++admitted_batches) {
+    const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    size_t ready_count = 0;
+    size_t ready_index = kBatches;
+    do {
+      ready_count = 0;
+      ready_index = kBatches;
+      for (size_t index = 0; index < kBatches; ++index) {
+        if (consumed[index]) continue;
+        if (reservations[index].wait_for(std::chrono::milliseconds(0)) ==
+            std::future_status::ready) {
+          ++ready_count;
+          ready_index = index;
+        }
+      }
+      if (ready_count == 0) std::this_thread::yield();
+    } while (ready_count == 0 &&
+             std::chrono::steady_clock::now() < deadline);
+
+    // Exactly one producer can commit while the previous pair is live.  In
+    // particular, no blocked producer may advance next_sequence by one.
+    assert(ready_count == 1);
+    const u64 first_sequence = reservations[ready_index].get();
+    consumed[ready_index] = true;
+    assert(first_sequence == admitted_batches * kBatchItems + 1);
+    assert(ring.next_sequence() == first_sequence + kBatchItems);
+    assert(ring.outstanding() == kBatchItems);
+    for (size_t index = 0; index < kBatches; ++index) {
+      if (consumed[index]) continue;
+      assert(reservations[index].wait_for(std::chrono::milliseconds(0)) ==
+             std::future_status::timeout);
+    }
+
+    // Completion may arrive out of order, but admission credit is released
+    // only after the complete contiguous pair has finalized.  That release
+    // must wake one of the remaining batches and guarantee forward progress.
+    ring.complete(first_sequence + 1);
+    assert(ring.finalized() == first_sequence - 1);
+    assert(ring.outstanding() == kBatchItems);
+    ring.complete(first_sequence);
+    assert(ring.finalized() == first_sequence + 1);
+  }
+  assert(ring.finalized() == kBatches * kBatchItems);
+  assert(ring.outstanding() == 0);
+}
+
 void test_integral_raw_stage2_distance_is_exact() {
   constexpr u32 dim = 128;
 
@@ -524,6 +597,58 @@ void test_stage1_arm_queue_permit_cannot_be_stolen() {
   assert(!maintenance_queue_permit_available(0, 0, 0));
 }
 
+void test_stage1_arm_batch_queue_permit_is_atomic_and_bounded() {
+  using memory_node_storage_owner_maintenance_detail::
+    maintenance_queue_batch_permit_available;
+  using memory_node_storage_owner_maintenance_detail::
+    maintenance_queue_permit_available;
+
+  constexpr size_t capacity = 8;
+  constexpr size_t runnable = 3;
+  constexpr size_t reserved = 2;
+  constexpr size_t remaining = capacity - runnable - reserved;
+  static_assert(remaining == 3);
+
+  // An entire control-RPC batch can claim the exact remaining capacity, but
+  // it cannot partially reserve a batch that is one item too large.
+  assert(maintenance_queue_batch_permit_available(
+    runnable, reserved, remaining, capacity));
+  assert(!maintenance_queue_batch_permit_available(
+    runnable, reserved, remaining + 1, capacity));
+  assert(!maintenance_queue_batch_permit_available(
+    runnable, reserved, 0, capacity));
+
+  // Reject inconsistent snapshots before performing any unsigned capacity
+  // subtraction: runnable work cannot exceed the queue, and reservations
+  // cannot exceed the capacity left by runnable work.
+  assert(!maintenance_queue_batch_permit_available(9, 0, 1, capacity));
+  assert(!maintenance_queue_batch_permit_available(6, 3, 1, capacity));
+  assert(!maintenance_queue_batch_permit_available(8, 1, 1, capacity));
+  assert(!maintenance_queue_batch_permit_available(0, 0, 1, 0));
+
+  // Batch and legacy single-slot permits share one reserved-slots account.
+  // One pre-existing single-slot permit plus a two-item batch exactly fills
+  // this queue; after accounting for that batch no producer can steal a slot.
+  constexpr size_t shared_capacity = 5;
+  constexpr size_t shared_runnable = 2;
+  constexpr size_t single_reserved = 1;
+  assert(maintenance_queue_permit_available(
+    shared_runnable, single_reserved, shared_capacity));
+  assert(maintenance_queue_batch_permit_available(
+    shared_runnable, single_reserved, 2, shared_capacity));
+  constexpr size_t all_reserved = single_reserved + 2;
+  assert(!maintenance_queue_permit_available(
+    shared_runnable, all_reserved, shared_capacity));
+  assert(!maintenance_queue_batch_permit_available(
+    shared_runnable, all_reserved, 1, shared_capacity));
+
+  // Releasing either kind of permit exposes the same single slot again.
+  assert(maintenance_queue_permit_available(
+    shared_runnable, all_reserved - 1, shared_capacity));
+  assert(maintenance_queue_batch_permit_available(
+    shared_runnable, all_reserved - 1, 1, shared_capacity));
+}
+
 void test_reverse_candidate_is_revalidated_at_locked_write_boundary() {
   const RemotePtr candidate{1, 4096};
   const vec<RemotePtr> current_neighbors;
@@ -684,6 +809,7 @@ int main() {
   test_sliding_completion_ring();
   test_sliding_completion_ring_atomic_batch_admission();
   test_sliding_completion_ring_bounded_smooth_admission();
+  test_sliding_completion_ring_concurrent_batches_never_partially_admit();
   test_integral_raw_stage2_distance_is_exact();
   test_wide_integral_simd_distance_never_overflows();
   test_stale_stage2_sequence_handoff_to_bounded_repair();
@@ -691,6 +817,7 @@ int main() {
   test_stage2_admission_yields_only_for_live_foreground_pressure();
   test_stage2_pressure_retains_a_dedicated_progress_floor();
   test_stage1_arm_queue_permit_cannot_be_stolen();
+  test_stage1_arm_batch_queue_permit_is_atomic_and_bounded();
   test_reverse_candidate_is_revalidated_at_locked_write_boundary();
   test_reverse_overflow_uses_alpha_robust_prune_not_nearest_r();
   test_stage2_rebase_preserves_post_stage1_reverse_edge();

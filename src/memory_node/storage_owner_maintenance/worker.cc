@@ -2401,8 +2401,17 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         storage_owner_cleanup_tasks_.front().maintenance_sequence) &&
       admission_now >=
         storage_owner_cleanup_tasks_.front().retry_not_before;
+    // A context is the unit across which vector and graph snapshots are
+    // coalesced.  Consuming the first descriptor immediately leaves the
+    // advertised compaction delay unused and turns every insertion into its
+    // own RDMA wave.  Wait only while the oldest descriptor is younger than
+    // the bounded delay; a full batch and an aged tail are always runnable.
+    const bool stage2_ready = !storage_owner_stage2_tasks_.empty() &&
+      (storage_owner_stage2_tasks_.size() >= batch_limit ||
+       elapsed_ns_since(storage_owner_stage2_tasks_.front().queued_at) >=
+         kStage2CompactionMaxDelayNs);
     const bool choose_stage2 =
-      !storage_owner_stage2_tasks_.empty() &&
+      stage2_ready &&
       (!cleanup_ready || storage_owner_stage2_tasks_.front().queued_at <=
                             storage_owner_cleanup_tasks_.front().queued_at);
     if (!choose_stage2 && !cleanup_ready) {
