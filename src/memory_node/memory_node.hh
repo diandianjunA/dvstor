@@ -655,6 +655,14 @@ private:
     node_t id,
     const AuthorityDirectoryState& state);
   u64 load_local_node_header_acquire(RemotePtr rptr) const;
+  bool read_locked_node_identity(RemotePtr rptr,
+                                 u64& header,
+                                 node_t& id,
+                                 u32& generation);
+  bool publish_locked_node_header(RemotePtr rptr,
+                                  u64 observed_header,
+                                  u64 set_flags,
+                                  u64 clear_flags);
   bool valid_local_storage_node_pointer(RemotePtr rptr) const;
   bool read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot);
   bool storage_owner_node_live(RemotePtr rptr);

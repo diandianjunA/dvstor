@@ -5,6 +5,14 @@
 
 namespace gpu_search::persistent_kernel_detail {
 
+#ifdef DVSTOR_HAVE_GPUNETIO
+__device__ __forceinline__ void record_owner_watchdog_counter(
+    unsigned long long* counter) {
+  if (counter == nullptr) return;
+  atomicAdd(counter, 1ULL);
+}
+#endif
+
 __device__ __forceinline__ f32 storage_component(
     const PersistentKernelParams& params, const u8* vector, u32 dimension) {
   if (params.vector_dtype == 0) return reinterpret_cast<const f32*>(vector)[dimension];
@@ -133,7 +141,9 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
   if (params.direct_qps[qp_index] == nullptr) return -EINVAL;
   if (params.direct_batch_queues != nullptr && owner_completion != nullptr) {
     if (qp_index >= params.direct_batch_queue_count) return -EINVAL;
-    const u64 started = global_time_ns();
+    DirectOwnerProgress* watchdog_progress =
+      params.direct_owner_progress == nullptr
+        ? nullptr : params.direct_owner_progress + qp_index;
     if (owner_progress != nullptr) {
       *reinterpret_cast<volatile u32*>(owner_progress) = 2;
       __threadfence_system();
@@ -149,23 +159,30 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
       .memory_node = memory_node,
       .bytes = bytes,
     };
+    // Announce before attempting the bounded enqueue. This also covers an
+    // owner that stopped before dequeueing enough entries to free a ring slot.
+    // Cancellation before publication balances the monotonic counters below.
+    if (watchdog_progress != nullptr) {
+      record_owner_watchdog_counter(&watchdog_progress->announced);
+    }
     while (!device_ring_try_push(params.direct_batch_queues[qp_index], descriptor)) {
       if (*reinterpret_cast<const volatile u32*>(params.stop) != 0) {
         atomicExch(owner_completion, -ECANCELED);
+        if (watchdog_progress != nullptr) {
+          record_owner_watchdog_counter(&watchdog_progress->completed);
+        }
         return -ECANCELED;
       }
       if (*reinterpret_cast<const volatile u32*>(params.direct_disabled) != 0) {
         atomicExch(owner_completion, -EHOSTDOWN);
+        if (watchdog_progress != nullptr) {
+          record_owner_watchdog_counter(&watchdog_progress->completed);
+        }
         return -EHOSTDOWN;
       }
-      if (global_time_ns() - started >= params.direct_timeout_ns) {
-        atomicExch(owner_completion, -ETIMEDOUT);
-        if (params.direct_error != nullptr) {
-          atomicCAS(params.direct_error, 0, -ETIMEDOUT);
-        }
-        atomicExch(params.direct_disabled, 1u);
-        return -ETIMEDOUT;
-      }
+      // A full descriptor ring is bounded backpressure, not evidence that the
+      // QP has failed.  The owner warp is the sole WQE/CQ authority and its CQ
+      // watchdog below is responsible for declaring a transport failure.
       device_ring_relax(128);
     }
     if (owner_progress != nullptr) {
@@ -180,13 +197,9 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
       if (*reinterpret_cast<const volatile u32*>(params.direct_disabled) != 0) {
         return -EHOSTDOWN;
       }
-      if (global_time_ns() - started >= params.direct_timeout_ns) {
-        if (params.direct_error != nullptr) {
-          atomicCAS(params.direct_error, 0, -ETIMEDOUT);
-        }
-        atomicExch(params.direct_disabled, 1u);
-        return -ETIMEDOUT;
-      }
+      // Waiting behind already admitted bounded work is normal under load.
+      // Only the owner that posts the WQE may turn a missing/error CQE into a
+      // global fail-stop transition.
       device_ring_relax(128);
     }
   }
@@ -262,7 +275,6 @@ __device__ i32 wait_direct_batch(const PersistentKernelParams& params,
                                  i32* owner_completion) {
 #ifdef DVSTOR_HAVE_GPUNETIO
   if (owner_completion == nullptr) return -EINVAL;
-  const u64 started = global_time_ns();
   for (;;) {
     const i32 status = *reinterpret_cast<volatile i32*>(owner_completion);
     if (status != -EINPROGRESS) return status;
@@ -272,13 +284,9 @@ __device__ i32 wait_direct_batch(const PersistentKernelParams& params,
     if (*reinterpret_cast<const volatile u32*>(params.direct_disabled) != 0) {
       return -EHOSTDOWN;
     }
-    if (global_time_ns() - started >= params.direct_timeout_ns) {
-      if (params.direct_error != nullptr) {
-        atomicCAS(params.direct_error, 0, -ETIMEDOUT);
-      }
-      atomicExch(params.direct_disabled, 1u);
-      return -ETIMEDOUT;
-    }
+    // This descriptor is already owned by a bounded owner queue.  Queueing
+    // delay must not poison every query; the posting owner enforces the actual
+    // CQ timeout and publishes a transport-wide failure when appropriate.
     device_ring_relax(128);
   }
 #else

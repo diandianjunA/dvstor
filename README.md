@@ -188,8 +188,9 @@ OPQ/PQ32 模型和
 ./experiment/stop_memory_nodes.sh
 ```
 
-Benchmark 并发使用独立的 `BENCHMARK_CLIENT_THREADS`，不写入索引/系统 profile；
-例如 `BENCHMARK_CLIENT_THREADS=128 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio`。
+Benchmark 并发使用独立的 `BENCHMARK_CLIENT_THREADS`，不写入索引/系统 profile。
+默认 `auto` 由 GPU query slots 和分片 RPC depth 的有界容量推导；显式整数值用于
+并发/延迟扫描，详细语义见 [`experiment/README.md`](experiment/README.md#召回率与性能)。
 标准的 10K `query.u8bin` 只用于 recall 检查。吞吐阶段使用独立的
 `PERFORMANCE_QUERY_FILE`，并从 warmup 到 measure 单遍消费；文件耗尽会直接失败，
 不会回绕重复。默认性能查询集是 `bigann_base.bvecs` 的 `[100M,110M)`，插入集是

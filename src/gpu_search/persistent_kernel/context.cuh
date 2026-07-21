@@ -28,6 +28,7 @@ inline constexpr u32 kApproximateSortItemsWide =
 inline constexpr u32 kApproximateSortThreadsCompact = 128;
 inline constexpr u32 kApproximateSortItemsCompactPass = 8;
 inline constexpr u32 kApproximateSortItemsCompactFinal = 2;
+inline constexpr u32 kApproximateSortItemsCompactFinal256 = 4;
 
 using ApproximateBlockSortWide = cub::BlockRadixSort<
   f32, kApproximateSortThreadsWide, kApproximateSortItemsWide, u64>;
@@ -35,5 +36,14 @@ using ApproximateBlockSortCompactPass = cub::BlockRadixSort<
   f32, kApproximateSortThreadsCompact, kApproximateSortItemsCompactPass, u64>;
 using ApproximateBlockSortCompactFinal = cub::BlockRadixSort<
   f32, kApproximateSortThreadsCompact, kApproximateSortItemsCompactFinal, u64>;
+using ApproximateBlockSortCompactFinal256 = cub::BlockRadixSort<
+  f32, kApproximateSortThreadsCompact,
+  kApproximateSortItemsCompactFinal256, u64>;
+
+// The 1024-item pass remains the largest compact-sort temporary.  Supporting
+// the 512-item final merge therefore does not increase per-query shared memory
+// (and cannot reduce the resident beam-128 CTA count).
+static_assert(sizeof(ApproximateBlockSortCompactFinal256::TempStorage) <=
+              sizeof(ApproximateBlockSortCompactPass::TempStorage));
 
 }  // namespace gpu_search::persistent_kernel_detail

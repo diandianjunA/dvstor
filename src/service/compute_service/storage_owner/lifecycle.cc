@@ -50,6 +50,11 @@ void ComputeService::start_storage_insert_runtime() {
     static_cast<u32>(total_task_capacity_u64));
   storage_completion_samples_ =
     std::make_unique<service::breakdown::Sample[]>(total_task_capacity_u64);
+  storage_maintenance_targets_ =
+    std::make_unique<std::atomic<u64>[]>(owner_count);
+  for (u32 shard = 0; shard < owner_count; ++shard) {
+    storage_maintenance_targets_[shard].store(0, std::memory_order_relaxed);
+  }
 
   storage_insert_owners_.reserve(owner_count);
   for (u32 owner = 0; owner < owner_count; ++owner) {
@@ -176,4 +181,5 @@ void ComputeService::release_storage_insert_runtime() {
   storage_released_slots_.reset();
   storage_completion_pool_.reset();
   storage_completion_samples_.reset();
+  storage_maintenance_targets_.reset();
 }

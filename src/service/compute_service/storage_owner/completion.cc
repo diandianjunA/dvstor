@@ -159,6 +159,9 @@ void ComputeService::commit_storage_owner_slot(
 
   const u32* statuses =
     service::storage_owner::response_statuses(response_buffer);
+  const auto* mutation_results =
+    service::storage_owner::response_mutation_results(
+      response_buffer, slot.item_count);
   bool collect_breakdown = false;
   for (const u32 task_id : slot.tasks) {
     collect_breakdown = collect_breakdown ||
@@ -203,6 +206,24 @@ void ComputeService::commit_storage_owner_slot(
     auto& task = state.tasks[task_id];
     auto& sample = storage_completion_samples_[task.completion_id];
     const bool committed = response_ok && statuses[i] == 0;
+    if (committed && mutation_results[i].maintenance_sequence != 0 &&
+        storage_maintenance_targets_ != nullptr) {
+      const RemotePtr new_pointer{mutation_results[i].new_rptr_raw};
+      const RemotePtr old_pointer{mutation_results[i].old_rptr_raw};
+      const RemotePtr maintenance_home =
+        !new_pointer.is_null() ? new_pointer : old_pointer;
+      if (!maintenance_home.is_null() &&
+          maintenance_home.memory_node() < num_servers_) {
+        auto& target =
+          storage_maintenance_targets_[maintenance_home.memory_node()];
+        u64 observed = target.load(std::memory_order_relaxed);
+        while (observed < mutation_results[i].maintenance_sequence &&
+               !target.compare_exchange_weak(
+                 observed, mutation_results[i].maintenance_sequence,
+                 std::memory_order_release, std::memory_order_relaxed)) {
+        }
+      }
+    }
     if (response_ok && !committed) {
       static std::atomic<u32> failed_status_logs{0};
       const u32 log_index = failed_status_logs.fetch_add(

@@ -1,9 +1,12 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 
 #include "common/bounded_queue.hh"
 #include "common/types.hh"
@@ -63,6 +66,27 @@ public:
       observed = state.load(std::memory_order_acquire);
     }
     return static_cast<Result>(observed);
+  }
+
+  template <typename Rep, typename Period>
+  Result wait_for(
+      u32 id, std::chrono::duration<Rep, Period> timeout) const {
+    validate(id);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    auto& state = cells_[id].state;
+    for (;;) {
+      const Result observed = static_cast<Result>(
+        state.load(std::memory_order_acquire));
+      if (observed != Result::pending) return observed;
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) return Result::pending;
+      const auto remaining = deadline - now;
+      // C++20 atomic::wait has no timed form. A short bounded sleep avoids a
+      // waiter object per cell and completion-side mutex contention.
+      std::this_thread::sleep_for(std::min(
+        remaining, std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::microseconds(50))));
+    }
   }
 
   void complete(u32 id, bool success) {

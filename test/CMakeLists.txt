@@ -149,6 +149,23 @@ dvstor_target_common_includes(partition_local_search_test)
 target_compile_options(partition_local_search_test PRIVATE -UNDEBUG)
 add_test(NAME partition_local_search_test COMMAND partition_local_search_test)
 
+add_executable(persistent_grid_plan_test persistent_grid_plan_test.cc)
+dvstor_target_common_includes(persistent_grid_plan_test)
+target_compile_options(persistent_grid_plan_test PRIVATE -UNDEBUG)
+add_test(NAME persistent_grid_plan_test COMMAND persistent_grid_plan_test)
+
+add_executable(persistent_owner_watchdog_test
+    persistent_owner_watchdog_test.cc)
+dvstor_target_common_includes(persistent_owner_watchdog_test)
+target_compile_options(persistent_owner_watchdog_test PRIVATE -UNDEBUG)
+add_test(NAME persistent_owner_watchdog_test
+         COMMAND persistent_owner_watchdog_test)
+
+add_executable(maintenance_fence_test maintenance_fence_test.cc)
+dvstor_target_common_includes(maintenance_fence_test)
+target_compile_options(maintenance_fence_test PRIVATE -UNDEBUG)
+add_test(NAME maintenance_fence_test COMMAND maintenance_fence_test)
+
 if (TARGET dvstor_gpu_kernels)
     add_executable(gpu_centroid_route_ranking_test
         gpu_centroid_route_ranking_test.cu)
@@ -163,6 +180,19 @@ if (TARGET dvstor_gpu_kernels)
         TIMEOUT 15
         SKIP_REGULAR_EXPRESSION "^SKIP:")
 
+    add_executable(gpu_compact_beam_merge_test
+        gpu_compact_beam_merge_test.cu)
+    dvstor_target_common_includes(gpu_compact_beam_merge_test)
+    target_link_libraries(gpu_compact_beam_merge_test PRIVATE CUDA::cudart)
+    target_compile_options(gpu_compact_beam_merge_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+    add_test(NAME gpu_compact_beam_merge_test
+        COMMAND gpu_compact_beam_merge_test)
+    set_tests_properties(gpu_compact_beam_merge_test PROPERTIES
+        TIMEOUT 15
+        SKIP_REGULAR_EXPRESSION "^SKIP:")
+
     add_executable(gpu_persistent_dispatch_test gpu_persistent_dispatch_test.cc)
     target_link_libraries(gpu_persistent_dispatch_test PRIVATE dvstor_runtime)
     add_test(NAME gpu_persistent_dispatch_test COMMAND gpu_persistent_dispatch_test)
@@ -172,6 +202,11 @@ if (TARGET dvstor_gpu_kernels)
     add_test(NAME gpu_persistent_dispatch_pq32_test
         COMMAND gpu_persistent_dispatch_test 1024 10 8 32)
     set_tests_properties(gpu_persistent_dispatch_pq32_test PROPERTIES
+        TIMEOUT 15
+        SKIP_REGULAR_EXPRESSION "^SKIP:")
+    add_test(NAME gpu_persistent_dispatch_256_test
+        COMMAND gpu_persistent_dispatch_test 128 10 8 32 256)
+    set_tests_properties(gpu_persistent_dispatch_256_test PROPERTIES
         TIMEOUT 15
         SKIP_REGULAR_EXPRESSION "^SKIP:")
 endif ()
@@ -197,6 +232,13 @@ dvstor_target_common_includes(incarnation_lock_test)
 target_link_libraries(incarnation_lock_test PRIVATE Threads::Threads)
 target_compile_options(incarnation_lock_test PRIVATE -UNDEBUG)
 add_test(NAME incarnation_lock_test COMMAND incarnation_lock_test)
+
+add_executable(stage2_remote_publication_test
+    stage2_remote_publication_test.cc)
+dvstor_target_common_includes(stage2_remote_publication_test)
+target_compile_options(stage2_remote_publication_test PRIVATE -UNDEBUG)
+add_test(NAME stage2_remote_publication_test
+         COMMAND stage2_remote_publication_test)
 
 add_executable(storage_owner_protocol_test storage_owner_protocol_test.cc)
 target_link_libraries(storage_owner_protocol_test PRIVATE dvstor_runtime)

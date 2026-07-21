@@ -300,10 +300,14 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
 }
 
 __device__ void complete_direct_batch(const DirectBatchDescriptor& descriptor,
-                                      i32 status) {
+                                      i32 status,
+                                      DirectOwnerProgress* owner_progress) {
   if (descriptor.completion_status == nullptr) return;
   __threadfence_system();
   atomicExch(descriptor.completion_status, status);
+  if (owner_progress != nullptr) {
+    record_owner_watchdog_counter(&owner_progress->completed);
+  }
 }
 
 __device__ void direct_read_owner_loop(PersistentKernelParams params,
@@ -366,6 +370,9 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
   u32 deferred_matching = 0;
   bool have_deferred = false;
   bool trace_first_batch = true;
+  DirectOwnerProgress* owner_progress = params.direct_owner_progress == nullptr
+    ? nullptr : params.direct_owner_progress + warp;
+  u64 last_heartbeat_ns = 0;
 
   if (lane == 0 && params.direct_owner_phases != nullptr) {
     params.direct_owner_phases[warp] = 1;
@@ -381,6 +388,21 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
     if (__shfl_sync(0xffffffffu, stop_requested, 0) != 0) break;
 
     if (lane == 0) {
+      if (owner_progress != nullptr) {
+        const u64 announced = *reinterpret_cast<const volatile u64*>(
+          &owner_progress->announced);
+        const u64 completed = *reinterpret_cast<const volatile u64*>(
+          &owner_progress->completed);
+        const u64 now_ns = global_time_ns();
+        const u64 half_timeout_ns = params.direct_timeout_ns / 2;
+        const u64 heartbeat_period_ns = half_timeout_ns < u64{1'000'000}
+          ? u64{1'000'000} : half_timeout_ns;
+        if (announced != completed &&
+            now_ns - last_heartbeat_ns >= heartbeat_period_ns) {
+          record_owner_watchdog_counter(&owner_progress->heartbeat);
+          last_heartbeat_ns = now_ns;
+        }
+      }
       u32 batch_count = 0;
       u32 total_wqes = 0;
       while (batch_count < max_submit_batches) {
@@ -393,6 +415,9 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
         } else if (!device_ring_try_pop(queue, descriptor)) {
           break;
         } else {
+          if (owner_progress != nullptr) {
+            record_owner_watchdog_counter(&owner_progress->dequeued);
+          }
           if (trace_first_batch && params.direct_owner_phases != nullptr) {
             params.direct_owner_phases[warp] = 2;
             __threadfence_system();
@@ -412,16 +437,16 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
         if (descriptor.memory_node != memory_node || matching == 0 ||
             descriptor.bytes == 0 ||
             descriptor.bytes > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE) {
-          complete_direct_batch(descriptor, -EINVAL);
+          complete_direct_batch(descriptor, -EINVAL, owner_progress);
           continue;
         }
         if (*reinterpret_cast<const volatile u32*>(params.direct_disabled) != 0) {
-          complete_direct_batch(descriptor, -EHOSTDOWN);
+          complete_direct_batch(descriptor, -EHOSTDOWN, owner_progress);
           continue;
         }
         const u32 needed = matching + (need_dump ? 1u : 0u);
         if (needed > qp->sq_wqe_num) {
-          complete_direct_batch(descriptor, -E2BIG);
+          complete_direct_batch(descriptor, -E2BIG, owner_progress);
           continue;
         }
         if (batch_count != 0 && total_wqes + needed > qp->sq_wqe_num) {
@@ -515,7 +540,8 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
                                   params.direct_timeout_ns, params.stop,
                                   params.direct_disabled);
         }
-        complete_direct_batch(shared_batches[warp_in_block][batch], status);
+        complete_direct_batch(shared_batches[warp_in_block][batch], status,
+                              owner_progress);
       }
       if (trace_first_batch && params.direct_owner_phases != nullptr) {
         params.direct_owner_phases[warp] = status == 0 ? 6u : 5u;

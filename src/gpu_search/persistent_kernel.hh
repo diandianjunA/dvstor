@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 
 #include "gpu_search/device_ring.cuh"
@@ -22,7 +23,6 @@ inline constexpr u32 kPersistentMaxMergeCandidates = 2048;
 // status workspaces cover that complete addressable range so a valid 64-shard
 // index never becomes GPU-incompatible at runtime.
 inline constexpr u32 kPersistentMaxShards = 64;
-inline constexpr u32 kPersistentQueryThreads = 256;
 inline constexpr u32 kPersistentGraphReadBytes = 2048;
 inline constexpr u64 kInvalidDeviceHandle = ~u64{0};
 inline constexpr u32 kRemoteOffsetUnitBits = 34;
@@ -121,6 +121,20 @@ struct DirectBatchDescriptor {
   u32 reserved{};
 };
 
+// One cache-line-isolated device progress record per exclusive QP owner. GPU
+// threads update these monotonic counters in local device memory; the host
+// watchdog periodically copies the compact array only while queries are
+// pending. Keeping this off mapped host memory avoids a PCIe atomic per batch.
+struct alignas(64) DirectOwnerProgress {
+  unsigned long long announced{};
+  unsigned long long dequeued{};
+  unsigned long long completed{};
+  unsigned long long heartbeat{};
+  unsigned long long reserved[4]{};
+};
+
+static_assert(sizeof(DirectOwnerProgress) == 64);
+
 struct PersistentKernelParams {
   DeviceRingView<QueryDescriptor> submissions;
   DeviceRingView<QueryDescriptor> device_submissions;
@@ -170,6 +184,7 @@ struct PersistentKernelParams {
   i32* direct_batch_statuses{};
   u32 direct_batch_queue_count{};
   u32* direct_owner_phases{};
+  DirectOwnerProgress* direct_owner_progress{};
   u8* direct_dump{};
   u32* direct_disabled{};
   i32* direct_error{};
@@ -206,6 +221,18 @@ struct PersistentKernelParams {
   u32* result_ids{};
   f32* result_distances{};
 };
+
+struct PersistentKernelOccupancy {
+  u32 active_blocks_per_sm{};
+  u32 registers_per_thread{};
+  size_t static_shared_bytes{};
+  u32 max_threads_per_block{};
+};
+
+// Query the resource footprint of the exact unified kernel binary.  An
+// analytical register-only estimate is not sufficient because CUDA also
+// accounts for allocation granularity and every other per-CTA resource.
+PersistentKernelOccupancy inspect_persistent_search_kernel(u32 threads);
 
 void launch_persistent_search(cudaStream_t stream, const PersistentKernelParams& params,
                               u32 blocks, u32 threads);

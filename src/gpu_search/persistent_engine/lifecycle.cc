@@ -122,6 +122,13 @@ void PersistentSearchEngine::Impl::start_persistent_kernel() {
              "cudaMemset(GPU navigation direct error)");
   (void)cudaGetLastError();
   std::fill_n(direct_owner_phases_host, direct_batch_queue_count, 0u);
+  std::fill_n(direct_owner_progress_host, direct_batch_queue_count,
+              DirectOwnerProgress{});
+  check_cuda(cudaMemset(
+               d_direct_owner_progress, 0,
+               static_cast<size_t>(direct_batch_queue_count) *
+                 sizeof(DirectOwnerProgress)),
+             "cudaMemset(GPUNetIO owner watchdog progress)");
   *query_kernel_ready_host = 0;
   *dispatcher_kernel_ready_host = 0;
   *control_kernel_ready_host = 0;
@@ -132,9 +139,42 @@ void PersistentSearchEngine::Impl::start_persistent_kernel() {
   launch_params.query_kernel_ready_count = d_query_kernel_ready;
   launch_params.dispatcher_kernel_ready_count = d_dispatcher_kernel_ready;
   launch_params.control_kernel_ready_count = d_control_kernel_ready;
-  const u32 total_blocks = owner_kernel_blocks + kernel_blocks + 2;
+  const PersistentGridCandidate& selected = persistent_grid_plan.selected;
+  const u32 total_blocks = selected.total_blocks;
+  if (kernel_threads != selected.threads ||
+      owner_kernel_blocks != selected.owner_blocks ||
+      kernel_blocks != selected.query_blocks ||
+      total_blocks != owner_kernel_blocks + kernel_blocks +
+                        kPersistentControlBlocks ||
+      total_blocks > selected.grid_capacity) {
+    throw std::logic_error("persistent GPU grid plan changed before launch");
+  }
+  for (const PersistentGridCandidate& candidate :
+       persistent_grid_plan.candidates) {
+    std::cerr << "[gpu-search] persistent occupancy candidate threads="
+              << candidate.threads
+              << " hardware_blocks_per_sm="
+              << candidate.hardware_blocks_per_sm
+              << " configured_cap="
+              << config.gpu_persistent_blocks_per_sm
+              << " effective_blocks_per_sm="
+              << candidate.effective_blocks_per_sm
+              << " grid_capacity=" << candidate.grid_capacity
+              << " owner_blocks=" << candidate.owner_blocks
+              << " query_blocks=" << candidate.query_blocks
+              << " resident_query_warps="
+              << candidate.resident_query_warps
+              << " selected=" << std::boolalpha
+              << (candidate.threads == kernel_threads) << '\n';
+  }
+  std::cerr << "[gpu-search] persistent kernel resources registers/thread="
+            << persistent_kernel_occupancy.registers_per_thread
+            << " static_shared_bytes="
+            << persistent_kernel_occupancy.static_shared_bytes
+            << " max_threads/block="
+            << persistent_kernel_occupancy.max_threads_per_block << '\n';
   launch_persistent_search(kernel_stream, launch_params, total_blocks,
-                           kPersistentQueryThreads);
+                           kernel_threads);
   check_cuda(cudaGetLastError(), "launch_persistent_search(unified navigation)");
 
   const auto ready_deadline = std::chrono::steady_clock::now() +
@@ -190,8 +230,10 @@ void PersistentSearchEngine::Impl::start_persistent_kernel() {
             << "-owner+" << kernel_blocks
             << "-query+1-dispatch+1-control"
             << " QP-owner-warps=" << direct_batch_queue_count
-            << " threads/CTA=" << kPersistentQueryThreads
-            << " query_slots=" << query_slots << '\n';
+            << " threads/CTA=" << kernel_threads
+            << " query_slots=" << query_slots
+            << " resident_capacity=" << selected.grid_capacity
+            << " launched=" << total_blocks << '\n';
 }
 
 void PersistentSearchEngine::Impl::stop_persistent_kernel() {
@@ -219,18 +261,29 @@ PersistentSearchEngine::Impl::~Impl() {
               << cudaGetErrorString(device_status) << '\n';
   }
   accepting.store(false, std::memory_order_release);
+  query_stop.store(true, std::memory_order_release);
+  if (free_slots != nullptr) free_slots->notify_all();
+  if (admission_queue != nullptr) admission_queue->notify_all();
+  reject_all_pending("persistent GPU query engine is stopping");
   maintenance_shutdown.store(true, std::memory_order_release);
   maintenance_cv.notify_all();
-  admission_cv.notify_all();
-  slot_cv.notify_all();
   if (maintenance_thread.joinable()) maintenance_thread.join();
   shutdown.store(true, std::memory_order_release);
-  admission_cv.notify_all();
+  if (admission_queue != nullptr) admission_queue->notify_all();
   if (admission_thread.joinable()) admission_thread.join();
-  reject_queued_submissions("persistent GPU query engine is stopping");
+  if (completion_thread.joinable()) completion_thread.join();
   const auto drain_deadline = std::chrono::steady_clock::now() +
     std::chrono::milliseconds(config.storage_owner_rpc_timeout_ms);
-  while (pending_count.load(std::memory_order_acquire) != 0 &&
+  const auto has_owned_query_slot = [&] {
+    for (u32 slot = 0; slot < query_slots; ++slot) {
+      if (query_slot_states[slot].phase.load(std::memory_order_acquire) !=
+          static_cast<u32>(QuerySlotPhase::free)) {
+        return true;
+      }
+    }
+    return false;
+  };
+  while (has_owned_query_slot() &&
          std::chrono::steady_clock::now() < drain_deadline) {
     std::this_thread::yield();
   }
@@ -246,14 +299,15 @@ PersistentSearchEngine::Impl::~Impl() {
     if (rdma_stream != nullptr) cudaStreamSynchronize(rdma_stream);
     kernel_running = false;
   }
-  reject_all_pending("persistent GPU query engine stopped before completion");
-  if (completion_thread.joinable()) completion_thread.join();
   if (rdma_stream != nullptr) cudaStreamDestroy(rdma_stream);
   if (route_stream != nullptr) cudaStreamDestroy(route_stream);
   if (kernel_stream != nullptr) cudaStreamDestroy(kernel_stream);
   if (direct_disabled_host != nullptr) cudaFreeHost(direct_disabled_host);
   if (direct_error_host != nullptr) cudaFreeHost(direct_error_host);
   if (direct_owner_phases_host != nullptr) cudaFreeHost(direct_owner_phases_host);
+  if (direct_owner_progress_host != nullptr) {
+    cudaFreeHost(direct_owner_progress_host);
+  }
   if (control_kernel_ready_host != nullptr) cudaFreeHost(control_kernel_ready_host);
   if (dispatcher_kernel_ready_host != nullptr) {
     cudaFreeHost(dispatcher_kernel_ready_host);
@@ -275,6 +329,7 @@ PersistentSearchEngine::Impl::~Impl() {
   device_free(d_centroid_route_shards);
   device_free(d_centroid_route_entries);
   device_free(d_direct_batch_statuses);
+  device_free(d_direct_owner_progress);
   device_free(d_direct_batch_queues);
   device_free(d_direct_batch_entries);
   device_free(d_direct_batch_sequences);

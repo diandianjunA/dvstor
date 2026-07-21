@@ -1,4 +1,5 @@
 #include "service/compute_service/detail.hh"
+#include "service/compute_service/storage_owner/batch_policy.hh"
 
 using namespace compute_service_detail;
 
@@ -9,6 +10,16 @@ void ComputeService::run_storage_insert_progress_loop() {
   auto previous_poll = std::chrono::steady_clock::now();
 
   for (;;) {
+    // Shutdown must remain bounded even when a remote process has disappeared.
+    // Outstanding request/response buffers stay registered until the QPs are
+    // destroyed by ComputeService::~ComputeService(), so it is safe to stop CQ
+    // progress here and fail the still-owned tasks in stop_storage_insert_runtime().
+    if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+      storage_insert_progress_done_.store(true, std::memory_order_release);
+      storage_insert_progress_done_.notify_all();
+      storage_ready_slots_->notify_all();
+      return;
+    }
     bool progressed = false;
     reclaim_storage_owner_slots();
 
@@ -37,18 +48,6 @@ void ComputeService::run_storage_insert_progress_loop() {
     progressed = drain_storage_owner_submissions(first_owner) || progressed;
     reclaim_storage_owner_slots();
 
-    bool submissions_empty = true;
-    for (const auto& state : storage_insert_owners_) {
-      submissions_empty = submissions_empty && state->queue->empty();
-    }
-    if (storage_insert_shutdown_.load(std::memory_order_acquire) &&
-        submissions_empty &&
-        storage_insert_inflight_.load(std::memory_order_acquire) == 0) {
-      storage_insert_progress_done_.store(true, std::memory_order_release);
-      storage_insert_progress_done_.notify_all();
-      storage_ready_slots_->notify_all();
-      return;
-    }
     if (!progressed) std::this_thread::yield();
   }
 }
@@ -69,10 +68,46 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
       auto& slot = state.slots[slot_id];
       slot.tasks.clear();
       slot.tasks.push_back(first_task);
-      u32 task_id = 0;
-      while (slot.tasks.size() < config_.storage_owner_batch_max &&
-             state.queue->try_pop(task_id)) {
-        slot.tasks.push_back(task_id);
+      const auto coalesce_started = std::chrono::steady_clock::now();
+      const auto drain = drain_concurrent_storage_owner_batch(
+        1, config_.storage_owner_batch_max,
+        [&](u32& task_id) { return state.queue->try_pop(task_id); },
+        [&]() {
+          return state.pending_producers.load(std::memory_order_acquire) != 0;
+        },
+        [&](u32 task_id) { slot.tasks.push_back(task_id); },
+        []() { std::this_thread::yield(); });
+      lib_assert(drain.item_count == slot.tasks.size(),
+                 "storage-owner batch policy lost a queued task");
+      ++state.rpc_batches;
+      state.rpc_items += drain.item_count;
+      if (drain.wait_rounds != 0) {
+        ++state.concurrent_wait_batches;
+        state.concurrent_wait_rounds += drain.wait_rounds;
+        state.concurrent_wait_ns += duration_ns(
+          coalesce_started, std::chrono::steady_clock::now());
+      }
+      if (state.rpc_batches >= 32 &&
+          (state.rpc_batches & (state.rpc_batches - 1)) == 0) {
+        const double average_batch = static_cast<double>(state.rpc_items) /
+          static_cast<double>(state.rpc_batches);
+        const double average_wait_us = state.concurrent_wait_batches == 0
+          ? 0.0
+          : static_cast<double>(state.concurrent_wait_ns) /
+              static_cast<double>(state.concurrent_wait_batches) / 1000.0;
+        std::cerr << "[storage-owner] sender batch telemetry owner="
+                  << owner
+                  << " batches=" << state.rpc_batches
+                  << " items=" << state.rpc_items
+                  << " avg_batch=" << average_batch
+                  << " concurrent_wait_batches="
+                  << state.concurrent_wait_batches
+                  << " avg_wait_rounds="
+                  << (state.concurrent_wait_batches == 0
+                        ? 0.0
+                        : static_cast<double>(state.concurrent_wait_rounds) /
+                            static_cast<double>(state.concurrent_wait_batches))
+                  << " avg_wait_us=" << average_wait_us << std::endl;
       }
       const auto dequeued_at = std::chrono::steady_clock::now();
       for (const u32 id : slot.tasks) {

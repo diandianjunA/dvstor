@@ -181,12 +181,42 @@ one-sided RDMA 按需读取，不维护需要广播、同步或回收的计算�
 stage2 context 有界回收；存储节点记录同时保持逻辑 generation 与物理 incarnation
 稳定，并在 durable watermark 后以 header-last 方式发布复用后的新 incarnation。
 
+性能阶段结束时，driver 会一次性读取所有分片的
+`next_maintenance_sequence - 1`，固定为全局 maintenance 前缀，再等待每个分片的
+`durable_maintenance_sequence` 追平。这个边界同时覆盖跨分片 upsert 的旧 home
+清理、新 home Stage2 以及迁移产生的远端退休任务；后续才提交的更大序号不会被
+本轮 drain 无限等待。该控制读只发生在显式阶段边界，不进入逐更新热路径。
+
 ## 召回率与性能
 
 测试负载参数不放在索引/系统 profile 中。`BENCHMARK_CLIENT_THREADS`、
 `WORKLOAD`、`READ_RATIO`、`WARMUP_SECONDS`、`MEASURE_SECONDS` 和
 `RECALL_QUERIES` 由运行脚本读取。`SERVICE_THREADS` 是计算服务 CPU 线程数，
 不等于 benchmark 客户端并发数。
+
+`BENCHMARK_CLIENT_THREADS` 默认为 `auto`。由于当前 load driver 每个线程同步
+提交一个请求，一个线程最多贡献一个在途操作；`auto` 因此只使用系统的
+显式有界容量推导闭环并发，不根据已测 QPS 调参：
+
+- query 使用 `GPU_QUERY_SLOTS`；insert 使用
+  `SHARDS * STORAGE_OWNER_RPC_DEPTH`；`both` 的两个阶段顺序执行，取两者最大值。
+- `mixed/fixed_threads` 保证按 `READ_RATIO` 分配后，活跃路径至少有对应的
+  容量数在途 caller。例如 256 个 GPU 查询槽、50/50 混合负载会推导为
+  512 线程，即 256 读 + 256 写。`READ_RATIO` 在该模式表示 caller 比例，
+  不保证不同延迟的读写最终完成量也恰好按此比例。
+- `mixed/probability` 使每个闭环 caller 在上一操作完成后按 `READ_RATIO`
+  选择下一操作，适合固定长时操作混合；它不保留专用读/写 caller。
+- `mixed/rate_limited` 对激活的读、写路径容量求和；调度数、完成数和
+  drain 均如实报告，不会把超载时未发出/未完成的计划请求算作完成来伪造达标。
+
+`BENCHMARK_CLIENT_THREAD_CAP` 默认为 1024，只限制 `auto` 意外创建过多
+OS 线程；如果截断了推导值，脚本会明确告警而不声称路径已饱和。
+显式设置正整数 `BENCHMARK_CLIENT_THREADS` 可用于 1/2/4/... 延迟—吞吐扫描。
+脚本会在终端输出完整推导，并在 JSON 的
+`meta.benchmark_driver_concurrency` 中保留容量、来源、cap 和计算式。
+`auto` 是一个与数据集无关的容量起点，不是“已饱和”的自动结论。论文实验应显式
+公布对应 `auto/4`、`auto/2`、`auto`、`2*auto` 整数并发的完整延迟—吞吐曲线，并且只有在
+零错误、召回不变且 durable backlog 有界时，平台点才能称为饱和吞吐。
 
 `query.u8bin` 的 10K 标准查询仅供 recall 使用。性能阶段由
 `PERFORMANCE_QUERY_FILE` 提供独立查询流，warmup 与 measure 共用一个单遍游标，
@@ -199,6 +229,12 @@ stage2 context 有界回收；存储节点记录同时保持逻辑 generation �
 sift100m_to_110m_query.u8bin
 sift110m_to_120m_insert.u8bin
 ```
+
+脚本会显示在 warmup + measure 全时段内不重用行所能支持的最大平均 query
+QPS。例如 1000 万行与 30 + 120 秒只能为 query 部分提供平均
+66,666.7 QPS；要完整测量 query-only 100K QPS，至少需要 1500 万不重复行，
+或将两个时段总时长降到 100 秒以内。增加并发不会绕过这个数据诚信上限；
+查询池耗尽仍会使 benchmark 失败。
 
 `run_breakdown.sh` 默认只校验并读取预生成文件，不会在计算节点寻找
 `bigann_base.bvecs`。只有显式设置 `PREPARE_BENCHMARK_DATA=1` 时才会调用数据准备。
@@ -226,10 +262,15 @@ RECALL_QUERIES=1000 \
 再运行读写混合负载：
 
 ```bash
-BENCHMARK_CLIENT_THREADS=128 WORKLOAD=mixed READ_RATIO=0.5 \
+WORKLOAD=mixed READ_RATIO=0.5 \
 WARMUP_SECONDS=30 MEASURE_SECONDS=120 \
 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
 ```
+
+这是饱和闭环吞吐测试，不是单客户端延迟测试。与单机 HNSW 比较时必须同时
+固定数据集、召回率/搜索参数、更新语义和负载比例，并让两个系统都有
+足够客户端达到各自饱和点。单纯 query-only HNSW 的 QPS 不能直接与包含权威
+Stage2 drain 的混合读写 QPS 解释为同一指标。
 
 如需比较不同运行，保持相同的索引、查询/插入文件和 GPU 参数即可。
 报告只提供吞吐、延迟、召回、GPU 内存与 stage2 遥测；不包含自动验收结论。

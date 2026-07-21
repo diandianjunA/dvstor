@@ -15,6 +15,8 @@ union CandidateSortWorkspace {
   ApproximateBlockSortWide::TempStorage radix_sort_wide;
   ApproximateBlockSortCompactPass::TempStorage radix_sort_compact_pass;
   ApproximateBlockSortCompactFinal::TempStorage radix_sort_compact_final;
+  ApproximateBlockSortCompactFinal256::TempStorage
+    radix_sort_compact_final_256;
 };
 
 struct CandidateWorkspace {
@@ -422,6 +424,62 @@ __device__ void merge_approximate_radix(
   __syncthreads();
 }
 
+template <u32 ItemsPerThread, class BlockSort>
+__device__ void merge_approximate_compact_final(
+    u64* beam_handles, u32* beam_ids, f32* beam_distances,
+    u8* beam_expanded, u32& beam_count, u32 beam_capacity,
+    u64* scratch_handles, u32* scratch_expanded, f32* scratch_distances,
+    typename BlockSort::TempStorage& radix_storage) {
+  const u32 scratch_count = beam_capacity * 2;
+  f32 final_distances[ItemsPerThread];
+  u64 final_values[ItemsPerThread];
+  u8 final_expanded[ItemsPerThread];
+  for (u32 item = 0; item < ItemsPerThread; ++item) {
+    const u32 index = threadIdx.x * ItemsPerThread + item;
+    u64 handle = kInvalidDeviceHandle;
+    f32 distance = FLT_MAX;
+    if (index < scratch_count) {
+      handle = scratch_handles[index];
+      distance = scratch_distances[index];
+    }
+    final_distances[item] = distance;
+    final_values[item] = handle;
+  }
+  __syncthreads();
+  BlockSort(radix_storage).Sort(final_distances, final_values);
+  for (u32 item = 0; item < ItemsPerThread; ++item) {
+    final_expanded[item] = 0;
+    for (u32 prior = 0; prior < scratch_count; ++prior) {
+      if (scratch_handles[prior] == final_values[item]) {
+        final_expanded[item] = static_cast<u8>(
+          scratch_expanded[prior] != 0);
+        break;
+      }
+    }
+  }
+  __syncthreads();
+  for (u32 item = 0; item < ItemsPerThread; ++item) {
+    const u32 output = threadIdx.x * ItemsPerThread + item;
+    if (output >= beam_capacity) continue;
+    beam_handles[output] = final_values[item];
+    beam_ids[output] = UINT32_MAX;
+    beam_distances[output] = final_distances[item];
+    beam_expanded[output] =
+      final_expanded[item];
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    u32 valid = 0;
+    while (valid < beam_capacity &&
+           beam_handles[valid] != kInvalidDeviceHandle &&
+           isfinite(beam_distances[valid]) && beam_distances[valid] != FLT_MAX) {
+      ++valid;
+    }
+    beam_count = valid;
+  }
+  __syncthreads();
+}
+
 __device__ void merge_approximate_compact(
     u64* candidate_handles, f32* candidate_distances,
     u64* beam_handles, u32* beam_ids, f32* beam_distances,
@@ -474,64 +532,27 @@ __device__ void merge_approximate_compact(
       if (output >= beam_capacity) continue;
       const u32 destination = pass * beam_capacity + output;
       scratch_handles[destination] = local_values[item];
-      scratch_expanded[destination] =
-        sorted_expanded[item];
+      scratch_expanded[destination] = sorted_expanded[item];
       scratch_distances[destination] = local_distances[item];
     }
     __syncthreads();
   }
 
-  f32 final_distances[kApproximateSortItemsCompactFinal];
-  u64 final_values[kApproximateSortItemsCompactFinal];
-  u8 final_expanded[kApproximateSortItemsCompactFinal];
-  const u32 scratch_count = beam_capacity * 2;
-  for (u32 item = 0; item < kApproximateSortItemsCompactFinal; ++item) {
-    const u32 index =
-      threadIdx.x * kApproximateSortItemsCompactFinal + item;
-    u64 handle = kInvalidDeviceHandle;
-    f32 distance = FLT_MAX;
-    if (index < scratch_count) {
-      handle = scratch_handles[index];
-      distance = scratch_distances[index];
-    }
-    final_distances[item] = distance;
-    final_values[item] = handle;
+  constexpr u32 compact_final_capacity =
+    kApproximateSortThreadsCompact * kApproximateSortItemsCompactFinal;
+  if (beam_capacity * 2 <= compact_final_capacity) {
+    merge_approximate_compact_final<kApproximateSortItemsCompactFinal,
+                                    ApproximateBlockSortCompactFinal>(
+      beam_handles, beam_ids, beam_distances, beam_expanded,
+      beam_count, beam_capacity, scratch_handles, scratch_expanded,
+      scratch_distances, workspace.sort.radix_sort_compact_final);
+  } else {
+    merge_approximate_compact_final<kApproximateSortItemsCompactFinal256,
+                                    ApproximateBlockSortCompactFinal256>(
+      beam_handles, beam_ids, beam_distances, beam_expanded,
+      beam_count, beam_capacity, scratch_handles, scratch_expanded,
+      scratch_distances, workspace.sort.radix_sort_compact_final_256);
   }
-  __syncthreads();
-  ApproximateBlockSortCompactFinal(workspace.sort.radix_sort_compact_final)
-    .Sort(final_distances, final_values);
-  for (u32 item = 0; item < kApproximateSortItemsCompactFinal; ++item) {
-    final_expanded[item] = 0;
-    for (u32 prior = 0; prior < scratch_count; ++prior) {
-      if (scratch_handles[prior] == final_values[item]) {
-        final_expanded[item] = static_cast<u8>(
-          scratch_expanded[prior] != 0);
-        break;
-      }
-    }
-  }
-  __syncthreads();
-  for (u32 item = 0; item < kApproximateSortItemsCompactFinal; ++item) {
-    const u32 output =
-      threadIdx.x * kApproximateSortItemsCompactFinal + item;
-    if (output >= beam_capacity) continue;
-    beam_handles[output] = final_values[item];
-    beam_ids[output] = UINT32_MAX;
-    beam_distances[output] = final_distances[item];
-    beam_expanded[output] =
-      final_expanded[item];
-  }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    u32 valid = 0;
-    while (valid < beam_capacity &&
-           beam_handles[valid] != kInvalidDeviceHandle &&
-           isfinite(beam_distances[valid]) && beam_distances[valid] != FLT_MAX) {
-      ++valid;
-    }
-    beam_count = valid;
-  }
-  __syncthreads();
 }
 
 __device__ void merge_approximate_into_beam(

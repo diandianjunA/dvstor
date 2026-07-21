@@ -137,6 +137,14 @@ public:
   // is admitted only if it belongs in the current fixed-width beam.
   void add_visited(RemotePtr pointer, distance_t distance) {
     const PartitionLocalSearchEntry candidate{pointer, distance, false};
+    // Once the beam is full, most graph neighbors are farther than its
+    // current boundary. Reject those in O(1) before lower_bound/insert moves
+    // up to L entries. This is exactly equivalent to inserting and truncating
+    // the last element, including the deterministic full-handle tie break.
+    if (beam_.size() == beam_width_ &&
+        !entry_less(candidate, beam_.back())) {
+      return;
+    }
     const auto position = std::lower_bound(
       beam_.begin(), beam_.end(), candidate, entry_less);
     beam_.insert(position, candidate);
@@ -424,15 +432,20 @@ public:
   void mark_budget_exhausted() { budget_exhausted_ = true; }
 
 private:
+  static bool entry_less(const PartitionLocalSearchEntry& lhs,
+                         const PartitionLocalSearchEntry& rhs) {
+    if (lhs.distance != rhs.distance) return lhs.distance < rhs.distance;
+    return lhs.rptr.raw_address < rhs.rptr.raw_address;
+  }
+
   void add(RemotePtr pointer, distance_t distance, bool expanded) {
     const PartitionLocalSearchEntry candidate{pointer, distance, expanded};
+    if (beam_.size() == beam_width_ &&
+        !entry_less(candidate, beam_.back())) {
+      return;
+    }
     const auto position = std::lower_bound(
-      beam_.begin(), beam_.end(), candidate,
-      [](const PartitionLocalSearchEntry& lhs,
-         const PartitionLocalSearchEntry& rhs) {
-        if (lhs.distance != rhs.distance) return lhs.distance < rhs.distance;
-        return lhs.rptr.raw_address < rhs.rptr.raw_address;
-      });
+      beam_.begin(), beam_.end(), candidate, entry_less);
     beam_.insert(position, candidate);
     if (beam_.size() > beam_width_) beam_.resize(beam_width_);
   }

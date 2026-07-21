@@ -1,5 +1,6 @@
 #include "gpu_search/persistent_engine/impl.hh"
 #include "gpu_search/persistent_engine/cuda_helpers.hh"
+#include "gpu_search/maintenance_fence.hh"
 
 namespace gpu_search {
 
@@ -98,6 +99,7 @@ void PersistentSearchEngine::Impl::validate_storage_control(const format::Storag
 }
 
 std::vector<format::StorageControlBlock> PersistentSearchEngine::Impl::read_storage_controls() {
+  std::lock_guard<std::mutex> read_lock(storage_control_read_mutex);
   if (control_bootstrapper == nullptr || index.shards.empty()) return {};
   std::vector<NavigationRead> requests(index.shards.size());
   std::vector<i32> statuses(index.shards.size(), -EIO);
@@ -124,6 +126,53 @@ std::vector<format::StorageControlBlock> PersistentSearchEngine::Impl::read_stor
     validate_storage_control(controls[shard], shard);
   }
   return controls;
+}
+
+bool PersistentSearchEngine::Impl::wait_for_maintenance(
+    std::span<const u64> target_sequences,
+    std::chrono::milliseconds timeout,
+    std::vector<u64>* durable_sequences,
+    std::vector<u64>* effective_target_sequences) {
+  if (target_sequences.size() != index.shards.size()) {
+    throw std::invalid_argument(
+      "maintenance target count does not match storage shard count");
+  }
+  std::vector<format::StorageControlBlock> controls =
+    read_storage_controls();
+  std::vector<u64> next_sequences(controls.size());
+  for (size_t shard = 0; shard < controls.size(); ++shard) {
+    next_sequences[shard] = controls[shard].next_maintenance_sequence;
+  }
+  const std::vector<u64> effective_targets =
+    maintenance_fence::capture_targets(target_sequences, next_sequences);
+  if (effective_target_sequences != nullptr) {
+    *effective_target_sequences = effective_targets;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  auto delay = std::chrono::milliseconds(1);
+  for (;;) {
+    std::vector<u64> observed(controls.size());
+    bool complete = controls.size() == effective_targets.size();
+    for (size_t shard = 0; shard < controls.size(); ++shard) {
+      observed[shard] = controls[shard].durable_maintenance_sequence;
+      complete = complete && observed[shard] >= effective_targets[shard];
+    }
+    if (durable_sequences != nullptr) *durable_sequences = observed;
+    if (complete) return true;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) return false;
+    const auto remaining =
+      std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    std::unique_lock<std::mutex> lock(maintenance_mutex);
+    maintenance_cv.wait_for(
+      lock, std::min(delay, remaining), [&] {
+        return maintenance_shutdown.load(std::memory_order_acquire);
+      });
+    if (maintenance_shutdown.load(std::memory_order_acquire)) return false;
+    delay = std::min(delay * 2, std::chrono::milliseconds(16));
+    controls = read_storage_controls();
+  }
 }
 
 PersistentSearchEngine::Impl::CentroidRouteReadResult

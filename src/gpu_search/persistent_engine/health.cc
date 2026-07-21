@@ -4,92 +4,70 @@
 namespace gpu_search {
 
 using namespace persistent_engine_detail;
+
 std::string PersistentSearchEngine::Impl::unhealthy_message() {
-  std::lock_guard<std::mutex> lock(admission_mutex);
-  return health_error.empty() ? "persistent GPU query engine is unhealthy" : health_error;
+  std::lock_guard<std::mutex> lock(health_mutex);
+  return health_error.empty()
+    ? "persistent GPU query engine is unhealthy" : health_error;
 }
 
-void PersistentSearchEngine::Impl::reject_submission(const PendingSubmission& submission,
-                       const std::string& message) {
-  std::shared_ptr<PendingQuery> pending;
-  {
-    std::lock_guard<std::mutex> lock(pending_mutex);
-    const auto iterator = pending_queries.find(submission.descriptor.request_id);
-    if (iterator != pending_queries.end()) {
-      pending = std::move(iterator->second);
-      pending_queries.erase(iterator);
+void PersistentSearchEngine::Impl::reject_query_slot(u32 slot) {
+  if (slot >= query_slots || query_slot_states == nullptr) return;
+  QuerySlotState& state = query_slot_states[slot];
+  u32 phase = state.phase.load(std::memory_order_acquire);
+  while (phase == static_cast<u32>(QuerySlotPhase::preparing) ||
+         phase == static_cast<u32>(QuerySlotPhase::pending)) {
+    if (state.phase.compare_exchange_weak(
+          phase, static_cast<u32>(QuerySlotPhase::rejected),
+          std::memory_order_release, std::memory_order_acquire)) {
+      state.phase.notify_all();
+      return;
     }
   }
-  if (!pending) return;
-  pending->promise.set_exception(
-    std::make_exception_ptr(std::runtime_error(message)));
-  {
-    std::lock_guard<std::mutex> lock(slot_mutex);
-    free_slots.push_back(pending->slot);
+}
+
+void PersistentSearchEngine::Impl::release_query_slot(u32 slot) {
+  QuerySlotState& state = query_slot_states[slot];
+  // Publish reusable state before publishing the slot into the free queue.
+  // The queue cell's release/acquire hand-off guarantees a successful pop
+  // observes this phase before attempting free -> preparing.
+  state.phase.store(static_cast<u32>(QuerySlotPhase::free),
+                    std::memory_order_release);
+  if (!free_slots->try_push(slot)) {
+    // A full free-slot queue means the same slot was released twice. Continuing
+    // would permit concurrent reuse of query/result scratch and corrupt recall.
+    std::cerr << "[gpu-search] fatal duplicate bounded query-slot release: "
+              << slot << '\n';
+    std::terminate();
   }
-  slot_cv.notify_one();
-  pending_count.fetch_sub(1, std::memory_order_release);
 }
 
 void PersistentSearchEngine::Impl::mark_unhealthy(const std::string& message) {
-  std::deque<PendingSubmission> rejected;
   {
-    std::lock_guard<std::mutex> lock(admission_mutex);
+    std::lock_guard<std::mutex> lock(health_mutex);
     if (!healthy.load(std::memory_order_relaxed)) return;
     health_error = message;
     healthy.store(false, std::memory_order_release);
-    rejected.swap(admission_queue);
   }
-  admission_cv.notify_all();
-  slot_cv.notify_all();
-  for (const PendingSubmission& submission : rejected) {
-    reject_submission(submission, message);
-  }
+  query_stop.store(true, std::memory_order_release);
+  if (free_slots != nullptr) free_slots->notify_all();
+  if (admission_queue != nullptr) admission_queue->notify_all();
+  reject_all_pending(message);
   std::cerr << "[gpu-search] query engine entered fail-stop mode: "
             << message << '\n';
 }
 
-void PersistentSearchEngine::Impl::reject_queued_submissions(const std::string& message) {
-  std::deque<PendingSubmission> rejected;
-  {
-    std::lock_guard<std::mutex> lock(admission_mutex);
-    rejected.swap(admission_queue);
-  }
-  for (const PendingSubmission& submission : rejected) {
-    reject_submission(submission, message);
+void PersistentSearchEngine::Impl::reject_all_pending(
+    const std::string& message) {
+  (void)message;
+  if (query_slot_states == nullptr) return;
+  for (u32 slot = 0; slot < query_slots; ++slot) {
+    reject_query_slot(slot);
   }
 }
 
-void PersistentSearchEngine::Impl::reject_all_pending(const std::string& message) {
-  std::vector<std::shared_ptr<PendingQuery>> rejected;
-  {
-    std::lock_guard<std::mutex> lock(pending_mutex);
-    rejected.reserve(pending_queries.size());
-    for (auto& [request_id, pending] : pending_queries) {
-      (void)request_id;
-      rejected.push_back(std::move(pending));
-    }
-    pending_queries.clear();
-  }
-  if (rejected.empty()) return;
-  {
-    std::lock_guard<std::mutex> lock(slot_mutex);
-    for (const auto& pending : rejected) {
-      free_slots.push_back(pending->slot);
-    }
-  }
-  for (const auto& pending : rejected) {
-    try {
-      pending->promise.set_exception(
-        std::make_exception_ptr(std::runtime_error(message)));
-    } catch (const std::future_error&) {
-    }
-  }
-  pending_count.fetch_sub(rejected.size(), std::memory_order_release);
-  slot_cv.notify_all();
-}
-
-void PersistentSearchEngine::Impl::bind_cuda_device(const char* operation) const {
+void PersistentSearchEngine::Impl::bind_cuda_device(
+    const char* operation) const {
   int current_device = -1;
   check_cuda(cudaGetDevice(&current_device), "cudaGetDevice(GPU navigation)");
   if (current_device != static_cast<int>(config.gpu_device)) {

@@ -172,7 +172,7 @@ private:
        "GPU-initiated GPUNetIO QPs per storage node.")
       ("gpu-persistent-blocks-per-sm",
        po::value<u32>(&gpu_persistent_blocks_per_sm)->default_value(gpu_persistent_blocks_per_sm),
-       "Persistent query blocks launched per GPU SM.")
+       "Maximum unified persistent CTAs per GPU SM; hardware occupancy may be lower.")
       ("enable-updates",
        po::value<bool>(&enable_updates)->default_value(enable_updates),
        "Enable compute-side insert, upsert, and erase submission.")
@@ -325,7 +325,7 @@ public:
              << config.gpu_max_expansions << '\n';
       output << std::setw(width) << "GPU RDMA QPs per storage node: "
              << config.gpu_rdma_qps << '\n';
-      output << std::setw(width) << "GPU persistent blocks/SM: "
+      output << std::setw(width) << "GPU persistent blocks/SM cap: "
              << config.gpu_persistent_blocks_per_sm << '\n';
       output << std::setw(width) << "compute updates enabled: "
              << std::boolalpha << config.enable_updates << '\n';

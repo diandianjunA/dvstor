@@ -4,8 +4,10 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <chrono>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <library/connection_manager.hh>
 #include <library/memory_region.hh>
@@ -32,6 +34,11 @@ public:
   service::QueryResult search(std::span<const element_t> query, u32 k);
   std::optional<u32> select_centroid_home(
     std::span<const f32> vector) const;
+  bool wait_for_maintenance(
+    std::span<const u64> target_sequences,
+    std::chrono::milliseconds timeout,
+    std::vector<u64>* durable_sequences = nullptr,
+    std::vector<u64>* effective_target_sequences = nullptr);
 
   TelemetrySnapshot telemetry() const { return telemetry_.snapshot(); }
   void reset_telemetry();

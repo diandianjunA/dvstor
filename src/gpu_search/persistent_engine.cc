@@ -40,6 +40,16 @@ std::optional<u32> PersistentSearchEngine::select_centroid_home(
   return impl_->select_centroid_home(vector);
 }
 
+bool PersistentSearchEngine::wait_for_maintenance(
+    std::span<const u64> target_sequences,
+    std::chrono::milliseconds timeout,
+    std::vector<u64>* durable_sequences,
+    std::vector<u64>* effective_target_sequences) {
+  return impl_->wait_for_maintenance(
+    target_sequences, timeout, durable_sequences,
+    effective_target_sequences);
+}
+
 void PersistentSearchEngine::reset_telemetry() {
   telemetry_.reset();
 }

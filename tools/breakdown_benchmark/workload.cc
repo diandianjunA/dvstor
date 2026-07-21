@@ -189,6 +189,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   const auto bootstrap_vectors = make_dataset(bootstrap_ids, dim);
   std::cerr << "[breakdown] bootstrap vectors ready (synthetic)" << std::endl;
   std::vector<ProgressSample> measure_windows;
+  // `both` executes insert and query as separate sequential phases. Preserve
+  // the first phase instead of letting the later query reporter overwrite it,
+  // so stability never interprets a query-only window as a write stall.
+  std::vector<ProgressSample> measure_insert_windows;
 
   auto run_insert_phase_ops = [&](const std::string& label, size_t ops,
                                   uint32_t start_id) -> size_t {
@@ -232,7 +236,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     for (auto& worker : workers) worker.join();
     reporter.finish();
     if (error != nullptr) std::rethrow_exception(error);
-    if (label.starts_with("measure-")) measure_windows = reporter.samples();
+    if (label.starts_with("measure-")) {
+      measure_windows = reporter.samples();
+      measure_insert_windows = measure_windows;
+    }
     return completed_ops.load(std::memory_order_relaxed);
   };
 
@@ -290,7 +297,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
              std::chrono::steady_clock::now() - deadline).count());
     reporter.finish();
     if (error != nullptr) std::rethrow_exception(error);
-    if (label.starts_with("measure-")) measure_windows = reporter.samples();
+    if (label.starts_with("measure-")) {
+      measure_windows = reporter.samples();
+      measure_insert_windows = measure_windows;
+    }
     return {
       .next_insert_id = current_id.load(std::memory_order_relaxed),
       .completed = completed_ops.load(std::memory_order_relaxed),
@@ -647,6 +657,9 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     std::atomic<size_t> completed_deletes{0};
     std::atomic<size_t> next_op{0};
     std::atomic<uint32_t> next_update_version{0};
+    std::atomic<bool> failed{false};
+    std::exception_ptr error;
+    std::mutex error_mutex;
     std::barrier start_barrier(static_cast<std::ptrdiff_t>(args.client_threads));
     std::vector<std::thread> threads;
     threads.reserve(args.client_threads);
@@ -659,31 +672,41 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                             (static_cast<uint64_t>(tid) << 32) ^
                             static_cast<uint64_t>(std::hash<std::string>{}(label)));
         start_barrier.arrive_and_wait();
-        for (;;) {
-          const size_t op_index = next_op.fetch_add(1, std::memory_order_relaxed);
-          if (op_index >= ops) {
-            break;
-          }
+        try {
+          while (!failed.load(std::memory_order_acquire)) {
+            const size_t op_index = next_op.fetch_add(1, std::memory_order_relaxed);
+            if (op_index >= ops) break;
 
-          const bool read_op = args.mixed_mode == "fixed_threads" ? tid < fixed_read_threads : choose_mixed_read(rng);
-          bool succeeded = true;
-          if (read_op) {
-            const auto query_row = performance_query_stream.try_claim();
-            if (!query_row.has_value()) break;
-            issued_reads.fetch_add(1, std::memory_order_relaxed);
-            (void)service.search_raw(
-              performance_query_rows.dtype,
-              performance_query_rows.raw_row(*query_row), dim, service.config().k);
-            completed_reads.fetch_add(1, std::memory_order_relaxed);
-          } else {
-            issued_writes.fetch_add(1, std::memory_order_relaxed);
-            succeeded = issue_mixed_write(
-              rng, next_insert_id, next_update_version,
-              issued_inserts, issued_upserts, issued_deletes,
-              completed_inserts, completed_upserts, completed_deletes);
-            if (succeeded) completed_writes.fetch_add(1, std::memory_order_relaxed);
+            const bool read_op = args.mixed_mode == "fixed_threads"
+              ? tid < fixed_read_threads : choose_mixed_read(rng);
+            if (read_op) {
+              const auto query_row = performance_query_stream.try_claim();
+              if (!query_row.has_value()) break;
+              issued_reads.fetch_add(1, std::memory_order_relaxed);
+              (void)service.search_raw(
+                performance_query_rows.dtype,
+                performance_query_rows.raw_row(*query_row), dim,
+                service.config().k);
+              completed_reads.fetch_add(1, std::memory_order_relaxed);
+            } else {
+              issued_writes.fetch_add(1, std::memory_order_relaxed);
+              if (!issue_mixed_write(
+                    rng, next_insert_id, next_update_version,
+                    issued_inserts, issued_upserts, issued_deletes,
+                    completed_inserts, completed_upserts, completed_deletes)) {
+                throw std::runtime_error(
+                  "mixed mutation was rejected or timed out");
+              }
+              completed_writes.fetch_add(1, std::memory_order_relaxed);
+            }
+            completed_ops.fetch_add(1, std::memory_order_relaxed);
           }
-          if (succeeded) completed_ops.fetch_add(1, std::memory_order_relaxed);
+        } catch (...) {
+          {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            if (error == nullptr) error = std::current_exception();
+          }
+          failed.store(true, std::memory_order_release);
         }
       });
     }
@@ -692,6 +715,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       thread.join();
     }
     reporter.finish();
+    if (error != nullptr) std::rethrow_exception(error);
     if (label.starts_with("measure-")) measure_windows = reporter.samples();
     throw_if_performance_queries_exhausted(label);
     return MixedPhaseStats{
@@ -772,9 +796,11 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                 rng, next_insert_id, next_update_version,
                 issued_inserts, issued_upserts, issued_deletes,
                 completed_inserts, completed_upserts, completed_deletes);
-              if (succeeded) {
-                completed_writes.fetch_add(1, std::memory_order_relaxed);
+              if (!succeeded) {
+                throw std::runtime_error(
+                  "mixed mutation was rejected or timed out");
               }
+              completed_writes.fetch_add(1, std::memory_order_relaxed);
             }
             if (succeeded) completed_ops.fetch_add(1, std::memory_order_relaxed);
           }
@@ -838,9 +864,43 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   root["meta"]["effective_insert_start_id"] = next_insert_id;
   std::cerr << "[breakdown] effective insert start id=" << next_insert_id << std::endl;
   const bool use_time_mode = args.warmup_seconds > 0 || args.measure_seconds > 0;
+  const bool workload_has_writes = !args.recall_only &&
+    (args.workload == "insert" || args.workload == "both" ||
+     (args.workload == "mixed" &&
+      (args.mixed_mode == "rate_limited"
+         ? args.target_write_qps > 0.0 : args.read_ratio < 1.0)));
   MixedPhaseStats warmup_mixed_stats{};
   MixedPhaseStats measure_mixed_stats{};
   double measure_client_drain_seconds = 0.0;
+  double measure_query_client_drain_seconds = 0.0;
+  double measure_write_client_drain_seconds = 0.0;
+  double measure_maintenance_drain_seconds = 0.0;
+  vec<u64> maintenance_target_sequences;
+  vec<u64> maintenance_durable_sequences;
+  const auto drain_storage_maintenance = [&](const char* phase) {
+    if (!workload_has_writes) return 0.0;
+    const auto started = std::chrono::steady_clock::now();
+    vec<u64> targets;
+    vec<u64> durable;
+    const bool complete = service.wait_for_storage_maintenance(
+      std::chrono::milliseconds(
+        std::max<u32>(1000, service.config().storage_owner_rpc_timeout_ms)),
+      &targets, &durable);
+    const double elapsed = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - started).count();
+    std::cerr << "[breakdown][" << phase
+              << "] maintenance drain elapsed=" << elapsed
+              << "s complete=" << (complete ? "yes" : "no")
+              << std::endl;
+    if (!complete) {
+      throw std::runtime_error(
+        std::string("storage Stage2 maintenance did not reach its durable ") +
+        "watermark during " + phase);
+    }
+    maintenance_target_sequences = std::move(targets);
+    maintenance_durable_sequences = std::move(durable);
+    return elapsed;
+  };
   std::vector<MaintenanceLogCursor> maintenance_log_cursors;
   if (!args.recall_only && (args.workload == "insert" || args.workload == "both")) {
     std::cerr << "[breakdown] starting warmup insert" << std::endl;
@@ -871,6 +931,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       next_insert_id = warmup_mixed_stats.next_insert_id + 1024;
     }
   }
+  (void)drain_storage_maintenance("warmup");
 
   const size_t performance_queries_after_warmup = performance_query_stream.consumed();
   if (!args.storage_maintenance_logs.empty()) {
@@ -889,7 +950,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
         "measure-insert", args.measure_seconds, next_insert_id);
       next_insert_id = measured.next_insert_id;
       measured_insert_operations = measured.completed;
-      measure_client_drain_seconds = measured.drain_seconds;
+      measure_write_client_drain_seconds = measured.drain_seconds;
+      measure_client_drain_seconds += measured.drain_seconds;
     } else {
       measured_insert_operations = run_insert_phase_ops(
         "measure-insert", args.measure_ops, next_insert_id);
@@ -900,7 +962,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       const auto measured = run_query_phase_seconds(
         "measure-query", args.measure_seconds);
       measured_query_operations = measured.completed;
-      measure_client_drain_seconds = measured.drain_seconds;
+      measure_query_client_drain_seconds = measured.drain_seconds;
+      measure_client_drain_seconds += measured.drain_seconds;
     } else {
       measured_query_operations = run_query_phase_ops("measure-query", args.measure_ops);
     }
@@ -910,11 +973,15 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       measure_mixed_stats = run_mixed_phase_seconds("measure-mixed", args.measure_seconds, next_insert_id);
       next_insert_id = measure_mixed_stats.next_insert_id;
       measure_client_drain_seconds = measure_mixed_stats.drain_seconds;
+      measure_query_client_drain_seconds = measure_client_drain_seconds;
+      measure_write_client_drain_seconds = measure_client_drain_seconds;
     } else {
       measure_mixed_stats = run_mixed_phase_ops("measure-mixed", args.measure_ops, next_insert_id);
       next_insert_id = measure_mixed_stats.next_insert_id;
     }
   }
+  measure_maintenance_drain_seconds =
+    drain_storage_maintenance("measure");
 
   MaintenanceLogSummary maintenance_summary;
   if (!maintenance_log_cursors.empty()) {
@@ -996,13 +1063,37 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   root["storage_owner_runtime"] = {
     {"late_rpc_completions", late_storage_owner_rpcs},
     {"late_rpc_threshold_ms", service.config().storage_owner_rpc_timeout_ms},
+    {"maintenance_drain_seconds", measure_maintenance_drain_seconds},
+    {"maintenance_target_sequences", maintenance_target_sequences},
+    {"maintenance_durable_sequences", maintenance_durable_sequences},
   };
 
 
   const bool has_throughput_duration = use_time_mode && args.measure_seconds > 0;
-  const double throughput_duration = has_throughput_duration
-    ? static_cast<double>(args.measure_seconds) + measure_client_drain_seconds
+  const double configured_phase_duration =
+    static_cast<double>(args.measure_seconds);
+  const double configured_total_measure_duration = has_throughput_duration
+    ? configured_phase_duration * (args.workload == "both" ? 2.0 : 1.0)
     : 0.0;
+  // `both` runs insert and query as two sequential full-duration phases.  Its
+  // aggregate denominator must therefore be their combined makespan, while
+  // each per-operation rate uses only the phase in which that operation was
+  // offered. Mixed/query/insert retain their single shared window.
+  const double throughput_duration = has_throughput_duration
+    ? configured_total_measure_duration + measure_client_drain_seconds
+    : 0.0;
+  const double query_throughput_duration = has_throughput_duration
+    ? configured_phase_duration +
+        (args.workload == "both" ? measure_query_client_drain_seconds
+                                  : measure_client_drain_seconds)
+    : 0.0;
+  const double write_throughput_duration = has_throughput_duration
+    ? configured_phase_duration +
+        (args.workload == "both" ? measure_write_client_drain_seconds
+                                  : measure_client_drain_seconds)
+    : 0.0;
+  const double durable_throughput_duration = has_throughput_duration
+    ? throughput_duration + measure_maintenance_drain_seconds : 0.0;
   const size_t throughput_query_ops = args.workload == "mixed"
     ? measure_mixed_stats.completed_reads
     : (service.config().enable_breakdown ? report.query.count : measured_query_operations);
@@ -1013,15 +1104,17 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     ? measure_mixed_stats.completed_inserts
     : (service.config().enable_breakdown ? report.insert.count : measured_insert_operations);
   const double effective_query_throughput = has_throughput_duration
-    ? static_cast<double>(throughput_query_ops) / throughput_duration : 0.0;
+    ? static_cast<double>(throughput_query_ops) / query_throughput_duration
+    : 0.0;
   const double effective_write_throughput = has_throughput_duration
-    ? static_cast<double>(throughput_write_ops) / throughput_duration : 0.0;
+    ? static_cast<double>(throughput_write_ops) / write_throughput_duration
+    : 0.0;
   const double effective_insert_throughput = has_throughput_duration
-    ? static_cast<double>(throughput_insert_ops) / throughput_duration : 0.0;
+    ? static_cast<double>(throughput_insert_ops) / write_throughput_duration
+    : 0.0;
   const bool rate_limited_measurement = args.workload == "mixed" &&
     args.mixed_mode == "rate_limited" && has_throughput_duration;
-  const double configured_measure_duration =
-    static_cast<double>(args.measure_seconds);
+  const double configured_measure_duration = configured_phase_duration;
   const double query_throughput = rate_limited_measurement
     ? static_cast<double>(throughput_query_ops) / configured_measure_duration
     : effective_query_throughput;
@@ -1031,12 +1124,31 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   const double insert_throughput = rate_limited_measurement
     ? static_cast<double>(throughput_insert_ops) / configured_measure_duration
     : effective_insert_throughput;
-  const double total_throughput = query_throughput + write_throughput;
+  const double total_throughput = has_throughput_duration
+    ? static_cast<double>(throughput_query_ops + throughput_write_ops) /
+        throughput_duration
+    : 0.0;
+  const double durable_write_throughput = durable_throughput_duration > 0.0
+    ? static_cast<double>(throughput_write_ops) / durable_throughput_duration
+    : 0.0;
+  const double durable_total_throughput = durable_throughput_duration > 0.0
+    ? static_cast<double>(throughput_query_ops + throughput_write_ops) /
+        durable_throughput_duration
+    : 0.0;
+  const double mixed_write_subtype_duration = rate_limited_measurement
+    ? configured_measure_duration : throughput_duration;
   root["throughput"] = {
     {"configured_measure_seconds", args.measure_seconds},
+    {"configured_total_measure_seconds", configured_total_measure_duration},
     {"effective_measure_seconds", throughput_duration},
     {"duration_seconds", throughput_duration},
     {"client_drain_seconds", measure_client_drain_seconds},
+    {"query_client_drain_seconds", measure_query_client_drain_seconds},
+    {"write_client_drain_seconds", measure_write_client_drain_seconds},
+    {"query_duration_seconds", query_throughput_duration},
+    {"write_duration_seconds", write_throughput_duration},
+    {"maintenance_drain_seconds", measure_maintenance_drain_seconds},
+    {"durable_effective_measure_seconds", durable_throughput_duration},
     {"total_ops", throughput_query_ops + throughput_write_ops},
     {"total_ops_per_sec", total_throughput},
     {"query_ops", throughput_query_ops},
@@ -1045,12 +1157,14 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"effective_query_ops_per_sec", effective_query_throughput},
     {"write_ops", throughput_write_ops},
     {"write_ops_per_sec", write_throughput},
+    {"durable_write_ops_per_sec", durable_write_throughput},
     {"nominal_write_ops_per_sec", write_throughput},
     {"effective_write_ops_per_sec", effective_write_throughput},
     {"insert_ops", throughput_insert_ops},
     {"insert_ops_per_sec", insert_throughput},
     {"nominal_insert_ops_per_sec", insert_throughput},
     {"effective_insert_ops_per_sec", effective_insert_throughput},
+    {"durable_total_ops_per_sec", durable_total_throughput},
     {"scheduled_query_ops", measure_mixed_stats.scheduled_reads},
     {"scheduled_write_ops", measure_mixed_stats.scheduled_writes},
     {"query_rate_attainment_ratio", measure_mixed_stats.scheduled_reads == 0
@@ -1062,18 +1176,24 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"nominal_rate_basis", rate_limited_measurement
       ? "configured_schedule_window" : "effective_wall_clock"},
     {"effective_rate_basis", "wall_clock_including_client_drain"},
+    {"durable_rate_basis",
+     "wall_clock_including_client_and_stage2_watermark_drain"},
     {"upsert_ops", args.workload == "mixed" ? measure_mixed_stats.completed_upserts : 0},
     {"upsert_ops_per_sec", has_throughput_duration && args.workload == "mixed"
-      ? static_cast<double>(measure_mixed_stats.completed_upserts) / throughput_duration
+      ? static_cast<double>(measure_mixed_stats.completed_upserts) /
+          mixed_write_subtype_duration
       : 0.0},
     {"delete_ops", args.workload == "mixed" ? measure_mixed_stats.completed_deletes : 0},
     {"delete_ops_per_sec", has_throughput_duration && args.workload == "mixed"
-      ? static_cast<double>(measure_mixed_stats.completed_deletes) / throughput_duration
+      ? static_cast<double>(measure_mixed_stats.completed_deletes) /
+          mixed_write_subtype_duration
       : 0.0},
   };
 
   nlohmann::json window_json = nlohmann::json::array();
   std::vector<double> total_window_rates;
+  std::vector<double> both_insert_total_window_rates;
+  std::vector<double> both_query_total_window_rates;
   std::vector<double> query_window_rates;
   std::vector<double> write_window_rates;
   size_t zero_completion_windows = 0;
@@ -1095,30 +1215,61 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   // create a false zero-completion window.
   const double stability_window_deadline =
     static_cast<double>(args.measure_seconds) + 0.5;
-  for (const ProgressSample& sample : measure_windows) {
-    const bool within_measurement_window = !has_throughput_duration ||
-      sample.elapsed_seconds <= stability_window_deadline;
-    window_json.push_back({
-      {"elapsed_seconds", sample.elapsed_seconds},
-      {"interval_seconds", sample.interval_seconds},
-      {"completed_ops", sample.completed_ops},
-      {"interval_ops", sample.interval_ops},
-      {"interval_reads", sample.interval_reads},
-      {"interval_writes", sample.interval_writes},
-      {"total_ops_per_sec", sample.total_ops_per_sec},
-      {"query_ops_per_sec", sample.query_ops_per_sec},
-      {"write_ops_per_sec", sample.write_ops_per_sec},
-      {"within_measurement_window", within_measurement_window},
-    });
-    if (within_measurement_window && sample.interval_seconds >= 2.5) {
-      total_window_rates.push_back(sample.total_ops_per_sec);
-      query_window_rates.push_back(sample.query_ops_per_sec);
-      write_window_rates.push_back(sample.write_ops_per_sec);
+  struct StabilityPhase {
+    const char* name;
+    const std::vector<ProgressSample>* samples;
+    bool expects_queries;
+    bool expects_writes;
+  };
+  std::vector<StabilityPhase> stability_phases;
+  if (args.workload == "both") {
+    stability_phases.push_back(
+      {"insert", &measure_insert_windows, false, true});
+    stability_phases.push_back(
+      {"query", &measure_windows, true, false});
+  } else {
+    stability_phases.push_back({
+      args.workload.c_str(), &measure_windows,
+      query_windows_expected, write_windows_expected});
+  }
+  for (const StabilityPhase& phase : stability_phases) {
+    for (const ProgressSample& sample : *phase.samples) {
+      const bool within_measurement_window = !has_throughput_duration ||
+        sample.elapsed_seconds <= stability_window_deadline;
+      window_json.push_back({
+        {"phase", phase.name},
+        {"elapsed_seconds", sample.elapsed_seconds},
+        {"interval_seconds", sample.interval_seconds},
+        {"completed_ops", sample.completed_ops},
+        {"interval_ops", sample.interval_ops},
+        {"interval_reads", sample.interval_reads},
+        {"interval_writes", sample.interval_writes},
+        {"total_ops_per_sec", sample.total_ops_per_sec},
+        {"query_ops_per_sec", sample.query_ops_per_sec},
+        {"write_ops_per_sec", sample.write_ops_per_sec},
+        {"within_measurement_window", within_measurement_window},
+      });
+      if (!within_measurement_window || sample.interval_seconds < 2.5) {
+        continue;
+      }
+      if (args.workload == "both") {
+        (phase.expects_queries ? both_query_total_window_rates
+                               : both_insert_total_window_rates)
+          .push_back(sample.total_ops_per_sec);
+      } else {
+        total_window_rates.push_back(sample.total_ops_per_sec);
+      }
+      if (phase.expects_queries) {
+        query_window_rates.push_back(sample.query_ops_per_sec);
+      }
+      if (phase.expects_writes) {
+        write_window_rates.push_back(sample.write_ops_per_sec);
+      }
       if (sample.interval_ops == 0) ++zero_completion_windows;
-      if (query_windows_expected && sample.interval_reads == 0) {
+      if (phase.expects_queries && sample.interval_reads == 0) {
         ++zero_query_windows;
       }
-      if (write_windows_expected && sample.interval_writes == 0) {
+      if (phase.expects_writes && sample.interval_writes == 0) {
         ++zero_write_windows;
       }
     }
@@ -1131,8 +1282,14 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                            values.begin() + begin + count, 0.0) /
       static_cast<double>(count);
   };
-  const double total_head_qps = edge_mean(total_window_rates, false);
-  const double total_tail_qps = edge_mean(total_window_rates, true);
+  const double total_head_qps = args.workload == "both"
+    ? (edge_mean(both_insert_total_window_rates, false) +
+       edge_mean(both_query_total_window_rates, false)) / 2.0
+    : edge_mean(total_window_rates, false);
+  const double total_tail_qps = args.workload == "both"
+    ? (edge_mean(both_insert_total_window_rates, true) +
+       edge_mean(both_query_total_window_rates, true)) / 2.0
+    : edge_mean(total_window_rates, true);
   const double query_head_qps = edge_mean(query_window_rates, false);
   const double query_tail_qps = edge_mean(query_window_rates, true);
   const double write_head_qps = edge_mean(write_window_rates, false);

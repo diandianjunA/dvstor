@@ -1264,18 +1264,13 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         task.maintenance_sequence = 0;
         continue;
       }
-      const u64 final_header =
-        load_local_node_header_acquire(task.final_target);
-      const byte_t* final_record = index_buffer_.get_full_buffer() +
-        task.final_target.byte_offset();
+      u64 final_header = 0;
+      node_t final_id = 0;
+      u32 final_generation = 0;
       const bool final_identity_matches =
-        VamanaNode::header_incarnation(final_header) ==
-          task.final_target.incarnation() &&
-        *reinterpret_cast<const node_t*>(
-          final_record + VamanaNode::offset_id()) == task.id &&
-        *reinterpret_cast<const u32*>(
-          final_record + VamanaNode::offset_generation()) ==
-            task.generation &&
+        read_locked_node_identity(task.final_target, final_header,
+                                  final_id, final_generation) &&
+        final_id == task.id && final_generation == task.generation &&
         (final_header & (VamanaNode::HEADER_DELETED |
                          VamanaNode::HEADER_PROVISIONAL |
                          VamanaNode::HEADER_RETIRING)) == 0;
@@ -1285,18 +1280,22 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         !published_adjacency.deleted &&
         published_adjacency.generation == task.generation;
       if (!final_current) {
-        unlock_node(task.final_target);
+        // We own the incarnation lock acquired above, but final_target may be
+        // remote.  Release it with the exact header observed while locked;
+        // the legacy one-byte remote unlock could otherwise clear NODE_LOCK
+        // in an ABA-reused slot if identity validation failed because the
+        // record changed unexpectedly.
+        lib_assert(publish_locked_node_header(
+                     task.final_target, final_header, 0, 0),
+                   "failed to release invalid final Stage2 owner record");
         if (!complete_stale_stage2(task)) return false;
         task.maintenance_sequence = 0;
         continue;
       }
-      auto* final_header_ptr = reinterpret_cast<u64*>(
-        index_buffer_.get_full_buffer() +
-        vamana::StorageLayoutResolver::header(task.final_target).offset);
-      std::atomic_ref<u64>(*final_header_ptr).fetch_or(
-        static_cast<u64>(VamanaNode::HEADER_STAGE2_FROZEN),
-        std::memory_order_acq_rel);
-      unlock_node(task.final_target);
+      lib_assert(publish_locked_node_header(
+                   task.final_target, final_header,
+                   VamanaNode::HEADER_STAGE2_FROZEN, 0),
+                 "failed to freeze final Stage2 owner record");
 
       vec<RemotePtr> candidates;
       candidates.reserve(
@@ -1362,19 +1361,15 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       const IncarnationLockResult rebase_lock =
         try_lock_node(task.final_target);
       if (rebase_lock != IncarnationLockResult::locked) return false;
-      const u64 rebased_header =
-        load_local_node_header_acquire(task.final_target);
-      const byte_t* rebased_record = index_buffer_.get_full_buffer() +
-        task.final_target.byte_offset();
+      u64 rebased_header = 0;
+      node_t rebased_id = 0;
+      u32 rebased_generation = 0;
       GraphAdjacency rebased_adjacency;
       const bool can_publish_rebase =
-        VamanaNode::header_incarnation(rebased_header) ==
-          task.final_target.incarnation() &&
-        *reinterpret_cast<const node_t*>(
-          rebased_record + VamanaNode::offset_id()) == task.id &&
-        *reinterpret_cast<const u32*>(
-          rebased_record + VamanaNode::offset_generation()) ==
-            task.generation &&
+        read_locked_node_identity(task.final_target, rebased_header,
+                                  rebased_id, rebased_generation) &&
+        rebased_id == task.id &&
+        rebased_generation == task.generation &&
         (rebased_header & VamanaNode::HEADER_STAGE2_FROZEN) != 0 &&
         (rebased_header & (VamanaNode::HEADER_DELETED |
                            VamanaNode::HEADER_PROVISIONAL |
@@ -1382,16 +1377,18 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         read_graph_adjacency(task.final_target, rebased_adjacency) &&
         !rebased_adjacency.deleted;
       if (!can_publish_rebase) {
-        unlock_node(task.final_target);
+        lib_assert(publish_locked_node_header(
+                     task.final_target, rebased_header, 0, 0),
+                   "failed to release invalid rebased Stage2 owner record");
         return false;
       }
       write_graph_adjacency(
         task.final_target, refreshed_neighbors,
         rebased_adjacency.provisional, task.generation, false);
-      std::atomic_ref<u64>(*final_header_ptr).fetch_and(
-        ~static_cast<u64>(VamanaNode::HEADER_STAGE2_FROZEN),
-        std::memory_order_acq_rel);
-      unlock_node(task.final_target);
+      lib_assert(publish_locked_node_header(
+                   task.final_target, rebased_header, 0,
+                   VamanaNode::HEADER_STAGE2_FROZEN),
+                 "failed to publish rebased Stage2 owner record");
       task.stage2_neighbors = std::move(refreshed_neighbors);
       if (task.final_target == task.target) {
         task.stage2_source_frozen = false;

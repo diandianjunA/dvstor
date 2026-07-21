@@ -10,10 +10,8 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstring>
-#include <deque>
 #include <exception>
 #include <fstream>
-#include <future>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -24,11 +22,12 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "common/bounded_queue.hh"
+#include "common/constants.hh"
 #include "common/index_path.hh"
 #include "gpu_search/centroid_route_poll_policy.hh"
 #include "gpu_search/persistent_engine.hh"
@@ -41,16 +40,31 @@
 #include "gpu_search/mapped_ring.hh"
 #include "gpu_search/memory_budget.hh"
 #include "gpu_search/pq_index.hh"
+#include "gpu_search/persistent_grid_plan.hh"
 #include "gpu_search/persistent_kernel.hh"
+#include "gpu_search/persistent_owner_watchdog.hh"
 #include "vamana/vamana_node.hh"
 
 namespace gpu_search {
 
 struct PersistentSearchEngine::Impl {
-  struct PendingQuery {
-    u32 slot{};
+  enum class QuerySlotPhase : u32 {
+    free,
+    preparing,
+    pending,
+    completed,
+    rejected,
+  };
+
+  // One cache-line-isolated rendezvous per device query slot. A caller owns a
+  // slot from free_slots.pop until release_query_slot(); the completion thread
+  // publishes only after checking both slot and request_id, which fences stale
+  // GPU completions from a later reuse of the same slot.
+  struct alignas(kCacheLineBytes) QuerySlotState {
+    std::atomic<u32> phase{static_cast<u32>(QuerySlotPhase::free)};
+    u64 request_id{};
     std::chrono::steady_clock::time_point submitted_at{};
-    std::promise<service::QueryResult> promise;
+    CompletionDescriptor completion{};
   };
 
   struct PendingSubmission {
@@ -91,11 +105,10 @@ struct PersistentSearchEngine::Impl {
   ~Impl();
 
   std::string unhealthy_message();
-  void reject_submission(const PendingSubmission& submission,
-                         const std::string& message);
   void mark_unhealthy(const std::string& message);
-  void reject_queued_submissions(const std::string& message);
+  void reject_query_slot(u32 slot);
   void reject_all_pending(const std::string& message);
+  void release_query_slot(u32 slot);
   void bind_cuda_device(const char* operation) const;
 
   void stream_codes_to_gpu(NavigationBootstrapper& source);
@@ -119,6 +132,11 @@ struct PersistentSearchEngine::Impl {
   CentroidRouteReadResult
     read_storage_centroid_route_publications();
   StorageRouteSyncResult synchronize_storage_routes();
+  bool wait_for_maintenance(
+    std::span<const u64> target_sequences,
+    std::chrono::milliseconds timeout,
+    std::vector<u64>* durable_sequences,
+    std::vector<u64>* effective_target_sequences);
   void initialize_storage_route_descriptors();
   void maintenance_loop();
 
@@ -204,6 +222,8 @@ struct PersistentSearchEngine::Impl {
   i32* d_direct_batch_statuses{};
   u32* direct_owner_phases_host{};
   u32* d_direct_owner_phases{};
+  DirectOwnerProgress* direct_owner_progress_host{};
+  DirectOwnerProgress* d_direct_owner_progress{};
   u32* query_kernel_ready_host{};
   u32* d_query_kernel_ready{};
   u32* dispatcher_kernel_ready_host{};
@@ -240,6 +260,9 @@ struct PersistentSearchEngine::Impl {
   cudaStream_t route_stream{};
   cudaStream_t rdma_stream{};
   PersistentKernelParams kernel_params{};
+  PersistentGridPlan persistent_grid_plan{};
+  PersistentKernelOccupancy persistent_kernel_occupancy{};
+  u32 kernel_threads{};
   u32 owner_kernel_blocks{};
   u32 kernel_blocks{};
   bool kernel_running{};
@@ -248,22 +271,19 @@ struct PersistentSearchEngine::Impl {
   std::atomic<bool> accepting{true};
   std::atomic<bool> healthy{true};
   std::atomic<bool> shutdown{false};
+  std::atomic<bool> query_stop{false};
   std::atomic<bool> maintenance_shutdown{false};
   std::atomic<u64> next_request_id{1};
   std::atomic<u64> next_route_command_id{1};
-  std::atomic<u64> pending_count{0};
-  std::mutex admission_mutex;
-  std::condition_variable admission_cv;
-  std::deque<PendingSubmission> admission_queue;
   std::string health_error;
-  std::mutex slot_mutex;
-  std::condition_variable slot_cv;
-  std::vector<u32> free_slots;
-  std::mutex pending_mutex;
-  std::unordered_map<u64, std::shared_ptr<PendingQuery>> pending_queries;
+  std::mutex health_mutex;
+  std::unique_ptr<QuerySlotState[]> query_slot_states;
+  std::unique_ptr<bounded::Queue<u32>> free_slots;
+  std::unique_ptr<bounded::Queue<PendingSubmission>> admission_queue;
   std::thread admission_thread;
   std::thread completion_thread;
   std::mutex maintenance_mutex;
+  std::mutex storage_control_read_mutex;
   std::condition_variable maintenance_cv;
   std::thread maintenance_thread;
 

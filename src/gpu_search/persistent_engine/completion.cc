@@ -6,17 +6,42 @@
 namespace gpu_search {
 
 using namespace persistent_engine_detail;
+
+namespace {
+
+u64 steady_now_ns() {
+  return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+owner_watchdog::Observation sample_owner_progress(
+    const DirectOwnerProgress& progress) {
+  return {
+    .announced = static_cast<u64>(progress.announced),
+    .dequeued = static_cast<u64>(progress.dequeued),
+    .completed = static_cast<u64>(progress.completed),
+    .heartbeat = static_cast<u64>(progress.heartbeat),
+  };
+}
+
+}  // namespace
+
 void PersistentSearchEngine::Impl::report_direct_path_failure() {
   if (direct_disabled_host == nullptr || direct_disabled_device == nullptr ||
       direct_error_host == nullptr || direct_error_device == nullptr) return;
-  check_cuda(cudaMemcpyAsync(direct_disabled_host, direct_disabled_device,
-                             sizeof(u32), cudaMemcpyDeviceToHost, rdma_stream),
-             "cudaMemcpyAsync(GPUNetIO failure flag)");
-  check_cuda(cudaMemcpyAsync(direct_error_host, direct_error_device,
-                             sizeof(i32), cudaMemcpyDeviceToHost, rdma_stream),
-             "cudaMemcpyAsync(GPUNetIO failure status)");
-  check_cuda(cudaStreamSynchronize(rdma_stream),
-             "cudaStreamSynchronize(GPUNetIO failure status)");
+  cudaError_t status = cudaMemcpyAsync(
+    direct_disabled_host, direct_disabled_device, sizeof(u32),
+    cudaMemcpyDeviceToHost, rdma_stream);
+  if (status == cudaSuccess) {
+    status = cudaMemcpyAsync(direct_error_host, direct_error_device,
+                             sizeof(i32), cudaMemcpyDeviceToHost, rdma_stream);
+  }
+  if (status == cudaSuccess) status = cudaStreamSynchronize(rdma_stream);
+  if (status != cudaSuccess) {
+    mark_unhealthy(std::string("failed to inspect GPUNetIO failure state: ") +
+                   cudaGetErrorString(status));
+    return;
+  }
   if (*direct_disabled_host == 0) return;
   bool expected = false;
   if (!direct_failure_logged.compare_exchange_strong(
@@ -37,26 +62,143 @@ void PersistentSearchEngine::Impl::report_direct_path_failure() {
 }
 
 void PersistentSearchEngine::Impl::completion_loop() {
-  while (!shutdown.load(std::memory_order_acquire) ||
-         pending_count.load(std::memory_order_acquire) != 0) {
+  try {
+    bind_cuda_device("cudaSetDevice(GPU completion/watchdog)");
+  } catch (const std::exception& exception) {
+    mark_unhealthy(exception.what());
+    return;
+  }
+
+  std::vector<owner_watchdog::Tracker> owner_trackers(
+    direct_batch_queue_count);
+  const u64 watchdog_timeout_ns = owner_watchdog::stall_timeout_ns(
+    kernel_params.direct_timeout_ns);
+  const u64 watchdog_poll_ns = std::max<u64>(
+    1'000'000ULL, std::min<u64>(10'000'000ULL, watchdog_timeout_ns / 8));
+  u64 next_watchdog_poll_ns = steady_now_ns() + watchdog_poll_ns;
+
+  while (!shutdown.load(std::memory_order_acquire)) {
+    const u64 now_ns = steady_now_ns();
+    if (now_ns >= next_watchdog_poll_ns &&
+        accepting.load(std::memory_order_acquire) &&
+        healthy.load(std::memory_order_acquire) &&
+        !query_stop.load(std::memory_order_acquire)) {
+      next_watchdog_poll_ns = now_ns + watchdog_poll_ns;
+
+      const cudaError_t stream_status = cudaStreamQuery(kernel_stream);
+      if (stream_status == cudaSuccess) {
+        mark_unhealthy(
+          "persistent CUDA kernel terminated while query admission was active");
+      } else if (stream_status != cudaErrorNotReady) {
+        mark_unhealthy(std::string("persistent CUDA kernel failed: ") +
+                       cudaGetErrorString(stream_status));
+      } else if (direct_owner_progress_host != nullptr &&
+                 d_direct_owner_progress != nullptr) {
+        bool has_pending_query = false;
+        for (u32 slot = 0; slot < query_slots; ++slot) {
+          if (query_slot_states[slot].phase.load(std::memory_order_acquire) ==
+              static_cast<u32>(QuerySlotPhase::pending)) {
+            has_pending_query = true;
+            break;
+          }
+        }
+        if (!has_pending_query) continue;
+
+        cudaError_t progress_status = cudaMemcpyAsync(
+          direct_owner_progress_host, d_direct_owner_progress,
+          static_cast<size_t>(direct_batch_queue_count) *
+            sizeof(DirectOwnerProgress),
+          cudaMemcpyDeviceToHost, rdma_stream);
+        if (progress_status == cudaSuccess) {
+          progress_status = cudaStreamSynchronize(rdma_stream);
+        }
+        if (progress_status != cudaSuccess) {
+          mark_unhealthy(std::string("failed to sample GPUNetIO owner progress: ") +
+                         cudaGetErrorString(progress_status));
+          continue;
+        }
+
+        for (u32 owner = 0; owner < direct_batch_queue_count; ++owner) {
+          const owner_watchdog::Observation observation =
+            sample_owner_progress(direct_owner_progress_host[owner]);
+          if (!owner_trackers[owner].observe(
+                observation, now_ns, watchdog_timeout_ns)) {
+            continue;
+          }
+
+          // Wake every GPU waiter before rejecting host slots. This is a
+          // transport-wide fail-stop, but unlike the removed query-side timer
+          // it is reached only after an owner with outstanding work made no
+          // dequeue/completion progress for a transport-derived grace period.
+          *direct_disabled_host = 1;
+          *direct_error_host = -ETIMEDOUT;
+          cudaError_t publish_status = cudaMemcpyAsync(
+            direct_disabled_device, direct_disabled_host, sizeof(u32),
+            cudaMemcpyHostToDevice, rdma_stream);
+          if (publish_status == cudaSuccess) {
+            publish_status = cudaMemcpyAsync(
+              direct_error_device, direct_error_host, sizeof(i32),
+              cudaMemcpyHostToDevice, rdma_stream);
+          }
+          if (publish_status == cudaSuccess) {
+            publish_status = cudaStreamSynchronize(rdma_stream);
+          }
+
+          const u32 phase = direct_owner_phases_host == nullptr ? 0u :
+            std::atomic_ref<u32>(direct_owner_phases_host[owner]).load(
+              std::memory_order_acquire);
+          const u64 outstanding = observation.announced >= observation.completed
+            ? observation.announced - observation.completed : 0;
+          std::ostringstream message;
+          message << "GPUNetIO owner watchdog stalled owner=" << owner
+                  << " outstanding=" << outstanding
+                  << " announced=" << observation.announced
+                  << " dequeued=" << observation.dequeued
+                  << " completed=" << observation.completed
+                  << " heartbeat=" << observation.heartbeat
+                  << " phase=" << phase
+                  << " stalled_ms="
+                  << owner_trackers[owner].stalled_for_ns(now_ns) / 1'000'000
+                  << " transport_timeout_ms="
+                  << kernel_params.direct_timeout_ns / 1'000'000;
+          if (publish_status != cudaSuccess) {
+            message << " failure_publish_error="
+                    << cudaGetErrorString(publish_status);
+          }
+          bool expected = false;
+          if (direct_failure_logged.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            engine.telemetry_.direct_path_failures.fetch_add(
+              1, std::memory_order_relaxed);
+          }
+          mark_unhealthy(message.str());
+          break;
+        }
+      }
+    }
+
     CompletionDescriptor completion;
     if (!completions.try_pop(completion)) {
       std::this_thread::yield();
       continue;
     }
-    if (completion.status != 0) report_direct_path_failure();
-    std::shared_ptr<PendingQuery> pending;
-    {
-      std::lock_guard<std::mutex> lock(pending_mutex);
-      const auto it = pending_queries.find(completion.request_id);
-      if (it != pending_queries.end()) {
-        pending = std::move(it->second);
-        pending_queries.erase(it);
-      }
-    }
-    if (!pending) {
+    if (completion.query_slot >= query_slots) {
       continue;
     }
+    QuerySlotState& state = query_slot_states[completion.query_slot];
+    if (state.phase.load(std::memory_order_acquire) !=
+          static_cast<u32>(QuerySlotPhase::pending) ||
+        state.request_id != completion.request_id) {
+      // A fail-stop/shutdown rejection can race a descriptor already running
+      // on the GPU. Slot+request identity prevents that stale completion from
+      // publishing into a later slot generation.
+      continue;
+    }
+    if (completion.status == 0 &&
+        completion.result_count > result_capacity) {
+      completion.status = -EOVERFLOW;
+    }
+    const auto submitted_at = state.submitted_at;
     const auto completed_at = std::chrono::steady_clock::now();
     const u64 gpu_ns = completion.gpu_cycles * 1000000ULL / gpu_clock_khz;
     const auto phase_ns = [&](u64 cycles) {
@@ -64,7 +206,7 @@ void PersistentSearchEngine::Impl::completion_loop() {
     };
     const u64 end_to_end_ns = static_cast<u64>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
-        completed_at - pending->submitted_at).count());
+        completed_at - submitted_at).count());
     if (end_to_end_ns >= 10000000ULL &&
         slow_query_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
       std::cerr << "[gpu-search] slow query e2e_us=" << end_to_end_ns / 1000
@@ -81,30 +223,23 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << " route_hits=" << completion.route_hits
                 << " exact_reads=" << completion.exact_vectors << '\n';
     }
-    try {
-      if (completion.status != 0) {
-        const std::string message = "persistent GPU query failed with status " +
-          std::to_string(completion.status);
-        mark_unhealthy(message);
-        throw std::runtime_error(message);
+    if (completion.status != 0) {
+      report_direct_path_failure();
+      if (healthy.load(std::memory_order_acquire)) {
+        mark_unhealthy("persistent GPU query failed with status " +
+                       std::to_string(completion.status));
       }
-      const size_t offset = static_cast<size_t>(pending->slot) * result_capacity;
-      service::QueryResult result;
-      result.reserve(completion.result_count);
-      for (u32 index = 0; index < completion.result_count; ++index) {
-        result.push_back({result_ids_host[offset + index],
-                          result_distances_host[offset + index]});
+      reject_query_slot(completion.query_slot);
+    } else {
+      state.completion = completion;
+      u32 expected = static_cast<u32>(QuerySlotPhase::pending);
+      if (!state.phase.compare_exchange_strong(
+            expected, static_cast<u32>(QuerySlotPhase::completed),
+            std::memory_order_release, std::memory_order_acquire)) {
+        continue;
       }
-      pending->promise.set_value(std::move(result));
-    } catch (...) {
-      pending->promise.set_exception(std::current_exception());
+      state.phase.notify_all();
     }
-    {
-      std::lock_guard<std::mutex> lock(slot_mutex);
-      free_slots.push_back(pending->slot);
-    }
-    slot_cv.notify_one();
-    pending_count.fetch_sub(1, std::memory_order_release);
     engine.telemetry_.queries_completed.fetch_add(1, std::memory_order_relaxed);
     engine.telemetry_.gpu_active_ns.fetch_add(gpu_ns, std::memory_order_relaxed);
     engine.telemetry_.gpu_prepare_ns.fetch_add(

@@ -58,6 +58,19 @@ public:
     }
   }
 
+  template <class U>
+  bool push_wait(U&& value, const std::atomic<bool>& stop) {
+    for (;;) {
+      if (stop.load(std::memory_order_acquire)) return false;
+      if (emplace(std::forward<U>(value))) return true;
+      if (stop.load(std::memory_order_acquire)) return false;
+      const u64 observed = pop_epoch_.load(std::memory_order_acquire);
+      if (emplace(std::forward<U>(value))) return true;
+      if (stop.load(std::memory_order_acquire)) return false;
+      pop_epoch_.wait(observed, std::memory_order_relaxed);
+    }
+  }
+
   bool try_pop(T& value) {
     u64 position = dequeue_position_.load(std::memory_order_relaxed);
     Cell* cell = nullptr;

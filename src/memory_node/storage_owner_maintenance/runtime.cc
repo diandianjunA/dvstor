@@ -484,6 +484,9 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(peer_stage1_processed) +
                " peer_stage1_items=" +
                std::to_string(peer_stage1_items) +
+               " avg_peer_stage1_items=" +
+               std::to_string(ratio_or_zero(
+                 peer_stage1_items, peer_stage1_processed)) +
                " peer_stage1_rate_per_sec=" +
                std::to_string(peer_stage1_rate) +
                " peer_stage1_max_queue=" +

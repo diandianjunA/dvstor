@@ -66,6 +66,65 @@ void test_queue_multiple_producers() {
   }
 }
 
+void test_queue_stopped_producer_does_not_overwrite_full_queue() {
+  bounded::Queue<unsigned> queue(2);
+  assert(queue.try_push(1));
+  assert(queue.try_push(2));
+
+  std::atomic<bool> stop{false};
+  auto producer = std::async(std::launch::async, [&]() {
+    return queue.push_wait(3, stop);
+  });
+  assert(producer.wait_for(std::chrono::milliseconds(10)) ==
+         std::future_status::timeout);
+  stop.store(true, std::memory_order_release);
+  queue.notify_all();
+  assert(producer.get() == false);
+
+  unsigned value = 0;
+  assert(queue.try_pop(value) && value == 1);
+  assert(queue.try_pop(value) && value == 2);
+  assert(!queue.try_pop(value));
+
+  assert(queue.push_wait(4, stop) == false);
+  assert(!queue.try_pop(value));
+}
+
+void test_queue_publication_precedes_slot_reuse() {
+  constexpr unsigned kSlots = 8;
+  constexpr unsigned kThreads = 8;
+  constexpr unsigned kIterations = 20'000;
+  bounded::Queue<unsigned> free_slots(kSlots);
+  std::array<std::atomic<unsigned>, kSlots> phases{};
+  for (unsigned slot = 0; slot < kSlots; ++slot) {
+    phases[slot].store(0, std::memory_order_relaxed);
+    assert(free_slots.try_push(slot));
+  }
+
+  std::atomic<bool> failed{false};
+  std::array<std::thread, kThreads> workers;
+  for (auto& worker : workers) {
+    worker = std::thread([&]() {
+      for (unsigned iteration = 0; iteration < kIterations; ++iteration) {
+        unsigned slot = 0;
+        free_slots.pop_wait(slot);
+        unsigned expected = 0;
+        if (!phases[slot].compare_exchange_strong(
+              expected, 1, std::memory_order_acquire,
+              std::memory_order_relaxed)) {
+          failed.store(true, std::memory_order_relaxed);
+        }
+        // This is the query-slot release order: publish free state first,
+        // then make its index visible to another queue consumer.
+        phases[slot].store(0, std::memory_order_release);
+        free_slots.push_wait(slot);
+      }
+    });
+  }
+  for (auto& worker : workers) worker.join();
+  assert(!failed.load(std::memory_order_relaxed));
+}
+
 void test_completion_pool_reuse_and_abandon() {
   bounded::CompletionPool pool(2);
   const u32 first = pool.acquire();
@@ -90,6 +149,21 @@ void test_completion_pool_reuse_and_abandon() {
   pool.complete(second, false);
   assert(pool.wait(second) == bounded::CompletionPool::Result::failure);
   pool.release_consumer(second);
+}
+
+void test_completion_pool_timed_wait_preserves_producer_reference() {
+  bounded::CompletionPool pool(1);
+  const u32 id = pool.acquire();
+  assert(pool.wait_for(id, std::chrono::milliseconds(1)) ==
+         bounded::CompletionPool::Result::pending);
+  pool.release_consumer(id);
+  pool.complete(id, true);
+
+  const u32 reused = pool.acquire();
+  assert(reused == id);
+  pool.complete(reused, false);
+  assert(pool.wait(reused) == bounded::CompletionPool::Result::failure);
+  pool.release_consumer(reused);
 }
 
 void test_sliding_completion_ring() {
@@ -589,7 +663,10 @@ void test_protected_reparent_capacity_never_evicts_existing_work() {
 int main() {
   test_queue_wrap_and_capacity();
   test_queue_multiple_producers();
+  test_queue_stopped_producer_does_not_overwrite_full_queue();
+  test_queue_publication_precedes_slot_reuse();
   test_completion_pool_reuse_and_abandon();
+  test_completion_pool_timed_wait_preserves_producer_reference();
   test_sliding_completion_ring();
   test_sliding_completion_ring_atomic_batch_admission();
   test_sliding_completion_ring_bounded_smooth_admission();

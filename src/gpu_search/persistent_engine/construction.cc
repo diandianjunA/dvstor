@@ -97,8 +97,15 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   result_capacity = std::max<u32>(config.k, config.gpu_final_rerank_width);
   exact_width = kPersistentMaxExact;
   code_bytes = index.layout.code_bytes;
-  free_slots.resize(query_slots);
-  for (u32 slot = 0; slot < query_slots; ++slot) free_slots[slot] = slot;
+  query_slot_states = std::make_unique<QuerySlotState[]>(query_slots);
+  free_slots = std::make_unique<bounded::Queue<u32>>(query_slots);
+  admission_queue =
+    std::make_unique<bounded::Queue<PendingSubmission>>(query_slots);
+  for (u32 slot = 0; slot < query_slots; ++slot) {
+    if (!free_slots->try_push(slot)) {
+      throw std::runtime_error("failed to initialize bounded GPU query slots");
+    }
+  }
 
   node_record_bytes = static_cast<u32>(VamanaNode::size_until_vector_end());
   node_record_stride = static_cast<u32>(align_up(
@@ -150,6 +157,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
       (sizeof(u64) + sizeof(QueryDescriptor));
   const u64 direct_queue_bytes = estimated_direct_queue_count *
     (2 * sizeof(u64) + sizeof(DeviceRingView<DirectBatchDescriptor>) +
+     sizeof(DirectOwnerProgress) +
      static_cast<u64>(kDirectBatchQueueCapacity) *
        (sizeof(u64) + sizeof(DirectBatchDescriptor))) +
     static_cast<u64>(query_slots) * index.shards.size() * sizeof(i32);
@@ -354,6 +362,14 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   mapped_host_allocate(direct_owner_phases_host, d_direct_owner_phases,
                        direct_batch_queue_count,
                        "cudaHostAlloc(GPUNetIO owner runtime phases)");
+  check_cuda(cudaHostAlloc(
+               reinterpret_cast<void**>(&direct_owner_progress_host),
+               static_cast<size_t>(direct_batch_queue_count) *
+                 sizeof(DirectOwnerProgress),
+               cudaHostAllocPortable),
+             "cudaHostAlloc(GPUNetIO owner watchdog staging)");
+  device_allocate(d_direct_owner_progress, direct_batch_queue_count,
+                  "cudaMalloc(GPUNetIO owner watchdog progress)");
   check_cuda(cudaMemset(d_direct_batch_enqueue, 0,
                         static_cast<size_t>(direct_batch_queue_count) * sizeof(u64)),
              "cudaMemset(GPUNetIO owner enqueue positions)");
@@ -473,26 +489,24 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   check_cuda(cudaGetDeviceProperties(&properties, static_cast<int>(config.gpu_device)),
              "cudaGetDeviceProperties(GPU navigation)");
   gpu_clock_khz = static_cast<u64>(std::max(1, properties.clockRate));
-  constexpr u32 warp_width = 32;
-  const u32 owner_warps_per_block = kPersistentQueryThreads / warp_width;
-  owner_kernel_blocks =
-    (direct_batch_queue_count + owner_warps_per_block - 1) /
-    owner_warps_per_block;
-  const u32 resident_blocks = static_cast<u32>(
-    std::max(1, properties.multiProcessorCount));
-  constexpr u32 control_blocks = 2;
-  if (owner_kernel_blocks + control_blocks >= resident_blocks) {
-    throw std::runtime_error(
-      "GPU has too few SMs to keep GPUNetIO owners and control resident");
+  std::array<PersistentKernelOccupancy, 2> occupancies{};
+  std::array<u32, 2> hardware_blocks_per_sm{};
+  for (size_t index = 0; index < occupancies.size(); ++index) {
+    occupancies[index] = inspect_persistent_search_kernel(
+      kPersistentThreadCandidates[index]);
+    hardware_blocks_per_sm[index] =
+      occupancies[index].active_blocks_per_sm;
   }
-  const u64 requested_blocks = static_cast<u64>(
-    std::max(1, properties.multiProcessorCount)) * config.gpu_persistent_blocks_per_sm;
-  const u64 useful_blocks = std::max<u64>(1, config.num_threads);
-  const u64 resident_query_blocks =
-    resident_blocks - owner_kernel_blocks - control_blocks;
-  kernel_blocks = static_cast<u32>(std::min({
-    static_cast<u64>(query_slots), requested_blocks, useful_blocks,
-    resident_query_blocks}));
+  persistent_grid_plan = plan_persistent_grid(
+    hardware_blocks_per_sm, config.gpu_persistent_blocks_per_sm,
+    static_cast<u32>(std::max(1, properties.multiProcessorCount)),
+    query_slots, direct_batch_queue_count);
+  kernel_threads = persistent_grid_plan.selected.threads;
+  owner_kernel_blocks = persistent_grid_plan.selected.owner_blocks;
+  kernel_blocks = persistent_grid_plan.selected.query_blocks;
+  const size_t selected_index =
+    kernel_threads == kPersistentThreadCandidates[0] ? 0 : 1;
+  persistent_kernel_occupancy = occupancies[selected_index];
 
   kernel_params = PersistentKernelParams{
     .submissions = submissions.device_view(),
@@ -552,6 +566,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .direct_batch_statuses = d_direct_batch_statuses,
     .direct_batch_queue_count = direct_batch_queue_count,
     .direct_owner_phases = d_direct_owner_phases,
+    .direct_owner_progress = d_direct_owner_progress,
     .direct_dump = direct_view.dump,
     .direct_disabled = direct_disabled_device,
     .direct_error = direct_error_device,

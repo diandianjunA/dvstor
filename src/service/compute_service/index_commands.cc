@@ -12,8 +12,7 @@ ComputeService::Status ComputeService::status() const {
 }
 
 void ComputeService::reset_breakdown_state() {
-  std::lock_guard<std::mutex> lock(breakdown_mutex_);
-  completed_breakdown_report_ = {};
+  completed_breakdown_report_.reset();
   breakdown_enabled_.store(config_.enable_breakdown,
                            std::memory_order_release);
   persistent_search_->reset_telemetry();
@@ -24,8 +23,7 @@ void ComputeService::clear_thread_statistics() {
 }
 
 service::breakdown::Report ComputeService::collect_breakdown_report() const {
-  std::lock_guard<std::mutex> lock(breakdown_mutex_);
-  return completed_breakdown_report_;
+  return completed_breakdown_report_.collect();
 }
 
 void ComputeService::init_remote_tokens() {

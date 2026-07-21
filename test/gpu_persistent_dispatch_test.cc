@@ -61,6 +61,16 @@ int main(int argc, char** argv) {
       return 0;
     }
     check_cuda(cudaSetDevice(0), "cudaSetDevice");
+    for (const u32 threads : {128u, 256u}) {
+      const auto occupancy =
+        gpu_search::inspect_persistent_search_kernel(threads);
+      if (occupancy.active_blocks_per_sm == 0 ||
+          occupancy.registers_per_thread == 0 ||
+          occupancy.max_threads_per_block < threads) {
+        throw std::runtime_error(
+          "persistent search occupancy inspection returned invalid data");
+      }
+    }
 
     MappedRing<gpu_search::QueryDescriptor> submissions(
       256, MappedRing<gpu_search::QueryDescriptor>::Direction::host_to_device);

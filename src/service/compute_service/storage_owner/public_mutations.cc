@@ -42,7 +42,23 @@ size_t ComputeService::submit_storage_owner_mutations(
   const auto consume_one = [&]() {
     lib_assert(!pending.empty(), "missing storage-owner completion");
     const u32 completion_id = pending.back();
-    const auto result = storage_completion_pool_->wait(completion_id);
+    const auto result = storage_completion_pool_->wait_for(
+      completion_id,
+      std::chrono::milliseconds(config_.storage_owner_rpc_timeout_ms));
+    if (result == bounded::CompletionPool::Result::pending) {
+      const u64 log_index = storage_insert_late_rpc_completions_.fetch_add(
+        1, std::memory_order_relaxed);
+      if (log_index < 8) {
+        std::cerr << "[storage-owner] mutation RPC timed out after "
+                  << config_.storage_owner_rpc_timeout_ms
+                  << " ms; caller stopped waiting but the bounded producer "
+                     "cell remains valid until its late completion"
+                  << std::endl;
+      }
+      storage_completion_pool_->release_consumer(completion_id);
+      pending.pop_back();
+      return;
+    }
     auto& sample = storage_completion_samples_[completion_id];
     if (sample.collects_breakdown()) {
       sample.add_subcategory(
@@ -52,7 +68,6 @@ size_t ComputeService::submit_storage_owner_mutations(
     }
     sample.mark_finished(std::chrono::steady_clock::now());
     if (sample.finished_flag) {
-      std::lock_guard<std::mutex> lock(breakdown_mutex_);
       service::breakdown::add_sample(
         completed_breakdown_report_.insert, sample);
     }
@@ -79,6 +94,25 @@ size_t ComputeService::submit_storage_owner_mutations(
     const u32 owner_storage = static_cast<u32>(item.id % num_servers_);
     lib_assert(owner_storage < storage_insert_owners_.size(),
                "storage-owner route selected an invalid owner");
+    auto& state = *storage_insert_owners_[owner_storage];
+    struct ProducerAnnouncement {
+      std::atomic<u32>& pending;
+      bool active{true};
+
+      explicit ProducerAnnouncement(std::atomic<u32>& value)
+          : pending(value) {
+        pending.fetch_add(1, std::memory_order_acq_rel);
+      }
+      ~ProducerAnnouncement() {
+        if (active) retire();
+      }
+      void retire() {
+        const u32 previous = pending.fetch_sub(1, std::memory_order_release);
+        lib_assert(previous != 0,
+                   "storage-owner producer announcement underflow");
+        active = false;
+      }
+    } producer_announcement{state.pending_producers};
     u32 stage1_home = owner_storage;
     if (kind != service::storage_owner::MutationKind::erase) {
       if (persistent_search_ == nullptr) {
@@ -121,7 +155,6 @@ size_t ComputeService::submit_storage_owner_mutations(
       service::breakdown::Subcategory::cpu_storage_owner_route,
       duration_ns(operation_started, route_finished));
 
-    auto& state = *storage_insert_owners_[owner_storage];
     u32 task_id = 0;
     state.free_tasks->pop_wait(task_id);
     auto& task = state.tasks[task_id];
@@ -138,6 +171,10 @@ size_t ComputeService::submit_storage_owner_mutations(
     task.enqueued_at = std::chrono::steady_clock::now();
     task.sender_dequeued_at = {};
     state.queue->push_wait(task_id);
+    // Queue publication precedes the release-store. A sender that observes no
+    // remaining producer therefore either already drained this task or can
+    // acquire it on its final queue probe.
+    producer_announcement.retire();
     pending.push_back(completion_id);
   }
 
@@ -169,4 +206,29 @@ size_t ComputeService::erase(const vec<node_t>& ids) {
   }
   return submit_storage_owner_mutations(
     items, service::storage_owner::MutationKind::erase);
+}
+
+bool ComputeService::wait_for_storage_maintenance(
+    std::chrono::milliseconds timeout,
+    vec<u64>* target_sequences,
+    vec<u64>* durable_sequences) {
+  if (!config_.enable_updates || storage_maintenance_targets_ == nullptr) {
+    if (target_sequences != nullptr) target_sequences->clear();
+    if (durable_sequences != nullptr) durable_sequences->clear();
+    return true;
+  }
+  vec<u64> targets(num_servers_, 0);
+  for (u32 shard = 0; shard < num_servers_; ++shard) {
+    targets[shard] = storage_maintenance_targets_[shard].load(
+      std::memory_order_acquire);
+  }
+  vec<u64> effective_targets;
+  const bool complete = persistent_search_ != nullptr &&
+    persistent_search_->wait_for_maintenance(
+      span<const u64>{targets}, timeout, durable_sequences,
+      &effective_targets);
+  if (target_sequences != nullptr) {
+    *target_sequences = std::move(effective_targets);
+  }
+  return complete;
 }

@@ -4,7 +4,6 @@
 #include <chrono>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -56,6 +55,10 @@ public:
   size_t insert(const vec<InsertItem>& batch);
   size_t upsert(const vec<InsertItem>& batch);
   size_t erase(const vec<node_t>& ids);
+  bool wait_for_storage_maintenance(
+    std::chrono::milliseconds timeout,
+    vec<u64>* target_sequences = nullptr,
+    vec<u64>* durable_sequences = nullptr);
   vec<node_t> search(const vec<element_t>& query, u32 k);
   vec<node_t> search_raw(VectorDType query_dtype, const byte_t* query_data, u32 dim, u32 k);
   Status status() const;
@@ -119,12 +122,25 @@ private:
 
   struct StorageOwnerSenderState {
     u32 task_capacity{};
+    // Producers announce before canonicalization/centroid routing and retire
+    // the announcement only after publishing their task into queue. This lets
+    // the sender distinguish real concurrent demand from an isolated write
+    // without a time-based batching delay.
+    std::atomic<u32> pending_producers{0};
     std::unique_ptr<bounded::Queue<u32>> queue;
     std::unique_ptr<bounded::Queue<u32>> free_tasks;
     std::unique_ptr<StorageInsertTask[]> tasks;
     vec<StorageOwnerRpcSlot> slots;
     vec<StorageOwnerResponseSlot> response_slots;
     vec<u32> free_slots;
+    // Written only by the progress thread. Power-of-two snapshots are logged
+    // so a benchmark can verify that batching is real rather than inferred
+    // from submitted operation counts.
+    u64 rpc_batches{};
+    u64 rpc_items{};
+    u64 concurrent_wait_batches{};
+    u64 concurrent_wait_rounds{};
+    u64 concurrent_wait_ns{};
   };
 
   struct StorageOwnerReadySlot {
@@ -193,10 +209,10 @@ private:
   std::unique_ptr<bounded::Queue<StorageOwnerReleasedSlot>> storage_released_slots_;
   std::unique_ptr<bounded::CompletionPool> storage_completion_pool_;
   std::unique_ptr<service::breakdown::Sample[]> storage_completion_samples_;
+  std::unique_ptr<std::atomic<u64>[]> storage_maintenance_targets_;
   vec<std::unique_ptr<StorageOwnerSenderState>> storage_insert_owners_;
   std::atomic<u64> next_request_id_{1};
 
-  mutable std::mutex breakdown_mutex_;
   std::atomic<bool> breakdown_enabled_{false};
-  service::breakdown::Report completed_breakdown_report_;
+  service::breakdown::ConcurrentReport completed_breakdown_report_;
 };

@@ -1,4 +1,5 @@
 #include "memory_node/storage_owner_index/detail.hh"
+#include "memory_node/storage_owner_index/locked_node_publication.hh"
 #include "memory_node/storage_owner_index/vector_snapshot_policy.hh"
 
 using namespace memory_node_storage_owner_index_detail;
@@ -43,6 +44,93 @@ IncarnationLockResult MemoryNode::try_lock_node(RemotePtr rptr) {
     std::this_thread::yield();
   }
   return IncarnationLockResult::busy;
+}
+
+bool MemoryNode::read_locked_node_identity(RemotePtr rptr,
+                                           u64& header,
+                                           node_t& id,
+                                           u32& generation) {
+  header = 0;
+  id = 0;
+  generation = 0;
+  if (rptr.is_null() || !rptr.is_well_formed() ||
+      rptr.memory_node() >= num_storage_nodes_ ||
+      !VamanaNode::hot_graph_entry_available(rptr)) {
+    return false;
+  }
+  constexpr size_t identity_bytes =
+    memory_node_storage_owner_index_detail::kLockedNodeIdentityBytes;
+  if (rptr.byte_offset() > mn_memory_bytes_ ||
+      identity_bytes > mn_memory_bytes_ - rptr.byte_offset()) {
+    return false;
+  }
+
+  memory_node_storage_owner_index_detail::LockedNodeIdentity identity;
+  const bool valid = memory_node_storage_owner_index_detail::
+    read_and_validate_locked_node_identity(
+      rptr,
+      [&](byte_t* destination, size_t bytes) {
+        if (local_shard(rptr.memory_node())) {
+          const u64 local_header = load_local_node_header_acquire(rptr);
+          std::memcpy(destination, &local_header, sizeof(local_header));
+          std::memcpy(destination + VamanaNode::HEADER_SIZE,
+                      index_buffer_.get_full_buffer() +
+                        rptr.byte_offset() + VamanaNode::HEADER_SIZE,
+                      VamanaNode::COMPACT_META_SIZE);
+          std::atomic_thread_fence(std::memory_order_acquire);
+        } else {
+          remote_read_bytes(rptr.memory_node(), rptr.byte_offset(),
+                            destination, bytes, 0);
+        }
+        return true;
+      },
+      identity);
+  header = identity.header;
+  id = identity.id;
+  generation = identity.generation;
+  return valid;
+}
+
+bool MemoryNode::publish_locked_node_header(RemotePtr rptr,
+                                            u64 observed_header,
+                                            u64 set_flags,
+                                            u64 clear_flags) {
+  if (rptr.is_null() || !rptr.is_well_formed() ||
+      rptr.memory_node() >= num_storage_nodes_ ||
+      !VamanaNode::hot_graph_entry_available(rptr)) {
+    return false;
+  }
+  const u64 header_offset =
+    vamana::StorageLayoutResolver::header(rptr).offset;
+  if (header_offset > mn_memory_bytes_ ||
+      sizeof(u64) > mn_memory_bytes_ - header_offset) {
+    return false;
+  }
+  if (local_shard(rptr.memory_node())) {
+    auto* storage = reinterpret_cast<u64*>(
+      index_buffer_.get_full_buffer() + header_offset);
+    std::atomic_ref<u64> header_ref(*storage);
+    return memory_node_storage_owner_index_detail::
+      publish_locked_node_header_transition(
+        rptr, observed_header, set_flags, clear_flags,
+        [&](u64 expected, u64 desired) {
+          const u64 original = expected;
+          if (header_ref.compare_exchange_strong(
+                expected, desired, std::memory_order_release,
+                std::memory_order_acquire)) {
+            return original;
+          }
+          return expected;
+        });
+  }
+  return memory_node_storage_owner_index_detail::
+    publish_locked_node_header_transition(
+      rptr, observed_header, set_flags, clear_flags,
+      [&](u64 expected, u64 desired) {
+        return remote_compare_and_swap(
+          rptr.memory_node(), header_offset, expected, desired,
+          align_up(sizeof(expected)));
+      });
 }
 
 bool MemoryNode::read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
