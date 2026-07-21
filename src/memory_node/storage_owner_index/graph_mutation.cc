@@ -51,7 +51,8 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
     batch.clear();
     batch.insert(batch.end(), filtered.begin() + begin, filtered.begin() + end);
     auto t_snapshot = std::chrono::steady_clock::now();
-    vec<NodeSnapshot> snapshots = read_node_snapshots_batched(batch, config);
+    vec<NodeSnapshot> snapshots = read_node_snapshots_batched(
+      batch, config, "robust_prune_cpu");
     if (breakdown != nullptr) {
       breakdown->storage_owner_prune_snapshot_read_ns += elapsed_ns_since(t_snapshot);
     }
@@ -519,7 +520,8 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
       }
     }
     vec<NodeSnapshot> snapshots =
-      read_node_snapshots_batched(prune_candidates, config);
+      read_node_snapshots_batched(
+        prune_candidates, config, "apply_local_reverse_update");
     hashset_t<RemotePtr> skip;
     skip.insert(target_ptr);
     vec<RemotePtr> selected_neighbors = robust_prune_snapshots_cpu(

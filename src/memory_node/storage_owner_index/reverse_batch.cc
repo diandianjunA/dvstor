@@ -159,7 +159,8 @@ bool MemoryNode::apply_local_reverse_updates_batched(
   // locked pass only needs its narrow liveness-boundary header checks; bulk
   // remote vector reads and alpha pruning stay outside the critical section.
   vec<NodeSnapshot> snapshots =
-    read_node_snapshots_batched(snapshots_needed, config);
+    read_node_snapshots_batched(
+      snapshots_needed, config, "apply_local_reverse_updates_batched");
   dense_hashmap_t<u64, size_t> snapshot_index;
   snapshot_index.reserve(snapshots.size());
   for (size_t index = 0; index < snapshots.size(); ++index) {

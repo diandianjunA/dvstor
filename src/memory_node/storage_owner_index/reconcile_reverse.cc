@@ -96,6 +96,8 @@ bool MemoryNode::reconcile_local_reverse_ops(
     const u64 target_header = load_local_node_header_acquire(target);
     const bool target_stable =
       VamanaNode::stable_graph_mutation_allowed(target_header);
+    const bool target_route_accounted =
+      (target_header & VamanaNode::HEADER_CENTROID_ACCOUNTED) != 0;
     GraphAdjacency adjacency;
     if (!read_graph_adjacency(target, adjacency)) {
       for (const size_t op_index : op_indices) {
@@ -151,7 +153,8 @@ bool MemoryNode::reconcile_local_reverse_ops(
 
     const auto robust_prune = [&](const vec<RemotePtr>& candidates) {
       vec<NodeSnapshot> snapshots =
-        read_node_snapshots_batched(candidates, config);
+        read_node_snapshots_batched(
+          candidates, config, "reconcile_local_reverse_ops");
       hashset_t<RemotePtr> skip;
       skip.insert(target);
       const auto target_vector =
@@ -173,6 +176,16 @@ bool MemoryNode::reconcile_local_reverse_ops(
       const size_t op_index = op_indices[group_position];
       const auto& op = ops[op_index];
       const auto kind = static_cast<ReconcileReverseOpKind>(op.kind);
+
+      // Reachability certificates may only land on a node that still belongs
+      // to the versioned centroid routing backbone while its incarnation lock
+      // is held.  This closes the selection-to-RPC retirement window without
+      // preventing ordinary removal cleanup on a node leaving the route.
+      const bool mandatory_reachability =
+        kind == ReconcileReverseOpKind::promote_stable_bridge ||
+        kind == ReconcileReverseOpKind::ensure_reachable;
+      const bool reachability_target_stable = target_stable &&
+        (!mandatory_reachability || target_route_accounted);
 
       if (kind == ReconcileReverseOpKind::add) {
         // Preserve the original per-target order. Stronger reconciliation
@@ -268,7 +281,8 @@ bool MemoryNode::reconcile_local_reverse_ops(
 
       ReconcileReverseResult& result = results[op_index];
       result = reconcile_reverse_adjacency(
-        op, target_stable, old_identity_matches, new_identity_live,
+        op, reachability_target_stable,
+        old_identity_matches, new_identity_live,
         replacement_equivalent, config.R, VamanaNode::provisional_slots(),
         adjacency.stable, adjacency.provisional, robust_prune);
       publish_allowed = publish_allowed || result.stale == 0;

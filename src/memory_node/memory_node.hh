@@ -732,11 +732,15 @@ private:
                                 vec<RemotePtr>& neighbors,
                                 vec<byte_t>& entry,
                                 vec<byte_t>& decoded) const;
-  vec<NodeSnapshot> read_node_snapshots_batched(const vec<RemotePtr>& rptrs, const Configuration& config);
+  vec<NodeSnapshot> read_node_snapshots_batched(
+      const vec<RemotePtr>& rptrs,
+      const Configuration& config,
+      const char* boundary = "read_node_snapshots_batched");
   size_t read_node_snapshots_batched_into(
       span<const RemotePtr> rptrs,
       const Configuration& config,
-      vec<NodeSnapshot>& snapshots);
+      vec<NodeSnapshot>& snapshots,
+      const char* boundary = "read_node_snapshots_batched_into");
   const vec<BeamEntry>& score_stable_node_vectors_batched(
       span<const RemotePtr> rptrs,
       const byte_t* stored_query,

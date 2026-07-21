@@ -932,11 +932,13 @@ bool MemoryNode::read_local_neighbor_list(RemotePtr rptr,
   return true;
 }
 
-vec<MemoryNode::NodeSnapshot> MemoryNode::read_node_snapshots_batched(const vec<RemotePtr>& rptrs,
-                                                                      const Configuration& config) {
+vec<MemoryNode::NodeSnapshot> MemoryNode::read_node_snapshots_batched(
+    const vec<RemotePtr>& rptrs,
+    const Configuration& config,
+    const char* boundary) {
   vec<NodeSnapshot> snapshots;
   const size_t snapshot_count = read_node_snapshots_batched_into(
-    span<const RemotePtr>{rptrs}, config, snapshots);
+    span<const RemotePtr>{rptrs}, config, snapshots, boundary);
   snapshots.resize(snapshot_count);
   return snapshots;
 }
@@ -944,7 +946,8 @@ vec<MemoryNode::NodeSnapshot> MemoryNode::read_node_snapshots_batched(const vec<
 size_t MemoryNode::read_node_snapshots_batched_into(
     span<const RemotePtr> rptrs,
     const Configuration& config,
-    vec<NodeSnapshot>& snapshots) {
+    vec<NodeSnapshot>& snapshots,
+    const char* boundary) {
   snapshots.reserve(rptrs.size());
   size_t snapshot_count = 0;
   if (rptrs.empty()) {
@@ -991,7 +994,7 @@ size_t MemoryNode::read_node_snapshots_batched_into(
 
       if (!storage_node_pointer_addressable(rptr)) {
         report_rejected_graph_pointer(
-          "read_node_snapshots_batched", rptr, num_storage_nodes_);
+          boundary, rptr, num_storage_nodes_);
         continue;
       }
 

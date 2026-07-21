@@ -244,7 +244,9 @@ void MemoryNode::continue_stage2_search_candidates_batched(
     const Configuration& config) {
   lib_assert(tasks.size() == targets.size(),
              "batched Stage2 continuation lost task/target correlation");
-  candidates_by_task.clear();
+  // Each resumable Stage2 context owns this output. Preserve active inner
+  // vector capacity across context reuse instead of destroying every row on
+  // each batch; the final-beam scatter below clears the rows it writes.
   candidates_by_task.resize(tasks.size());
   if (tasks.empty()) return;
 

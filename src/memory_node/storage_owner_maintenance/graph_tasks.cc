@@ -176,7 +176,8 @@ bool MemoryNode::remove_local_neighbors_identity_fenced(
   candidates.erase(std::unique(candidates.begin(), candidates.end()),
                    candidates.end());
   const vec<NodeSnapshot> candidate_snapshots =
-    read_node_snapshots_batched(candidates, config);
+    read_node_snapshots_batched(
+      candidates, config, "remove_local_neighbors_identity_fenced");
   dense_hashmap_t<u64, NodeSnapshot> candidate_by_raw;
   candidate_by_raw.reserve(candidate_snapshots.size());
   for (const NodeSnapshot& snapshot : candidate_snapshots) {
