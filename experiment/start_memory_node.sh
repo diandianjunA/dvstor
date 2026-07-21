@@ -16,6 +16,7 @@ ensure_built dvstor_memory_node
 
 PORT=$((BASE_PORT + NODE_ID - 1))
 validate_index_metadata storage "$NODE_ID"
+resolve_mn_memory_gb
 SHARD_FILE="$(shard_file "$NODE_ID")"
 
 PID_FILE="$PID_DIR/memory_node_${NODE_ID}.pid"
