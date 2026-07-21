@@ -61,6 +61,13 @@ void ComputeService::start_storage_nodes() {
     context_.receive();
     lib_assert(response.ready,
                "storage startup failed on node " + std::to_string(server));
+    lib_assert(response.vector_id_namespace_size ==
+                 config_.vector_id_namespace_size,
+               "vector ID namespace mismatch on storage node " +
+                 std::to_string(server) + ": compute=" +
+                 std::to_string(config_.vector_id_namespace_size) +
+                 " storage=" +
+                 std::to_string(response.vector_id_namespace_size));
   }
 }
 
@@ -88,6 +95,7 @@ bool ComputeService::validate_index_metadata(
                 metadata.shard_build_fingerprints.end(), 0) !=
         metadata.shard_build_fingerprints.end() ||
       metadata.dim != config_.dim || metadata.R != config_.R ||
+      metadata.num_vectors != config_.max_vectors ||
       metadata.num_memory_nodes != num_servers_) {
     if (error_message != nullptr) {
       *error_message = "index is not a compatible schema-16 OPQ/PQ GPU index";

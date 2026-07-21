@@ -29,6 +29,9 @@ public:
 
   u32 dim{};
   u32 max_vectors{1'000'000};
+  // Exclusive upper bound for logical node IDs. Zero during option parsing
+  // means "derive from max_vectors" for backward-compatible configurations.
+  u32 vector_id_namespace_size{};
   u32 k{};
   u32 R{64};
   u32 beam_width_construction{200};
@@ -72,6 +75,9 @@ public:
   IndexConfiguration(int argc, char** argv) {
     add_options();
     process_program_options(argc, argv);
+    if (vector_id_namespace_size == 0) {
+      vector_id_namespace_size = max_vectors;
+    }
     vector_data_type = normalize_mode(vector_data_type);
     validate(argv);
     operator<<(std::cerr, *this);
@@ -113,7 +119,11 @@ private:
        "Deterministic random seed.")
       ("dim", po::value<u32>(&dim), "Vector dimension.")
       ("max-vectors", po::value<u32>(&max_vectors)->default_value(max_vectors),
-       "Maximum logical vector identifier range.")
+       "Number of immutable base vectors in the loaded index.")
+      ("vector-id-namespace-size",
+       po::value<u32>(&vector_id_namespace_size)
+         ->default_value(vector_id_namespace_size),
+       "Exclusive upper bound for base and dynamically assigned vector IDs.")
       ("k", po::value<u32>(&k), "Requested nearest-neighbor count.")
       ("R", po::value<u32>(&R)->default_value(R), "Maximum graph out-degree.")
       ("beam-width-construction",
@@ -218,6 +228,9 @@ private:
         R == 0 || beam_width_construction == 0 || mn_memory_gb == 0) {
       fail("threads, dim, max-vectors, k, R, beam-width-construction, and mn-memory must be > 0");
     }
+    if (vector_id_namespace_size < max_vectors) {
+      fail("--vector-id-namespace-size must be >= --max-vectors");
+    }
     if (R > kMaxSupportedGraphDegree) {
       fail("--R must be <= " + std::to_string(kMaxSupportedGraphDegree));
     }
@@ -287,6 +300,8 @@ public:
       output << std::setw(width) << "threads: " << config.num_threads << '\n';
       output << std::setw(width) << "dimension: " << config.dim << '\n';
       output << std::setw(width) << "max vectors: " << config.max_vectors << '\n';
+      output << std::setw(width) << "vector ID namespace [0,N): "
+             << config.vector_id_namespace_size << '\n';
       output << std::setw(width) << "K / R: "
              << config.k << " / " << config.R << '\n';
       output << std::setw(width) << "vector data type: "
@@ -328,6 +343,9 @@ public:
       output << std::setw(width) << "storage shard: "
              << config.server_index_file << '\n';
       output << std::setw(width) << "storage id: " << config.storage_id << '\n';
+      output << std::setw(width) << "base vectors: " << config.max_vectors << '\n';
+      output << std::setw(width) << "vector ID namespace [0,N): "
+             << config.vector_id_namespace_size << '\n';
       output << std::setw(width) << "registered memory GiB: "
              << config.mn_memory_gb << '\n';
       output << std::setfill('=') << std::setw(line_width) << "" << '\n';

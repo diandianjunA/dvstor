@@ -295,7 +295,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     // malformed remote request before it can create an immortal authority
     // tombstone; similarly, never trust a wire-provided physical home enough
     // to index the peer arrays. The per-item failed status is already set.
-    if (ids[index] >= config.max_vectors ||
+    if (ids[index] >= config.vector_id_namespace_size ||
         stage1_homes[index] >= num_storage_nodes_) {
       continue;
     }

@@ -12,6 +12,10 @@ struct Request {
 
 struct Response {
   bool ready{};
+  u8 reserved[3]{};
+  u32 vector_id_namespace_size{};
 };
+
+static_assert(sizeof(Response) == 8);
 
 }  // namespace storage_startup
