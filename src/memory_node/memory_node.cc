@@ -463,12 +463,17 @@ std::pair<bool, str> MemoryNode::load_index_file(const str& path) {
               gpu_search::format::kStorageControlBytes);
   auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
     index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+  const u32 dynamic_navigation_code_payload_bytes =
+    VamanaNode::dynamic_navigation_code_payload_bytes();
+  lib_assert(dynamic_navigation_code_payload_bytes ==
+               gpu_navigation_code_bytes_,
+             "dynamic navigation PQ payload width does not match the index model");
   *control = gpu_search::format::StorageControlBlock{
     .shard_id = storage_id_,
     .dynamic_record_bytes = static_cast<u32>(VamanaNode::allocation_size()),
     .dynamic_hot_offset = VamanaNode::HOT_GRAPH_DYNAMIC_HOT_OFFSET,
     .dynamic_code_offset = VamanaNode::HOT_GRAPH_DYNAMIC_CODE_OFFSET,
-    .code_bytes = VamanaNode::HOT_GRAPH_DYNAMIC_CODE_BYTES,
+    .code_bytes = dynamic_navigation_code_payload_bytes,
     .dynamic_high_watermark = gpu_dynamic_node_base_,
     .centroid_route = {
       .remote_offset = centroid_publication_offset,

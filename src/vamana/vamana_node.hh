@@ -172,6 +172,8 @@ public:
   inline static u32 HOT_GRAPH_DYNAMIC_RECORD_BYTES = 0;
   inline static u32 HOT_GRAPH_DYNAMIC_HOT_OFFSET = 0;
   inline static u32 HOT_GRAPH_DYNAMIC_CODE_OFFSET = 0;
+  // PQ payload bytes only. The preceding incarnation is a distinct validation
+  // field and must never leak into metadata/StorageControlBlock::code_bytes.
   inline static u32 HOT_GRAPH_DYNAMIC_CODE_BYTES = 0;
 
   static size_t hot_graph_entry_size() {
@@ -182,6 +184,10 @@ public:
   }
   static size_t allocation_size() {
     return HAS_HOT_GRAPH ? HOT_GRAPH_DYNAMIC_RECORD_BYTES : total_size();
+  }
+
+  static u32 dynamic_navigation_code_payload_bytes() {
+    return HOT_GRAPH_DYNAMIC_CODE_BYTES;
   }
 
   static void disable_hot_graph() {
@@ -222,16 +228,17 @@ public:
       ? static_cast<u32>(total_size())
       : dynamic_hot_offset;
     HOT_GRAPH_DYNAMIC_CODE_OFFSET = dynamic_code_offset;
-    HOT_GRAPH_DYNAMIC_CODE_BYTES = dynamic_code_bytes == 0
-      ? 0 : dynamic_code_bytes + DYNAMIC_CODE_INCARNATION_BYTES;
+    HOT_GRAPH_DYNAMIC_CODE_BYTES = dynamic_code_bytes;
     HAS_HOT_GRAPH = entry_bytes >= hot_graph_entry_size() &&
       HOT_GRAPH_DYNAMIC_BASE_OFFSETS.size() == HOT_GRAPH_ENTRY_OFFSETS.size() &&
       HOT_GRAPH_DYNAMIC_RECORD_BYTES >= HOT_GRAPH_DYNAMIC_HOT_OFFSET + HOT_GRAPH_ENTRY_BYTES &&
       HOT_GRAPH_DYNAMIC_HOT_OFFSET >= total_size() &&
       (HOT_GRAPH_DYNAMIC_CODE_BYTES == 0 ||
        (HOT_GRAPH_DYNAMIC_CODE_OFFSET >= HOT_GRAPH_DYNAMIC_HOT_OFFSET + HOT_GRAPH_ENTRY_BYTES &&
-        HOT_GRAPH_DYNAMIC_RECORD_BYTES >=
-          HOT_GRAPH_DYNAMIC_CODE_OFFSET + HOT_GRAPH_DYNAMIC_CODE_BYTES));
+        static_cast<u64>(HOT_GRAPH_DYNAMIC_RECORD_BYTES) >=
+          static_cast<u64>(HOT_GRAPH_DYNAMIC_CODE_OFFSET) +
+            DYNAMIC_CODE_INCARNATION_BYTES +
+            HOT_GRAPH_DYNAMIC_CODE_BYTES));
     if (!HAS_HOT_GRAPH) disable_hot_graph();
   }
 
