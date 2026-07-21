@@ -229,7 +229,7 @@ bool MemoryNode::load_owner_idmap(const filepath_t& index_prefix) {
   }
   const bool valid_payload = vamana::idmap::read_validated_payload(
     input, header, validation, [&](const vamana::idmap::Entry& entry) {
-      if (entry.id >= max_vectors_) {
+      if (entry.id >= vector_id_namespace_size_) {
         return false;
       }
       const RemotePtr pointer{entry.rptr_raw};

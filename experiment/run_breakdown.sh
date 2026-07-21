@@ -41,6 +41,7 @@ source "$SCRIPT_DIR/common.sh"
 
 PROFILE="${1:-${PROFILE:-04_gpu_persistent_gpunetio}}"
 load_experiment_profile "$PROFILE"
+validate_vector_id_namespace_size
 
 WORKLOAD="${WORKLOAD:-mixed}"
 BENCHMARK_CLIENT_THREADS="${BENCHMARK_CLIENT_THREADS:-128}"
@@ -220,6 +221,10 @@ if (( needs_insert_data )); then
   fi
   if (( effective_insert_start_id < MAX_VECTORS )); then
     echo "INSERT_START_ID must not overlap base IDs [0,$MAX_VECTORS): $effective_insert_start_id" >&2
+    exit 1
+  fi
+  if (( effective_insert_start_id >= VECTOR_ID_NAMESPACE_SIZE )); then
+    echo "INSERT_START_ID must be inside vector ID namespace [0,$VECTOR_ID_NAMESPACE_SIZE): $effective_insert_start_id" >&2
     exit 1
   fi
 fi

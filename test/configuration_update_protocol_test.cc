@@ -6,7 +6,8 @@
 
 namespace {
 
-configuration::IndexConfiguration make_config(bool explicit_disable) {
+configuration::IndexConfiguration make_config(
+    bool explicit_disable, bool explicit_namespace = false) {
   std::vector<std::string> arguments{
     "configuration_update_protocol_test",
     "--servers", "127.0.0.1:1234",
@@ -20,6 +21,10 @@ configuration::IndexConfiguration make_config(bool explicit_disable) {
     arguments.emplace_back("--enable-updates");
     arguments.emplace_back("false");
   }
+  if (explicit_namespace) {
+    arguments.emplace_back("--vector-id-namespace-size");
+    arguments.emplace_back("2000000");
+  }
   std::vector<char*> argv;
   argv.reserve(arguments.size());
   for (auto& argument : arguments) argv.push_back(argument.data());
@@ -32,6 +37,11 @@ configuration::IndexConfiguration make_config(bool explicit_disable) {
 int main() {
   const auto default_config = make_config(false);
   assert(default_config.enable_updates);
+  assert(default_config.vector_id_namespace_size == default_config.max_vectors);
+
+  const auto expanded_namespace = make_config(false, true);
+  assert(expanded_namespace.max_vectors == 1'000'000);
+  assert(expanded_namespace.vector_id_namespace_size == 2'000'000);
 
   const auto query_only_config = make_config(true);
   assert(!query_only_config.enable_updates);

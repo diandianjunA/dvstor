@@ -37,6 +37,12 @@ export MN_MEMORY_GB=24
 这里的槽数是峰值同时占用量，不是累计更新次数；已完成清理的删除/迁移源槽可以
 复用。默认注册区下限由 `MN_MEMORY_MIN_GB` 控制，默认 8 GiB。
 
+`MAX_VECTORS` 只表示不可变基图的节点数，并必须与索引 metadata 一致；动态插入
+节点的合法 ID 上界由独立的 `VECTOR_ID_NAMESPACE_SIZE` 控制。默认使用
+`4294967295` 作为排他的上界，允许所有不会让 uint32 ID 生成器回绕的 ID。该配置
+不会分配一个同等大小的稠密表，authority/idmap 状态仍只为实际存在的动态节点
+按需创建。计算节点与所有存储节点必须使用相同的值。
+
 ## 构建新索引
 
 存储节点脚本默认使用独立的 `build-storage`，先按根目录 README 配置 CPU-only

@@ -16,6 +16,7 @@ ensure_built dvstor_memory_node
 
 PORT=$((BASE_PORT + NODE_ID - 1))
 validate_index_metadata storage "$NODE_ID"
+validate_vector_id_namespace_size
 resolve_mn_memory_gb
 SHARD_FILE="$(shard_file "$NODE_ID")"
 
@@ -61,6 +62,7 @@ cmd=("$BUILD_DIR/dvstor_memory_node"
   --threads "$SERVICE_THREADS"
   --dim "$DIM"
   --max-vectors "$MAX_VECTORS"
+  --vector-id-namespace-size "$VECTOR_ID_NAMESPACE_SIZE"
   --R "$R"
   --beam-width-construction "$BUILD_BEAM"
   --alpha "$ALPHA"

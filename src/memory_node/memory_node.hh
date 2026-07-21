@@ -802,7 +802,7 @@ private:
   // Authority metadata is retained per logical ID to preserve generation and
   // idempotent replay semantics. Binding IDs to this configured namespace
   // makes that state capacity-bounded under adversarial update streams.
-  const u32 max_vectors_;
+  const u32 vector_id_namespace_size_;
   const u32 storage_owner_peer_rdma_tokens_;
 
   HugePage<byte_t> index_buffer_;

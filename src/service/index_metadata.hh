@@ -12,6 +12,7 @@ struct Metadata {
   u32 beam_width_construction{};
   u32 partition_max_degree{};
   double partition_cross_shard_ratio{};
+  u64 num_vectors{};
   u32 num_memory_nodes{};
   u32 node_size{};
   str node_layout{"plain"};

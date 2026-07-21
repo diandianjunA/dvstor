@@ -20,7 +20,7 @@ MemoryNode::MemoryNode(Configuration& config)
       storage_id_(config.storage_id),
       num_storage_nodes_(config.storage_peers.empty() ? config.num_server_nodes()
                                                       : static_cast<u32>(config.storage_peers.size())),
-      max_vectors_(config.max_vectors),
+      vector_id_namespace_size_(config.vector_id_namespace_size),
       storage_owner_peer_rdma_tokens_(std::max<u32>(1, config.storage_owner_peer_rdma_tokens)),
       index_region_(context_),
       peer_rdma_read_outstanding_(num_storage_nodes_),
@@ -61,6 +61,8 @@ MemoryNode::MemoryNode(Configuration& config)
     lib_assert(service::index_metadata::load_metadata(index_prefix, metadata, &metadata_error), metadata_error);
     lib_assert(metadata.dim == config.dim, "index metadata dim mismatch on storage node");
     lib_assert(metadata.R == config.R, "index metadata R mismatch on storage node");
+    lib_assert(metadata.num_vectors == config.max_vectors,
+               "index metadata base-vector count mismatch on storage node");
     lib_assert(metadata.num_memory_nodes == num_storage_nodes_, "index metadata storage-node count mismatch");
     gpu_stream_layout_ = metadata.schema_version == gpu_search::format::kMetadataSchemaVersion &&
       metadata.node_layout == "plain" &&
@@ -323,6 +325,7 @@ void MemoryNode::wait_for_start_signal() {
   context_.receive();
   const storage_startup::Response response{
     .ready = request.magic == storage_startup::kMagic,
+    .vector_id_namespace_size = vector_id_namespace_size_,
   };
   cm_.initiator_qp->post_send_inlined(
     &response, sizeof(response), IBV_WR_SEND);

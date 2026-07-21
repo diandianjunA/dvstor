@@ -32,6 +32,11 @@ SERVICE_THREADS="${SERVICE_THREADS:-64}"
 GPU_DEVICE="${GPU_DEVICE:-1}"
 PQ_SUBQUANTIZERS="${PQ_SUBQUANTIZERS:-32}"
 MAX_VECTORS="${MAX_VECTORS:-100000000}"
+# Logical IDs are sparse and authority state is allocated only for IDs that
+# exist, so exposing the complete non-wrapping uint32 range does not reserve a
+# dense 4B-entry table. UINT32_MAX itself remains excluded to prevent a
+# benchmark's atomic ID generator from wrapping back to base ID 0.
+VECTOR_ID_NAMESPACE_SIZE="${VECTOR_ID_NAMESPACE_SIZE:-4294967295}"
 MAX_QUERIES="${MAX_QUERIES:-10000}"
 GROUNDTRUTH_LABEL="${GROUNDTRUTH_LABEL:-100M}"
 GROUNDTRUTH_TOPK="${GROUNDTRUTH_TOPK:-10}"
@@ -66,6 +71,15 @@ INDEX_PREFIX="${INDEX_PREFIX:-$INDEX_DIR/sift100m_R${R}_bw${BUILD_BEAM}_${PARTIT
 MN_DYNAMIC_HEADROOM_PERCENT="${MN_DYNAMIC_HEADROOM_PERCENT:-20}"
 MN_DYNAMIC_SLOTS_PER_SHARD="${MN_DYNAMIC_SLOTS_PER_SHARD:-}"
 MN_MEMORY_MIN_GB="${MN_MEMORY_MIN_GB:-8}"
+
+validate_vector_id_namespace_size() {
+  if [[ ! "$VECTOR_ID_NAMESPACE_SIZE" =~ ^[1-9][0-9]*$ ]] ||
+      ((VECTOR_ID_NAMESPACE_SIZE < MAX_VECTORS ||
+        VECTOR_ID_NAMESPACE_SIZE > 4294967295)); then
+    echo "VECTOR_ID_NAMESPACE_SIZE must be an integer in [$MAX_VECTORS,4294967295]: $VECTOR_ID_NAMESPACE_SIZE" >&2
+    return 1
+  fi
+}
 
 estimate_mn_memory_gb() {
   local metadata="${INDEX_PREFIX}.meta.json"
@@ -475,6 +489,7 @@ write_service_config() {
   fi
   endpoints="$(server_endpoints)"
   validate_index_metadata compute
+  validate_vector_id_namespace_size
   resolve_mn_memory_gb
 
   {
@@ -493,6 +508,7 @@ write_service_config() {
     echo "vector-data-type = $VECTOR_DATA_TYPE"
     echo "dim = $DIM"
     echo "max-vectors = $MAX_VECTORS"
+    echo "vector-id-namespace-size = $VECTOR_ID_NAMESPACE_SIZE"
     echo "R = $R"
     echo "beam-width-construction = $BUILD_BEAM"
     echo "alpha = $ALPHA"

@@ -13,9 +13,11 @@ size_t ComputeService::submit_storage_owner_mutations(
     throw std::runtime_error("storage_owner mutation runtime is not initialized");
   }
   for (const auto& item : items) {
-    if (item.id >= config_.max_vectors) {
+    if (item.id >= config_.vector_id_namespace_size) {
       throw std::out_of_range(
-        "mutation id exceeds the configured bounded vector namespace");
+        "mutation id " + std::to_string(item.id) +
+        " exceeds the configured vector namespace [0," +
+        std::to_string(config_.vector_id_namespace_size) + ")");
     }
   }
   if (kind != service::storage_owner::MutationKind::erase) {
