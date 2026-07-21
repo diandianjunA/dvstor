@@ -4,11 +4,12 @@
 using namespace memory_node_storage_owner_maintenance_detail;
 
 bool MemoryNode::storage_owner_maintenance_enabled(const Configuration& config) {
-  return config.storage_owner_maintenance_mode == "finalize" &&
-         config.storage_owner_maintenance_workers > 0;
+  return config.storage_owner_maintenance_workers > 0;
 }
 
 void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& config) {
+  lib_assert(storage_owner_maintenance_enabled(config),
+             "the two-stage update protocol requires a Stage2 executor");
   auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
     index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
   lib_assert(control->magic == gpu_search::format::kStorageControlMagic &&
@@ -20,32 +21,30 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   const u64 initial_durable = durable.load(std::memory_order_acquire);
   lib_assert(initial_next == initial_durable + 1,
              "storage-owner cannot restart with unfinished in-memory maintenance");
-  // Upserts can reserve stitch plus cleanup. Halving the descriptor bound
-  // guarantees that every admitted sequence can publish all of its intents.
+  // Every reserved sequence is either already queued/runnable or completed by
+  // its synchronous retirement path. Stage1 preparation owns no sequence, so
+  // the full descriptor bound is a safe admission window.
   const size_t completion_capacity = std::max<size_t>(
     std::max<size_t>(1, config.storage_owner_batch_max),
-    config.storage_owner_maintenance_queue_depth / 2);
+    config.storage_owner_maintenance_queue_depth);
   storage_owner_maintenance_completion_ring_ =
     std::make_unique<bounded::SlidingCompletionRing>(
       completion_capacity, initial_next, initial_durable);
-  const u64 requested_admission_limit = storage_owner_maintenance_enabled(config)
-    ? std::max<u64>(
-        std::max<u32>(1, config.storage_owner_batch_max),
-        static_cast<u64>(std::max<u32>(
-          1, config.storage_owner_maintenance_workers)) *
-          std::max<u32>(1, config.storage_owner_rpc_depth) * 4)
-    : completion_capacity;
+  const u64 requested_admission_limit = std::max<u64>(
+    std::max<u32>(1, config.storage_owner_batch_max),
+    static_cast<u64>(config.storage_owner_maintenance_workers) *
+      std::max<u32>(1, config.storage_owner_rpc_depth) * 4);
   storage_owner_maintenance_admission_limit_ = static_cast<size_t>(
     std::min<u64>(completion_capacity, requested_admission_limit));
   storage_owner_maintenance_intent_capacity_ = completion_capacity;
   storage_owner_maintenance_intents_ =
     std::make_unique<StorageOwnerMaintenanceIntent[]>(completion_capacity);
 
-  if (!storage_owner_maintenance_enabled(config)) {
-    return;
-  }
-
   storage_owner_maintenance_shutdown_.store(false, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
+    storage_owner_maintenance_reserved_slots_ = 0;
+  }
   storage_owner_maintenance_enqueued_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_finalize_enqueued_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_cleanup_enqueued_.store(0, std::memory_order_relaxed);
@@ -61,10 +60,8 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   storage_owner_maintenance_cleanup_processed_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_max_backlog_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_pressure_yields_.store(0, std::memory_order_relaxed);
-  storage_owner_stitch_external_requests_.store(0, std::memory_order_relaxed);
-  storage_owner_stitch_external_candidates_.store(0, std::memory_order_relaxed);
-  storage_owner_stitch_batches_.store(0, std::memory_order_relaxed);
-  storage_owner_stitch_batched_items_.store(0, std::memory_order_relaxed);
+  storage_owner_stage2_batches_.store(0, std::memory_order_relaxed);
+  storage_owner_stage2_batched_items_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_active_workers_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_finalize_latency_ns_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_finalize_max_latency_ns_.store(0, std::memory_order_relaxed);
@@ -98,7 +95,7 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   const u64 reverse_wire_max_u64 = std::max<u64>(
     1, static_cast<u64>(config.R) * config.storage_owner_batch_max);
   lib_assert(reverse_wire_max_u64 <= std::numeric_limits<u32>::max(),
-             "stage2 reverse aggregate exceeds schema-15 item_count");
+             "stage2 reverse aggregate exceeds bounded wire item_count");
   const u32 reverse_wire_max = static_cast<u32>(reverse_wire_max_u64);
   storage_owner_reverse_outbox_ = std::make_unique<Stage2ReverseOutbox>(
     reverse_outbox_capacity, reverse_outbox_capacity, num_storage_nodes_,
@@ -155,8 +152,7 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                std::to_string(storage_owner_reverse_outbox_->aggregate_capacity()) +
                " wire_max_ops=" + std::to_string(reverse_wire_max) +
                " (shared per-peer work-conserving aggregation)");
-  print_status("storage-owner maintenance tuning: mode=" + config.storage_owner_maintenance_mode +
-               " local_stitch=" + (config.storage_owner_update_mode == "local_stitch" ? "true" : "false") +
+  print_status("storage-owner maintenance tuning: protocol=centroid-home-two-stage"
                " compaction_batch_target=" + std::to_string(config.storage_owner_batch_max) +
                " backlog_limit=" +
                std::to_string(config.storage_owner_maintenance_queue_depth) +
@@ -170,7 +166,7 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
   // Foreground insert workers are joined before this call, so no new intent
   // can appear.  Keep peer progress alive and drain every queued/active stage2
   // context before asking executors to exit. The wait is bounded because peer
-  // runtimes have no cross-shard shutdown barrier in schema-15: one shard may
+  // Peer runtimes have no cross-shard shutdown barrier: one shard may
   // already be offline, in which case infinite same-ID retry must not deadlock
   // process shutdown. A non-drained summary is reported as an incomplete drain.
   if (!storage_owner_maintenance_workers_.empty()) {
@@ -181,8 +177,9 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
       std::max<u64>(5000, std::min<u64>(60'000, rpc_timeout_ms * 3)));
     const bool drained = storage_owner_maintenance_cv_.wait_for(
       lock, drain_timeout, [&]() {
-      return storage_owner_stitch_tasks_.empty() &&
+      return storage_owner_stage2_tasks_.empty() &&
              storage_owner_cleanup_tasks_.empty() &&
+             storage_owner_maintenance_reserved_slots_ == 0 &&
              (storage_owner_repair_tasks_ == nullptr ||
               storage_owner_repair_tasks_->empty()) &&
              storage_owner_maintenance_active_workers_.load(
@@ -203,13 +200,13 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
     }
   }
 
-  size_t stitch_remaining = 0;
+  size_t stage2_remaining = 0;
   size_t cleanup_remaining = 0;
   {
     std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
-    stitch_remaining = storage_owner_stitch_tasks_.size();
+    stage2_remaining = storage_owner_stage2_tasks_.size();
     cleanup_remaining = storage_owner_cleanup_tasks_.size();
-    storage_owner_stitch_tasks_.clear();
+    storage_owner_stage2_tasks_.clear();
     storage_owner_cleanup_tasks_.clear();
   }
   if (storage_owner_repair_tasks_ != nullptr) {
@@ -225,10 +222,10 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
   storage_owner_reverse_outbox_.reset();
   storage_owner_reverse_completions_.clear();
 
-  log_storage_owner_maintenance_observation(stitch_remaining, cleanup_remaining, true);
+  log_storage_owner_maintenance_observation(stage2_remaining, cleanup_remaining, true);
 }
 
-void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaining,
+void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaining,
                                                            size_t cleanup_remaining,
                                                            bool final) {
   if (storage_owner_maintenance_enqueued_.load(std::memory_order_relaxed) == 0) {
@@ -278,18 +275,43 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
     ? 0.0
     : static_cast<double>(
         kFinalizeLatencyBucketUpperNs[p99_finite_bucket]) / 1e6;
-  std::string stitch_delay_histogram;
+  std::string stage2_delay_histogram;
   for (size_t bucket = 0;
        bucket < storage_owner_maintenance_finalize_latency_buckets_.size();
        ++bucket) {
-    if (bucket != 0) stitch_delay_histogram.push_back(',');
-    stitch_delay_histogram += std::to_string(
+    if (bucket != 0) stage2_delay_histogram.push_back(',');
+    stage2_delay_histogram += std::to_string(
       storage_owner_maintenance_finalize_latency_buckets_[bucket].load(
         std::memory_order_relaxed));
   }
-  const u64 stitch_batches = storage_owner_stitch_batches_.load(std::memory_order_relaxed);
-  const u64 stitch_batched_items =
-    storage_owner_stitch_batched_items_.load(std::memory_order_relaxed);
+  const u64 stage2_batches = storage_owner_stage2_batches_.load(std::memory_order_relaxed);
+  const u64 stage2_batched_items =
+    storage_owner_stage2_batched_items_.load(std::memory_order_relaxed);
+  const u64 stage1_search_budget_exhausted =
+    storage_owner_stage1_search_budget_exhausted_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_search_budget_exhausted =
+    storage_owner_stage2_search_budget_exhausted_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_continuations =
+    storage_owner_stage2_continuations_.load(std::memory_order_relaxed);
+  const u64 stage2_remote_frontier_items =
+    storage_owner_stage2_remote_frontier_items_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_remote_expansions =
+    storage_owner_stage2_remote_expansions_.load(std::memory_order_relaxed);
+  const u64 stage2_scored_candidates =
+    storage_owner_stage2_scored_candidates_.load(std::memory_order_relaxed);
+  const u64 stage2_migrations =
+    storage_owner_stage2_migrations_.load(std::memory_order_relaxed);
+  const u64 stage2_final_edges =
+    storage_owner_stage2_final_edges_.load(std::memory_order_relaxed);
+  const u64 stage2_cross_edges_stage1_home =
+    storage_owner_stage2_cross_edges_stage1_home_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_cross_edges_final_home =
+    storage_owner_stage2_cross_edges_final_home_.load(
+      std::memory_order_relaxed);
   const u64 reverse_aggregate_batches =
     storage_owner_reverse_aggregate_batches_.load(std::memory_order_relaxed);
   const u64 reverse_aggregate_logical_requests =
@@ -297,9 +319,12 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
       std::memory_order_relaxed);
   const u64 reverse_aggregate_ops =
     storage_owner_reverse_aggregate_ops_.load(std::memory_order_relaxed);
-  const u64 peer_stitch_enqueued = peer_stitch_search_enqueued_.load(std::memory_order_relaxed);
-  const u64 peer_stitch_processed = peer_stitch_search_processed_.load(std::memory_order_relaxed);
-  const u64 peer_stitch_items = peer_stitch_search_items_.load(std::memory_order_relaxed);
+  const u64 peer_stage1_enqueued =
+    peer_stage1_enqueued_.load(std::memory_order_relaxed);
+  const u64 peer_stage1_processed =
+    peer_stage1_processed_.load(std::memory_order_relaxed);
+  const u64 peer_stage1_items =
+    peer_stage1_items_.load(std::memory_order_relaxed);
   const u64 peer_reverse_enqueued =
     peer_reverse_update_enqueued_.load(std::memory_order_relaxed);
   const u64 peer_reverse_processed =
@@ -311,9 +336,9 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
   const u64 peer_reverse_remaining = peer_reverse_enqueued > peer_reverse_processed
     ? peer_reverse_enqueued - peer_reverse_processed
     : 0;
-  const double peer_stitch_rate = elapsed_s > 0.0
-                                    ? static_cast<double>(peer_stitch_items) / elapsed_s
-                                    : 0.0;
+  const double peer_stage1_rate = elapsed_s > 0.0
+    ? static_cast<double>(peer_stage1_items) / elapsed_s
+    : 0.0;
   const double peer_reverse_rate = elapsed_s > 0.0
     ? static_cast<double>(peer_reverse_items_processed) / elapsed_s
     : 0.0;
@@ -340,7 +365,7 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
   // raw count so an observation does not hide pending RPC work.
   const u64 remaining = std::max<u64>(
     counter_remaining,
-    static_cast<u64>(stitch_remaining + cleanup_remaining) +
+    static_cast<u64>(stage2_remaining + cleanup_remaining) +
       active_contexts + repair_remaining);
   auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
     index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
@@ -350,44 +375,79 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
     std::atomic_ref<u64>(control->reclaim_reused_nodes).load(std::memory_order_acquire);
   const u64 dynamic_high_watermark =
     std::atomic_ref<u64>(control->dynamic_high_watermark).load(std::memory_order_acquire);
-  const u64 reclaim_ack = minimum_compute_reclaim_ack();
 
   print_status(str("storage-owner maintenance ") + (final ? "summary" : "observation") +
                ": enqueued=" +
                std::to_string(storage_owner_maintenance_enqueued_.load(std::memory_order_relaxed)) +
-               " stitch_enqueued=" +
+               " stage2_enqueued=" +
                std::to_string(finalize_enqueued) +
                " cleanup_enqueued=" +
                std::to_string(cleanup_enqueued) +
-               " stitch_tasks_done=" +
+               " stage2_tasks_done=" +
                std::to_string(storage_owner_maintenance_processed_.load(std::memory_order_relaxed)) +
-               " stitched_live=" +
+               " stage2_finalized_live=" +
                std::to_string(finalized_live) +
                " cleanup_processed=" +
                std::to_string(storage_owner_maintenance_cleanup_processed_.load(std::memory_order_relaxed)) +
                " stale=" +
                std::to_string(stale) +
-               " stitch_completion_ratio=" +
+               " stage2_completion_ratio=" +
                std::to_string(ratio_or_zero(finalized_live, finalize_enqueued)) +
-               " live_stitch_completion_ratio=" +
+               " live_stage2_completion_ratio=" +
                std::to_string(ratio_or_zero(finalized_live, live_required)) +
-               " avg_stitch_delay_ms=" +
+               " avg_stage2_delay_ms=" +
                std::to_string(avg_finalize_ms) +
-               " p99_stitch_delay_upper_ms=" +
+               " p99_stage2_delay_upper_ms=" +
                std::to_string(p99_finalize_ms) +
-               " p99_stitch_delay_over_30s=" +
+               " p99_stage2_delay_over_30s=" +
                (p99_finalize_over_30s ? "true" : "false") +
-               " stitch_delay_histogram=" + stitch_delay_histogram +
-               " max_stitch_delay_ms=" +
+               " stage2_delay_histogram=" + stage2_delay_histogram +
+               " max_stage2_delay_ms=" +
                std::to_string(static_cast<double>(max_finalize_latency_ns) / 1e6) +
                " compaction_batch_target=" +
                std::to_string(storage_worker_config_ != nullptr
                                 ? storage_worker_config_->storage_owner_batch_max
                                 : 0) +
                " compaction_max_delay_ms=" +
-               std::to_string(kStitchCompactionMaxDelayNs / 1000000ull) +
-               " stitch_rate_per_sec=" +
+               std::to_string(kStage2CompactionMaxDelayNs / 1000000ull) +
+               " stage2_rate_per_sec=" +
                std::to_string(repair_rate) +
+               " stage1_search_budget_exhausted=" +
+               std::to_string(stage1_search_budget_exhausted) +
+               " stage2_search_budget_exhausted=" +
+               std::to_string(stage2_search_budget_exhausted) +
+               " stage2_continuations=" +
+               std::to_string(stage2_continuations) +
+               " stage2_remote_frontier_items=" +
+               std::to_string(stage2_remote_frontier_items) +
+               " avg_stage2_remote_frontier=" +
+               std::to_string(ratio_or_zero(
+                 stage2_remote_frontier_items, stage2_continuations)) +
+               " stage2_remote_expansions=" +
+               std::to_string(stage2_remote_expansions) +
+               " avg_stage2_remote_expansions=" +
+               std::to_string(ratio_or_zero(
+                 stage2_remote_expansions, stage2_continuations)) +
+               " stage2_scored_candidates=" +
+               std::to_string(stage2_scored_candidates) +
+               " avg_stage2_scored_candidates=" +
+               std::to_string(ratio_or_zero(
+                 stage2_scored_candidates, stage2_continuations)) +
+               " stage2_migrations=" +
+               std::to_string(stage2_migrations) +
+               " home_match_rate=" +
+               std::to_string(finalized_live == 0 ? 0.0 :
+                 1.0 - ratio_or_zero(stage2_migrations, finalized_live)) +
+               " stage2_final_edges=" +
+               std::to_string(stage2_final_edges) +
+               " stage2_cross_edges_stage1_home=" +
+               std::to_string(stage2_cross_edges_stage1_home) +
+               " stage2_cross_edges_final_home=" +
+               std::to_string(stage2_cross_edges_final_home) +
+               " cross_edge_reduction_ratio=" +
+               std::to_string(stage2_cross_edges_stage1_home == 0 ? 0.0 :
+                 1.0 - ratio_or_zero(stage2_cross_edges_final_home,
+                                     stage2_cross_edges_stage1_home)) +
                " failed=" +
                std::to_string(storage_owner_maintenance_failed_.load(std::memory_order_relaxed)) +
                " rpc_timeouts=" +
@@ -414,24 +474,21 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
                std::to_string(completion_outstanding) +
                " pressure_yields=" +
                std::to_string(storage_owner_maintenance_pressure_yields_.load(std::memory_order_relaxed)) +
-               " external_search_requests=" +
-               std::to_string(storage_owner_stitch_external_requests_.load(std::memory_order_relaxed)) +
-               " external_candidates=" +
-               std::to_string(storage_owner_stitch_external_candidates_.load(std::memory_order_relaxed)) +
-               " stitch_batches=" +
-               std::to_string(stitch_batches) +
-               " avg_stitch_batch_size=" +
-               std::to_string(ratio_or_zero(stitch_batched_items, stitch_batches)) +
-               " peer_stitch_enqueued=" +
-               std::to_string(peer_stitch_enqueued) +
-               " peer_stitch_processed=" +
-               std::to_string(peer_stitch_processed) +
-               " peer_stitch_items=" +
-               std::to_string(peer_stitch_items) +
-               " peer_stitch_rate_per_sec=" +
-               std::to_string(peer_stitch_rate) +
-               " peer_stitch_max_queue=" +
-               std::to_string(peer_stitch_search_max_queue_.load(std::memory_order_relaxed)) +
+               " stage2_batches=" +
+               std::to_string(stage2_batches) +
+               " avg_stage2_batch_size=" +
+               std::to_string(ratio_or_zero(stage2_batched_items, stage2_batches)) +
+               " peer_stage1_enqueued=" +
+               std::to_string(peer_stage1_enqueued) +
+               " peer_stage1_processed=" +
+               std::to_string(peer_stage1_processed) +
+               " peer_stage1_items=" +
+               std::to_string(peer_stage1_items) +
+               " peer_stage1_rate_per_sec=" +
+               std::to_string(peer_stage1_rate) +
+               " peer_stage1_max_queue=" +
+               std::to_string(peer_stage1_max_queue_.load(
+                 std::memory_order_relaxed)) +
                " peer_reverse_enqueued=" +
                std::to_string(peer_reverse_enqueued) +
                " peer_reverse_processed=" +
@@ -448,16 +505,14 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stitch_remaini
                std::to_string(peer_reverse_update_failed_.load(std::memory_order_relaxed)) +
                " peer_reverse_max_queue=" +
                std::to_string(peer_reverse_update_max_queue_.load(std::memory_order_relaxed)) +
-               " reclaim_ack=" +
-               std::to_string(reclaim_ack) +
                " reclaim_pending=" +
                std::to_string(reclaim_pending) +
                " reclaim_reused=" +
                std::to_string(reclaim_reused) +
                " dynamic_high_watermark=" +
                std::to_string(dynamic_high_watermark) +
-               " stitch_remaining=" +
-               std::to_string(stitch_remaining) +
+               " stage2_remaining=" +
+               std::to_string(stage2_remaining) +
                " cleanup_remaining=" +
                std::to_string(cleanup_remaining) +
                " active_contexts=" +
@@ -473,14 +528,14 @@ void MemoryNode::maybe_log_storage_owner_maintenance_observation() {
   while (now - last >= kMaintenanceObservationPeriodNs) {
     if (storage_owner_maintenance_last_observation_ns_.compare_exchange_weak(
           last, now, std::memory_order_acq_rel, std::memory_order_acquire)) {
-      size_t stitch_remaining = 0;
+      size_t stage2_remaining = 0;
       size_t cleanup_remaining = 0;
       {
         std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
-        stitch_remaining = storage_owner_stitch_tasks_.size();
+        stage2_remaining = storage_owner_stage2_tasks_.size();
         cleanup_remaining = storage_owner_cleanup_tasks_.size();
       }
-      log_storage_owner_maintenance_observation(stitch_remaining, cleanup_remaining, false);
+      log_storage_owner_maintenance_observation(stage2_remaining, cleanup_remaining, false);
       return;
     }
   }

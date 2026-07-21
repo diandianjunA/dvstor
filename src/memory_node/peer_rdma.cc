@@ -443,10 +443,58 @@ u64 MemoryNode::remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 exp
   return *scratch;
 }
 
+u64 MemoryNode::remote_fetch_add(u32 shard_id,
+                                 u64 remote_offset,
+                                 u64 increment,
+                                 size_t scratch_offset) {
+  lib_assert(peer_context_ != nullptr,
+             "storage peer context is not initialized");
+  lib_assert(shard_id < num_storage_nodes_ &&
+               shard_id != storage_id_,
+             "remote FAA requires a remote storage shard");
+  lib_assert(peer_remote_tokens_[shard_id] != nullptr &&
+               peer_remote_tokens_[shard_id]->address != 0 &&
+               peer_remote_tokens_[shard_id]->rkey != 0,
+             "peer token is invalid for remote FAA");
+  lib_assert(remote_offset + sizeof(u64) <= mn_memory_bytes_,
+             "peer FAA exceeds shard bounds");
+  StorageOwnerThread* owner_thread = current_storage_owner_thread_;
+  const u32 qp_idx = peer_data_qp_index(
+    owner_thread != nullptr ? owner_thread->id : 0);
+  QP& qp = peer_data_qp(shard_id, qp_idx);
+  HugePage<byte_t>& scratch_buffer =
+    owner_thread != nullptr && owner_thread->has_peer_scratch()
+      ? owner_thread->scratch_buffer : peer_scratch_buffer_;
+  LocalMemoryRegion& scratch_region =
+    owner_thread != nullptr && owner_thread->has_peer_scratch()
+      ? *owner_thread->scratch_region : *peer_scratch_region_;
+  lib_assert(scratch_offset + sizeof(u64) <= scratch_buffer.buffer_size,
+             "peer scratch buffer exhausted");
+  auto* scratch = reinterpret_cast<u64*>(
+    scratch_buffer.get_full_buffer() + scratch_offset);
+  *scratch = 0;
+  acquire_peer_rdma_read_credit(shard_id, qp_idx);
+  const u64 wr_id = next_peer_sync_wr_id();
+  {
+    register_peer_pending_send_locked(
+      wr_id, PeerPendingSend{
+        shard_id, qp_idx, 0, 0, nullptr, false, true});
+    std::lock_guard<std::mutex> send_lock(
+      *peer_qp_send_mutexes_[shard_id][qp_idx]);
+    qp->post_FAA(reinterpret_cast<u64>(scratch),
+                 scratch_region.get_lkey(),
+                 peer_remote_tokens_[shard_id].get(),
+                 remote_offset, increment, true, wr_id);
+  }
+  wait_peer_sync_completion(wr_id);
+  return *scratch;
+}
+
 std::pair<bool, u64> MemoryNode::try_lock_remote_header(RemotePtr rptr) {
   u64 header = 0;
   remote_read_bytes(rptr.memory_node(), rptr.byte_offset(), &header, sizeof(header), 0);
-  if ((header & VamanaNode::HEADER_NODE_LOCK) != 0) {
+  if (VamanaNode::header_incarnation(header) != rptr.incarnation() ||
+      (header & VamanaNode::HEADER_NODE_LOCK) != 0) {
     return {false, header};
   }
   const u64 desired = header | VamanaNode::HEADER_NODE_LOCK;

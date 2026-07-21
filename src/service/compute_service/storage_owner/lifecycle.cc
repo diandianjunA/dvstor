@@ -60,7 +60,7 @@ void ComputeService::start_storage_insert_runtime() {
     state->tasks = std::make_unique<StorageInsertTask[]>(task_capacity);
     for (u32 task_id = 0; task_id < task_capacity; ++task_id) {
       auto& task = state->tasks[task_id];
-      task.item.values.reserve(config_.dim);
+      task.encoded_vector.reserve(VamanaNode::vector_bytes());
       lib_assert(state->free_tasks->try_push(task_id),
                  "failed to initialize storage-owner task pool");
     }
@@ -75,12 +75,6 @@ void ComputeService::start_storage_insert_runtime() {
       slot.request_region = std::make_unique<LocalMemoryRegion>(
         context_, slot.request_buffer.data(), slot.request_buffer.size());
       slot.tasks.reserve(config_.storage_owner_batch_max);
-      slot.publication_mutations.resize(config_.storage_owner_batch_max);
-      for (auto& mutation : slot.publication_mutations) {
-        mutation.vector.resize(VamanaNode::vector_bytes());
-      }
-      slot.publication_invalidated_graph_nodes.reserve(
-        static_cast<size_t>(config_.storage_owner_batch_max) * config_.R);
       state->free_slots.push_back(slot_id);
     }
     state->response_slots.resize(rpc_depth);
@@ -113,12 +107,11 @@ void ComputeService::start_storage_insert_runtime() {
     pin_thread(storage_insert_progress_thread_, progress_core);
     pin_thread(storage_insert_completion_thread_, completion_core);
     print_status("storage-owner update cores: progress=" +
-                 std::to_string(progress_core) + " response/gpu=" +
+                 std::to_string(progress_core) + " response=" +
                  std::to_string(completion_core));
   }
   print_status(
-    "storage-owner acknowledgement=owner-memory stage1 publication; "
-    "GPU visibility=ordered asynchronous publication; "
+    "storage-owner acknowledgement=query-visible stage1 graph publication; "
     "submission=bounded owner rings; progress=single work-conserving executor");
 }
 
@@ -155,7 +148,6 @@ void ComputeService::stop_storage_insert_runtime() {
       slot.response_done = false;
       slot.results_completed = true;
       slot.completion_claimed = false;
-      slot.gpu_reserved_items = 0;
     }
   }
   storage_insert_inflight_.store(0, std::memory_order_release);
@@ -168,8 +160,6 @@ void ComputeService::release_storage_insert_runtime() {
     for (auto& slot : state->slots) {
       slot.request_region.reset();
       slot.tasks.clear();
-      slot.publication_mutations.clear();
-      slot.publication_invalidated_graph_nodes.clear();
     }
     for (auto& response_slot : state->response_slots) {
       response_slot.region.reset();

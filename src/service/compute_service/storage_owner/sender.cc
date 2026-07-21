@@ -105,10 +105,6 @@ void ComputeService::reclaim_storage_owner_slots() {
     slot.completion_claimed = false;
     slot.response_valid = false;
     slot.response_slot_id = std::numeric_limits<u32>::max();
-    slot.gpu_reserved_items = 0;
-    slot.publication_mutation_count = 0;
-    slot.publication_reserved_items = 0;
-    slot.publication_invalidated_graph_nodes.clear();
     slot.item_count = 0;
     slot.batch_id = 0;
     slot.request_prepare_ns = 0;
@@ -169,7 +165,7 @@ void ComputeService::post_storage_owner_batch(
   request->item_count = item_count;
   request->vector_dtype = static_cast<u32>(VamanaNode::vector_dtype());
   request->vector_bytes = static_cast<u32>(VamanaNode::vector_bytes());
-  request->anchor_hint_count = 0;
+  request->protocol_version = service::storage_owner::kMutationProtocolVersion;
   request->batch_id = batch_id;
 
   node_t* ids = mutation_request
@@ -183,18 +179,25 @@ void ComputeService::post_storage_owner_batch(
   u32* kinds = mutation_request
     ? service::storage_owner::mutation_request_kinds(slot.request_buffer.data())
     : nullptr;
+  u32* stage1_homes = mutation_request
+    ? service::storage_owner::mutation_request_stage1_homes(
+        slot.request_buffer.data(), item_count)
+    : service::storage_owner::request_stage1_homes(
+        slot.request_buffer.data(), item_count);
   for (u32 i = 0; i < item_count; ++i) {
     const auto& task = state.tasks[slot.tasks[i]];
-    ids[i] = task.item.id;
+    ids[i] = task.id;
+    stage1_homes[i] = task.stage1_home;
     if (kinds != nullptr) kinds[i] = static_cast<u32>(task.kind);
     byte_t* vector_output =
       vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes();
     if (task.kind == service::storage_owner::MutationKind::erase) {
       std::memset(vector_output, 0, VamanaNode::vector_bytes());
     } else {
-      encode_float_vector_to_storage(
-        task.item.values.data(), config_.dim,
-        VamanaNode::vector_dtype(), vector_output);
+      lib_assert(task.encoded_vector.size() == VamanaNode::vector_bytes(),
+                 "storage-owner task lost its canonical encoded vector");
+      std::memcpy(vector_output, task.encoded_vector.data(),
+                  VamanaNode::vector_bytes());
     }
   }
 
@@ -205,10 +208,6 @@ void ComputeService::post_storage_owner_batch(
   slot.completion_claimed = false;
   slot.response_valid = false;
   slot.response_slot_id = std::numeric_limits<u32>::max();
-  slot.gpu_reserved_items = item_count;
-  slot.publication_mutation_count = 0;
-  slot.publication_reserved_items = 0;
-  slot.publication_invalidated_graph_nodes.clear();
   slot.item_count = item_count;
   slot.batch_id = batch_id;
   slot.request_prepare_ns = collect_breakdown

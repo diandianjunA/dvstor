@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -11,16 +12,10 @@
 
 #include "common/configuration.hh"
 #include "common/vector_dtype.hh"
-#include "gpu_search/delta_index.hh"
 #include "gpu_search/types.hh"
 #include "service/query_result.hh"
 
 namespace gpu_search {
-
-class MutationCapacityError : public std::runtime_error {
-public:
-  using std::runtime_error::runtime_error;
-};
 
 class PersistentSearchEngine {
 public:
@@ -35,25 +30,16 @@ public:
 
   service::QueryResult search(VectorDType query_dtype, const byte_t* query_data, u32 k);
   service::QueryResult search(std::span<const element_t> query, u32 k);
+  std::optional<u32> select_centroid_home(
+    std::span<const f32> vector) const;
 
-  bool publish_mutations(
-    std::span<DeltaMutation> mutations,
-    std::span<const u64> invalidated_graph_nodes = {});
-  bool try_reserve_mutation_capacity(size_t mutation_count);
-  void reserve_mutation_capacity(size_t mutation_count);
-  void release_mutation_capacity(size_t mutation_count);
-  void mark_committed_mutation_gap(const std::string& reason);
-  DeltaCoordinator& delta() { return delta_; }
-  const DeltaCoordinator& delta() const { return delta_; }
   TelemetrySnapshot telemetry() const { return telemetry_.snapshot(); }
   void reset_telemetry();
 
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
-  DeltaCoordinator delta_;
   Telemetry telemetry_;
-  std::mutex mutation_publish_mutex_;
 };
 
 }  // namespace gpu_search

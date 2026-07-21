@@ -100,7 +100,7 @@ case "$WORKLOAD" in
 esac
 
 # Pure-query clients do not initialize update ownership state. Any workload
-# with writes additionally validates owner idmaps and starts the update runtime.
+# with writes additionally starts the update runtime.
 if (( needs_insert_data )); then
   ENABLE_UPDATES=true
 else
@@ -124,10 +124,8 @@ else
 fi
 
 # Validate the deployed index before preparing inputs or rebuilding the client.
-# Query-only workloads still use static GPU bootstrap routes but skip owner
-# idmaps; write workloads validate the idmaps as well. write_service_config()
-# validates once more immediately before launch.
-validate_index_metadata compute 0 "$ENABLE_UPDATES"
+# write_service_config() validates once more immediately before launch.
+validate_index_metadata compute
 
 RECALL_QUERY_FILE=""
 GROUNDTRUTH_PATH=""

@@ -1,102 +1,89 @@
 #include <cassert>
 #include <cstdint>
+#include <limits>
 
-#include "gpu_search/index_format.hh"
 #include "gpu_search/memory_budget.hh"
 
 namespace {
 
-constexpr u64 gib(u64 value) {
+constexpr std::uint64_t gib(std::uint64_t value) {
   return value << 30;
 }
 
-gpu_search::memory_budget::Request sift_request(u64 nodes) {
+gpu_search::memory_budget::Request sift_request(std::uint64_t nodes) {
   return {
     .nodes = nodes,
-    .max_delta_vectors = nodes,
     .usable_bytes = gib(36),
-    .delta_budget_bytes = gib(2),
     .dim = 128,
     .pq_subquantizers = 16,
     .code_bytes = 16,
-    .vector_bytes = 128,
     .query_slots = 256,
     .beam_width = 64,
     .graph_degree = 96,
     .exact_width = 256,
     .exact_record_bytes = 144,
-    .anchor_count = 4096 * 5,
     .shard_count = 5,
-    .entry_point_count = 256,
   };
 }
 
 }  // namespace
 
 int main() {
-  const auto sift100m = gpu_search::memory_budget::estimate(sift_request(100'000'000));
+  const auto sift100m =
+    gpu_search::memory_budget::estimate(sift_request(100'000'000));
   assert(sift100m.fits);
   assert(sift100m.code_bytes == 1'600'000'000ULL);
-  assert(sift100m.delta_bytes <= gib(2));
-  assert(sift100m.delta_code_bytes ==
-         static_cast<u64>(sift100m.delta_capacity) * 16);
-  assert(sift100m.delta_code_bytes < sift100m.delta_bytes);
-  assert(sift100m.delta_capacity > 7'000'000);
   assert(sift100m.exact_bytes == 256ULL * 256 * 144);
+  assert(sift100m.fixed_bytes == sift100m.explicit_bytes);
   assert(sift100m.explicit_bytes <= gib(36));
+  assert(sift100m.visited_capacity >= 64 * 96 * 8);
 
-  const auto sift1b = gpu_search::memory_budget::estimate(sift_request(1'000'000'000));
+  const auto sift1b =
+    gpu_search::memory_budget::estimate(sift_request(1'000'000'000));
   assert(sift1b.fits);
   assert(sift1b.code_bytes == 16'000'000'000ULL);
-  assert(sift1b.delta_bytes <= gib(2));
-  assert(sift1b.delta_code_bytes ==
-         static_cast<u64>(sift1b.delta_capacity) * 16);
   assert(sift1b.explicit_bytes <= gib(36));
 
   auto sift1b_pq32_request = sift_request(1'000'000'000);
   sift1b_pq32_request.pq_subquantizers = 32;
   sift1b_pq32_request.code_bytes = 32;
   sift1b_pq32_request.beam_width = 128;
-  const auto sift1b_pq32 = gpu_search::memory_budget::estimate(sift1b_pq32_request);
+  const auto sift1b_pq32 =
+    gpu_search::memory_budget::estimate(sift1b_pq32_request);
   assert(sift1b_pq32.fits);
   assert(sift1b_pq32.code_bytes == 32'000'000'000ULL);
-  assert(sift1b_pq32.delta_bytes <= gib(2));
   assert(sift1b_pq32.explicit_bytes <= gib(36));
+  assert(sift1b_pq32.query_workspace_bytes > sift1b.query_workspace_bytes);
 
-  auto steady_state_1b = sift1b_pq32_request;
-  steady_state_1b.delta_budget_bytes = gib(1) / 4;
-  const auto bounded_1b = gpu_search::memory_budget::estimate(steady_state_1b);
-  assert(bounded_1b.fits);
-  assert(bounded_1b.delta_bytes <= gib(1) / 4);
-  assert(bounded_1b.permanent_override_bytes == 125'000'000ULL);
-  assert(bounded_1b.explicit_bytes <= gib(36));
-
-  const u64 resident_pq_budget = gib(4);
-  const u32 resident_pq32_capacity =
-    gpu_search::memory_budget::choose_resident_pq_capacity(
-      resident_pq_budget, 1'000'000'000, 32);
-  const u32 resident_pq16_capacity =
-    gpu_search::memory_budget::choose_resident_pq_capacity(
-      resident_pq_budget, 1'000'000'000, 16);
-  assert(resident_pq32_capacity > 50'000'000);
-  assert(resident_pq16_capacity >= resident_pq32_capacity);
-  assert(gpu_search::memory_budget::resident_pq_footprint(
-           resident_pq32_capacity, 16) <
-         gpu_search::memory_budget::resident_pq_footprint(
-           resident_pq32_capacity, 32));
-  assert(gpu_search::memory_budget::resident_pq_footprint(
-           resident_pq32_capacity, 32) <= resident_pq_budget);
-  assert(gpu_search::memory_budget::resident_pq_footprint(
-           resident_pq32_capacity + 1, 32) > resident_pq_budget);
-
-  const u64 pq_model_bytes =
-    (128ull * 128 + 128ull * 256) * sizeof(f32);
-  const u64 compute_local_files = pq_model_bytes;
-  assert(compute_local_files < (1ull << 20));
-  assert(compute_local_files < gib(50));
-
-  auto undersized = sift_request(1'000'000'000);
+  auto undersized = sift1b_pq32_request;
   undersized.usable_bytes = gib(16);
   assert(!gpu_search::memory_budget::estimate(undersized).fits);
+
+  auto invalid = sift_request(100'000'000);
+  invalid.code_bytes = 32;
+  assert(!gpu_search::memory_budget::estimate(invalid).fits);
+
+  // The public layout dimension is u32. Budget arithmetic must reject an
+  // impossible OPQ matrix instead of wrapping it into a small allocation.
+  auto overflowing = sift_request(100'000'000);
+  overflowing.usable_bytes = std::numeric_limits<std::uint64_t>::max();
+  overflowing.dim = std::numeric_limits<std::uint32_t>::max();
+  overflowing.pq_subquantizers = 1;
+  overflowing.code_bytes = 1;
+  const auto overflow_result =
+    gpu_search::memory_budget::estimate(overflowing);
+  assert(!overflow_result.fits);
+  assert(overflow_result.explicit_bytes == 0);
+
+  gpu_search::QueryDescriptor descriptor{};
+  descriptor.dim = 70'000;
+  assert(descriptor.dim == 70'000);
+
+  assert(gpu_search::persistent_score_chunk_capacity(68, 128) == 16);
+  // R=128 has eight bounded provisional slots. It remains supported by
+  // processing fourteen expansions per scoring chunk instead of overflowing
+  // the 2048-item merge workspace at the old fixed width of sixteen.
+  assert(gpu_search::persistent_score_chunk_capacity(136, 128) == 14);
+  assert(gpu_search::persistent_score_chunk_capacity(2048, 128) == 0);
   return 0;
 }

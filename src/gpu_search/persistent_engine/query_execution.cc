@@ -15,6 +15,14 @@ service::QueryResult PersistentSearchEngine::Impl::search(VectorDType query_dtyp
       k == 0 || k > result_capacity) {
     throw std::invalid_argument("invalid persistent GPU query");
   }
+  if (query_dtype == VectorDType::float32) {
+    const auto* components = reinterpret_cast<const f32*>(query_data);
+    for (u32 dimension = 0; dimension < config.dim; ++dimension) {
+      if (!floating_value_is_finite(components[dimension])) {
+        throw std::invalid_argument("persistent GPU query components must be finite");
+      }
+    }
+  }
   u32 slot = 0;
   {
     std::unique_lock<std::mutex> lock(slot_mutex);
@@ -45,14 +53,13 @@ service::QueryResult PersistentSearchEngine::Impl::search(VectorDType query_dtyp
   }
   QueryDescriptor descriptor{
     .request_id = request_id,
-    .snapshot_epoch = engine.delta_.published_epoch(),
     .query_device_address = reinterpret_cast<u64>(
       d_query_input + static_cast<size_t>(slot) * query_input_stride),
     .result_device_address = reinterpret_cast<u64>(
       d_result_ids + static_cast<size_t>(slot) * result_capacity),
     .query_slot = slot,
     .result_capacity = result_capacity,
-    .dim = static_cast<u16>(config.dim),
+    .dim = config.dim,
     .k = static_cast<u16>(k),
     .query_dtype = static_cast<u8>(query_dtype),
   };
@@ -100,24 +107,10 @@ void PersistentSearchEngine::Impl::admission_loop() {
           batch.push_back(admission_queue.front());
           admission_queue.pop_front();
         }
-        active_gpu_queries.fetch_add(count, std::memory_order_release);
       }
       if (batch.empty()) continue;
       const auto admitted_at = std::chrono::steady_clock::now();
       u64 wait_ns = 0;
-      {
-        std::lock_guard<std::mutex> snapshot_lock(query_snapshot_mutex);
-        for (PendingSubmission& submission : batch) {
-          submission.descriptor.snapshot_epoch = engine.delta_.published_epoch();
-          const u64 query_ticket =
-            next_query_ticket.fetch_add(1, std::memory_order_acq_rel);
-          const u32 slot = submission.descriptor.query_slot;
-          active_query_snapshots[slot].store(
-            submission.descriptor.snapshot_epoch + 1,
-            std::memory_order_release);
-          active_query_tickets[slot].store(query_ticket, std::memory_order_release);
-        }
-      }
       for (PendingSubmission& submission : batch) {
         while (!submissions.try_push(submission.descriptor)) {
           if (shutdown.load(std::memory_order_acquire) ||
@@ -138,20 +131,10 @@ void PersistentSearchEngine::Impl::admission_loop() {
     for (size_t index = submitted_count; index < batch.size(); ++index) {
       reject_submission(batch[index], error.what());
     }
-    const size_t rejected_count = batch.size() - submitted_count;
-    if (rejected_count != 0) {
-      active_gpu_queries.fetch_sub(rejected_count, std::memory_order_release);
-      maintenance_cv.notify_all();
-    }
     mark_unhealthy(std::string{"GPU admission failed: "} + error.what());
   } catch (...) {
     for (size_t index = submitted_count; index < batch.size(); ++index) {
       reject_submission(batch[index], "unknown GPU admission failure");
-    }
-    const size_t rejected_count = batch.size() - submitted_count;
-    if (rejected_count != 0) {
-      active_gpu_queries.fetch_sub(rejected_count, std::memory_order_release);
-      maintenance_cv.notify_all();
     }
     mark_unhealthy("unknown GPU admission failure");
   }

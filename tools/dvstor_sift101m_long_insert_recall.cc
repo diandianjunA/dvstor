@@ -654,13 +654,11 @@ int run_with_service(ComputeService& service, const Args& args) {
     {"reset_breakdown_every", args.reset_breakdown_every},
     {"dim", service.config().dim},
     {"max_vectors_config", service.config().max_vectors},
-    {"storage_owner_update_mode", service.config().storage_owner_update_mode},
-    {"storage_owner_maintenance_mode", service.config().storage_owner_maintenance_mode},
+    {"storage_owner_update_protocol", "centroid_home_two_stage"},
     {"storage_owner_maintenance_workers", service.config().storage_owner_maintenance_workers},
-    {"storage_owner_reverse_mode", service.config().storage_owner_reverse_mode},
     {"fine_grained_breakdown_enabled", service.config().enable_breakdown},
-    {"search", "gpu_persistent_opq_pq16"},
-    {"navigation_quantizer", "opq_pq16"},
+    {"search", "gpu_persistent_opq_pq"},
+    {"navigation_quantizer", "opq_pq"},
   };
   root["input"] = {
     {"insert_rows", insert_rows.count},

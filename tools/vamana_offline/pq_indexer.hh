@@ -12,7 +12,6 @@ struct PqIndexOptions {
   u32 opq_iterations{20};
   u32 pq_iterations{25};
   u32 chunk_vectors{32768};
-  u32 entry_points{256};
   u32 threads{};
   u64 seed{1234};
   bool overwrite{};

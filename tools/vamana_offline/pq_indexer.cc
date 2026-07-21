@@ -13,25 +13,32 @@
 #include <faiss/impl/ProductQuantizer.h>
 #include <omp.h>
 
+#include "common/constants.hh"
 #include "common/index_path.hh"
 #include "common/vector_dtype.hh"
 #include "gpu_search/index_format.hh"
 #include "gpu_search/pq_index.hh"
 #include "nlohmann/json.hh"
+#include "remote_pointer.hh"
+#include "vamana/centroid_state.hh"
+#include "vamana/vamana_node.hh"
 
 namespace tools::vamana_offline {
 namespace {
 
 struct Layout {
   u32 dim{};
+  u32 graph_degree{};
   u32 shards{};
   u32 node_bytes{};
   u32 vector_offset{};
   u32 vector_bytes{};
   VectorDType dtype{VectorDType::float32};
+  u64 build_fingerprint{};
   u64 node_count{};
   vec<u64> counts;
   vec<u64> dynamic_offsets;
+  vec<u64> shard_fingerprints;
 };
 
 struct PersistentLayout {
@@ -45,37 +52,69 @@ struct PersistentLayout {
 
 Layout parse_layout(const nlohmann::json& metadata) {
   const u32 schema_version = metadata.value("schema_version", 0u);
-  if (schema_version != 14 ||
+  if (schema_version != 15 ||
       metadata.value("node_layout", str{}) != "plain" ||
-      metadata.value("storage_format", str{}) != "vamana_compact_v1" ||
+      metadata.value("storage_format", str{}) != "vamana_tagged_v2" ||
+      metadata.value("remote_ptr_format", str{}) !=
+        "tagged_inc24_shard6_off34x16_v1" ||
+      metadata.value("centroid_state_format", str{}) !=
+        "physical_shard_centroid_v2_bound" ||
+      metadata.value("index_build_fingerprint", 0ull) == 0 ||
       metadata.value("distance", str{"l2"}) != "l2") {
     throw std::runtime_error(
-      "PQ indexer requires a schema-14 plain compact L2 index");
+      "PQ indexer requires a schema-15 tagged L2 index");
   }
   Layout layout;
   layout.dim = metadata.at("dim").get<u32>();
+  layout.graph_degree = metadata.at("R").get<u32>();
   layout.shards = metadata.at("num_memory_nodes").get<u32>();
   layout.node_bytes = metadata.at("node_size").get<u32>();
   layout.vector_offset = metadata.at("vector_offset").get<u32>();
   layout.vector_bytes = metadata.at("vector_bytes").get<u32>();
   layout.dtype = parse_vector_dtype(metadata.at("vector_data_type").get<str>());
+  layout.build_fingerprint =
+    metadata.at("index_build_fingerprint").get<u64>();
   layout.node_count = metadata.at("num_vectors").get<u64>();
   layout.counts = metadata.at("hot_graph_entry_counts").get<vec<u64>>();
   layout.dynamic_offsets =
     metadata.at("hot_graph_dynamic_base_offsets").get<vec<u64>>();
-  if (layout.dim == 0 || layout.shards == 0 || layout.node_bytes == 0 ||
+  layout.shard_fingerprints =
+    metadata.at("shard_build_fingerprints").get<vec<u64>>();
+  if (layout.dim == 0 || layout.graph_degree == 0 ||
+      layout.graph_degree > kMaxSupportedGraphDegree ||
+      layout.shards == 0 ||
+      layout.shards > RemotePtr::MEMORY_NODE_MASK + 1 ||
+      layout.node_bytes == 0 ||
       layout.vector_offset + layout.vector_bytes > layout.node_bytes ||
       vector_dtype_bytes(layout.dtype, layout.dim) != layout.vector_bytes ||
       layout.counts.size() != layout.shards ||
-      layout.dynamic_offsets.size() != layout.shards) {
-    throw std::runtime_error("schema-14 index metadata contains an invalid node layout");
+      layout.dynamic_offsets.size() != layout.shards ||
+      layout.shard_fingerprints.size() != layout.shards ||
+      std::find(layout.shard_fingerprints.begin(),
+                layout.shard_fingerprints.end(), 0) !=
+        layout.shard_fingerprints.end()) {
+    throw std::runtime_error("schema-15 index metadata contains an invalid node layout");
   }
   u64 total = 0;
   for (u64 count : layout.counts) total += count;
   if (total != layout.node_count || total == 0) {
-    throw std::runtime_error("schema-14 index metadata contains an invalid node count");
+    throw std::runtime_error("schema-15 index metadata contains an invalid node count");
   }
   return layout;
+}
+
+void validate_shard_fingerprint(std::ifstream& input,
+                                const filepath_t& path,
+                                u64 expected) {
+  u64 actual = 0;
+  input.seekg(static_cast<std::streamoff>(
+    vamana::centroid_state::kShardFingerprintOffset));
+  input.read(reinterpret_cast<char*>(&actual), sizeof(actual));
+  if (input.gcount() != static_cast<std::streamsize>(sizeof(actual)) ||
+      expected == 0 || actual != expected) {
+    throw std::runtime_error(
+      "index shard does not belong to metadata build: " + path.string());
+  }
 }
 
 PersistentLayout make_persistent_layout(const nlohmann::json& metadata,
@@ -89,7 +128,8 @@ PersistentLayout make_persistent_layout(const nlohmann::json& metadata,
   const u32 graph_entry_bytes = metadata.at("hot_graph_entry_size").get<u32>();
   const u64 dynamic_code_offset = static_cast<u64>(dynamic_hot_offset) + graph_entry_bytes;
   const u64 dynamic_record_bytes = gpu_search::format::align_up(
-    dynamic_code_offset + code_bytes, 16);
+    dynamic_code_offset + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
+      code_bytes, 16);
   if (dynamic_code_offset > std::numeric_limits<u32>::max() ||
       dynamic_record_bytes == 0 ||
       dynamic_record_bytes > std::numeric_limits<u32>::max()) {
@@ -149,6 +189,8 @@ void apply_persistent_layout(nlohmann::json& metadata,
   metadata["hot_graph_dynamic_record_bytes"] = layout.dynamic_record_bytes;
   metadata["allocation_size"] = layout.dynamic_record_bytes;
   metadata["dynamic_navigation_code_offset"] = layout.dynamic_code_offset;
+  metadata["dynamic_navigation_code_validation_bytes"] =
+    VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES;
   metadata["navigation_code_materialization"] = "storage_startup_sidecar";
   metadata["navigation_graph_source"] = "storage_compact_graph";
   metadata["navigation_execution"] = "gpu_beam_v1";
@@ -190,6 +232,8 @@ vec<f32> sample_training_vectors(const filepath_t& prefix, const Layout& layout,
     const filepath_t path = index_path::shard_file(prefix, shard + 1, layout.shards);
     inputs[shard].open(path, std::ios::binary);
     if (!inputs[shard].good()) throw std::runtime_error("missing index shard: " + path.string());
+    validate_shard_fingerprint(
+      inputs[shard], path, layout.shard_fingerprints[shard]);
   }
   vec<f32> samples(static_cast<size_t>(sample_count) * layout.dim);
   vec<byte_t> raw(layout.vector_bytes);
@@ -254,6 +298,8 @@ void encode_shard(const filepath_t& prefix, const Layout& layout,
   const filepath_t input_path = index_path::shard_file(prefix, shard + 1, layout.shards);
   std::ifstream input(input_path, std::ios::binary);
   if (!input.good()) throw std::runtime_error("missing index shard: " + input_path.string());
+  validate_shard_fingerprint(
+    input, input_path, layout.shard_fingerprints[shard]);
   std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
   if (!output.good()) throw std::runtime_error("failed to create PQ sidecar: " + output_path.string());
   gpu_search::format::CodeHeader header;
@@ -335,11 +381,14 @@ void encode_shard(const filepath_t& prefix, const Layout& layout,
   header.memory_node = shard;
   header.code_bytes = model.code_bytes();
   header.node_size = layout.node_bytes;
+  header.vector_dtype = static_cast<u32>(layout.dtype);
   header.entry_count = count;
   header.remote_offset = remote_offset;
   header.payload_bytes = count * model.code_bytes();
   header.model_checksum = model.checksum();
   header.payload_checksum = checksum;
+  header.build_fingerprint = layout.build_fingerprint;
+  header.shard_fingerprint = layout.shard_fingerprints[shard];
   std::string error;
   if (!gpu_search::format::write_code_header(output, header, &error)) {
     throw std::runtime_error(error);
@@ -420,23 +469,17 @@ PqIndexResult build_pq_index(const PqIndexOptions& options) {
   metadata["navigation_model_checksum"] = model.checksum();
   metadata["navigation_model_file"] = result.model_file.string();
   metadata["navigation_format"] = "opq_pq_graph_v1";
-  metadata["navigation_entry_points"] = options.entry_points;
   apply_persistent_layout(metadata, persistent, model.code_bytes());
   write_metadata_atomic(metadata_path, metadata);
 
   gpu_search::format::View manifest;
-  bool used_anchors = false;
   if (!gpu_search::format::synthesize_distributed_view(
-        options.index_prefix, manifest,
-        {.entry_points = options.entry_points, .seed = options.seed},
-        &used_anchors, &error)) {
+        options.index_prefix, manifest, &error)) {
     throw std::runtime_error(error);
   }
   std::cerr << "PQ index ready: nodes=" << result.node_count
             << " code_bytes=" << result.code_bytes
-            << " model_checksum=" << result.model_checksum
-            << " entry_points=" << manifest.entry_points.size()
-            << " anchors=" << (used_anchors ? "yes" : "no") << '\n';
+            << " model_checksum=" << result.model_checksum << '\n';
   return result;
 }
 

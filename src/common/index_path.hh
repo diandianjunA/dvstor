@@ -33,8 +33,12 @@ inline filepath_t owner_idmap_file(const filepath_t& prefix, size_t node_ordinal
                     std::to_string(num_nodes) + ".idmap");
 }
 
-inline filepath_t anchor_file(const filepath_t& prefix) {
-  return filepath_t(prefix.string() + ".anchors");
+inline filepath_t centroid_state_file(const filepath_t& prefix,
+                                      size_t node_ordinal,
+                                      size_t num_nodes) {
+  return filepath_t(prefix.string() + "_node" +
+                    std::to_string(node_ordinal) + "_of" +
+                    std::to_string(num_nodes) + ".centroid");
 }
 
 inline filepath_t navigation_model_file(const filepath_t& prefix, u32 subquantizers) {

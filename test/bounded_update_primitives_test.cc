@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <future>
 #include <thread>
 #include <vector>
@@ -241,8 +242,6 @@ void test_sliding_completion_ring_bounded_smooth_admission() {
 
 void test_integral_raw_stage2_distance_is_exact() {
   constexpr u32 dim = 128;
-  assert(integral_byte_l2_sum_exact_in_float(258));
-  assert(!integral_byte_l2_sum_exact_in_float(259));
 
   auto verify = [](const std::array<byte_t, dim>& lhs,
                    const std::array<byte_t, dim>& rhs,
@@ -288,7 +287,27 @@ void test_integral_raw_stage2_distance_is_exact() {
   }
 }
 
-void test_stale_stitch_sequence_handoff_to_bounded_repair() {
+void test_wide_integral_simd_distance_never_overflows() {
+  constexpr u32 dim = 100003;
+  vec<byte_t> lhs(dim, 0);
+  vec<byte_t> rhs(dim, static_cast<byte_t>(255));
+  const f64 exact = static_cast<f64>(dim) * 255.0 * 255.0;
+  const auto verify = [&](VectorDType dtype) {
+    const f32 actual = typed_l2_distance(
+      lhs.data(), dtype, rhs.data(), dtype, dim);
+    assert(std::isfinite(actual) && actual > 0.0F);
+    assert(actual == static_cast<f32>(exact));
+  };
+  verify(VectorDType::uint8);
+
+  auto* signed_lhs = reinterpret_cast<i8*>(lhs.data());
+  auto* signed_rhs = reinterpret_cast<i8*>(rhs.data());
+  std::fill(signed_lhs, signed_lhs + dim, static_cast<i8>(-128));
+  std::fill(signed_rhs, signed_rhs + dim, static_cast<i8>(127));
+  verify(VectorDType::int8);
+}
+
+void test_stale_stage2_sequence_handoff_to_bounded_repair() {
   struct RepairDescriptor {
     u64 sequence{};
   };
@@ -302,8 +321,8 @@ void test_stale_stitch_sequence_handoff_to_bounded_repair() {
   assert(repairs.try_push({insert_sequence}));
   assert(ring.finalized() == 0);
 
-  // An upsert owns stitch+cleanup units. Its ordinary cleanup may finish out
-  // of order, but the sequence remains blocked while stale stitch repair is
+  // An upsert owns Stage2-finalize+cleanup units. Its ordinary cleanup may finish out
+  // of order, but the sequence remains blocked while stale Stage2 finalization repair is
   // pending and while the prior insert sequence has not finalized.
   const u64 upsert_sequence = ring.reserve(2);
   ring.complete(upsert_sequence);
@@ -336,7 +355,7 @@ void test_stale_stitch_sequence_handoff_to_bounded_repair() {
   assert(repairs.empty());
 }
 
-void test_stale_stitch_repair_keeps_schema15_payload_bound() {
+void test_stale_stage2_repair_keeps_wire_payload_bound() {
   constexpr size_t kR = 4;
   const vec<RemotePtr> preserved{
     RemotePtr{1, 0x1000}, RemotePtr{1, 0x2000},
@@ -345,11 +364,11 @@ void test_stale_stitch_repair_keeps_schema15_payload_bound() {
     RemotePtr{2, 0x1000}, RemotePtr{2, 0x2000},
     RemotePtr{2, 0x3000}, RemotePtr{2, 0x4000}};
 
-  // The stale stitch transfers its completion unit to a repair descriptor.
+  // The stale Stage2 finalization transfers its completion unit to a repair descriptor.
   // Even with disjoint R-sized preserved and supplemental sets, that repair
-  // sends only the supplemental backlinks attempted by the stitch.
+  // sends only the supplemental backlinks attempted by the Stage2 finalization.
   bounded::SlidingCompletionRing ring(2);
-  const u64 stale_stitch_sequence = ring.reserve(1);
+  const u64 stale_stage2_sequence = ring.reserve(1);
   const u64 successor_cleanup_sequence = ring.reserve(1);
   const vec<RemotePtr> repair =
     memory_node_storage_owner_maintenance_detail::select_cleanup_neighbors(
@@ -362,8 +381,8 @@ void test_stale_stitch_repair_keeps_schema15_payload_bound() {
 
   // Repair completion releases the stale sequence. The later ordinary
   // delete/upsert cleanup independently consumes the preserved adjacency.
-  ring.complete(stale_stitch_sequence);
-  assert(ring.finalized() == stale_stitch_sequence);
+  ring.complete(stale_stage2_sequence);
+  assert(ring.finalized() == stale_stage2_sequence);
   const vec<RemotePtr> ordinary =
     memory_node_storage_owner_maintenance_detail::select_cleanup_neighbors(
       false,
@@ -402,6 +421,19 @@ void test_stage2_admission_yields_only_for_live_foreground_pressure() {
            return false;
          }) == Stage2AdmissionDecision::admit);
   assert(pressure_probe_called);
+}
+
+void test_stage1_arm_queue_permit_cannot_be_stolen() {
+  using memory_node_storage_owner_maintenance_detail::
+    maintenance_queue_permit_available;
+
+  assert(maintenance_queue_permit_available(3, 0, 4));
+  // Once arm owns the last slot, a generic cleanup/repair producer observes
+  // the queue as full even though the arm task is not enqueued yet.
+  assert(!maintenance_queue_permit_available(3, 1, 4));
+  assert(!maintenance_queue_permit_available(2, 2, 4));
+  assert(maintenance_queue_permit_available(2, 1, 4));
+  assert(!maintenance_queue_permit_available(0, 0, 0));
 }
 
 void test_reverse_candidate_is_revalidated_at_locked_write_boundary() {
@@ -501,6 +533,57 @@ void test_stage2_rebase_preserves_post_stage1_reverse_edge() {
   assert(rebased[1] == concurrent_reverse);
 }
 
+void test_cleanup_identity_fences_both_reused_slots() {
+  using namespace memory_node_storage_owner_maintenance_detail;
+  assert(cleanup_deleted_candidate_matches(7, 3, 7, 3, true));
+  assert(!cleanup_deleted_candidate_matches(7, 3, 8, 3, true));
+  assert(!cleanup_deleted_candidate_matches(7, 3, 7, 4, true));
+  assert(!cleanup_deleted_candidate_matches(7, 3, 7, 3, false));
+
+  assert(cleanup_reverse_target_matches(11, 5, 11, 5, false));
+  // A delayed cleanup is an idempotent no-op when the target address has
+  // been tombstoned or reused by either a different ID or generation.
+  assert(!cleanup_reverse_target_matches(11, 5, 12, 5, false));
+  assert(!cleanup_reverse_target_matches(11, 5, 11, 6, false));
+  assert(!cleanup_reverse_target_matches(11, 5, 11, 5, true));
+}
+
+void test_protected_reparent_order_is_local_bounded_and_deterministic() {
+  using memory_node_storage_owner_maintenance_detail::
+    order_protected_reparent_candidates;
+  const RemotePtr child{2, 0x1000};
+  const RemotePtr retiring{2, 0x2000};
+  const RemotePtr local_high{2, 0x5000};
+  const RemotePtr local_low{2, 0x3000};
+  const RemotePtr remote_low{0, 0x1000};
+  const RemotePtr remote_high{3, 0x7000};
+  const vec<RemotePtr> neighbors{
+    remote_high, retiring, local_high, remote_low, child, local_low,
+    local_high};
+  const vec<RemotePtr> ordered = order_protected_reparent_candidates(
+    child, retiring, span<const RemotePtr>{neighbors});
+  assert((ordered == vec<RemotePtr>{
+                       local_low, local_high, remote_low, remote_high}));
+  assert(ordered.size() <= neighbors.size());
+}
+
+void test_protected_reparent_capacity_never_evicts_existing_work() {
+  using memory_node_storage_owner_maintenance_detail::
+    protected_reparent_target_has_capacity;
+  const RemotePtr child{1, 0x1000};
+  const RemotePtr protected_other{1, 0x3000};
+  const vec<RemotePtr> one_protected{protected_other};
+  const vec<RemotePtr> full_protected{
+    protected_other, RemotePtr{1, 0x4000}};
+  assert(protected_reparent_target_has_capacity(
+    child, one_protected, 2));
+  assert(!protected_reparent_target_has_capacity(
+    child, full_protected, 2));
+  const vec<RemotePtr> already_reserved{protected_other, child};
+  assert(protected_reparent_target_has_capacity(
+    child, already_reserved, 2));
+}
+
 }  // namespace
 
 int main() {
@@ -511,11 +594,16 @@ int main() {
   test_sliding_completion_ring_atomic_batch_admission();
   test_sliding_completion_ring_bounded_smooth_admission();
   test_integral_raw_stage2_distance_is_exact();
-  test_stale_stitch_sequence_handoff_to_bounded_repair();
-  test_stale_stitch_repair_keeps_schema15_payload_bound();
+  test_wide_integral_simd_distance_never_overflows();
+  test_stale_stage2_sequence_handoff_to_bounded_repair();
+  test_stale_stage2_repair_keeps_wire_payload_bound();
   test_stage2_admission_yields_only_for_live_foreground_pressure();
+  test_stage1_arm_queue_permit_cannot_be_stolen();
   test_reverse_candidate_is_revalidated_at_locked_write_boundary();
   test_reverse_overflow_uses_alpha_robust_prune_not_nearest_r();
   test_stage2_rebase_preserves_post_stage1_reverse_edge();
+  test_cleanup_identity_fences_both_reused_slots();
+  test_protected_reparent_order_is_local_bounded_and_deterministic();
+  test_protected_reparent_capacity_never_evicts_existing_work();
   return 0;
 }

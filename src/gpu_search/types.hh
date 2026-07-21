@@ -14,28 +14,28 @@ using f32 = float;
 
 struct QueryDescriptor {
   u64 request_id{};
-  u64 snapshot_epoch{};
   u64 query_device_address{};
   u64 result_device_address{};
   u32 query_slot{};
   u32 result_capacity{};
-  u16 dim{};
+  // The runtime/index dimension is u32. Keeping only 16 bits here silently
+  // truncated otherwise valid layouts before the device-side shape check.
+  u32 dim{};
   u16 k{};
   u8 query_dtype{};
   u8 flags{};
-  u16 reserved{};
 };
+
+static_assert(sizeof(QueryDescriptor) == 40);
 
 struct CompletionDescriptor {
   u64 request_id{};
-  u64 snapshot_epoch{};
   u64 gpu_cycles{};
   u64 prepare_cycles{};
   u64 graph_cycles{};
   u64 score_cycles{};
   u64 beam_cycles{};
   u64 exact_cycles{};
-  u64 delta_scan_cycles{};
   u32 query_slot{};
   u32 result_count{};
   i32 status{};
@@ -44,104 +44,26 @@ struct CompletionDescriptor {
   u32 graph_rounds{};
   u32 exact_vectors{};
   u32 route_hits{};
-  u32 delta_scan_records{};
-  u32 delta_scan_scored{};
-  u32 delta_scan_truncated_buckets{};
   u32 graph_read_retries{};
-  u32 reserved[2]{};
+  u32 reserved[1]{};
 };
 
-static_assert(sizeof(CompletionDescriptor) == 128);
-
-struct DeltaSupersedeUpdate {
-  u32 slot{};
-  u32 reserved{};
-  u64 epoch{};
-};
-
-struct DeltaOverrideUpdate {
-  u32 ordinal{};
-  u32 reserved{};
-  u64 epoch{};
-};
-
-struct DeltaDurableUpdate {
-  u32 slot{};
-  u32 reserved{};
-  u64 epoch{};
-};
-
-struct ResidentPqEraseUpdate {
-  u64 remote_node{};
-  u32 slot{};
-  u32 reserved{};
-};
-
-// The dynamic query-route overlay is deliberately tiny and fixed-capacity.
-// Static anchors remain the bootstrap/fallback. Storage owners publish the
-// canonical live representatives, so every compute node installs identical
-// slot identities even when mutations originate from different clients.
-inline constexpr u32 kDynamicRouteSlotsPerShard = 8;
-inline constexpr u32 kDynamicRouteLive = 1u;
-
-struct DynamicRouteUpdate {
-  u64 epoch{};
-  u64 remote_node{};
-  u32 slot{};
-  u32 shard{};
-  u32 id{};
-  u32 generation{};
-  u32 flags{};
-  u32 reserved{};
-};
-
-// sequence is a device-scope seqlock.  The control CTA is the only writer:
-// odd means an update is in progress, even means the remaining fields form a
-// stable snapshot.  Query CTAs never wait for a writer; they skip an unstable
-// dynamic seed and continue with the static route.
-struct DeviceDynamicRouteSlot {
-  u64 sequence{};
+struct CentroidRoutePublishDescriptor {
   u64 command_id{};
-  u64 epoch{};
-  u64 remote_node{};
-  u32 id{};
-  u32 generation{};
-  u32 shard{};
-  u32 flags{};
+  u32 update_count{};
+  u32 reserved{};
 };
 
-static_assert(sizeof(DynamicRouteUpdate) == 40);
-static_assert(sizeof(DeviceDynamicRouteSlot) == 48);
-
-inline constexpr u32 kDeltaCommandReset = 1u;
-inline constexpr u32 kDeltaCommandPromoteOverrides = 1u << 1;
-
-struct DeltaPublishDescriptor {
-  u64 command_id{};
-  u32 first_slot{};
-  u32 record_count{};
-  u32 final_count{};
-  u32 invalidation_count{};
-  u32 superseded_count{};
-  u32 override_count{};
-  u32 durable_count{};
-  u32 resident_pq_erase_count{};
-  u32 dynamic_route_count{};
-  u32 flags{};
-};
-
-struct DeltaPublishCompletion {
+struct CentroidRoutePublishCompletion {
   u64 command_id{};
   i32 status{};
-  u32 final_count{};
+  u32 update_count{};
 };
 
 struct TelemetrySnapshot {
   u64 gpu_memory_explicit_bytes{};
   u64 gpu_memory_base_pq_bytes{};
-  u64 gpu_memory_resident_pq_bytes{};
   u64 gpu_memory_route_graph_bytes{};
-  u64 gpu_memory_delta_reserved_bytes{};
   u64 queries_submitted{};
   u64 queries_completed{};
   u64 batches{};
@@ -154,7 +76,6 @@ struct TelemetrySnapshot {
   u64 gpu_score_ns{};
   u64 gpu_beam_ns{};
   u64 gpu_exact_ns{};
-  u64 gpu_delta_scan_ns{};
   u64 rdma_read_ops{};
   u64 rdma_read_bytes{};
   u64 rdma_merged_requests{};
@@ -164,40 +85,15 @@ struct TelemetrySnapshot {
   u64 graph_dependency_rounds{};
   u64 graph_route_hits{};
   u64 graph_route_refreshes{};
-  u64 dynamic_route_publications{};
-  u64 dynamic_route_slot_updates{};
-  u64 dynamic_route_live_slots{};
-  u64 dynamic_route_snapshot_skips{};
-  u64 graph_route_invalidations{};
+  u64 centroid_route_publications{};
+  u64 centroid_route_shard_updates{};
+  u64 centroid_route_live_entries{};
+  u64 centroid_route_snapshot_skips{};
+  u64 centroid_route_probe_reads{};
+  u64 centroid_route_body_reads{};
+  u64 centroid_route_unchanged_polls{};
+  u64 centroid_route_poll_delay_us{};
   u64 exact_vector_reads{};
-  u64 delta_queries{};
-  u64 delta_scan_records{};
-  u64 delta_scan_scored{};
-  u64 delta_scan_truncated_buckets{};
-  u64 mutations_published{};
-  u64 delta_publications{};
-  u64 delta_reclaim_batches{};
-  u64 delta_entries_retired{};
-  u64 storage_reclaim_ack_writes{};
-  u64 storage_reclaim_ack_sequence{};
-  u64 delta_live_entries{};
-  u64 delta_physical_entries{};
-  u64 delta_mutable_entries{};
-  u64 delta_durable_entries{};
-  u64 resident_pq_capacity{};
-  u64 resident_pq_entries{};
-  u64 resident_pq_peak_entries{};
-  u64 resident_pq_reclaimed{};
-  u64 mutation_capacity_rejections{};
-  u64 mutation_capacity_wait_events{};
-  u64 mutation_capacity_wait_ns{};
-  u64 mutation_capacity_reserved{};
-  u64 mutation_capacity_reserved_max{};
-  u64 visibility_ns_total{};
-  u64 visibility_ns_max{};
-  u64 publication_queue_ns_total{};
-  u64 publication_prepare_ns_total{};
-  u64 publication_command_ns_total{};
 };
 
 class Telemetry {
@@ -207,9 +103,7 @@ public:
 
   std::atomic<u64> gpu_memory_explicit_bytes{0};
   std::atomic<u64> gpu_memory_base_pq_bytes{0};
-  std::atomic<u64> gpu_memory_resident_pq_bytes{0};
   std::atomic<u64> gpu_memory_route_graph_bytes{0};
-  std::atomic<u64> gpu_memory_delta_reserved_bytes{0};
   std::atomic<u64> queries_submitted{0};
   std::atomic<u64> queries_completed{0};
   std::atomic<u64> batches{0};
@@ -222,7 +116,6 @@ public:
   std::atomic<u64> gpu_score_ns{0};
   std::atomic<u64> gpu_beam_ns{0};
   std::atomic<u64> gpu_exact_ns{0};
-  std::atomic<u64> gpu_delta_scan_ns{0};
   std::atomic<u64> rdma_read_ops{0};
   std::atomic<u64> rdma_read_bytes{0};
   std::atomic<u64> rdma_merged_requests{0};
@@ -232,40 +125,15 @@ public:
   std::atomic<u64> graph_dependency_rounds{0};
   std::atomic<u64> graph_route_hits{0};
   std::atomic<u64> graph_route_refreshes{0};
-  std::atomic<u64> dynamic_route_publications{0};
-  std::atomic<u64> dynamic_route_slot_updates{0};
-  std::atomic<u64> dynamic_route_live_slots{0};
-  std::atomic<u64> dynamic_route_snapshot_skips{0};
-  std::atomic<u64> graph_route_invalidations{0};
+  std::atomic<u64> centroid_route_publications{0};
+  std::atomic<u64> centroid_route_shard_updates{0};
+  std::atomic<u64> centroid_route_live_entries{0};
+  std::atomic<u64> centroid_route_snapshot_skips{0};
+  std::atomic<u64> centroid_route_probe_reads{0};
+  std::atomic<u64> centroid_route_body_reads{0};
+  std::atomic<u64> centroid_route_unchanged_polls{0};
+  std::atomic<u64> centroid_route_poll_delay_us{0};
   std::atomic<u64> exact_vector_reads{0};
-  std::atomic<u64> delta_queries{0};
-  std::atomic<u64> delta_scan_records{0};
-  std::atomic<u64> delta_scan_scored{0};
-  std::atomic<u64> delta_scan_truncated_buckets{0};
-  std::atomic<u64> mutations_published{0};
-  std::atomic<u64> delta_publications{0};
-  std::atomic<u64> delta_reclaim_batches{0};
-  std::atomic<u64> delta_entries_retired{0};
-  std::atomic<u64> storage_reclaim_ack_writes{0};
-  std::atomic<u64> storage_reclaim_ack_sequence{0};
-  std::atomic<u64> delta_live_entries{0};
-  std::atomic<u64> delta_physical_entries{0};
-  std::atomic<u64> delta_mutable_entries{0};
-  std::atomic<u64> delta_durable_entries{0};
-  std::atomic<u64> resident_pq_capacity{0};
-  std::atomic<u64> resident_pq_entries{0};
-  std::atomic<u64> resident_pq_peak_entries{0};
-  std::atomic<u64> resident_pq_reclaimed{0};
-  std::atomic<u64> mutation_capacity_rejections{0};
-  std::atomic<u64> mutation_capacity_wait_events{0};
-  std::atomic<u64> mutation_capacity_wait_ns{0};
-  std::atomic<u64> mutation_capacity_reserved{0};
-  std::atomic<u64> mutation_capacity_reserved_max{0};
-  std::atomic<u64> visibility_ns_total{0};
-  std::atomic<u64> visibility_ns_max{0};
-  std::atomic<u64> publication_queue_ns_total{0};
-  std::atomic<u64> publication_prepare_ns_total{0};
-  std::atomic<u64> publication_command_ns_total{0};
 };
 
 }  // namespace gpu_search

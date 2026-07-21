@@ -3,7 +3,9 @@
 #include <filesystem>
 #include <fstream>
 
+#include "common/constants.hh"
 #include "nlohmann/json.hh"
+#include "remote_pointer.hh"
 
 namespace service::index_metadata {
 
@@ -42,6 +44,9 @@ bool load_metadata(const filepath_t& index_prefix, Metadata& metadata, str* erro
     metadata.storage_format = json.at("storage_format").get<str>();
     metadata.graph_hot_bytes = json.value("graph_hot_bytes", 0u);
     metadata.vector_offset = json.value("vector_offset", 0u);
+    metadata.slot_incarnation_offset =
+      json.value("slot_incarnation_offset", 0u);
+    metadata.remote_ptr_format = json.value("remote_ptr_format", str{});
     metadata.vector_dtype = parse_vector_dtype(json.value("vector_data_type", str{"float32"}));
     metadata.vector_component_size = json.value(
       "vector_component_size", static_cast<u32>(vector_dtype_component_size(metadata.vector_dtype)));
@@ -79,10 +84,18 @@ bool load_metadata(const filepath_t& index_prefix, Metadata& metadata, str* erro
       json.value("hot_graph_dynamic_hot_offset", 0u);
     metadata.dynamic_navigation_code_offset =
       json.value("dynamic_navigation_code_offset", 0u);
+    metadata.dynamic_navigation_code_validation_bytes =
+      json.value("dynamic_navigation_code_validation_bytes", 0u);
     metadata.allocation_size = json.value("allocation_size", metadata.node_size);
     metadata.idmap_format = json.value("idmap_format", str{});
-    metadata.anchor_format = json.value("anchor_format", str{});
-    metadata.anchor_count_per_shard = json.value("anchor_count_per_shard", 0u);
+    metadata.centroid_state_format =
+      json.value("centroid_state_format", str{});
+    metadata.index_build_fingerprint =
+      json.value("index_build_fingerprint", 0ull);
+    if (json.contains("shard_build_fingerprints")) {
+      metadata.shard_build_fingerprints =
+        json["shard_build_fingerprints"].get<vec<u64>>();
+    }
     metadata.navigation_format = json.value("navigation_format", str{});
     if (json.contains("navigation_code_remote_offsets")) {
       metadata.navigation_code_remote_offsets =
@@ -91,6 +104,22 @@ bool load_metadata(const filepath_t& index_prefix, Metadata& metadata, str* erro
     if (json.contains("navigation_code_region_bytes")) {
       metadata.navigation_code_region_bytes =
         json["navigation_code_region_bytes"].get<vec<u64>>();
+    }
+    if (metadata.dim == 0 || metadata.R == 0 ||
+        metadata.R > kMaxSupportedGraphDegree) {
+      return fail(error_message,
+                  "index metadata has an unsupported dimension or graph degree");
+    }
+    if (metadata.num_memory_nodes == 0 ||
+        metadata.num_memory_nodes > RemotePtr::MEMORY_NODE_MASK + 1) {
+      return fail(error_message,
+                  "index metadata exceeds the tagged RemotePtr shard limit");
+    }
+    if (!floating_value_is_finite(metadata.partition_cross_shard_ratio) ||
+        metadata.partition_cross_shard_ratio < 0.0 ||
+        metadata.partition_cross_shard_ratio > 1.0) {
+      return fail(error_message,
+                  "index metadata partition_cross_shard_ratio is invalid");
     }
   } catch (const std::exception& e) {
     return fail(error_message, "failed to parse index metadata " + metadata_file.string() + ": " + e.what());

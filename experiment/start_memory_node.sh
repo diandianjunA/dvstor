@@ -73,10 +73,7 @@ cmd=("$BUILD_DIR/dvstor_memory_node"
   --storage-owner-rpc-depth "${STORAGE_OWNER_RPC_DEPTH:-16}"
   --storage-owner-rpc-timeout-ms "${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}"
   --storage-owner-search-snapshot-batch "${STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH:-64}"
-  --storage-owner-update-mode "${STORAGE_OWNER_UPDATE_MODE:-local_stitch}"
-  --storage-owner-maintenance-mode "${STORAGE_OWNER_MAINTENANCE_MODE:-finalize}"
   --storage-owner-maintenance-workers "${STORAGE_OWNER_MAINTENANCE_WORKERS:-8}"
-  --storage-owner-reverse-mode "${STORAGE_OWNER_REVERSE_MODE:-async}"
   --storage-owner-reverse-queue-depth "${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
   --storage-owner-reverse-coalesce-max "${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}")
 

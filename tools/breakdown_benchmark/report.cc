@@ -35,121 +35,71 @@ std::vector<uint32_t> filter_base_only_recall_ids(
   return filtered;
 }
 
-nlohmann::json telemetry_to_json(const gpu_search::TelemetrySnapshot& telemetry) {
+nlohmann::json telemetry_to_json(
+    const gpu_search::TelemetrySnapshot& telemetry) {
   return {
-      {"gpu_memory_explicit_bytes", telemetry.gpu_memory_explicit_bytes},
-      {"gpu_memory_base_pq_bytes", telemetry.gpu_memory_base_pq_bytes},
-      {"gpu_memory_resident_pq_bytes", telemetry.gpu_memory_resident_pq_bytes},
-      {"gpu_memory_route_graph_bytes", telemetry.gpu_memory_route_graph_bytes},
-      {"gpu_memory_delta_reserved_bytes", telemetry.gpu_memory_delta_reserved_bytes},
-      {"queries_submitted", telemetry.queries_submitted},
-      {"queries_completed", telemetry.queries_completed},
-      {"batches", telemetry.batches},
-      {"batch_queries", telemetry.batch_queries},
-      {"average_batch_size", telemetry.batches == 0 ? 0.0
-        : static_cast<double>(telemetry.batch_queries) / static_cast<double>(telemetry.batches)},
-      {"submission_wait_ns", telemetry.submission_wait_ns},
-      {"average_submission_wait_us", telemetry.queries_submitted == 0 ? 0.0
-        : static_cast<double>(telemetry.submission_wait_ns) /
-            static_cast<double>(telemetry.queries_submitted) / 1000.0},
-      {"completion_wait_ns", telemetry.completion_wait_ns},
-      {"gpu_query_residence_ns", telemetry.gpu_active_ns},
-      {"average_gpu_query_us", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.gpu_active_ns) /
-            static_cast<double>(telemetry.queries_completed) / 1000.0},
-      {"average_gpu_prepare_us", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.gpu_prepare_ns) /
-            static_cast<double>(telemetry.queries_completed) / 1000.0},
-      {"average_gpu_graph_us", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.gpu_graph_ns) /
-            static_cast<double>(telemetry.queries_completed) / 1000.0},
-      {"average_gpu_score_us", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.gpu_score_ns) /
-            static_cast<double>(telemetry.queries_completed) / 1000.0},
-      {"average_gpu_beam_us", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.gpu_beam_ns) /
-            static_cast<double>(telemetry.queries_completed) / 1000.0},
-      {"average_gpu_exact_us", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.gpu_exact_ns) /
-            static_cast<double>(telemetry.queries_completed) / 1000.0},
-      {"gpu_delta_scan_ns", telemetry.gpu_delta_scan_ns},
-      {"average_gpu_delta_scan_us", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.gpu_delta_scan_ns) /
-            static_cast<double>(telemetry.queries_completed) / 1000.0},
-      {"rdma_read_ops", telemetry.rdma_read_ops},
-      {"rdma_read_bytes", telemetry.rdma_read_bytes},
-      {"rdma_merged_requests", telemetry.rdma_merged_requests},
-      {"direct_path_failures", telemetry.direct_path_failures},
-      {"graph_page_requests", telemetry.graph_page_requests},
-      {"graph_read_retries", telemetry.graph_read_retries},
-      {"average_graph_read_retries", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.graph_read_retries) /
-            static_cast<double>(telemetry.queries_completed)},
-      {"graph_dependency_rounds", telemetry.graph_dependency_rounds},
-      {"graph_route_hits", telemetry.graph_route_hits},
-      {"graph_route_refreshes", telemetry.graph_route_refreshes},
-      {"dynamic_route_publications", telemetry.dynamic_route_publications},
-      {"dynamic_route_slot_updates", telemetry.dynamic_route_slot_updates},
-      {"dynamic_route_live_slots", telemetry.dynamic_route_live_slots},
-      {"dynamic_route_snapshot_skips", telemetry.dynamic_route_snapshot_skips},
-      {"graph_route_invalidations", telemetry.graph_route_invalidations},
-      {"graph_route_hit_ratio",
-        telemetry.graph_page_requests + telemetry.graph_route_hits == 0 ? 0.0
-        : static_cast<double>(telemetry.graph_route_hits) /
-            static_cast<double>(telemetry.graph_page_requests +
-                                telemetry.graph_route_hits)},
-      {"exact_vector_reads", telemetry.exact_vector_reads},
-      {"delta_queries", telemetry.delta_queries},
-      {"delta_scan_records", telemetry.delta_scan_records},
-      {"delta_scan_scored", telemetry.delta_scan_scored},
-      {"delta_scan_truncated_buckets",
-       telemetry.delta_scan_truncated_buckets},
-      {"average_delta_scan_records", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.delta_scan_records) /
-            static_cast<double>(telemetry.queries_completed)},
-      {"average_delta_scan_scored", telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.delta_scan_scored) /
-            static_cast<double>(telemetry.queries_completed)},
-      {"average_delta_scan_truncated_buckets",
-       telemetry.queries_completed == 0 ? 0.0
-        : static_cast<double>(telemetry.delta_scan_truncated_buckets) /
-            static_cast<double>(telemetry.queries_completed)},
-      {"mutations_published", telemetry.mutations_published},
-      {"delta_publications", telemetry.delta_publications},
-      {"average_mutations_per_publication", telemetry.delta_publications == 0 ? 0.0
-        : static_cast<double>(telemetry.mutations_published) /
-            static_cast<double>(telemetry.delta_publications)},
-      {"delta_reclaim_batches", telemetry.delta_reclaim_batches},
-      {"delta_entries_retired", telemetry.delta_entries_retired},
-      {"storage_reclaim_ack_writes", telemetry.storage_reclaim_ack_writes},
-      {"storage_reclaim_ack_sequence", telemetry.storage_reclaim_ack_sequence},
-      {"delta_live_entries", telemetry.delta_live_entries},
-      {"delta_physical_entries", telemetry.delta_physical_entries},
-      {"delta_mutable_entries", telemetry.delta_mutable_entries},
-      {"delta_durable_entries", telemetry.delta_durable_entries},
-      {"resident_pq_capacity", telemetry.resident_pq_capacity},
-      {"resident_pq_entries", telemetry.resident_pq_entries},
-      {"resident_pq_peak_entries", telemetry.resident_pq_peak_entries},
-      {"resident_pq_reclaimed", telemetry.resident_pq_reclaimed},
-      {"mutation_capacity_rejections", telemetry.mutation_capacity_rejections},
-      {"mutation_capacity_wait_events", telemetry.mutation_capacity_wait_events},
-      {"mutation_capacity_wait_ns", telemetry.mutation_capacity_wait_ns},
-      {"mutation_capacity_wait_ms", static_cast<double>(telemetry.mutation_capacity_wait_ns) / 1e6},
-      {"mutation_capacity_reserved", telemetry.mutation_capacity_reserved},
-      {"mutation_capacity_reserved_max", telemetry.mutation_capacity_reserved_max},
-      {"average_visibility_us", telemetry.mutations_published == 0 ? 0.0
-        : static_cast<double>(telemetry.visibility_ns_total) /
-            static_cast<double>(telemetry.mutations_published) / 1000.0},
-      {"max_visibility_us", static_cast<double>(telemetry.visibility_ns_max) / 1000.0},
-      {"average_publication_queue_us", telemetry.mutations_published == 0 ? 0.0
-        : static_cast<double>(telemetry.publication_queue_ns_total) /
-            static_cast<double>(telemetry.mutations_published) / 1000.0},
-      {"average_publication_prepare_us", telemetry.delta_publications == 0 ? 0.0
-        : static_cast<double>(telemetry.publication_prepare_ns_total) /
-            static_cast<double>(telemetry.delta_publications) / 1000.0},
-      {"average_publication_command_us", telemetry.delta_publications == 0 ? 0.0
-        : static_cast<double>(telemetry.publication_command_ns_total) /
-            static_cast<double>(telemetry.delta_publications) / 1000.0},
+    {"gpu_memory_explicit_bytes", telemetry.gpu_memory_explicit_bytes},
+    {"gpu_memory_base_pq_bytes", telemetry.gpu_memory_base_pq_bytes},
+    {"gpu_memory_route_graph_bytes", telemetry.gpu_memory_route_graph_bytes},
+    {"queries_submitted", telemetry.queries_submitted},
+    {"queries_completed", telemetry.queries_completed},
+    {"batches", telemetry.batches},
+    {"batch_queries", telemetry.batch_queries},
+    {"average_batch_size", telemetry.batches == 0 ? 0.0
+      : static_cast<double>(telemetry.batch_queries) /
+          static_cast<double>(telemetry.batches)},
+    {"submission_wait_ns", telemetry.submission_wait_ns},
+    {"average_submission_wait_us", telemetry.queries_submitted == 0 ? 0.0
+      : static_cast<double>(telemetry.submission_wait_ns) /
+          static_cast<double>(telemetry.queries_submitted) / 1000.0},
+    {"completion_wait_ns", telemetry.completion_wait_ns},
+    {"gpu_query_residence_ns", telemetry.gpu_active_ns},
+    {"average_gpu_query_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_active_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_prepare_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_prepare_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_graph_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_graph_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_score_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_score_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_beam_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_beam_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_exact_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_exact_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"rdma_read_ops", telemetry.rdma_read_ops},
+    {"rdma_read_bytes", telemetry.rdma_read_bytes},
+    {"rdma_merged_requests", telemetry.rdma_merged_requests},
+    {"direct_path_failures", telemetry.direct_path_failures},
+    {"graph_page_requests", telemetry.graph_page_requests},
+    {"graph_read_retries", telemetry.graph_read_retries},
+    {"average_graph_read_retries", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.graph_read_retries) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"graph_dependency_rounds", telemetry.graph_dependency_rounds},
+    {"graph_route_hits", telemetry.graph_route_hits},
+    {"graph_route_refreshes", telemetry.graph_route_refreshes},
+    {"centroid_route_publications", telemetry.centroid_route_publications},
+    {"centroid_route_shard_updates", telemetry.centroid_route_shard_updates},
+    {"centroid_route_live_entries", telemetry.centroid_route_live_entries},
+    {"centroid_route_snapshot_skips", telemetry.centroid_route_snapshot_skips},
+    {"centroid_route_probe_reads", telemetry.centroid_route_probe_reads},
+    {"centroid_route_body_reads", telemetry.centroid_route_body_reads},
+    {"centroid_route_unchanged_polls",
+      telemetry.centroid_route_unchanged_polls},
+    {"centroid_route_poll_delay_us",
+      telemetry.centroid_route_poll_delay_us},
+    {"graph_route_hit_ratio",
+      telemetry.graph_page_requests + telemetry.graph_route_hits == 0 ? 0.0
+      : static_cast<double>(telemetry.graph_route_hits) /
+          static_cast<double>(
+            telemetry.graph_page_requests + telemetry.graph_route_hits)},
+    {"exact_vector_reads", telemetry.exact_vector_reads},
   };
 }
 
@@ -233,11 +183,11 @@ FormattedReport format_report(const nlohmann::json& root,
     output << "  logs observed/requested: "
            << stage2.value("logs_with_observations", 0ULL) << "/"
            << stage2.value("requested_logs", 0ULL) << '\n';
-    output << "  p99_stitch_delay_upper_ms: ";
-    if (stage2.value("p99_stitch_delay_available", false)) {
-      output << stage2.value("p99_stitch_delay_upper_ms", 0.0)
+    output << "  p99_stage2_delay_upper_ms: ";
+    if (stage2.value("p99_stage2_delay_available", false)) {
+      output << stage2.value("p99_stage2_delay_upper_ms", 0.0)
              << " (samples="
-             << stage2.value("p99_stitch_delay_samples", 0ULL) << ")\n";
+             << stage2.value("p99_stage2_delay_samples", 0ULL) << ")\n";
     } else {
       output << "unavailable\n";
     }
@@ -258,6 +208,28 @@ FormattedReport format_report(const nlohmann::json& root,
     output << "  backlog_slope_per_sec: "
            << stage2.value("backlog_slope_per_sec", 0.0) << '\n';
     output << "  failures: " << stage2.value("failures", 0ULL) << '\n';
+    output << "  locality telemetry: ";
+    if (stage2.value("locality_delta_available", false)) {
+      output << "home_match_rate="
+             << stage2.value("home_match_rate", 0.0)
+             << " cross_edge_reduction="
+             << stage2.value("cross_edge_reduction_ratio", 0.0)
+             << " avg_frontier/expansions/scored="
+             << stage2.value("avg_stage2_remote_frontier", 0.0) << "/"
+             << stage2.value("avg_stage2_remote_expansions", 0.0) << "/"
+             << stage2.value("avg_stage2_scored_candidates", 0.0) << '\n';
+    } else {
+      output << "unavailable\n";
+    }
+    output << "  search budget exhausted (stage1/stage2): ";
+    if (stage2.value("search_budget_delta_available", false)) {
+      output << stage2.value("stage1_search_budget_exhausted", 0ULL)
+             << "/"
+             << stage2.value("stage2_search_budget_exhausted", 0ULL)
+             << '\n';
+    } else {
+      output << "unavailable\n";
+    }
   }
 
   if (root.contains("recall")) {
@@ -294,12 +266,10 @@ FormattedReport format_report(const nlohmann::json& root,
     const auto& gpu = root["gpu_persistent"];
     constexpr double bytes_per_gib = 1024.0 * 1024.0 * 1024.0;
     output << "gpu_persistent\n";
-    output << "  GPU memory explicit/base_pq/resident_pq/route/delta GiB: "
+    output << "  GPU memory explicit/base_pq/route GiB: "
            << static_cast<double>(gpu.value("gpu_memory_explicit_bytes", 0ULL)) / bytes_per_gib << "/"
            << static_cast<double>(gpu.value("gpu_memory_base_pq_bytes", 0ULL)) / bytes_per_gib << "/"
-           << static_cast<double>(gpu.value("gpu_memory_resident_pq_bytes", 0ULL)) / bytes_per_gib << "/"
-           << static_cast<double>(gpu.value("gpu_memory_route_graph_bytes", 0ULL)) / bytes_per_gib << "/"
-           << static_cast<double>(gpu.value("gpu_memory_delta_reserved_bytes", 0ULL)) / bytes_per_gib << '\n';
+           << static_cast<double>(gpu.value("gpu_memory_route_graph_bytes", 0ULL)) / bytes_per_gib << '\n';
     output << "  average_batch_size: " << gpu.value("average_batch_size", 0.0) << '\n';
     output << "  average_submission_wait_us: "
            << gpu.value("average_submission_wait_us", 0.0) << '\n';
@@ -310,51 +280,23 @@ FormattedReport format_report(const nlohmann::json& root,
     output << "  graph snapshot reread records total/per_query: "
            << gpu.value("graph_read_retries", 0ULL) << "/"
            << gpu.value("average_graph_read_retries", 0.0) << '\n';
-    output << "  dynamic route publications/slot_updates/live/snapshot_skips: "
-           << gpu.value("dynamic_route_publications", 0ULL) << "/"
-           << gpu.value("dynamic_route_slot_updates", 0ULL) << "/"
-           << gpu.value("dynamic_route_live_slots", 0ULL) << "/"
-           << gpu.value("dynamic_route_snapshot_skips", 0ULL) << '\n';
-    output << "  graph_route_invalidations: "
-           << gpu.value("graph_route_invalidations", 0ULL) << '\n';
-    output << "  GPU query/prepare/graph/score/beam/exact/delta_scan us: "
+    output << "  centroid route publications/shard_updates/live/snapshot_skips: "
+           << gpu.value("centroid_route_publications", 0ULL) << "/"
+           << gpu.value("centroid_route_shard_updates", 0ULL) << "/"
+           << gpu.value("centroid_route_live_entries", 0ULL) << "/"
+           << gpu.value("centroid_route_snapshot_skips", 0ULL) << '\n';
+    output << "  centroid route probe_reads/body_reads/unchanged_polls/poll_us: "
+           << gpu.value("centroid_route_probe_reads", 0ULL) << "/"
+           << gpu.value("centroid_route_body_reads", 0ULL) << "/"
+           << gpu.value("centroid_route_unchanged_polls", 0ULL) << "/"
+           << gpu.value("centroid_route_poll_delay_us", 0ULL) << '\n';
+    output << "  GPU query/prepare/graph/score/beam/exact us: "
            << gpu.value("average_gpu_query_us", 0.0) << "/"
            << gpu.value("average_gpu_prepare_us", 0.0) << "/"
            << gpu.value("average_gpu_graph_us", 0.0) << "/"
            << gpu.value("average_gpu_score_us", 0.0) << "/"
            << gpu.value("average_gpu_beam_us", 0.0) << "/"
-           << gpu.value("average_gpu_exact_us", 0.0) << "/"
-           << gpu.value("average_gpu_delta_scan_us", 0.0) << '\n';
-    output << "  delta scan records/scored per query: "
-           << gpu.value("average_delta_scan_records", 0.0) << "/"
-           << gpu.value("average_delta_scan_scored", 0.0) << '\n';
-    output << "  delta scan structurally truncated bucket prefixes per query: "
-           << gpu.value("average_delta_scan_truncated_buckets", 0.0)
-           << '\n';
-    output << "  average_visibility_us: "
-           << gpu.value("average_visibility_us", 0.0) << '\n';
-    output << "  publication queue/prepare/command us: "
-           << gpu.value("average_publication_queue_us", 0.0) << "/"
-           << gpu.value("average_publication_prepare_us", 0.0) << "/"
-           << gpu.value("average_publication_command_us", 0.0) << '\n';
-    output << "  average_mutations_per_publication: "
-           << gpu.value("average_mutations_per_publication", 0.0) << '\n';
-    output << "  delta logical/physical/L0/L1 entries: "
-           << gpu.value("delta_live_entries", 0ULL) << "/"
-           << gpu.value("delta_physical_entries", 0ULL) << "/"
-           << gpu.value("delta_mutable_entries", 0ULL) << "/"
-           << gpu.value("delta_durable_entries", 0ULL) << '\n';
-    output << "  resident PQ current/peak/capacity/reclaimed: "
-           << gpu.value("resident_pq_entries", 0ULL) << "/"
-           << gpu.value("resident_pq_peak_entries", 0ULL) << "/"
-           << gpu.value("resident_pq_capacity", 0ULL) << "/"
-           << gpu.value("resident_pq_reclaimed", 0ULL) << '\n';
-    output << "  mutation capacity rejected/wait_events/wait_ms/current/peak: "
-           << gpu.value("mutation_capacity_rejections", 0ULL) << "/"
-           << gpu.value("mutation_capacity_wait_events", 0ULL) << "/"
-           << gpu.value("mutation_capacity_wait_ms", 0.0) << "/"
-           << gpu.value("mutation_capacity_reserved", 0ULL) << "/"
-           << gpu.value("mutation_capacity_reserved_max", 0ULL) << '\n';
+           << gpu.value("average_gpu_exact_us", 0.0) << '\n';
   }
   if (report.has_insert()) {
     const auto summary = service::breakdown::aggregate_text_summary(report.insert);

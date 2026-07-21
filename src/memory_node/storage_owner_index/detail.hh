@@ -54,11 +54,7 @@ inline u32 storage_owner_snapshot_batch_size(
   return static_cast<u32>(std::min<size_t>(configured, capacity));
 }
 
-inline bool local_stitch_enabled(const Configuration& config) {
-  return config.storage_owner_update_mode == "local_stitch";
-}
-
-inline void parse_remote_snapshot(RemotePtr remote_pointer, const byte_t* data,
+inline bool parse_remote_snapshot(RemotePtr remote_pointer, const byte_t* data,
                                   NodeSnapshot& snapshot) {
   snapshot = NodeSnapshot{};
   snapshot.rptr = remote_pointer;
@@ -66,94 +62,20 @@ inline void parse_remote_snapshot(RemotePtr remote_pointer, const byte_t* data,
   snapshot.id = *reinterpret_cast<const u32*>(data + VamanaNode::offset_id());
   snapshot.generation =
     *reinterpret_cast<const u32*>(data + VamanaNode::offset_generation());
+  snapshot.slot_incarnation = *reinterpret_cast<const u32*>(
+    data + VamanaNode::offset_slot_incarnation());
   snapshot.deleted = (snapshot.header & VamanaNode::HEADER_DELETED) != 0;
+  if ((snapshot.header & VamanaNode::HEADER_NODE_LOCK) != 0 ||
+      VamanaNode::header_incarnation(snapshot.header) !=
+        remote_pointer.incarnation() ||
+      snapshot.slot_incarnation != remote_pointer.incarnation()) {
+    snapshot = NodeSnapshot{};
+    return false;
+  }
   snapshot.vector_data.resize(VamanaNode::vector_bytes());
   std::memcpy(snapshot.vector_data.data(), data + VamanaNode::offset_vector(),
               VamanaNode::vector_bytes());
+  return true;
 }
 
 }  // namespace memory_node_storage_owner_index_detail
-
-struct MemoryNode::GlobalMedoidReadAwaitable {
-  bool ready{};
-  byte_t* buffer{};
-  MemoryNode* node{};
-
-  bool await_ready() const { return ready; }
-  static void await_suspend(std::coroutine_handle<>) {}
-  RemotePtr await_resume() const {
-    if (node->storage_id_ == 0) {
-      return RemotePtr{
-        *reinterpret_cast<u64*>(node->index_buffer_.get_full_buffer() + 8)};
-    }
-    return RemotePtr{*reinterpret_cast<const u64*>(buffer)};
-  }
-};
-
-struct MemoryNode::NodeSnapshotReadAwaitable {
-  bool ready{};
-  RemotePtr remote_pointer;
-  byte_t* buffer{};
-  memory_node_detail::NodeSnapshot snapshot;
-
-  bool await_ready() const { return ready; }
-  static void await_suspend(std::coroutine_handle<>) {}
-  memory_node_detail::NodeSnapshot await_resume() {
-    if (!ready) {
-      memory_node_storage_owner_index_detail::parse_remote_snapshot(
-        remote_pointer, buffer, snapshot);
-    }
-    return std::move(snapshot);
-  }
-};
-
-struct MemoryNode::NodeSnapshotsReadAwaitable {
-  struct PendingRead {
-    RemotePtr remote_pointer;
-    byte_t* buffer{};
-  };
-
-  bool ready{true};
-  vec<memory_node_detail::NodeSnapshot> snapshots;
-  vec<PendingRead> pending;
-
-  bool await_ready() const { return ready; }
-  static void await_suspend(std::coroutine_handle<>) {}
-  vec<memory_node_detail::NodeSnapshot> await_resume() {
-    for (const PendingRead& read : pending) {
-      memory_node_detail::NodeSnapshot snapshot;
-      memory_node_storage_owner_index_detail::parse_remote_snapshot(
-        read.remote_pointer, read.buffer, snapshot);
-      snapshots.push_back(std::move(snapshot));
-    }
-    return std::move(snapshots);
-  }
-};
-
-struct MemoryNode::NeighborListReadAwaitable {
-  bool ready{};
-  RemotePtr remote_pointer;
-  byte_t* buffer{};
-  vec<RemotePtr> neighbors;
-  MemoryNode* node{};
-
-  bool await_ready() const { return ready; }
-  static void await_suspend(std::coroutine_handle<>) {}
-  vec<RemotePtr> await_resume() {
-    if (ready) return std::move(neighbors);
-    vec<byte_t> decoded(VamanaNode::neighbor_read_size());
-    if (!VamanaNode::decode_hot_graph_entry(buffer, decoded.data())) {
-      return node->read_neighbor_list(remote_pointer);
-    }
-    const byte_t* parse_buffer = decoded.data();
-    const u8 edge_count = *reinterpret_cast<const u8*>(
-      parse_buffer + VamanaNode::neighbor_count_offset_in_read());
-    const auto* slots = reinterpret_cast<const RemotePtr*>(
-      parse_buffer + VamanaNode::neighbor_payload_offset_in_read());
-    neighbors.reserve(edge_count);
-    for (u32 index = 0; index < edge_count && index < VamanaNode::R; ++index) {
-      if (!slots[index].is_null()) neighbors.push_back(slots[index]);
-    }
-    return std::move(neighbors);
-  }
-};

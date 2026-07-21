@@ -1,27 +1,8 @@
 #include "memory_node/storage_owner_maintenance/detail.hh"
+#include "memory_node/storage_owner_maintenance/cleanup_policy.hh"
 
 using namespace memory_node_storage_owner_maintenance_detail;
-
-bool MemoryNode::try_lock_node(RemotePtr rptr) {
-  if (rptr.is_null() || !local_shard(rptr.memory_node())) {
-    return false;
-  }
-
-  auto* header_ptr = reinterpret_cast<u64*>(
-    index_buffer_.get_full_buffer() + vamana::StorageLayoutResolver::header(rptr).offset);
-  std::atomic_ref<u64> ref(*header_ptr);
-  for (u32 attempt = 0; attempt < 8; ++attempt) {
-    u64 header = ref.load(std::memory_order_acquire);
-    if ((header & VamanaNode::HEADER_NODE_LOCK) != 0) {
-      return false;
-    }
-    const u64 desired = header | VamanaNode::HEADER_NODE_LOCK;
-    if (ref.compare_exchange_weak(header, desired, std::memory_order_acq_rel, std::memory_order_acquire)) {
-      return true;
-    }
-  }
-  return false;
-}
+using memory_node_storage_owner_index_detail::IncarnationLockResult;
 
 bool MemoryNode::storage_owner_task_current(node_t id, u32 generation, RemotePtr target) {
   DynamicFreshnessShard& shard = dynamic_freshness_shard(id);
@@ -35,9 +16,17 @@ bool MemoryNode::storage_owner_task_current(node_t id, u32 generation, RemotePtr
   const auto& immutable_base = base_idmap_;
   const auto base = immutable_base.find(id);
   return base != immutable_base.end() &&
-         !base->second.deleted &&
-         base->second.generation == generation &&
-         base->second.current == target;
+         generation == 0 && base->second == target;
+}
+
+bool MemoryNode::storage_owner_physical_node_matches(
+    node_t id, u32 generation, RemotePtr target) {
+  if (target.is_null() || target.memory_node() >= num_storage_nodes_) {
+    return false;
+  }
+  NodeSnapshot snapshot;
+  return read_node_snapshot(target, snapshot) && !snapshot.deleted &&
+         snapshot.id == id && snapshot.generation == generation;
 }
 
 vec<RemotePtr> MemoryNode::read_preserved_neighbor_list(RemotePtr rptr) {
@@ -60,7 +49,10 @@ vec<RemotePtr> MemoryNode::read_preserved_neighbor_list(RemotePtr rptr) {
   }
   const u16 expected = vamana::hot_graph::load_u16_le(entry.data() + 2);
   const u16 actual = vamana::hot_graph::checksum16(entry.data(), entry.size());
-  if (expected != actual) {
+  if (expected != actual ||
+      vamana::hot_graph::load_u32_le(entry.data() + 8) !=
+        rptr.incarnation() ||
+      vamana::hot_graph::load_u32_le(entry.data() + 12) != 0) {
     return {};
   }
   vec<RemotePtr> neighbors;
@@ -83,16 +75,21 @@ bool MemoryNode::remove_local_neighbor(RemotePtr target_ptr,
     return false;
   }
 
-  lock_node(target_ptr);
-  const bool target_deleted =
-    (load_local_node_header_acquire(target_ptr) &
-     VamanaNode::HEADER_DELETED) != 0;
-  if (target_deleted) {
+  const IncarnationLockResult target_lock = try_lock_node(target_ptr);
+  if (target_lock == IncarnationLockResult::stale) return true;
+  if (target_lock == IncarnationLockResult::busy) return false;
+  const u64 target_header = load_local_node_header_acquire(target_ptr);
+  if ((target_header & (VamanaNode::HEADER_DELETED |
+                        VamanaNode::HEADER_RETIRING)) != 0) {
     unlock_node(target_ptr);
     return true;
   }
+  if (VamanaNode::graph_mutation_quiesced(target_header)) {
+    unlock_node(target_ptr);
+    return false;
+  }
 
-  vec<RemotePtr> neighbors = read_neighbor_list(target_ptr);
+  vec<RemotePtr> neighbors = read_stable_neighbor_list(target_ptr);
   const auto old_size = neighbors.size();
   neighbors.erase(
     std::remove(neighbors.begin(), neighbors.end(), deleted_ptr),
@@ -115,16 +112,25 @@ bool MemoryNode::remove_local_neighbors_batched(
       continue;
     }
 
-    lock_node(target_ptr);
-    const bool target_deleted =
-      (load_local_node_header_acquire(target_ptr) &
-       VamanaNode::HEADER_DELETED) != 0;
-    if (target_deleted) {
+    const IncarnationLockResult target_lock = try_lock_node(target_ptr);
+    if (target_lock == IncarnationLockResult::stale) continue;
+    if (target_lock == IncarnationLockResult::busy) {
+      success = false;
+      continue;
+    }
+    const u64 target_header = load_local_node_header_acquire(target_ptr);
+    if ((target_header & (VamanaNode::HEADER_DELETED |
+                          VamanaNode::HEADER_RETIRING)) != 0) {
       unlock_node(target_ptr);
       continue;
     }
+    if (VamanaNode::graph_mutation_quiesced(target_header)) {
+      unlock_node(target_ptr);
+      success = false;
+      continue;
+    }
 
-    vec<RemotePtr> neighbors = read_neighbor_list(target_ptr);
+    vec<RemotePtr> neighbors = read_stable_neighbor_list(target_ptr);
     const auto old_size = neighbors.size();
     neighbors.erase(
       std::remove_if(neighbors.begin(), neighbors.end(), [&](const RemotePtr& neighbor) {
@@ -138,4 +144,136 @@ bool MemoryNode::remove_local_neighbors_batched(
     unlock_node(target_ptr);
   }
   return success;
+}
+
+bool MemoryNode::remove_local_neighbors_identity_fenced(
+    span<const service::storage_owner::ReverseUpdateOp> ops,
+    const Configuration& config) {
+  using service::storage_owner::ReverseUpdateOp;
+  if (ops.empty()) return true;
+
+  // Candidate identity is not encoded in graph edges, so validate every
+  // physical candidate record before touching a target. The batched snapshot
+  // path coalesces repeated deleted candidates and remote reads across the
+  // whole cleanup RPC instead of issuing one RDMA read per edge.
+  vec<RemotePtr> candidates;
+  candidates.reserve(ops.size());
+  for (const ReverseUpdateOp& op : ops) {
+    const RemotePtr target{op.target_raw};
+    const RemotePtr candidate{op.candidate_raw};
+    if (!valid_local_storage_node_pointer(target) || candidate.is_null() ||
+        candidate.memory_node() >= num_storage_nodes_) {
+      // Malformed traffic is a protocol failure. A well-formed but stale
+      // identity below is instead an idempotent no-op/ACK.
+      return false;
+    }
+    candidates.push_back(candidate);
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [](RemotePtr lhs, RemotePtr rhs) {
+              return lhs.raw_address < rhs.raw_address;
+            });
+  candidates.erase(std::unique(candidates.begin(), candidates.end()),
+                   candidates.end());
+  const vec<NodeSnapshot> candidate_snapshots =
+    read_node_snapshots_batched(candidates, config);
+  dense_hashmap_t<u64, NodeSnapshot> candidate_by_raw;
+  candidate_by_raw.reserve(candidate_snapshots.size());
+  for (const NodeSnapshot& snapshot : candidate_snapshots) {
+    candidate_by_raw.emplace(snapshot.rptr.raw_address, snapshot);
+  }
+
+  dense_hashmap_t<u64, vec<const ReverseUpdateOp*>> grouped;
+  grouped.reserve(ops.size());
+  for (const ReverseUpdateOp& op : ops) {
+    const auto found = candidate_by_raw.find(op.candidate_raw);
+    // Delayed/replayed cleanup for a reclaimed candidate must succeed as an
+    // idempotent no-op. It must never remove a new edge that happens to reuse
+    // the same physical address.
+    if (found == candidate_by_raw.end() ||
+        !cleanup_deleted_candidate_matches(
+          op.candidate_id, op.candidate_generation,
+          found->second.id, found->second.generation,
+          found->second.deleted)) {
+      continue;
+    }
+    grouped[op.target_raw].push_back(&op);
+  }
+
+  for (const auto& [target_raw, removals] : grouped) {
+    const RemotePtr target{target_raw};
+    const IncarnationLockResult target_lock = try_lock_node(target);
+    if (target_lock == IncarnationLockResult::stale) {
+      // A reclaimed cleanup parent has no old-incarnation adjacency left to
+      // edit.  Treat absence as the idempotent cleanup postcondition.
+      continue;
+    }
+    if (target_lock == IncarnationLockResult::busy) return false;
+    const byte_t* record = index_buffer_.get_full_buffer() +
+      target.byte_offset();
+    const u64 header = load_local_node_header_acquire(target);
+    const node_t observed_id = *reinterpret_cast<const node_t*>(
+      record + VamanaNode::offset_id());
+    const u32 observed_generation = *reinterpret_cast<const u32*>(
+      record + VamanaNode::offset_generation());
+    const ReverseUpdateOp& identity = *removals.front();
+    if ((header & VamanaNode::HEADER_RETIRING) != 0) {
+      // This target has already stopped accepting graph mutations and will
+      // itself be tombstoned only after its protected children are handed
+      // off. Treat removal as complete; mutating its preserved adjacency
+      // would race that cleanup snapshot without improving live reachability.
+      unlock_node(target);
+      continue;
+    }
+    if (VamanaNode::graph_mutation_quiesced(header)) {
+      unlock_node(target);
+      return false;
+    }
+    if (!cleanup_reverse_target_matches(
+          identity.target_id, identity.target_generation,
+          observed_id, observed_generation,
+          (header & VamanaNode::HEADER_DELETED) != 0)) {
+      unlock_node(target);
+      continue;
+    }
+
+    // All operations grouped under one raw target must describe the same
+    // target generation. Conflicting stale identities are ignored rather
+    // than allowed to widen the deletion set.
+    vec<RemotePtr> deleted;
+    deleted.reserve(removals.size());
+    for (const ReverseUpdateOp* removal : removals) {
+      if (removal->target_id == observed_id &&
+          removal->target_generation == observed_generation) {
+        deleted.emplace_back(removal->candidate_raw);
+      }
+    }
+    GraphAdjacency adjacency;
+    if (!read_graph_adjacency(target, adjacency)) {
+      unlock_node(target);
+      return false;
+    }
+    const size_t old_stable_size = adjacency.stable.size();
+    const size_t old_protected_size = adjacency.provisional.size();
+    const auto remove_deleted =
+      [&](vec<RemotePtr>& neighbors) {
+        neighbors.erase(
+          std::remove_if(neighbors.begin(), neighbors.end(),
+                     [&](RemotePtr neighbor) {
+                       return std::find(deleted.begin(), deleted.end(),
+                                        neighbor) != deleted.end();
+                     }),
+          neighbors.end());
+      };
+    remove_deleted(adjacency.stable);
+    remove_deleted(adjacency.provisional);
+    if (adjacency.stable.size() != old_stable_size ||
+        adjacency.provisional.size() != old_protected_size) {
+      write_graph_adjacency(target, adjacency.stable,
+                            adjacency.provisional,
+                            adjacency.generation, false);
+    }
+    unlock_node(target);
+  }
+  return true;
 }

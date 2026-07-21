@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -25,7 +26,6 @@ enum class PeerResponseRegistration : std::uint8_t {
   registered,
   retry,
   already_complete,
-  retired,
   conflict,
   full,
 };
@@ -38,9 +38,31 @@ enum class PeerRequestAction : std::uint8_t {
   full,
 };
 
+// A delayed consumer must prove that the fixed slab slot still belongs to the
+// operation it observed. The generation also changes when a malformed
+// response is rearmed, closing the same-slot/same-request retry ABA window.
+struct PeerResponseLease {
+  size_t slot{std::numeric_limits<size_t>::max()};
+  u64 generation{};
+
+  [[nodiscard]] bool valid() const noexcept {
+    return slot != std::numeric_limits<size_t>::max() && generation != 0;
+  }
+};
+
+struct PeerRequestLease {
+  size_t slot{std::numeric_limits<size_t>::max()};
+  u64 generation{};
+
+  [[nodiscard]] bool valid() const noexcept {
+    return slot != std::numeric_limits<size_t>::max() && generation != 0;
+  }
+};
+
 struct PeerRequestDecision {
   PeerRequestAction action{PeerRequestAction::conflict};
   service::storage_owner::PeerRpcHeader response{};
+  PeerRequestLease lease{};
 };
 
 struct PeerResponseDescriptor {
@@ -50,26 +72,48 @@ struct PeerResponseDescriptor {
   service::storage_owner::PeerRpcHeader header{};
 };
 
-// Fixed-capacity request/response correlation for stage2 peer RPCs. Payloads
-// remain in their registered RDMA receive slots until the stage2 executor
-// consumes them, so CQ progress performs neither allocation nor payload copy.
-// All methods are short critical sections; callers perform copies and reposts
-// after the registry lock has been released.
+struct PeerHashProbeTelemetry {
+  u64 lookups{};
+  u64 probes{};
+  size_t max_probe{};
+};
+
+// Fixed-capacity request/response correlation for peer RPCs. Payloads remain
+// in registered RDMA receive slots until the requesting executor copies them,
+// so CQ progress performs neither allocation nor payload copying.
+//
+// Entries live in a preallocated slab. A separate hash index has twice as many
+// buckets and uses backward-shift deletion, so cumulative request churn never
+// leaves tombstones and the index load is bounded by 0.5. try_take() leases a
+// descriptor instead of deleting it: the operation-specific parser must call
+// ack_consumed() or retry() with that exact generation.
 class PeerAsyncResponseRegistry {
 public:
   explicit PeerAsyncResponseRegistry(size_t requested_capacity)
       : capacity_(normalize_capacity(requested_capacity)),
-        mask_(capacity_ - 1),
-        slots_(capacity_) {}
+        bucket_capacity_(capacity_ * 2),
+        bucket_mask_(bucket_capacity_ - 1),
+        slots_(capacity_),
+        buckets_(bucket_capacity_) {
+    initialize_free_list();
+  }
 
   PeerAsyncResponseRegistry(const PeerAsyncResponseRegistry&) = delete;
   PeerAsyncResponseRegistry& operator=(const PeerAsyncResponseRegistry&) = delete;
 
   [[nodiscard]] size_t capacity() const noexcept { return capacity_; }
+  [[nodiscard]] size_t bucket_capacity() const noexcept {
+    return bucket_capacity_;
+  }
 
   [[nodiscard]] size_t size() const noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     return size_;
+  }
+
+  [[nodiscard]] PeerHashProbeTelemetry probe_telemetry() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return probe_telemetry_;
   }
 
   PeerResponseRegistration register_request(
@@ -79,14 +123,9 @@ public:
       u32 expected_item_count) {
     std::lock_guard<std::mutex> lock(mutex_);
     return register_request_locked(request_id, expected_shard, expected_type,
-                                   expected_item_count, false);
+                                   expected_item_count);
   }
 
-  // Register an actual send attempt owned by an already-live logical stage2
-  // request. Unlike register_request(), this may atomically revive a matching
-  // retired tombstone after a consumed response was rejected by the payload
-  // parser. If that tombstone has meanwhile been reused, the same call either
-  // installs the missing ID or reports bounded-capacity pressure for retry.
   PeerResponseRegistration register_send_attempt(
       u64 request_id,
       u32 expected_shard,
@@ -94,25 +133,26 @@ public:
       u32 expected_item_count) {
     std::lock_guard<std::mutex> lock(mutex_);
     return register_request_locked(request_id, expected_shard, expected_type,
-                                   expected_item_count, true);
+                                   expected_item_count);
   }
 
   // Returns true only when ownership of the receive descriptor transfers to
-  // the registry. Unknown, stale, malformed, and duplicate responses remain
-  // owned by the caller and must be reposted immediately.
+  // the registry. Unknown, malformed, duplicate, late, and currently leased
+  // responses remain owned by the CQ caller and are reposted immediately.
   bool try_deliver(u32 peer_id,
                    u32 receive_slot,
                    size_t bytes,
                    const service::storage_owner::PeerRpcHeader& header) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const Lookup lookup = find_locked(header.request_id);
-    if (lookup.found == npos) return false;
+    const size_t slot_index = find_slot_locked(header.request_id);
+    if (slot_index == npos) return false;
 
-    Slot& slot = slots_[lookup.found];
+    Slot& slot = slots_[slot_index];
     if (slot.state != State::pending ||
         !metadata_matches(slot,
                           peer_id,
-                          static_cast<service::storage_owner::PeerRpcType>(header.type),
+                          static_cast<service::storage_owner::PeerRpcType>(
+                            header.type),
                           header.item_count) ||
         header.source_shard != peer_id) {
       return false;
@@ -124,6 +164,7 @@ public:
       .bytes = bytes,
       .header = header,
     };
+    slot.receive_descriptor_held = true;
     slot.state = State::complete;
     return true;
   }
@@ -133,104 +174,118 @@ public:
       u32 expected_shard,
       service::storage_owner::PeerRpcType expected_type,
       u32 expected_item_count,
-      PeerResponseDescriptor& response) {
+      PeerResponseDescriptor& response,
+      PeerResponseLease& lease) {
+    response = {};
+    lease = {};
     std::lock_guard<std::mutex> lock(mutex_);
-    const Lookup lookup = find_locked(request_id);
-    if (lookup.found == npos) return TryPeerResponse::stale;
+    const size_t slot_index = find_slot_locked(request_id);
+    if (slot_index == npos) return TryPeerResponse::stale;
 
-    Slot& slot = slots_[lookup.found];
+    Slot& slot = slots_[slot_index];
     if (!metadata_matches(slot, expected_shard, expected_type,
-                          expected_item_count) ||
-        slot.state == State::retired) {
+                          expected_item_count)) {
       return TryPeerResponse::stale;
     }
-    // retryable means the logical request is still live but is waiting for
-    // its identical-ID resend deadline.  Reporting it as stale makes the
-    // stage2 poller cancel the entry before it can call register_request()
-    // again, permanently poisoning every explicit failure/malformed retry.
-    if (slot.state == State::pending || slot.state == State::retryable) {
+    if (slot.state == State::pending || slot.state == State::retryable ||
+        slot.state == State::consuming) {
       return TryPeerResponse::pending;
     }
     if (slot.state != State::complete) return TryPeerResponse::stale;
 
     response = slot.response;
+    lease = PeerResponseLease{slot_index, slot.generation};
+    slot.state = State::consuming;
     const bool success = response.header.status == static_cast<u32>(
       service::storage_owner::InsertStatus::ok);
-    if (success) {
-      retire_locked(slot);
-    } else {
-      slot.response = {};
-      slot.state = State::retryable;
-    }
     return success ? TryPeerResponse::success : TryPeerResponse::failure;
   }
 
-  // Cancelling a completed request returns its held receive descriptor so the
-  // caller can repost the slot. Pending requests have no receive ownership.
-  std::optional<PeerResponseDescriptor> cancel(u64 request_id) {
+  // The consumer calls this immediately after copying the payload and
+  // reposting the receive WR. Semantic parsing may continue under the lease,
+  // but shutdown must no longer treat this descriptor as registry-owned.
+  bool mark_receive_reposted(PeerResponseLease lease) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const Lookup lookup = find_locked(request_id);
-    if (lookup.found == npos) return std::nullopt;
-
-    Slot& slot = slots_[lookup.found];
-    std::optional<PeerResponseDescriptor> response;
-    if (slot.state == State::complete) response = slot.response;
-    if (slot.state == State::pending || slot.state == State::complete) {
-      retire_locked(slot);
-    } else if (slot.state == State::retryable) {
-      slot.state = State::retired;
-      --size_;
-    }
-    return response;
+    if (!valid_lease_locked(lease, State::consuming)) return false;
+    Slot& slot = slots_[lease.slot];
+    if (!slot.receive_descriptor_held) return false;
+    slot.receive_descriptor_held = false;
+    return true;
   }
 
-  // Rearm a response that was structurally valid at CQ ingress but rejected
-  // by the stage2 payload parser (for example an out-of-range candidate count).
-  // Exact metadata prevents an old context from reviving a reused ID.
-  bool mark_retryable(
-      u64 request_id,
-      u32 expected_shard,
-      service::storage_owner::PeerRpcType expected_type,
-      u32 expected_item_count) {
+  // Commit parsing/copying of a leased response. Deletion is generation
+  // checked, removes the hash bucket without a tombstone, and returns the slab
+  // entry to the fixed free list.
+  bool ack_consumed(PeerResponseLease lease) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const Lookup lookup = find_locked(request_id);
-    if (lookup.found == npos) return false;
-    Slot& slot = slots_[lookup.found];
-    if (!metadata_matches(slot, expected_shard, expected_type,
-                          expected_item_count)) {
+    if (!valid_lease_locked(lease, State::consuming) ||
+        slots_[lease.slot].receive_descriptor_held) {
       return false;
     }
-    if (slot.state == State::retryable || slot.state == State::pending) {
-      return true;
+    release_slot_locked(lease.slot);
+    return true;
+  }
+
+  // Reject a structurally delivered response after operation-specific
+  // parsing. Incrementing the generation immediately invalidates all delayed
+  // actions associated with the rejected descriptor.
+  bool retry(PeerResponseLease lease) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!valid_lease_locked(lease, State::consuming) ||
+        slots_[lease.slot].receive_descriptor_held) {
+      return false;
     }
-    if (slot.state != State::retired || size_ == capacity_) return false;
+    Slot& slot = slots_[lease.slot];
     slot.response = {};
     slot.state = State::retryable;
-    ++size_;
+    advance_generation(slot);
     return true;
+  }
+
+  // Cancelling a completed request returns its held receive descriptor so the
+  // caller can repost it. A consuming entry belongs to its generation-checked
+  // lease and therefore cannot be cancelled by key behind that consumer.
+  std::optional<PeerResponseDescriptor> cancel(u64 request_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const size_t slot_index = find_slot_locked(request_id);
+    if (slot_index == npos) return std::nullopt;
+    Slot& slot = slots_[slot_index];
+    if (slot.state == State::consuming) return std::nullopt;
+
+    std::optional<PeerResponseDescriptor> response;
+    if (slot.state == State::complete) response = slot.response;
+    release_slot_locked(slot_index);
+    return response;
   }
 
   std::vector<PeerResponseDescriptor> drain_completed() {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<PeerResponseDescriptor> responses;
     responses.reserve(size_);
-    for (Slot& slot : slots_) {
-      if (slot.state == State::complete) responses.push_back(slot.response);
-      if (slot.state == State::pending || slot.state == State::complete ||
-          slot.state == State::retryable) {
-        retire_locked(slot);
+    for (size_t index = 0; index < capacity_; ++index) {
+      const Slot& slot = slots_[index];
+      if ((slot.state == State::complete || slot.state == State::consuming) &&
+          slot.receive_descriptor_held) {
+        responses.push_back(slot.response);
       }
     }
+    for (Bucket& bucket : buckets_) bucket = {};
+    for (Slot& slot : slots_) {
+      advance_generation(slot);
+      slot = Slot{.generation = slot.generation};
+    }
+    size_ = 0;
+    initialize_free_list();
     return responses;
   }
 
 private:
   enum class State : std::uint8_t {
-    empty,
+    free,
     pending,
     complete,
+    consuming,
     retryable,
-    retired,
   };
 
   struct Slot {
@@ -240,27 +295,30 @@ private:
       service::storage_owner::PeerRpcType::reverse_update_response};
     u32 expected_item_count{};
     PeerResponseDescriptor response{};
-    State state{State::empty};
+    bool receive_descriptor_held{};
+    u64 generation{};
+    size_t next_free{npos};
+    State state{State::free};
   };
 
-  struct Lookup {
-    size_t found{static_cast<size_t>(-1)};
-    size_t insertion{static_cast<size_t>(-1)};
+  struct Bucket {
+    u64 request_id{};
+    size_t slot{npos};
+    bool occupied{};
   };
 
-  static constexpr size_t npos = static_cast<size_t>(-1);
+  static constexpr size_t npos = std::numeric_limits<size_t>::max();
 
   PeerResponseRegistration register_request_locked(
       u64 request_id,
       u32 expected_shard,
       service::storage_owner::PeerRpcType expected_type,
-      u32 expected_item_count,
-      bool revive_retired) {
+      u32 expected_item_count) {
     if (request_id == 0) return PeerResponseRegistration::conflict;
 
-    const Lookup lookup = find_locked(request_id);
-    if (lookup.found != npos) {
-      Slot& slot = slots_[lookup.found];
+    const size_t existing = find_slot_locked(request_id);
+    if (existing != npos) {
+      Slot& slot = slots_[existing];
       if (!metadata_matches(slot, expected_shard, expected_type,
                             expected_item_count)) {
         return PeerResponseRegistration::conflict;
@@ -268,57 +326,92 @@ private:
       if (slot.state == State::pending) {
         return PeerResponseRegistration::retry;
       }
-      if (slot.state == State::complete) {
+      if (slot.state == State::complete || slot.state == State::consuming) {
         return PeerResponseRegistration::already_complete;
       }
       if (slot.state == State::retryable) {
-        slot.response = {};
         slot.state = State::pending;
         return PeerResponseRegistration::retry;
       }
-      if (!revive_retired) return PeerResponseRegistration::retired;
-      slot.response = {};
-      slot.state = State::pending;
-      ++size_;
-      return PeerResponseRegistration::retry;
+      return PeerResponseRegistration::conflict;
     }
 
-    if (size_ == capacity_ || lookup.insertion == npos) {
-      return PeerResponseRegistration::full;
-    }
-
-    Slot& slot = slots_[lookup.insertion];
+    if (free_head_ == npos) return PeerResponseRegistration::full;
+    const size_t slot_index = allocate_slot_locked();
+    Slot& slot = slots_[slot_index];
     slot.request_id = request_id;
     slot.expected_shard = expected_shard;
     slot.expected_type = expected_type;
     slot.expected_item_count = expected_item_count;
     slot.response = {};
+    slot.receive_descriptor_held = false;
     slot.state = State::pending;
+    insert_bucket_locked(request_id, slot_index);
     ++size_;
     return PeerResponseRegistration::registered;
   }
 
-  [[nodiscard]] Lookup find_locked(u64 request_id) const {
-    Lookup result;
-    size_t first_retired = npos;
-    size_t index = hash_request_id(request_id) & mask_;
-    for (size_t probe = 0; probe < capacity_; ++probe) {
-      const Slot& slot = slots_[index];
-      if (slot.state == State::empty) {
-        result.insertion = first_retired == npos ? index : first_retired;
-        return result;
+  [[nodiscard]] size_t find_slot_locked(u64 request_id) {
+    size_t index = hash_request_id(request_id) & bucket_mask_;
+    size_t probes = 0;
+    for (;;) {
+      ++probes;
+      const Bucket& bucket = buckets_[index];
+      if (!bucket.occupied) {
+        record_probe_locked(probes);
+        return npos;
       }
-      if (slot.request_id == request_id) {
-        result.found = index;
-        return result;
+      if (bucket.request_id == request_id) {
+        record_probe_locked(probes);
+        return bucket.slot;
       }
-      if (slot.state == State::retired && first_retired == npos) {
-        first_retired = index;
-      }
-      index = (index + 1) & mask_;
+      index = (index + 1) & bucket_mask_;
     }
-    result.insertion = first_retired;
-    return result;
+  }
+
+  void insert_bucket_locked(u64 request_id, size_t slot_index) {
+    size_t index = hash_request_id(request_id) & bucket_mask_;
+    size_t probes = 0;
+    for (;;) {
+      ++probes;
+      Bucket& bucket = buckets_[index];
+      if (!bucket.occupied) {
+        bucket = Bucket{request_id, slot_index, true};
+        record_probe_locked(probes);
+        return;
+      }
+      index = (index + 1) & bucket_mask_;
+    }
+  }
+
+  void erase_bucket_locked(u64 request_id) {
+    size_t hole = hash_request_id(request_id) & bucket_mask_;
+    while (buckets_[hole].occupied &&
+           buckets_[hole].request_id != request_id) {
+      hole = (hole + 1) & bucket_mask_;
+    }
+    if (!buckets_[hole].occupied) return;
+
+    size_t scan = (hole + 1) & bucket_mask_;
+    while (buckets_[scan].occupied) {
+      const size_t home = hash_request_id(buckets_[scan].request_id) &
+                          bucket_mask_;
+      const size_t scan_distance = (scan - home) & bucket_mask_;
+      const size_t hole_distance = (hole - home) & bucket_mask_;
+      if (scan_distance > hole_distance) {
+        buckets_[hole] = buckets_[scan];
+        hole = scan;
+      }
+      scan = (scan + 1) & bucket_mask_;
+    }
+    buckets_[hole] = {};
+  }
+
+  [[nodiscard]] bool valid_lease_locked(PeerResponseLease lease,
+                                         State state) const {
+    return lease.valid() && lease.slot < capacity_ &&
+           slots_[lease.slot].generation == lease.generation &&
+           slots_[lease.slot].state == state;
   }
 
   static bool metadata_matches(
@@ -331,15 +424,49 @@ private:
            slot.expected_item_count == expected_item_count;
   }
 
-  void retire_locked(Slot& slot) {
-    slot.response = {};
-    slot.state = State::retired;
+  size_t allocate_slot_locked() {
+    const size_t slot_index = free_head_;
+    Slot& slot = slots_[slot_index];
+    free_head_ = slot.next_free;
+    slot.next_free = npos;
+    advance_generation(slot);
+    return slot_index;
+  }
+
+  void release_slot_locked(size_t slot_index) {
+    Slot& slot = slots_[slot_index];
+    erase_bucket_locked(slot.request_id);
+    const u64 generation = slot.generation;
+    slot = Slot{};
+    slot.generation = generation;
+    slot.next_free = free_head_;
+    free_head_ = slot_index;
     --size_;
+  }
+
+  void initialize_free_list() {
+    free_head_ = capacity_ == 0 ? npos : 0;
+    for (size_t index = 0; index < capacity_; ++index) {
+      slots_[index].next_free = index + 1 < capacity_ ? index + 1 : npos;
+      slots_[index].state = State::free;
+    }
+  }
+
+  static void advance_generation(Slot& slot) {
+    ++slot.generation;
+    if (slot.generation == 0) ++slot.generation;
+  }
+
+  void record_probe_locked(size_t probes) {
+    ++probe_telemetry_.lookups;
+    probe_telemetry_.probes += probes;
+    probe_telemetry_.max_probe = std::max(
+      probe_telemetry_.max_probe, probes);
   }
 
   static size_t normalize_capacity(size_t requested) {
     requested = std::max<size_t>(2, requested);
-    if (requested > (size_t{1} << 62)) {
+    if (requested > (size_t{1} << 61)) {
       throw std::invalid_argument("peer response registry capacity is too large");
     }
     return std::bit_ceil(requested);
@@ -355,31 +482,63 @@ private:
   }
 
   const size_t capacity_;
-  const size_t mask_;
+  const size_t bucket_capacity_;
+  const size_t bucket_mask_;
   mutable std::mutex mutex_;
   std::vector<Slot> slots_;
+  std::vector<Bucket> buckets_;
+  size_t free_head_{npos};
   size_t size_{};
+  PeerHashProbeTelemetry probe_telemetry_{};
 };
 
 // Bounded receiver-side de-duplication for retries that reuse a request ID.
-// Reverse/cleanup completions replay their cached fixed-size response. Stitch
-// search completions are read-only and may be recomputed after completion;
-// concurrent duplicates are still coalesced while the first search runs.
+// Successful fixed-header responses remain in a completed FIFO. Eviction is
+// O(1), and the stable slab index lets the FIFO remain intrusive while hash
+// buckets move during backward-shift deletion. Inflight work is never evicted.
+//
+// Bounded replay is valid only for RPCs whose successful response denotes an
+// idempotent postcondition. The current replayable callers are reverse-edge,
+// deletion-edge, and centroid-membership operations; each carries generation
+// or membership semantics that make an already-applied success replay-safe.
 class PeerRequestDeduplicator {
 public:
   explicit PeerRequestDeduplicator(size_t requested_capacity)
       : capacity_(normalize_capacity(requested_capacity)),
-        mask_(capacity_ - 1),
-        slots_(capacity_) {}
+        bucket_capacity_(capacity_ * 2),
+        bucket_mask_(bucket_capacity_ - 1),
+        slots_(capacity_),
+        buckets_(bucket_capacity_) {
+    initialize_free_list();
+  }
+
+  [[nodiscard]] size_t capacity() const noexcept { return capacity_; }
+  [[nodiscard]] size_t bucket_capacity() const noexcept {
+    return bucket_capacity_;
+  }
+
+  [[nodiscard]] size_t size() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return size_;
+  }
+
+  [[nodiscard]] PeerHashProbeTelemetry probe_telemetry() const noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return probe_telemetry_;
+  }
 
   PeerRequestDecision begin(
       u32 source_shard,
       const service::storage_owner::PeerRpcHeader& request,
       bool response_replayable) {
     std::lock_guard<std::mutex> lock(mutex_);
-    Lookup lookup = find_locked(source_shard, request.request_id);
-    if (lookup.found != npos) {
-      Slot& slot = slots_[lookup.found];
+    if (request.request_id == 0) {
+      return {.action = PeerRequestAction::conflict};
+    }
+
+    size_t slot_index = find_slot_locked(source_shard, request.request_id);
+    if (slot_index != npos) {
+      Slot& slot = slots_[slot_index];
       if (!metadata_matches(slot, source_shard, request)) {
         return {.action = PeerRequestAction::conflict};
       }
@@ -393,82 +552,80 @@ public:
         };
       }
       if (slot.state == State::complete) {
-        slot.state = State::inflight;
-        slot.last_used = ++clock_;
-        return {.action = PeerRequestAction::execute};
-      }
-      if (slot.state == State::retired) {
+        remove_completed_locked(slot_index);
         slot.response = {};
-        slot.last_used = ++clock_;
         slot.state = State::inflight;
-        ++size_;
-        return {.action = PeerRequestAction::execute};
+        advance_generation(slot);
+        return {
+          .action = PeerRequestAction::execute,
+          .lease = PeerRequestLease{slot_index, slot.generation},
+        };
       }
+      return {.action = PeerRequestAction::conflict};
     }
 
-    if (lookup.insertion == npos || size_ == capacity_) {
-      evict_oldest_complete_locked();
-      lookup = find_locked(source_shard, request.request_id);
-    }
-    if (lookup.insertion == npos || size_ == capacity_) {
-      return {.action = PeerRequestAction::full};
-    }
+    if (free_head_ == npos) evict_oldest_complete_locked();
+    if (free_head_ == npos) return {.action = PeerRequestAction::full};
 
-    Slot& slot = slots_[lookup.insertion];
+    slot_index = allocate_slot_locked();
+    Slot& slot = slots_[slot_index];
     slot.source_shard = source_shard;
     slot.request_id = request.request_id;
     slot.type = request.type;
     slot.item_count = request.item_count;
     slot.reserved = request.reserved;
     slot.response = {};
-    slot.last_used = ++clock_;
     slot.state = State::inflight;
+    insert_bucket_locked(source_shard, request.request_id, slot_index);
     ++size_;
-    return {.action = PeerRequestAction::execute};
+    return {
+      .action = PeerRequestAction::execute,
+      .lease = PeerRequestLease{slot_index, slot.generation},
+    };
   }
 
-  void complete(u32 source_shard,
+  bool complete(PeerRequestLease lease,
+                u32 source_shard,
                 const service::storage_owner::PeerRpcHeader& request,
                 const service::storage_owner::PeerRpcHeader& response) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const Lookup lookup = find_locked(source_shard, request.request_id);
-    if (lookup.found == npos) return;
-    Slot& slot = slots_[lookup.found];
-    if (slot.state != State::inflight ||
-        !metadata_matches(slot, source_shard, request)) {
-      return;
+    if (!valid_inflight_lease_locked(lease) ||
+        !metadata_matches(slots_[lease.slot], source_shard, request)) {
+      return false;
     }
 
-    // A failed/overloaded operation is retryable with the same ID. Successful
-    // operations remain cached so a lost ACK never causes a second apply.
+    // Failed/overloaded operations are retryable with the same wire ID and
+    // therefore leave no cached entry. Successful operations enter the
+    // bounded completed FIFO so a lost ACK never causes a second apply.
     if (response.status != static_cast<u32>(
           service::storage_owner::InsertStatus::ok)) {
-      retire_locked(slot);
-      return;
+      release_slot_locked(lease.slot);
+      return true;
     }
+    Slot& slot = slots_[lease.slot];
     slot.response = response;
-    slot.last_used = ++clock_;
     slot.state = State::complete;
+    append_completed_locked(lease.slot);
+    return true;
   }
 
-  void abandon(u32 source_shard,
+  bool abandon(PeerRequestLease lease,
+               u32 source_shard,
                const service::storage_owner::PeerRpcHeader& request) {
     std::lock_guard<std::mutex> lock(mutex_);
-    const Lookup lookup = find_locked(source_shard, request.request_id);
-    if (lookup.found == npos) return;
-    Slot& slot = slots_[lookup.found];
-    if (slot.state == State::inflight &&
-        metadata_matches(slot, source_shard, request)) {
-      retire_locked(slot);
+    if (!valid_inflight_lease_locked(lease) ||
+        !metadata_matches(slots_[lease.slot], source_shard, request)) {
+      return false;
     }
+    release_slot_locked(lease.slot);
+    return true;
   }
 
 private:
   enum class State : std::uint8_t {
-    empty,
+    free,
     inflight,
     complete,
-    retired,
   };
 
   struct Slot {
@@ -478,39 +635,80 @@ private:
     u32 item_count{};
     u32 reserved{};
     service::storage_owner::PeerRpcHeader response{};
-    u64 last_used{};
-    State state{State::empty};
+    u64 generation{};
+    size_t next_free{npos};
+    size_t completed_prev{npos};
+    size_t completed_next{npos};
+    State state{State::free};
   };
 
-  struct Lookup {
-    size_t found{static_cast<size_t>(-1)};
-    size_t insertion{static_cast<size_t>(-1)};
+  struct Bucket {
+    u32 source_shard{};
+    u64 request_id{};
+    size_t slot{npos};
+    bool occupied{};
   };
 
-  static constexpr size_t npos = static_cast<size_t>(-1);
+  static constexpr size_t npos = std::numeric_limits<size_t>::max();
 
-  Lookup find_locked(u32 source_shard, u64 request_id) const {
-    Lookup result;
-    size_t first_retired = npos;
-    size_t index = hash_key(source_shard, request_id) & mask_;
-    for (size_t probe = 0; probe < capacity_; ++probe) {
-      const Slot& slot = slots_[index];
-      if (slot.state == State::empty) {
-        result.insertion = first_retired == npos ? index : first_retired;
-        return result;
+  size_t find_slot_locked(u32 source_shard, u64 request_id) {
+    size_t index = hash_key(source_shard, request_id) & bucket_mask_;
+    size_t probes = 0;
+    for (;;) {
+      ++probes;
+      const Bucket& bucket = buckets_[index];
+      if (!bucket.occupied) {
+        record_probe_locked(probes);
+        return npos;
       }
-      if (slot.source_shard == source_shard &&
-          slot.request_id == request_id) {
-        result.found = index;
-        return result;
+      if (bucket.source_shard == source_shard &&
+          bucket.request_id == request_id) {
+        record_probe_locked(probes);
+        return bucket.slot;
       }
-      if (slot.state == State::retired && first_retired == npos) {
-        first_retired = index;
-      }
-      index = (index + 1) & mask_;
+      index = (index + 1) & bucket_mask_;
     }
-    result.insertion = first_retired;
-    return result;
+  }
+
+  void insert_bucket_locked(u32 source_shard,
+                            u64 request_id,
+                            size_t slot_index) {
+    size_t index = hash_key(source_shard, request_id) & bucket_mask_;
+    size_t probes = 0;
+    for (;;) {
+      ++probes;
+      Bucket& bucket = buckets_[index];
+      if (!bucket.occupied) {
+        bucket = Bucket{source_shard, request_id, slot_index, true};
+        record_probe_locked(probes);
+        return;
+      }
+      index = (index + 1) & bucket_mask_;
+    }
+  }
+
+  void erase_bucket_locked(u32 source_shard, u64 request_id) {
+    size_t hole = hash_key(source_shard, request_id) & bucket_mask_;
+    while (buckets_[hole].occupied &&
+           (buckets_[hole].source_shard != source_shard ||
+            buckets_[hole].request_id != request_id)) {
+      hole = (hole + 1) & bucket_mask_;
+    }
+    if (!buckets_[hole].occupied) return;
+
+    size_t scan = (hole + 1) & bucket_mask_;
+    while (buckets_[scan].occupied) {
+      const size_t home = hash_key(buckets_[scan].source_shard,
+                                   buckets_[scan].request_id) & bucket_mask_;
+      const size_t scan_distance = (scan - home) & bucket_mask_;
+      const size_t hole_distance = (hole - home) & bucket_mask_;
+      if (scan_distance > hole_distance) {
+        buckets_[hole] = buckets_[scan];
+        hole = scan;
+      }
+      scan = (scan + 1) & bucket_mask_;
+    }
+    buckets_[hole] = {};
   }
 
   static bool metadata_matches(
@@ -524,26 +722,89 @@ private:
            slot.reserved == request.reserved;
   }
 
-  void evict_oldest_complete_locked() {
-    Slot* oldest = nullptr;
-    for (Slot& slot : slots_) {
-      if (slot.state == State::complete &&
-          (oldest == nullptr || slot.last_used < oldest->last_used)) {
-        oldest = &slot;
-      }
-    }
-    if (oldest != nullptr) retire_locked(*oldest);
+  [[nodiscard]] bool valid_inflight_lease_locked(
+      PeerRequestLease lease) const {
+    return lease.valid() && lease.slot < capacity_ &&
+           slots_[lease.slot].generation == lease.generation &&
+           slots_[lease.slot].state == State::inflight;
   }
 
-  void retire_locked(Slot& slot) {
-    slot.response = {};
-    slot.state = State::retired;
+  size_t allocate_slot_locked() {
+    const size_t slot_index = free_head_;
+    Slot& slot = slots_[slot_index];
+    free_head_ = slot.next_free;
+    slot.next_free = npos;
+    advance_generation(slot);
+    return slot_index;
+  }
+
+  void release_slot_locked(size_t slot_index) {
+    Slot& slot = slots_[slot_index];
+    if (slot.state == State::complete) remove_completed_locked(slot_index);
+    erase_bucket_locked(slot.source_shard, slot.request_id);
+    const u64 generation = slot.generation;
+    slot = Slot{};
+    slot.generation = generation;
+    slot.next_free = free_head_;
+    free_head_ = slot_index;
     --size_;
+  }
+
+  void append_completed_locked(size_t slot_index) {
+    Slot& slot = slots_[slot_index];
+    slot.completed_prev = completed_tail_;
+    slot.completed_next = npos;
+    if (completed_tail_ == npos) {
+      completed_head_ = slot_index;
+    } else {
+      slots_[completed_tail_].completed_next = slot_index;
+    }
+    completed_tail_ = slot_index;
+  }
+
+  void remove_completed_locked(size_t slot_index) {
+    Slot& slot = slots_[slot_index];
+    if (slot.completed_prev == npos) {
+      completed_head_ = slot.completed_next;
+    } else {
+      slots_[slot.completed_prev].completed_next = slot.completed_next;
+    }
+    if (slot.completed_next == npos) {
+      completed_tail_ = slot.completed_prev;
+    } else {
+      slots_[slot.completed_next].completed_prev = slot.completed_prev;
+    }
+    slot.completed_prev = npos;
+    slot.completed_next = npos;
+  }
+
+  void evict_oldest_complete_locked() {
+    if (completed_head_ != npos) release_slot_locked(completed_head_);
+  }
+
+  void initialize_free_list() {
+    free_head_ = capacity_ == 0 ? npos : 0;
+    for (size_t index = 0; index < capacity_; ++index) {
+      slots_[index].next_free = index + 1 < capacity_ ? index + 1 : npos;
+      slots_[index].state = State::free;
+    }
+  }
+
+  static void advance_generation(Slot& slot) {
+    ++slot.generation;
+    if (slot.generation == 0) ++slot.generation;
+  }
+
+  void record_probe_locked(size_t probes) {
+    ++probe_telemetry_.lookups;
+    probe_telemetry_.probes += probes;
+    probe_telemetry_.max_probe = std::max(
+      probe_telemetry_.max_probe, probes);
   }
 
   static size_t normalize_capacity(size_t requested) {
     requested = std::max<size_t>(2, requested);
-    if (requested > (size_t{1} << 62)) {
+    if (requested > (size_t{1} << 61)) {
       throw std::invalid_argument("peer request dedup capacity is too large");
     }
     return std::bit_ceil(requested);
@@ -560,11 +821,16 @@ private:
   }
 
   const size_t capacity_;
-  const size_t mask_;
-  std::mutex mutex_;
+  const size_t bucket_capacity_;
+  const size_t bucket_mask_;
+  mutable std::mutex mutex_;
   std::vector<Slot> slots_;
+  std::vector<Bucket> buckets_;
+  size_t free_head_{npos};
+  size_t completed_head_{npos};
+  size_t completed_tail_{npos};
   size_t size_{};
-  u64 clock_{};
+  PeerHashProbeTelemetry probe_telemetry_{};
 };
 
 }  // namespace memory_node_detail

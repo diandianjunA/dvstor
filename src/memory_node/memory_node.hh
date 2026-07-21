@@ -31,16 +31,17 @@
 #include "common/core_assignment.hh"
 #include "common/distance.hh"
 #include "common/timing.hh"
-#include "coroutine.hh"
 #include "gpu_search/pq_index.hh"
 #include "memory_node/peer_rpc/async_response.hh"
 #include "memory_node/startup_protocol.hh"
 #include "memory_node/storage_reclaim.hh"
+#include "memory_node/storage_owner_index/dynamic_allocation_receipt_policy.hh"
+#include "memory_node/storage_owner_index/incarnation_lock.hh"
 #include "memory_node/storage_owner_maintenance/reverse_outbox.hh"
 #include "memory_node/storage_owner_state.hh"
 #include "service/index_metadata.hh"
 #include "service/storage_owner_protocol.hh"
-#include "vamana/adaptive_route_table.hh"
+#include "vamana/centroid_router.hh"
 #include "vamana/vamana_node.hh"
 
 /**
@@ -56,8 +57,16 @@ class MemoryNode {
   struct PeerReverseUpdateTask {
     u32 source_shard{};
     service::storage_owner::PeerRpcHeader header{};
+    memory_node_detail::PeerRequestLease dedup_lease{};
     vec<service::storage_owner::ReverseUpdateOp> ops;
+    vec<service::storage_owner::ReconcileReverseOp> reconcile_ops;
+    vec<service::storage_owner::CentroidMembershipOp> centroid_ops;
     std::chrono::steady_clock::time_point received_at{};
+
+    size_t item_count() const {
+      if (!centroid_ops.empty()) return centroid_ops.size();
+      return reconcile_ops.empty() ? ops.size() : reconcile_ops.size();
+    }
   };
 
   struct PeerReverseUpdateResponse {
@@ -66,48 +75,178 @@ class MemoryNode {
     std::chrono::steady_clock::time_point queued_at{};
   };
 
-  struct PeerReverseOutgoingTask {
-    u32 target_shard{};
-    service::storage_owner::PeerRpcType rpc_type{
-      service::storage_owner::PeerRpcType::reverse_update_request};
-    vec<service::storage_owner::ReverseUpdateOp> ops;
-    std::chrono::steady_clock::time_point queued_at{};
-  };
-
-  struct PeerStitchSearchTask {
+  struct PeerStage1Task {
     u32 source_shard{};
+    // Monotonic within source_shard and assigned in RC receive order. A
+    // release waits for every smaller sequence from that authority to finish
+    // before erasing a semantic receipt; this closes the gap between ordered
+    // wire delivery and parallel Stage1 worker completion.
+    u64 source_sequence{};
     service::storage_owner::PeerRpcHeader header{};
+    memory_node_detail::PeerRequestLease dedup_lease{};
     vec<byte_t> payload;
     std::chrono::steady_clock::time_point received_at{};
   };
 
+  struct PeerOrderedCompletionState {
+    std::mutex mutex;
+    std::condition_variable changed;
+    u64 completed_prefix{};
+    std::unordered_set<u64> completed_out_of_order;
+  };
+
+  struct PeerPhysicalControlTask {
+    u32 source_shard{};
+    // Cleanup activate/release requests share the same per-source ordering
+    // discipline as Stage1. Placement requests leave this field zero because
+    // they do not erase a semantic receipt owned by an earlier request.
+    u64 source_sequence{};
+    service::storage_owner::PeerRpcHeader header{};
+    memory_node_detail::PeerRequestLease dedup_lease{};
+    vec<byte_t> payload;
+    std::chrono::steady_clock::time_point received_at{};
+  };
+
+  struct Stage1OperationKey {
+    u32 authority_shard{};
+    u32 source_client{};
+    u32 item_index{};
+    u64 client_batch_id{};
+
+    bool operator==(const Stage1OperationKey&) const = default;
+  };
+
+  struct Stage1OperationKeyHash {
+    size_t operator()(const Stage1OperationKey& key) const {
+      size_t value = std::hash<u64>{}(key.client_batch_id);
+      value ^= std::hash<u64>{}(
+        (static_cast<u64>(key.authority_shard) << 32) |
+        key.source_client) + 0x9e3779b97f4a7c15ull +
+        (value << 6) + (value >> 2);
+      value ^= std::hash<u32>{}(key.item_index) +
+        0x9e3779b97f4a7c15ull + (value << 6) + (value >> 2);
+      return value;
+    }
+  };
+
+  struct Stage1PreparedResult {
+    service::storage_owner::Stage1ExecuteResult result{};
+    u64 maintenance_sequence{};
+    node_t id{};
+    u32 generation{};
+    service::storage_owner::MutationKind kind{
+      service::storage_owner::MutationKind::insert};
+    RemotePtr old_ptr;
+    vec<byte_t> vector_data;
+    vec<RemotePtr> neighbors;
+    vec<memory_node_detail::BeamEntry> beam;
+    vec<RemotePtr> remote_frontier;
+    vec<RemotePtr> backlink_targets;
+    u64 initial_placement_version{};
+    bool prepared{};
+    bool arming{};
+    bool armed{};
+    bool aborted{};
+  };
+
+  static constexpr size_t kStage1PreparedShardCount = 64;
+  static_assert((kStage1PreparedShardCount &
+                 (kStage1PreparedShardCount - 1)) == 0);
+
+  struct Stage1PreparedResultShard {
+    std::mutex mutex;
+    std::unordered_map<Stage1OperationKey, Stage1PreparedResult,
+                       Stage1OperationKeyHash> records;
+  };
+
+  struct CleanupActivationRecord {
+    service::storage_owner::CleanupActivateItem item{};
+    service::storage_owner::CleanupActivateResult result{};
+    bool in_progress{};
+  };
+
+  static constexpr size_t kCleanupActivationShardCount = 64;
+  static_assert((kCleanupActivationShardCount &
+                 (kCleanupActivationShardCount - 1)) == 0);
+
+  struct CleanupActivationDedupeShard {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::unordered_map<Stage1OperationKey, CleanupActivationRecord,
+                       Stage1OperationKeyHash> records;
+  };
+
   enum class StorageOwnerMaintenanceKind : u8 {
-    stitch_insert,
+    finalize_insert,
     cleanup_deleted_node,
   };
 
   struct StorageOwnerMaintenanceTask {
-    StorageOwnerMaintenanceKind kind{StorageOwnerMaintenanceKind::stitch_insert};
+    StorageOwnerMaintenanceKind kind{StorageOwnerMaintenanceKind::finalize_insert};
     node_t id{};
     u32 generation{};
     u64 maintenance_sequence{};
     RemotePtr target;
-    bool stitch_prepared{};
-    // Complete owner-partition construction beam captured by stage1. The
-    // temporary adjacency below is already pruned to R and is therefore not
-    // a sufficient input for an algorithmically equivalent final prune.
-    vec<RemotePtr> stage1_candidates;
+    RemotePtr final_target;
+    u32 final_home{};
+    u32 stage2_revalidated_home{};
+    u32 authority_shard{};
+    u32 source_client{};
+    u32 operation_item_index{};
+    u64 operation_batch_id{};
+    u64 initial_placement_version{};
+    bool outgoing_committed{};
+    bool reverse_reconciled{};
+    bool placement_committed{};
+    bool allocation_settled{};
+    bool centroid_committed{};
+    bool stage2_prepared{};
+    bool stage2_source_frozen{};
+    // The physical home becomes immutable once its complete outgoing record
+    // is published. Parent churn may re-prune that record in place, but never
+    // creates a second ambiguous migration receipt for the same operation.
+    bool stage2_plan_sealed{};
+    // Persist the last ACKed incoming stable certificate across ordinary-edge
+    // failures. Every retry revalidates it before any temporary bridge removal.
+    bool stage2_promotion_committed{};
+    RemotePtr stage2_promotion_parent;
+    // Exact fixed-width Stage1 beam and every unique cross-partition pointer
+    // observed while expanding it. Stage2 resumes from these structures and
+    // never restarts a search from another shard's representative.
+    vec<memory_node_detail::BeamEntry> stage1_beam;
+    vec<RemotePtr> stage1_remote_frontier;
+    // Targets that actually acknowledged a provisional backlink. Stage2 must
+    // remove or replace exactly this set; attempted-but-full targets are not
+    // part of the handoff transaction.
+    vec<RemotePtr> stage1_backlink_targets;
     // Exact temporary adjacency written by stage1. Final commit compares the
     // then-current adjacency against this captured baseline, so reverse edges
     // added while stage2 was queued/in flight are rebased instead of lost.
-    vec<RemotePtr> stitch_base_neighbors;
-    vec<RemotePtr> stitch_neighbors;
-    // A stitch that becomes stale after applying reverse edges transfers its
-    // maintenance sequence to a cleanup task. These supplemental neighbors
+    vec<RemotePtr> stage1_base_neighbors;
+    vec<RemotePtr> stage2_neighbors;
+    // Protected children captured at the same locked boundary that freezes
+    // the source graph. They are preserved at an in-place destination and
+    // transferred verbatim to a migrated destination before it is published.
+    vec<RemotePtr> stage2_protected_children;
+    // A Stage2 finalization that becomes stale after applying reverse edges
+    // transfers its maintenance sequence to a cleanup task. These supplemental neighbors
     // must all be removed; pruning them would leave dangling reverse edges.
     bool cleanup_repair_only{};
+    // Cleanup is activated before the successor authority commit. No graph or
+    // centroid mutation may touch the old generation until the authority
+    // reports that a strictly newer logical generation has retired it.
+    bool cleanup_authority_retired{};
+    // Ordinary deletion first quiesces the still query-visible parent, then
+    // hands every live protected child to an ACKed replacement parent before
+    // publishing DELETED. The parallel replacement vector makes partial RPC
+    // success idempotent across cleanup-worker retries.
+    bool cleanup_retiring{};
+    bool cleanup_protected_reparented{};
+    vec<RemotePtr> cleanup_protected_children;
+    vec<RemotePtr> cleanup_replacement_parents;
     vec<RemotePtr> cleanup_neighbors;
     std::chrono::steady_clock::time_point queued_at{};
+    std::chrono::steady_clock::time_point retry_not_before{};
   };
 
   struct StorageOwnerMaintenanceIntent {
@@ -131,12 +270,12 @@ private:
   using InsertRuntimeState = memory_node_detail::InsertRuntimeState;
   using PeerRpcRuntimeState = memory_node_detail::PeerRpcRuntimeState;
   using PeerPendingSend = memory_node_detail::PeerPendingSend;
-  using PeerRpcMessage = memory_node_detail::PeerRpcMessage;
   using PeerAsyncResponseRegistry =
     memory_node_detail::PeerAsyncResponseRegistry;
   using PeerRequestDeduplicator =
     memory_node_detail::PeerRequestDeduplicator;
   using TryPeerResponse = memory_node_detail::TryPeerResponse;
+  using PeerResponseLease = memory_node_detail::PeerResponseLease;
   using Stage2ReverseOutbox =
     memory_node_storage_owner_maintenance_detail::Stage2ReverseOutbox;
   using Stage2ReverseCompletion =
@@ -144,8 +283,34 @@ private:
   using StorageOwnerInsertTask = memory_node_detail::StorageOwnerInsertTask;
   using StorageOwnerResponseReady = memory_node_detail::StorageOwnerResponseReady;
   using StorageOwnerThread = memory_node_detail::StorageOwnerThread;
-  using StorageOwnerInsertJob = memory_node_detail::StorageOwnerInsertJob;
   using FreshnessEntry = memory_node_detail::FreshnessEntry;
+  using AuthorityOperationToken =
+    memory_node_storage_owner_index_detail::AuthorityOperationToken;
+  using AuthorityMutationLease =
+    memory_node_storage_owner_index_detail::AuthorityMutationLease;
+  using AuthorityDirectoryState =
+    memory_node_storage_owner_index_detail::AuthorityDirectoryState;
+  using AuthorityBeginResult =
+    memory_node_storage_owner_index_detail::AuthorityBeginResult;
+  using AuthorityCommitState =
+    memory_node_storage_owner_index_detail::AuthorityCommitState;
+  using AuthorityAbortState =
+    memory_node_storage_owner_index_detail::AuthorityAbortState;
+  using AuthorityCheckState =
+    memory_node_storage_owner_index_detail::AuthorityCheckState;
+  using AuthorityRelocateState =
+    memory_node_storage_owner_index_detail::AuthorityRelocateState;
+
+  // Stable Vamana edges and query-visible Stage1 backlinks share one compact
+  // RDMA record, but they have deliberately separate capacities and mutation
+  // rules.  Keeping the split explicit prevents an ordinary graph rewrite
+  // from accidentally promoting transient backlinks into the durable graph.
+  struct GraphAdjacency {
+    vec<RemotePtr> stable;
+    vec<RemotePtr> provisional;
+    u32 generation{};
+    bool deleted{};
+  };
 
   static constexpr size_t kDynamicFreshnessShardCount = 256;
   static_assert((kDynamicFreshnessShardCount &
@@ -154,7 +319,7 @@ private:
   struct DynamicFreshnessShard {
     std::mutex mutex;
     dense_hashmap_t<node_t, FreshnessEntry> entries;
-    hashset_t<node_t> mutations_inflight;
+    dense_hashmap_t<node_t, AuthorityMutationLease> mutation_leases;
   };
 
   DynamicFreshnessShard& dynamic_freshness_shard(node_t id) {
@@ -162,18 +327,12 @@ private:
       std::hash<node_t>{}(id) & (kDynamicFreshnessShardCount - 1)];
   }
 
-  struct GlobalMedoidReadAwaitable;
-  struct NodeSnapshotReadAwaitable;
-  struct NodeSnapshotsReadAwaitable;
-  struct NeighborListReadAwaitable;
-
   static constexpr u32 kPeerSyncWrOwner = std::numeric_limits<u32>::max();
   static constexpr u32 kPeerAsyncWrOwner = std::numeric_limits<u32>::max() - 1;
   static constexpr u32 kPeerSafeRdAtomic = 8;
-  static constexpr u32 kPeerRpcFlagNoResponse = 1u;
 
   enum class PeerRpcSendClass : u8 {
-    stitch_search,
+    stage1,
     graph_update,
     control,
   };
@@ -216,6 +375,10 @@ private:
   void remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, size_t bytes, size_t scratch_offset);
   void remote_write_bytes(u32 shard_id, u64 remote_offset, const void* src, size_t bytes, size_t scratch_offset);
   u64 remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 expected, u64 desired, size_t scratch_offset);
+  u64 remote_fetch_add(u32 shard_id,
+                       u64 remote_offset,
+                       u64 increment,
+                       size_t scratch_offset);
   std::pair<bool, u64> try_lock_remote_header(RemotePtr rptr);
 
   // Peer reverse-update RPC
@@ -236,53 +399,81 @@ private:
   service::storage_owner::PeerRpcHeader make_peer_reverse_update_response(
       const service::storage_owner::PeerRpcHeader& request,
       bool success) const;
-  bool apply_peer_reverse_update_task(const PeerReverseUpdateTask& task, const Configuration& config);
   bool apply_peer_reverse_update_tasks(const vec<PeerReverseUpdateTask>& tasks, const Configuration& config);
   void send_peer_reverse_update_response(const PeerReverseUpdateResponse& response);
   bool try_enqueue_peer_reverse_update_response(
     PeerReverseUpdateResponse&& response);
-  bool handle_peer_reverse_update_request(u32 source_shard,
-                                          const service::storage_owner::PeerRpcHeader& header,
-                                          const service::storage_owner::ReverseUpdateOp* ops,
-                                          const Configuration& config);
-  bool handle_peer_cleanup_deleted_request(u32 source_shard,
-                                           const service::storage_owner::PeerRpcHeader& header,
-                                           const service::storage_owner::ReverseUpdateOp* ops,
-                                           const Configuration& config);
-  bool handle_peer_stitch_search_request(u32 source_shard,
-                                         const service::storage_owner::PeerRpcHeader& header,
-                                         const byte_t* payload,
-                                         const Configuration& config);
-  void send_peer_stitch_search_failed_response(
-      u32 destination_shard,
-      const service::storage_owner::PeerRpcHeader& request,
+  bool handle_peer_stage1_execute_request(
+      u32 source_shard,
+      const service::storage_owner::PeerRpcHeader& header,
+      const byte_t* payload,
       const Configuration& config);
-  bool handle_peer_rpc_request(const PeerRpcMessage& message, const Configuration& config);
+  service::storage_owner::Stage1ExecuteResult prepare_local_stage1_item(
+      u32 authority_shard,
+      const service::storage_owner::Stage1ExecuteItem& item,
+      const byte_t* raw_vector,
+      const Configuration& config,
+      InsertBreakdownCounters* breakdown = nullptr);
+  bool handle_peer_stage1_arm_request(
+      u32 source_shard,
+      const service::storage_owner::PeerRpcHeader& header,
+      const service::storage_owner::Stage1ArmItem* items,
+      const Configuration& config);
+  bool arm_local_stage1_items(
+      u32 authority_shard,
+      span<const service::storage_owner::Stage1ArmItem> items,
+      vec<service::storage_owner::Stage1ArmResult>& results,
+      const Configuration& config);
+  bool handle_peer_cleanup_activate_request(
+      u32 source_shard,
+      const service::storage_owner::PeerRpcHeader& header,
+      const service::storage_owner::CleanupActivateItem* items,
+      const Configuration& config);
+  bool handle_peer_authority_placement_request(
+      u32 source_shard,
+      const service::storage_owner::PeerRpcHeader& header,
+      const service::storage_owner::AuthorityPlacementItem* items,
+      const Configuration& config);
+  bool handle_peer_dynamic_node_control_request(
+      u32 source_shard,
+      const service::storage_owner::PeerRpcHeader& header,
+      const service::storage_owner::DynamicNodeControlItem* items,
+      const Configuration& config);
+  bool activate_local_cleanup_items(
+      u32 authority_shard,
+      span<const service::storage_owner::CleanupActivateItem> items,
+      vec<service::storage_owner::CleanupActivateResult>& results,
+      const Configuration& config);
+  bool apply_local_authority_placement_items(
+      span<const service::storage_owner::AuthorityPlacementItem> items,
+      vec<service::storage_owner::AuthorityPlacementResult>& results);
+  bool apply_local_dynamic_node_control_items(
+      u32 source_shard,
+      span<const service::storage_owner::DynamicNodeControlItem> items,
+      vec<service::storage_owner::DynamicNodeControlResult>& results,
+      const Configuration& config);
   bool enqueue_peer_reverse_update_task(PeerReverseUpdateTask&& task);
-  bool enqueue_peer_stitch_search_task(PeerStitchSearchTask&& task);
+  bool enqueue_peer_stage1_task(PeerStage1Task&& task);
+  bool enqueue_peer_physical_control_task(PeerPhysicalControlTask&& task);
   void enqueue_peer_reverse_update_response(u32 destination_shard,
                                             const service::storage_owner::PeerRpcHeader& request,
                                             bool success);
   void peer_rpc_progress_loop();
   void peer_reverse_update_worker_loop(u32 worker_id);
-  void peer_stitch_search_worker_loop(u32 worker_id);
+  void peer_stage1_worker_loop(u32 worker_id);
+  void peer_cleanup_control_worker_loop();
+  void peer_placement_control_worker_loop();
   void peer_reverse_response_loop();
-  void peer_reverse_outgoing_loop();
-  bool handle_peer_rpc_requests(vec<PeerRpcMessage>& requests, const Configuration& config);
-  bool pump_peer_rpcs_locked(const Configuration&,
-                             vec<PeerRpcMessage>& requests,
-                             bool wait_for_event = false);
-  bool pump_peer_rpcs(const Configuration& config, bool wait_for_event = false);
-  bool wait_for_peer_reverse_update_response(u64 request_id,
-                                             u32 target_shard,
-                                             u32 item_count,
-                                             service::storage_owner::PeerRpcType response_type,
-                                             const Configuration& config);
-  bool post_stitch_search_request_async(u32 target_shard,
-                                        const vec<NodeSnapshot>& targets,
-                                        u64 request_id,
-                                        u32& item_count,
-                                        const Configuration& config);
+  bool try_post_peer_rpc_request_attempt(
+    u32 target_shard,
+    service::storage_owner::PeerRpcType request_type,
+    service::storage_owner::PeerRpcType response_type,
+    u64 request_id,
+    u32 item_count,
+    const void* items,
+    size_t item_bytes,
+    size_t request_bytes,
+    PeerRpcSendClass send_class);
   bool post_peer_op_batch_async(
     u32 target_shard,
     const vec<service::storage_owner::ReverseUpdateOp>& ops,
@@ -296,74 +487,74 @@ private:
     service::storage_owner::PeerRpcType expected_type,
     u32 expected_item_count,
     service::storage_owner::PeerRpcHeader& header,
-    vec<byte_t>& payload);
-  bool rearm_peer_rpc_response(
-    u64 request_id,
-    u32 expected_shard,
-    service::storage_owner::PeerRpcType expected_type,
-    u32 expected_item_count);
+    vec<byte_t>& payload,
+    PeerResponseLease& lease);
+  bool acknowledge_peer_rpc_response(PeerResponseLease lease);
+  bool rearm_peer_rpc_response(PeerResponseLease lease);
   void cancel_peer_rpc_response(u64 request_id);
   u64 allocate_peer_request_id();
-  bool enqueue_reverse_update_batch(u32 target_shard,
-                                    const vec<service::storage_owner::ReverseUpdateOp>& ops,
-                                    const Configuration& config);
-  bool send_peer_op_batch_direct(u32 target_shard,
-                                 const vec<service::storage_owner::ReverseUpdateOp>& ops,
-                                 service::storage_owner::PeerRpcType rpc_type,
-                                 bool wait_for_response,
-                                 const Configuration& config);
-  bool send_reverse_update_batch_direct(u32 target_shard,
-                                        const vec<service::storage_owner::ReverseUpdateOp>& ops,
-                                        bool wait_for_response,
-                                        const Configuration& config);
-  bool send_reverse_update_batch(u32 target_shard,
-                                 const vec<service::storage_owner::ReverseUpdateOp>& ops,
-                                 const Configuration& config);
-  bool send_reverse_update_fanout_and_wait(
-      const dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>>& updates,
+  bool send_reconcile_reverse_fanout_and_wait(
+      const dense_hashmap_t<
+        u32, vec<service::storage_owner::ReconcileReverseOp>>& updates,
+      vec<service::storage_owner::ReconcileReverseResult>& results,
       const Configuration& config);
-  bool send_peer_op_fanout_and_wait(
-      const dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>>& updates,
+  bool apply_centroid_membership_fanout_and_wait(
+      span<const service::storage_owner::CentroidMembershipOp> ops,
+      const Configuration& config);
+  bool execute_remote_stage1_fanout_and_wait(
+      const dense_hashmap_t<
+        u32, vec<service::storage_owner::Stage1ExecuteItem>>& items_by_home,
+      const dense_hashmap_t<u32, vec<byte_t>>& vectors_by_home,
+      dense_hashmap_t<
+        u32, vec<service::storage_owner::Stage1ExecuteResult>>& results_by_home,
+      const Configuration& config);
+  bool arm_remote_stage1_batch(
+      u32 stage1_home,
+      u32 source_client,
+      span<const service::storage_owner::Stage1ArmItem> items,
+      vec<service::storage_owner::Stage1ArmResult>& results,
+      const Configuration& config);
+  bool activate_cleanup_fanout_and_wait(
+      span<const service::storage_owner::CleanupActivateItem> items,
+      vec<service::storage_owner::CleanupActivateResult>& results,
+      const Configuration& config);
+  bool relocate_via_authority(
+      u32 authority_shard,
+      const service::storage_owner::AuthorityPlacementItem& item,
+      service::storage_owner::AuthorityPlacementResult& result,
+      const Configuration& config);
+  bool control_dynamic_node_on_shard(
+      u32 physical_shard,
+      const service::storage_owner::DynamicNodeControlItem& item,
+      service::storage_owner::DynamicNodeControlResult& result,
+      const Configuration& config);
+  bool post_peer_control_request_attempt(
+      u32 target_shard,
       service::storage_owner::PeerRpcType request_type,
       service::storage_owner::PeerRpcType response_type,
+      u64 request_id,
+      u32 item_count,
+      const void* items,
+      size_t item_bytes,
+      size_t request_bytes,
       const Configuration& config);
-  bool send_cleanup_deleted_fanout_and_wait(
-      const dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>>& updates,
+  TryPeerResponse wait_peer_control_response(
+      u64 request_id,
+      u32 target_shard,
+      service::storage_owner::PeerRpcType response_type,
+      u32 item_count,
+      service::storage_owner::PeerRpcHeader& header,
+      vec<byte_t>& payload,
+      PeerResponseLease& lease,
       const Configuration& config);
-  void log_slow_peer_reverse_update_response(std::chrono::steady_clock::time_point wait_started,
-                                             u64 request_id,
-                                             u32 target_shard,
-                                             u32 item_count,
-                                             bool success) const;
-
   // Storage-owner background graph maintenance
   static bool storage_owner_maintenance_enabled(const Configuration& config);
   void start_storage_owner_maintenance_runtime(const Configuration& config);
   void stop_storage_owner_maintenance_runtime();
-  bool enqueue_storage_owner_maintenance(StorageOwnerMaintenanceTask&& task, const Configuration& config);
-  bool enqueue_insert_stitch(node_t id,
-                             u32 generation,
-                             RemotePtr target,
-                             u64 maintenance_sequence,
-                             const vec<RemotePtr>* stage1_candidates,
-                             const vec<RemotePtr>* stage1_neighbors,
-                             const Configuration& config);
-  bool enqueue_deleted_node_cleanup(RemotePtr deleted_ptr,
-                                    u64 maintenance_sequence,
-                                    const Configuration& config);
-  u64 schedule_storage_owner_maintenance(node_t id,
-                                         u32 generation,
-                                         service::storage_owner::MutationKind kind,
-                                         RemotePtr new_ptr,
-                                         RemotePtr old_ptr,
-                                         u64 reserved_sequence,
-                                         u32 reserved_work_items,
-                                         const Configuration& config,
-                                         const vec<RemotePtr>* stage1_candidates = nullptr,
-                                         const vec<RemotePtr>* stage1_neighbors = nullptr);
-  u32 storage_owner_maintenance_work_items(
-    service::storage_owner::MutationKind kind,
-    const Configuration& config) const;
+  u64 arm_storage_owner_maintenance(
+      StorageOwnerMaintenanceTask&& task, const Configuration& config);
+  u64 activate_storage_owner_cleanup(
+      StorageOwnerMaintenanceTask&& task, const Configuration& config);
   u64 begin_storage_owner_maintenance_sequence(u32 work_items);
   u64 begin_storage_owner_maintenance_batch(span<const u32> work_items);
   void complete_storage_owner_maintenance_sequence(u64 sequence);
@@ -372,49 +563,33 @@ private:
   bool storage_owner_cleanup_ready(u64 sequence) const;
   void publish_storage_owner_maintenance_watermarks();
   void mark_storage_owner_foreground_activity();
-  void log_storage_owner_maintenance_observation(size_t stitch_remaining,
+  void log_storage_owner_maintenance_observation(size_t stage2_remaining,
                                                  size_t cleanup_remaining,
                                                  bool final);
   void maybe_log_storage_owner_maintenance_observation();
   void storage_owner_maintenance_worker_loop(u32 worker_id);
   bool storage_owner_maintenance_foreground_busy(const Configuration& config);
   bool try_acquire_storage_owner_maintenance_slot(const Configuration& config);
-  bool try_lock_node(RemotePtr rptr);
+  memory_node_storage_owner_index_detail::IncarnationLockResult
+    try_lock_node(RemotePtr rptr);
   bool storage_owner_task_current(node_t id, u32 generation, RemotePtr target);
+  bool storage_owner_physical_node_matches(node_t id,
+                                           u32 generation,
+                                           RemotePtr target);
   vec<RemotePtr> read_preserved_neighbor_list(RemotePtr rptr);
   bool remove_local_neighbor(RemotePtr target_ptr, RemotePtr deleted_ptr, const Configuration& config);
   bool remove_local_neighbors_batched(
       const dense_hashmap_t<u64, vec<RemotePtr>>& removals,
       const Configuration& config);
-  bool stitch_inserted_storage_owner_nodes(const vec<StorageOwnerMaintenanceTask>& tasks,
-                                           const Configuration& config,
-                                           vec<StorageOwnerMaintenanceTask>& retry_tasks,
-                                           u64& processed_count);
-  bool stitch_inserted_storage_owner_node(const StorageOwnerMaintenanceTask& task,
-                                          const Configuration& config);
-  bool cleanup_deleted_storage_owner_nodes(
-      const vec<StorageOwnerMaintenanceTask>& tasks,
-      const Configuration& config,
-      vec<StorageOwnerMaintenanceTask>& retry_tasks,
-      u64& processed_count);
-
+  bool remove_local_neighbors_identity_fenced(
+      span<const service::storage_owner::ReverseUpdateOp> ops,
+      const Configuration& config);
   // Storage-owner RPC runtime
   void setup_insert_runtime(const Configuration& config);
   void start_storage_owner_insert_workers(const Configuration& config);
   void storage_owner_insert_worker_loop(u32 worker_id);
   void process_storage_owner_insert_task(const StorageOwnerInsertTask& task);
   void post_storage_owner_response(StorageOwnerResponseReady response);
-  bool execute_storage_owner_batch_items_async(const node_t* ids,
-                                               const service::storage_owner::MutationKind* kinds,
-                                               const element_t* vectors,
-                                               size_t item_count,
-                                               StorageOwnerThread& thread,
-                                               InsertBreakdownCounters& breakdown,
-                                               const Configuration& config,
-                                               vec<vec<u64>>* invalidated_neighbors = nullptr,
-                                               vec<u32>* statuses = nullptr,
-                                               vec<service::storage_owner::MutationResult>* results = nullptr);
-  static StorageOwnerInsertCoroutine dummy_storage_owner_insert_coroutine();
   size_t insert_request_slot_offset(u32 client_id, u32 slot_id) const;
   size_t insert_response_slot_offset(const Configuration& config, u32 client_id, u32 slot_id) const;
   void service_storage_runtime(const Configuration& config);
@@ -427,6 +602,10 @@ private:
   bool execute_storage_owner_batch_items(const node_t* ids,
                                          const service::storage_owner::MutationKind* kinds,
                                          const element_t* vectors,
+                                         const byte_t* raw_vectors,
+                                         const u32* stage1_homes,
+                                         u32 source_client,
+                                         u64 client_batch_id,
                                          size_t item_count,
                                          InsertBreakdownCounters& breakdown,
                                          const Configuration& config,
@@ -437,39 +616,73 @@ private:
   // Storage-owner index operations
   RemotePtr allocate_local_node();
   void retire_local_dynamic_node(RemotePtr pointer, u64 maintenance_sequence);
-  u64 minimum_compute_reclaim_ack() const;
   bool load_owner_idmap(const filepath_t& index_prefix);
   bool mark_node_deleted(RemotePtr rptr, u32 generation);
-  service::storage_owner::MutationStatus prepare_mutation(node_t id,
-                                                          service::storage_owner::MutationKind kind,
-                                                          FreshnessEntry* old_entry,
-                                                          u32* new_generation);
-  void publish_mutation(node_t id, RemotePtr ptr, u32 generation, bool deleted);
-  RemotePtr read_global_medoid();
-  GlobalMedoidReadAwaitable async_read_global_medoid(StorageOwnerThread& thread);
-  void write_global_medoid(const RemotePtr& medoid);
-  bool try_set_global_medoid(const RemotePtr& expected, const RemotePtr& desired, RemotePtr& observed);
+  AuthorityBeginResult begin_authority_mutation(
+    node_t id,
+    service::storage_owner::MutationKind kind,
+    AuthorityOperationToken operation,
+    u32 stage1_home);
+  AuthorityCommitState commit_authority_mutation(
+    node_t id,
+    AuthorityOperationToken operation,
+    RemotePtr desired,
+    u32 generation,
+    bool deleted,
+    u64 maintenance_sequence);
+  AuthorityAbortState abort_authority_mutation(
+    node_t id,
+    AuthorityOperationToken operation);
+  AuthorityCheckState check_authority_current(
+    node_t id,
+    AuthorityOperationToken operation,
+    u32 generation,
+    RemotePtr expected,
+    u64 expected_placement_version);
+  AuthorityRelocateState relocate_authority_if_current(
+    node_t id,
+    AuthorityOperationToken operation,
+    u32 generation,
+    RemotePtr expected,
+    RemotePtr desired,
+    u64 expected_placement_version,
+    u64* resulting_placement_version = nullptr);
+  AuthorityDirectoryState load_authority_directory_state_locked(
+    const DynamicFreshnessShard& shard,
+    node_t id) const;
+  void store_authority_directory_state_locked(
+    DynamicFreshnessShard& shard,
+    node_t id,
+    const AuthorityDirectoryState& state);
   u64 load_local_node_header_acquire(RemotePtr rptr) const;
   bool valid_local_storage_node_pointer(RemotePtr rptr) const;
   bool read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot);
   bool storage_owner_node_live(RemotePtr rptr);
+  bool storage_owner_node_stable(RemotePtr rptr);
+  bool read_stable_node_identity(RemotePtr rptr);
+  bool read_graph_adjacency(RemotePtr rptr,
+                            GraphAdjacency& adjacency);
   vec<RemotePtr> read_neighbor_list(RemotePtr rptr);
+  vec<RemotePtr> read_stable_neighbor_list(RemotePtr rptr);
   bool read_local_neighbor_list(RemotePtr rptr,
                                 vec<RemotePtr>& neighbors,
                                 vec<byte_t>& entry,
                                 vec<byte_t>& decoded) const;
-  NodeSnapshotReadAwaitable async_read_node_snapshot(
-    RemotePtr rptr, StorageOwnerThread& thread);
-  NodeSnapshotsReadAwaitable async_read_node_snapshots(
-    const vec<RemotePtr>& rptrs,
-    const Configuration& config,
-    StorageOwnerThread& thread);
   vec<NodeSnapshot> read_node_snapshots_batched(const vec<RemotePtr>& rptrs, const Configuration& config);
-  NeighborListReadAwaitable async_read_neighbor_list(
-    RemotePtr rptr, StorageOwnerThread& thread);
+  const vec<BeamEntry>& score_stable_node_vectors_batched(
+      span<const RemotePtr> rptrs,
+      const byte_t* stored_query,
+      span<const element_t> decoded_query,
+      const Configuration& config);
   void write_hot_graph_entry(
     RemotePtr rptr,
     const vec<RemotePtr>& neighbors,
+    std::optional<u32> generation_override = std::nullopt,
+    std::optional<bool> deleted_override = std::nullopt);
+  void write_graph_adjacency(
+    RemotePtr rptr,
+    const vec<RemotePtr>& stable,
+    const vec<RemotePtr>& provisional,
     std::optional<u32> generation_override = std::nullopt,
     std::optional<bool> deleted_override = std::nullopt);
   void write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neighbors);
@@ -479,19 +692,17 @@ private:
                       node_t id,
                       const span<const element_t> components,
                       const vec<RemotePtr>& neighbors,
-                      u32 generation = 0);
+                      u32 generation = 0,
+                      bool provisional = false);
+  void write_new_node_on_shard(RemotePtr rptr,
+                               node_t id,
+                               const span<const element_t> components,
+                               const vec<RemotePtr>& neighbors,
+                               u32 generation,
+                               bool provisional);
+  bool set_node_provisional(RemotePtr rptr, bool provisional);
   void lock_node(RemotePtr rptr);
   void unlock_node(RemotePtr rptr);
-  vec<RemotePtr> beam_search_candidates(const span<const element_t> query,
-                                        RemotePtr medoid,
-                                        const Configuration& config,
-                                        InsertBreakdownCounters* breakdown = nullptr);
-
-  auto beam_search_candidates_async(const span<const element_t> query,
-                                    RemotePtr medoid,
-                                    const Configuration& config,
-                                    StorageOwnerThread& thread,
-                                    InsertBreakdownCounters* breakdown = nullptr) -> StorageOwnerInsertCoroutine;
   // Synchronous CPU construction search. It deliberately has no "async"
   // facade: callers must place it on an executor where a complete local graph
   // walk may run without blocking CQ/RPC progress.
@@ -500,16 +711,23 @@ private:
       const vec<RemotePtr>& entry_points,
       const Configuration& config,
       InsertBreakdownCounters* breakdown = nullptr,
-      const byte_t* integral_raw_query = nullptr);
-  vec<RemotePtr> storage_owner_route_entries(
-      const span<const element_t> query);
-  void initialize_storage_owner_route_table();
-  void publish_storage_owner_route_table();
-  void observe_storage_owner_route(node_t id,
-                                   u32 generation,
-                                   RemotePtr entry,
-                                   const span<const element_t> vector);
-  void invalidate_storage_owner_route(node_t id, u32 generation);
+      const byte_t* integral_raw_query = nullptr,
+      vec<BeamEntry>* stage1_beam = nullptr,
+      vec<RemotePtr>* remote_frontier = nullptr);
+  // The returned worker-local buffer is valid until the next Stage2 search
+  // on the same OS thread. Callers must consume it synchronously.
+  const vec<RemotePtr>& continue_stage2_search_candidates(
+      const StorageOwnerMaintenanceTask& task,
+      const NodeSnapshot& target,
+      const Configuration& config);
+  vec<RemotePtr> local_centroid_route_entries() const;
+  void initialize_storage_centroid_route();
+  void publish_storage_centroid_route();
+  bool apply_local_centroid_membership_ops(
+      span<const service::storage_owner::CentroidMembershipOp> ops);
+  vec<vamana::routing::CentroidRouter::LiveEntry>
+    select_local_centroid_live_entries(
+      span<const RemotePtr> preferred = {});
   vec<RemotePtr> robust_prune_cpu(const byte_t* source,
                                   VectorDType source_dtype,
                                   const vec<RemotePtr>& candidates,
@@ -524,12 +742,6 @@ private:
       const hashset_t<RemotePtr>& skip,
       const Configuration& config,
       u32 result_limit_override = 0);
-  auto execute_storage_owner_insert_job_async(StorageOwnerThread& thread,
-                                              StorageOwnerInsertJob& job,
-                                              dense_hashmap_t<u64, vec<RemotePtr>>& local_updates,
-                                              dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>>& remote_updates,
-                                              InsertBreakdownCounters& breakdown,
-                                              const Configuration& config) -> StorageOwnerInsertCoroutine;
   bool apply_local_reverse_update(RemotePtr target_ptr,
                                   const vec<RemotePtr>& candidate_ptrs,
                                   const Configuration& config,
@@ -537,10 +749,20 @@ private:
   bool apply_local_reverse_updates_batched(
       const dense_hashmap_t<u64, vec<RemotePtr>>& updates,
       const Configuration& config);
+  bool reconcile_local_reverse_ops(
+      span<const service::storage_owner::ReconcileReverseOp> ops,
+      const Configuration& config,
+      vec<service::storage_owner::ReconcileReverseResult>& results);
   bool apply_partition_local_reverse_update(RemotePtr target_ptr,
                                             const vec<RemotePtr>& candidate_ptrs,
                                             const Configuration& config,
                                             bool* graph_changed = nullptr);
+  vec<RemotePtr> install_local_provisional_backlinks(
+      RemotePtr candidate,
+      span<const RemotePtr> targets);
+  bool remove_local_provisional_backlinks(
+      RemotePtr candidate,
+      span<const RemotePtr> targets);
 
   // Misc helpers
   static size_t align_up(size_t value, size_t alignment = kCacheLineBytes);
@@ -569,11 +791,18 @@ private:
   u64 gpu_static_dynamic_base_{};
   u64 gpu_storage_control_offset_{};
   u64 gpu_dynamic_node_base_{};
+  u64 dynamic_allocation_limit_{};
   u32 gpu_navigation_code_bytes_{};
   u64 gpu_navigation_model_checksum_{};
+  u64 gpu_index_build_fingerprint_{};
+  u64 gpu_shard_build_fingerprint_{};
   gpu_search::pq::Model gpu_navigation_model_;
   const u32 storage_id_;
   const u32 num_storage_nodes_;
+  // Authority metadata is retained per logical ID to preserve generation and
+  // idempotent replay semantics. Binding IDs to this configured namespace
+  // makes that state capacity-bounded under adversarial update streams.
+  const u32 max_vectors_;
   const u32 storage_owner_peer_rdma_tokens_;
 
   HugePage<byte_t> index_buffer_;
@@ -589,11 +818,6 @@ private:
   PeerRpcRuntimeState peer_rpc_runtime_;
   std::unique_ptr<PeerAsyncResponseRegistry> peer_async_responses_;
   std::unique_ptr<PeerRequestDeduplicator> peer_request_deduplicator_;
-  std::unordered_set<u64> peer_rpc_pending_responses_;
-  std::unordered_map<u64, service::storage_owner::PeerRpcHeader> peer_rpc_responses_;
-  std::unordered_map<u64, vec<byte_t>> peer_rpc_response_payloads_;
-  std::mutex peer_rpc_mutex_;
-  std::condition_variable peer_rpc_responses_cv_;
   std::mutex peer_send_cq_mutex_;
   std::mutex peer_completion_mutex_;
   std::condition_variable peer_completion_cv_;
@@ -613,45 +837,76 @@ private:
   std::atomic<bool> peer_rpc_progress_running_{false};
   std::thread peer_rpc_progress_thread_;
   vec<std::thread> peer_reverse_workers_;
-  vec<std::thread> peer_stitch_search_workers_;
+  vec<std::thread> peer_stage1_workers_;
   std::thread peer_reverse_response_thread_;
-  std::thread peer_reverse_outgoing_thread_;
+  vec<std::thread> peer_cleanup_control_workers_;
+  std::thread peer_placement_control_thread_;
   vec<u_ptr<StorageOwnerThread>> peer_reverse_worker_states_;
-  vec<u_ptr<StorageOwnerThread>> peer_stitch_search_worker_states_;
+  vec<u_ptr<StorageOwnerThread>> peer_stage1_worker_states_;
   std::mutex peer_reverse_tasks_mutex_;
   std::condition_variable peer_reverse_tasks_cv_;
   std::deque<PeerReverseUpdateTask> peer_reverse_tasks_;
-  std::mutex peer_stitch_search_tasks_mutex_;
-  std::condition_variable peer_stitch_search_tasks_cv_;
-  std::deque<PeerStitchSearchTask> peer_stitch_search_tasks_;
+  std::mutex peer_stage1_tasks_mutex_;
+  std::condition_variable peer_stage1_tasks_cv_;
+  std::deque<PeerStage1Task> peer_stage1_tasks_;
+  // next sequence is protected by peer_stage1_tasks_mutex_. Completion state
+  // is separate per authority so one busy peer cannot serialize releases from
+  // unrelated RC QPs.
+  vec<u64> peer_stage1_next_source_sequences_;
+  vec<u_ptr<PeerOrderedCompletionState>> peer_stage1_completion_states_;
+  std::mutex peer_cleanup_control_tasks_mutex_;
+  std::condition_variable peer_cleanup_control_tasks_cv_;
+  std::deque<PeerPhysicalControlTask> peer_cleanup_control_tasks_;
+  // Cleanup uses its own sequence namespace because Stage1 and cleanup are
+  // carried by independent worker pools. Both namespaces are assigned while
+  // holding their receive queues' mutexes.
+  vec<u64> peer_cleanup_next_source_sequences_;
+  vec<u_ptr<PeerOrderedCompletionState>> peer_cleanup_completion_states_;
+  std::mutex peer_placement_control_tasks_mutex_;
+  std::condition_variable peer_placement_control_tasks_cv_;
+  std::deque<PeerPhysicalControlTask> peer_placement_control_tasks_;
   std::unique_ptr<bounded::Queue<PeerReverseUpdateResponse>>
     peer_reverse_responses_;
-  std::mutex peer_reverse_outgoing_mutex_;
-  std::condition_variable peer_reverse_outgoing_cv_;
-  std::deque<PeerReverseOutgoingTask> peer_reverse_outgoing_;
   std::atomic<bool> peer_reverse_shutdown_{false};
   std::atomic<bool> peer_reverse_workers_done_{false};
   std::atomic<bool> peer_reverse_response_done_{false};
   size_t peer_reverse_task_queue_limit_{1024};
-  size_t peer_stitch_search_task_queue_limit_{1024};
-  size_t peer_reverse_outgoing_queue_limit_{1024};
+  size_t peer_stage1_task_queue_limit_{1024};
+  size_t peer_physical_control_task_queue_limit_{1024};
   std::atomic<u64> peer_reverse_update_enqueued_{0};
   std::atomic<u64> peer_reverse_update_processed_{0};
   std::atomic<u64> peer_reverse_update_items_enqueued_{0};
   std::atomic<u64> peer_reverse_update_items_processed_{0};
   std::atomic<u64> peer_reverse_update_failed_{0};
   std::atomic<u64> peer_reverse_update_max_queue_{0};
-  std::atomic<u64> peer_stitch_search_enqueued_{0};
-  std::atomic<u64> peer_stitch_search_processed_{0};
-  std::atomic<u64> peer_stitch_search_items_{0};
-  std::atomic<u64> peer_stitch_search_max_queue_{0};
-  std::atomic<u32> peer_stitch_search_active_workers_{0};
+  std::atomic<u64> peer_stage1_enqueued_{0};
+  std::atomic<u64> peer_stage1_processed_{0};
+  std::atomic<u64> peer_stage1_items_{0};
+  std::atomic<u64> peer_stage1_max_queue_{0};
+  std::atomic<u32> peer_stage1_active_workers_{0};
+  std::array<Stage1PreparedResultShard,
+             kStage1PreparedShardCount> stage1_prepared_results_;
+  size_t stage1_prepared_results_limit_{1024};
+  size_t stage1_prepared_results_limit_per_shard_{16};
+  std::array<CleanupActivationDedupeShard,
+             kCleanupActivationShardCount> cleanup_activation_dedupe_;
+  size_t cleanup_activation_dedupe_limit_per_shard_{16};
+  memory_node_storage_owner_index_detail::DynamicAllocationReceiptLedger
+    dynamic_allocation_receipts_;
+  size_t dynamic_allocation_dedupe_limit_{1024};
   vec<std::thread> storage_owner_maintenance_workers_;
   vec<u_ptr<StorageOwnerThread>> storage_owner_maintenance_worker_states_;
   std::mutex storage_owner_maintenance_mutex_;
   std::condition_variable storage_owner_maintenance_cv_;
-  std::deque<StorageOwnerMaintenanceTask> storage_owner_stitch_tasks_;
+  std::deque<StorageOwnerMaintenanceTask> storage_owner_stage2_tasks_;
+  // Min-heap ordered by maintenance_sequence then retry_not_before. The
+  // predecessor durability rule makes its front the only cleanup that can be
+  // runnable, eliminating admission-time scans under the global mutex.
   std::deque<StorageOwnerMaintenanceTask> storage_owner_cleanup_tasks_;
+  // Arm owns a queue permit before reserving a completion sequence. Generic
+  // producers include these permits in their capacity check, so a sequence
+  // can always become runnable immediately after it is allocated.
+  size_t storage_owner_maintenance_reserved_slots_{};
   std::unique_ptr<bounded::Queue<StorageOwnerMaintenanceTask>>
     storage_owner_repair_tasks_;
   std::unique_ptr<Stage2ReverseOutbox> storage_owner_reverse_outbox_;
@@ -672,10 +927,22 @@ private:
   std::atomic<u64> storage_owner_maintenance_cleanup_processed_{0};
   std::atomic<u64> storage_owner_maintenance_max_backlog_{0};
   std::atomic<u64> storage_owner_maintenance_pressure_yields_{0};
-  std::atomic<u64> storage_owner_stitch_external_requests_{0};
-  std::atomic<u64> storage_owner_stitch_external_candidates_{0};
-  std::atomic<u64> storage_owner_stitch_batches_{0};
-  std::atomic<u64> storage_owner_stitch_batched_items_{0};
+  std::atomic<u64> storage_owner_stage2_batches_{0};
+  std::atomic<u64> storage_owner_stage2_batched_items_{0};
+  std::atomic<u64> storage_owner_stage1_search_budget_exhausted_{0};
+  std::atomic<u64> storage_owner_stage2_search_budget_exhausted_{0};
+  // Cumulative, attempt-level work counters make the locality mechanism
+  // observable without sampling the hot path.  Continuation counters include
+  // searches that later become stale; placement counters are recorded only at
+  // the exactly-once Stage2 finalization boundary.
+  std::atomic<u64> storage_owner_stage2_continuations_{0};
+  std::atomic<u64> storage_owner_stage2_remote_frontier_items_{0};
+  std::atomic<u64> storage_owner_stage2_remote_expansions_{0};
+  std::atomic<u64> storage_owner_stage2_scored_candidates_{0};
+  std::atomic<u64> storage_owner_stage2_migrations_{0};
+  std::atomic<u64> storage_owner_stage2_final_edges_{0};
+  std::atomic<u64> storage_owner_stage2_cross_edges_stage1_home_{0};
+  std::atomic<u64> storage_owner_stage2_cross_edges_final_home_{0};
   std::atomic<u32> storage_owner_maintenance_active_workers_{0};
   std::atomic<u64> storage_owner_maintenance_started_ns_{0};
   std::atomic<u64> storage_owner_maintenance_last_observation_ns_{0};
@@ -697,20 +964,29 @@ private:
   std::unique_ptr<bounded::Queue<StorageOwnerInsertTask>> storage_insert_tasks_;
   vec<u_ptr<std::mutex>> storage_client_send_mutexes_;
   vec<u_ptr<StorageOwnerThread>> storage_owner_threads_;
-  vec<vec<vec<RemotePtr>>> storage_owner_async_candidates_;
   vec<std::thread> storage_insert_workers_;
   std::atomic<bool> storage_insert_shutdown_{false};
   std::atomic<u32> storage_owner_insert_active_workers_{0};
   const u64 mn_memory_bytes_;
   timing::Timing timing_;
   filepath_t index_prefix_;
-  std::unique_ptr<vamana::routing::AdaptiveRouteTable>
-    storage_owner_route_table_;
-  vec<vamana::routing::AdaptiveRouteTable::RouteSlotSnapshot>
-    storage_owner_route_snapshot_;
-  std::mutex storage_owner_route_publication_mutex_;
+  std::unique_ptr<vamana::routing::CentroidRouter>
+    storage_centroid_router_;
+  std::mutex storage_centroid_publication_mutex_;
+  std::mutex storage_centroid_update_mutex_;
+  // One bit per physical node gives O(1) membership changes and word-wise
+  // replacement-entry selection. It avoids rescanning an ever-growing
+  // dynamic region when a published route entry is deleted.
+  vec<u64> storage_centroid_static_live_bitmap_;
+  vec<u64> storage_centroid_dynamic_live_bitmap_;
+  u64 storage_centroid_static_cursor_{};
+  u64 storage_centroid_dynamic_cursor_{};
   bool owner_idmap_required_{false};
-  hashmap_t<node_t, FreshnessEntry> base_idmap_;
+  // Immutable base IDs need only their physical handle. Generation zero,
+  // live state, placement version zero, and empty replay receipts are
+  // materialized on lookup. Full transaction state exists only in sparse
+  // per-shard mutation state after an ID participates in a mutation.
+  dense_hashmap_t<node_t, RemotePtr> base_idmap_;
   std::array<DynamicFreshnessShard, kDynamicFreshnessShardCount>
     dynamic_freshness_shards_;
 

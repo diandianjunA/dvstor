@@ -6,3 +6,8 @@
 
 inline constexpr size_t kCacheLineBytes = 64;
 inline constexpr u32 kMaxPeerQps = 4;
+
+// One degree limit is shared by the offline builder, on-disk metadata, CPU
+// update path, and persistent GPU query engine.  Keeping the limit here avoids
+// producing an index that only fails after its expensive build has completed.
+inline constexpr u32 kMaxSupportedGraphDegree = 128;

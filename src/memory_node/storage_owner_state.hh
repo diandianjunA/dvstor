@@ -12,7 +12,7 @@
 
 #include "common/constants.hh"
 #include "common/types.hh"
-#include "coroutine.hh"
+#include "memory_node/storage_owner_index/authority_directory_policy.hh"
 #include "remote_pointer.hh"
 #include "service/storage_owner_protocol.hh"
 #include "vamana/vamana_node.hh"
@@ -45,6 +45,7 @@ struct NodeSnapshot {
   u64 header{};
   node_t id{};
   u32 generation{};
+  u32 slot_incarnation{};
   bool deleted{};
   vec<byte_t> vector_data;
 };
@@ -147,11 +148,6 @@ struct PeerPendingSend {
   u32 rpc_slot_id{};
 };
 
-struct PeerRpcMessage {
-  u32 source_shard{};
-  vec<byte_t> payload;
-};
-
 struct StorageOwnerInsertTask {
   u32 client_id{};
   u32 slot_id{};
@@ -235,31 +231,13 @@ struct StorageOwnerThread {
   vec<std::atomic<i32>> post_balances;
   vec<StorageOwnerCoroutineScratch> coroutine_scratch_states;
   StorageOwnerRequestScratch request_scratch;
-  vec<u_ptr<StorageOwnerInsertCoroutine>> coroutines;
   HugePage<byte_t> scratch_buffer;
   std::unique_ptr<LocalMemoryRegion> scratch_region;
   u32 running_coroutine{};
   size_t scratch_stride{};
 };
 
-struct StorageOwnerInsertJob {
-  node_t id{};
-  service::storage_owner::MutationKind kind{service::storage_owner::MutationKind::insert};
-  vec<byte_t> vector_data;
-  service::storage_owner::MutationStatus status{service::storage_owner::MutationStatus::failed};
-  bool ok{false};
-  RemotePtr new_ptr{};
-  RemotePtr old_ptr{};
-  u32 generation{};
-  u64 maintenance_sequence{};
-  u32 reserved_maintenance_work{};
-  vec<u64> invalidated_neighbors;
-};
-
-struct FreshnessEntry {
-  RemotePtr current;
-  u32 generation{};
-  bool deleted{};
-};
+using FreshnessEntry =
+  memory_node_storage_owner_index_detail::AuthorityDirectoryEntry;
 
 }  // namespace memory_node_detail

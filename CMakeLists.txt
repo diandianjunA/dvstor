@@ -19,6 +19,26 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_
         "Select a newer compiler with -DCMAKE_CXX_COMPILER=/path/to/g++.")
 endif ()
 
+# nvcc may use the distribution's default host compiler even when the CPU
+# targets were explicitly configured with a different GCC.  CMake then puts
+# nvcc's implicit GCC library directory on the final C++ link line; on mixed
+# GCC 11/13 hosts that can select an older libstdc++ and leave symbols emitted
+# by the configured C++ compiler unresolved (for example _M_replace_cold).
+# Put the configured compiler's own runtime directory first.  This is derived
+# from the compiler instead of hard-coding a host-specific GCC version.
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    execute_process(
+        COMMAND "${CMAKE_CXX_COMPILER}" -print-file-name=libstdc++.so
+        OUTPUT_VARIABLE DVSTOR_CXX_STDLIB
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE DVSTOR_CXX_STDLIB_RESULT)
+    if (DVSTOR_CXX_STDLIB_RESULT EQUAL 0 AND EXISTS "${DVSTOR_CXX_STDLIB}")
+        get_filename_component(DVSTOR_CXX_STDLIB_DIR
+            "${DVSTOR_CXX_STDLIB}" DIRECTORY)
+        add_link_options("-L${DVSTOR_CXX_STDLIB_DIR}")
+    endif ()
+endif ()
+
 # Use RPATH (not RUNPATH) so that custom METIS/GKlib paths take priority
 # over system library paths at runtime.
 set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--disable-new-dtags")
@@ -72,7 +92,14 @@ add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wfatal-errors>)
 if (DVSTOR_USE_NATIVE_ARCH)
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-march=native>)
 endif ()
-add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ffast-math>)
+# Preserve IEEE finite/NaN/Inf semantics in control-plane and update-state
+# code.  In particular, centroid routing and publication use finiteness checks
+# as validity barriers; project-wide unsafe reassociation would make those
+# checks undefined and could route inserts to different shards on different builds.
+# Distance hot paths use explicit SIMD/FMA implementations instead of relying
+# on whole-program reassociation.
+add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-math-errno>)
+add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-trapping-math>)
 add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-mavx2>)
 add_compile_options(-DNOHUGEPAGES)
 #add_compile_options(-g -fno-omit-frame-pointer -fno-inline)  # for profiling
@@ -107,13 +134,16 @@ set(DVSTOR_MEMORY_NODE_SOURCES
     src/memory_node/memory_node.cc
     src/memory_node/peer_rdma.cc
     src/memory_node/peer_rpc/client_requests.cc
+    src/memory_node/peer_rpc/physical_control.cc
     src/memory_node/peer_rpc/request_handlers.cc
     src/memory_node/peer_rpc/runtime.cc
+    src/memory_node/peer_rpc/stage1_requests.cc
     src/memory_node/peer_rpc/workers.cc
     src/memory_node/storage_owner_index/allocation.cc
     src/memory_node/storage_owner_index/candidate_search.cc
     src/memory_node/storage_owner_index/graph_access.cc
     src/memory_node/storage_owner_index/graph_mutation.cc
+    src/memory_node/storage_owner_index/reconcile_reverse.cc
     src/memory_node/storage_owner_index/reverse_batch.cc
     src/memory_node/storage_owner_maintenance/graph_tasks.cc
     src/memory_node/storage_owner_maintenance/queue.cc
@@ -123,12 +153,10 @@ set(DVSTOR_MEMORY_NODE_SOURCES
     src/memory_node/storage_owner_runtime/lifecycle.cc
     src/memory_node/storage_owner_runtime/wire_protocol.cc
     src/memory_node/storage_owner_runtime/workers.cc
-    src/vamana/anchor_index.cc
-    src/vamana/adaptive_route_table.cc
+    src/vamana/centroid_router.cc
 )
 
 set(DVSTOR_OFFLINE_BUILDER_SOURCES
-    tools/vamana_offline/anchor_builder.cc
     tools/vamana_offline/config.cc
     tools/vamana_offline/dataset_io.cc
     tools/vamana_offline/graph.cc
@@ -141,7 +169,6 @@ set(DVSTOR_OFFLINE_BUILDER_SOURCES
 set(DVSTOR_PQ_INDEXER_SOURCES
     src/gpu_search/index_format.cc
     src/gpu_search/pq_index.cc
-    src/vamana/anchor_index.cc
     tools/vamana_offline/pq_indexer.cc
 )
 
@@ -172,6 +199,15 @@ function(dvstor_add_offline_tools)
     )
     dvstor_target_tool_includes(vamana_pq_indexer)
     target_link_libraries(vamana_pq_indexer rdma_library FaissCPU::FaissCPU)
+
+    add_executable(vamana_legacy_index_converter
+        tools/vamana_legacy_index_converter.cc
+        tools/vamana_offline/legacy_index_converter.cc
+        ${DVSTOR_PQ_INDEXER_SOURCES}
+    )
+    dvstor_target_tool_includes(vamana_legacy_index_converter)
+    target_link_libraries(vamana_legacy_index_converter
+        rdma_library FaissCPU::FaissCPU)
 
 endfunction()
 
@@ -253,14 +289,12 @@ else ()
     set(DVSTOR_RUNTIME_SOURCES
         src/common/core_assignment.cc
         src/common/timing.cc
-        src/gpu_search/delta_index.cc
-        src/gpu_search/dynamic_route_overlay.cc
         src/gpu_search/navigation_bootstrapper.cc
         src/gpu_search/index_format.cc
         src/gpu_search/persistent_engine.cc
         src/gpu_search/persistent_engine/completion.cc
         src/gpu_search/persistent_engine/construction.cc
-        src/gpu_search/persistent_engine/delta_publication.cc
+        src/gpu_search/persistent_engine/centroid_route_publication.cc
         src/gpu_search/persistent_engine/health.cc
         src/gpu_search/persistent_engine/lifecycle.cc
         src/gpu_search/persistent_engine/query_execution.cc
@@ -268,7 +302,6 @@ else ()
         src/gpu_search/persistent_engine/storage_reclaim.cc
         src/gpu_search/pq_index.cc
         src/gpu_search/types.cc
-        src/service/base_owner_map.cc
         src/service/compute_service/index_commands.cc
         src/service/compute_service/lifecycle.cc
         src/service/compute_service/search.cc
@@ -277,8 +310,6 @@ else ()
         src/service/compute_service/storage_owner/public_mutations.cc
         src/service/compute_service/storage_owner/sender.cc
         src/service/index_metadata.cc
-        src/vamana/anchor_index.cc
-        src/vamana/adaptive_route_table.cc
     )
     if (DVSTOR_HAVE_GPUNETIO)
         list(APPEND DVSTOR_RUNTIME_SOURCES src/gpu/gpunetio_transport.cc)

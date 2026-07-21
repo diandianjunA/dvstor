@@ -37,14 +37,18 @@ int main() {
 
   const auto colocated = memory_node_detail::derive_storage_owner_cpu_plan(
     22, 64, 16, 8, 4);
-  assert(colocated.foreground_workers == 4);
+  assert(colocated.foreground_workers == 3);
   assert(colocated.maintenance_workers == 2);
   assert(colocated.peer_reverse_workers == 4);
-  assert(colocated.peer_search_workers == 8);
-  assert(colocated.peer_progress_threads == 3);
+  assert(colocated.peer_stage1_workers == 7);
+  assert(colocated.peer_cleanup_workers == 2);
+  assert(colocated.peer_placement_workers == 1);
+  assert(colocated.peer_progress_threads == 2);
   assert(colocated.foreground_progress_threads == 1);
   assert(colocated.foreground_workers + colocated.maintenance_workers +
-           colocated.peer_reverse_workers + colocated.peer_search_workers +
+           colocated.peer_reverse_workers + colocated.peer_stage1_workers +
+           colocated.peer_cleanup_workers +
+           colocated.peer_placement_workers +
            colocated.peer_progress_threads +
            colocated.foreground_progress_threads == 22);
 
@@ -53,6 +57,22 @@ int main() {
   assert(dedicated.foreground_workers == 16);
   assert(dedicated.maintenance_workers == 8);
   assert(dedicated.peer_reverse_workers == 8);
-  assert(dedicated.peer_search_workers == 32);
+  assert(dedicated.peer_stage1_workers == 32);
+  assert(dedicated.peer_cleanup_workers == 8);
+  assert(dedicated.peer_placement_workers == 1);
   assert(dedicated.foreground_progress_threads == 1);
+
+  // Stage1 chooses one physical home. Adding shards does not fan out its
+  // coordinator work and must not reduce foreground concurrency.
+  const auto one_remote = memory_node_detail::derive_storage_owner_cpu_plan(
+    22, 64, 16, 8, 1);
+  assert(one_remote.foreground_workers == colocated.foreground_workers);
+  assert(one_remote.peer_stage1_workers == colocated.peer_stage1_workers);
+
+  const auto local_only = memory_node_detail::derive_storage_owner_cpu_plan(
+    22, 64, 16, 8, 0);
+  assert(local_only.foreground_workers == 16);
+  assert(local_only.peer_stage1_workers == 0);
+  assert(local_only.peer_cleanup_workers == 0);
+  assert(local_only.peer_placement_workers == 0);
 }

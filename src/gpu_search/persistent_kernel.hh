@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 #include "gpu_search/device_ring.cuh"
@@ -13,25 +14,45 @@ namespace gpu_search {
 inline constexpr u32 kPersistentMaxBeam = 128;
 inline constexpr u32 kPersistentMaxExact = 256;
 inline constexpr u32 kPersistentMaxSubquantizers = 32;
-inline constexpr u32 kPersistentMaxEntryPoints = 512;
 inline constexpr u32 kPersistentMaxGraphDegree = 128;
 inline constexpr u32 kPersistentMaxPrefetch = 32;
 inline constexpr u32 kPersistentScoreChunk = 16;
 inline constexpr u32 kPersistentMaxMergeCandidates = 2048;
-inline constexpr u32 kPersistentMaxShards = 16;
-inline constexpr u32 kPersistentMaxAnchorProbes = 64;
+// RemotePtr dedicates six bits to the physical shard.  GPU routing and RDMA
+// status workspaces cover that complete addressable range so a valid 64-shard
+// index never becomes GPU-incompatible at runtime.
+inline constexpr u32 kPersistentMaxShards = 64;
 inline constexpr u32 kPersistentQueryThreads = 256;
-inline constexpr u32 kPersistentGraphReadBytes = 512;
-inline constexpr u32 kDeltaHandleBit = 0x80000000u;
-inline constexpr u32 kDeltaHandleMask = 0x7fffffffu;
-inline constexpr u32 kDeltaDeleted = 1u;
-inline constexpr u32 kDeltaDurable = 1u << 1;
-inline constexpr u32 kBaseOverrideEmpty = UINT32_MAX;
-inline constexpr u32 kBaseOverrideTombstone = UINT32_MAX - 1;
-inline constexpr u64 kDeltaRemoteEmpty = 0;
-inline constexpr u64 kDeltaRemoteTombstone = UINT64_MAX;
-static_assert(kPersistentMaxShards * kDynamicRouteSlotsPerShard <=
-              kPersistentMaxExact * 2);
+inline constexpr u32 kPersistentGraphReadBytes = 2048;
+inline constexpr u64 kInvalidDeviceHandle = ~u64{0};
+inline constexpr u32 kRemoteOffsetUnitBits = 34;
+inline constexpr u32 kRemoteShardBits = 6;
+inline constexpr u32 kRemoteIncarnationShift = 40;
+inline constexpr u64 kRemoteOffsetUnitMask =
+  (u64{1} << kRemoteOffsetUnitBits) - 1;
+inline constexpr u64 kRemoteShardMask =
+  (u64{1} << kRemoteShardBits) - 1;
+inline constexpr u32 kRemoteMaxIncarnation = (u32{1} << 24) - 2;
+inline constexpr u32 kNodeHeaderIncarnationShift = 32;
+
+// One scoring chunk merges all neighbors with the current beam. Derive its
+// width from the actual graph layout so a high (but supported) R does not
+// overflow the fixed GPU top-k workspace or require a dataset-specific knob.
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr u32 persistent_score_chunk_capacity(
+    u32 graph_entry_capacity, u32 traversal_beam_width) {
+  if (graph_entry_capacity == 0 ||
+      traversal_beam_width >= kPersistentMaxMergeCandidates) {
+    return 0;
+  }
+  const u32 available =
+    kPersistentMaxMergeCandidates - traversal_beam_width;
+  const u32 by_workspace = available / graph_entry_capacity;
+  return by_workspace < kPersistentScoreChunk
+    ? by_workspace : kPersistentScoreChunk;
+}
 
 struct DeviceShardRegion {
   u64 ordinal_base{};
@@ -55,17 +76,39 @@ struct DirectRemoteRegion {
   u32 reserved{};
 };
 
-struct DeviceDeltaRecord {
-  u32 id{};
+inline constexpr u32 kCentroidRouteMaxLiveEntries = 4;
+inline constexpr u32 kCentroidRouteLive = 1u;
+
+struct DeviceCentroidRouteEntry {
+  u64 remote_node{};
   u32 generation{};
   u32 flags{};
-  u32 base_ordinal{kBaseOverrideEmpty};
-  u64 epoch{};
-  u64 superseded_epoch{};
-  u64 remote_node{};
-  u32 anchor_bucket{};
-  u32 resident_pq_slot{UINT32_MAX};
 };
+
+// One seqlock covers the centroid and all live entries of a shard. Query CTAs
+// therefore never rank a centroid from one publication and traverse entry
+// handles from another.
+struct DeviceCentroidRouteShard {
+  u64 sequence{};
+  u64 command_id{};
+  u64 version{};
+  u64 vector_count{};
+  u32 live_entry_count{};
+  u32 reserved{};
+};
+
+struct CentroidRouteUpdate {
+  u64 version{};
+  u64 vector_count{};
+  u32 shard{};
+  u32 live_entry_count{};
+  std::array<DeviceCentroidRouteEntry,
+             kCentroidRouteMaxLiveEntries> entries{};
+};
+
+static_assert(sizeof(DeviceCentroidRouteEntry) == 16);
+static_assert(sizeof(DeviceCentroidRouteShard) == 40);
+static_assert(sizeof(CentroidRouteUpdate) == 88);
 
 struct DirectBatchDescriptor {
   const u32* request_shards{};
@@ -82,31 +125,34 @@ struct PersistentKernelParams {
   DeviceRingView<QueryDescriptor> submissions;
   DeviceRingView<QueryDescriptor> device_submissions;
   DeviceRingView<CompletionDescriptor> completions;
-  DeviceRingView<DeltaPublishDescriptor> delta_submissions;
-  DeviceRingView<DeltaPublishCompletion> delta_completions;
+  DeviceRingView<CentroidRoutePublishDescriptor> route_submissions;
+  DeviceRingView<CentroidRoutePublishCompletion> route_completions;
   const DeviceShardRegion* shards{};
   u32 num_shards{};
   const u8* pq_codes{};
   const f32* opq_matrix{};
   const f32* pq_centroids{};
-  const u32* entry_points{};
-  u32 entry_point_count{};
   u32 num_nodes{};
-  u32 medoid_ordinal{};
   u32 dim{};
   u32 pq_subquantizers{};
   u32 pq_subvector_dim{};
   u32 pq_code_bytes{};
+  u32 dynamic_code_record_bytes{};
   u32 graph_entry_bytes{};
   u32 graph_degree{};
+  // Total decodable pointer slots: stable graph_degree plus provisional
+  // backlink slots. RobustPrune still owns only graph_degree entries.
+  u32 graph_entry_capacity{};
   u32 graph_shard_bits{};
   u32 node_meta_offset{};
   u32 node_record_bytes{};
+  u32 node_record_stride{};
+  u32 node_vector_offset{};
+  u32 node_incarnation_offset{};
   u32 vector_bytes{};
   u32 vector_dtype{};
   u32 traversal_beam_width{};
   u32 final_rerank_width{};
-  u32 entry_seed_count{};
   u32 exact_width{};
   u32 max_expansions{};
   u32 prefetch_depth{};
@@ -127,53 +173,17 @@ struct PersistentKernelParams {
   u8* direct_dump{};
   u32* direct_disabled{};
   i32* direct_error{};
-  DeviceDeltaRecord* delta_records{};
-  u8* delta_vectors{};
-  u8* delta_pq_codes{};
-  const u32* delta_staging_slots{};
-  const DeviceDeltaRecord* delta_staging_records{};
-  const u8* delta_staging_vectors{};
-  f32* delta_encode_scratch{};
-  u32* delta_next{};
-  u32* delta_prev{};
-  u32* delta_remote_positions{};
-  u32* delta_bucket_heads{};
-  u32* delta_count{};
-  u32 delta_capacity{};
-  u32* base_override_keys{};
-  u64* base_override_epochs{};
-  u32 base_override_capacity{};
-  u32* permanent_override_bits{};
-  u32 permanent_override_words{};
-  u64* delta_remote_keys{};
-  u32* delta_remote_slots{};
-  u32 delta_remote_capacity{};
-  u8* resident_pq_codes{};
-  u64* resident_pq_keys{};
-  u32* resident_pq_slots{};
-  u32* resident_pq_positions{};
-  u32 resident_pq_capacity{};
-  u32 resident_pq_table_capacity{};
-  const DeltaSupersedeUpdate* delta_supersede_updates{};
-  const DeltaOverrideUpdate* delta_override_updates{};
-  const DeltaDurableUpdate* delta_durable_updates{};
-  const ResidentPqEraseUpdate* resident_pq_erase_updates{};
-  const DynamicRouteUpdate* dynamic_route_updates{};
-  const u8* dynamic_route_code_updates{};
-  DeviceDynamicRouteSlot* dynamic_route_slots{};
-  u8* dynamic_route_pq_codes{};
-  u32 dynamic_route_capacity{};
-  const u64* graph_invalidation_keys{};
-  const f32* anchor_vectors{};
-  const u32* anchor_handles{};
-  const u8* anchor_pq_codes{};
-  const u64* anchor_graph_keys{};
-  const u8* anchor_graph_records{};
-  u32* anchor_graph_states{};
-  u32* anchor_graph_readers{};
-  u32 anchor_graph_count{};
-  u32 anchor_count{};
-  u32 delta_anchor_probes{};
+  const CentroidRouteUpdate* centroid_route_updates{};
+  const f32* centroid_route_centroid_updates{};
+  DeviceCentroidRouteShard* centroid_route_shards{};
+  DeviceCentroidRouteEntry* centroid_route_entries{};
+  f32* shard_centroids{};
+  // Even values denote a complete route table generation. The sole route
+  // control CTA makes this odd while publishing any shard subset so query
+  // CTAs can validate one ranking snapshot across all shards.
+  u64* centroid_route_epoch{};
+  u32 centroid_route_shard_capacity{};
+  u32 centroid_route_entry_capacity{};
   u32* stop{};
   u32* kernel_ready_count{};
   u32 direct_owner_block_count{};
@@ -185,9 +195,9 @@ struct PersistentKernelParams {
   f32* decoded_queries{};
   f32* transformed_queries{};
   f32* query_luts{};
-  u32* navigation_candidate_handles{};
+  u64* navigation_candidate_handles{};
   f32* navigation_candidate_distances{};
-  u32* visited_hash{};
+  u64* visited_hash{};
   u8* exact_records{};
   u8* dynamic_code_records{};
   u32* dynamic_code_request_shards{};
@@ -207,10 +217,6 @@ void launch_gpunetio_owner_read_probe(
   u32* request_shards, u64* remote_offsets, u64* local_iova_offsets,
   u8* destinations, u32 destination_stride, i32* statuses,
   u32* completed, u32* phases, u32 queue_count);
-void launch_gather_anchor_codes(cudaStream_t stream, const u8* base_codes,
-                                const u32* anchor_handles, u8* anchor_codes,
-                                u32 anchor_count, u32 code_bytes,
-                                u32 node_count);
 void launch_gpunetio_locked_read_probe(cudaStream_t stream,
                                        const PersistentKernelParams& params,
                                        u8* destinations, u32 destination_stride,

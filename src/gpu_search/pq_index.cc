@@ -7,6 +7,8 @@
 #include <limits>
 #include <stdexcept>
 
+#include "common/vector_dtype.hh"
+
 namespace gpu_search::pq {
 namespace {
 
@@ -30,6 +32,25 @@ u64 checksum_update(u64 state, const void* data, size_t bytes) {
 bool read_exact(std::istream& input, void* destination, size_t bytes) {
   input.read(static_cast<char*>(destination), static_cast<std::streamsize>(bytes));
   return static_cast<size_t>(input.gcount()) == bytes;
+}
+
+f32 squared_l2_saturated(const f32* lhs, const f32* rhs, u32 dim) {
+  f32 distance = 0.0f;
+  for (u32 dimension = 0; dimension < dim; ++dimension) {
+    const f32 difference = lhs[dimension] - rhs[dimension];
+    distance += difference * difference;
+  }
+  if (floating_value_is_finite(distance) &&
+      distance < std::numeric_limits<f32>::max()) {
+    return std::min(distance, kMaxValidSquaredL2);
+  }
+  f64 wide_distance = 0.0;
+  for (u32 dimension = 0; dimension < dim; ++dimension) {
+    const f64 difference = static_cast<f64>(lhs[dimension]) -
+      static_cast<f64>(rhs[dimension]);
+    wide_distance += difference * difference;
+  }
+  return saturate_squared_l2(wide_distance);
 }
 
 }  // namespace
@@ -62,7 +83,9 @@ bool validate(const Model& model, std::string* error) {
   if (model.centroids.size() != expected_centroids) {
     return fail(error, "PQ model centroid table has an invalid shape");
   }
-  const auto finite = [](f32 value) { return std::isfinite(value); };
+  const auto finite = [](f32 value) {
+    return floating_value_is_finite(value);
+  };
   if (!std::all_of(model.rotation.begin(), model.rotation.end(), finite) ||
       !std::all_of(model.centroids.begin(), model.centroids.end(), finite)) {
     return fail(error, "PQ model contains non-finite values");
@@ -153,6 +176,11 @@ void transform(const Model& model, std::span<const f32> input,
   if (input.size() != model.dim || output.size() != model.dim) {
     throw std::invalid_argument("PQ transform dimension mismatch");
   }
+  if (!std::all_of(input.begin(), input.end(), [](f32 value) {
+        return floating_value_is_finite(value);
+      })) {
+    throw std::invalid_argument("PQ transform input must be finite");
+  }
   if (!model.has_rotation()) {
     std::copy(input.begin(), input.end(), output.begin());
     return;
@@ -162,6 +190,21 @@ void transform(const Model& model, std::span<const f32> input,
     const f32* matrix_row = model.rotation.data() + static_cast<size_t>(row) * model.dim;
     for (u32 column = 0; column < model.dim; ++column) {
       value += matrix_row[column] * input[column];
+    }
+    if (!floating_value_is_finite(value)) {
+      f64 wide_value = 0.0;
+      for (u32 column = 0; column < model.dim; ++column) {
+        wide_value = std::fma(
+          static_cast<f64>(matrix_row[column]),
+          static_cast<f64>(input[column]), wide_value);
+      }
+      const f64 maximum = static_cast<f64>(
+        std::numeric_limits<f32>::max());
+      value = wide_value >= maximum
+        ? std::numeric_limits<f32>::max()
+        : wide_value <= -maximum
+          ? -std::numeric_limits<f32>::max()
+          : static_cast<f32>(wide_value);
     }
     output[row] = value;
   }
@@ -181,12 +224,8 @@ void encode(const Model& model, std::span<const f32> input,
     f32 best_distance = std::numeric_limits<f32>::max();
     u32 best = 0;
     for (u32 centroid = 0; centroid < kCentroidsPerSubquantizer; ++centroid) {
-      f32 distance = 0.0f;
       const f32* candidate = table + static_cast<size_t>(centroid) * dsub;
-      for (u32 dimension = 0; dimension < dsub; ++dimension) {
-        const f32 difference = value[dimension] - candidate[dimension];
-        distance += difference * difference;
-      }
+      const f32 distance = squared_l2_saturated(value, candidate, dsub);
       if (distance < best_distance) {
         best_distance = distance;
         best = centroid;
@@ -211,12 +250,8 @@ void build_distance_table(const Model& model, std::span<const f32> input,
     const f32* centroids = model.centroids.data() +
       static_cast<size_t>(subquantizer) * kCentroidsPerSubquantizer * dsub;
     for (u32 centroid = 0; centroid < kCentroidsPerSubquantizer; ++centroid) {
-      f32 distance = 0.0f;
       const f32* candidate = centroids + static_cast<size_t>(centroid) * dsub;
-      for (u32 dimension = 0; dimension < dsub; ++dimension) {
-        const f32 difference = value[dimension] - candidate[dimension];
-        distance += difference * difference;
-      }
+      const f32 distance = squared_l2_saturated(value, candidate, dsub);
       table[static_cast<size_t>(subquantizer) * kCentroidsPerSubquantizer + centroid] =
         distance;
     }
@@ -229,12 +264,12 @@ f32 asymmetric_distance(const Model& model, std::span<const f32> table,
         kCentroidsPerSubquantizer || code.size() != model.code_bytes()) {
     throw std::invalid_argument("PQ asymmetric-distance buffer shape mismatch");
   }
-  f32 distance = 0.0f;
+  f64 distance = 0.0;
   for (u32 subquantizer = 0; subquantizer < model.subquantizers; ++subquantizer) {
-    distance += table[static_cast<size_t>(subquantizer) *
-      kCentroidsPerSubquantizer + code[subquantizer]];
+    distance += static_cast<f64>(table[static_cast<size_t>(subquantizer) *
+      kCentroidsPerSubquantizer + code[subquantizer]]);
   }
-  return distance;
+  return saturate_squared_l2(distance);
 }
 
 }  // namespace gpu_search::pq

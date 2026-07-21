@@ -16,10 +16,9 @@ RECALL_CLIENT_THREADS="${RECALL_CLIENT_THREADS:-128}"
 RECALL_K="${RECALL_K:-$K}"
 RECALL_QUERY_FILE="$(query_bin)"
 GROUNDTRUTH_FILE="$(groundtruth_bin)"
-# Recall is query-only. It still needs the static bootstrap/fallback anchors,
-# but does not initialize mutation routing or require the owner idmaps.
+# Recall is query-only and does not initialize the mutation executor.
 ENABLE_UPDATES=false
-validate_index_metadata compute 0 "$ENABLE_UPDATES"
+validate_index_metadata compute
 [[ -s "$RECALL_QUERY_FILE" ]] || {
   echo "missing recall query file: $RECALL_QUERY_FILE" >&2
   exit 1

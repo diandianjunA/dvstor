@@ -83,15 +83,23 @@ void test_recall_and_report_formatting() {
     results, truth.data(), truth.size()) - 0.5) < 1e-9);
 
   gpu_search::TelemetrySnapshot telemetry;
-  telemetry.delta_reclaim_batches = 7;
   telemetry.graph_read_retries = 11;
-  telemetry.mutation_capacity_wait_events = 3;
-  telemetry.mutation_capacity_wait_ns = 2'000'000;
+  telemetry.centroid_route_publications = 7;
+  telemetry.centroid_route_shard_updates = 9;
+  telemetry.centroid_route_live_entries = 13;
+  telemetry.centroid_route_probe_reads = 101;
+  telemetry.centroid_route_body_reads = 3;
+  telemetry.centroid_route_unchanged_polls = 47;
+  telemetry.centroid_route_poll_delay_us = 8000;
   const auto telemetry_json = tools::breakdown_benchmark::telemetry_to_json(telemetry);
-  assert(telemetry_json.at("delta_reclaim_batches") == 7);
   assert(telemetry_json.at("graph_read_retries") == 11);
-  assert(telemetry_json.at("mutation_capacity_wait_events") == 3);
-  assert(telemetry_json.at("mutation_capacity_wait_ms") == 2.0);
+  assert(telemetry_json.at("centroid_route_publications") == 7);
+  assert(telemetry_json.at("centroid_route_shard_updates") == 9);
+  assert(telemetry_json.at("centroid_route_live_entries") == 13);
+  assert(telemetry_json.at("centroid_route_probe_reads") == 101);
+  assert(telemetry_json.at("centroid_route_body_reads") == 3);
+  assert(telemetry_json.at("centroid_route_unchanged_polls") == 47);
+  assert(telemetry_json.at("centroid_route_poll_delay_us") == 8000);
 
   nlohmann::json root;
   root["meta"] = {
@@ -145,19 +153,29 @@ void test_maintenance_log_window() {
                                uint64_t peer_failed,
                                const Histogram& histogram) {
     output << "[STATUS]: storage-owner maintenance observation: "
-           << "stitch_enqueued=" << enqueued << ' '
-           << "stitched_live=" << completed << " stale=0 "
+           << "stage2_enqueued=" << enqueued << ' '
+           << "stage2_finalized_live=" << completed << " stale=0 "
            << "remaining=" << remaining << ' '
            << "peer_reverse_remaining=0 "
            << "failed=" << failed << ' '
            << "peer_reverse_failed=" << peer_failed << ' '
            << "admission_window=512 "
            << "completion_outstanding=" << remaining << ' '
+           << "stage2_continuations=" << completed << ' '
+           << "stage2_remote_frontier_items=" << completed * 2 << ' '
+           << "stage2_remote_expansions=" << completed * 3 << ' '
+           << "stage2_scored_candidates=" << completed * 4 << ' '
+           << "stage2_migrations=" << completed / 10 << ' '
+           << "stage2_final_edges=" << completed * 8 << ' '
+           << "stage2_cross_edges_stage1_home=" << completed * 4 << ' '
+           << "stage2_cross_edges_final_home=" << completed * 2 << ' '
+           << "stage1_search_budget_exhausted=" << completed / 20 << ' '
+           << "stage2_search_budget_exhausted=" << completed / 10 << ' '
            // Deliberately stale cumulative p99 fields: the parser must use
            // only the histogram delta from the cursor baseline.
-           << "p99_stitch_delay_upper_ms=30000 "
-           << "p99_stitch_delay_over_30s=true "
-           << "stitch_delay_histogram=" << histogram_text(histogram)
+           << "p99_stage2_delay_upper_ms=30000 "
+           << "p99_stage2_delay_over_30s=true "
+           << "stage2_delay_histogram=" << histogram_text(histogram)
            << '\n';
   };
 
@@ -193,14 +211,27 @@ void test_maintenance_log_window() {
   assert(summary.max_backlog_observed == 10);
   assert(summary.failures == 1);
   assert(summary.completion_window_available);
+  assert(summary.locality_delta_available);
+  assert(summary.stage2_finalized_live == 300);
+  assert(summary.stage2_continuations == 300);
+  assert(summary.stage2_remote_frontier_items == 600);
+  assert(summary.stage2_remote_expansions == 900);
+  assert(summary.stage2_scored_candidates == 1200);
+  assert(summary.stage2_migrations == 30);
+  assert(summary.stage2_final_edges == 2400);
+  assert(summary.stage2_cross_edges_stage1_home == 1200);
+  assert(summary.stage2_cross_edges_final_home == 600);
+  assert(summary.search_budget_delta_available);
+  assert(summary.stage1_search_budget_exhausted == 15);
+  assert(summary.stage2_search_budget_exhausted == 30);
   assert(summary.admission_window == 512);
   assert(summary.completion_outstanding == 0);
   assert(summary.max_completion_outstanding_per_shard == 10);
   assert(summary.failure_delta_available);
-  assert(summary.p99_stitch_delay_available);
-  assert(summary.p99_stitch_delay_samples == 100);
-  assert(summary.p99_stitch_delay_upper_ms == 4.0);
-  assert(!summary.p99_stitch_delay_over_30s);
+  assert(summary.p99_stage2_delay_available);
+  assert(summary.p99_stage2_delay_samples == 100);
+  assert(summary.p99_stage2_delay_upper_ms == 4.0);
+  assert(!summary.p99_stage2_delay_over_30s);
   assert(summary.backlog_slope_available);
   assert(summary.backlog_slope_per_sec < 0.0);
 
@@ -210,7 +241,7 @@ void test_maintenance_log_window() {
     tools::breakdown_benchmark::summarize_maintenance_logs(post_stop);
   assert(empty_post_stop.logs_with_observations == 0);
   assert(!empty_post_stop.failure_delta_available);
-  assert(!empty_post_stop.p99_stitch_delay_available);
+  assert(!empty_post_stop.p99_stage2_delay_available);
 
   {
     std::ofstream output(path, std::ios::app);
@@ -221,8 +252,8 @@ void test_maintenance_log_window() {
   assert(post_stop_without_completion.logs_with_observations == 1);
   assert(post_stop_without_completion.failure_delta_available);
   assert(post_stop_without_completion.failures == 0);
-  assert(post_stop_without_completion.p99_stitch_delay_samples == 0);
-  assert(!post_stop_without_completion.p99_stitch_delay_available);
+  assert(post_stop_without_completion.p99_stage2_delay_samples == 0);
+  assert(!post_stop_without_completion.p99_stage2_delay_available);
 
   // Appending drain observations cannot change the frozen load window.
   const auto frozen_again = tools::breakdown_benchmark::
@@ -245,8 +276,8 @@ void test_maintenance_log_window() {
   }
   const auto exact_5s =
     tools::breakdown_benchmark::summarize_maintenance_logs(exact_5s_begin);
-  assert(exact_5s.p99_stitch_delay_available);
-  assert(exact_5s.p99_stitch_delay_upper_ms == 5000.0);
+  assert(exact_5s.p99_stage2_delay_available);
+  assert(exact_5s.p99_stage2_delay_upper_ms == 5000.0);
 
   {
     std::ofstream output(path, std::ios::trunc);
@@ -261,8 +292,8 @@ void test_maintenance_log_window() {
   }
   const auto over_5s =
     tools::breakdown_benchmark::summarize_maintenance_logs(over_5s_begin);
-  assert(over_5s.p99_stitch_delay_available);
-  assert(over_5s.p99_stitch_delay_upper_ms == 8000.0);
+  assert(over_5s.p99_stage2_delay_available);
+  assert(over_5s.p99_stage2_delay_upper_ms == 8000.0);
 
   std::filesystem::remove(path);
 }

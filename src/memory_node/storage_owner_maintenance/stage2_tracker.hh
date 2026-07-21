@@ -98,6 +98,28 @@ class Stage2StateTracker {
     return true;
   }
 
+  // A cleanup can discover temporary protected-slot pressure before it has
+  // registered any asynchronous reverse request. Return that runnable work
+  // to the queue instead of pinning the only context that could execute the
+  // Stage2/delete work needed to release capacity.
+  [[nodiscard]] bool release_retryable(Stage2ContextHandle handle) {
+    Slot* slot = resolve(handle);
+    if (slot == nullptr ||
+        (slot->state.phase != Stage2Phase::local_ready &&
+         slot->state.phase != Stage2Phase::prune_ready) ||
+        slot->state.expected_search_mask !=
+          slot->state.completed_search_mask ||
+        slot->state.expected_reverse_mask != 0 ||
+        slot->state.completed_reverse_mask != 0) {
+      return false;
+    }
+    slot->in_use = false;
+    slot->state = {};
+    free_slots_.push_back(handle.slot);
+    --size_;
+    return true;
+  }
+
   [[nodiscard]] bool is_current(Stage2ContextHandle handle) const {
     return resolve(handle) != nullptr;
   }
@@ -400,12 +422,13 @@ class Stage2RequestTracker {
     const std::optional<std::size_t> bucket_index = find_bucket(request_id);
     if (!bucket_index.has_value()) return false;
 
-    Bucket& bucket = buckets_[*bucket_index];
-    Record& record = records_[bucket.record_index];
+    const std::uint32_t record_index =
+      buckets_[*bucket_index].record_index;
+    Record& record = records_[record_index];
     record.in_use = false;
     record.metadata = {};
-    free_records_.push_back(bucket.record_index);
-    bucket.state = BucketState::tombstone;
+    free_records_.push_back(record_index);
+    erase_bucket(*bucket_index);
     --size_;
     return true;
   }
@@ -414,8 +437,27 @@ class Stage2RequestTracker {
   [[nodiscard]] std::size_t capacity() const { return records_.size(); }
   [[nodiscard]] bool full() const { return size_ == records_.size(); }
 
+  // Diagnostic probe length used by bounded-runtime regression tests. A
+  // missing lookup in an empty tracker is exactly one probe; more generally,
+  // true deletion keeps this bounded by the current cluster rather than all
+  // requests that have ever passed through the tracker.
+  [[nodiscard]] std::size_t lookup_probe_count(
+      std::uint64_t request_id) const {
+    const std::size_t mask = buckets_.size() - 1;
+    std::size_t index = static_cast<std::size_t>(mix(request_id)) & mask;
+    for (std::size_t probes = 1; probes <= buckets_.size(); ++probes) {
+      const Bucket& bucket = buckets_[index];
+      if (bucket.state == BucketState::empty ||
+          bucket.request_id == request_id) {
+        return probes;
+      }
+      index = (index + 1) & mask;
+    }
+    return buckets_.size();
+  }
+
  private:
-  enum class BucketState : std::uint8_t { empty, occupied, tombstone };
+  enum class BucketState : std::uint8_t { empty, occupied };
 
   struct Record {
     bool in_use{};
@@ -475,19 +517,36 @@ class Stage2RequestTracker {
   [[nodiscard]] Bucket& bucket_for_insert(std::uint64_t request_id) {
     const std::size_t mask = buckets_.size() - 1;
     std::size_t index = static_cast<std::size_t>(mix(request_id)) & mask;
-    std::optional<std::size_t> first_tombstone;
     for (std::size_t probe = 0; probe < buckets_.size(); ++probe) {
       Bucket& bucket = buckets_[index];
-      if (bucket.state == BucketState::tombstone &&
-          !first_tombstone.has_value()) {
-        first_tombstone = index;
-      } else if (bucket.state == BucketState::empty) {
-        return buckets_[first_tombstone.value_or(index)];
-      }
+      if (bucket.state == BucketState::empty) return bucket;
       index = (index + 1) & mask;
     }
-    if (first_tombstone.has_value()) return buckets_[*first_tombstone];
     throw std::logic_error("stage2 request hash table is unexpectedly full");
+  }
+
+  [[nodiscard]] std::size_t probe_distance(std::size_t home,
+                                           std::size_t position) const {
+    return (position - home) & (buckets_.size() - 1);
+  }
+
+  // Linear-probing true deletion. Move every later bucket whose probe path
+  // crosses the hole one step/cluster segment backward, preserving its slab
+  // record_index verbatim. The first empty bucket terminates the cluster and
+  // becomes the final cleared hole. Thus no historical tombstones accumulate.
+  void erase_bucket(std::size_t hole) {
+    const std::size_t mask = buckets_.size() - 1;
+    std::size_t scan = (hole + 1) & mask;
+    while (buckets_[scan].state == BucketState::occupied) {
+      const std::size_t home =
+        static_cast<std::size_t>(mix(buckets_[scan].request_id)) & mask;
+      if (probe_distance(home, hole) < probe_distance(home, scan)) {
+        buckets_[hole] = buckets_[scan];
+        hole = scan;
+      }
+      scan = (scan + 1) & mask;
+    }
+    buckets_[hole] = Bucket{};
   }
 
   std::vector<Record> records_;

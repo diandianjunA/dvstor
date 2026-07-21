@@ -1,6 +1,7 @@
 #include "memory_node/storage_owner_index/detail.hh"
 #include "memory_node/storage_owner_index/reverse_batch_policy.hh"
 #include "memory_node/storage_owner_index/robust_prune_policy.hh"
+#include "memory_node/storage_owner_index/stage1_reachability_policy.hh"
 
 using namespace memory_node_storage_owner_index_detail;
 
@@ -55,7 +56,8 @@ vec<RemotePtr> MemoryNode::robust_prune_cpu(const byte_t* source,
       breakdown->storage_owner_prune_snapshot_read_ns += elapsed_ns_since(t_snapshot);
     }
     for (NodeSnapshot& snapshot : snapshots) {
-      if (snapshot.deleted) {
+      if (snapshot.deleted ||
+          (snapshot.header & VamanaNode::HEADER_PROVISIONAL) != 0) {
         continue;
       }
       auto t_distance = std::chrono::steady_clock::now();
@@ -141,6 +143,7 @@ vec<RemotePtr> MemoryNode::robust_prune_snapshots_cpu(
   selected.reserve(result_limit);
   for (const NodeSnapshot& candidate : candidates) {
     if (candidate.rptr.is_null() || candidate.deleted ||
+        (candidate.header & VamanaNode::HEADER_PROVISIONAL) != 0 ||
         candidate.vector_data.size() < VamanaNode::vector_bytes() ||
         skip.contains(candidate.rptr) || !seen.insert(candidate.rptr).second) {
       continue;
@@ -213,14 +216,21 @@ bool MemoryNode::apply_partition_local_reverse_update(
     return true;
   }
 
-  lock_node(target_ptr);
-  if ((load_local_node_header_acquire(target_ptr) &
-       VamanaNode::HEADER_DELETED) != 0) {
-    unlock_node(target_ptr);
+  const IncarnationLockResult target_lock = try_lock_node(target_ptr);
+  if (target_lock == IncarnationLockResult::stale) {
+    // A reverse edge into an incarnation that no longer exists is already an
+    // idempotent no-op. Never redirect it into the replacement occupant.
     return true;
   }
+  if (target_lock == IncarnationLockResult::busy) return false;
+  if (!VamanaNode::stable_graph_mutation_allowed(
+        load_local_node_header_acquire(target_ptr))) {
+    unlock_node(target_ptr);
+    return false;
+  }
 
-  vec<RemotePtr> current_neighbors = read_neighbor_list(target_ptr);
+  vec<RemotePtr> current_neighbors =
+    read_stable_neighbor_list(target_ptr);
   vec<RemotePtr> preserved_external;
   vec<RemotePtr> local_candidates;
   preserved_external.reserve(current_neighbors.size());
@@ -231,7 +241,7 @@ bool MemoryNode::apply_partition_local_reverse_update(
       changed = true;
       continue;
     }
-    if (!storage_owner_node_live(neighbor)) {
+    if (!storage_owner_node_stable(neighbor)) {
       changed = true;
       continue;
     }
@@ -243,7 +253,7 @@ bool MemoryNode::apply_partition_local_reverse_update(
   }
 
   for (const RemotePtr& candidate : unique_candidates) {
-    if (!storage_owner_node_live(candidate)) {
+    if (!storage_owner_node_stable(candidate)) {
       continue;
     }
     if (std::find(local_candidates.begin(), local_candidates.end(), candidate) ==
@@ -303,121 +313,106 @@ bool MemoryNode::apply_partition_local_reverse_update(
   return true;
 }
 
-auto MemoryNode::execute_storage_owner_insert_job_async(StorageOwnerThread& thread,
-                                            StorageOwnerInsertJob& job,
-                                            dense_hashmap_t<u64, vec<RemotePtr>>& local_updates,
-                                            dense_hashmap_t<u32, vec<service::storage_owner::ReverseUpdateOp>>& remote_updates,
-                                            InsertBreakdownCounters& breakdown,
-                                            const Configuration& config) -> StorageOwnerInsertCoroutine {
-  const auto components = span<const element_t>{reinterpret_cast<const element_t*>(job.vector_data.data()),
-                                                 VamanaNode::DIM};
-  FreshnessEntry old_entry{};
-  u32 generation = 0;
-  const auto status = prepare_mutation(job.id, job.kind, &old_entry, &generation);
-  job.old_ptr = old_entry.current;
-  job.generation = generation;
-  const bool maintenance_enabled = storage_owner_maintenance_enabled(config);
-  if (status != service::storage_owner::MutationStatus::ok) {
-    complete_storage_owner_maintenance_sequence(
-      job.maintenance_sequence, job.reserved_maintenance_work);
-    job.status = status;
-    job.ok = false;
-    co_return;
-  }
-  if (job.kind == service::storage_owner::MutationKind::erase) {
-    job.ok = mark_node_deleted(old_entry.current, generation);
-    job.status = job.ok ? service::storage_owner::MutationStatus::ok
-                        : service::storage_owner::MutationStatus::failed;
-    if (job.ok) {
-      publish_mutation(job.id, old_entry.current, generation, true);
-      job.maintenance_sequence = schedule_storage_owner_maintenance(
-        job.id, generation, job.kind, RemotePtr{}, old_entry.current,
-        job.maintenance_sequence, job.reserved_maintenance_work, config);
-    } else {
-      complete_storage_owner_maintenance_sequence(
-        job.maintenance_sequence, job.reserved_maintenance_work);
-    }
-    co_return;
-  }
-  lib_assert(!local_stitch_enabled(config),
-             "local stage1 must run on its dedicated CPU executor");
-  RemotePtr medoid_ptr{};
-  const vec<RemotePtr>* candidates = nullptr;
-
-  auto t_medoid = std::chrono::steady_clock::now();
-  medoid_ptr = co_await async_read_global_medoid(thread);
-  breakdown.storage_owner_medoid_ns += elapsed_ns_since(t_medoid);
-  if (medoid_ptr.is_null()) {
-    const RemotePtr new_ptr = allocate_local_node();
-    job.new_ptr = new_ptr;
-    auto t_write = std::chrono::steady_clock::now();
-    write_new_node(new_ptr, job.id, components, {}, generation);
-    breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
-    RemotePtr observed;
-    if (try_set_global_medoid(RemotePtr{}, new_ptr, observed) || observed.is_null()) {
-      job.ok = true;
-      job.status = service::storage_owner::MutationStatus::ok;
-      if (job.kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
-        mark_node_deleted(old_entry.current, old_entry.generation);
-      }
-      publish_mutation(job.id, new_ptr, generation, false);
-      job.maintenance_sequence = schedule_storage_owner_maintenance(
-        job.id, generation, job.kind, new_ptr, old_entry.current,
-        job.maintenance_sequence, job.reserved_maintenance_work, config);
-      co_return;
-    }
-    medoid_ptr = observed;
+vec<RemotePtr> MemoryNode::install_local_provisional_backlinks(
+    RemotePtr candidate,
+    span<const RemotePtr> targets) {
+  if (candidate.is_null() || !local_shard(candidate.memory_node()) ||
+      !storage_owner_node_live(candidate)) {
+    return {};
   }
 
-  auto t_search = std::chrono::steady_clock::now();
-  auto search = beam_search_candidates_async(
-    components, medoid_ptr, config, thread, &breakdown);
-  co_await std::suspend_always{};
-  while (!search.handle.done()) {
-    if (thread.is_ready(thread.running_coroutine)) {
-      search.handle.resume();
-    } else {
-      co_await std::suspend_always{};
+  const auto try_install = [&](const RemotePtr target) {
+    if (!local_shard(target.memory_node())) return false;
+    if (try_lock_node(target) != IncarnationLockResult::locked) {
+      // Contention lets Stage1 try another bounded bridge; a stale target is
+      // not eligible for an ACK under its old physical identity.
+      return false;
     }
-  }
-  search.handle.destroy();
-  breakdown.storage_owner_search_ns += elapsed_ns_since(t_search);
-  candidates = &storage_owner_async_candidates_[thread.id][thread.running_coroutine];
-
-  lib_assert(candidates != nullptr, "storage-owner insert search produced no candidate set");
-  StorageOwnerCoroutineScratch& scratch = thread.coroutine_scratch_state();
-  scratch.empty_skip.clear();
-  auto t_prune = std::chrono::steady_clock::now();
-  vec<RemotePtr> selected_neighbors = robust_prune_cpu(reinterpret_cast<const byte_t*>(components.data()),
-                                                       VectorDType::float32, *candidates, scratch.empty_skip, config, &breakdown);
-  breakdown.storage_owner_prune_ns += elapsed_ns_since(t_prune);
-  const RemotePtr new_ptr = allocate_local_node();
-  job.new_ptr = new_ptr;
-  auto t_write = std::chrono::steady_clock::now();
-  write_new_node(new_ptr, job.id, components, selected_neighbors, generation);
-  breakdown.storage_owner_write_node_ns += elapsed_ns_since(t_write);
-  if (job.kind == service::storage_owner::MutationKind::upsert && !old_entry.deleted) {
-    mark_node_deleted(old_entry.current, old_entry.generation);
-  }
-  publish_mutation(job.id, new_ptr, generation, false);
-  job.maintenance_sequence = schedule_storage_owner_maintenance(
-    job.id, generation, job.kind, new_ptr, old_entry.current,
-    job.maintenance_sequence, job.reserved_maintenance_work, config);
-
-  if (!maintenance_enabled) {
-    for (const RemotePtr& neighbor_ptr : selected_neighbors) {
-      if (local_shard(neighbor_ptr.memory_node())) {
-        local_updates[neighbor_ptr.raw_address].push_back(new_ptr);
-        job.invalidated_neighbors.push_back(neighbor_ptr.raw_address);
-      } else {
-        remote_updates[neighbor_ptr.memory_node()].push_back(
-          service::storage_owner::ReverseUpdateOp{neighbor_ptr.raw_address, new_ptr.raw_address});
-        job.invalidated_neighbors.push_back(neighbor_ptr.raw_address);
-      }
+    const u64 header = load_local_node_header_acquire(target);
+    if (!VamanaNode::stable_graph_mutation_allowed(header)) {
+      unlock_node(target);
+      return false;
     }
+
+    GraphAdjacency adjacency;
+    if (!read_graph_adjacency(target, adjacency) || adjacency.deleted) {
+      unlock_node(target);
+      return false;
+    }
+    if (std::find(adjacency.stable.begin(), adjacency.stable.end(),
+                  candidate) != adjacency.stable.end() ||
+        std::find(adjacency.provisional.begin(),
+                  adjacency.provisional.end(), candidate) !=
+          adjacency.provisional.end()) {
+      unlock_node(target);
+      return true;
+    }
+    if (adjacency.provisional.size() >=
+        VamanaNode::provisional_slots()) {
+      unlock_node(target);
+      return false;
+    }
+
+    adjacency.provisional.push_back(candidate);
+    write_graph_adjacency(target, adjacency.stable,
+                          adjacency.provisional,
+                          adjacency.generation, false);
+    unlock_node(target);
+    return true;
+  };
+  return select_stage1_reachability_bridges(
+    candidate, targets, VamanaNode::allocation_size(), try_install);
+}
+
+bool MemoryNode::remove_local_provisional_backlinks(
+    RemotePtr candidate,
+    span<const RemotePtr> targets) {
+  if (candidate.is_null() || candidate.memory_node() != storage_id_) {
+    return false;
   }
-  job.ok = true;
-  job.status = service::storage_owner::MutationStatus::ok;
+  hashset_t<RemotePtr> visited;
+  visited.reserve(targets.size());
+  for (const RemotePtr target : targets) {
+    if (target.is_null() || target.memory_node() != storage_id_ ||
+        !visited.insert(target).second) {
+      continue;
+    }
+    const IncarnationLockResult target_lock = try_lock_node(target);
+    if (target_lock == IncarnationLockResult::stale) {
+      // The old parent is gone, so its old-incarnation provisional edge is
+      // gone as well. This is the required idempotent removal postcondition.
+      continue;
+    }
+    if (target_lock == IncarnationLockResult::busy) return false;
+    const u64 target_header = load_local_node_header_acquire(target);
+    if ((target_header & VamanaNode::HEADER_RETIRING) != 0) {
+      // The retiring parent's cleanup snapshot already owns this protected
+      // plane. Its eventual tombstone makes removal here an idempotent no-op.
+      unlock_node(target);
+      continue;
+    }
+    if (VamanaNode::graph_mutation_quiesced(target_header)) {
+      unlock_node(target);
+      return false;
+    }
+    GraphAdjacency adjacency;
+    if (!read_graph_adjacency(target, adjacency)) {
+      unlock_node(target);
+      return false;
+    }
+    const size_t old_size = adjacency.provisional.size();
+    adjacency.provisional.erase(
+      std::remove(adjacency.provisional.begin(),
+                  adjacency.provisional.end(), candidate),
+      adjacency.provisional.end());
+    if (adjacency.provisional.size() != old_size) {
+      write_graph_adjacency(target, adjacency.stable,
+                            adjacency.provisional,
+                            adjacency.generation, adjacency.deleted);
+    }
+    unlock_node(target);
+  }
+  return true;
 }
 
 bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
@@ -447,9 +442,9 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
     return true;
   }
 
-  const auto target_deleted = [&]() {
-    return (load_local_node_header_acquire(target_ptr) &
-            VamanaNode::HEADER_DELETED) != 0;
+  const auto target_unavailable = [&]() {
+    return !VamanaNode::stable_graph_mutation_allowed(
+      load_local_node_header_acquire(target_ptr));
   };
   (void)enqueue_maintenance;
 
@@ -460,17 +455,19 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
   u32 conflicts = 0;
 
   for (;;) {
-    lock_node(target_ptr);
-    if (target_deleted()) {
+    const IncarnationLockResult first_lock = try_lock_node(target_ptr);
+    if (first_lock == IncarnationLockResult::stale) return true;
+    if (first_lock == IncarnationLockResult::busy) return false;
+    if (target_unavailable()) {
       unlock_node(target_ptr);
-      return true;
+      return false;
     }
-    current_neighbors = read_neighbor_list(target_ptr);
+    current_neighbors = read_stable_neighbor_list(target_ptr);
     select_fresh_reverse_candidates_locked(
       current_neighbors,
       unique_candidates,
       [this](const RemotePtr& candidate) {
-        return storage_owner_node_live(candidate);
+        return storage_owner_node_stable(candidate);
       },
       fresh_candidates);
     if (fresh_candidates.empty()) {
@@ -510,12 +507,15 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
       config,
       config.R);
 
-    lock_node(target_ptr);
-    if (target_deleted()) {
+    const IncarnationLockResult final_lock = try_lock_node(target_ptr);
+    if (final_lock == IncarnationLockResult::stale) return true;
+    if (final_lock == IncarnationLockResult::busy) return false;
+    if (target_unavailable()) {
       unlock_node(target_ptr);
-      return true;
+      return false;
     }
-    const vec<RemotePtr> observed_neighbors = read_neighbor_list(target_ptr);
+    const vec<RemotePtr> observed_neighbors =
+      read_stable_neighbor_list(target_ptr);
     const bool unchanged =
       observed_neighbors.size() == current_neighbors.size() &&
       std::equal(observed_neighbors.begin(), observed_neighbors.end(),
@@ -529,7 +529,7 @@ bool MemoryNode::apply_local_reverse_update(RemotePtr target_ptr,
       observed_neighbors,
       fresh_candidates,
       [this](const RemotePtr& candidate) {
-        return storage_owner_node_live(candidate);
+        return storage_owner_node_stable(candidate);
       },
       revalidated_candidates);
     const bool candidates_unchanged =

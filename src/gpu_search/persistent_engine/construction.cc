@@ -3,71 +3,15 @@
 
 namespace gpu_search {
 
-static_assert(kDynamicRouteSlotsPerShard == format::kStorageRouteSlots);
-static_assert(kPersistentMaxSubquantizers ==
-              format::kStorageRouteMaxCodeBytes);
+static_assert(kCentroidRouteMaxLiveEntries ==
+              format::kStorageCentroidRouteMaxLiveEntries);
 
 using namespace persistent_engine_detail;
 
 namespace {
 
 static_assert(sizeof(DeviceShardRegion) == sizeof(format::ShardRegion));
-
-AnchorTable load_anchor_table(const filepath_t& prefix, u32 expected_dim,
-                              u32 expected_shards, const format::View& index_view) {
-  AnchorTable result;
-  const filepath_t path = index_path::anchor_file(prefix);
-  std::ifstream input(path, std::ios::binary);
-  if (!input.good()) {
-    std::cerr << "[gpu-search] warning: no anchor sidecar; large deltas use a full scan\n";
-    return result;
-  }
-  vamana::anchor::Header header;
-  input.read(reinterpret_cast<char*>(&header), sizeof(header));
-  if (!input.good() || header.magic != vamana::anchor::kMagic ||
-      header.version != vamana::anchor::kVersion || header.dim != expected_dim ||
-      header.shard_count != expected_shards || header.total_anchors > (1u << 24)) {
-    throw std::runtime_error("invalid anchor sidecar for GPU delta buckets: " + path.string());
-  }
-  const VectorDType dtype = static_cast<VectorDType>(header.vector_dtype);
-  if (vector_dtype_bytes(dtype, header.dim) != header.vector_bytes) {
-    throw std::runtime_error("anchor sidecar vector layout mismatch");
-  }
-  result.dim = header.dim;
-  result.vectors.reserve(static_cast<size_t>(header.total_anchors) * header.dim);
-  result.shard_offsets.resize(header.shard_count + 1, 0);
-  std::vector<byte_t> raw(header.vector_bytes);
-  std::vector<f32> decoded(header.dim);
-  for (u32 shard = 0; shard < header.shard_count; ++shard) {
-    result.shard_offsets[shard] = result.count();
-    vamana::anchor::ShardHeader shard_header;
-    input.read(reinterpret_cast<char*>(&shard_header), sizeof(shard_header));
-    if (!input.good() || shard_header.shard != shard ||
-        shard_header.anchor_count > header.anchors_per_shard) {
-      throw std::runtime_error("invalid anchor shard header");
-    }
-    input.seekg(static_cast<std::streamoff>(header.dim * sizeof(f32)), std::ios::cur);
-    for (u32 index = 0; index < shard_header.anchor_count; ++index) {
-      vamana::anchor::EntryHeader entry;
-      input.read(reinterpret_cast<char*>(&entry), sizeof(entry));
-      input.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
-      if (!input.good()) throw std::runtime_error("truncated anchor sidecar");
-      u32 handle = UINT32_MAX;
-      if (!format::remote_to_ordinal(index_view, RemotePtr{entry.rptr_raw}, handle)) {
-        throw std::runtime_error("anchor sidecar contains a non-static GPU entry point");
-      }
-      decode_storage_vector_to_float(raw.data(), dtype, header.dim, decoded.data());
-      result.vectors.insert(result.vectors.end(), decoded.begin(), decoded.end());
-      result.handles.push_back(handle);
-      result.raw_pointers.push_back(entry.rptr_raw);
-    }
-  }
-  result.shard_offsets.back() = result.count();
-  if (result.count() != header.total_anchors) {
-    throw std::runtime_error("anchor sidecar count mismatch");
-  }
-  return result;
-}
+static_assert(kPersistentMaxGraphDegree == kMaxSupportedGraphDegree);
 
 }  // namespace
 PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
@@ -80,15 +24,15 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                   MappedRing<QueryDescriptor>::Direction::host_to_device),
       completions(config.gpu_query_slots * 2,
                   MappedRing<CompletionDescriptor>::Direction::device_to_host),
-      delta_submissions(8, MappedRing<DeltaPublishDescriptor>::Direction::host_to_device),
-      delta_completions(8, MappedRing<DeltaPublishCompletion>::Direction::device_to_host) {
+      route_submissions(
+        8, MappedRing<CentroidRoutePublishDescriptor>::Direction::host_to_device),
+      route_completions(
+        8, MappedRing<CentroidRoutePublishCompletion>::Direction::device_to_host) {
   bind_cuda_device("cudaSetDevice(GPU navigation construction)");
-  compute_client_id = connection_manager.client_id;
-  compute_client_count = connection_manager.num_total_clients;
-  if (compute_client_count == 0 ||
-      compute_client_count > format::kMaxComputeClients ||
-      compute_client_id >= compute_client_count) {
-    throw std::runtime_error("compute client identity exceeds storage reclaim capacity");
+  route_poll_salt = connection_manager.client_id;
+  if (connection_manager.num_total_clients == 0 ||
+      route_poll_salt >= connection_manager.num_total_clients) {
+    throw std::runtime_error("invalid compute client identity");
   }
   if (config.gpu_traversal_beam_width > kPersistentMaxBeam ||
       config.gpu_final_rerank_width > kPersistentMaxExact ||
@@ -97,18 +41,12 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   }
 
   std::string load_error;
-  bool used_anchor_entry_points = false;
   if (!format::synthesize_distributed_view(
         config.resolved_index_prefix(), index,
-        format::SynthesisOptions{
-          .entry_points = 0,
-          .seed = static_cast<u64>(static_cast<u32>(config.seed)),
-        },
-        &used_anchor_entry_points, &load_error)) {
+        &load_error)) {
     throw std::runtime_error(load_error);
   }
-  std::cerr << "[gpu-search] synthesized navigation manifest in memory from metadata"
-            << (used_anchor_entry_points ? " and anchors\n" : "\n");
+  std::cerr << "[gpu-search] synthesized navigation manifest in memory from metadata\n";
   if (!pq::read_model(index_path::navigation_model_file(
         config.resolved_index_prefix(), index.layout.pq_subquantizers),
         pq_model, &load_error)) {
@@ -124,48 +62,36 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
       index.layout.model_checksum != pq_model.checksum() ||
       index.layout.graph_entry_bytes != VamanaNode::hot_graph_entry_size() ||
       index.layout.graph_shard_bits != VamanaNode::HOT_GRAPH_SHARD_BITS ||
-      index.layout.vector_dtype != static_cast<u32>(config.resolved_vector_dtype()) ||
-      index.entry_points.size() > kPersistentMaxEntryPoints) {
+      index.layout.vector_dtype != static_cast<u32>(config.resolved_vector_dtype())) {
     throw std::runtime_error("GPU navigation manifest does not match runtime metadata");
   }
+  const u32 graph_entry_capacity = VamanaNode::graph_entry_capacity();
+  if (graph_entry_capacity < config.R ||
+      index.layout.graph_entry_bytes <
+        vamana::hot_graph::kTaggedNeighborBaseOffset +
+          static_cast<u64>(graph_entry_capacity) *
+          vamana::hot_graph::kCompactPointerBytes) {
+    throw std::runtime_error(
+      "GPU hot graph cannot contain stable and provisional backlink slots");
+  }
+  const u32 score_chunk_capacity = persistent_score_chunk_capacity(
+    graph_entry_capacity, config.gpu_traversal_beam_width);
   const u64 max_merge_candidates =
     static_cast<u64>(config.gpu_traversal_beam_width) +
     static_cast<u64>(std::min(config.gpu_graph_prefetch_depth,
-                              kPersistentScoreChunk)) * config.R;
-  if (max_merge_candidates > kPersistentMaxMergeCandidates) {
+                              score_chunk_capacity)) * graph_entry_capacity;
+  if (score_chunk_capacity == 0 ||
+      max_merge_candidates > kPersistentMaxMergeCandidates) {
     throw std::invalid_argument("GPU navigation prefetch/degree exceeds parallel top-k capacity");
   }
 
-  anchor_table = load_anchor_table(config.resolved_index_prefix(), config.dim,
-                                   index.layout.num_shards, index);
-  dynamic_route_capacity = static_cast<u32>(index.shards.size()) *
-    kDynamicRouteSlotsPerShard;
-  dynamic_route_diff =
-    std::make_unique<DynamicRouteOverlayDiff>(
-      static_cast<u32>(index.shards.size()));
-  if (dynamic_route_diff->capacity() != dynamic_route_capacity) {
-    throw std::logic_error("GPU dynamic route capacity mismatch");
-  }
-  dynamic_route_snapshot.resize(dynamic_route_capacity);
-  dynamic_route_update_scratch.reserve(dynamic_route_capacity);
-  for (u32 anchor = 0; anchor < anchor_table.raw_pointers.size(); ++anchor) {
-    anchor_buckets_by_raw.emplace(anchor_table.raw_pointers[anchor], anchor);
-    anchor_graph_keys_host.push_back(
-      graph_record_key(anchor_table.raw_pointers[anchor]));
-  }
-  std::sort(anchor_graph_keys_host.begin(), anchor_graph_keys_host.end());
-  anchor_graph_keys_host.erase(
-    std::unique(anchor_graph_keys_host.begin(), anchor_graph_keys_host.end()),
-    anchor_graph_keys_host.end());
-  if (anchor_graph_keys_host.size() > std::numeric_limits<u32>::max()) {
-    throw std::runtime_error("GPU anchor route table exceeds uint32 capacity");
-  }
-  entry_handles = index.entry_points;
-  std::cerr << "[gpu-search] query routing=storage-canonical adaptive routes"
-            << "+static recall fallback"
-            << " static_fallback_entries=" << anchor_table.count()
-            << " adaptive_slots_per_shard=" << kDynamicRouteSlotsPerShard
-            << " seeds=" << config.gpu_entry_seed_count << '\n';
+  centroid_route_shard_capacity = static_cast<u32>(index.shards.size());
+  centroid_route_versions.assign(centroid_route_shard_capacity, 0);
+  centroid_route_snapshots.resize(centroid_route_shard_capacity);
+  std::cerr << "[gpu-search] query routing=versioned centroid routes"
+            << " centroid_shards=" << index.shards.size()
+            << " live_entries_per_shard=" << centroid_route_entry_capacity
+            << " start_shards=1\n";
   query_slots = config.gpu_query_slots;
   query_dispatch_capacity = memory_budget::next_power_of_two(query_slots * 2);
   result_capacity = std::max<u32>(config.k, config.gpu_final_rerank_width);
@@ -173,14 +99,12 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   code_bytes = index.layout.code_bytes;
   free_slots.resize(query_slots);
   for (u32 slot = 0; slot < query_slots; ++slot) free_slots[slot] = slot;
-  active_query_tickets = std::make_unique<std::atomic<u64>[]>(query_slots);
-  active_query_snapshots = std::make_unique<std::atomic<u64>[]>(query_slots);
-  for (u32 slot = 0; slot < query_slots; ++slot) {
-    active_query_tickets[slot].store(0, std::memory_order_relaxed);
-    active_query_snapshots[slot].store(0, std::memory_order_relaxed);
-  }
 
   node_record_bytes = static_cast<u32>(VamanaNode::size_until_vector_end());
+  node_record_stride = static_cast<u32>(align_up(
+    static_cast<u64>(node_record_bytes) + sizeof(u64), alignof(u64)));
+  dynamic_code_record_bytes =
+    VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES + code_bytes;
   const u64 engine_budget = static_cast<u64>(
     config.gpu_memory_limit_gb - config.gpu_memory_reserve_gb) << 30;
   size_t free_gpu_bytes = 0;
@@ -192,21 +116,16 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   const u64 usable_budget = std::min(engine_budget, physically_available);
   const auto budget = memory_budget::estimate(memory_budget::Request{
     .nodes = index.layout.num_nodes,
-    .max_delta_vectors = config.max_vectors,
     .usable_bytes = usable_budget,
-    .delta_budget_bytes = static_cast<u64>(config.delta_budget_mb) << 20,
     .dim = config.dim,
     .pq_subquantizers = pq_model.subquantizers,
     .code_bytes = code_bytes,
-    .vector_bytes = static_cast<u32>(VamanaNode::vector_bytes()),
     .query_slots = query_slots,
     .beam_width = config.gpu_traversal_beam_width,
     .graph_degree = config.R,
     .exact_width = exact_width,
-    .exact_record_bytes = node_record_bytes,
-    .anchor_count = anchor_table.count(),
+    .exact_record_bytes = node_record_stride,
     .shard_count = static_cast<u32>(index.shards.size()),
-    .entry_point_count = static_cast<u32>(entry_handles.size()),
   });
   if (!budget.fits) {
     throw std::runtime_error(
@@ -214,24 +133,16 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
       std::to_string(budget.code_bytes) + " fixed=" +
       std::to_string(budget.fixed_bytes));
   }
-  delta_capacity = budget.delta_capacity;
-  delta_table_capacity = budget.delta_table_capacity;
-  permanent_override_words = static_cast<u32>((index.layout.num_nodes + 31) / 32);
   visited_capacity = budget.visited_capacity;
-  const u64 invalidation_capacity = static_cast<u64>(
-    std::max(config.storage_owner_batch_max, config.gpu_query_slots)) * config.R;
-  if (invalidation_capacity > std::numeric_limits<u32>::max()) {
-    throw std::runtime_error("GPU navigation graph invalidation capacity exceeds uint32");
-  }
-  graph_invalidation_capacity = static_cast<u32>(std::max<u64>(1, invalidation_capacity));
   const u64 dynamic_code_scratch_bytes =
-    static_cast<u64>(query_slots) * kPersistentMaxMergeCandidates * code_bytes;
+    static_cast<u64>(query_slots) * kPersistentMaxMergeCandidates *
+      dynamic_code_record_bytes;
   const u64 dynamic_request_scratch_bytes =
     static_cast<u64>(query_slots) * kPersistentMaxMergeCandidates *
     (sizeof(u32) + 2 * sizeof(u64));
   const u64 navigation_candidate_bytes =
     static_cast<u64>(query_slots) * kPersistentMaxMergeCandidates *
-    (sizeof(u32) + sizeof(f32));
+    (sizeof(u64) + sizeof(f32));
   const u64 estimated_direct_queue_count =
     static_cast<u64>(config.gpu_rdma_qps) * index.shards.size();
   const u64 query_dispatch_bytes = 2 * sizeof(u64) +
@@ -244,21 +155,16 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     static_cast<u64>(query_slots) * index.shards.size() * sizeof(i32);
   const u64 graph_scratch_bytes = static_cast<u64>(query_slots) *
     kPersistentMaxPrefetch * kPersistentGraphReadBytes;
-  const u64 route_graph_record_bytes =
-    static_cast<u64>(anchor_graph_keys_host.size()) *
-    index.layout.graph_entry_bytes;
-  const u64 route_graph_metadata_bytes =
-    static_cast<u64>(anchor_graph_keys_host.size()) *
-    (sizeof(u64) + 2 * sizeof(u32));
-  const u64 dynamic_route_bytes =
-    static_cast<u64>(dynamic_route_capacity) *
-    sizeof(DeviceDynamicRouteSlot);
-  const u64 dynamic_route_code_bytes =
-    static_cast<u64>(dynamic_route_capacity) * index.layout.code_bytes;
-  const u64 anchor_route_bytes =
-    route_graph_record_bytes + route_graph_metadata_bytes;
-  route_graph_bytes = anchor_route_bytes + dynamic_route_bytes +
-    dynamic_route_code_bytes;
+  const u64 centroid_route_bytes =
+    static_cast<u64>(centroid_route_shard_capacity) *
+      sizeof(DeviceCentroidRouteShard) +
+    static_cast<u64>(centroid_route_shard_capacity) *
+      centroid_route_entry_capacity * sizeof(DeviceCentroidRouteEntry) +
+    sizeof(u64);
+  const u64 shard_centroid_bytes = static_cast<u64>(index.shards.size()) *
+    config.dim * sizeof(f32);
+  route_graph_bytes = centroid_route_bytes +
+    shard_centroid_bytes;
   const u64 additional_scratch_bytes =
     dynamic_code_scratch_bytes + dynamic_request_scratch_bytes +
     navigation_candidate_bytes + query_dispatch_bytes + direct_queue_bytes +
@@ -267,62 +173,29 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     throw std::runtime_error(
       "GPU navigation dynamic-code scratch exceeds the configured memory budget");
   }
-  const u64 available_resident_pq_bytes =
-    usable_budget - budget.explicit_bytes - additional_scratch_bytes;
-  const u64 requested_resident_pq_bytes =
-    static_cast<u64>(config.gpu_resident_pq_budget_mb) << 20;
-  const u64 resident_pq_budget_bytes = std::min(
-    requested_resident_pq_bytes, available_resident_pq_bytes);
-  resident_pq_capacity = memory_budget::choose_resident_pq_capacity(
-    resident_pq_budget_bytes, kDeltaHandleMask, code_bytes);
-  if (resident_pq_capacity < delta_capacity) {
-    throw std::runtime_error(
-      "GPU resident dynamic-PQ budget is too small for the bounded update tier; "
-      "increase --gpu-resident-pq-budget-mb or reduce --delta-budget-mb");
-  }
-  resident_pq_table_capacity = memory_budget::next_power_of_two(
-    static_cast<u64>(resident_pq_capacity) * 2);
-  resident_pq_bytes = memory_budget::resident_pq_footprint(
-    resident_pq_capacity, code_bytes);
-  explicit_gpu_bytes = budget.explicit_bytes + additional_scratch_bytes +
-    resident_pq_bytes;
+  explicit_gpu_bytes = budget.explicit_bytes + additional_scratch_bytes;
   engine.telemetry_.gpu_memory_explicit_bytes.store(
     explicit_gpu_bytes, std::memory_order_relaxed);
   engine.telemetry_.gpu_memory_base_pq_bytes.store(
     budget.code_bytes, std::memory_order_relaxed);
-  engine.telemetry_.gpu_memory_resident_pq_bytes.store(
-    resident_pq_bytes, std::memory_order_relaxed);
-  engine.telemetry_.resident_pq_capacity.store(
-    resident_pq_capacity, std::memory_order_relaxed);
   engine.telemetry_.gpu_memory_route_graph_bytes.store(
     route_graph_bytes, std::memory_order_relaxed);
-  engine.telemetry_.gpu_memory_delta_reserved_bytes.store(
-    budget.delta_bytes, std::memory_order_relaxed);
   const u64 base_code_region_bytes = budget.code_bytes;
   const u64 exact_bytes = budget.exact_bytes;
   std::cerr << "[gpu-search] navigation budget codes=" << budget.code_bytes
-            << " delta=" << budget.delta_bytes
-            << " delta_capacity=" << budget.delta_capacity
-            << " delta_codes=" << budget.delta_code_bytes
-            << " resident_pq=" << resident_pq_bytes
-            << " resident_pq_capacity=" << resident_pq_capacity
-            << " permanent_overrides=" << budget.permanent_override_bytes
             << " dynamic_code_scratch=" << dynamic_code_scratch_bytes
             << " dynamic_request_scratch=" << dynamic_request_scratch_bytes
             << " navigation_candidates=" << navigation_candidate_bytes
             << " direct_queue_scratch=" << direct_queue_bytes
             << " graph_scratch=" << graph_scratch_bytes
-            << " anchor_route=" << anchor_route_bytes
-            << " dynamic_route=" << dynamic_route_bytes
-            << " dynamic_route_codes=" << dynamic_route_code_bytes
+            << " centroid_route=" << centroid_route_bytes
+            << " shard_centroids=" << shard_centroid_bytes
             << " explicit=" << explicit_gpu_bytes
             << " limit=" << engine_budget << " bytes\n";
 
   const size_t code_region_bytes = static_cast<size_t>(base_code_region_bytes);
-  anchor_graph_region_offset = static_cast<size_t>(
-    align_up(code_region_bytes, 512));
   dynamic_code_region_offset = static_cast<size_t>(align_up(
-    anchor_graph_region_offset + route_graph_record_bytes, 256));
+    code_region_bytes, 256));
   exact_region_offset = static_cast<size_t>(align_up(
     dynamic_code_region_offset + dynamic_code_scratch_bytes, 256));
   graph_scratch_offset = static_cast<size_t>(align_up(
@@ -331,14 +204,23 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     align_up(graph_scratch_offset + graph_scratch_bytes, 256));
   const size_t control_snapshot_bytes =
     index.shards.size() * sizeof(format::StorageControlBlock);
+  storage_route_snapshot_stride = static_cast<size_t>(
+    format::storage_centroid_route_publication_bytes(
+      config.dim, format::CentroidScalarType::float32,
+      centroid_route_entry_capacity));
+  if (storage_route_snapshot_stride == 0) {
+    throw std::runtime_error("invalid centroid route snapshot dimensions");
+  }
+  if (index.shards.size() >
+      std::numeric_limits<size_t>::max() / storage_route_snapshot_stride) {
+    throw std::runtime_error("centroid route snapshot allocation overflows size_t");
+  }
   const size_t route_snapshot_offset = static_cast<size_t>(align_up(
-    control_snapshot_bytes, alignof(format::StorageRoutePublication)));
+    control_snapshot_bytes, 64));
   const size_t route_snapshot_bytes =
-    index.shards.size() * sizeof(format::StorageRoutePublication);
-  const size_t route_sequence_before_offset = static_cast<size_t>(align_up(
+    index.shards.size() * storage_route_snapshot_stride;
+  const size_t route_sequence_after_offset = static_cast<size_t>(align_up(
     route_snapshot_offset + route_snapshot_bytes, alignof(u64)));
-  const size_t route_sequence_after_offset = route_sequence_before_offset +
-    index.shards.size() * sizeof(u64);
   const size_t control_region_bytes = route_sequence_after_offset +
     index.shards.size() * sizeof(u64);
   const size_t remote_buffer_bytes = control_region_offset + control_region_bytes;
@@ -355,17 +237,13 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   throw std::runtime_error("GPU query engine requires DOCA GPUNetIO support");
 #endif
   d_pq_codes = d_remote_buffer;
-  d_anchor_graph_records = d_remote_buffer + anchor_graph_region_offset;
   d_dynamic_code_records = d_remote_buffer + dynamic_code_region_offset;
   d_exact_records = d_remote_buffer + exact_region_offset;
   d_graph_scratch = d_remote_buffer + graph_scratch_offset;
   d_control_snapshots = reinterpret_cast<format::StorageControlBlock*>(
     d_remote_buffer + control_region_offset);
-  d_storage_route_snapshots = reinterpret_cast<
-    format::StorageRoutePublication*>(
-      d_remote_buffer + control_region_offset + route_snapshot_offset);
-  d_storage_route_sequence_before = reinterpret_cast<u64*>(
-    d_remote_buffer + control_region_offset + route_sequence_before_offset);
+  d_storage_route_snapshots =
+    d_remote_buffer + control_region_offset + route_snapshot_offset;
   d_storage_route_sequence_after = reinterpret_cast<u64*>(
     d_remote_buffer + control_region_offset + route_sequence_after_offset);
 
@@ -374,18 +252,19 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     d_remote_buffer, remote_buffer_bytes);
   std::cerr << "[gpu-search] bootstrap=CPU-posted GPUDirect RDMA; "
                "queries=strict GPU-initiated GPUNetIO\n";
-  initialize_storage_reclaim_ack();
+  initialize_storage_route_descriptors();
   // Fail before accepting queries when storage nodes do not expose the
   // canonical fixed-route extension. A concurrent publication may produce a
   // transient empty result and will simply be retried by maintenance.
-  (void)read_storage_route_publications();
+  (void)read_storage_centroid_route_publications();
   stream_codes_to_gpu(*control_bootstrapper);
-  stream_anchor_graph_to_gpu(*control_bootstrapper);
 
   device_allocate(d_shards, index.shards.size(), "cudaMalloc(GPU navigation shards)");
   device_allocate(d_opq_matrix, pq_model.rotation.size(), "cudaMalloc(OPQ matrix)");
   device_allocate(d_pq_centroids, pq_model.centroids.size(), "cudaMalloc(PQ centroids)");
-  device_allocate(d_entry_points, entry_handles.size(), "cudaMalloc(GPU navigation entries)");
+  device_allocate(d_shard_centroids,
+                  static_cast<size_t>(index.shards.size()) * config.dim,
+                  "cudaMalloc(shard route centroids)");
   check_cuda(cudaMemcpy(d_shards, index.shards.data(),
                         index.shards.size() * sizeof(format::ShardRegion),
                         cudaMemcpyHostToDevice), "cudaMemcpy(GPU navigation shards)");
@@ -397,79 +276,11 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   check_cuda(cudaMemcpy(d_pq_centroids, pq_model.centroids.data(),
                         pq_model.centroids.size() * sizeof(f32),
                         cudaMemcpyHostToDevice), "cudaMemcpy(PQ centroids)");
-  check_cuda(cudaMemcpy(d_entry_points, entry_handles.data(),
-                        entry_handles.size() * sizeof(u32), cudaMemcpyHostToDevice),
-             "cudaMemcpy(GPU navigation entries)");
-  const u32 anchor_graph_count =
-    static_cast<u32>(anchor_graph_keys_host.size());
-  device_allocate(d_anchor_graph_keys, anchor_graph_count,
-                  "cudaMalloc(GPU anchor route keys)");
-  device_allocate(d_anchor_graph_states, anchor_graph_count,
-                  "cudaMalloc(GPU anchor route states)");
-  device_allocate(d_anchor_graph_readers, anchor_graph_count,
-                  "cudaMalloc(GPU anchor route readers)");
-  anchor_graph_ready_states_host.assign(anchor_graph_count,
-                                        kResidentRouteReady);
-  if (anchor_graph_count != 0) {
-    check_cuda(cudaMemcpy(d_anchor_graph_keys, anchor_graph_keys_host.data(),
-                          anchor_graph_keys_host.size() * sizeof(u64),
-                          cudaMemcpyHostToDevice),
-               "cudaMemcpy(GPU anchor route keys)");
-    check_cuda(cudaMemcpy(d_anchor_graph_states,
-                          anchor_graph_ready_states_host.data(),
-                          anchor_graph_ready_states_host.size() * sizeof(u32),
-                          cudaMemcpyHostToDevice),
-               "cudaMemcpy(GPU anchor route states)");
-    check_cuda(cudaMemset(d_anchor_graph_readers, 0,
-                          anchor_graph_keys_host.size() * sizeof(u32)),
-               "cudaMemset(GPU anchor route readers)");
-    check_cuda(cudaHostAlloc(
-                 reinterpret_cast<void**>(&anchor_graph_readers_host),
-                 anchor_graph_keys_host.size() * sizeof(u32),
-                 cudaHostAllocPortable),
-               "cudaHostAlloc(GPU anchor route reader snapshot)");
-    check_cuda(cudaHostAlloc(
-                 reinterpret_cast<void**>(&anchor_graph_validation_host),
-                 index.layout.graph_entry_bytes,
-                 cudaHostAllocPortable),
-               "cudaHostAlloc(GPU anchor route validation record)");
-  }
-  if (!anchor_table.vectors.empty()) {
-    std::vector<f32> transposed_anchors(anchor_table.vectors.size());
-    for (u32 anchor = 0; anchor < anchor_table.count(); ++anchor) {
-      for (u32 dimension = 0; dimension < anchor_table.dim; ++dimension) {
-        transposed_anchors[
-          static_cast<size_t>(dimension) * anchor_table.count() + anchor] =
-            anchor_table.vectors[
-              static_cast<size_t>(anchor) * anchor_table.dim + dimension];
-      }
-    }
-    device_allocate(d_anchor_vectors, anchor_table.vectors.size(),
-                    "cudaMalloc(GPU navigation anchors)");
-    check_cuda(cudaMemcpy(d_anchor_vectors, transposed_anchors.data(),
-                          transposed_anchors.size() * sizeof(f32), cudaMemcpyHostToDevice),
-               "cudaMemcpy(GPU navigation anchors)");
-    device_allocate(d_anchor_handles, anchor_table.handles.size(),
-                    "cudaMalloc(GPU navigation anchor handles)");
-    check_cuda(cudaMemcpy(d_anchor_handles, anchor_table.handles.data(),
-                          anchor_table.handles.size() * sizeof(u32), cudaMemcpyHostToDevice),
-               "cudaMemcpy(GPU navigation anchor handles)");
-    device_allocate(d_anchor_pq_codes,
-                    static_cast<size_t>(anchor_table.count()) * code_bytes,
-                    "cudaMalloc(GPU navigation anchor PQ codes)");
-    launch_gather_anchor_codes(nullptr, d_pq_codes, d_anchor_handles,
-                               d_anchor_pq_codes, anchor_table.count(), code_bytes,
-                               static_cast<u32>(index.layout.num_nodes));
-    check_cuda(cudaGetLastError(), "launch_gather_anchor_codes");
-    check_cuda(cudaStreamSynchronize(nullptr),
-               "cudaStreamSynchronize(GPU navigation anchor PQ codes)");
-    device_allocate(d_delta_bucket_heads, anchor_table.count(),
-                    "cudaMalloc(GPU navigation delta buckets)");
-    check_cuda(cudaMemset(d_delta_bucket_heads, 0xff,
-                          static_cast<size_t>(anchor_table.count()) * sizeof(u32)),
-               "cudaMemset(GPU navigation delta buckets)");
-  }
-
+  check_cuda(cudaMemset(
+               d_shard_centroids, 0,
+               static_cast<size_t>(index.shards.size()) * config.dim *
+                 sizeof(f32)),
+             "cudaMemset(shard route centroids)");
   query_input_stride = static_cast<size_t>(config.dim) * sizeof(f32);
   device_allocate(d_queries, static_cast<size_t>(query_slots) * config.dim,
                   "cudaMalloc(GPU decoded queries)");
@@ -578,33 +389,15 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                         cudaMemcpyHostToDevice),
              "cudaMemcpy(GPUNetIO owner queue views)");
 
-  delta_command_capacity = std::max({1u, config.storage_owner_batch_max,
-                                     config.gpu_query_slots});
-  mapped_host_allocate(graph_invalidation_keys_host, d_graph_invalidation_keys,
-                       graph_invalidation_capacity,
-                       "cudaHostAlloc(navigation graph invalidation staging)");
-  mapped_host_allocate(delta_supersede_updates_host, d_delta_supersede_updates,
-                       delta_command_capacity,
-                       "cudaHostAlloc(navigation delta supersede staging)");
-  mapped_host_allocate(delta_override_updates_host, d_delta_override_updates,
-                       delta_command_capacity,
-                       "cudaHostAlloc(navigation delta override staging)");
-  mapped_host_allocate(delta_durable_updates_host, d_delta_durable_updates,
-                       delta_command_capacity,
-                       "cudaHostAlloc(navigation delta durable staging)");
-  mapped_host_allocate(resident_pq_erase_updates_host,
-                       d_resident_pq_erase_updates,
-                       delta_command_capacity,
-                       "cudaHostAlloc(resident dynamic PQ erase staging)");
-  mapped_host_allocate(dynamic_route_updates_host,
-                       d_dynamic_route_updates,
-                       dynamic_route_capacity,
-                       "cudaHostAlloc(dynamic query route staging)");
-  mapped_host_allocate(dynamic_route_code_updates_host,
-                       d_dynamic_route_code_updates,
-                       static_cast<size_t>(dynamic_route_capacity) *
-                         index.layout.code_bytes,
-                       "cudaHostAlloc(dynamic query route code staging)");
+  mapped_host_allocate(centroid_route_updates_host,
+                       d_centroid_route_updates,
+                       centroid_route_shard_capacity,
+                       "cudaHostAlloc(centroid route metadata staging)");
+  mapped_host_allocate(centroid_route_centroid_updates_host,
+                       d_centroid_route_centroid_updates,
+                       static_cast<size_t>(centroid_route_shard_capacity) *
+                         config.dim,
+                       "cudaHostAlloc(centroid route vector staging)");
   const size_t result_elements = static_cast<size_t>(query_slots) * result_capacity;
   check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&result_ids_host),
                            result_elements * sizeof(u32),
@@ -621,81 +414,25 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                                       result_distances_host, 0),
              "cudaHostGetDevicePointer(GPU navigation result distances)");
 
-  device_allocate(d_delta_records, delta_capacity, "cudaMalloc(navigation delta records)");
-  device_allocate(d_delta_vectors,
-                  static_cast<size_t>(delta_capacity) * VamanaNode::vector_bytes(),
-                  "cudaMalloc(navigation delta vectors)");
-  if (budget.delta_code_bytes !=
-      static_cast<u64>(delta_capacity) * this->code_bytes) {
-    throw std::logic_error("GPU delta-code budget does not match the PQ code width");
-  }
-  device_allocate(d_delta_pq_codes,
-                  static_cast<size_t>(budget.delta_code_bytes),
-                  "cudaMalloc(PQ delta codes)");
-  mapped_host_allocate(delta_staging_slots_host, d_delta_staging_slots,
-                       delta_command_capacity,
-                       "cudaHostAlloc(navigation delta slot staging)");
-  mapped_host_allocate(delta_staging_records_host, d_delta_staging_records,
-                       delta_command_capacity,
-                       "cudaHostAlloc(navigation delta record staging)");
-  mapped_host_allocate(delta_staging_vectors_host, d_delta_staging_vectors,
-                       static_cast<size_t>(delta_command_capacity) *
-                         VamanaNode::vector_bytes(),
-                       "cudaHostAlloc(navigation delta vector staging)");
-  device_allocate(d_delta_encode_scratch,
-                  static_cast<size_t>(delta_command_capacity) * config.dim,
-                  "cudaMalloc(navigation delta encode scratch)");
-  device_allocate(d_delta_next, delta_capacity, "cudaMalloc(navigation delta links)");
-  device_allocate(d_delta_prev, delta_capacity,
-                  "cudaMalloc(navigation delta reverse links)");
-  device_allocate(d_delta_remote_positions, delta_capacity,
-                  "cudaMalloc(navigation delta remote positions)");
-  device_allocate(d_base_override_keys, delta_table_capacity,
-                  "cudaMalloc(navigation override keys)");
-  device_allocate(d_base_override_epochs, delta_table_capacity,
-                  "cudaMalloc(navigation override epochs)");
-  device_allocate(d_permanent_override_bits, permanent_override_words,
-                  "cudaMalloc(navigation permanent override bits)");
-  device_allocate(d_delta_remote_keys, delta_table_capacity,
-                  "cudaMalloc(navigation delta remote keys)");
-  device_allocate(d_delta_remote_slots, delta_table_capacity,
-                  "cudaMalloc(navigation delta remote slots)");
-  device_allocate(d_resident_pq_codes,
-                  static_cast<size_t>(resident_pq_capacity) * code_bytes,
-                  "cudaMalloc(resident dynamic PQ codes)");
-  device_allocate(d_resident_pq_keys, resident_pq_table_capacity,
-                  "cudaMalloc(resident dynamic PQ keys)");
-  device_allocate(d_resident_pq_slots, resident_pq_table_capacity,
-                  "cudaMalloc(resident dynamic PQ slots)");
-  device_allocate(d_resident_pq_positions, resident_pq_capacity,
-                  "cudaMalloc(resident dynamic PQ positions)");
-  check_cuda(cudaMemset(d_resident_pq_keys, 0,
-                        static_cast<size_t>(resident_pq_table_capacity) *
-                          sizeof(u64)),
-             "cudaMemset(resident dynamic PQ keys)");
-  check_cuda(cudaMemset(d_resident_pq_slots, 0xff,
-                        static_cast<size_t>(resident_pq_table_capacity) *
-                          sizeof(u32)),
-             "cudaMemset(resident dynamic PQ slots)");
-  check_cuda(cudaMemset(d_resident_pq_positions, 0xff,
-                        static_cast<size_t>(resident_pq_capacity) * sizeof(u32)),
-             "cudaMemset(resident dynamic PQ positions)");
-  device_allocate(d_delta_count, 1, "cudaMalloc(navigation delta count)");
-  device_allocate(d_dynamic_route_slots, dynamic_route_capacity,
-                  "cudaMalloc(dynamic query route slots)");
-  device_allocate(d_dynamic_route_pq_codes,
-                  static_cast<size_t>(dynamic_route_capacity) * code_bytes,
-                  "cudaMalloc(dynamic query route PQ codes)");
-  check_cuda(cudaMemset(d_dynamic_route_slots, 0,
-                        static_cast<size_t>(dynamic_route_capacity) *
-                          sizeof(DeviceDynamicRouteSlot)),
-             "cudaMemset(dynamic query route slots)");
-  check_cuda(cudaMemset(d_dynamic_route_pq_codes, 0,
-                        static_cast<size_t>(dynamic_route_capacity) *
-                          code_bytes),
-             "cudaMemset(dynamic query route PQ codes)");
-  clear_delta_device_state();
-
+  device_allocate(d_centroid_route_shards, centroid_route_shard_capacity,
+                  "cudaMalloc(centroid route shard headers)");
+  device_allocate(d_centroid_route_entries,
+                  static_cast<size_t>(centroid_route_shard_capacity) *
+                    centroid_route_entry_capacity,
+                  "cudaMalloc(centroid route entries)");
+  device_allocate(d_centroid_route_epoch, 1,
+                  "cudaMalloc(centroid route publication epoch)");
+  check_cuda(cudaMemset(d_centroid_route_shards, 0,
+                        static_cast<size_t>(centroid_route_shard_capacity) *
+                          sizeof(DeviceCentroidRouteShard)),
+             "cudaMemset(centroid route shard headers)");
+  check_cuda(cudaMemset(d_centroid_route_entries, 0,
+                        static_cast<size_t>(centroid_route_shard_capacity) *
+                          centroid_route_entry_capacity *
+                          sizeof(DeviceCentroidRouteEntry)),
+             "cudaMemset(centroid route entries)");
+  check_cuda(cudaMemset(d_centroid_route_epoch, 0, sizeof(u64)),
+             "cudaMemset(centroid route publication epoch)");
   check_cuda(cudaHostAlloc(reinterpret_cast<void**>(&stop_host), sizeof(u32),
                            cudaHostAllocPortable),
              "cudaHostAlloc(GPU navigation stop staging)");
@@ -728,13 +465,10 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                        "cudaHostAlloc(GPU control kernel readiness)");
   check_cuda(cudaStreamCreateWithFlags(&kernel_stream, cudaStreamNonBlocking),
              "cudaStreamCreate(GPU navigation kernel)");
-  check_cuda(cudaStreamCreateWithFlags(&delta_stream, cudaStreamNonBlocking),
-             "cudaStreamCreate(GPU navigation delta)");
+  check_cuda(cudaStreamCreateWithFlags(&route_stream, cudaStreamNonBlocking),
+             "cudaStreamCreate(GPU centroid route control)");
   check_cuda(cudaStreamCreateWithFlags(&rdma_stream, cudaStreamNonBlocking),
              "cudaStreamCreate(GPU navigation RDMA owners)");
-  check_cuda(cudaStreamCreateWithFlags(&route_refresh_stream,
-                                       cudaStreamNonBlocking),
-             "cudaStreamCreate(GPU anchor route refresh)");
   cudaDeviceProp properties{};
   check_cuda(cudaGetDeviceProperties(&properties, static_cast<int>(config.gpu_device)),
              "cudaGetDeviceProperties(GPU navigation)");
@@ -774,31 +508,33 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
       .mask = query_dispatch_capacity - 1,
     },
     .completions = completions.device_view(),
-    .delta_submissions = delta_submissions.device_view(),
-    .delta_completions = delta_completions.device_view(),
+    .route_submissions = route_submissions.device_view(),
+    .route_completions = route_completions.device_view(),
     .shards = d_shards,
     .num_shards = static_cast<u32>(index.shards.size()),
     .pq_codes = d_pq_codes,
     .opq_matrix = d_opq_matrix,
     .pq_centroids = d_pq_centroids,
-    .entry_points = d_entry_points,
-    .entry_point_count = static_cast<u32>(entry_handles.size()),
     .num_nodes = static_cast<u32>(index.layout.num_nodes),
-    .medoid_ordinal = index.layout.medoid_ordinal,
     .dim = config.dim,
     .pq_subquantizers = pq_model.subquantizers,
     .pq_subvector_dim = pq_model.subvector_dim(),
     .pq_code_bytes = pq_model.code_bytes(),
+    .dynamic_code_record_bytes = dynamic_code_record_bytes,
     .graph_entry_bytes = index.layout.graph_entry_bytes,
     .graph_degree = index.layout.graph_degree,
+    .graph_entry_capacity = graph_entry_capacity,
     .graph_shard_bits = index.layout.graph_shard_bits,
     .node_meta_offset = 0,
     .node_record_bytes = node_record_bytes,
+    .node_record_stride = node_record_stride,
+    .node_vector_offset = static_cast<u32>(VamanaNode::offset_vector()),
+    .node_incarnation_offset =
+      static_cast<u32>(VamanaNode::offset_slot_incarnation()),
     .vector_bytes = static_cast<u32>(VamanaNode::vector_bytes()),
     .vector_dtype = static_cast<u32>(config.resolved_vector_dtype()),
     .traversal_beam_width = config.gpu_traversal_beam_width,
     .final_rerank_width = config.gpu_final_rerank_width,
-    .entry_seed_count = config.gpu_entry_seed_count,
     .exact_width = exact_width,
     .max_expansions = config.gpu_max_expansions,
     .prefetch_depth = config.gpu_graph_prefetch_depth,
@@ -819,53 +555,14 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .direct_dump = direct_view.dump,
     .direct_disabled = direct_disabled_device,
     .direct_error = direct_error_device,
-    .delta_records = d_delta_records,
-    .delta_vectors = d_delta_vectors,
-    .delta_pq_codes = d_delta_pq_codes,
-    .delta_staging_slots = d_delta_staging_slots,
-    .delta_staging_records = d_delta_staging_records,
-    .delta_staging_vectors = d_delta_staging_vectors,
-    .delta_encode_scratch = d_delta_encode_scratch,
-    .delta_next = d_delta_next,
-    .delta_prev = d_delta_prev,
-    .delta_remote_positions = d_delta_remote_positions,
-    .delta_bucket_heads = d_delta_bucket_heads,
-    .delta_count = d_delta_count,
-    .delta_capacity = delta_capacity,
-    .base_override_keys = d_base_override_keys,
-    .base_override_epochs = d_base_override_epochs,
-    .base_override_capacity = delta_table_capacity,
-    .permanent_override_bits = d_permanent_override_bits,
-    .permanent_override_words = permanent_override_words,
-    .delta_remote_keys = d_delta_remote_keys,
-    .delta_remote_slots = d_delta_remote_slots,
-    .delta_remote_capacity = delta_table_capacity,
-    .resident_pq_codes = d_resident_pq_codes,
-    .resident_pq_keys = d_resident_pq_keys,
-    .resident_pq_slots = d_resident_pq_slots,
-    .resident_pq_positions = d_resident_pq_positions,
-    .resident_pq_capacity = resident_pq_capacity,
-    .resident_pq_table_capacity = resident_pq_table_capacity,
-    .delta_supersede_updates = d_delta_supersede_updates,
-    .delta_override_updates = d_delta_override_updates,
-    .delta_durable_updates = d_delta_durable_updates,
-    .resident_pq_erase_updates = d_resident_pq_erase_updates,
-    .dynamic_route_updates = d_dynamic_route_updates,
-    .dynamic_route_code_updates = d_dynamic_route_code_updates,
-    .dynamic_route_slots = d_dynamic_route_slots,
-    .dynamic_route_pq_codes = d_dynamic_route_pq_codes,
-    .dynamic_route_capacity = dynamic_route_capacity,
-    .graph_invalidation_keys = d_graph_invalidation_keys,
-    .anchor_vectors = d_anchor_vectors,
-    .anchor_handles = d_anchor_handles,
-    .anchor_pq_codes = d_anchor_pq_codes,
-    .anchor_graph_keys = d_anchor_graph_keys,
-    .anchor_graph_records = d_anchor_graph_records,
-    .anchor_graph_states = d_anchor_graph_states,
-    .anchor_graph_readers = d_anchor_graph_readers,
-    .anchor_graph_count = anchor_graph_count,
-    .anchor_count = anchor_table.count(),
-    .delta_anchor_probes = config.gpu_delta_anchor_probes,
+    .centroid_route_updates = d_centroid_route_updates,
+    .centroid_route_centroid_updates = d_centroid_route_centroid_updates,
+    .centroid_route_shards = d_centroid_route_shards,
+    .centroid_route_entries = d_centroid_route_entries,
+    .shard_centroids = d_shard_centroids,
+    .centroid_route_epoch = d_centroid_route_epoch,
+    .centroid_route_shard_capacity = centroid_route_shard_capacity,
+    .centroid_route_entry_capacity = centroid_route_entry_capacity,
     .stop = stop_device,
     .graph_scratch = d_graph_scratch,
     .decoded_queries = d_queries,
@@ -883,6 +580,13 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .result_distances = d_result_distances,
   };
   start_persistent_kernel();
+  // Query admission has no immutable offline fallback. Install the first
+  // complete versioned centroid-entry snapshot before any descriptor can reach
+  // a query CTA.
+  if (synchronize_storage_routes() != StorageRouteSyncResult::changed) {
+    throw std::runtime_error(
+      "initial versioned centroid route snapshot was not stable");
+  }
   admission_thread = std::thread([this] { admission_loop(); });
   completion_thread = std::thread([this] { completion_loop(); });
   maintenance_thread = std::thread([this] { maintenance_loop(); });

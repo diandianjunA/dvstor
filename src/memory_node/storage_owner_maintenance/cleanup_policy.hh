@@ -4,13 +4,130 @@
 
 #include "common/types.hh"
 #include "remote_pointer.hh"
+#include "vamana/vamana_node.hh"
 
 namespace memory_node_storage_owner_maintenance_detail {
 
-// A stale stitch repair owns only the backlinks attempted by that stitch.
-// The mutation that made the stitch stale has its own ordinary cleanup intent
+struct Stage2StableBacklinkTarget {
+  RemotePtr target;
+  bool had_stage1_bridge{};
+};
+
+struct Stage2BacklinkPlan {
+  RemotePtr promotion_target;
+  bool promotion_consumes_stage1_bridge{};
+  vec<Stage2StableBacklinkTarget> ordinary_stable_targets;
+  vec<RemotePtr> obsolete_stage1_bridges;
+};
+
+// Final Stage2 parents must be durable members of the already-published graph,
+// not merely readable records.  In particular, excluding an unaccounted
+// destination prevents a wave of concurrent Stage2 insertions from using only
+// one another as parents and forming a disconnected dependency cycle.
+inline bool stage2_parent_is_stable(const u64 header, const bool deleted) {
+  return !deleted &&
+    VamanaNode::stable_graph_mutation_allowed(header) &&
+    (header & VamanaNode::HEADER_CENTROID_ACCOUNTED) != 0;
+}
+
+// Produces the three Stage2 backlink barriers without retaining any long-lived
+// protected edge. Prefer promoting a Stage1 parent that survived final prune;
+// otherwise establish the mandatory stable bridge at the first final parent
+// while an existing Stage1 bridge remains query-visible. Input order is
+// preserved, making the choice deterministic for an identical final beam.
+inline Stage2BacklinkPlan plan_stage2_backlink_reconciliation(
+    span<const RemotePtr> stage1_bridges,
+    span<const RemotePtr> final_targets,
+    RemotePtr acknowledged_certificate = {}) {
+  Stage2BacklinkPlan plan;
+  hashset_t<RemotePtr> stage1_set;
+  hashset_t<RemotePtr> final_set;
+  stage1_set.reserve(stage1_bridges.size());
+  final_set.reserve(final_targets.size());
+  for (const RemotePtr target : stage1_bridges) {
+    if (!target.is_null()) stage1_set.insert(target);
+  }
+
+  vec<RemotePtr> unique_final;
+  unique_final.reserve(final_targets.size());
+  for (const RemotePtr target : final_targets) {
+    if (!target.is_null() && final_set.insert(target).second) {
+      unique_final.push_back(target);
+    }
+  }
+  // A previously ACKed stable certificate is the strongest retry anchor.
+  // Otherwise consume a surviving Stage1 protected edge before considering a
+  // newly discovered final parent.  This both handles an empty final set and
+  // prevents small batches of fresh nodes from depending only on one another.
+  if (!acknowledged_certificate.is_null()) {
+    plan.promotion_target = acknowledged_certificate;
+    plan.promotion_consumes_stage1_bridge =
+      stage1_set.contains(acknowledged_certificate);
+  } else {
+    for (const RemotePtr target : unique_final) {
+      if (stage1_set.contains(target)) {
+        plan.promotion_target = target;
+        plan.promotion_consumes_stage1_bridge = true;
+        break;
+      }
+    }
+    if (plan.promotion_target.is_null() && !stage1_bridges.empty()) {
+      for (const RemotePtr target : stage1_bridges) {
+        if (target.is_null()) continue;
+        plan.promotion_target = target;
+        plan.promotion_consumes_stage1_bridge = true;
+        break;
+      }
+    }
+    if (plan.promotion_target.is_null() && !unique_final.empty()) {
+      plan.promotion_target = unique_final.front();
+    }
+  }
+
+  plan.ordinary_stable_targets.reserve(
+    unique_final.empty() ? 0 : unique_final.size() - 1);
+  for (const RemotePtr target : unique_final) {
+    if (target == plan.promotion_target) continue;
+    plan.ordinary_stable_targets.push_back(Stage2StableBacklinkTarget{
+      .target = target,
+      .had_stage1_bridge = stage1_set.contains(target),
+    });
+  }
+
+  hashset_t<RemotePtr> seen_stage1;
+  seen_stage1.reserve(stage1_set.size());
+  plan.obsolete_stage1_bridges.reserve(stage1_set.size());
+  for (const RemotePtr target : stage1_bridges) {
+    if (target.is_null() || !seen_stage1.insert(target).second ||
+        final_set.contains(target) || target == plan.promotion_target) {
+      continue;
+    }
+    plan.obsolete_stage1_bridges.push_back(target);
+  }
+  return plan;
+}
+
+inline bool cleanup_deleted_candidate_matches(
+    node_t expected_id, u32 expected_generation,
+    node_t observed_id, u32 observed_generation,
+    bool observed_deleted) {
+  return observed_deleted && observed_id == expected_id &&
+    observed_generation == expected_generation;
+}
+
+inline bool cleanup_reverse_target_matches(
+    node_t expected_id, u32 expected_generation,
+    node_t observed_id, u32 observed_generation,
+    bool observed_deleted) {
+  return !observed_deleted && observed_id == expected_id &&
+    observed_generation == expected_generation;
+}
+
+// A stale Stage2 finalization repair owns only the backlinks attempted by
+// that finalization.
+// The mutation that made the Stage2 finalization stale has its own ordinary cleanup intent
 // and removes the tombstone's preserved adjacency after the earlier repair
-// sequence advances. Keeping the two sets separate also preserves the schema-15
+// sequence advances. Keeping the two sets separate also preserves the bounded
 // R-operations-per-item peer RPC bound.
 inline vec<RemotePtr> select_cleanup_neighbors(
     bool repair_only,
@@ -37,6 +154,66 @@ inline vec<RemotePtr> select_cleanup_neighbors(
   return selected;
 }
 
+// A protected child can be reparented only through one of its own durable
+// outgoing neighbors. Besides preserving graph locality, this makes the new
+// protected parent discoverable by the child's later tombstone cleanup; an
+// unrelated fallback parent would otherwise become untracked protected
+// state. The order is deterministic and dataset-independent: prefer the
+// child's physical shard, then the encoded handle order.
+inline vec<RemotePtr> order_protected_reparent_candidates(
+    RemotePtr child,
+    RemotePtr retiring_parent,
+    span<const RemotePtr> child_stable_neighbors) {
+  vec<RemotePtr> candidates;
+  candidates.reserve(child_stable_neighbors.size());
+  for (const RemotePtr candidate : child_stable_neighbors) {
+    if (candidate.is_null() || candidate == child ||
+        candidate == retiring_parent ||
+        std::find(candidates.begin(), candidates.end(), candidate) !=
+          candidates.end()) {
+      continue;
+    }
+    candidates.push_back(candidate);
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [child](RemotePtr lhs, RemotePtr rhs) {
+              const bool lhs_local =
+                lhs.memory_node() == child.memory_node();
+              const bool rhs_local =
+                rhs.memory_node() == child.memory_node();
+              if (lhs_local != rhs_local) return lhs_local;
+              return lhs.raw_address < rhs.raw_address;
+            });
+  return candidates;
+}
+
+inline bool protected_reparent_target_has_capacity(
+    RemotePtr child,
+    span<const RemotePtr> provisional,
+    u32 protected_limit) {
+  if (child.is_null() || protected_limit == 0) return false;
+  if (std::find(provisional.begin(), provisional.end(), child) !=
+      provisional.end()) {
+    return true;
+  }
+  // A stable edge to the same child can be moved, not duplicated, into a free
+  // protected slot. No unrelated stable/protected edge is ever displaced.
+  return provisional.size() < protected_limit;
+}
+
+// Once the authority CAS has moved a generation from source to destination,
+// a successor captures only destination as its cleanup predecessor. If the
+// old Stage2 then becomes stale before retiring source, no later cleanup owns
+// source. The stale continuation must therefore finish that retirement
+// itself; before the placement CAS, the successor cleanup still owns source.
+inline bool stale_stage2_owns_source_retirement(
+    bool placement_committed,
+    RemotePtr source,
+    RemotePtr destination) {
+  return placement_committed && !source.is_null() &&
+    !destination.is_null() && source != destination;
+}
+
 // Stage2 starts from the globally pruned outgoing set, then preserves only
 // neighbors that appeared after stage1 published its temporary adjacency.
 // Those later neighbors are acknowledged concurrent reverse-edge additions;
@@ -47,17 +224,21 @@ inline vec<RemotePtr> merge_stage2_rebase_candidates(
     span<const RemotePtr> observed_neighbors) {
   vec<RemotePtr> rebased;
   rebased.reserve(globally_pruned.size() + observed_neighbors.size());
+  hashset_t<RemotePtr> stage1_set;
+  hashset_t<RemotePtr> rebased_set;
+  stage1_set.reserve(stage1_neighbors.size());
+  rebased_set.reserve(globally_pruned.size() + observed_neighbors.size());
+  for (const RemotePtr neighbor : stage1_neighbors) {
+    if (!neighbor.is_null()) stage1_set.insert(neighbor);
+  }
   for (const RemotePtr neighbor : globally_pruned) {
-    if (!neighbor.is_null() &&
-        std::find(rebased.begin(), rebased.end(), neighbor) == rebased.end()) {
+    if (!neighbor.is_null() && rebased_set.insert(neighbor).second) {
       rebased.push_back(neighbor);
     }
   }
   for (const RemotePtr neighbor : observed_neighbors) {
-    if (neighbor.is_null() ||
-        std::find(stage1_neighbors.begin(), stage1_neighbors.end(), neighbor) !=
-          stage1_neighbors.end() ||
-        std::find(rebased.begin(), rebased.end(), neighbor) != rebased.end()) {
+    if (neighbor.is_null() || stage1_set.contains(neighbor) ||
+        !rebased_set.insert(neighbor).second) {
       continue;
     }
     rebased.push_back(neighbor);

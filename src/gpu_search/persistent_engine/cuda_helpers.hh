@@ -12,8 +12,6 @@
 namespace gpu_search::persistent_engine_detail {
 
 inline constexpr u32 kDirectBatchQueueCapacity = 64;
-inline constexpr u32 kResidentRouteReady = 2;
-
 inline void check_cuda(cudaError_t status, const char* operation) {
   if (status != cudaSuccess) {
     throw std::runtime_error(std::string(operation) + ": " +
@@ -69,7 +67,7 @@ void mapped_host_allocate(T*& host_pointer, T*& device_pointer,
              operation);
   check_cuda(cudaHostGetDevicePointer(reinterpret_cast<void**>(&device_pointer),
                                       host_pointer, 0),
-             "cudaHostGetDevicePointer(delta staging)");
+             "cudaHostGetDevicePointer(mapped staging)");
 }
 
 }  // namespace gpu_search::persistent_engine_detail
