@@ -246,7 +246,12 @@ bool MemoryNode::activate_local_cleanup_items(
         item.authority_shard != authority_shard ||
         (action != protocol::CleanupActivateAction::activate &&
          action != protocol::CleanupActivateAction::release) ||
-        !valid_local_storage_node_pointer(target)) {
+        (action == protocol::CleanupActivateAction::activate &&
+         !valid_local_storage_node_pointer(target)) ||
+        (action == protocol::CleanupActivateAction::release &&
+         !authority::receipt_release_pointer_addressable(
+           target, storage_id_, num_storage_nodes_, mn_memory_bytes_,
+           false))) {
       success = false;
       continue;
     }
@@ -699,13 +704,28 @@ bool MemoryNode::apply_local_dynamic_node_control_items(
 
     if (node.memory_node() != storage_id_ ||
         node.byte_offset() < gpu_dynamic_node_base_ ||
-        !valid_local_storage_node_pointer(node) ||
+        !authority::local_storage_pointer_addressable(
+          node, storage_id_, num_storage_nodes_, mn_memory_bytes_) ||
         storage_owner_maintenance_completion_ring_ == nullptr) {
       structurally_valid = false;
       continue;
     }
     NodeSnapshot snapshot;
-    if (!read_node_snapshot(node, snapshot) || snapshot.id != item.id ||
+    if (!read_node_snapshot(node, snapshot)) {
+      // Snapshot failure is not itself proof of a stale incarnation: a live
+      // node can remain locked across the bounded snapshot attempts.  ACK
+      // stale only after the identity-only reader proves that the tagged
+      // incarnation is gone; otherwise leave `failed` so the caller retries
+      // instead of leaking a still-live migration destination.
+      if (inspect_identity(node, item.id, item.generation) ==
+          IdentityObservation::stale) {
+        output.node_raw = node.raw_address;
+        output.status = static_cast<u32>(
+          protocol::DynamicNodeControlStatus::stale);
+      }
+      continue;
+    }
+    if (snapshot.id != item.id ||
         snapshot.generation != item.generation) {
       // The desired postcondition already holds for this logical record. A
       // delayed retirement must not tombstone or enqueue its address after it

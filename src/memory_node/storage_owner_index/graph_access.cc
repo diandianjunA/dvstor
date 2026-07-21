@@ -552,17 +552,19 @@ size_t MemoryNode::read_node_identity_headers_batched_into(
   const size_t identity_stride = align_up(kIdentityBytes);
   // A compact header permits far more records to fit in scratch than a full
   // vector snapshot, but scratch capacity is not a transport credit. Keep the
-  // wave inside the configured/tested request window; post_peer_read_async()
-  // still stripes those requests over all data QPs.
+  // wave inside the configured/tested request window; the linked-read batch
+  // still stripes bounded chains over the available data QPs.
   const size_t max_batch = std::max<size_t>(1, std::min<size_t>(
     thread->scratch_stride / identity_stride,
     storage_owner_snapshot_batch_size(config, thread)));
   thread_local vec<PendingIdentityRead> pending;
+  thread_local vec<PeerReadRequest> read_requests;
   pending.reserve(max_batch);
 
   for (size_t begin = 0; begin < rptrs.size(); begin += max_batch) {
     const size_t end = std::min(rptrs.size(), begin + max_batch);
     pending.clear();
+    read_requests.clear();
     size_t remote_slot = 0;
     for (size_t index = begin; index < end; ++index) {
       const RemotePtr pointer = rptrs[index];
@@ -575,16 +577,22 @@ size_t MemoryNode::read_node_identity_headers_batched_into(
       lib_assert(scratch_offset + kIdentityBytes <= thread->scratch_stride,
                  "storage-owner scratch cannot hold identity wave");
       byte_t* buffer = thread->coroutine_scratch(scratch_offset);
-      post_peer_read_async(*thread, pointer.memory_node(),
-                           pointer.byte_offset(), buffer, kIdentityBytes);
+      read_requests.push_back(PeerReadRequest{
+        .shard_id = pointer.memory_node(),
+        .remote_offset = pointer.byte_offset(),
+        .destination = buffer,
+        .bytes = kIdentityBytes,
+      });
       pending.push_back({pointer, buffer});
     }
+    post_peer_reads_async(*thread, span<const PeerReadRequest>{read_requests});
     while (!thread->is_ready(thread->running_coroutine)) {
       poll_peer_send_cq();
       std::this_thread::yield();
     }
 
     size_t valid_count = 0;
+    read_requests.clear();
     for (PendingIdentityRead& read : pending) {
       read.before = *reinterpret_cast<const u64*>(read.buffer);
       read.slot_incarnation = *reinterpret_cast<const u32*>(
@@ -599,11 +607,15 @@ size_t MemoryNode::read_node_identity_headers_batched_into(
         pending[valid_count] = read;
       }
       PendingIdentityRead& accepted = pending[valid_count++];
-      post_peer_read_async(*thread, accepted.pointer.memory_node(),
-                           accepted.pointer.byte_offset(), accepted.buffer,
-                           VamanaNode::HEADER_SIZE);
+      read_requests.push_back(PeerReadRequest{
+        .shard_id = accepted.pointer.memory_node(),
+        .remote_offset = accepted.pointer.byte_offset(),
+        .destination = accepted.buffer,
+        .bytes = VamanaNode::HEADER_SIZE,
+      });
     }
     pending.resize(valid_count);
+    post_peer_reads_async(*thread, span<const PeerReadRequest>{read_requests});
     while (!thread->is_ready(thread->running_coroutine)) {
       poll_peer_send_cq();
       std::this_thread::yield();
@@ -836,6 +848,7 @@ size_t MemoryNode::read_graph_adjacencies_batched_into(
   constexpr u32 kMaxReadAttempts = 3;
   thread_local vec<PendingRead> pending;
   thread_local vec<PendingRead> retry;
+  thread_local vec<PeerReadRequest> read_requests;
   pending.reserve(max_batch);
   retry.reserve(max_batch);
   for (size_t begin = 0; begin < rptrs.size(); begin += max_batch) {
@@ -869,12 +882,16 @@ size_t MemoryNode::read_graph_adjacencies_batched_into(
 
     for (u32 attempt = 0;
          attempt < kMaxReadAttempts && !pending.empty(); ++attempt) {
+      read_requests.clear();
       for (const PendingRead& read : pending) {
-        post_peer_read_async(
-          *thread, read.rptr.memory_node(),
-          VamanaNode::hot_graph_entry_offset(read.rptr), read.buffer,
-          VamanaNode::hot_graph_entry_size());
+        read_requests.push_back(PeerReadRequest{
+          .shard_id = read.rptr.memory_node(),
+          .remote_offset = VamanaNode::hot_graph_entry_offset(read.rptr),
+          .destination = read.buffer,
+          .bytes = VamanaNode::hot_graph_entry_size(),
+        });
       }
+      post_peer_reads_async(*thread, span<const PeerReadRequest>{read_requests});
       while (!thread->is_ready(thread->running_coroutine)) {
         poll_peer_send_cq();
         std::this_thread::yield();
@@ -1016,12 +1033,14 @@ size_t MemoryNode::read_node_snapshots_batched_into(
   const size_t snapshot_size = snapshot_buffer_bytes();
   const size_t snapshot_stride = aligned_snapshot_bytes();
   const size_t max_batch = storage_owner_snapshot_batch_size(config, thread);
+  thread_local vec<PeerReadRequest> read_requests;
 
   for (size_t begin = 0; begin < rptrs.size(); begin += max_batch) {
     const size_t end = std::min(rptrs.size(), begin + max_batch);
     thread_local vec<PendingRead> pending;
     pending.reserve(end - begin);
     pending.clear();
+    read_requests.clear();
     u32 remote_slot = 0;
 
     for (size_t idx = begin; idx < end; ++idx) {
@@ -1052,12 +1071,17 @@ size_t MemoryNode::read_node_snapshots_batched_into(
                  " remote_slot=" + std::to_string(remote_slot) +
                  " chunk=" + std::to_string(end - begin));
       byte_t* buffer = thread->coroutine_scratch(scratch_offset);
-      post_peer_read_async(*thread, rptr.memory_node(), rptr.byte_offset(), buffer,
-                           VamanaNode::size_until_vector_end());
+      read_requests.push_back(PeerReadRequest{
+        .shard_id = rptr.memory_node(),
+        .remote_offset = rptr.byte_offset(),
+        .destination = buffer,
+        .bytes = VamanaNode::size_until_vector_end(),
+      });
       pending.push_back(PendingRead{rptr, buffer});
       ++remote_slot;
     }
 
+    post_peer_reads_async(*thread, span<const PeerReadRequest>{read_requests});
     while (!thread->is_ready(thread->running_coroutine)) {
       poll_peer_send_cq();
       std::this_thread::yield();
@@ -1078,11 +1102,16 @@ size_t MemoryNode::read_node_snapshots_batched_into(
     // Reuse each registered snapshot buffer for a second header read after
     // copying its body out. Equality with the first header closes the RDMA
     // overwrite window without allocating another registered scratch plane.
+    read_requests.clear();
     for (const PendingRead& read : valid_pending) {
-      post_peer_read_async(*thread, read.rptr.memory_node(),
-                           read.rptr.byte_offset(), read.buffer,
-                           VamanaNode::HEADER_SIZE);
+      read_requests.push_back(PeerReadRequest{
+        .shard_id = read.rptr.memory_node(),
+        .remote_offset = read.rptr.byte_offset(),
+        .destination = read.buffer,
+        .bytes = VamanaNode::HEADER_SIZE,
+      });
     }
+    post_peer_reads_async(*thread, span<const PeerReadRequest>{read_requests});
     while (!thread->is_ready(thread->running_coroutine)) {
       poll_peer_send_cq();
       std::this_thread::yield();
@@ -1234,10 +1263,12 @@ MemoryNode::score_stable_node_vectors_batched(
   const size_t snapshot_size = snapshot_buffer_bytes();
   const size_t snapshot_stride = aligned_snapshot_bytes();
   const size_t max_batch = storage_owner_snapshot_batch_size(config, thread);
+  thread_local vec<PeerReadRequest> read_requests;
   pending.reserve(max_batch);
   for (size_t begin = 0; begin < rptrs.size(); begin += max_batch) {
     const size_t end = std::min(rptrs.size(), begin + max_batch);
     pending.clear();
+    read_requests.clear();
     u32 remote_slot = 0;
     for (size_t index = begin; index < end; ++index) {
       const RemotePtr rptr = rptrs[index];
@@ -1252,19 +1283,24 @@ MemoryNode::score_stable_node_vectors_batched(
                  "storage-owner coroutine scratch stride is too small for "
                  "stage2 vector scoring");
       byte_t* buffer = thread->coroutine_scratch(scratch_offset);
-      post_peer_read_async(
-        *thread, rptr.memory_node(), rptr.byte_offset(), buffer,
-        VamanaNode::size_until_vector_end());
+      read_requests.push_back(PeerReadRequest{
+        .shard_id = rptr.memory_node(),
+        .remote_offset = rptr.byte_offset(),
+        .destination = buffer,
+        .bytes = VamanaNode::size_until_vector_end(),
+      });
       pending.push_back(PendingVectorRead{rptr, buffer});
       ++remote_slot;
     }
 
+    post_peer_reads_async(*thread, span<const PeerReadRequest>{read_requests});
     while (!thread->is_ready(thread->running_coroutine)) {
       poll_peer_send_cq();
       std::this_thread::yield();
     }
 
     size_t valid_count = 0;
+    read_requests.clear();
     for (PendingVectorRead& read : pending) {
       read.before = *reinterpret_cast<const u64*>(read.buffer);
       read.slot_incarnation = *reinterpret_cast<const u32*>(
@@ -1278,12 +1314,15 @@ MemoryNode::score_stable_node_vectors_batched(
         pending[valid_count] = read;
       }
       PendingVectorRead& accepted = pending[valid_count++];
-      post_peer_read_async(
-        *thread, accepted.rptr.memory_node(),
-        accepted.rptr.byte_offset(), accepted.buffer,
-        VamanaNode::HEADER_SIZE);
+      read_requests.push_back(PeerReadRequest{
+        .shard_id = accepted.rptr.memory_node(),
+        .remote_offset = accepted.rptr.byte_offset(),
+        .destination = accepted.buffer,
+        .bytes = VamanaNode::HEADER_SIZE,
+      });
     }
     pending.resize(valid_count);
+    post_peer_reads_async(*thread, span<const PeerReadRequest>{read_requests});
     while (!thread->is_ready(thread->running_coroutine)) {
       poll_peer_send_cq();
       std::this_thread::yield();

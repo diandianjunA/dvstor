@@ -49,6 +49,42 @@ int main() {
   assert(memory_node_storage_owner_index_detail::
            storage_pointer_addressable(valid, kShardCount, kShardBytes));
 
+  // Receipt release is an identity/control operation, not a graph access.
+  // An arbitrary old incarnation at an addressable slot remains a valid
+  // release target after Stage2 has retired or reused that slot.  The helper
+  // must still reject a wrong physical home, an out-of-range address, and a
+  // null target unless the Stage1-abort protocol explicitly permits it.
+  assert(memory_node_storage_owner_index_detail::
+           receipt_release_pointer_addressable(
+             valid, 1, kShardCount, kShardBytes, false));
+  assert(!memory_node_storage_owner_index_detail::
+           receipt_release_pointer_addressable(
+             valid, 0, kShardCount, kShardBytes, false));
+  assert(memory_node_storage_owner_index_detail::
+           receipt_release_pointer_addressable(
+             RemotePtr{}, 1, kShardCount, kShardBytes, true));
+  assert(!memory_node_storage_owner_index_detail::
+           receipt_release_pointer_addressable(
+             RemotePtr{}, 1, kShardCount, kShardBytes, false));
+
+  // Model the production race directly: Stage2/cleanup sends a delayed
+  // control request for incarnation 7 after the allocator has already reused
+  // the same physical slot as incarnation 8.  Both handles are structurally
+  // addressable; the control handler must inspect the slot identity and ACK
+  // the old one as stale instead of rejecting the RPC before that check.
+  const RemotePtr recycled{1, kDynamicBase, 8};
+  assert(recycled.byte_offset() == valid.byte_offset());
+  assert(recycled.incarnation() != valid.incarnation());
+  assert(memory_node_storage_owner_index_detail::
+           local_storage_pointer_addressable(
+             valid, 1, kShardCount, kShardBytes));
+  assert(memory_node_storage_owner_index_detail::
+           local_storage_pointer_addressable(
+             recycled, 1, kShardCount, kShardBytes));
+  assert(!memory_node_storage_owner_index_detail::
+           local_storage_pointer_addressable(
+             valid, 0, kShardCount, kShardBytes));
+
   const u64 records_to_cap =
     (kShardBytes - kDynamicBase + dynamic_record_bytes - 1) /
     dynamic_record_bytes;
@@ -64,6 +100,12 @@ int main() {
   assert(!memory_node_storage_owner_index_detail::
            storage_pointer_addressable(
              out_of_bounds, kShardCount, kShardBytes));
+  assert(!memory_node_storage_owner_index_detail::
+           receipt_release_pointer_addressable(
+             out_of_bounds, 1, kShardCount, kShardBytes, false));
+  assert(!memory_node_storage_owner_index_detail::
+           local_storage_pointer_addressable(
+             out_of_bounds, 1, kShardCount, kShardBytes));
 
   VamanaNode::disable_hot_graph();
   return 0;

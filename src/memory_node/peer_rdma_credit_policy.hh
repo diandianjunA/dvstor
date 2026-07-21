@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <limits>
 
@@ -13,6 +14,74 @@ struct PeerRdmaReadCreditPlan {
   std::uint32_t global{};
   std::uint32_t shared_cq_read_budget{};
 };
+
+// A linked RC READ chain consumes one requester-read-atomic/WQE credit for
+// every WR even though only its tail produces a successful CQE.  Keep one
+// chain inside every independently enforced credit domain.  Larger waves are
+// split into several chains; posting a completed chain before reserving the
+// next one guarantees progress even for a single-QP deployment.
+constexpr std::uint32_t peer_rdma_read_batch_group_limit(
+    const PeerRdmaReadCreditPlan& plan) {
+  return std::min({plan.per_qp, plan.per_peer, plan.global});
+}
+
+constexpr std::uint32_t peer_rdma_read_batch_completion_count(
+    const std::uint32_t read_count,
+    const PeerRdmaReadCreditPlan& plan) {
+  const std::uint32_t group_limit =
+    peer_rdma_read_batch_group_limit(plan);
+  return read_count == 0 || group_limit == 0
+    ? 0
+    : 1 + (read_count - 1) / group_limit;
+}
+
+inline bool try_reserve_bounded_counter(
+    std::atomic<std::uint32_t>& counter,
+    const std::uint32_t limit,
+    const std::uint32_t count) {
+  if (count == 0 || count > limit) return false;
+  std::uint32_t current = counter.load(std::memory_order_acquire);
+  while (current <= limit - count) {
+    if (counter.compare_exchange_weak(
+          current, current + count,
+          std::memory_order_acq_rel, std::memory_order_acquire)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Reserve the three credit domains as one logical operation. This is not a
+// multi-word CAS, so a failed later domain rolls back every earlier one before
+// returning. No caller may wait while retaining credits for an unposted WR;
+// consequently concurrent producers cannot each hold a partial chain and
+// deadlock on the remaining global credits.
+inline bool try_reserve_peer_rdma_read_group(
+    std::atomic<std::uint32_t>& peer_outstanding,
+    std::atomic<std::uint32_t>& qp_outstanding,
+    std::atomic<std::uint32_t>& global_outstanding,
+    const PeerRdmaReadCreditPlan& plan,
+    const std::uint32_t count) {
+  if (count == 0 ||
+      count > peer_rdma_read_batch_group_limit(plan)) {
+    return false;
+  }
+  if (!try_reserve_bounded_counter(
+        peer_outstanding, plan.per_peer, count)) {
+    return false;
+  }
+  if (!try_reserve_bounded_counter(qp_outstanding, plan.per_qp, count)) {
+    peer_outstanding.fetch_sub(count, std::memory_order_acq_rel);
+    return false;
+  }
+  if (!try_reserve_bounded_counter(
+        global_outstanding, plan.global, count)) {
+    qp_outstanding.fetch_sub(count, std::memory_order_acq_rel);
+    peer_outstanding.fetch_sub(count, std::memory_order_acq_rel);
+    return false;
+  }
+  return true;
+}
 
 // QP0 carries peer RPC traffic whenever there is more than one QP.  A
 // single-QP deployment necessarily shares QP0 between control and data.
@@ -93,5 +162,9 @@ static_assert(select_peer_data_qp(4, 0) == 1);
 static_assert(select_peer_data_qp(4, 1) == 2);
 static_assert(select_peer_data_qp(4, 2) == 3);
 static_assert(select_peer_data_qp(4, 3) == 1);
+static_assert(peer_rdma_read_batch_group_limit(
+                PeerRdmaReadCreditPlan{3, 8, 16, 32, 32}) == 8);
+static_assert(peer_rdma_read_batch_completion_count(
+                17, PeerRdmaReadCreditPlan{1, 8, 8, 8, 8}) == 3);
 
 }  // namespace memory_node_detail

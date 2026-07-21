@@ -557,8 +557,9 @@ bool MemoryNode::arm_local_stage1_items(
           (!declared_target.is_null() &&
            !valid_local_storage_node_pointer(declared_target)))) ||
         (action == Stage1ArmAction::release &&
-         !declared_target.is_null() &&
-         !valid_local_storage_node_pointer(declared_target))) {
+         !authority::receipt_release_pointer_addressable(
+           declared_target, storage_id_, num_storage_nodes_,
+           mn_memory_bytes_, true))) {
       structurally_valid = false;
       continue;
     }

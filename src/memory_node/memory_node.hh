@@ -302,6 +302,13 @@ private:
   using StorageOwnerResponseReady = memory_node_detail::StorageOwnerResponseReady;
   using StorageOwnerThread = memory_node_detail::StorageOwnerThread;
   using FreshnessEntry = memory_node_detail::FreshnessEntry;
+  struct PeerReadRequest {
+    u32 shard_id{};
+    u64 remote_offset{};
+    byte_t* destination{};
+    size_t bytes{};
+    size_t local_offset{};
+  };
   using AuthorityOperationToken =
     memory_node_storage_owner_index_detail::AuthorityOperationToken;
   using AuthorityMutationLease =
@@ -382,6 +389,10 @@ private:
   bool try_acquire_counter(std::atomic<u32>& counter, u32 limit);
   bool try_acquire_peer_rdma_read_credit(u32 shard_id, u32 qp_idx);
   void acquire_peer_rdma_read_credit(u32 shard_id, u32 qp_idx);
+  bool try_acquire_peer_rdma_read_group(u32 shard_id, u32 qp_idx,
+                                        u32 read_count);
+  void acquire_peer_rdma_read_group(u32 shard_id, u32 qp_idx,
+                                    u32 read_count);
   u64 next_peer_sync_wr_id();
   u64 next_peer_async_wr_id();
   void register_peer_pending_send_locked(u64 wr_id, PeerPendingSend pending);
@@ -395,6 +406,8 @@ private:
                             byte_t* dst,
                             size_t bytes,
                             size_t local_offset = 0);
+  void post_peer_reads_async(StorageOwnerThread& thread,
+                             span<const PeerReadRequest> requests);
   void remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, size_t bytes, size_t scratch_offset);
   void remote_write_bytes(u32 shard_id, u64 remote_offset, const void* src, size_t bytes, size_t scratch_offset);
   u64 remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 expected, u64 desired, size_t scratch_offset);

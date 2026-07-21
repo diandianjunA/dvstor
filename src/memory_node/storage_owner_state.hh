@@ -146,6 +146,9 @@ struct PeerPendingSend {
   bool rdma_read_credit{};
   bool release_rpc_slot{};
   u32 rpc_slot_id{};
+  // A linked RC READ chain produces one successful CQE at its signaled tail.
+  // Credit counters still account for every WR in that chain.
+  u32 rdma_read_count{1};
 };
 
 struct StorageOwnerInsertTask {

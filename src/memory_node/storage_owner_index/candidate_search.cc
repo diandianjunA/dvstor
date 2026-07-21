@@ -365,6 +365,7 @@ void MemoryNode::continue_stage2_search_candidates_batched(
       u32 slot_incarnation{};
     };
     thread_local vec<PendingVectorRead> pending;
+    thread_local vec<PeerReadRequest> read_requests;
     const size_t snapshot_size = snapshot_buffer_bytes();
     const size_t snapshot_stride = aligned_snapshot_bytes();
     const size_t max_batch =
@@ -374,6 +375,7 @@ void MemoryNode::continue_stage2_search_candidates_batched(
          begin += max_batch) {
       const size_t end = std::min(score_unique.size(), begin + max_batch);
       pending.clear();
+      read_requests.clear();
       u32 remote_slot = 0;
       for (size_t group = begin; group < end; ++group) {
         const RemotePtr pointer = score_unique[group];
@@ -398,17 +400,22 @@ void MemoryNode::continue_stage2_search_candidates_batched(
         lib_assert(scratch_offset + snapshot_size <= thread->scratch_stride,
                    "storage-owner scratch cannot hold Stage2 score wave");
         byte_t* buffer = thread->coroutine_scratch(scratch_offset);
-        post_peer_read_async(
-          *thread, pointer.memory_node(), pointer.byte_offset(), buffer,
-          VamanaNode::size_until_vector_end());
+        read_requests.push_back(PeerReadRequest{
+          .shard_id = pointer.memory_node(),
+          .remote_offset = pointer.byte_offset(),
+          .destination = buffer,
+          .bytes = VamanaNode::size_until_vector_end(),
+        });
         pending.push_back({group, pointer, buffer});
       }
+      post_peer_reads_async(*thread, span<const PeerReadRequest>{read_requests});
       while (!thread->is_ready(thread->running_coroutine)) {
         poll_peer_send_cq();
         std::this_thread::yield();
       }
 
       size_t valid_count = 0;
+      read_requests.clear();
       for (PendingVectorRead& read : pending) {
         read.before = *reinterpret_cast<const u64*>(read.buffer);
         read.slot_incarnation = *reinterpret_cast<const u32*>(
@@ -422,12 +429,15 @@ void MemoryNode::continue_stage2_search_candidates_batched(
           pending[valid_count] = read;
         }
         PendingVectorRead& accepted = pending[valid_count++];
-        post_peer_read_async(
-          *thread, accepted.pointer.memory_node(),
-          accepted.pointer.byte_offset(), accepted.buffer,
-          VamanaNode::HEADER_SIZE);
+        read_requests.push_back(PeerReadRequest{
+          .shard_id = accepted.pointer.memory_node(),
+          .remote_offset = accepted.pointer.byte_offset(),
+          .destination = accepted.buffer,
+          .bytes = VamanaNode::HEADER_SIZE,
+        });
       }
       pending.resize(valid_count);
+      post_peer_reads_async(*thread, span<const PeerReadRequest>{read_requests});
       while (!thread->is_ready(thread->running_coroutine)) {
         poll_peer_send_cq();
         std::this_thread::yield();

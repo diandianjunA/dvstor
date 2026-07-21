@@ -41,4 +41,37 @@ inline bool storage_pointer_addressable(RemotePtr pointer,
     VamanaNode::hot_graph_entry_size() <= shard_bytes - hot_offset;
 }
 
+// Validate the immutable part of a storage handle at a local control-plane
+// trust boundary.  This intentionally says nothing about the slot's *current*
+// incarnation: idempotent control operations can legitimately arrive after
+// the named incarnation was retired and the slot was reused.  Callers that
+// may mutate or dereference the logical record must perform a separate
+// identity snapshot and act only when that exact incarnation still matches.
+inline bool local_storage_pointer_addressable(RemotePtr pointer,
+                                              u32 owning_shard,
+                                              u32 shard_count,
+                                              u64 shard_bytes,
+                                              bool allow_null = false) {
+  if (pointer.is_null()) return allow_null;
+  return pointer.memory_node() == owning_shard &&
+    storage_pointer_addressable(pointer, shard_count, shard_bytes);
+}
+
+// A receipt release names the physical identity that was admitted earlier,
+// but it never dereferences or mutates that node.  By the time the authority
+// sends the ordered release marker, Stage2/cleanup may already have migrated,
+// retired, or even recycled the original slot.  Requiring the pointer's
+// incarnation to still be live would therefore turn a successful commit into
+// an unreleasable receipt and make the authority retry forever.  Keep the
+// wire trust boundary (encoding, owning shard, and exported-MR bounds) while
+// deliberately avoiding any current-slot-incarnation check.
+inline bool receipt_release_pointer_addressable(RemotePtr pointer,
+                                                u32 owning_shard,
+                                                u32 shard_count,
+                                                u64 shard_bytes,
+                                                bool allow_null) {
+  return local_storage_pointer_addressable(
+    pointer, owning_shard, shard_count, shard_bytes, allow_null);
+}
+
 }  // namespace memory_node_storage_owner_index_detail
