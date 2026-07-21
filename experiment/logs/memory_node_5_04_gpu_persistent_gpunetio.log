@@ -24,11 +24,11 @@ num_cores: 112
 physical cores per socket: 28
 hyperthreading enabled
 local process CPU partition: rank 4/5 logical_cpus=22
-pairing: 5652 -- 2973
+pairing: 6057 -- 3300
 [STATUS]: loaded index metadata from /data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32_schema16 (layout=plain, vector_data_type=uint8)
 [STATUS]: storage-owner stage2 candidate width L=128 per shard
 allocation size: 25769803776
-allocated ALIGNED MEM (no hugepage) at 137927065600064 with buffer size 25769803776
+allocated ALIGNED MEM (no hugepage) at 130057410445376 with buffer size 25769803776
 [STATUS]: loading index (19261201856 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32_schema16_node5_of5.dat
 [STATUS]: loaded GPU PQ codes (621329088 Bytes) at remote offset 19261205952
 [STATUS]: storage-owner idmap loaded entries=20000000 format=owner_sharded_v2_bound immutable_base=true dynamic_shards=256 dynamic_reserved=65536
@@ -36,110 +36,111 @@ allocated ALIGNED MEM (no hugepage) at 137927065600064 with buffer size 25769803
 [STATUS]: register memory and distribute access token
 [STATUS]: connect QPs of compute threads
 [STATUS]: reserving 64 GPU/bootstrap QPs per compute node
-pairing: 5657 -- 2978
-pairing: 5662 -- 2983
-pairing: 5667 -- 2988
-pairing: 5672 -- 2993
-pairing: 5677 -- 2998
-pairing: 5682 -- 3003
-pairing: 5687 -- 3008
-pairing: 5692 -- 3013
-pairing: 5697 -- 3018
-pairing: 5702 -- 3023
-pairing: 5707 -- 3028
-pairing: 5712 -- 3033
-pairing: 5717 -- 3038
-pairing: 5722 -- 3043
-pairing: 5727 -- 3048
-pairing: 5732 -- 3053
-pairing: 5737 -- 3058
-pairing: 5742 -- 3063
-pairing: 5747 -- 3068
-pairing: 5752 -- 3073
-pairing: 5757 -- 3078
-pairing: 5762 -- 3083
-pairing: 5767 -- 3088
-pairing: 5772 -- 3093
-pairing: 5777 -- 3098
-pairing: 5782 -- 3103
-pairing: 5787 -- 3108
-pairing: 5792 -- 3113
-pairing: 5797 -- 3118
-pairing: 5802 -- 3123
-pairing: 5807 -- 3128
-pairing: 5812 -- 3133
-pairing: 5817 -- 3264
-pairing: 5942 -- 3265
-pairing: 5943 -- 3266
-pairing: 5944 -- 3267
-pairing: 5945 -- 3268
-pairing: 5946 -- 3269
-pairing: 5947 -- 3270
-pairing: 5948 -- 3271
-pairing: 5949 -- 3272
-pairing: 5950 -- 3273
-pairing: 5951 -- 3274
-pairing: 5952 -- 3275
-pairing: 5953 -- 3276
-pairing: 5954 -- 3277
-pairing: 5955 -- 3278
-pairing: 5956 -- 3279
-pairing: 5957 -- 3280
-pairing: 5958 -- 3281
-pairing: 5959 -- 3282
-pairing: 5960 -- 3283
-pairing: 5961 -- 3284
-pairing: 5962 -- 3285
-pairing: 5963 -- 3286
-pairing: 5964 -- 3287
-pairing: 5965 -- 3288
-pairing: 5966 -- 3289
-pairing: 5967 -- 3290
-pairing: 5968 -- 3291
-pairing: 5969 -- 3292
-pairing: 5970 -- 3293
-pairing: 5971 -- 3294
-pairing: 5972 -- 3295
+pairing: 6062 -- 3305
+pairing: 6068 -- 3310
+pairing: 6072 -- 3315
+pairing: 6077 -- 3320
+pairing: 6082 -- 3325
+pairing: 6087 -- 3330
+pairing: 6092 -- 3335
+pairing: 6097 -- 3340
+pairing: 6102 -- 3345
+pairing: 6107 -- 3350
+pairing: 6112 -- 3355
+pairing: 6117 -- 3360
+pairing: 6122 -- 3365
+pairing: 6127 -- 3370
+pairing: 6132 -- 3375
+pairing: 6137 -- 3380
+pairing: 6142 -- 3385
+pairing: 6147 -- 3390
+pairing: 6152 -- 3395
+pairing: 6157 -- 3400
+pairing: 6162 -- 3405
+pairing: 6167 -- 3410
+pairing: 6172 -- 3415
+pairing: 6177 -- 3420
+pairing: 6182 -- 3425
+pairing: 6187 -- 3430
+pairing: 6192 -- 3435
+pairing: 6197 -- 3440
+pairing: 6202 -- 3445
+pairing: 6207 -- 3450
+pairing: 6212 -- 3455
+pairing: 6217 -- 3460
+pairing: 6222 -- 3589
+pairing: 6347 -- 3590
+pairing: 6348 -- 3591
+pairing: 6349 -- 3592
+pairing: 6350 -- 3593
+pairing: 6351 -- 3594
+pairing: 6352 -- 3595
+pairing: 6353 -- 3596
+pairing: 6354 -- 3597
+pairing: 6355 -- 3598
+pairing: 6356 -- 3599
+pairing: 6357 -- 3600
+pairing: 6358 -- 3601
+pairing: 6359 -- 3602
+pairing: 6360 -- 3603
+pairing: 6361 -- 3604
+pairing: 6362 -- 3605
+pairing: 6363 -- 3606
+pairing: 6364 -- 3607
+pairing: 6365 -- 3608
+pairing: 6366 -- 3609
+pairing: 6367 -- 3610
+pairing: 6368 -- 3611
+pairing: 6369 -- 3612
+pairing: 6370 -- 3613
+pairing: 6371 -- 3614
+pairing: 6372 -- 3615
+pairing: 6373 -- 3616
+pairing: 6374 -- 3617
+pairing: 6375 -- 3618
+pairing: 6376 -- 3619
+pairing: 6377 -- 3620
 [STATUS]: waiting for compute-node startup barrier
 1 device(s) found
 Selected device: ibp86s0
 Selected port state: 4, lid: 8
-pairing: 5977 -- 5982
-pairing: 5984 -- 5991
-pairing: 5993 -- 5998
-pairing: 6000 -- 6006
-pairing: 6010 -- 6013
-pairing: 6016 -- 6019
-pairing: 6022 -- 6025
-pairing: 6028 -- 6029
-pairing: 6031 -- 6033
-pairing: 6035 -- 6037
-pairing: 6039 -- 6041
-pairing: 6043 -- 6045
-pairing: 6046 -- 6044
-pairing: 6048 -- 6047
-pairing: 6050 -- 6049
-pairing: 6052 -- 6051
+pairing: 6382 -- 6387
+pairing: 6389 -- 6395
+pairing: 6397 -- 6404
+pairing: 6405 -- 6414
+pairing: 6417 -- 6421
+pairing: 6423 -- 6426
+pairing: 6429 -- 6430
+pairing: 6433 -- 6434
+pairing: 6436 -- 6437
+pairing: 6440 -- 6441
+pairing: 6444 -- 6445
+pairing: 6447 -- 6450
+pairing: 6451 -- 6449
+pairing: 6452 -- 6453
+pairing: 6455 -- 6454
+pairing: 6457 -- 6456
 [STATUS]: storage-owner peer RDMA QPs per peer: 4
 [STATUS]: storage-owner peer QP0 reserved for RPC; data RDMA uses QP1..3
-allocated ALIGNED MEM (no hugepage) at 137926065258560 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 137926025412672 with buffer size 39839040
+allocated ALIGNED MEM (no hugepage) at 130056410103872 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 130056370257984 with buffer size 39839040
 [STATUS]: storage-owner peer RPC receive slots per peer: 64 (requested=64)
 [STATUS]: storage-owner peer RPC concurrent sends per peer: 16
 [STATUS]: storage-owner peer RPC send credits: Stage1/graph are split at depth >= 2; responses use a dedicated sync buffer
 [STATUS]: storage-owner peer async response capacity: 32768
-allocated ALIGNED MEM (no hugepage) at 137926247219264 with buffer size 488448
-allocated ALIGNED MEM (no hugepage) at 97067688505472 with buffer size 8192
-allocated ALIGNED MEM (no hugepage) at 97067688514944 with buffer size 8192
-allocated ALIGNED MEM (no hugepage) at 97067688524416 with buffer size 8192
-allocated ALIGNED MEM (no hugepage) at 97067688533888 with buffer size 8192
+allocated ALIGNED MEM (no hugepage) at 130056599851072 with buffer size 488448
+allocated ALIGNED MEM (no hugepage) at 109709783384192 with buffer size 53248
+allocated ALIGNED MEM (no hugepage) at 109709783438720 with buffer size 53248
+allocated ALIGNED MEM (no hugepage) at 109709783493248 with buffer size 53248
+allocated ALIGNED MEM (no hugepage) at 109709783547776 with buffer size 53248
 [STATUS]: storage-owner peer reverse-update workers: 4
 [STATUS]: storage-owner peer Stage1 workers: 7 (dedicated physical-home CPU partition)
 [STATUS]: storage-owner physical control workers: cleanup=2 placement=1 (separate blocking domains)
 [STATUS]: storage-owner Stage1 artifact capacity: 67968 (64-way, per shard=1062) cleanup replay per shard=2048 active migration receipts=131072
 [STATUS]: storage-owner peer reverse-update tuning: queue_depth=65536 coalesce_max=256
-allocated ALIGNED MEM (no hugepage) at 97067701172928 with buffer size 13120
-allocated ALIGNED MEM (no hugepage) at 97067701187200 with buffer size 13120
+allocated ALIGNED MEM (no hugepage) at 109709796231872 with buffer size 54080
+allocated ALIGNED MEM (no hugepage) at 109709796287104 with buffer size 54080
+[STATUS]: storage-owner peer scratch: snapshot_slot=192 graph_slot=832 batch=64 bytes_per_worker=54080
 [STATUS]: storage-owner maintenance workers: 2 (configured=8, work_conserving=true)
 [STATUS]: storage-owner stage2 reverse outbox descriptors: 128 aggregates=128 wire_max_ops=3072 (shared per-peer work-conserving aggregation)
 [STATUS]: storage-owner maintenance tuning: protocol=centroid-home-two-stage compaction_batch_target=32 backlog_limit=65536 admission_window=128 physical_completion_capacity=65536
@@ -150,5 +151,12 @@ allocated ALIGNED MEM (no hugepage) at 97067701187200 with buffer size 13120
 [STATUS]: storage-owner foreground pipeline: coordinators=12 cpu_lanes=3 (assigned_cpus=22, rpc_parallelism=16)
 [STATUS]: storage-owner CPU plan: foreground_cpu=3 foreground_coordinators=12 maintenance=2 peer_stage1=7 peer_reverse=4 peer_cleanup=2 peer_placement=1 peer_progress=2 foreground_progress=1
 [STATUS]: storage-owner insert runtime enabled on shard 4
-[STATUS]: storage-owner maintenance observation: enqueued=255 stage2_enqueued=255 cleanup_enqueued=0 stage2_tasks_done=226 stage2_finalized_live=226 cleanup_processed=0 stale=0 stage2_completion_ratio=0.886275 live_stage2_completion_ratio=0.886275 avg_stage2_delay_ms=225.207734 p99_stage2_delay_upper_ms=512.000000 p99_stage2_delay_over_30s=false stage2_delay_histogram=0,0,0,2,0,2,4,43,97,78,0,0,0,0,0,0,0,0 max_stage2_delay_ms=417.773989 compaction_batch_target=32 compaction_max_delay_ms=10 stage2_rate_per_sec=45.064466 stage1_search_budget_exhausted=170 stage2_search_budget_exhausted=2 stage2_continuations=255 stage2_remote_frontier_items=50358 avg_stage2_remote_frontier=197.482353 stage2_remote_expansions=2496 avg_stage2_remote_expansions=9.788235 stage2_scored_candidates=130292 avg_stage2_scored_candidates=510.949020 stage2_graph_read_waves=1313 avg_stage2_expansions_per_graph_wave=1.900990 stage2_graph_unique_reads=2496 stage2_vector_read_waves=1355 avg_stage2_scores_per_vector_wave=96.156458 stage2_vector_unique_reads=130236 stage2_migrations=7 home_match_rate=0.969027 stage2_final_edges=14016 stage2_cross_edges_stage1_home=1208 stage2_cross_edges_final_home=1084 cross_edge_reduction_ratio=0.102649 failed=0 rpc_timeouts=0 reverse_aggregate_batches=0 reverse_aggregate_logical_requests=0 reverse_aggregate_ops=0 avg_reverse_aggregate_logicals=0.000000 avg_reverse_aggregate_ops=0.000000 max_backlog=33 admission_window=128 completion_outstanding=29 pressure_yields=1909 stage2_batches=42 avg_stage2_batch_size=6.071429 peer_stage1_enqueued=88 peer_stage1_processed=88 peer_stage1_items=382 avg_peer_stage1_items=4.340909 peer_stage1_rate_per_sec=76.170912 peer_stage1_max_queue=12 peer_reverse_enqueued=31 peer_reverse_processed=30 peer_reverse_remaining=1 peer_reverse_items_enqueued=2177 peer_reverse_items_processed=1917 peer_reverse_rate_per_sec=382.250364 peer_reverse_failed=0 peer_reverse_max_queue=1 reclaim_pending=0 reclaim_reused=7 dynamic_high_watermark=19882819216 stage2_remaining=0 cleanup_remaining=0 active_contexts=2 repair_remaining=0 remaining=29
-Send request failed: status=12 (transport retry counter exceeded), opcode=0, vendor_err=129, wr_id=18446744065121215492
+[STATUS]: storage-owner maintenance observation: enqueued=162 stage2_enqueued=162 cleanup_enqueued=0 stage2_tasks_done=103 stage2_finalized_live=103 cleanup_processed=0 stale=0 stage2_completion_ratio=0.635802 live_stage2_completion_ratio=0.635802 avg_stage2_delay_ms=365.671078 p99_stage2_delay_upper_ms=1000.000000 p99_stage2_delay_over_30s=false stage2_delay_histogram=1,0,0,0,0,1,6,16,45,0,34,0,0,0,0,0,0,0 max_stage2_delay_ms=811.091812 compaction_batch_target=32 compaction_max_delay_ms=10 stage2_rate_per_sec=20.526288 stage1_search_budget_exhausted=107 stage2_search_budget_exhausted=1 stage2_continuations=162 stage2_remote_frontier_items=31473 avg_stage2_remote_frontier=194.277778 stage2_remote_expansions=2014 avg_stage2_remote_expansions=12.432099 stage2_scored_candidates=108687 avg_stage2_scored_candidates=670.907407 stage2_graph_read_waves=752 avg_stage2_expansions_per_graph_wave=2.678191 stage2_graph_unique_reads=2014 stage2_vector_read_waves=781 avg_stage2_scores_per_vector_wave=139.163892 stage2_vector_unique_reads=108643 stage2_migrations=4 home_match_rate=0.961165 stage2_final_edges=6443 stage2_cross_edges_stage1_home=632 stage2_cross_edges_final_home=569 cross_edge_reduction_ratio=0.099684 failed=0 rpc_timeouts=0 reverse_aggregate_batches=0 reverse_aggregate_logical_requests=0 reverse_aggregate_ops=0 avg_reverse_aggregate_logicals=0.000000 avg_reverse_aggregate_ops=0.000000 max_backlog=41 admission_window=128 completion_outstanding=66 pressure_yields=1267 stage2_batches=29 avg_stage2_batch_size=5.586207 peer_stage1_enqueued=67 peer_stage1_processed=67 peer_stage1_items=212 avg_peer_stage1_items=3.164179 peer_stage1_rate_per_sec=42.248283 peer_stage1_max_queue=11 peer_reverse_enqueued=14 peer_reverse_processed=14 peer_reverse_remaining=0 peer_reverse_items_enqueued=947 peer_reverse_items_processed=947 peer_reverse_rate_per_sec=188.722282 peer_reverse_failed=0 peer_reverse_max_queue=1 reclaim_pending=2 reclaim_reused=2 dynamic_high_watermark=19882713136 stage2_remaining=0 cleanup_remaining=0 active_contexts=13 repair_remaining=0 remaining=59
+[STATUS]: storage-owner maintenance observation: enqueued=315 stage2_enqueued=315 cleanup_enqueued=0 stage2_tasks_done=244 stage2_finalized_live=244 cleanup_processed=0 stale=0 stage2_completion_ratio=0.774603 live_stage2_completion_ratio=0.774603 avg_stage2_delay_ms=494.050421 p99_stage2_delay_upper_ms=2000.000000 p99_stage2_delay_over_30s=false stage2_delay_histogram=1,0,0,0,0,2,13,21,48,46,91,22,0,0,0,0,0,0 max_stage2_delay_ms=1027.878153 compaction_batch_target=32 compaction_max_delay_ms=10 stage2_rate_per_sec=24.356204 stage1_search_budget_exhausted=215 stage2_search_budget_exhausted=1 stage2_continuations=315 stage2_remote_frontier_items=62860 avg_stage2_remote_frontier=199.555556 stage2_remote_expansions=3751 avg_stage2_remote_expansions=11.907937 stage2_scored_candidates=206387 avg_stage2_scored_candidates=655.196825 stage2_graph_read_waves=1835 avg_stage2_expansions_per_graph_wave=2.044142 stage2_graph_unique_reads=3751 stage2_vector_read_waves=1911 avg_stage2_scores_per_vector_wave=107.999477 stage2_vector_unique_reads=206320 stage2_migrations=7 home_match_rate=0.971311 stage2_final_edges=15364 stage2_cross_edges_stage1_home=1535 stage2_cross_edges_final_home=1390 cross_edge_reduction_ratio=0.094463 failed=0 rpc_timeouts=0 reverse_aggregate_batches=0 reverse_aggregate_logical_requests=0 reverse_aggregate_ops=0 avg_reverse_aggregate_logicals=0.000000 avg_reverse_aggregate_ops=0.000000 max_backlog=41 admission_window=128 completion_outstanding=93 pressure_yields=51380 stage2_batches=76 avg_stage2_batch_size=4.144737 peer_stage1_enqueued=103 peer_stage1_processed=103 peer_stage1_items=448 avg_peer_stage1_items=4.349515 peer_stage1_rate_per_sec=44.719588 peer_stage1_max_queue=11 peer_reverse_enqueued=39 peer_reverse_processed=39 peer_reverse_remaining=0 peer_reverse_items_enqueued=3493 peer_reverse_items_processed=3493 peer_reverse_rate_per_sec=348.673039 peer_reverse_failed=0 peer_reverse_max_queue=1 reclaim_pending=0 reclaim_reused=7 dynamic_high_watermark=19882899296 stage2_remaining=0 cleanup_remaining=0 active_contexts=16 repair_remaining=0 remaining=71
+[STATUS]: storage-owner maintenance observation: enqueued=315 stage2_enqueued=315 cleanup_enqueued=0 stage2_tasks_done=244 stage2_finalized_live=244 cleanup_processed=0 stale=0 stage2_completion_ratio=0.774603 live_stage2_completion_ratio=0.774603 avg_stage2_delay_ms=494.050421 p99_stage2_delay_upper_ms=2000.000000 p99_stage2_delay_over_30s=false stage2_delay_histogram=1,0,0,0,0,2,13,21,48,46,91,22,0,0,0,0,0,0 max_stage2_delay_ms=1027.878153 compaction_batch_target=32 compaction_max_delay_ms=10 stage2_rate_per_sec=16.247021 stage1_search_budget_exhausted=215 stage2_search_budget_exhausted=1 stage2_continuations=315 stage2_remote_frontier_items=62860 avg_stage2_remote_frontier=199.555556 stage2_remote_expansions=3751 avg_stage2_remote_expansions=11.907937 stage2_scored_candidates=206387 avg_stage2_scored_candidates=655.196825 stage2_graph_read_waves=1835 avg_stage2_expansions_per_graph_wave=2.044142 stage2_graph_unique_reads=3751 stage2_vector_read_waves=1911 avg_stage2_scores_per_vector_wave=107.999477 stage2_vector_unique_reads=206320 stage2_migrations=7 home_match_rate=0.971311 stage2_final_edges=15364 stage2_cross_edges_stage1_home=1535 stage2_cross_edges_final_home=1390 cross_edge_reduction_ratio=0.094463 failed=0 rpc_timeouts=0 reverse_aggregate_batches=0 reverse_aggregate_logical_requests=0 reverse_aggregate_ops=0 avg_reverse_aggregate_logicals=0.000000 avg_reverse_aggregate_ops=0.000000 max_backlog=41 admission_window=128 completion_outstanding=93 pressure_yields=110460 stage2_batches=76 avg_stage2_batch_size=4.144737 peer_stage1_enqueued=103 peer_stage1_processed=103 peer_stage1_items=448 avg_peer_stage1_items=4.349515 peer_stage1_rate_per_sec=29.830595 peer_stage1_max_queue=11 peer_reverse_enqueued=39 peer_reverse_processed=39 peer_reverse_remaining=0 peer_reverse_items_enqueued=3493 peer_reverse_items_processed=3493 peer_reverse_rate_per_sec=232.585423 peer_reverse_failed=0 peer_reverse_max_queue=1 reclaim_pending=0 reclaim_reused=7 dynamic_high_watermark=19882899296 stage2_remaining=0 cleanup_remaining=0 active_contexts=16 repair_remaining=0 remaining=71
+[STATUS]: storage-owner maintenance observation: enqueued=315 stage2_enqueued=315 cleanup_enqueued=0 stage2_tasks_done=244 stage2_finalized_live=244 cleanup_processed=0 stale=0 stage2_completion_ratio=0.774603 live_stage2_completion_ratio=0.774603 avg_stage2_delay_ms=494.050421 p99_stage2_delay_upper_ms=2000.000000 p99_stage2_delay_over_30s=false stage2_delay_histogram=1,0,0,0,0,2,13,21,48,46,91,22,0,0,0,0,0,0 max_stage2_delay_ms=1027.878153 compaction_batch_target=32 compaction_max_delay_ms=10 stage2_rate_per_sec=12.188942 stage1_search_budget_exhausted=215 stage2_search_budget_exhausted=1 stage2_continuations=315 stage2_remote_frontier_items=62860 avg_stage2_remote_frontier=199.555556 stage2_remote_expansions=3751 avg_stage2_remote_expansions=11.907937 stage2_scored_candidates=206387 avg_stage2_scored_candidates=655.196825 stage2_graph_read_waves=1835 avg_stage2_expansions_per_graph_wave=2.044142 stage2_graph_unique_reads=3751 stage2_vector_read_waves=1911 avg_stage2_scores_per_vector_wave=107.999477 stage2_vector_unique_reads=206320 stage2_migrations=7 home_match_rate=0.971311 stage2_final_edges=15364 stage2_cross_edges_stage1_home=1535 stage2_cross_edges_final_home=1390 cross_edge_reduction_ratio=0.094463 failed=0 rpc_timeouts=0 reverse_aggregate_batches=0 reverse_aggregate_logical_requests=0 reverse_aggregate_ops=0 avg_reverse_aggregate_logicals=0.000000 avg_reverse_aggregate_ops=0.000000 max_backlog=41 admission_window=128 completion_outstanding=93 pressure_yields=167401 stage2_batches=76 avg_stage2_batch_size=4.144737 peer_stage1_enqueued=103 peer_stage1_processed=103 peer_stage1_items=448 avg_peer_stage1_items=4.349515 peer_stage1_rate_per_sec=22.379697 peer_stage1_max_queue=11 peer_reverse_enqueued=39 peer_reverse_processed=39 peer_reverse_remaining=0 peer_reverse_items_enqueued=3493 peer_reverse_items_processed=3493 peer_reverse_rate_per_sec=174.491701 peer_reverse_failed=0 peer_reverse_max_queue=1 reclaim_pending=0 reclaim_reused=7 dynamic_high_watermark=19882899296 stage2_remaining=0 cleanup_remaining=0 active_contexts=16 repair_remaining=0 remaining=71
+[STATUS]: storage-owner maintenance observation: enqueued=315 stage2_enqueued=315 cleanup_enqueued=0 stage2_tasks_done=244 stage2_finalized_live=244 cleanup_processed=0 stale=0 stage2_completion_ratio=0.774603 live_stage2_completion_ratio=0.774603 avg_stage2_delay_ms=494.050421 p99_stage2_delay_upper_ms=2000.000000 p99_stage2_delay_over_30s=false stage2_delay_histogram=1,0,0,0,0,2,13,21,48,46,91,22,0,0,0,0,0,0 max_stage2_delay_ms=1027.878153 compaction_batch_target=32 compaction_max_delay_ms=10 stage2_rate_per_sec=9.752427 stage1_search_budget_exhausted=215 stage2_search_budget_exhausted=1 stage2_continuations=315 stage2_remote_frontier_items=62860 avg_stage2_remote_frontier=199.555556 stage2_remote_expansions=3751 avg_stage2_remote_expansions=11.907937 stage2_scored_candidates=206387 avg_stage2_scored_candidates=655.196825 stage2_graph_read_waves=1835 avg_stage2_expansions_per_graph_wave=2.044142 stage2_graph_unique_reads=3751 stage2_vector_read_waves=1911 avg_stage2_scores_per_vector_wave=107.999477 stage2_vector_unique_reads=206320 stage2_migrations=7 home_match_rate=0.971311 stage2_final_edges=15364 stage2_cross_edges_stage1_home=1535 stage2_cross_edges_final_home=1390 cross_edge_reduction_ratio=0.094463 failed=0 rpc_timeouts=0 reverse_aggregate_batches=0 reverse_aggregate_logical_requests=0 reverse_aggregate_ops=0 avg_reverse_aggregate_logicals=0.000000 avg_reverse_aggregate_ops=0.000000 max_backlog=41 admission_window=128 completion_outstanding=93 pressure_yields=223128 stage2_batches=76 avg_stage2_batch_size=4.144737 peer_stage1_enqueued=103 peer_stage1_processed=103 peer_stage1_items=448 avg_peer_stage1_items=4.349515 peer_stage1_rate_per_sec=17.906096 peer_stage1_max_queue=11 peer_reverse_enqueued=39 peer_reverse_processed=39 peer_reverse_remaining=0 peer_reverse_items_enqueued=3493 peer_reverse_items_processed=3493 peer_reverse_rate_per_sec=139.611589 peer_reverse_failed=0 peer_reverse_max_queue=1 reclaim_pending=0 reclaim_reused=7 dynamic_high_watermark=19882899296 stage2_remaining=0 cleanup_remaining=0 active_contexts=16 repair_remaining=0 remaining=71
+[STATUS]: storage-owner maintenance observation: enqueued=315 stage2_enqueued=315 cleanup_enqueued=0 stage2_tasks_done=244 stage2_finalized_live=244 cleanup_processed=0 stale=0 stage2_completion_ratio=0.774603 live_stage2_completion_ratio=0.774603 avg_stage2_delay_ms=494.050421 p99_stage2_delay_upper_ms=2000.000000 p99_stage2_delay_over_30s=false stage2_delay_histogram=1,0,0,0,0,2,13,21,48,46,91,22,0,0,0,0,0,0 max_stage2_delay_ms=1027.878153 compaction_batch_target=32 compaction_max_delay_ms=10 stage2_rate_per_sec=8.128024 stage1_search_budget_exhausted=215 stage2_search_budget_exhausted=1 stage2_continuations=315 stage2_remote_frontier_items=62860 avg_stage2_remote_frontier=199.555556 stage2_remote_expansions=3751 avg_stage2_remote_expansions=11.907937 stage2_scored_candidates=206387 avg_stage2_scored_candidates=655.196825 stage2_graph_read_waves=1835 avg_stage2_expansions_per_graph_wave=2.044142 stage2_graph_unique_reads=3751 stage2_vector_read_waves=1911 avg_stage2_scores_per_vector_wave=107.999477 stage2_vector_unique_reads=206320 stage2_migrations=7 home_match_rate=0.971311 stage2_final_edges=15364 stage2_cross_edges_stage1_home=1535 stage2_cross_edges_final_home=1390 cross_edge_reduction_ratio=0.094463 failed=0 rpc_timeouts=0 reverse_aggregate_batches=0 reverse_aggregate_logical_requests=0 reverse_aggregate_ops=0 avg_reverse_aggregate_logicals=0.000000 avg_reverse_aggregate_ops=0.000000 max_backlog=41 admission_window=128 completion_outstanding=93 pressure_yields=279481 stage2_batches=76 avg_stage2_batch_size=4.144737 peer_stage1_enqueued=103 peer_stage1_processed=103 peer_stage1_items=448 avg_peer_stage1_items=4.349515 peer_stage1_rate_per_sec=14.923586 peer_stage1_max_queue=11 peer_reverse_enqueued=39 peer_reverse_processed=39 peer_reverse_remaining=0 peer_reverse_items_enqueued=3493 peer_reverse_items_processed=3493 peer_reverse_rate_per_sec=116.357331 peer_reverse_failed=0 peer_reverse_max_queue=1 reclaim_pending=0 reclaim_reused=7 dynamic_high_watermark=19882899296 stage2_remaining=0 cleanup_remaining=0 active_contexts=16 repair_remaining=0 remaining=71
+[STATUS]: storage-owner maintenance observation: enqueued=315 stage2_enqueued=315 cleanup_enqueued=0 stage2_tasks_done=244 stage2_finalized_live=244 cleanup_processed=0 stale=0 stage2_completion_ratio=0.774603 live_stage2_completion_ratio=0.774603 avg_stage2_delay_ms=494.050421 p99_stage2_delay_upper_ms=2000.000000 p99_stage2_delay_over_30s=false stage2_delay_histogram=1,0,0,0,0,2,13,21,48,46,91,22,0,0,0,0,0,0 max_stage2_delay_ms=1027.878153 compaction_batch_target=32 compaction_max_delay_ms=10 stage2_rate_per_sec=6.967527 stage1_search_budget_exhausted=215 stage2_search_budget_exhausted=1 stage2_continuations=315 stage2_remote_frontier_items=62860 avg_stage2_remote_frontier=199.555556 stage2_remote_expansions=3751 avg_stage2_remote_expansions=11.907937 stage2_scored_candidates=206387 avg_stage2_scored_candidates=655.196825 stage2_graph_read_waves=1835 avg_stage2_expansions_per_graph_wave=2.044142 stage2_graph_unique_reads=3751 stage2_vector_read_waves=1911 avg_stage2_scores_per_vector_wave=107.999477 stage2_vector_unique_reads=206320 stage2_migrations=7 home_match_rate=0.971311 stage2_final_edges=15364 stage2_cross_edges_stage1_home=1535 stage2_cross_edges_final_home=1390 cross_edge_reduction_ratio=0.094463 failed=0 rpc_timeouts=0 reverse_aggregate_batches=0 reverse_aggregate_logical_requests=0 reverse_aggregate_ops=0 avg_reverse_aggregate_logicals=0.000000 avg_reverse_aggregate_ops=0.000000 max_backlog=41 admission_window=128 completion_outstanding=93 pressure_yields=338958 stage2_batches=76 avg_stage2_batch_size=4.144737 peer_stage1_enqueued=103 peer_stage1_processed=103 peer_stage1_items=448 avg_peer_stage1_items=4.349515 peer_stage1_rate_per_sec=12.792836 peer_stage1_max_queue=11 peer_reverse_enqueued=39 peer_reverse_processed=39 peer_reverse_remaining=0 peer_reverse_items_enqueued=3493 peer_reverse_items_processed=3493 peer_reverse_rate_per_sec=99.744140 peer_reverse_failed=0 peer_reverse_max_queue=1 reclaim_pending=0 reclaim_reused=7 dynamic_high_watermark=19882899296 stage2_remaining=0 cleanup_remaining=0 active_contexts=16 repair_remaining=0 remaining=71
+[STATUS]: storage-owner maintenance observation: enqueued=315 stage2_enqueued=315 cleanup_enqueued=0 stage2_tasks_done=244 stage2_finalized_live=244 cleanup_processed=0 stale=0 stage2_completion_ratio=0.774603 live_stage2_completion_ratio=0.774603 avg_stage2_delay_ms=494.050421 p99_stage2_delay_upper_ms=2000.000000 p99_stage2_delay_over_30s=false stage2_delay_histogram=1,0,0,0,0,2,13,21,48,46,91,22,0,0,0,0,0,0 max_stage2_delay_ms=1027.878153 compaction_batch_target=32 compaction_max_delay_ms=10 stage2_rate_per_sec=6.097007 stage1_search_budget_exhausted=215 stage2_search_budget_exhausted=1 stage2_continuations=315 stage2_remote_frontier_items=62860 avg_stage2_remote_frontier=199.555556 stage2_remote_expansions=3751 avg_stage2_remote_expansions=11.907937 stage2_scored_candidates=206387 avg_stage2_scored_candidates=655.196825 stage2_graph_read_waves=1835 avg_stage2_expansions_per_graph_wave=2.044142 stage2_graph_unique_reads=3751 stage2_vector_read_waves=1911 avg_stage2_scores_per_vector_wave=107.999477 stage2_vector_unique_reads=206320 stage2_migrations=7 home_match_rate=0.971311 stage2_final_edges=15364 stage2_cross_edges_stage1_home=1535 stage2_cross_edges_final_home=1390 cross_edge_reduction_ratio=0.094463 failed=0 rpc_timeouts=0 reverse_aggregate_batches=0 reverse_aggregate_logical_requests=0 reverse_aggregate_ops=0 avg_reverse_aggregate_logicals=0.000000 avg_reverse_aggregate_ops=0.000000 max_backlog=41 admission_window=128 completion_outstanding=93 pressure_yields=402965 stage2_batches=76 avg_stage2_batch_size=4.144737 peer_stage1_enqueued=103 peer_stage1_processed=103 peer_stage1_items=448 avg_peer_stage1_items=4.349515 peer_stage1_rate_per_sec=11.194505 peer_stage1_max_queue=11 peer_reverse_enqueued=39 peer_reverse_processed=39 peer_reverse_remaining=0 peer_reverse_items_enqueued=3493 peer_reverse_items_processed=3493 peer_reverse_rate_per_sec=87.282154 peer_reverse_failed=0 peer_reverse_max_queue=1 reclaim_pending=0 reclaim_reused=7 dynamic_high_watermark=19882899296 stage2_remaining=0 cleanup_remaining=0 active_contexts=16 repair_remaining=0 remaining=71
+[STATUS]: storage-owner maintenance observation: enqueued=315 stage2_enqueued=315 cleanup_enqueued=0 stage2_tasks_done=244 stage2_finalized_live=244 cleanup_processed=0 stale=0 stage2_completion_ratio=0.774603 live_stage2_completion_ratio=0.774603 avg_stage2_delay_ms=494.050421 p99_stage2_delay_upper_ms=2000.000000 p99_stage2_delay_over_30s=false stage2_delay_histogram=1,0,0,0,0,2,13,21,48,46,91,22,0,0,0,0,0,0 max_stage2_delay_ms=1027.878153 compaction_batch_target=32 compaction_max_delay_ms=10 stage2_rate_per_sec=5.419761 stage1_search_budget_exhausted=215 stage2_search_budget_exhausted=1 stage2_continuations=315 stage2_remote_frontier_items=62860 avg_stage2_remote_frontier=199.555556 stage2_remote_expansions=3751 avg_stage2_remote_expansions=11.907937 stage2_scored_candidates=206387 avg_stage2_scored_candidates=655.196825 stage2_graph_read_waves=1835 avg_stage2_expansions_per_graph_wave=2.044142 stage2_graph_unique_reads=3751 stage2_vector_read_waves=1911 avg_stage2_scores_per_vector_wave=107.999477 stage2_vector_unique_reads=206320 stage2_migrations=7 home_match_rate=0.971311 stage2_final_edges=15364 stage2_cross_edges_stage1_home=1535 stage2_cross_edges_final_home=1390 cross_edge_reduction_ratio=0.094463 failed=0 rpc_timeouts=0 reverse_aggregate_batches=0 reverse_aggregate_logical_requests=0 reverse_aggregate_ops=0 avg_reverse_aggregate_logicals=0.000000 avg_reverse_aggregate_ops=0.000000 max_backlog=41 admission_window=128 completion_outstanding=93 pressure_yields=464300 stage2_batches=76 avg_stage2_batch_size=4.144737 peer_stage1_enqueued=103 peer_stage1_processed=103 peer_stage1_items=448 avg_peer_stage1_items=4.349515 peer_stage1_rate_per_sec=9.951037 peer_stage1_max_queue=11 peer_reverse_enqueued=39 peer_reverse_processed=39 peer_reverse_remaining=0 peer_reverse_items_enqueued=3493 peer_reverse_items_processed=3493 peer_reverse_rate_per_sec=77.586994 peer_reverse_failed=0 peer_reverse_max_queue=1 reclaim_pending=0 reclaim_reused=7 dynamic_high_watermark=19882899296 stage2_remaining=0 cleanup_remaining=0 active_contexts=16 repair_remaining=0 remaining=71
