@@ -13,8 +13,57 @@
 #include "gpu_search/index_format.hh"
 #include "nlohmann/json.hh"
 #include "vamana/hot_graph.hh"
+#include "vamana/vamana_node.hh"
 
 namespace {
+
+void test_dynamic_navigation_code_width_semantics() {
+  namespace format = gpu_search::format;
+  constexpr u32 dim = 128;
+  constexpr u32 degree = 96;
+  VamanaNode::init_static_storage(dim, degree, VectorDType::uint8);
+
+  for (u32 payload_bytes : {16u, 32u, 64u}) {
+    const u32 dynamic_hot_offset =
+      static_cast<u32>(VamanaNode::total_size());
+    const u32 graph_entry_bytes =
+      static_cast<u32>(VamanaNode::hot_graph_entry_size());
+    const u32 dynamic_code_offset =
+      dynamic_hot_offset + graph_entry_bytes;
+    const u32 dynamic_record_bytes = static_cast<u32>(
+      VamanaNode::align_compact(
+        dynamic_code_offset + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
+          payload_bytes));
+
+    VamanaNode::configure_hot_graph(
+      {4096}, {1}, graph_entry_bytes, 0, {8192}, dynamic_record_bytes,
+      dynamic_hot_offset, dynamic_code_offset, payload_bytes);
+    assert(VamanaNode::HAS_HOT_GRAPH);
+    assert(VamanaNode::HOT_GRAPH_DYNAMIC_CODE_BYTES == payload_bytes);
+    assert(VamanaNode::dynamic_navigation_code_payload_bytes() ==
+           payload_bytes);
+    assert(dynamic_code_offset +
+             VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES + payload_bytes <=
+           VamanaNode::allocation_size());
+
+    format::StorageControlBlock control{
+      .dynamic_record_bytes = dynamic_record_bytes,
+      .dynamic_hot_offset = dynamic_hot_offset,
+      .dynamic_code_offset = dynamic_code_offset,
+      .code_bytes = VamanaNode::dynamic_navigation_code_payload_bytes(),
+    };
+    assert(control.code_bytes == payload_bytes);
+
+    // A record that fits the PQ payload but omits the incarnation prefix must
+    // be rejected even though code_bytes itself remains payload-only.
+    VamanaNode::configure_hot_graph(
+      {4096}, {1}, graph_entry_bytes, 0, {8192},
+      dynamic_code_offset + payload_bytes, dynamic_hot_offset,
+      dynamic_code_offset, payload_bytes);
+    assert(!VamanaNode::HAS_HOT_GRAPH);
+  }
+  VamanaNode::disable_hot_graph();
+}
 
 void test_supported_gpu_layout_limits() {
   namespace format = gpu_search::format;
@@ -286,6 +335,7 @@ void test_centroid_route_publication(
 
 int main() {
   namespace format = gpu_search::format;
+  test_dynamic_navigation_code_width_semantics();
   test_supported_gpu_layout_limits();
   test_tagged_remote_pointer();
   test_graph_record_stale_incarnation_is_not_transport_failure();

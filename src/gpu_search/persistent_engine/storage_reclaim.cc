@@ -90,8 +90,9 @@ void PersistentSearchEngine::Impl::validate_storage_control(const format::Storag
             << ",code=" << control.code_bytes
             << ",centroid_route="
             << (valid_centroid_route ? "valid" : centroid_route_error)
-            << "}. Rebuild and restart every storage node from the current "
-               "dev branch before starting the compute node.";
+            << "}. Ensure the compute node and every storage node use the "
+               "same current binaries and index metadata, then restart all "
+               "processes.";
     throw std::runtime_error(message.str());
   }
 }
