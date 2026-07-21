@@ -3,6 +3,10 @@ target_link_libraries(breakdown_aggregate_test PRIVATE dvstor_runtime)
 target_compile_options(breakdown_aggregate_test PRIVATE -UNDEBUG)
 add_test(NAME breakdown_aggregate_test COMMAND breakdown_aggregate_test)
 
+add_test(NAME mn_memory_estimator_test
+         COMMAND bash ${CMAKE_SOURCE_DIR}/test/mn_memory_estimator_test.sh
+                      ${CMAKE_SOURCE_DIR})
+
 add_executable(breakdown_benchmark_support_test breakdown_benchmark_support_test.cc)
 dvstor_target_tool_includes(breakdown_benchmark_support_test)
 target_link_libraries(breakdown_benchmark_support_test PRIVATE dvstor_breakdown_support)

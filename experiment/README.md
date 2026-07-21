@@ -16,6 +16,27 @@ export GPU_MEMORY_LIMIT_GB=40
 export GPU_MEMORY_RESERVE_GB=4
 ```
 
+`MN_MEMORY_GB` 表示每个存储分片的 RDMA 注册区容量，不是进程总 RSS。未显式
+设置时，启动脚本会在 profile 确定最终 `INDEX_PREFIX` 后估算：已有 schema-16
+metadata 时直接使用每个真实分片的 `dynamic_node_base_offsets`、节点数和动态记录
+步长，并按最坏分片取整；索引尚不存在时才按当前 tagged-v2 fixed/graph/PQ 布局和
+`PARTITION_IMBALANCE` 做保守估算。默认给每个分片预留相当于基图节点数 20% 的
+动态槽，可按 workload 调整：
+
+```bash
+# 按比例预留峰值同时存活/迁移在途的动态记录
+export MN_DYNAMIC_HEADROOM_PERCENT=20
+
+# 或直接指定每个物理分片的绝对动态槽容量；设置后覆盖百分比策略
+export MN_DYNAMIC_SLOTS_PER_SHARD=4000000
+
+# 完全覆盖自动估算，仍要求整数 GiB 且不超过 tagged pointer 的 256 GiB 上限
+export MN_MEMORY_GB=24
+```
+
+这里的槽数是峰值同时占用量，不是累计更新次数；已完成清理的删除/迁移源槽可以
+复用。默认注册区下限由 `MN_MEMORY_MIN_GB` 控制，默认 8 GiB。
+
 ## 构建新索引
 
 存储节点脚本默认使用独立的 `build-storage`，先按根目录 README 配置 CPU-only
@@ -164,13 +185,13 @@ stage2 context 有界回收；存储节点记录同时保持逻辑 generation �
 `query.u8bin` 的 10K 标准查询仅供 recall 使用。性能阶段由
 `PERFORMANCE_QUERY_FILE` 提供独立查询流，warmup 与 measure 共用一个单遍游标，
 同一行不会再次执行；查询池耗尽时 benchmark 会失败而不是取模回绕。当前默认
-性能查询池为 `[100M,105M)` 的 500 万行。为便于当前机器直接预跑，默认插入池
-为已有的 `[103M,105M)` 200 万行。文件默认位于
+性能查询池为 `[100M,110M)` 的 1000 万行，默认插入池为与之相邻且不重叠的
+`[110M,120M)` 1000 万行。文件默认位于
 `/data/xjs/datasets/sift1b`：
 
 ```text
-sift100m_to_105m_query.u8bin
-sift103m_to_105m_insert.u8bin
+sift100m_to_110m_query.u8bin
+sift110m_to_120m_insert.u8bin
 ```
 
 `run_breakdown.sh` 默认只校验并读取预生成文件，不会在计算节点寻找

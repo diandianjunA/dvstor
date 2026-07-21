@@ -11,10 +11,10 @@ Usage: ./experiment/run_breakdown.sh [PROFILE]
   WORKLOAD=query|insert|both|mixed        默认 mixed
 
 数据文件与声明范围（在 sift100m_common.sh 集中配置，也可用环境变量覆盖）：
-  PERFORMANCE_QUERY_FILE                 默认 sift100m_to_105m_query.u8bin
-  PERFORMANCE_QUERY_START/END            默认 [100000000,105000000)
-  INSERT_FILE                            默认 sift103m_to_105m_insert.u8bin
-  INSERT_VECTOR_START/END                默认 [103000000,105000000)
+  PERFORMANCE_QUERY_FILE                 默认 sift100m_to_110m_query.u8bin
+  PERFORMANCE_QUERY_START/END            默认 [100000000,110000000)
+  INSERT_FILE                            默认 sift110m_to_120m_insert.u8bin
+  INSERT_VECTOR_START/END                默认 [110000000,120000000)
 
 数据准备：
   PREPARE_BENCHMARK_DATA=0                默认；只读取预生成 u8bin，不需要 bigann_base.bvecs

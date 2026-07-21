@@ -60,7 +60,7 @@ builder=("$BUILD_DIR/vamana_offline_builder"
   --max-vectors "$MAX_VECTORS"
   --vector-data-type "$VECTOR_DATA_TYPE"
   --partition-max-degree "${PARTITION_MAX_DEGREE:-32}"
-  --partition-imbalance "${PARTITION_IMBALANCE:-1.03}"
+  --partition-imbalance "$PARTITION_IMBALANCE"
   --skip-sanity-check)
 
 pq=("$BUILD_DIR/vamana_pq_indexer"

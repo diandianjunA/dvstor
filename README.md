@@ -192,10 +192,10 @@ Benchmark 并发使用独立的 `BENCHMARK_CLIENT_THREADS`，不写入索引/系
 例如 `BENCHMARK_CLIENT_THREADS=128 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio`。
 标准的 10K `query.u8bin` 只用于 recall 检查。吞吐阶段使用独立的
 `PERFORMANCE_QUERY_FILE`，并从 warmup 到 measure 单遍消费；文件耗尽会直接失败，
-不会回绕重复。默认性能查询集是 `bigann_base.bvecs` 的 `[100M,105M)`，插入集是
-`[103M,105M)`；生成的 `.u8bin` 文件位于 SIFT1B 数据集目录。两个流按你的当前
-压测设置有重叠，适合直接复用预生成数据做吞吐测试，但不能当作严格 held-out 的
-质量证据。计算节点只需这两份生成文件，不需要完整的 `bigann_base.bvecs`。
+不会回绕重复。默认性能查询集是 `bigann_base.bvecs` 的 `[100M,110M)`，插入集是
+`[110M,120M)`；生成的 `.u8bin` 文件位于 SIFT1B 数据集目录。两个流使用相邻且
+不重叠的 held-out 范围。计算节点只需这两份生成文件，不需要完整的
+`bigann_base.bvecs`。
 
 分布式部署时，每台存储节点只需其自身的 `.dat`、`.idmap`、`.centroid`、
 `.pq32.codes`，再加共享 metadata；计算节点不需要额外的路由 sidecar。详细流程见

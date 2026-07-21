@@ -20,6 +20,7 @@ PID_DIR="${PID_DIR:-$SCRIPT_DIR/pids}"
 
 SHARDS="${SHARDS:-5}"
 PARTITION_STRATEGY="${PARTITION_STRATEGY:-metis}"
+PARTITION_IMBALANCE="${PARTITION_IMBALANCE:-1.03}"
 R="${R:-96}"
 BUILD_BEAM="${BUILD_BEAM:-128}"
 ALPHA="${ALPHA:-1.2}"
@@ -39,15 +40,14 @@ GROUNDTRUTH_TOPK="${GROUNDTRUTH_TOPK:-10}"
 # moving the benchmark to another machine. Source row ranges describe how each
 # pre-generated u8bin was extracted.
 BENCHMARK_VECTOR_SOURCE="${BENCHMARK_VECTOR_SOURCE:-$DATASET_DIR/bigann_base.bvecs}"
-PERFORMANCE_QUERY_FILE="${PERFORMANCE_QUERY_FILE:-$DATASET_DIR/sift100m_to_105m_query.u8bin}"
+PERFORMANCE_QUERY_FILE="${PERFORMANCE_QUERY_FILE:-$DATASET_DIR/sift100m_to_110m_query.u8bin}"
 PERFORMANCE_QUERY_START="${PERFORMANCE_QUERY_START:-100000000}"
-PERFORMANCE_QUERY_END="${PERFORMANCE_QUERY_END:-105000000}"
-INSERT_FILE="${INSERT_FILE:-$DATASET_DIR/sift103m_to_105m_insert.u8bin}"
-INSERT_VECTOR_START="${INSERT_VECTOR_START:-103000000}"
-INSERT_VECTOR_END="${INSERT_VECTOR_END:-105000000}"
+PERFORMANCE_QUERY_END="${PERFORMANCE_QUERY_END:-110000000}"
+INSERT_FILE="${INSERT_FILE:-$DATASET_DIR/sift110m_to_120m_insert.u8bin}"
+INSERT_VECTOR_START="${INSERT_VECTOR_START:-110000000}"
+INSERT_VECTOR_END="${INSERT_VECTOR_END:-120000000}"
 
-# The convenient local defaults overlap. The script records the declared ranges
-# but leaves dataset-split choices to the experimenter.
+# Query and insert defaults are adjacent, non-overlapping held-out ranges.
 
 BASE_PORT="${BASE_PORT:-1234}"
 HOSTS="${HOSTS:-192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202}"
@@ -60,29 +60,218 @@ MAX_POLL_CQES="${MAX_POLL_CQES:-64}"
 PROFILE="${PROFILE:-04_gpu_persistent_gpunetio}"
 INDEX_PREFIX="${INDEX_PREFIX:-$INDEX_DIR/sift100m_R${R}_bw${BUILD_BEAM}_${PARTITION_STRATEGY}_pq${PQ_SUBQUANTIZERS}}"
 
-estimate_node_bytes() {
-  local component_size=4
-  case "$VECTOR_DATA_TYPE" in
-    uint8|int8) component_size=1 ;;
-    float32|auto) component_size=4 ;;
-    *) echo "unsupported VECTOR_DATA_TYPE=$VECTOR_DATA_TYPE" >&2; return 1 ;;
-  esac
-  local fixed_bytes=$((((16 + DIM * component_size + 15) / 16) * 16))
-  local graph_bytes=$((((8 + R * 5 + 7) / 8) * 8))
-  echo $((fixed_bytes + graph_bytes + 16))
-}
+# MN_MEMORY_GB is the per-shard RDMA-registered storage region, not total
+# process RSS. Resolve it only after the selected profile has established the
+# final INDEX_PREFIX. An explicit environment/profile value always wins.
+MN_DYNAMIC_HEADROOM_PERCENT="${MN_DYNAMIC_HEADROOM_PERCENT:-20}"
+MN_DYNAMIC_SLOTS_PER_SHARD="${MN_DYNAMIC_SLOTS_PER_SHARD:-}"
+MN_MEMORY_MIN_GB="${MN_MEMORY_MIN_GB:-8}"
 
 estimate_mn_memory_gb() {
-  local node_bytes vectors_per_shard bytes gib
-  node_bytes="$(estimate_node_bytes)"
-  vectors_per_shard=$(((MAX_VECTORS + SHARDS - 1) / SHARDS))
-  bytes=$((vectors_per_shard * node_bytes))
-  gib=$(((bytes * 12 / 10 + 4 * 1024 * 1024 * 1024 + 1024 * 1024 * 1024 - 1) / (1024 * 1024 * 1024)))
-  ((gib >= 8)) || gib=8
-  echo "$gib"
+  local metadata="${INDEX_PREFIX}.meta.json"
+  python3 - "$metadata" "$SHARDS" "$MAX_VECTORS" "$DIM" "$R" \
+    "$VECTOR_DATA_TYPE" "$PQ_SUBQUANTIZERS" "$PARTITION_IMBALANCE" \
+    "$MN_DYNAMIC_HEADROOM_PERCENT" "$MN_DYNAMIC_SLOTS_PER_SHARD" \
+    "$MN_MEMORY_MIN_GB" <<'PY_MN_MEMORY'
+import json
+import os
+import sys
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
+
+GIB = 1 << 30
+REMOTE_PTR_CAPACITY = 256 * GIB
+CENTROID_HEADER_BYTES = 128
+CENTROID_ENTRY_BYTES = 16
+CENTROID_ENTRY_CAPACITY = 4
+STORAGE_CONTROL_BYTES = 4096
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def positive_int(name, raw, *, allow_zero=False):
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        fail(f'{name} must be an integer: {raw!r}')
+    if value < 0 or (value == 0 and not allow_zero):
+        relation = 'non-negative' if allow_zero else 'positive'
+        fail(f'{name} must be {relation}: {value}')
+    return value
+
+
+def decimal_value(name, raw, *, minimum):
+    try:
+        value = Decimal(raw)
+    except (InvalidOperation, TypeError, ValueError):
+        fail(f'{name} must be numeric: {raw!r}')
+    if not value.is_finite() or value < minimum:
+        fail(f'{name} must be finite and >= {minimum}: {raw!r}')
+    return value
+
+
+def align_up(value, alignment):
+    if value < 0 or alignment <= 0:
+        fail('invalid alignment input')
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def centroid_publication_bytes(dim):
+    centroid_end = CENTROID_HEADER_BYTES + dim * 4  # canonical FP32 route
+    entries_offset = align_up(centroid_end, 8)
+    return align_up(
+        entries_offset + CENTROID_ENTRY_CAPACITY * CENTROID_ENTRY_BYTES, 64)
+
+
+def metadata_layout(path, expected_shards):
+    try:
+        with open(path, 'r', encoding='utf-8') as stream:
+            metadata = json.load(stream)
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f'cannot read index metadata {path}: {error}')
+
+    if metadata.get('schema_version') != 16 or \
+            metadata.get('storage_format') != 'vamana_tagged_v2':
+        fail(f'index metadata is not a schema-16 tagged index: {path}')
+    shards = positive_int('metadata.num_memory_nodes',
+                          metadata.get('num_memory_nodes'))
+    if shards != expected_shards:
+        fail(f'metadata shard count {shards} does not match SHARDS={expected_shards}')
+
+    counts = metadata.get('hot_graph_entry_counts')
+    bases = metadata.get('dynamic_node_base_offsets')
+    if not isinstance(counts, list) or len(counts) != shards:
+        fail('hot_graph_entry_counts must contain one value per shard')
+    if not isinstance(bases, list) or len(bases) != shards:
+        fail('dynamic_node_base_offsets must contain one value per shard')
+    counts = [positive_int(f'hot_graph_entry_counts[{index}]', value)
+              for index, value in enumerate(counts)]
+    bases = [positive_int(f'dynamic_node_base_offsets[{index}]', value)
+             for index, value in enumerate(bases)]
+    num_vectors = positive_int('metadata.num_vectors', metadata.get('num_vectors'))
+    if sum(counts) != num_vectors:
+        fail('hot_graph_entry_counts do not sum to metadata.num_vectors')
+
+    record_bytes = positive_int(
+        'hot_graph_dynamic_record_bytes',
+        metadata.get('hot_graph_dynamic_record_bytes'))
+    allocation_size = positive_int(
+        'allocation_size', metadata.get('allocation_size'))
+    if allocation_size != record_bytes:
+        fail('allocation_size does not match hot_graph_dynamic_record_bytes')
+    dim = positive_int('metadata.dim', metadata.get('dim'))
+    return counts, bases, record_bytes, dim, 'metadata'
+
+
+def fallback_layout(shards, max_vectors, dim, degree, dtype, code_bytes,
+                    partition_imbalance):
+    if max_vectors == 0:
+        fail('MAX_VECTORS=0 requires an existing schema-16 metadata file')
+    component_sizes = {'uint8': 1, 'int8': 1, 'float32': 4, 'auto': 4}
+    if dtype not in component_sizes:
+        fail(f'unsupported VECTOR_DATA_TYPE={dtype!r}')
+    if degree > 255:
+        fail(f'R exceeds the one-byte graph-degree format: {degree}')
+    if shards > 64:
+        fail(f'SHARDS exceeds tagged RemotePtr capacity: {shards}')
+    if code_bytes > dim:
+        fail(f'PQ_SUBQUANTIZERS exceeds DIM: {code_bytes} > {dim}')
+
+    vector_bytes = dim * component_sizes[dtype]
+    fixed_bytes = align_up(24 + align_up(vector_bytes, 8), 16)
+    provisional_slots = min(15, max(2, (degree + 15) // 16))
+    graph_bytes = align_up(16 + (degree + provisional_slots) * 8, 8)
+    dynamic_code_offset = fixed_bytes + graph_bytes
+    record_bytes = align_up(dynamic_code_offset + 4 + code_bytes, 16)
+
+    projected = (Decimal(max_vectors) * partition_imbalance /
+                 Decimal(shards)).to_integral_value(rounding=ROUND_CEILING)
+    count = int(projected)
+    fixed_end = 16 + count * fixed_bytes
+    graph_header = align_up(fixed_end, 64)
+    graph_offset = align_up(graph_header + 64, 64)
+    dat_end = align_up(graph_offset + count * graph_bytes, 64)
+    persistent_bytes = STORAGE_CONTROL_BYTES + count * code_bytes
+    dynamic_base = dat_end + align_up(persistent_bytes, record_bytes)
+    return ([count] * shards, [dynamic_base] * shards,
+            record_bytes, dim, 'schema16-fallback')
+
+
+def main():
+    (metadata_path, raw_shards, raw_max_vectors, raw_dim, raw_degree,
+     dtype, raw_code_bytes, raw_partition_imbalance,
+     raw_headroom_percent, raw_absolute_slots, raw_min_gib) = sys.argv[1:]
+
+    shards = positive_int('SHARDS', raw_shards)
+    max_vectors = positive_int('MAX_VECTORS', raw_max_vectors, allow_zero=True)
+    dim = positive_int('DIM', raw_dim)
+    degree = positive_int('R', raw_degree)
+    code_bytes = positive_int('PQ_SUBQUANTIZERS', raw_code_bytes)
+    partition_imbalance = decimal_value(
+        'PARTITION_IMBALANCE', raw_partition_imbalance, minimum=Decimal(1))
+    headroom_percent = decimal_value(
+        'MN_DYNAMIC_HEADROOM_PERCENT', raw_headroom_percent,
+        minimum=Decimal(0))
+    min_gib = positive_int('MN_MEMORY_MIN_GB', raw_min_gib)
+
+    if os.path.exists(metadata_path):
+        counts, bases, record_bytes, layout_dim, source = metadata_layout(
+            metadata_path, shards)
+    else:
+        counts, bases, record_bytes, layout_dim, source = fallback_layout(
+            shards, max_vectors, dim, degree, dtype, code_bytes,
+            partition_imbalance)
+
+    if raw_absolute_slots:
+        absolute_slots = positive_int(
+            'MN_DYNAMIC_SLOTS_PER_SHARD', raw_absolute_slots)
+        headroom_slots = [absolute_slots] * shards
+        policy = f'{absolute_slots} slots/shard'
+    else:
+        headroom_slots = [max(1, int(
+            (Decimal(count) * headroom_percent / Decimal(100))
+            .to_integral_value(rounding=ROUND_CEILING))) for count in counts]
+        policy = f'{headroom_percent}% of base nodes'
+
+    tail_bytes = centroid_publication_bytes(layout_dim)
+    required_by_shard = [
+        base + slots * record_bytes + tail_bytes
+        for base, slots in zip(bases, headroom_slots)
+    ]
+    required_bytes = max(required_by_shard)
+    estimated_gib = max(min_gib, (required_bytes + GIB - 1) // GIB)
+    if estimated_gib * GIB > REMOTE_PTR_CAPACITY:
+        fail(f'estimated storage region exceeds 256 GiB: {estimated_gib} GiB')
+
+    limiting_shard = max(range(shards), key=required_by_shard.__getitem__)
+    print(
+        f'[mn-memory] auto={estimated_gib} GiB source={source} '
+        f'policy={policy} limiting_shard={limiting_shard + 1} '
+        f'dynamic_slots={headroom_slots[limiting_shard]} '
+        f'record_bytes={record_bytes}',
+        file=sys.stderr)
+    print(estimated_gib)
+
+
+try:
+    main()
+except (ValueError, KeyError, TypeError) as error:
+    print(f'mn-memory estimation failed: {error}', file=sys.stderr)
+    raise SystemExit(1)
+PY_MN_MEMORY
 }
 
-MN_MEMORY_GB="${MN_MEMORY_GB:-$(estimate_mn_memory_gb)}"
+resolve_mn_memory_gb() {
+  if [[ -z "${MN_MEMORY_GB:-}" ]]; then
+    MN_MEMORY_GB="$(estimate_mn_memory_gb)"
+  fi
+  if [[ ! "$MN_MEMORY_GB" =~ ^[1-9][0-9]*$ ]] ||
+      ((MN_MEMORY_GB > 256)); then
+    echo "MN_MEMORY_GB must be an integer in [1,256]: $MN_MEMORY_GB" >&2
+    return 1
+  fi
+}
 
 mkdir -p "$CONVERTED_DIR" "$INDEX_DIR" "$REPORT_DIR" "$LOG_DIR" "$PID_DIR"
 
@@ -286,6 +475,7 @@ write_service_config() {
   fi
   endpoints="$(server_endpoints)"
   validate_index_metadata compute
+  resolve_mn_memory_gb
 
   {
     echo "servers = $endpoints"
