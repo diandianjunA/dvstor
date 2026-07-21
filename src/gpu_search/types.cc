@@ -44,6 +44,10 @@ TelemetrySnapshot Telemetry::snapshot() const {
       centroid_route_unchanged_polls.load(std::memory_order_relaxed),
     .centroid_route_poll_delay_us =
       centroid_route_poll_delay_us.load(std::memory_order_relaxed),
+    .centroid_route_query_retries =
+      centroid_route_query_retries.load(std::memory_order_relaxed),
+    .centroid_route_query_timeouts =
+      centroid_route_query_timeouts.load(std::memory_order_relaxed),
     .exact_vector_reads = exact_vector_reads.load(std::memory_order_relaxed),
   };
 }
@@ -76,6 +80,8 @@ void Telemetry::reset() {
   centroid_route_probe_reads.store(0, std::memory_order_relaxed);
   centroid_route_body_reads.store(0, std::memory_order_relaxed);
   centroid_route_unchanged_polls.store(0, std::memory_order_relaxed);
+  centroid_route_query_retries.store(0, std::memory_order_relaxed);
+  centroid_route_query_timeouts.store(0, std::memory_order_relaxed);
   exact_vector_reads.store(0, std::memory_order_relaxed);
 }
 

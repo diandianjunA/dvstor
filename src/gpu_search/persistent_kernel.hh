@@ -177,6 +177,9 @@ struct PersistentKernelParams {
   u32 direct_local_mkey{};
   u64 direct_local_iova_base{};
   u64 direct_timeout_ns{};
+  // Route publication is a local control-plane transaction, not an RDMA CQ
+  // operation. Keep its liveness deadline independent from data-path latency.
+  u64 route_snapshot_timeout_ns{100'000'000ULL};
   const DirectRemoteRegion* direct_regions{};
   void* const* direct_qps{};
   i32* direct_qp_locks{};

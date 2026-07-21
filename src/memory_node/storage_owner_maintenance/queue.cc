@@ -251,16 +251,19 @@ bool MemoryNode::storage_owner_maintenance_foreground_busy(const Configuration&)
   return false;
 }
 
-bool MemoryNode::try_acquire_storage_owner_maintenance_slot(const Configuration& config) {
+bool MemoryNode::try_acquire_storage_owner_maintenance_slot(
+    const Configuration& config, bool foreground_pressure) {
   // This counter is the global number of live stage2 contexts, not the number
   // of physical workers. Each maintenance executor owns a fixed rpc-depth
   // context pool; peer send credits are independently bounded and try-only.
-  const u64 configured_contexts =
-    static_cast<u64>(std::max<size_t>(
-      1, storage_owner_maintenance_worker_states_.size())) *
-    std::max<u32>(1, config.storage_owner_rpc_depth);
+  // Under foreground pressure, retain one escape context per dedicated
+  // maintenance worker. A zero-context policy deadlocks when Stage1 producers
+  // themselves are waiting for the ordered maintenance window to advance.
+  const size_t admitted_contexts = stage2_context_admission_limit(
+    storage_owner_maintenance_worker_states_.size(),
+    config.storage_owner_rpc_depth, foreground_pressure);
   const u32 max_contexts = static_cast<u32>(std::min<u64>(
-    configured_contexts, std::numeric_limits<u32>::max()));
+    admitted_contexts, std::numeric_limits<u32>::max()));
   u32 active = storage_owner_maintenance_active_workers_.load(std::memory_order_acquire);
   while (active < max_contexts) {
     if (storage_owner_maintenance_active_workers_.compare_exchange_weak(

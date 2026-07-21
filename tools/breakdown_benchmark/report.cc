@@ -94,6 +94,10 @@ nlohmann::json telemetry_to_json(
       telemetry.centroid_route_unchanged_polls},
     {"centroid_route_poll_delay_us",
       telemetry.centroid_route_poll_delay_us},
+    {"centroid_route_query_retries",
+      telemetry.centroid_route_query_retries},
+    {"centroid_route_query_timeouts",
+      telemetry.centroid_route_query_timeouts},
     {"graph_route_hit_ratio",
       telemetry.graph_page_requests + telemetry.graph_route_hits == 0 ? 0.0
       : static_cast<double>(telemetry.graph_route_hits) /
@@ -290,6 +294,9 @@ FormattedReport format_report(const nlohmann::json& root,
            << gpu.value("centroid_route_body_reads", 0ULL) << "/"
            << gpu.value("centroid_route_unchanged_polls", 0ULL) << "/"
            << gpu.value("centroid_route_poll_delay_us", 0ULL) << '\n';
+    output << "  centroid route query snapshot retries/timeouts: "
+           << gpu.value("centroid_route_query_retries", 0ULL) << "/"
+           << gpu.value("centroid_route_query_timeouts", 0ULL) << '\n';
     output << "  GPU query/prepare/graph/score/beam/exact us: "
            << gpu.value("average_gpu_query_us", 0.0) << "/"
            << gpu.value("average_gpu_prepare_us", 0.0) << "/"

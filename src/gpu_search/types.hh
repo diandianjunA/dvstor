@@ -28,6 +28,40 @@ struct QueryDescriptor {
 
 static_assert(sizeof(QueryDescriptor) == 40);
 
+enum class QueryFailureReason : u32 {
+  none = 0,
+  invalid_descriptor = 1,
+  route_snapshot_timeout = 2,
+  route_no_seed = 3,
+  graph_fetch = 4,
+  dynamic_code_fetch = 5,
+  exact_rerank_empty = 6,
+};
+
+inline constexpr u32 kQueryFailureReasonBits = 8;
+inline constexpr u32 kQueryFailureReasonMask =
+  (u32{1} << kQueryFailureReasonBits) - 1;
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr u32 make_query_diagnostic(QueryFailureReason reason,
+                                           u32 route_snapshot_retries = 0) {
+  const u32 bounded_retries = route_snapshot_retries > 0x00ffffffu
+    ? 0x00ffffffu : route_snapshot_retries;
+  return (bounded_retries << kQueryFailureReasonBits) |
+    static_cast<u32>(reason);
+}
+
+inline constexpr QueryFailureReason query_failure_reason(u32 diagnostic) {
+  return static_cast<QueryFailureReason>(
+    diagnostic & kQueryFailureReasonMask);
+}
+
+inline constexpr u32 query_route_snapshot_retries(u32 diagnostic) {
+  return diagnostic >> kQueryFailureReasonBits;
+}
+
 struct CompletionDescriptor {
   u64 request_id{};
   u64 gpu_cycles{};
@@ -45,7 +79,9 @@ struct CompletionDescriptor {
   u32 exact_vectors{};
   u32 route_hits{};
   u32 graph_read_retries{};
-  u32 reserved[1]{};
+  // Low 8 bits encode QueryFailureReason; the high 24 bits count complete
+  // centroid-route snapshot retries caused by a concurrent publication.
+  u32 diagnostic{};
 };
 
 struct CentroidRoutePublishDescriptor {
@@ -93,6 +129,8 @@ struct TelemetrySnapshot {
   u64 centroid_route_body_reads{};
   u64 centroid_route_unchanged_polls{};
   u64 centroid_route_poll_delay_us{};
+  u64 centroid_route_query_retries{};
+  u64 centroid_route_query_timeouts{};
   u64 exact_vector_reads{};
 };
 
@@ -133,6 +171,8 @@ public:
   std::atomic<u64> centroid_route_body_reads{0};
   std::atomic<u64> centroid_route_unchanged_polls{0};
   std::atomic<u64> centroid_route_poll_delay_us{0};
+  std::atomic<u64> centroid_route_query_retries{0};
+  std::atomic<u64> centroid_route_query_timeouts{0};
   std::atomic<u64> exact_vector_reads{0};
 };
 

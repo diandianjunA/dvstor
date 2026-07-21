@@ -9,6 +9,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "gpu_search/persistent_kernel/query_traversal.cuh"
 
@@ -17,6 +18,8 @@ namespace {
 using gpu_search::DeviceCentroidRouteEntry;
 using gpu_search::DeviceCentroidRouteShard;
 using gpu_search::PersistentKernelParams;
+using gpu_search::CompletionDescriptor;
+using gpu_search::QueryDescriptor;
 using gpu_search::f32;
 using gpu_search::u32;
 using gpu_search::u64;
@@ -77,6 +80,212 @@ __global__ void classify_graph_record_kernel(
       true, state, false);
   output[0] = static_cast<u32>(state);
   output[1] = static_cast<u32>(action);
+}
+
+__global__ void route_contention_query_kernel(PersistentKernelParams params,
+                                               QueryDescriptor descriptor) {
+  gpu_search::persistent_kernel_detail::process_query(params, descriptor);
+}
+
+__global__ void close_route_epoch_after(u64* epoch, u64 delay_ns) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  u64 started = 0;
+  u64 now = 0;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(started));
+  do {
+    __nanosleep(256);
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+  } while (now - started < delay_ns);
+  atomicExch(reinterpret_cast<unsigned long long*>(epoch), 2ULL);
+  __threadfence();
+}
+
+void test_route_publication_contention() {
+  constexpr u32 kRouteDim = 1;
+  constexpr u32 kRequestCapacity = gpu_search::kPersistentMaxMergeCandidates;
+
+  std::vector<void*> allocations;
+  const auto allocate = [&](std::size_t bytes) {
+    void* result = nullptr;
+    check_cuda(cudaMalloc(&result, bytes), "cudaMalloc(route contention state)");
+    allocations.push_back(result);
+    check_cuda(cudaMemset(result, 0, bytes), "cudaMemset(route contention state)");
+    return result;
+  };
+
+  auto* shard = static_cast<gpu_search::DeviceShardRegion*>(
+    allocate(sizeof(gpu_search::DeviceShardRegion)));
+  const gpu_search::DeviceShardRegion shard_host{
+    .ordinal_base = 0,
+    .node_count = 1,
+    .node_base_offset = 0x1000,
+    .node_stride = 64,
+    .graph_base_offset = 0x2000,
+    .dynamic_base_offset = 0x4000,
+    .memory_node = 0,
+    .dynamic_record_bytes = 64,
+    .dynamic_hot_offset = 16,
+    .dynamic_code_offset = 32,
+  };
+  check_cuda(cudaMemcpy(shard, &shard_host, sizeof(shard_host),
+                        cudaMemcpyHostToDevice), "cudaMemcpy(route shard)");
+
+  auto* route_shard = static_cast<DeviceCentroidRouteShard*>(
+    allocate(sizeof(DeviceCentroidRouteShard)));
+  const DeviceCentroidRouteShard route_shard_host{
+    .sequence = 2,
+    .command_id = 1,
+    .version = 1,
+    .vector_count = 1,
+    .live_entry_count = 1,
+  };
+  check_cuda(cudaMemcpy(route_shard, &route_shard_host,
+                        sizeof(route_shard_host), cudaMemcpyHostToDevice),
+             "cudaMemcpy(route shard header)");
+  auto* route_entries = static_cast<DeviceCentroidRouteEntry*>(
+    allocate(gpu_search::kCentroidRouteMaxLiveEntries *
+             sizeof(DeviceCentroidRouteEntry)));
+  const DeviceCentroidRouteEntry route_entry{
+    .remote_node = 0x1000 >> 4,
+    .generation = 1,
+    .flags = gpu_search::kCentroidRouteLive,
+  };
+  check_cuda(cudaMemcpy(route_entries, &route_entry, sizeof(route_entry),
+                        cudaMemcpyHostToDevice), "cudaMemcpy(route entry)");
+  auto* route_epoch = static_cast<u64*>(allocate(sizeof(u64)));
+  const u64 odd_epoch = 1;
+  check_cuda(cudaMemcpy(route_epoch, &odd_epoch, sizeof(odd_epoch),
+                        cudaMemcpyHostToDevice), "cudaMemcpy(odd route epoch)");
+
+  auto* query_input = static_cast<std::uint8_t*>(allocate(sizeof(std::uint8_t)));
+  auto* result_id = static_cast<u32*>(allocate(sizeof(u32)));
+  auto* result_distance = static_cast<f32*>(allocate(sizeof(f32)));
+  auto* pq_code = static_cast<std::uint8_t*>(allocate(sizeof(std::uint8_t)));
+  auto* pq_centroids = static_cast<f32*>(allocate(256 * sizeof(f32)));
+  auto* decoded_query = static_cast<f32*>(allocate(sizeof(f32)));
+  auto* transformed_query = static_cast<f32*>(allocate(sizeof(f32)));
+  auto* query_lut = static_cast<f32*>(allocate(256 * sizeof(f32)));
+  auto* navigation_handles = static_cast<u64*>(
+    allocate(kRequestCapacity * sizeof(u64)));
+  auto* navigation_distances = static_cast<f32*>(
+    allocate(kRequestCapacity * sizeof(f32)));
+  auto* visited = static_cast<u64*>(allocate(256 * sizeof(u64)));
+  auto* exact_records = static_cast<std::uint8_t*>(allocate(24));
+  auto* request_shards = static_cast<u32*>(
+    allocate(kRequestCapacity * sizeof(u32)));
+  auto* request_offsets = static_cast<u64*>(
+    allocate(kRequestCapacity * sizeof(u64)));
+  auto* request_iovas = static_cast<u64*>(
+    allocate(kRequestCapacity * sizeof(u64)));
+  auto* stop = static_cast<u32*>(allocate(sizeof(u32)));
+  auto* shard_centroid = static_cast<f32*>(allocate(sizeof(f32)));
+  auto* completion_enqueue = static_cast<unsigned long long*>(
+    allocate(sizeof(unsigned long long)));
+  auto* completion_dequeue = static_cast<unsigned long long*>(
+    allocate(sizeof(unsigned long long)));
+  auto* completion_sequences = static_cast<unsigned long long*>(
+    allocate(2 * sizeof(unsigned long long)));
+  const std::array<unsigned long long, 2> initial_sequences{0, 1};
+  check_cuda(cudaMemcpy(completion_sequences, initial_sequences.data(),
+                        sizeof(initial_sequences), cudaMemcpyHostToDevice),
+             "cudaMemcpy(completion sequences)");
+  auto* completion_entries = static_cast<CompletionDescriptor*>(
+    allocate(2 * sizeof(CompletionDescriptor)));
+
+  PersistentKernelParams params{
+    .completions = {
+      .enqueue_position = completion_enqueue,
+      .dequeue_position = completion_dequeue,
+      .sequences = completion_sequences,
+      .entries = completion_entries,
+      .capacity = 2,
+      .mask = 1,
+    },
+    .shards = shard,
+    .num_shards = 1,
+    .pq_codes = pq_code,
+    .pq_centroids = pq_centroids,
+    .num_nodes = 1,
+    .dim = kRouteDim,
+    .pq_subquantizers = 1,
+    .pq_subvector_dim = 1,
+    .pq_code_bytes = 1,
+    .graph_entry_bytes = 16,
+    .graph_degree = 1,
+    .graph_entry_capacity = 1,
+    .node_record_bytes = 16,
+    .node_record_stride = 24,
+    .node_vector_offset = 8,
+    .node_incarnation_offset = 4,
+    .vector_bytes = 1,
+    .vector_dtype = 1,
+    .traversal_beam_width = 1,
+    .final_rerank_width = 1,
+    .exact_width = 1,
+    .max_expansions = 0,
+    .visited_capacity = 256,
+    .query_slots = 1,
+    .route_snapshot_timeout_ns = 100'000'000ULL,
+    .centroid_route_shards = route_shard,
+    .centroid_route_entries = route_entries,
+    .shard_centroids = shard_centroid,
+    .centroid_route_epoch = route_epoch,
+    .centroid_route_shard_capacity = 1,
+    .centroid_route_entry_capacity =
+      gpu_search::kCentroidRouteMaxLiveEntries,
+    .stop = stop,
+    .decoded_queries = decoded_query,
+    .transformed_queries = transformed_query,
+    .query_luts = query_lut,
+    .navigation_candidate_handles = navigation_handles,
+    .navigation_candidate_distances = navigation_distances,
+    .visited_hash = visited,
+    .exact_records = exact_records,
+    .dynamic_code_request_shards = request_shards,
+    .dynamic_code_request_offsets = request_offsets,
+    .dynamic_code_request_local_iovas = request_iovas,
+    .result_ids = result_id,
+    .result_distances = result_distance,
+  };
+  const QueryDescriptor descriptor{
+    .request_id = 7,
+    .query_device_address = reinterpret_cast<u64>(query_input),
+    .result_device_address = reinterpret_cast<u64>(result_id),
+    .query_slot = 0,
+    .result_capacity = 1,
+    .dim = 1,
+    .k = 1,
+    .query_dtype = 1,
+  };
+
+  cudaStream_t query_stream = nullptr;
+  cudaStream_t writer_stream = nullptr;
+  check_cuda(cudaStreamCreateWithFlags(&query_stream, cudaStreamNonBlocking),
+             "cudaStreamCreate(query contention)");
+  check_cuda(cudaStreamCreateWithFlags(&writer_stream, cudaStreamNonBlocking),
+             "cudaStreamCreate(route writer)");
+  route_contention_query_kernel<<<1, 128, 0, query_stream>>>(params, descriptor);
+  check_cuda(cudaGetLastError(), "route_contention_query_kernel launch");
+  close_route_epoch_after<<<1, 1, 0, writer_stream>>>(route_epoch, 5'000'000ULL);
+  check_cuda(cudaGetLastError(), "close_route_epoch_after launch");
+  check_cuda(cudaStreamSynchronize(query_stream),
+             "cudaStreamSynchronize(route contention query)");
+  check_cuda(cudaStreamSynchronize(writer_stream),
+             "cudaStreamSynchronize(route writer)");
+
+  CompletionDescriptor completion{};
+  check_cuda(cudaMemcpy(&completion, completion_entries, sizeof(completion),
+                        cudaMemcpyDeviceToHost),
+             "cudaMemcpy(route contention completion)");
+  assert(completion.request_id == descriptor.request_id);
+  assert(completion.status == -EIO);
+  assert(gpu_search::query_failure_reason(completion.diagnostic) ==
+         gpu_search::QueryFailureReason::exact_rerank_empty);
+  assert(gpu_search::query_route_snapshot_retries(completion.diagnostic) != 0);
+
+  check_cuda(cudaStreamDestroy(writer_stream), "cudaStreamDestroy(route writer)");
+  check_cuda(cudaStreamDestroy(query_stream), "cudaStreamDestroy(query contention)");
+  for (void* allocation : allocations) check_cuda(cudaFree(allocation), "cudaFree");
 }
 
 }  // namespace
@@ -163,6 +372,8 @@ int main() {
       assert(actual[rank].shard == expected[rank].shard);
       assert(actual[rank].distance == expected[rank].distance);
     }
+
+    test_route_publication_contention();
 
     // Exercise the same host/device classifier used by graph RDMA reads. A
     // checksum-valid replacement incarnation must discard only the stale

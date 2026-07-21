@@ -148,6 +148,8 @@ __device__ void process_query(const PersistentKernelParams& params,
       descriptor.k == 0 || descriptor.k > descriptor.result_capacity) {
     if (threadIdx.x == 0) {
       completion.status = -EINVAL;
+      completion.diagnostic = make_query_diagnostic(
+        QueryFailureReason::invalid_descriptor);
       completion.gpu_cycles = clock64() - query_started_cycles;
       device_ring_push(params.completions, completion);
     }
@@ -272,97 +274,162 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ u32 route_entry_count;
   __shared__ u32 ranked_route_count;
   __shared__ u32 route_seed_failed;
+  __shared__ u32 route_snapshot_conflicted;
+  __shared__ u32 route_snapshot_timed_out;
+  __shared__ u32 route_snapshot_cancelled;
+  __shared__ u32 route_snapshot_retries;
+  __shared__ u32 route_snapshot_backoff_ns;
+  __shared__ u32 route_failure_reason;
   __shared__ u64 route_epoch_before;
+  __shared__ u64 route_wait_started_ns;
   if (threadIdx.x == 0) {
     rerank_count = 0;
     total_exact_reads = 0;
+    route_snapshot_retries = 0;
   }
   __syncthreads();
 
   // A route publication may replace every seed after this CTA snapshots it.
-  // Re-snapshot once in the same query when no seed remains routable. This is
-  // deliberately bounded and never falls back to an immutable entry table.
+  // Epoch contention is not an I/O error: wait for one complete authoritative
+  // table transaction. The occupancy planner reserves a resident control CTA,
+  // so the writer can always close the short odd-epoch window. A genuinely
+  // stuck writer is bounded by the independent route-control deadline below.
+  // Separately, re-snapshot once when a once-valid seed becomes stale after the
+  // transaction; no immutable entry table is used as a fallback.
   for (u32 route_attempt = 0; route_attempt < 2; ++route_attempt) {
     if (threadIdx.x == 0) {
-      route_entry_count = 0;
-      ranked_route_count = 0;
-      route_seed_failed = 0;
-      if (params.centroid_route_epoch == nullptr) {
-        route_epoch_before = 1;
-        route_seed_failed = 1;
-      } else {
-        cuda::atomic_ref<u64, cuda::thread_scope_device> route_epoch(
-          *params.centroid_route_epoch);
-        route_epoch_before = route_epoch.load(cuda::memory_order_acquire);
-        if ((route_epoch_before & 1u) != 0) route_seed_failed = 1;
-      }
       beam_count = 0;
       rerank_count = 0;
-    }
-    // Parallelize across physical shards while preserving the exact scalar
-    // fmaf recurrence within a shard. A dimension-wise tree reduction would
-    // change FP32 rounding and could send inserts and queries to different
-    // homes. With at most 64 shards, one lane per shard removes the previous
-    // thread-0 shards*dim serialization without weakening that invariant.
-    for (u32 shard = threadIdx.x; shard < kPersistentMaxShards;
-         shard += blockDim.x) {
-      route_snapshot_entry_counts[shard] = 0;
-      ranked_routes[shard] = centroid_route_ranking::RankedShard{
-        .distance = FLT_MAX,
-        .shard = shard,
-        .valid = 0,
-      };
-      if (shard >= params.num_shards) continue;
-      CentroidRouteShardSnapshot snapshot;
-      if (!snapshot_centroid_route_shard(params, shard, query, snapshot)) {
-        continue;
-      }
-      route_snapshot_entry_counts[shard] = snapshot.live_entry_count;
-      for (u32 entry = 0; entry < snapshot.live_entry_count; ++entry) {
-        route_snapshot_remote_nodes[
-          static_cast<size_t>(shard) * kCentroidRouteMaxLiveEntries + entry] =
-          snapshot.remote_nodes[entry];
-      }
-      ranked_routes[shard] = centroid_route_ranking::RankedShard{
-        .distance = snapshot.distance,
-        .shard = shard,
-        .valid = 1,
-      };
+      route_wait_started_ns = global_time_ns();
+      route_snapshot_backoff_ns = 128u +
+        ((descriptor.query_slot * 97u + route_attempt * 53u) & 255u);
     }
     __syncthreads();
-    sort_centroid_route_shards(ranked_routes);
-    if (threadIdx.x == 0) {
-      u64 route_epoch_after = 1;
-      if (params.centroid_route_epoch != nullptr) {
-        cuda::atomic_ref<u64, cuda::thread_scope_device> route_epoch(
-          *params.centroid_route_epoch);
-        route_epoch_after = route_epoch.load(cuda::memory_order_acquire);
-      }
-      if (params.centroid_route_epoch == nullptr ||
-          !centroid_route_ranking::stable_publication_epoch(
-            route_epoch_before, route_epoch_after)) {
-        route_seed_failed = 1;
+    for (;;) {
+      if (threadIdx.x == 0) {
         route_entry_count = 0;
-      } else {
-        while (ranked_route_count < kPersistentMaxShards &&
-               ranked_routes[ranked_route_count].valid != 0) {
-          ++ranked_route_count;
-        }
-      }
-      // Query and Stage1 share one locality decision: begin only at the
-      // nearest routable centroid shard. Cross-shard work is introduced by
-      // graph edges, never by an eager multi-shard seed fanout.
-      if (route_seed_failed == 0 && ranked_route_count != 0) {
-        const u32 shard = ranked_routes[0].shard;
-        for (u32 local = 0; local < route_snapshot_entry_counts[shard];
-             ++local) {
-          const u64 remote_node = route_snapshot_remote_nodes[
-            static_cast<size_t>(shard) * kCentroidRouteMaxLiveEntries + local];
-          const u64 handle = handle_from_raw(params, remote_node);
-          if (handle != kInvalidDeviceHandle) {
-            navigation_handles[route_entry_count++] = handle;
+        ranked_route_count = 0;
+        route_seed_failed = 0;
+        route_snapshot_conflicted = 0;
+        route_snapshot_timed_out = 0;
+        route_snapshot_cancelled = 0;
+        route_failure_reason = static_cast<u32>(
+          QueryFailureReason::route_no_seed);
+        if (params.centroid_route_epoch == nullptr) {
+          route_epoch_before = 1;
+          route_seed_failed = 1;
+        } else {
+          cuda::atomic_ref<u64, cuda::thread_scope_device> route_epoch(
+            *params.centroid_route_epoch);
+          route_epoch_before = route_epoch.load(cuda::memory_order_acquire);
+          if ((route_epoch_before & 1u) != 0) {
+            route_snapshot_conflicted = 1;
           }
         }
+      }
+      __syncthreads();
+
+      if (route_snapshot_conflicted == 0) {
+        // Parallelize across physical shards while preserving the exact scalar
+        // fmaf recurrence within a shard. A dimension-wise tree reduction
+        // would change FP32 rounding and could send inserts and queries to
+        // different homes.
+        for (u32 shard = threadIdx.x; shard < kPersistentMaxShards;
+             shard += blockDim.x) {
+          route_snapshot_entry_counts[shard] = 0;
+          ranked_routes[shard] = centroid_route_ranking::RankedShard{
+            .distance = FLT_MAX,
+            .shard = shard,
+            .valid = 0,
+          };
+          if (shard >= params.num_shards) continue;
+          CentroidRouteShardSnapshot snapshot;
+          if (!snapshot_centroid_route_shard(params, shard, query, snapshot)) {
+            continue;
+          }
+          route_snapshot_entry_counts[shard] = snapshot.live_entry_count;
+          for (u32 entry = 0; entry < snapshot.live_entry_count; ++entry) {
+            route_snapshot_remote_nodes[
+              static_cast<size_t>(shard) * kCentroidRouteMaxLiveEntries + entry] =
+              snapshot.remote_nodes[entry];
+          }
+          ranked_routes[shard] = centroid_route_ranking::RankedShard{
+            .distance = snapshot.distance,
+            .shard = shard,
+            .valid = 1,
+          };
+        }
+        __syncthreads();
+        sort_centroid_route_shards(ranked_routes);
+        if (threadIdx.x == 0) {
+          u64 route_epoch_after = 1;
+          if (params.centroid_route_epoch != nullptr) {
+            cuda::atomic_ref<u64, cuda::thread_scope_device> route_epoch(
+              *params.centroid_route_epoch);
+            route_epoch_after = route_epoch.load(cuda::memory_order_acquire);
+          }
+          if (params.centroid_route_epoch == nullptr ||
+              !centroid_route_ranking::stable_publication_epoch(
+                route_epoch_before, route_epoch_after)) {
+            route_snapshot_conflicted = 1;
+            route_entry_count = 0;
+          } else {
+            while (ranked_route_count < kPersistentMaxShards &&
+                   ranked_routes[ranked_route_count].valid != 0) {
+              ++ranked_route_count;
+            }
+          }
+          // Query and Stage1 share one locality decision: begin only at the
+          // nearest routable centroid shard. Cross-shard work is introduced by
+          // graph edges, never by an eager multi-shard seed fanout.
+          if (route_snapshot_conflicted == 0 && route_seed_failed == 0 &&
+              ranked_route_count != 0) {
+            const u32 shard = ranked_routes[0].shard;
+            for (u32 local = 0; local < route_snapshot_entry_counts[shard];
+                 ++local) {
+              const u64 remote_node = route_snapshot_remote_nodes[
+                static_cast<size_t>(shard) * kCentroidRouteMaxLiveEntries + local];
+              const u64 handle = handle_from_raw(params, remote_node);
+              if (handle != kInvalidDeviceHandle) {
+                navigation_handles[route_entry_count++] = handle;
+              }
+            }
+          }
+        }
+        __syncthreads();
+      }
+
+      if (route_snapshot_conflicted == 0) break;
+      if (threadIdx.x == 0) {
+        ++route_snapshot_retries;
+        if (params.stop != nullptr &&
+            *reinterpret_cast<const volatile u32*>(params.stop) != 0) {
+          route_snapshot_cancelled = 1;
+        } else {
+          const u64 timeout_ns = params.route_snapshot_timeout_ns == 0
+            ? u64{100'000'000} : params.route_snapshot_timeout_ns;
+          if (global_time_ns() - route_wait_started_ns >= timeout_ns) {
+            route_snapshot_timed_out = 1;
+          } else {
+            device_ring_relax(route_snapshot_backoff_ns);
+            route_snapshot_backoff_ns = min(
+              route_snapshot_backoff_ns * 2u, 8192u);
+          }
+        }
+      }
+      __syncthreads();
+      if (route_snapshot_cancelled != 0) return;
+      if (route_snapshot_timed_out != 0) {
+        if (threadIdx.x == 0) {
+          completion.status = -ETIMEDOUT;
+          completion.diagnostic = make_query_diagnostic(
+            QueryFailureReason::route_snapshot_timeout,
+            route_snapshot_retries);
+          completion.gpu_cycles = clock64() - query_started_cycles;
+          device_ring_push(params.completions, completion);
+        }
+        __syncthreads();
+        return;
       }
     }
     __syncthreads();
@@ -370,7 +437,11 @@ __device__ void process_query(const PersistentKernelParams& params,
         !approximate_handles_batch(params, descriptor, query_lut,
                                    navigation_handles, route_entry_count,
                                    navigation_distances)) {
-      if (threadIdx.x == 0) route_seed_failed = 1;
+      if (threadIdx.x == 0) {
+        route_seed_failed = 1;
+        route_failure_reason = static_cast<u32>(
+          QueryFailureReason::dynamic_code_fetch);
+      }
     }
     __syncthreads();
     if (route_seed_failed == 0) {
@@ -435,6 +506,9 @@ __device__ void process_query(const PersistentKernelParams& params,
       }
       if (threadIdx.x == 0) {
         completion.status = -EIO;
+        completion.diagnostic = make_query_diagnostic(
+          static_cast<QueryFailureReason>(route_failure_reason),
+          route_snapshot_retries);
         completion.gpu_cycles = clock64() - query_started_cycles;
         device_ring_push(params.completions, completion);
       }
@@ -512,6 +586,8 @@ __device__ void process_query(const PersistentKernelParams& params,
       __syncthreads();
       if (threadIdx.x == 0) {
         completion.status = -EIO;
+        completion.diagnostic = make_query_diagnostic(
+          QueryFailureReason::graph_fetch, route_snapshot_retries);
         completion.gpu_cycles = clock64() - query_started_cycles;
         completion.remote_pages = total_remote_reads;
         completion.remote_batches = total_remote_batches;
@@ -618,6 +694,9 @@ __device__ void process_query(const PersistentKernelParams& params,
       __syncthreads();
       if (threadIdx.x == 0) {
         completion.status = -EIO;
+        completion.diagnostic = make_query_diagnostic(
+          QueryFailureReason::dynamic_code_fetch,
+          route_snapshot_retries);
         completion.gpu_cycles = clock64() - query_started_cycles;
         completion.remote_pages = total_remote_reads;
         completion.remote_batches = total_remote_batches;
@@ -680,6 +759,9 @@ __device__ void process_query(const PersistentKernelParams& params,
     }
     if (threadIdx.x == 0) {
       completion.status = -EIO;
+      completion.diagnostic = make_query_diagnostic(
+        QueryFailureReason::exact_rerank_empty,
+        route_snapshot_retries);
       completion.gpu_cycles = clock64() - query_started_cycles;
       completion.remote_pages = total_remote_reads;
       completion.remote_batches = total_remote_batches;
@@ -707,6 +789,8 @@ __device__ void process_query(const PersistentKernelParams& params,
     }
     completion.result_count = result_count;
     completion.status = 0;
+    completion.diagnostic = make_query_diagnostic(
+      QueryFailureReason::none, route_snapshot_retries);
     completion.gpu_cycles = clock64() - query_started_cycles;
     completion.graph_cycles = graph_phase_cycles;
     completion.score_cycles = score_phase_cycles;

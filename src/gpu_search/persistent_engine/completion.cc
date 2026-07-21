@@ -24,6 +24,20 @@ owner_watchdog::Observation sample_owner_progress(
   };
 }
 
+const char* query_failure_reason_name(QueryFailureReason reason) {
+  switch (reason) {
+    case QueryFailureReason::none: return "none";
+    case QueryFailureReason::invalid_descriptor: return "invalid_descriptor";
+    case QueryFailureReason::route_snapshot_timeout:
+      return "route_snapshot_timeout";
+    case QueryFailureReason::route_no_seed: return "route_no_seed";
+    case QueryFailureReason::graph_fetch: return "graph_fetch";
+    case QueryFailureReason::dynamic_code_fetch: return "dynamic_code_fetch";
+    case QueryFailureReason::exact_rerank_empty: return "exact_rerank_empty";
+  }
+  return "unknown";
+}
+
 }  // namespace
 
 void PersistentSearchEngine::Impl::report_direct_path_failure() {
@@ -198,6 +212,16 @@ void PersistentSearchEngine::Impl::completion_loop() {
         completion.result_count > result_capacity) {
       completion.status = -EOVERFLOW;
     }
+    const QueryFailureReason failure_reason =
+      query_failure_reason(completion.diagnostic);
+    const u32 route_snapshot_retries =
+      query_route_snapshot_retries(completion.diagnostic);
+    engine.telemetry_.centroid_route_query_retries.fetch_add(
+      route_snapshot_retries, std::memory_order_relaxed);
+    if (failure_reason == QueryFailureReason::route_snapshot_timeout) {
+      engine.telemetry_.centroid_route_query_timeouts.fetch_add(
+        1, std::memory_order_relaxed);
+    }
     const auto submitted_at = state.submitted_at;
     const auto completed_at = std::chrono::steady_clock::now();
     const u64 gpu_ns = completion.gpu_cycles * 1000000ULL / gpu_clock_khz;
@@ -226,8 +250,12 @@ void PersistentSearchEngine::Impl::completion_loop() {
     if (completion.status != 0) {
       report_direct_path_failure();
       if (healthy.load(std::memory_order_acquire)) {
-        mark_unhealthy("persistent GPU query failed with status " +
-                       std::to_string(completion.status));
+        std::ostringstream message;
+        message << "persistent GPU query failed with status "
+                << completion.status
+                << " reason=" << query_failure_reason_name(failure_reason)
+                << " route_snapshot_retries=" << route_snapshot_retries;
+        mark_unhealthy(message.str());
       }
       reject_query_slot(completion.query_slot);
     } else {

@@ -152,6 +152,20 @@ void test_whole_table_publication_epoch() {
   assert(!stable_publication_epoch(42, 44));
 }
 
+void test_query_diagnostic_encoding() {
+  const u32 diagnostic = gpu_search::make_query_diagnostic(
+    gpu_search::QueryFailureReason::route_snapshot_timeout, 12345);
+  assert(gpu_search::query_failure_reason(diagnostic) ==
+         gpu_search::QueryFailureReason::route_snapshot_timeout);
+  assert(gpu_search::query_route_snapshot_retries(diagnostic) == 12345);
+  const u32 saturated = gpu_search::make_query_diagnostic(
+    gpu_search::QueryFailureReason::graph_fetch,
+    std::numeric_limits<u32>::max());
+  assert(gpu_search::query_failure_reason(saturated) ==
+         gpu_search::QueryFailureReason::graph_fetch);
+  assert(gpu_search::query_route_snapshot_retries(saturated) == 0x00ffffffu);
+}
+
 }  // namespace
 
 int main() {
@@ -159,5 +173,6 @@ int main() {
   test_fma_home_and_seed_parity();
   test_physical_shard_tie_break();
   test_whole_table_publication_epoch();
+  test_query_diagnostic_encoding();
   return 0;
 }

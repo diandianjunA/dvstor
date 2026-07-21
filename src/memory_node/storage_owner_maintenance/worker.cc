@@ -2061,12 +2061,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     if (admission == Stage2AdmissionDecision::unavailable) {
       return nullptr;
     }
-    if (admission == Stage2AdmissionDecision::foreground_pressure) {
-      storage_owner_maintenance_pressure_yields_.fetch_add(
-        1, std::memory_order_relaxed);
-      return nullptr;
-    }
-    if (!try_acquire_storage_owner_maintenance_slot(config)) {
+    const bool foreground_pressure =
+      admission == Stage2AdmissionDecision::foreground_pressure;
+    if (!try_acquire_storage_owner_maintenance_slot(
+          config, foreground_pressure)) {
       storage_owner_maintenance_pressure_yields_.fetch_add(
         1, std::memory_order_relaxed);
       return nullptr;

@@ -21,9 +21,21 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   const u64 initial_durable = durable.load(std::memory_order_acquire);
   lib_assert(initial_next == initial_durable + 1,
              "storage-owner cannot restart with unfinished in-memory maintenance");
+  const u32 rpc_parallelism = std::max<u32>(
+    1, static_cast<u32>(num_clients_) *
+       std::max<u32>(1, config.storage_owner_rpc_depth));
+  const auto cpu_plan = memory_node_detail::derive_storage_owner_cpu_plan(
+    core_assignment_.available_core_count(), num_compute_threads_,
+    rpc_parallelism, config.storage_owner_maintenance_workers,
+    num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
+  const u32 worker_count = cpu_plan.maintenance_workers;
   // Every reserved sequence is either already queued/runnable or completed by
   // its synchronous retirement path. Stage1 preparation owns no sequence, so
-  // the full descriptor bound is a safe admission window.
+  // the full descriptor bound is safe. Keep the smaller admission window tied
+  // to the workers that the CPU plan actually supplied, not merely the
+  // requested worker count: otherwise a constrained node can acknowledge a
+  // burst sized for executors that do not exist and create seconds of avoidable
+  // Stage2 debt before bounded backpressure begins.
   const size_t completion_capacity = std::max<size_t>(
     std::max<size_t>(1, config.storage_owner_batch_max),
     config.storage_owner_maintenance_queue_depth);
@@ -32,7 +44,7 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
       completion_capacity, initial_next, initial_durable);
   const u64 requested_admission_limit = std::max<u64>(
     std::max<u32>(1, config.storage_owner_batch_max),
-    static_cast<u64>(config.storage_owner_maintenance_workers) *
+    static_cast<u64>(worker_count) *
       std::max<u32>(1, config.storage_owner_rpc_depth) * 4);
   storage_owner_maintenance_admission_limit_ = static_cast<size_t>(
     std::min<u64>(completion_capacity, requested_admission_limit));
@@ -70,14 +82,6 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   }
   storage_owner_maintenance_started_ns_.store(steady_now_ns(), std::memory_order_release);
   storage_owner_maintenance_last_observation_ns_.store(0, std::memory_order_relaxed);
-  const u32 rpc_parallelism = std::max<u32>(
-    1, static_cast<u32>(num_clients_) *
-       std::max<u32>(1, config.storage_owner_rpc_depth));
-  const auto cpu_plan = memory_node_detail::derive_storage_owner_cpu_plan(
-    core_assignment_.available_core_count(), num_compute_threads_,
-    rpc_parallelism, config.storage_owner_maintenance_workers,
-    num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
-  const u32 worker_count = cpu_plan.maintenance_workers;
   const size_t contexts_per_worker =
     std::max<size_t>(1, config.storage_owner_rpc_depth);
   const size_t remote_peer_count =

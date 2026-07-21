@@ -569,7 +569,8 @@ private:
   void maybe_log_storage_owner_maintenance_observation();
   void storage_owner_maintenance_worker_loop(u32 worker_id);
   bool storage_owner_maintenance_foreground_busy(const Configuration& config);
-  bool try_acquire_storage_owner_maintenance_slot(const Configuration& config);
+  bool try_acquire_storage_owner_maintenance_slot(
+      const Configuration& config, bool foreground_pressure);
   memory_node_storage_owner_index_detail::IncarnationLockResult
     try_lock_node(RemotePtr rptr);
   bool storage_owner_task_current(node_t id, u32 generation, RemotePtr target);

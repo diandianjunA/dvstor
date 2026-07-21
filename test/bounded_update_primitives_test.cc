@@ -497,6 +497,20 @@ void test_stage2_admission_yields_only_for_live_foreground_pressure() {
   assert(pressure_probe_called);
 }
 
+void test_stage2_pressure_retains_a_dedicated_progress_floor() {
+  using memory_node_storage_owner_maintenance_detail::
+    stage2_context_admission_limit;
+
+  // The normal path can hide peer latency with the configured RPC depth.
+  assert(stage2_context_admission_limit(2, 16, false) == 32);
+  // Foreground pressure throttles that fanout but cannot stop both dedicated
+  // Stage2 workers, otherwise a full completion window deadlocks Stage1 ACKs.
+  assert(stage2_context_admission_limit(2, 16, true) == 2);
+  assert(stage2_context_admission_limit(1, 16, true) == 1);
+  assert(stage2_context_admission_limit(0, 0, true) == 1);
+  assert(stage2_context_admission_limit(0, 0, false) == 1);
+}
+
 void test_stage1_arm_queue_permit_cannot_be_stolen() {
   using memory_node_storage_owner_maintenance_detail::
     maintenance_queue_permit_available;
@@ -675,6 +689,7 @@ int main() {
   test_stale_stage2_sequence_handoff_to_bounded_repair();
   test_stale_stage2_repair_keeps_wire_payload_bound();
   test_stage2_admission_yields_only_for_live_foreground_pressure();
+  test_stage2_pressure_retains_a_dedicated_progress_floor();
   test_stage1_arm_queue_permit_cannot_be_stolen();
   test_reverse_candidate_is_revalidated_at_locked_write_boundary();
   test_reverse_overflow_uses_alpha_robust_prune_not_nearest_r();

@@ -91,6 +91,8 @@ void test_recall_and_report_formatting() {
   telemetry.centroid_route_body_reads = 3;
   telemetry.centroid_route_unchanged_polls = 47;
   telemetry.centroid_route_poll_delay_us = 8000;
+  telemetry.centroid_route_query_retries = 23;
+  telemetry.centroid_route_query_timeouts = 0;
   const auto telemetry_json = tools::breakdown_benchmark::telemetry_to_json(telemetry);
   assert(telemetry_json.at("graph_read_retries") == 11);
   assert(telemetry_json.at("centroid_route_publications") == 7);
@@ -100,6 +102,8 @@ void test_recall_and_report_formatting() {
   assert(telemetry_json.at("centroid_route_body_reads") == 3);
   assert(telemetry_json.at("centroid_route_unchanged_polls") == 47);
   assert(telemetry_json.at("centroid_route_poll_delay_us") == 8000);
+  assert(telemetry_json.at("centroid_route_query_retries") == 23);
+  assert(telemetry_json.at("centroid_route_query_timeouts") == 0);
 
   nlohmann::json root;
   root["meta"] = {
