@@ -24,11 +24,11 @@ num_cores: 112
 physical cores per socket: 28
 hyperthreading enabled
 local process CPU partition: rank 4/5 logical_cpus=22
-pairing: 12932 -- 8178
+pairing: 13902 -- 8829
 [STATUS]: loaded index metadata from /data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32_schema16 (layout=plain, vector_data_type=uint8)
 [STATUS]: storage-owner stage2 candidate width L=128 per shard
 allocation size: 25769803776
-allocated ALIGNED MEM (no hugepage) at 123126788653120 with buffer size 25769803776
+allocated ALIGNED MEM (no hugepage) at 136584148025408 with buffer size 25769803776
 [STATUS]: loading index (19261201856 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32_schema16_node5_of5.dat
 [STATUS]: loaded GPU PQ codes (621329088 Bytes) at remote offset 19261205952
 [STATUS]: storage-owner idmap loaded entries=20000000 format=owner_sharded_v2_bound immutable_base=true dynamic_shards=256 dynamic_reserved=65536
@@ -36,126 +36,126 @@ allocated ALIGNED MEM (no hugepage) at 123126788653120 with buffer size 25769803
 [STATUS]: register memory and distribute access token
 [STATUS]: connect QPs of compute threads
 [STATUS]: reserving 64 GPU/bootstrap QPs per compute node
-pairing: 12937 -- 8183
-pairing: 12942 -- 8188
-pairing: 12947 -- 8193
-pairing: 12952 -- 8198
-pairing: 12957 -- 8203
-pairing: 12962 -- 8208
-pairing: 12967 -- 8213
-pairing: 12972 -- 8218
-pairing: 12977 -- 8223
-pairing: 12982 -- 8228
-pairing: 12987 -- 8233
-pairing: 12992 -- 8238
-pairing: 12997 -- 8243
-pairing: 13002 -- 8248
-pairing: 13007 -- 8253
-pairing: 13012 -- 8258
-pairing: 13017 -- 8263
-pairing: 13022 -- 8268
-pairing: 13027 -- 8273
-pairing: 13032 -- 8278
-pairing: 13037 -- 8283
-pairing: 13042 -- 8288
-pairing: 13047 -- 8293
-pairing: 13052 -- 8298
-pairing: 13057 -- 8303
-pairing: 13062 -- 8308
-pairing: 13067 -- 8313
-pairing: 13072 -- 8318
-pairing: 13077 -- 8323
-pairing: 13082 -- 8328
-pairing: 13087 -- 8333
-pairing: 13092 -- 8338
-pairing: 13097 -- 8467
-pairing: 13222 -- 8468
-pairing: 13223 -- 8469
-pairing: 13224 -- 8470
-pairing: 13225 -- 8471
-pairing: 13226 -- 8472
-pairing: 13227 -- 8473
-pairing: 13228 -- 8474
-pairing: 13229 -- 8475
-pairing: 13230 -- 8476
-pairing: 13231 -- 8477
-pairing: 13232 -- 8478
-pairing: 13233 -- 8479
-pairing: 13234 -- 8480
-pairing: 13235 -- 8481
-pairing: 13236 -- 8482
-pairing: 13237 -- 8483
-pairing: 13238 -- 8484
-pairing: 13239 -- 8485
-pairing: 13240 -- 8486
-pairing: 13241 -- 8487
-pairing: 13242 -- 8488
-pairing: 13243 -- 8489
-pairing: 13244 -- 8490
-pairing: 13245 -- 8491
-pairing: 13246 -- 8492
-pairing: 13247 -- 8493
-pairing: 13248 -- 8494
-pairing: 13249 -- 8495
-pairing: 13250 -- 8496
-pairing: 13251 -- 8497
-pairing: 13252 -- 8498
+pairing: 13907 -- 8834
+pairing: 13912 -- 8839
+pairing: 13917 -- 8844
+pairing: 13922 -- 8849
+pairing: 13927 -- 8854
+pairing: 13932 -- 8859
+pairing: 13937 -- 8864
+pairing: 13942 -- 8869
+pairing: 13947 -- 8874
+pairing: 13952 -- 8879
+pairing: 13957 -- 8884
+pairing: 13962 -- 8889
+pairing: 13967 -- 8894
+pairing: 13972 -- 8899
+pairing: 13977 -- 8904
+pairing: 13982 -- 8909
+pairing: 13987 -- 8914
+pairing: 13992 -- 8919
+pairing: 13997 -- 8924
+pairing: 14002 -- 8929
+pairing: 14007 -- 8934
+pairing: 14012 -- 8939
+pairing: 14017 -- 8944
+pairing: 14022 -- 8949
+pairing: 14027 -- 8954
+pairing: 14032 -- 8959
+pairing: 14037 -- 8964
+pairing: 14042 -- 8969
+pairing: 14048 -- 8974
+pairing: 14052 -- 8979
+pairing: 14057 -- 8984
+pairing: 14062 -- 8989
+pairing: 14067 -- 9118
+pairing: 14192 -- 9119
+pairing: 14193 -- 9120
+pairing: 14194 -- 9121
+pairing: 14195 -- 9122
+pairing: 14196 -- 9123
+pairing: 14197 -- 9124
+pairing: 14198 -- 9125
+pairing: 14199 -- 9126
+pairing: 14200 -- 9127
+pairing: 14201 -- 9128
+pairing: 14202 -- 9129
+pairing: 14203 -- 9130
+pairing: 14204 -- 9131
+pairing: 14205 -- 9132
+pairing: 14206 -- 9133
+pairing: 14207 -- 9134
+pairing: 14208 -- 9135
+pairing: 14209 -- 9136
+pairing: 14210 -- 9137
+pairing: 14211 -- 9138
+pairing: 14212 -- 9139
+pairing: 14213 -- 9140
+pairing: 14214 -- 9141
+pairing: 14215 -- 9142
+pairing: 14216 -- 9143
+pairing: 14217 -- 9144
+pairing: 14218 -- 9145
+pairing: 14219 -- 9146
+pairing: 14220 -- 9147
+pairing: 14221 -- 9148
+pairing: 14222 -- 9149
 [STATUS]: waiting for compute-node startup barrier
 1 device(s) found
 Selected device: ibp86s0
 Selected port state: 4, lid: 8
-pairing: 13259 -- 13264
-pairing: 13266 -- 13273
-pairing: 13274 -- 13280
-pairing: 13283 -- 13288
-pairing: 13291 -- 13296
-pairing: 13299 -- 13304
-pairing: 13307 -- 13312
-pairing: 13315 -- 13318
-pairing: 13322 -- 13325
-pairing: 13328 -- 13332
-pairing: 13334 -- 13337
-pairing: 13340 -- 13343
-pairing: 13346 -- 13349
-pairing: 13352 -- 13355
-pairing: 13358 -- 13362
-pairing: 13364 -- 13366
-pairing: 13367 -- 13369
-pairing: 13370 -- 13373
-pairing: 13375 -- 13376
-pairing: 13378 -- 13380
-pairing: 13382 -- 13385
-pairing: 13386 -- 13389
-pairing: 13390 -- 13393
-pairing: 13394 -- 13397
-pairing: 13398 -- 13396
-pairing: 13399 -- 13400
-pairing: 13401 -- 13402
-pairing: 13403 -- 13404
-pairing: 13405 -- 13406
-pairing: 13407 -- 13408
-pairing: 13409 -- 13410
-pairing: 13411 -- 13412
+pairing: 14229 -- 14234
+pairing: 14236 -- 14243
+pairing: 14245 -- 14250
+pairing: 14253 -- 14258
+pairing: 14261 -- 14266
+pairing: 14269 -- 14274
+pairing: 14277 -- 14282
+pairing: 14285 -- 14288
+pairing: 14292 -- 14295
+pairing: 14298 -- 14301
+pairing: 14304 -- 14307
+pairing: 14310 -- 14313
+pairing: 14316 -- 14319
+pairing: 14321 -- 14325
+pairing: 14328 -- 14331
+pairing: 14334 -- 14335
+pairing: 14337 -- 14339
+pairing: 14340 -- 14343
+pairing: 14344 -- 14347
+pairing: 14348 -- 14351
+pairing: 14352 -- 14355
+pairing: 14356 -- 14359
+pairing: 14360 -- 14363
+pairing: 14364 -- 14367
+pairing: 14368 -- 14366
+pairing: 14370 -- 14369
+pairing: 14371 -- 14372
+pairing: 14374 -- 14373
+pairing: 14375 -- 14376
+pairing: 14378 -- 14377
+pairing: 14380 -- 14379
+pairing: 14382 -- 14381
 [STATUS]: storage-owner peer RDMA QPs per peer: 8
 [STATUS]: storage-owner peer QP0 reserved for RPC; data RDMA uses QP1..7
-allocated ALIGNED MEM (no hugepage) at 123125721202752 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 123125681356864 with buffer size 39839040
+allocated ALIGNED MEM (no hugepage) at 136583080575040 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 136583040729152 with buffer size 39839040
 [STATUS]: storage-owner peer RPC receive slots per peer: 64 (requested=64)
 [STATUS]: storage-owner peer RPC concurrent sends per peer: 16
 [STATUS]: storage-owner peer RPC send credits: Stage1/graph are split at depth >= 2; responses use a dedicated sync buffer
 [STATUS]: storage-owner peer async response capacity: 32768
-allocated ALIGNED MEM (no hugepage) at 123125957689408 with buffer size 488448
-allocated ALIGNED MEM (no hugepage) at 107855648412672 with buffer size 53248
-allocated ALIGNED MEM (no hugepage) at 107855648466944 with buffer size 53248
+allocated ALIGNED MEM (no hugepage) at 136583320117312 with buffer size 488448
+allocated ALIGNED MEM (no hugepage) at 100982740595712 with buffer size 53248
+allocated ALIGNED MEM (no hugepage) at 100982740649984 with buffer size 53248
 [STATUS]: storage-owner peer reverse-update workers: 2
 [STATUS]: storage-owner peer Stage1 workers: 6; Stage2-home workers: 1 (isolated fixed physical-home CPU partition)
 [STATUS]: storage-owner physical control workers: cleanup=2 placement=1 (separate blocking domains)
 [STATUS]: storage-owner Stage1 artifact capacity: 67968 (64-way, per shard=1062) cleanup replay per shard=2048 active migration receipts=131072
 [STATUS]: storage-owner peer reverse-update tuning: queue_depth=65536 coalesce_max=256
-allocated ALIGNED MEM (no hugepage) at 107855673765888 with buffer size 108160
-allocated ALIGNED MEM (no hugepage) at 107855673875968 with buffer size 108160
-allocated ALIGNED MEM (no hugepage) at 107855673986176 with buffer size 108160
-allocated ALIGNED MEM (no hugepage) at 107855674096384 with buffer size 108160
+allocated ALIGNED MEM (no hugepage) at 100982765948928 with buffer size 108160
+allocated ALIGNED MEM (no hugepage) at 100982766059008 with buffer size 108160
+allocated ALIGNED MEM (no hugepage) at 100982766169216 with buffer size 108160
+allocated ALIGNED MEM (no hugepage) at 100982766279424 with buffer size 108160
 [STATUS]: storage-owner peer scratch: snapshot_slot=192 graph_slot=832 batch=64 lane_peak_rdma_wrs=56 lane_useful_wave_rdma_wrs=56 global_read_window=224 search_lanes_global=8 search_lanes_per_worker_min/max=2/2 bytes_per_lane=54080 bytes_total=432640
 [STATUS]: storage-owner maintenance workers: 4 (configured=8, admission_baseline_workers=2, work_conserving=true)
 [STATUS]: storage-owner stage2 reverse outbox descriptors: 256 aggregates=256 wire_max_ops=3072 (shared per-peer work-conserving aggregation)
@@ -167,10 +167,5 @@ allocated ALIGNED MEM (no hugepage) at 107855674096384 with buffer size 108160
 [STATUS]: storage-owner foreground pipeline: coordinators=12 cpu_lanes=3 (assigned_cpus=22, rpc_parallelism=16)
 [STATUS]: storage-owner CPU plan: foreground_cpu=3 foreground_coordinators=12 maintenance=4 peer_stage1=7 (split into isolated Stage1/Stage2-home domains) peer_reverse=2 peer_cleanup=2 peer_placement=1 peer_progress=2 foreground_progress=1
 [STATUS]: storage-owner insert runtime enabled on shard 4
-Stage1 scheduler selected an empty publication queue
-[storage-owner] rejected malformed graph pointer boundary=read_local_neighbor_list raw=0x7a75e99 shard=0 offset=2054547856 incarnation=0 configured_shards=5 shard_bytes=25769803776 parent_raw=0x100799175d parent_shard=4 parent_offset=2039576016 parent_incarnation=0[storage-owner] rejected malformed graph pointer boundary=stage2_async_score/input raw=0x10c625 shard=0 offset=17588816 incarnation=0 configured_shards=5 shard_bytes=25769803776 context=0 count=2
-[storage-owner] rejected malformed graph pointer boundary=stage2_async_score/input raw=0x205a7f7 shard=0 offset=542801776 incarnation=0 configured_shards=5 shard_bytes= context=63 count=1
-[ERROR]: stable Stage1 graph contains a malformed remote pointer
-25769803776 context=[storage-owner] rejected malformed graph pointer1 count=3
-[storage-owner] rejected malformed graph pointer boundary=stage2_async_score/input raw=0x7ffb535 shard=0 offset=2147177296 incarnation=0 configured_shards=5 shard_bytes=25769803776 context=2 count=5
-[storage-owner] rejected malformed graph pointer boundary=stage2_async_score/input raw=0x810a273 shard=0 boundary=read_local_neighbor_list raw=0x38471df shard=0
+[STATUS]: storage-owner maintenance observation: enqueued=70 stage2_enqueued=70 cleanup_enqueued=0 stage2_tasks_done=0 stage2_finalized_live=0 cleanup_processed=0 stale=0 stage2_completion_ratio=0.000000 live_stage2_completion_ratio=0.000000 avg_stage2_delay_ms=0.000000 p99_stage2_delay_upper_ms=0.000000 p99_stage2_delay_over_30s=false stage2_delay_histogram=0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 max_stage2_delay_ms=0.000000 compaction_batch_target=32 compaction_max_delay_ms=10.000000 stage2_rate_per_sec=0.000000 stage1_search_budget_exhausted=0 stage2_search_budget_exhausted=0 stage2_continuations=70 stage2_remote_frontier_items=61084 avg_stage2_remote_frontier=872.628571 stage2_remote_expansions=74 avg_stage2_remote_expansions=1.057143 stage2_scored_candidates=8332 avg_stage2_scored_candidates=119.028571 stage2_graph_read_waves=70 avg_stage2_expansions_per_graph_wave=1.057143 stage2_graph_unique_reads=74 stage2_vector_read_waves=124 avg_stage2_scores_per_vector_wave=67.193548 stage2_vector_unique_reads=6086 stage2_home_rpc_batches=390 stage2_home_rpc_items=6160 avg_stage2_home_rpc_batch=15.794872 stage2_home_score_rpc_batches=319 stage2_home_score_rpc_items=6086 avg_stage2_home_score_rpc_batch=19.078370 stage2_home_scored_neighbors=8332 home_scores_per_expansion=1.352597 stage2_migrations=0 home_match_rate=0.000000 stage2_final_edges=0 stage2_cross_edges_stage1_home=0 stage2_cross_edges_final_home=0 cross_edge_reduction_ratio=0.000000 failed=0 rpc_timeouts=0 reverse_aggregate_batches=0 reverse_aggregate_logical_requests=0 reverse_aggregate_ops=0 avg_reverse_aggregate_logicals=0.000000 avg_reverse_aggregate_ops=0.000000 max_backlog=19 admission_window=128 completion_outstanding=70 pressure_yields=0 stage2_batches=9 avg_stage2_batch_size=7.777778 stage2_phase_search_attempts=1 stage2_phase_search_task_attempts=3 stage2_phase_search_elapsed_ms=66.590713 avg_stage2_phase_search_us_per_task=22196.904333 stage2_phase_freeze_prune_attempts=0 stage2_phase_freeze_prune_task_attempts=0 stage2_phase_freeze_prune_elapsed_ms=0.000000 avg_stage2_phase_freeze_prune_us_per_task=0.000000 stage2_phase_reverse_prepare_attempts=0 stage2_phase_reverse_prepare_task_attempts=0 stage2_phase_reverse_prepare_elapsed_ms=0.000000 avg_stage2_phase_reverse_prepare_us_per_task=0.000000 stage2_phase_placement_authority_attempts=0 stage2_phase_placement_authority_task_attempts=0 stage2_phase_placement_authority_elapsed_ms=0.000000 avg_stage2_phase_placement_authority_us_per_task=0.000000 stage2_phase_completion_handoff_attempts=0 stage2_phase_completion_handoff_task_attempts=0 stage2_phase_completion_handoff_elapsed_ms=0.000000 avg_stage2_phase_completion_handoff_us_per_task=0.000000 stage2_phase_finalize_attempts=0 stage2_phase_finalize_task_attempts=0 stage2_phase_finalize_elapsed_ms=0.000000 avg_stage2_phase_finalize_us_per_task=0.000000 maintenance_worker_idle_waits=214336 maintenance_worker_idle_ms=13793.873351 maintenance_worker_observed_idle_ratio=0.686996 maintenance_worker_observed_busy_ratio=0.313004 peer_stage1_enqueued=36 peer_stage1_processed=36 peer_stage1_items=125 avg_peer_stage1_items=3.472222 peer_stage1_rate_per_sec=24.902201 peer_stage1_max_queue=5 peer_stage1_active_workers=0 peer_stage2_home_enqueued=121 peer_stage2_home_processed=121 peer_stage2_home_items=1547 avg_peer_stage2_home_items=12.785124 peer_stage2_home_max_queue=4 peer_stage2_home_response_queue_drops=0 peer_stage2_home_response_send_wait_ms=0.769418 avg_peer_stage2_home_queue_wait_us=133.967893 avg_peer_stage2_home_execution_us=15.904298 peer_stage1_release_deferred_batches=0 peer_stage1_release_deferred_items=0 peer_stage1_duplicate_retry_responses=0 peer_stage1_admission_retry_responses=0 peer_stage1_retry_response_drops=0 peer_stage1_admission_waiters=0 peer_stage1_admission_waiter_items=0 peer_stage1_admission_owned_items=0 peer_stage1_admission_wake_coverage=0 peer_stage1_admission_parked=0 peer_stage1_admission_woken=0 peer_stage1_admission_reparked=0 peer_stage1_max_admission_waiters=0 peer_stage1_duplicate_coalesced=0 peer_reverse_enqueued=0 peer_reverse_processed=0 peer_reverse_remaining=0 peer_reverse_items_enqueued=0 peer_reverse_items_processed=0 peer_reverse_rate_per_sec=0.000000 peer_reverse_failed=0 peer_reverse_max_queue=0 reclaim_pending=0 reclaim_reused=0 dynamic_high_watermark=19882618496 stage2_remaining=0 cleanup_remaining=0 active_contexts=9 repair_remaining=0 remaining=70
+Send request failed: status=11 (remote operation error), opcode=0, vendor_err=137, wr_id=18446744065119617574

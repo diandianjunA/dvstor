@@ -24,11 +24,11 @@ num_cores: 112
 physical cores per socket: 28
 hyperthreading enabled
 local process CPU partition: rank 1/5 logical_cpus=22
-pairing: 12929 -- 8175
+pairing: 13899 -- 8826
 [STATUS]: loaded index metadata from /data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32_schema16 (layout=plain, vector_data_type=uint8)
 [STATUS]: storage-owner stage2 candidate width L=128 per shard
 allocation size: 25769803776
-allocated ALIGNED MEM (no hugepage) at 133649947164736 with buffer size 25769803776
+allocated ALIGNED MEM (no hugepage) at 138624156827712 with buffer size 25769803776
 [STATUS]: loading index (20436190144 Bytes) from /data/xjs/index/dvstor_sift100m/index/sift100m_R96_bw128_metis_pmd32_pq32_schema16_node2_of5.dat
 [STATUS]: loaded GPU PQ codes (659231936 Bytes) at remote offset 20436194240
 [STATUS]: storage-owner idmap loaded entries=20000000 format=owner_sharded_v2_bound immutable_base=true dynamic_shards=256 dynamic_reserved=65536
@@ -36,126 +36,126 @@ allocated ALIGNED MEM (no hugepage) at 133649947164736 with buffer size 25769803
 [STATUS]: register memory and distribute access token
 [STATUS]: connect QPs of compute threads
 [STATUS]: reserving 64 GPU/bootstrap QPs per compute node
-pairing: 12934 -- 8180
-pairing: 12939 -- 8185
-pairing: 12944 -- 8190
-pairing: 12949 -- 8195
-pairing: 12954 -- 8200
-pairing: 12959 -- 8205
-pairing: 12964 -- 8210
-pairing: 12969 -- 8215
-pairing: 12974 -- 8220
-pairing: 12979 -- 8225
-pairing: 12984 -- 8230
-pairing: 12989 -- 8235
-pairing: 12994 -- 8240
-pairing: 12999 -- 8245
-pairing: 13004 -- 8250
-pairing: 13009 -- 8255
-pairing: 13014 -- 8260
-pairing: 13019 -- 8265
-pairing: 13024 -- 8270
-pairing: 13029 -- 8275
-pairing: 13034 -- 8280
-pairing: 13039 -- 8285
-pairing: 13044 -- 8290
-pairing: 13049 -- 8295
-pairing: 13054 -- 8300
-pairing: 13059 -- 8305
-pairing: 13064 -- 8310
-pairing: 13069 -- 8315
-pairing: 13074 -- 8320
-pairing: 13079 -- 8325
-pairing: 13084 -- 8330
-pairing: 13089 -- 8335
-pairing: 13094 -- 8371
-pairing: 13129 -- 8372
-pairing: 13130 -- 8373
-pairing: 13131 -- 8374
-pairing: 13132 -- 8375
-pairing: 13133 -- 8376
-pairing: 13134 -- 8377
-pairing: 13135 -- 8378
-pairing: 13136 -- 8379
-pairing: 13137 -- 8380
-pairing: 13138 -- 8381
-pairing: 13139 -- 8382
-pairing: 13140 -- 8383
-pairing: 13141 -- 8384
-pairing: 13142 -- 8385
-pairing: 13143 -- 8386
-pairing: 13144 -- 8387
-pairing: 13145 -- 8388
-pairing: 13146 -- 8389
-pairing: 13147 -- 8390
-pairing: 13148 -- 8391
-pairing: 13149 -- 8392
-pairing: 13150 -- 8393
-pairing: 13151 -- 8394
-pairing: 13152 -- 8395
-pairing: 13153 -- 8396
-pairing: 13154 -- 8397
-pairing: 13155 -- 8398
-pairing: 13156 -- 8399
-pairing: 13157 -- 8400
-pairing: 13158 -- 8401
-pairing: 13159 -- 8402
+pairing: 13904 -- 8831
+pairing: 13909 -- 8836
+pairing: 13914 -- 8841
+pairing: 13919 -- 8846
+pairing: 13924 -- 8851
+pairing: 13929 -- 8856
+pairing: 13934 -- 8861
+pairing: 13939 -- 8866
+pairing: 13944 -- 8871
+pairing: 13949 -- 8876
+pairing: 13954 -- 8881
+pairing: 13959 -- 8886
+pairing: 13964 -- 8891
+pairing: 13969 -- 8896
+pairing: 13974 -- 8901
+pairing: 13979 -- 8906
+pairing: 13984 -- 8911
+pairing: 13989 -- 8916
+pairing: 13994 -- 8921
+pairing: 13999 -- 8926
+pairing: 14004 -- 8931
+pairing: 14009 -- 8936
+pairing: 14014 -- 8941
+pairing: 14019 -- 8946
+pairing: 14024 -- 8951
+pairing: 14029 -- 8956
+pairing: 14034 -- 8961
+pairing: 14039 -- 8966
+pairing: 14044 -- 8971
+pairing: 14049 -- 8976
+pairing: 14054 -- 8981
+pairing: 14059 -- 8986
+pairing: 14064 -- 9022
+pairing: 14099 -- 9023
+pairing: 14100 -- 9024
+pairing: 14101 -- 9025
+pairing: 14102 -- 9026
+pairing: 14103 -- 9027
+pairing: 14104 -- 9028
+pairing: 14105 -- 9029
+pairing: 14106 -- 9030
+pairing: 14107 -- 9031
+pairing: 14108 -- 9032
+pairing: 14109 -- 9033
+pairing: 14110 -- 9034
+pairing: 14111 -- 9035
+pairing: 14112 -- 9036
+pairing: 14113 -- 9037
+pairing: 14114 -- 9038
+pairing: 14115 -- 9039
+pairing: 14116 -- 9040
+pairing: 14117 -- 9041
+pairing: 14118 -- 9042
+pairing: 14119 -- 9043
+pairing: 14120 -- 9044
+pairing: 14121 -- 9045
+pairing: 14122 -- 9046
+pairing: 14123 -- 9047
+pairing: 14124 -- 9048
+pairing: 14125 -- 9049
+pairing: 14126 -- 9050
+pairing: 14127 -- 9051
+pairing: 14128 -- 9052
+pairing: 14129 -- 9053
 [STATUS]: waiting for compute-node startup barrier
 1 device(s) found
 Selected device: ibp86s0
 Selected port state: 4, lid: 8
-pairing: 13253 -- 13258
-pairing: 13260 -- 13267
-pairing: 13269 -- 13275
-pairing: 13277 -- 13282
-pairing: 13285 -- 13290
-pairing: 13293 -- 13298
-pairing: 13301 -- 13306
-pairing: 13309 -- 13314
-pairing: 13317 -- 13313
-pairing: 13320 -- 13319
-pairing: 13323 -- 13321
-pairing: 13325 -- 13322
-pairing: 13327 -- 13324
-pairing: 13329 -- 13326
-pairing: 13332 -- 13328
-pairing: 13333 -- 13330
-pairing: 13336 -- 13331
-pairing: 13337 -- 13334
-pairing: 13339 -- 13335
-pairing: 13342 -- 13338
-pairing: 13343 -- 13340
-pairing: 13345 -- 13341
-pairing: 13347 -- 13344
-pairing: 13349 -- 13346
-pairing: 13351 -- 13348
-pairing: 13354 -- 13350
-pairing: 13355 -- 13352
-pairing: 13357 -- 13353
-pairing: 13359 -- 13356
-pairing: 13362 -- 13358
-pairing: 13363 -- 13360
-pairing: 13366 -- 13364
+pairing: 14223 -- 14224
+pairing: 14228 -- 14232
+pairing: 14235 -- 14240
+pairing: 14242 -- 14248
+pairing: 14251 -- 14256
+pairing: 14259 -- 14264
+pairing: 14267 -- 14272
+pairing: 14275 -- 14280
+pairing: 14283 -- 14287
+pairing: 14290 -- 14289
+pairing: 14293 -- 14291
+pairing: 14295 -- 14292
+pairing: 14297 -- 14294
+pairing: 14299 -- 14296
+pairing: 14301 -- 14298
+pairing: 14303 -- 14300
+pairing: 14306 -- 14302
+pairing: 14307 -- 14304
+pairing: 14309 -- 14305
+pairing: 14311 -- 14308
+pairing: 14313 -- 14310
+pairing: 14315 -- 14312
+pairing: 14317 -- 14314
+pairing: 14319 -- 14316
+pairing: 14322 -- 14318
+pairing: 14323 -- 14320
+pairing: 14325 -- 14321
+pairing: 14327 -- 14324
+pairing: 14329 -- 14326
+pairing: 14331 -- 14328
+pairing: 14333 -- 14330
+pairing: 14335 -- 14334
 [STATUS]: storage-owner peer RDMA QPs per peer: 8
 [STATUS]: storage-owner peer QP0 reserved for RPC; data RDMA uses QP1..7
-allocated ALIGNED MEM (no hugepage) at 133648879714368 with buffer size 67108864
-allocated ALIGNED MEM (no hugepage) at 133648839868480 with buffer size 39839040
+allocated ALIGNED MEM (no hugepage) at 138623089377344 with buffer size 67108864
+allocated ALIGNED MEM (no hugepage) at 138623049531456 with buffer size 39839040
 [STATUS]: storage-owner peer RPC receive slots per peer: 64 (requested=64)
 [STATUS]: storage-owner peer RPC concurrent sends per peer: 16
 [STATUS]: storage-owner peer RPC send credits: Stage1/graph are split at depth >= 2; responses use a dedicated sync buffer
 [STATUS]: storage-owner peer async response capacity: 32768
-allocated ALIGNED MEM (no hugepage) at 133649119522880 with buffer size 488448
-allocated ALIGNED MEM (no hugepage) at 95410532275200 with buffer size 53248
-allocated ALIGNED MEM (no hugepage) at 95410532329472 with buffer size 53248
+allocated ALIGNED MEM (no hugepage) at 138623325864000 with buffer size 488448
+allocated ALIGNED MEM (no hugepage) at 99182058247168 with buffer size 53248
+allocated ALIGNED MEM (no hugepage) at 99182058301440 with buffer size 53248
 [STATUS]: storage-owner peer reverse-update workers: 2
 [STATUS]: storage-owner peer Stage1 workers: 6; Stage2-home workers: 1 (isolated fixed physical-home CPU partition)
 [STATUS]: storage-owner physical control workers: cleanup=2 placement=1 (separate blocking domains)
 [STATUS]: storage-owner Stage1 artifact capacity: 67968 (64-way, per shard=1062) cleanup replay per shard=2048 active migration receipts=131072
 [STATUS]: storage-owner peer reverse-update tuning: queue_depth=65536 coalesce_max=256
-allocated ALIGNED MEM (no hugepage) at 95410557628416 with buffer size 108160
-allocated ALIGNED MEM (no hugepage) at 95410557738496 with buffer size 108160
-allocated ALIGNED MEM (no hugepage) at 95410557848704 with buffer size 108160
-allocated ALIGNED MEM (no hugepage) at 95410557958912 with buffer size 108160
+allocated ALIGNED MEM (no hugepage) at 99182083600384 with buffer size 108160
+allocated ALIGNED MEM (no hugepage) at 99182083710464 with buffer size 108160
+allocated ALIGNED MEM (no hugepage) at 99182083820672 with buffer size 108160
+allocated ALIGNED MEM (no hugepage) at 99182083930880 with buffer size 108160
 [STATUS]: storage-owner peer scratch: snapshot_slot=192 graph_slot=832 batch=64 lane_peak_rdma_wrs=56 lane_useful_wave_rdma_wrs=56 global_read_window=224 search_lanes_global=8 search_lanes_per_worker_min/max=2/2 bytes_per_lane=54080 bytes_total=432640
 [STATUS]: storage-owner maintenance workers: 4 (configured=8, admission_baseline_workers=2, work_conserving=true)
 [STATUS]: storage-owner stage2 reverse outbox descriptors: 256 aggregates=256 wire_max_ops=3072 (shared per-peer work-conserving aggregation)
@@ -167,4 +167,4 @@ allocated ALIGNED MEM (no hugepage) at 95410557958912 with buffer size 108160
 [STATUS]: storage-owner foreground pipeline: coordinators=12 cpu_lanes=3 (assigned_cpus=22, rpc_parallelism=16)
 [STATUS]: storage-owner CPU plan: foreground_cpu=3 foreground_coordinators=12 maintenance=4 peer_stage1=7 (split into isolated Stage1/Stage2-home domains) peer_reverse=2 peer_cleanup=2 peer_placement=1 peer_progress=2 foreground_progress=1
 [STATUS]: storage-owner insert runtime enabled on shard 1
-Send request failed: status=11 (remote operation error), opcode=0, vendor_err=137, wr_id=18446744065119617783
+Send request failed: status=11 (remote operation error), opcode=0, vendor_err=137, wr_id=18446744065119617473
