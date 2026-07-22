@@ -1267,9 +1267,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                  "stage2 continuation exceeded construction width L");
     }
 
-    // The Stage1 owner continues one logical beam through one-sided RDMA.
-    // There is no per-shard restart RPC and therefore no remote-search ACK
-    // mask to wait for.
+    // The Stage1 owner remains the sole owner of one logical beam. Remote
+    // homes execute only the selected expansion plus same-home scoring; they
+    // never restart or recursively advance a shard-local search. There is
+    // therefore no remote-search ACK mask to wait for.
     constexpr u64 expected_mask = 0;
     const auto transition =
       states.begin_remote_search(context.handle, expected_mask);
@@ -3019,7 +3020,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         }
         case Stage2Phase::remote_search_pending:
           lib_failure(
-            "one-sided Stage2 continuation cannot await per-shard search RPCs");
+            "home-executed Stage2 continuation cannot await legacy shard-search ACKs");
           return progressed;
         case Stage2Phase::prune_ready: {
           const bool prepared =

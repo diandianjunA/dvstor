@@ -74,7 +74,10 @@ void MemoryNode::peer_rpc_progress_loop() {
           service::storage_owner::PeerRpcType::authority_placement_request) ||
         header->type == static_cast<u32>(
           service::storage_owner::PeerRpcType::dynamic_node_control_request);
-      if (is_request &&
+      const bool is_stage2_home_request =
+        header->type == static_cast<u32>(
+          service::storage_owner::PeerRpcType::stage2_expand_score_request);
+      if ((is_request || is_stage2_home_request) &&
           peer_reverse_shutdown_.load(std::memory_order_acquire)) {
         repost_peer_rpc_receive(peer_id, slot_id);
         continue;
@@ -259,6 +262,31 @@ void MemoryNode::peer_rpc_progress_loop() {
           }
         }
       } else if (header->type == static_cast<u32>(
+                   service::storage_owner::PeerRpcType::stage2_expand_score_request)) {
+        const size_t expected_bytes =
+          service::storage_owner::stage2_expand_score_request_bytes(
+            header->item_count);
+        if (header->item_count != 0 &&
+            header->item_count <= config.storage_owner_batch_max &&
+            header->reserved == 0 && bytes == expected_bytes) {
+          const auto decision = peer_request_deduplicator_->begin(
+            peer_id, *header, false);
+          if (decision.action ==
+              memory_node_detail::PeerRequestAction::execute) {
+            PeerStage1Task task;
+            task.source_shard = peer_id;
+            task.header = *header;
+            task.dedup_lease = decision.lease;
+            task.received_at = std::chrono::steady_clock::now();
+            task.payload.assign(payload, payload + expected_bytes);
+            if (!enqueue_peer_stage1_task(std::move(task))) {
+              lib_assert(peer_request_deduplicator_->abandon(
+                           decision.lease, peer_id, *header),
+                         "Stage2 home request lost its dedup lease");
+            }
+          }
+        }
+      } else if (header->type == static_cast<u32>(
                    service::storage_owner::PeerRpcType::stage1_execute_request) ||
                  header->type == static_cast<u32>(
                    service::storage_owner::PeerRpcType::stage1_arm_request)) {
@@ -321,6 +349,20 @@ void MemoryNode::peer_rpc_progress_loop() {
                 1, std::memory_order_relaxed);
             }
           }
+        }
+      } else if (header->type == static_cast<u32>(
+                   service::storage_owner::PeerRpcType::stage2_expand_score_response)) {
+        const bool valid_response = header->item_count != 0 &&
+          header->item_count <= config.storage_owner_batch_max &&
+          header->reserved == 0 &&
+          bytes == service::storage_owner::stage2_expand_score_response_bytes(
+            header->item_count);
+        if (valid_response && peer_async_responses_ != nullptr &&
+            peer_async_responses_->try_deliver(
+              peer_id, slot_id, bytes, *header)) {
+          hold_receive_slot = true;
+          peer_completion_cv_.notify_all();
+          storage_owner_maintenance_cv_.notify_all();
         }
       } else if (header->type == static_cast<u32>(
                    service::storage_owner::PeerRpcType::reconcile_reverse_response)) {
@@ -512,10 +554,11 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
       std::unique_lock<std::mutex> lock(peer_stage1_tasks_mutex_);
       peer_stage1_tasks_cv_.wait(lock, [&]() {
         return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
-               !peer_stage1_tasks_.empty();
+               !peer_stage1_tasks_.empty() ||
+               !peer_stage2_home_tasks_.empty();
       });
       if (peer_reverse_shutdown_.load(std::memory_order_acquire) &&
-          peer_stage1_tasks_.empty()) {
+          peer_stage1_tasks_.empty() && peer_stage2_home_tasks_.empty()) {
         current_storage_owner_thread_ = nullptr;
         return;
       }
@@ -528,16 +571,35 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
     PeerStage1Task task;
     {
       std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
-      if (peer_stage1_tasks_.empty()) {
+      if (peer_stage1_tasks_.empty() && peer_stage2_home_tasks_.empty()) {
         continue;
       }
-      task = std::move(peer_stage1_tasks_.front());
-      peer_stage1_tasks_.pop_front();
+      if (!peer_stage1_tasks_.empty()) {
+        task = std::move(peer_stage1_tasks_.front());
+        peer_stage1_tasks_.pop_front();
+      } else {
+        task = std::move(peer_stage2_home_tasks_.front());
+        peer_stage2_home_tasks_.pop_front();
+      }
     }
     peer_stage1_tasks_cv_.notify_one();
 
     const auto request_type = static_cast<
       service::storage_owner::PeerRpcType>(task.header.type);
+    if (request_type ==
+        service::storage_owner::PeerRpcType::stage2_expand_score_request) {
+      (void)handle_peer_stage2_expand_score_request(
+        task.source_shard, task.header, task.payload.data(), config);
+      // The operation is read-only and generation fenced at the caller.  Do
+      // not retain a large payload response in the generic dedup table;
+      // retrying the identical request is semantically and physically safe.
+      lib_assert(peer_request_deduplicator_->abandon(
+                   task.dedup_lease, task.source_shard, task.header),
+                 "Stage2 home completion lost its dedup lease");
+      peer_stage1_processed_.fetch_add(1, std::memory_order_relaxed);
+      peer_stage1_tasks_cv_.notify_one();
+      continue;
+    }
     bool release_barrier = false;
     if (request_type ==
         service::storage_owner::PeerRpcType::stage1_arm_request) {

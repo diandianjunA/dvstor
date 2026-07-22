@@ -49,6 +49,15 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .centroid_route_query_timeouts =
       centroid_route_query_timeouts.load(std::memory_order_relaxed),
     .exact_vector_reads = exact_vector_reads.load(std::memory_order_relaxed),
+    .dynamic_code_candidates =
+      dynamic_code_candidates.load(std::memory_order_relaxed),
+    .dynamic_code_reads = dynamic_code_reads.load(std::memory_order_relaxed),
+    .dynamic_code_read_bytes =
+      dynamic_code_read_bytes.load(std::memory_order_relaxed),
+    .dynamic_code_incarnation_rejects =
+      dynamic_code_incarnation_rejects.load(std::memory_order_relaxed),
+    .dynamic_code_wait_ns =
+      dynamic_code_wait_ns.load(std::memory_order_relaxed),
   };
 }
 
@@ -83,6 +92,11 @@ void Telemetry::reset() {
   centroid_route_query_retries.store(0, std::memory_order_relaxed);
   centroid_route_query_timeouts.store(0, std::memory_order_relaxed);
   exact_vector_reads.store(0, std::memory_order_relaxed);
+  dynamic_code_candidates.store(0, std::memory_order_relaxed);
+  dynamic_code_reads.store(0, std::memory_order_relaxed);
+  dynamic_code_read_bytes.store(0, std::memory_order_relaxed);
+  dynamic_code_incarnation_rejects.store(0, std::memory_order_relaxed);
+  dynamic_code_wait_ns.store(0, std::memory_order_relaxed);
 }
 
 }  // namespace gpu_search

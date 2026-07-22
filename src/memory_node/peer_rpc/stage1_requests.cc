@@ -1,7 +1,143 @@
 #include "memory_node/peer_rpc/detail.hh"
 #include "memory_node/peer_rpc/stage1_control_fanout_policy.hh"
+#include "memory_node/storage_owner_index/vector_snapshot_policy.hh"
 
 namespace authority = memory_node_storage_owner_index_detail;
+
+bool MemoryNode::handle_peer_stage2_expand_score_request(
+    u32 source_shard,
+    const service::storage_owner::PeerRpcHeader& header,
+    const byte_t* payload,
+    const Configuration& config) {
+  using namespace service::storage_owner;
+  using memory_node_storage_owner_index_detail::StableNodeSnapshotState;
+  using memory_node_storage_owner_index_detail::classify_stable_node_snapshot;
+  if (payload == nullptr || source_shard >= num_storage_nodes_ ||
+      source_shard == storage_id_ || header.item_count == 0 ||
+      header.item_count > config.storage_owner_batch_max) {
+    return false;
+  }
+
+  const size_t response_bytes =
+    stage2_expand_score_response_bytes(header.item_count);
+  if (response_bytes > peer_rpc_runtime_.message_bytes) return false;
+  // One worker owns this buffer until the synchronous RC send completes.
+  // Reuse its high-water allocation: Stage2 emits many medium-sized batches
+  // and allocating/zeroing a fresh vector for every expansion wave was itself
+  // a measurable CPU allocator bottleneck.
+  thread_local vec<byte_t> response;
+  response.assign(response_bytes, byte_t{0});
+  auto* response_header = reinterpret_cast<PeerRpcHeader*>(response.data());
+  response_header->magic = kPeerRpcMagic;
+  response_header->version = kPeerRpcVersion;
+  response_header->type = static_cast<u32>(
+    PeerRpcType::stage2_expand_score_response);
+  response_header->source_shard = storage_id_;
+  response_header->item_count = header.item_count;
+  response_header->request_id = header.request_id;
+  response_header->status = static_cast<u32>(InsertStatus::ok);
+
+  const auto* items = stage2_expand_score_items(payload);
+  const byte_t* queries = stage2_expand_score_queries(
+    payload, header.item_count);
+  auto* results = stage2_expand_score_results(response.data());
+  auto* neighbors = stage2_expand_score_neighbors(
+    response.data(), header.item_count);
+  const size_t neighbor_stride = VamanaNode::graph_entry_capacity();
+  const VectorDType dtype = VamanaNode::vector_dtype();
+
+  for (u32 item_index = 0; item_index < header.item_count; ++item_index) {
+    const Stage2ExpandScoreItem& item = items[item_index];
+    Stage2ExpandScoreResult& result = results[item_index];
+    result.pointer_raw = item.pointer_raw;
+    result.generation = item.generation;
+    result.search_index = item.search_index;
+    const RemotePtr pointer{item.pointer_raw};
+    if (!valid_local_storage_node_pointer(pointer)) {
+      result.disposition = static_cast<u32>(
+        Stage2HomeDisposition::terminal);
+      continue;
+    }
+
+    GraphAdjacency adjacency;
+    if (!read_graph_adjacency(pointer, adjacency)) {
+      const u64 before = load_local_node_header_acquire(pointer);
+      const u32 slot_incarnation = *reinterpret_cast<const u32*>(
+        local_node_ptr(pointer) + VamanaNode::offset_slot_incarnation());
+      std::atomic_thread_fence(std::memory_order_acquire);
+      const u64 after = load_local_node_header_acquire(pointer);
+      const StableNodeSnapshotState state = classify_stable_node_snapshot(
+        pointer, before, after, slot_incarnation);
+      result.disposition = static_cast<u32>(
+        state == StableNodeSnapshotState::terminal
+          ? Stage2HomeDisposition::terminal
+          : Stage2HomeDisposition::retryable);
+      continue;
+    }
+
+    result.disposition = static_cast<u32>(Stage2HomeDisposition::stable);
+    if (adjacency.deleted) continue;
+    const size_t total_neighbors = std::min(
+      neighbor_stride, adjacency.stable.size() +
+        adjacency.provisional.size());
+    result.neighbor_count = static_cast<u32>(total_neighbors);
+    const byte_t* query = queries +
+      static_cast<size_t>(item_index) * VamanaNode::vector_bytes();
+    size_t output_index = 0;
+    const auto emit_neighbor = [&](RemotePtr neighbor) {
+      if (output_index >= total_neighbors) return;
+      Stage2ExpandScoreNeighbor& output =
+        neighbors[static_cast<size_t>(item_index) * neighbor_stride +
+                  output_index++];
+      output.pointer_raw = neighbor.raw_address;
+      if (!storage_node_pointer_addressable(neighbor)) {
+        output.disposition = static_cast<u32>(
+          Stage2HomeDisposition::terminal);
+        return;
+      }
+      if (!local_shard(neighbor.memory_node())) {
+        output.disposition = static_cast<u32>(
+          Stage2HomeDisposition::unscored);
+        return;
+      }
+      NodeSnapshot snapshot;
+      if (read_node_snapshot(neighbor, snapshot)) {
+        const StableNodeSnapshotState state = classify_stable_node_snapshot(
+          neighbor, snapshot.header, snapshot.header,
+          snapshot.slot_incarnation);
+        if (state == StableNodeSnapshotState::stable &&
+            snapshot.vector_data.size() >= VamanaNode::vector_bytes()) {
+          output.distance = distance_between_vectors(
+            query, dtype, snapshot.vector_data.data(), dtype, config);
+          output.disposition = static_cast<u32>(
+            Stage2HomeDisposition::stable);
+        } else {
+          output.disposition = static_cast<u32>(
+            state == StableNodeSnapshotState::terminal
+              ? Stage2HomeDisposition::terminal
+              : Stage2HomeDisposition::retryable);
+        }
+        return;
+      }
+      const u64 before = load_local_node_header_acquire(neighbor);
+      const u32 slot_incarnation = *reinterpret_cast<const u32*>(
+        local_node_ptr(neighbor) + VamanaNode::offset_slot_incarnation());
+      std::atomic_thread_fence(std::memory_order_acquire);
+      const u64 after = load_local_node_header_acquire(neighbor);
+      const StableNodeSnapshotState state = classify_stable_node_snapshot(
+        neighbor, before, after, slot_incarnation);
+      output.disposition = static_cast<u32>(
+        state == StableNodeSnapshotState::terminal
+          ? Stage2HomeDisposition::terminal
+          : Stage2HomeDisposition::retryable);
+    };
+    for (RemotePtr neighbor : adjacency.stable) emit_neighbor(neighbor);
+    for (RemotePtr neighbor : adjacency.provisional) emit_neighbor(neighbor);
+  }
+
+  send_peer_rpc_message(source_shard, response.data(), response.size());
+  return true;
+}
 
 bool MemoryNode::try_send_peer_stage1_retry_response(
     u32 destination_shard,

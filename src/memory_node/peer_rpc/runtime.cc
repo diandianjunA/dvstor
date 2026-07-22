@@ -37,6 +37,12 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
   const size_t stage1_arm_response_bytes =
     service::storage_owner::stage1_arm_response_bytes(
       config.storage_owner_batch_max);
+  const size_t stage2_expand_score_request_bytes =
+    service::storage_owner::stage2_expand_score_request_bytes(
+      config.storage_owner_batch_max);
+  const size_t stage2_expand_score_response_bytes =
+    service::storage_owner::stage2_expand_score_response_bytes(
+      config.storage_owner_batch_max);
   peer_rpc_runtime_.message_bytes = align_up(
     std::max({reverse_update_bytes,
               service::storage_owner::reconcile_reverse_request_bytes(1),
@@ -49,7 +55,9 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
               stage1_request_bytes,
               stage1_response_bytes,
               stage1_arm_request_bytes,
-              stage1_arm_response_bytes}));
+              stage1_arm_response_bytes,
+              stage2_expand_score_request_bytes,
+              stage2_expand_score_response_bytes}));
   lib_assert(peer_rpc_runtime_.message_bytes <= std::numeric_limits<u32>::max(),
              "storage-owner peer RPC message is too large for verbs SGEs");
   const u32 remote_peer_count = num_storage_nodes_ - 1;
@@ -186,6 +194,7 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   {
     std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
     peer_stage1_tasks_.clear();
+    peer_stage2_home_tasks_.clear();
     peer_stage1_admission_waiters_.clear();
     peer_stage1_admission_waiter_items_ = 0;
     peer_stage1_admission_owned_items_ = 0;

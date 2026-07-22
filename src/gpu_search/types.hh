@@ -70,6 +70,7 @@ struct CompletionDescriptor {
   u64 score_cycles{};
   u64 beam_cycles{};
   u64 exact_cycles{};
+  u64 dynamic_code_cycles{};
   u32 query_slot{};
   u32 result_count{};
   i32 status{};
@@ -79,6 +80,9 @@ struct CompletionDescriptor {
   u32 exact_vectors{};
   u32 route_hits{};
   u32 graph_read_retries{};
+  u32 dynamic_code_candidates{};
+  u32 dynamic_code_reads{};
+  u32 dynamic_code_incarnation_rejects{};
   // Low 8 bits encode QueryFailureReason; the high 24 bits count complete
   // centroid-route snapshot retries caused by a concurrent publication.
   u32 diagnostic{};
@@ -132,6 +136,11 @@ struct TelemetrySnapshot {
   u64 centroid_route_query_retries{};
   u64 centroid_route_query_timeouts{};
   u64 exact_vector_reads{};
+  u64 dynamic_code_candidates{};
+  u64 dynamic_code_reads{};
+  u64 dynamic_code_read_bytes{};
+  u64 dynamic_code_incarnation_rejects{};
+  u64 dynamic_code_wait_ns{};
 };
 
 class Telemetry {
@@ -174,6 +183,11 @@ public:
   std::atomic<u64> centroid_route_query_retries{0};
   std::atomic<u64> centroid_route_query_timeouts{0};
   std::atomic<u64> exact_vector_reads{0};
+  std::atomic<u64> dynamic_code_candidates{0};
+  std::atomic<u64> dynamic_code_reads{0};
+  std::atomic<u64> dynamic_code_read_bytes{0};
+  std::atomic<u64> dynamic_code_incarnation_rejects{0};
+  std::atomic<u64> dynamic_code_wait_ns{0};
 };
 
 }  // namespace gpu_search

@@ -104,6 +104,18 @@ nlohmann::json telemetry_to_json(
           static_cast<double>(
             telemetry.graph_page_requests + telemetry.graph_route_hits)},
     {"exact_vector_reads", telemetry.exact_vector_reads},
+    {"dynamic_code_candidates", telemetry.dynamic_code_candidates},
+    {"dynamic_code_reads", telemetry.dynamic_code_reads},
+    {"dynamic_code_read_bytes", telemetry.dynamic_code_read_bytes},
+    {"dynamic_code_incarnation_rejects",
+      telemetry.dynamic_code_incarnation_rejects},
+    {"dynamic_code_wait_ns", telemetry.dynamic_code_wait_ns},
+    {"average_dynamic_code_reads", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.dynamic_code_reads) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"average_dynamic_code_wait_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.dynamic_code_wait_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
   };
 }
 
@@ -313,6 +325,14 @@ FormattedReport format_report(const nlohmann::json& root,
            << gpu.value("average_gpu_score_us", 0.0) << "/"
            << gpu.value("average_gpu_beam_us", 0.0) << "/"
            << gpu.value("average_gpu_exact_us", 0.0) << '\n';
+    output << "  dynamic PQ candidates/reads/bytes/incarnation_rejects: "
+           << gpu.value("dynamic_code_candidates", 0ULL) << "/"
+           << gpu.value("dynamic_code_reads", 0ULL) << "/"
+           << gpu.value("dynamic_code_read_bytes", 0ULL) << "/"
+           << gpu.value("dynamic_code_incarnation_rejects", 0ULL) << '\n';
+    output << "  dynamic PQ reads/query and wait_us/query: "
+           << gpu.value("average_dynamic_code_reads", 0.0) << "/"
+           << gpu.value("average_dynamic_code_wait_us", 0.0) << '\n';
   }
   if (report.has_insert()) {
     const auto summary = service::breakdown::aggregate_text_summary(report.insert);

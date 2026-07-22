@@ -245,7 +245,12 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << " graph_batches=" << completion.remote_batches
                 << " graph_rounds=" << completion.graph_rounds
                 << " route_hits=" << completion.route_hits
-                << " exact_reads=" << completion.exact_vectors << '\n';
+                << " exact_reads=" << completion.exact_vectors
+                << " dynamic_pq_reads=" << completion.dynamic_code_reads
+                << " dynamic_pq_us="
+                << completion.dynamic_code_cycles * 1000ULL / gpu_clock_khz
+                << " dynamic_pq_incarnation_rejects="
+                << completion.dynamic_code_incarnation_rejects << '\n';
     }
     if (completion.status != 0) {
       report_direct_path_failure();
@@ -285,11 +290,14 @@ void PersistentSearchEngine::Impl::completion_loop() {
     const u64 physical_graph_reads =
       static_cast<u64>(completion.remote_pages) + completion.graph_read_retries;
     engine.telemetry_.rdma_read_ops.fetch_add(
-      static_cast<u64>(completion.exact_vectors) + physical_graph_reads,
+      static_cast<u64>(completion.exact_vectors) + physical_graph_reads +
+        completion.dynamic_code_reads,
       std::memory_order_relaxed);
     engine.telemetry_.rdma_read_bytes.fetch_add(
       static_cast<u64>(completion.exact_vectors) * node_record_bytes +
-      physical_graph_reads * index.layout.graph_entry_bytes,
+      physical_graph_reads * index.layout.graph_entry_bytes +
+      static_cast<u64>(completion.dynamic_code_reads) *
+        dynamic_code_record_bytes,
       std::memory_order_relaxed);
     if (physical_graph_reads > completion.remote_batches) {
       engine.telemetry_.rdma_merged_requests.fetch_add(
@@ -298,6 +306,20 @@ void PersistentSearchEngine::Impl::completion_loop() {
     }
     engine.telemetry_.exact_vector_reads.fetch_add(completion.exact_vectors,
                                                    std::memory_order_relaxed);
+    engine.telemetry_.dynamic_code_candidates.fetch_add(
+      completion.dynamic_code_candidates, std::memory_order_relaxed);
+    engine.telemetry_.dynamic_code_reads.fetch_add(
+      completion.dynamic_code_reads, std::memory_order_relaxed);
+    engine.telemetry_.dynamic_code_read_bytes.fetch_add(
+      static_cast<u64>(completion.dynamic_code_reads) *
+        dynamic_code_record_bytes,
+      std::memory_order_relaxed);
+    engine.telemetry_.dynamic_code_incarnation_rejects.fetch_add(
+      completion.dynamic_code_incarnation_rejects,
+      std::memory_order_relaxed);
+    engine.telemetry_.dynamic_code_wait_ns.fetch_add(
+      phase_ns(completion.dynamic_code_cycles),
+      std::memory_order_relaxed);
     engine.telemetry_.graph_page_requests.fetch_add(completion.remote_pages,
                                                     std::memory_order_relaxed);
     engine.telemetry_.graph_read_retries.fetch_add(

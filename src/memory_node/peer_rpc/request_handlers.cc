@@ -171,19 +171,31 @@ bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
     // release/mutation message at the trust boundary so its quiescence
     // semantics cannot be ambiguous.
     if (saw_release && saw_non_release) return false;
+  } else if (request_type == PeerRpcType::stage2_expand_score_request) {
+    // Read-only home work has no Stage1 semantic token.  The request's
+    // generation is fenced by the continuation owner when the response is
+    // scattered, so a delayed/retried execution is harmless.
   } else {
     return false;
   }
 
   std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
+  const bool stage2_home =
+    request_type == PeerRpcType::stage2_expand_score_request;
+  const size_t stage2_home_limit = std::max<size_t>(
+    1, peer_stage1_task_queue_limit_ / 2);
   if (peer_reverse_shutdown_.load(std::memory_order_acquire) ||
       peer_stage1_tasks_.size() +
+          peer_stage2_home_tasks_.size() +
           peer_stage1_admission_waiters_.size() +
           peer_stage1_active_workers_.load(std::memory_order_acquire) >=
         peer_stage1_task_queue_limit_ ||
+      (stage2_home &&
+       peer_stage2_home_tasks_.size() >= stage2_home_limit) ||
       task.source_shard >= peer_stage1_next_source_sequences_.size() ||
-      peer_stage1_next_source_sequences_[task.source_shard] ==
-        std::numeric_limits<u64>::max()) {
+      (request_type != PeerRpcType::stage2_expand_score_request &&
+       peer_stage1_next_source_sequences_[task.source_shard] ==
+         std::numeric_limits<u64>::max())) {
     return false;
   }
   vec<Stage1OperationKey> tracked_keys;
@@ -207,13 +219,20 @@ bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
     }
     tracked_keys.push_back(key);
   }
-  task.source_sequence =
-    ++peer_stage1_next_source_sequences_[task.source_shard];
-  peer_stage1_tasks_.push_back(std::move(task));
+  if (request_type != PeerRpcType::stage2_expand_score_request) {
+    task.source_sequence =
+      ++peer_stage1_next_source_sequences_[task.source_shard];
+  }
+  if (stage2_home) {
+    peer_stage2_home_tasks_.push_back(std::move(task));
+  } else {
+    peer_stage1_tasks_.push_back(std::move(task));
+  }
   peer_stage1_enqueued_.fetch_add(1, std::memory_order_relaxed);
   atomic_utils::update_max_relaxed(
     peer_stage1_max_queue_,
-    static_cast<u64>(peer_stage1_tasks_.size()));
+    static_cast<u64>(peer_stage1_tasks_.size() +
+                     peer_stage2_home_tasks_.size()));
   peer_stage1_tasks_cv_.notify_one();
   return true;
 }

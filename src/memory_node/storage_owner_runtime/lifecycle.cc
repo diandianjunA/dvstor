@@ -58,7 +58,7 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
                " snapshot_batch=" + std::to_string(config.storage_owner_search_snapshot_batch) +
                " protocol=centroid-home-two-stage");
   print_status("storage-owner stage1=physical-home local search and backlinks; "
-               "stage2=one-sided-RDMA continuation");
+               "stage2=generation-fenced home expand+score continuation");
   print_status("storage-owner responses=foreground direct post; "
                "completion=repost by service poller");
   const u32 rpc_parallelism = std::max<u32>(

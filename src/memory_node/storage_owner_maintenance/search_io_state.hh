@@ -25,6 +25,7 @@ enum class Stage2SearchIoPhase : std::uint8_t {
   score_header_pending,
   graph_ready,
   graph_pending,
+  graph_home_pending,
 };
 
 enum class Stage2SearchAdvanceResult : std::uint8_t {
@@ -66,6 +67,16 @@ struct Stage2GraphConsumer {
 struct Stage2GraphRetryState {
   RemotePtr pointer;
   u32 attempt{};
+};
+
+struct Stage2HomeExpandRpc {
+  u32 target_shard{};
+  u32 item_count{};
+  u64 request_id{};
+  u64 deadline_ns{};
+  bool posted{};
+  bool complete{};
+  vec<byte_t> request;
 };
 
 // A score generation may expose more candidates than fit in one transport
@@ -149,6 +160,8 @@ struct Stage2SearchIoState {
   vec<Stage2PendingGraphRead> pending_graph;
   vec<vec<RemotePtr>> graph_neighbors;
   vec<Stage2GraphRetryState> graph_retry_state;
+  vec<Stage2HomeExpandRpc> home_expand_rpcs;
+  std::size_t home_expand_rpc_count{};
 
   void reset() {
     initialized = false;
@@ -174,6 +187,12 @@ struct Stage2SearchIoState {
     pending_graph.clear();
     for (vec<RemotePtr>& neighbors : graph_neighbors) neighbors.clear();
     graph_retry_state.clear();
+    home_expand_rpc_count = 0;
+    for (auto& rpc : home_expand_rpcs) {
+      rpc.posted = false;
+      rpc.complete = false;
+      rpc.request.clear();
+    }
   }
 
   // The continuation must be complete and its results already copied.  This
@@ -208,6 +227,10 @@ struct Stage2SearchIoState {
     trim(pending_graph);
     for (auto& neighbors : graph_neighbors) trim(neighbors);
     trim(graph_neighbors);
+    // At most one request buffer per peer is retained. Its capacity is
+    // bounded by storage_owner_batch_max * (metadata + vector bytes), and
+    // retaining it avoids an allocator round trip for every graph wave.
+    trim(home_expand_rpcs);
     trim(graph_retry_state);
   }
 

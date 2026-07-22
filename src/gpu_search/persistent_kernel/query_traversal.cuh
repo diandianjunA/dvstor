@@ -163,6 +163,10 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ u64 score_phase_cycles;
   __shared__ u64 beam_phase_cycles;
   __shared__ u64 exact_phase_cycles;
+  __shared__ u64 dynamic_code_cycles;
+  __shared__ u32 dynamic_code_candidates;
+  __shared__ u32 dynamic_code_reads;
+  __shared__ u32 dynamic_code_incarnation_rejects;
   __shared__ u64 phase_started_cycles;
   if (threadIdx.x == 0) {
     prepare_started_cycles = clock64();
@@ -170,6 +174,10 @@ __device__ void process_query(const PersistentKernelParams& params,
     score_phase_cycles = 0;
     beam_phase_cycles = 0;
     exact_phase_cycles = 0;
+    dynamic_code_cycles = 0;
+    dynamic_code_candidates = 0;
+    dynamic_code_reads = 0;
+    dynamic_code_incarnation_rejects = 0;
   }
   __syncthreads();
   f32* query = params.decoded_queries + static_cast<size_t>(query_slot) * params.dim;
@@ -434,9 +442,11 @@ __device__ void process_query(const PersistentKernelParams& params,
     }
     __syncthreads();
     if (route_entry_count != 0 &&
-        !approximate_handles_batch(params, descriptor, query_lut,
-                                   navigation_handles, route_entry_count,
-                                   navigation_distances)) {
+        !approximate_handles_batch(
+          params, descriptor, query_lut, navigation_handles,
+          route_entry_count, navigation_distances, &dynamic_code_cycles,
+          &dynamic_code_candidates, &dynamic_code_reads,
+          &dynamic_code_incarnation_rejects)) {
       if (threadIdx.x == 0) {
         route_seed_failed = 1;
         route_failure_reason = static_cast<u32>(
@@ -510,6 +520,11 @@ __device__ void process_query(const PersistentKernelParams& params,
           static_cast<QueryFailureReason>(route_failure_reason),
           route_snapshot_retries);
         completion.gpu_cycles = clock64() - query_started_cycles;
+        completion.dynamic_code_cycles = dynamic_code_cycles;
+        completion.dynamic_code_candidates = dynamic_code_candidates;
+        completion.dynamic_code_reads = dynamic_code_reads;
+        completion.dynamic_code_incarnation_rejects =
+          dynamic_code_incarnation_rejects;
         device_ring_push(params.completions, completion);
       }
       __syncthreads();
@@ -594,6 +609,11 @@ __device__ void process_query(const PersistentKernelParams& params,
         completion.graph_read_retries = total_graph_read_retries;
         completion.graph_rounds = total_graph_rounds;
         completion.exact_vectors = total_exact_reads;
+        completion.dynamic_code_cycles = dynamic_code_cycles;
+        completion.dynamic_code_candidates = dynamic_code_candidates;
+        completion.dynamic_code_reads = dynamic_code_reads;
+        completion.dynamic_code_incarnation_rejects =
+          dynamic_code_incarnation_rejects;
         device_ring_push(params.completions, completion);
       }
       __syncthreads();
@@ -665,10 +685,11 @@ __device__ void process_query(const PersistentKernelParams& params,
         }
       }
       __syncthreads();
-      if (!approximate_handles_batch(params, descriptor, query_lut,
-                                     navigation_handles,
-                                     candidate_count,
-                                     navigation_distances)) {
+      if (!approximate_handles_batch(
+            params, descriptor, query_lut, navigation_handles,
+            candidate_count, navigation_distances, &dynamic_code_cycles,
+            &dynamic_code_candidates, &dynamic_code_reads,
+            &dynamic_code_incarnation_rejects)) {
         if (threadIdx.x == 0) graph_failed = 1;
       }
       __syncthreads();
@@ -703,6 +724,11 @@ __device__ void process_query(const PersistentKernelParams& params,
         completion.graph_read_retries = total_graph_read_retries;
         completion.graph_rounds = total_graph_rounds;
         completion.exact_vectors = total_exact_reads;
+        completion.dynamic_code_cycles = dynamic_code_cycles;
+        completion.dynamic_code_candidates = dynamic_code_candidates;
+        completion.dynamic_code_reads = dynamic_code_reads;
+        completion.dynamic_code_incarnation_rejects =
+          dynamic_code_incarnation_rejects;
         device_ring_push(params.completions, completion);
       }
       __syncthreads();
@@ -768,6 +794,11 @@ __device__ void process_query(const PersistentKernelParams& params,
       completion.graph_read_retries = total_graph_read_retries;
       completion.graph_rounds = total_graph_rounds;
       completion.exact_vectors = total_exact_reads;
+      completion.dynamic_code_cycles = dynamic_code_cycles;
+      completion.dynamic_code_candidates = dynamic_code_candidates;
+      completion.dynamic_code_reads = dynamic_code_reads;
+      completion.dynamic_code_incarnation_rejects =
+        dynamic_code_incarnation_rejects;
       device_ring_push(params.completions, completion);
     }
     __syncthreads();
@@ -801,6 +832,11 @@ __device__ void process_query(const PersistentKernelParams& params,
     completion.graph_read_retries = total_graph_read_retries;
     completion.graph_rounds = total_graph_rounds;
     completion.exact_vectors = total_exact_reads;
+    completion.dynamic_code_cycles = dynamic_code_cycles;
+    completion.dynamic_code_candidates = dynamic_code_candidates;
+    completion.dynamic_code_reads = dynamic_code_reads;
+    completion.dynamic_code_incarnation_rejects =
+      dynamic_code_incarnation_rejects;
     device_ring_push(params.completions, completion);
   }
   __syncthreads();

@@ -12,7 +12,7 @@ constexpr u32 kInsertMagic = 0x53494e54;  // "SINT"
 constexpr u32 kMutationMagic = 0x4d555444;  // D T U M / "DUTM"
 constexpr u32 kMutationProtocolVersion = 3;
 constexpr u32 kPeerRpcMagic = 0x53505250;  // "SPRP"
-constexpr u32 kPeerRpcVersion = 12;
+constexpr u32 kPeerRpcVersion = 13;
 
 enum class InsertStatus : u32 {
   ok = 0,
@@ -57,7 +57,49 @@ enum class PeerRpcType : u32 {
   authority_placement_response = 18,
   dynamic_node_control_request = 19,
   dynamic_node_control_response = 20,
+  // Stage2 keeps beam ownership at the insertion home.  A request expands
+  // exactly the pointer selected by that beam and scores only neighbors whose
+  // vectors are resident at the expansion pointer's physical home.  It is a
+  // transport fusion, not a nested/local search and therefore cannot change
+  // the natural convergence order.
+  stage2_expand_score_request = 21,
+  stage2_expand_score_response = 22,
 };
+
+enum class Stage2HomeDisposition : u32 {
+  retryable = 0,
+  stable = 1,
+  terminal = 2,
+  // The neighbor is valid but belongs to another physical home.  The beam
+  // owner retains its ordinary score request for that pointer.
+  unscored = 3,
+};
+
+struct Stage2ExpandScoreItem {
+  u64 pointer_raw{};
+  u64 generation{};
+  u32 search_index{};
+  u32 reserved{};
+};
+
+struct Stage2ExpandScoreResult {
+  u64 pointer_raw{};
+  u64 generation{};
+  u32 search_index{};
+  u32 neighbor_count{};
+  u32 disposition{static_cast<u32>(Stage2HomeDisposition::retryable)};
+  u32 reserved{};
+};
+
+struct Stage2ExpandScoreNeighbor {
+  u64 pointer_raw{};
+  distance_t distance{};
+  u32 disposition{static_cast<u32>(Stage2HomeDisposition::unscored)};
+};
+
+static_assert(sizeof(Stage2ExpandScoreItem) == 24);
+static_assert(sizeof(Stage2ExpandScoreResult) == 32);
+static_assert(sizeof(Stage2ExpandScoreNeighbor) == 16);
 
 struct InsertBatchRequestHeader {
   u32 magic{kInsertMagic};
@@ -917,6 +959,76 @@ inline const ReconcileReverseOp* reconcile_reverse_ops(
     const void* payload) {
   return reinterpret_cast<const ReconcileReverseOp*>(
     reinterpret_cast<const byte_t*>(payload) + sizeof(PeerRpcHeader));
+}
+
+inline size_t stage2_expand_score_queries_offset(u32 item_count) {
+  return align_wire_u64(
+    wire_saturating_add(sizeof(PeerRpcHeader), wire_saturating_multiply(
+      item_count, sizeof(Stage2ExpandScoreItem))));
+}
+
+inline size_t stage2_expand_score_request_bytes(u32 item_count) {
+  return wire_saturating_add(
+    stage2_expand_score_queries_offset(item_count), wire_saturating_multiply(
+      item_count, VamanaNode::vector_bytes()));
+}
+
+inline size_t stage2_expand_score_response_bytes(u32 item_count) {
+  const size_t result_bytes = wire_saturating_multiply(
+    item_count, sizeof(Stage2ExpandScoreResult));
+  const size_t neighbor_count = wire_saturating_multiply(
+    item_count, VamanaNode::graph_entry_capacity());
+  return wire_saturating_add(
+    wire_saturating_add(sizeof(PeerRpcHeader), result_bytes),
+    wire_saturating_multiply(
+      neighbor_count, sizeof(Stage2ExpandScoreNeighbor)));
+}
+
+inline Stage2ExpandScoreItem* stage2_expand_score_items(void* payload) {
+  return reinterpret_cast<Stage2ExpandScoreItem*>(
+    reinterpret_cast<byte_t*>(payload) + sizeof(PeerRpcHeader));
+}
+
+inline const Stage2ExpandScoreItem* stage2_expand_score_items(
+    const void* payload) {
+  return reinterpret_cast<const Stage2ExpandScoreItem*>(
+    reinterpret_cast<const byte_t*>(payload) + sizeof(PeerRpcHeader));
+}
+
+inline byte_t* stage2_expand_score_queries(void* payload, u32 item_count) {
+  return reinterpret_cast<byte_t*>(payload) +
+         stage2_expand_score_queries_offset(item_count);
+}
+
+inline const byte_t* stage2_expand_score_queries(
+    const void* payload, u32 item_count) {
+  return reinterpret_cast<const byte_t*>(payload) +
+         stage2_expand_score_queries_offset(item_count);
+}
+
+inline Stage2ExpandScoreResult* stage2_expand_score_results(void* payload) {
+  return reinterpret_cast<Stage2ExpandScoreResult*>(
+    reinterpret_cast<byte_t*>(payload) + sizeof(PeerRpcHeader));
+}
+
+inline const Stage2ExpandScoreResult* stage2_expand_score_results(
+    const void* payload) {
+  return reinterpret_cast<const Stage2ExpandScoreResult*>(
+    reinterpret_cast<const byte_t*>(payload) + sizeof(PeerRpcHeader));
+}
+
+inline Stage2ExpandScoreNeighbor* stage2_expand_score_neighbors(
+    void* payload, u32 item_count) {
+  return reinterpret_cast<Stage2ExpandScoreNeighbor*>(
+    reinterpret_cast<byte_t*>(payload) + sizeof(PeerRpcHeader) +
+    static_cast<size_t>(item_count) * sizeof(Stage2ExpandScoreResult));
+}
+
+inline const Stage2ExpandScoreNeighbor* stage2_expand_score_neighbors(
+    const void* payload, u32 item_count) {
+  return reinterpret_cast<const Stage2ExpandScoreNeighbor*>(
+    reinterpret_cast<const byte_t*>(payload) + sizeof(PeerRpcHeader) +
+    static_cast<size_t>(item_count) * sizeof(Stage2ExpandScoreResult));
 }
 
 }  // namespace service::storage_owner

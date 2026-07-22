@@ -9,7 +9,7 @@ void test_authority_extension_rpc_layouts() {
   namespace protocol = service::storage_owner;
 
   static_assert(protocol::kMutationProtocolVersion == 3);
-  static_assert(protocol::kPeerRpcVersion == 12);
+  static_assert(protocol::kPeerRpcVersion == 13);
   static_assert(static_cast<u32>(
                   protocol::PeerRpcType::stage1_arm_response) == 14);
   static_assert(static_cast<u32>(
@@ -24,6 +24,13 @@ void test_authority_extension_rpc_layouts() {
                   protocol::PeerRpcType::dynamic_node_control_request) == 19);
   static_assert(static_cast<u32>(
                   protocol::PeerRpcType::dynamic_node_control_response) == 20);
+  static_assert(static_cast<u32>(
+                  protocol::PeerRpcType::stage2_expand_score_request) == 21);
+  static_assert(static_cast<u32>(
+                  protocol::PeerRpcType::stage2_expand_score_response) == 22);
+  static_assert(sizeof(protocol::Stage2ExpandScoreItem) == 24);
+  static_assert(sizeof(protocol::Stage2ExpandScoreResult) == 32);
+  static_assert(sizeof(protocol::Stage2ExpandScoreNeighbor) == 16);
   static_assert(static_cast<u32>(
                   protocol::DynamicNodeControlAction::settle_allocation) == 3);
   static_assert(sizeof(protocol::DynamicNodeControlItem) == 48);

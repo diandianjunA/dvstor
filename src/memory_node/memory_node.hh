@@ -498,6 +498,11 @@ private:
       const byte_t* payload,
       const Configuration& config,
       bool* admission_deferred = nullptr);
+  bool handle_peer_stage2_expand_score_request(
+      u32 source_shard,
+      const service::storage_owner::PeerRpcHeader& header,
+      const byte_t* payload,
+      const Configuration& config);
   bool try_send_peer_stage1_retry_response(
       u32 destination_shard,
       const service::storage_owner::PeerRpcHeader& header,
@@ -1064,6 +1069,11 @@ private:
   std::mutex peer_stage1_tasks_mutex_;
   std::condition_variable peer_stage1_tasks_cv_;
   std::deque<PeerStage1Task> peer_stage1_tasks_;
+  // Read-only Stage2 home work shares the physical-home CPU pool, but not the
+  // Stage1 admission queue.  Stage1 is always dequeued first and this queue
+  // has its own bound, so an expansion burst cannot reject or starve new
+  // mutations before they publish their Stage1 graph.
+  std::deque<PeerStage1Task> peer_stage2_home_tasks_;
   // Execute requests whose ANN artifact is already prepared but whose fused
   // Stage2 admission window is full.  They retain their request-dedup lease
   // and per-token in-flight ownership, so a duplicate wire request can be
@@ -1192,6 +1202,9 @@ private:
   std::atomic<u64> storage_owner_stage2_graph_unique_reads_{0};
   std::atomic<u64> storage_owner_stage2_vector_read_waves_{0};
   std::atomic<u64> storage_owner_stage2_vector_unique_reads_{0};
+  std::atomic<u64> storage_owner_stage2_home_rpc_batches_{0};
+  std::atomic<u64> storage_owner_stage2_home_rpc_items_{0};
+  std::atomic<u64> storage_owner_stage2_home_scored_neighbors_{0};
   std::atomic<u64> storage_owner_stage2_migrations_{0};
   std::atomic<u64> storage_owner_stage2_final_edges_{0};
   std::atomic<u64> storage_owner_stage2_cross_edges_stage1_home_{0};

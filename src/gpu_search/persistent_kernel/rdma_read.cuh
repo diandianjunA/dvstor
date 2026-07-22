@@ -316,16 +316,29 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
                                           const f32* query_lut,
                                           u64* handles,
                                           u32 count,
-                                          f32* distances) {
+                                          f32* distances,
+                                          u64* total_dynamic_cycles,
+                                          u32* total_dynamic_candidates,
+                                          u32* total_dynamic_reads,
+                                          u32* total_incarnation_rejects) {
   __shared__ i32 shard_status[kPersistentMaxShards];
   __shared__ u32 failed;
+  __shared__ u32 call_dynamic_candidates;
+  __shared__ u32 call_incarnation_rejects;
+  __shared__ u64 call_started_cycles;
   const size_t request_base =
     static_cast<size_t>(descriptor.query_slot) * kPersistentMaxMergeCandidates;
   u32* request_shards = params.dynamic_code_request_shards + request_base;
   u64* request_offsets = params.dynamic_code_request_offsets + request_base;
   u64* request_local_iova_offsets =
     params.dynamic_code_request_local_iovas + request_base;
-  if (threadIdx.x == 0) failed = 0;
+  if (threadIdx.x == 0) {
+    failed = 0;
+    call_dynamic_candidates = 0;
+    call_incarnation_rejects = 0;
+    call_started_cycles = clock64();
+  }
+  __syncthreads();
   for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
     const u64 handle = handles[index];
     request_shards[index] = UINT32_MAX;
@@ -351,6 +364,7 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     // Dynamic PQ is authoritative in the storage record. Centroid-route seeds
     // and discovered neighbors therefore use the same one-sided RDMA path.
     if (params.dynamic_code_records == nullptr || shard >= params.num_shards) continue;
+    atomicAdd(&call_dynamic_candidates, 1u);
     const u64 node_offset = remote_byte_offset(raw);
     request_shards[index] = shard;
     request_offsets[index] = node_offset + params.shards[shard].dynamic_code_offset;
@@ -398,6 +412,23 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
       distances[index] = approximate_entry(
         params, query_lut,
         code + sizeof(u32));
+    } else {
+      atomicAdd(&call_incarnation_rejects, 1u);
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (total_dynamic_cycles != nullptr) {
+      *total_dynamic_cycles += clock64() - call_started_cycles;
+    }
+    if (total_dynamic_candidates != nullptr) {
+      *total_dynamic_candidates += call_dynamic_candidates;
+    }
+    if (total_dynamic_reads != nullptr) {
+      *total_dynamic_reads += call_dynamic_candidates;
+    }
+    if (total_incarnation_rejects != nullptr) {
+      *total_incarnation_rejects += call_incarnation_rejects;
     }
   }
   __syncthreads();

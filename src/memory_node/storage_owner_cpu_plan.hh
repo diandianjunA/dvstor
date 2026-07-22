@@ -54,7 +54,7 @@ inline StorageOwnerCpuPlan derive_storage_owner_cpu_plan(
   // the foreground send/receive CQs, so it needs its own CPU just like the
   // explicit worker threads below.
   plan.foreground_progress_threads = 1;
-  // Stage2 executes several synchronous one-sided-RDMA waves for every
+  // Stage2 executes several generation-fenced remote dependency waves for every
   // inserted vector, while reverse updates are coalesced before they reach a
   // peer worker.  Giving the latter twice as many CPUs as Stage2 therefore
   // leaves the latency-bearing side unable to keep enough reads in flight on
