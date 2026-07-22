@@ -326,7 +326,8 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
   __shared__ u32 call_dynamic_candidates;
   __shared__ u32 call_dynamic_reads;
   __shared__ u32 call_incarnation_rejects;
-  __shared__ u64 call_started_cycles;
+  __shared__ u64 call_rdma_started_cycles;
+  __shared__ u64 call_rdma_cycles;
   const size_t request_base =
     static_cast<size_t>(descriptor.query_slot) * kPersistentMaxMergeCandidates;
   u32* request_shards = params.dynamic_code_request_shards + request_base;
@@ -338,7 +339,8 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     call_dynamic_candidates = 0;
     call_dynamic_reads = 0;
     call_incarnation_rejects = 0;
-    call_started_cycles = clock64();
+    call_rdma_started_cycles = 0;
+    call_rdma_cycles = 0;
   }
   __syncthreads();
   for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
@@ -372,30 +374,34 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     // handle, not by the reusable byte offset, so slot reuse is an
     // unconditional miss even though the cache is shared across queries.
     if (params.dynamic_code_cache_handles != nullptr &&
-        params.dynamic_code_cache_records != nullptr) {
-      const u32 cache_slot = static_cast<u32>(
-        (handle ^ (handle >> 32) ^ (handle >> 17)) &
-        (kPersistentDynamicCodeCacheCapacity - 1));
-      const u64 cached_handle = load_cg(
-        params.dynamic_code_cache_handles + cache_slot);
-      if (cached_handle == handle) {
-        const u8* cached = params.dynamic_code_cache_records +
-          static_cast<size_t>(cache_slot) * params.dynamic_code_record_bytes;
-        if (*reinterpret_cast<const u32*>(cached) ==
-            remote_incarnation(handle)) {
-          const f32 cached_distance = approximate_entry(
-            params, query_lut, cached + sizeof(u32));
-          // A colliding publisher first replaces the key with BUSY, then
-          // overwrites the payload. Accept only if the full incarnation key
-          // remained stable across the payload read.
-          __threadfence();
-          if (load_cg(params.dynamic_code_cache_handles + cache_slot) ==
-              handle) {
-            distances[index] = cached_distance;
-            continue;
-          }
+        params.dynamic_code_cache_records != nullptr &&
+        params.dynamic_code_cache_capacity != 0) {
+      u64 hash = handle;
+      hash ^= hash >> 30;
+      hash *= 0xbf58476d1ce4e5b9ULL;
+      hash ^= hash >> 27;
+      hash *= 0x94d049bb133111ebULL;
+      hash ^= hash >> 31;
+      const u32 mask = params.dynamic_code_cache_capacity - 1;
+      const u32 first_slot = static_cast<u32>(hash) & mask;
+      for (u32 probe = 0; probe < params.dynamic_code_cache_probe_limit;
+           ++probe) {
+        const u32 cache_slot = (first_slot + probe) & mask;
+        auto* cache_key = reinterpret_cast<unsigned long long*>(
+          params.dynamic_code_cache_handles + cache_slot);
+        // atomicCAS is the acquire operation paired with the publisher's
+        // threadfence + atomicExch.  Entries are immutable after publication,
+        // so a hit needs neither a fence nor a second key load.
+        const u64 cached_handle = atomicCAS(cache_key, 0, 0);
+        if (cached_handle == handle) {
+          const u8* cached = params.dynamic_code_cache_records +
+            static_cast<size_t>(cache_slot) * params.pq_code_bytes;
+          distances[index] = approximate_entry(params, query_lut, cached);
+          break;
         }
+        if (cached_handle == kPersistentDynamicCodeCacheEmpty) break;
       }
+      if (distances[index] != FLT_MAX) continue;
     }
     // The merge frontier can contain the same tagged handle through multiple
     // graph parents.  Deduplicate only inside this finite scoring call: one
@@ -428,6 +434,22 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
   }
   __syncthreads();
 
+  // The steady-state path is all cache hits.  Do not enter the shard fan-out,
+  // CQ polling, publication, or duplicate-scatter machinery when there is no
+  // authoritative read to issue.
+  if (call_dynamic_reads == 0) {
+    if (threadIdx.x == 0) {
+      if (total_dynamic_candidates != nullptr) {
+        *total_dynamic_candidates += call_dynamic_candidates;
+      }
+    }
+    __syncthreads();
+    return true;
+  }
+
+  if (threadIdx.x == 0) call_rdma_started_cycles = clock64();
+  __syncthreads();
+
   for (u32 shard = threadIdx.x; shard < params.num_shards; shard += blockDim.x) {
     i32* owner_completion = params.direct_batch_statuses == nullptr ? nullptr :
       params.direct_batch_statuses +
@@ -446,6 +468,10 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     i32* owner_completion = params.direct_batch_statuses +
       static_cast<size_t>(descriptor.query_slot) * params.num_shards + shard;
     shard_status[shard] = wait_direct_batch(params, owner_completion);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    call_rdma_cycles = clock64() - call_rdma_started_cycles;
   }
   __syncthreads();
 
@@ -467,10 +493,9 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     }
   }
   __syncthreads();
-  // Serialize the tiny direct-mapped cache publication. Different fetched
-  // handles can hash to the same slot; a single publisher avoids torn records
-  // while making collision behavior deterministic. This loop is bounded by
-  // kPersistentMaxMergeCandidates and runs after scoring, off the RDMA path.
+  // Serialize publication within this CTA.  Globally, EMPTY -> BUSY reserves a
+  // slot and payload -> fence -> tagged handle publishes an immutable entry.
+  // Collisions never evict a valid incarnation.
   if (threadIdx.x == 0 && params.dynamic_code_cache_handles != nullptr &&
       params.dynamic_code_cache_records != nullptr) {
     for (u32 index = 0; index < count; ++index) {
@@ -486,28 +511,36 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
           remote_incarnation(handle)) {
         continue;
       }
-      const u32 cache_slot = static_cast<u32>(
-        (handle ^ (handle >> 32) ^ (handle >> 17)) &
-        (kPersistentDynamicCodeCacheCapacity - 1));
-      auto* cache_key = reinterpret_cast<unsigned long long*>(
-        params.dynamic_code_cache_handles + cache_slot);
-      const u64 observed = load_cg(
-        params.dynamic_code_cache_handles + cache_slot);
-      if (observed == kPersistentDynamicCodeCacheBusy ||
-          atomicCAS(cache_key, observed,
-                    kPersistentDynamicCodeCacheBusy) != observed) {
-        continue;
+      u64 hash = handle;
+      hash ^= hash >> 30;
+      hash *= 0xbf58476d1ce4e5b9ULL;
+      hash ^= hash >> 27;
+      hash *= 0x94d049bb133111ebULL;
+      hash ^= hash >> 31;
+      const u32 mask = params.dynamic_code_cache_capacity - 1;
+      const u32 first_slot = static_cast<u32>(hash) & mask;
+      for (u32 probe = 0; probe < params.dynamic_code_cache_probe_limit;
+           ++probe) {
+        const u32 cache_slot = (first_slot + probe) & mask;
+        auto* cache_key = reinterpret_cast<unsigned long long*>(
+          params.dynamic_code_cache_handles + cache_slot);
+        const u64 observed = atomicCAS(cache_key, 0, 0);
+        if (observed == handle) break;
+        if (observed != kPersistentDynamicCodeCacheEmpty) continue;
+        if (atomicCAS(cache_key, kPersistentDynamicCodeCacheEmpty,
+                      kPersistentDynamicCodeCacheBusy) !=
+            kPersistentDynamicCodeCacheEmpty) {
+          continue;
+        }
+        u8* destination = params.dynamic_code_cache_records +
+          static_cast<size_t>(cache_slot) * params.pq_code_bytes;
+        for (u32 byte = 0; byte < params.pq_code_bytes; ++byte) {
+          destination[byte] = source[sizeof(u32) + byte];
+        }
+        __threadfence();
+        atomicExch(cache_key, handle);
+        break;
       }
-      // Make BUSY globally visible before any byte of the old payload is
-      // replaced. Readers validate the key again after scoring.
-      __threadfence();
-      u8* destination = params.dynamic_code_cache_records +
-        static_cast<size_t>(cache_slot) * params.dynamic_code_record_bytes;
-      for (u32 byte = 0; byte < params.dynamic_code_record_bytes; ++byte) {
-        destination[byte] = source[byte];
-      }
-      __threadfence();
-      atomicExch(cache_key, handle);
     }
   }
   __syncthreads();
@@ -519,7 +552,7 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
   __syncthreads();
   if (threadIdx.x == 0) {
     if (total_dynamic_cycles != nullptr) {
-      *total_dynamic_cycles += clock64() - call_started_cycles;
+      *total_dynamic_cycles += call_rdma_cycles;
     }
     if (total_dynamic_candidates != nullptr) {
       *total_dynamic_candidates += call_dynamic_candidates;

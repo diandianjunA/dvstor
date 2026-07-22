@@ -233,17 +233,16 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
     rpc_parallelism, config.storage_owner_maintenance_workers,
     num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
   const u32 reverse_worker_count = cpu_plan.peer_reverse_workers;
-  // Stage2 home scoring is substantially more numerous than Stage1 publish
-  // work. Sharing every worker allowed a growing maintenance backlog to
-  // inject head-of-line delay into foreground mutation ACKs. Split the same
-  // fixed physical-home CPU budget into independent scheduling domains.
+  // Reserve one Stage2-home lane to break dependency cycles. The remaining
+  // lanes keep Stage1 priority but may steal Stage2 work after a bounded
+  // burst, preserving both isolation and work conservation.
   const u32 physical_home_worker_count = cpu_plan.peer_stage1_workers;
   const auto physical_home_split =
     memory_node_detail::split_physical_home_workers(
       physical_home_worker_count);
   const u32 stage2_home_worker_count = physical_home_split.stage2_home;
   const u32 stage1_rpc_worker_count = physical_home_split.stage1;
-  peer_stage2_home_dedicated_ = stage2_home_worker_count != 0;
+  peer_stage2_home_dedicated_ = false;
   peer_graph_response_buffer_limit_ = std::max<size_t>(
     1, static_cast<size_t>(physical_home_worker_count) * 2);
   {
@@ -376,7 +375,7 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
                std::to_string(stage1_rpc_worker_count) +
                "; Stage2-home workers: " +
                std::to_string(stage2_home_worker_count) +
-               " (isolated fixed physical-home CPU partition)");
+               " (one reserved + elastic work-conserving home scheduling)");
   print_status("storage-owner physical control workers: cleanup=" +
                std::to_string(cleanup_worker_count) + " placement=" +
                std::to_string(cpu_plan.peer_placement_workers) +

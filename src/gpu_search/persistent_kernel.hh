@@ -221,10 +221,12 @@ struct PersistentKernelParams {
   // Process-wide, incarnation-tagged navigation-code cache. Dynamic PQ
   // payloads are immutable after a node incarnation is published; the
   // complete remote handle therefore provides the cache's ABA fence. Cache
-  // entries use a busy-key publication protocol so concurrent query CTAs
-  // never consume a torn replacement record.
+  // entries use EMPTY -> BUSY -> tagged-handle publication and are never
+  // replaced, so concurrent query CTAs cannot consume a torn payload.
   u64* dynamic_code_cache_handles{};
   u8* dynamic_code_cache_records{};
+  u32 dynamic_code_cache_capacity{};
+  u32 dynamic_code_cache_probe_limit{};
   u32* dynamic_code_request_shards{};
   u64* dynamic_code_request_offsets{};
   u64* dynamic_code_request_local_iovas{};
@@ -232,14 +234,16 @@ struct PersistentKernelParams {
   f32* result_distances{};
 };
 
-// A direct-mapped 1M-entry cache costs about 44 MiB for PQ32 records. This is
-// deliberately independent of query-slot count: inserted nodes are shared by
-// all queries, and a per-query cache turns every hot dynamic node into one
-// tiny RDMA read per query.
-inline constexpr u32 kPersistentDynamicCodeCacheCapacity = 1u << 20;
+// Dynamic records are shared by all queries.  Keep the immutable PQ payload in
+// an open-addressed table; a generous table avoids turning long-running insert
+// workloads into a stream of collision misses.  The key is the complete tagged
+// handle, so slot reuse is an unconditional miss without invalidation.
+inline constexpr u32 kPersistentDynamicCodeCacheDefaultCapacity = 1u << 20;
+inline constexpr u32 kPersistentDynamicCodeCacheProbeLimit = 16;
+inline constexpr u64 kPersistentDynamicCodeCacheEmpty = ~u64{0};
 inline constexpr u64 kPersistentDynamicCodeCacheBusy = ~u64{1};
-static_assert((kPersistentDynamicCodeCacheCapacity &
-               (kPersistentDynamicCodeCacheCapacity - 1)) == 0);
+static_assert((kPersistentDynamicCodeCacheDefaultCapacity &
+               (kPersistentDynamicCodeCacheDefaultCapacity - 1)) == 0);
 
 struct PersistentKernelOccupancy {
   u32 active_blocks_per_sm{};

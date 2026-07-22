@@ -26,7 +26,7 @@ int main() {
       assert(split.stage1 >= 1);
       assert(split.stage2_home >= 1);
     }
-    if (total >= 4) assert(split.stage2_home == total / 4);
+    if (total >= 2) assert(split.stage2_home == 1);
   }
 
   // Strict order for four physical cores followed by their four SMT siblings.
@@ -60,11 +60,11 @@ int main() {
     22, 64, 16, 8, 4);
   assert(colocated.foreground_workers == 3);
   assert(colocated.foreground_coordinators == 12);
-  assert(colocated.maintenance_workers == 4);
+  assert(colocated.maintenance_workers == 8);
   assert(colocated.maintenance_admission_workers == 2);
   assert(colocated.peer_reverse_workers == 2);
-  assert(colocated.peer_stage1_workers == 7);
-  assert(colocated.peer_cleanup_workers == 2);
+  assert(colocated.peer_stage1_workers == 4);
+  assert(colocated.peer_cleanup_workers == 1);
   assert(colocated.peer_placement_workers == 1);
   assert(colocated.peer_progress_threads == 2);
   assert(colocated.foreground_progress_threads == 1);
@@ -76,18 +76,17 @@ int main() {
            colocated.foreground_progress_threads == 22);
 
   // The five-way colocated deployment gives some shard ranks 24 logical
-  // CPUs.  The rebalanced plan must spend exactly that budget as well: two
-  // reverse lanes move to latency-bearing Stage2 without taking a Stage1,
-  // cleanup, placement, or progress lane.
+  // CPUs. The latency-bearing Stage2 pool stays at eight while the two extra
+  // CPUs preserve one additional physical-home and cleanup lane.
   const auto colocated_24 = memory_node_detail::derive_storage_owner_cpu_plan(
     24, 64, 16, 8, 4);
   assert(colocated_24.foreground_workers == 3);
   assert(colocated_24.foreground_coordinators == 12);
-  assert(colocated_24.maintenance_workers == 4);
+  assert(colocated_24.maintenance_workers == 8);
   assert(colocated_24.maintenance_admission_workers == 2);
   assert(colocated_24.peer_reverse_workers == 2);
-  assert(colocated_24.peer_stage1_workers == 8);
-  assert(colocated_24.peer_cleanup_workers == 3);
+  assert(colocated_24.peer_stage1_workers == 5);
+  assert(colocated_24.peer_cleanup_workers == 2);
   assert(colocated_24.peer_placement_workers == 1);
   assert(colocated_24.peer_progress_threads == 2);
   assert(colocated_24.foreground_progress_threads == 1);
@@ -100,9 +99,8 @@ int main() {
            colocated_24.peer_progress_threads +
            colocated_24.foreground_progress_threads == 24);
 
-  // Configuration is still authoritative.  Transferring one worker at a
-  // time preserves the combined Stage2/reverse CPU pool and the reverse
-  // service floor instead of silently expanding the process CPU budget.
+  // Configuration remains authoritative below the colocated eight-worker
+  // profile, and preserves the combined Stage2/reverse CPU pool.
   const auto maintenance_two =
     memory_node_detail::derive_storage_owner_cpu_plan(22, 64, 16, 2, 4);
   const auto maintenance_three =
@@ -117,7 +115,7 @@ int main() {
            maintenance_two.peer_reverse_workers == 6);
   assert(maintenance_three.maintenance_workers +
            maintenance_three.peer_reverse_workers == 6);
-  assert(colocated.maintenance_workers + colocated.peer_reverse_workers == 6);
+  assert(colocated.maintenance_workers + colocated.peer_reverse_workers == 10);
 
   const auto dedicated = memory_node_detail::derive_storage_owner_cpu_plan(
     112, 64, 16, 8, 4);

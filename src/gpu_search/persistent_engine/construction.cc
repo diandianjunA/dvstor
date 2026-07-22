@@ -145,8 +145,8 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     static_cast<u64>(query_slots) * kPersistentMaxMergeCandidates *
       dynamic_code_record_bytes;
   const u64 dynamic_code_cache_bytes =
-    static_cast<u64>(kPersistentDynamicCodeCacheCapacity) *
-      (sizeof(u64) + dynamic_code_record_bytes);
+    static_cast<u64>(config.gpu_dynamic_code_cache_entries) *
+      (sizeof(u64) + code_bytes);
   const u64 dynamic_request_scratch_bytes =
     static_cast<u64>(query_slots) * kPersistentMaxMergeCandidates *
     (sizeof(u32) + 2 * sizeof(u64));
@@ -197,6 +197,10 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   std::cerr << "[gpu-search] navigation budget codes=" << budget.code_bytes
             << " dynamic_code_scratch=" << dynamic_code_scratch_bytes
             << " dynamic_code_cache=" << dynamic_code_cache_bytes
+            << " dynamic_code_cache_entries="
+            << config.gpu_dynamic_code_cache_entries
+            << " dynamic_code_cache_probes="
+            << kPersistentDynamicCodeCacheProbeLimit
             << " dynamic_request_scratch=" << dynamic_request_scratch_bytes
             << " navigation_candidates=" << navigation_candidate_bytes
             << " direct_queue_scratch=" << direct_queue_bytes
@@ -335,11 +339,12 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                   "cudaMalloc(dynamic PQ request offsets)");
   device_allocate(d_dynamic_code_request_local_iovas, dynamic_request_elements,
                   "cudaMalloc(dynamic PQ request local IOVAs)");
-  const size_t dynamic_cache_elements = kPersistentDynamicCodeCacheCapacity;
+  const size_t dynamic_cache_elements =
+    config.gpu_dynamic_code_cache_entries;
   device_allocate(d_dynamic_code_cache_handles, dynamic_cache_elements,
                   "cudaMalloc(dynamic PQ cache handles)");
   device_allocate(d_dynamic_code_cache_records,
-                  dynamic_cache_elements * dynamic_code_record_bytes,
+                  dynamic_cache_elements * code_bytes,
                   "cudaMalloc(dynamic PQ cache records)");
   check_cuda(cudaMemset(d_dynamic_code_cache_handles, 0xff,
                         dynamic_cache_elements * sizeof(u64)),
@@ -620,6 +625,8 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .dynamic_code_records = d_dynamic_code_records,
     .dynamic_code_cache_handles = d_dynamic_code_cache_handles,
     .dynamic_code_cache_records = d_dynamic_code_cache_records,
+    .dynamic_code_cache_capacity = config.gpu_dynamic_code_cache_entries,
+    .dynamic_code_cache_probe_limit = kPersistentDynamicCodeCacheProbeLimit,
     .dynamic_code_request_shards = d_dynamic_code_request_shards,
     .dynamic_code_request_offsets = d_dynamic_code_request_offsets,
     .dynamic_code_request_local_iovas = d_dynamic_code_request_local_iovas,

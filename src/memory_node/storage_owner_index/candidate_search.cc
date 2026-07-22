@@ -1240,6 +1240,10 @@ MemoryNode::advance_stage2_search_candidates_batched(
     }
     state.score_group_offsets.push_back(state.score_order.size());
     state.pending_vectors.clear();
+    const size_t snapshot_stride = aligned_snapshot_bytes();
+    const size_t validation_offset =
+      memory_node_detail::storage_owner_snapshot_validation_offset();
+    u32 remote_slot = 0;
     bool progressed = false;
     for (size_t group = 0; group < state.score_unique.size(); ++group) {
       const RemotePtr pointer = state.score_unique[group];
@@ -1280,11 +1284,38 @@ MemoryNode::advance_stage2_search_candidates_batched(
         continue;
       }
 
-      // Remote exact scores are computed at the vector's physical home.  The
-      // previous one-sided path issued a 2-WR seqlock read for every dynamic
-      // candidate, producing hundreds of tiny READs per insertion.  A home
-      // score request keeps the identical incarnation validation and exact
-      // distance, while batching independent queries into one RPC.
+      if (VamanaNode::immutable_base_record(pointer)) {
+        const size_t scratch_offset =
+          static_cast<size_t>(remote_slot++) * snapshot_stride;
+        lib_assert(scratch_offset + validation_offset +
+                     VamanaNode::HEADER_SIZE <= thread->scratch_stride,
+                   "Stage2 base-vector dispatch exceeded lane scratch");
+        byte_t* buffer = thread->coroutine_scratch(scratch_offset);
+        state.pending_vectors.push_back(Stage2PendingVectorRead{
+          .group_index = group,
+          .pointer = pointer,
+          .buffer = buffer,
+          .after_header = buffer + validation_offset,
+          .requires_after_header = false,
+        });
+      }
+      // Mutable/recyclable records are scored at their physical home below.
+      // Their home RPC retains the incarnation validation, while immutable
+      // base records above need only one authoritative one-sided READ.
+    }
+
+    // Resolve the cheap immutable wave first.  Dynamic requests remain in the
+    // continuation and are selected by the next finite dispatch; this avoids
+    // imposing an all-RPC barrier on base candidates and keeps one CQ wave
+    // bounded by the existing credit calculation.
+    if (!state.pending_vectors.empty()) {
+      storage_owner_stage2_vector_read_waves_.fetch_add(
+        1, std::memory_order_relaxed);
+      storage_owner_stage2_vector_unique_reads_.fetch_add(
+        state.pending_vectors.size(), std::memory_order_relaxed);
+      state.ordered_snapshot_pairs = mixed_snapshots;
+      state.phase = Stage2SearchIoPhase::score_body_ready;
+      return std::pair{progressed, true};
     }
 
     state.score_home_rpc_count = 0;
@@ -1302,7 +1333,8 @@ MemoryNode::advance_stage2_search_candidates_batched(
       const Stage2ScoreConsumer& consumer =
         state.score_consumers[consumer_index];
       if (storage_node_pointer_addressable(consumer.pointer) &&
-          !local_shard(consumer.pointer.memory_node())) {
+          !local_shard(consumer.pointer.memory_node()) &&
+          !VamanaNode::immutable_base_record(consumer.pointer)) {
         consumers_by_shard[consumer.pointer.memory_node()].push_back(
           consumer_index);
       }

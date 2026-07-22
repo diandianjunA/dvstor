@@ -40,9 +40,11 @@ struct PhysicalHomeWorkerSplit {
 // only Stage1 lane would make foreground progress impossible.
 inline PhysicalHomeWorkerSplit split_physical_home_workers(
     std::uint32_t total) {
-  const std::uint32_t stage2_home = total >= 4
-    ? std::max<std::uint32_t>(1, total / 4)
-    : (total >= 2 ? 1 : 0);
+  // One reserved home lane breaks the dependency cycle.  The remaining
+  // physical-home lanes are work-conserving and may steal Stage2 after a
+  // bounded Stage1 burst, so permanently carving out total/4 lanes only
+  // reduces publication capacity when Stage2 is not runnable.
+  const std::uint32_t stage2_home = total >= 2 ? 1 : 0;
   return PhysicalHomeWorkerSplit{
     .stage1 = total - stage2_home,
     .stage2_home = stage2_home,
@@ -118,6 +120,15 @@ inline StorageOwnerCpuPlan derive_storage_owner_cpu_plan(
       baseline_maintenance_workers + transferred_workers;
     plan.peer_reverse_workers =
       baseline_reverse_workers - transferred_workers;
+    // The colocated five-shard deployment has 22--24 logical CPUs per
+    // process. Stage2 is the durable-completion critical path there: use the
+    // configured eight-worker ceiling and retain a two-worker reverse floor.
+    // This is a fixed-pool rebalance, not oversubscription.
+    if (budget >= 22 && budget <= 24 &&
+        configured_maintenance_workers >= 8) {
+      plan.maintenance_workers = 8;
+      plan.peer_reverse_workers = 2;
+    }
   }
   // Cleanup activation is on every replacement/deletion path and may wait
   // behind an in-progress same-token retry. Give it a bounded CPU-scaled
@@ -127,7 +138,8 @@ inline StorageOwnerCpuPlan derive_storage_owner_cpu_plan(
   plan.peer_cleanup_workers = remote_peer_count == 0 ? 0 : std::min({
     std::uint32_t{8},
     std::max<std::uint32_t>(1, rpc_parallelism),
-    std::max<std::uint32_t>(1, budget / 8)});
+    std::max<std::uint32_t>(1,
+      budget >= 22 && budget <= 24 ? budget / 12 : budget / 8)});
   // Placement and node-control mutate global physical state and deliberately
   // remain in their own serial ordering domain.
   plan.peer_placement_workers = remote_peer_count == 0 ? 0 : 1;
@@ -176,11 +188,22 @@ inline StorageOwnerCpuPlan derive_storage_owner_cpu_plan(
     return plan;
   }
 
-  // One worker on each side is a functional minimum.  With a usable CPU
-  // budget, divide the remainder in proportion to each side's real
-  // concurrency ceiling; critically, remote_peer_count is not a divisor.
+  // One worker on each side is a functional minimum.
   const std::uint32_t usable_stage1_budget =
     std::max<std::uint32_t>(2, stage1_budget);
+  if (budget >= 22 && budget <= 24 &&
+      configured_maintenance_workers >= 8) {
+    plan.foreground_workers = std::min<std::uint32_t>(
+      std::min<std::uint32_t>(3, foreground_limit),
+      std::max<std::uint32_t>(1, usable_stage1_budget - 1));
+    plan.peer_stage1_workers = std::max<std::uint32_t>(
+      1, usable_stage1_budget - plan.foreground_workers);
+    finish_foreground_coordinators();
+    return plan;
+  }
+
+  // With a usable CPU budget, divide the remainder in proportion to each
+  // side's real concurrency ceiling; remote_peer_count is not a divisor.
   const std::uint64_t combined_limit =
     static_cast<std::uint64_t>(foreground_limit) + cpu_parallelism;
   if (usable_stage1_budget >= combined_limit) {

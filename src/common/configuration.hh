@@ -50,6 +50,9 @@ public:
   u32 gpu_final_rerank_width{64};
   u32 gpu_max_expansions{384};
   u32 gpu_rdma_qps{4};
+  // Power-of-two immutable dynamic-PQ cache entries. Large streaming-update
+  // profiles raise this without imposing the memory cost on small GPUs.
+  u32 gpu_dynamic_code_cache_entries{1u << 20};
   // A CQE can be delayed well beyond ordinary read latency when GPU reads and
   // CPU-posted mutation traffic share the NIC.  This is a liveness bound, not
   // a latency target: transport errors still fail immediately.
@@ -71,10 +74,10 @@ public:
   // must not be tied to the foreground Stage1 batching latency.
   u32 storage_owner_stage2_batch_max_wait_us{10'000};
   u32 storage_owner_peer_qps_per_peer{8};
-  u32 storage_owner_peer_rdma_tokens{8};
+  u32 storage_owner_peer_rdma_tokens{16};
   u32 storage_owner_rpc_depth{8};
   u32 storage_owner_rpc_timeout_ms{30'000};
-  u32 storage_owner_search_snapshot_batch{64};
+  u32 storage_owner_search_snapshot_batch{256};
   // Stage2 is part of the only supported update protocol, so at least one
   // maintenance executor must exist even when the caller does not tune it.
   u32 storage_owner_maintenance_workers{1};
@@ -191,6 +194,10 @@ private:
       ("enable-updates",
        po::value<bool>(&enable_updates)->default_value(enable_updates),
        "Enable compute-side insert, upsert, and erase submission.")
+      ("gpu-dynamic-code-cache-entries",
+       po::value<u32>(&gpu_dynamic_code_cache_entries)
+         ->default_value(gpu_dynamic_code_cache_entries),
+       "Power-of-two entries in the immutable dynamic-PQ GPU cache.")
 
       ("storage-id", po::value<u32>(&storage_id)->default_value(storage_id),
        "Zero-based storage shard identifier.")
@@ -284,6 +291,10 @@ private:
         gpu_max_expansions < gpu_traversal_beam_width ||
         gpu_max_expansions > 4096 ||
         gpu_rdma_qps == 0 || gpu_rdma_qps > 32 ||
+        gpu_dynamic_code_cache_entries == 0 ||
+        (gpu_dynamic_code_cache_entries &
+         (gpu_dynamic_code_cache_entries - 1)) != 0 ||
+        gpu_dynamic_code_cache_entries > (1u << 27) ||
         gpu_direct_timeout_ms < 20 || gpu_direct_timeout_ms > 5'000 ||
         gpu_persistent_blocks_per_sm == 0 ||
         gpu_persistent_blocks_per_sm > 16) {
