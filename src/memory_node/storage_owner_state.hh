@@ -130,7 +130,9 @@ struct InsertRuntimeState {
   std::unique_ptr<LocalMemoryRegion> region;
   size_t request_bytes{};
   size_t response_offset{};
+  size_t completion_offset{};
   u32 request_slot_count{1};
+  u32 completion_slot_count{1};
 };
 
 struct PeerRpcRuntimeState {
@@ -167,6 +169,11 @@ struct StorageOwnerInsertTask {
   u32 item_count{};
   u64 batch_id{};
   size_t byte_len{};
+  vec<byte_t> payload;
+  // Reserved before the acceptance ACK. This makes the ACK a hard promise
+  // that every item can publish one completion even if SEND CQ progress is
+  // delayed after the worker finishes.
+  vec<u32> completion_slots;
   std::chrono::steady_clock::time_point received_at{};
 };
 

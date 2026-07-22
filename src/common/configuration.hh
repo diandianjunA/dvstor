@@ -69,10 +69,13 @@ public:
   // Give synchronous writers enough time to form one useful foreground
   // microbatch. A full batch is sent immediately; this only bounds additional
   // coalescing while an RPC slot is available, not remote service time.
-  u32 storage_owner_batch_max_wait_us{10'000};
+  u32 storage_owner_batch_max_wait_us{2'000};
   // Stage2 is query-invisible background maintenance. Its compaction horizon
   // must not be tied to the foreground Stage1 batching latency.
-  u32 storage_owner_stage2_batch_max_wait_us{10'000};
+  // Stage2 batching is coordinated across already-pending work.  A short
+  // horizon still forms useful waves without adding millisecond-scale queue
+  // delay when update load is sparse or uneven across homes.
+  u32 storage_owner_stage2_batch_max_wait_us{50};
   u32 storage_owner_peer_qps_per_peer{8};
   u32 storage_owner_peer_rdma_tokens{16};
   u32 storage_owner_rpc_depth{8};

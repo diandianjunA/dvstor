@@ -31,5 +31,8 @@ using service::storage_owner_client::duration_ns;
 using service::storage_owner_client::duration_ns_clamped;
 using service::storage_owner_client::per_item_ns;
 using service::storage_owner_client::storage_owner_wr_id;
+using service::storage_owner_client::storage_owner_completion_wr_id;
+using service::storage_owner_client::storage_owner_is_completion_wr;
+using service::storage_owner_client::storage_owner_wr_owner;
 
 }  // namespace compute_service_detail

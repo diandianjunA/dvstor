@@ -375,7 +375,7 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
                std::to_string(stage1_rpc_worker_count) +
                "; Stage2-home workers: " +
                std::to_string(stage2_home_worker_count) +
-               " (proportional reserved + alternating work-conserving home scheduling)");
+               " (one reserved + queue-age adaptive shared scheduling)");
   print_status("storage-owner physical control workers: cleanup=" +
                std::to_string(cleanup_worker_count) + " placement=" +
                std::to_string(cpu_plan.peer_placement_workers) +

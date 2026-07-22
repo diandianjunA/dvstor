@@ -27,7 +27,7 @@ int main() {
       assert(split.stage2_home >= 1);
     }
     if (total >= 2) {
-      assert(split.stage2_home == std::max<std::uint32_t>(1, total / 3));
+      assert(split.stage2_home == 1);
     }
   }
 

@@ -1,4 +1,5 @@
 #include "memory_node/storage_owner_runtime/detail.hh"
+#include "service/storage_owner_client_helpers.hh"
 
 using namespace memory_node_storage_owner_runtime_detail;
 
@@ -12,8 +13,16 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
   lib_assert(task.client_id < num_clients_ &&
                task.slot_id < insert_runtime_.request_slot_count,
              "storage-owner task references an invalid request slot");
-  const byte_t* payload = insert_runtime_.buffer.get_full_buffer() +
-    insert_request_slot_offset(task.client_id, task.slot_id);
+  struct BatchContextCreditGuard {
+    std::atomic<u32>* credits{};
+    ~BatchContextCreditGuard() {
+      if (credits != nullptr) {
+        credits->fetch_add(1, std::memory_order_release);
+      }
+    }
+  } context_credit_guard{
+    &storage_client_batch_context_credits_[task.client_id]};
+  const byte_t* payload = task.payload.data();
   const auto* request =
     reinterpret_cast<const service::storage_owner::InsertBatchRequestHeader*>(payload);
   const bool mutation = request->magic == service::storage_owner::kMutationMagic;
@@ -22,6 +31,7 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
     : service::storage_owner::insert_batch_request_bytes(request->item_count);
   lib_assert(request->item_count == task.item_count &&
                request->batch_id == task.batch_id &&
+               task.completion_slots.size() == request->item_count &&
                request->protocol_version ==
                  service::storage_owner::kMutationProtocolVersion &&
                task.byte_len >= expected_bytes,
@@ -34,6 +44,11 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
     ? service::storage_owner::mutation_request_stage1_homes(
         payload, request->item_count)
     : service::storage_owner::request_stage1_homes(
+        payload, request->item_count);
+  const u64* operation_ids = mutation
+    ? service::storage_owner::mutation_request_operation_ids(
+        payload, request->item_count)
+    : service::storage_owner::request_operation_ids(
         payload, request->item_count);
   const byte_t* vectors = mutation
     ? service::storage_owner::mutation_request_vectors(payload, request->item_count)
@@ -54,77 +69,53 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
     std::chrono::duration_cast<std::chrono::nanoseconds>(
       process_started - task.received_at).count());
 
+  vec<u8> completion_emitted(request->item_count, 0);
+  const auto emit_completion = [&](size_t item) {
+    lib_assert(item < request->item_count,
+               "storage-owner completion callback crossed its request");
+    if (completion_emitted[item] != 0) return;
+    completion_emitted[item] = 1;
+    const auto& result = scratch.results[item];
+    post_storage_owner_token_completion(
+      task.client_id,
+      task.completion_slots[item],
+      service::storage_owner::MutationCompletionV2{
+        .owner_storage = storage_id_,
+        .source_client = request->source_client,
+        .operation_id = operation_ids[item],
+        .new_rptr_raw = result.new_rptr_raw,
+        .old_rptr_raw = result.old_rptr_raw,
+        .maintenance_sequence = result.maintenance_sequence,
+        .generation = result.generation,
+        .status = scratch.statuses[item],
+      });
+  };
+
   const bool ok = execute_storage_owner_batch_items(
         ids,
         scratch.kinds.data(),
         vectors,
         stage1_homes,
+        operation_ids,
         request->source_client,
-        request->batch_id,
         request->item_count,
         breakdown,
         config,
         &scratch.invalidated_neighbors,
         &scratch.statuses,
-        &scratch.results);
+        &scratch.results,
+        emit_completion);
 
-  const auto response_build_started = std::chrono::steady_clock::now();
-  const u32 item_count = request->item_count;
-  const size_t response_size = service::storage_owner::insert_batch_response_bytes(item_count);
-  lib_assert(response_size <= std::numeric_limits<u32>::max(),
-             "storage_owner response is too large for verbs SGEs");
-  byte_t* response_buffer = insert_runtime_.buffer.get_full_buffer() +
-    insert_response_slot_offset(config, task.client_id, task.slot_id);
-  auto* response =
-    reinterpret_cast<service::storage_owner::InsertBatchResponseHeader*>(response_buffer);
-  response->magic = request->magic;
-  response->owner_storage = storage_id_;
-  response->item_count = item_count;
-  response->batch_id = request->batch_id;
-  u32* response_statuses = service::storage_owner::response_statuses(response_buffer);
-  auto* response_results =
-    service::storage_owner::response_mutation_results(response_buffer, item_count);
-  for (u32 item = 0; item < item_count; ++item) {
-    response_statuses[item] = ok
-      ? scratch.statuses[item]
-      : static_cast<u32>(service::storage_owner::MutationStatus::failed);
-    response_results[item] = ok
-      ? scratch.results[item]
-      : service::storage_owner::MutationResult{};
+  // Non-committing terminal paths are emitted here. Successful fresh inserts
+  // normally complete earlier, directly from authority commit_plan().
+  for (size_t item = 0; item < request->item_count; ++item) {
+    if (!ok && scratch.statuses[item] ==
+          static_cast<u32>(service::storage_owner::MutationStatus::ok)) {
+      scratch.statuses[item] = static_cast<u32>(
+        service::storage_owner::MutationStatus::failed);
+    }
+    emit_completion(item);
   }
-  const u32 invalidation_capacity =
-    service::storage_owner::response_invalidation_capacity(item_count);
-  scratch.response_invalidations.reserve(invalidation_capacity);
-  for (const auto& item_invalidations : scratch.invalidated_neighbors) {
-    scratch.response_invalidations.insert(
-      scratch.response_invalidations.end(),
-      item_invalidations.begin(),
-      item_invalidations.end());
-  }
-  std::sort(scratch.response_invalidations.begin(),
-            scratch.response_invalidations.end());
-  scratch.response_invalidations.erase(
-    std::unique(scratch.response_invalidations.begin(),
-                scratch.response_invalidations.end()),
-    scratch.response_invalidations.end());
-  lib_assert(scratch.response_invalidations.size() <= invalidation_capacity,
-             "storage_owner invalidation response exceeds its capacity");
-  const u32 invalidation_count =
-    static_cast<u32>(scratch.response_invalidations.size());
-  *service::storage_owner::response_invalidation_count(response_buffer, item_count) =
-    invalidation_count;
-  u64* invalidated =
-    service::storage_owner::response_invalidated_raws(response_buffer, item_count);
-  std::copy(scratch.response_invalidations.begin(),
-            scratch.response_invalidations.end(),
-            invalidated);
-  breakdown.storage_owner_response_build_ns += elapsed_ns_since(response_build_started);
-  *service::storage_owner::response_breakdown(response_buffer, item_count) = breakdown;
-  post_storage_owner_response(
-    {task.client_id,
-     task.slot_id,
-     static_cast<u32>(response_size),
-     std::chrono::steady_clock::now()});
 }
 
 void MemoryNode::post_storage_owner_response(StorageOwnerResponseReady response) {
@@ -162,4 +153,33 @@ void MemoryNode::post_storage_owner_response(StorageOwnerResponseReady response)
     nullptr,
     0,
     insert_response_slot_offset(config, response.client_id, response.slot_id));
+}
+
+void MemoryNode::post_storage_owner_token_completion(
+    u32 client_id,
+    u32 slot_id,
+    const service::storage_owner::MutationCompletionV2& completion) {
+  lib_assert(client_id < num_clients_ &&
+               client_id < storage_client_completion_free_slots_.size(),
+             "storage-owner token completion references an invalid client");
+  lib_assert(slot_id < insert_runtime_.completion_slot_count,
+             "storage-owner token completion references an invalid credit");
+  const size_t offset = insert_completion_slot_offset(client_id, slot_id);
+  auto* output = reinterpret_cast<
+    service::storage_owner::MutationCompletionV2*>(
+      insert_runtime_.buffer.get_full_buffer() + offset);
+  *output = completion;
+
+  std::lock_guard<std::mutex> send_lock(
+    *storage_client_send_mutexes_[client_id]);
+  cm_.client_qps[client_id]->post_send_with_id(
+    *insert_runtime_.region,
+    sizeof(service::storage_owner::MutationCompletionV2),
+    IBV_WR_SEND,
+    service::storage_owner_client::storage_owner_completion_wr_id(
+      client_id, slot_id),
+    true,
+    nullptr,
+    0,
+    offset);
 }

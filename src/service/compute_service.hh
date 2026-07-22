@@ -118,6 +118,10 @@ private:
     service::storage_owner::MutationKind kind{service::storage_owner::MutationKind::insert};
     u32 completion_id{std::numeric_limits<u32>::max()};
     u32 stage1_home{};
+    // Stable logical identity.  Transport batches may be rebuilt without
+    // changing this value, so authority replay never depends on batch ordinal.
+    u64 operation_id{};
+    u32 operation_generation{};
     std::chrono::steady_clock::time_point enqueued_at{};
     std::chrono::steady_clock::time_point sender_dequeued_at{};
   };
@@ -166,17 +170,18 @@ private:
     // dequeue-visible prefix. The single progress consumer subtracts only the
     // prefix it actually popped.
     std::atomic<u32> published_tasks{0};
-    // Stage1 acknowledgement is scoped to a physical home.  Keeping one FIFO
-    // per home prevents an authority-owner RPC from coupling unrelated homes
-    // behind the slowest Stage1 publication in a mixed batch.
-    vec<std::unique_ptr<bounded::Queue<u32>>> home_queues;
-    std::unique_ptr<std::atomic<u32>[]> home_published_tasks;
-    vec<u64> home_oldest_published_observed_ns;
-    u32 next_home{};
+    // One assembler per logical authority. Physical-home fanout happens at
+    // the authority after acceptance; splitting this queue by home produces
+    // 25 sparse flows and destroys useful foreground batching.
+    std::unique_ptr<bounded::Queue<u32>> queue;
+    u64 oldest_published_observed_ns{};
     std::unique_ptr<bounded::Queue<u32>> free_tasks;
     std::unique_ptr<StorageInsertTask[]> tasks;
     vec<StorageOwnerRpcSlot> slots;
     vec<StorageOwnerResponseSlot> response_slots;
+    u32 completion_slot_count{};
+    vec<byte_t> completion_buffer;
+    std::unique_ptr<LocalMemoryRegion> completion_region;
     vec<u32> free_slots;
     // Set and cleared only by the CQ/progress thread. published_tasks is an
     // exact total but may include cells behind an invisible MPMC head, so this
@@ -241,6 +246,11 @@ private:
                                      u32 response_slot_id,
                                      u32 received_bytes);
   void post_storage_owner_response_receive(u32 owner_storage, u32 response_slot_id);
+  void post_storage_owner_completion_receive(u32 owner_storage,
+                                             u32 completion_slot_id);
+  void handle_storage_owner_token_completion(u32 owner_storage,
+                                             u32 completion_slot_id,
+                                             u32 received_bytes);
   bool queue_storage_owner_completion(StorageOwnerRpcSlot& slot);
   void commit_storage_owner_slot(u32 owner_storage, u32 slot_id);
   void release_storage_owner_slot(u32 owner_storage, u32 slot_id);
@@ -281,6 +291,10 @@ private:
   std::unique_ptr<service::breakdown::Sample[]> storage_completion_samples_;
   std::unique_ptr<std::atomic<u64>[]> storage_maintenance_targets_;
   vec<std::unique_ptr<StorageOwnerSenderState>> storage_insert_owners_;
+  // Authority replay identity includes a per-process incarnation, not the
+  // reusable connection-manager client ordinal. This prevents a restarted
+  // compute process from replaying an old operation token accidentally.
+  u32 storage_operation_source_{};
   std::atomic<u64> next_request_id_{1};
 
   std::atomic<bool> breakdown_enabled_{false};

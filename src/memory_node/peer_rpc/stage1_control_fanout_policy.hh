@@ -21,7 +21,8 @@ namespace memory_node_peer_rpc_detail {
 // debt under a sustained insert stream.  Alternate when both queues are
 // runnable.  Stage1 still has a strict progress guarantee and consumes the
 // whole pool whenever Stage2 is empty.
-constexpr u32 kStage1MaximumDequeueBurst = 1;
+constexpr u64 kStage2HomeBorrowAgeNs = 250'000;
+constexpr u64 kStage1UrgentAgeNs = 1'000'000;
 
 // Stage1 workers may share a condition variable with an isolated Stage2-home
 // pool. A notification is not proof that this worker owns runnable work: when
@@ -37,21 +38,16 @@ inline bool stage1_worker_has_eligible_task(
 inline bool dequeue_stage2_home_first(
     bool stage1_available,
     bool stage2_home_available,
-    u32& stage1_dequeue_streak) noexcept {
-  if (!stage2_home_available) {
-    if (stage1_available) {
-      stage1_dequeue_streak = std::min(
-        kStage1MaximumDequeueBurst, stage1_dequeue_streak + 1);
-    }
-    return false;
-  }
-  if (!stage1_available ||
-      stage1_dequeue_streak >= kStage1MaximumDequeueBurst) {
-    stage1_dequeue_streak = 0;
-    return true;
-  }
-  ++stage1_dequeue_streak;
-  return false;
+    u64 stage1_oldest_age_ns,
+    u64 stage2_oldest_age_ns) noexcept {
+  if (!stage2_home_available) return false;
+  if (!stage1_available) return true;
+  // Foreground publication is urgent above 1 ms. Otherwise Stage2 may borrow
+  // a shared lane only after its oldest request has waited 250 us. A
+  // dedicated Stage2 lane remains active independently, so neither class can
+  // starve and idle lanes stay work-conserving.
+  if (stage1_oldest_age_ns >= kStage1UrgentAgeNs) return false;
+  return stage2_oldest_age_ns >= kStage2HomeBorrowAgeNs;
 }
 
 // Build a fully self-describing transient Stage1 response directly from the

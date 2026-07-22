@@ -60,25 +60,13 @@ Stage1ArmResult ok_result(const Stage1ArmItem& input) {
 }
 
 void test_stage2_home_queue_cannot_starve_behind_stage1() {
-  u32 stage1_streak = 0;
-  for (u32 iteration = 0;
-       iteration < memory_node_peer_rpc_detail::kStage1MaximumDequeueBurst;
-       ++iteration) {
-    assert(!dequeue_stage2_home_first(true, true, stage1_streak));
-  }
-  assert(dequeue_stage2_home_first(true, true, stage1_streak));
-  assert(stage1_streak == 0);
+  assert(!dequeue_stage2_home_first(true, true, 100'000, 100'000));
+  assert(dequeue_stage2_home_first(true, true, 100'000, 250'000));
+  assert(!dequeue_stage2_home_first(true, true, 1'000'000, 5'000'000));
 
   // Either queue remains independently work-conserving.
-  assert(dequeue_stage2_home_first(false, true, stage1_streak));
-  assert(!dequeue_stage2_home_first(true, false, stage1_streak));
-
-  // A long Stage1-only interval retains a saturated fairness baton, so newly
-  // arrived completion-producing work is served immediately.
-  for (u32 iteration = 0; iteration < 100; ++iteration) {
-    assert(!dequeue_stage2_home_first(true, false, stage1_streak));
-  }
-  assert(dequeue_stage2_home_first(true, true, stage1_streak));
+  assert(dequeue_stage2_home_first(false, true, 0, 0));
+  assert(!dequeue_stage2_home_first(true, false, 5'000'000, 0));
 }
 
 void test_dedicated_stage2_queue_never_wakes_stage1_worker() {

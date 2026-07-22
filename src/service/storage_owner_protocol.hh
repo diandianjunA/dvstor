@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 
 #include "common/types.hh"
@@ -10,7 +11,11 @@ namespace service::storage_owner {
 
 constexpr u32 kInsertMagic = 0x53494e54;  // "SINT"
 constexpr u32 kMutationMagic = 0x4d555444;  // D T U M / "DUTM"
-constexpr u32 kMutationProtocolVersion = 3;
+constexpr u32 kMutationCompletionMagic = 0x4d434d50;  // "MCMP"
+// Version 4 carries a stable operation id for every logical mutation.  Batch
+// ids and array ordinals are transport metadata and are no longer authority
+// replay identities.
+constexpr u32 kMutationProtocolVersion = 4;
 constexpr u32 kPeerRpcMagic = 0x53505250;  // "SPRP"
 constexpr u32 kPeerRpcVersion = 14;
 
@@ -149,6 +154,42 @@ struct InsertBatchResponseHeader {
   u32 reserved{};
   u64 batch_id{};
 };
+
+enum class MutationBatchAckStatus : u32 {
+  accepted = 0,
+  busy = 1,
+  malformed = 2,
+};
+
+// Transport acceptance is deliberately separate from logical completion.
+// Once accepted, every item owns completion credit and may finish out of
+// order through MutationCompletionV2.
+struct MutationBatchAckV2 {
+  u32 magic{};
+  u32 owner_storage{};
+  u32 item_count{};
+  u32 status{static_cast<u32>(MutationBatchAckStatus::malformed)};
+  u32 protocol_version{kMutationProtocolVersion};
+  u32 reserved{};
+  u64 batch_id{};
+};
+
+struct MutationCompletionV2 {
+  u32 magic{kMutationCompletionMagic};
+  u32 protocol_version{kMutationProtocolVersion};
+  u32 owner_storage{};
+  u32 source_client{};
+  u64 operation_id{};
+  u64 new_rptr_raw{};
+  u64 old_rptr_raw{};
+  u64 maintenance_sequence{};
+  u32 generation{};
+  u32 status{static_cast<u32>(MutationStatus::failed)};
+  u64 reserved{};
+};
+
+static_assert(sizeof(MutationBatchAckV2) == 32);
+static_assert(sizeof(MutationCompletionV2) == 64);
 
 struct MutationResult {
   u64 new_rptr_raw{};
@@ -576,6 +617,11 @@ inline size_t insert_batch_request_bytes(u32 item_count) {
   size_t bytes = sizeof(InsertBatchRequestHeader);
   bytes = wire_saturating_add(bytes, wire_saturating_multiply(
     item_count, sizeof(node_t)));
+  if ((bytes & (alignof(u64) - 1)) != 0) {
+    bytes = wire_saturating_add(bytes, sizeof(u32));
+  }
+  bytes = wire_saturating_add(bytes, wire_saturating_multiply(
+    item_count, sizeof(u64)));
   bytes = wire_saturating_add(bytes, wire_saturating_multiply(
     item_count, sizeof(u32)));
   return wire_saturating_add(bytes, wire_saturating_multiply(
@@ -588,6 +634,8 @@ inline size_t mutation_batch_request_bytes(u32 item_count) {
     item_count, sizeof(u32)));
   bytes = wire_saturating_add(bytes, wire_saturating_multiply(
     item_count, sizeof(node_t)));
+  bytes = wire_saturating_add(bytes, wire_saturating_multiply(
+    item_count, sizeof(u64)));
   bytes = wire_saturating_add(bytes, wire_saturating_multiply(
     item_count, sizeof(u32)));
   return wire_saturating_add(bytes, wire_saturating_multiply(
@@ -616,13 +664,34 @@ inline const node_t* request_ids(const void* payload) {
   return reinterpret_cast<const node_t*>(reinterpret_cast<const byte_t*>(payload) + sizeof(InsertBatchRequestHeader));
 }
 
+inline u64* request_operation_ids(void* payload, u32 item_count) {
+  byte_t* address = reinterpret_cast<byte_t*>(request_ids(payload) +
+                                              item_count);
+  const uintptr_t raw = reinterpret_cast<uintptr_t>(address);
+  const uintptr_t aligned = (raw + alignof(u64) - 1) &
+                            ~(static_cast<uintptr_t>(alignof(u64) - 1));
+  return reinterpret_cast<u64*>(aligned);
+}
+
+inline const u64* request_operation_ids(const void* payload,
+                                        u32 item_count) {
+  const byte_t* address = reinterpret_cast<const byte_t*>(
+    request_ids(payload) + item_count);
+  const uintptr_t raw = reinterpret_cast<uintptr_t>(address);
+  const uintptr_t aligned = (raw + alignof(u64) - 1) &
+                            ~(static_cast<uintptr_t>(alignof(u64) - 1));
+  return reinterpret_cast<const u64*>(aligned);
+}
+
 inline u32* request_stage1_homes(void* payload, u32 item_count) {
-  return reinterpret_cast<u32*>(request_ids(payload) + item_count);
+  return reinterpret_cast<u32*>(request_operation_ids(payload, item_count) +
+                                item_count);
 }
 
 inline const u32* request_stage1_homes(const void* payload,
                                        u32 item_count) {
-  return reinterpret_cast<const u32*>(request_ids(payload) + item_count);
+  return reinterpret_cast<const u32*>(
+    request_operation_ids(payload, item_count) + item_count);
 }
 
 inline u32* mutation_request_kinds(void* payload) {
@@ -643,14 +712,25 @@ inline const node_t* mutation_request_ids(const void* payload) {
                                          reinterpret_cast<const MutationBatchRequestHeader*>(payload)->item_count);
 }
 
+inline u64* mutation_request_operation_ids(void* payload, u32 item_count) {
+  return reinterpret_cast<u64*>(mutation_request_ids(payload) + item_count);
+}
+
+inline const u64* mutation_request_operation_ids(const void* payload,
+                                                  u32 item_count) {
+  return reinterpret_cast<const u64*>(
+    mutation_request_ids(payload) + item_count);
+}
+
 inline u32* mutation_request_stage1_homes(void* payload, u32 item_count) {
-  return reinterpret_cast<u32*>(mutation_request_ids(payload) + item_count);
+  return reinterpret_cast<u32*>(
+    mutation_request_operation_ids(payload, item_count) + item_count);
 }
 
 inline const u32* mutation_request_stage1_homes(const void* payload,
                                                  u32 item_count) {
   return reinterpret_cast<const u32*>(
-    mutation_request_ids(payload) + item_count);
+    mutation_request_operation_ids(payload, item_count) + item_count);
 }
 
 inline byte_t* mutation_request_vectors(void* payload, u32 item_count) {

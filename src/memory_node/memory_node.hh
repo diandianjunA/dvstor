@@ -752,8 +752,13 @@ private:
   void storage_owner_insert_worker_loop(u32 worker_id);
   void process_storage_owner_insert_task(const StorageOwnerInsertTask& task);
   void post_storage_owner_response(StorageOwnerResponseReady response);
+  void post_storage_owner_token_completion(
+    u32 client_id,
+    u32 completion_slot_id,
+    const service::storage_owner::MutationCompletionV2& completion);
   size_t insert_request_slot_offset(u32 client_id, u32 slot_id) const;
   size_t insert_response_slot_offset(const Configuration& config, u32 client_id, u32 slot_id) const;
+  size_t insert_completion_slot_offset(u32 client_id, u32 slot_id) const;
   void service_storage_runtime(const Configuration& config);
   size_t response_slot_bytes(const Configuration& config) const;
   size_t handle_storage_insert_request(u32 client_id,
@@ -765,14 +770,16 @@ private:
                                          const service::storage_owner::MutationKind* kinds,
                                          const byte_t* raw_vectors,
                                          const u32* stage1_homes,
+                                         const u64* operation_ids,
                                          u32 source_client,
-                                         u64 client_batch_id,
                                          size_t item_count,
                                          InsertBreakdownCounters& breakdown,
                                          const Configuration& config,
                                          vec<vec<u64>>* invalidated_neighbors = nullptr,
                                          vec<u32>* statuses = nullptr,
-                                         vec<service::storage_owner::MutationResult>* results = nullptr);
+                                         vec<service::storage_owner::MutationResult>* results = nullptr,
+                                         const std::function<void(size_t)>&
+                                           on_terminal = {});
 
   // Storage-owner index operations
   RemotePtr allocate_local_node();
@@ -1278,6 +1285,12 @@ private:
   std::unique_ptr<Configuration> storage_worker_config_;
   std::unique_ptr<bounded::Queue<StorageOwnerInsertTask>> storage_insert_tasks_;
   vec<u_ptr<std::mutex>> storage_client_send_mutexes_;
+  vec<u_ptr<bounded::Queue<u32>>> storage_client_completion_free_slots_;
+  // An accepted batch reserves enough completion capacity for every item in
+  // that batch.  Credits are per RC connection so one compute client cannot
+  // consume another client's completion window.
+  std::unique_ptr<std::atomic<u32>[]>
+    storage_client_batch_context_credits_;
   vec<u_ptr<StorageOwnerThread>> storage_owner_threads_;
   vec<std::thread> storage_insert_workers_;
   std::atomic<bool> storage_insert_shutdown_{false};

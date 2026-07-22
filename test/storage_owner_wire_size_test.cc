@@ -1,5 +1,6 @@
 #include <cassert>
 #include <limits>
+#include <vector>
 
 #include "service/storage_owner_protocol.hh"
 
@@ -23,8 +24,18 @@ int main() {
 
   VamanaNode::init_static_storage(128, 96, VectorDType::uint8);
   const size_t expected = sizeof(InsertBatchRequestHeader) +
-    4 * sizeof(node_t) + 4 * sizeof(u32) + 4 * 128;
+    4 * sizeof(node_t) + 4 * sizeof(u64) + 4 * sizeof(u32) + 4 * 128;
   assert(insert_batch_request_bytes(4) == expected);
+  std::vector<byte_t> request(insert_batch_request_bytes(3), 0);
+  auto* header = reinterpret_cast<InsertBatchRequestHeader*>(request.data());
+  header->item_count = 3;
+  auto* operations = request_operation_ids(request.data(), 3);
+  operations[0] = 11;
+  operations[1] = 12;
+  operations[2] = 13;
+  assert(reinterpret_cast<uintptr_t>(operations) % alignof(u64) == 0);
+  assert(request_stage1_homes(request.data(), 3) ==
+         reinterpret_cast<u32*>(operations + 3));
   const size_t stage2_request_expected = align_wire_u64(
       sizeof(PeerRpcHeader) + 4 * sizeof(Stage2ExpandScoreItem)) +
     4 * VamanaNode::vector_bytes();

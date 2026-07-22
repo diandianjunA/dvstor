@@ -36,6 +36,20 @@ inline u64 storage_owner_wr_id(u32 owner_storage, u32 slot_id) {
   return encode_64bit(owner_storage, slot_id);
 }
 
+inline constexpr u32 kStorageOwnerCompletionWrBit = 0x80000000u;
+
+inline u64 storage_owner_completion_wr_id(u32 owner_storage, u32 slot_id) {
+  return encode_64bit(owner_storage | kStorageOwnerCompletionWrBit, slot_id);
+}
+
+inline bool storage_owner_is_completion_wr(u32 encoded_owner) {
+  return (encoded_owner & kStorageOwnerCompletionWrBit) != 0;
+}
+
+inline u32 storage_owner_wr_owner(u32 encoded_owner) {
+  return encoded_owner & ~kStorageOwnerCompletionWrBit;
+}
+
 inline void add_storage_owner_breakdown(
     service::breakdown::Sample* sample,
     const service::storage_owner::InsertBreakdownCounters& counters,

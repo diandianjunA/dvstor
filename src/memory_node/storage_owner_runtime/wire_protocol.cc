@@ -2,6 +2,7 @@
 
 #include "memory_node/peer_rpc/stage1_control_fanout_policy.hh"
 #include "memory_node/storage_owner_runtime/detail.hh"
+#include "service/storage_owner_client_helpers.hh"
 
 using namespace memory_node_storage_owner_runtime_detail;
 
@@ -26,7 +27,22 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
       send_wcs.data(), static_cast<i32>(send_wcs.size()));
     progressed = progressed || num_sent > 0;
     for (i32 i = 0; i < num_sent; ++i) {
-      const auto [client_id, slot_id] = decode_64bit(send_wcs[i].wr_id);
+      const auto [encoded_client, slot_id] = decode_64bit(send_wcs[i].wr_id);
+      const bool token_completion =
+        service::storage_owner_client::storage_owner_is_completion_wr(
+          encoded_client);
+      const u32 client_id =
+        service::storage_owner_client::storage_owner_wr_owner(
+          encoded_client);
+      if (token_completion) {
+        if (client_id < storage_client_completion_free_slots_.size() &&
+            slot_id < insert_runtime_.completion_slot_count) {
+          lib_assert(storage_client_completion_free_slots_[client_id]->try_push(
+                       slot_id),
+                     "storage-owner completion credit returned twice");
+        }
+        continue;
+      }
       if (client_id >= num_clients_ || slot_id >= insert_runtime_.request_slot_count) {
         continue;
       }
@@ -72,14 +88,86 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
           task.slot_id = slot_id;
           task.item_count = request->item_count;
           task.batch_id = request->batch_id;
-          task.byte_len = bytes;
+          task.byte_len = expected_bytes;
+          task.payload.assign(payload, payload + expected_bytes);
+          task.completion_slots.reserve(request->item_count);
           task.received_at = std::chrono::steady_clock::now();
-          mark_storage_owner_foreground_activity();
-          // At most one descriptor exists per occupied receive slot. The
-          // queue is preallocated to that exact protocol bound, so ingress
-          // never blocks the CQ progress loop.
-          lib_assert(storage_insert_tasks_->try_push(std::move(task)),
-                     "storage-owner ingress queue exhausted despite RPC-slot bound");
+
+          byte_t* ack_buffer = insert_runtime_.buffer.get_full_buffer() +
+            insert_response_slot_offset(config, client_id, slot_id);
+          auto* ack = reinterpret_cast<
+            service::storage_owner::MutationBatchAckV2*>(ack_buffer);
+          *ack = service::storage_owner::MutationBatchAckV2{
+            .magic = request->magic,
+            .owner_storage = storage_id_,
+            .item_count = request->item_count,
+            .status = static_cast<u32>(
+              service::storage_owner::MutationBatchAckStatus::busy),
+            .protocol_version =
+              service::storage_owner::kMutationProtocolVersion,
+            .batch_id = request->batch_id,
+          };
+
+          // Serialize acceptance before every completion SEND on this RC QP.
+          // The worker may dequeue immediately, but its completion post takes
+          // the same mutex and therefore cannot overtake this ACK.
+          bool context_reserved = false;
+          auto& context_credits =
+            storage_client_batch_context_credits_[client_id];
+          u32 available = context_credits.load(std::memory_order_acquire);
+          while (available != 0 &&
+                 !context_credits.compare_exchange_weak(
+                   available, available - 1,
+                   std::memory_order_acq_rel,
+                   std::memory_order_acquire)) {
+          }
+          context_reserved = available != 0;
+          if (context_reserved) {
+            u32 completion_slot = 0;
+            while (task.completion_slots.size() < request->item_count &&
+                   storage_client_completion_free_slots_[client_id]->try_pop(
+                     completion_slot)) {
+              task.completion_slots.push_back(completion_slot);
+            }
+            if (task.completion_slots.size() != request->item_count) {
+              for (const u32 reserved_slot : task.completion_slots) {
+                lib_assert(
+                  storage_client_completion_free_slots_[client_id]->try_push(
+                    reserved_slot),
+                  "failed to roll back storage-owner completion reservation");
+              }
+              task.completion_slots.clear();
+              context_credits.fetch_add(1, std::memory_order_release);
+              context_reserved = false;
+            }
+          }
+          std::lock_guard<std::mutex> send_lock(
+            *storage_client_send_mutexes_[client_id]);
+          if (context_reserved &&
+              storage_insert_tasks_->try_push(std::move(task))) {
+            ack->status = static_cast<u32>(
+              service::storage_owner::MutationBatchAckStatus::accepted);
+            mark_storage_owner_foreground_activity();
+          } else if (context_reserved) {
+            // bounded::Queue does not move its input unless it successfully
+            // claims a cell, so the reservation remains available here.
+            for (const u32 reserved_slot : task.completion_slots) {
+              lib_assert(
+                storage_client_completion_free_slots_[client_id]->try_push(
+                  reserved_slot),
+                "failed to roll back rejected completion reservation");
+            }
+            context_credits.fetch_add(1, std::memory_order_release);
+          }
+          cm_.client_qps[client_id]->post_send_with_id(
+            *insert_runtime_.region,
+            sizeof(service::storage_owner::MutationBatchAckV2),
+            IBV_WR_SEND,
+            encode_64bit(client_id, slot_id),
+            true,
+            nullptr,
+            0,
+            insert_response_slot_offset(config, client_id, slot_id));
           handled_async = true;
         }
       }
@@ -88,17 +176,43 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
         continue;
       }
 
-      const size_t response_bytes = handle_storage_insert_request(
-        client_id, slot_id, payload, bytes, config);
-      lib_assert(response_bytes > 0, "invalid storage-owner insert request");
-      lib_assert(response_bytes <= response_slot_bytes(config) &&
-                 response_bytes <= std::numeric_limits<u32>::max(),
-                 "storage_owner response exceeds the registered response slot");
-      post_storage_owner_response(
-        {client_id,
-         slot_id,
-         static_cast<u32>(response_bytes),
-         std::chrono::steady_clock::now()});
+      // Reject a parseable malformed request without entering the authority
+      // pipeline. The ACK carries its batch id so the compute side can fail
+      // the exact logical tasks instead of waiting for an RPC timeout.
+      if (bytes >= sizeof(service::storage_owner::InsertBatchRequestHeader)) {
+        const auto* request = reinterpret_cast<const
+          service::storage_owner::InsertBatchRequestHeader*>(payload);
+        const size_t response_offset =
+          insert_response_slot_offset(config, client_id, slot_id);
+        auto* ack = reinterpret_cast<
+          service::storage_owner::MutationBatchAckV2*>(
+            insert_runtime_.buffer.get_full_buffer() + response_offset);
+        *ack = service::storage_owner::MutationBatchAckV2{
+          .magic = request->magic,
+          .owner_storage = storage_id_,
+          .item_count = request->item_count,
+          .status = static_cast<u32>(
+            service::storage_owner::MutationBatchAckStatus::malformed),
+          .protocol_version = service::storage_owner::kMutationProtocolVersion,
+          .batch_id = request->batch_id,
+        };
+        std::lock_guard<std::mutex> send_lock(
+          *storage_client_send_mutexes_[client_id]);
+        cm_.client_qps[client_id]->post_send_with_id(
+          *insert_runtime_.region,
+          sizeof(*ack), IBV_WR_SEND,
+          encode_64bit(client_id, slot_id), true, nullptr, 0,
+          response_offset);
+      } else {
+        // There is no safe batch identity to echo. Replenish the transport
+        // receive and let the sender's existing fail-stop/timeout policy
+        // diagnose the truncated connection payload.
+        cm_.client_qps[client_id]->post_receive(
+          *insert_runtime_.region,
+          static_cast<u32>(insert_runtime_.request_bytes),
+          encode_64bit(client_id, slot_id),
+          insert_request_slot_offset(client_id, slot_id));
+      }
     }
 
     if (!progressed) {
@@ -108,7 +222,8 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
 }
 
 size_t MemoryNode::response_slot_bytes(const Configuration& config) const {
-  return align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max));
+  (void)config;
+  return align_up(sizeof(service::storage_owner::MutationBatchAckV2));
 }
 
 size_t MemoryNode::handle_storage_insert_request(u32 client_id,
@@ -157,6 +272,11 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id,
         payload, request->item_count)
     : service::storage_owner::request_stage1_homes(
         payload, request->item_count);
+  const u64* operation_ids = mutation
+    ? service::storage_owner::mutation_request_operation_ids(
+        payload, request->item_count)
+    : service::storage_owner::request_operation_ids(
+        payload, request->item_count);
   const byte_t* raw_vectors = mutation
     ? service::storage_owner::mutation_request_vectors(payload, request->item_count)
     : service::storage_owner::request_vectors(payload, request->item_count);
@@ -172,8 +292,8 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id,
   storage_owner_insert_active_workers_.fetch_add(1, std::memory_order_acq_rel);
   const bool ok = execute_storage_owner_batch_items(ids, kinds.data(), raw_vectors,
                                                     stage1_homes,
+                                                    operation_ids,
                                                     request->source_client,
-                                                    request->batch_id,
                                                     request->item_count,
                                                     breakdown, config, &invalidated_neighbors,
                                                     &item_statuses, &mutation_results);
@@ -216,14 +336,16 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
                                        const service::storage_owner::MutationKind* kinds,
                                        const byte_t* raw_vectors,
                                        const u32* stage1_homes,
+                                       const u64* operation_ids,
                                        u32 source_client,
-                                       u64 client_batch_id,
                                        size_t item_count,
                                        InsertBreakdownCounters& breakdown,
                                        const Configuration& config,
                                        vec<vec<u64>>* invalidated_neighbors,
                                        vec<u32>* statuses,
-                                       vec<service::storage_owner::MutationResult>* results) {
+                                       vec<service::storage_owner::MutationResult>* results,
+                                       const std::function<void(size_t)>&
+                                         on_terminal) {
   if (item_count == 0) {
     return true;
   }
@@ -231,8 +353,12 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
              "two-stage mutation request omitted physical Stage1 homes");
 
   lib_assert(ids != nullptr && kinds != nullptr && raw_vectors != nullptr &&
-               client_batch_id != 0,
+               operation_ids != nullptr,
              "two-stage authority request omitted mutation identity or vectors");
+  for (size_t index = 0; index < item_count; ++index) {
+    lib_assert(operation_ids[index] != 0,
+               "two-stage authority request contains a zero operation id");
+  }
   lib_assert(storage_owner_maintenance_enabled(config),
              "two-stage updates require the Stage2 maintenance runtime");
   if (statuses != nullptr) {
@@ -266,6 +392,16 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   };
   vec<MutationPlan> plans(item_count);
   dense_hashmap_t<u32, vec<size_t>> stage1_groups;
+  const auto plan_index_for_token = [&](u32 token_source,
+                                        u64 token_operation) -> size_t {
+    for (size_t candidate = 0; candidate < plans.size(); ++candidate) {
+      if (plans[candidate].operation.source_client == token_source &&
+          plans[candidate].operation.client_batch_id == token_operation) {
+        return candidate;
+      }
+    }
+    return plans.size();
+  };
 
   const auto map_begin_failure = [](BeginState state) {
     switch (state) {
@@ -294,13 +430,14 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     // to index the peer arrays. The per-item failed status is already set.
     if (ids[index] >= config.vector_id_namespace_size ||
         stage1_homes[index] >= num_storage_nodes_) {
+      if (on_terminal) on_terminal(index);
       continue;
     }
     MutationPlan& plan = plans[index];
     plan.kind = kinds[index];
     plan.stage1_home = stage1_homes[index];
     plan.operation = AuthorityOperationToken{
-      source_client, static_cast<u32>(index), client_batch_id};
+      source_client, 0, operation_ids[index]};
     const auto prepare_started = std::chrono::steady_clock::now();
     plan.begin = begin_authority_mutation(
       ids[index], plan.kind, plan.operation, plan.stage1_home);
@@ -321,6 +458,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
           .maintenance_sequence = replay.maintenance_sequence,
         };
       }
+      if (on_terminal) on_terminal(index);
       continue;
     }
     if (!plan.begin.acquired()) {
@@ -328,6 +466,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
         (*statuses)[index] = static_cast<u32>(
           map_begin_failure(plan.begin.state));
       }
+      if (on_terminal) on_terminal(index);
       continue;
     }
     plan.active = true;
@@ -339,7 +478,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     if (plan.kind == MutationKind::erase) continue;
 
     plan.stage1_item = Stage1ExecuteItem{
-      .client_batch_id = client_batch_id,
+      .client_batch_id = operation_ids[index],
       .old_raw = plan.begin.previous.current.raw_address,
       // The complete physical-home subgroup below decides whether this stays
       // a legacy prepare or carries a fresh-insert fused-arm request. Starting
@@ -347,7 +486,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       // the subgroup's cleanup dependency has been checked.
       .initial_placement_version = 0,
       .source_client = source_client,
-      .item_index = static_cast<u32>(index),
+      .item_index = 0,
       .id = ids[index],
       .generation = plan.begin.generation,
       .kind = static_cast<u32>(plan.kind),
@@ -417,6 +556,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
         .maintenance_sequence = maintenance_sequence,
       };
     }
+    if (on_terminal) on_terminal(index);
   };
 
   // Group each item by its one centroid-selected home. Distinct remote-home
@@ -506,9 +646,10 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
                "Stage1 execute fanout lost its home-to-authority mapping");
     for (size_t slot = 0; slot < home_items.size(); ++slot) {
       // A physical-home response may contain only the tokens that resolved in
-      // this wave. Map by the immutable public item index rather than by the
-      // original home-batch slot; retrying siblings are intentionally absent.
-      const size_t index = home_items[slot].item_index;
+      // this wave. Map by the stable public operation id; transport ordinals
+      // are intentionally excluded from authority identity.
+      const size_t index = plan_index_for_token(
+        home_items[slot].source_client, home_items[slot].client_batch_id);
       lib_assert(index < plans.size(),
                  "Stage1 partial callback referenced an invalid mutation");
       MutationPlan& plan = plans[index];
@@ -547,7 +688,8 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   const auto resolve_remote_stage1_release = [&] (
       u32 home, span<const Stage1ArmItem> release_items) {
     for (const Stage1ArmItem& item : release_items) {
-      const size_t index = item.token.item_index;
+      const size_t index = plan_index_for_token(
+        item.token.source_client, item.token.client_batch_id);
       lib_assert(index < plans.size(),
                  "Stage1 release ACK referenced an invalid mutation index");
       const MutationPlan& plan = plans[index];
@@ -567,7 +709,11 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
                  "Stage1 release ACK crossed a committed mutation token");
     }
     for (const Stage1ArmItem& item : release_items) {
-      plans[item.token.item_index].stage1_receipt_released = true;
+      const size_t index = plan_index_for_token(
+        item.token.source_client, item.token.client_batch_id);
+      lib_assert(index < plans.size(),
+                 "Stage1 release completion lost its stable operation id");
+      plans[index].stage1_receipt_released = true;
     }
   };
 
@@ -845,8 +991,8 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     const Stage1ArmItem item{
       .token = {
         .source_client = source_client,
-        .item_index = static_cast<u32>(index),
-        .client_batch_id = client_batch_id,
+        .item_index = 0,
+        .client_batch_id = operation_ids[index],
       },
       .target_raw = plan.stage1_result.target_raw,
       .initial_placement_version = placement_version,
@@ -963,8 +1109,8 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     plan.cleanup_item = CleanupActivateItem{
       .token = {
         .source_client = source_client,
-        .item_index = static_cast<u32>(index),
-        .client_batch_id = client_batch_id,
+        .item_index = 0,
+        .client_batch_id = operation_ids[index],
       },
       .old_raw = plan.begin.previous.current.raw_address,
       .id = ids[index],

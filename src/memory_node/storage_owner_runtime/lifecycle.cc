@@ -15,7 +15,7 @@ void MemoryNode::setup_insert_runtime(const Configuration& config) {
   insert_runtime_.request_bytes = insert_request_bytes;
   insert_runtime_.request_slot_count = std::max<u32>(1, config.storage_owner_rpc_depth);
   const size_t insert_response_bytes =
-    align_up(service::storage_owner::insert_batch_response_bytes(config.storage_owner_batch_max));
+    align_up(sizeof(service::storage_owner::MutationBatchAckV2));
   lib_assert(insert_request_bytes <= std::numeric_limits<u32>::max() &&
              insert_response_bytes <= std::numeric_limits<u32>::max(),
              "storage_owner RPC message is too large for verbs SGEs; reduce batch size or vector dimension");
@@ -24,16 +24,45 @@ void MemoryNode::setup_insert_runtime(const Configuration& config) {
   lib_assert(slot_count <= static_cast<size_t>(config.max_recv_queue_wr),
              "storage_owner RPC receive slots exceed memory-node receive CQ capacity");
   insert_runtime_.response_offset = insert_runtime_.request_bytes * slot_count;
+  const u64 completion_slots_u64 =
+    static_cast<u64>(insert_runtime_.request_slot_count) *
+    config.storage_owner_batch_max * 2;
+  lib_assert(completion_slots_u64 > 0 &&
+               completion_slots_u64 <= std::numeric_limits<u32>::max(),
+             "storage-owner completion window is invalid");
+  insert_runtime_.completion_slot_count = static_cast<u32>(
+    completion_slots_u64);
+  insert_runtime_.completion_offset = insert_runtime_.response_offset +
+    insert_response_bytes * slot_count;
+  const size_t total_completion_slots =
+    static_cast<size_t>(num_clients_) * insert_runtime_.completion_slot_count;
   storage_insert_tasks_ =
-    std::make_unique<bounded::Queue<StorageOwnerInsertTask>>(slot_count);
-  insert_runtime_.buffer.allocate(insert_runtime_.response_offset + insert_response_bytes * slot_count);
+    std::make_unique<bounded::Queue<StorageOwnerInsertTask>>(slot_count * 2);
+  insert_runtime_.buffer.allocate(
+    insert_runtime_.completion_offset + total_completion_slots *
+      sizeof(service::storage_owner::MutationCompletionV2));
   insert_runtime_.buffer.touch_memory();
   insert_runtime_.region = std::make_unique<LocalMemoryRegion>(
     context_, insert_runtime_.buffer.get_full_buffer(), insert_runtime_.buffer.buffer_size);
   storage_client_send_mutexes_.clear();
   storage_client_send_mutexes_.reserve(num_clients_);
+  storage_client_completion_free_slots_.clear();
+  storage_client_completion_free_slots_.reserve(num_clients_);
+  storage_client_batch_context_credits_ =
+    std::make_unique<std::atomic<u32>[]>(num_clients_);
+  const u32 batch_contexts_per_client =
+    insert_runtime_.request_slot_count * 2;
   for (u32 client_id = 0; client_id < num_clients_; ++client_id) {
+    storage_client_batch_context_credits_[client_id].store(
+      batch_contexts_per_client, std::memory_order_relaxed);
     storage_client_send_mutexes_.push_back(std::make_unique<std::mutex>());
+    auto free_slots = std::make_unique<bounded::Queue<u32>>(
+      insert_runtime_.completion_slot_count);
+    for (u32 slot = 0; slot < insert_runtime_.completion_slot_count; ++slot) {
+      lib_assert(free_slots->try_push(slot),
+                 "failed to initialize storage-owner completion credits");
+    }
+    storage_client_completion_free_slots_.push_back(std::move(free_slots));
   }
 }
 

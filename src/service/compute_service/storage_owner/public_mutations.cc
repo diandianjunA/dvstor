@@ -168,13 +168,15 @@ size_t ComputeService::submit_storage_owner_mutations(
     task.kind = kind;
     task.completion_id = completion_id;
     task.stage1_home = stage1_home;
+    ++task.operation_generation;
+    if (task.operation_generation == 0) ++task.operation_generation;
+    task.operation_id =
+      (static_cast<u64>(task.operation_generation) << 32) | task_id;
+    lib_assert(task.operation_id != 0,
+               "storage-owner operation id wrapped to zero");
     task.enqueued_at = std::chrono::steady_clock::now();
     task.sender_dequeued_at = {};
-    lib_assert(stage1_home < state.home_queues.size(),
-               "storage-owner task selected an invalid Stage1 home queue");
-    state.home_queues[stage1_home]->push_wait(task_id);
-    state.home_published_tasks[stage1_home].fetch_add(
-      1, std::memory_order_release);
+    state.queue->push_wait(task_id);
     state.published_tasks.fetch_add(1, std::memory_order_release);
     // Queue publication precedes the release-store. A sender that observes no
     // remaining producer therefore either already drained this task or can

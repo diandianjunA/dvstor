@@ -5,10 +5,50 @@
 
 namespace {
 
+void test_public_mutation_acceptance_and_completion_envelopes() {
+  namespace protocol = service::storage_owner;
+
+  const protocol::MutationBatchAckV2 ack{
+    .magic = protocol::kMutationMagic,
+    .owner_storage = 3,
+    .item_count = 17,
+    .status = static_cast<u32>(
+      protocol::MutationBatchAckStatus::accepted),
+    .protocol_version = protocol::kMutationProtocolVersion,
+    .batch_id = 91,
+  };
+  assert(ack.magic == protocol::kMutationMagic);
+  assert(ack.status == static_cast<u32>(
+    protocol::MutationBatchAckStatus::accepted));
+  assert(ack.protocol_version == 4);
+  assert(ack.reserved == 0);
+
+  constexpr u32 task_id = 0x01020304;
+  constexpr u32 generation = 0xa1b2c3d4;
+  constexpr u64 operation_id =
+    (static_cast<u64>(generation) << 32) | task_id;
+  const protocol::MutationCompletionV2 completion{
+    .owner_storage = 3,
+    .source_client = 7,
+    .operation_id = operation_id,
+    .new_rptr_raw = 0x1234,
+    .maintenance_sequence = 51,
+    .generation = 9,
+    .status = static_cast<u32>(protocol::MutationStatus::ok),
+  };
+  assert(completion.magic == protocol::kMutationCompletionMagic);
+  assert(completion.protocol_version == 4);
+  assert(static_cast<u32>(completion.operation_id) == task_id);
+  assert(static_cast<u32>(completion.operation_id >> 32) == generation);
+  assert(completion.status == static_cast<u32>(
+    protocol::MutationStatus::ok));
+  assert(completion.reserved == 0);
+}
+
 void test_authority_extension_rpc_layouts() {
   namespace protocol = service::storage_owner;
 
-  static_assert(protocol::kMutationProtocolVersion == 3);
+  static_assert(protocol::kMutationProtocolVersion == 4);
   static_assert(protocol::kPeerRpcVersion == 14);
   static_assert(static_cast<u32>(
                   protocol::PeerRpcType::stage1_arm_response) == 14);
@@ -312,6 +352,7 @@ void test_authority_extension_rpc_layouts() {
 
 int main() {
   VamanaNode::init_static_storage(128, 96, VectorDType::uint8);
+  test_public_mutation_acceptance_and_completion_envelopes();
   test_authority_extension_rpc_layouts();
   return 0;
 }

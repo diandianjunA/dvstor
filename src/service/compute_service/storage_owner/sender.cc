@@ -40,9 +40,15 @@ void ComputeService::run_storage_insert_progress_loop() {
       recv_wcs.data(), static_cast<i32>(recv_wcs.size()));
     progressed = progressed || recv_count > 0;
     for (i32 i = 0; i < recv_count; ++i) {
-      const auto [owner_storage, slot_id] = decode_64bit(recv_wcs[i].wr_id);
-      handle_storage_owner_response(
-        owner_storage, slot_id, recv_wcs[i].byte_len);
+      const auto [encoded_owner, slot_id] = decode_64bit(recv_wcs[i].wr_id);
+      const u32 owner_storage = storage_owner_wr_owner(encoded_owner);
+      if (storage_owner_is_completion_wr(encoded_owner)) {
+        handle_storage_owner_token_completion(
+          owner_storage, slot_id, recv_wcs[i].byte_len);
+      } else {
+        handle_storage_owner_response(
+          owner_storage, slot_id, recv_wcs[i].byte_len);
+      }
     }
 
     progressed = drain_storage_owner_submissions(first_owner) || progressed;
@@ -76,29 +82,20 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
       const u64 observed_now_ns = now_ns();
       const u32 free = static_cast<u32>(state.free_slots.size());
       const u32 active = static_cast<u32>(state.slots.size()) - free;
-      const u32 home_count = static_cast<u32>(state.home_queues.size());
-      u32 selected_home = home_count;
-      StorageOwnerBatchDecision decision;
-      for (u32 home_offset = 0; home_offset < home_count; ++home_offset) {
-        const u32 home = (state.next_home + home_offset) % home_count;
-        const u32 ready = state.home_published_tasks[home].load(
-          std::memory_order_acquire);
-        u64& oldest = state.home_oldest_published_observed_ns[home];
-        if (ready == 0) {
-          oldest = 0;
-          continue;
-        }
-        if (oldest == 0) oldest = observed_now_ns;
-        const auto candidate = decide_storage_owner_batch(
-          ready, active, free,
-          state.pending_producers.load(std::memory_order_acquire), batch_max,
-          oldest, observed_now_ns, max_wait_ns);
-        if (candidate.take == 0) continue;
-        selected_home = home;
-        decision = candidate;
+      const u32 ready = state.published_tasks.load(
+        std::memory_order_acquire);
+      if (ready == 0) {
+        state.oldest_published_observed_ns = 0;
         break;
       }
-      if (selected_home == home_count) break;
+      if (state.oldest_published_observed_ns == 0) {
+        state.oldest_published_observed_ns = observed_now_ns;
+      }
+      const StorageOwnerBatchDecision decision = decide_storage_owner_batch(
+        ready, active, free,
+        state.pending_producers.load(std::memory_order_acquire), batch_max,
+        state.oldest_published_observed_ns, observed_now_ns, max_wait_ns);
+      if (decision.take == 0) break;
       state.max_active_rpcs = std::max(state.max_active_rpcs, active);
 
       const u32 slot_id = state.free_slots.back();
@@ -106,7 +103,7 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
       auto& slot = state.slots[slot_id];
       slot.tasks.clear();
       const u32 dequeued = dequeue_storage_owner_visible_prefix(
-        *state.home_queues[selected_home], decision.take, slot.tasks);
+        *state.queue, decision.take, slot.tasks);
       if (dequeued == 0) {
         // A producer can be preempted after reserving the FIFO head but before
         // publishing it. Later cells may already contribute to
@@ -115,15 +112,9 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
         // pass; blocking here would also stop CQ progress.
         ++state.queue_visibility_stalls;
         state.free_slots.push_back(slot_id);
-        state.next_home = (selected_home + 1) % home_count;
         break;
       }
       state.partial_visible_batches += dequeued < decision.take;
-      const u32 previous_home =
-        state.home_published_tasks[selected_home].fetch_sub(
-          dequeued, std::memory_order_acq_rel);
-      lib_assert(previous_home >= dequeued,
-                 "storage-owner home-published task counter underflow");
       const u32 previous = state.published_tasks.fetch_sub(
         dequeued, std::memory_order_acq_rel);
       lib_assert(previous >= dequeued,
@@ -139,21 +130,18 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
       state.max_wait_flush_batches += decision.max_wait_flush;
       state.occupancy_flush_batches += decision.occupancy_flush;
       state.adaptive_wait_flush_batches += decision.adaptive_wait_flush;
-      const u32 remaining_home_published =
-        state.home_published_tasks[selected_home].load(
-          std::memory_order_acquire);
-      state.home_oldest_published_observed_ns[selected_home] =
+      const u32 remaining_published = state.published_tasks.load(
+        std::memory_order_acquire);
+      state.oldest_published_observed_ns =
         next_storage_owner_batch_observed_ns(
-          state.home_oldest_published_observed_ns[selected_home],
-          remaining_home_published, dequeued, decision.take, dequeued_at_ns);
-      state.next_home = (selected_home + 1) % home_count;
+          state.oldest_published_observed_ns, remaining_published,
+          dequeued, decision.take, dequeued_at_ns);
       if (state.rpc_batches >= 32 &&
           (state.rpc_batches & (state.rpc_batches - 1)) == 0) {
         const double average_batch = static_cast<double>(state.rpc_items) /
           static_cast<double>(state.rpc_batches);
         std::cerr << "[storage-owner] sender batch telemetry owner="
                   << owner
-                  << " stage1_home=" << selected_home
                   << " batches=" << state.rpc_batches
                   << " items=" << state.rpc_items
                   << " avg_batch=" << average_batch
@@ -174,8 +162,6 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
                   << std::endl;
       }
       for (const u32 id : slot.tasks) {
-        lib_assert(state.tasks[id].stage1_home == selected_home,
-                   "storage-owner Stage1-home batch lost homogeneity");
         state.tasks[id].sender_dequeued_at = dequeued_at;
       }
       post_storage_owner_batch(owner, slot_id);
@@ -250,7 +236,7 @@ void ComputeService::post_storage_owner_batch(
     ? service::storage_owner::mutation_batch_request_bytes(item_count)
     : service::storage_owner::insert_batch_request_bytes(item_count);
   const size_t response_size =
-    service::storage_owner::insert_batch_response_bytes(item_count);
+    sizeof(service::storage_owner::MutationBatchAckV2);
   lib_assert(request_size <= slot.request_buffer.size(),
              "storage_owner RPC request slot is too small for this batch");
   lib_assert(request_size <= std::numeric_limits<u32>::max() &&
@@ -264,7 +250,7 @@ void ComputeService::post_storage_owner_batch(
     : service::storage_owner::kInsertMagic;
   request->dim = config_.dim;
   request->owner_storage = owner_storage;
-  request->source_client = cm_.client_id;
+  request->source_client = storage_operation_source_;
   request->item_count = item_count;
   request->vector_dtype = static_cast<u32>(VamanaNode::vector_dtype());
   request->vector_bytes = static_cast<u32>(VamanaNode::vector_bytes());
@@ -274,6 +260,11 @@ void ComputeService::post_storage_owner_batch(
   node_t* ids = mutation_request
     ? service::storage_owner::mutation_request_ids(slot.request_buffer.data())
     : service::storage_owner::request_ids(slot.request_buffer.data());
+  u64* operation_ids = mutation_request
+    ? service::storage_owner::mutation_request_operation_ids(
+        slot.request_buffer.data(), item_count)
+    : service::storage_owner::request_operation_ids(
+        slot.request_buffer.data(), item_count);
   byte_t* vectors = mutation_request
     ? service::storage_owner::mutation_request_vectors(
         slot.request_buffer.data(), item_count)
@@ -290,6 +281,7 @@ void ComputeService::post_storage_owner_batch(
   for (u32 i = 0; i < item_count; ++i) {
     const auto& task = state.tasks[slot.tasks[i]];
     ids[i] = task.id;
+    operation_ids[i] = task.operation_id;
     stage1_homes[i] = task.stage1_home;
     if (kinds != nullptr) kinds[i] = static_cast<u32>(task.kind);
     byte_t* vector_output =

@@ -562,7 +562,6 @@ void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
 void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
   current_storage_owner_thread_ = peer_stage1_worker_states_[worker_id].get();
   const Configuration& config = *storage_worker_config_;
-  u32 stage1_dequeue_streak = 0;
   for (;;) {
     {
       std::unique_lock<std::mutex> lock(peer_stage1_tasks_mutex_);
@@ -601,7 +600,14 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
         !peer_stage2_home_dedicated_ &&
         memory_node_peer_rpc_detail::dequeue_stage2_home_first(
           !peer_stage1_tasks_.empty(), !peer_stage2_home_tasks_.empty(),
-          stage1_dequeue_streak);
+          peer_stage1_tasks_.empty() ? 0 : static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() -
+              peer_stage1_tasks_.front().received_at).count()),
+          peer_stage2_home_tasks_.empty() ? 0 : static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() -
+              peer_stage2_home_tasks_.front().received_at).count()));
       if (!take_stage2_home) {
         lib_assert(!peer_stage1_tasks_.empty(),
                    "Stage1 scheduler selected an empty publication queue");

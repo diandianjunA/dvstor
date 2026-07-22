@@ -13,3 +13,12 @@ size_t MemoryNode::insert_response_slot_offset(const Configuration& config, u32 
     static_cast<size_t>(client_id) * insert_runtime_.request_slot_count + slot_id;
   return insert_runtime_.response_offset + slot_index * response_slot_bytes(config);
 }
+
+size_t MemoryNode::insert_completion_slot_offset(
+    u32 client_id, u32 slot_id) const {
+  const size_t slot_index =
+    static_cast<size_t>(client_id) * insert_runtime_.completion_slot_count +
+    slot_id;
+  return insert_runtime_.completion_offset + slot_index *
+    sizeof(service::storage_owner::MutationCompletionV2);
+}
