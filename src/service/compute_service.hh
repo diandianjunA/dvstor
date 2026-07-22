@@ -29,6 +29,15 @@ private:
   using Assignment = CoreAssignment<interleaved>;
 
 public:
+  struct StorageOwnerSenderTelemetry {
+    u64 submitted_batches{};
+    u64 submitted_items{};
+    u64 completed_batches{};
+    u64 completed_items{};
+    u64 completed_rpc_wall_ns{};
+    u64 max_rpc_wall_ns{};
+  };
+
   struct InsertItem {
     node_t id;
     vec<element_t> values;
@@ -80,6 +89,22 @@ public:
   u64 late_storage_owner_rpc_completions() const {
     return storage_insert_late_rpc_completions_.load(
       std::memory_order_relaxed);
+  }
+  StorageOwnerSenderTelemetry storage_owner_sender_telemetry() const {
+    return {
+      .submitted_batches = storage_owner_submitted_batches_.load(
+        std::memory_order_relaxed),
+      .submitted_items = storage_owner_submitted_items_.load(
+        std::memory_order_relaxed),
+      .completed_batches = storage_owner_completed_batches_.load(
+        std::memory_order_relaxed),
+      .completed_items = storage_owner_completed_items_.load(
+        std::memory_order_relaxed),
+      .completed_rpc_wall_ns = storage_owner_completed_rpc_wall_ns_.load(
+        std::memory_order_relaxed),
+      .max_rpc_wall_ns = storage_owner_max_rpc_wall_ns_.load(
+        std::memory_order_relaxed),
+    };
   }
 
   const Configuration& config() const { return config_; }
@@ -141,7 +166,13 @@ private:
     // dequeue-visible prefix. The single progress consumer subtracts only the
     // prefix it actually popped.
     std::atomic<u32> published_tasks{0};
-    std::unique_ptr<bounded::Queue<u32>> queue;
+    // Stage1 acknowledgement is scoped to a physical home.  Keeping one FIFO
+    // per home prevents an authority-owner RPC from coupling unrelated homes
+    // behind the slowest Stage1 publication in a mixed batch.
+    vec<std::unique_ptr<bounded::Queue<u32>>> home_queues;
+    std::unique_ptr<std::atomic<u32>[]> home_published_tasks;
+    vec<u64> home_oldest_published_observed_ns;
+    u32 next_home{};
     std::unique_ptr<bounded::Queue<u32>> free_tasks;
     std::unique_ptr<StorageInsertTask[]> tasks;
     vec<StorageOwnerRpcSlot> slots;
@@ -150,7 +181,6 @@ private:
     // Set and cleared only by the CQ/progress thread. published_tasks is an
     // exact total but may include cells behind an invisible MPMC head, so this
     // is an observation time rather than proof that the FIFO head is visible.
-    u64 oldest_published_observed_ns{};
     // Written only by the progress thread. Power-of-two snapshots are logged
     // so a benchmark can verify that batching is real rather than inferred
     // from submitted operation counts.
@@ -238,6 +268,12 @@ private:
   std::atomic<bool> storage_insert_progress_done_{false};
   std::atomic<u32> storage_insert_inflight_{0};
   std::atomic<u64> storage_insert_late_rpc_completions_{0};
+  std::atomic<u64> storage_owner_submitted_batches_{0};
+  std::atomic<u64> storage_owner_submitted_items_{0};
+  std::atomic<u64> storage_owner_completed_batches_{0};
+  std::atomic<u64> storage_owner_completed_items_{0};
+  std::atomic<u64> storage_owner_completed_rpc_wall_ns_{0};
+  std::atomic<u64> storage_owner_max_rpc_wall_ns_{0};
   u64 storage_insert_current_cq_gap_ns_{};
   std::unique_ptr<bounded::Queue<StorageOwnerReadySlot>> storage_ready_slots_;
   std::unique_ptr<bounded::Queue<StorageOwnerReleasedSlot>> storage_released_slots_;

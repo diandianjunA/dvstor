@@ -320,12 +320,28 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
                                           u64* total_dynamic_cycles,
                                           u32* total_dynamic_candidates,
                                           u32* total_dynamic_reads,
-                                          u32* total_incarnation_rejects) {
+                                          u32* total_incarnation_rejects,
+                                          u32* total_cache_hits,
+                                          u32* total_batch_deduplicated,
+                                          u32* total_cache_publish_successes,
+                                          u32* total_cache_publish_races,
+                                          u32* total_lookup_probe_exhaustions,
+                                          u32* total_publish_probe_exhaustions,
+                                          u32* total_lookup_probes,
+                                          u32* max_lookup_probes) {
   __shared__ i32 shard_status[kPersistentMaxShards];
   __shared__ u32 failed;
   __shared__ u32 call_dynamic_candidates;
   __shared__ u32 call_dynamic_reads;
   __shared__ u32 call_incarnation_rejects;
+  __shared__ u32 call_cache_hits;
+  __shared__ u32 call_batch_deduplicated;
+  __shared__ u32 call_cache_publish_successes;
+  __shared__ u32 call_cache_publish_races;
+  __shared__ u32 call_lookup_probe_exhaustions;
+  __shared__ u32 call_publish_probe_exhaustions;
+  __shared__ u32 call_lookup_probes;
+  __shared__ u32 call_max_lookup_probes;
   __shared__ u64 call_rdma_started_cycles;
   __shared__ u64 call_rdma_cycles;
   const size_t request_base =
@@ -339,6 +355,14 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     call_dynamic_candidates = 0;
     call_dynamic_reads = 0;
     call_incarnation_rejects = 0;
+    call_cache_hits = 0;
+    call_batch_deduplicated = 0;
+    call_cache_publish_successes = 0;
+    call_cache_publish_races = 0;
+    call_lookup_probe_exhaustions = 0;
+    call_publish_probe_exhaustions = 0;
+    call_lookup_probes = 0;
+    call_max_lookup_probes = 0;
     call_rdma_started_cycles = 0;
     call_rdma_cycles = 0;
   }
@@ -384,8 +408,11 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
       hash ^= hash >> 31;
       const u32 mask = params.dynamic_code_cache_capacity - 1;
       const u32 first_slot = static_cast<u32>(hash) & mask;
+      u32 lookup_probes = 0;
+      bool observed_empty = false;
       for (u32 probe = 0; probe < params.dynamic_code_cache_probe_limit;
            ++probe) {
+        ++lookup_probes;
         const u32 cache_slot = (first_slot + probe) & mask;
         auto* cache_key = reinterpret_cast<unsigned long long*>(
           params.dynamic_code_cache_handles + cache_slot);
@@ -397,11 +424,21 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
           const u8* cached = params.dynamic_code_cache_records +
             static_cast<size_t>(cache_slot) * params.pq_code_bytes;
           distances[index] = approximate_entry(params, query_lut, cached);
+          atomicAdd(&call_cache_hits, 1u);
           break;
         }
-        if (cached_handle == kPersistentDynamicCodeCacheEmpty) break;
+        if (cached_handle == kPersistentDynamicCodeCacheEmpty) {
+          observed_empty = true;
+          break;
+        }
       }
+      atomicAdd(&call_lookup_probes, lookup_probes);
+      atomicMax(&call_max_lookup_probes, lookup_probes);
       if (distances[index] != FLT_MAX) continue;
+      if (!observed_empty &&
+          lookup_probes == params.dynamic_code_cache_probe_limit) {
+        atomicAdd(&call_lookup_probe_exhaustions, 1u);
+      }
     }
     // The merge frontier can contain the same tagged handle through multiple
     // graph parents.  Deduplicate only inside this finite scoring call: one
@@ -418,6 +455,7 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     if (duplicate_of != UINT32_MAX) {
       request_shards[index] = UINT32_MAX - 1u;
       request_offsets[index] = duplicate_of;
+      atomicAdd(&call_batch_deduplicated, 1u);
       continue;
     }
     atomicAdd(&call_dynamic_reads, 1u);
@@ -441,6 +479,18 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     if (threadIdx.x == 0) {
       if (total_dynamic_candidates != nullptr) {
         *total_dynamic_candidates += call_dynamic_candidates;
+      }
+      if (total_cache_hits != nullptr) {
+        *total_cache_hits += call_cache_hits;
+      }
+      if (total_lookup_probe_exhaustions != nullptr) {
+        *total_lookup_probe_exhaustions += call_lookup_probe_exhaustions;
+      }
+      if (total_lookup_probes != nullptr) {
+        *total_lookup_probes += call_lookup_probes;
+      }
+      if (max_lookup_probes != nullptr) {
+        *max_lookup_probes = max(*max_lookup_probes, call_max_lookup_probes);
       }
     }
     __syncthreads();
@@ -519,13 +569,18 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
       hash ^= hash >> 31;
       const u32 mask = params.dynamic_code_cache_capacity - 1;
       const u32 first_slot = static_cast<u32>(hash) & mask;
+      bool published = false;
       for (u32 probe = 0; probe < params.dynamic_code_cache_probe_limit;
            ++probe) {
         const u32 cache_slot = (first_slot + probe) & mask;
         auto* cache_key = reinterpret_cast<unsigned long long*>(
           params.dynamic_code_cache_handles + cache_slot);
         const u64 observed = atomicCAS(cache_key, 0, 0);
-        if (observed == handle) break;
+        if (observed == handle) {
+          ++call_cache_publish_races;
+          published = true;
+          break;
+        }
         if (observed != kPersistentDynamicCodeCacheEmpty) continue;
         if (atomicCAS(cache_key, kPersistentDynamicCodeCacheEmpty,
                       kPersistentDynamicCodeCacheBusy) !=
@@ -539,8 +594,11 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
         }
         __threadfence();
         atomicExch(cache_key, handle);
+        ++call_cache_publish_successes;
+        published = true;
         break;
       }
+      if (!published) ++call_publish_probe_exhaustions;
     }
   }
   __syncthreads();
@@ -562,6 +620,30 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     }
     if (total_incarnation_rejects != nullptr) {
       *total_incarnation_rejects += call_incarnation_rejects;
+    }
+    if (total_cache_hits != nullptr) {
+      *total_cache_hits += call_cache_hits;
+    }
+    if (total_batch_deduplicated != nullptr) {
+      *total_batch_deduplicated += call_batch_deduplicated;
+    }
+    if (total_cache_publish_successes != nullptr) {
+      *total_cache_publish_successes += call_cache_publish_successes;
+    }
+    if (total_cache_publish_races != nullptr) {
+      *total_cache_publish_races += call_cache_publish_races;
+    }
+    if (total_lookup_probe_exhaustions != nullptr) {
+      *total_lookup_probe_exhaustions += call_lookup_probe_exhaustions;
+    }
+    if (total_publish_probe_exhaustions != nullptr) {
+      *total_publish_probe_exhaustions += call_publish_probe_exhaustions;
+    }
+    if (total_lookup_probes != nullptr) {
+      *total_lookup_probes += call_lookup_probes;
+    }
+    if (max_lookup_probes != nullptr) {
+      *max_lookup_probes = max(*max_lookup_probes, call_max_lookup_probes);
     }
   }
   __syncthreads();

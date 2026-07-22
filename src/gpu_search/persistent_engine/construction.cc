@@ -190,6 +190,8 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     explicit_gpu_bytes, std::memory_order_relaxed);
   engine.telemetry_.gpu_memory_base_pq_bytes.store(
     budget.code_bytes, std::memory_order_relaxed);
+  engine.telemetry_.dynamic_code_cache_capacity.store(
+    config.gpu_dynamic_code_cache_entries, std::memory_order_relaxed);
   engine.telemetry_.gpu_memory_route_graph_bytes.store(
     route_graph_bytes, std::memory_order_relaxed);
   const u64 base_code_region_bytes = budget.code_bytes;
@@ -341,14 +343,16 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                   "cudaMalloc(dynamic PQ request local IOVAs)");
   const size_t dynamic_cache_elements =
     config.gpu_dynamic_code_cache_entries;
-  device_allocate(d_dynamic_code_cache_handles, dynamic_cache_elements,
-                  "cudaMalloc(dynamic PQ cache handles)");
-  device_allocate(d_dynamic_code_cache_records,
-                  dynamic_cache_elements * code_bytes,
-                  "cudaMalloc(dynamic PQ cache records)");
-  check_cuda(cudaMemset(d_dynamic_code_cache_handles, 0xff,
-                        dynamic_cache_elements * sizeof(u64)),
-             "cudaMemset(dynamic PQ cache handles)");
+  if (dynamic_cache_elements != 0) {
+    device_allocate(d_dynamic_code_cache_handles, dynamic_cache_elements,
+                    "cudaMalloc(dynamic PQ cache handles)");
+    device_allocate(d_dynamic_code_cache_records,
+                    dynamic_cache_elements * code_bytes,
+                    "cudaMalloc(dynamic PQ cache records)");
+    check_cuda(cudaMemset(d_dynamic_code_cache_handles, 0xff,
+                          dynamic_cache_elements * sizeof(u64)),
+               "cudaMemset(dynamic PQ cache handles)");
+  }
 
   device_allocate(d_query_dispatch_enqueue, 1,
                   "cudaMalloc(GPU query dispatch enqueue)");

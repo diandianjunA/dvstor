@@ -72,37 +72,41 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
       std::memory_order_acquire);
     state.max_published_tasks = std::max(
       state.max_published_tasks, initially_ready);
-    if (initially_ready == 0) {
-      state.oldest_published_observed_ns = 0;
-    } else if (state.oldest_published_observed_ns == 0) {
-      state.oldest_published_observed_ns = now_ns();
-    }
     while (!state.free_slots.empty()) {
-      const u32 ready = state.published_tasks.load(
-        std::memory_order_acquire);
-      if (ready == 0) {
-        state.oldest_published_observed_ns = 0;
-        break;
-      }
       const u64 observed_now_ns = now_ns();
-      if (state.oldest_published_observed_ns == 0) {
-        state.oldest_published_observed_ns = observed_now_ns;
-      }
       const u32 free = static_cast<u32>(state.free_slots.size());
       const u32 active = static_cast<u32>(state.slots.size()) - free;
+      const u32 home_count = static_cast<u32>(state.home_queues.size());
+      u32 selected_home = home_count;
+      StorageOwnerBatchDecision decision;
+      for (u32 home_offset = 0; home_offset < home_count; ++home_offset) {
+        const u32 home = (state.next_home + home_offset) % home_count;
+        const u32 ready = state.home_published_tasks[home].load(
+          std::memory_order_acquire);
+        u64& oldest = state.home_oldest_published_observed_ns[home];
+        if (ready == 0) {
+          oldest = 0;
+          continue;
+        }
+        if (oldest == 0) oldest = observed_now_ns;
+        const auto candidate = decide_storage_owner_batch(
+          ready, active, free,
+          state.pending_producers.load(std::memory_order_acquire), batch_max,
+          oldest, observed_now_ns, max_wait_ns);
+        if (candidate.take == 0) continue;
+        selected_home = home;
+        decision = candidate;
+        break;
+      }
+      if (selected_home == home_count) break;
       state.max_active_rpcs = std::max(state.max_active_rpcs, active);
-      const auto decision = decide_storage_owner_batch(
-        ready, active, free,
-        state.pending_producers.load(std::memory_order_acquire), batch_max,
-        state.oldest_published_observed_ns, observed_now_ns, max_wait_ns);
-      if (decision.take == 0) break;
 
       const u32 slot_id = state.free_slots.back();
       state.free_slots.pop_back();
       auto& slot = state.slots[slot_id];
       slot.tasks.clear();
       const u32 dequeued = dequeue_storage_owner_visible_prefix(
-        *state.queue, decision.take, slot.tasks);
+        *state.home_queues[selected_home], decision.take, slot.tasks);
       if (dequeued == 0) {
         // A producer can be preempted after reserving the FIFO head but before
         // publishing it. Later cells may already contribute to
@@ -111,9 +115,15 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
         // pass; blocking here would also stop CQ progress.
         ++state.queue_visibility_stalls;
         state.free_slots.push_back(slot_id);
+        state.next_home = (selected_home + 1) % home_count;
         break;
       }
       state.partial_visible_batches += dequeued < decision.take;
+      const u32 previous_home =
+        state.home_published_tasks[selected_home].fetch_sub(
+          dequeued, std::memory_order_acq_rel);
+      lib_assert(previous_home >= dequeued,
+                 "storage-owner home-published task counter underflow");
       const u32 previous = state.published_tasks.fetch_sub(
         dequeued, std::memory_order_acq_rel);
       lib_assert(previous >= dequeued,
@@ -129,18 +139,21 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
       state.max_wait_flush_batches += decision.max_wait_flush;
       state.occupancy_flush_batches += decision.occupancy_flush;
       state.adaptive_wait_flush_batches += decision.adaptive_wait_flush;
-      const u32 remaining_published = state.published_tasks.load(
-        std::memory_order_acquire);
-      state.oldest_published_observed_ns =
+      const u32 remaining_home_published =
+        state.home_published_tasks[selected_home].load(
+          std::memory_order_acquire);
+      state.home_oldest_published_observed_ns[selected_home] =
         next_storage_owner_batch_observed_ns(
-          state.oldest_published_observed_ns, remaining_published,
-          dequeued, decision.take, dequeued_at_ns);
+          state.home_oldest_published_observed_ns[selected_home],
+          remaining_home_published, dequeued, decision.take, dequeued_at_ns);
+      state.next_home = (selected_home + 1) % home_count;
       if (state.rpc_batches >= 32 &&
           (state.rpc_batches & (state.rpc_batches - 1)) == 0) {
         const double average_batch = static_cast<double>(state.rpc_items) /
           static_cast<double>(state.rpc_batches);
         std::cerr << "[storage-owner] sender batch telemetry owner="
                   << owner
+                  << " stage1_home=" << selected_home
                   << " batches=" << state.rpc_batches
                   << " items=" << state.rpc_items
                   << " avg_batch=" << average_batch
@@ -161,6 +174,8 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
                   << std::endl;
       }
       for (const u32 id : slot.tasks) {
+        lib_assert(state.tasks[id].stage1_home == selected_home,
+                   "storage-owner Stage1-home batch lost homogeneity");
         state.tasks[id].sender_dequeued_at = dequeued_at;
       }
       post_storage_owner_batch(owner, slot_id);
@@ -315,4 +330,7 @@ void ComputeService::post_storage_owner_batch(
     nullptr,
     0,
     0);
+  storage_owner_submitted_batches_.fetch_add(1, std::memory_order_relaxed);
+  storage_owner_submitted_items_.fetch_add(
+    item_count, std::memory_order_relaxed);
 }

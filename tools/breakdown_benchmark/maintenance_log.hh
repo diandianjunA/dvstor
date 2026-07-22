@@ -40,6 +40,13 @@ struct MaintenanceObservation {
   uint64_t stage2_cross_edges_final_home{};
   uint64_t stage1_search_budget_exhausted{};
   uint64_t stage2_search_budget_exhausted{};
+  uint64_t pressure_yields{};
+  uint64_t stage2_batches{};
+  uint64_t stage2_batched_items{};
+  uint64_t stage2_graph_read_waves{};
+  uint64_t stage2_graph_unique_reads{};
+  uint64_t stage2_vector_read_waves{};
+  uint64_t stage2_vector_unique_reads{};
   double p99_stage2_delay_upper_ms{};
   bool p99_stage2_delay_over_30s{};
   std::array<uint64_t, kMaintenanceLatencyBucketCount>
@@ -88,6 +95,13 @@ struct MaintenanceLogSummary {
   uint64_t stage2_cross_edges_final_home{};
   uint64_t stage1_search_budget_exhausted{};
   uint64_t stage2_search_budget_exhausted{};
+  uint64_t pressure_yields{};
+  uint64_t stage2_batches{};
+  uint64_t stage2_batched_items{};
+  uint64_t stage2_graph_read_waves{};
+  uint64_t stage2_graph_unique_reads{};
+  uint64_t stage2_vector_read_waves{};
+  uint64_t stage2_vector_unique_reads{};
   double p99_stage2_delay_upper_ms{};
   bool p99_stage2_delay_over_30s{};
   uint64_t p99_stage2_delay_samples{};
@@ -98,11 +112,13 @@ struct MaintenanceLogSummary {
   size_t logs_with_completion_window{};
   size_t logs_with_locality_deltas{};
   size_t logs_with_search_budget_deltas{};
+  size_t logs_with_execution_counter_deltas{};
   bool failure_delta_available{};
   bool peer_reverse_retry_delta_available{};
   bool completion_window_available{};
   bool locality_delta_available{};
   bool search_budget_delta_available{};
+  bool execution_counter_delta_available{};
   double backlog_slope_per_sec{};
   bool backlog_slope_available{};
   std::vector<std::string> unreadable_logs;

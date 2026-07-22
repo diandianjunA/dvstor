@@ -7,6 +7,23 @@
 
 namespace gpu_search::persistent_kernel_detail {
 
+__device__ void set_dynamic_code_cache_completion(
+    CompletionDescriptor& completion, u32 cache_hits,
+    u32 batch_deduplicated, u32 publish_successes, u32 publish_races,
+    u32 lookup_probe_exhaustions, u32 publish_probe_exhaustions,
+    u32 lookup_probes, u32 max_lookup_probes) {
+  completion.dynamic_code_cache_hits = cache_hits;
+  completion.dynamic_code_batch_deduplicated = batch_deduplicated;
+  completion.dynamic_code_cache_publish_successes = publish_successes;
+  completion.dynamic_code_cache_publish_races = publish_races;
+  completion.dynamic_code_cache_lookup_probe_exhaustions =
+    lookup_probe_exhaustions;
+  completion.dynamic_code_cache_publish_probe_exhaustions =
+    publish_probe_exhaustions;
+  completion.dynamic_code_cache_lookup_probes = lookup_probes;
+  completion.dynamic_code_cache_max_lookup_probes = max_lookup_probes;
+}
+
 __device__ u64 decode_tagged_raw(const u8* source) {
   return *reinterpret_cast<const u64*>(source);
 }
@@ -167,6 +184,14 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ u32 dynamic_code_candidates;
   __shared__ u32 dynamic_code_reads;
   __shared__ u32 dynamic_code_incarnation_rejects;
+  __shared__ u32 dynamic_code_cache_hits;
+  __shared__ u32 dynamic_code_batch_deduplicated;
+  __shared__ u32 dynamic_code_cache_publish_successes;
+  __shared__ u32 dynamic_code_cache_publish_races;
+  __shared__ u32 dynamic_code_cache_lookup_probe_exhaustions;
+  __shared__ u32 dynamic_code_cache_publish_probe_exhaustions;
+  __shared__ u32 dynamic_code_cache_lookup_probes;
+  __shared__ u32 dynamic_code_cache_max_lookup_probes;
   __shared__ u64 phase_started_cycles;
   if (threadIdx.x == 0) {
     prepare_started_cycles = clock64();
@@ -178,6 +203,14 @@ __device__ void process_query(const PersistentKernelParams& params,
     dynamic_code_candidates = 0;
     dynamic_code_reads = 0;
     dynamic_code_incarnation_rejects = 0;
+    dynamic_code_cache_hits = 0;
+    dynamic_code_batch_deduplicated = 0;
+    dynamic_code_cache_publish_successes = 0;
+    dynamic_code_cache_publish_races = 0;
+    dynamic_code_cache_lookup_probe_exhaustions = 0;
+    dynamic_code_cache_publish_probe_exhaustions = 0;
+    dynamic_code_cache_lookup_probes = 0;
+    dynamic_code_cache_max_lookup_probes = 0;
   }
   __syncthreads();
   f32* query = params.decoded_queries + static_cast<size_t>(query_slot) * params.dim;
@@ -446,7 +479,14 @@ __device__ void process_query(const PersistentKernelParams& params,
           params, descriptor, query_lut, navigation_handles,
           route_entry_count, navigation_distances, &dynamic_code_cycles,
           &dynamic_code_candidates, &dynamic_code_reads,
-          &dynamic_code_incarnation_rejects)) {
+          &dynamic_code_incarnation_rejects, &dynamic_code_cache_hits,
+          &dynamic_code_batch_deduplicated,
+          &dynamic_code_cache_publish_successes,
+          &dynamic_code_cache_publish_races,
+          &dynamic_code_cache_lookup_probe_exhaustions,
+          &dynamic_code_cache_publish_probe_exhaustions,
+          &dynamic_code_cache_lookup_probes,
+          &dynamic_code_cache_max_lookup_probes)) {
       if (threadIdx.x == 0) {
         route_seed_failed = 1;
         route_failure_reason = static_cast<u32>(
@@ -525,6 +565,14 @@ __device__ void process_query(const PersistentKernelParams& params,
         completion.dynamic_code_reads = dynamic_code_reads;
         completion.dynamic_code_incarnation_rejects =
           dynamic_code_incarnation_rejects;
+        set_dynamic_code_cache_completion(
+          completion, dynamic_code_cache_hits,
+          dynamic_code_batch_deduplicated,
+          dynamic_code_cache_publish_successes, dynamic_code_cache_publish_races,
+          dynamic_code_cache_lookup_probe_exhaustions,
+          dynamic_code_cache_publish_probe_exhaustions,
+          dynamic_code_cache_lookup_probes,
+          dynamic_code_cache_max_lookup_probes);
         device_ring_push(params.completions, completion);
       }
       __syncthreads();
@@ -614,6 +662,14 @@ __device__ void process_query(const PersistentKernelParams& params,
         completion.dynamic_code_reads = dynamic_code_reads;
         completion.dynamic_code_incarnation_rejects =
           dynamic_code_incarnation_rejects;
+        set_dynamic_code_cache_completion(
+          completion, dynamic_code_cache_hits,
+          dynamic_code_batch_deduplicated,
+          dynamic_code_cache_publish_successes, dynamic_code_cache_publish_races,
+          dynamic_code_cache_lookup_probe_exhaustions,
+          dynamic_code_cache_publish_probe_exhaustions,
+          dynamic_code_cache_lookup_probes,
+          dynamic_code_cache_max_lookup_probes);
         device_ring_push(params.completions, completion);
       }
       __syncthreads();
@@ -689,7 +745,14 @@ __device__ void process_query(const PersistentKernelParams& params,
             params, descriptor, query_lut, navigation_handles,
             candidate_count, navigation_distances, &dynamic_code_cycles,
             &dynamic_code_candidates, &dynamic_code_reads,
-            &dynamic_code_incarnation_rejects)) {
+            &dynamic_code_incarnation_rejects, &dynamic_code_cache_hits,
+            &dynamic_code_batch_deduplicated,
+            &dynamic_code_cache_publish_successes,
+            &dynamic_code_cache_publish_races,
+            &dynamic_code_cache_lookup_probe_exhaustions,
+            &dynamic_code_cache_publish_probe_exhaustions,
+            &dynamic_code_cache_lookup_probes,
+            &dynamic_code_cache_max_lookup_probes)) {
         if (threadIdx.x == 0) graph_failed = 1;
       }
       __syncthreads();
@@ -729,6 +792,14 @@ __device__ void process_query(const PersistentKernelParams& params,
         completion.dynamic_code_reads = dynamic_code_reads;
         completion.dynamic_code_incarnation_rejects =
           dynamic_code_incarnation_rejects;
+        set_dynamic_code_cache_completion(
+          completion, dynamic_code_cache_hits,
+          dynamic_code_batch_deduplicated,
+          dynamic_code_cache_publish_successes, dynamic_code_cache_publish_races,
+          dynamic_code_cache_lookup_probe_exhaustions,
+          dynamic_code_cache_publish_probe_exhaustions,
+          dynamic_code_cache_lookup_probes,
+          dynamic_code_cache_max_lookup_probes);
         device_ring_push(params.completions, completion);
       }
       __syncthreads();
@@ -799,6 +870,14 @@ __device__ void process_query(const PersistentKernelParams& params,
       completion.dynamic_code_reads = dynamic_code_reads;
       completion.dynamic_code_incarnation_rejects =
         dynamic_code_incarnation_rejects;
+      set_dynamic_code_cache_completion(
+        completion, dynamic_code_cache_hits,
+        dynamic_code_batch_deduplicated,
+        dynamic_code_cache_publish_successes, dynamic_code_cache_publish_races,
+        dynamic_code_cache_lookup_probe_exhaustions,
+        dynamic_code_cache_publish_probe_exhaustions,
+        dynamic_code_cache_lookup_probes,
+        dynamic_code_cache_max_lookup_probes);
       device_ring_push(params.completions, completion);
     }
     __syncthreads();
@@ -837,6 +916,14 @@ __device__ void process_query(const PersistentKernelParams& params,
     completion.dynamic_code_reads = dynamic_code_reads;
     completion.dynamic_code_incarnation_rejects =
       dynamic_code_incarnation_rejects;
+    set_dynamic_code_cache_completion(
+      completion, dynamic_code_cache_hits,
+      dynamic_code_batch_deduplicated,
+      dynamic_code_cache_publish_successes, dynamic_code_cache_publish_races,
+      dynamic_code_cache_lookup_probe_exhaustions,
+      dynamic_code_cache_publish_probe_exhaustions,
+      dynamic_code_cache_lookup_probes,
+      dynamic_code_cache_max_lookup_probes);
     device_ring_push(params.completions, completion);
   }
   __syncthreads();

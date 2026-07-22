@@ -60,7 +60,15 @@ void ComputeService::start_storage_insert_runtime() {
   for (u32 owner = 0; owner < owner_count; ++owner) {
     auto state = std::make_unique<StorageOwnerSenderState>();
     state->task_capacity = task_capacity;
-    state->queue = std::make_unique<bounded::Queue<u32>>(task_capacity);
+    state->home_queues.reserve(owner_count);
+    state->home_published_tasks =
+      std::make_unique<std::atomic<u32>[]>(owner_count);
+    state->home_oldest_published_observed_ns.assign(owner_count, 0);
+    for (u32 home = 0; home < owner_count; ++home) {
+      state->home_queues.push_back(
+        std::make_unique<bounded::Queue<u32>>(task_capacity));
+      state->home_published_tasks[home].store(0, std::memory_order_relaxed);
+    }
     state->free_tasks = std::make_unique<bounded::Queue<u32>>(task_capacity);
     state->tasks = std::make_unique<StorageInsertTask[]>(task_capacity);
     for (u32 task_id = 0; task_id < task_capacity; ++task_id) {
@@ -117,13 +125,18 @@ void ComputeService::start_storage_insert_runtime() {
   }
   print_status(
     "storage-owner acknowledgement=query-visible stage1 graph publication; "
-    "submission=bounded owner rings; progress=single work-conserving executor");
+    "submission=bounded authority/home rings; batching=stage1-home isolated; "
+    "progress=single work-conserving executor");
 }
 
 void ComputeService::stop_storage_insert_runtime() {
   storage_insert_shutdown_.store(true, std::memory_order_release);
   for (auto& state : storage_insert_owners_) {
-    if (state && state->queue) state->queue->notify_all();
+    if (state) {
+      for (auto& queue : state->home_queues) {
+        if (queue) queue->notify_all();
+      }
+    }
     if (state && state->free_tasks) state->free_tasks->notify_all();
   }
   if (storage_ready_slots_) storage_ready_slots_->notify_all();
@@ -139,10 +152,12 @@ void ComputeService::stop_storage_insert_runtime() {
 
   for (u32 owner = 0; owner < storage_insert_owners_.size(); ++owner) {
     auto& state = *storage_insert_owners_[owner];
-    u32 task_id = 0;
-    while (state.queue && state.queue->try_pop(task_id)) {
-      vec<u32> failed{task_id};
-      fail_storage_owner_tasks(owner, failed);
+    for (auto& queue : state.home_queues) {
+      u32 task_id = 0;
+      while (queue && queue->try_pop(task_id)) {
+        vec<u32> failed{task_id};
+        fail_storage_owner_tasks(owner, failed);
+      }
     }
     for (auto& slot : state.slots) {
       if (slot.in_use && !slot.results_completed) {
@@ -172,7 +187,9 @@ void ComputeService::release_storage_insert_runtime() {
     state->slots.clear();
     state->response_slots.clear();
     state->free_slots.clear();
-    state->queue.reset();
+    state->home_queues.clear();
+    state->home_published_tasks.reset();
+    state->home_oldest_published_observed_ns.clear();
     state->free_tasks.reset();
     state->tasks.reset();
   }

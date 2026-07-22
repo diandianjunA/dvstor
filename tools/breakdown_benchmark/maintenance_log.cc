@@ -672,6 +672,38 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
       summary.stage1_search_budget_exhausted += stage1_exhausted;
       summary.stage2_search_budget_exhausted += stage2_exhausted;
     }
+
+    uint64_t pressure_yields = 0;
+    uint64_t stage2_batches = 0;
+    uint64_t stage2_batched_items = 0;
+    uint64_t graph_waves = 0;
+    uint64_t graph_reads = 0;
+    uint64_t vector_waves = 0;
+    uint64_t vector_reads = 0;
+    if (counter_delta(first.pressure_yields, latest.pressure_yields,
+                      &pressure_yields) &&
+        counter_delta(first.stage2_batches, latest.stage2_batches,
+                      &stage2_batches) &&
+        counter_delta(first.stage2_batched_items,
+                      latest.stage2_batched_items,
+                      &stage2_batched_items) &&
+        counter_delta(first.stage2_graph_read_waves,
+                      latest.stage2_graph_read_waves, &graph_waves) &&
+        counter_delta(first.stage2_graph_unique_reads,
+                      latest.stage2_graph_unique_reads, &graph_reads) &&
+        counter_delta(first.stage2_vector_read_waves,
+                      latest.stage2_vector_read_waves, &vector_waves) &&
+        counter_delta(first.stage2_vector_unique_reads,
+                      latest.stage2_vector_unique_reads, &vector_reads)) {
+      ++summary.logs_with_execution_counter_deltas;
+      summary.pressure_yields += pressure_yields;
+      summary.stage2_batches += stage2_batches;
+      summary.stage2_batched_items += stage2_batched_items;
+      summary.stage2_graph_read_waves += graph_waves;
+      summary.stage2_graph_unique_reads += graph_reads;
+      summary.stage2_vector_read_waves += vector_waves;
+      summary.stage2_vector_unique_reads += vector_reads;
+    }
   }
   summary.backlog_slope_available = summary.requested_logs != 0 &&
     summary.logs_with_slope_observations == summary.requested_logs;
@@ -688,6 +720,11 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
   summary.p99_stage2_delay_available = summary.requested_logs != 0 &&
     summary.logs_with_histogram_deltas == summary.requested_logs &&
     summary.p99_stage2_delay_samples != 0;
+  // These counters are part of the in-band snapshot on every readable shard.
+  // A zero delta is valid, so availability depends on complete snapshots.
+  summary.execution_counter_delta_available =
+    summary.requested_logs != 0 &&
+    summary.logs_with_execution_counter_deltas == summary.requested_logs;
   return summary;
 }
 

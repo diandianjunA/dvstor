@@ -17,6 +17,12 @@ void ComputeService::reset_breakdown_state() {
                            std::memory_order_release);
   persistent_search_->reset_telemetry();
   storage_insert_late_rpc_completions_.store(0, std::memory_order_relaxed);
+  storage_owner_submitted_batches_.store(0, std::memory_order_relaxed);
+  storage_owner_submitted_items_.store(0, std::memory_order_relaxed);
+  storage_owner_completed_batches_.store(0, std::memory_order_relaxed);
+  storage_owner_completed_items_.store(0, std::memory_order_relaxed);
+  storage_owner_completed_rpc_wall_ns_.store(0, std::memory_order_relaxed);
+  storage_owner_max_rpc_wall_ns_.store(0, std::memory_order_relaxed);
 }
 
 void ComputeService::clear_thread_statistics() {

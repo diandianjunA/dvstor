@@ -40,11 +40,15 @@ struct PhysicalHomeWorkerSplit {
 // only Stage1 lane would make foreground progress impossible.
 inline PhysicalHomeWorkerSplit split_physical_home_workers(
     std::uint32_t total) {
-  // One reserved home lane breaks the dependency cycle.  The remaining
-  // physical-home lanes are work-conserving and may steal Stage2 after a
-  // bounded Stage1 burst, so permanently carving out total/4 lanes only
-  // reduces publication capacity when Stage2 is not runnable.
-  const std::uint32_t stage2_home = total >= 2 ? 1 : 0;
+  // Stage2 performs multiple graph-expansion and scoring waves for every
+  // Stage1 publication.  Reserving only one lane makes its capacity almost
+  // independent of the physical-home pool size and turns the bounded Stage2
+  // admission window into the write-throughput ceiling.  Reserve one third
+  // of the pool (while retaining at least one Stage1 lane); the remaining
+  // Stage1 lanes are work-conserving and alternate into Stage2 whenever both
+  // queues are runnable.
+  const std::uint32_t stage2_home = total >= 2
+    ? std::max<std::uint32_t>(1, total / 3) : 0;
   return PhysicalHomeWorkerSplit{
     .stage1 = total - stage2_home,
     .stage2_home = stage2_home,

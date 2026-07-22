@@ -1089,12 +1089,30 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   root["gpu_persistent"] = telemetry_to_json(final_gpu_telemetry);
   const u64 late_storage_owner_rpcs =
     service.late_storage_owner_rpc_completions();
+  const auto storage_owner_sender =
+    service.storage_owner_sender_telemetry();
   root["storage_owner_runtime"] = {
     {"late_rpc_completions", late_storage_owner_rpcs},
     {"late_rpc_threshold_ms", service.config().storage_owner_rpc_timeout_ms},
     {"maintenance_drain_seconds", measure_maintenance_drain_seconds},
     {"maintenance_target_sequences", maintenance_target_sequences},
     {"maintenance_durable_sequences", maintenance_durable_sequences},
+    {"submitted_batches", storage_owner_sender.submitted_batches},
+    {"submitted_items", storage_owner_sender.submitted_items},
+    {"completed_batches", storage_owner_sender.completed_batches},
+    {"completed_items", storage_owner_sender.completed_items},
+    {"completed_rpc_wall_ns",
+      storage_owner_sender.completed_rpc_wall_ns},
+    {"max_rpc_wall_ns", storage_owner_sender.max_rpc_wall_ns},
+    {"average_submitted_batch_size",
+      storage_owner_sender.submitted_batches == 0 ? 0.0
+      : static_cast<double>(storage_owner_sender.submitted_items) /
+          static_cast<double>(storage_owner_sender.submitted_batches)},
+    {"average_completed_rpc_wall_us",
+      storage_owner_sender.completed_batches == 0 ? 0.0
+      : static_cast<double>(storage_owner_sender.completed_rpc_wall_ns) /
+          static_cast<double>(storage_owner_sender.completed_batches) /
+          1000.0},
   };
 
 
@@ -1311,6 +1329,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                            values.begin() + begin + count, 0.0) /
       static_cast<double>(count);
   };
+  const auto minimum_rate = [](const std::vector<double>& values) {
+    return values.empty() ? 0.0
+      : *std::min_element(values.begin(), values.end());
+  };
   const double total_head_qps = args.workload == "both"
     ? (edge_mean(both_insert_total_window_rates, false) +
        edge_mean(both_query_total_window_rates, false)) / 2.0
@@ -1335,10 +1357,12 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       : total_tail_qps / total_head_qps},
     {"query_head_ops_per_sec", query_head_qps},
     {"query_tail_ops_per_sec", query_tail_qps},
+    {"query_min_window_ops_per_sec", minimum_rate(query_window_rates)},
     {"query_tail_to_head_ratio", query_head_qps == 0.0 ? 0.0
       : query_tail_qps / query_head_qps},
     {"write_head_ops_per_sec", write_head_qps},
     {"write_tail_ops_per_sec", write_tail_qps},
+    {"write_min_window_ops_per_sec", minimum_rate(write_window_rates)},
     {"write_tail_to_head_ratio", write_head_qps == 0.0 ? 0.0
       : write_tail_qps / write_head_qps},
     {"single_pass_no_reuse", true},
@@ -1431,6 +1455,31 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
      maintenance_summary.stage1_search_budget_exhausted},
     {"stage2_search_budget_exhausted",
      maintenance_summary.stage2_search_budget_exhausted},
+    {"execution_counter_delta_available",
+     maintenance_summary.execution_counter_delta_available},
+    {"pressure_yields", maintenance_summary.pressure_yields},
+    {"stage2_batches", maintenance_summary.stage2_batches},
+    {"stage2_batched_items", maintenance_summary.stage2_batched_items},
+    {"avg_stage2_batch_size",
+     maintenance_summary.stage2_batches == 0 ? 0.0 :
+       static_cast<double>(maintenance_summary.stage2_batched_items) /
+       static_cast<double>(maintenance_summary.stage2_batches)},
+    {"stage2_graph_read_waves",
+     maintenance_summary.stage2_graph_read_waves},
+    {"stage2_graph_unique_reads",
+     maintenance_summary.stage2_graph_unique_reads},
+    {"avg_stage2_graph_reads_per_wave",
+     maintenance_summary.stage2_graph_read_waves == 0 ? 0.0 :
+       static_cast<double>(maintenance_summary.stage2_graph_unique_reads) /
+       static_cast<double>(maintenance_summary.stage2_graph_read_waves)},
+    {"stage2_vector_read_waves",
+     maintenance_summary.stage2_vector_read_waves},
+    {"stage2_vector_unique_reads",
+     maintenance_summary.stage2_vector_unique_reads},
+    {"avg_stage2_vector_reads_per_wave",
+     maintenance_summary.stage2_vector_read_waves == 0 ? 0.0 :
+       static_cast<double>(maintenance_summary.stage2_vector_unique_reads) /
+       static_cast<double>(maintenance_summary.stage2_vector_read_waves)},
     {"observation_period_seconds_assumed", 5.0},
   };
 

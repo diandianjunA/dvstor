@@ -83,6 +83,14 @@ struct CompletionDescriptor {
   u32 dynamic_code_candidates{};
   u32 dynamic_code_reads{};
   u32 dynamic_code_incarnation_rejects{};
+  u32 dynamic_code_cache_hits{};
+  u32 dynamic_code_batch_deduplicated{};
+  u32 dynamic_code_cache_publish_successes{};
+  u32 dynamic_code_cache_publish_races{};
+  u32 dynamic_code_cache_lookup_probe_exhaustions{};
+  u32 dynamic_code_cache_publish_probe_exhaustions{};
+  u32 dynamic_code_cache_lookup_probes{};
+  u32 dynamic_code_cache_max_lookup_probes{};
   // Low 8 bits encode QueryFailureReason; the high 24 bits count complete
   // centroid-route snapshot retries caused by a concurrent publication.
   u32 diagnostic{};
@@ -141,6 +149,16 @@ struct TelemetrySnapshot {
   u64 dynamic_code_read_bytes{};
   u64 dynamic_code_incarnation_rejects{};
   u64 dynamic_code_wait_ns{};
+  u64 dynamic_code_cache_hits{};
+  u64 dynamic_code_batch_deduplicated{};
+  u64 dynamic_code_cache_publish_successes{};
+  u64 dynamic_code_cache_publish_races{};
+  u64 dynamic_code_cache_lookup_probe_exhaustions{};
+  u64 dynamic_code_cache_publish_probe_exhaustions{};
+  u64 dynamic_code_cache_lookup_probes{};
+  u64 dynamic_code_cache_max_lookup_probes{};
+  u64 dynamic_code_cache_occupied{};
+  u64 dynamic_code_cache_capacity{};
 };
 
 class Telemetry {
@@ -188,6 +206,18 @@ public:
   std::atomic<u64> dynamic_code_read_bytes{0};
   std::atomic<u64> dynamic_code_incarnation_rejects{0};
   std::atomic<u64> dynamic_code_wait_ns{0};
+  std::atomic<u64> dynamic_code_cache_hits{0};
+  std::atomic<u64> dynamic_code_batch_deduplicated{0};
+  std::atomic<u64> dynamic_code_cache_publish_successes{0};
+  std::atomic<u64> dynamic_code_cache_publish_races{0};
+  std::atomic<u64> dynamic_code_cache_lookup_probe_exhaustions{0};
+  std::atomic<u64> dynamic_code_cache_publish_probe_exhaustions{0};
+  std::atomic<u64> dynamic_code_cache_lookup_probes{0};
+  std::atomic<u64> dynamic_code_cache_max_lookup_probes{0};
+  // Occupancy is lifetime state, not an interval counter. reset() deliberately
+  // preserves it so a post-warmup benchmark reports the cache it actually uses.
+  std::atomic<u64> dynamic_code_cache_occupied{0};
+  std::atomic<u64> dynamic_code_cache_capacity{0};
 };
 
 }  // namespace gpu_search

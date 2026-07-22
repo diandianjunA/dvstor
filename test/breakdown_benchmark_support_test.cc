@@ -93,6 +93,14 @@ void test_recall_and_report_formatting() {
   telemetry.centroid_route_poll_delay_us = 8000;
   telemetry.centroid_route_query_retries = 23;
   telemetry.centroid_route_query_timeouts = 0;
+  telemetry.dynamic_code_candidates = 100;
+  telemetry.dynamic_code_reads = 7;
+  telemetry.dynamic_code_cache_hits = 89;
+  telemetry.dynamic_code_batch_deduplicated = 4;
+  telemetry.dynamic_code_cache_lookup_probes = 125;
+  telemetry.dynamic_code_cache_max_lookup_probes = 3;
+  telemetry.dynamic_code_cache_occupied = 64;
+  telemetry.dynamic_code_cache_capacity = 256;
   const auto telemetry_json = tools::breakdown_benchmark::telemetry_to_json(telemetry);
   assert(telemetry_json.at("graph_read_retries") == 11);
   assert(telemetry_json.at("centroid_route_publications") == 7);
@@ -104,6 +112,18 @@ void test_recall_and_report_formatting() {
   assert(telemetry_json.at("centroid_route_poll_delay_us") == 8000);
   assert(telemetry_json.at("centroid_route_query_retries") == 23);
   assert(telemetry_json.at("centroid_route_query_timeouts") == 0);
+  assert(telemetry_json.at("dynamic_code_cache_hits") == 89);
+  assert(telemetry_json.at("dynamic_code_batch_deduplicated") == 4);
+  assert(std::abs(telemetry_json.at("dynamic_code_cache_hit_ratio").get<double>() -
+                  0.89) < 1e-9);
+  assert(std::abs(telemetry_json.at(
+                    "dynamic_code_authoritative_avoidance_ratio").get<double>() -
+                  0.93) < 1e-9);
+  assert(std::abs(telemetry_json.at("dynamic_code_cache_load_factor").get<double>() -
+                  0.25) < 1e-9);
+  assert(std::abs(telemetry_json.at(
+                    "average_dynamic_code_cache_lookup_probes").get<double>() -
+                  1.25) < 1e-9);
 
   nlohmann::json root;
   root["meta"] = {
@@ -136,6 +156,21 @@ void test_recall_and_report_formatting() {
   assert(formatted.text.find("failures (hard): 0") != std::string::npos);
   assert(formatted.text.find("peer_reverse_retry_attempts: 7") !=
          std::string::npos);
+}
+
+void test_dynamic_cache_telemetry_reset_preserves_lifetime_gauges() {
+  gpu_search::Telemetry telemetry;
+  telemetry.dynamic_code_cache_hits.store(17, std::memory_order_relaxed);
+  telemetry.dynamic_code_cache_publish_successes.store(
+    5, std::memory_order_relaxed);
+  telemetry.dynamic_code_cache_occupied.store(123, std::memory_order_relaxed);
+  telemetry.dynamic_code_cache_capacity.store(256, std::memory_order_relaxed);
+  telemetry.reset();
+  const auto snapshot = telemetry.snapshot();
+  assert(snapshot.dynamic_code_cache_hits == 0);
+  assert(snapshot.dynamic_code_cache_publish_successes == 0);
+  assert(snapshot.dynamic_code_cache_occupied == 123);
+  assert(snapshot.dynamic_code_cache_capacity == 256);
 }
 
 void test_base_only_recall_filter() {
@@ -343,6 +378,13 @@ void test_in_band_maintenance_snapshot_window() {
       .stage2_final_edges = 64,
       .stage2_cross_edges_stage1_home = 20,
       .stage2_cross_edges_final_home = 18,
+      .pressure_yields = 4,
+      .stage2_batches = 2,
+      .stage2_batched_items = 8,
+      .stage2_graph_read_waves = 5,
+      .stage2_graph_unique_reads = 40,
+      .stage2_vector_read_waves = 6,
+      .stage2_vector_unique_reads = 60,
     };
     end[shard] = *begin[shard];
     auto& latest = *end[shard];
@@ -365,6 +407,13 @@ void test_in_band_maintenance_snapshot_window() {
     latest.stage2_final_edges = 224;
     latest.stage2_cross_edges_stage1_home = 70;
     latest.stage2_cross_edges_final_home = 60;
+    latest.pressure_yields = 14;
+    latest.stage2_batches = 7;
+    latest.stage2_batched_items = 28;
+    latest.stage2_graph_read_waves = 15;
+    latest.stage2_graph_unique_reads = 120;
+    latest.stage2_vector_read_waves = 18;
+    latest.stage2_vector_unique_reads = 180;
     latest.stage2_delay_histogram[8] = 20;
   }
   const auto summary = tools::breakdown_benchmark::
@@ -392,6 +441,14 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.search_budget_delta_available);
   assert(summary.stage1_search_budget_exhausted == 4);
   assert(summary.stage2_search_budget_exhausted == 6);
+  assert(summary.execution_counter_delta_available);
+  assert(summary.pressure_yields == 20);
+  assert(summary.stage2_batches == 10);
+  assert(summary.stage2_batched_items == 40);
+  assert(summary.stage2_graph_read_waves == 20);
+  assert(summary.stage2_graph_unique_reads == 160);
+  assert(summary.stage2_vector_read_waves == 24);
+  assert(summary.stage2_vector_unique_reads == 240);
   assert(summary.p99_stage2_delay_available);
   assert(summary.p99_stage2_delay_samples == 40);
   assert(summary.p99_stage2_delay_upper_ms == 256.0);
@@ -406,6 +463,7 @@ int main() {
   test_vector_file_reader();
   test_single_pass_stream();
   test_recall_and_report_formatting();
+  test_dynamic_cache_telemetry_reset_preserves_lifetime_gauges();
   test_base_only_recall_filter();
   test_maintenance_log_window();
   test_in_band_maintenance_snapshot_window();

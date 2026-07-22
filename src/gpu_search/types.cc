@@ -58,6 +58,28 @@ TelemetrySnapshot Telemetry::snapshot() const {
       dynamic_code_incarnation_rejects.load(std::memory_order_relaxed),
     .dynamic_code_wait_ns =
       dynamic_code_wait_ns.load(std::memory_order_relaxed),
+    .dynamic_code_cache_hits =
+      dynamic_code_cache_hits.load(std::memory_order_relaxed),
+    .dynamic_code_batch_deduplicated =
+      dynamic_code_batch_deduplicated.load(std::memory_order_relaxed),
+    .dynamic_code_cache_publish_successes =
+      dynamic_code_cache_publish_successes.load(std::memory_order_relaxed),
+    .dynamic_code_cache_publish_races =
+      dynamic_code_cache_publish_races.load(std::memory_order_relaxed),
+    .dynamic_code_cache_lookup_probe_exhaustions =
+      dynamic_code_cache_lookup_probe_exhaustions.load(
+        std::memory_order_relaxed),
+    .dynamic_code_cache_publish_probe_exhaustions =
+      dynamic_code_cache_publish_probe_exhaustions.load(
+        std::memory_order_relaxed),
+    .dynamic_code_cache_lookup_probes =
+      dynamic_code_cache_lookup_probes.load(std::memory_order_relaxed),
+    .dynamic_code_cache_max_lookup_probes =
+      dynamic_code_cache_max_lookup_probes.load(std::memory_order_relaxed),
+    .dynamic_code_cache_occupied =
+      dynamic_code_cache_occupied.load(std::memory_order_relaxed),
+    .dynamic_code_cache_capacity =
+      dynamic_code_cache_capacity.load(std::memory_order_relaxed),
   };
 }
 
@@ -97,6 +119,16 @@ void Telemetry::reset() {
   dynamic_code_read_bytes.store(0, std::memory_order_relaxed);
   dynamic_code_incarnation_rejects.store(0, std::memory_order_relaxed);
   dynamic_code_wait_ns.store(0, std::memory_order_relaxed);
+  dynamic_code_cache_hits.store(0, std::memory_order_relaxed);
+  dynamic_code_batch_deduplicated.store(0, std::memory_order_relaxed);
+  dynamic_code_cache_publish_successes.store(0, std::memory_order_relaxed);
+  dynamic_code_cache_publish_races.store(0, std::memory_order_relaxed);
+  dynamic_code_cache_lookup_probe_exhaustions.store(
+    0, std::memory_order_relaxed);
+  dynamic_code_cache_publish_probe_exhaustions.store(
+    0, std::memory_order_relaxed);
+  dynamic_code_cache_lookup_probes.store(0, std::memory_order_relaxed);
+  dynamic_code_cache_max_lookup_probes.store(0, std::memory_order_relaxed);
 }
 
 }  // namespace gpu_search

@@ -110,6 +110,39 @@ nlohmann::json telemetry_to_json(
     {"dynamic_code_incarnation_rejects",
       telemetry.dynamic_code_incarnation_rejects},
     {"dynamic_code_wait_ns", telemetry.dynamic_code_wait_ns},
+    {"dynamic_code_cache_hits", telemetry.dynamic_code_cache_hits},
+    {"dynamic_code_batch_deduplicated",
+      telemetry.dynamic_code_batch_deduplicated},
+    {"dynamic_code_cache_publish_successes",
+      telemetry.dynamic_code_cache_publish_successes},
+    {"dynamic_code_cache_publish_races",
+      telemetry.dynamic_code_cache_publish_races},
+    {"dynamic_code_cache_lookup_probe_exhaustions",
+      telemetry.dynamic_code_cache_lookup_probe_exhaustions},
+    {"dynamic_code_cache_publish_probe_exhaustions",
+      telemetry.dynamic_code_cache_publish_probe_exhaustions},
+    {"dynamic_code_cache_lookup_probes",
+      telemetry.dynamic_code_cache_lookup_probes},
+    {"dynamic_code_cache_max_lookup_probes",
+      telemetry.dynamic_code_cache_max_lookup_probes},
+    {"dynamic_code_cache_occupied", telemetry.dynamic_code_cache_occupied},
+    {"dynamic_code_cache_capacity", telemetry.dynamic_code_cache_capacity},
+    {"dynamic_code_cache_hit_ratio", telemetry.dynamic_code_candidates == 0
+      ? 0.0 : static_cast<double>(telemetry.dynamic_code_cache_hits) /
+          static_cast<double>(telemetry.dynamic_code_candidates)},
+    {"dynamic_code_authoritative_avoidance_ratio",
+      telemetry.dynamic_code_candidates == 0 ? 0.0
+      : static_cast<double>(telemetry.dynamic_code_candidates -
+          std::min(telemetry.dynamic_code_candidates,
+                   telemetry.dynamic_code_reads)) /
+          static_cast<double>(telemetry.dynamic_code_candidates)},
+    {"dynamic_code_cache_load_factor", telemetry.dynamic_code_cache_capacity == 0
+      ? 0.0 : static_cast<double>(telemetry.dynamic_code_cache_occupied) /
+          static_cast<double>(telemetry.dynamic_code_cache_capacity)},
+    {"average_dynamic_code_cache_lookup_probes",
+      telemetry.dynamic_code_candidates == 0 ? 0.0
+      : static_cast<double>(telemetry.dynamic_code_cache_lookup_probes) /
+          static_cast<double>(telemetry.dynamic_code_candidates)},
     {"average_dynamic_code_reads", telemetry.queries_completed == 0 ? 0.0
       : static_cast<double>(telemetry.dynamic_code_reads) /
           static_cast<double>(telemetry.queries_completed)},
@@ -180,11 +213,15 @@ FormattedReport format_report(const nlohmann::json& root,
            << stability.value("query_tail_ops_per_sec", 0.0) << '\n';
     output << "  query_tail_to_head_ratio: "
            << stability.value("query_tail_to_head_ratio", 0.0) << '\n';
+    output << "  query_min_5s_qps: "
+           << stability.value("query_min_window_ops_per_sec", 0.0) << '\n';
     output << "  write_head/tail_qps: "
            << stability.value("write_head_ops_per_sec", 0.0) << "/"
            << stability.value("write_tail_ops_per_sec", 0.0) << '\n';
     output << "  write_tail_to_head_ratio: "
            << stability.value("write_tail_to_head_ratio", 0.0) << '\n';
+    output << "  write_min_5s_qps: "
+           << stability.value("write_min_window_ops_per_sec", 0.0) << '\n';
     output << "  zero_completion_windows: "
            << stability.value("zero_completion_windows", 0ULL) << '\n';
     output << "  zero_query/write_windows: "
@@ -252,6 +289,19 @@ FormattedReport format_report(const nlohmann::json& root,
              << "/"
              << stage2.value("stage2_search_budget_exhausted", 0ULL)
              << '\n';
+    } else {
+      output << "unavailable\n";
+    }
+    output << "  execution batching: ";
+    if (stage2.value("execution_counter_delta_available", false)) {
+      output << "contexts=" << stage2.value("stage2_batches", 0ULL)
+             << " avg_items=" << stage2.value("avg_stage2_batch_size", 0.0)
+             << " graph_reads/wave="
+             << stage2.value("avg_stage2_graph_reads_per_wave", 0.0)
+             << " vector_reads/wave="
+             << stage2.value("avg_stage2_vector_reads_per_wave", 0.0)
+             << " pressure_yields="
+             << stage2.value("pressure_yields", 0ULL) << '\n';
     } else {
       output << "unavailable\n";
     }
@@ -333,6 +383,40 @@ FormattedReport format_report(const nlohmann::json& root,
     output << "  dynamic PQ reads/query and wait_us/query: "
            << gpu.value("average_dynamic_code_reads", 0.0) << "/"
            << gpu.value("average_dynamic_code_wait_us", 0.0) << '\n';
+    output << "  dynamic PQ cache hits/batch_dedup/authoritative_avoidance: "
+           << gpu.value("dynamic_code_cache_hits", 0ULL) << "/"
+           << gpu.value("dynamic_code_batch_deduplicated", 0ULL) << "/"
+           << gpu.value("dynamic_code_authoritative_avoidance_ratio", 0.0)
+           << '\n';
+    output << "  dynamic PQ cache occupied/capacity/load_factor: "
+           << gpu.value("dynamic_code_cache_occupied", 0ULL) << "/"
+           << gpu.value("dynamic_code_cache_capacity", 0ULL) << "/"
+           << gpu.value("dynamic_code_cache_load_factor", 0.0) << '\n';
+    output << "  dynamic PQ cache publish success/race, lookup/publish exhaustion: "
+           << gpu.value("dynamic_code_cache_publish_successes", 0ULL) << "/"
+           << gpu.value("dynamic_code_cache_publish_races", 0ULL) << ", "
+           << gpu.value("dynamic_code_cache_lookup_probe_exhaustions", 0ULL)
+           << "/"
+           << gpu.value("dynamic_code_cache_publish_probe_exhaustions", 0ULL)
+           << '\n';
+    output << "  dynamic PQ cache avg/max lookup probes: "
+           << gpu.value("average_dynamic_code_cache_lookup_probes", 0.0)
+           << "/"
+           << gpu.value("dynamic_code_cache_max_lookup_probes", 0ULL) << '\n';
+  }
+  if (root.contains("storage_owner_runtime")) {
+    const auto& runtime = root["storage_owner_runtime"];
+    output << "storage_owner_runtime\n";
+    output << "  submitted/completed batches: "
+           << runtime.value("submitted_batches", 0ULL) << "/"
+           << runtime.value("completed_batches", 0ULL) << '\n';
+    output << "  submitted/completed items: "
+           << runtime.value("submitted_items", 0ULL) << "/"
+           << runtime.value("completed_items", 0ULL) << '\n';
+    output << "  average batch / average RPC wall us / max RPC wall us: "
+           << runtime.value("average_submitted_batch_size", 0.0) << "/"
+           << runtime.value("average_completed_rpc_wall_us", 0.0) << "/"
+           << runtime.value("max_rpc_wall_ns", 0ULL) / 1000.0 << '\n';
   }
   if (report.has_insert()) {
     const auto summary = service::breakdown::aggregate_text_summary(report.insert);

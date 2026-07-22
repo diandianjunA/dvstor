@@ -7,7 +7,8 @@
 namespace {
 
 configuration::IndexConfiguration make_config(
-    bool explicit_disable, bool explicit_namespace = false) {
+    bool explicit_disable, bool explicit_namespace = false,
+    bool bypass_dynamic_cache = false) {
   std::vector<std::string> arguments{
     "configuration_update_protocol_test",
     "--servers", "127.0.0.1:1234",
@@ -24,6 +25,10 @@ configuration::IndexConfiguration make_config(
   if (explicit_namespace) {
     arguments.emplace_back("--vector-id-namespace-size");
     arguments.emplace_back("2000000");
+  }
+  if (bypass_dynamic_cache) {
+    arguments.emplace_back("--gpu-dynamic-code-cache-entries");
+    arguments.emplace_back("0");
   }
   std::vector<char*> argv;
   argv.reserve(arguments.size());
@@ -48,6 +53,9 @@ int main() {
 
   const auto query_only_config = make_config(true);
   assert(!query_only_config.enable_updates);
+
+  const auto cache_bypass_config = make_config(false, false, true);
+  assert(cache_bypass_config.gpu_dynamic_code_cache_entries == 0);
 
   // Stage2 is mandatory for the sole supported update pipeline.
   assert(default_config.storage_owner_maintenance_workers > 0);

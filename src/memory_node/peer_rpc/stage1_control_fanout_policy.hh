@@ -15,7 +15,13 @@ namespace memory_node_peer_rpc_detail {
 // Bound the Stage1 dequeue burst while keeping both queues work-conserving.
 // This is scheduler fairness only; it neither drops work nor changes either
 // stage's acknowledgement boundary.
-constexpr u32 kStage1MaximumDequeueBurst = 4;
+// A Stage2-home request performs the expansion/scoring work that dominates
+// insert service time.  Letting every shared worker dequeue four new Stage1
+// publications before one Stage2 request amplifies acknowledged maintenance
+// debt under a sustained insert stream.  Alternate when both queues are
+// runnable.  Stage1 still has a strict progress guarantee and consumes the
+// whole pool whenever Stage2 is empty.
+constexpr u32 kStage1MaximumDequeueBurst = 1;
 
 // Stage1 workers may share a condition variable with an isolated Stage2-home
 // pool. A notification is not proof that this worker owns runnable work: when

@@ -80,6 +80,18 @@ void ComputeService::handle_storage_owner_response(
   state.completed_rpc_items += matched->item_count;
   state.completed_rpc_wall_ns += rpc_wall_ns;
   state.max_rpc_wall_ns = std::max(state.max_rpc_wall_ns, rpc_wall_ns);
+  storage_owner_completed_batches_.fetch_add(1, std::memory_order_relaxed);
+  storage_owner_completed_items_.fetch_add(
+    matched->item_count, std::memory_order_relaxed);
+  storage_owner_completed_rpc_wall_ns_.fetch_add(
+    rpc_wall_ns, std::memory_order_relaxed);
+  u64 observed_max = storage_owner_max_rpc_wall_ns_.load(
+    std::memory_order_relaxed);
+  while (observed_max < rpc_wall_ns &&
+         !storage_owner_max_rpc_wall_ns_.compare_exchange_weak(
+           observed_max, rpc_wall_ns, std::memory_order_relaxed,
+           std::memory_order_relaxed)) {
+  }
   if (state.completed_rpc_batches >= 32 &&
       (state.completed_rpc_batches & (state.completed_rpc_batches - 1)) == 0) {
     const double average_items = static_cast<double>(

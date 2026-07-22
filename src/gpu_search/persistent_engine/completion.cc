@@ -255,7 +255,11 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << " dynamic_pq_us="
                 << completion.dynamic_code_cycles * 1000ULL / gpu_clock_khz
                 << " dynamic_pq_incarnation_rejects="
-                << completion.dynamic_code_incarnation_rejects << '\n';
+                << completion.dynamic_code_incarnation_rejects
+                << " dynamic_pq_cache_hits="
+                << completion.dynamic_code_cache_hits
+                << " dynamic_pq_batch_deduplicated="
+                << completion.dynamic_code_batch_deduplicated << '\n';
     }
     if (completion.status != 0) {
       report_direct_path_failure();
@@ -325,6 +329,38 @@ void PersistentSearchEngine::Impl::completion_loop() {
     engine.telemetry_.dynamic_code_wait_ns.fetch_add(
       phase_ns(completion.dynamic_code_cycles),
       std::memory_order_relaxed);
+    engine.telemetry_.dynamic_code_cache_hits.fetch_add(
+      completion.dynamic_code_cache_hits, std::memory_order_relaxed);
+    engine.telemetry_.dynamic_code_batch_deduplicated.fetch_add(
+      completion.dynamic_code_batch_deduplicated,
+      std::memory_order_relaxed);
+    engine.telemetry_.dynamic_code_cache_publish_successes.fetch_add(
+      completion.dynamic_code_cache_publish_successes,
+      std::memory_order_relaxed);
+    engine.telemetry_.dynamic_code_cache_publish_races.fetch_add(
+      completion.dynamic_code_cache_publish_races,
+      std::memory_order_relaxed);
+    engine.telemetry_.dynamic_code_cache_lookup_probe_exhaustions.fetch_add(
+      completion.dynamic_code_cache_lookup_probe_exhaustions,
+      std::memory_order_relaxed);
+    engine.telemetry_.dynamic_code_cache_publish_probe_exhaustions.fetch_add(
+      completion.dynamic_code_cache_publish_probe_exhaustions,
+      std::memory_order_relaxed);
+    engine.telemetry_.dynamic_code_cache_lookup_probes.fetch_add(
+      completion.dynamic_code_cache_lookup_probes,
+      std::memory_order_relaxed);
+    engine.telemetry_.dynamic_code_cache_occupied.fetch_add(
+      completion.dynamic_code_cache_publish_successes,
+      std::memory_order_relaxed);
+    u64 observed_max =
+      engine.telemetry_.dynamic_code_cache_max_lookup_probes.load(
+        std::memory_order_relaxed);
+    while (observed_max < completion.dynamic_code_cache_max_lookup_probes &&
+           !engine.telemetry_.dynamic_code_cache_max_lookup_probes
+              .compare_exchange_weak(
+                observed_max, completion.dynamic_code_cache_max_lookup_probes,
+                std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
     engine.telemetry_.graph_page_requests.fetch_add(completion.remote_pages,
                                                     std::memory_order_relaxed);
     engine.telemetry_.graph_read_retries.fetch_add(
