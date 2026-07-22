@@ -16,21 +16,17 @@ void ComputeService::handle_storage_owner_send_completion(
 }
 
 void ComputeService::handle_storage_owner_response(
-    u32 owner_storage, u32 response_slot_id, u32 received_bytes) {
+    u32 owner_storage,
+    const service::storage_owner::MutationBatchAckV2& response,
+    u32 received_bytes) {
   if (owner_storage >= storage_insert_owners_.size()) return;
   auto& state = *storage_insert_owners_[owner_storage];
-  if (response_slot_id >= state.response_slots.size()) return;
-
-  auto& response_slot = state.response_slots[response_slot_id];
-  const auto* response = reinterpret_cast<const
-    service::storage_owner::MutationBatchAckV2*>(
-      response_slot.buffer.data());
   StorageOwnerRpcSlot* matched = nullptr;
   if (received_bytes >=
       sizeof(service::storage_owner::MutationBatchAckV2)) {
     for (auto& slot : state.slots) {
       if (slot.in_use && !slot.response_done &&
-          slot.batch_id == response->batch_id) {
+          slot.batch_id == response.batch_id) {
         matched = &slot;
         break;
       }
@@ -43,29 +39,27 @@ void ComputeService::handle_storage_owner_response(
     if (log_index < 16) {
       std::cerr << "[storage-owner] unmatched insert response"
                 << " owner=" << owner_storage
-                << " response_slot=" << response_slot_id
-                << " magic=0x" << std::hex << response->magic << std::dec
-                << " response_owner=" << response->owner_storage
-                << " batch_id=" << response->batch_id
-                << " item_count=" << response->item_count
+                << " magic=0x" << std::hex << response.magic << std::dec
+                << " response_owner=" << response.owner_storage
+                << " batch_id=" << response.batch_id
+                << " item_count=" << response.item_count
                 << " received_bytes=" << received_bytes << std::endl;
     }
-    post_storage_owner_response_receive(owner_storage, response_slot_id);
     return;
   }
 
   matched->response_done = true;
   matched->response_valid =
     received_bytes == sizeof(service::storage_owner::MutationBatchAckV2) &&
-    response->magic == reinterpret_cast<const
+    response.magic == reinterpret_cast<const
       service::storage_owner::InsertBatchRequestHeader*>(
         matched->request_buffer.data())->magic &&
-    response->owner_storage == owner_storage &&
-    response->item_count == matched->item_count &&
-    response->protocol_version ==
+    response.owner_storage == owner_storage &&
+    response.item_count == matched->item_count &&
+    response.protocol_version ==
       service::storage_owner::kMutationProtocolVersion &&
-    response->reserved == 0;
-  matched->response_slot_id = response_slot_id;
+    response.reserved == 0;
+  matched->response_ack = response;
   matched->response_completed_at = std::chrono::steady_clock::now();
   matched->cq_progress_gap_ns = storage_insert_current_cq_gap_ns_;
   const u64 rpc_wall_ns = duration_ns_clamped(
@@ -105,8 +99,6 @@ void ComputeService::handle_storage_owner_response(
               << std::endl;
   }
   queue_storage_owner_completion(*matched);
-  // The receive is reposted only after the response executor has finished
-  // parsing this buffer. This removes the large CQ-thread memcpy.
 }
 
 void ComputeService::post_storage_owner_response_receive(
@@ -139,19 +131,11 @@ void ComputeService::post_storage_owner_completion_receive(
 }
 
 void ComputeService::handle_storage_owner_token_completion(
-    u32 owner_storage, u32 completion_slot_id, u32 received_bytes) {
+    u32 owner_storage,
+    const service::storage_owner::MutationCompletionV2& completion,
+    u32 received_bytes) {
   if (owner_storage >= storage_insert_owners_.size()) return;
   auto& state = *storage_insert_owners_[owner_storage];
-  if (completion_slot_id >= state.completion_slot_count) return;
-  const size_t offset = static_cast<size_t>(completion_slot_id) *
-    sizeof(service::storage_owner::MutationCompletionV2);
-  const auto* completion_ptr = reinterpret_cast<const
-    service::storage_owner::MutationCompletionV2*>(
-      state.completion_buffer.data() + offset);
-  // Copy before reposting this receive slot. The NIC may overwrite the
-  // registered buffer as soon as post_receive() returns.
-  const service::storage_owner::MutationCompletionV2 completion =
-    *completion_ptr;
   const bool envelope_ok =
     received_bytes == sizeof(completion) &&
     completion.magic == service::storage_owner::kMutationCompletionMagic &&
@@ -161,9 +145,6 @@ void ComputeService::handle_storage_owner_token_completion(
     completion.source_client == storage_operation_source_ &&
     completion.operation_id != 0 && completion.reserved == 0;
 
-  // Replenish transport credit before waking a closed-loop writer. This
-  // guarantees that accepted-token count can never outrun posted receives.
-  post_storage_owner_completion_receive(owner_storage, completion_slot_id);
   if (!envelope_ok) {
     throw std::runtime_error("malformed storage-owner token completion");
   }
@@ -242,15 +223,12 @@ void ComputeService::commit_storage_owner_slot(
              "storage-owner completion references an invalid slot");
   auto& slot = state.slots[slot_id];
   lib_assert(slot.in_use && slot.send_done && slot.response_done &&
-               slot.completion_claimed && !slot.results_completed &&
-               slot.response_slot_id < state.response_slots.size(),
+               slot.completion_claimed && !slot.results_completed,
              "storage-owner completion claimed a slot in an invalid state");
   slot.results_completed = true;
-  const auto* ack = reinterpret_cast<const
-    service::storage_owner::MutationBatchAckV2*>(
-      state.response_slots[slot.response_slot_id].buffer.data());
   const auto ack_status = static_cast<
-    service::storage_owner::MutationBatchAckStatus>(ack->status);
+    service::storage_owner::MutationBatchAckStatus>(
+      slot.response_ack.status);
   if (slot.response_valid &&
       ack_status == service::storage_owner::MutationBatchAckStatus::accepted) {
     // Logical tasks remain owned by their stable operation ids. Their
@@ -432,12 +410,10 @@ void ComputeService::release_storage_owner_slot(
   lib_assert(slot_id < state.slots.size(),
              "storage-owner release references an invalid slot");
   auto& slot = state.slots[slot_id];
-  lib_assert(slot.in_use && slot.results_completed &&
-               slot.response_slot_id < state.response_slots.size(),
+  lib_assert(slot.in_use && slot.results_completed,
              "storage-owner released a slot before completion");
   const bool queued = storage_released_slots_->try_push(
-    StorageOwnerReleasedSlot{
-      owner_storage, slot_id, slot.response_slot_id});
+    StorageOwnerReleasedSlot{owner_storage, slot_id});
   lib_assert(queued,
              "storage-owner release queue exhausted despite RPC-slot bound");
 }

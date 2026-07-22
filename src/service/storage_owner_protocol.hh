@@ -191,6 +191,14 @@ struct MutationCompletionV2 {
 static_assert(sizeof(MutationBatchAckV2) == 32);
 static_assert(sizeof(MutationCompletionV2) == 64);
 
+// ACKs and completions share one RC QP. RC receive WQEs are consumed in queue
+// order rather than selected by WR-ID, so every posted receive on that QP must
+// accept the largest envelope.
+inline constexpr size_t mutation_receive_slot_bytes() {
+  return sizeof(MutationCompletionV2);
+}
+static_assert(sizeof(MutationBatchAckV2) <= mutation_receive_slot_bytes());
+
 struct MutationResult {
   u64 new_rptr_raw{};
   u64 old_rptr_raw{};

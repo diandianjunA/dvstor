@@ -135,6 +135,9 @@ private:
     bool results_completed{false};
     bool completion_claimed{false};
     bool response_valid{false};
+    service::storage_owner::MutationBatchAckV2 response_ack{};
+    // Kept only for the unreachable protocol-v3 parser below the v4 return;
+    // no v4 receive slot is retained by an RPC batch.
     u32 response_slot_id{std::numeric_limits<u32>::max()};
     u32 item_count{};
     u64 batch_id{};
@@ -220,7 +223,6 @@ private:
   struct StorageOwnerReleasedSlot {
     u32 owner_storage{};
     u32 slot_id{};
-    u32 response_slot_id{};
   };
 
   void init_remote_tokens();
@@ -242,15 +244,17 @@ private:
   void post_storage_owner_batch(u32 owner_storage,
                                 u32 slot_id);
   void handle_storage_owner_send_completion(u32 owner_storage, u32 slot_id);
-  void handle_storage_owner_response(u32 owner_storage,
-                                     u32 response_slot_id,
-                                     u32 received_bytes);
+  void handle_storage_owner_response(
+    u32 owner_storage,
+    const service::storage_owner::MutationBatchAckV2& response,
+    u32 received_bytes);
   void post_storage_owner_response_receive(u32 owner_storage, u32 response_slot_id);
   void post_storage_owner_completion_receive(u32 owner_storage,
                                              u32 completion_slot_id);
-  void handle_storage_owner_token_completion(u32 owner_storage,
-                                             u32 completion_slot_id,
-                                             u32 received_bytes);
+  void handle_storage_owner_token_completion(
+    u32 owner_storage,
+    const service::storage_owner::MutationCompletionV2& completion,
+    u32 received_bytes);
   bool queue_storage_owner_completion(StorageOwnerRpcSlot& slot);
   void commit_storage_owner_slot(u32 owner_storage, u32 slot_id);
   void release_storage_owner_slot(u32 owner_storage, u32 slot_id);

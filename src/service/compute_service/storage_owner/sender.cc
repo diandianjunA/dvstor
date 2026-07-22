@@ -42,12 +42,47 @@ void ComputeService::run_storage_insert_progress_loop() {
     for (i32 i = 0; i < recv_count; ++i) {
       const auto [encoded_owner, slot_id] = decode_64bit(recv_wcs[i].wr_id);
       const u32 owner_storage = storage_owner_wr_owner(encoded_owner);
-      if (storage_owner_is_completion_wr(encoded_owner)) {
+      if (owner_storage >= storage_insert_owners_.size()) continue;
+      auto& state = *storage_insert_owners_[owner_storage];
+      const bool completion_pool =
+        storage_owner_is_completion_wr(encoded_owner);
+      const byte_t* receive_buffer = nullptr;
+      if (completion_pool) {
+        if (slot_id >= state.completion_slot_count) continue;
+        receive_buffer = state.completion_buffer.data() +
+          static_cast<size_t>(slot_id) *
+            sizeof(service::storage_owner::MutationCompletionV2);
+      } else {
+        if (slot_id >= state.response_slots.size()) continue;
+        receive_buffer = state.response_slots[slot_id].buffer.data();
+      }
+
+      // Every receive WQE on an RC QP is interchangeable. Copy and classify
+      // the envelope before reposting the same physical slot; WR-ID denotes
+      // buffer ownership only, never the incoming message type.
+      u32 magic = 0;
+      if (recv_wcs[i].byte_len >= sizeof(magic)) {
+        std::memcpy(&magic, receive_buffer, sizeof(magic));
+      }
+      service::storage_owner::MutationBatchAckV2 ack{};
+      service::storage_owner::MutationCompletionV2 completion{};
+      if (magic == service::storage_owner::kMutationCompletionMagic &&
+          recv_wcs[i].byte_len == sizeof(completion)) {
+        std::memcpy(&completion, receive_buffer, sizeof(completion));
+      } else if (recv_wcs[i].byte_len == sizeof(ack)) {
+        std::memcpy(&ack, receive_buffer, sizeof(ack));
+      }
+      if (completion_pool) {
+        post_storage_owner_completion_receive(owner_storage, slot_id);
+      } else {
+        post_storage_owner_response_receive(owner_storage, slot_id);
+      }
+      if (magic == service::storage_owner::kMutationCompletionMagic) {
         handle_storage_owner_token_completion(
-          owner_storage, slot_id, recv_wcs[i].byte_len);
+          owner_storage, completion, recv_wcs[i].byte_len);
       } else {
         handle_storage_owner_response(
-          owner_storage, slot_id, recv_wcs[i].byte_len);
+          owner_storage, ack, recv_wcs[i].byte_len);
       }
     }
 
@@ -181,8 +216,7 @@ void ComputeService::reclaim_storage_owner_slots() {
     lib_assert(released.owner_storage < storage_insert_owners_.size(),
                "storage-owner release references an invalid owner");
     auto& state = *storage_insert_owners_[released.owner_storage];
-    lib_assert(released.slot_id < state.slots.size() &&
-                 released.response_slot_id < state.response_slots.size(),
+    lib_assert(released.slot_id < state.slots.size(),
                "storage-owner release references an invalid slot");
     auto& slot = state.slots[released.slot_id];
     lib_assert(slot.in_use && slot.results_completed,
@@ -193,6 +227,7 @@ void ComputeService::reclaim_storage_owner_slots() {
     slot.results_completed = false;
     slot.completion_claimed = false;
     slot.response_valid = false;
+    slot.response_ack = {};
     slot.response_slot_id = std::numeric_limits<u32>::max();
     slot.item_count = 0;
     slot.batch_id = 0;
@@ -205,8 +240,6 @@ void ComputeService::reclaim_storage_owner_slots() {
     slot.response_completed_at = {};
     slot.tasks.clear();
     state.free_slots.push_back(released.slot_id);
-    post_storage_owner_response_receive(
-      released.owner_storage, released.response_slot_id);
     storage_insert_inflight_.fetch_sub(1, std::memory_order_acq_rel);
   }
 }
@@ -302,6 +335,7 @@ void ComputeService::post_storage_owner_batch(
   slot.results_completed = false;
   slot.completion_claimed = false;
   slot.response_valid = false;
+  slot.response_ack = {};
   slot.response_slot_id = std::numeric_limits<u32>::max();
   slot.item_count = item_count;
   slot.batch_id = batch_id;

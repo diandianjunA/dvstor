@@ -8,6 +8,10 @@ namespace {
 void test_public_mutation_acceptance_and_completion_envelopes() {
   namespace protocol = service::storage_owner;
 
+  static_assert(protocol::mutation_receive_slot_bytes() == 64);
+  static_assert(sizeof(protocol::MutationBatchAckV2) <
+                protocol::mutation_receive_slot_bytes());
+
   const protocol::MutationBatchAckV2 ack{
     .magic = protocol::kMutationMagic,
     .owner_storage = 3,

@@ -26,7 +26,7 @@ void ComputeService::start_storage_insert_runtime() {
     service::storage_owner::mutation_batch_request_bytes(
       config_.storage_owner_batch_max));
   const size_t response_bytes =
-    sizeof(service::storage_owner::MutationBatchAckV2);
+    service::storage_owner::mutation_receive_slot_bytes();
   lib_assert(request_bytes <= std::numeric_limits<u32>::max() &&
                response_bytes <= std::numeric_limits<u32>::max(),
              "storage_owner RPC message is too large for verbs SGEs; "
