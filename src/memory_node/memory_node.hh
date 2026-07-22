@@ -599,6 +599,10 @@ private:
         span<const service::storage_owner::Stage1ExecuteItem>,
         span<const service::storage_owner::Stage1ExecuteResult>)>&
         on_home_resolved,
+      const std::function<void(
+        u32,
+        span<const service::storage_owner::Stage1ArmItem>)>&
+        on_home_release_resolved,
       const std::function<bool()>& overlap_work,
       const Configuration& config);
   bool arm_remote_stage1_batch(
@@ -671,6 +675,8 @@ private:
       const Configuration& config);
   u64 begin_storage_owner_maintenance_sequence(u32 work_items);
   u64 begin_storage_owner_maintenance_batch(span<const u32> work_items);
+  u64 try_begin_storage_owner_maintenance_batch(
+    span<const u32> work_items);
   void complete_storage_owner_maintenance_sequence(u64 sequence);
   void complete_storage_owner_maintenance_sequence(u64 sequence,
                                                    u32 work_items);
@@ -1089,9 +1095,9 @@ private:
   // predecessor durability rule makes its front the only cleanup that can be
   // runnable, eliminating admission-time scans under the global mutex.
   std::deque<StorageOwnerMaintenanceTask> storage_owner_cleanup_tasks_;
-  // Arm owns a queue permit before reserving a completion sequence. Generic
-  // producers include these permits in their capacity check, so a sequence
-  // can always become runnable immediately after it is allocated.
+  // Arm owns a queue permit while it tries to reserve a completion batch.
+  // Generic producers include these permits in their capacity check, so a
+  // successfully reserved sequence can become runnable immediately.
   size_t storage_owner_maintenance_reserved_slots_{};
   std::unique_ptr<bounded::Queue<StorageOwnerMaintenanceTask>>
     storage_owner_repair_tasks_;

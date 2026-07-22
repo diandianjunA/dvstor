@@ -1,5 +1,8 @@
 #pragma once
 
+#include <algorithm>
+#include <chrono>
+
 #include "service/storage_owner_protocol.hh"
 
 namespace memory_node_peer_rpc_detail {
@@ -137,6 +140,42 @@ public:
 private:
   bool posted_{};
   bool resolved_{};
+};
+
+// A bounded per-home retry delay keeps a temporarily full Stage2 completion
+// window from turning an Execute `retry` response into a tight request storm.
+// The semantic token and transport request ID remain unchanged across retries;
+// only a successful phase transition resets the delay.
+class Stage1HomeRetryBackoff {
+public:
+  using Clock = std::chrono::steady_clock;
+
+  static constexpr u32 kInitialDelayUs = 100;
+  static constexpr u32 kMaximumDelayUs = 2'000;
+
+  [[nodiscard]] bool ready(Clock::time_point now) const noexcept {
+    return retry_not_before_ == Clock::time_point{} ||
+      now >= retry_not_before_;
+  }
+
+  void schedule(Clock::time_point now) noexcept {
+    retry_not_before_ = now + std::chrono::microseconds(next_delay_us_);
+    next_delay_us_ = std::min<u32>(
+      next_delay_us_ * 2, kMaximumDelayUs);
+  }
+
+  void reset() noexcept {
+    retry_not_before_ = {};
+    next_delay_us_ = kInitialDelayUs;
+  }
+
+  [[nodiscard]] u32 next_delay_us() const noexcept {
+    return next_delay_us_;
+  }
+
+private:
+  Clock::time_point retry_not_before_{};
+  u32 next_delay_us_{kInitialDelayUs};
 };
 
 }  // namespace memory_node_peer_rpc_detail

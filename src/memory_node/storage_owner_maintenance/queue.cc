@@ -4,6 +4,63 @@
 
 using namespace memory_node_storage_owner_maintenance_detail;
 
+namespace {
+
+// Owns the queue slots between the try-only queue check and completion-ring
+// reservation.  A full completion window, shutdown race, or exception returns
+// every slot and wakes another producer; successful enqueue consumes the
+// permit under the same mutex that protects the runnable queues.
+class MaintenanceQueueBatchPermitGuard {
+public:
+  MaintenanceQueueBatchPermitGuard(
+      std::mutex& mutex,
+      std::condition_variable& changed,
+      size_t& reserved_slots,
+      size_t task_count) noexcept
+      : mutex_(mutex),
+        changed_(changed),
+        reserved_slots_(reserved_slots),
+        task_count_(task_count) {}
+
+  MaintenanceQueueBatchPermitGuard(
+      const MaintenanceQueueBatchPermitGuard&) = delete;
+  MaintenanceQueueBatchPermitGuard& operator=(
+      const MaintenanceQueueBatchPermitGuard&) = delete;
+
+  ~MaintenanceQueueBatchPermitGuard() { release(); }
+
+  // The caller holds mutex_. Runnable queue ownership replaces the temporary
+  // reservation atomically with respect to every other capacity check.
+  void consume_locked() {
+    lib_assert(active_, "maintenance queue batch permit consumed twice");
+    lib_assert(release_maintenance_queue_batch_permit(
+                 task_count_, reserved_slots_),
+               "maintenance queue batch permit account underflow");
+    active_ = false;
+  }
+
+private:
+  void release() {
+    if (!active_) return;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      lib_assert(release_maintenance_queue_batch_permit(
+                   task_count_, reserved_slots_),
+                 "maintenance queue batch permit rollback underflow");
+      active_ = false;
+    }
+    changed_.notify_all();
+  }
+
+  std::mutex& mutex_;
+  std::condition_variable& changed_;
+  size_t& reserved_slots_;
+  size_t task_count_{};
+  bool active_{true};
+};
+
+}  // namespace
+
 u64 MemoryNode::arm_storage_owner_maintenance(
     StorageOwnerMaintenanceTask&& task, const Configuration& config) {
   vec<StorageOwnerMaintenanceTask> tasks;
@@ -30,41 +87,38 @@ u64 MemoryNode::arm_storage_owner_maintenance_batch(
     }
   }
 
-  // The physical-home control RPC is one admission transaction.  Reserve all
-  // queue permits before touching the completion ring; otherwise concurrent
-  // RPCs can each own a partial batch and wait forever for the credit that
-  // those same pre-commit tasks are unable to release.
+  // The physical-home control RPC is one try-only admission transaction.
+  // Claim every queue permit before touching the completion ring; if either
+  // bounded resource cannot hold the whole batch, retain every task and let
+  // the Stage1 control protocol return an explicit transient retry.
   const size_t task_count = tasks.size();
+  vec<u32> work_items(task_count, 1);
   {
-    std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
-    storage_owner_maintenance_cv_.wait(lock, [&]() {
-      return storage_owner_maintenance_shutdown_.load(
-               std::memory_order_acquire) ||
-        maintenance_queue_batch_permit_available(
+    std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
+    if (storage_owner_maintenance_shutdown_.load(
+          std::memory_order_acquire) ||
+        !try_acquire_maintenance_queue_batch_permit(
           storage_owner_stage2_tasks_.size() +
             storage_owner_cleanup_tasks_.size(),
-          storage_owner_maintenance_reserved_slots_,
           task_count,
-          config.storage_owner_maintenance_queue_depth);
-    });
-    if (storage_owner_maintenance_shutdown_.load(
-          std::memory_order_acquire)) {
+          config.storage_owner_maintenance_queue_depth,
+          storage_owner_maintenance_reserved_slots_)) {
       return 0;
     }
-    storage_owner_maintenance_reserved_slots_ += task_count;
   }
+  MaintenanceQueueBatchPermitGuard queue_permit{
+    storage_owner_maintenance_mutex_, storage_owner_maintenance_cv_,
+    storage_owner_maintenance_reserved_slots_, task_count};
 
-  vec<u32> work_items(task_count, 1);
-  const u64 first_sequence = begin_storage_owner_maintenance_batch(
+  const u64 first_sequence = try_begin_storage_owner_maintenance_batch(
     span<const u32>{work_items});
+  if (first_sequence == 0) return 0;
   const auto queued_at = std::chrono::steady_clock::now();
   size_t backlog = 0;
   bool enqueued = false;
   {
     std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
-    lib_assert(storage_owner_maintenance_reserved_slots_ >= task_count,
-               "Stage1 arm lost its reserved maintenance queue batch");
-    storage_owner_maintenance_reserved_slots_ -= task_count;
+    queue_permit.consume_locked();
     if (!storage_owner_maintenance_shutdown_.load(
           std::memory_order_acquire)) {
       for (size_t item = 0; item < task_count; ++item) {
@@ -207,6 +261,19 @@ u64 MemoryNode::begin_storage_owner_maintenance_batch(
     storage_owner_maintenance_completion_ring_->reserve_batch(
       work_items, storage_owner_maintenance_admission_limit_);
   publish_storage_owner_maintenance_watermarks();
+  return sequence;
+}
+
+u64 MemoryNode::try_begin_storage_owner_maintenance_batch(
+    span<const u32> work_items) {
+  lib_assert(storage_owner_maintenance_completion_ring_ != nullptr,
+             "storage-owner completion ring is not initialized");
+  lib_assert(storage_owner_maintenance_admission_limit_ != 0,
+             "storage-owner completion admission window is not initialized");
+  const u64 sequence =
+    storage_owner_maintenance_completion_ring_->try_reserve_batch(
+      work_items, storage_owner_maintenance_admission_limit_);
+  if (sequence != 0) publish_storage_owner_maintenance_watermarks();
   return sequence;
 }
 

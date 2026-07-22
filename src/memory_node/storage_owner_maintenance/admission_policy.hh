@@ -67,9 +67,10 @@ inline std::size_t stage2_context_admission_limit(
   return workers * depth;
 }
 
-// A Stage1 arm permit is counted before it waits for completion-ring credit.
-// Other producers must include those permits in their queue-capacity test or
-// they could steal the slot after arm has reserved a sequence.
+// A Stage1 arm permit bridges the queue-capacity check and the try-only
+// completion-ring transaction. Other producers must include those permits in
+// their queue-capacity test or they could steal a runnable slot after arm has
+// reserved a sequence.
 inline bool maintenance_queue_permit_available(
     std::size_t runnable_tasks,
     std::size_t reserved_slots,
@@ -94,6 +95,32 @@ inline bool maintenance_queue_batch_permit_available(
   }
   return requested_slots <=
     capacity - runnable_tasks - reserved_slots;
+}
+
+// Update the shared permit account only when the entire batch fits. Keeping
+// this arithmetic in one helper makes both the no-partial-admission property
+// and the transient-failure no-op directly testable.
+inline bool try_acquire_maintenance_queue_batch_permit(
+    std::size_t runnable_tasks,
+    std::size_t requested_slots,
+    std::size_t capacity,
+    std::size_t& reserved_slots) {
+  if (!maintenance_queue_batch_permit_available(
+        runnable_tasks, reserved_slots, requested_slots, capacity)) {
+    return false;
+  }
+  reserved_slots += requested_slots;
+  return true;
+}
+
+// Release is similarly checked so a failed completion-ring try cannot wrap
+// the reservation account and silently expose more queue capacity than exists.
+inline bool release_maintenance_queue_batch_permit(
+    std::size_t released_slots,
+    std::size_t& reserved_slots) {
+  if (released_slots == 0 || released_slots > reserved_slots) return false;
+  reserved_slots -= released_slots;
+  return true;
 }
 
 // Avoid calling the pressure probe when this executor cannot admit work at

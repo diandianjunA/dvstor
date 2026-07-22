@@ -52,6 +52,13 @@ public:
     return reserve_batch(span<const u32>{&work_items, 1});
   }
 
+  // Try-only counterpart used by foreground protocol workers.  A zero return
+  // is an explicit transient-capacity result; sequence zero is never a valid
+  // reservation.  Failure leaves next_, every cell, and finalized_ unchanged.
+  u64 try_reserve(u32 work_items) {
+    return try_reserve_batch(span<const u32>{&work_items, 1});
+  }
+
   // Atomically admits a whole foreground RPC batch.  Reserving each item
   // separately can deadlock when several workers each hold a partial window
   // while waiting for the rest of their batch: none of those sequences has
@@ -67,49 +74,31 @@ public:
   // contiguous watermark advances; compare/exchange still admits only the
   // batches that fit, including mixed batch sizes without head-of-line idling.
   u64 reserve_batch(span<const u32> work_items, size_t admission_limit) {
-    if (work_items.empty()) {
-      throw std::invalid_argument("completion ring batch must not be empty");
-    }
-    if (admission_limit == 0 || admission_limit > capacity_ ||
-        work_items.size() > admission_limit) {
-      throw std::invalid_argument(
-        "completion ring batch exceeds its admission window");
-    }
+    validate_batch(work_items, admission_limit);
 
-    const u64 count = static_cast<u64>(work_items.size());
-    u64 sequence = 0;
+    // Load the wait value before the try.  If a completion races the failed
+    // capacity check, atomic::wait observes the changed watermark and returns
+    // instead of sleeping after credit has already become available.
     for (;;) {
       const u64 done = finalized_.load(std::memory_order_acquire);
-      sequence = next_.load(std::memory_order_acquire);
-      // finalized_ advancing implies that next_ was advanced first. Loading
-      // the watermark before next_ prevents a cross-atomic stale snapshot
-      // from underflowing the unsigned outstanding calculation.
-      if (sequence <= done) continue;
-      if (sequence > std::numeric_limits<u64>::max() - count) {
-        throw std::overflow_error("completion ring sequence overflow");
-      }
-      const u64 next_after_batch = sequence + count;
-      if (next_after_batch - done - 1 > admission_limit) {
-        finalized_.wait(done, std::memory_order_relaxed);
-        continue;
-      }
-      if (next_.compare_exchange_weak(
-            sequence, next_after_batch,
-            std::memory_order_acq_rel, std::memory_order_acquire)) {
-        break;
-      }
+      const u64 sequence = try_reserve_batch_validated(
+        work_items, admission_limit);
+      if (sequence != 0) return sequence;
+      finalized_.wait(done, std::memory_order_relaxed);
     }
+  }
 
-    for (size_t item = 0; item < work_items.size(); ++item) {
-      const u64 item_sequence = sequence + static_cast<u64>(item);
-      Cell& cell = cells_[index(item_sequence)];
-      cell.remaining.store(work_items[item], std::memory_order_relaxed);
-      cell.sequence.store(item_sequence, std::memory_order_release);
-    }
-    // This also advances across any zero-work prefix.  A later zero-work cell
-    // will be consumed by the completion that makes its predecessor ready.
-    advance();
-    return sequence;
+  u64 try_reserve_batch(span<const u32> work_items) {
+    return try_reserve_batch(work_items, capacity_);
+  }
+
+  // Atomically claims the complete batch or claims nothing.  Capacity
+  // pressure never waits on finalized_: callers retain ownership of their
+  // artifacts and may return a protocol-level transient retry.
+  u64 try_reserve_batch(
+      span<const u32> work_items, size_t admission_limit) {
+    validate_batch(work_items, admission_limit);
+    return try_reserve_batch_validated(work_items, admission_limit);
   }
 
   void complete(u64 sequence, u32 work_items = 1) {
@@ -139,6 +128,60 @@ private:
     std::atomic<u64> sequence{0};
     std::atomic<u32> remaining{0};
   };
+
+  void validate_batch(
+      span<const u32> work_items, size_t admission_limit) const {
+    if (work_items.empty()) {
+      throw std::invalid_argument("completion ring batch must not be empty");
+    }
+    if (admission_limit == 0 || admission_limit > capacity_ ||
+        work_items.size() > admission_limit) {
+      throw std::invalid_argument(
+        "completion ring batch exceeds its admission window");
+    }
+  }
+
+  u64 try_reserve_batch_validated(
+      span<const u32> work_items, size_t admission_limit) {
+    const u64 count = static_cast<u64>(work_items.size());
+    for (;;) {
+      const u64 done = finalized_.load(std::memory_order_acquire);
+      u64 sequence = next_.load(std::memory_order_acquire);
+      // finalized_ advancing implies that next_ was advanced first. Loading
+      // the watermark before next_ prevents a cross-atomic stale snapshot
+      // from underflowing the unsigned outstanding calculation.
+      if (sequence <= done) continue;
+      if (sequence > std::numeric_limits<u64>::max() - count) {
+        throw std::overflow_error("completion ring sequence overflow");
+      }
+      const u64 next_after_batch = sequence + count;
+      if (next_after_batch - done - 1 > admission_limit) {
+        // Avoid a false transient result when the contiguous watermark moved
+        // during this cross-atomic snapshot.  Otherwise report full without
+        // touching next_ or any cell.
+        if (finalized_.load(std::memory_order_acquire) != done) continue;
+        return 0;
+      }
+      if (next_.compare_exchange_weak(
+            sequence, next_after_batch,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        for (size_t item = 0; item < work_items.size(); ++item) {
+          const u64 item_sequence = sequence + static_cast<u64>(item);
+          Cell& cell = cells_[index(item_sequence)];
+          cell.remaining.store(work_items[item], std::memory_order_relaxed);
+          cell.sequence.store(item_sequence, std::memory_order_release);
+        }
+        // This also advances across any zero-work prefix.  A later zero-work
+        // cell will be consumed by the completion that makes its predecessor
+        // ready.
+        advance();
+        return sequence;
+      }
+      // CAS contention (including a spurious failure) is not a capacity
+      // result. Re-read both atomics and either commit the complete batch or
+      // return zero only after observing a genuinely full window.
+    }
+  }
 
   size_t index(u64 sequence) const noexcept {
     return static_cast<size_t>((sequence - 1) % capacity_);

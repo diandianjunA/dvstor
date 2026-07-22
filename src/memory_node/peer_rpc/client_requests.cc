@@ -555,9 +555,14 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
       u32, span<const service::storage_owner::Stage1ExecuteItem>,
       span<const service::storage_owner::Stage1ExecuteResult>)>&
       on_home_resolved,
+    const std::function<void(
+      u32,
+      span<const service::storage_owner::Stage1ArmItem>)>&
+      on_home_release_resolved,
     const std::function<bool()>& overlap_work,
     const Configuration& config) {
   using namespace service::storage_owner;
+  using memory_node_peer_rpc_detail::Stage1HomeRetryBackoff;
   results_by_home.clear();
   if (items_by_home.empty()) return !overlap_work || overlap_work();
 
@@ -568,6 +573,7 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
     vec<byte_t> message;
     vec<Stage1ArmItem> release_items;
     std::chrono::steady_clock::time_point deadline{};
+    Stage1HomeRetryBackoff retry_backoff;
     bool posted{};
     bool execute_resolved{};
     bool resolved{};
@@ -721,6 +727,7 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
         if (request.resolved) continue;
 
         if (!request.posted) {
+          if (!request.retry_backoff.ready(now)) continue;
           const bool posted = request.execute_resolved
             ? try_post_release(request) : try_post_execute(request);
           if (!posted) continue;
@@ -743,12 +750,16 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
           if (state == TryPeerResponse::pending) {
             if (std::chrono::steady_clock::now() >= request.deadline) {
               request.posted = false;
+              request.retry_backoff.schedule(
+                std::chrono::steady_clock::now());
               made_progress = true;
             }
             continue;
           }
           if (state == TryPeerResponse::stale) {
             request.posted = false;
+            request.retry_backoff.schedule(
+              std::chrono::steady_clock::now());
             made_progress = true;
             continue;
           }
@@ -789,11 +800,18 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
             lib_assert(rearm_peer_rpc_response(response_lease),
                        "retryable Stage1 release lost its response lease");
             request.posted = false;
+            request.retry_backoff.schedule(
+              std::chrono::steady_clock::now());
             made_progress = true;
             continue;
           }
           lib_assert(acknowledge_peer_rpc_response(response_lease),
                      "validated Stage1 release lost its response lease");
+          if (on_home_release_resolved) {
+            on_home_release_resolved(
+              request.home,
+              span<const Stage1ArmItem>{request.release_items});
+          }
           request.posted = false;
           request.resolved = true;
           --remaining;
@@ -814,12 +832,16 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
             // an uncertain request; repost the identical request ID so either
             // response resolves the same registry entry.
             request.posted = false;
+            request.retry_backoff.schedule(
+              std::chrono::steady_clock::now());
             made_progress = true;
           }
           continue;
         }
         if (state == TryPeerResponse::stale) {
           request.posted = false;
+          request.retry_backoff.schedule(
+            std::chrono::steady_clock::now());
           made_progress = true;
           continue;
         }
@@ -886,7 +908,11 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
         }
         request.posted = false;
         made_progress = true;
-        if (retryable) continue;
+        if (retryable) {
+          request.retry_backoff.schedule(
+            std::chrono::steady_clock::now());
+          continue;
+        }
 
         const auto [resolved_position, inserted] = results_by_home.emplace(
           request.home, std::move(shard_results));
@@ -933,6 +959,7 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
         }
         request.execute_resolved = true;
         request.request_id = allocate_peer_request_id();
+        request.retry_backoff.reset();
       }
 
       if (!made_progress && remaining != 0) {

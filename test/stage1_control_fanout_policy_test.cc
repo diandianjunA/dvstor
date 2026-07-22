@@ -8,6 +8,7 @@ namespace {
 using namespace service::storage_owner;
 using memory_node_peer_rpc_detail::Stage1ControlHomeProgress;
 using memory_node_peer_rpc_detail::Stage1ControlResponseDisposition;
+using memory_node_peer_rpc_detail::Stage1HomeRetryBackoff;
 using memory_node_peer_rpc_detail::classify_stage1_control_response;
 using memory_node_peer_rpc_detail::
   defer_fused_stage1_success_for_atomic_retry;
@@ -128,6 +129,37 @@ void test_each_home_advances_independently() {
   assert(!homes[1].needs_post());
   assert(!homes[2].needs_post());
   assert(!homes[1].mark_resolved());
+}
+
+void test_stage1_retry_backoff_is_bounded_and_phase_local() {
+  using namespace std::chrono_literals;
+  Stage1HomeRetryBackoff backoff;
+  const auto epoch = Stage1HomeRetryBackoff::Clock::time_point{} + 1s;
+
+  assert(backoff.ready(epoch));
+  assert(backoff.next_delay_us() == 100);
+  backoff.schedule(epoch);
+  assert(!backoff.ready(epoch + 99us));
+  assert(backoff.ready(epoch + 100us));
+  assert(backoff.next_delay_us() == 200);
+
+  auto retry_at = epoch + 100us;
+  for (u32 expected : {400u, 800u, 1600u, 2000u, 2000u}) {
+    const u32 scheduled_delay = backoff.next_delay_us();
+    backoff.schedule(retry_at);
+    assert(!backoff.ready(
+      retry_at + std::chrono::microseconds(scheduled_delay - 1)));
+    retry_at += std::chrono::microseconds(scheduled_delay);
+    assert(backoff.ready(retry_at));
+    assert(backoff.next_delay_us() == expected);
+  }
+
+  // Execute resolution starts a distinct ordered release phase. Its first
+  // retry must begin at the minimum delay rather than inheriting Execute's
+  // saturated-window backoff.
+  backoff.reset();
+  assert(backoff.ready(retry_at));
+  assert(backoff.next_delay_us() == 100);
 }
 
 void test_home_commit_releases_credit_before_next_home_arm() {
@@ -271,6 +303,7 @@ int main() {
   test_release_is_an_idempotent_ordered_watermark();
   test_structural_corruption_never_becomes_retry();
   test_each_home_advances_independently();
+  test_stage1_retry_backoff_is_bounded_and_phase_local();
   test_home_commit_releases_credit_before_next_home_arm();
   test_fused_execute_requires_fresh_insert_and_runnable_fence();
   test_atomic_retry_never_hides_terminal_prepare_failure();

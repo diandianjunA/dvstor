@@ -506,8 +506,6 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     return true;
   };
   dense_hashmap_t<u32, vec<Stage1ExecuteResult>> remote_stage1_results;
-  bool stage1_home_release_ok = true;
-  u64 eager_remote_stage1_release_ns = 0;
   const auto resolve_remote_stage1_home = [&] (
       u32 home, span<const Stage1ExecuteItem> home_items,
       span<const Stage1ExecuteResult> home_results) {
@@ -516,10 +514,6 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
                  found->second.size() == home_items.size() &&
                  home_results.size() == home_items.size(),
                "Stage1 execute fanout lost its home-to-authority mapping");
-    vec<size_t> release_indices;
-    vec<Stage1ArmItem> release_items;
-    release_indices.reserve(found->second.size());
-    release_items.reserve(found->second.size());
     for (size_t slot = 0; slot < found->second.size(); ++slot) {
       const size_t index = found->second[slot];
       MutationPlan& plan = plans[index];
@@ -547,8 +541,51 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       // The response lease has already been acknowledged. Commit this home
       // now, while unrelated homes may still be waiting or retrying.
       commit_plan(index);
-      release_indices.push_back(index);
-      release_items.push_back(Stage1ArmItem{
+    }
+  };
+
+  // The asynchronous per-home Execute state machine owns the only normal-path
+  // remote release. It invokes this notification only after validating the
+  // release envelope and every token/status, then acknowledging the response
+  // lease. Map by the release input token: an idempotent missing-receipt ACK is
+  // allowed to return target_raw == 0.
+  const auto resolve_remote_stage1_release = [&] (
+      u32 home, span<const Stage1ArmItem> release_items) {
+    for (const Stage1ArmItem& item : release_items) {
+      const size_t index = item.token.item_index;
+      lib_assert(index < plans.size(),
+                 "Stage1 release ACK referenced an invalid mutation index");
+      const MutationPlan& plan = plans[index];
+      lib_assert(home != storage_id_ && plan.stage1_home == home &&
+                   plan.fused_stage1 && plan.authority_committed &&
+                   plan.operation.source_client == item.token.source_client &&
+                   plan.operation.item_index == item.token.item_index &&
+                   plan.operation.client_batch_id ==
+                     item.token.client_batch_id &&
+                   plan.stage1_result.target_raw == item.target_raw &&
+                   plan.stage1_item.initial_placement_version ==
+                     item.initial_placement_version &&
+                   ids[index] == item.id &&
+                   plan.begin.generation == item.generation &&
+                   static_cast<Stage1ArmAction>(item.action) ==
+                     Stage1ArmAction::release,
+                 "Stage1 release ACK crossed a committed mutation token");
+    }
+    for (const Stage1ArmItem& item : release_items) {
+      plans[item.token.item_index].stage1_receipt_released = true;
+    }
+  };
+
+  const auto collect_remote_stage1_release_debt = [&]() {
+    dense_hashmap_t<u32, vec<Stage1ArmItem>> groups;
+    for (size_t index = 0; index < item_count; ++index) {
+      const MutationPlan& plan = plans[index];
+      if (!plan.active || !plan.fused_stage1 ||
+          !plan.authority_committed || plan.stage1_receipt_released ||
+          plan.stage1_home == storage_id_) {
+        continue;
+      }
+      groups[plan.stage1_home].push_back(Stage1ArmItem{
         .token = plan.operation,
         .target_raw = plan.stage1_result.target_raw,
         .initial_placement_version =
@@ -558,65 +595,46 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
         .action = static_cast<u32>(Stage1ArmAction::release),
       });
     }
-
-    // Release this home's compact receipts immediately after its authority
-    // commit. The marker shares the ordered RC control path with Execute, so
-    // the physical home can quiesce late retries without a global all-home
-    // receipt barrier. A retry here never reopens or re-commits the home.
-    if (!release_items.empty()) {
-      const auto release_started = std::chrono::steady_clock::now();
-      for (;;) {
-        vec<Stage1ArmResult> release_results;
-        const bool transported = arm_remote_stage1_batch(
-          home, source_client, span<const Stage1ArmItem>{release_items},
-          release_results, config);
-        if (transported) {
-          const auto disposition =
-            memory_node_peer_rpc_detail::classify_stage1_control_response(
-              span<const Stage1ArmItem>{release_items},
-              span<const Stage1ArmResult>{release_results});
-          if (disposition == memory_node_peer_rpc_detail::
-                Stage1ControlResponseDisposition::resolved) {
-            for (const size_t index : release_indices) {
-              plans[index].stage1_receipt_released = true;
-            }
-            break;
-          }
-          if (disposition == memory_node_peer_rpc_detail::
-                Stage1ControlResponseDisposition::malformed) {
-            throw std::runtime_error(
-              "remote fused Stage1 release returned a malformed result");
-          }
-        }
-        if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
-          stage1_home_release_ok = false;
-          break;
-        }
-        std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
-        storage_owner_maintenance_cv_.wait_for(
-          lock, std::chrono::microseconds(100));
-      }
-      const u64 release_ns = elapsed_ns_since(release_started);
-      eager_remote_stage1_release_ns += release_ns;
-      breakdown.storage_owner_stage1_release_wait_ns += release_ns;
-    }
+    return groups;
   };
+
   const auto stage1_execute_started = std::chrono::steady_clock::now();
-  const bool stage1_transport_ok = execute_remote_stage1_fanout_and_wait(
-    remote_stage1_items, remote_stage1_vectors,
-    remote_stage1_results, resolve_remote_stage1_home,
-    execute_local_stage1, config);
+  bool stage1_transport_ok = false;
+  try {
+    stage1_transport_ok = execute_remote_stage1_fanout_and_wait(
+      remote_stage1_items, remote_stage1_vectors,
+      remote_stage1_results, resolve_remote_stage1_home,
+      resolve_remote_stage1_release, execute_local_stage1, config);
+  } catch (...) {
+    // A callback can fail after committing only part of a remote home. Drain
+    // exactly those committed receipt debts before propagating the exception;
+    // uncommitted prepares remain replayable under their authority leases.
+    auto debt = collect_remote_stage1_release_debt();
+    if (!debt.empty()) {
+      const auto release_started = std::chrono::steady_clock::now();
+      const bool debt_released = control_stage1_fanout_and_wait(
+        debt, source_client,
+        [&](u32 home, span<const Stage1ArmItem> items,
+            span<const Stage1ArmResult>) {
+          resolve_remote_stage1_release(home, items);
+        },
+        config);
+      breakdown.storage_owner_stage1_release_wait_ns +=
+        elapsed_ns_since(release_started);
+      if (!debt_released &&
+          storage_insert_shutdown_.load(std::memory_order_acquire)) {
+        return false;
+      }
+    }
+    throw;
+  }
   // Local search/prune time is already represented by its detailed counters.
   // Subtract the overlapped interval so the aggregate breakdown remains a
   // partition rather than double-counting concurrent local and remote work.
   const u64 stage1_critical_path_ns = elapsed_ns_since(stage1_execute_started);
-  const u64 excluded_stage1_ns = local_stage1_elapsed_ns >
-      std::numeric_limits<u64>::max() - eager_remote_stage1_release_ns
-    ? std::numeric_limits<u64>::max()
-    : local_stage1_elapsed_ns + eager_remote_stage1_release_ns;
   breakdown.storage_owner_stage1_execute_wait_ns +=
-    stage1_critical_path_ns > excluded_stage1_ns
-      ? stage1_critical_path_ns - excluded_stage1_ns : 0;
+    stage1_critical_path_ns > local_stage1_elapsed_ns
+      ? stage1_critical_path_ns - local_stage1_elapsed_ns : 0;
   if (!stage1_transport_ok) {
     // A fused request may already own a runnable Stage2 descriptor at its
     // physical home. Transport uncertainty is not a semantic prepare failure.
@@ -626,7 +644,6 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     throw std::runtime_error(
       "Stage1 transport stopped before every semantic token resolved");
   }
-  if (!stage1_home_release_ok) return false;
   for (const auto& [home, indices] : stage1_groups) {
     if (home == storage_id_) continue;
     const auto found = remote_stage1_results.find(home);

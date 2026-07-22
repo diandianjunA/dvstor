@@ -335,6 +335,78 @@ void test_sliding_completion_ring_atomic_batch_admission() {
   assert(ring.finalized() == 7);
 }
 
+void test_sliding_completion_ring_try_batch_is_atomic_and_nonblocking() {
+  bounded::SlidingCompletionRing ring(8);
+  const std::array<u32, 3> initial_work{1, 1, 1};
+  assert(ring.try_reserve_batch(
+           span<const u32>{initial_work.data(), initial_work.size()}, 3) == 1);
+  assert(ring.next_sequence() == 4);
+
+  const std::array<u32, 2> blocked_work{1, 1};
+  const u64 next_before_full_try = ring.next_sequence();
+  const u64 finalized_before_full_try = ring.finalized();
+  assert(ring.try_reserve_batch(
+           span<const u32>{blocked_work.data(), blocked_work.size()}, 3) == 0);
+  // A transient full result cannot retain one item from the batch or publish
+  // any sequence/watermark state.
+  assert(ring.next_sequence() == next_before_full_try);
+  assert(ring.finalized() == finalized_before_full_try);
+  assert(ring.outstanding() == 3);
+
+  // Out-of-order completions do not release contiguous admission credit.
+  ring.complete(2);
+  ring.complete(3);
+  assert(ring.try_reserve_batch(
+           span<const u32>{blocked_work.data(), blocked_work.size()}, 3) == 0);
+  assert(ring.next_sequence() == next_before_full_try);
+
+  ring.complete(1);
+  assert(ring.try_reserve_batch(
+           span<const u32>{blocked_work.data(), blocked_work.size()}, 3) == 4);
+  assert(ring.next_sequence() == 6);
+  ring.complete(5);
+  assert(ring.finalized() == 3);
+  ring.complete(4);
+  assert(ring.finalized() == 5);
+}
+
+void test_sliding_completion_ring_concurrent_try_batches_claim_no_partials() {
+  constexpr size_t kProducers = 4;
+  constexpr size_t kBatchItems = 2;
+  bounded::SlidingCompletionRing ring(kProducers * kBatchItems);
+  const std::array<u32, kBatchItems> work{1, 1};
+  std::barrier start(static_cast<std::ptrdiff_t>(kProducers + 1));
+  std::array<std::future<u64>, kProducers> reservations;
+  for (auto& reservation : reservations) {
+    reservation = std::async(std::launch::async, [&]() {
+      start.arrive_and_wait();
+      return ring.try_reserve_batch(
+        span<const u32>{work.data(), work.size()}, kBatchItems);
+    });
+  }
+  start.arrive_and_wait();
+
+  size_t admitted = 0;
+  u64 first_sequence = 0;
+  for (auto& reservation : reservations) {
+    assert(reservation.wait_for(std::chrono::seconds(1)) ==
+           std::future_status::ready);
+    const u64 sequence = reservation.get();
+    if (sequence != 0) {
+      ++admitted;
+      first_sequence = sequence;
+    }
+  }
+  assert(admitted == 1);
+  assert(first_sequence == 1);
+  assert(ring.next_sequence() == 3);
+  assert(ring.outstanding() == kBatchItems);
+  ring.complete(first_sequence + 1);
+  assert(ring.finalized() == 0);
+  ring.complete(first_sequence);
+  assert(ring.finalized() == 2);
+}
+
 void test_sliding_completion_ring_bounded_smooth_admission() {
   {
     bounded::SlidingCompletionRing ring(8);
@@ -740,6 +812,10 @@ void test_stage1_arm_batch_queue_permit_is_atomic_and_bounded() {
     maintenance_queue_batch_permit_available;
   using memory_node_storage_owner_maintenance_detail::
     maintenance_queue_permit_available;
+  using memory_node_storage_owner_maintenance_detail::
+    release_maintenance_queue_batch_permit;
+  using memory_node_storage_owner_maintenance_detail::
+    try_acquire_maintenance_queue_batch_permit;
 
   constexpr size_t capacity = 8;
   constexpr size_t runnable = 3;
@@ -785,6 +861,26 @@ void test_stage1_arm_batch_queue_permit_is_atomic_and_bounded() {
     shared_runnable, all_reserved - 1, shared_capacity));
   assert(maintenance_queue_batch_permit_available(
     shared_runnable, all_reserved - 1, 1, shared_capacity));
+
+  // The shared account changes only for a complete batch. A failed ring try
+  // releases exactly what it acquired; an oversized attempt is a strict no-op
+  // and cannot leak a partial queue reservation.
+  size_t mutable_reserved = single_reserved;
+  assert(!try_acquire_maintenance_queue_batch_permit(
+    shared_runnable, 3, shared_capacity, mutable_reserved));
+  assert(mutable_reserved == single_reserved);
+  assert(try_acquire_maintenance_queue_batch_permit(
+    shared_runnable, 2, shared_capacity, mutable_reserved));
+  assert(mutable_reserved == all_reserved);
+  assert(!try_acquire_maintenance_queue_batch_permit(
+    shared_runnable, 1, shared_capacity, mutable_reserved));
+  assert(mutable_reserved == all_reserved);
+  assert(release_maintenance_queue_batch_permit(
+    2, mutable_reserved));
+  assert(mutable_reserved == single_reserved);
+  assert(!release_maintenance_queue_batch_permit(
+    2, mutable_reserved));
+  assert(mutable_reserved == single_reserved);
 }
 
 void test_reverse_candidate_is_revalidated_at_locked_write_boundary() {
@@ -948,6 +1044,8 @@ int main() {
   test_completion_pool_timed_wait_is_completion_driven();
   test_sliding_completion_ring();
   test_sliding_completion_ring_atomic_batch_admission();
+  test_sliding_completion_ring_try_batch_is_atomic_and_nonblocking();
+  test_sliding_completion_ring_concurrent_try_batches_claim_no_partials();
   test_sliding_completion_ring_bounded_smooth_admission();
   test_sliding_completion_ring_concurrent_batches_never_partially_admit();
   test_integral_raw_stage2_distance_is_exact();

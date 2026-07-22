@@ -595,6 +595,11 @@ bool MemoryNode::arm_local_stage1_items(
     if (!tasks.empty()) {
       first_sequence = arm_storage_owner_maintenance_batch(tasks, config);
       if (first_sequence == 0) {
+        // Queue/completion admission is try-only. No task was consumed and no
+        // sequence was published, so restore every claimed heavy artifact and
+        // let the bounded Stage1 control retry path back off before rearming.
+        lib_assert(tasks.size() == claimed.size(),
+                   "failed atomic Stage1 admission changed batch ownership");
         for (size_t item = 0; item < claimed.size(); ++item) {
           claimed[item].task = std::move(tasks[item]);
         }
@@ -878,6 +883,8 @@ bool MemoryNode::arm_local_stage1_items(
     const u64 maintenance_sequence =
       arm_storage_owner_maintenance(std::move(task), config);
     if (maintenance_sequence == 0) {
+      // A full queue/window is transient and arm_storage_owner_maintenance
+      // returns ownership instead of waiting on a Stage2 watermark.
       std::lock_guard<std::mutex> lock(prepared_shard.mutex);
       const auto position = prepared_records.find(key);
       if (position != prepared_records.end()) {
