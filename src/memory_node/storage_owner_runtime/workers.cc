@@ -41,20 +41,11 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
   const u32* wire_kinds = mutation
     ? service::storage_owner::mutation_request_kinds(payload) : nullptr;
   scratch.kinds.resize(request->item_count, service::storage_owner::MutationKind::insert);
-  scratch.decoded_vectors.resize(static_cast<size_t>(request->item_count) * config.dim);
   for (u32 item = 0; item < request->item_count; ++item) {
     if (wire_kinds != nullptr) {
       scratch.kinds[item] =
         static_cast<service::storage_owner::MutationKind>(wire_kinds[item]);
     }
-    if (scratch.kinds[item] == service::storage_owner::MutationKind::erase) {
-      continue;
-    }
-    decode_storage_vector_to_float(
-      vectors + static_cast<size_t>(item) * VamanaNode::vector_bytes(),
-      VamanaNode::vector_dtype(),
-      config.dim,
-      scratch.decoded_vectors.data() + static_cast<size_t>(item) * config.dim);
   }
 
   InsertBreakdownCounters breakdown{};
@@ -66,7 +57,6 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
   const bool ok = execute_storage_owner_batch_items(
         ids,
         scratch.kinds.data(),
-        scratch.decoded_vectors.data(),
         vectors,
         stage1_homes,
         request->source_client,

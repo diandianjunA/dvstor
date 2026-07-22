@@ -68,8 +68,10 @@ private:
   std::unordered_map<std::uint64_t, Receipt> records_;
 };
 
-// Models the per-authority completion prefix used before a Stage1 release.
-// RC receive order assigns sequences; workers may complete them out of order.
+// Models the conservative per-authority completion prefix retained by the
+// older release design. RC receive order assigns sequences; workers may
+// complete them out of order. Production Stage1 release below deliberately
+// uses the narrower same-token quiescence condition instead.
 class OrderedCompletionModel {
 public:
   void complete(std::uint64_t sequence) {
@@ -90,6 +92,59 @@ public:
 private:
   std::uint64_t prefix_{};
   std::unordered_set<std::uint64_t> out_of_order_;
+};
+
+enum class ReleaseAttempt : std::uint8_t {
+  retry,
+  resolved,
+};
+
+// Models the receiver-side token quiescence probe.  A release never waits on
+// an older Execute while occupying a worker: it reports retry, preserving the
+// receipt, and the authority reposts the same request ID after backoff.
+class NonblockingStage1ReleaseModel {
+public:
+  void begin_execute(std::uint64_t token) {
+    ++tokens_[token].inflight_execute;
+  }
+
+  void finish_execute(std::uint64_t token) {
+    TokenState& state = tokens_[token];
+    assert(state.inflight_execute != 0);
+    --state.inflight_execute;
+  }
+
+  ReleaseAttempt release(std::uint64_t token, std::uint64_t request_id) {
+    assert(token != 0 && request_id != 0);
+    ++attempts_;
+    TokenState& state = tokens_[token];
+    if (state.release_request_id == 0) {
+      state.release_request_id = request_id;
+    } else {
+      // Transport retry and lost-ACK replay must retain the registry identity
+      // as well as the semantic token.
+      assert(state.release_request_id == request_id);
+    }
+    if (state.inflight_execute != 0) return ReleaseAttempt::retry;
+    state.receipt_present = false;
+    return ReleaseAttempt::resolved;
+  }
+
+  bool receipt_present(std::uint64_t token) const {
+    const auto position = tokens_.find(token);
+    return position == tokens_.end() || position->second.receipt_present;
+  }
+  std::size_t attempts() const { return attempts_; }
+
+private:
+  struct TokenState {
+    std::size_t inflight_execute{};
+    bool receipt_present{true};
+    std::uint64_t release_request_id{};
+  };
+
+  std::unordered_map<std::uint64_t, TokenState> tokens_;
+  std::size_t attempts_{};
 };
 
 struct OperationKey {
@@ -219,6 +274,46 @@ void test_abort_fence_waits_for_parallel_worker_prefix() {
   assert(table.claim(77, {ReceiptPhase::prepared, 0}));
 }
 
+void test_stage1_release_defers_without_blocking_a_worker() {
+  NonblockingStage1ReleaseModel receipt;
+  constexpr std::uint64_t request_id = 91;
+  constexpr std::uint64_t blocked_token = 7;
+  constexpr std::uint64_t independent_token = 8;
+
+  // Keep an Execute live on a separate worker. The release must return retry
+  // before that worker is allowed to finish, rather than waiting on it.
+  std::barrier execute_started(2);
+  std::barrier allow_execute_finish(2);
+  std::thread execute([&]() {
+    receipt.begin_execute(blocked_token);
+    execute_started.arrive_and_wait();
+    allow_execute_finish.arrive_and_wait();
+    receipt.finish_execute(blocked_token);
+  });
+  execute_started.arrive_and_wait();
+  assert(receipt.release(blocked_token, request_id) == ReleaseAttempt::retry);
+  assert(receipt.receipt_present(blocked_token));
+
+  // Quiescence is per semantic token, not a global source-shard prefix.
+  assert(receipt.release(independent_token, request_id + 1) ==
+         ReleaseAttempt::resolved);
+  assert(!receipt.receipt_present(independent_token));
+
+  // Once the older handler quiesces, the identical release request resolves.
+  allow_execute_finish.arrive_and_wait();
+  execute.join();
+  assert(receipt.release(blocked_token, request_id) ==
+         ReleaseAttempt::resolved);
+  assert(!receipt.receipt_present(blocked_token));
+
+  // A lost successful ACK is harmless: replay sees the already-missing
+  // postcondition and resolves again without recreating the receipt.
+  assert(receipt.release(blocked_token, request_id) ==
+         ReleaseAttempt::resolved);
+  assert(!receipt.receipt_present(blocked_token));
+  assert(receipt.attempts() == 4);
+}
+
 void test_cleanup_duplicate_and_lost_release_response() {
   ExplicitReleaseTableModel table(1);
   for (std::uint64_t token = 1; token <= 100'000; ++token) {
@@ -287,6 +382,7 @@ int main() {
   test_sustained_stage1_release_has_no_rate_window();
   test_capacity_tracks_only_true_inflight_operations();
   test_abort_fence_waits_for_parallel_worker_prefix();
+  test_stage1_release_defers_without_blocking_a_worker();
   test_cleanup_duplicate_and_lost_release_response();
   test_stage1_receipts_use_independent_key_shards();
   test_stage1_same_token_claim_is_idempotent_under_concurrency();

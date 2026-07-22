@@ -288,6 +288,33 @@ void MemoryNode::peer_rpc_progress_loop() {
               lib_assert(peer_request_deduplicator_->abandon(
                            decision.lease, peer_id, *header),
                          "Stage1 request lost its dedup lease");
+              const bool sent = try_send_peer_stage1_retry_response(
+                peer_id, *header,
+                span<const byte_t>{payload, expected_bytes});
+              (sent ? peer_stage1_admission_retry_responses_
+                    : peer_stage1_retry_response_drops_)
+                .fetch_add(1, std::memory_order_relaxed);
+            }
+          } else if (decision.action ==
+                       memory_node_detail::PeerRequestAction::duplicate_inflight ||
+                     decision.action ==
+                       memory_node_detail::PeerRequestAction::full) {
+            // Never make an idempotent caller discover transient receiver
+            // pressure only through a 500 ms attempt timeout. A token-complete
+            // retry response is nonblocking and races safely with the original
+            // success response in the same response registry.
+            const bool sent = try_send_peer_stage1_retry_response(
+              peer_id, *header,
+              span<const byte_t>{payload, expected_bytes});
+            if (sent) {
+              (decision.action ==
+                   memory_node_detail::PeerRequestAction::duplicate_inflight
+                 ? peer_stage1_duplicate_retry_responses_
+                 : peer_stage1_admission_retry_responses_)
+                .fetch_add(1, std::memory_order_relaxed);
+            } else {
+              peer_stage1_retry_response_drops_.fetch_add(
+                1, std::memory_order_relaxed);
             }
           }
         }
@@ -534,23 +561,29 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
           .item_index = items[item].token.item_index,
           .client_batch_id = items[item].token.client_batch_id,
         };
-        if (!wait_for_stage1_inflight_quiescence(key)) {
+        if (!stage1_inflight_quiescent(key)) {
           release_quiesced = false;
           break;
         }
       }
     }
     bool success = false;
+    if (release_barrier && !release_quiesced) {
+      peer_stage1_release_deferred_batches_.fetch_add(
+        1, std::memory_order_relaxed);
+      peer_stage1_release_deferred_items_.fetch_add(
+        task.header.item_count, std::memory_order_relaxed);
+    }
     if (release_quiesced && request_type ==
         service::storage_owner::PeerRpcType::stage1_execute_request) {
       success = handle_peer_stage1_execute_request(
         task.source_shard, task.header, task.payload.data(), config);
-    } else if (release_quiesced && request_type ==
+    } else if (request_type ==
                service::storage_owner::PeerRpcType::stage1_arm_request) {
       success = handle_peer_stage1_arm_request(
         task.source_shard, task.header,
         service::storage_owner::stage1_arm_items(task.payload.data()),
-        config);
+        release_quiesced, config);
     }
     // Stage1 payloads live in the bounded operation table and arm is
     // idempotent there, so a same-ID retry can be executed safely. Large
@@ -586,10 +619,12 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
       }
     }
     completion.changed.notify_all();
+    // `processed` counts consumed RPCs, including an explicit retry response.
+    // The handlers count each per-token ok result directly, including mixed
+    // responses; charging item_count only when the aggregate bool was true
+    // made partial progress invisible and distorted retry amplification.
     peer_stage1_processed_.fetch_add(1, std::memory_order_relaxed);
-    if (success) {
-      peer_stage1_items_.fetch_add(task.header.item_count, std::memory_order_relaxed);
-    }
+    (void)success;
     peer_stage1_tasks_cv_.notify_one();
   }
 }

@@ -164,22 +164,14 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id,
   for (u32 i = 0; i < request->item_count && kinds_raw != nullptr; ++i) {
     kinds[i] = static_cast<service::storage_owner::MutationKind>(kinds_raw[i]);
   }
-  vec<element_t> decoded_vectors(static_cast<size_t>(request->item_count) * config.dim);
-  for (u32 i = 0; i < request->item_count; ++i) {
-    if (kinds[i] == service::storage_owner::MutationKind::erase) continue;
-    decode_storage_vector_to_float(raw_vectors + static_cast<size_t>(i) * VamanaNode::vector_bytes(),
-                                   VamanaNode::vector_dtype(),
-                                   config.dim,
-                                   decoded_vectors.data() + static_cast<size_t>(i) * config.dim);
-  }
   InsertBreakdownCounters breakdown{};
   vec<vec<u64>> invalidated_neighbors;
   vec<u32> item_statuses(request->item_count, static_cast<u32>(service::storage_owner::MutationStatus::failed));
   vec<service::storage_owner::MutationResult> mutation_results(request->item_count);
   mark_storage_owner_foreground_activity();
   storage_owner_insert_active_workers_.fetch_add(1, std::memory_order_acq_rel);
-  const bool ok = execute_storage_owner_batch_items(ids, kinds.data(), decoded_vectors.data(),
-                                                    raw_vectors, stage1_homes,
+  const bool ok = execute_storage_owner_batch_items(ids, kinds.data(), raw_vectors,
+                                                    stage1_homes,
                                                     request->source_client,
                                                     request->batch_id,
                                                     request->item_count,
@@ -222,7 +214,6 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id,
 
 bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
                                        const service::storage_owner::MutationKind* kinds,
-                                       const element_t* vectors,
                                        const byte_t* raw_vectors,
                                        const u32* stage1_homes,
                                        u32 source_client,
@@ -239,8 +230,8 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   lib_assert(stage1_homes != nullptr,
              "two-stage mutation request omitted physical Stage1 homes");
 
-  lib_assert(ids != nullptr && kinds != nullptr && vectors != nullptr &&
-               raw_vectors != nullptr && client_batch_id != 0,
+  lib_assert(ids != nullptr && kinds != nullptr && raw_vectors != nullptr &&
+               client_batch_id != 0,
              "two-stage authority request omitted mutation identity or vectors");
   lib_assert(storage_owner_maintenance_enabled(config),
              "two-stage updates require the Stage2 maintenance runtime");
@@ -510,12 +501,16 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       u32 home, span<const Stage1ExecuteItem> home_items,
       span<const Stage1ExecuteResult> home_results) {
     const auto found = stage1_groups.find(home);
-    lib_assert(found != stage1_groups.end() &&
-                 found->second.size() == home_items.size() &&
+    lib_assert(found != stage1_groups.end() && !home_items.empty() &&
                  home_results.size() == home_items.size(),
                "Stage1 execute fanout lost its home-to-authority mapping");
-    for (size_t slot = 0; slot < found->second.size(); ++slot) {
-      const size_t index = found->second[slot];
+    for (size_t slot = 0; slot < home_items.size(); ++slot) {
+      // A physical-home response may contain only the tokens that resolved in
+      // this wave. Map by the immutable public item index rather than by the
+      // original home-batch slot; retrying siblings are intentionally absent.
+      const size_t index = home_items[slot].item_index;
+      lib_assert(index < plans.size(),
+                 "Stage1 partial callback referenced an invalid mutation");
       MutationPlan& plan = plans[index];
       lib_assert(plan.stage1_home == home &&
                    plan.stage1_item.client_batch_id ==
@@ -705,37 +700,84 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   }
   if (!local_fused_items.empty()) {
     const auto arm_started = std::chrono::steady_clock::now();
-    for (;;) {
-      vec<Stage1ArmResult> arm_results;
-      (void)arm_local_stage1_items(
-        storage_id_, span<const Stage1ArmItem>{local_fused_items},
-        arm_results, config);
-      const auto disposition =
-        memory_node_peer_rpc_detail::classify_stage1_control_response(
-          span<const Stage1ArmItem>{local_fused_items},
-          span<const Stage1ArmResult>{arm_results});
-      if (disposition == memory_node_peer_rpc_detail::
-            Stage1ControlResponseDisposition::resolved) {
-        for (size_t slot = 0; slot < local_fused_indices.size(); ++slot) {
+    vec<Stage1ArmResult> arm_results;
+    (void)arm_local_stage1_items(
+      storage_id_, span<const Stage1ArmItem>{local_fused_items},
+      arm_results, config);
+    const auto batch_disposition =
+      memory_node_peer_rpc_detail::classify_stage1_control_response(
+        span<const Stage1ArmItem>{local_fused_items},
+        span<const Stage1ArmResult>{arm_results});
+    if (batch_disposition == memory_node_peer_rpc_detail::
+          Stage1ControlResponseDisposition::malformed) {
+      throw std::runtime_error(
+        "local fused Stage1 arm returned a malformed result");
+    }
+    if (batch_disposition == memory_node_peer_rpc_detail::
+          Stage1ControlResponseDisposition::resolved) {
+      // Uncontended fast path: retain one completion-ring reservation and one
+      // maintenance-queue transaction for the complete local subgroup.
+      for (size_t slot = 0; slot < local_fused_indices.size(); ++slot) {
+        MutationPlan& plan = plans[local_fused_indices[slot]];
+        plan.arm_result = arm_results[slot];
+        plan.stage1_result.maintenance_sequence =
+          arm_results[slot].maintenance_sequence;
+        commit_plan(local_fused_indices[slot]);
+      }
+    } else {
+      // The authority is also this physical home for roughly one shard's
+      // worth of updates. Do not leave that subset behind the old atomic ARM
+      // retry loop: sweep size-one try-admissions, commit every success
+      // immediately so Stage2 can return its credit, and retain only retrying
+      // slots for the next sweep.
+      vec<size_t> pending_slots(local_fused_items.size());
+      for (size_t slot = 0; slot < pending_slots.size(); ++slot) {
+        pending_slots[slot] = slot;
+      }
+      vec<Stage1ArmResult> one_result;
+      one_result.reserve(1);
+      while (!pending_slots.empty()) {
+        bool made_progress = false;
+        vec<size_t> retry_slots;
+        retry_slots.reserve(pending_slots.size());
+        for (const size_t slot : pending_slots) {
+          const Stage1ArmItem& arm_item = local_fused_items[slot];
+          (void)arm_local_stage1_items(
+            storage_id_, span<const Stage1ArmItem>{&arm_item, 1},
+            one_result, config);
+          const auto disposition =
+            memory_node_peer_rpc_detail::classify_stage1_control_response(
+              span<const Stage1ArmItem>{&arm_item, 1},
+              span<const Stage1ArmResult>{one_result});
+          if (disposition == memory_node_peer_rpc_detail::
+                Stage1ControlResponseDisposition::malformed) {
+            throw std::runtime_error(
+              "local partial fused Stage1 arm returned a malformed result");
+          }
+          if (disposition == memory_node_peer_rpc_detail::
+                Stage1ControlResponseDisposition::retry) {
+            retry_slots.push_back(slot);
+            continue;
+          }
           MutationPlan& plan = plans[local_fused_indices[slot]];
-          plan.arm_result = arm_results[slot];
+          plan.arm_result = one_result.front();
           plan.stage1_result.maintenance_sequence =
-            arm_results[slot].maintenance_sequence;
+            one_result.front().maintenance_sequence;
           commit_plan(local_fused_indices[slot]);
+          made_progress = true;
         }
-        break;
+        pending_slots = std::move(retry_slots);
+        if (pending_slots.empty()) break;
+        if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+          return false;
+        }
+        if (!made_progress) {
+          std::unique_lock<std::mutex> lock(
+            storage_owner_maintenance_mutex_);
+          storage_owner_maintenance_cv_.wait_for(
+            lock, std::chrono::microseconds(100));
+        }
       }
-      if (disposition == memory_node_peer_rpc_detail::
-            Stage1ControlResponseDisposition::malformed) {
-        throw std::runtime_error(
-          "local fused Stage1 arm returned a malformed result");
-      }
-      if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
-        return false;
-      }
-      std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
-      storage_owner_maintenance_cv_.wait_for(
-        lock, std::chrono::microseconds(100));
     }
     breakdown.storage_owner_stage1_arm_wait_ns +=
       elapsed_ns_since(arm_started);

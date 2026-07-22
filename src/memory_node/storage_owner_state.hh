@@ -179,7 +179,6 @@ struct StorageOwnerResponseReady {
 
 struct StorageOwnerRequestScratch {
   vec<service::storage_owner::MutationKind> kinds;
-  vec<element_t> decoded_vectors;
   vec<vec<u64>> invalidated_neighbors;
   vec<u32> statuses;
   vec<service::storage_owner::MutationResult> results;
@@ -187,7 +186,6 @@ struct StorageOwnerRequestScratch {
 
   void clear() {
     kinds.clear();
-    decoded_vectors.clear();
     invalidated_neighbors.clear();
     statuses.clear();
     results.clear();

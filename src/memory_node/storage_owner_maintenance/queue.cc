@@ -385,9 +385,11 @@ bool MemoryNode::try_acquire_storage_owner_maintenance_slot(
   // This counter is the global number of live stage2 contexts, not the number
   // of physical workers. Each maintenance executor owns a fixed rpc-depth
   // context pool; peer send credits are independently bounded and try-only.
-  // Under foreground pressure, retain one escape context per dedicated
-  // maintenance worker. A zero-context policy deadlocks when Stage1 producers
-  // themselves are waiting for the ordered maintenance window to advance.
+  // Under foreground pressure, retain bounded two-context latency-hiding
+  // headroom per dedicated maintenance worker. A zero-context policy deadlocks
+  // when Stage1 producers themselves wait for the ordered maintenance window
+  // to advance, while a one-context policy left available RDMA/scratch lanes
+  // idle on the colocated deployment.
   const size_t admitted_contexts = stage2_context_admission_limit(
     storage_owner_maintenance_worker_states_.size(),
     config.storage_owner_rpc_depth, foreground_pressure);

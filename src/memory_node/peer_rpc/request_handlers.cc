@@ -168,8 +168,8 @@ bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
       }
     }
     // Production callers send homogeneous control batches. Reject a mixed
-    // release/mutation message at the trust boundary so its wait semantics
-    // cannot be ambiguous.
+    // release/mutation message at the trust boundary so its quiescence
+    // semantics cannot be ambiguous.
     if (saw_release && saw_non_release) return false;
   } else {
     return false;

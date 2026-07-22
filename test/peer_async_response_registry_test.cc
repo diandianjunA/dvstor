@@ -173,6 +173,45 @@ void test_retry_generation_and_cancelled_descriptor() {
   assert(!registry.cancel(23).has_value());
 }
 
+void test_transient_response_keeps_late_same_attempt_delivery_open() {
+  detail::PeerAsyncResponseRegistry registry(2);
+  constexpr auto type = protocol::PeerRpcType::stage1_execute_response;
+  constexpr u64 request_id = 24;
+  constexpr u32 shard = 3;
+  constexpr u32 item_count = 5;
+  assert(registry.register_request(request_id, shard, type, item_count) ==
+         detail::PeerResponseRegistration::registered);
+
+  // A synthetic all-retry response can arrive while the original Stage1
+  // handler is still running. Its descriptor is consumed and reposted, but
+  // no second send is posted during the sender's retry backoff.
+  const auto transient = response(
+    request_id, shard, type, item_count, protocol::InsertStatus::overloaded);
+  assert(registry.try_deliver(shard, 2, sizeof(transient), transient));
+  detail::PeerResponseDescriptor descriptor;
+  detail::PeerResponseLease transient_lease;
+  assert(registry.try_take(
+           request_id, shard, type, item_count, descriptor,
+           transient_lease) == detail::TryPeerResponse::failure);
+  assert(!registry.await_late_delivery(transient_lease));
+  assert(registry.mark_receive_reposted(transient_lease));
+  assert(registry.await_late_delivery(transient_lease));
+  assert(!registry.ack_consumed(transient_lease));
+
+  // The original success is accepted immediately in the pending backoff
+  // interval. In particular, this does not call register_send_attempt().
+  const auto success = response(request_id, shard, type, item_count);
+  assert(registry.try_deliver(shard, 3, sizeof(success), success));
+  detail::PeerResponseLease success_lease;
+  assert(registry.try_take(
+           request_id, shard, type, item_count, descriptor,
+           success_lease) == detail::TryPeerResponse::success);
+  assert(success_lease.generation != transient_lease.generation);
+  assert(!registry.await_late_delivery(transient_lease));
+  assert(registry.mark_receive_reposted(success_lease));
+  assert(registry.ack_consumed(success_lease));
+}
+
 void test_response_slab_aba_and_late_response() {
   detail::PeerAsyncResponseRegistry registry(2);
   constexpr auto type = protocol::PeerRpcType::cleanup_deleted_response;
@@ -346,6 +385,7 @@ void test_dedup_inflight_capacity_and_high_churn_fifo() {
 int main() {
   test_registration_delivery_and_explicit_consumption();
   test_retry_generation_and_cancelled_descriptor();
+  test_transient_response_keeps_late_same_attempt_delivery_open();
   test_response_slab_aba_and_late_response();
   test_shutdown_drain_respects_receive_ownership();
   test_response_high_churn_has_no_probe_cliff();

@@ -3,6 +3,43 @@
 
 namespace authority = memory_node_storage_owner_index_detail;
 
+bool MemoryNode::try_send_peer_stage1_retry_response(
+    u32 destination_shard,
+    const service::storage_owner::PeerRpcHeader& header,
+    span<const byte_t> request) {
+  using namespace service::storage_owner;
+  const auto request_type = static_cast<PeerRpcType>(header.type);
+  const size_t response_bytes = request_type ==
+      PeerRpcType::stage1_execute_request
+    ? stage1_execute_response_bytes(header.item_count)
+    : request_type == PeerRpcType::stage1_arm_request
+      ? stage1_arm_response_bytes(header.item_count) : 0;
+  if (destination_shard >= num_storage_nodes_ ||
+      destination_shard == storage_id_ || response_bytes == 0 ||
+      response_bytes > peer_rpc_runtime_.message_bytes) {
+    return false;
+  }
+
+  u32 slot_id = 0;
+  if (!try_acquire_peer_rpc_send_slot(
+        destination_shard, PeerRpcSendClass::control, slot_id)) {
+    return false;
+  }
+  byte_t* destination = peer_rpc_runtime_.buffer.get_full_buffer() +
+    peer_rpc_async_send_offset(destination_shard, slot_id);
+  if (!memory_node_peer_rpc_detail::write_stage1_retry_response(
+        storage_id_, header, request,
+        span<byte_t>{destination, response_bytes})) {
+    release_peer_rpc_send_slot(destination_shard, slot_id);
+    return false;
+  }
+  // This path runs on the CQ progress thread. Use an asynchronous registered
+  // send slot; send_peer_rpc_message() intentionally forbids its blocking
+  // completion wait here.
+  post_peer_rpc_send_slot(destination_shard, slot_id, response_bytes);
+  return true;
+}
+
 service::storage_owner::Stage1ExecuteResult
 MemoryNode::prepare_local_stage1_item(
     u32 authority_shard,
@@ -247,6 +284,14 @@ void MemoryNode::finish_stage1_inflight_request(
   inflight.changed.notify_all();
 }
 
+bool MemoryNode::stage1_inflight_quiescent(
+    const Stage1OperationKey& key) {
+  Stage1InflightRequestShard& inflight = stage1_inflight_requests_[
+    Stage1OperationKeyHash{}(key) & (kStage1PreparedShardCount - 1)];
+  std::lock_guard<std::mutex> lock(inflight.mutex);
+  return inflight.counts.find(key) == inflight.counts.end();
+}
+
 bool MemoryNode::wait_for_stage1_inflight_quiescence(
     const Stage1OperationKey& key) {
   Stage1InflightRequestShard& inflight = stage1_inflight_requests_[
@@ -294,7 +339,6 @@ bool MemoryNode::handle_peer_stage1_execute_request(
   vec<Stage1ArmItem> fused_arm_items;
   fused_result_indices.reserve(header.item_count);
   fused_arm_items.reserve(header.item_count);
-  bool fused_prepare_retry = false;
 
   for (u32 index = 0; index < header.item_count; ++index) {
     const Stage1ExecuteItem& item = items[index];
@@ -306,7 +350,6 @@ bool MemoryNode::handle_peer_stage1_execute_request(
       continue;
     }
     if (output[index].status == static_cast<u32>(MutationStatus::retry)) {
-      fused_prepare_retry = true;
       continue;
     }
     if (output[index].status == static_cast<u32>(MutationStatus::ok)) {
@@ -326,58 +369,76 @@ bool MemoryNode::handle_peer_stage1_execute_request(
     }
   }
 
-  if (fused_prepare_retry) {
-    // Do not let the ready prefix consume Stage2 completion credits while the
-    // authority still lacks a response for another item in this transaction.
-    // Cached prepares make retrying the complete semantic request cheap.
-    for (u32 index = 0; index < header.item_count; ++index) {
-      if (memory_node_peer_rpc_detail::stage1_execute_uses_fused_arm(
-            items[index])) {
-        memory_node_peer_rpc_detail::
-          defer_fused_stage1_success_for_atomic_retry(output[index]);
-      }
-    }
-  } else if (!fused_arm_items.empty()) {
+  if (!fused_arm_items.empty()) {
+    // Transport batching does not make sibling mutation tokens atomic. Arm
+    // every prepared token now even when another prepare returned transient
+    // retry. The authority commits/releases this successful subset and sends a
+    // compact retry containing only the unfinished semantic tokens. This
+    // prevents one hot token from repeatedly consuming CPU for every ready
+    // sibling while preserving the same bounded batch admission for the ready
+    // subset itself.
+    // Keep the one-lock/one-sequence-range fast path when the complete ready
+    // subset fits. Under completion-window pressure the atomic batch returns
+    // retry without consuming any task, so fall back to size-one admission.
+    // That fallback admits every token for which credit exists and produces a
+    // truthful mixed ok/retry response; receipt replay consumes no new credit.
     vec<Stage1ArmResult> arm_results;
-    const bool armed = arm_local_stage1_items(
+    (void)arm_local_stage1_items(
       source_shard, span<const Stage1ArmItem>{fused_arm_items},
       arm_results, config);
-    const bool complete_results =
-      arm_results.size() == fused_arm_items.size();
+    const bool batch_fast_path =
+      arm_results.size() == fused_arm_items.size() &&
+      std::all_of(
+        arm_results.begin(), arm_results.end(), [](const Stage1ArmResult& result) {
+          return result.status == static_cast<u32>(MutationStatus::ok);
+        });
+    if (!batch_fast_path) arm_results.clear();
+    arm_results.reserve(fused_arm_items.size());
+    vec<Stage1ArmResult> one_result;
+    one_result.reserve(1);
     for (size_t slot = 0; slot < fused_result_indices.size(); ++slot) {
       Stage1ExecuteResult& execute = output[fused_result_indices[slot]];
-      if (!complete_results) {
-        execute.maintenance_sequence = 0;
-        execute.status = static_cast<u32>(MutationStatus::failed);
-        continue;
-      }
       const Stage1ArmItem& arm = fused_arm_items[slot];
-      const Stage1ArmResult& result = arm_results[slot];
-      const bool same_token =
-        result.token.source_client == arm.token.source_client &&
-        result.token.item_index == arm.token.item_index &&
-        result.token.client_batch_id == arm.token.client_batch_id;
-      if (!same_token || result.target_raw != arm.target_raw ||
-          result.reserved != 0 ||
-          result.status > static_cast<u32>(MutationStatus::retry) ||
-          (result.status == static_cast<u32>(MutationStatus::ok) &&
-           result.maintenance_sequence == 0) ||
-          (result.status != static_cast<u32>(MutationStatus::ok) &&
-           result.maintenance_sequence != 0)) {
+      const Stage1ArmResult* result = nullptr;
+      if (batch_fast_path) {
+        result = &arm_results[slot];
+      } else {
+        (void)arm_local_stage1_items(
+          source_shard, span<const Stage1ArmItem>{&arm, 1},
+          one_result, config);
+        if (one_result.size() == 1) result = &one_result.front();
+      }
+      if (result == nullptr) {
         execute.maintenance_sequence = 0;
         execute.status = static_cast<u32>(MutationStatus::failed);
         continue;
       }
-      execute.maintenance_sequence = result.maintenance_sequence;
-      execute.status = result.status;
+      const bool same_token =
+        result->token.source_client == arm.token.source_client &&
+        result->token.item_index == arm.token.item_index &&
+        result->token.client_batch_id == arm.token.client_batch_id;
+      if (!same_token || result->target_raw != arm.target_raw ||
+          result->reserved != 0 ||
+          result->status > static_cast<u32>(MutationStatus::retry) ||
+          (result->status == static_cast<u32>(MutationStatus::ok) &&
+           result->maintenance_sequence == 0) ||
+          (result->status != static_cast<u32>(MutationStatus::ok) &&
+           result->maintenance_sequence != 0)) {
+        execute.maintenance_sequence = 0;
+        execute.status = static_cast<u32>(MutationStatus::failed);
+        continue;
+      }
+      execute.maintenance_sequence = result->maintenance_sequence;
+      execute.status = result->status;
     }
-    (void)armed;
   }
 
   response_header->status = static_cast<u32>(InsertStatus::ok);
   for (u32 index = 0; index < header.item_count; ++index) {
     if (output[index].status != static_cast<u32>(MutationStatus::ok)) {
       response_header->status = static_cast<u32>(InsertStatus::overloaded);
+    } else {
+      peer_stage1_items_.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
@@ -389,6 +450,7 @@ bool MemoryNode::handle_peer_stage1_arm_request(
     u32 source_shard,
     const service::storage_owner::PeerRpcHeader& header,
     const service::storage_owner::Stage1ArmItem* items,
+    bool release_quiesced,
     const Configuration& config) {
   using namespace service::storage_owner;
   if (items == nullptr || header.item_count == 0 ||
@@ -397,9 +459,50 @@ bool MemoryNode::handle_peer_stage1_arm_request(
   }
 
   vec<Stage1ArmResult> results;
-  const bool processed = arm_local_stage1_items(
-    source_shard, span<const Stage1ArmItem>{items, header.item_count},
-    results, config);
+  bool processed = true;
+  if (release_quiesced) {
+    processed = arm_local_stage1_items(
+      source_shard, span<const Stage1ArmItem>{items, header.item_count},
+      results, config);
+  } else {
+    // A release is an ordered observation, not work that should occupy a
+    // Stage1 executor while an older same-token Execute finishes. Probe each
+    // token independently: quiescent receipts can be erased now, while only
+    // the still-live tokens return retry. This preserves every per-token QP
+    // watermark and prevents one slow Execute from replaying an entire release
+    // group or delaying the next compact Execute wave.
+    processed = true;
+    results.assign(header.item_count, {});
+    vec<Stage1ArmResult> one_result;
+    one_result.reserve(1);
+    for (u32 index = 0; index < header.item_count; ++index) {
+      const Stage1OperationKey key{
+        .authority_shard = source_shard,
+        .source_client = items[index].token.source_client,
+        .item_index = items[index].token.item_index,
+        .client_batch_id = items[index].token.client_batch_id,
+      };
+      if (!stage1_inflight_quiescent(key)) {
+        results[index].token = items[index].token;
+        results[index].target_raw = items[index].target_raw;
+        results[index].status = static_cast<u32>(MutationStatus::retry);
+        processed = false;
+        continue;
+      }
+      const bool one_processed = arm_local_stage1_items(
+        source_shard, span<const Stage1ArmItem>{items + index, 1},
+        one_result, config);
+      if (one_result.size() != 1) {
+        results[index].token = items[index].token;
+        results[index].target_raw = items[index].target_raw;
+        results[index].status = static_cast<u32>(MutationStatus::failed);
+        processed = false;
+        continue;
+      }
+      results[index] = one_result.front();
+      processed &= one_processed;
+    }
+  }
   const size_t bytes = stage1_arm_response_bytes(header.item_count);
   vec<byte_t> response(bytes, 0);
   auto* response_header = reinterpret_cast<PeerRpcHeader*>(
@@ -417,6 +520,11 @@ bool MemoryNode::handle_peer_stage1_arm_request(
   if (results.size() == header.item_count) {
     std::memcpy(stage1_arm_results(response.data()), results.data(),
                 results.size() * sizeof(results[0]));
+    for (const Stage1ArmResult& result : results) {
+      if (result.status == static_cast<u32>(MutationStatus::ok)) {
+        peer_stage1_items_.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
   }
   send_peer_rpc_message(source_shard, response.data(), response.size());
   return processed;
@@ -683,9 +791,10 @@ bool MemoryNode::arm_local_stage1_items(
       if (position == prepared_records.end()) {
         // A lost release response is retried with the same token. Missing is
         // therefore the successful idempotent postcondition. Remote release
-        // arrives after every same-token execute retry on the authority's RC
-        // QP and waits for the tracked requests, so an older retry cannot
-        // recreate the receipt after this ACK.
+        // arrives after every same-token Execute retry on the authority's RC
+        // QP. The worker only enters this erase path after its per-token
+        // quiescence probe succeeds; otherwise it returns an explicit retry.
+        // An older Execute therefore cannot recreate the receipt after ACK.
         output.status = static_cast<u32>(MutationStatus::ok);
         continue;
       }
@@ -935,8 +1044,9 @@ bool MemoryNode::release_resolved_local_stage1_receipt(
   // A remote authority may have an older same-token execute retry that has
   // not reached this process's receive CQ yet.  A local in-flight count of
   // zero cannot prove that transport watermark.  The authority therefore
-  // sends a release marker after commit on the same RC QP as every execute;
-  // the peer Stage1 worker performs the actual quiescence wait and erase.
+  // sends a release marker after commit on the same RC QP as every Execute;
+  // the peer Stage1 worker probes per-token quiescence and either erases or
+  // returns retry without blocking its executor.
   // Stage2 must not race that ordered marker with a locally inferred erase.
   if (task.authority_shard != storage_id_) return true;
 

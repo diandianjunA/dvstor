@@ -159,6 +159,8 @@ private:
     u64 full_batches{};
     u64 tail_escape_batches{};
     u64 max_wait_flush_batches{};
+    u64 occupancy_flush_batches{};
+    u64 adaptive_wait_flush_batches{};
     // A later producer may publish behind a reserved-but-invisible FIFO head.
     // These counters distinguish that transient MPMC condition from remote
     // RPC or storage-maintenance stalls.

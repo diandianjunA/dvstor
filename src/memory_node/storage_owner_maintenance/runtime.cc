@@ -768,6 +768,24 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                " peer_stage1_max_queue=" +
                std::to_string(peer_stage1_max_queue_.load(
                  std::memory_order_relaxed)) +
+               " peer_stage1_active_workers=" +
+               std::to_string(peer_stage1_active_workers_.load(
+                 std::memory_order_relaxed)) +
+               " peer_stage1_release_deferred_batches=" +
+               std::to_string(peer_stage1_release_deferred_batches_.load(
+                 std::memory_order_relaxed)) +
+               " peer_stage1_release_deferred_items=" +
+               std::to_string(peer_stage1_release_deferred_items_.load(
+                 std::memory_order_relaxed)) +
+               " peer_stage1_duplicate_retry_responses=" +
+               std::to_string(peer_stage1_duplicate_retry_responses_.load(
+                 std::memory_order_relaxed)) +
+               " peer_stage1_admission_retry_responses=" +
+               std::to_string(peer_stage1_admission_retry_responses_.load(
+                 std::memory_order_relaxed)) +
+               " peer_stage1_retry_response_drops=" +
+               std::to_string(peer_stage1_retry_response_drops_.load(
+                 std::memory_order_relaxed)) +
                " peer_reverse_enqueued=" +
                std::to_string(peer_reverse_enqueued) +
                " peer_reverse_processed=" +

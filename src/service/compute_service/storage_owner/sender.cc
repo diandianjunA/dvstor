@@ -127,6 +127,8 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
       state.full_batches += dequeued == batch_max;
       state.tail_escape_batches += decision.tail_escape;
       state.max_wait_flush_batches += decision.max_wait_flush;
+      state.occupancy_flush_batches += decision.occupancy_flush;
+      state.adaptive_wait_flush_batches += decision.adaptive_wait_flush;
       const u32 remaining_published = state.published_tasks.load(
         std::memory_order_acquire);
       state.oldest_published_observed_ns =
@@ -146,6 +148,10 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
                   << " tail_escape_batches=" << state.tail_escape_batches
                   << " max_wait_flush_batches="
                   << state.max_wait_flush_batches
+                  << " occupancy_flush_batches="
+                  << state.occupancy_flush_batches
+                  << " adaptive_wait_flush_batches="
+                  << state.adaptive_wait_flush_batches
                   << " queue_visibility_stalls="
                   << state.queue_visibility_stalls
                   << " partial_visible_batches="

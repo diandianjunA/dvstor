@@ -86,7 +86,8 @@ struct PeerHashProbeTelemetry {
 // buckets and uses backward-shift deletion, so cumulative request churn never
 // leaves tombstones and the index load is bounded by 0.5. try_take() leases a
 // descriptor instead of deleting it: the operation-specific parser must call
-// ack_consumed() or retry() with that exact generation.
+// ack_consumed(), retry(), or await_late_delivery() with that exact
+// generation.
 class PeerAsyncResponseRegistry {
 public:
   explicit PeerAsyncResponseRegistry(size_t requested_capacity)
@@ -238,6 +239,25 @@ public:
     Slot& slot = slots_[lease.slot];
     slot.response = {};
     slot.state = State::retryable;
+    advance_generation(slot);
+    return true;
+  }
+
+  // Consume a valid transient response while continuing to wait for another
+  // response from work that may already be in flight under the same request
+  // ID and metadata. Unlike retry(), this transition becomes pending
+  // immediately: no subsequent register_send_attempt() is required before a
+  // late response can be delivered. The generation change invalidates the
+  // consumed descriptor's lease without changing the request identity.
+  bool await_late_delivery(PeerResponseLease lease) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!valid_lease_locked(lease, State::consuming) ||
+        slots_[lease.slot].receive_descriptor_held) {
+      return false;
+    }
+    Slot& slot = slots_[lease.slot];
+    slot.response = {};
+    slot.state = State::pending;
     advance_generation(slot);
     return true;
   }

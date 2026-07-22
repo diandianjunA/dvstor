@@ -97,8 +97,9 @@ class MemoryNode {
     memory_node_detail::PeerRequestLease dedup_lease{};
     vec<byte_t> payload;
     // Execute/arm/abort tokens tracked by the bounded per-operation in-flight
-    // table. Release tokens are deliberately excluded: a release waits for
-    // this table to become empty before erasing the semantic receipt.
+    // table. Release tokens are deliberately excluded: a release probes this
+    // table and returns an explicit retry while an older same-token operation
+    // remains, rather than occupying a worker while it waits.
     vec<service::storage_owner::AuthorityOperationToken> operation_tokens;
     std::chrono::steady_clock::time_point received_at{};
   };
@@ -482,6 +483,10 @@ private:
       const service::storage_owner::PeerRpcHeader& header,
       const byte_t* payload,
       const Configuration& config);
+  bool try_send_peer_stage1_retry_response(
+      u32 destination_shard,
+      const service::storage_owner::PeerRpcHeader& header,
+      span<const byte_t> request);
   service::storage_owner::Stage1ExecuteResult prepare_local_stage1_item(
       u32 authority_shard,
       const service::storage_owner::Stage1ExecuteItem& item,
@@ -497,6 +502,7 @@ private:
       InsertBreakdownCounters* breakdown = nullptr);
   bool try_track_stage1_inflight_request(const Stage1OperationKey& key);
   void finish_stage1_inflight_request(const Stage1OperationKey& key);
+  bool stage1_inflight_quiescent(const Stage1OperationKey& key);
   bool wait_for_stage1_inflight_quiescence(const Stage1OperationKey& key);
   bool release_resolved_local_stage1_receipt(
       const StorageOwnerMaintenanceTask& task,
@@ -505,6 +511,7 @@ private:
       u32 source_shard,
       const service::storage_owner::PeerRpcHeader& header,
       const service::storage_owner::Stage1ArmItem* items,
+      bool release_quiesced,
       const Configuration& config);
   bool arm_local_stage1_items(
       u32 authority_shard,
@@ -578,6 +585,7 @@ private:
     PeerResponseLease& lease);
   bool acknowledge_peer_rpc_response(PeerResponseLease lease);
   bool rearm_peer_rpc_response(PeerResponseLease lease);
+  bool await_late_peer_rpc_response(PeerResponseLease lease);
   void cancel_peer_rpc_response(u64 request_id);
   u64 allocate_peer_request_id();
   bool send_reconcile_reverse_fanout_and_wait(
@@ -724,7 +732,6 @@ private:
                                        const Configuration& config);
   bool execute_storage_owner_batch_items(const node_t* ids,
                                          const service::storage_owner::MutationKind* kinds,
-                                         const element_t* vectors,
                                          const byte_t* raw_vectors,
                                          const u32* stage1_homes,
                                          u32 source_client,
@@ -1073,6 +1080,11 @@ private:
   std::atomic<u64> peer_stage1_processed_{0};
   std::atomic<u64> peer_stage1_items_{0};
   std::atomic<u64> peer_stage1_max_queue_{0};
+  std::atomic<u64> peer_stage1_release_deferred_batches_{0};
+  std::atomic<u64> peer_stage1_release_deferred_items_{0};
+  std::atomic<u64> peer_stage1_duplicate_retry_responses_{0};
+  std::atomic<u64> peer_stage1_admission_retry_responses_{0};
+  std::atomic<u64> peer_stage1_retry_response_drops_{0};
   std::atomic<u32> peer_stage1_active_workers_{0};
   std::array<Stage1PreparedResultShard,
              kStage1PreparedShardCount> stage1_prepared_results_;

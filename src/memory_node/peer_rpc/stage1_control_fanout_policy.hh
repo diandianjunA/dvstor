@@ -2,10 +2,94 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 
 #include "service/storage_owner_protocol.hh"
 
 namespace memory_node_peer_rpc_detail {
+
+// Build a fully self-describing transient Stage1 response directly from the
+// validated request bytes. CQ progress uses this when a same-ID request is
+// already executing or bounded queue admission fails. An explicit response
+// lets the authority back off immediately instead of waiting for an attempt
+// timeout, while all semantic fields remain available for token validation.
+inline bool write_stage1_retry_response(
+    u32 response_source_shard,
+    const service::storage_owner::PeerRpcHeader& request_header,
+    span<const byte_t> request,
+    span<byte_t> response) noexcept {
+  using namespace service::storage_owner;
+  if (request_header.item_count == 0 || request_header.request_id == 0 ||
+      request_header.reserved != 0) {
+    return false;
+  }
+  const auto request_type = static_cast<PeerRpcType>(request_header.type);
+  const bool execute = request_type == PeerRpcType::stage1_execute_request;
+  const bool control = request_type == PeerRpcType::stage1_arm_request;
+  if (!execute && !control) return false;
+
+  const size_t expected_request_bytes = execute
+    ? stage1_execute_request_bytes(request_header.item_count)
+    : stage1_arm_request_bytes(request_header.item_count);
+  const size_t expected_response_bytes = execute
+    ? stage1_execute_response_bytes(request_header.item_count)
+    : stage1_arm_response_bytes(request_header.item_count);
+  if (request.size() != expected_request_bytes ||
+      response.size() != expected_response_bytes) {
+    return false;
+  }
+
+  std::fill(response.begin(), response.end(), byte_t{});
+  auto* response_header = reinterpret_cast<PeerRpcHeader*>(response.data());
+  response_header->magic = kPeerRpcMagic;
+  response_header->version = kPeerRpcVersion;
+  response_header->type = static_cast<u32>(execute
+    ? PeerRpcType::stage1_execute_response
+    : PeerRpcType::stage1_arm_response);
+  response_header->source_shard = response_source_shard;
+  response_header->item_count = request_header.item_count;
+  response_header->request_id = request_header.request_id;
+  // Execute's existing aggregate convention marks any per-item retry as
+  // overloaded. Stage1 control keeps a consumable envelope and carries retry
+  // solely per item so the strict control parser can validate every token.
+  response_header->status = static_cast<u32>(execute
+    ? InsertStatus::overloaded : InsertStatus::ok);
+
+  if (execute) {
+    const Stage1ExecuteItem* inputs = stage1_execute_items(request.data());
+    Stage1ExecuteResult* outputs = stage1_execute_results(response.data());
+    for (u32 index = 0; index < request_header.item_count; ++index) {
+      outputs[index].client_batch_id = inputs[index].client_batch_id;
+      outputs[index].source_client = inputs[index].source_client;
+      outputs[index].item_index = inputs[index].item_index;
+      outputs[index].status = static_cast<u32>(MutationStatus::retry);
+    }
+  } else {
+    const Stage1ArmItem* inputs = stage1_arm_items(request.data());
+    Stage1ArmResult* outputs = stage1_arm_results(response.data());
+    for (u32 index = 0; index < request_header.item_count; ++index) {
+      outputs[index].token = inputs[index].token;
+      outputs[index].target_raw = inputs[index].target_raw;
+      outputs[index].status = static_cast<u32>(MutationStatus::retry);
+    }
+  }
+  return true;
+}
+
+// The public mutation timeout bounds the whole authority transaction.  A
+// peer Execute/control response is only one idempotent transport attempt
+// inside that transaction, so using the same deadline for both layers leaves
+// no time to recover a request that was deliberately dropped when a bounded
+// peer queue was transiently full.  Keep attempts long enough for a loaded
+// physical-home search, but always leave multiple retry opportunities before
+// the public caller's deadline.
+inline std::chrono::milliseconds stage1_peer_attempt_timeout(
+    u32 public_timeout_ms) noexcept {
+  constexpr u32 kMaximumAttemptMs = 500;
+  const u32 retry_headroom_ms = std::max<u32>(1, public_timeout_ms / 4);
+  return std::chrono::milliseconds(
+    std::min(retry_headroom_ms, kMaximumAttemptMs));
+}
 
 inline bool stage1_execute_uses_fused_arm(
     const service::storage_owner::Stage1ExecuteItem& item) noexcept {
@@ -22,6 +106,20 @@ inline bool valid_fused_stage1_execute_item(
   using namespace service::storage_owner;
   return stage1_execute_uses_fused_arm(item) && item.old_raw == 0 &&
     static_cast<MutationKind>(item.kind) == MutationKind::insert;
+}
+
+inline bool stage1_execute_tokens_unique(
+    span<const service::storage_owner::Stage1ExecuteItem> items) noexcept {
+  for (size_t item = 0; item < items.size(); ++item) {
+    for (size_t previous = 0; previous < item; ++previous) {
+      if (items[item].client_batch_id == items[previous].client_batch_id &&
+          items[item].source_client == items[previous].source_client &&
+          items[item].item_index == items[previous].item_index) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 // A successful legacy prepare owns no maintenance sequence.  Conversely, a
@@ -43,17 +141,109 @@ inline bool stage1_execute_success_has_expected_fence(
   return output.maintenance_sequence == 0;
 }
 
-// When one prepare in a fused home batch is transiently unready, already
-// successful prepares must wait for the batch-atomic ARM retry. A terminal
-// prepare failure is not transient and must remain visible; rewriting it to
-// retry could turn an allocation or graph-publication failure into an
-// unbounded retry loop.
-inline void defer_fused_stage1_success_for_atomic_retry(
-    service::storage_owner::Stage1ExecuteResult& output) noexcept {
+enum class Stage1ExecuteItemDisposition : u8 {
+  resolved,
+  retry,
+  malformed,
+};
+
+// Execute is a physical-home batch only for transport and queue efficiency;
+// each public mutation token remains an independent authority transaction.
+// Validate one result without letting a transient sibling hide an already
+// runnable token.  This is also the single definition used while compacting a
+// retry wave, so a malformed token can never be silently moved to a new RPC.
+inline Stage1ExecuteItemDisposition classify_stage1_execute_item(
+    const service::storage_owner::Stage1ExecuteItem& input,
+    const service::storage_owner::Stage1ExecuteResult& output,
+    u32 physical_home) noexcept {
   using namespace service::storage_owner;
-  if (output.status != static_cast<u32>(MutationStatus::ok)) return;
-  output.maintenance_sequence = 0;
-  output.status = static_cast<u32>(MutationStatus::retry);
+  const bool same_token = output.client_batch_id == input.client_batch_id &&
+    output.source_client == input.source_client &&
+    output.item_index == input.item_index;
+  if (!same_token || output.reserved != 0 ||
+      output.status > static_cast<u32>(MutationStatus::retry) ||
+      !stage1_execute_success_has_expected_fence(input, output)) {
+    return Stage1ExecuteItemDisposition::malformed;
+  }
+  if (output.target_raw != 0 &&
+      RemotePtr{output.target_raw}.memory_node() != physical_home) {
+    // A prepare failure has no target, while a later ARM failure/retry retains
+    // the same-home provisional target so the authority can abort it. Reject
+    // pointers that could make that recovery cross physical ownership.
+    return Stage1ExecuteItemDisposition::malformed;
+  }
+  if (output.status == static_cast<u32>(MutationStatus::retry)) {
+    return Stage1ExecuteItemDisposition::retry;
+  }
+  if (output.status == static_cast<u32>(MutationStatus::ok)) {
+    const RemotePtr target{output.target_raw};
+    if (target.is_null() || target.memory_node() != physical_home) {
+      return Stage1ExecuteItemDisposition::malformed;
+    }
+  }
+  return Stage1ExecuteItemDisposition::resolved;
+}
+
+// Partition the current wire wave by slot. Resolved slots may be committed
+// immediately; retry slots are the only records copied into the next wire
+// wave. Original semantic tokens are carried by the input records and never
+// rewritten. The caller must use a fresh transport request ID for the compact
+// wave so a late response for the previous item_count cannot alias it.
+inline bool partition_stage1_execute_response(
+    span<const service::storage_owner::Stage1ExecuteItem> inputs,
+    span<const service::storage_owner::Stage1ExecuteResult> outputs,
+    u32 physical_home,
+    vec<u32>& resolved_slots,
+    vec<u32>& retry_slots) {
+  resolved_slots.clear();
+  retry_slots.clear();
+  if (inputs.empty() || inputs.size() != outputs.size() ||
+      inputs.size() > std::numeric_limits<u32>::max()) {
+    return false;
+  }
+  resolved_slots.reserve(inputs.size());
+  retry_slots.reserve(inputs.size());
+  for (u32 slot = 0; slot < static_cast<u32>(inputs.size()); ++slot) {
+    switch (classify_stage1_execute_item(
+              inputs[slot], outputs[slot], physical_home)) {
+      case Stage1ExecuteItemDisposition::resolved:
+        resolved_slots.push_back(slot);
+        break;
+      case Stage1ExecuteItemDisposition::retry:
+        retry_slots.push_back(slot);
+        break;
+      case Stage1ExecuteItemDisposition::malformed:
+        resolved_slots.clear();
+        retry_slots.clear();
+        return false;
+    }
+  }
+  return true;
+}
+
+inline bool make_fused_stage1_release_item(
+    const service::storage_owner::Stage1ExecuteItem& input,
+    const service::storage_owner::Stage1ExecuteResult& output,
+    service::storage_owner::Stage1ArmItem& release) noexcept {
+  using namespace service::storage_owner;
+  if (!stage1_execute_uses_fused_arm(input) ||
+      output.status != static_cast<u32>(MutationStatus::ok) ||
+      !stage1_execute_success_has_expected_fence(input, output)) {
+    return false;
+  }
+  release = Stage1ArmItem{
+    .token = {
+      .source_client = input.source_client,
+      .item_index = input.item_index,
+      .client_batch_id = input.client_batch_id,
+    },
+    .target_raw = output.target_raw,
+    .initial_placement_version = input.initial_placement_version,
+    .id = input.id,
+    .generation = input.generation,
+    .action = static_cast<u32>(Stage1ArmAction::release),
+  };
+  return true;
 }
 
 enum class Stage1ControlResponseDisposition : u8 {
@@ -61,6 +251,65 @@ enum class Stage1ControlResponseDisposition : u8 {
   retry,
   malformed,
 };
+
+inline Stage1ControlResponseDisposition classify_stage1_control_item(
+    const service::storage_owner::Stage1ArmItem& input,
+    const service::storage_owner::Stage1ArmResult& output) noexcept {
+  using namespace service::storage_owner;
+  const auto action = static_cast<Stage1ArmAction>(input.action);
+  const bool known_action = action == Stage1ArmAction::arm ||
+    action == Stage1ArmAction::abort ||
+    action == Stage1ArmAction::release;
+  const bool same_token =
+    output.token.source_client == input.token.source_client &&
+    output.token.item_index == input.token.item_index &&
+    output.token.client_batch_id == input.token.client_batch_id;
+  if (!known_action || !same_token || output.reserved != 0 ||
+      output.status > static_cast<u32>(MutationStatus::retry) ||
+      (action == Stage1ArmAction::arm &&
+       output.target_raw != input.target_raw)) {
+    return Stage1ControlResponseDisposition::malformed;
+  }
+  if (output.status == static_cast<u32>(MutationStatus::retry)) {
+    return Stage1ControlResponseDisposition::retry;
+  }
+  if (output.status != static_cast<u32>(MutationStatus::ok) ||
+      (action == Stage1ArmAction::arm &&
+       output.maintenance_sequence == 0)) {
+    return Stage1ControlResponseDisposition::malformed;
+  }
+  return Stage1ControlResponseDisposition::resolved;
+}
+
+inline bool partition_stage1_control_response(
+    span<const service::storage_owner::Stage1ArmItem> inputs,
+    span<const service::storage_owner::Stage1ArmResult> outputs,
+    vec<u32>& resolved_slots,
+    vec<u32>& retry_slots) {
+  resolved_slots.clear();
+  retry_slots.clear();
+  if (inputs.empty() || inputs.size() != outputs.size() ||
+      inputs.size() > std::numeric_limits<u32>::max()) {
+    return false;
+  }
+  resolved_slots.reserve(inputs.size());
+  retry_slots.reserve(inputs.size());
+  for (u32 slot = 0; slot < static_cast<u32>(inputs.size()); ++slot) {
+    switch (classify_stage1_control_item(inputs[slot], outputs[slot])) {
+      case Stage1ControlResponseDisposition::resolved:
+        resolved_slots.push_back(slot);
+        break;
+      case Stage1ControlResponseDisposition::retry:
+        retry_slots.push_back(slot);
+        break;
+      case Stage1ControlResponseDisposition::malformed:
+        resolved_slots.clear();
+        retry_slots.clear();
+        return false;
+    }
+  }
+  return true;
+}
 
 // Classify one physical home's atomic Stage1 control response. Only the
 // explicit internal `retry` status is transient. `failed`, not-found, and
@@ -77,34 +326,12 @@ inline Stage1ControlResponseDisposition classify_stage1_control_response(
 
   bool retry = false;
   for (size_t index = 0; index < inputs.size(); ++index) {
-    const Stage1ArmItem& input = inputs[index];
-    const Stage1ArmResult& output = outputs[index];
-    const auto action = static_cast<Stage1ArmAction>(input.action);
-    const bool known_action = action == Stage1ArmAction::arm ||
-      action == Stage1ArmAction::abort ||
-      action == Stage1ArmAction::release;
-    const bool same_token =
-      output.token.source_client == input.token.source_client &&
-      output.token.item_index == input.token.item_index &&
-      output.token.client_batch_id == input.token.client_batch_id;
-    if (!known_action || !same_token || output.reserved != 0 ||
-        output.status > static_cast<u32>(MutationStatus::retry) ||
-        (action == Stage1ArmAction::arm &&
-         output.target_raw != input.target_raw)) {
+    const auto disposition = classify_stage1_control_item(
+      inputs[index], outputs[index]);
+    if (disposition == Stage1ControlResponseDisposition::malformed) {
       return Stage1ControlResponseDisposition::malformed;
     }
-
-    if (output.status == static_cast<u32>(MutationStatus::retry)) {
-      retry = true;
-      continue;
-    }
-    if (output.status != static_cast<u32>(MutationStatus::ok)) {
-      return Stage1ControlResponseDisposition::malformed;
-    }
-    if (action == Stage1ArmAction::arm &&
-        output.maintenance_sequence == 0) {
-      return Stage1ControlResponseDisposition::malformed;
-    }
+    retry |= disposition == Stage1ControlResponseDisposition::retry;
   }
   return retry ? Stage1ControlResponseDisposition::retry
                : Stage1ControlResponseDisposition::resolved;
@@ -150,8 +377,13 @@ class Stage1HomeRetryBackoff {
 public:
   using Clock = std::chrono::steady_clock;
 
-  static constexpr u32 kInitialDelayUs = 100;
-  static constexpr u32 kMaximumDelayUs = 2'000;
+  // A full Stage2 completion window normally advances on the millisecond
+  // scale.  Retrying every 2 ms at saturation multiplied peer Stage1 traffic
+  // by nearly 6x in the 100M mixed run and stole CPU from the work that would
+  // release the window.  Keep the first retry responsive, then converge to the
+  // existing 10 ms Stage2 batching horizon instead of polling it aggressively.
+  static constexpr u32 kInitialDelayUs = 250;
+  static constexpr u32 kMaximumDelayUs = 10'000;
 
   [[nodiscard]] bool ready(Clock::time_point now) const noexcept {
     return retry_not_before_ == Clock::time_point{} ||

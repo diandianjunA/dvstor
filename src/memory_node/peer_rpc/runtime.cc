@@ -170,6 +170,11 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   peer_stage1_processed_.store(0, std::memory_order_relaxed);
   peer_stage1_items_.store(0, std::memory_order_relaxed);
   peer_stage1_max_queue_.store(0, std::memory_order_relaxed);
+  peer_stage1_release_deferred_batches_.store(0, std::memory_order_relaxed);
+  peer_stage1_release_deferred_items_.store(0, std::memory_order_relaxed);
+  peer_stage1_duplicate_retry_responses_.store(0, std::memory_order_relaxed);
+  peer_stage1_admission_retry_responses_.store(0, std::memory_order_relaxed);
+  peer_stage1_retry_response_drops_.store(0, std::memory_order_relaxed);
   peer_stage1_active_workers_.store(0, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
