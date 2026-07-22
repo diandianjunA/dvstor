@@ -444,12 +444,18 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
           complete_direct_batch(descriptor, -EHOSTDOWN, owner_progress);
           continue;
         }
-        const u32 needed = matching + (need_dump ? 1u : 0u);
-        if (needed > qp->sq_wqe_num) {
+        // All descriptors collected below are published by one SQ doorbell.
+        // Reserve at most one dump WQE for that submission, rather than one
+        // per logical descriptor.  RC execution is ordered and the single
+        // final signaled WQE covers every preceding read.
+        const u32 needed = matching;
+        const u32 completion_wqes = need_dump ? 1u : 0u;
+        if (needed + completion_wqes > qp->sq_wqe_num) {
           complete_direct_batch(descriptor, -E2BIG, owner_progress);
           continue;
         }
-        if (batch_count != 0 && total_wqes + needed > qp->sq_wqe_num) {
+        if (batch_count != 0 &&
+            total_wqes + needed + completion_wqes > qp->sq_wqe_num) {
           deferred = descriptor;
           deferred_matching = matching;
           have_deferred = true;
@@ -498,8 +504,9 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
           const doca_gpu_dev_verbs_ticket_t ticket =
             first_wqe + batch_offset + matched;
           auto* wqe = doca_gpu_dev_verbs_get_wqe_ptr(qp, ticket);
-          const bool last_read = matched + 1 == matching;
-          const auto flags = !need_dump && last_read
+          const bool final_submission_read =
+            batch + 1 == batch_count && matched + 1 == matching;
+          const auto flags = !need_dump && final_submission_read
             ? DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_UPDATE
             : DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_ERROR_UPDATE;
           doca_gpu_dev_verbs_wqe_prepare_read(
@@ -510,36 +517,38 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
         }
         matched_before += __popc(matching_mask);
       }
-      if (need_dump && lane == 0) {
-        const doca_gpu_dev_verbs_ticket_t ticket =
-          first_wqe + batch_offset + matching;
-        auto* dump_wqe = doca_gpu_dev_verbs_get_wqe_ptr(qp, ticket);
-        doca_gpu_dev_verbs_wqe_prepare_dump(
-          qp, dump_wqe, ticket, DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_UPDATE,
-          reinterpret_cast<u64>(params.direct_dump) - params.direct_local_iova_base,
-          params.direct_local_mkey, 1);
-      }
     }
     __syncwarp();
     if (lane == 0) {
+      const u32 read_wqes = shared_total_wqes[warp_in_block];
+      const u32 submission_wqes = read_wqes + (need_dump ? 1u : 0u);
+      if (need_dump) {
+        const doca_gpu_dev_verbs_ticket_t dump_ticket = first_wqe + read_wqes;
+        auto* dump_wqe = doca_gpu_dev_verbs_get_wqe_ptr(qp, dump_ticket);
+        doca_gpu_dev_verbs_wqe_prepare_dump(
+          qp, dump_wqe, dump_ticket, DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_UPDATE,
+          reinterpret_cast<u64>(params.direct_dump) -
+            params.direct_local_iova_base,
+          params.direct_local_mkey, 1);
+      }
       if (trace_first_batch && params.direct_owner_phases != nullptr) {
         params.direct_owner_phases[warp] = 3;
         __threadfence_system();
       }
       doca_gpu_dev_verbs_submit<DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE>(
-        qp, first_wqe + shared_total_wqes[warp_in_block]);
+        qp, first_wqe + submission_wqes);
       if (trace_first_batch && params.direct_owner_phases != nullptr) {
         params.direct_owner_phases[warp] = 4;
         __threadfence_system();
       }
 
-      i32 status = 0;
+      // One final CQE is sufficient for the whole RC submission. Every
+      // earlier read is ordered before it, while CQ_ERROR_UPDATE still emits
+      // an immediate CQE if any intermediate WQE fails.
+      const i32 status = poll_direct_cq(
+        completion_queue, first_completion, params.direct_timeout_ns,
+        params.stop, params.direct_disabled);
       for (u32 batch = 0; batch < batch_count; ++batch) {
-        if (status == 0) {
-          status = poll_direct_cq(completion_queue, first_completion + batch,
-                                  params.direct_timeout_ns, params.stop,
-                                  params.direct_disabled);
-        }
         complete_direct_batch(shared_batches[warp_in_block][batch], status,
                               owner_progress);
       }
