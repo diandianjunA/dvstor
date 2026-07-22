@@ -534,7 +534,7 @@ write_service_config() {
     echo "storage-peers = $endpoints"
     echo "storage-owner-batch-max = ${STORAGE_OWNER_BATCH_MAX:-32}"
     echo "storage-owner-batch-max-wait-us = ${STORAGE_OWNER_BATCH_MAX_WAIT_US:-10000}"
-    echo "storage-owner-stage2-batch-max-wait-us = ${STORAGE_OWNER_STAGE2_BATCH_MAX_WAIT_US:-10000}"
+    echo "storage-owner-stage2-batch-max-wait-us = ${STORAGE_OWNER_STAGE2_BATCH_MAX_WAIT_US:-50}"
     echo "storage-owner-peer-qps-per-peer = ${STORAGE_OWNER_PEER_QPS_PER_PEER:-8}"
     echo "storage-owner-peer-rdma-tokens = ${STORAGE_OWNER_PEER_RDMA_TOKENS:-16}"
     echo "storage-owner-rpc-depth = ${STORAGE_OWNER_RPC_DEPTH:-16}"

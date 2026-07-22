@@ -33,7 +33,7 @@ void ComputeService::start_storage_insert_runtime() {
              "reduce batch size or vector dimension");
   const size_t max_inflight = static_cast<size_t>(owner_count) * rpc_depth;
   const u64 completion_slots_per_owner_u64 =
-    static_cast<u64>(rpc_depth) * config_.storage_owner_batch_max * 2;
+    static_cast<u64>(rpc_depth) * config_.storage_owner_batch_max;
   lib_assert(completion_slots_per_owner_u64 > 0 &&
                completion_slots_per_owner_u64 <=
                  std::numeric_limits<u32>::max(),

@@ -26,7 +26,7 @@ void MemoryNode::setup_insert_runtime(const Configuration& config) {
   insert_runtime_.response_offset = insert_runtime_.request_bytes * slot_count;
   const u64 completion_slots_u64 =
     static_cast<u64>(insert_runtime_.request_slot_count) *
-    config.storage_owner_batch_max * 2;
+    config.storage_owner_batch_max;
   lib_assert(completion_slots_u64 > 0 &&
                completion_slots_u64 <= std::numeric_limits<u32>::max(),
              "storage-owner completion window is invalid");
@@ -37,7 +37,7 @@ void MemoryNode::setup_insert_runtime(const Configuration& config) {
   const size_t total_completion_slots =
     static_cast<size_t>(num_clients_) * insert_runtime_.completion_slot_count;
   storage_insert_tasks_ =
-    std::make_unique<bounded::Queue<StorageOwnerInsertTask>>(slot_count * 2);
+    std::make_unique<bounded::Queue<StorageOwnerInsertTask>>(slot_count);
   insert_runtime_.buffer.allocate(
     insert_runtime_.completion_offset + total_completion_slots *
       sizeof(service::storage_owner::MutationCompletionV2));
@@ -51,7 +51,7 @@ void MemoryNode::setup_insert_runtime(const Configuration& config) {
   storage_client_batch_context_credits_ =
     std::make_unique<std::atomic<u32>[]>(num_clients_);
   const u32 batch_contexts_per_client =
-    insert_runtime_.request_slot_count * 2;
+    insert_runtime_.request_slot_count;
   for (u32 client_id = 0; client_id < num_clients_; ++client_id) {
     storage_client_batch_context_credits_[client_id].store(
       batch_contexts_per_client, std::memory_order_relaxed);
