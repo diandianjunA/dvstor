@@ -147,7 +147,18 @@ private:
     vec<StorageOwnerRpcSlot> slots;
     vec<StorageOwnerResponseSlot> response_slots;
     vec<u32> free_slots;
-    bool saturated_batch_epoch{};
+    // Set, rearmed after each actual dequeue, and cleared only by the
+    // CQ/progress thread. published_tasks is an exact total but may include
+    // cells behind an invisible MPMC head, so this is the current batching
+    // epoch's observation time rather than proof that the FIFO head is visible.
+    u64 oldest_published_observed_ns{};
+    // Number of tasks admitted into the current dispatch epoch but not yet
+    // dequeued. Keeping the epoch across lane reclamation and transient MPMC
+    // head holes ensures the oldest admitted tail is not re-aged after every
+    // small batch, while newly published work starts a fresh bounded epoch.
+    u32 dispatch_epoch_remaining{};
+    bool dispatch_epoch_idle_flush{};
+    bool dispatch_epoch_max_wait_flush{};
     // Written only by the progress thread. Power-of-two snapshots are logged
     // so a benchmark can verify that batching is real rather than inferred
     // from submitted operation counts.
@@ -155,11 +166,21 @@ private:
     u64 rpc_items{};
     u64 full_batches{};
     u64 tail_escape_batches{};
+    u64 max_wait_flush_batches{};
     // A later producer may publish behind a reserved-but-invisible FIFO head.
     // These counters distinguish that transient MPMC condition from remote
     // RPC or storage-maintenance stalls.
     u64 queue_visibility_stalls{};
     u64 partial_visible_batches{};
+    // Raw batch critical-path telemetry. These values deliberately are not
+    // divided across logical items: an item experiences the complete batch
+    // response latency even though CPU work counters are per-item shares.
+    u64 completed_rpc_batches{};
+    u64 completed_rpc_items{};
+    u64 completed_rpc_wall_ns{};
+    u64 max_rpc_wall_ns{};
+    u32 max_active_rpcs{};
+    u32 max_published_tasks{};
   };
 
   struct StorageOwnerReadySlot {

@@ -1179,76 +1179,216 @@ bool MemoryNode::relocate_batch_via_authority(
     groups[authority_shards[index]].push_back(index);
   }
 
+  struct PendingAuthorityGroup {
+    u32 authority_shard{};
+    u64 request_id{};
+    vec<protocol::AuthorityPlacementItem> items;
+    vec<size_t> input_indices;
+    vec<byte_t> response_payload;
+    std::chrono::steady_clock::time_point deadline{};
+    u32 attempts_started{};
+    bool attempt_active{};
+    bool posted{};
+    bool complete{};
+  };
+  vec<PendingAuthorityGroup> pending;
+  pending.reserve(groups.size());
+  vec<protocol::AuthorityPlacementItem> local_items;
+  vec<size_t> local_input_indices;
+
   for (const auto& [authority_shard, indices] : groups) {
     vec<protocol::AuthorityPlacementItem> group_items;
     group_items.reserve(indices.size());
     for (const size_t index : indices) group_items.push_back(items[index]);
 
-    vec<protocol::AuthorityPlacementResult> group_results;
     if (authority_shard == storage_id_) {
-      if (!apply_local_authority_placement_items(
-            span<const protocol::AuthorityPlacementItem>{group_items},
-            group_results) || group_results.size() != group_items.size()) {
-        return false;
-      }
-    } else {
-      const u32 item_count = static_cast<u32>(group_items.size());
-      const u64 request_id = allocate_peer_request_id();
-      constexpr u32 kTransportAttempts = 3;
-      bool posted = false;
-      bool complete = false;
-      for (u32 attempt = 0;
-           attempt < kTransportAttempts && !complete; ++attempt) {
-        if (!posted) {
-          posted = post_peer_control_request_attempt(
-            authority_shard,
-            protocol::PeerRpcType::authority_placement_request,
-            protocol::PeerRpcType::authority_placement_response,
-            request_id, item_count, group_items.data(),
-            group_items.size() * sizeof(group_items[0]),
-            protocol::authority_placement_request_bytes(item_count), config);
-          if (!posted) continue;
-        }
-        protocol::PeerRpcHeader header;
-        vec<byte_t> payload;
-        PeerResponseLease response_lease{};
-        const TryPeerResponse state = wait_peer_control_response(
-          request_id, authority_shard,
-          protocol::PeerRpcType::authority_placement_response,
-          item_count, header, payload, response_lease, config);
-        if (state == TryPeerResponse::success &&
-            payload.size() ==
-              protocol::authority_placement_response_bytes(item_count)) {
-          const auto* wire =
-            protocol::authority_placement_results(payload.data());
-          bool valid = true;
-          for (u32 item = 0; item < item_count; ++item) {
-            valid &= wire[item].reserved == 0 &&
-              wire[item].status <= static_cast<u32>(
-                protocol::AuthorityPlacementStatus::conflict);
-          }
-          if (valid && acknowledge_peer_rpc_response(response_lease)) {
-            group_results.assign(wire, wire + item_count);
-            complete = true;
-            break;
-          }
-        }
-        posted = false;
-        if (response_lease.valid()) {
-          (void)rearm_peer_rpc_response(response_lease);
-        }
-      }
-      if (!complete) {
-        cancel_peer_rpc_response(request_id);
-        return false;
-      }
+      local_items = std::move(group_items);
+      local_input_indices = indices;
+      continue;
     }
 
-    for (size_t slot = 0; slot < indices.size(); ++slot) {
-      results[indices[slot]] = group_results[slot];
+    PendingAuthorityGroup request;
+    request.authority_shard = authority_shard;
+    request.request_id = allocate_peer_request_id();
+    request.items = std::move(group_items);
+    request.input_indices = indices;
+    request.response_payload.reserve(peer_rpc_runtime_.message_bytes);
+    pending.push_back(std::move(request));
+  }
+
+  constexpr u32 kTransportAttempts = 3;
+  const auto timeout =
+    std::chrono::milliseconds(config.storage_owner_rpc_timeout_ms);
+  const auto try_post = [&](PendingAuthorityGroup& request) {
+    const u32 item_count = static_cast<u32>(request.items.size());
+    const bool posted = try_post_peer_rpc_request_attempt(
+      request.authority_shard,
+      protocol::PeerRpcType::authority_placement_request,
+      protocol::PeerRpcType::authority_placement_response,
+      request.request_id, item_count, request.items.data(),
+      request.items.size() * sizeof(request.items[0]),
+      protocol::authority_placement_request_bytes(item_count),
+      PeerRpcSendClass::control);
+    if (posted) request.posted = true;
+    return posted;
+  };
+
+  // Prime every authority shard before waiting on any one of them.  Placement
+  // tokens are independent and idempotent, so serial shard waits only add one
+  // network RTT per distinct authority without strengthening the commit
+  // boundary.
+  const auto first_deadline = std::chrono::steady_clock::now() + timeout;
+  for (PendingAuthorityGroup& request : pending) {
+    request.attempts_started = 1;
+    request.attempt_active = true;
+    request.deadline = first_deadline;
+    (void)try_post(request);
+  }
+
+  // Once a response key has been registered, every exit path--including an
+  // allocation failure while applying the local group or copying a remote
+  // response--must retire it.  The response table and receive slab are fixed
+  // capacity, so leaking one exceptional request would otherwise turn a
+  // recoverable allocation error into a later permanent control-plane stall.
+  const auto cancel_incomplete = [&](void*) {
+    for (const PendingAuthorityGroup& request : pending) {
+      if (!request.complete) {
+        cancel_peer_rpc_response(request.request_id);
+      }
+    }
+  };
+  std::unique_ptr<void, decltype(cancel_incomplete)> response_guard{
+    reinterpret_cast<void*>(1), cancel_incomplete};
+
+  // Local authority work can take locks and perform directory publication.
+  // Execute it only after every remote send has been primed so that CPU work
+  // overlaps the wire instead of delaying it.
+  if (!local_items.empty()) {
+    vec<protocol::AuthorityPlacementResult> local_results;
+    if (!apply_local_authority_placement_items(
+          span<const protocol::AuthorityPlacementItem>{local_items},
+          local_results) || local_results.size() != local_items.size()) {
+      return false;
+    }
+    for (size_t slot = 0; slot < local_input_indices.size(); ++slot) {
+      results[local_input_indices[slot]] = local_results[slot];
     }
   }
-  return true;
+
+  if (pending.empty()) return true;
+
+  bool success = true;
+  size_t remaining = pending.size();
+  while (remaining != 0 &&
+         !peer_reverse_shutdown_.load(std::memory_order_acquire)) {
+    bool made_progress = false;
+    for (PendingAuthorityGroup& request : pending) {
+      if (request.complete) continue;
+      auto now = std::chrono::steady_clock::now();
+      if (!request.attempt_active) {
+        if (request.attempts_started == kTransportAttempts) {
+          cancel_peer_rpc_response(request.request_id);
+          request.complete = true;
+          --remaining;
+          success = false;
+          made_progress = true;
+          continue;
+        }
+        ++request.attempts_started;
+        request.attempt_active = true;
+        request.posted = false;
+        request.deadline = now + timeout;
+      }
+
+      if (!request.posted) {
+        made_progress = try_post(request) || made_progress;
+        now = std::chrono::steady_clock::now();
+        if (!request.posted && now >= request.deadline) {
+          cancel_peer_rpc_response(request.request_id);
+          request.attempt_active = false;
+          made_progress = true;
+        }
+        if (!request.posted) continue;
+      }
+
+      protocol::PeerRpcHeader header{};
+      request.response_payload.clear();
+      PeerResponseLease response_lease{};
+      const u32 item_count = static_cast<u32>(request.items.size());
+      const TryPeerResponse state = try_consume_peer_rpc_response(
+        request.request_id, request.authority_shard,
+        protocol::PeerRpcType::authority_placement_response,
+        item_count, header, request.response_payload, response_lease);
+      now = std::chrono::steady_clock::now();
+      if (state == TryPeerResponse::pending) {
+        if (now >= request.deadline) {
+          cancel_peer_rpc_response(request.request_id);
+          request.attempt_active = false;
+          request.posted = false;
+          made_progress = true;
+        }
+        continue;
+      }
+      if (state == TryPeerResponse::stale) {
+        request.attempt_active = false;
+        request.posted = false;
+        made_progress = true;
+        continue;
+      }
+
+      const bool valid_envelope = state == TryPeerResponse::success &&
+        request.response_payload.size() ==
+          protocol::authority_placement_response_bytes(item_count) &&
+        header.magic == protocol::kPeerRpcMagic &&
+        header.version == protocol::kPeerRpcVersion &&
+        header.type == static_cast<u32>(
+          protocol::PeerRpcType::authority_placement_response) &&
+        header.source_shard == request.authority_shard &&
+        header.item_count == item_count &&
+        header.request_id == request.request_id &&
+        header.status == static_cast<u32>(protocol::InsertStatus::ok) &&
+        header.reserved == 0;
+      bool valid = valid_envelope;
+      const protocol::AuthorityPlacementResult* wire = nullptr;
+      if (valid) {
+        wire = protocol::authority_placement_results(
+          request.response_payload.data());
+        for (u32 item = 0; item < item_count; ++item) {
+          valid &= wire[item].reserved == 0 &&
+            wire[item].status <= static_cast<u32>(
+              protocol::AuthorityPlacementStatus::conflict);
+        }
+      }
+
+      if (valid) {
+        lib_assert(acknowledge_peer_rpc_response(response_lease),
+                   "validated authority response lost its lease");
+        for (size_t slot = 0; slot < request.input_indices.size(); ++slot) {
+          results[request.input_indices[slot]] = wire[slot];
+        }
+        request.complete = true;
+        --remaining;
+      } else {
+        if (response_lease.valid()) {
+          lib_assert(rearm_peer_rpc_response(response_lease),
+                     "invalid authority response could not be rearmed");
+        }
+        request.attempt_active = false;
+        request.posted = false;
+      }
+      made_progress = true;
+    }
+
+    if (!made_progress && remaining != 0) {
+      std::unique_lock<std::mutex> lock(peer_completion_mutex_);
+      peer_completion_cv_.wait_for(lock, std::chrono::microseconds(100));
+    }
+  }
+
+  for (const PendingAuthorityGroup& request : pending) {
+    if (!request.complete) success = false;
+  }
+  return success;
 }
 
 bool MemoryNode::control_dynamic_node_on_shard(

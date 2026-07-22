@@ -1,5 +1,6 @@
 #include "memory_node/storage_owner_index/detail.hh"
 #include "memory_node/storage_owner_index/reconcile_reverse_policy.hh"
+#include "memory_node/storage_owner_index/vector_snapshot_policy.hh"
 
 #include <algorithm>
 #include <cstring>
@@ -100,9 +101,10 @@ bool MemoryNode::reconcile_local_reverse_ops(
       (target_header & VamanaNode::HEADER_CENTROID_ACCOUNTED) != 0;
     GraphAdjacency adjacency;
     if (!read_graph_adjacency(target, adjacency)) {
-      for (const size_t op_index : op_indices) {
-        results[op_index].stale = 1;
-      }
+      // We own the target identity lock, so a bounded checksum miss is not a
+      // stable stale-target observation. Return a retryable RPC failure and
+      // leave the authoritative adjacency byte-for-byte unchanged.
+      structurally_valid = false;
       unlock_node(target);
       continue;
     }
@@ -151,10 +153,22 @@ bool MemoryNode::reconcile_local_reverse_ops(
         adjacency.provisional.end());
     };
 
+    bool robust_prune_retryable = false;
     const auto robust_prune = [&](const vec<RemotePtr>& candidates) {
+      vec<StableNodeSnapshotState> snapshot_states;
       vec<NodeSnapshot> snapshots =
         read_node_snapshots_batched(
-          candidates, config, "reconcile_local_reverse_ops");
+          candidates, config, "reconcile_local_reverse_ops",
+          &snapshot_states);
+      if (std::find(snapshot_states.begin(), snapshot_states.end(),
+                    StableNodeSnapshotState::retryable) !=
+          snapshot_states.end()) {
+        // The caller still owns the target lock. Preserve the complete
+        // pre-reconciliation adjacency and make the RPC retry instead of
+        // pruning from a set that merely omitted a contended live neighbor.
+        robust_prune_retryable = true;
+        return candidates;
+      }
       hashset_t<RemotePtr> skip;
       skip.insert(target);
       const auto target_vector =
@@ -287,6 +301,14 @@ bool MemoryNode::reconcile_local_reverse_ops(
         adjacency.stable, adjacency.provisional, robust_prune);
       publish_allowed = publish_allowed || result.stale == 0;
       ++group_position;
+    }
+
+    if (robust_prune_retryable) {
+      adjacency.stable = before_stable;
+      adjacency.provisional = before_provisional;
+      structurally_valid = false;
+      unlock_node(target);
+      continue;
     }
 
     const bool changed =

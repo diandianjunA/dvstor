@@ -74,6 +74,30 @@ void ComputeService::handle_storage_owner_response(
   matched->response_slot_id = response_slot_id;
   matched->response_completed_at = std::chrono::steady_clock::now();
   matched->cq_progress_gap_ns = storage_insert_current_cq_gap_ns_;
+  const u64 rpc_wall_ns = duration_ns_clamped(
+    matched->send_posted_at, matched->response_completed_at);
+  ++state.completed_rpc_batches;
+  state.completed_rpc_items += matched->item_count;
+  state.completed_rpc_wall_ns += rpc_wall_ns;
+  state.max_rpc_wall_ns = std::max(state.max_rpc_wall_ns, rpc_wall_ns);
+  if (state.completed_rpc_batches >= 32 &&
+      (state.completed_rpc_batches & (state.completed_rpc_batches - 1)) == 0) {
+    const double average_items = static_cast<double>(
+      state.completed_rpc_items) / state.completed_rpc_batches;
+    const double average_wall_us = static_cast<double>(
+      state.completed_rpc_wall_ns) /
+      (1000.0 * static_cast<double>(state.completed_rpc_batches));
+    std::cerr << "[storage-owner] sender completion telemetry owner="
+              << owner_storage
+              << " batches=" << state.completed_rpc_batches
+              << " items=" << state.completed_rpc_items
+              << " avg_batch=" << average_items
+              << " avg_rpc_wall_us=" << average_wall_us
+              << " max_rpc_wall_us=" << (state.max_rpc_wall_ns / 1000.0)
+              << " max_active_rpcs=" << state.max_active_rpcs
+              << " max_published=" << state.max_published_tasks
+              << std::endl;
+  }
   queue_storage_owner_completion(*matched);
   // The receive is reposted only after the response executor has finished
   // parsing this buffer. This removes the large CQ-thread memcpy.

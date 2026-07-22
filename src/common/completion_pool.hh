@@ -1,12 +1,13 @@
 #pragma once
 
-#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
-#include <thread>
 
 #include "common/bounded_queue.hh"
 #include "common/types.hh"
@@ -74,33 +75,36 @@ public:
     validate(id);
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     auto& state = cells_[id].state;
-    for (;;) {
-      const Result observed = static_cast<Result>(
-        state.load(std::memory_order_acquire));
-      if (observed != Result::pending) return observed;
-      const auto now = std::chrono::steady_clock::now();
-      if (now >= deadline) return Result::pending;
-      const auto remaining = deadline - now;
-      // C++20 atomic::wait has no timed form. A short bounded sleep avoids a
-      // waiter object per cell and completion-side mutex contention.
-      std::this_thread::sleep_for(std::min(
-        remaining, std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-          std::chrono::microseconds(50))));
-    }
+    WaitShard& shard = wait_shards_[id & (kWaitShardCount - 1)];
+    std::unique_lock<std::mutex> lock(shard.mutex);
+    const bool completed = shard.changed.wait_until(lock, deadline, [&]() {
+      return state.load(std::memory_order_acquire) !=
+        static_cast<u32>(Result::pending);
+    });
+    if (!completed) return Result::pending;
+    return static_cast<Result>(state.load(std::memory_order_acquire));
   }
 
   void complete(u32 id, bool success) {
     validate(id);
     Cell& cell = cells_[id];
+    WaitShard& shard = wait_shards_[id & (kWaitShardCount - 1)];
     const u32 desired = static_cast<u32>(
       success ? Result::success : Result::failure);
     u32 expected = static_cast<u32>(Result::pending);
-    if (!cell.state.compare_exchange_strong(
-          expected, desired, std::memory_order_release,
-          std::memory_order_acquire)) {
-      throw std::logic_error("completion cell completed more than once");
+    {
+      // Pair the predicate transition with the same striped mutex used by the
+      // timed waiter. This closes the check-to-sleep lost-wakeup window without
+      // allocating one condition variable (or one polling timer) per cell.
+      std::lock_guard<std::mutex> lock(shard.mutex);
+      if (!cell.state.compare_exchange_strong(
+            expected, desired, std::memory_order_release,
+            std::memory_order_acquire)) {
+        throw std::logic_error("completion cell completed more than once");
+      }
     }
     cell.state.notify_all();
+    shard.changed.notify_all();
     release_reference(id);
   }
 
@@ -121,6 +125,18 @@ private:
     std::atomic<u32> state{static_cast<u32>(Result::pending)};
     std::atomic<u32> references{0};
   };
+
+  struct WaitShard {
+    mutable std::mutex mutex;
+    mutable std::condition_variable changed;
+  };
+
+  // Keep unrelated synchronous writers out of one another's completion wake
+  // domain. 1024 shards are still a fixed, small allocation compared with the
+  // bounded mutation cells, while reducing notify_all fanout at 512--4096
+  // concurrent callers.
+  static constexpr size_t kWaitShardCount = 1024;
+  static_assert((kWaitShardCount & (kWaitShardCount - 1)) == 0);
 
   void validate(u32 id) const {
     if (id >= capacity_) {
@@ -150,6 +166,7 @@ private:
   const u32 capacity_;
   std::unique_ptr<Cell[]> cells_;
   Queue<u32> free_;
+  mutable std::array<WaitShard, kWaitShardCount> wait_shards_;
 };
 
 }  // namespace bounded

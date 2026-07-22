@@ -2,6 +2,66 @@
 
 #include <algorithm>
 
+namespace {
+
+struct PeerScratchLaneRange {
+  uintptr_t begin{};
+  uintptr_t end{};
+};
+
+PeerScratchLaneRange peer_scratch_lane_range(
+    const memory_node_detail::StorageOwnerThread& thread) {
+  lib_assert(thread.has_peer_scratch(),
+             "storage-owner thread scratch is not initialized");
+  lib_assert(thread.running_coroutine < thread.post_balances.size(),
+             "storage-owner peer read has an invalid coroutine lane");
+  lib_assert(thread.scratch_stride != 0,
+             "storage-owner peer read has a zero scratch stride");
+  lib_assert(
+    static_cast<size_t>(thread.running_coroutine) <=
+      std::numeric_limits<size_t>::max() / thread.scratch_stride,
+    "storage-owner scratch lane offset overflow");
+  const size_t lane_offset =
+    static_cast<size_t>(thread.running_coroutine) * thread.scratch_stride;
+  lib_assert(lane_offset <= thread.scratch_buffer.buffer_size &&
+               thread.scratch_stride <=
+                 thread.scratch_buffer.buffer_size - lane_offset,
+             "storage-owner scratch lane exceeds registered memory");
+  const uintptr_t registered_begin = reinterpret_cast<uintptr_t>(
+    thread.scratch_buffer.get_full_buffer());
+  lib_assert(lane_offset <=
+               std::numeric_limits<uintptr_t>::max() - registered_begin,
+             "storage-owner scratch lane address overflow");
+  const uintptr_t lane_begin = registered_begin + lane_offset;
+  lib_assert(thread.scratch_stride <=
+               std::numeric_limits<uintptr_t>::max() - lane_begin,
+             "storage-owner scratch lane end overflow");
+  return PeerScratchLaneRange{
+    .begin = lane_begin,
+    .end = lane_begin + thread.scratch_stride,
+  };
+}
+
+std::pair<uintptr_t, uintptr_t> checked_local_read_range(
+    byte_t* destination,
+    const size_t local_offset,
+    const size_t bytes,
+    const char* boundary) {
+  lib_assert(destination != nullptr,
+             str(boundary) + " has a null destination");
+  const uintptr_t destination_address =
+    reinterpret_cast<uintptr_t>(destination);
+  lib_assert(local_offset <=
+               std::numeric_limits<uintptr_t>::max() - destination_address,
+             str(boundary) + " local offset overflow");
+  const uintptr_t begin = destination_address + local_offset;
+  lib_assert(bytes <= std::numeric_limits<uintptr_t>::max() - begin,
+             str(boundary) + " local range overflow");
+  return {begin, begin + bytes};
+}
+
+}  // namespace
+
 void MemoryNode::setup_storage_peers(Configuration& config) {
   if (num_storage_nodes_ <= 1) {
     return;
@@ -197,31 +257,17 @@ u32 MemoryNode::peer_rdma_read_global_credit_limit() const {
   return peer_rdma_read_credits_.global;
 }
 
-bool MemoryNode::try_acquire_counter(std::atomic<u32>& counter, u32 limit) {
-  u32 current = counter.load(std::memory_order_acquire);
-  while (current < limit) {
-    if (counter.compare_exchange_weak(current,
-                                      current + 1,
-                                      std::memory_order_acq_rel,
-                                      std::memory_order_acquire)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 bool MemoryNode::try_acquire_peer_rdma_read_credit(u32 shard_id, u32 qp_idx) {
   lib_assert(shard_id < peer_rdma_read_qp_outstanding_.size(), "invalid peer shard id");
   lib_assert(qp_idx < peer_rdma_read_qp_outstanding_[shard_id].size(), "invalid peer QP index");
-  if (!try_acquire_counter(peer_rdma_read_outstanding_[shard_id], peer_rdma_read_credit_limit())) {
-    return false;
-  }
-  if (try_acquire_counter(peer_rdma_read_qp_outstanding_[shard_id][qp_idx],
-                          peer_rdma_read_credit_limit_per_qp())) {
-    return true;
-  }
-  peer_rdma_read_outstanding_[shard_id].fetch_sub(1, std::memory_order_acq_rel);
-  return false;
+  // Synchronous reads and atomics share the same NIC requester/CQ resources
+  // as resumable Stage2 waves.  Reserve all three domains transactionally;
+  // otherwise a synchronous caller can overrun the global plan while async
+  // searches already occupy it.
+  return memory_node_detail::try_reserve_peer_rdma_read_group(
+    peer_rdma_read_outstanding_[shard_id],
+    peer_rdma_read_qp_outstanding_[shard_id][qp_idx],
+    peer_async_rdma_outstanding_, peer_rdma_read_credit_plan(), 1);
 }
 
 void MemoryNode::acquire_peer_rdma_read_credit(u32 shard_id, u32 qp_idx) {
@@ -256,21 +302,52 @@ void MemoryNode::acquire_peer_rdma_read_group(
 }
 
 u64 MemoryNode::next_peer_sync_wr_id() {
-  const u32 id = peer_sync_wr_id_counter_.fetch_add(1, std::memory_order_relaxed);
-  return encode_64bit(kPeerSyncWrOwner, id);
+  std::lock_guard<std::mutex> lock(peer_completion_mutex_);
+  const auto wr_id = memory_node_detail::next_collision_free_peer_wr_id(
+    kPeerSyncWrOwner, peer_sync_wr_id_counter_, [&](const u64 candidate) {
+      return peer_reserved_wr_ids_.contains(candidate) ||
+        peer_pending_sends_.contains(candidate) ||
+        peer_sync_completions_.contains(candidate);
+    });
+  lib_assert(wr_id.has_value(),
+             "peer sync WR-ID namespace is completely occupied");
+  const auto [_, inserted] = peer_reserved_wr_ids_.insert(*wr_id);
+  lib_assert(inserted, "peer sync WR-ID reservation collided");
+  return *wr_id;
 }
 
 u64 MemoryNode::next_peer_async_wr_id() {
-  const u32 id = peer_async_wr_id_counter_.fetch_add(1, std::memory_order_relaxed);
-  return encode_64bit(kPeerAsyncWrOwner, id);
+  std::lock_guard<std::mutex> lock(peer_completion_mutex_);
+  const auto wr_id = memory_node_detail::next_collision_free_peer_wr_id(
+    kPeerAsyncWrOwner, peer_async_wr_id_counter_, [&](const u64 candidate) {
+      return peer_reserved_wr_ids_.contains(candidate) ||
+        peer_pending_sends_.contains(candidate) ||
+        peer_sync_completions_.contains(candidate);
+    });
+  lib_assert(wr_id.has_value(),
+             "peer async WR-ID namespace is completely occupied");
+  const auto [_, inserted] = peer_reserved_wr_ids_.insert(*wr_id);
+  lib_assert(inserted, "peer async WR-ID reservation collided");
+  return *wr_id;
 }
 
 void MemoryNode::register_peer_pending_send_locked(u64 wr_id, PeerPendingSend pending) {
   std::lock_guard<std::mutex> lock(peer_completion_mutex_);
-  peer_pending_sends_[wr_id] = pending;
+  const auto [owner, ignored_sequence] = decode_64bit(wr_id);
+  (void)ignored_sequence;
+  if (owner == kPeerSyncWrOwner || owner == kPeerAsyncWrOwner) {
+    lib_assert(peer_reserved_wr_ids_.erase(wr_id) == 1,
+               "generated peer WR-ID was not reserved before registration");
+  }
+  lib_assert(!peer_sync_completions_.contains(wr_id),
+             "peer WR-ID collides with an unconsumed completion");
+  const auto [_, inserted] = peer_pending_sends_.emplace(wr_id, pending);
+  lib_assert(inserted,
+             "peer WR-ID collides with an active pending send");
 }
 
 void MemoryNode::handle_peer_send_completion(u64 wr_id) {
+  const auto [completion_owner, completion_sequence] = decode_64bit(wr_id);
   PeerPendingSend pending;
   bool has_pending = false;
   {
@@ -279,6 +356,14 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
     if (pending_it != peer_pending_sends_.end()) {
       pending = pending_it->second;
       peer_pending_sends_.erase(pending_it);
+      if (completion_owner == kPeerSyncWrOwner) {
+        // Keep the ID live across the pending -> completed transition.  Credit
+        // release happens outside this mutex, so without this reservation a
+        // sequence wrap could reallocate the ID in that short window.
+        const auto [_, inserted] = peer_reserved_wr_ids_.insert(wr_id);
+        lib_assert(inserted,
+                   "peer sync completion transition reservation collided");
+      }
       has_pending = true;
     }
   }
@@ -288,40 +373,85 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
       return;
     }
     const u32 read_count = std::max<u32>(1, pending.rdma_read_count);
+    bool released_read_credit = false;
     if (pending.rdma_read_credit) {
-      peer_rdma_read_outstanding_[pending.target_shard].fetch_sub(
-        read_count, std::memory_order_acq_rel);
-      if (pending.target_shard < peer_rdma_read_qp_outstanding_.size() &&
-          pending.target_qp_idx < peer_rdma_read_qp_outstanding_[pending.target_shard].size()) {
-        peer_rdma_read_qp_outstanding_[pending.target_shard][pending.target_qp_idx].fetch_sub(
+      lib_assert(pending.target_shard <
+                   peer_rdma_read_outstanding_.size() &&
+                   pending.target_shard <
+                     peer_rdma_read_qp_outstanding_.size(),
+                 "peer RDMA completion has an invalid credit shard");
+      lib_assert(pending.target_qp_idx <
+                   peer_rdma_read_qp_outstanding_[pending.target_shard].size(),
+                 "peer RDMA completion has an invalid credit QP");
+      const u32 previous_peer =
+        peer_rdma_read_outstanding_[pending.target_shard].fetch_sub(
           read_count, std::memory_order_acq_rel);
-      }
+      lib_assert(previous_peer >= read_count,
+                 "peer RDMA completion underflowed peer read credits");
+      const u32 previous_qp =
+        peer_rdma_read_qp_outstanding_
+          [pending.target_shard][pending.target_qp_idx].fetch_sub(
+            read_count, std::memory_order_acq_rel);
+      lib_assert(previous_qp >= read_count,
+                 "peer RDMA completion underflowed QP read credits");
+      const u32 previous_global = peer_async_rdma_outstanding_.fetch_sub(
+        read_count, std::memory_order_acq_rel);
+      lib_assert(previous_global >= read_count,
+                 "peer RDMA completion underflowed global read credits");
+      released_read_credit = true;
     }
     if (pending.async) {
       lib_assert(pending.thread != nullptr, "async peer RDMA completion has no owner thread");
       lib_assert(pending.coroutine_id < pending.thread->post_balances.size(),
                  "async peer RDMA completion has invalid coroutine id");
       auto& balance = pending.thread->post_balances[pending.coroutine_id];
-      --balance;
-      peer_async_rdma_outstanding_.fetch_sub(
-        read_count, std::memory_order_acq_rel);
+      const i32 previous = balance.fetch_sub(1, std::memory_order_acq_rel);
+      lib_assert(previous > 0,
+                 "async peer RDMA completion underflowed its search lane");
+      if (released_read_credit || previous == 1) {
+        // A completed chain can make another context credit-runnable before
+        // this lane reaches zero.  Notify on every credit release; the same
+        // notification also publishes this lane's updated post balance.
+        storage_owner_maintenance_cv_.notify_all();
+      }
       return;
+    }
+    if (released_read_credit) {
+      // Synchronous reads/atomics share the same credit domains as Stage2.
+      // Their caller waits on a different condition variable, so explicitly
+      // wake maintenance contexts whose previously rejected wave now fits.
+      storage_owner_maintenance_cv_.notify_all();
     }
   }
 
-  const auto [owner, id] = decode_64bit(wr_id);
-  if (owner == kPeerSyncWrOwner) {
+  if (completion_owner == kPeerSyncWrOwner) {
     {
       std::lock_guard<std::mutex> lock(peer_completion_mutex_);
-      peer_sync_completions_.insert(wr_id);
+      // A non-pending sync WR (currently none in normal operation) may still
+      // carry an allocation reservation.  Consume it before publishing the
+      // completion so wraparound cannot confuse the two states.
+      lib_assert(peer_reserved_wr_ids_.erase(wr_id) == 1,
+                 "peer sync completion lost its transition reservation");
+      const auto [_, inserted] = peer_sync_completions_.insert(wr_id);
+      lib_assert(inserted, "duplicate peer sync completion WR-ID");
     }
     peer_completion_cv_.notify_all();
     return;
   }
-  if (owner < storage_owner_threads_.size() && storage_owner_threads_[owner]) {
-    auto& balance = storage_owner_threads_[owner]->post_balances[id];
-    --balance;
-    peer_async_rdma_outstanding_.fetch_sub(1, std::memory_order_acq_rel);
+  if (completion_owner < storage_owner_threads_.size() &&
+      storage_owner_threads_[completion_owner]) {
+    auto& balance = storage_owner_threads_[completion_owner]
+      ->post_balances[completion_sequence];
+    const i32 previous = balance.fetch_sub(1, std::memory_order_acq_rel);
+    lib_assert(previous > 0,
+               "peer RDMA completion underflowed its coroutine lane");
+    const u32 previous_global = peer_async_rdma_outstanding_.fetch_sub(
+      1, std::memory_order_acq_rel);
+    lib_assert(previous_global > 0,
+               "peer RDMA completion underflowed legacy global credits");
+    // The credit release can unblock a different context even when this
+    // particular coroutine still owns more completions.
+    storage_owner_maintenance_cv_.notify_all();
   }
 }
 
@@ -377,10 +507,27 @@ void MemoryNode::post_peer_read_async(StorageOwnerThread& thread,
   }
   lib_assert(peer_context_ != nullptr, "storage peer context is not initialized");
   lib_assert(thread.has_peer_scratch(), "storage-owner thread scratch is not initialized");
-  lib_assert(shard_id < num_storage_nodes_, "invalid peer shard id: " + std::to_string(shard_id));
+  lib_assert(shard_id < num_storage_nodes_ && shard_id != storage_id_,
+             "invalid remote peer shard id: " + std::to_string(shard_id));
   lib_assert(peer_remote_tokens_[shard_id] != nullptr,
              "peer token is not initialized for shard " + std::to_string(shard_id));
-  lib_assert(remote_offset + bytes <= mn_memory_bytes_, "peer RDMA read exceeds shard bounds");
+  lib_assert(remote_offset <= mn_memory_bytes_ &&
+               bytes <= mn_memory_bytes_ - remote_offset,
+             "peer RDMA read exceeds shard bounds");
+  lib_assert(bytes <= std::numeric_limits<u32>::max(),
+             "peer RDMA read exceeds verbs SGE length");
+  lib_assert(remote_offset <= std::numeric_limits<u64>::max() -
+                 peer_remote_tokens_[shard_id]->address,
+             "peer RDMA remote address overflow");
+  const u64 remote_address =
+    peer_remote_tokens_[shard_id]->address + remote_offset;
+  lib_assert(bytes <= std::numeric_limits<u64>::max() - remote_address,
+             "peer RDMA remote range overflow");
+  const PeerScratchLaneRange lane = peer_scratch_lane_range(thread);
+  const auto [local_begin, local_end] = checked_local_read_range(
+    dst, local_offset, bytes, "peer RDMA read");
+  lib_assert(local_begin >= lane.begin && local_end <= lane.end,
+             "peer RDMA read exceeds its registered scratch lane");
   const u32 qp_idx = memory_node_detail::select_peer_data_qp(
     peer_qps_per_peer_, thread.id + thread.next_peer_data_qp_ticket++);
   QP& qp = peer_data_qp(shard_id, qp_idx);
@@ -406,11 +553,26 @@ void MemoryNode::post_peer_read_async(StorageOwnerThread& thread,
 void MemoryNode::post_peer_reads_async(
     StorageOwnerThread& thread,
     span<const PeerReadRequest> requests) {
-  if (requests.empty()) return;
+  const bool posted = post_peer_reads_async_impl(thread, requests, false);
+  lib_assert(posted, "blocking peer RDMA read post unexpectedly deferred");
+}
+
+bool MemoryNode::try_post_peer_reads_async(
+    StorageOwnerThread& thread,
+    span<const PeerReadRequest> requests) {
+  return post_peer_reads_async_impl(thread, requests, true);
+}
+
+bool MemoryNode::post_peer_reads_async_impl(
+    StorageOwnerThread& thread,
+    span<const PeerReadRequest> requests,
+    const bool try_only) {
+  if (requests.empty()) return true;
   lib_assert(peer_context_ != nullptr,
              "storage peer context is not initialized");
   lib_assert(thread.has_peer_scratch(),
              "storage-owner thread scratch is not initialized");
+  const PeerScratchLaneRange lane = peer_scratch_lane_range(thread);
 
   struct AssignedRead {
     PeerReadRequest request;
@@ -431,8 +593,14 @@ void MemoryNode::post_peer_reads_async(
              "peer RDMA read batch has no transport credit");
   thread_local vec<u32> active_qp_by_shard;
   thread_local vec<u32> active_fill_by_shard;
+  thread_local vec<u32> wave_qp_start_by_shard;
+  thread_local vec<u32> wave_qp_chain_by_shard;
+  thread_local vec<u8> wave_qp_initialized_by_shard;
   active_qp_by_shard.resize(num_storage_nodes_);
   active_fill_by_shard.assign(num_storage_nodes_, 0);
+  wave_qp_start_by_shard.resize(num_storage_nodes_);
+  wave_qp_chain_by_shard.assign(num_storage_nodes_, 0);
+  wave_qp_initialized_by_shard.assign(num_storage_nodes_, 0);
 
   for (const PeerReadRequest& request : requests) {
     if (request.bytes == 0) continue;
@@ -448,6 +616,20 @@ void MemoryNode::post_peer_reads_async(
                "peer RDMA read batch exceeds shard bounds");
     lib_assert(request.bytes <= std::numeric_limits<u32>::max(),
                "peer RDMA read batch item exceeds verbs SGE length");
+    lib_assert(request.remote_offset <= std::numeric_limits<u64>::max() -
+                   peer_remote_tokens_[request.shard_id]->address,
+               "peer RDMA read batch remote address overflow");
+    const u64 remote_address =
+      peer_remote_tokens_[request.shard_id]->address +
+      request.remote_offset;
+    lib_assert(request.bytes <=
+                 std::numeric_limits<u64>::max() - remote_address,
+               "peer RDMA read batch remote range overflow");
+    const auto [local_begin, local_end] = checked_local_read_range(
+      request.destination, request.local_offset, request.bytes,
+      "peer RDMA read batch item");
+    lib_assert(local_begin >= lane.begin && local_end <= lane.end,
+               "peer RDMA read batch exceeds its registered scratch lane");
     // Rotate QPs once per bounded linked chain, not once per WR. Striping
     // every individual item makes every chain a singleton when a node owns
     // many QPs and defeats CQ/WQE batching. Independent waves and workers
@@ -455,9 +637,20 @@ void MemoryNode::post_peer_reads_async(
     // per-(remote shard, QP) ownership.
     if (active_fill_by_shard[request.shard_id] == 0 ||
         active_fill_by_shard[request.shard_id] == chain_limit) {
+      if (wave_qp_initialized_by_shard[request.shard_id] == 0) {
+        // Take one rotating start ticket per shard and wave. Chains of this
+        // shard then advance by their own ordinal, so interleaved requests
+        // for other shards cannot consume its QP sequence and make it reuse
+        // one QP before visiting every data lane.
+        wave_qp_start_by_shard[request.shard_id] =
+          thread.id + thread.next_peer_data_qp_ticket++;
+        wave_qp_initialized_by_shard[request.shard_id] = 1;
+      }
       active_qp_by_shard[request.shard_id] =
-        memory_node_detail::select_peer_data_qp(
-          peer_qps_per_peer_, thread.id + thread.next_peer_data_qp_ticket++);
+        memory_node_detail::select_peer_data_qp_for_wave_chain(
+          peer_qps_per_peer_,
+          wave_qp_start_by_shard[request.shard_id],
+          wave_qp_chain_by_shard[request.shard_id]++);
       active_fill_by_shard[request.shard_id] = 0;
     }
     const u32 qp_idx = active_qp_by_shard[request.shard_id];
@@ -469,6 +662,64 @@ void MemoryNode::post_peer_reads_async(
 
   thread_local vec<ibv_send_wr> work_requests;
   thread_local vec<ibv_sge> scatter_gather_entries;
+
+  thread_local vec<memory_node_detail::PeerRdmaReadCreditRequest>
+    credit_requests;
+  credit_requests.clear();
+  u64 wave_read_count = 0;
+  thread_local vec<u64> wave_reads_by_shard;
+  thread_local vec<u64> wave_reads_by_qp;
+  wave_reads_by_shard.assign(num_storage_nodes_, 0);
+  wave_reads_by_qp.assign(group_count, 0);
+  for (const vec<AssignedRead>& group : groups) {
+    if (group.empty()) continue;
+    const u32 shard_id = group.front().request.shard_id;
+    const u32 qp_idx = group.front().qp_idx;
+    const size_t group_index =
+      static_cast<size_t>(shard_id) * peer_qps_per_peer_ + qp_idx;
+    for (size_t begin = 0; begin < group.size(); begin += chain_limit) {
+      const size_t end = std::min(
+        group.size(), begin + static_cast<size_t>(chain_limit));
+      const u32 read_count = static_cast<u32>(end - begin);
+      credit_requests.push_back({
+        .peer_outstanding = &peer_rdma_read_outstanding_[shard_id],
+        .qp_outstanding =
+          &peer_rdma_read_qp_outstanding_[shard_id][qp_idx],
+        .count = read_count,
+      });
+      wave_read_count += read_count;
+      wave_reads_by_shard[shard_id] += read_count;
+      wave_reads_by_qp[group_index] += read_count;
+    }
+  }
+
+  if (try_only) {
+    // A try-post is all-or-nothing.  Reject a programming error explicitly
+    // instead of returning false forever for a wave that can never fit the
+    // static transport window.  The resumable Stage2 caller chunks waves to
+    // these same per-QP, per-peer and global limits.
+    lib_assert(wave_read_count <= peer_rdma_read_global_credit_limit(),
+               "nonblocking peer RDMA read wave exceeds global credit");
+    for (u32 shard_id = 0; shard_id < num_storage_nodes_; ++shard_id) {
+      lib_assert(wave_reads_by_shard[shard_id] <=
+                   peer_rdma_read_credit_limit(),
+                 "nonblocking peer RDMA read wave exceeds peer credit");
+    }
+    for (u64 count : wave_reads_by_qp) {
+      lib_assert(count <= peer_rdma_read_credit_limit_per_qp(),
+                 "nonblocking peer RDMA read wave exceeds QP credit");
+    }
+
+    if (!memory_node_detail::try_reserve_peer_rdma_read_wave(
+          span<const memory_node_detail::PeerRdmaReadCreditRequest>{
+            credit_requests},
+          peer_async_rdma_outstanding_, peer_rdma_read_credit_plan())) {
+      // The helper rolls back the complete prefix before returning to the
+      // scheduler. A false result therefore owns no partial credit and has
+      // posted no WR.
+      return false;
+    }
+  }
 
   for (vec<AssignedRead>& group : groups) {
     if (group.empty()) continue;
@@ -483,7 +734,9 @@ void MemoryNode::post_peer_reads_async(
       // Reserve the complete chain all-or-nothing. A producer never waits
       // while holding credits for an unposted prefix, so two maintenance
       // workers cannot split the global window and deadlock each other.
-      acquire_peer_rdma_read_group(shard_id, qp_idx, read_count);
+      if (!try_only) {
+        acquire_peer_rdma_read_group(shard_id, qp_idx, read_count);
+      }
 
       work_requests.resize(read_count);
       scatter_gather_entries.resize(read_count);
@@ -538,12 +791,29 @@ void MemoryNode::post_peer_reads_async(
       }
     }
   }
+  return true;
 }
 
 void MemoryNode::post_peer_read_pairs_async(
     StorageOwnerThread& thread,
     span<const PeerReadPairRequest> requests) {
-  if (requests.empty()) return;
+  const bool posted = post_peer_read_pairs_async_impl(
+    thread, requests, false);
+  lib_assert(posted,
+             "blocking ordered peer snapshot post unexpectedly deferred");
+}
+
+bool MemoryNode::try_post_peer_read_pairs_async(
+    StorageOwnerThread& thread,
+    span<const PeerReadPairRequest> requests) {
+  return post_peer_read_pairs_async_impl(thread, requests, true);
+}
+
+bool MemoryNode::post_peer_read_pairs_async_impl(
+    StorageOwnerThread& thread,
+    span<const PeerReadPairRequest> requests,
+    const bool try_only) {
+  if (requests.empty()) return true;
   lib_assert(peer_context_ != nullptr,
              "storage peer context is not initialized");
   lib_assert(thread.has_peer_scratch(),
@@ -568,27 +838,20 @@ void MemoryNode::post_peer_read_pairs_async(
 
   thread_local vec<u32> active_qp_by_shard;
   thread_local vec<u32> active_fill_by_shard;
+  thread_local vec<u32> wave_qp_start_by_shard;
+  thread_local vec<u32> wave_qp_chain_by_shard;
+  thread_local vec<u8> wave_qp_initialized_by_shard;
   active_qp_by_shard.resize(num_storage_nodes_);
   active_fill_by_shard.assign(num_storage_nodes_, 0);
+  wave_qp_start_by_shard.resize(num_storage_nodes_);
+  wave_qp_chain_by_shard.assign(num_storage_nodes_, 0);
+  wave_qp_initialized_by_shard.assign(num_storage_nodes_, 0);
 
-  const uintptr_t scratch_begin = reinterpret_cast<uintptr_t>(
-    thread.scratch_buffer.get_full_buffer());
-  lib_assert(thread.scratch_buffer.buffer_size <=
-               std::numeric_limits<uintptr_t>::max() - scratch_begin,
-             "storage-owner scratch address range overflow");
-  const uintptr_t scratch_end =
-    scratch_begin + thread.scratch_buffer.buffer_size;
+  const PeerScratchLaneRange lane = peer_scratch_lane_range(thread);
   const auto local_range = [&](const PeerReadRequest& request) {
-    const uintptr_t destination =
-      reinterpret_cast<uintptr_t>(request.destination);
-    lib_assert(request.local_offset <=
-                 std::numeric_limits<uintptr_t>::max() - destination,
-               "ordered peer snapshot local offset overflow");
-    const uintptr_t begin = destination + request.local_offset;
-    lib_assert(request.bytes <=
-                 std::numeric_limits<uintptr_t>::max() - begin,
-               "ordered peer snapshot local range overflow");
-    return std::pair<uintptr_t, uintptr_t>{begin, begin + request.bytes};
+    return checked_local_read_range(
+      request.destination, request.local_offset, request.bytes,
+      "ordered peer snapshot");
   };
 
   for (const PeerReadPairRequest& pair : requests) {
@@ -613,20 +876,35 @@ void MemoryNode::post_peer_read_pairs_async(
                "ordered peer snapshot pair exceeds shard bounds");
     lib_assert(full.bytes <= std::numeric_limits<u32>::max(),
                "ordered peer full snapshot exceeds verbs SGE length");
+    lib_assert(full.remote_offset <= std::numeric_limits<u64>::max() -
+                   peer_remote_tokens_[full.shard_id]->address,
+               "ordered peer snapshot remote address overflow");
+    const u64 remote_address =
+      peer_remote_tokens_[full.shard_id]->address + full.remote_offset;
+    lib_assert(full.bytes <=
+                 std::numeric_limits<u64>::max() - remote_address,
+               "ordered peer snapshot remote range overflow");
 
     const auto [full_begin, full_end] = local_range(full);
     const auto [after_begin, after_end] = local_range(after);
-    lib_assert(full_begin >= scratch_begin && full_end <= scratch_end &&
-                 after_begin >= scratch_begin && after_end <= scratch_end,
-               "ordered peer snapshot pair exceeds registered scratch");
+    lib_assert(full_begin >= lane.begin && full_end <= lane.end &&
+                 after_begin >= lane.begin && after_end <= lane.end,
+               "ordered peer snapshot pair exceeds registered scratch lane");
     lib_assert(full_end <= after_begin || after_end <= full_begin,
                "ordered peer after-header overlaps the before snapshot");
 
     if (active_fill_by_shard[full.shard_id] == 0 ||
         active_fill_by_shard[full.shard_id] == pair_chain_limit) {
+      if (wave_qp_initialized_by_shard[full.shard_id] == 0) {
+        wave_qp_start_by_shard[full.shard_id] =
+          thread.id + thread.next_peer_data_qp_ticket++;
+        wave_qp_initialized_by_shard[full.shard_id] = 1;
+      }
       active_qp_by_shard[full.shard_id] =
-        memory_node_detail::select_peer_data_qp(
-          peer_qps_per_peer_, thread.id + thread.next_peer_data_qp_ticket++);
+        memory_node_detail::select_peer_data_qp_for_wave_chain(
+          peer_qps_per_peer_,
+          wave_qp_start_by_shard[full.shard_id],
+          wave_qp_chain_by_shard[full.shard_id]++);
       active_fill_by_shard[full.shard_id] = 0;
     }
     const u32 qp_idx = active_qp_by_shard[full.shard_id];
@@ -638,6 +916,64 @@ void MemoryNode::post_peer_read_pairs_async(
 
   thread_local vec<ibv_send_wr> work_requests;
   thread_local vec<ibv_sge> scatter_gather_entries;
+
+  thread_local vec<memory_node_detail::PeerRdmaReadCreditRequest>
+    credit_requests;
+  credit_requests.clear();
+  u64 wave_read_count = 0;
+  thread_local vec<u64> wave_reads_by_shard;
+  thread_local vec<u64> wave_reads_by_qp;
+  wave_reads_by_shard.assign(num_storage_nodes_, 0);
+  wave_reads_by_qp.assign(group_count, 0);
+  for (const vec<AssignedPair>& group : groups) {
+    if (group.empty()) continue;
+    const u32 shard_id = group.front().request.full_snapshot.shard_id;
+    const u32 qp_idx = group.front().qp_idx;
+    const size_t group_index =
+      static_cast<size_t>(shard_id) * peer_qps_per_peer_ + qp_idx;
+    for (size_t begin = 0; begin < group.size();
+         begin += pair_chain_limit) {
+      const size_t end = std::min(
+        group.size(), begin + static_cast<size_t>(pair_chain_limit));
+      const u32 pair_count = static_cast<u32>(end - begin);
+      const u32 read_count =
+        memory_node_detail::peer_rdma_read_pair_work_request_count(
+          pair_count);
+      lib_assert(read_count != 0,
+                 "ordered peer snapshot pair WR count overflow");
+      credit_requests.push_back({
+        .peer_outstanding = &peer_rdma_read_outstanding_[shard_id],
+        .qp_outstanding =
+          &peer_rdma_read_qp_outstanding_[shard_id][qp_idx],
+        .count = read_count,
+      });
+      wave_read_count += read_count;
+      wave_reads_by_shard[shard_id] += read_count;
+      wave_reads_by_qp[group_index] += read_count;
+    }
+  }
+
+  if (try_only) {
+    lib_assert(wave_read_count <= peer_rdma_read_global_credit_limit(),
+               "nonblocking ordered snapshot wave exceeds global credit");
+    for (u32 shard_id = 0; shard_id < num_storage_nodes_; ++shard_id) {
+      lib_assert(wave_reads_by_shard[shard_id] <=
+                   peer_rdma_read_credit_limit(),
+                 "nonblocking ordered snapshot wave exceeds peer credit");
+    }
+    for (u64 count : wave_reads_by_qp) {
+      lib_assert(count <= peer_rdma_read_credit_limit_per_qp(),
+                 "nonblocking ordered snapshot wave exceeds QP credit");
+    }
+
+    if (!memory_node_detail::try_reserve_peer_rdma_read_wave(
+          span<const memory_node_detail::PeerRdmaReadCreditRequest>{
+            credit_requests},
+          peer_async_rdma_outstanding_, peer_rdma_read_credit_plan())) {
+      return false;
+    }
+  }
+
   for (vec<AssignedPair>& group : groups) {
     if (group.empty()) continue;
     const u32 shard_id = group.front().request.full_snapshot.shard_id;
@@ -658,7 +994,9 @@ void MemoryNode::post_peer_read_pairs_async(
       // A pair is never split across QPs/chains, and the only signaled WR is
       // the chain tail.  RC ordering therefore guarantees full snapshot ->
       // after-header before the caller observes completion.
-      acquire_peer_rdma_read_group(shard_id, qp_idx, read_count);
+      if (!try_only) {
+        acquire_peer_rdma_read_group(shard_id, qp_idx, read_count);
+      }
       work_requests.resize(read_count);
       scatter_gather_entries.resize(read_count);
       const MemoryRegionToken& token = *peer_remote_tokens_[shard_id];
@@ -721,6 +1059,7 @@ void MemoryNode::post_peer_read_pairs_async(
       }
     }
   }
+  return true;
 }
 
 void MemoryNode::remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, size_t bytes, size_t scratch_offset) {
@@ -743,8 +1082,15 @@ void MemoryNode::remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, s
     owner_thread != nullptr && owner_thread->has_peer_scratch() ? owner_thread->scratch_buffer : peer_scratch_buffer_;
   LocalMemoryRegion& scratch_region =
     owner_thread != nullptr && owner_thread->has_peer_scratch() ? *owner_thread->scratch_region : *peer_scratch_region_;
-  lib_assert(scratch_offset + bytes <= scratch_buffer.buffer_size, "peer scratch buffer exhausted");
-  byte_t* scratch = scratch_buffer.get_full_buffer() + scratch_offset;
+  const size_t scratch_capacity =
+    owner_thread != nullptr && owner_thread->has_peer_scratch()
+      ? owner_thread->scratch_stride : scratch_buffer.buffer_size;
+  lib_assert(scratch_offset <= scratch_capacity &&
+               bytes <= scratch_capacity - scratch_offset,
+             "peer scratch buffer exhausted");
+  byte_t* scratch = owner_thread != nullptr && owner_thread->has_peer_scratch()
+    ? owner_thread->coroutine_scratch(scratch_offset)
+    : scratch_buffer.get_full_buffer() + scratch_offset;
   acquire_peer_rdma_read_credit(shard_id, qp_idx);
   const u64 wr_id = next_peer_sync_wr_id();
   {
@@ -764,7 +1110,7 @@ void MemoryNode::remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, s
                   wr_id);
   }
   wait_peer_sync_completion(wr_id);
-  std::memcpy(dst, scratch, bytes);
+  if (dst != scratch) std::memcpy(dst, scratch, bytes);
 }
 
 void MemoryNode::remote_write_bytes(u32 shard_id, u64 remote_offset, const void* src, size_t bytes, size_t scratch_offset) {
@@ -787,11 +1133,21 @@ void MemoryNode::remote_write_bytes(u32 shard_id, u64 remote_offset, const void*
     owner_thread != nullptr && owner_thread->has_peer_scratch() ? owner_thread->scratch_buffer : peer_scratch_buffer_;
   LocalMemoryRegion& scratch_region =
     owner_thread != nullptr && owner_thread->has_peer_scratch() ? *owner_thread->scratch_region : *peer_scratch_region_;
-  lib_assert(scratch_offset + bytes <= scratch_buffer.buffer_size, "peer scratch buffer exhausted");
-  byte_t* scratch = scratch_buffer.get_full_buffer() + scratch_offset;
-  std::memcpy(scratch, src, bytes);
+  const size_t scratch_capacity =
+    owner_thread != nullptr && owner_thread->has_peer_scratch()
+      ? owner_thread->scratch_stride : scratch_buffer.buffer_size;
+  lib_assert(scratch_offset <= scratch_capacity &&
+               bytes <= scratch_capacity - scratch_offset,
+             "peer scratch buffer exhausted");
+  byte_t* scratch = owner_thread != nullptr && owner_thread->has_peer_scratch()
+    ? owner_thread->coroutine_scratch(scratch_offset)
+    : scratch_buffer.get_full_buffer() + scratch_offset;
+  if (src != scratch) std::memcpy(scratch, src, bytes);
   const u64 wr_id = next_peer_sync_wr_id();
   {
+    register_peer_pending_send_locked(
+      wr_id,
+      PeerPendingSend{shard_id, qp_idx, 0, 0, nullptr, false, false});
     std::lock_guard<std::mutex> send_lock(*peer_qp_send_mutexes_[shard_id][qp_idx]);
     qp->post_send(reinterpret_cast<u64>(scratch),
                   static_cast<u32>(bytes),
@@ -825,8 +1181,16 @@ u64 MemoryNode::remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 exp
     owner_thread != nullptr && owner_thread->has_peer_scratch() ? owner_thread->scratch_buffer : peer_scratch_buffer_;
   LocalMemoryRegion& scratch_region =
     owner_thread != nullptr && owner_thread->has_peer_scratch() ? *owner_thread->scratch_region : *peer_scratch_region_;
-  lib_assert(scratch_offset + sizeof(u64) <= scratch_buffer.buffer_size, "peer scratch buffer exhausted");
-  auto* scratch = reinterpret_cast<u64*>(scratch_buffer.get_full_buffer() + scratch_offset);
+  const size_t scratch_capacity =
+    owner_thread != nullptr && owner_thread->has_peer_scratch()
+      ? owner_thread->scratch_stride : scratch_buffer.buffer_size;
+  lib_assert(scratch_offset <= scratch_capacity &&
+               sizeof(u64) <= scratch_capacity - scratch_offset,
+             "peer scratch buffer exhausted");
+  auto* scratch = reinterpret_cast<u64*>(
+    owner_thread != nullptr && owner_thread->has_peer_scratch()
+      ? owner_thread->coroutine_scratch(scratch_offset)
+      : scratch_buffer.get_full_buffer() + scratch_offset);
   *scratch = 0;
   acquire_peer_rdma_read_credit(shard_id, qp_idx);
   const u64 wr_id = next_peer_sync_wr_id();
@@ -873,10 +1237,16 @@ u64 MemoryNode::remote_fetch_add(u32 shard_id,
   LocalMemoryRegion& scratch_region =
     owner_thread != nullptr && owner_thread->has_peer_scratch()
       ? *owner_thread->scratch_region : *peer_scratch_region_;
-  lib_assert(scratch_offset + sizeof(u64) <= scratch_buffer.buffer_size,
+  const size_t scratch_capacity =
+    owner_thread != nullptr && owner_thread->has_peer_scratch()
+      ? owner_thread->scratch_stride : scratch_buffer.buffer_size;
+  lib_assert(scratch_offset <= scratch_capacity &&
+               sizeof(u64) <= scratch_capacity - scratch_offset,
              "peer scratch buffer exhausted");
   auto* scratch = reinterpret_cast<u64*>(
-    scratch_buffer.get_full_buffer() + scratch_offset);
+    owner_thread != nullptr && owner_thread->has_peer_scratch()
+      ? owner_thread->coroutine_scratch(scratch_offset)
+      : scratch_buffer.get_full_buffer() + scratch_offset);
   *scratch = 0;
   acquire_peer_rdma_read_credit(shard_id, qp_idx);
   const u64 wr_id = next_peer_sync_wr_id();

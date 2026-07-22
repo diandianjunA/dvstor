@@ -54,6 +54,20 @@ dvstor_target_common_includes(peer_rdma_credit_policy_test)
 target_compile_options(peer_rdma_credit_policy_test PRIVATE -UNDEBUG)
 add_test(NAME peer_rdma_credit_policy_test COMMAND peer_rdma_credit_policy_test)
 
+add_executable(stage1_control_fanout_policy_test
+    stage1_control_fanout_policy_test.cc)
+dvstor_target_common_includes(stage1_control_fanout_policy_test)
+target_compile_options(stage1_control_fanout_policy_test PRIVATE -UNDEBUG)
+add_test(NAME stage1_control_fanout_policy_test
+         COMMAND stage1_control_fanout_policy_test)
+
+add_executable(stage2_score_round_robin_test
+    stage2_score_round_robin_test.cc)
+dvstor_target_common_includes(stage2_score_round_robin_test)
+target_compile_options(stage2_score_round_robin_test PRIVATE -UNDEBUG)
+add_test(NAME stage2_score_round_robin_test
+         COMMAND stage2_score_round_robin_test)
+
 add_executable(bounded_update_primitives_test bounded_update_primitives_test.cc)
 target_link_libraries(bounded_update_primitives_test PRIVATE dvstor_runtime)
 target_compile_options(bounded_update_primitives_test PRIVATE -UNDEBUG)
@@ -274,6 +288,18 @@ add_executable(storage_owner_stage2_tracker_test
 target_compile_options(storage_owner_stage2_tracker_test PRIVATE -UNDEBUG)
 add_test(NAME storage_owner_stage2_tracker_test
     COMMAND storage_owner_stage2_tracker_test)
+
+add_executable(stage2_reconcile_batch_state_test
+    stage2_reconcile_batch_state_test.cc)
+dvstor_target_common_includes(stage2_reconcile_batch_state_test)
+target_compile_options(stage2_reconcile_batch_state_test PRIVATE -UNDEBUG)
+add_test(NAME stage2_reconcile_batch_state_test
+    COMMAND stage2_reconcile_batch_state_test)
+
+add_executable(stage2_batch_policy_test stage2_batch_policy_test.cc)
+dvstor_target_common_includes(stage2_batch_policy_test)
+target_compile_options(stage2_batch_policy_test PRIVATE -UNDEBUG)
+add_test(NAME stage2_batch_policy_test COMMAND stage2_batch_policy_test)
 
 add_executable(storage_owner_reverse_outbox_test
     storage_owner_reverse_outbox_test.cc)

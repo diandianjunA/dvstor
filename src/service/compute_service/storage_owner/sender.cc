@@ -55,39 +55,74 @@ void ComputeService::run_storage_insert_progress_loop() {
 bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
   const u32 owner_count = static_cast<u32>(storage_insert_owners_.size());
   if (owner_count == 0) return false;
+  const u64 max_wait_ns =
+    static_cast<u64>(config_.storage_owner_batch_max_wait_us) * 1000ull;
+  const auto now_ns = []() {
+    return static_cast<u64>(std::chrono::duration_cast<
+      std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+  };
   bool progressed = false;
   for (u32 offset = 0; offset < owner_count; ++offset) {
     const u32 owner = (first_owner + offset) % owner_count;
     auto& state = *storage_insert_owners_[owner];
     const u32 batch_max = std::max<u32>(
       1, config_.storage_owner_batch_max);
-    {
-      const u32 ready = state.published_tasks.load(
-        std::memory_order_acquire);
-      const u32 free = static_cast<u32>(state.free_slots.size());
-      const u32 active = static_cast<u32>(state.slots.size()) - free;
-      const auto decision = decide_storage_owner_batch(
-        state.saturated_batch_epoch, ready, active, free,
-        state.pending_producers.load(std::memory_order_acquire), batch_max);
-      state.saturated_batch_epoch = decision.saturated;
+    const u32 initially_ready = state.published_tasks.load(
+      std::memory_order_acquire);
+    state.max_published_tasks = std::max(
+      state.max_published_tasks, initially_ready);
+    if (initially_ready == 0) {
+      state.oldest_published_observed_ns = 0;
+    } else if (state.oldest_published_observed_ns == 0) {
+      // Observe demand even while every RPC lane is occupied. When a lane is
+      // reclaimed, an already-aged tail must flush immediately rather than
+      // starting a fresh wait interval at credit availability.
+      state.oldest_published_observed_ns = now_ns();
     }
     while (!state.free_slots.empty()) {
       const u32 ready = state.published_tasks.load(
         std::memory_order_acquire);
+      if (ready == 0) {
+        state.oldest_published_observed_ns = 0;
+        state.dispatch_epoch_remaining = 0;
+        state.dispatch_epoch_idle_flush = false;
+        state.dispatch_epoch_max_wait_flush = false;
+        break;
+      }
+      const u64 observed_now_ns = now_ns();
+      if (state.oldest_published_observed_ns == 0) {
+        state.oldest_published_observed_ns = observed_now_ns;
+      }
       const u32 free = static_cast<u32>(state.free_slots.size());
       const u32 active = static_cast<u32>(state.slots.size()) - free;
-      const auto decision = decide_storage_owner_batch(
-        state.saturated_batch_epoch, ready, active, free,
-        state.pending_producers.load(std::memory_order_acquire), batch_max);
-      state.saturated_batch_epoch = decision.saturated;
-      if (decision.take == 0) break;
+      state.max_active_rpcs = std::max(state.max_active_rpcs, active);
+      if (state.dispatch_epoch_remaining == 0) {
+        const auto decision = decide_storage_owner_batch(
+          ready, active, free,
+          state.pending_producers.load(std::memory_order_acquire), batch_max,
+          state.oldest_published_observed_ns, observed_now_ns, max_wait_ns);
+        if (decision.take == 0) break;
+        // Snapshot the currently published credit. New arrivals cannot extend
+        // this epoch indefinitely and therefore cannot starve an older tail.
+        state.dispatch_epoch_remaining = ready;
+        state.dispatch_epoch_idle_flush = decision.idle_flush;
+        state.dispatch_epoch_max_wait_flush = decision.max_wait_flush;
+      }
+
+      const u32 epoch_ready = std::min(
+        ready, state.dispatch_epoch_remaining);
+      const u32 take = storage_owner_dispatch_epoch_take(
+        epoch_ready, free, batch_max, state.dispatch_epoch_idle_flush);
+      lib_assert(take != 0,
+                 "storage-owner dispatch epoch lost its visible credit");
 
       const u32 slot_id = state.free_slots.back();
       state.free_slots.pop_back();
       auto& slot = state.slots[slot_id];
       slot.tasks.clear();
       const u32 dequeued = dequeue_storage_owner_visible_prefix(
-        *state.queue, decision.take, slot.tasks);
+        *state.queue, take, slot.tasks);
       if (dequeued == 0) {
         // A producer can be preempted after reserving the FIFO head but before
         // publishing it. Later cells may already contribute to
@@ -98,15 +133,30 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
         state.free_slots.push_back(slot_id);
         break;
       }
-      state.partial_visible_batches += dequeued < decision.take;
+      state.partial_visible_batches += dequeued < take;
       const u32 previous = state.published_tasks.fetch_sub(
         dequeued, std::memory_order_acq_rel);
       lib_assert(previous >= dequeued,
                  "storage-owner published task counter underflow");
+      const auto dequeued_at = std::chrono::steady_clock::now();
+      const u64 dequeued_at_ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+          dequeued_at.time_since_epoch()).count());
+      lib_assert(state.dispatch_epoch_remaining >= dequeued,
+                 "storage-owner dispatch epoch counter underflow");
+      state.dispatch_epoch_remaining -= dequeued;
       ++state.rpc_batches;
       state.rpc_items += dequeued;
       state.full_batches += dequeued == batch_max;
-      state.tail_escape_batches += decision.tail_escape;
+      state.tail_escape_batches += state.dispatch_epoch_idle_flush;
+      state.max_wait_flush_batches += state.dispatch_epoch_max_wait_flush;
+      if (state.dispatch_epoch_remaining == 0) {
+        state.dispatch_epoch_idle_flush = false;
+        state.dispatch_epoch_max_wait_flush = false;
+        state.oldest_published_observed_ns = rearm_storage_owner_batch_wait(
+          state.published_tasks.load(std::memory_order_acquire),
+          dequeued_at_ns);
+      }
       if (state.rpc_batches >= 32 &&
           (state.rpc_batches & (state.rpc_batches - 1)) == 0) {
         const double average_batch = static_cast<double>(state.rpc_items) /
@@ -118,37 +168,24 @@ bool ComputeService::drain_storage_owner_submissions(u32& first_owner) {
                   << " avg_batch=" << average_batch
                   << " full_batches=" << state.full_batches
                   << " tail_escape_batches=" << state.tail_escape_batches
+                  << " max_wait_flush_batches="
+                  << state.max_wait_flush_batches
                   << " queue_visibility_stalls="
                   << state.queue_visibility_stalls
                   << " partial_visible_batches="
                   << state.partial_visible_batches
-                  << " saturated=" << std::boolalpha
-                  << state.saturated_batch_epoch << std::noboolalpha
                   << " published="
                   << state.published_tasks.load(std::memory_order_relaxed)
                   << std::endl;
       }
-      const auto dequeued_at = std::chrono::steady_clock::now();
       for (const u32 id : slot.tasks) {
         state.tasks[id].sender_dequeued_at = dequeued_at;
       }
       post_storage_owner_batch(owner, slot_id);
+      state.max_active_rpcs = std::max(
+        state.max_active_rpcs,
+        static_cast<u32>(state.slots.size() - state.free_slots.size()));
       progressed = true;
-
-      // Latch saturation at the exact transition where the last RPC credit
-      // was consumed. Waiting until the next progress-loop iteration is
-      // racy with a CQ completion: a newly freed lane could otherwise drain
-      // another tiny tail before the policy ever observes free==0.
-      const u32 remaining_ready = state.published_tasks.load(
-        std::memory_order_acquire);
-      const u32 remaining_free = static_cast<u32>(state.free_slots.size());
-      const u32 remaining_active =
-        static_cast<u32>(state.slots.size()) - remaining_free;
-      state.saturated_batch_epoch = decide_storage_owner_batch(
-        state.saturated_batch_epoch, remaining_ready, remaining_active,
-        remaining_free,
-        state.pending_producers.load(std::memory_order_acquire),
-        batch_max).saturated;
     }
   }
   first_owner = (first_owner + 1) % owner_count;

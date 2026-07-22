@@ -1,4 +1,5 @@
 #include <cassert>
+#include <vector>
 
 #include "memory_node/storage_owner_state.hh"
 #include "memory_node/storage_owner_index/graph_pointer_validation.hh"
@@ -47,6 +48,38 @@ int main() {
   assert(batch_slot_stride == graph_stride);
   assert(graph_stride + VamanaNode::hot_graph_entry_size() <=
          2 * graph_stride);
+
+  // A checksummed counted prefix cannot contain an empty slot. Accepting it
+  // as a shorter list would let maintenance silently discard an authoritative
+  // edge after a durable malformed publication.
+  const RemotePtr encoded_neighbors[] = {
+    RemotePtr{0, 0x2000}, RemotePtr{1, 0x4000}};
+  std::vector<byte_t> compact_graph(VamanaNode::hot_graph_entry_size());
+  std::vector<byte_t> decoded_graph(VamanaNode::neighbor_read_size());
+  VamanaNode::encode_hot_graph_entry(
+    compact_graph.data(), 2, encoded_neighbors, 2,
+    VamanaNode::HOT_GRAPH_SHARD_BITS);
+  assert(VamanaNode::decode_hot_graph_entry(
+    compact_graph.data(), decoded_graph.data(), 0));
+
+  std::vector<byte_t> reserved_flag_graph = compact_graph;
+  reserved_flag_graph[1] |= 0x02u;
+  vamana::hot_graph::store_u16_le(
+    reserved_flag_graph.data() + 2,
+    vamana::hot_graph::checksum16(
+      reserved_flag_graph.data(), reserved_flag_graph.size()));
+  assert(!VamanaNode::decode_hot_graph_entry(
+    reserved_flag_graph.data(), decoded_graph.data(), 0));
+
+  (void)vamana::hot_graph::encode_remote_ptr(
+    RemotePtr{}, VamanaNode::HOT_GRAPH_SHARD_BITS,
+    compact_graph.data() + vamana::hot_graph::neighbor_offset(0));
+  vamana::hot_graph::store_u16_le(
+    compact_graph.data() + 2,
+    vamana::hot_graph::checksum16(
+      compact_graph.data(), compact_graph.size()));
+  assert(!VamanaNode::decode_hot_graph_entry(
+    compact_graph.data(), decoded_graph.data(), 0));
 
   const RemotePtr valid{1, kDynamicBase, 7};
   assert(valid.is_well_formed());

@@ -229,7 +229,7 @@ bool MemoryNode::read_node_snapshot(RemotePtr rptr, NodeSnapshot& snapshot) {
 
   StorageOwnerThread* owner_thread = current_storage_owner_thread_;
   byte_t* read_buffer = owner_thread != nullptr && owner_thread->has_peer_scratch()
-                          ? owner_thread->scratch_buffer.get_full_buffer()
+                          ? owner_thread->coroutine_scratch()
                           : peer_scratch_buffer_.get_full_buffer();
   for (u32 attempt = 0; attempt < kMaxReadAttempts; ++attempt) {
     remote_read_bytes(rptr.memory_node(), rptr.byte_offset(), read_buffer,
@@ -445,17 +445,28 @@ bool MemoryNode::read_stable_node_identity(RemotePtr rptr) {
 size_t MemoryNode::read_node_identity_headers_batched_into(
     span<const RemotePtr> rptrs,
     const Configuration& config,
-    vec<std::pair<RemotePtr, u64>>& identities) {
+    vec<std::pair<RemotePtr, u64>>& identities,
+    vec<StableNodeSnapshotState>* states) {
   identities.reserve(rptrs.size());
   size_t identity_count = 0;
+  if (states != nullptr) {
+    states->assign(rptrs.size(), StableNodeSnapshotState::terminal);
+  }
   if (rptrs.empty()) return identity_count;
 
-  const auto next_identity = [&](RemotePtr pointer, u64 header) {
+  const auto set_state = [&](size_t input_index,
+                             StableNodeSnapshotState state) {
+    if (states != nullptr) (*states)[input_index] = state;
+  };
+  const auto next_identity = [&](size_t input_index,
+                                 RemotePtr pointer,
+                                 u64 header) {
     if (identity_count == identities.size()) {
       identities.emplace_back(pointer, header);
     } else {
       identities[identity_count] = {pointer, header};
     }
+    set_state(input_index, StableNodeSnapshotState::stable);
     ++identity_count;
   };
   const auto pointer_valid = [&](RemotePtr pointer) {
@@ -470,33 +481,29 @@ size_t MemoryNode::read_node_identity_headers_batched_into(
     return header.offset <= mn_memory_bytes_ &&
       kIdentityBytes <= mn_memory_bytes_ - header.offset;
   };
-  const auto read_local = [&](RemotePtr pointer) {
-    if (!valid_local_storage_node_pointer(pointer)) return;
+  const auto read_local = [&](size_t input_index, RemotePtr pointer) {
     const byte_t* record = index_buffer_.get_full_buffer() +
       pointer.byte_offset();
     constexpr u32 kMaxReadAttempts = 3;
     for (u32 attempt = 0; attempt < kMaxReadAttempts; ++attempt) {
       const u64 before = load_local_node_header_acquire(pointer);
-      if ((before & VamanaNode::HEADER_NODE_LOCK) != 0 ||
-          VamanaNode::header_incarnation(before) !=
-            pointer.incarnation()) {
-        std::this_thread::yield();
-        continue;
-      }
       const u32 slot_incarnation = *reinterpret_cast<const u32*>(
         record + VamanaNode::offset_slot_incarnation());
       std::atomic_thread_fence(std::memory_order_acquire);
       const u64 after = load_local_node_header_acquire(pointer);
-      if (before == after && slot_incarnation == pointer.incarnation()) {
-        next_identity(pointer, before);
+      const StableNodeSnapshotState disposition =
+        classify_physical_node_snapshot(
+          pointer, before, after, slot_incarnation);
+      if (disposition == StableNodeSnapshotState::stable) {
+        next_identity(input_index, pointer, before);
         return;
       }
-      if (VamanaNode::header_incarnation(after) !=
-          pointer.incarnation()) {
+      if (disposition == StableNodeSnapshotState::terminal) {
         return;
       }
       std::this_thread::yield();
     }
+    set_state(input_index, StableNodeSnapshotState::retryable);
   };
 
   StorageOwnerThread* thread = current_storage_owner_thread_;
@@ -504,44 +511,47 @@ size_t MemoryNode::read_node_identity_headers_batched_into(
     constexpr size_t kIdentityBytes =
       VamanaNode::HEADER_SIZE + VamanaNode::COMPACT_META_SIZE;
     byte_t identity[kIdentityBytes]{};
-    for (const RemotePtr pointer : rptrs) {
+    for (size_t input_index = 0; input_index < rptrs.size(); ++input_index) {
+      const RemotePtr pointer = rptrs[input_index];
       if (!pointer_valid(pointer)) continue;
       if (local_shard(pointer.memory_node())) {
-        read_local(pointer);
+        read_local(input_index, pointer);
         continue;
       }
       constexpr u32 kMaxReadAttempts = 3;
+      bool resolved = false;
       for (u32 attempt = 0; attempt < kMaxReadAttempts; ++attempt) {
         remote_read_bytes(pointer.memory_node(), pointer.byte_offset(),
                           identity, sizeof(identity), 0);
         const u64 before = *reinterpret_cast<const u64*>(identity);
         const u32 slot_incarnation = *reinterpret_cast<const u32*>(
           identity + VamanaNode::offset_slot_incarnation());
-        if ((before & VamanaNode::HEADER_NODE_LOCK) != 0 ||
-            VamanaNode::header_incarnation(before) !=
-              pointer.incarnation() ||
-            slot_incarnation != pointer.incarnation()) {
-          std::this_thread::yield();
-          continue;
-        }
         u64 after = 0;
         remote_read_bytes(pointer.memory_node(), pointer.byte_offset(),
                           &after, sizeof(after), 0);
-        if (before == after) {
-          next_identity(pointer, before);
+        const StableNodeSnapshotState disposition =
+          classify_physical_node_snapshot(
+            pointer, before, after, slot_incarnation);
+        if (disposition == StableNodeSnapshotState::stable) {
+          next_identity(input_index, pointer, before);
+          resolved = true;
           break;
         }
-        if (VamanaNode::header_incarnation(after) !=
-            pointer.incarnation()) {
+        if (disposition == StableNodeSnapshotState::terminal) {
+          resolved = true;
           break;
         }
         std::this_thread::yield();
+      }
+      if (!resolved) {
+        set_state(input_index, StableNodeSnapshotState::retryable);
       }
     }
     return identity_count;
   }
 
   struct PendingIdentityRead {
+    size_t input_index{};
     RemotePtr pointer;
     byte_t* buffer{};
     u64 before{};
@@ -570,7 +580,7 @@ size_t MemoryNode::read_node_identity_headers_batched_into(
       const RemotePtr pointer = rptrs[index];
       if (!pointer_valid(pointer)) continue;
       if (local_shard(pointer.memory_node())) {
-        read_local(pointer);
+        read_local(index, pointer);
         continue;
       }
       const size_t scratch_offset = remote_slot++ * identity_stride;
@@ -583,7 +593,7 @@ size_t MemoryNode::read_node_identity_headers_batched_into(
         .destination = buffer,
         .bytes = kIdentityBytes,
       });
-      pending.push_back({pointer, buffer});
+      pending.push_back({index, pointer, buffer});
     }
     post_peer_reads_async(*thread, span<const PeerReadRequest>{read_requests});
     while (!thread->is_ready(thread->running_coroutine)) {
@@ -591,30 +601,18 @@ size_t MemoryNode::read_node_identity_headers_batched_into(
       std::this_thread::yield();
     }
 
-    size_t valid_count = 0;
     read_requests.clear();
     for (PendingIdentityRead& read : pending) {
       read.before = *reinterpret_cast<const u64*>(read.buffer);
       read.slot_incarnation = *reinterpret_cast<const u32*>(
         read.buffer + VamanaNode::offset_slot_incarnation());
-      if ((read.before & VamanaNode::HEADER_NODE_LOCK) != 0 ||
-          VamanaNode::header_incarnation(read.before) !=
-            read.pointer.incarnation() ||
-          read.slot_incarnation != read.pointer.incarnation()) {
-        continue;
-      }
-      if (valid_count != static_cast<size_t>(&read - pending.data())) {
-        pending[valid_count] = read;
-      }
-      PendingIdentityRead& accepted = pending[valid_count++];
       read_requests.push_back(PeerReadRequest{
-        .shard_id = accepted.pointer.memory_node(),
-        .remote_offset = accepted.pointer.byte_offset(),
-        .destination = accepted.buffer,
+        .shard_id = read.pointer.memory_node(),
+        .remote_offset = read.pointer.byte_offset(),
+        .destination = read.buffer,
         .bytes = VamanaNode::HEADER_SIZE,
       });
     }
-    pending.resize(valid_count);
     post_peer_reads_async(*thread, span<const PeerReadRequest>{read_requests});
     while (!thread->is_ready(thread->running_coroutine)) {
       poll_peer_send_cq();
@@ -622,10 +620,13 @@ size_t MemoryNode::read_node_identity_headers_batched_into(
     }
     for (const PendingIdentityRead& read : pending) {
       const u64 after = *reinterpret_cast<const u64*>(read.buffer);
-      if (read.before == after &&
-          VamanaNode::header_incarnation(after) ==
-            read.pointer.incarnation()) {
-        next_identity(read.pointer, read.before);
+      const StableNodeSnapshotState disposition =
+        classify_physical_node_snapshot(
+          read.pointer, read.before, after, read.slot_incarnation);
+      if (disposition == StableNodeSnapshotState::stable) {
+        next_identity(read.input_index, read.pointer, read.before);
+      } else {
+        set_state(read.input_index, disposition);
       }
     }
   }
@@ -652,7 +653,7 @@ bool MemoryNode::read_graph_adjacency(RemotePtr rptr,
     read_buffer = local_entry.data();
   } else {
     read_buffer = owner_thread != nullptr && owner_thread->has_peer_scratch()
-                    ? owner_thread->scratch_buffer.get_full_buffer()
+                    ? owner_thread->coroutine_scratch()
                     : peer_scratch_buffer_.get_full_buffer();
   }
   constexpr u32 kMaxReadAttempts = 3;
@@ -678,6 +679,7 @@ bool MemoryNode::read_graph_adjacency(RemotePtr rptr,
       provisional_count <= VamanaNode::provisional_slots() &&
       static_cast<u32>(stable_count) + provisional_count <=
         VamanaNode::graph_entry_capacity() &&
+      (read_buffer[1] & 0x0eu) == 0 &&
       vamana::hot_graph::load_u32_le(read_buffer + 8) ==
         rptr.incarnation() &&
       vamana::hot_graph::load_u32_le(read_buffer + 12) == 0 &&
@@ -699,7 +701,14 @@ bool MemoryNode::read_graph_adjacency(RemotePtr rptr,
       const RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
         read_buffer + vamana::hot_graph::neighbor_offset(index),
         VamanaNode::HOT_GRAPH_SHARD_BITS);
-      if (neighbor.is_null()) continue;
+      if (neighbor.is_null()) {
+        // The count is part of the checksummed publication. A null inside
+        // that counted prefix is structural corruption, not unused capacity.
+        malformed_neighbor = true;
+        report_rejected_graph_pointer(
+          "read_graph_adjacency/stable_null", neighbor, rptr, index);
+        continue;
+      }
       if (!storage_node_pointer_addressable(neighbor)) {
         malformed_neighbor = true;
         report_rejected_graph_pointer(
@@ -712,7 +721,12 @@ bool MemoryNode::read_graph_adjacency(RemotePtr rptr,
       const RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
         read_buffer + vamana::hot_graph::neighbor_offset(stable_count + index),
         VamanaNode::HOT_GRAPH_SHARD_BITS);
-      if (neighbor.is_null()) continue;
+      if (neighbor.is_null()) {
+        malformed_neighbor = true;
+        report_rejected_graph_pointer(
+          "read_graph_adjacency/provisional_null", neighbor, rptr, index);
+        continue;
+      }
       if (!storage_node_pointer_addressable(neighbor)) {
         malformed_neighbor = true;
         report_rejected_graph_pointer(
@@ -721,11 +735,15 @@ bool MemoryNode::read_graph_adjacency(RemotePtr rptr,
       }
       adjacency.provisional.push_back(neighbor);
     }
-    // A malformed pointer can be a transient torn graph snapshot. Re-read it
-    // before accepting a filtered entry. On the final attempt, retain the
-    // valid neighbors so one damaged edge cannot disconnect the whole node.
-    if (!malformed_neighbor || attempt + 1 == kMaxReadAttempts) {
-      return true;
+    // A malformed pointer can be a transient torn graph snapshot, so retry
+    // optimistic reads. It must never be accepted after filtering: mutation
+    // maintenance could otherwise acknowledge a graph with silently missing
+    // authoritative edges. Repeated checksum-consistent damage is terminal.
+    if (!malformed_neighbor) return true;
+    if (attempt + 1 == kMaxReadAttempts) {
+      lib_failure(
+        "persistent malformed counted graph edge: parent_raw=" +
+        std::to_string(rptr.raw_address));
     }
     std::this_thread::yield();
   }
@@ -800,6 +818,7 @@ size_t MemoryNode::read_graph_adjacencies_batched_into(
         provisional_count > VamanaNode::provisional_slots() ||
         static_cast<u32>(stable_count) + provisional_count >
           VamanaNode::graph_entry_capacity() ||
+        (entry[1] & 0x0eu) != 0 ||
         vamana::hot_graph::load_u32_le(entry + 8) !=
           rptr.incarnation() ||
         vamana::hot_graph::load_u32_le(entry + 12) != 0 ||
@@ -816,7 +835,13 @@ size_t MemoryNode::read_graph_adjacencies_batched_into(
       const RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
         entry + vamana::hot_graph::neighbor_offset(index),
         VamanaNode::HOT_GRAPH_SHARD_BITS);
-      if (neighbor.is_null()) continue;
+      if (neighbor.is_null()) {
+        malformed_neighbor = true;
+        report_rejected_graph_pointer(
+          "read_graph_adjacencies_batched/stable_null", neighbor, rptr,
+          index);
+        continue;
+      }
       if (!storage_node_pointer_addressable(neighbor)) {
         malformed_neighbor = true;
         report_rejected_graph_pointer(
@@ -829,7 +854,13 @@ size_t MemoryNode::read_graph_adjacencies_batched_into(
       const RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
         entry + vamana::hot_graph::neighbor_offset(stable_count + index),
         VamanaNode::HOT_GRAPH_SHARD_BITS);
-      if (neighbor.is_null()) continue;
+      if (neighbor.is_null()) {
+        malformed_neighbor = true;
+        report_rejected_graph_pointer(
+          "read_graph_adjacencies_batched/provisional_null", neighbor,
+          rptr, index);
+        continue;
+      }
       if (!storage_node_pointer_addressable(neighbor)) {
         malformed_neighbor = true;
         report_rejected_graph_pointer(
@@ -902,11 +933,14 @@ size_t MemoryNode::read_graph_adjacencies_batched_into(
         auto& slot = next_result();
         const GraphDecodeResult decoded =
           decode(read.rptr, read.buffer, slot.second);
-        if (decoded == GraphDecodeResult::valid ||
-            (decoded == GraphDecodeResult::malformed_pointer &&
-             attempt + 1 == kMaxReadAttempts)) {
+        if (decoded == GraphDecodeResult::valid) {
           slot.first = read.rptr;
           ++result_count;
+        } else if (decoded == GraphDecodeResult::malformed_pointer &&
+                   attempt + 1 == kMaxReadAttempts) {
+          lib_failure(
+            "persistent malformed counted graph edge in batched read: "
+            "parent_raw=" + std::to_string(read.rptr.raw_address));
         } else if (attempt + 1 < kMaxReadAttempts) {
           retry.push_back(read);
         }
@@ -990,10 +1024,11 @@ bool MemoryNode::read_local_neighbor_list(RemotePtr rptr,
 vec<MemoryNode::NodeSnapshot> MemoryNode::read_node_snapshots_batched(
     const vec<RemotePtr>& rptrs,
     const Configuration& config,
-    const char* boundary) {
+    const char* boundary,
+    vec<StableNodeSnapshotState>* states) {
   vec<NodeSnapshot> snapshots;
   const size_t snapshot_count = read_node_snapshots_batched_into(
-    span<const RemotePtr>{rptrs}, config, snapshots, boundary);
+    span<const RemotePtr>{rptrs}, config, snapshots, boundary, states);
   snapshots.resize(snapshot_count);
   return snapshots;
 }
@@ -1002,12 +1037,41 @@ size_t MemoryNode::read_node_snapshots_batched_into(
     span<const RemotePtr> rptrs,
     const Configuration& config,
     vec<NodeSnapshot>& snapshots,
-    const char* boundary) {
+    const char* boundary,
+    vec<StableNodeSnapshotState>* states) {
   snapshots.reserve(rptrs.size());
   size_t snapshot_count = 0;
+  if (states != nullptr) {
+    states->assign(rptrs.size(), StableNodeSnapshotState::terminal);
+  }
   if (rptrs.empty()) {
     return snapshot_count;
   }
+
+  const auto set_state = [&](size_t input_index,
+                             StableNodeSnapshotState state) {
+    if (states != nullptr) (*states)[input_index] = state;
+  };
+
+  // If a complete D-byte optimistic snapshot did not stabilize, a compact
+  // identity observation distinguishes a stable replacement from transient
+  // lock/torn contention. A current identity still means retryable here: the
+  // caller requested the vector payload and must never receive a fabricated
+  // or partially observed one.
+  const auto classify_failed_snapshot = [&](size_t input_index,
+                                            RemotePtr pointer) {
+    vec<std::pair<RemotePtr, u64>> identity;
+    vec<StableNodeSnapshotState> identity_state;
+    read_node_identity_headers_batched_into(
+      span<const RemotePtr>{&pointer, 1}, config, identity, &identity_state);
+    lib_assert(identity_state.size() == 1,
+               "single snapshot retry classification lost input alignment");
+    set_state(
+      input_index,
+      identity_state.front() == StableNodeSnapshotState::stable
+        ? StableNodeSnapshotState::retryable
+        : identity_state.front());
+  };
 
   const auto next_snapshot = [&]() -> NodeSnapshot& {
     if (snapshot_count == snapshots.size()) snapshots.emplace_back();
@@ -1016,18 +1080,25 @@ size_t MemoryNode::read_node_snapshots_batched_into(
 
   StorageOwnerThread* thread = current_storage_owner_thread_;
   if (thread == nullptr || !thread->has_peer_scratch()) {
-    for (const RemotePtr& rptr : rptrs) {
+    for (size_t input_index = 0; input_index < rptrs.size(); ++input_index) {
+      const RemotePtr rptr = rptrs[input_index];
       NodeSnapshot& snapshot = next_snapshot();
       if (!rptr.is_null() && read_node_snapshot(rptr, snapshot)) {
+        set_state(input_index, StableNodeSnapshotState::stable);
         ++snapshot_count;
+      } else if (!rptr.is_null() && storage_node_pointer_addressable(rptr)) {
+        classify_failed_snapshot(input_index, rptr);
       }
     }
     return snapshot_count;
   }
 
   struct PendingRead {
+    size_t input_index{};
     RemotePtr rptr;
     byte_t* buffer{};
+    u64 before{};
+    u32 slot_incarnation{};
   };
 
   const size_t snapshot_size = snapshot_buffer_bytes();
@@ -1057,7 +1128,10 @@ size_t MemoryNode::read_node_snapshots_batched_into(
       if (local_shard(rptr.memory_node())) {
         NodeSnapshot& snapshot = next_snapshot();
         if (read_node_snapshot(rptr, snapshot)) {
+          set_state(idx, StableNodeSnapshotState::stable);
           ++snapshot_count;
+        } else {
+          classify_failed_snapshot(idx, rptr);
         }
         continue;
       }
@@ -1077,7 +1151,7 @@ size_t MemoryNode::read_node_snapshots_batched_into(
         .destination = buffer,
         .bytes = VamanaNode::size_until_vector_end(),
       });
-      pending.push_back(PendingRead{rptr, buffer});
+      pending.push_back(PendingRead{idx, rptr, buffer});
       ++remote_slot;
     }
 
@@ -1087,23 +1161,17 @@ size_t MemoryNode::read_node_snapshots_batched_into(
       std::this_thread::yield();
     }
 
-    const size_t first_remote_snapshot = snapshot_count;
-    thread_local vec<PendingRead> valid_pending;
-    valid_pending.clear();
-    valid_pending.reserve(pending.size());
-    for (const PendingRead& read : pending) {
-      NodeSnapshot& snapshot = next_snapshot();
-      if (parse_remote_snapshot(read.rptr, read.buffer, snapshot)) {
-        ++snapshot_count;
-        valid_pending.push_back(read);
-      }
-    }
-
     // Reuse each registered snapshot buffer for a second header read after
-    // copying its body out. Equality with the first header closes the RDMA
-    // overwrite window without allocating another registered scratch plane.
+    // saving its identity fields. Equality with the first header closes the
+    // RDMA overwrite window without allocating another registered scratch
+    // plane. Even a locked/mismatched first header receives this validation
+    // read, because only an unchanged unlocked mismatch is terminal; a changing
+    // record is retryable.
     read_requests.clear();
-    for (const PendingRead& read : valid_pending) {
+    for (PendingRead& read : pending) {
+      read.before = *reinterpret_cast<const u64*>(read.buffer);
+      read.slot_incarnation = *reinterpret_cast<const u32*>(
+        read.buffer + VamanaNode::offset_slot_incarnation());
       read_requests.push_back(PeerReadRequest{
         .shard_id = read.rptr.memory_node(),
         .remote_offset = read.rptr.byte_offset(),
@@ -1116,22 +1184,21 @@ size_t MemoryNode::read_node_snapshots_batched_into(
       poll_peer_send_cq();
       std::this_thread::yield();
     }
-    size_t accepted = first_remote_snapshot;
-    for (size_t index = 0; index < valid_pending.size(); ++index) {
-      NodeSnapshot& candidate = snapshots[first_remote_snapshot + index];
-      const u64 after = *reinterpret_cast<const u64*>(
-        valid_pending[index].buffer);
-      if (candidate.header == after &&
-          (after & VamanaNode::HEADER_NODE_LOCK) == 0 &&
-          VamanaNode::header_incarnation(after) ==
-            valid_pending[index].rptr.incarnation()) {
-        if (accepted != first_remote_snapshot + index) {
-          snapshots[accepted] = std::move(candidate);
-        }
-        ++accepted;
+    for (const PendingRead& read : pending) {
+      const u64 after = *reinterpret_cast<const u64*>(read.buffer);
+      const StableNodeSnapshotState disposition =
+        classify_physical_node_snapshot(
+          read.rptr, read.before, after, read.slot_incarnation);
+      if (disposition == StableNodeSnapshotState::stable) {
+        NodeSnapshot& snapshot = next_snapshot();
+        lib_assert(parse_remote_snapshot(read.rptr, read.buffer, snapshot),
+                   "coherent remote snapshot failed to parse");
+        set_state(read.input_index, StableNodeSnapshotState::stable);
+        ++snapshot_count;
+      } else {
+        set_state(read.input_index, disposition);
       }
     }
-    snapshot_count = accepted;
   }
 
   return snapshot_count;

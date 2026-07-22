@@ -721,76 +721,52 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
   }
 
-  // Batch arm by physical home. A skewed centroid assignment therefore costs
-  // one bounded control message rather than one RTT per item. The physical
-  // home atomically reserves every new sequence in this message. Commit this
-  // home immediately after its ACK, before attempting another potentially
-  // blocking home, which removes the cross-shard hold-and-wait edge.
+  // Batch arm by physical home and post every remote batch together. Each
+  // physical home remains an independent atomic admission transaction: when
+  // its ACK arrives, commit exactly that authority subset immediately. No
+  // home waits while the coordinator accumulates resources from every other
+  // home, and only a still-unresolved home is retried with the same tokens.
   dense_hashmap_t<u32, vec<size_t>> arm_groups;
+  dense_hashmap_t<u32, vec<Stage1ArmItem>> arm_items_by_home;
   for (size_t index = 0; index < item_count; ++index) {
     MutationPlan& plan = plans[index];
     if (!plan.active || plan.kind == MutationKind::erase) continue;
     arm_groups[plan.stage1_home].push_back(index);
+    lib_assert(plan.begin.previous.placement_version !=
+                 std::numeric_limits<u64>::max(),
+               "authority placement version overflow");
+    arm_items_by_home[plan.stage1_home].push_back(Stage1ArmItem{
+      .token = plan.operation,
+      .target_raw = plan.stage1_result.target_raw,
+      .initial_placement_version =
+        plan.begin.previous.placement_version + 1,
+      .id = ids[index],
+      .generation = plan.begin.generation,
+      .action = static_cast<u32>(Stage1ArmAction::arm),
+    });
   }
-  for (const auto& [home, indices] : arm_groups) {
-    vec<Stage1ArmItem> arm_items;
-    arm_items.reserve(indices.size());
-    for (const size_t index : indices) {
-      const MutationPlan& plan = plans[index];
-      lib_assert(plan.begin.previous.placement_version !=
-                   std::numeric_limits<u64>::max(),
-                 "authority placement version overflow");
-      arm_items.push_back(Stage1ArmItem{
-        .token = plan.operation,
-        .target_raw = plan.stage1_result.target_raw,
-        .initial_placement_version =
-          plan.begin.previous.placement_version + 1,
-        .id = ids[index],
-        .generation = plan.begin.generation,
-        .action = static_cast<u32>(Stage1ArmAction::arm),
-      });
-    }
-
-    bool armed = false;
-    const auto arm_started = std::chrono::steady_clock::now();
-    while (!armed) {
-      if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
-        return false;
+  const auto arm_started = std::chrono::steady_clock::now();
+  const bool armed = control_stage1_fanout_and_wait(
+    arm_items_by_home, source_client,
+    [&](u32 home, span<const Stage1ArmItem> arm_items,
+        span<const Stage1ArmResult> arm_results) {
+      const auto found = arm_groups.find(home);
+      lib_assert(found != arm_groups.end() &&
+                   found->second.size() == arm_items.size() &&
+                   arm_results.size() == arm_items.size(),
+                 "Stage1 arm fanout lost its home-to-authority mapping");
+      for (size_t slot = 0; slot < found->second.size(); ++slot) {
+        plans[found->second[slot]].arm_result = arm_results[slot];
       }
-      vec<Stage1ArmResult> arm_results;
-      const bool transported = home == storage_id_
-        ? arm_local_stage1_items(
-            storage_id_, span<const Stage1ArmItem>{arm_items},
-            arm_results, config)
-        : arm_remote_stage1_batch(
-            home, source_client, span<const Stage1ArmItem>{arm_items},
-            arm_results, config);
-      armed = transported && arm_results.size() == arm_items.size();
-      for (size_t slot = 0; armed && slot < arm_items.size(); ++slot) {
-        const Stage1ArmItem& input = arm_items[slot];
-        const Stage1ArmResult& output = arm_results[slot];
-        armed = output.token.source_client == input.token.source_client &&
-          output.token.item_index == input.token.item_index &&
-          output.token.client_batch_id == input.token.client_batch_id &&
-          output.target_raw == input.target_raw && output.reserved == 0 &&
-          output.status == static_cast<u32>(MutationStatus::ok) &&
-          output.maintenance_sequence != 0;
-      }
-      if (armed) {
-        for (size_t slot = 0; slot < indices.size(); ++slot) {
-          plans[indices[slot]].arm_result = arm_results[slot];
-        }
-        for (const size_t index : indices) {
-          commit_plan(index);
-        }
-        break;
-      }
-      std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
-      storage_owner_maintenance_cv_.wait_for(
-        lock, std::chrono::microseconds(100));
-    }
-    breakdown.storage_owner_stage1_arm_wait_ns +=
-      elapsed_ns_since(arm_started);
+      // This callback runs as soon as this home's validated ACK is consumed;
+      // it is deliberately not deferred until all other homes have armed.
+      for (const size_t index : found->second) commit_plan(index);
+    },
+    config);
+  breakdown.storage_owner_stage1_arm_wait_ns +=
+    elapsed_ns_since(arm_started);
+  if (!armed) {
+    return false;
   }
 
   // Every active mutation must have crossed its own physical admission
@@ -822,47 +798,16 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       .action = static_cast<u32>(Stage1ArmAction::release),
     });
   }
-  for (const auto& [home, release_items] : committed_release_groups) {
-    const auto release_started = std::chrono::steady_clock::now();
-    bool released = false;
-    while (!released &&
-           !storage_insert_shutdown_.load(std::memory_order_acquire)) {
-      vec<Stage1ArmResult> release_results;
-      const bool transported = home == storage_id_
-        ? arm_local_stage1_items(
-            storage_id_, span<const Stage1ArmItem>{release_items},
-            release_results, config)
-        : arm_remote_stage1_batch(
-            home, source_client, span<const Stage1ArmItem>{release_items},
-            release_results, config);
-      released = transported &&
-        release_results.size() == release_items.size();
-      for (size_t slot = 0;
-           released && slot < release_items.size(); ++slot) {
-        const Stage1ArmItem& input = release_items[slot];
-        const Stage1ArmResult& output = release_results[slot];
-        released = output.token.source_client ==
-                     input.token.source_client &&
-          output.token.item_index == input.token.item_index &&
-          output.token.client_batch_id == input.token.client_batch_id &&
-          output.reserved == 0 &&
-          output.status == static_cast<u32>(MutationStatus::ok);
-      }
-      if (!released) {
-        std::unique_lock<std::mutex> lock(
-          storage_owner_maintenance_mutex_);
-        storage_owner_maintenance_cv_.wait_for(
-          lock, std::chrono::microseconds(100));
-      }
-    }
-    breakdown.storage_owner_stage1_release_wait_ns +=
-      elapsed_ns_since(release_started);
-    if (!released) {
-      // The directory commit is already durable.  Returning a transport
-      // failure is safe: replay of this public token observes committed_replay
-      // and never performs physical work twice.
-      return false;
-    }
+  const auto release_started = std::chrono::steady_clock::now();
+  const bool released = control_stage1_fanout_and_wait(
+    committed_release_groups, source_client, {}, config);
+  breakdown.storage_owner_stage1_release_wait_ns +=
+    elapsed_ns_since(release_started);
+  if (!released) {
+    // The directory commit is already durable. Returning a transport failure
+    // is safe: replay of this public token observes committed_replay and never
+    // performs physical work twice.
+    return false;
   }
 
   vec<CleanupActivateItem> committed_cleanup_items;

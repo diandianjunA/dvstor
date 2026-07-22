@@ -59,6 +59,7 @@ public:
   u32 storage_id{};
   vec<str> storage_peers;
   u32 storage_owner_batch_max{16};
+  u32 storage_owner_batch_max_wait_us{100};
   u32 storage_owner_peer_rdma_tokens{8};
   u32 storage_owner_rpc_depth{8};
   u32 storage_owner_rpc_timeout_ms{30'000};
@@ -184,6 +185,11 @@ private:
       ("storage-owner-batch-max",
        po::value<u32>(&storage_owner_batch_max)->default_value(storage_owner_batch_max),
        "Maximum mutations in one storage RPC batch.")
+      ("storage-owner-batch-max-wait-us",
+       po::value<u32>(&storage_owner_batch_max_wait_us)
+         ->default_value(storage_owner_batch_max_wait_us),
+       "Maximum compute and Stage2 wait for a partial mutation batch; zero "
+       "runs partial batches immediately.")
       ("storage-owner-peer-rdma-tokens",
        po::value<u32>(&storage_owner_peer_rdma_tokens)->default_value(storage_owner_peer_rdma_tokens),
        "Outstanding peer reads allowed per storage data QP.")
@@ -334,6 +340,8 @@ public:
       output << std::setw(width) << "storage RPC depth/batch: "
              << config.storage_owner_rpc_depth << "/"
              << config.storage_owner_batch_max << '\n';
+      output << std::setw(width) << "storage batch max wait us: "
+             << config.storage_owner_batch_max_wait_us << '\n';
       output << std::setw(width) << "storage stage2 maintenance: "
              << config.storage_owner_maintenance_workers << " workers, backlog "
              << config.storage_owner_maintenance_queue_depth << '\n';

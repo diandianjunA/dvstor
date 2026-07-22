@@ -1,9 +1,12 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 #include "memory_node/storage_owner_maintenance/cleanup_scheduler.hh"
+#include "memory_node/storage_owner_maintenance/search_lane_pool.hh"
 #include "memory_node/storage_owner_maintenance/stage2_tracker.hh"
 
 namespace detail = memory_node_storage_owner_maintenance_detail;
@@ -391,6 +394,132 @@ void test_backward_shift_preserves_colliding_record_indices() {
   assert(requests.lookup_probe_count(colliding[4]) == 1);
 }
 
+void test_search_lane_pool_is_generation_fenced_and_completion_gated() {
+  detail::Stage2SearchLanePool lanes(2);
+  const detail::Stage2ContextHandle first{3, 7};
+  const detail::Stage2ContextHandle second{4, 9};
+  const detail::Stage2ContextHandle reused{3, 8};
+
+  const auto first_lane = lanes.try_acquire(first);
+  const auto second_lane = lanes.try_acquire(second);
+  assert(first_lane.has_value());
+  assert(second_lane.has_value());
+  assert(*first_lane != *second_lane);
+  assert(lanes.full());
+  assert(lanes.try_acquire(first) == first_lane);
+  assert(!lanes.try_acquire(reused).has_value());
+
+  // Neither an outstanding RDMA chain nor an older generation can release a
+  // lane that still owns registered scratch.
+  assert(!lanes.release(*first_lane, first, false));
+  assert(!lanes.release(*first_lane, reused, true));
+  assert(lanes.owns(*first_lane, first));
+  assert(lanes.release(*first_lane, first, true));
+  assert(!lanes.owns(*first_lane, first));
+
+  const auto reused_lane = lanes.try_acquire(reused);
+  assert(reused_lane == first_lane);
+  assert(lanes.size() == 2);
+}
+
+void test_search_lane_rebind_requires_transport_and_search_quiescence() {
+  assert(detail::stage2_search_lane_rebindable(true, true));
+  assert(!detail::stage2_search_lane_rebindable(false, true));
+  assert(!detail::stage2_search_lane_rebindable(true, false));
+  assert(!detail::stage2_search_lane_rebindable(false, false));
+
+  // Model the one-lane worker case: a prune context that has copied out its
+  // continuation and drained CQ must release the lane during backoff, allowing
+  // another context to run.  The original generation can safely rebind later.
+  detail::Stage2SearchLanePool lanes(1);
+  const detail::Stage2ContextHandle deferred{0, 11};
+  const detail::Stage2ContextHandle ready{1, 4};
+  const auto lane = lanes.try_acquire(deferred);
+  assert(lane.has_value());
+  assert(lanes.release(
+    *lane, deferred,
+    detail::stage2_search_lane_rebindable(true, true)));
+  const auto ready_lane = lanes.try_acquire(ready);
+  assert(ready_lane == lane);
+  assert(lanes.release(*ready_lane, ready, true));
+  assert(lanes.try_acquire(deferred) == lane);
+}
+
+void test_search_lane_budget_is_global_and_evenly_distributed() {
+  const std::size_t peak =
+    detail::stage2_search_lane_peak_rdma_wrs(32, 96, 48);
+  assert(peak == 64);
+
+  // Lane ownership is bounded continuation/scratch capacity, not a static
+  // reservation of peak wave credits. With 96 global credits, four workers
+  // and sixteen contexts each, every bounded context may own a lane even
+  // though only dynamically admitted waves can be in flight.
+  const std::size_t global =
+    detail::stage2_global_search_lane_count(4, 16, 1, 96);
+  assert(global == 64);
+  assert(global > 4);
+  std::size_t distributed = 0;
+  for (std::size_t worker = 0; worker < 4; ++worker) {
+    const std::size_t lanes = detail::stage2_search_lanes_for_worker(
+      worker, 4, 16, global);
+    assert(lanes == 16);
+    distributed += lanes;
+  }
+  assert(distributed == global);
+
+  // A transport window smaller than worker_count still gives every executor
+  // one progress lane, while context capacity remains the hard upper bound.
+  assert(detail::stage2_global_search_lane_count(5, 16, 1, 3) == 5);
+  assert(detail::stage2_global_search_lane_count(5, 1, 1, 4096) == 5);
+
+  const std::size_t uneven =
+    detail::stage2_global_search_lane_count(5, 16, 1, 7);
+  assert(uneven == 7);
+  assert(detail::stage2_search_lanes_for_worker(0, 5, 16, uneven) == 2);
+  assert(detail::stage2_search_lanes_for_worker(1, 5, 16, uneven) == 2);
+  assert(detail::stage2_search_lanes_for_worker(2, 5, 16, uneven) == 1);
+
+  // Host-sized arithmetic must remain exact until the runtime performs its
+  // explicit u32 transport-index check. The pool rejects the boundary before
+  // attempting allocation.
+  if constexpr (std::numeric_limits<std::size_t>::max() >
+                std::numeric_limits<std::uint32_t>::max()) {
+    const std::size_t beyond_u32 =
+      static_cast<std::size_t>(
+        std::numeric_limits<std::uint32_t>::max()) + 1;
+    const std::size_t wide_global =
+      detail::stage2_global_search_lane_count(
+        1, beyond_u32, 1, beyond_u32);
+    assert(wide_global == beyond_u32);
+    assert(detail::stage2_search_lanes_for_worker(
+             0, 1, beyond_u32, wide_global) == beyond_u32);
+    bool rejected = false;
+    try {
+      detail::Stage2SearchLanePool invalid(beyond_u32);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    assert(rejected);
+  }
+}
+
+void test_round_robin_context_scan_rotates_without_omission() {
+  constexpr std::size_t context_count = 5;
+  for (std::size_t begin = 0; begin < context_count; ++begin) {
+    std::vector<bool> seen(context_count, false);
+    for (std::size_t offset = 0; offset < context_count; ++offset) {
+      const std::size_t index = detail::stage2_round_robin_context_index(
+        begin, offset, context_count);
+      assert(index < context_count);
+      assert(!seen[index]);
+      seen[index] = true;
+    }
+    for (const bool visited : seen) assert(visited);
+  }
+  assert(detail::stage2_round_robin_context_index(4, 0, 5) == 4);
+  assert(detail::stage2_round_robin_context_index(4, 1, 5) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -403,5 +532,9 @@ int main() {
   test_retryable_cleanup_release_cannot_pin_the_only_context();
   test_request_tracker_true_deletion_survives_long_churn();
   test_backward_shift_preserves_colliding_record_indices();
+  test_search_lane_pool_is_generation_fenced_and_completion_gated();
+  test_search_lane_rebind_requires_transport_and_search_quiescence();
+  test_search_lane_budget_is_global_and_evenly_distributed();
+  test_round_robin_context_scan_rotates_without_omission();
   return 0;
 }

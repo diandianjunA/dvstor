@@ -1,6 +1,7 @@
 #include <stdexcept>
 
 #include "memory_node/peer_rpc/detail.hh"
+#include "memory_node/peer_rpc/stage1_control_fanout_policy.hh"
 #include "memory_node/storage_owner_index/reconcile_reverse_policy.hh"
 
 u64 MemoryNode::allocate_peer_request_id() {
@@ -844,4 +845,254 @@ bool MemoryNode::arm_remote_stage1_batch(
   }
   cancel_peer_rpc_response(request_id);
   return false;
+}
+
+bool MemoryNode::control_stage1_fanout_and_wait(
+    const dense_hashmap_t<
+      u32, vec<service::storage_owner::Stage1ArmItem>>& items_by_home,
+    u32 source_client,
+    const std::function<void(
+      u32,
+      span<const service::storage_owner::Stage1ArmItem>,
+      span<const service::storage_owner::Stage1ArmResult>)>&
+      on_home_resolved,
+    const Configuration& config) {
+  using namespace service::storage_owner;
+  using memory_node_peer_rpc_detail::Stage1ControlHomeProgress;
+  using memory_node_peer_rpc_detail::Stage1ControlResponseDisposition;
+  using memory_node_peer_rpc_detail::classify_stage1_control_response;
+
+  if (items_by_home.empty()) return true;
+  struct PendingControl {
+    u32 home{};
+    u64 request_id{};
+    vec<Stage1ArmItem> items;
+    vec<byte_t> response_payload;
+    Stage1ControlHomeProgress progress;
+    std::chrono::steady_clock::time_point deadline{};
+    bool local{};
+  };
+  vec<PendingControl> pending;
+  pending.reserve(items_by_home.size());
+
+  for (const auto& [home, items] : items_by_home) {
+    if (home >= num_storage_nodes_ || items.empty() ||
+        items.size() > config.storage_owner_batch_max ||
+        items.size() > std::numeric_limits<u32>::max() ||
+        stage1_arm_request_bytes(static_cast<u32>(items.size())) >
+          peer_rpc_runtime_.message_bytes) {
+      return false;
+    }
+    for (const Stage1ArmItem& item : items) {
+      const auto action = static_cast<Stage1ArmAction>(item.action);
+      if (item.token.source_client != source_client ||
+          item.token.client_batch_id == 0 || item.generation == 0 ||
+          item.reserved != 0 ||
+          (action != Stage1ArmAction::arm &&
+           action != Stage1ArmAction::abort &&
+           action != Stage1ArmAction::release)) {
+        return false;
+      }
+    }
+    PendingControl request;
+    request.home = home;
+    request.local = home == storage_id_;
+    request.request_id = request.local ? 0 : allocate_peer_request_id();
+    request.items = items;
+    if (!request.local) {
+      // Reserve before registering a request ID. Payload copying after a
+      // response lease is acquired is then allocation-free and exception-safe.
+      request.response_payload.reserve(peer_rpc_runtime_.message_bytes);
+    }
+    pending.push_back(std::move(request));
+  }
+
+  const auto timeout =
+    std::chrono::milliseconds(config.storage_owner_rpc_timeout_ms);
+  const auto try_post = [&](PendingControl& request) {
+    lib_assert(!request.local && !request.progress.resolved(),
+               "invalid remote Stage1 control post state");
+    const u32 item_count = static_cast<u32>(request.items.size());
+    const bool posted = try_post_peer_rpc_request_attempt(
+      request.home, PeerRpcType::stage1_arm_request,
+      PeerRpcType::stage1_arm_response, request.request_id, item_count,
+      request.items.data(), request.items.size() * sizeof(request.items[0]),
+      stage1_arm_request_bytes(item_count), PeerRpcSendClass::stage1);
+    if (posted) {
+      request.progress.mark_posted();
+      request.deadline = std::chrono::steady_clock::now() + timeout;
+    }
+    return posted;
+  };
+
+  // Prime every remote physical home before touching the local group. The
+  // local admission path may wait for bounded Stage2 capacity, but that wait
+  // now overlaps all remote arm/release work instead of preceding its sends.
+  for (PendingControl& request : pending) {
+    if (!request.local) (void)try_post(request);
+  }
+
+  const auto cancel_unresolved = [&]() {
+    for (const PendingControl& request : pending) {
+      if (!request.local && !request.progress.resolved()) {
+        cancel_peer_rpc_response(request.request_id);
+      }
+    }
+  };
+  const auto resolve = [&](PendingControl& request,
+                           span<const Stage1ArmResult> outputs) {
+    const auto disposition = classify_stage1_control_response(
+      span<const Stage1ArmItem>{request.items}, outputs);
+    if (disposition == Stage1ControlResponseDisposition::malformed) {
+      throw std::runtime_error(
+        "malformed token-fenced Stage1 control response");
+    }
+    if (disposition == Stage1ControlResponseDisposition::retry) {
+      request.progress.mark_retry();
+      return false;
+    }
+    if (on_home_resolved) {
+      on_home_resolved(
+        request.home, span<const Stage1ArmItem>{request.items}, outputs);
+    }
+    // "Resolved" includes the caller's per-home authority action, not just
+    // receipt parsing. If that callback throws, the public token remains the
+    // recovery mechanism and no later home is incorrectly reported complete.
+    lib_assert(request.progress.mark_resolved(),
+               "Stage1 control home resolved twice");
+    return true;
+  };
+
+  size_t remaining = pending.size();
+  try {
+    while (remaining != 0 &&
+           !peer_reverse_shutdown_.load(std::memory_order_acquire) &&
+           !storage_insert_shutdown_.load(std::memory_order_acquire)) {
+      bool made_progress = false;
+      bool local_wait_needed = false;
+
+      // Consume remote homes first. Any response already durable before local
+      // admission is processed and committed immediately; no callback waits
+      // for a second physical home to resolve.
+      for (PendingControl& request : pending) {
+        if (request.local || request.progress.resolved()) continue;
+        if (request.progress.needs_post()) {
+          made_progress = try_post(request) || made_progress;
+          if (request.progress.needs_post()) continue;
+        }
+
+        PeerRpcHeader response_header{};
+        request.response_payload.clear();
+        PeerResponseLease response_lease{};
+        const u32 item_count = static_cast<u32>(request.items.size());
+        const TryPeerResponse state = try_consume_peer_rpc_response(
+          request.request_id, request.home,
+          PeerRpcType::stage1_arm_response, item_count,
+          response_header, request.response_payload, response_lease);
+        if (state == TryPeerResponse::pending) {
+          if (std::chrono::steady_clock::now() >= request.deadline) {
+            // The physical transaction is token-idempotent. Keep both the
+            // request ID and semantic tokens and repost only this unresolved
+            // home; a late response still resolves the same registry entry.
+            request.progress.mark_retry();
+            made_progress = true;
+          }
+          continue;
+        }
+        if (state == TryPeerResponse::stale) {
+          request.progress.mark_retry();
+          made_progress = true;
+          continue;
+        }
+
+        const size_t expected_bytes = stage1_arm_response_bytes(item_count);
+        const bool valid_envelope = state == TryPeerResponse::success &&
+          request.response_payload.size() == expected_bytes &&
+          response_header.magic == kPeerRpcMagic &&
+          response_header.version == kPeerRpcVersion &&
+          response_header.type == static_cast<u32>(
+            PeerRpcType::stage1_arm_response) &&
+          response_header.source_shard == request.home &&
+          response_header.item_count == item_count &&
+          response_header.request_id == request.request_id &&
+          response_header.status == static_cast<u32>(InsertStatus::ok) &&
+          response_header.reserved == 0;
+        if (!valid_envelope) {
+          if (response_lease.valid()) {
+            (void)rearm_peer_rpc_response(response_lease);
+          }
+          throw std::runtime_error(
+            "malformed Stage1 control response envelope");
+        }
+
+        const Stage1ArmResult* wire = stage1_arm_results(
+          request.response_payload.data());
+        const span<const Stage1ArmResult> outputs{wire, item_count};
+        const auto disposition = classify_stage1_control_response(
+          span<const Stage1ArmItem>{request.items}, outputs);
+        if (disposition == Stage1ControlResponseDisposition::malformed) {
+          (void)rearm_peer_rpc_response(response_lease);
+          throw std::runtime_error(
+            "malformed token-fenced Stage1 control response");
+        }
+        if (disposition == Stage1ControlResponseDisposition::retry) {
+          lib_assert(rearm_peer_rpc_response(response_lease),
+                     "retryable Stage1 control response lost its lease");
+          request.progress.mark_retry();
+          made_progress = true;
+          continue;
+        }
+
+        lib_assert(acknowledge_peer_rpc_response(response_lease),
+                   "validated Stage1 control response lost its lease");
+        if (resolve(request, outputs)) --remaining;
+        made_progress = true;
+      }
+
+      // There is at most one local physical home. It is deliberately driven
+      // after polling remote completions so a ready remote subset can commit
+      // before a locally saturated maintenance queue wakes up.
+      for (PendingControl& request : pending) {
+        if (!request.local || request.progress.resolved()) continue;
+        vec<Stage1ArmResult> local_results;
+        const bool processed = arm_local_stage1_items(
+          storage_id_, span<const Stage1ArmItem>{request.items},
+          local_results, config);
+        made_progress = true;
+        if (local_results.size() != request.items.size()) {
+          throw std::runtime_error(
+            "local Stage1 control returned a malformed result count");
+        }
+        // Per-item status is the semantic contract. `processed == false`
+        // accompanies structural invalidity, whose failed result must pass
+        // through the classifier and fail fast rather than becoming an
+        // implicit infinite retry.
+        (void)processed;
+        if (resolve(request, span<const Stage1ArmResult>{local_results})) {
+          --remaining;
+        } else {
+          local_wait_needed = true;
+        }
+      }
+
+      if (remaining == 0) break;
+      if (local_wait_needed) {
+        // Local semantic backpressure has no CQ edge. Yield on the shared
+        // maintenance condition rather than spinning between identical arm
+        // attempts, while remote sends remain in flight.
+        std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+        storage_owner_maintenance_cv_.wait_for(
+          lock, std::chrono::microseconds(100));
+      } else if (!made_progress) {
+        std::unique_lock<std::mutex> lock(peer_completion_mutex_);
+        peer_completion_cv_.wait_for(lock, std::chrono::microseconds(100));
+      }
+    }
+  } catch (...) {
+    cancel_unresolved();
+    throw;
+  }
+
+  cancel_unresolved();
+  return remaining == 0;
 }

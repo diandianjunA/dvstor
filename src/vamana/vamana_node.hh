@@ -334,6 +334,7 @@ public:
     if (stable_count > R || provisional_count > provisional_slots() ||
         static_cast<u32>(stable_count) + provisional_count >
           graph_entry_capacity() ||
+        (compact[1] & 0x0eu) != 0 ||
         vamana::hot_graph::load_u32_le(compact + 8) !=
           expected_incarnation ||
         vamana::hot_graph::load_u32_le(compact + 12) != 0) {
@@ -360,7 +361,10 @@ public:
          i < static_cast<u32>(stable_count) + provisional_count; ++i) {
       out[i] = vamana::hot_graph::decode_remote_ptr(
         compact + vamana::hot_graph::neighbor_offset(i), HOT_GRAPH_SHARD_BITS);
-      if (!out[i].is_well_formed()) return false;
+      // Every slot in the checksummed counted prefix is an edge. A null value
+      // is valid only in the unused suffix and must not be silently decoded as
+      // a shorter adjacency.
+      if (out[i].is_null() || !out[i].is_well_formed()) return false;
     }
     return true;
   }

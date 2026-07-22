@@ -1,5 +1,6 @@
 #include "memory_node/storage_owner_maintenance/detail.hh"
 #include "memory_node/storage_owner_maintenance/admission_policy.hh"
+#include "memory_node/storage_owner_maintenance/search_lane_pool.hh"
 #include "memory_node/storage_owner_cpu_plan.hh"
 #include "memory_node/storage_owner_index/graph_pointer_validation.hh"
 #include "gpu_search/maintenance_telemetry.hh"
@@ -32,6 +33,8 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     rpc_parallelism, config.storage_owner_maintenance_workers,
     num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
   const u32 worker_count = cpu_plan.maintenance_workers;
+  lib_assert(worker_count != 0,
+             "two-stage maintenance CPU plan produced no executor");
   // Every reserved sequence is either already queued/runnable or completed by
   // its synchronous retirement path. Stage1 preparation owns no sequence, so
   // the full descriptor bound is safe. Keep the smaller admission window tied
@@ -152,14 +155,71 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   const size_t batch_slot_stride =
     memory_node_storage_owner_index_detail::batched_read_slot_stride(
       snapshot_stride);
+  lib_assert(batch_slot_stride <=
+               std::numeric_limits<size_t>::max() / snapshot_batch,
+             "stage2 per-lane snapshot scratch size overflow");
   const size_t coroutine_scratch_stride =
     align_up(batch_slot_stride * snapshot_batch +
              std::max(VamanaNode::total_size(), neighbor_stride));
-  const size_t scratch_bytes = coroutine_scratch_stride;
+  const auto& peer_credit_plan = peer_rdma_read_credit_plan();
+  const size_t ordinary_wave_limit = std::min<size_t>(
+    peer_credit_plan.per_peer, peer_credit_plan.global);
+  const size_t ordered_pair_wave_limit =
+    memory_node_detail::peer_rdma_read_pair_wave_limit(peer_credit_plan);
+  const size_t per_lane_peak_rdma_wrs =
+    stage2_search_lane_peak_rdma_wrs(
+      snapshot_batch, ordinary_wave_limit, ordered_pair_wave_limit);
+  // Every Stage2 continuation can make progress with one ordinary graph or
+  // snapshot READ.  Lane ownership does not reserve that credit: the actual
+  // (possibly much larger) wave is admitted transactionally by the shared
+  // per-QP/per-peer/global credit manager.  Keeping all bounded contexts
+  // schedulable lets smaller independent waves fill the HCA while denied
+  // lanes remain ready instead of consuming transport state.
+  constexpr size_t minimum_schedulable_chain_rdma_wrs = 1;
+  const size_t global_search_lane_count =
+    stage2_global_search_lane_count(
+      worker_count, contexts_per_worker,
+      minimum_schedulable_chain_rdma_wrs,
+      peer_credit_plan.global);
+  lib_assert(global_search_lane_count >= worker_count,
+             "global Stage2 lane allocation starved a maintenance worker");
+
+  vec<u32> search_lanes_by_worker(worker_count);
+  size_t min_search_lanes_per_worker =
+    std::numeric_limits<size_t>::max();
+  size_t max_search_lanes_per_worker = 0;
+  size_t total_scratch_bytes = 0;
+  for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {
+    const size_t lane_count = stage2_search_lanes_for_worker(
+      worker_id, worker_count, contexts_per_worker,
+      global_search_lane_count);
+    lib_assert(lane_count != 0 && lane_count <= contexts_per_worker,
+               "Stage2 lane distribution violated worker context capacity");
+    lib_assert(lane_count <= std::numeric_limits<u32>::max(),
+               "Stage2 per-worker lane count exceeds u32 transport index");
+    lib_assert(coroutine_scratch_stride <=
+                 std::numeric_limits<size_t>::max() / lane_count,
+               "stage2 search lane scratch size overflow");
+    const size_t worker_scratch_bytes =
+      coroutine_scratch_stride * lane_count;
+    lib_assert(total_scratch_bytes <=
+                 std::numeric_limits<size_t>::max() - worker_scratch_bytes,
+               "stage2 aggregate peer scratch size overflow");
+    total_scratch_bytes += worker_scratch_bytes;
+    min_search_lanes_per_worker = std::min(
+      min_search_lanes_per_worker, lane_count);
+    max_search_lanes_per_worker = std::max(
+      max_search_lanes_per_worker, lane_count);
+    search_lanes_by_worker[worker_id] = static_cast<u32>(lane_count);
+  }
 
   storage_owner_maintenance_worker_states_.reserve(worker_count);
   for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {
-    auto worker = std::make_unique<StorageOwnerThread>(worker_id, 1, config.max_send_queue_wr);
+    const u32 search_lanes = search_lanes_by_worker[worker_id];
+    const size_t scratch_bytes =
+      coroutine_scratch_stride * static_cast<size_t>(search_lanes);
+    auto worker = std::make_unique<StorageOwnerThread>(
+      worker_id, search_lanes, config.max_send_queue_wr);
     if (peer_context_) {
       worker->init_peer_scratch(*peer_context_, scratch_bytes, coroutine_scratch_stride);
     }
@@ -169,8 +229,20 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   print_status("storage-owner peer scratch: snapshot_slot=" +
                std::to_string(snapshot_stride) + " graph_slot=" +
                std::to_string(graph_stride) + " batch=" +
-               std::to_string(snapshot_batch) + " bytes_per_worker=" +
-               std::to_string(coroutine_scratch_stride));
+               std::to_string(snapshot_batch) + " lane_peak_rdma_wrs=" +
+               std::to_string(per_lane_peak_rdma_wrs) +
+               " lane_min_chain_rdma_wrs=" +
+               std::to_string(minimum_schedulable_chain_rdma_wrs) +
+               " global_read_window=" +
+               std::to_string(peer_credit_plan.global) +
+               " search_lanes_global=" +
+               std::to_string(global_search_lane_count) +
+               " search_lanes_per_worker_min/max=" +
+               std::to_string(min_search_lanes_per_worker) + "/" +
+               std::to_string(max_search_lanes_per_worker) +
+               " bytes_per_lane=" +
+               std::to_string(coroutine_scratch_stride) +
+               " bytes_total=" + std::to_string(total_scratch_bytes));
 
   for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {
     storage_owner_maintenance_workers_.emplace_back(
@@ -593,7 +665,12 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                                 ? storage_worker_config_->storage_owner_batch_max
                                 : 0) +
                " compaction_max_delay_ms=" +
-               std::to_string(kStage2CompactionMaxDelayNs / 1000000ull) +
+               std::to_string(
+                 storage_worker_config_ != nullptr
+                   ? static_cast<double>(
+                       storage_worker_config_->storage_owner_batch_max_wait_us) /
+                       1000.0
+                   : 0.0) +
                " stage2_rate_per_sec=" +
                std::to_string(repair_rate) +
                " stage1_search_budget_exhausted=" +

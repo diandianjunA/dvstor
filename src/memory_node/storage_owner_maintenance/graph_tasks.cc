@@ -1,8 +1,11 @@
 #include "memory_node/storage_owner_maintenance/detail.hh"
 #include "memory_node/storage_owner_maintenance/cleanup_policy.hh"
+#include "memory_node/storage_owner_index/vector_snapshot_policy.hh"
 
 using namespace memory_node_storage_owner_maintenance_detail;
 using memory_node_storage_owner_index_detail::IncarnationLockResult;
+using memory_node_storage_owner_index_detail::StableNodeSnapshotState;
+using memory_node_storage_owner_index_detail::classify_stage2_target_snapshot;
 
 bool MemoryNode::storage_owner_task_current(node_t id, u32 generation, RemotePtr target) {
   DynamicFreshnessShard& shard = dynamic_freshness_shard(id);
@@ -19,23 +22,88 @@ bool MemoryNode::storage_owner_task_current(node_t id, u32 generation, RemotePtr
          generation == 0 && base->second == target;
 }
 
-bool MemoryNode::storage_owner_physical_node_matches(
-    node_t id, u32 generation, RemotePtr target) {
-  if (target.is_null() || target.memory_node() >= num_storage_nodes_) {
-    return false;
+StableNodeSnapshotState MemoryNode::storage_owner_physical_node_state(
+    node_t id,
+    u32 generation,
+    RemotePtr target,
+    NodeSnapshot* stable_snapshot) {
+  if (!storage_node_pointer_addressable(target)) {
+    return StableNodeSnapshotState::terminal;
   }
-  NodeSnapshot snapshot;
-  return read_node_snapshot(target, snapshot) && !snapshot.deleted &&
-         snapshot.id == id && snapshot.generation == generation;
+
+  // When the caller also needs the vector, first try the existing complete
+  // optimistic snapshot.  A failed bounded read is not terminal: it is
+  // followed by a small identity observation below so a stable replacement
+  // can still be distinguished from transient lock contention.
+  if (stable_snapshot != nullptr) {
+    NodeSnapshot candidate;
+    if (read_node_snapshot(target, candidate)) {
+      const StableNodeSnapshotState state = classify_stage2_target_snapshot(
+        target, candidate.header, candidate.header,
+        candidate.slot_incarnation, candidate.id, candidate.generation,
+        id, generation);
+      if (state == StableNodeSnapshotState::stable) {
+        *stable_snapshot = std::move(candidate);
+      }
+      return state;
+    }
+  }
+
+  constexpr size_t kIdentityBytes =
+    VamanaNode::HEADER_SIZE + VamanaNode::COMPACT_META_SIZE;
+  std::array<byte_t, kIdentityBytes> identity{};
+  u64 after = 0;
+  if (local_shard(target.memory_node())) {
+    const u64 before = load_local_node_header_acquire(target);
+    std::memcpy(identity.data(), &before, sizeof(before));
+    std::memcpy(identity.data() + VamanaNode::HEADER_SIZE,
+                index_buffer_.get_full_buffer() + target.byte_offset() +
+                  VamanaNode::HEADER_SIZE,
+                VamanaNode::COMPACT_META_SIZE);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    after = load_local_node_header_acquire(target);
+  } else {
+    remote_read_bytes(target.memory_node(), target.byte_offset(),
+                      identity.data(), identity.size(), 0);
+    remote_read_bytes(target.memory_node(), target.byte_offset(),
+                      &after, sizeof(after), 0);
+  }
+
+  u64 before = 0;
+  node_t observed_id = 0;
+  u32 observed_generation = 0;
+  u32 slot_incarnation = 0;
+  std::memcpy(&before, identity.data(), sizeof(before));
+  std::memcpy(&observed_id, identity.data() + VamanaNode::offset_id(),
+              sizeof(observed_id));
+  std::memcpy(&observed_generation,
+              identity.data() + VamanaNode::offset_generation(),
+              sizeof(observed_generation));
+  std::memcpy(&slot_incarnation,
+              identity.data() + VamanaNode::offset_slot_incarnation(),
+              sizeof(slot_incarnation));
+  const StableNodeSnapshotState identity_state =
+    classify_stage2_target_snapshot(
+      target, before, after, slot_incarnation, observed_id,
+      observed_generation, id, generation);
+  if (stable_snapshot != nullptr &&
+      identity_state == StableNodeSnapshotState::stable) {
+    // The identity is current, but the preceding full vector observation did
+    // not stabilize.  Suspend this context and retry it after other lanes have
+    // advanced; never fabricate a vector or discard the task.
+    return StableNodeSnapshotState::retryable;
+  }
+  return identity_state;
 }
 
 vec<RemotePtr> MemoryNode::read_preserved_neighbor_list(RemotePtr rptr) {
-  if (!storage_node_pointer_addressable(rptr)) {
-    if (!rptr.is_null()) {
-      report_rejected_graph_pointer("read_preserved_neighbor_list/input", rptr);
-    }
-    return {};
-  }
+  // This is not an optimistic query read.  The tombstone's preserved
+  // adjacency is the sole authority for removing old backlinks before its
+  // physical slot can be reclaimed.  Treating corruption as an empty list
+  // would acknowledge cleanup while silently leaving dangling graph edges.
+  lib_assert(storage_node_pointer_addressable(rptr),
+             "preserved adjacency target is not addressable: raw=" +
+               std::to_string(rptr.raw_address));
   vec<byte_t> entry(VamanaNode::hot_graph_entry_size());
   const u64 hot_offset = VamanaNode::hot_graph_entry_offset(rptr);
   if (local_shard(rptr.memory_node())) {
@@ -47,29 +115,37 @@ vec<RemotePtr> MemoryNode::read_preserved_neighbor_list(RemotePtr rptr) {
   }
 
   const u8 edge_count = entry[0];
-  if (edge_count > VamanaNode::R) {
-    return {};
-  }
+  lib_assert(edge_count <= VamanaNode::R,
+             "preserved adjacency edge count exceeds R: raw=" +
+               std::to_string(rptr.raw_address) + " count=" +
+               std::to_string(edge_count));
   const u16 expected = vamana::hot_graph::load_u16_le(entry.data() + 2);
   const u16 actual = vamana::hot_graph::checksum16(entry.data(), entry.size());
-  if (expected != actual ||
-      vamana::hot_graph::load_u32_le(entry.data() + 8) !=
-        rptr.incarnation() ||
-      vamana::hot_graph::load_u32_le(entry.data() + 12) != 0) {
-    return {};
-  }
+  lib_assert(expected == actual,
+             "preserved adjacency checksum mismatch: raw=" +
+               std::to_string(rptr.raw_address));
+  lib_assert(vamana::hot_graph::load_u32_le(entry.data() + 8) ==
+               rptr.incarnation(),
+             "preserved adjacency incarnation mismatch: raw=" +
+               std::to_string(rptr.raw_address));
+  lib_assert(vamana::hot_graph::load_u32_le(entry.data() + 12) == 0,
+             "preserved adjacency reserved field is nonzero: raw=" +
+               std::to_string(rptr.raw_address));
   vec<RemotePtr> neighbors;
   neighbors.reserve(edge_count);
   for (u32 i = 0; i < edge_count; ++i) {
     RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
       entry.data() + vamana::hot_graph::neighbor_offset(i),
       VamanaNode::HOT_GRAPH_SHARD_BITS);
-    if (neighbor.is_null()) continue;
-    if (!storage_node_pointer_addressable(neighbor)) {
-      report_rejected_graph_pointer(
-        "read_preserved_neighbor_list/neighbor", neighbor, rptr, i);
-      continue;
-    }
+    lib_assert(!neighbor.is_null(),
+               "preserved adjacency contains a null counted edge: parent_raw=" +
+                 std::to_string(rptr.raw_address) + " index=" +
+                 std::to_string(i));
+    lib_assert(storage_node_pointer_addressable(neighbor),
+               "preserved adjacency contains malformed neighbor: parent_raw=" +
+                 std::to_string(rptr.raw_address) + " neighbor_raw=" +
+                 std::to_string(neighbor.raw_address) + " index=" +
+                 std::to_string(i));
     neighbors.push_back(neighbor);
   }
   return neighbors;

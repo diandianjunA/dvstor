@@ -236,6 +236,19 @@ void test_completion_pool_timed_wait_preserves_producer_reference() {
   pool.release_consumer(reused);
 }
 
+void test_completion_pool_timed_wait_is_completion_driven() {
+  bounded::CompletionPool pool(1);
+  const u32 id = pool.acquire();
+  std::thread producer([&]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    pool.complete(id, true);
+  });
+  assert(pool.wait_for(id, std::chrono::seconds(1)) ==
+         bounded::CompletionPool::Result::success);
+  pool.release_consumer(id);
+  producer.join();
+}
+
 void test_sliding_completion_ring() {
   bounded::SlidingCompletionRing ring(3);
   const u64 one = ring.reserve(1);
@@ -932,6 +945,7 @@ int main() {
   test_queue_publication_precedes_slot_reuse();
   test_completion_pool_reuse_and_abandon();
   test_completion_pool_timed_wait_preserves_producer_reference();
+  test_completion_pool_timed_wait_is_completion_driven();
   test_sliding_completion_ring();
   test_sliding_completion_ring_atomic_batch_admission();
   test_sliding_completion_ring_bounded_smooth_admission();

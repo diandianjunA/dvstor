@@ -371,6 +371,8 @@ bool MemoryNode::arm_local_stage1_items(
     vec<ClaimedArm> claimed;
     claimed.reserve(items.size());
     bool structurally_valid = true;
+    bool structural_conflict = false;
+    bool transient_unready = false;
     bool whole_batch_claimed = true;
 
     const auto restore_claims = [&]() {
@@ -426,6 +428,7 @@ bool MemoryNode::arm_local_stage1_items(
       std::lock_guard<std::mutex> lock(prepared_shard.mutex);
       const auto position = prepared_shard.records.find(key);
       if (position == prepared_shard.records.end()) {
+        transient_unready = true;
         whole_batch_claimed = false;
         continue;
       }
@@ -438,6 +441,7 @@ bool MemoryNode::arm_local_stage1_items(
           (prepared.execute_initial_placement_version != 0 &&
            prepared.execute_initial_placement_version !=
              item.initial_placement_version)) {
+        structural_conflict = true;
         whole_batch_claimed = false;
         continue;
       }
@@ -448,11 +452,13 @@ bool MemoryNode::arm_local_stage1_items(
           output.maintenance_sequence = prepared.maintenance_sequence;
           output.status = static_cast<u32>(MutationStatus::ok);
         } else {
+          structural_conflict = true;
           whole_batch_claimed = false;
         }
         continue;
       }
       if (!prepared.prepared || prepared.arming) {
+        transient_unready = true;
         whole_batch_claimed = false;
         continue;
       }
@@ -482,12 +488,20 @@ bool MemoryNode::arm_local_stage1_items(
     }
 
     // A semantic control RPC is all-or-nothing with respect to new
-    // completion credits.  Replays consume no credit; if any new item could
-    // not be claimed, restore every artifact and let the authority retry the
-    // same token set.
+    // completion credits. Replays consume no credit. If an item is merely
+    // unpublished or concurrently arming, restore every claim and return the
+    // explicit retry status for the whole atomic home batch. Identity,
+    // generation, target, and placement-version conflicts remain failed.
     if (!whole_batch_claimed) {
       restore_claims();
-      return structurally_valid;
+      if (structurally_valid && !structural_conflict && transient_unready) {
+        for (Stage1ArmResult& output : results) {
+          output.maintenance_sequence = 0;
+          output.status = static_cast<u32>(MutationStatus::retry);
+        }
+        return true;
+      }
+      return false;
     }
 
     vec<StorageOwnerMaintenanceTask> tasks;
@@ -503,7 +517,11 @@ bool MemoryNode::arm_local_stage1_items(
           claimed[item].task = std::move(tasks[item]);
         }
         restore_claims();
-        return structurally_valid;
+        for (Stage1ArmResult& output : results) {
+          output.maintenance_sequence = 0;
+          output.status = static_cast<u32>(MutationStatus::retry);
+        }
+        return true;
       }
     }
 
@@ -593,7 +611,14 @@ bool MemoryNode::arm_local_stage1_items(
            item.initial_placement_version) ||
         (prepared.aborted && item.initial_placement_version == 0);
       if (prepared.id != item.id || prepared.generation != item.generation ||
-          prepared.arming || !target_matches || !terminal_matches) {
+          !target_matches) {
+        continue;
+      }
+      if (prepared.arming) {
+        output.status = static_cast<u32>(MutationStatus::retry);
+        continue;
+      }
+      if (!terminal_matches) {
         continue;
       }
       output.target_raw = prepared.result.target_raw;
@@ -616,6 +641,7 @@ bool MemoryNode::arm_local_stage1_items(
           // earlier execute until a release crosses the completion barrier.
           if (prepared_records.size() >=
               stage1_prepared_results_limit_per_shard_) {
+            output.status = static_cast<u32>(MutationStatus::retry);
             continue;
           }
           Stage1PreparedResult receipt;
@@ -646,7 +672,11 @@ bool MemoryNode::arm_local_stage1_items(
           output.status = static_cast<u32>(MutationStatus::ok);
           continue;
         }
-        if (!prepared.prepared || prepared.arming || prepared.armed) {
+        if (!prepared.prepared || prepared.arming) {
+          output.status = static_cast<u32>(MutationStatus::retry);
+          continue;
+        }
+        if (prepared.armed) {
           continue;
         }
         prepared.arming = true;
@@ -698,6 +728,8 @@ bool MemoryNode::arm_local_stage1_items(
         output.target_raw = target.raw_address;
         output.maintenance_sequence = retirement_sequence;
         output.status = static_cast<u32>(MutationStatus::ok);
+      } else {
+        output.status = static_cast<u32>(MutationStatus::retry);
       }
       continue;
     }
@@ -709,6 +741,7 @@ bool MemoryNode::arm_local_stage1_items(
       if (position == prepared_records.end()) {
         // A physical snapshot cannot prove that a runnable task owns a
         // completion sequence. Only the bounded arm receipt may replay ACK.
+        output.status = static_cast<u32>(MutationStatus::retry);
         continue;
       }
       Stage1PreparedResult& prepared = position->second;
@@ -735,7 +768,10 @@ bool MemoryNode::arm_local_stage1_items(
       // Do not hold the operation-table lock while the bounded maintenance
       // queue applies backpressure. This keeps unrelated Stage1 executes and
       // retries moving under sustained update load.
-      if (prepared.arming) continue;
+      if (!prepared.prepared || prepared.arming) {
+        output.status = static_cast<u32>(MutationStatus::retry);
+        continue;
+      }
       prepared.arming = true;
       prepared.initial_placement_version =
         item.initial_placement_version;
@@ -774,6 +810,7 @@ bool MemoryNode::arm_local_stage1_items(
         prepared.arming = false;
         prepared.initial_placement_version = 0;
       }
+      output.status = static_cast<u32>(MutationStatus::retry);
       continue;
     }
     {

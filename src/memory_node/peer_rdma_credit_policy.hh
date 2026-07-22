@@ -2,10 +2,43 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <optional>
+#include <span>
 
 namespace memory_node_detail {
+
+constexpr std::uint64_t make_peer_wr_id(
+    const std::uint32_t owner,
+    const std::uint32_t sequence) {
+  return (static_cast<std::uint64_t>(owner) << 32) | sequence;
+}
+
+// Work-request sequence numbers intentionally remain 32 bit because the
+// upper half of wr_id is a transport-owner namespace.  A long-running node
+// can wrap that sequence, however, so allocation must probe past every ID
+// that is still pending, reserved by another producer, or waiting to be
+// consumed by a synchronous caller.  `next_sequence` is protected by the
+// caller's completion mutex; the predicate observes the same protected
+// containers.  Returning nullopt means the complete 32-bit namespace is
+// occupied, which is impossible for a correctly bounded verbs transport but
+// is still made explicit instead of silently overwriting state.
+template <typename IsUnavailable>
+std::optional<std::uint64_t> next_collision_free_peer_wr_id(
+    const std::uint32_t owner,
+    std::uint32_t& next_sequence,
+    IsUnavailable&& unavailable) {
+  const std::uint32_t first = next_sequence;
+  do {
+    const std::uint32_t sequence = next_sequence++;
+    const std::uint64_t candidate = make_peer_wr_id(owner, sequence);
+    if (!unavailable(candidate)) return candidate;
+  } while (next_sequence != first);
+  return std::nullopt;
+}
 
 struct PeerRdmaReadCreditPlan {
   std::uint32_t data_qps_per_peer{};
@@ -35,6 +68,23 @@ constexpr std::uint32_t peer_rdma_read_batch_group_limit(
 constexpr std::uint32_t peer_rdma_read_pair_group_limit(
     const PeerRdmaReadCreditPlan& plan) {
   return peer_rdma_read_batch_group_limit(plan) / 2;
+}
+
+// Maximum number of ordered snapshot pairs that one all-or-nothing wave can
+// distribute over every data QP of one peer.  Per-QP capacity must be rounded
+// down before aggregation: with an odd per_qp limit, aggregating first and
+// dividing later would invent one unusable READ credit per pair of QPs and can
+// force the round-robin to reuse a QP beyond its actual limit.
+constexpr std::uint32_t peer_rdma_read_pair_wave_limit(
+    const PeerRdmaReadCreditPlan& plan) {
+  const std::uint64_t aggregate_qp_pairs =
+    static_cast<std::uint64_t>(plan.data_qps_per_peer) *
+    (plan.per_qp / 2);
+  return static_cast<std::uint32_t>(std::min<std::uint64_t>({
+    plan.global / 2,
+    plan.per_peer / 2,
+    aggregate_qp_pairs,
+  }));
 }
 
 struct PeerRdmaReadPairChainItem {
@@ -90,6 +140,17 @@ inline bool try_reserve_bounded_counter(
   return false;
 }
 
+inline void release_reserved_counter(
+    std::atomic<std::uint32_t>& counter,
+    const std::uint32_t count) {
+  const std::uint32_t previous = counter.fetch_sub(
+    count, std::memory_order_acq_rel);
+  if (previous < count) {
+    assert(false && "RDMA credit counter underflow");
+    std::abort();
+  }
+}
+
 // Reserve the three credit domains as one logical operation. This is not a
 // multi-word CAS, so a failed later domain rolls back every earlier one before
 // returning. No caller may wait while retaining credits for an unposted WR;
@@ -110,13 +171,55 @@ inline bool try_reserve_peer_rdma_read_group(
     return false;
   }
   if (!try_reserve_bounded_counter(qp_outstanding, plan.per_qp, count)) {
-    peer_outstanding.fetch_sub(count, std::memory_order_acq_rel);
+    release_reserved_counter(peer_outstanding, count);
     return false;
   }
   if (!try_reserve_bounded_counter(
         global_outstanding, plan.global, count)) {
-    qp_outstanding.fetch_sub(count, std::memory_order_acq_rel);
-    peer_outstanding.fetch_sub(count, std::memory_order_acq_rel);
+    release_reserved_counter(qp_outstanding, count);
+    release_reserved_counter(peer_outstanding, count);
+    return false;
+  }
+  return true;
+}
+
+struct PeerRdmaReadCreditRequest {
+  std::atomic<std::uint32_t>* peer_outstanding{};
+  std::atomic<std::uint32_t>* qp_outstanding{};
+  std::uint32_t count{};
+};
+
+inline void release_peer_rdma_read_group(
+    const PeerRdmaReadCreditRequest& request,
+    std::atomic<std::uint32_t>& global_outstanding) {
+  release_reserved_counter(*request.qp_outstanding, request.count);
+  release_reserved_counter(*request.peer_outstanding, request.count);
+  release_reserved_counter(global_outstanding, request.count);
+}
+
+// Reserve every chain needed by one scheduler wave before posting its first
+// WR. If any domain is temporarily full, unwind the complete prefix. This is
+// the transaction boundary required by a resumable caller: false means zero
+// posted WRs and zero credit retained by this attempt, so retrying the same
+// immutable request wave cannot duplicate an RDMA operation.
+inline bool try_reserve_peer_rdma_read_wave(
+    const std::span<const PeerRdmaReadCreditRequest> requests,
+    std::atomic<std::uint32_t>& global_outstanding,
+    const PeerRdmaReadCreditPlan& plan) {
+  std::size_t reserved = 0;
+  for (; reserved < requests.size(); ++reserved) {
+    const PeerRdmaReadCreditRequest& request = requests[reserved];
+    if (request.peer_outstanding != nullptr &&
+        request.qp_outstanding != nullptr &&
+        try_reserve_peer_rdma_read_group(
+          *request.peer_outstanding, *request.qp_outstanding,
+          global_outstanding, plan, request.count)) {
+      continue;
+    }
+    while (reserved != 0) {
+      release_peer_rdma_read_group(requests[--reserved],
+                                   global_outstanding);
+    }
     return false;
   }
   return true;
@@ -139,6 +242,17 @@ constexpr std::uint32_t select_peer_data_qp(
   return qps_per_peer <= 1
     ? 0
     : 1 + ticket % (qps_per_peer - 1);
+}
+
+// One request wave takes a single rotating start ticket for each destination
+// shard. Chain ordinals are then local to that shard: requests for a second
+// shard cannot perturb the first shard's QP sequence or cause early reuse.
+constexpr std::uint32_t select_peer_data_qp_for_wave_chain(
+    const std::uint32_t qps_per_peer,
+    const std::uint32_t wave_start_ticket,
+    const std::uint32_t chain_ordinal) {
+  return select_peer_data_qp(
+    qps_per_peer, wave_start_ticket + chain_ordinal);
 }
 
 // storage_owner_peer_rdma_tokens is a per-data-QP knob.  Derive all transport
@@ -201,8 +315,13 @@ static_assert(select_peer_data_qp(4, 0) == 1);
 static_assert(select_peer_data_qp(4, 1) == 2);
 static_assert(select_peer_data_qp(4, 2) == 3);
 static_assert(select_peer_data_qp(4, 3) == 1);
+static_assert(select_peer_data_qp_for_wave_chain(4, 1, 0) == 2);
+static_assert(select_peer_data_qp_for_wave_chain(4, 1, 1) == 3);
+static_assert(select_peer_data_qp_for_wave_chain(4, 1, 2) == 1);
 static_assert(peer_rdma_read_batch_group_limit(
                 PeerRdmaReadCreditPlan{3, 8, 16, 32, 32}) == 8);
+static_assert(peer_rdma_read_pair_wave_limit(
+                PeerRdmaReadCreditPlan{3, 7, 21, 42, 42}) == 9);
 static_assert(peer_rdma_read_batch_completion_count(
                 17, PeerRdmaReadCreditPlan{1, 8, 8, 8, 8}) == 3);
 

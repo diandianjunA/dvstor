@@ -46,6 +46,15 @@
 #include "vamana/centroid_router.hh"
 #include "vamana/vamana_node.hh"
 
+namespace memory_node_storage_owner_maintenance_detail {
+enum class Stage2SearchAdvanceResult : std::uint8_t;
+struct Stage2SearchIoState;
+}  // namespace memory_node_storage_owner_maintenance_detail
+
+namespace memory_node_storage_owner_index_detail {
+enum class StableNodeSnapshotState : u8;
+}  // namespace memory_node_storage_owner_index_detail
+
 /**
  * Owns one static vector/compact-graph shard, its PQ navigation-code stream,
  * and the mutable storage-owner region used by online updates. Compute nodes
@@ -390,7 +399,6 @@ private:
   u32 peer_rdma_read_credit_limit_per_qp() const;
   u32 peer_rdma_read_credit_limit() const;
   u32 peer_rdma_read_global_credit_limit() const;
-  bool try_acquire_counter(std::atomic<u32>& counter, u32 limit);
   bool try_acquire_peer_rdma_read_credit(u32 shard_id, u32 qp_idx);
   void acquire_peer_rdma_read_credit(u32 shard_id, u32 qp_idx);
   bool try_acquire_peer_rdma_read_group(u32 shard_id, u32 qp_idx,
@@ -412,9 +420,23 @@ private:
                             size_t local_offset = 0);
   void post_peer_reads_async(StorageOwnerThread& thread,
                              span<const PeerReadRequest> requests);
+  bool try_post_peer_reads_async(
+    StorageOwnerThread& thread,
+    span<const PeerReadRequest> requests);
+  bool post_peer_reads_async_impl(
+    StorageOwnerThread& thread,
+    span<const PeerReadRequest> requests,
+    bool try_only);
   void post_peer_read_pairs_async(
     StorageOwnerThread& thread,
     span<const PeerReadPairRequest> requests);
+  bool try_post_peer_read_pairs_async(
+    StorageOwnerThread& thread,
+    span<const PeerReadPairRequest> requests);
+  bool post_peer_read_pairs_async_impl(
+    StorageOwnerThread& thread,
+    span<const PeerReadPairRequest> requests,
+    bool try_only);
   void remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, size_t bytes, size_t scratch_offset);
   void remote_write_bytes(u32 shard_id, u64 remote_offset, const void* src, size_t bytes, size_t scratch_offset);
   u64 remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 expected, u64 desired, size_t scratch_offset);
@@ -571,6 +593,16 @@ private:
       span<const service::storage_owner::Stage1ArmItem> items,
       vec<service::storage_owner::Stage1ArmResult>& results,
       const Configuration& config);
+  bool control_stage1_fanout_and_wait(
+      const dense_hashmap_t<
+        u32, vec<service::storage_owner::Stage1ArmItem>>& items_by_home,
+      u32 source_client,
+      const std::function<void(
+        u32,
+        span<const service::storage_owner::Stage1ArmItem>,
+        span<const service::storage_owner::Stage1ArmResult>)>&
+        on_home_resolved,
+      const Configuration& config);
   bool activate_cleanup_fanout_and_wait(
       span<const service::storage_owner::CleanupActivateItem> items,
       vec<service::storage_owner::CleanupActivateResult>& results,
@@ -642,9 +674,11 @@ private:
   memory_node_storage_owner_index_detail::IncarnationLockResult
     try_lock_node(RemotePtr rptr);
   bool storage_owner_task_current(node_t id, u32 generation, RemotePtr target);
-  bool storage_owner_physical_node_matches(node_t id,
-                                           u32 generation,
-                                           RemotePtr target);
+  memory_node_storage_owner_index_detail::StableNodeSnapshotState
+    storage_owner_physical_node_state(node_t id,
+                                      u32 generation,
+                                      RemotePtr target,
+                                      NodeSnapshot* stable_snapshot = nullptr);
   vec<RemotePtr> read_preserved_neighbor_list(RemotePtr rptr);
   bool remove_local_neighbor(RemotePtr target_ptr, RemotePtr deleted_ptr, const Configuration& config);
   bool remove_local_neighbors_batched(
@@ -746,7 +780,9 @@ private:
   size_t read_node_identity_headers_batched_into(
       span<const RemotePtr> rptrs,
       const configuration::IndexConfiguration& config,
-      vec<std::pair<RemotePtr, u64>>& identities);
+      vec<std::pair<RemotePtr, u64>>& identities,
+      vec<memory_node_storage_owner_index_detail::StableNodeSnapshotState>*
+        states = nullptr);
   bool read_graph_adjacency(RemotePtr rptr,
                             GraphAdjacency& adjacency);
   vec<std::pair<RemotePtr, GraphAdjacency>>
@@ -766,12 +802,16 @@ private:
   vec<NodeSnapshot> read_node_snapshots_batched(
       const vec<RemotePtr>& rptrs,
       const Configuration& config,
-      const char* boundary = "read_node_snapshots_batched");
+      const char* boundary = "read_node_snapshots_batched",
+      vec<memory_node_storage_owner_index_detail::StableNodeSnapshotState>*
+        states = nullptr);
   size_t read_node_snapshots_batched_into(
       span<const RemotePtr> rptrs,
       const Configuration& config,
       vec<NodeSnapshot>& snapshots,
-      const char* boundary = "read_node_snapshots_batched_into");
+      const char* boundary = "read_node_snapshots_batched_into",
+      vec<memory_node_storage_owner_index_detail::StableNodeSnapshotState>*
+        states = nullptr);
   const vec<BeamEntry>& score_stable_node_vectors_batched(
       span<const RemotePtr> rptrs,
       const byte_t* stored_query,
@@ -827,6 +867,13 @@ private:
       span<const StorageOwnerMaintenanceTask> tasks,
       span<const NodeSnapshot> targets,
       vec<vec<RemotePtr>>& candidates_by_task,
+      const Configuration& config);
+  memory_node_storage_owner_maintenance_detail::Stage2SearchAdvanceResult
+  advance_stage2_search_candidates_batched(
+      span<const StorageOwnerMaintenanceTask> tasks,
+      span<const NodeSnapshot> targets,
+      vec<vec<RemotePtr>>& candidates_by_task,
+      memory_node_storage_owner_maintenance_detail::Stage2SearchIoState& state,
       const Configuration& config);
   vec<RemotePtr> local_centroid_route_entries() const;
   void initialize_storage_centroid_route();
@@ -938,6 +985,10 @@ private:
   std::condition_variable peer_completion_cv_;
   vec<ibv_wc> peer_send_wcs_;
   std::unordered_set<u64> peer_sync_completions_;
+  // IDs returned by next_peer_*_wr_id() are reserved before the producer
+  // drops peer_completion_mutex_ to populate/post its WR.  This closes the
+  // allocation-to-registration race when a 32-bit sequence wraps.
+  std::unordered_set<u64> peer_reserved_wr_ids_;
   std::unordered_map<u64, PeerPendingSend> peer_pending_sends_;
   vec<std::atomic<u32>> peer_rdma_read_outstanding_;
   vec<vec<std::atomic<u32>>> peer_rdma_read_qp_outstanding_;
@@ -947,8 +998,10 @@ private:
   vec<std::unique_ptr<std::mutex>> peer_rpc_sync_send_mutexes_;
   std::mutex peer_rpc_send_slots_mutex_;
   vec<std::array<std::deque<u32>, 3>> peer_rpc_free_send_slots_;
-  std::atomic<u32> peer_sync_wr_id_counter_{1};
-  std::atomic<u32> peer_async_wr_id_counter_{1};
+  // Accessed only while peer_completion_mutex_ is held.  They deliberately
+  // wrap; allocation probes past every still-live ID in that namespace.
+  u32 peer_sync_wr_id_counter_{1};
+  u32 peer_async_wr_id_counter_{1};
   std::atomic<u32> peer_async_rdma_outstanding_{0};
   std::atomic<u64> next_peer_request_id_{1};
   std::atomic<bool> peer_rpc_progress_running_{false};

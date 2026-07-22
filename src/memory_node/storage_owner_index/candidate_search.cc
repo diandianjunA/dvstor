@@ -1,10 +1,34 @@
 #include "memory_node/storage_owner_index/detail.hh"
 #include "memory_node/storage_owner_index/partition_local_search.hh"
 #include "memory_node/storage_owner_index/vector_snapshot_policy.hh"
+#include "memory_node/storage_owner_maintenance/search_io_state.hh"
 
 #include <numeric>
 
 using namespace memory_node_storage_owner_index_detail;
+using namespace memory_node_storage_owner_maintenance_detail;
+
+namespace {
+
+// Stage1 may traverse a query-visible insertion while its Stage2 maintenance
+// is still pending.  PROVISIONAL is therefore a traversal state, not a dead
+// physical identity.  The final Stage1 handoff is filtered separately with
+// classify_stable_node_snapshot(), so only stable nodes become final
+// candidates or inherited Stage2 beam entries.
+StableNodeSnapshotState classify_stage1_traversal_snapshot(
+    RemotePtr pointer,
+    u64 before,
+    u64 after,
+    u32 slot_incarnation) {
+  const StableNodeSnapshotState physical = classify_physical_node_snapshot(
+    pointer, before, after, slot_incarnation);
+  if (physical != StableNodeSnapshotState::stable) return physical;
+  return (after & VamanaNode::HEADER_DELETED) != 0
+    ? StableNodeSnapshotState::terminal
+    : StableNodeSnapshotState::stable;
+}
+
+}  // namespace
 
 vec<RemotePtr> MemoryNode::partition_local_search_candidates(
     const span<const element_t> query,
@@ -38,55 +62,172 @@ vec<RemotePtr> MemoryNode::partition_local_search_candidates(
     (dtype == VectorDType::uint8 || dtype == VectorDType::int8);
   auto score = [&](RemotePtr candidate) -> std::optional<distance_t> {
     auto started = std::chrono::steady_clock::now();
-    const byte_t* vector = local_live_vector(candidate);
-    if (breakdown != nullptr) {
-      breakdown->storage_owner_search_snapshot_read_ns += elapsed_ns_since(started);
-    }
-    if (vector == nullptr) {
+    if (!storage_node_pointer_addressable(candidate)) {
+      if (breakdown != nullptr) {
+        breakdown->storage_owner_search_snapshot_read_ns +=
+          elapsed_ns_since(started);
+      }
       return std::nullopt;
     }
 
-    started = std::chrono::steady_clock::now();
-    // The canonical insert bytes are available on both stages. Use the same
-    // chunked integer SIMD reduction for every uint8/int8 dimension so the
-    // local beam, remote continuation and final prune compare one distance
-    // semantics. A normal query still uses the float-query path because it
-    // may contain genuinely fractional coordinates.
-    const distance_t distance = exact_integral_query
-      ? typed_l2_distance(
-          integral_raw_query, dtype, vector, dtype, config.dim)
-      : distance_to_stored_vector(query, vector, config);
-    if (breakdown != nullptr) {
-      breakdown->storage_owner_search_distance_ns += elapsed_ns_since(started);
+    const byte_t* node = local_node_ptr(candidate);
+    const byte_t* vector = node + VamanaNode::offset_vector();
+    for (;;) {
+      const u64 before = load_local_node_header_acquire(candidate);
+      if ((before & VamanaNode::HEADER_NODE_LOCK) != 0) {
+        std::this_thread::yield();
+        continue;
+      }
+      const u32 slot_incarnation = *reinterpret_cast<const u32*>(
+        node + VamanaNode::offset_slot_incarnation());
+
+      // Avoid an O(D) distance calculation for a conclusively dead physical
+      // identity.  It is conclusive only when the header remains unchanged
+      // and unlocked around the slot-incarnation observation.
+      if (VamanaNode::header_incarnation(before) != candidate.incarnation() ||
+          slot_incarnation != candidate.incarnation() ||
+          (before & VamanaNode::HEADER_DELETED) != 0) {
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const u64 after = load_local_node_header_acquire(candidate);
+        const StableNodeSnapshotState state =
+          classify_stage1_traversal_snapshot(
+            candidate, before, after, slot_incarnation);
+        if (state == StableNodeSnapshotState::terminal) {
+          if (breakdown != nullptr) {
+            breakdown->storage_owner_search_snapshot_read_ns +=
+              elapsed_ns_since(started);
+          }
+          return std::nullopt;
+        }
+        std::this_thread::yield();
+        continue;
+      }
+
+      const auto distance_started = std::chrono::steady_clock::now();
+      // The canonical insert bytes are available on both stages. Use the same
+      // chunked integer SIMD reduction for every uint8/int8 dimension so the
+      // local beam, remote continuation and final prune compare one distance
+      // semantics. A normal query still uses the float-query path because it
+      // may contain genuinely fractional coordinates.
+      const distance_t distance = exact_integral_query
+        ? typed_l2_distance(
+            integral_raw_query, dtype, vector, dtype, config.dim)
+        : distance_to_stored_vector(query, vector, config);
+      if (breakdown != nullptr) {
+        breakdown->storage_owner_search_distance_ns +=
+          elapsed_ns_since(distance_started);
+      }
+      std::atomic_thread_fence(std::memory_order_acquire);
+      const u64 after = load_local_node_header_acquire(candidate);
+      const StableNodeSnapshotState state =
+        classify_stage1_traversal_snapshot(
+          candidate, before, after, slot_incarnation);
+      if (state == StableNodeSnapshotState::stable) {
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_snapshot_read_ns +=
+            elapsed_ns_since(started);
+        }
+        return distance;
+      }
+      if (state == StableNodeSnapshotState::terminal) {
+        if (breakdown != nullptr) {
+          breakdown->storage_owner_search_snapshot_read_ns +=
+            elapsed_ns_since(started);
+        }
+        return std::nullopt;
+      }
+      // NODE_LOCK or any optimistic before/after mismatch is contention, not
+      // evidence that the candidate is absent.  There is intentionally no
+      // retry count that converts this state into successful convergence.
+      std::this_thread::yield();
     }
-    return distance;
   };
   auto expand = [&](RemotePtr candidate, auto&& visit) {
     const auto started = std::chrono::steady_clock::now();
-    bool decoded = read_local_neighbor_list(
-      candidate, neighbors, neighbor_entry, neighbor_decoded);
-    if (!decoded) {
-      // Concurrent adjacency publication can invalidate all optimistic
-      // checksum attempts. Falling back to the node lock is rare, but avoids
-      // silently treating a hot node as a leaf and permanently reducing the
-      // construction candidate set.
-      IncarnationLockResult lock_result;
-      do {
-        lock_result = try_lock_node(candidate);
-      } while (lock_result == IncarnationLockResult::busy);
-      if (lock_result == IncarnationLockResult::stale) {
-        // The beam retained an old physical handle while cleanup recycled its
-        // slot.  The new incarnation is a different node and must not be
-        // expanded through this candidate.
+    const byte_t* node = local_node_ptr(candidate);
+    const auto validate_decoded_neighbors = [&] {
+      const u32 edge_count =
+        VamanaNode::decoded_neighbor_count(neighbor_decoded.data());
+      const auto* slots = reinterpret_cast<const RemotePtr*>(
+        neighbor_decoded.data() +
+          VamanaNode::neighbor_payload_offset_in_read());
+      for (u32 index = 0;
+           index < edge_count &&
+             index < VamanaNode::graph_entry_capacity();
+           ++index) {
+        if (!slots[index].is_null() &&
+            !storage_node_pointer_addressable(slots[index])) {
+          lib_failure(
+            "stable Stage1 graph contains a malformed remote pointer");
+        }
+      }
+    };
+    u32 stable_optimistic_misses = 0;
+    constexpr u32 kStableOptimisticMissesBeforeLock = 3;
+    for (;;) {
+      const u64 before = load_local_node_header_acquire(candidate);
+      const u32 slot_incarnation = *reinterpret_cast<const u32*>(
+        node + VamanaNode::offset_slot_incarnation());
+      const bool decoded = read_local_neighbor_list(
+        candidate, neighbors, neighbor_entry, neighbor_decoded);
+      std::atomic_thread_fence(std::memory_order_acquire);
+      const u64 after = load_local_node_header_acquire(candidate);
+      const StableNodeSnapshotState state =
+        classify_stage1_traversal_snapshot(
+          candidate, before, after, slot_incarnation);
+      if (state == StableNodeSnapshotState::terminal) {
         neighbors.clear();
         return;
       }
-      decoded = read_local_neighbor_list(
+      if (state == StableNodeSnapshotState::stable && decoded) {
+        validate_decoded_neighbors();
+        break;
+      }
+
+      if (state != StableNodeSnapshotState::stable) {
+        // A changing/locked header explains this miss; it is ordinary
+        // contention rather than evidence of persistent graph corruption.
+        stable_optimistic_misses = 0;
+        std::this_thread::yield();
+        continue;
+      }
+
+      ++stable_optimistic_misses;
+      if (stable_optimistic_misses <
+          kStableOptimisticMissesBeforeLock) {
+        std::this_thread::yield();
+        continue;
+      }
+
+      // Repeated checksum failure under one coherent physical identity needs
+      // a race-closing diagnosis. The short count is not a search budget: it
+      // only distinguishes optimistic publication tearing from a durable
+      // malformed adjacency. Once the incarnation lock is held, a second
+      // decode cannot race a graph writer and therefore must succeed.
+      const IncarnationLockResult lock = try_lock_node(candidate);
+      if (lock == IncarnationLockResult::busy) {
+        std::this_thread::yield();
+        continue;
+      }
+      if (lock == IncarnationLockResult::stale) {
+        neighbors.clear();
+        return;
+      }
+      const u64 locked_header = load_local_node_header_acquire(candidate);
+      if ((locked_header & VamanaNode::HEADER_DELETED) != 0) {
+        neighbors.clear();
+        unlock_node(candidate);
+        return;
+      }
+      const bool locked_decoded = read_local_neighbor_list(
         candidate, neighbors, neighbor_entry, neighbor_decoded);
       unlock_node(candidate);
-      lib_assert(decoded,
-                 "partition-local construction search could not decode a "
-                 "locked adjacency snapshot");
+      if (!locked_decoded) {
+        lib_failure(
+          "stable Stage1 graph remains malformed while incarnation-locked");
+      }
+      validate_decoded_neighbors();
+      break;
     }
     if (breakdown != nullptr) {
       breakdown->storage_owner_search_neighbor_read_ns += elapsed_ns_since(started);
@@ -115,12 +256,24 @@ vec<RemotePtr> MemoryNode::partition_local_search_candidates(
   filter_final_partition_local_beam(
     final_beam, [&](RemotePtr candidate) {
       const auto validation_started = std::chrono::steady_clock::now();
-      const bool live = storage_owner_node_stable(candidate);
-      if (breakdown != nullptr) {
-        breakdown->storage_owner_search_snapshot_read_ns +=
-          elapsed_ns_since(validation_started);
+      const byte_t* node = local_node_ptr(candidate);
+      for (;;) {
+        const u64 before = load_local_node_header_acquire(candidate);
+        const u32 slot_incarnation = *reinterpret_cast<const u32*>(
+          node + VamanaNode::offset_slot_incarnation());
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const u64 after = load_local_node_header_acquire(candidate);
+        const StableNodeSnapshotState state = classify_stable_node_snapshot(
+          candidate, before, after, slot_incarnation);
+        if (state != StableNodeSnapshotState::retryable) {
+          if (breakdown != nullptr) {
+            breakdown->storage_owner_search_snapshot_read_ns +=
+              elapsed_ns_since(validation_started);
+          }
+          return state == StableNodeSnapshotState::stable;
+        }
+        std::this_thread::yield();
       }
-      return live;
     });
 
   if (stage1_beam != nullptr) {
@@ -147,6 +300,11 @@ vec<RemotePtr> MemoryNode::partition_local_search_candidates(
     // final result materialization rather than a redundant sort.
     breakdown->storage_owner_search_result_sort_ns += elapsed_ns_since(started);
   }
+  // All three externally visible Stage1 products have now been copied.
+  // Release only exceptional thread-local high-water capacity; this is a
+  // completed-search retention policy and never constrains an active search.
+  reusable_search.trim_oversized_capacity(
+    std::max<size_t>(1024, static_cast<size_t>(construction_width) * 8));
   return candidates;
 }
 
@@ -159,15 +317,40 @@ const vec<RemotePtr>& MemoryNode::continue_stage2_search_candidates(
   lib_assert(target.vector_data.size() >= VamanaNode::vector_bytes(),
              "stage2 continuation target vector is incomplete");
 
+  const auto classify_inherited_stage1_entry = [&](RemotePtr pointer) {
+    if (!storage_node_pointer_addressable(pointer) ||
+        !local_shard(pointer.memory_node())) {
+      return StableNodeSnapshotState::terminal;
+    }
+    const byte_t* node = local_node_ptr(pointer);
+    const u64 before = load_local_node_header_acquire(pointer);
+    const u32 slot_incarnation = *reinterpret_cast<const u32*>(
+      node + VamanaNode::offset_slot_incarnation());
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const u64 after = load_local_node_header_acquire(pointer);
+    return classify_stable_node_snapshot(
+      pointer, before, after, slot_incarnation);
+  };
+
   thread_local vec<PartitionLocalSearchEntry> local_beam;
   local_beam.clear();
   local_beam.reserve(task.stage1_beam.size());
   for (const BeamEntry& entry : task.stage1_beam) {
     // Stage1 already computed the exact distance. Revalidation needs only the
     // stable physical identity, not another D-byte vector materialization.
-    if (!read_stable_node_identity(entry.rptr)) continue;
-    local_beam.push_back(
-      PartitionLocalSearchEntry{entry.rptr, entry.distance, true});
+    // A transient lock/torn observation is retried without a fixed count;
+    // only a coherent stale/deleted/provisional identity is omitted.
+    for (;;) {
+      const StableNodeSnapshotState state =
+        classify_inherited_stage1_entry(entry.rptr);
+      if (state == StableNodeSnapshotState::stable) {
+        local_beam.push_back(
+          PartitionLocalSearchEntry{entry.rptr, entry.distance, true});
+        break;
+      }
+      if (state == StableNodeSnapshotState::terminal) break;
+      std::this_thread::yield();
+    }
   }
 
   thread_local vec<element_t> query;
@@ -270,6 +453,21 @@ void MemoryNode::continue_stage2_search_candidates_batched(
   local_beams.resize(tasks.size());
   seeds.resize(tasks.size());
 
+  const auto classify_inherited_stage1_entry = [&](RemotePtr pointer) {
+    if (!storage_node_pointer_addressable(pointer) ||
+        !local_shard(pointer.memory_node())) {
+      return StableNodeSnapshotState::terminal;
+    }
+    const byte_t* node = local_node_ptr(pointer);
+    const u64 before = load_local_node_header_acquire(pointer);
+    const u32 slot_incarnation = *reinterpret_cast<const u32*>(
+      node + VamanaNode::offset_slot_incarnation());
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const u64 after = load_local_node_header_acquire(pointer);
+    return classify_stable_node_snapshot(
+      pointer, before, after, slot_incarnation);
+  };
+
   u64 frontier_items = 0;
   for (size_t item = 0; item < tasks.size(); ++item) {
     const StorageOwnerMaintenanceTask& task = tasks[item];
@@ -285,8 +483,16 @@ void MemoryNode::continue_stage2_search_candidates_batched(
       // Stage1 distances remain authoritative for its local beam. Identity
       // validation is local to the Stage1 owner and therefore adds no RDMA
       // serialization to the cross-task wavefront.
-      if (!read_stable_node_identity(entry.rptr)) continue;
-      local.push_back({entry.rptr, entry.distance, true});
+      for (;;) {
+        const StableNodeSnapshotState state =
+          classify_inherited_stage1_entry(entry.rptr);
+        if (state == StableNodeSnapshotState::stable) {
+          local.push_back({entry.rptr, entry.distance, true});
+          break;
+        }
+        if (state == StableNodeSnapshotState::terminal) break;
+        std::this_thread::yield();
+      }
     }
     seeds[item] = {
       .local_beam = span<const PartitionLocalSearchEntry>{local},
@@ -567,4 +773,841 @@ void MemoryNode::continue_stage2_search_candidates_batched(
     total_expansions, std::memory_order_relaxed);
   storage_owner_stage2_search_budget_exhausted_.fetch_add(
     exhausted, std::memory_order_relaxed);
+}
+
+
+Stage2SearchAdvanceResult
+MemoryNode::advance_stage2_search_candidates_batched(
+    span<const StorageOwnerMaintenanceTask> tasks,
+    span<const NodeSnapshot> targets,
+    vec<vec<RemotePtr>>& candidates_by_task,
+    Stage2SearchIoState& state,
+    const Configuration& config) {
+  lib_assert(tasks.size() == targets.size(),
+             "asynchronous Stage2 continuation lost task/target correlation");
+  candidates_by_task.resize(tasks.size());
+  if (tasks.empty()) {
+    state.reset();
+    return Stage2SearchAdvanceResult::complete;
+  }
+
+  StorageOwnerThread* thread = current_storage_owner_thread_;
+  if (thread == nullptr || !thread->has_peer_scratch()) {
+    // Unit/single-node callers have no registered lane scratch.  Production
+    // maintenance always enters the resumable path below.
+    continue_stage2_search_candidates_batched(
+      tasks, targets, candidates_by_task, config);
+    state.reset();
+    return Stage2SearchAdvanceResult::complete;
+  }
+
+  const u32 construction_width = storage_owner_construction_width(config);
+  const PartitionSearchBudget budget = stage2_partition_search_budget(
+    construction_width, VamanaNode::graph_entry_capacity());
+  const auto& credit_plan = peer_rdma_read_credit_plan();
+  const size_t ordinary_credit_limit =
+    std::min<size_t>(credit_plan.per_peer, credit_plan.global);
+  const size_t pair_credit_limit =
+    memory_node_detail::peer_rdma_read_pair_wave_limit(credit_plan);
+  lib_assert(ordinary_credit_limit != 0,
+             "asynchronous Stage2 has no RDMA READ credit");
+  const bool ordered_pairs = pair_credit_limit != 0;
+  const size_t score_dispatch_limit = std::min<size_t>(
+    storage_owner_snapshot_batch_size(config, thread),
+    ordered_pairs ? pair_credit_limit : ordinary_credit_limit);
+  const size_t graph_dispatch_limit = std::min<size_t>(
+    storage_owner_graph_batch_size(config, thread), ordinary_credit_limit);
+  lib_assert(score_dispatch_limit != 0 && graph_dispatch_limit != 0,
+             "asynchronous Stage2 scratch cannot hold one RDMA record");
+
+  const auto classify_inherited_stage1_entry = [&](RemotePtr pointer) {
+    if (!storage_node_pointer_addressable(pointer) ||
+        !local_shard(pointer.memory_node())) {
+      return StableNodeSnapshotState::terminal;
+    }
+    const byte_t* node = local_node_ptr(pointer);
+    const u64 before = load_local_node_header_acquire(pointer);
+    const u32 slot_incarnation = *reinterpret_cast<const u32*>(
+      node + VamanaNode::offset_slot_incarnation());
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const u64 after = load_local_node_header_acquire(pointer);
+    return classify_stable_node_snapshot(
+      pointer, before, after, slot_incarnation);
+  };
+
+  if (!state.initialized) {
+    lib_assert(state.phase == Stage2SearchIoPhase::idle,
+               "new Stage2 continuation inherited pending lane I/O");
+    state.local_beams.resize(tasks.size());
+    state.seeds.resize(tasks.size());
+    state.search_seeded.assign(tasks.size(), 0);
+    state.score_collect_cursors.assign(tasks.size(), {});
+    state.continuation.initialize(
+      tasks.size(), storage_id_, construction_width, budget);
+    state.round_robin_search = 0;
+    state.prefer_graph = false;
+    state.initialized = true;
+
+    u64 frontier_items = 0;
+    for (const StorageOwnerMaintenanceTask& task : tasks) {
+      frontier_items += task.stage1_remote_frontier.size();
+    }
+    storage_owner_stage2_continuations_.fetch_add(
+      tasks.size(), std::memory_order_relaxed);
+    storage_owner_stage2_remote_frontier_items_.fetch_add(
+      frontier_items, std::memory_order_relaxed);
+  }
+
+  // Activate every stable Stage1 handoff independently.  A transient lock in
+  // one inherited local beam leaves only that search uninitialized; searches
+  // already activated below continue to issue and retire RDMA dispatches.
+  for (size_t item = 0; item < tasks.size(); ++item) {
+    if (state.search_seeded[item] != 0) continue;
+    const StorageOwnerMaintenanceTask& task = tasks[item];
+    const NodeSnapshot& target = targets[item];
+    lib_assert(!task.stage1_beam.empty(),
+               "stage2 task lost its Stage1 continuation beam");
+    lib_assert(target.vector_data.size() >= VamanaNode::vector_bytes(),
+               "stage2 continuation target vector is incomplete");
+
+    vec<PartitionLocalSearchEntry>& local = state.local_beams[item];
+    local.clear();
+    local.reserve(task.stage1_beam.size());
+    bool retryable = false;
+    for (const BeamEntry& entry : task.stage1_beam) {
+      const StableNodeSnapshotState entry_state =
+        classify_inherited_stage1_entry(entry.rptr);
+      if (entry_state == StableNodeSnapshotState::retryable) {
+        retryable = true;
+        break;
+      }
+      if (entry_state == StableNodeSnapshotState::stable) {
+        local.push_back({entry.rptr, entry.distance, true});
+      }
+    }
+    if (retryable) continue;
+
+    state.seeds[item] = {
+      .local_beam = span<const PartitionLocalSearchEntry>{local},
+      .remote_frontier = span<const RemotePtr>{task.stage1_remote_frontier},
+    };
+    state.continuation.initialize_search(item, state.seeds[item]);
+    state.search_seeded[item] = 1;
+  }
+
+  const auto classify_vector_snapshot = [](
+      RemotePtr pointer, u64 before, u64 after, u32 slot_incarnation) {
+    return classify_stable_node_snapshot(
+      pointer, before, after, slot_incarnation);
+  };
+
+  const auto clear_score_dispatch = [&] {
+    state.score_consumers.clear();
+    state.score_order.clear();
+    state.score_group_offsets.clear();
+    state.score_unique.clear();
+    state.pending_vectors.clear();
+    state.ordered_snapshot_pairs = false;
+    state.phase = Stage2SearchIoPhase::idle;
+  };
+  const auto clear_graph_dispatch = [&] {
+    state.graph_consumers.clear();
+    state.graph_order.clear();
+    state.graph_group_offsets.clear();
+    state.graph_unique.clear();
+    state.pending_graph.clear();
+    for (vec<RemotePtr>& neighbors : state.graph_neighbors) {
+      neighbors.clear();
+    }
+    state.phase = Stage2SearchIoPhase::idle;
+  };
+
+  const auto resolve_score_group = [&] (
+      size_t group_index,
+      const byte_t* candidate_vector) -> size_t {
+    lib_assert(group_index + 1 < state.score_group_offsets.size(),
+               "Stage2 score dispatch group is out of range");
+    const VectorDType dtype = VamanaNode::vector_dtype();
+    size_t resolved = 0;
+    for (size_t position = state.score_group_offsets[group_index];
+         position < state.score_group_offsets[group_index + 1]; ++position) {
+      const Stage2ScoreConsumer& consumer =
+        state.score_consumers[state.score_order[position]];
+      const distance_t distance = distance_between_vectors(
+        targets[consumer.search_index].vector_data.data(), dtype,
+        candidate_vector, dtype, config);
+      resolved += state.continuation.resolve_score_request(
+        consumer.search_index, consumer.generation, consumer.pointer,
+        std::optional<distance_t>{distance});
+    }
+    if (resolved != 0) {
+      storage_owner_stage2_scored_candidates_.fetch_add(
+        resolved, std::memory_order_relaxed);
+    }
+    return resolved;
+  };
+
+  const auto resolve_terminal_score_group = [&] (
+      size_t group_index) -> size_t {
+    lib_assert(group_index + 1 < state.score_group_offsets.size(),
+               "Stage2 terminal score group is out of range");
+    size_t resolved = 0;
+    for (size_t position = state.score_group_offsets[group_index];
+         position < state.score_group_offsets[group_index + 1]; ++position) {
+      const Stage2ScoreConsumer& consumer =
+        state.score_consumers[state.score_order[position]];
+      resolved += state.continuation.resolve_score_request(
+        consumer.search_index, consumer.generation, consumer.pointer,
+        std::nullopt);
+    }
+    if (resolved != 0) {
+      storage_owner_stage2_scored_candidates_.fetch_add(
+        resolved, std::memory_order_relaxed);
+    }
+    return resolved;
+  };
+
+  const auto resolve_graph_group = [&] (
+      size_t group_index, span<const RemotePtr> neighbors) -> size_t {
+    lib_assert(group_index + 1 < state.graph_group_offsets.size(),
+               "Stage2 graph dispatch group is out of range");
+    size_t resolved = 0;
+    for (size_t position = state.graph_group_offsets[group_index];
+         position < state.graph_group_offsets[group_index + 1]; ++position) {
+      const Stage2GraphConsumer& consumer =
+        state.graph_consumers[state.graph_order[position]];
+      resolved += state.continuation.resolve_expand_request(
+        consumer.search_index, consumer.generation, neighbors);
+    }
+    return resolved;
+  };
+
+  enum class GraphDecodeResult : u8 {
+    invalid_snapshot,
+    terminal_snapshot,
+    valid,
+    malformed_pointer,
+  };
+  const auto decode_graph = [&](size_t unique_index, RemotePtr pointer,
+                                const byte_t* entry) {
+    vec<RemotePtr>& neighbors = state.graph_neighbors[unique_index];
+    neighbors.clear();
+    const u8 stable_count = entry[0];
+    const u8 provisional_count =
+      vamana::hot_graph::provisional_count(entry);
+    const u16 expected = vamana::hot_graph::load_u16_le(entry + 2);
+    const u16 actual = vamana::hot_graph::checksum16(
+      entry, VamanaNode::hot_graph_entry_size());
+    if (stable_count > VamanaNode::R ||
+        provisional_count > VamanaNode::provisional_slots() ||
+        static_cast<u32>(stable_count) + provisional_count >
+          VamanaNode::graph_entry_capacity() ||
+        (entry[1] & 0x0e) != 0 ||
+        vamana::hot_graph::load_u32_le(entry + 12) != 0 ||
+        expected != actual) {
+      return GraphDecodeResult::invalid_snapshot;
+    }
+    if (vamana::hot_graph::load_u32_le(entry + 8) !=
+        pointer.incarnation()) {
+      return GraphDecodeResult::terminal_snapshot;
+    }
+    if ((entry[1] & VamanaNode::HOT_GRAPH_DELETED) != 0) {
+      return GraphDecodeResult::valid;
+    }
+    neighbors.reserve(
+      static_cast<size_t>(stable_count) + provisional_count);
+    bool malformed = false;
+    for (u32 index = 0;
+         index < static_cast<u32>(stable_count) + provisional_count;
+         ++index) {
+      const RemotePtr neighbor = vamana::hot_graph::decode_remote_ptr(
+        entry + vamana::hot_graph::neighbor_offset(index),
+        VamanaNode::HOT_GRAPH_SHARD_BITS);
+      // A counted prefix slot is part of the authoritative adjacency. Null
+      // here is malformed; only slots after the counted prefix are padding.
+      if (neighbor.is_null()) {
+        malformed = true;
+        continue;
+      }
+      if (!storage_node_pointer_addressable(neighbor)) {
+        malformed = true;
+        report_rejected_graph_pointer(
+          index < stable_count
+            ? "stage2_async_graph/stable"
+            : "stage2_async_graph/provisional",
+          neighbor, pointer, index);
+        continue;
+      }
+      neighbors.push_back(neighbor);
+    }
+    return malformed ? GraphDecodeResult::malformed_pointer
+                     : GraphDecodeResult::valid;
+  };
+
+  const auto graph_retry_attempt = [&](RemotePtr pointer) {
+    for (const Stage2GraphRetryState& retry : state.graph_retry_state) {
+      if (retry.pointer == pointer) return retry.attempt;
+    }
+    return u32{0};
+  };
+  const auto remember_graph_retry = [&](RemotePtr pointer, u32 attempt) {
+    for (Stage2GraphRetryState& retry : state.graph_retry_state) {
+      if (retry.pointer == pointer) {
+        retry.attempt = attempt;
+        return;
+      }
+    }
+    state.graph_retry_state.push_back({pointer, attempt});
+  };
+  const auto forget_graph_retry = [&](RemotePtr pointer) {
+    const auto found = std::find_if(
+      state.graph_retry_state.begin(), state.graph_retry_state.end(),
+      [&](const Stage2GraphRetryState& retry) {
+        return retry.pointer == pointer;
+      });
+    if (found != state.graph_retry_state.end()) {
+      *found = state.graph_retry_state.back();
+      state.graph_retry_state.pop_back();
+    }
+  };
+
+  const auto collect_score_dispatch = [&] {
+    state.score_consumers.clear();
+    for (Stage2ScoreRoundRobinCursor& cursor :
+         state.score_collect_cursors) {
+      cursor.begin_dispatch();
+    }
+    const size_t search_count = tasks.size();
+    size_t last_search = state.round_robin_search % search_count;
+    bool selected_any = false;
+    while (state.score_consumers.size() < score_dispatch_limit) {
+      bool selected_this_round = false;
+      for (size_t offset = 0;
+           offset < search_count &&
+             state.score_consumers.size() < score_dispatch_limit;
+           ++offset) {
+        const size_t search_index =
+          (state.round_robin_search + offset) % search_count;
+        if (state.search_seeded[search_index] == 0) continue;
+        const auto requests =
+          state.continuation.pending_score_requests(search_index);
+        const std::optional<size_t> position =
+          state.score_collect_cursors[search_index].take(requests.size());
+        if (!position.has_value()) continue;
+        const PartitionContinuationScoreRequest& request =
+          requests[*position];
+        state.score_consumers.push_back({
+          request.search_index, request.generation, request.pointer});
+        last_search = search_index;
+        selected_any = true;
+        selected_this_round = true;
+      }
+      if (!selected_this_round) break;
+    }
+    if (selected_any) {
+      state.round_robin_search = (last_search + 1) % search_count;
+    }
+    return selected_any;
+  };
+
+  const auto collect_graph_dispatch = [&] {
+    state.graph_consumers.clear();
+    const size_t search_count = tasks.size();
+    size_t last_search = state.round_robin_search % search_count;
+    bool selected_any = false;
+    for (size_t offset = 0;
+         offset < search_count &&
+           state.graph_consumers.size() < graph_dispatch_limit;
+         ++offset) {
+      const size_t search_index =
+        (state.round_robin_search + offset) % search_count;
+      if (state.search_seeded[search_index] == 0) continue;
+      const auto request =
+        state.continuation.pending_expand_request(search_index);
+      if (!request.has_value()) continue;
+      state.graph_consumers.push_back({
+        request->search_index, request->generation, request->pointer});
+      last_search = search_index;
+      selected_any = true;
+    }
+    if (selected_any) {
+      state.round_robin_search = (last_search + 1) % search_count;
+    }
+    return selected_any;
+  };
+
+  const auto prepare_score_dispatch = [&] {
+    if (!collect_score_dispatch()) return std::pair{false, false};
+    state.score_order.resize(state.score_consumers.size());
+    std::iota(state.score_order.begin(), state.score_order.end(), size_t{0});
+    std::sort(state.score_order.begin(), state.score_order.end(),
+              [&](size_t lhs, size_t rhs) {
+                const Stage2ScoreConsumer& left =
+                  state.score_consumers[lhs];
+                const Stage2ScoreConsumer& right =
+                  state.score_consumers[rhs];
+                if (left.pointer.raw_address != right.pointer.raw_address) {
+                  return left.pointer.raw_address < right.pointer.raw_address;
+                }
+                if (left.search_index != right.search_index) {
+                  return left.search_index < right.search_index;
+                }
+                return left.generation < right.generation;
+              });
+    state.score_unique.clear();
+    state.score_group_offsets.clear();
+    for (size_t position = 0; position < state.score_order.size();
+         ++position) {
+      const RemotePtr pointer =
+        state.score_consumers[state.score_order[position]].pointer;
+      if (state.score_unique.empty() ||
+          state.score_unique.back() != pointer) {
+        state.score_unique.push_back(pointer);
+        state.score_group_offsets.push_back(position);
+      }
+    }
+    state.score_group_offsets.push_back(state.score_order.size());
+    state.pending_vectors.clear();
+    const size_t snapshot_stride = aligned_snapshot_bytes();
+    const size_t validation_offset =
+      memory_node_detail::storage_owner_snapshot_validation_offset();
+    u32 remote_slot = 0;
+    bool progressed = false;
+    for (size_t group = 0; group < state.score_unique.size(); ++group) {
+      const RemotePtr pointer = state.score_unique[group];
+      if (!storage_node_pointer_addressable(pointer)) {
+        if (!pointer.is_null()) {
+          report_rejected_graph_pointer(
+            "stage2_async_score/input", pointer, RemotePtr{}, group);
+        }
+        progressed |= resolve_terminal_score_group(group) != 0;
+        continue;
+      }
+      if (local_shard(pointer.memory_node())) {
+        NodeSnapshot snapshot;
+        if (read_node_snapshot(pointer, snapshot)) {
+          const StableNodeSnapshotState disposition =
+            classify_vector_snapshot(
+              pointer, snapshot.header, snapshot.header,
+              snapshot.slot_incarnation);
+          if (disposition == StableNodeSnapshotState::stable &&
+              snapshot.vector_data.size() >= VamanaNode::vector_bytes()) {
+            progressed |= resolve_score_group(
+              group, snapshot.vector_data.data()) != 0;
+          } else if (disposition == StableNodeSnapshotState::terminal) {
+            progressed |= resolve_terminal_score_group(group) != 0;
+          }
+          continue;
+        }
+        const u64 before = load_local_node_header_acquire(pointer);
+        const u32 slot_incarnation = *reinterpret_cast<const u32*>(
+          local_node_ptr(pointer) + VamanaNode::offset_slot_incarnation());
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const u64 after = load_local_node_header_acquire(pointer);
+        if (classify_stable_node_snapshot(
+              pointer, before, after, slot_incarnation) ==
+            StableNodeSnapshotState::terminal) {
+          progressed |= resolve_terminal_score_group(group) != 0;
+        }
+        continue;
+      }
+
+      const size_t scratch_offset =
+        static_cast<size_t>(remote_slot++) * snapshot_stride;
+      lib_assert(scratch_offset + validation_offset +
+                   VamanaNode::HEADER_SIZE <= thread->scratch_stride,
+                 "Stage2 vector dispatch exceeded lane scratch");
+      byte_t* buffer = thread->coroutine_scratch(scratch_offset);
+      state.pending_vectors.push_back(Stage2PendingVectorRead{
+        .group_index = group,
+        .pointer = pointer,
+        .buffer = buffer,
+        .after_header = buffer + validation_offset,
+      });
+    }
+    if (!state.pending_vectors.empty()) {
+      storage_owner_stage2_vector_read_waves_.fetch_add(
+        1, std::memory_order_relaxed);
+      storage_owner_stage2_vector_unique_reads_.fetch_add(
+        state.pending_vectors.size(), std::memory_order_relaxed);
+      state.ordered_snapshot_pairs = ordered_pairs;
+      state.phase = Stage2SearchIoPhase::score_body_ready;
+    }
+    return std::pair{progressed, !state.pending_vectors.empty()};
+  };
+
+  const auto prepare_graph_dispatch = [&] {
+    if (!collect_graph_dispatch()) return std::pair{false, false};
+    state.graph_order.resize(state.graph_consumers.size());
+    std::iota(state.graph_order.begin(), state.graph_order.end(), size_t{0});
+    std::sort(state.graph_order.begin(), state.graph_order.end(),
+              [&](size_t lhs, size_t rhs) {
+                const Stage2GraphConsumer& left =
+                  state.graph_consumers[lhs];
+                const Stage2GraphConsumer& right =
+                  state.graph_consumers[rhs];
+                if (left.pointer.raw_address != right.pointer.raw_address) {
+                  return left.pointer.raw_address < right.pointer.raw_address;
+                }
+                if (left.search_index != right.search_index) {
+                  return left.search_index < right.search_index;
+                }
+                return left.generation < right.generation;
+              });
+    state.graph_unique.clear();
+    state.graph_group_offsets.clear();
+    for (size_t position = 0; position < state.graph_order.size();
+         ++position) {
+      const RemotePtr pointer =
+        state.graph_consumers[state.graph_order[position]].pointer;
+      if (state.graph_unique.empty() ||
+          state.graph_unique.back() != pointer) {
+        state.graph_unique.push_back(pointer);
+        state.graph_group_offsets.push_back(position);
+      }
+    }
+    state.graph_group_offsets.push_back(state.graph_order.size());
+    if (state.graph_neighbors.size() < state.graph_unique.size()) {
+      state.graph_neighbors.resize(state.graph_unique.size());
+    }
+    for (size_t group = 0; group < state.graph_unique.size(); ++group) {
+      state.graph_neighbors[group].clear();
+    }
+    state.pending_graph.clear();
+    const size_t scratch_stride = aligned_graph_entry_bytes();
+    u32 remote_slot = 0;
+    bool progressed = false;
+    for (size_t group = 0; group < state.graph_unique.size(); ++group) {
+      const RemotePtr pointer = state.graph_unique[group];
+      if (!storage_node_pointer_addressable(pointer)) {
+        if (!pointer.is_null()) {
+          report_rejected_graph_pointer(
+            "stage2_async_graph/input", pointer, RemotePtr{}, group);
+        }
+        progressed |= resolve_graph_group(
+          group, span<const RemotePtr>{}) != 0;
+        continue;
+      }
+      if (local_shard(pointer.memory_node())) {
+        GraphAdjacency adjacency;
+        if (read_graph_adjacency(pointer, adjacency)) {
+          vec<RemotePtr>& neighbors = state.graph_neighbors[group];
+          if (!adjacency.deleted) {
+            neighbors.reserve(adjacency.stable.size() +
+                              adjacency.provisional.size());
+            neighbors.insert(neighbors.end(), adjacency.stable.begin(),
+                             adjacency.stable.end());
+            neighbors.insert(neighbors.end(), adjacency.provisional.begin(),
+                             adjacency.provisional.end());
+          }
+          progressed |= resolve_graph_group(
+            group, span<const RemotePtr>{neighbors}) != 0;
+          forget_graph_retry(pointer);
+          continue;
+        }
+        const u64 before = load_local_node_header_acquire(pointer);
+        const u32 slot_incarnation = *reinterpret_cast<const u32*>(
+          local_node_ptr(pointer) + VamanaNode::offset_slot_incarnation());
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const u64 after = load_local_node_header_acquire(pointer);
+        if (classify_stable_node_snapshot(
+              pointer, before, after, slot_incarnation) ==
+            StableNodeSnapshotState::terminal) {
+          progressed |= resolve_graph_group(
+            group, span<const RemotePtr>{}) != 0;
+          forget_graph_retry(pointer);
+        }
+        continue;
+      }
+
+      const size_t scratch_offset =
+        static_cast<size_t>(remote_slot++) * scratch_stride;
+      lib_assert(scratch_offset + VamanaNode::hot_graph_entry_size() <=
+                   thread->scratch_stride,
+                 "Stage2 graph dispatch exceeded lane scratch");
+      state.pending_graph.push_back(Stage2PendingGraphRead{
+        .unique_index = group,
+        .pointer = pointer,
+        .buffer = thread->coroutine_scratch(scratch_offset),
+        .attempt = graph_retry_attempt(pointer),
+      });
+    }
+    if (!state.pending_graph.empty()) {
+      storage_owner_stage2_graph_read_waves_.fetch_add(
+        1, std::memory_order_relaxed);
+      storage_owner_stage2_graph_unique_reads_.fetch_add(
+        state.pending_graph.size(), std::memory_order_relaxed);
+      state.phase = Stage2SearchIoPhase::graph_ready;
+    }
+    return std::pair{progressed, !state.pending_graph.empty()};
+  };
+
+  thread_local vec<PeerReadRequest> read_requests;
+  thread_local vec<PeerReadPairRequest> read_pairs;
+  u8 idle_attempt_mask = 0;
+
+  // Only a bounded transport dispatch is synchronized on one CQ.  Once its
+  // WRs retire, every stable/terminal consumer is resolved immediately and
+  // retryable consumers simply remain in their own search generation.
+  for (;;) {
+    if (state.continuation.all_complete()) {
+      const auto& final_beams = state.continuation.results();
+      const auto& exhausted =
+        state.continuation.budget_exhausted_results();
+      const auto& expansions =
+        state.continuation.expansion_count_results();
+      u64 total_expansions = 0;
+      u64 exhausted_count = 0;
+      lib_assert(final_beams.size() == tasks.size(),
+                 "asynchronous Stage2 result count changed");
+      for (size_t item = 0; item < final_beams.size(); ++item) {
+        total_expansions += expansions[item];
+        exhausted_count += exhausted[item];
+        vec<RemotePtr>& candidates = candidates_by_task[item];
+        candidates.clear();
+        candidates.reserve(final_beams[item].size());
+        for (const PartitionLocalSearchEntry& entry : final_beams[item]) {
+          candidates.push_back(entry.rptr);
+        }
+      }
+      storage_owner_stage2_remote_expansions_.fetch_add(
+        total_expansions, std::memory_order_relaxed);
+      storage_owner_stage2_search_budget_exhausted_.fetch_add(
+        exhausted_count, std::memory_order_relaxed);
+      const size_t retained_capacity = std::max<size_t>(
+        1024, static_cast<size_t>(construction_width) * 8);
+      state.reset_completed(retained_capacity);
+      return Stage2SearchAdvanceResult::complete;
+    }
+
+    if (state.phase == Stage2SearchIoPhase::score_body_pending) {
+      if (!thread->is_ready(thread->running_coroutine)) {
+        return Stage2SearchAdvanceResult::waiting_rdma;
+      }
+      if (state.ordered_snapshot_pairs) {
+        for (Stage2PendingVectorRead& read : state.pending_vectors) {
+          const u64 before = *reinterpret_cast<const u64*>(read.buffer);
+          const u32 slot_incarnation = *reinterpret_cast<const u32*>(
+            read.buffer + VamanaNode::offset_slot_incarnation());
+          const u64 after = *reinterpret_cast<const u64*>(read.after_header);
+          const StableNodeSnapshotState disposition =
+            classify_vector_snapshot(
+              read.pointer, before, after, slot_incarnation);
+          if (disposition == StableNodeSnapshotState::stable) {
+            resolve_score_group(
+              read.group_index,
+              read.buffer + VamanaNode::offset_vector());
+          } else if (disposition == StableNodeSnapshotState::terminal) {
+            resolve_terminal_score_group(read.group_index);
+          } else {
+            lib_assert(read.attempt != std::numeric_limits<u32>::max(),
+                       "Stage2 vector retry counter overflow");
+          }
+        }
+        clear_score_dispatch();
+        state.prefer_graph = true;
+        idle_attempt_mask = 0;
+        continue;
+      }
+      for (Stage2PendingVectorRead& read : state.pending_vectors) {
+        read.before = *reinterpret_cast<const u64*>(read.buffer);
+        read.slot_incarnation = *reinterpret_cast<const u32*>(
+          read.buffer + VamanaNode::offset_slot_incarnation());
+      }
+      state.phase = Stage2SearchIoPhase::score_header_ready;
+      continue;
+    }
+
+    if (state.phase == Stage2SearchIoPhase::score_header_pending) {
+      if (!thread->is_ready(thread->running_coroutine)) {
+        return Stage2SearchAdvanceResult::waiting_rdma;
+      }
+      for (Stage2PendingVectorRead& read : state.pending_vectors) {
+        const u64 after = *reinterpret_cast<const u64*>(read.buffer);
+        const StableNodeSnapshotState disposition = classify_vector_snapshot(
+          read.pointer, read.before, after, read.slot_incarnation);
+        if (disposition == StableNodeSnapshotState::stable) {
+          resolve_score_group(
+            read.group_index,
+            read.buffer + VamanaNode::offset_vector());
+        } else if (disposition == StableNodeSnapshotState::terminal) {
+          resolve_terminal_score_group(read.group_index);
+        } else {
+          lib_assert(read.attempt != std::numeric_limits<u32>::max(),
+                     "Stage2 vector retry counter overflow");
+        }
+      }
+      clear_score_dispatch();
+      state.prefer_graph = true;
+      idle_attempt_mask = 0;
+      continue;
+    }
+
+    if (state.phase == Stage2SearchIoPhase::score_header_ready) {
+      read_requests.clear();
+      for (const Stage2PendingVectorRead& read : state.pending_vectors) {
+        read_requests.push_back(PeerReadRequest{
+          .shard_id = read.pointer.memory_node(),
+          .remote_offset = read.pointer.byte_offset(),
+          .destination = read.buffer,
+          .bytes = VamanaNode::HEADER_SIZE,
+        });
+      }
+      lib_assert(read_requests.size() <= ordinary_credit_limit,
+                 "Stage2 header dispatch exceeds RDMA credit");
+      if (!try_post_peer_reads_async(
+            *thread, span<const PeerReadRequest>{read_requests})) {
+        return Stage2SearchAdvanceResult::waiting_rdma;
+      }
+      state.phase = Stage2SearchIoPhase::score_header_pending;
+      return Stage2SearchAdvanceResult::posted_rdma;
+    }
+
+    if (state.phase == Stage2SearchIoPhase::score_body_ready) {
+      if (state.ordered_snapshot_pairs) {
+        read_pairs.clear();
+        for (const Stage2PendingVectorRead& read : state.pending_vectors) {
+          const PeerReadRequest body{
+            .shard_id = read.pointer.memory_node(),
+            .remote_offset = read.pointer.byte_offset(),
+            .destination = read.buffer,
+            .bytes = VamanaNode::size_until_vector_end(),
+          };
+          read_pairs.push_back(PeerReadPairRequest{
+            .full_snapshot = body,
+            .after_header = PeerReadRequest{
+              .shard_id = read.pointer.memory_node(),
+              .remote_offset = read.pointer.byte_offset(),
+              .destination = read.after_header,
+              .bytes = VamanaNode::HEADER_SIZE,
+            },
+          });
+        }
+        lib_assert(read_pairs.size() <= pair_credit_limit,
+                   "Stage2 ordered snapshot dispatch exceeds RDMA credit");
+        if (!try_post_peer_read_pairs_async(
+              *thread, span<const PeerReadPairRequest>{read_pairs})) {
+          return Stage2SearchAdvanceResult::waiting_rdma;
+        }
+      } else {
+        read_requests.clear();
+        for (const Stage2PendingVectorRead& read : state.pending_vectors) {
+          read_requests.push_back(PeerReadRequest{
+            .shard_id = read.pointer.memory_node(),
+            .remote_offset = read.pointer.byte_offset(),
+            .destination = read.buffer,
+            .bytes = VamanaNode::size_until_vector_end(),
+          });
+        }
+        lib_assert(read_requests.size() <= ordinary_credit_limit,
+                   "Stage2 vector dispatch exceeds RDMA credit");
+        if (!try_post_peer_reads_async(
+              *thread, span<const PeerReadRequest>{read_requests})) {
+          return Stage2SearchAdvanceResult::waiting_rdma;
+        }
+      }
+      state.phase = Stage2SearchIoPhase::score_body_pending;
+      return Stage2SearchAdvanceResult::posted_rdma;
+    }
+
+    if (state.phase == Stage2SearchIoPhase::graph_pending) {
+      if (!thread->is_ready(thread->running_coroutine)) {
+        return Stage2SearchAdvanceResult::waiting_rdma;
+      }
+      constexpr u32 kMalformedRetryAttempts = 3;
+      for (Stage2PendingGraphRead& read : state.pending_graph) {
+        const GraphDecodeResult decoded = decode_graph(
+          read.unique_index, read.pointer, read.buffer);
+        if (decoded == GraphDecodeResult::valid) {
+          resolve_graph_group(
+            read.unique_index,
+            span<const RemotePtr>{state.graph_neighbors[read.unique_index]});
+          forget_graph_retry(read.pointer);
+          continue;
+        }
+        if (decoded == GraphDecodeResult::terminal_snapshot) {
+          resolve_graph_group(
+            read.unique_index, span<const RemotePtr>{});
+          forget_graph_retry(read.pointer);
+          continue;
+        }
+        if (decoded == GraphDecodeResult::malformed_pointer) {
+          if (read.attempt >= kMalformedRetryAttempts - 1) {
+            lib_failure(
+              "stable Stage2 graph contains a malformed remote pointer");
+          }
+          lib_assert(read.attempt != std::numeric_limits<u32>::max(),
+                     "Stage2 graph retry counter overflow");
+          remember_graph_retry(read.pointer, read.attempt + 1);
+        }
+        // An invalid checksum/header is an optimistic torn observation, not
+        // one of the three stable malformed records required for fail-stop.
+        // Leave the consumer unresolved and retain its prior diagnostic count.
+      }
+      clear_graph_dispatch();
+      state.prefer_graph = false;
+      idle_attempt_mask = 0;
+      continue;
+    }
+
+    if (state.phase == Stage2SearchIoPhase::graph_ready) {
+      read_requests.clear();
+      for (const Stage2PendingGraphRead& read : state.pending_graph) {
+        read_requests.push_back(PeerReadRequest{
+          .shard_id = read.pointer.memory_node(),
+          .remote_offset = VamanaNode::hot_graph_entry_offset(read.pointer),
+          .destination = read.buffer,
+          .bytes = VamanaNode::hot_graph_entry_size(),
+        });
+      }
+      lib_assert(read_requests.size() <= ordinary_credit_limit,
+                 "Stage2 graph dispatch exceeds RDMA credit");
+      if (!try_post_peer_reads_async(
+            *thread, span<const PeerReadRequest>{read_requests})) {
+        return Stage2SearchAdvanceResult::waiting_rdma;
+      }
+      state.phase = Stage2SearchIoPhase::graph_pending;
+      return Stage2SearchAdvanceResult::posted_rdma;
+    }
+
+    lib_assert(state.phase == Stage2SearchIoPhase::idle,
+               "Stage2 dispatcher entered an invalid I/O phase");
+    const bool has_score =
+      !state.continuation.pending_score_requests().empty();
+    const bool has_graph =
+      !state.continuation.pending_expand_requests().empty();
+    const bool score_available = has_score && (idle_attempt_mask & 1u) == 0;
+    const bool graph_available = has_graph && (idle_attempt_mask & 2u) == 0;
+    if (!score_available && !graph_available) {
+      // No ready work means either every active search is complete while a
+      // handoff is retryable, or both retry-only kinds were attempted once in
+      // this scheduler turn.  Yield instead of spinning on NODE_LOCK/torn
+      // snapshots.
+      return Stage2SearchAdvanceResult::waiting_rdma;
+    }
+
+    const bool choose_graph = graph_available &&
+      (!score_available || state.prefer_graph);
+    std::pair<bool, bool> prepared;
+    if (choose_graph) {
+      idle_attempt_mask |= 2u;
+      prepared = prepare_graph_dispatch();
+      state.prefer_graph = false;
+      if (!prepared.second) clear_graph_dispatch();
+    } else {
+      idle_attempt_mask |= 1u;
+      prepared = prepare_score_dispatch();
+      state.prefer_graph = true;
+      if (!prepared.second) clear_score_dispatch();
+    }
+    if (prepared.second) {
+      // The next loop iteration posts the prepared WRs.  No scratch address
+      // is reused until the corresponding *_pending phase observes CQ ready.
+      continue;
+    }
+    if (prepared.first) {
+      // Stable/terminal local consumers may have exposed a new generation.
+      idle_attempt_mask = 0;
+    }
+  }
 }

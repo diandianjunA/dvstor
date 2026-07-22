@@ -1,6 +1,7 @@
 #pragma once
 
 #include "memory_node/memory_node.hh"
+#include "memory_node/storage_owner_maintenance/stage2_batch_policy.hh"
 
 #include <algorithm>
 #include <array>
@@ -19,8 +20,6 @@ namespace memory_node_storage_owner_maintenance_detail {
 
 inline constexpr u64 kMaintenanceObservationPeriodNs =
   5ull * 1000ull * 1000ull * 1000ull;
-inline constexpr u64 kStage2CompactionMaxDelayNs =
-  10ull * 1000ull * 1000ull;
 inline constexpr size_t kForegroundQueueYieldMultiplier = 2;
 inline constexpr std::array<u64, 18> kFinalizeLatencyBucketUpperNs{
   1ull * 1000ull * 1000ull,
