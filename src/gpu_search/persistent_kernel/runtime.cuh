@@ -548,6 +548,51 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
       const i32 status = poll_direct_cq(
         completion_queue, first_completion, params.direct_timeout_ns,
         params.stop, params.direct_disabled);
+      if (status == -ETIMEDOUT) {
+        auto* completion_base = reinterpret_cast<mlx5_cqe64*>(
+          __ldg(reinterpret_cast<uintptr_t*>(&completion_queue->cqe_daddr)));
+        const u32 completion_count = __ldg(&completion_queue->cqe_num);
+        const u32 completion_index =
+          static_cast<u32>(first_completion) & (completion_count - 1u);
+        const u64 observed_consumer =
+          doca_gpu_dev_verbs_load_relaxed<
+            DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE>(
+              &completion_queue->cqe_ci);
+        const u8 observed_owner =
+          doca_gpu_dev_verbs_load_relaxed_sys_global(
+            reinterpret_cast<u8*>(
+              &completion_base[completion_index].op_own));
+        const u32 observed_dbrec = doca_gpu_dev_verbs_bswap32(
+          *reinterpret_cast<const volatile u32*>(completion_queue->dbrec));
+        const DirectBatchDescriptor first_descriptor =
+          shared_batches[warp_in_block][0];
+        u64 first_remote_offset = 0;
+        u64 first_local_iova = 0;
+        for (u32 request = 0; request < first_descriptor.request_count;
+             ++request) {
+          if (first_descriptor.request_shards[request] != memory_node) continue;
+          first_remote_offset = first_descriptor.remote_offsets[request];
+          if (first_descriptor.local_iova_offsets != nullptr) {
+            first_local_iova = first_descriptor.local_iova_offsets[request];
+          }
+          break;
+        }
+        printf("[gpu-search] direct CQ timeout owner=%u node=%u batches=%u "
+               "reads=%u dump=%u first_wqe=%llu sq_pi=%llu cq_ticket=%llu "
+               "cq_ci=%llu cq_dbrec=%u cq_index=%u cq_count=%u "
+               "op_own=0x%x bytes=%u "
+               "remote_offset=%llu local_iova=%llu\n",
+               warp, memory_node, batch_count, read_wqes,
+               need_dump ? 1u : 0u,
+               static_cast<unsigned long long>(first_wqe),
+               static_cast<unsigned long long>(qp->sq_wqe_pi),
+               static_cast<unsigned long long>(first_completion),
+               static_cast<unsigned long long>(observed_consumer),
+               observed_dbrec, completion_index, completion_count,
+               static_cast<unsigned>(observed_owner), first_descriptor.bytes,
+               static_cast<unsigned long long>(first_remote_offset),
+               static_cast<unsigned long long>(first_local_iova));
+      }
       for (u32 batch = 0; batch < batch_count; ++batch) {
         complete_direct_batch(shared_batches[warp_in_block][batch], status,
                               owner_progress);

@@ -34,11 +34,9 @@ __device__ inline int poll_cq_at_with_timeout(struct doca_gpu_dev_verbs_cq* cq,
     opown = doca_gpu_dev_verbs_load_relaxed_sys_global(reinterpret_cast<uint8_t*>(&cqe64->op_own));
     if (!((curr_cons_index <= ticket) && ((opown & MLX5_CQE_OWNER_MASK) ^ !!(ticket & cqe_num)))) {
       const uint8_t opcode = opown >> DOCA_GPUNETIO_VERBS_MLX5_CQE_OPCODE_SHIFT;
-      if (opcode == MLX5_CQE_REQ_ERR) return -EIO;
       doca_gpu_dev_verbs_fence_acquire<DOCA_GPUNETIO_VERBS_SYNC_SCOPE_SYS>();
-      doca_gpu_dev_verbs_atomic_max<uint64_t, sharing_mode>(
-        &cq->cqe_ci, ticket + 1);
-      return 0;
+      doca_gpu_dev_verbs_cq_update_dbrec<false>(cq, 1);
+      return opcode == MLX5_CQE_REQ_ERR ? -EIO : 0;
     }
   }
 

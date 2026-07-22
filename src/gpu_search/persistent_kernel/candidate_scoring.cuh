@@ -117,12 +117,14 @@ __device__ i32 poll_direct_cq(doca_gpu_dev_verbs_cq* completion_queue,
           ((owner & MLX5_CQE_OWNER_MASK) ^ !!(ticket & completion_count)))) {
       const u8 opcode = owner >> DOCA_GPUNETIO_VERBS_MLX5_CQE_OPCODE_SHIFT;
       const i32 status = opcode == MLX5_CQE_REQ_ERR ? -EIO : 0;
-      if (status == 0) {
-        doca_gpu_dev_verbs_fence_acquire<DOCA_GPUNETIO_VERBS_SYNC_SCOPE_SYS>();
-        doca_gpu_dev_verbs_atomic_max<
-          u64, DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE>(
-            &completion_queue->cqe_ci, ticket + 1);
-      }
+      doca_gpu_dev_verbs_fence_acquire<DOCA_GPUNETIO_VERBS_SYNC_SCOPE_SYS>();
+      // Advancing only the device-side consumer index is insufficient: the
+      // NIC uses the CQ doorbell record to decide whether a wrapped CQE slot
+      // has been reclaimed. Without this commit every QP eventually stops
+      // producing CQEs after enough successful submissions. One exclusive
+      // owner consumes this CQ, so exactly one CQE is committed here. Error
+      // CQEs are consumed as well before the engine enters fail-stop mode.
+      doca_gpu_dev_verbs_cq_update_dbrec<false>(completion_queue, 1);
       return status;
     }
     if (*reinterpret_cast<const volatile u32*>(stop) != 0 ||

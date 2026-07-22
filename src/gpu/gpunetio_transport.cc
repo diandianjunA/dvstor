@@ -265,8 +265,10 @@ struct GpuNetioPersistentTransport::Impl {
       check_doca("doca_verbs_cq_attr_set_entry_size",
                  doca_verbs_cq_attr_set_entry_size(cq_attr, DOCA_VERBS_CQ_ENTRY_SIZE_64));
       check_doca("doca_verbs_cq_attr_set_cq_size", doca_verbs_cq_attr_set_cq_size(cq_attr, kQueryQueueEntries));
+      // Protect the CQ ring from overwriting unconsumed entries. Device
+      // polling commits every consumed CQE to the CQ doorbell record.
       check_doca("doca_verbs_cq_attr_set_cq_overrun",
-                 doca_verbs_cq_attr_set_cq_overrun(cq_attr, 1));
+                 doca_verbs_cq_attr_set_cq_overrun(cq_attr, 0));
       check_doca("doca_gpu_mem_alloc(send_cq_umem)",
                  doca_gpu_mem_alloc(
                    gpu, kExternalQueueBytes, kGpuPageSize, DOCA_GPU_MEM_TYPE_GPU, &send_cq_umem_buf, nullptr));

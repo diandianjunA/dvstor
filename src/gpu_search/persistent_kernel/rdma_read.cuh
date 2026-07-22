@@ -329,8 +329,6 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
   __shared__ u64 call_started_cycles;
   const size_t request_base =
     static_cast<size_t>(descriptor.query_slot) * kPersistentMaxMergeCandidates;
-  const size_t cache_base = static_cast<size_t>(descriptor.query_slot) *
-    kPersistentDynamicCodeCacheCapacity;
   u32* request_shards = params.dynamic_code_request_shards + request_base;
   u64* request_offsets = params.dynamic_code_request_offsets + request_base;
   u64* request_local_iova_offsets =
@@ -370,23 +368,32 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     if (params.dynamic_code_records == nullptr || shard >= params.num_shards) continue;
     atomicAdd(&call_dynamic_candidates, 1u);
     // A dynamic code is written before the incarnation's publishing header
-    // and never changes during that incarnation.  Cache by the complete
-    // tagged handle, not by the reusable byte offset, so slot reuse is an
-    // unconditional miss. Cache lifetime is one query and its handles are
-    // cleared before the slot is reused.
+    // and never changes during that incarnation. Cache by the complete tagged
+    // handle, not by the reusable byte offset, so slot reuse is an
+    // unconditional miss even though the cache is shared across queries.
     if (params.dynamic_code_cache_handles != nullptr &&
         params.dynamic_code_cache_records != nullptr) {
       const u32 cache_slot = static_cast<u32>(
         (handle ^ (handle >> 32) ^ (handle >> 17)) &
         (kPersistentDynamicCodeCacheCapacity - 1));
-      if (params.dynamic_code_cache_handles[cache_base + cache_slot] == handle) {
+      const u64 cached_handle = load_cg(
+        params.dynamic_code_cache_handles + cache_slot);
+      if (cached_handle == handle) {
         const u8* cached = params.dynamic_code_cache_records +
-          (cache_base + cache_slot) * params.dynamic_code_record_bytes;
+          static_cast<size_t>(cache_slot) * params.dynamic_code_record_bytes;
         if (*reinterpret_cast<const u32*>(cached) ==
             remote_incarnation(handle)) {
-          distances[index] = approximate_entry(
+          const f32 cached_distance = approximate_entry(
             params, query_lut, cached + sizeof(u32));
-          continue;
+          // A colliding publisher first replaces the key with BUSY, then
+          // overwrites the payload. Accept only if the full incarnation key
+          // remained stable across the payload read.
+          __threadfence();
+          if (load_cg(params.dynamic_code_cache_handles + cache_slot) ==
+              handle) {
+            distances[index] = cached_distance;
+            continue;
+          }
         }
       }
     }
@@ -482,13 +489,25 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
       const u32 cache_slot = static_cast<u32>(
         (handle ^ (handle >> 32) ^ (handle >> 17)) &
         (kPersistentDynamicCodeCacheCapacity - 1));
+      auto* cache_key = reinterpret_cast<unsigned long long*>(
+        params.dynamic_code_cache_handles + cache_slot);
+      const u64 observed = load_cg(
+        params.dynamic_code_cache_handles + cache_slot);
+      if (observed == kPersistentDynamicCodeCacheBusy ||
+          atomicCAS(cache_key, observed,
+                    kPersistentDynamicCodeCacheBusy) != observed) {
+        continue;
+      }
+      // Make BUSY globally visible before any byte of the old payload is
+      // replaced. Readers validate the key again after scoring.
+      __threadfence();
       u8* destination = params.dynamic_code_cache_records +
-        (cache_base + cache_slot) * params.dynamic_code_record_bytes;
+        static_cast<size_t>(cache_slot) * params.dynamic_code_record_bytes;
       for (u32 byte = 0; byte < params.dynamic_code_record_bytes; ++byte) {
         destination[byte] = source[byte];
       }
-      __threadfence_block();
-      params.dynamic_code_cache_handles[cache_base + cache_slot] = handle;
+      __threadfence();
+      atomicExch(cache_key, handle);
     }
   }
   __syncthreads();

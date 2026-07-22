@@ -16,6 +16,7 @@ using memory_node_peer_rpc_detail::make_fused_stage1_release_item;
 using memory_node_peer_rpc_detail::partition_stage1_control_response;
 using memory_node_peer_rpc_detail::partition_stage1_execute_response;
 using memory_node_peer_rpc_detail::stage1_peer_attempt_timeout;
+using memory_node_peer_rpc_detail::stage1_worker_has_eligible_task;
 using memory_node_peer_rpc_detail::write_stage1_retry_response;
 using memory_node_peer_rpc_detail::stage1_execute_success_has_expected_fence;
 using memory_node_peer_rpc_detail::stage1_execute_tokens_unique;
@@ -78,6 +79,18 @@ void test_stage2_home_queue_cannot_starve_behind_stage1() {
     assert(!dequeue_stage2_home_first(true, false, stage1_streak));
   }
   assert(dequeue_stage2_home_first(true, true, stage1_streak));
+}
+
+void test_dedicated_stage2_queue_never_wakes_stage1_worker() {
+  assert(!stage1_worker_has_eligible_task(true, false, false));
+  assert(!stage1_worker_has_eligible_task(true, false, true));
+  assert(stage1_worker_has_eligible_task(true, true, false));
+  assert(stage1_worker_has_eligible_task(true, true, true));
+
+  assert(!stage1_worker_has_eligible_task(false, false, false));
+  assert(stage1_worker_has_eligible_task(false, false, true));
+  assert(stage1_worker_has_eligible_task(false, true, false));
+  assert(stage1_worker_has_eligible_task(false, true, true));
 }
 
 void test_atomic_home_arm_response() {
@@ -571,6 +584,7 @@ void test_execute_mixed_progress_compacts_only_retry_tokens() {
 
 int main() {
   test_stage2_home_queue_cannot_starve_behind_stage1();
+  test_dedicated_stage2_queue_never_wakes_stage1_worker();
   test_atomic_home_arm_response();
   test_release_is_an_idempotent_ordered_watermark();
   test_structural_corruption_never_becomes_retry();

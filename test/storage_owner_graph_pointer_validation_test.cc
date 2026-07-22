@@ -177,6 +177,30 @@ int main() {
            odd_snapshot_stride);
   }
 
+  // Production regression from the five-shard SIFT100M run. This handle was
+  // incorrectly reported as malformed after scheduler failure even though it
+  // names a properly aligned immutable shard-0 record and its compact graph
+  // entry is fully inside the 24-GiB MR.
+  constexpr u64 kProductionShardBytes = 24ull << 30;
+  constexpr u64 kReportedRaw = 0x8088b29ull;
+  VamanaNode::init_static_storage(128, 96, VectorDType::uint8);
+  VamanaNode::configure_hot_graph(
+    {3194389888ull, 3296159808ull, 3106645568ull,
+     3296159808ull, 3106645568ull},
+    {19964936ull, 20600998ull, 19416534ull, 20600998ull, 19416534ull},
+    832, 3,
+    {20444099040ull, 21095426384ull, 19882535296ull,
+     21095426384ull, 19882535296ull},
+    1040, 160, 992, 32);
+  const RemotePtr reported{kReportedRaw};
+  assert(reported.memory_node() == 0);
+  assert(reported.byte_offset() == 2156442256ull);
+  assert(reported.incarnation() == 0);
+  assert(VamanaNode::immutable_base_record(reported));
+  assert(VamanaNode::hot_graph_entry_offset(reported) == 14407889536ull);
+  assert(memory_node_storage_owner_index_detail::storage_pointer_addressable(
+    reported, 5, kProductionShardBytes));
+
   VamanaNode::disable_hot_graph();
   return 0;
 }

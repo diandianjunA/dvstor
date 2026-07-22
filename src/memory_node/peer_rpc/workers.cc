@@ -568,13 +568,14 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
       std::unique_lock<std::mutex> lock(peer_stage1_tasks_mutex_);
       peer_stage1_tasks_cv_.wait(lock, [&]() {
         return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
-               !peer_stage1_tasks_.empty() ||
-               (!peer_stage2_home_dedicated_ &&
-                !peer_stage2_home_tasks_.empty());
+          memory_node_peer_rpc_detail::stage1_worker_has_eligible_task(
+            peer_stage2_home_dedicated_, !peer_stage1_tasks_.empty(),
+            !peer_stage2_home_tasks_.empty());
       });
       if (peer_reverse_shutdown_.load(std::memory_order_acquire) &&
-          peer_stage1_tasks_.empty() &&
-          (peer_stage2_home_dedicated_ || peer_stage2_home_tasks_.empty())) {
+          !memory_node_peer_rpc_detail::stage1_worker_has_eligible_task(
+            peer_stage2_home_dedicated_, !peer_stage1_tasks_.empty(),
+            !peer_stage2_home_tasks_.empty())) {
         current_storage_owner_thread_ = nullptr;
         return;
       }
@@ -587,7 +588,13 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
     PeerStage1Task task;
     {
       std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
-      if (peer_stage1_tasks_.empty() && peer_stage2_home_tasks_.empty()) {
+      // Dedicated Stage2-home workers own their queue. A Stage1 worker can be
+      // woken by the shared condition variable while only that foreign queue
+      // is non-empty; in that case it has no eligible task and must go back
+      // to sleep instead of asserting on an empty Stage1 queue.
+      if (!memory_node_peer_rpc_detail::stage1_worker_has_eligible_task(
+            peer_stage2_home_dedicated_, !peer_stage1_tasks_.empty(),
+            !peer_stage2_home_tasks_.empty())) {
         continue;
       }
       const bool take_stage2_home =

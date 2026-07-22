@@ -257,8 +257,6 @@ __device__ void process_query(const PersistentKernelParams& params,
   const u32 traversal_capacity = min(kPersistentMaxBeam, params.traversal_beam_width);
   u64* visited = params.visited_hash +
     static_cast<size_t>(query_slot) * params.visited_capacity;
-  u64* dynamic_code_cache_handles = params.dynamic_code_cache_handles +
-    static_cast<size_t>(query_slot) * kPersistentDynamicCodeCacheCapacity;
   for (u32 index = threadIdx.x; index < traversal_capacity; index += blockDim.x) {
     beam_handles[index] = kInvalidDeviceHandle;
     beam_ids[index] = UINT32_MAX;
@@ -267,10 +265,6 @@ __device__ void process_query(const PersistentKernelParams& params,
   }
   for (u32 index = threadIdx.x; index < params.visited_capacity; index += blockDim.x) {
     visited[index] = kInvalidDeviceHandle;
-  }
-  for (u32 index = threadIdx.x;
-       index < kPersistentDynamicCodeCacheCapacity; index += blockDim.x) {
-    dynamic_code_cache_handles[index] = kInvalidDeviceHandle;
   }
   __syncthreads();
 

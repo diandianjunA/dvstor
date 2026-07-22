@@ -977,12 +977,22 @@ bool MemoryNode::read_local_neighbor_list(RemotePtr rptr,
                                           vec<RemotePtr>& neighbors,
                                           vec<byte_t>& entry,
                                           vec<byte_t>& decoded) const {
-  lib_assert(local_shard(rptr.memory_node()),
-             "local neighbor lookup received a remote pointer");
+  if (!local_shard(rptr.memory_node()) ||
+      !storage_node_pointer_addressable(rptr)) {
+    if (!rptr.is_null()) {
+      report_rejected_graph_pointer("read_local_neighbor_list", rptr);
+    }
+    neighbors.clear();
+    return false;
+  }
   const u64 hot_offset = VamanaNode::hot_graph_entry_offset(rptr);
   const size_t entry_size = VamanaNode::hot_graph_entry_size();
-  lib_assert(hot_offset + entry_size <= mn_memory_bytes_,
-             "local neighbor lookup exceeds shard bounds");
+  if (hot_offset > mn_memory_bytes_ ||
+      entry_size > mn_memory_bytes_ - hot_offset) {
+    report_rejected_graph_pointer("read_local_neighbor_list.hot", rptr);
+    neighbors.clear();
+    return false;
+  }
 
   entry.resize(entry_size);
   decoded.resize(VamanaNode::neighbor_read_size());

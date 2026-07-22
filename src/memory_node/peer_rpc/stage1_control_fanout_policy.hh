@@ -17,6 +17,17 @@ namespace memory_node_peer_rpc_detail {
 // stage's acknowledgement boundary.
 constexpr u32 kStage1MaximumDequeueBurst = 4;
 
+// Stage1 workers may share a condition variable with an isolated Stage2-home
+// pool. A notification is not proof that this worker owns runnable work: when
+// Stage2-home is dedicated, only the Stage1 queue is eligible here.
+inline bool stage1_worker_has_eligible_task(
+    bool stage2_home_dedicated,
+    bool stage1_available,
+    bool stage2_home_available) noexcept {
+  return stage1_available ||
+    (!stage2_home_dedicated && stage2_home_available);
+}
+
 inline bool dequeue_stage2_home_first(
     bool stage1_available,
     bool stage2_home_available,
