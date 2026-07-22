@@ -201,6 +201,7 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   peer_stage1_admission_waiter_items_hint_.store(
     0, std::memory_order_relaxed);
   peer_stage1_active_workers_.store(0, std::memory_order_relaxed);
+  peer_stage2_home_active_workers_.store(0, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
     peer_stage1_tasks_.clear();
@@ -232,9 +233,19 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
     rpc_parallelism, config.storage_owner_maintenance_workers,
     num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
   const u32 reverse_worker_count = cpu_plan.peer_reverse_workers;
-  const u32 stage1_rpc_worker_count = cpu_plan.peer_stage1_workers;
+  // Stage2 home scoring is substantially more numerous than Stage1 publish
+  // work. Sharing every worker allowed a growing maintenance backlog to
+  // inject head-of-line delay into foreground mutation ACKs. Split the same
+  // fixed physical-home CPU budget into independent scheduling domains.
+  const u32 physical_home_worker_count = cpu_plan.peer_stage1_workers;
+  const auto physical_home_split =
+    memory_node_detail::split_physical_home_workers(
+      physical_home_worker_count);
+  const u32 stage2_home_worker_count = physical_home_split.stage2_home;
+  const u32 stage1_rpc_worker_count = physical_home_split.stage1;
+  peer_stage2_home_dedicated_ = stage2_home_worker_count != 0;
   peer_graph_response_buffer_limit_ = std::max<size_t>(
-    1, static_cast<size_t>(stage1_rpc_worker_count) * 2);
+    1, static_cast<size_t>(physical_home_worker_count) * 2);
   {
     std::lock_guard<std::mutex> lock(peer_graph_response_buffers_mutex_);
     peer_graph_response_buffers_.clear();
@@ -242,7 +253,7 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   const u32 cleanup_worker_count = cpu_plan.peer_cleanup_workers;
   const size_t stage1_total_worker_count =
     static_cast<size_t>(cpu_plan.foreground_coordinators) +
-    static_cast<size_t>(stage1_rpc_worker_count);
+    static_cast<size_t>(physical_home_worker_count);
   lib_assert(stage1_total_worker_count <=
                std::numeric_limits<size_t>::max() /
                  std::max<size_t>(1, config.storage_owner_batch_max) / 4,
@@ -306,6 +317,13 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
       reverse_worker_count + i, 1, config.max_send_queue_wr);
     peer_stage1_worker_states_.push_back(std::move(stage1_worker));
   }
+  peer_stage2_home_worker_states_.reserve(stage2_home_worker_count);
+  for (u32 i = 0; i < stage2_home_worker_count; ++i) {
+    auto home_worker = std::make_unique<StorageOwnerThread>(
+      reverse_worker_count + stage1_rpc_worker_count + i, 1,
+      config.max_send_queue_wr);
+    peer_stage2_home_worker_states_.push_back(std::move(home_worker));
+  }
 
   peer_rpc_progress_thread_ = std::thread([this]() { peer_rpc_progress_loop(); });
   peer_reverse_response_thread_ = std::thread([this]() { peer_reverse_response_loop(); });
@@ -343,11 +361,22 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
                  core_assignment_.get_available_core());
     }
   }
+  for (u32 i = 0; i < stage2_home_worker_count; ++i) {
+    peer_stage2_home_workers_.emplace_back([this, i]() {
+      peer_stage2_home_worker_loop(i);
+    });
+    if (!config.disable_thread_pinning) {
+      pin_thread(peer_stage2_home_workers_.back(),
+                 core_assignment_.get_available_core());
+    }
+  }
   print_status("storage-owner peer reverse-update workers: " +
                std::to_string(reverse_worker_count));
   print_status("storage-owner peer Stage1 workers: " +
                std::to_string(stage1_rpc_worker_count) +
-               " (dedicated physical-home CPU partition)");
+               "; Stage2-home workers: " +
+               std::to_string(stage2_home_worker_count) +
+               " (isolated fixed physical-home CPU partition)");
   print_status("storage-owner physical control workers: cleanup=" +
                std::to_string(cleanup_worker_count) + " placement=" +
                std::to_string(cpu_plan.peer_placement_workers) +
@@ -410,6 +439,11 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
       worker.join();
     }
   }
+  for (auto& worker : peer_stage2_home_workers_) {
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
   {
     std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
     lib_assert(peer_stage1_admission_wake_coverage_ == 0,
@@ -464,9 +498,12 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
   }
   peer_reverse_workers_.clear();
   peer_stage1_workers_.clear();
+  peer_stage2_home_workers_.clear();
   peer_cleanup_control_workers_.clear();
   peer_reverse_worker_states_.clear();
   peer_stage1_worker_states_.clear();
+  peer_stage2_home_worker_states_.clear();
+  peer_stage2_home_dedicated_ = false;
   {
     std::lock_guard<std::mutex> lock(peer_graph_response_buffers_mutex_);
     peer_graph_response_buffers_.clear();

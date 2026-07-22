@@ -353,11 +353,18 @@ void MemoryNode::peer_rpc_progress_loop() {
         }
       } else if (header->type == static_cast<u32>(
                    service::storage_owner::PeerRpcType::stage2_expand_score_response)) {
+        const size_t minimum_bytes =
+          service::storage_owner::stage2_expand_score_response_bytes(
+            header->item_count, 0);
+        const size_t maximum_bytes =
+          service::storage_owner::stage2_expand_score_response_bytes(
+            header->item_count);
         const bool valid_response = header->item_count != 0 &&
           header->item_count <= config.storage_owner_batch_max &&
           header->reserved == 0 &&
-          bytes == service::storage_owner::stage2_expand_score_response_bytes(
-            header->item_count);
+          bytes >= minimum_bytes && bytes <= maximum_bytes &&
+          (bytes - minimum_bytes) %
+              sizeof(service::storage_owner::Stage2ExpandScoreNeighbor) == 0;
         if (valid_response && peer_async_responses_ != nullptr &&
             peer_async_responses_->try_deliver(
               peer_id, slot_id, bytes, *header)) {
@@ -562,10 +569,12 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
       peer_stage1_tasks_cv_.wait(lock, [&]() {
         return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
                !peer_stage1_tasks_.empty() ||
-               !peer_stage2_home_tasks_.empty();
+               (!peer_stage2_home_dedicated_ &&
+                !peer_stage2_home_tasks_.empty());
       });
       if (peer_reverse_shutdown_.load(std::memory_order_acquire) &&
-          peer_stage1_tasks_.empty() && peer_stage2_home_tasks_.empty()) {
+          peer_stage1_tasks_.empty() &&
+          (peer_stage2_home_dedicated_ || peer_stage2_home_tasks_.empty())) {
         current_storage_owner_thread_ = nullptr;
         return;
       }
@@ -582,6 +591,7 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
         continue;
       }
       const bool take_stage2_home =
+        !peer_stage2_home_dedicated_ &&
         memory_node_peer_rpc_detail::dequeue_stage2_home_first(
           !peer_stage1_tasks_.empty(), !peer_stage2_home_tasks_.empty(),
           stage1_dequeue_streak);
@@ -597,7 +607,7 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
         peer_stage2_home_tasks_.pop_front();
       }
     }
-    peer_stage1_tasks_cv_.notify_one();
+    peer_stage1_tasks_cv_.notify_all();
 
     const auto request_type = static_cast<
       service::storage_owner::PeerRpcType>(task.header.type);
@@ -621,7 +631,7 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
         static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - execution_started).count()),
         std::memory_order_relaxed);
-      peer_stage1_tasks_cv_.notify_one();
+      peer_stage1_tasks_cv_.notify_all();
       continue;
     }
     bool release_barrier = false;
@@ -822,7 +832,60 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
       // still-visible credit to the next FIFO waiter.
       wake_peer_stage1_admission_waiters();
     }
-    peer_stage1_tasks_cv_.notify_one();
+    peer_stage1_tasks_cv_.notify_all();
+  }
+}
+
+void MemoryNode::peer_stage2_home_worker_loop(u32 worker_id) {
+  current_storage_owner_thread_ =
+    peer_stage2_home_worker_states_[worker_id].get();
+  const Configuration& config = *storage_worker_config_;
+  for (;;) {
+    PeerStage1Task task;
+    {
+      std::unique_lock<std::mutex> lock(peer_stage1_tasks_mutex_);
+      peer_stage1_tasks_cv_.wait(lock, [&]() {
+        return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
+               !peer_stage2_home_tasks_.empty();
+      });
+      if (peer_reverse_shutdown_.load(std::memory_order_acquire) &&
+          peer_stage2_home_tasks_.empty()) {
+        current_storage_owner_thread_ = nullptr;
+        return;
+      }
+      if (peer_stage2_home_tasks_.empty()) continue;
+      task = std::move(peer_stage2_home_tasks_.front());
+      peer_stage2_home_tasks_.pop_front();
+    }
+    peer_stage1_tasks_cv_.notify_all();
+
+    peer_stage2_home_active_workers_.fetch_add(
+      1, std::memory_order_acq_rel);
+    atomic_utils::CounterDecrementGuard active_slot(
+      peer_stage2_home_active_workers_);
+    lib_assert(static_cast<service::storage_owner::PeerRpcType>(
+                 task.header.type) ==
+                 service::storage_owner::PeerRpcType::
+                   stage2_expand_score_request,
+               "Stage2-home worker received a Stage1 publication task");
+    const auto execution_started = std::chrono::steady_clock::now();
+    peer_stage2_home_queue_wait_ns_.fetch_add(
+      static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        execution_started - task.received_at).count()),
+      std::memory_order_relaxed);
+    (void)handle_peer_stage2_expand_score_request(
+      task.source_shard, task.header, task.payload.data(), config);
+    // This request is read-only and generation/incarnation fenced by its
+    // owner. Same-ID replay may safely recompute, so no large payload is kept
+    // in the generic dedup table.
+    lib_assert(peer_request_deduplicator_->abandon(
+                 task.dedup_lease, task.source_shard, task.header),
+               "Stage2 home completion lost its dedup lease");
+    peer_stage2_home_processed_.fetch_add(1, std::memory_order_relaxed);
+    peer_stage2_home_execution_ns_.fetch_add(
+      static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - execution_started).count()),
+      std::memory_order_relaxed);
   }
 }
 

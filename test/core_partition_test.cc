@@ -16,6 +16,19 @@ int main() {
       plan.foreground_progress_threads;
   };
 
+  for (std::uint32_t total = 0; total <= 128; ++total) {
+    const auto split =
+      memory_node_detail::split_physical_home_workers(total);
+    assert(split.stage1 + split.stage2_home == total);
+    if (total == 0) assert(split.stage1 == 0 && split.stage2_home == 0);
+    if (total == 1) assert(split.stage1 == 1 && split.stage2_home == 0);
+    if (total >= 2) {
+      assert(split.stage1 >= 1);
+      assert(split.stage2_home >= 1);
+    }
+    if (total >= 4) assert(split.stage2_home == total / 4);
+  }
+
   // Strict order for four physical cores followed by their four SMT siblings.
   const std::vector<std::uint32_t> ordered{4, 5, 0, 1, 12, 13, 8, 9};
   std::set<std::uint32_t> union_cpus;

@@ -239,7 +239,8 @@ bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
       peer_stage1_tasks_.size() +
           peer_stage2_home_tasks_.size() +
           peer_stage1_admission_waiters_.size() +
-          peer_stage1_active_workers_.load(std::memory_order_acquire) >=
+          peer_stage1_active_workers_.load(std::memory_order_acquire) +
+          peer_stage2_home_active_workers_.load(std::memory_order_acquire) >=
         peer_stage1_task_queue_limit_ ||
       (stage2_home &&
        peer_stage2_home_tasks_.size() >= stage2_home_limit) ||
@@ -294,7 +295,10 @@ bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
       peer_stage1_max_queue_,
       static_cast<u64>(peer_stage1_tasks_.size()));
   }
-  peer_stage1_tasks_cv_.notify_one();
+  // Dedicated Stage1 and Stage2-home waiters share this condition variable.
+  // notify_one can wake the wrong class whose predicate remains false and
+  // strand the newly non-empty queue until unrelated traffic arrives.
+  peer_stage1_tasks_cv_.notify_all();
   return true;
 }
 

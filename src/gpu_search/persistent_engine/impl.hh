@@ -209,6 +209,8 @@ struct PersistentSearchEngine::Impl {
   f32* d_navigation_candidate_distances{};
   u64* d_visited{};
   byte_t* d_dynamic_code_records{};
+  u64* d_dynamic_code_cache_handles{};
+  byte_t* d_dynamic_code_cache_records{};
   u32* d_dynamic_code_request_shards{};
   u64* d_dynamic_code_request_offsets{};
   u64* d_dynamic_code_request_local_iovas{};

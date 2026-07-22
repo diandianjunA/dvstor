@@ -30,11 +30,16 @@ int main() {
     4 * VamanaNode::vector_bytes();
   assert(stage2_expand_score_request_bytes(4) ==
          stage2_request_expected);
-  const size_t stage2_response_expected = sizeof(PeerRpcHeader) +
+  const size_t stage2_response_max_expected = sizeof(PeerRpcHeader) +
     4 * sizeof(Stage2ExpandScoreResult) +
     4 * VamanaNode::graph_entry_capacity() *
       sizeof(Stage2ExpandScoreNeighbor);
   assert(stage2_expand_score_response_bytes(4) ==
-         stage2_response_expected);
+         stage2_response_max_expected);
+  const size_t stage2_response_compact_expected = sizeof(PeerRpcHeader) +
+    4 * sizeof(Stage2ExpandScoreResult) +
+    17 * sizeof(Stage2ExpandScoreNeighbor);
+  assert(stage2_expand_score_response_bytes(4, 17) ==
+         stage2_response_compact_expected);
   return 0;
 }

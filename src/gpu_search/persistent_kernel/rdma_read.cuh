@@ -324,10 +324,13 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
   __shared__ i32 shard_status[kPersistentMaxShards];
   __shared__ u32 failed;
   __shared__ u32 call_dynamic_candidates;
+  __shared__ u32 call_dynamic_reads;
   __shared__ u32 call_incarnation_rejects;
   __shared__ u64 call_started_cycles;
   const size_t request_base =
     static_cast<size_t>(descriptor.query_slot) * kPersistentMaxMergeCandidates;
+  const size_t cache_base = static_cast<size_t>(descriptor.query_slot) *
+    kPersistentDynamicCodeCacheCapacity;
   u32* request_shards = params.dynamic_code_request_shards + request_base;
   u64* request_offsets = params.dynamic_code_request_offsets + request_base;
   u64* request_local_iova_offsets =
@@ -335,6 +338,7 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
   if (threadIdx.x == 0) {
     failed = 0;
     call_dynamic_candidates = 0;
+    call_dynamic_reads = 0;
     call_incarnation_rejects = 0;
     call_started_cycles = clock64();
   }
@@ -365,6 +369,45 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     // and discovered neighbors therefore use the same one-sided RDMA path.
     if (params.dynamic_code_records == nullptr || shard >= params.num_shards) continue;
     atomicAdd(&call_dynamic_candidates, 1u);
+    // A dynamic code is written before the incarnation's publishing header
+    // and never changes during that incarnation.  Cache by the complete
+    // tagged handle, not by the reusable byte offset, so slot reuse is an
+    // unconditional miss. Cache lifetime is one query and its handles are
+    // cleared before the slot is reused.
+    if (params.dynamic_code_cache_handles != nullptr &&
+        params.dynamic_code_cache_records != nullptr) {
+      const u32 cache_slot = static_cast<u32>(
+        (handle ^ (handle >> 32) ^ (handle >> 17)) &
+        (kPersistentDynamicCodeCacheCapacity - 1));
+      if (params.dynamic_code_cache_handles[cache_base + cache_slot] == handle) {
+        const u8* cached = params.dynamic_code_cache_records +
+          (cache_base + cache_slot) * params.dynamic_code_record_bytes;
+        if (*reinterpret_cast<const u32*>(cached) ==
+            remote_incarnation(handle)) {
+          distances[index] = approximate_entry(
+            params, query_lut, cached + sizeof(u32));
+          continue;
+        }
+      }
+    }
+    // The merge frontier can contain the same tagged handle through multiple
+    // graph parents.  Deduplicate only inside this finite scoring call: one
+    // stable incarnation-checked record is scattered to all identical
+    // consumers below.  No value survives the call, so slot reuse needs no
+    // cache invalidation protocol and ABA behavior is unchanged.
+    u32 duplicate_of = UINT32_MAX;
+    for (u32 prior = 0; prior < index; ++prior) {
+      if (handles[prior] == handle) {
+        duplicate_of = prior;
+        break;
+      }
+    }
+    if (duplicate_of != UINT32_MAX) {
+      request_shards[index] = UINT32_MAX - 1u;
+      request_offsets[index] = duplicate_of;
+      continue;
+    }
+    atomicAdd(&call_dynamic_reads, 1u);
     const u64 node_offset = remote_byte_offset(raw);
     request_shards[index] = shard;
     request_offsets[index] = node_offset + params.shards[shard].dynamic_code_offset;
@@ -401,7 +444,7 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
 
   for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
     const u32 shard = request_shards[index];
-    if (shard == UINT32_MAX) continue;
+    if (shard >= params.num_shards) continue;
     if (shard_status[shard] != 0) {
       atomicExch(&failed, 1u);
       continue;
@@ -417,6 +460,44 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     }
   }
   __syncthreads();
+  // Serialize the tiny direct-mapped cache publication. Different fetched
+  // handles can hash to the same slot; a single publisher avoids torn records
+  // while making collision behavior deterministic. This loop is bounded by
+  // kPersistentMaxMergeCandidates and runs after scoring, off the RDMA path.
+  if (threadIdx.x == 0 && params.dynamic_code_cache_handles != nullptr &&
+      params.dynamic_code_cache_records != nullptr) {
+    for (u32 index = 0; index < count; ++index) {
+      const u32 shard = request_shards[index];
+      if (shard >= params.num_shards || shard_status[shard] != 0 ||
+          distances[index] == FLT_MAX) {
+        continue;
+      }
+      const u64 handle = handles[index];
+      const u8* source = params.dynamic_code_records +
+        (request_base + index) * params.dynamic_code_record_bytes;
+      if (*reinterpret_cast<const u32*>(source) !=
+          remote_incarnation(handle)) {
+        continue;
+      }
+      const u32 cache_slot = static_cast<u32>(
+        (handle ^ (handle >> 32) ^ (handle >> 17)) &
+        (kPersistentDynamicCodeCacheCapacity - 1));
+      u8* destination = params.dynamic_code_cache_records +
+        (cache_base + cache_slot) * params.dynamic_code_record_bytes;
+      for (u32 byte = 0; byte < params.dynamic_code_record_bytes; ++byte) {
+        destination[byte] = source[byte];
+      }
+      __threadfence_block();
+      params.dynamic_code_cache_handles[cache_base + cache_slot] = handle;
+    }
+  }
+  __syncthreads();
+  for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
+    if (request_shards[index] != UINT32_MAX - 1u) continue;
+    const u64 source_index = request_offsets[index];
+    if (source_index < index) distances[index] = distances[source_index];
+  }
+  __syncthreads();
   if (threadIdx.x == 0) {
     if (total_dynamic_cycles != nullptr) {
       *total_dynamic_cycles += clock64() - call_started_cycles;
@@ -425,7 +506,7 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
       *total_dynamic_candidates += call_dynamic_candidates;
     }
     if (total_dynamic_reads != nullptr) {
-      *total_dynamic_reads += call_dynamic_candidates;
+      *total_dynamic_reads += call_dynamic_reads;
     }
     if (total_incarnation_rejects != nullptr) {
       *total_incarnation_rejects += call_incarnation_rejects;

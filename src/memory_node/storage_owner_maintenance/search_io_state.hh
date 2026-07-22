@@ -25,6 +25,7 @@ enum class Stage2SearchIoPhase : std::uint8_t {
   score_header_pending,
   graph_ready,
   graph_pending,
+  score_home_pending,
   graph_home_pending,
 };
 
@@ -152,6 +153,8 @@ struct Stage2SearchIoState {
   vec<std::size_t> score_group_offsets;
   vec<RemotePtr> score_unique;
   vec<Stage2PendingVectorRead> pending_vectors;
+  vec<Stage2HomeExpandRpc> score_home_rpcs;
+  std::size_t score_home_rpc_count{};
 
   vec<Stage2GraphConsumer> graph_consumers;
   hashset_t<RemotePtr> graph_selected_remote;
@@ -180,6 +183,12 @@ struct Stage2SearchIoState {
     score_group_offsets.clear();
     score_unique.clear();
     pending_vectors.clear();
+    score_home_rpc_count = 0;
+    for (auto& rpc : score_home_rpcs) {
+      rpc.posted = false;
+      rpc.complete = false;
+      rpc.request.clear();
+    }
     graph_consumers.clear();
     graph_selected_remote.clear();
     graph_order.clear();
@@ -221,6 +230,7 @@ struct Stage2SearchIoState {
     trim(score_group_offsets);
     trim(score_unique);
     trim(pending_vectors);
+    trim(score_home_rpcs);
     trim(graph_consumers);
     trim(graph_order);
     trim(graph_group_offsets);
@@ -246,7 +256,8 @@ struct Stage2SearchIoState {
   // search budget or acknowledging a task before durable completion.
   [[nodiscard]] bool scratch_rebindable() const {
     return idle() ||
-      (phase == Stage2SearchIoPhase::graph_home_pending &&
+      ((phase == Stage2SearchIoPhase::graph_home_pending ||
+        phase == Stage2SearchIoPhase::score_home_pending) &&
        pending_vectors.empty() && pending_graph.empty());
   }
 };

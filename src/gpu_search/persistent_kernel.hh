@@ -218,12 +218,21 @@ struct PersistentKernelParams {
   u64* visited_hash{};
   u8* exact_records{};
   u8* dynamic_code_records{};
+  // Per-query, incarnation-tagged navigation-code cache. Dynamic PQ payloads
+  // are immutable after a node incarnation is published; the complete remote
+  // handle therefore provides the cache's ABA fence.
+  u64* dynamic_code_cache_handles{};
+  u8* dynamic_code_cache_records{};
   u32* dynamic_code_request_shards{};
   u64* dynamic_code_request_offsets{};
   u64* dynamic_code_request_local_iovas{};
   u32* result_ids{};
   f32* result_distances{};
 };
+
+inline constexpr u32 kPersistentDynamicCodeCacheCapacity = 256;
+static_assert((kPersistentDynamicCodeCacheCapacity &
+               (kPersistentDynamicCodeCacheCapacity - 1)) == 0);
 
 struct PersistentKernelOccupancy {
   u32 active_blocks_per_sm{};

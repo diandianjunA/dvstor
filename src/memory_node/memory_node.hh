@@ -584,6 +584,7 @@ private:
   void peer_rpc_progress_loop();
   void peer_reverse_update_worker_loop(u32 worker_id);
   void peer_stage1_worker_loop(u32 worker_id);
+  void peer_stage2_home_worker_loop(u32 worker_id);
   void peer_cleanup_control_worker_loop();
   void peer_placement_control_worker_loop();
   void peer_reverse_response_loop();
@@ -1065,11 +1066,13 @@ private:
   std::thread peer_rpc_progress_thread_;
   vec<std::thread> peer_reverse_workers_;
   vec<std::thread> peer_stage1_workers_;
+  vec<std::thread> peer_stage2_home_workers_;
   std::thread peer_reverse_response_thread_;
   vec<std::thread> peer_cleanup_control_workers_;
   std::thread peer_placement_control_thread_;
   vec<u_ptr<StorageOwnerThread>> peer_reverse_worker_states_;
   vec<u_ptr<StorageOwnerThread>> peer_stage1_worker_states_;
+  vec<u_ptr<StorageOwnerThread>> peer_stage2_home_worker_states_;
   std::mutex peer_reverse_tasks_mutex_;
   std::condition_variable peer_reverse_tasks_cv_;
   std::deque<PeerReverseUpdateTask> peer_reverse_tasks_;
@@ -1159,6 +1162,8 @@ private:
   std::atomic<u64> peer_stage1_duplicate_coalesced_{0};
   std::atomic<u64> peer_stage1_max_admission_waiters_{0};
   std::atomic<u32> peer_stage1_active_workers_{0};
+  std::atomic<u32> peer_stage2_home_active_workers_{0};
+  bool peer_stage2_home_dedicated_{};
   std::array<Stage1PreparedResultShard,
              kStage1PreparedShardCount> stage1_prepared_results_;
   std::array<Stage1InflightRequestShard,
@@ -1222,6 +1227,8 @@ private:
   std::atomic<u64> storage_owner_stage2_vector_unique_reads_{0};
   std::atomic<u64> storage_owner_stage2_home_rpc_batches_{0};
   std::atomic<u64> storage_owner_stage2_home_rpc_items_{0};
+  std::atomic<u64> storage_owner_stage2_home_score_rpc_batches_{0};
+  std::atomic<u64> storage_owner_stage2_home_score_rpc_items_{0};
   std::atomic<u64> storage_owner_stage2_home_scored_neighbors_{0};
   std::atomic<u64> storage_owner_stage2_migrations_{0};
   std::atomic<u64> storage_owner_stage2_final_edges_{0};

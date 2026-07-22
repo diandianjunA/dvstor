@@ -264,6 +264,14 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         cancel_peer_rpc_response(rpc.request_id);
       }
     }
+    for (size_t rpc_index = 0;
+         rpc_index < context.search_io.score_home_rpc_count; ++rpc_index) {
+      const Stage2HomeExpandRpc& rpc =
+        context.search_io.score_home_rpcs[rpc_index];
+      if (rpc.posted && !rpc.complete && rpc.request_id != 0) {
+        cancel_peer_rpc_response(rpc.request_id);
+      }
+    }
     context.search_io.reset();
     context.reconcile_batch.clear();
     context.active = false;

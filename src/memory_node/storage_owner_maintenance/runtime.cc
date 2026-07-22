@@ -83,6 +83,10 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   storage_owner_stage2_batched_items_.store(0, std::memory_order_relaxed);
   storage_owner_stage2_home_rpc_batches_.store(0, std::memory_order_relaxed);
   storage_owner_stage2_home_rpc_items_.store(0, std::memory_order_relaxed);
+  storage_owner_stage2_home_score_rpc_batches_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_home_score_rpc_items_.store(
+    0, std::memory_order_relaxed);
   storage_owner_stage2_home_scored_neighbors_.store(
     0, std::memory_order_relaxed);
   for (auto& timing : storage_owner_stage2_phase_timing_) {
@@ -521,6 +525,12 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
     storage_owner_stage2_home_rpc_batches_.load(std::memory_order_relaxed);
   const u64 stage2_home_rpc_items =
     storage_owner_stage2_home_rpc_items_.load(std::memory_order_relaxed);
+  const u64 stage2_home_score_rpc_batches =
+    storage_owner_stage2_home_score_rpc_batches_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_home_score_rpc_items =
+    storage_owner_stage2_home_score_rpc_items_.load(
+      std::memory_order_relaxed);
   const u64 stage2_home_scored_neighbors =
     storage_owner_stage2_home_scored_neighbors_.load(
       std::memory_order_relaxed);
@@ -747,6 +757,14 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                " avg_stage2_home_rpc_batch=" +
                std::to_string(ratio_or_zero(
                  stage2_home_rpc_items, stage2_home_rpc_batches)) +
+               " stage2_home_score_rpc_batches=" +
+               std::to_string(stage2_home_score_rpc_batches) +
+               " stage2_home_score_rpc_items=" +
+               std::to_string(stage2_home_score_rpc_items) +
+               " avg_stage2_home_score_rpc_batch=" +
+               std::to_string(ratio_or_zero(
+                 stage2_home_score_rpc_items,
+                 stage2_home_score_rpc_batches)) +
                " stage2_home_scored_neighbors=" +
                std::to_string(stage2_home_scored_neighbors) +
                " home_scores_per_expansion=" +

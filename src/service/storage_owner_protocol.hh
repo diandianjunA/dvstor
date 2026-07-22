@@ -12,7 +12,7 @@ constexpr u32 kInsertMagic = 0x53494e54;  // "SINT"
 constexpr u32 kMutationMagic = 0x4d555444;  // D T U M / "DUTM"
 constexpr u32 kMutationProtocolVersion = 3;
 constexpr u32 kPeerRpcMagic = 0x53505250;  // "SPRP"
-constexpr u32 kPeerRpcVersion = 13;
+constexpr u32 kPeerRpcVersion = 14;
 
 enum class InsertStatus : u32 {
   ok = 0,
@@ -75,11 +75,16 @@ enum class Stage2HomeDisposition : u32 {
   unscored = 3,
 };
 
+enum class Stage2HomeOperation : u32 {
+  expand_score = 0,
+  score_only = 1,
+};
+
 struct Stage2ExpandScoreItem {
   u64 pointer_raw{};
   u64 generation{};
   u32 search_index{};
-  u32 reserved{};
+  u32 operation{static_cast<u32>(Stage2HomeOperation::expand_score)};
 };
 
 struct Stage2ExpandScoreResult {
@@ -88,7 +93,12 @@ struct Stage2ExpandScoreResult {
   u32 search_index{};
   u32 neighbor_count{};
   u32 disposition{static_cast<u32>(Stage2HomeDisposition::retryable)};
-  u32 reserved{};
+  // Offset in the compact neighbor array that follows all result records.
+  // Version 13 used a fixed graph-capacity stride here, which made a batch of
+  // 32 responses consume more than 50 KiB even when nodes had few live edges.
+  u32 neighbor_offset{};
+  distance_t distance{};
+  u32 operation{static_cast<u32>(Stage2HomeOperation::expand_score)};
 };
 
 struct Stage2ExpandScoreNeighbor {
@@ -98,7 +108,7 @@ struct Stage2ExpandScoreNeighbor {
 };
 
 static_assert(sizeof(Stage2ExpandScoreItem) == 24);
-static_assert(sizeof(Stage2ExpandScoreResult) == 32);
+static_assert(sizeof(Stage2ExpandScoreResult) == 40);
 static_assert(sizeof(Stage2ExpandScoreNeighbor) == 16);
 
 struct InsertBatchRequestHeader {
@@ -973,15 +983,24 @@ inline size_t stage2_expand_score_request_bytes(u32 item_count) {
       item_count, VamanaNode::vector_bytes()));
 }
 
-inline size_t stage2_expand_score_response_bytes(u32 item_count) {
+inline size_t stage2_expand_score_response_bytes(
+    u32 item_count, u32 neighbor_count) {
   const size_t result_bytes = wire_saturating_multiply(
     item_count, sizeof(Stage2ExpandScoreResult));
-  const size_t neighbor_count = wire_saturating_multiply(
-    item_count, VamanaNode::graph_entry_capacity());
   return wire_saturating_add(
     wire_saturating_add(sizeof(PeerRpcHeader), result_bytes),
     wire_saturating_multiply(
       neighbor_count, sizeof(Stage2ExpandScoreNeighbor)));
+}
+
+inline size_t stage2_expand_score_response_bytes(u32 item_count) {
+  const size_t neighbor_count = wire_saturating_multiply(
+    item_count, VamanaNode::graph_entry_capacity());
+  if (neighbor_count > std::numeric_limits<u32>::max()) {
+    return std::numeric_limits<size_t>::max();
+  }
+  return stage2_expand_score_response_bytes(
+    item_count, static_cast<u32>(neighbor_count));
 }
 
 inline Stage2ExpandScoreItem* stage2_expand_score_items(void* payload) {

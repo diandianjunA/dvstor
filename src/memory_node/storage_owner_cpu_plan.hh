@@ -29,6 +29,26 @@ struct StorageOwnerCpuPlan {
   std::uint32_t foreground_progress_threads{};
 };
 
+struct PhysicalHomeWorkerSplit {
+  std::uint32_t stage1{};
+  std::uint32_t stage2_home{};
+};
+
+// Isolate latency-bearing Stage1 publication from the much more numerous
+// read-only Stage2 home operations without changing the CPU plan's total.
+// Very small deployments keep the legacy shared executor because taking its
+// only Stage1 lane would make foreground progress impossible.
+inline PhysicalHomeWorkerSplit split_physical_home_workers(
+    std::uint32_t total) {
+  const std::uint32_t stage2_home = total >= 4
+    ? std::max<std::uint32_t>(1, total / 4)
+    : (total >= 2 ? 1 : 0);
+  return PhysicalHomeWorkerSplit{
+    .stage1 = total - stage2_home,
+    .stage2_home = stage2_home,
+  };
+}
+
 // Derive one stable division of the CPUs assigned to this storage process.
 // Stage1 has one coordinator and exactly one physical-home executor per
 // insert.  Therefore its CPU split is independent of the number of remote

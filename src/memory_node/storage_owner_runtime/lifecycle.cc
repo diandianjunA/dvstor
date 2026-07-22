@@ -83,6 +83,7 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
                std::to_string(cpu_plan.maintenance_workers) +
                " peer_stage1=" +
                std::to_string(cpu_plan.peer_stage1_workers) +
+               " (split into isolated Stage1/Stage2-home domains)" +
                " peer_reverse=" +
                std::to_string(cpu_plan.peer_reverse_workers) +
                " peer_cleanup=" +

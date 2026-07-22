@@ -18,13 +18,13 @@ bool MemoryNode::handle_peer_stage2_expand_score_request(
     return false;
   }
 
-  const size_t response_bytes =
+  const size_t response_capacity =
     stage2_expand_score_response_bytes(header.item_count);
-  if (response_bytes > peer_rpc_runtime_.message_bytes) return false;
+  if (response_capacity > peer_rpc_runtime_.message_bytes) return false;
   // The asynchronous sender recycles bounded high-water buffers after copying
   // them into registered send slots. Stage2 emits many medium-sized responses;
   // avoiding a malloc/free pair for each graph wave is important at high QPS.
-  vec<byte_t> response = acquire_peer_graph_response_buffer(response_bytes);
+  vec<byte_t> response = acquire_peer_graph_response_buffer(response_capacity);
   auto* response_header = reinterpret_cast<PeerRpcHeader*>(response.data());
   response_header->magic = kPeerRpcMagic;
   response_header->version = kPeerRpcVersion;
@@ -34,6 +34,7 @@ bool MemoryNode::handle_peer_stage2_expand_score_request(
   response_header->item_count = header.item_count;
   response_header->request_id = header.request_id;
   response_header->status = static_cast<u32>(InsertStatus::ok);
+  response_header->reserved = 0;
 
   const auto* items = stage2_expand_score_items(payload);
   const byte_t* queries = stage2_expand_score_queries(
@@ -44,6 +45,7 @@ bool MemoryNode::handle_peer_stage2_expand_score_request(
   const size_t neighbor_stride = VamanaNode::graph_entry_capacity();
   const VectorDType dtype = VamanaNode::vector_dtype();
   GraphAdjacency adjacency;
+  u32 compact_neighbor_count = 0;
 
   // Home expansion needs only a stable vector, not an owning NodeSnapshot.
   // Score directly from the local registered node under the same header /
@@ -91,13 +93,31 @@ bool MemoryNode::handle_peer_stage2_expand_score_request(
   for (u32 item_index = 0; item_index < header.item_count; ++item_index) {
     const Stage2ExpandScoreItem& item = items[item_index];
     Stage2ExpandScoreResult& result = results[item_index];
+    result = {};
     result.pointer_raw = item.pointer_raw;
     result.generation = item.generation;
     result.search_index = item.search_index;
+    result.neighbor_offset = compact_neighbor_count;
+    result.operation = item.operation;
     const RemotePtr pointer{item.pointer_raw};
+    if (item.operation > static_cast<u32>(Stage2HomeOperation::score_only)) {
+      result.disposition = static_cast<u32>(
+        Stage2HomeDisposition::terminal);
+      continue;
+    }
     if (!valid_local_storage_node_pointer(pointer)) {
       result.disposition = static_cast<u32>(
         Stage2HomeDisposition::terminal);
+      continue;
+    }
+
+    const byte_t* query = queries +
+      static_cast<size_t>(item_index) * VamanaNode::vector_bytes();
+    if (item.operation == static_cast<u32>(Stage2HomeOperation::score_only)) {
+      Stage2ExpandScoreNeighbor score{};
+      score_local_neighbor(pointer, query, score);
+      result.distance = score.distance;
+      result.disposition = score.disposition;
       continue;
     }
 
@@ -124,14 +144,13 @@ bool MemoryNode::handle_peer_stage2_expand_score_request(
       neighbor_stride, adjacency.stable.size() +
         adjacency.provisional.size());
     result.neighbor_count = static_cast<u32>(total_neighbors);
-    const byte_t* query = queries +
-      static_cast<size_t>(item_index) * VamanaNode::vector_bytes();
     size_t output_index = 0;
     const auto emit_neighbor = [&](RemotePtr neighbor) {
       if (output_index >= total_neighbors) return;
       Stage2ExpandScoreNeighbor& output =
-        neighbors[static_cast<size_t>(item_index) * neighbor_stride +
+        neighbors[static_cast<size_t>(compact_neighbor_count) +
                   output_index++];
+      output = {};
       output.pointer_raw = neighbor.raw_address;
       if (!storage_node_pointer_addressable(neighbor)) {
         output.disposition = static_cast<u32>(
@@ -147,7 +166,11 @@ bool MemoryNode::handle_peer_stage2_expand_score_request(
     };
     for (RemotePtr neighbor : adjacency.stable) emit_neighbor(neighbor);
     for (RemotePtr neighbor : adjacency.provisional) emit_neighbor(neighbor);
+    compact_neighbor_count += result.neighbor_count;
   }
+
+  response.resize(stage2_expand_score_response_bytes(
+    header.item_count, compact_neighbor_count));
 
   PeerReverseUpdateResponse outbound;
   outbound.destination_shard = source_shard;
