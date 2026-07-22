@@ -147,18 +147,10 @@ private:
     vec<StorageOwnerRpcSlot> slots;
     vec<StorageOwnerResponseSlot> response_slots;
     vec<u32> free_slots;
-    // Set, rearmed after each actual dequeue, and cleared only by the
-    // CQ/progress thread. published_tasks is an exact total but may include
-    // cells behind an invisible MPMC head, so this is the current batching
-    // epoch's observation time rather than proof that the FIFO head is visible.
+    // Set and cleared only by the CQ/progress thread. published_tasks is an
+    // exact total but may include cells behind an invisible MPMC head, so this
+    // is an observation time rather than proof that the FIFO head is visible.
     u64 oldest_published_observed_ns{};
-    // Number of tasks admitted into the current dispatch epoch but not yet
-    // dequeued. Keeping the epoch across lane reclamation and transient MPMC
-    // head holes ensures the oldest admitted tail is not re-aged after every
-    // small batch, while newly published work starts a fresh bounded epoch.
-    u32 dispatch_epoch_remaining{};
-    bool dispatch_epoch_idle_flush{};
-    bool dispatch_epoch_max_wait_flush{};
     // Written only by the progress thread. Power-of-two snapshots are logged
     // so a benchmark can verify that batching is real rather than inferred
     // from submitted operation counts.

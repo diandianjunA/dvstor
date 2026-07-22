@@ -8,11 +8,9 @@
 namespace {
 
 using compute_service_detail::StorageOwnerResponseValidation;
-using compute_service_detail::balanced_storage_owner_batch_take;
 using compute_service_detail::dequeue_storage_owner_visible_prefix;
 using compute_service_detail::decide_storage_owner_batch;
-using compute_service_detail::rearm_storage_owner_batch_wait;
-using compute_service_detail::storage_owner_dispatch_epoch_take;
+using compute_service_detail::next_storage_owner_batch_observed_ns;
 using compute_service_detail::validate_storage_owner_response;
 
 struct ScriptedPrefixQueue {
@@ -81,91 +79,70 @@ void test_matched_malformed_response_fails() {
 void test_batch_policy_sends_full_batch_immediately() {
   const auto decision = decide_storage_owner_batch(
     41, 4, 12, 7, 32, 100, 101, 0);
-  assert(!decision.idle_flush);
+  assert(!decision.tail_escape);
   assert(!decision.max_wait_flush);
-  assert(decision.take == 4);
+  assert(decision.take == 32);
+
+  // The remaining finite tail stays intact.  It waits while the full RPC is
+  // active, then consumes exactly one slot at its deadline rather than being
+  // spread over every free slot.
+  const auto waiting_tail = decide_storage_owner_batch(
+    9, 1, 11, 0, 32, 101, 149, 50);
+  assert(waiting_tail.take == 0);
+  const auto expired_tail = decide_storage_owner_batch(
+    9, 1, 11, 0, 32, 101, 151, 50);
+  assert(expired_tail.max_wait_flush);
+  assert(expired_tail.take == 9);
 }
 
-void test_batch_policy_uses_all_existing_rpc_lanes() {
-  assert(balanced_storage_owner_batch_take(51, 16, 32) == 4);
-  assert(balanced_storage_owner_batch_take(47, 15, 32) == 4);
-  assert(balanced_storage_owner_batch_take(32, 16, 32) == 4);
-  assert(balanced_storage_owner_batch_take(512, 16, 32) == 32);
-  assert(balanced_storage_owner_batch_take(7, 1, 32) == 7);
-  assert(balanced_storage_owner_batch_take(7, 16, 32) == 4);
-  assert(balanced_storage_owner_batch_take(3, 16, 32) == 3);
-  assert(balanced_storage_owner_batch_take(32, 16, 2) == 2);
-  assert(balanced_storage_owner_batch_take(0, 16, 32) == 0);
+void test_announced_producer_keeps_partial_waiting_until_deadline() {
+  // The producer counter is only a liveness hint (it can briefly overlap the
+  // published counter), but one outstanding producer means this is not yet an
+  // isolated tail and should not consume a lane as a singleton.
+  const auto decision = decide_storage_owner_batch(
+    1, 0, 16, 31, 32, 100, 100, 50);
+  assert(decision.take == 0);
 }
 
-void test_batch_policy_idle_tail_preserves_batch_amortization() {
-  assert(storage_owner_dispatch_epoch_take(9, 16, 32, true) == 9);
-  assert(storage_owner_dispatch_epoch_take(9, 16, 32, false) == 4);
-  assert(storage_owner_dispatch_epoch_take(40, 16, 32, true) == 32);
+void test_partial_visible_dequeue_preserves_expired_batch_age() {
+  assert(next_storage_owner_batch_observed_ns(
+           100, 2, 1, 3, 1'000) == 100);
+  assert(next_storage_owner_batch_observed_ns(
+           100, 2, 3, 3, 1'000) == 1'000);
+  assert(next_storage_owner_batch_observed_ns(
+           100, 0, 1, 3, 1'000) == 0);
 }
 
-void test_batch_policy_holds_concurrent_partial_batch_until_deadline() {
-  const auto hold_tail = decide_storage_owner_batch(
-    31, 5, 11, 3, 32, 100, 149, 50);
-  assert(!hold_tail.idle_flush);
-  assert(!hold_tail.max_wait_flush);
-  assert(hold_tail.take == 0);
-
+void test_expired_concurrent_tail_is_sent_intact() {
   const auto expired = decide_storage_owner_batch(
     31, 5, 11, 3, 32, 100, 150, 50);
-  assert(!expired.idle_flush);
   assert(expired.max_wait_flush);
-  assert(expired.take == 4);
+  assert(!expired.tail_escape);
+  assert(expired.take == 31);
 }
 
-void test_batch_policy_zero_wait_flushes_concurrent_tail_immediately() {
-  const auto decision = decide_storage_owner_batch(
-    7, 5, 11, 3, 32, 0, 0, 0);
-  assert(!decision.idle_flush);
-  assert(decision.max_wait_flush);
-  assert(decision.take == 4);
+void test_finite_announced_tail_has_a_bounded_initial_wait() {
+  const auto waiting = decide_storage_owner_batch(
+    9, 0, 16, 3, 32, 100, 149, 50);
+  assert(!waiting.max_wait_flush);
+  assert(waiting.take == 0);
+
+  const auto expired = decide_storage_owner_batch(
+    9, 0, 16, 3, 32, 100, 150, 50);
+  assert(expired.max_wait_flush);
+  assert(expired.take == 9);
+
+  const auto zero_wait = decide_storage_owner_batch(
+    7, 0, 16, 3, 32, 0, 0, 0);
+  assert(zero_wait.max_wait_flush);
+  assert(zero_wait.take == 7);
 }
 
-void test_batch_policy_isolated_tail_is_immediate() {
+void test_isolated_write_is_immediate() {
   const auto tail = decide_storage_owner_batch(
-    9, 0, 16, 0, 32, 100, 101, 50);
-  assert(tail.idle_flush);
-  assert(!tail.max_wait_flush);
-  assert(tail.take == 9);
-
-  const auto producer_gap = decide_storage_owner_batch(
-    0, 0, 16, 1, 32, 0, 200, 50);
-  assert(producer_gap.take == 0);
-
-  const auto announced_tail = decide_storage_owner_batch(
-    9, 0, 16, 3, 32, 100, 101, 50);
-  assert(!announced_tail.idle_flush);
-  assert(!announced_tail.max_wait_flush);
-  assert(announced_tail.take == 0);
-}
-
-void test_batch_policy_continuous_load_cannot_strand_tail() {
-  for (u64 now = 100; now < 150; ++now) {
-    const auto waiting = decide_storage_owner_batch(
-      7, 8, 8, 4, 32, 100, now, 50);
-    assert(waiting.take == 0);
-  }
-  const auto deadline = decide_storage_owner_batch(
-    7, 8, 8, 4, 32, 100, 150, 50);
-  assert(deadline.max_wait_flush);
-  assert(deadline.take == 4);
-
-  // A real dequeue starts a new bounded epoch. Reusing the original timestamp
-  // would make this second partial batch immediately eligible forever.
-  const u64 rearmed_at = rearm_storage_owner_batch_wait(5, 150);
-  assert(rearmed_at == 150);
-  const auto second_wait = decide_storage_owner_batch(
-    5, 8, 8, 4, 32, rearmed_at, 199, 50);
-  assert(!second_wait.max_wait_flush && second_wait.take == 0);
-  const auto second_deadline = decide_storage_owner_batch(
-    5, 8, 8, 4, 32, rearmed_at, 200, 50);
-  assert(second_deadline.max_wait_flush && second_deadline.take == 4);
-  assert(rearm_storage_owner_batch_wait(0, 200) == 0);
+    1, 0, 16, 0, 32, 100, 100, 50);
+  assert(tail.tail_escape);
+  assert(tail.take == 1);
 }
 
 void test_batch_policy_never_consumes_rpc_slot_without_credit() {
@@ -175,6 +152,13 @@ void test_batch_policy_never_consumes_rpc_slot_without_credit() {
   const auto no_ready = decide_storage_owner_batch(
     0, 0, 16, 0, 32, 0, 1000, 50);
   assert(no_ready.take == 0);
+
+  // Queue age continues while transport credit is unavailable.  Reclaiming a
+  // slot must expose the already-expired whole tail immediately.
+  const auto reclaimed = decide_storage_owner_batch(
+    7, 15, 1, 1, 32, 100, 1'000, 50);
+  assert(reclaimed.max_wait_flush);
+  assert(reclaimed.take == 7);
 }
 
 void test_sender_consumes_only_the_queue_visible_prefix() {
@@ -200,7 +184,7 @@ void test_sender_consumes_only_the_queue_visible_prefix() {
 
 void test_expired_batch_still_waits_for_the_visible_fifo_head() {
   const auto expired = decide_storage_owner_batch(
-    3, 4, 12, 1, 32, 100, 200, 50);
+    3, 0, 16, 1, 32, 100, 200, 50);
   assert(expired.max_wait_flush && expired.take == 3);
 
   ScriptedPrefixQueue queue{{20, 21, 22}, 0};
@@ -221,12 +205,11 @@ void test_expired_batch_still_waits_for_the_visible_fifo_head() {
 int main() {
   test_matched_malformed_response_fails();
   test_batch_policy_sends_full_batch_immediately();
-  test_batch_policy_uses_all_existing_rpc_lanes();
-  test_batch_policy_idle_tail_preserves_batch_amortization();
-  test_batch_policy_holds_concurrent_partial_batch_until_deadline();
-  test_batch_policy_zero_wait_flushes_concurrent_tail_immediately();
-  test_batch_policy_isolated_tail_is_immediate();
-  test_batch_policy_continuous_load_cannot_strand_tail();
+  test_announced_producer_keeps_partial_waiting_until_deadline();
+  test_partial_visible_dequeue_preserves_expired_batch_age();
+  test_expired_concurrent_tail_is_sent_intact();
+  test_finite_announced_tail_has_a_bounded_initial_wait();
+  test_isolated_write_is_immediate();
   test_batch_policy_never_consumes_rpc_slot_without_credit();
   test_sender_consumes_only_the_queue_visible_prefix();
   test_expired_batch_still_waits_for_the_visible_fifo_head();

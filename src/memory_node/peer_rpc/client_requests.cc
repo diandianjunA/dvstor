@@ -578,10 +578,17 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
           items.size() * VamanaNode::vector_bytes()) {
       return false;
     }
+    const bool fused_batch =
+      memory_node_peer_rpc_detail::stage1_execute_uses_fused_arm(
+        items.front());
     for (const Stage1ExecuteItem& item : items) {
       if (item.authority_shard != storage_id_ ||
           item.client_batch_id == 0 ||
-          item.initial_placement_version != 0) {
+          memory_node_peer_rpc_detail::stage1_execute_uses_fused_arm(item) !=
+            fused_batch ||
+          (fused_batch &&
+           !memory_node_peer_rpc_detail::valid_fused_stage1_execute_item(
+             item))) {
         return false;
       }
     }
@@ -752,14 +759,16 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
           shard_results[index].reserved == 0 &&
           shard_results[index].status <=
             static_cast<u32>(MutationStatus::retry);
+        valid &= memory_node_peer_rpc_detail::
+          stage1_execute_success_has_expected_fence(
+            input[index], shard_results[index]);
         retryable |= shard_results[index].status ==
           static_cast<u32>(MutationStatus::retry);
         if (shard_results[index].status ==
             static_cast<u32>(MutationStatus::ok)) {
           const RemotePtr target{shard_results[index].target_raw};
           valid &= !target.is_null() &&
-            target.memory_node() == request.home &&
-            shard_results[index].maintenance_sequence == 0;
+            target.memory_node() == request.home;
         }
       }
       if (!valid) {

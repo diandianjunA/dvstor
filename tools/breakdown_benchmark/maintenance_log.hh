@@ -23,7 +23,11 @@ struct MaintenanceObservation {
   uint64_t remaining{};
   uint64_t peer_reverse_remaining{};
   uint64_t failed{};
-  uint64_t peer_reverse_failed{};
+  // The storage log/control-page field is historically named
+  // peer_reverse_failed, but it counts retryable apply attempts. A failed
+  // response is not cached by receiver deduplication and the sender retries
+  // the same idempotent request until it receives a successful ACK.
+  uint64_t peer_reverse_retry_attempts{};
   uint64_t admission_window{};
   uint64_t completion_outstanding{};
   uint64_t stage2_continuations{};
@@ -41,6 +45,7 @@ struct MaintenanceObservation {
   std::array<uint64_t, kMaintenanceLatencyBucketCount>
     stage2_delay_histogram{};
   bool failure_counters_available{};
+  bool peer_reverse_retry_counter_available{};
   bool stage2_delay_histogram_available{};
   bool completion_window_available{};
   bool locality_counters_available{};
@@ -64,7 +69,11 @@ struct MaintenanceLogSummary {
   size_t observations{};
   uint64_t remaining{};
   uint64_t max_backlog_observed{};
+  // Terminal maintenance failures only. Retryable peer reverse attempts are
+  // reported separately and must not make a successfully drained run look
+  // inconsistent.
   uint64_t failures{};
+  uint64_t peer_reverse_retry_attempts{};
   uint64_t admission_window{};
   uint64_t completion_outstanding{};
   uint64_t max_completion_outstanding_per_shard{};
@@ -84,11 +93,13 @@ struct MaintenanceLogSummary {
   uint64_t p99_stage2_delay_samples{};
   bool p99_stage2_delay_available{};
   size_t logs_with_failure_deltas{};
+  size_t logs_with_peer_reverse_retry_deltas{};
   size_t logs_with_histogram_deltas{};
   size_t logs_with_completion_window{};
   size_t logs_with_locality_deltas{};
   size_t logs_with_search_budget_deltas{};
   bool failure_delta_available{};
+  bool peer_reverse_retry_delta_available{};
   bool completion_window_available{};
   bool locality_delta_available{};
   bool search_budget_delta_available{};

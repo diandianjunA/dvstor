@@ -38,6 +38,7 @@ struct Stage2PendingVectorRead {
   RemotePtr pointer;
   byte_t* buffer{};
   byte_t* after_header{};
+  bool requires_after_header{};
   u64 before{};
   u32 slot_incarnation{};
   u32 attempt{};

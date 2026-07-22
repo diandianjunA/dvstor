@@ -805,18 +805,26 @@ MemoryNode::advance_stage2_search_candidates_batched(
   const PartitionSearchBudget budget = stage2_partition_search_budget(
     construction_width, VamanaNode::graph_entry_capacity());
   const auto& credit_plan = peer_rdma_read_credit_plan();
-  const size_t ordinary_credit_limit =
-    std::min<size_t>(credit_plan.per_peer, credit_plan.global);
-  const size_t pair_credit_limit =
-    memory_node_detail::peer_rdma_read_pair_wave_limit(credit_plan);
-  lib_assert(ordinary_credit_limit != 0,
+  const auto ordinary_dispatch_limits =
+    memory_node_detail::peer_rdma_read_dispatch_limits(credit_plan);
+  const auto pair_dispatch_limits =
+    memory_node_detail::peer_rdma_read_pair_dispatch_limits(credit_plan);
+  const auto snapshot_dispatch_limits =
+    memory_node_detail::peer_rdma_snapshot_dispatch_limits(credit_plan);
+  lib_assert(ordinary_dispatch_limits.global_items != 0 &&
+               ordinary_dispatch_limits.per_peer_items != 0,
              "asynchronous Stage2 has no RDMA READ credit");
-  const bool ordered_pairs = pair_credit_limit != 0;
-  const size_t score_dispatch_limit = std::min<size_t>(
-    storage_owner_snapshot_batch_size(config, thread),
-    ordered_pairs ? pair_credit_limit : ordinary_credit_limit);
-  const size_t graph_dispatch_limit = std::min<size_t>(
-    storage_owner_graph_batch_size(config, thread), ordinary_credit_limit);
+  const bool ordered_pairs = pair_dispatch_limits.global_items != 0 &&
+    pair_dispatch_limits.per_peer_items != 0;
+  const bool mixed_snapshots = ordered_pairs &&
+    snapshot_dispatch_limits.per_peer_pairs != 0;
+  // Scratch bounds the number of logical consumers inspected in one pass.
+  // RDMA quota is enforced independently below: global_items caps the whole
+  // physical wave and per_peer_items caps each destination shard.
+  const size_t score_dispatch_limit =
+    storage_owner_snapshot_batch_size(config, thread);
+  const size_t graph_dispatch_limit =
+    storage_owner_graph_batch_size(config, thread);
   lib_assert(score_dispatch_limit != 0 && graph_dispatch_limit != 0,
              "asynchronous Stage2 scratch cannot hold one RDMA record");
 
@@ -1077,11 +1085,28 @@ MemoryNode::advance_stage2_search_candidates_batched(
          state.score_collect_cursors) {
       cursor.begin_dispatch();
     }
+    thread_local vec<u32> remote_wrs_by_peer;
+    thread_local vec<u32> remote_pairs_by_peer;
+    remote_wrs_by_peer.resize(num_storage_nodes_);
+    remote_pairs_by_peer.resize(num_storage_nodes_);
+    memory_node_detail::PeerRdmaVectorSnapshotDispatchQuota quota;
+    // This collector prepares a new dispatch, so choose its accounting from
+    // the transport capability, not from state.ordered_snapshot_pairs (which
+    // describes the previously prepared/in-flight dispatch and is cleared at
+    // retirement). Dynamic records must consume both WR credits before this
+    // wave is materialized.
+    quota.reset(
+      mixed_snapshots, snapshot_dispatch_limits,
+      ordinary_dispatch_limits,
+      std::span<u32>{
+        remote_wrs_by_peer.data(), remote_wrs_by_peer.size()},
+      std::span<u32>{
+        remote_pairs_by_peer.data(), remote_pairs_by_peer.size()});
     const size_t search_count = tasks.size();
     size_t last_search = state.round_robin_search % search_count;
     bool selected_any = false;
     while (state.score_consumers.size() < score_dispatch_limit) {
-      bool selected_this_round = false;
+      bool examined_this_round = false;
       for (size_t offset = 0;
            offset < search_count &&
              state.score_consumers.size() < score_dispatch_limit;
@@ -1094,15 +1119,35 @@ MemoryNode::advance_stage2_search_candidates_batched(
         const std::optional<size_t> position =
           state.score_collect_cursors[search_index].take(requests.size());
         if (!position.has_value()) continue;
+        examined_this_round = true;
         const PartitionContinuationScoreRequest& request =
           requests[*position];
+        const bool remote = storage_node_pointer_addressable(
+          request.pointer) && !local_shard(request.pointer.memory_node());
+        const bool duplicate_remote = remote && std::any_of(
+          state.score_consumers.begin(), state.score_consumers.end(),
+          [&](const Stage2ScoreConsumer& selected) {
+            return selected.pointer == request.pointer;
+          });
+        const bool distinct_remote = remote && !duplicate_remote;
+        const bool requires_after_header = distinct_remote &&
+          !VamanaNode::immutable_base_record(request.pointer);
+        const bool accepted = quota.try_accept(
+          request.pointer.memory_node(), distinct_remote,
+          requires_after_header);
+        if (!accepted) {
+          // The cursor has advanced, but the continuation request remains
+          // unresolved.  This prevents a hot peer at its quota from hiding a
+          // later request for another peer, and revisits the skipped request
+          // in a subsequent finite dispatch without duplicating it here.
+          continue;
+        }
         state.score_consumers.push_back({
           request.search_index, request.generation, request.pointer});
         last_search = search_index;
         selected_any = true;
-        selected_this_round = true;
       }
-      if (!selected_this_round) break;
+      if (!examined_this_round) break;
     }
     if (selected_any) {
       state.round_robin_search = (last_search + 1) % search_count;
@@ -1112,6 +1157,13 @@ MemoryNode::advance_stage2_search_candidates_batched(
 
   const auto collect_graph_dispatch = [&] {
     state.graph_consumers.clear();
+    thread_local vec<u32> remote_items_by_peer;
+    remote_items_by_peer.resize(num_storage_nodes_);
+    memory_node_detail::PeerRdmaReadDispatchQuota quota;
+    quota.reset(
+      ordinary_dispatch_limits,
+      std::span<u32>{
+        remote_items_by_peer.data(), remote_items_by_peer.size()});
     const size_t search_count = tasks.size();
     size_t last_search = state.round_robin_search % search_count;
     bool selected_any = false;
@@ -1125,6 +1177,17 @@ MemoryNode::advance_stage2_search_candidates_batched(
       const auto request =
         state.continuation.pending_expand_request(search_index);
       if (!request.has_value()) continue;
+      const bool remote = storage_node_pointer_addressable(
+        request->pointer) && !local_shard(request->pointer.memory_node());
+      const bool duplicate_remote = remote && std::any_of(
+        state.graph_consumers.begin(), state.graph_consumers.end(),
+        [&](const Stage2GraphConsumer& selected) {
+          return selected.pointer == request->pointer;
+        });
+      if (!quota.try_accept(
+            request->pointer.memory_node(), remote && !duplicate_remote)) {
+        continue;
+      }
       state.graph_consumers.push_back({
         request->search_index, request->generation, request->pointer});
       last_search = search_index;
@@ -1223,6 +1286,8 @@ MemoryNode::advance_stage2_search_candidates_batched(
         .pointer = pointer,
         .buffer = buffer,
         .after_header = buffer + validation_offset,
+        .requires_after_header =
+          !VamanaNode::immutable_base_record(pointer),
       });
     }
     if (!state.pending_vectors.empty()) {
@@ -1230,7 +1295,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
         1, std::memory_order_relaxed);
       storage_owner_stage2_vector_unique_reads_.fetch_add(
         state.pending_vectors.size(), std::memory_order_relaxed);
-      state.ordered_snapshot_pairs = ordered_pairs;
+      state.ordered_snapshot_pairs = mixed_snapshots;
       state.phase = Stage2SearchIoPhase::score_body_ready;
     }
     return std::pair{progressed, !state.pending_vectors.empty()};
@@ -1343,7 +1408,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
   };
 
   thread_local vec<PeerReadRequest> read_requests;
-  thread_local vec<PeerReadPairRequest> read_pairs;
+  thread_local vec<PeerReadSnapshotRequest> snapshot_requests;
   u8 idle_attempt_mask = 0;
 
   // Only a bounded transport dispatch is synchronized on one CQ.  Once its
@@ -1389,7 +1454,9 @@ MemoryNode::advance_stage2_search_candidates_batched(
           const u64 before = *reinterpret_cast<const u64*>(read.buffer);
           const u32 slot_incarnation = *reinterpret_cast<const u32*>(
             read.buffer + VamanaNode::offset_slot_incarnation());
-          const u64 after = *reinterpret_cast<const u64*>(read.after_header);
+          const u64 after = read.requires_after_header
+            ? *reinterpret_cast<const u64*>(read.after_header)
+            : before;
           const StableNodeSnapshotState disposition =
             classify_vector_snapshot(
               read.pointer, before, after, slot_incarnation);
@@ -1409,10 +1476,37 @@ MemoryNode::advance_stage2_search_candidates_batched(
         idle_attempt_mask = 0;
         continue;
       }
+      size_t dynamic_count = 0;
       for (Stage2PendingVectorRead& read : state.pending_vectors) {
         read.before = *reinterpret_cast<const u64*>(read.buffer);
         read.slot_incarnation = *reinterpret_cast<const u32*>(
           read.buffer + VamanaNode::offset_slot_incarnation());
+        if (!read.requires_after_header) {
+          const StableNodeSnapshotState disposition =
+            classify_vector_snapshot(
+              read.pointer, read.before, read.before,
+              read.slot_incarnation);
+          if (disposition == StableNodeSnapshotState::stable) {
+            resolve_score_group(
+              read.group_index,
+              read.buffer + VamanaNode::offset_vector());
+          } else if (disposition == StableNodeSnapshotState::terminal) {
+            resolve_terminal_score_group(read.group_index);
+          }
+          continue;
+        }
+        if (dynamic_count !=
+            static_cast<size_t>(&read - state.pending_vectors.data())) {
+          state.pending_vectors[dynamic_count] = read;
+        }
+        ++dynamic_count;
+      }
+      state.pending_vectors.resize(dynamic_count);
+      if (state.pending_vectors.empty()) {
+        clear_score_dispatch();
+        state.prefer_graph = true;
+        idle_attempt_mask = 0;
+        continue;
       }
       state.phase = Stage2SearchIoPhase::score_header_ready;
       continue;
@@ -1453,7 +1547,8 @@ MemoryNode::advance_stage2_search_candidates_batched(
           .bytes = VamanaNode::HEADER_SIZE,
         });
       }
-      lib_assert(read_requests.size() <= ordinary_credit_limit,
+      lib_assert(read_requests.size() <=
+                   ordinary_dispatch_limits.global_items,
                  "Stage2 header dispatch exceeds RDMA credit");
       if (!try_post_peer_reads_async(
             *thread, span<const PeerReadRequest>{read_requests})) {
@@ -1465,7 +1560,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
 
     if (state.phase == Stage2SearchIoPhase::score_body_ready) {
       if (state.ordered_snapshot_pairs) {
-        read_pairs.clear();
+        snapshot_requests.clear();
         for (const Stage2PendingVectorRead& read : state.pending_vectors) {
           const PeerReadRequest body{
             .shard_id = read.pointer.memory_node(),
@@ -1473,20 +1568,21 @@ MemoryNode::advance_stage2_search_candidates_batched(
             .destination = read.buffer,
             .bytes = VamanaNode::size_until_vector_end(),
           };
-          read_pairs.push_back(PeerReadPairRequest{
+          snapshot_requests.push_back(PeerReadSnapshotRequest{
             .full_snapshot = body,
-            .after_header = PeerReadRequest{
-              .shard_id = read.pointer.memory_node(),
-              .remote_offset = read.pointer.byte_offset(),
-              .destination = read.after_header,
-              .bytes = VamanaNode::HEADER_SIZE,
-            },
+            .after_header = read.requires_after_header
+              ? std::optional<PeerReadRequest>{PeerReadRequest{
+                  .shard_id = read.pointer.memory_node(),
+                  .remote_offset = read.pointer.byte_offset(),
+                  .destination = read.after_header,
+                  .bytes = VamanaNode::HEADER_SIZE,
+                }}
+              : std::nullopt,
           });
         }
-        lib_assert(read_pairs.size() <= pair_credit_limit,
-                   "Stage2 ordered snapshot dispatch exceeds RDMA credit");
-        if (!try_post_peer_read_pairs_async(
-              *thread, span<const PeerReadPairRequest>{read_pairs})) {
+        if (!try_post_peer_snapshot_reads_async(
+              *thread,
+              span<const PeerReadSnapshotRequest>{snapshot_requests})) {
           return Stage2SearchAdvanceResult::waiting_rdma;
         }
       } else {
@@ -1499,7 +1595,8 @@ MemoryNode::advance_stage2_search_candidates_batched(
             .bytes = VamanaNode::size_until_vector_end(),
           });
         }
-        lib_assert(read_requests.size() <= ordinary_credit_limit,
+        lib_assert(read_requests.size() <=
+                     ordinary_dispatch_limits.global_items,
                    "Stage2 vector dispatch exceeds RDMA credit");
         if (!try_post_peer_reads_async(
               *thread, span<const PeerReadRequest>{read_requests})) {
@@ -1560,7 +1657,8 @@ MemoryNode::advance_stage2_search_candidates_batched(
           .bytes = VamanaNode::hot_graph_entry_size(),
         });
       }
-      lib_assert(read_requests.size() <= ordinary_credit_limit,
+      lib_assert(read_requests.size() <=
+                   ordinary_dispatch_limits.global_items,
                  "Stage2 graph dispatch exceeds RDMA credit");
       if (!try_post_peer_reads_async(
             *thread, span<const PeerReadRequest>{read_requests})) {

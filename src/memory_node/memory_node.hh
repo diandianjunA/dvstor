@@ -322,6 +322,12 @@ private:
     PeerReadRequest full_snapshot;
     PeerReadRequest after_header;
   };
+  struct PeerReadSnapshotRequest {
+    PeerReadRequest full_snapshot;
+    // Immutable base records leave this empty. Dynamic records require the
+    // ordered after-header read that closes their reuse/torn-body window.
+    std::optional<PeerReadRequest> after_header;
+  };
   using AuthorityOperationToken =
     memory_node_storage_owner_index_detail::AuthorityOperationToken;
   using AuthorityMutationLease =
@@ -437,6 +443,9 @@ private:
     StorageOwnerThread& thread,
     span<const PeerReadPairRequest> requests,
     bool try_only);
+  bool try_post_peer_snapshot_reads_async(
+    StorageOwnerThread& thread,
+    span<const PeerReadSnapshotRequest> requests);
   void remote_read_bytes(u32 shard_id, u64 remote_offset, void* dst, size_t bytes, size_t scratch_offset);
   void remote_write_bytes(u32 shard_id, u64 remote_offset, const void* src, size_t bytes, size_t scratch_offset);
   u64 remote_compare_and_swap(u32 shard_id, u64 remote_offset, u64 expected, u64 desired, size_t scratch_offset);

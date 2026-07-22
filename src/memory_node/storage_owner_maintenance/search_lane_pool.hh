@@ -68,27 +68,36 @@ constexpr std::size_t saturating_stage2_lane_product(
 // every worker.
 //
 // A lane is continuation/scratch ownership, not a reservation of its largest
-// possible RDMA wave.  try_post_peer_* reserves the actual wave atomically and
-// rolls the whole reservation back on pressure, so sizing lanes by a static
-// worst-case wave strands most contexts whenever real graph/vector waves are
-// smaller.  Admit one lane per minimally schedulable transport chain, bounded
-// by the fixed context pool.  Lanes that do not win dynamic credit simply stay
-// ready and retry after another chain releases credit.  A worker always
-// receives one lane so a low-credit transport cannot starve an executor.
+// possible RDMA wave. try_post_peer_* reserves the actual wave atomically and
+// rolls the whole reservation back on pressure. One lane per peak-sized credit
+// window is nevertheless insufficient: when every such lane is waiting on the
+// HCA, an OS worker has no ready continuation with which to hide that latency.
+// Keep two bounded lanes per useful credit window (one in flight and one ready)
+// and, when context capacity permits, at least two lanes per worker. This is a
+// fixed double buffer, not backlog-dependent growth; the context pool remains
+// the hard memory bound and dynamic credit admission remains authoritative.
 constexpr std::size_t stage2_global_search_lane_count(
     const std::size_t worker_count,
     const std::size_t contexts_per_worker,
-    const std::size_t minimum_chain_rdma_wrs,
+    const std::size_t useful_wave_rdma_wrs,
     const std::size_t global_read_window) {
   if (worker_count == 0) return 0;
   const std::size_t contexts = std::max<std::size_t>(1, contexts_per_worker);
   const std::size_t maximum_lanes =
     saturating_stage2_lane_product(worker_count, contexts);
-  const std::size_t minimum_chain =
-    std::max<std::size_t>(1, minimum_chain_rdma_wrs);
-  const std::size_t credit_lanes = global_read_window / minimum_chain;
-  return std::min(maximum_lanes,
-                  std::max(worker_count, credit_lanes));
+  const std::size_t useful_wave =
+    std::max<std::size_t>(1, useful_wave_rdma_wrs);
+  const std::size_t credit_windows = global_read_window == 0
+    ? 1
+    : 1 + (global_read_window - 1) / useful_wave;
+  const std::size_t buffered_credit_windows =
+    saturating_stage2_lane_product(credit_windows, 2);
+  const std::size_t worker_double_buffer =
+    saturating_stage2_lane_product(
+      worker_count, std::min<std::size_t>(contexts, 2));
+  return std::min(
+    maximum_lanes,
+    std::max(worker_double_buffer, buffered_credit_windows));
 }
 
 // Deterministically spread the global lane budget.  The first remainder
@@ -202,8 +211,11 @@ static_assert(stage2_search_lane_count(16, 0, 0) == 1);
 static_assert(stage2_search_lane_peak_rdma_wrs(32, 96, 48) == 64);
 static_assert(stage2_search_lane_peak_rdma_wrs(32, 24, 0) == 24);
 static_assert(stage2_global_search_lane_count(4, 16, 1, 96) == 64);
-static_assert(stage2_global_search_lane_count(4, 16, 2, 96) == 48);
-static_assert(stage2_global_search_lane_count(5, 16, 1, 4) == 5);
+static_assert(stage2_global_search_lane_count(4, 16, 2, 96) == 64);
+static_assert(stage2_global_search_lane_count(4, 16, 56, 224) == 8);
+static_assert(stage2_global_search_lane_count(4, 16, 64, 96) == 8);
+static_assert(stage2_global_search_lane_count(5, 16, 1, 4) == 10);
+static_assert(stage2_global_search_lane_count(5, 1, 1, 4096) == 5);
 static_assert(stage2_search_lanes_for_worker(0, 5, 16, 7) == 2);
 static_assert(stage2_search_lanes_for_worker(1, 5, 16, 7) == 2);
 static_assert(stage2_search_lanes_for_worker(2, 5, 16, 7) == 1);

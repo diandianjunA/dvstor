@@ -119,6 +119,12 @@ void test_recall_and_report_formatting() {
     }},
   };
   root["throughput"] = {{"duration_seconds", 0.0}};
+  root["stage2"] = {
+    {"requested_logs", 1},
+    {"failures", 0},
+    {"peer_reverse_retry_attempts", 7},
+    {"peer_reverse_retry_delta_available", true},
+  };
   service::breakdown::Report report;
   report.query.operation = service::breakdown::Operation::query;
   report.query.count = 1;
@@ -127,6 +133,9 @@ void test_recall_and_report_formatting() {
   assert(formatted.bottleneck_summary.contains("query"));
   assert(formatted.text.find("single_pass_no_reuse") != std::string::npos);
   assert(formatted.text.find("query breakdown") != std::string::npos);
+  assert(formatted.text.find("failures (hard): 0") != std::string::npos);
+  assert(formatted.text.find("peer_reverse_retry_attempts: 7") !=
+         std::string::npos);
 }
 
 void test_base_only_recall_filter() {
@@ -200,7 +209,7 @@ void test_maintenance_log_window() {
     histogram[2] = 60;
     write_observation(output, 200, 195, 5, 9, 3, histogram);
     histogram[2] = 100;
-    write_observation(output, 300, 300, 0, 10, 3, histogram);
+    write_observation(output, 300, 300, 0, 10, 7, histogram);
   }
 
   const auto post_stop =
@@ -214,6 +223,7 @@ void test_maintenance_log_window() {
   assert(summary.remaining == 0);
   assert(summary.max_backlog_observed == 10);
   assert(summary.failures == 1);
+  assert(summary.peer_reverse_retry_attempts == 4);
   assert(summary.completion_window_available);
   assert(summary.locality_delta_available);
   assert(summary.stage2_finalized_live == 300);
@@ -232,6 +242,7 @@ void test_maintenance_log_window() {
   assert(summary.completion_outstanding == 0);
   assert(summary.max_completion_outstanding_per_shard == 10);
   assert(summary.failure_delta_available);
+  assert(summary.peer_reverse_retry_delta_available);
   assert(summary.p99_stage2_delay_available);
   assert(summary.p99_stage2_delay_samples == 100);
   assert(summary.p99_stage2_delay_upper_ms == 4.0);
@@ -249,13 +260,15 @@ void test_maintenance_log_window() {
 
   {
     std::ofstream output(path, std::ios::app);
-    write_observation(output, 303, 300, 3, 10, 3, histogram);
+    write_observation(output, 303, 300, 3, 10, 7, histogram);
   }
   const auto post_stop_without_completion =
     tools::breakdown_benchmark::summarize_maintenance_logs(post_stop);
   assert(post_stop_without_completion.logs_with_observations == 1);
   assert(post_stop_without_completion.failure_delta_available);
   assert(post_stop_without_completion.failures == 0);
+  assert(post_stop_without_completion.peer_reverse_retry_attempts == 0);
+  assert(post_stop_without_completion.peer_reverse_retry_delta_available);
   assert(post_stop_without_completion.p99_stage2_delay_samples == 0);
   assert(!post_stop_without_completion.p99_stage2_delay_available);
 
@@ -316,6 +329,7 @@ void test_in_band_maintenance_snapshot_window() {
       .stage2_finalized_live = 8,
       .remaining = 2,
       .failed = 3,
+      .peer_reverse_failed = 5,
       .admission_window = 128,
       .completion_outstanding = 2,
       .max_backlog = 2,
@@ -338,6 +352,7 @@ void test_in_band_maintenance_snapshot_window() {
     latest.stage2_finalized_live = 28;
     latest.remaining = 2;
     latest.failed = 4;
+    latest.peer_reverse_failed = 8;
     latest.completion_outstanding = 2;
     latest.max_backlog = 7;
     latest.stage1_search_budget_exhausted = 3;
@@ -361,7 +376,9 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.remaining == 4);
   assert(summary.max_backlog_observed == 7);
   assert(summary.failures == 2);
+  assert(summary.peer_reverse_retry_attempts == 6);
   assert(summary.failure_delta_available);
+  assert(summary.peer_reverse_retry_delta_available);
   assert(summary.completion_window_available);
   assert(summary.admission_window == 256);
   assert(summary.completion_outstanding == 4);

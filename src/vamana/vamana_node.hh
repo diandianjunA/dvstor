@@ -262,6 +262,30 @@ public:
     return dynamic_relative % HOT_GRAPH_DYNAMIC_RECORD_BYTES == 0;
   }
 
+  // Incarnation-zero base records are materialized once by the offline build
+  // and are never recycled. Runtime graph mutations touch the disjoint compact
+  // graph plane, while an upsert allocates a new dynamic record and tombstones
+  // the old base header. Consequently the base id/generation/incarnation/vector
+  // payload is immutable even though lifecycle flags in its header may change.
+  //
+  // Do not infer this property from a zero incarnation alone: a malformed
+  // tagged handle could name a dynamic slot with incarnation zero. Require the
+  // exact fixed-record address range as well so only an offline base slot is
+  // eligible for single-READ vector snapshots.
+  static bool immutable_base_record(RemotePtr ptr) {
+    if (!HAS_HOT_GRAPH || !ptr.is_static() ||
+        ptr.memory_node() >= HOT_GRAPH_ENTRY_COUNTS.size() ||
+        ptr.byte_offset() < vamana::hot_graph::kNodeBaseOffset) {
+      return false;
+    }
+    const u64 node_size = total_size();
+    if (node_size == 0) return false;
+    const u64 relative =
+      ptr.byte_offset() - vamana::hot_graph::kNodeBaseOffset;
+    return relative % node_size == 0 &&
+      relative / node_size < HOT_GRAPH_ENTRY_COUNTS[ptr.memory_node()];
+  }
+
   static u64 hot_graph_entry_offset(RemotePtr ptr) {
     const u64 relative = ptr.byte_offset() - vamana::hot_graph::kNodeBaseOffset;
     const u64 node_size = total_size();

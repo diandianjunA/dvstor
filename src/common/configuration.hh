@@ -59,7 +59,14 @@ public:
   u32 storage_id{};
   vec<str> storage_peers;
   u32 storage_owner_batch_max{16};
-  u32 storage_owner_batch_max_wait_us{100};
+  // Give synchronous writers enough time to form one useful foreground
+  // microbatch. A full batch is sent immediately; this only bounds additional
+  // coalescing while an RPC slot is available, not remote service time.
+  u32 storage_owner_batch_max_wait_us{10'000};
+  // Stage2 is query-invisible background maintenance. Its compaction horizon
+  // must not be tied to the foreground Stage1 batching latency.
+  u32 storage_owner_stage2_batch_max_wait_us{10'000};
+  u32 storage_owner_peer_qps_per_peer{8};
   u32 storage_owner_peer_rdma_tokens{8};
   u32 storage_owner_rpc_depth{8};
   u32 storage_owner_rpc_timeout_ms{30'000};
@@ -188,11 +195,20 @@ private:
       ("storage-owner-batch-max-wait-us",
        po::value<u32>(&storage_owner_batch_max_wait_us)
          ->default_value(storage_owner_batch_max_wait_us),
-       "Maximum compute and Stage2 wait for a partial mutation batch; zero "
-       "runs partial batches immediately.")
+       "Maximum foreground wait while an announced initial mutation batch is "
+       "still being published; zero runs that partial batch immediately.")
+      ("storage-owner-stage2-batch-max-wait-us",
+       po::value<u32>(&storage_owner_stage2_batch_max_wait_us)
+         ->default_value(storage_owner_stage2_batch_max_wait_us),
+       "Maximum background Stage2 compaction wait for a partial batch; zero "
+       "runs partial Stage2 batches immediately.")
       ("storage-owner-peer-rdma-tokens",
        po::value<u32>(&storage_owner_peer_rdma_tokens)->default_value(storage_owner_peer_rdma_tokens),
        "Outstanding peer reads allowed per storage data QP.")
+      ("storage-owner-peer-qps-per-peer",
+       po::value<u32>(&storage_owner_peer_qps_per_peer)
+         ->default_value(storage_owner_peer_qps_per_peer),
+       "Storage-to-storage RC QPs per peer, including one ordered control QP.")
       ("storage-owner-rpc-depth",
        po::value<u32>(&storage_owner_rpc_depth)->default_value(storage_owner_rpc_depth),
        "In-flight mutation batches per storage node.")
@@ -271,6 +287,8 @@ private:
     }
     if (storage_id >= num_server_nodes() ||
         storage_owner_batch_max == 0 ||
+        storage_owner_peer_qps_per_peer == 0 ||
+        storage_owner_peer_qps_per_peer > kMaxPeerQps ||
         storage_owner_peer_rdma_tokens == 0 ||
         storage_owner_rpc_depth == 0 ||
         storage_owner_rpc_timeout_ms == 0 ||
@@ -342,6 +360,10 @@ public:
              << config.storage_owner_batch_max << '\n';
       output << std::setw(width) << "storage batch max wait us: "
              << config.storage_owner_batch_max_wait_us << '\n';
+      output << std::setw(width) << "storage Stage2 batch max wait us: "
+             << config.storage_owner_stage2_batch_max_wait_us << '\n';
+      output << std::setw(width) << "storage peer QPs per peer: "
+             << config.storage_owner_peer_qps_per_peer << '\n';
       output << std::setw(width) << "storage stage2 maintenance: "
              << config.storage_owner_maintenance_workers << " workers, backlog "
              << config.storage_owner_maintenance_queue_depth << '\n';

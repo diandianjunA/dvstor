@@ -15,10 +15,15 @@ using memory_node_detail::make_peer_wr_id;
 using memory_node_detail::next_collision_free_peer_wr_id;
 using memory_node_detail::peer_rdma_read_batch_completion_count;
 using memory_node_detail::peer_rdma_read_batch_group_limit;
+using memory_node_detail::peer_rdma_read_dispatch_limits;
 using memory_node_detail::peer_rdma_read_pair_chain_item;
+using memory_node_detail::peer_rdma_read_pair_dispatch_limits;
 using memory_node_detail::peer_rdma_read_pair_group_limit;
 using memory_node_detail::peer_rdma_read_pair_wave_limit;
 using memory_node_detail::peer_rdma_read_pair_work_request_count;
+using memory_node_detail::peer_rdma_snapshot_chain_item;
+using memory_node_detail::peer_rdma_snapshot_dispatch_limits;
+using memory_node_detail::peer_rdma_snapshot_work_request_count;
 using memory_node_detail::PeerRdmaReadCreditRequest;
 using memory_node_detail::release_peer_rdma_read_group;
 using memory_node_detail::select_peer_data_qp;
@@ -247,6 +252,148 @@ void test_ordered_pair_wave_rounds_down_each_qp_before_aggregation() {
   assert(peer_rdma_read_pair_wave_limit(global_limited) == 5);
 }
 
+void test_multi_peer_dispatch_uses_global_and_per_peer_quotas() {
+  const auto plan = derive_peer_rdma_read_credit_plan(
+    8, 4, 4, 16, 4096, 4096, 80);
+  const auto ordinary = peer_rdma_read_dispatch_limits(plan);
+  const auto ordered = peer_rdma_read_pair_dispatch_limits(plan);
+  assert(ordinary.global_items == 96);
+  assert(ordinary.per_peer_items == 24);
+  assert(ordered.global_items == 48);
+  assert(ordered.per_peer_items == 12);
+
+  std::array<std::uint32_t, 5> used{};
+  memory_node_detail::PeerRdmaReadDispatchQuota quota;
+  quota.reset(ordered, used);
+  for (std::uint32_t peer = 0; peer < 4; ++peer) {
+    for (std::uint32_t item = 0; item < 12; ++item) {
+      assert(quota.try_accept(peer, true));
+    }
+    assert(!quota.try_accept(peer, true));
+  }
+  assert(quota.global_used == 48);
+  assert(!quota.try_accept(4, true));
+
+  // A local/terminal consumer or another consumer of an already selected
+  // physical pointer performs no new READ and must not consume remote quota.
+  assert(quota.try_accept(std::numeric_limits<std::uint32_t>::max(), false));
+  assert(quota.global_used == 48);
+  for (std::uint32_t peer = 0; peer < 4; ++peer) {
+    assert(used[peer] == 12);
+  }
+
+  quota.reset(ordinary, used);
+  for (std::uint32_t peer = 0; peer < 4; ++peer) {
+    for (std::uint32_t item = 0; item < 24; ++item) {
+      assert(quota.try_accept(peer, true));
+    }
+  }
+  assert(quota.global_used == 96);
+}
+
+void test_mixed_snapshot_dispatch_charges_bodies_and_dynamic_validation() {
+  const auto plan = derive_peer_rdma_read_credit_plan(
+    8, 4, 4, 16, 4096, 4096, 80);
+  const auto limits = peer_rdma_snapshot_dispatch_limits(plan);
+  assert(limits.global_wrs == 96);
+  assert(limits.per_peer_wrs == 24);
+  assert(limits.per_peer_pairs == 12);
+
+  std::array<std::uint32_t, 5> wrs{};
+  std::array<std::uint32_t, 5> pairs{};
+  memory_node_detail::PeerRdmaSnapshotDispatchQuota quota;
+  quota.reset(limits, wrs, pairs);
+
+  // Twelve dynamic snapshots consume the complete 24-WR window of one peer.
+  for (std::uint32_t item = 0; item < 12; ++item) {
+    assert(quota.try_accept(0, 2, true));
+  }
+  assert(!quota.try_accept(0, 2, true));
+  assert(!quota.try_accept(0, 1, false));
+  assert(wrs[0] == 24 && pairs[0] == 12);
+
+  // Immutable base snapshots use one WR and another peer's independent
+  // window. Duplicate/local consumers cost zero remote credit.
+  for (std::uint32_t item = 0; item < 24; ++item) {
+    assert(quota.try_accept(1, 1, false));
+  }
+  assert(wrs[1] == 24 && pairs[1] == 0);
+  assert(quota.try_accept(
+    std::numeric_limits<std::uint32_t>::max(), 0, false));
+}
+
+void test_vector_collector_admits_base_and_dynamic_in_same_mixed_wave() {
+  const auto plan = derive_peer_rdma_read_credit_plan(
+    8, 4, 4, 16, 4096, 4096, 80);
+  std::array<std::uint32_t, 5> wrs{};
+  std::array<std::uint32_t, 5> pairs{};
+  memory_node_detail::PeerRdmaVectorSnapshotDispatchQuota quota;
+  quota.reset(
+    true, peer_rdma_snapshot_dispatch_limits(plan),
+    peer_rdma_read_dispatch_limits(plan), wrs, pairs);
+
+  // One immutable base body and one dynamic body/after-header pair belong to
+  // the same destination and the same collector wave.  The combined charge
+  // is three WRs, not two logical candidates and not two full pairs.
+  assert(quota.try_accept(2, true, false));
+  assert(quota.try_accept(2, true, true));
+  assert(quota.mixed_snapshots);
+  assert(quota.mixed.global_wrs == 3);
+  assert(wrs[2] == 3);
+  assert(pairs[2] == 1);
+
+  // A second logical consumer of either selected pointer adds no transport
+  // work and remains admissible without changing the finite wave.
+  assert(quota.try_accept(2, false, true));
+  assert(quota.mixed.global_wrs == 3);
+  assert(wrs[2] == 3 && pairs[2] == 1);
+}
+
+void test_mixed_snapshot_pair_capacity_rounds_down_each_qp() {
+  const memory_node_detail::PeerRdmaReadCreditPlan odd_qp{
+    .data_qps_per_peer = 3,
+    .per_qp = 7,
+    .per_peer = 21,
+    .global = 63,
+    .shared_cq_read_budget = 63,
+  };
+  const auto limits = peer_rdma_snapshot_dispatch_limits(odd_qp);
+  assert(limits.per_peer_wrs == 21);
+  assert(limits.per_peer_pairs == 9);
+
+  std::array<std::uint32_t, 3> wrs{};
+  std::array<std::uint32_t, 3> pairs{};
+  memory_node_detail::PeerRdmaSnapshotDispatchQuota quota;
+  quota.reset(limits, wrs, pairs);
+  for (std::uint32_t item = 0; item < 9; ++item) {
+    assert(quota.try_accept(0, 2, true));
+  }
+  // Three odd QP remainders can hold singles, but cannot be combined into a
+  // tenth ordered pair.
+  assert(!quota.try_accept(0, 2, true));
+  for (std::uint32_t item = 0; item < 3; ++item) {
+    assert(quota.try_accept(0, 1, false));
+  }
+  assert(wrs[0] == 21 && pairs[0] == 9);
+}
+
+void test_mixed_snapshot_chain_orders_only_dynamic_after_headers() {
+  constexpr std::array<std::uint32_t, 2> dynamic_indices{0, 2};
+  static_assert(peer_rdma_snapshot_work_request_count(4, 2) == 6);
+  for (std::uint32_t wr = 0; wr < 4; ++wr) {
+    const auto item = peer_rdma_snapshot_chain_item(
+      wr, 4, dynamic_indices);
+    assert(item.snapshot_index == wr);
+    assert(!item.after_header);
+  }
+  const auto first_after = peer_rdma_snapshot_chain_item(
+    4, 4, dynamic_indices);
+  const auto second_after = peer_rdma_snapshot_chain_item(
+    5, 4, dynamic_indices);
+  assert(first_after.after_header && first_after.snapshot_index == 0);
+  assert(second_after.after_header && second_after.snapshot_index == 2);
+}
+
 void test_group_reservation_rolls_back_every_partial_domain() {
   const memory_node_detail::PeerRdmaReadCreditPlan plan{
     .data_qps_per_peer = 1,
@@ -381,6 +528,11 @@ int main() {
   test_linked_read_batches_stay_inside_every_credit_domain();
   test_ordered_snapshot_pairs_never_split_a_credit_chain();
   test_ordered_pair_wave_rounds_down_each_qp_before_aggregation();
+  test_multi_peer_dispatch_uses_global_and_per_peer_quotas();
+  test_mixed_snapshot_dispatch_charges_bodies_and_dynamic_validation();
+  test_vector_collector_admits_base_and_dynamic_in_same_mixed_wave();
+  test_mixed_snapshot_pair_capacity_rounds_down_each_qp();
+  test_mixed_snapshot_chain_orders_only_dynamic_after_headers();
   test_group_reservation_rolls_back_every_partial_domain();
   test_sync_and_async_reads_share_the_global_window();
   test_concurrent_group_reservation_never_overcommits();

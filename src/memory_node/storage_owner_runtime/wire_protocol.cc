@@ -1,5 +1,6 @@
 #include <stdexcept>
 
+#include "memory_node/peer_rpc/stage1_control_fanout_policy.hh"
 #include "memory_node/storage_owner_runtime/detail.hh"
 
 using namespace memory_node_storage_owner_runtime_detail;
@@ -269,6 +270,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     bool active{};
     bool committed_replay{};
     bool authority_committed{};
+    bool fused_stage1{};
   };
   vec<MutationPlan> plans(item_count);
   dense_hashmap_t<u32, vec<size_t>> stage1_groups;
@@ -347,10 +349,10 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     plan.stage1_item = Stage1ExecuteItem{
       .client_batch_id = client_batch_id,
       .old_raw = plan.begin.previous.current.raw_address,
-      // Execute prepares the query-visible local node and continuation only.
-      // Arm is a separate, batch-atomic control transaction; fusing arm here
-      // lets a multi-item execute RPC partially consume the completion window
-      // before its authority can receive any sequence and commit the leases.
+      // The complete physical-home subgroup below decides whether this stays
+      // a legacy prepare or carries a fresh-insert fused-arm request. Starting
+      // at zero prevents an individual item from opting into fusion before
+      // the subgroup's cleanup dependency has been checked.
       .initial_placement_version = 0,
       .source_client = source_client,
       .item_index = static_cast<u32>(index),
@@ -360,6 +362,30 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       .authority_shard = storage_id_,
     };
     stage1_groups[plan.stage1_home].push_back(index);
+  }
+
+  // Fuse prepare and bounded Stage2 admission only when the complete
+  // physical-home subgroup consists of fresh inserts. A mixed insert/upsert
+  // subgroup stays on the legacy prepare -> cleanup -> arm path so the old
+  // generation is never retired after its successor becomes runnable.
+  for (const auto& [home, indices] : stage1_groups) {
+    (void)home;
+    const bool fused = std::all_of(
+      indices.begin(), indices.end(), [&](const size_t index) {
+        const MutationPlan& plan = plans[index];
+        return plan.kind == MutationKind::insert &&
+          plan.begin.previous.current.is_null();
+      });
+    if (!fused) continue;
+    for (const size_t index : indices) {
+      MutationPlan& plan = plans[index];
+      lib_assert(plan.begin.previous.placement_version !=
+                   std::numeric_limits<u64>::max(),
+                 "authority placement version overflow");
+      plan.fused_stage1 = true;
+      plan.stage1_item.initial_placement_version =
+        plan.begin.previous.placement_version + 1;
+    }
   }
 
   // Group each item by its one centroid-selected home. Distinct remote-home
@@ -440,6 +466,66 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
       } while (plans[index].stage1_result.status ==
                static_cast<u32>(MutationStatus::retry));
     }
+
+    vec<size_t> fused_indices;
+    vec<Stage1ArmItem> fused_items;
+    fused_indices.reserve(local_stage1_indices.size());
+    fused_items.reserve(local_stage1_indices.size());
+    for (const size_t index : local_stage1_indices) {
+      MutationPlan& plan = plans[index];
+      if (!plan.fused_stage1 ||
+          plan.stage1_result.status !=
+            static_cast<u32>(MutationStatus::ok)) {
+        continue;
+      }
+      fused_indices.push_back(index);
+      fused_items.push_back(Stage1ArmItem{
+        .token = plan.operation,
+        .target_raw = plan.stage1_result.target_raw,
+        .initial_placement_version =
+          plan.stage1_item.initial_placement_version,
+        .id = ids[index],
+        .generation = plan.begin.generation,
+        .action = static_cast<u32>(Stage1ArmAction::arm),
+      });
+    }
+    if (!fused_items.empty()) {
+      const auto arm_started = std::chrono::steady_clock::now();
+      for (;;) {
+        vec<Stage1ArmResult> arm_results;
+        (void)arm_local_stage1_items(
+          storage_id_, span<const Stage1ArmItem>{fused_items},
+          arm_results, config);
+        const auto disposition =
+          memory_node_peer_rpc_detail::classify_stage1_control_response(
+            span<const Stage1ArmItem>{fused_items},
+            span<const Stage1ArmResult>{arm_results});
+        if (disposition == memory_node_peer_rpc_detail::
+              Stage1ControlResponseDisposition::resolved) {
+          for (size_t slot = 0; slot < fused_indices.size(); ++slot) {
+            MutationPlan& plan = plans[fused_indices[slot]];
+            plan.arm_result = arm_results[slot];
+            plan.stage1_result.maintenance_sequence =
+              arm_results[slot].maintenance_sequence;
+          }
+          break;
+        }
+        if (disposition == memory_node_peer_rpc_detail::
+              Stage1ControlResponseDisposition::malformed) {
+          throw std::runtime_error(
+            "local fused Stage1 arm returned a malformed result");
+        }
+        if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+          finish_local_timing();
+          return false;
+        }
+        std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+        storage_owner_maintenance_cv_.wait_for(
+          lock, std::chrono::microseconds(100));
+      }
+      breakdown.storage_owner_stage1_arm_wait_ns +=
+        elapsed_ns_since(arm_started);
+    }
     finish_local_timing();
     return true;
   };
@@ -475,6 +561,22 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     for (size_t slot = 0; slot < indices.size(); ++slot) {
       plans[indices[slot]].stage1_result = found->second[slot];
     }
+  }
+  for (size_t index = 0; index < item_count; ++index) {
+    MutationPlan& plan = plans[index];
+    if (!plan.fused_stage1 ||
+        plan.stage1_result.status !=
+          static_cast<u32>(MutationStatus::ok)) {
+      continue;
+    }
+    lib_assert(plan.stage1_result.maintenance_sequence != 0,
+               "fused Stage1 success omitted its runnable maintenance fence");
+    plan.arm_result = Stage1ArmResult{
+      .token = plan.operation,
+      .target_raw = plan.stage1_result.target_raw,
+      .maintenance_sequence = plan.stage1_result.maintenance_sequence,
+      .status = static_cast<u32>(MutationStatus::ok),
+    };
   }
 
   const auto control_stage1 = [&](size_t index, Stage1ArmAction action,
@@ -712,11 +814,14 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
   };
 
-  // Cleanup-only mutations do not participate in a Stage1 arm group. Commit
-  // them now so they cannot retain authority leases while an unrelated home
-  // waits for completion credit.
+  // Cleanup-only mutations do not participate in a Stage1 arm group. Fresh
+  // fused inserts already crossed their physical home's bounded admission
+  // transaction in the Execute response. Commit both now so neither retains
+  // an authority lease while an unrelated legacy home waits for credit.
   for (size_t index = 0; index < item_count; ++index) {
-    if (plans[index].active && plans[index].kind == MutationKind::erase) {
+    if (plans[index].active &&
+        (plans[index].kind == MutationKind::erase ||
+         plans[index].fused_stage1)) {
       commit_plan(index);
     }
   }
@@ -730,7 +835,10 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   dense_hashmap_t<u32, vec<Stage1ArmItem>> arm_items_by_home;
   for (size_t index = 0; index < item_count; ++index) {
     MutationPlan& plan = plans[index];
-    if (!plan.active || plan.kind == MutationKind::erase) continue;
+    if (!plan.active || plan.kind == MutationKind::erase ||
+        plan.fused_stage1) {
+      continue;
+    }
     arm_groups[plan.stage1_home].push_back(index);
     lib_assert(plan.begin.previous.placement_version !=
                  std::numeric_limits<u64>::max(),

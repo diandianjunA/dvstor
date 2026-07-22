@@ -169,17 +169,16 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   const size_t per_lane_peak_rdma_wrs =
     stage2_search_lane_peak_rdma_wrs(
       snapshot_batch, ordinary_wave_limit, ordered_pair_wave_limit);
-  // Every Stage2 continuation can make progress with one ordinary graph or
-  // snapshot READ.  Lane ownership does not reserve that credit: the actual
-  // (possibly much larger) wave is admitted transactionally by the shared
-  // per-QP/per-peer/global credit manager.  Keeping all bounded contexts
-  // schedulable lets smaller independent waves fill the HCA while denied
-  // lanes remain ready instead of consuming transport state.
-  constexpr size_t minimum_schedulable_chain_rdma_wrs = 1;
+  // Size registered continuation scratch as a bounded double buffer around a
+  // useful peak wave. One lane can wait on the HCA while another context on the
+  // same worker prepares/runs; actual WR ownership is still admitted by the
+  // shared per-QP/per-peer/global credit manager.
+  const size_t useful_lane_wave_rdma_wrs =
+    std::max<size_t>(1, per_lane_peak_rdma_wrs);
   const size_t global_search_lane_count =
     stage2_global_search_lane_count(
       worker_count, contexts_per_worker,
-      minimum_schedulable_chain_rdma_wrs,
+      useful_lane_wave_rdma_wrs,
       peer_credit_plan.global);
   lib_assert(global_search_lane_count >= worker_count,
              "global Stage2 lane allocation starved a maintenance worker");
@@ -231,8 +230,8 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                std::to_string(graph_stride) + " batch=" +
                std::to_string(snapshot_batch) + " lane_peak_rdma_wrs=" +
                std::to_string(per_lane_peak_rdma_wrs) +
-               " lane_min_chain_rdma_wrs=" +
-               std::to_string(minimum_schedulable_chain_rdma_wrs) +
+               " lane_useful_wave_rdma_wrs=" +
+               std::to_string(useful_lane_wave_rdma_wrs) +
                " global_read_window=" +
                std::to_string(peer_credit_plan.global) +
                " search_lanes_global=" +
@@ -668,7 +667,8 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(
                  storage_worker_config_ != nullptr
                    ? static_cast<double>(
-                       storage_worker_config_->storage_owner_batch_max_wait_us) /
+                       storage_worker_config_->
+                         storage_owner_stage2_batch_max_wait_us) /
                        1000.0
                    : 0.0) +
                " stage2_rate_per_sec=" +

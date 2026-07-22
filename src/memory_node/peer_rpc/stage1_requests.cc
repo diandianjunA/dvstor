@@ -1,4 +1,5 @@
 #include "memory_node/peer_rpc/detail.hh"
+#include "memory_node/peer_rpc/stage1_control_fanout_policy.hh"
 
 namespace authority = memory_node_storage_owner_index_detail;
 
@@ -19,7 +20,8 @@ MemoryNode::prepare_local_stage1_item(
   if (raw_vector == nullptr || authority_shard >= num_storage_nodes_ ||
       item.authority_shard != authority_shard || item.generation == 0 ||
       (kind != MutationKind::insert && kind != MutationKind::upsert) ||
-      item.initial_placement_version != 0) {
+      (memory_node_peer_rpc_detail::stage1_execute_uses_fused_arm(item) &&
+       !memory_node_peer_rpc_detail::valid_fused_stage1_execute_item(item))) {
     result.status = static_cast<u32>(MutationStatus::failed);
     return result;
   }
@@ -202,10 +204,10 @@ MemoryNode::prepare_and_maybe_arm_local_stage1_item(
     const Configuration& config,
     InsertBreakdownCounters* breakdown) {
   using namespace service::storage_owner;
-  // Stage1 execute is deliberately prepare-only.  A multi-item execute RPC
-  // cannot safely arm item-by-item because its authority receives no sequence
-  // until the whole response is returned.  The subsequent homogeneous arm
-  // RPC reserves all new completion credits atomically.
+  // Keep the per-item helper prepare-only. The Execute request handler may
+  // subsequently arm a homogeneous fresh-insert batch in one atomic bounded
+  // admission operation; legacy upsert batches retain their standalone
+  // cleanup -> arm ordering.
   return prepare_local_stage1_item(
     authority_shard, item, raw_vector, config, breakdown);
 }
@@ -288,12 +290,92 @@ bool MemoryNode::handle_peer_stage1_execute_request(
   const byte_t* vectors = stage1_execute_vectors(
     payload, header.item_count);
 
+  vec<size_t> fused_result_indices;
+  vec<Stage1ArmItem> fused_arm_items;
+  fused_result_indices.reserve(header.item_count);
+  fused_arm_items.reserve(header.item_count);
+  bool fused_prepare_retry = false;
+
   for (u32 index = 0; index < header.item_count; ++index) {
     const Stage1ExecuteItem& item = items[index];
     const byte_t* raw_vector = vectors +
       static_cast<size_t>(index) * VamanaNode::vector_bytes();
     output[index] = prepare_and_maybe_arm_local_stage1_item(
       source_shard, item, raw_vector, config);
+    if (!memory_node_peer_rpc_detail::stage1_execute_uses_fused_arm(item)) {
+      continue;
+    }
+    if (output[index].status == static_cast<u32>(MutationStatus::retry)) {
+      fused_prepare_retry = true;
+      continue;
+    }
+    if (output[index].status == static_cast<u32>(MutationStatus::ok)) {
+      fused_result_indices.push_back(index);
+      fused_arm_items.push_back(Stage1ArmItem{
+        .token = {
+          .source_client = item.source_client,
+          .item_index = item.item_index,
+          .client_batch_id = item.client_batch_id,
+        },
+        .target_raw = output[index].target_raw,
+        .initial_placement_version = item.initial_placement_version,
+        .id = item.id,
+        .generation = item.generation,
+        .action = static_cast<u32>(Stage1ArmAction::arm),
+      });
+    }
+  }
+
+  if (fused_prepare_retry) {
+    // Do not let the ready prefix consume Stage2 completion credits while the
+    // authority still lacks a response for another item in this transaction.
+    // Cached prepares make retrying the complete semantic request cheap.
+    for (u32 index = 0; index < header.item_count; ++index) {
+      if (memory_node_peer_rpc_detail::stage1_execute_uses_fused_arm(
+            items[index])) {
+        memory_node_peer_rpc_detail::
+          defer_fused_stage1_success_for_atomic_retry(output[index]);
+      }
+    }
+  } else if (!fused_arm_items.empty()) {
+    vec<Stage1ArmResult> arm_results;
+    const bool armed = arm_local_stage1_items(
+      source_shard, span<const Stage1ArmItem>{fused_arm_items},
+      arm_results, config);
+    const bool complete_results =
+      arm_results.size() == fused_arm_items.size();
+    for (size_t slot = 0; slot < fused_result_indices.size(); ++slot) {
+      Stage1ExecuteResult& execute = output[fused_result_indices[slot]];
+      if (!complete_results) {
+        execute.maintenance_sequence = 0;
+        execute.status = static_cast<u32>(MutationStatus::failed);
+        continue;
+      }
+      const Stage1ArmItem& arm = fused_arm_items[slot];
+      const Stage1ArmResult& result = arm_results[slot];
+      const bool same_token =
+        result.token.source_client == arm.token.source_client &&
+        result.token.item_index == arm.token.item_index &&
+        result.token.client_batch_id == arm.token.client_batch_id;
+      if (!same_token || result.target_raw != arm.target_raw ||
+          result.reserved != 0 ||
+          result.status > static_cast<u32>(MutationStatus::retry) ||
+          (result.status == static_cast<u32>(MutationStatus::ok) &&
+           result.maintenance_sequence == 0) ||
+          (result.status != static_cast<u32>(MutationStatus::ok) &&
+           result.maintenance_sequence != 0)) {
+        execute.maintenance_sequence = 0;
+        execute.status = static_cast<u32>(MutationStatus::failed);
+        continue;
+      }
+      execute.maintenance_sequence = result.maintenance_sequence;
+      execute.status = result.status;
+    }
+    (void)armed;
+  }
+
+  response_header->status = static_cast<u32>(InsertStatus::ok);
+  for (u32 index = 0; index < header.item_count; ++index) {
     if (output[index].status != static_cast<u32>(MutationStatus::ok)) {
       response_header->status = static_cast<u32>(InsertStatus::overloaded);
     }

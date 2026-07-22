@@ -148,7 +148,7 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
     .peer_reverse_remaining =
       parse_u64(fields, "peer_reverse_remaining").value_or(0),
     .failed = failed.value_or(0),
-    .peer_reverse_failed = peer_reverse_failed.value_or(0),
+    .peer_reverse_retry_attempts = peer_reverse_failed.value_or(0),
     .admission_window = admission_window.value_or(0),
     .completion_outstanding = completion_outstanding.value_or(0),
     .stage2_continuations = stage2_continuations.value_or(0),
@@ -173,7 +173,8 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
       fields.at("p99_stage2_delay_over_30s") == "true",
     .stage2_delay_histogram = histogram.value_or(
       std::array<uint64_t, kMaintenanceLatencyBucketCount>{}),
-    .failure_counters_available = failed.has_value() &&
+    .failure_counters_available = failed.has_value(),
+    .peer_reverse_retry_counter_available =
       peer_reverse_failed.has_value(),
     .stage2_delay_histogram_available = histogram.has_value(),
     .completion_window_available = admission_window.has_value() &&
@@ -379,12 +380,21 @@ MaintenanceLogSummary summarize_impl(
         cursor.baseline.failure_counters_available &&
         latest.failure_counters_available) {
       uint64_t failed_delta = 0;
-      uint64_t peer_failed_delta = 0;
-      if (counter_delta(cursor.baseline.failed, latest.failed, &failed_delta) &&
-          counter_delta(cursor.baseline.peer_reverse_failed,
-                        latest.peer_reverse_failed, &peer_failed_delta)) {
+      if (counter_delta(cursor.baseline.failed, latest.failed,
+                        &failed_delta)) {
         ++summary.logs_with_failure_deltas;
-        summary.failures += failed_delta + peer_failed_delta;
+        summary.failures += failed_delta;
+      }
+    }
+
+    if (!slice.rotated && cursor.baseline_available &&
+        cursor.baseline.peer_reverse_retry_counter_available &&
+        latest.peer_reverse_retry_counter_available) {
+      uint64_t retry_delta = 0;
+      if (counter_delta(cursor.baseline.peer_reverse_retry_attempts,
+                        latest.peer_reverse_retry_attempts, &retry_delta)) {
+        ++summary.logs_with_peer_reverse_retry_deltas;
+        summary.peer_reverse_retry_attempts += retry_delta;
       }
     }
 
@@ -466,6 +476,8 @@ MaintenanceLogSummary summarize_impl(
     summary.logs_with_slope_observations == summary.requested_logs;
   summary.failure_delta_available = summary.requested_logs != 0 &&
     summary.logs_with_failure_deltas == summary.requested_logs;
+  summary.peer_reverse_retry_delta_available = summary.requested_logs != 0 &&
+    summary.logs_with_peer_reverse_retry_deltas == summary.requested_logs;
   summary.completion_window_available = summary.requested_logs != 0 &&
     summary.logs_with_completion_window == summary.requested_logs;
   summary.locality_delta_available = summary.requested_logs != 0 &&
@@ -585,12 +597,16 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
       latest.completion_outstanding);
 
     uint64_t failed = 0;
-    uint64_t peer_failed = 0;
-    if (counter_delta(first.failed, latest.failed, &failed) &&
-        counter_delta(first.peer_reverse_failed,
-                      latest.peer_reverse_failed, &peer_failed)) {
+    if (counter_delta(first.failed, latest.failed, &failed)) {
       ++summary.logs_with_failure_deltas;
-      summary.failures += failed + peer_failed;
+      summary.failures += failed;
+    }
+    uint64_t peer_reverse_retries = 0;
+    if (counter_delta(first.peer_reverse_failed,
+                      latest.peer_reverse_failed,
+                      &peer_reverse_retries)) {
+      ++summary.logs_with_peer_reverse_retry_deltas;
+      summary.peer_reverse_retry_attempts += peer_reverse_retries;
     }
 
     std::array<uint64_t, kMaintenanceLatencyBucketCount> latency_delta{};
@@ -661,6 +677,8 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
     summary.logs_with_slope_observations == summary.requested_logs;
   summary.failure_delta_available = summary.requested_logs != 0 &&
     summary.logs_with_failure_deltas == summary.requested_logs;
+  summary.peer_reverse_retry_delta_available = summary.requested_logs != 0 &&
+    summary.logs_with_peer_reverse_retry_deltas == summary.requested_logs;
   summary.completion_window_available = summary.requested_logs != 0 &&
     summary.logs_with_completion_window == summary.requested_logs;
   summary.locality_delta_available = summary.requested_logs != 0 &&

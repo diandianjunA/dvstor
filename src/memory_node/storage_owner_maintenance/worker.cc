@@ -3131,7 +3131,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       stage2_batch_ready(
         storage_owner_stage2_tasks_.size(), batch_limit,
         storage_owner_stage2_tasks_.front().queued_at, admission_now,
-        config.storage_owner_batch_max_wait_us);
+        config.storage_owner_stage2_batch_max_wait_us);
     const bool choose_stage2 =
       stage2_ready &&
       (!cleanup_ready || storage_owner_stage2_tasks_.front().queued_at <=
@@ -3277,7 +3277,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           storage_owner_stage2_tasks_.size(),
           std::max<size_t>(1, config.storage_owner_batch_max),
           storage_owner_stage2_tasks_.front().queued_at,
-          config.storage_owner_batch_max_wait_us);
+          config.storage_owner_stage2_batch_max_wait_us);
         if (batch_deadline.has_value() && *batch_deadline < wake_at) {
           wake_at = *batch_deadline;
         }

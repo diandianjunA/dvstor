@@ -7,53 +7,24 @@
 namespace compute_service_detail {
 
 struct StorageOwnerBatchDecision {
-  bool idle_flush{};
+  bool tail_escape{};
   bool max_wait_flush{};
   u32 take{};
 };
 
-inline constexpr u32 kStorageOwnerAmortizedBatchFloor = 4;
-
-// Spread one already-admitted dispatch epoch over the transport credits that
-// are available now. Greedily putting batch_max items into the first free RPC
-// serializes their storage-side Stage1 work and can leave every other lane
-// idle. Conversely, spreading a small epoch over every free credit destroys
-// the storage-side execute/arm/release batching. Keep an amortized four-item
-// floor whenever enough work exists; fewer than four items are sent only for a
-// finite tail. ceil(ready/free) then grows naturally above that floor when the
-// current credit window could not otherwise carry the epoch.
-inline u32 balanced_storage_owner_batch_take(
-    u32 ready_tasks, u32 free_rpc_slots, u32 batch_max) {
-  if (ready_tasks == 0 || free_rpc_slots == 0 || batch_max == 0) return 0;
-  const u32 fair_share =
-    ready_tasks / free_rpc_slots + (ready_tasks % free_rpc_slots != 0);
-  return std::min({
-    ready_tasks,
-    batch_max,
-    std::max(kStorageOwnerAmortizedBatchFloor, fair_share),
-  });
-}
-
-// An idle partial tail has no latency to hide behind another request and must
-// retain all available batching: send it once rather than fragmenting it over
-// empty lanes. Full or non-idle epochs use the amortized balanced policy above.
-inline u32 storage_owner_dispatch_epoch_take(
-    u32 ready_tasks,
-    u32 free_rpc_slots,
-    u32 batch_max,
-    bool idle_flush) {
-  if (ready_tasks == 0 || free_rpc_slots == 0 || batch_max == 0) return 0;
-  if (idle_flush) return std::min(ready_tasks, batch_max);
-  return balanced_storage_owner_batch_take(
-    ready_tasks, free_rpc_slots, batch_max);
-}
-
-// A successful dequeue closes the current batching epoch. Remaining published
-// credit belongs to a new epoch; carrying the old timestamp forward would make
-// every later partial batch permanently expired under continuous load.
-inline u64 rearm_storage_owner_batch_wait(
-    u32 remaining_published_tasks, u64 dequeued_at_ns) {
-  return remaining_published_tasks == 0 ? 0 : dequeued_at_ns;
+// A partial visible dequeue stopped at an MPMC publication hole.  The credit
+// behind that hole belongs to the same (possibly already expired) batch, so it
+// must inherit the old timestamp.  Only a completely consumed prefix starts a
+// new tail's coalescing interval.
+inline u64 next_storage_owner_batch_observed_ns(
+    u64 previous_observed_ns,
+    u32 remaining_tasks,
+    u32 dequeued_tasks,
+    u32 requested_tasks,
+    u64 dequeued_at_ns) {
+  if (remaining_tasks == 0) return 0;
+  return dequeued_tasks < requested_tasks
+    ? previous_observed_ns : dequeued_at_ns;
 }
 
 // Queue::push_wait() is linearizable, but a Vyukov MPMC producer reserves its
@@ -85,13 +56,13 @@ inline u32 dequeue_storage_owner_visible_prefix(
 // policy that waits for a full batch can strand a finite tail forever while
 // unrelated RPCs or producers remain active.
 //
-// Form a bounded microbatch instead. A full batch is always ready immediately.
-// An actually idle, isolated tail also progresses immediately. Otherwise the
-// oldest observed published task supplies a hard deadline; a zero maximum wait
-// flushes every visible tail immediately. This function only
-// decides whether the single CQ/progress thread should attempt a dequeue; the
-// external published count remains a hint and dequeue must still consume only
-// the queue-visible FIFO prefix.
+// Keep the policy deliberately conventional: a full batch is sent immediately;
+// an isolated tail is sent immediately; a concurrent partial batch waits only
+// until a hard maximum latency.  Crucially, an admitted tail is kept intact in
+// one RPC.  Dividing it by the number of free slots creates a closed-loop
+// collapse in which synchronous callers return one by one and every later RPC
+// is another singleton.  Multiple full/expired batches may still occupy
+// independent RPC slots, preserving storage-side request parallelism.
 inline StorageOwnerBatchDecision decide_storage_owner_batch(
     u32 ready_tasks,
     u32 active_rpcs,
@@ -107,23 +78,21 @@ inline StorageOwnerBatchDecision decide_storage_owner_batch(
   }
 
   if (ready_tasks >= batch_max) {
-    return {.take = storage_owner_dispatch_epoch_take(
-              ready_tasks, free_rpc_slots, batch_max, false)};
+    return {.take = batch_max};
   }
 
-  const bool idle_flush = active_rpcs == 0 && pending_producers == 0;
-  const bool max_wait_flush = !idle_flush &&
+  const bool isolated_tail = active_rpcs == 0 && pending_producers == 0;
+  const bool max_wait_flush = !isolated_tail &&
     (max_wait_ns == 0 ||
      (oldest_ready_since_ns != 0 &&
       now_ns >= oldest_ready_since_ns &&
       now_ns - oldest_ready_since_ns >= max_wait_ns));
-  if (!idle_flush && !max_wait_flush) return {};
+  if (!isolated_tail && !max_wait_flush) return {};
 
   return {
-    .idle_flush = idle_flush,
+    .tail_escape = isolated_tail,
     .max_wait_flush = max_wait_flush,
-    .take = storage_owner_dispatch_epoch_take(
-      ready_tasks, free_rpc_slots, batch_max, idle_flush),
+    .take = std::min(ready_tasks, batch_max),
   };
 }
 

@@ -198,6 +198,34 @@ void test_stage2_vector_snapshot_validation_matches_stable_search() {
     pointer.incarnation() + 1);
   assert(!detail::stable_vector_snapshot_valid(
     pointer, stable, replacement, pointer.incarnation() + 1));
+
+  // A single header observation is deliberately insufficient for a dynamic
+  // slot: its body could have started with the old identity and ended with a
+  // replacement vector after reuse. The ordered after-header changes the
+  // classification from an apparent stable old identity to retryable.
+  assert(detail::classify_stable_node_snapshot(
+           pointer, stable, stable, pointer.incarnation()) ==
+         detail::StableNodeSnapshotState::stable);
+  assert(detail::classify_stable_node_snapshot(
+           pointer, stable, replacement, pointer.incarnation()) ==
+         detail::StableNodeSnapshotState::retryable);
+
+  // For an immutable incarnation-zero base payload, one unlocked live header
+  // is a valid linearization point. Lifecycle flags retain the same policy as
+  // the paired path; NODE_LOCK is contention and deletion is terminal.
+  const RemotePtr base{kPartition, 8192, 0};
+  const u64 base_live = VamanaNode::make_header(0);
+  assert(detail::classify_stable_node_snapshot(
+           base, base_live, base_live, 0) ==
+         detail::StableNodeSnapshotState::stable);
+  assert(detail::classify_stable_node_snapshot(
+           base, base_live | VamanaNode::HEADER_NODE_LOCK,
+           base_live | VamanaNode::HEADER_NODE_LOCK, 0) ==
+         detail::StableNodeSnapshotState::retryable);
+  assert(detail::classify_stable_node_snapshot(
+           base, base_live | VamanaNode::HEADER_DELETED,
+           base_live | VamanaNode::HEADER_DELETED, 0) ==
+         detail::StableNodeSnapshotState::terminal);
 }
 
 void test_transient_node_snapshot_is_retryable_not_terminal() {

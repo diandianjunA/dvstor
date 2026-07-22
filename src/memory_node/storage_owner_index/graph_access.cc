@@ -1161,28 +1161,54 @@ size_t MemoryNode::read_node_snapshots_batched_into(
       std::this_thread::yield();
     }
 
-    // Reuse each registered snapshot buffer for a second header read after
-    // saving its identity fields. Equality with the first header closes the
-    // RDMA overwrite window without allocating another registered scratch
-    // plane. Even a locked/mismatched first header receives this validation
-    // read, because only an unchanged unlocked mismatch is terminal; a changing
-    // record is retryable.
+    // A structurally verified base record has an immutable identity/vector
+    // payload, so its first unlocked body header is already a linearization
+    // point. Dynamic slots can be recycled while this READ crosses the body;
+    // retain their second header read after saving the first identity fields.
+    // Equality closes that overwrite window without another scratch plane.
     read_requests.clear();
+    size_t dynamic_count = 0;
     for (PendingRead& read : pending) {
       read.before = *reinterpret_cast<const u64*>(read.buffer);
       read.slot_incarnation = *reinterpret_cast<const u32*>(
         read.buffer + VamanaNode::offset_slot_incarnation());
+      if (VamanaNode::immutable_base_record(read.rptr)) {
+        const StableNodeSnapshotState disposition =
+          classify_physical_node_snapshot(
+            read.rptr, read.before, read.before,
+            read.slot_incarnation);
+        if (disposition == StableNodeSnapshotState::stable) {
+          NodeSnapshot& snapshot = next_snapshot();
+          lib_assert(parse_remote_snapshot(
+                       read.rptr, read.buffer, snapshot),
+                     "immutable base snapshot failed to parse");
+          set_state(read.input_index, StableNodeSnapshotState::stable);
+          ++snapshot_count;
+        } else {
+          set_state(read.input_index, disposition);
+        }
+        continue;
+      }
+      if (dynamic_count !=
+          static_cast<size_t>(&read - pending.data())) {
+        pending[dynamic_count] = read;
+      }
+      PendingRead& dynamic = pending[dynamic_count++];
       read_requests.push_back(PeerReadRequest{
-        .shard_id = read.rptr.memory_node(),
-        .remote_offset = read.rptr.byte_offset(),
-        .destination = read.buffer,
+        .shard_id = dynamic.rptr.memory_node(),
+        .remote_offset = dynamic.rptr.byte_offset(),
+        .destination = dynamic.buffer,
         .bytes = VamanaNode::HEADER_SIZE,
       });
     }
-    post_peer_reads_async(*thread, span<const PeerReadRequest>{read_requests});
-    while (!thread->is_ready(thread->running_coroutine)) {
-      poll_peer_send_cq();
-      std::this_thread::yield();
+    pending.resize(dynamic_count);
+    if (!read_requests.empty()) {
+      post_peer_reads_async(
+        *thread, span<const PeerReadRequest>{read_requests});
+      while (!thread->is_ready(thread->running_coroutine)) {
+        poll_peer_send_cq();
+        std::this_thread::yield();
+      }
     }
     for (const PendingRead& read : pending) {
       const u64 after = *reinterpret_cast<const u64*>(read.buffer);

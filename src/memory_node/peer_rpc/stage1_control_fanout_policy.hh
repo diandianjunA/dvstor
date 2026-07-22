@@ -4,6 +4,55 @@
 
 namespace memory_node_peer_rpc_detail {
 
+inline bool stage1_execute_uses_fused_arm(
+    const service::storage_owner::Stage1ExecuteItem& item) noexcept {
+  return item.initial_placement_version != 0;
+}
+
+// Fresh inserts have no old-generation cleanup dependency.  They may
+// therefore reserve their bounded Stage2 sequence in the same physical-home
+// transaction that prepares the local graph node.  Upserts must keep the
+// standalone cleanup -> arm ordering even if a malformed sender supplies a
+// non-zero placement version.
+inline bool valid_fused_stage1_execute_item(
+    const service::storage_owner::Stage1ExecuteItem& item) noexcept {
+  using namespace service::storage_owner;
+  return stage1_execute_uses_fused_arm(item) && item.old_raw == 0 &&
+    static_cast<MutationKind>(item.kind) == MutationKind::insert;
+}
+
+// A successful legacy prepare owns no maintenance sequence.  Conversely, a
+// successful fused prepare is authority-committable only when the response
+// proves that the physical home already owns a runnable bounded Stage2 task.
+// Retry/terminal prepare results are checked by their caller and intentionally
+// carry no such proof.
+inline bool stage1_execute_success_has_expected_fence(
+    const service::storage_owner::Stage1ExecuteItem& input,
+    const service::storage_owner::Stage1ExecuteResult& output) noexcept {
+  using namespace service::storage_owner;
+  if (output.status != static_cast<u32>(MutationStatus::ok)) {
+    return output.maintenance_sequence == 0;
+  }
+  if (stage1_execute_uses_fused_arm(input)) {
+    return valid_fused_stage1_execute_item(input) &&
+      output.maintenance_sequence != 0;
+  }
+  return output.maintenance_sequence == 0;
+}
+
+// When one prepare in a fused home batch is transiently unready, already
+// successful prepares must wait for the batch-atomic ARM retry. A terminal
+// prepare failure is not transient and must remain visible; rewriting it to
+// retry could turn an allocation or graph-publication failure into an
+// unbounded retry loop.
+inline void defer_fused_stage1_success_for_atomic_retry(
+    service::storage_owner::Stage1ExecuteResult& output) noexcept {
+  using namespace service::storage_owner;
+  if (output.status != static_cast<u32>(MutationStatus::ok)) return;
+  output.maintenance_sequence = 0;
+  output.status = static_cast<u32>(MutationStatus::retry);
+}
+
 enum class Stage1ControlResponseDisposition : u8 {
   resolved,
   retry,

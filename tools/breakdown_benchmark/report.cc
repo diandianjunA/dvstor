@@ -213,7 +213,14 @@ FormattedReport format_report(const nlohmann::json& root,
     }
     output << "  backlog_slope_per_sec: "
            << stage2.value("backlog_slope_per_sec", 0.0) << '\n';
-    output << "  failures: " << stage2.value("failures", 0ULL) << '\n';
+    output << "  failures (hard): "
+           << stage2.value("failures", 0ULL) << '\n';
+    output << "  peer_reverse_retry_attempts: ";
+    if (stage2.value("peer_reverse_retry_delta_available", false)) {
+      output << stage2.value("peer_reverse_retry_attempts", 0ULL) << '\n';
+    } else {
+      output << "unavailable\n";
+    }
     output << "  locality telemetry: ";
     if (stage2.value("locality_delta_available", false)) {
       output << "home_match_rate="

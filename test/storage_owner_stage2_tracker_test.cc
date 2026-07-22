@@ -450,34 +450,40 @@ void test_search_lane_budget_is_global_and_evenly_distributed() {
     detail::stage2_search_lane_peak_rdma_wrs(32, 96, 48);
   assert(peak == 64);
 
-  // Lane ownership is bounded continuation/scratch capacity, not a static
-  // reservation of peak wave credits. With 96 global credits, four workers
-  // and sixteen contexts each, every bounded context may own a lane even
-  // though only dynamically admitted waves can be in flight.
+  // Two lanes per worker retain one ready continuation while its peer waits on
+  // RDMA. Credits are admitted dynamically, so these lanes do not reserve two
+  // peak waves apiece.
   const std::size_t global =
-    detail::stage2_global_search_lane_count(4, 16, 1, 96);
-  assert(global == 64);
+    detail::stage2_global_search_lane_count(4, 16, peak, 96);
+  assert(global == 8);
   assert(global > 4);
   std::size_t distributed = 0;
   for (std::size_t worker = 0; worker < 4; ++worker) {
     const std::size_t lanes = detail::stage2_search_lanes_for_worker(
       worker, 4, 16, global);
-    assert(lanes == 16);
+    assert(lanes == 2);
     distributed += lanes;
   }
   assert(distributed == global);
 
+  // The production-shaped 224-WR window and 56-WR peak has four independent
+  // credit windows and exactly eight double-buffered lanes.
+  assert(detail::stage2_global_search_lane_count(4, 16, 56, 224) == 8);
+
   // A transport window smaller than worker_count still gives every executor
-  // one progress lane, while context capacity remains the hard upper bound.
-  assert(detail::stage2_global_search_lane_count(5, 16, 1, 3) == 5);
+  // two scheduling lanes when context capacity permits. A one-context worker
+  // remains correctly capped at one lane.
+  assert(detail::stage2_global_search_lane_count(5, 16, 1, 3) == 10);
   assert(detail::stage2_global_search_lane_count(5, 1, 1, 4096) == 5);
 
+  // Ceil the number of credit windows before doubling. Six one-WR windows are
+  // spread 3/3/2/2/2 rather than silently dropping the non-divisible tail.
   const std::size_t uneven =
-    detail::stage2_global_search_lane_count(5, 16, 1, 7);
-  assert(uneven == 7);
-  assert(detail::stage2_search_lanes_for_worker(0, 5, 16, uneven) == 2);
-  assert(detail::stage2_search_lanes_for_worker(1, 5, 16, uneven) == 2);
-  assert(detail::stage2_search_lanes_for_worker(2, 5, 16, uneven) == 1);
+    detail::stage2_global_search_lane_count(5, 16, 1, 6);
+  assert(uneven == 12);
+  assert(detail::stage2_search_lanes_for_worker(0, 5, 16, uneven) == 3);
+  assert(detail::stage2_search_lanes_for_worker(1, 5, 16, uneven) == 3);
+  assert(detail::stage2_search_lanes_for_worker(2, 5, 16, uneven) == 2);
 
   // Host-sized arithmetic must remain exact until the runtime performs its
   // explicit u32 transport-index check. The pool rejects the boundary before

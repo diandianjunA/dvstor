@@ -92,6 +92,223 @@ struct PeerRdmaReadPairChainItem {
   bool after_header{};
 };
 
+// A Stage2 transport dispatch may contain requests for several remote peers.
+// `per_peer` is therefore a quota for each destination, not a cap on the
+// complete dispatch.  Keep the aggregate and destination limits separate so
+// a balanced wave can use the full shared-CQ window without allowing one hot
+// peer (or one of its data QPs) to be overcommitted.
+struct PeerRdmaReadDispatchLimits {
+  std::uint32_t global_items{};
+  std::uint32_t per_peer_items{};
+};
+
+constexpr PeerRdmaReadDispatchLimits peer_rdma_read_dispatch_limits(
+    const PeerRdmaReadCreditPlan& plan) {
+  const std::uint64_t aggregate_qp_items =
+    static_cast<std::uint64_t>(plan.data_qps_per_peer) * plan.per_qp;
+  return PeerRdmaReadDispatchLimits{
+    .global_items = plan.global,
+    .per_peer_items = static_cast<std::uint32_t>(
+      std::min<std::uint64_t>(plan.per_peer, aggregate_qp_items)),
+  };
+}
+
+constexpr PeerRdmaReadDispatchLimits
+peer_rdma_read_pair_dispatch_limits(
+    const PeerRdmaReadCreditPlan& plan) {
+  // Round down each QP before aggregating.  An odd final READ credit on one
+  // QP cannot be combined with another QP's odd credit to form an ordered
+  // body/after-header pair.
+  const std::uint64_t aggregate_qp_pairs =
+    static_cast<std::uint64_t>(plan.data_qps_per_peer) *
+    (plan.per_qp / 2);
+  return PeerRdmaReadDispatchLimits{
+    .global_items = plan.global / 2,
+    .per_peer_items = static_cast<std::uint32_t>(
+      std::min<std::uint64_t>(plan.per_peer / 2, aggregate_qp_pairs)),
+  };
+}
+
+// Mutable accounting for one finite collector pass.  Local/terminal work and
+// another consumer of an already selected physical pointer set
+// `consumes_remote_item=false`; they remain admissible without stealing RDMA
+// credit from a distinct remote read.  A rejected remote item owns no quota
+// and remains pending in its logical search for a later dispatch.
+struct PeerRdmaReadDispatchQuota {
+  PeerRdmaReadDispatchLimits limits{};
+  std::span<std::uint32_t> used_by_peer{};
+  std::uint32_t global_used{};
+
+  void reset(
+      const PeerRdmaReadDispatchLimits new_limits,
+      const std::span<std::uint32_t> new_used_by_peer) {
+    limits = new_limits;
+    used_by_peer = new_used_by_peer;
+    std::fill(used_by_peer.begin(), used_by_peer.end(), 0);
+    global_used = 0;
+  }
+
+  [[nodiscard]] bool try_accept(
+      const std::uint32_t peer,
+      const bool consumes_remote_item) {
+    if (!consumes_remote_item) return true;
+    if (peer >= used_by_peer.size() ||
+        global_used >= limits.global_items ||
+        used_by_peer[peer] >= limits.per_peer_items) {
+      return false;
+    }
+    ++global_used;
+    ++used_by_peer[peer];
+    return true;
+  }
+};
+
+// One mixed immutable-base/dynamic vector wave charges one READ for every
+// body and one additional ordered after-header READ only for a recyclable
+// dynamic record.  Total WR credit and pair packing are different limits:
+// when per_qp is odd, the last credit of two QPs cannot be combined into one
+// ordered pair. Keep both dimensions explicit so a caller never prepares an
+// all-or-nothing wave that the transport can only partially place.
+struct PeerRdmaSnapshotDispatchLimits {
+  std::uint32_t global_wrs{};
+  std::uint32_t per_peer_wrs{};
+  std::uint32_t per_peer_pairs{};
+};
+
+constexpr PeerRdmaSnapshotDispatchLimits
+peer_rdma_snapshot_dispatch_limits(const PeerRdmaReadCreditPlan& plan) {
+  const std::uint64_t aggregate_qp_wrs =
+    static_cast<std::uint64_t>(plan.data_qps_per_peer) * plan.per_qp;
+  const std::uint64_t aggregate_qp_pairs =
+    static_cast<std::uint64_t>(plan.data_qps_per_peer) *
+    (plan.per_qp / 2);
+  return PeerRdmaSnapshotDispatchLimits{
+    .global_wrs = plan.global,
+    .per_peer_wrs = static_cast<std::uint32_t>(
+      std::min<std::uint64_t>(plan.per_peer, aggregate_qp_wrs)),
+    .per_peer_pairs = static_cast<std::uint32_t>(
+      std::min<std::uint64_t>(plan.per_peer / 2, aggregate_qp_pairs)),
+  };
+}
+
+struct PeerRdmaSnapshotDispatchQuota {
+  PeerRdmaSnapshotDispatchLimits limits{};
+  std::span<std::uint32_t> wrs_by_peer{};
+  std::span<std::uint32_t> pairs_by_peer{};
+  std::uint32_t global_wrs{};
+
+  void reset(
+      const PeerRdmaSnapshotDispatchLimits new_limits,
+      const std::span<std::uint32_t> new_wrs_by_peer,
+      const std::span<std::uint32_t> new_pairs_by_peer) {
+    assert(new_wrs_by_peer.size() == new_pairs_by_peer.size());
+    limits = new_limits;
+    wrs_by_peer = new_wrs_by_peer;
+    pairs_by_peer = new_pairs_by_peer;
+    std::fill(wrs_by_peer.begin(), wrs_by_peer.end(), 0);
+    std::fill(pairs_by_peer.begin(), pairs_by_peer.end(), 0);
+    global_wrs = 0;
+  }
+
+  // `wr_cost==0` represents local/terminal work or another consumer of an
+  // already selected physical pointer. A distinct immutable base record costs
+  // one body READ; a distinct dynamic record costs an indivisible two-READ
+  // ordered pair.
+  [[nodiscard]] bool try_accept(
+      const std::uint32_t peer,
+      const std::uint32_t wr_cost,
+      const bool ordered_pair) {
+    if (wr_cost == 0) return true;
+    assert(wr_cost == (ordered_pair ? 2u : 1u));
+    if (peer >= wrs_by_peer.size() ||
+        wr_cost > limits.global_wrs -
+          std::min(global_wrs, limits.global_wrs) ||
+        wr_cost > limits.per_peer_wrs -
+          std::min(wrs_by_peer[peer], limits.per_peer_wrs) ||
+        (ordered_pair &&
+         pairs_by_peer[peer] >= limits.per_peer_pairs)) {
+      return false;
+    }
+    global_wrs += wr_cost;
+    wrs_by_peer[peer] += wr_cost;
+    pairs_by_peer[peer] += ordered_pair;
+    return true;
+  }
+};
+
+// Keep the collector's transport-mode choice and its admission decision in
+// one object.  This prevents a new wave from initializing one quota using
+// stale in-flight state and then admitting through the other quota.  In mixed
+// mode an immutable base record costs one READ while a recyclable dynamic
+// record reserves its body/after-header pair atomically.
+struct PeerRdmaVectorSnapshotDispatchQuota {
+  bool mixed_snapshots{};
+  PeerRdmaSnapshotDispatchQuota mixed{};
+  PeerRdmaReadDispatchQuota fallback{};
+
+  void reset(
+      const bool new_mixed_snapshots,
+      const PeerRdmaSnapshotDispatchLimits mixed_limits,
+      const PeerRdmaReadDispatchLimits fallback_limits,
+      const std::span<std::uint32_t> wrs_by_peer,
+      const std::span<std::uint32_t> pairs_by_peer) {
+    mixed_snapshots = new_mixed_snapshots;
+    if (mixed_snapshots) {
+      mixed.reset(mixed_limits, wrs_by_peer, pairs_by_peer);
+    } else {
+      fallback.reset(fallback_limits, wrs_by_peer);
+      std::fill(pairs_by_peer.begin(), pairs_by_peer.end(), 0);
+    }
+  }
+
+  [[nodiscard]] bool try_accept(
+      const std::uint32_t peer,
+      const bool distinct_remote,
+      const bool requires_after_header) {
+    if (mixed_snapshots) {
+      return mixed.try_accept(
+        peer,
+        distinct_remote ? (requires_after_header ? 2u : 1u) : 0u,
+        distinct_remote && requires_after_header);
+    }
+    return fallback.try_accept(peer, distinct_remote);
+  }
+};
+
+struct PeerRdmaSnapshotChainItem {
+  std::uint32_t snapshot_index{};
+  bool after_header{};
+};
+
+constexpr std::uint32_t peer_rdma_snapshot_work_request_count(
+    const std::uint32_t snapshot_count,
+    const std::uint32_t ordered_pair_count) {
+  return ordered_pair_count <=
+      std::numeric_limits<std::uint32_t>::max() - snapshot_count
+    ? snapshot_count + ordered_pair_count
+    : 0;
+}
+
+// A mixed chain is [all bodies, dynamic after-headers]. The first item in the
+// second half carries IBV_SEND_FENCE in the transport implementation. The
+// caller supplies the logical indices of pair-requiring records in the exact
+// order used to build that second half.
+constexpr PeerRdmaSnapshotChainItem peer_rdma_snapshot_chain_item(
+    const std::uint32_t work_request_index,
+    const std::uint32_t snapshot_count,
+    const std::span<const std::uint32_t> ordered_pair_indices) {
+  return work_request_index < snapshot_count
+    ? PeerRdmaSnapshotChainItem{
+        .snapshot_index = work_request_index,
+        .after_header = false,
+      }
+    : PeerRdmaSnapshotChainItem{
+        .snapshot_index = ordered_pair_indices[
+          work_request_index - snapshot_count],
+        .after_header = true,
+      };
+}
+
 // Production and tests share this mapping.  One chain is laid out as
 // [full_0 .. full_N-1, after_0(FENCE) .. after_N-1], not as interleaved pairs:
 // the single fence delays the complete validation half until every body read

@@ -1,0 +1,69 @@
+query_inputs
+  recall_source: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  recall_rows: 10000
+  performance_source: /data/xjs/datasets/sift1b/sift100m_to_110m_query.u8bin
+  performance_rows: 10000000
+  performance_row_reuse_policy: single_pass_no_reuse
+  performance_warmup/measure/total_rows_consumed: 1169524/4402436/5571960
+throughput
+  duration_seconds: 120.614
+  total_ops_per_sec: 37240.4 (ops=4491731)
+  query_ops_per_sec: 36500.1 (ops=4402436)
+  effective_query_ops_per_sec: 36500.1
+  write_ops_per_sec: 740.335 (ops=89295)
+  effective_write_ops_per_sec: 740.335
+  insert_ops_per_sec: 740.335 (ops=89295)
+  client_drain_seconds: 0.61436
+  scheduled_query/write_ops: 0/0
+  query/write_rate_attainment_ratio: 1/1
+  nominal/effective_rate_basis: effective_wall_clock/wall_clock_including_client_drain
+  write_mix_completed: insert=89295 upsert=0 delete=0
+  query_head/tail_qps: 38199.3/35323
+  query_tail_to_head_ratio: 0.924702
+  write_head/tail_qps: 821.4/646.6
+  write_tail_to_head_ratio: 0.787193
+  zero_completion_windows: 0
+  zero_query/write_windows: 0/0
+stage2
+  source: in_band_control_page
+  shards observed/requested: 5/5
+  p99_stage2_delay_upper_ms: 2000 (samples=93170)
+  remaining/max_backlog: 64/55
+  completion_outstanding/admission_window: 177/640 (max_per_shard=128)
+  backlog_slope_per_sec: -0.223985
+  failures: 24
+  locality telemetry: home_match_rate=0.892465 cross_edge_reduction=0.233487 avg_frontier/expansions/scored=643.976/21.8126/1212.09
+  search budget exhausted (stage1/stage2): 0/0
+recall
+  recall@10: 0.9454
+  queries: 1000
+  mode/base_id_limit/search_width/insufficient_queries: all/0/10/0
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+static_gt_post_recall
+  recall@10: 0.9438
+  queries: 1000
+  mode/base_id_limit/search_width/insufficient_queries: all/0/10/0
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+gpu_persistent
+  GPU memory explicit/base_pq/route GiB: 3.36015/2.98023/2.87592e-06
+  average_batch_size: 1.23135
+  average_submission_wait_us: 4.46707
+  rdma_read_bytes: 1021998610560
+  graph_route_hit_ratio/refreshes: 0/0
+  graph snapshot reread records total/per_query: 0/0
+  centroid route publications/shard_updates/live/snapshot_skips: 13779/31544/20/205
+  centroid route probe_reads/body_reads/unchanged_polls/poll_us: 90125/32137/4041/32010
+  centroid route query snapshot retries/timeouts: 44707/0
+  GPU query/prepare/graph/score/beam/exact us: 6906.23/106.693/1504.34/1833.19/3111.82/257.046
+insert breakdown
+  count: 89295
+  latency_ms: mean=345.493 p50=195.547 p95=985.504 p99=1265.86
+  cpu_ms: 3.08501e+07
+  rdma_ms: 623.709
+query breakdown
+  count: 4402436
+  latency_ms: mean=6.97668 p50=6.95027 p95=8.07735 p99=8.62115
+  cpu_ms: 3.07144e+07
+  rdma_ms: 0

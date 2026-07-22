@@ -28,6 +28,21 @@ int main() {
     dynamic_hot_offset, dynamic_code_offset, 32);
   assert(VamanaNode::HAS_HOT_GRAPH);
 
+  const RemotePtr immutable_base{
+    0, vamana::hot_graph::kNodeBaseOffset, 0};
+  const RemotePtr tagged_static_address{
+    0, vamana::hot_graph::kNodeBaseOffset, 1};
+  const RemotePtr misaligned_static_slot{
+    0, vamana::hot_graph::kNodeBaseOffset + RemotePtr::OFFSET_ALIGNMENT, 0};
+  const RemotePtr past_static_count{
+    0, vamana::hot_graph::kNodeBaseOffset + VamanaNode::total_size(), 0};
+  const RemotePtr zero_tag_dynamic{0, kDynamicBase, 0};
+  assert(VamanaNode::immutable_base_record(immutable_base));
+  assert(!VamanaNode::immutable_base_record(tagged_static_address));
+  assert(!VamanaNode::immutable_base_record(misaligned_static_slot));
+  assert(!VamanaNode::immutable_base_record(past_static_count));
+  assert(!VamanaNode::immutable_base_record(zero_tag_dynamic));
+
   // Regression for the Stage2 corruption: a graph RDMA read is much larger
   // than a uint8 D128 vector snapshot. Consecutive graph slots must be spaced
   // by the graph size, never by the snapshot stride.
