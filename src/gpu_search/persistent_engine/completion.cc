@@ -66,7 +66,12 @@ void PersistentSearchEngine::Impl::report_direct_path_failure() {
             << (graph_snapshot_error
                   ? "graph snapshot validation failed after bounded rereads"
                   : "GPUNetIO direct read failed")
-            << " with status=" << direct_error
+            << " with status=" << direct_error;
+  if (direct_error == -ETIMEDOUT) {
+    std::cerr << " after cq_timeout_ms="
+              << kernel_params.direct_timeout_ns / 1'000'000ULL;
+  }
+  std::cerr
             << "; strict query mode rejects the query\n";
   engine.telemetry_.direct_path_failures.fetch_add(1, std::memory_order_relaxed);
   mark_unhealthy(std::string(graph_snapshot_error

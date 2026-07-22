@@ -10,6 +10,7 @@ int main() {
   const u64 timeout = gpu_search::owner_watchdog::stall_timeout_ns(20 * ms);
   assert(timeout == 100 * ms);
   assert(gpu_search::owner_watchdog::stall_timeout_ns(40 * ms) == 160 * ms);
+  assert(gpu_search::owner_watchdog::stall_timeout_ns(250 * ms) == 1'000 * ms);
 
   // An idle owner is never considered stalled.
   Tracker idle;

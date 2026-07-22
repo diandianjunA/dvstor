@@ -50,6 +50,10 @@ public:
   u32 gpu_final_rerank_width{64};
   u32 gpu_max_expansions{384};
   u32 gpu_rdma_qps{4};
+  // A CQE can be delayed well beyond ordinary read latency when GPU reads and
+  // CPU-posted mutation traffic share the NIC.  This is a liveness bound, not
+  // a latency target: transport errors still fail immediately.
+  u32 gpu_direct_timeout_ms{250};
   u32 gpu_persistent_blocks_per_sm{4};
   // Compute-side mutation support is optional for query-only deployments.
   // Keep it enabled by default so existing service configurations preserve
@@ -178,6 +182,9 @@ private:
       ("gpu-rdma-qps",
        po::value<u32>(&gpu_rdma_qps)->default_value(gpu_rdma_qps),
        "GPU-initiated GPUNetIO QPs per storage node.")
+      ("gpu-direct-timeout-ms",
+       po::value<u32>(&gpu_direct_timeout_ms)->default_value(gpu_direct_timeout_ms),
+       "Maximum wait for one GPU-initiated RDMA completion before fail-stop.")
       ("gpu-persistent-blocks-per-sm",
        po::value<u32>(&gpu_persistent_blocks_per_sm)->default_value(gpu_persistent_blocks_per_sm),
        "Maximum unified persistent CTAs per GPU SM; hardware occupancy may be lower.")
@@ -277,6 +284,7 @@ private:
         gpu_max_expansions < gpu_traversal_beam_width ||
         gpu_max_expansions > 4096 ||
         gpu_rdma_qps == 0 || gpu_rdma_qps > 32 ||
+        gpu_direct_timeout_ms < 20 || gpu_direct_timeout_ms > 5'000 ||
         gpu_persistent_blocks_per_sm == 0 ||
         gpu_persistent_blocks_per_sm > 16) {
       fail("invalid persistent GPU query configuration");
@@ -349,6 +357,8 @@ public:
              << config.gpu_max_expansions << '\n';
       output << std::setw(width) << "GPU RDMA QPs per storage node: "
              << config.gpu_rdma_qps << '\n';
+      output << std::setw(width) << "GPU direct CQ timeout ms: "
+             << config.gpu_direct_timeout_ms << '\n';
       output << std::setw(width) << "GPU persistent blocks/SM cap: "
              << config.gpu_persistent_blocks_per_sm << '\n';
       output << std::setw(width) << "compute updates enabled: "

@@ -527,6 +527,7 @@ write_service_config() {
     echo "gpu-final-rerank-width = ${GPU_FINAL_RERANK_WIDTH:-128}"
     echo "gpu-max-expansions = ${GPU_MAX_EXPANSIONS:-384}"
     echo "gpu-rdma-qps = ${GPU_RDMA_QPS:-32}"
+    echo "gpu-direct-timeout-ms = ${GPU_DIRECT_TIMEOUT_MS:-250}"
     echo "gpu-persistent-blocks-per-sm = ${GPU_PERSISTENT_BLOCKS_PER_SM:-4}"
     echo "storage-id = 0"
     echo "storage-peers = $endpoints"

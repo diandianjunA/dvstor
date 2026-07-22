@@ -38,6 +38,9 @@ int main() {
   const auto default_config = make_config(false);
   assert(default_config.enable_updates);
   assert(default_config.vector_id_namespace_size == default_config.max_vectors);
+  // Mixed CPU/GPU traffic may transiently delay a CQE; the default must not
+  // retain the old 20 ms false-failure threshold.
+  assert(default_config.gpu_direct_timeout_ms == 250);
 
   const auto expanded_namespace = make_config(false, true);
   assert(expanded_namespace.max_vectors == 1'000'000);
