@@ -594,6 +594,11 @@ private:
       const dense_hashmap_t<u32, vec<byte_t>>& vectors_by_home,
       dense_hashmap_t<
         u32, vec<service::storage_owner::Stage1ExecuteResult>>& results_by_home,
+      const std::function<void(
+        u32,
+        span<const service::storage_owner::Stage1ExecuteItem>,
+        span<const service::storage_owner::Stage1ExecuteResult>)>&
+        on_home_resolved,
       const std::function<bool()>& overlap_work,
       const Configuration& config);
   bool arm_remote_stage1_batch(

@@ -130,6 +130,66 @@ void test_each_home_advances_independently() {
   assert(!homes[1].mark_resolved());
 }
 
+void test_home_commit_releases_credit_before_next_home_arm() {
+  // Model the minimum completion window that exposed the distributed cycle:
+  // one remote fused home has armed and owns the only credit while a local
+  // home still needs to arm. Consuming the remote ACK must invoke its commit
+  // and ordered receipt release before the coordinator may enter the
+  // potentially blocking local ARM.
+  size_t available_completion_credits = 1;
+  size_t available_receipt_slots = 1;
+  std::array<bool, 2> authority_committed{};
+  std::array<bool, 2> receipt_released{};
+  std::array<Stage1ControlHomeProgress, 2> homes;
+
+  const auto try_arm = [&](size_t home) {
+    if (available_completion_credits == 0 ||
+        available_receipt_slots == 0) {
+      return false;
+    }
+    --available_completion_credits;
+    --available_receipt_slots;
+    homes[home].mark_posted();
+    return true;
+  };
+  const auto resolve_and_commit = [&](size_t home) {
+    if (!homes[home].mark_resolved()) return false;
+    authority_committed[home] = true;
+    // This represents Stage2 crossing its authority gate and retiring the
+    // bounded completion sequence. With an all-home commit barrier this
+    // release cannot happen and the second arm has no legal transition.
+    ++available_completion_credits;
+    return true;
+  };
+  const auto release_receipt = [&](size_t home) {
+    if (!authority_committed[home] || receipt_released[home]) return false;
+    receipt_released[home] = true;
+    ++available_receipt_slots;
+    return true;
+  };
+
+  assert(try_arm(0));
+  assert(!try_arm(1));
+  assert(resolve_and_commit(0));
+  assert(authority_committed[0]);
+  // Authority commit alone frees Stage2 completion credit, but an all-home
+  // receipt barrier can still block the next prepare forever.
+  assert(!try_arm(1));
+  assert(release_receipt(0));
+  assert(try_arm(1));
+  assert(resolve_and_commit(1));
+  assert(authority_committed[1]);
+  assert(release_receipt(1));
+  assert(available_completion_credits == 1);
+  assert(available_receipt_slots == 1);
+
+  // A duplicated/late response or release cannot manufacture capacity.
+  assert(!resolve_and_commit(0));
+  assert(!release_receipt(0));
+  assert(available_completion_credits == 1);
+  assert(available_receipt_slots == 1);
+}
+
 void test_fused_execute_requires_fresh_insert_and_runnable_fence() {
   Stage1ExecuteItem input{
     .client_batch_id = 99,
@@ -211,6 +271,7 @@ int main() {
   test_release_is_an_idempotent_ordered_watermark();
   test_structural_corruption_never_becomes_retry();
   test_each_home_advances_independently();
+  test_home_commit_releases_credit_before_next_home_arm();
   test_fused_execute_requires_fresh_insert_and_runnable_fence();
   test_atomic_retry_never_hides_terminal_prepare_failure();
 }

@@ -271,6 +271,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     bool committed_replay{};
     bool authority_committed{};
     bool fused_stage1{};
+    bool stage1_receipt_released{};
   };
   vec<MutationPlan> plans(item_count);
   dense_hashmap_t<u32, vec<size_t>> stage1_groups;
@@ -388,6 +389,45 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     }
   }
 
+  // Authority publication is intentionally per item, not batch-atomic.  In
+  // particular, a fresh fused insert must be committed as soon as its own
+  // physical home proves bounded Stage2 admission; retaining that lease while
+  // another home waits for completion credit creates a cross-home cycle.
+  const auto commit_plan = [&](size_t index) {
+    MutationPlan& plan = plans[index];
+    if (!plan.active || plan.authority_committed) return;
+    const bool deleted = plan.kind == MutationKind::erase;
+    const RemotePtr desired = deleted
+      ? RemotePtr{} : RemotePtr{plan.stage1_result.target_raw};
+    const u64 maintenance_sequence = deleted
+      ? plan.cleanup_result.maintenance_sequence
+      : plan.arm_result.maintenance_sequence;
+    lib_assert(maintenance_sequence != 0,
+               "authority commit omitted its runnable maintenance fence");
+    const auto commit_started = std::chrono::steady_clock::now();
+    const AuthorityCommitState commit = commit_authority_mutation(
+      ids[index], plan.operation, desired, plan.begin.generation, deleted,
+      maintenance_sequence);
+    breakdown.storage_owner_publish_mutation_ns +=
+      elapsed_ns_since(commit_started);
+    lib_assert(commit == AuthorityCommitState::committed ||
+                 commit == AuthorityCommitState::replay,
+               "token-fenced authority commit lost its active lease");
+    plan.authority_committed = true;
+
+    if (statuses != nullptr) {
+      (*statuses)[index] = static_cast<u32>(MutationStatus::ok);
+    }
+    if (results != nullptr) {
+      (*results)[index] = MutationResult{
+        .new_rptr_raw = desired.raw_address,
+        .old_rptr_raw = plan.begin.previous.current.raw_address,
+        .generation = plan.begin.generation,
+        .maintenance_sequence = maintenance_sequence,
+      };
+    }
+  };
+
   // Group each item by its one centroid-selected home. Distinct remote-home
   // groups in the batch are posted as one fanout before waiting for any
   // response, so centroid skew does not turn the batch into a serial RPC
@@ -418,129 +458,165 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   }
 
   u64 local_stage1_elapsed_ns = 0;
+  const auto execute_local_stage1_attempt = [&](size_t index) {
+    MutationPlan& plan = plans[index];
+    const Stage1OperationKey key{
+      .authority_shard = storage_id_,
+      .source_client = plan.stage1_item.source_client,
+      .item_index = plan.stage1_item.item_index,
+      .client_batch_id = plan.stage1_item.client_batch_id,
+    };
+    if (!try_track_stage1_inflight_request(key)) {
+      // Do not wait here: remote fused Execute requests were already posted.
+      // Returning an explicit local retry lets the remote ACK loop commit and
+      // release those homes before this coordinator waits for local capacity.
+      plan.stage1_result = Stage1ExecuteResult{
+        .client_batch_id = plan.stage1_item.client_batch_id,
+        .source_client = plan.stage1_item.source_client,
+        .item_index = plan.stage1_item.item_index,
+        .status = static_cast<u32>(MutationStatus::retry),
+      };
+      return;
+    }
+    try {
+      plan.stage1_result = prepare_and_maybe_arm_local_stage1_item(
+        storage_id_, plan.stage1_item,
+        raw_vectors + index * VamanaNode::vector_bytes(), config,
+        &breakdown);
+    } catch (...) {
+      finish_stage1_inflight_request(key);
+      throw;
+    }
+    finish_stage1_inflight_request(key);
+  };
   const auto execute_local_stage1 = [&]() {
     const auto local_started = std::chrono::steady_clock::now();
     const auto finish_local_timing = [&]() {
       local_stage1_elapsed_ns += elapsed_ns_since(local_started);
     };
     for (const size_t index : local_stage1_indices) {
-      const Stage1OperationKey key{
-        .authority_shard = storage_id_,
-        .source_client = plans[index].stage1_item.source_client,
-        .item_index = plans[index].stage1_item.item_index,
-        .client_batch_id = plans[index].stage1_item.client_batch_id,
-      };
-      do {
-        while (!try_track_stage1_inflight_request(key)) {
-          if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
-            finish_local_timing();
-            return false;
-          }
-          std::unique_lock<std::mutex> lock(
-            storage_owner_maintenance_mutex_);
-          storage_owner_maintenance_cv_.wait_for(
-            lock, std::chrono::microseconds(100));
-        }
-        try {
-          plans[index].stage1_result =
-            prepare_and_maybe_arm_local_stage1_item(
-              storage_id_, plans[index].stage1_item,
-              raw_vectors + index * VamanaNode::vector_bytes(), config,
-              &breakdown);
-        } catch (...) {
-          finish_stage1_inflight_request(key);
-          throw;
-        }
-        finish_stage1_inflight_request(key);
-        if (plans[index].stage1_result.status ==
-            static_cast<u32>(MutationStatus::retry)) {
-          if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
-            finish_local_timing();
-            return false;
-          }
-          std::unique_lock<std::mutex> lock(
-            storage_owner_maintenance_mutex_);
-          storage_owner_maintenance_cv_.wait_for(
-            lock, std::chrono::microseconds(100));
-        }
-      } while (plans[index].stage1_result.status ==
-               static_cast<u32>(MutationStatus::retry));
+      execute_local_stage1_attempt(index);
     }
 
-    vec<size_t> fused_indices;
-    vec<Stage1ArmItem> fused_items;
-    fused_indices.reserve(local_stage1_indices.size());
-    fused_items.reserve(local_stage1_indices.size());
-    for (const size_t index : local_stage1_indices) {
+    // Do not reserve local completion credit in this overlap callback. Remote
+    // homes have already been posted, but their fused ACKs are consumed only
+    // after this function returns. A blocking local ARM here could therefore
+    // prevent the remote per-home authority commits that release that credit.
+    finish_local_timing();
+    return true;
+  };
+  dense_hashmap_t<u32, vec<Stage1ExecuteResult>> remote_stage1_results;
+  bool stage1_home_release_ok = true;
+  u64 eager_remote_stage1_release_ns = 0;
+  const auto resolve_remote_stage1_home = [&] (
+      u32 home, span<const Stage1ExecuteItem> home_items,
+      span<const Stage1ExecuteResult> home_results) {
+    const auto found = stage1_groups.find(home);
+    lib_assert(found != stage1_groups.end() &&
+                 found->second.size() == home_items.size() &&
+                 home_results.size() == home_items.size(),
+               "Stage1 execute fanout lost its home-to-authority mapping");
+    vec<size_t> release_indices;
+    vec<Stage1ArmItem> release_items;
+    release_indices.reserve(found->second.size());
+    release_items.reserve(found->second.size());
+    for (size_t slot = 0; slot < found->second.size(); ++slot) {
+      const size_t index = found->second[slot];
       MutationPlan& plan = plans[index];
+      lib_assert(plan.stage1_home == home &&
+                   plan.stage1_item.client_batch_id ==
+                     home_items[slot].client_batch_id &&
+                   plan.stage1_item.source_client ==
+                     home_items[slot].source_client &&
+                   plan.stage1_item.item_index == home_items[slot].item_index,
+                 "Stage1 home callback crossed a mutation token");
+      plan.stage1_result = home_results[slot];
       if (!plan.fused_stage1 ||
           plan.stage1_result.status !=
             static_cast<u32>(MutationStatus::ok)) {
         continue;
       }
-      fused_indices.push_back(index);
-      fused_items.push_back(Stage1ArmItem{
+      lib_assert(plan.stage1_result.maintenance_sequence != 0,
+                 "fused Stage1 home ACK omitted bounded admission");
+      plan.arm_result = Stage1ArmResult{
+        .token = plan.operation,
+        .target_raw = plan.stage1_result.target_raw,
+        .maintenance_sequence = plan.stage1_result.maintenance_sequence,
+        .status = static_cast<u32>(MutationStatus::ok),
+      };
+      // The response lease has already been acknowledged. Commit this home
+      // now, while unrelated homes may still be waiting or retrying.
+      commit_plan(index);
+      release_indices.push_back(index);
+      release_items.push_back(Stage1ArmItem{
         .token = plan.operation,
         .target_raw = plan.stage1_result.target_raw,
         .initial_placement_version =
           plan.stage1_item.initial_placement_version,
         .id = ids[index],
         .generation = plan.begin.generation,
-        .action = static_cast<u32>(Stage1ArmAction::arm),
+        .action = static_cast<u32>(Stage1ArmAction::release),
       });
     }
-    if (!fused_items.empty()) {
-      const auto arm_started = std::chrono::steady_clock::now();
+
+    // Release this home's compact receipts immediately after its authority
+    // commit. The marker shares the ordered RC control path with Execute, so
+    // the physical home can quiesce late retries without a global all-home
+    // receipt barrier. A retry here never reopens or re-commits the home.
+    if (!release_items.empty()) {
+      const auto release_started = std::chrono::steady_clock::now();
       for (;;) {
-        vec<Stage1ArmResult> arm_results;
-        (void)arm_local_stage1_items(
-          storage_id_, span<const Stage1ArmItem>{fused_items},
-          arm_results, config);
-        const auto disposition =
-          memory_node_peer_rpc_detail::classify_stage1_control_response(
-            span<const Stage1ArmItem>{fused_items},
-            span<const Stage1ArmResult>{arm_results});
-        if (disposition == memory_node_peer_rpc_detail::
-              Stage1ControlResponseDisposition::resolved) {
-          for (size_t slot = 0; slot < fused_indices.size(); ++slot) {
-            MutationPlan& plan = plans[fused_indices[slot]];
-            plan.arm_result = arm_results[slot];
-            plan.stage1_result.maintenance_sequence =
-              arm_results[slot].maintenance_sequence;
+        vec<Stage1ArmResult> release_results;
+        const bool transported = arm_remote_stage1_batch(
+          home, source_client, span<const Stage1ArmItem>{release_items},
+          release_results, config);
+        if (transported) {
+          const auto disposition =
+            memory_node_peer_rpc_detail::classify_stage1_control_response(
+              span<const Stage1ArmItem>{release_items},
+              span<const Stage1ArmResult>{release_results});
+          if (disposition == memory_node_peer_rpc_detail::
+                Stage1ControlResponseDisposition::resolved) {
+            for (const size_t index : release_indices) {
+              plans[index].stage1_receipt_released = true;
+            }
+            break;
           }
-          break;
-        }
-        if (disposition == memory_node_peer_rpc_detail::
-              Stage1ControlResponseDisposition::malformed) {
-          throw std::runtime_error(
-            "local fused Stage1 arm returned a malformed result");
+          if (disposition == memory_node_peer_rpc_detail::
+                Stage1ControlResponseDisposition::malformed) {
+            throw std::runtime_error(
+              "remote fused Stage1 release returned a malformed result");
+          }
         }
         if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
-          finish_local_timing();
-          return false;
+          stage1_home_release_ok = false;
+          break;
         }
         std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
         storage_owner_maintenance_cv_.wait_for(
           lock, std::chrono::microseconds(100));
       }
-      breakdown.storage_owner_stage1_arm_wait_ns +=
-        elapsed_ns_since(arm_started);
+      const u64 release_ns = elapsed_ns_since(release_started);
+      eager_remote_stage1_release_ns += release_ns;
+      breakdown.storage_owner_stage1_release_wait_ns += release_ns;
     }
-    finish_local_timing();
-    return true;
   };
-  dense_hashmap_t<u32, vec<Stage1ExecuteResult>> remote_stage1_results;
   const auto stage1_execute_started = std::chrono::steady_clock::now();
   const bool stage1_transport_ok = execute_remote_stage1_fanout_and_wait(
     remote_stage1_items, remote_stage1_vectors,
-    remote_stage1_results, execute_local_stage1, config);
+    remote_stage1_results, resolve_remote_stage1_home,
+    execute_local_stage1, config);
   // Local search/prune time is already represented by its detailed counters.
   // Subtract the overlapped interval so the aggregate breakdown remains a
   // partition rather than double-counting concurrent local and remote work.
   const u64 stage1_critical_path_ns = elapsed_ns_since(stage1_execute_started);
+  const u64 excluded_stage1_ns = local_stage1_elapsed_ns >
+      std::numeric_limits<u64>::max() - eager_remote_stage1_release_ns
+    ? std::numeric_limits<u64>::max()
+    : local_stage1_elapsed_ns + eager_remote_stage1_release_ns;
   breakdown.storage_owner_stage1_execute_wait_ns +=
-    stage1_critical_path_ns > local_stage1_elapsed_ns
-      ? stage1_critical_path_ns - local_stage1_elapsed_ns : 0;
+    stage1_critical_path_ns > excluded_stage1_ns
+      ? stage1_critical_path_ns - excluded_stage1_ns : 0;
   if (!stage1_transport_ok) {
     // A fused request may already own a runnable Stage2 descriptor at its
     // physical home. Transport uncertainty is not a semantic prepare failure.
@@ -550,6 +626,7 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     throw std::runtime_error(
       "Stage1 transport stopped before every semantic token resolved");
   }
+  if (!stage1_home_release_ok) return false;
   for (const auto& [home, indices] : stage1_groups) {
     if (home == storage_id_) continue;
     const auto found = remote_stage1_results.find(home);
@@ -561,6 +638,128 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
     for (size_t slot = 0; slot < indices.size(); ++slot) {
       plans[indices[slot]].stage1_result = found->second[slot];
     }
+  }
+
+  // A local capacity retry must not hold already-posted remote homes behind
+  // the overlap callback. Those homes are now committed and their receipts
+  // released, so retrying local prepare cannot participate in a cross-home
+  // hold-and-wait cycle. The uncontended path still performed its full local
+  // search concurrently with the remote Execute requests above.
+  for (const size_t index : local_stage1_indices) {
+    while (plans[index].stage1_result.status ==
+           static_cast<u32>(MutationStatus::retry)) {
+      if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+        return false;
+      }
+      std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+      storage_owner_maintenance_cv_.wait_for(
+        lock, std::chrono::microseconds(100));
+      lock.unlock();
+      execute_local_stage1_attempt(index);
+    }
+  }
+
+  // Remote homes have now either committed their fused authority subset or
+  // returned a terminal prepare result. Only now may a local fused home wait
+  // for admission: no remote completion credit remains pinned behind an
+  // unconsumed ACK. Search/prune was still overlapped above; only this bounded
+  // local admission step is ordered after the remote event loop.
+  vec<size_t> local_fused_indices;
+  vec<Stage1ArmItem> local_fused_items;
+  local_fused_indices.reserve(local_stage1_indices.size());
+  local_fused_items.reserve(local_stage1_indices.size());
+  for (const size_t index : local_stage1_indices) {
+    MutationPlan& plan = plans[index];
+    if (!plan.fused_stage1 ||
+        plan.stage1_result.status !=
+          static_cast<u32>(MutationStatus::ok)) {
+      continue;
+    }
+    local_fused_indices.push_back(index);
+    local_fused_items.push_back(Stage1ArmItem{
+      .token = plan.operation,
+      .target_raw = plan.stage1_result.target_raw,
+      .initial_placement_version =
+        plan.stage1_item.initial_placement_version,
+      .id = ids[index],
+      .generation = plan.begin.generation,
+      .action = static_cast<u32>(Stage1ArmAction::arm),
+    });
+  }
+  if (!local_fused_items.empty()) {
+    const auto arm_started = std::chrono::steady_clock::now();
+    for (;;) {
+      vec<Stage1ArmResult> arm_results;
+      (void)arm_local_stage1_items(
+        storage_id_, span<const Stage1ArmItem>{local_fused_items},
+        arm_results, config);
+      const auto disposition =
+        memory_node_peer_rpc_detail::classify_stage1_control_response(
+          span<const Stage1ArmItem>{local_fused_items},
+          span<const Stage1ArmResult>{arm_results});
+      if (disposition == memory_node_peer_rpc_detail::
+            Stage1ControlResponseDisposition::resolved) {
+        for (size_t slot = 0; slot < local_fused_indices.size(); ++slot) {
+          MutationPlan& plan = plans[local_fused_indices[slot]];
+          plan.arm_result = arm_results[slot];
+          plan.stage1_result.maintenance_sequence =
+            arm_results[slot].maintenance_sequence;
+          commit_plan(local_fused_indices[slot]);
+        }
+        break;
+      }
+      if (disposition == memory_node_peer_rpc_detail::
+            Stage1ControlResponseDisposition::malformed) {
+        throw std::runtime_error(
+          "local fused Stage1 arm returned a malformed result");
+      }
+      if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+        return false;
+      }
+      std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+      storage_owner_maintenance_cv_.wait_for(
+        lock, std::chrono::microseconds(100));
+    }
+    breakdown.storage_owner_stage1_arm_wait_ns +=
+      elapsed_ns_since(arm_started);
+
+    vec<Stage1ArmItem> local_release_items = local_fused_items;
+    for (Stage1ArmItem& item : local_release_items) {
+      item.action = static_cast<u32>(Stage1ArmAction::release);
+    }
+    const auto release_started = std::chrono::steady_clock::now();
+    for (;;) {
+      vec<Stage1ArmResult> release_results;
+      const bool transported = arm_local_stage1_items(
+        storage_id_, span<const Stage1ArmItem>{local_release_items},
+        release_results, config);
+      if (transported) {
+        const auto disposition =
+          memory_node_peer_rpc_detail::classify_stage1_control_response(
+            span<const Stage1ArmItem>{local_release_items},
+            span<const Stage1ArmResult>{release_results});
+        if (disposition == memory_node_peer_rpc_detail::
+              Stage1ControlResponseDisposition::resolved) {
+          for (const size_t index : local_fused_indices) {
+            plans[index].stage1_receipt_released = true;
+          }
+          break;
+        }
+        if (disposition == memory_node_peer_rpc_detail::
+              Stage1ControlResponseDisposition::malformed) {
+          throw std::runtime_error(
+            "local fused Stage1 release returned a malformed result");
+        }
+      }
+      if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+        return false;
+      }
+      std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+      storage_owner_maintenance_cv_.wait_for(
+        lock, std::chrono::microseconds(100));
+    }
+    breakdown.storage_owner_stage1_release_wait_ns +=
+      elapsed_ns_since(release_started);
   }
   for (size_t index = 0; index < item_count; ++index) {
     MutationPlan& plan = plans[index];
@@ -779,45 +978,10 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
 
   }
 
-  const auto commit_plan = [&](size_t index) {
-    MutationPlan& plan = plans[index];
-    if (!plan.active || plan.authority_committed) return;
-    const bool deleted = plan.kind == MutationKind::erase;
-    const RemotePtr desired = deleted
-      ? RemotePtr{} : RemotePtr{plan.stage1_result.target_raw};
-    const u64 maintenance_sequence = deleted
-      ? plan.cleanup_result.maintenance_sequence
-      : plan.arm_result.maintenance_sequence;
-    lib_assert(maintenance_sequence != 0,
-               "authority commit omitted its runnable maintenance fence");
-    const auto commit_started = std::chrono::steady_clock::now();
-    const AuthorityCommitState commit = commit_authority_mutation(
-      ids[index], plan.operation, desired, plan.begin.generation, deleted,
-      maintenance_sequence);
-    breakdown.storage_owner_publish_mutation_ns +=
-      elapsed_ns_since(commit_started);
-    lib_assert(commit == AuthorityCommitState::committed ||
-                 commit == AuthorityCommitState::replay,
-               "token-fenced authority commit lost its active lease");
-    plan.authority_committed = true;
-
-    if (statuses != nullptr) {
-      (*statuses)[index] = static_cast<u32>(MutationStatus::ok);
-    }
-    if (results != nullptr) {
-      (*results)[index] = MutationResult{
-        .new_rptr_raw = desired.raw_address,
-        .old_rptr_raw = plan.begin.previous.current.raw_address,
-        .generation = plan.begin.generation,
-        .maintenance_sequence = maintenance_sequence,
-      };
-    }
-  };
-
   // Cleanup-only mutations do not participate in a Stage1 arm group. Fresh
-  // fused inserts already crossed their physical home's bounded admission
-  // transaction in the Execute response. Commit both now so neither retains
-  // an authority lease while an unrelated legacy home waits for credit.
+  // fused inserts were already committed by their per-home Execute callback
+  // (or by the local ARM completion); the idempotent call here is an audit that
+  // no successful fused item escaped its immediate linearization point.
   for (size_t index = 0; index < item_count; ++index) {
     if (plans[index].active &&
         (plans[index].kind == MutationKind::erase ||
@@ -895,7 +1059,10 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   dense_hashmap_t<u32, vec<Stage1ArmItem>> committed_release_groups;
   for (size_t index = 0; index < item_count; ++index) {
     const MutationPlan& plan = plans[index];
-    if (!plan.active || plan.kind == MutationKind::erase) continue;
+    if (!plan.active || plan.kind == MutationKind::erase ||
+        plan.stage1_receipt_released) {
+      continue;
+    }
     committed_release_groups[plan.stage1_home].push_back(Stage1ArmItem{
       .token = plan.operation,
       .target_raw = plan.stage1_result.target_raw,

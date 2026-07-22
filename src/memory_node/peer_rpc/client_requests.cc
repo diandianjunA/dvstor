@@ -551,6 +551,10 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
     const dense_hashmap_t<u32, vec<byte_t>>& vectors_by_home,
     dense_hashmap_t<
       u32, vec<service::storage_owner::Stage1ExecuteResult>>& results_by_home,
+    const std::function<void(
+      u32, span<const service::storage_owner::Stage1ExecuteItem>,
+      span<const service::storage_owner::Stage1ExecuteResult>)>&
+      on_home_resolved,
     const std::function<bool()>& overlap_work,
     const Configuration& config) {
   using namespace service::storage_owner;
@@ -562,8 +566,10 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
     u64 request_id{};
     u32 item_count{};
     vec<byte_t> message;
+    vec<Stage1ArmItem> release_items;
     std::chrono::steady_clock::time_point deadline{};
     bool posted{};
+    bool execute_resolved{};
     bool resolved{};
   };
   vec<PendingStage1> pending;
@@ -619,7 +625,7 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
   // single-home groups of one mutation batch in flight together and prevents
   // a foreground coordinator from serializing on the shared synchronous
   // response buffer. Each item still executes on exactly one centroid home.
-  const auto try_post = [&](const PendingStage1& request) {
+  const auto try_post_execute = [&](const PendingStage1& request) {
     if (peer_async_responses_ == nullptr) return false;
     const auto registration = peer_async_responses_->register_send_attempt(
       request.request_id, request.home,
@@ -648,6 +654,18 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
       request.home, slot_id, request.message.size());
     return true;
   };
+  const auto try_post_release = [&](const PendingStage1& request) {
+    lib_assert(request.execute_resolved && !request.release_items.empty(),
+               "Stage1 release post omitted its resolved Execute home");
+    const u32 release_count = static_cast<u32>(
+      request.release_items.size());
+    return try_post_peer_rpc_request_attempt(
+      request.home, PeerRpcType::stage1_arm_request,
+      PeerRpcType::stage1_arm_response, request.request_id, release_count,
+      request.release_items.data(),
+      request.release_items.size() * sizeof(request.release_items[0]),
+      stage1_arm_request_bytes(release_count), PeerRpcSendClass::stage1);
+  };
 
   // Prime every remote home before running authority-local Stage1 work.  The
   // physical-home workers can then search and publish in parallel with the
@@ -655,7 +673,7 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
   // error: the event loop below posts that home as soon as a slot completes.
   const auto initial_post_time = std::chrono::steady_clock::now();
   for (PendingStage1& request : pending) {
-    if (!try_post(request)) continue;
+    if (!try_post_execute(request)) continue;
     request.posted = true;
     request.deadline = initial_post_time +
       std::chrono::milliseconds(config.storage_owner_rpc_timeout_ms);
@@ -678,132 +696,256 @@ bool MemoryNode::execute_remote_stage1_fanout_and_wait(
     throw;
   }
 
+  const auto cancel_unresolved = [&]() {
+    for (const PendingStage1& request : pending) {
+      if (!request.resolved) cancel_peer_rpc_response(request.request_id);
+    }
+  };
+
   // Progress every home in one event loop.  Consuming completed descriptors
   // promptly is part of flow control: a response holds its registered receive
   // WR until acknowledge_peer_rpc_response(), so waiting indefinitely on one
   // retrying home before inspecting the others can exhaust receive credits.
-  // Per-home retries keep the same request ID and semantic item tokens.
+  // A fused home advances through Execute ACK -> authority callback -> ordered
+  // release ACK without blocking this scan. Thus one slow receipt release
+  // cannot delay another home's Execute ACK or authority commit. Per-phase
+  // retries keep the same request ID and semantic item tokens.
   size_t remaining = pending.size();
-  while (remaining != 0 &&
-         !peer_reverse_shutdown_.load(std::memory_order_acquire) &&
-         !storage_insert_shutdown_.load(std::memory_order_acquire)) {
-    bool made_progress = false;
-    const auto now = std::chrono::steady_clock::now();
-    for (PendingStage1& request : pending) {
-      if (request.resolved) continue;
+  try {
+    while (remaining != 0 &&
+           !peer_reverse_shutdown_.load(std::memory_order_acquire) &&
+           !storage_insert_shutdown_.load(std::memory_order_acquire)) {
+      bool made_progress = false;
+      const auto now = std::chrono::steady_clock::now();
+      for (PendingStage1& request : pending) {
+        if (request.resolved) continue;
 
-      if (!request.posted) {
-        if (!try_post(request)) continue;
-        request.posted = true;
-        request.deadline = now +
-          std::chrono::milliseconds(config.storage_owner_rpc_timeout_ms);
-        made_progress = true;
-      }
-
-      vec<byte_t> response;
-      PeerResponseLease response_lease{};
-      PeerRpcHeader response_header{};
-      const TryPeerResponse state = try_consume_peer_rpc_response(
-        request.request_id, request.home,
-        PeerRpcType::stage1_execute_response, request.item_count,
-        response_header, response, response_lease);
-      if (state == TryPeerResponse::pending) {
-        if (std::chrono::steady_clock::now() >= request.deadline) {
-          // Prepare is token-idempotent. Do not cancel or semantically abort
-          // an uncertain request; repost the identical request ID so either
-          // response resolves the same registry entry.
-          request.posted = false;
+        if (!request.posted) {
+          const bool posted = request.execute_resolved
+            ? try_post_release(request) : try_post_execute(request);
+          if (!posted) continue;
+          request.posted = true;
+          request.deadline = now +
+            std::chrono::milliseconds(config.storage_owner_rpc_timeout_ms);
           made_progress = true;
         }
-        continue;
-      }
-      if (state == TryPeerResponse::stale) {
-        request.posted = false;
-        made_progress = true;
-        continue;
-      }
 
-      // A failed aggregate header can still carry authoritative per-item
-      // Stage1 statuses. Keep the descriptor leased until all payload records
-      // have been validated.
-      const size_t expected_bytes =
-        stage1_execute_response_bytes(request.item_count);
-      const auto* header = response.size() == expected_bytes
-        ? reinterpret_cast<const PeerRpcHeader*>(response.data()) : nullptr;
-      if (header == nullptr || header->magic != kPeerRpcMagic ||
-          header->version != kPeerRpcVersion ||
-          header->type != static_cast<u32>(
-            PeerRpcType::stage1_execute_response) ||
-          header->source_shard != request.home ||
-          header->item_count != request.item_count ||
-          header->request_id != request.request_id) {
-        if (response_lease.valid()) {
-          (void)rearm_peer_rpc_response(response_lease);
+        if (request.execute_resolved) {
+          vec<byte_t> response;
+          PeerResponseLease response_lease{};
+          PeerRpcHeader response_header{};
+          const u32 release_count = static_cast<u32>(
+            request.release_items.size());
+          const TryPeerResponse state = try_consume_peer_rpc_response(
+            request.request_id, request.home,
+            PeerRpcType::stage1_arm_response, release_count,
+            response_header, response, response_lease);
+          if (state == TryPeerResponse::pending) {
+            if (std::chrono::steady_clock::now() >= request.deadline) {
+              request.posted = false;
+              made_progress = true;
+            }
+            continue;
+          }
+          if (state == TryPeerResponse::stale) {
+            request.posted = false;
+            made_progress = true;
+            continue;
+          }
+
+          const size_t expected_bytes =
+            stage1_arm_response_bytes(release_count);
+          const bool valid_envelope = state == TryPeerResponse::success &&
+            response.size() == expected_bytes &&
+            response_header.magic == kPeerRpcMagic &&
+            response_header.version == kPeerRpcVersion &&
+            response_header.type == static_cast<u32>(
+              PeerRpcType::stage1_arm_response) &&
+            response_header.source_shard == request.home &&
+            response_header.item_count == release_count &&
+            response_header.request_id == request.request_id &&
+            response_header.status == static_cast<u32>(InsertStatus::ok) &&
+            response_header.reserved == 0;
+          if (!valid_envelope) {
+            if (response_lease.valid()) {
+              (void)rearm_peer_rpc_response(response_lease);
+            }
+            throw std::runtime_error(
+              "malformed ordered Stage1 release response envelope");
+          }
+          const Stage1ArmResult* wire = stage1_arm_results(response.data());
+          const auto disposition = memory_node_peer_rpc_detail::
+            classify_stage1_control_response(
+              span<const Stage1ArmItem>{request.release_items},
+              span<const Stage1ArmResult>{wire, release_count});
+          if (disposition == memory_node_peer_rpc_detail::
+                Stage1ControlResponseDisposition::malformed) {
+            (void)rearm_peer_rpc_response(response_lease);
+            throw std::runtime_error(
+              "malformed token-fenced ordered Stage1 release response");
+          }
+          if (disposition == memory_node_peer_rpc_detail::
+                Stage1ControlResponseDisposition::retry) {
+            lib_assert(rearm_peer_rpc_response(response_lease),
+                       "retryable Stage1 release lost its response lease");
+            request.posted = false;
+            made_progress = true;
+            continue;
+          }
+          lib_assert(acknowledge_peer_rpc_response(response_lease),
+                     "validated Stage1 release lost its response lease");
+          request.posted = false;
+          request.resolved = true;
+          --remaining;
+          made_progress = true;
+          continue;
         }
-        cancel_peer_rpc_response(request.request_id);
-        throw std::runtime_error(
-          "invalid Stage1 response under an uncertain prepare");
-      }
 
-      const auto* output = stage1_execute_results(response.data());
-      vec<Stage1ExecuteResult> shard_results(
-        output, output + request.item_count);
-      const auto& input = items_by_home.at(request.home);
-      bool valid = true;
-      bool retryable = false;
-      for (u32 index = 0; index < request.item_count; ++index) {
-        valid &= shard_results[index].client_batch_id ==
-                   input[index].client_batch_id &&
-          shard_results[index].source_client == input[index].source_client &&
-          shard_results[index].item_index == input[index].item_index &&
-          shard_results[index].reserved == 0 &&
-          shard_results[index].status <=
+        vec<byte_t> response;
+        PeerResponseLease response_lease{};
+        PeerRpcHeader response_header{};
+        const TryPeerResponse state = try_consume_peer_rpc_response(
+          request.request_id, request.home,
+          PeerRpcType::stage1_execute_response, request.item_count,
+          response_header, response, response_lease);
+        if (state == TryPeerResponse::pending) {
+          if (std::chrono::steady_clock::now() >= request.deadline) {
+            // Prepare is token-idempotent. Do not cancel or semantically abort
+            // an uncertain request; repost the identical request ID so either
+            // response resolves the same registry entry.
+            request.posted = false;
+            made_progress = true;
+          }
+          continue;
+        }
+        if (state == TryPeerResponse::stale) {
+          request.posted = false;
+          made_progress = true;
+          continue;
+        }
+
+        // A failed aggregate header can still carry authoritative per-item
+        // Stage1 statuses. Keep the descriptor leased until all payload
+        // records have been validated.
+        const size_t expected_bytes =
+          stage1_execute_response_bytes(request.item_count);
+        const auto* header = response.size() == expected_bytes
+          ? reinterpret_cast<const PeerRpcHeader*>(response.data()) : nullptr;
+        if (header == nullptr || header->magic != kPeerRpcMagic ||
+            header->version != kPeerRpcVersion ||
+            header->type != static_cast<u32>(
+              PeerRpcType::stage1_execute_response) ||
+            header->source_shard != request.home ||
+            header->item_count != request.item_count ||
+            header->request_id != request.request_id) {
+          if (response_lease.valid()) {
+            (void)rearm_peer_rpc_response(response_lease);
+          }
+          throw std::runtime_error(
+            "invalid Stage1 response under an uncertain prepare");
+        }
+
+        const auto* output = stage1_execute_results(response.data());
+        vec<Stage1ExecuteResult> shard_results(
+          output, output + request.item_count);
+        const auto& input = items_by_home.at(request.home);
+        bool valid = true;
+        bool retryable = false;
+        for (u32 index = 0; index < request.item_count; ++index) {
+          valid &= shard_results[index].client_batch_id ==
+                     input[index].client_batch_id &&
+            shard_results[index].source_client ==
+              input[index].source_client &&
+            shard_results[index].item_index == input[index].item_index &&
+            shard_results[index].reserved == 0 &&
+            shard_results[index].status <=
+              static_cast<u32>(MutationStatus::retry);
+          valid &= memory_node_peer_rpc_detail::
+            stage1_execute_success_has_expected_fence(
+              input[index], shard_results[index]);
+          retryable |= shard_results[index].status ==
             static_cast<u32>(MutationStatus::retry);
-        valid &= memory_node_peer_rpc_detail::
-          stage1_execute_success_has_expected_fence(
-            input[index], shard_results[index]);
-        retryable |= shard_results[index].status ==
-          static_cast<u32>(MutationStatus::retry);
-        if (shard_results[index].status ==
-            static_cast<u32>(MutationStatus::ok)) {
-          const RemotePtr target{shard_results[index].target_raw};
-          valid &= !target.is_null() &&
-            target.memory_node() == request.home;
+          if (shard_results[index].status ==
+              static_cast<u32>(MutationStatus::ok)) {
+            const RemotePtr target{shard_results[index].target_raw};
+            valid &= !target.is_null() &&
+              target.memory_node() == request.home;
+          }
         }
-      }
-      if (!valid) {
-        if (response_lease.valid()) {
-          (void)rearm_peer_rpc_response(response_lease);
+        if (!valid) {
+          if (response_lease.valid()) {
+            (void)rearm_peer_rpc_response(response_lease);
+          }
+          throw std::runtime_error(
+            "malformed Stage1 result under an uncertain prepare");
         }
-        cancel_peer_rpc_response(request.request_id);
-        throw std::runtime_error(
-          "malformed Stage1 result under an uncertain prepare");
-      }
-      if (!acknowledge_peer_rpc_response(response_lease)) {
+        if (!acknowledge_peer_rpc_response(response_lease)) {
+          request.posted = false;
+          made_progress = true;
+          continue;
+        }
         request.posted = false;
         made_progress = true;
-        continue;
+        if (retryable) continue;
+
+        const auto [resolved_position, inserted] = results_by_home.emplace(
+          request.home, std::move(shard_results));
+        lib_assert(inserted, "Stage1 home resolved twice");
+        // A fused physical home already owns runnable Stage2 descriptors at
+        // this point. Linearize that home's authority subset before waiting
+        // for any other home, otherwise a full completion ring can form a
+        // hold-and-wait cycle with Stage2's authority gate. The callback runs
+        // synchronously on this foreground coordinator, never on a CQ thread.
+        if (on_home_resolved) {
+          on_home_resolved(
+            request.home, span<const Stage1ExecuteItem>{input},
+            span<const Stage1ExecuteResult>{resolved_position->second});
+        }
+
+        // The authority callback has committed every successful fused item.
+        // Post its release watermark on the same RC QP as Execute/retries, but
+        // keep it in this event loop so another home can resolve concurrently.
+        for (u32 index = 0; index < request.item_count; ++index) {
+          if (!memory_node_peer_rpc_detail::stage1_execute_uses_fused_arm(
+                input[index]) ||
+              resolved_position->second[index].status !=
+                static_cast<u32>(MutationStatus::ok)) {
+            continue;
+          }
+          request.release_items.push_back(Stage1ArmItem{
+            .token = {
+              .source_client = input[index].source_client,
+              .item_index = input[index].item_index,
+              .client_batch_id = input[index].client_batch_id,
+            },
+            .target_raw = resolved_position->second[index].target_raw,
+            .initial_placement_version =
+              input[index].initial_placement_version,
+            .id = input[index].id,
+            .generation = input[index].generation,
+            .action = static_cast<u32>(Stage1ArmAction::release),
+          });
+        }
+        if (request.release_items.empty()) {
+          request.resolved = true;
+          --remaining;
+          continue;
+        }
+        request.execute_resolved = true;
+        request.request_id = allocate_peer_request_id();
       }
-      request.posted = false;
-      made_progress = true;
-      if (retryable) continue;
 
-      const bool inserted = results_by_home.emplace(
-        request.home, std::move(shard_results)).second;
-      lib_assert(inserted, "Stage1 home resolved twice");
-      request.resolved = true;
-      --remaining;
+      if (!made_progress && remaining != 0) {
+        std::unique_lock<std::mutex> lock(peer_completion_mutex_);
+        peer_completion_cv_.wait_for(lock, std::chrono::microseconds(100));
+      }
     }
-
-    if (!made_progress && remaining != 0) {
-      std::unique_lock<std::mutex> lock(peer_completion_mutex_);
-      peer_completion_cv_.wait_for(lock, std::chrono::microseconds(100));
-    }
+  } catch (...) {
+    cancel_unresolved();
+    throw;
   }
 
-  for (const PendingStage1& request : pending) {
-    if (!request.resolved) cancel_peer_rpc_response(request.request_id);
-  }
+  cancel_unresolved();
   return remaining == 0;
 }
 
