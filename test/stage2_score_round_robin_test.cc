@@ -10,6 +10,8 @@
 
 using memory_node_storage_owner_maintenance_detail::
   Stage2ScoreRoundRobinCursor;
+using memory_node_storage_owner_maintenance_detail::Stage2SearchIoPhase;
+using memory_node_storage_owner_maintenance_detail::Stage2SearchIoState;
 using memory_node_storage_owner_maintenance_detail::
   stage2_consumer_fits_physical_scratch;
 
@@ -129,6 +131,27 @@ void test_scratch_capacity_counts_physical_reads_not_consumers() {
   assert(stage2_consumer_fits_physical_scratch(false, 0, 0));
 }
 
+void test_home_rpc_wait_does_not_pin_registered_rdma_scratch() {
+  Stage2SearchIoState state;
+  assert(state.scratch_rebindable());
+
+  state.initialized = true;
+  state.phase = Stage2SearchIoPhase::graph_home_pending;
+  assert(state.scratch_rebindable());
+
+  // A live one-sided record always pins the lane, even if phase metadata were
+  // corrupted to say that the context is waiting on a home RPC.
+  state.pending_graph.push_back({});
+  assert(!state.scratch_rebindable());
+  state.pending_graph.clear();
+  state.pending_vectors.push_back({});
+  assert(!state.scratch_rebindable());
+
+  state.pending_vectors.clear();
+  state.phase = Stage2SearchIoPhase::score_body_pending;
+  assert(!state.scratch_rebindable());
+}
+
 }  // namespace
 
 int main() {
@@ -137,5 +160,6 @@ int main() {
   test_cursor_normalizes_after_generation_size_change();
   test_full_peer_is_skipped_without_hiding_other_peers_or_local_work();
   test_scratch_capacity_counts_physical_reads_not_consumers();
+  test_home_rpc_wait_does_not_pin_registered_rdma_scratch();
   return 0;
 }

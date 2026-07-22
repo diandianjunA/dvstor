@@ -178,6 +178,16 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   peer_stage1_processed_.store(0, std::memory_order_relaxed);
   peer_stage1_items_.store(0, std::memory_order_relaxed);
   peer_stage1_max_queue_.store(0, std::memory_order_relaxed);
+  peer_stage2_home_enqueued_.store(0, std::memory_order_relaxed);
+  peer_stage2_home_processed_.store(0, std::memory_order_relaxed);
+  peer_stage2_home_items_.store(0, std::memory_order_relaxed);
+  peer_stage2_home_max_queue_.store(0, std::memory_order_relaxed);
+  peer_stage2_home_response_queue_drops_.store(0,
+                                               std::memory_order_relaxed);
+  peer_stage2_home_response_send_wait_ns_.store(0,
+                                                std::memory_order_relaxed);
+  peer_stage2_home_queue_wait_ns_.store(0, std::memory_order_relaxed);
+  peer_stage2_home_execution_ns_.store(0, std::memory_order_relaxed);
   peer_stage1_release_deferred_batches_.store(0, std::memory_order_relaxed);
   peer_stage1_release_deferred_items_.store(0, std::memory_order_relaxed);
   peer_stage1_duplicate_retry_responses_.store(0, std::memory_order_relaxed);
@@ -223,6 +233,12 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
     num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
   const u32 reverse_worker_count = cpu_plan.peer_reverse_workers;
   const u32 stage1_rpc_worker_count = cpu_plan.peer_stage1_workers;
+  peer_graph_response_buffer_limit_ = std::max<size_t>(
+    1, static_cast<size_t>(stage1_rpc_worker_count) * 2);
+  {
+    std::lock_guard<std::mutex> lock(peer_graph_response_buffers_mutex_);
+    peer_graph_response_buffers_.clear();
+  }
   const u32 cleanup_worker_count = cpu_plan.peer_cleanup_workers;
   const size_t stage1_total_worker_count =
     static_cast<size_t>(cpu_plan.foreground_coordinators) +
@@ -451,6 +467,10 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
   peer_cleanup_control_workers_.clear();
   peer_reverse_worker_states_.clear();
   peer_stage1_worker_states_.clear();
+  {
+    std::lock_guard<std::mutex> lock(peer_graph_response_buffers_mutex_);
+    peer_graph_response_buffers_.clear();
+  }
   peer_reverse_responses_.reset();
 }
 

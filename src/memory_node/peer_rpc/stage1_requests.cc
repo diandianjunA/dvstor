@@ -21,12 +21,10 @@ bool MemoryNode::handle_peer_stage2_expand_score_request(
   const size_t response_bytes =
     stage2_expand_score_response_bytes(header.item_count);
   if (response_bytes > peer_rpc_runtime_.message_bytes) return false;
-  // One worker owns this buffer until the synchronous RC send completes.
-  // Reuse its high-water allocation: Stage2 emits many medium-sized batches
-  // and allocating/zeroing a fresh vector for every expansion wave was itself
-  // a measurable CPU allocator bottleneck.
-  thread_local vec<byte_t> response;
-  response.assign(response_bytes, byte_t{0});
+  // The asynchronous sender recycles bounded high-water buffers after copying
+  // them into registered send slots. Stage2 emits many medium-sized responses;
+  // avoiding a malloc/free pair for each graph wave is important at high QPS.
+  vec<byte_t> response = acquire_peer_graph_response_buffer(response_bytes);
   auto* response_header = reinterpret_cast<PeerRpcHeader*>(response.data());
   response_header->magic = kPeerRpcMagic;
   response_header->version = kPeerRpcVersion;
@@ -45,6 +43,50 @@ bool MemoryNode::handle_peer_stage2_expand_score_request(
     response.data(), header.item_count);
   const size_t neighbor_stride = VamanaNode::graph_entry_capacity();
   const VectorDType dtype = VamanaNode::vector_dtype();
+  GraphAdjacency adjacency;
+
+  // Home expansion needs only a stable vector, not an owning NodeSnapshot.
+  // Score directly from the local registered node under the same header /
+  // incarnation seqlock used by read_node_snapshot(). This removes one vector
+  // allocation and 128-byte copy per neighbor while preserving the exact
+  // stable/terminal/retryable classification.
+  const auto score_local_neighbor = [&] (
+      RemotePtr neighbor, const byte_t* query,
+      Stage2ExpandScoreNeighbor& output) {
+    constexpr u32 kMaxReadAttempts = 3;
+    const byte_t* node = local_node_ptr(neighbor);
+    for (u32 attempt = 0; attempt < kMaxReadAttempts; ++attempt) {
+      const u64 before = load_local_node_header_acquire(neighbor);
+      if ((before & VamanaNode::HEADER_NODE_LOCK) != 0 ||
+          VamanaNode::header_incarnation(before) !=
+            neighbor.incarnation()) {
+        std::this_thread::yield();
+        continue;
+      }
+      const u32 slot_incarnation = *reinterpret_cast<const u32*>(
+        node + VamanaNode::offset_slot_incarnation());
+      const distance_t distance = distance_between_vectors(
+        query, dtype, node + VamanaNode::offset_vector(), dtype, config);
+      std::atomic_thread_fence(std::memory_order_acquire);
+      const u64 after = load_local_node_header_acquire(neighbor);
+      const StableNodeSnapshotState state = classify_stable_node_snapshot(
+        neighbor, before, after, slot_incarnation);
+      if (state == StableNodeSnapshotState::stable) {
+        output.distance = distance;
+        output.disposition = static_cast<u32>(
+          Stage2HomeDisposition::stable);
+        return;
+      }
+      if (state == StableNodeSnapshotState::terminal) {
+        output.disposition = static_cast<u32>(
+          Stage2HomeDisposition::terminal);
+        return;
+      }
+      std::this_thread::yield();
+    }
+    output.disposition = static_cast<u32>(
+      Stage2HomeDisposition::retryable);
+  };
 
   for (u32 item_index = 0; item_index < header.item_count; ++item_index) {
     const Stage2ExpandScoreItem& item = items[item_index];
@@ -59,7 +101,8 @@ bool MemoryNode::handle_peer_stage2_expand_score_request(
       continue;
     }
 
-    GraphAdjacency adjacency;
+    adjacency.stable.clear();
+    adjacency.provisional.clear();
     if (!read_graph_adjacency(pointer, adjacency)) {
       const u64 before = load_local_node_header_acquire(pointer);
       const u32 slot_incarnation = *reinterpret_cast<const u32*>(
@@ -100,43 +143,25 @@ bool MemoryNode::handle_peer_stage2_expand_score_request(
           Stage2HomeDisposition::unscored);
         return;
       }
-      NodeSnapshot snapshot;
-      if (read_node_snapshot(neighbor, snapshot)) {
-        const StableNodeSnapshotState state = classify_stable_node_snapshot(
-          neighbor, snapshot.header, snapshot.header,
-          snapshot.slot_incarnation);
-        if (state == StableNodeSnapshotState::stable &&
-            snapshot.vector_data.size() >= VamanaNode::vector_bytes()) {
-          output.distance = distance_between_vectors(
-            query, dtype, snapshot.vector_data.data(), dtype, config);
-          output.disposition = static_cast<u32>(
-            Stage2HomeDisposition::stable);
-        } else {
-          output.disposition = static_cast<u32>(
-            state == StableNodeSnapshotState::terminal
-              ? Stage2HomeDisposition::terminal
-              : Stage2HomeDisposition::retryable);
-        }
-        return;
-      }
-      const u64 before = load_local_node_header_acquire(neighbor);
-      const u32 slot_incarnation = *reinterpret_cast<const u32*>(
-        local_node_ptr(neighbor) + VamanaNode::offset_slot_incarnation());
-      std::atomic_thread_fence(std::memory_order_acquire);
-      const u64 after = load_local_node_header_acquire(neighbor);
-      const StableNodeSnapshotState state = classify_stable_node_snapshot(
-        neighbor, before, after, slot_incarnation);
-      output.disposition = static_cast<u32>(
-        state == StableNodeSnapshotState::terminal
-          ? Stage2HomeDisposition::terminal
-          : Stage2HomeDisposition::retryable);
+      score_local_neighbor(neighbor, query, output);
     };
     for (RemotePtr neighbor : adjacency.stable) emit_neighbor(neighbor);
     for (RemotePtr neighbor : adjacency.provisional) emit_neighbor(neighbor);
   }
 
-  send_peer_rpc_message(source_shard, response.data(), response.size());
-  return true;
+  PeerReverseUpdateResponse outbound;
+  outbound.destination_shard = source_shard;
+  outbound.header = *response_header;
+  outbound.payload = std::move(response);
+  outbound.graph_response = true;
+  outbound.queued_at = std::chrono::steady_clock::now();
+  const bool queued = try_enqueue_peer_reverse_update_response(
+    std::move(outbound));
+  if (!queued) {
+    peer_stage2_home_response_queue_drops_.fetch_add(
+      1, std::memory_order_relaxed);
+  }
+  return queued;
 }
 
 bool MemoryNode::try_send_peer_stage1_retry_response(

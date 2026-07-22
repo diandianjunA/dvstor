@@ -49,11 +49,11 @@ inline std::size_t stage2_sequence_admission_limit(
 }
 
 // Foreground pressure may reduce asynchronous Stage2 concurrency, but it must
-// never collapse the pipeline to one context per executor.  One context per
-// worker exposed no latency-hiding headroom on the colocated deployment even
-// though bounded RDMA credits and scratch lanes were still available. Retain
-// at most two contexts per worker under pressure and restore the full
-// per-worker RPC depth otherwise.
+// never collapse the pipeline to one context per executor. Logical search
+// state is context-owned, and a context waiting on a home RPC releases its
+// registered RDMA lane. Keep four bounded contexts per worker under foreground
+// pressure: two can occupy the physical scratch lanes while two independently
+// wait for home responses. Restore the full per-worker RPC depth otherwise.
 // The existing global/per-peer RDMA credits still bound posted work, while a
 // depth-one configuration naturally retains the original single-context
 // floor.
@@ -64,7 +64,7 @@ inline std::size_t stage2_context_admission_limit(
   const std::size_t workers = std::max<std::size_t>(1, maintenance_workers);
   const std::size_t depth = std::max<std::size_t>(1, rpc_depth);
   const std::size_t contexts_per_worker = foreground_pressure
-    ? std::min<std::size_t>(depth, 2) : depth;
+    ? std::min<std::size_t>(depth, 4) : depth;
   if (workers >
       std::numeric_limits<std::size_t>::max() / contexts_per_worker) {
     return std::numeric_limits<std::size_t>::max();
@@ -83,7 +83,7 @@ inline std::size_t stage2_worker_context_admission_limit(
     std::size_t rpc_depth,
     bool foreground_pressure) {
   const std::size_t depth = std::max<std::size_t>(1, rpc_depth);
-  return foreground_pressure ? std::min<std::size_t>(depth, 2) : depth;
+  return foreground_pressure ? std::min<std::size_t>(depth, 4) : depth;
 }
 
 // Credit-return callbacks can race and observe the same completion-ring

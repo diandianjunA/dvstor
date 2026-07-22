@@ -547,6 +547,12 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
     peer_stage1_processed_.load(std::memory_order_relaxed);
   const u64 peer_stage1_items =
     peer_stage1_items_.load(std::memory_order_relaxed);
+  const u64 peer_stage2_home_enqueued =
+    peer_stage2_home_enqueued_.load(std::memory_order_relaxed);
+  const u64 peer_stage2_home_processed =
+    peer_stage2_home_processed_.load(std::memory_order_relaxed);
+  const u64 peer_stage2_home_items =
+    peer_stage2_home_items_.load(std::memory_order_relaxed);
   u64 peer_stage1_admission_waiters = 0;
   u64 peer_stage1_admission_waiter_items = 0;
   u64 peer_stage1_admission_owned_items = 0;
@@ -809,6 +815,35 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                " peer_stage1_active_workers=" +
                std::to_string(peer_stage1_active_workers_.load(
                  std::memory_order_relaxed)) +
+               " peer_stage2_home_enqueued=" +
+               std::to_string(peer_stage2_home_enqueued) +
+               " peer_stage2_home_processed=" +
+               std::to_string(peer_stage2_home_processed) +
+               " peer_stage2_home_items=" +
+               std::to_string(peer_stage2_home_items) +
+               " avg_peer_stage2_home_items=" +
+               std::to_string(ratio_or_zero(
+                 peer_stage2_home_items, peer_stage2_home_processed)) +
+               " peer_stage2_home_max_queue=" +
+               std::to_string(peer_stage2_home_max_queue_.load(
+                 std::memory_order_relaxed)) +
+               " peer_stage2_home_response_queue_drops=" +
+               std::to_string(peer_stage2_home_response_queue_drops_.load(
+                 std::memory_order_relaxed)) +
+               " peer_stage2_home_response_send_wait_ms=" +
+               std::to_string(static_cast<double>(
+                 peer_stage2_home_response_send_wait_ns_.load(
+                   std::memory_order_relaxed)) / 1e6) +
+               " avg_peer_stage2_home_queue_wait_us=" +
+               std::to_string(0.001 * ratio_or_zero(
+                 peer_stage2_home_queue_wait_ns_.load(
+                   std::memory_order_relaxed),
+                 peer_stage2_home_processed)) +
+               " avg_peer_stage2_home_execution_us=" +
+               std::to_string(0.001 * ratio_or_zero(
+                 peer_stage2_home_execution_ns_.load(
+                   std::memory_order_relaxed),
+                 peer_stage2_home_processed)) +
                " peer_stage1_release_deferred_batches=" +
                std::to_string(peer_stage1_release_deferred_batches_.load(
                  std::memory_order_relaxed)) +

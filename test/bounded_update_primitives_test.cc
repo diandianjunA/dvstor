@@ -732,20 +732,19 @@ void test_stage2_pressure_retains_a_dedicated_progress_floor() {
 
   // The normal path can hide peer latency with the configured RPC depth.
   assert(stage2_context_admission_limit(2, 16, false) == 32);
-  // Pressure retains two bounded contexts per worker. This still throttles a
-  // depth-16 context pool by 8x, but preserves latency-hiding headroom when the
-  // independently bounded RDMA/scratch lanes are available.
-  assert(stage2_context_admission_limit(2, 16, true) == 4);
-  assert(stage2_context_admission_limit(1, 16, true) == 2);
+  // Pressure retains four bounded contexts per worker: two may use the
+  // physical lanes while two wait on context-owned home RPC state.
+  assert(stage2_context_admission_limit(2, 16, true) == 8);
+  assert(stage2_context_admission_limit(1, 16, true) == 4);
   assert(stage2_context_admission_limit(3, 1, true) == 3);
   assert(stage2_context_admission_limit(0, 0, true) == 1);
   assert(stage2_context_admission_limit(0, 0, false) == 1);
 
   // The global cap alone is not a fair-share policy: a fast worker could
-  // otherwise claim all four/eight contexts while owning only its own RDMA
+  // otherwise claim all bounded contexts while owning only its own RDMA
   // lanes. Each executor applies the matching local share before the global
   // CAS, so all workers can expose their preallocated lanes.
-  assert(stage2_worker_context_admission_limit(16, true) == 2);
+  assert(stage2_worker_context_admission_limit(16, true) == 4);
   assert(stage2_worker_context_admission_limit(1, true) == 1);
   assert(stage2_worker_context_admission_limit(16, false) == 16);
   assert(stage2_worker_context_admission_limit(0, false) == 1);

@@ -11,6 +11,7 @@ using memory_node_peer_rpc_detail::Stage1ControlHomeProgress;
 using memory_node_peer_rpc_detail::Stage1ControlResponseDisposition;
 using memory_node_peer_rpc_detail::Stage1HomeRetryBackoff;
 using memory_node_peer_rpc_detail::classify_stage1_control_response;
+using memory_node_peer_rpc_detail::dequeue_stage2_home_first;
 using memory_node_peer_rpc_detail::make_fused_stage1_release_item;
 using memory_node_peer_rpc_detail::partition_stage1_control_response;
 using memory_node_peer_rpc_detail::partition_stage1_execute_response;
@@ -55,6 +56,28 @@ Stage1ArmResult ok_result(const Stage1ArmItem& input) {
     .maintenance_sequence = 1000 + input.token.item_index,
     .status = static_cast<u32>(MutationStatus::ok),
   };
+}
+
+void test_stage2_home_queue_cannot_starve_behind_stage1() {
+  u32 stage1_streak = 0;
+  for (u32 iteration = 0;
+       iteration < memory_node_peer_rpc_detail::kStage1MaximumDequeueBurst;
+       ++iteration) {
+    assert(!dequeue_stage2_home_first(true, true, stage1_streak));
+  }
+  assert(dequeue_stage2_home_first(true, true, stage1_streak));
+  assert(stage1_streak == 0);
+
+  // Either queue remains independently work-conserving.
+  assert(dequeue_stage2_home_first(false, true, stage1_streak));
+  assert(!dequeue_stage2_home_first(true, false, stage1_streak));
+
+  // A long Stage1-only interval retains a saturated fairness baton, so newly
+  // arrived completion-producing work is served immediately.
+  for (u32 iteration = 0; iteration < 100; ++iteration) {
+    assert(!dequeue_stage2_home_first(true, false, stage1_streak));
+  }
+  assert(dequeue_stage2_home_first(true, true, stage1_streak));
 }
 
 void test_atomic_home_arm_response() {
@@ -547,6 +570,7 @@ void test_execute_mixed_progress_compacts_only_retry_tokens() {
 }  // namespace
 
 int main() {
+  test_stage2_home_queue_cannot_starve_behind_stage1();
   test_atomic_home_arm_response();
   test_release_is_an_idempotent_ordered_watermark();
   test_structural_corruption_never_becomes_retry();

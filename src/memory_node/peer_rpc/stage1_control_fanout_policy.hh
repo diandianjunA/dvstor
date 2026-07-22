@@ -8,6 +8,35 @@
 
 namespace memory_node_peer_rpc_detail {
 
+// Stage1 publication and Stage2 home expansion share a CPU pool. Strictly
+// preferring Stage1 creates a dependency cycle under sustained load: every
+// newly published update adds Stage2 work, but that work runs only after the
+// Stage1 queue becomes empty, so durable completion credit can never return.
+// Bound the Stage1 dequeue burst while keeping both queues work-conserving.
+// This is scheduler fairness only; it neither drops work nor changes either
+// stage's acknowledgement boundary.
+constexpr u32 kStage1MaximumDequeueBurst = 4;
+
+inline bool dequeue_stage2_home_first(
+    bool stage1_available,
+    bool stage2_home_available,
+    u32& stage1_dequeue_streak) noexcept {
+  if (!stage2_home_available) {
+    if (stage1_available) {
+      stage1_dequeue_streak = std::min(
+        kStage1MaximumDequeueBurst, stage1_dequeue_streak + 1);
+    }
+    return false;
+  }
+  if (!stage1_available ||
+      stage1_dequeue_streak >= kStage1MaximumDequeueBurst) {
+    stage1_dequeue_streak = 0;
+    return true;
+  }
+  ++stage1_dequeue_streak;
+  return false;
+}
+
 // Build a fully self-describing transient Stage1 response directly from the
 // validated request bytes. CQ progress uses this when a same-ID request is
 // already executing or bounded queue admission fails. An explicit response

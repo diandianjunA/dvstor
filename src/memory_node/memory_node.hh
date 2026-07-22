@@ -83,6 +83,11 @@ class MemoryNode {
   struct PeerReverseUpdateResponse {
     u32 destination_shard{};
     service::storage_owner::PeerRpcHeader header{};
+    // Empty for the fixed-header reverse-update ACK. Variable-size home
+    // dependency and reconciliation responses retain their immutable bytes
+    // here until an asynchronous registered send slot is available.
+    vec<byte_t> payload;
+    bool graph_response{};
     std::chrono::steady_clock::time_point queued_at{};
   };
 
@@ -489,7 +494,9 @@ private:
       const service::storage_owner::PeerRpcHeader& request,
       bool success) const;
   bool apply_peer_reverse_update_tasks(const vec<PeerReverseUpdateTask>& tasks, const Configuration& config);
-  void send_peer_reverse_update_response(const PeerReverseUpdateResponse& response);
+  void send_peer_reverse_update_response(PeerReverseUpdateResponse& response);
+  vec<byte_t> acquire_peer_graph_response_buffer(size_t bytes);
+  void recycle_peer_graph_response_buffer(vec<byte_t>&& buffer);
   bool try_enqueue_peer_reverse_update_response(
     PeerReverseUpdateResponse&& response);
   bool handle_peer_stage1_execute_request(
@@ -1114,6 +1121,9 @@ private:
   std::deque<PeerPhysicalControlTask> peer_placement_control_tasks_;
   std::unique_ptr<bounded::Queue<PeerReverseUpdateResponse>>
     peer_reverse_responses_;
+  std::mutex peer_graph_response_buffers_mutex_;
+  std::deque<vec<byte_t>> peer_graph_response_buffers_;
+  size_t peer_graph_response_buffer_limit_{1};
   std::atomic<bool> peer_reverse_shutdown_{false};
   std::atomic<bool> peer_reverse_workers_done_{false};
   std::atomic<bool> peer_reverse_response_done_{false};
@@ -1130,6 +1140,14 @@ private:
   std::atomic<u64> peer_stage1_processed_{0};
   std::atomic<u64> peer_stage1_items_{0};
   std::atomic<u64> peer_stage1_max_queue_{0};
+  std::atomic<u64> peer_stage2_home_enqueued_{0};
+  std::atomic<u64> peer_stage2_home_processed_{0};
+  std::atomic<u64> peer_stage2_home_items_{0};
+  std::atomic<u64> peer_stage2_home_max_queue_{0};
+  std::atomic<u64> peer_stage2_home_response_queue_drops_{0};
+  std::atomic<u64> peer_stage2_home_response_send_wait_ns_{0};
+  std::atomic<u64> peer_stage2_home_queue_wait_ns_{0};
+  std::atomic<u64> peer_stage2_home_execution_ns_{0};
   std::atomic<u64> peer_stage1_release_deferred_batches_{0};
   std::atomic<u64> peer_stage1_release_deferred_items_{0};
   std::atomic<u64> peer_stage1_duplicate_retry_responses_{0};

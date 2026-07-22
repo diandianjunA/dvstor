@@ -13,10 +13,10 @@
 
 namespace memory_node_storage_owner_maintenance_detail {
 
-// One Stage2 search lane owns this state while a context is suspended at an
-// RDMA dependency boundary.  The vectors retain their high-water capacity when
-// the lane is reused, so allocation is bounded by the small lane pool rather
-// than by the number or history of Stage2 contexts.
+// One Stage2 context owns this state for the lifetime of its continuation.
+// Registered RDMA scratch remains lane-owned, but the logical beam, pending
+// home RPCs, and retry state must survive releasing that lane while the task is
+// waiting on a dependency that does not reference the scratch buffers.
 enum class Stage2SearchIoPhase : std::uint8_t {
   idle,
   score_body_ready,
@@ -129,9 +129,10 @@ struct Stage2SearchIoState {
   bool prefer_graph{};
   std::size_t round_robin_search{};
 
-  // The continuation is lane-owned because it contains the private beam and
-  // visited set for every task in the compacted context.  A worker may have
-  // several lanes suspended on independent CQ completions at once.
+  // The continuation is context-owned because it contains the private beam
+  // and visited set for every task in the compacted context. A context may
+  // release and later reacquire a physical scratch lane while its home RPCs
+  // are in flight without restarting or changing the logical search.
   memory_node_storage_owner_index_detail::PartitionContinuationBatch
     continuation;
   vec<vec<memory_node_storage_owner_index_detail::PartitionLocalSearchEntry>>
@@ -236,6 +237,17 @@ struct Stage2SearchIoState {
 
   [[nodiscard]] bool idle() const {
     return phase == Stage2SearchIoPhase::idle && !initialized;
+  }
+
+  // A lane may be rebound only when no live object in this state points into
+  // its registered scratch. Home-executed graph expansion owns request and
+  // response payloads independently, so waiting for those RPCs does not pin
+  // the RDMA lane. This increases latency-hiding concurrency without adding a
+  // search budget or acknowledging a task before durable completion.
+  [[nodiscard]] bool scratch_rebindable() const {
+    return idle() ||
+      (phase == Stage2SearchIoPhase::graph_home_pending &&
+       pending_vectors.empty() && pending_graph.empty());
   }
 };
 

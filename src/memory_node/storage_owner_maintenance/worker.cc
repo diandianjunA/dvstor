@@ -58,11 +58,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     // state-machine/context handoff into finalization. Remote reconciliation
     // latency is charged to the context-spanning reverse_prepare timer.
     u64 completion_handoff_started_ns{};
-    // A context owns registered scratch while a search continuation or a
-    // synchronous prune helper can still touch it.  Once the CQ is drained and
-    // the lane-owned search state is idle, scheduler boundaries may release and
-    // later rebind any lane to this context without losing its context-owned
-    // candidates or task progress.
+    // Logical search state belongs to the resumable context. Registered RDMA
+    // scratch belongs to search_lane only while a posted one-sided operation
+    // can still touch it. This lets a home-RPC wait release and later rebind a
+    // lane without restarting the continuation.
+    Stage2SearchIoState search_io;
     std::optional<u32> search_lane;
     bool search_input_prepared{};
     bool search_timing_recorded{};
@@ -126,7 +126,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   Stage2RequestTracker requests(request_capacity);
   vec<Stage2Context> contexts(context_capacity);
   Stage2SearchLanePool search_lanes(thread.post_balances.size());
-  vec<Stage2SearchIoState> search_io_by_lane(search_lanes.capacity());
   // Stage2 resumes one global beam; it does not collect an independent L-set
   // from every shard. Its memory footprint is therefore O(batch * L), not
   // O(batch * shard_count * L).
@@ -218,7 +217,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     const bool rdma_ready = thread.is_ready(lane);
     lib_assert(rdma_ready,
                "stage2 context released scratch with RDMA still in flight");
-    search_io_by_lane[lane].reset();
     lib_assert(search_lanes.release(lane, context.handle, rdma_ready),
                "stage2 search lane release violated context generation");
     context.search_lane.reset();
@@ -229,7 +227,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       const auto lane = search_lanes.try_acquire(context.handle);
       if (!lane.has_value()) return false;
       context.search_lane = *lane;
-      search_io_by_lane[*lane].reset();
     }
     lib_assert(search_lanes.owns(*context.search_lane, context.handle),
                "stage2 search lane belongs to another context generation");
@@ -243,7 +240,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     lib_assert(search_lanes.owns(lane, context.handle),
                "stage2 rebind check observed a foreign search lane");
     if (!stage2_search_lane_rebindable(
-          thread.is_ready(lane), search_io_by_lane[lane].idle())) {
+          thread.is_ready(lane), context.search_io.scratch_rebindable())) {
       return false;
     }
     release_context_lane(context);
@@ -259,6 +256,15 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         cancel_peer_rpc_response(chunk.request_id);
       }
     }
+    for (size_t rpc_index = 0;
+         rpc_index < context.search_io.home_expand_rpc_count; ++rpc_index) {
+      const Stage2HomeExpandRpc& rpc =
+        context.search_io.home_expand_rpcs[rpc_index];
+      if (rpc.posted && !rpc.complete && rpc.request_id != 0) {
+        cancel_peer_rpc_response(rpc.request_id);
+      }
+    }
+    context.search_io.reset();
     context.reconcile_batch.clear();
     context.active = false;
     context.tasks.clear();
@@ -1231,8 +1237,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     // wave. Graph and vector reads that are ready at the same time are issued
     // across the complete context batch, eliminating the per-task RDMA RTT
     // chain while preserving each task's private beam and convergence state.
-    Stage2SearchIoState& search_io =
-      search_io_by_lane[*context.search_lane];
+    Stage2SearchIoState& search_io = context.search_io;
     const Stage2SearchAdvanceResult search_result =
       advance_stage2_search_candidates_batched(
       span<const StorageOwnerMaintenanceTask>{context.tasks},

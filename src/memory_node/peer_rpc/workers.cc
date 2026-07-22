@@ -1,4 +1,5 @@
 #include "memory_node/peer_rpc/detail.hh"
+#include "memory_node/peer_rpc/stage1_control_fanout_policy.hh"
 
 void MemoryNode::peer_rpc_progress_loop() {
   lib_assert(storage_worker_config_ != nullptr,
@@ -531,8 +532,13 @@ void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
         lib_assert(peer_request_deduplicator_->abandon(
                      task.dedup_lease, task.source_shard, task.header),
                    "reconcile completion lost its dedup lease");
-        send_peer_rpc_message(
-          task.source_shard, response.data(), response.size());
+        PeerReverseUpdateResponse outbound;
+        outbound.destination_shard = task.source_shard;
+        outbound.header = *response_header;
+        outbound.payload = std::move(response);
+        outbound.graph_response = true;
+        outbound.queued_at = std::chrono::steady_clock::now();
+        (void)try_enqueue_peer_reverse_update_response(std::move(outbound));
         continue;
       }
       const auto response_header = make_peer_reverse_update_response(
@@ -549,6 +555,7 @@ void MemoryNode::peer_reverse_update_worker_loop(u32 worker_id) {
 void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
   current_storage_owner_thread_ = peer_stage1_worker_states_[worker_id].get();
   const Configuration& config = *storage_worker_config_;
+  u32 stage1_dequeue_streak = 0;
   for (;;) {
     {
       std::unique_lock<std::mutex> lock(peer_stage1_tasks_mutex_);
@@ -574,10 +581,18 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
       if (peer_stage1_tasks_.empty() && peer_stage2_home_tasks_.empty()) {
         continue;
       }
-      if (!peer_stage1_tasks_.empty()) {
+      const bool take_stage2_home =
+        memory_node_peer_rpc_detail::dequeue_stage2_home_first(
+          !peer_stage1_tasks_.empty(), !peer_stage2_home_tasks_.empty(),
+          stage1_dequeue_streak);
+      if (!take_stage2_home) {
+        lib_assert(!peer_stage1_tasks_.empty(),
+                   "Stage1 scheduler selected an empty publication queue");
         task = std::move(peer_stage1_tasks_.front());
         peer_stage1_tasks_.pop_front();
       } else {
+        lib_assert(!peer_stage2_home_tasks_.empty(),
+                   "Stage1 scheduler selected an empty Stage2 home queue");
         task = std::move(peer_stage2_home_tasks_.front());
         peer_stage2_home_tasks_.pop_front();
       }
@@ -588,6 +603,11 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
       service::storage_owner::PeerRpcType>(task.header.type);
     if (request_type ==
         service::storage_owner::PeerRpcType::stage2_expand_score_request) {
+      const auto execution_started = std::chrono::steady_clock::now();
+      peer_stage2_home_queue_wait_ns_.fetch_add(
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          execution_started - task.received_at).count()),
+        std::memory_order_relaxed);
       (void)handle_peer_stage2_expand_score_request(
         task.source_shard, task.header, task.payload.data(), config);
       // The operation is read-only and generation fenced at the caller.  Do
@@ -596,7 +616,11 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
       lib_assert(peer_request_deduplicator_->abandon(
                    task.dedup_lease, task.source_shard, task.header),
                  "Stage2 home completion lost its dedup lease");
-      peer_stage1_processed_.fetch_add(1, std::memory_order_relaxed);
+      peer_stage2_home_processed_.fetch_add(1, std::memory_order_relaxed);
+      peer_stage2_home_execution_ns_.fetch_add(
+        static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - execution_started).count()),
+        std::memory_order_relaxed);
       peer_stage1_tasks_cv_.notify_one();
       continue;
     }
