@@ -296,22 +296,26 @@ void MemoryNode::peer_rpc_progress_loop() {
                 .fetch_add(1, std::memory_order_relaxed);
             }
           } else if (decision.action ==
-                       memory_node_detail::PeerRequestAction::duplicate_inflight ||
-                     decision.action ==
+                       memory_node_detail::PeerRequestAction::duplicate_inflight) {
+            // The original request may be parked behind the bounded Stage2
+            // credit window and owns the only semantic execution/dedup lease.
+            // Coalesce a same-ID retransmission into its eventual late
+            // response. Sending an immediate retry here changes a normal
+            // at-most-once duplicate into a 10ms polling loop that steals the
+            // CPU/CQ capacity needed to release that very window.
+            peer_stage1_duplicate_coalesced_.fetch_add(
+              1, std::memory_order_relaxed);
+          } else if (decision.action ==
                        memory_node_detail::PeerRequestAction::full) {
-            // Never make an idempotent caller discover transient receiver
-            // pressure only through a 500 ms attempt timeout. A token-complete
-            // retry response is nonblocking and races safely with the original
-            // success response in the same response registry.
+            // No original execution owns a full-table rejection, so return an
+            // explicit retry rather than making the caller wait for a response
+            // that cannot arrive.
             const bool sent = try_send_peer_stage1_retry_response(
               peer_id, *header,
               span<const byte_t>{payload, expected_bytes});
             if (sent) {
-              (decision.action ==
-                   memory_node_detail::PeerRequestAction::duplicate_inflight
-                 ? peer_stage1_duplicate_retry_responses_
-                 : peer_stage1_admission_retry_responses_)
-                .fetch_add(1, std::memory_order_relaxed);
+              peer_stage1_admission_retry_responses_.fetch_add(
+                1, std::memory_order_relaxed);
             } else {
               peer_stage1_retry_response_drops_.fetch_add(
                 1, std::memory_order_relaxed);
@@ -550,6 +554,28 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
                "peer Stage1 task omitted its RC receive-order sequence");
     PeerOrderedCompletionState& completion =
       *peer_stage1_completion_states_[task.source_shard];
+    const auto record_source_completion = [&]() {
+      if (task.source_sequence_completed) return;
+      {
+        std::lock_guard<std::mutex> lock(completion.mutex);
+        if (task.source_sequence == completion.completed_prefix + 1) {
+          ++completion.completed_prefix;
+          while (completion.completed_out_of_order.erase(
+                   completion.completed_prefix + 1) != 0) {
+            ++completion.completed_prefix;
+          }
+        } else {
+          lib_assert(task.source_sequence > completion.completed_prefix + 1,
+                     "peer Stage1 task completed its sequence twice");
+          const bool inserted = completion.completed_out_of_order.insert(
+            task.source_sequence).second;
+          lib_assert(inserted,
+                     "peer Stage1 out-of-order sequence completed twice");
+        }
+      }
+      task.source_sequence_completed = true;
+      completion.changed.notify_all();
+    };
     bool release_quiesced = true;
     if (release_barrier) {
       const auto* items = service::storage_owner::stage1_arm_items(
@@ -568,6 +594,7 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
       }
     }
     bool success = false;
+    bool admission_deferred = false;
     if (release_barrier && !release_quiesced) {
       peer_stage1_release_deferred_batches_.fetch_add(
         1, std::memory_order_relaxed);
@@ -577,13 +604,100 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
     if (release_quiesced && request_type ==
         service::storage_owner::PeerRpcType::stage1_execute_request) {
       success = handle_peer_stage1_execute_request(
-        task.source_shard, task.header, task.payload.data(), config);
+        task.source_shard, task.header, task.payload.data(), config,
+        &admission_deferred);
     } else if (request_type ==
                service::storage_owner::PeerRpcType::stage1_arm_request) {
       success = handle_peer_stage1_arm_request(
         task.source_shard, task.header,
         service::storage_owner::stage1_arm_items(task.payload.data()),
         release_quiesced, config);
+    }
+    const bool had_admission_wake_coverage =
+      task.admission_wake_coverage != 0;
+    const auto release_admission_wake_coverage_locked = [&]() {
+      if (task.admission_wake_coverage == 0) return;
+      lib_assert(peer_stage1_admission_wake_coverage_ >=
+                   task.admission_wake_coverage,
+                 "Stage1 runnable waiter coverage underflow");
+      peer_stage1_admission_wake_coverage_ -=
+        task.admission_wake_coverage;
+      task.admission_wake_coverage = 0;
+    };
+    if (admission_deferred) {
+      // Retain the exact request/dedup lease and semantic in-flight tokens.
+      // The completion sequence is diagnostic only, and must be retired now
+      // so one saturated physical home cannot grow its out-of-order set behind
+      // a long-lived parked request.
+      const bool reparked = task.admission_waiter_owned;
+      record_source_completion();
+      bool parked = false;
+      size_t waiter_count = 0;
+      {
+        std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
+        // Drop this request's scheduler baton in the same critical section
+        // that republishes it as a waiter. No younger waiter can observe the
+        // transient uncovered credit and overtake it in between.
+        release_admission_wake_coverage_locked();
+        const size_t waiter_item_limit = std::max<size_t>(
+          1, storage_owner_maintenance_admission_limit_);
+        const size_t task_items = task.header.item_count;
+        const bool owns_waiter_items = task.admission_waiter_owned;
+        if (!peer_reverse_shutdown_.load(std::memory_order_acquire) &&
+            !storage_owner_maintenance_shutdown_.load(
+              std::memory_order_acquire) &&
+            task_items <= waiter_item_limit &&
+            (owns_waiter_items ||
+             peer_stage1_admission_owned_items_ <=
+               waiter_item_limit - task_items)) {
+          if (!owns_waiter_items) {
+            task.admission_waiter_owned = true;
+            peer_stage1_admission_owned_items_ += task_items;
+          }
+          peer_stage1_admission_waiters_.push_back(std::move(task));
+          peer_stage1_admission_waiter_items_ += task_items;
+          peer_stage1_admission_waiter_items_hint_.store(
+            peer_stage1_admission_waiter_items_,
+            std::memory_order_release);
+          waiter_count = peer_stage1_admission_waiters_.size();
+          parked = true;
+        }
+      }
+      if (parked) {
+        peer_stage1_admission_parked_.fetch_add(
+          1, std::memory_order_relaxed);
+        if (reparked) {
+          peer_stage1_admission_reparked_.fetch_add(
+            1, std::memory_order_relaxed);
+        }
+        atomic_utils::update_max_relaxed(
+          peer_stage1_max_admission_waiters_,
+          static_cast<u64>(waiter_count));
+        // Do not abandon the dedup lease or finish operation_tokens. A same-ID
+        // retry is coalesced, and the eventual late success remains fenced by
+        // the original in-flight ownership.
+        // Recheck after parking to close the lost-wakeup race in which the
+        // final completion/queue-pop edge happened between arm failure and
+        // insertion into the waiter deque. The wake routine accounts runnable
+        // soft coverage, so this cannot create a completion-burst stampede.
+        wake_peer_stage1_admission_waiters();
+        continue;
+      }
+
+      // The waiter pool is intentionally bounded independently of the large
+      // peer dedup table so Stage2 reverse/placement traffic always retains
+      // headroom. Fall back to an explicit retry without losing the original
+      // request's cleanup path.
+      const bool sent = try_send_peer_stage1_retry_response(
+        task.source_shard, task.header,
+        span<const byte_t>{task.payload.data(), task.payload.size()});
+      (sent ? peer_stage1_admission_retry_responses_
+            : peer_stage1_retry_response_drops_)
+        .fetch_add(1, std::memory_order_relaxed);
+    }
+    if (task.admission_wake_coverage != 0) {
+      std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
+      release_admission_wake_coverage_locked();
     }
     // Stage1 payloads live in the bounded operation table and arm is
     // idempotent there, so a same-ID retry can be executed safely. Large
@@ -601,30 +715,27 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
       };
       finish_stage1_inflight_request(key);
     }
-    {
-      std::lock_guard<std::mutex> lock(completion.mutex);
-      if (task.source_sequence == completion.completed_prefix + 1) {
-        ++completion.completed_prefix;
-        while (completion.completed_out_of_order.erase(
-                 completion.completed_prefix + 1) != 0) {
-          ++completion.completed_prefix;
-        }
-      } else {
-        lib_assert(task.source_sequence > completion.completed_prefix + 1,
-                   "peer Stage1 task completed its sequence twice");
-        const bool inserted = completion.completed_out_of_order.insert(
-          task.source_sequence).second;
-        lib_assert(inserted,
-                   "peer Stage1 out-of-order sequence completed twice");
-      }
+    if (task.admission_waiter_owned) {
+      std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
+      const size_t task_items = task.header.item_count;
+      lib_assert(peer_stage1_admission_owned_items_ >= task_items,
+                 "Stage1 semantic waiter item account underflow");
+      peer_stage1_admission_owned_items_ -= task_items;
+      task.admission_waiter_owned = false;
     }
-    completion.changed.notify_all();
+    record_source_completion();
     // `processed` counts consumed RPCs, including an explicit retry response.
     // The handlers count each per-token ok result directly, including mixed
     // responses; charging item_count only when the aggregate bool was true
     // made partial progress invisible and distorted retry amplification.
     peer_stage1_processed_.fetch_add(1, std::memory_order_relaxed);
     (void)success;
+    if (had_admission_wake_coverage) {
+      // A woken request can resolve without consuming its advertised soft
+      // coverage (for example a structural retry during shutdown). Pass any
+      // still-visible credit to the next FIFO waiter.
+      wake_peer_stage1_admission_waiters();
+    }
     peer_stage1_tasks_cv_.notify_one();
   }
 }

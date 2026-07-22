@@ -99,6 +99,18 @@ struct Stage2ScoreRoundRobinCursor {
   }
 };
 
+// Registered lane scratch is consumed only by a distinct remote physical
+// READ.  Local/terminal work and another logical consumer of a pointer already
+// selected in this dispatch need no additional scratch record.  Keep this
+// predicate separate from transport-credit admission: both limits must accept
+// a distinct remote pointer before the collector records it.
+constexpr bool stage2_consumer_fits_physical_scratch(
+    bool distinct_remote,
+    std::size_t physical_reads,
+    std::size_t physical_read_capacity) {
+  return !distinct_remote || physical_reads < physical_read_capacity;
+}
+
 struct Stage2SearchIoState {
   bool initialized{};
   Stage2SearchIoPhase phase{Stage2SearchIoPhase::idle};
@@ -123,12 +135,14 @@ struct Stage2SearchIoState {
   // sorted group table reads one physical pointer and scatters the stable or
   // terminal outcome to every matching search.
   vec<Stage2ScoreConsumer> score_consumers;
+  hashset_t<RemotePtr> score_selected_remote;
   vec<std::size_t> score_order;
   vec<std::size_t> score_group_offsets;
   vec<RemotePtr> score_unique;
   vec<Stage2PendingVectorRead> pending_vectors;
 
   vec<Stage2GraphConsumer> graph_consumers;
+  hashset_t<RemotePtr> graph_selected_remote;
   vec<std::size_t> graph_order;
   vec<std::size_t> graph_group_offsets;
   vec<RemotePtr> graph_unique;
@@ -147,11 +161,13 @@ struct Stage2SearchIoState {
     search_seeded.clear();
     score_collect_cursors.clear();
     score_consumers.clear();
+    score_selected_remote.clear();
     score_order.clear();
     score_group_offsets.clear();
     score_unique.clear();
     pending_vectors.clear();
     graph_consumers.clear();
+    graph_selected_remote.clear();
     graph_order.clear();
     graph_group_offsets.clear();
     graph_unique.clear();
@@ -179,6 +195,8 @@ struct Stage2SearchIoState {
     trim(search_seeded);
     trim(score_collect_cursors);
     trim(score_consumers);
+    // The selected-pointer sets can never grow beyond the fixed physical
+    // scratch capacity, unlike the logical continuation vectors trimmed here.
     trim(score_order);
     trim(score_group_offsets);
     trim(score_unique);

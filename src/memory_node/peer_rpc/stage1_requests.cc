@@ -309,8 +309,10 @@ bool MemoryNode::handle_peer_stage1_execute_request(
     u32 source_shard,
     const service::storage_owner::PeerRpcHeader& header,
     const byte_t* payload,
-    const Configuration& config) {
+    const Configuration& config,
+    bool* admission_deferred) {
   using namespace service::storage_owner;
+  if (admission_deferred != nullptr) *admission_deferred = false;
   if (payload == nullptr || header.item_count == 0 ||
       header.item_count > config.storage_owner_batch_max ||
       source_shard >= num_storage_nodes_) {
@@ -369,6 +371,7 @@ bool MemoryNode::handle_peer_stage1_execute_request(
     }
   }
 
+  bool saw_admission_block = false;
   if (!fused_arm_items.empty()) {
     // Transport batching does not make sibling mutation tokens atomic. Arm
     // every prepared token now even when another prepare returned transient
@@ -383,9 +386,11 @@ bool MemoryNode::handle_peer_stage1_execute_request(
     // That fallback admits every token for which credit exists and produces a
     // truthful mixed ok/retry response; receipt replay consumes no new credit.
     vec<Stage1ArmResult> arm_results;
+    bool batch_admission_blocked = false;
     (void)arm_local_stage1_items(
       source_shard, span<const Stage1ArmItem>{fused_arm_items},
-      arm_results, config);
+      arm_results, config, &batch_admission_blocked);
+    saw_admission_block |= batch_admission_blocked;
     const bool batch_fast_path =
       arm_results.size() == fused_arm_items.size() &&
       std::all_of(
@@ -403,9 +408,11 @@ bool MemoryNode::handle_peer_stage1_execute_request(
       if (batch_fast_path) {
         result = &arm_results[slot];
       } else {
+        bool one_admission_blocked = false;
         (void)arm_local_stage1_items(
           source_shard, span<const Stage1ArmItem>{&arm, 1},
-          one_result, config);
+          one_result, config, &one_admission_blocked);
+        saw_admission_block |= one_admission_blocked;
         if (one_result.size() == 1) result = &one_result.front();
       }
       if (result == nullptr) {
@@ -431,6 +438,31 @@ bool MemoryNode::handle_peer_stage1_execute_request(
       execute.maintenance_sequence = result->maintenance_sequence;
       execute.status = result->status;
     }
+  }
+
+  // A prepared fresh-insert request that made no semantic progress solely
+  // because the ordered Stage2 window is full is not a transport failure.
+  // Keep its original dedup lease/request ID parked on the physical home. A
+  // durable completion will wake it and the cached ANN artifact will be armed
+  // exactly once; the authority's existing late-response registry consumes
+  // that success. This removes completion-credit polling without moving the
+  // public ACK boundary or reserving additional Stage2 debt.
+  const bool complete_fused_prepare =
+    fused_result_indices.size() == header.item_count;
+  const bool all_admission_retry = complete_fused_prepare &&
+    std::all_of(output, output + header.item_count,
+                [](const Stage1ExecuteResult& result) {
+                  return result.status ==
+                    static_cast<u32>(MutationStatus::retry) &&
+                    result.maintenance_sequence == 0;
+                });
+  if (saw_admission_block && all_admission_retry &&
+      admission_deferred != nullptr &&
+      !peer_reverse_shutdown_.load(std::memory_order_acquire) &&
+      !storage_owner_maintenance_shutdown_.load(
+        std::memory_order_acquire)) {
+    *admission_deferred = true;
+    return false;
   }
 
   response_header->status = static_cast<u32>(InsertStatus::ok);
@@ -534,8 +566,10 @@ bool MemoryNode::arm_local_stage1_items(
     u32 authority_shard,
     span<const service::storage_owner::Stage1ArmItem> items,
     vec<service::storage_owner::Stage1ArmResult>& results,
-    const Configuration& config) {
+    const Configuration& config,
+    bool* admission_blocked) {
   using namespace service::storage_owner;
+  if (admission_blocked != nullptr) *admission_blocked = false;
   results.assign(items.size(), {});
   if (authority_shard >= num_storage_nodes_ || items.empty()) return false;
 
@@ -701,7 +735,9 @@ bool MemoryNode::arm_local_stage1_items(
     }
     u64 first_sequence = 0;
     if (!tasks.empty()) {
-      first_sequence = arm_storage_owner_maintenance_batch(tasks, config);
+      bool capacity_blocked = false;
+      first_sequence = arm_storage_owner_maintenance_batch(
+        tasks, config, &capacity_blocked);
       if (first_sequence == 0) {
         // Queue/completion admission is try-only. No task was consumed and no
         // sequence was published, so restore every claimed heavy artifact and
@@ -712,6 +748,9 @@ bool MemoryNode::arm_local_stage1_items(
           claimed[item].task = std::move(tasks[item]);
         }
         restore_claims();
+        if (admission_blocked != nullptr) {
+          *admission_blocked = capacity_blocked;
+        }
         for (Stage1ArmResult& output : results) {
           output.maintenance_sequence = 0;
           output.status = static_cast<u32>(MutationStatus::retry);

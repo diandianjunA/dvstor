@@ -727,6 +727,8 @@ void test_stage2_admission_yields_only_for_live_foreground_pressure() {
 void test_stage2_pressure_retains_a_dedicated_progress_floor() {
   using memory_node_storage_owner_maintenance_detail::
     stage2_context_admission_limit;
+  using memory_node_storage_owner_maintenance_detail::
+    stage2_worker_context_admission_limit;
 
   // The normal path can hide peer latency with the configured RPC depth.
   assert(stage2_context_admission_limit(2, 16, false) == 32);
@@ -738,6 +740,35 @@ void test_stage2_pressure_retains_a_dedicated_progress_floor() {
   assert(stage2_context_admission_limit(3, 1, true) == 3);
   assert(stage2_context_admission_limit(0, 0, true) == 1);
   assert(stage2_context_admission_limit(0, 0, false) == 1);
+
+  // The global cap alone is not a fair-share policy: a fast worker could
+  // otherwise claim all four/eight contexts while owning only its own RDMA
+  // lanes. Each executor applies the matching local share before the global
+  // CAS, so all workers can expose their preallocated lanes.
+  assert(stage2_worker_context_admission_limit(16, true) == 2);
+  assert(stage2_worker_context_admission_limit(1, true) == 1);
+  assert(stage2_worker_context_admission_limit(16, false) == 16);
+  assert(stage2_worker_context_admission_limit(0, false) == 1);
+}
+
+void test_stage1_waiter_wake_coverage_prevents_credit_stampedes() {
+  using memory_node_storage_owner_maintenance_detail::
+    stage1_waiter_head_wake_coverage;
+  using memory_node_storage_owner_maintenance_detail::
+    stage1_waiter_uncovered_wake_capacity;
+
+  assert(stage1_waiter_uncovered_wake_capacity(32, 0) == 32);
+  assert(stage1_waiter_uncovered_wake_capacity(32, 32) == 0);
+  assert(stage1_waiter_uncovered_wake_capacity(32, 40) == 0);
+
+  // One 32-item request covers the entire 32-credit edge, rather than waking
+  // 32 whole RPCs. A one-credit edge still wakes the FIFO head so its truthful
+  // per-token admission fallback can make progress without starvation.
+  assert(stage1_waiter_head_wake_coverage(32, 32) == 32);
+  assert(stage1_waiter_head_wake_coverage(32, 1) == 32);
+  assert(stage1_waiter_head_wake_coverage(4, 32) == 4);
+  assert(stage1_waiter_head_wake_coverage(0, 32) == 0);
+  assert(stage1_waiter_head_wake_coverage(32, 0) == 0);
 }
 
 void test_stage2_sequence_window_tracks_service_capacity_not_lane_rebalance() {
@@ -1056,6 +1087,7 @@ int main() {
   test_stale_stage2_repair_keeps_wire_payload_bound();
   test_stage2_admission_yields_only_for_live_foreground_pressure();
   test_stage2_pressure_retains_a_dedicated_progress_floor();
+  test_stage1_waiter_wake_coverage_prevents_credit_stampedes();
   test_stage2_sequence_window_tracks_service_capacity_not_lane_rebalance();
   test_stage1_arm_queue_permit_cannot_be_stolen();
   test_stage1_arm_batch_queue_permit_is_atomic_and_bounded();

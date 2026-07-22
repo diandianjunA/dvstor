@@ -39,6 +39,11 @@ public:
     active_ = false;
   }
 
+  // Explicit rollback is an admission-credit edge. The caller invokes the
+  // peer-waiter wake only after this method has released mutex_, avoiding a
+  // maintenance->peer nested lock while closing the last-permit lost wake.
+  void release_now() { release(); }
+
 private:
   void release() {
     if (!active_) return;
@@ -74,8 +79,16 @@ u64 MemoryNode::arm_storage_owner_maintenance(
 
 u64 MemoryNode::arm_storage_owner_maintenance_batch(
     vec<StorageOwnerMaintenanceTask>& tasks,
-    const Configuration& config) {
-  if (!storage_owner_maintenance_enabled(config) || tasks.empty() ||
+    const Configuration& config,
+    bool* capacity_blocked) {
+  if (capacity_blocked != nullptr) *capacity_blocked = false;
+  // Peer receive/progress threads are intentionally started before the Stage2
+  // executor so RC traffic can queue during node startup. A faster peer may
+  // therefore deliver Stage1 in that narrow window; return an explicit retry
+  // rather than entering try_begin() before its completion ring exists.
+  if (!storage_owner_maintenance_enabled(config) ||
+      storage_owner_maintenance_completion_ring_ == nullptr ||
+      storage_owner_maintenance_admission_limit_ == 0 || tasks.empty() ||
       tasks.size() > config.storage_owner_maintenance_queue_depth ||
       tasks.size() > storage_owner_maintenance_admission_limit_) {
     return 0;
@@ -96,13 +109,16 @@ u64 MemoryNode::arm_storage_owner_maintenance_batch(
   {
     std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
     if (storage_owner_maintenance_shutdown_.load(
-          std::memory_order_acquire) ||
-        !try_acquire_maintenance_queue_batch_permit(
+          std::memory_order_acquire)) {
+      return 0;
+    }
+    if (!try_acquire_maintenance_queue_batch_permit(
           storage_owner_stage2_tasks_.size() +
             storage_owner_cleanup_tasks_.size(),
           task_count,
           config.storage_owner_maintenance_queue_depth,
           storage_owner_maintenance_reserved_slots_)) {
+      if (capacity_blocked != nullptr) *capacity_blocked = true;
       return 0;
     }
   }
@@ -112,7 +128,16 @@ u64 MemoryNode::arm_storage_owner_maintenance_batch(
 
   const u64 first_sequence = try_begin_storage_owner_maintenance_batch(
     span<const u32>{work_items});
-  if (first_sequence == 0) return 0;
+  if (first_sequence == 0) {
+    if (capacity_blocked != nullptr &&
+        !storage_owner_maintenance_shutdown_.load(
+          std::memory_order_acquire)) {
+      *capacity_blocked = true;
+    }
+    queue_permit.release_now();
+    wake_peer_stage1_admission_waiters();
+    return 0;
+  }
   const auto queued_at = std::chrono::steady_clock::now();
   size_t backlog = 0;
   bool enqueued = false;
@@ -315,6 +340,84 @@ void MemoryNode::complete_storage_owner_maintenance_sequence(
     sequence, work_items);
   publish_storage_owner_maintenance_watermarks();
   storage_owner_maintenance_cv_.notify_all();
+  wake_peer_stage1_admission_waiters();
+}
+
+void MemoryNode::wake_peer_stage1_admission_waiters() {
+  if (peer_stage1_admission_waiter_items_hint_.load(
+        std::memory_order_acquire) == 0) {
+    return;
+  }
+  if (storage_owner_maintenance_completion_ring_ == nullptr ||
+      storage_owner_maintenance_admission_limit_ == 0 ||
+      storage_worker_config_ == nullptr) {
+    return;
+  }
+  const size_t outstanding =
+    storage_owner_maintenance_completion_ring_->outstanding();
+  if (outstanding >= storage_owner_maintenance_admission_limit_) return;
+  size_t queue_available = 0;
+  {
+    std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
+    const size_t occupied = storage_owner_stage2_tasks_.size() +
+      storage_owner_cleanup_tasks_.size() +
+      storage_owner_maintenance_reserved_slots_;
+    const size_t queue_depth =
+      storage_worker_config_->storage_owner_maintenance_queue_depth;
+    if (occupied >= queue_depth) return;
+    queue_available = queue_depth - occupied;
+  }
+  size_t available = std::min(
+    storage_owner_maintenance_admission_limit_ - outstanding,
+    queue_available);
+  u64 woken = 0;
+  {
+    std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
+    available = stage1_waiter_uncovered_wake_capacity(
+      available, peer_stage1_admission_wake_coverage_);
+    if (available == 0) return;
+    // Reserve no hidden debt here: this is only a runnable notification. The
+    // normal try-only arm remains the sole allocator. One visible credit can
+    // wake an oversized FIFO head, whose *whole* demand becomes soft coverage;
+    // its existing per-token fallback then makes truthful partial progress.
+    // Requiring item_count visible credits before waking can starve forever in
+    // a closed loop where other producers consume each returned credit before
+    // a full wire batch accumulates.
+    std::deque<PeerStage1Task> ready_waiters;
+    while (available != 0 &&
+           !peer_stage1_admission_waiters_.empty()) {
+      const size_t item_count = std::max<size_t>(
+        1, peer_stage1_admission_waiters_.front().header.item_count);
+      const size_t coverage = stage1_waiter_head_wake_coverage(
+        item_count, available);
+      available = coverage >= available ? 0 : available - coverage;
+      lib_assert(peer_stage1_admission_waiter_items_ >= item_count,
+                 "Stage1 admission waiter item account underflow");
+      peer_stage1_admission_waiter_items_ -= item_count;
+      peer_stage1_admission_waiter_items_hint_.store(
+        peer_stage1_admission_waiter_items_, std::memory_order_release);
+      PeerStage1Task ready =
+        std::move(peer_stage1_admission_waiters_.front());
+      ready.admission_wake_coverage = static_cast<u32>(coverage);
+      peer_stage1_admission_wake_coverage_ += coverage;
+      ready_waiters.push_back(std::move(ready));
+      peer_stage1_admission_waiters_.pop_front();
+      ++woken;
+    }
+    // A returned completion credit is the event that made these old waiters
+    // runnable. Put them ahead of fresh peer traffic so a hot receive stream
+    // cannot repeatedly steal the credit and force wake -> repark CPU churn.
+    // Moving the temporary queue from the back preserves waiter FIFO order.
+    while (!ready_waiters.empty()) {
+      peer_stage1_tasks_.push_front(std::move(ready_waiters.back()));
+      ready_waiters.pop_back();
+    }
+  }
+  if (woken != 0) {
+    peer_stage1_admission_woken_.fetch_add(
+      woken, std::memory_order_relaxed);
+    peer_stage1_tasks_cv_.notify_all();
+  }
 }
 
 bool MemoryNode::storage_owner_cleanup_ready(u64 sequence) const {

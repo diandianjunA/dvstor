@@ -72,6 +72,42 @@ inline std::size_t stage2_context_admission_limit(
   return workers * contexts_per_worker;
 }
 
+// The global context counter above is a debt/scratch bound, not a fair-share
+// scheduler.  Without this local bound, the first OS worker to run can claim
+// the entire global allowance even though it owns only its own small search
+// lane pool; the other workers and their RDMA lanes then remain idle.  Apply
+// the same per-worker share before touching the global counter.  This changes
+// only which executor owns an admitted context, never the search, completion
+// window, or amount of acknowledged work.
+inline std::size_t stage2_worker_context_admission_limit(
+    std::size_t rpc_depth,
+    bool foreground_pressure) {
+  const std::size_t depth = std::max<std::size_t>(1, rpc_depth);
+  return foreground_pressure ? std::min<std::size_t>(depth, 2) : depth;
+}
+
+// Credit-return callbacks can race and observe the same completion-ring
+// availability. Runnable waiter coverage is a scheduler-only claim that makes
+// those snapshots idempotent without reserving a maintenance sequence.
+inline std::size_t stage1_waiter_uncovered_wake_capacity(
+    std::size_t resource_available,
+    std::size_t runnable_coverage) {
+  return resource_available > runnable_coverage
+    ? resource_available - runnable_coverage : 0;
+}
+
+// Wake an oversized FIFO head even when only one semantic credit is visible;
+// its existing per-token fallback makes partial progress. Cover its *whole*
+// demand as a scheduling baton: if another 31 credits arrive before this
+// 32-item request runs, a second whole request must not be woken for the same
+// eventual capacity. This is not durable debt or a sequence reservation.
+inline std::size_t stage1_waiter_head_wake_coverage(
+    std::size_t item_count,
+    std::size_t uncovered_capacity) {
+  if (item_count == 0 || uncovered_capacity == 0) return 0;
+  return item_count;
+}
+
 // A Stage1 arm permit bridges the queue-capacity check and the try-only
 // completion-ring transaction. Other producers must include those permits in
 // their queue-capacity test or they could steal a runnable slot after arm has

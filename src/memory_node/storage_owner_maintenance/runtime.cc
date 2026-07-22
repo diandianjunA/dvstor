@@ -536,6 +536,21 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
     peer_stage1_processed_.load(std::memory_order_relaxed);
   const u64 peer_stage1_items =
     peer_stage1_items_.load(std::memory_order_relaxed);
+  u64 peer_stage1_admission_waiters = 0;
+  u64 peer_stage1_admission_waiter_items = 0;
+  u64 peer_stage1_admission_owned_items = 0;
+  u64 peer_stage1_admission_wake_coverage = 0;
+  {
+    std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
+    peer_stage1_admission_waiters =
+      static_cast<u64>(peer_stage1_admission_waiters_.size());
+    peer_stage1_admission_waiter_items =
+      static_cast<u64>(peer_stage1_admission_waiter_items_);
+    peer_stage1_admission_owned_items =
+      static_cast<u64>(peer_stage1_admission_owned_items_);
+    peer_stage1_admission_wake_coverage =
+      static_cast<u64>(peer_stage1_admission_wake_coverage_);
+  }
   const u64 peer_reverse_enqueued =
     peer_reverse_update_enqueued_.load(std::memory_order_relaxed);
   const u64 peer_reverse_processed =
@@ -785,6 +800,29 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                  std::memory_order_relaxed)) +
                " peer_stage1_retry_response_drops=" +
                std::to_string(peer_stage1_retry_response_drops_.load(
+                 std::memory_order_relaxed)) +
+               " peer_stage1_admission_waiters=" +
+               std::to_string(peer_stage1_admission_waiters) +
+               " peer_stage1_admission_waiter_items=" +
+               std::to_string(peer_stage1_admission_waiter_items) +
+               " peer_stage1_admission_owned_items=" +
+               std::to_string(peer_stage1_admission_owned_items) +
+               " peer_stage1_admission_wake_coverage=" +
+               std::to_string(peer_stage1_admission_wake_coverage) +
+               " peer_stage1_admission_parked=" +
+               std::to_string(peer_stage1_admission_parked_.load(
+                 std::memory_order_relaxed)) +
+               " peer_stage1_admission_woken=" +
+               std::to_string(peer_stage1_admission_woken_.load(
+                 std::memory_order_relaxed)) +
+               " peer_stage1_admission_reparked=" +
+               std::to_string(peer_stage1_admission_reparked_.load(
+                 std::memory_order_relaxed)) +
+               " peer_stage1_max_admission_waiters=" +
+               std::to_string(peer_stage1_max_admission_waiters_.load(
+                 std::memory_order_relaxed)) +
+               " peer_stage1_duplicate_coalesced=" +
+               std::to_string(peer_stage1_duplicate_coalesced_.load(
                  std::memory_order_relaxed)) +
                " peer_reverse_enqueued=" +
                std::to_string(peer_reverse_enqueued) +

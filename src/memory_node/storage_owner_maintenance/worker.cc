@@ -3064,6 +3064,18 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     }
     const bool foreground_pressure =
       admission == Stage2AdmissionDecision::foreground_pressure;
+    const size_t local_context_limit =
+      stage2_worker_context_admission_limit(
+        config.storage_owner_rpc_depth, foreground_pressure);
+    if (states.size() >= local_context_limit) {
+      // Do not let this worker monopolize the process-wide context allowance.
+      // Its contexts can use only this worker's registered search lanes;
+      // leaving the remaining global permits for sibling workers is what
+      // exposes the already-allocated RDMA concurrency.
+      storage_owner_maintenance_pressure_yields_.fetch_add(
+        1, std::memory_order_relaxed);
+      return nullptr;
+    }
     if (!try_acquire_storage_owner_maintenance_slot(
           config, foreground_pressure)) {
       storage_owner_maintenance_pressure_yields_.fetch_add(
@@ -3172,6 +3184,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       }
     }
     lock.unlock();
+    // Removing descriptors from the bounded runnable queue is an admission
+    // edge just like completing a Stage2 sequence. Wake a parked Stage1 arm
+    // even when queue capacity, rather than completion credit, was the last
+    // exhausted resource.
+    wake_peer_stage1_admission_waiters();
     storage_owner_maintenance_cv_.notify_all();
     lib_assert(!context.tasks.empty(),
                "stage2 admitted an empty maintenance context");

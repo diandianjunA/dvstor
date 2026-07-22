@@ -818,8 +818,10 @@ MemoryNode::advance_stage2_search_candidates_batched(
     pair_dispatch_limits.per_peer_items != 0;
   const bool mixed_snapshots = ordered_pairs &&
     snapshot_dispatch_limits.per_peer_pairs != 0;
-  // Scratch bounds the number of logical consumers inspected in one pass.
-  // RDMA quota is enforced independently below: global_items caps the whole
+  // Scratch bounds distinct remote physical records, not logical consumers.
+  // Local/terminal work and multiple searches sharing one pointer consume no
+  // additional registered bytes and can retire in this dispatcher turn. RDMA
+  // quota is enforced independently below: global_items caps the whole
   // physical wave and per_peer_items caps each destination shard.
   const size_t score_dispatch_limit =
     storage_owner_snapshot_batch_size(config, thread);
@@ -1081,6 +1083,8 @@ MemoryNode::advance_stage2_search_candidates_batched(
 
   const auto collect_score_dispatch = [&] {
     state.score_consumers.clear();
+    state.score_selected_remote.clear();
+    state.score_selected_remote.reserve(score_dispatch_limit);
     for (Stage2ScoreRoundRobinCursor& cursor :
          state.score_collect_cursors) {
       cursor.begin_dispatch();
@@ -1104,13 +1108,15 @@ MemoryNode::advance_stage2_search_candidates_batched(
         remote_pairs_by_peer.data(), remote_pairs_by_peer.size()});
     const size_t search_count = tasks.size();
     size_t last_search = state.round_robin_search % search_count;
+    size_t physical_reads = 0;
     bool selected_any = false;
-    while (state.score_consumers.size() < score_dispatch_limit) {
+    // Visit every logical request at most once. The continuation bounds this
+    // set naturally; only distinct remote records are bounded by lane scratch
+    // and transport credit. This lets local work and duplicate consumers pass
+    // a full remote wave instead of waiting behind its CQ.
+    for (;;) {
       bool examined_this_round = false;
-      for (size_t offset = 0;
-           offset < search_count &&
-             state.score_consumers.size() < score_dispatch_limit;
-           ++offset) {
+      for (size_t offset = 0; offset < search_count; ++offset) {
         const size_t search_index =
           (state.round_robin_search + offset) % search_count;
         if (state.search_seeded[search_index] == 0) continue;
@@ -1124,17 +1130,16 @@ MemoryNode::advance_stage2_search_candidates_batched(
           requests[*position];
         const bool remote = storage_node_pointer_addressable(
           request.pointer) && !local_shard(request.pointer.memory_node());
-        const bool duplicate_remote = remote && std::any_of(
-          state.score_consumers.begin(), state.score_consumers.end(),
-          [&](const Stage2ScoreConsumer& selected) {
-            return selected.pointer == request.pointer;
-          });
+        const bool duplicate_remote = remote &&
+          state.score_selected_remote.contains(request.pointer);
         const bool distinct_remote = remote && !duplicate_remote;
         const bool requires_after_header = distinct_remote &&
           !VamanaNode::immutable_base_record(request.pointer);
-        const bool accepted = quota.try_accept(
-          request.pointer.memory_node(), distinct_remote,
-          requires_after_header);
+        const bool accepted =
+          stage2_consumer_fits_physical_scratch(
+            distinct_remote, physical_reads, score_dispatch_limit) &&
+          quota.try_accept(request.pointer.memory_node(), distinct_remote,
+                           requires_after_header);
         if (!accepted) {
           // The cursor has advanced, but the continuation request remains
           // unresolved.  This prevents a hot peer at its quota from hiding a
@@ -1144,6 +1149,10 @@ MemoryNode::advance_stage2_search_candidates_batched(
         }
         state.score_consumers.push_back({
           request.search_index, request.generation, request.pointer});
+        if (distinct_remote) {
+          state.score_selected_remote.insert(request.pointer);
+          ++physical_reads;
+        }
         last_search = search_index;
         selected_any = true;
       }
@@ -1157,6 +1166,8 @@ MemoryNode::advance_stage2_search_candidates_batched(
 
   const auto collect_graph_dispatch = [&] {
     state.graph_consumers.clear();
+    state.graph_selected_remote.clear();
+    state.graph_selected_remote.reserve(graph_dispatch_limit);
     thread_local vec<u32> remote_items_by_peer;
     remote_items_by_peer.resize(num_storage_nodes_);
     memory_node_detail::PeerRdmaReadDispatchQuota quota;
@@ -1166,11 +1177,9 @@ MemoryNode::advance_stage2_search_candidates_batched(
         remote_items_by_peer.data(), remote_items_by_peer.size()});
     const size_t search_count = tasks.size();
     size_t last_search = state.round_robin_search % search_count;
+    size_t physical_reads = 0;
     bool selected_any = false;
-    for (size_t offset = 0;
-         offset < search_count &&
-           state.graph_consumers.size() < graph_dispatch_limit;
-         ++offset) {
+    for (size_t offset = 0; offset < search_count; ++offset) {
       const size_t search_index =
         (state.round_robin_search + offset) % search_count;
       if (state.search_seeded[search_index] == 0) continue;
@@ -1179,17 +1188,20 @@ MemoryNode::advance_stage2_search_candidates_batched(
       if (!request.has_value()) continue;
       const bool remote = storage_node_pointer_addressable(
         request->pointer) && !local_shard(request->pointer.memory_node());
-      const bool duplicate_remote = remote && std::any_of(
-        state.graph_consumers.begin(), state.graph_consumers.end(),
-        [&](const Stage2GraphConsumer& selected) {
-          return selected.pointer == request->pointer;
-        });
-      if (!quota.try_accept(
-            request->pointer.memory_node(), remote && !duplicate_remote)) {
+      const bool duplicate_remote = remote &&
+        state.graph_selected_remote.contains(request->pointer);
+      const bool distinct_remote = remote && !duplicate_remote;
+      if (!stage2_consumer_fits_physical_scratch(
+            distinct_remote, physical_reads, graph_dispatch_limit) ||
+          !quota.try_accept(request->pointer.memory_node(), distinct_remote)) {
         continue;
       }
       state.graph_consumers.push_back({
         request->search_index, request->generation, request->pointer});
+      if (distinct_remote) {
+        state.graph_selected_remote.insert(request->pointer);
+        ++physical_reads;
+      }
       last_search = search_index;
       selected_any = true;
     }

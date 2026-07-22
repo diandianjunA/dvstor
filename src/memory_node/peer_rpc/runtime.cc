@@ -175,10 +175,21 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   peer_stage1_duplicate_retry_responses_.store(0, std::memory_order_relaxed);
   peer_stage1_admission_retry_responses_.store(0, std::memory_order_relaxed);
   peer_stage1_retry_response_drops_.store(0, std::memory_order_relaxed);
+  peer_stage1_admission_parked_.store(0, std::memory_order_relaxed);
+  peer_stage1_admission_woken_.store(0, std::memory_order_relaxed);
+  peer_stage1_admission_reparked_.store(0, std::memory_order_relaxed);
+  peer_stage1_duplicate_coalesced_.store(0, std::memory_order_relaxed);
+  peer_stage1_max_admission_waiters_.store(0, std::memory_order_relaxed);
+  peer_stage1_admission_waiter_items_hint_.store(
+    0, std::memory_order_relaxed);
   peer_stage1_active_workers_.store(0, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
     peer_stage1_tasks_.clear();
+    peer_stage1_admission_waiters_.clear();
+    peer_stage1_admission_waiter_items_ = 0;
+    peer_stage1_admission_owned_items_ = 0;
+    peer_stage1_admission_wake_coverage_ = 0;
     peer_stage1_next_source_sequences_.assign(num_storage_nodes_, 0);
   }
   peer_stage1_completion_states_.clear();
@@ -330,7 +341,28 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
 }
 
 void MemoryNode::stop_peer_reverse_update_runtime() {
-  peer_reverse_shutdown_.store(true, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
+    // Publish shutdown while holding the same mutex used by the worker exit
+    // predicate and waiter parking. Otherwise every Stage1 worker can observe
+    // shutdown+an empty runnable queue and exit in the gap before parked
+    // waiters are moved, stranding their dedup leases and semantic tokens.
+    peer_reverse_shutdown_.store(true, std::memory_order_release);
+    while (!peer_stage1_admission_waiters_.empty()) {
+      const size_t item_count = std::max<size_t>(
+        1, peer_stage1_admission_waiters_.front().header.item_count);
+      lib_assert(peer_stage1_admission_waiter_items_ >= item_count,
+                 "Stage1 shutdown waiter item account underflow");
+      peer_stage1_admission_waiter_items_ -= item_count;
+      peer_stage1_tasks_.push_back(
+        std::move(peer_stage1_admission_waiters_.front()));
+      peer_stage1_admission_waiters_.pop_front();
+    }
+    lib_assert(peer_stage1_admission_waiter_items_ == 0,
+               "Stage1 shutdown retained waiter item credit");
+    peer_stage1_admission_waiter_items_hint_.store(
+      0, std::memory_order_release);
+  }
   peer_reverse_tasks_cv_.notify_all();
   peer_stage1_tasks_cv_.notify_all();
   for (const auto& completion : peer_stage1_completion_states_) {
@@ -352,6 +384,13 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
     if (worker.joinable()) {
       worker.join();
     }
+  }
+  {
+    std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
+    lib_assert(peer_stage1_admission_wake_coverage_ == 0,
+               "Stage1 shutdown retained runnable waiter coverage");
+    lib_assert(peer_stage1_admission_owned_items_ == 0,
+               "Stage1 shutdown retained semantic waiter ownership");
   }
   for (auto& worker : peer_cleanup_control_workers_) {
     if (worker.joinable()) {

@@ -177,7 +177,10 @@ bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
 
   std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
   if (peer_reverse_shutdown_.load(std::memory_order_acquire) ||
-      peer_stage1_tasks_.size() >= peer_stage1_task_queue_limit_ ||
+      peer_stage1_tasks_.size() +
+          peer_stage1_admission_waiters_.size() +
+          peer_stage1_active_workers_.load(std::memory_order_acquire) >=
+        peer_stage1_task_queue_limit_ ||
       task.source_shard >= peer_stage1_next_source_sequences_.size() ||
       peer_stage1_next_source_sequences_[task.source_shard] ==
         std::numeric_limits<u64>::max()) {

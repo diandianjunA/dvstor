@@ -10,6 +10,8 @@
 
 using memory_node_storage_owner_maintenance_detail::
   Stage2ScoreRoundRobinCursor;
+using memory_node_storage_owner_maintenance_detail::
+  stage2_consumer_fits_physical_scratch;
 
 namespace {
 
@@ -109,6 +111,24 @@ void test_full_peer_is_skipped_without_hiding_other_peers_or_local_work() {
   }));
 }
 
+void test_scratch_capacity_counts_physical_reads_not_consumers() {
+  constexpr std::size_t kCapacity = 2;
+  assert(stage2_consumer_fits_physical_scratch(true, 0, kCapacity));
+  assert(stage2_consumer_fits_physical_scratch(true, 1, kCapacity));
+  assert(!stage2_consumer_fits_physical_scratch(true, 2, kCapacity));
+
+  // Once the physical wave is full, a local/terminal consumer or another
+  // consumer of an already-selected remote pointer still needs no scratch.
+  assert(stage2_consumer_fits_physical_scratch(false, 2, kCapacity));
+
+  // A zero-capacity lane cannot admit a physical READ, but the same no-scratch
+  // logical work remains legal. Production rejects zero-capacity lanes before
+  // entering the dispatcher; keeping the predicate total makes its contract
+  // explicit and independently testable.
+  assert(!stage2_consumer_fits_physical_scratch(true, 0, 0));
+  assert(stage2_consumer_fits_physical_scratch(false, 0, 0));
+}
+
 }  // namespace
 
 int main() {
@@ -116,5 +136,6 @@ int main() {
   test_retryable_front_does_not_starve_tail_after_swap_erase();
   test_cursor_normalizes_after_generation_size_change();
   test_full_peer_is_skipped_without_hiding_other_peers_or_local_work();
+  test_scratch_capacity_counts_physical_reads_not_consumers();
   return 0;
 }

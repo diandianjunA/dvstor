@@ -102,6 +102,20 @@ class MemoryNode {
     // remains, rather than occupying a worker while it waits.
     vec<service::storage_owner::AuthorityOperationToken> operation_tokens;
     std::chrono::steady_clock::time_point received_at{};
+    // A credit-parked request must not leave a permanent diagnostic ordering
+    // hole while unrelated same-source requests complete. Semantic ordering
+    // remains fenced by operation_tokens/inflight; this bit prevents the
+    // source completion sequence from being recorded twice after wakeup.
+    bool source_sequence_completed{};
+    // True from the first capacity park until this request either arms or
+    // returns an explicit retry. It keeps the semantic continuation item
+    // bound intact while the task moves waiter -> runnable -> active -> waiter.
+    bool admission_waiter_owned{};
+    // Scheduler-only coverage for completion/queue credit that caused a
+    // parked request to become runnable. This is not semantic debt and is
+    // released after the arm attempt; it merely prevents a completion burst
+    // from waking many whole RPCs for the same small visible credit window.
+    u32 admission_wake_coverage{};
   };
 
   struct PeerOrderedCompletionState {
@@ -482,7 +496,8 @@ private:
       u32 source_shard,
       const service::storage_owner::PeerRpcHeader& header,
       const byte_t* payload,
-      const Configuration& config);
+      const Configuration& config,
+      bool* admission_deferred = nullptr);
   bool try_send_peer_stage1_retry_response(
       u32 destination_shard,
       const service::storage_owner::PeerRpcHeader& header,
@@ -517,7 +532,9 @@ private:
       u32 authority_shard,
       span<const service::storage_owner::Stage1ArmItem> items,
       vec<service::storage_owner::Stage1ArmResult>& results,
-      const Configuration& config);
+      const Configuration& config,
+      bool* admission_blocked = nullptr);
+  void wake_peer_stage1_admission_waiters();
   bool handle_peer_cleanup_activate_request(
       u32 source_shard,
       const service::storage_owner::PeerRpcHeader& header,
@@ -675,7 +692,8 @@ private:
       StorageOwnerMaintenanceTask&& task, const Configuration& config);
   u64 arm_storage_owner_maintenance_batch(
       vec<StorageOwnerMaintenanceTask>& tasks,
-      const Configuration& config);
+      const Configuration& config,
+      bool* capacity_blocked = nullptr);
   u64 activate_storage_owner_cleanup(
       StorageOwnerMaintenanceTask&& task, const Configuration& config);
   u64 activate_storage_owner_cleanup_batch(
@@ -1046,6 +1064,28 @@ private:
   std::mutex peer_stage1_tasks_mutex_;
   std::condition_variable peer_stage1_tasks_cv_;
   std::deque<PeerStage1Task> peer_stage1_tasks_;
+  // Execute requests whose ANN artifact is already prepared but whose fused
+  // Stage2 admission window is full.  They retain their request-dedup lease
+  // and per-token in-flight ownership, so a duplicate wire request can be
+  // coalesced into the eventual late response instead of re-executing arm.
+  // The combined runnable+waiting population is bounded by
+  // peer_stage1_task_queue_limit_.
+  std::deque<PeerStage1Task> peer_stage1_admission_waiters_;
+  // Protected by peer_stage1_tasks_mutex_. This is the admission unit: the
+  // waiter bound is expressed in semantic tokens/sequences, not RPC objects.
+  size_t peer_stage1_admission_waiter_items_{};
+  // Lock-free empty hint for the completion and queue-pop hot paths. Writers
+  // update it while holding peer_stage1_tasks_mutex_; a newly parked task also
+  // performs a self-wake recheck, so a stale zero cannot lose an edge.
+  std::atomic<size_t> peer_stage1_admission_waiter_items_hint_{0};
+  // Includes waiter-deque, runnable, and active continuations. This is the
+  // actual bounded semantic state; moving a waiter to the runnable queue must
+  // not temporarily free room for another full wire batch.
+  size_t peer_stage1_admission_owned_items_{};
+  // Credits already represented by waiter tasks moved to the runnable queue.
+  // Protected by peer_stage1_tasks_mutex_; never included in durable Stage2
+  // debt and always released after the corresponding arm attempt.
+  size_t peer_stage1_admission_wake_coverage_{};
   // next sequence is protected by peer_stage1_tasks_mutex_. Completion state
   // is diagnostic only; semantic receipt lifetime uses the bounded per-token
   // table below rather than a global per-authority prefix.
@@ -1085,6 +1125,11 @@ private:
   std::atomic<u64> peer_stage1_duplicate_retry_responses_{0};
   std::atomic<u64> peer_stage1_admission_retry_responses_{0};
   std::atomic<u64> peer_stage1_retry_response_drops_{0};
+  std::atomic<u64> peer_stage1_admission_parked_{0};
+  std::atomic<u64> peer_stage1_admission_woken_{0};
+  std::atomic<u64> peer_stage1_admission_reparked_{0};
+  std::atomic<u64> peer_stage1_duplicate_coalesced_{0};
+  std::atomic<u64> peer_stage1_max_admission_waiters_{0};
   std::atomic<u32> peer_stage1_active_workers_{0};
   std::array<Stage1PreparedResultShard,
              kStage1PreparedShardCount> stage1_prepared_results_;
