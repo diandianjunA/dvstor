@@ -10,7 +10,6 @@ using namespace persistent_engine_detail;
 
 namespace {
 
-static_assert(sizeof(DeviceShardRegion) == sizeof(format::ShardRegion));
 static_assert(kPersistentMaxGraphDegree == kMaxSupportedGraphDegree);
 
 }  // namespace
@@ -112,6 +111,53 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     static_cast<u64>(node_record_bytes) + sizeof(u64), alignof(u64)));
   dynamic_code_record_bytes =
     VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES + code_bytes;
+  const u64 storage_region_bytes =
+    static_cast<u64>(config.mn_memory_gb) << 30;
+  const u64 centroid_publication_bytes =
+    format::storage_centroid_route_publication_bytes(
+      config.dim, format::CentroidScalarType::float32,
+      format::kStorageCentroidRouteMaxLiveEntries);
+  if (centroid_publication_bytes == 0 ||
+      centroid_publication_bytes > storage_region_bytes) {
+    throw std::runtime_error("invalid storage tail reservation for dynamic PQ arena");
+  }
+  const u64 dynamic_allocation_limit =
+    (storage_region_bytes - centroid_publication_bytes) & ~u64{63};
+  std::vector<DeviceShardRegion> device_shards;
+  device_shards.reserve(index.shards.size());
+  for (const format::ShardRegion& shard : index.shards) {
+    if (shard.dynamic_record_bytes == 0 ||
+        shard.dynamic_base_offset >= dynamic_allocation_limit) {
+      throw std::runtime_error(
+        "dynamic storage range cannot be represented by the GPU PQ arena");
+    }
+    const u64 slot_count =
+      (dynamic_allocation_limit - shard.dynamic_base_offset) /
+      shard.dynamic_record_bytes;
+    if (slot_count == 0 ||
+        dynamic_code_arena_capacity >
+          std::numeric_limits<u64>::max() - slot_count) {
+      throw std::runtime_error("dynamic GPU PQ arena slot count overflows");
+    }
+    device_shards.push_back(DeviceShardRegion{
+      .ordinal_base = shard.ordinal_base,
+      .node_count = shard.node_count,
+      .node_base_offset = shard.node_base_offset,
+      .node_stride = shard.node_stride,
+      .graph_base_offset = shard.graph_base_offset,
+      .dynamic_base_offset = shard.dynamic_base_offset,
+      .control_remote_offset = shard.control_remote_offset,
+      .code_remote_offset = shard.code_remote_offset,
+      .code_bytes = shard.code_bytes,
+      .memory_node = shard.memory_node,
+      .dynamic_record_bytes = shard.dynamic_record_bytes,
+      .dynamic_hot_offset = shard.dynamic_hot_offset,
+      .dynamic_code_offset = shard.dynamic_code_offset,
+      .dynamic_arena_base_slot = dynamic_code_arena_capacity,
+      .dynamic_arena_slot_count = slot_count,
+    });
+    dynamic_code_arena_capacity += slot_count;
+  }
   const u64 engine_budget = static_cast<u64>(
     config.gpu_memory_limit_gb - config.gpu_memory_reserve_gb) << 30;
   size_t free_gpu_bytes = 0;
@@ -144,9 +190,12 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   const u64 dynamic_code_scratch_bytes =
     static_cast<u64>(query_slots) * kPersistentMaxMergeCandidates *
       dynamic_code_record_bytes;
-  const u64 dynamic_code_cache_bytes =
-    static_cast<u64>(config.gpu_dynamic_code_cache_entries) *
-      (sizeof(u64) + code_bytes);
+  if (dynamic_code_arena_capacity >
+      std::numeric_limits<u64>::max() / (sizeof(u32) + code_bytes)) {
+    throw std::runtime_error("dynamic GPU PQ arena byte count overflows");
+  }
+  const u64 dynamic_code_arena_bytes =
+    dynamic_code_arena_capacity * (sizeof(u32) + code_bytes);
   const u64 dynamic_request_scratch_bytes =
     static_cast<u64>(query_slots) * kPersistentMaxMergeCandidates *
     (sizeof(u32) + 2 * sizeof(u64));
@@ -177,7 +226,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   route_graph_bytes = centroid_route_bytes +
     shard_centroid_bytes;
   const u64 additional_scratch_bytes =
-    dynamic_code_scratch_bytes + dynamic_code_cache_bytes +
+    dynamic_code_scratch_bytes + dynamic_code_arena_bytes +
     dynamic_request_scratch_bytes +
     navigation_candidate_bytes + query_dispatch_bytes + direct_queue_bytes +
     graph_scratch_bytes + route_graph_bytes;
@@ -191,18 +240,15 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   engine.telemetry_.gpu_memory_base_pq_bytes.store(
     budget.code_bytes, std::memory_order_relaxed);
   engine.telemetry_.dynamic_code_cache_capacity.store(
-    config.gpu_dynamic_code_cache_entries, std::memory_order_relaxed);
+    dynamic_code_arena_capacity, std::memory_order_relaxed);
   engine.telemetry_.gpu_memory_route_graph_bytes.store(
     route_graph_bytes, std::memory_order_relaxed);
   const u64 base_code_region_bytes = budget.code_bytes;
   const u64 exact_bytes = budget.exact_bytes;
   std::cerr << "[gpu-search] navigation budget codes=" << budget.code_bytes
             << " dynamic_code_scratch=" << dynamic_code_scratch_bytes
-            << " dynamic_code_cache=" << dynamic_code_cache_bytes
-            << " dynamic_code_cache_entries="
-            << config.gpu_dynamic_code_cache_entries
-            << " dynamic_code_cache_probes="
-            << kPersistentDynamicCodeCacheProbeLimit
+            << " dynamic_code_arena=" << dynamic_code_arena_bytes
+            << " dynamic_code_arena_slots=" << dynamic_code_arena_capacity
             << " dynamic_request_scratch=" << dynamic_request_scratch_bytes
             << " navigation_candidates=" << navigation_candidate_bytes
             << " direct_queue_scratch=" << direct_queue_bytes
@@ -298,8 +344,8 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   device_allocate(d_shard_centroids,
                   static_cast<size_t>(index.shards.size()) * config.dim,
                   "cudaMalloc(shard route centroids)");
-  check_cuda(cudaMemcpy(d_shards, index.shards.data(),
-                        index.shards.size() * sizeof(format::ShardRegion),
+  check_cuda(cudaMemcpy(d_shards, device_shards.data(),
+                        device_shards.size() * sizeof(DeviceShardRegion),
                         cudaMemcpyHostToDevice), "cudaMemcpy(GPU navigation shards)");
   if (!pq_model.rotation.empty()) {
     check_cuda(cudaMemcpy(d_opq_matrix, pq_model.rotation.data(),
@@ -341,18 +387,20 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                   "cudaMalloc(dynamic PQ request offsets)");
   device_allocate(d_dynamic_code_request_local_iovas, dynamic_request_elements,
                   "cudaMalloc(dynamic PQ request local IOVAs)");
-  const size_t dynamic_cache_elements =
-    config.gpu_dynamic_code_cache_entries;
-  if (dynamic_cache_elements != 0) {
-    device_allocate(d_dynamic_code_cache_handles, dynamic_cache_elements,
-                    "cudaMalloc(dynamic PQ cache handles)");
-    device_allocate(d_dynamic_code_cache_records,
-                    dynamic_cache_elements * code_bytes,
-                    "cudaMalloc(dynamic PQ cache records)");
-    check_cuda(cudaMemset(d_dynamic_code_cache_handles, 0xff,
-                          dynamic_cache_elements * sizeof(u64)),
-               "cudaMemset(dynamic PQ cache handles)");
+  if (dynamic_code_arena_capacity >
+      std::numeric_limits<size_t>::max() / code_bytes) {
+    throw std::runtime_error("dynamic GPU PQ arena allocation exceeds size_t");
   }
+  const size_t dynamic_arena_elements =
+    static_cast<size_t>(dynamic_code_arena_capacity);
+  device_allocate(d_dynamic_code_arena_states, dynamic_arena_elements,
+                  "cudaMalloc(dynamic PQ arena incarnation states)");
+  device_allocate(d_dynamic_code_arena_records,
+                  dynamic_arena_elements * code_bytes,
+                  "cudaMalloc(dynamic PQ arena records)");
+  check_cuda(cudaMemset(d_dynamic_code_arena_states, 0,
+                        dynamic_arena_elements * sizeof(u32)),
+             "cudaMemset(dynamic PQ arena incarnation states)");
 
   device_allocate(d_query_dispatch_enqueue, 1,
                   "cudaMalloc(GPU query dispatch enqueue)");
@@ -627,10 +675,9 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .visited_hash = d_visited,
     .exact_records = d_exact_records,
     .dynamic_code_records = d_dynamic_code_records,
-    .dynamic_code_cache_handles = d_dynamic_code_cache_handles,
-    .dynamic_code_cache_records = d_dynamic_code_cache_records,
-    .dynamic_code_cache_capacity = config.gpu_dynamic_code_cache_entries,
-    .dynamic_code_cache_probe_limit = kPersistentDynamicCodeCacheProbeLimit,
+    .dynamic_code_arena_states = d_dynamic_code_arena_states,
+    .dynamic_code_arena_records = d_dynamic_code_arena_records,
+    .dynamic_code_arena_capacity = dynamic_code_arena_capacity,
     .dynamic_code_request_shards = d_dynamic_code_request_shards,
     .dynamic_code_request_offsets = d_dynamic_code_request_offsets,
     .dynamic_code_request_local_iovas = d_dynamic_code_request_local_iovas,

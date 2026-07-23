@@ -11,11 +11,41 @@
 #include "common/constants.hh"
 #include "gpu_search/graph_record_validation.hh"
 #include "gpu_search/index_format.hh"
+#include "gpu_search/persistent_kernel.hh"
 #include "nlohmann/json.hh"
 #include "vamana/hot_graph.hh"
 #include "vamana/vamana_node.hh"
 
 namespace {
+
+void test_dynamic_pq_arena_mapping_and_incarnation_order() {
+  const gpu_search::DeviceShardRegion shard{
+    .dynamic_base_offset = 4096,
+    .dynamic_record_bytes = 1040,
+    .dynamic_arena_base_slot = 700,
+    .dynamic_arena_slot_count = 3,
+  };
+  u64 slot = 0;
+  assert(gpu_search::dynamic_code_arena_slot_from_offset(
+    shard, 4096, 703, slot));
+  assert(slot == 700);
+  assert(gpu_search::dynamic_code_arena_slot_from_offset(
+    shard, 4096 + 2 * 1040, 703, slot));
+  assert(slot == 702);
+  assert(!gpu_search::dynamic_code_arena_slot_from_offset(
+    shard, 4095, 703, slot));
+  assert(!gpu_search::dynamic_code_arena_slot_from_offset(
+    shard, 4097, 703, slot));
+  assert(!gpu_search::dynamic_code_arena_slot_from_offset(
+    shard, 4096 + 3 * 1040, 703, slot));
+
+  assert(gpu_search::dynamic_code_arena_can_publish(0, 1));
+  assert(gpu_search::dynamic_code_arena_can_publish(1, 2));
+  assert(!gpu_search::dynamic_code_arena_can_publish(2, 2));
+  assert(!gpu_search::dynamic_code_arena_can_publish(3, 2));
+  assert(!gpu_search::dynamic_code_arena_can_publish(
+    gpu_search::kPersistentDynamicCodeArenaBusy | 1u, 2));
+}
 
 void test_dynamic_navigation_code_width_semantics() {
   namespace format = gpu_search::format;
@@ -335,6 +365,7 @@ void test_centroid_route_publication(
 
 int main() {
   namespace format = gpu_search::format;
+  test_dynamic_pq_arena_mapping_and_incarnation_order();
   test_dynamic_navigation_code_width_semantics();
   test_supported_gpu_layout_limits();
   test_tagged_remote_pointer();

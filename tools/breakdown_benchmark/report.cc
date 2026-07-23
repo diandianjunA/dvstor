@@ -111,11 +111,16 @@ nlohmann::json telemetry_to_json(
       telemetry.dynamic_code_incarnation_rejects},
     {"dynamic_code_wait_ns", telemetry.dynamic_code_wait_ns},
     {"dynamic_code_cache_hits", telemetry.dynamic_code_cache_hits},
+    {"dynamic_code_arena_hits", telemetry.dynamic_code_cache_hits},
     {"dynamic_code_batch_deduplicated",
       telemetry.dynamic_code_batch_deduplicated},
     {"dynamic_code_cache_publish_successes",
       telemetry.dynamic_code_cache_publish_successes},
+    {"dynamic_code_arena_publish_successes",
+      telemetry.dynamic_code_cache_publish_successes},
     {"dynamic_code_cache_publish_races",
+      telemetry.dynamic_code_cache_publish_races},
+    {"dynamic_code_arena_publish_races",
       telemetry.dynamic_code_cache_publish_races},
     {"dynamic_code_cache_lookup_probe_exhaustions",
       telemetry.dynamic_code_cache_lookup_probe_exhaustions},
@@ -127,6 +132,7 @@ nlohmann::json telemetry_to_json(
       telemetry.dynamic_code_cache_max_lookup_probes},
     {"dynamic_code_cache_occupied", telemetry.dynamic_code_cache_occupied},
     {"dynamic_code_cache_capacity", telemetry.dynamic_code_cache_capacity},
+    {"dynamic_code_arena_capacity", telemetry.dynamic_code_cache_capacity},
     {"dynamic_code_cache_hit_ratio", telemetry.dynamic_code_candidates == 0
       ? 0.0 : static_cast<double>(telemetry.dynamic_code_cache_hits) /
           static_cast<double>(telemetry.dynamic_code_candidates)},
@@ -383,26 +389,15 @@ FormattedReport format_report(const nlohmann::json& root,
     output << "  dynamic PQ reads/query and wait_us/query: "
            << gpu.value("average_dynamic_code_reads", 0.0) << "/"
            << gpu.value("average_dynamic_code_wait_us", 0.0) << '\n';
-    output << "  dynamic PQ cache hits/batch_dedup/authoritative_avoidance: "
-           << gpu.value("dynamic_code_cache_hits", 0ULL) << "/"
+    output << "  dynamic PQ arena hits/batch_dedup/authoritative_avoidance: "
+           << gpu.value("dynamic_code_arena_hits", 0ULL) << "/"
            << gpu.value("dynamic_code_batch_deduplicated", 0ULL) << "/"
            << gpu.value("dynamic_code_authoritative_avoidance_ratio", 0.0)
            << '\n';
-    output << "  dynamic PQ cache occupied/capacity/load_factor: "
-           << gpu.value("dynamic_code_cache_occupied", 0ULL) << "/"
-           << gpu.value("dynamic_code_cache_capacity", 0ULL) << "/"
-           << gpu.value("dynamic_code_cache_load_factor", 0.0) << '\n';
-    output << "  dynamic PQ cache publish success/race, lookup/publish exhaustion: "
-           << gpu.value("dynamic_code_cache_publish_successes", 0ULL) << "/"
-           << gpu.value("dynamic_code_cache_publish_races", 0ULL) << ", "
-           << gpu.value("dynamic_code_cache_lookup_probe_exhaustions", 0ULL)
-           << "/"
-           << gpu.value("dynamic_code_cache_publish_probe_exhaustions", 0ULL)
-           << '\n';
-    output << "  dynamic PQ cache avg/max lookup probes: "
-           << gpu.value("average_dynamic_code_cache_lookup_probes", 0.0)
-           << "/"
-           << gpu.value("dynamic_code_cache_max_lookup_probes", 0ULL) << '\n';
+    output << "  dynamic PQ arena publish success/race/capacity: "
+           << gpu.value("dynamic_code_arena_publish_successes", 0ULL) << "/"
+           << gpu.value("dynamic_code_arena_publish_races", 0ULL) << "/"
+           << gpu.value("dynamic_code_arena_capacity", 0ULL) << '\n';
   }
   if (root.contains("storage_owner_runtime")) {
     const auto& runtime = root["storage_owner_runtime"];

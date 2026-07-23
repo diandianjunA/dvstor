@@ -68,7 +68,37 @@ struct DeviceShardRegion {
   u32 dynamic_record_bytes{};
   u32 dynamic_hot_offset{};
   u32 dynamic_code_offset{};
+  // Dense GPU PQ arena mapping for reusable dynamic storage slots.  Every
+  // physical slot has exactly one GPU slot; incarnation_state decides whether
+  // the payload currently belongs to the requested incarnation.
+  u64 dynamic_arena_base_slot{};
+  u64 dynamic_arena_slot_count{};
 };
+
+// Translate a physical dynamic-node offset to its unique GPU arena slot.
+// Keeping this helper host/device makes the storage/GPU layout contract
+// directly unit-testable.
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr bool dynamic_code_arena_slot_from_offset(
+    const DeviceShardRegion& region, u64 node_offset,
+    u64 arena_capacity, u64& arena_slot) {
+  if (region.dynamic_record_bytes == 0 ||
+      node_offset < region.dynamic_base_offset) {
+    return false;
+  }
+  const u64 relative = node_offset - region.dynamic_base_offset;
+  if (relative % region.dynamic_record_bytes != 0) return false;
+  const u64 physical_slot = relative / region.dynamic_record_bytes;
+  if (physical_slot >= region.dynamic_arena_slot_count ||
+      region.dynamic_arena_base_slot > arena_capacity ||
+      physical_slot >= arena_capacity - region.dynamic_arena_base_slot) {
+    return false;
+  }
+  arena_slot = region.dynamic_arena_base_slot + physical_slot;
+  return true;
+}
 
 struct DirectRemoteRegion {
   u64 address{};
@@ -218,15 +248,13 @@ struct PersistentKernelParams {
   u64* visited_hash{};
   u8* exact_records{};
   u8* dynamic_code_records{};
-  // Process-wide, incarnation-tagged navigation-code cache. Dynamic PQ
-  // payloads are immutable after a node incarnation is published; the
-  // complete remote handle therefore provides the cache's ABA fence. Cache
-  // entries use EMPTY -> BUSY -> tagged-handle publication and are never
-  // replaced, so concurrent query CTAs cannot consume a torn payload.
-  u64* dynamic_code_cache_handles{};
-  u8* dynamic_code_cache_records{};
-  u32 dynamic_code_cache_capacity{};
-  u32 dynamic_code_cache_probe_limit{};
+  // The dynamic PQ arena is indexed directly by physical storage slot.  A
+  // state is either 0 (not resident), an incarnation, or BUSY|incarnation
+  // while one CTA replaces the payload. Incarnations are monotonic for a
+  // physical slot, preventing a delayed reader from overwriting newer data.
+  u32* dynamic_code_arena_states{};
+  u8* dynamic_code_arena_records{};
+  u64 dynamic_code_arena_capacity{};
   u32* dynamic_code_request_shards{};
   u64* dynamic_code_request_offsets{};
   u64* dynamic_code_request_local_iovas{};
@@ -234,16 +262,23 @@ struct PersistentKernelParams {
   f32* result_distances{};
 };
 
-// Dynamic records are shared by all queries.  Keep the immutable PQ payload in
-// an open-addressed table; a generous table avoids turning long-running insert
-// workloads into a stream of collision misses.  The key is the complete tagged
-// handle, so slot reuse is an unconditional miss without invalidation.
-inline constexpr u32 kPersistentDynamicCodeCacheDefaultCapacity = 1u << 20;
-inline constexpr u32 kPersistentDynamicCodeCacheProbeLimit = 16;
-inline constexpr u64 kPersistentDynamicCodeCacheEmpty = ~u64{0};
-inline constexpr u64 kPersistentDynamicCodeCacheBusy = ~u64{1};
-static_assert((kPersistentDynamicCodeCacheDefaultCapacity &
-               (kPersistentDynamicCodeCacheDefaultCapacity - 1)) == 0);
+inline constexpr u32 kPersistentDynamicCodeArenaBusy = u32{1} << 31;
+inline constexpr u32 kPersistentDynamicCodeArenaIncarnationMask =
+  kPersistentDynamicCodeArenaBusy - 1;
+static_assert(kRemoteMaxIncarnation <
+              kPersistentDynamicCodeArenaIncarnationMask);
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr bool dynamic_code_arena_can_publish(
+    u32 observed_state, u32 desired_incarnation) {
+  return desired_incarnation != 0 &&
+    desired_incarnation <= kRemoteMaxIncarnation &&
+    (observed_state & kPersistentDynamicCodeArenaBusy) == 0 &&
+    (observed_state & kPersistentDynamicCodeArenaIncarnationMask) <
+      desired_incarnation;
+}
 
 struct PersistentKernelOccupancy {
   u32 active_blocks_per_sm{};

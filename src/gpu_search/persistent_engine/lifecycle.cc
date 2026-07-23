@@ -347,8 +347,8 @@ PersistentSearchEngine::Impl::~Impl() {
   device_free(d_dynamic_code_request_local_iovas);
   device_free(d_dynamic_code_request_offsets);
   device_free(d_dynamic_code_request_shards);
-  device_free(d_dynamic_code_cache_records);
-  device_free(d_dynamic_code_cache_handles);
+  device_free(d_dynamic_code_arena_records);
+  device_free(d_dynamic_code_arena_states);
   device_free(d_visited);
   device_free(d_navigation_candidate_distances);
   device_free(d_navigation_candidate_handles);

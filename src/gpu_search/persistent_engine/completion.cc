@@ -256,7 +256,7 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << completion.dynamic_code_cycles * 1000ULL / gpu_clock_khz
                 << " dynamic_pq_incarnation_rejects="
                 << completion.dynamic_code_incarnation_rejects
-                << " dynamic_pq_cache_hits="
+                << " dynamic_pq_arena_hits="
                 << completion.dynamic_code_cache_hits
                 << " dynamic_pq_batch_deduplicated="
                 << completion.dynamic_code_batch_deduplicated << '\n';

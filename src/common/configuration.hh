@@ -50,8 +50,8 @@ public:
   u32 gpu_final_rerank_width{64};
   u32 gpu_max_expansions{384};
   u32 gpu_rdma_qps{4};
-  // Power-of-two immutable dynamic-PQ cache entries. Zero is an explicit
-  // correctness-preserving bypass for cold-path/cache-scaling A/B runs.
+  // Deprecated compatibility input. Dynamic PQ now uses a fixed one-to-one
+  // physical-slot arena sized from storage metadata; this value is ignored.
   u32 gpu_dynamic_code_cache_entries{1u << 20};
   // A CQE can be delayed well beyond ordinary read latency when GPU reads and
   // CPU-posted mutation traffic share the NIC.  This is a liveness bound, not
@@ -200,7 +200,7 @@ private:
       ("gpu-dynamic-code-cache-entries",
        po::value<u32>(&gpu_dynamic_code_cache_entries)
          ->default_value(gpu_dynamic_code_cache_entries),
-       "Power-of-two entries in the immutable dynamic-PQ GPU cache; zero bypasses it.")
+       "Deprecated compatibility option; the dynamic-PQ arena is metadata-sized.")
 
       ("storage-id", po::value<u32>(&storage_id)->default_value(storage_id),
        "Zero-based storage shard identifier.")
@@ -294,10 +294,6 @@ private:
         gpu_max_expansions < gpu_traversal_beam_width ||
         gpu_max_expansions > 4096 ||
         gpu_rdma_qps == 0 || gpu_rdma_qps > 32 ||
-        (gpu_dynamic_code_cache_entries != 0 &&
-         (gpu_dynamic_code_cache_entries &
-          (gpu_dynamic_code_cache_entries - 1)) != 0) ||
-        gpu_dynamic_code_cache_entries > (1u << 27) ||
         gpu_direct_timeout_ms < 20 || gpu_direct_timeout_ms > 5'000 ||
         gpu_persistent_blocks_per_sm == 0 ||
         gpu_persistent_blocks_per_sm > 16) {

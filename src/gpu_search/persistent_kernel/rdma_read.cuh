@@ -393,51 +393,29 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     // and discovered neighbors therefore use the same one-sided RDMA path.
     if (params.dynamic_code_records == nullptr || shard >= params.num_shards) continue;
     atomicAdd(&call_dynamic_candidates, 1u);
-    // A dynamic code is written before the incarnation's publishing header
-    // and never changes during that incarnation. Cache by the complete tagged
-    // handle, not by the reusable byte offset, so slot reuse is an
-    // unconditional miss even though the cache is shared across queries.
-    if (params.dynamic_code_cache_handles != nullptr &&
-        params.dynamic_code_cache_records != nullptr &&
-        params.dynamic_code_cache_capacity != 0) {
-      u64 hash = handle;
-      hash ^= hash >> 30;
-      hash *= 0xbf58476d1ce4e5b9ULL;
-      hash ^= hash >> 27;
-      hash *= 0x94d049bb133111ebULL;
-      hash ^= hash >> 31;
-      const u32 mask = params.dynamic_code_cache_capacity - 1;
-      const u32 first_slot = static_cast<u32>(hash) & mask;
-      u32 lookup_probes = 0;
-      bool observed_empty = false;
-      for (u32 probe = 0; probe < params.dynamic_code_cache_probe_limit;
-           ++probe) {
-        ++lookup_probes;
-        const u32 cache_slot = (first_slot + probe) & mask;
-        auto* cache_key = reinterpret_cast<unsigned long long*>(
-          params.dynamic_code_cache_handles + cache_slot);
-        // atomicCAS is the acquire operation paired with the publisher's
-        // threadfence + atomicExch.  Entries are immutable after publication,
-        // so a hit needs neither a fence nor a second key load.
-        const u64 cached_handle = atomicCAS(cache_key, 0, 0);
-        if (cached_handle == handle) {
-          const u8* cached = params.dynamic_code_cache_records +
-            static_cast<size_t>(cache_slot) * params.pq_code_bytes;
-          distances[index] = approximate_entry(params, query_lut, cached);
-          atomicAdd(&call_cache_hits, 1u);
-          break;
-        }
-        if (cached_handle == kPersistentDynamicCodeCacheEmpty) {
-          observed_empty = true;
-          break;
-        }
-      }
-      atomicAdd(&call_lookup_probes, lookup_probes);
-      atomicMax(&call_max_lookup_probes, lookup_probes);
-      if (distances[index] != FLT_MAX) continue;
-      if (!observed_empty &&
-          lookup_probes == params.dynamic_code_cache_probe_limit) {
-        atomicAdd(&call_lookup_probe_exhaustions, 1u);
+    // Dynamic records use the same physical-slot ordinal on storage and GPU.
+    // There is no hash table, collision chain, or capacity-dependent lookup.
+    const DeviceShardRegion& region = params.shards[shard];
+    const u64 node_offset = remote_byte_offset(raw);
+    const bool arena_available =
+      params.dynamic_code_arena_states != nullptr &&
+      params.dynamic_code_arena_records != nullptr;
+    u64 arena_slot = 0;
+    if (arena_available && dynamic_code_arena_slot_from_offset(
+          region, node_offset, params.dynamic_code_arena_capacity,
+          arena_slot)) {
+      auto* state = params.dynamic_code_arena_states + arena_slot;
+      // atomicCAS supplies the acquire side of payload -> threadfence ->
+      // incarnation publication.
+      const u32 observed = atomicCAS(state, 0u, 0u);
+      atomicAdd(&call_lookup_probes, 1u);
+      atomicMax(&call_max_lookup_probes, 1u);
+      if (observed == remote_incarnation(handle)) {
+        const u8* resident = params.dynamic_code_arena_records +
+          static_cast<size_t>(arena_slot) * params.pq_code_bytes;
+        distances[index] = approximate_entry(params, query_lut, resident);
+        atomicAdd(&call_cache_hits, 1u);
+        continue;
       }
     }
     // The merge frontier can contain the same tagged handle through multiple
@@ -459,7 +437,6 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
       continue;
     }
     atomicAdd(&call_dynamic_reads, 1u);
-    const u64 node_offset = remote_byte_offset(raw);
     request_shards[index] = shard;
     request_offsets[index] = node_offset + params.shards[shard].dynamic_code_offset;
     u8* destination = params.dynamic_code_records +
@@ -543,11 +520,12 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     }
   }
   __syncthreads();
-  // Serialize publication within this CTA.  Globally, EMPTY -> BUSY reserves a
-  // slot and payload -> fence -> tagged handle publishes an immutable entry.
-  // Collisions never evict a valid incarnation.
-  if (threadIdx.x == 0 && params.dynamic_code_cache_handles != nullptr &&
-      params.dynamic_code_cache_records != nullptr) {
+  // Serialize publication within this CTA. Globally, old-incarnation ->
+  // BUSY|new-incarnation reserves the physical slot and payload -> fence ->
+  // new-incarnation publishes it. Incarnations only increase, so a delayed
+  // reader can never replace a newer payload (the slot-reuse ABA case).
+  if (threadIdx.x == 0 && params.dynamic_code_arena_states != nullptr &&
+      params.dynamic_code_arena_records != nullptr) {
     for (u32 index = 0; index < count; ++index) {
       const u32 shard = request_shards[index];
       if (shard >= params.num_shards || shard_status[shard] != 0 ||
@@ -561,44 +539,35 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
           remote_incarnation(handle)) {
         continue;
       }
-      u64 hash = handle;
-      hash ^= hash >> 30;
-      hash *= 0xbf58476d1ce4e5b9ULL;
-      hash ^= hash >> 27;
-      hash *= 0x94d049bb133111ebULL;
-      hash ^= hash >> 31;
-      const u32 mask = params.dynamic_code_cache_capacity - 1;
-      const u32 first_slot = static_cast<u32>(hash) & mask;
-      bool published = false;
-      for (u32 probe = 0; probe < params.dynamic_code_cache_probe_limit;
-           ++probe) {
-        const u32 cache_slot = (first_slot + probe) & mask;
-        auto* cache_key = reinterpret_cast<unsigned long long*>(
-          params.dynamic_code_cache_handles + cache_slot);
-        const u64 observed = atomicCAS(cache_key, 0, 0);
-        if (observed == handle) {
-          ++call_cache_publish_races;
-          published = true;
-          break;
-        }
-        if (observed != kPersistentDynamicCodeCacheEmpty) continue;
-        if (atomicCAS(cache_key, kPersistentDynamicCodeCacheEmpty,
-                      kPersistentDynamicCodeCacheBusy) !=
-            kPersistentDynamicCodeCacheEmpty) {
-          continue;
-        }
-        u8* destination = params.dynamic_code_cache_records +
-          static_cast<size_t>(cache_slot) * params.pq_code_bytes;
-        for (u32 byte = 0; byte < params.pq_code_bytes; ++byte) {
-          destination[byte] = source[sizeof(u32) + byte];
-        }
-        __threadfence();
-        atomicExch(cache_key, handle);
-        ++call_cache_publish_successes;
-        published = true;
-        break;
+      const u64 node_offset = remote_byte_offset(handle);
+      const DeviceShardRegion& region = params.shards[shard];
+      u64 arena_slot = 0;
+      if (!dynamic_code_arena_slot_from_offset(
+            region, node_offset, params.dynamic_code_arena_capacity,
+            arena_slot)) {
+        continue;
       }
-      if (!published) ++call_publish_probe_exhaustions;
+      const u32 desired = remote_incarnation(handle);
+      auto* state = params.dynamic_code_arena_states + arena_slot;
+      const u32 observed = atomicCAS(state, 0u, 0u);
+      if (observed == desired) {
+        ++call_cache_publish_races;
+        continue;
+      }
+      if (!dynamic_code_arena_can_publish(observed, desired) ||
+          atomicCAS(state, observed,
+                    kPersistentDynamicCodeArenaBusy | desired) != observed) {
+        ++call_cache_publish_races;
+        continue;
+      }
+      u8* destination = params.dynamic_code_arena_records +
+        static_cast<size_t>(arena_slot) * params.pq_code_bytes;
+      for (u32 byte = 0; byte < params.pq_code_bytes; ++byte) {
+        destination[byte] = source[sizeof(u32) + byte];
+      }
+      __threadfence();
+      atomicExch(state, desired);
+      ++call_cache_publish_successes;
     }
   }
   __syncthreads();
