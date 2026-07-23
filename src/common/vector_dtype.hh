@@ -1,8 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 
@@ -80,6 +82,35 @@ inline size_t vector_dtype_bytes(VectorDType dtype, u32 dim) {
   return static_cast<size_t>(dim) * vector_dtype_component_size(dtype);
 }
 
+// Inspect IEEE-754 exponent bits at external-data boundaries. This is cheap
+// and keeps validation stable across supported compilers and math-library
+// implementations without depending on optimizer treatment of isfinite.
+inline bool floating_value_is_finite(f32 value) {
+  return (std::bit_cast<u32>(value) & 0x7f800000u) != 0x7f800000u;
+}
+
+inline bool floating_value_is_finite(f64 value) {
+  return (std::bit_cast<u64>(value) & 0x7ff0000000000000ull) !=
+    0x7ff0000000000000ull;
+}
+
+inline bool vector_component_is_finite(float value) {
+  return floating_value_is_finite(value);
+}
+
+// FLT_MAX remains the internal invalid/uninitialized sentinel in the GPU
+// beam.  Saturate legal squared-L2 results to the immediately preceding float
+// so even finite extreme inputs remain sortable and cannot be mistaken for an
+// RDMA or record-validation failure.
+inline constexpr f32 kMaxValidSquaredL2 = 0x1.fffffcp+127f;
+
+inline f32 saturate_squared_l2(f64 value) {
+  if (!(value < static_cast<f64>(kMaxValidSquaredL2))) {
+    return kMaxValidSquaredL2;
+  }
+  return value <= 0.0 ? 0.0f : static_cast<f32>(value);
+}
+
 inline float vector_component_as_float(const byte_t* data, VectorDType dtype, size_t index) {
   switch (dtype) {
     case VectorDType::float32:
@@ -93,32 +124,53 @@ inline float vector_component_as_float(const byte_t* data, VectorDType dtype, si
 }
 
 inline void encode_float_vector_to_storage(const float* src, u32 dim, VectorDType dtype, byte_t* dst) {
+  if (src == nullptr || dst == nullptr) {
+    throw std::invalid_argument("vector encoding requires non-null storage");
+  }
   switch (dtype) {
     case VectorDType::float32:
+      for (u32 i = 0; i < dim; ++i) {
+        if (!vector_component_is_finite(src[i])) {
+          throw std::invalid_argument("vector components must be finite");
+        }
+      }
       std::memcpy(dst, src, static_cast<size_t>(dim) * sizeof(float));
       return;
     case VectorDType::uint8: {
       auto* out = reinterpret_cast<u8*>(dst);
       for (u32 i = 0; i < dim; ++i) {
-        const long rounded = std::lround(src[i]);
-        out[i] = static_cast<u8>(std::clamp<long>(rounded, 0, 255));
+        if (!vector_component_is_finite(src[i])) {
+          throw std::invalid_argument("vector components must be finite");
+        }
+        // Clamp in float before lround. A finite float can still exceed the
+        // range of long, for which lround has a domain error.
+        const float bounded = std::clamp(src[i], 0.0f, 255.0f);
+        out[i] = static_cast<u8>(std::lround(bounded));
       }
       return;
     }
     case VectorDType::int8: {
       auto* out = reinterpret_cast<i8*>(dst);
       for (u32 i = 0; i < dim; ++i) {
-        const long rounded = std::lround(src[i]);
-        out[i] = static_cast<i8>(std::clamp<long>(rounded, -128, 127));
+        if (!vector_component_is_finite(src[i])) {
+          throw std::invalid_argument("vector components must be finite");
+        }
+        const float bounded = std::clamp(src[i], -128.0f, 127.0f);
+        out[i] = static_cast<i8>(std::lround(bounded));
       }
       return;
     }
   }
+  throw std::invalid_argument("unknown vector dtype");
 }
 
 inline vec<byte_t> encode_float_vector_to_storage(const span<const element_t> src, VectorDType dtype) {
-  vec<byte_t> out(vector_dtype_bytes(dtype, static_cast<u32>(src.size())));
-  encode_float_vector_to_storage(src.data(), static_cast<u32>(src.size()), dtype, out.data());
+  if (src.size() > std::numeric_limits<u32>::max()) {
+    throw std::length_error("vector dimension exceeds the storage layout limit");
+  }
+  const u32 dim = static_cast<u32>(src.size());
+  vec<byte_t> out(vector_dtype_bytes(dtype, dim));
+  encode_float_vector_to_storage(src.data(), dim, dtype, out.data());
   return out;
 }
 
@@ -134,13 +186,26 @@ inline vec<float> decode_storage_vector_to_float(const byte_t* src, VectorDType 
   return out;
 }
 
+inline float typed_l2_distance_float_query_scalar(
+    const span<const element_t> query, const byte_t* stored,
+    VectorDType stored_dtype, u32 dim) {
+  f64 sum = 0.0;
+  for (u32 i = 0; i < dim; ++i) {
+    const f64 diff = static_cast<f64>(query[i]) -
+      static_cast<f64>(vector_component_as_float(stored, stored_dtype, i));
+    sum += diff * diff;
+  }
+  return saturate_squared_l2(sum);
+}
+
 // =========================================================================
 // SIMD-accelerated distance functions for same-dtype vector pairs (AVX2)
 // =========================================================================
 
 #ifdef __AVX2__
 
-inline float typed_l2_distance_uint8_simd(const byte_t* lhs, const byte_t* rhs, u32 dim) {
+inline float typed_l2_distance_uint8_simd_chunk(
+    const byte_t* lhs, const byte_t* rhs, u32 dim) {
   const u8* a = reinterpret_cast<const u8*>(lhs);
   const u8* b = reinterpret_cast<const u8*>(rhs);
 
@@ -242,7 +307,8 @@ inline float typed_l2_distance_uint8_simd(const byte_t* lhs, const byte_t* rhs, 
   return result;
 }
 
-inline float typed_l2_distance_int8_simd(const byte_t* lhs, const byte_t* rhs, u32 dim) {
+inline float typed_l2_distance_int8_simd_chunk(
+    const byte_t* lhs, const byte_t* rhs, u32 dim) {
   const i8* a = reinterpret_cast<const i8*>(lhs);
   const i8* b = reinterpret_cast<const i8*>(rhs);
 
@@ -341,190 +407,37 @@ inline float typed_l2_distance_int8_simd(const byte_t* lhs, const byte_t* rhs, u
   return result;
 }
 
-inline float typed_ip_distance_uint8_simd(const byte_t* lhs, const byte_t* rhs, u32 dim) {
-  const u8* a = reinterpret_cast<const u8*>(lhs);
-  const u8* b = reinterpret_cast<const u8*>(rhs);
+// Keep every signed epi32 reduction and its float conversion exact.
+// 256*255^2=16,646,400 is below both INT32_MAX and float's exact-integer
+// range. Wider vectors retain SIMD throughput, accumulate exact chunk totals
+// in FP64, and round only once at the public float result.
+inline constexpr u32 kIntegralByteSimdExactChunk = 256;
 
-  __m256i dot0 = _mm256_setzero_si256();
-  __m256i dot1 = _mm256_setzero_si256();
-  __m256i dot2 = _mm256_setzero_si256();
-  __m256i dot3 = _mm256_setzero_si256();
-
-  u32 i = 0;
-
-  for (; i + 128 <= dim; i += 128) {
-    // k = 0
-    { __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
-      __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
-      __m256i va_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(va));
-      __m256i vb_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(vb));
-      __m256i prod_lo = _mm256_madd_epi16(va_lo, vb_lo);
-      __m256i va_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(va, 1));
-      __m256i vb_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vb, 1));
-      __m256i prod_hi = _mm256_madd_epi16(va_hi, vb_hi);
-      dot0 = _mm256_add_epi32(dot0, prod_lo);
-      dot0 = _mm256_add_epi32(dot0, prod_hi); }
-
-    // k = 1
-    { __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i + 32));
-      __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i + 32));
-      __m256i va_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(va));
-      __m256i vb_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(vb));
-      __m256i prod_lo = _mm256_madd_epi16(va_lo, vb_lo);
-      __m256i va_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(va, 1));
-      __m256i vb_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vb, 1));
-      __m256i prod_hi = _mm256_madd_epi16(va_hi, vb_hi);
-      dot1 = _mm256_add_epi32(dot1, prod_lo);
-      dot1 = _mm256_add_epi32(dot1, prod_hi); }
-
-    // k = 2
-    { __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i + 64));
-      __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i + 64));
-      __m256i va_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(va));
-      __m256i vb_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(vb));
-      __m256i prod_lo = _mm256_madd_epi16(va_lo, vb_lo);
-      __m256i va_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(va, 1));
-      __m256i vb_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vb, 1));
-      __m256i prod_hi = _mm256_madd_epi16(va_hi, vb_hi);
-      dot2 = _mm256_add_epi32(dot2, prod_lo);
-      dot2 = _mm256_add_epi32(dot2, prod_hi); }
-
-    // k = 3
-    { __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i + 96));
-      __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i + 96));
-      __m256i va_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(va));
-      __m256i vb_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(vb));
-      __m256i prod_lo = _mm256_madd_epi16(va_lo, vb_lo);
-      __m256i va_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(va, 1));
-      __m256i vb_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vb, 1));
-      __m256i prod_hi = _mm256_madd_epi16(va_hi, vb_hi);
-      dot3 = _mm256_add_epi32(dot3, prod_lo);
-      dot3 = _mm256_add_epi32(dot3, prod_hi); }
+inline float typed_l2_distance_uint8_simd(
+    const byte_t* lhs, const byte_t* rhs, u32 dim) {
+  f64 total = 0.0;
+  for (u32 offset = 0; offset < dim;) {
+    const u32 chunk = std::min<u32>(
+      kIntegralByteSimdExactChunk, dim - offset);
+    total += typed_l2_distance_uint8_simd_chunk(
+      lhs + offset, rhs + offset, chunk);
+    offset += chunk;
   }
-
-  for (; i + 32 <= dim; i += 32) {
-    __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
-    __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
-
-    __m256i va_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(va));
-    __m256i vb_lo = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(vb));
-    dot0 = _mm256_add_epi32(dot0, _mm256_madd_epi16(va_lo, vb_lo));
-
-    __m256i va_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(va, 1));
-    __m256i vb_hi = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(vb, 1));
-    dot0 = _mm256_add_epi32(dot0, _mm256_madd_epi16(va_hi, vb_hi));
-  }
-
-  dot0 = _mm256_add_epi32(dot0, dot1);
-  dot2 = _mm256_add_epi32(dot2, dot3);
-  dot0 = _mm256_add_epi32(dot0, dot2);
-
-  __m128i lo = _mm256_castsi256_si128(dot0);
-  __m128i hi = _mm256_extracti128_si256(dot0, 1);
-  __m128i combined = _mm_add_epi32(lo, hi);
-  combined = _mm_hadd_epi32(combined, combined);
-  combined = _mm_hadd_epi32(combined, combined);
-  float dot = static_cast<float>(_mm_cvtsi128_si32(combined));
-
-  for (; i < dim; ++i) {
-    dot += static_cast<float>(a[i]) * static_cast<float>(b[i]);
-  }
-
-  return 1.0f - dot;
+  return static_cast<float>(total);
 }
 
-inline float typed_ip_distance_int8_simd(const byte_t* lhs, const byte_t* rhs, u32 dim) {
-  const i8* a = reinterpret_cast<const i8*>(lhs);
-  const i8* b = reinterpret_cast<const i8*>(rhs);
-
-  __m256i dot0 = _mm256_setzero_si256();
-  __m256i dot1 = _mm256_setzero_si256();
-  __m256i dot2 = _mm256_setzero_si256();
-  __m256i dot3 = _mm256_setzero_si256();
-
-  u32 i = 0;
-
-  for (; i + 128 <= dim; i += 128) {
-    // k = 0
-    { __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
-      __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
-      __m256i va_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
-      __m256i vb_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
-      __m256i prod_lo = _mm256_madd_epi16(va_lo, vb_lo);
-      __m256i va_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va, 1));
-      __m256i vb_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb, 1));
-      __m256i prod_hi = _mm256_madd_epi16(va_hi, vb_hi);
-      dot0 = _mm256_add_epi32(dot0, prod_lo);
-      dot0 = _mm256_add_epi32(dot0, prod_hi); }
-
-    // k = 1
-    { __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i + 32));
-      __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i + 32));
-      __m256i va_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
-      __m256i vb_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
-      __m256i prod_lo = _mm256_madd_epi16(va_lo, vb_lo);
-      __m256i va_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va, 1));
-      __m256i vb_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb, 1));
-      __m256i prod_hi = _mm256_madd_epi16(va_hi, vb_hi);
-      dot1 = _mm256_add_epi32(dot1, prod_lo);
-      dot1 = _mm256_add_epi32(dot1, prod_hi); }
-
-    // k = 2
-    { __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i + 64));
-      __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i + 64));
-      __m256i va_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
-      __m256i vb_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
-      __m256i prod_lo = _mm256_madd_epi16(va_lo, vb_lo);
-      __m256i va_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va, 1));
-      __m256i vb_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb, 1));
-      __m256i prod_hi = _mm256_madd_epi16(va_hi, vb_hi);
-      dot2 = _mm256_add_epi32(dot2, prod_lo);
-      dot2 = _mm256_add_epi32(dot2, prod_hi); }
-
-    // k = 3
-    { __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i + 96));
-      __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i + 96));
-      __m256i va_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
-      __m256i vb_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
-      __m256i prod_lo = _mm256_madd_epi16(va_lo, vb_lo);
-      __m256i va_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va, 1));
-      __m256i vb_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb, 1));
-      __m256i prod_hi = _mm256_madd_epi16(va_hi, vb_hi);
-      dot3 = _mm256_add_epi32(dot3, prod_lo);
-      dot3 = _mm256_add_epi32(dot3, prod_hi); }
+inline float typed_l2_distance_int8_simd(
+    const byte_t* lhs, const byte_t* rhs, u32 dim) {
+  f64 total = 0.0;
+  for (u32 offset = 0; offset < dim;) {
+    const u32 chunk = std::min<u32>(
+      kIntegralByteSimdExactChunk, dim - offset);
+    total += typed_l2_distance_int8_simd_chunk(
+      lhs + offset, rhs + offset, chunk);
+    offset += chunk;
   }
-
-  for (; i + 32 <= dim; i += 32) {
-    __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + i));
-    __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + i));
-
-    __m256i va_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(va));
-    __m256i vb_lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vb));
-    dot0 = _mm256_add_epi32(dot0, _mm256_madd_epi16(va_lo, vb_lo));
-
-    __m256i va_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(va, 1));
-    __m256i vb_hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vb, 1));
-    dot0 = _mm256_add_epi32(dot0, _mm256_madd_epi16(va_hi, vb_hi));
-  }
-
-  dot0 = _mm256_add_epi32(dot0, dot1);
-  dot2 = _mm256_add_epi32(dot2, dot3);
-  dot0 = _mm256_add_epi32(dot0, dot2);
-
-  __m128i lo = _mm256_castsi256_si128(dot0);
-  __m128i hi = _mm256_extracti128_si256(dot0, 1);
-  __m128i combined = _mm_add_epi32(lo, hi);
-  combined = _mm_hadd_epi32(combined, combined);
-  combined = _mm_hadd_epi32(combined, combined);
-  float dot = static_cast<float>(_mm_cvtsi128_si32(combined));
-
-  for (; i < dim; ++i) {
-    dot += static_cast<float>(a[i]) * static_cast<float>(b[i]);
-  }
-
-  return 1.0f - dot;
+  return static_cast<float>(total);
 }
-
 
 inline float horizontal_sum_ps(__m256 value) {
   __m128 lo = _mm256_castps256_ps128(value);
@@ -578,9 +491,11 @@ inline float typed_l2_distance_float_query_uint8_simd(const span<const element_t
     const float diff = q[i] - static_cast<float>(s[i]);
     sum += diff * diff;
   }
-  return sum;
+  return floating_value_is_finite(sum)
+    ? std::min(sum, kMaxValidSquaredL2)
+    : typed_l2_distance_float_query_scalar(
+        query, stored, VectorDType::uint8, dim);
 }
-
 inline float typed_l2_distance_float_query_int8_simd(const span<const element_t> query,
                                                      const byte_t* stored,
                                                      u32 dim) {
@@ -624,7 +539,10 @@ inline float typed_l2_distance_float_query_int8_simd(const span<const element_t>
     const float diff = q[i] - static_cast<float>(s[i]);
     sum += diff * diff;
   }
-  return sum;
+  return floating_value_is_finite(sum)
+    ? std::min(sum, kMaxValidSquaredL2)
+    : typed_l2_distance_float_query_scalar(
+        query, stored, VectorDType::int8, dim);
 }
 
 #endif  // __AVX2__
@@ -644,37 +562,107 @@ inline float typed_l2_distance(const byte_t* lhs,
     }
   }
 #endif
-  float sum = 0.0f;
+  f64 sum = 0.0;
   for (u32 i = 0; i < dim; ++i) {
-    const float diff = vector_component_as_float(lhs, lhs_dtype, i) -
-                       vector_component_as_float(rhs, rhs_dtype, i);
+    const f64 diff =
+      static_cast<f64>(vector_component_as_float(lhs, lhs_dtype, i)) -
+      static_cast<f64>(vector_component_as_float(rhs, rhs_dtype, i));
     sum += diff * diff;
   }
-  return sum;
+  return saturate_squared_l2(sum);
 }
 
-inline float typed_ip_distance(const byte_t* lhs,
-                               VectorDType lhs_dtype,
-                               const byte_t* rhs,
-                               VectorDType rhs_dtype,
-                               u32 dim) {
+// Evaluate the exact predicate used by alpha RobustPrune while avoiding the
+// rest of an integral byte-vector distance once the predicate can no longer
+// hold.  For equal uint8/int8 dtypes every squared component difference is a
+// non-negative integer.  Consequently the exact partial sum and its rounded
+// float representation are monotone.  With a finite positive alpha,
+//
+//   alpha * float(partial_sum) > source_distance
+//
+// proves that alpha * float(final_sum) <= source_distance is impossible.
+// The completed path rounds the exact integer sum once, exactly as
+// typed_l2_distance() does.  Float, mixed-dtype, and unusual-alpha cases use
+// typed_l2_distance() directly so their established behavior is unchanged.
+// evaluated_components is optional test/telemetry output; it has no bearing
+// on the result.
+inline bool typed_l2_distance_alpha_leq_source(
+    const byte_t* lhs,
+    VectorDType lhs_dtype,
+    const byte_t* rhs,
+    VectorDType rhs_dtype,
+    u32 dim,
+    f64 alpha,
+    distance_t source_distance,
+    u32* evaluated_components = nullptr) {
+  if (evaluated_components != nullptr) {
+    *evaluated_components = 0;
+  }
+  const bool same_integral_dtype =
+    lhs_dtype == rhs_dtype &&
+    (lhs_dtype == VectorDType::uint8 || lhs_dtype == VectorDType::int8);
+  if (!same_integral_dtype || !(alpha > 0.0) ||
+      !floating_value_is_finite(alpha)) {
+    if (evaluated_components != nullptr) {
+      *evaluated_components = dim;
+    }
+    return alpha * static_cast<f64>(
+                     typed_l2_distance(lhs, lhs_dtype, rhs, rhs_dtype, dim)) <=
+      static_cast<f64>(source_distance);
+  }
+
+  // A 32-component chunk is small enough that its largest possible sum
+  // (32 * 255^2) is represented exactly by float.  This preserves exact
+  // accumulation while providing four early-exit opportunities for the
+  // common 128-dimensional vectors.
+  constexpr u32 kThresholdChunkComponents = 32;
+  f64 exact_sum = 0.0;
+  u32 offset = 0;
+  while (offset < dim) {
+    const u32 chunk = std::min<u32>(
+      kThresholdChunkComponents, dim - offset);
 #ifdef __AVX2__
-  if (lhs_dtype == rhs_dtype) {
+    exact_sum += lhs_dtype == VectorDType::uint8
+      ? static_cast<f64>(typed_l2_distance_uint8_simd_chunk(
+          lhs + offset, rhs + offset, chunk))
+      : static_cast<f64>(typed_l2_distance_int8_simd_chunk(
+          lhs + offset, rhs + offset, chunk));
+#else
     if (lhs_dtype == VectorDType::uint8) {
-      return typed_ip_distance_uint8_simd(lhs, rhs, dim);
+      const auto* a = reinterpret_cast<const u8*>(lhs + offset);
+      const auto* b = reinterpret_cast<const u8*>(rhs + offset);
+      for (u32 index = 0; index < chunk; ++index) {
+        const i32 diff = static_cast<i32>(a[index]) -
+          static_cast<i32>(b[index]);
+        exact_sum += static_cast<f64>(diff * diff);
+      }
+    } else {
+      const auto* a = reinterpret_cast<const i8*>(lhs + offset);
+      const auto* b = reinterpret_cast<const i8*>(rhs + offset);
+      for (u32 index = 0; index < chunk; ++index) {
+        const i32 diff = static_cast<i32>(a[index]) -
+          static_cast<i32>(b[index]);
+        exact_sum += static_cast<f64>(diff * diff);
+      }
     }
-    if (lhs_dtype == VectorDType::int8) {
-      return typed_ip_distance_int8_simd(lhs, rhs, dim);
-    }
-  }
 #endif
-  float dot = 0.0f;
-  for (u32 i = 0; i < dim; ++i) {
-    dot += vector_component_as_float(lhs, lhs_dtype, i) *
-           vector_component_as_float(rhs, rhs_dtype, i);
+    offset += chunk;
+    if (evaluated_components != nullptr) {
+      *evaluated_components = offset;
+    }
+
+    const distance_t rounded_partial = static_cast<distance_t>(exact_sum);
+    if (alpha * static_cast<f64>(rounded_partial) >
+        static_cast<f64>(source_distance)) {
+      return false;
+    }
   }
-  return 1.0f - dot;
+
+  const distance_t rounded_distance = static_cast<distance_t>(exact_sum);
+  return alpha * static_cast<f64>(rounded_distance) <=
+    static_cast<f64>(source_distance);
 }
+
 inline float typed_l2_distance_float_query(const span<const element_t> query,
                                            const byte_t* stored,
                                            VectorDType stored_dtype,
@@ -687,30 +675,6 @@ inline float typed_l2_distance_float_query(const span<const element_t> query,
     return typed_l2_distance_float_query_int8_simd(query, stored, dim);
   }
 #endif
-  float sum = 0.0f;
-  for (u32 i = 0; i < dim; ++i) {
-    const float diff = query[i] - vector_component_as_float(stored, stored_dtype, i);
-    sum += diff * diff;
-  }
-  return sum;
-}
-
-inline float typed_ip_distance_float_query(const span<const element_t> query,
-                                           const byte_t* stored,
-                                           VectorDType stored_dtype,
-                                           u32 dim) {
-  float dot = 0.0f;
-  for (u32 i = 0; i < dim; ++i) {
-    dot += query[i] * vector_component_as_float(stored, stored_dtype, i);
-  }
-  return 1.0f - dot;
-}
-
-inline float typed_distance_float_query(const span<const element_t> query,
-                                        const byte_t* stored,
-                                        VectorDType stored_dtype,
-                                        u32 dim,
-                                        bool ip_distance) {
-  return ip_distance ? typed_ip_distance_float_query(query, stored, stored_dtype, dim)
-                     : typed_l2_distance_float_query(query, stored, stored_dtype, dim);
+  return typed_l2_distance_float_query_scalar(
+    query, stored, stored_dtype, dim);
 }

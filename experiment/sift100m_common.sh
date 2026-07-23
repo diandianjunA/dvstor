@@ -3,6 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [[ -n "${BUILD_DIR+x}" ]]; then
+  DVSTOR_BUILD_DIR_EXPLICIT=1
+else
+  DVSTOR_BUILD_DIR_EXPLICIT=0
+fi
 BUILD_DIR="${BUILD_DIR:-$PROJECT_DIR/build}"
 
 DATASET_DIR="${DATASET_DIR:-/data/xjs/datasets/sift1b}"
@@ -14,60 +19,40 @@ LOG_DIR="${LOG_DIR:-$SCRIPT_DIR/logs}"
 PID_DIR="${PID_DIR:-$SCRIPT_DIR/pids}"
 
 SHARDS="${SHARDS:-5}"
-# PARTITION_STRATEGY="${PARTITION_STRATEGY:-bfs}"
-# PARTITION_STRATEGY="${PARTITION_STRATEGY:-metis}"
-PARTITION_STRATEGY="${PARTITION_STRATEGY:-balanced}"
+PARTITION_STRATEGY="${PARTITION_STRATEGY:-metis}"
+PARTITION_IMBALANCE="${PARTITION_IMBALANCE:-1.03}"
 R="${R:-96}"
 BUILD_BEAM="${BUILD_BEAM:-128}"
-SEARCH_BEAM="${SEARCH_BEAM:-100}"
 ALPHA="${ALPHA:-1.2}"
 K="${K:-10}"
 DIM="${DIM:-128}"
 VECTOR_DATA_TYPE="${VECTOR_DATA_TYPE:-uint8}"
-STORAGE_FORMAT="${STORAGE_FORMAT:-vamana_compact_v1}"
 BUILD_THREADS="${BUILD_THREADS:-112}"
-SERVICE_THREADS="${SERVICE_THREADS:-16}"
-COROUTINES="${COROUTINES:-4}"
-CLIENT_THREADS="${CLIENT_THREADS:-16}"
+SERVICE_THREADS="${SERVICE_THREADS:-64}"
 GPU_DEVICE="${GPU_DEVICE:-1}"
+PQ_SUBQUANTIZERS="${PQ_SUBQUANTIZERS:-32}"
 MAX_VECTORS="${MAX_VECTORS:-100000000}"
+# Logical IDs are sparse and authority state is allocated only for IDs that
+# exist, so exposing the complete non-wrapping uint32 range does not reserve a
+# dense 4B-entry table. UINT32_MAX itself remains excluded to prevent a
+# benchmark's atomic ID generator from wrapping back to base ID 0.
+VECTOR_ID_NAMESPACE_SIZE="${VECTOR_ID_NAMESPACE_SIZE:-4294967295}"
 MAX_QUERIES="${MAX_QUERIES:-10000}"
 GROUNDTRUTH_LABEL="${GROUNDTRUTH_LABEL:-100M}"
 GROUNDTRUTH_TOPK="${GROUNDTRUTH_TOPK:-10}"
 
-estimate_node_bytes() {
-  local component_size=4
-  case "$VECTOR_DATA_TYPE" in
-    uint8|int8) component_size=1 ;;
-    float32|auto) component_size=4 ;;
-  esac
-  if [[ "$STORAGE_FORMAT" == "vamana_compact_v1" ]]; then
-    local fixed_bytes=$((((16 + DIM * component_size + 15) / 16) * 16))
-    local graph_bytes=$((((8 + R * 5 + 7) / 8) * 8))
-    echo $((fixed_bytes + graph_bytes))
-  else
-    echo $((16 + DIM * component_size + R * 8))
-  fi
-}
+# Benchmark input files. These are the only settings normally changed when
+# moving the benchmark to another machine. Source row ranges describe how each
+# pre-generated u8bin was extracted.
+BENCHMARK_VECTOR_SOURCE="${BENCHMARK_VECTOR_SOURCE:-$DATASET_DIR/bigann_base.bvecs}"
+PERFORMANCE_QUERY_FILE="${PERFORMANCE_QUERY_FILE:-$DATASET_DIR/sift100m_to_110m_query.u8bin}"
+PERFORMANCE_QUERY_START="${PERFORMANCE_QUERY_START:-100000000}"
+PERFORMANCE_QUERY_END="${PERFORMANCE_QUERY_END:-110000000}"
+INSERT_FILE="${INSERT_FILE:-$DATASET_DIR/sift110m_to_120m_insert.u8bin}"
+INSERT_VECTOR_START="${INSERT_VECTOR_START:-110000000}"
+INSERT_VECTOR_END="${INSERT_VECTOR_END:-120000000}"
 
-estimate_mn_memory_gb() {
-  local node_bytes vectors_per_shard bytes gib
-  node_bytes="$(estimate_node_bytes)"
-  vectors_per_shard=$(((MAX_VECTORS + SHARDS - 1) / SHARDS))
-  bytes=$((vectors_per_shard * node_bytes))
-  # 20% slack for partition imbalance, headers, allocator alignment, and online inserts, plus 4GB floor slack.
-  gib=$(((bytes * 12 / 10 + 4 * 1024 * 1024 * 1024 + 1024 * 1024 * 1024 - 1) / (1024 * 1024 * 1024)))
-  if (( gib < 8 )); then gib=8; fi
-  echo "$gib"
-}
-
-if [[ -z "${CN_MEMORY_GB+x}" ]]; then
-  CN_MEMORY_GB=16
-  CN_MEMORY_GB_WAS_DEFAULT=1
-else
-  CN_MEMORY_GB_WAS_DEFAULT=0
-fi
-MN_MEMORY_GB="${MN_MEMORY_GB:-$(estimate_mn_memory_gb)}"
+# Query and insert defaults are adjacent, non-overlapping held-out ranges.
 
 BASE_PORT="${BASE_PORT:-1234}"
 HOSTS="${HOSTS:-192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202}"
@@ -77,8 +62,230 @@ MAX_SEND_WRS="${MAX_SEND_WRS:-4096}"
 MAX_RECEIVE_WRS="${MAX_RECEIVE_WRS:-4096}"
 MAX_POLL_CQES="${MAX_POLL_CQES:-64}"
 
-PROFILE="${PROFILE:-baseline}"
-INDEX_PREFIX="${INDEX_PREFIX:-$INDEX_DIR/sift100m_R${R}_bw${BUILD_BEAM}_${PARTITION_STRATEGY}}"
+PROFILE="${PROFILE:-04_gpu_persistent_gpunetio}"
+INDEX_PREFIX="${INDEX_PREFIX:-$INDEX_DIR/sift100m_R${R}_bw${BUILD_BEAM}_${PARTITION_STRATEGY}_pq${PQ_SUBQUANTIZERS}}"
+
+# MN_MEMORY_GB is the per-shard RDMA-registered storage region, not total
+# process RSS. Resolve it only after the selected profile has established the
+# final INDEX_PREFIX. An explicit environment/profile value always wins.
+MN_DYNAMIC_HEADROOM_PERCENT="${MN_DYNAMIC_HEADROOM_PERCENT:-20}"
+MN_DYNAMIC_SLOTS_PER_SHARD="${MN_DYNAMIC_SLOTS_PER_SHARD:-}"
+MN_MEMORY_MIN_GB="${MN_MEMORY_MIN_GB:-8}"
+
+validate_vector_id_namespace_size() {
+  if [[ ! "$VECTOR_ID_NAMESPACE_SIZE" =~ ^[1-9][0-9]*$ ]] ||
+      ((VECTOR_ID_NAMESPACE_SIZE < MAX_VECTORS ||
+        VECTOR_ID_NAMESPACE_SIZE > 4294967295)); then
+    echo "VECTOR_ID_NAMESPACE_SIZE must be an integer in [$MAX_VECTORS,4294967295]: $VECTOR_ID_NAMESPACE_SIZE" >&2
+    return 1
+  fi
+}
+
+estimate_mn_memory_gb() {
+  local metadata="${INDEX_PREFIX}.meta.json"
+  python3 - "$metadata" "$SHARDS" "$MAX_VECTORS" "$DIM" "$R" \
+    "$VECTOR_DATA_TYPE" "$PQ_SUBQUANTIZERS" "$PARTITION_IMBALANCE" \
+    "$MN_DYNAMIC_HEADROOM_PERCENT" "$MN_DYNAMIC_SLOTS_PER_SHARD" \
+    "$MN_MEMORY_MIN_GB" <<'PY_MN_MEMORY'
+import json
+import os
+import sys
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
+
+GIB = 1 << 30
+REMOTE_PTR_CAPACITY = 256 * GIB
+CENTROID_HEADER_BYTES = 128
+CENTROID_ENTRY_BYTES = 16
+CENTROID_ENTRY_CAPACITY = 4
+STORAGE_CONTROL_BYTES = 4096
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def positive_int(name, raw, *, allow_zero=False):
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        fail(f'{name} must be an integer: {raw!r}')
+    if value < 0 or (value == 0 and not allow_zero):
+        relation = 'non-negative' if allow_zero else 'positive'
+        fail(f'{name} must be {relation}: {value}')
+    return value
+
+
+def decimal_value(name, raw, *, minimum):
+    try:
+        value = Decimal(raw)
+    except (InvalidOperation, TypeError, ValueError):
+        fail(f'{name} must be numeric: {raw!r}')
+    if not value.is_finite() or value < minimum:
+        fail(f'{name} must be finite and >= {minimum}: {raw!r}')
+    return value
+
+
+def align_up(value, alignment):
+    if value < 0 or alignment <= 0:
+        fail('invalid alignment input')
+    return ((value + alignment - 1) // alignment) * alignment
+
+
+def centroid_publication_bytes(dim):
+    centroid_end = CENTROID_HEADER_BYTES + dim * 4  # canonical FP32 route
+    entries_offset = align_up(centroid_end, 8)
+    return align_up(
+        entries_offset + CENTROID_ENTRY_CAPACITY * CENTROID_ENTRY_BYTES, 64)
+
+
+def metadata_layout(path, expected_shards):
+    try:
+        with open(path, 'r', encoding='utf-8') as stream:
+            metadata = json.load(stream)
+    except (OSError, json.JSONDecodeError) as error:
+        fail(f'cannot read index metadata {path}: {error}')
+
+    if metadata.get('schema_version') != 16 or \
+            metadata.get('storage_format') != 'vamana_tagged_v2':
+        fail(f'index metadata is not a schema-16 tagged index: {path}')
+    shards = positive_int('metadata.num_memory_nodes',
+                          metadata.get('num_memory_nodes'))
+    if shards != expected_shards:
+        fail(f'metadata shard count {shards} does not match SHARDS={expected_shards}')
+
+    counts = metadata.get('hot_graph_entry_counts')
+    bases = metadata.get('dynamic_node_base_offsets')
+    if not isinstance(counts, list) or len(counts) != shards:
+        fail('hot_graph_entry_counts must contain one value per shard')
+    if not isinstance(bases, list) or len(bases) != shards:
+        fail('dynamic_node_base_offsets must contain one value per shard')
+    counts = [positive_int(f'hot_graph_entry_counts[{index}]', value)
+              for index, value in enumerate(counts)]
+    bases = [positive_int(f'dynamic_node_base_offsets[{index}]', value)
+             for index, value in enumerate(bases)]
+    num_vectors = positive_int('metadata.num_vectors', metadata.get('num_vectors'))
+    if sum(counts) != num_vectors:
+        fail('hot_graph_entry_counts do not sum to metadata.num_vectors')
+
+    record_bytes = positive_int(
+        'hot_graph_dynamic_record_bytes',
+        metadata.get('hot_graph_dynamic_record_bytes'))
+    allocation_size = positive_int(
+        'allocation_size', metadata.get('allocation_size'))
+    if allocation_size != record_bytes:
+        fail('allocation_size does not match hot_graph_dynamic_record_bytes')
+    dim = positive_int('metadata.dim', metadata.get('dim'))
+    return counts, bases, record_bytes, dim, 'metadata'
+
+
+def fallback_layout(shards, max_vectors, dim, degree, dtype, code_bytes,
+                    partition_imbalance):
+    if max_vectors == 0:
+        fail('MAX_VECTORS=0 requires an existing schema-16 metadata file')
+    component_sizes = {'uint8': 1, 'int8': 1, 'float32': 4, 'auto': 4}
+    if dtype not in component_sizes:
+        fail(f'unsupported VECTOR_DATA_TYPE={dtype!r}')
+    if degree > 255:
+        fail(f'R exceeds the one-byte graph-degree format: {degree}')
+    if shards > 64:
+        fail(f'SHARDS exceeds tagged RemotePtr capacity: {shards}')
+    if code_bytes > dim:
+        fail(f'PQ_SUBQUANTIZERS exceeds DIM: {code_bytes} > {dim}')
+
+    vector_bytes = dim * component_sizes[dtype]
+    fixed_bytes = align_up(24 + align_up(vector_bytes, 8), 16)
+    provisional_slots = min(15, max(2, (degree + 15) // 16))
+    graph_bytes = align_up(16 + (degree + provisional_slots) * 8, 8)
+    dynamic_code_offset = fixed_bytes + graph_bytes
+    record_bytes = align_up(dynamic_code_offset + 4 + code_bytes, 16)
+
+    projected = (Decimal(max_vectors) * partition_imbalance /
+                 Decimal(shards)).to_integral_value(rounding=ROUND_CEILING)
+    count = int(projected)
+    fixed_end = 16 + count * fixed_bytes
+    graph_header = align_up(fixed_end, 64)
+    graph_offset = align_up(graph_header + 64, 64)
+    dat_end = align_up(graph_offset + count * graph_bytes, 64)
+    persistent_bytes = STORAGE_CONTROL_BYTES + count * code_bytes
+    dynamic_base = dat_end + align_up(persistent_bytes, record_bytes)
+    return ([count] * shards, [dynamic_base] * shards,
+            record_bytes, dim, 'schema16-fallback')
+
+
+def main():
+    (metadata_path, raw_shards, raw_max_vectors, raw_dim, raw_degree,
+     dtype, raw_code_bytes, raw_partition_imbalance,
+     raw_headroom_percent, raw_absolute_slots, raw_min_gib) = sys.argv[1:]
+
+    shards = positive_int('SHARDS', raw_shards)
+    max_vectors = positive_int('MAX_VECTORS', raw_max_vectors, allow_zero=True)
+    dim = positive_int('DIM', raw_dim)
+    degree = positive_int('R', raw_degree)
+    code_bytes = positive_int('PQ_SUBQUANTIZERS', raw_code_bytes)
+    partition_imbalance = decimal_value(
+        'PARTITION_IMBALANCE', raw_partition_imbalance, minimum=Decimal(1))
+    headroom_percent = decimal_value(
+        'MN_DYNAMIC_HEADROOM_PERCENT', raw_headroom_percent,
+        minimum=Decimal(0))
+    min_gib = positive_int('MN_MEMORY_MIN_GB', raw_min_gib)
+
+    if os.path.exists(metadata_path):
+        counts, bases, record_bytes, layout_dim, source = metadata_layout(
+            metadata_path, shards)
+    else:
+        counts, bases, record_bytes, layout_dim, source = fallback_layout(
+            shards, max_vectors, dim, degree, dtype, code_bytes,
+            partition_imbalance)
+
+    if raw_absolute_slots:
+        absolute_slots = positive_int(
+            'MN_DYNAMIC_SLOTS_PER_SHARD', raw_absolute_slots)
+        headroom_slots = [absolute_slots] * shards
+        policy = f'{absolute_slots} slots/shard'
+    else:
+        headroom_slots = [max(1, int(
+            (Decimal(count) * headroom_percent / Decimal(100))
+            .to_integral_value(rounding=ROUND_CEILING))) for count in counts]
+        policy = f'{headroom_percent}% of base nodes'
+
+    tail_bytes = centroid_publication_bytes(layout_dim)
+    required_by_shard = [
+        base + slots * record_bytes + tail_bytes
+        for base, slots in zip(bases, headroom_slots)
+    ]
+    required_bytes = max(required_by_shard)
+    estimated_gib = max(min_gib, (required_bytes + GIB - 1) // GIB)
+    if estimated_gib * GIB > REMOTE_PTR_CAPACITY:
+        fail(f'estimated storage region exceeds 256 GiB: {estimated_gib} GiB')
+
+    limiting_shard = max(range(shards), key=required_by_shard.__getitem__)
+    print(
+        f'[mn-memory] auto={estimated_gib} GiB source={source} '
+        f'policy={policy} limiting_shard={limiting_shard + 1} '
+        f'dynamic_slots={headroom_slots[limiting_shard]} '
+        f'record_bytes={record_bytes}',
+        file=sys.stderr)
+    print(estimated_gib)
+
+
+try:
+    main()
+except (ValueError, KeyError, TypeError) as error:
+    print(f'mn-memory estimation failed: {error}', file=sys.stderr)
+    raise SystemExit(1)
+PY_MN_MEMORY
+}
+
+resolve_mn_memory_gb() {
+  if [[ -z "${MN_MEMORY_GB:-}" ]]; then
+    MN_MEMORY_GB="$(estimate_mn_memory_gb)"
+  fi
+  if [[ ! "$MN_MEMORY_GB" =~ ^[1-9][0-9]*$ ]] ||
+      ((MN_MEMORY_GB > 256)); then
+    echo "MN_MEMORY_GB must be an integer in [1,256]: $MN_MEMORY_GB" >&2
+    return 1
+  fi
+}
 
 mkdir -p "$CONVERTED_DIR" "$INDEX_DIR" "$REPORT_DIR" "$LOG_DIR" "$PID_DIR"
 
@@ -101,124 +308,189 @@ query_suffix() {
 base_bin() { echo "$CONVERTED_DIR/base$(base_suffix).u8bin"; }
 query_bin() { echo "$CONVERTED_DIR/query$(query_suffix).u8bin"; }
 groundtruth_bin() { echo "$CONVERTED_DIR/groundtruth_${GROUNDTRUTH_LABEL}.bin"; }
-insert_bin() { echo "${INSERT_FILE:-$CONVERTED_DIR/insert_test.u8bin}"; }
-
+insert_bin() { echo "$INSERT_FILE"; }
+performance_query_bin() { echo "$PERFORMANCE_QUERY_FILE"; }
 metadata_file() { echo "${INDEX_PREFIX}.meta.json"; }
+model_file() { echo "${INDEX_PREFIX}.pq${PQ_SUBQUANTIZERS}"; }
+
+shard_file() {
+  local node_id="${1:?node id is required}"
+  echo "${INDEX_PREFIX}_node${node_id}_of${SHARDS}.dat"
+}
+
+idmap_file() {
+  local node_id="${1:?node id is required}"
+  echo "${INDEX_PREFIX}_node${node_id}_of${SHARDS}.idmap"
+}
+
+centroid_file() {
+  local node_id="${1:?node id is required}"
+  echo "${INDEX_PREFIX}_node${node_id}_of${SHARDS}.centroid"
+}
+
+navigation_code_file() {
+  local node_id="${1:?node id is required}"
+  echo "${INDEX_PREFIX}_node${node_id}_of${SHARDS}.pq${PQ_SUBQUANTIZERS}.codes"
+}
 
 validate_index_metadata() {
+  local role="${1:-compute}"
+  local node_id="${2:-0}"
   local metadata
   metadata="$(metadata_file)"
-  if [[ ! -f "$metadata" ]]; then
+  if [[ ! -s "$metadata" ]]; then
     echo "missing index metadata: $metadata" >&2
     return 1
   fi
 
-  python3 - "$metadata" "$INDEX_PREFIX" "$R" "$BUILD_BEAM" "$DIM" "$MAX_VECTORS" "$SHARDS" "$VECTOR_DATA_TYPE" <<'PY_VALIDATE'
+  python3 - "$metadata" "$INDEX_PREFIX" "$R" "$BUILD_BEAM" "$DIM" \
+    "$MAX_VECTORS" "$SHARDS" "$VECTOR_DATA_TYPE" "$PQ_SUBQUANTIZERS" \
+    "$PARTITION_STRATEGY" "${PARTITION_MAX_DEGREE:-32}" <<'PY_VALIDATE'
 import json
 import sys
 
-path, expected_prefix, expected_r, expected_beam, expected_dim, expected_vectors, expected_shards, expected_dtype = sys.argv[1:]
-with open(path, 'r', encoding='utf-8') as f:
-    metadata = json.load(f)
+path, prefix, degree, build_beam, dim, vectors, shards, dtype, subquantizers, \
+    partition_strategy, partition_max_degree = sys.argv[1:]
+with open(path, 'r', encoding='utf-8') as stream:
+    metadata = json.load(stream)
 
 expected = {
-    'output_prefix': expected_prefix,
-    'R': int(expected_r),
-    'beam_width_construction': int(expected_beam),
-    'dim': int(expected_dim),
-    'num_vectors': int(expected_vectors),
-    'num_memory_nodes': int(expected_shards),
-    'vector_data_type': expected_dtype,
+    'output_prefix': prefix,
+    'schema_version': 16,
+    'distance': 'l2',
+    'node_layout': 'plain',
+    'storage_format': 'vamana_tagged_v2',
+    'remote_ptr_format': 'tagged_inc24_shard6_off34x16_v1',
+    'navigation_execution': 'gpu_beam_v1',
+    'R': int(degree),
+    'beam_width_construction': int(build_beam),
+    'dim': int(dim),
+    'num_vectors': int(vectors),
+    'num_memory_nodes': int(shards),
+    'vector_data_type': dtype,
+    'navigation_code_bytes': int(subquantizers),
+    'pq_subquantizers': int(subquantizers),
+    'pq_bits': 8,
+    'partition_strategy': partition_strategy,
+    'partition_max_degree': int(partition_max_degree),
+    'idmap_format': 'owner_sharded_v2_bound',
+    'centroid_state_format': 'physical_shard_centroid_v2_bound',
+    'hot_graph_pointer_bytes': 8,
 }
-errors = []
-for key, value in expected.items():
-    if metadata.get(key) != value:
-        errors.append(f"{key}: metadata={metadata.get(key)!r}, expected={value!r}")
-if metadata.get('offline_builder_version', 0) < 2:
-    errors.append('offline_builder_version is missing or older than 2; rebuild with the fixed per-node random graph initializer')
-if metadata.get('random_graph_seed_scope') != 'per_node':
-    errors.append('random_graph_seed_scope is not per_node; this index may contain duplicated initial neighbor lists')
-
+errors = [
+    f'{key}: metadata={metadata.get(key)!r}, expected={value!r}'
+    for key, value in expected.items() if metadata.get(key) != value
+]
+if metadata.get('navigation_quantizer') != 'opq_pq':
+    errors.append('navigation_quantizer must be opq_pq')
+if metadata.get('navigation_format') != 'opq_pq_graph_v1':
+    errors.append('navigation_format must be opq_pq_graph_v1')
+if not metadata.get('navigation_model_checksum'):
+    errors.append('navigation_model_checksum is missing')
+if not metadata.get('index_build_fingerprint'):
+    errors.append('index_build_fingerprint is missing')
+shard_fingerprints = metadata.get('shard_build_fingerprints')
+if (not isinstance(shard_fingerprints, list) or
+        len(shard_fingerprints) != int(shards) or
+        any(not isinstance(value, int) or value == 0
+            for value in shard_fingerprints)):
+    errors.append('shard_build_fingerprints must bind every storage shard')
+if 'medoid' in metadata or 'navigation_entry_points' in metadata:
+    errors.append('runtime metadata must not contain static query entry state')
+for key in (
+    'hot_graph_offsets',
+    'hot_graph_entry_counts',
+    'hot_graph_dynamic_base_offsets',
+    'navigation_code_remote_offsets',
+    'navigation_code_region_bytes',
+    'storage_control_remote_offsets',
+    'dynamic_node_base_offsets',
+):
+    value = metadata.get(key)
+    if not isinstance(value, list) or len(value) != int(shards):
+        errors.append(f'{key} must contain one value per storage shard')
+dynamic_hot = metadata.get('hot_graph_dynamic_hot_offset', 0)
+graph_entry = metadata.get('hot_graph_entry_size', 0)
+dynamic_code = metadata.get('dynamic_navigation_code_offset', 0)
+dynamic_record = metadata.get('hot_graph_dynamic_record_bytes', 0)
+if dynamic_code < dynamic_hot + graph_entry:
+    errors.append('dynamic PQ code overlaps the compact graph record')
+if dynamic_record < dynamic_code + int(subquantizers):
+    errors.append('persistent dynamic record is too small for PQ codes')
 if errors:
-    print(f"incompatible or unsafe index metadata: {path}", file=sys.stderr)
+    print(f'incompatible GPU index metadata: {path}', file=sys.stderr)
     for error in errors:
-        print(f"  - {error}", file=sys.stderr)
-    sys.exit(1)
+        print(f'  - {error}', file=sys.stderr)
+    raise SystemExit(1)
 PY_VALIDATE
 
-  local node_id shard
-  for ((node_id = 1; node_id <= SHARDS; ++node_id)); do
-    shard="$(shard_file "$node_id")"
-    if [[ ! -s "$shard" ]]; then
-      echo "missing or empty shard file: $shard" >&2
+  if [[ "$role" == "compute" ]]; then
+    if [[ ! -s "$(model_file)" ]]; then
+      echo "missing OPQ/PQ${PQ_SUBQUANTIZERS} model: $(model_file)" >&2
       return 1
     fi
-  done
+  elif [[ "$role" == "storage" ]]; then
+    local first=1 last="$SHARDS"
+    if ((node_id > 0)); then first="$node_id"; last="$node_id"; fi
+    local current
+    for ((current = first; current <= last; ++current)); do
+      for artifact in "$(shard_file "$current")" "$(idmap_file "$current")" \
+                      "$(centroid_file "$current")" \
+                      "$(navigation_code_file "$current")"; do
+        if [[ ! -s "$artifact" ]]; then
+          echo "missing storage artifact: $artifact" >&2
+          return 1
+        fi
+      done
+    done
+  else
+    echo "unknown index validation role: $role" >&2
+    return 1
+  fi
 }
 
 server_endpoints() {
-  local idx=0
+  local index=0
   local endpoints=()
   for host in $HOSTS; do
-    if (( idx >= SHARDS )); then break; fi
-    endpoints+=("${host}:$((BASE_PORT + idx))")
-    idx=$((idx + 1))
+    ((index >= SHARDS)) && break
+    endpoints+=("${host}:$((BASE_PORT + index))")
+    index=$((index + 1))
   done
-  if (( ${#endpoints[@]} != SHARDS )); then
+  if ((${#endpoints[@]} != SHARDS)); then
     echo "HOSTS must contain $SHARDS entries; got ${#endpoints[@]}" >&2
     return 1
   fi
   printf '%s ' "${endpoints[@]}"
 }
 
-shard_file() {
-  local node_id="$1"
-  echo "${INDEX_PREFIX}_node${node_id}_of${SHARDS}.dat"
-}
-
 common_rdma_args() {
-  local args=(--ib-port "$IB_PORT" --max-send-wrs "$MAX_SEND_WRS" --max-receive-wrs "$MAX_RECEIVE_WRS" --max-poll-cqes "$MAX_POLL_CQES")
-  if [[ -n "$IB_DEVICE" ]]; then
-    args+=(--ib-device "$IB_DEVICE")
-  fi
+  local args=(--ib-port "$IB_PORT" --max-send-wrs "$MAX_SEND_WRS"
+              --max-receive-wrs "$MAX_RECEIVE_WRS" --max-poll-cqes "$MAX_POLL_CQES")
+  [[ -z "$IB_DEVICE" ]] || args+=(--ib-device "$IB_DEVICE")
   printf '%q ' "${args[@]}"
 }
 
 ensure_built() {
+  if [[ ! -f "$BUILD_DIR/CMakeCache.txt" ]]; then
+    echo "build directory is not configured: $BUILD_DIR" >&2
+    return 1
+  fi
   cmake --build "$BUILD_DIR" -j --target "$@"
 }
 
-
 write_service_config() {
-  local output="$1"
+  local output="${1:?output path is required}"
   local endpoints
-  local insert_execution="${INSERT_EXECUTION:-compute}"
-  local insert_workers query_workers insert_coroutines query_coroutines
-  endpoints="$(server_endpoints)"
-
-  if [[ "$insert_execution" == "storage_owner" ]]; then
-    # Inserts execute on memory nodes; all compute-side workers remain available for queries.
-    insert_workers=0
-    query_workers="$SERVICE_THREADS"
-    insert_coroutines=0
-    query_coroutines="${QUERY_COROUTINES:-$COROUTINES}"
-  else
-    if [[ -z "${INSERT_WORKERS+x}" && -z "${QUERY_WORKERS+x}" ]]; then
-      insert_workers=$((SERVICE_THREADS / 2))
-      query_workers=$((SERVICE_THREADS - insert_workers))
-    elif [[ -z "${INSERT_WORKERS+x}" ]]; then
-      query_workers="$QUERY_WORKERS"
-      insert_workers=$((SERVICE_THREADS - query_workers))
-    elif [[ -z "${QUERY_WORKERS+x}" ]]; then
-      insert_workers="$INSERT_WORKERS"
-      query_workers=$((SERVICE_THREADS - insert_workers))
-    else
-      insert_workers="$INSERT_WORKERS"
-      query_workers="$QUERY_WORKERS"
-    fi
-    insert_coroutines="${INSERT_COROUTINES:-$COROUTINES}"
-    query_coroutines="${QUERY_COROUTINES:-$COROUTINES}"
+  local enable_updates="${ENABLE_UPDATES:-true}"
+  if [[ "$enable_updates" != "true" && "$enable_updates" != "false" ]]; then
+    echo "ENABLE_UPDATES must be true or false: $enable_updates" >&2
+    return 1
   fi
+  endpoints="$(server_endpoints)"
+  validate_index_metadata compute
+  validate_vector_id_namespace_size
+  resolve_mn_memory_gb
 
   {
     echo "servers = $endpoints"
@@ -226,120 +498,50 @@ write_service_config() {
     echo "num-clients = 1"
     echo "port = 2234"
     echo "ib-port = $IB_PORT"
-    if [[ -n "$IB_DEVICE" ]]; then echo "ib-device = $IB_DEVICE"; fi
+    [[ -z "$IB_DEVICE" ]] || echo "ib-device = $IB_DEVICE"
     echo "max-send-wrs = $MAX_SEND_WRS"
     echo "max-receive-wrs = $MAX_RECEIVE_WRS"
     echo "max-poll-cqes = $MAX_POLL_CQES"
-    echo "data-path = $(base_bin)"
     echo "index-prefix = $INDEX_PREFIX"
-    echo "load-index = true"
-    echo "no-recall = true"
+    echo "threads = $SERVICE_THREADS"
+    echo "seed = ${SEED:-1234}"
     echo "vector-data-type = $VECTOR_DATA_TYPE"
     echo "dim = $DIM"
     echo "max-vectors = $MAX_VECTORS"
-    echo "threads = $SERVICE_THREADS"
-    echo "coroutines = $COROUTINES"
+    echo "vector-id-namespace-size = $VECTOR_ID_NAMESPACE_SIZE"
     echo "R = $R"
-    echo "beam-width = $SEARCH_BEAM"
     echo "beam-width-construction = $BUILD_BEAM"
     echo "alpha = $ALPHA"
     echo "k = $K"
-    echo "gpu-device = $GPU_DEVICE"
-    echo "cn-memory = $CN_MEMORY_GB"
     echo "mn-memory = $MN_MEMORY_GB"
-    echo "insert-workers = $insert_workers"
-    echo "query-workers = $query_workers"
-    echo "insert-coroutines = $insert_coroutines"
-    echo "query-coroutines = $query_coroutines"
-    echo "label = sift100m_${PROFILE_NAME:-$PROFILE}"
-    if [[ "${GPUDIRECT_RDMA:-0}" == "1" ]]; then echo "gpudirect-rdma = true"; fi
-    if [[ -n "${ENABLE_BREAKDOWN:-}" ]]; then
-      if [[ "${ENABLE_BREAKDOWN}" == "1" || "${ENABLE_BREAKDOWN}" == "true" ]]; then
-        echo "enable-breakdown = true"
-      else
-        echo "enable-breakdown = false"
-      fi
-    fi
-    if [[ "${OBSERVE_DEVICE_UTILIZATION:-0}" == "1" || "${OBSERVE_DEVICE_UTILIZATION:-0}" == "true" ]]; then
-      echo "observe-device-utilization = true"
-    fi
-    if [[ -n "${EXPANSION_BATCH:-}" ]]; then echo "expansion-batch = ${EXPANSION_BATCH}"; fi
-    if [[ "${CREDIT_AWARE_EXPANSION:-0}" == "1" || "${CREDIT_AWARE_EXPANSION:-0}" == "true" ]]; then
-      echo "credit-aware-expansion = true"
-      if [[ -n "${CREDIT_AWARE_MIN_K:-}" ]]; then echo "credit-aware-min-k = ${CREDIT_AWARE_MIN_K}"; fi
-      if [[ -n "${CREDIT_AWARE_MAX_K:-}" ]]; then echo "credit-aware-max-k = ${CREDIT_AWARE_MAX_K}"; fi
-      if [[ -n "${CREDIT_AWARE_TARGET_CANDIDATES:-}" ]]; then
-        echo "credit-aware-target-candidates = ${CREDIT_AWARE_TARGET_CANDIDATES}"
-      fi
-      if [[ -n "${CREDIT_AWARE_MAX_LOOKAHEAD:-}" ]]; then
-        echo "credit-aware-max-lookahead = ${CREDIT_AWARE_MAX_LOOKAHEAD}"
-      fi
-      if [[ "${CREDIT_AWARE_COST_GUARD:-0}" == "1" || "${CREDIT_AWARE_COST_GUARD:-0}" == "true" ]]; then
-        echo "credit-aware-cost-guard = true"
-        if [[ -n "${CREDIT_AWARE_COST_MAX_EXTRA_RATIO:-}" ]]; then
-          echo "credit-aware-cost-max-extra-ratio = ${CREDIT_AWARE_COST_MAX_EXTRA_RATIO}"
-        fi
-        if [[ -n "${CREDIT_AWARE_COST_PROBE_ROUNDS:-}" ]]; then
-          echo "credit-aware-cost-probe-rounds = ${CREDIT_AWARE_COST_PROBE_ROUNDS}"
-        fi
-      fi
-    fi
-    if [[ -n "${RDMA_QP_POOL_SIZE:-}" ]]; then echo "rdma-qp-pool-size = ${RDMA_QP_POOL_SIZE}"; fi
-    if [[ -n "${RDMA_READ_BATCH_MODE:-}" ]]; then echo "rdma-read-batch-mode = ${RDMA_READ_BATCH_MODE}"; fi
-    if [[ -n "${RDMA_READ_CHAIN_SIZE:-}" ]]; then echo "rdma-read-chain-size = ${RDMA_READ_CHAIN_SIZE}"; fi
-    if [[ -n "${RDMA_READ_MAX_INFLIGHT_WRS:-}" ]]; then echo "rdma-read-max-inflight-wrs = ${RDMA_READ_MAX_INFLIGHT_WRS}"; fi
-    if [[ -n "${QUERY_BATCH_SIZE:-}" ]]; then echo "query-batch-size = ${QUERY_BATCH_SIZE}"; fi
-    if [[ "${USE_RABITQ:-0}" == "1" ]]; then echo "use-rabitq = true"; fi
-    if [[ "${USE_RABITQ:-0}" == "1" ]]; then
-      echo "rabitq-gate-width = ${RABITQ_GATE_WIDTH:-18}"
-      echo "rabitq-gate-max-width = ${RABITQ_GATE_MAX_WIDTH:-36}"
-      echo "rabitq-gate-margin = ${RABITQ_GATE_MARGIN:-0.08}"
-      echo "rabitq-cache-max-ratio = ${RABITQ_CACHE_MAX_RATIO:-0.10}"
-      echo "rabitq-dynamic-budget-mb = ${RABITQ_DYNAMIC_BUDGET_MB:-64}"
-      echo "rabitq-coalesce-target = ${RABITQ_COALESCE_TARGET:-64}"
-      echo "rabitq-coalesce-min = ${RABITQ_COALESCE_MIN:-32}"
-      echo "rabitq-coalesce-wait-us = ${RABITQ_COALESCE_WAIT_US:-6}"
-      echo "rabitq-warmup-exact-expansions = ${RABITQ_WARMUP_EXACT_EXPANSIONS:-6}"
-      echo "rabitq-audit-period = ${RABITQ_AUDIT_PERIOD:-12}"
-      if [[ "${RABITQ_STRICT_RECALL:-1}" == "1" ]]; then
-        echo "rabitq-strict-recall = true"
-      else
-        echo "rabitq-strict-recall = false"
-      fi
-    fi
-    echo "insert-execution = $insert_execution"
-    if [[ "$insert_execution" == "storage_owner" ]]; then
-      echo "storage-peers = $endpoints"
-      echo "storage-owner-batch-max = ${STORAGE_OWNER_BATCH_MAX:-32}"
-      echo "storage-owner-batch-wait-us = ${STORAGE_OWNER_BATCH_WAIT_US:-100}"
-      echo "storage-owner-peer-rdma-tokens = ${STORAGE_OWNER_PEER_RDMA_TOKENS:-8}"
-      echo "storage-owner-rpc-depth = ${STORAGE_OWNER_RPC_DEPTH:-16}"
-      echo "storage-owner-rpc-timeout-ms = ${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}"
-      echo "storage-owner-construction-beam-width = ${STORAGE_OWNER_CONSTRUCTION_BEAM_WIDTH:-$BUILD_BEAM}"
-      echo "storage-owner-search-snapshot-batch = ${STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH:-64}"
-      echo "storage-owner-prune-max-candidates = ${STORAGE_OWNER_PRUNE_MAX_CANDIDATES:-128}"
-      local update_mode="${STORAGE_OWNER_UPDATE_MODE:-exact}"
-      if [[ "$update_mode" != "exact" ]]; then
-        echo "storage-owner-update-mode = ${update_mode}"
-      fi
-      if [[ "$update_mode" == "local_stitch" ]]; then
-        echo "storage-owner-anchor-hints = ${STORAGE_OWNER_ANCHOR_HINTS:-4}"
-        echo "storage-owner-anchor-beam-width = ${STORAGE_OWNER_ANCHOR_BEAM_WIDTH:-64}"
-        echo "storage-owner-anchor-expand-cap = ${STORAGE_OWNER_ANCHOR_EXPAND_CAP:-16}"
-        echo "storage-owner-anchor-remote-rescue-cap = ${STORAGE_OWNER_ANCHOR_REMOTE_RESCUE_CAP:-4}"
-        if [[ "${STORAGE_OWNER_LOCAL_STITCH_SYNC_FAST_PATH:-1}" == "0" || \
-              "${STORAGE_OWNER_LOCAL_STITCH_SYNC_FAST_PATH:-1}" == "false" ]]; then
-          echo "storage-owner-local-stitch-sync-fast-path = false"
-        else
-          echo "storage-owner-local-stitch-sync-fast-path = true"
-        fi
-      fi
-      echo "storage-owner-maintenance-mode = ${STORAGE_OWNER_MAINTENANCE_MODE:-off}"
-      echo "storage-owner-maintenance-workers = ${STORAGE_OWNER_MAINTENANCE_WORKERS:-0}"
-      echo "storage-owner-reverse-mode = ${STORAGE_OWNER_REVERSE_MODE:-async}"
-      echo "storage-owner-reverse-queue-depth = ${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
-      echo "storage-owner-reverse-flush-us = ${STORAGE_OWNER_REVERSE_FLUSH_US:-200}"
-      echo "storage-owner-reverse-coalesce-max = ${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}"
-    fi
+    echo "gpu-device = $GPU_DEVICE"
+    echo "enable-breakdown = ${ENABLE_BREAKDOWN:-true}"
+    echo "enable-updates = $enable_updates"
+    echo "gpu-query-slots = ${GPU_QUERY_SLOTS:-256}"
+    echo "gpu-memory-limit-gb = ${GPU_MEMORY_LIMIT_GB:-40}"
+    echo "gpu-memory-reserve-gb = ${GPU_MEMORY_RESERVE_GB:-4}"
+    echo "gpu-bootstrap-window-mb = ${GPU_BOOTSTRAP_WINDOW_MB:-64}"
+    echo "gpu-bootstrap-windows = ${GPU_BOOTSTRAP_WINDOWS:-4}"
+    echo "gpu-graph-prefetch-depth = ${GPU_GRAPH_PREFETCH_DEPTH:-32}"
+    echo "gpu-traversal-beam-width = ${GPU_TRAVERSAL_BEAM_WIDTH:-128}"
+    echo "gpu-final-rerank-width = ${GPU_FINAL_RERANK_WIDTH:-128}"
+    echo "gpu-max-expansions = ${GPU_MAX_EXPANSIONS:-384}"
+    echo "gpu-rdma-qps = ${GPU_RDMA_QPS:-32}"
+    echo "gpu-dynamic-code-cache-entries = ${GPU_DYNAMIC_CODE_CACHE_ENTRIES:-16777216}"
+    echo "gpu-direct-timeout-ms = ${GPU_DIRECT_TIMEOUT_MS:-250}"
+    echo "gpu-persistent-blocks-per-sm = ${GPU_PERSISTENT_BLOCKS_PER_SM:-4}"
+    echo "storage-id = 0"
+    echo "storage-peers = $endpoints"
+    echo "storage-owner-batch-max = ${STORAGE_OWNER_BATCH_MAX:-32}"
+    echo "storage-owner-batch-max-wait-us = ${STORAGE_OWNER_BATCH_MAX_WAIT_US:-10000}"
+    echo "storage-owner-stage2-batch-max-wait-us = ${STORAGE_OWNER_STAGE2_BATCH_MAX_WAIT_US:-50}"
+    echo "storage-owner-peer-qps-per-peer = ${STORAGE_OWNER_PEER_QPS_PER_PEER:-8}"
+    echo "storage-owner-peer-rdma-tokens = ${STORAGE_OWNER_PEER_RDMA_TOKENS:-16}"
+    echo "storage-owner-rpc-depth = ${STORAGE_OWNER_RPC_DEPTH:-16}"
+    echo "storage-owner-rpc-timeout-ms = ${STORAGE_OWNER_RPC_TIMEOUT_MS:-30000}"
+    echo "storage-owner-search-snapshot-batch = ${STORAGE_OWNER_SEARCH_SNAPSHOT_BATCH:-256}"
+    echo "storage-owner-maintenance-workers = ${STORAGE_OWNER_MAINTENANCE_WORKERS:-8}"
+    echo "storage-owner-reverse-queue-depth = ${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
+    echo "storage-owner-reverse-coalesce-max = ${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}"
   } > "$output"
 }

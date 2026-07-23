@@ -24,9 +24,8 @@ private:
 filepath_t resolve_dataset_file(const filepath_t& input_path);
 Dataset read_dataset(const VamanaBuildConfig& config);
 float dataset_l2_distance(const Dataset& dataset, size_t lhs, size_t rhs);
-float dataset_ip_distance(const Dataset& dataset, size_t lhs, size_t rhs);
-float dataset_distance(const Dataset& dataset, size_t lhs, size_t rhs, bool ip_distance);
-float dataset_distance_float_query(const Dataset& dataset, const float* query, size_t rhs, bool ip_distance);
+float dataset_distance(const Dataset& dataset, size_t lhs, size_t rhs);
+float dataset_distance_float_query(const Dataset& dataset, const float* query, size_t rhs);
 void dataset_decode_vector(const Dataset& dataset, size_t row, float* dst);
 
 }  // namespace tools::vamana_offline

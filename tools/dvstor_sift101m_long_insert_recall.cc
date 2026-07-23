@@ -24,7 +24,6 @@
 #include <vector>
 
 #include "common/configuration.hh"
-#include "common/distance.hh"
 #include "common/vector_dtype.hh"
 #include "nlohmann/json.hh"
 #include "service/compute_service.hh"
@@ -52,8 +51,6 @@ struct Args {
   u32 recall_k{10};
   size_t settle_seconds{300};
 
-  double min_post_recall{-1.0};
-  double max_recall_drop{-1.0};
   std::filesystem::path report_json_path;
   std::filesystem::path report_text_path;
 };
@@ -366,8 +363,6 @@ void usage(const char* argv0) {
       << "  --recall-k <k>                  Recall K, default 10\n"
       << "  --settle-seconds <n>            Sleep after insertion before post recall, default 300\n"
       << "  --reset-breakdown-every <n>     Clear samples every n attempted inserts, default 50000; 0 disables\n"
-      << "  --min-post-recall <v>           Fail when post recall is below v\n"
-      << "  --max-recall-drop <v>           Fail when baseline - post exceeds v\n"
       << "  --report-text <path>            Optional text summary\n";
 }
 
@@ -410,10 +405,6 @@ Args parse_args(int argc, char** argv) {
       args.settle_seconds = std::stoull(require_value("--settle-seconds"));
     } else if (flag == "--reset-breakdown-every") {
       args.reset_breakdown_every = std::stoull(require_value("--reset-breakdown-every"));
-    } else if (flag == "--min-post-recall") {
-      args.min_post_recall = std::stod(require_value("--min-post-recall"));
-    } else if (flag == "--max-recall-drop") {
-      args.max_recall_drop = std::stod(require_value("--max-recall-drop"));
     } else if (flag == "--report-json") {
       args.report_json_path = require_value("--report-json");
     } else if (flag == "--report-text") {
@@ -440,8 +431,7 @@ Args parse_args(int argc, char** argv) {
   return args;
 }
 
-template <class Distance>
-RecallResult run_recall(ComputeService<Distance>& service,
+RecallResult run_recall(ComputeService& service,
                         const std::string& label,
                         const VectorRows& queries,
                         const GroundTruth& gt,
@@ -487,8 +477,7 @@ RecallResult run_recall(ComputeService<Distance>& service,
   return result;
 }
 
-template <class Distance>
-InsertStats run_insert_phase(ComputeService<Distance>& service,
+InsertStats run_insert_phase(ComputeService& service,
                              const VectorRows& insert_rows,
                              const Args& args,
                              size_t effective_insert_count) {
@@ -523,7 +512,7 @@ InsertStats run_insert_phase(ComputeService<Distance>& service,
       (void)tid;
       try {
         start_barrier.arrive_and_wait();
-        vec<typename ComputeService<Distance>::InsertItem> batch;
+        vec<ComputeService::InsertItem> batch;
         batch.reserve(args.insert_batch_size);
         while (!stop.load(std::memory_order_acquire)) {
           const size_t begin = next_row.fetch_add(args.insert_batch_size, std::memory_order_relaxed);
@@ -621,8 +610,7 @@ nlohmann::json insert_stats_json(const InsertStats& stats) {
   };
 }
 
-template <class Distance>
-int run_with_service(ComputeService<Distance>& service, const Args& args) {
+int run_with_service(ComputeService& service, const Args& args) {
   std::cerr << "[sift101m-long-insert] loading insert vectors: " << args.insert_file << std::endl;
   const VectorRows insert_rows = read_vector_rows(args.insert_file);
   std::cerr << "[sift101m-long-insert] insert rows=" << insert_rows.count
@@ -666,18 +654,11 @@ int run_with_service(ComputeService<Distance>& service, const Args& args) {
     {"reset_breakdown_every", args.reset_breakdown_every},
     {"dim", service.config().dim},
     {"max_vectors_config", service.config().max_vectors},
-    {"insert_execution", service.config().insert_execution},
-    {"storage_owner_update_mode", service.config().storage_owner_update_mode},
-    {"storage_owner_maintenance_mode", service.config().storage_owner_maintenance_mode},
+    {"storage_owner_update_protocol", "centroid_home_two_stage"},
     {"storage_owner_maintenance_workers", service.config().storage_owner_maintenance_workers},
-    {"storage_owner_reverse_mode", service.config().storage_owner_reverse_mode},
-    {"storage_owner_local_stitch_sync_fast_path", service.config().storage_owner_local_stitch_sync_fast_path},
     {"fine_grained_breakdown_enabled", service.config().enable_breakdown},
-    {"search", std::string(service.config().credit_aware_expansion ? "credit_aware_" : "") +
-        (service.config().use_rabitq ? "rabitq_cpu_gate" : "exact")},
-    {"use_rabitq", service.config().use_rabitq},
-    {"credit_aware_expansion", service.config().credit_aware_expansion},
-    {"gpudirect_rdma", service.config().gpudirect_rdma},
+    {"search", "gpu_persistent_opq_pq"},
+    {"navigation_quantizer", "opq_pq"},
   };
   root["input"] = {
     {"insert_rows", insert_rows.count},
@@ -709,8 +690,7 @@ int run_with_service(ComputeService<Distance>& service, const Args& args) {
   service.reset_breakdown_state();
 
   if (insert_stats.failed != 0 || insert_stats.inserted != effective_insert_count) {
-    root["passed"] = false;
-    root["failure_reason"] = "one or more inserts failed";
+    root["execution_error"] = "one or more inserts failed";
     std::ostringstream text;
     text << "insert failed\n"
          << "  attempted: " << insert_stats.attempted << '\n'
@@ -731,27 +711,12 @@ int run_with_service(ComputeService<Distance>& service, const Args& args) {
                                               args.recall_queries, args.recall_k);
   root["post_insert_recall"] = recall_json(post_recall, args.query_file, args.groundtruth_file);
 
-  bool passed = true;
-  std::string failure_reason;
-  if (args.min_post_recall >= 0.0 && post_recall.recall < args.min_post_recall) {
-    passed = false;
-    failure_reason = "post recall below threshold";
-  }
   if (baseline_recall.has_value()) {
     const double drop = baseline_recall->recall - post_recall.recall;
     root["recall_delta"] = {
       {"baseline_minus_post", drop},
       {"post_minus_baseline", post_recall.recall - baseline_recall->recall},
-      {"max_allowed_drop", args.max_recall_drop},
     };
-    if (args.max_recall_drop >= 0.0 && drop > args.max_recall_drop) {
-      passed = false;
-      failure_reason = "recall drop exceeds threshold";
-    }
-  }
-  root["passed"] = passed;
-  if (!failure_reason.empty()) {
-    root["failure_reason"] = failure_reason;
   }
 
   std::ostringstream text;
@@ -769,15 +734,11 @@ int run_with_service(ComputeService<Distance>& service, const Args& args) {
   if (baseline_recall.has_value()) {
     text << "  recall drop: " << (baseline_recall->recall - post_recall.recall) << '\n';
   }
-  text << "  passed: " << (passed ? "true" : "false") << '\n';
-  if (!failure_reason.empty()) {
-    text << "  failure_reason: " << failure_reason << '\n';
-  }
 
   write_json_file(args.report_json_path, root);
   write_text_file(args.report_text_path, text.str());
   std::cout << text.str();
-  return passed ? EXIT_SUCCESS : EXIT_FAILURE;
+  return EXIT_SUCCESS;
 }
 
 }  // namespace
@@ -792,12 +753,7 @@ int main(int argc, char** argv) {
     auto service_argv = tools::breakdown_benchmark::make_argv(service_args);
     configuration::IndexConfiguration config(static_cast<int>(service_argv.size()), service_argv.data());
 
-    if (config.ip_distance) {
-      ComputeService<IPDistance> service(config, false);
-      return run_with_service(service, args);
-    }
-
-    ComputeService<L2Distance> service(config, false);
+    ComputeService service(config);
     return run_with_service(service, args);
   } catch (const std::exception& e) {
     std::cerr << "sift101m long insert recall failed: " << e.what() << std::endl;

@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -79,8 +82,7 @@ std::vector<std::string> build_service_argv(const std::string& service_config_pa
 
   static const std::vector<std::string> multi_keys = {"servers", "clients", "storage-peers"};
   static const std::vector<std::string> flag_keys = {
-    "initiator", "routing", "load-index", "store-index", "disable-thread-pinning", "no-recall", "ip-dist",
-    "gpudirect-rdma", "observe-device-utilization"};
+    "initiator", "disable-thread-pinning"};
   static const std::vector<std::string> benchmark_only_keys = {"insert-start-id", "write-id-base"};
 
   for (const auto& [key, value] : config) {
@@ -141,8 +143,25 @@ Args parse_args(int argc, char** argv) {
       args.read_ratio = std::stod(require_value("--read-ratio"));
     } else if (flag == "--mixed-mode") {
       args.mixed_mode = require_value("--mixed-mode");
+    } else if (flag == "--target-query-qps") {
+      args.target_query_qps = std::stod(require_value("--target-query-qps"));
+    } else if (flag == "--target-write-qps" || flag == "--target-insert-qps") {
+      args.target_write_qps = std::stod(require_value(flag.c_str()));
+    } else if (flag == "--recall-query-file") {
+      if (!args.recall_query_file.empty()) {
+        throw std::runtime_error("--recall-query-file was specified more than once");
+      }
+      args.recall_query_file = require_value("--recall-query-file");
+    } else if (flag == "--performance-query-file") {
+      if (!args.performance_query_file.empty()) {
+        throw std::runtime_error("--performance-query-file was specified more than once");
+      }
+      args.performance_query_file = require_value("--performance-query-file");
     } else if (flag == "--query-file") {
-      args.query_file = require_value("--query-file");
+      if (!args.recall_query_file.empty()) {
+        throw std::runtime_error("--query-file and --recall-query-file cannot both be specified");
+      }
+      args.recall_query_file = require_value("--query-file");
     } else if (flag == "--insert-file") {
       args.insert_file = require_value("--insert-file");
     } else if (flag == "--groundtruth-file") {
@@ -151,8 +170,19 @@ Args parse_args(int argc, char** argv) {
       args.recall_queries = std::stoull(require_value("--recall-queries"));
     } else if (flag == "--recall-k") {
       args.recall_k = static_cast<uint32_t>(std::stoul(require_value("--recall-k")));
-    } else if (flag == "--min-recall") {
-      args.min_recall = std::stod(require_value("--min-recall"));
+    } else if (flag == "--recall-mode") {
+      args.recall_mode = require_value("--recall-mode");
+    } else if (flag == "--recall-base-id-limit") {
+      const auto value = std::stoull(require_value("--recall-base-id-limit"));
+      if (value > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error("--recall-base-id-limit exceeds uint32_t");
+      }
+      args.recall_base_id_limit = static_cast<uint32_t>(value);
+    } else if (flag == "--storage-maintenance-log") {
+      args.storage_maintenance_logs.push_back(
+        require_value("--storage-maintenance-log"));
+    } else if (flag == "--recall-only") {
+      args.recall_only = true;
     } else if (flag == "--synthetic") {
       args.synthetic = true;
     } else if (flag == "--report-json") {
@@ -185,11 +215,25 @@ Args parse_args(int argc, char** argv) {
   if (args.client_threads == 0) {
     throw std::runtime_error("--client-threads must be > 0");
   }
+  const std::vector<double> numeric_options = {
+    args.read_ratio,
+    args.target_query_qps,
+    args.target_write_qps,
+    args.write_insert_ratio,
+    args.write_upsert_ratio,
+    args.write_delete_ratio,
+  };
+  if (std::any_of(numeric_options.begin(), numeric_options.end(),
+                  [](double value) { return !std::isfinite(value); })) {
+    throw std::runtime_error("floating-point arguments must be finite");
+  }
   if (args.read_ratio < 0.0 || args.read_ratio > 1.0) {
     throw std::runtime_error("--read-ratio must be in [0, 1]");
   }
-  if (args.mixed_mode != "probability" && args.mixed_mode != "fixed_threads") {
-    throw std::runtime_error("--mixed-mode must be probability or fixed_threads");
+  if (args.mixed_mode != "probability" && args.mixed_mode != "fixed_threads" &&
+      args.mixed_mode != "rate_limited") {
+    throw std::runtime_error(
+      "--mixed-mode must be probability, fixed_threads, or rate_limited");
   }
   if (args.write_insert_ratio < 0.0 || args.write_upsert_ratio < 0.0 || args.write_delete_ratio < 0.0) {
     throw std::runtime_error("write mutation ratios must be >= 0");
@@ -197,8 +241,56 @@ Args parse_args(int argc, char** argv) {
   if (args.write_insert_ratio + args.write_upsert_ratio + args.write_delete_ratio <= 0.0) {
     throw std::runtime_error("at least one write mutation ratio must be > 0");
   }
-  if (args.min_recall > 1.0) {
-    throw std::runtime_error("--min-recall must be <= 1");
+  if (args.target_query_qps < 0.0 || args.target_write_qps < 0.0) {
+    throw std::runtime_error("target rates must be non-negative");
+  }
+  if (!args.groundtruth_file.empty() && args.recall_query_file.empty()) {
+    throw std::runtime_error("--recall-query-file is required with --groundtruth-file");
+  }
+  if (args.recall_only && args.groundtruth_file.empty()) {
+    throw std::runtime_error("--recall-only requires --groundtruth-file");
+  }
+  if (args.recall_mode != "all" && args.recall_mode != "base_only") {
+    throw std::runtime_error("--recall-mode must be all or base_only");
+  }
+  if ((args.recall_mode == "base_only") !=
+      (args.recall_base_id_limit != 0)) {
+    throw std::runtime_error(
+      "--recall-mode base_only and a positive --recall-base-id-limit "
+      "must be supplied together");
+  }
+  if (args.recall_mode == "base_only" && args.groundtruth_file.empty()) {
+    throw std::runtime_error(
+      "--recall-mode base_only requires --groundtruth-file");
+  }
+  const bool workload_has_queries =
+    !args.recall_only &&
+    (args.workload == "query" || args.workload == "both" ||
+     (args.workload == "mixed" &&
+      (args.mixed_mode == "rate_limited" ? args.target_query_qps > 0.0
+                                         : args.read_ratio > 0.0)));
+  if (workload_has_queries && args.performance_query_file.empty()) {
+    throw std::runtime_error(
+      "--performance-query-file is required for query performance phases; "
+      "the recall query file is intentionally not reused");
+  }
+  if (workload_has_queries && !args.recall_query_file.empty()) {
+    std::error_code error;
+    const bool same_file = std::filesystem::equivalent(
+      args.recall_query_file, args.performance_query_file, error);
+    if (!error && same_file) {
+      throw std::runtime_error(
+        "--recall-query-file and --performance-query-file must refer to different files");
+    }
+  }
+  if (!args.performance_query_file.empty() && !args.insert_file.empty()) {
+    std::error_code error;
+    const bool same_file = std::filesystem::equivalent(
+      args.performance_query_file, args.insert_file, error);
+    if (!error && same_file) {
+      throw std::runtime_error(
+        "--performance-query-file and --insert-file must refer to different files");
+    }
   }
   if (args.insert_start_id == 0) {
     const auto service_config = read_config(args.service_config_path);
@@ -213,6 +305,19 @@ Args parse_args(int argc, char** argv) {
   const bool use_time_mode = args.warmup_seconds > 0 || args.measure_seconds > 0;
   if (use_time_mode && (args.warmup_seconds == 0 || args.measure_seconds == 0)) {
     throw std::runtime_error("--warmup-seconds and --measure-seconds must both be > 0 when using time-based mode");
+  }
+  if (args.mixed_mode == "rate_limited") {
+    if (args.workload != "mixed" || !use_time_mode) {
+      throw std::runtime_error(
+        "--mixed-mode rate_limited requires --workload mixed and time-based mode");
+    }
+    if (args.target_query_qps <= 0.0 && args.target_write_qps <= 0.0) {
+      throw std::runtime_error(
+        "rate_limited mode requires a positive query or write target");
+    }
+  } else if (args.target_query_qps != 0.0 || args.target_write_qps != 0.0) {
+    throw std::runtime_error(
+      "target query/write rates are only valid with --mixed-mode rate_limited");
   }
   return args;
 }

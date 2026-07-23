@@ -10,6 +10,7 @@
 
 #include <library/utils.hh>
 
+#include "common/constants.hh"
 #include "tools/vamana_offline/progress.hh"
 
 namespace tools::vamana_offline {
@@ -102,7 +103,8 @@ void insert_sorted_beam(vec<std::pair<float, u32>>& beam,
 }  // namespace
 
 void VamanaGraph::init(size_t n, u32 d, u32 max_degree, size_t requested_lock_stripes) {
-  lib_assert(max_degree <= std::numeric_limits<u8>::max(), "offline graph degree must fit in u8");
+  lib_assert(max_degree > 0 && max_degree <= kMaxSupportedGraphDegree,
+             "offline graph degree exceeds the system-wide limit");
   num_nodes = n;
   dim = d;
   R = max_degree;
@@ -178,7 +180,7 @@ void VamanaGraph::unlock_node(size_t node) {
   lock_stripes[node & (lock_stripe_count - 1)].clear(std::memory_order_release);
 }
 
-size_t compute_medoid(const Dataset& dataset, bool ip_distance) {
+size_t compute_medoid(const Dataset& dataset) {
   const size_t n = dataset.size();
   const u32 dim = dataset.dim;
   const size_t sample_size = std::min<size_t>(n, 10000);
@@ -201,7 +203,7 @@ size_t compute_medoid(const Dataset& dataset, bool ip_distance) {
   size_t best = 0;
   float best_dist = std::numeric_limits<float>::max();
   for (size_t i = 0; i < n; ++i) {
-    const float dist = dataset_distance_float_query(dataset, centroid.data(), i, ip_distance);
+    const float dist = dataset_distance_float_query(dataset, centroid.data(), i);
     if (dist < best_dist) {
       best_dist = dist;
       best = i;
@@ -213,15 +215,14 @@ size_t compute_medoid(const Dataset& dataset, bool ip_distance) {
 vec<std::pair<float, u32>> beam_search(VamanaGraph& graph,
                                        const Dataset& dataset,
                                        u32 query_id,
-                                       u32 beam_width,
-                                       bool ip_distance) {
+                                       u32 beam_width) {
   vec<std::pair<float, u32>> all_visited;
   vec<std::pair<float, u32>> beam;
   const size_t expected_seen = std::max<size_t>(1024, static_cast<size_t>(beam_width) * graph.R + graph.R + 1);
   LocalIdSet visited(expected_seen);
   LocalIdSet expanded(std::max<size_t>(1024, beam_width * 2));
 
-  const float medoid_dist = dataset_distance(dataset, query_id, graph.medoid, ip_distance);
+  const float medoid_dist = dataset_distance(dataset, query_id, graph.medoid);
   beam.push_back({medoid_dist, static_cast<u32>(graph.medoid)});
   all_visited.push_back({medoid_dist, static_cast<u32>(graph.medoid)});
   visited.insert(static_cast<u32>(graph.medoid));
@@ -253,7 +254,7 @@ vec<std::pair<float, u32>> beam_search(VamanaGraph& graph,
     }
 
     for (u32 nbr : unvisited) {
-      const float d = dataset_distance(dataset, query_id, nbr, ip_distance);
+      const float d = dataset_distance(dataset, query_id, nbr);
       insert_sorted_beam(beam, {d, nbr}, beam_width);
       all_visited.push_back({d, nbr});
     }
@@ -267,15 +268,14 @@ vec<std::pair<float, u32>> beam_search(VamanaGraph& graph,
 vec<std::pair<float, u32>> beam_search_float_query(VamanaGraph& graph,
                                                    const Dataset& dataset,
                                                    const float* query,
-                                                   u32 beam_width,
-                                                   bool ip_distance) {
+                                                   u32 beam_width) {
   vec<std::pair<float, u32>> all_visited;
   vec<std::pair<float, u32>> beam;
   const size_t expected_seen = std::max<size_t>(1024, static_cast<size_t>(beam_width) * graph.R + graph.R + 1);
   LocalIdSet visited(expected_seen);
   LocalIdSet expanded(std::max<size_t>(1024, beam_width * 2));
 
-  const float medoid_dist = dataset_distance_float_query(dataset, query, graph.medoid, ip_distance);
+  const float medoid_dist = dataset_distance_float_query(dataset, query, graph.medoid);
   beam.push_back({medoid_dist, static_cast<u32>(graph.medoid)});
   all_visited.push_back({medoid_dist, static_cast<u32>(graph.medoid)});
   visited.insert(static_cast<u32>(graph.medoid));
@@ -298,7 +298,7 @@ vec<std::pair<float, u32>> beam_search_float_query(VamanaGraph& graph,
     }
     for (u32 nbr : nbrs) {
       if (!visited.insert(nbr)) continue;
-      const float d = dataset_distance_float_query(dataset, query, nbr, ip_distance);
+      const float d = dataset_distance_float_query(dataset, query, nbr);
       insert_sorted_beam(beam, {d, nbr}, beam_width);
       all_visited.push_back({d, nbr});
     }
@@ -311,8 +311,7 @@ vec<u32> robust_prune(const Dataset& dataset,
                       u32 source,
                       const vec<std::pair<float, u32>>& sorted_candidates,
                       float alpha,
-                      u32 R,
-                      bool ip_distance) {
+                      u32 R) {
   vec<u32> selected;
   selected.reserve(R);
   for (const auto& [cand_dist, cand_id] : sorted_candidates) {
@@ -321,7 +320,7 @@ vec<u32> robust_prune(const Dataset& dataset,
 
     bool pruned = false;
     for (u32 sel_id : selected) {
-      const float d_sel_cand = dataset_distance(dataset, sel_id, cand_id, ip_distance);
+      const float d_sel_cand = dataset_distance(dataset, sel_id, cand_id);
       if (alpha * d_sel_cand <= cand_dist) {
         pruned = true;
         break;
@@ -334,7 +333,6 @@ vec<u32> robust_prune(const Dataset& dataset,
 
 void consolidate_reverse_edges(VamanaGraph& graph,
                                const Dataset& dataset,
-                               const VamanaBuildConfig& config,
                                size_t num_threads,
                                float build_alpha) {
   const size_t n = graph.num_nodes;
@@ -408,11 +406,11 @@ void consolidate_reverse_edges(VamanaGraph& graph,
     vec<std::pair<float, u32>> prune_candidates;
     prune_candidates.reserve(candidate_ids.size());
     for (u32 candidate : candidate_ids) {
-      prune_candidates.push_back({dataset_distance(dataset, node, candidate, config.ip_distance), candidate});
+      prune_candidates.push_back({dataset_distance(dataset, node, candidate), candidate});
     }
     std::sort(prune_candidates.begin(), prune_candidates.end(), candidate_id_less);
     graph.set_neighbors(node, robust_prune(dataset, static_cast<u32>(node), prune_candidates,
-                                           build_alpha, graph.R, config.ip_distance));
+                                           build_alpha, graph.R));
     reverse_progress.increment();
   });
   reverse_progress.finish();
@@ -430,7 +428,7 @@ void build_vamana_graph(VamanaGraph& graph,
   graph.init(n, dataset.dim, R);
 
   std::cerr << "computing medoid...\n";
-  graph.medoid = compute_medoid(dataset, config.ip_distance);
+  graph.medoid = compute_medoid(dataset);
   std::cerr << "medoid: node " << graph.medoid << "\n";
 
   vec<u32> order(n);
@@ -490,7 +488,7 @@ void build_vamana_graph(VamanaGraph& graph,
   parallel_for(static_cast<size_t>(0), n, num_threads, [&](size_t step, size_t) {
     const u32 node_idx = order[step];
 
-    auto candidates = beam_search(graph, dataset, node_idx, beam_width, config.ip_distance);
+    auto candidates = beam_search(graph, dataset, node_idx, beam_width);
 
     vec<u32> existing_neighbors;
     {
@@ -498,11 +496,11 @@ void build_vamana_graph(VamanaGraph& graph,
       graph.copy_neighbors(node_idx, existing_neighbors);
     }
     for (u32 existing : existing_neighbors) {
-      candidates.push_back({dataset_distance(dataset, node_idx, existing, config.ip_distance), existing});
+      candidates.push_back({dataset_distance(dataset, node_idx, existing), existing});
     }
     sort_and_unique_candidates(candidates);
 
-    vec<u32> new_neighbors = robust_prune(dataset, node_idx, candidates, build_alpha, R, config.ip_distance);
+    vec<u32> new_neighbors = robust_prune(dataset, node_idx, candidates, build_alpha, R);
     {
       NodeLockGuard lock(graph, node_idx);
       graph.set_neighbors(node_idx, new_neighbors);
@@ -516,7 +514,7 @@ void build_vamana_graph(VamanaGraph& graph,
   });
   progress.finish();
 
-  consolidate_reverse_edges(graph, dataset, config, num_threads, build_alpha);
+  consolidate_reverse_edges(graph, dataset, num_threads, build_alpha);
 
   size_t total_edges = 0;
   size_t max_edges = 0;
@@ -544,7 +542,7 @@ void build_vamana_graph(VamanaGraph& graph,
       all_dists.reserve(n);
       for (size_t i = 0; i < n; ++i) {
         if (i == qid) continue;
-        all_dists.push_back({dataset_distance(dataset, qid, i, config.ip_distance), static_cast<u32>(i)});
+        all_dists.push_back({dataset_distance(dataset, qid, i), static_cast<u32>(i)});
       }
       std::partial_sort(all_dists.begin(),
                         all_dists.begin() + std::min<size_t>(topk, all_dists.size()),
@@ -553,7 +551,7 @@ void build_vamana_graph(VamanaGraph& graph,
       std::unordered_set<u32> gt;
       for (size_t i = 0; i < topk && i < all_dists.size(); ++i) gt.insert(all_dists[i].second);
 
-      auto results = beam_search(graph, dataset, qid, beam_width, config.ip_distance);
+      auto results = beam_search(graph, dataset, qid, beam_width);
       size_t hits = 0;
       for (size_t i = 0; i < topk && i < results.size(); ++i) {
         if (gt.count(results[i].second)) ++hits;

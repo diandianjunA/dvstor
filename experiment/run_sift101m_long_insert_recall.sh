@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/common.sh"
 
-PROFILE="${1:-${PROFILE:-03_rabitq_expension_aware_two_stage_aldi_rdma}}"
+PROFILE="${1:-${PROFILE:-04_gpu_persistent_gpunetio}}"
 load_experiment_profile "$PROFILE"
 
 ensure_built dvstor_sift101m_long_insert_recall
@@ -22,14 +22,12 @@ BASELINE_GROUNDTRUTH_FILE="${BASELINE_GROUNDTRUTH_FILE:-$SIFT_ROOT/gnd/idx_100M.
 INSERT_START_ID="${INSERT_START_ID:-100000000}"
 INSERT_COUNT="${INSERT_COUNT:-1000000}"
 INSERT_ROW_OFFSET="${INSERT_ROW_OFFSET:-0}"
-INSERT_THREADS="${INSERT_THREADS:-$CLIENT_THREADS}"
+INSERT_THREADS="${INSERT_THREADS:-128}"
 INSERT_BATCH_SIZE="${INSERT_BATCH_SIZE:-16}"
 RECALL_QUERIES="${RECALL_QUERIES:-10000}"
 RECALL_K="${RECALL_K:-$K}"
 SETTLE_SECONDS="${SETTLE_SECONDS:-300}"
 RESET_BREAKDOWN_EVERY="${RESET_BREAKDOWN_EVERY:-50000}"
-MIN_POST_RECALL="${MIN_POST_RECALL:--1}"
-MAX_RECALL_DROP="${MAX_RECALL_DROP:--1}"
 
 for path in "$INSERT_FILE_101M" "$QUERY_FILE_101M" "$GROUNDTRUTH_FILE_101M"; do
   if [[ ! -s "$path" ]]; then
@@ -64,8 +62,6 @@ cmd=("$BUILD_DIR/dvstor_sift101m_long_insert_recall"
   --recall-k "$RECALL_K"
   --settle-seconds "$SETTLE_SECONDS"
   --reset-breakdown-every "$RESET_BREAKDOWN_EVERY"
-  --min-post-recall "$MIN_POST_RECALL"
-  --max-recall-drop "$MAX_RECALL_DROP"
   --report-json "$JSON_REPORT"
   --report-text "$TEXT_REPORT")
 

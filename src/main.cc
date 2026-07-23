@@ -1,9 +1,8 @@
 #include "common/configuration.hh"
-#include "common/distance.hh"
-#include "memory_node/memory_node.hh"
 #include "service/compute_service.hh"
 
 #include <csignal>
+#include <iostream>
 
 namespace {
 
@@ -25,16 +24,11 @@ int main(int argc, char** argv) {
   configuration::IndexConfiguration config{argc, argv};
 
   if (config.is_server) {
-    MemoryNode memory_node{config};
-  } else {
-    if (config.ip_distance) {
-      ComputeService<IPDistance> service{config, true};
-      wait_for_shutdown_signal();
-    } else {
-      ComputeService<L2Distance> service{config, true};
-      wait_for_shutdown_signal();
-    }
+    std::cerr << "use dvstor_memory_node for a storage process\n";
+    return EXIT_FAILURE;
   }
+  ComputeService service{config};
+  wait_for_shutdown_signal();
 
   return EXIT_SUCCESS;
 }

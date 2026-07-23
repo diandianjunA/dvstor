@@ -12,28 +12,36 @@
 
 #include "common/constants.hh"
 #include "common/types.hh"
-#include "coroutine.hh"
+#include "memory_node/storage_owner_index/authority_directory_policy.hh"
 #include "remote_pointer.hh"
+#include "service/storage_owner_protocol.hh"
 #include "vamana/vamana_node.hh"
 
 namespace memory_node_detail {
 
 inline size_t align_to_cacheline(size_t value) {
-  while (value % CACHELINE_SIZE != 0) {
+  while (value % kCacheLineBytes != 0) {
     ++value;
   }
   return value;
 }
 
 inline size_t storage_owner_snapshot_bytes() {
-  return VamanaNode::compact_storage()
-    ? VamanaNode::size_until_vector_end()
-    : VamanaNode::HEADER_SIZE + VamanaNode::COMPACT_META_SIZE +
-        VamanaNode::vector_bytes();
+  return VamanaNode::size_until_vector_end();
+}
+
+inline size_t storage_owner_snapshot_validation_offset() {
+  const size_t alignment = alignof(u64);
+  return (storage_owner_snapshot_bytes() + alignment - 1) &
+    ~(alignment - 1);
 }
 
 inline size_t storage_owner_snapshot_stride() {
-  return align_to_cacheline(storage_owner_snapshot_bytes());
+  // Keep an independent after-header in every registered snapshot slot.  It
+  // must not overwrite the before-header at byte zero when both reads are
+  // submitted in one ordered RC chain.
+  return align_to_cacheline(
+    storage_owner_snapshot_validation_offset() + VamanaNode::HEADER_SIZE);
 }
 
 struct BeamEntry {
@@ -47,7 +55,7 @@ struct NodeSnapshot {
   u64 header{};
   node_t id{};
   u32 generation{};
-  u8 edge_count{};
+  u32 slot_incarnation{};
   bool deleted{};
   vec<byte_t> vector_data;
 };
@@ -58,16 +66,27 @@ struct StorageOwnerPruneCandidateInfo {
   vec<byte_t> vector_data;
 };
 
+struct StorageOwnerScoredSnapshot {
+  const NodeSnapshot* snapshot{};
+  distance_t distance{};
+};
+
 struct StorageOwnerCoroutineScratch {
   hashset_t<RemotePtr> visited;
   hashset_t<RemotePtr> empty_skip;
   vec<BeamEntry> beam;
+  vec<RemotePtr> neighbors;
   vec<RemotePtr> unvisited;
   vec<RemotePtr> batch;
+  vec<byte_t> neighbor_entry;
+  vec<byte_t> neighbor_decoded;
   vec<RemotePtr> filtered;
   vec<RemotePtr> selected;
   vec<const byte_t*> selected_vectors;
+  vec<size_t> prune_selected_indices;
   vec<StorageOwnerPruneCandidateInfo> prune_infos;
+  hashset_t<RemotePtr> prune_seen;
+  vec<StorageOwnerScoredSnapshot> scored_snapshots;
   vec<RemotePtr> reverse_unique_candidates;
   vec<RemotePtr> reverse_current_neighbors;
   vec<RemotePtr> reverse_filtered_candidates;
@@ -79,6 +98,7 @@ struct StorageOwnerCoroutineScratch {
   void clear_search() {
     visited.clear();
     beam.clear();
+    neighbors.clear();
     unvisited.clear();
     batch.clear();
   }
@@ -88,7 +108,10 @@ struct StorageOwnerCoroutineScratch {
     batch.clear();
     selected.clear();
     selected_vectors.clear();
+    prune_selected_indices.clear();
     prune_infos.clear();
+    prune_seen.clear();
+    scored_snapshots.clear();
   }
 
   void clear_reverse_update() {
@@ -107,7 +130,9 @@ struct InsertRuntimeState {
   std::unique_ptr<LocalMemoryRegion> region;
   size_t request_bytes{};
   size_t response_offset{};
+  size_t completion_offset{};
   u32 request_slot_count{1};
+  u32 completion_slot_count{1};
 };
 
 struct PeerRpcRuntimeState {
@@ -131,19 +156,48 @@ struct PeerPendingSend {
   StorageOwnerThread* thread{};
   bool async{};
   bool rdma_read_credit{};
-};
-
-struct PeerRpcMessage {
-  u32 source_shard{};
-  vec<byte_t> payload;
+  bool release_rpc_slot{};
+  u32 rpc_slot_id{};
+  // A linked RC READ chain produces one successful CQE at its signaled tail.
+  // Credit counters still account for every WR in that chain.
+  u32 rdma_read_count{1};
 };
 
 struct StorageOwnerInsertTask {
   u32 client_id{};
+  u32 slot_id{};
   u32 item_count{};
   u64 batch_id{};
-  std::chrono::steady_clock::time_point received_at{};
+  size_t byte_len{};
   vec<byte_t> payload;
+  // Reserved before the acceptance ACK. This makes the ACK a hard promise
+  // that every item can publish one completion even if SEND CQ progress is
+  // delayed after the worker finishes.
+  vec<u32> completion_slots;
+  std::chrono::steady_clock::time_point received_at{};
+};
+
+struct StorageOwnerResponseReady {
+  u32 client_id{};
+  u32 slot_id{};
+  u32 byte_len{};
+  std::chrono::steady_clock::time_point queued_at{};
+};
+
+struct StorageOwnerRequestScratch {
+  vec<service::storage_owner::MutationKind> kinds;
+  vec<vec<u64>> invalidated_neighbors;
+  vec<u32> statuses;
+  vec<service::storage_owner::MutationResult> results;
+  vec<u64> response_invalidations;
+
+  void clear() {
+    kinds.clear();
+    invalidated_neighbors.clear();
+    statuses.clear();
+    results.clear();
+    response_invalidations.clear();
+  }
 };
 
 struct StorageOwnerThread {
@@ -194,29 +248,17 @@ struct StorageOwnerThread {
   vec<ibv_wc> send_wcs;
   vec<std::atomic<i32>> post_balances;
   vec<StorageOwnerCoroutineScratch> coroutine_scratch_states;
-  vec<u_ptr<StorageOwnerInsertCoroutine>> coroutines;
+  StorageOwnerRequestScratch request_scratch;
   HugePage<byte_t> scratch_buffer;
   std::unique_ptr<LocalMemoryRegion> scratch_region;
   u32 running_coroutine{};
+  // Used only by the owning OS thread. Async reads rotate across every data
+  // QP instead of pinning a low worker count to a strict subset of the lanes.
+  u32 next_peer_data_qp_ticket{};
   size_t scratch_stride{};
 };
 
-struct StorageOwnerInsertJob {
-  node_t id{};
-  service::storage_owner::MutationKind kind{service::storage_owner::MutationKind::insert};
-  vec<byte_t> vector_data;
-  service::storage_owner::MutationStatus status{service::storage_owner::MutationStatus::failed};
-  bool ok{false};
-  RemotePtr new_ptr{};
-  RemotePtr old_ptr{};
-  u32 generation{};
-  vec<RemotePtr> anchor_hints;
-};
-
-struct FreshnessEntry {
-  RemotePtr current;
-  u32 generation{};
-  bool deleted{};
-};
+using FreshnessEntry =
+  memory_node_storage_owner_index_detail::AuthorityDirectoryEntry;
 
 }  // namespace memory_node_detail
