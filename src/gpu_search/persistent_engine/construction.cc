@@ -1,6 +1,8 @@
 #include "gpu_search/persistent_engine/impl.hh"
 #include "gpu_search/persistent_engine/cuda_helpers.hh"
 
+#include <filesystem>
+
 namespace gpu_search {
 
 static_assert(kCentroidRouteMaxLiveEntries ==
@@ -207,12 +209,20 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   const u64 query_dispatch_bytes = 2 * sizeof(u64) +
     static_cast<u64>(query_dispatch_capacity) *
       (sizeof(u64) + sizeof(QueryDescriptor));
+  const bool rdma_trace_enabled = config.query_rdma_trace_mode != "off";
   const u64 direct_queue_bytes = estimated_direct_queue_count *
     (2 * sizeof(u64) + sizeof(DeviceRingView<DirectBatchDescriptor>) +
      sizeof(DirectOwnerProgress) +
      static_cast<u64>(kDirectBatchQueueCapacity) *
        (sizeof(u64) + sizeof(DirectBatchDescriptor))) +
-    static_cast<u64>(query_slots) * index.shards.size() * sizeof(i32);
+    static_cast<u64>(query_slots) * index.shards.size() *
+      (sizeof(i32) + (rdma_trace_enabled ? sizeof(u64) : 0));
+  const u64 rdma_trace_bytes = rdma_trace_enabled
+    ? static_cast<u64>(query_slots) *
+        (sizeof(QueryRdmaTraceHeader) +
+         static_cast<u64>(config.query_rdma_trace_events_per_query) *
+           sizeof(QueryRdmaTraceEvent))
+    : 0;
   const u64 graph_scratch_bytes = static_cast<u64>(query_slots) *
     kPersistentMaxPrefetch * kPersistentGraphReadBytes;
   const u64 centroid_route_bytes =
@@ -229,7 +239,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     dynamic_code_scratch_bytes + dynamic_code_arena_bytes +
     dynamic_request_scratch_bytes +
     navigation_candidate_bytes + query_dispatch_bytes + direct_queue_bytes +
-    graph_scratch_bytes + route_graph_bytes;
+    graph_scratch_bytes + route_graph_bytes + rdma_trace_bytes;
   if (additional_scratch_bytes > usable_budget - budget.explicit_bytes) {
     throw std::runtime_error(
       "GPU navigation dynamic-code scratch exceeds the configured memory budget");
@@ -253,6 +263,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
             << " navigation_candidates=" << navigation_candidate_bytes
             << " direct_queue_scratch=" << direct_queue_bytes
             << " graph_scratch=" << graph_scratch_bytes
+            << " query_rdma_trace=" << rdma_trace_bytes
             << " centroid_route=" << centroid_route_bytes
             << " shard_centroids=" << shard_centroid_bytes
             << " explicit=" << explicit_gpu_bytes
@@ -444,6 +455,38 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   device_allocate(d_direct_batch_statuses,
                   static_cast<size_t>(query_slots) * index.shards.size(),
                   "cudaMalloc(GPUNetIO owner completion statuses)");
+  if (rdma_trace_enabled) {
+    device_allocate(d_direct_batch_completion_timestamps_ns,
+                    static_cast<size_t>(query_slots) * index.shards.size(),
+                    "cudaMalloc(GPUNetIO owner completion timestamps)");
+    device_allocate(d_query_rdma_trace_headers, query_slots,
+                    "cudaMalloc(query RDMA trace headers)");
+    device_allocate(
+      d_query_rdma_trace_events,
+      static_cast<size_t>(query_slots) *
+        config.query_rdma_trace_events_per_query,
+      "cudaMalloc(query RDMA trace events)");
+    check_cuda(cudaMemset(
+                 d_query_rdma_trace_headers, 0,
+                 static_cast<size_t>(query_slots) *
+                   sizeof(QueryRdmaTraceHeader)),
+               "cudaMemset(query RDMA trace headers)");
+    const std::filesystem::path output(config.query_rdma_trace_output);
+    if (output.has_parent_path()) {
+      std::filesystem::create_directories(output.parent_path());
+    }
+    query_rdma_trace_stream.open(output, std::ios::out | std::ios::trunc);
+    if (!query_rdma_trace_stream) {
+      throw std::runtime_error(
+        "failed to open query RDMA trace output: " + output.string());
+    }
+    query_rdma_trace_stream
+      << "{\"type\":\"metadata\",\"schema\":1,"
+         "\"completion_granularity\":\"shard_batch\","
+         "\"timestamp_clock\":\"GPU globaltimer nanoseconds\","
+         "\"completion_semantics\":\"owner CTA timestamp before status publication; "
+         "not NIC-internal completion\"}\n";
+  }
   mapped_host_allocate(direct_owner_phases_host, d_direct_owner_phases,
                        direct_batch_queue_count,
                        "cudaHostAlloc(GPUNetIO owner runtime phases)");
@@ -651,6 +694,8 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .direct_qp_locks = direct_view.qp_locks,
     .direct_batch_queues = d_direct_batch_queues,
     .direct_batch_statuses = d_direct_batch_statuses,
+    .direct_batch_completion_timestamps_ns =
+      d_direct_batch_completion_timestamps_ns,
     .direct_batch_queue_count = direct_batch_queue_count,
     .direct_owner_phases = d_direct_owner_phases,
     .direct_owner_progress = d_direct_owner_progress,
@@ -667,6 +712,16 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .centroid_route_entry_capacity = centroid_route_entry_capacity,
     .stop = stop_device,
     .graph_scratch = d_graph_scratch,
+    .query_rdma_trace_headers = d_query_rdma_trace_headers,
+    .query_rdma_trace_events = d_query_rdma_trace_events,
+    .query_rdma_trace_mode = config.query_rdma_trace_mode == "full"
+      ? static_cast<u32>(QueryRdmaTraceMode::full)
+      : config.query_rdma_trace_mode == "sampled"
+        ? static_cast<u32>(QueryRdmaTraceMode::sampled)
+        : static_cast<u32>(QueryRdmaTraceMode::off),
+    .query_rdma_trace_sample_rate = config.query_rdma_trace_sample_rate,
+    .query_rdma_trace_events_per_query =
+      config.query_rdma_trace_events_per_query,
     .decoded_queries = d_queries,
     .transformed_queries = d_transformed_queries,
     .query_luts = d_query_luts,

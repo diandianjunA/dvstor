@@ -46,6 +46,10 @@ public:
   u32 gpu_bootstrap_window_mb{64};
   u32 gpu_bootstrap_windows{2};
   u32 gpu_graph_prefetch_depth{32};
+  str query_rdma_trace_mode{"off"};
+  u32 query_rdma_trace_sample_rate{1000};
+  filepath_t query_rdma_trace_output{};
+  u32 query_rdma_trace_events_per_query{1024};
   u32 gpu_traversal_beam_width{128};
   u32 gpu_final_rerank_width{64};
   u32 gpu_max_expansions{384};
@@ -97,6 +101,7 @@ public:
       vector_id_namespace_size = max_vectors;
     }
     vector_data_type = normalize_mode(vector_data_type);
+    query_rdma_trace_mode = normalize_mode(query_rdma_trace_mode);
     validate(argv);
     operator<<(std::cerr, *this);
   }
@@ -176,6 +181,21 @@ private:
       ("gpu-graph-prefetch-depth",
        po::value<u32>(&gpu_graph_prefetch_depth)->default_value(gpu_graph_prefetch_depth),
        "Graph records fetched concurrently by one GPU query.")
+      ("query-rdma-trace-mode",
+       po::value<str>(&query_rdma_trace_mode)->default_value(query_rdma_trace_mode),
+       "Shard-batch RDMA trace mode: off, sampled, or full.")
+      ("query-rdma-trace-sample-rate",
+       po::value<u32>(&query_rdma_trace_sample_rate)
+         ->default_value(query_rdma_trace_sample_rate),
+       "In sampled mode, trace one of every N request IDs.")
+      ("query-rdma-trace-output",
+       po::value<filepath_t>(&query_rdma_trace_output)
+         ->default_value(query_rdma_trace_output),
+       "JSONL output for detailed shard-batch RDMA trace events.")
+      ("query-rdma-trace-events-per-query",
+       po::value<u32>(&query_rdma_trace_events_per_query)
+         ->default_value(query_rdma_trace_events_per_query),
+       "Preallocated per-query-slot trace event capacity.")
       ("gpu-traversal-beam-width",
        po::value<u32>(&gpu_traversal_beam_width)->default_value(gpu_traversal_beam_width),
        "OPQ/PQ beam width for GPU graph navigation.")
@@ -282,6 +302,19 @@ private:
       fail(str{"invalid --vector-data-type: "} + error.what());
     }
 
+    if (query_rdma_trace_mode != "off" &&
+        query_rdma_trace_mode != "sampled" &&
+        query_rdma_trace_mode != "full") {
+      fail("--query-rdma-trace-mode must be off, sampled, or full");
+    }
+    if (query_rdma_trace_sample_rate == 0 ||
+        query_rdma_trace_events_per_query == 0 ||
+        query_rdma_trace_events_per_query > 65'536) {
+      fail("invalid query RDMA trace sampling rate or event capacity");
+    }
+    if (query_rdma_trace_mode != "off" && query_rdma_trace_output.empty()) {
+      fail("--query-rdma-trace-output is required when tracing is enabled");
+    }
     if (gpu_query_slots == 0 || gpu_query_slots > 4096 ||
         gpu_memory_limit_gb == 0 ||
         gpu_memory_reserve_gb >= gpu_memory_limit_gb ||
@@ -365,6 +398,11 @@ public:
              << config.gpu_final_rerank_width << '\n';
       output << std::setw(width) << "GPU max expansions: "
              << config.gpu_max_expansions << '\n';
+      output << std::setw(width) << "query RDMA trace mode/rate: "
+             << config.query_rdma_trace_mode << "/"
+             << config.query_rdma_trace_sample_rate << '\n';
+      output << std::setw(width) << "query RDMA trace output: "
+             << config.query_rdma_trace_output << '\n';
       output << std::setw(width) << "GPU RDMA QPs per storage node: "
              << config.gpu_rdma_qps << '\n';
       output << std::setw(width) << "GPU direct CQ timeout ms: "

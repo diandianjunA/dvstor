@@ -5,6 +5,12 @@
 
 namespace gpu_search::persistent_kernel_detail {
 
+struct GraphFetchCycleBreakdown {
+  u64 issue{};
+  u64 wait{};
+  u64 validation{};
+};
+
 #ifdef DVSTOR_HAVE_GPUNETIO
 __device__ __forceinline__ void record_owner_watchdog_counter(
     unsigned long long* counter) {
@@ -125,7 +131,8 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
                                   const u64* local_iova_offsets = nullptr,
                                   i32* owner_completion = nullptr,
                                   bool defer_owner_wait = false,
-                                  u32* owner_progress = nullptr) {
+                                  u32* owner_progress = nullptr,
+                                  u64* owner_completion_timestamp_ns = nullptr) {
 #ifdef DVSTOR_HAVE_GPUNETIO
   u32 matching = 0;
   for (u32 index = 0; index < request_count; ++index) {
@@ -149,12 +156,16 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
       __threadfence_system();
     }
     atomicExch(owner_completion, -EINPROGRESS);
+    if (owner_completion_timestamp_ns != nullptr) {
+      *owner_completion_timestamp_ns = 0;
+    }
     __threadfence();
     const DirectBatchDescriptor descriptor{
       .request_shards = request_shards,
       .remote_offsets = remote_offsets,
       .local_iova_offsets = local_iova_offsets,
       .completion_status = owner_completion,
+      .completion_timestamp_ns = owner_completion_timestamp_ns,
       .request_count = request_count,
       .memory_node = memory_node,
       .bytes = bytes,
@@ -267,6 +278,7 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
   (void)local_iova_offsets;
   (void)owner_completion;
   (void)owner_progress;
+  (void)owner_completion_timestamp_ns;
   return -ENOTSUP;
 #endif
 }
@@ -841,8 +853,14 @@ __device__ bool fetch_graph_records_batch(
     u32* acquired_slots,
     u32* remote_reads,
     u32* remote_batches,
-    u32* graph_read_retries) {
+    u32* graph_read_retries,
+    u32 search_round,
+    bool trace_enabled,
+    GraphFetchCycleBreakdown* cycle_breakdown) {
   __shared__ i32 shard_status[kPersistentMaxShards];
+  __shared__ u64 stage_started_cycles;
+  __shared__ u32 trace_event_start;
+  __shared__ u32 trace_batch_count;
   __shared__ u32 failed;
   __shared__ u32 retry_pending;
   const size_t request_base =
@@ -905,6 +923,29 @@ __device__ bool fetch_graph_records_batch(
     }
     __syncthreads();
 
+    if (threadIdx.x == 0) {
+      stage_started_cycles = clock64();
+      trace_event_start = 0;
+      trace_batch_count = 0;
+      if (trace_enabled && params.query_rdma_trace_headers != nullptr) {
+        for (u32 shard = 0; shard < params.num_shards; ++shard) {
+          for (u32 index = 0; index < count; ++index) {
+            if (request_shards[index] == shard) {
+              ++trace_batch_count;
+              break;
+            }
+          }
+        }
+        QueryRdmaTraceHeader& header =
+          params.query_rdma_trace_headers[descriptor.query_slot];
+        trace_event_start = header.event_count;
+        header.event_count += trace_batch_count;
+        if (header.event_count > params.query_rdma_trace_events_per_query) {
+          header.overflow = 1;
+        }
+      }
+    }
+    __syncthreads();
     for (u32 shard = threadIdx.x; shard < params.num_shards;
          shard += blockDim.x) {
       u32 matching = 0;
@@ -912,6 +953,31 @@ __device__ bool fetch_graph_records_batch(
         matching += request_shards[index] == shard ? 1u : 0u;
       }
       if (matching != 0) {
+        if (trace_enabled && params.query_rdma_trace_events != nullptr) {
+          u32 ordinal = 0;
+          for (u32 prior = 0; prior < shard; ++prior) {
+            for (u32 index = 0; index < count; ++index) {
+              if (request_shards[index] == prior) {
+                ++ordinal;
+                break;
+              }
+            }
+          }
+          const u32 event_index = trace_event_start + ordinal;
+          if (event_index < params.query_rdma_trace_events_per_query) {
+            params.query_rdma_trace_events[
+              static_cast<size_t>(descriptor.query_slot) *
+                params.query_rdma_trace_events_per_query + event_index] = {
+                  .request_id = descriptor.request_id,
+                  .issue_timestamp_ns = global_time_ns(),
+                  .search_round = search_round,
+                  .snapshot_attempt = attempt,
+                  .target_shard = shard,
+                  .parent_count = matching,
+                  .bytes_per_parent = params.graph_entry_bytes,
+                };
+          }
+        }
         atomicAdd(remote_batches, 1u);
         if (attempt != 0 && graph_read_retries != nullptr) {
           atomicAdd(graph_read_retries, matching);
@@ -920,12 +986,24 @@ __device__ bool fetch_graph_records_batch(
       i32* owner_completion = params.direct_batch_statuses == nullptr ? nullptr :
         params.direct_batch_statuses +
           static_cast<size_t>(descriptor.query_slot) * params.num_shards + shard;
+      u64* owner_completion_timestamp_ns =
+        !trace_enabled ||
+        params.direct_batch_completion_timestamps_ns == nullptr ? nullptr :
+          params.direct_batch_completion_timestamps_ns +
+            static_cast<size_t>(descriptor.query_slot) * params.num_shards +
+            shard;
       shard_status[shard] = direct_fetch_batch(
           params, shard, request_shards, request_offsets, count,
           params.graph_scratch, kPersistentGraphReadBytes,
           params.graph_entry_bytes,
           (descriptor.query_slot + shard) % params.direct_qps_per_node,
-          request_local_iovas, owner_completion, true);
+          request_local_iovas, owner_completion, true, nullptr,
+          owner_completion_timestamp_ns);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && cycle_breakdown != nullptr) {
+      cycle_breakdown->issue += clock64() - stage_started_cycles;
+      stage_started_cycles = clock64();
     }
     __syncthreads();
     for (u32 shard = threadIdx.x; shard < params.num_shards;
@@ -934,6 +1012,32 @@ __device__ bool fetch_graph_records_batch(
       i32* owner_completion = params.direct_batch_statuses +
         static_cast<size_t>(descriptor.query_slot) * params.num_shards + shard;
       shard_status[shard] = wait_direct_batch(params, owner_completion);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      if (cycle_breakdown != nullptr) {
+        cycle_breakdown->wait += clock64() - stage_started_cycles;
+      }
+      const u64 process_start_ns = trace_enabled ? global_time_ns() : 0;
+      if (trace_enabled && params.query_rdma_trace_headers != nullptr &&
+          params.query_rdma_trace_events != nullptr) {
+        const u32 available = trace_event_start >=
+            params.query_rdma_trace_events_per_query ? 0 :
+          min(trace_batch_count,
+              params.query_rdma_trace_events_per_query - trace_event_start);
+        for (u32 ordinal = 0; ordinal < available; ++ordinal) {
+          QueryRdmaTraceEvent& event = params.query_rdma_trace_events[
+            static_cast<size_t>(descriptor.query_slot) *
+              params.query_rdma_trace_events_per_query +
+            trace_event_start + ordinal];
+          event.completion_timestamp_ns =
+            params.direct_batch_completion_timestamps_ns[
+              static_cast<size_t>(descriptor.query_slot) *
+                params.num_shards + event.target_shard];
+          event.batch_process_start_timestamp_ns = process_start_ns;
+        }
+      }
+      stage_started_cycles = clock64();
     }
     __syncthreads();
 
@@ -979,6 +1083,9 @@ __device__ bool fetch_graph_records_batch(
       }
     }
     __syncthreads();
+    if (threadIdx.x == 0 && cycle_breakdown != nullptr) {
+      cycle_breakdown->validation += clock64() - stage_started_cycles;
+    }
     if (retry_pending == 0) break;
     if (threadIdx.x == 0) device_ring_relax(128);
     __syncthreads();

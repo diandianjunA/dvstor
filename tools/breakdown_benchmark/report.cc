@@ -37,6 +37,14 @@ std::vector<uint32_t> filter_base_only_recall_ids(
 
 nlohmann::json telemetry_to_json(
     const gpu_search::TelemetrySnapshot& telemetry) {
+  const uint64_t explicit_phase_ns =
+    telemetry.gpu_prepare_ns + telemetry.gpu_beam_selection_ns +
+    telemetry.gpu_rdma_issue_ns + telemetry.gpu_rdma_wait_ns +
+    telemetry.gpu_graph_validation_ns + telemetry.gpu_neighbor_decode_ns +
+    telemetry.gpu_pq_score_ns + telemetry.gpu_visited_ns +
+    telemetry.gpu_beam_merge_ns + telemetry.gpu_exact_ns;
+  const uint64_t gpu_other_ns = telemetry.gpu_active_ns > explicit_phase_ns
+    ? telemetry.gpu_active_ns - explicit_phase_ns : 0;
   return {
     {"gpu_memory_explicit_bytes", telemetry.gpu_memory_explicit_bytes},
     {"gpu_memory_base_pq_bytes", telemetry.gpu_memory_base_pq_bytes},
@@ -54,6 +62,7 @@ nlohmann::json telemetry_to_json(
           static_cast<double>(telemetry.queries_submitted) / 1000.0},
     {"completion_wait_ns", telemetry.completion_wait_ns},
     {"gpu_query_residence_ns", telemetry.gpu_active_ns},
+    {"gpu_other_ns", gpu_other_ns},
     {"average_gpu_query_us", telemetry.queries_completed == 0 ? 0.0
       : static_cast<double>(telemetry.gpu_active_ns) /
           static_cast<double>(telemetry.queries_completed) / 1000.0},
@@ -72,16 +81,54 @@ nlohmann::json telemetry_to_json(
     {"average_gpu_exact_us", telemetry.queries_completed == 0 ? 0.0
       : static_cast<double>(telemetry.gpu_exact_ns) /
           static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_beam_selection_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_beam_selection_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_rdma_issue_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_rdma_issue_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_rdma_wait_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_rdma_wait_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_graph_validation_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_graph_validation_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_neighbor_decode_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_neighbor_decode_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_pq_score_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_pq_score_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_visited_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_visited_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_beam_merge_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_beam_merge_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_other_us", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(gpu_other_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
     {"rdma_read_ops", telemetry.rdma_read_ops},
     {"rdma_read_bytes", telemetry.rdma_read_bytes},
     {"rdma_merged_requests", telemetry.rdma_merged_requests},
     {"direct_path_failures", telemetry.direct_path_failures},
     {"graph_page_requests", telemetry.graph_page_requests},
+    {"graph_shard_batches", telemetry.graph_shard_batches},
+    {"average_graph_shard_batches_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.graph_shard_batches) /
+          static_cast<double>(telemetry.queries_completed)},
     {"graph_read_retries", telemetry.graph_read_retries},
     {"average_graph_read_retries", telemetry.queries_completed == 0 ? 0.0
       : static_cast<double>(telemetry.graph_read_retries) /
           static_cast<double>(telemetry.queries_completed)},
     {"graph_dependency_rounds", telemetry.graph_dependency_rounds},
+    {"average_graph_rounds_per_query", telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.graph_dependency_rounds) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"average_parent_batch_size", telemetry.graph_dependency_rounds == 0 ? 0.0
+      : static_cast<double>(telemetry.graph_page_requests) /
+          static_cast<double>(telemetry.graph_dependency_rounds)},
     {"graph_route_hits", telemetry.graph_route_hits},
     {"graph_route_refreshes", telemetry.graph_route_refreshes},
     {"centroid_route_publications", telemetry.centroid_route_publications},

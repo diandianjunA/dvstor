@@ -7,6 +7,62 @@ namespace gpu_search {
 
 using namespace persistent_engine_detail;
 
+void PersistentSearchEngine::Impl::write_query_rdma_trace(
+    const CompletionDescriptor& completion) {
+  if (completion.trace_event_count == 0 ||
+      d_query_rdma_trace_events == nullptr ||
+      !query_rdma_trace_stream.is_open()) {
+    return;
+  }
+  std::vector<QueryRdmaTraceEvent> trace_events(completion.trace_event_count);
+  check_cuda(cudaMemcpy(
+    trace_events.data(),
+    d_query_rdma_trace_events +
+      static_cast<size_t>(completion.query_slot) *
+        config.query_rdma_trace_events_per_query,
+    trace_events.size() * sizeof(QueryRdmaTraceEvent),
+    cudaMemcpyDeviceToHost), "cudaMemcpy(query RDMA trace events)");
+  std::lock_guard<std::mutex> trace_lock(query_rdma_trace_mutex);
+  query_rdma_trace_stream
+    << "{\"type\":\"query\",\"request_id\":"
+    << completion.request_id << ",\"query_slot\":"
+    << completion.query_slot << ",\"status\":" << completion.status
+    << ",\"event_count\":" << completion.trace_event_count
+    << ",\"overflow\":" << completion.trace_overflow
+    << ",\"gpu_cycles\":" << completion.gpu_cycles
+    << ",\"gpu_clock_khz\":" << gpu_clock_khz
+    << ",\"graph_rounds\":" << completion.graph_rounds
+    << ",\"graph_reads\":" << completion.remote_pages
+    << ",\"graph_batches\":" << completion.remote_batches
+    << ",\"graph_read_retries\":" << completion.graph_read_retries
+    << ",\"beam_selection_cycles\":" << completion.beam_selection_cycles
+    << ",\"rdma_issue_cycles\":" << completion.rdma_issue_cycles
+    << ",\"rdma_wait_cycles\":" << completion.rdma_wait_cycles
+    << ",\"graph_validation_cycles\":"
+    << completion.graph_validation_cycles
+    << ",\"neighbor_decode_cycles\":" << completion.neighbor_decode_cycles
+    << ",\"pq_score_cycles\":" << completion.pq_score_cycles
+    << ",\"visited_cycles\":" << completion.visited_cycles
+    << ",\"beam_merge_cycles\":" << completion.beam_merge_cycles
+    << ",\"exact_cycles\":" << completion.exact_cycles
+    << ",\"dynamic_code_cycles\":" << completion.dynamic_code_cycles
+    << "}\n";
+  for (const QueryRdmaTraceEvent& event : trace_events) {
+    query_rdma_trace_stream
+      << "{\"type\":\"shard_batch\",\"request_id\":" << event.request_id
+      << ",\"search_round\":" << event.search_round
+      << ",\"snapshot_attempt\":" << event.snapshot_attempt
+      << ",\"target_shard\":" << event.target_shard
+      << ",\"parent_count\":" << event.parent_count
+      << ",\"bytes_per_parent\":" << event.bytes_per_parent
+      << ",\"issue_timestamp_ns\":" << event.issue_timestamp_ns
+      << ",\"completion_timestamp_ns\":" << event.completion_timestamp_ns
+      << ",\"batch_process_start_timestamp_ns\":"
+      << event.batch_process_start_timestamp_ns << "}\n";
+  }
+  query_rdma_trace_stream.flush();
+}
+
 namespace {
 
 u64 steady_now_ns() {
@@ -245,6 +301,22 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << " score_us=" << completion.score_cycles * 1000ULL / gpu_clock_khz
                 << " beam_us=" << completion.beam_cycles * 1000ULL / gpu_clock_khz
                 << " exact_us=" << completion.exact_cycles * 1000ULL / gpu_clock_khz
+                << " beam_select_us="
+                << completion.beam_selection_cycles * 1000ULL / gpu_clock_khz
+                << " rdma_issue_us="
+                << completion.rdma_issue_cycles * 1000ULL / gpu_clock_khz
+                << " rdma_wait_us="
+                << completion.rdma_wait_cycles * 1000ULL / gpu_clock_khz
+                << " graph_validation_us="
+                << completion.graph_validation_cycles * 1000ULL / gpu_clock_khz
+                << " neighbor_decode_us="
+                << completion.neighbor_decode_cycles * 1000ULL / gpu_clock_khz
+                << " pq_score_us="
+                << completion.pq_score_cycles * 1000ULL / gpu_clock_khz
+                << " visited_us="
+                << completion.visited_cycles * 1000ULL / gpu_clock_khz
+                << " beam_merge_us="
+                << completion.beam_merge_cycles * 1000ULL / gpu_clock_khz
                 << " graph_reads=" << completion.remote_pages
                 << " graph_rereads=" << completion.graph_read_retries
                 << " graph_batches=" << completion.remote_batches
@@ -261,6 +333,7 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << " dynamic_pq_batch_deduplicated="
                 << completion.dynamic_code_batch_deduplicated << '\n';
     }
+    write_query_rdma_trace(completion);
     if (completion.status != 0) {
       report_direct_path_failure();
       if (healthy.load(std::memory_order_acquire)) {
@@ -294,10 +367,28 @@ void PersistentSearchEngine::Impl::completion_loop() {
       phase_ns(completion.beam_cycles), std::memory_order_relaxed);
     engine.telemetry_.gpu_exact_ns.fetch_add(
       phase_ns(completion.exact_cycles), std::memory_order_relaxed);
+    engine.telemetry_.gpu_beam_selection_ns.fetch_add(
+      phase_ns(completion.beam_selection_cycles), std::memory_order_relaxed);
+    engine.telemetry_.gpu_rdma_issue_ns.fetch_add(
+      phase_ns(completion.rdma_issue_cycles), std::memory_order_relaxed);
+    engine.telemetry_.gpu_rdma_wait_ns.fetch_add(
+      phase_ns(completion.rdma_wait_cycles), std::memory_order_relaxed);
+    engine.telemetry_.gpu_graph_validation_ns.fetch_add(
+      phase_ns(completion.graph_validation_cycles), std::memory_order_relaxed);
+    engine.telemetry_.gpu_neighbor_decode_ns.fetch_add(
+      phase_ns(completion.neighbor_decode_cycles), std::memory_order_relaxed);
+    engine.telemetry_.gpu_pq_score_ns.fetch_add(
+      phase_ns(completion.pq_score_cycles), std::memory_order_relaxed);
+    engine.telemetry_.gpu_visited_ns.fetch_add(
+      phase_ns(completion.visited_cycles), std::memory_order_relaxed);
+    engine.telemetry_.gpu_beam_merge_ns.fetch_add(
+      phase_ns(completion.beam_merge_cycles), std::memory_order_relaxed);
     engine.telemetry_.completion_wait_ns.fetch_add(end_to_end_ns,
                                                    std::memory_order_relaxed);
     const u64 physical_graph_reads =
       static_cast<u64>(completion.remote_pages) + completion.graph_read_retries;
+    engine.telemetry_.graph_shard_batches.fetch_add(
+      completion.remote_batches, std::memory_order_relaxed);
     engine.telemetry_.rdma_read_ops.fetch_add(
       static_cast<u64>(completion.exact_vectors) + physical_graph_reads +
         completion.dynamic_code_reads,

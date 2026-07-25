@@ -71,6 +71,14 @@ struct CompletionDescriptor {
   u64 beam_cycles{};
   u64 exact_cycles{};
   u64 dynamic_code_cycles{};
+  u64 beam_selection_cycles{};
+  u64 rdma_issue_cycles{};
+  u64 rdma_wait_cycles{};
+  u64 graph_validation_cycles{};
+  u64 neighbor_decode_cycles{};
+  u64 pq_score_cycles{};
+  u64 visited_cycles{};
+  u64 beam_merge_cycles{};
   u32 query_slot{};
   u32 result_count{};
   i32 status{};
@@ -91,6 +99,8 @@ struct CompletionDescriptor {
   u32 dynamic_code_cache_publish_probe_exhaustions{};
   u32 dynamic_code_cache_lookup_probes{};
   u32 dynamic_code_cache_max_lookup_probes{};
+  u32 trace_event_count{};
+  u32 trace_overflow{};
   // Low 8 bits encode QueryFailureReason; the high 24 bits count complete
   // centroid-route snapshot retries caused by a concurrent publication.
   u32 diagnostic{};
@@ -124,11 +134,20 @@ struct TelemetrySnapshot {
   u64 gpu_score_ns{};
   u64 gpu_beam_ns{};
   u64 gpu_exact_ns{};
+  u64 gpu_beam_selection_ns{};
+  u64 gpu_rdma_issue_ns{};
+  u64 gpu_rdma_wait_ns{};
+  u64 gpu_graph_validation_ns{};
+  u64 gpu_neighbor_decode_ns{};
+  u64 gpu_pq_score_ns{};
+  u64 gpu_visited_ns{};
+  u64 gpu_beam_merge_ns{};
   u64 rdma_read_ops{};
   u64 rdma_read_bytes{};
   u64 rdma_merged_requests{};
   u64 direct_path_failures{};
   u64 graph_page_requests{};
+  u64 graph_shard_batches{};
   u64 graph_read_retries{};
   u64 graph_dependency_rounds{};
   u64 graph_route_hits{};
@@ -181,11 +200,20 @@ public:
   std::atomic<u64> gpu_score_ns{0};
   std::atomic<u64> gpu_beam_ns{0};
   std::atomic<u64> gpu_exact_ns{0};
+  std::atomic<u64> gpu_beam_selection_ns{0};
+  std::atomic<u64> gpu_rdma_issue_ns{0};
+  std::atomic<u64> gpu_rdma_wait_ns{0};
+  std::atomic<u64> gpu_graph_validation_ns{0};
+  std::atomic<u64> gpu_neighbor_decode_ns{0};
+  std::atomic<u64> gpu_pq_score_ns{0};
+  std::atomic<u64> gpu_visited_ns{0};
+  std::atomic<u64> gpu_beam_merge_ns{0};
   std::atomic<u64> rdma_read_ops{0};
   std::atomic<u64> rdma_read_bytes{0};
   std::atomic<u64> rdma_merged_requests{0};
   std::atomic<u64> direct_path_failures{0};
   std::atomic<u64> graph_page_requests{0};
+  std::atomic<u64> graph_shard_batches{0};
   std::atomic<u64> graph_read_retries{0};
   std::atomic<u64> graph_dependency_rounds{0};
   std::atomic<u64> graph_route_hits{0};

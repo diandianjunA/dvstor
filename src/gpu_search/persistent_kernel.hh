@@ -145,9 +145,40 @@ struct DirectBatchDescriptor {
   const u64* remote_offsets{};
   const u64* local_iova_offsets{};
   i32* completion_status{};
+  u64* completion_timestamp_ns{};
   u32 request_count{};
   u32 memory_node{};
   u32 bytes{};
+  u32 reserved{};
+};
+
+enum class QueryRdmaTraceMode : u32 {
+  off = 0,
+  sampled = 1,
+  full = 2,
+};
+
+// Completion is intentionally shard-batch granular. GPUNetIO requests only a
+// CQE for the final READ (or dump WQE), so individual parent/WQE completion
+// times are not observable without changing the transport data path.
+struct QueryRdmaTraceEvent {
+  u64 request_id{};
+  u64 issue_timestamp_ns{};
+  u64 completion_timestamp_ns{};
+  u64 batch_process_start_timestamp_ns{};
+  u32 search_round{};
+  u32 snapshot_attempt{};
+  u32 target_shard{};
+  u32 parent_count{};
+  u32 bytes_per_parent{};
+  u32 reserved{};
+};
+
+struct QueryRdmaTraceHeader {
+  u64 request_id{};
+  u32 event_count{};
+  u32 overflow{};
+  u32 enabled{};
   u32 reserved{};
 };
 
@@ -215,6 +246,7 @@ struct PersistentKernelParams {
   i32* direct_qp_locks{};
   const DeviceRingView<DirectBatchDescriptor>* direct_batch_queues{};
   i32* direct_batch_statuses{};
+  u64* direct_batch_completion_timestamps_ns{};
   u32 direct_batch_queue_count{};
   u32* direct_owner_phases{};
   DirectOwnerProgress* direct_owner_progress{};
@@ -240,6 +272,11 @@ struct PersistentKernelParams {
   u32* dispatcher_kernel_ready_count{};
   u32* control_kernel_ready_count{};
   u8* graph_scratch{};
+  QueryRdmaTraceHeader* query_rdma_trace_headers{};
+  QueryRdmaTraceEvent* query_rdma_trace_events{};
+  u32 query_rdma_trace_mode{};
+  u32 query_rdma_trace_sample_rate{};
+  u32 query_rdma_trace_events_per_query{};
   f32* decoded_queries{};
   f32* transformed_queries{};
   f32* query_luts{};

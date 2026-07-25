@@ -523,6 +523,11 @@ write_service_config() {
     echo "gpu-bootstrap-window-mb = ${GPU_BOOTSTRAP_WINDOW_MB:-64}"
     echo "gpu-bootstrap-windows = ${GPU_BOOTSTRAP_WINDOWS:-4}"
     echo "gpu-graph-prefetch-depth = ${GPU_GRAPH_PREFETCH_DEPTH:-32}"
+    echo "query-rdma-trace-mode = ${QUERY_RDMA_TRACE_MODE:-off}"
+    echo "query-rdma-trace-sample-rate = ${QUERY_RDMA_TRACE_SAMPLE_RATE:-1000}"
+    [[ -z "${QUERY_RDMA_TRACE_OUTPUT:-}" ]] ||
+      echo "query-rdma-trace-output = $QUERY_RDMA_TRACE_OUTPUT"
+    echo "query-rdma-trace-events-per-query = ${QUERY_RDMA_TRACE_EVENTS_PER_QUERY:-1024}"
     echo "gpu-traversal-beam-width = ${GPU_TRAVERSAL_BEAM_WIDTH:-128}"
     echo "gpu-final-rerank-width = ${GPU_FINAL_RERANK_WIDTH:-128}"
     echo "gpu-max-expansions = ${GPU_MAX_EXPANSIONS:-384}"

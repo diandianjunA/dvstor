@@ -122,6 +122,7 @@ struct PersistentSearchEngine::Impl {
   void admission_loop();
   void report_direct_path_failure();
   void completion_loop();
+  void write_query_rdma_trace(const CompletionDescriptor& completion);
 
   void submit_centroid_route_publication(
     const CentroidRoutePublishDescriptor& descriptor);
@@ -225,6 +226,11 @@ struct PersistentSearchEngine::Impl {
   DirectBatchDescriptor* d_direct_batch_entries{};
   DeviceRingView<DirectBatchDescriptor>* d_direct_batch_queues{};
   i32* d_direct_batch_statuses{};
+  u64* d_direct_batch_completion_timestamps_ns{};
+  QueryRdmaTraceHeader* d_query_rdma_trace_headers{};
+  QueryRdmaTraceEvent* d_query_rdma_trace_events{};
+  std::ofstream query_rdma_trace_stream;
+  std::mutex query_rdma_trace_mutex;
   u32* direct_owner_phases_host{};
   u32* d_direct_owner_phases{};
   DirectOwnerProgress* direct_owner_progress_host{};

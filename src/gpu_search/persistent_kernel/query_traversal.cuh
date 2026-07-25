@@ -7,6 +7,19 @@
 
 namespace gpu_search::persistent_kernel_detail {
 
+__device__ void set_query_trace_completion(
+    const PersistentKernelParams& params, u32 query_slot,
+    CompletionDescriptor& completion) {
+  if (params.query_rdma_trace_headers == nullptr ||
+      query_slot >= params.query_slots) return;
+  const QueryRdmaTraceHeader& header =
+    params.query_rdma_trace_headers[query_slot];
+  if (header.request_id != completion.request_id || header.enabled == 0) return;
+  completion.trace_event_count = min(
+    header.event_count, params.query_rdma_trace_events_per_query);
+  completion.trace_overflow = header.overflow;
+}
+
 __device__ void set_dynamic_code_cache_completion(
     CompletionDescriptor& completion, u32 cache_hits,
     u32 batch_deduplicated, u32 publish_successes, u32 publish_races,
@@ -168,6 +181,7 @@ __device__ void process_query(const PersistentKernelParams& params,
       completion.diagnostic = make_query_diagnostic(
         QueryFailureReason::invalid_descriptor);
       completion.gpu_cycles = clock64() - query_started_cycles;
+      set_query_trace_completion(params, query_slot, completion);
       device_ring_push(params.completions, completion);
     }
     __syncthreads();
@@ -181,6 +195,16 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ u64 beam_phase_cycles;
   __shared__ u64 exact_phase_cycles;
   __shared__ u64 dynamic_code_cycles;
+  __shared__ u64 beam_selection_cycles;
+  __shared__ u64 rdma_issue_cycles;
+  __shared__ u64 rdma_wait_cycles;
+  __shared__ u64 graph_validation_cycles;
+  __shared__ u64 neighbor_decode_cycles;
+  __shared__ u64 pq_score_cycles;
+  __shared__ u64 visited_cycles;
+  __shared__ u64 beam_merge_cycles;
+  __shared__ u32 rdma_trace_enabled;
+  __shared__ GraphFetchCycleBreakdown graph_fetch_breakdown;
   __shared__ u32 dynamic_code_candidates;
   __shared__ u32 dynamic_code_reads;
   __shared__ u32 dynamic_code_incarnation_rejects;
@@ -200,6 +224,29 @@ __device__ void process_query(const PersistentKernelParams& params,
     beam_phase_cycles = 0;
     exact_phase_cycles = 0;
     dynamic_code_cycles = 0;
+    beam_selection_cycles = 0;
+    rdma_issue_cycles = 0;
+    rdma_wait_cycles = 0;
+    graph_validation_cycles = 0;
+    neighbor_decode_cycles = 0;
+    pq_score_cycles = 0;
+    visited_cycles = 0;
+    beam_merge_cycles = 0;
+    rdma_trace_enabled =
+      params.query_rdma_trace_mode ==
+        static_cast<u32>(QueryRdmaTraceMode::full) ||
+      (params.query_rdma_trace_mode ==
+         static_cast<u32>(QueryRdmaTraceMode::sampled) &&
+       params.query_rdma_trace_sample_rate != 0 &&
+       descriptor.request_id % params.query_rdma_trace_sample_rate == 0);
+    if (params.query_rdma_trace_headers != nullptr) {
+      params.query_rdma_trace_headers[query_slot] = {
+        .request_id = descriptor.request_id,
+        .event_count = 0,
+        .overflow = 0,
+        .enabled = rdma_trace_enabled,
+      };
+    }
     dynamic_code_candidates = 0;
     dynamic_code_reads = 0;
     dynamic_code_incarnation_rejects = 0;
@@ -467,6 +514,7 @@ __device__ void process_query(const PersistentKernelParams& params,
             QueryFailureReason::route_snapshot_timeout,
             route_snapshot_retries);
           completion.gpu_cycles = clock64() - query_started_cycles;
+          set_query_trace_completion(params, query_slot, completion);
           device_ring_push(params.completions, completion);
         }
         __syncthreads();
@@ -573,6 +621,7 @@ __device__ void process_query(const PersistentKernelParams& params,
           dynamic_code_cache_publish_probe_exhaustions,
           dynamic_code_cache_lookup_probes,
           dynamic_code_cache_max_lookup_probes);
+        set_query_trace_completion(params, query_slot, completion);
         device_ring_push(params.completions, completion);
       }
       __syncthreads();
@@ -621,20 +670,31 @@ __device__ void process_query(const PersistentKernelParams& params,
       }
     }
     __syncthreads();
+    if (threadIdx.x == 0) {
+      beam_selection_cycles += clock64() - phase_started_cycles;
+      phase_started_cycles = clock64();
+    }
     if (selected_count == 0) break;
     if (threadIdx.x == 0) ++total_graph_rounds;
     __syncthreads();
     constexpr u32 warp_width = 32;
     const u32 warp = threadIdx.x / warp_width;
     const u32 lane_in_warp = threadIdx.x % warp_width;
+    if (threadIdx.x == 0) graph_fetch_breakdown = {};
+    __syncthreads();
     if (!fetch_graph_records_batch(
           params, descriptor, selected_handles, selected_count,
           graph_record_slots, remote_reads_by_lane,
-          &total_remote_batches, &total_graph_read_retries)) {
+          &total_remote_batches, &total_graph_read_retries,
+          total_graph_rounds - 1, rdma_trace_enabled != 0,
+          &graph_fetch_breakdown)) {
       if (threadIdx.x == 0) graph_failed = 1;
     }
     __syncthreads();
     if (threadIdx.x == 0) {
+      rdma_issue_cycles += graph_fetch_breakdown.issue;
+      rdma_wait_cycles += graph_fetch_breakdown.wait;
+      graph_validation_cycles += graph_fetch_breakdown.validation;
       graph_phase_cycles += clock64() - phase_started_cycles;
       for (u32 selected = 0; selected < selected_count; ++selected) {
         total_remote_reads += remote_reads_by_lane[selected];
@@ -670,6 +730,7 @@ __device__ void process_query(const PersistentKernelParams& params,
           dynamic_code_cache_publish_probe_exhaustions,
           dynamic_code_cache_lookup_probes,
           dynamic_code_cache_max_lookup_probes);
+        set_query_trace_completion(params, query_slot, completion);
         device_ring_push(params.completions, completion);
       }
       __syncthreads();
@@ -732,6 +793,10 @@ __device__ void process_query(const PersistentKernelParams& params,
         if (lane_in_warp == 0) graph_record_slots[selected] = UINT32_MAX;
       }
       __syncthreads();
+      if (threadIdx.x == 0) {
+        neighbor_decode_cycles += clock64() - phase_started_cycles;
+        phase_started_cycles = clock64();
+      }
       const u32 candidate_count = flattened_neighbors;
       for (u32 flat = threadIdx.x; flat < candidate_count; flat += blockDim.x) {
         const u64 handle = navigation_handles[flat];
@@ -741,6 +806,10 @@ __device__ void process_query(const PersistentKernelParams& params,
         }
       }
       __syncthreads();
+      if (threadIdx.x == 0) {
+        visited_cycles += clock64() - phase_started_cycles;
+        phase_started_cycles = clock64();
+      }
       if (!approximate_handles_batch(
             params, descriptor, query_lut, navigation_handles,
             candidate_count, navigation_distances, &dynamic_code_cycles,
@@ -757,7 +826,9 @@ __device__ void process_query(const PersistentKernelParams& params,
       }
       __syncthreads();
       if (threadIdx.x == 0) {
-        score_phase_cycles += clock64() - phase_started_cycles;
+        pq_score_cycles += clock64() - phase_started_cycles;
+        score_phase_cycles = neighbor_decode_cycles +
+          visited_cycles + pq_score_cycles;
         phase_started_cycles = clock64();
       }
       __syncthreads();
@@ -770,7 +841,9 @@ __device__ void process_query(const PersistentKernelParams& params,
         rerank_handles, rerank_ids, rerank_distances,
         candidate_workspace);
       if (threadIdx.x == 0) {
-        beam_phase_cycles += clock64() - phase_started_cycles;
+        const u64 merge_cycles = clock64() - phase_started_cycles;
+        beam_merge_cycles += merge_cycles;
+        beam_phase_cycles += merge_cycles;
       }
       __syncthreads();
     }
@@ -800,6 +873,7 @@ __device__ void process_query(const PersistentKernelParams& params,
           dynamic_code_cache_publish_probe_exhaustions,
           dynamic_code_cache_lookup_probes,
           dynamic_code_cache_max_lookup_probes);
+        set_query_trace_completion(params, query_slot, completion);
         device_ring_push(params.completions, completion);
       }
       __syncthreads();
@@ -878,6 +952,7 @@ __device__ void process_query(const PersistentKernelParams& params,
         dynamic_code_cache_publish_probe_exhaustions,
         dynamic_code_cache_lookup_probes,
         dynamic_code_cache_max_lookup_probes);
+      set_query_trace_completion(params, query_slot, completion);
       device_ring_push(params.completions, completion);
     }
     __syncthreads();
@@ -906,6 +981,14 @@ __device__ void process_query(const PersistentKernelParams& params,
     completion.score_cycles = score_phase_cycles;
     completion.beam_cycles = beam_phase_cycles;
     completion.exact_cycles = exact_phase_cycles;
+    completion.beam_selection_cycles = beam_selection_cycles;
+    completion.rdma_issue_cycles = rdma_issue_cycles;
+    completion.rdma_wait_cycles = rdma_wait_cycles;
+    completion.graph_validation_cycles = graph_validation_cycles;
+    completion.neighbor_decode_cycles = neighbor_decode_cycles;
+    completion.pq_score_cycles = pq_score_cycles;
+    completion.visited_cycles = visited_cycles;
+    completion.beam_merge_cycles = beam_merge_cycles;
     completion.remote_pages = total_remote_reads;
     completion.remote_batches = total_remote_batches;
     completion.graph_read_retries = total_graph_read_retries;
@@ -924,6 +1007,7 @@ __device__ void process_query(const PersistentKernelParams& params,
       dynamic_code_cache_publish_probe_exhaustions,
       dynamic_code_cache_lookup_probes,
       dynamic_code_cache_max_lookup_probes);
+    set_query_trace_completion(params, query_slot, completion);
     device_ring_push(params.completions, completion);
   }
   __syncthreads();

@@ -303,6 +303,9 @@ __device__ void complete_direct_batch(const DirectBatchDescriptor& descriptor,
                                       i32 status,
                                       DirectOwnerProgress* owner_progress) {
   if (descriptor.completion_status == nullptr) return;
+  if (descriptor.completion_timestamp_ns != nullptr) {
+    *descriptor.completion_timestamp_ns = global_time_ns();
+  }
   __threadfence_system();
   atomicExch(descriptor.completion_status, status);
   if (owner_progress != nullptr) {

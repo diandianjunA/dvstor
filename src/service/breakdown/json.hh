@@ -25,9 +25,11 @@ inline nlohmann::json aggregate_to_json(const Aggregate& aggregate) {
     {"p50_end_to_end_ns", percentile_ns(aggregate.end_to_end_latencies_ns, 0.50)},
     {"p95_end_to_end_ns", percentile_ns(aggregate.end_to_end_latencies_ns, 0.95)},
     {"p99_end_to_end_ns", percentile_ns(aggregate.end_to_end_latencies_ns, 0.99)},
+    {"p999_end_to_end_ns", percentile_ns(aggregate.end_to_end_latencies_ns, 0.999)},
     {"p50_service_ns", percentile_ns(aggregate.service_latencies_ns, 0.50)},
     {"p95_service_ns", percentile_ns(aggregate.service_latencies_ns, 0.95)},
     {"p99_service_ns", percentile_ns(aggregate.service_latencies_ns, 0.99)},
+    {"p999_service_ns", percentile_ns(aggregate.service_latencies_ns, 0.999)},
   };
   output["fine_grained_breakdown_observed"] =
     aggregate.fine_grained_breakdown_observed;

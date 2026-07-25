@@ -17,6 +17,7 @@ inline std::string aggregate_text_summary(const Aggregate& aggregate) {
          << " p50=" << ns_to_ms(percentile_ns(aggregate.end_to_end_latencies_ns, 0.50))
          << " p95=" << ns_to_ms(percentile_ns(aggregate.end_to_end_latencies_ns, 0.95))
          << " p99=" << ns_to_ms(percentile_ns(aggregate.end_to_end_latencies_ns, 0.99))
+         << " p999=" << ns_to_ms(percentile_ns(aggregate.end_to_end_latencies_ns, 0.999))
          << '\n';
   if (!aggregate.fine_grained_breakdown_observed) {
     output << "  fine_grained_breakdown: disabled\n";

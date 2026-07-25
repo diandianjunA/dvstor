@@ -19,11 +19,20 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .gpu_score_ns = gpu_score_ns.load(std::memory_order_relaxed),
     .gpu_beam_ns = gpu_beam_ns.load(std::memory_order_relaxed),
     .gpu_exact_ns = gpu_exact_ns.load(std::memory_order_relaxed),
+    .gpu_beam_selection_ns = gpu_beam_selection_ns.load(std::memory_order_relaxed),
+    .gpu_rdma_issue_ns = gpu_rdma_issue_ns.load(std::memory_order_relaxed),
+    .gpu_rdma_wait_ns = gpu_rdma_wait_ns.load(std::memory_order_relaxed),
+    .gpu_graph_validation_ns = gpu_graph_validation_ns.load(std::memory_order_relaxed),
+    .gpu_neighbor_decode_ns = gpu_neighbor_decode_ns.load(std::memory_order_relaxed),
+    .gpu_pq_score_ns = gpu_pq_score_ns.load(std::memory_order_relaxed),
+    .gpu_visited_ns = gpu_visited_ns.load(std::memory_order_relaxed),
+    .gpu_beam_merge_ns = gpu_beam_merge_ns.load(std::memory_order_relaxed),
     .rdma_read_ops = rdma_read_ops.load(std::memory_order_relaxed),
     .rdma_read_bytes = rdma_read_bytes.load(std::memory_order_relaxed),
     .rdma_merged_requests = rdma_merged_requests.load(std::memory_order_relaxed),
     .direct_path_failures = direct_path_failures.load(std::memory_order_relaxed),
     .graph_page_requests = graph_page_requests.load(std::memory_order_relaxed),
+    .graph_shard_batches = graph_shard_batches.load(std::memory_order_relaxed),
     .graph_read_retries = graph_read_retries.load(std::memory_order_relaxed),
     .graph_dependency_rounds = graph_dependency_rounds.load(std::memory_order_relaxed),
     .graph_route_hits = graph_route_hits.load(std::memory_order_relaxed),
@@ -96,11 +105,20 @@ void Telemetry::reset() {
   gpu_score_ns.store(0, std::memory_order_relaxed);
   gpu_beam_ns.store(0, std::memory_order_relaxed);
   gpu_exact_ns.store(0, std::memory_order_relaxed);
+  gpu_beam_selection_ns.store(0, std::memory_order_relaxed);
+  gpu_rdma_issue_ns.store(0, std::memory_order_relaxed);
+  gpu_rdma_wait_ns.store(0, std::memory_order_relaxed);
+  gpu_graph_validation_ns.store(0, std::memory_order_relaxed);
+  gpu_neighbor_decode_ns.store(0, std::memory_order_relaxed);
+  gpu_pq_score_ns.store(0, std::memory_order_relaxed);
+  gpu_visited_ns.store(0, std::memory_order_relaxed);
+  gpu_beam_merge_ns.store(0, std::memory_order_relaxed);
   rdma_read_ops.store(0, std::memory_order_relaxed);
   rdma_read_bytes.store(0, std::memory_order_relaxed);
   rdma_merged_requests.store(0, std::memory_order_relaxed);
   direct_path_failures.store(0, std::memory_order_relaxed);
   graph_page_requests.store(0, std::memory_order_relaxed);
+  graph_shard_batches.store(0, std::memory_order_relaxed);
   graph_read_retries.store(0, std::memory_order_relaxed);
   graph_dependency_rounds.store(0, std::memory_order_relaxed);
   graph_route_hits.store(0, std::memory_order_relaxed);

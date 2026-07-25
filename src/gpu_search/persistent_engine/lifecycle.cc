@@ -329,6 +329,9 @@ PersistentSearchEngine::Impl::~Impl() {
   device_free(d_centroid_route_shards);
   device_free(d_centroid_route_entries);
   device_free(d_direct_batch_statuses);
+  device_free(d_direct_batch_completion_timestamps_ns);
+  device_free(d_query_rdma_trace_events);
+  device_free(d_query_rdma_trace_headers);
   device_free(d_direct_owner_progress);
   device_free(d_direct_batch_queues);
   device_free(d_direct_batch_entries);
