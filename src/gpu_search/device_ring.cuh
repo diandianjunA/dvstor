@@ -75,6 +75,15 @@ __device__ __forceinline__ bool device_ring_try_push(DeviceRingView<T> ring,
 }
 
 template <class T>
+__device__ __forceinline__ bool device_ring_is_full(DeviceRingView<T> ring) {
+  const unsigned long long enqueue = atomicAdd(
+    ring.enqueue_position, 0ULL);
+  const unsigned long long dequeue = atomicAdd(
+    ring.dequeue_position, 0ULL);
+  return enqueue - dequeue >= ring.capacity;
+}
+
+template <class T>
 __device__ __forceinline__ void device_ring_push(DeviceRingView<T> ring, const T& value) {
   const unsigned long long position = atomicAdd(ring.enqueue_position, 1ULL);
   const unsigned int slot = static_cast<unsigned int>(position) & ring.mask;

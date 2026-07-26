@@ -27,6 +27,22 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .gpu_pq_score_ns = gpu_pq_score_ns.load(std::memory_order_relaxed),
     .gpu_visited_ns = gpu_visited_ns.load(std::memory_order_relaxed),
     .gpu_beam_merge_ns = gpu_beam_merge_ns.load(std::memory_order_relaxed),
+    .feedback_hunger_queries =
+      feedback_hunger_queries.load(std::memory_order_relaxed),
+    .expansion_sum_selected_parents =
+      expansion_sum_selected_parents.load(std::memory_order_relaxed),
+    .expansion_sum_feedback_horizon =
+      expansion_sum_feedback_horizon.load(std::memory_order_relaxed),
+    .expansion_sum_hardware_credit_tiles =
+      expansion_sum_hardware_credit_tiles.load(std::memory_order_relaxed),
+    .expansion_minimum_selected_batch =
+      expansion_minimum_selected_batch.load(std::memory_order_relaxed),
+    .expansion_maximum_selected_batch =
+      expansion_maximum_selected_batch.load(std::memory_order_relaxed),
+    .expansion_minimum_feedback_horizon =
+      expansion_minimum_feedback_horizon.load(std::memory_order_relaxed),
+    .expansion_maximum_feedback_horizon =
+      expansion_maximum_feedback_horizon.load(std::memory_order_relaxed),
     .rdma_read_ops = rdma_read_ops.load(std::memory_order_relaxed),
     .rdma_read_bytes = rdma_read_bytes.load(std::memory_order_relaxed),
     .rdma_merged_requests = rdma_merged_requests.load(std::memory_order_relaxed),
@@ -113,6 +129,16 @@ void Telemetry::reset() {
   gpu_pq_score_ns.store(0, std::memory_order_relaxed);
   gpu_visited_ns.store(0, std::memory_order_relaxed);
   gpu_beam_merge_ns.store(0, std::memory_order_relaxed);
+  feedback_hunger_queries.store(0, std::memory_order_relaxed);
+  expansion_sum_selected_parents.store(0, std::memory_order_relaxed);
+  expansion_sum_feedback_horizon.store(0, std::memory_order_relaxed);
+  expansion_sum_hardware_credit_tiles.store(0, std::memory_order_relaxed);
+  expansion_minimum_selected_batch.store(
+    UINT64_MAX, std::memory_order_relaxed);
+  expansion_maximum_selected_batch.store(0, std::memory_order_relaxed);
+  expansion_minimum_feedback_horizon.store(
+    UINT64_MAX, std::memory_order_relaxed);
+  expansion_maximum_feedback_horizon.store(0, std::memory_order_relaxed);
   rdma_read_ops.store(0, std::memory_order_relaxed);
   rdma_read_bytes.store(0, std::memory_order_relaxed);
   rdma_merged_requests.store(0, std::memory_order_relaxed);

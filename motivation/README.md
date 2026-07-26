@@ -178,3 +178,12 @@ DEPTH=8 FULL_TRACE_QUERIES=50 ./motivation/run_full_trace_smoke.sh
 不能选择性删除 overflow 查询。主 sweep 完成后还会生成
 `motivation/results/sweep/prefetch_sweep.csv`；也可手工执行
 `./motivation/summarize_prefetch_sweep.py` 重新汇总全部未过滤报告。
+
+## 6. Feedback-Hunger 动态扩展
+
+动态扩展实现、验证和当前负性能结论见
+`motivation/FEEDBACK_HUNGER_REPORT.md`。完整 fixed/dynamic A/B：
+
+```bash
+./motivation/run_feedback_hunger_ab.sh
+```

@@ -235,11 +235,15 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     config.dim * sizeof(f32);
   route_graph_bytes = centroid_route_bytes +
     shard_centroid_bytes;
+  const u64 expansion_pressure_bytes =
+    config.gpu_query_expansion_policy == "feedback-hunger"
+      ? sizeof(ExpansionPressureState) : 0;
   const u64 additional_scratch_bytes =
     dynamic_code_scratch_bytes + dynamic_code_arena_bytes +
     dynamic_request_scratch_bytes +
     navigation_candidate_bytes + query_dispatch_bytes + direct_queue_bytes +
-    graph_scratch_bytes + route_graph_bytes + rdma_trace_bytes;
+    graph_scratch_bytes + route_graph_bytes + rdma_trace_bytes +
+    expansion_pressure_bytes;
   if (additional_scratch_bytes > usable_budget - budget.explicit_bytes) {
     throw std::runtime_error(
       "GPU navigation dynamic-code scratch exceeds the configured memory budget");
@@ -266,6 +270,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
             << " query_rdma_trace=" << rdma_trace_bytes
             << " centroid_route=" << centroid_route_bytes
             << " shard_centroids=" << shard_centroid_bytes
+            << " expansion_pressure=" << expansion_pressure_bytes
             << " explicit=" << explicit_gpu_bytes
             << " limit=" << engine_budget << " bytes\n";
 
@@ -635,6 +640,18 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   const size_t selected_index =
     kernel_threads == kPersistentThreadCandidates[0] ? 0 : 1;
   persistent_kernel_occupancy = occupancies[selected_index];
+  if (config.gpu_query_expansion_policy == "feedback-hunger") {
+    device_allocate(d_expansion_pressure, 1,
+                    "cudaMalloc(GPU expansion pressure state)");
+    const u32 expansion_tile = std::max(1u, kernel_threads / 32u);
+    ExpansionPressureState initial_pressure{};
+    initial_pressure.maximum_credit_tiles =
+      (score_chunk_capacity + expansion_tile - 1u) / expansion_tile;
+    check_cuda(cudaMemcpy(
+                 d_expansion_pressure, &initial_pressure,
+                 sizeof(initial_pressure), cudaMemcpyHostToDevice),
+               "cudaMemcpy(GPU expansion pressure state)");
+  }
 
   kernel_params = PersistentKernelParams{
     .submissions = submissions.device_view(),
@@ -680,6 +697,12 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .exact_width = exact_width,
     .max_expansions = config.gpu_max_expansions,
     .prefetch_depth = config.gpu_graph_prefetch_depth,
+    .query_expansion_policy =
+      config.gpu_query_expansion_policy == "feedback-hunger"
+        ? static_cast<u32>(QueryExpansionPolicy::feedback_hunger)
+        : static_cast<u32>(QueryExpansionPolicy::fixed),
+    .efficient_batch_cap = std::min(
+      kPersistentMaxPrefetch, score_chunk_capacity),
     .visited_capacity = visited_capacity,
     .query_slots = query_slots,
     .direct_region_count = direct_view.remote_region_count,
@@ -699,6 +722,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .direct_batch_queue_count = direct_batch_queue_count,
     .direct_owner_phases = d_direct_owner_phases,
     .direct_owner_progress = d_direct_owner_progress,
+    .expansion_pressure = d_expansion_pressure,
     .direct_dump = direct_view.dump,
     .direct_disabled = direct_disabled_device,
     .direct_error = direct_error_device,

@@ -46,6 +46,7 @@ public:
   u32 gpu_bootstrap_window_mb{64};
   u32 gpu_bootstrap_windows{2};
   u32 gpu_graph_prefetch_depth{32};
+  str gpu_query_expansion_policy{"fixed"};
   str query_rdma_trace_mode{"off"};
   u32 query_rdma_trace_sample_rate{1000};
   filepath_t query_rdma_trace_output{};
@@ -101,6 +102,8 @@ public:
       vector_id_namespace_size = max_vectors;
     }
     vector_data_type = normalize_mode(vector_data_type);
+    gpu_query_expansion_policy =
+      normalize_mode(gpu_query_expansion_policy);
     query_rdma_trace_mode = normalize_mode(query_rdma_trace_mode);
     validate(argv);
     operator<<(std::cerr, *this);
@@ -181,6 +184,10 @@ private:
       ("gpu-graph-prefetch-depth",
        po::value<u32>(&gpu_graph_prefetch_depth)->default_value(gpu_graph_prefetch_depth),
        "Graph records fetched concurrently by one GPU query.")
+      ("gpu-query-expansion-policy",
+       po::value<str>(&gpu_query_expansion_policy)
+         ->default_value(gpu_query_expansion_policy),
+       "GPU graph expansion policy: fixed or feedback-hunger.")
       ("query-rdma-trace-mode",
        po::value<str>(&query_rdma_trace_mode)->default_value(query_rdma_trace_mode),
        "Shard-batch RDMA trace mode: off, sampled, or full.")
@@ -315,6 +322,10 @@ private:
     if (query_rdma_trace_mode != "off" && query_rdma_trace_output.empty()) {
       fail("--query-rdma-trace-output is required when tracing is enabled");
     }
+    if (gpu_query_expansion_policy != "fixed" &&
+        gpu_query_expansion_policy != "feedback-hunger") {
+      fail("--gpu-query-expansion-policy must be fixed or feedback-hunger");
+    }
     if (gpu_query_slots == 0 || gpu_query_slots > 4096 ||
         gpu_memory_limit_gb == 0 ||
         gpu_memory_reserve_gb >= gpu_memory_limit_gb ||
@@ -398,6 +409,8 @@ public:
              << config.gpu_final_rerank_width << '\n';
       output << std::setw(width) << "GPU max expansions: "
              << config.gpu_max_expansions << '\n';
+      output << std::setw(width) << "GPU expansion policy: "
+             << config.gpu_query_expansion_policy << '\n';
       output << std::setw(width) << "query RDMA trace mode/rate: "
              << config.query_rdma_trace_mode << "/"
              << config.query_rdma_trace_sample_rate << '\n';

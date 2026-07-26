@@ -43,7 +43,7 @@ public:
   std::vector<std::optional<maintenance_telemetry::Snapshot>>
     read_maintenance_telemetry();
 
-  TelemetrySnapshot telemetry() const { return telemetry_.snapshot(); }
+  TelemetrySnapshot telemetry() const;
   void reset_telemetry();
 
 private:

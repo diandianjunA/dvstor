@@ -37,6 +37,24 @@ __device__ void set_dynamic_code_cache_completion(
   completion.dynamic_code_cache_max_lookup_probes = max_lookup_probes;
 }
 
+__device__ void set_expansion_completion(
+    CompletionDescriptor& completion, const PersistentKernelParams& params,
+    u32 sum_selected_parents, u32 sum_feedback_horizon,
+    u32 sum_hardware_credit_tiles, u32 minimum_selected_batch,
+    u32 maximum_selected_batch, u32 minimum_feedback_horizon,
+    u32 maximum_feedback_horizon) {
+  completion.expansion_policy = params.query_expansion_policy;
+  completion.sum_selected_parents = sum_selected_parents;
+  completion.sum_feedback_horizon = sum_feedback_horizon;
+  completion.sum_hardware_credit_tiles = sum_hardware_credit_tiles;
+  completion.minimum_selected_batch =
+    minimum_selected_batch == UINT32_MAX ? 0 : minimum_selected_batch;
+  completion.maximum_selected_batch = maximum_selected_batch;
+  completion.minimum_feedback_horizon =
+    minimum_feedback_horizon == UINT32_MAX ? 0 : minimum_feedback_horizon;
+  completion.maximum_feedback_horizon = maximum_feedback_horizon;
+}
+
 __device__ u64 decode_tagged_raw(const u8* source) {
   return *reinterpret_cast<const u64*>(source);
 }
@@ -187,6 +205,10 @@ __device__ void process_query(const PersistentKernelParams& params,
     __syncthreads();
     return;
   }
+  if (threadIdx.x == 0) {
+    expansion_pressure_query_enter(params.expansion_pressure);
+  }
+  __syncthreads();
 
   const u8* query_input = reinterpret_cast<const u8*>(descriptor.query_device_address);
   __shared__ u64 prepare_started_cycles;
@@ -203,6 +225,15 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ u64 pq_score_cycles;
   __shared__ u64 visited_cycles;
   __shared__ u64 beam_merge_cycles;
+  __shared__ u32 feedback_horizon;
+  __shared__ u32 sum_selected_parents;
+  __shared__ u32 sum_feedback_horizon;
+  __shared__ u32 sum_hardware_credit_tiles;
+  __shared__ u32 minimum_selected_batch;
+  __shared__ u32 maximum_selected_batch;
+  __shared__ u32 minimum_feedback_horizon;
+  __shared__ u32 maximum_feedback_horizon;
+  __shared__ FeedbackHorizonResult merge_feedback;
   __shared__ u32 rdma_trace_enabled;
   __shared__ GraphFetchCycleBreakdown graph_fetch_breakdown;
   __shared__ u32 dynamic_code_candidates;
@@ -232,6 +263,14 @@ __device__ void process_query(const PersistentKernelParams& params,
     pq_score_cycles = 0;
     visited_cycles = 0;
     beam_merge_cycles = 0;
+    feedback_horizon = params.efficient_batch_cap;
+    sum_selected_parents = 0;
+    sum_feedback_horizon = 0;
+    sum_hardware_credit_tiles = 0;
+    minimum_selected_batch = UINT32_MAX;
+    maximum_selected_batch = 0;
+    minimum_feedback_horizon = UINT32_MAX;
+    maximum_feedback_horizon = 0;
     rdma_trace_enabled =
       params.query_rdma_trace_mode ==
         static_cast<u32>(QueryRdmaTraceMode::full) ||
@@ -386,6 +425,7 @@ __device__ void process_query(const PersistentKernelParams& params,
   // transaction; no immutable entry table is used as a fallback.
   for (u32 route_attempt = 0; route_attempt < 2; ++route_attempt) {
     if (threadIdx.x == 0) {
+      feedback_horizon = params.efficient_batch_cap;
       beam_count = 0;
       rerank_count = 0;
       route_wait_started_ns = global_time_ns();
@@ -506,7 +546,13 @@ __device__ void process_query(const PersistentKernelParams& params,
         }
       }
       __syncthreads();
-      if (route_snapshot_cancelled != 0) return;
+      if (route_snapshot_cancelled != 0) {
+        if (threadIdx.x == 0) {
+          expansion_pressure_query_exit(params.expansion_pressure);
+        }
+        __syncthreads();
+        return;
+      }
       if (route_snapshot_timed_out != 0) {
         if (threadIdx.x == 0) {
           completion.status = -ETIMEDOUT;
@@ -514,6 +560,12 @@ __device__ void process_query(const PersistentKernelParams& params,
             QueryFailureReason::route_snapshot_timeout,
             route_snapshot_retries);
           completion.gpu_cycles = clock64() - query_started_cycles;
+          set_expansion_completion(
+            completion, params, sum_selected_parents, sum_feedback_horizon,
+            sum_hardware_credit_tiles, minimum_selected_batch,
+            maximum_selected_batch, minimum_feedback_horizon,
+            maximum_feedback_horizon);
+          expansion_pressure_query_exit(params.expansion_pressure);
           set_query_trace_completion(params, query_slot, completion);
           device_ring_push(params.completions, completion);
         }
@@ -621,6 +673,12 @@ __device__ void process_query(const PersistentKernelParams& params,
           dynamic_code_cache_publish_probe_exhaustions,
           dynamic_code_cache_lookup_probes,
           dynamic_code_cache_max_lookup_probes);
+        set_expansion_completion(
+          completion, params, sum_selected_parents, sum_feedback_horizon,
+          sum_hardware_credit_tiles, minimum_selected_batch,
+          maximum_selected_batch, minimum_feedback_horizon,
+          maximum_feedback_horizon);
+        expansion_pressure_query_exit(params.expansion_pressure);
         set_query_trace_completion(params, query_slot, completion);
         device_ring_push(params.completions, completion);
       }
@@ -662,11 +720,39 @@ __device__ void process_query(const PersistentKernelParams& params,
     if (threadIdx.x == 0) {
       selected_count = 0;
       graph_failed = 0;
-      const u32 target = min(params.prefetch_depth, params.max_expansions - expansions);
+      const bool feedback_policy =
+        params.query_expansion_policy ==
+          static_cast<u32>(QueryExpansionPolicy::feedback_hunger);
+      const u32 pressure_credit = feedback_policy
+        ? expansion_pressure_credit(
+            expansion_pressure_load(params.expansion_pressure))
+        : 0u;
+      const u32 expansion_tile = max(1u, blockDim.x / 32u);
+      const u32 remaining = params.max_expansions - expansions;
+      const u32 requested = feedback_policy
+        ? min(params.efficient_batch_cap,
+              feedback_horizon + pressure_credit * expansion_tile)
+        : params.prefetch_depth;
+      const u32 target = min(requested, remaining);
       for (u32 index = 0; index < beam_count && selected_count < target; ++index) {
         if (beam_expanded[index] != 0) continue;
         beam_expanded[index] = 1;
         selected_handles[selected_count++] = beam_handles[index];
+      }
+      if (selected_count != 0) {
+        sum_selected_parents += selected_count;
+        sum_feedback_horizon += feedback_policy ? feedback_horizon : 0u;
+        sum_hardware_credit_tiles += pressure_credit;
+        minimum_selected_batch = min(
+          minimum_selected_batch, selected_count);
+        maximum_selected_batch = max(
+          maximum_selected_batch, selected_count);
+        if (feedback_policy) {
+          minimum_feedback_horizon = min(
+            minimum_feedback_horizon, feedback_horizon);
+          maximum_feedback_horizon = max(
+            maximum_feedback_horizon, feedback_horizon);
+        }
       }
     }
     __syncthreads();
@@ -730,6 +816,12 @@ __device__ void process_query(const PersistentKernelParams& params,
           dynamic_code_cache_publish_probe_exhaustions,
           dynamic_code_cache_lookup_probes,
           dynamic_code_cache_max_lookup_probes);
+        set_expansion_completion(
+          completion, params, sum_selected_parents, sum_feedback_horizon,
+          sum_hardware_credit_tiles, minimum_selected_batch,
+          maximum_selected_batch, minimum_feedback_horizon,
+          maximum_feedback_horizon);
+        expansion_pressure_query_exit(params.expansion_pressure);
         set_query_trace_completion(params, query_slot, completion);
         device_ring_push(params.completions, completion);
       }
@@ -739,7 +831,10 @@ __device__ void process_query(const PersistentKernelParams& params,
 
     const u32 score_chunk_capacity = persistent_score_chunk_capacity(
       params.graph_entry_capacity, traversal_capacity);
-    if (score_chunk_capacity == 0) {
+    if (score_chunk_capacity == 0 ||
+        (params.query_expansion_policy ==
+           static_cast<u32>(QueryExpansionPolicy::feedback_hunger) &&
+         selected_count > score_chunk_capacity)) {
       if (threadIdx.x == 0) graph_failed = 1;
       __syncthreads();
     }
@@ -839,11 +934,18 @@ __device__ void process_query(const PersistentKernelParams& params,
         beam_expanded, beam_count, traversal_capacity,
         merge_handles, merge_ids, merge_distances, merge_expanded,
         rerank_handles, rerank_ids, rerank_distances,
-        candidate_workspace);
+        candidate_workspace, params.efficient_batch_cap,
+        params.query_expansion_policy ==
+            static_cast<u32>(QueryExpansionPolicy::feedback_hunger)
+          ? &merge_feedback : nullptr);
       if (threadIdx.x == 0) {
         const u64 merge_cycles = clock64() - phase_started_cycles;
         beam_merge_cycles += merge_cycles;
         beam_phase_cycles += merge_cycles;
+        if (params.query_expansion_policy ==
+            static_cast<u32>(QueryExpansionPolicy::feedback_hunger)) {
+          feedback_horizon = merge_feedback.horizon;
+        }
       }
       __syncthreads();
     }
@@ -873,6 +975,12 @@ __device__ void process_query(const PersistentKernelParams& params,
           dynamic_code_cache_publish_probe_exhaustions,
           dynamic_code_cache_lookup_probes,
           dynamic_code_cache_max_lookup_probes);
+        set_expansion_completion(
+          completion, params, sum_selected_parents, sum_feedback_horizon,
+          sum_hardware_credit_tiles, minimum_selected_batch,
+          maximum_selected_batch, minimum_feedback_horizon,
+          maximum_feedback_horizon);
+        expansion_pressure_query_exit(params.expansion_pressure);
         set_query_trace_completion(params, query_slot, completion);
         device_ring_push(params.completions, completion);
       }
@@ -952,6 +1060,12 @@ __device__ void process_query(const PersistentKernelParams& params,
         dynamic_code_cache_publish_probe_exhaustions,
         dynamic_code_cache_lookup_probes,
         dynamic_code_cache_max_lookup_probes);
+      set_expansion_completion(
+        completion, params, sum_selected_parents, sum_feedback_horizon,
+        sum_hardware_credit_tiles, minimum_selected_batch,
+        maximum_selected_batch, minimum_feedback_horizon,
+        maximum_feedback_horizon);
+      expansion_pressure_query_exit(params.expansion_pressure);
       set_query_trace_completion(params, query_slot, completion);
       device_ring_push(params.completions, completion);
     }
@@ -1007,6 +1121,12 @@ __device__ void process_query(const PersistentKernelParams& params,
       dynamic_code_cache_publish_probe_exhaustions,
       dynamic_code_cache_lookup_probes,
       dynamic_code_cache_max_lookup_probes);
+    set_expansion_completion(
+      completion, params, sum_selected_parents, sum_feedback_horizon,
+      sum_hardware_credit_tiles, minimum_selected_batch,
+      maximum_selected_batch, minimum_feedback_horizon,
+      maximum_feedback_horizon);
+    expansion_pressure_query_exit(params.expansion_pressure);
     set_query_trace_completion(params, query_slot, completion);
     device_ring_push(params.completions, completion);
   }

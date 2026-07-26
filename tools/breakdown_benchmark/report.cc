@@ -105,6 +105,56 @@ nlohmann::json telemetry_to_json(
     {"average_gpu_beam_merge_us", telemetry.queries_completed == 0 ? 0.0
       : static_cast<double>(telemetry.gpu_beam_merge_ns) /
           static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"feedback_hunger_queries", telemetry.feedback_hunger_queries},
+    {"expansion_sum_selected_parents",
+      telemetry.expansion_sum_selected_parents},
+    {"expansion_sum_feedback_horizon",
+      telemetry.expansion_sum_feedback_horizon},
+    {"expansion_sum_hardware_credit_tiles",
+      telemetry.expansion_sum_hardware_credit_tiles},
+    {"expansion_minimum_selected_batch",
+      telemetry.expansion_minimum_selected_batch == UINT64_MAX
+        ? 0 : telemetry.expansion_minimum_selected_batch},
+    {"expansion_maximum_selected_batch",
+      telemetry.expansion_maximum_selected_batch},
+    {"expansion_minimum_feedback_horizon",
+      telemetry.expansion_minimum_feedback_horizon == UINT64_MAX
+        ? 0 : telemetry.expansion_minimum_feedback_horizon},
+    {"expansion_maximum_feedback_horizon",
+      telemetry.expansion_maximum_feedback_horizon},
+    {"average_selected_batch",
+      telemetry.graph_dependency_rounds == 0 ? 0.0
+      : static_cast<double>(telemetry.expansion_sum_selected_parents) /
+          static_cast<double>(telemetry.graph_dependency_rounds)},
+    {"average_feedback_horizon",
+      telemetry.graph_dependency_rounds == 0 ? 0.0
+      : static_cast<double>(telemetry.expansion_sum_feedback_horizon) /
+          static_cast<double>(telemetry.graph_dependency_rounds)},
+    {"average_hardware_credit_tiles",
+      telemetry.graph_dependency_rounds == 0 ? 0.0
+      : static_cast<double>(
+          telemetry.expansion_sum_hardware_credit_tiles) /
+          static_cast<double>(telemetry.graph_dependency_rounds)},
+    {"expansion_pressure_active_queries",
+      telemetry.expansion_pressure_active_queries},
+    {"expansion_pressure_active_queries_peak",
+      telemetry.expansion_pressure_active_queries_peak},
+    {"expansion_pressure_credit_current",
+      telemetry.expansion_pressure_credit_current},
+    {"expansion_pressure_credit_max_observed",
+      telemetry.expansion_pressure_credit_max_observed},
+    {"expansion_pressure_maximum_credit_tiles",
+      telemetry.expansion_pressure_maximum_credit_tiles},
+    {"expansion_pressure_hunger_grants",
+      telemetry.expansion_pressure_hunger_grants},
+    {"expansion_pressure_idle_owner_episodes",
+      telemetry.expansion_pressure_idle_owner_episodes},
+    {"expansion_pressure_congestion_clears",
+      telemetry.expansion_pressure_congestion_clears},
+    {"expansion_pressure_ring_backpressure_events",
+      telemetry.expansion_pressure_ring_backpressure_events},
+    {"expansion_pressure_sq_defer_events",
+      telemetry.expansion_pressure_sq_defer_events},
     {"average_gpu_other_us", telemetry.queries_completed == 0 ? 0.0
       : static_cast<double>(gpu_other_ns) /
           static_cast<double>(telemetry.queries_completed) / 1000.0},

@@ -123,6 +123,9 @@ struct PersistentSearchEngine::Impl {
   void report_direct_path_failure();
   void completion_loop();
   void write_query_rdma_trace(const CompletionDescriptor& completion);
+  void augment_expansion_pressure_telemetry(
+    TelemetrySnapshot& snapshot) const;
+  void reset_expansion_pressure_telemetry();
 
   void submit_centroid_route_publication(
     const CentroidRoutePublishDescriptor& descriptor);
@@ -235,6 +238,8 @@ struct PersistentSearchEngine::Impl {
   u32* d_direct_owner_phases{};
   DirectOwnerProgress* direct_owner_progress_host{};
   DirectOwnerProgress* d_direct_owner_progress{};
+  ExpansionPressureState* d_expansion_pressure{};
+  ExpansionPressureState expansion_pressure_baseline{};
   u32* query_kernel_ready_host{};
   u32* d_query_kernel_ready{};
   u32* dispatcher_kernel_ready_host{};

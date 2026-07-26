@@ -44,6 +44,19 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
     << ",\"pq_score_cycles\":" << completion.pq_score_cycles
     << ",\"visited_cycles\":" << completion.visited_cycles
     << ",\"beam_merge_cycles\":" << completion.beam_merge_cycles
+    << ",\"expansion_policy\":" << completion.expansion_policy
+    << ",\"sum_selected_parents\":" << completion.sum_selected_parents
+    << ",\"sum_feedback_horizon\":" << completion.sum_feedback_horizon
+    << ",\"sum_hardware_credit_tiles\":"
+    << completion.sum_hardware_credit_tiles
+    << ",\"minimum_selected_batch\":"
+    << completion.minimum_selected_batch
+    << ",\"maximum_selected_batch\":"
+    << completion.maximum_selected_batch
+    << ",\"minimum_feedback_horizon\":"
+    << completion.minimum_feedback_horizon
+    << ",\"maximum_feedback_horizon\":"
+    << completion.maximum_feedback_horizon
     << ",\"exact_cycles\":" << completion.exact_cycles
     << ",\"dynamic_code_cycles\":" << completion.dynamic_code_cycles
     << "}\n";
@@ -383,6 +396,43 @@ void PersistentSearchEngine::Impl::completion_loop() {
       phase_ns(completion.visited_cycles), std::memory_order_relaxed);
     engine.telemetry_.gpu_beam_merge_ns.fetch_add(
       phase_ns(completion.beam_merge_cycles), std::memory_order_relaxed);
+    if (completion.expansion_policy ==
+        static_cast<u32>(QueryExpansionPolicy::feedback_hunger)) {
+      engine.telemetry_.feedback_hunger_queries.fetch_add(
+        1, std::memory_order_relaxed);
+    }
+    engine.telemetry_.expansion_sum_selected_parents.fetch_add(
+      completion.sum_selected_parents, std::memory_order_relaxed);
+    engine.telemetry_.expansion_sum_feedback_horizon.fetch_add(
+      completion.sum_feedback_horizon, std::memory_order_relaxed);
+    engine.telemetry_.expansion_sum_hardware_credit_tiles.fetch_add(
+      completion.sum_hardware_credit_tiles, std::memory_order_relaxed);
+    if (completion.graph_rounds != 0) {
+      if (completion.minimum_selected_batch <
+          engine.telemetry_.expansion_minimum_selected_batch.load(
+            std::memory_order_relaxed)) {
+        engine.telemetry_.expansion_minimum_selected_batch.store(
+          completion.minimum_selected_batch, std::memory_order_relaxed);
+      }
+      if (completion.minimum_feedback_horizon <
+          engine.telemetry_.expansion_minimum_feedback_horizon.load(
+            std::memory_order_relaxed)) {
+        engine.telemetry_.expansion_minimum_feedback_horizon.store(
+          completion.minimum_feedback_horizon, std::memory_order_relaxed);
+      }
+    }
+    if (completion.maximum_selected_batch >
+        engine.telemetry_.expansion_maximum_selected_batch.load(
+          std::memory_order_relaxed)) {
+      engine.telemetry_.expansion_maximum_selected_batch.store(
+        completion.maximum_selected_batch, std::memory_order_relaxed);
+    }
+    if (completion.maximum_feedback_horizon >
+        engine.telemetry_.expansion_maximum_feedback_horizon.load(
+          std::memory_order_relaxed)) {
+      engine.telemetry_.expansion_maximum_feedback_horizon.store(
+        completion.maximum_feedback_horizon, std::memory_order_relaxed);
+    }
     engine.telemetry_.completion_wait_ns.fetch_add(end_to_end_ns,
                                                    std::memory_order_relaxed);
     const u64 physical_graph_reads =

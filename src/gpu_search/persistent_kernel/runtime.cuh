@@ -372,6 +372,7 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
   DirectBatchDescriptor deferred{};
   u32 deferred_matching = 0;
   bool have_deferred = false;
+  bool idle_credit_announced = false;
   bool trace_first_batch = true;
   DirectOwnerProgress* owner_progress = params.direct_owner_progress == nullptr
     ? nullptr : params.direct_owner_progress + warp;
@@ -459,6 +460,8 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
         }
         if (batch_count != 0 &&
             total_wqes + needed + completion_wqes > qp->sq_wqe_num) {
+          expansion_pressure_clear_credit(
+            params.expansion_pressure, false, true);
           deferred = descriptor;
           deferred_matching = matching;
           have_deferred = true;
@@ -477,10 +480,38 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
 
     const u32 batch_count = shared_batch_counts[warp_in_block];
     if (batch_count == 0) {
-      if (lane == 0) device_ring_relax(idle_cycles);
+      if (lane == 0) {
+        const unsigned long long pressure =
+          expansion_pressure_load(params.expansion_pressure);
+        const u32 active_queries = expansion_pressure_active(pressure);
+        bool progress_balanced = false;
+        if (!have_deferred && owner_progress != nullptr) {
+          const u64 announced = *reinterpret_cast<const volatile u64*>(
+            &owner_progress->announced);
+          const u64 completed = *reinterpret_cast<const volatile u64*>(
+            &owner_progress->completed);
+          progress_balanced = announced == completed;
+        }
+        if (expansion_owner_idle_episode_transition(
+              active_queries, true, progress_balanced, false,
+              idle_credit_announced)) {
+          if (params.expansion_pressure != nullptr) {
+            atomicAdd(
+              &params.expansion_pressure->idle_owner_episodes, 1ULL);
+            expansion_pressure_grant_idle(params.expansion_pressure);
+          }
+        }
+        device_ring_relax(idle_cycles);
+      }
       __syncwarp();
       idle_cycles = min(idle_cycles * 2, 16384u);
       continue;
+    }
+    if (lane == 0) {
+      (void)expansion_owner_idle_episode_transition(
+        expansion_pressure_active(
+          expansion_pressure_load(params.expansion_pressure)),
+        false, false, true, idle_credit_announced);
     }
     idle_cycles = initial_idle_cycles;
 

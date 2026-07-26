@@ -120,6 +120,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"gpu_query_slots", service.config().gpu_query_slots},
     {"gpu_rdma_qps", service.config().gpu_rdma_qps},
     {"gpu_graph_prefetch_depth", service.config().gpu_graph_prefetch_depth},
+    {"gpu_query_expansion_policy",
+      service.config().gpu_query_expansion_policy},
   };
   const size_t dim = service.config().dim;
   const double write_ratio_sum = args.write_insert_ratio + args.write_upsert_ratio + args.write_delete_ratio;

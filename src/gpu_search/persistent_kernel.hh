@@ -7,6 +7,10 @@
 #include "gpu_search/device_ring.cuh"
 #include "gpu_search/types.hh"
 
+#ifdef __CUDACC__
+#include <cuda/atomic>
+#endif
+
 struct CUstream_st;
 using cudaStream_t = CUstream_st*;
 
@@ -196,6 +200,191 @@ struct alignas(64) DirectOwnerProgress {
 
 static_assert(sizeof(DirectOwnerProgress) == 64);
 
+enum class QueryExpansionPolicy : u32 {
+  fixed = 0,
+  feedback_hunger = 1,
+};
+
+// Query/owner CTAs share the compact controller in the first cache line.
+// Diagnostic counters occupy the second cache line.
+struct alignas(64) ExpansionPressureState {
+  // [15:0] active, [31:16] credit, [47:32] active peak,
+  // [63:48] maximum observed credit.
+  unsigned long long control{};
+  u32 maximum_credit_tiles{};
+  u32 reserved0{};
+  unsigned long long reserved_control[6]{};
+
+  unsigned long long hunger_grants{};
+  unsigned long long congestion_clears{};
+  unsigned long long ring_backpressure_events{};
+  unsigned long long sq_defer_events{};
+  unsigned long long idle_owner_episodes{};
+  unsigned long long reserved_counters[3]{};
+};
+
+static_assert(sizeof(ExpansionPressureState) == 128);
+static_assert(alignof(ExpansionPressureState) == 64);
+
+inline constexpr u32 kExpansionPressureFieldMask = 0xffffu;
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr u32 expansion_pressure_active(unsigned long long control) {
+  return static_cast<u32>(control) & kExpansionPressureFieldMask;
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr u32 expansion_pressure_credit(unsigned long long control) {
+  return static_cast<u32>(control >> 16) & kExpansionPressureFieldMask;
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr u32 expansion_pressure_active_peak(
+    unsigned long long control) {
+  return static_cast<u32>(control >> 32) & kExpansionPressureFieldMask;
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr u32 expansion_pressure_credit_peak(
+    unsigned long long control) {
+  return static_cast<u32>(control >> 48) & kExpansionPressureFieldMask;
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr unsigned long long make_expansion_pressure_control(
+    u32 active, u32 credit, u32 active_peak, u32 credit_peak) {
+  return static_cast<unsigned long long>(
+           active & kExpansionPressureFieldMask) |
+    (static_cast<unsigned long long>(
+       credit & kExpansionPressureFieldMask) << 16) |
+    (static_cast<unsigned long long>(
+       active_peak & kExpansionPressureFieldMask) << 32) |
+    (static_cast<unsigned long long>(
+       credit_peak & kExpansionPressureFieldMask) << 48);
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline bool expansion_owner_idle_episode_transition(
+    u32 active_queries, bool queue_empty, bool progress_balanced,
+    bool obtained_batch, bool& idle_credit_announced) {
+  if (active_queries == 0 || obtained_batch) {
+    idle_credit_announced = false;
+    return false;
+  }
+  if (queue_empty && progress_balanced && !idle_credit_announced) {
+    idle_credit_announced = true;
+    return true;
+  }
+  return false;
+}
+
+#ifdef __CUDACC__
+__device__ __forceinline__ unsigned long long expansion_pressure_load(
+    const ExpansionPressureState* state) {
+  if (state == nullptr) return 0;
+  cuda::atomic_ref<unsigned long long, cuda::thread_scope_device> control(
+    const_cast<unsigned long long&>(state->control));
+  return control.load(cuda::memory_order_relaxed);
+}
+
+__device__ __forceinline__ void expansion_pressure_query_enter(
+    ExpansionPressureState* state) {
+  if (state == nullptr) return;
+  unsigned long long observed = expansion_pressure_load(state);
+  for (;;) {
+    const u32 old_active = expansion_pressure_active(observed);
+    const u32 active = min(
+      old_active + 1u, kExpansionPressureFieldMask);
+    const unsigned long long desired = make_expansion_pressure_control(
+      active, old_active == 0 ? 0u : expansion_pressure_credit(observed),
+      max(expansion_pressure_active_peak(observed), active),
+      expansion_pressure_credit_peak(observed));
+    const unsigned long long prior =
+      atomicCAS(&state->control, observed, desired);
+    if (prior == observed) return;
+    observed = prior;
+  }
+}
+
+__device__ __forceinline__ void expansion_pressure_query_exit(
+    ExpansionPressureState* state) {
+  if (state == nullptr) return;
+  unsigned long long observed = expansion_pressure_load(state);
+  for (;;) {
+    const u32 old_active = expansion_pressure_active(observed);
+    if (old_active == 0) return;
+    const u32 active = old_active - 1u;
+    const unsigned long long desired = make_expansion_pressure_control(
+      active, active == 0 ? 0u : expansion_pressure_credit(observed),
+      expansion_pressure_active_peak(observed),
+      expansion_pressure_credit_peak(observed));
+    const unsigned long long prior =
+      atomicCAS(&state->control, observed, desired);
+    if (prior == observed) return;
+    observed = prior;
+  }
+}
+
+__device__ __forceinline__ bool expansion_pressure_grant_idle(
+    ExpansionPressureState* state) {
+  if (state == nullptr || state->maximum_credit_tiles == 0) return false;
+  unsigned long long observed = expansion_pressure_load(state);
+  for (;;) {
+    const u32 active = expansion_pressure_active(observed);
+    const u32 credit = expansion_pressure_credit(observed);
+    if (active == 0 || credit >= state->maximum_credit_tiles) return false;
+    const u32 next_credit = credit + 1u;
+    const unsigned long long desired = make_expansion_pressure_control(
+      active, next_credit, expansion_pressure_active_peak(observed),
+      max(expansion_pressure_credit_peak(observed), next_credit));
+    const unsigned long long prior =
+      atomicCAS(&state->control, observed, desired);
+    if (prior == observed) {
+      atomicAdd(&state->hunger_grants, 1ULL);
+      return true;
+    }
+    observed = prior;
+  }
+}
+
+__device__ __forceinline__ void expansion_pressure_clear_credit(
+    ExpansionPressureState* state, bool ring_backpressure, bool sq_defer) {
+  if (state == nullptr) return;
+  unsigned long long observed = expansion_pressure_load(state);
+  bool cleared = false;
+  while (expansion_pressure_credit(observed) != 0) {
+    const unsigned long long desired = make_expansion_pressure_control(
+      expansion_pressure_active(observed), 0,
+      expansion_pressure_active_peak(observed),
+      expansion_pressure_credit_peak(observed));
+    const unsigned long long prior =
+      atomicCAS(&state->control, observed, desired);
+    if (prior == observed) {
+      cleared = true;
+      break;
+    }
+    observed = prior;
+  }
+  if (cleared) atomicAdd(&state->congestion_clears, 1ULL);
+  if (ring_backpressure) {
+    atomicAdd(&state->ring_backpressure_events, 1ULL);
+  }
+  if (sq_defer) atomicAdd(&state->sq_defer_events, 1ULL);
+}
+#endif
+
 struct PersistentKernelParams {
   DeviceRingView<QueryDescriptor> submissions;
   DeviceRingView<QueryDescriptor> device_submissions;
@@ -231,6 +420,8 @@ struct PersistentKernelParams {
   u32 exact_width{};
   u32 max_expansions{};
   u32 prefetch_depth{};
+  u32 query_expansion_policy{};
+  u32 efficient_batch_cap{};
   u32 visited_capacity{};
   u32 query_slots{};
   u32 direct_region_count{};
@@ -250,6 +441,7 @@ struct PersistentKernelParams {
   u32 direct_batch_queue_count{};
   u32* direct_owner_phases{};
   DirectOwnerProgress* direct_owner_progress{};
+  ExpansionPressureState* expansion_pressure{};
   u8* direct_dump{};
   u32* direct_disabled{};
   i32* direct_error{};

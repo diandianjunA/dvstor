@@ -176,7 +176,16 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
     if (watchdog_progress != nullptr) {
       record_owner_watchdog_counter(&watchdog_progress->announced);
     }
-    while (!device_ring_try_push(params.direct_batch_queues[qp_index], descriptor)) {
+    bool pushed = device_ring_try_push(
+      params.direct_batch_queues[qp_index], descriptor);
+    bool backpressure_recorded = false;
+    while (!pushed) {
+      if (!backpressure_recorded &&
+          device_ring_is_full(params.direct_batch_queues[qp_index])) {
+        expansion_pressure_clear_credit(
+          params.expansion_pressure, true, false);
+        backpressure_recorded = true;
+      }
       if (*reinterpret_cast<const volatile u32*>(params.stop) != 0) {
         atomicExch(owner_completion, -ECANCELED);
         if (watchdog_progress != nullptr) {
@@ -195,6 +204,8 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
       // QP has failed.  The owner warp is the sole WQE/CQ authority and its CQ
       // watchdog below is responsible for declaring a transport failure.
       device_ring_relax(128);
+      pushed = device_ring_try_push(
+        params.direct_batch_queues[qp_index], descriptor);
     }
     if (owner_progress != nullptr) {
       *reinterpret_cast<volatile u32*>(owner_progress) = 3;
