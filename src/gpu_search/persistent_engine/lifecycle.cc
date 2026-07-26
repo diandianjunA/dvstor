@@ -1,6 +1,8 @@
 #include "gpu_search/persistent_engine/impl.hh"
 #include "gpu_search/persistent_engine/cuda_helpers.hh"
 
+#include <algorithm>
+
 namespace gpu_search {
 
 using namespace persistent_engine_detail;
@@ -120,6 +122,23 @@ void PersistentSearchEngine::Impl::start_persistent_kernel() {
              "cudaMemset(GPU navigation direct failure flag)");
   check_cuda(cudaMemset(direct_error_device, 0, sizeof(i32)),
              "cudaMemset(GPU navigation direct error)");
+  if (d_expansion_pressure != nullptr) {
+    ExpansionPressureState pressure{};
+    const u32 tile = std::max(1u, kernel_threads / 32u);
+    pressure.maximum_credit_tiles =
+      (kernel_params.efficient_batch_cap + tile - 1u) / tile;
+    check_cuda(cudaMemcpy(
+                 d_expansion_pressure, &pressure, sizeof(pressure),
+                 cudaMemcpyHostToDevice),
+               "cudaMemcpy(GPU expansion pressure start state)");
+  }
+  if (d_expansion_qp_leases != nullptr && direct_batch_queue_count != 0) {
+    check_cuda(cudaMemset(
+                 d_expansion_qp_leases, 0,
+                 static_cast<size_t>(direct_batch_queue_count) *
+                   sizeof(QpExpansionLeaseState)),
+               "cudaMemset(GPU expansion QP lease start state)");
+  }
   (void)cudaGetLastError();
   std::fill_n(direct_owner_phases_host, direct_batch_queue_count, 0u);
   std::fill_n(direct_owner_progress_host, direct_batch_queue_count,
@@ -332,6 +351,7 @@ PersistentSearchEngine::Impl::~Impl() {
   device_free(d_direct_batch_completion_timestamps_ns);
   device_free(d_query_rdma_trace_events);
   device_free(d_query_rdma_trace_headers);
+  device_free(d_expansion_qp_leases);
   device_free(d_expansion_pressure);
   device_free(d_direct_owner_progress);
   device_free(d_direct_batch_queues);

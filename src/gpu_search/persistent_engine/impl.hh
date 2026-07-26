@@ -239,7 +239,9 @@ struct PersistentSearchEngine::Impl {
   DirectOwnerProgress* direct_owner_progress_host{};
   DirectOwnerProgress* d_direct_owner_progress{};
   ExpansionPressureState* d_expansion_pressure{};
+  QpExpansionLeaseState* d_expansion_qp_leases{};
   ExpansionPressureState expansion_pressure_baseline{};
+  std::vector<QpExpansionLeaseState> expansion_qp_lease_baseline;
   u32* query_kernel_ready_host{};
   u32* d_query_kernel_ready{};
   u32* dispatcher_kernel_ready_host{};

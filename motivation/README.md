@@ -187,3 +187,23 @@ DEPTH=8 FULL_TRACE_QUERIES=50 ./motivation/run_full_trace_smoke.sh
 ```bash
 ./motivation/run_feedback_hunger_ab.sh
 ```
+
+## 7. Beam merge policy A/B
+
+设计、精确性证明、资源占用和最终性能结果见
+`motivation/STABLE_RUN_BEAM_REPORT.md`。
+
+固定扩展策略与同一 prefetch depth 下比较旧 merge 和 stable-run：
+
+```bash
+./motivation/run_beam_merge_ab.sh
+```
+
+可用 `PREFETCH_DEPTH` 和 `CONCURRENCIES` 缩小或覆盖矩阵：
+
+```bash
+PREFETCH_DEPTH=16 CONCURRENCIES="64 256" \
+  ./motivation/run_beam_merge_ab.sh
+
+./motivation/analyze_beam_merge_ab.py
+```

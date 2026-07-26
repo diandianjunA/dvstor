@@ -11,8 +11,11 @@ struct CandidateWorkspaceArrays {
   u8 expanded[kPersistentMaxExact * 2];
 };
 
+static_assert(kPersistentMaxExact >= kPersistentMaxBeam);
+
 union CandidateSortWorkspace {
   ApproximateBlockSortWide::TempStorage radix_sort_wide;
+  ApproximateBlockSortWideRun::TempStorage radix_sort_wide_run;
   ApproximateBlockSortCompactPass::TempStorage radix_sort_compact_pass;
   ApproximateBlockSortCompactFinal::TempStorage radix_sort_compact_final;
   ApproximateBlockSortCompactFinal256::TempStorage
@@ -32,6 +35,15 @@ struct FeedbackHorizonResult {
   u32 earliest_new_output{UINT32_MAX};
   u32 old_unexpanded_before_new{};
   u32 new_candidates_in_beam{};
+};
+
+struct BeamMergeCycleBreakdown {
+  // One stable-run call writes a call-local breakdown.  The query keeps a
+  // separate instance and explicitly accumulates these fields across rounds;
+  // legacy leaves them untouched.
+  u64 prepare{};
+  u64 sort{};
+  u64 materialize{};
 };
 
 constexpr u32 kGraphScratchBit = 0x80000000u;
@@ -374,20 +386,6 @@ __device__ void sort_candidates(u64* handles, u32* ids, f32* distances,
   }
 }
 
-__device__ __forceinline__ u32 warp_reduce_min_u32(u32 value) {
-  for (u32 offset = 16; offset != 0; offset >>= 1) {
-    value = min(value, __shfl_down_sync(0xffffffffu, value, offset));
-  }
-  return value;
-}
-
-__device__ __forceinline__ u32 warp_reduce_sum_u32(u32 value) {
-  for (u32 offset = 16; offset != 0; offset >>= 1) {
-    value += __shfl_down_sync(0xffffffffu, value, offset);
-  }
-  return value;
-}
-
 __device__ __forceinline__ void finish_feedback_horizon(
     u32 valid, u32 feedback_cap, u32 earliest_new_output,
     u32 old_unexpanded_before_new, u32 unexpanded_total,
@@ -399,6 +397,20 @@ __device__ __forceinline__ void finish_feedback_horizon(
   feedback->horizon = earliest_new_output < valid
     ? min(old_unexpanded_before_new + 1u, unexpanded_total)
     : min(unexpanded_total, feedback_cap);
+}
+
+__device__ __forceinline__ u32 feedback_warp_min_u32(u32 value) {
+  for (u32 offset = 16; offset != 0; offset >>= 1) {
+    value = min(value, __shfl_down_sync(0xffffffffu, value, offset));
+  }
+  return value;
+}
+
+__device__ __forceinline__ u32 feedback_warp_sum_u32(u32 value) {
+  for (u32 offset = 16; offset != 0; offset >>= 1) {
+    value += __shfl_down_sync(0xffffffffu, value, offset);
+  }
+  return value;
 }
 
 template <class BlockSort, u32 ItemsPerThread>
@@ -418,6 +430,7 @@ __device__ void merge_approximate_radix(
     earliest_new_output = UINT32_MAX;
     new_candidates_in_beam = 0;
   }
+  __syncthreads();
   for (u32 item = 0; item < ItemsPerThread; ++item) {
     const u32 index = threadIdx.x * ItemsPerThread + item;
     u64 handle = kInvalidDeviceHandle;
@@ -465,8 +478,8 @@ __device__ void merge_approximate_radix(
   }
   if (feedback != nullptr) {
     const u32 lane = threadIdx.x & 31u;
-    thread_earliest_new = warp_reduce_min_u32(thread_earliest_new);
-    thread_new_count = warp_reduce_sum_u32(thread_new_count);
+    thread_earliest_new = feedback_warp_min_u32(thread_earliest_new);
+    thread_new_count = feedback_warp_sum_u32(thread_new_count);
     if (lane == 0) {
       atomicMin(&earliest_new_output, thread_earliest_new);
       atomicAdd(&new_candidates_in_beam, thread_new_count);
@@ -479,8 +492,10 @@ __device__ void merge_approximate_radix(
     beam_handles[output] = local_values[item];
     beam_ids[output] = UINT32_MAX;
     beam_distances[output] = local_distances[item];
-    beam_expanded[output] =
-      (sorted_flags[item] & kMergeFlagExpanded) != 0 ? 1u : 0u;
+    beam_expanded[output] = feedback == nullptr
+      ? static_cast<u8>(
+          (sorted_flags[item] & kMergeFlagExpanded) != 0 ? 1u : 0u)
+      : sorted_flags[item];
   }
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -490,9 +505,18 @@ __device__ void merge_approximate_radix(
     const u32 limit = min(merge_count, beam_capacity);
     while (valid < limit && beam_handles[valid] != kInvalidDeviceHandle &&
            isfinite(beam_distances[valid]) && beam_distances[valid] != FLT_MAX) {
-      if (feedback != nullptr && beam_expanded[valid] == 0) {
-        ++unexpanded_total;
-        if (valid < earliest_new_output) ++old_unexpanded_before_new;
+      if (feedback != nullptr) {
+        const u32 flags = beam_expanded[valid];
+        const bool is_new = (flags & kMergeFlagNew) != 0;
+        const bool expanded = (flags & kMergeFlagExpanded) != 0;
+        if (!expanded) {
+          ++unexpanded_total;
+          if (valid < earliest_new_output && !is_new) {
+            ++old_unexpanded_before_new;
+          }
+        }
+        beam_expanded[valid] =
+          expanded ? static_cast<u8>(1) : static_cast<u8>(0);
       }
       ++valid;
     }
@@ -522,6 +546,7 @@ __device__ void merge_approximate_compact_final(
     earliest_new_output = UINT32_MAX;
     new_candidates_in_beam = 0;
   }
+  __syncthreads();
   for (u32 item = 0; item < ItemsPerThread; ++item) {
     const u32 index = threadIdx.x * ItemsPerThread + item;
     u64 handle = kInvalidDeviceHandle;
@@ -535,8 +560,6 @@ __device__ void merge_approximate_compact_final(
   }
   __syncthreads();
   BlockSort(radix_storage).Sort(final_distances, final_values);
-  u32 thread_earliest_new = UINT32_MAX;
-  u32 thread_new_count = 0;
   for (u32 item = 0; item < ItemsPerThread; ++item) {
     final_flags[item] = 0;
     for (u32 prior = 0; prior < scratch_count; ++prior) {
@@ -545,21 +568,25 @@ __device__ void merge_approximate_compact_final(
         break;
       }
     }
+  }
+  __syncthreads();
+  u32 thread_earliest_new = UINT32_MAX;
+  u32 thread_new_count = 0;
+  for (u32 item = 0; item < ItemsPerThread; ++item) {
     const u32 output = threadIdx.x * ItemsPerThread + item;
-    const bool valid_new = feedback != nullptr &&
-      (final_flags[item] & kMergeFlagNew) != 0 &&
-      output < beam_capacity &&
-      final_values[item] != kInvalidDeviceHandle &&
-      isfinite(final_distances[item]) && final_distances[item] != FLT_MAX;
-    if (valid_new) {
+    if (feedback != nullptr &&
+        (final_flags[item] & kMergeFlagNew) != 0 &&
+        output < beam_capacity &&
+        final_values[item] != kInvalidDeviceHandle &&
+        isfinite(final_distances[item]) && final_distances[item] != FLT_MAX) {
       thread_earliest_new = min(thread_earliest_new, output);
       ++thread_new_count;
     }
   }
   if (feedback != nullptr) {
     const u32 lane = threadIdx.x & 31u;
-    thread_earliest_new = warp_reduce_min_u32(thread_earliest_new);
-    thread_new_count = warp_reduce_sum_u32(thread_new_count);
+    thread_earliest_new = feedback_warp_min_u32(thread_earliest_new);
+    thread_new_count = feedback_warp_sum_u32(thread_new_count);
     if (lane == 0) {
       atomicMin(&earliest_new_output, thread_earliest_new);
       atomicAdd(&new_candidates_in_beam, thread_new_count);
@@ -572,8 +599,10 @@ __device__ void merge_approximate_compact_final(
     beam_handles[output] = final_values[item];
     beam_ids[output] = UINT32_MAX;
     beam_distances[output] = final_distances[item];
-    beam_expanded[output] =
-      (final_flags[item] & kMergeFlagExpanded) != 0 ? 1u : 0u;
+    beam_expanded[output] = feedback == nullptr
+      ? static_cast<u8>(
+          (final_flags[item] & kMergeFlagExpanded) != 0 ? 1u : 0u)
+      : final_flags[item];
   }
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -583,9 +612,18 @@ __device__ void merge_approximate_compact_final(
     while (valid < beam_capacity &&
            beam_handles[valid] != kInvalidDeviceHandle &&
            isfinite(beam_distances[valid]) && beam_distances[valid] != FLT_MAX) {
-      if (feedback != nullptr && beam_expanded[valid] == 0) {
-        ++unexpanded_total;
-        if (valid < earliest_new_output) ++old_unexpanded_before_new;
+      if (feedback != nullptr) {
+        const u32 flags = beam_expanded[valid];
+        const bool is_new = (flags & kMergeFlagNew) != 0;
+        const bool expanded = (flags & kMergeFlagExpanded) != 0;
+        if (!expanded) {
+          ++unexpanded_total;
+          if (valid < earliest_new_output && !is_new) {
+            ++old_unexpanded_before_new;
+          }
+        }
+        beam_expanded[valid] =
+          expanded ? static_cast<u8>(1) : static_cast<u8>(0);
       }
       ++valid;
     }
@@ -685,6 +723,388 @@ __device__ void merge_approximate_compact(
   }
 }
 
+__device__ __forceinline__ bool stable_run_item_valid(
+    u64 handle, f32 distance) {
+  return handle != kInvalidDeviceHandle && isfinite(distance) &&
+    distance != FLT_MAX;
+}
+
+__device__ __forceinline__ bool stable_run_head_precedes(
+    f32 lhs_distance, u32 lhs_run, f32 rhs_distance, u32 rhs_run) {
+  return lhs_distance < rhs_distance ||
+    (lhs_distance == rhs_distance && lhs_run < rhs_run);
+}
+
+// Return how many items from A occur in the first `diagonal` outputs of a
+// stable merge.  A wins an equal-distance tie, matching the concatenated input
+// order used by CUB's stable radix sort.  BlockRadixSort also treats -0/+0 as
+// equal, so the boundary deliberately uses floating-point comparisons rather
+// than comparing transformed key bits.
+__device__ __forceinline__ u32 stable_merge_a_corank(
+    u32 diagonal, const f32* a_distances, u32 a_count,
+    const f32* b_distances, u32 b_count) {
+  u32 low = diagonal > b_count ? diagonal - b_count : 0u;
+  u32 high = min(diagonal, a_count);
+  while (low <= high) {
+    const u32 a = low + ((high - low) >> 1);
+    const u32 b = diagonal - a;
+    if (a != 0 && b < b_count &&
+        b_distances[b] < a_distances[a - 1]) {
+      high = a - 1;
+      continue;
+    }
+    if (b != 0 && a < a_count &&
+        !(b_distances[b - 1] < a_distances[a])) {
+      low = a + 1;
+      continue;
+    }
+    return a;
+  }
+  return min(low, a_count);
+}
+
+// Sort one contiguous candidate input run with the same stable, distance-only
+// radix ordering as the legacy combined merge.  Only the first beam_capacity
+// entries can contribute to the global top-k: every discarded item already
+// has beam_capacity entries no worse than it in this run.
+template <class BlockSort, u32 ItemsPerThread>
+__device__ __noinline__ void stable_sort_candidate_run(
+    const u64* candidate_handles, const f32* candidate_distances,
+    u32 candidate_count, u32 input_offset,
+    u64* scratch_handles, u32* scratch_flags, f32* scratch_distances,
+    u32 output_offset, u32 beam_capacity,
+    typename BlockSort::TempStorage& radix_storage,
+    BeamMergeCycleBreakdown* cycle_breakdown,
+    u64* phase_started) {
+  f32 local_distances[ItemsPerThread];
+  u64 local_values[ItemsPerThread];
+  for (u32 item = 0; item < ItemsPerThread; ++item) {
+    const u32 index =
+      input_offset + threadIdx.x * ItemsPerThread + item;
+    u64 handle = kInvalidDeviceHandle;
+    f32 distance = FLT_MAX;
+    if (index < candidate_count) {
+      handle = candidate_handles[index];
+      distance = candidate_distances[index];
+    }
+    if (handle == kInvalidDeviceHandle || !isfinite(distance)) {
+      handle = kInvalidDeviceHandle;
+      distance = FLT_MAX;
+    }
+    local_distances[item] = distance;
+    local_values[item] = handle;
+  }
+  if (threadIdx.x == 0 && cycle_breakdown != nullptr) {
+    const u64 now = clock64();
+    cycle_breakdown->prepare += now - *phase_started;
+    *phase_started = now;
+  }
+  BlockSort(radix_storage).Sort(local_distances, local_values);
+  if (threadIdx.x == 0 && cycle_breakdown != nullptr) {
+    const u64 now = clock64();
+    cycle_breakdown->sort += now - *phase_started;
+    *phase_started = now;
+  }
+  for (u32 item = 0; item < ItemsPerThread; ++item) {
+    const u32 output = threadIdx.x * ItemsPerThread + item;
+    if (output >= beam_capacity) continue;
+    const u32 destination = output_offset + output;
+    scratch_handles[destination] = local_values[item];
+    scratch_distances[destination] = local_distances[item];
+    scratch_flags[destination] =
+      stable_run_item_valid(local_values[item], local_distances[item])
+        ? kMergeFlagNew : 0u;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0 && cycle_breakdown != nullptr) {
+    const u64 now = clock64();
+    cycle_breakdown->materialize += now - *phase_started;
+    *phase_started = now;
+  }
+}
+
+__device__ void clear_stable_candidate_run(
+    u64* scratch_handles, u32* scratch_flags, f32* scratch_distances,
+    u32 output_offset, u32 beam_capacity,
+    BeamMergeCycleBreakdown* cycle_breakdown, u64* phase_started) {
+  for (u32 index = threadIdx.x; index < beam_capacity;
+       index += blockDim.x) {
+    const u32 destination = output_offset + index;
+    scratch_handles[destination] = kInvalidDeviceHandle;
+    scratch_flags[destination] = 0;
+    scratch_distances[destination] = FLT_MAX;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0 && cycle_breakdown != nullptr) {
+    const u64 now = clock64();
+    cycle_breakdown->materialize += now - *phase_started;
+    *phase_started = now;
+  }
+}
+
+// Materialize the exact top-k of three individually stable runs:
+//   old Beam, candidate pass 0, candidate pass 1.
+// The old run wins equal-distance ties, followed by candidate input order.
+__device__ __noinline__ void materialize_stable_candidate_runs(
+    u64* beam_handles, u32* beam_ids, f32* beam_distances,
+    u8* beam_expanded, u32& beam_count, u32 beam_capacity,
+    u32 existing_count, const u64* origin_handles,
+    const u8* origin_expanded, u32 origin_count,
+    u64* scratch_handles, u32* scratch_flags,
+    f32* scratch_distances, u32 candidate_run_count,
+    CandidateWorkspaceArrays& output, u32 feedback_cap,
+    FeedbackHorizonResult* feedback, bool finalize_feedback = true) {
+  // Classify both sorted candidate prefixes while the authoritative old Beam
+  // is still intact.  Production candidates are disjoint from the old Beam
+  // through visited, but direct merge callers historically allow duplicates:
+  // a duplicate inherits the first old entry's expanded bit and is not new.
+  const u32 candidate_slots = candidate_run_count * beam_capacity;
+  for (u32 index = threadIdx.x; index < candidate_slots;
+       index += blockDim.x) {
+    const u64 handle = scratch_handles[index];
+    const f32 distance = scratch_distances[index];
+    u32 flags = stable_run_item_valid(handle, distance)
+      ? kMergeFlagNew : 0u;
+    if (flags != 0) {
+      for (u32 prior = 0; prior < origin_count; ++prior) {
+        if (origin_handles[prior] != handle) continue;
+        flags = (origin_expanded[prior] & kMergeFlagExpanded) != 0
+          ? kMergeFlagExpanded : 0u;
+        break;
+      }
+    }
+    scratch_flags[index] = flags;
+  }
+  __syncthreads();
+
+  // Stage 1: exact stable top-K of old Beam and candidate run 0.  One thread
+  // owns each output rank (or a small stride for K=256/128-thread CTAs), using
+  // co-rank to avoid both a block-wide second sort and a serial k-way merge.
+  for (u32 index = threadIdx.x; index < beam_capacity;
+       index += blockDim.x) {
+    const u32 old_index = stable_merge_a_corank(
+      index, beam_distances, existing_count,
+      scratch_distances, beam_capacity);
+    const u32 candidate_index = index - old_index;
+    const bool take_old =
+      old_index < existing_count &&
+      (candidate_index >= beam_capacity ||
+       !(scratch_distances[candidate_index] <
+         beam_distances[old_index]));
+    if (take_old) {
+      output.handles[index] = beam_handles[old_index];
+      output.distances[index] = beam_distances[old_index];
+      output.expanded[index] = beam_expanded[old_index];
+    } else {
+      output.handles[index] = scratch_handles[candidate_index];
+      output.distances[index] = scratch_distances[candidate_index];
+      output.expanded[index] =
+        static_cast<u8>(scratch_flags[candidate_index]);
+    }
+    output.ids[index] = UINT32_MAX;
+  }
+  __syncthreads();
+
+  // Stage 2: merge the stable (old, run0) prefix with run1.  The intermediate
+  // run wins equal keys, preserving the global old < run0 < run1 order.
+  const u32 second_count =
+    candidate_run_count > 1 ? beam_capacity : 0u;
+  for (u32 index = threadIdx.x; index < beam_capacity;
+       index += blockDim.x) {
+    const u32 intermediate_index = stable_merge_a_corank(
+      index, output.distances, beam_capacity,
+      scratch_distances + beam_capacity, second_count);
+    const u32 candidate_index = index - intermediate_index;
+    const bool take_intermediate =
+      intermediate_index < beam_capacity &&
+      (candidate_index >= second_count ||
+       !(scratch_distances[beam_capacity + candidate_index] <
+         output.distances[intermediate_index]));
+    if (take_intermediate) {
+      beam_handles[index] = output.handles[intermediate_index];
+      beam_distances[index] = output.distances[intermediate_index];
+      beam_expanded[index] = output.expanded[intermediate_index];
+    } else {
+      const u32 source = beam_capacity + candidate_index;
+      beam_handles[index] = scratch_handles[source];
+      beam_distances[index] = scratch_distances[source];
+      beam_expanded[index] = static_cast<u8>(scratch_flags[source]);
+    }
+    beam_ids[index] = UINT32_MAX;
+  }
+  __syncthreads();
+
+  // Fuse Feedback Horizon bookkeeping into the existing valid-prefix scan.
+  // Only the expanded bit is retained in the authoritative Beam afterwards.
+  if (threadIdx.x == 0) {
+    u32 valid = 0;
+    u32 earliest_new_output = UINT32_MAX;
+    u32 old_unexpanded_before_new = 0;
+    u32 unexpanded_total = 0;
+    u32 new_candidates_in_beam = 0;
+    while (valid < beam_capacity &&
+           stable_run_item_valid(
+             beam_handles[valid], beam_distances[valid])) {
+      const u32 flags = beam_expanded[valid];
+      const bool is_new = (flags & kMergeFlagNew) != 0;
+      const bool expanded = (flags & kMergeFlagExpanded) != 0;
+      if (is_new) {
+        earliest_new_output = min(earliest_new_output, valid);
+        ++new_candidates_in_beam;
+      }
+      if (!expanded) {
+        ++unexpanded_total;
+        if (valid < earliest_new_output && !is_new) {
+          ++old_unexpanded_before_new;
+        }
+      }
+      ++valid;
+    }
+    beam_count = valid;
+    if (finalize_feedback) {
+      finish_feedback_horizon(
+        valid, feedback_cap, earliest_new_output,
+        old_unexpanded_before_new, unexpanded_total,
+        new_candidates_in_beam, feedback);
+    }
+  }
+  __syncthreads();
+  if (finalize_feedback) {
+    for (u32 index = threadIdx.x; index < beam_capacity;
+         index += blockDim.x) {
+      beam_expanded[index] = static_cast<u8>(
+        (beam_expanded[index] & kMergeFlagExpanded) != 0 ? 1u : 0u);
+    }
+  }
+  __syncthreads();
+}
+
+__device__ __noinline__ void merge_approximate_stable_runs(
+    u64* candidate_handles, f32* candidate_distances, u32 candidate_count,
+    u64* beam_handles, u32* beam_ids, f32* beam_distances,
+    u8* beam_expanded, u32& beam_count, u32 beam_capacity,
+    u64* scratch_handles, u32* scratch_flags, f32* scratch_distances,
+    CandidateWorkspace& workspace, u32 feedback_cap = 0,
+    FeedbackHorizonResult* feedback = nullptr,
+    BeamMergeCycleBreakdown* cycle_breakdown = nullptr) {
+  __shared__ u64 stable_phase_started;
+  const u32 existing_count = beam_count;
+  if (threadIdx.x == 0 && cycle_breakdown != nullptr) {
+    *cycle_breakdown = {};
+    stable_phase_started = clock64();
+  }
+  __syncthreads();
+
+  if (blockDim.x == kApproximateSortThreadsWide) {
+    stable_sort_candidate_run<ApproximateBlockSortWideRun,
+                              kApproximateSortItemsWideRun>(
+      candidate_handles, candidate_distances, candidate_count, 0,
+      scratch_handles, scratch_flags, scratch_distances, 0, beam_capacity,
+      workspace.sort.radix_sort_wide_run, cycle_breakdown,
+      &stable_phase_started);
+    if (candidate_count > kApproximateSortCapacityCompactPass) {
+      stable_sort_candidate_run<ApproximateBlockSortWideRun,
+                                kApproximateSortItemsWideRun>(
+        candidate_handles, candidate_distances, candidate_count,
+        kApproximateSortCapacityCompactPass,
+        scratch_handles, scratch_flags, scratch_distances, beam_capacity,
+        beam_capacity, workspace.sort.radix_sort_wide_run,
+        cycle_breakdown, &stable_phase_started);
+    } else {
+      clear_stable_candidate_run(
+        scratch_handles, scratch_flags, scratch_distances,
+        beam_capacity, beam_capacity, cycle_breakdown,
+        &stable_phase_started);
+    }
+    materialize_stable_candidate_runs(
+      beam_handles, beam_ids, beam_distances, beam_expanded,
+      beam_count, beam_capacity, existing_count,
+      beam_handles, beam_expanded, existing_count,
+      scratch_handles, scratch_flags, scratch_distances, 2u,
+      workspace.arrays, feedback_cap, feedback, true);
+  } else if (blockDim.x == kApproximateSortThreadsCompact) {
+    // Four 512-item sorts keep the compact CTA's sort helper below the
+    // register footprint that would otherwise reduce resident query CTAs.
+    // Preserve the original Beam metadata in the unused half of the existing
+    // 2*K workspace, then fold two candidate runs at a time.
+    for (u32 index = threadIdx.x; index < existing_count;
+         index += blockDim.x) {
+      workspace.arrays.handles[beam_capacity + index] =
+        beam_handles[index];
+      workspace.arrays.expanded[beam_capacity + index] =
+        beam_expanded[index];
+    }
+    __syncthreads();
+    constexpr u32 compact_run_capacity =
+      kApproximateSortThreadsCompact *
+      kApproximateSortItemsCompactFinal256;
+    for (u32 pass = 0; pass < 2; ++pass) {
+      const u32 input_offset = pass * compact_run_capacity;
+      const u32 output_offset = pass * beam_capacity;
+      if (candidate_count > input_offset) {
+        stable_sort_candidate_run<ApproximateBlockSortCompactFinal256,
+                                  kApproximateSortItemsCompactFinal256>(
+          candidate_handles, candidate_distances, candidate_count,
+          input_offset, scratch_handles, scratch_flags,
+          scratch_distances, output_offset, beam_capacity,
+          workspace.sort.radix_sort_compact_final_256,
+          cycle_breakdown, &stable_phase_started);
+      } else {
+        clear_stable_candidate_run(
+          scratch_handles, scratch_flags, scratch_distances,
+          output_offset, beam_capacity, cycle_breakdown,
+          &stable_phase_started);
+      }
+    }
+    materialize_stable_candidate_runs(
+      beam_handles, beam_ids, beam_distances, beam_expanded,
+      beam_count, beam_capacity, existing_count,
+      workspace.arrays.handles + beam_capacity,
+      workspace.arrays.expanded + beam_capacity, existing_count,
+      scratch_handles, scratch_flags, scratch_distances, 2u,
+      workspace.arrays, feedback_cap, nullptr, false);
+    if (threadIdx.x == 0 && cycle_breakdown != nullptr) {
+      const u64 now = clock64();
+      cycle_breakdown->materialize += now - stable_phase_started;
+      stable_phase_started = now;
+    }
+    __syncthreads();
+    for (u32 pass = 2; pass < 4; ++pass) {
+      const u32 input_offset = pass * compact_run_capacity;
+      const u32 output_offset = (pass - 2u) * beam_capacity;
+      if (candidate_count > input_offset) {
+        stable_sort_candidate_run<ApproximateBlockSortCompactFinal256,
+                                  kApproximateSortItemsCompactFinal256>(
+          candidate_handles, candidate_distances, candidate_count,
+          input_offset, scratch_handles, scratch_flags,
+          scratch_distances, output_offset, beam_capacity,
+          workspace.sort.radix_sort_compact_final_256,
+          cycle_breakdown, &stable_phase_started);
+      } else {
+        clear_stable_candidate_run(
+          scratch_handles, scratch_flags, scratch_distances,
+          output_offset, beam_capacity, cycle_breakdown,
+          &stable_phase_started);
+      }
+    }
+    materialize_stable_candidate_runs(
+      beam_handles, beam_ids, beam_distances, beam_expanded,
+      beam_count, beam_capacity, beam_count,
+      workspace.arrays.handles + beam_capacity,
+      workspace.arrays.expanded + beam_capacity, existing_count,
+      scratch_handles, scratch_flags, scratch_distances, 2u,
+      workspace.arrays, feedback_cap, feedback, true);
+  } else {
+    if (threadIdx.x == 0) beam_count = 0;
+    __syncthreads();
+    return;
+  }
+  if (threadIdx.x == 0 && cycle_breakdown != nullptr) {
+    cycle_breakdown->materialize += clock64() - stable_phase_started;
+  }
+  __syncthreads();
+}
+
 __device__ void merge_approximate_into_beam(
     u64* candidate_handles, f32* candidate_distances, u32 candidate_count,
     u64* beam_handles, u32* beam_ids, f32* beam_distances,
@@ -693,13 +1113,24 @@ __device__ void merge_approximate_into_beam(
     u8* merge_expanded, u64* compact_scratch_handles,
     u32* compact_scratch_expanded, f32* compact_scratch_distances,
     CandidateWorkspace& workspace, u32 feedback_cap = 0,
-    FeedbackHorizonResult* feedback = nullptr) {
+    FeedbackHorizonResult* feedback = nullptr,
+    BeamMergePolicy policy = BeamMergePolicy::legacy,
+    BeamMergeCycleBreakdown* cycle_breakdown = nullptr) {
   const u32 existing_count = beam_count;
   const u32 merge_count = existing_count + candidate_count;
   if (blockDim.x != kApproximateSortThreadsWide &&
       blockDim.x != kApproximateSortThreadsCompact) {
     if (threadIdx.x == 0) beam_count = 0;
     __syncthreads();
+    return;
+  }
+  if (policy == BeamMergePolicy::stable_run) {
+    merge_approximate_stable_runs(
+      candidate_handles, candidate_distances, candidate_count,
+      beam_handles, beam_ids, beam_distances, beam_expanded,
+      beam_count, beam_capacity, compact_scratch_handles,
+      compact_scratch_expanded, compact_scratch_distances,
+      workspace, feedback_cap, feedback, cycle_breakdown);
     return;
   }
   if (blockDim.x == kApproximateSortThreadsWide) {

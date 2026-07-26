@@ -47,6 +47,7 @@ public:
   u32 gpu_bootstrap_windows{2};
   u32 gpu_graph_prefetch_depth{32};
   str gpu_query_expansion_policy{"fixed"};
+  str gpu_query_beam_merge_policy{"legacy"};
   str query_rdma_trace_mode{"off"};
   u32 query_rdma_trace_sample_rate{1000};
   filepath_t query_rdma_trace_output{};
@@ -104,6 +105,8 @@ public:
     vector_data_type = normalize_mode(vector_data_type);
     gpu_query_expansion_policy =
       normalize_mode(gpu_query_expansion_policy);
+    gpu_query_beam_merge_policy =
+      normalize_mode(gpu_query_beam_merge_policy);
     query_rdma_trace_mode = normalize_mode(query_rdma_trace_mode);
     validate(argv);
     operator<<(std::cerr, *this);
@@ -187,7 +190,12 @@ private:
       ("gpu-query-expansion-policy",
        po::value<str>(&gpu_query_expansion_policy)
          ->default_value(gpu_query_expansion_policy),
-       "GPU graph expansion policy: fixed or feedback-hunger.")
+       "GPU graph expansion policy: fixed or feedback-horizon-hunger "
+       "(feedback-hunger is kept as a compatibility alias).")
+      ("gpu-query-beam-merge-policy",
+       po::value<str>(&gpu_query_beam_merge_policy)
+         ->default_value(gpu_query_beam_merge_policy),
+       "GPU query Beam merge policy: legacy or stable-run.")
       ("query-rdma-trace-mode",
        po::value<str>(&query_rdma_trace_mode)->default_value(query_rdma_trace_mode),
        "Shard-batch RDMA trace mode: off, sampled, or full.")
@@ -323,8 +331,14 @@ private:
       fail("--query-rdma-trace-output is required when tracing is enabled");
     }
     if (gpu_query_expansion_policy != "fixed" &&
-        gpu_query_expansion_policy != "feedback-hunger") {
-      fail("--gpu-query-expansion-policy must be fixed or feedback-hunger");
+        gpu_query_expansion_policy != "feedback-hunger" &&
+        gpu_query_expansion_policy != "feedback-horizon-hunger") {
+      fail("--gpu-query-expansion-policy must be fixed, feedback-hunger, "
+           "or feedback-horizon-hunger");
+    }
+    if (gpu_query_beam_merge_policy != "legacy" &&
+        gpu_query_beam_merge_policy != "stable-run") {
+      fail("--gpu-query-beam-merge-policy must be legacy or stable-run");
     }
     if (gpu_query_slots == 0 || gpu_query_slots > 4096 ||
         gpu_memory_limit_gb == 0 ||
@@ -411,6 +425,8 @@ public:
              << config.gpu_max_expansions << '\n';
       output << std::setw(width) << "GPU expansion policy: "
              << config.gpu_query_expansion_policy << '\n';
+      output << std::setw(width) << "GPU Beam merge policy: "
+             << config.gpu_query_beam_merge_policy << '\n';
       output << std::setw(width) << "query RDMA trace mode/rate: "
              << config.query_rdma_trace_mode << "/"
              << config.query_rdma_trace_sample_rate << '\n';

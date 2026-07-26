@@ -44,6 +44,12 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
     << ",\"pq_score_cycles\":" << completion.pq_score_cycles
     << ",\"visited_cycles\":" << completion.visited_cycles
     << ",\"beam_merge_cycles\":" << completion.beam_merge_cycles
+    << ",\"beam_merge_prepare_cycles\":"
+    << completion.beam_merge_prepare_cycles
+    << ",\"beam_merge_sort_cycles\":"
+    << completion.beam_merge_sort_cycles
+    << ",\"beam_merge_materialize_cycles\":"
+    << completion.beam_merge_materialize_cycles
     << ",\"expansion_policy\":" << completion.expansion_policy
     << ",\"sum_selected_parents\":" << completion.sum_selected_parents
     << ",\"sum_feedback_horizon\":" << completion.sum_feedback_horizon
@@ -57,6 +63,17 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
     << completion.minimum_feedback_horizon
     << ",\"maximum_feedback_horizon\":"
     << completion.maximum_feedback_horizon
+    << ",\"extra_parent_count\":" << completion.extra_parent_count
+    << ",\"qp_lease_claim_count\":" << completion.qp_lease_claim_count
+    << ",\"qp_lease_reject_count\":" << completion.qp_lease_reject_count
+    << ",\"qp_lease_rollback_count\":"
+    << completion.qp_lease_rollback_count
+    << ",\"compute_allowance_tile_sum\":"
+    << completion.compute_allowance_tile_sum
+    << ",\"marginal_probe_pass_count\":"
+    << completion.marginal_probe_pass_count
+    << ",\"marginal_probe_fail_count\":"
+    << completion.marginal_probe_fail_count
     << ",\"exact_cycles\":" << completion.exact_cycles
     << ",\"dynamic_code_cycles\":" << completion.dynamic_code_cycles
     << "}\n";
@@ -396,6 +413,15 @@ void PersistentSearchEngine::Impl::completion_loop() {
       phase_ns(completion.visited_cycles), std::memory_order_relaxed);
     engine.telemetry_.gpu_beam_merge_ns.fetch_add(
       phase_ns(completion.beam_merge_cycles), std::memory_order_relaxed);
+    engine.telemetry_.gpu_beam_merge_prepare_ns.fetch_add(
+      phase_ns(completion.beam_merge_prepare_cycles),
+      std::memory_order_relaxed);
+    engine.telemetry_.gpu_beam_merge_sort_ns.fetch_add(
+      phase_ns(completion.beam_merge_sort_cycles),
+      std::memory_order_relaxed);
+    engine.telemetry_.gpu_beam_merge_materialize_ns.fetch_add(
+      phase_ns(completion.beam_merge_materialize_cycles),
+      std::memory_order_relaxed);
     if (completion.expansion_policy ==
         static_cast<u32>(QueryExpansionPolicy::feedback_hunger)) {
       engine.telemetry_.feedback_hunger_queries.fetch_add(
@@ -407,6 +433,20 @@ void PersistentSearchEngine::Impl::completion_loop() {
       completion.sum_feedback_horizon, std::memory_order_relaxed);
     engine.telemetry_.expansion_sum_hardware_credit_tiles.fetch_add(
       completion.sum_hardware_credit_tiles, std::memory_order_relaxed);
+    engine.telemetry_.expansion_extra_parents.fetch_add(
+      completion.extra_parent_count, std::memory_order_relaxed);
+    engine.telemetry_.expansion_qp_lease_claims.fetch_add(
+      completion.qp_lease_claim_count, std::memory_order_relaxed);
+    engine.telemetry_.expansion_qp_lease_rejects.fetch_add(
+      completion.qp_lease_reject_count, std::memory_order_relaxed);
+    engine.telemetry_.expansion_qp_lease_rollbacks.fetch_add(
+      completion.qp_lease_rollback_count, std::memory_order_relaxed);
+    engine.telemetry_.expansion_compute_allowance_tiles.fetch_add(
+      completion.compute_allowance_tile_sum, std::memory_order_relaxed);
+    engine.telemetry_.expansion_marginal_probe_passes.fetch_add(
+      completion.marginal_probe_pass_count, std::memory_order_relaxed);
+    engine.telemetry_.expansion_marginal_probe_failures.fetch_add(
+      completion.marginal_probe_fail_count, std::memory_order_relaxed);
     if (completion.graph_rounds != 0) {
       if (completion.minimum_selected_batch <
           engine.telemetry_.expansion_minimum_selected_batch.load(

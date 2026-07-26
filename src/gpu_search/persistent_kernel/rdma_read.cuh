@@ -184,6 +184,11 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
           device_ring_is_full(params.direct_batch_queues[qp_index])) {
         expansion_pressure_clear_credit(
           params.expansion_pressure, true, false);
+        if (params.expansion_qp_leases != nullptr &&
+            qp_index < params.expansion_qp_lease_count) {
+          qp_expansion_lease_revoke(
+            params.expansion_qp_leases + qp_index);
+        }
         backpressure_recorded = true;
       }
       if (*reinterpret_cast<const volatile u32*>(params.stop) != 0) {
@@ -865,6 +870,7 @@ __device__ bool fetch_graph_records_batch(
     u32* remote_reads,
     u32* remote_batches,
     u32* graph_read_retries,
+    u32* issued_qps,
     u32 search_round,
     bool trace_enabled,
     GraphFetchCycleBreakdown* cycle_breakdown) {
@@ -891,6 +897,7 @@ __device__ bool fetch_graph_records_batch(
   }
   for (u32 shard = threadIdx.x; shard < params.num_shards; shard += blockDim.x) {
     shard_status[shard] = 0;
+    if (issued_qps != nullptr) issued_qps[shard] = UINT32_MAX;
   }
   __syncthreads();
 
@@ -1010,6 +1017,12 @@ __device__ bool fetch_graph_records_batch(
           (descriptor.query_slot + shard) % params.direct_qps_per_node,
           request_local_iovas, owner_completion, true, nullptr,
           owner_completion_timestamp_ns);
+      if (issued_qps != nullptr &&
+          shard_status[shard] == -EINPROGRESS) {
+        issued_qps[shard] =
+          ((descriptor.query_slot + shard) % params.direct_qps_per_node) *
+            params.direct_region_count + shard;
+      }
     }
     __syncthreads();
     if (threadIdx.x == 0 && cycle_breakdown != nullptr) {

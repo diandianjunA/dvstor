@@ -83,6 +83,10 @@ void test_recall_and_report_formatting() {
     results, truth.data(), truth.size()) - 0.5) < 1e-9);
 
   gpu_search::TelemetrySnapshot telemetry;
+  telemetry.queries_completed = 2;
+  telemetry.gpu_beam_merge_prepare_ns = 4'000;
+  telemetry.gpu_beam_merge_sort_ns = 6'000;
+  telemetry.gpu_beam_merge_materialize_ns = 8'000;
   telemetry.graph_read_retries = 11;
   telemetry.centroid_route_publications = 7;
   telemetry.centroid_route_shard_updates = 9;
@@ -103,6 +107,12 @@ void test_recall_and_report_formatting() {
   telemetry.dynamic_code_cache_capacity = 256;
   const auto telemetry_json = tools::breakdown_benchmark::telemetry_to_json(telemetry);
   assert(telemetry_json.at("graph_read_retries") == 11);
+  assert(telemetry_json.at("gpu_beam_merge_prepare_ns") == 4'000);
+  assert(telemetry_json.at("gpu_beam_merge_sort_ns") == 6'000);
+  assert(telemetry_json.at("gpu_beam_merge_materialize_ns") == 8'000);
+  assert(telemetry_json.at("average_gpu_beam_merge_prepare_us") == 2.0);
+  assert(telemetry_json.at("average_gpu_beam_merge_sort_us") == 3.0);
+  assert(telemetry_json.at("average_gpu_beam_merge_materialize_us") == 4.0);
   assert(telemetry_json.at("centroid_route_publications") == 7);
   assert(telemetry_json.at("centroid_route_shard_updates") == 9);
   assert(telemetry_json.at("centroid_route_live_entries") == 13);
@@ -128,6 +138,7 @@ void test_recall_and_report_formatting() {
   nlohmann::json root;
   root["meta"] = {
     {"workload", "query"},
+    {"gpu_query_beam_merge_policy", "stable-run"},
     {"recall_query", {{"source", "recall.u8bin"}, {"rows", 1000}}},
     {"performance_query", {
       {"source", "performance.u8bin"},
@@ -139,6 +150,7 @@ void test_recall_and_report_formatting() {
     }},
   };
   root["throughput"] = {{"duration_seconds", 0.0}};
+  root["gpu_persistent"] = telemetry_json;
   root["stage2"] = {
     {"requested_logs", 1},
     {"failures", 0},
@@ -155,6 +167,11 @@ void test_recall_and_report_formatting() {
   assert(formatted.text.find("query breakdown") != std::string::npos);
   assert(formatted.text.find("failures (hard): 0") != std::string::npos);
   assert(formatted.text.find("peer_reverse_retry_attempts: 7") !=
+         std::string::npos);
+  assert(formatted.text.find("GPU Beam merge policy: stable-run") !=
+         std::string::npos);
+  assert(formatted.text.find(
+           "GPU Beam merge total/prepare/sort/materialize us:") !=
          std::string::npos);
 }
 

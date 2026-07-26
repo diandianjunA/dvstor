@@ -26,12 +26,19 @@ inline constexpr u32 kApproximateSortThreadsWide = 256;
 inline constexpr u32 kApproximateSortItemsWide =
   kPersistentMaxMergeCandidates / kApproximateSortThreadsWide;
 inline constexpr u32 kApproximateSortThreadsCompact = 128;
+inline constexpr u32 kApproximateSortItemsWideRun = 4;
 inline constexpr u32 kApproximateSortItemsCompactPass = 8;
 inline constexpr u32 kApproximateSortItemsCompactFinal = 2;
 inline constexpr u32 kApproximateSortItemsCompactFinal256 = 4;
+inline constexpr u32 kApproximateSortCapacityWide =
+  kApproximateSortThreadsWide * kApproximateSortItemsWide;
+inline constexpr u32 kApproximateSortCapacityCompactPass =
+  kApproximateSortThreadsCompact * kApproximateSortItemsCompactPass;
 
 using ApproximateBlockSortWide = cub::BlockRadixSort<
   f32, kApproximateSortThreadsWide, kApproximateSortItemsWide, u64>;
+using ApproximateBlockSortWideRun = cub::BlockRadixSort<
+  f32, kApproximateSortThreadsWide, kApproximateSortItemsWideRun, u64>;
 using ApproximateBlockSortCompactPass = cub::BlockRadixSort<
   f32, kApproximateSortThreadsCompact, kApproximateSortItemsCompactPass, u64>;
 using ApproximateBlockSortCompactFinal = cub::BlockRadixSort<
@@ -45,5 +52,14 @@ using ApproximateBlockSortCompactFinal256 = cub::BlockRadixSort<
 // (and cannot reduce the resident beam-128 CTA count).
 static_assert(sizeof(ApproximateBlockSortCompactFinal256::TempStorage) <=
               sizeof(ApproximateBlockSortCompactPass::TempStorage));
+static_assert(sizeof(ApproximateBlockSortWideRun::TempStorage) <=
+              sizeof(ApproximateBlockSortWide::TempStorage));
+static_assert(kApproximateSortThreadsWide *
+                kApproximateSortItemsWideRun ==
+              kApproximateSortCapacityCompactPass);
+static_assert(kApproximateSortCapacityWide ==
+              kPersistentMaxMergeCandidates);
+static_assert(kApproximateSortCapacityCompactPass * 2 ==
+              kPersistentMaxMergeCandidates);
 
 }  // namespace gpu_search::persistent_kernel_detail

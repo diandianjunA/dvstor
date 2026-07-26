@@ -237,6 +237,19 @@ if (TARGET dvstor_gpu_kernels)
         TIMEOUT 15
         SKIP_REGULAR_EXPRESSION "^SKIP:")
 
+    add_executable(gpu_stable_run_merge_microbench
+        gpu_stable_run_merge_microbench.cu)
+    dvstor_target_common_includes(gpu_stable_run_merge_microbench)
+    target_link_libraries(gpu_stable_run_merge_microbench PRIVATE CUDA::cudart)
+    target_compile_options(gpu_stable_run_merge_microbench PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+    add_test(NAME gpu_stable_run_merge_microbench
+        COMMAND gpu_stable_run_merge_microbench)
+    set_tests_properties(gpu_stable_run_merge_microbench PROPERTIES
+        TIMEOUT 30
+        SKIP_REGULAR_EXPRESSION "^SKIP:")
+
     add_executable(gpu_expansion_pressure_test
         gpu_expansion_pressure_test.cu)
     dvstor_target_common_includes(gpu_expansion_pressure_test)

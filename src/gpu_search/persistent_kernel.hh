@@ -205,6 +205,11 @@ enum class QueryExpansionPolicy : u32 {
   feedback_hunger = 1,
 };
 
+enum class BeamMergePolicy : u32 {
+  legacy = 0,
+  stable_run = 1,
+};
+
 // Query/owner CTAs share the compact controller in the first cache line.
 // Diagnostic counters occupy the second cache line.
 struct alignas(64) ExpansionPressureState {
@@ -225,6 +230,57 @@ struct alignas(64) ExpansionPressureState {
 
 static_assert(sizeof(ExpansionPressureState) == 128);
 static_assert(alignof(ExpansionPressureState) == 64);
+
+// One-shot capacity advertised by one exclusive QP owner.  The high 32 bits
+// are an owner epoch and the low 32 bits are unclaimed read-WQE units.  A
+// query consumes units with one CAS; an owner busy transition advances the
+// epoch and revokes every unclaimed unit.  Unlike the old global credit, a
+// unit can therefore be consumed by only one query round and only by work
+// routed to this QP.
+struct alignas(64) QpExpansionLeaseState {
+  unsigned long long control{};
+  unsigned long long offers{};
+  unsigned long long claims{};
+  unsigned long long rejects{};
+  unsigned long long returns{};
+  unsigned long long revocations{};
+  unsigned long long stale_returns{};
+  unsigned long long reserved{};
+};
+
+static_assert(sizeof(QpExpansionLeaseState) == 64);
+static_assert(alignof(QpExpansionLeaseState) == 64);
+
+struct QpExpansionLeaseClaim {
+  u32 qp{};
+  u32 epoch{};
+  u32 wqes{};
+};
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr unsigned long long make_qp_expansion_lease_control(
+    u32 epoch, u32 available_wqes) {
+  return (static_cast<unsigned long long>(epoch) << 32) |
+    static_cast<unsigned long long>(available_wqes);
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr u32 qp_expansion_lease_epoch(
+    unsigned long long control) {
+  return static_cast<u32>(control >> 32);
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr u32 qp_expansion_lease_available(
+    unsigned long long control) {
+  return static_cast<u32>(control);
+}
 
 inline constexpr u32 kExpansionPressureFieldMask = 0xffffu;
 
@@ -383,6 +439,99 @@ __device__ __forceinline__ void expansion_pressure_clear_credit(
   }
   if (sq_defer) atomicAdd(&state->sq_defer_events, 1ULL);
 }
+
+__device__ __forceinline__ unsigned long long qp_expansion_lease_load(
+    const QpExpansionLeaseState* state) {
+  if (state == nullptr) return 0;
+  cuda::atomic_ref<unsigned long long, cuda::thread_scope_device> control(
+    const_cast<unsigned long long&>(state->control));
+  return control.load(cuda::memory_order_relaxed);
+}
+
+__device__ __forceinline__ bool qp_expansion_lease_publish(
+    QpExpansionLeaseState* state, u32 available_wqes) {
+  if (state == nullptr || available_wqes == 0) return false;
+  unsigned long long observed = qp_expansion_lease_load(state);
+  for (;;) {
+    if (qp_expansion_lease_available(observed) != 0) return false;
+    const unsigned long long desired = make_qp_expansion_lease_control(
+      qp_expansion_lease_epoch(observed) + 1u, available_wqes);
+    const unsigned long long prior =
+      atomicCAS(&state->control, observed, desired);
+    if (prior == observed) {
+      atomicAdd(&state->offers, 1ULL);
+      return true;
+    }
+    observed = prior;
+  }
+}
+
+__device__ __forceinline__ void qp_expansion_lease_revoke(
+    QpExpansionLeaseState* state) {
+  if (state == nullptr) return;
+  unsigned long long observed = qp_expansion_lease_load(state);
+  for (;;) {
+    const u32 available = qp_expansion_lease_available(observed);
+    if (available == 0) return;
+    const unsigned long long desired = make_qp_expansion_lease_control(
+      qp_expansion_lease_epoch(observed) + 1u, 0u);
+    const unsigned long long prior =
+      atomicCAS(&state->control, observed, desired);
+    if (prior == observed) {
+      return;
+    }
+    observed = prior;
+  }
+}
+
+__device__ __forceinline__ bool qp_expansion_lease_try_claim(
+    QpExpansionLeaseState* states, u32 state_count, u32 qp, u32 wqes,
+    QpExpansionLeaseClaim& claim) {
+  claim = {};
+  if (states == nullptr || qp >= state_count || wqes == 0) return false;
+  QpExpansionLeaseState& state = states[qp];
+  unsigned long long observed = qp_expansion_lease_load(&state);
+  for (;;) {
+    const u32 available = qp_expansion_lease_available(observed);
+    if (available < wqes) {
+      return false;
+    }
+    const u32 epoch = qp_expansion_lease_epoch(observed);
+    const unsigned long long desired = make_qp_expansion_lease_control(
+      epoch, available - wqes);
+    const unsigned long long prior =
+      atomicCAS(&state.control, observed, desired);
+    if (prior == observed) {
+      claim = {.qp = qp, .epoch = epoch, .wqes = wqes};
+      return true;
+    }
+    observed = prior;
+  }
+}
+
+__device__ __forceinline__ void qp_expansion_lease_return(
+    QpExpansionLeaseState* states, u32 state_count,
+    const QpExpansionLeaseClaim& claim) {
+  if (states == nullptr || claim.qp >= state_count || claim.wqes == 0) return;
+  QpExpansionLeaseState& state = states[claim.qp];
+  unsigned long long observed = qp_expansion_lease_load(&state);
+  for (;;) {
+    if (qp_expansion_lease_epoch(observed) != claim.epoch) {
+      return;
+    }
+    const u32 available = qp_expansion_lease_available(observed);
+    const u32 returned = available > UINT32_MAX - claim.wqes
+      ? UINT32_MAX : available + claim.wqes;
+    const unsigned long long desired = make_qp_expansion_lease_control(
+      claim.epoch, returned);
+    const unsigned long long prior =
+      atomicCAS(&state.control, observed, desired);
+    if (prior == observed) {
+      return;
+    }
+    observed = prior;
+  }
+}
 #endif
 
 struct PersistentKernelParams {
@@ -421,6 +570,7 @@ struct PersistentKernelParams {
   u32 max_expansions{};
   u32 prefetch_depth{};
   u32 query_expansion_policy{};
+  u32 beam_merge_policy{};
   u32 efficient_batch_cap{};
   u32 visited_capacity{};
   u32 query_slots{};
@@ -442,6 +592,8 @@ struct PersistentKernelParams {
   u32* direct_owner_phases{};
   DirectOwnerProgress* direct_owner_progress{};
   ExpansionPressureState* expansion_pressure{};
+  QpExpansionLeaseState* expansion_qp_leases{};
+  u32 expansion_qp_lease_count{};
   u8* direct_dump{};
   u32* direct_disabled{};
   i32* direct_error{};

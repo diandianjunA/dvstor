@@ -105,6 +105,22 @@ nlohmann::json telemetry_to_json(
     {"average_gpu_beam_merge_us", telemetry.queries_completed == 0 ? 0.0
       : static_cast<double>(telemetry.gpu_beam_merge_ns) /
           static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"gpu_beam_merge_prepare_ns", telemetry.gpu_beam_merge_prepare_ns},
+    {"gpu_beam_merge_sort_ns", telemetry.gpu_beam_merge_sort_ns},
+    {"gpu_beam_merge_materialize_ns",
+      telemetry.gpu_beam_merge_materialize_ns},
+    {"average_gpu_beam_merge_prepare_us",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_beam_merge_prepare_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_beam_merge_sort_us",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_beam_merge_sort_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_beam_merge_materialize_us",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_beam_merge_materialize_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
     {"feedback_hunger_queries", telemetry.feedback_hunger_queries},
     {"expansion_sum_selected_parents",
       telemetry.expansion_sum_selected_parents},
@@ -122,6 +138,17 @@ nlohmann::json telemetry_to_json(
         ? 0 : telemetry.expansion_minimum_feedback_horizon},
     {"expansion_maximum_feedback_horizon",
       telemetry.expansion_maximum_feedback_horizon},
+    {"expansion_extra_parents", telemetry.expansion_extra_parents},
+    {"expansion_qp_lease_claims", telemetry.expansion_qp_lease_claims},
+    {"expansion_qp_lease_rejects", telemetry.expansion_qp_lease_rejects},
+    {"expansion_qp_lease_rollbacks",
+      telemetry.expansion_qp_lease_rollbacks},
+    {"expansion_compute_allowance_tiles",
+      telemetry.expansion_compute_allowance_tiles},
+    {"expansion_marginal_probe_passes",
+      telemetry.expansion_marginal_probe_passes},
+    {"expansion_marginal_probe_failures",
+      telemetry.expansion_marginal_probe_failures},
     {"average_selected_batch",
       telemetry.graph_dependency_rounds == 0 ? 0.0
       : static_cast<double>(telemetry.expansion_sum_selected_parents) /
@@ -155,6 +182,20 @@ nlohmann::json telemetry_to_json(
       telemetry.expansion_pressure_ring_backpressure_events},
     {"expansion_pressure_sq_defer_events",
       telemetry.expansion_pressure_sq_defer_events},
+    {"expansion_qp_lease_available_wqes",
+      telemetry.expansion_qp_lease_available_wqes},
+    {"expansion_qp_lease_offers",
+      telemetry.expansion_qp_lease_offers},
+    {"expansion_qp_lease_claimed_wqes",
+      telemetry.expansion_qp_lease_claimed_wqes},
+    {"expansion_qp_lease_owner_rejects",
+      telemetry.expansion_qp_lease_owner_rejects},
+    {"expansion_qp_lease_returns",
+      telemetry.expansion_qp_lease_returns},
+    {"expansion_qp_lease_revocations",
+      telemetry.expansion_qp_lease_revocations},
+    {"expansion_qp_lease_stale_returns",
+      telemetry.expansion_qp_lease_stale_returns},
     {"average_gpu_other_us", telemetry.queries_completed == 0 ? 0.0
       : static_cast<double>(gpu_other_ns) /
           static_cast<double>(telemetry.queries_completed) / 1000.0},
@@ -478,6 +519,15 @@ FormattedReport format_report(const nlohmann::json& root,
            << gpu.value("average_gpu_score_us", 0.0) << "/"
            << gpu.value("average_gpu_beam_us", 0.0) << "/"
            << gpu.value("average_gpu_exact_us", 0.0) << '\n';
+    output << "  GPU Beam merge policy: "
+           << root["meta"].value(
+                "gpu_query_beam_merge_policy", "legacy") << '\n';
+    output << "  GPU Beam merge total/prepare/sort/materialize us: "
+           << gpu.value("average_gpu_beam_merge_us", 0.0) << "/"
+           << gpu.value("average_gpu_beam_merge_prepare_us", 0.0) << "/"
+           << gpu.value("average_gpu_beam_merge_sort_us", 0.0) << "/"
+           << gpu.value(
+                "average_gpu_beam_merge_materialize_us", 0.0) << '\n';
     output << "  dynamic PQ candidates/reads/bytes/incarnation_rejects: "
            << gpu.value("dynamic_code_candidates", 0ULL) << "/"
            << gpu.value("dynamic_code_reads", 0ULL) << "/"

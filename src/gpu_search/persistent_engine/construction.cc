@@ -236,8 +236,12 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   route_graph_bytes = centroid_route_bytes +
     shard_centroid_bytes;
   const u64 expansion_pressure_bytes =
-    config.gpu_query_expansion_policy == "feedback-hunger"
-      ? sizeof(ExpansionPressureState) : 0;
+    config.gpu_query_expansion_policy == "feedback-hunger" ||
+        config.gpu_query_expansion_policy == "feedback-horizon-hunger"
+      ? sizeof(ExpansionPressureState) +
+          static_cast<u64>(estimated_direct_queue_count) *
+            sizeof(QpExpansionLeaseState)
+      : 0;
   const u64 additional_scratch_bytes =
     dynamic_code_scratch_bytes + dynamic_code_arena_bytes +
     dynamic_request_scratch_bytes +
@@ -640,9 +644,12 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   const size_t selected_index =
     kernel_threads == kPersistentThreadCandidates[0] ? 0 : 1;
   persistent_kernel_occupancy = occupancies[selected_index];
-  if (config.gpu_query_expansion_policy == "feedback-hunger") {
+  if (config.gpu_query_expansion_policy == "feedback-hunger" ||
+      config.gpu_query_expansion_policy == "feedback-horizon-hunger") {
     device_allocate(d_expansion_pressure, 1,
                     "cudaMalloc(GPU expansion pressure state)");
+    device_allocate(d_expansion_qp_leases, direct_batch_queue_count,
+                    "cudaMalloc(GPU expansion QP leases)");
     const u32 expansion_tile = std::max(1u, kernel_threads / 32u);
     ExpansionPressureState initial_pressure{};
     initial_pressure.maximum_credit_tiles =
@@ -651,6 +658,11 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                  d_expansion_pressure, &initial_pressure,
                  sizeof(initial_pressure), cudaMemcpyHostToDevice),
                "cudaMemcpy(GPU expansion pressure state)");
+    check_cuda(cudaMemset(
+                 d_expansion_qp_leases, 0,
+                 static_cast<size_t>(direct_batch_queue_count) *
+                   sizeof(QpExpansionLeaseState)),
+               "cudaMemset(GPU expansion QP leases)");
   }
 
   kernel_params = PersistentKernelParams{
@@ -698,9 +710,14 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .max_expansions = config.gpu_max_expansions,
     .prefetch_depth = config.gpu_graph_prefetch_depth,
     .query_expansion_policy =
-      config.gpu_query_expansion_policy == "feedback-hunger"
+      config.gpu_query_expansion_policy == "feedback-hunger" ||
+          config.gpu_query_expansion_policy == "feedback-horizon-hunger"
         ? static_cast<u32>(QueryExpansionPolicy::feedback_hunger)
         : static_cast<u32>(QueryExpansionPolicy::fixed),
+    .beam_merge_policy =
+      config.gpu_query_beam_merge_policy == "stable-run"
+        ? static_cast<u32>(BeamMergePolicy::stable_run)
+        : static_cast<u32>(BeamMergePolicy::legacy),
     .efficient_batch_cap = std::min(
       kPersistentMaxPrefetch, score_chunk_capacity),
     .visited_capacity = visited_capacity,
@@ -723,6 +740,8 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .direct_owner_phases = d_direct_owner_phases,
     .direct_owner_progress = d_direct_owner_progress,
     .expansion_pressure = d_expansion_pressure,
+    .expansion_qp_leases = d_expansion_qp_leases,
+    .expansion_qp_lease_count = direct_batch_queue_count,
     .direct_dump = direct_view.dump,
     .direct_disabled = direct_disabled_device,
     .direct_error = direct_error_device,

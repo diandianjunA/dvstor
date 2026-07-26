@@ -108,6 +108,34 @@ void PersistentSearchEngine::Impl::augment_expansion_pressure_telemetry(
     expansion_pressure_baseline.ring_backpressure_events);
   snapshot.expansion_pressure_sq_defer_events = counter_delta(
     current.sq_defer_events, expansion_pressure_baseline.sq_defer_events);
+  if (d_expansion_qp_leases != nullptr && direct_batch_queue_count != 0) {
+    std::vector<QpExpansionLeaseState> leases(direct_batch_queue_count);
+    check_cuda(cudaMemcpy(
+                 leases.data(), d_expansion_qp_leases,
+                 leases.size() * sizeof(QpExpansionLeaseState),
+                 cudaMemcpyDeviceToHost),
+               "cudaMemcpy(expansion QP lease telemetry)");
+    for (u32 qp = 0; qp < direct_batch_queue_count; ++qp) {
+      const QpExpansionLeaseState& lease = leases[qp];
+      const QpExpansionLeaseState baseline =
+        qp < expansion_qp_lease_baseline.size()
+          ? expansion_qp_lease_baseline[qp] : QpExpansionLeaseState{};
+      snapshot.expansion_qp_lease_available_wqes +=
+        qp_expansion_lease_available(lease.control);
+      snapshot.expansion_qp_lease_offers +=
+        counter_delta(lease.offers, baseline.offers);
+      snapshot.expansion_qp_lease_claimed_wqes +=
+        counter_delta(lease.claims, baseline.claims);
+      snapshot.expansion_qp_lease_owner_rejects +=
+        counter_delta(lease.rejects, baseline.rejects);
+      snapshot.expansion_qp_lease_returns +=
+        counter_delta(lease.returns, baseline.returns);
+      snapshot.expansion_qp_lease_revocations +=
+        counter_delta(lease.revocations, baseline.revocations);
+      snapshot.expansion_qp_lease_stale_returns +=
+        counter_delta(lease.stale_returns, baseline.stale_returns);
+    }
+  }
 }
 
 void PersistentSearchEngine::Impl::reset_expansion_pressure_telemetry() {
@@ -117,6 +145,16 @@ void PersistentSearchEngine::Impl::reset_expansion_pressure_telemetry() {
                &expansion_pressure_baseline, d_expansion_pressure,
                sizeof(expansion_pressure_baseline), cudaMemcpyDeviceToHost),
              "cudaMemcpy(expansion pressure telemetry baseline)");
+  if (d_expansion_qp_leases != nullptr && direct_batch_queue_count != 0) {
+    expansion_qp_lease_baseline.resize(direct_batch_queue_count);
+    check_cuda(cudaMemcpy(
+                 expansion_qp_lease_baseline.data(),
+                 d_expansion_qp_leases,
+                 expansion_qp_lease_baseline.size() *
+                   sizeof(QpExpansionLeaseState),
+                 cudaMemcpyDeviceToHost),
+               "cudaMemcpy(expansion QP lease telemetry baseline)");
+  }
 }
 
 }  // namespace gpu_search

@@ -376,6 +376,10 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
   bool trace_first_batch = true;
   DirectOwnerProgress* owner_progress = params.direct_owner_progress == nullptr
     ? nullptr : params.direct_owner_progress + warp;
+  QpExpansionLeaseState* expansion_lease =
+    params.expansion_qp_leases == nullptr ||
+        warp >= params.expansion_qp_lease_count
+      ? nullptr : params.expansion_qp_leases + warp;
   u64 last_heartbeat_ns = 0;
 
   if (lane == 0 && params.direct_owner_phases != nullptr) {
@@ -462,6 +466,7 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
             total_wqes + needed + completion_wqes > qp->sq_wqe_num) {
           expansion_pressure_clear_credit(
             params.expansion_pressure, false, true);
+          qp_expansion_lease_revoke(expansion_lease);
           deferred = descriptor;
           deferred_matching = matching;
           have_deferred = true;
@@ -498,8 +503,12 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
           if (params.expansion_pressure != nullptr) {
             atomicAdd(
               &params.expansion_pressure->idle_owner_episodes, 1ULL);
-            expansion_pressure_grant_idle(params.expansion_pressure);
           }
+          const u32 completion_wqes = need_dump ? 1u : 0u;
+          const u32 free_wqes = qp->sq_wqe_num > completion_wqes
+            ? qp->sq_wqe_num - completion_wqes : 0u;
+          (void)qp_expansion_lease_publish(
+            expansion_lease, min(free_wqes, params.efficient_batch_cap));
         }
         device_ring_relax(idle_cycles);
       }
@@ -508,6 +517,7 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
       continue;
     }
     if (lane == 0) {
+      qp_expansion_lease_revoke(expansion_lease);
       (void)expansion_owner_idle_episode_transition(
         expansion_pressure_active(
           expansion_pressure_load(params.expansion_pressure)),

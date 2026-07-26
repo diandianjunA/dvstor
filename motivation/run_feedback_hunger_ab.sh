@@ -17,7 +17,7 @@ run_one() {
   (
     set -a
     source "$MOTIVATION_DIR/configs/common.env"
-    if [[ "$policy" == feedback-hunger ]]; then
+    if [[ "$policy" == feedback-hunger || "$policy" == feedback-horizon-hunger ]]; then
       source "$MOTIVATION_DIR/configs/feedback_hunger.env"
     else
       source "$MOTIVATION_DIR/configs/prefetch_${depth}.env"
@@ -39,7 +39,7 @@ done
 
 if [[ "$RUN_DYNAMIC" == 1 ]]; then
   for concurrency in $CONCURRENCIES; do
-    run_one "feedback-hunger" 16 "$concurrency"
+      run_one "feedback-horizon-hunger" 16 "$concurrency"
   done
 fi
 

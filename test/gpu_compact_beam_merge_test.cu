@@ -13,6 +13,7 @@
 namespace {
 
 using gpu_search::f32;
+using gpu_search::BeamMergePolicy;
 using gpu_search::u8;
 using gpu_search::u32;
 using gpu_search::u64;
@@ -74,39 +75,48 @@ __global__ void compact_merge_kernel(
     u64* beam_handles, u32* beam_ids, f32* beam_distances,
     u8* beam_expanded, u32 beam_capacity,
     u64* scratch_handles, u32* scratch_expanded, f32* scratch_distances,
-    u32* result_count) {
+    BeamMergePolicy policy, u32* result_count) {
   __shared__ CandidateWorkspace workspace;
   __shared__ u32 beam_count;
   if (threadIdx.x == 0) beam_count = beam_capacity;
   __syncthreads();
-  merge_approximate_compact(
-    candidate_handles, candidate_distances,
-    beam_handles, beam_ids, beam_distances, beam_expanded,
-    beam_count, beam_capacity, beam_capacity,
-    beam_capacity + candidate_count,
-    scratch_handles, scratch_expanded, scratch_distances, workspace);
+  if (policy == BeamMergePolicy::legacy) {
+    merge_approximate_compact(
+      candidate_handles, candidate_distances,
+      beam_handles, beam_ids, beam_distances, beam_expanded,
+      beam_count, beam_capacity, beam_capacity,
+      beam_capacity + candidate_count,
+      scratch_handles, scratch_expanded, scratch_distances, workspace);
+  } else {
+    merge_approximate_stable_runs(
+      candidate_handles, candidate_distances, candidate_count,
+      beam_handles, beam_ids, beam_distances, beam_expanded,
+      beam_count, beam_capacity,
+      scratch_handles, scratch_expanded, scratch_distances, workspace);
+  }
   if (threadIdx.x == 0) *result_count = beam_count;
 }
 
 void run_case(u32 beam_capacity) {
   constexpr u32 kMergeItems = gpu_search::kPersistentMaxMergeCandidates;
-  constexpr u32 kPassItems =
-    gpu_search::persistent_kernel_detail::kApproximateSortThreadsCompact *
-    gpu_search::persistent_kernel_detail::kApproximateSortItemsCompactPass;
+  constexpr u32 kStableSecondFold = 1024;
   if (beam_capacity != 128 && beam_capacity != 256) {
     throw std::invalid_argument("unexpected compact beam test capacity");
   }
   const u32 candidate_count = kMergeItems - beam_capacity;
   const u32 scratch_count = beam_capacity * 2;
+  if (candidate_count < kStableSecondFold + beam_capacity) {
+    throw std::invalid_argument(
+      "compact merge test cannot cover the stable second fold");
+  }
 
   std::vector<u64> candidate_handles(candidate_count);
   std::vector<f32> candidate_distances(candidate_count);
   for (u32 index = 0; index < candidate_count; ++index) {
     candidate_handles[index] = 0x200000000ULL + index;
-    const u32 combined_index = beam_capacity + index;
-    candidate_distances[index] = combined_index >= kPassItems
-      ? static_cast<f32>(combined_index - kPassItems)
-      : static_cast<f32>(100000 + combined_index);
+    candidate_distances[index] = index >= kStableSecondFold
+      ? static_cast<f32>(index - kStableSecondFold)
+      : static_cast<f32>(100000 + index);
   }
 
   std::vector<u64> beam_handles(beam_capacity);
@@ -118,8 +128,8 @@ void run_case(u32 beam_capacity) {
     beam_distances[index] = static_cast<f32>(200000 + index);
   }
   // Keep one expanded entry globally best.  This also verifies that the
-  // two-pass top-k merge preserves expansion state while selecting the best
-  // candidates from the second 1024-item pass.
+  // merge preserves expansion state while selecting the best candidates
+  // whose original indices are in the stable-run path's second fold.
   beam_distances[0] = -1.0f;
   beam_expanded[0] = 1;
 
@@ -135,40 +145,47 @@ void run_case(u32 beam_capacity) {
   DeviceBuffer<u32> d_result_count(1);
   copy_to_device(d_candidate_handles, candidate_handles);
   copy_to_device(d_candidate_distances, candidate_distances);
-  copy_to_device(d_beam_handles, beam_handles);
-  copy_to_device(d_beam_ids, beam_ids);
-  copy_to_device(d_beam_distances, beam_distances);
-  copy_to_device(d_beam_expanded, beam_expanded);
+  for (const BeamMergePolicy policy :
+       {BeamMergePolicy::legacy, BeamMergePolicy::stable_run}) {
+    const std::string policy_name =
+      policy == BeamMergePolicy::legacy ? "legacy" : "stable-run";
+    copy_to_device(d_beam_handles, beam_handles);
+    copy_to_device(d_beam_ids, beam_ids);
+    copy_to_device(d_beam_distances, beam_distances);
+    copy_to_device(d_beam_expanded, beam_expanded);
 
-  compact_merge_kernel<<<1, 128>>>(
-    d_candidate_handles.get(), d_candidate_distances.get(), candidate_count,
-    d_beam_handles.get(), d_beam_ids.get(), d_beam_distances.get(),
-    d_beam_expanded.get(), beam_capacity,
-    d_scratch_handles.get(), d_scratch_expanded.get(),
-    d_scratch_distances.get(), d_result_count.get());
-  check_cuda(cudaGetLastError(), "compact_merge_kernel launch");
-  check_cuda(cudaDeviceSynchronize(), "compact_merge_kernel completion");
+    compact_merge_kernel<<<1, 128>>>(
+      d_candidate_handles.get(), d_candidate_distances.get(), candidate_count,
+      d_beam_handles.get(), d_beam_ids.get(), d_beam_distances.get(),
+      d_beam_expanded.get(), beam_capacity,
+      d_scratch_handles.get(), d_scratch_expanded.get(),
+      d_scratch_distances.get(), policy, d_result_count.get());
+    check_cuda(cudaGetLastError(), "compact_merge_kernel launch");
+    check_cuda(cudaDeviceSynchronize(), "compact_merge_kernel completion");
 
-  const auto output_handles = copy_from_device(d_beam_handles);
-  const auto output_ids = copy_from_device(d_beam_ids);
-  const auto output_distances = copy_from_device(d_beam_distances);
-  const auto output_expanded = copy_from_device(d_beam_expanded);
-  const auto output_count = copy_from_device(d_result_count);
-  if (output_count[0] != beam_capacity ||
-      output_handles[0] != beam_handles[0] ||
-      output_distances[0] != -1.0f || output_expanded[0] != 1) {
-    throw std::runtime_error(
-      "compact merge lost the best existing beam entry");
-  }
-  const u32 second_pass_candidate = kPassItems - beam_capacity;
-  for (u32 output = 1; output < beam_capacity; ++output) {
-    const u32 candidate = second_pass_candidate + output - 1;
-    if (output_handles[output] != candidate_handles[candidate] ||
-        output_distances[output] != static_cast<f32>(output - 1) ||
-        output_expanded[output] != 0 ||
-        output_ids[output] != std::numeric_limits<u32>::max()) {
+    const auto output_handles = copy_from_device(d_beam_handles);
+    const auto output_ids = copy_from_device(d_beam_ids);
+    const auto output_distances = copy_from_device(d_beam_distances);
+    const auto output_expanded = copy_from_device(d_beam_expanded);
+    const auto output_count = copy_from_device(d_result_count);
+    if (output_count[0] != beam_capacity ||
+        output_handles[0] != beam_handles[0] ||
+        output_distances[0] != -1.0f || output_expanded[0] != 1) {
       throw std::runtime_error(
-        "compact merge did not retain the global top-k across both passes");
+        policy_name +
+        ": compact merge lost the best existing beam entry");
+    }
+    const u32 second_pass_candidate = kStableSecondFold;
+    for (u32 output = 1; output < beam_capacity; ++output) {
+      const u32 candidate = second_pass_candidate + output - 1;
+      if (output_handles[output] != candidate_handles[candidate] ||
+          output_distances[output] != static_cast<f32>(output - 1) ||
+          output_expanded[output] != 0 ||
+          output_ids[output] != std::numeric_limits<u32>::max()) {
+        throw std::runtime_error(
+          policy_name +
+          ": compact merge did not retain the global top-k across both passes");
+      }
     }
   }
 }
