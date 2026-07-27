@@ -1,0 +1,162 @@
+{
+  "schema_version": 1,
+  "comparison": "current-build static c256 fixed vs live-extent",
+  "controlled_variable": "gpu_query_graph_read_policy",
+  "reports": {
+    "fixed": "/home/xjs/experiment/dvstor/motivation/results/live_extent_e2e/fixed_highwater_build_c256_static/04_gpu_persistent_gpunetio/sift100m_04_gpu_persistent_gpunetio_20260727_215008.json",
+    "live-extent": "/home/xjs/experiment/dvstor/motivation/results/live_extent_e2e/live_highwater_c256_static/04_gpu_persistent_gpunetio/sift100m_04_gpu_persistent_gpunetio_20260727_211636.json"
+  },
+  "validation": {
+    "strict_report_load": true,
+    "service_ini_only_policy_differs": true,
+    "json_pair_fields_equal": true,
+    "query_accounting_complete": true,
+    "direct_path_failures": {
+      "fixed": 0,
+      "live-extent": 0
+    },
+    "centroid_route_query_timeouts": {
+      "fixed": 0,
+      "live-extent": 0
+    },
+    "stage2_failures": {
+      "fixed": 0,
+      "live-extent": 0
+    },
+    "recall_at_10_before": {
+      "fixed": 0.9401,
+      "live-extent": 0.9401
+    },
+    "recall_at_10_after": {
+      "fixed": 0.9401,
+      "live-extent": 0.9401
+    },
+    "fixed_search_contract": {
+      "workload": "query",
+      "client_threads": 256,
+      "measure_seconds": 120,
+      "expansion_policy": "fixed",
+      "prefetch_depth": 16,
+      "beam_merge_policy": "stable-run",
+      "beam_width": 128,
+      "max_expansions": 384,
+      "rerank_width": 128,
+      "performance_query_policy": "single_pass_no_reuse"
+    }
+  },
+  "metrics": {
+    "fixed": {
+      "query_qps": 57912.540199,
+      "query_ops": 6949912,
+      "latency_mean_us": 4419.042,
+      "latency_p50_us": 4392.742,
+      "latency_p95_us": 5070.021,
+      "latency_p99_us": 5425.463,
+      "latency_p999_us": 5928.378,
+      "gpu_query_us": 4346.08049,
+      "gpu_prepare_us": 108.372813,
+      "gpu_graph_us": 1862.703831,
+      "gpu_rdma_issue_us": 143.592903,
+      "gpu_rdma_wait_us": 1029.970552,
+      "gpu_graph_validation_us": 585.139232,
+      "gpu_neighbor_decode_us": 91.321522,
+      "gpu_score_us": 770.207976,
+      "gpu_beam_us": 1085.574451,
+      "gpu_exact_us": 367.55058,
+      "gpu_other_us": 178.07539,
+      "logical_graph_reads_per_query": 195.427613,
+      "selected_parents_per_query": 195.427613,
+      "graph_rounds_per_query": 14.618201,
+      "graph_shard_batches_per_query": 20.95951,
+      "physical_graph_wqes_per_query": 195.427613,
+      "total_tracked_rdma_wqes_per_query": 323.427613,
+      "exact_reads_per_query": 128.0,
+      "graph_bytes_per_query": 162595.77369,
+      "total_tracked_rdma_bytes_per_query": 182051.77369,
+      "graph_bytes_per_parent": 832.0,
+      "fallback_reads_per_query": 0.0,
+      "underhint_reads_per_query": 0.0,
+      "hint_promotions_per_query": 0.0,
+      "query_tail_to_head_ratio": 0.999988
+    },
+    "live-extent": {
+      "query_qps": 63065.848221,
+      "query_ops": 7568297,
+      "latency_mean_us": 4057.857,
+      "latency_p50_us": 4045.004,
+      "latency_p95_us": 4669.348,
+      "latency_p99_us": 4997.475,
+      "latency_p999_us": 5481.367,
+      "gpu_query_us": 3985.622295,
+      "gpu_prepare_us": 109.627669,
+      "gpu_graph_us": 1561.161135,
+      "gpu_rdma_issue_us": 158.217568,
+      "gpu_rdma_wait_us": 846.143206,
+      "gpu_graph_validation_us": 395.993764,
+      "gpu_neighbor_decode_us": 89.919595,
+      "gpu_score_us": 782.433,
+      "gpu_beam_us": 1092.365257,
+      "gpu_exact_us": 287.845705,
+      "gpu_other_us": 235.131525,
+      "logical_graph_reads_per_query": 195.429693,
+      "selected_parents_per_query": 195.429693,
+      "graph_rounds_per_query": 14.619656,
+      "graph_shard_batches_per_query": 20.974295,
+      "physical_graph_wqes_per_query": 195.429693,
+      "total_tracked_rdma_wqes_per_query": 323.429693,
+      "exact_reads_per_query": 128.0,
+      "graph_bytes_per_query": 81878.402508,
+      "total_tracked_rdma_bytes_per_query": 101334.402508,
+      "graph_bytes_per_parent": 418.966029,
+      "fallback_reads_per_query": 0.0,
+      "underhint_reads_per_query": 0.0,
+      "hint_promotions_per_query": 0.0,
+      "query_tail_to_head_ratio": 0.999341
+    }
+  },
+  "live_over_fixed_change_percent": {
+    "query_qps": 8.898432,
+    "latency_mean_us": -8.173378,
+    "latency_p50_us": -7.916194,
+    "latency_p95_us": -7.902788,
+    "latency_p99_us": -7.888506,
+    "latency_p999_us": -7.540191,
+    "gpu_query_us": -8.293868,
+    "gpu_prepare_us": 1.157907,
+    "gpu_graph_us": -16.18844,
+    "gpu_rdma_issue_us": 10.184811,
+    "gpu_rdma_wait_us": -17.847825,
+    "gpu_graph_validation_us": -32.324865,
+    "gpu_neighbor_decode_us": -1.535155,
+    "gpu_score_us": 1.587237,
+    "gpu_beam_us": 0.62555,
+    "gpu_exact_us": -21.685417,
+    "gpu_other_us": 32.040438,
+    "logical_graph_reads_per_query": 0.001065,
+    "selected_parents_per_query": 0.001065,
+    "graph_rounds_per_query": 0.009954,
+    "graph_shard_batches_per_query": 0.07054,
+    "physical_graph_wqes_per_query": 0.001065,
+    "total_tracked_rdma_wqes_per_query": 0.000643,
+    "exact_reads_per_query": 0.0,
+    "graph_bytes_per_query": -49.64297,
+    "total_tracked_rdma_bytes_per_query": -44.337591,
+    "graph_bytes_per_parent": -49.643506
+  },
+  "interpretation": {
+    "primary_result": "Live-Extent reduces transferred graph bytes without changing the search or request count, and converts the saved transfer/validation work into higher static throughput and lower latency.",
+    "causal_evidence": [
+      "logical graph reads/query differ by only 0.0011%",
+      "physical graph WQEs/query differ by only 0.0011%",
+      "exact reads/query are exactly 128 for both policies",
+      "fallback, underhint, and promotion counts are zero in the static run",
+      "graph bytes/query fall by 49.64% while GPU RDMA wait falls by 17.85%"
+    ],
+    "scope_limitations": [
+      "This is one 120-second paired run, not a multi-repeat confidence interval.",
+      "The live run preceded the fixed run; ordering was not randomized.",
+      "The single-pass performance source means the faster policy consumes more query rows; aggregate logical-work rates are therefore compared per query, not over identical completed row counts.",
+      "rdma_read_bytes and rdma_read_ops are tracked GPU query reads, not whole-system NIC wire traffic."
+    ]
+  }
+}

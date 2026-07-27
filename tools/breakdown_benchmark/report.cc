@@ -225,6 +225,10 @@ nlohmann::json telemetry_to_json(
     {"graph_live_extent_reads", telemetry.graph_live_extent_reads},
     {"graph_full_record_reads", telemetry.graph_full_record_reads},
     {"graph_extent_fallback_reads", telemetry.graph_extent_fallback_reads},
+    {"graph_extent_underhint_reads",
+      telemetry.graph_extent_underhint_reads},
+    {"graph_extent_hint_promotions",
+      telemetry.graph_extent_hint_promotions},
     {"graph_live_extent_read_ratio",
       telemetry.graph_live_extent_reads + telemetry.graph_full_record_reads == 0
         ? 0.0
@@ -527,10 +531,12 @@ FormattedReport format_report(const nlohmann::json& root,
            << gpu.value("average_graph_read_bytes_per_query", 0.0) << "/"
            << gpu.value(
                 "average_graph_read_bytes_per_logical_parent", 0.0) << '\n';
-    output << "  graph live/full/fallback reads: "
+    output << "  graph live/full/fallback/underhint/promotions reads: "
            << gpu.value("graph_live_extent_reads", 0ULL) << "/"
            << gpu.value("graph_full_record_reads", 0ULL) << "/"
-           << gpu.value("graph_extent_fallback_reads", 0ULL) << '\n';
+           << gpu.value("graph_extent_fallback_reads", 0ULL) << "/"
+           << gpu.value("graph_extent_underhint_reads", 0ULL) << "/"
+           << gpu.value("graph_extent_hint_promotions", 0ULL) << '\n';
     output << "  centroid route publications/shard_updates/live/snapshot_skips: "
            << gpu.value("centroid_route_publications", 0ULL) << "/"
            << gpu.value("centroid_route_shard_updates", 0ULL) << "/"

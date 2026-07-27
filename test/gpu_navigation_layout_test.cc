@@ -249,6 +249,14 @@ void test_graph_live_extent_reconstructs_canonical_record() {
   constexpr u32 record_bytes = 16 + graph_capacity * sizeof(u64);
   static_assert(record_bytes == 832);
 
+  for (const u32 exponent : {0u, 1u, 2u, 7u, 64u, 368u, 816u}) {
+    u32 repeated = 1;
+    for (u32 index = 0; index < exponent; ++index) {
+      repeated *= 16777619u;
+    }
+    assert(validation::fnv1a_prime_power(exponent) == repeated);
+  }
+
   assert(validation::graph_extent_bytes_for_class(
            0, record_bytes, graph_capacity) == 16);
   assert(validation::graph_extent_bytes_for_class(
@@ -260,6 +268,39 @@ void test_graph_live_extent_reconstructs_canonical_record() {
   assert(validation::graph_extent_bytes_for_class(
            validation::kGraphExtentClassUnknown,
            record_bytes, graph_capacity) == record_bytes);
+  assert(validation::graph_extent_class_for_required_bytes(
+           16, graph_capacity) == 0);
+  assert(validation::graph_extent_class_for_required_bytes(
+           16 + 8 * sizeof(u64), graph_capacity) == 1);
+  assert(validation::graph_extent_class_for_required_bytes(
+           16 + 9 * sizeof(u64), graph_capacity) == 2);
+  assert(validation::graph_extent_class_for_required_bytes(
+           17, graph_capacity) ==
+         validation::kGraphExtentClassUnknown);
+  assert(validation::graph_extent_class_for_required_bytes(
+           record_bytes + sizeof(u64), graph_capacity) ==
+         validation::kGraphExtentClassUnknown);
+
+  const u32 packed_classes =
+    3u | (7u << 8) | (validation::kGraphExtentClassUnknown << 16) |
+      (9u << 24);
+  assert(validation::packed_graph_extent_class(packed_classes, 0) == 3);
+  assert(validation::packed_graph_extent_class(packed_classes, 1) == 7);
+  assert(validation::packed_graph_extent_class(packed_classes, 2) ==
+         validation::kGraphExtentClassUnknown);
+  assert(validation::packed_graph_extent_class(packed_classes, 3) == 9);
+  u32 promoted_word = 0;
+  assert(validation::promoted_graph_extent_word(
+    packed_classes, 1, 8, promoted_word));
+  assert(validation::packed_graph_extent_class(promoted_word, 0) == 3);
+  assert(validation::packed_graph_extent_class(promoted_word, 1) == 8);
+  assert(validation::packed_graph_extent_class(promoted_word, 2) ==
+         validation::kGraphExtentClassUnknown);
+  assert(validation::packed_graph_extent_class(promoted_word, 3) == 9);
+  assert(!validation::promoted_graph_extent_word(
+    promoted_word, 1, 7, promoted_word));
+  assert(!validation::promoted_graph_extent_word(
+    promoted_word, 2, 12, promoted_word));
   // The optimistic hint is not charged against the legacy three full-record
   // snapshot attempts. Fixed/full: attempts 0,1 may retry and 2 is final.
   assert(validation::snapshot_retry_available(0, false, false, 3, 3));
@@ -299,22 +340,71 @@ void test_graph_live_extent_reconstructs_canonical_record() {
 
   const u32 extent_bytes = validation::graph_extent_bytes_for_class(
     7, record_bytes, graph_capacity);
+  assert(validation::checksum16_zero_extended_prefix(
+           authoritative.data(), extent_bytes, authoritative.size()) ==
+         checksum);
   std::array<byte_t, record_bytes> reconstructed;
+  // The unread scratch suffix is deliberately poisoned. Short validation must
+  // neither read nor clear it: it hashes the transferred prefix and advances
+  // the canonical zero suffix algebraically.
   reconstructed.fill(0xa5);
   std::memcpy(
     reconstructed.data(), authoritative.data(), extent_bytes);
-  std::fill(
-    reconstructed.begin() + extent_bytes, reconstructed.end(), byte_t{0});
   u32 required_bytes = 0;
   assert(validation::required_live_extent_bytes(
     reconstructed.data(), extent_bytes, graph_degree, graph_capacity,
     required_bytes));
   assert(required_bytes == 16 + 49 * sizeof(u64));
   assert(required_bytes <= extent_bytes);
-  assert(validation::classify_snapshot(
-           reconstructed.data(), reconstructed.size(),
+  // Class rounding fetched seven inactive slots. They are outside the logical
+  // prefix and outside the decoder's count, so checksum validation need not
+  // read them. Even a concurrently written unpublished slot can be ignored as
+  // part of the still-valid old logical snapshot.
+  reconstructed[required_bytes + 3] = 0x4b;
+  assert(validation::classify_zero_extended_snapshot(
+           reconstructed.data(), extent_bytes, reconstructed.size(),
            graph_degree, graph_capacity, 0) ==
          validation::SnapshotState::valid);
+
+  // Canonical records in several extent classes must produce exactly the
+  // existing full-record checksum without touching the unread scratch bytes.
+  for (const u32 live_edges : {0u, 1u, 8u, 9u, 32u, 80u, 95u}) {
+    std::array<byte_t, record_bytes> record{};
+    record[0] = static_cast<byte_t>(live_edges);
+    for (u32 edge = 0; edge < live_edges; ++edge) {
+      const u64 handle = RemotePtr{
+        edge % 4, 16 + static_cast<u64>(edge) * 64}.raw_address;
+      std::memcpy(
+        record.data() + validation::kGraphRecordHeaderBytes +
+          static_cast<size_t>(edge) * sizeof(handle),
+        &handle, sizeof(handle));
+    }
+    const u16 full_checksum =
+      validation::checksum16(record.data(), record.size());
+    record[2] = static_cast<byte_t>(full_checksum);
+    record[3] = static_cast<byte_t>(full_checksum >> 8);
+    const u8 extent_class = static_cast<u8>(
+      (live_edges + validation::kGraphExtentEdgesPerClass - 1) /
+      validation::kGraphExtentEdgesPerClass);
+    const u32 transferred = validation::graph_extent_bytes_for_class(
+      extent_class, record_bytes, graph_capacity);
+    assert(transferred < record_bytes);
+    const u32 logical_bytes =
+      validation::kGraphRecordHeaderBytes + live_edges * sizeof(u64);
+    assert(validation::checksum16_zero_extended_prefix(
+             record.data(), logical_bytes, record.size()) == full_checksum);
+
+    std::array<byte_t, record_bytes> poisoned_scratch;
+    poisoned_scratch.fill(0x5a);
+    std::memcpy(poisoned_scratch.data(), record.data(), transferred);
+    for (u32 byte = logical_bytes; byte < transferred; ++byte) {
+      poisoned_scratch[byte] = 0xc3;
+    }
+    assert(validation::classify_zero_extended_snapshot(
+             poisoned_scratch.data(), transferred, poisoned_scratch.size(),
+             graph_degree, graph_capacity, 0) ==
+           validation::SnapshotState::valid);
+  }
 
   // A build-time hint that is now one class too small must be detected from
   // the returned header before checksum acceptance or neighbor decoding.
@@ -326,9 +416,36 @@ void test_graph_live_extent_reconstructs_canonical_record() {
     required_bytes));
   assert(required_bytes > stale_extent_bytes);
 
-  reconstructed[32] ^= 1;
+  // If the authoritative record contains data outside the hinted extent, its
+  // stored full checksum cannot be reconstructed with a logical-zero suffix.
+  // The short attempt is rejected and the existing retry policy safely
+  // promotes it to a full read; the authoritative full snapshot then passes.
+  std::array<byte_t, record_bytes> nonzero_unread_suffix = authoritative;
+  nonzero_unread_suffix[extent_bytes + 17] = 0x6d;
+  const u16 nonzero_checksum = validation::checksum16(
+    nonzero_unread_suffix.data(), nonzero_unread_suffix.size());
+  nonzero_unread_suffix[2] = static_cast<byte_t>(nonzero_checksum);
+  nonzero_unread_suffix[3] = static_cast<byte_t>(nonzero_checksum >> 8);
+  reconstructed.fill(0xa5);
+  std::memcpy(
+    reconstructed.data(), nonzero_unread_suffix.data(), extent_bytes);
+  const auto short_nonzero = validation::classify_zero_extended_snapshot(
+    reconstructed.data(), extent_bytes, reconstructed.size(),
+    graph_degree, graph_capacity, 0);
+  assert(short_nonzero == validation::SnapshotState::invalid);
+  assert(validation::decide_read_action(true, short_nonzero, true) ==
+         validation::ReadAction::retry);
   assert(validation::classify_snapshot(
-           reconstructed.data(), reconstructed.size(),
+           nonzero_unread_suffix.data(), nonzero_unread_suffix.size(),
+           graph_degree, graph_capacity, 0) ==
+         validation::SnapshotState::valid);
+
+  reconstructed.fill(0xa5);
+  std::memcpy(
+    reconstructed.data(), authoritative.data(), extent_bytes);
+  reconstructed[32] ^= 1;
+  assert(validation::classify_zero_extended_snapshot(
+           reconstructed.data(), extent_bytes, reconstructed.size(),
            graph_degree, graph_capacity, 0) ==
          validation::SnapshotState::invalid);
 }

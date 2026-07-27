@@ -158,11 +158,43 @@ gpu-query-graph-read-policy = fixed        # 默认，始终读取完整记录
 gpu-query-graph-read-policy = live-extent  # 一次 one-sided READ 读取长度档覆盖的前缀
 ```
 
-`live-extent` 不改变图记录、WQE 数、Beam/visited/扩展顺序或存储 CPU 路径。静态
-base node 使用离线长度档；动态 node 始终读取完整记录。并发更新使档位落后、或短读
-重构后的结构/checksum 校验失败时，同一父节点有界重试一次完整记录，并分别计入
-`graph_extent_fallback_reads`、`graph_full_record_reads` 和实际
-`graph_read_bytes`。
+`live-extent` 不改变图记录、Beam/visited、扩展顺序或存储 CPU 路径。静态稳态下，
+每个逻辑 base-node graph fetch 仍只产生一个 READ WQE，只缩短 payload；dynamic
+handle 始终读取完整记录且不访问长度档。磁盘 sidecar 是 1 byte/base-node，启动时
+加载为 packed、aligned-u32 GPU high-water 表，占 `align_up(num_nodes, 4)` bytes；
+SIFT100M 约 100 MB。
+
+并发更新使档位落后时，短读只有在 header/count 可验证且
+`required_bytes > transfer_bytes` 时才记为 underhint；其首个成功 admitted 的 full
+fallback WQE 计入 `graph_extent_underhint_reads`。authoritative full record
+通过完整 checksum 后，GPU 才重新计算档位并用 packed CAS 单调提升对应 byte，后续
+查询直接使用新 high-water；已经读取旧 class 的并发在途 query 仍可能各自完成一次
+fallback。checksum/torn-record 等其他 fallback 不学习档位，
+删除或收缩也不会降低档位。fallback 继续沿用原有有界 snapshot retry 和错误语义，
+因此更新期可能临时增加 WQE，但不会截断邻接表。相关统计包括
+`graph_live_extent_reads`、`graph_full_record_reads`、
+`graph_extent_fallback_reads`、`graph_extent_underhint_reads`、
+`graph_extent_hint_promotions` 和实际 `graph_read_bytes`；promotions 统计成功的
+class transition，同一节点随增长可多次提升。
+
+当前所有已验证且可组合的查询优化集中在：
+
+```text
+experiment/profiles/04_gpu_persistent_gpunetio_all_optimizations.env
+```
+
+该 profile 固定使用 C16 authoritative expansion、`stable-run` Beam merge 和
+`live-extent`（自动包含 GPU high-water），并关闭详细 RDMA trace。性能为负的
+`feedback-horizon-hunger` 不在其中。它不写死 workload、更新开关或客户端并发，
+因此纯查询和混合负载可使用同一系统配置：
+
+```bash
+./experiment/start_all_memory_nodes.sh \
+  04_gpu_persistent_gpunetio_all_optimizations
+
+./experiment/run_breakdown.sh \
+  04_gpu_persistent_gpunetio_all_optimizations
+```
 
 在各存储节点准备对应文件后启动服务：
 

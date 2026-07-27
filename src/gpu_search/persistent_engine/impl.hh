@@ -219,9 +219,10 @@ struct PersistentSearchEngine::Impl {
   u32* d_dynamic_code_request_shards{};
   u64* d_dynamic_code_request_offsets{};
   u64* d_dynamic_code_request_local_iovas{};
-  // Optional immutable per-base-node extent classes. Dynamic records never
-  // consult this table and always use the full physical graph record.
-  u8* d_graph_extent_classes{};
+  // Optional packed per-base-node extent classes. The at-rest sidecar remains
+  // u8/node; the device copy is u32-aligned so query CTAs can monotonically
+  // repair stale bytes with CAS. Dynamic records always use the full record.
+  u32* d_graph_extent_class_words{};
   u32* d_graph_request_bytes{};
   u64 graph_extent_sidecar_bytes{};
   u64* d_query_dispatch_enqueue{};

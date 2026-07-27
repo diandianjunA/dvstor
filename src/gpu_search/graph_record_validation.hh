@@ -40,6 +40,51 @@ DVSTOR_GRAPH_RECORD_HD std::uint16_t checksum16(
   return static_cast<std::uint16_t>(hash);
 }
 
+// Return 16777619^exponent modulo 2^32. Unsigned overflow is the arithmetic
+// required by FNV-1a, so exponentiation by squaring can append a long run of
+// zero bytes without reading or materializing them.
+DVSTOR_GRAPH_RECORD_HD std::uint32_t fnv1a_prime_power(
+    std::uint32_t exponent) {
+  std::uint32_t result = 1u;
+  std::uint32_t base = 16777619u;
+  while (exponent != 0) {
+    if ((exponent & 1u) != 0) result *= base;
+    exponent >>= 1;
+    if (exponent != 0) base *= base;
+  }
+  return result;
+}
+
+// Compute the existing full-record checksum from an actually consumed prefix
+// and a logical all-zero suffix. This is byte-for-byte equivalent to
+// checksum16() over a canonical zero-padded record, but touches only
+// prefix_bytes and advances the zero suffix in O(log suffix_bytes). A caller
+// may therefore exclude class-rounding padding that was transferred but is
+// outside the count declared by the validated header.
+//
+// Bytes 2 and 3 store the checksum and are excluded by the on-disk checksum
+// format. The generic skipped_suffix calculation also keeps the helper exact
+// for prefixes shorter than the graph header, although live-extent callers
+// always transfer at least the complete 16-byte header.
+DVSTOR_GRAPH_RECORD_HD std::uint16_t checksum16_zero_extended_prefix(
+    const std::uint8_t* data,
+    std::uint32_t prefix_bytes,
+    std::uint32_t total_bytes) {
+  if (data == nullptr || prefix_bytes > total_bytes) return 0;
+  std::uint32_t hash = 2166136261u;
+  for (std::uint32_t index = 0; index < prefix_bytes; ++index) {
+    if (index == 2 || index == 3) continue;
+    hash ^= data[index];
+    hash *= 16777619u;
+  }
+  std::uint32_t zero_steps = total_bytes - prefix_bytes;
+  if (prefix_bytes <= 2 && total_bytes > 2) --zero_steps;
+  if (prefix_bytes <= 3 && total_bytes > 3) --zero_steps;
+  hash *= fnv1a_prime_power(zero_steps);
+  hash ^= hash >> 16;
+  return static_cast<std::uint16_t>(hash);
+}
+
 DVSTOR_GRAPH_RECORD_HD std::uint32_t load_u32(
     const std::uint8_t* data) {
   return static_cast<std::uint32_t>(data[0]) |
@@ -106,6 +151,69 @@ DVSTOR_GRAPH_RECORD_HD std::uint32_t graph_extent_bytes_for_class(
   return extent_bytes < record_bytes ? extent_bytes : record_bytes;
 }
 
+// Derive the smallest eight-edge class that covers an exact counted prefix.
+// The helper intentionally rejects malformed byte counts instead of rounding
+// them: callers use the result to monotonically repair a performance hint,
+// never as an authority for record validity.
+DVSTOR_GRAPH_RECORD_HD std::uint8_t graph_extent_class_for_required_bytes(
+    std::uint32_t required_bytes,
+    std::uint32_t graph_entry_capacity) {
+  if (required_bytes < kGraphRecordHeaderBytes) {
+    return kGraphExtentClassUnknown;
+  }
+  const std::uint32_t payload_bytes =
+    required_bytes - kGraphRecordHeaderBytes;
+  if ((payload_bytes % kGraphPointerBytes) != 0) {
+    return kGraphExtentClassUnknown;
+  }
+  const std::uint32_t live_neighbors = payload_bytes / kGraphPointerBytes;
+  if (live_neighbors > graph_entry_capacity) {
+    return kGraphExtentClassUnknown;
+  }
+  const std::uint32_t extent_class =
+    (live_neighbors + kGraphExtentEdgesPerClass - 1u) /
+      kGraphExtentEdgesPerClass;
+  return extent_class < kGraphExtentClassUnknown
+    ? static_cast<std::uint8_t>(extent_class)
+    : kGraphExtentClassUnknown;
+}
+
+// Device extent hints are stored four u8 classes per aligned u32 so a class
+// can be promoted with one CAS while preserving its three neighbours. These
+// pure helpers keep the byte packing and monotonic rule host-testable.
+DVSTOR_GRAPH_RECORD_HD std::uint8_t packed_graph_extent_class(
+    std::uint32_t word, std::uint32_t byte_index) {
+  if (byte_index >= sizeof(std::uint32_t)) {
+    return kGraphExtentClassUnknown;
+  }
+  return static_cast<std::uint8_t>(
+    word >> (byte_index * 8u));
+}
+
+DVSTOR_GRAPH_RECORD_HD bool promoted_graph_extent_word(
+    std::uint32_t observed_word,
+    std::uint32_t byte_index,
+    std::uint8_t requested_class,
+    std::uint32_t& promoted_word) {
+  promoted_word = observed_word;
+  if (byte_index >= sizeof(std::uint32_t) ||
+      requested_class == kGraphExtentClassUnknown) {
+    return false;
+  }
+  const std::uint32_t shift = byte_index * 8u;
+  const std::uint32_t mask = 0xffu << shift;
+  const std::uint8_t observed_class =
+    static_cast<std::uint8_t>((observed_word & mask) >> shift);
+  if (observed_class == kGraphExtentClassUnknown ||
+      requested_class <= observed_class) {
+    return false;
+  }
+  promoted_word =
+    (observed_word & ~mask) |
+      (static_cast<std::uint32_t>(requested_class) << shift);
+  return true;
+}
+
 // A checksum-valid dynamic graph record with another incarnation is not a
 // damaged RDMA response: cleanup may have recycled the slot while an older
 // read-committed query still holds its tagged handle.  Static records are never
@@ -131,6 +239,47 @@ DVSTOR_GRAPH_RECORD_HD SnapshotState classify_snapshot(
       required_bytes) &&
     required_bytes <= record_bytes &&
     stored_checksum == checksum16(record, record_bytes);
+  if (!structurally_valid) return SnapshotState::invalid;
+
+  const std::uint32_t stored_incarnation = load_u32(record + 8);
+  if (stored_incarnation == expected_incarnation) {
+    return SnapshotState::valid;
+  }
+  return expected_incarnation == 0
+    ? SnapshotState::invalid : SnapshotState::stale_incarnation;
+}
+
+// Validate a one-sided short read without touching bytes that the NIC did not
+// overwrite. Static graph records are canonically zero-padded at build time;
+// therefore the stored full-record checksum must equal the checksum of the
+// transferred prefix followed by logical zeros. A stale extent hint whose
+// unseen suffix contains published data fails this test and is upgraded to
+// the authoritative full-record path by the caller.
+DVSTOR_GRAPH_RECORD_HD SnapshotState classify_zero_extended_snapshot(
+    const std::uint8_t* record,
+    std::uint32_t transferred_bytes,
+    std::uint32_t record_bytes,
+    std::uint32_t graph_degree,
+    std::uint32_t graph_entry_capacity,
+    std::uint32_t expected_incarnation) {
+  if (record == nullptr ||
+      transferred_bytes < kGraphRecordHeaderBytes ||
+      transferred_bytes >= record_bytes ||
+      graph_entry_capacity < graph_degree) {
+    return SnapshotState::invalid;
+  }
+  const std::uint16_t stored_checksum =
+    static_cast<std::uint16_t>(record[2]) |
+    static_cast<std::uint16_t>(
+      static_cast<std::uint16_t>(record[3]) << 8);
+  std::uint32_t required_bytes = 0;
+  const bool structurally_valid =
+    required_live_extent_bytes(
+      record, transferred_bytes, graph_degree, graph_entry_capacity,
+      required_bytes) &&
+    required_bytes <= transferred_bytes &&
+    stored_checksum == checksum16_zero_extended_prefix(
+      record, required_bytes, record_bytes);
   if (!structurally_valid) return SnapshotState::invalid;
 
   const std::uint32_t stored_incarnation = load_u32(record + 8);

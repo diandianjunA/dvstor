@@ -861,6 +861,8 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ u32 total_graph_live_extent_reads;
   __shared__ u32 total_graph_full_record_reads;
   __shared__ u32 total_graph_extent_fallback_reads;
+  __shared__ u32 total_graph_extent_underhint_reads;
+  __shared__ u32 total_graph_extent_hint_promotions;
   __shared__ u32 total_graph_rounds;
   __shared__ u32 graph_failed;
   __shared__ u32 adjacency_oracle_trace_event_index;
@@ -872,6 +874,8 @@ __device__ void process_query(const PersistentKernelParams& params,
     total_graph_live_extent_reads = 0;
     total_graph_full_record_reads = 0;
     total_graph_extent_fallback_reads = 0;
+    total_graph_extent_underhint_reads = 0;
+    total_graph_extent_hint_promotions = 0;
     total_graph_rounds = 0;
     graph_failed = 0;
   }
@@ -1011,6 +1015,8 @@ __device__ void process_query(const PersistentKernelParams& params,
           &total_graph_live_extent_reads,
           &total_graph_full_record_reads,
           &total_graph_extent_fallback_reads,
+          &total_graph_extent_underhint_reads,
+          &total_graph_extent_hint_promotions,
           issued_qps,
           route_attempt,
           total_graph_rounds - 1, rdma_trace_enabled != 0,
@@ -1057,6 +1063,10 @@ __device__ void process_query(const PersistentKernelParams& params,
           total_graph_full_record_reads;
         completion.graph_extent_fallback_reads =
           total_graph_extent_fallback_reads;
+        completion.graph_extent_underhint_reads =
+          total_graph_extent_underhint_reads;
+        completion.graph_extent_hint_promotions =
+          total_graph_extent_hint_promotions;
         completion.graph_rounds = total_graph_rounds;
         completion.exact_vectors = total_exact_reads;
         completion.dynamic_code_cycles = dynamic_code_cycles;
@@ -1283,6 +1293,10 @@ __device__ void process_query(const PersistentKernelParams& params,
           total_graph_full_record_reads;
         completion.graph_extent_fallback_reads =
           total_graph_extent_fallback_reads;
+        completion.graph_extent_underhint_reads =
+          total_graph_extent_underhint_reads;
+        completion.graph_extent_hint_promotions =
+          total_graph_extent_hint_promotions;
         completion.graph_rounds = total_graph_rounds;
         completion.exact_vectors = total_exact_reads;
         completion.dynamic_code_cycles = dynamic_code_cycles;
@@ -1408,6 +1422,10 @@ __device__ void process_query(const PersistentKernelParams& params,
         total_graph_full_record_reads;
       completion.graph_extent_fallback_reads =
         total_graph_extent_fallback_reads;
+      completion.graph_extent_underhint_reads =
+        total_graph_extent_underhint_reads;
+      completion.graph_extent_hint_promotions =
+        total_graph_extent_hint_promotions;
       completion.graph_rounds = total_graph_rounds;
       completion.exact_vectors = total_exact_reads;
       completion.dynamic_code_cycles = dynamic_code_cycles;
@@ -1478,6 +1496,10 @@ __device__ void process_query(const PersistentKernelParams& params,
       total_graph_full_record_reads;
     completion.graph_extent_fallback_reads =
       total_graph_extent_fallback_reads;
+    completion.graph_extent_underhint_reads =
+      total_graph_extent_underhint_reads;
+    completion.graph_extent_hint_promotions =
+      total_graph_extent_hint_promotions;
     completion.graph_rounds = total_graph_rounds;
     completion.exact_vectors = total_exact_reads;
     completion.dynamic_code_cycles = dynamic_code_cycles;

@@ -93,6 +93,8 @@ void test_recall_and_report_formatting() {
   telemetry.graph_live_extent_reads = 8;
   telemetry.graph_full_record_reads = 3;
   telemetry.graph_extent_fallback_reads = 1;
+  telemetry.graph_extent_underhint_reads = 1;
+  telemetry.graph_extent_hint_promotions = 1;
   telemetry.centroid_route_publications = 7;
   telemetry.centroid_route_shard_updates = 9;
   telemetry.centroid_route_live_entries = 13;
@@ -119,6 +121,8 @@ void test_recall_and_report_formatting() {
   assert(telemetry_json.at("graph_live_extent_reads") == 8);
   assert(telemetry_json.at("graph_full_record_reads") == 3);
   assert(telemetry_json.at("graph_extent_fallback_reads") == 1);
+  assert(telemetry_json.at("graph_extent_underhint_reads") == 1);
+  assert(telemetry_json.at("graph_extent_hint_promotions") == 1);
   assert(std::abs(
     telemetry_json.at("graph_live_extent_read_ratio").get<double>() -
     8.0 / 11.0) < 1e-9);

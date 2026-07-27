@@ -71,6 +71,10 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
     << completion.graph_full_record_reads
     << ",\"graph_extent_fallback_reads\":"
     << completion.graph_extent_fallback_reads
+    << ",\"graph_extent_underhint_reads\":"
+    << completion.graph_extent_underhint_reads
+    << ",\"graph_extent_hint_promotions\":"
+    << completion.graph_extent_hint_promotions
     << ",\"beam_selection_cycles\":" << completion.beam_selection_cycles
     << ",\"rdma_issue_cycles\":" << completion.rdma_issue_cycles
     << ",\"rdma_wait_cycles\":" << completion.rdma_wait_cycles
@@ -531,6 +535,10 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << completion.graph_full_record_reads
                 << " graph_extent_fallbacks="
                 << completion.graph_extent_fallback_reads
+                << " graph_extent_underhints="
+                << completion.graph_extent_underhint_reads
+                << " graph_extent_promotions="
+                << completion.graph_extent_hint_promotions
                 << " graph_batches=" << completion.remote_batches
                 << " graph_rounds=" << completion.graph_rounds
                 << " route_hits=" << completion.route_hits
@@ -737,6 +745,10 @@ void PersistentSearchEngine::Impl::completion_loop() {
       completion.graph_full_record_reads, std::memory_order_relaxed);
     engine.telemetry_.graph_extent_fallback_reads.fetch_add(
       completion.graph_extent_fallback_reads, std::memory_order_relaxed);
+    engine.telemetry_.graph_extent_underhint_reads.fetch_add(
+      completion.graph_extent_underhint_reads, std::memory_order_relaxed);
+    engine.telemetry_.graph_extent_hint_promotions.fetch_add(
+      completion.graph_extent_hint_promotions, std::memory_order_relaxed);
     engine.telemetry_.graph_dependency_rounds.fetch_add(
       completion.graph_rounds, std::memory_order_relaxed);
     engine.telemetry_.graph_route_hits.fetch_add(completion.route_hits,
