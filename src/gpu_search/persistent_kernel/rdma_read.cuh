@@ -831,6 +831,68 @@ __device__ graph_record_validation::SnapshotState classify_graph_record(
     params.graph_entry_capacity, remote_incarnation(handle));
 }
 
+__device__ graph_record_validation::SnapshotState
+classify_short_graph_record(
+    const PersistentKernelParams& params,
+    const u8* record,
+    u32 transferred_bytes,
+    u64 handle) {
+  return graph_record_validation::classify_zero_extended_snapshot(
+    record, transferred_bytes, params.graph_entry_bytes,
+    params.graph_degree, params.graph_entry_capacity,
+    remote_incarnation(handle));
+}
+
+__device__ __forceinline__ u8 load_graph_extent_class(
+    const PersistentKernelParams& params, u32 static_ordinal) {
+  if (params.graph_extent_class_words == nullptr ||
+      static_ordinal >= params.num_nodes) {
+    return graph_record_validation::kGraphExtentClassUnknown;
+  }
+  const u32 word = *reinterpret_cast<volatile const u32*>(
+    params.graph_extent_class_words + static_ordinal / sizeof(u32));
+  return graph_record_validation::packed_graph_extent_class(
+    word, static_ordinal % sizeof(u32));
+}
+
+// Once an under-hinted short read has been upgraded and the authoritative full
+// snapshot validates, promote the packed device byte monotonically so later
+// queries do not repeat the same dependent short->full pair. Seeing a stale
+// class is harmless (one extra fallback), while a high-water class remains
+// safe because full snapshot validation is always authoritative.
+__device__ bool promote_graph_extent_class(
+    const PersistentKernelParams& params,
+    u64 handle,
+    u32 required_bytes) {
+  if (params.graph_extent_class_words == nullptr) return false;
+  u32 static_ordinal = 0;
+  if (!static_ordinal_from_raw(params, handle, static_ordinal) ||
+      static_ordinal >= params.num_nodes) {
+    return false;
+  }
+  const u8 requested_class =
+    graph_record_validation::graph_extent_class_for_required_bytes(
+      required_bytes, params.graph_entry_capacity);
+  if (requested_class ==
+      graph_record_validation::kGraphExtentClassUnknown) {
+    return false;
+  }
+  u32* const word =
+    params.graph_extent_class_words + static_ordinal / sizeof(u32);
+  const u32 byte_index = static_ordinal % sizeof(u32);
+  u32 observed = *reinterpret_cast<volatile u32*>(word);
+  while (true) {
+    u32 desired = observed;
+    if (!graph_record_validation::promoted_graph_extent_word(
+          observed, byte_index, requested_class, desired)) {
+      return false;
+    }
+    const u32 prior = atomicCAS(word, observed, desired);
+    if (prior == observed) return true;
+    observed = prior;
+  }
+}
+
 __device__ bool prepare_graph_record(const PersistentKernelParams& params,
                                      u64 handle,
                                      u32 query_slot,
@@ -850,7 +912,7 @@ __device__ bool prepare_graph_record(const PersistentKernelParams& params,
   u32 shard = 0;
   u32 static_ordinal = 0;
   const bool static_record =
-    params.graph_extent_classes != nullptr &&
+    params.graph_extent_class_words != nullptr &&
     params.graph_request_bytes != nullptr &&
     static_ordinal_from_raw(params, handle, static_ordinal);
   if (!resolve_handle(params, handle, raw, shard, graph_offset)) return false;
@@ -872,11 +934,11 @@ __device__ bool prepare_graph_record(const PersistentKernelParams& params,
   // Dynamic records have no immutable ordinal and therefore always retain the
   // full-record read-committed path. A static sidecar class is only a hint:
   // validation below will promote any inconsistent short read to a full retry.
-  if (static_record && params.graph_extent_classes != nullptr &&
+  if (static_record && params.graph_extent_class_words != nullptr &&
       params.graph_request_bytes != nullptr &&
       (params.graph_entry_bytes & (sizeof(u64) - 1u)) == 0) {
     request_bytes = graph_record_validation::graph_extent_bytes_for_class(
-      params.graph_extent_classes[static_ordinal],
+      load_graph_extent_class(params, static_ordinal),
       params.graph_entry_bytes, params.graph_entry_capacity);
   }
   return true;
@@ -906,6 +968,8 @@ __device__ bool fetch_graph_records_batch(
     u32* graph_live_extent_reads,
     u32* graph_full_record_reads,
     u32* graph_extent_fallback_reads,
+    u32* graph_extent_underhint_reads,
+    u32* graph_extent_hint_promotions,
     u32* issued_qps,
     u32 route_attempt,
     u32 search_round,
@@ -924,7 +988,7 @@ __device__ bool fetch_graph_records_batch(
   u64* request_local_iovas =
     params.dynamic_code_request_local_iovas + request_base;
   u32* request_bytes =
-    params.graph_extent_classes == nullptr ||
+    params.graph_extent_class_words == nullptr ||
         params.graph_request_bytes == nullptr
       ? nullptr
       : params.graph_request_bytes +
@@ -957,6 +1021,7 @@ __device__ bool fetch_graph_records_batch(
   constexpr u32 kLogicalGraphRead = 1u;
   constexpr u32 kStartedWithShortExtent = 2u;
   constexpr u32 kNeedsExtentFallbackRead = 4u;
+  constexpr u32 kExtentUnderhintFallback = 8u;
   const u32 warp = threadIdx.x / warp_width;
   const u32 lane_in_warp = threadIdx.x % warp_width;
   const u32 warp_count = max(1u, blockDim.x / warp_width);
@@ -986,26 +1051,6 @@ __device__ bool fetch_graph_records_batch(
     }
     __syncthreads();
     return false;
-  }
-
-  // A short one-sided READ overwrites only the live prefix. Reconstruct the
-  // canonical unused suffix in the fixed scratch slot before issue so the
-  // existing full-record checksum remains the validation authority. Never
-  // touch the prefix here: a producer store racing the NIC would corrupt the
-  // just-arrived payload.
-  if (live_extent_enabled) {
-    const u32 words_per_record = params.graph_entry_bytes / sizeof(u64);
-    const u32 total_words = count * words_per_record;
-    for (u32 flat = threadIdx.x; flat < total_words; flat += blockDim.x) {
-      const u32 index = flat / words_per_record;
-      const u32 byte_offset =
-        (flat - index * words_per_record) * sizeof(u64);
-      if (byte_offset < request_bytes[index]) continue;
-      u8* record = graph_record_pointer(
-        params, descriptor.query_slot, acquired_slots[index]);
-      *reinterpret_cast<u64*>(record + byte_offset) = 0;
-    }
-    __syncthreads();
   }
 
   // A compact graph entry is updated in-place by stage2/reverse-edge workers.
@@ -1062,6 +1107,7 @@ __device__ bool fetch_graph_records_batch(
       u32 short_reads = 0;
       u32 full_reads = 0;
       u32 fallback_reads = 0;
+      u32 underhint_reads = 0;
       for (u32 index = 0; index < count; ++index) {
         if (request_shards[index] != shard) continue;
         ++matching;
@@ -1074,8 +1120,12 @@ __device__ bool fetch_graph_records_batch(
             ++short_reads;
           } else {
             ++full_reads;
-            fallback_reads +=
-              (remote_reads[index] & kNeedsExtentFallbackRead) != 0
+            const bool is_fallback =
+              (remote_reads[index] & kNeedsExtentFallbackRead) != 0;
+            fallback_reads += is_fallback ? 1u : 0u;
+            underhint_reads +=
+              is_fallback &&
+                  (remote_reads[index] & kExtentUnderhintFallback) != 0
                 ? 1u : 0u;
           }
         }
@@ -1155,6 +1205,10 @@ __device__ bool fetch_graph_records_batch(
         if (graph_extent_fallback_reads != nullptr &&
             fallback_reads != 0) {
           atomicAdd(graph_extent_fallback_reads, fallback_reads);
+        }
+        if (graph_extent_underhint_reads != nullptr &&
+            underhint_reads != 0) {
+          atomicAdd(graph_extent_underhint_reads, underhint_reads);
         }
         // Count one fallback only when its first full WQE is admitted. Further
         // full snapshot retries remain graph_read_retries but are not another
@@ -1256,9 +1310,15 @@ __device__ bool fetch_graph_records_batch(
       const bool short_read_requires_full =
         status == 0 && partial_read &&
         (!prefix_valid || required_bytes > transfer_bytes);
+      const bool extent_underhint =
+        status == 0 && partial_read && prefix_valid &&
+        required_bytes > transfer_bytes;
       const graph_record_validation::SnapshotState snapshot =
         status == 0 && !short_read_requires_full
-          ? classify_graph_record(params, record, handles[index])
+          ? (partial_read
+              ? classify_short_graph_record(
+                  params, record, transfer_bytes, handles[index])
+              : classify_graph_record(params, record, handles[index]))
           : graph_record_validation::SnapshotState::invalid;
       const bool started_with_short =
         (remote_reads[index] & kStartedWithShortExtent) != 0;
@@ -1274,6 +1334,16 @@ __device__ bool fetch_graph_records_batch(
           : graph_record_validation::decide_read_action(
               status == 0, snapshot, attempts_remain);
       if (action == graph_record_validation::ReadAction::accept) {
+        // Learn only from the checksum-valid authoritative full snapshot, not
+        // from the optimistic short header that triggered the upgrade. This
+        // prevents a transient torn header from inflating the high-water hint.
+        if (!partial_read &&
+            (remote_reads[index] & kExtentUnderhintFallback) != 0 &&
+            promote_graph_extent_class(
+              params, handles[index], required_bytes) &&
+            graph_extent_hint_promotions != nullptr) {
+          atomicAdd(graph_extent_hint_promotions, 1u);
+        }
         // UINT32_MAX removes this entry from subsequent per-shard retry
         // batches while leaving acquired_slots intact for traversal.
         request_shards[index] = UINT32_MAX;
@@ -1291,6 +1361,9 @@ __device__ bool fetch_graph_records_batch(
         if (partial_read) {
           request_bytes[index] = params.graph_entry_bytes;
           remote_reads[index] |= kNeedsExtentFallbackRead;
+          if (extent_underhint) {
+            remote_reads[index] |= kExtentUnderhintFallback;
+          }
         }
         atomicAdd(&retry_pending, 1u);
         continue;

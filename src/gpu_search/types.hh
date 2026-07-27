@@ -99,6 +99,8 @@ struct CompletionDescriptor {
   u32 graph_live_extent_reads{};
   u32 graph_full_record_reads{};
   u32 graph_extent_fallback_reads{};
+  u32 graph_extent_underhint_reads{};
+  u32 graph_extent_hint_promotions{};
   u32 expansion_policy{};
   u32 sum_selected_parents{};
   u32 sum_feedback_horizon{};
@@ -217,6 +219,8 @@ struct TelemetrySnapshot {
   u64 graph_live_extent_reads{};
   u64 graph_full_record_reads{};
   u64 graph_extent_fallback_reads{};
+  u64 graph_extent_underhint_reads{};
+  u64 graph_extent_hint_promotions{};
   u64 graph_dependency_rounds{};
   u64 graph_route_hits{};
   u64 graph_route_refreshes{};
@@ -305,6 +309,8 @@ public:
   std::atomic<u64> graph_live_extent_reads{0};
   std::atomic<u64> graph_full_record_reads{0};
   std::atomic<u64> graph_extent_fallback_reads{0};
+  std::atomic<u64> graph_extent_underhint_reads{0};
+  std::atomic<u64> graph_extent_hint_promotions{0};
   std::atomic<u64> graph_dependency_rounds{0};
   std::atomic<u64> graph_route_hits{0};
   std::atomic<u64> graph_route_refreshes{0};

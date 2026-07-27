@@ -65,8 +65,9 @@ thread 只做以下工作：
    距离选择最近的一个物理分片并对其入口打分；跨分片遍历只由真实图边引入；
 4. 从 beam 选择未展开候选；
 5. 以 `gpu-graph-prefetch-depth` 并行发出远端图读取。默认 `fixed` 为每条 WQE
-   使用完整物理记录长度；`live-extent` 在不增加 WQE/descriptor/CQE 的前提下，
-   为同一 descriptor 中每条静态记录选择独立的 8-edge 分档长度；
+   使用完整物理记录长度；`live-extent` 为同一 descriptor 中每条静态记录选择独立的
+   8-edge 分档长度。静态稳态不增加 WQE/descriptor/CQE；更新首次撑出旧档位时执行
+   一次 full fallback，并在 GPU high-water 表中修复该档位；
 6. 解码 8-byte incarnation-tagged RemotePtr，并用对应 PQ code 评分；
 7. 去重、合并并裁剪到 traversal beam；
 8. 达到收敛或 `gpu-max-expansions` 后进入精排。
@@ -156,12 +157,18 @@ checksum 契约的记录才触发 fail-stop。这样槽复用是正常并发现�
 故障。
 
 Live-Extent 把存储分配大小和网络传输大小解耦，但不改变存储格式。静态记录发起
-one-sided READ 前，从 1 byte/base-node 的只读 sidecar 取得能够覆盖构建时 live
-邻接前缀的长度档；目标 scratch 仍是完整物理记录大小，并在 READ 前协作清零未读
-suffix，因此继续使用原有的 full-record checksum。返回 header 声明的 live prefix
-超出已读范围，或重构后的结构/checksum 无效时，该请求在下一 snapshot attempt
-升级为 full read。动态记录没有静态 ordinal，始终 full read。由此，过期 hint
-最多增加一次有显式统计的 fallback，不能造成邻接截断。
+one-sided READ 前，从 1 byte/base-node 离线 sidecar 初始化的 device high-water
+表取得长度档；目标 scratch 仍是完整物理记录大小，但不再写入未传输 suffix。
+校验器只扫描 header 声明且已传输的有效前缀，并以模 `2^32` 的 FNV prime 幂把逻辑
+零 suffix 延续到完整记录长度，因此结果与 canonical full-record checksum 完全等价。
+返回 header 声明的 live prefix 超出已读范围，或逻辑补零后的结构/checksum 无效时，
+该请求在下一 snapshot attempt
+升级为 full read。若原因是明确的 extent underhint，且随后 full snapshot 通过
+checksum，CTA 用 packed-u32 CAS 单调提升该节点的 u8 class；checksum/torn failure
+和 dynamic handle 不更新表。动态记录没有静态 ordinal，始终 full read。由此，每个
+已经读到过期 hint 的在途查询至多升级一次；首个成功 CAS 发布新 class 后，后续查询
+不再为同一档位重复 fallback。竞争查询可能同时进入 full fallback，但不能造成邻接
+截断。
 
 这里的“退休”不是伪装成静态索引重写：静态 PQ/图 generation 在线保持不变，
 已 Stage2 完成的存活动态节点继续由存储节点持有并按需 RDMA 访问。schema-16 的
@@ -190,7 +197,7 @@ watermark 后才可复用，复用时递增 incarnation；计数耗尽的
 - `N * M` 字节的常驻 PQ code，默认 `M=32`；
 - 每物理分片一个 centroid、版本和最多 4 个 live entry 的固定上界路由状态；
 - query、OPQ 输出、LUT、beam、visited set、centroid 路由入口和结果；
-- 可选 Live-Extent 的 `N` byte class table，以及每 query slot
+- 可选 Live-Extent 的 `align_up(N,4)` byte packed class high-water table，以及每 query slot
   `kPersistentMaxPrefetch * sizeof(u32)` 的 request-length scratch；
 - DOCA/CUDA 外部状态的固定安全余量。
 
@@ -210,7 +217,8 @@ watermark 后才可复用，复用时递增 incarnation；计数耗尽的
 
 - 连续 PQ code 只在启动时传输一次；
 - 稳态只按需读取由 `R` 决定且不超过 2048 B 的紧凑图记录和最终精确向量；
-- Live-Extent 保留固定远端记录的更新余量，但只把当前长度档覆盖的邻接前缀搬过网络；
+- Live-Extent 保留固定远端记录的更新余量，但只把当前 high-water 长度档覆盖的邻接
+  前缀搬过网络；更新触发的首次 underhint 由完整校验后的 GPU 自学习消除重复 fallback；
 - 每个 storage node 使用多条长期存活的 GPU QP；
 - 查询状态、LUT、beam 和 centroid route 状态均预分配；
 - 多查询并发隐藏远端延迟，而不是同步执行单查询 RDMA 往返；

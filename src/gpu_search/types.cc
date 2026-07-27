@@ -77,6 +77,10 @@ TelemetrySnapshot Telemetry::snapshot() const {
       graph_full_record_reads.load(std::memory_order_relaxed),
     .graph_extent_fallback_reads =
       graph_extent_fallback_reads.load(std::memory_order_relaxed),
+    .graph_extent_underhint_reads =
+      graph_extent_underhint_reads.load(std::memory_order_relaxed),
+    .graph_extent_hint_promotions =
+      graph_extent_hint_promotions.load(std::memory_order_relaxed),
     .graph_dependency_rounds = graph_dependency_rounds.load(std::memory_order_relaxed),
     .graph_route_hits = graph_route_hits.load(std::memory_order_relaxed),
     .graph_route_refreshes = graph_route_refreshes.load(std::memory_order_relaxed),
@@ -187,6 +191,8 @@ void Telemetry::reset() {
   graph_live_extent_reads.store(0, std::memory_order_relaxed);
   graph_full_record_reads.store(0, std::memory_order_relaxed);
   graph_extent_fallback_reads.store(0, std::memory_order_relaxed);
+  graph_extent_underhint_reads.store(0, std::memory_order_relaxed);
+  graph_extent_hint_promotions.store(0, std::memory_order_relaxed);
   graph_dependency_rounds.store(0, std::memory_order_relaxed);
   graph_route_hits.store(0, std::memory_order_relaxed);
   graph_route_refreshes.store(0, std::memory_order_relaxed);

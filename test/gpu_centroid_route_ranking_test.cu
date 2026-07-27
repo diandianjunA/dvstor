@@ -82,6 +82,48 @@ __global__ void classify_graph_record_kernel(
   output[1] = static_cast<u32>(action);
 }
 
+__global__ void promote_graph_extent_hint_kernel(
+    PersistentKernelParams params,
+    u64 handle,
+    u32 required_bytes,
+    u32* output) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  output[0] = gpu_search::persistent_kernel_detail::
+    promote_graph_extent_class(params, handle, required_bytes) ? 1u : 0u;
+  u32 ordinal = 0;
+  output[1] =
+    gpu_search::persistent_kernel_detail::static_ordinal_from_raw(
+      params, handle, ordinal)
+      ? gpu_search::persistent_kernel_detail::load_graph_extent_class(
+          params, ordinal)
+      : gpu_search::graph_record_validation::kGraphExtentClassUnknown;
+}
+
+__global__ void concurrently_promote_graph_extent_hint_kernel(
+    PersistentKernelParams params,
+    u64 handle,
+    u32* output) {
+  const u32 requested_class = 3u + threadIdx.x % 11u;
+  const u32 live_edges = (requested_class - 1u) * 8u + 1u;
+  const u32 required_bytes =
+    gpu_search::graph_record_validation::kGraphRecordHeaderBytes +
+      live_edges * sizeof(u64);
+  if (gpu_search::persistent_kernel_detail::promote_graph_extent_class(
+        params, handle, required_bytes)) {
+    atomicAdd(output, 1u);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    u32 ordinal = 0;
+    output[1] =
+      gpu_search::persistent_kernel_detail::static_ordinal_from_raw(
+        params, handle, ordinal)
+        ? gpu_search::persistent_kernel_detail::load_graph_extent_class(
+            params, ordinal)
+        : gpu_search::graph_record_validation::kGraphExtentClassUnknown;
+  }
+}
+
 __global__ void route_contention_query_kernel(PersistentKernelParams params,
                                                QueryDescriptor descriptor) {
   gpu_search::persistent_kernel_detail::process_query(params, descriptor);
@@ -288,6 +330,137 @@ void test_route_publication_contention() {
   for (void* allocation : allocations) check_cuda(cudaFree(allocation), "cudaFree");
 }
 
+void test_graph_extent_hint_promotion() {
+  constexpr u32 graph_capacity = 102;
+  const gpu_search::DeviceShardRegion shard{
+    .ordinal_base = 0,
+    .node_count = 3,
+    .node_base_offset = 0x1000,
+    .node_stride = 64,
+    .memory_node = 0,
+  };
+  auto* device_shard = device_copy(&shard, 1);
+  const u32 initial_word =
+    static_cast<u32>(
+      gpu_search::graph_record_validation::kGraphExtentClassUnknown) |
+      (2u << 8) | (1u << 16) | (0x5au << 24);
+  auto* device_word = device_copy(&initial_word, 1);
+  u32* device_output = nullptr;
+  check_cuda(cudaMalloc(
+    reinterpret_cast<void**>(&device_output), 2 * sizeof(u32)),
+    "cudaMalloc(extent promotion output)");
+
+  PersistentKernelParams params{};
+  params.shards = device_shard;
+  params.num_shards = 1;
+  params.num_nodes = 3;
+  params.graph_entry_capacity = graph_capacity;
+  params.graph_extent_class_words = device_word;
+  const u64 ordinal_one = (u64{0x1000} + 64) >> 4;
+  const u32 class_five_bytes =
+    gpu_search::graph_record_validation::kGraphRecordHeaderBytes +
+      33 * sizeof(u64);
+  promote_graph_extent_hint_kernel<<<1, 32>>>(
+    params, ordinal_one, class_five_bytes, device_output);
+  check_cuda(cudaGetLastError(), "promote_graph_extent_hint_kernel launch");
+  check_cuda(cudaDeviceSynchronize(),
+             "promote_graph_extent_hint_kernel sync");
+  std::array<u32, 2> output{};
+  check_cuda(cudaMemcpy(
+    output.data(), device_output, sizeof(output), cudaMemcpyDeviceToHost),
+    "cudaMemcpy(extent promotion output)");
+  assert(output[0] == 1);
+  assert(output[1] == 5);
+
+  u32 promoted_word = 0;
+  check_cuda(cudaMemcpy(
+    &promoted_word, device_word, sizeof(promoted_word),
+    cudaMemcpyDeviceToHost), "cudaMemcpy(promoted extent word)");
+  assert(gpu_search::graph_record_validation::packed_graph_extent_class(
+           promoted_word, 0) ==
+         gpu_search::graph_record_validation::kGraphExtentClassUnknown);
+  assert(gpu_search::graph_record_validation::packed_graph_extent_class(
+           promoted_word, 1) == 5);
+  assert(gpu_search::graph_record_validation::packed_graph_extent_class(
+           promoted_word, 2) == 1);
+  assert(gpu_search::graph_record_validation::packed_graph_extent_class(
+           promoted_word, 3) == 0x5a);
+
+  // A lower request cannot regress a learned class, and an unknown/full byte
+  // remains authoritative rather than being replaced by a short-read hint.
+  promote_graph_extent_hint_kernel<<<1, 32>>>(
+    params, ordinal_one,
+    gpu_search::graph_record_validation::kGraphRecordHeaderBytes +
+      24 * sizeof(u64),
+    device_output);
+  check_cuda(cudaGetLastError(), "nonregressing extent promotion launch");
+  check_cuda(cudaDeviceSynchronize(), "nonregressing extent promotion sync");
+  check_cuda(cudaMemcpy(
+    output.data(), device_output, sizeof(output), cudaMemcpyDeviceToHost),
+    "cudaMemcpy(nonregressing extent promotion output)");
+  assert(output[0] == 0);
+  assert(output[1] == 5);
+
+  const u64 ordinal_zero = u64{0x1000} >> 4;
+  promote_graph_extent_hint_kernel<<<1, 32>>>(
+    params, ordinal_zero, class_five_bytes, device_output);
+  check_cuda(cudaGetLastError(), "unknown extent promotion launch");
+  check_cuda(cudaDeviceSynchronize(), "unknown extent promotion sync");
+  check_cuda(cudaMemcpy(
+    output.data(), device_output, sizeof(output), cudaMemcpyDeviceToHost),
+    "cudaMemcpy(unknown extent promotion output)");
+  assert(output[0] == 0);
+  assert(output[1] ==
+         gpu_search::graph_record_validation::kGraphExtentClassUnknown);
+
+  // The third byte is the final real ordinal in a partially occupied device
+  // word. Its CAS must remain in bounds and preserve the padding byte.
+  const u64 ordinal_two = (u64{0x1000} + 2 * 64) >> 4;
+  promote_graph_extent_hint_kernel<<<1, 32>>>(
+    params, ordinal_two, class_five_bytes, device_output);
+  check_cuda(cudaGetLastError(), "partial-word extent promotion launch");
+  check_cuda(cudaDeviceSynchronize(), "partial-word extent promotion sync");
+  check_cuda(cudaMemcpy(
+    &promoted_word, device_word, sizeof(promoted_word),
+    cudaMemcpyDeviceToHost), "cudaMemcpy(partial-word extent word)");
+  assert(gpu_search::graph_record_validation::packed_graph_extent_class(
+           promoted_word, 2) == 5);
+  assert(gpu_search::graph_record_validation::packed_graph_extent_class(
+           promoted_word, 3) == 0x5a);
+
+  // Multiple CTAs/threads may observe the same stale byte. Every successful
+  // transition is monotonic and the maximum requested class must win without
+  // corrupting adjacent ordinals.
+  check_cuda(cudaMemset(device_output, 0, 2 * sizeof(u32)),
+             "cudaMemset(concurrent extent output)");
+  concurrently_promote_graph_extent_hint_kernel<<<1, 32>>>(
+    params, ordinal_one, device_output);
+  check_cuda(cudaGetLastError(), "concurrent extent promotion launch");
+  check_cuda(cudaDeviceSynchronize(), "concurrent extent promotion sync");
+  check_cuda(cudaMemcpy(
+    output.data(), device_output, sizeof(output), cudaMemcpyDeviceToHost),
+    "cudaMemcpy(concurrent extent promotion output)");
+  assert(output[0] >= 1);
+  assert(output[0] <= 8);
+  assert(output[1] == 13);
+  check_cuda(cudaMemcpy(
+    &promoted_word, device_word, sizeof(promoted_word),
+    cudaMemcpyDeviceToHost), "cudaMemcpy(concurrent extent word)");
+  assert(gpu_search::graph_record_validation::packed_graph_extent_class(
+           promoted_word, 0) ==
+         gpu_search::graph_record_validation::kGraphExtentClassUnknown);
+  assert(gpu_search::graph_record_validation::packed_graph_extent_class(
+           promoted_word, 1) == 13);
+  assert(gpu_search::graph_record_validation::packed_graph_extent_class(
+           promoted_word, 2) == 5);
+  assert(gpu_search::graph_record_validation::packed_graph_extent_class(
+           promoted_word, 3) == 0x5a);
+
+  check_cuda(cudaFree(device_output), "cudaFree(extent promotion output)");
+  check_cuda(cudaFree(device_word), "cudaFree(extent class word)");
+  check_cuda(cudaFree(device_shard), "cudaFree(extent promotion shard)");
+}
+
 }  // namespace
 
 int main() {
@@ -374,6 +547,7 @@ int main() {
     }
 
     test_route_publication_contention();
+    test_graph_extent_hint_promotion();
 
     // Exercise the same host/device classifier used by graph RDMA reads. A
     // checksum-valid replacement incarnation must discard only the stale

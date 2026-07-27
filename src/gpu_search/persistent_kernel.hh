@@ -708,11 +708,13 @@ struct PersistentKernelParams {
   u32* dispatcher_kernel_ready_count{};
   u32* control_kernel_ready_count{};
   u8* graph_scratch{};
-  // One immutable eight-edge extent class per static ordinal. Class zero is a
-  // header-only 16-byte record, class n covers n*8 neighbor slots, and 0xff
-  // means unknown/full-record. A null pointer keeps the legacy fixed-size
-  // graph READ path exactly intact.
-  const u8* graph_extent_classes{};
+  // Four eight-edge extent classes per aligned word, indexed by static
+  // ordinal. Class zero is a header-only 16-byte record, class n covers n*8
+  // neighbor slots, and 0xff means unknown/full-record. The device copy is a
+  // monotonic high-water cache: a verified header that outgrows its offline
+  // hint atomically promotes only its byte. A null pointer keeps the legacy
+  // fixed-size graph READ path exactly intact.
+  u32* graph_extent_class_words{};
   // Per-query-slot global metadata consumed asynchronously by QP-owner warps.
   // Only the first kPersistentMaxPrefetch entries of each query slot are used
   // by graph fetches.

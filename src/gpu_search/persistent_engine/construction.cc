@@ -300,8 +300,11 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   const u64 graph_request_metadata_bytes = live_extent_graph_reads
     ? static_cast<u64>(query_slots) * kPersistentMaxPrefetch * sizeof(u32)
     : 0;
+  // The sidecar remains exactly one byte per base node on disk. Round only
+  // the device allocation to a u32 word so the last real byte can be repaired
+  // with an in-bounds packed CAS.
   const u64 graph_extent_device_bytes = live_extent_graph_reads
-    ? graph_extent_sidecar_bytes
+    ? align_up(graph_extent_sidecar_bytes, sizeof(u32))
     : 0;
   const u64 centroid_route_bytes =
     static_cast<u64>(centroid_route_shard_capacity) *
@@ -445,13 +448,18 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   device_allocate(d_shards, index.shards.size(), "cudaMalloc(GPU navigation shards)");
   if (live_extent_graph_reads) {
     device_allocate(
-      d_graph_extent_classes, graph_extent_classes.size(),
-      "cudaMalloc(static graph extent classes)");
+      d_graph_extent_class_words,
+      static_cast<size_t>(graph_extent_device_bytes / sizeof(u32)),
+      "cudaMalloc(static graph extent class words)");
+    check_cuda(cudaMemset(
+                 d_graph_extent_class_words, 0,
+                 static_cast<size_t>(graph_extent_device_bytes)),
+               "cudaMemset(static graph extent class words)");
     check_cuda(cudaMemcpy(
-                 d_graph_extent_classes, graph_extent_classes.data(),
+                 d_graph_extent_class_words, graph_extent_classes.data(),
                  graph_extent_classes.size() * sizeof(u8),
                  cudaMemcpyHostToDevice),
-               "cudaMemcpy(static graph extent classes)");
+               "cudaMemcpy(static graph extent class words)");
   }
   device_allocate(d_opq_matrix, pq_model.rotation.size(), "cudaMalloc(OPQ matrix)");
   device_allocate(d_pq_centroids, pq_model.centroids.size(), "cudaMalloc(PQ centroids)");
@@ -917,7 +925,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .centroid_route_entry_capacity = centroid_route_entry_capacity,
     .stop = stop_device,
     .graph_scratch = d_graph_scratch,
-    .graph_extent_classes = d_graph_extent_classes,
+    .graph_extent_class_words = d_graph_extent_class_words,
     .graph_request_bytes = d_graph_request_bytes,
     .query_rdma_trace_headers = d_query_rdma_trace_headers,
     .query_rdma_trace_events = d_query_rdma_trace_events,
