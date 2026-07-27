@@ -312,6 +312,7 @@ insert_bin() { echo "$INSERT_FILE"; }
 performance_query_bin() { echo "$PERFORMANCE_QUERY_FILE"; }
 metadata_file() { echo "${INDEX_PREFIX}.meta.json"; }
 model_file() { echo "${INDEX_PREFIX}.pq${PQ_SUBQUANTIZERS}"; }
+graph_extent_file() { echo "${INDEX_PREFIX}.gextent8"; }
 
 shard_file() {
   local node_id="${1:?node id is required}"
@@ -429,6 +430,12 @@ PY_VALIDATE
       echo "missing OPQ/PQ${PQ_SUBQUANTIZERS} model: $(model_file)" >&2
       return 1
     fi
+    if [[ "${GPU_QUERY_GRAPH_READ_POLICY:-fixed}" == "live-extent" &&
+          ! -s "$(graph_extent_file)" ]]; then
+      echo "missing Live-Extent sidecar: $(graph_extent_file)" >&2
+      echo "generate it on a host that has every .dat shard, then copy it to the compute index prefix" >&2
+      return 1
+    fi
   elif [[ "$role" == "storage" ]]; then
     local first=1 last="$SHARDS"
     if ((node_id > 0)); then first="$node_id"; last="$node_id"; fi
@@ -523,6 +530,7 @@ write_service_config() {
     echo "gpu-bootstrap-window-mb = ${GPU_BOOTSTRAP_WINDOW_MB:-64}"
     echo "gpu-bootstrap-windows = ${GPU_BOOTSTRAP_WINDOWS:-4}"
     echo "gpu-graph-prefetch-depth = ${GPU_GRAPH_PREFETCH_DEPTH:-32}"
+    echo "gpu-query-graph-read-policy = ${GPU_QUERY_GRAPH_READ_POLICY:-fixed}"
     echo "gpu-query-expansion-policy = ${GPU_QUERY_EXPANSION_POLICY:-fixed}"
     echo "gpu-query-beam-merge-policy = ${GPU_QUERY_BEAM_MERGE_POLICY:-legacy}"
     echo "query-rdma-trace-mode = ${QUERY_RDMA_TRACE_MODE:-off}"

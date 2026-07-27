@@ -21,6 +21,9 @@
 
 1. 计算服务读取 metadata 与 PQ 模型，仅从不可变尺寸、offset 和格式字段合成并校验
    内存中的分片布局；medoid 与离线采样 entry-point 不属于在线查询契约。
+   当 `gpu-query-graph-read-policy=live-extent` 时，同时加载
+   `<prefix>.gextent8`，并校验 build fingerprint、节点/分片数、记录容量、指针宽度
+   及 header/payload checksum；任何不匹配都在创建查询资源前失败。
 2. 每个存储节点加载自身 `.dat` 和 `.centroid`。后者包含该物理分片的补偿式 FP64
    sum/count 与 1--4 个真实存活入口，用于恢复 `CentroidRouter` 的首个版本。
 3. 存储节点把 `.pq32.codes` 放入 metadata 指定的注册内存区间，并在 control block
@@ -61,7 +64,9 @@ thread 只做以下工作：
 3. 在同一完整 publication 中读取每个物理分片的 centroid 和实时入口，按 centroid
    距离选择最近的一个物理分片并对其入口打分；跨分片遍历只由真实图边引入；
 4. 从 beam 选择未展开候选；
-5. 以 `gpu-graph-prefetch-depth` 并行发出远端图读取；
+5. 以 `gpu-graph-prefetch-depth` 并行发出远端图读取。默认 `fixed` 为每条 WQE
+   使用完整物理记录长度；`live-extent` 在不增加 WQE/descriptor/CQE 的前提下，
+   为同一 descriptor 中每条静态记录选择独立的 8-edge 分档长度；
 6. 解码 8-byte incarnation-tagged RemotePtr，并用对应 PQ code 评分；
 7. 去重、合并并裁剪到 traversal beam；
 8. 达到收敛或 `gpu-max-expansions` 后进入精排。
@@ -150,6 +155,14 @@ GPU 图读取也遵守同一规则：checksum 完整但 incarnation 与请求 ha
 checksum 契约的记录才触发 fail-stop。这样槽复用是正常并发现象，而不是伪装成硬件
 故障。
 
+Live-Extent 把存储分配大小和网络传输大小解耦，但不改变存储格式。静态记录发起
+one-sided READ 前，从 1 byte/base-node 的只读 sidecar 取得能够覆盖构建时 live
+邻接前缀的长度档；目标 scratch 仍是完整物理记录大小，并在 READ 前协作清零未读
+suffix，因此继续使用原有的 full-record checksum。返回 header 声明的 live prefix
+超出已读范围，或重构后的结构/checksum 无效时，该请求在下一 snapshot attempt
+升级为 full read。动态记录没有静态 ordinal，始终 full read。由此，过期 hint
+最多增加一次有显式统计的 fallback，不能造成邻接截断。
+
 这里的“退休”不是伪装成静态索引重写：静态 PQ/图 generation 在线保持不变，
 已 Stage2 完成的存活动态节点继续由存储节点持有并按需 RDMA 访问。schema-16 的
 8-byte `RemotePtr` 同时携带 shard、16-byte aligned offset 和 24-bit incarnation；
@@ -177,6 +190,8 @@ watermark 后才可复用，复用时递增 incarnation；计数耗尽的
 - `N * M` 字节的常驻 PQ code，默认 `M=32`；
 - 每物理分片一个 centroid、版本和最多 4 个 live entry 的固定上界路由状态；
 - query、OPQ 输出、LUT、beam、visited set、centroid 路由入口和结果；
+- 可选 Live-Extent 的 `N` byte class table，以及每 query slot
+  `kPersistentMaxPrefetch * sizeof(u32)` 的 request-length scratch；
 - DOCA/CUDA 外部状态的固定安全余量。
 
 默认 SIFT1B：
@@ -195,11 +210,13 @@ watermark 后才可复用，复用时递增 incarnation；计数耗尽的
 
 - 连续 PQ code 只在启动时传输一次；
 - 稳态只按需读取由 `R` 决定且不超过 2048 B 的紧凑图记录和最终精确向量；
+- Live-Extent 保留固定远端记录的更新余量，但只把当前长度档覆盖的邻接前缀搬过网络；
 - 每个 storage node 使用多条长期存活的 GPU QP；
 - 查询状态、LUT、beam 和 centroid route 状态均预分配；
 - 多查询并发隐藏远端延迟，而不是同步执行单查询 RDMA 往返；
 - telemetry 分别记录图读、精确读、GPU phase cycle、direct-path failure 和
-  centroid route probe/body/publication。
+  centroid route probe/body/publication；图读额外报告真实 payload bytes、
+  short/full WQE 及 stale-hint fallback，不能再用物理记录大小估算流量。
 
 要判断是否达到目标吞吐，必须同时检查 QPS、recall、GPU utilization、QP 错误、
 direct-path failure、每查询图读取数和精确读取数。单独看到 GPUNetIO probe 成功

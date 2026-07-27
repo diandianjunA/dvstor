@@ -17,6 +17,20 @@ namespace {
 constexpr uint64_t kPollSpinLimit = 100000000ULL;
 constexpr int kPollTimeoutStatus = -110;
 
+__device__ __forceinline__ uint64_t probe_global_time_ns() {
+  uint64_t value = 0;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
+  return value;
+}
+
+__device__ __forceinline__ uint64_t probe_mix64(uint64_t value) {
+  value ^= value >> 30;
+  value *= 0xbf58476d1ce4e5b9ULL;
+  value ^= value >> 27;
+  value *= 0x94d049bb133111ebULL;
+  return value ^ (value >> 31);
+}
+
 template <enum doca_gpu_dev_verbs_resource_sharing_mode sharing_mode>
 __device__ inline int poll_cq_at_with_timeout(struct doca_gpu_dev_verbs_cq* cq,
                                               const uint64_t ticket,
@@ -49,6 +63,39 @@ __device__ inline int poll_cq_at_with_timeout(struct doca_gpu_dev_verbs_cq* cq,
 
   return kPollTimeoutStatus;
 }
+
+__device__ inline int poll_payload_cq_at_with_timeout(
+    struct doca_gpu_dev_verbs_cq* cq, const uint64_t ticket,
+    const uint64_t timeout_ns) {
+  auto* cqe_base = reinterpret_cast<struct mlx5_cqe64*>(
+    __ldg(reinterpret_cast<uintptr_t*>(&cq->cqe_daddr)));
+  const uint32_t cqe_num = __ldg(&cq->cqe_num);
+  const uint32_t idx = ticket & (cqe_num - 1);
+  auto* cqe64 = &cqe_base[idx];
+  const uint64_t started = probe_global_time_ns();
+
+  for (;;) {
+    const uint64_t curr_cons_index =
+      doca_gpu_dev_verbs_load_relaxed<
+        DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE>(&cq->cqe_ci);
+    const uint8_t opown = doca_gpu_dev_verbs_load_relaxed_sys_global(
+      reinterpret_cast<uint8_t*>(&cqe64->op_own));
+    if (!((curr_cons_index <= ticket) &&
+          ((opown & MLX5_CQE_OWNER_MASK) ^ !!(ticket & cqe_num)))) {
+      const uint8_t opcode =
+        opown >> DOCA_GPUNETIO_VERBS_MLX5_CQE_OPCODE_SHIFT;
+      doca_gpu_dev_verbs_fence_acquire<
+        DOCA_GPUNETIO_VERBS_SYNC_SCOPE_SYS>();
+      doca_gpu_dev_verbs_cq_update_dbrec<false>(cq, 1);
+      return opcode == MLX5_CQE_REQ_ERR ? -EIO : 0;
+    }
+    if (probe_global_time_ns() - started >= timeout_ns) {
+      return kPollTimeoutStatus;
+    }
+    __nanosleep(128);
+  }
+}
+
 __global__ void gpunetio_read_probe_kernel(GpuNetioReadProbeParams params) {
   if (blockIdx.x != 0 || threadIdx.x != 0) return;
   if (params.remote_region_count == 0 || params.qp_array == nullptr ||
@@ -160,11 +207,169 @@ __global__ void gpunetio_read_probe_kernel(GpuNetioReadProbeParams params) {
   *params.status_code = dump_status;
 }
 
+__global__ void gpunetio_payload_probe_kernel(
+    GpuNetioPayloadProbeParams params) {
+  constexpr uint32_t kWarpWidth = 32;
+  const uint32_t lane = threadIdx.x % kWarpWidth;
+  const uint32_t warps_per_block = blockDim.x / kWarpWidth;
+  const uint32_t warp_in_block = threadIdx.x / kWarpWidth;
+  const uint32_t worker = blockIdx.x * warps_per_block + warp_in_block;
+  if (worker >= params.active_qps) return;
+
+  int status = 0;
+  if (lane == 0) {
+    if (params.remote_region_count == 0 || params.qp_array == nullptr ||
+        params.remote_regions == nullptr || worker >= params.qp_count ||
+        params.qp_array[worker] == nullptr || params.destination == nullptr ||
+        params.dump_ptr == nullptr || params.first_stage_bytes == 0 ||
+        params.batch_reads == 0 || params.measured_batches == 0 ||
+        params.destination_stride < params.first_stage_bytes ||
+        (params.second_stage_bytes != 0 &&
+         params.destination_stride <
+           params.first_stage_bytes + params.second_stage_bytes) ||
+        params.remote_record_stride <
+          params.first_stage_bytes + params.second_stage_bytes ||
+        params.remote_span_bytes < params.remote_record_stride ||
+        params.first_stage_bytes > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE ||
+        params.second_stage_bytes > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE) {
+      status = -EINVAL;
+    }
+    params.status_codes[worker] = status;
+    params.completed_reads[worker] = 0;
+    params.dump_wqe_flags[worker] = 0;
+  }
+  status = __shfl_sync(0xffffffffu, status, 0);
+  if (status != 0) return;
+
+  const uint32_t memory_node = worker % params.remote_region_count;
+  const GpuNetioRemoteMemoryRegion region =
+    params.remote_regions[memory_node];
+  auto* qp =
+    reinterpret_cast<doca_gpu_dev_verbs_qp*>(params.qp_array[worker]);
+  auto* cq = doca_gpu_dev_verbs_qp_get_cq_sq(qp);
+  const bool need_dump = qp->need_dump;
+  const uint32_t stage_count = params.second_stage_bytes == 0 ? 1u : 2u;
+  if (lane == 0) {
+    params.dump_wqe_flags[worker] = need_dump ? 1u : 0u;
+    if (params.batch_reads + (need_dump ? 1u : 0u) > qp->sq_wqe_num) {
+      status = -E2BIG;
+      params.status_codes[worker] = status;
+    }
+  }
+  status = __shfl_sync(0xffffffffu, status, 0);
+  if (status != 0) return;
+
+  uint64_t measured_reads = 0;
+  const uint32_t total_batches =
+    params.warmup_batches + params.measured_batches;
+  for (uint32_t batch = 0; batch < total_batches; ++batch) {
+    uint64_t batch_started_ns = 0;
+    if (lane == 0) batch_started_ns = probe_global_time_ns();
+
+    for (uint32_t stage = 0; stage < stage_count; ++stage) {
+      const uint32_t bytes =
+        stage == 0 ? params.first_stage_bytes : params.second_stage_bytes;
+      const uint32_t remote_stage_offset =
+        stage == 0 ? 0u : params.first_stage_bytes;
+      uint64_t first_wqe = 0;
+      uint64_t completion_ticket = 0;
+      if (lane == 0) {
+        first_wqe = qp->sq_wqe_pi;
+        completion_ticket =
+          doca_gpu_dev_verbs_load_relaxed<
+            DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE>(
+              &cq->cqe_ci);
+      }
+      first_wqe = __shfl_sync(0xffffffffu, first_wqe, 0);
+      completion_ticket =
+        __shfl_sync(0xffffffffu, completion_ticket, 0);
+
+      for (uint32_t read = lane; read < params.batch_reads;
+           read += kWarpWidth) {
+        const uint64_t ticket = first_wqe + read;
+        auto* wqe = doca_gpu_dev_verbs_get_wqe_ptr(qp, ticket);
+        const bool final_read = read + 1 == params.batch_reads;
+        const auto flags = !need_dump && final_read
+          ? DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_UPDATE
+          : DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_ERROR_UPDATE;
+        const uint64_t record_count =
+          params.remote_span_bytes / params.remote_record_stride;
+        const uint64_t logical_read =
+          (static_cast<uint64_t>(worker) << 40) ^
+          (static_cast<uint64_t>(batch) << 16) ^ read;
+        const uint64_t record =
+          probe_mix64(logical_read + 0x9e3779b97f4a7c15ULL) %
+          record_count;
+        const uint64_t remote_address =
+          region.address + record * params.remote_record_stride +
+          remote_stage_offset;
+        auto* destination =
+          params.destination +
+          (static_cast<size_t>(worker) * params.batch_reads + read) *
+            params.destination_stride + remote_stage_offset;
+        const uint64_t local_iova =
+          reinterpret_cast<uint64_t>(destination) - params.local_iova_base;
+        doca_gpu_dev_verbs_wqe_prepare_read(
+          qp, wqe, ticket, flags, remote_address, region.rkey,
+          local_iova, params.local_mkey, bytes);
+      }
+      __syncwarp();
+
+      if (lane == 0) {
+        uint64_t final_wqe = first_wqe + params.batch_reads - 1;
+        if (need_dump) {
+          final_wqe = first_wqe + params.batch_reads;
+          auto* dump_wqe = doca_gpu_dev_verbs_get_wqe_ptr(qp, final_wqe);
+          doca_gpu_dev_verbs_wqe_prepare_dump(
+            qp, dump_wqe, final_wqe,
+            DOCA_GPUNETIO_MLX5_WQE_CTRL_CQ_UPDATE,
+            reinterpret_cast<uint64_t>(params.dump_ptr) -
+              params.local_iova_base,
+            params.local_mkey, 1);
+        }
+        doca_gpu_dev_verbs_submit<
+          DOCA_GPUNETIO_VERBS_RESOURCE_SHARING_MODE_EXCLUSIVE>(
+            qp, final_wqe + 1);
+        status = poll_payload_cq_at_with_timeout(
+          cq, completion_ticket, params.timeout_ns);
+      }
+      status = __shfl_sync(0xffffffffu, status, 0);
+      __syncwarp();
+      if (status != 0) break;
+    }
+
+    if (lane == 0 && status == 0 && batch >= params.warmup_batches) {
+      const uint32_t measured_index = batch - params.warmup_batches;
+      params.batch_latency_ns[
+        static_cast<size_t>(worker) * params.measured_batches +
+        measured_index] = probe_global_time_ns() - batch_started_ns;
+      measured_reads +=
+        static_cast<uint64_t>(params.batch_reads) * stage_count;
+    }
+    status = __shfl_sync(0xffffffffu, status, 0);
+    if (status != 0) break;
+  }
+
+  if (lane == 0) {
+    params.status_codes[worker] = status;
+    params.completed_reads[worker] = measured_reads;
+  }
+}
+
 }  // namespace
 
 void launch_gpunetio_read_probe(
     cudaStream_t stream, const GpuNetioReadProbeParams& params) {
   gpunetio_read_probe_kernel<<<1, 1, 0, stream>>>(params);
+}
+
+void launch_gpunetio_payload_probe(
+    cudaStream_t stream, const GpuNetioPayloadProbeParams& params) {
+  constexpr uint32_t kThreads = 128;
+  constexpr uint32_t kWarpsPerBlock = kThreads / 32;
+  const uint32_t blocks =
+    (params.active_qps + kWarpsPerBlock - 1) / kWarpsPerBlock;
+  gpunetio_payload_probe_kernel<<<blocks, kThreads, 0, stream>>>(params);
 }
 
 }  // namespace gpu

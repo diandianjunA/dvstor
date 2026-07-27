@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "common/vector_dtype.hh"
+#include "gpu_search/index_format.hh"
 #include "gpu_search/persistent_kernel.hh"
 #include "service/breakdown.hh"
 #include "tools/breakdown_benchmark/dataset.hh"
@@ -120,6 +121,13 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"gpu_query_slots", service.config().gpu_query_slots},
     {"gpu_rdma_qps", service.config().gpu_rdma_qps},
     {"gpu_graph_prefetch_depth", service.config().gpu_graph_prefetch_depth},
+    {"gpu_query_graph_read_policy",
+      service.config().gpu_query_graph_read_policy},
+    {"gpu_graph_physical_record_bytes", VamanaNode::hot_graph_entry_size()},
+    {"gpu_graph_entry_capacity", VamanaNode::graph_entry_capacity()},
+    {"gpu_graph_extent_quantum_edges",
+      gpu_search::format::kGraphExtentQuantum},
+    {"gpu_graph_extent_sidecar_format", "global_ordinal_u8_gextent8_v1"},
     {"gpu_query_expansion_policy",
       service.config().gpu_query_expansion_policy},
     {"gpu_query_beam_merge_policy",

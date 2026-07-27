@@ -17,6 +17,11 @@ namespace gpu_search::format {
 inline constexpr std::array<char, 8> kCodeMagic{'D', 'V', 'G', 'P', 'U', 'C', '6', '\0'};
 inline constexpr u32 kVersion = 6;
 inline constexpr u32 kEndianMarker = 0x01020304;
+inline constexpr std::array<char, 8> kGraphExtentMagic{
+  'D', 'V', 'G', 'E', 'X', 'T', '8', '\0'};
+inline constexpr u32 kGraphExtentVersion = 1;
+inline constexpr u32 kGraphExtentQuantum = 8;
+inline constexpr u32 kGraphExtentClassBytes = sizeof(u8);
 inline constexpr u32 kMaxGraphEntryBytes = 2048;
 inline constexpr u32 kCompactPointerBytes = sizeof(u64);
 inline constexpr u64 kNodeBaseOffset = 16;
@@ -173,6 +178,31 @@ struct CodeHeader {
   std::array<u64, 2> reserved{};
 };
 
+// One byte per immutable base-node ordinal. A class c means that a one-sided
+// graph READ must cover at least c groups of kGraphExtentQuantum consecutive
+// RemotePtrs after the fixed 16-byte graph header. The final class is clamped
+// to graph_entry_bytes, so layouts whose capacity is not a multiple of the
+// quantum remain exactly representable.
+struct GraphExtentHeader {
+  std::array<char, 8> magic{kGraphExtentMagic};
+  u32 version{kGraphExtentVersion};
+  u32 header_bytes{sizeof(GraphExtentHeader)};
+  u32 endian_marker{kEndianMarker};
+  u32 extent_quantum{kGraphExtentQuantum};
+  u32 class_bytes{kGraphExtentClassBytes};
+  u32 graph_pointer_bytes{kCompactPointerBytes};
+  u32 graph_entry_bytes{};
+  u32 graph_entry_capacity{};
+  u32 num_shards{};
+  u32 reserved0{};
+  u64 num_nodes{};
+  u64 payload_bytes{};
+  u64 build_fingerprint{};
+  u64 payload_checksum{};
+  u64 header_checksum{};
+  std::array<u64, 5> reserved{};
+};
+
 static_assert(sizeof(ShardRegion) == 88);
 static_assert(sizeof(StorageCentroidRouteDescriptor) == 64);
 static_assert(offsetof(StorageControlBlock, centroid_route) == 128);
@@ -181,6 +211,7 @@ static_assert(sizeof(StorageControlBlock) <= kStorageControlBytes);
 static_assert(sizeof(StorageCentroidRouteEntry) == 16);
 static_assert(sizeof(StorageCentroidRoutePublicationHeader) == 128);
 static_assert(sizeof(CodeHeader) == 120);
+static_assert(sizeof(GraphExtentHeader) == 128);
 
 u32 centroid_scalar_bytes(CentroidScalarType type);
 u64 storage_centroid_route_publication_bytes(
@@ -229,6 +260,20 @@ bool read_code_header(const std::filesystem::path& path, CodeHeader& header,
                       std::string* error = nullptr);
 bool write_code_header(std::ostream& output, const CodeHeader& header,
                        std::string* error = nullptr);
+
+u32 graph_extent_class(u32 live_neighbors);
+u32 graph_extent_read_bytes(u32 extent_class, u32 graph_entry_bytes);
+bool validate_graph_extent_header(
+  const GraphExtentHeader& header, std::string* error = nullptr);
+bool read_graph_extent_header(
+  const std::filesystem::path& path, GraphExtentHeader& header,
+  std::string* error = nullptr);
+bool read_graph_extent_sidecar(
+  const std::filesystem::path& path, GraphExtentHeader& header,
+  std::vector<u8>& classes, std::string* error = nullptr);
+bool write_graph_extent_header(
+  std::ostream& output, const GraphExtentHeader& header,
+  std::string* error = nullptr);
 
 bool ordinal_to_remote(const View& view, u32 ordinal, RemotePtr& pointer);
 bool remote_to_ordinal(const View& view, RemotePtr pointer, u32& ordinal);

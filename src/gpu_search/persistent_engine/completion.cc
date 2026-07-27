@@ -2,6 +2,8 @@
 #include "gpu_search/persistent_engine/cuda_helpers.hh"
 
 #include <cerrno>
+#include <cmath>
+#include <cstring>
 
 namespace gpu_search {
 
@@ -9,32 +11,66 @@ using namespace persistent_engine_detail;
 
 void PersistentSearchEngine::Impl::write_query_rdma_trace(
     const CompletionDescriptor& completion) {
-  if (completion.trace_event_count == 0 ||
-      d_query_rdma_trace_events == nullptr ||
-      !query_rdma_trace_stream.is_open()) {
+  if (!query_rdma_trace_stream.is_open()) {
     return;
   }
-  std::vector<QueryRdmaTraceEvent> trace_events(completion.trace_event_count);
-  check_cuda(cudaMemcpy(
-    trace_events.data(),
-    d_query_rdma_trace_events +
-      static_cast<size_t>(completion.query_slot) *
-        config.query_rdma_trace_events_per_query,
-    trace_events.size() * sizeof(QueryRdmaTraceEvent),
-    cudaMemcpyDeviceToHost), "cudaMemcpy(query RDMA trace events)");
+  const u32 rdma_event_count = std::min(
+    completion.trace_event_count, config.query_rdma_trace_events_per_query);
+  const u32 adjacency_event_count = std::min(
+    completion.adjacency_oracle_event_count,
+    config.query_rdma_trace_events_per_query);
+  const bool have_rdma_events =
+    rdma_event_count != 0 && d_query_rdma_trace_events != nullptr;
+  const bool have_adjacency_events =
+    adjacency_event_count != 0 &&
+    d_query_adjacency_oracle_trace_events != nullptr;
+  if (!have_rdma_events && !have_adjacency_events) return;
+
+  std::vector<QueryRdmaTraceEvent> trace_events(rdma_event_count);
+  if (have_rdma_events) {
+    check_cuda(cudaMemcpy(
+      trace_events.data(),
+      d_query_rdma_trace_events +
+        static_cast<size_t>(completion.query_slot) *
+          config.query_rdma_trace_events_per_query,
+      trace_events.size() * sizeof(QueryRdmaTraceEvent),
+      cudaMemcpyDeviceToHost), "cudaMemcpy(query RDMA trace events)");
+  }
+  std::vector<QueryAdjacencyOracleTraceEvent> adjacency_events(
+    adjacency_event_count);
+  if (have_adjacency_events) {
+    check_cuda(cudaMemcpy(
+      adjacency_events.data(),
+      d_query_adjacency_oracle_trace_events +
+        static_cast<size_t>(completion.query_slot) *
+          config.query_rdma_trace_events_per_query,
+      adjacency_events.size() * sizeof(QueryAdjacencyOracleTraceEvent),
+      cudaMemcpyDeviceToHost),
+      "cudaMemcpy(query adjacency oracle trace events)");
+  }
   std::lock_guard<std::mutex> trace_lock(query_rdma_trace_mutex);
   query_rdma_trace_stream
     << "{\"type\":\"query\",\"request_id\":"
     << completion.request_id << ",\"query_slot\":"
     << completion.query_slot << ",\"status\":" << completion.status
-    << ",\"event_count\":" << completion.trace_event_count
+    << ",\"event_count\":" << rdma_event_count
     << ",\"overflow\":" << completion.trace_overflow
+    << ",\"adjacency_oracle_event_count\":" << adjacency_event_count
+    << ",\"adjacency_oracle_overflow\":"
+    << completion.adjacency_oracle_overflow
     << ",\"gpu_cycles\":" << completion.gpu_cycles
     << ",\"gpu_clock_khz\":" << gpu_clock_khz
     << ",\"graph_rounds\":" << completion.graph_rounds
     << ",\"graph_reads\":" << completion.remote_pages
     << ",\"graph_batches\":" << completion.remote_batches
     << ",\"graph_read_retries\":" << completion.graph_read_retries
+    << ",\"graph_read_bytes\":" << completion.graph_read_bytes
+    << ",\"graph_live_extent_reads\":"
+    << completion.graph_live_extent_reads
+    << ",\"graph_full_record_reads\":"
+    << completion.graph_full_record_reads
+    << ",\"graph_extent_fallback_reads\":"
+    << completion.graph_extent_fallback_reads
     << ",\"beam_selection_cycles\":" << completion.beam_selection_cycles
     << ",\"rdma_issue_cycles\":" << completion.rdma_issue_cycles
     << ",\"rdma_wait_cycles\":" << completion.rdma_wait_cycles
@@ -80,15 +116,154 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
   for (const QueryRdmaTraceEvent& event : trace_events) {
     query_rdma_trace_stream
       << "{\"type\":\"shard_batch\",\"request_id\":" << event.request_id
+      << ",\"route_attempt\":" << event.route_attempt
       << ",\"search_round\":" << event.search_round
       << ",\"snapshot_attempt\":" << event.snapshot_attempt
       << ",\"target_shard\":" << event.target_shard
       << ",\"parent_count\":" << event.parent_count
-      << ",\"bytes_per_parent\":" << event.bytes_per_parent
+      << ",\"payload_bytes\":" << event.payload_bytes
+      << ",\"minimum_bytes_per_parent\":"
+      << event.minimum_bytes_per_parent
+      << ",\"maximum_bytes_per_parent\":"
+      << event.maximum_bytes_per_parent
       << ",\"issue_timestamp_ns\":" << event.issue_timestamp_ns
+      << ",\"wait_phase_start_timestamp_ns\":"
+      << event.wait_phase_start_timestamp_ns
       << ",\"completion_timestamp_ns\":" << event.completion_timestamp_ns
       << ",\"batch_process_start_timestamp_ns\":"
       << event.batch_process_start_timestamp_ns << "}\n";
+  }
+  auto write_group_array = [this](const char* name, const u32* values) {
+    query_rdma_trace_stream << ",\"" << name << "\":[";
+    for (u32 index = 0; index < kQueryAdjacencyOracleGroupCount; ++index) {
+      if (index != 0) query_rdma_trace_stream << ',';
+      query_rdma_trace_stream << values[index];
+    }
+    query_rdma_trace_stream << ']';
+  };
+  auto write_prefix_array = [this](const char* name, const u32* values) {
+    query_rdma_trace_stream << ",\"" << name << "\":[";
+    for (u32 index = 0; index < kQueryAdjacencyOraclePrefixCount; ++index) {
+      if (index != 0) query_rdma_trace_stream << ',';
+      query_rdma_trace_stream << values[index];
+    }
+    query_rdma_trace_stream << ']';
+  };
+  auto write_turnover_u32_array =
+    [this](const char* name, const u32* values, u32 count) {
+      query_rdma_trace_stream << ",\"" << name << "\":[";
+      for (u32 index = 0;
+           index < std::min(count, kQueryBeamTurnoverTraceWidth); ++index) {
+        if (index != 0) query_rdma_trace_stream << ',';
+        query_rdma_trace_stream << values[index];
+      }
+      query_rdma_trace_stream << ']';
+    };
+  auto write_turnover_u64_array =
+    [this](const char* name, const u64* values, u32 count) {
+      query_rdma_trace_stream << ",\"" << name << "\":[";
+      for (u32 index = 0;
+           index < std::min(count, kQueryBeamTurnoverTraceWidth); ++index) {
+        if (index != 0) query_rdma_trace_stream << ',';
+        query_rdma_trace_stream << values[index];
+      }
+      query_rdma_trace_stream << ']';
+    };
+  for (const QueryAdjacencyOracleTraceEvent& event : adjacency_events) {
+    f32 cutoff_distance = 0.0f;
+    static_assert(sizeof(cutoff_distance) == sizeof(event.cutoff_distance_bits));
+    std::memcpy(
+      &cutoff_distance, &event.cutoff_distance_bits,
+      sizeof(cutoff_distance));
+    query_rdma_trace_stream
+      << "{\"type\":\"adjacency_oracle\",\"schema\":2,\"request_id\":"
+      << event.request_id
+      << ",\"search_round\":" << event.search_round
+      << ",\"chunk_begin\":" << event.chunk_begin
+      << ",\"parent_count\":" << event.parent_count
+      << ",\"edge_count\":" << event.edge_count
+      << ",\"invalid_decoded_count\":" << event.invalid_decoded_count
+      << ",\"dynamic_edge_count\":" << event.dynamic_edge_count
+      << ",\"visited_survivor_count\":" << event.visited_survivor_count
+      << ",\"finite_scored_count\":" << event.finite_scored_count
+      << ",\"beam_count_before\":" << event.beam_count_before
+      << ",\"beam_capacity\":" << event.beam_capacity
+      << ",\"cutoff_distance_bits\":" << event.cutoff_distance_bits
+      << ",\"cutoff_distance\":";
+    if (std::isfinite(cutoff_distance)) {
+      query_rdma_trace_stream << cutoff_distance;
+    } else {
+      query_rdma_trace_stream << "null";
+    }
+    query_rdma_trace_stream
+      << ",\"new_candidates_in_beam\":" << event.new_candidates_in_beam
+      << ",\"interval_lb_violation_count\":"
+      << event.interval_lb_violation_count
+      << ",\"minimum_interval_safety_margin\":";
+    if (std::isfinite(event.minimum_interval_safety_margin)) {
+      query_rdma_trace_stream << event.minimum_interval_safety_margin;
+    } else {
+      query_rdma_trace_stream << "null";
+    }
+    write_group_array("total_groups", event.total_groups);
+    write_group_array(
+      "certificate_needed_groups", event.certificate_needed_groups);
+    write_group_array(
+      "post_visited_needed_groups", event.post_visited_needed_groups);
+    write_group_array(
+      "final_beam_needed_groups", event.final_beam_needed_groups);
+    write_group_array(
+      "certificate_needed_runs", event.certificate_needed_runs);
+    write_group_array(
+      "certificate_first_group_needed_parents",
+      event.certificate_first_group_needed_parents);
+    write_group_array(
+      "interval_needed_groups", event.interval_needed_groups);
+    write_group_array(
+      "interval_needed_runs", event.interval_needed_runs);
+    write_group_array(
+      "interval_first_group_needed_parents",
+      event.interval_first_group_needed_parents);
+    write_prefix_array("parents_with_tail", event.parents_with_tail);
+    write_prefix_array(
+      "perfect_tail_needed_parents", event.perfect_tail_needed_parents);
+    write_prefix_array(
+      "suffix_interval_tail_needed_parents",
+      event.suffix_interval_tail_needed_parents);
+    write_prefix_array(
+      "post_visited_tail_needed_parents",
+      event.post_visited_tail_needed_parents);
+    write_prefix_array(
+      "final_beam_tail_needed_parents",
+      event.final_beam_tail_needed_parents);
+    write_prefix_array("total_tail_edges", event.total_tail_edges);
+    write_prefix_array(
+      "perfect_tail_needed_edges", event.perfect_tail_needed_edges);
+    write_prefix_array(
+      "suffix_interval_tail_needed_edges",
+      event.suffix_interval_tail_needed_edges);
+    query_rdma_trace_stream
+      << ",\"selected_productive_mask\":"
+      << event.selected_productive_mask
+      << ",\"frontier_count\":" << event.frontier_count
+      << ",\"frontier_new_mask\":" << event.frontier_new_mask
+      << ",\"round_graph_cycles\":" << event.round_graph_cycles
+      << ",\"round_score_cycles\":" << event.round_score_cycles
+      << ",\"round_beam_cycles\":" << event.round_beam_cycles;
+    write_turnover_u64_array(
+      "selected_handles", event.selected_handles, event.parent_count);
+    write_turnover_u32_array(
+      "selected_child_in_beam_count",
+      event.selected_child_in_beam_count, event.parent_count);
+    write_turnover_u32_array(
+      "selected_best_child_rank",
+      event.selected_best_child_rank, event.parent_count);
+    write_turnover_u64_array(
+      "frontier_handles", event.frontier_handles, event.frontier_count);
+    write_turnover_u32_array(
+      "frontier_distance_bits",
+      event.frontier_distance_bits, event.frontier_count);
+    query_rdma_trace_stream << "}\n";
   }
   query_rdma_trace_stream.flush();
 }
@@ -349,6 +524,13 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << completion.beam_merge_cycles * 1000ULL / gpu_clock_khz
                 << " graph_reads=" << completion.remote_pages
                 << " graph_rereads=" << completion.graph_read_retries
+                << " graph_bytes=" << completion.graph_read_bytes
+                << " graph_extent_reads="
+                << completion.graph_live_extent_reads
+                << " graph_full_reads="
+                << completion.graph_full_record_reads
+                << " graph_extent_fallbacks="
+                << completion.graph_extent_fallback_reads
                 << " graph_batches=" << completion.remote_batches
                 << " graph_rounds=" << completion.graph_rounds
                 << " route_hits=" << completion.route_hits
@@ -476,7 +658,8 @@ void PersistentSearchEngine::Impl::completion_loop() {
     engine.telemetry_.completion_wait_ns.fetch_add(end_to_end_ns,
                                                    std::memory_order_relaxed);
     const u64 physical_graph_reads =
-      static_cast<u64>(completion.remote_pages) + completion.graph_read_retries;
+      static_cast<u64>(completion.graph_live_extent_reads) +
+      completion.graph_full_record_reads;
     engine.telemetry_.graph_shard_batches.fetch_add(
       completion.remote_batches, std::memory_order_relaxed);
     engine.telemetry_.rdma_read_ops.fetch_add(
@@ -485,7 +668,7 @@ void PersistentSearchEngine::Impl::completion_loop() {
       std::memory_order_relaxed);
     engine.telemetry_.rdma_read_bytes.fetch_add(
       static_cast<u64>(completion.exact_vectors) * node_record_bytes +
-      physical_graph_reads * index.layout.graph_entry_bytes +
+      completion.graph_read_bytes +
       static_cast<u64>(completion.dynamic_code_reads) *
         dynamic_code_record_bytes,
       std::memory_order_relaxed);
@@ -546,6 +729,14 @@ void PersistentSearchEngine::Impl::completion_loop() {
                                                     std::memory_order_relaxed);
     engine.telemetry_.graph_read_retries.fetch_add(
       completion.graph_read_retries, std::memory_order_relaxed);
+    engine.telemetry_.graph_read_bytes.fetch_add(
+      completion.graph_read_bytes, std::memory_order_relaxed);
+    engine.telemetry_.graph_live_extent_reads.fetch_add(
+      completion.graph_live_extent_reads, std::memory_order_relaxed);
+    engine.telemetry_.graph_full_record_reads.fetch_add(
+      completion.graph_full_record_reads, std::memory_order_relaxed);
+    engine.telemetry_.graph_extent_fallback_reads.fetch_add(
+      completion.graph_extent_fallback_reads, std::memory_order_relaxed);
     engine.telemetry_.graph_dependency_rounds.fetch_add(
       completion.graph_rounds, std::memory_order_relaxed);
     engine.telemetry_.graph_route_hits.fetch_add(completion.route_hits,

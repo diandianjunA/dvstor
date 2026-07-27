@@ -46,6 +46,7 @@ public:
   u32 gpu_bootstrap_window_mb{64};
   u32 gpu_bootstrap_windows{2};
   u32 gpu_graph_prefetch_depth{32};
+  str gpu_query_graph_read_policy{"fixed"};
   str gpu_query_expansion_policy{"fixed"};
   str gpu_query_beam_merge_policy{"legacy"};
   str query_rdma_trace_mode{"off"};
@@ -103,6 +104,8 @@ public:
       vector_id_namespace_size = max_vectors;
     }
     vector_data_type = normalize_mode(vector_data_type);
+    gpu_query_graph_read_policy =
+      normalize_mode(gpu_query_graph_read_policy);
     gpu_query_expansion_policy =
       normalize_mode(gpu_query_expansion_policy);
     gpu_query_beam_merge_policy =
@@ -187,6 +190,10 @@ private:
       ("gpu-graph-prefetch-depth",
        po::value<u32>(&gpu_graph_prefetch_depth)->default_value(gpu_graph_prefetch_depth),
        "Graph records fetched concurrently by one GPU query.")
+      ("gpu-query-graph-read-policy",
+       po::value<str>(&gpu_query_graph_read_policy)
+         ->default_value(gpu_query_graph_read_policy),
+       "GPU graph-record transfer policy: fixed or live-extent.")
       ("gpu-query-expansion-policy",
        po::value<str>(&gpu_query_expansion_policy)
          ->default_value(gpu_query_expansion_policy),
@@ -330,6 +337,10 @@ private:
     if (query_rdma_trace_mode != "off" && query_rdma_trace_output.empty()) {
       fail("--query-rdma-trace-output is required when tracing is enabled");
     }
+    if (gpu_query_graph_read_policy != "fixed" &&
+        gpu_query_graph_read_policy != "live-extent") {
+      fail("--gpu-query-graph-read-policy must be fixed or live-extent");
+    }
     if (gpu_query_expansion_policy != "fixed" &&
         gpu_query_expansion_policy != "feedback-hunger" &&
         gpu_query_expansion_policy != "feedback-horizon-hunger") {
@@ -423,6 +434,8 @@ public:
              << config.gpu_final_rerank_width << '\n';
       output << std::setw(width) << "GPU max expansions: "
              << config.gpu_max_expansions << '\n';
+      output << std::setw(width) << "GPU graph read policy: "
+             << config.gpu_query_graph_read_policy << '\n';
       output << std::setw(width) << "GPU expansion policy: "
              << config.gpu_query_expansion_policy << '\n';
       output << std::setw(width) << "GPU Beam merge policy: "

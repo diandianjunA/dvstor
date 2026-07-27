@@ -219,6 +219,11 @@ struct PersistentSearchEngine::Impl {
   u32* d_dynamic_code_request_shards{};
   u64* d_dynamic_code_request_offsets{};
   u64* d_dynamic_code_request_local_iovas{};
+  // Optional immutable per-base-node extent classes. Dynamic records never
+  // consult this table and always use the full physical graph record.
+  u8* d_graph_extent_classes{};
+  u32* d_graph_request_bytes{};
+  u64 graph_extent_sidecar_bytes{};
   u64* d_query_dispatch_enqueue{};
   u64* d_query_dispatch_dequeue{};
   u64* d_query_dispatch_sequences{};
@@ -232,6 +237,10 @@ struct PersistentSearchEngine::Impl {
   u64* d_direct_batch_completion_timestamps_ns{};
   QueryRdmaTraceHeader* d_query_rdma_trace_headers{};
   QueryRdmaTraceEvent* d_query_rdma_trace_events{};
+  QueryAdjacencyOracleTraceHeader*
+    d_query_adjacency_oracle_trace_headers{};
+  QueryAdjacencyOracleTraceEvent*
+    d_query_adjacency_oracle_trace_events{};
   std::ofstream query_rdma_trace_stream;
   std::mutex query_rdma_trace_mutex;
   u32* direct_owner_phases_host{};

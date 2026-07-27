@@ -3,6 +3,8 @@
 
 #include <filesystem>
 
+#include "nlohmann/json.hh"
+
 namespace gpu_search {
 
 static_assert(kCentroidRouteMaxLiveEntries ==
@@ -13,6 +15,27 @@ using namespace persistent_engine_detail;
 namespace {
 
 static_assert(kPersistentMaxGraphDegree == kMaxSupportedGraphDegree);
+
+u64 read_index_build_fingerprint(const std::filesystem::path& index_prefix) {
+  const std::filesystem::path metadata_path{
+    index_prefix.string() + ".meta.json"};
+  std::ifstream input(metadata_path);
+  if (!input.good()) {
+    throw std::runtime_error(
+      "missing index metadata while validating graph extent sidecar: " +
+      metadata_path.string());
+  }
+  nlohmann::json metadata;
+  input >> metadata;
+  const u64 fingerprint =
+    metadata.value("index_build_fingerprint", u64{0});
+  if (fingerprint == 0) {
+    throw std::runtime_error(
+      "index metadata has no build fingerprint for graph extent validation: " +
+      metadata_path.string());
+  }
+  return fingerprint;
+}
 
 }  // namespace
 PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
@@ -74,6 +97,49 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
           vamana::hot_graph::kCompactPointerBytes) {
     throw std::runtime_error(
       "GPU hot graph cannot contain stable and provisional backlink slots");
+  }
+  std::vector<u8> graph_extent_classes;
+  format::GraphExtentHeader graph_extent_header{};
+  const bool live_extent_graph_reads =
+    config.gpu_query_graph_read_policy == "live-extent";
+  const std::filesystem::path graph_extent_path =
+    index_path::graph_extent_file(config.resolved_index_prefix());
+  if (live_extent_graph_reads) {
+    if (!format::read_graph_extent_sidecar(
+          graph_extent_path, graph_extent_header, graph_extent_classes,
+          &load_error)) {
+      throw std::runtime_error(
+        "live-extent graph reads require a valid extent sidecar: " +
+        load_error);
+    }
+    const u64 expected_build_fingerprint =
+      read_index_build_fingerprint(config.resolved_index_prefix());
+    if (graph_extent_header.num_nodes != index.layout.num_nodes ||
+        graph_extent_header.num_shards != index.layout.num_shards ||
+        graph_extent_header.graph_entry_bytes !=
+          index.layout.graph_entry_bytes ||
+        graph_extent_header.graph_entry_capacity != graph_entry_capacity ||
+        graph_extent_header.graph_pointer_bytes !=
+          index.layout.graph_pointer_bytes ||
+        graph_extent_header.build_fingerprint !=
+          expected_build_fingerprint ||
+        graph_extent_header.payload_bytes != index.layout.num_nodes ||
+        graph_extent_classes.size() != index.layout.num_nodes) {
+      throw std::runtime_error(
+        "graph extent sidecar does not match the active index: " +
+        graph_extent_path.string());
+    }
+    graph_extent_sidecar_bytes = graph_extent_classes.size();
+    std::cerr << "[gpu-search] graph-read-policy=live-extent"
+              << " extent_quantum=" << format::kGraphExtentQuantum
+              << " extent_source=" << graph_extent_path
+              << " extent_classes=" << graph_extent_classes.size()
+              << " extent_payload_bytes=" << graph_extent_sidecar_bytes
+              << '\n';
+  } else {
+    std::cerr << "[gpu-search] graph-read-policy=fixed"
+              << " graph_record_bytes=" << index.layout.graph_entry_bytes
+              << '\n';
   }
   const u32 score_chunk_capacity = persistent_score_chunk_capacity(
     graph_entry_capacity, config.gpu_traversal_beam_width);
@@ -223,8 +289,20 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
          static_cast<u64>(config.query_rdma_trace_events_per_query) *
            sizeof(QueryRdmaTraceEvent))
     : 0;
+  const u64 adjacency_oracle_trace_bytes = rdma_trace_enabled
+    ? static_cast<u64>(query_slots) *
+        (sizeof(QueryAdjacencyOracleTraceHeader) +
+         static_cast<u64>(config.query_rdma_trace_events_per_query) *
+           sizeof(QueryAdjacencyOracleTraceEvent))
+    : 0;
   const u64 graph_scratch_bytes = static_cast<u64>(query_slots) *
     kPersistentMaxPrefetch * kPersistentGraphReadBytes;
+  const u64 graph_request_metadata_bytes = live_extent_graph_reads
+    ? static_cast<u64>(query_slots) * kPersistentMaxPrefetch * sizeof(u32)
+    : 0;
+  const u64 graph_extent_device_bytes = live_extent_graph_reads
+    ? graph_extent_sidecar_bytes
+    : 0;
   const u64 centroid_route_bytes =
     static_cast<u64>(centroid_route_shard_capacity) *
       sizeof(DeviceCentroidRouteShard) +
@@ -247,6 +325,8 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     dynamic_request_scratch_bytes +
     navigation_candidate_bytes + query_dispatch_bytes + direct_queue_bytes +
     graph_scratch_bytes + route_graph_bytes + rdma_trace_bytes +
+    adjacency_oracle_trace_bytes +
+    graph_request_metadata_bytes + graph_extent_device_bytes +
     expansion_pressure_bytes;
   if (additional_scratch_bytes > usable_budget - budget.explicit_bytes) {
     throw std::runtime_error(
@@ -271,7 +351,11 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
             << " navigation_candidates=" << navigation_candidate_bytes
             << " direct_queue_scratch=" << direct_queue_bytes
             << " graph_scratch=" << graph_scratch_bytes
+            << " graph_request_metadata=" << graph_request_metadata_bytes
+            << " graph_extent_classes=" << graph_extent_device_bytes
             << " query_rdma_trace=" << rdma_trace_bytes
+            << " query_adjacency_oracle_trace="
+            << adjacency_oracle_trace_bytes
             << " centroid_route=" << centroid_route_bytes
             << " shard_centroids=" << shard_centroid_bytes
             << " expansion_pressure=" << expansion_pressure_bytes
@@ -359,6 +443,16 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   stream_codes_to_gpu(*control_bootstrapper);
 
   device_allocate(d_shards, index.shards.size(), "cudaMalloc(GPU navigation shards)");
+  if (live_extent_graph_reads) {
+    device_allocate(
+      d_graph_extent_classes, graph_extent_classes.size(),
+      "cudaMalloc(static graph extent classes)");
+    check_cuda(cudaMemcpy(
+                 d_graph_extent_classes, graph_extent_classes.data(),
+                 graph_extent_classes.size() * sizeof(u8),
+                 cudaMemcpyHostToDevice),
+               "cudaMemcpy(static graph extent classes)");
+  }
   device_allocate(d_opq_matrix, pq_model.rotation.size(), "cudaMalloc(OPQ matrix)");
   device_allocate(d_pq_centroids, pq_model.centroids.size(), "cudaMalloc(PQ centroids)");
   device_allocate(d_shard_centroids,
@@ -407,6 +501,16 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
                   "cudaMalloc(dynamic PQ request offsets)");
   device_allocate(d_dynamic_code_request_local_iovas, dynamic_request_elements,
                   "cudaMalloc(dynamic PQ request local IOVAs)");
+  if (live_extent_graph_reads) {
+    const size_t graph_request_elements =
+      static_cast<size_t>(query_slots) * kPersistentMaxPrefetch;
+    device_allocate(d_graph_request_bytes, graph_request_elements,
+                    "cudaMalloc(graph request byte lengths)");
+    check_cuda(cudaMemset(
+                 d_graph_request_bytes, 0,
+                 graph_request_elements * sizeof(u32)),
+               "cudaMemset(graph request byte lengths)");
+  }
   if (dynamic_code_arena_capacity >
       std::numeric_limits<size_t>::max() / code_bytes) {
     throw std::runtime_error("dynamic GPU PQ arena allocation exceeds size_t");
@@ -475,11 +579,23 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
       static_cast<size_t>(query_slots) *
         config.query_rdma_trace_events_per_query,
       "cudaMalloc(query RDMA trace events)");
+    device_allocate(d_query_adjacency_oracle_trace_headers, query_slots,
+                    "cudaMalloc(query adjacency oracle trace headers)");
+    device_allocate(
+      d_query_adjacency_oracle_trace_events,
+      static_cast<size_t>(query_slots) *
+        config.query_rdma_trace_events_per_query,
+      "cudaMalloc(query adjacency oracle trace events)");
     check_cuda(cudaMemset(
                  d_query_rdma_trace_headers, 0,
                  static_cast<size_t>(query_slots) *
                    sizeof(QueryRdmaTraceHeader)),
                "cudaMemset(query RDMA trace headers)");
+    check_cuda(cudaMemset(
+                 d_query_adjacency_oracle_trace_headers, 0,
+                 static_cast<size_t>(query_slots) *
+                   sizeof(QueryAdjacencyOracleTraceHeader)),
+               "cudaMemset(query adjacency oracle trace headers)");
     const std::filesystem::path output(config.query_rdma_trace_output);
     if (output.has_parent_path()) {
       std::filesystem::create_directories(output.parent_path());
@@ -489,12 +605,6 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
       throw std::runtime_error(
         "failed to open query RDMA trace output: " + output.string());
     }
-    query_rdma_trace_stream
-      << "{\"type\":\"metadata\",\"schema\":1,"
-         "\"completion_granularity\":\"shard_batch\","
-         "\"timestamp_clock\":\"GPU globaltimer nanoseconds\","
-         "\"completion_semantics\":\"owner CTA timestamp before status publication; "
-         "not NIC-internal completion\"}\n";
   }
   mapped_host_allocate(direct_owner_phases_host, d_direct_owner_phases,
                        direct_batch_queue_count,
@@ -630,7 +740,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   std::array<u32, 2> hardware_blocks_per_sm{};
   for (size_t index = 0; index < occupancies.size(); ++index) {
     occupancies[index] = inspect_persistent_search_kernel(
-      kPersistentThreadCandidates[index]);
+      kPersistentThreadCandidates[index], rdma_trace_enabled);
     hardware_blocks_per_sm[index] =
       occupancies[index].active_blocks_per_sm;
   }
@@ -644,6 +754,58 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   const size_t selected_index =
     kernel_threads == kPersistentThreadCandidates[0] ? 0 : 1;
   persistent_kernel_occupancy = occupancies[selected_index];
+  if (query_rdma_trace_stream.is_open()) {
+    query_rdma_trace_stream
+      << "{\"type\":\"metadata\",\"schema\":3,"
+         "\"completion_granularity\":\"shard_batch_owner_completion_boundary\","
+         "\"timestamp_clock\":\"GPU globaltimer nanoseconds\","
+         "\"completion_semantics\":\"owner CTA timestamp after the owner "
+         "submission group's final CQE and before descriptor status publication; "
+         "not per-parent, per-WQE, per-descriptor physical, or NIC-internal "
+         "completion\","
+      << "\"num_shards\":" << index.shards.size()
+      << ",\"direct_qps_per_node\":" << direct_view.qps_per_node
+      << ",\"kernel_threads\":" << kernel_threads
+      << ",\"natural_parent_tile\":" << std::max(1u, kernel_threads / 32u)
+      << ",\"prefetch_depth\":" << config.gpu_graph_prefetch_depth
+      << ",\"traversal_beam_width\":" << config.gpu_traversal_beam_width
+      << ",\"max_expansions\":" << config.gpu_max_expansions
+      << ",\"expansion_policy\":\"" << config.gpu_query_expansion_policy
+      << "\",\"beam_merge_policy\":\""
+      << config.gpu_query_beam_merge_policy
+      << "\",\"graph_read_policy\":\""
+      << config.gpu_query_graph_read_policy
+      << "\",\"graph_extent_quantum\":"
+      << format::kGraphExtentQuantum
+      << ",\"graph_extent_source\":\""
+      << (live_extent_graph_reads
+            ? "offline_global_ordinal_gextent8"
+            : "fixed_physical_record")
+      << "\"}\n";
+    query_rdma_trace_stream
+      << "{\"type\":\"adjacency_oracle_metadata\",\"schema\":1,"
+         "\"group_sizes\":[4,8,16,32],"
+         "\"prefix_sizes\":[8,16,32,48,64],"
+         "\"cutoff_semantics\":\"pre-merge full-Beam cutoff; FLT_MAX when "
+         "Beam is not full\","
+         "\"certificate_semantics\":\"perfect exact-ADC oracle over every "
+         "decoded edge including visited rejects; unavailable dynamic ADC "
+         "forces the group needed\","
+         "\"interval_certificate\":\"parent-centered annulus "
+         "LB=max(0,a-r,r-b)^2 using optimistic FP32 distances\","
+         "\"interval_validation\":\"violation means geometric LB exceeds "
+         "actual minimum device ADC; safety margin is actual_min_device_ADC "
+         "minus geometric LB over finite static groups and suffixes\","
+         "\"suffix_semantics\":\"one prefix read per parent plus one tail "
+         "read exactly when the selected tail predicate is needed\","
+         "\"post_visited_semantics\":\"diagnostic only\","
+         "\"final_beam_semantics\":\"diagnostic only\","
+      << "\"graph_entry_bytes\":" << index.layout.graph_entry_bytes
+      << ",\"graph_entry_capacity\":" << graph_entry_capacity
+      << ",\"remote_ptr_bytes\":8"
+      << ",\"event_bytes\":" << sizeof(QueryAdjacencyOracleTraceEvent)
+      << "}\n";
+  }
   if (config.gpu_query_expansion_policy == "feedback-hunger" ||
       config.gpu_query_expansion_policy == "feedback-horizon-hunger") {
     device_allocate(d_expansion_pressure, 1,
@@ -755,8 +917,14 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .centroid_route_entry_capacity = centroid_route_entry_capacity,
     .stop = stop_device,
     .graph_scratch = d_graph_scratch,
+    .graph_extent_classes = d_graph_extent_classes,
+    .graph_request_bytes = d_graph_request_bytes,
     .query_rdma_trace_headers = d_query_rdma_trace_headers,
     .query_rdma_trace_events = d_query_rdma_trace_events,
+    .query_adjacency_oracle_trace_headers =
+      d_query_adjacency_oracle_trace_headers,
+    .query_adjacency_oracle_trace_events =
+      d_query_adjacency_oracle_trace_events,
     .query_rdma_trace_mode = config.query_rdma_trace_mode == "full"
       ? static_cast<u32>(QueryRdmaTraceMode::full)
       : config.query_rdma_trace_mode == "sampled"

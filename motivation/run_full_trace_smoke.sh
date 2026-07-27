@@ -13,6 +13,8 @@ trace_path="$run_dir/rdma_trace.jsonl"
   set -a
   source "$MOTIVATION_DIR/configs/common.env"
   source "$MOTIVATION_DIR/configs/prefetch_${DEPTH}.env"
+  GPU_QUERY_EXPANSION_POLICY=fixed
+  GPU_QUERY_BEAM_MERGE_POLICY=stable-run
   BENCHMARK_CLIENT_THREADS=1
   REPORT_DIR="$run_dir"
   QUERY_RDMA_TRACE_MODE=full
@@ -25,4 +27,5 @@ trace_path="$run_dir/rdma_trace.jsonl"
   set +a
   "$PROJECT_DIR/experiment/run_breakdown.sh" "$PROFILE"
 )
-"$MOTIVATION_DIR/analyze_rdma_trace.py" "$trace_path"
+"$MOTIVATION_DIR/analyze_rdma_trace.py" \
+  --include-round-details "$trace_path"

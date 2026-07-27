@@ -612,6 +612,171 @@ bool write_code_header(std::ostream& output, const CodeHeader& source,
   return true;
 }
 
+u32 graph_extent_class(u32 live_neighbors) {
+  return live_neighbors / kGraphExtentQuantum +
+    (live_neighbors % kGraphExtentQuantum != 0 ? 1u : 0u);
+}
+
+u32 graph_extent_read_bytes(u32 extent_class, u32 graph_entry_bytes) {
+  constexpr u64 header_bytes = vamana::hot_graph::kTaggedNeighborBaseOffset;
+  const u64 requested = header_bytes +
+    static_cast<u64>(extent_class) * kGraphExtentQuantum *
+      kCompactPointerBytes;
+  return static_cast<u32>(std::min<u64>(requested, graph_entry_bytes));
+}
+
+bool validate_graph_extent_header(
+    const GraphExtentHeader& header, std::string* error) {
+  const auto fail = [&](const std::string& message) {
+    set_error(error, message);
+    return false;
+  };
+  if (header.magic != kGraphExtentMagic ||
+      header.version != kGraphExtentVersion ||
+      header.header_bytes != sizeof(GraphExtentHeader) ||
+      header.endian_marker != kEndianMarker ||
+      header.extent_quantum != kGraphExtentQuantum ||
+      header.class_bytes != kGraphExtentClassBytes ||
+      header.graph_pointer_bytes != kCompactPointerBytes ||
+      header.graph_entry_bytes <
+        vamana::hot_graph::kTaggedNeighborBaseOffset ||
+      header.graph_entry_bytes > kMaxGraphEntryBytes ||
+      header.graph_entry_capacity == 0 ||
+      header.graph_entry_capacity >
+        (kMaxGraphEntryBytes -
+         vamana::hot_graph::kTaggedNeighborBaseOffset) /
+          kCompactPointerBytes ||
+      header.graph_entry_bytes !=
+        vamana::hot_graph::kTaggedNeighborBaseOffset +
+          static_cast<u64>(header.graph_entry_capacity) *
+            kCompactPointerBytes ||
+      header.num_shards == 0 ||
+      header.num_shards > RemotePtr::MEMORY_NODE_MASK + 1 ||
+      header.reserved0 != 0 || header.num_nodes == 0 ||
+      header.num_nodes >= (1ull << 30) ||
+      header.num_nodes >
+        std::numeric_limits<u64>::max() / header.class_bytes ||
+      header.payload_bytes != header.num_nodes * header.class_bytes ||
+      header.build_fingerprint == 0 ||
+      std::any_of(
+        header.reserved.begin(), header.reserved.end(),
+        [](u64 value) { return value != 0; })) {
+    return fail("invalid graph extent sidecar header");
+  }
+  GraphExtentHeader copy = header;
+  const u64 stored_checksum = copy.header_checksum;
+  copy.header_checksum = 0;
+  if (checksum64(
+        reinterpret_cast<const byte_t*>(&copy), sizeof(copy)) !=
+      stored_checksum) {
+    return fail("graph extent sidecar header checksum mismatch");
+  }
+  if (error != nullptr) error->clear();
+  return true;
+}
+
+bool read_graph_extent_header(
+    const std::filesystem::path& path, GraphExtentHeader& header,
+    std::string* error) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input.good()) {
+    set_error(
+      error, "GPU graph extent sidecar does not exist: " + path.string());
+    return false;
+  }
+  input.read(reinterpret_cast<char*>(&header), sizeof(header));
+  if (!input.good() || !validate_graph_extent_header(header, error)) {
+    return false;
+  }
+  std::error_code file_error;
+  const u64 file_bytes = std::filesystem::file_size(path, file_error);
+  if (file_error ||
+      header.payload_bytes >
+        std::numeric_limits<u64>::max() - sizeof(GraphExtentHeader) ||
+      file_bytes != sizeof(GraphExtentHeader) + header.payload_bytes) {
+    set_error(
+      error, "GPU graph extent sidecar file size mismatch: " +
+        path.string());
+    return false;
+  }
+  if (error != nullptr) error->clear();
+  return true;
+}
+
+bool read_graph_extent_sidecar(
+    const std::filesystem::path& path, GraphExtentHeader& header,
+    std::vector<u8>& classes, std::string* error) {
+  classes.clear();
+  if (!read_graph_extent_header(path, header, error)) return false;
+  if (header.payload_bytes > std::numeric_limits<size_t>::max() ||
+      header.payload_bytes >
+        static_cast<u64>(std::numeric_limits<std::streamsize>::max())) {
+    set_error(
+      error, "GPU graph extent sidecar payload exceeds host I/O limits");
+    return false;
+  }
+  std::ifstream input(path, std::ios::binary);
+  input.seekg(static_cast<std::streamoff>(sizeof(GraphExtentHeader)));
+  classes.resize(static_cast<size_t>(header.payload_bytes));
+  input.read(
+    reinterpret_cast<char*>(classes.data()),
+    static_cast<std::streamsize>(classes.size()));
+  if (!input.good() ||
+      static_cast<size_t>(input.gcount()) != classes.size()) {
+    classes.clear();
+    set_error(
+      error, "short read from GPU graph extent sidecar: " + path.string());
+    return false;
+  }
+  const u32 maximum_class =
+    graph_extent_class(header.graph_entry_capacity);
+  if (std::any_of(
+        classes.begin(), classes.end(),
+        [maximum_class](u8 extent_class) {
+          return static_cast<u32>(extent_class) > maximum_class;
+        })) {
+    classes.clear();
+    set_error(error, "GPU graph extent sidecar contains an invalid class");
+    return false;
+  }
+  if (checksum64(classes.data(), classes.size()) !=
+      header.payload_checksum) {
+    classes.clear();
+    set_error(
+      error, "GPU graph extent sidecar payload checksum mismatch: " +
+        path.string());
+    return false;
+  }
+  if (error != nullptr) error->clear();
+  return true;
+}
+
+bool write_graph_extent_header(
+    std::ostream& output, const GraphExtentHeader& source,
+    std::string* error) {
+  GraphExtentHeader header = source;
+  header.magic = kGraphExtentMagic;
+  header.version = kGraphExtentVersion;
+  header.header_bytes = sizeof(GraphExtentHeader);
+  header.endian_marker = kEndianMarker;
+  header.extent_quantum = kGraphExtentQuantum;
+  header.class_bytes = kGraphExtentClassBytes;
+  header.graph_pointer_bytes = kCompactPointerBytes;
+  header.header_checksum = 0;
+  header.header_checksum = checksum64(
+    reinterpret_cast<const byte_t*>(&header), sizeof(header));
+  if (!validate_graph_extent_header(header, error)) return false;
+  output.seekp(0);
+  output.write(
+    reinterpret_cast<const char*>(&header), sizeof(header));
+  if (!output.good()) {
+    set_error(error, "failed to write GPU graph extent sidecar header");
+    return false;
+  }
+  if (error != nullptr) error->clear();
+  return true;
+}
+
 bool ordinal_to_remote(const View& view, u32 ordinal, RemotePtr& pointer) {
   if (ordinal >= view.layout.num_nodes) return false;
   const auto it = std::upper_bound(

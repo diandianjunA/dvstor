@@ -291,6 +291,14 @@ target_link_libraries(gpu_pq_index_test PRIVATE dvstor_runtime)
 target_compile_options(gpu_pq_index_test PRIVATE -UNDEBUG)
 add_test(NAME gpu_pq_index_test COMMAND gpu_pq_index_test)
 
+add_executable(graph_extent_indexer_test
+    graph_extent_indexer_test.cc
+    ${CMAKE_SOURCE_DIR}/tools/vamana_offline/graph_extent_indexer.cc)
+dvstor_target_tool_includes(graph_extent_indexer_test)
+target_link_libraries(graph_extent_indexer_test PRIVATE dvstor_runtime)
+target_compile_options(graph_extent_indexer_test PRIVATE -UNDEBUG)
+add_test(NAME graph_extent_indexer_test COMMAND graph_extent_indexer_test)
+
 add_executable(storage_reclaim_test storage_reclaim_test.cc)
 target_link_libraries(storage_reclaim_test PRIVATE dvstor_runtime)
 target_compile_options(storage_reclaim_test PRIVATE -UNDEBUG)

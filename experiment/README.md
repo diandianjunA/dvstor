@@ -48,14 +48,24 @@ export MN_MEMORY_GB=24
 存储节点脚本默认使用独立的 `build-storage`，先按根目录 README 配置 CPU-only
 构建，不能与计算节点的 `build` 共用。
 
-该命令先构建 compact Vamana/Metis 分片，再训练 OPQ/PQ32 并写码流：
+该命令先构建 compact Vamana/Metis 分片，再训练 OPQ/PQ32、写码流并生成
+Live-Extent 长度档：
 
 ```bash
 ./experiment/build_sift100m_index.sh 04_gpu_persistent_gpunetio
 ```
 
 完整构建以 schema-15 tagged graph 为中间态，最终直接生成 schema-16
-OPQ/PQ32 运行索引，无需随后重编码。
+OPQ/PQ32 运行索引和 `<prefix>.gextent8`，无需随后重编码。已有完整
+schema-16 分片也可在持有全部 `.dat` 的机器上单独生成：
+
+```bash
+./build/vamana_graph_extent_indexer \
+  --index-prefix "$INDEX_PREFIX"
+```
+
+工具会流式校验所有 graph record，再用同目录临时文件原子发布 sidecar；已有输出
+必须显式传入 `--overwrite`。
 推荐使用 `PQ_INDEX_PREFIX=/new/prefix` 保留已有索引；只有明确要删除目标 prefix
 下旧产物并原地重建时才设置 `OVERWRITE_INDEX=1`。
 
@@ -101,10 +111,14 @@ generation 或含动态 slot 的运行时快照；这类在线状态没有足够
 ```text
 <prefix>.meta.json
 <prefix>.pq32
+<prefix>.gextent8        # 仅 live-extent 模式需要
 ```
 
 纯查询配置使用 `enable-updates = false`，需要 `<prefix>.meta.json` 和
-`<prefix>.pq32`；不会启动更新执行器。在线 mutation 会持续
+`<prefix>.pq32`；`gpu-query-graph-read-policy = live-extent` 还要求
+`<prefix>.gextent8`，缺失或与 build fingerprint/布局不匹配时启动直接失败，不会
+静默退化成 fixed。该文件只有 1 byte/base-node 的长度档，不包含邻接表。纯查询不会启动
+更新执行器。在线 mutation 会持续
 更新 storage owner 的 centroid publication；每个计算节点从 storage 拉取同一版本化
 快照，因此其他计算节点写入的新代表节点同样可见。
 
@@ -118,7 +132,9 @@ generation 或含动态 slot 的运行时快照；这类在线状态没有足够
 <prefix>_nodeX_ofN.pq32.codes
 ```
 
-计算节点不需要 `.dat`、`.idmap`、`.pq32.codes` 或 `.gpu.idx`。METIS 只决定物理
+计算节点不需要 `.dat`、`.idmap`、`.pq32.codes` 或 `.gpu.idx`。Live-Extent
+sidecar 应在持有全部 `.dat` 的构建/存储机器上生成，再复制到计算节点的同一 prefix。
+METIS 只决定物理
 placement；基础和动态 ID 的逻辑 authority 都由 `ID % N` 确定，其存储端 idmap
 负责解析当前物理记录。因而增加计算节点不会复制一份 O(N) 的 ID 目录；每个存储
 节点只加载自己的 `owner_sharded_v2_bound` idmap。该文件与整次构建和 owner
@@ -134,6 +150,19 @@ placement；基础和动态 ID 的逻辑 authority 都由 `ID % N` 确定，其�
 不需要 `.pq32` 模型。
 
 ## 启动
+
+图读取策略：
+
+```text
+gpu-query-graph-read-policy = fixed        # 默认，始终读取完整记录
+gpu-query-graph-read-policy = live-extent  # 一次 one-sided READ 读取长度档覆盖的前缀
+```
+
+`live-extent` 不改变图记录、WQE 数、Beam/visited/扩展顺序或存储 CPU 路径。静态
+base node 使用离线长度档；动态 node 始终读取完整记录。并发更新使档位落后、或短读
+重构后的结构/checksum 校验失败时，同一父节点有界重试一次完整记录，并分别计入
+`graph_extent_fallback_reads`、`graph_full_record_reads` 和实际
+`graph_read_bytes`。
 
 在各存储节点准备对应文件后启动服务：
 

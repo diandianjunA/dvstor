@@ -16,7 +16,8 @@ PQ_ITERATIONS="${PQ_ITERATIONS:-25}"
 PQ_ENCODE_CHUNK_VECTORS="${PQ_ENCODE_CHUNK_VECTORS:-32768}"
 PQ_THREADS="${PQ_THREADS:-32}"
 
-ensure_built vamana_offline_builder vamana_pq_indexer
+ensure_built vamana_offline_builder vamana_pq_indexer \
+  vamana_graph_extent_indexer
 PREPARE_BENCHMARK_DATA=0 "$EXPERIMENT_DIR/prepare_sift100m_data.sh"
 
 mkdir -p "$(dirname "$INDEX_PREFIX")"
@@ -25,6 +26,7 @@ LOG_FILE="${BUILD_LOG:-$LOG_DIR/build_${PARTITION_STRATEGY}_$(date +%Y%m%d_%H%M%
 artifacts=(
   "${INDEX_PREFIX}.meta.json"
   "${INDEX_PREFIX}.pq${PQ_SUBQUANTIZERS}"
+  "${INDEX_PREFIX}.gextent8"
 )
 for ((node = 1; node <= SHARDS; ++node)); do
   artifacts+=(
@@ -74,6 +76,9 @@ pq=("$BUILD_DIR/vamana_pq_indexer"
   --seed "${SEED:-1234}")
 if [[ -n "${PQ_REUSE_MODEL:-}" ]]; then pq+=(--reuse-model "$PQ_REUSE_MODEL"); fi
 if [[ "${OVERWRITE_INDEX:-0}" == "1" ]]; then pq+=(--overwrite); fi
+extent=("$BUILD_DIR/vamana_graph_extent_indexer"
+  --index-prefix "$INDEX_PREFIX")
+if [[ "${OVERWRITE_INDEX:-0}" == "1" ]]; then extent+=(--overwrite); fi
 
 {
   echo "[build] schema-15 tagged graph intermediate: $INDEX_PREFIX"
@@ -85,8 +90,10 @@ if [[ "${OVERWRITE_INDEX:-0}" == "1" ]]; then pq+=(--overwrite); fi
   MKL_NUM_THREADS=1 \
   OMP_DYNAMIC=FALSE \
   "${pq[@]}"
+  printf '[extent] command:'; printf ' %q' "${extent[@]}"; echo
+  "${extent[@]}"
 } 2>&1 | tee "$LOG_FILE"
 
 validate_index_metadata storage
-echo "[build] complete: schema-16 persistent OPQ/PQ index $INDEX_PREFIX"
+echo "[build] complete: schema-16 persistent OPQ/PQ index and Live-Extent metadata $INDEX_PREFIX"
 echo "[build] log: $LOG_FILE"

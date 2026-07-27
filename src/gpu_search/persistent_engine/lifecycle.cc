@@ -351,6 +351,8 @@ PersistentSearchEngine::Impl::~Impl() {
   device_free(d_direct_batch_completion_timestamps_ns);
   device_free(d_query_rdma_trace_events);
   device_free(d_query_rdma_trace_headers);
+  device_free(d_query_adjacency_oracle_trace_events);
+  device_free(d_query_adjacency_oracle_trace_headers);
   device_free(d_expansion_qp_leases);
   device_free(d_expansion_pressure);
   device_free(d_direct_owner_progress);
@@ -371,6 +373,8 @@ PersistentSearchEngine::Impl::~Impl() {
   device_free(d_dynamic_code_request_local_iovas);
   device_free(d_dynamic_code_request_offsets);
   device_free(d_dynamic_code_request_shards);
+  device_free(d_graph_request_bytes);
+  device_free(d_graph_extent_classes);
   device_free(d_dynamic_code_arena_records);
   device_free(d_dynamic_code_arena_states);
   device_free(d_visited);

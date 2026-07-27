@@ -148,6 +148,11 @@ struct DirectBatchDescriptor {
   const u32* request_shards{};
   const u64* remote_offsets{};
   const u64* local_iova_offsets{};
+  // Optional per-request transfer lengths. A null pointer preserves the
+  // uniform `bytes` contract used by exact-vector and dynamic-code reads.
+  // The pointed-to device storage must remain live until completion_status is
+  // published by the exclusive QP owner.
+  const u32* request_bytes{};
   i32* completion_status{};
   u64* completion_timestamp_ns{};
   u32 request_count{};
@@ -155,6 +160,7 @@ struct DirectBatchDescriptor {
   u32 bytes{};
   u32 reserved{};
 };
+static_assert(sizeof(DirectBatchDescriptor) == 64);
 
 enum class QueryRdmaTraceMode : u32 {
   off = 0,
@@ -162,23 +168,109 @@ enum class QueryRdmaTraceMode : u32 {
   full = 2,
 };
 
-// Completion is intentionally shard-batch granular. GPUNetIO requests only a
-// CQE for the final READ (or dump WQE), so individual parent/WQE completion
-// times are not observable without changing the transport data path.
+// Completion is intentionally limited to the software-visible boundary of the
+// owner submission group containing this shard descriptor.  The owner requests
+// one success CQE for the group's final READ (or dump WQE), so physical
+// per-descriptor, per-parent, and per-WQE completion times are not observable
+// without changing the transport data path.
 struct QueryRdmaTraceEvent {
   u64 request_id{};
   u64 issue_timestamp_ns{};
+  u64 wait_phase_start_timestamp_ns{};
   u64 completion_timestamp_ns{};
   u64 batch_process_start_timestamp_ns{};
+  u32 route_attempt{};
   u32 search_round{};
   u32 snapshot_attempt{};
   u32 target_shard{};
   u32 parent_count{};
-  u32 bytes_per_parent{};
+  u32 payload_bytes{};
+  u32 minimum_bytes_per_parent{};
+  u32 maximum_bytes_per_parent{};
+};
+static_assert(sizeof(QueryRdmaTraceEvent) == 72);
+
+struct QueryRdmaTraceHeader {
+  u64 request_id{};
+  u32 event_count{};
+  u32 overflow{};
+  u32 enabled{};
   u32 reserved{};
 };
 
-struct QueryRdmaTraceHeader {
+inline constexpr u32 kQueryAdjacencyOracleGroupCount = 4;
+inline constexpr u32 kQueryAdjacencyOraclePrefixCount = 5;
+inline constexpr u32 kQueryBeamTurnoverTraceWidth = 32;
+
+// One event summarizes a score/merge chunk. The four lanes in each group
+// array correspond to contiguous adjacency groups of 4, 8, 16, and 32
+// RemotePtrs, respectively. certificate_needed_groups is the perfect-ADC
+// oracle evaluated at the pre-merge cutoff using every decoded edge,
+// including visited rejects; unavailable dynamic ADCs are conservatively
+// needed. interval_* describes the implementable parent-centered annulus
+// certificate. post_visited_* and final_beam_* are diagnostic only.
+struct QueryAdjacencyOracleTraceEvent {
+  u64 request_id{};
+  u32 search_round{};
+  u32 chunk_begin{};
+  u32 parent_count{};
+  u32 edge_count{};
+  u32 invalid_decoded_count{};
+  u32 dynamic_edge_count{};
+  u32 visited_survivor_count{};
+  u32 finite_scored_count{};
+  u32 beam_count_before{};
+  u32 beam_capacity{};
+  u32 cutoff_distance_bits{};
+  u32 new_candidates_in_beam{};
+  u32 interval_lb_violation_count{};
+  f32 minimum_interval_safety_margin{};
+  u32 total_groups[kQueryAdjacencyOracleGroupCount]{};
+  u32 certificate_needed_groups[kQueryAdjacencyOracleGroupCount]{};
+  u32 post_visited_needed_groups[kQueryAdjacencyOracleGroupCount]{};
+  u32 final_beam_needed_groups[kQueryAdjacencyOracleGroupCount]{};
+  u32 certificate_needed_runs[kQueryAdjacencyOracleGroupCount]{};
+  u32 certificate_first_group_needed_parents[
+    kQueryAdjacencyOracleGroupCount]{};
+  u32 interval_needed_groups[kQueryAdjacencyOracleGroupCount]{};
+  u32 interval_needed_runs[kQueryAdjacencyOracleGroupCount]{};
+  u32 interval_first_group_needed_parents[
+    kQueryAdjacencyOracleGroupCount]{};
+  // Prefix lanes are 8, 16, 32, 48, and 64 edges. A parent always transfers
+  // the prefix; *_tail_needed_parents counts the additional suffix read.
+  u32 parents_with_tail[kQueryAdjacencyOraclePrefixCount]{};
+  u32 perfect_tail_needed_parents[kQueryAdjacencyOraclePrefixCount]{};
+  u32 suffix_interval_tail_needed_parents[
+    kQueryAdjacencyOraclePrefixCount]{};
+  u32 post_visited_tail_needed_parents[
+    kQueryAdjacencyOraclePrefixCount]{};
+  u32 final_beam_tail_needed_parents[
+    kQueryAdjacencyOraclePrefixCount]{};
+  u32 total_tail_edges[kQueryAdjacencyOraclePrefixCount]{};
+  u32 perfect_tail_needed_edges[kQueryAdjacencyOraclePrefixCount]{};
+  u32 suffix_interval_tail_needed_edges[
+    kQueryAdjacencyOraclePrefixCount]{};
+  // Motivation-only Beam-turnover probe.  The selected arrays describe the
+  // parents consumed by this round; productive means that at least one of the
+  // parent's post-visited finite children survives in the authoritative Beam.
+  // frontier_* is the first 32 unexpanded outputs after the merge.  A bit in
+  // frontier_new_mask says that the output originated in this round's scored
+  // candidate set rather than the old Beam.
+  u32 selected_productive_mask{};
+  u32 selected_child_in_beam_count[kQueryBeamTurnoverTraceWidth]{};
+  u32 selected_best_child_rank[kQueryBeamTurnoverTraceWidth]{};
+  u64 selected_handles[kQueryBeamTurnoverTraceWidth]{};
+  u32 frontier_count{};
+  u32 frontier_new_mask{};
+  u64 frontier_handles[kQueryBeamTurnoverTraceWidth]{};
+  u32 frontier_distance_bits[kQueryBeamTurnoverTraceWidth]{};
+  u64 round_graph_cycles{};
+  u64 round_score_cycles{};
+  u64 round_beam_cycles{};
+};
+static_assert(sizeof(QueryAdjacencyOracleTraceEvent) == 1304);
+
+struct QueryAdjacencyOracleTraceHeader {
   u64 request_id{};
   u32 event_count{};
   u32 overflow{};
@@ -616,8 +708,19 @@ struct PersistentKernelParams {
   u32* dispatcher_kernel_ready_count{};
   u32* control_kernel_ready_count{};
   u8* graph_scratch{};
+  // One immutable eight-edge extent class per static ordinal. Class zero is a
+  // header-only 16-byte record, class n covers n*8 neighbor slots, and 0xff
+  // means unknown/full-record. A null pointer keeps the legacy fixed-size
+  // graph READ path exactly intact.
+  const u8* graph_extent_classes{};
+  // Per-query-slot global metadata consumed asynchronously by QP-owner warps.
+  // Only the first kPersistentMaxPrefetch entries of each query slot are used
+  // by graph fetches.
+  u32* graph_request_bytes{};
   QueryRdmaTraceHeader* query_rdma_trace_headers{};
   QueryRdmaTraceEvent* query_rdma_trace_events{};
+  QueryAdjacencyOracleTraceHeader* query_adjacency_oracle_trace_headers{};
+  QueryAdjacencyOracleTraceEvent* query_adjacency_oracle_trace_events{};
   u32 query_rdma_trace_mode{};
   u32 query_rdma_trace_sample_rate{};
   u32 query_rdma_trace_events_per_query{};
@@ -671,7 +774,8 @@ struct PersistentKernelOccupancy {
 // Query the resource footprint of the exact unified kernel binary.  An
 // analytical register-only estimate is not sufficient because CUDA also
 // accounts for allocation granularity and every other per-CTA resource.
-PersistentKernelOccupancy inspect_persistent_search_kernel(u32 threads);
+PersistentKernelOccupancy inspect_persistent_search_kernel(
+  u32 threads, bool enable_adjacency_oracle = false);
 
 void launch_persistent_search(cudaStream_t stream, const PersistentKernelParams& params,
                               u32 blocks, u32 threads);

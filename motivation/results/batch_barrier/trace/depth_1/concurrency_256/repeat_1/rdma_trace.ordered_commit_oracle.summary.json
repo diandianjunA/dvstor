@@ -1,0 +1,1764 @@
+{
+  "aggregate": {
+    "completion_to_process_handoff_p50_ns": 4096.0,
+    "modeled_service_per_parent_p50_ns": 32936.29019356903,
+    "multi_release_round_fraction": 0.0,
+    "multi_release_rounds": 0,
+    "natural_parent_tile": 4,
+    "primary_rounds": 6687,
+    "query_strict_saved_ns_by_task_overhead": {
+      "0us": {
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0
+      },
+      "10us": {
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0
+      },
+      "1us": {
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0
+      },
+      "2us": {
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0
+      },
+      "5us": {
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0
+      }
+    },
+    "query_strict_saved_over_gpu_by_task_overhead": {
+      "0us": {
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0
+      },
+      "10us": {
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0
+      },
+      "1us": {
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0
+      },
+      "2us": {
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0
+      },
+      "5us": {
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0
+      }
+    },
+    "query_strict_saved_over_rdma_wait_by_task_overhead": {
+      "0us": {
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0
+      },
+      "10us": {
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0
+      },
+      "1us": {
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0
+      },
+      "2us": {
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0
+      },
+      "5us": {
+        "mean": 0.0,
+        "p50": 0.0,
+        "p90": 0.0
+      }
+    },
+    "round_fraction_with_tile_ready_10us_before_tail": 0.0,
+    "round_fraction_with_tile_ready_20us_before_tail": 0.0,
+    "round_fraction_with_tile_ready_50us_before_tail": 0.0,
+    "round_fraction_with_tile_ready_5us_before_tail": 0.0,
+    "strict_completion_spread_p50_ns": null,
+    "strict_completion_spread_p90_ns": null,
+    "strict_completion_spread_p99_ns": null
+  },
+  "input": "/home/xjs/experiment/dvstor/motivation/results/batch_barrier/trace/depth_1/concurrency_256/repeat_1/rdma_trace.jsonl",
+  "input_counts": {
+    "metadata": 1,
+    "query": 50,
+    "shard_batch": 6687
+  },
+  "integrity": {
+    "failed_queries": 0,
+    "inconsistent_round_groups": 0,
+    "invalid_event_count": 0,
+    "metadata_schema": 2,
+    "overflow_queries": 0,
+    "query_emitted_event_count": 6687,
+    "query_event_count_matches": true,
+    "query_records": 50,
+    "trace_events": 6687
+  },
+  "measurement": {
+    "baseline": "all observable releases, then modeled movable work",
+    "completion_granularity": "shard_batch_owner_completion_boundary",
+    "excluded_from_movable_work": "beam merge, parent selection, expansion budget, termination, exact rerank",
+    "natural_parent_tile": 4,
+    "oracle": "one query compute CTA executes modeled work at each observable release; Beam/search state commits only after all work",
+    "service_model": "Per-query validation+neighbor_decode+PQ+visited wall time is distributed linearly over graph parents. This is an oracle sensitivity model, not measured per-task service.",
+    "task_granularity": "tile",
+    "timestamp_clock": "GPU globaltimer nanoseconds"
+  },
+  "metadata": [
+    {
+      "beam_merge_policy": "stable-run",
+      "completion_granularity": "shard_batch_owner_completion_boundary",
+      "completion_semantics": "owner CTA timestamp after the owner submission group's final CQE and before descriptor status publication; not per-parent, per-WQE, per-descriptor physical, or NIC-internal completion",
+      "direct_qps_per_node": 32,
+      "expansion_policy": "fixed",
+      "kernel_threads": 128,
+      "max_expansions": 384,
+      "natural_parent_tile": 4,
+      "num_shards": 5,
+      "prefetch_depth": 1,
+      "schema": 2,
+      "timestamp_clock": "GPU globaltimer nanoseconds",
+      "traversal_beam_width": 128,
+      "type": "metadata"
+    }
+  ],
+  "queries": [
+    {
+      "modeled_round_count": 134,
+      "modeled_service_per_parent_ns": 34710.426590452,
+      "overflow": 0,
+      "query_gpu_time_ns": 21151370.21276596,
+      "query_graph_reads": 134,
+      "query_graph_rounds": 134,
+      "query_rdma_wait_ns": 5974890.070921985,
+      "request_id": 1000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 135,
+      "modeled_service_per_parent_ns": 32151.221434200153,
+      "overflow": 0,
+      "query_gpu_time_ns": 19626239.71631206,
+      "query_graph_reads": 135,
+      "query_graph_rounds": 135,
+      "query_rdma_wait_ns": 4683010.638297873,
+      "request_id": 2000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 137,
+      "modeled_service_per_parent_ns": 31005.64787492882,
+      "overflow": 0,
+      "query_gpu_time_ns": 20742729.078014184,
+      "query_graph_reads": 137,
+      "query_graph_rounds": 137,
+      "query_rdma_wait_ns": 6140568.085106383,
+      "request_id": 3000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 134,
+      "modeled_service_per_parent_ns": 32091.648142267386,
+      "overflow": 0,
+      "query_gpu_time_ns": 21586341.134751774,
+      "query_graph_reads": 134,
+      "query_graph_rounds": 134,
+      "query_rdma_wait_ns": 6696513.475177305,
+      "request_id": 4000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 36157.51613075241,
+      "overflow": 0,
+      "query_gpu_time_ns": 21878002.127659574,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 6682466.666666667,
+      "request_id": 5000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 136,
+      "modeled_service_per_parent_ns": 31987.76595744681,
+      "overflow": 0,
+      "query_gpu_time_ns": 21288249.64539007,
+      "query_graph_reads": 136,
+      "query_graph_rounds": 136,
+      "query_rdma_wait_ns": 6408485.106382979,
+      "request_id": 6000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 132,
+      "modeled_service_per_parent_ns": 33461.03589082312,
+      "overflow": 0,
+      "query_gpu_time_ns": 19693761.702127658,
+      "query_graph_reads": 132,
+      "query_graph_rounds": 132,
+      "query_rdma_wait_ns": 5017991.489361702,
+      "request_id": 7000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 134,
+      "modeled_service_per_parent_ns": 33901.720122790306,
+      "overflow": 0,
+      "query_gpu_time_ns": 20313548.936170213,
+      "query_graph_reads": 134,
+      "query_graph_rounds": 134,
+      "query_rdma_wait_ns": 5492139.007092198,
+      "request_id": 8000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 134,
+      "modeled_service_per_parent_ns": 32721.710595956385,
+      "overflow": 0,
+      "query_gpu_time_ns": 20099946.09929078,
+      "query_graph_reads": 134,
+      "query_graph_rounds": 134,
+      "query_rdma_wait_ns": 5101733.333333333,
+      "request_id": 9000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 132,
+      "modeled_service_per_parent_ns": 33393.03137760585,
+      "overflow": 0,
+      "query_gpu_time_ns": 19524113.475177307,
+      "query_graph_reads": 132,
+      "query_graph_rounds": 132,
+      "query_rdma_wait_ns": 4815638.29787234,
+      "request_id": 10000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 33292.5665226897,
+      "overflow": 0,
+      "query_gpu_time_ns": 21175914.184397165,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 6383085.815602837,
+      "request_id": 11000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 33813.69380899056,
+      "overflow": 0,
+      "query_gpu_time_ns": 21398643.971631207,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 6380083.687943262,
+      "request_id": 12000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 135,
+      "modeled_service_per_parent_ns": 34379.75833990019,
+      "overflow": 0,
+      "query_gpu_time_ns": 20612605.673758864,
+      "query_graph_reads": 135,
+      "query_graph_rounds": 135,
+      "query_rdma_wait_ns": 5401437.588652482,
+      "request_id": 13000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 130,
+      "modeled_service_per_parent_ns": 34894.12438625205,
+      "overflow": 0,
+      "query_gpu_time_ns": 21389024.822695035,
+      "query_graph_reads": 130,
+      "query_graph_rounds": 130,
+      "query_rdma_wait_ns": 6488749.645390071,
+      "request_id": 14000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 32944.766170746014,
+      "overflow": 0,
+      "query_gpu_time_ns": 20767971.631205674,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 5918760.283687944,
+      "request_id": 15000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 131,
+      "modeled_service_per_parent_ns": 32299.886308267014,
+      "overflow": 0,
+      "query_gpu_time_ns": 20638365.95744681,
+      "query_graph_reads": 131,
+      "query_graph_rounds": 131,
+      "query_rdma_wait_ns": 5952726.241134752,
+      "request_id": 16000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 33601.85037060737,
+      "overflow": 0,
+      "query_gpu_time_ns": 21443302.836879432,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 6414142.55319149,
+      "request_id": 17000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 132,
+      "modeled_service_per_parent_ns": 31525.752202879863,
+      "overflow": 0,
+      "query_gpu_time_ns": 19195482.269503545,
+      "query_graph_reads": 132,
+      "query_graph_rounds": 132,
+      "query_rdma_wait_ns": 4696039.716312056,
+      "request_id": 18000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 135,
+      "modeled_service_per_parent_ns": 31650.133963750985,
+      "overflow": 0,
+      "query_gpu_time_ns": 21633138.297872342,
+      "query_graph_reads": 135,
+      "query_graph_rounds": 135,
+      "query_rdma_wait_ns": 6670409.219858156,
+      "request_id": 19000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 33962.21404575268,
+      "overflow": 0,
+      "query_gpu_time_ns": 19738952.482269503,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 4840335.460992908,
+      "request_id": 20000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 134,
+      "modeled_service_per_parent_ns": 32209.15634592992,
+      "overflow": 0,
+      "query_gpu_time_ns": 21850689.36170213,
+      "query_graph_reads": 134,
+      "query_graph_rounds": 134,
+      "query_rdma_wait_ns": 6811240.425531914,
+      "request_id": 21000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 32311.054231322985,
+      "overflow": 0,
+      "query_gpu_time_ns": 21608829.78723404,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 6972932.624113475,
+      "request_id": 22000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 134,
+      "modeled_service_per_parent_ns": 32223.82237747433,
+      "overflow": 0,
+      "query_gpu_time_ns": 19863008.510638297,
+      "query_graph_reads": 134,
+      "query_graph_rounds": 134,
+      "query_rdma_wait_ns": 4867373.758865248,
+      "request_id": 23000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 31705.30581773583,
+      "overflow": 0,
+      "query_gpu_time_ns": 20567450.35460993,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 5651746.09929078,
+      "request_id": 24000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 136,
+      "modeled_service_per_parent_ns": 31698.758865248226,
+      "overflow": 0,
+      "query_gpu_time_ns": 22028459.574468084,
+      "query_graph_reads": 136,
+      "query_graph_rounds": 136,
+      "query_rdma_wait_ns": 7043050.354609929,
+      "request_id": 25000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 32977.171652535595,
+      "overflow": 0,
+      "query_gpu_time_ns": 20915983.68794326,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 6199409.929078015,
+      "request_id": 26000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 32927.81421639204,
+      "overflow": 0,
+      "query_gpu_time_ns": 20555121.985815603,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 6009646.09929078,
+      "request_id": 27000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 134,
+      "modeled_service_per_parent_ns": 32955.7637345189,
+      "overflow": 0,
+      "query_gpu_time_ns": 19386090.070921987,
+      "query_graph_reads": 134,
+      "query_graph_rounds": 134,
+      "query_rdma_wait_ns": 4686288.652482269,
+      "request_id": 28000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 33619.54887218045,
+      "overflow": 0,
+      "query_gpu_time_ns": 20528760.9929078,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 5471043.971631206,
+      "request_id": 29000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 31499.978670079454,
+      "overflow": 0,
+      "query_gpu_time_ns": 19289651.773049645,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 4693923.404255319,
+      "request_id": 30000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 30010.55831067029,
+      "overflow": 0,
+      "query_gpu_time_ns": 20637968.794326242,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 6319302.836879432,
+      "request_id": 31000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 139,
+      "modeled_service_per_parent_ns": 33124.603296086534,
+      "overflow": 0,
+      "query_gpu_time_ns": 21305300.0,
+      "query_graph_reads": 139,
+      "query_graph_rounds": 139,
+      "query_rdma_wait_ns": 5813740.425531914,
+      "request_id": 32000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 136,
+      "modeled_service_per_parent_ns": 34024.149979140595,
+      "overflow": 0,
+      "query_gpu_time_ns": 21805530.4964539,
+      "query_graph_reads": 136,
+      "query_graph_rounds": 136,
+      "query_rdma_wait_ns": 6291245.390070922,
+      "request_id": 33000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 134,
+      "modeled_service_per_parent_ns": 32869.51942415581,
+      "overflow": 0,
+      "query_gpu_time_ns": 20807948.226950355,
+      "query_graph_reads": 134,
+      "query_graph_rounds": 134,
+      "query_rdma_wait_ns": 5882860.992907802,
+      "request_id": 34000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 32962.33669279582,
+      "overflow": 0,
+      "query_gpu_time_ns": 21858394.326241136,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 7314043.262411348,
+      "request_id": 35000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 134,
+      "modeled_service_per_parent_ns": 31298.06816978935,
+      "overflow": 0,
+      "query_gpu_time_ns": 20981495.035460994,
+      "query_graph_reads": 134,
+      "query_graph_rounds": 134,
+      "query_rdma_wait_ns": 6311569.503546099,
+      "request_id": 36000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 132,
+      "modeled_service_per_parent_ns": 33322.54996776273,
+      "overflow": 0,
+      "query_gpu_time_ns": 19745945.390070923,
+      "query_graph_reads": 132,
+      "query_graph_rounds": 132,
+      "query_rdma_wait_ns": 5136653.90070922,
+      "request_id": 37000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 132,
+      "modeled_service_per_parent_ns": 32163.614872125512,
+      "overflow": 0,
+      "query_gpu_time_ns": 20514119.14893617,
+      "query_graph_reads": 132,
+      "query_graph_rounds": 132,
+      "query_rdma_wait_ns": 6025678.723404256,
+      "request_id": 38000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 134,
+      "modeled_service_per_parent_ns": 35824.71684132529,
+      "overflow": 0,
+      "query_gpu_time_ns": 21561135.460992906,
+      "query_graph_reads": 134,
+      "query_graph_rounds": 134,
+      "query_rdma_wait_ns": 6127723.404255319,
+      "request_id": 39000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 132,
+      "modeled_service_per_parent_ns": 33652.43391360412,
+      "overflow": 0,
+      "query_gpu_time_ns": 20854868.794326242,
+      "query_graph_reads": 132,
+      "query_graph_rounds": 132,
+      "query_rdma_wait_ns": 6036931.205673759,
+      "request_id": 40000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 36358.79059350504,
+      "overflow": 0,
+      "query_gpu_time_ns": 21615934.04255319,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 6303977.304964539,
+      "request_id": 41000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 134,
+      "modeled_service_per_parent_ns": 31884.661797396,
+      "overflow": 0,
+      "query_gpu_time_ns": 20675034.75177305,
+      "query_graph_reads": 134,
+      "query_graph_rounds": 134,
+      "query_rdma_wait_ns": 5663975.1773049645,
+      "request_id": 42000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 132,
+      "modeled_service_per_parent_ns": 32472.592950784438,
+      "overflow": 0,
+      "query_gpu_time_ns": 20898334.75177305,
+      "query_graph_reads": 132,
+      "query_graph_rounds": 132,
+      "query_rdma_wait_ns": 5960284.397163121,
+      "request_id": 43000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 135,
+      "modeled_service_per_parent_ns": 31491.205673758865,
+      "overflow": 0,
+      "query_gpu_time_ns": 19951426.95035461,
+      "query_graph_reads": 135,
+      "query_graph_rounds": 135,
+      "query_rdma_wait_ns": 5274227.659574468,
+      "request_id": 44000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 137,
+      "modeled_service_per_parent_ns": 31669.959103380446,
+      "overflow": 0,
+      "query_gpu_time_ns": 20129761.702127658,
+      "query_graph_reads": 137,
+      "query_graph_rounds": 137,
+      "query_rdma_wait_ns": 5177698.581560284,
+      "request_id": 45000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 135,
+      "modeled_service_per_parent_ns": 34652.91305489887,
+      "overflow": 0,
+      "query_gpu_time_ns": 21032041.134751774,
+      "query_graph_reads": 135,
+      "query_graph_rounds": 135,
+      "query_rdma_wait_ns": 5584246.808510638,
+      "request_id": 46000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 135,
+      "modeled_service_per_parent_ns": 33449.33018124508,
+      "overflow": 0,
+      "query_gpu_time_ns": 20724964.539007094,
+      "query_graph_reads": 135,
+      "query_graph_rounds": 135,
+      "query_rdma_wait_ns": 5443690.070921985,
+      "request_id": 47000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 134,
+      "modeled_service_per_parent_ns": 31357.076320525037,
+      "overflow": 0,
+      "query_gpu_time_ns": 20481726.95035461,
+      "query_graph_reads": 134,
+      "query_graph_rounds": 134,
+      "query_rdma_wait_ns": 5712090.780141844,
+      "request_id": 48000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 133,
+      "modeled_service_per_parent_ns": 32636.79411294193,
+      "overflow": 0,
+      "query_gpu_time_ns": 21010752.482269503,
+      "query_graph_reads": 133,
+      "query_graph_rounds": 133,
+      "query_rdma_wait_ns": 6045131.205673759,
+      "request_id": 49000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    },
+    {
+      "modeled_round_count": 135,
+      "modeled_service_per_parent_ns": 33432.77121092724,
+      "overflow": 0,
+      "query_gpu_time_ns": 20850034.75177305,
+      "query_graph_reads": 135,
+      "query_graph_rounds": 135,
+      "query_rdma_wait_ns": 5577792.1985815605,
+      "request_id": 50000,
+      "status": 0,
+      "strict_saved_ns_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_gpu_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      },
+      "strict_saved_over_rdma_wait_by_task_overhead": {
+        "0us": 0.0,
+        "10us": 0.0,
+        "1us": 0.0,
+        "2us": 0.0,
+        "5us": 0.0
+      }
+    }
+  ],
+  "rounds": [],
+  "schema": 1,
+  "screening": {
+    "checks": {
+      "dispersion_ge_10us_p50_or_25us_p90": false,
+      "integrity_clean": true,
+      "multi_release_coverage_ge_25pct": false,
+      "zero_overhead_oracle_ge_8pct_gpu_time": false
+    },
+    "parent_or_tile_completion_observed": false,
+    "verdict": "negative at observed granularity; parent/tile result remains unmeasured"
+  },
+  "task_overheads_us": [
+    0.0,
+    1.0,
+    2.0,
+    5.0,
+    10.0
+  ]
+}

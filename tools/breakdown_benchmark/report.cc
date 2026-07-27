@@ -213,6 +213,29 @@ nlohmann::json telemetry_to_json(
     {"average_graph_read_retries", telemetry.queries_completed == 0 ? 0.0
       : static_cast<double>(telemetry.graph_read_retries) /
           static_cast<double>(telemetry.queries_completed)},
+    {"graph_read_bytes", telemetry.graph_read_bytes},
+    {"average_graph_read_bytes_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.graph_read_bytes) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"average_graph_read_bytes_per_logical_parent",
+      telemetry.graph_page_requests == 0 ? 0.0
+      : static_cast<double>(telemetry.graph_read_bytes) /
+          static_cast<double>(telemetry.graph_page_requests)},
+    {"graph_live_extent_reads", telemetry.graph_live_extent_reads},
+    {"graph_full_record_reads", telemetry.graph_full_record_reads},
+    {"graph_extent_fallback_reads", telemetry.graph_extent_fallback_reads},
+    {"graph_live_extent_read_ratio",
+      telemetry.graph_live_extent_reads + telemetry.graph_full_record_reads == 0
+        ? 0.0
+        : static_cast<double>(telemetry.graph_live_extent_reads) /
+            static_cast<double>(
+              telemetry.graph_live_extent_reads +
+              telemetry.graph_full_record_reads)},
+    {"graph_extent_fallback_ratio",
+      telemetry.graph_live_extent_reads == 0 ? 0.0
+      : static_cast<double>(telemetry.graph_extent_fallback_reads) /
+          static_cast<double>(telemetry.graph_live_extent_reads)},
     {"graph_dependency_rounds", telemetry.graph_dependency_rounds},
     {"average_graph_rounds_per_query", telemetry.queries_completed == 0 ? 0.0
       : static_cast<double>(telemetry.graph_dependency_rounds) /
@@ -499,6 +522,15 @@ FormattedReport format_report(const nlohmann::json& root,
     output << "  graph snapshot reread records total/per_query: "
            << gpu.value("graph_read_retries", 0ULL) << "/"
            << gpu.value("average_graph_read_retries", 0.0) << '\n';
+    output << "  graph RDMA bytes total/per_query/per_parent: "
+           << gpu.value("graph_read_bytes", 0ULL) << "/"
+           << gpu.value("average_graph_read_bytes_per_query", 0.0) << "/"
+           << gpu.value(
+                "average_graph_read_bytes_per_logical_parent", 0.0) << '\n';
+    output << "  graph live/full/fallback reads: "
+           << gpu.value("graph_live_extent_reads", 0ULL) << "/"
+           << gpu.value("graph_full_record_reads", 0ULL) << "/"
+           << gpu.value("graph_extent_fallback_reads", 0ULL) << '\n';
     output << "  centroid route publications/shard_updates/live/snapshot_skips: "
            << gpu.value("centroid_route_publications", 0ULL) << "/"
            << gpu.value("centroid_route_shard_updates", 0ULL) << "/"

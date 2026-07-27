@@ -82,6 +82,11 @@ struct CompletionDescriptor {
   u64 beam_merge_prepare_cycles{};
   u64 beam_merge_sort_cycles{};
   u64 beam_merge_materialize_cycles{};
+  // Actual graph-record RDMA payload issued by this query. Unlike
+  // remote_pages, this includes snapshot retries and live-extent fallback
+  // reads and therefore cannot be reconstructed from the physical record
+  // size when variable-length reads are enabled.
+  u64 graph_read_bytes{};
   u32 query_slot{};
   u32 result_count{};
   i32 status{};
@@ -91,6 +96,9 @@ struct CompletionDescriptor {
   u32 exact_vectors{};
   u32 route_hits{};
   u32 graph_read_retries{};
+  u32 graph_live_extent_reads{};
+  u32 graph_full_record_reads{};
+  u32 graph_extent_fallback_reads{};
   u32 expansion_policy{};
   u32 sum_selected_parents{};
   u32 sum_feedback_horizon{};
@@ -120,6 +128,8 @@ struct CompletionDescriptor {
   u32 dynamic_code_cache_max_lookup_probes{};
   u32 trace_event_count{};
   u32 trace_overflow{};
+  u32 adjacency_oracle_event_count{};
+  u32 adjacency_oracle_overflow{};
   // Low 8 bits encode QueryFailureReason; the high 24 bits count complete
   // centroid-route snapshot retries caused by a concurrent publication.
   u32 diagnostic{};
@@ -203,6 +213,10 @@ struct TelemetrySnapshot {
   u64 graph_page_requests{};
   u64 graph_shard_batches{};
   u64 graph_read_retries{};
+  u64 graph_read_bytes{};
+  u64 graph_live_extent_reads{};
+  u64 graph_full_record_reads{};
+  u64 graph_extent_fallback_reads{};
   u64 graph_dependency_rounds{};
   u64 graph_route_hits{};
   u64 graph_route_refreshes{};
@@ -287,6 +301,10 @@ public:
   std::atomic<u64> graph_page_requests{0};
   std::atomic<u64> graph_shard_batches{0};
   std::atomic<u64> graph_read_retries{0};
+  std::atomic<u64> graph_read_bytes{0};
+  std::atomic<u64> graph_live_extent_reads{0};
+  std::atomic<u64> graph_full_record_reads{0};
+  std::atomic<u64> graph_extent_fallback_reads{0};
   std::atomic<u64> graph_dependency_rounds{0};
   std::atomic<u64> graph_route_hits{0};
   std::atomic<u64> graph_route_refreshes{0};

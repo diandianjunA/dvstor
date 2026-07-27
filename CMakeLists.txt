@@ -172,6 +172,11 @@ set(DVSTOR_PQ_INDEXER_SOURCES
     tools/vamana_offline/pq_indexer.cc
 )
 
+set(DVSTOR_GRAPH_EXTENT_INDEXER_SOURCES
+    src/gpu_search/index_format.cc
+    tools/vamana_offline/graph_extent_indexer.cc
+)
+
 set(DVSTOR_BREAKDOWN_SUPPORT_SOURCES
     tools/breakdown_benchmark/dataset.cc
     tools/breakdown_benchmark/maintenance_log.cc
@@ -199,6 +204,13 @@ function(dvstor_add_offline_tools)
     )
     dvstor_target_tool_includes(vamana_pq_indexer)
     target_link_libraries(vamana_pq_indexer rdma_library FaissCPU::FaissCPU)
+
+    add_executable(vamana_graph_extent_indexer
+        tools/vamana_graph_extent_indexer.cc
+        ${DVSTOR_GRAPH_EXTENT_INDEXER_SOURCES}
+    )
+    dvstor_target_tool_includes(vamana_graph_extent_indexer)
+    target_link_libraries(vamana_graph_extent_indexer rdma_library)
 
     add_executable(vamana_legacy_index_converter
         tools/vamana_legacy_index_converter.cc

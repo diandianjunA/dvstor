@@ -4,10 +4,10 @@ set -euo pipefail
 MOTIVATION_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$MOTIVATION_DIR/.." && pwd)"
 PROFILE="${PROFILE:-04_gpu_persistent_gpunetio}"
-TRACE_CONCURRENCIES="${TRACE_CONCURRENCIES:-1 64}"
+TRACE_CONCURRENCIES="${TRACE_CONCURRENCIES:-1 8 64 256}"
 DEPTHS="${DEPTHS:-1 2 4 8 16 32}"
 TRACE_MODE="${TRACE_MODE:-sampled}"
-TRACE_SAMPLE_RATE="${TRACE_SAMPLE_RATE:-100}"
+TRACE_SAMPLE_RATE="${TRACE_SAMPLE_RATE:-1000}"
 
 for depth in $DEPTHS; do
   for concurrency in $TRACE_CONCURRENCIES; do
@@ -22,6 +22,7 @@ for depth in $DEPTHS; do
       REPORT_DIR="$run_dir"
       QUERY_RDMA_TRACE_MODE="$TRACE_MODE"
       QUERY_RDMA_TRACE_SAMPLE_RATE="$TRACE_SAMPLE_RATE"
+      QUERY_RDMA_TRACE_EVENTS_PER_QUERY="${QUERY_RDMA_TRACE_EVENTS_PER_QUERY:-4096}"
       QUERY_RDMA_TRACE_OUTPUT="$trace_path"
       # Detailed tracing is an analysis run, not a throughput result.
       WARMUP_SECONDS="${TRACE_WARMUP_SECONDS:-5}"

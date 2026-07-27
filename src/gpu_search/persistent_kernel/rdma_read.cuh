@@ -132,7 +132,8 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
                                   i32* owner_completion = nullptr,
                                   bool defer_owner_wait = false,
                                   u32* owner_progress = nullptr,
-                                  u64* owner_completion_timestamp_ns = nullptr) {
+                                  u64* owner_completion_timestamp_ns = nullptr,
+                                  const u32* request_bytes = nullptr) {
 #ifdef DVSTOR_HAVE_GPUNETIO
   u32 matching = 0;
   for (u32 index = 0; index < request_count; ++index) {
@@ -164,6 +165,7 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
       .request_shards = request_shards,
       .remote_offsets = remote_offsets,
       .local_iova_offsets = local_iova_offsets,
+      .request_bytes = request_bytes,
       .completion_status = owner_completion,
       .completion_timestamp_ns = owner_completion_timestamp_ns,
       .request_count = request_count,
@@ -231,8 +233,19 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
     }
   }
   auto* qp = reinterpret_cast<doca_gpu_dev_verbs_qp*>(params.direct_qps[qp_index]);
+  if (bytes == 0) return -EINVAL;
   if (bytes > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE ||
       matching + (qp->need_dump ? 1u : 0u) > qp->sq_wqe_num) return -E2BIG;
+  for (u32 index = 0; index < request_count; ++index) {
+    if (request_shards[index] != memory_node) continue;
+    const u32 request_length =
+      request_bytes == nullptr ? bytes : request_bytes[index];
+    if (request_length == 0 || request_length > bytes ||
+        request_length > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE) {
+      return request_length > DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE
+        ? -E2BIG : -EINVAL;
+    }
+  }
   i32 status = lock_direct_qp(params.direct_qp_locks + qp_index, params.stop,
                               params.direct_disabled);
   if (status != 0) return status;
@@ -258,7 +271,8 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
           static_cast<u64>(index) * destination_stride - params.direct_local_iova_base;
     doca_gpu_dev_verbs_wqe_prepare_read(
       qp, wqe, ticket, flags, region.address + remote_offsets[index], region.rkey,
-      local_iova, params.direct_local_mkey, bytes);
+      local_iova, params.direct_local_mkey,
+      request_bytes == nullptr ? bytes : request_bytes[index]);
     ++posted;
   }
   doca_gpu_dev_verbs_ticket_t final_wqe = first_wqe + posted - 1;
@@ -295,6 +309,7 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
   (void)owner_completion;
   (void)owner_progress;
   (void)owner_completion_timestamp_ns;
+  (void)request_bytes;
   return -ENOTSUP;
 #endif
 }
@@ -823,14 +838,21 @@ __device__ bool prepare_graph_record(const PersistentKernelParams& params,
                                      u32& acquired_slot,
                                      u32& request_shard,
                                      u64& request_offset,
-                                     u64& request_local_iova) {
+                                     u64& request_local_iova,
+                                     u32& request_bytes) {
   acquired_slot = UINT32_MAX;
   request_shard = UINT32_MAX;
   request_offset = 0;
   request_local_iova = 0;
+  request_bytes = params.graph_entry_bytes;
   u64 raw = 0;
   u64 graph_offset = 0;
   u32 shard = 0;
+  u32 static_ordinal = 0;
+  const bool static_record =
+    params.graph_extent_classes != nullptr &&
+    params.graph_request_bytes != nullptr &&
+    static_ordinal_from_raw(params, handle, static_ordinal);
   if (!resolve_handle(params, handle, raw, shard, graph_offset)) return false;
   // Graph records are mutable and versioned by their storage checksum. Always
   // fetch the authoritative record so provisional backlinks and tombstones
@@ -847,6 +869,16 @@ __device__ bool prepare_graph_record(const PersistentKernelParams& params,
   request_offset = graph_offset;
   request_local_iova = reinterpret_cast<u64>(destination) -
     params.direct_local_iova_base;
+  // Dynamic records have no immutable ordinal and therefore always retain the
+  // full-record read-committed path. A static sidecar class is only a hint:
+  // validation below will promote any inconsistent short read to a full retry.
+  if (static_record && params.graph_extent_classes != nullptr &&
+      params.graph_request_bytes != nullptr &&
+      (params.graph_entry_bytes & (sizeof(u64) - 1u)) == 0) {
+    request_bytes = graph_record_validation::graph_extent_bytes_for_class(
+      params.graph_extent_classes[static_ordinal],
+      params.graph_entry_bytes, params.graph_entry_capacity);
+  }
   return true;
 }
 
@@ -870,7 +902,12 @@ __device__ bool fetch_graph_records_batch(
     u32* remote_reads,
     u32* remote_batches,
     u32* graph_read_retries,
+    u64* graph_read_bytes,
+    u32* graph_live_extent_reads,
+    u32* graph_full_record_reads,
+    u32* graph_extent_fallback_reads,
     u32* issued_qps,
+    u32 route_attempt,
     u32 search_round,
     bool trace_enabled,
     GraphFetchCycleBreakdown* cycle_breakdown) {
@@ -886,6 +923,14 @@ __device__ bool fetch_graph_records_batch(
   u64* request_offsets = params.dynamic_code_request_offsets + request_base;
   u64* request_local_iovas =
     params.dynamic_code_request_local_iovas + request_base;
+  u32* request_bytes =
+    params.graph_extent_classes == nullptr ||
+        params.graph_request_bytes == nullptr
+      ? nullptr
+      : params.graph_request_bytes +
+          static_cast<size_t>(descriptor.query_slot) *
+            kPersistentMaxPrefetch;
+  const bool live_extent_enabled = request_bytes != nullptr;
 
   if (threadIdx.x == 0) failed = 0;
   for (u32 index = threadIdx.x; index < count; index += blockDim.x) {
@@ -893,6 +938,9 @@ __device__ bool fetch_graph_records_batch(
     request_shards[index] = UINT32_MAX;
     request_offsets[index] = 0;
     request_local_iovas[index] = 0;
+    if (request_bytes != nullptr) {
+      request_bytes[index] = params.graph_entry_bytes;
+    }
     remote_reads[index] = 0;
   }
   for (u32 shard = threadIdx.x; shard < params.num_shards; shard += blockDim.x) {
@@ -902,18 +950,32 @@ __device__ bool fetch_graph_records_batch(
   __syncthreads();
 
   constexpr u32 warp_width = 32;
+  // `remote_reads` is query-local scratch. Bit zero preserves its original
+  // logical-read counter contract; bit one remembers that this parent started
+  // with a short extent. The latter lets a short->full upgrade retain the
+  // legacy budget of three authoritative full snapshot attempts.
+  constexpr u32 kLogicalGraphRead = 1u;
+  constexpr u32 kStartedWithShortExtent = 2u;
+  constexpr u32 kNeedsExtentFallbackRead = 4u;
   const u32 warp = threadIdx.x / warp_width;
   const u32 lane_in_warp = threadIdx.x % warp_width;
   const u32 warp_count = max(1u, blockDim.x / warp_width);
   if (lane_in_warp == 0) {
     for (u32 index = warp; index < count; index += warp_count) {
+      u32 transfer_bytes = params.graph_entry_bytes;
       if (!prepare_graph_record(params, handles[index], descriptor.query_slot,
                                 index, acquired_slots[index],
                                 request_shards[index], request_offsets[index],
-                                request_local_iovas[index])) {
+                                request_local_iovas[index],
+                                transfer_bytes)) {
         atomicExch(&failed, 1u);
       } else {
-        remote_reads[index] = 1;
+        if (request_bytes != nullptr) {
+          request_bytes[index] = transfer_bytes;
+        }
+        remote_reads[index] = kLogicalGraphRead |
+          (transfer_bytes < params.graph_entry_bytes
+             ? kStartedWithShortExtent : 0u);
       }
     }
   }
@@ -926,14 +988,41 @@ __device__ bool fetch_graph_records_batch(
     return false;
   }
 
+  // A short one-sided READ overwrites only the live prefix. Reconstruct the
+  // canonical unused suffix in the fixed scratch slot before issue so the
+  // existing full-record checksum remains the validation authority. Never
+  // touch the prefix here: a producer store racing the NIC would corrupt the
+  // just-arrived payload.
+  if (live_extent_enabled) {
+    const u32 words_per_record = params.graph_entry_bytes / sizeof(u64);
+    const u32 total_words = count * words_per_record;
+    for (u32 flat = threadIdx.x; flat < total_words; flat += blockDim.x) {
+      const u32 index = flat / words_per_record;
+      const u32 byte_offset =
+        (flat - index * words_per_record) * sizeof(u64);
+      if (byte_offset < request_bytes[index]) continue;
+      u8* record = graph_record_pointer(
+        params, descriptor.query_slot, acquired_slots[index]);
+      *reinterpret_cast<u64*>(record + byte_offset) = 0;
+    }
+    __syncthreads();
+  }
+
   // A compact graph entry is updated in-place by stage2/reverse-edge workers.
   // Its checksum is therefore an optimistic snapshot validator: a successful
   // RDMA completion can still overlap a legal publication and contain a torn
   // mix of the old and new entry. Storage CPU readers already retry this same
   // condition. Re-read only invalid entries and reserve fail-stop for a record
   // that remains invalid after the bounded snapshot attempts.
-  constexpr u32 kGraphSnapshotAttempts = 3;
-  for (u32 attempt = 0; attempt < kGraphSnapshotAttempts; ++attempt) {
+  constexpr u32 kFullGraphSnapshotAttempts = 3;
+  // A failed optimistic short read is an extent-hint upgrade, not one of the
+  // full-record snapshot retries available to the fixed path. Mixed batches
+  // therefore need at most one short attempt plus the legacy three full
+  // attempts. Entries that began full are still capped at exactly three.
+  const u32 maximum_batch_attempts =
+    live_extent_enabled ? kFullGraphSnapshotAttempts + 1u
+                        : kFullGraphSnapshotAttempts;
+  for (u32 attempt = 0; attempt < maximum_batch_attempts; ++attempt) {
     if (threadIdx.x == 0) retry_pending = 0;
     for (u32 shard = threadIdx.x; shard < params.num_shards;
          shard += blockDim.x) {
@@ -967,8 +1056,35 @@ __device__ bool fetch_graph_records_batch(
     for (u32 shard = threadIdx.x; shard < params.num_shards;
          shard += blockDim.x) {
       u32 matching = 0;
+      u32 payload_bytes = 0;
+      u32 minimum_bytes = UINT32_MAX;
+      u32 maximum_bytes = 0;
+      u32 short_reads = 0;
+      u32 full_reads = 0;
+      u32 fallback_reads = 0;
       for (u32 index = 0; index < count; ++index) {
-        matching += request_shards[index] == shard ? 1u : 0u;
+        if (request_shards[index] != shard) continue;
+        ++matching;
+        if (live_extent_enabled) {
+          const u32 transfer_bytes = request_bytes[index];
+          payload_bytes += transfer_bytes;
+          minimum_bytes = min(minimum_bytes, transfer_bytes);
+          maximum_bytes = max(maximum_bytes, transfer_bytes);
+          if (transfer_bytes < params.graph_entry_bytes) {
+            ++short_reads;
+          } else {
+            ++full_reads;
+            fallback_reads +=
+              (remote_reads[index] & kNeedsExtentFallbackRead) != 0
+                ? 1u : 0u;
+          }
+        }
+      }
+      if (!live_extent_enabled && matching != 0) {
+        payload_bytes = matching * params.graph_entry_bytes;
+        minimum_bytes = params.graph_entry_bytes;
+        maximum_bytes = params.graph_entry_bytes;
+        full_reads = matching;
       }
       if (matching != 0) {
         if (trace_enabled && params.query_rdma_trace_events != nullptr) {
@@ -988,17 +1104,16 @@ __device__ bool fetch_graph_records_batch(
                 params.query_rdma_trace_events_per_query + event_index] = {
                   .request_id = descriptor.request_id,
                   .issue_timestamp_ns = global_time_ns(),
+                  .route_attempt = route_attempt,
                   .search_round = search_round,
                   .snapshot_attempt = attempt,
                   .target_shard = shard,
                   .parent_count = matching,
-                  .bytes_per_parent = params.graph_entry_bytes,
+                  .payload_bytes = payload_bytes,
+                  .minimum_bytes_per_parent = minimum_bytes,
+                  .maximum_bytes_per_parent = maximum_bytes,
                 };
           }
-        }
-        atomicAdd(remote_batches, 1u);
-        if (attempt != 0 && graph_read_retries != nullptr) {
-          atomicAdd(graph_read_retries, matching);
         }
       }
       i32* owner_completion = params.direct_batch_statuses == nullptr ? nullptr :
@@ -1016,7 +1131,45 @@ __device__ bool fetch_graph_records_batch(
           params.graph_entry_bytes,
           (descriptor.query_slot + shard) % params.direct_qps_per_node,
           request_local_iovas, owner_completion, true, nullptr,
-          owner_completion_timestamp_ns);
+          owner_completion_timestamp_ns,
+          live_extent_enabled ? request_bytes : nullptr);
+      // Account only work that completed synchronously or was successfully
+      // admitted to an owner queue. Parameter/enqueue/transport failures that
+      // return before admission did not issue the advertised graph payload.
+      const bool admitted =
+        shard_status[shard] == 0 ||
+        shard_status[shard] == -EINPROGRESS;
+      if (matching != 0 && admitted) {
+        atomicAdd(remote_batches, 1u);
+        if (graph_read_bytes != nullptr) {
+          atomicAdd(
+            reinterpret_cast<unsigned long long*>(graph_read_bytes),
+            static_cast<unsigned long long>(payload_bytes));
+        }
+        if (graph_live_extent_reads != nullptr && short_reads != 0) {
+          atomicAdd(graph_live_extent_reads, short_reads);
+        }
+        if (graph_full_record_reads != nullptr && full_reads != 0) {
+          atomicAdd(graph_full_record_reads, full_reads);
+        }
+        if (graph_extent_fallback_reads != nullptr &&
+            fallback_reads != 0) {
+          atomicAdd(graph_extent_fallback_reads, fallback_reads);
+        }
+        // Count one fallback only when its first full WQE is admitted. Further
+        // full snapshot retries remain graph_read_retries but are not another
+        // stale-hint fallback.
+        if (fallback_reads != 0) {
+          for (u32 index = 0; index < count; ++index) {
+            if (request_shards[index] == shard) {
+              remote_reads[index] &= ~kNeedsExtentFallbackRead;
+            }
+          }
+        }
+        if (attempt != 0 && graph_read_retries != nullptr) {
+          atomicAdd(graph_read_retries, matching);
+        }
+      }
       if (issued_qps != nullptr &&
           shard_status[shard] == -EINPROGRESS) {
         issued_qps[shard] =
@@ -1025,9 +1178,25 @@ __device__ bool fetch_graph_records_batch(
       }
     }
     __syncthreads();
-    if (threadIdx.x == 0 && cycle_breakdown != nullptr) {
-      cycle_breakdown->issue += clock64() - stage_started_cycles;
-      stage_started_cycles = clock64();
+    if (threadIdx.x == 0) {
+      if (trace_enabled && params.query_rdma_trace_events != nullptr) {
+        const u64 wait_phase_start_ns = global_time_ns();
+        const u32 available = trace_event_start >=
+            params.query_rdma_trace_events_per_query ? 0 :
+          min(trace_batch_count,
+              params.query_rdma_trace_events_per_query - trace_event_start);
+        for (u32 ordinal = 0; ordinal < available; ++ordinal) {
+          QueryRdmaTraceEvent& event = params.query_rdma_trace_events[
+            static_cast<size_t>(descriptor.query_slot) *
+              params.query_rdma_trace_events_per_query +
+            trace_event_start + ordinal];
+          event.wait_phase_start_timestamp_ns = wait_phase_start_ns;
+        }
+      }
+      if (cycle_breakdown != nullptr) {
+        cycle_breakdown->issue += clock64() - stage_started_cycles;
+        stage_started_cycles = clock64();
+      }
     }
     __syncthreads();
     for (u32 shard = threadIdx.x; shard < params.num_shards;
@@ -1071,12 +1240,39 @@ __device__ bool fetch_graph_records_batch(
       const u32 slot = acquired_slots[index];
       u8* record = graph_record_pointer(params, descriptor.query_slot, slot);
       const i32 status = shard_status[shard];
-      const graph_record_validation::SnapshotState snapshot = status == 0
-        ? classify_graph_record(params, record, handles[index])
-        : graph_record_validation::SnapshotState::invalid;
+      const u32 transfer_bytes = live_extent_enabled
+        ? request_bytes[index] : params.graph_entry_bytes;
+      const bool partial_read = transfer_bytes < params.graph_entry_bytes;
+      u32 required_bytes = 0;
+      const bool prefix_valid = status == 0 &&
+        graph_record_validation::required_live_extent_bytes(
+          record, transfer_bytes, params.graph_degree,
+          params.graph_entry_capacity, required_bytes);
+      // Capacity is checked before checksum acceptance. This prevents a
+      // truncated counted prefix from being accepted even in the event of a
+      // checksum collision. Any other invalid reconstructed short read also
+      // upgrades to the authoritative full record rather than repeating the
+      // same insufficient request.
+      const bool short_read_requires_full =
+        status == 0 && partial_read &&
+        (!prefix_valid || required_bytes > transfer_bytes);
+      const graph_record_validation::SnapshotState snapshot =
+        status == 0 && !short_read_requires_full
+          ? classify_graph_record(params, record, handles[index])
+          : graph_record_validation::SnapshotState::invalid;
+      const bool started_with_short =
+        (remote_reads[index] & kStartedWithShortExtent) != 0;
+      const bool attempts_remain =
+        graph_record_validation::snapshot_retry_available(
+          attempt, started_with_short, partial_read,
+          maximum_batch_attempts, kFullGraphSnapshotAttempts);
       const graph_record_validation::ReadAction action =
-        graph_record_validation::decide_read_action(
-          status == 0, snapshot, attempt + 1 < kGraphSnapshotAttempts);
+        short_read_requires_full
+          ? (attempts_remain
+              ? graph_record_validation::ReadAction::retry
+              : graph_record_validation::ReadAction::fail)
+          : graph_record_validation::decide_read_action(
+              status == 0, snapshot, attempts_remain);
       if (action == graph_record_validation::ReadAction::accept) {
         // UINT32_MAX removes this entry from subsequent per-shard retry
         // batches while leaving acquired_slots intact for traversal.
@@ -1092,6 +1288,10 @@ __device__ bool fetch_graph_records_batch(
         continue;
       }
       if (action == graph_record_validation::ReadAction::retry) {
+        if (partial_read) {
+          request_bytes[index] = params.graph_entry_bytes;
+          remote_reads[index] |= kNeedsExtentFallbackRead;
+        }
         atomicAdd(&retry_pending, 1u);
         continue;
       }

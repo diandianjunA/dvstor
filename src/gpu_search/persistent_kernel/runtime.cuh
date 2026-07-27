@@ -8,6 +8,7 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
                                        u32 queue_count,
                                        u32 owner_block);
 
+template <bool EnableAdjacencyOracle>
 __global__ void persistent_search_kernel(PersistentKernelParams params) {
   const bool unified_dispatch = params.direct_owner_block_count != 0;
   if (unified_dispatch && blockIdx.x < params.direct_owner_block_count) {
@@ -294,17 +295,27 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
       idle_cycles = 256u + ((blockIdx.x * 131u) & 1023u);
     }
     __syncthreads();
-    process_query(params, descriptor);
+    process_query<EnableAdjacencyOracle>(params, descriptor);
     __syncthreads();
   }
 }
 
 __device__ void complete_direct_batch(const DirectBatchDescriptor& descriptor,
                                       i32 status,
-                                      DirectOwnerProgress* owner_progress) {
+                                      DirectOwnerProgress* owner_progress,
+                                      u64* submission_completion_ns = nullptr) {
   if (descriptor.completion_status == nullptr) return;
   if (descriptor.completion_timestamp_ns != nullptr) {
-    *descriptor.completion_timestamp_ns = global_time_ns();
+    u64 completion_ns = 0;
+    if (submission_completion_ns != nullptr) {
+      if (*submission_completion_ns == 0) {
+        *submission_completion_ns = global_time_ns();
+      }
+      completion_ns = *submission_completion_ns;
+    } else {
+      completion_ns = global_time_ns();
+    }
+    *descriptor.completion_timestamp_ns = completion_ns;
   }
   __threadfence_system();
   atomicExch(descriptor.completion_status, status);
@@ -436,9 +447,18 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
               descriptor.local_iova_offsets != nullptr &&
               descriptor.bytes != 0 &&
               descriptor.bytes <= DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE) {
+            bool request_lengths_valid = true;
             for (u32 index = 0; index < descriptor.request_count; ++index) {
-              matching += descriptor.request_shards[index] == memory_node ? 1u : 0u;
+              if (descriptor.request_shards[index] != memory_node) continue;
+              ++matching;
+              const u32 request_length = descriptor.request_bytes == nullptr
+                ? descriptor.bytes : descriptor.request_bytes[index];
+              request_lengths_valid &=
+                request_length != 0 &&
+                request_length <= descriptor.bytes &&
+                request_length <= DOCA_GPUNETIO_VERBS_MAX_TRANSFER_SIZE;
             }
+            if (!request_lengths_valid) matching = 0;
           }
         }
 
@@ -557,7 +577,8 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
             qp, wqe, ticket, flags,
             region.address + descriptor.remote_offsets[index], region.rkey,
             descriptor.local_iova_offsets[index], params.direct_local_mkey,
-            descriptor.bytes);
+            descriptor.request_bytes == nullptr
+              ? descriptor.bytes : descriptor.request_bytes[index]);
         }
         matched_before += __popc(matching_mask);
       }
@@ -612,12 +633,16 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
           shared_batches[warp_in_block][0];
         u64 first_remote_offset = 0;
         u64 first_local_iova = 0;
+        u32 first_request_bytes = first_descriptor.bytes;
         for (u32 request = 0; request < first_descriptor.request_count;
              ++request) {
           if (first_descriptor.request_shards[request] != memory_node) continue;
           first_remote_offset = first_descriptor.remote_offsets[request];
           if (first_descriptor.local_iova_offsets != nullptr) {
             first_local_iova = first_descriptor.local_iova_offsets[request];
+          }
+          if (first_descriptor.request_bytes != nullptr) {
+            first_request_bytes = first_descriptor.request_bytes[request];
           }
           break;
         }
@@ -633,13 +658,17 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
                static_cast<unsigned long long>(first_completion),
                static_cast<unsigned long long>(observed_consumer),
                observed_dbrec, completion_index, completion_count,
-               static_cast<unsigned>(observed_owner), first_descriptor.bytes,
+               static_cast<unsigned>(observed_owner), first_request_bytes,
                static_cast<unsigned long long>(first_remote_offset),
                static_cast<unsigned long long>(first_local_iova));
       }
+      // All descriptors in this owner submission become software-visible at
+      // one final-CQE boundary.  Reuse one timestamp so the trace does not
+      // manufacture a completion spread from this publication loop itself.
+      u64 submission_completion_ns = 0;
       for (u32 batch = 0; batch < batch_count; ++batch) {
         complete_direct_batch(shared_batches[warp_in_block][batch], status,
-                              owner_progress);
+                              owner_progress, &submission_completion_ns);
       }
       if (trace_first_batch && params.direct_owner_phases != nullptr) {
         params.direct_owner_phases[warp] = status == 0 ? 6u : 5u;

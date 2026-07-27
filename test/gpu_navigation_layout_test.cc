@@ -242,6 +242,97 @@ void test_graph_record_stale_incarnation_is_not_transport_failure() {
          validation::ReadAction::fail);
 }
 
+void test_graph_live_extent_reconstructs_canonical_record() {
+  namespace validation = gpu_search::graph_record_validation;
+  constexpr u32 graph_degree = 96;
+  constexpr u32 graph_capacity = 102;
+  constexpr u32 record_bytes = 16 + graph_capacity * sizeof(u64);
+  static_assert(record_bytes == 832);
+
+  assert(validation::graph_extent_bytes_for_class(
+           0, record_bytes, graph_capacity) == 16);
+  assert(validation::graph_extent_bytes_for_class(
+           1, record_bytes, graph_capacity) == 80);
+  assert(validation::graph_extent_bytes_for_class(
+           7, record_bytes, graph_capacity) == 464);
+  assert(validation::graph_extent_bytes_for_class(
+           13, record_bytes, graph_capacity) == record_bytes);
+  assert(validation::graph_extent_bytes_for_class(
+           validation::kGraphExtentClassUnknown,
+           record_bytes, graph_capacity) == record_bytes);
+  // The optimistic hint is not charged against the legacy three full-record
+  // snapshot attempts. Fixed/full: attempts 0,1 may retry and 2 is final.
+  assert(validation::snapshot_retry_available(0, false, false, 3, 3));
+  assert(validation::snapshot_retry_available(1, false, false, 3, 3));
+  assert(!validation::snapshot_retry_available(2, false, false, 3, 3));
+  // Live: attempt 0 is short; attempts 1,2,3 remain three independent full
+  // opportunities, with the third full attempt final.
+  assert(validation::snapshot_retry_available(0, true, true, 4, 3));
+  assert(validation::snapshot_retry_available(1, true, false, 4, 3));
+  assert(validation::snapshot_retry_available(2, true, false, 4, 3));
+  assert(!validation::snapshot_retry_available(3, true, false, 4, 3));
+  // R=128 plus eight provisional slots requires 17 classes; a four-bit
+  // encoding would silently truncate this supported layout.
+  assert(validation::graph_extent_bytes_for_class(
+           17, 16 + 136 * sizeof(u64), 136) ==
+         16 + 136 * sizeof(u64));
+
+  std::array<byte_t, record_bytes> authoritative{};
+  authoritative[0] = 47;
+  authoritative[1] = static_cast<byte_t>(2u << 4);
+  for (u32 edge = 0; edge < 49; ++edge) {
+    const u64 handle = RemotePtr{
+      edge % 4, 16 + static_cast<u64>(edge) * 64}.raw_address;
+    std::memcpy(
+      authoritative.data() + validation::kGraphRecordHeaderBytes +
+        static_cast<size_t>(edge) * sizeof(handle),
+      &handle, sizeof(handle));
+  }
+  const u16 checksum = validation::checksum16(
+    authoritative.data(), authoritative.size());
+  authoritative[2] = static_cast<byte_t>(checksum);
+  authoritative[3] = static_cast<byte_t>(checksum >> 8);
+  assert(validation::classify_snapshot(
+           authoritative.data(), authoritative.size(),
+           graph_degree, graph_capacity, 0) ==
+         validation::SnapshotState::valid);
+
+  const u32 extent_bytes = validation::graph_extent_bytes_for_class(
+    7, record_bytes, graph_capacity);
+  std::array<byte_t, record_bytes> reconstructed;
+  reconstructed.fill(0xa5);
+  std::memcpy(
+    reconstructed.data(), authoritative.data(), extent_bytes);
+  std::fill(
+    reconstructed.begin() + extent_bytes, reconstructed.end(), byte_t{0});
+  u32 required_bytes = 0;
+  assert(validation::required_live_extent_bytes(
+    reconstructed.data(), extent_bytes, graph_degree, graph_capacity,
+    required_bytes));
+  assert(required_bytes == 16 + 49 * sizeof(u64));
+  assert(required_bytes <= extent_bytes);
+  assert(validation::classify_snapshot(
+           reconstructed.data(), reconstructed.size(),
+           graph_degree, graph_capacity, 0) ==
+         validation::SnapshotState::valid);
+
+  // A build-time hint that is now one class too small must be detected from
+  // the returned header before checksum acceptance or neighbor decoding.
+  const u32 stale_extent_bytes = validation::graph_extent_bytes_for_class(
+    6, record_bytes, graph_capacity);
+  assert(stale_extent_bytes < required_bytes);
+  assert(validation::required_live_extent_bytes(
+    reconstructed.data(), stale_extent_bytes, graph_degree, graph_capacity,
+    required_bytes));
+  assert(required_bytes > stale_extent_bytes);
+
+  reconstructed[32] ^= 1;
+  assert(validation::classify_snapshot(
+           reconstructed.data(), reconstructed.size(),
+           graph_degree, graph_capacity, 0) ==
+         validation::SnapshotState::invalid);
+}
+
 void test_centroid_route_publication(
     gpu_search::format::CentroidScalarType scalar_type, u32 dim) {
   namespace format = gpu_search::format;
@@ -370,6 +461,7 @@ int main() {
   test_supported_gpu_layout_limits();
   test_tagged_remote_pointer();
   test_graph_record_stale_incarnation_is_not_transport_failure();
+  test_graph_live_extent_reconstructs_canonical_record();
   format::View view;
   view.layout.dim = 16;
   view.layout.graph_degree = 3;

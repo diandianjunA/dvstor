@@ -61,4 +61,8 @@ inline filepath_t navigation_code_for_shard(const filepath_t& shard_file_path,
   return result;
 }
 
+inline filepath_t graph_extent_file(const filepath_t& prefix) {
+  return filepath_t(prefix.string() + ".gextent8");
+}
+
 }  // namespace index_path

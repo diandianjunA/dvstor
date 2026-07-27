@@ -10,7 +10,8 @@ namespace {
 configuration::IndexConfiguration make_config(
     bool explicit_disable, bool explicit_namespace = false,
     bool bypass_dynamic_cache = false,
-    std::string beam_merge_policy = {}) {
+    std::string beam_merge_policy = {},
+    std::string graph_read_policy = {}) {
   std::vector<std::string> arguments{
     "configuration_update_protocol_test",
     "--servers", "127.0.0.1:1234",
@@ -36,6 +37,10 @@ configuration::IndexConfiguration make_config(
     arguments.emplace_back("--gpu-query-beam-merge-policy");
     arguments.emplace_back(std::move(beam_merge_policy));
   }
+  if (!graph_read_policy.empty()) {
+    arguments.emplace_back("--gpu-query-graph-read-policy");
+    arguments.emplace_back(std::move(graph_read_policy));
+  }
   std::vector<char*> argv;
   argv.reserve(arguments.size());
   for (auto& argument : arguments) argv.push_back(argument.data());
@@ -53,10 +58,14 @@ int main() {
   // retain the old 20 ms false-failure threshold.
   assert(default_config.gpu_direct_timeout_ms == 250);
   assert(default_config.gpu_query_beam_merge_policy == "legacy");
+  assert(default_config.gpu_query_graph_read_policy == "fixed");
 
   const auto stable_run_config =
     make_config(false, false, false, "STABLE-RUN");
   assert(stable_run_config.gpu_query_beam_merge_policy == "stable-run");
+  const auto live_extent_config =
+    make_config(false, false, false, {}, "LIVE-EXTENT");
+  assert(live_extent_config.gpu_query_graph_read_policy == "live-extent");
 
   const auto expanded_namespace = make_config(false, true);
   assert(expanded_namespace.max_vectors == 1'000'000);

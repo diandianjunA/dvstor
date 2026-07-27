@@ -1,0 +1,173 @@
+{
+  "baseline": {
+    "graph_reads_per_query": 195.18838483036106,
+    "query_count": 293771.0,
+    "rdma_bytes_per_query": 181852.73617886042,
+    "rdma_ops_per_query": 323.1883848303611
+  },
+  "continuation": [
+    {
+      "chunk_continuation_rate": 1.0,
+      "chunks_with_continuation": 2233,
+      "contiguous_tail_payload_bytes": 11641120,
+      "contiguous_tail_payload_ratio": 0.4696314828728483,
+      "contiguous_tail_wqes": 59559,
+      "contiguous_tail_wqes_per_parent": 1.9990937468532877,
+      "continuation_parent_rate": 0.9990937468532877,
+      "extent_chain_payload_bytes_lower": 11641168,
+      "extent_chain_payload_bytes_upper": 13307984,
+      "extent_chain_payload_ratio_lower": 0.46963341931119595,
+      "extent_chain_payload_ratio_upper": 0.5368768864136904,
+      "extent_chain_wqes_per_parent_lower": 5.855234451045548,
+      "extent_chain_wqes_per_parent_upper": 6.729399523377975,
+      "extent_tail_wqes_lower": 144652,
+      "extent_tail_wqes_upper": 170696,
+      "live_tail_edges": 1157210,
+      "parents_with_continuation": 29766,
+      "prefix_edges": 8
+    },
+    {
+      "chunk_continuation_rate": 0.9977608598298253,
+      "chunks_with_continuation": 2228,
+      "contiguous_tail_payload_bytes": 11654288,
+      "contiguous_tail_payload_ratio": 0.4701627124595607,
+      "contiguous_tail_wqes": 58876,
+      "contiguous_tail_wqes_per_parent": 1.976168898734602,
+      "continuation_parent_rate": 0.9761688987346021,
+      "extent_chain_payload_bytes_lower": 11654288,
+      "extent_chain_payload_bytes_upper": 13282896,
+      "extent_chain_payload_ratio_lower": 0.4701627124595607,
+      "extent_chain_payload_ratio_upper": 0.5358647746373051,
+      "extent_chain_wqes_per_parent_lower": 4.86211526197429,
+      "extent_chain_wqes_per_parent_upper": 5.716242070284967,
+      "extent_tail_wqes_lower": 115064,
+      "extent_tail_wqes_upper": 140511,
+      "live_tail_edges": 920512,
+      "parents_with_continuation": 29083,
+      "prefix_edges": 16
+    },
+    {
+      "chunk_continuation_rate": 0.9650694133452754,
+      "chunks_with_continuation": 2155,
+      "contiguous_tail_payload_bytes": 12133312,
+      "contiguous_tail_payload_ratio": 0.48948772168991683,
+      "contiguous_tail_wqes": 51121,
+      "contiguous_tail_wqes_per_parent": 1.7158728560400094,
+      "continuation_parent_rate": 0.7158728560400094,
+      "extent_chain_payload_bytes_lower": 12133328,
+      "extent_chain_payload_bytes_upper": 13327632,
+      "extent_chain_payload_ratio_lower": 0.48948836716936606,
+      "extent_chain_payload_ratio_upper": 0.5376695351773391,
+      "extent_chain_wqes_per_parent_lower": 3.113348773201759,
+      "extent_chain_wqes_per_parent_upper": 3.7397039573054074,
+      "extent_tail_wqes_lower": 62963,
+      "extent_tail_wqes_upper": 81624,
+      "live_tail_edges": 503702,
+      "parents_with_continuation": 21328,
+      "prefix_edges": 32
+    },
+    {
+      "chunk_continuation_rate": 0.8293775190326914,
+      "chunks_with_continuation": 1852,
+      "contiguous_tail_payload_bytes": 13812592,
+      "contiguous_tail_payload_ratio": 0.5572340172833578,
+      "contiguous_tail_wqes": 41583,
+      "contiguous_tail_wqes_per_parent": 1.3957305407310443,
+      "continuation_parent_rate": 0.3957305407310442,
+      "extent_chain_payload_bytes_lower": 13812624,
+      "extent_chain_payload_bytes_upper": 14472784,
+      "extent_chain_payload_ratio_lower": 0.5572353082422562,
+      "extent_chain_payload_ratio_upper": 0.5838677903172919,
+      "extent_chain_wqes_per_parent_lower": 1.9940590071493305,
+      "extent_chain_wqes_per_parent_upper": 2.3402812741247945,
+      "extent_tail_wqes_lower": 29616,
+      "extent_tail_wqes_upper": 39931,
+      "live_tail_edges": 236924,
+      "parents_with_continuation": 11790,
+      "prefix_edges": 48
+    },
+    {
+      "chunk_continuation_rate": 0.6291983878190774,
+      "chunks_with_continuation": 1405,
+      "contiguous_tail_payload_bytes": 16516440,
+      "contiguous_tail_payload_ratio": 0.666313912147665,
+      "contiguous_tail_wqes": 35607,
+      "contiguous_tail_wqes_per_parent": 1.1951465109253852,
+      "continuation_parent_rate": 0.19514651092538515,
+      "extent_chain_payload_bytes_lower": 16516496,
+      "extent_chain_payload_bytes_upper": 16842000,
+      "extent_chain_payload_ratio_lower": 0.6663161713257373,
+      "extent_chain_payload_ratio_upper": 0.6794478052407767,
+      "extent_chain_wqes_per_parent_lower": 1.4121102272345853,
+      "extent_chain_wqes_per_parent_upper": 1.5828214681300976,
+      "extent_tail_wqes_lower": 12278,
+      "extent_tail_wqes_upper": 17364,
+      "live_tail_edges": 98217,
+      "parents_with_continuation": 5814,
+      "prefix_edges": 64
+    }
+  ],
+  "extent_8": {
+    "bytes_per_parent": 417.7222837579297,
+    "extent_count": 187008,
+    "extents_per_parent": 6.276910683717651,
+    "one_shot_wqes_per_parent": 1.0,
+    "payload_bytes": 12445200,
+    "payload_ratio": 0.5020700525936656,
+    "payload_savings": 0.49792994740633445,
+    "rounding_bytes": 804584,
+    "rounding_overhead_vs_ideal": 0.06911867894276386
+  },
+  "fixed_record": {
+    "bytes_per_parent": 832.0,
+    "payload_bytes": 24787776,
+    "payload_ratio": 1.0,
+    "payload_savings": 0.0
+  },
+  "ideal_live_prefix": {
+    "bytes_per_parent": 390.7164770248045,
+    "payload_bytes": 11640616,
+    "payload_ratio": 0.4696111502701977,
+    "payload_savings": 0.5303888497298024
+  },
+  "interpretation": {
+    "continuation_bounds": "The lower WQE model reads one contiguous live tail. The extent-chain bounds use only aggregate tail counts and never pretend that per-parent degrees were traced.",
+    "layout_not_query_selection": "Savings come only from eliminating unused fixed-record capacity; no edge is skipped based on the query."
+  },
+  "layout_assumptions": {
+    "extent_bytes": 64,
+    "extent_edges": 8,
+    "fixed_record_bytes": 832,
+    "header_bytes": 16,
+    "one_shot_extent_requires_pre_read_length_class": true,
+    "remote_ptr_bytes": 8,
+    "version_checksum_redesign_cost_included": false
+  },
+  "schema": 1,
+  "total_rdma_projection": {
+    "extent_8": {
+      "current_graph_bytes_per_query": 162396.7361788604,
+      "current_total_rdma_bytes_per_query": 181852.73617886042,
+      "non_graph_bytes_per_query": 19456.00000000003,
+      "proposed_graph_bytes_per_query": 81534.53787436006,
+      "proposed_total_rdma_bytes_per_query": 100990.53787436009,
+      "total_rdma_byte_reduction": 0.44465758395281274
+    },
+    "ideal_live_prefix": {
+      "current_graph_bytes_per_query": 162396.7361788604,
+      "current_total_rdma_bytes_per_query": 181852.73617886042,
+      "non_graph_bytes_per_query": 19456.00000000003,
+      "proposed_graph_bytes_per_query": 76263.31807708045,
+      "proposed_total_rdma_bytes_per_query": 95719.31807708048,
+      "total_rdma_byte_reduction": 0.47364378403998175
+    }
+  },
+  "trace": {
+    "average_live_edges_per_parent": 46.83955962810056,
+    "live_edges": 1395491,
+    "overflow_count": 0,
+    "parents": 29793,
+    "query_records": 152,
+    "score_chunks": 2233
+  }
+}

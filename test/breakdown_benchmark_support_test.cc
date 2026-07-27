@@ -88,6 +88,11 @@ void test_recall_and_report_formatting() {
   telemetry.gpu_beam_merge_sort_ns = 6'000;
   telemetry.gpu_beam_merge_materialize_ns = 8'000;
   telemetry.graph_read_retries = 11;
+  telemetry.graph_page_requests = 10;
+  telemetry.graph_read_bytes = 4'000;
+  telemetry.graph_live_extent_reads = 8;
+  telemetry.graph_full_record_reads = 3;
+  telemetry.graph_extent_fallback_reads = 1;
   telemetry.centroid_route_publications = 7;
   telemetry.centroid_route_shard_updates = 9;
   telemetry.centroid_route_live_entries = 13;
@@ -107,6 +112,17 @@ void test_recall_and_report_formatting() {
   telemetry.dynamic_code_cache_capacity = 256;
   const auto telemetry_json = tools::breakdown_benchmark::telemetry_to_json(telemetry);
   assert(telemetry_json.at("graph_read_retries") == 11);
+  assert(telemetry_json.at("graph_read_bytes") == 4'000);
+  assert(telemetry_json.at("average_graph_read_bytes_per_query") == 2'000.0);
+  assert(
+    telemetry_json.at("average_graph_read_bytes_per_logical_parent") == 400.0);
+  assert(telemetry_json.at("graph_live_extent_reads") == 8);
+  assert(telemetry_json.at("graph_full_record_reads") == 3);
+  assert(telemetry_json.at("graph_extent_fallback_reads") == 1);
+  assert(std::abs(
+    telemetry_json.at("graph_live_extent_read_ratio").get<double>() -
+    8.0 / 11.0) < 1e-9);
+  assert(telemetry_json.at("graph_extent_fallback_ratio") == 0.125);
   assert(telemetry_json.at("gpu_beam_merge_prepare_ns") == 4'000);
   assert(telemetry_json.at("gpu_beam_merge_sort_ns") == 6'000);
   assert(telemetry_json.at("gpu_beam_merge_materialize_ns") == 8'000);

@@ -78,19 +78,23 @@ frontier、实际远端展开和评分记录数，初选 home 命中率、迁移
 ## 索引文件
 
 运行索引固定为 schema 16、L2、`plain` vector record、tagged compact graph、持久化
-storage control block 和
-OPQ/PQ 导航。默认 profile 使用 32 个 8-bit 子空间。运行时不读取任何计算节点图清单文件。
+storage control block 和 OPQ/PQ 导航。默认 profile 使用 32 个 8-bit 子空间。
+默认 `fixed` 图读取路径不需要计算节点图 metadata；可选 `live-extent` 路径只额外读取
+一个 1 byte/base-node 的只读长度 sidecar，不保存邻接表。
 
 | 文件                              | 计算节点             | 存储节点 X | 作用                     |
 | ------------------------------- | ---------------- | ------ | ---------------------- |
 | `<prefix>.meta.json`            | 必需               | 必需     | 分片、远端 offset 和格式契约     |
 | `<prefix>.pq32`                 | 必需               | 不需要    | OPQ 矩阵与 PQ codebook    |
+| `<prefix>.gextent8`             | live-extent 时必需 | 不需要    | 每个 base node 的 8-edge 读取长度档 |
 | `<prefix>_nodeX_ofN.dat`        | 不需要              | 必需     | 精确向量、固定记录和紧凑图          |
 | `<prefix>_nodeX_ofN.idmap`      | 不需要              | 必需     | 与构建/owner 强绑定的 ID/代际/物理目录 |
 | `<prefix>_nodeX_ofN.centroid`   | 不需要              | 必需     | 物理分片 FP64 sum/count 与启动入口  |
 | `<prefix>_nodeX_ofN.pq32.codes` | 不需要              | 必需     | 启动时注册到远端内存的 PQ32 码流    |
 
-计算节点本地保存 metadata 和 PQ 模型；metadata 只合成并校验不可变分片布局，
+计算节点本地保存 metadata 和 PQ 模型；启用 `live-extent` 时还保存
+`.gextent8`。该 sidecar 对 SIFT100M 为约 100 MB，只含全局物理 ordinal 对应的
+长度档和与索引绑定的校验头，不包含 handle、边或向量。metadata 只合成并校验不可变分片布局，
 不读取 medoid 或离线采样 entry-point。METIS 只决定物理 placement；逻辑 authority
 始终可由 ID 推导，因此查询和更新模式的计算节点都不加载 `.idmap`。计算节点不会
 保存 `.gpu.idx`、图分片、精确向量、ID 目录或全量导航码。
@@ -101,6 +105,9 @@ OPQ/PQ 导航。默认 profile 使用 32 个 8-bit 子空间。运行时不读�
 （约 29.8 GiB）。计算 GPU 只为每个分片常驻中心和最多 4 个实时入口，不保存
 计算侧 mutable overlay、基础图记录或精确向量；稳态查询通过
 GPUNetIO/RDMA 按需直接读取它们。
+
+Live-Extent 的格式、fallback、telemetry 和 A/B 方法见
+[`docs/live_extent_rdma.md`](docs/live_extent_rdma.md)。
 
 每个 owner idmap 使用 `owner_sharded_v2_bound`：header 同时绑定整次构建指纹、
 owner 对应的分片指纹、owner/shard 数量、tagged `RemotePtr` 布局以及 payload/header
@@ -127,6 +134,8 @@ cmake --build build -j
 - `vamana_offline_builder`：在 CPU 上构建 compact Vamana 图，并执行
   `balanced`、`bfs` 或可选的 `metis` 分片；
 - `vamana_pq_indexer`：训练 OPQ/PQ 并生成分片码流。
+- `vamana_graph_extent_indexer`：校验完整 schema-16 图分片，并生成
+  one-shot Live-Extent RDMA 所需的只读长度档 sidecar。
 
 无 GPU 的存储节点可同时构建存储服务和 CPU 离线索引工具：
 
@@ -137,7 +146,7 @@ cmake -S . -B build-storage \
   -DCMAKE_CXX_COMPILER=/usr/bin/g++-11
 cmake --build build-storage -j --target \
   dvstor_memory_node vamana_offline_builder vamana_pq_indexer \
-  vamana_legacy_index_converter
+  vamana_graph_extent_indexer vamana_legacy_index_converter
 ```
 
 存储服务本身只依赖 CPU、RDMA、Boost 和 TBB。离线工具使用 CPU Faiss、BLAS、
@@ -166,8 +175,8 @@ GPU，也不需要额外重分片可执行文件。
 
 该命令先产出 schema-15 tagged graph 中间态及每个物理分片的精确 `.centroid`
 sidecar，再由 PQ indexer 原子升级并产出最终 schema-16 分片契约、owner idmap、
-OPQ/PQ32 模型和
-每分片 PQ32 码流，不需要再运行重编码脚本。默认目标已存在时脚本会在昂贵构建前
+OPQ/PQ32 模型和每分片 PQ32 码流，最后全量校验图记录并生成 `.gextent8`，
+不需要再运行重编码脚本。默认目标已存在时脚本会在昂贵构建前
 拒绝覆盖；建议通过 `PQ_INDEX_PREFIX=/new/prefix` 构建新版本，确认需要原地重建时
 才设置 `OVERWRITE_INDEX=1`。
 
@@ -199,7 +208,8 @@ Benchmark 并发使用独立的 `BENCHMARK_CLIENT_THREADS`，不写入索引/系
 `bigann_base.bvecs`。
 
 分布式部署时，每台存储节点只需其自身的 `.dat`、`.idmap`、`.centroid`、
-`.pq32.codes`，再加共享 metadata；计算节点不需要额外的路由 sidecar。详细流程见
+`.pq32.codes`，再加共享 metadata。计算节点启用 `live-extent` 时还需要
+`.gextent8`；它不是路由或图副本。详细流程见
 `experiment/README.md`。
 
 ## 验证

@@ -70,6 +70,13 @@ TelemetrySnapshot Telemetry::snapshot() const {
     .graph_page_requests = graph_page_requests.load(std::memory_order_relaxed),
     .graph_shard_batches = graph_shard_batches.load(std::memory_order_relaxed),
     .graph_read_retries = graph_read_retries.load(std::memory_order_relaxed),
+    .graph_read_bytes = graph_read_bytes.load(std::memory_order_relaxed),
+    .graph_live_extent_reads =
+      graph_live_extent_reads.load(std::memory_order_relaxed),
+    .graph_full_record_reads =
+      graph_full_record_reads.load(std::memory_order_relaxed),
+    .graph_extent_fallback_reads =
+      graph_extent_fallback_reads.load(std::memory_order_relaxed),
     .graph_dependency_rounds = graph_dependency_rounds.load(std::memory_order_relaxed),
     .graph_route_hits = graph_route_hits.load(std::memory_order_relaxed),
     .graph_route_refreshes = graph_route_refreshes.load(std::memory_order_relaxed),
@@ -176,6 +183,10 @@ void Telemetry::reset() {
   graph_page_requests.store(0, std::memory_order_relaxed);
   graph_shard_batches.store(0, std::memory_order_relaxed);
   graph_read_retries.store(0, std::memory_order_relaxed);
+  graph_read_bytes.store(0, std::memory_order_relaxed);
+  graph_live_extent_reads.store(0, std::memory_order_relaxed);
+  graph_full_record_reads.store(0, std::memory_order_relaxed);
+  graph_extent_fallback_reads.store(0, std::memory_order_relaxed);
   graph_dependency_rounds.store(0, std::memory_order_relaxed);
   graph_route_hits.store(0, std::memory_order_relaxed);
   graph_route_refreshes.store(0, std::memory_order_relaxed);
