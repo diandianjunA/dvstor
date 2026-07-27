@@ -1,0 +1,9 @@
+date=2026-07-27T12:51:46+08:00
+git_commit=e84a53c44b0323112ff2eb1f289bfb1adf786310
+0, NVIDIA A800 80GB PCIe, 00000000:5B:00.0, 610.43.03, 81920 MiB
+1, NVIDIA A800 80GB PCIe, 00000000:5C:00.0, 610.43.03, 81920 MiB
+hca_id:	mlx5_0
+	transport:			InfiniBand (0)
+	fw_ver:				20.43.3608
+	node_guid:			08c0:eb03:00e0:08e4
+			link_layer:		InfiniBand

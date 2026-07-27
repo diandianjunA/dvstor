@@ -6,7 +6,6 @@
 
 namespace tools::breakdown_benchmark {
 
-template <class Distance>
-nlohmann::json run_benchmark(ComputeService<Distance>& service, const Args& args);
+nlohmann::json run_benchmark(ComputeService& service, const Args& args);
 
 }  // namespace tools::breakdown_benchmark

@@ -4,454 +4,128 @@
 #include <cctype>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+
 #include <library/configuration.hh>
 
 #include "constants.hh"
-#include "index_path.hh"
 #include "types.hh"
 #include "vector_dtype.hh"
 
 namespace configuration {
 
-// struct used for sending serialized from CN to MN
 struct Parameters {
   u32 num_threads{};
-  bool reserved{};
-  bool routing{};
-  u32 qp_pool_size{1};
+  u32 gpu_rdma_qps{};
 };
 
 class IndexConfiguration : public Configuration {
 public:
-  filepath_t data_path{};
   filepath_t index_prefix{};
   filepath_t server_index_file{};
-  str query_suffix{};
   u32 num_threads{};
-  u32 num_coroutines{};
-  i32 seed{};
+  i32 seed{1234};
   bool disable_thread_pinning{};
-  str label{};  // for labeling benchmarks
-
-  // Vamana parameters
-  u32 R{};                // max out-degree
-  u32 beam_width{};       // beam width for search (replaces ef_search)
-  u32 beam_width_construction{}; // beam width for insert (replaces ef_construction)
-  f64 alpha{};            // RobustPrune alpha parameter
-  u32 k{};
-  u32 gpu_device{};       // CUDA device ID
-  bool gpudirect_rdma{};  // Enable GPUDirect RDMA (read vectors directly into GPU buffers)
-  u32 expansion_batch{1};   // Batch K beam expansions per iteration (1=serial)
-  u32 rdma_qp_pool_size{};   // QPs per memory node per SharedContext (0=auto)
-  str rdma_read_batch_mode{"adaptive"};
-  u32 rdma_read_chain_size{};
-  u32 rdma_read_max_inflight_wrs{};
-  u32 query_batch_size{1};  // Fuse GPU across N queries (1=single query)
-  bool use_rabitq{};        // Use the local RaBitQ gate before exact beam insertion
-  str rabitq_mode{"exact_safe"};
-  u32 rabitq_gate_width{18};
-  u32 rabitq_gate_max_width{36};
-  f64 rabitq_gate_margin{0.08};
-  f64 rabitq_cache_max_ratio{0.10};
-  u32 rabitq_dynamic_budget_mb{64};
-  u32 rabitq_coalesce_target{64};
-  u32 rabitq_coalesce_min{32};
-  u32 rabitq_coalesce_wait_us{6};
-  u32 rabitq_prefetch_width{2};
-  u32 rabitq_prefetch_min_samples{16};
-  f64 rabitq_prefetch_min_hit_ratio{0.35};
-  u32 rabitq_warmup_exact_expansions{6};
-  u32 rabitq_audit_period{12};
-  f64 rabitq_safe_epsilon{1e-4};
-  bool rabitq_strict_recall{true};
-  str vector_data_type{"auto"};
-  str insert_execution{"compute"};
-  u32 insert_workers{};
-  u32 query_workers{};
-  u32 insert_coroutines{};
-  u32 query_coroutines{};
-  u32 storage_id{0};
-  vec<str> storage_peers;
-  u32 storage_owner_batch_max{16};
-  u32 storage_owner_batch_wait_us{250};
-  u32 storage_owner_peer_rdma_tokens{8};
-  u32 storage_owner_rpc_depth{8};
-  u32 storage_owner_rpc_timeout_ms{30000};
-  u32 storage_owner_construction_beam_width{128};
-  u32 storage_owner_search_snapshot_batch{64};
-  u32 storage_owner_prune_max_candidates{128};
-  str storage_owner_update_mode{"exact"};
-  u32 storage_owner_anchor_hints{4};
-  u32 storage_owner_anchor_beam_width{64};
-  u32 storage_owner_anchor_expand_cap{16};
-  u32 storage_owner_anchor_remote_rescue_cap{4};
-  u32 storage_owner_anchor_audit_rate{256};
-  f64 storage_owner_anchor_min_overlap{0.5};
-  bool storage_owner_anchor_rehome_upsert{false};
-  str storage_owner_reverse_mode{"async"};
-  u32 storage_owner_reverse_queue_depth{65536};
-  u32 storage_owner_reverse_flush_us{200};
-  u32 storage_owner_reverse_coalesce_max{256};
-
-  // Legacy aliases for compatibility
-  u32& ef_search = beam_width;
-  u32& ef_construction = beam_width_construction;
-  u32& m = R;
-
-  bool store_index{};  // memory servers store the index; index is constructed from scratch; location is data_path
-  bool load_index{};  // memory servers load index from file; cannot be used with store_index; location is data_path
-  bool no_recall{};  // does not calculate the recall and thus requires no groundtruth
-  bool ip_distance{};  // use the inner product distance rather than squared L2 norm
-
-  bool routing{};
 
   u32 dim{};
-  u32 max_vectors{1000000};
+  u32 max_vectors{1'000'000};
+  // Exclusive upper bound for logical node IDs. Zero during option parsing
+  // means "derive from max_vectors" for backward-compatible configurations.
+  u32 vector_id_namespace_size{};
+  u32 k{};
+  u32 R{64};
+  u32 beam_width_construction{200};
+  f64 alpha{1.2};
+  str vector_data_type{"auto"};
 
-  // Memory size parameters (in GB)
-  u32 cn_memory_gb{10};
+  u32 gpu_device{};
+  bool enable_breakdown{true};
+  u32 gpu_query_slots{256};
+  u32 gpu_memory_limit_gb{40};
+  u32 gpu_memory_reserve_gb{4};
+  u32 gpu_bootstrap_window_mb{64};
+  u32 gpu_bootstrap_windows{2};
+  u32 gpu_graph_prefetch_depth{32};
+  str gpu_query_graph_read_policy{"fixed"};
+  str gpu_query_expansion_policy{"fixed"};
+  str gpu_query_beam_merge_policy{"legacy"};
+  str query_rdma_trace_mode{"off"};
+  u32 query_rdma_trace_sample_rate{1000};
+  filepath_t query_rdma_trace_output{};
+  u32 query_rdma_trace_events_per_query{1024};
+  u32 gpu_traversal_beam_width{128};
+  u32 gpu_final_rerank_width{64};
+  u32 gpu_max_expansions{384};
+  u32 gpu_rdma_qps{4};
+  // Deprecated compatibility input. Dynamic PQ now uses a fixed one-to-one
+  // physical-slot arena sized from storage metadata; this value is ignored.
+  u32 gpu_dynamic_code_cache_entries{1u << 20};
+  // A CQE can be delayed well beyond ordinary read latency when GPU reads and
+  // CPU-posted mutation traffic share the NIC.  This is a liveness bound, not
+  // a latency target: transport errors still fail immediately.
+  u32 gpu_direct_timeout_ms{250};
+  u32 gpu_persistent_blocks_per_sm{4};
+  // Compute-side mutation support is optional for query-only deployments.
+  // Keep it enabled by default so existing service configurations preserve
+  // their insert/upsert/erase behavior.
+  bool enable_updates{true};
+
+  u32 storage_id{};
+  vec<str> storage_peers;
+  u32 storage_owner_batch_max{16};
+  // Give synchronous writers enough time to form one useful foreground
+  // microbatch. A full batch is sent immediately; this only bounds additional
+  // coalescing while an RPC slot is available, not remote service time.
+  u32 storage_owner_batch_max_wait_us{2'000};
+  // Stage2 is query-invisible background maintenance. Its compaction horizon
+  // must not be tied to the foreground Stage1 batching latency.
+  // Stage2 batching is coordinated across already-pending work.  A short
+  // horizon still forms useful waves without adding millisecond-scale queue
+  // delay when update load is sparse or uneven across homes.
+  u32 storage_owner_stage2_batch_max_wait_us{50};
+  u32 storage_owner_peer_qps_per_peer{8};
+  u32 storage_owner_peer_rdma_tokens{16};
+  u32 storage_owner_rpc_depth{8};
+  u32 storage_owner_rpc_timeout_ms{30'000};
+  u32 storage_owner_search_snapshot_batch{256};
+  // Stage2 is part of the only supported update protocol, so at least one
+  // maintenance executor must exist even when the caller does not tune it.
+  u32 storage_owner_maintenance_workers{1};
+  u32 storage_owner_maintenance_queue_depth{65'536};
+  u32 storage_owner_reverse_queue_depth{65'536};
+  u32 storage_owner_reverse_coalesce_max{256};
+
   u32 mn_memory_gb{10};
 
-public:
   IndexConfiguration(int argc, char** argv) {
     add_options();
     process_program_options(argc, argv);
-    insert_execution = normalize_mode(insert_execution);
-    storage_owner_reverse_mode = normalize_mode(storage_owner_reverse_mode);
-    storage_owner_update_mode = normalize_mode(storage_owner_update_mode);
-    rdma_read_batch_mode = normalize_mode(rdma_read_batch_mode);
-
-    if (!is_server) {
-      validate_compute_node_options(argv);
+    if (vector_id_namespace_size == 0) {
+      vector_id_namespace_size = max_vectors;
     }
-
+    vector_data_type = normalize_mode(vector_data_type);
+    gpu_query_graph_read_policy =
+      normalize_mode(gpu_query_graph_read_policy);
+    gpu_query_expansion_policy =
+      normalize_mode(gpu_query_expansion_policy);
+    gpu_query_beam_merge_policy =
+      normalize_mode(gpu_query_beam_merge_policy);
+    query_rdma_trace_mode = normalize_mode(query_rdma_trace_mode);
+    validate(argv);
     operator<<(std::cerr, *this);
   }
 
-private:
-  void add_options() {
-    desc.add_options()("data-path,d",
-                       po::value<filepath_t>(&data_path),
-                       "Path to input directory containing the base vectors (\"base.fvecs\") and the \"query\" "
-                       "directory (which contains the query and the groundtruth file).")(
-      "index-prefix",
-      po::value<filepath_t>(&index_prefix),
-      "Path prefix of index shard files without the _nodeX_ofN.dat suffix. If omitted, the prefix is derived from "
-      "data-path, M, and ef-construction.")(
-      "server-index-file",
-      po::value<filepath_t>(&server_index_file),
-      "Path to a local DVSTOR index shard file that a memory node should load during startup.")(
-      "threads,t", po::value<u32>(&num_threads), "Number of threads per compute node.")(
-      "coroutines,C", po::value<u32>(&num_coroutines)->default_value(4), "Number of coroutines per compute thread.")(
-      "disable-thread-pinning,p",
-      po::bool_switch(&disable_thread_pinning)->default_value(false),
-      "Disables pinning compute threads to physical cores if set.")(
-      "seed", po::value<i32>(&seed)->default_value(1234), "Seed for PRNG; setting to -1 uses std::random_device.")(
-      "label", po::value<str>(&label), "Optional label to identify benchmarks.")(
-      "query-suffix,q", po::value<str>(&query_suffix), "Filename suffix for the query file.")(
-      "store-index,s",
-      po::bool_switch(&store_index),
-      "Construct the index from scratch and the memory servers store the index to a file.")(
-      "load-index,l",
-      po::bool_switch(&load_index),
-      "The index is not built, the memory servers load the index from a file.")(
-      "routing", po::bool_switch(&routing), "Activate adaptive query routing.")(
-      "no-recall", po::bool_switch(&no_recall), "No recall computation, ground truth file can be omitted.")(
-      "ip-dist", po::bool_switch(&ip_distance), "Use the inner product distance rather than the squared L2 norm.")(
-      "beam-width", po::value<u32>(&beam_width), "Beam width during search (replaces ef-search).")(
-      "ef-search", po::value<u32>(&beam_width), "Alias for --beam-width.")(
-      "beam-width-construction", po::value<u32>(&beam_width_construction)->default_value(200),
-      "Beam width during construction (replaces ef-construction).")(
-      "ef-construction", po::value<u32>(&beam_width_construction), "Alias for --beam-width-construction.")(
-      "k,k", po::value<u32>(&k), "Number of k nearest neighbors.")(
-      "R", po::value<u32>(&R)->default_value(64), "Maximum out-degree of Vamana graph.")(
-      "m,m", po::value<u32>(&R), "Alias for --R (max out-degree).")(
-      "alpha", po::value<f64>(&alpha)->default_value(1.2), "RobustPrune diversity factor.")
-      ("vector-data-type", po::value<str>(&vector_data_type)->default_value(vector_data_type),
-      "Storage dtype for full vectors: auto, float32, uint8, or int8.")(
-      "insert-execution", po::value<str>(&insert_execution)->default_value(insert_execution),
-      "Insert execution mode: compute or storage_owner.")(
-      "insert-workers", po::value<u32>(&insert_workers)->default_value(0),
-      "Dedicated insert worker threads. 0 keeps the built-in split.")(
-      "query-workers", po::value<u32>(&query_workers)->default_value(0),
-      "Dedicated query worker threads. 0 keeps the built-in split.")(
-      "insert-coroutines", po::value<u32>(&insert_coroutines)->default_value(0),
-      "Coroutines per insert worker. 0 uses the global coroutines value.")(
-      "query-coroutines", po::value<u32>(&query_coroutines)->default_value(0),
-      "Coroutines per query worker. 0 uses the built-in query default.")(
-      "storage-id", po::value<u32>(&storage_id)->default_value(0),
-      "Storage-node id used by storage_owner insert execution.")(
-      "storage-peers", po::value<vec<str>>(&storage_peers)->multitoken(),
-      "Ordered list of storage-peer endpoints used for storage_owner insert execution.")(
-      "storage-owner-batch-max", po::value<u32>(&storage_owner_batch_max)->default_value(storage_owner_batch_max),
-      "Maximum number of inserts grouped into one storage_owner batch.")(
-      "storage-owner-batch-wait-us", po::value<u32>(&storage_owner_batch_wait_us)->default_value(storage_owner_batch_wait_us),
-      "Maximum micro-batch wait in microseconds for storage_owner inserts.")(
-      "storage-owner-peer-rdma-tokens",
-      po::value<u32>(&storage_owner_peer_rdma_tokens)->default_value(storage_owner_peer_rdma_tokens),
-      "Maximum storage-owner peer RDMA reads allowed per peer QP. Capped by the memory-node safety limit.")(
-      "storage-owner-rpc-depth",
-      po::value<u32>(&storage_owner_rpc_depth)->default_value(storage_owner_rpc_depth),
-      "Maximum in-flight storage_owner insert batches per storage node.")(
-      "storage-owner-rpc-timeout-ms",
-      po::value<u32>(&storage_owner_rpc_timeout_ms)->default_value(storage_owner_rpc_timeout_ms),
-      "Maximum time to wait for one storage_owner insert RPC response.")(
-      "storage-owner-construction-beam-width",
-      po::value<u32>(&storage_owner_construction_beam_width)->default_value(storage_owner_construction_beam_width),
-      "Storage-owner online construction beam width. 0 uses --beam-width-construction unchanged.")(
-      "storage-owner-search-snapshot-batch",
-      po::value<u32>(&storage_owner_search_snapshot_batch)->default_value(storage_owner_search_snapshot_batch),
-      "Maximum node snapshots read concurrently during storage-owner search/prune.")(
-      "storage-owner-prune-max-candidates",
-      po::value<u32>(&storage_owner_prune_max_candidates)->default_value(storage_owner_prune_max_candidates),
-      "Maximum candidates considered by storage-owner robust-prune. 0 disables the cap.")(
-      "storage-owner-update-mode",
-      po::value<str>(&storage_owner_update_mode)->default_value(storage_owner_update_mode),
-      "Storage-owner update search: exact or anchored.")(
-      "storage-owner-anchor-hints",
-      po::value<u32>(&storage_owner_anchor_hints)->default_value(storage_owner_anchor_hints),
-      "Anchor entry points attached to each storage-owner mutation.")(
-      "storage-owner-anchor-beam-width",
-      po::value<u32>(&storage_owner_anchor_beam_width)->default_value(storage_owner_anchor_beam_width),
-      "Maximum beam width for anchored storage-owner search.")(
-      "storage-owner-anchor-expand-cap",
-      po::value<u32>(&storage_owner_anchor_expand_cap)->default_value(storage_owner_anchor_expand_cap),
-      "Maximum graph expansions in anchored foreground search.")(
-      "storage-owner-anchor-remote-rescue-cap",
-      po::value<u32>(&storage_owner_anchor_remote_rescue_cap)->default_value(storage_owner_anchor_remote_rescue_cap),
-      "Maximum remote-node expansions in anchored foreground search.")(
-      "storage-owner-anchor-audit-rate",
-      po::value<u32>(&storage_owner_anchor_audit_rate)->default_value(storage_owner_anchor_audit_rate),
-      "Run one sampled exact shadow audit per N successful anchored inserts. 0 disables auditing.")(
-      "storage-owner-anchor-min-overlap",
-      po::value<f64>(&storage_owner_anchor_min_overlap)->default_value(storage_owner_anchor_min_overlap),
-      "Minimum selected-neighbor overlap accepted by anchor shadow audits.")(
-      "storage-owner-anchor-rehome-upsert",
-      po::value<bool>(&storage_owner_anchor_rehome_upsert)->default_value(storage_owner_anchor_rehome_upsert),
-      "Allow anchored upserts to migrate ID ownership. Disabled until distributed two-phase ownership is enabled.")(
-      "storage-owner-reverse-mode",
-      po::value<str>(&storage_owner_reverse_mode)->default_value(storage_owner_reverse_mode),
-      "Reverse-update completion mode for storage_owner inserts: async or sync.")(
-      "storage-owner-reverse-queue-depth",
-      po::value<u32>(&storage_owner_reverse_queue_depth)->default_value(storage_owner_reverse_queue_depth),
-      "Maximum queued peer reverse-update requests per memory node.")(
-      "storage-owner-reverse-flush-us",
-      po::value<u32>(&storage_owner_reverse_flush_us)->default_value(storage_owner_reverse_flush_us),
-      "Maximum worker-side coalescing wait for peer reverse updates in microseconds.")(
-      "storage-owner-reverse-coalesce-max",
-      po::value<u32>(&storage_owner_reverse_coalesce_max)->default_value(storage_owner_reverse_coalesce_max),
-      "Maximum reverse-update operations coalesced by one peer worker batch.")(
-      "gpu-device", po::value<u32>(&gpu_device)->default_value(0), "CUDA device ID.")(
-      "gpudirect-rdma", po::bool_switch(&gpudirect_rdma)->default_value(false),
-      "Enable GPUDirect RDMA on compute nodes (direct RDMA reads into GPU memory).")(
-      "expansion-batch,K", po::value<u32>(&expansion_batch)->default_value(1),
-      "Number of beam nodes expanded per iteration.")(
-      "rdma-qp-pool-size", po::value<u32>(&rdma_qp_pool_size)->default_value(rdma_qp_pool_size),
-      "QPs per memory node per SharedContext. 0 selects the automatic pool size.")(
-      "rdma-read-batch-mode",
-      po::value<str>(&rdma_read_batch_mode)->default_value(rdma_read_batch_mode),
-      "Vector RDMA batch scheduling mode: adaptive or legacy.")(
-      "rdma-read-chain-size",
-      po::value<u32>(&rdma_read_chain_size)->default_value(rdma_read_chain_size),
-      "Maximum RDMA READ WRs per signaled chain. 0 derives it from device capabilities.")(
-      "rdma-read-max-inflight-wrs",
-      po::value<u32>(&rdma_read_max_inflight_wrs)->default_value(rdma_read_max_inflight_wrs),
-      "Maximum outstanding bulk READ WRs per QP. 0 derives it from the send queue capacity.")(
-      "query-batch-size", po::value<u32>(&query_batch_size)->default_value(1),
-      "Fuse GPU/D2H across N queries processed in lockstep (1=disabled, 2-4=batch).")(
-      "use-rabitq", po::bool_switch(&use_rabitq)->default_value(false),
-      "Use the local RaBitQ gate; only exact distances enter the beam.")(
-      "rabitq-mode", po::value<str>(&rabitq_mode)->default_value(rabitq_mode),
-      "RaBitQ execution mode: exact_safe, speculative_prefetch, gpu_coalesced, or cpu_gate.")(
-      "rabitq-gate-width", po::value<u32>(&rabitq_gate_width)->default_value(rabitq_gate_width),
-      "Minimum cached candidates exactified per expansion.")(
-      "rabitq-gate-max-width",
-      po::value<u32>(&rabitq_gate_max_width)->default_value(rabitq_gate_max_width),
-      "Maximum cached candidates exactified after margin expansion.")(
-      "rabitq-gate-margin", po::value<f64>(&rabitq_gate_margin)->default_value(rabitq_gate_margin),
-      "Relative margin around the gate-width cutoff.")(
-      "rabitq-cache-max-ratio",
-      po::value<f64>(&rabitq_cache_max_ratio)->default_value(rabitq_cache_max_ratio),
-      "Maximum compute-node RaBitQ bytes as a ratio of raw vector bytes.")(
-      "rabitq-dynamic-budget-mb",
-      po::value<u32>(&rabitq_dynamic_budget_mb)->default_value(rabitq_dynamic_budget_mb),
-      "Fixed RaBitQ dynamic overlay budget in MiB, capped by --rabitq-cache-max-ratio.")(
-      "rabitq-coalesce-target",
-      po::value<u32>(&rabitq_coalesce_target)->default_value(rabitq_coalesce_target),
-      "Target candidates per RaBitQ exactification flush.")(
-      "rabitq-coalesce-min",
-      po::value<u32>(&rabitq_coalesce_min)->default_value(rabitq_coalesce_min),
-      "Minimum RDMA-friendly candidates exactified before strict recall widening stops.")(
-      "rabitq-coalesce-wait-us",
-      po::value<u32>(&rabitq_coalesce_wait_us)->default_value(rabitq_coalesce_wait_us),
-      "Maximum RaBitQ coalescer wait in microseconds.")(
-      "rabitq-prefetch-width",
-      po::value<u32>(&rabitq_prefetch_width)->default_value(rabitq_prefetch_width),
-      "Number of RaBitQ-ranked neighbor lists speculatively prefetched per exact GPU batch.")(
-      "rabitq-prefetch-min-samples",
-      po::value<u32>(&rabitq_prefetch_min_samples)->default_value(rabitq_prefetch_min_samples),
-      "Predictions observed before applying the per-query prefetch stop-loss.")(
-      "rabitq-prefetch-min-hit-ratio",
-      po::value<f64>(&rabitq_prefetch_min_hit_ratio)->default_value(rabitq_prefetch_min_hit_ratio),
-      "Disable speculative prefetch for a query when its hit ratio falls below this value.")(
-      "rabitq-warmup-exact-expansions",
-      po::value<u32>(&rabitq_warmup_exact_expansions)->default_value(rabitq_warmup_exact_expansions),
-      "Exactify all candidates for this many initial RaBitQ graph expansions.")(
-      "rabitq-audit-period",
-      po::value<u32>(&rabitq_audit_period)->default_value(rabitq_audit_period),
-      "Exactify one full RaBitQ frontier every N graph expansions after warmup. 0 disables audit.")(
-      "rabitq-safe-epsilon",
-      po::value<f64>(&rabitq_safe_epsilon)->default_value(rabitq_safe_epsilon),
-      "Absolute safety margin for RFQ5 exact-safe lower-bound skipping.")(
-      "rabitq-strict-recall",
-      po::value<bool>(&rabitq_strict_recall)->default_value(rabitq_strict_recall),
-      "Widen uncertain small RaBitQ gates so recall is protected.")(
-      "dim", po::value<u32>(&dim), "Vector dimension")(
-      "max-vectors", po::value<u32>(&max_vectors)->default_value(1000000), "Max vectors capacity")(
-      "cn-memory", po::value<u32>(&cn_memory_gb)->default_value(10), "Compute node local buffer size in GB")(
-      "mn-memory", po::value<u32>(&mn_memory_gb)->default_value(10), "Memory node buffer size in GB");
+  filepath_t resolved_index_prefix() const {
+    return index_prefix;
   }
 
-  void validate_compute_node_options(char** argv) const {
-    if (num_threads == 0 || beam_width == 0 || k == 0 || dim == 0) {
-      std::cerr << "[ERROR]: Parameters threads, beam-width (ef-search), k, and dim are required" << std::endl;
-      exit_with_help_message(argv);
-    }
-
-    if (store_index && load_index) {
-      std::cerr << "[ERROR]: --store-index and --load-index cannot be used in conjunction" << std::endl;
-      exit_with_help_message(argv);
-    }
-
-    if (rdma_read_batch_mode != "adaptive" && rdma_read_batch_mode != "legacy") {
-      std::cerr << "[ERROR]: --rdma-read-batch-mode must be adaptive or legacy" << std::endl;
-      exit_with_help_message(argv);
-    }
-
-    if ((store_index || load_index) && index_prefix.empty() && data_path.empty()) {
-      std::cerr << "[ERROR]: --data-path or --index-prefix is required when --load-index or --store-index is set"
-                << std::endl;
-      exit_with_help_message(argv);
-    }
-
-    if (vector_data_type != "auto") {
-      try {
-        (void)parse_vector_dtype(vector_data_type);
-      } catch (const std::exception& e) {
-        std::cerr << "[ERROR]: --vector-data-type must be auto, float32, uint8, or int8: "
-                  << e.what() << std::endl;
-        exit_with_help_message(argv);
-      }
-    }
-
-    if (use_rabitq && ip_distance) {
-      std::cerr << "[ERROR]: --use-rabitq currently supports L2 distance only" << std::endl;
-      exit_with_help_message(argv);
-    }
-    if (use_rabitq && rabitq_mode != "exact_safe" &&
-        rabitq_mode != "speculative_prefetch" &&
-        rabitq_mode != "gpu_coalesced" && rabitq_mode != "cpu_gate") {
-      std::cerr << "[ERROR]: --rabitq-mode must be exact_safe, speculative_prefetch, "
-                   "gpu_coalesced, or cpu_gate" << std::endl;
-      exit_with_help_message(argv);
-    }
-    if (rabitq_gate_width == 0 || rabitq_gate_max_width < rabitq_gate_width ||
-        rabitq_gate_margin < 0.0 || rabitq_cache_max_ratio <= 0.0 ||
-        rabitq_coalesce_min == 0 || rabitq_coalesce_target < rabitq_coalesce_min ||
-        (rabitq_mode == "speculative_prefetch" &&
-         (rabitq_prefetch_width == 0 || rabitq_prefetch_min_samples == 0 ||
-          rabitq_prefetch_width > 8 ||
-          rabitq_prefetch_min_hit_ratio < 0.0 || rabitq_prefetch_min_hit_ratio > 1.0))) {
-      std::cerr << "[ERROR]: invalid RaBitQ gate configuration" << std::endl;
-      exit_with_help_message(argv);
-    }
-
-    if (insert_execution != "compute" && insert_execution != "storage_owner") {
-      std::cerr << "[ERROR]: --insert-execution must be compute or storage_owner" << std::endl;
-      exit_with_help_message(argv);
-    }
-
-    if (insert_workers > num_threads || query_workers > num_threads) {
-      std::cerr << "[ERROR]: --insert-workers and --query-workers cannot exceed --threads" << std::endl;
-      exit_with_help_message(argv);
-    }
-
-    if (insert_workers > 0 && query_workers > 0 && insert_workers + query_workers != num_threads) {
-      std::cerr << "[ERROR]: --insert-workers + --query-workers must equal --threads when both are set" << std::endl;
-      exit_with_help_message(argv);
-    }
-
-    if (insert_coroutines > num_coroutines || query_coroutines > num_coroutines) {
-      std::cerr << "[ERROR]: --insert-coroutines and --query-coroutines cannot exceed --coroutines" << std::endl;
-      exit_with_help_message(argv);
-    }
-
-    if (insert_execution == "storage_owner") {
-      if (routing) {
-        std::cerr << "[ERROR]: storage-side insert execution is not compatible with --routing in the current implementation"
-                  << std::endl;
-        exit_with_help_message(argv);
-      }
-      if (storage_owner_batch_max == 0) {
-        std::cerr << "[ERROR]: --storage-owner-batch-max must be > 0" << std::endl;
-        exit_with_help_message(argv);
-      }
-      if (storage_owner_peer_rdma_tokens == 0) {
-        std::cerr << "[ERROR]: --storage-owner-peer-rdma-tokens must be > 0" << std::endl;
-        exit_with_help_message(argv);
-      }
-      if (storage_owner_rpc_depth == 0) {
-        std::cerr << "[ERROR]: --storage-owner-rpc-depth must be > 0" << std::endl;
-        exit_with_help_message(argv);
-      }
-      if (storage_owner_rpc_timeout_ms == 0) {
-        std::cerr << "[ERROR]: --storage-owner-rpc-timeout-ms must be > 0" << std::endl;
-        exit_with_help_message(argv);
-      }
-      if (storage_owner_search_snapshot_batch == 0) {
-        std::cerr << "[ERROR]: --storage-owner-search-snapshot-batch must be > 0" << std::endl;
-        exit_with_help_message(argv);
-      }
-      if (storage_owner_update_mode != "exact" && storage_owner_update_mode != "anchored") {
-        std::cerr << "[ERROR]: --storage-owner-update-mode must be exact or anchored" << std::endl;
-        exit_with_help_message(argv);
-      }
-      if (storage_owner_update_mode == "anchored" &&
-          (ip_distance || storage_owner_anchor_hints == 0 ||
-           storage_owner_anchor_beam_width == 0 || storage_owner_anchor_expand_cap == 0 ||
-           storage_owner_anchor_min_overlap < 0.0 || storage_owner_anchor_min_overlap > 1.0 ||
-           storage_owner_anchor_rehome_upsert)) {
-        std::cerr << "[ERROR]: invalid anchored storage-owner configuration; L2 is required and "
-                     "upsert rehome is not enabled in this protocol version" << std::endl;
-        exit_with_help_message(argv);
-      }
-      if (storage_owner_reverse_mode != "async" && storage_owner_reverse_mode != "sync") {
-        std::cerr << "[ERROR]: --storage-owner-reverse-mode must be async or sync" << std::endl;
-        exit_with_help_message(argv);
-      }
-      if (storage_owner_reverse_queue_depth == 0) {
-        std::cerr << "[ERROR]: --storage-owner-reverse-queue-depth must be > 0" << std::endl;
-        exit_with_help_message(argv);
-      }
-      if (storage_owner_reverse_coalesce_max == 0) {
-        std::cerr << "[ERROR]: --storage-owner-reverse-coalesce-max must be > 0" << std::endl;
-        exit_with_help_message(argv);
-      }
-      if (storage_peers.size() != num_server_nodes()) {
-        std::cerr << "[ERROR]: --storage-peers must list exactly one endpoint per storage node when "
-                     "--insert-execution=storage_owner"
-                  << std::endl;
-        exit_with_help_message(argv);
-      }
-    }
-  }
-
-public:
   VectorDType resolved_vector_dtype() const {
-    if (vector_data_type == "auto") {
-      return VectorDType::float32;
-    }
-    return parse_vector_dtype(vector_data_type);
+    return vector_data_type == "auto"
+      ? VectorDType::float32 : parse_vector_dtype(vector_data_type);
+  }
+
+  u32 resolved_storage_owner_construction_width() const {
+    return beam_width_construction;
   }
 
 private:
@@ -462,125 +136,351 @@ private:
     return value;
   }
 
+  void add_options() {
+    desc.add_options()
+      ("index-prefix", po::value<filepath_t>(&index_prefix),
+       "Prefix shared by metadata, graph shards, PQ model, and PQ code shards.")
+      ("server-index-file", po::value<filepath_t>(&server_index_file),
+       "Local graph shard loaded by this storage node before serving requests.")
+      ("threads,t", po::value<u32>(&num_threads),
+       "CPU control/update threads represented by this process.")
+      ("disable-thread-pinning,p",
+       po::bool_switch(&disable_thread_pinning)->default_value(false),
+       "Disable CPU thread pinning.")
+      ("seed", po::value<i32>(&seed)->default_value(seed),
+       "Deterministic random seed.")
+      ("dim", po::value<u32>(&dim), "Vector dimension.")
+      ("max-vectors", po::value<u32>(&max_vectors)->default_value(max_vectors),
+       "Number of immutable base vectors in the loaded index.")
+      ("vector-id-namespace-size",
+       po::value<u32>(&vector_id_namespace_size)
+         ->default_value(vector_id_namespace_size),
+       "Exclusive upper bound for base and dynamically assigned vector IDs.")
+      ("k", po::value<u32>(&k), "Requested nearest-neighbor count.")
+      ("R", po::value<u32>(&R)->default_value(R), "Maximum graph out-degree.")
+      ("beam-width-construction",
+       po::value<u32>(&beam_width_construction)->default_value(beam_width_construction),
+       "Beam width used by storage-side online graph maintenance.")
+      ("alpha", po::value<f64>(&alpha)->default_value(alpha),
+       "RobustPrune diversity factor.")
+      ("vector-data-type",
+       po::value<str>(&vector_data_type)->default_value(vector_data_type),
+       "Exact-vector storage type: auto, float32, uint8, or int8.")
+
+      ("gpu-device", po::value<u32>(&gpu_device)->default_value(gpu_device),
+       "CUDA device used by the persistent query engine.")
+      ("enable-breakdown",
+       po::value<bool>(&enable_breakdown)->default_value(enable_breakdown),
+       "Collect per-request breakdown samples.")
+      ("gpu-query-slots",
+       po::value<u32>(&gpu_query_slots)->default_value(gpu_query_slots),
+       "Maximum concurrent GPU query slots.")
+      ("gpu-memory-limit-gb",
+       po::value<u32>(&gpu_memory_limit_gb)->default_value(gpu_memory_limit_gb),
+       "Hard limit for explicit query-engine GPU allocations.")
+      ("gpu-memory-reserve-gb",
+       po::value<u32>(&gpu_memory_reserve_gb)->default_value(gpu_memory_reserve_gb),
+       "GPU memory reserved for CUDA and transport runtime state.")
+      ("gpu-bootstrap-window-mb",
+       po::value<u32>(&gpu_bootstrap_window_mb)->default_value(gpu_bootstrap_window_mb),
+       "Maximum one-time PQ bootstrap RDMA read size.")
+      ("gpu-bootstrap-windows",
+       po::value<u32>(&gpu_bootstrap_windows)->default_value(gpu_bootstrap_windows),
+       "Concurrent one-time PQ bootstrap reads.")
+      ("gpu-graph-prefetch-depth",
+       po::value<u32>(&gpu_graph_prefetch_depth)->default_value(gpu_graph_prefetch_depth),
+       "Graph records fetched concurrently by one GPU query.")
+      ("gpu-query-graph-read-policy",
+       po::value<str>(&gpu_query_graph_read_policy)
+         ->default_value(gpu_query_graph_read_policy),
+       "GPU graph-record transfer policy: fixed or live-extent.")
+      ("gpu-query-expansion-policy",
+       po::value<str>(&gpu_query_expansion_policy)
+         ->default_value(gpu_query_expansion_policy),
+       "GPU graph expansion policy: fixed or feedback-horizon-hunger "
+       "(feedback-hunger is kept as a compatibility alias).")
+      ("gpu-query-beam-merge-policy",
+       po::value<str>(&gpu_query_beam_merge_policy)
+         ->default_value(gpu_query_beam_merge_policy),
+       "GPU query Beam merge policy: legacy or stable-run.")
+      ("query-rdma-trace-mode",
+       po::value<str>(&query_rdma_trace_mode)->default_value(query_rdma_trace_mode),
+       "Shard-batch RDMA trace mode: off, sampled, or full.")
+      ("query-rdma-trace-sample-rate",
+       po::value<u32>(&query_rdma_trace_sample_rate)
+         ->default_value(query_rdma_trace_sample_rate),
+       "In sampled mode, trace one of every N request IDs.")
+      ("query-rdma-trace-output",
+       po::value<filepath_t>(&query_rdma_trace_output)
+         ->default_value(query_rdma_trace_output),
+       "JSONL output for detailed shard-batch RDMA trace events.")
+      ("query-rdma-trace-events-per-query",
+       po::value<u32>(&query_rdma_trace_events_per_query)
+         ->default_value(query_rdma_trace_events_per_query),
+       "Preallocated per-query-slot trace event capacity.")
+      ("gpu-traversal-beam-width",
+       po::value<u32>(&gpu_traversal_beam_width)->default_value(gpu_traversal_beam_width),
+       "OPQ/PQ beam width for GPU graph navigation.")
+      ("gpu-final-rerank-width",
+       po::value<u32>(&gpu_final_rerank_width)->default_value(gpu_final_rerank_width),
+       "Exact vectors fetched for final reranking.")
+      ("gpu-max-expansions",
+       po::value<u32>(&gpu_max_expansions)->default_value(gpu_max_expansions),
+       "Maximum graph expansions per query.")
+      ("gpu-rdma-qps",
+       po::value<u32>(&gpu_rdma_qps)->default_value(gpu_rdma_qps),
+       "GPU-initiated GPUNetIO QPs per storage node.")
+      ("gpu-direct-timeout-ms",
+       po::value<u32>(&gpu_direct_timeout_ms)->default_value(gpu_direct_timeout_ms),
+       "Maximum wait for one GPU-initiated RDMA completion before fail-stop.")
+      ("gpu-persistent-blocks-per-sm",
+       po::value<u32>(&gpu_persistent_blocks_per_sm)->default_value(gpu_persistent_blocks_per_sm),
+       "Maximum unified persistent CTAs per GPU SM; hardware occupancy may be lower.")
+      ("enable-updates",
+       po::value<bool>(&enable_updates)->default_value(enable_updates),
+       "Enable compute-side insert, upsert, and erase submission.")
+      ("gpu-dynamic-code-cache-entries",
+       po::value<u32>(&gpu_dynamic_code_cache_entries)
+         ->default_value(gpu_dynamic_code_cache_entries),
+       "Deprecated compatibility option; the dynamic-PQ arena is metadata-sized.")
+
+      ("storage-id", po::value<u32>(&storage_id)->default_value(storage_id),
+       "Zero-based storage shard identifier.")
+      ("storage-peers", po::value<vec<str>>(&storage_peers)->multitoken(),
+       "Ordered storage-node endpoints.")
+      ("storage-owner-batch-max",
+       po::value<u32>(&storage_owner_batch_max)->default_value(storage_owner_batch_max),
+       "Maximum mutations in one storage RPC batch.")
+      ("storage-owner-batch-max-wait-us",
+       po::value<u32>(&storage_owner_batch_max_wait_us)
+         ->default_value(storage_owner_batch_max_wait_us),
+       "Maximum foreground wait while an announced initial mutation batch is "
+       "still being published; zero runs that partial batch immediately.")
+      ("storage-owner-stage2-batch-max-wait-us",
+       po::value<u32>(&storage_owner_stage2_batch_max_wait_us)
+         ->default_value(storage_owner_stage2_batch_max_wait_us),
+       "Maximum background Stage2 compaction wait for a partial batch; zero "
+       "runs partial Stage2 batches immediately.")
+      ("storage-owner-peer-rdma-tokens",
+       po::value<u32>(&storage_owner_peer_rdma_tokens)->default_value(storage_owner_peer_rdma_tokens),
+       "Outstanding peer reads allowed per storage data QP.")
+      ("storage-owner-peer-qps-per-peer",
+       po::value<u32>(&storage_owner_peer_qps_per_peer)
+         ->default_value(storage_owner_peer_qps_per_peer),
+       "Storage-to-storage RC QPs per peer, including one ordered control QP.")
+      ("storage-owner-rpc-depth",
+       po::value<u32>(&storage_owner_rpc_depth)->default_value(storage_owner_rpc_depth),
+       "In-flight mutation batches per storage node.")
+      ("storage-owner-rpc-timeout-ms",
+       po::value<u32>(&storage_owner_rpc_timeout_ms)->default_value(storage_owner_rpc_timeout_ms),
+       "Mutation RPC timeout.")
+      ("storage-owner-search-snapshot-batch",
+       po::value<u32>(&storage_owner_search_snapshot_batch)
+         ->default_value(storage_owner_search_snapshot_batch),
+       "Concurrent node snapshots during update search.")
+      ("storage-owner-maintenance-workers",
+       po::value<u32>(&storage_owner_maintenance_workers)
+         ->default_value(storage_owner_maintenance_workers),
+       "Background exact-finalization workers.")
+      ("storage-owner-maintenance-queue-depth",
+       po::value<u32>(&storage_owner_maintenance_queue_depth)
+         ->default_value(storage_owner_maintenance_queue_depth),
+       "Bounded graph-maintenance backlog; writers backpressure at the limit.")
+      ("storage-owner-reverse-queue-depth",
+       po::value<u32>(&storage_owner_reverse_queue_depth)
+         ->default_value(storage_owner_reverse_queue_depth),
+       "Maximum queued reverse updates.")
+      ("storage-owner-reverse-coalesce-max",
+       po::value<u32>(&storage_owner_reverse_coalesce_max)
+         ->default_value(storage_owner_reverse_coalesce_max),
+       "Maximum reverse updates per coalesced batch.")
+      ("mn-memory", po::value<u32>(&mn_memory_gb)->default_value(mn_memory_gb),
+       "Storage-node registered-memory capacity in GiB.");
+  }
+
+  void validate(char** argv) const {
+    const auto fail = [&](const str& message) {
+      std::cerr << "[ERROR]: " << message << std::endl;
+      exit_with_help_message(argv);
+    };
+
+    if (index_prefix.empty()) fail("--index-prefix is required");
+    if (num_threads == 0 || dim == 0 || max_vectors == 0 || k == 0 ||
+        R == 0 || beam_width_construction == 0 || mn_memory_gb == 0) {
+      fail("threads, dim, max-vectors, k, R, beam-width-construction, and mn-memory must be > 0");
+    }
+    if (vector_id_namespace_size < max_vectors) {
+      fail("--vector-id-namespace-size must be >= --max-vectors");
+    }
+    if (R > kMaxSupportedGraphDegree) {
+      fail("--R must be <= " + std::to_string(kMaxSupportedGraphDegree));
+    }
+    if (k > gpu_final_rerank_width) {
+      fail("--k must not exceed --gpu-final-rerank-width");
+    }
+    try {
+      if (vector_data_type != "auto") (void)parse_vector_dtype(vector_data_type);
+    } catch (const std::exception& error) {
+      fail(str{"invalid --vector-data-type: "} + error.what());
+    }
+
+    if (query_rdma_trace_mode != "off" &&
+        query_rdma_trace_mode != "sampled" &&
+        query_rdma_trace_mode != "full") {
+      fail("--query-rdma-trace-mode must be off, sampled, or full");
+    }
+    if (query_rdma_trace_sample_rate == 0 ||
+        query_rdma_trace_events_per_query == 0 ||
+        query_rdma_trace_events_per_query > 65'536) {
+      fail("invalid query RDMA trace sampling rate or event capacity");
+    }
+    if (query_rdma_trace_mode != "off" && query_rdma_trace_output.empty()) {
+      fail("--query-rdma-trace-output is required when tracing is enabled");
+    }
+    if (gpu_query_graph_read_policy != "fixed" &&
+        gpu_query_graph_read_policy != "live-extent") {
+      fail("--gpu-query-graph-read-policy must be fixed or live-extent");
+    }
+    if (gpu_query_expansion_policy != "fixed" &&
+        gpu_query_expansion_policy != "feedback-hunger" &&
+        gpu_query_expansion_policy != "feedback-horizon-hunger") {
+      fail("--gpu-query-expansion-policy must be fixed, feedback-hunger, "
+           "or feedback-horizon-hunger");
+    }
+    if (gpu_query_beam_merge_policy != "legacy" &&
+        gpu_query_beam_merge_policy != "stable-run") {
+      fail("--gpu-query-beam-merge-policy must be legacy or stable-run");
+    }
+    if (gpu_query_slots == 0 || gpu_query_slots > 4096 ||
+        gpu_memory_limit_gb == 0 ||
+        gpu_memory_reserve_gb >= gpu_memory_limit_gb ||
+        gpu_bootstrap_window_mb == 0 || gpu_bootstrap_windows == 0 ||
+        gpu_bootstrap_windows > 16 ||
+        gpu_graph_prefetch_depth == 0 ||
+        gpu_graph_prefetch_depth > 32 ||
+        gpu_traversal_beam_width < k || gpu_traversal_beam_width > 256 ||
+        gpu_final_rerank_width < k || gpu_final_rerank_width > 256 ||
+        gpu_max_expansions < gpu_traversal_beam_width ||
+        gpu_max_expansions > 4096 ||
+        gpu_rdma_qps == 0 || gpu_rdma_qps > 32 ||
+        gpu_direct_timeout_ms < 20 || gpu_direct_timeout_ms > 5'000 ||
+        gpu_persistent_blocks_per_sm == 0 ||
+        gpu_persistent_blocks_per_sm > 16) {
+      fail("invalid persistent GPU query configuration");
+    }
+
+    if (storage_peers.size() != num_server_nodes()) {
+      fail("--storage-peers must list exactly one endpoint per storage node");
+    }
+    if (storage_id >= num_server_nodes() ||
+        storage_owner_batch_max == 0 ||
+        storage_owner_peer_qps_per_peer == 0 ||
+        storage_owner_peer_qps_per_peer > kMaxPeerQps ||
+        storage_owner_peer_rdma_tokens == 0 ||
+        storage_owner_rpc_depth == 0 ||
+        storage_owner_rpc_timeout_ms == 0 ||
+        storage_owner_search_snapshot_batch == 0 ||
+        storage_owner_maintenance_workers == 0 ||
+        storage_owner_maintenance_queue_depth == 0 ||
+        storage_owner_reverse_queue_depth == 0 ||
+        storage_owner_reverse_coalesce_max == 0) {
+      fail("invalid storage-side update configuration");
+    }
+    if (storage_owner_batch_max > std::numeric_limits<u32>::max() / R) {
+      fail("storage-owner batch invalidation capacity exceeds u32");
+    }
+    if (static_cast<u64>(storage_owner_maintenance_queue_depth) <
+        static_cast<u64>(storage_owner_batch_max) * 2) {
+      fail("stage2 maintenance queue depth must cover two intents per RPC batch");
+    }
+    if (is_server && server_index_file.empty()) {
+      fail("storage node requires --server-index-file");
+    }
+  }
+
 public:
-  filepath_t resolved_index_prefix() const {
-    return index_path::resolve_prefix(data_path, index_prefix, R, beam_width_construction);
-  }
-
-  bool use_storage_owner_insert() const { return insert_execution == "storage_owner"; }
-  u32 effective_rdma_qp_pool_size() const {
-    if (rdma_qp_pool_size != 0) return rdma_qp_pool_size;
-    return rdma_read_batch_mode == "legacy" ? 1 : MAX_QPS;
-  }
-
-  friend std::ostream& operator<<(std::ostream& os, const IndexConfiguration& config) {
-    os << static_cast<const Configuration&>(config);
+  friend std::ostream& operator<<(
+      std::ostream& output, const IndexConfiguration& config) {
+    output << static_cast<const Configuration&>(config);
+    constexpr i32 width = 34;
+    constexpr i32 line_width = 68;
+    output << std::left << std::setfill(' ');
 
     if (config.is_initiator) {
-      constexpr i32 width = 30;
-      constexpr i32 max_width = width * 2;
-
-      os << std::left << std::setfill(' ');
-      os << std::setw(width) << "data path: " << config.data_path << std::endl;
-      if (!config.index_prefix.empty()) {
-        os << std::setw(width) << "index prefix: " << config.index_prefix << std::endl;
-      }
-      os << std::setw(width) << "query suffix: " << config.query_suffix << std::endl;
-      os << std::setw(width) << "number of threads: " << config.num_threads << std::endl;
-      os << std::setw(width) << "number of coroutines: " << config.num_coroutines << std::endl;
-      os << std::setw(width) << "threads pinned: " << (config.disable_thread_pinning ? "false" : "true") << std::endl;
-      os << std::setw(width) << "seed: " << config.seed << std::endl;
-      os << std::setw(width) << "dimension: " << config.dim << std::endl;
-      os << std::setw(width) << "max vectors: " << config.max_vectors << std::endl;
-      os << std::setw(width) << "CN memory (GB): " << config.cn_memory_gb << std::endl;
-      os << std::setfill('-') << std::setw(max_width) << "" << std::endl;
-      os << std::left << std::setfill(' ');
-      os << std::setw(width) << "K: " << config.k << std::endl;
-      os << std::setw(width) << "R (max degree): " << config.R << std::endl;
-      os << std::setw(width) << "beam width (search): " << config.beam_width << std::endl;
-      os << std::setw(width) << "beam width (construction): " << config.beam_width_construction << std::endl;
-      os << std::setw(width) << "alpha: " << config.alpha << std::endl;
-      os << std::setw(width) << "vector data type: " << config.vector_data_type << std::endl;
-      os << std::setw(width) << "insert execution: " << config.insert_execution << std::endl;
-      if (!config.storage_peers.empty()) {
-        os << std::setw(width) << "storage id: " << config.storage_id << std::endl;
-        os << std::setw(width) << "storage batch max: " << config.storage_owner_batch_max << std::endl;
-        os << std::setw(width) << "storage batch wait(us): " << config.storage_owner_batch_wait_us << std::endl;
-        os << std::setw(width) << "storage peer RDMA tokens: " << config.storage_owner_peer_rdma_tokens << std::endl;
-        os << std::setw(width) << "storage RPC depth: " << config.storage_owner_rpc_depth << std::endl;
-        os << std::setw(width) << "storage RPC timeout(ms): " << config.storage_owner_rpc_timeout_ms << std::endl;
-        os << std::setw(width) << "storage construction beam: "
-           << config.storage_owner_construction_beam_width << std::endl;
-        os << std::setw(width) << "storage snapshot batch: "
-           << config.storage_owner_search_snapshot_batch << std::endl;
-        os << std::setw(width) << "storage prune max candidates: "
-           << config.storage_owner_prune_max_candidates << std::endl;
-        os << std::setw(width) << "storage update mode: " << config.storage_owner_update_mode << std::endl;
-        if (config.storage_owner_update_mode == "anchored") {
-          os << std::setw(width) << "anchor hints: " << config.storage_owner_anchor_hints << std::endl;
-          os << std::setw(width) << "anchor beam width: " << config.storage_owner_anchor_beam_width << std::endl;
-          os << std::setw(width) << "anchor expand cap: " << config.storage_owner_anchor_expand_cap << std::endl;
-          os << std::setw(width) << "anchor remote cap: "
-             << config.storage_owner_anchor_remote_rescue_cap << std::endl;
-          os << std::setw(width) << "anchor audit rate: " << config.storage_owner_anchor_audit_rate << std::endl;
-        }
-        os << std::setw(width) << "storage reverse mode: " << config.storage_owner_reverse_mode << std::endl;
-        os << std::setw(width) << "storage reverse queue depth: "
-           << config.storage_owner_reverse_queue_depth << std::endl;
-        os << std::setw(width) << "storage reverse flush(us): "
-           << config.storage_owner_reverse_flush_us << std::endl;
-        os << std::setw(width) << "storage reverse coalesce max: "
-           << config.storage_owner_reverse_coalesce_max << std::endl;
-        os << std::setw(width) << "storage peers: " << "[";
-        for (const str& node : config.storage_peers) {
-          os << node << ", ";
-        }
-        os << "\b\b]" << std::endl;
-      }
-      os << std::setw(width) << "insert workers: " << config.insert_workers << std::endl;
-      os << std::setw(width) << "query workers: " << config.query_workers << std::endl;
-      os << std::setw(width) << "insert coroutines: " << config.insert_coroutines << std::endl;
-      os << std::setw(width) << "query coroutines: " << config.query_coroutines << std::endl;
-      os << std::setw(width) << "GPU device: " << config.gpu_device << std::endl;
-      os << std::setw(width) << "GPUDirect RDMA: " << (config.gpudirect_rdma ? "true" : "false") << std::endl;
-      os << std::setw(width) << "Expansion Batch (K): " << config.expansion_batch << std::endl;
-      os << std::setw(width) << "RDMA QP Pool Size: "
-         << config.effective_rdma_qp_pool_size();
-      if (config.rdma_qp_pool_size == 0) os << " (auto)";
-      os << std::endl;
-      os << std::setw(width) << "RDMA read batch mode: " << config.rdma_read_batch_mode << std::endl;
-      os << std::setw(width) << "RDMA read chain size: " << config.rdma_read_chain_size << std::endl;
-      os << std::setw(width) << "RDMA read max inflight WRs: "
-         << config.rdma_read_max_inflight_wrs << std::endl;
-      os << std::setw(width) << "Query Batch Size: " << config.query_batch_size << std::endl;
-      os << std::setw(width) << "Use RaBitQ: " << (config.use_rabitq ? "true" : "false") << std::endl;
-      os << std::setw(width) << "RaBitQ mode: " << config.rabitq_mode << std::endl;
-      os << std::setw(width) << "RaBitQ gate width: " << config.rabitq_gate_width << std::endl;
-      os << std::setw(width) << "RaBitQ gate max width: " << config.rabitq_gate_max_width << std::endl;
-      os << std::setw(width) << "RaBitQ gate margin: " << config.rabitq_gate_margin << std::endl;
-      os << std::setw(width) << "RaBitQ cache max ratio: " << config.rabitq_cache_max_ratio << std::endl;
-      os << std::setw(width) << "RaBitQ dynamic budget MB: " << config.rabitq_dynamic_budget_mb << std::endl;
-      os << std::setw(width) << "RaBitQ coalesce target: " << config.rabitq_coalesce_target << std::endl;
-      os << std::setw(width) << "RaBitQ coalesce min: " << config.rabitq_coalesce_min << std::endl;
-      os << std::setw(width) << "RaBitQ coalesce wait(us): " << config.rabitq_coalesce_wait_us << std::endl;
-      os << std::setw(width) << "RaBitQ prefetch width: " << config.rabitq_prefetch_width << std::endl;
-      os << std::setw(width) << "RaBitQ prefetch min samples: "
-         << config.rabitq_prefetch_min_samples << std::endl;
-      os << std::setw(width) << "RaBitQ prefetch min hit ratio: "
-         << config.rabitq_prefetch_min_hit_ratio << std::endl;
-      os << std::setw(width) << "RaBitQ warmup exact expansions: "
-         << config.rabitq_warmup_exact_expansions << std::endl;
-      os << std::setw(width) << "RaBitQ audit period: " << config.rabitq_audit_period << std::endl;
-      os << std::setw(width) << "RaBitQ safe epsilon: " << config.rabitq_safe_epsilon << std::endl;
-      os << std::setw(width) << "RaBitQ strict recall: "
-         << (config.rabitq_strict_recall ? "true" : "false") << std::endl;
-      os << std::setfill('=') << std::setw(max_width) << "" << std::endl;
-    } else if (config.is_server && !config.server_index_file.empty()) {
-      os << std::left << std::setfill(' ');
-      os << std::setw(30) << "server index file: " << config.server_index_file << std::endl;
-      os << std::setfill('=') << std::setw(60) << "" << std::endl;
+      output << std::setw(width) << "index prefix: " << config.index_prefix << '\n';
+      output << std::setw(width) << "threads: " << config.num_threads << '\n';
+      output << std::setw(width) << "dimension: " << config.dim << '\n';
+      output << std::setw(width) << "max vectors: " << config.max_vectors << '\n';
+      output << std::setw(width) << "vector ID namespace [0,N): "
+             << config.vector_id_namespace_size << '\n';
+      output << std::setw(width) << "K / R: "
+             << config.k << " / " << config.R << '\n';
+      output << std::setw(width) << "vector data type: "
+             << config.vector_data_type << '\n';
+      output << std::setfill('-') << std::setw(line_width) << "" << '\n';
+      output << std::setfill(' ');
+      output << std::setw(width) << "query engine: "
+             << "persistent_gpu_opq_pq" << '\n';
+      output << std::setw(width) << "remote transport: "
+             << "GPU-initiated GPUNetIO" << '\n';
+      output << std::setw(width) << "GPU device: " << config.gpu_device << '\n';
+      output << std::setw(width) << "GPU concurrent query slots: "
+             << config.gpu_query_slots << '\n';
+      output << std::setw(width) << "GPU memory limit/reserve GiB: "
+             << config.gpu_memory_limit_gb << "/"
+             << config.gpu_memory_reserve_gb << '\n';
+      output << std::setw(width) << "GPU traversal/rerank width: "
+             << config.gpu_traversal_beam_width << "/"
+             << config.gpu_final_rerank_width << '\n';
+      output << std::setw(width) << "GPU max expansions: "
+             << config.gpu_max_expansions << '\n';
+      output << std::setw(width) << "GPU graph read policy: "
+             << config.gpu_query_graph_read_policy << '\n';
+      output << std::setw(width) << "GPU expansion policy: "
+             << config.gpu_query_expansion_policy << '\n';
+      output << std::setw(width) << "GPU Beam merge policy: "
+             << config.gpu_query_beam_merge_policy << '\n';
+      output << std::setw(width) << "query RDMA trace mode/rate: "
+             << config.query_rdma_trace_mode << "/"
+             << config.query_rdma_trace_sample_rate << '\n';
+      output << std::setw(width) << "query RDMA trace output: "
+             << config.query_rdma_trace_output << '\n';
+      output << std::setw(width) << "GPU RDMA QPs per storage node: "
+             << config.gpu_rdma_qps << '\n';
+      output << std::setw(width) << "GPU direct CQ timeout ms: "
+             << config.gpu_direct_timeout_ms << '\n';
+      output << std::setw(width) << "GPU persistent blocks/SM cap: "
+             << config.gpu_persistent_blocks_per_sm << '\n';
+      output << std::setw(width) << "compute updates enabled: "
+             << std::boolalpha << config.enable_updates << '\n';
+      output << std::setw(width) << "storage update protocol: "
+             << "centroid-home two-stage" << '\n';
+      output << std::setw(width) << "storage RPC depth/batch: "
+             << config.storage_owner_rpc_depth << "/"
+             << config.storage_owner_batch_max << '\n';
+      output << std::setw(width) << "storage batch max wait us: "
+             << config.storage_owner_batch_max_wait_us << '\n';
+      output << std::setw(width) << "storage Stage2 batch max wait us: "
+             << config.storage_owner_stage2_batch_max_wait_us << '\n';
+      output << std::setw(width) << "storage peer QPs per peer: "
+             << config.storage_owner_peer_qps_per_peer << '\n';
+      output << std::setw(width) << "storage stage2 maintenance: "
+             << config.storage_owner_maintenance_workers << " workers, backlog "
+             << config.storage_owner_maintenance_queue_depth << '\n';
+      output << std::setfill('=') << std::setw(line_width) << "" << '\n';
+    } else if (config.is_server) {
+      output << std::setw(width) << "index prefix: " << config.index_prefix << '\n';
+      output << std::setw(width) << "storage shard: "
+             << config.server_index_file << '\n';
+      output << std::setw(width) << "storage id: " << config.storage_id << '\n';
+      output << std::setw(width) << "base vectors: " << config.max_vectors << '\n';
+      output << std::setw(width) << "vector ID namespace [0,N): "
+             << config.vector_id_namespace_size << '\n';
+      output << std::setw(width) << "registered memory GiB: "
+             << config.mn_memory_gb << '\n';
+      output << std::setfill('=') << std::setw(line_width) << "" << '\n';
     }
-    return os;
+    return output;
   }
 };
 

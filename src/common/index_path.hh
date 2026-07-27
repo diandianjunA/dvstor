@@ -28,18 +28,41 @@ inline filepath_t shard_file(const filepath_t& prefix, size_t node_ordinal, size
                     ".dat");
 }
 
-inline filepath_t rabitq_cache_file(const filepath_t& prefix, size_t node_ordinal, size_t num_nodes) {
-  return filepath_t(prefix.string() + "_node" + std::to_string(node_ordinal) + "_of" +
-                    std::to_string(num_nodes) + ".rabitq12");
-}
-
 inline filepath_t owner_idmap_file(const filepath_t& prefix, size_t node_ordinal, size_t num_nodes) {
   return filepath_t(prefix.string() + "_node" + std::to_string(node_ordinal) + "_of" +
                     std::to_string(num_nodes) + ".idmap");
 }
 
-inline filepath_t anchor_file(const filepath_t& prefix) {
-  return filepath_t(prefix.string() + ".anchors");
+inline filepath_t centroid_state_file(const filepath_t& prefix,
+                                      size_t node_ordinal,
+                                      size_t num_nodes) {
+  return filepath_t(prefix.string() + "_node" +
+                    std::to_string(node_ordinal) + "_of" +
+                    std::to_string(num_nodes) + ".centroid");
+}
+
+inline filepath_t navigation_model_file(const filepath_t& prefix, u32 subquantizers) {
+  return filepath_t(prefix.string() + ".pq" + std::to_string(subquantizers));
+}
+
+inline filepath_t navigation_code_file(const filepath_t& prefix,
+                                       size_t node_ordinal,
+                                       size_t num_nodes,
+                                       u32 subquantizers) {
+  return filepath_t(prefix.string() + "_node" + std::to_string(node_ordinal) + "_of" +
+                    std::to_string(num_nodes) + ".pq" +
+                    std::to_string(subquantizers) + ".codes");
+}
+
+inline filepath_t navigation_code_for_shard(const filepath_t& shard_file_path,
+                                             u32 subquantizers) {
+  filepath_t result = shard_file_path;
+  result.replace_extension(".pq" + std::to_string(subquantizers) + ".codes");
+  return result;
+}
+
+inline filepath_t graph_extent_file(const filepath_t& prefix) {
+  return filepath_t(prefix.string() + ".gextent8");
 }
 
 }  // namespace index_path

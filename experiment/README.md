@@ -1,90 +1,337 @@
-# Contribution Ablation Experiments
+# SIFT100M Experiment
 
-This directory reorganizes the SIFT100M evaluation into the revised three paper
-contributions. The current split keeps RaBitQ with the GPU query pipeline and
-isolates adaptive RDMA scheduling as the third contribution.
+实验目录只保留 `04_gpu_persistent_gpunetio`：持久化 GPU OPQ/PQ32 图导航、
+GPUNetIO 远端读取和 storage-owner 动态更新。
 
-| Profile | Enabled mechanisms | Purpose |
-| --- | --- | --- |
-| `00_baseline` | storage-owner exact search/update substrate | baseline, no paper contribution |
-| `01_rabitq_gpu_pipeline` | Contribution 1 | RaBitQ-aware GPU query pipeline |
-| `02_rabitq_gpu_pipeline_aldi` | Contribution 1 + 2 | add ALDI and METIS/locality-oriented placement |
-| `03_rabitq_gpu_pipeline_aldi_rdma` | Contribution 1 + 2 + 3 | add adaptive multi-QP RDMA scheduling |
+## 配置
 
-Contribution 1 includes the compute-side RaBitQ proxy gate because the current
-measurements show it behaves as part of the query execution pipeline: it trades
-CPU gate work for fewer full-vector RDMA reads. The default profile uses
-`RABITQ_MODE=cpu_gate`. Use `RABITQ_MODE=exact_safe` only as a conservative
-lower-bound control.
-
-Contribution 3 is the adaptive RDMA scheduler. It should be evaluated after
-Contribution 2 because ALDI + METIS increases edge locality, which can reduce
-the number of active memory nodes per vector batch. The adaptive scheduler then
-recovers parallelism through multiple QPs per hot memory node and chained READ
-WRs.
-
-## Prerequisites
-
-The scripts reuse the SIFT100M harness under `evaluation/sift100m`. The default
-index build already writes RaBitQ and anchor sidecars:
+默认路径定义在 `sift100m_common.sh`，架构参数定义在
+`profiles/04_gpu_persistent_gpunetio.env`。常用覆盖项：
 
 ```bash
-./evaluation/sift100m/build_sift100m_index.sh
+export HOSTS="192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202"
+export INDEX_DIR=/data/xjs/index/dvstor_sift100m/index
+export GPU_DEVICE=1
+export GPU_MEMORY_LIMIT_GB=40
+export GPU_MEMORY_RESERVE_GB=4
 ```
 
-If an older index is missing the ALDI anchor sidecar, generate it once for the
-actual index prefix being tested. Profiles `02_*` and `03_*` use the METIS
-prefix by default:
+`MN_MEMORY_GB` 表示每个存储分片的 RDMA 注册区容量，不是进程总 RSS。未显式
+设置时，启动脚本会在 profile 确定最终 `INDEX_PREFIX` 后估算：已有 schema-16
+metadata 时直接使用每个真实分片的 `dynamic_node_base_offsets`、节点数和动态记录
+步长，并按最坏分片取整；索引尚不存在时才按当前 tagged-v2 fixed/graph/PQ 布局和
+`PARTITION_IMBALANCE` 做保守估算。默认给每个分片预留相当于基图节点数 20% 的
+动态槽，可按 workload 调整：
 
 ```bash
-./build/vamana_anchor_sidecar_builder \
-  --index-prefix /data/xjs/index/dvstor_sift100m/index/sift100m_R48_bw200_metis \
-  --anchors-per-shard 4096
+# 按比例预留峰值同时存活/迁移在途的动态记录
+export MN_DYNAMIC_HEADROOM_PERCENT=20
+
+# 或直接指定每个物理分片的绝对动态槽容量；设置后覆盖百分比策略
+export MN_DYNAMIC_SLOTS_PER_SHARD=4000000
+
+# 完全覆盖自动估算，仍要求整数 GiB 且不超过 tagged pointer 的 256 GiB 上限
+export MN_MEMORY_GB=24
 ```
 
-## Run One Profile
+这里的槽数是峰值同时占用量，不是累计更新次数；已完成清理的删除/迁移源槽可以
+复用。默认注册区下限由 `MN_MEMORY_MIN_GB` 控制，默认 8 GiB。
+
+`MAX_VECTORS` 只表示不可变基图的节点数，并必须与索引 metadata 一致；动态插入
+节点的合法 ID 上界由独立的 `VECTOR_ID_NAMESPACE_SIZE` 控制。默认使用
+`4294967295` 作为排他的上界，允许所有不会让 uint32 ID 生成器回绕的 ID。该配置
+不会分配一个同等大小的稠密表，authority/idmap 状态仍只为实际存在的动态节点
+按需创建。计算节点与所有存储节点必须使用相同的值。
+
+## 构建新索引
+
+存储节点脚本默认使用独立的 `build-storage`，先按根目录 README 配置 CPU-only
+构建，不能与计算节点的 `build` 共用。
+
+该命令先构建 compact Vamana/Metis 分片，再训练 OPQ/PQ32、写码流并生成
+Live-Extent 长度档：
 
 ```bash
-./experiment/start_all_memory_nodes.sh 00_baseline
-./experiment/run_breakdown.sh 00_baseline
+./experiment/build_sift100m_index.sh 04_gpu_persistent_gpunetio
+```
+
+完整构建以 schema-15 tagged graph 为中间态，最终直接生成 schema-16
+OPQ/PQ32 运行索引和 `<prefix>.gextent8`，无需随后重编码。已有完整
+schema-16 分片也可在持有全部 `.dat` 的机器上单独生成：
+
+```bash
+./build/vamana_graph_extent_indexer \
+  --index-prefix "$INDEX_PREFIX"
+```
+
+工具会流式校验所有 graph record，再用同目录临时文件原子发布 sidecar；已有输出
+必须显式传入 `--overwrite`。
+推荐使用 `PQ_INDEX_PREFIX=/new/prefix` 保留已有索引；只有明确要删除目标 prefix
+下旧产物并原地重建时才设置 `OVERWRITE_INDEX=1`。
+
+## 转换旧 compact-v1 索引
+
+完整、未包含在线 mutation 的旧 schema-15 `vamana_compact_v1` 基图可以流式
+转换，不需要重新运行 Vamana 或 METIS，也不需要重新训练 OPQ/PQ。转换保持每个
+物理分片的 slot 顺序，因此保留原始向量字节、图拓扑、METIS placement 和跨分片边；
+它会重写 fixed record、5-byte compact edge、所有 `RemotePtr`，并重新生成 bound
+idmap v2 和物理分片 centroid v2。旧 PQ model 被复用，base PQ codes 从精确向量
+重新编码。
+
+先执行只读的全量校验：
+
+```bash
+./build/vamana_legacy_index_converter \
+  --input-prefix "$OLD_PREFIX" \
+  --output-prefix "$NEW_PREFIX" \
+  --dry-run
+```
+
+校验通过后写到新的 prefix：
+
+```bash
+./build/vamana_legacy_index_converter \
+  --input-prefix "$OLD_PREFIX" \
+  --output-prefix "$NEW_PREFIX" \
+  --chunk-vectors 65536 \
+  --threads 32
+```
+
+转换器禁止原地执行或覆盖已有输出，并在所有分片、idmap 和 centroid 完成后最后
+发布 metadata。输入至少需要 metadata、全部旧 `.dat` 和旧 `.pqM` model；旧
+`.codes`、`.anchors`、原始 dataset 和旧 idmap 都不是恢复静态基图所必需的。
+`--graph-only` 可停在新的 tagged schema-15 中间态。转换器拒绝 deleted、非零
+generation 或含动态 slot 的运行时快照；这类在线状态没有足够的旧持久化语义可安全
+映射到 incarnation/provisional/centroid 新契约，只能从一致的静态快照重新生成。
+
+## 部署文件
+
+计算节点（查询与更新）：
+
+```text
+<prefix>.meta.json
+<prefix>.pq32
+<prefix>.gextent8        # 仅 live-extent 模式需要
+```
+
+纯查询配置使用 `enable-updates = false`，需要 `<prefix>.meta.json` 和
+`<prefix>.pq32`；`gpu-query-graph-read-policy = live-extent` 还要求
+`<prefix>.gextent8`，缺失或与 build fingerprint/布局不匹配时启动直接失败，不会
+静默退化成 fixed。该文件只有 1 byte/base-node 的长度档，不包含邻接表。纯查询不会启动
+更新执行器。在线 mutation 会持续
+更新 storage owner 的 centroid publication；每个计算节点从 storage 拉取同一版本化
+快照，因此其他计算节点写入的新代表节点同样可见。
+
+存储节点 X：
+
+```text
+<prefix>.meta.json
+<prefix>_nodeX_ofN.dat
+<prefix>_nodeX_ofN.idmap
+<prefix>_nodeX_ofN.centroid
+<prefix>_nodeX_ofN.pq32.codes
+```
+
+计算节点不需要 `.dat`、`.idmap`、`.pq32.codes` 或 `.gpu.idx`。Live-Extent
+sidecar 应在持有全部 `.dat` 的构建/存储机器上生成，再复制到计算节点的同一 prefix。
+METIS 只决定物理
+placement；基础和动态 ID 的逻辑 authority 都由 `ID % N` 确定，其存储端 idmap
+负责解析当前物理记录。因而增加计算节点不会复制一份 O(N) 的 ID 目录；每个存储
+节点只加载自己的 `owner_sharded_v2_bound` idmap。该文件与整次构建和 owner
+分片指纹强绑定，并校验完整长度、payload/header checksum、`ID % N`、tagged
+`RemotePtr` 静态范围及重复 ID；旧 v1 会被直接拒绝。
+加载后基础项只保留紧凑的 `ID -> RemotePtr`，完整的代际、提交回执和迁移状态仅为
+实际参与 mutation 的 ID 分配。离线 writer 同样以每 owner 临时流单遍分桶，不在
+内存中复制一份全量 idmap payload。
+旧索引不能通过复制或改名 sidecar 升级：schema-16 运行格式、8-byte tagged
+`RemotePtr`、构建/分片指纹、centroid sidecar v2 和 PQ code header 是同一次构建的
+绑定契约。完整的 compact-v1 静态 `.dat` 可使用上面的转换器重写这些契约；缺失
+`.dat` 或只有 anchor/idmap/PQ model 时信息不足，才必须重新构图。存储节点运行时
+不需要 `.pq32` 模型。
+
+## 启动
+
+图读取策略：
+
+```text
+gpu-query-graph-read-policy = fixed        # 默认，始终读取完整记录
+gpu-query-graph-read-policy = live-extent  # 一次 one-sided READ 读取长度档覆盖的前缀
+```
+
+`live-extent` 不改变图记录、WQE 数、Beam/visited/扩展顺序或存储 CPU 路径。静态
+base node 使用离线长度档；动态 node 始终读取完整记录。并发更新使档位落后、或短读
+重构后的结构/checksum 校验失败时，同一父节点有界重试一次完整记录，并分别计入
+`graph_extent_fallback_reads`、`graph_full_record_reads` 和实际
+`graph_read_bytes`。
+
+在各存储节点准备对应文件后启动服务：
+
+```bash
+./experiment/start_all_memory_nodes.sh 04_gpu_persistent_gpunetio
+```
+
+如果每个分片位于不同主机，可分别执行：
+
+```bash
+./experiment/start_memory_node.sh 1 04_gpu_persistent_gpunetio
+```
+
+启动脚本会验证 schema、分片数、R、dtype、PQ checksum 和角色所需文件，
+不兼容时在申请大块注册内存前退出。
+
+运行格式固定为 schema 16，peer RPC 协议固定为版本 11。所有动态图指针携带
+`{shard, offset, incarnation}`，记录头在读取和修改前都校验 incarnation；删除地址只在
+对应维护序列 durable 后进入复用流程。查询采用 incarnation-tagged read-committed
+语义，不要求动态加入的计算节点参与全局 ACK；incarnation 耗尽的槽位永久退休而不回绕。
+动态目标分配使用无超时驱逐的 receipt：只有源记录进入终态且目标记录的精确身份已
+确认后才结算，避免迟到重试把新对象误认为旧对象。混用旧二进制、旧分片、旧
+centroid 或旧 PQ code 会在启动校验时失败。
+
+Stage2 finalized 的等价边界是同一逻辑快照下延续 Stage1 的宽度 `L`
+beam/visited/frontier，沿图中实际跨分片边完成 one-sided-RDMA 扩展后执行一次相同
+RobustPrune，并等待本次 insert 所选邻居的反向边完成；它不会为每个分片重启独立
+搜索，也不等价于离线 builder 的全候选构图。当前也没有
+完整入边索引，所以 delete/upsert 不能同步清除所有历史未知入边；报告中的 durable
+或 drained 仅表示已声明的 maintenance 任务完成，不应解释为全图整理已经完成。
+
+控制页通过 descriptor 指向独立、可变长度的 centroid route publication；容量由
+维度、标量类型和 live-entry 上限计算，不受 4 KiB 控制页固定槽位约束。旧存储
+二进制没有该运行时扩展，因此新计算节点会在启动校验时拒绝混合部署；必须同步
+升级全部二进制，并使用新 builder 重建或用上述工具完整转换索引。
+
+maintenance observation 同时输出窗口可差分的 locality 计数器：Stage2 continuation
+次数、远端 frontier/展开/评分记录数、迁移数，以及以 Stage1 home 和最终 home 计算的
+跨分片边数。benchmark 只对测量窗口前后的单调累积值做差，报告
+`home_match_rate`、`cross_edge_reduction_ratio` 和每次 continuation 的平均远端工作量；
+这些指标包含窗口内全部请求，不使用请求抽样或数据集专用捷径。
+
+动态节点的 PQ code 和图记录都以存储节点上的权威记录为准，GPU 查询通过
+one-sided RDMA 按需读取，不维护需要广播、同步或回收的计算侧 dynamic-PQ 副本。
+stage2 context 有界回收；存储节点记录同时保持逻辑 generation 与物理 incarnation
+稳定，并在 durable watermark 后以 header-last 方式发布复用后的新 incarnation。
+
+性能阶段结束时，driver 会一次性读取所有分片的
+`next_maintenance_sequence - 1`，固定为全局 maintenance 前缀，再等待每个分片的
+`durable_maintenance_sequence` 追平。这个边界同时覆盖跨分片 upsert 的旧 home
+清理、新 home Stage2 以及迁移产生的远端退休任务；后续才提交的更大序号不会被
+本轮 drain 无限等待。该控制读只发生在显式阶段边界，不进入逐更新热路径。
+
+## 召回率与性能
+
+测试负载参数不放在索引/系统 profile 中。`BENCHMARK_CLIENT_THREADS`、
+`WORKLOAD`、`READ_RATIO`、`WARMUP_SECONDS`、`MEASURE_SECONDS` 和
+`RECALL_QUERIES` 由运行脚本读取。`SERVICE_THREADS` 是计算服务 CPU 线程数，
+不等于 benchmark 客户端并发数。
+
+`BENCHMARK_CLIENT_THREADS` 默认为 `auto`。由于当前 load driver 每个线程同步
+提交一个请求，一个线程最多贡献一个在途操作；`auto` 因此只使用系统的
+显式有界容量推导闭环并发，不根据已测 QPS 调参：
+
+- query 使用 `GPU_QUERY_SLOTS`；insert 使用
+  `SHARDS * STORAGE_OWNER_RPC_DEPTH`；`both` 的两个阶段顺序执行，取两者最大值。
+- `mixed/fixed_threads` 保证按 `READ_RATIO` 分配后，活跃路径至少有对应的
+  容量数在途 caller。例如 256 个 GPU 查询槽、50/50 混合负载会推导为
+  512 线程，即 256 读 + 256 写。`READ_RATIO` 在该模式表示 caller 比例，
+  不保证不同延迟的读写最终完成量也恰好按此比例。
+- `mixed/probability` 使每个闭环 caller 在上一操作完成后按 `READ_RATIO`
+  选择下一操作，适合固定长时操作混合；它不保留专用读/写 caller。
+- `mixed/rate_limited` 对激活的读、写路径容量求和；调度数、完成数和
+  drain 均如实报告，不会把超载时未发出/未完成的计划请求算作完成来伪造达标。
+
+`BENCHMARK_CLIENT_THREAD_CAP` 默认为 1024，只限制 `auto` 意外创建过多
+OS 线程；如果截断了推导值，脚本会明确告警而不声称路径已饱和。
+显式设置正整数 `BENCHMARK_CLIENT_THREADS` 可用于 1/2/4/... 延迟—吞吐扫描。
+脚本会在终端输出完整推导，并在 JSON 的
+`meta.benchmark_driver_concurrency` 中保留容量、来源、cap 和计算式。
+`auto` 是一个与数据集无关的容量起点，不是“已饱和”的自动结论。论文实验应显式
+公布对应 `auto/4`、`auto/2`、`auto`、`2*auto` 整数并发的完整延迟—吞吐曲线，并且只有在
+零错误、召回不变且 durable backlog 有界时，平台点才能称为饱和吞吐。
+
+`query.u8bin` 的 10K 标准查询仅供 recall 使用。性能阶段由
+`PERFORMANCE_QUERY_FILE` 提供独立查询流，warmup 与 measure 共用一个单遍游标，
+同一行不会再次执行；查询池耗尽时 benchmark 会失败而不是取模回绕。当前默认
+性能查询池为 `[100M,110M)` 的 1000 万行，默认插入池为与之相邻且不重叠的
+`[110M,120M)` 1000 万行。文件默认位于
+`/data/xjs/datasets/sift1b`：
+
+```text
+sift100m_to_110m_query.u8bin
+sift110m_to_120m_insert.u8bin
+```
+
+脚本会显示在 warmup + measure 全时段内不重用行所能支持的最大平均 query
+QPS。例如 1000 万行与 30 + 120 秒只能为 query 部分提供平均
+66,666.7 QPS；要完整测量 query-only 100K QPS，至少需要 1500 万不重复行，
+或将两个时段总时长降到 100 秒以内。增加并发不会绕过这个数据诚信上限；
+查询池耗尽仍会使 benchmark 失败。
+
+`run_breakdown.sh` 默认只校验并读取预生成文件，不会在计算节点寻找
+`bigann_base.bvecs`。只有显式设置 `PREPARE_BENCHMARK_DATA=1` 时才会调用数据准备。
+可通过
+`PERFORMANCE_QUERY_FILE`、`INSERT_FILE` 覆盖路径，或用以下变量
+调整源区间：`PERFORMANCE_QUERY_START`、`PERFORMANCE_QUERY_END`、
+`INSERT_VECTOR_START`、`INSERT_VECTOR_END`。常用选项可直接查看
+`./experiment/run_breakdown.sh --help`。例如：
+
+```bash
+PERFORMANCE_QUERY_FILE=/data/xjs/datasets/sift/perf_queries_2m.u8bin \
+INSERT_FILE=/data/xjs/datasets/sift/inserts_2m.u8bin \
+./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
+```
+
+先做 query-only 召回验证：
+
+```bash
+RECALL_QUERIES=1000 \
+./experiment/run_recall.sh 04_gpu_persistent_gpunetio
+```
+
+该脚本使用 `--recall-only`，不会执行 warmup/measure，也不会加载性能查询池。
+
+再运行读写混合负载：
+
+```bash
+WORKLOAD=mixed READ_RATIO=0.5 \
+WARMUP_SECONDS=30 MEASURE_SECONDS=120 \
+./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
+```
+
+这是饱和闭环吞吐测试，不是单客户端延迟测试。与单机 HNSW 比较时必须同时
+固定数据集、召回率/搜索参数、更新语义和负载比例，并让两个系统都有
+足够客户端达到各自饱和点。单纯 query-only HNSW 的 QPS 不能直接与包含权威
+Stage2 drain 的混合读写 QPS 解释为同一指标。
+
+如需比较不同运行，保持相同的索引、查询/插入文件和 GPU 参数即可。
+报告只提供吞吐、延迟、召回、GPU 内存与 stage2 遥测；不包含自动验收结论。
+
+短跑示例：
+
+```bash
+WORKLOAD=query RECALL_QUERIES=100 \
+WARMUP_SECONDS=1 MEASURE_SECONDS=5 \
+./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
+```
+
+结果写入 `experiment/reports/04_gpu_persistent_gpunetio/`。报告保留下列原始指标，
+由实验者结合目标负载自行分析：
+
+- `gpu_persistent.direct_path_failures == 0`；
+- 前后 recall 及其变化；
+- 没有 unhealthy/fail-stop 日志；
+- GPU 和 RDMA 指标显示多查询并发，而非单查询串行等待。
+
+可与 OdinANN 或历史 JSON 比较：
+
+```bash
+python3 experiment/compare_reports.py \
+  --baseline /path/to/odinann.json \
+  --candidate experiment/reports/04_gpu_persistent_gpunetio/latest.json
+```
+
+比较工具只输出原始吞吐、延迟、加速比和 recall 差值，不给出自动通过/失败结论。
+
+停止本机启动的存储进程：
+
+```bash
 ./experiment/stop_memory_nodes.sh
 ```
-
-The same pattern works for the other profiles.
-
-## Run The Full Ablation
-
-```bash
-./experiment/run_ablation.sh
-```
-
-Reports are written to `experiment/reports/<profile>/`. The generated
-`service_*.ini` file in each report directory is the exact runtime config used
-for the run.
-
-## Short Query-Only Runs
-
-To isolate Contribution 1 and Contribution 3 on query performance:
-
-```bash
-WORKLOAD=query WARMUP_SECONDS=10 MEASURE_SECONDS=60 ./experiment/run_breakdown.sh 01_rabitq_gpu_pipeline
-WORKLOAD=query WARMUP_SECONDS=10 MEASURE_SECONDS=60 ./experiment/run_breakdown.sh 02_rabitq_gpu_pipeline_aldi
-WORKLOAD=query WARMUP_SECONDS=10 MEASURE_SECONDS=60 ./experiment/run_breakdown.sh 03_rabitq_gpu_pipeline_aldi_rdma
-```
-
-To compare the conservative RaBitQ gate against the performance gate:
-
-```bash
-RABITQ_MODE=exact_safe WORKLOAD=query ./experiment/run_breakdown.sh 01_rabitq_gpu_pipeline
-RABITQ_MODE=cpu_gate WORKLOAD=query ./experiment/run_breakdown.sh 01_rabitq_gpu_pipeline
-```
-
-## Summarize Latest Reports
-
-```bash
-./experiment/summarize_reports.py
-```
-
-The summary prints query/write throughput, recall, p50 latencies, vector RDMA
-traffic, RaBitQ drop ratio, RDMA active-node/QP indicators, and ALDI audit
-failure rate.

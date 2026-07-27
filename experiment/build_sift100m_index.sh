@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/common.sh"
+
+PROFILE="${1:-${PROFILE:-04_gpu_persistent_gpunetio}}"
+load_experiment_profile "$PROFILE"
+
+# Offline OPQ/PQ construction settings. They are deliberately kept here rather
+# than in the online GPUNetIO profile: changing any of them requires rebuilding
+# the final schema-16 index and has no effect on an already-built index at runtime.
+PQ_TRAIN_SAMPLES="${PQ_TRAIN_SAMPLES:-262144}"
+PQ_OPQ_ITERATIONS="${PQ_OPQ_ITERATIONS:-20}"
+PQ_ITERATIONS="${PQ_ITERATIONS:-25}"
+PQ_ENCODE_CHUNK_VECTORS="${PQ_ENCODE_CHUNK_VECTORS:-32768}"
+PQ_THREADS="${PQ_THREADS:-32}"
+
+ensure_built vamana_offline_builder vamana_pq_indexer \
+  vamana_graph_extent_indexer
+PREPARE_BENCHMARK_DATA=0 "$EXPERIMENT_DIR/prepare_sift100m_data.sh"
+
+mkdir -p "$(dirname "$INDEX_PREFIX")"
+LOG_FILE="${BUILD_LOG:-$LOG_DIR/build_${PARTITION_STRATEGY}_$(date +%Y%m%d_%H%M%S).log}"
+
+artifacts=(
+  "${INDEX_PREFIX}.meta.json"
+  "${INDEX_PREFIX}.pq${PQ_SUBQUANTIZERS}"
+  "${INDEX_PREFIX}.gextent8"
+)
+for ((node = 1; node <= SHARDS; ++node)); do
+  artifacts+=(
+    "${INDEX_PREFIX}_node${node}_of${SHARDS}.dat"
+    "${INDEX_PREFIX}_node${node}_of${SHARDS}.idmap"
+    "${INDEX_PREFIX}_node${node}_of${SHARDS}.centroid"
+    "${INDEX_PREFIX}_node${node}_of${SHARDS}.pq${PQ_SUBQUANTIZERS}.codes"
+  )
+done
+existing=()
+for artifact in "${artifacts[@]}"; do
+  if [[ -e "$artifact" || -L "$artifact" ]]; then existing+=("$artifact"); fi
+done
+if ((${#existing[@]} != 0)); then
+  if [[ "${OVERWRITE_INDEX:-0}" != "1" ]]; then
+    echo "index output already exists; choose a new PQ_INDEX_PREFIX or set OVERWRITE_INDEX=1:" >&2
+    printf '  %s\n' "${existing[@]}" >&2
+    exit 1
+  fi
+  echo "[build] removing ${#existing[@]} old target artifacts before rebuild"
+  rm -f -- "${existing[@]}"
+fi
+
+builder=("$BUILD_DIR/vamana_offline_builder"
+  --data-path "$(base_bin)"
+  --output-prefix "$INDEX_PREFIX"
+  --memory-nodes "$SHARDS"
+  --partition-strategy "$PARTITION_STRATEGY"
+  --R "$R"
+  --beam-width "$BUILD_BEAM"
+  --alpha "$ALPHA"
+  --threads "$BUILD_THREADS"
+  --max-vectors "$MAX_VECTORS"
+  --vector-data-type "$VECTOR_DATA_TYPE"
+  --partition-max-degree "${PARTITION_MAX_DEGREE:-32}"
+  --partition-imbalance "$PARTITION_IMBALANCE"
+  --skip-sanity-check)
+
+pq=("$BUILD_DIR/vamana_pq_indexer"
+  --index-prefix "$INDEX_PREFIX"
+  --subquantizers "${PQ_SUBQUANTIZERS:-32}"
+  --train-samples "$PQ_TRAIN_SAMPLES"
+  --opq-iterations "$PQ_OPQ_ITERATIONS"
+  --pq-iterations "$PQ_ITERATIONS"
+  --chunk-vectors "$PQ_ENCODE_CHUNK_VECTORS"
+  --threads "$PQ_THREADS"
+  --seed "${SEED:-1234}")
+if [[ -n "${PQ_REUSE_MODEL:-}" ]]; then pq+=(--reuse-model "$PQ_REUSE_MODEL"); fi
+if [[ "${OVERWRITE_INDEX:-0}" == "1" ]]; then pq+=(--overwrite); fi
+extent=("$BUILD_DIR/vamana_graph_extent_indexer"
+  --index-prefix "$INDEX_PREFIX")
+if [[ "${OVERWRITE_INDEX:-0}" == "1" ]]; then extent+=(--overwrite); fi
+
+{
+  echo "[build] schema-15 tagged graph intermediate: $INDEX_PREFIX"
+  printf '[build] command:'; printf ' %q' "${builder[@]}"; echo
+  "${builder[@]}"
+  printf '[pq] command:'; printf ' %q' "${pq[@]}"; echo
+  OMP_NUM_THREADS="$PQ_THREADS" \
+  OPENBLAS_NUM_THREADS=1 \
+  MKL_NUM_THREADS=1 \
+  OMP_DYNAMIC=FALSE \
+  "${pq[@]}"
+  printf '[extent] command:'; printf ' %q' "${extent[@]}"; echo
+  "${extent[@]}"
+} 2>&1 | tee "$LOG_FILE"
+
+validate_index_metadata storage
+echo "[build] complete: schema-16 persistent OPQ/PQ index and Live-Extent metadata $INDEX_PREFIX"
+echo "[build] log: $LOG_FILE"

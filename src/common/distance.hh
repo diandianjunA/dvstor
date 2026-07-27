@@ -40,40 +40,6 @@ static f32 L2SqrSIMD16ExtAVX(const void* pVect1v, const void* pVect2v, const voi
   return TmpRes[0] + TmpRes[1] + TmpRes[2] + TmpRes[3] + TmpRes[4] + TmpRes[5] + TmpRes[6] + TmpRes[7];
 }
 
-// taken from https://github.com/nmslib/hnswlib/blob/c1b9b79af3d10c6ee7b5d0afa1ce851ae975254c/hnswlib/space_ip.h#L210
-static f32 InnerProductSIMD16ExtAVX(const void* pVect1v, const void* pVect2v, const void* qty_ptr) {
-  f32 __attribute__((aligned(32))) TmpRes[8];
-  f32* pVect1 = (f32*)pVect1v;
-  f32* pVect2 = (f32*)pVect2v;
-  size_t qty = *((size_t*)qty_ptr);
-
-  size_t qty16 = qty / 16;
-
-  const f32* pEnd1 = pVect1 + 16 * qty16;
-
-  __m256 sum256 = _mm256_set1_ps(0);
-
-  while (pVect1 < pEnd1) {
-    //_mm_prefetch((char*)(pVect2 + 16), _MM_HINT_T0);
-
-    __m256 v1 = _mm256_loadu_ps(pVect1);
-    pVect1 += 8;
-    __m256 v2 = _mm256_loadu_ps(pVect2);
-    pVect2 += 8;
-    sum256 = _mm256_add_ps(sum256, _mm256_mul_ps(v1, v2));
-
-    v1 = _mm256_loadu_ps(pVect1);
-    pVect1 += 8;
-    v2 = _mm256_loadu_ps(pVect2);
-    pVect2 += 8;
-    sum256 = _mm256_add_ps(sum256, _mm256_mul_ps(v1, v2));
-  }
-
-  _mm256_store_ps(TmpRes, sum256);
-  f32 sum = TmpRes[0] + TmpRes[1] + TmpRes[2] + TmpRes[3] + TmpRes[4] + TmpRes[5] + TmpRes[6] + TmpRes[7];
-
-  return sum;
-}
 
 #endif
 
@@ -117,45 +83,6 @@ static f32 l2(const span<const f32>& lhs, const span<const f32>& rhs, size_t dim
   return result;
 }
 
-static f32 ip_distance(const span<const f32>& lhs, const span<const f32>& rhs, size_t dim) {
-  const f32* a = lhs.data();
-  const f32* b = rhs.data();
-
-  f32 result = 0.;
-
-#ifdef __AVX__
-  const size_t qty16 = dim >> 4 << 4;
-  const f32 res = InnerProductSIMD16ExtAVX(a, b, &qty16);
-
-  a += qty16;
-  b += qty16;
-  const size_t qty_left = dim - qty16;
-
-  f32 res_tail = 0;
-  for (idx_t i = 0; i < qty_left; i++) {
-    res_tail += a[i] * b[i];
-  }
-
-  result = 1.0f - (res + res_tail);
-
-#else
-  f32 res = 0;
-  for (idx_t i = 0; i < dim; i++) {
-    res += a[i] * b[i];
-  }
-
-  result = 1.0f - res;
-#endif
-
-  return result;
-}
-
 struct L2Distance {
   static f32 dist(const span<const f32>& lhs, const span<const f32>& rhs, size_t dim) { return l2(lhs, rhs, dim); }
-};
-
-struct IPDistance {
-  static f32 dist(const span<const f32>& lhs, const span<const f32>& rhs, size_t dim) {
-    return ip_distance(lhs, rhs, dim);
-  }
 };

@@ -2,72 +2,42 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <deque>
+#include <limits>
 #include <memory>
-#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include <library/connection_manager.hh>
 #include <library/memory_region.hh>
 
 #include "common/configuration.hh"
+#include "common/bounded_queue.hh"
+#include "common/completion_pool.hh"
 #include "common/core_assignment.hh"
-#include "http/vamana_service_scheduler.hh"
-#include "memory_node/command_protocol.hh"
+#include "gpu_search/persistent_engine.hh"
+#include "memory_node/startup_protocol.hh"
 #include "service/breakdown.hh"
-#include "service/compute_service/state.hh"
 #include "service/storage_owner_protocol.hh"
 #include "service/index_metadata.hh"
-#include "vamana/storage_layout_resolver.hh"
-#include "vamana/anchor_index.hh"
-#include "vamana/vamana.hh"
-#include "worker_pool.hh"
+#include "service/query_result.hh"
 
-template <class Distance>
 class ComputeService {
 private:
   using Configuration = configuration::IndexConfiguration;
   using Assignment = CoreAssignment<interleaved>;
 
-  struct CommandResult {
-    bool success;
-    str message;
-  };
-
-  struct RpcHeader {
-    u32 magic{};
-    u32 type{};
-    u32 source_client{};
-    u32 origin_client{};
-    u64 request_id{};
-    u32 top_k{};
-    u32 payload_count{};
-  };
-
-  enum RpcType : u32 {
-    rpc_register_centroid = 1,
-    rpc_register_ack = 2,
-    rpc_search_proxy = 3,
-    rpc_search_request = 4,
-    rpc_search_response = 5,
-  };
-
-  struct RpcOutbound {
-    u32 destination_client{};
-    RpcType type{};
-    u64 request_id{};
-    u32 origin_client{};
-    u32 top_k{};
-    vec<element_t> float_payload;
-    vec<node_t> id_payload;
-  };
-
 public:
+  struct StorageOwnerSenderTelemetry {
+    u64 submitted_batches{};
+    u64 submitted_items{};
+    u64 completed_batches{};
+    u64 completed_items{};
+    u64 completed_rpc_wall_ns{};
+    u64 max_rpc_wall_ns{};
+  };
+
   struct InsertItem {
     node_t id;
     vec<element_t> values;
@@ -80,20 +50,13 @@ public:
     u32 threads{};
   };
 
-  struct ServiceProfile {
-    u32 insert_workers{};
-    u32 query_workers{};
-    u32 insert_coroutines{};
-    u32 query_coroutines{};
-  };
-
   struct LocalMainSearchOutput {
     service::QueryResult results;
     std::shared_ptr<service::breakdown::Sample> sample;
   };
 
 public:
-  explicit ComputeService(const Configuration& config, bool shutdown_remote_on_stop = false);
+  explicit ComputeService(const Configuration& config);
   ~ComputeService();
 
   ComputeService(const ComputeService&) = delete;
@@ -102,40 +65,65 @@ public:
   size_t insert(const vec<InsertItem>& batch);
   size_t upsert(const vec<InsertItem>& batch);
   size_t erase(const vec<node_t>& ids);
+  bool wait_for_storage_maintenance(
+    std::chrono::milliseconds timeout,
+    vec<u64>* target_sequences = nullptr,
+    vec<u64>* durable_sequences = nullptr);
   vec<node_t> search(const vec<element_t>& query, u32 k);
   vec<node_t> search_raw(VectorDType query_dtype, const byte_t* query_data, u32 dim, u32 k);
-  bool load_index(const std::string& path, str* error_message = nullptr);
-  bool store_index(const std::string& path, str* error_message = nullptr);
   Status status() const;
   void reset_breakdown_state();
   void clear_thread_statistics();
   service::breakdown::Report collect_breakdown_report() const;
+  gpu_search::TelemetrySnapshot gpu_search_telemetry() const {
+    return persistent_search_ == nullptr
+      ? gpu_search::TelemetrySnapshot{} : persistent_search_->telemetry();
+  }
+  std::vector<std::optional<gpu_search::maintenance_telemetry::Snapshot>>
+    storage_maintenance_telemetry() {
+    return persistent_search_ == nullptr
+      ? std::vector<std::optional<
+          gpu_search::maintenance_telemetry::Snapshot>>{}
+      : persistent_search_->read_maintenance_telemetry();
+  }
+  u64 late_storage_owner_rpc_completions() const {
+    return storage_insert_late_rpc_completions_.load(
+      std::memory_order_relaxed);
+  }
+  StorageOwnerSenderTelemetry storage_owner_sender_telemetry() const {
+    return {
+      .submitted_batches = storage_owner_submitted_batches_.load(
+        std::memory_order_relaxed),
+      .submitted_items = storage_owner_submitted_items_.load(
+        std::memory_order_relaxed),
+      .completed_batches = storage_owner_completed_batches_.load(
+        std::memory_order_relaxed),
+      .completed_items = storage_owner_completed_items_.load(
+        std::memory_order_relaxed),
+      .completed_rpc_wall_ns = storage_owner_completed_rpc_wall_ns_.load(
+        std::memory_order_relaxed),
+      .max_rpc_wall_ns = storage_owner_max_rpc_wall_ns_.load(
+        std::memory_order_relaxed),
+    };
+  }
 
   const Configuration& config() const { return config_; }
-  size_t rabitq_cache_bytes() const { return rabitq_cache_ ? rabitq_cache_->total_size_bytes() : 0; }
-  size_t rabitq_cache_entries() const { return rabitq_cache_ ? rabitq_cache_->entry_count() : 0; }
-  size_t rabitq_cache_entry_bytes() const { return rabitq_cache_ ? rabitq_cache_->entry_bytes() : 0; }
-  size_t rabitq_cache_code_bits() const { return rabitq_cache_ ? rabitq_cache_->code_bits() : 0; }
-  size_t rabitq_cache_override_bitmap_bytes() const {
-    return rabitq_cache_ ? rabitq_cache_->override_bitmap_bytes() : 0;
-  }
-  size_t rabitq_cache_dynamic_live() const { return rabitq_cache_ ? rabitq_cache_->dynamic_live() : 0; }
-  size_t rabitq_cache_dynamic_overflow() const {
-    return rabitq_cache_ ? rabitq_cache_->dynamic_overflow() : 0;
-  }
-  bool rabitq_cache_numa_interleaved() const {
-    return rabitq_cache_ && rabitq_cache_->numa_interleaved();
-  }
-
 private:
   struct StorageInsertTask {
-    InsertItem item;
+    node_t id{};
+    // Canonical storage bytes are produced before centroid routing. Keeping
+    // the exact bytes here prevents uint8/int8 home selection from happening
+    // in a different vector space and avoids a second quantization in sender.
+    vec<byte_t> encoded_vector;
     service::storage_owner::MutationKind kind{service::storage_owner::MutationKind::insert};
-    std::shared_ptr<service::breakdown::Sample> sample;
-    std::promise<bool> result;
+    u32 completion_id{std::numeric_limits<u32>::max()};
+    u32 stage1_home{};
+    // Stable logical identity.  Transport batches may be rebuilt without
+    // changing this value, so authority replay never depends on batch ordinal.
+    u64 operation_id{};
+    u32 operation_generation{};
     std::chrono::steady_clock::time_point enqueued_at{};
     std::chrono::steady_clock::time_point sender_dequeued_at{};
-    vec<RemotePtr> anchor_hints;
   };
 
   struct StorageOwnerRpcSlot {
@@ -145,21 +133,24 @@ private:
     bool send_done{false};
     bool response_done{false};
     bool results_completed{false};
+    bool completion_claimed{false};
+    bool response_valid{false};
+    service::storage_owner::MutationBatchAckV2 response_ack{};
+    // Kept only for the unreachable protocol-v3 parser below the v4 return;
+    // no v4 receive slot is retained by an RPC batch.
+    u32 response_slot_id{std::numeric_limits<u32>::max()};
     u32 item_count{};
     u64 batch_id{};
-    u64 batch_wait_ns{};
     u64 request_prepare_ns{};
+    u64 cq_progress_gap_ns{};
     size_t request_size{};
     size_t response_size{};
     std::chrono::steady_clock::time_point send_posted_at{};
     std::chrono::steady_clock::time_point send_completed_at{};
     std::chrono::steady_clock::time_point response_completed_at{};
     vec<byte_t> request_buffer;
-    vec<byte_t> response_buffer;
     std::unique_ptr<LocalMemoryRegion> request_region;
-    std::unique_ptr<LocalMemoryRegion> response_region;
-    vec<std::unique_ptr<StorageInsertTask>> tasks;
-    vec<std::shared_ptr<service::breakdown::Sample>> samples;
+    vec<u32> tasks;
   };
 
   struct StorageOwnerResponseSlot {
@@ -170,145 +161,146 @@ private:
   };
 
   struct StorageOwnerSenderState {
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::deque<std::unique_ptr<StorageInsertTask>> queue;
+    u32 task_capacity{};
+    // Producers announce before canonicalization/centroid routing and retire
+    // the announcement only after publishing their task into queue. This lets
+    // the sender distinguish real concurrent demand from an isolated write
+    // without a time-based batching delay.
+    std::atomic<u32> pending_producers{0};
+    // Accounting credit for cells whose Queue::push_wait has returned.
+    // Multiple producers can publish out of FIFO-reservation order, so this
+    // is an exact total credit but only a batching hint for the immediately
+    // dequeue-visible prefix. The single progress consumer subtracts only the
+    // prefix it actually popped.
+    std::atomic<u32> published_tasks{0};
+    // One assembler per logical authority. Physical-home fanout happens at
+    // the authority after acceptance; splitting this queue by home produces
+    // 25 sparse flows and destroys useful foreground batching.
+    std::unique_ptr<bounded::Queue<u32>> queue;
+    u64 oldest_published_observed_ns{};
+    std::unique_ptr<bounded::Queue<u32>> free_tasks;
+    std::unique_ptr<StorageInsertTask[]> tasks;
     vec<StorageOwnerRpcSlot> slots;
     vec<StorageOwnerResponseSlot> response_slots;
-    std::deque<u32> free_slots;
-    std::unordered_map<u64, u32> batch_to_slot;
-    std::thread thread;
+    u32 completion_slot_count{};
+    vec<byte_t> completion_buffer;
+    std::unique_ptr<LocalMemoryRegion> completion_region;
+    vec<u32> free_slots;
+    // Set and cleared only by the CQ/progress thread. published_tasks is an
+    // exact total but may include cells behind an invisible MPMC head, so this
+    // is an observation time rather than proof that the FIFO head is visible.
+    // Written only by the progress thread. Power-of-two snapshots are logged
+    // so a benchmark can verify that batching is real rather than inferred
+    // from submitted operation counts.
+    u64 rpc_batches{};
+    u64 rpc_items{};
+    u64 full_batches{};
+    u64 tail_escape_batches{};
+    u64 max_wait_flush_batches{};
+    u64 occupancy_flush_batches{};
+    u64 adaptive_wait_flush_batches{};
+    // A later producer may publish behind a reserved-but-invisible FIFO head.
+    // These counters distinguish that transient MPMC condition from remote
+    // RPC or storage-maintenance stalls.
+    u64 queue_visibility_stalls{};
+    u64 partial_visible_batches{};
+    // Raw batch critical-path telemetry. These values deliberately are not
+    // divided across logical items: an item experiences the complete batch
+    // response latency even though CPU work counters are per-item shares.
+    u64 completed_rpc_batches{};
+    u64 completed_rpc_items{};
+    u64 completed_rpc_wall_ns{};
+    u64 max_rpc_wall_ns{};
+    u32 max_active_rpcs{};
+    u32 max_published_tasks{};
+  };
+
+  struct StorageOwnerReadySlot {
+    u32 owner_storage{};
+    u32 slot_id{};
+  };
+
+  struct StorageOwnerReleasedSlot {
+    u32 owner_storage{};
+    u32 slot_id{};
   };
 
   void init_remote_tokens();
   void receive_remote_access_tokens();
-  void wait_for_load_or_store();
-  ServiceProfile resolve_service_profile() const;
+  void start_storage_nodes();
   bool validate_index_metadata(const filepath_t& index_prefix, str* error_message = nullptr);
   void synchronize_clients_after_startup();
-  vec<CommandResult> send_index_command(mn_command::Command cmd, const std::string& path);
-  void start_workers();
-  void stop_workers();
-  void pause_workers();
-  void resume_workers();
   LocalMainSearchOutput search_local_result(const vec<element_t>& query, u32 k);
   LocalMainSearchOutput search_local_raw_result(VectorDType query_dtype, const byte_t* query_data, u32 k);
   vec<node_t> search_local(const vec<element_t>& query, u32 k);
   vec<node_t> search_local_raw(VectorDType query_dtype, const byte_t* query_data, u32 k);
   void start_storage_insert_runtime();
   void stop_storage_insert_runtime();
-  void run_storage_insert_sender(u32 owner_storage);
+  void release_storage_insert_runtime();
+  void run_storage_insert_progress_loop();
   void run_storage_insert_completion_loop();
+  bool drain_storage_owner_submissions(u32& first_owner);
+  void reclaim_storage_owner_slots();
   void post_storage_owner_batch(u32 owner_storage,
-                                u32 slot_id,
-                                vec<std::unique_ptr<StorageInsertTask>>&& tasks,
-                                u64 batch_wait_ns);
+                                u32 slot_id);
   void handle_storage_owner_send_completion(u32 owner_storage, u32 slot_id);
-  void handle_storage_owner_response(u32 owner_storage, u32 response_slot_id);
+  void handle_storage_owner_response(
+    u32 owner_storage,
+    const service::storage_owner::MutationBatchAckV2& response,
+    u32 received_bytes);
   void post_storage_owner_response_receive(u32 owner_storage, u32 response_slot_id);
-  void maybe_release_storage_owner_slot_locked(StorageOwnerSenderState& state,
-                                               StorageOwnerRpcSlot& slot);
-  void fail_storage_owner_tasks(vec<std::unique_ptr<StorageInsertTask>>& tasks);
-  bool initialize_compute_side_idmap(const filepath_t& index_prefix,
-                                     const service::index_metadata::Metadata& metadata);
-  bool mark_remote_deleted(RemotePtr ptr);
-  void publish_compute_side_id(node_t id, RemotePtr ptr, bool deleted, u32 owner_storage);
-  bool lookup_compute_side_id(node_t id, RemotePtr* ptr, bool* deleted = nullptr) const;
-  u32 storage_owner_for_id(node_t id) const;
-  vamana::anchor::Route route_storage_owner_update(const InsertItem& item,
-                                                    std::optional<u32> owner_override = std::nullopt) const;
-  bool routing_enabled() const;
-  size_t rpc_message_size() const;
-  vec<element_t> compute_local_routing_centroid() const;
-  void start_rpc();
-  void stop_rpc();
-  void pause_rpc();
-  void resume_rpc();
-  void run_rpc_loop();
-  void handle_rpc_receive(const RpcHeader& header, const byte_t* payload);
-  void handle_search_proxy(const RpcHeader& header, const byte_t* payload);
-  void handle_search_request(const RpcHeader& header, const byte_t* payload);
-  void handle_search_response(const RpcHeader& header, const byte_t* payload);
-  void handle_register_centroid(const RpcHeader& header, const byte_t* payload);
-  void handle_register_ack(const RpcHeader& header);
-  void enqueue_rpc(RpcOutbound* outbound);
-  void flush_outbound_rpc();
-  void post_initial_rpc_receives();
-  void post_rpc_receive(u32 peer_client);
-  QueuePair& qp_for_client(u32 client_id);
-  u32 choose_destination(const vec<element_t>& query) const;
-  void refresh_routing_state(bool wait_for_remote_registration);
-  void shutdown_remote_if_requested();
-
-  auto& compute_threads() { return worker_pool_->get_compute_threads(); }
-  const auto& compute_threads() const { return worker_pool_->get_compute_threads(); }
+  void post_storage_owner_completion_receive(u32 owner_storage,
+                                             u32 completion_slot_id);
+  void handle_storage_owner_token_completion(
+    u32 owner_storage,
+    const service::storage_owner::MutationCompletionV2& completion,
+    u32 received_bytes);
+  bool queue_storage_owner_completion(StorageOwnerRpcSlot& slot);
+  void commit_storage_owner_slot(u32 owner_storage, u32 slot_id);
+  void release_storage_owner_slot(u32 owner_storage, u32 slot_id);
+  void complete_storage_owner_task(u32 owner_storage, u32 task_id, bool success);
+  void fail_storage_owner_tasks(u32 owner_storage, vec<u32>& tasks);
+  size_t submit_storage_owner_mutations(
+    const vec<InsertItem>& items,
+    service::storage_owner::MutationKind kind);
 
 private:
   Configuration config_;
   Context context_;
   ClientConnectionManager cm_;
   const u32 num_servers_;
-  const bool shutdown_remote_on_stop_;
 
   MemoryRegionTokens remote_access_tokens_;
   Assignment core_assignment_;
 
-  std::atomic<bool> shutdown_{false};
   std::atomic<size_t> vectors_inserted_{0};
-  void* reserved_query_state_[2]{};
 
-  std::mutex mn_command_mutex_;
-  std::atomic<bool> workers_paused_{false};
-  std::atomic<u32> workers_idle_count_{0};
-  std::atomic<bool> stopped_{false};
-  std::atomic<bool> rpc_shutdown_{false};
-  std::atomic<bool> rpc_paused_{false};
-  std::atomic<bool> rpc_idle_{false};
-
-  std::unique_ptr<vamana::Vamana<Distance>> vamana_;
-  std::unique_ptr<vamana::rabitq::Cache> rabitq_cache_;
-  std::unique_ptr<vamana::anchor::Index> anchor_index_;
-  std::unique_ptr<WorkerPool> worker_pool_;
-  ServiceProfile service_profile_{};
-  service::InsertQueue insert_queue_;
-  service::QueryQueue query_queue_;
-  vec<std::thread> workers_;
-  std::thread rpc_thread_;
+  std::unique_ptr<gpu_search::PersistentSearchEngine> persistent_search_;
+  std::thread storage_insert_progress_thread_;
   std::thread storage_insert_completion_thread_;
   std::atomic<bool> storage_insert_shutdown_{false};
-  std::atomic<bool> storage_insert_senders_done_{false};
+  std::atomic<bool> storage_insert_progress_done_{false};
   std::atomic<u32> storage_insert_inflight_{0};
-  std::atomic<u32> storage_insert_timeout_logs_{0};
+  std::atomic<u64> storage_insert_late_rpc_completions_{0};
+  std::atomic<u64> storage_owner_submitted_batches_{0};
+  std::atomic<u64> storage_owner_submitted_items_{0};
+  std::atomic<u64> storage_owner_completed_batches_{0};
+  std::atomic<u64> storage_owner_completed_items_{0};
+  std::atomic<u64> storage_owner_completed_rpc_wall_ns_{0};
+  std::atomic<u64> storage_owner_max_rpc_wall_ns_{0};
+  u64 storage_insert_current_cq_gap_ns_{};
+  std::unique_ptr<bounded::Queue<StorageOwnerReadySlot>> storage_ready_slots_;
+  std::unique_ptr<bounded::Queue<StorageOwnerReleasedSlot>> storage_released_slots_;
+  std::unique_ptr<bounded::CompletionPool> storage_completion_pool_;
+  std::unique_ptr<service::breakdown::Sample[]> storage_completion_samples_;
+  std::unique_ptr<std::atomic<u64>[]> storage_maintenance_targets_;
   vec<std::unique_ptr<StorageOwnerSenderState>> storage_insert_owners_;
-  struct ComputeSideIdEntry {
-    RemotePtr ptr;
-    bool deleted{};
-    u32 owner_storage{};
-  };
-  mutable std::mutex compute_side_idmap_mutex_;
-  hashmap_t<node_t, ComputeSideIdEntry> compute_side_idmap_;
-
-  std::unique_ptr<byte_t[]> rpc_buffer_;
-  std::unique_ptr<LocalMemoryRegion> rpc_region_;
-  vec<idx_t> rpc_freelist_;
-  concurrent_queue<RpcOutbound*> outbound_rpc_queue_;
-
-  std::mutex pending_mutex_;
-  std::unordered_map<u64, std::shared_ptr<std::promise<vec<node_t>>>> pending_queries_;
-  std::unordered_map<u64, std::shared_ptr<std::promise<void>>> pending_registration_acks_;
+  // Authority replay identity includes a per-process incarnation, not the
+  // reusable connection-manager client ordinal. This prevents a restarted
+  // compute process from replaying an old operation token accidentally.
+  u32 storage_operation_source_{};
   std::atomic<u64> next_request_id_{1};
 
-  mutable std::mutex routing_mutex_;
-  vec<vec<element_t>> routing_centroids_;
-  vec<u32> routing_inflight_;
-  std::atomic<u32> registered_remote_clients_{0};
-  std::condition_variable routing_cv_;
-
-  mutable std::mutex breakdown_mutex_;
-  bool breakdown_enabled_{false};
-  std::vector<service::breakdown::Sample> completed_query_samples_;
-  std::vector<service::breakdown::Sample> completed_insert_samples_;
+  std::atomic<bool> breakdown_enabled_{false};
+  service::breakdown::ConcurrentReport completed_breakdown_report_;
 };
-
-extern template class ComputeService<L2Distance>;
-extern template class ComputeService<IPDistance>;

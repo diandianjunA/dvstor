@@ -1,27 +1,30 @@
 #include "tools/vamana_offline/shard_writer.hh"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <random>
 #include <stdexcept>
 #include <utility>
 
 #include <library/utils.hh>
 
 #include "common/index_path.hh"
+#include "common/vector_dtype.hh"
 #include "nlohmann/json.hh"
 #include "remote_pointer.hh"
+#include "vamana/centroid_seed_policy.hh"
+#include "vamana/centroid_state.hh"
 #include "vamana/idmap.hh"
-#include "vamana/rabitq_cache.hh"
 #include "vamana/storage_layout_resolver.hh"
 #include "vamana/vamana_node.hh"
 #include "tools/vamana_offline/partitioning.hh"
 #include "tools/vamana_offline/progress.hh"
-#include "tools/vamana_offline/anchor_builder.hh"
 
 namespace tools::vamana_offline {
 
@@ -38,6 +41,30 @@ struct PlacementResult {
   PartitionStats stats;
   double cross_shard_ratio{0.0};
 };
+
+u64 mix64(u64 value) {
+  value += 0x9e3779b97f4a7c15ULL;
+  value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+  return value ^ (value >> 31);
+}
+
+u64 make_build_fingerprint(const filepath_t& output_prefix,
+                           size_t vector_count,
+                           u32 dim,
+                           u32 max_degree,
+                           u32 shard_count) {
+  const str path = output_prefix.string();
+  u64 value = vamana::centroid_state::checksum(span<const byte_t>{
+    reinterpret_cast<const byte_t*>(path.data()), path.size()});
+  value = mix64(value ^ static_cast<u64>(vector_count));
+  value = mix64(value ^ (static_cast<u64>(dim) << 32) ^ max_degree);
+  value = mix64(value ^ shard_count ^ static_cast<u64>(
+    std::chrono::high_resolution_clock::now().time_since_epoch().count()));
+  std::random_device entropy;
+  value = mix64(value ^ (static_cast<u64>(entropy()) << 32) ^ entropy());
+  return value == 0 ? 0x9e3779b97f4a7c15ULL : value;
+}
 
 size_t graph_input_edges(const VamanaGraph& graph) {
   size_t total = 0;
@@ -266,95 +293,114 @@ void create_sized_file(const filepath_t& path, u64 size) {
   lib_assert(output.good(), "failed to size output shard file: " + path.string());
 }
 
+void finalize_owner_idmap_atomic(
+    const filepath_t& path, const filepath_t& temporary,
+    std::ofstream& output, vamana::idmap::Header header,
+    u64 entry_count, u64 payload_checksum) {
+  u64 payload_bytes = 0;
+  lib_assert(vamana::idmap::checked_payload_bytes(entry_count, payload_bytes),
+             "owner idmap payload size overflow: " + path.string());
+  lib_assert(payload_bytes <= std::numeric_limits<size_t>::max() &&
+               payload_bytes <= static_cast<u64>(
+                 std::numeric_limits<std::streamsize>::max()),
+             "owner idmap payload exceeds host I/O limits: " +
+               path.string());
+  header.entry_count = entry_count;
+  header.payload_bytes = payload_bytes;
+  header.payload_checksum = payload_checksum;
+  header.header_checksum = vamana::idmap::compute_header_checksum(header);
+
+  output.flush();
+  lib_assert(output.good(),
+             "failed to flush owner idmap payload: " +
+               temporary.string());
+  output.seekp(0);
+  output.write(reinterpret_cast<const char*>(&header), sizeof(header));
+  output.flush();
+  lib_assert(output.good(),
+             "failed to write complete owner idmap: " +
+               temporary.string());
+  output.close();
+  lib_assert(!output.fail(),
+             "failed to close complete owner idmap: " +
+               temporary.string());
+
+  std::error_code error;
+  const uintmax_t actual_bytes =
+    std::filesystem::file_size(temporary, error);
+  lib_assert(!error &&
+               actual_bytes == sizeof(header) + payload_bytes,
+             "temporary owner idmap has an incomplete payload: " +
+               temporary.string());
+  error.clear();
+  std::filesystem::rename(temporary, path, error);
+  lib_assert(!error,
+             "failed to publish owner idmap atomically: " + path.string() +
+               ": " + error.message());
+}
+
 }  // namespace
 
 void write_vamana_shards(const VamanaGraph& graph,
                          const Dataset& dataset,
                          const VamanaBuildConfig& config,
                          const filepath_t& output_prefix) {
+  lib_assert(config.num_memory_nodes > 0 &&
+               config.num_memory_nodes <= RemotePtr::MEMORY_NODE_MASK + 1,
+             "tagged RemotePtr supports between 1 and 64 physical shards");
   const size_t n = dataset.size();
   const u32 dim = dataset.dim;
-  const auto storage_format = vamana::parse_storage_format(config.storage_format);
-  lib_assert(storage_format.has_value(), "unsupported Vamana storage format");
-  VamanaNode::set_storage_format(*storage_format);
   VamanaNode::disable_hot_graph();
-  if (config.use_rabitq) {
-    lib_assert(n > 0, "cannot build RaBitQ metadata for an empty dataset");
-    VamanaNode::enable_rabitq();
-    // Compute global centroid for asymmetric RaBitQ.
-    vec<double> centroid_sum(dim, 0.0);
-    for (size_t i = 0; i < n; ++i) {
-        const byte_t* raw = dataset.raw_vector(i);
-        for (u32 d = 0; d < dim; ++d)
-            centroid_sum[d] += vector_component_as_float(raw, dataset.dtype, d);
-    }
-    vec<float> centroid(dim);
-    for (u32 d = 0; d < dim; ++d)
-        centroid[d] = static_cast<float>(centroid_sum[d] / static_cast<double>(n));
-    VamanaNode::set_rabitq_centroid(centroid);
-  }
-
-  vamana::rabitq::Quantization cache_quantization{};
-  u32 rabitq_cache_entry_bytes = 0;
-  u32 rabitq_cache_code_bits = 0;
-  if (config.use_rabitq) {
-    rabitq_cache_entry_bytes = vamana::rabitq::choose_entry_bytes(
-      static_cast<u32>(dataset.vector_bytes));
-    lib_assert(rabitq_cache_entry_bytes >= 2,
-               "RaBitQ RFQ5 sidecar cannot fit within the 10% raw-vector budget for this dtype/dim");
-    rabitq_cache_code_bits = vamana::rabitq::entry_code_bits(rabitq_cache_entry_bytes);
-    cache_quantization.norm_min = std::numeric_limits<f32>::max();
-    cache_quantization.norm_max = std::numeric_limits<f32>::lowest();
-    vec<byte_t> ignored_code(vamana::rabitq::entry_code_bytes(rabitq_cache_entry_bytes));
-    for (size_t i = 0; i < n; ++i) {
-      f32 norm = 0.0f;
-      vamana::rabitq::compute_values(dataset.raw_vector(i), dataset.dtype,
-                                     rabitq_cache_code_bits, ignored_code.data(), &norm);
-      cache_quantization.norm_min = std::min(cache_quantization.norm_min, norm);
-      cache_quantization.norm_max = std::max(cache_quantization.norm_max, norm);
-    }
-  }
   const size_t node_size = VamanaNode::total_size();
   const size_t aligned_size = (node_size + 7) & ~7ULL;
+  const u64 build_fingerprint = make_build_fingerprint(
+    output_prefix, n, dim, config.R, config.num_memory_nodes);
 
   ProgressReporter progress{"Exporting Vamana shards", n + config.num_memory_nodes};
 
   PlacementResult placement_result = place_nodes(graph, config, aligned_size);
   print_partition_stats(config, placement_result);
   const auto& placements = placement_result.placements;
-  write_anchor_sidecar(graph, dataset, config, placements, output_prefix);
 
   vec<u64> shard_sizes(config.num_memory_nodes, 16);
   vec<u64> shard_entry_counts(config.num_memory_nodes, 0);
   for (const auto& p : placements) {
+    lib_assert(RemotePtr::representable(p.memory_node, p.offset, 0),
+               "static node placement exceeds tagged RemotePtr capacity");
     shard_sizes[p.memory_node] = std::max<u64>(shard_sizes[p.memory_node], p.offset + aligned_size);
     shard_entry_counts[p.memory_node] = std::max<u64>(
       shard_entry_counts[p.memory_node], (p.offset - 16) / aligned_size + 1);
   }
 
-  const bool use_hot_graph = *storage_format == vamana::StorageFormat::compact_v1;
   const u32 hot_graph_shard_bits = vamana::hot_graph::shard_bits_for(config.num_memory_nodes);
   const u32 hot_graph_entry_size = static_cast<u32>(VamanaNode::hot_graph_entry_size());
   vec<u64> hot_graph_header_offsets(config.num_memory_nodes, 0);
   vec<u64> hot_graph_entry_offsets(config.num_memory_nodes, 0);
   vec<u64> hot_graph_dynamic_base_offsets(config.num_memory_nodes, 0);
-  if (use_hot_graph) {
-    for (u32 shard = 0; shard < config.num_memory_nodes; ++shard) {
-      hot_graph_header_offsets[shard] = VamanaNode::align_storage(shard_sizes[shard]);
-      hot_graph_entry_offsets[shard] =
-        VamanaNode::align_storage(hot_graph_header_offsets[shard] + sizeof(vamana::hot_graph::Header));
-      hot_graph_dynamic_base_offsets[shard] = VamanaNode::align_storage(
-        hot_graph_entry_offsets[shard] + shard_entry_counts[shard] * hot_graph_entry_size);
-      shard_sizes[shard] = hot_graph_dynamic_base_offsets[shard];
+  for (u32 shard = 0; shard < config.num_memory_nodes; ++shard) {
+    hot_graph_header_offsets[shard] = VamanaNode::align_storage(shard_sizes[shard]);
+    hot_graph_entry_offsets[shard] =
+      VamanaNode::align_storage(hot_graph_header_offsets[shard] + sizeof(vamana::hot_graph::Header));
+    hot_graph_dynamic_base_offsets[shard] = VamanaNode::align_storage(
+      hot_graph_entry_offsets[shard] + shard_entry_counts[shard] * hot_graph_entry_size);
+    shard_sizes[shard] = hot_graph_dynamic_base_offsets[shard];
+  }
+  VamanaNode::configure_hot_graph(hot_graph_entry_offsets,
+                                  shard_entry_counts,
+                                  hot_graph_entry_size,
+                                  hot_graph_shard_bits,
+                                  hot_graph_dynamic_base_offsets,
+                                  static_cast<u32>(VamanaNode::dynamic_record_size()),
+                                  static_cast<u32>(VamanaNode::total_size()));
+
+  vec<u64> shard_fingerprints(config.num_memory_nodes, 0);
+  for (u32 shard = 0; shard < config.num_memory_nodes; ++shard) {
+    shard_fingerprints[shard] = mix64(
+      build_fingerprint ^ mix64(shard) ^ shard_sizes[shard] ^
+      mix64(shard_entry_counts[shard]) ^ hot_graph_entry_offsets[shard]);
+    if (shard_fingerprints[shard] == 0) {
+      shard_fingerprints[shard] = mix64(build_fingerprint ^ shard ^ 1);
     }
-    VamanaNode::configure_hot_graph(hot_graph_entry_offsets,
-                                    shard_entry_counts,
-                                    hot_graph_entry_size,
-                                    hot_graph_shard_bits,
-                                    2,
-                                    hot_graph_dynamic_base_offsets,
-                                    static_cast<u32>(VamanaNode::dynamic_record_size()),
-                                    static_cast<u32>(VamanaNode::total_size()));
   }
 
   const filepath_t output_dir = output_prefix.parent_path();
@@ -367,69 +413,54 @@ void write_vamana_shards(const VamanaGraph& graph,
   }
 
   vec<std::fstream> shard_files(config.num_memory_nodes);
-  vec<std::fstream> cache_files(config.num_memory_nodes);
   for (u32 shard = 0; shard < config.num_memory_nodes; ++shard) {
     shard_files[shard].open(shard_paths[shard], std::ios::binary | std::ios::in | std::ios::out);
     lib_assert(shard_files[shard].good(), "failed to open output shard file: " + shard_paths[shard].string());
     shard_files[shard].seekp(0);
     shard_files[shard].write(reinterpret_cast<const char*>(&shard_sizes[shard]), sizeof(u64));
-    if (use_hot_graph) {
-      vamana::hot_graph::Header header;
-      header.version = vamana::hot_graph::kVersion2;
-      header.entry_bytes = hot_graph_entry_size;
-      header.max_degree = config.R;
-      header.compact_pointer_shard_bits = hot_graph_shard_bits;
-      header.entry_count = shard_entry_counts[shard];
-      header.reserved0 = hot_graph_dynamic_base_offsets[shard];
-      header.reserved1 = VamanaNode::allocation_size();
-      header.reserved2 = static_cast<u32>(VamanaNode::total_size());
-      shard_files[shard].seekp(static_cast<std::streamoff>(hot_graph_header_offsets[shard]));
-      shard_files[shard].write(reinterpret_cast<const char*>(&header), sizeof(header));
-    }
-    if (config.use_rabitq) {
-      const filepath_t cache_path = index_path::rabitq_cache_file(
-        output_prefix, shard + 1, config.num_memory_nodes);
-      const u64 cache_size = sizeof(vamana::rabitq::SidecarHeader) +
-        shard_entry_counts[shard] * rabitq_cache_entry_bytes;
-      create_sized_file(cache_path, cache_size);
-      cache_files[shard].open(cache_path, std::ios::binary | std::ios::in | std::ios::out);
-      lib_assert(cache_files[shard].good(), "failed to open RaBitQ cache sidecar: " + cache_path.string());
-      vamana::rabitq::SidecarHeader header;
-      header.entry_size = rabitq_cache_entry_bytes;
-      header.code_bits = rabitq_cache_code_bits;
-      header.node_size = static_cast<u32>(aligned_size);
-      header.raw_vector_bytes = static_cast<u32>(VamanaNode::vector_bytes());
-      header.entry_count = shard_entry_counts[shard];
-      header.cache_budget_bytes = cache_size;
-      header.quantization = cache_quantization;
-      cache_files[shard].write(reinterpret_cast<const char*>(&header), sizeof(header));
-    }
+    shard_files[shard].write(
+      reinterpret_cast<const char*>(&shard_fingerprints[shard]),
+      sizeof(shard_fingerprints[shard]));
+    vamana::hot_graph::Header header;
+    header.version = vamana::hot_graph::kVersion3;
+    header.entry_bytes = hot_graph_entry_size;
+    header.max_degree = config.R;
+    header.compact_pointer_shard_bits = hot_graph_shard_bits;
+    header.entry_count = shard_entry_counts[shard];
+    header.reserved0 = hot_graph_dynamic_base_offsets[shard];
+    header.reserved1 = VamanaNode::allocation_size();
+    header.reserved2 = static_cast<u32>(VamanaNode::total_size());
+    shard_files[shard].seekp(static_cast<std::streamoff>(hot_graph_header_offsets[shard]));
+    shard_files[shard].write(reinterpret_cast<const char*>(&header), sizeof(header));
   }
-
-  const RemotePtr medoid_ptr{placements[graph.medoid].memory_node, placements[graph.medoid].offset};
-  shard_files[0].seekp(8);
-  shard_files[0].write(reinterpret_cast<const char*>(&medoid_ptr.raw_address), sizeof(u64));
 
   vec<byte_t> node_buf(aligned_size, 0);
   vec<byte_t> hot_graph_entry(hot_graph_entry_size, 0);
   vec<RemotePtr> hot_neighbors(config.R);
+  vec<vec<f64>> centroid_sums(
+    config.num_memory_nodes, vec<f64>(dim, 0.0));
+  vec<u64> centroid_counts(config.num_memory_nodes, 0);
+  struct RouteEntryCandidate {
+    vamana::routing::CentroidSeedRank rank{};
+    vamana::centroid_state::Entry entry{};
+  };
+  vec<vec<RouteEntryCandidate>> route_entries(config.num_memory_nodes);
+  for (auto& entries : route_entries) {
+    entries.reserve(vamana::centroid_state::kMaxLiveEntries);
+  }
   vec<u32> nbrs;
   for (size_t i = 0; i < n; ++i) {
     std::fill(node_buf.begin(), node_buf.end(), 0);
     byte_t* buf = node_buf.data();
 
-    u64 header = 0;
-    if (i == graph.medoid) header |= VamanaNode::HEADER_IS_MEDOID;
-    *reinterpret_cast<u64*>(buf) = header;
+    *reinterpret_cast<u64*>(buf) = VamanaNode::make_header(
+      0, VamanaNode::HEADER_CENTROID_ACCOUNTED);
     *reinterpret_cast<u32*>(buf + VamanaNode::HEADER_SIZE) = dataset.id(i);
 
     graph.copy_neighbors(i, nbrs);
     const u8 edge_count = static_cast<u8>(std::min<size_t>(nbrs.size(), config.R));
-    if (use_hot_graph) {
-      *reinterpret_cast<u32*>(buf + VamanaNode::offset_generation()) = 0;
-    } else {
-      *reinterpret_cast<u8*>(buf + VamanaNode::offset_edge_count()) = edge_count;
-    }
+    *reinterpret_cast<u32*>(buf + VamanaNode::offset_generation()) = 0;
+    *reinterpret_cast<u32*>(buf + VamanaNode::offset_slot_incarnation()) = 0;
 
     std::memcpy(buf + VamanaNode::offset_vector(), dataset.raw_vector(i), dataset.vector_bytes);
 
@@ -437,75 +468,147 @@ void write_vamana_shards(const VamanaGraph& graph,
     for (u8 j = 0; j < edge_count; ++j) {
       const u32 nbr = nbrs[j];
       RemotePtr nbr_ptr{placements[nbr].memory_node, placements[nbr].offset};
-      if (!use_hot_graph) {
-        reinterpret_cast<u64*>(buf + VamanaNode::offset_neighbors())[j] = nbr_ptr.raw_address;
-      }
       hot_neighbors[j] = nbr_ptr;
     }
 
-    if (config.use_rabitq) {
-        VamanaNode::RabitqCode code;
-        float norm = 0.0f;
-        float error = 0.0f;
-        VamanaNode::compute_rabitq_entry(dataset.raw_vector(i), dataset.dtype,
-                                         code, norm, error);
-        std::memcpy(buf + VamanaNode::offset_rabitq_code(), code.data(), code.size());
-        *reinterpret_cast<float*>(buf + VamanaNode::offset_rabitq_norm()) = norm;
-        *reinterpret_cast<float*>(buf + VamanaNode::offset_rabitq_error()) = error;
-
-        const auto cache_entry = vamana::rabitq::encode(
-          dataset.raw_vector(i), dataset.dtype, cache_quantization,
-          rabitq_cache_code_bits, rabitq_cache_entry_bytes);
-        const auto& placement = placements[i];
-        const u64 slot = (placement.offset - 16) / aligned_size;
-        auto& cache_file = cache_files[placement.memory_node];
-        const u64 cache_offset = sizeof(vamana::rabitq::SidecarHeader) +
-          slot * rabitq_cache_entry_bytes;
-        cache_file.seekp(static_cast<std::streamoff>(cache_offset));
-        cache_file.write(reinterpret_cast<const char*>(cache_entry.data()),
-                         static_cast<std::streamsize>(cache_entry.size()));
-        lib_assert(cache_file.good(), "failed to write RaBitQ cache sidecar entry");
-    }
-
     const auto& placement = placements[i];
+    for (u32 dimension = 0; dimension < dim; ++dimension) {
+      centroid_sums[placement.memory_node][dimension] +=
+        static_cast<f64>(vector_component_as_float(
+          dataset.raw_vector(i), dataset.dtype, dimension));
+    }
+    ++centroid_counts[placement.memory_node];
     auto& file = shard_files[placement.memory_node];
     file.seekp(static_cast<std::streamoff>(placement.offset));
     file.write(reinterpret_cast<const char*>(node_buf.data()), static_cast<std::streamsize>(node_buf.size()));
     lib_assert(file.good(), "failed to write output shard node");
-    if (use_hot_graph) {
-      VamanaNode::encode_hot_graph_entry(hot_graph_entry.data(),
-                                         dataset.id(i),
-                                         edge_count,
-                                         hot_neighbors.data(),
-                                         edge_count,
-                                         hot_graph_shard_bits,
-                                         0,
-                                         2);
-      const u64 slot = (placement.offset - 16) / aligned_size;
-      const u64 hot_offset = hot_graph_entry_offsets[placement.memory_node] +
-        slot * hot_graph_entry_size;
-      file.seekp(static_cast<std::streamoff>(hot_offset));
-      file.write(reinterpret_cast<const char*>(hot_graph_entry.data()),
-                 static_cast<std::streamsize>(hot_graph_entry_size));
-      lib_assert(file.good(), "failed to write compact hot graph entry");
-    }
+    VamanaNode::encode_hot_graph_entry(hot_graph_entry.data(),
+                                       edge_count,
+                                       hot_neighbors.data(),
+                                       edge_count,
+                                       hot_graph_shard_bits,
+                                       0);
+    const u64 slot = (placement.offset - 16) / aligned_size;
+    const u64 hot_offset = hot_graph_entry_offsets[placement.memory_node] +
+      slot * hot_graph_entry_size;
+    file.seekp(static_cast<std::streamoff>(hot_offset));
+    file.write(reinterpret_cast<const char*>(hot_graph_entry.data()),
+               static_cast<std::streamsize>(hot_graph_entry_size));
+    lib_assert(file.good(), "failed to write compact hot graph entry");
     progress.increment();
   }
 
   for (u32 shard = 0; shard < config.num_memory_nodes; ++shard) {
     shard_files[shard].flush();
     lib_assert(shard_files[shard].good(), "failed to flush output shard file: " + shard_paths[shard].string());
-    if (config.use_rabitq) {
-      cache_files[shard].flush();
-      lib_assert(cache_files[shard].good(), "failed to flush RaBitQ cache sidecar");
-    }
     progress.increment();
+  }
+
+  // Initialize the runtime-maintained live route entries with the real base
+  // nodes nearest each physical shard's final compensated FP64 centroid. This
+  // second offline pass is O(N*dim), uses O(shards) memory and is
+  // dtype-independent; online maintenance later replaces entries from the
+  // authoritative live membership under the updated centroid.
+  const auto route_less = [](const RouteEntryCandidate& lhs,
+                             const RouteEntryCandidate& rhs) {
+    return vamana::routing::centroid_seed_rank_less(lhs.rank, rhs.rank);
+  };
+  for (size_t i = 0; i < n; ++i) {
+    const auto& placement = placements[i];
+    const u32 shard = placement.memory_node;
+    lib_assert(centroid_counts[shard] != 0,
+               "centroid seed selection encountered an empty shard");
+    long double squared_l2 = 0;
+    const f64 inverse_count =
+      1.0 / static_cast<f64>(centroid_counts[shard]);
+    for (u32 dimension = 0; dimension < dim; ++dimension) {
+      const long double component = static_cast<long double>(
+        vector_component_as_float(
+          dataset.raw_vector(i), dataset.dtype, dimension));
+      const long double centroid = static_cast<long double>(
+        centroid_sums[shard][dimension] * inverse_count);
+      const long double difference = component - centroid;
+      squared_l2 += difference * difference;
+    }
+    const RemotePtr pointer{shard, placement.offset};
+    const RouteEntryCandidate candidate{
+      .rank = {
+        .squared_l2 = squared_l2,
+        .pointer_raw = pointer.raw_address,
+      },
+      .entry = {.remote_node = pointer.raw_address},
+    };
+    auto& entries = route_entries[shard];
+    if (entries.size() < vamana::centroid_state::kMaxLiveEntries) {
+      entries.push_back(candidate);
+      std::sort(entries.begin(), entries.end(), route_less);
+    } else if (route_less(candidate, entries.back())) {
+      entries.back() = candidate;
+      std::sort(entries.begin(), entries.end(), route_less);
+    }
+  }
+
+  for (u32 shard = 0; shard < config.num_memory_nodes; ++shard) {
+    lib_assert(centroid_counts[shard] == shard_entry_counts[shard] &&
+                 !route_entries[shard].empty(),
+               "physical shard centroid state is incomplete");
+    vec<vamana::centroid_state::Entry> entries;
+    entries.reserve(route_entries[shard].size());
+    for (const RouteEntryCandidate& candidate : route_entries[shard]) {
+      entries.push_back(candidate.entry);
+    }
+    vamana::centroid_state::Header header;
+    header.build_fingerprint = build_fingerprint;
+    header.shard_fingerprint = shard_fingerprints[shard];
+    header.shard = shard;
+    header.shard_count = config.num_memory_nodes;
+    header.dim = dim;
+    header.max_degree = config.R;
+    header.entry_count = static_cast<u32>(entries.size());
+    header.vector_count = centroid_counts[shard];
+    header.node_base_offset = vamana::hot_graph::kNodeBaseOffset;
+    header.vector_dtype = static_cast<u32>(dataset.dtype);
+    header.vector_component_size = static_cast<u32>(
+      vector_dtype_component_size(dataset.dtype));
+    header.node_size = static_cast<u32>(node_size);
+    header.vector_offset = static_cast<u32>(VamanaNode::offset_vector());
+    header.vector_bytes = static_cast<u32>(dataset.vector_bytes);
+    header.slot_incarnation_offset = static_cast<u32>(
+      VamanaNode::offset_slot_incarnation());
+    header.hot_graph_version = vamana::hot_graph::kVersion3;
+    header.hot_graph_entry_size = hot_graph_entry_size;
+    header.hot_graph_pointer_bytes = vamana::hot_graph::kCompactPointerBytes;
+    header.hot_graph_shard_bits = hot_graph_shard_bits;
+    header.payload_bytes = vamana::centroid_state::payload_bytes(
+      dim, header.entry_count);
+    vec<byte_t> payload(static_cast<size_t>(header.payload_bytes));
+    std::memcpy(payload.data(), centroid_sums[shard].data(),
+                static_cast<size_t>(dim) * sizeof(f64));
+    std::memcpy(payload.data() + static_cast<size_t>(dim) * sizeof(f64),
+                entries.data(), entries.size() * sizeof(entries.front()));
+    header.payload_checksum = vamana::centroid_state::checksum(payload);
+    header.header_checksum =
+      vamana::centroid_state::compute_header_checksum(header);
+
+    const filepath_t centroid_path = index_path::centroid_state_file(
+      output_prefix, shard + 1, config.num_memory_nodes);
+    std::ofstream output(
+      centroid_path, std::ios::binary | std::ios::out | std::ios::trunc);
+    lib_assert(output.good(),
+               "failed to create centroid sidecar: " +
+                 centroid_path.string());
+    output.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    output.write(reinterpret_cast<const char*>(payload.data()),
+                 static_cast<std::streamsize>(payload.size()));
+    lib_assert(output.good(),
+               "failed to write centroid sidecar: " +
+                 centroid_path.string());
   }
 
   nlohmann::json metadata{
     {"data_file", dataset.source_file.string()},
     {"output_prefix", output_prefix.string()},
-    {"distance", config.ip_distance ? "ip" : "l2"},
+    {"distance", "l2"},
     {"num_vectors", n},
     {"dim", dim},
     {"R", config.R},
@@ -513,15 +616,14 @@ void write_vamana_shards(const VamanaGraph& graph,
     {"beam_width_construction", config.beam_width},
     {"alpha", config.alpha},
     {"num_memory_nodes", config.num_memory_nodes},
-    {"medoid", {{"memory_node", medoid_ptr.memory_node()}, {"offset", medoid_ptr.byte_offset()}}},
     {"node_size", node_size},
     {"node_layout", VamanaNode::layout_name()},
     {"storage_format", VamanaNode::storage_format_name()},
-    {"schema_version", 13},
+    {"schema_version", 15},
     {"graph_hot_bytes", VamanaNode::graph_hot_bytes()},
     {"vector_offset", VamanaNode::offset_vector()},
-    {"neighbors_offset", VamanaNode::offset_neighbors()},
-    {"rabitq_offset", config.use_rabitq ? VamanaNode::offset_rabitq_code() : 0},
+    {"slot_incarnation_offset", VamanaNode::offset_slot_incarnation()},
+    {"remote_ptr_format", "tagged_inc24_shard6_off34x16_v1"},
     {"vector_storage_bytes", VamanaNode::vector_storage_bytes()},
     {"offline_builder_version", 2},
     {"random_graph_seed_scope", "per_node"},
@@ -533,71 +635,109 @@ void write_vamana_shards(const VamanaGraph& graph,
     {"partition_imbalance", config.partition_imbalance},
     {"partition_edge_cut", placement_result.stats.edge_cut},
     {"partition_cross_shard_ratio", placement_result.cross_shard_ratio},
+    {"navigation_quantizer", ""},
+    {"navigation_code_bytes", 0},
+    {"pq_subquantizers", 0},
+    {"pq_bits", 0},
+    {"navigation_model_checksum", 0},
+    {"navigation_format", ""},
+    {"navigation_code_remote_offsets", vec<u64>{}},
+    {"navigation_code_region_bytes", vec<u64>{}},
+    {"navigation_code_materialization", ""},
+    {"navigation_graph_source", "storage_compact_graph"},
+    {"navigation_execution", ""},
   };
-  if (use_hot_graph) {
-    metadata["hot_graph_neighbor_read_bytes"] = hot_graph_entry_size;
-    metadata["hot_graph_neighbor_update_bytes"] = hot_graph_entry_size;
-    metadata["hot_graph_entry_size"] = hot_graph_entry_size;
-    metadata["hot_graph_pointer_bytes"] = vamana::hot_graph::kCompactPointerBytes;
-    metadata["hot_graph_shard_bits"] = hot_graph_shard_bits;
-    metadata["hot_graph_offsets"] = hot_graph_entry_offsets;
-    metadata["hot_graph_header_offsets"] = hot_graph_header_offsets;
-    metadata["hot_graph_entry_counts"] = shard_entry_counts;
-    metadata["hot_graph_dynamic_base_offsets"] = hot_graph_dynamic_base_offsets;
-    metadata["hot_graph_dynamic_record_bytes"] = VamanaNode::allocation_size();
-    metadata["hot_graph_dynamic_hot_offset"] = VamanaNode::total_size();
-    metadata["allocation_size"] = VamanaNode::allocation_size();
+  metadata["hot_graph_neighbor_read_bytes"] = hot_graph_entry_size;
+  metadata["hot_graph_neighbor_update_bytes"] = hot_graph_entry_size;
+  metadata["hot_graph_entry_size"] = hot_graph_entry_size;
+  metadata["hot_graph_pointer_bytes"] = vamana::hot_graph::kCompactPointerBytes;
+  metadata["hot_graph_shard_bits"] = hot_graph_shard_bits;
+  metadata["hot_graph_offsets"] = hot_graph_entry_offsets;
+  metadata["hot_graph_header_offsets"] = hot_graph_header_offsets;
+  metadata["hot_graph_entry_counts"] = shard_entry_counts;
+  metadata["hot_graph_dynamic_base_offsets"] = hot_graph_dynamic_base_offsets;
+  metadata["hot_graph_dynamic_record_bytes"] = VamanaNode::allocation_size();
+  metadata["hot_graph_dynamic_hot_offset"] = VamanaNode::total_size();
+  metadata["allocation_size"] = VamanaNode::allocation_size();
+  metadata["idmap_format"] = "owner_sharded_v2_bound";
+  metadata["centroid_state_format"] = "physical_shard_centroid_v2_bound";
+  metadata["index_build_fingerprint"] = build_fingerprint;
+  metadata["shard_build_fingerprints"] = shard_fingerprints;
+  metadata["centroid_state_header_bytes"] =
+    sizeof(vamana::centroid_state::Header);
+  // Stream one pass over the placement table directly into per-owner
+  // temporary files. Keeping all idmap entries in vectors would add 24 bytes
+  // per base vector (about 24 GB for SIFT1B) to peak builder memory.
+  vec<filepath_t> idmap_paths(config.num_memory_nodes);
+  vec<filepath_t> idmap_temporary_paths(config.num_memory_nodes);
+  vec<std::ofstream> idmap_outputs(config.num_memory_nodes);
+  vec<u64> idmap_entry_counts(config.num_memory_nodes, 0);
+  vec<u64> idmap_payload_checksums(
+    config.num_memory_nodes, vamana::idmap::checksum_initial());
+  for (u32 owner = 0; owner < config.num_memory_nodes; ++owner) {
+    idmap_paths[owner] = index_path::owner_idmap_file(
+      output_prefix, owner + 1, config.num_memory_nodes);
+    idmap_temporary_paths[owner] =
+      filepath_t{idmap_paths[owner].string() + ".bound-v2.tmp"};
+    std::error_code error;
+    (void)std::filesystem::remove(idmap_temporary_paths[owner], error);
+    idmap_outputs[owner].open(
+      idmap_temporary_paths[owner],
+      std::ios::binary | std::ios::out | std::ios::trunc);
+    lib_assert(idmap_outputs[owner].good(),
+               "failed to create temporary owner idmap: " +
+                 idmap_temporary_paths[owner].string());
+    const vamana::idmap::Header placeholder;
+    idmap_outputs[owner].write(
+      reinterpret_cast<const char*>(&placeholder), sizeof(placeholder));
   }
-  metadata["idmap_format"] = "owner_sharded_v1";
-  metadata["anchor_format"] = config.anchor_count_per_shard == 0 ? "" : "owner_anchor_v1";
-  metadata["anchor_count_per_shard"] = config.anchor_count_per_shard;
-  if (config.use_rabitq) {
-    metadata["rabitq_centroid"] = VamanaNode::rabitq_centroid;
-    metadata["rabitq_code_bits"] = VamanaNode::rabitq_code_bits();
-    metadata["rabitq_entry_size"] = VamanaNode::rabitq_entry_size();
-    metadata["rabitq_entry_storage_size"] = VamanaNode::rabitq_entry_storage_size();
-    metadata["rabitq_cache_bits"] = rabitq_cache_code_bits;
-    metadata["rabitq_cache_entry_size"] = rabitq_cache_entry_bytes;
-    metadata["rabitq_cache_norm_min"] = cache_quantization.norm_min;
-    metadata["rabitq_cache_norm_max"] = cache_quantization.norm_max;
-    metadata["rabitq_cache_error_min"] = cache_quantization.error_min;
-    metadata["rabitq_cache_error_max"] = cache_quantization.error_max;
+  for (size_t index = 0; index < n; ++index) {
+    const node_t id = dataset.id(index);
+    const u32 owner = static_cast<u32>(id % config.num_memory_nodes);
+    const vamana::idmap::Entry entry{
+      id,
+      RemotePtr{placements[index].memory_node,
+                placements[index].offset}.raw_address,
+      0,
+      0,
+      0,
+    };
+    idmap_outputs[owner].write(
+      reinterpret_cast<const char*>(&entry), sizeof(entry));
+    ++idmap_entry_counts[owner];
+    idmap_payload_checksums[owner] = vamana::idmap::checksum_update(
+      idmap_payload_checksums[owner], &entry, sizeof(entry));
   }
-
-  const filepath_t metadata_file = filepath_t(output_prefix.string() + ".meta.json");
+  for (u32 owner = 0; owner < config.num_memory_nodes; ++owner) {
+    lib_assert(idmap_outputs[owner].good(),
+               "failed while streaming owner idmap: " +
+                 idmap_temporary_paths[owner].string());
+    vamana::idmap::Header header;
+    header.build_fingerprint = build_fingerprint;
+    header.owner_shard_fingerprint = shard_fingerprints[owner];
+    header.owner_shard = owner;
+    header.shard_count = config.num_memory_nodes;
+    header.node_base_offset = vamana::hot_graph::kNodeBaseOffset;
+    header.node_size = static_cast<u32>(node_size);
+    header.id_offset = static_cast<u32>(VamanaNode::offset_id());
+    header.generation_offset =
+      static_cast<u32>(VamanaNode::offset_generation());
+    header.slot_incarnation_offset =
+      static_cast<u32>(VamanaNode::offset_slot_incarnation());
+    finalize_owner_idmap_atomic(
+      idmap_paths[owner], idmap_temporary_paths[owner],
+      idmap_outputs[owner], header, idmap_entry_counts[owner],
+      idmap_payload_checksums[owner]);
+  }
+  // Publish metadata only after every owner directory is complete. A crash
+  // can therefore leave harmless temporary sidecars, never metadata that
+  // advertises a partially-written authority directory set.
+  const filepath_t metadata_file =
+    filepath_t(output_prefix.string() + ".meta.json");
   std::ofstream metadata_output(metadata_file);
   metadata_output << std::setw(2) << metadata << std::endl;
-
-  {
-    vec<vec<vamana::idmap::Entry>> owner_entries(config.num_memory_nodes);
-    for (size_t i = 0; i < n; ++i) {
-      const u32 owner = config.num_memory_nodes == 0
-        ? 0
-        : static_cast<u32>(dataset.id(i) % config.num_memory_nodes);
-      owner_entries[owner].push_back(vamana::idmap::Entry{
-        dataset.id(i),
-        RemotePtr{placements[i].memory_node, placements[i].offset}.raw_address,
-        0,
-        0});
-    }
-    for (u32 owner = 0; owner < config.num_memory_nodes; ++owner) {
-      const filepath_t idmap_path = index_path::owner_idmap_file(
-        output_prefix, owner + 1, config.num_memory_nodes);
-      std::ofstream idmap_output(idmap_path, std::ios::binary | std::ios::out | std::ios::trunc);
-      lib_assert(idmap_output.good(), "failed to create idmap sidecar: " + idmap_path.string());
-      vamana::idmap::Header header;
-      header.owner_shard = owner;
-      header.shard_count = config.num_memory_nodes;
-      header.entry_count = owner_entries[owner].size();
-      idmap_output.write(reinterpret_cast<const char*>(&header), sizeof(header));
-      if (!owner_entries[owner].empty()) {
-        idmap_output.write(reinterpret_cast<const char*>(owner_entries[owner].data()),
-                           static_cast<std::streamsize>(
-                             owner_entries[owner].size() * sizeof(vamana::idmap::Entry)));
-      }
-      lib_assert(idmap_output.good(), "failed to write idmap sidecar: " + idmap_path.string());
-    }
-  }
+  lib_assert(metadata_output.good(),
+             "failed to write index metadata: " + metadata_file.string());
   progress.finish();
 }
 

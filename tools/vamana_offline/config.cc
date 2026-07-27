@@ -7,7 +7,8 @@
 #include <boost/program_options.hpp>
 #include <library/utils.hh>
 
-#include "vamana/storage_format.hh"
+#include "common/constants.hh"
+#include "remote_pointer.hh"
 
 namespace po = boost::program_options;
 
@@ -49,21 +50,13 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
      "METIS ubvec balance tolerance, e.g. 1.03 allows about 3% imbalance.")
     ("skip-sanity-check", po::bool_switch(&config.skip_sanity_check),
      "Skip the expensive in-memory brute-force recall sanity check after graph construction.")
-    ("use-rabitq", po::bool_switch(&config.use_rabitq),
-     "Store dimension-scaled RaBitQ search entries per node for GPU approximate search.")
-    ("storage-format", po::value<str>(&config.storage_format)->default_value(config.storage_format),
-     "Storage format to write: vamana_aos_v1 or vamana_compact_v1.")
     ("seed", po::value<i32>(&config.seed)->default_value(config.seed), "PRNG seed.")
     ("max-vectors", po::value<size_t>(&config.max_vectors)->default_value(config.max_vectors),
      "Maximum number of vectors to read.")
-    ("ip-dist", po::bool_switch(&config.ip_distance), "Use inner-product distance instead of L2.")
     ("query-path", po::value<filepath_t>(&config.query_path),
      "Path to query file (.fbin) for post-build recall test.")
     ("groundtruth-path", po::value<filepath_t>(&config.groundtruth_path),
-     "Path to ground truth file (.bin) for post-build recall test.")
-    ("anchor-count-per-shard",
-     po::value<u32>(&config.anchor_count_per_shard)->default_value(config.anchor_count_per_shard),
-     "Representative anchors written per shard. 0 disables the anchor sidecar.");
+     "Path to ground truth file (.bin) for post-build recall test.");
 
   po::variables_map vm;
   po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -77,7 +70,12 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
 
   if (config.data_path.empty()) lib_failure("--data-path is required");
   if (config.num_memory_nodes == 0) lib_failure("--memory-nodes must be > 0");
+  if (config.num_memory_nodes > RemotePtr::MEMORY_NODE_MASK + 1)
+    lib_failure("--memory-nodes exceeds the 64-shard tagged pointer limit");
   if (config.R == 0) lib_failure("--R must be > 0");
+  if (config.R > kMaxSupportedGraphDegree)
+    lib_failure("--R exceeds the system-wide degree limit of " +
+                std::to_string(kMaxSupportedGraphDegree));
   if (config.vector_data_type != "auto") {
     try {
       (void)parse_vector_dtype(config.vector_data_type);
@@ -93,10 +91,6 @@ VamanaBuildConfig parse_configuration(int argc, char** argv) {
     lib_failure("--partition-max-degree must be > 0");
   if (config.partition_imbalance < 1.0)
     lib_failure("--partition-imbalance must be >= 1.0");
-  if (config.use_rabitq && config.ip_distance)
-    lib_failure("--use-rabitq currently supports L2 distance only");
-  if (!vamana::parse_storage_format(config.storage_format))
-    lib_failure("--storage-format must be vamana_aos_v1 or vamana_compact_v1");
   return config;
 }
 

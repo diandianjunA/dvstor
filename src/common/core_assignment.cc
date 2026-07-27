@@ -52,6 +52,9 @@ void CoreAssignment<P>::print_hardware_info() const {
   std::cerr << "num_cores: " << num_cores_ << std::endl;
   std::cerr << "physical cores per socket: " << physical_cores_per_socket_ << std::endl;
   std::cerr << "hyperthreading " << (hyperthreading_enabled() ? "enabled" : "disabled") << std::endl;
+  std::cerr << "local process CPU partition: rank " << local_process_rank_
+            << "/" << local_process_count_
+            << " logical_cpus=" << cores_.size() << std::endl;
 }
 
 template void CoreAssignment<strict>::print_hardware_info() const;
