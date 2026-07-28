@@ -8,31 +8,23 @@ namespace gpu_search {
 
 using namespace persistent_kernel_detail;
 
-PersistentKernelOccupancy inspect_persistent_search_kernel(
-    u32 threads, bool enable_adjacency_oracle) {
+PersistentKernelOccupancy inspect_persistent_search_kernel(u32 threads) {
   if (threads != 128 && threads != 256) {
     throw std::invalid_argument(
       "persistent search kernel supports only 128 or 256 threads");
   }
   cudaFuncAttributes attributes{};
-  cudaError_t status = enable_adjacency_oracle
-    ? cudaFuncGetAttributes(
-        &attributes, persistent_search_kernel<true>)
-    : cudaFuncGetAttributes(
-        &attributes, persistent_search_kernel<false>);
+  cudaError_t status =
+    cudaFuncGetAttributes(&attributes, persistent_search_kernel);
   if (status != cudaSuccess) {
     throw std::runtime_error(
       std::string("cudaFuncGetAttributes(persistent search): ") +
       cudaGetErrorString(status));
   }
   int active_blocks = 0;
-  status = enable_adjacency_oracle
-    ? cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &active_blocks, persistent_search_kernel<true>,
-        static_cast<int>(threads), 0)
-    : cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &active_blocks, persistent_search_kernel<false>,
-        static_cast<int>(threads), 0);
+  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &active_blocks, persistent_search_kernel,
+    static_cast<int>(threads), 0);
   if (status != cudaSuccess) {
     throw std::runtime_error(
       std::string("cudaOccupancyMaxActiveBlocksPerMultiprocessor(persistent search): ") +
@@ -54,12 +46,7 @@ PersistentKernelOccupancy inspect_persistent_search_kernel(
 
 void launch_persistent_search(cudaStream_t stream, const PersistentKernelParams& params,
                               u32 blocks, u32 threads) {
-  if (params.query_rdma_trace_mode ==
-      static_cast<u32>(QueryRdmaTraceMode::off)) {
-    persistent_search_kernel<false><<<blocks, threads, 0, stream>>>(params);
-  } else {
-    persistent_search_kernel<true><<<blocks, threads, 0, stream>>>(params);
-  }
+  persistent_search_kernel<<<blocks, threads, 0, stream>>>(params);
 }
 
 void launch_direct_read_owners(cudaStream_t stream,

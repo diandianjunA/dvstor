@@ -128,8 +128,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"gpu_graph_extent_quantum_edges",
       gpu_search::format::kGraphExtentQuantum},
     {"gpu_graph_extent_sidecar_format", "global_ordinal_u8_gextent8_v1"},
-    {"gpu_query_expansion_policy",
-      service.config().gpu_query_expansion_policy},
     {"gpu_query_beam_merge_policy",
       service.config().gpu_query_beam_merge_policy},
   };

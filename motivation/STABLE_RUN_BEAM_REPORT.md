@@ -11,7 +11,9 @@ publication.  The new path is opt-in:
 --gpu-query-beam-merge-policy=legacy|stable-run
 ```
 
-The default remains `legacy`.
+The bare binary keeps `legacy` as its compatibility default, and the baseline
+profile uses it. The default production experiment profile selects
+`stable-run`.
 
 ## Observation and actual bottleneck
 
@@ -84,8 +86,9 @@ original old-handle metadata in the existing `2*K` workspace.
 
 The first two-run prototype was faster per merge but raised the linked
 persistent kernel to 244 registers/thread, reducing occupancy from three to
-two blocks/SM.  Separating the radix helper and using 512-item compact runs
-reduced the final kernel to 140 registers/thread and restored three blocks/SM.
+two blocks/SM. Separating the radix helper and using 512-item compact runs
+restored three blocks/SM. The current cleaned production kernel uses 142
+registers/thread.
 
 ## Correctness
 
@@ -105,18 +108,17 @@ The GPU test matrix covers:
 
 Both policies are compared against the same CPU stable-merge reference for
 handles, numeric distance values (with the existing signed-zero equivalence),
-expanded flags, valid count, and Feedback Horizon metadata.  The production
-visited path makes old/new duplicate handles impossible, but the direct merge
-API retains the legacy duplicate-old behavior.
+expanded flags, and valid count. The production visited path makes old/new
+duplicate handles impossible, but the direct merge API retains the legacy
+duplicate-old behavior.
 
 Validation:
 
 ```text
 cmake --build build -j8                                      PASS
 ctest --test-dir build --output-on-failure -j8               PASS
-gpu_feedback_horizon_test on GPU 1                          PASS
+gpu_beam_merge_equivalence_test on GPU 1                    PASS
 gpu_compact_beam_merge_test on GPU 1                        PASS
-gpu_expansion_pressure_test on GPU 1                        PASS
 gpu_stable_run_merge_microbench on GPU 1                    PASS
 ```
 
@@ -128,8 +130,8 @@ round-trip is introduced.
 Final linked persistent kernel:
 
 ```text
-registers/thread:                   140
-static shared memory:               41,978 bytes
+registers/thread:                   142
+static shared memory:               41,746 bytes
 entry-kernel spill stores/loads:    0 / 0 bytes
 selected CTA:                       128 threads
 active blocks/SM:                   3
@@ -138,15 +140,10 @@ query CTAs:                         256
 
 `-Xptxas=-v` also exposes call-local traffic which `cuobjdump`'s entry-level
 `LOCAL=0` summary does not: each stable radix helper reports 60-byte spill
-stores and loads, and the stable-run coordinator reports 168-byte spill stores
+stores and loads, and the stable-run coordinator reports 156-byte spill stores
 and loads.  This is a real residual cost, not hidden in the report.  The
 occupancy-restored implementation still wins end to end, but eliminating that
 call-local traffic is a valid follow-up optimization.
-
-The initial two-1024-run prototype used 244 registers/thread and only two
-blocks/SM.  That intermediate result is retained under
-`motivation/results/beam_merge_diagnostics/pre_occupancy_fix` as an
-implementation diagnostic, but it is not the final performance result.
 
 ## GPU merge microbenchmark
 
@@ -274,49 +271,15 @@ declared tolerances.  `BEAM_MERGE_RESULT_ROOT=<path>` can be used to isolate
 longer repetitions or diagnostic runs without mixing them into the primary
 result set.
 
-## Research interpretation and next exact mechanism
+## Research interpretation and scope
 
 Stable-run is a substantial system optimization, but its individual
 primitives (sorted-run reuse, stable radix delta sorting, local top-K
 truncation, and co-rank merge) are established GPU techniques.  The stronger
 research contribution is the observation that authoritative Beam
-reconstruction, rather than RDMA, becomes the dominant barrier in this
-GPU-centric remote traversal, plus an exact continuation mechanism which
-turns that barrier into useful I/O overlap.
-
-The proposed next mechanism is **Certified Frontier-First Merge
-Continuation**:
-
-1. Continue the same stable merge only until it emits the next `C`
-   authoritative, unexpanded parents.
-2. Prove this ordered prefix equals baseline post-merge selection.
-3. Issue graph reads only for that exact prefix.
-4. Save the bounded merge cursor/diagonal and continue materializing the
-   reservoir while owner CTAs advance RDMA.
-5. Preserve the baseline expansion-commit point and consume only residual
-   graph wait next round.
-
-This is prediction-free: promotion is 100%, waste is zero, graph reads/bytes
-do not increase, and expansion order does not change.  It is well targeted by
-the final breakdown: stable materialization is about 810 us/query
-(approximately 55 us/round), while graph wait is about 71 us/round.
-
-An optional supporting optimization is incumbent-certified candidate
-compaction:
-
-- when the old Beam is full, a new candidate with distance greater than or
-  equal to the old Beam's worst distance cannot enter the stable global top
-  `K`;
-- compact only candidates strictly better than that authoritative threshold;
-- choose the smallest compile-time radix size class which contains the
-  competitive count;
-- retain the same stable co-rank materialization.
-
-This remains prediction-free and cannot add graph I/O.  It should first be
-gated by a competitive-count histogram; if most rounds do not shrink below a
-smaller radix class, it should not be implemented.  Since sort is only about
-215 us/query in the final path, compaction alone has a lower end-to-end ceiling
-than frontier-first continuation.
+reconstruction, rather than RDMA, was the dominant barrier in the original
+GPU-centric remote traversal.  Stable-run removes that measured cost without
+changing the authoritative Beam, expansion order, graph reads, or Recall.
 
 Before claiming hardware- or dataset-independent performance, the mechanism
 still needs multiple AB/BA repetitions, other graph degrees and Beam widths,

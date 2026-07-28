@@ -47,13 +47,13 @@ SIFT100M 的 payload 为 100,000,000 B；它不包含任何边、handle 或向�
 
 ## GPU 数据路径
 
-`fixed` 是默认策略：
+裸二进制在未加载实验 profile 时保留兼容默认 `fixed`；baseline profile 也使用它：
 
 ```text
 --gpu-query-graph-read-policy=fixed
 ```
 
-启用：
+默认生产 profile 启用：
 
 ```text
 --gpu-query-graph-read-policy=live-extent

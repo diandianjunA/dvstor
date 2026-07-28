@@ -62,14 +62,11 @@ std::vector<T> download(const DeviceBuffer<T>& source) {
   return result;
 }
 
-__global__ void feedback_merge_kernel(
+__global__ void beam_merge_kernel(
     u64* candidate_handles, f32* candidate_distances, u32 candidate_count,
     u64* beam_handles, u32* beam_ids, f32* beam_distances,
     u8* beam_expanded, u32 initial_beam_count, u32 beam_capacity,
-    u64* scratch_handles, u32* scratch_ids, f32* scratch_distances,
-    u8* scratch_expanded, u64* compact_handles,
-    u32* compact_flags, f32* compact_distances,
-    FeedbackHorizonResult* feedback, u32 feedback_cap,
+    u64* scratch_handles, u32* scratch_flags, f32* scratch_distances,
     BeamMergePolicy policy, BeamMergeCycleBreakdown* cycle_breakdown,
     u32* output_count) {
   __shared__ CandidateWorkspace workspace;
@@ -79,24 +76,19 @@ __global__ void feedback_merge_kernel(
   merge_approximate_into_beam(
     candidate_handles, candidate_distances, candidate_count,
     beam_handles, beam_ids, beam_distances, beam_expanded,
-    beam_count, beam_capacity, scratch_handles, scratch_ids,
-    scratch_distances, scratch_expanded, compact_handles,
-    compact_flags, compact_distances, workspace, feedback_cap, feedback,
-    policy, cycle_breakdown);
+    beam_count, beam_capacity, scratch_handles, scratch_flags,
+    scratch_distances, workspace, policy, cycle_breakdown);
   if (threadIdx.x == 0) *output_count = beam_count;
 }
 
 struct HostItem {
   u64 handle;
   f32 distance;
-  u32 input;
-  bool matched_old;
   u8 expanded;
 };
 
 struct HostReference {
   std::vector<HostItem> beam;
-  FeedbackHorizonResult feedback;
 };
 
 HostReference reference_merge(
@@ -105,12 +97,11 @@ HostReference reference_merge(
     const std::vector<u8>& old_expanded,
     const std::vector<u64>& candidate_handles,
     const std::vector<f32>& candidate_distances,
-    u32 beam_capacity, u32 feedback_cap) {
+    u32 beam_capacity) {
   std::vector<HostItem> items;
   for (u32 index = 0; index < old_handles.size(); ++index) {
     items.push_back({
-      old_handles[index], old_distances[index], index, true,
-      old_expanded[index]});
+      old_handles[index], old_distances[index], old_expanded[index]});
   }
   for (u32 index = 0; index < candidate_handles.size(); ++index) {
     u64 handle = candidate_handles[index];
@@ -120,56 +111,28 @@ HostReference reference_merge(
       handle = gpu_search::kInvalidDeviceHandle;
       distance = FLT_MAX;
     }
-    bool matched_old = false;
     u8 expanded = 0;
     for (u32 prior = 0; prior < old_handles.size(); ++prior) {
       if (old_handles[prior] == handle) {
-        matched_old = true;
         expanded = old_expanded[prior];
         break;
       }
     }
-    items.push_back({
-      handle, distance,
-      static_cast<u32>(old_handles.size() + index),
-      matched_old, expanded});
+    items.push_back({handle, distance, expanded});
   }
   std::stable_sort(items.begin(), items.end(),
     [](const HostItem& lhs, const HostItem& rhs) {
       return lhs.distance < rhs.distance;
     });
   HostReference result;
-  u32 earliest_new = UINT32_MAX;
-  u32 new_count = 0;
   for (const HostItem& item : items) {
     if (result.beam.size() == beam_capacity) break;
     if (item.handle == gpu_search::kInvalidDeviceHandle ||
         !std::isfinite(item.distance) || item.distance == FLT_MAX) {
       break;
     }
-    const u32 output = static_cast<u32>(result.beam.size());
     result.beam.push_back(item);
-    if (!item.matched_old) {
-      earliest_new = std::min(earliest_new, output);
-      ++new_count;
-    }
   }
-  u32 unexpanded_before = 0;
-  u32 unexpanded_total = 0;
-  for (u32 index = 0; index < result.beam.size(); ++index) {
-    if (result.beam[index].expanded == 0) {
-      ++unexpanded_total;
-      if (index < earliest_new) ++unexpanded_before;
-    }
-  }
-  result.feedback = {
-    .horizon = earliest_new < result.beam.size()
-      ? std::min(unexpanded_before + 1u, unexpanded_total)
-      : std::min(unexpanded_total, feedback_cap),
-    .earliest_new_output = earliest_new,
-    .old_unexpanded_before_new = unexpanded_before,
-    .new_candidates_in_beam = new_count,
-  };
   return result;
 }
 
@@ -179,11 +142,10 @@ void run_case(
     std::vector<u8> old_expanded,
     std::vector<u64> candidate_handles,
     std::vector<f32> candidate_distances) {
-  constexpr u32 feedback_cap = 16;
   const u32 old_count = static_cast<u32>(old_handles.size());
   const HostReference expected = reference_merge(
     old_handles, old_distances, old_expanded,
-    candidate_handles, candidate_distances, beam_capacity, feedback_cap);
+    candidate_handles, candidate_distances, beam_capacity);
   std::vector<u32> old_ids(beam_capacity, 7);
   old_handles.resize(beam_capacity, gpu_search::kInvalidDeviceHandle);
   old_distances.resize(beam_capacity, FLT_MAX);
@@ -195,14 +157,9 @@ void run_case(
   DeviceBuffer<u32> d_ids(beam_capacity);
   DeviceBuffer<f32> d_distances(beam_capacity);
   DeviceBuffer<u8> d_expanded(beam_capacity);
-  DeviceBuffer<u64> d_scratch_handles(beam_capacity * 2);
-  DeviceBuffer<u32> d_scratch_ids(beam_capacity * 2);
-  DeviceBuffer<f32> d_scratch_distances(beam_capacity * 2);
-  DeviceBuffer<u8> d_scratch_expanded(beam_capacity * 2);
   DeviceBuffer<u64> d_compact_handles(beam_capacity * 2);
   DeviceBuffer<u32> d_compact_flags(beam_capacity * 2);
   DeviceBuffer<f32> d_compact_distances(beam_capacity * 2);
-  DeviceBuffer<FeedbackHorizonResult> d_feedback(1);
   DeviceBuffer<BeamMergeCycleBreakdown> d_cycle_breakdown(1);
   DeviceBuffer<u32> d_count(1);
   upload(d_candidates, candidate_handles);
@@ -219,28 +176,25 @@ void run_case(
     check_cuda(cudaMemset(d_cycle_breakdown.get(), 0,
                           sizeof(BeamMergeCycleBreakdown)),
                "cudaMemset cycle breakdown");
-    feedback_merge_kernel<<<1, threads>>>(
+    beam_merge_kernel<<<1, threads>>>(
       d_candidates.get(), d_candidate_distances.get(),
       static_cast<u32>(candidate_handles.size()), d_beam.get(), d_ids.get(),
       d_distances.get(), d_expanded.get(),
       old_count, beam_capacity,
-      d_scratch_handles.get(), d_scratch_ids.get(),
-      d_scratch_distances.get(), d_scratch_expanded.get(),
       d_compact_handles.get(), d_compact_flags.get(),
-      d_compact_distances.get(), d_feedback.get(), feedback_cap, policy,
+      d_compact_distances.get(), policy,
       d_cycle_breakdown.get(), d_count.get());
-    check_cuda(cudaGetLastError(), "feedback_merge_kernel launch");
-    check_cuda(cudaDeviceSynchronize(), "feedback_merge_kernel");
+    check_cuda(cudaGetLastError(), "beam_merge_kernel launch");
+    check_cuda(cudaDeviceSynchronize(), "beam_merge_kernel");
     const auto output_count = download(d_count);
     const auto output_handles = download(d_beam);
     const auto output_distances = download(d_distances);
     const auto output_expanded = download(d_expanded);
     const auto output_ids = download(d_ids);
-    const auto output_feedback = download(d_feedback);
     const auto cycle_breakdown = download(d_cycle_breakdown);
     if (output_count[0] != expected.beam.size()) {
       throw std::runtime_error(
-        label + ": feedback merge valid count mismatch: expected " +
+        label + ": Beam merge valid count mismatch: expected " +
         std::to_string(expected.beam.size()) + ", got " +
         std::to_string(output_count[0]));
     }
@@ -250,20 +204,9 @@ void run_case(
           output_expanded[index] != expected.beam[index].expanded ||
           output_ids[index] != UINT32_MAX) {
         throw std::runtime_error(
-          label + ": feedback merge changed Beam semantics at output " +
+          label + ": Beam merge changed semantics at output " +
           std::to_string(index));
       }
-    }
-    const FeedbackHorizonResult& actual = output_feedback[0];
-    if (actual.horizon != expected.feedback.horizon ||
-        actual.earliest_new_output !=
-          expected.feedback.earliest_new_output ||
-        actual.old_unexpanded_before_new !=
-          expected.feedback.old_unexpanded_before_new ||
-        actual.new_candidates_in_beam !=
-          expected.feedback.new_candidates_in_beam) {
-      throw std::runtime_error(
-        label + ": feedback horizon metadata mismatch");
     }
     if (policy == BeamMergePolicy::stable_run &&
         (cycle_breakdown[0].sort == 0 ||

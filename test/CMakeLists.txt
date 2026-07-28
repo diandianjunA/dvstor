@@ -224,16 +224,16 @@ if (TARGET dvstor_gpu_kernels)
         TIMEOUT 15
         SKIP_REGULAR_EXPRESSION "^SKIP:")
 
-    add_executable(gpu_feedback_horizon_test
-        gpu_feedback_horizon_test.cu)
-    dvstor_target_common_includes(gpu_feedback_horizon_test)
-    target_link_libraries(gpu_feedback_horizon_test PRIVATE CUDA::cudart)
-    target_compile_options(gpu_feedback_horizon_test PRIVATE
+    add_executable(gpu_beam_merge_equivalence_test
+        gpu_beam_merge_equivalence_test.cu)
+    dvstor_target_common_includes(gpu_beam_merge_equivalence_test)
+    target_link_libraries(gpu_beam_merge_equivalence_test PRIVATE CUDA::cudart)
+    target_compile_options(gpu_beam_merge_equivalence_test PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
-    add_test(NAME gpu_feedback_horizon_test
-        COMMAND gpu_feedback_horizon_test)
-    set_tests_properties(gpu_feedback_horizon_test PROPERTIES
+    add_test(NAME gpu_beam_merge_equivalence_test
+        COMMAND gpu_beam_merge_equivalence_test)
+    set_tests_properties(gpu_beam_merge_equivalence_test PROPERTIES
         TIMEOUT 15
         SKIP_REGULAR_EXPRESSION "^SKIP:")
 
@@ -248,19 +248,6 @@ if (TARGET dvstor_gpu_kernels)
         COMMAND gpu_stable_run_merge_microbench)
     set_tests_properties(gpu_stable_run_merge_microbench PROPERTIES
         TIMEOUT 30
-        SKIP_REGULAR_EXPRESSION "^SKIP:")
-
-    add_executable(gpu_expansion_pressure_test
-        gpu_expansion_pressure_test.cu)
-    dvstor_target_common_includes(gpu_expansion_pressure_test)
-    target_link_libraries(gpu_expansion_pressure_test PRIVATE CUDA::cudart)
-    target_compile_options(gpu_expansion_pressure_test PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
-    add_test(NAME gpu_expansion_pressure_test
-        COMMAND gpu_expansion_pressure_test)
-    set_tests_properties(gpu_expansion_pressure_test PROPERTIES
-        TIMEOUT 15
         SKIP_REGULAR_EXPRESSION "^SKIP:")
 
     add_executable(gpu_persistent_dispatch_test gpu_persistent_dispatch_test.cc)

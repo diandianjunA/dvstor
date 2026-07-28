@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze observable GPU graph-read completion barriers.
+"""Analyze observable GPU graph-read completion timing.
 
 The transport exposes an owner submission-group completion boundary for each
 query shard descriptor.  It does not expose per-parent, per-WQE, or
@@ -734,7 +734,7 @@ def write_markdown(summary, destination):
     overlap_over_gpu = aggregate.get(
         "query_strict_wait_overlap_upper_bound_over_gpu_time_p50")
     lines = [
-        "# GPU graph-read batch barrier motivation",
+        "# GPU graph-read RDMA trace analysis",
         "",
         f"- Trace: `{summary['input']}`",
         f"- Integrity suitable for a headline result: "
@@ -745,7 +745,7 @@ def write_markdown(summary, destination):
         f"{primary['multi_shard_round_attempts']} "
         f"({_format_pct(primary.get('multi_shard_round_fraction'))})",
         "",
-        "## Observable barrier evidence",
+        "## Observable completion distribution",
         "",
         "| Metric | Result |",
         "|---|---:|",
@@ -779,14 +779,13 @@ def write_markdown(summary, destination):
         json.dumps(integrity, indent=2),
         "```",
         "",
-        "## Decision rule",
+        "## Interpretation limits",
         "",
-        "Proceed to a shard-batch out-of-order execution prototype only if "
-        "the trace is clean, multi-shard coverage is substantial, strict "
-        "wait spread is material relative to query RDMA wait, and at least "
-        "one natural parent tile is commonly ready before the tail. Otherwise "
-        "this trace is negative or inconclusive evidence; it must not be "
-        "presented as proof of a parent-level barrier.",
+        "The trace is meaningful only when integrity checks pass and "
+        "multi-shard coverage is reported. Completion spread and weighted "
+        "ready area describe the current shard-batch interface; they are not "
+        "measured query-time savings and must not be presented as "
+        "parent-level or NIC-internal completion timing.",
         "",
     ]
     destination.write_text("\n".join(lines), encoding="utf-8")

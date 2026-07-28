@@ -8,7 +8,6 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
                                        u32 queue_count,
                                        u32 owner_block);
 
-template <bool EnableAdjacencyOracle>
 __global__ void persistent_search_kernel(PersistentKernelParams params) {
   const bool unified_dispatch = params.direct_owner_block_count != 0;
   if (unified_dispatch && blockIdx.x < params.direct_owner_block_count) {
@@ -295,7 +294,7 @@ __global__ void persistent_search_kernel(PersistentKernelParams params) {
       idle_cycles = 256u + ((blockIdx.x * 131u) & 1023u);
     }
     __syncthreads();
-    process_query<EnableAdjacencyOracle>(params, descriptor);
+    process_query(params, descriptor);
     __syncthreads();
   }
 }
@@ -383,14 +382,9 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
   DirectBatchDescriptor deferred{};
   u32 deferred_matching = 0;
   bool have_deferred = false;
-  bool idle_credit_announced = false;
   bool trace_first_batch = true;
   DirectOwnerProgress* owner_progress = params.direct_owner_progress == nullptr
     ? nullptr : params.direct_owner_progress + warp;
-  QpExpansionLeaseState* expansion_lease =
-    params.expansion_qp_leases == nullptr ||
-        warp >= params.expansion_qp_lease_count
-      ? nullptr : params.expansion_qp_leases + warp;
   u64 last_heartbeat_ns = 0;
 
   if (lane == 0 && params.direct_owner_phases != nullptr) {
@@ -484,9 +478,6 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
         }
         if (batch_count != 0 &&
             total_wqes + needed + completion_wqes > qp->sq_wqe_num) {
-          expansion_pressure_clear_credit(
-            params.expansion_pressure, false, true);
-          qp_expansion_lease_revoke(expansion_lease);
           deferred = descriptor;
           deferred_matching = matching;
           have_deferred = true;
@@ -506,42 +497,11 @@ __device__ void direct_read_owner_loop(PersistentKernelParams params,
     const u32 batch_count = shared_batch_counts[warp_in_block];
     if (batch_count == 0) {
       if (lane == 0) {
-        const unsigned long long pressure =
-          expansion_pressure_load(params.expansion_pressure);
-        const u32 active_queries = expansion_pressure_active(pressure);
-        bool progress_balanced = false;
-        if (!have_deferred && owner_progress != nullptr) {
-          const u64 announced = *reinterpret_cast<const volatile u64*>(
-            &owner_progress->announced);
-          const u64 completed = *reinterpret_cast<const volatile u64*>(
-            &owner_progress->completed);
-          progress_balanced = announced == completed;
-        }
-        if (expansion_owner_idle_episode_transition(
-              active_queries, true, progress_balanced, false,
-              idle_credit_announced)) {
-          if (params.expansion_pressure != nullptr) {
-            atomicAdd(
-              &params.expansion_pressure->idle_owner_episodes, 1ULL);
-          }
-          const u32 completion_wqes = need_dump ? 1u : 0u;
-          const u32 free_wqes = qp->sq_wqe_num > completion_wqes
-            ? qp->sq_wqe_num - completion_wqes : 0u;
-          (void)qp_expansion_lease_publish(
-            expansion_lease, min(free_wqes, params.efficient_batch_cap));
-        }
         device_ring_relax(idle_cycles);
       }
       __syncwarp();
       idle_cycles = min(idle_cycles * 2, 16384u);
       continue;
-    }
-    if (lane == 0) {
-      qp_expansion_lease_revoke(expansion_lease);
-      (void)expansion_owner_idle_episode_transition(
-        expansion_pressure_active(
-          expansion_pressure_load(params.expansion_pressure)),
-        false, false, true, idle_credit_announced);
     }
     idle_cycles = initial_idle_cycles;
 

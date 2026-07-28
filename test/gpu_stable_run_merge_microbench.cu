@@ -108,9 +108,8 @@ __global__ void stable_run_microbench_kernel(
       const_cast<f32*>(candidate_distances), candidate_count,
       beam_handles, beam_ids, beam_distances, beam_expanded,
       beam_count, beam_capacity,
-      nullptr, nullptr, nullptr, nullptr,
       scratch_handles, scratch_flags, scratch_distances,
-      workspace, 0, nullptr, policy,
+      workspace, policy,
       policy == BeamMergePolicy::stable_run ? &phases : nullptr);
 
     if (threadIdx.x == 0 && iteration >= kWarmupIterations) {

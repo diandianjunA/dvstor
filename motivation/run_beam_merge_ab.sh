@@ -17,7 +17,6 @@ run_one() {
     set -a
     source "$MOTIVATION_DIR/configs/common.env"
     source "$MOTIVATION_DIR/configs/beam_merge_${policy//-/_}.env"
-    GPU_QUERY_EXPANSION_POLICY=fixed
     GPU_GRAPH_PREFETCH_DEPTH="$PREFETCH_DEPTH"
     BENCHMARK_CLIENT_THREADS="$concurrency"
     REPORT_DIR="$run_dir"

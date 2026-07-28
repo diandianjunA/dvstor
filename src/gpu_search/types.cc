@@ -33,36 +33,6 @@ TelemetrySnapshot Telemetry::snapshot() const {
       gpu_beam_merge_sort_ns.load(std::memory_order_relaxed),
     .gpu_beam_merge_materialize_ns =
       gpu_beam_merge_materialize_ns.load(std::memory_order_relaxed),
-    .feedback_hunger_queries =
-      feedback_hunger_queries.load(std::memory_order_relaxed),
-    .expansion_sum_selected_parents =
-      expansion_sum_selected_parents.load(std::memory_order_relaxed),
-    .expansion_sum_feedback_horizon =
-      expansion_sum_feedback_horizon.load(std::memory_order_relaxed),
-    .expansion_sum_hardware_credit_tiles =
-      expansion_sum_hardware_credit_tiles.load(std::memory_order_relaxed),
-    .expansion_minimum_selected_batch =
-      expansion_minimum_selected_batch.load(std::memory_order_relaxed),
-    .expansion_maximum_selected_batch =
-      expansion_maximum_selected_batch.load(std::memory_order_relaxed),
-    .expansion_minimum_feedback_horizon =
-      expansion_minimum_feedback_horizon.load(std::memory_order_relaxed),
-    .expansion_maximum_feedback_horizon =
-      expansion_maximum_feedback_horizon.load(std::memory_order_relaxed),
-    .expansion_extra_parents =
-      expansion_extra_parents.load(std::memory_order_relaxed),
-    .expansion_qp_lease_claims =
-      expansion_qp_lease_claims.load(std::memory_order_relaxed),
-    .expansion_qp_lease_rejects =
-      expansion_qp_lease_rejects.load(std::memory_order_relaxed),
-    .expansion_qp_lease_rollbacks =
-      expansion_qp_lease_rollbacks.load(std::memory_order_relaxed),
-    .expansion_compute_allowance_tiles =
-      expansion_compute_allowance_tiles.load(std::memory_order_relaxed),
-    .expansion_marginal_probe_passes =
-      expansion_marginal_probe_passes.load(std::memory_order_relaxed),
-    .expansion_marginal_probe_failures =
-      expansion_marginal_probe_failures.load(std::memory_order_relaxed),
     .rdma_read_ops = rdma_read_ops.load(std::memory_order_relaxed),
     .rdma_read_bytes = rdma_read_bytes.load(std::memory_order_relaxed),
     .rdma_merged_requests = rdma_merged_requests.load(std::memory_order_relaxed),
@@ -163,23 +133,6 @@ void Telemetry::reset() {
   gpu_beam_merge_prepare_ns.store(0, std::memory_order_relaxed);
   gpu_beam_merge_sort_ns.store(0, std::memory_order_relaxed);
   gpu_beam_merge_materialize_ns.store(0, std::memory_order_relaxed);
-  feedback_hunger_queries.store(0, std::memory_order_relaxed);
-  expansion_sum_selected_parents.store(0, std::memory_order_relaxed);
-  expansion_sum_feedback_horizon.store(0, std::memory_order_relaxed);
-  expansion_sum_hardware_credit_tiles.store(0, std::memory_order_relaxed);
-  expansion_minimum_selected_batch.store(
-    UINT64_MAX, std::memory_order_relaxed);
-  expansion_maximum_selected_batch.store(0, std::memory_order_relaxed);
-  expansion_minimum_feedback_horizon.store(
-    UINT64_MAX, std::memory_order_relaxed);
-  expansion_maximum_feedback_horizon.store(0, std::memory_order_relaxed);
-  expansion_extra_parents.store(0, std::memory_order_relaxed);
-  expansion_qp_lease_claims.store(0, std::memory_order_relaxed);
-  expansion_qp_lease_rejects.store(0, std::memory_order_relaxed);
-  expansion_qp_lease_rollbacks.store(0, std::memory_order_relaxed);
-  expansion_compute_allowance_tiles.store(0, std::memory_order_relaxed);
-  expansion_marginal_probe_passes.store(0, std::memory_order_relaxed);
-  expansion_marginal_probe_failures.store(0, std::memory_order_relaxed);
   rdma_read_ops.store(0, std::memory_order_relaxed);
   rdma_read_bytes.store(0, std::memory_order_relaxed);
   rdma_merged_requests.store(0, std::memory_order_relaxed);

@@ -1,12 +1,20 @@
 # SIFT100M Experiment
 
-实验目录只保留 `04_gpu_persistent_gpunetio`：持久化 GPU OPQ/PQ32 图导航、
-GPUNetIO 远端读取和 storage-owner 动态更新。
+实验目录只保留持久化 GPU OPQ/PQ32 图导航、GPUNetIO 远端读取和
+storage-owner 动态更新这一套系统架构，以及它的 optimized/baseline 两个 profile。
 
 ## 配置
 
-默认路径定义在 `sift100m_common.sh`，架构参数定义在
-`profiles/04_gpu_persistent_gpunetio.env`。常用覆盖项：
+默认路径定义在 `sift100m_common.sh`。实验只保留两个完整、自包含的系统 profile：
+
+```text
+profiles/04_gpu_persistent_gpunetio.env           # 默认最佳性能
+profiles/04_gpu_persistent_gpunetio_baseline.env  # 严格 A/B baseline
+```
+
+二者的索引、C16 扩展、Beam 宽度、expansion budget、rerank、QP、显存与更新配置
+完全相同。默认 profile 使用 Stable-Run Beam merge 和 Live-Extent RDMA；baseline
+使用 legacy Beam merge 和 fixed-size graph read。常用机器路径覆盖项：
 
 ```bash
 export HOSTS="192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202"
@@ -151,11 +159,11 @@ placement；基础和动态 ID 的逻辑 authority 都由 `ID % N` 确定，其�
 
 ## 启动
 
-图读取策略：
+两个 profile 对应的图读取策略：
 
 ```text
-gpu-query-graph-read-policy = fixed        # 默认，始终读取完整记录
-gpu-query-graph-read-policy = live-extent  # 一次 one-sided READ 读取长度档覆盖的前缀
+gpu-query-graph-read-policy = fixed        # baseline：始终读取完整记录
+gpu-query-graph-read-policy = live-extent  # optimized：一次 READ 读取有效前缀
 ```
 
 `live-extent` 不改变图记录、Beam/visited、扩展顺序或存储 CPU 路径。静态稳态下，
@@ -177,23 +185,20 @@ fallback。checksum/torn-record 等其他 fallback 不学习档位，
 `graph_extent_hint_promotions` 和实际 `graph_read_bytes`；promotions 统计成功的
 class transition，同一节点随增长可多次提升。
 
-当前所有已验证且可组合的查询优化集中在：
-
-```text
-experiment/profiles/04_gpu_persistent_gpunetio_all_optimizations.env
-```
-
-该 profile 固定使用 C16 authoritative expansion、`stable-run` Beam merge 和
-`live-extent`（自动包含 GPU high-water），并关闭详细 RDMA trace。性能为负的
-`feedback-horizon-hunger` 不在其中。它不写死 workload、更新开关或客户端并发，
-因此纯查询和混合负载可使用同一系统配置：
+默认 profile 固定使用 C16 authoritative expansion、`stable-run` Beam merge 和
+`live-extent`（自动包含 GPU high-water），并关闭详细 RDMA trace。它不写死
+workload、更新开关或客户端并发，因此纯查询和混合负载可使用同一系统配置：
 
 ```bash
-./experiment/start_all_memory_nodes.sh \
-  04_gpu_persistent_gpunetio_all_optimizations
+./experiment/start_all_memory_nodes.sh 04_gpu_persistent_gpunetio
+./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
+```
 
-./experiment/run_breakdown.sh \
-  04_gpu_persistent_gpunetio_all_optimizations
+严格 baseline 使用：
+
+```bash
+./experiment/start_all_memory_nodes.sh 04_gpu_persistent_gpunetio_baseline
+./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio_baseline
 ```
 
 在各存储节点准备对应文件后启动服务：

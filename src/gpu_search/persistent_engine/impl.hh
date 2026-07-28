@@ -123,9 +123,6 @@ struct PersistentSearchEngine::Impl {
   void report_direct_path_failure();
   void completion_loop();
   void write_query_rdma_trace(const CompletionDescriptor& completion);
-  void augment_expansion_pressure_telemetry(
-    TelemetrySnapshot& snapshot) const;
-  void reset_expansion_pressure_telemetry();
 
   void submit_centroid_route_publication(
     const CentroidRoutePublishDescriptor& descriptor);
@@ -238,20 +235,12 @@ struct PersistentSearchEngine::Impl {
   u64* d_direct_batch_completion_timestamps_ns{};
   QueryRdmaTraceHeader* d_query_rdma_trace_headers{};
   QueryRdmaTraceEvent* d_query_rdma_trace_events{};
-  QueryAdjacencyOracleTraceHeader*
-    d_query_adjacency_oracle_trace_headers{};
-  QueryAdjacencyOracleTraceEvent*
-    d_query_adjacency_oracle_trace_events{};
   std::ofstream query_rdma_trace_stream;
   std::mutex query_rdma_trace_mutex;
   u32* direct_owner_phases_host{};
   u32* d_direct_owner_phases{};
   DirectOwnerProgress* direct_owner_progress_host{};
   DirectOwnerProgress* d_direct_owner_progress{};
-  ExpansionPressureState* d_expansion_pressure{};
-  QpExpansionLeaseState* d_expansion_qp_leases{};
-  ExpansionPressureState expansion_pressure_baseline{};
-  std::vector<QpExpansionLeaseState> expansion_qp_lease_baseline;
   u32* query_kernel_ready_host{};
   u32* d_query_kernel_ready{};
   u32* dispatcher_kernel_ready_host{};

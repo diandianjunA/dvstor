@@ -70,8 +70,9 @@ warmup 会建立并保留 device high-water 状态，所以结论限于 warmed s
 证明插入 ID 的检索质量或逐查询 top-k 完全一致。准确判断是：**high-water 修复通过了继续
 复测和最大吞吐实验的 gate，但尚不能由这一组结果宣称混合更新下的最终性能结论。**
 
-> 2026-07-27 实现状态：Live-Extent 已接入主查询路径，默认仍为 `fixed`。磁盘 sidecar
-> 保持通用 u8/8-edge class，100M 节点约 100 MB；GPU 表仅为支持并发原子提升而按 u32
+> 2026-07-27 实现状态：Live-Extent 已接入主查询路径，由默认 optimized profile 启用；
+> baseline profile 使用 `fixed`。磁盘 sidecar 保持通用 u8/8-edge class，100M 节点约
+> 100 MB；GPU 表仅为支持并发原子提升而按 u32
 > 对齐打包，空间量级不变。实现继续沿用同 descriptor per-request length、逻辑零 suffix
 > 的精确 FNV 延续、原 checksum 校验和有界 full-read fallback。静态与混合负载的正、负
 > 原始结果均完整保留。
@@ -748,40 +749,24 @@ issue/bookkeeping 仍抵消网络收益，或 cold-start fallback wave 不可接
 
 ## 10. 产物与复现
 
-核心产物：
+可运行的核心产物：
 
-- `motivation/analyze_live_extent_motivation.py`
-- `motivation/summarize_live_extent_motivation.py`
 - `motivation/analyze_live_extent_rdma_probe.py`
 - `motivation/run_live_extent_rdma_probe.sh`
+- `motivation/run_live_extent_ab.sh`
+- `motivation/summarize_live_extent_ab.py`
 - `motivation/summarize_live_extent_mixed_ab.py`
-- `motivation/results/live_extent/c256/live_extent_analysis.{json,md}`
-- `motivation/results/live_extent/c256_replication/live_extent_analysis.{json,md}`
-- `motivation/results/live_extent/concurrency_roofline.{json,md}`
 - `motivation/results/live_extent_rdma/20260727_125146/`
-- `motivation/results/live_extent_e2e/live_c256_zero_elision_smoke/`
-- `motivation/results/live_extent_e2e/fixed_c256_zero_elision_pair/`
-- `motivation/results/live_extent_e2e/live_c256_zero_elision_repeat2/`
-- `motivation/results/live_extent_e2e/live_c256_zero_elision_long_ba/`
-- `motivation/results/live_extent_e2e/fixed_c256_zero_elision_long_ba/`
-- `motivation/results/live_extent_e2e/live_c64_zero_elision/`
-- `motivation/results/live_extent_e2e/fixed_c64_zero_elision/`
-- `motivation/results/live_extent_e2e/live_c8_zero_elision/`
-- `motivation/results/live_extent_e2e/fixed_c8_zero_elision/`
-- `motivation/results/live_extent_e2e/live_c1_zero_elision/`
-- `motivation/results/live_extent_e2e/fixed_c1_zero_elision/`
-- `motivation/results/live_extent_e2e/live_highwater_c256_static/`
-- `motivation/results/live_extent_e2e/fixed_highwater_build_c256_static/`
 - `motivation/results/live_extent_e2e/current_build_static_c256_live211636_fixed215008_summary.{json,md}`
-- `motivation/results/live_extent_e2e/fixed_mixed_q40k_w1k/`
-- `motivation/results/live_extent_e2e/live_mixed_q40k_w1k_repeat2/`
-- `motivation/results/live_extent_e2e/live_highwater_mixed_q40k_w1k/`
-- `motivation/results/live_extent_e2e/mixed_q40k_w1k_fixed202410_live203441_summary.{json,md}`
 - `motivation/results/live_extent_e2e/mixed_q40k_w1k_highwater_fixed202410_live205653_summary.{json,md}`
 
 远端 storage nodes 启动后，在 compute node 执行：
 
 ```bash
+# 端到端 fixed/live-extent A/B
+./motivation/run_live_extent_ab.sh
+
+# 独立 transport payload probe
 LIVE_EXTENT_CONFIG=motivation/configs/live_extent_rdma.env \
   ./motivation/run_live_extent_rdma_probe.sh
 ```

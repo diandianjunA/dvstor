@@ -180,19 +180,7 @@ __device__ i32 direct_fetch_batch(const PersistentKernelParams& params,
     }
     bool pushed = device_ring_try_push(
       params.direct_batch_queues[qp_index], descriptor);
-    bool backpressure_recorded = false;
     while (!pushed) {
-      if (!backpressure_recorded &&
-          device_ring_is_full(params.direct_batch_queues[qp_index])) {
-        expansion_pressure_clear_credit(
-          params.expansion_pressure, true, false);
-        if (params.expansion_qp_leases != nullptr &&
-            qp_index < params.expansion_qp_lease_count) {
-          qp_expansion_lease_revoke(
-            params.expansion_qp_leases + qp_index);
-        }
-        backpressure_recorded = true;
-      }
       if (*reinterpret_cast<const volatile u32*>(params.stop) != 0) {
         atomicExch(owner_completion, -ECANCELED);
         if (watchdog_progress != nullptr) {
@@ -970,7 +958,6 @@ __device__ bool fetch_graph_records_batch(
     u32* graph_extent_fallback_reads,
     u32* graph_extent_underhint_reads,
     u32* graph_extent_hint_promotions,
-    u32* issued_qps,
     u32 route_attempt,
     u32 search_round,
     bool trace_enabled,
@@ -1009,7 +996,6 @@ __device__ bool fetch_graph_records_batch(
   }
   for (u32 shard = threadIdx.x; shard < params.num_shards; shard += blockDim.x) {
     shard_status[shard] = 0;
-    if (issued_qps != nullptr) issued_qps[shard] = UINT32_MAX;
   }
   __syncthreads();
 
@@ -1223,12 +1209,6 @@ __device__ bool fetch_graph_records_batch(
         if (attempt != 0 && graph_read_retries != nullptr) {
           atomicAdd(graph_read_retries, matching);
         }
-      }
-      if (issued_qps != nullptr &&
-          shard_status[shard] == -EINPROGRESS) {
-        issued_qps[shard] =
-          ((descriptor.query_slot + shard) % params.direct_qps_per_node) *
-            params.direct_region_count + shard;
       }
     }
     __syncthreads();

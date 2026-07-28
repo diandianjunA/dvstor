@@ -1,14 +1,12 @@
 #pragma once
 
 #include "gpu_search/centroid_route_ranking.hh"
-#include "gpu_search/persistent_kernel/adjacency_oracle_trace.cuh"
 #include "gpu_search/persistent_kernel/rdma_read.cuh"
 
 #include <cuda/atomic>
 
 namespace gpu_search::persistent_kernel_detail {
 
-template <bool EnableAdjacencyOracle>
 __device__ void set_query_trace_completion(
     const PersistentKernelParams& params, u32 query_slot,
     CompletionDescriptor& completion) {
@@ -20,18 +18,6 @@ __device__ void set_query_trace_completion(
   completion.trace_event_count = min(
     header.event_count, params.query_rdma_trace_events_per_query);
   completion.trace_overflow = header.overflow;
-  if constexpr (EnableAdjacencyOracle) {
-    if (params.query_adjacency_oracle_trace_headers == nullptr) return;
-    const QueryAdjacencyOracleTraceHeader& adjacency_header =
-      params.query_adjacency_oracle_trace_headers[query_slot];
-    if (adjacency_header.request_id != completion.request_id ||
-        adjacency_header.enabled == 0) {
-      return;
-    }
-    completion.adjacency_oracle_event_count = min(
-      adjacency_header.event_count, params.query_rdma_trace_events_per_query);
-    completion.adjacency_oracle_overflow = adjacency_header.overflow;
-  }
 }
 
 __device__ void set_dynamic_code_cache_completion(
@@ -49,24 +35,6 @@ __device__ void set_dynamic_code_cache_completion(
     publish_probe_exhaustions;
   completion.dynamic_code_cache_lookup_probes = lookup_probes;
   completion.dynamic_code_cache_max_lookup_probes = max_lookup_probes;
-}
-
-__device__ void set_expansion_completion(
-    CompletionDescriptor& completion, const PersistentKernelParams& params,
-    u32 sum_selected_parents, u32 sum_feedback_horizon,
-    u32 sum_hardware_credit_tiles, u32 minimum_selected_batch,
-    u32 maximum_selected_batch, u32 minimum_feedback_horizon,
-    u32 maximum_feedback_horizon) {
-  completion.expansion_policy = params.query_expansion_policy;
-  completion.sum_selected_parents = sum_selected_parents;
-  completion.sum_feedback_horizon = sum_feedback_horizon;
-  completion.sum_hardware_credit_tiles = sum_hardware_credit_tiles;
-  completion.minimum_selected_batch =
-    minimum_selected_batch == UINT32_MAX ? 0 : minimum_selected_batch;
-  completion.maximum_selected_batch = maximum_selected_batch;
-  completion.minimum_feedback_horizon =
-    minimum_feedback_horizon == UINT32_MAX ? 0 : minimum_feedback_horizon;
-  completion.maximum_feedback_horizon = maximum_feedback_horizon;
 }
 
 __device__ void set_beam_merge_completion(
@@ -201,117 +169,9 @@ __device__ void sort_centroid_route_shards(
   }
 }
 
-struct ExpansionRoundCycleBaseline {
-  u64 beam_selection{};
-  u64 rdma_issue{};
-  u64 neighbor_decode{};
-  u64 visited{};
-  u64 pq_score{};
-  u64 beam_merge{};
-};
-
-__device__ bool try_claim_expansion_tile(
-    const PersistentKernelParams& params, u32 query_slot,
-    const u64* handles, u32 begin, u32 count,
-    u32* claim_qps, u32* claim_epochs, u32* claim_wqes,
-    u32& claim_count,
-    u32& rollback_count) {
-  claim_count = 0;
-  if (params.expansion_qp_leases == nullptr ||
-      params.expansion_qp_lease_count == 0 ||
-      params.direct_qps_per_node == 0 || params.direct_region_count == 0) {
-    return false;
-  }
-  for (u32 item = 0; item < count; ++item) {
-    u64 raw = 0;
-    u64 graph_offset = 0;
-    u32 shard = 0;
-    if (!resolve_handle(
-          params, handles[begin + item], raw, shard, graph_offset)) {
-      return false;
-    }
-    const u32 qp =
-      ((query_slot + shard) % params.direct_qps_per_node) *
-        params.direct_region_count + shard;
-    if (qp >= params.expansion_qp_lease_count) return false;
-    u32 demand = 0;
-    for (; demand < claim_count; ++demand) {
-      if (claim_qps[demand] == qp) {
-        ++claim_wqes[demand];
-        break;
-      }
-    }
-    if (demand == claim_count) {
-      if (claim_count >= kPersistentMaxPrefetch) return false;
-      claim_qps[claim_count] = qp;
-      claim_epochs[claim_count] = 0;
-      claim_wqes[claim_count] = 1;
-      ++claim_count;
-    }
-  }
-
-  // A deterministic QP order avoids lock-order cycles when one tile spans
-  // multiple shards.  Claims are non-blocking; failure returns the complete
-  // partial vector before the authoritative expanded bits are changed.
-  for (u32 left = 1; left < claim_count; ++left) {
-    const u32 value_qp = claim_qps[left];
-    const u32 value_wqes = claim_wqes[left];
-    u32 right = left;
-    while (right != 0 && claim_qps[right - 1] > value_qp) {
-      claim_qps[right] = claim_qps[right - 1];
-      claim_wqes[right] = claim_wqes[right - 1];
-      --right;
-    }
-    claim_qps[right] = value_qp;
-    claim_wqes[right] = value_wqes;
-  }
-  u32 claimed = 0;
-  for (; claimed < claim_count; ++claimed) {
-    const u32 qp = claim_qps[claimed];
-    const u32 wqes = claim_wqes[claimed];
-    QpExpansionLeaseClaim acquired{};
-    if (!qp_expansion_lease_try_claim(
-          params.expansion_qp_leases, params.expansion_qp_lease_count,
-          qp, wqes, acquired)) {
-      break;
-    }
-    claim_epochs[claimed] = acquired.epoch;
-  }
-  if (claimed == claim_count) return true;
-  for (u32 index = 0; index < claimed; ++index) {
-    qp_expansion_lease_return(
-      params.expansion_qp_leases, params.expansion_qp_lease_count,
-      QpExpansionLeaseClaim{
-        .qp = claim_qps[index],
-        .epoch = claim_epochs[index],
-        .wqes = claim_wqes[index],
-      });
-  }
-  rollback_count += claimed;
-  claim_count = 0;
-  return false;
-}
-
-__device__ void return_unissued_expansion_leases(
+__device__ __forceinline__ void process_query(
     const PersistentKernelParams& params,
-    const QpExpansionLeaseClaim* claims, u32 claim_count,
-    const u32* issued_qps, u32 issued_count) {
-  for (u32 claim = 0; claim < claim_count; ++claim) {
-    bool issued = false;
-    for (u32 shard = 0; shard < issued_count; ++shard) {
-      issued |= issued_qps[shard] == claims[claim].qp;
-    }
-    if (!issued) {
-      qp_expansion_lease_return(
-        params.expansion_qp_leases, params.expansion_qp_lease_count,
-        claims[claim]);
-    }
-  }
-}
-
-template <bool EnableAdjacencyOracle>
-__device__ void process_query(const PersistentKernelParams& params,
-                              const QueryDescriptor& descriptor) {
+    const QueryDescriptor& descriptor) {
   const u32 query_slot = descriptor.query_slot;
   __shared__ u64 query_started_cycles;
   if (threadIdx.x == 0) query_started_cycles = clock64();
@@ -330,18 +190,12 @@ __device__ void process_query(const PersistentKernelParams& params,
       completion.diagnostic = make_query_diagnostic(
         QueryFailureReason::invalid_descriptor);
       completion.gpu_cycles = clock64() - query_started_cycles;
-      set_query_trace_completion<EnableAdjacencyOracle>(
-        params, query_slot, completion);
+      set_query_trace_completion(params, query_slot, completion);
       device_ring_push(params.completions, completion);
     }
     __syncthreads();
     return;
   }
-  if (threadIdx.x == 0) {
-    expansion_pressure_query_enter(params.expansion_pressure);
-  }
-  __syncthreads();
-
   const u8* query_input = reinterpret_cast<const u8*>(descriptor.query_device_address);
   __shared__ u64 prepare_started_cycles;
   __shared__ u64 graph_phase_cycles;
@@ -359,18 +213,6 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ u64 beam_merge_cycles;
   __shared__ BeamMergeCycleBreakdown beam_merge_breakdown;
   __shared__ BeamMergeCycleBreakdown beam_merge_round_breakdown;
-  __shared__ u32 feedback_horizon;
-  __shared__ u32 sum_selected_parents;
-  __shared__ u32 sum_feedback_horizon;
-  __shared__ u32 sum_hardware_credit_tiles;
-  __shared__ u32 minimum_selected_batch;
-  __shared__ u32 maximum_selected_batch;
-  __shared__ u32 minimum_feedback_horizon;
-  __shared__ u32 maximum_feedback_horizon;
-  __shared__ u32 compute_extra_tile_allowance;
-  __shared__ u32 round_extra_tiles;
-  __shared__ ExpansionRoundCycleBaseline expansion_cycle_baseline;
-  __shared__ FeedbackHorizonResult merge_feedback;
   __shared__ u32 rdma_trace_enabled;
   __shared__ GraphFetchCycleBreakdown graph_fetch_breakdown;
   __shared__ u32 dynamic_code_candidates;
@@ -402,19 +244,6 @@ __device__ void process_query(const PersistentKernelParams& params,
     beam_merge_cycles = 0;
     beam_merge_breakdown = {};
     beam_merge_round_breakdown = {};
-    feedback_horizon = params.efficient_batch_cap;
-    sum_selected_parents = 0;
-    sum_feedback_horizon = 0;
-    sum_hardware_credit_tiles = 0;
-    minimum_selected_batch = UINT32_MAX;
-    maximum_selected_batch = 0;
-    minimum_feedback_horizon = UINT32_MAX;
-    maximum_feedback_horizon = 0;
-    compute_extra_tile_allowance =
-      (params.efficient_batch_cap +
-       max(1u, blockDim.x / 32u) - 1u) /
-      max(1u, blockDim.x / 32u);
-    round_extra_tiles = 0;
     rdma_trace_enabled =
       params.query_rdma_trace_mode ==
         static_cast<u32>(QueryRdmaTraceMode::full) ||
@@ -429,16 +258,6 @@ __device__ void process_query(const PersistentKernelParams& params,
         .overflow = 0,
         .enabled = rdma_trace_enabled,
       };
-    }
-    if constexpr (EnableAdjacencyOracle) {
-      if (params.query_adjacency_oracle_trace_headers != nullptr) {
-        params.query_adjacency_oracle_trace_headers[query_slot] = {
-          .request_id = descriptor.request_id,
-          .event_count = 0,
-          .overflow = 0,
-          .enabled = rdma_trace_enabled,
-        };
-      }
     }
     dynamic_code_candidates = 0;
     dynamic_code_reads = 0;
@@ -579,7 +398,6 @@ __device__ void process_query(const PersistentKernelParams& params,
   // transaction; no immutable entry table is used as a fallback.
   for (u32 route_attempt = 0; route_attempt < 2; ++route_attempt) {
     if (threadIdx.x == 0) {
-      feedback_horizon = params.efficient_batch_cap;
       beam_count = 0;
       rerank_count = 0;
       route_wait_started_ns = global_time_ns();
@@ -701,10 +519,6 @@ __device__ void process_query(const PersistentKernelParams& params,
       }
       __syncthreads();
       if (route_snapshot_cancelled != 0) {
-        if (threadIdx.x == 0) {
-          expansion_pressure_query_exit(params.expansion_pressure);
-        }
-        __syncthreads();
         return;
       }
       if (route_snapshot_timed_out != 0) {
@@ -714,15 +528,8 @@ __device__ void process_query(const PersistentKernelParams& params,
             QueryFailureReason::route_snapshot_timeout,
             route_snapshot_retries);
           completion.gpu_cycles = clock64() - query_started_cycles;
-          set_expansion_completion(
-            completion, params, sum_selected_parents, sum_feedback_horizon,
-            sum_hardware_credit_tiles, minimum_selected_batch,
-            maximum_selected_batch, minimum_feedback_horizon,
-            maximum_feedback_horizon);
           set_beam_merge_completion(completion, beam_merge_breakdown);
-          expansion_pressure_query_exit(params.expansion_pressure);
-          set_query_trace_completion<EnableAdjacencyOracle>(
-            params, query_slot, completion);
+          set_query_trace_completion(params, query_slot, completion);
           device_ring_push(params.completions, completion);
         }
         __syncthreads();
@@ -829,15 +636,8 @@ __device__ void process_query(const PersistentKernelParams& params,
           dynamic_code_cache_publish_probe_exhaustions,
           dynamic_code_cache_lookup_probes,
           dynamic_code_cache_max_lookup_probes);
-        set_expansion_completion(
-          completion, params, sum_selected_parents, sum_feedback_horizon,
-          sum_hardware_credit_tiles, minimum_selected_batch,
-          maximum_selected_batch, minimum_feedback_horizon,
-          maximum_feedback_horizon);
         set_beam_merge_completion(completion, beam_merge_breakdown);
-        expansion_pressure_query_exit(params.expansion_pressure);
-        set_query_trace_completion<EnableAdjacencyOracle>(
-          params, query_slot, completion);
+        set_query_trace_completion(params, query_slot, completion);
         device_ring_push(params.completions, completion);
       }
       __syncthreads();
@@ -846,14 +646,11 @@ __device__ void process_query(const PersistentKernelParams& params,
 
   __shared__ u64 selected_handles[kPersistentMaxPrefetch];
   __shared__ u32 selected_count;
-  __shared__ QpExpansionLeaseClaim expansion_lease_claims[kPersistentMaxPrefetch];
-  __shared__ u32 round_lease_claim_count;
   __shared__ u32 neighbor_counts[kPersistentMaxPrefetch];
   __shared__ u32 neighbor_offsets[kPersistentMaxPrefetch + 1];
   __shared__ u32 flattened_neighbors;
   __shared__ u32 remote_reads_by_lane[kPersistentMaxPrefetch];
   __shared__ u32 graph_record_slots[kPersistentMaxPrefetch];
-  __shared__ u32 issued_qps[kPersistentMaxShards];
   __shared__ u32 total_remote_reads;
   __shared__ u32 total_remote_batches;
   __shared__ u32 total_graph_read_retries;
@@ -865,7 +662,6 @@ __device__ void process_query(const PersistentKernelParams& params,
   __shared__ u32 total_graph_extent_hint_promotions;
   __shared__ u32 total_graph_rounds;
   __shared__ u32 graph_failed;
-  __shared__ u32 adjacency_oracle_trace_event_index;
   if (threadIdx.x == 0) {
     total_remote_reads = 0;
     total_remote_batches = 0;
@@ -891,107 +687,18 @@ __device__ void process_query(const PersistentKernelParams& params,
   while (expansions < params.max_expansions) {
     if (threadIdx.x == 0) {
       phase_started_cycles = clock64();
-      expansion_cycle_baseline = {
-        .beam_selection = beam_selection_cycles,
-        .rdma_issue = rdma_issue_cycles,
-        .neighbor_decode = neighbor_decode_cycles,
-        .visited = visited_cycles,
-        .pq_score = pq_score_cycles,
-        .beam_merge = beam_merge_cycles,
-      };
     }
     __syncthreads();
     if (threadIdx.x == 0) {
       selected_count = 0;
-      round_lease_claim_count = 0;
       graph_failed = 0;
-      round_extra_tiles = 0;
-      const bool feedback_policy =
-        params.query_expansion_policy ==
-          static_cast<u32>(QueryExpansionPolicy::feedback_hunger);
-      const u32 expansion_tile = max(1u, blockDim.x / 32u);
       const u32 remaining = params.max_expansions - expansions;
-      if (!feedback_policy) {
-        const u32 target = min(params.prefetch_depth, remaining);
-        for (u32 index = 0;
-             index < beam_count && selected_count < target; ++index) {
-          if (beam_expanded[index] != 0) continue;
-          beam_expanded[index] = 1;
-          selected_handles[selected_count++] = beam_handles[index];
-        }
-      } else {
-        const u32 selection_limit = min(params.efficient_batch_cap, remaining);
-        u32 eligible = 0;
-        for (u32 index = 0;
-             index < beam_count && eligible < selection_limit; ++index) {
-          if (beam_expanded[index] != 0) continue;
-          selected_handles[eligible] = beam_handles[index];
-          // neighbor_counts is not live until graph records have arrived.
-          neighbor_counts[eligible] = index;
-          ++eligible;
-        }
-        const u32 base_count = min(feedback_horizon, eligible);
-        for (u32 index = 0; index < base_count; ++index) {
-          beam_expanded[neighbor_counts[index]] = 1;
-        }
-        selected_count = base_count;
-
-        const u32 structural_extra_tiles =
-          (eligible > selected_count
-             ? eligible - selected_count + expansion_tile - 1u : 0u) /
-            expansion_tile;
-        // The ledger is diagnostic only.  It must not become a hidden,
-        // dataset-specific width knob: the admissible width is determined by
-        // the natural CTA tile and the actual per-QP leases.
-        const u32 maximum_extra_tiles = structural_extra_tiles;
-        while (selected_count < eligible &&
-               round_extra_tiles < maximum_extra_tiles) {
-          const u32 tile_count = min(
-            expansion_tile, eligible - selected_count);
-          u32 claim_count = 0;
-          u32 rollback_count = 0;
-          if (!try_claim_expansion_tile(
-                params, descriptor.query_slot, selected_handles,
-                selected_count, tile_count,
-                remote_reads_by_lane, graph_record_slots, neighbor_offsets,
-                claim_count, rollback_count)) {
-            ++completion.qp_lease_reject_count;
-            completion.qp_lease_rollback_count += rollback_count;
-            break;
-          }
-          for (u32 index = 0; index < tile_count; ++index) {
-            beam_expanded[
-              neighbor_counts[selected_count + index]] = 1;
-          }
-          selected_count += tile_count;
-          ++round_extra_tiles;
-          completion.extra_parent_count += tile_count;
-          completion.qp_lease_claim_count += claim_count;
-          for (u32 claim = 0; claim < claim_count; ++claim) {
-            expansion_lease_claims[round_lease_claim_count++] = {
-              .qp = remote_reads_by_lane[claim],
-              .epoch = graph_record_slots[claim],
-              .wqes = neighbor_offsets[claim],
-            };
-          }
-        }
-        completion.compute_allowance_tile_sum +=
-          compute_extra_tile_allowance;
-      }
-      if (selected_count != 0) {
-        sum_selected_parents += selected_count;
-        sum_feedback_horizon += feedback_policy ? feedback_horizon : 0u;
-        sum_hardware_credit_tiles += round_extra_tiles;
-        minimum_selected_batch = min(
-          minimum_selected_batch, selected_count);
-        maximum_selected_batch = max(
-          maximum_selected_batch, selected_count);
-        if (feedback_policy) {
-          minimum_feedback_horizon = min(
-            minimum_feedback_horizon, feedback_horizon);
-          maximum_feedback_horizon = max(
-            maximum_feedback_horizon, feedback_horizon);
-        }
+      const u32 target = min(params.prefetch_depth, remaining);
+      for (u32 index = 0;
+           index < beam_count && selected_count < target; ++index) {
+        if (beam_expanded[index] != 0) continue;
+        beam_expanded[index] = 1;
+        selected_handles[selected_count++] = beam_handles[index];
       }
     }
     __syncthreads();
@@ -1017,7 +724,6 @@ __device__ void process_query(const PersistentKernelParams& params,
           &total_graph_extent_fallback_reads,
           &total_graph_extent_underhint_reads,
           &total_graph_extent_hint_promotions,
-          issued_qps,
           route_attempt,
           total_graph_rounds - 1, rdma_trace_enabled != 0,
           &graph_fetch_breakdown)) {
@@ -1038,11 +744,6 @@ __device__ void process_query(const PersistentKernelParams& params,
     }
     __syncthreads();
     if (graph_failed != 0) {
-      if (threadIdx.x == 0) {
-        return_unissued_expansion_leases(
-          params, expansion_lease_claims, round_lease_claim_count,
-          issued_qps, params.num_shards);
-      }
       for (u32 selected = warp; selected < selected_count;
            selected += blockDim.x / warp_width) {
         if (lane_in_warp == 0) graph_record_slots[selected] = UINT32_MAX;
@@ -1082,15 +783,8 @@ __device__ void process_query(const PersistentKernelParams& params,
           dynamic_code_cache_publish_probe_exhaustions,
           dynamic_code_cache_lookup_probes,
           dynamic_code_cache_max_lookup_probes);
-        set_expansion_completion(
-          completion, params, sum_selected_parents, sum_feedback_horizon,
-          sum_hardware_credit_tiles, minimum_selected_batch,
-          maximum_selected_batch, minimum_feedback_horizon,
-          maximum_feedback_horizon);
         set_beam_merge_completion(completion, beam_merge_breakdown);
-        expansion_pressure_query_exit(params.expansion_pressure);
-        set_query_trace_completion<EnableAdjacencyOracle>(
-          params, query_slot, completion);
+        set_query_trace_completion(params, query_slot, completion);
         device_ring_push(params.completions, completion);
       }
       __syncthreads();
@@ -1099,10 +793,7 @@ __device__ void process_query(const PersistentKernelParams& params,
 
     const u32 score_chunk_capacity = persistent_score_chunk_capacity(
       params.graph_entry_capacity, traversal_capacity);
-    if (score_chunk_capacity == 0 ||
-        (params.query_expansion_policy ==
-           static_cast<u32>(QueryExpansionPolicy::feedback_hunger) &&
-         selected_count > score_chunk_capacity)) {
+    if (score_chunk_capacity == 0) {
       if (threadIdx.x == 0) graph_failed = 1;
       __syncthreads();
     }
@@ -1160,22 +851,6 @@ __device__ void process_query(const PersistentKernelParams& params,
         neighbor_decode_cycles += clock64() - phase_started_cycles;
         phase_started_cycles = clock64();
       }
-      if constexpr (EnableAdjacencyOracle) {
-        if (rdma_trace_enabled != 0) {
-          begin_adjacency_oracle_trace(
-            params, descriptor, true,
-            total_graph_rounds - 1u, chunk_begin, selected_handles,
-            chunk_count, neighbor_counts, neighbor_offsets,
-            navigation_handles, navigation_distances, query_lut,
-            beam_distances, beam_count, traversal_capacity,
-            adjacency_oracle_trace_event_index);
-          if (threadIdx.x == 0) {
-            // Keep the deliberately expensive probe out of the production
-            // phase breakdown. Trace runs are never throughput measurements.
-            phase_started_cycles = clock64();
-          }
-        }
-      }
       const u32 candidate_count = flattened_neighbors;
       for (u32 flat = threadIdx.x; flat < candidate_count; flat += blockDim.x) {
         const u64 handle = navigation_handles[flat];
@@ -1212,29 +887,12 @@ __device__ void process_query(const PersistentKernelParams& params,
       }
       __syncthreads();
       if (graph_failed != 0) break;
-      if constexpr (EnableAdjacencyOracle) {
-        if (rdma_trace_enabled != 0) {
-          record_adjacency_oracle_post_visited(
-            params, descriptor, adjacency_oracle_trace_event_index,
-            chunk_count, neighbor_counts, neighbor_offsets,
-            navigation_handles, navigation_distances);
-          if (threadIdx.x == 0) {
-            phase_started_cycles = clock64();
-          }
-          __syncthreads();
-        }
-      }
       merge_approximate_into_beam(
         navigation_handles, navigation_distances,
         candidate_count, beam_handles, beam_ids, beam_distances,
         beam_expanded, beam_count, traversal_capacity,
-        merge_handles, merge_ids, merge_distances, merge_expanded,
         rerank_handles, rerank_ids, rerank_distances,
-        candidate_workspace, params.efficient_batch_cap,
-        (params.query_expansion_policy ==
-            static_cast<u32>(QueryExpansionPolicy::feedback_hunger) ||
-         (EnableAdjacencyOracle && rdma_trace_enabled != 0))
-          ? &merge_feedback : nullptr,
+        candidate_workspace,
         static_cast<BeamMergePolicy>(params.beam_merge_policy),
         params.beam_merge_policy ==
             static_cast<u32>(BeamMergePolicy::stable_run)
@@ -1251,29 +909,8 @@ __device__ void process_query(const PersistentKernelParams& params,
           beam_merge_breakdown.materialize +=
             beam_merge_round_breakdown.materialize;
         }
-        if (params.query_expansion_policy ==
-            static_cast<u32>(QueryExpansionPolicy::feedback_hunger)) {
-          feedback_horizon = merge_feedback.horizon;
-        }
       }
       __syncthreads();
-      if constexpr (EnableAdjacencyOracle) {
-        if (rdma_trace_enabled != 0) {
-          finish_adjacency_oracle_trace(
-            params, descriptor, adjacency_oracle_trace_event_index,
-            chunk_count, neighbor_counts, neighbor_offsets,
-            navigation_handles, navigation_distances,
-            beam_handles, beam_distances, beam_expanded, beam_count,
-            merge_feedback.new_candidates_in_beam,
-            graph_fetch_breakdown.issue + graph_fetch_breakdown.wait +
-              graph_fetch_breakdown.validation +
-              (neighbor_decode_cycles -
-                expansion_cycle_baseline.neighbor_decode),
-            (visited_cycles - expansion_cycle_baseline.visited) +
-              (pq_score_cycles - expansion_cycle_baseline.pq_score),
-            beam_merge_cycles - expansion_cycle_baseline.beam_merge);
-        }
-      }
     }
     if (graph_failed != 0) {
       __syncthreads();
@@ -1312,52 +949,14 @@ __device__ void process_query(const PersistentKernelParams& params,
           dynamic_code_cache_publish_probe_exhaustions,
           dynamic_code_cache_lookup_probes,
           dynamic_code_cache_max_lookup_probes);
-        set_expansion_completion(
-          completion, params, sum_selected_parents, sum_feedback_horizon,
-          sum_hardware_credit_tiles, minimum_selected_batch,
-          maximum_selected_batch, minimum_feedback_horizon,
-          maximum_feedback_horizon);
         set_beam_merge_completion(completion, beam_merge_breakdown);
-        expansion_pressure_query_exit(params.expansion_pressure);
-        set_query_trace_completion<EnableAdjacencyOracle>(
-          params, query_slot, completion);
+        set_query_trace_completion(params, query_slot, completion);
         device_ring_push(params.completions, completion);
       }
       __syncthreads();
       return;
     }
     if (threadIdx.x == 0) {
-      if (params.query_expansion_policy ==
-          static_cast<u32>(QueryExpansionPolicy::feedback_hunger)) {
-        const u64 fixed_cycles =
-          (beam_selection_cycles - expansion_cycle_baseline.beam_selection) +
-          (rdma_issue_cycles - expansion_cycle_baseline.rdma_issue) +
-          (beam_merge_cycles - expansion_cycle_baseline.beam_merge);
-        const u64 parent_cycles =
-          (neighbor_decode_cycles -
-             expansion_cycle_baseline.neighbor_decode) +
-          (visited_cycles - expansion_cycle_baseline.visited) +
-          (pq_score_cycles - expansion_cycle_baseline.pq_score);
-        const u32 expansion_tile = max(1u, blockDim.x / 32u);
-        const u32 processed_tiles =
-          (selected_count + expansion_tile - 1u) / expansion_tile;
-        const u64 tile_cycles = processed_tiles == 0 ? 0 :
-          (parent_cycles + processed_tiles - 1u) / processed_tiles;
-        const u32 structural_max =
-          (params.efficient_batch_cap + expansion_tile - 1u) /
-          expansion_tile;
-        compute_extra_tile_allowance = tile_cycles == 0
-          ? structural_max
-          : min(structural_max,
-                static_cast<u32>(fixed_cycles / tile_cycles));
-        if (round_extra_tiles != 0) {
-          if (compute_extra_tile_allowance >= round_extra_tiles) {
-            ++completion.marginal_probe_pass_count;
-          } else {
-            ++completion.marginal_probe_fail_count;
-          }
-        }
-      }
       expansions += selected_count;
     }
     __syncthreads();
@@ -1441,15 +1040,8 @@ __device__ void process_query(const PersistentKernelParams& params,
         dynamic_code_cache_publish_probe_exhaustions,
         dynamic_code_cache_lookup_probes,
         dynamic_code_cache_max_lookup_probes);
-      set_expansion_completion(
-        completion, params, sum_selected_parents, sum_feedback_horizon,
-        sum_hardware_credit_tiles, minimum_selected_batch,
-        maximum_selected_batch, minimum_feedback_horizon,
-        maximum_feedback_horizon);
       set_beam_merge_completion(completion, beam_merge_breakdown);
-      expansion_pressure_query_exit(params.expansion_pressure);
-      set_query_trace_completion<EnableAdjacencyOracle>(
-        params, query_slot, completion);
+      set_query_trace_completion(params, query_slot, completion);
       device_ring_push(params.completions, completion);
     }
     __syncthreads();
@@ -1515,27 +1107,13 @@ __device__ void process_query(const PersistentKernelParams& params,
       dynamic_code_cache_publish_probe_exhaustions,
       dynamic_code_cache_lookup_probes,
       dynamic_code_cache_max_lookup_probes);
-    set_expansion_completion(
-      completion, params, sum_selected_parents, sum_feedback_horizon,
-      sum_hardware_credit_tiles, minimum_selected_batch,
-      maximum_selected_batch, minimum_feedback_horizon,
-      maximum_feedback_horizon);
     set_beam_merge_completion(completion, beam_merge_breakdown);
-    expansion_pressure_query_exit(params.expansion_pressure);
-    set_query_trace_completion<EnableAdjacencyOracle>(
-      params, query_slot, completion);
+    set_query_trace_completion(params, query_slot, completion);
     device_ring_push(params.completions, completion);
   }
   __syncthreads();
   return;
   }
-}
-
-// Unit probes that call the traversal helper directly exercise the production,
-// trace-free instantiation.
-__device__ void process_query(const PersistentKernelParams& params,
-                              const QueryDescriptor& descriptor) {
-  process_query<false>(params, descriptor);
 }
 
 }  // namespace gpu_search::persistent_kernel_detail

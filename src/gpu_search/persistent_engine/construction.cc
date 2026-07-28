@@ -289,12 +289,6 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
          static_cast<u64>(config.query_rdma_trace_events_per_query) *
            sizeof(QueryRdmaTraceEvent))
     : 0;
-  const u64 adjacency_oracle_trace_bytes = rdma_trace_enabled
-    ? static_cast<u64>(query_slots) *
-        (sizeof(QueryAdjacencyOracleTraceHeader) +
-         static_cast<u64>(config.query_rdma_trace_events_per_query) *
-           sizeof(QueryAdjacencyOracleTraceEvent))
-    : 0;
   const u64 graph_scratch_bytes = static_cast<u64>(query_slots) *
     kPersistentMaxPrefetch * kPersistentGraphReadBytes;
   const u64 graph_request_metadata_bytes = live_extent_graph_reads
@@ -316,21 +310,12 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     config.dim * sizeof(f32);
   route_graph_bytes = centroid_route_bytes +
     shard_centroid_bytes;
-  const u64 expansion_pressure_bytes =
-    config.gpu_query_expansion_policy == "feedback-hunger" ||
-        config.gpu_query_expansion_policy == "feedback-horizon-hunger"
-      ? sizeof(ExpansionPressureState) +
-          static_cast<u64>(estimated_direct_queue_count) *
-            sizeof(QpExpansionLeaseState)
-      : 0;
   const u64 additional_scratch_bytes =
     dynamic_code_scratch_bytes + dynamic_code_arena_bytes +
     dynamic_request_scratch_bytes +
     navigation_candidate_bytes + query_dispatch_bytes + direct_queue_bytes +
     graph_scratch_bytes + route_graph_bytes + rdma_trace_bytes +
-    adjacency_oracle_trace_bytes +
-    graph_request_metadata_bytes + graph_extent_device_bytes +
-    expansion_pressure_bytes;
+    graph_request_metadata_bytes + graph_extent_device_bytes;
   if (additional_scratch_bytes > usable_budget - budget.explicit_bytes) {
     throw std::runtime_error(
       "GPU navigation dynamic-code scratch exceeds the configured memory budget");
@@ -357,11 +342,8 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
             << " graph_request_metadata=" << graph_request_metadata_bytes
             << " graph_extent_classes=" << graph_extent_device_bytes
             << " query_rdma_trace=" << rdma_trace_bytes
-            << " query_adjacency_oracle_trace="
-            << adjacency_oracle_trace_bytes
             << " centroid_route=" << centroid_route_bytes
             << " shard_centroids=" << shard_centroid_bytes
-            << " expansion_pressure=" << expansion_pressure_bytes
             << " explicit=" << explicit_gpu_bytes
             << " limit=" << engine_budget << " bytes\n";
 
@@ -587,23 +569,11 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
       static_cast<size_t>(query_slots) *
         config.query_rdma_trace_events_per_query,
       "cudaMalloc(query RDMA trace events)");
-    device_allocate(d_query_adjacency_oracle_trace_headers, query_slots,
-                    "cudaMalloc(query adjacency oracle trace headers)");
-    device_allocate(
-      d_query_adjacency_oracle_trace_events,
-      static_cast<size_t>(query_slots) *
-        config.query_rdma_trace_events_per_query,
-      "cudaMalloc(query adjacency oracle trace events)");
     check_cuda(cudaMemset(
                  d_query_rdma_trace_headers, 0,
                  static_cast<size_t>(query_slots) *
                    sizeof(QueryRdmaTraceHeader)),
                "cudaMemset(query RDMA trace headers)");
-    check_cuda(cudaMemset(
-                 d_query_adjacency_oracle_trace_headers, 0,
-                 static_cast<size_t>(query_slots) *
-                   sizeof(QueryAdjacencyOracleTraceHeader)),
-               "cudaMemset(query adjacency oracle trace headers)");
     const std::filesystem::path output(config.query_rdma_trace_output);
     if (output.has_parent_path()) {
       std::filesystem::create_directories(output.parent_path());
@@ -747,8 +717,8 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   std::array<PersistentKernelOccupancy, 2> occupancies{};
   std::array<u32, 2> hardware_blocks_per_sm{};
   for (size_t index = 0; index < occupancies.size(); ++index) {
-    occupancies[index] = inspect_persistent_search_kernel(
-      kPersistentThreadCandidates[index], rdma_trace_enabled);
+    occupancies[index] =
+      inspect_persistent_search_kernel(kPersistentThreadCandidates[index]);
     hardware_blocks_per_sm[index] =
       occupancies[index].active_blocks_per_sm;
   }
@@ -778,8 +748,7 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
       << ",\"prefetch_depth\":" << config.gpu_graph_prefetch_depth
       << ",\"traversal_beam_width\":" << config.gpu_traversal_beam_width
       << ",\"max_expansions\":" << config.gpu_max_expansions
-      << ",\"expansion_policy\":\"" << config.gpu_query_expansion_policy
-      << "\",\"beam_merge_policy\":\""
+      << ",\"beam_merge_policy\":\""
       << config.gpu_query_beam_merge_policy
       << "\",\"graph_read_policy\":\""
       << config.gpu_query_graph_read_policy
@@ -790,49 +759,6 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
             ? "offline_global_ordinal_gextent8"
             : "fixed_physical_record")
       << "\"}\n";
-    query_rdma_trace_stream
-      << "{\"type\":\"adjacency_oracle_metadata\",\"schema\":1,"
-         "\"group_sizes\":[4,8,16,32],"
-         "\"prefix_sizes\":[8,16,32,48,64],"
-         "\"cutoff_semantics\":\"pre-merge full-Beam cutoff; FLT_MAX when "
-         "Beam is not full\","
-         "\"certificate_semantics\":\"perfect exact-ADC oracle over every "
-         "decoded edge including visited rejects; unavailable dynamic ADC "
-         "forces the group needed\","
-         "\"interval_certificate\":\"parent-centered annulus "
-         "LB=max(0,a-r,r-b)^2 using optimistic FP32 distances\","
-         "\"interval_validation\":\"violation means geometric LB exceeds "
-         "actual minimum device ADC; safety margin is actual_min_device_ADC "
-         "minus geometric LB over finite static groups and suffixes\","
-         "\"suffix_semantics\":\"one prefix read per parent plus one tail "
-         "read exactly when the selected tail predicate is needed\","
-         "\"post_visited_semantics\":\"diagnostic only\","
-         "\"final_beam_semantics\":\"diagnostic only\","
-      << "\"graph_entry_bytes\":" << index.layout.graph_entry_bytes
-      << ",\"graph_entry_capacity\":" << graph_entry_capacity
-      << ",\"remote_ptr_bytes\":8"
-      << ",\"event_bytes\":" << sizeof(QueryAdjacencyOracleTraceEvent)
-      << "}\n";
-  }
-  if (config.gpu_query_expansion_policy == "feedback-hunger" ||
-      config.gpu_query_expansion_policy == "feedback-horizon-hunger") {
-    device_allocate(d_expansion_pressure, 1,
-                    "cudaMalloc(GPU expansion pressure state)");
-    device_allocate(d_expansion_qp_leases, direct_batch_queue_count,
-                    "cudaMalloc(GPU expansion QP leases)");
-    const u32 expansion_tile = std::max(1u, kernel_threads / 32u);
-    ExpansionPressureState initial_pressure{};
-    initial_pressure.maximum_credit_tiles =
-      (score_chunk_capacity + expansion_tile - 1u) / expansion_tile;
-    check_cuda(cudaMemcpy(
-                 d_expansion_pressure, &initial_pressure,
-                 sizeof(initial_pressure), cudaMemcpyHostToDevice),
-               "cudaMemcpy(GPU expansion pressure state)");
-    check_cuda(cudaMemset(
-                 d_expansion_qp_leases, 0,
-                 static_cast<size_t>(direct_batch_queue_count) *
-                   sizeof(QpExpansionLeaseState)),
-               "cudaMemset(GPU expansion QP leases)");
   }
 
   kernel_params = PersistentKernelParams{
@@ -879,17 +805,10 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .exact_width = exact_width,
     .max_expansions = config.gpu_max_expansions,
     .prefetch_depth = config.gpu_graph_prefetch_depth,
-    .query_expansion_policy =
-      config.gpu_query_expansion_policy == "feedback-hunger" ||
-          config.gpu_query_expansion_policy == "feedback-horizon-hunger"
-        ? static_cast<u32>(QueryExpansionPolicy::feedback_hunger)
-        : static_cast<u32>(QueryExpansionPolicy::fixed),
     .beam_merge_policy =
       config.gpu_query_beam_merge_policy == "stable-run"
         ? static_cast<u32>(BeamMergePolicy::stable_run)
         : static_cast<u32>(BeamMergePolicy::legacy),
-    .efficient_batch_cap = std::min(
-      kPersistentMaxPrefetch, score_chunk_capacity),
     .visited_capacity = visited_capacity,
     .query_slots = query_slots,
     .direct_region_count = direct_view.remote_region_count,
@@ -909,9 +828,6 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .direct_batch_queue_count = direct_batch_queue_count,
     .direct_owner_phases = d_direct_owner_phases,
     .direct_owner_progress = d_direct_owner_progress,
-    .expansion_pressure = d_expansion_pressure,
-    .expansion_qp_leases = d_expansion_qp_leases,
-    .expansion_qp_lease_count = direct_batch_queue_count,
     .direct_dump = direct_view.dump,
     .direct_disabled = direct_disabled_device,
     .direct_error = direct_error_device,
@@ -929,10 +845,6 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .graph_request_bytes = d_graph_request_bytes,
     .query_rdma_trace_headers = d_query_rdma_trace_headers,
     .query_rdma_trace_events = d_query_rdma_trace_events,
-    .query_adjacency_oracle_trace_headers =
-      d_query_adjacency_oracle_trace_headers,
-    .query_adjacency_oracle_trace_events =
-      d_query_adjacency_oracle_trace_events,
     .query_rdma_trace_mode = config.query_rdma_trace_mode == "full"
       ? static_cast<u32>(QueryRdmaTraceMode::full)
       : config.query_rdma_trace_mode == "sampled"
