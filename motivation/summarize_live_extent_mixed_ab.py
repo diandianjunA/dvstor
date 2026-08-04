@@ -288,6 +288,9 @@ def _controlled_meta(root: dict[str, Any], path: Path) -> dict[str, Any]:
     if not isinstance(meta, dict):
         raise ReportError(f"{path}: meta is not an object")
     meta.pop("gpu_query_graph_read_policy", None)
+    # Historical reports may contain the removed expansion-policy field.
+    # It is neither required nor an A/B pairing dimension.
+    meta.pop("gpu_query_expansion_policy", None)
     for field in META_OUTCOME_FIELDS:
         meta.pop(field, None)
     performance_query = meta.get("performance_query")
@@ -314,7 +317,6 @@ def _validate_contract(
         ("meta", "run_mode"): "time",
         ("meta", "recall_only"): False,
         ("meta", "fine_grained_breakdown_enabled"): True,
-        ("meta", "gpu_query_expansion_policy"): "fixed",
         ("meta", "gpu_graph_prefetch_depth"): 16,
         ("meta", "gpu_query_beam_merge_policy"): "stable-run",
         ("meta", "traversal_beam_width"): 128,
@@ -1114,7 +1116,6 @@ def build_summary(
             "read_ratio": contract.read_ratio,
             "target_query_qps": contract.target_query_qps,
             "target_write_qps": contract.target_write_qps,
-            "gpu_query_expansion_policy": "fixed",
             "gpu_graph_prefetch_depth": 16,
             "gpu_query_beam_merge_policy": "stable-run",
             "traversal_beam_width": 128,

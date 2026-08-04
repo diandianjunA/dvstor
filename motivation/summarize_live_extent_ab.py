@@ -64,7 +64,6 @@ PAIR_FIELDS = (
     ("gpu_graph_extent_sidecar_format",
      ("meta", "gpu_graph_extent_sidecar_format")),
     ("prefetch_depth", ("meta", "gpu_graph_prefetch_depth")),
-    ("expansion_policy", ("meta", "gpu_query_expansion_policy")),
     ("beam_merge_policy", ("meta", "gpu_query_beam_merge_policy")),
     ("beam_width", ("meta", "traversal_beam_width")),
     ("max_expansions", ("meta", "max_expansions")),
@@ -262,8 +261,6 @@ def load_report(path, policy, concurrency, repeat):
         path,
     )
     _require_equal(root, ("meta", "client_threads"), concurrency, path)
-    _require_equal(
-        root, ("meta", "gpu_query_expansion_policy"), "fixed", path)
     _require_equal(
         root, ("meta", "gpu_graph_prefetch_depth"), 16, path)
     _require_equal(
@@ -628,7 +625,6 @@ def build_summary(root, pairs):
         "controlled_variable": "gpu_query_graph_read_policy",
         "policies": list(POLICIES),
         "fixed_search_contract": {
-            "gpu_query_expansion_policy": "fixed",
             "gpu_graph_prefetch_depth": 16,
             "gpu_query_beam_merge_policy": "stable-run",
             "workload": "query",

@@ -414,6 +414,17 @@ class LiveExtentMixedAbAnalyzerTest(unittest.TestCase):
         self.assertEqual(len(pairs), 1)
         self.assertEqual(pairs[0][0].concurrency, 512)
 
+    def test_removed_expansion_policy_field_is_optional_and_ignored(self):
+        fixed = make_report("fixed")
+        live = make_report("live-extent")
+        live["meta"].pop("gpu_query_expansion_policy")
+        self.write_report("fixed", 1, document=fixed)
+        self.write_report("live-extent", 1, document=live)
+
+        pairs = analyzer.discover_pairs(
+            self.root, analyzer.CONTRACTS["rate-limited"])
+        self.assertEqual(len(pairs), 1)
+
     def test_required_query_rows_uses_schedule_not_completion(self):
         report = make_report("fixed")
         report["meta"]["warmup_mixed"]["issued_reads"] -= 4

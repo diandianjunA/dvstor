@@ -7,10 +7,6 @@
 #include "gpu_search/device_ring.cuh"
 #include "gpu_search/types.hh"
 
-#ifdef __CUDACC__
-#include <cuda/atomic>
-#endif
-
 struct CUstream_st;
 using cudaStream_t = CUstream_st*;
 
@@ -20,7 +16,14 @@ inline constexpr u32 kPersistentMaxBeam = 128;
 inline constexpr u32 kPersistentMaxExact = 256;
 inline constexpr u32 kPersistentMaxSubquantizers = 32;
 inline constexpr u32 kPersistentMaxGraphDegree = 128;
+// The authoritative commit frontier preserves the legacy maximum batch width.
+// The speculative ROB is independently bounded by the same compile-time
+// capacity, while graph scratch has a disjoint bank for each role so an
+// in-flight shadow read can overlap committed decode/PQ/Beam work.
 inline constexpr u32 kPersistentMaxPrefetch = 32;
+inline constexpr u32 kPersistentFrontierRobCapacity = 32;
+inline constexpr u32 kPersistentGraphScratchSlots = kPersistentMaxPrefetch;
+inline constexpr u32 kPersistentStableRunScratch = 4 * kPersistentMaxBeam;
 inline constexpr u32 kPersistentScoreChunk = 16;
 inline constexpr u32 kPersistentMaxMergeCandidates = 2048;
 // RemotePtr dedicates six bits to the physical shard.  GPU routing and RDMA
@@ -155,12 +158,119 @@ struct DirectBatchDescriptor {
   const u32* request_bytes{};
   i32* completion_status{};
   u64* completion_timestamp_ns{};
-  u32 request_count{};
-  u32 memory_node{};
+  // A split descriptor is published once on the critical queue. After
+  // collecting every visible critical descriptor, the owner may append the
+  // suffix to unused SQ credit behind a critical CQ fence. Otherwise it
+  // rejects the optional suffix without posting another doorbell. Both
+  // outcomes retain independent completion words and priority semantics.
+  i32* speculative_completion_status{};
+  u64* speculative_completion_timestamp_ns{};
+  // Frontier/exact batches are bounded by kPersistentMaxExact and RemotePtr
+  // exposes at most kPersistentMaxShards.  Narrow fields keep the descriptor
+  // at 80 bytes; owner CTAs retain eight descriptors per warp in shared
+  // memory, so the former 88-byte layout materially reduced the query
+  // workspace available to the unified persistent kernel.
+  u16 request_count{};
+  u16 memory_node{};
   u32 bytes{};
-  u32 reserved{};
+  u8 priority{};
+  u8 flags{};
+  u16 critical_request_count{};
 };
-static_assert(sizeof(DirectBatchDescriptor) == 64);
+static_assert(sizeof(DirectBatchDescriptor) == 80);
+
+enum class DirectBatchPriority : u32 {
+  critical = 0,
+  speculative = 1,
+};
+
+// The split suffix is correctness-critical and must be posted in the same SQ
+// train as its prefix. The owner inserts a real mlx5 initiator fence on the
+// first suffix READ, so the suffix observes memory only after every prefix
+// READ has completed. This is used by exact rerank's second header snapshot;
+// unlike an ASFE shadow suffix, it is reserved during critical admission and
+// can never be rejected merely because the service boundary has no spare SQ
+// credit.
+inline constexpr u8 kDirectBatchFlagMandatoryFencedTail = 1u << 0;
+// A terminal-cache final train has the same mandatory ordering/completion
+// contract, but its suffix may contain additional current-header reads after
+// the one-to-one validation trailers:
+//
+//   [M full records][M matching trailers][H cached-record headers]
+//
+// Keep this distinct from the original exact-snapshot flag so widening the
+// suffix cannot silently weaken the established 2*M descriptor ABI.
+inline constexpr u8 kDirectBatchFlagMixedMandatoryFencedTail = 1u << 1;
+inline constexpr u8 kDirectBatchKnownFlags =
+  kDirectBatchFlagMandatoryFencedTail |
+  kDirectBatchFlagMixedMandatoryFencedTail;
+
+// exactify_into_beam normalizes successful fenced trains, successful legacy
+// fallbacks, and empty shards to status zero. A remaining non-zero status is
+// therefore a final transport failure, not an incarnation/tombstone reject.
+// Keep the policy host/device so the query-failure boundary is directly
+// unit-testable without a live RDMA peer.
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr bool exact_snapshot_transport_failed(i32 final_status) {
+  return final_status != 0;
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr bool exact_rerank_should_retry_route(
+    bool exact_fetch_succeeded, u32 route_attempt) {
+  return exact_fetch_succeeded && route_attempt == 0;
+}
+
+enum class FrontierRequestState : u8 {
+  init = 0,
+  issued = 1,
+  inflight = 2,
+  arrived = 3,
+  validated = 4,
+  committed = 5,
+  stale = 6,
+};
+
+enum class FrontierValidationState : u8 {
+  unknown = 0,
+  valid = 1,
+  stale_incarnation = 2,
+  invalid_snapshot = 3,
+  transport_rejected = 4,
+};
+
+inline constexpr u8 kFrontierRobFlagEarlyShadow = 1u << 0;
+// Retention is useful controller evidence only on the first exact
+// certificate transition of one physical speculative read. Without this bit,
+// a long-lived ROB entry is counted again every round and can inflate issue
+// width without any additional RDMA benefit.
+inline constexpr u8 kFrontierRobFlagUtilityAccounted = 1u << 1;
+
+// Query-CTA-local reorder-buffer entry. Payload remains in coalesced global
+// graph scratch; this compact metadata is kept in shared memory and is never
+// observed by another CTA. In particular, ISSUED/ARRIVED never changes the
+// authoritative Beam, expanded bits, or visited table.
+struct FrontierRobEntry {
+  u64 node_handle{kInvalidDeviceHandle};
+  u32 issue_epoch{};
+  u32 transfer_bytes{};
+  u16 beam_rank{};
+  u8 scratch_slot{};
+  u8 state{static_cast<u8>(FrontierRequestState::init)};
+  u8 validation{static_cast<u8>(FrontierValidationState::unknown)};
+  u8 priority{static_cast<u8>(DirectBatchPriority::speculative)};
+  u8 flags{};
+};
+// query_id is the CTA's QueryDescriptor request_id; request_id is
+// issue_epoch*capacity+slot; record location remains in the asynchronously
+// owned request-offset SoA. Keeping those wave-invariant/derived fields out of
+// every entry cuts shared-memory traffic without weakening the logical ROB
+// contract.
+static_assert(sizeof(FrontierRobEntry) == 24);
 
 enum class QueryRdmaTraceMode : u32 {
   off = 0,
@@ -168,11 +278,11 @@ enum class QueryRdmaTraceMode : u32 {
   full = 2,
 };
 
-// Completion is intentionally limited to the software-visible boundary of the
-// owner submission group containing this shard descriptor.  The owner requests
-// one success CQE for the group's final READ (or dump WQE), so physical
-// per-descriptor, per-parent, and per-WQE completion times are not observable
-// without changing the transport data path.
+// Completion is intentionally limited to a software-visible owner priority
+// fence. Unsplit submissions expose their final READ (or dump WQE); split
+// submissions expose independent critical-prefix and speculative-tail fences.
+// Physical per-descriptor, per-parent, and per-WQE completion times remain
+// unobservable without changing the transport data path.
 struct QueryRdmaTraceEvent {
   u64 request_id{};
   u64 issue_timestamp_ns{};
@@ -198,86 +308,6 @@ struct QueryRdmaTraceHeader {
   u32 reserved{};
 };
 
-inline constexpr u32 kQueryAdjacencyOracleGroupCount = 4;
-inline constexpr u32 kQueryAdjacencyOraclePrefixCount = 5;
-inline constexpr u32 kQueryBeamTurnoverTraceWidth = 32;
-
-// One event summarizes a score/merge chunk. The four lanes in each group
-// array correspond to contiguous adjacency groups of 4, 8, 16, and 32
-// RemotePtrs, respectively. certificate_needed_groups is the perfect-ADC
-// oracle evaluated at the pre-merge cutoff using every decoded edge,
-// including visited rejects; unavailable dynamic ADCs are conservatively
-// needed. interval_* describes the implementable parent-centered annulus
-// certificate. post_visited_* and final_beam_* are diagnostic only.
-struct QueryAdjacencyOracleTraceEvent {
-  u64 request_id{};
-  u32 search_round{};
-  u32 chunk_begin{};
-  u32 parent_count{};
-  u32 edge_count{};
-  u32 invalid_decoded_count{};
-  u32 dynamic_edge_count{};
-  u32 visited_survivor_count{};
-  u32 finite_scored_count{};
-  u32 beam_count_before{};
-  u32 beam_capacity{};
-  u32 cutoff_distance_bits{};
-  u32 new_candidates_in_beam{};
-  u32 interval_lb_violation_count{};
-  f32 minimum_interval_safety_margin{};
-  u32 total_groups[kQueryAdjacencyOracleGroupCount]{};
-  u32 certificate_needed_groups[kQueryAdjacencyOracleGroupCount]{};
-  u32 post_visited_needed_groups[kQueryAdjacencyOracleGroupCount]{};
-  u32 final_beam_needed_groups[kQueryAdjacencyOracleGroupCount]{};
-  u32 certificate_needed_runs[kQueryAdjacencyOracleGroupCount]{};
-  u32 certificate_first_group_needed_parents[
-    kQueryAdjacencyOracleGroupCount]{};
-  u32 interval_needed_groups[kQueryAdjacencyOracleGroupCount]{};
-  u32 interval_needed_runs[kQueryAdjacencyOracleGroupCount]{};
-  u32 interval_first_group_needed_parents[
-    kQueryAdjacencyOracleGroupCount]{};
-  // Prefix lanes are 8, 16, 32, 48, and 64 edges. A parent always transfers
-  // the prefix; *_tail_needed_parents counts the additional suffix read.
-  u32 parents_with_tail[kQueryAdjacencyOraclePrefixCount]{};
-  u32 perfect_tail_needed_parents[kQueryAdjacencyOraclePrefixCount]{};
-  u32 suffix_interval_tail_needed_parents[
-    kQueryAdjacencyOraclePrefixCount]{};
-  u32 post_visited_tail_needed_parents[
-    kQueryAdjacencyOraclePrefixCount]{};
-  u32 final_beam_tail_needed_parents[
-    kQueryAdjacencyOraclePrefixCount]{};
-  u32 total_tail_edges[kQueryAdjacencyOraclePrefixCount]{};
-  u32 perfect_tail_needed_edges[kQueryAdjacencyOraclePrefixCount]{};
-  u32 suffix_interval_tail_needed_edges[
-    kQueryAdjacencyOraclePrefixCount]{};
-  // Motivation-only Beam-turnover probe.  The selected arrays describe the
-  // parents consumed by this round; productive means that at least one of the
-  // parent's post-visited finite children survives in the authoritative Beam.
-  // frontier_* is the first 32 unexpanded outputs after the merge.  A bit in
-  // frontier_new_mask says that the output originated in this round's scored
-  // candidate set rather than the old Beam.
-  u32 selected_productive_mask{};
-  u32 selected_child_in_beam_count[kQueryBeamTurnoverTraceWidth]{};
-  u32 selected_best_child_rank[kQueryBeamTurnoverTraceWidth]{};
-  u64 selected_handles[kQueryBeamTurnoverTraceWidth]{};
-  u32 frontier_count{};
-  u32 frontier_new_mask{};
-  u64 frontier_handles[kQueryBeamTurnoverTraceWidth]{};
-  u32 frontier_distance_bits[kQueryBeamTurnoverTraceWidth]{};
-  u64 round_graph_cycles{};
-  u64 round_score_cycles{};
-  u64 round_beam_cycles{};
-};
-static_assert(sizeof(QueryAdjacencyOracleTraceEvent) == 1304);
-
-struct QueryAdjacencyOracleTraceHeader {
-  u64 request_id{};
-  u32 event_count{};
-  u32 overflow{};
-  u32 enabled{};
-  u32 reserved{};
-};
-
 // One cache-line-isolated device progress record per exclusive QP owner. GPU
 // threads update these monotonic counters in local device memory; the host
 // watchdog periodically copies the compact array only while queries are
@@ -287,344 +317,18 @@ struct alignas(64) DirectOwnerProgress {
   unsigned long long dequeued{};
   unsigned long long completed{};
   unsigned long long heartbeat{};
-  unsigned long long reserved[4]{};
+  unsigned long long submitted_wqes{};
+  unsigned long long submission_wqe_capacity{};
+  unsigned long long critical_batches{};
+  unsigned long long speculative_batches{};
 };
 
 static_assert(sizeof(DirectOwnerProgress) == 64);
-
-enum class QueryExpansionPolicy : u32 {
-  fixed = 0,
-  feedback_hunger = 1,
-};
 
 enum class BeamMergePolicy : u32 {
   legacy = 0,
   stable_run = 1,
 };
-
-// Query/owner CTAs share the compact controller in the first cache line.
-// Diagnostic counters occupy the second cache line.
-struct alignas(64) ExpansionPressureState {
-  // [15:0] active, [31:16] credit, [47:32] active peak,
-  // [63:48] maximum observed credit.
-  unsigned long long control{};
-  u32 maximum_credit_tiles{};
-  u32 reserved0{};
-  unsigned long long reserved_control[6]{};
-
-  unsigned long long hunger_grants{};
-  unsigned long long congestion_clears{};
-  unsigned long long ring_backpressure_events{};
-  unsigned long long sq_defer_events{};
-  unsigned long long idle_owner_episodes{};
-  unsigned long long reserved_counters[3]{};
-};
-
-static_assert(sizeof(ExpansionPressureState) == 128);
-static_assert(alignof(ExpansionPressureState) == 64);
-
-// One-shot capacity advertised by one exclusive QP owner.  The high 32 bits
-// are an owner epoch and the low 32 bits are unclaimed read-WQE units.  A
-// query consumes units with one CAS; an owner busy transition advances the
-// epoch and revokes every unclaimed unit.  Unlike the old global credit, a
-// unit can therefore be consumed by only one query round and only by work
-// routed to this QP.
-struct alignas(64) QpExpansionLeaseState {
-  unsigned long long control{};
-  unsigned long long offers{};
-  unsigned long long claims{};
-  unsigned long long rejects{};
-  unsigned long long returns{};
-  unsigned long long revocations{};
-  unsigned long long stale_returns{};
-  unsigned long long reserved{};
-};
-
-static_assert(sizeof(QpExpansionLeaseState) == 64);
-static_assert(alignof(QpExpansionLeaseState) == 64);
-
-struct QpExpansionLeaseClaim {
-  u32 qp{};
-  u32 epoch{};
-  u32 wqes{};
-};
-
-#ifdef __CUDACC__
-__host__ __device__
-#endif
-inline constexpr unsigned long long make_qp_expansion_lease_control(
-    u32 epoch, u32 available_wqes) {
-  return (static_cast<unsigned long long>(epoch) << 32) |
-    static_cast<unsigned long long>(available_wqes);
-}
-
-#ifdef __CUDACC__
-__host__ __device__
-#endif
-inline constexpr u32 qp_expansion_lease_epoch(
-    unsigned long long control) {
-  return static_cast<u32>(control >> 32);
-}
-
-#ifdef __CUDACC__
-__host__ __device__
-#endif
-inline constexpr u32 qp_expansion_lease_available(
-    unsigned long long control) {
-  return static_cast<u32>(control);
-}
-
-inline constexpr u32 kExpansionPressureFieldMask = 0xffffu;
-
-#ifdef __CUDACC__
-__host__ __device__
-#endif
-inline constexpr u32 expansion_pressure_active(unsigned long long control) {
-  return static_cast<u32>(control) & kExpansionPressureFieldMask;
-}
-
-#ifdef __CUDACC__
-__host__ __device__
-#endif
-inline constexpr u32 expansion_pressure_credit(unsigned long long control) {
-  return static_cast<u32>(control >> 16) & kExpansionPressureFieldMask;
-}
-
-#ifdef __CUDACC__
-__host__ __device__
-#endif
-inline constexpr u32 expansion_pressure_active_peak(
-    unsigned long long control) {
-  return static_cast<u32>(control >> 32) & kExpansionPressureFieldMask;
-}
-
-#ifdef __CUDACC__
-__host__ __device__
-#endif
-inline constexpr u32 expansion_pressure_credit_peak(
-    unsigned long long control) {
-  return static_cast<u32>(control >> 48) & kExpansionPressureFieldMask;
-}
-
-#ifdef __CUDACC__
-__host__ __device__
-#endif
-inline constexpr unsigned long long make_expansion_pressure_control(
-    u32 active, u32 credit, u32 active_peak, u32 credit_peak) {
-  return static_cast<unsigned long long>(
-           active & kExpansionPressureFieldMask) |
-    (static_cast<unsigned long long>(
-       credit & kExpansionPressureFieldMask) << 16) |
-    (static_cast<unsigned long long>(
-       active_peak & kExpansionPressureFieldMask) << 32) |
-    (static_cast<unsigned long long>(
-       credit_peak & kExpansionPressureFieldMask) << 48);
-}
-
-#ifdef __CUDACC__
-__host__ __device__
-#endif
-inline bool expansion_owner_idle_episode_transition(
-    u32 active_queries, bool queue_empty, bool progress_balanced,
-    bool obtained_batch, bool& idle_credit_announced) {
-  if (active_queries == 0 || obtained_batch) {
-    idle_credit_announced = false;
-    return false;
-  }
-  if (queue_empty && progress_balanced && !idle_credit_announced) {
-    idle_credit_announced = true;
-    return true;
-  }
-  return false;
-}
-
-#ifdef __CUDACC__
-__device__ __forceinline__ unsigned long long expansion_pressure_load(
-    const ExpansionPressureState* state) {
-  if (state == nullptr) return 0;
-  cuda::atomic_ref<unsigned long long, cuda::thread_scope_device> control(
-    const_cast<unsigned long long&>(state->control));
-  return control.load(cuda::memory_order_relaxed);
-}
-
-__device__ __forceinline__ void expansion_pressure_query_enter(
-    ExpansionPressureState* state) {
-  if (state == nullptr) return;
-  unsigned long long observed = expansion_pressure_load(state);
-  for (;;) {
-    const u32 old_active = expansion_pressure_active(observed);
-    const u32 active = min(
-      old_active + 1u, kExpansionPressureFieldMask);
-    const unsigned long long desired = make_expansion_pressure_control(
-      active, old_active == 0 ? 0u : expansion_pressure_credit(observed),
-      max(expansion_pressure_active_peak(observed), active),
-      expansion_pressure_credit_peak(observed));
-    const unsigned long long prior =
-      atomicCAS(&state->control, observed, desired);
-    if (prior == observed) return;
-    observed = prior;
-  }
-}
-
-__device__ __forceinline__ void expansion_pressure_query_exit(
-    ExpansionPressureState* state) {
-  if (state == nullptr) return;
-  unsigned long long observed = expansion_pressure_load(state);
-  for (;;) {
-    const u32 old_active = expansion_pressure_active(observed);
-    if (old_active == 0) return;
-    const u32 active = old_active - 1u;
-    const unsigned long long desired = make_expansion_pressure_control(
-      active, active == 0 ? 0u : expansion_pressure_credit(observed),
-      expansion_pressure_active_peak(observed),
-      expansion_pressure_credit_peak(observed));
-    const unsigned long long prior =
-      atomicCAS(&state->control, observed, desired);
-    if (prior == observed) return;
-    observed = prior;
-  }
-}
-
-__device__ __forceinline__ bool expansion_pressure_grant_idle(
-    ExpansionPressureState* state) {
-  if (state == nullptr || state->maximum_credit_tiles == 0) return false;
-  unsigned long long observed = expansion_pressure_load(state);
-  for (;;) {
-    const u32 active = expansion_pressure_active(observed);
-    const u32 credit = expansion_pressure_credit(observed);
-    if (active == 0 || credit >= state->maximum_credit_tiles) return false;
-    const u32 next_credit = credit + 1u;
-    const unsigned long long desired = make_expansion_pressure_control(
-      active, next_credit, expansion_pressure_active_peak(observed),
-      max(expansion_pressure_credit_peak(observed), next_credit));
-    const unsigned long long prior =
-      atomicCAS(&state->control, observed, desired);
-    if (prior == observed) {
-      atomicAdd(&state->hunger_grants, 1ULL);
-      return true;
-    }
-    observed = prior;
-  }
-}
-
-__device__ __forceinline__ void expansion_pressure_clear_credit(
-    ExpansionPressureState* state, bool ring_backpressure, bool sq_defer) {
-  if (state == nullptr) return;
-  unsigned long long observed = expansion_pressure_load(state);
-  bool cleared = false;
-  while (expansion_pressure_credit(observed) != 0) {
-    const unsigned long long desired = make_expansion_pressure_control(
-      expansion_pressure_active(observed), 0,
-      expansion_pressure_active_peak(observed),
-      expansion_pressure_credit_peak(observed));
-    const unsigned long long prior =
-      atomicCAS(&state->control, observed, desired);
-    if (prior == observed) {
-      cleared = true;
-      break;
-    }
-    observed = prior;
-  }
-  if (cleared) atomicAdd(&state->congestion_clears, 1ULL);
-  if (ring_backpressure) {
-    atomicAdd(&state->ring_backpressure_events, 1ULL);
-  }
-  if (sq_defer) atomicAdd(&state->sq_defer_events, 1ULL);
-}
-
-__device__ __forceinline__ unsigned long long qp_expansion_lease_load(
-    const QpExpansionLeaseState* state) {
-  if (state == nullptr) return 0;
-  cuda::atomic_ref<unsigned long long, cuda::thread_scope_device> control(
-    const_cast<unsigned long long&>(state->control));
-  return control.load(cuda::memory_order_relaxed);
-}
-
-__device__ __forceinline__ bool qp_expansion_lease_publish(
-    QpExpansionLeaseState* state, u32 available_wqes) {
-  if (state == nullptr || available_wqes == 0) return false;
-  unsigned long long observed = qp_expansion_lease_load(state);
-  for (;;) {
-    if (qp_expansion_lease_available(observed) != 0) return false;
-    const unsigned long long desired = make_qp_expansion_lease_control(
-      qp_expansion_lease_epoch(observed) + 1u, available_wqes);
-    const unsigned long long prior =
-      atomicCAS(&state->control, observed, desired);
-    if (prior == observed) {
-      atomicAdd(&state->offers, 1ULL);
-      return true;
-    }
-    observed = prior;
-  }
-}
-
-__device__ __forceinline__ void qp_expansion_lease_revoke(
-    QpExpansionLeaseState* state) {
-  if (state == nullptr) return;
-  unsigned long long observed = qp_expansion_lease_load(state);
-  for (;;) {
-    const u32 available = qp_expansion_lease_available(observed);
-    if (available == 0) return;
-    const unsigned long long desired = make_qp_expansion_lease_control(
-      qp_expansion_lease_epoch(observed) + 1u, 0u);
-    const unsigned long long prior =
-      atomicCAS(&state->control, observed, desired);
-    if (prior == observed) {
-      return;
-    }
-    observed = prior;
-  }
-}
-
-__device__ __forceinline__ bool qp_expansion_lease_try_claim(
-    QpExpansionLeaseState* states, u32 state_count, u32 qp, u32 wqes,
-    QpExpansionLeaseClaim& claim) {
-  claim = {};
-  if (states == nullptr || qp >= state_count || wqes == 0) return false;
-  QpExpansionLeaseState& state = states[qp];
-  unsigned long long observed = qp_expansion_lease_load(&state);
-  for (;;) {
-    const u32 available = qp_expansion_lease_available(observed);
-    if (available < wqes) {
-      return false;
-    }
-    const u32 epoch = qp_expansion_lease_epoch(observed);
-    const unsigned long long desired = make_qp_expansion_lease_control(
-      epoch, available - wqes);
-    const unsigned long long prior =
-      atomicCAS(&state.control, observed, desired);
-    if (prior == observed) {
-      claim = {.qp = qp, .epoch = epoch, .wqes = wqes};
-      return true;
-    }
-    observed = prior;
-  }
-}
-
-__device__ __forceinline__ void qp_expansion_lease_return(
-    QpExpansionLeaseState* states, u32 state_count,
-    const QpExpansionLeaseClaim& claim) {
-  if (states == nullptr || claim.qp >= state_count || claim.wqes == 0) return;
-  QpExpansionLeaseState& state = states[claim.qp];
-  unsigned long long observed = qp_expansion_lease_load(&state);
-  for (;;) {
-    if (qp_expansion_lease_epoch(observed) != claim.epoch) {
-      return;
-    }
-    const u32 available = qp_expansion_lease_available(observed);
-    const u32 returned = available > UINT32_MAX - claim.wqes
-      ? UINT32_MAX : available + claim.wqes;
-    const unsigned long long desired = make_qp_expansion_lease_control(
-      claim.epoch, returned);
-    const unsigned long long prior =
-      atomicCAS(&state.control, observed, desired);
-    if (prior == observed) {
-      return;
-    }
-    observed = prior;
-  }
-}
-#endif
 
 struct PersistentKernelParams {
   DeviceRingView<QueryDescriptor> submissions;
@@ -660,10 +364,9 @@ struct PersistentKernelParams {
   u32 final_rerank_width{};
   u32 exact_width{};
   u32 max_expansions{};
-  u32 prefetch_depth{};
-  u32 query_expansion_policy{};
+  u32 commit_width{};
+  u32 issue_width{};
   u32 beam_merge_policy{};
-  u32 efficient_batch_cap{};
   u32 visited_capacity{};
   u32 query_slots{};
   u32 direct_region_count{};
@@ -678,14 +381,17 @@ struct PersistentKernelParams {
   void* const* direct_qps{};
   i32* direct_qp_locks{};
   const DeviceRingView<DirectBatchDescriptor>* direct_batch_queues{};
+  const DeviceRingView<DirectBatchDescriptor>*
+    direct_speculative_batch_queues{};
   i32* direct_batch_statuses{};
   u64* direct_batch_completion_timestamps_ns{};
+  i32* core_batch_statuses{};
+  u64* core_batch_completion_timestamps_ns{};
+  i32* tail_batch_statuses{};
+  u64* tail_batch_completion_timestamps_ns{};
   u32 direct_batch_queue_count{};
   u32* direct_owner_phases{};
   DirectOwnerProgress* direct_owner_progress{};
-  ExpansionPressureState* expansion_pressure{};
-  QpExpansionLeaseState* expansion_qp_leases{};
-  u32 expansion_qp_lease_count{};
   u8* direct_dump{};
   u32* direct_disabled{};
   i32* direct_error{};
@@ -719,10 +425,22 @@ struct PersistentKernelParams {
   // Only the first kPersistentMaxPrefetch entries of each query slot are used
   // by graph fetches.
   u32* graph_request_bytes{};
+  // Speculative descriptors remain owned by the QP-owner warp while the query
+  // CTA decodes committed records and may reuse the dynamic-PQ request arrays.
+  // These dedicated SoA arrays therefore have ROB-slot lifetime and eliminate
+  // descriptor-pointer aliasing/ABA with critical graph and dynamic-code reads.
+  u32* speculative_graph_request_shards{};
+  u64* speculative_graph_request_offsets{};
+  u64* speculative_graph_request_local_iovas{};
+  u32* speculative_graph_request_bytes{};
+  // The QP owner validates prefetched graph snapshots before publishing the
+  // completion word. Handles and one-byte results share the ROB-slot lifetime
+  // of the request SoA, so query CTAs consume validation without rescanning
+  // every record after the overlap window.
+  u64* speculative_graph_request_handles{};
+  u8* speculative_graph_validation_states{};
   QueryRdmaTraceHeader* query_rdma_trace_headers{};
   QueryRdmaTraceEvent* query_rdma_trace_events{};
-  QueryAdjacencyOracleTraceHeader* query_adjacency_oracle_trace_headers{};
-  QueryAdjacencyOracleTraceEvent* query_adjacency_oracle_trace_events{};
   u32 query_rdma_trace_mode{};
   u32 query_rdma_trace_sample_rate{};
   u32 query_rdma_trace_events_per_query{};
@@ -777,9 +495,10 @@ struct PersistentKernelOccupancy {
 // analytical register-only estimate is not sufficient because CUDA also
 // accounts for allocation granularity and every other per-CTA resource.
 PersistentKernelOccupancy inspect_persistent_search_kernel(
-  u32 threads, bool enable_adjacency_oracle = false);
+  u32 threads, bool enable_asfe = true);
 
-void launch_persistent_search(cudaStream_t stream, const PersistentKernelParams& params,
+void launch_persistent_search(cudaStream_t stream,
+                              const PersistentKernelParams& params,
                               u32 blocks, u32 threads);
 void launch_direct_read_owners(cudaStream_t stream,
                                const PersistentKernelParams& params,

@@ -2,8 +2,6 @@
 #include "gpu_search/persistent_engine/cuda_helpers.hh"
 
 #include <cerrno>
-#include <cmath>
-#include <cstring>
 
 namespace gpu_search {
 
@@ -16,15 +14,9 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
   }
   const u32 rdma_event_count = std::min(
     completion.trace_event_count, config.query_rdma_trace_events_per_query);
-  const u32 adjacency_event_count = std::min(
-    completion.adjacency_oracle_event_count,
-    config.query_rdma_trace_events_per_query);
   const bool have_rdma_events =
     rdma_event_count != 0 && d_query_rdma_trace_events != nullptr;
-  const bool have_adjacency_events =
-    adjacency_event_count != 0 &&
-    d_query_adjacency_oracle_trace_events != nullptr;
-  if (!have_rdma_events && !have_adjacency_events) return;
+  if (!have_rdma_events) return;
 
   std::vector<QueryRdmaTraceEvent> trace_events(rdma_event_count);
   if (have_rdma_events) {
@@ -36,18 +28,6 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
       trace_events.size() * sizeof(QueryRdmaTraceEvent),
       cudaMemcpyDeviceToHost), "cudaMemcpy(query RDMA trace events)");
   }
-  std::vector<QueryAdjacencyOracleTraceEvent> adjacency_events(
-    adjacency_event_count);
-  if (have_adjacency_events) {
-    check_cuda(cudaMemcpy(
-      adjacency_events.data(),
-      d_query_adjacency_oracle_trace_events +
-        static_cast<size_t>(completion.query_slot) *
-          config.query_rdma_trace_events_per_query,
-      adjacency_events.size() * sizeof(QueryAdjacencyOracleTraceEvent),
-      cudaMemcpyDeviceToHost),
-      "cudaMemcpy(query adjacency oracle trace events)");
-  }
   std::lock_guard<std::mutex> trace_lock(query_rdma_trace_mutex);
   query_rdma_trace_stream
     << "{\"type\":\"query\",\"request_id\":"
@@ -55,9 +35,6 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
     << completion.query_slot << ",\"status\":" << completion.status
     << ",\"event_count\":" << rdma_event_count
     << ",\"overflow\":" << completion.trace_overflow
-    << ",\"adjacency_oracle_event_count\":" << adjacency_event_count
-    << ",\"adjacency_oracle_overflow\":"
-    << completion.adjacency_oracle_overflow
     << ",\"gpu_cycles\":" << completion.gpu_cycles
     << ",\"gpu_clock_khz\":" << gpu_clock_khz
     << ",\"graph_rounds\":" << completion.graph_rounds
@@ -75,6 +52,82 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
     << completion.graph_extent_underhint_reads
     << ",\"graph_extent_hint_promotions\":"
     << completion.graph_extent_hint_promotions
+    << ",\"logical_expansions\":" << completion.logical_expansions
+    << ",\"critical_graph_reads\":" << completion.critical_graph_reads
+    << ",\"critical_graph_bytes\":" << completion.critical_graph_bytes
+    << ",\"speculative_graph_reads\":"
+    << completion.speculative_graph_reads
+    << ",\"speculative_graph_bytes\":"
+    << completion.speculative_graph_bytes
+    << ",\"speculative_wasted_bytes\":"
+    << completion.speculative_wasted_bytes
+    << ",\"rdma_completion_latency_ns\":"
+    << completion.rdma_completion_latency_ns
+    << ",\"speculative_completion_latency_ns\":"
+    << completion.speculative_completion_latency_ns
+    << ",\"rdma_completion_groups\":"
+    << completion.rdma_completion_groups
+    << ",\"speculative_completion_groups\":"
+    << completion.speculative_completion_groups
+    << ",\"speculative_arrived\":" << completion.speculative_arrived
+    << ",\"speculative_promoted\":" << completion.speculative_promoted
+    << ",\"speculative_stale\":" << completion.speculative_stale
+    << ",\"speculative_queue_rejects\":"
+    << completion.speculative_queue_rejects
+    << ",\"core_prefetch_reads\":" << completion.core_prefetch_reads
+    << ",\"core_prefetch_bytes\":" << completion.core_prefetch_bytes
+    << ",\"core_prefetch_arrived\":" << completion.core_prefetch_arrived
+    << ",\"core_prefetch_promoted\":"
+    << completion.core_prefetch_promoted
+    << ",\"core_prefetch_stale\":" << completion.core_prefetch_stale
+    << ",\"core_prefetch_queue_rejects\":"
+    << completion.core_prefetch_queue_rejects
+    << ",\"core_prefetch_waves\":" << completion.core_prefetch_waves
+    << ",\"core_ready_waves\":" << completion.core_ready_waves
+    << ",\"terminal_exact_cache_attempted_queries\":"
+    << completion.terminal_exact_cache_attempted_queries
+    << ",\"terminal_exact_cache_issued_records\":"
+    << completion.terminal_exact_cache_issued_records
+    << ",\"terminal_exact_cache_promoted_records\":"
+    << completion.terminal_exact_cache_promoted_records
+    << ",\"terminal_exact_cache_wasted_bytes\":"
+    << completion.terminal_exact_cache_wasted_bytes
+    << ",\"terminal_exact_cache_queue_rejects\":"
+    << completion.terminal_exact_cache_queue_rejects
+    << ",\"terminal_exact_cache_miss_records\":"
+    << completion.terminal_exact_cache_miss_records
+    << ",\"completion_score_batches\":"
+    << completion.completion_score_batches
+    << ",\"completion_score_candidates\":"
+    << completion.completion_score_candidates
+    << ",\"frontier_reusable_certificates\":"
+    << completion.frontier_reusable_certificates
+    << ",\"frontier_streamed_candidate_runs\":"
+    << completion.frontier_streamed_candidate_runs
+    << ",\"ordered_score_batches\":"
+    << completion.ordered_score_batches
+    << ",\"ordered_score_candidates\":"
+    << completion.ordered_score_candidates
+    << ",\"frontier_reusable_prefix_ranks\":"
+    << completion.frontier_reusable_prefix_ranks
+    << ",\"frontier_reusable_full_prefix_certificates\":"
+    << completion.frontier_reusable_full_prefix_certificates
+    << ",\"frontier_reusable_issued_certificates\":"
+    << completion.frontier_reusable_issued_certificates
+    << ",\"frontier_certificate_rejects\":"
+    << completion.frontier_telemetry_reserved0
+    << ",\"issue_epochs\":" << completion.issue_epochs
+    << ",\"commit_epochs\":" << completion.commit_epochs
+    << ",\"issue_width_sum\":" << completion.issue_width_sum
+    << ",\"issue_width_capacity_sum\":"
+    << completion.issue_width_capacity_sum
+    << ",\"commit_width_sum\":" << completion.commit_width_sum
+    << ",\"max_issue_width\":" << completion.max_issue_width
+    << ",\"max_commit_width\":" << completion.max_commit_width
+    << ",\"critical_rob_hits\":" << completion.critical_rob_hits
+    << ",\"critical_misses\":" << completion.critical_misses
+    << ",\"speculative_wait_cycles\":"
+    << completion.speculative_wait_cycles
     << ",\"beam_selection_cycles\":" << completion.beam_selection_cycles
     << ",\"rdma_issue_cycles\":" << completion.rdma_issue_cycles
     << ",\"rdma_wait_cycles\":" << completion.rdma_wait_cycles
@@ -90,31 +143,11 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
     << completion.beam_merge_sort_cycles
     << ",\"beam_merge_materialize_cycles\":"
     << completion.beam_merge_materialize_cycles
-    << ",\"expansion_policy\":" << completion.expansion_policy
-    << ",\"sum_selected_parents\":" << completion.sum_selected_parents
-    << ",\"sum_feedback_horizon\":" << completion.sum_feedback_horizon
-    << ",\"sum_hardware_credit_tiles\":"
-    << completion.sum_hardware_credit_tiles
-    << ",\"minimum_selected_batch\":"
-    << completion.minimum_selected_batch
-    << ",\"maximum_selected_batch\":"
-    << completion.maximum_selected_batch
-    << ",\"minimum_feedback_horizon\":"
-    << completion.minimum_feedback_horizon
-    << ",\"maximum_feedback_horizon\":"
-    << completion.maximum_feedback_horizon
-    << ",\"extra_parent_count\":" << completion.extra_parent_count
-    << ",\"qp_lease_claim_count\":" << completion.qp_lease_claim_count
-    << ",\"qp_lease_reject_count\":" << completion.qp_lease_reject_count
-    << ",\"qp_lease_rollback_count\":"
-    << completion.qp_lease_rollback_count
-    << ",\"compute_allowance_tile_sum\":"
-    << completion.compute_allowance_tile_sum
-    << ",\"marginal_probe_pass_count\":"
-    << completion.marginal_probe_pass_count
-    << ",\"marginal_probe_fail_count\":"
-    << completion.marginal_probe_fail_count
     << ",\"exact_cycles\":" << completion.exact_cycles
+    << ",\"exact_snapshot_train_batches\":"
+    << completion.exact_snapshot_train_batches
+    << ",\"exact_snapshot_train_fallbacks\":"
+    << completion.exact_snapshot_train_fallbacks
     << ",\"dynamic_code_cycles\":" << completion.dynamic_code_cycles
     << "}\n";
   for (const QueryRdmaTraceEvent& event : trace_events) {
@@ -136,138 +169,6 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
       << ",\"completion_timestamp_ns\":" << event.completion_timestamp_ns
       << ",\"batch_process_start_timestamp_ns\":"
       << event.batch_process_start_timestamp_ns << "}\n";
-  }
-  auto write_group_array = [this](const char* name, const u32* values) {
-    query_rdma_trace_stream << ",\"" << name << "\":[";
-    for (u32 index = 0; index < kQueryAdjacencyOracleGroupCount; ++index) {
-      if (index != 0) query_rdma_trace_stream << ',';
-      query_rdma_trace_stream << values[index];
-    }
-    query_rdma_trace_stream << ']';
-  };
-  auto write_prefix_array = [this](const char* name, const u32* values) {
-    query_rdma_trace_stream << ",\"" << name << "\":[";
-    for (u32 index = 0; index < kQueryAdjacencyOraclePrefixCount; ++index) {
-      if (index != 0) query_rdma_trace_stream << ',';
-      query_rdma_trace_stream << values[index];
-    }
-    query_rdma_trace_stream << ']';
-  };
-  auto write_turnover_u32_array =
-    [this](const char* name, const u32* values, u32 count) {
-      query_rdma_trace_stream << ",\"" << name << "\":[";
-      for (u32 index = 0;
-           index < std::min(count, kQueryBeamTurnoverTraceWidth); ++index) {
-        if (index != 0) query_rdma_trace_stream << ',';
-        query_rdma_trace_stream << values[index];
-      }
-      query_rdma_trace_stream << ']';
-    };
-  auto write_turnover_u64_array =
-    [this](const char* name, const u64* values, u32 count) {
-      query_rdma_trace_stream << ",\"" << name << "\":[";
-      for (u32 index = 0;
-           index < std::min(count, kQueryBeamTurnoverTraceWidth); ++index) {
-        if (index != 0) query_rdma_trace_stream << ',';
-        query_rdma_trace_stream << values[index];
-      }
-      query_rdma_trace_stream << ']';
-    };
-  for (const QueryAdjacencyOracleTraceEvent& event : adjacency_events) {
-    f32 cutoff_distance = 0.0f;
-    static_assert(sizeof(cutoff_distance) == sizeof(event.cutoff_distance_bits));
-    std::memcpy(
-      &cutoff_distance, &event.cutoff_distance_bits,
-      sizeof(cutoff_distance));
-    query_rdma_trace_stream
-      << "{\"type\":\"adjacency_oracle\",\"schema\":2,\"request_id\":"
-      << event.request_id
-      << ",\"search_round\":" << event.search_round
-      << ",\"chunk_begin\":" << event.chunk_begin
-      << ",\"parent_count\":" << event.parent_count
-      << ",\"edge_count\":" << event.edge_count
-      << ",\"invalid_decoded_count\":" << event.invalid_decoded_count
-      << ",\"dynamic_edge_count\":" << event.dynamic_edge_count
-      << ",\"visited_survivor_count\":" << event.visited_survivor_count
-      << ",\"finite_scored_count\":" << event.finite_scored_count
-      << ",\"beam_count_before\":" << event.beam_count_before
-      << ",\"beam_capacity\":" << event.beam_capacity
-      << ",\"cutoff_distance_bits\":" << event.cutoff_distance_bits
-      << ",\"cutoff_distance\":";
-    if (std::isfinite(cutoff_distance)) {
-      query_rdma_trace_stream << cutoff_distance;
-    } else {
-      query_rdma_trace_stream << "null";
-    }
-    query_rdma_trace_stream
-      << ",\"new_candidates_in_beam\":" << event.new_candidates_in_beam
-      << ",\"interval_lb_violation_count\":"
-      << event.interval_lb_violation_count
-      << ",\"minimum_interval_safety_margin\":";
-    if (std::isfinite(event.minimum_interval_safety_margin)) {
-      query_rdma_trace_stream << event.minimum_interval_safety_margin;
-    } else {
-      query_rdma_trace_stream << "null";
-    }
-    write_group_array("total_groups", event.total_groups);
-    write_group_array(
-      "certificate_needed_groups", event.certificate_needed_groups);
-    write_group_array(
-      "post_visited_needed_groups", event.post_visited_needed_groups);
-    write_group_array(
-      "final_beam_needed_groups", event.final_beam_needed_groups);
-    write_group_array(
-      "certificate_needed_runs", event.certificate_needed_runs);
-    write_group_array(
-      "certificate_first_group_needed_parents",
-      event.certificate_first_group_needed_parents);
-    write_group_array(
-      "interval_needed_groups", event.interval_needed_groups);
-    write_group_array(
-      "interval_needed_runs", event.interval_needed_runs);
-    write_group_array(
-      "interval_first_group_needed_parents",
-      event.interval_first_group_needed_parents);
-    write_prefix_array("parents_with_tail", event.parents_with_tail);
-    write_prefix_array(
-      "perfect_tail_needed_parents", event.perfect_tail_needed_parents);
-    write_prefix_array(
-      "suffix_interval_tail_needed_parents",
-      event.suffix_interval_tail_needed_parents);
-    write_prefix_array(
-      "post_visited_tail_needed_parents",
-      event.post_visited_tail_needed_parents);
-    write_prefix_array(
-      "final_beam_tail_needed_parents",
-      event.final_beam_tail_needed_parents);
-    write_prefix_array("total_tail_edges", event.total_tail_edges);
-    write_prefix_array(
-      "perfect_tail_needed_edges", event.perfect_tail_needed_edges);
-    write_prefix_array(
-      "suffix_interval_tail_needed_edges",
-      event.suffix_interval_tail_needed_edges);
-    query_rdma_trace_stream
-      << ",\"selected_productive_mask\":"
-      << event.selected_productive_mask
-      << ",\"frontier_count\":" << event.frontier_count
-      << ",\"frontier_new_mask\":" << event.frontier_new_mask
-      << ",\"round_graph_cycles\":" << event.round_graph_cycles
-      << ",\"round_score_cycles\":" << event.round_score_cycles
-      << ",\"round_beam_cycles\":" << event.round_beam_cycles;
-    write_turnover_u64_array(
-      "selected_handles", event.selected_handles, event.parent_count);
-    write_turnover_u32_array(
-      "selected_child_in_beam_count",
-      event.selected_child_in_beam_count, event.parent_count);
-    write_turnover_u32_array(
-      "selected_best_child_rank",
-      event.selected_best_child_rank, event.parent_count);
-    write_turnover_u64_array(
-      "frontier_handles", event.frontier_handles, event.frontier_count);
-    write_turnover_u32_array(
-      "frontier_distance_bits",
-      event.frontier_distance_bits, event.frontier_count);
-    query_rdma_trace_stream << "}\n";
   }
   query_rdma_trace_stream.flush();
 }
@@ -299,6 +200,7 @@ const char* query_failure_reason_name(QueryFailureReason reason) {
     case QueryFailureReason::graph_fetch: return "graph_fetch";
     case QueryFailureReason::dynamic_code_fetch: return "dynamic_code_fetch";
     case QueryFailureReason::exact_rerank_empty: return "exact_rerank_empty";
+    case QueryFailureReason::exact_fetch: return "exact_fetch";
   }
   return "unknown";
 }
@@ -539,10 +441,46 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << completion.graph_extent_underhint_reads
                 << " graph_extent_promotions="
                 << completion.graph_extent_hint_promotions
+                << " logical_expansions=" << completion.logical_expansions
+                << " critical_graph_reads="
+                << completion.critical_graph_reads
+                << " speculative_graph_reads="
+                << completion.speculative_graph_reads
+                << " speculative_promoted="
+                << completion.speculative_promoted
+                << " speculative_stale="
+                << completion.speculative_stale
+                << " speculative_wasted_bytes="
+                << completion.speculative_wasted_bytes
+                << " rdma_completion_latency_ns="
+                << completion.rdma_completion_latency_ns
+                << " rdma_completion_groups="
+                << completion.rdma_completion_groups
+                << " issue_width_max=" << completion.max_issue_width
+                << " commit_width_max=" << completion.max_commit_width
+                << " critical_misses=" << completion.critical_misses
+                << " certificate_rejects="
+                << completion.frontier_telemetry_reserved0
                 << " graph_batches=" << completion.remote_batches
                 << " graph_rounds=" << completion.graph_rounds
                 << " route_hits=" << completion.route_hits
                 << " exact_reads=" << completion.exact_vectors
+                << " exact_snapshot_trains="
+                << completion.exact_snapshot_train_batches
+                << " exact_snapshot_fallbacks="
+                << completion.exact_snapshot_train_fallbacks
+                << " terminal_exact_cache_attempted="
+                << completion.terminal_exact_cache_attempted_queries
+                << " terminal_exact_cache_issued="
+                << completion.terminal_exact_cache_issued_records
+                << " terminal_exact_cache_promoted="
+                << completion.terminal_exact_cache_promoted_records
+                << " terminal_exact_cache_misses="
+                << completion.terminal_exact_cache_miss_records
+                << " terminal_exact_cache_wasted_bytes="
+                << completion.terminal_exact_cache_wasted_bytes
+                << " terminal_exact_cache_queue_rejects="
+                << completion.terminal_exact_cache_queue_rejects
                 << " dynamic_pq_reads=" << completion.dynamic_code_reads
                 << " dynamic_pq_us="
                 << completion.dynamic_code_cycles * 1000ULL / gpu_clock_khz
@@ -562,6 +500,67 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << completion.status
                 << " reason=" << query_failure_reason_name(failure_reason)
                 << " route_snapshot_retries=" << route_snapshot_retries;
+        if (failure_reason == QueryFailureReason::graph_fetch ||
+            failure_reason == QueryFailureReason::dynamic_code_fetch) {
+          const u32 failure_code = completion.result_count;
+          const u32 failure_stage = failure_code & 0xffu;
+          message << " failure_stage=" << failure_stage;
+          if (failure_stage == 6u) {
+            const u32 detail = failure_code >> 8;
+            message << " authoritative_fetch_detail=" << detail;
+            if ((detail & (u32{1} << 16)) != 0) {
+              message << " authoritative_fetch_status=-"
+                      << (detail & 0xffffu);
+            } else {
+              const u32 prepare_reason = detail & 0xfu;
+              if (prepare_reason == 1u || prepare_reason == 2u ||
+                  prepare_reason == 3u || prepare_reason == 4u ||
+                  prepare_reason == 6u || prepare_reason == 7u ||
+                  prepare_reason == 8u) {
+                message << " prepare_reason=" << prepare_reason
+                        << " prepare_index=" << ((detail >> 4) & 0x1fu)
+                        << " prepare_scratch_slot="
+                        << ((detail >> 9) & 0x3fu)
+                        << " selection_from_certificate="
+                        << ((detail >> 15) & 1u)
+                        << " rejected_handle=0x" << std::hex
+                        << (static_cast<u64>(
+                              completion.frontier_telemetry_reserved1)
+                              << 32 |
+                            completion.frontier_telemetry_reserved0)
+                        << std::dec;
+              }
+            }
+          } else {
+            message << " dependency_status=-"
+                    << ((failure_code >> 8) & 0xffffu);
+          }
+        } else if (failure_reason ==
+                   QueryFailureReason::exact_rerank_empty) {
+          const u32 detail = completion.result_count;
+          const u64 rejected_handle =
+            (static_cast<u64>(
+               completion.frontier_telemetry_reserved1) << 32) |
+            completion.frontier_telemetry_reserved0;
+          message
+            << " exact_candidates=" << (detail & 0xffu)
+            << " exact_resolved=" << ((detail >> 8) & 0xffu)
+            << " exact_equal_headers=" << ((detail >> 16) & 0xffu)
+            << " exact_visible=" << ((detail >> 24) & 0xffu)
+            << " first_rejected_handle=0x" << std::hex
+            << rejected_handle
+            << " first_header_before=0x"
+            << completion.rdma_completion_latency_ns
+            << " first_header_after=0x"
+            << completion.speculative_completion_latency_ns
+            << std::dec
+            << " expected_incarnation="
+            << static_cast<u32>(completion.issue_width_sum >> 32)
+            << " stored_incarnation="
+            << static_cast<u32>(completion.issue_width_sum)
+            << " beam_empty_detail=0x" << std::hex
+            << completion.commit_width_sum << std::dec;
+        }
         mark_unhealthy(message.str());
       }
       reject_query_slot(completion.query_slot);
@@ -591,6 +590,15 @@ void PersistentSearchEngine::Impl::completion_loop() {
       phase_ns(completion.beam_selection_cycles), std::memory_order_relaxed);
     engine.telemetry_.gpu_rdma_issue_ns.fetch_add(
       phase_ns(completion.rdma_issue_cycles), std::memory_order_relaxed);
+    engine.telemetry_.gpu_frontier_preview_ns.fetch_add(
+      phase_ns(completion.frontier_preview_cycles),
+      std::memory_order_relaxed);
+    engine.telemetry_.gpu_frontier_prepare_ns.fetch_add(
+      phase_ns(completion.frontier_prepare_cycles),
+      std::memory_order_relaxed);
+    engine.telemetry_.gpu_frontier_enqueue_ns.fetch_add(
+      phase_ns(completion.frontier_enqueue_cycles),
+      std::memory_order_relaxed);
     engine.telemetry_.gpu_rdma_wait_ns.fetch_add(
       phase_ns(completion.rdma_wait_cycles), std::memory_order_relaxed);
     engine.telemetry_.gpu_graph_validation_ns.fetch_add(
@@ -612,57 +620,6 @@ void PersistentSearchEngine::Impl::completion_loop() {
     engine.telemetry_.gpu_beam_merge_materialize_ns.fetch_add(
       phase_ns(completion.beam_merge_materialize_cycles),
       std::memory_order_relaxed);
-    if (completion.expansion_policy ==
-        static_cast<u32>(QueryExpansionPolicy::feedback_hunger)) {
-      engine.telemetry_.feedback_hunger_queries.fetch_add(
-        1, std::memory_order_relaxed);
-    }
-    engine.telemetry_.expansion_sum_selected_parents.fetch_add(
-      completion.sum_selected_parents, std::memory_order_relaxed);
-    engine.telemetry_.expansion_sum_feedback_horizon.fetch_add(
-      completion.sum_feedback_horizon, std::memory_order_relaxed);
-    engine.telemetry_.expansion_sum_hardware_credit_tiles.fetch_add(
-      completion.sum_hardware_credit_tiles, std::memory_order_relaxed);
-    engine.telemetry_.expansion_extra_parents.fetch_add(
-      completion.extra_parent_count, std::memory_order_relaxed);
-    engine.telemetry_.expansion_qp_lease_claims.fetch_add(
-      completion.qp_lease_claim_count, std::memory_order_relaxed);
-    engine.telemetry_.expansion_qp_lease_rejects.fetch_add(
-      completion.qp_lease_reject_count, std::memory_order_relaxed);
-    engine.telemetry_.expansion_qp_lease_rollbacks.fetch_add(
-      completion.qp_lease_rollback_count, std::memory_order_relaxed);
-    engine.telemetry_.expansion_compute_allowance_tiles.fetch_add(
-      completion.compute_allowance_tile_sum, std::memory_order_relaxed);
-    engine.telemetry_.expansion_marginal_probe_passes.fetch_add(
-      completion.marginal_probe_pass_count, std::memory_order_relaxed);
-    engine.telemetry_.expansion_marginal_probe_failures.fetch_add(
-      completion.marginal_probe_fail_count, std::memory_order_relaxed);
-    if (completion.graph_rounds != 0) {
-      if (completion.minimum_selected_batch <
-          engine.telemetry_.expansion_minimum_selected_batch.load(
-            std::memory_order_relaxed)) {
-        engine.telemetry_.expansion_minimum_selected_batch.store(
-          completion.minimum_selected_batch, std::memory_order_relaxed);
-      }
-      if (completion.minimum_feedback_horizon <
-          engine.telemetry_.expansion_minimum_feedback_horizon.load(
-            std::memory_order_relaxed)) {
-        engine.telemetry_.expansion_minimum_feedback_horizon.store(
-          completion.minimum_feedback_horizon, std::memory_order_relaxed);
-      }
-    }
-    if (completion.maximum_selected_batch >
-        engine.telemetry_.expansion_maximum_selected_batch.load(
-          std::memory_order_relaxed)) {
-      engine.telemetry_.expansion_maximum_selected_batch.store(
-        completion.maximum_selected_batch, std::memory_order_relaxed);
-    }
-    if (completion.maximum_feedback_horizon >
-        engine.telemetry_.expansion_maximum_feedback_horizon.load(
-          std::memory_order_relaxed)) {
-      engine.telemetry_.expansion_maximum_feedback_horizon.store(
-        completion.maximum_feedback_horizon, std::memory_order_relaxed);
-    }
     engine.telemetry_.completion_wait_ns.fetch_add(end_to_end_ns,
                                                    std::memory_order_relaxed);
     const u64 physical_graph_reads =
@@ -687,6 +644,12 @@ void PersistentSearchEngine::Impl::completion_loop() {
     }
     engine.telemetry_.exact_vector_reads.fetch_add(completion.exact_vectors,
                                                    std::memory_order_relaxed);
+    engine.telemetry_.exact_snapshot_train_batches.fetch_add(
+      completion.exact_snapshot_train_batches,
+      std::memory_order_relaxed);
+    engine.telemetry_.exact_snapshot_train_fallbacks.fetch_add(
+      completion.exact_snapshot_train_fallbacks,
+      std::memory_order_relaxed);
     engine.telemetry_.dynamic_code_candidates.fetch_add(
       completion.dynamic_code_candidates, std::memory_order_relaxed);
     engine.telemetry_.dynamic_code_reads.fetch_add(
@@ -749,6 +712,127 @@ void PersistentSearchEngine::Impl::completion_loop() {
       completion.graph_extent_underhint_reads, std::memory_order_relaxed);
     engine.telemetry_.graph_extent_hint_promotions.fetch_add(
       completion.graph_extent_hint_promotions, std::memory_order_relaxed);
+    engine.telemetry_.logical_expansions.fetch_add(
+      completion.logical_expansions, std::memory_order_relaxed);
+    engine.telemetry_.critical_graph_reads.fetch_add(
+      completion.critical_graph_reads, std::memory_order_relaxed);
+    engine.telemetry_.critical_graph_bytes.fetch_add(
+      completion.critical_graph_bytes, std::memory_order_relaxed);
+    engine.telemetry_.speculative_graph_reads.fetch_add(
+      completion.speculative_graph_reads, std::memory_order_relaxed);
+    engine.telemetry_.speculative_graph_bytes.fetch_add(
+      completion.speculative_graph_bytes, std::memory_order_relaxed);
+    engine.telemetry_.speculative_wasted_bytes.fetch_add(
+      completion.speculative_wasted_bytes, std::memory_order_relaxed);
+    engine.telemetry_.terminal_exact_cache_wasted_bytes.fetch_add(
+      completion.terminal_exact_cache_wasted_bytes,
+      std::memory_order_relaxed);
+    engine.telemetry_.rdma_completion_latency_ns.fetch_add(
+      completion.rdma_completion_latency_ns, std::memory_order_relaxed);
+    engine.telemetry_.speculative_completion_latency_ns.fetch_add(
+      completion.speculative_completion_latency_ns,
+      std::memory_order_relaxed);
+    engine.telemetry_.rdma_completion_groups.fetch_add(
+      completion.rdma_completion_groups, std::memory_order_relaxed);
+    engine.telemetry_.speculative_completion_groups.fetch_add(
+      completion.speculative_completion_groups,
+      std::memory_order_relaxed);
+    engine.telemetry_.speculative_arrived.fetch_add(
+      completion.speculative_arrived, std::memory_order_relaxed);
+    engine.telemetry_.speculative_promoted.fetch_add(
+      completion.speculative_promoted, std::memory_order_relaxed);
+    engine.telemetry_.speculative_stale.fetch_add(
+      completion.speculative_stale, std::memory_order_relaxed);
+    engine.telemetry_.speculative_queue_rejects.fetch_add(
+      completion.speculative_queue_rejects, std::memory_order_relaxed);
+    engine.telemetry_.core_prefetch_reads.fetch_add(
+      completion.core_prefetch_reads, std::memory_order_relaxed);
+    engine.telemetry_.core_prefetch_bytes.fetch_add(
+      completion.core_prefetch_bytes, std::memory_order_relaxed);
+    engine.telemetry_.core_prefetch_arrived.fetch_add(
+      completion.core_prefetch_arrived, std::memory_order_relaxed);
+    engine.telemetry_.core_prefetch_promoted.fetch_add(
+      completion.core_prefetch_promoted, std::memory_order_relaxed);
+    engine.telemetry_.core_prefetch_stale.fetch_add(
+      completion.core_prefetch_stale, std::memory_order_relaxed);
+    engine.telemetry_.core_prefetch_queue_rejects.fetch_add(
+      completion.core_prefetch_queue_rejects, std::memory_order_relaxed);
+    engine.telemetry_.core_prefetch_waves.fetch_add(
+      completion.core_prefetch_waves, std::memory_order_relaxed);
+    engine.telemetry_.core_ready_waves.fetch_add(
+      completion.core_ready_waves, std::memory_order_relaxed);
+    engine.telemetry_.terminal_exact_cache_attempted_queries.fetch_add(
+      completion.terminal_exact_cache_attempted_queries,
+      std::memory_order_relaxed);
+    engine.telemetry_.terminal_exact_cache_issued_records.fetch_add(
+      completion.terminal_exact_cache_issued_records,
+      std::memory_order_relaxed);
+    engine.telemetry_.terminal_exact_cache_promoted_records.fetch_add(
+      completion.terminal_exact_cache_promoted_records,
+      std::memory_order_relaxed);
+    engine.telemetry_.terminal_exact_cache_queue_rejects.fetch_add(
+      completion.terminal_exact_cache_queue_rejects,
+      std::memory_order_relaxed);
+    engine.telemetry_.terminal_exact_cache_miss_records.fetch_add(
+      completion.terminal_exact_cache_miss_records,
+      std::memory_order_relaxed);
+    engine.telemetry_.completion_score_batches.fetch_add(
+      completion.completion_score_batches, std::memory_order_relaxed);
+    engine.telemetry_.completion_score_candidates.fetch_add(
+      completion.completion_score_candidates, std::memory_order_relaxed);
+    engine.telemetry_.frontier_reusable_certificates.fetch_add(
+      completion.frontier_reusable_certificates,
+      std::memory_order_relaxed);
+    engine.telemetry_.frontier_streamed_candidate_runs.fetch_add(
+      completion.frontier_streamed_candidate_runs,
+      std::memory_order_relaxed);
+    engine.telemetry_.ordered_score_batches.fetch_add(
+      completion.ordered_score_batches, std::memory_order_relaxed);
+    engine.telemetry_.ordered_score_candidates.fetch_add(
+      completion.ordered_score_candidates, std::memory_order_relaxed);
+    engine.telemetry_.frontier_reusable_prefix_ranks.fetch_add(
+      completion.frontier_reusable_prefix_ranks,
+      std::memory_order_relaxed);
+    engine.telemetry_.frontier_reusable_full_prefix_certificates.fetch_add(
+      completion.frontier_reusable_full_prefix_certificates,
+      std::memory_order_relaxed);
+    engine.telemetry_.frontier_reusable_issued_certificates.fetch_add(
+      completion.frontier_reusable_issued_certificates,
+      std::memory_order_relaxed);
+    engine.telemetry_.frontier_certificate_rejects.fetch_add(
+      completion.frontier_telemetry_reserved0,
+      std::memory_order_relaxed);
+    engine.telemetry_.issue_epochs.fetch_add(
+      completion.issue_epochs, std::memory_order_relaxed);
+    engine.telemetry_.commit_epochs.fetch_add(
+      completion.commit_epochs, std::memory_order_relaxed);
+    engine.telemetry_.issue_width_sum.fetch_add(
+      completion.issue_width_sum, std::memory_order_relaxed);
+    engine.telemetry_.issue_width_capacity_sum.fetch_add(
+      completion.issue_width_capacity_sum, std::memory_order_relaxed);
+    engine.telemetry_.commit_width_sum.fetch_add(
+      completion.commit_width_sum, std::memory_order_relaxed);
+    engine.telemetry_.critical_rob_hits.fetch_add(
+      completion.critical_rob_hits, std::memory_order_relaxed);
+    engine.telemetry_.critical_misses.fetch_add(
+      completion.critical_misses, std::memory_order_relaxed);
+    engine.telemetry_.speculative_wait_ns.fetch_add(
+      phase_ns(completion.speculative_wait_cycles),
+      std::memory_order_relaxed);
+    u64 observed_max_issue_width =
+      engine.telemetry_.max_issue_width.load(std::memory_order_relaxed);
+    while (observed_max_issue_width < completion.max_issue_width &&
+           !engine.telemetry_.max_issue_width.compare_exchange_weak(
+             observed_max_issue_width, completion.max_issue_width,
+             std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+    u64 observed_max_commit_width =
+      engine.telemetry_.max_commit_width.load(std::memory_order_relaxed);
+    while (observed_max_commit_width < completion.max_commit_width &&
+           !engine.telemetry_.max_commit_width.compare_exchange_weak(
+             observed_max_commit_width, completion.max_commit_width,
+             std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
     engine.telemetry_.graph_dependency_rounds.fetch_add(
       completion.graph_rounds, std::memory_order_relaxed);
     engine.telemetry_.graph_route_hits.fetch_add(completion.route_hits,

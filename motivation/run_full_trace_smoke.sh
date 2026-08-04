@@ -13,7 +13,6 @@ trace_path="$run_dir/rdma_trace.jsonl"
   set -a
   source "$MOTIVATION_DIR/configs/common.env"
   source "$MOTIVATION_DIR/configs/prefetch_${DEPTH}.env"
-  GPU_QUERY_EXPANSION_POLICY=fixed
   GPU_QUERY_BEAM_MERGE_POLICY=stable-run
   BENCHMARK_CLIENT_THREADS=1
   REPORT_DIR="$run_dir"

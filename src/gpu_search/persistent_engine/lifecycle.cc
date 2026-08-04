@@ -113,6 +113,29 @@ void PersistentSearchEngine::Impl::stream_codes_to_gpu(NavigationBootstrapper& s
 
 void PersistentSearchEngine::Impl::start_persistent_kernel() {
   bind_cuda_device("cudaSetDevice(GPU navigation kernel start)");
+  if (kernel_params.issue_width > kernel_params.commit_width) {
+    // The ASFE specialization has an out-of-line Stable-Run/CUB call chain.
+    // The ASFE specialization has an out-of-line Stable-Run/CUB call chain.
+    // Its linked device frame is slightly larger than CUDA's common 1-KiB
+    // default, so an undersized per-thread stack can corrupt the generic
+    // shared-memory pointer passed to BlockRadixSort. Set a context-local
+    // floor; this does not allocate any per-query buffer or alter occupancy.
+    constexpr size_t kAsfeDeviceStackFloor = 2u * 1024u;
+    size_t device_stack_limit = 0;
+    check_cuda(cudaDeviceGetLimit(
+                 &device_stack_limit, cudaLimitStackSize),
+               "cudaDeviceGetLimit(cudaLimitStackSize)");
+    if (device_stack_limit < kAsfeDeviceStackFloor) {
+      check_cuda(cudaDeviceSetLimit(
+                   cudaLimitStackSize, kAsfeDeviceStackFloor),
+                 "cudaDeviceSetLimit(cudaLimitStackSize)");
+      check_cuda(cudaDeviceGetLimit(
+                   &device_stack_limit, cudaLimitStackSize),
+                 "cudaDeviceGetLimit(cudaLimitStackSize adjusted)");
+    }
+    std::cerr << "[gpu-search] ASFE device stack bytes/thread="
+              << device_stack_limit << '\n';
+  }
   *stop_host = 0;
   *direct_disabled_host = 0;
   *direct_error_host = 0;
@@ -122,23 +145,6 @@ void PersistentSearchEngine::Impl::start_persistent_kernel() {
              "cudaMemset(GPU navigation direct failure flag)");
   check_cuda(cudaMemset(direct_error_device, 0, sizeof(i32)),
              "cudaMemset(GPU navigation direct error)");
-  if (d_expansion_pressure != nullptr) {
-    ExpansionPressureState pressure{};
-    const u32 tile = std::max(1u, kernel_threads / 32u);
-    pressure.maximum_credit_tiles =
-      (kernel_params.efficient_batch_cap + tile - 1u) / tile;
-    check_cuda(cudaMemcpy(
-                 d_expansion_pressure, &pressure, sizeof(pressure),
-                 cudaMemcpyHostToDevice),
-               "cudaMemcpy(GPU expansion pressure start state)");
-  }
-  if (d_expansion_qp_leases != nullptr && direct_batch_queue_count != 0) {
-    check_cuda(cudaMemset(
-                 d_expansion_qp_leases, 0,
-                 static_cast<size_t>(direct_batch_queue_count) *
-                   sizeof(QpExpansionLeaseState)),
-               "cudaMemset(GPU expansion QP lease start state)");
-  }
   (void)cudaGetLastError();
   std::fill_n(direct_owner_phases_host, direct_batch_queue_count, 0u);
   std::fill_n(direct_owner_progress_host, direct_batch_queue_count,
@@ -192,8 +198,8 @@ void PersistentSearchEngine::Impl::start_persistent_kernel() {
             << persistent_kernel_occupancy.static_shared_bytes
             << " max_threads/block="
             << persistent_kernel_occupancy.max_threads_per_block << '\n';
-  launch_persistent_search(kernel_stream, launch_params, total_blocks,
-                           kernel_threads);
+  launch_persistent_search(kernel_stream, launch_params,
+                           total_blocks, kernel_threads);
   check_cuda(cudaGetLastError(), "launch_persistent_search(unified navigation)");
 
   const auto ready_deadline = std::chrono::steady_clock::now() +
@@ -349,13 +355,18 @@ PersistentSearchEngine::Impl::~Impl() {
   device_free(d_centroid_route_entries);
   device_free(d_direct_batch_statuses);
   device_free(d_direct_batch_completion_timestamps_ns);
+  device_free(d_core_batch_statuses);
+  device_free(d_core_batch_completion_timestamps_ns);
+  device_free(d_tail_batch_statuses);
+  device_free(d_tail_batch_completion_timestamps_ns);
   device_free(d_query_rdma_trace_events);
   device_free(d_query_rdma_trace_headers);
-  device_free(d_query_adjacency_oracle_trace_events);
-  device_free(d_query_adjacency_oracle_trace_headers);
-  device_free(d_expansion_qp_leases);
-  device_free(d_expansion_pressure);
   device_free(d_direct_owner_progress);
+  device_free(d_direct_speculative_batch_queues);
+  device_free(d_direct_speculative_batch_entries);
+  device_free(d_direct_speculative_batch_sequences);
+  device_free(d_direct_speculative_batch_dequeue);
+  device_free(d_direct_speculative_batch_enqueue);
   device_free(d_direct_batch_queues);
   device_free(d_direct_batch_entries);
   device_free(d_direct_batch_sequences);
@@ -374,6 +385,12 @@ PersistentSearchEngine::Impl::~Impl() {
   device_free(d_dynamic_code_request_offsets);
   device_free(d_dynamic_code_request_shards);
   device_free(d_graph_request_bytes);
+  device_free(d_speculative_graph_validation_states);
+  device_free(d_speculative_graph_request_handles);
+  device_free(d_speculative_graph_request_bytes);
+  device_free(d_speculative_graph_request_local_iovas);
+  device_free(d_speculative_graph_request_offsets);
+  device_free(d_speculative_graph_request_shards);
   device_free(d_graph_extent_class_words);
   device_free(d_dynamic_code_arena_records);
   device_free(d_dynamic_code_arena_states);

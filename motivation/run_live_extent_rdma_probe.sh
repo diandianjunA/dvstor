@@ -69,7 +69,6 @@ cmd=("$BUILD_DIR/dvstor_gpunetio_loopback_probe"
   --gpu-bootstrap-window-mb "${GPU_BOOTSTRAP_WINDOW_MB:-64}"
   --gpu-bootstrap-windows "${GPU_BOOTSTRAP_WINDOWS:-4}"
   --gpu-graph-prefetch-depth "${GPU_GRAPH_PREFETCH_DEPTH:-16}"
-  --gpu-query-expansion-policy fixed
   --gpu-query-beam-merge-policy "${GPU_QUERY_BEAM_MERGE_POLICY:-stable-run}"
   --query-rdma-trace-mode off
   --gpu-traversal-beam-width "${GPU_TRAVERSAL_BEAM_WIDTH:-128}"

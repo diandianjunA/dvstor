@@ -9,6 +9,8 @@ Usage: ./experiment/run_breakdown.sh [PROFILE]
 
 常用负载：
   WORKLOAD=query|insert|both|mixed        默认 mixed
+  BENCHMARK_MODE=time|ops                 默认 time；ops 固定 warmup/measurement 工作量
+  WARMUP_OPS/MEASURE_OPS                 ops 模式下的固定操作数（默认 100/1000）
 
 并发负载：
   BENCHMARK_CLIENT_THREADS=auto           默认；由有界 GPU/RPC 容量推导
@@ -59,6 +61,9 @@ MIXED_MODE="${MIXED_MODE:-fixed_threads}"
 # MIXED_MODE="${MIXED_MODE:-probability}"
 WARMUP_SECONDS="${WARMUP_SECONDS:-30}"
 MEASURE_SECONDS="${MEASURE_SECONDS:-120}"
+BENCHMARK_MODE="${BENCHMARK_MODE:-time}"
+WARMUP_OPS="${WARMUP_OPS:-100}"
+MEASURE_OPS="${MEASURE_OPS:-1000}"
 RECALL_QUERIES="${RECALL_QUERIES:-1000}"
 RECALL_K="${RECALL_K:-$K}"
 TARGET_QUERY_QPS="${TARGET_QUERY_QPS:-0}"
@@ -66,13 +71,25 @@ TARGET_WRITE_QPS="${TARGET_WRITE_QPS:-0}"
 RECALL_MODE="${RECALL_MODE:-all}"
 RECALL_BASE_ID_LIMIT="${RECALL_BASE_ID_LIMIT:-0}"
 
+if [[ "$BENCHMARK_MODE" != "time" && "$BENCHMARK_MODE" != "ops" ]]; then
+  echo "BENCHMARK_MODE must be time or ops" >&2
+  exit 1
+fi
 if [[ ! "$WARMUP_SECONDS" =~ ^(0|[1-9][0-9]*)$ ]] ||
-   [[ ! "$MEASURE_SECONDS" =~ ^(0|[1-9][0-9]*)$ ]]; then
+   [[ ! "$MEASURE_SECONDS" =~ ^(0|[1-9][0-9]*)$ ]] ||
+   [[ ! "$WARMUP_OPS" =~ ^(0|[1-9][0-9]*)$ ]] ||
+   [[ ! "$MEASURE_OPS" =~ ^(0|[1-9][0-9]*)$ ]]; then
   echo "WARMUP_SECONDS and MEASURE_SECONDS must be non-negative integers" >&2
   exit 1
 fi
-if (( (WARMUP_SECONDS == 0) != (MEASURE_SECONDS == 0) )); then
+if [[ "$BENCHMARK_MODE" == "time" ]] &&
+   (( (WARMUP_SECONDS == 0) != (MEASURE_SECONDS == 0) )); then
   echo "WARMUP_SECONDS and MEASURE_SECONDS must either both be zero or both be positive" >&2
+  exit 1
+fi
+if [[ "$BENCHMARK_MODE" == "ops" ]] &&
+   (( WARMUP_OPS == 0 || MEASURE_OPS == 0 )); then
+  echo "WARMUP_OPS and MEASURE_OPS must be positive in ops mode" >&2
   exit 1
 fi
 
@@ -390,7 +407,8 @@ if (( needs_performance_query )); then
     echo "invalid performance query header: $PERFORMANCE_QUERY_PATH" >&2
     exit 1
   fi
-  if (( WARMUP_SECONDS + MEASURE_SECONDS > 0 )); then
+  if [[ "$BENCHMARK_MODE" == "time" ]] &&
+     (( WARMUP_SECONDS + MEASURE_SECONDS > 0 )); then
     unique_query_budget_qps="$(awk \
       -v rows="$performance_query_rows" \
       -v seconds="$((WARMUP_SECONDS + MEASURE_SECONDS))" \
@@ -450,8 +468,10 @@ write_service_config "$RUNTIME_CONFIG"
 cmd=("$BUILD_DIR/dvstor_breakdown_benchmark"
   --service-config "$RUNTIME_CONFIG"
   --workload "$WORKLOAD"
-  --warmup-seconds "$WARMUP_SECONDS"
-  --measure-seconds "$MEASURE_SECONDS"
+  --warmup-ops "$WARMUP_OPS"
+  --measure-ops "$MEASURE_OPS"
+  --warmup-seconds "$([[ "$BENCHMARK_MODE" == "time" ]] && echo "$WARMUP_SECONDS" || echo 0)"
+  --measure-seconds "$([[ "$BENCHMARK_MODE" == "time" ]] && echo "$MEASURE_SECONDS" || echo 0)"
   --client-threads "$BENCHMARK_CLIENT_THREADS"
   --read-ratio "$READ_RATIO"
   --mixed-mode "$MIXED_MODE"

@@ -123,9 +123,6 @@ struct PersistentSearchEngine::Impl {
   void report_direct_path_failure();
   void completion_loop();
   void write_query_rdma_trace(const CompletionDescriptor& completion);
-  void augment_expansion_pressure_telemetry(
-    TelemetrySnapshot& snapshot) const;
-  void reset_expansion_pressure_telemetry();
 
   void submit_centroid_route_publication(
     const CentroidRoutePublishDescriptor& descriptor);
@@ -224,6 +221,12 @@ struct PersistentSearchEngine::Impl {
   // repair stale bytes with CAS. Dynamic records always use the full record.
   u32* d_graph_extent_class_words{};
   u32* d_graph_request_bytes{};
+  u32* d_speculative_graph_request_shards{};
+  u64* d_speculative_graph_request_offsets{};
+  u64* d_speculative_graph_request_local_iovas{};
+  u32* d_speculative_graph_request_bytes{};
+  u64* d_speculative_graph_request_handles{};
+  u8* d_speculative_graph_validation_states{};
   u64 graph_extent_sidecar_bytes{};
   u64* d_query_dispatch_enqueue{};
   u64* d_query_dispatch_dequeue{};
@@ -234,24 +237,33 @@ struct PersistentSearchEngine::Impl {
   u64* d_direct_batch_sequences{};
   DirectBatchDescriptor* d_direct_batch_entries{};
   DeviceRingView<DirectBatchDescriptor>* d_direct_batch_queues{};
+  // Standalone shadow-frontier reads use a disjoint per-QP ring.  Keeping
+  // them out of the critical producer ring lets the persistent owner enforce
+  // critical-first admission without a global scheduler or producer atomics.
+  u64* d_direct_speculative_batch_enqueue{};
+  u64* d_direct_speculative_batch_dequeue{};
+  u64* d_direct_speculative_batch_sequences{};
+  DirectBatchDescriptor* d_direct_speculative_batch_entries{};
+  DeviceRingView<DirectBatchDescriptor>*
+    d_direct_speculative_batch_queues{};
   i32* d_direct_batch_statuses{};
   u64* d_direct_batch_completion_timestamps_ns{};
+  i32* d_core_batch_statuses{};
+  u64* d_core_batch_completion_timestamps_ns{};
+  i32* d_tail_batch_statuses{};
+  u64* d_tail_batch_completion_timestamps_ns{};
   QueryRdmaTraceHeader* d_query_rdma_trace_headers{};
   QueryRdmaTraceEvent* d_query_rdma_trace_events{};
-  QueryAdjacencyOracleTraceHeader*
-    d_query_adjacency_oracle_trace_headers{};
-  QueryAdjacencyOracleTraceEvent*
-    d_query_adjacency_oracle_trace_events{};
   std::ofstream query_rdma_trace_stream;
   std::mutex query_rdma_trace_mutex;
   u32* direct_owner_phases_host{};
   u32* d_direct_owner_phases{};
   DirectOwnerProgress* direct_owner_progress_host{};
   DirectOwnerProgress* d_direct_owner_progress{};
-  ExpansionPressureState* d_expansion_pressure{};
-  QpExpansionLeaseState* d_expansion_qp_leases{};
-  ExpansionPressureState expansion_pressure_baseline{};
-  std::vector<QpExpansionLeaseState> expansion_qp_lease_baseline;
+  std::atomic<u64> owner_submitted_wqes_baseline{0};
+  std::atomic<u64> owner_submission_wqe_capacity_baseline{0};
+  std::atomic<u64> owner_critical_batches_baseline{0};
+  std::atomic<u64> owner_speculative_batches_baseline{0};
   u32* query_kernel_ready_host{};
   u32* d_query_kernel_ready{};
   u32* dispatcher_kernel_ready_host{};

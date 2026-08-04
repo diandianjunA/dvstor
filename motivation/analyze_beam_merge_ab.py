@@ -20,8 +20,9 @@ POLICIES = ("legacy", "stable-run")
 # pair.  Policy is checked separately because it is the controlled variable.
 PAIR_FIELDS = (
     ("client_threads", ("meta", "client_threads")),
+    ("index_prefix", ("meta", "index_prefix")),
     ("prefetch_depth", ("meta", "gpu_graph_prefetch_depth")),
-    ("expansion_policy", ("meta", "gpu_query_expansion_policy")),
+    ("graph_read_policy", ("meta", "gpu_query_graph_read_policy")),
     ("beam_width", ("meta", "traversal_beam_width")),
     ("rerank_width", ("meta", "final_rerank_width")),
     ("max_expansions", ("meta", "max_expansions")),
@@ -38,6 +39,13 @@ PAIR_FIELDS = (
     ("recall_query_file", ("recall", "query_file")),
     ("groundtruth_file", ("recall", "groundtruth_file")),
 )
+
+# Live-Extent did not exist when the preserved Stable-Run evidence was
+# collected, so those reports omit the field and necessarily used fixed-size
+# graph reads. New reports always record it explicitly.
+OPTIONAL_PAIR_DEFAULTS = {
+    ("meta", "gpu_query_graph_read_policy"): "fixed",
+}
 
 
 @dataclass(frozen=True)
@@ -137,7 +145,12 @@ def require_number(root, parts, report_path, *, nonnegative=True):
 
 
 def require_pair_value(root, parts, report_path):
-    value = require_field(root, parts, report_path)
+    try:
+        value = require_field(root, parts, report_path)
+    except ReportError:
+        if parts not in OPTIONAL_PAIR_DEFAULTS:
+            raise
+        value = OPTIONAL_PAIR_DEFAULTS[parts]
     if isinstance(value, (dict, list)) or value is None:
         raise ReportError(
             f"{report_path}: {field_name(parts)} is not a scalar")
@@ -167,11 +180,6 @@ def load_report(path, expected_policy):
         require_pair_value(root, parts, path)
         for _, parts in PAIR_FIELDS
     )
-    expansion_policy = key[2]
-    if expansion_policy != "fixed":
-        raise ReportError(
-            f"{path}: beam-merge A/B requires fixed expansion policy, "
-            f"got {expansion_policy!r}")
 
     metrics = {}
     for spec in METRIC_SPECS:

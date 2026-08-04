@@ -214,6 +214,16 @@ class LiveExtentAbAnalyzerTest(unittest.TestCase):
                 "gpu_query_graph_read_policy='fixed', expected 'live-extent'"):
             analyzer.discover_pairs(self.root)
 
+    def test_removed_expansion_policy_field_is_optional_and_ignored(self):
+        fixed = make_report("fixed", 64)
+        live = make_report("live-extent", 64)
+        live["meta"].pop("gpu_query_expansion_policy")
+        self.write_report("fixed", 64, 1, document=fixed)
+        self.write_report("live-extent", 64, 1, document=live)
+
+        pairs = analyzer.discover_pairs(self.root)
+        self.assertEqual(len(pairs), 1)
+
     def test_rejects_missing_paired_case(self):
         self.write_report("fixed", 1, 1)
         self.write_report("live-extent", 1, 1)

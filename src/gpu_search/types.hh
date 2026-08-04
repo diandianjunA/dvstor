@@ -36,6 +36,7 @@ enum class QueryFailureReason : u32 {
   graph_fetch = 4,
   dynamic_code_fetch = 5,
   exact_rerank_empty = 6,
+  exact_fetch = 7,
 };
 
 inline constexpr u32 kQueryFailureReasonBits = 8;
@@ -73,6 +74,9 @@ struct CompletionDescriptor {
   u64 dynamic_code_cycles{};
   u64 beam_selection_cycles{};
   u64 rdma_issue_cycles{};
+  u64 frontier_preview_cycles{};
+  u64 frontier_prepare_cycles{};
+  u64 frontier_enqueue_cycles{};
   u64 rdma_wait_cycles{};
   u64 graph_validation_cycles{};
   u64 neighbor_decode_cycles{};
@@ -87,13 +91,105 @@ struct CompletionDescriptor {
   // reads and therefore cannot be reconstructed from the physical record
   // size when variable-length reads are enabled.
   u64 graph_read_bytes{};
+  // Adaptive Speculative Frontier Execution (ASFE) keeps communication issue
+  // width independent from authoritative graph-expansion commit width. These
+  // counters are query-local and are reduced into Telemetry by the host
+  // completion loop. In particular, graph_page_requests remains sourced from
+  // remote_pages; the critical/speculative split below is not used to
+  // reconstruct or reinterpret that existing counter.
+  u64 critical_graph_bytes{};
+  u64 speculative_graph_bytes{};
+  // Bytes fetched speculatively whose records were ultimately discarded
+  // before the authoritative commit frontier.  This is intentionally
+  // separate from speculative_stale (a request count): a single request can
+  // have a variable Live-Extent payload.
+  u64 speculative_wasted_bytes{};
+  // Full fixed-record bytes fetched by the terminal exact cache but not
+  // promoted into the final authoritative exact Beam.
+  u64 terminal_exact_cache_wasted_bytes{};
+  // Sum of submission-group completion latencies measured on the GPU.  A
+  // submission group is one descriptor group that produces one final CQE;
+  // keeping both the sum and count makes the metric independent of query
+  // batching and avoids presenting a request-count approximation as latency.
+  u64 rdma_completion_latency_ns{};
+  u64 speculative_completion_latency_ns{};
+  u64 rdma_completion_groups{};
+  u64 speculative_completion_groups{};
+  u64 issue_width_sum{};
+  // Sum of the controller's issue-width capacity for every issue epoch.  The
+  // ratio issue_width_sum / issue_width_capacity_sum is the realized
+  // outstanding-frontier utilization.
+  u64 issue_width_capacity_sum{};
+  u64 commit_width_sum{};
+  u64 speculative_wait_cycles{};
+  // Core-prefetch waves are the guaranteed next commit frontier.  They share
+  // the critical owner queue with authoritative misses, but remain
+  // asynchronous until the next commit phase.  These counters make the
+  // overlap visible without folding core traffic into speculative waste.
+  u64 core_prefetch_bytes{};
   u32 query_slot{};
   u32 result_count{};
   i32 status{};
   u32 remote_pages{};
   u32 remote_batches{};
   u32 graph_rounds{};
+  u32 logical_expansions{};
+  u32 critical_graph_reads{};
+  u32 speculative_graph_reads{};
+  u32 speculative_arrived{};
+  u32 speculative_promoted{};
+  u32 speculative_stale{};
+  u32 speculative_queue_rejects{};
+  u32 core_prefetch_reads{};
+  u32 core_prefetch_arrived{};
+  u32 core_prefetch_promoted{};
+  u32 core_prefetch_stale{};
+  u32 core_prefetch_queue_rejects{};
+  u32 core_prefetch_waves{};
+  u32 core_ready_waves{};
+  // Terminal-horizon exact-cache diagnostics. attempted_queries is 0/1 for a
+  // single completion and is widened by the host aggregation path. Records
+  // are counted independently so promotion and fail-soft miss behavior remain
+  // visible without reusing the frontier-certificate diagnostic slots.
+  u32 terminal_exact_cache_attempted_queries{};
+  u32 terminal_exact_cache_issued_records{};
+  u32 terminal_exact_cache_promoted_records{};
+  u32 terminal_exact_cache_queue_rejects{};
+  u32 terminal_exact_cache_miss_records{};
+  // PQ phase-boundary diagnostics.  Reuse the four retired production-DEEC
+  // slots so adding these counters does not enlarge CompletionDescriptor (and
+  // therefore does not enlarge the persistent CTA's shared completion object).
+  // A batch is counted only when its candidate count is nonzero.
+  u32 completion_score_batches{};
+  u32 completion_score_candidates{};
+  u32 frontier_telemetry_reserved0{};
+  u32 frontier_telemetry_reserved1{};
+  // Exact Issue-Frontier certificates derived from the already-required
+  // Stable-Run leaves.  Their bounded tree prefix is retained and reused by
+  // the authoritative merge; DEEC remains only a focused test primitive.
+  u32 frontier_reusable_certificates{};
+  // Streaming/ordered-score/SRFC work counters.  These are deliberately
+  // query-local u32 values: the completion loop widens them to u64 before
+  // process-wide aggregation.
+  u32 frontier_streamed_candidate_runs{};
+  u32 ordered_score_batches{};
+  u32 ordered_score_candidates{};
+  u32 frontier_reusable_prefix_ranks{};
+  u32 frontier_reusable_full_prefix_certificates{};
+  u32 frontier_reusable_issued_certificates{};
+  u32 issue_epochs{};
+  u32 commit_epochs{};
+  u32 max_issue_width{};
+  u32 max_commit_width{};
+  u32 critical_rob_hits{};
+  u32 critical_misses{};
   u32 exact_vectors{};
+  // Populated-shard attempts to issue one fenced full-record/trailer train,
+  // and the disjoint subset that had to use the correctness-preserving
+  // two-batch fallback (normally only an SQ-capacity/compatibility event).
+  // Therefore successful trains = batches - fallbacks.
+  u32 exact_snapshot_train_batches{};
+  u32 exact_snapshot_train_fallbacks{};
   u32 route_hits{};
   u32 graph_read_retries{};
   u32 graph_live_extent_reads{};
@@ -101,22 +197,6 @@ struct CompletionDescriptor {
   u32 graph_extent_fallback_reads{};
   u32 graph_extent_underhint_reads{};
   u32 graph_extent_hint_promotions{};
-  u32 expansion_policy{};
-  u32 sum_selected_parents{};
-  u32 sum_feedback_horizon{};
-  u32 sum_hardware_credit_tiles{};
-  u32 minimum_selected_batch{};
-  u32 maximum_selected_batch{};
-  u32 minimum_feedback_horizon{};
-  u32 maximum_feedback_horizon{};
-  u32 extra_parent_count{};
-  u32 qp_lease_claim_count{};
-  u32 qp_lease_reject_count{};
-  u32 qp_lease_rollback_count{};
-  u32 compute_allowance_tile_sum{};
-  u32 marginal_probe_pass_count{};
-  u32 marginal_probe_fail_count{};
-  u32 reserved_expansion{};
   u32 dynamic_code_candidates{};
   u32 dynamic_code_reads{};
   u32 dynamic_code_incarnation_rejects{};
@@ -130,12 +210,16 @@ struct CompletionDescriptor {
   u32 dynamic_code_cache_max_lookup_probes{};
   u32 trace_event_count{};
   u32 trace_overflow{};
-  u32 adjacency_oracle_event_count{};
-  u32 adjacency_oracle_overflow{};
   // Low 8 bits encode QueryFailureReason; the high 24 bits count complete
   // centroid-route snapshot retries caused by a concurrent publication.
   u32 diagnostic{};
 };
+
+// CompletionDescriptor is embedded once in persistent-kernel shared memory
+// and is also the mapped device-to-host ring ABI. Keep the explicit size check
+// synchronized with both sides whenever production telemetry extends it.
+static_assert(sizeof(CompletionDescriptor) == 552);
+static_assert(alignof(CompletionDescriptor) == alignof(u64));
 
 struct CentroidRoutePublishDescriptor {
   u64 command_id{};
@@ -167,6 +251,9 @@ struct TelemetrySnapshot {
   u64 gpu_exact_ns{};
   u64 gpu_beam_selection_ns{};
   u64 gpu_rdma_issue_ns{};
+  u64 gpu_frontier_preview_ns{};
+  u64 gpu_frontier_prepare_ns{};
+  u64 gpu_frontier_enqueue_ns{};
   u64 gpu_rdma_wait_ns{};
   u64 gpu_graph_validation_ns{};
   u64 gpu_neighbor_decode_ns{};
@@ -176,38 +263,6 @@ struct TelemetrySnapshot {
   u64 gpu_beam_merge_prepare_ns{};
   u64 gpu_beam_merge_sort_ns{};
   u64 gpu_beam_merge_materialize_ns{};
-  u64 feedback_hunger_queries{};
-  u64 expansion_sum_selected_parents{};
-  u64 expansion_sum_feedback_horizon{};
-  u64 expansion_sum_hardware_credit_tiles{};
-  u64 expansion_minimum_selected_batch{};
-  u64 expansion_maximum_selected_batch{};
-  u64 expansion_minimum_feedback_horizon{};
-  u64 expansion_maximum_feedback_horizon{};
-  u64 expansion_extra_parents{};
-  u64 expansion_qp_lease_claims{};
-  u64 expansion_qp_lease_rejects{};
-  u64 expansion_qp_lease_rollbacks{};
-  u64 expansion_compute_allowance_tiles{};
-  u64 expansion_marginal_probe_passes{};
-  u64 expansion_marginal_probe_failures{};
-  u64 expansion_pressure_active_queries{};
-  u64 expansion_pressure_active_queries_peak{};
-  u64 expansion_pressure_credit_current{};
-  u64 expansion_pressure_credit_max_observed{};
-  u64 expansion_pressure_maximum_credit_tiles{};
-  u64 expansion_pressure_hunger_grants{};
-  u64 expansion_pressure_idle_owner_episodes{};
-  u64 expansion_pressure_congestion_clears{};
-  u64 expansion_pressure_ring_backpressure_events{};
-  u64 expansion_pressure_sq_defer_events{};
-  u64 expansion_qp_lease_available_wqes{};
-  u64 expansion_qp_lease_offers{};
-  u64 expansion_qp_lease_claimed_wqes{};
-  u64 expansion_qp_lease_owner_rejects{};
-  u64 expansion_qp_lease_returns{};
-  u64 expansion_qp_lease_revocations{};
-  u64 expansion_qp_lease_stale_returns{};
   u64 rdma_read_ops{};
   u64 rdma_read_bytes{};
   u64 rdma_merged_requests{};
@@ -221,6 +276,58 @@ struct TelemetrySnapshot {
   u64 graph_extent_fallback_reads{};
   u64 graph_extent_underhint_reads{};
   u64 graph_extent_hint_promotions{};
+  u64 logical_expansions{};
+  u64 critical_graph_reads{};
+  u64 critical_graph_bytes{};
+  u64 speculative_graph_reads{};
+  u64 speculative_graph_bytes{};
+  u64 speculative_wasted_bytes{};
+  u64 terminal_exact_cache_wasted_bytes{};
+  u64 rdma_completion_latency_ns{};
+  u64 speculative_completion_latency_ns{};
+  u64 rdma_completion_groups{};
+  u64 speculative_completion_groups{};
+  u64 speculative_arrived{};
+  u64 speculative_promoted{};
+  u64 speculative_stale{};
+  u64 speculative_queue_rejects{};
+  u64 issue_epochs{};
+  u64 commit_epochs{};
+  u64 issue_width_sum{};
+  u64 issue_width_capacity_sum{};
+  u64 commit_width_sum{};
+  u64 core_prefetch_bytes{};
+  u64 max_issue_width{};
+  u64 max_commit_width{};
+  u64 critical_rob_hits{};
+  u64 critical_misses{};
+  u64 speculative_wait_ns{};
+  u64 core_prefetch_reads{};
+  u64 core_prefetch_arrived{};
+  u64 core_prefetch_promoted{};
+  u64 core_prefetch_stale{};
+  u64 core_prefetch_queue_rejects{};
+  u64 core_prefetch_waves{};
+  u64 core_ready_waves{};
+  u64 terminal_exact_cache_attempted_queries{};
+  u64 terminal_exact_cache_issued_records{};
+  u64 terminal_exact_cache_promoted_records{};
+  u64 terminal_exact_cache_queue_rejects{};
+  u64 terminal_exact_cache_miss_records{};
+  u64 completion_score_batches{};
+  u64 completion_score_candidates{};
+  u64 frontier_reusable_certificates{};
+  u64 frontier_streamed_candidate_runs{};
+  u64 ordered_score_batches{};
+  u64 ordered_score_candidates{};
+  u64 frontier_reusable_prefix_ranks{};
+  u64 frontier_reusable_full_prefix_certificates{};
+  u64 frontier_reusable_issued_certificates{};
+  u64 frontier_certificate_rejects{};
+  u64 owner_submitted_wqes{};
+  u64 owner_submission_wqe_capacity{};
+  u64 owner_critical_batches{};
+  u64 owner_speculative_batches{};
   u64 graph_dependency_rounds{};
   u64 graph_route_hits{};
   u64 graph_route_refreshes{};
@@ -235,6 +342,8 @@ struct TelemetrySnapshot {
   u64 centroid_route_query_retries{};
   u64 centroid_route_query_timeouts{};
   u64 exact_vector_reads{};
+  u64 exact_snapshot_train_batches{};
+  u64 exact_snapshot_train_fallbacks{};
   u64 dynamic_code_candidates{};
   u64 dynamic_code_reads{};
   u64 dynamic_code_read_bytes{};
@@ -250,12 +359,31 @@ struct TelemetrySnapshot {
   u64 dynamic_code_cache_max_lookup_probes{};
   u64 dynamic_code_cache_occupied{};
   u64 dynamic_code_cache_capacity{};
+  // Static kernel resource facts are exported with every interval report.
+  // They are not reset between warmup and measurement.
+  u64 gpu_kernel_threads{};
+  u64 gpu_registers_per_thread{};
+  u64 gpu_static_shared_bytes{};
+  u64 gpu_active_blocks_per_sm{};
+  u64 gpu_effective_blocks_per_sm{};
+  u64 gpu_query_blocks{};
+  u64 gpu_owner_blocks{};
+  u64 gpu_total_persistent_blocks{};
 };
 
 class Telemetry {
 public:
   TelemetrySnapshot snapshot() const;
   void reset();
+  void set_gpu_occupancy(
+      u64 kernel_threads,
+      u64 registers_per_thread,
+      u64 static_shared_bytes,
+      u64 active_blocks_per_sm,
+      u64 effective_blocks_per_sm,
+      u64 query_blocks,
+      u64 owner_blocks,
+      u64 total_persistent_blocks);
 
   std::atomic<u64> gpu_memory_explicit_bytes{0};
   std::atomic<u64> gpu_memory_base_pq_bytes{0};
@@ -274,6 +402,9 @@ public:
   std::atomic<u64> gpu_exact_ns{0};
   std::atomic<u64> gpu_beam_selection_ns{0};
   std::atomic<u64> gpu_rdma_issue_ns{0};
+  std::atomic<u64> gpu_frontier_preview_ns{0};
+  std::atomic<u64> gpu_frontier_prepare_ns{0};
+  std::atomic<u64> gpu_frontier_enqueue_ns{0};
   std::atomic<u64> gpu_rdma_wait_ns{0};
   std::atomic<u64> gpu_graph_validation_ns{0};
   std::atomic<u64> gpu_neighbor_decode_ns{0};
@@ -283,21 +414,6 @@ public:
   std::atomic<u64> gpu_beam_merge_prepare_ns{0};
   std::atomic<u64> gpu_beam_merge_sort_ns{0};
   std::atomic<u64> gpu_beam_merge_materialize_ns{0};
-  std::atomic<u64> feedback_hunger_queries{0};
-  std::atomic<u64> expansion_sum_selected_parents{0};
-  std::atomic<u64> expansion_sum_feedback_horizon{0};
-  std::atomic<u64> expansion_sum_hardware_credit_tiles{0};
-  std::atomic<u64> expansion_minimum_selected_batch{UINT64_MAX};
-  std::atomic<u64> expansion_maximum_selected_batch{0};
-  std::atomic<u64> expansion_minimum_feedback_horizon{UINT64_MAX};
-  std::atomic<u64> expansion_maximum_feedback_horizon{0};
-  std::atomic<u64> expansion_extra_parents{0};
-  std::atomic<u64> expansion_qp_lease_claims{0};
-  std::atomic<u64> expansion_qp_lease_rejects{0};
-  std::atomic<u64> expansion_qp_lease_rollbacks{0};
-  std::atomic<u64> expansion_compute_allowance_tiles{0};
-  std::atomic<u64> expansion_marginal_probe_passes{0};
-  std::atomic<u64> expansion_marginal_probe_failures{0};
   std::atomic<u64> rdma_read_ops{0};
   std::atomic<u64> rdma_read_bytes{0};
   std::atomic<u64> rdma_merged_requests{0};
@@ -311,6 +427,54 @@ public:
   std::atomic<u64> graph_extent_fallback_reads{0};
   std::atomic<u64> graph_extent_underhint_reads{0};
   std::atomic<u64> graph_extent_hint_promotions{0};
+  std::atomic<u64> logical_expansions{0};
+  std::atomic<u64> critical_graph_reads{0};
+  std::atomic<u64> critical_graph_bytes{0};
+  std::atomic<u64> speculative_graph_reads{0};
+  std::atomic<u64> speculative_graph_bytes{0};
+  std::atomic<u64> speculative_wasted_bytes{0};
+  std::atomic<u64> terminal_exact_cache_wasted_bytes{0};
+  std::atomic<u64> rdma_completion_latency_ns{0};
+  std::atomic<u64> speculative_completion_latency_ns{0};
+  std::atomic<u64> rdma_completion_groups{0};
+  std::atomic<u64> speculative_completion_groups{0};
+  std::atomic<u64> speculative_arrived{0};
+  std::atomic<u64> speculative_promoted{0};
+  std::atomic<u64> speculative_stale{0};
+  std::atomic<u64> speculative_queue_rejects{0};
+  std::atomic<u64> issue_epochs{0};
+  std::atomic<u64> commit_epochs{0};
+  std::atomic<u64> issue_width_sum{0};
+  std::atomic<u64> issue_width_capacity_sum{0};
+  std::atomic<u64> commit_width_sum{0};
+  std::atomic<u64> core_prefetch_bytes{0};
+  std::atomic<u64> max_issue_width{0};
+  std::atomic<u64> max_commit_width{0};
+  std::atomic<u64> critical_rob_hits{0};
+  std::atomic<u64> critical_misses{0};
+  std::atomic<u64> speculative_wait_ns{0};
+  std::atomic<u64> core_prefetch_reads{0};
+  std::atomic<u64> core_prefetch_arrived{0};
+  std::atomic<u64> core_prefetch_promoted{0};
+  std::atomic<u64> core_prefetch_stale{0};
+  std::atomic<u64> core_prefetch_queue_rejects{0};
+  std::atomic<u64> core_prefetch_waves{0};
+  std::atomic<u64> core_ready_waves{0};
+  std::atomic<u64> terminal_exact_cache_attempted_queries{0};
+  std::atomic<u64> terminal_exact_cache_issued_records{0};
+  std::atomic<u64> terminal_exact_cache_promoted_records{0};
+  std::atomic<u64> terminal_exact_cache_queue_rejects{0};
+  std::atomic<u64> terminal_exact_cache_miss_records{0};
+  std::atomic<u64> completion_score_batches{0};
+  std::atomic<u64> completion_score_candidates{0};
+  std::atomic<u64> frontier_reusable_certificates{0};
+  std::atomic<u64> frontier_streamed_candidate_runs{0};
+  std::atomic<u64> ordered_score_batches{0};
+  std::atomic<u64> ordered_score_candidates{0};
+  std::atomic<u64> frontier_reusable_prefix_ranks{0};
+  std::atomic<u64> frontier_reusable_full_prefix_certificates{0};
+  std::atomic<u64> frontier_reusable_issued_certificates{0};
+  std::atomic<u64> frontier_certificate_rejects{0};
   std::atomic<u64> graph_dependency_rounds{0};
   std::atomic<u64> graph_route_hits{0};
   std::atomic<u64> graph_route_refreshes{0};
@@ -325,6 +489,8 @@ public:
   std::atomic<u64> centroid_route_query_retries{0};
   std::atomic<u64> centroid_route_query_timeouts{0};
   std::atomic<u64> exact_vector_reads{0};
+  std::atomic<u64> exact_snapshot_train_batches{0};
+  std::atomic<u64> exact_snapshot_train_fallbacks{0};
   std::atomic<u64> dynamic_code_candidates{0};
   std::atomic<u64> dynamic_code_reads{0};
   std::atomic<u64> dynamic_code_read_bytes{0};
@@ -342,6 +508,14 @@ public:
   // preserves it so a post-warmup benchmark reports the cache it actually uses.
   std::atomic<u64> dynamic_code_cache_occupied{0};
   std::atomic<u64> dynamic_code_cache_capacity{0};
+  std::atomic<u64> gpu_kernel_threads{0};
+  std::atomic<u64> gpu_registers_per_thread{0};
+  std::atomic<u64> gpu_static_shared_bytes{0};
+  std::atomic<u64> gpu_active_blocks_per_sm{0};
+  std::atomic<u64> gpu_effective_blocks_per_sm{0};
+  std::atomic<u64> gpu_query_blocks{0};
+  std::atomic<u64> gpu_owner_blocks{0};
+  std::atomic<u64> gpu_total_persistent_blocks{0};
 };
 
 }  // namespace gpu_search
