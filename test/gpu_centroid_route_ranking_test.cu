@@ -126,7 +126,16 @@ __global__ void concurrently_promote_graph_extent_hint_kernel(
 
 __global__ void route_contention_query_kernel(PersistentKernelParams params,
                                                QueryDescriptor descriptor) {
-  gpu_search::persistent_kernel_detail::process_query(params, descriptor);
+  __shared__ gpu_search::adaptive_frontier::ControllerState
+    frontier_controller;
+  if (threadIdx.x == 0) {
+    frontier_controller =
+      gpu_search::adaptive_frontier::make_controller_state(
+        params.commit_width, params.issue_width);
+  }
+  __syncthreads();
+  gpu_search::persistent_kernel_detail::process_query<false>(
+    params, descriptor, frontier_controller);
 }
 
 __global__ void close_route_epoch_after(u64* epoch, u64 delay_ns) {

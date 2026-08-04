@@ -52,6 +52,82 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
     << completion.graph_extent_underhint_reads
     << ",\"graph_extent_hint_promotions\":"
     << completion.graph_extent_hint_promotions
+    << ",\"logical_expansions\":" << completion.logical_expansions
+    << ",\"critical_graph_reads\":" << completion.critical_graph_reads
+    << ",\"critical_graph_bytes\":" << completion.critical_graph_bytes
+    << ",\"speculative_graph_reads\":"
+    << completion.speculative_graph_reads
+    << ",\"speculative_graph_bytes\":"
+    << completion.speculative_graph_bytes
+    << ",\"speculative_wasted_bytes\":"
+    << completion.speculative_wasted_bytes
+    << ",\"rdma_completion_latency_ns\":"
+    << completion.rdma_completion_latency_ns
+    << ",\"speculative_completion_latency_ns\":"
+    << completion.speculative_completion_latency_ns
+    << ",\"rdma_completion_groups\":"
+    << completion.rdma_completion_groups
+    << ",\"speculative_completion_groups\":"
+    << completion.speculative_completion_groups
+    << ",\"speculative_arrived\":" << completion.speculative_arrived
+    << ",\"speculative_promoted\":" << completion.speculative_promoted
+    << ",\"speculative_stale\":" << completion.speculative_stale
+    << ",\"speculative_queue_rejects\":"
+    << completion.speculative_queue_rejects
+    << ",\"core_prefetch_reads\":" << completion.core_prefetch_reads
+    << ",\"core_prefetch_bytes\":" << completion.core_prefetch_bytes
+    << ",\"core_prefetch_arrived\":" << completion.core_prefetch_arrived
+    << ",\"core_prefetch_promoted\":"
+    << completion.core_prefetch_promoted
+    << ",\"core_prefetch_stale\":" << completion.core_prefetch_stale
+    << ",\"core_prefetch_queue_rejects\":"
+    << completion.core_prefetch_queue_rejects
+    << ",\"core_prefetch_waves\":" << completion.core_prefetch_waves
+    << ",\"core_ready_waves\":" << completion.core_ready_waves
+    << ",\"terminal_exact_cache_attempted_queries\":"
+    << completion.terminal_exact_cache_attempted_queries
+    << ",\"terminal_exact_cache_issued_records\":"
+    << completion.terminal_exact_cache_issued_records
+    << ",\"terminal_exact_cache_promoted_records\":"
+    << completion.terminal_exact_cache_promoted_records
+    << ",\"terminal_exact_cache_wasted_bytes\":"
+    << completion.terminal_exact_cache_wasted_bytes
+    << ",\"terminal_exact_cache_queue_rejects\":"
+    << completion.terminal_exact_cache_queue_rejects
+    << ",\"terminal_exact_cache_miss_records\":"
+    << completion.terminal_exact_cache_miss_records
+    << ",\"completion_score_batches\":"
+    << completion.completion_score_batches
+    << ",\"completion_score_candidates\":"
+    << completion.completion_score_candidates
+    << ",\"frontier_reusable_certificates\":"
+    << completion.frontier_reusable_certificates
+    << ",\"frontier_streamed_candidate_runs\":"
+    << completion.frontier_streamed_candidate_runs
+    << ",\"ordered_score_batches\":"
+    << completion.ordered_score_batches
+    << ",\"ordered_score_candidates\":"
+    << completion.ordered_score_candidates
+    << ",\"frontier_reusable_prefix_ranks\":"
+    << completion.frontier_reusable_prefix_ranks
+    << ",\"frontier_reusable_full_prefix_certificates\":"
+    << completion.frontier_reusable_full_prefix_certificates
+    << ",\"frontier_reusable_issued_certificates\":"
+    << completion.frontier_reusable_issued_certificates
+    << ",\"frontier_certificate_rejects\":"
+    << completion.frontier_telemetry_reserved0
+    << ",\"issue_epochs\":" << completion.issue_epochs
+    << ",\"commit_epochs\":" << completion.commit_epochs
+    << ",\"issue_width_sum\":" << completion.issue_width_sum
+    << ",\"issue_width_capacity_sum\":"
+    << completion.issue_width_capacity_sum
+    << ",\"commit_width_sum\":" << completion.commit_width_sum
+    << ",\"max_issue_width\":" << completion.max_issue_width
+    << ",\"max_commit_width\":" << completion.max_commit_width
+    << ",\"critical_rob_hits\":" << completion.critical_rob_hits
+    << ",\"critical_misses\":" << completion.critical_misses
+    << ",\"speculative_wait_cycles\":"
+    << completion.speculative_wait_cycles
     << ",\"beam_selection_cycles\":" << completion.beam_selection_cycles
     << ",\"rdma_issue_cycles\":" << completion.rdma_issue_cycles
     << ",\"rdma_wait_cycles\":" << completion.rdma_wait_cycles
@@ -68,6 +144,10 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
     << ",\"beam_merge_materialize_cycles\":"
     << completion.beam_merge_materialize_cycles
     << ",\"exact_cycles\":" << completion.exact_cycles
+    << ",\"exact_snapshot_train_batches\":"
+    << completion.exact_snapshot_train_batches
+    << ",\"exact_snapshot_train_fallbacks\":"
+    << completion.exact_snapshot_train_fallbacks
     << ",\"dynamic_code_cycles\":" << completion.dynamic_code_cycles
     << "}\n";
   for (const QueryRdmaTraceEvent& event : trace_events) {
@@ -120,6 +200,7 @@ const char* query_failure_reason_name(QueryFailureReason reason) {
     case QueryFailureReason::graph_fetch: return "graph_fetch";
     case QueryFailureReason::dynamic_code_fetch: return "dynamic_code_fetch";
     case QueryFailureReason::exact_rerank_empty: return "exact_rerank_empty";
+    case QueryFailureReason::exact_fetch: return "exact_fetch";
   }
   return "unknown";
 }
@@ -360,10 +441,46 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << completion.graph_extent_underhint_reads
                 << " graph_extent_promotions="
                 << completion.graph_extent_hint_promotions
+                << " logical_expansions=" << completion.logical_expansions
+                << " critical_graph_reads="
+                << completion.critical_graph_reads
+                << " speculative_graph_reads="
+                << completion.speculative_graph_reads
+                << " speculative_promoted="
+                << completion.speculative_promoted
+                << " speculative_stale="
+                << completion.speculative_stale
+                << " speculative_wasted_bytes="
+                << completion.speculative_wasted_bytes
+                << " rdma_completion_latency_ns="
+                << completion.rdma_completion_latency_ns
+                << " rdma_completion_groups="
+                << completion.rdma_completion_groups
+                << " issue_width_max=" << completion.max_issue_width
+                << " commit_width_max=" << completion.max_commit_width
+                << " critical_misses=" << completion.critical_misses
+                << " certificate_rejects="
+                << completion.frontier_telemetry_reserved0
                 << " graph_batches=" << completion.remote_batches
                 << " graph_rounds=" << completion.graph_rounds
                 << " route_hits=" << completion.route_hits
                 << " exact_reads=" << completion.exact_vectors
+                << " exact_snapshot_trains="
+                << completion.exact_snapshot_train_batches
+                << " exact_snapshot_fallbacks="
+                << completion.exact_snapshot_train_fallbacks
+                << " terminal_exact_cache_attempted="
+                << completion.terminal_exact_cache_attempted_queries
+                << " terminal_exact_cache_issued="
+                << completion.terminal_exact_cache_issued_records
+                << " terminal_exact_cache_promoted="
+                << completion.terminal_exact_cache_promoted_records
+                << " terminal_exact_cache_misses="
+                << completion.terminal_exact_cache_miss_records
+                << " terminal_exact_cache_wasted_bytes="
+                << completion.terminal_exact_cache_wasted_bytes
+                << " terminal_exact_cache_queue_rejects="
+                << completion.terminal_exact_cache_queue_rejects
                 << " dynamic_pq_reads=" << completion.dynamic_code_reads
                 << " dynamic_pq_us="
                 << completion.dynamic_code_cycles * 1000ULL / gpu_clock_khz
@@ -383,6 +500,67 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << completion.status
                 << " reason=" << query_failure_reason_name(failure_reason)
                 << " route_snapshot_retries=" << route_snapshot_retries;
+        if (failure_reason == QueryFailureReason::graph_fetch ||
+            failure_reason == QueryFailureReason::dynamic_code_fetch) {
+          const u32 failure_code = completion.result_count;
+          const u32 failure_stage = failure_code & 0xffu;
+          message << " failure_stage=" << failure_stage;
+          if (failure_stage == 6u) {
+            const u32 detail = failure_code >> 8;
+            message << " authoritative_fetch_detail=" << detail;
+            if ((detail & (u32{1} << 16)) != 0) {
+              message << " authoritative_fetch_status=-"
+                      << (detail & 0xffffu);
+            } else {
+              const u32 prepare_reason = detail & 0xfu;
+              if (prepare_reason == 1u || prepare_reason == 2u ||
+                  prepare_reason == 3u || prepare_reason == 4u ||
+                  prepare_reason == 6u || prepare_reason == 7u ||
+                  prepare_reason == 8u) {
+                message << " prepare_reason=" << prepare_reason
+                        << " prepare_index=" << ((detail >> 4) & 0x1fu)
+                        << " prepare_scratch_slot="
+                        << ((detail >> 9) & 0x3fu)
+                        << " selection_from_certificate="
+                        << ((detail >> 15) & 1u)
+                        << " rejected_handle=0x" << std::hex
+                        << (static_cast<u64>(
+                              completion.frontier_telemetry_reserved1)
+                              << 32 |
+                            completion.frontier_telemetry_reserved0)
+                        << std::dec;
+              }
+            }
+          } else {
+            message << " dependency_status=-"
+                    << ((failure_code >> 8) & 0xffffu);
+          }
+        } else if (failure_reason ==
+                   QueryFailureReason::exact_rerank_empty) {
+          const u32 detail = completion.result_count;
+          const u64 rejected_handle =
+            (static_cast<u64>(
+               completion.frontier_telemetry_reserved1) << 32) |
+            completion.frontier_telemetry_reserved0;
+          message
+            << " exact_candidates=" << (detail & 0xffu)
+            << " exact_resolved=" << ((detail >> 8) & 0xffu)
+            << " exact_equal_headers=" << ((detail >> 16) & 0xffu)
+            << " exact_visible=" << ((detail >> 24) & 0xffu)
+            << " first_rejected_handle=0x" << std::hex
+            << rejected_handle
+            << " first_header_before=0x"
+            << completion.rdma_completion_latency_ns
+            << " first_header_after=0x"
+            << completion.speculative_completion_latency_ns
+            << std::dec
+            << " expected_incarnation="
+            << static_cast<u32>(completion.issue_width_sum >> 32)
+            << " stored_incarnation="
+            << static_cast<u32>(completion.issue_width_sum)
+            << " beam_empty_detail=0x" << std::hex
+            << completion.commit_width_sum << std::dec;
+        }
         mark_unhealthy(message.str());
       }
       reject_query_slot(completion.query_slot);
@@ -412,6 +590,15 @@ void PersistentSearchEngine::Impl::completion_loop() {
       phase_ns(completion.beam_selection_cycles), std::memory_order_relaxed);
     engine.telemetry_.gpu_rdma_issue_ns.fetch_add(
       phase_ns(completion.rdma_issue_cycles), std::memory_order_relaxed);
+    engine.telemetry_.gpu_frontier_preview_ns.fetch_add(
+      phase_ns(completion.frontier_preview_cycles),
+      std::memory_order_relaxed);
+    engine.telemetry_.gpu_frontier_prepare_ns.fetch_add(
+      phase_ns(completion.frontier_prepare_cycles),
+      std::memory_order_relaxed);
+    engine.telemetry_.gpu_frontier_enqueue_ns.fetch_add(
+      phase_ns(completion.frontier_enqueue_cycles),
+      std::memory_order_relaxed);
     engine.telemetry_.gpu_rdma_wait_ns.fetch_add(
       phase_ns(completion.rdma_wait_cycles), std::memory_order_relaxed);
     engine.telemetry_.gpu_graph_validation_ns.fetch_add(
@@ -457,6 +644,12 @@ void PersistentSearchEngine::Impl::completion_loop() {
     }
     engine.telemetry_.exact_vector_reads.fetch_add(completion.exact_vectors,
                                                    std::memory_order_relaxed);
+    engine.telemetry_.exact_snapshot_train_batches.fetch_add(
+      completion.exact_snapshot_train_batches,
+      std::memory_order_relaxed);
+    engine.telemetry_.exact_snapshot_train_fallbacks.fetch_add(
+      completion.exact_snapshot_train_fallbacks,
+      std::memory_order_relaxed);
     engine.telemetry_.dynamic_code_candidates.fetch_add(
       completion.dynamic_code_candidates, std::memory_order_relaxed);
     engine.telemetry_.dynamic_code_reads.fetch_add(
@@ -519,6 +712,127 @@ void PersistentSearchEngine::Impl::completion_loop() {
       completion.graph_extent_underhint_reads, std::memory_order_relaxed);
     engine.telemetry_.graph_extent_hint_promotions.fetch_add(
       completion.graph_extent_hint_promotions, std::memory_order_relaxed);
+    engine.telemetry_.logical_expansions.fetch_add(
+      completion.logical_expansions, std::memory_order_relaxed);
+    engine.telemetry_.critical_graph_reads.fetch_add(
+      completion.critical_graph_reads, std::memory_order_relaxed);
+    engine.telemetry_.critical_graph_bytes.fetch_add(
+      completion.critical_graph_bytes, std::memory_order_relaxed);
+    engine.telemetry_.speculative_graph_reads.fetch_add(
+      completion.speculative_graph_reads, std::memory_order_relaxed);
+    engine.telemetry_.speculative_graph_bytes.fetch_add(
+      completion.speculative_graph_bytes, std::memory_order_relaxed);
+    engine.telemetry_.speculative_wasted_bytes.fetch_add(
+      completion.speculative_wasted_bytes, std::memory_order_relaxed);
+    engine.telemetry_.terminal_exact_cache_wasted_bytes.fetch_add(
+      completion.terminal_exact_cache_wasted_bytes,
+      std::memory_order_relaxed);
+    engine.telemetry_.rdma_completion_latency_ns.fetch_add(
+      completion.rdma_completion_latency_ns, std::memory_order_relaxed);
+    engine.telemetry_.speculative_completion_latency_ns.fetch_add(
+      completion.speculative_completion_latency_ns,
+      std::memory_order_relaxed);
+    engine.telemetry_.rdma_completion_groups.fetch_add(
+      completion.rdma_completion_groups, std::memory_order_relaxed);
+    engine.telemetry_.speculative_completion_groups.fetch_add(
+      completion.speculative_completion_groups,
+      std::memory_order_relaxed);
+    engine.telemetry_.speculative_arrived.fetch_add(
+      completion.speculative_arrived, std::memory_order_relaxed);
+    engine.telemetry_.speculative_promoted.fetch_add(
+      completion.speculative_promoted, std::memory_order_relaxed);
+    engine.telemetry_.speculative_stale.fetch_add(
+      completion.speculative_stale, std::memory_order_relaxed);
+    engine.telemetry_.speculative_queue_rejects.fetch_add(
+      completion.speculative_queue_rejects, std::memory_order_relaxed);
+    engine.telemetry_.core_prefetch_reads.fetch_add(
+      completion.core_prefetch_reads, std::memory_order_relaxed);
+    engine.telemetry_.core_prefetch_bytes.fetch_add(
+      completion.core_prefetch_bytes, std::memory_order_relaxed);
+    engine.telemetry_.core_prefetch_arrived.fetch_add(
+      completion.core_prefetch_arrived, std::memory_order_relaxed);
+    engine.telemetry_.core_prefetch_promoted.fetch_add(
+      completion.core_prefetch_promoted, std::memory_order_relaxed);
+    engine.telemetry_.core_prefetch_stale.fetch_add(
+      completion.core_prefetch_stale, std::memory_order_relaxed);
+    engine.telemetry_.core_prefetch_queue_rejects.fetch_add(
+      completion.core_prefetch_queue_rejects, std::memory_order_relaxed);
+    engine.telemetry_.core_prefetch_waves.fetch_add(
+      completion.core_prefetch_waves, std::memory_order_relaxed);
+    engine.telemetry_.core_ready_waves.fetch_add(
+      completion.core_ready_waves, std::memory_order_relaxed);
+    engine.telemetry_.terminal_exact_cache_attempted_queries.fetch_add(
+      completion.terminal_exact_cache_attempted_queries,
+      std::memory_order_relaxed);
+    engine.telemetry_.terminal_exact_cache_issued_records.fetch_add(
+      completion.terminal_exact_cache_issued_records,
+      std::memory_order_relaxed);
+    engine.telemetry_.terminal_exact_cache_promoted_records.fetch_add(
+      completion.terminal_exact_cache_promoted_records,
+      std::memory_order_relaxed);
+    engine.telemetry_.terminal_exact_cache_queue_rejects.fetch_add(
+      completion.terminal_exact_cache_queue_rejects,
+      std::memory_order_relaxed);
+    engine.telemetry_.terminal_exact_cache_miss_records.fetch_add(
+      completion.terminal_exact_cache_miss_records,
+      std::memory_order_relaxed);
+    engine.telemetry_.completion_score_batches.fetch_add(
+      completion.completion_score_batches, std::memory_order_relaxed);
+    engine.telemetry_.completion_score_candidates.fetch_add(
+      completion.completion_score_candidates, std::memory_order_relaxed);
+    engine.telemetry_.frontier_reusable_certificates.fetch_add(
+      completion.frontier_reusable_certificates,
+      std::memory_order_relaxed);
+    engine.telemetry_.frontier_streamed_candidate_runs.fetch_add(
+      completion.frontier_streamed_candidate_runs,
+      std::memory_order_relaxed);
+    engine.telemetry_.ordered_score_batches.fetch_add(
+      completion.ordered_score_batches, std::memory_order_relaxed);
+    engine.telemetry_.ordered_score_candidates.fetch_add(
+      completion.ordered_score_candidates, std::memory_order_relaxed);
+    engine.telemetry_.frontier_reusable_prefix_ranks.fetch_add(
+      completion.frontier_reusable_prefix_ranks,
+      std::memory_order_relaxed);
+    engine.telemetry_.frontier_reusable_full_prefix_certificates.fetch_add(
+      completion.frontier_reusable_full_prefix_certificates,
+      std::memory_order_relaxed);
+    engine.telemetry_.frontier_reusable_issued_certificates.fetch_add(
+      completion.frontier_reusable_issued_certificates,
+      std::memory_order_relaxed);
+    engine.telemetry_.frontier_certificate_rejects.fetch_add(
+      completion.frontier_telemetry_reserved0,
+      std::memory_order_relaxed);
+    engine.telemetry_.issue_epochs.fetch_add(
+      completion.issue_epochs, std::memory_order_relaxed);
+    engine.telemetry_.commit_epochs.fetch_add(
+      completion.commit_epochs, std::memory_order_relaxed);
+    engine.telemetry_.issue_width_sum.fetch_add(
+      completion.issue_width_sum, std::memory_order_relaxed);
+    engine.telemetry_.issue_width_capacity_sum.fetch_add(
+      completion.issue_width_capacity_sum, std::memory_order_relaxed);
+    engine.telemetry_.commit_width_sum.fetch_add(
+      completion.commit_width_sum, std::memory_order_relaxed);
+    engine.telemetry_.critical_rob_hits.fetch_add(
+      completion.critical_rob_hits, std::memory_order_relaxed);
+    engine.telemetry_.critical_misses.fetch_add(
+      completion.critical_misses, std::memory_order_relaxed);
+    engine.telemetry_.speculative_wait_ns.fetch_add(
+      phase_ns(completion.speculative_wait_cycles),
+      std::memory_order_relaxed);
+    u64 observed_max_issue_width =
+      engine.telemetry_.max_issue_width.load(std::memory_order_relaxed);
+    while (observed_max_issue_width < completion.max_issue_width &&
+           !engine.telemetry_.max_issue_width.compare_exchange_weak(
+             observed_max_issue_width, completion.max_issue_width,
+             std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
+    u64 observed_max_commit_width =
+      engine.telemetry_.max_commit_width.load(std::memory_order_relaxed);
+    while (observed_max_commit_width < completion.max_commit_width &&
+           !engine.telemetry_.max_commit_width.compare_exchange_weak(
+             observed_max_commit_width, completion.max_commit_width,
+             std::memory_order_relaxed, std::memory_order_relaxed)) {
+    }
     engine.telemetry_.graph_dependency_rounds.fetch_add(
       completion.graph_rounds, std::memory_order_relaxed);
     engine.telemetry_.graph_route_hits.fetch_add(completion.route_hits,

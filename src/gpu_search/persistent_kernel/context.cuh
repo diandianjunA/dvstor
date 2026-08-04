@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 #include <cub/block/block_radix_sort.cuh>
+#include <cub/warp/warp_merge_sort.cuh>
 
 #include <algorithm>
 #include <cfloat>
@@ -46,6 +47,27 @@ using ApproximateBlockSortCompactFinal = cub::BlockRadixSort<
 using ApproximateBlockSortCompactFinal256 = cub::BlockRadixSort<
   f32, kApproximateSortThreadsCompact,
   kApproximateSortItemsCompactFinal256, u64>;
+// Four physical warps own the four immutable 512-item Stable-Run leaves.
+// Sorting an ordered (distance, raw ordinal) key and resolving the handle
+// afterwards avoids CUB's key/value merge path while retaining exact stable
+// input order, including equal-distance candidates.
+inline constexpr u32 kWarpLeafSortWarps = 4;
+inline constexpr u32 kWarpLeafSortThreads = 32;
+inline constexpr u32 kWarpLeafSortItemsPerThread = 16;
+inline constexpr u32 kWarpLeafSortCapacity =
+  kWarpLeafSortThreads * kWarpLeafSortItemsPerThread;
+using ApproximateWarpLeafSort = cub::WarpMergeSort<
+  u64, kWarpLeafSortItemsPerThread, kWarpLeafSortThreads>;
+
+struct ApproximateWarpLeafSortStorage {
+  ApproximateWarpLeafSort::TempStorage leaves[kWarpLeafSortWarps];
+};
+
+struct OrderedU64Less {
+  __device__ __forceinline__ bool operator()(u64 lhs, u64 rhs) const {
+    return lhs < rhs;
+  }
+};
 
 // The 1024-item pass remains the largest compact-sort temporary.  Supporting
 // the 512-item final merge therefore does not increase per-query shared memory
@@ -60,6 +82,8 @@ static_assert(kApproximateSortThreadsWide *
 static_assert(kApproximateSortCapacityWide ==
               kPersistentMaxMergeCandidates);
 static_assert(kApproximateSortCapacityCompactPass * 2 ==
+              kPersistentMaxMergeCandidates);
+static_assert(kWarpLeafSortWarps * kWarpLeafSortCapacity ==
               kPersistentMaxMergeCandidates);
 
 }  // namespace gpu_search::persistent_kernel_detail

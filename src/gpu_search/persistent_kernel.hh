@@ -16,7 +16,14 @@ inline constexpr u32 kPersistentMaxBeam = 128;
 inline constexpr u32 kPersistentMaxExact = 256;
 inline constexpr u32 kPersistentMaxSubquantizers = 32;
 inline constexpr u32 kPersistentMaxGraphDegree = 128;
+// The authoritative commit frontier preserves the legacy maximum batch width.
+// The speculative ROB is independently bounded by the same compile-time
+// capacity, while graph scratch has a disjoint bank for each role so an
+// in-flight shadow read can overlap committed decode/PQ/Beam work.
 inline constexpr u32 kPersistentMaxPrefetch = 32;
+inline constexpr u32 kPersistentFrontierRobCapacity = 32;
+inline constexpr u32 kPersistentGraphScratchSlots = kPersistentMaxPrefetch;
+inline constexpr u32 kPersistentStableRunScratch = 4 * kPersistentMaxBeam;
 inline constexpr u32 kPersistentScoreChunk = 16;
 inline constexpr u32 kPersistentMaxMergeCandidates = 2048;
 // RemotePtr dedicates six bits to the physical shard.  GPU routing and RDMA
@@ -151,12 +158,119 @@ struct DirectBatchDescriptor {
   const u32* request_bytes{};
   i32* completion_status{};
   u64* completion_timestamp_ns{};
-  u32 request_count{};
-  u32 memory_node{};
+  // A split descriptor is published once on the critical queue. After
+  // collecting every visible critical descriptor, the owner may append the
+  // suffix to unused SQ credit behind a critical CQ fence. Otherwise it
+  // rejects the optional suffix without posting another doorbell. Both
+  // outcomes retain independent completion words and priority semantics.
+  i32* speculative_completion_status{};
+  u64* speculative_completion_timestamp_ns{};
+  // Frontier/exact batches are bounded by kPersistentMaxExact and RemotePtr
+  // exposes at most kPersistentMaxShards.  Narrow fields keep the descriptor
+  // at 80 bytes; owner CTAs retain eight descriptors per warp in shared
+  // memory, so the former 88-byte layout materially reduced the query
+  // workspace available to the unified persistent kernel.
+  u16 request_count{};
+  u16 memory_node{};
   u32 bytes{};
-  u32 reserved{};
+  u8 priority{};
+  u8 flags{};
+  u16 critical_request_count{};
 };
-static_assert(sizeof(DirectBatchDescriptor) == 64);
+static_assert(sizeof(DirectBatchDescriptor) == 80);
+
+enum class DirectBatchPriority : u32 {
+  critical = 0,
+  speculative = 1,
+};
+
+// The split suffix is correctness-critical and must be posted in the same SQ
+// train as its prefix. The owner inserts a real mlx5 initiator fence on the
+// first suffix READ, so the suffix observes memory only after every prefix
+// READ has completed. This is used by exact rerank's second header snapshot;
+// unlike an ASFE shadow suffix, it is reserved during critical admission and
+// can never be rejected merely because the service boundary has no spare SQ
+// credit.
+inline constexpr u8 kDirectBatchFlagMandatoryFencedTail = 1u << 0;
+// A terminal-cache final train has the same mandatory ordering/completion
+// contract, but its suffix may contain additional current-header reads after
+// the one-to-one validation trailers:
+//
+//   [M full records][M matching trailers][H cached-record headers]
+//
+// Keep this distinct from the original exact-snapshot flag so widening the
+// suffix cannot silently weaken the established 2*M descriptor ABI.
+inline constexpr u8 kDirectBatchFlagMixedMandatoryFencedTail = 1u << 1;
+inline constexpr u8 kDirectBatchKnownFlags =
+  kDirectBatchFlagMandatoryFencedTail |
+  kDirectBatchFlagMixedMandatoryFencedTail;
+
+// exactify_into_beam normalizes successful fenced trains, successful legacy
+// fallbacks, and empty shards to status zero. A remaining non-zero status is
+// therefore a final transport failure, not an incarnation/tombstone reject.
+// Keep the policy host/device so the query-failure boundary is directly
+// unit-testable without a live RDMA peer.
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr bool exact_snapshot_transport_failed(i32 final_status) {
+  return final_status != 0;
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr bool exact_rerank_should_retry_route(
+    bool exact_fetch_succeeded, u32 route_attempt) {
+  return exact_fetch_succeeded && route_attempt == 0;
+}
+
+enum class FrontierRequestState : u8 {
+  init = 0,
+  issued = 1,
+  inflight = 2,
+  arrived = 3,
+  validated = 4,
+  committed = 5,
+  stale = 6,
+};
+
+enum class FrontierValidationState : u8 {
+  unknown = 0,
+  valid = 1,
+  stale_incarnation = 2,
+  invalid_snapshot = 3,
+  transport_rejected = 4,
+};
+
+inline constexpr u8 kFrontierRobFlagEarlyShadow = 1u << 0;
+// Retention is useful controller evidence only on the first exact
+// certificate transition of one physical speculative read. Without this bit,
+// a long-lived ROB entry is counted again every round and can inflate issue
+// width without any additional RDMA benefit.
+inline constexpr u8 kFrontierRobFlagUtilityAccounted = 1u << 1;
+
+// Query-CTA-local reorder-buffer entry. Payload remains in coalesced global
+// graph scratch; this compact metadata is kept in shared memory and is never
+// observed by another CTA. In particular, ISSUED/ARRIVED never changes the
+// authoritative Beam, expanded bits, or visited table.
+struct FrontierRobEntry {
+  u64 node_handle{kInvalidDeviceHandle};
+  u32 issue_epoch{};
+  u32 transfer_bytes{};
+  u16 beam_rank{};
+  u8 scratch_slot{};
+  u8 state{static_cast<u8>(FrontierRequestState::init)};
+  u8 validation{static_cast<u8>(FrontierValidationState::unknown)};
+  u8 priority{static_cast<u8>(DirectBatchPriority::speculative)};
+  u8 flags{};
+};
+// query_id is the CTA's QueryDescriptor request_id; request_id is
+// issue_epoch*capacity+slot; record location remains in the asynchronously
+// owned request-offset SoA. Keeping those wave-invariant/derived fields out of
+// every entry cuts shared-memory traffic without weakening the logical ROB
+// contract.
+static_assert(sizeof(FrontierRobEntry) == 24);
 
 enum class QueryRdmaTraceMode : u32 {
   off = 0,
@@ -164,11 +278,11 @@ enum class QueryRdmaTraceMode : u32 {
   full = 2,
 };
 
-// Completion is intentionally limited to the software-visible boundary of the
-// owner submission group containing this shard descriptor.  The owner requests
-// one success CQE for the group's final READ (or dump WQE), so physical
-// per-descriptor, per-parent, and per-WQE completion times are not observable
-// without changing the transport data path.
+// Completion is intentionally limited to a software-visible owner priority
+// fence. Unsplit submissions expose their final READ (or dump WQE); split
+// submissions expose independent critical-prefix and speculative-tail fences.
+// Physical per-descriptor, per-parent, and per-WQE completion times remain
+// unobservable without changing the transport data path.
 struct QueryRdmaTraceEvent {
   u64 request_id{};
   u64 issue_timestamp_ns{};
@@ -203,7 +317,10 @@ struct alignas(64) DirectOwnerProgress {
   unsigned long long dequeued{};
   unsigned long long completed{};
   unsigned long long heartbeat{};
-  unsigned long long reserved[4]{};
+  unsigned long long submitted_wqes{};
+  unsigned long long submission_wqe_capacity{};
+  unsigned long long critical_batches{};
+  unsigned long long speculative_batches{};
 };
 
 static_assert(sizeof(DirectOwnerProgress) == 64);
@@ -247,7 +364,8 @@ struct PersistentKernelParams {
   u32 final_rerank_width{};
   u32 exact_width{};
   u32 max_expansions{};
-  u32 prefetch_depth{};
+  u32 commit_width{};
+  u32 issue_width{};
   u32 beam_merge_policy{};
   u32 visited_capacity{};
   u32 query_slots{};
@@ -263,8 +381,14 @@ struct PersistentKernelParams {
   void* const* direct_qps{};
   i32* direct_qp_locks{};
   const DeviceRingView<DirectBatchDescriptor>* direct_batch_queues{};
+  const DeviceRingView<DirectBatchDescriptor>*
+    direct_speculative_batch_queues{};
   i32* direct_batch_statuses{};
   u64* direct_batch_completion_timestamps_ns{};
+  i32* core_batch_statuses{};
+  u64* core_batch_completion_timestamps_ns{};
+  i32* tail_batch_statuses{};
+  u64* tail_batch_completion_timestamps_ns{};
   u32 direct_batch_queue_count{};
   u32* direct_owner_phases{};
   DirectOwnerProgress* direct_owner_progress{};
@@ -301,6 +425,20 @@ struct PersistentKernelParams {
   // Only the first kPersistentMaxPrefetch entries of each query slot are used
   // by graph fetches.
   u32* graph_request_bytes{};
+  // Speculative descriptors remain owned by the QP-owner warp while the query
+  // CTA decodes committed records and may reuse the dynamic-PQ request arrays.
+  // These dedicated SoA arrays therefore have ROB-slot lifetime and eliminate
+  // descriptor-pointer aliasing/ABA with critical graph and dynamic-code reads.
+  u32* speculative_graph_request_shards{};
+  u64* speculative_graph_request_offsets{};
+  u64* speculative_graph_request_local_iovas{};
+  u32* speculative_graph_request_bytes{};
+  // The QP owner validates prefetched graph snapshots before publishing the
+  // completion word. Handles and one-byte results share the ROB-slot lifetime
+  // of the request SoA, so query CTAs consume validation without rescanning
+  // every record after the overlap window.
+  u64* speculative_graph_request_handles{};
+  u8* speculative_graph_validation_states{};
   QueryRdmaTraceHeader* query_rdma_trace_headers{};
   QueryRdmaTraceEvent* query_rdma_trace_events{};
   u32 query_rdma_trace_mode{};
@@ -356,9 +494,11 @@ struct PersistentKernelOccupancy {
 // Query the resource footprint of the exact unified kernel binary.  An
 // analytical register-only estimate is not sufficient because CUDA also
 // accounts for allocation granularity and every other per-CTA resource.
-PersistentKernelOccupancy inspect_persistent_search_kernel(u32 threads);
+PersistentKernelOccupancy inspect_persistent_search_kernel(
+  u32 threads, bool enable_asfe = true);
 
-void launch_persistent_search(cudaStream_t stream, const PersistentKernelParams& params,
+void launch_persistent_search(cudaStream_t stream,
+                              const PersistentKernelParams& params,
                               u32 blocks, u32 threads);
 void launch_direct_read_owners(cudaStream_t stream,
                                const PersistentKernelParams& params,

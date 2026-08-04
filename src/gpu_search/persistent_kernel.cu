@@ -8,14 +8,24 @@ namespace gpu_search {
 
 using namespace persistent_kernel_detail;
 
-PersistentKernelOccupancy inspect_persistent_search_kernel(u32 threads) {
+PersistentKernelOccupancy inspect_persistent_search_kernel(
+    u32 threads, bool enable_asfe) {
   if (threads != 128 && threads != 256) {
     throw std::invalid_argument(
       "persistent search kernel supports only 128 or 256 threads");
   }
   cudaFuncAttributes attributes{};
-  cudaError_t status =
-    cudaFuncGetAttributes(&attributes, persistent_search_kernel);
+  const void* kernel = nullptr;
+  if (threads == 128) {
+    kernel = enable_asfe
+      ? reinterpret_cast<const void*>(persistent_search_kernel<128, true>)
+      : reinterpret_cast<const void*>(persistent_search_kernel<128, false>);
+  } else {
+    kernel = enable_asfe
+      ? reinterpret_cast<const void*>(persistent_search_kernel<256, true>)
+      : reinterpret_cast<const void*>(persistent_search_kernel<256, false>);
+  }
+  cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
   if (status != cudaSuccess) {
     throw std::runtime_error(
       std::string("cudaFuncGetAttributes(persistent search): ") +
@@ -23,7 +33,7 @@ PersistentKernelOccupancy inspect_persistent_search_kernel(u32 threads) {
   }
   int active_blocks = 0;
   status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-    &active_blocks, persistent_search_kernel,
+    &active_blocks, kernel,
     static_cast<int>(threads), 0);
   if (status != cudaSuccess) {
     throw std::runtime_error(
@@ -44,9 +54,29 @@ PersistentKernelOccupancy inspect_persistent_search_kernel(u32 threads) {
   };
 }
 
-void launch_persistent_search(cudaStream_t stream, const PersistentKernelParams& params,
+void launch_persistent_search(cudaStream_t stream,
+                              const PersistentKernelParams& params,
                               u32 blocks, u32 threads) {
-  persistent_search_kernel<<<blocks, threads, 0, stream>>>(params);
+  if (threads == 128) {
+    if (params.issue_width > params.commit_width) {
+      persistent_search_kernel<128, true>
+        <<<blocks, 128, 0, stream>>>(params);
+    } else {
+      persistent_search_kernel<128, false>
+        <<<blocks, 128, 0, stream>>>(params);
+    }
+  } else if (threads == 256) {
+    if (params.issue_width > params.commit_width) {
+      persistent_search_kernel<256, true>
+        <<<blocks, 256, 0, stream>>>(params);
+    } else {
+      persistent_search_kernel<256, false>
+        <<<blocks, 256, 0, stream>>>(params);
+    }
+  } else {
+    throw std::invalid_argument(
+      "persistent search kernel supports only 128 or 256 threads");
+  }
 }
 
 void launch_direct_read_owners(cudaStream_t stream,

@@ -74,7 +74,7 @@ __global__ void compact_merge_kernel(
     u64* candidate_handles, f32* candidate_distances, u32 candidate_count,
     u64* beam_handles, u32* beam_ids, f32* beam_distances,
     u8* beam_expanded, u32 beam_capacity,
-    u64* scratch_handles, u32* scratch_expanded, f32* scratch_distances,
+    u64* scratch_handles, u8* scratch_expanded, f32* scratch_distances,
     BeamMergePolicy policy, u32* result_count) {
   __shared__ CandidateWorkspace workspace;
   __shared__ u32 beam_count;
@@ -104,7 +104,7 @@ void run_case(u32 beam_capacity) {
     throw std::invalid_argument("unexpected compact beam test capacity");
   }
   const u32 candidate_count = kMergeItems - beam_capacity;
-  const u32 scratch_count = beam_capacity * 2;
+  const u32 scratch_count = beam_capacity * 4;
   if (candidate_count < kStableSecondFold + beam_capacity) {
     throw std::invalid_argument(
       "compact merge test cannot cover the stable second fold");
@@ -140,7 +140,7 @@ void run_case(u32 beam_capacity) {
   DeviceBuffer<f32> d_beam_distances(beam_capacity);
   DeviceBuffer<u8> d_beam_expanded(beam_capacity);
   DeviceBuffer<u64> d_scratch_handles(scratch_count);
-  DeviceBuffer<u32> d_scratch_expanded(scratch_count);
+  DeviceBuffer<u8> d_scratch_expanded(scratch_count);
   DeviceBuffer<f32> d_scratch_distances(scratch_count);
   DeviceBuffer<u32> d_result_count(1);
   copy_to_device(d_candidate_handles, candidate_handles);

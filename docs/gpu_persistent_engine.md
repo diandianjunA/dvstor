@@ -63,14 +63,177 @@ thread 只做以下工作：
 2. 为每个 PQ 子空间构建 256 项距离表；
 3. 在同一完整 publication 中读取每个物理分片的 centroid 和实时入口，按 centroid
    距离选择最近的一个物理分片并对其入口打分；跨分片遍历只由真实图边引入；
-4. 从 beam 选择未展开候选；
-5. 以 `gpu-graph-prefetch-depth` 并行发出远端图读取。默认 `fixed` 为每条 WQE
-   使用完整物理记录长度；`live-extent` 为同一 descriptor 中每条静态记录选择独立的
-   8-edge 分档长度。静态稳态不增加 WQE/descriptor/CQE；更新首次撑出旧档位时执行
-   一次 full fallback，并在 GPU high-water 表中修复该档位；
-6. 解码 8-byte incarnation-tagged RemotePtr，并用对应 PQ code 评分；
-7. 去重、合并并裁剪到 traversal beam；
-8. 达到收敛或 `gpu-max-expansions` 后进入精排。
+4. 从已完整发布的 authoritative Beam 冻结精确 commit frontier，再等待保证这些
+   节点推进的 core wave；tail wave 只做非阻塞完成轮询。冻结点是本轮逻辑 commit
+   决策，`gpu-graph-commit-width` 只决定本轮允许产生搜索副作用的节点数；shadow
+   tail 永远不能进入这一步。
+5. commit 节点若命中已验证 ROB payload 则直接解码，否则进入原有
+   Live-Extent/full-snapshot retry。随后才产生邻居、更新 visited、计算 PQ
+   distance，并在本轮权威发布时设置 expanded；RDMA 到达本身不能触发这些状态
+   变化。ordered completion pipeline 先无阻塞收割当前可见的 CQ backlog；若下一
+   CQ 尚未 READY，则立即按精确父节点顺序执行已缓存前缀，绝不拿着可做工作进入
+   网络轮询。parent completion 与 candidate scoring 使用独立进度游标：decode 和
+   visited 按父节点及时追加，不足一个 Stable-Run 叶（128 threads × 4 items =
+   512 candidates）的候选保留到下一 CQ 小组，PQ 只在完整叶（最终 residue 除外）
+   上启动。512 来自后续 COSSF 可立即消费的最小结构单元，不是数据集参数；这样小
+   shard completion 仍能用 decode/visited 覆盖 RDMA interval，也不会为了一个尚
+   不能 merge 的窄前缀额外进入一次完整 PQ batch。若 ordered progress 已完成本轮
+   全部父节点，common final 直接复用三条进度游标，只清理 graph-slot/ROB ownership；
+   visited suffix 或 PQ residue 为空时不再执行对应的空 CTA barrier 框架。
+6. Stable-Run 保持原排序与 tie 语义，但把通信、候选评分、稳定合并和 Beam 发布拆成
+   可重叠阶段。COSSF（Commit-Ordered Streaming Stable Fold）在 commit frontier
+   冻结后把 old Beam 复制到既有 `CandidateWorkspace` 的私有 ping-pong
+   accumulator，并只在私有副本上覆盖本轮 selected ranks 的 expanded 位。ordered
+   CQ progress 按原 parent/neighbor 顺序产生不可再变化的连续候选区间；当后续
+   critical CQ 仍在 flight 时，已封闭区间立即执行必要的 stable radix sort，并按
+   原始流顺序 left-fold 到私有 top-K accumulator：
+   `topK(topK(A) ⊕ B) = topK(A ⊕ B)`。CUB 叶内稳定排序和 co-rank 的左输入
+   tie 优先共同保留 `old Beam < run0 < run1 ...` 的精确总顺序，分段边界可以来自
+   任意运行时 completion grouping，不依赖数据集。
+   最后一个区间完成后，从精确 accumulator 压缩出 unexpanded Issue Frontier，先
+   发布下一 critical RDMA wave，再用一次 coalesced copy 发布完整 authoritative
+   Beam。此前 Beam、termination 和 authoritative expanded 均不可见；任意 critical
+   失败直接丢弃私有 fold。没有新增 per-query global buffer、全局队列或 CPU
+   scheduler。高图度导致一次 commit 无法放入 ordered scoring workspace，或
+   issue/commit 未解耦时，仍走 SRFC（Sort-Once Reusable Frontier Certificate）
+   的同一 Stable-Run 精确前缀/后缀路径，而不是改变搜索语义。
+7. `gpu-graph-issue-width` 是运行时上限。CTA-local controller 使用真实
+   promotion/retention、stale、owner-ring rejection 和下一 commit prefix 的
+   exact coverage，在
+   `[commit-width, issue-cap]` 内调整；它不改变 Beam 宽度、commit 宽度或终止
+   条件。controller 在 persistent query CTA 内跨查询保留学习状态，按已验证
+   shadow 的净收益做有界乘法增长；stale 和 SQ rejection 分别计算比例收缩并只
+   应用其中最大值。宽度收缩到 commit width 后不再让每个短查询重复 bootstrap，
+   而是每 `commit-width` 个有效查询开放一个 shadow slot 重新采样，以运行时参数
+   决定恢复频率而不引入数据集阈值。
+   未完成 tail 既不能 refill，也不能取得 exact coverage，因此 CQ backlog 会自然
+   阻止增长；controller 不再把一次 nonblocking poll 的函数耗时误当 issue-to-CQ
+   latency。每个物理请求的 retention/promotion utility 最多计一次。
+8. preview 的前 `commit-width` 个请求组成 guaranteed core wave，其余请求组成
+   可丢弃 tail。二者作为一个 split descriptor 只进入 critical owner ring。
+   QP owner 先收集服务边界上所有 critical descriptor；仅当已形成的 SQ train
+   仍有空闲 WQE 时，才用一个 doorbell 发布
+   `[all critical READ][critical CQ fence][admitted tail READ][tail CQ fence]`。
+   第一 CQ fence 立即发布 core completion，第二 fence 只发布 tail。若 critical
+   backlog、descriptor 饱和或 SQ credit 不足，tail 以 `-EAGAIN` fail-soft 丢弃，
+   不进入另一个 QP/doorbell。该调度是 work-conserving non-preemptive priority：
+   服务边界上已可见的 critical 永远优先；一个已经 doorbell 的有界 tail 仍会占用
+   当前 QP interval，之后到达的 critical 在下一 train 服务，不能宣称硬件级抢占。
+9. core/tail 到达后只在复用的 32 个 coalesced graph scratch slot 中验证
+   checksum/incarnation，状态按 `ARRIVED -> VALIDATED` 或 `STALE` 迁移，绝不会提前
+   设置 `expanded`、visited 或修改 authoritative Beam。过期 tail payload 可直接
+   丢弃；Stable-Run materialize 继续作为唯一权威 Beam 写入点。
+10. 解码 8-byte incarnation-tagged RemotePtr，并用对应 PQ code 评分；Live-Extent
+   继续按每条静态记录独立的 8-edge 分档长度读取，更新撑档仍走 full fallback。
+11. 去重、合并并裁剪到 traversal beam；达到收敛或 `gpu-max-expansions` 后进入精排。
+
+query slot 是所有 speculative DMA 的生命周期边界。正常精排、graph/dynamic-code
+失败以及 final frontier drain 失败在发布 completion 前都必须先收割 core、tail 和
+terminal-exact descriptor；这也包括下一 epoch 开始处的 authoritative graph fetch
+失败，因为上一 epoch 发出的 terminal train 此时仍可能 active。已知 `graph_failed`
+的 epoch 禁止再发起 terminal wave。
+因此 host 观察到 completion 并归还 slot 时，不可能仍有旧 generation 的 RDMA 写入
+该 slot 的 graph/exact scratch。异常路径上的结果只用于 quiesce，不参与 Beam、visited
+或返回结果。
+
+### Adaptive Speculative Frontier
+
+Frontier reorder buffer 位于 query CTA 的 shared memory。每个 24-byte 条目物理保存
+node handle、issue epoch、issue 时 beam rank、scratch slot、传输字节数、priority、
+completion state 和 validation state；query id 是 CTA descriptor 标量，request id
+由 `epoch * capacity + slot` 派生，record location 保持在 coalesced request SoA，
+避免逐条重复存储。ROB 生命周期只由 CTA 维护，因此没有 global queue 或 CPU
+scheduler。
+
+shadow 历史只参与宽度控制，不写 visited/expanded，也不会在完整 merge barrier
+前成为下一轮的 authoritative Beam。它把 shadow handle 分为“下一次精确对账时
+进入 commit prefix”和“仍在 tail 或被替换”两类；前者才计 promotion/retention，
+后者计浪费。物理请求失败会被标为 stale 并释放，随后同一 handle 仍可走 critical
+重试路径。同一个物理 speculative read 的 controller utility 在首次
+retention 或 promotion 时只计一次（promotion telemetry 仍按真实命中统计）；
+累计 useful/waste 比例可被后续运行状态反转，不需要离线训练或数据集阈值。
+
+commit 匹配、ROB 回收和 issue allocation 由一个 warp 分别以 commit position、
+ROB slot 和 preview position 为 lane 粒度执行，ballot 后直接压缩 critical miss；
+不存在 lane-0 的 32x32 ROB 扫描。core issue 同样以一个 request/lane 组织，用
+warp match-any 按目标 shard 聚合一次 batch，而不再执行
+`num_shards × request_count` 扫描；batch timestamp 数组也由 warp/CTA 协作清零。
+COSSF 的 accumulator 使用 `CandidateWorkspace` 已有的两个 Beam-sized segment，
+当前 sorted interval 复用既有 rerank scratch 的首段；每个区间 fold 完后即可覆盖
+scratch，不保留按数据集扩张的候选缓存。selected expanded overlay 是唯一 rank 一次
+写入，没有 `K × commit-width` 扫描或全局原子。最终 Issue 输出使用四个 warp 的
+ballot/compaction。SRFC fallback 则在已准备的 Stable-Run leaves 与只读 old Beam
+上构造 dependency-closed 精确前缀，split RDMA 发布后由原 authoritative
+materializer 复用同一棵 merge tree 的结果。两条路径都只使用 CTA-local shared
+metadata，且不会重新实现或绕开 Stable-Run 的排序语义。
+
+DEEC（Dominance-Envelope Exact Certificate）及 PBEC 仍作为精确证明边界与微基准
+保留在 CUDA 测试中，但不再位于生产热路径。实测 workload 的 DEEC fit 不足时，
+其 raw-candidate 扫描和 fallback 会重复 Stable-Run 的必要工作；COSSF/SRFC 用
+“必要工作只做一次、并在通信区间内推进”的结构性约束替代该数据分布相关分支。
+
+请求完成不能直接改变搜索语义。只有 commit 阶段在冻结的 rank 顺序下把 `COMMITTED`
+条目映射到 `graph_record_slots`，随后才执行邻居生成、visited 插入、PQ distance
+和 Stable-Run merge。这样 speculative read 可以隐藏 RDMA 延迟，但不会因为提前收到
+邻居而影响 beam 排序或 termination。
+
+并发更新下沿用现有逐记录一致性契约：一次 graph record 读取在线性化于该查询区间内
+的 RDMA snapshot，incarnation/checksum 验证排除 torn 或已失效记录；查询不承诺所有
+记录来自同一全局版本。ASFE 只把这个合法 snapshot 提前到 issue 时刻，静态或无并发
+写入时与 coupled baseline 位级等价。若未来接口要求“commit 时刻的最新记录”而不是
+“查询区间内的一致记录”，必须增加版本重验证；当前系统与 baseline 都不提供该更强的
+全局快照语义。
+
+completion/report 输出 `logical_expansions`、critical/core/tail reads/bytes、
+core-ready wave ratio、tail promotion/waste ratio、tail wasted bytes、owner
+WQE submission utilization、critical/speculative completion latency、
+issue-capacity utilization、commit/issue width、reusable-certificate count
+及其实际发布数、每 query 的 reusable prefix ranks、覆盖完整
+`traversal_capacity` 的 certificate 数、CQ ordered/completion PQ 分段，
+以及后续 core CQ 尚未完成时真正提前密封并 fold 的 candidate-run 数。`issued`
+只在 critical core
+batch 确实进入 active 状态后计数；`full-prefix` 只表示
+`fused_tree_prefix == traversal_capacity`，不能由 shadow 输出恰好填满 preview
+误判。prefix-rank 和 streamed-run 都按实际完成工作累加，因此可用于验证重叠工作
+是否存在而不是仅验证代码分支被访问。PQ 分段计数严格定义如下：
+
+- `ordered_score_batches/candidates` 只统计 COSSF 已建立私有 accumulator、候选数
+  非零且调用 `approximate_handles_batch` 时仍有 critical core CQ 未完成的调用；
+- `completion_score_batches/candidates` 只统计 critical core 已全部完成后执行的
+  非零 PQ 调用，包括此前保留的 candidate-tile residue 和最后到达/critical retry
+  父节点产生的连续候选 suffix；
+- 两类 batch 都不把零候选控制路径计为调用，候选数是传给评分函数的实际 `count`。
+
+三个 PQ 计数复用已退出生产热路径的 DEEC completion 槽；独立的 terminal exact
+cache 计数将 completion descriptor 从 528 bytes 增至 552 bytes，但仍直接写入
+已有 CTA-local shared completion 对象，因此没有新增 per-query global allocation
+或 cache buffer。报告还包含 exact snapshot train attempts/fallback ratio。
+Live-Extent 的物理字节仍
+以实际 admitted WQE 计数；owner 因 SQ slack 不足而拒绝的 tail 会一次性回退
+producer 的乐观 reads/bytes/batch 记账，只进入 queue-reject 压力，不算 wasted bytes。
+已读取但未晋升的 tail 才进入 wasted-byte 统计，且两者都不会被算作 logical
+expansion。这里的 `remote_batches` 是每 shard、每 priority 的逻辑 batch，不是
+doorbell 或 CQE 数；物理 train 利用率应使用 owner submitted-WQE/capacity 及
+critical/speculative owner-batch 指标。
+
+冻结 A/B 汇总器把上述 COSSF 原始计数字段作为报告 schema 合约；任何旧服务进程或
+旧 benchmark binary 生成、缺少这些字段的报告都会直接拒绝汇总，而不会与新结果
+混合成一个看似有效的性能结论。它还要求 coupled baseline 的 certificate/ordered
+计数为零，并要求 candidate 至少完成一个 reusable certificate、实际发布一个
+下一轮 core wave 且执行一次非空 ordered/completion score batch，防止“配置写着
+adaptive、运行时却没有进入解耦路径”的假 A/B。
+
+公平性能验收使用固定工作量、配对交错顺序和相同 Stable-Run + Live-Extent 栈：
+
+```bash
+REPETITIONS=10 CONCURRENCIES="1 8 64 256" \
+  ./experiment/run_asfe_ab.sh
+```
+
+baseline 唯一差异是 `issue-width == commit-width`；candidate 允许 controller 在
+commit width 与 workspace cap 之间选择 issue width。脚本报告每个并发度的配对 QPS
+几何均值、mean/P99 latency ratio、recall delta，并用单侧 95% 置信界验证 30% 吞吐
+目标，避免依赖一次短时运行。
 
 在线查询完全不读取 metadata medoid 或离线静态 entry points。查询准入依赖完整、
 可路由的 storage-canonical centroid 状态；若一次查询在两次有界快照尝试后仍得不到
@@ -104,10 +267,19 @@ overlay 或需要广播到所有计算节点的动态索引副本。
 近似导航只决定候选覆盖，最终结果始终使用原始 L2 距离：
 
 1. 选择最多 `gpu-final-rerank-width` 个候选；
-2. 通过 GPUNetIO/RDMA 从存储节点直接拉取远端 fixed record；
-3. 按 metadata dtype 解码 uint8、int8 或 float32；
-4. 计算精确 L2，并按权威记录中的 tombstone/generation 过滤失效版本；
-5. 按距离返回 top-k。
+2. 每个有候选的物理分片发布一个 mandatory fenced snapshot train。请求 SoA 为
+   `[完整 fixed records][同序第二 header snapshots]`；QP owner 把 descriptor
+   作为不可分割的 critical train，第一条 trailer READ 带 mlx5 initiator fence，
+   因而只有在全部完整记录 READ 完成后才会启动第二次 header 读取；
+3. 最终 trailer READ（或硬件需要时的唯一 final dump WQE）产生一次 CQE。查询 CTA
+   只执行一次 `issue -> wait`，但仍用前后 header、tombstone、generation 和 slot
+   incarnation 验证更新一致性；它没有缓存远端向量，也没有改变存储记录格式；
+4. 若 train 在发布前因 SQ 容量或兼容性原因不能执行，该分片回退到既有的
+   `完整记录 issue/wait -> header issue/wait` 协议。只有 fallback 也发生最终
+   transport failure 时整条查询以 `exact_fetch` 失败，绝不静默发布其他分片组成的
+   partial rerank；合法 tombstone/incarnation/snapshot visibility reject 仍只过滤
+   对应候选；
+5. 按 metadata dtype 解码 uint8、int8 或 float32，计算精确 L2，并按距离返回 top-k。
 
 因此 PQ 误差不会直接污染最终距离，但会影响候选是否进入精排。召回率主要由
 centroid publication 中的实时入口、traversal beam、最大展开数和精排宽度共同决定。

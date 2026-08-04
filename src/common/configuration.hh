@@ -9,6 +9,7 @@
 #include <library/configuration.hh>
 
 #include "constants.hh"
+#include "gpu_search/adaptive_frontier.hh"
 #include "types.hh"
 #include "vector_dtype.hh"
 
@@ -46,6 +47,11 @@ public:
   u32 gpu_bootstrap_window_mb{64};
   u32 gpu_bootstrap_windows{2};
   u32 gpu_graph_prefetch_depth{32};
+  // Zero preserves legacy configurations by deriving the authoritative
+  // commit width from gpu_graph_prefetch_depth after option parsing.
+  u32 gpu_graph_commit_width{};
+  // Zero selects the workspace/beam-limited speculative issue cap.
+  u32 gpu_graph_issue_width{};
   str gpu_query_graph_read_policy{"fixed"};
   str gpu_query_beam_merge_policy{"legacy"};
   str query_rdma_trace_mode{"off"};
@@ -102,6 +108,7 @@ public:
     if (vector_id_namespace_size == 0) {
       vector_id_namespace_size = max_vectors;
     }
+    resolve_graph_frontier_widths();
     vector_data_type = normalize_mode(vector_data_type);
     gpu_query_graph_read_policy =
       normalize_mode(gpu_query_graph_read_policy);
@@ -126,6 +133,23 @@ public:
   }
 
 private:
+  void resolve_graph_frontier_widths() {
+    if (gpu_graph_commit_width == 0) {
+      gpu_graph_commit_width = gpu_graph_prefetch_depth;
+    }
+    if (gpu_graph_issue_width == 0) {
+      gpu_graph_issue_width =
+        gpu_search::adaptive_frontier::automatic_max_issue_width(
+          gpu_traversal_beam_width);
+      // A historical configuration could legally use a prefetch depth larger
+      // than its traversal beam. Keep that configuration valid and preserve
+      // its authoritative width instead of silently narrowing the search.
+      if (gpu_graph_issue_width < gpu_graph_commit_width) {
+        gpu_graph_issue_width = gpu_graph_commit_width;
+      }
+    }
+  }
+
   static str normalize_mode(str value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
       return static_cast<char>(std::tolower(ch));
@@ -186,7 +210,13 @@ private:
        "Concurrent one-time PQ bootstrap reads.")
       ("gpu-graph-prefetch-depth",
        po::value<u32>(&gpu_graph_prefetch_depth)->default_value(gpu_graph_prefetch_depth),
-       "Graph records fetched concurrently by one GPU query.")
+       "Legacy graph fetch/expansion width and default commit width.")
+      ("gpu-graph-commit-width",
+       po::value<u32>(&gpu_graph_commit_width)->default_value(gpu_graph_commit_width),
+       "Authoritative graph expansion width; zero derives from legacy prefetch depth.")
+      ("gpu-graph-issue-width",
+       po::value<u32>(&gpu_graph_issue_width)->default_value(gpu_graph_issue_width),
+       "Maximum speculative graph read width; zero derives from frontier capacity and traversal beam.")
       ("gpu-query-graph-read-policy",
        po::value<str>(&gpu_query_graph_read_policy)
          ->default_value(gpu_query_graph_read_policy),
@@ -344,6 +374,10 @@ private:
         gpu_bootstrap_windows > 16 ||
         gpu_graph_prefetch_depth == 0 ||
         gpu_graph_prefetch_depth > 32 ||
+        gpu_graph_commit_width == 0 ||
+        gpu_graph_commit_width > gpu_graph_issue_width ||
+        gpu_graph_issue_width >
+          gpu_search::adaptive_frontier::kFrontierCapacity ||
         gpu_traversal_beam_width < k || gpu_traversal_beam_width > 256 ||
         gpu_final_rerank_width < k || gpu_final_rerank_width > 256 ||
         gpu_max_expansions < gpu_traversal_beam_width ||
@@ -420,6 +454,9 @@ public:
              << config.gpu_final_rerank_width << '\n';
       output << std::setw(width) << "GPU max expansions: "
              << config.gpu_max_expansions << '\n';
+      output << std::setw(width) << "GPU graph commit/issue width: "
+             << config.gpu_graph_commit_width << "/"
+             << config.gpu_graph_issue_width << '\n';
       output << std::setw(width) << "GPU graph read policy: "
              << config.gpu_query_graph_read_policy << '\n';
       output << std::setw(width) << "GPU Beam merge policy: "

@@ -75,9 +75,10 @@ __global__ void stable_run_microbench_kernel(
     const f32* original_beam_distances, const u8* original_beam_expanded,
     u32 beam_capacity, u64* beam_handles, u32* beam_ids,
     f32* beam_distances, u8* beam_expanded, u64* scratch_handles,
-    u32* scratch_flags, f32* scratch_distances, BeamMergePolicy policy,
-    MicrobenchResult* result) {
+    u8* scratch_flags, f32* scratch_distances, BeamMergePolicy policy,
+    bool fused_materialize, MicrobenchResult* result) {
   __shared__ CandidateWorkspace workspace;
+  __shared__ StableMergePreparedState stable_state;
   __shared__ u32 beam_count;
   __shared__ u64 iteration_started;
   __shared__ BeamMergeCycleBreakdown phases;
@@ -103,14 +104,29 @@ __global__ void stable_run_microbench_kernel(
     if (threadIdx.x == 0) iteration_started = clock64();
     __syncthreads();
 
-    merge_approximate_into_beam(
-      const_cast<u64*>(candidate_handles),
-      const_cast<f32*>(candidate_distances), candidate_count,
-      beam_handles, beam_ids, beam_distances, beam_expanded,
-      beam_count, beam_capacity,
-      scratch_handles, scratch_flags, scratch_distances,
-      workspace, policy,
-      policy == BeamMergePolicy::stable_run ? &phases : nullptr);
+    if (policy == BeamMergePolicy::stable_run && fused_materialize) {
+      prepare_approximate_stable_runs(
+        const_cast<u64*>(candidate_handles),
+        const_cast<f32*>(candidate_distances), candidate_count,
+        beam_handles, beam_ids, beam_distances, beam_expanded,
+        beam_count, beam_capacity,
+        scratch_handles, scratch_flags, scratch_distances,
+        workspace, stable_state, &phases, false);
+      finish_approximate_stable_runs(
+        beam_handles, beam_ids, beam_distances, beam_expanded,
+        beam_count, beam_capacity,
+        scratch_handles, scratch_flags, scratch_distances,
+        workspace, stable_state, &phases, true);
+    } else {
+      merge_approximate_into_beam(
+        const_cast<u64*>(candidate_handles),
+        const_cast<f32*>(candidate_distances), candidate_count,
+        beam_handles, beam_ids, beam_distances, beam_expanded,
+        beam_count, beam_capacity,
+        scratch_handles, scratch_flags, scratch_distances,
+        workspace, policy,
+        policy == BeamMergePolicy::stable_run ? &phases : nullptr);
+    }
 
     if (threadIdx.x == 0 && iteration >= kWarmupIterations) {
       total_cycles += clock64() - iteration_started;
@@ -128,7 +144,7 @@ __global__ void stable_run_microbench_kernel(
 
 MicrobenchResult run_one(
     u32 threads, u32 beam_capacity, u32 candidate_count,
-    BeamMergePolicy policy) {
+    BeamMergePolicy policy, bool fused_materialize) {
   if (beam_capacity + candidate_count >
       gpu_search::kPersistentMaxMergeCandidates) {
     throw std::invalid_argument("microbench merge input exceeds capacity");
@@ -160,9 +176,9 @@ MicrobenchResult run_one(
   DeviceBuffer<u32> d_beam_ids(beam_capacity);
   DeviceBuffer<f32> d_beam_distances(beam_capacity);
   DeviceBuffer<u8> d_beam_expanded(beam_capacity);
-  DeviceBuffer<u64> d_scratch_handles(beam_capacity * 2);
-  DeviceBuffer<u32> d_scratch_flags(beam_capacity * 2);
-  DeviceBuffer<f32> d_scratch_distances(beam_capacity * 2);
+  DeviceBuffer<u64> d_scratch_handles(beam_capacity * 4);
+  DeviceBuffer<u8> d_scratch_flags(beam_capacity * 4);
+  DeviceBuffer<f32> d_scratch_distances(beam_capacity * 4);
   DeviceBuffer<MicrobenchResult> d_result(1);
   upload(d_candidate_handles, candidate_handles);
   upload(d_candidate_distances, candidate_distances);
@@ -176,7 +192,7 @@ MicrobenchResult run_one(
     d_original_beam_expanded.get(), beam_capacity,
     d_beam_handles.get(), d_beam_ids.get(), d_beam_distances.get(),
     d_beam_expanded.get(), d_scratch_handles.get(), d_scratch_flags.get(),
-    d_scratch_distances.get(), policy, d_result.get());
+    d_scratch_distances.get(), policy, fused_materialize, d_result.get());
   check_cuda(cudaGetLastError(), "stable_run_microbench_kernel launch");
   check_cuda(cudaDeviceSynchronize(),
              "stable_run_microbench_kernel completion");
@@ -191,7 +207,8 @@ MicrobenchResult run_one(
 
 void print_result(
     u32 threads, u32 beam_capacity, u32 candidate_count,
-    BeamMergePolicy policy, const MicrobenchResult& result,
+    BeamMergePolicy policy, bool fused_materialize,
+    const MicrobenchResult& result,
     double cycles_per_microsecond) {
   const char* name =
     policy == BeamMergePolicy::legacy ? "legacy" : "stable-run";
@@ -203,6 +220,8 @@ void print_result(
     static_cast<double>(result.materialize_cycles) / divisor;
   std::cout << "merge_microbench"
             << " policy=" << name
+            << " materializer="
+            << (fused_materialize ? "fused-tree" : "default")
             << " threads=" << threads
             << " beam=" << beam_capacity
             << " candidates=" << candidate_count
@@ -243,11 +262,21 @@ int main() {
           }
           for (const BeamMergePolicy policy :
                {BeamMergePolicy::legacy, BeamMergePolicy::stable_run}) {
-            const MicrobenchResult result =
-              run_one(threads, beam_capacity, candidate_count, policy);
-            print_result(
-              threads, beam_capacity, candidate_count, policy, result,
-              cycles_per_microsecond);
+            const u32 materializer_count =
+              policy == BeamMergePolicy::stable_run &&
+                threads == kApproximateSortThreadsCompact &&
+                beam_capacity <= gpu_search::kPersistentMaxBeam
+                ? 2u : 1u;
+            for (u32 materializer = 0; materializer < materializer_count;
+                 ++materializer) {
+              const bool fused_materialize = materializer != 0;
+              const MicrobenchResult result = run_one(
+                threads, beam_capacity, candidate_count, policy,
+                fused_materialize);
+              print_result(
+                threads, beam_capacity, candidate_count, policy,
+                fused_materialize, result, cycles_per_microsecond);
+            }
           }
         }
       }

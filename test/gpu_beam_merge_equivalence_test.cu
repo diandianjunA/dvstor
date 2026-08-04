@@ -66,7 +66,7 @@ __global__ void beam_merge_kernel(
     u64* candidate_handles, f32* candidate_distances, u32 candidate_count,
     u64* beam_handles, u32* beam_ids, f32* beam_distances,
     u8* beam_expanded, u32 initial_beam_count, u32 beam_capacity,
-    u64* scratch_handles, u32* scratch_flags, f32* scratch_distances,
+    u64* scratch_handles, u8* scratch_flags, f32* scratch_distances,
     BeamMergePolicy policy, BeamMergeCycleBreakdown* cycle_breakdown,
     u32* output_count) {
   __shared__ CandidateWorkspace workspace;
@@ -157,9 +157,9 @@ void run_case(
   DeviceBuffer<u32> d_ids(beam_capacity);
   DeviceBuffer<f32> d_distances(beam_capacity);
   DeviceBuffer<u8> d_expanded(beam_capacity);
-  DeviceBuffer<u64> d_compact_handles(beam_capacity * 2);
-  DeviceBuffer<u32> d_compact_flags(beam_capacity * 2);
-  DeviceBuffer<f32> d_compact_distances(beam_capacity * 2);
+  DeviceBuffer<u64> d_compact_handles(beam_capacity * 4);
+  DeviceBuffer<u8> d_compact_flags(beam_capacity * 4);
+  DeviceBuffer<f32> d_compact_distances(beam_capacity * 4);
   DeviceBuffer<BeamMergeCycleBreakdown> d_cycle_breakdown(1);
   DeviceBuffer<u32> d_count(1);
   upload(d_candidates, candidate_handles);

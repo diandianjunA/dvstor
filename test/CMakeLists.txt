@@ -32,6 +32,12 @@ dvstor_target_common_includes(vector_dtype_test)
 target_compile_options(vector_dtype_test PRIVATE -UNDEBUG)
 add_test(NAME vector_dtype_test COMMAND vector_dtype_test)
 
+add_executable(adaptive_frontier_policy_test adaptive_frontier_policy_test.cc)
+dvstor_target_common_includes(adaptive_frontier_policy_test)
+target_link_libraries(adaptive_frontier_policy_test PRIVATE rdma_library)
+target_compile_options(adaptive_frontier_policy_test PRIVATE -UNDEBUG)
+add_test(NAME adaptive_frontier_policy_test COMMAND adaptive_frontier_policy_test)
+
 add_executable(storage_owner_wire_size_test storage_owner_wire_size_test.cc)
 dvstor_target_common_includes(storage_owner_wire_size_test)
 target_compile_options(storage_owner_wire_size_test PRIVATE -UNDEBUG)
@@ -187,6 +193,18 @@ target_compile_options(persistent_owner_watchdog_test PRIVATE -UNDEBUG)
 add_test(NAME persistent_owner_watchdog_test
          COMMAND persistent_owner_watchdog_test)
 
+add_executable(direct_owner_train_layout_test
+    direct_owner_train_layout_test.cc)
+dvstor_target_common_includes(direct_owner_train_layout_test)
+target_compile_options(direct_owner_train_layout_test PRIVATE -UNDEBUG)
+add_test(NAME direct_owner_train_layout_test
+         COMMAND direct_owner_train_layout_test)
+
+add_executable(frontier_staging_test frontier_staging_test.cc)
+dvstor_target_common_includes(frontier_staging_test)
+target_compile_options(frontier_staging_test PRIVATE -UNDEBUG)
+add_test(NAME frontier_staging_test COMMAND frontier_staging_test)
+
 add_executable(maintenance_fence_test maintenance_fence_test.cc)
 dvstor_target_common_includes(maintenance_fence_test)
 target_compile_options(maintenance_fence_test PRIVATE -UNDEBUG)
@@ -247,6 +265,72 @@ if (TARGET dvstor_gpu_kernels)
     add_test(NAME gpu_stable_run_merge_microbench
         COMMAND gpu_stable_run_merge_microbench)
     set_tests_properties(gpu_stable_run_merge_microbench PROPERTIES
+        TIMEOUT 30
+        SKIP_REGULAR_EXPRESSION "^SKIP:")
+
+    add_executable(gpu_stable_frontier_preview_test
+        gpu_stable_frontier_preview_test.cu)
+    dvstor_target_common_includes(gpu_stable_frontier_preview_test)
+    target_link_libraries(gpu_stable_frontier_preview_test PRIVATE CUDA::cudart)
+    target_compile_options(gpu_stable_frontier_preview_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+    add_test(NAME gpu_stable_frontier_preview_test
+        COMMAND gpu_stable_frontier_preview_test)
+    set_tests_properties(gpu_stable_frontier_preview_test PROPERTIES
+        TIMEOUT 30
+        SKIP_REGULAR_EXPRESSION "^SKIP:")
+
+    add_executable(gpu_partition_bounded_certificate_test
+        gpu_partition_bounded_certificate_test.cu)
+    dvstor_target_common_includes(gpu_partition_bounded_certificate_test)
+    target_link_libraries(gpu_partition_bounded_certificate_test
+        PRIVATE CUDA::cudart)
+    target_compile_options(gpu_partition_bounded_certificate_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+    add_test(NAME gpu_partition_bounded_certificate_test
+        COMMAND gpu_partition_bounded_certificate_test)
+    set_tests_properties(gpu_partition_bounded_certificate_test PROPERTIES
+        TIMEOUT 30
+        SKIP_REGULAR_EXPRESSION "^SKIP:")
+
+    add_executable(gpu_dominance_envelope_certificate_test
+        gpu_dominance_envelope_certificate_test.cu)
+    dvstor_target_common_includes(gpu_dominance_envelope_certificate_test)
+    target_link_libraries(gpu_dominance_envelope_certificate_test
+        PRIVATE CUDA::cudart)
+    target_compile_options(gpu_dominance_envelope_certificate_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+    add_test(NAME gpu_dominance_envelope_certificate_test
+        COMMAND gpu_dominance_envelope_certificate_test)
+    set_tests_properties(gpu_dominance_envelope_certificate_test PROPERTIES
+        TIMEOUT 60
+        SKIP_REGULAR_EXPRESSION "^SKIP:")
+
+    add_executable(gpu_fused_prefix_materialization_test
+        gpu_fused_prefix_materialization_test.cu)
+    dvstor_target_common_includes(gpu_fused_prefix_materialization_test)
+    target_link_libraries(gpu_fused_prefix_materialization_test
+        PRIVATE CUDA::cudart)
+    target_compile_options(gpu_fused_prefix_materialization_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+    add_test(NAME gpu_fused_prefix_materialization_test
+        COMMAND gpu_fused_prefix_materialization_test)
+    set_tests_properties(gpu_fused_prefix_materialization_test PROPERTIES
+        TIMEOUT 30
+        SKIP_REGULAR_EXPRESSION "^SKIP:")
+
+    add_executable(gpu_frontier_rob_test gpu_frontier_rob_test.cu)
+    dvstor_target_common_includes(gpu_frontier_rob_test)
+    target_link_libraries(gpu_frontier_rob_test PRIVATE CUDA::cudart)
+    target_compile_options(gpu_frontier_rob_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
+    add_test(NAME gpu_frontier_rob_test COMMAND gpu_frontier_rob_test)
+    set_tests_properties(gpu_frontier_rob_test PROPERTIES
         TIMEOUT 30
         SKIP_REGULAR_EXPRESSION "^SKIP:")
 

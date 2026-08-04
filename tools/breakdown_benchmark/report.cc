@@ -39,12 +39,19 @@ nlohmann::json telemetry_to_json(
     const gpu_search::TelemetrySnapshot& telemetry) {
   const uint64_t explicit_phase_ns =
     telemetry.gpu_prepare_ns + telemetry.gpu_beam_selection_ns +
-    telemetry.gpu_rdma_issue_ns + telemetry.gpu_rdma_wait_ns +
+    telemetry.gpu_frontier_preview_ns + telemetry.gpu_rdma_issue_ns +
+    telemetry.gpu_rdma_wait_ns +
     telemetry.gpu_graph_validation_ns + telemetry.gpu_neighbor_decode_ns +
     telemetry.gpu_pq_score_ns + telemetry.gpu_visited_ns +
     telemetry.gpu_beam_merge_ns + telemetry.gpu_exact_ns;
   const uint64_t gpu_other_ns = telemetry.gpu_active_ns > explicit_phase_ns
     ? telemetry.gpu_active_ns - explicit_phase_ns : 0;
+  const uint64_t terminal_exact_cache_unpromoted_records =
+    telemetry.terminal_exact_cache_issued_records >
+        telemetry.terminal_exact_cache_promoted_records
+      ? telemetry.terminal_exact_cache_issued_records -
+          telemetry.terminal_exact_cache_promoted_records
+      : 0;
   return {
     {"gpu_memory_explicit_bytes", telemetry.gpu_memory_explicit_bytes},
     {"gpu_memory_base_pq_bytes", telemetry.gpu_memory_base_pq_bytes},
@@ -87,6 +94,18 @@ nlohmann::json telemetry_to_json(
     {"average_gpu_rdma_issue_us", telemetry.queries_completed == 0 ? 0.0
       : static_cast<double>(telemetry.gpu_rdma_issue_ns) /
           static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_frontier_preview_us",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_frontier_preview_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_frontier_prepare_us",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_frontier_prepare_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"average_gpu_frontier_enqueue_us",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.gpu_frontier_enqueue_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
     {"average_gpu_rdma_wait_us", telemetry.queries_completed == 0 ? 0.0
       : static_cast<double>(telemetry.gpu_rdma_wait_ns) /
           static_cast<double>(telemetry.queries_completed) / 1000.0},
@@ -127,8 +146,24 @@ nlohmann::json telemetry_to_json(
     {"rdma_read_ops", telemetry.rdma_read_ops},
     {"rdma_read_bytes", telemetry.rdma_read_bytes},
     {"rdma_merged_requests", telemetry.rdma_merged_requests},
+    {"owner_submitted_wqes", telemetry.owner_submitted_wqes},
+    {"owner_submission_wqe_capacity",
+      telemetry.owner_submission_wqe_capacity},
+    {"owner_wqe_submission_utilization",
+      telemetry.owner_submission_wqe_capacity == 0 ? 0.0
+      : static_cast<double>(telemetry.owner_submitted_wqes) /
+          static_cast<double>(telemetry.owner_submission_wqe_capacity)},
+    {"owner_critical_batches", telemetry.owner_critical_batches},
+    {"owner_speculative_batches", telemetry.owner_speculative_batches},
     {"direct_path_failures", telemetry.direct_path_failures},
     {"graph_page_requests", telemetry.graph_page_requests},
+    {"logical_graph_reads",
+      telemetry.critical_graph_reads + telemetry.speculative_graph_reads},
+    {"average_logical_graph_reads_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(
+          telemetry.critical_graph_reads + telemetry.speculative_graph_reads) /
+          static_cast<double>(telemetry.queries_completed)},
     {"graph_shard_batches", telemetry.graph_shard_batches},
     {"average_graph_shard_batches_per_query",
       telemetry.queries_completed == 0 ? 0.0
@@ -165,6 +200,238 @@ nlohmann::json telemetry_to_json(
       telemetry.graph_live_extent_reads == 0 ? 0.0
       : static_cast<double>(telemetry.graph_extent_fallback_reads) /
           static_cast<double>(telemetry.graph_live_extent_reads)},
+    {"logical_expansions", telemetry.logical_expansions},
+    {"average_logical_expansions_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.logical_expansions) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"critical_graph_reads", telemetry.critical_graph_reads},
+    {"critical_graph_bytes", telemetry.critical_graph_bytes},
+    {"average_critical_graph_reads_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.critical_graph_reads) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"average_critical_graph_bytes_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.critical_graph_bytes) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"speculative_graph_reads", telemetry.speculative_graph_reads},
+    {"speculative_graph_bytes", telemetry.speculative_graph_bytes},
+    {"average_speculative_graph_reads_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.speculative_graph_reads) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"average_speculative_graph_bytes_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.speculative_graph_bytes) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"speculative_wasted_bytes", telemetry.speculative_wasted_bytes},
+    {"average_speculative_wasted_bytes_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.speculative_wasted_bytes) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"speculative_arrived", telemetry.speculative_arrived},
+    {"speculative_promoted", telemetry.speculative_promoted},
+    {"speculative_stale", telemetry.speculative_stale},
+    {"speculative_queue_rejects", telemetry.speculative_queue_rejects},
+    {"core_prefetch_reads", telemetry.core_prefetch_reads},
+    {"core_prefetch_bytes", telemetry.core_prefetch_bytes},
+    {"core_prefetch_arrived", telemetry.core_prefetch_arrived},
+    {"core_prefetch_promoted", telemetry.core_prefetch_promoted},
+    {"core_prefetch_stale", telemetry.core_prefetch_stale},
+    {"core_prefetch_queue_rejects",
+      telemetry.core_prefetch_queue_rejects},
+    {"core_prefetch_waves", telemetry.core_prefetch_waves},
+    {"core_ready_waves", telemetry.core_ready_waves},
+    {"core_ready_wave_ratio",
+      telemetry.core_prefetch_waves == 0 ? 0.0
+      : static_cast<double>(telemetry.core_ready_waves) /
+          static_cast<double>(telemetry.core_prefetch_waves)},
+    {"terminal_exact_cache_attempted_queries",
+      telemetry.terminal_exact_cache_attempted_queries},
+    {"terminal_exact_cache_attempt_rate",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(
+          telemetry.terminal_exact_cache_attempted_queries) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"terminal_exact_cache_issued_records",
+      telemetry.terminal_exact_cache_issued_records},
+    {"average_terminal_exact_cache_issued_records_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.terminal_exact_cache_issued_records) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"terminal_exact_cache_promoted_records",
+      telemetry.terminal_exact_cache_promoted_records},
+    {"average_terminal_exact_cache_promoted_records_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(
+          telemetry.terminal_exact_cache_promoted_records) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"terminal_exact_cache_wasted_bytes",
+      telemetry.terminal_exact_cache_wasted_bytes},
+    {"average_terminal_exact_cache_wasted_bytes_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.terminal_exact_cache_wasted_bytes) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"terminal_exact_cache_queue_rejects",
+      telemetry.terminal_exact_cache_queue_rejects},
+    {"average_terminal_exact_cache_queue_rejects_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(
+          telemetry.terminal_exact_cache_queue_rejects) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"terminal_exact_cache_miss_records",
+      telemetry.terminal_exact_cache_miss_records},
+    {"average_terminal_exact_cache_miss_records_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.terminal_exact_cache_miss_records) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"terminal_exact_cache_promotion_ratio",
+      telemetry.terminal_exact_cache_issued_records == 0 ? 0.0
+      : static_cast<double>(
+          telemetry.terminal_exact_cache_promoted_records) /
+          static_cast<double>(telemetry.terminal_exact_cache_issued_records)},
+    {"terminal_exact_cache_waste_ratio",
+      telemetry.terminal_exact_cache_issued_records == 0 ? 0.0
+      : static_cast<double>(terminal_exact_cache_unpromoted_records) /
+          static_cast<double>(telemetry.terminal_exact_cache_issued_records)},
+    {"completion_score_batches", telemetry.completion_score_batches},
+    {"average_completion_score_batches_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.completion_score_batches) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"completion_score_candidates", telemetry.completion_score_candidates},
+    {"average_completion_score_candidates_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.completion_score_candidates) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"average_completion_score_candidates_per_batch",
+      telemetry.completion_score_batches == 0 ? 0.0
+      : static_cast<double>(telemetry.completion_score_candidates) /
+          static_cast<double>(telemetry.completion_score_batches)},
+    {"frontier_reusable_certificates",
+      telemetry.frontier_reusable_certificates},
+    {"average_frontier_reusable_certificates_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.frontier_reusable_certificates) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"frontier_streamed_candidate_runs",
+      telemetry.frontier_streamed_candidate_runs},
+    {"average_frontier_streamed_candidate_runs_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.frontier_streamed_candidate_runs) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"ordered_score_batches", telemetry.ordered_score_batches},
+    {"average_ordered_score_batches_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.ordered_score_batches) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"ordered_score_candidates", telemetry.ordered_score_candidates},
+    {"average_ordered_score_candidates_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.ordered_score_candidates) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"average_ordered_score_candidates_per_batch",
+      telemetry.ordered_score_batches == 0 ? 0.0
+      : static_cast<double>(telemetry.ordered_score_candidates) /
+          static_cast<double>(telemetry.ordered_score_batches)},
+    {"frontier_reusable_prefix_ranks",
+      telemetry.frontier_reusable_prefix_ranks},
+    {"average_frontier_reusable_prefix_ranks_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.frontier_reusable_prefix_ranks) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"frontier_reusable_full_prefix_certificates",
+      telemetry.frontier_reusable_full_prefix_certificates},
+    {"average_frontier_reusable_full_prefix_certificates_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(
+          telemetry.frontier_reusable_full_prefix_certificates) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"frontier_reusable_issued_certificates",
+      telemetry.frontier_reusable_issued_certificates},
+    {"average_frontier_reusable_issued_certificates_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(
+          telemetry.frontier_reusable_issued_certificates) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"frontier_certificate_rejects",
+      telemetry.frontier_certificate_rejects},
+    {"average_frontier_certificate_rejects_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.frontier_certificate_rejects) /
+          static_cast<double>(telemetry.queries_completed)},
+    {"speculative_promotion_ratio",
+      telemetry.speculative_graph_reads == 0 ? 0.0
+      : static_cast<double>(telemetry.speculative_promoted) /
+          static_cast<double>(telemetry.speculative_graph_reads)},
+    {"speculative_waste_ratio",
+      telemetry.speculative_graph_reads == 0 ? 0.0
+      : static_cast<double>(telemetry.speculative_stale) /
+          static_cast<double>(telemetry.speculative_graph_reads)},
+    {"speculative_wasted_byte_ratio",
+      telemetry.speculative_graph_bytes == 0 ? 0.0
+      : static_cast<double>(telemetry.speculative_wasted_bytes) /
+          static_cast<double>(telemetry.speculative_graph_bytes)},
+    {"tail_promotion_ratio",
+      telemetry.speculative_graph_reads == 0 ? 0.0
+      : static_cast<double>(telemetry.speculative_promoted) /
+          static_cast<double>(telemetry.speculative_graph_reads)},
+    {"rdma_completion_latency_ns", telemetry.rdma_completion_latency_ns},
+    {"speculative_completion_latency_ns",
+      telemetry.speculative_completion_latency_ns},
+    {"rdma_completion_groups", telemetry.rdma_completion_groups},
+    {"speculative_completion_groups",
+      telemetry.speculative_completion_groups},
+    {"average_rdma_completion_latency_us",
+      telemetry.rdma_completion_groups == 0 ? 0.0
+      : static_cast<double>(telemetry.rdma_completion_latency_ns) /
+          static_cast<double>(telemetry.rdma_completion_groups) / 1000.0},
+    {"average_speculative_completion_latency_us",
+      telemetry.speculative_completion_groups == 0 ? 0.0
+      : static_cast<double>(telemetry.speculative_completion_latency_ns) /
+          static_cast<double>(telemetry.speculative_completion_groups) /
+          1000.0},
+    {"issue_epochs", telemetry.issue_epochs},
+    {"commit_epochs", telemetry.commit_epochs},
+    {"issue_width_sum", telemetry.issue_width_sum},
+    {"issue_width_capacity_sum", telemetry.issue_width_capacity_sum},
+    {"commit_width_sum", telemetry.commit_width_sum},
+    {"average_issue_width", telemetry.issue_epochs == 0 ? 0.0
+      : static_cast<double>(telemetry.issue_width_sum) /
+          static_cast<double>(telemetry.issue_epochs)},
+    {"average_issue_width_capacity", telemetry.issue_epochs == 0 ? 0.0
+      : static_cast<double>(telemetry.issue_width_capacity_sum) /
+          static_cast<double>(telemetry.issue_epochs)},
+    {"issue_frontier_utilization",
+      telemetry.issue_width_capacity_sum == 0 ? 0.0
+      : static_cast<double>(telemetry.issue_width_sum) /
+          static_cast<double>(telemetry.issue_width_capacity_sum)},
+    {"average_commit_width", telemetry.commit_epochs == 0 ? 0.0
+      : static_cast<double>(telemetry.commit_width_sum) /
+          static_cast<double>(telemetry.commit_epochs)},
+    {"max_issue_width", telemetry.max_issue_width},
+    {"max_commit_width", telemetry.max_commit_width},
+    {"critical_rob_hits", telemetry.critical_rob_hits},
+    {"critical_misses", telemetry.critical_misses},
+    {"critical_rob_hit_ratio",
+      telemetry.critical_rob_hits + telemetry.critical_misses == 0 ? 0.0
+      : static_cast<double>(telemetry.critical_rob_hits) /
+          static_cast<double>(
+            telemetry.critical_rob_hits + telemetry.critical_misses)},
+    {"speculative_wait_ns", telemetry.speculative_wait_ns},
+    {"average_speculative_wait_us",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.speculative_wait_ns) /
+          static_cast<double>(telemetry.queries_completed) / 1000.0},
+    {"gpu_kernel_threads", telemetry.gpu_kernel_threads},
+    {"gpu_registers_per_thread", telemetry.gpu_registers_per_thread},
+    {"gpu_static_shared_bytes", telemetry.gpu_static_shared_bytes},
+    {"gpu_active_blocks_per_sm", telemetry.gpu_active_blocks_per_sm},
+    {"gpu_effective_blocks_per_sm", telemetry.gpu_effective_blocks_per_sm},
+    {"gpu_query_blocks", telemetry.gpu_query_blocks},
+    {"gpu_owner_blocks", telemetry.gpu_owner_blocks},
+    {"gpu_total_persistent_blocks", telemetry.gpu_total_persistent_blocks},
     {"graph_dependency_rounds", telemetry.graph_dependency_rounds},
     {"average_graph_rounds_per_query", telemetry.queries_completed == 0 ? 0.0
       : static_cast<double>(telemetry.graph_dependency_rounds) /
@@ -194,6 +461,19 @@ nlohmann::json telemetry_to_json(
           static_cast<double>(
             telemetry.graph_page_requests + telemetry.graph_route_hits)},
     {"exact_vector_reads", telemetry.exact_vector_reads},
+    {"exact_snapshot_train_batches",
+      telemetry.exact_snapshot_train_batches},
+    {"exact_snapshot_train_fallbacks",
+      telemetry.exact_snapshot_train_fallbacks},
+    {"exact_snapshot_train_success_ratio",
+      telemetry.exact_snapshot_train_batches == 0 ? 0.0
+      : static_cast<double>(
+          telemetry.exact_snapshot_train_batches >
+              telemetry.exact_snapshot_train_fallbacks
+            ? telemetry.exact_snapshot_train_batches -
+                telemetry.exact_snapshot_train_fallbacks
+            : 0) /
+          static_cast<double>(telemetry.exact_snapshot_train_batches)},
     {"dynamic_code_candidates", telemetry.dynamic_code_candidates},
     {"dynamic_code_reads", telemetry.dynamic_code_reads},
     {"dynamic_code_read_bytes", telemetry.dynamic_code_read_bytes},
@@ -445,6 +725,13 @@ FormattedReport format_report(const nlohmann::json& root,
     output << "  average_submission_wait_us: "
            << gpu.value("average_submission_wait_us", 0.0) << '\n';
     output << "  rdma_read_bytes: " << gpu.value("rdma_read_bytes", 0ULL) << '\n';
+    output << "  owner WQE submitted/capacity/utilization: "
+           << gpu.value("owner_submitted_wqes", 0ULL) << "/"
+           << gpu.value("owner_submission_wqe_capacity", 0ULL) << "/"
+           << gpu.value("owner_wqe_submission_utilization", 0.0) << '\n';
+    output << "  owner critical/speculative batches: "
+           << gpu.value("owner_critical_batches", 0ULL) << "/"
+           << gpu.value("owner_speculative_batches", 0ULL) << '\n';
     output << "  graph_route_hit_ratio/refreshes: "
            << gpu.value("graph_route_hit_ratio", 0.0) << "/"
            << gpu.value("graph_route_refreshes", 0ULL) << '\n';
@@ -462,6 +749,163 @@ FormattedReport format_report(const nlohmann::json& root,
            << gpu.value("graph_extent_fallback_reads", 0ULL) << "/"
            << gpu.value("graph_extent_underhint_reads", 0ULL) << "/"
            << gpu.value("graph_extent_hint_promotions", 0ULL) << '\n';
+    output << "  ASFE logical expansions total/per_query: "
+           << gpu.value("logical_expansions", 0ULL) << "/"
+           << gpu.value("average_logical_expansions_per_query", 0.0) << '\n';
+    output << "  ASFE critical/speculative graph reads: "
+           << gpu.value("critical_graph_reads", 0ULL) << "/"
+           << gpu.value("speculative_graph_reads", 0ULL) << '\n';
+    output << "  ASFE critical/speculative graph bytes: "
+           << gpu.value("critical_graph_bytes", 0ULL) << "/"
+           << gpu.value("speculative_graph_bytes", 0ULL) << '\n';
+    output << "  ASFE core reads/bytes/arrived/promoted/stale: "
+           << gpu.value("core_prefetch_reads", 0ULL) << "/"
+           << gpu.value("core_prefetch_bytes", 0ULL) << "/"
+           << gpu.value("core_prefetch_arrived", 0ULL) << "/"
+           << gpu.value("core_prefetch_promoted", 0ULL) << "/"
+           << gpu.value("core_prefetch_stale", 0ULL) << '\n';
+    output << "  ASFE core waves/ready waves/ready ratio: "
+           << gpu.value("core_prefetch_waves", 0ULL) << "/"
+           << gpu.value("core_ready_waves", 0ULL) << "/"
+           << gpu.value("core_ready_wave_ratio", 0.0) << '\n';
+    output << "  terminal exact cache attempts/rate: "
+           << gpu.value("terminal_exact_cache_attempted_queries", 0ULL)
+           << "/"
+           << gpu.value("terminal_exact_cache_attempt_rate", 0.0) << '\n';
+    output << "  terminal exact cache issued/promoted/misses/rejects "
+              "(total/per_query): "
+           << gpu.value("terminal_exact_cache_issued_records", 0ULL) << "/"
+           << gpu.value(
+                "average_terminal_exact_cache_issued_records_per_query", 0.0)
+           << ", "
+           << gpu.value("terminal_exact_cache_promoted_records", 0ULL)
+           << "/"
+           << gpu.value(
+                "average_terminal_exact_cache_promoted_records_per_query", 0.0)
+           << ", "
+           << gpu.value("terminal_exact_cache_miss_records", 0ULL) << "/"
+           << gpu.value(
+                "average_terminal_exact_cache_miss_records_per_query", 0.0)
+           << ", "
+           << gpu.value("terminal_exact_cache_queue_rejects", 0ULL) << "/"
+           << gpu.value(
+                "average_terminal_exact_cache_queue_rejects_per_query", 0.0)
+           << '\n';
+    output << "  terminal exact cache promotion/waste ratio: "
+           << gpu.value("terminal_exact_cache_promotion_ratio", 0.0)
+           << "/"
+           << gpu.value("terminal_exact_cache_waste_ratio", 0.0) << '\n';
+    output << "  terminal exact cache wasted bytes total/per_query: "
+           << gpu.value("terminal_exact_cache_wasted_bytes", 0ULL) << "/"
+           << gpu.value(
+                "average_terminal_exact_cache_wasted_bytes_per_query", 0.0)
+           << '\n';
+    output << "  ASFE completion scoring batches/candidates "
+              "(total/per_query/candidates_per_batch): "
+           << gpu.value("completion_score_batches", 0ULL) << "/"
+           << gpu.value(
+                "average_completion_score_batches_per_query", 0.0)
+           << ", "
+           << gpu.value("completion_score_candidates", 0ULL) << "/"
+           << gpu.value(
+                "average_completion_score_candidates_per_query", 0.0)
+           << "/"
+           << gpu.value(
+                "average_completion_score_candidates_per_batch", 0.0)
+           << '\n';
+    output << "  ASFE reusable exact certificates total/per_query: "
+           << gpu.value("frontier_reusable_certificates", 0ULL) << "/"
+           << gpu.value(
+                "average_frontier_reusable_certificates_per_query", 0.0)
+           << '\n';
+    output << "  ASFE streamed runs/ordered scoring batches/candidates "
+              "(total/per_query/candidates_per_batch): "
+           << gpu.value("frontier_streamed_candidate_runs", 0ULL) << "/"
+           << gpu.value(
+                "average_frontier_streamed_candidate_runs_per_query", 0.0)
+           << ", "
+           << gpu.value("ordered_score_batches", 0ULL) << "/"
+           << gpu.value(
+                "average_ordered_score_batches_per_query", 0.0)
+           << ", "
+           << gpu.value("ordered_score_candidates", 0ULL) << "/"
+           << gpu.value(
+                "average_ordered_score_candidates_per_query", 0.0)
+           << "/"
+           << gpu.value(
+                "average_ordered_score_candidates_per_batch", 0.0)
+           << '\n';
+    output << "  ASFE reusable prefix ranks/full/issued certificates "
+              "(total/per_query): "
+           << gpu.value("frontier_reusable_prefix_ranks", 0ULL) << "/"
+           << gpu.value(
+                "average_frontier_reusable_prefix_ranks_per_query", 0.0)
+           << ", "
+           << gpu.value(
+                "frontier_reusable_full_prefix_certificates", 0ULL)
+           << "/"
+           << gpu.value(
+                "average_frontier_reusable_full_prefix_certificates_per_query",
+                0.0)
+           << ", "
+           << gpu.value("frontier_reusable_issued_certificates", 0ULL)
+           << "/"
+           << gpu.value(
+                "average_frontier_reusable_issued_certificates_per_query",
+                0.0)
+           << '\n';
+    output << "  ASFE certificate rejects total/per_query: "
+           << gpu.value("frontier_certificate_rejects", 0ULL) << "/"
+           << gpu.value(
+                "average_frontier_certificate_rejects_per_query", 0.0)
+           << '\n';
+    output << "  ASFE speculative wasted bytes/ratio: "
+           << gpu.value("speculative_wasted_bytes", 0ULL) << "/"
+           << gpu.value("speculative_wasted_byte_ratio", 0.0) << '\n';
+    output << "  ASFE speculative arrived/promoted/stale/queue_rejects: "
+           << gpu.value("speculative_arrived", 0ULL) << "/"
+           << gpu.value("speculative_promoted", 0ULL) << "/"
+           << gpu.value("speculative_stale", 0ULL) << "/"
+           << gpu.value("speculative_queue_rejects", 0ULL) << '\n';
+    output << "  ASFE promotion/waste ratio: "
+           << gpu.value("speculative_promotion_ratio", 0.0) << "/"
+           << gpu.value("speculative_waste_ratio", 0.0) << '\n';
+    output << "  ASFE issue/commit epochs: "
+           << gpu.value("issue_epochs", 0ULL) << "/"
+           << gpu.value("commit_epochs", 0ULL) << '\n';
+    output << "  ASFE average issue/commit width: "
+           << gpu.value("average_issue_width", 0.0) << "/"
+           << gpu.value("average_commit_width", 0.0) << '\n';
+    output << "  ASFE issue capacity/utilization: "
+           << gpu.value("average_issue_width_capacity", 0.0) << "/"
+           << gpu.value("issue_frontier_utilization", 0.0) << '\n';
+    output << "  ASFE max issue/commit width: "
+           << gpu.value("max_issue_width", 0ULL) << "/"
+           << gpu.value("max_commit_width", 0ULL) << '\n';
+    output << "  ASFE critical ROB hits/speculative wait ns/us_per_query: "
+           << gpu.value("critical_rob_hits", 0ULL) << "/"
+           << gpu.value("speculative_wait_ns", 0ULL) << "/"
+           << gpu.value("average_speculative_wait_us", 0.0) << '\n';
+    output << "  ASFE critical misses/ROB hit ratio: "
+           << gpu.value("critical_misses", 0ULL) << "/"
+           << gpu.value("critical_rob_hit_ratio", 0.0) << '\n';
+    output << "  ASFE RDMA completion groups/avg us (critical/speculative): "
+           << gpu.value("rdma_completion_groups", 0ULL) << "/"
+           << gpu.value("average_rdma_completion_latency_us", 0.0) << " ("
+           << gpu.value("speculative_completion_groups", 0ULL) << "/"
+           << gpu.value("average_speculative_completion_latency_us", 0.0)
+           << ")\n";
+    output << "  GPU occupancy threads/registers/static_shared: "
+           << gpu.value("gpu_kernel_threads", 0ULL) << "/"
+           << gpu.value("gpu_registers_per_thread", 0ULL) << "/"
+           << gpu.value("gpu_static_shared_bytes", 0ULL) << '\n';
+    output << "  GPU occupancy active/effective blocks per SM: "
+           << gpu.value("gpu_active_blocks_per_sm", 0ULL) << "/"
+           << gpu.value("gpu_effective_blocks_per_sm", 0ULL) << '\n';
+    output << "  GPU persistent query/owner/total blocks: "
+           << gpu.value("gpu_query_blocks", 0ULL) << "/"
+           << gpu.value("gpu_owner_blocks", 0ULL) << "/"
+           << gpu.value("gpu_total_persistent_blocks", 0ULL) << '\n';
     output << "  centroid route publications/shard_updates/live/snapshot_skips: "
            << gpu.value("centroid_route_publications", 0ULL) << "/"
            << gpu.value("centroid_route_shard_updates", 0ULL) << "/"
@@ -482,6 +926,11 @@ FormattedReport format_report(const nlohmann::json& root,
            << gpu.value("average_gpu_score_us", 0.0) << "/"
            << gpu.value("average_gpu_beam_us", 0.0) << "/"
            << gpu.value("average_gpu_exact_us", 0.0) << '\n';
+    output << "  exact snapshot train batches/fallbacks/success ratio: "
+           << gpu.value("exact_snapshot_train_batches", 0ULL) << "/"
+           << gpu.value("exact_snapshot_train_fallbacks", 0ULL) << "/"
+           << gpu.value("exact_snapshot_train_success_ratio", 0.0)
+           << '\n';
     output << "  GPU Beam merge policy: "
            << root["meta"].value(
                 "gpu_query_beam_merge_policy", "legacy") << '\n';
