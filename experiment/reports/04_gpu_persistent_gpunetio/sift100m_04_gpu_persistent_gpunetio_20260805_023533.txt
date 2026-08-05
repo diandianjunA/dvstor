@@ -1,0 +1,116 @@
+query_inputs
+  recall_source: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  recall_rows: 10000
+  performance_source: /data/xjs/datasets/sift1b/sift100m_to_110m_query.u8bin
+  performance_rows: 10000000
+  performance_row_reuse_policy: single_pass_no_reuse
+  performance_warmup/measure/total_rows_consumed: 330242/985284/1315526
+throughput
+  duration_seconds: 15.2692
+  total_ops_per_sec: 66223 (ops=1011169)
+  query_ops_per_sec: 64527.7 (ops=985284)
+  effective_query_ops_per_sec: 64527.7
+  write_ops_per_sec: 1695.25 (ops=25885)
+  effective_write_ops_per_sec: 1695.25
+  insert_ops_per_sec: 1695.25 (ops=25885)
+  client_drain_seconds: 0.269157
+  scheduled_query/write_ops: 0/0
+  query/write_rate_attainment_ratio: 1/1
+  nominal/effective_rate_basis: effective_wall_clock/wall_clock_including_client_drain
+  write_mix_completed: insert=25885 upsert=0 delete=0
+  query_head/tail_qps: 65668.4/65668.4
+  query_tail_to_head_ratio: 1
+  query_min_5s_qps: 65661.4
+  write_head/tail_qps: 1708.6/1708.6
+  write_tail_to_head_ratio: 1
+  write_min_5s_qps: 1648
+  zero_completion_windows: 0
+  zero_query/write_windows: 0/0
+stage2
+  source: in_band_control_page
+  shards observed/requested: 5/5
+  p99_stage2_delay_upper_ms: 1000 (samples=24580)
+  remaining/max_backlog: 272/91
+  completion_outstanding/admission_window: 424/640 (max_per_shard=128)
+  backlog_slope_per_sec: 9.33334
+  failures (hard): 0
+  peer_reverse_retry_attempts: 2
+  locality telemetry: home_match_rate=0.893613 cross_edge_reduction=0.24862 avg_frontier/expansions/scored=573.578/20.6172/1083.04
+  search budget exhausted (stage1/stage2): 0/0
+  execution batching: contexts=11392 avg_items=2.16994 graph_reads/wave=1.32716 vector_reads/wave=38.5853 pressure_yields=79380
+recall
+  recall@10: 0.928125
+  queries: 32
+  mode/base_id_limit/search_width/insufficient_queries: all/0/10/0
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+static_gt_post_recall
+  recall@10: 0.928125
+  queries: 32
+  mode/base_id_limit/search_width/insufficient_queries: all/0/10/0
+  query_file: /data/xjs/index/dvstor_sift100m/converted/query.u8bin
+  groundtruth_file: /data/xjs/index/dvstor_sift100m/converted/groundtruth_100M.bin
+gpu_persistent
+  GPU memory explicit/base_pq/route GiB: 4.30741/2.98023/2.87592e-06
+  average_batch_size: 1.11637
+  average_submission_wait_us: 2.6009
+  rdma_read_bytes: 99937880084
+  owner WQE submitted/capacity/utilization: 466271269/18464022528/0.025253
+  owner critical/speculative batches: 23647143/116233
+  graph_route_hit_ratio/refreshes: 0/0
+  graph snapshot reread records total/per_query: 89997/0.0913412
+  graph RDMA bytes total/per_query/per_parent: 80767072640/81973.4/428.386
+  graph live/full/fallback/underhint/promotions reads: 185336280/3291904/89997/89997/89650
+  ASFE logical expansions total/per_query: 188332717/191.146
+  ASFE critical/speculative graph reads: 188421954/116233
+  ASFE critical/speculative graph bytes: 80703845440/63227200
+  ASFE core reads/bytes/arrived/promoted/stale: 182433193/76699725728/182433193/182343950/2136868
+  ASFE core waves/ready waves/ready ratio: 13066051/906015/0.0693411
+  terminal exact cache attempts/rate: 985284/1
+  terminal exact cache issued/promoted/misses/rejects (total/per_query): 126116352/128, 122499363/124.329, 0/0, 0/0
+  terminal exact cache promotion/waste ratio: 0.97132/0.0286798
+  terminal exact cache wasted bytes total/per_query: 549782328/557.994
+  ASFE completion scoring batches/candidates (total/per_query/candidates_per_batch): 14213932/14.4262, 7351327379/7461.13/517.192
+  ASFE reusable exact certificates total/per_query: 14148731/14.3601
+  ASFE streamed runs/ordered scoring batches/candidates (total/per_query/candidates_per_batch): 27828531/28.2442, 5146106/5.22297, 1530289114/1553.15/297.368
+  OOO parents processed beyond an unresolved rank hole (total/per_query): 23941268/24.2988
+  ASFE reusable prefix ranks/full/issued certificates (total/per_query): 184514859/187.271, 0/0, 13066051/13.2612
+  ASFE certificate rejects total/per_query: 0/0
+  ASFE speculative wasted bytes/ratio: 63224224/0.999953
+  ASFE speculative arrived/promoted/stale/queue_rejects: 116233/6/116227/6917
+  ASFE promotion/waste ratio: 5.16205e-05/0.999948
+  ASFE issue/commit epochs: 13163447/14148731
+  ASFE average issue/commit width: 14.0172/13.3109
+  ASFE issue capacity/utilization: 16.0094/0.875563
+  ASFE max issue/commit width: 17/16
+  ASFE critical ROB hits/speculative wait ns/us_per_query: 182343956/724029252078/734.843
+  ASFE critical misses/ROB hit ratio: 5988761/0.968201
+  ASFE RDMA completion groups/avg us (critical/speculative): 25992304/81.9665 (116233/91.5307)
+  GPU occupancy threads/registers/static_shared: 128/166/48872
+  GPU occupancy active/effective blocks per SM: 3/3
+  GPU persistent query/owner/total blocks: 256/40/298
+  centroid route publications/shard_updates/live/snapshot_skips: 2864/8036/20/95
+  centroid route probe_reads/body_reads/unchanged_polls/poll_us: 15770/8355/195/16287
+  centroid route query snapshot retries/timeouts: 19663/0
+  GPU query/prepare/graph/score/beam/exact us: 3799.85/117.903/380.062/918.242/478.565/261.671
+  exact snapshot train batches/fallbacks/success ratio: 1036387/0/1
+  GPU Beam merge policy: stable-run
+  GPU Beam merge total/prepare/sort/materialize us: 478.565/16.7589/229.103/232.702
+  dynamic PQ candidates/reads/bytes/incarnation_rejects: 76736293/31165/1121940/0
+  dynamic PQ reads/query and wait_us/query: 0.0316305/5.53443
+  dynamic PQ arena hits/batch_dedup/authoritative_avoidance: 76705128/0/0.999594
+  dynamic PQ arena publish success/race/capacity: 25955/5210/25431721
+storage_owner_runtime
+  submitted/completed batches: 1247133/1247133
+  submitted/completed items: 8185836/8185836
+  average batch / average RPC wall us / max RPC wall us: 6.56372/13.6703/23738
+insert breakdown
+  count: 25885
+  latency_ms: mean=149.835 p50=111.863 p95=395.517 p99=529.12 p999=713.562
+  cpu_ms: 3.87848e+06
+  rdma_ms: 0
+query breakdown
+  count: 985284
+  latency_ms: mean=3.89611 p50=3.86935 p95=4.73295 p99=5.15784 p999=5.69394
+  cpu_ms: 3.83877e+06
+  rdma_ms: 0

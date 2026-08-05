@@ -197,7 +197,9 @@ def fallback_layout(shards, max_vectors, dim, degree, dtype, code_bytes,
     provisional_slots = min(15, max(2, (degree + 15) // 16))
     graph_bytes = align_up(16 + (degree + provisional_slots) * 8, 8)
     dynamic_code_offset = fixed_bytes + graph_bytes
-    record_bytes = align_up(dynamic_code_offset + 4 + code_bytes, 16)
+    # Four-byte incarnation/extent prefix plus the incarnation-bound snapshot
+    # checksum used by one-READ dynamic PQ validation.
+    record_bytes = align_up(dynamic_code_offset + 4 + code_bytes + 4, 16)
 
     projected = (Decimal(max_vectors) * partition_imbalance /
                  Decimal(shards)).to_integral_value(rounding=ROUND_CEILING)
@@ -414,10 +416,15 @@ dynamic_hot = metadata.get('hot_graph_dynamic_hot_offset', 0)
 graph_entry = metadata.get('hot_graph_entry_size', 0)
 dynamic_code = metadata.get('dynamic_navigation_code_offset', 0)
 dynamic_record = metadata.get('hot_graph_dynamic_record_bytes', 0)
-if dynamic_code < dynamic_hot + graph_entry:
-    errors.append('dynamic PQ code overlaps the compact graph record')
-if dynamic_record < dynamic_code + int(subquantizers):
-    errors.append('persistent dynamic record is too small for PQ codes')
+dynamic_validation = metadata.get('dynamic_navigation_code_validation_bytes', 0)
+dynamic_checksum = metadata.get('dynamic_navigation_code_checksum_bytes', 4)
+if dynamic_code != dynamic_hot + graph_entry:
+    errors.append('dynamic PQ tag must immediately follow the compact graph record')
+if dynamic_validation != 4 or dynamic_checksum != 4:
+    errors.append('dynamic PQ snapshot validation must use 4B tag + 4B checksum')
+if dynamic_record < (dynamic_code + dynamic_validation +
+                     int(subquantizers) + dynamic_checksum):
+    errors.append('persistent dynamic record is too small for validated PQ codes')
 if errors:
     print(f'incompatible GPU index metadata: {path}', file=sys.stderr)
     for error in errors:
@@ -533,6 +540,7 @@ write_service_config() {
     echo "gpu-graph-commit-width = ${GPU_GRAPH_COMMIT_WIDTH:-0}"
     echo "gpu-graph-issue-width = ${GPU_GRAPH_ISSUE_WIDTH:-0}"
     echo "gpu-query-graph-read-policy = ${GPU_QUERY_GRAPH_READ_POLICY:-fixed}"
+    echo "gpu-dynamic-graph-extent = ${GPU_DYNAMIC_GRAPH_EXTENT:-true}"
     echo "gpu-query-beam-merge-policy = ${GPU_QUERY_BEAM_MERGE_POLICY:-legacy}"
     echo "query-rdma-trace-mode = ${QUERY_RDMA_TRACE_MODE:-off}"
     echo "query-rdma-trace-sample-rate = ${QUERY_RDMA_TRACE_SAMPLE_RATE:-1000}"

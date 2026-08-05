@@ -39,12 +39,82 @@ void test_dynamic_pq_arena_mapping_and_incarnation_order() {
   assert(!gpu_search::dynamic_code_arena_slot_from_offset(
     shard, 4096 + 3 * 1040, 703, slot));
 
+  constexpr u32 incarnation = 19;
+  const u32 tag = gpu_search::make_dynamic_code_tag(incarnation, 7);
+  assert(gpu_search::dynamic_code_tag_incarnation(tag) == incarnation);
+  assert(gpu_search::dynamic_code_tag_extent_class(tag) == 7);
+  assert(gpu_search::dynamic_code_arena_state_matches(tag, incarnation));
+  assert(!gpu_search::dynamic_code_arena_state_matches(
+    gpu_search::kPersistentDynamicCodeArenaBusy | tag, incarnation));
+  assert(gpu_search::dynamic_code_arena_read_stable(
+    tag, gpu_search::make_dynamic_code_tag(incarnation, 8), incarnation));
+  assert(!gpu_search::dynamic_code_arena_read_stable(
+    tag, gpu_search::kPersistentDynamicCodeArenaBusy | tag, incarnation));
+  assert(!gpu_search::dynamic_code_arena_read_stable(
+    tag, gpu_search::make_dynamic_code_tag(incarnation + 1, 1),
+    incarnation));
+  assert(gpu_search::dynamic_code_tag_extent_class(
+           0xff000000u | incarnation) ==
+         gpu_search::kPersistentDynamicCodeArenaUnknownExtent);
+
   assert(gpu_search::dynamic_code_arena_can_publish(0, 1));
-  assert(gpu_search::dynamic_code_arena_can_publish(1, 2));
-  assert(!gpu_search::dynamic_code_arena_can_publish(2, 2));
-  assert(!gpu_search::dynamic_code_arena_can_publish(3, 2));
+  assert(gpu_search::dynamic_code_arena_can_publish(
+    gpu_search::make_dynamic_code_tag(1, 9), 2));
+  assert(!gpu_search::dynamic_code_arena_can_publish(
+    gpu_search::make_dynamic_code_tag(2, 1), 2));
+  assert(!gpu_search::dynamic_code_arena_can_publish(
+    gpu_search::make_dynamic_code_tag(3, 1), 2));
   assert(!gpu_search::dynamic_code_arena_can_publish(
     gpu_search::kPersistentDynamicCodeArenaBusy | 1u, 2));
+  assert(gpu_search::dynamic_code_arena_first_occupancy(0));
+  assert(!gpu_search::dynamic_code_arena_first_occupancy(tag));
+  assert(!gpu_search::dynamic_code_arena_first_occupancy(
+    gpu_search::kPersistentDynamicCodeArenaBusy | tag));
+
+  u32 promoted = 0;
+  assert(gpu_search::dynamic_code_arena_promoted_extent_state(
+    tag, incarnation, 11, promoted));
+  assert(gpu_search::dynamic_code_tag_incarnation(promoted) == incarnation);
+  assert(gpu_search::dynamic_code_tag_extent_class(promoted) == 11);
+  assert(!gpu_search::dynamic_code_arena_promoted_extent_state(
+    promoted, incarnation, 10, promoted));
+  // A delayed repair for incarnation 19 must not change a recycled slot 20.
+  const u32 recycled = gpu_search::make_dynamic_code_tag(incarnation + 1, 2);
+  assert(!gpu_search::dynamic_code_arena_promoted_extent_state(
+    recycled, incarnation, 12, promoted));
+  assert(promoted == recycled);
+
+  const u32 unknown = gpu_search::make_dynamic_code_tag(
+    incarnation, gpu_search::kPersistentDynamicCodeArenaUnknownExtent);
+  u32 refined = 0;
+  assert(gpu_search::dynamic_code_arena_refined_unknown_extent_state(
+    unknown, incarnation, 6, refined));
+  assert(gpu_search::dynamic_code_tag_incarnation(refined) == incarnation);
+  assert(gpu_search::dynamic_code_tag_extent_class(refined) == 6);
+  assert(!gpu_search::dynamic_code_arena_refined_unknown_extent_state(
+    refined, incarnation, 5, refined));
+  assert(!gpu_search::dynamic_code_arena_refined_unknown_extent_state(
+    unknown, incarnation + 1, 6, refined));
+  assert(refined == unknown);
+  assert(!gpu_search::dynamic_code_arena_refined_unknown_extent_state(
+    0, incarnation, 6, refined));
+  assert(refined == 0);
+  const u32 busy_unknown =
+    gpu_search::kPersistentDynamicCodeArenaBusy | unknown;
+  assert(!gpu_search::dynamic_code_arena_refined_unknown_extent_state(
+    busy_unknown, incarnation, 6, refined));
+  assert(refined == busy_unknown);
+
+  u32 demoted = 0;
+  assert(gpu_search::dynamic_code_arena_guarded_demoted_extent_state(
+    promoted = gpu_search::make_dynamic_code_tag(incarnation, 11),
+    incarnation, 7, demoted));
+  assert(gpu_search::dynamic_code_tag_extent_class(demoted) == 8);
+  assert(!gpu_search::dynamic_code_arena_guarded_demoted_extent_state(
+    demoted, incarnation, 7, demoted));
+  assert(!gpu_search::dynamic_code_arena_guarded_demoted_extent_state(
+    recycled, incarnation, 0, demoted));
+  assert(demoted == recycled);
 }
 
 void test_dynamic_navigation_code_width_semantics() {
@@ -63,7 +133,17 @@ void test_dynamic_navigation_code_width_semantics() {
     const u32 dynamic_record_bytes = static_cast<u32>(
       VamanaNode::align_compact(
         dynamic_code_offset + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
+          payload_bytes + VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES));
+    if (payload_bytes == 32) {
+      const u32 old_stride = static_cast<u32>(VamanaNode::align_compact(
+        dynamic_code_offset + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
           payload_bytes));
+      assert(dynamic_code_offset == 992);
+      assert(old_stride == 1040);
+      assert(dynamic_record_bytes == old_stride);
+      assert(VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES + payload_bytes +
+               VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES == 40);
+    }
 
     VamanaNode::configure_hot_graph(
       {4096}, {1}, graph_entry_bytes, 0, {8192}, dynamic_record_bytes,
@@ -73,8 +153,32 @@ void test_dynamic_navigation_code_width_semantics() {
     assert(VamanaNode::dynamic_navigation_code_payload_bytes() ==
            payload_bytes);
     assert(dynamic_code_offset +
-             VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES + payload_bytes <=
+             VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES + payload_bytes +
+             VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES <=
            VamanaNode::allocation_size());
+
+    std::vector<u8> payload(payload_bytes);
+    for (u32 byte = 0; byte < payload_bytes; ++byte) {
+      payload[byte] = static_cast<u8>(byte * 17u + 3u);
+    }
+    const u32 tag = VamanaNode::pack_dynamic_navigation_tag(19, 2);
+    std::array<u8, VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES> checksum{};
+    vamana::dynamic_navigation_code::store_u32_le(
+      checksum.data(),
+      vamana::dynamic_navigation_code::checksum(
+        tag, payload.data(), payload_bytes));
+    assert(vamana::dynamic_navigation_code::validate(
+      tag, payload.data(), payload_bytes, checksum.data()));
+    // Extent is advisory and may change independently of the immutable PQ.
+    assert(vamana::dynamic_navigation_code::validate(
+      VamanaNode::pack_dynamic_navigation_tag(19, 9),
+      payload.data(), payload_bytes, checksum.data()));
+    assert(!vamana::dynamic_navigation_code::validate(
+      VamanaNode::pack_dynamic_navigation_tag(20, 2),
+      payload.data(), payload_bytes, checksum.data()));
+    payload[payload_bytes / 2] ^= 1u;
+    assert(!vamana::dynamic_navigation_code::validate(
+      tag, payload.data(), payload_bytes, checksum.data()));
 
     format::StorageControlBlock control{
       .dynamic_record_bytes = dynamic_record_bytes,
@@ -84,15 +188,88 @@ void test_dynamic_navigation_code_width_semantics() {
     };
     assert(control.code_bytes == payload_bytes);
 
-    // A record that fits the PQ payload but omits the incarnation prefix must
+    // The graph publication serializer writes the four-byte dynamic tag
+    // immediately after the graph entry. A metadata padding gap would make the
+    // GPU read a different address, so reject it even when the padded record
+    // is otherwise large enough for the complete PQ payload.
+    const u32 padded_code_offset = dynamic_code_offset + 16;
+    const u32 padded_record_bytes = static_cast<u32>(
+      VamanaNode::align_compact(
+        padded_code_offset + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
+          payload_bytes + VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES));
+    VamanaNode::configure_hot_graph(
+      {4096}, {1}, graph_entry_bytes, 0, {8192}, padded_record_bytes,
+      dynamic_hot_offset, padded_code_offset, payload_bytes);
+    assert(!VamanaNode::HAS_HOT_GRAPH);
+
+    // A record that fits the prefix and PQ payload but omits the checksum must
     // be rejected even though code_bytes itself remains payload-only.
     VamanaNode::configure_hot_graph(
       {4096}, {1}, graph_entry_bytes, 0, {8192},
-      dynamic_code_offset + payload_bytes, dynamic_hot_offset,
+      dynamic_code_offset + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
+        payload_bytes,
+      dynamic_hot_offset,
       dynamic_code_offset, payload_bytes);
     assert(!VamanaNode::HAS_HOT_GRAPH);
   }
   VamanaNode::disable_hot_graph();
+}
+
+void test_dynamic_navigation_code_torn_snapshot_detection() {
+  constexpr u32 payload_bytes = 32;
+  constexpr u32 record_bytes =
+    VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES + payload_bytes +
+      VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES;
+  const auto make_record = [](u32 incarnation, u8 extent, u8 seed) {
+    std::array<u8, record_bytes> record{};
+    const u32 tag = VamanaNode::pack_dynamic_navigation_tag(
+      incarnation, extent);
+    vamana::dynamic_navigation_code::store_u32_le(record.data(), tag);
+    for (u32 byte = 0; byte < payload_bytes; ++byte) {
+      record[VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES + byte] =
+        static_cast<u8>(seed + byte * 29u);
+    }
+    const u8* payload =
+      record.data() + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES;
+    vamana::dynamic_navigation_code::store_u32_le(
+      record.data() + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
+        payload_bytes,
+      vamana::dynamic_navigation_code::checksum(
+        tag, payload, payload_bytes));
+    return record;
+  };
+  const auto accepted = [](const std::array<u8, record_bytes>& record,
+                           u32 incarnation) {
+    const u32 tag =
+      vamana::dynamic_navigation_code::load_u32_le(record.data());
+    const u8* payload =
+      record.data() + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES;
+    const u8* checksum = payload + payload_bytes;
+    return VamanaNode::dynamic_navigation_tag_incarnation(tag) ==
+             incarnation &&
+      vamana::dynamic_navigation_code::validate(
+        tag, payload, payload_bytes, checksum);
+  };
+
+  const auto old_record = make_record(41, 2, 7);
+  const auto new_record = make_record(42, 9, 131);
+  assert(accepted(old_record, 41));
+  assert(accepted(new_record, 42));
+
+  // Model every prefix/suffix visibility boundary of an in-place remote body
+  // WRITE in both directions.  Apart from the documented 32-bit collision
+  // boundary, a mixed record must not be accepted as either incarnation.
+  for (u32 cut = 0; cut <= record_bytes; ++cut) {
+    for (bool new_prefix : {false, true}) {
+      std::array<u8, record_bytes> mixed{};
+      const auto& prefix = new_prefix ? new_record : old_record;
+      const auto& suffix = new_prefix ? old_record : new_record;
+      std::copy_n(prefix.begin(), cut, mixed.begin());
+      std::copy(suffix.begin() + cut, suffix.end(), mixed.begin() + cut);
+      if (accepted(mixed, 41)) assert(mixed == old_record);
+      if (accepted(mixed, 42)) assert(mixed == new_record);
+    }
+  }
 }
 
 void test_supported_gpu_layout_limits() {
@@ -575,6 +752,7 @@ int main() {
   namespace format = gpu_search::format;
   test_dynamic_pq_arena_mapping_and_incarnation_order();
   test_dynamic_navigation_code_width_semantics();
+  test_dynamic_navigation_code_torn_snapshot_detection();
   test_supported_gpu_layout_limits();
   test_tagged_remote_pointer();
   test_graph_record_stale_incarnation_is_not_transport_failure();
@@ -641,6 +819,10 @@ int main() {
   assert(!format::validate_view(malformed, &error));
   malformed = view;
   malformed.shards[0].code_remote_offset += 64;
+  assert(!format::validate_view(malformed, &error));
+  malformed = view;
+  malformed.shards[0].dynamic_code_offset += 8;
+  malformed.shards[0].dynamic_record_bytes += 16;
   assert(!format::validate_view(malformed, &error));
 
   const auto code_path =
@@ -770,6 +952,7 @@ int main() {
     {"storage_control_remote_offsets", control_offsets},
     {"dynamic_node_base_offsets", dynamic_node_offsets},
     {"dynamic_navigation_code_validation_bytes", 4},
+    {"dynamic_navigation_code_checksum_bytes", 4},
     {"navigation_code_remote_offsets", code_offsets},
     {"navigation_code_region_bytes", code_sizes},
     {"dim", 128},

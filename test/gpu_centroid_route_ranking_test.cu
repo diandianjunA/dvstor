@@ -82,6 +82,62 @@ __global__ void classify_graph_record_kernel(
   output[1] = static_cast<u32>(action);
 }
 
+struct DynamicArenaReuseRaceResult {
+  u32 before{};
+  u32 after{};
+  u32 accepted{};
+  u32 observed_payload{};
+};
+
+__global__ void dynamic_arena_reuse_race_kernel(
+    u32* state, std::uint8_t* payload, u32* phase,
+    DynamicArenaReuseRaceResult* result) {
+  if (threadIdx.x != 0 || blockIdx.x >= 2) return;
+  constexpr u32 old_incarnation = 31;
+  constexpr u32 new_incarnation = 32;
+  const u32 old_state = gpu_search::make_dynamic_code_tag(
+    old_incarnation, 2);
+  const u32 new_state = gpu_search::make_dynamic_code_tag(
+    new_incarnation, 4);
+  cuda::atomic_ref<u32, cuda::thread_scope_device> phase_ref(*phase);
+  if (blockIdx.x == 0) {
+    const u32 before = gpu_search::persistent_kernel_detail::
+      dynamic_arena_state_load(state);
+    phase_ref.store(1, cuda::memory_order_release);
+    while (phase_ref.load(cuda::memory_order_acquire) < 2) {}
+    const u32 observed_payload = *payload;
+    cuda::atomic_thread_fence(
+      cuda::memory_order_acquire, cuda::thread_scope_device);
+    const u32 after = gpu_search::persistent_kernel_detail::
+      dynamic_arena_state_load(state);
+    result->before = before;
+    result->after = after;
+    result->accepted = gpu_search::dynamic_code_arena_read_stable(
+      before, after, old_incarnation) ? 1u : 0u;
+    result->observed_payload = observed_payload;
+    phase_ref.store(3, cuda::memory_order_release);
+    return;
+  }
+
+  while (phase_ref.load(cuda::memory_order_acquire) < 1) {}
+  const u32 prior = gpu_search::persistent_kernel_detail::
+    dynamic_arena_state_compare_exchange(
+      state, old_state,
+      gpu_search::kPersistentDynamicCodeArenaBusy | new_state);
+  if (prior != old_state) {
+    result->accepted = 2;
+    phase_ref.store(3, cuda::memory_order_release);
+    return;
+  }
+  *payload = 0xbbu;
+  cuda::atomic_thread_fence(
+    cuda::memory_order_release, cuda::thread_scope_device);
+  phase_ref.store(2, cuda::memory_order_release);
+  while (phase_ref.load(cuda::memory_order_acquire) < 3) {}
+  gpu_search::persistent_kernel_detail::dynamic_arena_state_publish(
+    state, new_state);
+}
+
 __global__ void promote_graph_extent_hint_kernel(
     PersistentKernelParams params,
     u64 handle,
@@ -122,6 +178,86 @@ __global__ void concurrently_promote_graph_extent_hint_kernel(
             params, ordinal)
         : gpu_search::graph_record_validation::kGraphExtentClassUnknown;
   }
+}
+
+__global__ void inspect_dynamic_graph_extent_hint_kernel(
+    PersistentKernelParams params,
+    u64 handle,
+    u32 promote_required_bytes,
+    u32 shrink_required_bytes,
+    u32* output) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  using namespace gpu_search::persistent_kernel_detail;
+  output[0] = load_dynamic_graph_extent_class(params, handle);
+  u32 acquired_slot = UINT32_MAX;
+  u32 request_shard = UINT32_MAX;
+  u64 request_offset = 0;
+  u64 request_local_iova = 0;
+  u32 request_bytes = 0;
+  output[1] = prepare_graph_record_in_scratch(
+    params, handle, 0, 0, acquired_slot, request_shard, request_offset,
+    request_local_iova, request_bytes) ? request_bytes : UINT32_MAX;
+  output[2] = promote_graph_extent_class(
+    params, handle, promote_required_bytes) ? 1u : 0u;
+  output[3] = load_dynamic_graph_extent_class(params, handle);
+  const DynamicGraphExtentAdaptation adaptation =
+    adapt_dynamic_graph_extent_class(
+      params, handle, shrink_required_bytes);
+  output[4] = adaptation != DynamicGraphExtentAdaptation::none ? 1u : 0u;
+  output[5] = load_dynamic_graph_extent_class(params, handle);
+  output[6] =
+    adaptation == DynamicGraphExtentAdaptation::refined_unknown ? 1u : 0u;
+}
+
+__global__ void inspect_dynamic_code_cache_completion_kernel(
+    CompletionDescriptor* output) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  CompletionDescriptor completion{};
+  gpu_search::persistent_kernel_detail::set_dynamic_code_cache_completion(
+    completion, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+  *output = completion;
+}
+
+__global__ void inspect_query_local_force_full_plan_kernel(
+    u32 initial_bytes, u32 full_record_bytes, u32* output) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  using namespace gpu_search::persistent_kernel_detail;
+  u32 transfer_bytes = initial_bytes;
+  const u32 initial_state = prepare_graph_read_attempt_state(
+    full_record_bytes, true, transfer_bytes);
+  output[0] = transfer_bytes;
+  output[1] = initial_state;
+  output[2] = graph_read_state_after_fallback_admission(initial_state);
+  // The async short is outside this helper's bounded authoritative-full
+  // budget. A forced attempt zero therefore still retains three full tries.
+  output[3] = gpu_search::graph_record_validation::snapshot_retry_available(
+    0, false, false, 4, 3) ? 1u : 0u;
+  output[4] = gpu_search::graph_record_validation::snapshot_retry_available(
+    1, false, false, 4, 3) ? 1u : 0u;
+  output[5] = gpu_search::graph_record_validation::snapshot_retry_available(
+    2, false, false, 4, 3) ? 1u : 0u;
+
+  u32 state = initial_state;
+  u32 authoritative_full_attempts = 0;
+  u32 fallback_reads = 0;
+  u32 retry_reads = 0;
+  for (u32 attempt = 0; attempt < 4; ++attempt) {
+    const GraphReadAdmissionAccounting accounting =
+      classify_graph_read_admission(state, true, attempt);
+    ++authoritative_full_attempts;
+    fallback_reads += accounting.fallback_reads;
+    retry_reads += accounting.retry_reads;
+    if (accounting.fallback_reads != 0) {
+      state = graph_read_state_after_fallback_admission(state);
+    }
+    if (!gpu_search::graph_record_validation::snapshot_retry_available(
+          attempt, false, false, 4, 3)) {
+      break;
+    }
+  }
+  output[6] = authoritative_full_attempts;
+  output[7] = fallback_reads;
+  output[8] = retry_reads;
 }
 
 __global__ void route_contention_query_kernel(PersistentKernelParams params,
@@ -470,6 +606,274 @@ void test_graph_extent_hint_promotion() {
   check_cuda(cudaFree(device_shard), "cudaFree(extent promotion shard)");
 }
 
+void test_dynamic_graph_extent_hint_lifecycle() {
+  constexpr u32 graph_capacity = 102;
+  constexpr u32 graph_record_bytes =
+    gpu_search::graph_record_validation::kGraphRecordHeaderBytes +
+      graph_capacity * sizeof(u64);
+  constexpr u64 dynamic_offset = 0x4000;
+  constexpr u32 incarnation = 17;
+  const gpu_search::DeviceShardRegion shard{
+    .dynamic_base_offset = dynamic_offset,
+    .memory_node = 0,
+    .dynamic_record_bytes = 1040,
+    .dynamic_hot_offset = 160,
+    .dynamic_arena_base_slot = 0,
+    .dynamic_arena_slot_count = 1,
+  };
+  auto* device_shard = device_copy(&shard, 1);
+  const u32 initial_state =
+    gpu_search::make_dynamic_code_tag(incarnation, 2);
+  auto* device_state = device_copy(&initial_state, 1);
+  std::uint8_t* device_graph_scratch = nullptr;
+  check_cuda(cudaMalloc(
+    reinterpret_cast<void**>(&device_graph_scratch),
+    gpu_search::kPersistentGraphReadBytes),
+    "cudaMalloc(dynamic extent graph scratch)");
+  u32* device_request_bytes = nullptr;
+  check_cuda(cudaMalloc(
+    reinterpret_cast<void**>(&device_request_bytes), sizeof(u32)),
+    "cudaMalloc(dynamic extent request bytes)");
+  u32* device_stop = nullptr;
+  check_cuda(cudaMalloc(
+    reinterpret_cast<void**>(&device_stop), sizeof(u32)),
+    "cudaMalloc(dynamic extent stop)");
+  check_cuda(cudaMemset(device_stop, 0, sizeof(u32)),
+             "cudaMemset(dynamic extent stop)");
+  u32* device_output = nullptr;
+  check_cuda(cudaMalloc(
+    reinterpret_cast<void**>(&device_output), 9 * sizeof(u32)),
+    "cudaMalloc(dynamic extent output)");
+
+  PersistentKernelParams params{};
+  params.shards = device_shard;
+  params.num_shards = 1;
+  params.graph_entry_bytes = graph_record_bytes;
+  params.graph_degree = 96;
+  params.graph_entry_capacity = graph_capacity;
+  params.graph_scratch = device_graph_scratch;
+  params.graph_request_bytes = device_request_bytes;
+  params.dynamic_graph_extent_enabled = 1;
+  params.dynamic_code_arena_states = device_state;
+  params.dynamic_code_arena_capacity = 1;
+  params.direct_local_iova_base =
+    reinterpret_cast<u64>(device_graph_scratch);
+  params.stop = device_stop;
+  const u64 handle =
+    (static_cast<u64>(incarnation) << gpu_search::kRemoteIncarnationShift) |
+    (dynamic_offset >> 4);
+  const u32 class_five_bytes =
+    gpu_search::graph_record_validation::kGraphRecordHeaderBytes +
+      33 * sizeof(u64);
+  const u32 class_two_bytes =
+    gpu_search::graph_record_validation::kGraphRecordHeaderBytes +
+      9 * sizeof(u64);
+  inspect_dynamic_graph_extent_hint_kernel<<<1, 32>>>(
+    params, handle, class_five_bytes, class_two_bytes, device_output);
+  check_cuda(cudaGetLastError(), "dynamic extent lifecycle launch");
+  check_cuda(cudaDeviceSynchronize(), "dynamic extent lifecycle sync");
+  std::array<u32, 9> output{};
+  check_cuda(cudaMemcpy(
+    output.data(), device_output, sizeof(output), cudaMemcpyDeviceToHost),
+    "cudaMemcpy(dynamic extent lifecycle output)");
+  assert(output[0] == 2);
+  assert(output[1] ==
+         gpu_search::graph_record_validation::graph_extent_bytes_for_class(
+           2, graph_record_bytes, graph_capacity));
+  assert(output[2] == 1);
+  assert(output[3] == 5);
+  assert(output[4] == 1);
+  assert(output[5] == 3);  // observed class two plus one guard class.
+  assert(output[6] == 0);
+
+  // UNKNOWN is a conservative full-read sentinel, but it must not become a
+  // permanent same-incarnation state. A checksum-authoritative full snapshot
+  // refines it without being reported as an underhint fallback or shrink.
+  const u32 unknown_state = gpu_search::make_dynamic_code_tag(
+    incarnation, gpu_search::kPersistentDynamicCodeArenaUnknownExtent);
+  check_cuda(cudaMemcpy(
+    device_state, &unknown_state, sizeof(unknown_state),
+    cudaMemcpyHostToDevice), "cudaMemcpy(unknown dynamic extent state)");
+  inspect_dynamic_graph_extent_hint_kernel<<<1, 32>>>(
+    params, handle, class_five_bytes, class_two_bytes, device_output);
+  check_cuda(cudaGetLastError(), "unknown dynamic extent refinement launch");
+  check_cuda(cudaDeviceSynchronize(),
+             "unknown dynamic extent refinement sync");
+  check_cuda(cudaMemcpy(
+    output.data(), device_output, sizeof(output), cudaMemcpyDeviceToHost),
+    "cudaMemcpy(unknown dynamic extent refinement output)");
+  assert(output[0] ==
+         gpu_search::kPersistentDynamicCodeArenaUnknownExtent);
+  assert(output[1] == graph_record_bytes);
+  assert(output[2] == 0);
+  assert(output[3] ==
+         gpu_search::kPersistentDynamicCodeArenaUnknownExtent);
+  assert(output[4] == 1);
+  assert(output[5] == 2);
+  assert(output[6] == 1);
+
+  inspect_query_local_force_full_plan_kernel<<<1, 1>>>(
+    class_two_bytes, graph_record_bytes, device_output);
+  check_cuda(cudaGetLastError(), "query-local force-full plan launch");
+  check_cuda(cudaDeviceSynchronize(), "query-local force-full plan sync");
+  check_cuda(cudaMemcpy(
+    output.data(), device_output, sizeof(output), cudaMemcpyDeviceToHost),
+    "cudaMemcpy(query-local force-full plan)");
+  // One query-local fallback is followed by exactly three authoritative full
+  // attempts. The first full is the retry of the already-issued async short;
+  // each later checksum retry also contributes once, but fallback stays one.
+  if (output[0] != graph_record_bytes ||
+      (output[1] &
+       gpu_search::persistent_kernel_detail::kGraphReadLogical) == 0 ||
+      (output[1] & gpu_search::persistent_kernel_detail::
+       kGraphReadNeedsExtentFallback) == 0 ||
+      (output[1] & gpu_search::persistent_kernel_detail::
+       kGraphReadExtentUnderhint) == 0 ||
+      (output[1] & gpu_search::persistent_kernel_detail::
+       kGraphReadStartedWithShortExtent) != 0 ||
+      (output[2] & gpu_search::persistent_kernel_detail::
+       kGraphReadNeedsExtentFallback) != 0 ||
+      (output[2] & gpu_search::persistent_kernel_detail::
+       kGraphReadExtentUnderhint) == 0 ||
+      output[3] != 1 || output[4] != 1 || output[5] != 0 ||
+      output[6] != 3 || output[7] != 1 || output[8] != 3) {
+    throw std::runtime_error(
+      "query-local force-full accounting mismatch: attempts/fallbacks/"
+      "retries=" + std::to_string(output[6]) + "/" +
+      std::to_string(output[7]) + "/" + std::to_string(output[8]));
+  }
+
+  // The independent gate supports a base-only Live-Extent ablation without
+  // invalidating or rewriting the resident PQ/code state.
+  params.dynamic_graph_extent_enabled = 0;
+  inspect_dynamic_graph_extent_hint_kernel<<<1, 32>>>(
+    params, handle, class_five_bytes, class_two_bytes, device_output);
+  check_cuda(cudaGetLastError(), "disabled dynamic extent lifecycle launch");
+  check_cuda(cudaDeviceSynchronize(), "disabled dynamic extent lifecycle sync");
+  check_cuda(cudaMemcpy(
+    output.data(), device_output, sizeof(output), cudaMemcpyDeviceToHost),
+    "cudaMemcpy(disabled dynamic extent lifecycle output)");
+  assert(output[0] ==
+         gpu_search::kPersistentDynamicCodeArenaUnknownExtent);
+  assert(output[1] == graph_record_bytes);
+  assert(output[2] == 0);
+  assert(output[4] == 0);
+  params.dynamic_graph_extent_enabled = 1;
+
+  // A delayed query for incarnation 17 must neither consume nor repair the
+  // slot after PQ publication has installed incarnation 18.
+  const u32 recycled_state =
+    gpu_search::make_dynamic_code_tag(incarnation + 1, 1);
+  check_cuda(cudaMemcpy(
+    device_state, &recycled_state, sizeof(recycled_state),
+    cudaMemcpyHostToDevice), "cudaMemcpy(recycled dynamic extent state)");
+  inspect_dynamic_graph_extent_hint_kernel<<<1, 32>>>(
+    params, handle, class_five_bytes, class_two_bytes, device_output);
+  check_cuda(cudaGetLastError(), "stale dynamic extent lifecycle launch");
+  check_cuda(cudaDeviceSynchronize(), "stale dynamic extent lifecycle sync");
+  check_cuda(cudaMemcpy(
+    output.data(), device_output, sizeof(output), cudaMemcpyDeviceToHost),
+    "cudaMemcpy(stale dynamic extent lifecycle output)");
+  assert(output[0] ==
+         gpu_search::kPersistentDynamicCodeArenaUnknownExtent);
+  assert(output[1] == graph_record_bytes);
+  assert(output[2] == 0);
+  assert(output[4] == 0);
+  u32 retained_state = 0;
+  check_cuda(cudaMemcpy(
+    &retained_state, device_state, sizeof(retained_state),
+    cudaMemcpyDeviceToHost), "cudaMemcpy(retained dynamic extent state)");
+  assert(retained_state == recycled_state);
+
+  check_cuda(cudaFree(device_output), "cudaFree(dynamic extent output)");
+  check_cuda(cudaFree(device_stop), "cudaFree(dynamic extent stop)");
+  check_cuda(cudaFree(device_request_bytes),
+             "cudaFree(dynamic extent request bytes)");
+  check_cuda(cudaFree(device_graph_scratch),
+             "cudaFree(dynamic extent graph scratch)");
+  check_cuda(cudaFree(device_state), "cudaFree(dynamic extent state)");
+  check_cuda(cudaFree(device_shard), "cudaFree(dynamic extent shard)");
+}
+
+void test_dynamic_code_cache_completion_first_occupancy() {
+  CompletionDescriptor* device_completion = nullptr;
+  check_cuda(cudaMalloc(
+    reinterpret_cast<void**>(&device_completion),
+    sizeof(CompletionDescriptor)),
+    "cudaMalloc(dynamic code cache completion)");
+  inspect_dynamic_code_cache_completion_kernel<<<1, 1>>>(device_completion);
+  check_cuda(cudaGetLastError(), "dynamic code cache completion launch");
+  check_cuda(cudaDeviceSynchronize(), "dynamic code cache completion sync");
+  CompletionDescriptor completion{};
+  check_cuda(cudaMemcpy(
+    &completion, device_completion, sizeof(completion),
+    cudaMemcpyDeviceToHost),
+    "cudaMemcpy(dynamic code cache completion)");
+  assert(completion.dynamic_code_cache_hits == 1);
+  assert(completion.dynamic_code_batch_deduplicated == 2);
+  assert(completion.dynamic_code_cache_publish_successes == 3);
+  assert(completion.dynamic_code_cache_first_occupancies == 4);
+  assert(completion.dynamic_code_cache_publish_races == 5);
+  assert(completion.dynamic_code_cache_lookup_probe_exhaustions == 6);
+  assert(completion.dynamic_code_cache_publish_probe_exhaustions == 7);
+  assert(completion.dynamic_code_cache_lookup_probes == 8);
+  assert(completion.dynamic_code_cache_max_lookup_probes == 9);
+  check_cuda(cudaFree(device_completion),
+             "cudaFree(dynamic code cache completion)");
+}
+
+void test_dynamic_code_arena_reuse_interleaving() {
+  constexpr u32 old_incarnation = 31;
+  constexpr u32 new_incarnation = 32;
+  const u32 old_state = gpu_search::make_dynamic_code_tag(
+    old_incarnation, 2);
+  u32* device_state = device_copy(&old_state, 1);
+  const std::uint8_t old_payload = 0x11u;
+  std::uint8_t* device_payload = device_copy(&old_payload, 1);
+  u32* device_phase = nullptr;
+  DynamicArenaReuseRaceResult* device_result = nullptr;
+  check_cuda(cudaMalloc(reinterpret_cast<void**>(&device_phase), sizeof(u32)),
+             "cudaMalloc(dynamic arena race phase)");
+  check_cuda(cudaMalloc(reinterpret_cast<void**>(&device_result),
+                        sizeof(DynamicArenaReuseRaceResult)),
+             "cudaMalloc(dynamic arena race result)");
+  check_cuda(cudaMemset(device_phase, 0, sizeof(u32)),
+             "cudaMemset(dynamic arena race phase)");
+  check_cuda(cudaMemset(device_result, 0,
+                        sizeof(DynamicArenaReuseRaceResult)),
+             "cudaMemset(dynamic arena race result)");
+
+  dynamic_arena_reuse_race_kernel<<<2, 32>>>(
+    device_state, device_payload, device_phase, device_result);
+  check_cuda(cudaGetLastError(), "dynamic arena race launch");
+  check_cuda(cudaDeviceSynchronize(), "dynamic arena race sync");
+  DynamicArenaReuseRaceResult result{};
+  u32 final_state = 0;
+  check_cuda(cudaMemcpy(&result, device_result, sizeof(result),
+                        cudaMemcpyDeviceToHost),
+             "cudaMemcpy(dynamic arena race result)");
+  check_cuda(cudaMemcpy(&final_state, device_state, sizeof(final_state),
+                        cudaMemcpyDeviceToHost),
+             "cudaMemcpy(dynamic arena race state)");
+  const u32 expected_new_state = gpu_search::make_dynamic_code_tag(
+    new_incarnation, 4);
+  if (result.before != old_state ||
+      result.after !=
+        (gpu_search::kPersistentDynamicCodeArenaBusy | expected_new_state) ||
+      result.observed_payload != 0xbbu || result.accepted != 0 ||
+      final_state != expected_new_state) {
+    throw std::runtime_error(
+      "dynamic arena reuse overlap was not rejected");
+  }
+
+  check_cuda(cudaFree(device_result),
+             "cudaFree(dynamic arena race result)");
+  check_cuda(cudaFree(device_phase), "cudaFree(dynamic arena race phase)");
+  check_cuda(cudaFree(device_payload),
+             "cudaFree(dynamic arena race payload)");
+  check_cuda(cudaFree(device_state), "cudaFree(dynamic arena race state)");
+}
+
 }  // namespace
 
 int main() {
@@ -557,6 +961,9 @@ int main() {
 
     test_route_publication_contention();
     test_graph_extent_hint_promotion();
+    test_dynamic_graph_extent_hint_lifecycle();
+    test_dynamic_code_cache_completion_first_occupancy();
+    test_dynamic_code_arena_reuse_interleaving();
 
     // Exercise the same host/device classifier used by graph RDMA reads. A
     // checksum-valid replacement incarnation must discard only the stale

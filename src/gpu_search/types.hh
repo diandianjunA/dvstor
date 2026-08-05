@@ -91,6 +91,10 @@ struct CompletionDescriptor {
   // reads and therefore cannot be reconstructed from the physical record
   // size when variable-length reads are enabled.
   u64 graph_read_bytes{};
+  // Physical graph bytes fetched for dynamic handles only. This is kept
+  // separate from graph_read_bytes so DynaExtent savings are not hidden by
+  // the much larger immutable base-node population.
+  u64 dynamic_graph_read_bytes{};
   // Adaptive Speculative Frontier Execution (ASFE) keeps communication issue
   // width independent from authoritative graph-expansion commit width. These
   // counters are query-local and are reduced into Telemetry by the host
@@ -197,8 +201,20 @@ struct CompletionDescriptor {
   u32 graph_extent_fallback_reads{};
   u32 graph_extent_underhint_reads{};
   u32 graph_extent_hint_promotions{};
+  // DynaExtent raw physical snapshot-attempt and repair counters. A fallback
+  // contributes one short attempt plus one full attempt, but checksum retries
+  // add further physical attempts, so logical graph reads cannot be inferred
+  // from these fields. The host widens the query-local counters unchanged.
+  u32 dynamic_graph_short_reads{};
+  u32 dynamic_graph_full_reads{};
+  u32 dynamic_graph_fallback_reads{};
+  u32 dynamic_graph_hint_promotions{};
+  u32 dynamic_graph_hint_demotions{};
   u32 dynamic_code_candidates{};
   u32 dynamic_code_reads{};
+  // Schema-compatible name: this is now the complete rejected-snapshot
+  // count, including incarnation mismatch, arena replacement overlap, and
+  // trailer-checksum failure. It is not a pure incarnation-mismatch metric.
   u32 dynamic_code_incarnation_rejects{};
   u32 dynamic_code_cache_hits{};
   u32 dynamic_code_batch_deduplicated{};
@@ -213,12 +229,16 @@ struct CompletionDescriptor {
   // Low 8 bits encode QueryFailureReason; the high 24 bits count complete
   // centroid-route snapshot retries caused by a concurrent publication.
   u32 diagnostic{};
+  // Successful 0 -> occupied arena transitions. Appending this field consumes
+  // the descriptor's former four-byte tail padding, preserving every existing
+  // field offset and the mapped-ring ABI size.
+  u32 dynamic_code_cache_first_occupancies{};
 };
 
 // CompletionDescriptor is embedded once in persistent-kernel shared memory
 // and is also the mapped device-to-host ring ABI. Keep the explicit size check
 // synchronized with both sides whenever production telemetry extends it.
-static_assert(sizeof(CompletionDescriptor) == 552);
+static_assert(sizeof(CompletionDescriptor) == 584);
 static_assert(alignof(CompletionDescriptor) == alignof(u64));
 
 struct CentroidRoutePublishDescriptor {
@@ -276,6 +296,12 @@ struct TelemetrySnapshot {
   u64 graph_extent_fallback_reads{};
   u64 graph_extent_underhint_reads{};
   u64 graph_extent_hint_promotions{};
+  u64 dynamic_graph_short_reads{};
+  u64 dynamic_graph_full_reads{};
+  u64 dynamic_graph_read_bytes{};
+  u64 dynamic_graph_fallback_reads{};
+  u64 dynamic_graph_hint_promotions{};
+  u64 dynamic_graph_hint_demotions{};
   u64 logical_expansions{};
   u64 critical_graph_reads{};
   u64 critical_graph_bytes{};
@@ -320,6 +346,7 @@ struct TelemetrySnapshot {
   u64 frontier_streamed_candidate_runs{};
   u64 ordered_score_batches{};
   u64 ordered_score_candidates{};
+  u64 ooo_bypassed_parents{};
   u64 frontier_reusable_prefix_ranks{};
   u64 frontier_reusable_full_prefix_certificates{};
   u64 frontier_reusable_issued_certificates{};
@@ -427,6 +454,12 @@ public:
   std::atomic<u64> graph_extent_fallback_reads{0};
   std::atomic<u64> graph_extent_underhint_reads{0};
   std::atomic<u64> graph_extent_hint_promotions{0};
+  std::atomic<u64> dynamic_graph_short_reads{0};
+  std::atomic<u64> dynamic_graph_full_reads{0};
+  std::atomic<u64> dynamic_graph_read_bytes{0};
+  std::atomic<u64> dynamic_graph_fallback_reads{0};
+  std::atomic<u64> dynamic_graph_hint_promotions{0};
+  std::atomic<u64> dynamic_graph_hint_demotions{0};
   std::atomic<u64> logical_expansions{0};
   std::atomic<u64> critical_graph_reads{0};
   std::atomic<u64> critical_graph_bytes{0};
@@ -471,6 +504,7 @@ public:
   std::atomic<u64> frontier_streamed_candidate_runs{0};
   std::atomic<u64> ordered_score_batches{0};
   std::atomic<u64> ordered_score_candidates{0};
+  std::atomic<u64> ooo_bypassed_parents{0};
   std::atomic<u64> frontier_reusable_prefix_ranks{0};
   std::atomic<u64> frontier_reusable_full_prefix_certificates{0};
   std::atomic<u64> frontier_reusable_issued_certificates{0};

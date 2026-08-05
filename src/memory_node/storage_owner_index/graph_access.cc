@@ -1529,6 +1529,9 @@ void MemoryNode::write_graph_adjacency(
     std::optional<u32> generation_override,
     std::optional<bool> deleted_override) {
   if (!storage_node_pointer_addressable(rptr)) return;
+  lib_assert(VamanaNode::hot_graph_record_kind_matches(rptr),
+             "graph publication handle kind does not match its physical "
+             "record plane");
 
   const size_t entry_size = VamanaNode::hot_graph_entry_size();
   const u64 hot_offset = VamanaNode::hot_graph_entry_offset(rptr);
@@ -1619,28 +1622,51 @@ void MemoryNode::write_graph_adjacency(
     if (bounded_provisional.size() == VamanaNode::provisional_slots()) break;
   }
 
-  vec<byte_t> entry(entry_size, 0);
+  const bool publish_dynamic_extent = rptr.is_dynamic();
+  if (publish_dynamic_extent) {
+    lib_assert(VamanaNode::dynamic_graph_publication_layout_valid(),
+               "dynamic graph and navigation tag must be contiguous");
+  }
+  const size_t publication_size = publish_dynamic_extent
+    ? VamanaNode::dynamic_graph_publication_size() : entry_size;
+  lib_assert(hot_offset <= mn_memory_bytes_ &&
+               publication_size <= mn_memory_bytes_ - hot_offset,
+             "hot graph publication exceeds shard bounds");
+  vec<byte_t> entry(publication_size, 0);
   const u8 edge_count = static_cast<u8>(bounded_stable.size());
-  VamanaNode::encode_hot_graph_entry(entry.data(), edge_count,
-                                     bounded_stable.data(), edge_count,
-                                     VamanaNode::HOT_GRAPH_SHARD_BITS,
-                                     generation, false,
-                                     bounded_provisional.data(),
-                                     bounded_provisional.size(),
-                                     rptr.incarnation());
-  if (deleted) {
-    // Deleted nodes retain their preserved adjacency for cleanup, while GPU
-    // readers still observe the tombstone and ignore the payload.
-    entry[1] |= VamanaNode::HOT_GRAPH_DELETED;
-    const u16 checksum =
-      vamana::hot_graph::checksum16(entry.data(), entry.size());
-    vamana::hot_graph::store_u16_le(entry.data() + 2, checksum);
+  if (publish_dynamic_extent) {
+    lib_assert(VamanaNode::encode_dynamic_graph_publication(
+                 entry.data(), entry.size(), bounded_stable.data(),
+                 bounded_stable.size(), bounded_provisional.data(),
+                 bounded_provisional.size(), generation, deleted,
+                 rptr.incarnation(), VamanaNode::HOT_GRAPH_SHARD_BITS),
+               "failed to serialize dynamic graph publication");
+  } else {
+    VamanaNode::encode_hot_graph_entry(
+      entry.data(), edge_count, bounded_stable.data(), edge_count,
+      VamanaNode::HOT_GRAPH_SHARD_BITS, generation, false,
+      bounded_provisional.data(), bounded_provisional.size(),
+      rptr.incarnation());
+    if (deleted) {
+      // Deleted nodes retain their preserved adjacency for cleanup, while GPU
+      // readers still observe the tombstone and ignore the payload.
+      entry[1] |= VamanaNode::HOT_GRAPH_DELETED;
+      const u16 checksum =
+        vamana::hot_graph::checksum16(entry.data(), entry_size);
+      vamana::hot_graph::store_u16_le(entry.data() + 2, checksum);
+    }
   }
   if (local_shard(rptr.memory_node())) {
-    std::memcpy(index_buffer_.get_full_buffer() + hot_offset, entry.data(), entry_size);
+    // The graph and advisory tag share one publication copy.  The copy ends
+    // exactly where the PQ payload begins and therefore cannot corrupt it.
+    std::memcpy(index_buffer_.get_full_buffer() + hot_offset,
+                entry.data(), publication_size);
     return;
   }
-  remote_write_bytes(rptr.memory_node(), hot_offset, entry.data(), entry_size, 0);
+  // One RDMA WRITE publishes graph + tag; no extra WQE/CQE/round trip is
+  // introduced for dynamic extent maintenance.
+  remote_write_bytes(
+    rptr.memory_node(), hot_offset, entry.data(), publication_size, 0);
 }
 
 void MemoryNode::write_neighbor_list(RemotePtr rptr, const vec<RemotePtr>& neighbors) {
@@ -1664,12 +1690,23 @@ void MemoryNode::write_dynamic_navigation_code(
   transformed.resize(gpu_navigation_model_.dim);
   byte_t* destination = index_buffer_.get_full_buffer() +
     VamanaNode::dynamic_navigation_code_offset(rptr);
-  *reinterpret_cast<u32*>(destination) = rptr.incarnation();
+  *reinterpret_cast<u32*>(destination) =
+    VamanaNode::pack_dynamic_navigation_tag(
+      rptr.incarnation(),
+      VamanaNode::DYNAMIC_CODE_EXTENT_CLASS_UNKNOWN);
   gpu_search::pq::encode(
     gpu_navigation_model_,
     std::span<const f32>{components.data(), components.size()},
     std::span<u8>{destination + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES,
                   gpu_navigation_model_.code_bytes()}, transformed);
+  const u32 checksum = vamana::dynamic_navigation_code::checksum(
+    vamana::dynamic_navigation_code::load_u32_le(destination),
+    destination + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES,
+    gpu_navigation_model_.code_bytes());
+  vamana::dynamic_navigation_code::store_u32_le(
+    destination + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
+      gpu_navigation_model_.code_bytes(),
+    checksum);
 }
 
 void MemoryNode::write_new_node(RemotePtr rptr,
@@ -1751,12 +1788,15 @@ void MemoryNode::write_new_node_on_shard(
     bounded_neighbors.push_back(neighbor);
     if (bounded_neighbors.size() == VamanaNode::R) break;
   }
-  const u8 stable_count = static_cast<u8>(bounded_neighbors.size());
-  VamanaNode::encode_hot_graph_entry(
-    record.data() + VamanaNode::HOT_GRAPH_DYNAMIC_HOT_OFFSET,
-    stable_count, bounded_neighbors.data(), stable_count,
-    VamanaNode::HOT_GRAPH_SHARD_BITS, generation, false,
-    nullptr, 0, rptr.incarnation());
+  lib_assert(VamanaNode::dynamic_graph_publication_layout_valid(),
+             "dynamic graph and navigation tag must be contiguous");
+  lib_assert(VamanaNode::encode_dynamic_graph_publication(
+               record.data() + VamanaNode::HOT_GRAPH_DYNAMIC_HOT_OFFSET,
+               record.size() - VamanaNode::HOT_GRAPH_DYNAMIC_HOT_OFFSET,
+               bounded_neighbors.data(), bounded_neighbors.size(),
+               nullptr, 0, generation, false, rptr.incarnation(),
+               VamanaNode::HOT_GRAPH_SHARD_BITS),
+             "failed to serialize remote dynamic graph publication");
 
   thread_local vec<f32> transformed;
   transformed.resize(gpu_navigation_model_.dim);
@@ -1768,9 +1808,17 @@ void MemoryNode::write_new_node_on_shard(
         VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES,
       gpu_navigation_model_.code_bytes()},
     transformed);
-  *reinterpret_cast<u32*>(
-    record.data() + VamanaNode::HOT_GRAPH_DYNAMIC_CODE_OFFSET) =
-      rptr.incarnation();
+  byte_t* dynamic_code =
+    record.data() + VamanaNode::HOT_GRAPH_DYNAMIC_CODE_OFFSET;
+  const u32 dynamic_code_checksum =
+    vamana::dynamic_navigation_code::checksum(
+      vamana::dynamic_navigation_code::load_u32_le(dynamic_code),
+      dynamic_code + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES,
+      gpu_navigation_model_.code_bytes());
+  vamana::dynamic_navigation_code::store_u32_le(
+    dynamic_code + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
+      gpu_navigation_model_.code_bytes(),
+    dynamic_code_checksum);
   // Publish remote records header-last. A reader either observes the old
   // tombstone, the publishing lock, or a complete new incarnation.
   const u64 observed = remote_compare_and_swap(

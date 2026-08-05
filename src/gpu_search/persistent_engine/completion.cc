@@ -52,6 +52,18 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
     << completion.graph_extent_underhint_reads
     << ",\"graph_extent_hint_promotions\":"
     << completion.graph_extent_hint_promotions
+    << ",\"dynamic_graph_short_reads\":"
+    << completion.dynamic_graph_short_reads
+    << ",\"dynamic_graph_full_reads\":"
+    << completion.dynamic_graph_full_reads
+    << ",\"dynamic_graph_read_bytes\":"
+    << completion.dynamic_graph_read_bytes
+    << ",\"dynamic_graph_fallback_reads\":"
+    << completion.dynamic_graph_fallback_reads
+    << ",\"dynamic_graph_hint_promotions\":"
+    << completion.dynamic_graph_hint_promotions
+    << ",\"dynamic_graph_hint_demotions\":"
+    << completion.dynamic_graph_hint_demotions
     << ",\"logical_expansions\":" << completion.logical_expansions
     << ",\"critical_graph_reads\":" << completion.critical_graph_reads
     << ",\"critical_graph_bytes\":" << completion.critical_graph_bytes
@@ -108,6 +120,9 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
     << completion.ordered_score_batches
     << ",\"ordered_score_candidates\":"
     << completion.ordered_score_candidates
+    << ",\"ooo_bypassed_parents\":"
+    << (completion.status == 0
+          ? completion.frontier_telemetry_reserved1 : 0u)
     << ",\"frontier_reusable_prefix_ranks\":"
     << completion.frontier_reusable_prefix_ranks
     << ",\"frontier_reusable_full_prefix_certificates\":"
@@ -115,7 +130,8 @@ void PersistentSearchEngine::Impl::write_query_rdma_trace(
     << ",\"frontier_reusable_issued_certificates\":"
     << completion.frontier_reusable_issued_certificates
     << ",\"frontier_certificate_rejects\":"
-    << completion.frontier_telemetry_reserved0
+    << (completion.status == 0
+          ? completion.frontier_telemetry_reserved0 : 0u)
     << ",\"issue_epochs\":" << completion.issue_epochs
     << ",\"commit_epochs\":" << completion.commit_epochs
     << ",\"issue_width_sum\":" << completion.issue_width_sum
@@ -441,6 +457,18 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << completion.graph_extent_underhint_reads
                 << " graph_extent_promotions="
                 << completion.graph_extent_hint_promotions
+                << " dynamic_graph_short_reads="
+                << completion.dynamic_graph_short_reads
+                << " dynamic_graph_full_reads="
+                << completion.dynamic_graph_full_reads
+                << " dynamic_graph_bytes="
+                << completion.dynamic_graph_read_bytes
+                << " dynamic_graph_fallbacks="
+                << completion.dynamic_graph_fallback_reads
+                << " dynamic_graph_promotions="
+                << completion.dynamic_graph_hint_promotions
+                << " dynamic_graph_demotions="
+                << completion.dynamic_graph_hint_demotions
                 << " logical_expansions=" << completion.logical_expansions
                 << " critical_graph_reads="
                 << completion.critical_graph_reads
@@ -460,7 +488,8 @@ void PersistentSearchEngine::Impl::completion_loop() {
                 << " commit_width_max=" << completion.max_commit_width
                 << " critical_misses=" << completion.critical_misses
                 << " certificate_rejects="
-                << completion.frontier_telemetry_reserved0
+                << (completion.status == 0
+                      ? completion.frontier_telemetry_reserved0 : 0u)
                 << " graph_batches=" << completion.remote_batches
                 << " graph_rounds=" << completion.graph_rounds
                 << " route_hits=" << completion.route_hits
@@ -685,7 +714,7 @@ void PersistentSearchEngine::Impl::completion_loop() {
       completion.dynamic_code_cache_lookup_probes,
       std::memory_order_relaxed);
     engine.telemetry_.dynamic_code_cache_occupied.fetch_add(
-      completion.dynamic_code_cache_publish_successes,
+      completion.dynamic_code_cache_first_occupancies,
       std::memory_order_relaxed);
     u64 observed_max =
       engine.telemetry_.dynamic_code_cache_max_lookup_probes.load(
@@ -712,6 +741,18 @@ void PersistentSearchEngine::Impl::completion_loop() {
       completion.graph_extent_underhint_reads, std::memory_order_relaxed);
     engine.telemetry_.graph_extent_hint_promotions.fetch_add(
       completion.graph_extent_hint_promotions, std::memory_order_relaxed);
+    engine.telemetry_.dynamic_graph_short_reads.fetch_add(
+      completion.dynamic_graph_short_reads, std::memory_order_relaxed);
+    engine.telemetry_.dynamic_graph_full_reads.fetch_add(
+      completion.dynamic_graph_full_reads, std::memory_order_relaxed);
+    engine.telemetry_.dynamic_graph_read_bytes.fetch_add(
+      completion.dynamic_graph_read_bytes, std::memory_order_relaxed);
+    engine.telemetry_.dynamic_graph_fallback_reads.fetch_add(
+      completion.dynamic_graph_fallback_reads, std::memory_order_relaxed);
+    engine.telemetry_.dynamic_graph_hint_promotions.fetch_add(
+      completion.dynamic_graph_hint_promotions, std::memory_order_relaxed);
+    engine.telemetry_.dynamic_graph_hint_demotions.fetch_add(
+      completion.dynamic_graph_hint_demotions, std::memory_order_relaxed);
     engine.telemetry_.logical_expansions.fetch_add(
       completion.logical_expansions, std::memory_order_relaxed);
     engine.telemetry_.critical_graph_reads.fetch_add(
@@ -790,6 +831,11 @@ void PersistentSearchEngine::Impl::completion_loop() {
       completion.ordered_score_batches, std::memory_order_relaxed);
     engine.telemetry_.ordered_score_candidates.fetch_add(
       completion.ordered_score_candidates, std::memory_order_relaxed);
+    if (completion.status == 0) {
+      engine.telemetry_.ooo_bypassed_parents.fetch_add(
+        completion.frontier_telemetry_reserved1,
+        std::memory_order_relaxed);
+    }
     engine.telemetry_.frontier_reusable_prefix_ranks.fetch_add(
       completion.frontier_reusable_prefix_ranks,
       std::memory_order_relaxed);
@@ -799,9 +845,11 @@ void PersistentSearchEngine::Impl::completion_loop() {
     engine.telemetry_.frontier_reusable_issued_certificates.fetch_add(
       completion.frontier_reusable_issued_certificates,
       std::memory_order_relaxed);
-    engine.telemetry_.frontier_certificate_rejects.fetch_add(
-      completion.frontier_telemetry_reserved0,
-      std::memory_order_relaxed);
+    if (completion.status == 0) {
+      engine.telemetry_.frontier_certificate_rejects.fetch_add(
+        completion.frontier_telemetry_reserved0,
+        std::memory_order_relaxed);
+    }
     engine.telemetry_.issue_epochs.fetch_add(
       completion.issue_epochs, std::memory_order_relaxed);
     engine.telemetry_.commit_epochs.fetch_add(

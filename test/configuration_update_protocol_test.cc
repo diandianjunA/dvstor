@@ -11,7 +11,8 @@ configuration::IndexConfiguration make_config(
     bool explicit_disable, bool explicit_namespace = false,
     bool bypass_dynamic_cache = false,
     std::string beam_merge_policy = {},
-    std::string graph_read_policy = {}) {
+    std::string graph_read_policy = {},
+    std::string dynamic_graph_extent = {}) {
   std::vector<std::string> arguments{
     "configuration_update_protocol_test",
     "--servers", "127.0.0.1:1234",
@@ -41,6 +42,10 @@ configuration::IndexConfiguration make_config(
     arguments.emplace_back("--gpu-query-graph-read-policy");
     arguments.emplace_back(std::move(graph_read_policy));
   }
+  if (!dynamic_graph_extent.empty()) {
+    arguments.emplace_back("--gpu-dynamic-graph-extent");
+    arguments.emplace_back(std::move(dynamic_graph_extent));
+  }
   std::vector<char*> argv;
   argv.reserve(arguments.size());
   for (auto& argument : arguments) argv.push_back(argument.data());
@@ -59,6 +64,7 @@ int main() {
   assert(default_config.gpu_direct_timeout_ms == 250);
   assert(default_config.gpu_query_beam_merge_policy == "legacy");
   assert(default_config.gpu_query_graph_read_policy == "fixed");
+  assert(default_config.gpu_dynamic_graph_extent);
 
   const auto stable_run_config =
     make_config(false, false, false, "STABLE-RUN");
@@ -66,6 +72,11 @@ int main() {
   const auto live_extent_config =
     make_config(false, false, false, {}, "LIVE-EXTENT");
   assert(live_extent_config.gpu_query_graph_read_policy == "live-extent");
+  const auto static_only_extent_config =
+    make_config(false, false, false, {}, "LIVE-EXTENT", "false");
+  assert(static_only_extent_config.gpu_query_graph_read_policy ==
+         "live-extent");
+  assert(!static_only_extent_config.gpu_dynamic_graph_extent);
 
   const auto expanded_namespace = make_config(false, true);
   assert(expanded_namespace.max_vectors == 1'000'000);

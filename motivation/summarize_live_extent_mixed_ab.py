@@ -288,6 +288,10 @@ def _controlled_meta(root: dict[str, Any], path: Path) -> dict[str, Any]:
     if not isinstance(meta, dict):
         raise ReportError(f"{path}: meta is not an object")
     meta.pop("gpu_query_graph_read_policy", None)
+    # Derived components of the graph-read policy, not independent controls.
+    # fixed reports disabled/full while live-extent may enable DynaExtent.
+    meta.pop("gpu_dynamic_graph_extent", None)
+    meta.pop("gpu_dynamic_graph_extent_source", None)
     # Historical reports may contain the removed expansion-policy field.
     # It is neither required nor an A/B pairing dimension.
     meta.pop("gpu_query_expansion_policy", None)

@@ -134,6 +134,14 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
         ? "adaptive_decoupled" : "coupled_baseline"},
     {"gpu_query_graph_read_policy",
       service.config().gpu_query_graph_read_policy},
+    {"gpu_dynamic_graph_extent",
+      service.config().gpu_query_graph_read_policy == "live-extent" &&
+        service.config().gpu_dynamic_graph_extent},
+    {"gpu_dynamic_graph_extent_source",
+      service.config().gpu_query_graph_read_policy == "live-extent" &&
+          service.config().gpu_dynamic_graph_extent
+        ? "incarnation_tagged_live_extent"
+        : "full_physical_record"},
     {"gpu_graph_physical_record_bytes", VamanaNode::hot_graph_entry_size()},
     {"gpu_graph_entry_capacity", VamanaNode::graph_entry_capacity()},
     {"gpu_graph_extent_quantum_edges",

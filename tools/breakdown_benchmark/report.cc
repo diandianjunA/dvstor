@@ -52,6 +52,14 @@ nlohmann::json telemetry_to_json(
       ? telemetry.terminal_exact_cache_issued_records -
           telemetry.terminal_exact_cache_promoted_records
       : 0;
+  const uint64_t dynamic_graph_nonfallback_full_attempts =
+    telemetry.dynamic_graph_full_reads >
+        telemetry.dynamic_graph_fallback_reads
+      ? telemetry.dynamic_graph_full_reads -
+          telemetry.dynamic_graph_fallback_reads
+      : 0;
+  const uint64_t dynamic_graph_snapshot_attempts =
+    telemetry.dynamic_graph_short_reads + telemetry.dynamic_graph_full_reads;
   return {
     {"gpu_memory_explicit_bytes", telemetry.gpu_memory_explicit_bytes},
     {"gpu_memory_base_pq_bytes", telemetry.gpu_memory_base_pq_bytes},
@@ -189,6 +197,34 @@ nlohmann::json telemetry_to_json(
       telemetry.graph_extent_underhint_reads},
     {"graph_extent_hint_promotions",
       telemetry.graph_extent_hint_promotions},
+    {"dynamic_graph_short_reads", telemetry.dynamic_graph_short_reads},
+    {"dynamic_graph_full_reads", telemetry.dynamic_graph_full_reads},
+    {"dynamic_graph_read_bytes", telemetry.dynamic_graph_read_bytes},
+    {"dynamic_graph_fallback_reads",
+      telemetry.dynamic_graph_fallback_reads},
+    {"dynamic_graph_hint_promotions",
+      telemetry.dynamic_graph_hint_promotions},
+    {"dynamic_graph_hint_demotions",
+      telemetry.dynamic_graph_hint_demotions},
+    {"dynamic_graph_snapshot_attempts", dynamic_graph_snapshot_attempts},
+    {"dynamic_graph_nonfallback_full_attempts",
+      dynamic_graph_nonfallback_full_attempts},
+    {"dynamic_graph_short_physical_ratio",
+      dynamic_graph_snapshot_attempts == 0 ? 0.0
+      : static_cast<double>(telemetry.dynamic_graph_short_reads) /
+          static_cast<double>(dynamic_graph_snapshot_attempts)},
+    {"dynamic_graph_fallback_ratio",
+      telemetry.dynamic_graph_short_reads == 0 ? 0.0
+      : static_cast<double>(telemetry.dynamic_graph_fallback_reads) /
+          static_cast<double>(telemetry.dynamic_graph_short_reads)},
+    {"average_dynamic_graph_read_bytes_per_physical_read",
+      dynamic_graph_snapshot_attempts == 0 ? 0.0
+      : static_cast<double>(telemetry.dynamic_graph_read_bytes) /
+          static_cast<double>(dynamic_graph_snapshot_attempts)},
+    {"average_dynamic_graph_read_bytes_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.dynamic_graph_read_bytes) /
+          static_cast<double>(telemetry.queries_completed)},
     {"graph_live_extent_read_ratio",
       telemetry.graph_live_extent_reads + telemetry.graph_full_record_reads == 0
         ? 0.0
@@ -335,6 +371,11 @@ nlohmann::json telemetry_to_json(
       telemetry.ordered_score_batches == 0 ? 0.0
       : static_cast<double>(telemetry.ordered_score_candidates) /
           static_cast<double>(telemetry.ordered_score_batches)},
+    {"ooo_bypassed_parents", telemetry.ooo_bypassed_parents},
+    {"average_ooo_bypassed_parents_per_query",
+      telemetry.queries_completed == 0 ? 0.0
+      : static_cast<double>(telemetry.ooo_bypassed_parents) /
+          static_cast<double>(telemetry.queries_completed)},
     {"frontier_reusable_prefix_ranks",
       telemetry.frontier_reusable_prefix_ranks},
     {"average_frontier_reusable_prefix_ranks_per_query",
@@ -749,6 +790,23 @@ FormattedReport format_report(const nlohmann::json& root,
            << gpu.value("graph_extent_fallback_reads", 0ULL) << "/"
            << gpu.value("graph_extent_underhint_reads", 0ULL) << "/"
            << gpu.value("graph_extent_hint_promotions", 0ULL) << '\n';
+    output << "  DynaExtent short/full/bytes/fallback/promotions/demotions: "
+           << gpu.value("dynamic_graph_short_reads", 0ULL) << "/"
+           << gpu.value("dynamic_graph_full_reads", 0ULL) << "/"
+           << gpu.value("dynamic_graph_read_bytes", 0ULL) << "/"
+           << gpu.value("dynamic_graph_fallback_reads", 0ULL) << "/"
+           << gpu.value("dynamic_graph_hint_promotions", 0ULL) << "/"
+           << gpu.value("dynamic_graph_hint_demotions", 0ULL) << '\n';
+    output << "  DynaExtent snapshot-attempts/nonfallback-full-attempts/"
+              "short-physical-ratio/fallback-ratio/bytes-per-physical-read: "
+           << gpu.value("dynamic_graph_snapshot_attempts", 0ULL) << "/"
+           << gpu.value(
+                "dynamic_graph_nonfallback_full_attempts", 0ULL) << "/"
+           << gpu.value("dynamic_graph_short_physical_ratio", 0.0) << "/"
+           << gpu.value("dynamic_graph_fallback_ratio", 0.0) << "/"
+           << gpu.value(
+                "average_dynamic_graph_read_bytes_per_physical_read", 0.0)
+           << '\n';
     output << "  ASFE logical expansions total/per_query: "
            << gpu.value("logical_expansions", 0ULL) << "/"
            << gpu.value("average_logical_expansions_per_query", 0.0) << '\n';
@@ -834,6 +892,12 @@ FormattedReport format_report(const nlohmann::json& root,
            << "/"
            << gpu.value(
                 "average_ordered_score_candidates_per_batch", 0.0)
+           << '\n';
+    output << "  OOO ROB parents retired beyond an unresolved rank hole "
+              "(total/per_query): "
+           << gpu.value("ooo_bypassed_parents", 0ULL) << "/"
+           << gpu.value(
+                "average_ooo_bypassed_parents_per_query", 0.0)
            << '\n';
     output << "  ASFE reusable prefix ranks/full/issued certificates "
               "(total/per_query): "

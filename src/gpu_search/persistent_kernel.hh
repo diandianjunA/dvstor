@@ -241,6 +241,10 @@ enum class FrontierValidationState : u8 {
   stale_incarnation = 2,
   invalid_snapshot = 3,
   transport_rejected = 4,
+  // A structurally readable short prefix proved that the complete adjacency
+  // does not fit. This is query-local retry evidence only; the unverified
+  // header must never directly update a global extent hint.
+  extent_underhint = 5,
 };
 
 inline constexpr u8 kFrontierRobFlagEarlyShadow = 1u << 0;
@@ -421,6 +425,10 @@ struct PersistentKernelParams {
   // hint atomically promotes only its byte. A null pointer keeps the legacy
   // fixed-size graph READ path exactly intact.
   u32* graph_extent_class_words{};
+  // Enables incarnation-scoped graph hints piggybacked by dynamic PQ reads.
+  // Kept independent from the static sidecar for base-only/complete
+  // Live-Extent ablations; zero leaves dynamic records on full graph reads.
+  u32 dynamic_graph_extent_enabled{};
   // Per-query-slot global metadata consumed asynchronously by QP-owner warps.
   // Only the first kPersistentMaxPrefetch entries of each query slot are used
   // by graph fetches.
@@ -452,10 +460,11 @@ struct PersistentKernelParams {
   u64* visited_hash{};
   u8* exact_records{};
   u8* dynamic_code_records{};
-  // The dynamic PQ arena is indexed directly by physical storage slot.  A
-  // state is either 0 (not resident), an incarnation, or BUSY|incarnation
-  // while one CTA replaces the payload. Incarnations are monotonic for a
-  // physical slot, preventing a delayed reader from overwriting newer data.
+  // The dynamic PQ arena is indexed directly by physical storage slot.  The
+  // low 24 bits name the resident incarnation and bits [30:24] carry its
+  // graph-extent hint; bit 31 is BUSY while one CTA replaces the payload.
+  // Incarnations are monotonic for a physical slot, preventing a delayed
+  // reader (including an old graph-hint repair) from overwriting newer data.
   u32* dynamic_code_arena_states{};
   u8* dynamic_code_arena_records{};
   u64 dynamic_code_arena_capacity{};
@@ -466,11 +475,78 @@ struct PersistentKernelParams {
   f32* result_distances{};
 };
 
+// Storage piggybacks a graph-extent class on the four-byte dynamic PQ
+// incarnation tag.  RemotePtr already limits incarnations to 24 bits, so this
+// changes neither the dynamic record layout nor the PQ RDMA transfer size.
+// Arena states reserve the tag's top bit for BUSY and normalize every unknown
+// or unrepresentable remote class to 0x7f.  That value is greater than every
+// supported graph extent class and therefore maps to a safe full-record read.
+inline constexpr u32 kPersistentDynamicCodeTagIncarnationMask =
+  (u32{1} << 24) - 1u;
+inline constexpr u32 kPersistentDynamicCodeTagExtentShift = 24;
+inline constexpr u32 kPersistentDynamicCodeTagExtentMask = u32{0xff} << 24;
+inline constexpr u8 kPersistentDynamicCodeArenaUnknownExtent = 0x7fu;
 inline constexpr u32 kPersistentDynamicCodeArenaBusy = u32{1} << 31;
 inline constexpr u32 kPersistentDynamicCodeArenaIncarnationMask =
-  kPersistentDynamicCodeArenaBusy - 1;
+  kPersistentDynamicCodeTagIncarnationMask;
+inline constexpr u32 kPersistentDynamicCodeArenaExtentMask =
+  u32{kPersistentDynamicCodeArenaUnknownExtent} <<
+    kPersistentDynamicCodeTagExtentShift;
 static_assert(kRemoteMaxIncarnation <
               kPersistentDynamicCodeArenaIncarnationMask);
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr u32 dynamic_code_tag_incarnation(u32 tag) {
+  return tag & kPersistentDynamicCodeTagIncarnationMask;
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr u8 dynamic_code_tag_extent_class(u32 tag) {
+  const u32 extent = tag >> kPersistentDynamicCodeTagExtentShift;
+  return static_cast<u8>(
+    extent < kPersistentDynamicCodeArenaUnknownExtent
+      ? extent : kPersistentDynamicCodeArenaUnknownExtent);
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr u32 make_dynamic_code_tag(u32 incarnation,
+                                           u8 extent_class) {
+  const u32 normalized_extent =
+    extent_class < kPersistentDynamicCodeArenaUnknownExtent
+      ? extent_class : kPersistentDynamicCodeArenaUnknownExtent;
+  return (normalized_extent << kPersistentDynamicCodeTagExtentShift) |
+    (incarnation & kPersistentDynamicCodeTagIncarnationMask);
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr bool dynamic_code_arena_state_matches(
+    u32 state, u32 incarnation) {
+  return incarnation != 0 && incarnation <= kRemoteMaxIncarnation &&
+    (state & kPersistentDynamicCodeArenaBusy) == 0 &&
+    dynamic_code_tag_incarnation(state) == incarnation;
+}
+
+// A cache reader samples the state on both sides of the payload load.  Extent
+// promotion/demotion for the same incarnation is harmless because it never
+// rewrites the immutable PQ bytes; BUSY or a different incarnation means a
+// physical-slot replacement overlapped the read and the score must be
+// discarded.
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr bool dynamic_code_arena_read_stable(
+    u32 before, u32 after, u32 incarnation) {
+  return dynamic_code_arena_state_matches(before, incarnation) &&
+    dynamic_code_arena_state_matches(after, incarnation);
+}
 
 #ifdef __CUDACC__
 __host__ __device__
@@ -480,8 +556,103 @@ inline constexpr bool dynamic_code_arena_can_publish(
   return desired_incarnation != 0 &&
     desired_incarnation <= kRemoteMaxIncarnation &&
     (observed_state & kPersistentDynamicCodeArenaBusy) == 0 &&
-    (observed_state & kPersistentDynamicCodeArenaIncarnationMask) <
-      desired_incarnation;
+    dynamic_code_tag_incarnation(observed_state) < desired_incarnation;
+}
+
+// A successful 0 -> BUSY|tag reservation is the only transition that adds a
+// physical arena occupant. Later incarnations replace the resident payload in
+// the same slot and must not increase occupancy again.
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr bool dynamic_code_arena_first_occupancy(
+    u32 reserved_from_state) {
+  return reserved_from_state == 0;
+}
+
+// Produce the same-incarnation, monotonic class transition used by graph
+// under-hint repair.  Slot reuse or a BUSY publisher makes the transition a
+// no-op, so a delayed query can never attach its old class to a new payload.
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr bool dynamic_code_arena_promoted_extent_state(
+    u32 observed_state,
+    u32 desired_incarnation,
+    u8 requested_extent_class,
+    u32& promoted_state) {
+  promoted_state = observed_state;
+  if (!dynamic_code_arena_state_matches(
+        observed_state, desired_incarnation) ||
+      requested_extent_class >= kPersistentDynamicCodeArenaUnknownExtent) {
+    return false;
+  }
+  const u8 observed_extent =
+    dynamic_code_tag_extent_class(observed_state);
+  if (observed_extent == kPersistentDynamicCodeArenaUnknownExtent ||
+      requested_extent_class <= observed_extent) {
+    return false;
+  }
+  promoted_state = make_dynamic_code_tag(
+    desired_incarnation, requested_extent_class);
+  return true;
+}
+
+// UNKNOWN is a conservative full-record sentinel rather than an ordinal
+// high-water class. A same-incarnation, checksum-authoritative graph snapshot
+// may refine it exactly once without republishing the immutable PQ payload.
+// Keeping this transition separate from promotion/demotion preserves their
+// telemetry semantics: a planned UNKNOWN full read is not a short->full
+// fallback, and learning its exact class is not evidence of graph shrinkage.
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr bool dynamic_code_arena_refined_unknown_extent_state(
+    u32 observed_state,
+    u32 desired_incarnation,
+    u8 observed_graph_class,
+    u32& refined_state) {
+  refined_state = observed_state;
+  if (!dynamic_code_arena_state_matches(
+        observed_state, desired_incarnation) ||
+      observed_graph_class >= kPersistentDynamicCodeArenaUnknownExtent ||
+      dynamic_code_tag_extent_class(observed_state) !=
+        kPersistentDynamicCodeArenaUnknownExtent) {
+    return false;
+  }
+  refined_state = make_dynamic_code_tag(
+    desired_incarnation, observed_graph_class);
+  return true;
+}
+
+// Apply asymmetric hysteresis to graph shrinkage.  A verified snapshot must
+// be at least two classes below the cached hint before the cache moves down,
+// and the retained one-class guard absorbs an immediate small regrowth.  The
+// exact incarnation check gives this pure transition the same slot-reuse
+// protection as upward repair.
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr bool dynamic_code_arena_guarded_demoted_extent_state(
+    u32 observed_state,
+    u32 desired_incarnation,
+    u8 observed_graph_class,
+    u32& demoted_state) {
+  demoted_state = observed_state;
+  if (!dynamic_code_arena_state_matches(
+        observed_state, desired_incarnation) ||
+      observed_graph_class >= kPersistentDynamicCodeArenaUnknownExtent) {
+    return false;
+  }
+  const u8 cached_extent =
+    dynamic_code_tag_extent_class(observed_state);
+  if (cached_extent == kPersistentDynamicCodeArenaUnknownExtent ||
+      static_cast<u32>(observed_graph_class) + 2u > cached_extent) {
+    return false;
+  }
+  demoted_state = make_dynamic_code_tag(
+    desired_incarnation, static_cast<u8>(observed_graph_class + 1u));
+  return true;
 }
 
 struct PersistentKernelOccupancy {
