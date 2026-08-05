@@ -95,6 +95,12 @@ void test_recall_and_report_formatting() {
   telemetry.graph_extent_fallback_reads = 1;
   telemetry.graph_extent_underhint_reads = 1;
   telemetry.graph_extent_hint_promotions = 1;
+  telemetry.dynamic_graph_short_reads = 8;
+  telemetry.dynamic_graph_full_reads = 3;
+  telemetry.dynamic_graph_read_bytes = 2'000;
+  telemetry.dynamic_graph_fallback_reads = 1;
+  telemetry.dynamic_graph_hint_promotions = 2;
+  telemetry.dynamic_graph_hint_demotions = 4;
   telemetry.centroid_route_publications = 7;
   telemetry.centroid_route_shard_updates = 9;
   telemetry.centroid_route_live_entries = 13;
@@ -112,6 +118,7 @@ void test_recall_and_report_formatting() {
   telemetry.dynamic_code_cache_max_lookup_probes = 3;
   telemetry.dynamic_code_cache_occupied = 64;
   telemetry.dynamic_code_cache_capacity = 256;
+  telemetry.ooo_bypassed_parents = 6;
   const auto telemetry_json = tools::breakdown_benchmark::telemetry_to_json(telemetry);
   assert(telemetry_json.at("graph_read_retries") == 11);
   assert(telemetry_json.at("graph_read_bytes") == 4'000);
@@ -123,6 +130,27 @@ void test_recall_and_report_formatting() {
   assert(telemetry_json.at("graph_extent_fallback_reads") == 1);
   assert(telemetry_json.at("graph_extent_underhint_reads") == 1);
   assert(telemetry_json.at("graph_extent_hint_promotions") == 1);
+  assert(telemetry_json.at("dynamic_graph_short_reads") == 8);
+  assert(telemetry_json.at("dynamic_graph_full_reads") == 3);
+  assert(telemetry_json.at("dynamic_graph_read_bytes") == 2'000);
+  assert(telemetry_json.at("dynamic_graph_fallback_reads") == 1);
+  assert(telemetry_json.at("dynamic_graph_hint_promotions") == 2);
+  assert(telemetry_json.at("dynamic_graph_hint_demotions") == 4);
+  assert(telemetry_json.at("dynamic_graph_snapshot_attempts") == 11);
+  assert(telemetry_json.at(
+           "dynamic_graph_nonfallback_full_attempts") == 2);
+  assert(std::abs(
+    telemetry_json.at("dynamic_graph_short_physical_ratio").get<double>() -
+    8.0 / 11.0) < 1e-9);
+  assert(std::abs(
+    telemetry_json.at("dynamic_graph_fallback_ratio").get<double>() -
+    0.125) < 1e-9);
+  assert(std::abs(telemetry_json.at(
+                    "average_dynamic_graph_read_bytes_per_physical_read")
+                    .get<double>() -
+                  2'000.0 / 11.0) < 1e-9);
+  assert(telemetry_json.at(
+           "average_dynamic_graph_read_bytes_per_query") == 1'000.0);
   assert(std::abs(
     telemetry_json.at("graph_live_extent_read_ratio").get<double>() -
     8.0 / 11.0) < 1e-9);
@@ -142,6 +170,8 @@ void test_recall_and_report_formatting() {
   assert(telemetry_json.at("centroid_route_poll_delay_us") == 8000);
   assert(telemetry_json.at("centroid_route_query_retries") == 23);
   assert(telemetry_json.at("centroid_route_query_timeouts") == 0);
+  assert(telemetry_json.at("ooo_bypassed_parents") == 6);
+  assert(telemetry_json.at("average_ooo_bypassed_parents_per_query") == 3.0);
   assert(telemetry_json.at("dynamic_code_cache_hits") == 89);
   assert(telemetry_json.at("dynamic_code_batch_deduplicated") == 4);
   assert(std::abs(telemetry_json.at("dynamic_code_cache_hit_ratio").get<double>() -
@@ -193,6 +223,13 @@ void test_recall_and_report_formatting() {
   assert(formatted.text.find(
            "GPU Beam merge total/prepare/sort/materialize us:") !=
          std::string::npos);
+  assert(formatted.text.find(
+           "DynaExtent short/full/bytes/fallback/promotions/demotions: "
+           "8/3/2000/1/2/4") != std::string::npos);
+  assert(formatted.text.find(
+           "DynaExtent snapshot-attempts/nonfallback-full-attempts/"
+           "short-physical-ratio/fallback-ratio/"
+           "bytes-per-physical-read: 11/2/") != std::string::npos);
 }
 
 void test_dynamic_cache_telemetry_reset_preserves_lifetime_gauges() {
@@ -202,12 +239,31 @@ void test_dynamic_cache_telemetry_reset_preserves_lifetime_gauges() {
     5, std::memory_order_relaxed);
   telemetry.dynamic_code_cache_occupied.store(123, std::memory_order_relaxed);
   telemetry.dynamic_code_cache_capacity.store(256, std::memory_order_relaxed);
+  telemetry.dynamic_graph_short_reads.store(11, std::memory_order_relaxed);
+  telemetry.dynamic_graph_full_reads.store(12, std::memory_order_relaxed);
+  telemetry.dynamic_graph_read_bytes.store(13, std::memory_order_relaxed);
+  telemetry.dynamic_graph_fallback_reads.store(14, std::memory_order_relaxed);
+  telemetry.dynamic_graph_hint_promotions.store(15, std::memory_order_relaxed);
+  telemetry.dynamic_graph_hint_demotions.store(16, std::memory_order_relaxed);
+  const auto before_reset = telemetry.snapshot();
+  assert(before_reset.dynamic_graph_short_reads == 11);
+  assert(before_reset.dynamic_graph_full_reads == 12);
+  assert(before_reset.dynamic_graph_read_bytes == 13);
+  assert(before_reset.dynamic_graph_fallback_reads == 14);
+  assert(before_reset.dynamic_graph_hint_promotions == 15);
+  assert(before_reset.dynamic_graph_hint_demotions == 16);
   telemetry.reset();
   const auto snapshot = telemetry.snapshot();
   assert(snapshot.dynamic_code_cache_hits == 0);
   assert(snapshot.dynamic_code_cache_publish_successes == 0);
   assert(snapshot.dynamic_code_cache_occupied == 123);
   assert(snapshot.dynamic_code_cache_capacity == 256);
+  assert(snapshot.dynamic_graph_short_reads == 0);
+  assert(snapshot.dynamic_graph_full_reads == 0);
+  assert(snapshot.dynamic_graph_read_bytes == 0);
+  assert(snapshot.dynamic_graph_fallback_reads == 0);
+  assert(snapshot.dynamic_graph_hint_promotions == 0);
+  assert(snapshot.dynamic_graph_hint_demotions == 0);
 }
 
 void test_base_only_recall_filter() {

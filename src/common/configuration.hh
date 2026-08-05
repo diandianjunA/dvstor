@@ -53,6 +53,9 @@ public:
   // Zero selects the workspace/beam-limited speculative issue cap.
   u32 gpu_graph_issue_width{};
   str gpu_query_graph_read_policy{"fixed"};
+  // Keep dynamic-node extent prediction independently ablatable from the
+  // base-node Live-Extent sidecar. Fixed graph reads ignore this switch.
+  bool gpu_dynamic_graph_extent{true};
   str gpu_query_beam_merge_policy{"legacy"};
   str query_rdma_trace_mode{"off"};
   u32 query_rdma_trace_sample_rate{1000};
@@ -221,6 +224,11 @@ private:
        po::value<str>(&gpu_query_graph_read_policy)
          ->default_value(gpu_query_graph_read_policy),
        "GPU graph-record transfer policy: fixed or live-extent.")
+      ("gpu-dynamic-graph-extent",
+       po::value<bool>(&gpu_dynamic_graph_extent)
+         ->default_value(gpu_dynamic_graph_extent),
+       "Use incarnation-tagged dynamic-node extent hints when Live-Extent "
+       "graph reads are enabled.")
       ("gpu-query-beam-merge-policy",
        po::value<str>(&gpu_query_beam_merge_policy)
          ->default_value(gpu_query_beam_merge_policy),

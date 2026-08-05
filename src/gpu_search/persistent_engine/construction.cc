@@ -178,7 +178,8 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
   node_record_stride = static_cast<u32>(align_up(
     static_cast<u64>(node_record_bytes) + sizeof(u64), alignof(u64)));
   dynamic_code_record_bytes =
-    VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES + code_bytes;
+    VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES + code_bytes +
+      VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES;
   const u64 storage_region_bytes =
     static_cast<u64>(config.mn_memory_gb) << 30;
   const u64 centroid_publication_bytes =
@@ -856,9 +857,14 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
       << config.gpu_query_graph_read_policy
       << "\",\"graph_extent_quantum\":"
       << format::kGraphExtentQuantum
+      << ",\"dynamic_graph_extent_enabled\":"
+      << (live_extent_graph_reads && config.gpu_dynamic_graph_extent
+            ? "true" : "false")
       << ",\"graph_extent_source\":\""
       << (live_extent_graph_reads
-            ? "offline_global_ordinal_gextent8"
+            ? (config.gpu_dynamic_graph_extent
+                 ? "static_gextent8_plus_dynamic_incarnation_tag"
+                 : "offline_global_ordinal_gextent8")
             : "fixed_physical_record")
       << "\"}\n";
   }
@@ -953,6 +959,8 @@ PersistentSearchEngine::Impl::Impl(PersistentSearchEngine& owner,
     .stop = stop_device,
     .graph_scratch = d_graph_scratch,
     .graph_extent_class_words = d_graph_extent_class_words,
+    .dynamic_graph_extent_enabled =
+      live_extent_graph_reads && config.gpu_dynamic_graph_extent ? 1u : 0u,
     .graph_request_bytes = d_graph_request_bytes,
     .speculative_graph_request_shards =
       d_speculative_graph_request_shards,

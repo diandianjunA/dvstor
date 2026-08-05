@@ -57,6 +57,18 @@ TelemetrySnapshot Telemetry::snapshot() const {
       graph_extent_underhint_reads.load(std::memory_order_relaxed),
     .graph_extent_hint_promotions =
       graph_extent_hint_promotions.load(std::memory_order_relaxed),
+    .dynamic_graph_short_reads =
+      dynamic_graph_short_reads.load(std::memory_order_relaxed),
+    .dynamic_graph_full_reads =
+      dynamic_graph_full_reads.load(std::memory_order_relaxed),
+    .dynamic_graph_read_bytes =
+      dynamic_graph_read_bytes.load(std::memory_order_relaxed),
+    .dynamic_graph_fallback_reads =
+      dynamic_graph_fallback_reads.load(std::memory_order_relaxed),
+    .dynamic_graph_hint_promotions =
+      dynamic_graph_hint_promotions.load(std::memory_order_relaxed),
+    .dynamic_graph_hint_demotions =
+      dynamic_graph_hint_demotions.load(std::memory_order_relaxed),
     .logical_expansions =
       logical_expansions.load(std::memory_order_relaxed),
     .critical_graph_reads =
@@ -138,6 +150,8 @@ TelemetrySnapshot Telemetry::snapshot() const {
       ordered_score_batches.load(std::memory_order_relaxed),
     .ordered_score_candidates =
       ordered_score_candidates.load(std::memory_order_relaxed),
+    .ooo_bypassed_parents =
+      ooo_bypassed_parents.load(std::memory_order_relaxed),
     .frontier_reusable_prefix_ranks =
       frontier_reusable_prefix_ranks.load(std::memory_order_relaxed),
     .frontier_reusable_full_prefix_certificates =
@@ -288,6 +302,12 @@ void Telemetry::reset() {
   graph_extent_fallback_reads.store(0, std::memory_order_relaxed);
   graph_extent_underhint_reads.store(0, std::memory_order_relaxed);
   graph_extent_hint_promotions.store(0, std::memory_order_relaxed);
+  dynamic_graph_short_reads.store(0, std::memory_order_relaxed);
+  dynamic_graph_full_reads.store(0, std::memory_order_relaxed);
+  dynamic_graph_read_bytes.store(0, std::memory_order_relaxed);
+  dynamic_graph_fallback_reads.store(0, std::memory_order_relaxed);
+  dynamic_graph_hint_promotions.store(0, std::memory_order_relaxed);
+  dynamic_graph_hint_demotions.store(0, std::memory_order_relaxed);
   logical_expansions.store(0, std::memory_order_relaxed);
   critical_graph_reads.store(0, std::memory_order_relaxed);
   critical_graph_bytes.store(0, std::memory_order_relaxed);
@@ -332,6 +352,7 @@ void Telemetry::reset() {
   frontier_streamed_candidate_runs.store(0, std::memory_order_relaxed);
   ordered_score_batches.store(0, std::memory_order_relaxed);
   ordered_score_candidates.store(0, std::memory_order_relaxed);
+  ooo_bypassed_parents.store(0, std::memory_order_relaxed);
   frontier_reusable_prefix_ranks.store(0, std::memory_order_relaxed);
   frontier_reusable_full_prefix_certificates.store(
     0, std::memory_order_relaxed);

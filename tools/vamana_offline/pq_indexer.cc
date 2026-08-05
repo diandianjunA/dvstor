@@ -129,7 +129,7 @@ PersistentLayout make_persistent_layout(const nlohmann::json& metadata,
   const u64 dynamic_code_offset = static_cast<u64>(dynamic_hot_offset) + graph_entry_bytes;
   const u64 dynamic_record_bytes = gpu_search::format::align_up(
     dynamic_code_offset + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
-      code_bytes, 16);
+      code_bytes + VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES, 16);
   if (dynamic_code_offset > std::numeric_limits<u32>::max() ||
       dynamic_record_bytes == 0 ||
       dynamic_record_bytes > std::numeric_limits<u32>::max()) {
@@ -191,6 +191,8 @@ void apply_persistent_layout(nlohmann::json& metadata,
   metadata["dynamic_navigation_code_offset"] = layout.dynamic_code_offset;
   metadata["dynamic_navigation_code_validation_bytes"] =
     VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES;
+  metadata["dynamic_navigation_code_checksum_bytes"] =
+    VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES;
   metadata["navigation_code_materialization"] = "storage_startup_sidecar";
   metadata["navigation_graph_source"] = "storage_compact_graph";
   metadata["navigation_execution"] = "gpu_beam_v1";

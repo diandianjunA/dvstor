@@ -87,6 +87,8 @@ bool load_metadata(const filepath_t& index_prefix, Metadata& metadata, str* erro
       json.value("dynamic_navigation_code_offset", 0u);
     metadata.dynamic_navigation_code_validation_bytes =
       json.value("dynamic_navigation_code_validation_bytes", 0u);
+    metadata.dynamic_navigation_code_checksum_bytes =
+      json.value("dynamic_navigation_code_checksum_bytes", sizeof(u32));
     metadata.allocation_size = json.value("allocation_size", metadata.node_size);
     metadata.idmap_format = json.value("idmap_format", str{});
     metadata.centroid_state_format =

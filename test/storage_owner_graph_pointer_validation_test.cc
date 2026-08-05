@@ -20,13 +20,134 @@ int main() {
   const u32 dynamic_record_bytes = static_cast<u32>(
     VamanaNode::align_compact(
       dynamic_code_offset + VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
-      32));
+      32 + VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES));
   VamanaNode::configure_hot_graph(
     {0x2000, 0x4000}, {1, 1}, graph_bytes,
     vamana::hot_graph::shard_bits_for(kShardCount),
     {kDynamicBase, kDynamicBase}, dynamic_record_bytes,
     dynamic_hot_offset, dynamic_code_offset, 32);
   assert(VamanaNode::HAS_HOT_GRAPH);
+  assert(VamanaNode::HOT_GRAPH_DYNAMIC_CODE_OFFSET ==
+         VamanaNode::HOT_GRAPH_DYNAMIC_HOT_OFFSET + graph_bytes);
+
+  // Publication size is selected from the handle incarnation, so the handle
+  // kind must agree with the physical record plane.  In particular, a tagged
+  // handle forged over an immutable slot must never append a dynamic tag to
+  // the following compact graph record, and incarnation zero cannot name a
+  // recyclable dynamic slot.
+  const RemotePtr valid_base{0, vamana::hot_graph::kNodeBaseOffset, 0};
+  const RemotePtr tagged_base{0, vamana::hot_graph::kNodeBaseOffset, 1};
+  const RemotePtr valid_dynamic{0, kDynamicBase, 1};
+  const RemotePtr untagged_dynamic{0, kDynamicBase, 0};
+  assert(VamanaNode::hot_graph_record_kind_matches(valid_base));
+  assert(!VamanaNode::hot_graph_record_kind_matches(tagged_base));
+  assert(VamanaNode::hot_graph_record_kind_matches(valid_dynamic));
+  assert(!VamanaNode::hot_graph_record_kind_matches(untagged_dynamic));
+
+  // DynaExtent reuses the existing four-byte PQ validation prefix for the
+  // extent hint.  A four-byte incarnation-bound trailer closes torn PQ reads;
+  // in the production R96/PQ32 layout it consumes existing alignment padding,
+  // so neither the physical dynamic-record stride nor update WQE count grows.
+  static_assert(VamanaNode::DYNAMIC_CODE_TAG_BYTES == sizeof(u32));
+  static_assert(VamanaNode::DYNAMIC_CODE_INCARNATION_MASK == 0x00ffffffu);
+  assert(VamanaNode::graph_extent_class(0, 0) == 0);
+  assert(VamanaNode::graph_extent_class(8, 0) == 1);
+  assert(VamanaNode::graph_extent_class(8, 1) == 2);
+  assert(VamanaNode::graph_extent_class(96, 6) == 13);
+  constexpr u32 dynamic_tag = VamanaNode::pack_dynamic_navigation_tag(
+    0x00abc123u, 13);
+  static_assert(VamanaNode::dynamic_navigation_tag_incarnation(dynamic_tag) ==
+                0x00abc123u);
+  static_assert(VamanaNode::dynamic_navigation_tag_extent_class(dynamic_tag) ==
+                13);
+  static_assert((dynamic_tag & 0x80000000u) == 0);
+  constexpr u32 unknown_tag = VamanaNode::pack_dynamic_navigation_tag(
+    RemotePtr::MAX_INCARNATION,
+    VamanaNode::DYNAMIC_CODE_EXTENT_CLASS_UNKNOWN);
+  static_assert((unknown_tag & 0x80000000u) == 0);
+
+  // Exercise the production serializer used by dynamic graph updates and
+  // remote inserts. Reusing one dirty buffer is intentional: shrink must erase
+  // neighbors left by a previous larger publication, while the following PQ
+  // payload must remain untouched in every lifecycle state.
+  assert(VamanaNode::dynamic_graph_publication_layout_valid());
+  const size_t publication_bytes =
+    VamanaNode::dynamic_graph_publication_size();
+  assert(publication_bytes ==
+         graph_bytes + VamanaNode::DYNAMIC_CODE_TAG_BYTES);
+  constexpr byte_t kPqGuard = 0xa5u;
+  std::vector<byte_t> dynamic_tail(publication_bytes + 32, kPqGuard);
+  std::vector<byte_t> dynamic_decoded_graph(
+    VamanaNode::neighbor_read_size());
+  const std::vector<RemotePtr> stable_neighbors{
+    RemotePtr{0, 0x2000}, RemotePtr{0, 0x2010},
+    RemotePtr{0, 0x2020}, RemotePtr{0, 0x2030},
+    RemotePtr{0, 0x2040}, RemotePtr{0, 0x2050},
+    RemotePtr{0, 0x2060}, RemotePtr{0, 0x2070},
+    RemotePtr{0, 0x2080}};
+  const std::vector<RemotePtr> provisional_neighbors{
+    RemotePtr{1, 0x3000}, RemotePtr{1, 0x3010}};
+
+  const auto verify_publication = [&](size_t stable_count,
+                                      size_t provisional_count,
+                                      u32 incarnation,
+                                      bool deleted) {
+    assert(dynamic_tail[0] == stable_count);
+    assert(vamana::hot_graph::provisional_count(dynamic_tail.data()) ==
+           provisional_count);
+    assert(((dynamic_tail[1] & VamanaNode::HOT_GRAPH_DELETED) != 0) ==
+           deleted);
+    assert(vamana::hot_graph::load_u32_le(dynamic_tail.data() + 8) ==
+           incarnation);
+    assert(vamana::hot_graph::load_u16_le(dynamic_tail.data() + 2) ==
+           vamana::hot_graph::checksum16(dynamic_tail.data(), graph_bytes));
+    const u32 tag = vamana::hot_graph::load_u32_le(
+      dynamic_tail.data() + graph_bytes);
+    assert(VamanaNode::dynamic_navigation_tag_incarnation(tag) ==
+           incarnation);
+    assert(VamanaNode::dynamic_navigation_tag_extent_class(tag) ==
+           VamanaNode::graph_extent_class(
+             static_cast<u32>(stable_count),
+             static_cast<u32>(provisional_count)));
+    const size_t live_count = stable_count + provisional_count;
+    for (size_t byte = vamana::hot_graph::neighbor_offset(
+           static_cast<u32>(live_count));
+         byte < graph_bytes; ++byte) {
+      assert(dynamic_tail[byte] == 0);
+    }
+    for (size_t byte = publication_bytes;
+         byte < dynamic_tail.size(); ++byte) {
+      assert(dynamic_tail[byte] == kPqGuard);
+    }
+    assert(VamanaNode::decode_hot_graph_entry(
+      dynamic_tail.data(), dynamic_decoded_graph.data(), incarnation));
+    assert(VamanaNode::decoded_neighbor_count(dynamic_decoded_graph.data()) ==
+           (deleted ? 0 : live_count));
+  };
+
+  // Grow across an eight-edge class boundary.
+  assert(VamanaNode::encode_dynamic_graph_publication(
+    dynamic_tail.data(), dynamic_tail.size(), stable_neighbors.data(), 3,
+    provisional_neighbors.data(), 1, 11, false, 7));
+  verify_publication(3, 1, 7, false);
+  assert(VamanaNode::encode_dynamic_graph_publication(
+    dynamic_tail.data(), dynamic_tail.size(), stable_neighbors.data(), 9,
+    provisional_neighbors.data(), 2, 12, false, 7));
+  verify_publication(9, 2, 7, false);
+
+  // Shrink must clear the previously published counted suffix.
+  assert(VamanaNode::encode_dynamic_graph_publication(
+    dynamic_tail.data(), dynamic_tail.size(), stable_neighbors.data(), 1,
+    nullptr, 0, 13, false, 7));
+  verify_publication(1, 0, 7, false);
+
+  // A tombstone retains its preserved adjacency and class for cleanup, while
+  // readers decode the deleted record as an empty adjacency. Re-incarnation
+  // must replace the low-24-bit identity in the same publication.
+  assert(VamanaNode::encode_dynamic_graph_publication(
+    dynamic_tail.data(), dynamic_tail.size(), stable_neighbors.data(), 3,
+    provisional_neighbors.data(), 2, 14, true, 8));
+  verify_publication(3, 2, 8, true);
 
   const RemotePtr immutable_base{
     0, vamana::hot_graph::kNodeBaseOffset, 0};

@@ -392,11 +392,12 @@ bool validate_view(const View& view, std::string* error) {
         shard.dynamic_hot_offset > shard.dynamic_record_bytes ||
         view.layout.graph_entry_bytes >
           shard.dynamic_record_bytes - shard.dynamic_hot_offset ||
-        shard.dynamic_code_offset <
+        shard.dynamic_code_offset !=
           shard.dynamic_hot_offset + view.layout.graph_entry_bytes ||
         shard.dynamic_code_offset > shard.dynamic_record_bytes ||
         VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES +
-          static_cast<u64>(view.layout.code_bytes) >
+          static_cast<u64>(view.layout.code_bytes) +
+          VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES >
           shard.dynamic_record_bytes - shard.dynamic_code_offset ||
         shard.code_remote_offset !=
           shard.control_remote_offset + kStorageControlBytes ||
@@ -497,6 +498,12 @@ bool synthesize_distributed_view(
         VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES) {
       throw std::runtime_error(
         "GPU navigation metadata lacks dynamic slot-incarnation validation");
+    }
+    if (metadata.value("dynamic_navigation_code_checksum_bytes",
+                       VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES) !=
+        VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES) {
+      throw std::runtime_error(
+        "GPU navigation metadata has an incompatible dynamic PQ checksum");
     }
     u64 node_count = 0;
     for (u32 shard = 0; shard < shard_count; ++shard) {

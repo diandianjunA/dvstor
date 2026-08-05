@@ -122,8 +122,18 @@ struct CriticalReservationResult {
   u32 protected_feedback_stale{};
 };
 
+struct UnderhintForceFullResult {
+  u32 failed{};
+  u32 any_with_underhint{};
+  u32 any_without_underhint{};
+  u8 selected_force_full[4]{};
+  u8 positional_force_full[4]{};
+  u8 general_force_full[4]{};
+  u8 certified_force_full[4]{};
+};
+
 struct OwnerValidationFixture {
-  alignas(16) u8 records[3][32]{};
+  alignas(16) u8 records[4][32]{};
   u32 shards[kPersistentFrontierRobCapacity]{};
   u32 unrelated_shards[kPersistentFrontierRobCapacity]{};
   u64 offsets[kPersistentFrontierRobCapacity]{};
@@ -131,6 +141,13 @@ struct OwnerValidationFixture {
   u64 handles[kPersistentFrontierRobCapacity]{};
   u32 bytes[kPersistentFrontierRobCapacity]{};
   u8 states[kPersistentFrontierRobCapacity]{};
+};
+
+struct DynamicUnknownValidationFixture {
+  gpu_search::DeviceShardRegion shard{};
+  alignas(16) u8 record[gpu_search::kPersistentGraphReadBytes]{};
+  u32 arena_state{};
+  u32 output[3]{};
 };
 
 void check_cuda(cudaError_t status, const char* operation) {
@@ -1264,11 +1281,155 @@ __global__ void rob_fast_path_cycle_kernel(
   if (threadIdx.x == 0) output->iterations = iterations;
 }
 
+__global__ void underhint_force_full_mapping_kernel(
+    UnderhintForceFullResult* output) {
+  __shared__ FrontierRobEntry rob[kPersistentFrontierRobCapacity];
+  __shared__ u64 selected_handles[kPersistentFrontierRobCapacity];
+  __shared__ u8 selected_force_full[kPersistentFrontierRobCapacity];
+  __shared__ u32 certified_rob_slots[kPersistentFrontierRobCapacity];
+  __shared__ u32 critical_to_commit[kPersistentFrontierRobCapacity];
+  __shared__ u8 critical_force_full[kPersistentFrontierRobCapacity];
+  __shared__ u32 any_force_full;
+
+  const u32 lane = threadIdx.x;
+  if (lane < kPersistentFrontierRobCapacity) {
+    rob[lane] = {};
+    selected_handles[lane] = kInvalidDeviceHandle;
+    selected_force_full[lane] = 0xffu;
+    certified_rob_slots[lane] = UINT32_MAX;
+    critical_to_commit[lane] = UINT32_MAX;
+    critical_force_full[lane] = 0xffu;
+  }
+  if (lane == 0) {
+    *output = {};
+    selected_handles[0] =
+      (u64{7} << gpu_search::kRemoteIncarnationShift) | 101u;
+    selected_handles[1] =
+      (u64{8} << gpu_search::kRemoteIncarnationShift) | 102u;
+    selected_handles[2] =
+      (u64{9} << gpu_search::kRemoteIncarnationShift) | 103u;
+    selected_handles[3] =
+      (u64{10} << gpu_search::kRemoteIncarnationShift) | 104u;
+
+    rob[0].node_handle = selected_handles[0];
+    rob[0].state = static_cast<u8>(FrontierRequestState::stale);
+    rob[0].validation =
+      static_cast<u8>(FrontierValidationState::extent_underhint);
+
+    rob[1].node_handle = selected_handles[1];
+    rob[1].state = static_cast<u8>(FrontierRequestState::stale);
+    rob[1].validation =
+      static_cast<u8>(FrontierValidationState::invalid_snapshot);
+
+    rob[2].node_handle = selected_handles[2];
+    rob[2].state = static_cast<u8>(FrontierRequestState::stale);
+    rob[2].validation =
+      static_cast<u8>(FrontierValidationState::stale_incarnation);
+
+    // Same physical low bits, but a different incarnation: never evidence for
+    // selected_handles[2], even on the associative or certified lookup path.
+    rob[23].node_handle =
+      (u64{11} << gpu_search::kRemoteIncarnationShift) | 103u;
+    rob[23].state = static_cast<u8>(FrontierRequestState::stale);
+    rob[23].validation =
+      static_cast<u8>(FrontierValidationState::extent_underhint);
+
+    certified_rob_slots[0] = 0;
+    certified_rob_slots[1] = 1;
+    certified_rob_slots[2] = 23;
+    certified_rob_slots[3] = 31;
+  }
+  __syncthreads();
+
+  identify_selected_underhint_force_full(
+    selected_handles, 4, rob, certified_rob_slots,
+    UnderhintLookupMode::positional, selected_force_full,
+    &any_force_full);
+  if (lane == 0) output->any_with_underhint = any_force_full;
+  if (lane < 4) {
+    output->selected_force_full[lane] = selected_force_full[lane];
+  }
+
+  // Positional core compaction preserves commit order.
+  if (lane < 4) critical_to_commit[lane] = lane;
+  __syncthreads();
+  remap_critical_underhint_force_full(
+    selected_force_full, 4, critical_to_commit, 4,
+    critical_force_full);
+  if (lane < 4) {
+    output->positional_force_full[lane] = critical_force_full[lane];
+  }
+
+  // General ROB reconciliation may compact misses in a different order.
+  identify_selected_underhint_force_full(
+    selected_handles, 4, rob, certified_rob_slots,
+    UnderhintLookupMode::associative, selected_force_full,
+    &any_force_full);
+  if (lane == 0) {
+    critical_to_commit[0] = 2;
+    critical_to_commit[1] = 0;
+    critical_to_commit[2] = 3;
+    critical_to_commit[3] = 1;
+  }
+  __syncthreads();
+  remap_critical_underhint_force_full(
+    selected_force_full, 4, critical_to_commit, 4,
+    critical_force_full);
+  if (lane < 4) {
+    output->general_force_full[lane] = critical_force_full[lane];
+  }
+
+  // A reusable certificate supplies the same position map through its own
+  // reconciliation path; the common post-compaction remap remains exact.
+  identify_selected_underhint_force_full(
+    selected_handles, 4, rob, certified_rob_slots,
+    UnderhintLookupMode::certified, selected_force_full,
+    &any_force_full);
+  if (lane == 0) {
+    critical_to_commit[0] = 1;
+    critical_to_commit[1] = 2;
+    critical_to_commit[2] = 3;
+    critical_to_commit[3] = 0;
+  }
+  __syncthreads();
+  remap_critical_underhint_force_full(
+    selected_force_full, 4, critical_to_commit, 4,
+    critical_force_full);
+  if (lane < 4) {
+    output->certified_force_full[lane] = critical_force_full[lane];
+  }
+  if (lane == 0) {
+    rob[0].validation =
+      static_cast<u8>(FrontierValidationState::invalid_snapshot);
+    rob[23].validation =
+      static_cast<u8>(FrontierValidationState::invalid_snapshot);
+  }
+  __syncthreads();
+  identify_selected_underhint_force_full(
+    selected_handles, 4, rob, certified_rob_slots,
+    UnderhintLookupMode::associative, selected_force_full,
+    &any_force_full);
+  if (lane == 0) output->any_without_underhint = any_force_full;
+}
+
 __global__ void owner_validation_kernel(
     PersistentKernelParams params, DirectBatchDescriptor descriptor,
     u32 memory_node) {
   validate_frontier_owner_batch(
     params, descriptor, memory_node, threadIdx.x & 31u);
+}
+
+__global__ void dynamic_unknown_validation_kernel(
+    PersistentKernelParams params,
+    FrontierRobEntry entry,
+    u32* output) {
+  if (threadIdx.x != 0 || blockIdx.x != 0) return;
+  __shared__ DynamicGraphTelemetry telemetry;
+  telemetry = {};
+  output[0] = static_cast<u32>(validate_frontier_record_local(
+    params, 0, entry, &telemetry));
+  output[1] = load_dynamic_graph_extent_class(params, entry.node_handle);
+  output[2] = telemetry.hint_demotions;
 }
 
 void store_u32(u8* destination, u32 value) {
@@ -1375,6 +1536,13 @@ bool run_owner_validation_test() {
   finalize_graph_record(fixture->records[2]);
   fixture->records[2][16] ^= 1u;
 
+  // A readable header whose two neighbors do not fit in the transferred
+  // 16-byte prefix. It may request a query-local full retry, but it is not a
+  // checksum-authoritative snapshot and cannot repair a global hint.
+  fixture->records[3][0] = 2;
+  store_u32(fixture->records[3] + 8, 0);
+  finalize_graph_record(fixture->records[3]);
+
   for (u32 index = 0; index < kPersistentFrontierRobCapacity; ++index) {
     fixture->shards[index] = memory_node;
     fixture->unrelated_shards[index] = memory_node;
@@ -1384,12 +1552,15 @@ bool run_owner_validation_test() {
   fixture->local_iovas[0] = 0;
   fixture->local_iovas[1] = 32;
   fixture->local_iovas[2] = 64;
+  fixture->local_iovas[3] = 96;
   fixture->handles[0] = static_handle;
   fixture->handles[1] = dynamic_handle;
   fixture->handles[2] = static_handle;
+  fixture->handles[3] = static_handle;
   fixture->bytes[0] = 24;
   fixture->bytes[1] = 32;
   fixture->bytes[2] = 32;
+  fixture->bytes[3] = 16;
 
   PersistentKernelParams params{};
   params.query_slots = 1;
@@ -1410,7 +1581,7 @@ bool run_owner_validation_test() {
   descriptor.remote_offsets = fixture->offsets;
   descriptor.local_iova_offsets = fixture->local_iovas;
   descriptor.request_bytes = fixture->bytes;
-  descriptor.request_count = 3;
+  descriptor.request_count = 4;
   descriptor.bytes = 32;
   owner_validation_kernel<<<1, 32>>>(
     params, descriptor, memory_node);
@@ -1424,17 +1595,19 @@ bool run_owner_validation_test() {
     fixture->states[1] ==
       static_cast<u8>(FrontierValidationState::stale_incarnation) &&
     fixture->states[2] ==
-      static_cast<u8>(FrontierValidationState::invalid_snapshot);
+      static_cast<u8>(FrontierValidationState::invalid_snapshot) &&
+    fixture->states[3] ==
+      static_cast<u8>(FrontierValidationState::extent_underhint);
 
   // Pointer identity is the descriptor type tag. A generic descriptor with
   // look-alike arrays must not write the frontier validation SoA.
-  fixture->states[3] =
+  fixture->states[4] =
     static_cast<u8>(FrontierValidationState::unknown);
   descriptor.request_shards = fixture->unrelated_shards;
   descriptor.request_count = 1;
-  descriptor.remote_offsets = fixture->offsets + 3;
-  descriptor.local_iova_offsets = fixture->local_iovas + 3;
-  descriptor.request_bytes = fixture->bytes + 3;
+  descriptor.remote_offsets = fixture->offsets + 4;
+  descriptor.local_iova_offsets = fixture->local_iovas + 4;
+  descriptor.request_bytes = fixture->bytes + 4;
   owner_validation_kernel<<<1, 32>>>(
     params, descriptor, memory_node);
   check_cuda(cudaGetLastError(),
@@ -1442,10 +1615,107 @@ bool run_owner_validation_test() {
   check_cuda(cudaDeviceSynchronize(),
              "owner_validation_identity_kernel synchronize");
   const bool identity_guard =
-    fixture->states[3] ==
+    fixture->states[4] ==
       static_cast<u8>(FrontierValidationState::unknown);
   check_cuda(cudaFree(fixture), "cudaFree owner validation");
   return classified && identity_guard;
+}
+
+bool run_dynamic_unknown_validation_test() {
+  DynamicUnknownValidationFixture* fixture = nullptr;
+  check_cuda(cudaMallocManaged(
+               reinterpret_cast<void**>(&fixture),
+               sizeof(DynamicUnknownValidationFixture)),
+             "cudaMallocManaged dynamic unknown validation");
+  std::memset(fixture, 0, sizeof(*fixture));
+
+  constexpr u64 dynamic_offset = 0x4000;
+  constexpr u32 incarnation = 7;
+  fixture->shard = {
+    .dynamic_base_offset = dynamic_offset,
+    .memory_node = 0,
+    .dynamic_record_bytes = 1040,
+    .dynamic_hot_offset = 160,
+    .dynamic_arena_base_slot = 0,
+    .dynamic_arena_slot_count = 1,
+  };
+  const u64 handle =
+    (static_cast<u64>(incarnation) <<
+       gpu_search::kRemoteIncarnationShift) |
+    (dynamic_offset >> 4);
+  FrontierRobEntry entry{};
+  entry.node_handle = handle;
+  entry.scratch_slot = 0;
+  entry.transfer_bytes = 32;
+
+  PersistentKernelParams params{};
+  params.shards = &fixture->shard;
+  params.num_shards = 1;
+  params.graph_degree = 2;
+  params.graph_entry_capacity = 2;
+  params.graph_entry_bytes = 32;
+  params.graph_scratch = fixture->record;
+  params.dynamic_graph_extent_enabled = 1;
+  params.dynamic_code_arena_states = &fixture->arena_state;
+  params.dynamic_code_arena_capacity = 1;
+
+  const auto reset_unknown = [&] {
+    fixture->arena_state = gpu_search::make_dynamic_code_tag(
+      incarnation, gpu_search::kPersistentDynamicCodeArenaUnknownExtent);
+    std::memset(fixture->output, 0, sizeof(fixture->output));
+  };
+  const auto launch = [&] {
+    dynamic_unknown_validation_kernel<<<1, 1>>>(
+      params, entry, fixture->output);
+    check_cuda(cudaGetLastError(),
+               "dynamic_unknown_validation_kernel launch");
+    check_cuda(cudaDeviceSynchronize(),
+               "dynamic_unknown_validation_kernel synchronize");
+  };
+
+  // A real checksum-valid full snapshot is the sole authority allowed to
+  // refine a resident same-incarnation UNKNOWN hint. This initialization is
+  // deliberately not reported as graph shrinkage.
+  fixture->record[0] = 1;
+  store_u32(fixture->record + 8, incarnation);
+  finalize_graph_record(fixture->record);
+  reset_unknown();
+  launch();
+  const bool valid_refined =
+    fixture->output[0] ==
+      static_cast<u32>(FrontierValidationState::valid) &&
+    fixture->output[1] == 1 && fixture->output[2] == 0;
+
+  // Neither a corrupt snapshot nor a valid snapshot of a recycled
+  // incarnation may turn the advisory state into a cache hit for old data.
+  reset_unknown();
+  fixture->record[16] ^= 1u;
+  launch();
+  const bool corrupt_retained =
+    fixture->output[0] ==
+      static_cast<u32>(FrontierValidationState::invalid_snapshot) &&
+    fixture->output[1] ==
+      gpu_search::kPersistentDynamicCodeArenaUnknownExtent &&
+    fixture->arena_state == gpu_search::make_dynamic_code_tag(
+      incarnation, gpu_search::kPersistentDynamicCodeArenaUnknownExtent);
+
+  std::memset(fixture->record, 0, sizeof(fixture->record));
+  fixture->record[0] = 1;
+  store_u32(fixture->record + 8, incarnation + 1);
+  finalize_graph_record(fixture->record);
+  reset_unknown();
+  launch();
+  const bool stale_retained =
+    fixture->output[0] ==
+      static_cast<u32>(FrontierValidationState::stale_incarnation) &&
+    fixture->output[1] ==
+      gpu_search::kPersistentDynamicCodeArenaUnknownExtent &&
+    fixture->arena_state == gpu_search::make_dynamic_code_tag(
+      incarnation, gpu_search::kPersistentDynamicCodeArenaUnknownExtent);
+
+  check_cuda(cudaFree(fixture),
+             "cudaFree dynamic unknown validation");
+  return valid_refined && corrupt_retained && stale_retained;
 }
 
 }  // namespace
@@ -1463,6 +1733,7 @@ int main() {
   LogicalHoleResult* device_logical_hole = nullptr;
   CertifiedReconcileResult* device_certified = nullptr;
   CriticalReservationResult* device_reservation = nullptr;
+  UnderhintForceFullResult* device_underhint = nullptr;
   check_cuda(cudaMalloc(reinterpret_cast<void**>(&device_result),
                         2 * sizeof(RobTestResult)), "cudaMalloc");
   check_cuda(cudaMalloc(reinterpret_cast<void**>(&device_cycles),
@@ -1479,6 +1750,9 @@ int main() {
   check_cuda(cudaMalloc(reinterpret_cast<void**>(&device_reservation),
                         sizeof(CriticalReservationResult)),
              "cudaMalloc critical reservation");
+  check_cuda(cudaMalloc(reinterpret_cast<void**>(&device_underhint),
+                        sizeof(UnderhintForceFullResult)),
+             "cudaMalloc underhint force-full");
   rob_test_kernel<<<1, 128>>>(device_result, false);
   check_cuda(cudaGetLastError(), "rob_test_kernel launch");
   rob_test_kernel<<<1, 128>>>(device_result + 1, true);
@@ -1500,6 +1774,9 @@ int main() {
   critical_reservation_test_kernel<<<1, 32>>>(device_reservation);
   check_cuda(cudaGetLastError(),
              "critical_reservation_test_kernel launch");
+  underhint_force_full_mapping_kernel<<<1, 32>>>(device_underhint);
+  check_cuda(cudaGetLastError(),
+             "underhint_force_full_mapping_kernel launch");
   check_cuda(cudaDeviceSynchronize(), "rob_test_kernel synchronize");
   RobTestResult results[2]{};
   RobFastPathCycleResult cycles{};
@@ -1507,6 +1784,7 @@ int main() {
   LogicalHoleResult logical_hole{};
   CertifiedReconcileResult certified[2]{};
   CriticalReservationResult reservation{};
+  UnderhintForceFullResult underhint{};
   check_cuda(cudaMemcpy(results, device_result, sizeof(results),
                         cudaMemcpyDeviceToHost), "cudaMemcpy D2H");
   check_cuda(cudaMemcpy(&cycles, device_cycles, sizeof(cycles),
@@ -1524,6 +1802,10 @@ int main() {
                &reservation, device_reservation, sizeof(reservation),
                cudaMemcpyDeviceToHost),
              "cudaMemcpy critical reservation D2H");
+  check_cuda(cudaMemcpy(
+               &underhint, device_underhint, sizeof(underhint),
+               cudaMemcpyDeviceToHost),
+             "cudaMemcpy underhint force-full D2H");
   check_cuda(cudaFree(device_result), "cudaFree");
   check_cuda(cudaFree(device_cycles), "cudaFree cycles");
   check_cuda(cudaFree(device_early), "cudaFree early");
@@ -1531,6 +1813,8 @@ int main() {
   check_cuda(cudaFree(device_certified), "cudaFree certified");
   check_cuda(cudaFree(device_reservation),
              "cudaFree critical reservation");
+  check_cuda(cudaFree(device_underhint),
+             "cudaFree underhint force-full");
   const RobTestResult& result = results[0];
   const RobTestResult& waste = results[1];
   if (result.failed != 0 || result.first_issue_count != 17 ||
@@ -1697,6 +1981,39 @@ int main() {
       << reservation.protected_feedback_stale << '\n';
     return 1;
   }
+  constexpr u8 expected_selected_force[4]{1, 0, 0, 0};
+  constexpr u8 expected_positional_force[4]{1, 0, 0, 0};
+  constexpr u8 expected_general_force[4]{0, 1, 0, 0};
+  constexpr u8 expected_certified_force[4]{0, 0, 0, 1};
+  if (underhint.any_with_underhint != 1 ||
+      underhint.any_without_underhint != 0) {
+    std::cerr << "underhint any-gate mismatch with/without="
+              << underhint.any_with_underhint << '/'
+              << underhint.any_without_underhint << '\n';
+    return 1;
+  }
+  for (u32 index = 0; index < 4; ++index) {
+    if (underhint.selected_force_full[index] !=
+          expected_selected_force[index] ||
+        underhint.positional_force_full[index] !=
+          expected_positional_force[index] ||
+        underhint.general_force_full[index] !=
+          expected_general_force[index] ||
+        underhint.certified_force_full[index] !=
+          expected_certified_force[index]) {
+      std::cerr << "underhint force-full mapping mismatch index=" << index
+                << " selected/positional/general/certified="
+                << static_cast<u32>(underhint.selected_force_full[index])
+                << '/'
+                << static_cast<u32>(underhint.positional_force_full[index])
+                << '/'
+                << static_cast<u32>(underhint.general_force_full[index])
+                << '/'
+                << static_cast<u32>(underhint.certified_force_full[index])
+                << '\n';
+      return 1;
+    }
+  }
   if (cycles.failed != 0 || cycles.iterations == 0) {
     std::cerr << "frontier ROB fast-path cycle test failed="
               << cycles.failed << '\n';
@@ -1704,6 +2021,10 @@ int main() {
   }
   if (!run_owner_validation_test()) {
     std::cerr << "frontier owner validation mismatch\n";
+    return 1;
+  }
+  if (!run_dynamic_unknown_validation_test()) {
+    std::cerr << "dynamic UNKNOWN validation/refinement mismatch\n";
     return 1;
   }
   std::cout << "rob_fast_prepare_cycles="

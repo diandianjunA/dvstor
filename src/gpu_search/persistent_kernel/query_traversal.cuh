@@ -78,6 +78,90 @@ struct CertifiedCommitReconcileContext {
   TailFrontierFeedback* feedback{};
 };
 
+enum class UnderhintLookupMode : u8 {
+  positional = 0,
+  certified = 1,
+  associative = 2,
+};
+
+__device__ __forceinline__ bool is_exact_underhint_evidence(
+    const FrontierRobEntry& entry, u64 node_handle) {
+  return entry.node_handle == node_handle &&
+    entry.state == static_cast<u8>(FrontierRequestState::stale) &&
+    entry.validation ==
+      static_cast<u8>(FrontierValidationState::extent_underhint);
+}
+
+// Snapshot under-hint evidence before reconciliation clears stale ROB entries.
+// Positional core and reusable-certificate paths already own exact position to
+// ROB maps, so each lane checks only that one slot. Only the general/shadow
+// path pays the bounded associative lookup. Exact tagged-handle equality keeps
+// evidence query-local and prevents it from being mapped to a different
+// incarnation. A warp-wide precheck skips all handle matching in the common
+// case where this ROB contains no underhint evidence.
+__device__ __forceinline__ void identify_selected_underhint_force_full(
+    const u64* selected_handles,
+    u32 selected_count,
+    const FrontierRobEntry* frontier_rob,
+    const u32* certified_rob_slots,
+    UnderhintLookupMode lookup_mode,
+    u8* selected_force_full,
+    u32* any_force_full) {
+  if (threadIdx.x < kPersistentFrontierRobCapacity) {
+    const u32 position = threadIdx.x;
+    const FrontierRobEntry& lane_entry = frontier_rob[position];
+    const bool lane_has_underhint =
+      lane_entry.state == static_cast<u8>(FrontierRequestState::stale) &&
+      lane_entry.validation ==
+        static_cast<u8>(FrontierValidationState::extent_underhint);
+    const u32 underhint_mask = __ballot_sync(
+      0xffffffffu, lane_has_underhint);
+    if (position == 0) *any_force_full = underhint_mask != 0 ? 1u : 0u;
+    bool force_full = false;
+    if (underhint_mask != 0 && position < selected_count) {
+      const u64 handle = selected_handles[position];
+      if (lookup_mode == UnderhintLookupMode::positional) {
+        force_full =
+          is_exact_underhint_evidence(frontier_rob[position], handle);
+      } else if (lookup_mode == UnderhintLookupMode::certified) {
+        const u32 slot = certified_rob_slots[position];
+        force_full = slot < kPersistentFrontierRobCapacity &&
+          is_exact_underhint_evidence(frontier_rob[slot], handle);
+      } else {
+        for (u32 slot = 0; slot < kPersistentFrontierRobCapacity; ++slot) {
+          if (is_exact_underhint_evidence(frontier_rob[slot], handle)) {
+            force_full = true;
+            break;
+          }
+        }
+      }
+    }
+    if (underhint_mask != 0) {
+      selected_force_full[position] = force_full ? 1u : 0u;
+    }
+  }
+  __syncthreads();
+}
+
+// Every reconcile path publishes critical_fetch_to_commit. Re-indexing the
+// position-local evidence only after compaction avoids threading another flag
+// through each path and guarantees baseline misses are explicitly zeroed.
+__device__ __forceinline__ void remap_critical_underhint_force_full(
+    const u8* selected_force_full,
+    u32 selected_count,
+    const u32* critical_fetch_to_commit,
+    u32 critical_fetch_count,
+    u8* critical_force_full) {
+  for (u32 fetch = threadIdx.x; fetch < critical_fetch_count;
+       fetch += blockDim.x) {
+    const u32 position = critical_fetch_to_commit[fetch];
+    critical_force_full[fetch] =
+      position < selected_count && selected_force_full[position] != 0
+        ? 1u : 0u;
+  }
+  __syncthreads();
+}
+
 __device__ void set_query_trace_completion(
     const PersistentKernelParams& params, u32 query_slot,
     CompletionDescriptor& completion) {
@@ -93,12 +177,14 @@ __device__ void set_query_trace_completion(
 
 __device__ void set_dynamic_code_cache_completion(
     CompletionDescriptor& completion, u32 cache_hits,
-    u32 batch_deduplicated, u32 publish_successes, u32 publish_races,
+    u32 batch_deduplicated, u32 publish_successes,
+    u32 first_occupancies, u32 publish_races,
     u32 lookup_probe_exhaustions, u32 publish_probe_exhaustions,
     u32 lookup_probes, u32 max_lookup_probes) {
   completion.dynamic_code_cache_hits = cache_hits;
   completion.dynamic_code_batch_deduplicated = batch_deduplicated;
   completion.dynamic_code_cache_publish_successes = publish_successes;
+  completion.dynamic_code_cache_first_occupancies = first_occupancies;
   completion.dynamic_code_cache_publish_races = publish_races;
   completion.dynamic_code_cache_lookup_probe_exhaustions =
     lookup_probe_exhaustions;
@@ -106,6 +192,17 @@ __device__ void set_dynamic_code_cache_completion(
     publish_probe_exhaustions;
   completion.dynamic_code_cache_lookup_probes = lookup_probes;
   completion.dynamic_code_cache_max_lookup_probes = max_lookup_probes;
+}
+
+__device__ __forceinline__ void set_dynamic_graph_completion(
+    CompletionDescriptor& completion,
+    const DynamicGraphTelemetry& telemetry) {
+  completion.dynamic_graph_read_bytes = telemetry.read_bytes;
+  completion.dynamic_graph_short_reads = telemetry.short_reads;
+  completion.dynamic_graph_full_reads = telemetry.full_reads;
+  completion.dynamic_graph_fallback_reads = telemetry.fallback_reads;
+  completion.dynamic_graph_hint_promotions = telemetry.hint_promotions;
+  completion.dynamic_graph_hint_demotions = telemetry.hint_demotions;
 }
 
 __device__ void set_beam_merge_completion(
@@ -302,12 +399,17 @@ __device__ __forceinline__ void set_frontier_certificate_completion(
     u32 ordered_score_candidates, u32 reusable_prefix_ranks,
     u32 reusable_full_prefix_certificates,
     u32 reusable_issued_certificates,
+    u32 ooo_bypassed_parents,
     u32 certificate_rejects) {
   if constexpr (EnableAsfe) {
     // DEEC remains available as a focused proof/test primitive; production
     // uses the sort-once reusable PFEC certificate below.
     completion.frontier_telemetry_reserved0 = certificate_rejects;
-    completion.frontier_telemetry_reserved1 = 0;
+    // The second retired DEEC slot is a success-only counter. Failure paths
+    // keep it zero until they optionally overwrite both reserved words with
+    // a rejected-handle diagnostic.
+    completion.frontier_telemetry_reserved1 =
+      completion.status == 0 ? ooo_bypassed_parents : 0u;
     completion.frontier_reusable_certificates = reusable_certificates;
     completion.frontier_streamed_candidate_runs =
       streamed_candidate_runs;
@@ -926,7 +1028,7 @@ __device__ __forceinline__ bool finish_query_core_frontier_batch(
     params.core_batch_completion_timestamps_ns,
     telemetry.wait_cycles, telemetry.completion_latency_ns,
     telemetry.completion_groups, telemetry.arrived, telemetry.stale,
-    telemetry.ready_waves);
+    telemetry.ready_waves, telemetry.dynamic_graph);
 }
 
 // Failure completions normally collapse every query-local graph dependency
@@ -1885,6 +1987,7 @@ __device__ __forceinline__ void process_query(
   __shared__ u32 dynamic_code_cache_hits;
   __shared__ u32 dynamic_code_batch_deduplicated;
   __shared__ u32 dynamic_code_cache_publish_successes;
+  __shared__ u32 dynamic_code_cache_first_occupancies;
   __shared__ u32 dynamic_code_cache_publish_races;
   __shared__ u32 dynamic_code_cache_lookup_probe_exhaustions;
   __shared__ u32 dynamic_code_cache_publish_probe_exhaustions;
@@ -1933,6 +2036,7 @@ __device__ __forceinline__ void process_query(
     dynamic_code_cache_hits = 0;
     dynamic_code_batch_deduplicated = 0;
     dynamic_code_cache_publish_successes = 0;
+    dynamic_code_cache_first_occupancies = 0;
     dynamic_code_cache_publish_races = 0;
     dynamic_code_cache_lookup_probe_exhaustions = 0;
     dynamic_code_cache_publish_probe_exhaustions = 0;
@@ -2236,6 +2340,7 @@ __device__ __forceinline__ void process_query(
           &dynamic_code_incarnation_rejects, &dynamic_code_cache_hits,
           &dynamic_code_batch_deduplicated,
           &dynamic_code_cache_publish_successes,
+          &dynamic_code_cache_first_occupancies,
           &dynamic_code_cache_publish_races,
           &dynamic_code_cache_lookup_probe_exhaustions,
           &dynamic_code_cache_publish_probe_exhaustions,
@@ -2322,7 +2427,9 @@ __device__ __forceinline__ void process_query(
         set_dynamic_code_cache_completion(
           completion, dynamic_code_cache_hits,
           dynamic_code_batch_deduplicated,
-          dynamic_code_cache_publish_successes, dynamic_code_cache_publish_races,
+          dynamic_code_cache_publish_successes,
+          dynamic_code_cache_first_occupancies,
+          dynamic_code_cache_publish_races,
           dynamic_code_cache_lookup_probe_exhaustions,
           dynamic_code_cache_publish_probe_exhaustions,
           dynamic_code_cache_lookup_probes,
@@ -2350,6 +2457,16 @@ __device__ __forceinline__ void process_query(
   __shared__ u32 critical_fetch_slots[kPersistentMaxPrefetch];
   __shared__ u32 critical_fetch_to_commit[kPersistentMaxPrefetch];
   __shared__ u32 critical_fetch_destination_slots[kPersistentMaxPrefetch];
+  __shared__ u8 selected_underhint_force_full[kPersistentMaxPrefetch];
+  __shared__ u8 critical_fetch_force_full[kPersistentMaxPrefetch];
+  // Tail completion has finished before underhint mapping starts. Reuse its
+  // phase-local scalar for the uniform fast-path gate instead of growing the
+  // persistent CTA's already occupancy-sensitive shared-memory footprint.
+  union TailUnderhintPhaseScratch {
+    u32 tail_stale_before;
+    u32 selected_underhint_any;
+  };
+  __shared__ TailUnderhintPhaseScratch tail_underhint_scratch;
   __shared__ u32 commit_rob_slots[kPersistentMaxPrefetch];
   __shared__ u32 critical_fetch_count;
   __shared__ u64 shadow_frontier_handles[kPersistentFrontierRobCapacity];
@@ -2366,6 +2483,7 @@ __device__ __forceinline__ void process_query(
   __shared__ u32 frontier_streamed_candidate_runs;
   __shared__ u32 ordered_score_batches;
   __shared__ u32 ordered_score_candidates;
+  __shared__ u32 ooo_bypassed_parents;
   __shared__ u32 frontier_reusable_prefix_ranks;
   __shared__ u32 frontier_reusable_full_prefix_certificates;
   __shared__ u32 frontier_reusable_issued_certificates;
@@ -2430,22 +2548,16 @@ __device__ __forceinline__ void process_query(
   __shared__ u32 core_prefetch_queue_rejects;
   __shared__ u32 core_prefetch_waves;
   __shared__ u32 core_ready_waves;
+  __shared__ DynamicGraphTelemetry dynamic_graph_telemetry;
   __shared__ CoreFrontierTelemetry core_telemetry;
   __shared__ TailFrontierTelemetry tail_telemetry;
   __shared__ TailAdmissionCorrection tail_admission_correction;
   __shared__ u64 shadow_issue_started_cycles;
-  __shared__ u32 pipelined_parent_count;
-  // Independent authoritative cursors for the rank-contiguous prefix of the
-  // frozen Commit Frontier.  CQ completion order may be arbitrary, but only
-  // a hole-free prefix is retired into this canonical candidate stream.
-  __shared__ u32 pipelined_candidate_count;
-  __shared__ u32 pipeline_scored_candidate_count;
-  // READY parents are coalesced before decode/PQ so a one-parent CQ does not
-  // turn into a sub-warp scoring launch.  These are scalar query-CTA cursors,
-  // not queues, and add no global coordination.
-  __shared__ u32 pipeline_next_parent_count;
-  __shared__ u32 pipeline_deferred_parent_count;
-  __shared__ u32 pipeline_flush_deferred;
+  // Completion harvesting is independent of Beam rank. Candidate decode and
+  // scoring deliberately remain one canonical full-width batch after every
+  // mandatory parent has arrived; fragmenting that GPU work per CQ group is
+  // substantially more expensive than the network wait it can hide.
+  __shared__ u32 ooo_completed_parent_mask;
   __shared__ u32 early_queue_rejects_before;
   __shared__ u32 core_batch_positional;
   __shared__ u32 certified_mapping_ready;
@@ -2478,8 +2590,11 @@ __device__ __forceinline__ void process_query(
     next_commit_ready = 0;
     next_commit_count = 0;
     selection_from_certificate = 0;
+    tail_underhint_scratch.selected_underhint_any = 0;
     stable_runs_prepared_before_issue = 0;
+    ooo_completed_parent_mask = 0;
     frontier_reusable_certificates = 0;
+    ooo_bypassed_parents = 0;
     if constexpr (EnableAsfe) {
       frontier_streamed_candidate_runs = 0;
       ordered_score_batches = 0;
@@ -2527,6 +2642,7 @@ __device__ __forceinline__ void process_query(
     core_prefetch_queue_rejects = 0;
     core_prefetch_waves = 0;
     core_ready_waves = 0;
+    dynamic_graph_telemetry = {};
     core_batch_positional = 0;
     certified_mapping_ready = 0;
     reconciled_positional_core = 0;
@@ -2539,6 +2655,7 @@ __device__ __forceinline__ void process_query(
       .arrived = &core_prefetch_arrived,
       .stale = &core_prefetch_stale,
       .ready_waves = &core_ready_waves,
+      .dynamic_graph = &dynamic_graph_telemetry,
     };
     tail_telemetry = TailFrontierTelemetry{
       .arrived = &speculative_arrived,
@@ -2548,6 +2665,7 @@ __device__ __forceinline__ void process_query(
       .completion_groups = &speculative_completion_groups,
       .wasted_bytes = &speculative_wasted_bytes,
       .admission_correction = &tail_admission_correction,
+      .dynamic_graph = &dynamic_graph_telemetry,
     };
     tail_admission_correction = {};
     certified_commit_context = CertifiedCommitReconcileContext{
@@ -2579,6 +2697,17 @@ __device__ __forceinline__ void process_query(
       frontier_rob[slot] = {};
     }
   }
+  // Fixed-record policy leaves graph_request_bytes null, so no asynchronous
+  // short read can produce extent-underhint evidence. Avoid even the one-time
+  // flag stores for that baseline; the fixed path also skips both per-round
+  // helper barriers below and passes no force-full vector to the fetcher.
+  if (params.graph_request_bytes != nullptr) {
+    for (u32 slot = threadIdx.x; slot < kPersistentMaxPrefetch;
+         slot += blockDim.x) {
+      selected_underhint_force_full[slot] = 0;
+      critical_fetch_force_full[slot] = 0;
+    }
+  }
   __syncthreads();
 
   __shared__ u32 expansions;
@@ -2592,10 +2721,9 @@ __device__ __forceinline__ void process_query(
     __shared__ u64 speculative_wait_before;
     if constexpr (EnableAsfe) {
       // Freeze the authoritative commit prefix before consuming any payload.
-      // Each completed shard group below may publish only private decoded
-      // handles and immutable static PQ distances for this frozen commit.
-      // Visited, dynamic PQ, Beam, and expanded bits remain unchanged until
-      // the complete dependency set has been resolved.
+      // Completed shard groups may retire ROB entries in any order, but
+      // candidate decode, visited, PQ, Beam, and expanded bits remain
+      // unchanged until the complete dependency set has been resolved.
       if (threadIdx.x == 0) {
         phase_started_cycles = clock64();
         graph_failed = 0;
@@ -2656,29 +2784,24 @@ __device__ __forceinline__ void process_query(
         beam_selection_cycles += clock64() - phase_started_cycles;
         core_batch.rejected = 0;
         speculative_wait_before = speculative_wait_cycles;
-        pipelined_parent_count = 0;
-        pipelined_candidate_count = 0;
-        pipeline_scored_candidate_count = 0;
-        pipeline_next_parent_count = 0;
-        pipeline_deferred_parent_count = 0;
-        pipeline_flush_deferred = 0;
+        ooo_completed_parent_mask = 0;
         stable_runs_prepared_before_issue = 0;
       }
       __syncthreads();
-      const u32 pipeline_score_capacity =
+      const u32 single_chunk_parent_capacity =
         persistent_score_chunk_capacity(
           params.graph_entry_capacity, traversal_capacity);
-      const bool ordered_core_mapping_ready =
+      const bool canonical_core_mapping_ready =
         core_batch_positional != 0 ||
         (selection_from_certificate != 0 &&
          certified_mapping_ready != 0);
-      const bool ordered_pipeline_enabled =
-        core_batch.active != 0 && ordered_core_mapping_ready &&
+      const bool ooo_pipeline_enabled =
+        core_batch.active != 0 && canonical_core_mapping_ready &&
         selected_count != 0 &&
-        selected_count <= pipeline_score_capacity &&
+        selected_count <= single_chunk_parent_capacity &&
         blockDim.x == kApproximateSortThreadsCompact;
       const bool frontier_stable_run_enabled =
-        ordered_pipeline_enabled &&
+        ooo_pipeline_enabled &&
         params.issue_width > params.commit_width &&
         params.beam_merge_policy ==
           static_cast<u32>(BeamMergePolicy::stable_run) &&
@@ -2695,305 +2818,82 @@ __device__ __forceinline__ void process_query(
         }
         __syncthreads();
       }
-      if (ordered_pipeline_enabled) {
-        constexpr u32 pipeline_warp_width = 32;
-        const u32 pipeline_warp =
-          threadIdx.x / pipeline_warp_width;
-        const u32 pipeline_lane =
-          threadIdx.x % pipeline_warp_width;
+      if (ooo_pipeline_enabled) {
+        constexpr u32 completion_warp_width = 32;
+        const u32 completion_lane =
+          threadIdx.x % completion_warp_width;
+
         while (core_batch.active != 0 && graph_failed == 0) {
-          if (threadIdx.x == 0) {
-            pipeline_flush_deferred = 0;
-          }
-          __syncthreads();
-          if (pipeline_flush_deferred == 0) {
-            const bool buffered_parent_work =
-              pipeline_deferred_parent_count > pipelined_parent_count;
-            const i32 completion_progress =
-              finish_next_core_frontier_group(
-                params, descriptor, frontier_rob, core_batch,
-                min(params.commit_width,
-                    static_cast<u32>(kPersistentFrontierRobCapacity)),
-                core_telemetry, !buffered_parent_work);
-            if (completion_progress < 0) {
-              if (threadIdx.x == 0) {
-                graph_failed = frontier_graph_failure_code(
-                  params, descriptor, 1u);
-              }
-            } else if (completion_progress == 0 &&
-                       threadIdx.x == 0) {
-              // The CQ is empty but a rank-contiguous prefix is already
-              // resident. Retire it before entering a blocking wait.
-              pipeline_next_parent_count =
-                pipeline_deferred_parent_count;
-              pipeline_flush_deferred =
-                pipeline_next_parent_count > pipelined_parent_count
-                  ? 1u : 0u;
+          const i32 completion_progress =
+            finish_next_core_frontier_group(
+              params, descriptor, frontier_rob, core_batch,
+              min(params.commit_width,
+                  static_cast<u32>(kPersistentFrontierRobCapacity)),
+              core_telemetry, true);
+          if (completion_progress < 0) {
+            if (threadIdx.x == 0) {
+              graph_failed = frontier_graph_failure_code(
+                params, descriptor, 1u);
             }
+            __syncthreads();
+            break;
           }
 
-          if (threadIdx.x == 0 && graph_failed == 0 &&
-              pipeline_flush_deferred == 0) {
-            u32 ready = pipelined_parent_count;
-            while (ready < selected_count) {
-              const u32 rob_slot = core_batch_positional != 0
-                ? ready : issue_rob_slots[ready];
-              if (rob_slot >= kPersistentFrontierRobCapacity) break;
-              const FrontierRobEntry& entry = frontier_rob[rob_slot];
-              if (entry.state !=
-                    static_cast<u8>(FrontierRequestState::validated) ||
-                  entry.node_handle != selected_handles[ready]) {
-                break;
-              }
-              ++ready;
-            }
-
-            // Coalesce small completion groups to at least the natural
-            // warp-per-parent tile or half the frozen Commit Frontier.  If
-            // the CQ is temporarily empty, the nonblocking probe above
-            // flushes whatever prefix is available instead of idling.
-            const u32 hardware_parent_tile =
-              max(1u, blockDim.x / pipeline_warp_width);
-            const u32 parent_coalesce_target = max(
-              hardware_parent_tile, (selected_count + 1u) / 2u);
-            const u32 newly_ready = ready - pipelined_parent_count;
-            const bool should_coalesce =
-              ready < selected_count &&
-              newly_ready < parent_coalesce_target;
-            pipeline_deferred_parent_count = ready;
-            pipeline_next_parent_count =
-              should_coalesce ? pipelined_parent_count : ready;
-          }
-          __syncthreads();
-
-          const u32 pipeline_begin = pipelined_parent_count;
-          const u32 pipeline_count =
-            pipeline_next_parent_count - pipeline_begin;
-          if (pipeline_count == 0 || graph_failed != 0) continue;
-
-          // These positions are part of the already frozen authoritative
-          // Commit Frontier. Publish VALIDATED -> COMMITTED before any
-          // visited/PQ work; out-of-order arrivals beyond the first hole
-          // remain purely speculative.
-          for (u32 local = threadIdx.x; local < pipeline_count;
-               local += blockDim.x) {
-            const u32 position = pipeline_begin + local;
-            const u32 rob_slot = core_batch_positional != 0
-              ? position : issue_rob_slots[position];
-            if (rob_slot < kPersistentFrontierRobCapacity) {
-              FrontierRobEntry& entry = frontier_rob[rob_slot];
-              if (entry.state ==
-                    static_cast<u8>(FrontierRequestState::validated) &&
-                  entry.node_handle == selected_handles[position]) {
-                entry.state =
-                  static_cast<u8>(FrontierRequestState::committed);
-              }
-            }
-          }
-          __syncthreads();
-
-          for (u32 local = pipeline_warp; local < pipeline_count;
-               local += blockDim.x / pipeline_warp_width) {
-            const u32 position = pipeline_begin + local;
-            const u32 rob_slot = core_batch_positional != 0
-              ? position : issue_rob_slots[position];
-            const FrontierRobEntry* entry =
+          // The completion helper returns at a CTA barrier. One warp can now
+          // retire every newly VALIDATED logical parent without another
+          // block-wide readiness scan or publication barrier. Other warps
+          // rendezvous at the helper's first barrier in the next iteration.
+          if (threadIdx.x < completion_warp_width) {
+            const u32 position = completion_lane;
+            const u32 rob_slot = position < selected_count
+              ? (core_batch_positional != 0
+                   ? position : issue_rob_slots[position])
+              : UINT32_MAX;
+            FrontierRobEntry* entry =
               rob_slot < kPersistentFrontierRobCapacity
                 ? frontier_rob + rob_slot : nullptr;
-            const bool mapped_payload_valid =
+            const bool ready =
+              position < selected_count &&
+              (ooo_completed_parent_mask &
+                 (u32{1} << position)) == 0 &&
               entry != nullptr &&
               entry->state ==
-                static_cast<u8>(FrontierRequestState::committed) &&
+                static_cast<u8>(FrontierRequestState::validated) &&
               entry->node_handle == selected_handles[position];
-            const u8* record = mapped_payload_valid
-              ? graph_record_pointer(
-                  params, descriptor.query_slot,
-                  kGraphScratchBit |
-                    static_cast<u32>(entry->scratch_slot))
-              : nullptr;
-            if (pipeline_lane == 0) {
-              const u32 stable_count = record == nullptr ? 0 : record[0];
-              const u32 provisional_count = record == nullptr
-                ? 0 : (record[1] >> 4) & 0xfu;
-              neighbor_counts[local] =
-                record != nullptr && (record[1] & 1u) == 0
-                  ? min(stable_count + provisional_count,
-                        params.graph_entry_capacity)
-                  : 0;
+            const u32 ready_parent_mask =
+              __ballot_sync(0xffffffffu, ready);
+            if (ready) {
+              entry->state =
+                static_cast<u8>(FrontierRequestState::committed);
             }
-          }
-          __syncthreads();
-          if (threadIdx.x == 0) {
-            neighbor_offsets[0] = pipelined_candidate_count;
-            for (u32 local = 0; local < pipeline_count; ++local) {
-              neighbor_offsets[local + 1] =
-                neighbor_offsets[local] + neighbor_counts[local];
-            }
-            flattened_neighbors = neighbor_offsets[pipeline_count];
-            phase_started_cycles = clock64();
-          }
-          __syncthreads();
-          for (u32 local = pipeline_warp; local < pipeline_count;
-               local += blockDim.x / pipeline_warp_width) {
-            const u32 position = pipeline_begin + local;
-            const u32 rob_slot = core_batch_positional != 0
-              ? position : issue_rob_slots[position];
-            const FrontierRobEntry* entry =
-              rob_slot < kPersistentFrontierRobCapacity
-                ? frontier_rob + rob_slot : nullptr;
-            const bool mapped_payload_valid =
-              entry != nullptr &&
-              entry->state ==
-                static_cast<u8>(FrontierRequestState::committed) &&
-              entry->node_handle == selected_handles[position];
-            const u8* record = mapped_payload_valid
-              ? graph_record_pointer(
-                  params, descriptor.query_slot,
-                  kGraphScratchBit |
-                    static_cast<u32>(entry->scratch_slot))
-              : nullptr;
-            const u32 count =
-              mapped_payload_valid ? neighbor_counts[local] : 0u;
-            for (u32 neighbor = pipeline_lane; neighbor < count;
-                 neighbor += pipeline_warp_width) {
-              const u64 raw = decode_tagged_raw(
-                record + 16 + neighbor * sizeof(u64));
-              navigation_handles[
-                neighbor_offsets[local] + neighbor] =
-                  handle_from_raw(params, raw);
-            }
-          }
-          __syncthreads();
-          if (threadIdx.x == 0) {
-            neighbor_decode_cycles +=
-              clock64() - phase_started_cycles;
-            phase_started_cycles = clock64();
-          }
-          const u32 pipeline_candidate_begin =
-            pipelined_candidate_count;
-          const u32 pipeline_candidate_end = flattened_neighbors;
-          for (u32 flat = pipeline_candidate_begin + threadIdx.x;
-               flat < pipeline_candidate_end; flat += blockDim.x) {
-            const u64 handle = navigation_handles[flat];
-            if (handle == kInvalidDeviceHandle ||
-                !insert_visited(
-                  visited, params.visited_capacity, handle)) {
-              navigation_handles[flat] = kInvalidDeviceHandle;
-            }
-          }
-          __syncthreads();
-          if (threadIdx.x == 0) {
-            visited_cycles += clock64() - phase_started_cycles;
-          }
-
-          // The parent prefix is rank-contiguous and immutable once decoded
-          // above. PQ evaluation is element-local, but very short calls lose
-          // substantially more warp efficiency than the RDMA time they can
-          // cover. Retire natural two-CTA tiles while dependencies remain,
-          // then score the exact final residue. Leaf sorting still waits for
-          // a complete immutable 512-item Stable-Run range below.
-          const bool final_ordered_parent_prefix =
-            pipeline_next_parent_count == selected_count;
-          const u32 score_candidates_available =
-            pipeline_candidate_end -
-              pipeline_scored_candidate_count;
-          constexpr u32 pipeline_score_tile_capacity =
-            2u * kApproximateSortThreadsCompact;
-          const u32 pipeline_score_count =
-            final_ordered_parent_prefix
-              ? score_candidates_available
-              : (score_candidates_available /
-                   pipeline_score_tile_capacity) *
-                  pipeline_score_tile_capacity;
-          if constexpr (EnableAsfe) {
-            if (threadIdx.x == 0 && pipeline_score_count != 0) {
-              if (core_batch.active != 0) {
-                ++ordered_score_batches;
-                ordered_score_candidates += pipeline_score_count;
-              } else {
-                ++completion.completion_score_batches;
-                completion.completion_score_candidates +=
-                  pipeline_score_count;
+            if (completion_lane == 0) {
+              const u32 selected_mask =
+                selected_count == completion_warp_width
+                  ? 0xffffffffu : (u32{1} << selected_count) - 1u;
+              const u32 not_ready_mask =
+                selected_mask & ~ooo_completed_parent_mask &
+                ~ready_parent_mask;
+              if (not_ready_mask != 0) {
+                const u32 first_hole =
+                  static_cast<u32>(__ffs(not_ready_mask) - 1);
+                const u32 prefix_through_hole =
+                  first_hole + 1u == completion_warp_width
+                    ? 0xffffffffu
+                    : (u32{1} << (first_hole + 1u)) - 1u;
+                ooo_bypassed_parents += __popc(
+                  ready_parent_mask & ~prefix_through_hole);
               }
-            }
-          }
-          if (threadIdx.x == 0) phase_started_cycles = clock64();
-          if (pipeline_score_count != 0 &&
-              !approximate_handles_batch(
-                params, descriptor, query_lut,
-                navigation_handles +
-                  pipeline_scored_candidate_count,
-                pipeline_score_count,
-                navigation_distances +
-                  pipeline_scored_candidate_count,
-                &dynamic_code_cycles, &dynamic_code_candidates,
-                &dynamic_code_reads,
-                &dynamic_code_incarnation_rejects,
-                &dynamic_code_cache_hits,
-                &dynamic_code_batch_deduplicated,
-                &dynamic_code_cache_publish_successes,
-                &dynamic_code_cache_publish_races,
-                &dynamic_code_cache_lookup_probe_exhaustions,
-                &dynamic_code_cache_publish_probe_exhaustions,
-                &dynamic_code_cache_lookup_probes,
-                &dynamic_code_cache_max_lookup_probes)) {
-            if (threadIdx.x == 0) graph_failed = 2u;
-          }
-          __syncthreads();
-          if (threadIdx.x == 0) {
-            if (pipeline_score_count != 0) {
-              pq_score_cycles += clock64() - phase_started_cycles;
-            }
-            score_phase_cycles = neighbor_decode_cycles +
-              visited_cycles + pq_score_cycles;
-            pipelined_parent_count = pipeline_next_parent_count;
-            pipelined_candidate_count = pipeline_candidate_end;
-            pipeline_scored_candidate_count += pipeline_score_count;
-          }
-          __syncthreads();
-
-          if (stable_runs_prepared_before_issue == 2 &&
-              graph_failed == 0) {
-            constexpr u32 stable_leaf_capacity =
-              kApproximateSortThreadsCompact *
-              kApproximateSortItemsCompactFinal256;
-            const u32 sealed_leaf_target = min(
-              pipeline_scored_candidate_count /
-                stable_leaf_capacity,
-              4u);
-            while (stable_merge_state.candidate_run_count <
-                   sealed_leaf_target) {
-              const u32 pass =
-                stable_merge_state.candidate_run_count;
-              const u32 input_offset =
-                pass * stable_leaf_capacity;
-              const u32 input_end =
-                input_offset + stable_leaf_capacity;
-              const u32 output_offset =
-                pass * traversal_capacity;
-              if (threadIdx.x == 0) {
-                stable_merge_state.phase_started = clock64();
-              }
-              __syncthreads();
-              stable_sort_candidate_run<
-                  ApproximateBlockSortCompactFinal256,
-                  kApproximateSortItemsCompactFinal256>(
-                candidate_workspace.sort.radix_sort_compact_final_256,
-                navigation_handles, navigation_distances,
-                input_end, input_offset,
-                rerank_handles, rerank_flags, rerank_distances,
-                output_offset, traversal_capacity,
-                &beam_merge_round_breakdown,
-                &stable_merge_state.phase_started);
-              if (threadIdx.x == 0) {
-                ++stable_merge_state.candidate_run_count;
-                ++frontier_streamed_candidate_runs;
-              }
-              __syncthreads();
+              ooo_completed_parent_mask |= ready_parent_mask;
             }
           }
         }
-      } else if (!finish_query_core_frontier_batch(
+        // The final completion clears core_batch.active, so there is no next
+        // helper-entry barrier at which non-owner warps can rendezvous.
+        __syncthreads();
+      }
+
+      if (!ooo_pipeline_enabled &&
+          !finish_query_core_frontier_batch(
                    params, descriptor, frontier_rob, core_batch,
                    min(params.commit_width,
                        static_cast<u32>(
@@ -3011,14 +2911,13 @@ __device__ __forceinline__ void process_query(
         speculative_wait_before = speculative_wait_cycles;
       }
       __syncthreads();
-      __shared__ u32 tail_stale_before;
       // The tail state is CTA-resident and therefore a uniform predicate.
       // Skip the out-of-line completion frame entirely when no speculative
       // descriptor is active; this is the steady state after the controller
       // collapses an unprofitable suffix.
       if (tail_batch.active != 0) {
         if (threadIdx.x == 0) {
-          tail_stale_before = speculative_stale;
+          tail_underhint_scratch.tail_stale_before = speculative_stale;
         }
         __syncthreads();
         if (!finish_query_tail_frontier_batch<false>(
@@ -3040,10 +2939,25 @@ __device__ __forceinline__ void process_query(
           rdma_wait_cycles += tail_wait_delta;
           speculative_wait_before = speculative_wait_cycles;
           tail_feedback.stale +=
-            speculative_stale - tail_stale_before;
+            speculative_stale -
+              tail_underhint_scratch.tail_stale_before;
         }
       }
       __syncthreads();
+
+      if (params.graph_request_bytes != nullptr) {
+        const UnderhintLookupMode underhint_lookup_mode =
+          core_batch_positional != 0
+            ? UnderhintLookupMode::positional
+            : ((selection_from_certificate != 0 &&
+                certified_mapping_ready != 0)
+                 ? UnderhintLookupMode::certified
+                 : UnderhintLookupMode::associative);
+        identify_selected_underhint_force_full(
+          selected_handles, selected_count, frontier_rob, issue_rob_slots,
+          underhint_lookup_mode, selected_underhint_force_full,
+          &tail_underhint_scratch.selected_underhint_any);
+      }
 
       if (core_batch_positional != 0) {
         reconcile_exact_core_frontier(
@@ -3131,6 +3045,13 @@ __device__ __forceinline__ void process_query(
       }
     }
     __syncthreads();
+    if (params.graph_request_bytes != nullptr &&
+        tail_underhint_scratch.selected_underhint_any != 0) {
+      remap_critical_underhint_force_full(
+        selected_underhint_force_full, selected_count,
+        critical_fetch_to_commit, critical_fetch_count,
+        critical_fetch_force_full);
+    }
     if (threadIdx.x == 0) {
       phase_started_cycles = clock64();
     }
@@ -3159,7 +3080,11 @@ __device__ __forceinline__ void process_query(
             &total_graph_extent_underhint_reads,
             &total_graph_extent_hint_promotions,
             route_attempt, total_graph_rounds - 1,
-            rdma_trace_enabled != 0, &graph_fetch_breakdown);
+            rdma_trace_enabled != 0, &graph_fetch_breakdown,
+            &dynamic_graph_telemetry,
+            params.graph_request_bytes != nullptr &&
+                tail_underhint_scratch.selected_underhint_any != 0
+              ? critical_fetch_force_full : nullptr);
       if (fetch_failure != 0) {
         if (threadIdx.x == 0) {
           const u32 contextual_failure =
@@ -3250,6 +3175,7 @@ __device__ __forceinline__ void process_query(
           total_graph_extent_underhint_reads;
         completion.graph_extent_hint_promotions =
           total_graph_extent_hint_promotions;
+        set_dynamic_graph_completion(completion, dynamic_graph_telemetry);
         set_frontier_completion<EnableAsfe>(
           completion, logical_expansions, critical_graph_reads,
           critical_graph_bytes, speculative_graph_reads,
@@ -3272,6 +3198,7 @@ __device__ __forceinline__ void process_query(
           ordered_score_candidates, frontier_reusable_prefix_ranks,
           frontier_reusable_full_prefix_certificates,
           frontier_reusable_issued_certificates,
+          ooo_bypassed_parents,
           frontier_certificate_rejects);
         // Failure-only provenance: preserve the exact handle rejected by the
         // authoritative fetch preparer.  The two reserved words normally
@@ -3299,7 +3226,9 @@ __device__ __forceinline__ void process_query(
         set_dynamic_code_cache_completion(
           completion, dynamic_code_cache_hits,
           dynamic_code_batch_deduplicated,
-          dynamic_code_cache_publish_successes, dynamic_code_cache_publish_races,
+          dynamic_code_cache_publish_successes,
+          dynamic_code_cache_first_occupancies,
+          dynamic_code_cache_publish_races,
           dynamic_code_cache_lookup_probe_exhaustions,
           dynamic_code_cache_publish_probe_exhaustions,
           dynamic_code_cache_lookup_probes,
@@ -3335,86 +3264,59 @@ __device__ __forceinline__ void process_query(
          chunk_begin += score_chunk_capacity) {
       const u32 chunk_count = min(score_chunk_capacity,
                                   selected_count - chunk_begin);
-      // A completed out-of-order stage can provide the entire decoded stream
-      // without having touched visited. Keep decode, visited, and score
-      // authority as independent cursors: Stable-Run still observes the
-      // original parent/neighbor stream byte-for-byte.
-      const u32 pre_decoded_parent_count =
-        chunk_begin == 0 ? min(pipelined_parent_count, chunk_count) : 0;
-      const u32 pre_decoded_candidate_count =
-        chunk_begin == 0 ? pipelined_candidate_count : 0;
-      const u32 pre_scored_candidate_count =
-        chunk_begin == 0 ? pipeline_scored_candidate_count : 0;
-      const u32 remaining_parent_count =
-        chunk_count - pre_decoded_parent_count;
       const bool final_parent_chunk =
         chunk_begin + chunk_count >= selected_count;
-      u32 candidate_count = pre_decoded_candidate_count;
-      for (u32 selected = chunk_begin + threadIdx.x;
-           selected < chunk_begin + pre_decoded_parent_count;
-           selected += blockDim.x) {
-        graph_record_slots[selected] = UINT32_MAX;
+      for (u32 local = warp; local < chunk_count;
+           local += blockDim.x / warp_width) {
+        const u32 selected = chunk_begin + local;
+        const u32 slot = graph_record_slots[selected];
+        const u8* record = slot == UINT32_MAX ? nullptr :
+          graph_record_pointer(params, descriptor.query_slot, slot);
+        if (lane_in_warp == 0) {
+          const u32 stable_count = record == nullptr ? 0 : record[0];
+          const u32 provisional_count = record == nullptr
+            ? 0 : (record[1] >> 4) & 0xfu;
+          neighbor_counts[local] =
+            record != nullptr && (record[1] & 1u) == 0
+              ? min(stable_count + provisional_count,
+                    params.graph_entry_capacity)
+              : 0;
+        }
       }
-      if (remaining_parent_count != 0) {
-        for (u32 local = warp; local < remaining_parent_count;
-             local += blockDim.x / warp_width) {
-          const u32 selected =
-            chunk_begin + pre_decoded_parent_count + local;
-          const u32 slot = graph_record_slots[selected];
-          const u8* record = slot == UINT32_MAX ? nullptr :
-            graph_record_pointer(params, descriptor.query_slot, slot);
-          if (lane_in_warp == 0) {
-            const u32 stable_count = record == nullptr ? 0 : record[0];
-            const u32 provisional_count = record == nullptr
-              ? 0 : (record[1] >> 4) & 0xfu;
-            neighbor_counts[local] =
-              record != nullptr && (record[1] & 1u) == 0
-                ? min(stable_count + provisional_count,
-                      params.graph_entry_capacity)
-                : 0;
-          }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        neighbor_offsets[0] = 0;
+        for (u32 local = 0; local < chunk_count; ++local) {
+          neighbor_offsets[local + 1] =
+            neighbor_offsets[local] + neighbor_counts[local];
         }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-          neighbor_offsets[0] = pre_decoded_candidate_count;
-          for (u32 local = 0; local < remaining_parent_count; ++local) {
-            neighbor_offsets[local + 1] =
-              neighbor_offsets[local] + neighbor_counts[local];
-          }
-          flattened_neighbors = neighbor_offsets[remaining_parent_count];
-          phase_started_cycles = clock64();
+        flattened_neighbors = neighbor_offsets[chunk_count];
+        phase_started_cycles = clock64();
+      }
+      __syncthreads();
+      for (u32 local = warp; local < chunk_count;
+           local += blockDim.x / warp_width) {
+        const u32 selected = chunk_begin + local;
+        const u32 slot = graph_record_slots[selected];
+        const u8* record = slot == UINT32_MAX ? nullptr :
+          graph_record_pointer(params, descriptor.query_slot, slot);
+        __syncwarp();
+        const u32 count = neighbor_counts[local];
+        for (u32 neighbor = lane_in_warp; neighbor < count;
+             neighbor += warp_width) {
+          const u64 raw = decode_tagged_raw(
+            record + 16 + neighbor * sizeof(u64));
+          navigation_handles[neighbor_offsets[local] + neighbor] =
+            handle_from_raw(params, raw);
         }
-        __syncthreads();
-        for (u32 local = warp; local < remaining_parent_count;
-             local += blockDim.x / warp_width) {
-          const u32 selected =
-            chunk_begin + pre_decoded_parent_count + local;
-          const u32 slot = graph_record_slots[selected];
-          const u8* record = slot == UINT32_MAX ? nullptr :
-            graph_record_pointer(params, descriptor.query_slot, slot);
-          __syncwarp();
-          const u32 count = neighbor_counts[local];
-          for (u32 neighbor = lane_in_warp; neighbor < count;
-               neighbor += warp_width) {
-            const u64 raw = decode_tagged_raw(
-              record + 16 + neighbor * sizeof(u64));
-            navigation_handles[neighbor_offsets[local] + neighbor] =
-              handle_from_raw(params, raw);
-          }
-          __syncwarp();
-          if (lane_in_warp == 0) {
-            graph_record_slots[selected] = UINT32_MAX;
-          }
+        __syncwarp();
+        if (lane_in_warp == 0) {
+          graph_record_slots[selected] = UINT32_MAX;
         }
-        __syncthreads();
-        if (threadIdx.x == 0) {
-          neighbor_decode_cycles += clock64() - phase_started_cycles;
-        }
-      } else if (threadIdx.x == 0) {
-        // Ordered progress already produced the complete immutable candidate
-        // stream.  Avoid re-entering the empty conventional
-        // count/offset/decode framework merely to rediscover its end cursor.
-        flattened_neighbors = pre_decoded_candidate_count;
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        neighbor_decode_cycles += clock64() - phase_started_cycles;
       }
       if constexpr (EnableAsfe) {
         if (final_parent_chunk) {
@@ -3434,17 +3336,11 @@ __device__ __forceinline__ void process_query(
         }
         __syncthreads();
       }
-      candidate_count = flattened_neighbors;
-      // The contiguous prefix was already visited-filtered in canonical
-      // parent/neighbor order. Only the dependency-completion suffix remains.
-      const u32 pre_visited_candidate_count =
-        pre_decoded_candidate_count;
-      const u32 unvisited_candidate_count =
-        candidate_count - pre_visited_candidate_count;
-      if (unvisited_candidate_count != 0) {
+      const u32 candidate_count = flattened_neighbors;
+      if (candidate_count != 0) {
         if (threadIdx.x == 0) phase_started_cycles = clock64();
         __syncthreads();
-        for (u32 flat = pre_visited_candidate_count + threadIdx.x;
+        for (u32 flat = threadIdx.x;
              flat < candidate_count; flat += blockDim.x) {
           const u64 handle = navigation_handles[flat];
           if (handle == kInvalidDeviceHandle ||
@@ -3457,31 +3353,26 @@ __device__ __forceinline__ void process_query(
           visited_cycles += clock64() - phase_started_cycles;
         }
       }
-      const u32 remaining_candidate_count =
-        candidate_count - pre_scored_candidate_count;
       if constexpr (EnableAsfe) {
-        if (threadIdx.x == 0 && remaining_candidate_count != 0) {
+        if (threadIdx.x == 0 && candidate_count != 0) {
           // All speculative/critical graph dependencies have been reconciled
-          // and every mandatory miss has completed before this point.  This
-          // one suffix includes both an ordered-score carry residue and every
-          // candidate produced by the final/unresolved parent suffix.
+          // and every mandatory miss has completed before this point.
           ++completion.completion_score_batches;
-          completion.completion_score_candidates +=
-            remaining_candidate_count;
+          completion.completion_score_candidates += candidate_count;
         }
       }
       if (threadIdx.x == 0) phase_started_cycles = clock64();
-      if (remaining_candidate_count != 0 &&
+      if (candidate_count != 0 &&
           !approximate_handles_batch(
             params, descriptor, query_lut,
-            navigation_handles + pre_scored_candidate_count,
-            remaining_candidate_count,
-            navigation_distances + pre_scored_candidate_count,
+            navigation_handles, candidate_count,
+            navigation_distances,
             &dynamic_code_cycles,
             &dynamic_code_candidates, &dynamic_code_reads,
             &dynamic_code_incarnation_rejects, &dynamic_code_cache_hits,
             &dynamic_code_batch_deduplicated,
             &dynamic_code_cache_publish_successes,
+            &dynamic_code_cache_first_occupancies,
             &dynamic_code_cache_publish_races,
             &dynamic_code_cache_lookup_probe_exhaustions,
             &dynamic_code_cache_publish_probe_exhaustions,
@@ -3491,7 +3382,7 @@ __device__ __forceinline__ void process_query(
       }
       __syncthreads();
       if (threadIdx.x == 0) {
-        if (remaining_candidate_count != 0) {
+        if (candidate_count != 0) {
           pq_score_cycles += clock64() - phase_started_cycles;
         }
         score_phase_cycles = neighbor_decode_cycles +
@@ -3534,13 +3425,10 @@ __device__ __forceinline__ void process_query(
         constexpr u32 stable_leaf_capacity =
           kApproximateSortThreadsCompact *
           kApproximateSortItemsCompactFinal256;
-        // Out-of-order static scoring deliberately did not seal candidate
-        // leaves: visited and dynamic PQ were still non-authoritative. Sort
-        // every complete/partial ordered leaf only after those dependencies
-        // have resolved.  An absent leaf is the identity (+infinity) run, so
-        // retain the logical arity instead of writing and later merging its
-        // 128 sentinel entries. Stable-Run still sees the identical ordered
-        // parent/neighbor input stream.
+        // Sort every complete/partial canonical leaf after visited and
+        // dynamic PQ have resolved. An absent leaf is the identity
+        // (+infinity) run, so retain the logical arity instead of writing and
+        // later merging its 128 sentinel entries.
         const u32 final_candidate_run_count = min(
           4u,
           (candidate_count + stable_leaf_capacity - 1u) /
@@ -3569,6 +3457,7 @@ __device__ __forceinline__ void process_query(
             &stable_merge_state.phase_started);
           if (threadIdx.x == 0) {
             ++stable_merge_state.candidate_run_count;
+            ++frontier_streamed_candidate_runs;
           }
           __syncthreads();
         }
@@ -3786,7 +3675,8 @@ __device__ __forceinline__ void process_query(
                 &core_prefetch_queue_rejects,
                 &speculative_queue_rejects,
                 &core_prefetch_reads, &core_prefetch_bytes,
-                &tail_feedback.tail_admitted);
+                &tail_feedback.tail_admitted,
+                &dynamic_graph_telemetry);
             } else {
               // The narrow core-only path preserves the critical-first
               // publication cost of the coupled engine. A resident tail does
@@ -3803,7 +3693,8 @@ __device__ __forceinline__ void process_query(
                 &total_graph_full_record_reads,
                 &critical_graph_reads, &critical_graph_bytes,
                 &core_prefetch_queue_rejects,
-                &core_prefetch_reads, &core_prefetch_bytes);
+                &core_prefetch_reads, &core_prefetch_bytes,
+                &dynamic_graph_telemetry);
             }
             if (!issue_ok && threadIdx.x == 0) {
               graph_failed = frontier_graph_failure_code(
@@ -4009,6 +3900,7 @@ __device__ __forceinline__ void process_query(
           total_graph_extent_underhint_reads;
         completion.graph_extent_hint_promotions =
           total_graph_extent_hint_promotions;
+        set_dynamic_graph_completion(completion, dynamic_graph_telemetry);
         set_frontier_completion<EnableAsfe>(
           completion, logical_expansions, critical_graph_reads,
           critical_graph_bytes, speculative_graph_reads,
@@ -4031,6 +3923,7 @@ __device__ __forceinline__ void process_query(
           ordered_score_candidates, frontier_reusable_prefix_ranks,
           frontier_reusable_full_prefix_certificates,
           frontier_reusable_issued_certificates,
+          ooo_bypassed_parents,
           frontier_certificate_rejects);
         completion.graph_rounds = total_graph_rounds;
         completion.exact_vectors = total_exact_reads;
@@ -4042,7 +3935,9 @@ __device__ __forceinline__ void process_query(
         set_dynamic_code_cache_completion(
           completion, dynamic_code_cache_hits,
           dynamic_code_batch_deduplicated,
-          dynamic_code_cache_publish_successes, dynamic_code_cache_publish_races,
+          dynamic_code_cache_publish_successes,
+          dynamic_code_cache_first_occupancies,
+          dynamic_code_cache_publish_races,
           dynamic_code_cache_lookup_probe_exhaustions,
           dynamic_code_cache_publish_probe_exhaustions,
           dynamic_code_cache_lookup_probes,
@@ -4184,6 +4079,7 @@ __device__ __forceinline__ void process_query(
         total_graph_extent_underhint_reads;
       completion.graph_extent_hint_promotions =
         total_graph_extent_hint_promotions;
+      set_dynamic_graph_completion(completion, dynamic_graph_telemetry);
       set_frontier_completion<EnableAsfe>(
         completion, logical_expansions, critical_graph_reads,
         critical_graph_bytes, speculative_graph_reads,
@@ -4206,6 +4102,7 @@ __device__ __forceinline__ void process_query(
         ordered_score_candidates, frontier_reusable_prefix_ranks,
         frontier_reusable_full_prefix_certificates,
         frontier_reusable_issued_certificates,
+        ooo_bypassed_parents,
         frontier_certificate_rejects);
       completion.graph_rounds = total_graph_rounds;
       set_terminal_exact_cache_completion<EnableAsfe>(
@@ -4399,6 +4296,7 @@ __device__ __forceinline__ void process_query(
         total_graph_extent_underhint_reads;
       completion.graph_extent_hint_promotions =
         total_graph_extent_hint_promotions;
+      set_dynamic_graph_completion(completion, dynamic_graph_telemetry);
       set_frontier_completion<EnableAsfe>(
         completion, logical_expansions, critical_graph_reads,
         critical_graph_bytes, speculative_graph_reads,
@@ -4421,6 +4319,7 @@ __device__ __forceinline__ void process_query(
         ordered_score_candidates, frontier_reusable_prefix_ranks,
         frontier_reusable_full_prefix_certificates,
         frontier_reusable_issued_certificates,
+        ooo_bypassed_parents,
         frontier_certificate_rejects);
       completion.graph_rounds = total_graph_rounds;
       completion.exact_vectors = total_exact_reads;
@@ -4432,7 +4331,9 @@ __device__ __forceinline__ void process_query(
       set_dynamic_code_cache_completion(
         completion, dynamic_code_cache_hits,
         dynamic_code_batch_deduplicated,
-        dynamic_code_cache_publish_successes, dynamic_code_cache_publish_races,
+        dynamic_code_cache_publish_successes,
+        dynamic_code_cache_first_occupancies,
+        dynamic_code_cache_publish_races,
         dynamic_code_cache_lookup_probe_exhaustions,
         dynamic_code_cache_publish_probe_exhaustions,
           dynamic_code_cache_lookup_probes,
@@ -4513,6 +4414,7 @@ __device__ __forceinline__ void process_query(
       total_graph_extent_underhint_reads;
     completion.graph_extent_hint_promotions =
       total_graph_extent_hint_promotions;
+    set_dynamic_graph_completion(completion, dynamic_graph_telemetry);
     set_frontier_completion<EnableAsfe>(
       completion, logical_expansions, critical_graph_reads,
       critical_graph_bytes, speculative_graph_reads,
@@ -4535,6 +4437,7 @@ __device__ __forceinline__ void process_query(
       ordered_score_candidates, frontier_reusable_prefix_ranks,
       frontier_reusable_full_prefix_certificates,
       frontier_reusable_issued_certificates,
+      ooo_bypassed_parents,
       frontier_certificate_rejects);
     set_terminal_exact_cache_completion<EnableAsfe>(
       completion, terminal_exact_cache);
@@ -4548,7 +4451,9 @@ __device__ __forceinline__ void process_query(
     set_dynamic_code_cache_completion(
       completion, dynamic_code_cache_hits,
       dynamic_code_batch_deduplicated,
-      dynamic_code_cache_publish_successes, dynamic_code_cache_publish_races,
+      dynamic_code_cache_publish_successes,
+      dynamic_code_cache_first_occupancies,
+      dynamic_code_cache_publish_races,
       dynamic_code_cache_lookup_probe_exhaustions,
       dynamic_code_cache_publish_probe_exhaustions,
       dynamic_code_cache_lookup_probes,

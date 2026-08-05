@@ -9,6 +9,13 @@
 #include "common/vector_dtype.hh"
 #include "remote_pointer.hh"
 #include "vamana/hot_graph.hh"
+#include "vamana/dynamic_navigation_code.hh"
+
+#if defined(__CUDACC__)
+#define DVSTOR_VAMANA_NODE_HD __host__ __device__
+#else
+#define DVSTOR_VAMANA_NODE_HD
+#endif
 
 /**
  * Fixed records contain header, id, generation, and exact vector. The compact
@@ -79,7 +86,59 @@ public:
   static str storage_format_name() { return "vamana_tagged_v2"; }
   static constexpr size_t STORAGE_ALIGNMENT = 64;
   static constexpr size_t COMPACT_ALIGNMENT = 16;
+  // Dynamic PQ validation and graph-extent advice share one four-byte word:
+  //
+  //   [ graph extent class (8b) | slot incarnation (24b) ]
+  //
+  // The high bit is deliberately never set, including for UNKNOWN, because
+  // the GPU arena reserves bit 31 as its publication BUSY bit.  The tag is a
+  // performance hint only; graph checksum/incarnation validation remains the
+  // authority for accepting an adjacency snapshot.
   static constexpr u32 DYNAMIC_CODE_INCARNATION_BYTES = sizeof(u32);
+  static constexpr u32 DYNAMIC_CODE_TAG_BYTES =
+    DYNAMIC_CODE_INCARNATION_BYTES;
+  // A trailing checksum makes a single RDMA READ a coherent dynamic-PQ
+  // snapshot across physical-slot reuse.  It binds the payload to the low
+  // 24-bit incarnation while intentionally excluding the advisory extent.
+  static constexpr u32 DYNAMIC_CODE_CHECKSUM_BYTES =
+    vamana::dynamic_navigation_code::kChecksumBytes;
+  static constexpr u32 DYNAMIC_CODE_INCARNATION_BITS =
+    RemotePtr::INCARNATION_BITS;
+  static constexpr u32 DYNAMIC_CODE_INCARNATION_MASK =
+    (u32{1} << DYNAMIC_CODE_INCARNATION_BITS) - 1u;
+  static constexpr u32 DYNAMIC_CODE_EXTENT_CLASS_SHIFT =
+    DYNAMIC_CODE_INCARNATION_BITS;
+  static constexpr u8 DYNAMIC_CODE_EXTENT_CLASS_UNKNOWN = 0x7fu;
+  static constexpr u32 GRAPH_EXTENT_EDGES_PER_CLASS = 8;
+
+  DVSTOR_VAMANA_NODE_HD static constexpr u32 pack_dynamic_navigation_tag(
+      u32 incarnation, u8 extent_class) {
+    return (incarnation & DYNAMIC_CODE_INCARNATION_MASK) |
+      (static_cast<u32>(extent_class) <<
+       DYNAMIC_CODE_EXTENT_CLASS_SHIFT);
+  }
+
+  DVSTOR_VAMANA_NODE_HD static constexpr u32
+  dynamic_navigation_tag_incarnation(u32 tag) {
+    return tag & DYNAMIC_CODE_INCARNATION_MASK;
+  }
+
+  DVSTOR_VAMANA_NODE_HD static constexpr u8
+  dynamic_navigation_tag_extent_class(u32 tag) {
+    return static_cast<u8>(tag >> DYNAMIC_CODE_EXTENT_CLASS_SHIFT);
+  }
+
+  DVSTOR_VAMANA_NODE_HD static constexpr u8 graph_extent_class(
+      u32 stable_count, u32 provisional_count) {
+    const u32 total = stable_count + provisional_count;
+    if (total < stable_count) return DYNAMIC_CODE_EXTENT_CLASS_UNKNOWN;
+    const u32 extent_class =
+      total / GRAPH_EXTENT_EDGES_PER_CLASS +
+        (total % GRAPH_EXTENT_EDGES_PER_CLASS != 0 ? 1u : 0u);
+    return extent_class < DYNAMIC_CODE_EXTENT_CLASS_UNKNOWN
+      ? static_cast<u8>(extent_class)
+      : DYNAMIC_CODE_EXTENT_CLASS_UNKNOWN;
+  }
 
   static size_t align_storage(size_t value) {
     return (value + STORAGE_ALIGNMENT - 1) & ~(STORAGE_ALIGNMENT - 1);
@@ -190,6 +249,16 @@ public:
     return HOT_GRAPH_DYNAMIC_CODE_BYTES;
   }
 
+  static size_t dynamic_graph_publication_size() {
+    return hot_graph_entry_size() + DYNAMIC_CODE_TAG_BYTES;
+  }
+
+  static bool dynamic_graph_publication_layout_valid() {
+    return HAS_HOT_GRAPH && HOT_GRAPH_DYNAMIC_CODE_BYTES != 0 &&
+      HOT_GRAPH_DYNAMIC_CODE_OFFSET ==
+        HOT_GRAPH_DYNAMIC_HOT_OFFSET + hot_graph_entry_size();
+  }
+
   static void disable_hot_graph() {
     HAS_HOT_GRAPH = false;
     HOT_GRAPH_ENTRY_BYTES = 0;
@@ -234,15 +303,20 @@ public:
       HOT_GRAPH_DYNAMIC_RECORD_BYTES >= HOT_GRAPH_DYNAMIC_HOT_OFFSET + HOT_GRAPH_ENTRY_BYTES &&
       HOT_GRAPH_DYNAMIC_HOT_OFFSET >= total_size() &&
       (HOT_GRAPH_DYNAMIC_CODE_BYTES == 0 ||
-       (HOT_GRAPH_DYNAMIC_CODE_OFFSET >= HOT_GRAPH_DYNAMIC_HOT_OFFSET + HOT_GRAPH_ENTRY_BYTES &&
+       (HOT_GRAPH_DYNAMIC_CODE_OFFSET == HOT_GRAPH_DYNAMIC_HOT_OFFSET + HOT_GRAPH_ENTRY_BYTES &&
         static_cast<u64>(HOT_GRAPH_DYNAMIC_RECORD_BYTES) >=
           static_cast<u64>(HOT_GRAPH_DYNAMIC_CODE_OFFSET) +
             DYNAMIC_CODE_INCARNATION_BYTES +
-            HOT_GRAPH_DYNAMIC_CODE_BYTES));
+            HOT_GRAPH_DYNAMIC_CODE_BYTES +
+            DYNAMIC_CODE_CHECKSUM_BYTES));
     if (!HAS_HOT_GRAPH) disable_hot_graph();
   }
 
-  static bool hot_graph_entry_available(RemotePtr ptr) {
+  // Classify a physical fixed-record address without trusting the handle's
+  // incarnation bits.  Runtime writers use this to reject a malformed tagged
+  // handle before choosing between an 832-byte base publication and the
+  // dynamic graph+tag publication.
+  static bool hot_graph_base_record_address(RemotePtr ptr) {
     if (!HAS_HOT_GRAPH || ptr.memory_node() >= HOT_GRAPH_ENTRY_OFFSETS.size() ||
         ptr.byte_offset() < vamana::hot_graph::kNodeBaseOffset) {
       return false;
@@ -253,6 +327,14 @@ public:
       const u64 slot = relative / node_size;
       if (slot < HOT_GRAPH_ENTRY_COUNTS[ptr.memory_node()]) return true;
     }
+    return false;
+  }
+
+  static bool hot_graph_entry_available(RemotePtr ptr) {
+    if (hot_graph_base_record_address(ptr)) return true;
+    if (!HAS_HOT_GRAPH || ptr.memory_node() >= HOT_GRAPH_ENTRY_OFFSETS.size()) {
+      return false;
+    }
     if (ptr.memory_node() >= HOT_GRAPH_DYNAMIC_BASE_OFFSETS.size() ||
         HOT_GRAPH_DYNAMIC_RECORD_BYTES == 0 ||
         ptr.byte_offset() < HOT_GRAPH_DYNAMIC_BASE_OFFSETS[ptr.memory_node()]) {
@@ -260,6 +342,15 @@ public:
     }
     const u64 dynamic_relative = ptr.byte_offset() - HOT_GRAPH_DYNAMIC_BASE_OFFSETS[ptr.memory_node()];
     return dynamic_relative % HOT_GRAPH_DYNAMIC_RECORD_BYTES == 0;
+  }
+
+  // A handle's identity class must agree with the physical record plane.
+  // Otherwise selecting the publication size from incarnation alone could
+  // append a four-byte dynamic tag to an 832-byte immutable-base slot.
+  static bool hot_graph_record_kind_matches(RemotePtr ptr) {
+    if (!hot_graph_entry_available(ptr)) return false;
+    const bool base_address = hot_graph_base_record_address(ptr);
+    return base_address ? ptr.is_static() : ptr.is_dynamic();
   }
 
   // Incarnation-zero base records are materialized once by the offline build
@@ -273,17 +364,7 @@ public:
   // exact fixed-record address range as well so only an offline base slot is
   // eligible for single-READ vector snapshots.
   static bool immutable_base_record(RemotePtr ptr) {
-    if (!HAS_HOT_GRAPH || !ptr.is_static() ||
-        ptr.memory_node() >= HOT_GRAPH_ENTRY_COUNTS.size() ||
-        ptr.byte_offset() < vamana::hot_graph::kNodeBaseOffset) {
-      return false;
-    }
-    const u64 node_size = total_size();
-    if (node_size == 0) return false;
-    const u64 relative =
-      ptr.byte_offset() - vamana::hot_graph::kNodeBaseOffset;
-    return relative % node_size == 0 &&
-      relative / node_size < HOT_GRAPH_ENTRY_COUNTS[ptr.memory_node()];
+    return ptr.is_static() && hot_graph_base_record_address(ptr);
   }
 
   static u64 hot_graph_entry_offset(RemotePtr ptr) {
@@ -300,7 +381,7 @@ public:
 
   static u64 dynamic_navigation_code_offset(RemotePtr ptr) {
     lib_assert(HAS_HOT_GRAPH && HOT_GRAPH_DYNAMIC_CODE_BYTES != 0 &&
-                 hot_graph_entry_available(ptr),
+                 ptr.is_dynamic() && hot_graph_record_kind_matches(ptr),
                "dynamic navigation code requested for an invalid node");
     return ptr.byte_offset() + HOT_GRAPH_DYNAMIC_CODE_OFFSET;
   }
@@ -308,6 +389,11 @@ public:
   static u64 dynamic_navigation_code_data_offset(RemotePtr ptr) {
     return dynamic_navigation_code_offset(ptr) +
       DYNAMIC_CODE_INCARNATION_BYTES;
+  }
+
+  static u64 dynamic_navigation_code_checksum_offset(RemotePtr ptr) {
+    return dynamic_navigation_code_data_offset(ptr) +
+      HOT_GRAPH_DYNAMIC_CODE_BYTES;
   }
 
   static void encode_hot_graph_entry(byte_t* out,
@@ -346,6 +432,54 @@ public:
     }
     const u16 checksum = vamana::hot_graph::checksum16(out, hot_graph_entry_size());
     vamana::hot_graph::store_u16_le(out + 2, checksum);
+  }
+
+  // Serialize the exact byte range used by a dynamic adjacency publication:
+  // one checksummed graph entry followed immediately by its advisory
+  // incarnation/extent tag.  The function deliberately touches no byte past
+  // dynamic_graph_publication_size(), so a caller may point it into a full
+  // dynamic record without exposing the following PQ payload to overwrite.
+  // Deleted entries preserve their counted adjacency for cleanup, matching
+  // the storage-owner graph writer's existing lifecycle contract.
+  static bool encode_dynamic_graph_publication(
+      byte_t* out,
+      size_t out_bytes,
+      const RemotePtr* stable_neighbors,
+      size_t stable_count,
+      const RemotePtr* provisional_neighbors,
+      size_t provisional_count,
+      u32 generation,
+      bool deleted,
+      u32 slot_incarnation,
+      u32 shard_bits = HOT_GRAPH_SHARD_BITS) {
+    const size_t publication_bytes = dynamic_graph_publication_size();
+    if (out == nullptr || out_bytes < publication_bytes ||
+        stable_count > R || provisional_count > provisional_slots() ||
+        (stable_count != 0 && stable_neighbors == nullptr) ||
+        (provisional_count != 0 && provisional_neighbors == nullptr) ||
+        slot_incarnation == 0 ||
+        slot_incarnation > RemotePtr::MAX_INCARNATION) {
+      return false;
+    }
+    const u8 stable_count_u8 = static_cast<u8>(stable_count);
+    encode_hot_graph_entry(
+      out, stable_count_u8, stable_neighbors, stable_count, shard_bits,
+      generation, false, provisional_neighbors, provisional_count,
+      slot_incarnation);
+    if (deleted) {
+      out[1] |= HOT_GRAPH_DELETED;
+      const u16 checksum =
+        vamana::hot_graph::checksum16(out, hot_graph_entry_size());
+      vamana::hot_graph::store_u16_le(out + 2, checksum);
+    }
+    const u8 extent_class = graph_extent_class(
+      static_cast<u32>(stable_count),
+      static_cast<u32>(provisional_count));
+    if (extent_class == DYNAMIC_CODE_EXTENT_CLASS_UNKNOWN) return false;
+    vamana::hot_graph::store_u32_le(
+      out + hot_graph_entry_size(),
+      pack_dynamic_navigation_tag(slot_incarnation, extent_class));
+    return true;
   }
 
   static bool decode_hot_graph_entry(const byte_t* compact,
@@ -394,3 +528,11 @@ public:
   }
 
 };
+
+static_assert(VamanaNode::DYNAMIC_CODE_INCARNATION_BITS == 24);
+static_assert(
+  VamanaNode::pack_dynamic_navigation_tag(
+    RemotePtr::MAX_INCARNATION,
+    VamanaNode::DYNAMIC_CODE_EXTENT_CLASS_UNKNOWN) < (u32{1} << 31));
+
+#undef DVSTOR_VAMANA_NODE_HD

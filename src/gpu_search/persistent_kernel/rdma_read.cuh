@@ -1,9 +1,38 @@
 #pragma once
 
+#include <cuda/atomic>
+
 #include "gpu_search/graph_record_validation.hh"
 #include "gpu_search/persistent_kernel/candidate_scoring.cuh"
+#include "vamana/dynamic_navigation_code.hh"
 
 namespace gpu_search::persistent_kernel_detail {
+
+__device__ __forceinline__ u32 dynamic_arena_state_load(
+    const u32* state) {
+  cuda::atomic_ref<u32, cuda::thread_scope_device> reference(
+    *const_cast<u32*>(state));
+  return reference.load(cuda::memory_order_acquire);
+}
+
+// Match atomicCAS's return-value convention while making the publication
+// order explicit.  Successful reservations/extent transitions are acq_rel;
+// failure returns an acquire observation for the caller's retry loop.
+__device__ __forceinline__ u32 dynamic_arena_state_compare_exchange(
+    u32* state, u32 expected, u32 desired) {
+  cuda::atomic_ref<u32, cuda::thread_scope_device> reference(*state);
+  u32 observed = expected;
+  (void)reference.compare_exchange_strong(
+    observed, desired, cuda::memory_order_acq_rel,
+    cuda::memory_order_acquire);
+  return observed;
+}
+
+__device__ __forceinline__ void dynamic_arena_state_publish(
+    u32* state, u32 desired) {
+  cuda::atomic_ref<u32, cuda::thread_scope_device> reference(*state);
+  reference.store(desired, cuda::memory_order_release);
+}
 
 struct GraphFetchCycleBreakdown {
   u64 issue{};
@@ -891,6 +920,7 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
                                           u32* total_cache_hits,
                                           u32* total_batch_deduplicated,
                                           u32* total_cache_publish_successes,
+                                          u32* total_cache_first_occupancies,
                                           u32* total_cache_publish_races,
                                           u32* total_lookup_probe_exhaustions,
                                           u32* total_publish_probe_exhaustions,
@@ -904,6 +934,7 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
   __shared__ u32 call_cache_hits;
   __shared__ u32 call_batch_deduplicated;
   __shared__ u32 call_cache_publish_successes;
+  __shared__ u32 call_cache_first_occupancies;
   __shared__ u32 call_cache_publish_races;
   __shared__ u32 call_lookup_probe_exhaustions;
   __shared__ u32 call_publish_probe_exhaustions;
@@ -925,6 +956,7 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     call_cache_hits = 0;
     call_batch_deduplicated = 0;
     call_cache_publish_successes = 0;
+    call_cache_first_occupancies = 0;
     call_cache_publish_races = 0;
     call_lookup_probe_exhaustions = 0;
     call_publish_probe_exhaustions = 0;
@@ -972,17 +1004,31 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
           region, node_offset, params.dynamic_code_arena_capacity,
           arena_slot)) {
       auto* state = params.dynamic_code_arena_states + arena_slot;
-      // atomicCAS supplies the acquire side of payload -> threadfence ->
-      // incarnation publication.
-      const u32 observed = atomicCAS(state, 0u, 0u);
+      const u32 observed = dynamic_arena_state_load(state);
       atomicAdd(&call_lookup_probes, 1u);
       atomicMax(&call_max_lookup_probes, 1u);
-      if (observed == remote_incarnation(handle)) {
+      if (dynamic_code_arena_state_matches(
+            observed, remote_incarnation(handle))) {
         const u8* resident = params.dynamic_code_arena_records +
           static_cast<size_t>(arena_slot) * params.pq_code_bytes;
         distances[index] = approximate_entry(params, query_lut, resident);
-        atomicAdd(&call_cache_hits, 1u);
-        continue;
+        // Keep every payload load before the second state sample. Together
+        // with the publisher's release store this is the device-scope
+        // seqlock read side; legacy relaxed atomics are intentionally avoided.
+        cuda::atomic_thread_fence(
+          cuda::memory_order_acquire, cuda::thread_scope_device);
+        const u32 after = dynamic_arena_state_load(state);
+        if (dynamic_code_arena_read_stable(
+              observed, after, remote_incarnation(handle))) {
+          atomicAdd(&call_cache_hits, 1u);
+          continue;
+        }
+        // A replacement reserved or republished the physical slot while its
+        // payload was being scored.  Never attribute those bytes to the old
+        // handle; retry through the incarnation+checksum-validated storage
+        // path in this same scoring call.
+        distances[index] = FLT_MAX;
+        atomicAdd(&call_incarnation_rejects, 1u);
       }
     }
     // The merge frontier can contain the same tagged handle through multiple
@@ -1078,10 +1124,16 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     }
     const u8* code = params.dynamic_code_records +
       (request_base + index) * params.dynamic_code_record_bytes;
-    if (*reinterpret_cast<const u32*>(code) == remote_incarnation(handles[index])) {
+    const u32 dynamic_tag =
+      vamana::dynamic_navigation_code::load_u32_le(code);
+    const u8* payload = code + sizeof(u32);
+    const u8* checksum = payload + params.pq_code_bytes;
+    if (dynamic_code_tag_incarnation(dynamic_tag) ==
+          remote_incarnation(handles[index]) &&
+        vamana::dynamic_navigation_code::validate(
+          dynamic_tag, payload, params.pq_code_bytes, checksum)) {
       distances[index] = approximate_entry(
-        params, query_lut,
-        code + sizeof(u32));
+        params, query_lut, payload);
     } else {
       atomicAdd(&call_incarnation_rejects, 1u);
     }
@@ -1102,8 +1154,10 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
       const u64 handle = handles[index];
       const u8* source = params.dynamic_code_records +
         (request_base + index) * params.dynamic_code_record_bytes;
-      if (*reinterpret_cast<const u32*>(source) !=
-          remote_incarnation(handle)) {
+      const u32 source_tag = *reinterpret_cast<const u32*>(source);
+      const u32 desired_incarnation = remote_incarnation(handle);
+      if (dynamic_code_tag_incarnation(source_tag) !=
+          desired_incarnation) {
         continue;
       }
       const u64 node_offset = remote_byte_offset(handle);
@@ -1114,16 +1168,37 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
             arena_slot)) {
         continue;
       }
-      const u32 desired = remote_incarnation(handle);
+      const u8 desired_extent =
+        dynamic_code_tag_extent_class(source_tag);
+      const u32 desired = make_dynamic_code_tag(
+        desired_incarnation, desired_extent);
       auto* state = params.dynamic_code_arena_states + arena_slot;
-      const u32 observed = atomicCAS(state, 0u, 0u);
-      if (observed == desired) {
+      u32 observed = dynamic_arena_state_load(state);
+      if (dynamic_code_arena_state_matches(
+            observed, desired_incarnation)) {
+        // Concurrent reads of one immutable PQ payload may observe successive
+        // graph tags. Refine a defensive UNKNOWN state from the freshly read
+        // storage tag, otherwise retain the larger class, all without
+        // republishing the code. A later checksum-valid graph snapshot remains
+        // the authority if the tag itself raced an adjacency publication.
+        u32 promoted = observed;
+        while (dynamic_code_arena_refined_unknown_extent_state(
+                 observed, desired_incarnation, desired_extent, promoted) ||
+               dynamic_code_arena_promoted_extent_state(
+                 observed, desired_incarnation, desired_extent, promoted)) {
+          const u32 prior = dynamic_arena_state_compare_exchange(
+            state, observed, promoted);
+          if (prior == observed) break;
+          observed = prior;
+        }
         ++call_cache_publish_races;
         continue;
       }
-      if (!dynamic_code_arena_can_publish(observed, desired) ||
-          atomicCAS(state, observed,
-                    kPersistentDynamicCodeArenaBusy | desired) != observed) {
+      if (!dynamic_code_arena_can_publish(
+            observed, desired_incarnation) ||
+          dynamic_arena_state_compare_exchange(
+            state, observed,
+            kPersistentDynamicCodeArenaBusy | desired) != observed) {
         ++call_cache_publish_races;
         continue;
       }
@@ -1132,9 +1207,11 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
       for (u32 byte = 0; byte < params.pq_code_bytes; ++byte) {
         destination[byte] = source[sizeof(u32) + byte];
       }
-      __threadfence();
-      atomicExch(state, desired);
+      dynamic_arena_state_publish(state, desired);
       ++call_cache_publish_successes;
+      if (dynamic_code_arena_first_occupancy(observed)) {
+        ++call_cache_first_occupancies;
+      }
     }
   }
   __syncthreads();
@@ -1165,6 +1242,9 @@ __device__ bool approximate_handles_batch(const PersistentKernelParams& params,
     }
     if (total_cache_publish_successes != nullptr) {
       *total_cache_publish_successes += call_cache_publish_successes;
+    }
+    if (total_cache_first_occupancies != nullptr) {
+      *total_cache_first_occupancies += call_cache_first_occupancies;
     }
     if (total_cache_publish_races != nullptr) {
       *total_cache_publish_races += call_cache_publish_races;
@@ -1946,6 +2026,8 @@ __device__ void validate_frontier_owner_batch(
         record, transferred_bytes, params.graph_degree,
         params.graph_entry_capacity, required_bytes);
     const bool partial = transferred_bytes < params.graph_entry_bytes;
+    const bool extent_underhint =
+      partial && prefix_valid && required_bytes > transferred_bytes;
     const graph_record_validation::SnapshotState snapshot =
       prefix_valid && required_bytes <= transferred_bytes
         ? (partial
@@ -1954,7 +2036,9 @@ __device__ void validate_frontier_owner_batch(
             : classify_graph_record(params, record, handle))
         : graph_record_validation::SnapshotState::invalid;
     const FrontierValidationState validation =
-      snapshot == graph_record_validation::SnapshotState::valid
+      extent_underhint
+        ? FrontierValidationState::extent_underhint
+        : snapshot == graph_record_validation::SnapshotState::valid
         ? FrontierValidationState::valid
         : snapshot ==
             graph_record_validation::SnapshotState::stale_incarnation
@@ -1982,6 +2066,51 @@ __device__ __forceinline__ u8 load_graph_extent_class(
     word, static_ordinal % sizeof(u32));
 }
 
+// Resolve the incarnation-scoped dynamic arena state for a graph handle.  PQ
+// discovery publishes this word as payload -> fence -> tagged state.  An
+// exact incarnation match is therefore sufficient to reuse its extent hint;
+// BUSY, unknown, and recycled slots all fall back to the full graph record.
+__device__ __forceinline__ bool dynamic_graph_extent_state(
+    const PersistentKernelParams& params,
+    u64 handle,
+    u32*& state,
+    u32& observed) {
+  state = nullptr;
+  observed = 0;
+  if (params.dynamic_graph_extent_enabled == 0 ||
+      params.dynamic_code_arena_states == nullptr ||
+      remote_incarnation(handle) == 0) {
+    return false;
+  }
+  u64 raw = 0;
+  u64 graph_offset = 0;
+  u32 shard = 0;
+  if (!resolve_handle(params, handle, raw, shard, graph_offset) ||
+      shard >= params.num_shards) {
+    return false;
+  }
+  const DeviceShardRegion& region = params.shards[shard];
+  u64 arena_slot = 0;
+  if (!dynamic_code_arena_slot_from_offset(
+        region, remote_byte_offset(raw),
+        params.dynamic_code_arena_capacity, arena_slot)) {
+    return false;
+  }
+  state = params.dynamic_code_arena_states + arena_slot;
+  observed = dynamic_arena_state_load(state);
+  return dynamic_code_arena_state_matches(
+    observed, remote_incarnation(handle));
+}
+
+__device__ __forceinline__ u8 load_dynamic_graph_extent_class(
+    const PersistentKernelParams& params, u64 handle) {
+  u32* state = nullptr;
+  u32 observed = 0;
+  return dynamic_graph_extent_state(params, handle, state, observed)
+    ? dynamic_code_tag_extent_class(observed)
+    : kPersistentDynamicCodeArenaUnknownExtent;
+}
+
 // Once an under-hinted short read has been upgraded and the authoritative full
 // snapshot validates, promote the packed device byte monotonically so later
 // queries do not repeat the same dependent short->full pair. Seeing a stale
@@ -1991,12 +2120,6 @@ __device__ bool promote_graph_extent_class(
     const PersistentKernelParams& params,
     u64 handle,
     u32 required_bytes) {
-  if (params.graph_extent_class_words == nullptr) return false;
-  u32 static_ordinal = 0;
-  if (!static_ordinal_from_raw(params, handle, static_ordinal) ||
-      static_ordinal >= params.num_nodes) {
-    return false;
-  }
   const u8 requested_class =
     graph_record_validation::graph_extent_class_for_required_bytes(
       required_bytes, params.graph_entry_capacity);
@@ -2004,18 +2127,101 @@ __device__ bool promote_graph_extent_class(
       graph_record_validation::kGraphExtentClassUnknown) {
     return false;
   }
-  u32* const word =
-    params.graph_extent_class_words + static_ordinal / sizeof(u32);
-  const u32 byte_index = static_ordinal % sizeof(u32);
-  u32 observed = *reinterpret_cast<volatile u32*>(word);
-  while (true) {
-    u32 desired = observed;
-    if (!graph_record_validation::promoted_graph_extent_word(
-          observed, byte_index, requested_class, desired)) {
+
+  u32 static_ordinal = 0;
+  if (static_ordinal_from_raw(params, handle, static_ordinal)) {
+    if (params.graph_extent_class_words == nullptr ||
+        static_ordinal >= params.num_nodes) {
       return false;
     }
-    const u32 prior = atomicCAS(word, observed, desired);
+    u32* const word =
+      params.graph_extent_class_words + static_ordinal / sizeof(u32);
+    const u32 byte_index = static_ordinal % sizeof(u32);
+    u32 observed = *reinterpret_cast<volatile u32*>(word);
+    while (true) {
+      u32 desired = observed;
+      if (!graph_record_validation::promoted_graph_extent_word(
+            observed, byte_index, requested_class, desired)) {
+        return false;
+      }
+      const u32 prior = atomicCAS(word, observed, desired);
+      if (prior == observed) return true;
+      observed = prior;
+    }
+  }
+
+  u32* state = nullptr;
+  u32 observed = 0;
+  const u32 incarnation = remote_incarnation(handle);
+  if (!dynamic_graph_extent_state(params, handle, state, observed)) {
+    return false;
+  }
+  while (true) {
+    u32 desired = observed;
+    if (!dynamic_code_arena_promoted_extent_state(
+          observed, incarnation, requested_class, desired)) {
+      return false;
+    }
+    const u32 prior = dynamic_arena_state_compare_exchange(
+      state, observed, desired);
     if (prior == observed) return true;
+    observed = prior;
+  }
+}
+
+enum class DynamicGraphExtentAdaptation : u8 {
+  none = 0,
+  refined_unknown = 1,
+  demoted = 2,
+};
+
+// Adapt only dynamic hints and only after a checksum-valid snapshot. A
+// defensive UNKNOWN state is refined to the exact observed class once; this
+// planned full read is neither an underhint promotion nor a shrink demotion.
+// Otherwise the two-class threshold and one-class guard avoid an atomic write
+// for ordinary degree jitter. Static sidecar classes retain monotonic
+// high-water semantics, while exact-incarnation CAS prevents an old query from
+// modifying a slot that PQ publication has already reserved or recycled.
+__device__ DynamicGraphExtentAdaptation adapt_dynamic_graph_extent_class(
+    const PersistentKernelParams& params,
+    u64 handle,
+    u32 required_bytes) {
+  if (remote_incarnation(handle) == 0) {
+    return DynamicGraphExtentAdaptation::none;
+  }
+  const u8 observed_graph_class =
+    graph_record_validation::graph_extent_class_for_required_bytes(
+      required_bytes, params.graph_entry_capacity);
+  if (observed_graph_class ==
+      graph_record_validation::kGraphExtentClassUnknown) {
+    return DynamicGraphExtentAdaptation::none;
+  }
+  u32* state = nullptr;
+  u32 observed = 0;
+  const u32 incarnation = remote_incarnation(handle);
+  if (!dynamic_graph_extent_state(params, handle, state, observed)) {
+    return DynamicGraphExtentAdaptation::none;
+  }
+  while (true) {
+    u32 desired = observed;
+    const bool refining_unknown =
+      dynamic_code_tag_extent_class(observed) ==
+        kPersistentDynamicCodeArenaUnknownExtent;
+    const bool transition_available = refining_unknown
+      ? dynamic_code_arena_refined_unknown_extent_state(
+          observed, incarnation, observed_graph_class, desired)
+      : dynamic_code_arena_guarded_demoted_extent_state(
+          observed, incarnation, observed_graph_class, desired);
+    if (!transition_available) {
+      return DynamicGraphExtentAdaptation::none;
+    }
+    const u32 prior = dynamic_arena_state_compare_exchange(
+      state, observed, desired);
+    if (prior == observed) {
+      return refining_unknown
+        ? DynamicGraphExtentAdaptation::refined_unknown
+        : DynamicGraphExtentAdaptation::demoted;
+    }
     observed = prior;
   }
 }
@@ -2061,14 +2267,20 @@ __device__ bool prepare_graph_record_in_scratch(
   request_offset = graph_offset;
   request_local_iova = reinterpret_cast<u64>(destination) -
     params.direct_local_iova_base;
-  // Dynamic records have no immutable ordinal and therefore always retain the
-  // full-record read-committed path. A static sidecar class is only a hint:
-  // validation below will promote any inconsistent short read to a full retry.
+  // Both static sidecar and incarnation-scoped dynamic classes are hints:
+  // validation below promotes any insufficient short read to an authoritative
+  // full retry.  An unseen/BUSY/recycled dynamic slot returns the unknown class
+  // and therefore preserves the legacy full-record path.
   if (static_record && params.graph_extent_class_words != nullptr &&
       params.graph_request_bytes != nullptr &&
       (params.graph_entry_bytes & (sizeof(u64) - 1u)) == 0) {
     request_bytes = graph_record_validation::graph_extent_bytes_for_class(
       load_graph_extent_class(params, static_ordinal),
+      params.graph_entry_bytes, params.graph_entry_capacity);
+  } else if (!static_record && params.graph_request_bytes != nullptr &&
+             (params.graph_entry_bytes & (sizeof(u64) - 1u)) == 0) {
+    request_bytes = graph_record_validation::graph_extent_bytes_for_class(
+      load_dynamic_graph_extent_class(params, handle),
       params.graph_entry_bytes, params.graph_entry_capacity);
   }
   return true;
@@ -2102,13 +2314,114 @@ __device__ u8* graph_record_pointer(const PersistentKernelParams& params,
   return nullptr;
 }
 
+// Query-local state carried beside one authoritative graph fetch. A force-full
+// retry is produced only after an asynchronous short prefix has already shown
+// that the exact handle needs more bytes. The first admitted full attempt is
+// therefore the full half of that one fallback; later checksum retries keep
+// the underhint provenance for safe promotion but are not another fallback.
+inline constexpr u32 kGraphReadLogical = 1u;
+inline constexpr u32 kGraphReadStartedWithShortExtent = 2u;
+inline constexpr u32 kGraphReadNeedsExtentFallback = 4u;
+inline constexpr u32 kGraphReadExtentUnderhint = 8u;
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr u32 prepare_graph_read_attempt_state(
+    u32 full_record_bytes,
+    bool force_full_underhint,
+    u32& transfer_bytes) {
+  if (force_full_underhint) {
+    transfer_bytes = full_record_bytes;
+    return kGraphReadLogical | kGraphReadNeedsExtentFallback |
+      kGraphReadExtentUnderhint;
+  }
+  return kGraphReadLogical |
+    (transfer_bytes < full_record_bytes
+       ? kGraphReadStartedWithShortExtent : 0u);
+}
+
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr u32 graph_read_state_after_fallback_admission(u32 state) {
+  return state & ~kGraphReadNeedsExtentFallback;
+}
+
+struct GraphReadAdmissionAccounting {
+  u32 fallback_reads{};
+  u32 underhint_reads{};
+  u32 retry_reads{};
+};
+
+// Classify one admitted physical read. Attempt zero may still be a physical
+// retry when this helper was entered after an asynchronous short under-hint;
+// later admitted attempts are ordinary checksum retries. Clearing the
+// needs-fallback bit after admission makes the fallback count one-shot.
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline constexpr GraphReadAdmissionAccounting
+classify_graph_read_admission(
+    u32 state, bool full_record_read, u32 batch_attempt) {
+  const bool fallback = full_record_read &&
+    (state & kGraphReadNeedsExtentFallback) != 0;
+  return GraphReadAdmissionAccounting{
+    .fallback_reads = fallback ? 1u : 0u,
+    .underhint_reads =
+      fallback && (state & kGraphReadExtentUnderhint) != 0 ? 1u : 0u,
+    .retry_reads = batch_attempt != 0 ||
+        (fallback && (state & kGraphReadStartedWithShortExtent) == 0)
+      ? 1u : 0u,
+  };
+}
+
+// Per-query physical accounting for dynamic graph traffic.  The structure is
+// intended to live in shared memory and is passed by pointer through the RDMA
+// helpers, avoiding six additional wide call arguments. Counts include every
+// admitted physical snapshot attempt (including full retries), while fallback
+// counts only the first admitted short->full upgrade.
+struct DynamicGraphTelemetry {
+  u64 read_bytes{};
+  u32 short_reads{};
+  u32 full_reads{};
+  u32 fallback_reads{};
+  u32 hint_promotions{};
+  u32 hint_demotions{};
+};
+
+__device__ __forceinline__ bool dynamic_graph_telemetry_handle(u64 handle) {
+  return handle != 0 && handle != kInvalidDeviceHandle &&
+    remote_incarnation(handle) != 0;
+}
+
+__device__ __forceinline__ void add_dynamic_graph_read_telemetry(
+    DynamicGraphTelemetry* telemetry,
+    u32 short_reads,
+    u32 full_reads,
+    u64 read_bytes,
+    u32 fallback_reads = 0) {
+  if (telemetry == nullptr) return;
+  if (short_reads != 0) atomicAdd(&telemetry->short_reads, short_reads);
+  if (full_reads != 0) atomicAdd(&telemetry->full_reads, full_reads);
+  if (read_bytes != 0) {
+    atomicAdd(
+      reinterpret_cast<unsigned long long*>(&telemetry->read_bytes),
+      static_cast<unsigned long long>(read_bytes));
+  }
+  if (fallback_reads != 0) {
+    atomicAdd(&telemetry->fallback_reads, fallback_reads);
+  }
+}
+
 // Validate an asynchronously fetched frontier payload in the consuming query
 // CTA. Publishing the CQ completion no longer depends on owner-side checksum
 // work or a cross-thread system fence; the same snapshot/incarnation and
 // Live-Extent rules are applied after the completion acquire.
 __device__ FrontierValidationState validate_frontier_record_local(
     const PersistentKernelParams& params, u32 query_slot,
-    const FrontierRobEntry& entry) {
+    const FrontierRobEntry& entry,
+    DynamicGraphTelemetry* dynamic_telemetry = nullptr) {
   const u8* record = graph_record_pointer(
     params, query_slot,
     kGraphScratchBit | static_cast<u32>(entry.scratch_slot));
@@ -2120,7 +2433,17 @@ __device__ FrontierValidationState validate_frontier_record_local(
     graph_record_validation::required_live_extent_bytes(
       record, entry.transfer_bytes, params.graph_degree,
       params.graph_entry_capacity, required_bytes);
-  if (!prefix_valid || required_bytes > entry.transfer_bytes) {
+  if (!prefix_valid) {
+    return FrontierValidationState::invalid_snapshot;
+  }
+  if (entry.transfer_bytes < params.graph_entry_bytes &&
+      required_bytes > entry.transfer_bytes) {
+    // This short prefix is not checksum-authoritative. Preserve only a
+    // query-local force-full classification; the full retry below is the
+    // first point allowed to repair the global extent hint.
+    return FrontierValidationState::extent_underhint;
+  }
+  if (required_bytes > entry.transfer_bytes) {
     return FrontierValidationState::invalid_snapshot;
   }
   const graph_record_validation::SnapshotState snapshot =
@@ -2129,6 +2452,14 @@ __device__ FrontierValidationState validate_frontier_record_local(
           params, record, entry.transfer_bytes, entry.node_handle)
       : classify_graph_record(params, record, entry.node_handle);
   if (snapshot == graph_record_validation::SnapshotState::valid) {
+    // Only a checksum-valid exact snapshot may move a dynamic hint down. The
+    // helper applies hysteresis and rejects BUSY/recycled incarnations.
+    if (adapt_dynamic_graph_extent_class(
+          params, entry.node_handle, required_bytes) ==
+          DynamicGraphExtentAdaptation::demoted &&
+        dynamic_telemetry != nullptr) {
+      atomicAdd(&dynamic_telemetry->hint_demotions, 1u);
+    }
     return FrontierValidationState::valid;
   }
   return snapshot ==
@@ -2155,6 +2486,7 @@ struct CoreFrontierTelemetry {
   u32* arrived{};
   u32* stale{};
   u32* ready_waves{};
+  DynamicGraphTelemetry* dynamic_graph{};
 };
 
 // A split descriptor is visible to the query before the owner knows whether
@@ -2179,6 +2511,7 @@ struct TailFrontierTelemetry {
   u64* completion_groups{};
   u64* wasted_bytes{};
   TailAdmissionCorrection* admission_correction{};
+  DynamicGraphTelemetry* dynamic_graph{};
 };
 
 // A narrow core or tail frontier is owned by one warp. This avoids the
@@ -2204,7 +2537,8 @@ __device__ bool issue_narrow_frontier_graph_batch(
     u64* classified_graph_bytes,
     u32* queue_rejects,
     u32* prefetch_reads = nullptr,
-    u64* prefetch_bytes = nullptr) {
+    u64* prefetch_bytes = nullptr,
+    DynamicGraphTelemetry* dynamic_telemetry = nullptr) {
   constexpr u32 full_warp = 0xffffffffu;
   const u32 lane = threadIdx.x & 31u;
   const size_t request_base =
@@ -2242,9 +2576,12 @@ __device__ bool issue_narrow_frontier_graph_batch(
     u32 admitted_reads = 0;
     u32 admitted_short_reads = 0;
     u32 admitted_full_reads = 0;
+    u32 admitted_dynamic_short_reads = 0;
+    u32 admitted_dynamic_full_reads = 0;
     u32 rejected_reads = 0;
     u32 fatal_batches = 0;
     u64 admitted_bytes = 0;
+    u64 admitted_dynamic_bytes = 0;
     if (lane == 0) {
       batch.active = 0;
       batch.fatal = 0;
@@ -2322,6 +2659,10 @@ __device__ bool issue_narrow_frontier_graph_batch(
     const u32 short_mask = __ballot_sync(
       full_warp,
       valid_request && lane_bytes < params.graph_entry_bytes);
+    const bool dynamic_request = valid_request &&
+      dynamic_graph_telemetry_handle(rob[slot_begin + lane].node_handle);
+    const u32 dynamic_mask =
+      __ballot_sync(full_warp, dynamic_request);
     if (valid_request) {
       const u32 shard_group =
         __match_any_sync(valid_mask, shard);
@@ -2332,6 +2673,14 @@ __device__ bool issue_narrow_frontier_graph_batch(
       const u32 short_reads =
         __popc(shard_group & short_mask);
       const u32 full_reads = matching - short_reads;
+      const u32 dynamic_matching =
+        __popc(shard_group & dynamic_mask);
+      const u32 dynamic_short_reads =
+        __popc(shard_group & dynamic_mask & short_mask);
+      const u32 dynamic_full_reads =
+        dynamic_matching - dynamic_short_reads;
+      const u32 dynamic_payload_bytes = __reduce_add_sync(
+        shard_group, dynamic_request ? lane_bytes : 0u);
       if (lane == leader) {
         const u64 issue_timestamp_ns = global_time_ns();
         const i32 status = direct_fetch_batch(
@@ -2352,6 +2701,9 @@ __device__ bool issue_narrow_frontier_graph_batch(
           admitted_bytes = payload_bytes;
           admitted_short_reads = short_reads;
           admitted_full_reads = full_reads;
+          admitted_dynamic_bytes = dynamic_payload_bytes;
+          admitted_dynamic_short_reads = dynamic_short_reads;
+          admitted_dynamic_full_reads = dynamic_full_reads;
         } else {
           // Publish an immediate producer-side failure into the same
           // completion word consumed by the lane-local state transition.
@@ -2384,12 +2736,18 @@ __device__ bool issue_narrow_frontier_graph_batch(
         __shfl_down_sync(full_warp, admitted_short_reads, offset);
       admitted_full_reads +=
         __shfl_down_sync(full_warp, admitted_full_reads, offset);
+      admitted_dynamic_short_reads += __shfl_down_sync(
+        full_warp, admitted_dynamic_short_reads, offset);
+      admitted_dynamic_full_reads += __shfl_down_sync(
+        full_warp, admitted_dynamic_full_reads, offset);
       rejected_reads +=
         __shfl_down_sync(full_warp, rejected_reads, offset);
       fatal_batches +=
         __shfl_down_sync(full_warp, fatal_batches, offset);
       admitted_bytes +=
         __shfl_down_sync(full_warp, admitted_bytes, offset);
+      admitted_dynamic_bytes += __shfl_down_sync(
+        full_warp, admitted_dynamic_bytes, offset);
     }
     if (lane == 0) {
       batch.active = admitted_batches != 0 ? 1u : 0u;
@@ -2402,6 +2760,9 @@ __device__ bool issue_narrow_frontier_graph_batch(
       *classified_graph_bytes += admitted_bytes;
       *graph_live_extent_reads += admitted_short_reads;
       *graph_full_record_reads += admitted_full_reads;
+      add_dynamic_graph_read_telemetry(
+        dynamic_telemetry, admitted_dynamic_short_reads,
+        admitted_dynamic_full_reads, admitted_dynamic_bytes);
       *queue_rejects += rejected_reads;
       if (prefetch_reads != nullptr) {
         *prefetch_reads += admitted_reads;
@@ -2471,7 +2832,8 @@ __device__ bool issue_split_frontier_graph_batch(
     u32* speculative_queue_rejects,
     u32* core_prefetch_reads,
     u64* core_prefetch_bytes,
-    u32* tail_admitted) {
+    u32* tail_admitted,
+    DynamicGraphTelemetry* dynamic_telemetry = nullptr) {
   constexpr u32 full_warp = 0xffffffffu;
   const u32 lane = threadIdx.x & 31u;
   // `request_count` is the admitted frontier width for this epoch, not the
@@ -2609,6 +2971,10 @@ __device__ bool issue_split_frontier_graph_batch(
     const u32 short_mask = __ballot_sync(
       full_warp,
       valid_request && lane_bytes < params.graph_entry_bytes);
+    const bool dynamic_request = valid_request &&
+      dynamic_graph_telemetry_handle(rob[lane].node_handle);
+    const u32 dynamic_mask =
+      __ballot_sync(full_warp, dynamic_request);
 
     u32 admitted_core_reads = 0;
     u32 admitted_tail_reads = 0;
@@ -2616,6 +2982,9 @@ __device__ bool issue_split_frontier_graph_batch(
     u32 admitted_tail_bytes = 0;
     u32 admitted_short_reads = 0;
     u32 admitted_full_reads = 0;
+    u32 admitted_dynamic_short_reads = 0;
+    u32 admitted_dynamic_full_reads = 0;
+    u32 admitted_dynamic_bytes = 0;
     u32 admitted_core_batches = 0;
     u32 admitted_tail_batches = 0;
     u32 rejected_core_reads = 0;
@@ -2635,6 +3004,14 @@ __device__ bool issue_split_frontier_graph_batch(
       const u32 short_reads = __popc(shard_group & short_mask);
       const u32 full_reads =
         core_matching + tail_matching - short_reads;
+      const u32 dynamic_matching =
+        __popc(shard_group & dynamic_mask);
+      const u32 dynamic_short_reads =
+        __popc(shard_group & dynamic_mask & short_mask);
+      const u32 dynamic_full_reads =
+        dynamic_matching - dynamic_short_reads;
+      const u32 dynamic_payload_bytes = __reduce_add_sync(
+        shard_group, dynamic_request ? lane_bytes : 0u);
 
       if (lane == leader) {
         // Timestamp before publication: the exclusive owner may dequeue and
@@ -2667,6 +3044,9 @@ __device__ bool issue_split_frontier_graph_batch(
           }
           admitted_short_reads = short_reads;
           admitted_full_reads = full_reads;
+          admitted_dynamic_short_reads = dynamic_short_reads;
+          admitted_dynamic_full_reads = dynamic_full_reads;
+          admitted_dynamic_bytes = dynamic_payload_bytes;
         } else {
           if (core_matching != 0) {
             core_statuses[shard] = issue_status;
@@ -2702,6 +3082,12 @@ __device__ bool issue_split_frontier_graph_batch(
         full_warp, admitted_short_reads, offset);
       admitted_full_reads += __shfl_down_sync(
         full_warp, admitted_full_reads, offset);
+      admitted_dynamic_short_reads += __shfl_down_sync(
+        full_warp, admitted_dynamic_short_reads, offset);
+      admitted_dynamic_full_reads += __shfl_down_sync(
+        full_warp, admitted_dynamic_full_reads, offset);
+      admitted_dynamic_bytes += __shfl_down_sync(
+        full_warp, admitted_dynamic_bytes, offset);
       admitted_core_batches += __shfl_down_sync(
         full_warp, admitted_core_batches, offset);
       admitted_tail_batches += __shfl_down_sync(
@@ -2729,6 +3115,9 @@ __device__ bool issue_split_frontier_graph_batch(
       *graph_read_bytes += admitted_bytes;
       *graph_live_extent_reads += admitted_short_reads;
       *graph_full_record_reads += admitted_full_reads;
+      add_dynamic_graph_read_telemetry(
+        dynamic_telemetry, admitted_dynamic_short_reads,
+        admitted_dynamic_full_reads, admitted_dynamic_bytes);
       *critical_graph_reads += admitted_core_reads;
       *critical_graph_bytes += admitted_core_bytes;
       *speculative_graph_reads += admitted_tail_reads;
@@ -2808,7 +3197,8 @@ __device__ bool issue_frontier_graph_batch(
     u64* speculative_graph_bytes,
     u32* speculative_queue_rejects,
     u32* prefetch_reads = nullptr,
-    u64* prefetch_bytes = nullptr) {
+    u64* prefetch_bytes = nullptr,
+    DynamicGraphTelemetry* dynamic_telemetry = nullptr) {
   // Completion/status/request storage is wave-owned. Reusing it while an
   // owner still holds the prior descriptor is an ABA corruption, not
   // backpressure. The query pipeline normally defers new tail admission; keep
@@ -2841,7 +3231,8 @@ __device__ bool issue_frontier_graph_batch(
       remote_batches, total_remote_reads,
       graph_read_bytes, graph_live_extent_reads, graph_full_record_reads,
       speculative_graph_reads, speculative_graph_bytes,
-      speculative_queue_rejects, prefetch_reads, prefetch_bytes);
+      speculative_queue_rejects, prefetch_reads, prefetch_bytes,
+      dynamic_telemetry);
   }
   const size_t request_base =
     static_cast<size_t>(descriptor.query_slot) *
@@ -2938,6 +3329,9 @@ __device__ bool issue_frontier_graph_batch(
     u32 payload_bytes = 0;
     u32 short_reads = 0;
     u32 full_reads = 0;
+    u32 dynamic_short_reads = 0;
+    u32 dynamic_full_reads = 0;
+    u64 dynamic_payload_bytes = 0;
     for (u32 local = 0; local < slot_count; ++local) {
       if (request_shards[local] != shard) continue;
       ++matching;
@@ -2948,6 +3342,15 @@ __device__ bool issue_frontier_graph_batch(
         ++short_reads;
       } else {
         ++full_reads;
+      }
+      if (dynamic_graph_telemetry_handle(
+            rob[slot_begin + local].node_handle)) {
+        dynamic_payload_bytes += bytes;
+        if (bytes < params.graph_entry_bytes) {
+          ++dynamic_short_reads;
+        } else {
+          ++dynamic_full_reads;
+        }
       }
     }
     if (matching == 0) continue;
@@ -2988,6 +3391,9 @@ __device__ bool issue_frontier_graph_batch(
       if (full_reads != 0) {
         atomicAdd(graph_full_record_reads, full_reads);
       }
+      add_dynamic_graph_read_telemetry(
+        dynamic_telemetry, dynamic_short_reads, dynamic_full_reads,
+        dynamic_payload_bytes);
     } else if (status == -EAGAIN) {
       atomicAdd(&batch.rejected, matching);
       atomicAdd(speculative_queue_rejects, matching);
@@ -3055,7 +3461,8 @@ __device__ __forceinline__ bool finish_core_frontier_graph_batch(
     u64* completion_groups,
     u32* arrived,
     u32* stale,
-    u32* ready_waves) {
+    u32* ready_waves,
+    DynamicGraphTelemetry* dynamic_telemetry = nullptr) {
   // No descriptor was admitted for this epoch. Avoid rescanning stale
   // per-shard completion words and the core ROB prefix; in a stable wide
   // frontier this is the common case because retained tail records already
@@ -3138,7 +3545,7 @@ __device__ __forceinline__ bool finish_core_frontier_graph_batch(
           local_arrived = true;
           const FrontierValidationState validation =
             validate_frontier_record_local(
-              params, descriptor.query_slot, entry);
+              params, descriptor.query_slot, entry, dynamic_telemetry);
           if (validation == FrontierValidationState::valid) {
             entry.state =
               static_cast<u8>(FrontierRequestState::validated);
@@ -3175,12 +3582,12 @@ __device__ __forceinline__ bool finish_core_frontier_graph_batch(
 //   * true: wait for the first completion, then harvest the complete visible
 //     CQ backlog;
 //   * false: return zero immediately when the CQ is empty so the caller can
-//     score an already READY ordered-parent prefix during that network gap.
+//     consume already READY query-private parent work during that network gap.
 //
 // The tri-state result is -1 for a fatal batch, zero for a nonblocking empty
 // observation, and one after useful progress. A single-group consumer paid
 // two full shard scans, a wide call ABI, and four CTA barriers even when the
-// completed shard could not advance the ordered Beam prefix. Batched harvest
+// completed shard exposed only parents behind a lower-rank hole. Batched harvest
 // changes only private ROB arrival/validation state; Beam publication remains
 // outside this function and therefore frontier-consistent.
 __device__ __noinline__ i32 finish_next_core_frontier_group(
@@ -3296,7 +3703,8 @@ __device__ __noinline__ i32 finish_next_core_frontier_group(
         local_arrived = true;
         const FrontierValidationState validation =
           validate_frontier_record_local(
-            params, descriptor.query_slot, entry);
+            params, descriptor.query_slot, entry,
+            telemetry.dynamic_graph);
         if (validation == FrontierValidationState::valid) {
           entry.state =
             static_cast<u8>(FrontierRequestState::validated);
@@ -3372,7 +3780,8 @@ __device__ __forceinline__ bool finish_narrow_speculative_frontier_batch(
     u64* speculative_wait_cycles,
     u64* speculative_completion_latency_ns,
     u64* speculative_completion_groups,
-    u64* speculative_wasted_bytes) {
+    u64* speculative_wasted_bytes,
+    DynamicGraphTelemetry* dynamic_telemetry = nullptr) {
   if (batch.active == 0) return batch.fatal == 0;
   constexpr u32 full_warp = 0xffffffffu;
   const u32 lane = threadIdx.x & 31u;
@@ -3473,7 +3882,7 @@ __device__ __forceinline__ bool finish_narrow_speculative_frontier_batch(
           local_arrived = true;
           const FrontierValidationState validation =
             validate_frontier_record_local(
-              params, descriptor.query_slot, entry);
+              params, descriptor.query_slot, entry, dynamic_telemetry);
           if (validation == FrontierValidationState::valid) {
             entry.state =
               static_cast<u8>(FrontierRequestState::validated);
@@ -3624,6 +4033,9 @@ __device__ __noinline__ bool finish_query_tail_frontier_batch(
     u64 local_rejected_bytes = 0;
     u32 local_rejected_live_extent_reads = 0;
     u32 local_rejected_full_record_reads = 0;
+    u64 local_rejected_dynamic_bytes = 0;
+    u32 local_rejected_dynamic_short_reads = 0;
+    u32 local_rejected_dynamic_full_reads = 0;
     FrontierRobEntry& entry = rob[lane];
     if (entry.state ==
         static_cast<u8>(FrontierRequestState::inflight)) {
@@ -3641,7 +4053,8 @@ __device__ __noinline__ bool finish_query_tail_frontier_batch(
         local_arrived = true;
         const FrontierValidationState validation =
           validate_frontier_record_local(
-            params, descriptor.query_slot, entry);
+            params, descriptor.query_slot, entry,
+            telemetry.dynamic_graph);
         if (validation == FrontierValidationState::valid) {
           entry.state =
             static_cast<u8>(FrontierRequestState::validated);
@@ -3659,6 +4072,13 @@ __device__ __noinline__ bool finish_query_tail_frontier_batch(
           entry.transfer_bytes < params.graph_entry_bytes ? 1u : 0u;
         local_rejected_full_record_reads =
           entry.transfer_bytes < params.graph_entry_bytes ? 0u : 1u;
+        if (dynamic_graph_telemetry_handle(entry.node_handle)) {
+          local_rejected_dynamic_bytes = entry.transfer_bytes;
+          local_rejected_dynamic_short_reads =
+            entry.transfer_bytes < params.graph_entry_bytes ? 1u : 0u;
+          local_rejected_dynamic_full_reads =
+            entry.transfer_bytes < params.graph_entry_bytes ? 0u : 1u;
+        }
         // This payload never reached the NIC. Keep the terminal ROB state for
         // exact retry, but do not later charge it as speculative waste.
         entry.transfer_bytes = 0;
@@ -3682,6 +4102,12 @@ __device__ __noinline__ bool finish_query_tail_frontier_batch(
         full_warp, local_rejected_live_extent_reads, offset);
       local_rejected_full_record_reads += __shfl_down_sync(
         full_warp, local_rejected_full_record_reads, offset);
+      local_rejected_dynamic_bytes += __shfl_down_sync(
+        full_warp, local_rejected_dynamic_bytes, offset);
+      local_rejected_dynamic_short_reads += __shfl_down_sync(
+        full_warp, local_rejected_dynamic_short_reads, offset);
+      local_rejected_dynamic_full_reads += __shfl_down_sync(
+        full_warp, local_rejected_dynamic_full_reads, offset);
     }
     if (lane == 0) {
       *telemetry.arrived += __popc(arrived_mask);
@@ -3695,6 +4121,22 @@ __device__ __noinline__ bool finish_query_tail_frontier_batch(
         local_rejected_live_extent_reads;
       telemetry.admission_correction->rejected_full_record_reads +=
         local_rejected_full_record_reads;
+      // Split admission initially counts the complete core+tail descriptor.
+      // If the owner later rejects only the tail before posting any WQE, remove
+      // its dynamic traffic here exactly once alongside the existing deferred
+      // aggregate correction. This keeps the DynaExtent counters physical even
+      // if callers use an older TailAdmissionCorrection consumer.
+      if (telemetry.dynamic_graph != nullptr) {
+        telemetry.dynamic_graph->read_bytes -= min(
+          telemetry.dynamic_graph->read_bytes,
+          local_rejected_dynamic_bytes);
+        telemetry.dynamic_graph->short_reads -= min(
+          telemetry.dynamic_graph->short_reads,
+          local_rejected_dynamic_short_reads);
+        telemetry.dynamic_graph->full_reads -= min(
+          telemetry.dynamic_graph->full_reads,
+          local_rejected_dynamic_full_reads);
+      }
       *telemetry.wait_cycles +=
         clock64() - query_tail_finish_started_cycles;
       batch.active = 0;
@@ -3727,7 +4169,8 @@ __device__ bool finish_frontier_graph_batch(
     u32* classified_arrived = nullptr,
     u32* classified_stale = nullptr,
     u64* classified_wasted_bytes = nullptr,
-    u32* classified_ready_waves = nullptr) {
+    u32* classified_ready_waves = nullptr,
+    DynamicGraphTelemetry* dynamic_telemetry = nullptr) {
   if (batch.active == 0) return batch.fatal == 0;
   if (slot_begin > kPersistentFrontierRobCapacity ||
       slot_count > kPersistentFrontierRobCapacity - slot_begin ||
@@ -3753,7 +4196,8 @@ __device__ bool finish_frontier_graph_batch(
       batch_statuses, batch_completion_timestamps_ns,
       wait_for_completion, speculative_arrived, speculative_stale,
       speculative_wait_cycles, speculative_completion_latency_ns,
-      speculative_completion_groups, speculative_wasted_bytes);
+      speculative_completion_groups, speculative_wasted_bytes,
+      dynamic_telemetry);
   }
   if (blockDim.x == kApproximateSortThreadsCompact &&
       wait_for_completion && slot_begin == 0 &&
@@ -3769,7 +4213,8 @@ __device__ bool finish_frontier_graph_batch(
       params, descriptor, rob, batch, slot_count, batch_statuses,
       batch_completion_timestamps_ns, speculative_wait_cycles,
       speculative_completion_latency_ns, speculative_completion_groups,
-      classified_arrived, classified_stale, classified_ready_waves);
+      classified_arrived, classified_stale, classified_ready_waves,
+      dynamic_telemetry);
   }
   i32* completion_statuses = batch_statuses +
     static_cast<size_t>(descriptor.query_slot) * params.num_shards;
@@ -3875,7 +4320,7 @@ __device__ bool finish_frontier_graph_batch(
     }
     const FrontierValidationState validation =
       validate_frontier_record_local(
-        params, descriptor.query_slot, entry);
+        params, descriptor.query_slot, entry, dynamic_telemetry);
     if (validation == FrontierValidationState::valid) {
       entry.state = static_cast<u8>(FrontierRequestState::validated);
       entry.validation =
@@ -3946,7 +4391,9 @@ __device__ u32 fetch_graph_records_batch(
     u32 route_attempt,
     u32 search_round,
     bool trace_enabled,
-    GraphFetchCycleBreakdown* cycle_breakdown) {
+    GraphFetchCycleBreakdown* cycle_breakdown,
+    DynamicGraphTelemetry* dynamic_telemetry = nullptr,
+    const u8* force_full_underhint = nullptr) {
   __shared__ i32 shard_status[kPersistentMaxShards];
   __shared__ u64 shard_issue_timestamp_ns[kPersistentMaxShards];
   __shared__ u64 stage_started_cycles;
@@ -3988,13 +4435,8 @@ __device__ u32 fetch_graph_records_batch(
 
   constexpr u32 warp_width = 32;
   // `remote_reads` is query-local scratch. Bit zero preserves its original
-  // logical-read counter contract; bit one remembers that this parent started
-  // with a short extent. The latter lets a short->full upgrade retain the
-  // legacy budget of three authoritative full snapshot attempts.
-  constexpr u32 kLogicalGraphRead = 1u;
-  constexpr u32 kStartedWithShortExtent = 2u;
-  constexpr u32 kNeedsExtentFallbackRead = 4u;
-  constexpr u32 kExtentUnderhintFallback = 8u;
+  // logical-read counter contract; the remaining bits carry retry provenance
+  // across physical attempts without publishing an unverified short header.
   const u32 warp = threadIdx.x / warp_width;
   const u32 lane_in_warp = threadIdx.x % warp_width;
   const u32 warp_count = max(1u, blockDim.x / warp_width);
@@ -4035,12 +4477,14 @@ __device__ u32 fetch_graph_records_batch(
           ((min(scratch_slot, 0x3fu) & 0x3fu) << 9);
         atomicCAS(&failed, 0u, detail);
       } else {
+        const bool force_full =
+          force_full_underhint != nullptr &&
+          force_full_underhint[index] != 0;
+        remote_reads[index] = prepare_graph_read_attempt_state(
+          params.graph_entry_bytes, force_full, transfer_bytes);
         if (request_bytes != nullptr) {
           request_bytes[index] = transfer_bytes;
         }
-        remote_reads[index] = kLogicalGraphRead |
-          (transfer_bytes < params.graph_entry_bytes
-             ? kStartedWithShortExtent : 0u);
       }
     }
   }
@@ -4109,11 +4553,23 @@ __device__ u32 fetch_graph_records_batch(
       u32 full_reads = 0;
       u32 fallback_reads = 0;
       u32 underhint_reads = 0;
+      u32 retry_reads = 0;
+      u32 dynamic_short_reads = 0;
+      u32 dynamic_full_reads = 0;
+      u32 dynamic_fallback_reads = 0;
+      u64 dynamic_payload_bytes = 0;
       for (u32 index = 0; index < count; ++index) {
         if (request_shards[index] != shard) continue;
         ++matching;
+        const u32 transfer_bytes = live_extent_enabled
+          ? request_bytes[index] : params.graph_entry_bytes;
+        const bool full_record_read =
+          transfer_bytes >= params.graph_entry_bytes;
+        const GraphReadAdmissionAccounting admission =
+          classify_graph_read_admission(
+            remote_reads[index], full_record_read, attempt);
+        retry_reads += admission.retry_reads;
         if (live_extent_enabled) {
-          const u32 transfer_bytes = request_bytes[index];
           payload_bytes += transfer_bytes;
           minimum_bytes = min(minimum_bytes, transfer_bytes);
           maximum_bytes = max(maximum_bytes, transfer_bytes);
@@ -4121,13 +4577,17 @@ __device__ u32 fetch_graph_records_batch(
             ++short_reads;
           } else {
             ++full_reads;
-            const bool is_fallback =
-              (remote_reads[index] & kNeedsExtentFallbackRead) != 0;
-            fallback_reads += is_fallback ? 1u : 0u;
-            underhint_reads +=
-              is_fallback &&
-                  (remote_reads[index] & kExtentUnderhintFallback) != 0
-                ? 1u : 0u;
+            fallback_reads += admission.fallback_reads;
+            underhint_reads += admission.underhint_reads;
+          }
+        }
+        if (dynamic_graph_telemetry_handle(handles[index])) {
+          dynamic_payload_bytes += transfer_bytes;
+          if (transfer_bytes < params.graph_entry_bytes) {
+            ++dynamic_short_reads;
+          } else {
+            ++dynamic_full_reads;
+            dynamic_fallback_reads += admission.fallback_reads;
           }
         }
       }
@@ -4212,18 +4672,29 @@ __device__ u32 fetch_graph_records_batch(
             underhint_reads != 0) {
           atomicAdd(graph_extent_underhint_reads, underhint_reads);
         }
+        add_dynamic_graph_read_telemetry(
+          dynamic_telemetry, dynamic_short_reads, dynamic_full_reads,
+          dynamic_payload_bytes, dynamic_fallback_reads);
         // Count one fallback only when its first full WQE is admitted. Further
         // full snapshot retries remain graph_read_retries but are not another
         // stale-hint fallback.
         if (fallback_reads != 0) {
           for (u32 index = 0; index < count; ++index) {
             if (request_shards[index] == shard) {
-              remote_reads[index] &= ~kNeedsExtentFallbackRead;
+              remote_reads[index] =
+                graph_read_state_after_fallback_admission(
+                  remote_reads[index]);
             }
           }
         }
-        if (attempt != 0 && graph_read_retries != nullptr) {
-          atomicAdd(graph_read_retries, matching);
+        if (graph_read_retries != nullptr) {
+          // A query-local force-full is attempt zero only inside this helper;
+          // physically it follows the already-admitted async short and must
+          // retain the original short->full retry count. Later checksum full
+          // attempts continue to contribute once each.
+          if (retry_reads != 0) {
+            atomicAdd(graph_read_retries, retry_reads);
+          }
         }
       }
     }
@@ -4335,7 +4806,7 @@ __device__ u32 fetch_graph_records_batch(
               : classify_graph_record(params, record, handles[index]))
           : graph_record_validation::SnapshotState::invalid;
       const bool started_with_short =
-        (remote_reads[index] & kStartedWithShortExtent) != 0;
+        (remote_reads[index] & kGraphReadStartedWithShortExtent) != 0;
       const bool attempts_remain =
         graph_record_validation::snapshot_retry_available(
           attempt, started_with_short, partial_read,
@@ -4352,11 +4823,22 @@ __device__ u32 fetch_graph_records_batch(
         // from the optimistic short header that triggered the upgrade. This
         // prevents a transient torn header from inflating the high-water hint.
         if (!partial_read &&
-            (remote_reads[index] & kExtentUnderhintFallback) != 0 &&
+            (remote_reads[index] & kGraphReadExtentUnderhint) != 0 &&
             promote_graph_extent_class(
-              params, handles[index], required_bytes) &&
-            graph_extent_hint_promotions != nullptr) {
-          atomicAdd(graph_extent_hint_promotions, 1u);
+              params, handles[index], required_bytes)) {
+          if (graph_extent_hint_promotions != nullptr) {
+            atomicAdd(graph_extent_hint_promotions, 1u);
+          }
+          if (dynamic_telemetry != nullptr &&
+              dynamic_graph_telemetry_handle(handles[index])) {
+            atomicAdd(&dynamic_telemetry->hint_promotions, 1u);
+          }
+        }
+        if (adapt_dynamic_graph_extent_class(
+              params, handles[index], required_bytes) ==
+              DynamicGraphExtentAdaptation::demoted &&
+            dynamic_telemetry != nullptr) {
+          atomicAdd(&dynamic_telemetry->hint_demotions, 1u);
         }
         // UINT32_MAX removes this entry from subsequent per-shard retry
         // batches while leaving acquired_slots intact for traversal.
@@ -4374,9 +4856,9 @@ __device__ u32 fetch_graph_records_batch(
       if (action == graph_record_validation::ReadAction::retry) {
         if (partial_read) {
           request_bytes[index] = params.graph_entry_bytes;
-          remote_reads[index] |= kNeedsExtentFallbackRead;
+          remote_reads[index] |= kGraphReadNeedsExtentFallback;
           if (extent_underhint) {
-            remote_reads[index] |= kExtentUnderhintFallback;
+            remote_reads[index] |= kGraphReadExtentUnderhint;
           }
         }
         atomicAdd(&retry_pending, 1u);

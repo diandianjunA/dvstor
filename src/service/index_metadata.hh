@@ -41,6 +41,10 @@ struct Metadata {
   u32 hot_graph_dynamic_hot_offset{};
   u32 dynamic_navigation_code_offset{};
   u32 dynamic_navigation_code_validation_bytes{};
+  // Early schema-16 metadata did not name the trailer explicitly. Dynamic
+  // nodes are runtime materializations, so they can use the checksum after an
+  // upgrade whenever the loader's record-padding check succeeds.
+  u32 dynamic_navigation_code_checksum_bytes{sizeof(u32)};
   u32 allocation_size{};
   str idmap_format{};
   str centroid_state_format{};

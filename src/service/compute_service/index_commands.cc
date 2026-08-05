@@ -135,14 +135,17 @@ bool ComputeService::validate_index_metadata(
       metadata.hot_graph_dynamic_record_bytes <
         metadata.hot_graph_dynamic_hot_offset + metadata.hot_graph_entry_size ||
       metadata.hot_graph_dynamic_hot_offset < VamanaNode::total_size() ||
-      metadata.dynamic_navigation_code_offset <
+      metadata.dynamic_navigation_code_offset !=
         metadata.hot_graph_dynamic_hot_offset + metadata.hot_graph_entry_size ||
       metadata.dynamic_navigation_code_validation_bytes !=
         VamanaNode::DYNAMIC_CODE_INCARNATION_BYTES ||
+      metadata.dynamic_navigation_code_checksum_bytes !=
+        VamanaNode::DYNAMIC_CODE_CHECKSUM_BYTES ||
       metadata.hot_graph_dynamic_record_bytes <
         metadata.dynamic_navigation_code_offset +
           metadata.dynamic_navigation_code_validation_bytes +
-          metadata.navigation_code_bytes) {
+          metadata.navigation_code_bytes +
+          metadata.dynamic_navigation_code_checksum_bytes) {
     if (error_message != nullptr) *error_message = "index storage layout mismatch";
     return false;
   }

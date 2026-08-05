@@ -885,7 +885,8 @@ LegacyIndexConvertResult convert_legacy_index(
                                "navigation_entry_points", "storage_control_remote_offsets",
                                "dynamic_node_base_offsets",
                                "dynamic_navigation_code_offset",
-                               "dynamic_navigation_code_validation_bytes"}) {
+                               "dynamic_navigation_code_validation_bytes",
+                               "dynamic_navigation_code_checksum_bytes"}) {
     metadata.erase(obsolete);
   }
 
