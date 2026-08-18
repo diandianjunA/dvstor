@@ -35,6 +35,17 @@ inline bool stage1_worker_has_eligible_task(
     (!stage2_home_dedicated && stage2_home_available);
 }
 
+// Keep the CQ response router and the Stage2 caller on one definition of the
+// home-search response family.  A response type omitted from the router is
+// otherwise silently reposted, leaving an already completed home RPC pending
+// until its caller retries forever.
+inline bool is_stage2_home_response(
+    service::storage_owner::PeerRpcType type) noexcept {
+  using service::storage_owner::PeerRpcType;
+  return type == PeerRpcType::stage2_expand_score_response ||
+    type == PeerRpcType::stage2_score_many_response;
+}
+
 inline bool dequeue_stage2_home_first(
     bool stage1_available,
     bool stage2_home_available,
