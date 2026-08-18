@@ -633,6 +633,57 @@ void test_singleton_direct_timeout_retries_exact_wire_image() {
   assert(outbox.size() == 0 && outbox.aggregate_size() == 0);
 }
 
+void test_deadline_gate_recomputes_after_stale_earliest_owner() {
+  detail::Stage2HomeRpcOutbox outbox(
+    8, 4, 5, 32, 256, 256, 1u << 20);
+  auto later_request = expand_request(1, 17500, 156);
+  auto earlier_request = expand_request(1, 17600, 157);
+  constexpr std::uint64_t later_id = 75;
+  constexpr std::uint64_t earlier_id = 76;
+  assert(outbox.try_enqueue(dispatch(
+           later_id, 2,
+           protocol::PeerRpcType::stage2_expand_score_request,
+           1, later_request)) == detail::Stage2HomeRpcEnqueueResult::enqueued);
+  const auto later = outbox.form_singleton_direct(
+    2, protocol::PeerRpcType::stage2_expand_score_request, 0);
+  assert(later.has_value());
+  std::vector<byte_t> later_wire(later->request_bytes);
+  std::size_t later_bytes = 0;
+  const auto later_post = outbox.claim_ready_for_post(
+    later_id, later_wire, later_bytes);
+  assert(later_post.has_value());
+  assert(outbox.mark_awaiting_response(*later_post, 200));
+
+  assert(outbox.try_enqueue(dispatch(
+           earlier_id, 3,
+           protocol::PeerRpcType::stage2_expand_score_request,
+           1, earlier_request)) ==
+         detail::Stage2HomeRpcEnqueueResult::enqueued);
+  const auto earlier = outbox.form_singleton_direct(
+    3, protocol::PeerRpcType::stage2_expand_score_request, 0);
+  assert(earlier.has_value());
+  std::vector<byte_t> earlier_wire(earlier->request_bytes);
+  std::size_t earlier_bytes = 0;
+  const auto earlier_post = outbox.claim_ready_for_post(
+    earlier_id, earlier_wire, earlier_bytes);
+  assert(earlier_post.has_value());
+  assert(outbox.mark_awaiting_response(*earlier_post, 100));
+
+  // Cancelling the earliest request intentionally leaves a stale atomic
+  // lower bound. Before that bound, promote_expired must remain a lock-free
+  // no-op; at the stale bound one repair scan discovers the live deadline.
+  assert(outbox.cancel_logical(earlier_id));
+  assert(outbox.promote_expired(99) == 0);
+  assert(outbox.promote_expired(100) == 0);
+  assert(outbox.promote_expired(199) == 0);
+  assert(outbox.promote_expired(200) == 1);
+  const auto retry_id = outbox.next_retry_wire_request(
+    2, protocol::PeerRpcType::stage2_expand_score_request);
+  assert(retry_id.has_value() && *retry_id == later_id);
+  assert(outbox.cancel_logical(later_id));
+  assert(outbox.size() == 0 && outbox.aggregate_size() == 0);
+}
+
 void test_singleton_direct_send_failure_and_cancel() {
   detail::Stage2HomeRpcOutbox outbox(
     8, 4, 5, 32, 256, 256, 1u << 20);
@@ -950,6 +1001,7 @@ int main() {
   test_leased_partial_cancel_retries_only_live_members();
   test_singleton_direct_fast_success_uses_borrowed_registry_slot();
   test_singleton_direct_timeout_retries_exact_wire_image();
+  test_deadline_gate_recomputes_after_stale_earliest_owner();
   test_singleton_direct_send_failure_and_cancel();
   test_singleton_direct_and_multi_logical_aggregate_coexist();
   test_singleton_direct_validation_and_semantic_rearm();

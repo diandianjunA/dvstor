@@ -22,54 +22,62 @@ inline std::size_t saturating_admission_multiply(
   return lhs * rhs;
 }
 
-// Bound acknowledged-but-unfinished Stage2 debt.  The caller supplies the
-// pre-rebalance Stage2 lane count, so moving CPUs from reverse processing to
-// Stage2 cannot alter this window for any wire batch size.  Four wire batches
-// are enough to absorb burst and batch-formation jitter; at larger dedicated
-// deployments, one task per available worker/RPC context keeps every executor
-// feedable.  The legacy four-tasks-per-context bound remains a ceiling unless
-// one complete wire batch itself is larger.
+// Keep the acknowledged-but-unfinished task window aligned with the actual
+// runtime pipeline rather than a historical worker count.  One search lane
+// needs one runnable context plus one context suspended on an RPC/resource
+// edge.  Production contexts contain at most logical_batch_limit tasks; wire
+// aggregation is independently bounded by the home/reverse outboxes.
 //
-// In particular, moving two CPUs from an idle reverse pool to Stage2 on the
-// five-way colocated deployment must improve the rate at which debt is paid,
-// not double the amount of debt hidden before backpressure starts.
+// The resulting window is still exact incomplete-task credit, not queue
+// capacity: the completion ring and every transport retain their existing
+// independent bounds.
 inline std::size_t stage2_sequence_admission_limit(
     std::size_t maintenance_workers,
     std::size_t rpc_depth,
-    std::size_t batch_max) {
+    std::size_t active_search_lanes,
+    std::size_t logical_batch_limit,
+    std::size_t wire_batch_max) {
   const std::size_t workers = std::max<std::size_t>(1, maintenance_workers);
   const std::size_t depth = std::max<std::size_t>(1, rpc_depth);
-  const std::size_t batch = std::max<std::size_t>(1, batch_max);
-  const std::size_t contexts = saturating_admission_multiply(workers, depth);
-  const std::size_t legacy_limit =
-    saturating_admission_multiply(contexts, 4);
-  const std::size_t batch_burst = saturating_admission_multiply(batch, 4);
-  const std::size_t service_demand = std::max(contexts, batch_burst);
-  return std::max(batch, std::min(legacy_limit, service_demand));
+  const std::size_t physical_contexts =
+    saturating_admission_multiply(workers, depth);
+  const std::size_t pipeline_contexts = std::min(
+    physical_contexts,
+    saturating_admission_multiply(
+      std::max<std::size_t>(1, active_search_lanes), 2));
+  const std::size_t pipeline_tasks = saturating_admission_multiply(
+    pipeline_contexts, std::max<std::size_t>(1, logical_batch_limit));
+  // Stage1 reserves and publishes one wire request atomically. Even a tiny
+  // executor must therefore be able to arm one complete legal batch; pipeline
+  // geometry controls additional debt above that correctness floor.
+  return std::max(
+    std::max<std::size_t>(1, wire_batch_max), pipeline_tasks);
 }
 
 // Foreground pressure may reduce asynchronous Stage2 concurrency, but it must
 // never collapse the pipeline to one context per executor. Logical search
 // state is context-owned, and a context waiting on a home RPC releases its
-// registered RDMA lane. Keep four bounded contexts per worker under foreground
-// pressure: two can occupy the physical scratch lanes while two independently
-// wait for home responses. Restore the full per-worker RPC depth otherwise.
+// registered RDMA lane. Keep two bounded contexts per active lane under
+// foreground pressure: one can own the lane while the other independently
+// waits for a home response/resource edge. Restore the full per-worker RPC
+// depth otherwise.
 // The existing global/per-peer RDMA credits still bound posted work, while a
 // depth-one configuration naturally retains the original single-context
 // floor.
 inline std::size_t stage2_context_admission_limit(
     std::size_t maintenance_workers,
     std::size_t rpc_depth,
+    std::size_t active_search_lanes,
     bool foreground_pressure) {
   const std::size_t workers = std::max<std::size_t>(1, maintenance_workers);
   const std::size_t depth = std::max<std::size_t>(1, rpc_depth);
-  const std::size_t contexts_per_worker = foreground_pressure
-    ? std::min<std::size_t>(depth, 4) : depth;
-  if (workers >
-      std::numeric_limits<std::size_t>::max() / contexts_per_worker) {
-    return std::numeric_limits<std::size_t>::max();
-  }
-  return workers * contexts_per_worker;
+  const std::size_t physical_contexts =
+    saturating_admission_multiply(workers, depth);
+  if (!foreground_pressure) return physical_contexts;
+  return std::min(
+    physical_contexts,
+    saturating_admission_multiply(
+      std::max<std::size_t>(1, active_search_lanes), 2));
 }
 
 // The global context counter above is a debt/scratch bound, not a fair-share
@@ -80,10 +88,22 @@ inline std::size_t stage2_context_admission_limit(
 // only which executor owns an admitted context, never the search, completion
 // window, or amount of acknowledged work.
 inline std::size_t stage2_worker_context_admission_limit(
+    std::size_t worker_id,
+    std::size_t maintenance_workers,
     std::size_t rpc_depth,
+    std::size_t active_search_lanes,
     bool foreground_pressure) {
   const std::size_t depth = std::max<std::size_t>(1, rpc_depth);
-  return foreground_pressure ? std::min<std::size_t>(depth, 4) : depth;
+  if (!foreground_pressure) return depth;
+  const std::size_t workers =
+    std::max<std::size_t>(1, maintenance_workers);
+  const std::size_t lanes = std::max<std::size_t>(1, active_search_lanes);
+  const std::size_t lane_share = lanes / workers +
+    (worker_id < lanes % workers ? 1 : 0);
+  return std::min(
+    depth,
+    std::max<std::size_t>(
+      1, saturating_admission_multiply(lane_share, 2)));
 }
 
 // Credit-return callbacks can race and observe the same completion-ring

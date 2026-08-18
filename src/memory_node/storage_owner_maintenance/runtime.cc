@@ -47,13 +47,58 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     channel.epoch.store(0, std::memory_order_relaxed);
     channel.context_scan_requested.store(false, std::memory_order_relaxed);
   }
+  const size_t contexts_per_worker =
+    std::max<size_t>(1, config.storage_owner_rpc_depth);
+  const size_t snapshot_batch =
+    std::max<u32>(1, config.storage_owner_search_snapshot_batch);
+  const auto& peer_credit_plan = peer_rdma_read_credit_plan();
+  const size_t ordinary_wave_limit = std::min<size_t>(
+    peer_credit_plan.per_peer, peer_credit_plan.global);
+  const size_t ordered_pair_wave_limit =
+    memory_node_detail::peer_rdma_read_pair_wave_limit(peer_credit_plan);
+  const size_t per_lane_peak_rdma_wrs =
+    stage2_search_lane_peak_rdma_wrs(
+      snapshot_batch, ordinary_wave_limit, ordered_pair_wave_limit);
+  const size_t useful_lane_wave_rdma_wrs =
+    std::max<size_t>(1, per_lane_peak_rdma_wrs);
+  const size_t global_search_lane_count =
+    stage2_global_search_lane_count(
+      worker_count, contexts_per_worker,
+      useful_lane_wave_rdma_wrs,
+      peer_credit_plan.global);
+  lib_assert(global_search_lane_count != 0,
+             "global Stage2 lane allocation produced no runnable lane");
+  // Allocate the registered substrate from the configured context pool, then
+  // derive the active lease from the actual worker/lane geometry.  This is a
+  // machine-independent bound; posted RDMA work remains gated by the existing
+  // per-QP, per-peer, and global credit counters.
+  constexpr size_t kMaxPhysicalSearchLanesPerWorker = 16;
+  const size_t physical_lanes_per_worker = std::min<size_t>(
+    contexts_per_worker, kMaxPhysicalSearchLanesPerWorker);
+  lib_assert(physical_lanes_per_worker != 0 &&
+               physical_lanes_per_worker <=
+                 std::numeric_limits<u32>::max(),
+             "Stage2 per-worker physical lane count exceeds u32 transport index");
+  lib_assert(static_cast<size_t>(worker_count) <=
+               std::numeric_limits<size_t>::max() /
+                 physical_lanes_per_worker,
+             "Stage2 aggregate physical lane count overflow");
+  const size_t global_search_lane_lease_limit =
+    stage2_global_search_lane_lease_limit(
+      worker_count, physical_lanes_per_worker,
+      global_search_lane_count);
+  lib_assert(global_search_lane_lease_limit != 0 &&
+               global_search_lane_lease_limit <=
+                 std::numeric_limits<u32>::max(),
+             "global Stage2 lane lease is outside its transport range");
+  const size_t logical_context_batch_limit = std::min<size_t>(
+    2, std::max<u32>(1, config.storage_owner_batch_max));
   // Every reserved sequence is either already queued/runnable or completed by
   // its synchronous retirement path. Stage1 preparation owns no sequence, so
-  // the full descriptor bound is safe. Keep the smaller admission window tied
-  // to the workers that the CPU plan actually supplied, not merely the
-  // requested worker count: otherwise a constrained node can acknowledge a
-  // burst sized for executors that do not exist and create seconds of avoidable
-  // Stage2 debt before bounded backpressure begins.
+  // the full descriptor bound is safe. Tie the exact incomplete-task window to
+  // the workers and active search lanes the runtime actually supplied. This
+  // prevents both an oversized acknowledged burst on a constrained node and
+  // an old worker-only cap from starving newly available continuation lanes.
   const size_t completion_capacity = std::max<size_t>(
     std::max<size_t>(1, config.storage_owner_batch_max),
     config.storage_owner_maintenance_queue_depth);
@@ -62,8 +107,9 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
       completion_capacity, initial_next, initial_durable);
   const size_t requested_admission_limit =
     stage2_sequence_admission_limit(
-      cpu_plan.maintenance_admission_workers,
-      config.storage_owner_rpc_depth,
+      worker_count, contexts_per_worker,
+      global_search_lane_lease_limit,
+      logical_context_batch_limit,
       config.storage_owner_batch_max);
   storage_owner_maintenance_admission_limit_ = static_cast<size_t>(
     std::min(completion_capacity, requested_admission_limit));
@@ -266,8 +312,6 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
       .published_steady_ns = steady_now_ns(),
       .admission_window = storage_owner_maintenance_admission_limit_,
     });
-  const size_t contexts_per_worker =
-    std::max<size_t>(1, config.storage_owner_rpc_depth);
   const u64 previous_runtime_epoch =
     storage_owner_maintenance_runtime_epoch_counter_.fetch_add(
       1, std::memory_order_acq_rel);
@@ -337,7 +381,6 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   const size_t snapshot_stride = memory_node_detail::storage_owner_snapshot_stride();
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
   const size_t graph_stride = align_up(VamanaNode::hot_graph_entry_size());
-  const size_t snapshot_batch = std::max<u32>(1, config.storage_owner_search_snapshot_batch);
   const size_t batch_slot_stride =
     memory_node_storage_owner_index_detail::batched_read_slot_stride(
       snapshot_stride);
@@ -347,50 +390,6 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   const size_t coroutine_scratch_stride =
     align_up(batch_slot_stride * snapshot_batch +
              std::max(VamanaNode::total_size(), neighbor_stride));
-  const auto& peer_credit_plan = peer_rdma_read_credit_plan();
-  const size_t ordinary_wave_limit = std::min<size_t>(
-    peer_credit_plan.per_peer, peer_credit_plan.global);
-  const size_t ordered_pair_wave_limit =
-    memory_node_detail::peer_rdma_read_pair_wave_limit(peer_credit_plan);
-  const size_t per_lane_peak_rdma_wrs =
-    stage2_search_lane_peak_rdma_wrs(
-      snapshot_batch, ordinary_wave_limit, ordered_pair_wave_limit);
-  // Size registered continuation scratch as a bounded double buffer around a
-  // useful peak wave. One lane can wait on the HCA while another context on the
-  // same worker prepares/runs; actual WR ownership is still admitted by the
-  // shared per-QP/per-peer/global credit manager.
-  const size_t useful_lane_wave_rdma_wrs =
-    std::max<size_t>(1, per_lane_peak_rdma_wrs);
-  const size_t global_search_lane_count =
-    stage2_global_search_lane_count(
-      worker_count, contexts_per_worker,
-      useful_lane_wave_rdma_wrs,
-      peer_credit_plan.global);
-  lib_assert(global_search_lane_count != 0,
-             "global Stage2 lane allocation produced no runnable lane");
-  // Registered scratch is a bounded execution substrate, not a cache. Give
-  // every worker one lane per local context, then admit active lanes through
-  // the node-wide lease above. A hot worker can therefore borrow all useful
-  // dependency chains instead of being pinned to its old two-lane share.
-  constexpr size_t kMaxPhysicalSearchLanesPerWorker = 16;
-  const size_t physical_lanes_per_worker = std::min<size_t>(
-    contexts_per_worker, kMaxPhysicalSearchLanesPerWorker);
-  lib_assert(physical_lanes_per_worker != 0 &&
-               physical_lanes_per_worker <=
-                 std::numeric_limits<u32>::max(),
-             "Stage2 per-worker physical lane count exceeds u32 transport index");
-  lib_assert(static_cast<size_t>(worker_count) <=
-               std::numeric_limits<size_t>::max() /
-                 physical_lanes_per_worker,
-             "Stage2 aggregate physical lane count overflow");
-  const size_t global_search_lane_lease_limit =
-    stage2_global_search_lane_lease_limit(
-      worker_count, physical_lanes_per_worker,
-      global_search_lane_count);
-  lib_assert(global_search_lane_lease_limit != 0 &&
-               global_search_lane_lease_limit <=
-                 std::numeric_limits<u32>::max(),
-             "global Stage2 lane lease is outside its transport range");
   storage_owner_search_lane_lease_limit_.store(
     static_cast<u32>(global_search_lane_lease_limit),
     std::memory_order_release);
@@ -462,6 +461,12 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                " (configured=" + std::to_string(config.storage_owner_maintenance_workers) +
                ", admission_baseline_workers=" +
                std::to_string(cpu_plan.maintenance_admission_workers) +
+               ", pressure_context_limit=" +
+               std::to_string(stage2_context_admission_limit(
+                 worker_count, contexts_per_worker,
+                 global_search_lane_lease_limit, true)) +
+               ", logical_context_batch_limit=" +
+               std::to_string(logical_context_batch_limit) +
                ", work_conserving=true)");
   print_status("storage-owner stage2 reverse outbox descriptors: " +
                std::to_string(storage_owner_reverse_outbox_->capacity()) +

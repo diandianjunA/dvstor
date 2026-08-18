@@ -492,6 +492,7 @@ class Stage2HomeRpcOutbox {
     }
     aggregates_[lease.slot].state = AggregateState::await_response;
     aggregates_[lease.slot].deadline_ns = deadline_ns;
+    lower_earliest_deadline(deadline_ns);
     return true;
   }
 
@@ -788,19 +789,42 @@ class Stage2HomeRpcOutbox {
 
   std::size_t promote_expired(std::uint64_t now_ns) {
     if (now_ns == 0) return 0;
+    // The progress loop calls this every millisecond.  In the normal case
+    // RPCs finish in microseconds and the configured deadline is tens of
+    // seconds away, so avoid both the global mutex and a full aggregate-slab
+    // scan until an observed deadline can actually be due.  A completed or
+    // cancelled earliest owner may leave a stale lower bound; that costs one
+    // scan at its former deadline and is repaired below without a removal
+    // heap or another contended data structure.
+    if (now_ns < earliest_deadline_ns_.load(std::memory_order_acquire)) {
+      return 0;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
+    // Another progress attempt may have repaired the lower bound while this
+    // caller waited for a producer/response critical section.
+    if (now_ns < earliest_deadline_ns_.load(std::memory_order_relaxed)) {
+      return 0;
+    }
     std::size_t promoted = 0;
+    std::uint64_t next_deadline =
+      std::numeric_limits<std::uint64_t>::max();
     for (std::uint32_t index = 0; index < aggregates_.size(); ++index) {
       Aggregate& aggregate = aggregates_[index];
-      if (aggregate.in_use &&
-          aggregate.state == AggregateState::await_response &&
-          aggregate.deadline_ns != 0 && aggregate.deadline_ns <= now_ns) {
+      if (!aggregate.in_use ||
+          aggregate.state != AggregateState::await_response ||
+          aggregate.deadline_ns == 0) {
+        continue;
+      }
+      if (aggregate.deadline_ns <= now_ns) {
         aggregate.state = AggregateState::ready;
         aggregate.deadline_ns = 0;
         enqueue_ready_aggregate(index);
         ++promoted;
+      } else {
+        next_deadline = std::min(next_deadline, aggregate.deadline_ns);
       }
     }
+    earliest_deadline_ns_.store(next_deadline, std::memory_order_release);
     return promoted;
   }
 
@@ -1528,6 +1552,16 @@ class Stage2HomeRpcOutbox {
     if (generation == 0) ++generation;
   }
 
+  void lower_earliest_deadline(std::uint64_t deadline_ns) noexcept {
+    std::uint64_t observed = earliest_deadline_ns_.load(
+      std::memory_order_relaxed);
+    while (deadline_ns < observed &&
+           !earliest_deadline_ns_.compare_exchange_weak(
+             observed, deadline_ns,
+             std::memory_order_release, std::memory_order_relaxed)) {
+    }
+  }
+
   [[nodiscard]] static std::size_t hash_capacity(std::size_t capacity) {
     if (capacity > std::numeric_limits<std::size_t>::max() / 2) {
       throw std::invalid_argument("stage2 home RPC hash capacity overflows");
@@ -1647,6 +1681,8 @@ class Stage2HomeRpcOutbox {
   std::size_t resident_bytes_{};
   std::size_t logical_size_{};
   std::size_t aggregate_size_{};
+  std::atomic<std::uint64_t> earliest_deadline_ns_{
+    std::numeric_limits<std::uint64_t>::max()};
 };
 
 }  // namespace memory_node_storage_owner_maintenance_detail
