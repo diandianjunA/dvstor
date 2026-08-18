@@ -1249,10 +1249,14 @@ MemoryNode::advance_stage2_search_candidates_batched(
       }
       if (!examined_this_round) break;
     }
-    // Score prefetch is also piggyback-only. It consumes unused credit in a
-    // destination already required by an authoritative score wave, so it can
-    // neither create another wave nor add a peer RPC. Cached exact distances
-    // are committed only if their expansion later becomes authoritative.
+    // Score prefetch consumes only unused capacity in an already-required
+    // score wave.  One-sided READs may use any peer with spare per-peer/global
+    // credit because all of them retire on the same CQ dependency; this is
+    // the key overlap that turns the high-hit ordered graph lookahead into a
+    // score pipeline.  Score-many remains restricted to an authoritative
+    // destination so speculation never creates another two-sided RPC tail.
+    // Cached exact distances are committed only if their expansion later
+    // becomes authoritative.
     const u64 score_prefetch_hits =
       storage_owner_stage2_score_prefetch_hits_.load(
         std::memory_order_relaxed);
@@ -1307,7 +1311,11 @@ MemoryNode::advance_stage2_search_candidates_batched(
               continue;
             }
             const u32 peer = neighbor.pointer.memory_node();
-            if (authoritative_peer_selected[peer] == 0) continue;
+            if (!stage2_score_prefetch_peer_eligible(
+                  state.score_many_dispatch,
+                  authoritative_peer_selected[peer] != 0)) {
+              continue;
+            }
             const bool duplicate_remote = !state.score_many_dispatch &&
               state.score_selected_remote.contains(neighbor.pointer);
             const bool distinct_remote = !duplicate_remote;
