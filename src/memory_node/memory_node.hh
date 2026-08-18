@@ -1257,6 +1257,13 @@ private:
   std::atomic<u64> storage_owner_stage2_graph_prefetch_issued_{0};
   std::atomic<u64> storage_owner_stage2_graph_prefetch_hits_{0};
   std::atomic<u64> storage_owner_stage2_graph_prefetch_wasted_{0};
+  std::atomic<u64> storage_owner_stage2_score_prefetch_issued_{0};
+  std::atomic<u64> storage_owner_stage2_score_prefetch_hits_{0};
+  std::atomic<u64> storage_owner_stage2_score_prefetch_wasted_{0};
+  std::atomic<u64> storage_owner_stage2_score_feedback_base_hits_{0};
+  std::atomic<u64> storage_owner_stage2_score_feedback_base_wasted_{0};
+  std::atomic<u64> storage_owner_stage2_score_feedback_next_outcome_{512};
+  std::atomic<bool> storage_owner_stage2_score_prefetch_enabled_{true};
   // A 512-outcome rolling window bounds adaptation time after workload drift;
   // the cumulative counters above remain the externally reported telemetry.
   std::atomic<u64> storage_owner_stage2_graph_feedback_base_hits_{0};

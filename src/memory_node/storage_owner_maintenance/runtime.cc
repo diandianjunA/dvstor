@@ -101,6 +101,20 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     0, std::memory_order_relaxed);
   storage_owner_stage2_graph_prefetch_wasted_.store(
     0, std::memory_order_relaxed);
+  storage_owner_stage2_score_prefetch_issued_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_score_prefetch_hits_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_score_prefetch_wasted_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_score_feedback_base_hits_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_score_feedback_base_wasted_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_score_feedback_next_outcome_.store(
+    512, std::memory_order_relaxed);
+  storage_owner_stage2_score_prefetch_enabled_.store(
+    true, std::memory_order_relaxed);
   storage_owner_stage2_graph_feedback_base_hits_.store(
     0, std::memory_order_relaxed);
   storage_owner_stage2_graph_feedback_base_wasted_.store(
@@ -555,6 +569,15 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   const u64 stage2_graph_prefetch_wasted =
     storage_owner_stage2_graph_prefetch_wasted_.load(
       std::memory_order_relaxed);
+  const u64 stage2_score_prefetch_issued =
+    storage_owner_stage2_score_prefetch_issued_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_score_prefetch_hits =
+    storage_owner_stage2_score_prefetch_hits_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_score_prefetch_wasted =
+    storage_owner_stage2_score_prefetch_wasted_.load(
+      std::memory_order_relaxed);
   const u64 stage2_vector_read_waves =
     storage_owner_stage2_vector_read_waves_.load(std::memory_order_relaxed);
   const u64 stage2_vector_unique_reads =
@@ -712,6 +735,9 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
     .stage2_graph_prefetch_issued = stage2_graph_prefetch_issued,
     .stage2_graph_prefetch_hits = stage2_graph_prefetch_hits,
     .stage2_graph_prefetch_wasted = stage2_graph_prefetch_wasted,
+    .stage2_score_prefetch_issued = stage2_score_prefetch_issued,
+    .stage2_score_prefetch_hits = stage2_score_prefetch_hits,
+    .stage2_score_prefetch_wasted = stage2_score_prefetch_wasted,
     .stage2_vector_read_waves = stage2_vector_read_waves,
     .stage2_vector_unique_reads = stage2_vector_unique_reads,
   };
@@ -853,6 +879,21 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                " stage2_graph_issue_width_current=" +
                std::to_string(
                  storage_owner_stage2_graph_issue_width_current_.load(
+                   std::memory_order_relaxed)) +
+               " stage2_score_prefetch_issued=" +
+               std::to_string(stage2_score_prefetch_issued) +
+               " stage2_score_prefetch_hits=" +
+               std::to_string(stage2_score_prefetch_hits) +
+               " stage2_score_prefetch_wasted=" +
+               std::to_string(stage2_score_prefetch_wasted) +
+               " stage2_score_prefetch_promotion_ratio=" +
+               std::to_string(ratio_or_zero(
+                 stage2_score_prefetch_hits,
+                 stage2_score_prefetch_hits +
+                   stage2_score_prefetch_wasted)) +
+               " stage2_score_prefetch_enabled=" +
+               std::to_string(
+                 storage_owner_stage2_score_prefetch_enabled_.load(
                    std::memory_order_relaxed)) +
                " stage2_vector_read_waves=" +
                std::to_string(stage2_vector_read_waves) +

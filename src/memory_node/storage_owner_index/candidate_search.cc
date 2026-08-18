@@ -951,9 +951,17 @@ MemoryNode::advance_stage2_search_candidates_batched(
       const distance_t distance = distance_between_vectors(
         targets[consumer.search_index].vector_data.data(), dtype,
         candidate_vector, dtype, config);
-      resolved += state.continuation.resolve_score_request(
-        consumer.search_index, consumer.generation, consumer.pointer,
-        std::optional<distance_t>{distance});
+      if (consumer.speculative) {
+        state.resolve_graph_prefetch_score(
+          consumer.search_index, consumer.expansion_pointer,
+          consumer.pointer, std::optional<distance_t>{distance},
+          static_cast<u32>(
+            service::storage_owner::Stage2HomeDisposition::stable));
+      } else {
+        resolved += state.continuation.resolve_score_request(
+          consumer.search_index, consumer.generation, consumer.pointer,
+          std::optional<distance_t>{distance});
+      }
     }
     if (resolved != 0) {
       storage_owner_stage2_scored_candidates_.fetch_add(
@@ -971,9 +979,17 @@ MemoryNode::advance_stage2_search_candidates_batched(
          position < state.score_group_offsets[group_index + 1]; ++position) {
       const Stage2ScoreConsumer& consumer =
         state.score_consumers[state.score_order[position]];
-      resolved += state.continuation.resolve_score_request(
-        consumer.search_index, consumer.generation, consumer.pointer,
-        std::nullopt);
+      if (consumer.speculative) {
+        state.resolve_graph_prefetch_score(
+          consumer.search_index, consumer.expansion_pointer,
+          consumer.pointer, std::nullopt,
+          static_cast<u32>(
+            service::storage_owner::Stage2HomeDisposition::terminal));
+      } else {
+        resolved += state.continuation.resolve_score_request(
+          consumer.search_index, consumer.generation, consumer.pointer,
+          std::nullopt);
+      }
     }
     if (resolved != 0) {
       storage_owner_stage2_scored_candidates_.fetch_add(
@@ -1094,12 +1110,16 @@ MemoryNode::advance_stage2_search_candidates_batched(
     thread_local vec<u32> remote_pairs_by_peer;
     thread_local vec<u32> score_many_items_by_peer;
     thread_local vec<size_t> score_many_pending_by_peer;
+    thread_local vec<size_t> authoritative_pending_by_peer;
     thread_local vec<u8> score_many_peer_eligible;
+    thread_local vec<u8> authoritative_peer_selected;
     remote_wrs_by_peer.resize(num_storage_nodes_);
     remote_pairs_by_peer.resize(num_storage_nodes_);
     score_many_items_by_peer.resize(num_storage_nodes_);
     score_many_pending_by_peer.assign(num_storage_nodes_, 0);
+    authoritative_pending_by_peer.assign(num_storage_nodes_, 0);
     score_many_peer_eligible.assign(num_storage_nodes_, 0);
+    authoritative_peer_selected.assign(num_storage_nodes_, 0);
     const u32 score_many_item_limit =
       std::max<u32>(1, config.storage_owner_search_snapshot_batch);
     state.score_many_dispatch = false;
@@ -1112,6 +1132,34 @@ MemoryNode::advance_stage2_search_candidates_batched(
           if (storage_node_pointer_addressable(request.pointer) &&
               !local_shard(request.pointer.memory_node())) {
             ++score_many_pending_by_peer[request.pointer.memory_node()];
+          }
+        }
+      }
+      authoritative_pending_by_peer = score_many_pending_by_peer;
+      for (size_t search_index = 0;
+           search_index < state.graph_prefetch_cache.size(); ++search_index) {
+        for (const Stage2PrefetchedGraphExpansion& expansion :
+             state.graph_prefetch_cache[search_index]) {
+          for (const Stage2PrefetchedGraphNeighbor& neighbor :
+               expansion.neighbors) {
+            if (neighbor.score_prefetched ||
+                !storage_node_pointer_addressable(neighbor.pointer) ||
+                local_shard(neighbor.pointer.memory_node())) {
+              continue;
+            }
+            const auto disposition = static_cast<
+              service::storage_owner::Stage2HomeDisposition>(
+                neighbor.disposition);
+            if (disposition ==
+                  service::storage_owner::Stage2HomeDisposition::stable ||
+                disposition ==
+                  service::storage_owner::Stage2HomeDisposition::terminal) {
+              continue;
+            }
+            const u32 peer = neighbor.pointer.memory_node();
+            if (authoritative_pending_by_peer[peer] != 0) {
+              ++score_many_pending_by_peer[peer];
+            }
           }
         }
       }
@@ -1187,7 +1235,11 @@ MemoryNode::advance_stage2_search_candidates_batched(
           continue;
         }
         state.score_consumers.push_back({
-          request.search_index, request.generation, request.pointer});
+          request.search_index, request.generation, request.pointer,
+          false, RemotePtr{}});
+        if (remote) {
+          authoritative_peer_selected[request.pointer.memory_node()] = 1;
+        }
         if (!state.score_many_dispatch && distinct_remote) {
           state.score_selected_remote.insert(request.pointer);
           ++physical_reads;
@@ -1196,6 +1248,108 @@ MemoryNode::advance_stage2_search_candidates_batched(
         selected_any = true;
       }
       if (!examined_this_round) break;
+    }
+    // Score prefetch is also piggyback-only. It consumes unused credit in a
+    // destination already required by an authoritative score wave, so it can
+    // neither create another wave nor add a peer RPC. Cached exact distances
+    // are committed only if their expansion later becomes authoritative.
+    const u64 score_prefetch_hits =
+      storage_owner_stage2_score_prefetch_hits_.load(
+        std::memory_order_relaxed);
+    const u64 score_prefetch_wasted =
+      storage_owner_stage2_score_prefetch_wasted_.load(
+        std::memory_order_relaxed);
+    const u64 score_prefetch_outcomes =
+      score_prefetch_hits + score_prefetch_wasted;
+    u64 next_score_feedback =
+      storage_owner_stage2_score_feedback_next_outcome_.load(
+        std::memory_order_relaxed);
+    if (score_prefetch_outcomes >= next_score_feedback &&
+        storage_owner_stage2_score_feedback_next_outcome_
+          .compare_exchange_strong(
+            next_score_feedback, score_prefetch_outcomes + 512,
+            std::memory_order_relaxed, std::memory_order_relaxed)) {
+      const u64 base_hits =
+        storage_owner_stage2_score_feedback_base_hits_.exchange(
+          score_prefetch_hits, std::memory_order_relaxed);
+      const u64 base_wasted =
+        storage_owner_stage2_score_feedback_base_wasted_.exchange(
+          score_prefetch_wasted, std::memory_order_relaxed);
+      storage_owner_stage2_score_prefetch_enabled_.store(
+        stage2_score_prefetch_enabled(
+          score_prefetch_hits >= base_hits
+            ? score_prefetch_hits - base_hits : 0,
+          score_prefetch_wasted >= base_wasted
+            ? score_prefetch_wasted - base_wasted : 0),
+        std::memory_order_relaxed);
+    }
+    u64 speculative_scores = 0;
+    if (selected_any &&
+        storage_owner_stage2_score_prefetch_enabled_.load(
+          std::memory_order_relaxed)) {
+      for (size_t search_index = 0;
+           search_index < state.graph_prefetch_cache.size(); ++search_index) {
+        if (state.search_seeded[search_index] == 0) continue;
+        for (Stage2PrefetchedGraphExpansion& expansion :
+             state.graph_prefetch_cache[search_index]) {
+          for (Stage2PrefetchedGraphNeighbor& neighbor :
+               expansion.neighbors) {
+            const auto disposition = static_cast<
+              service::storage_owner::Stage2HomeDisposition>(
+                neighbor.disposition);
+            if (neighbor.score_prefetched ||
+                disposition ==
+                  service::storage_owner::Stage2HomeDisposition::stable ||
+                disposition ==
+                  service::storage_owner::Stage2HomeDisposition::terminal ||
+                !storage_node_pointer_addressable(neighbor.pointer) ||
+                local_shard(neighbor.pointer.memory_node())) {
+              continue;
+            }
+            const u32 peer = neighbor.pointer.memory_node();
+            if (authoritative_peer_selected[peer] == 0) continue;
+            const bool duplicate_remote = !state.score_many_dispatch &&
+              state.score_selected_remote.contains(neighbor.pointer);
+            const bool distinct_remote = !duplicate_remote;
+            const bool requires_after_header = distinct_remote &&
+              !VamanaNode::immutable_base_record(neighbor.pointer);
+            if (!state.score_many_dispatch && requires_after_header) {
+              // The one-sided dispatcher deliberately retires immutable and
+              // mutable records in separate waves. A mutable speculative item
+              // would be dropped at that boundary, so leave it authoritative.
+              continue;
+            }
+            const bool accepted = state.score_many_dispatch
+              ? (score_many_peer_eligible[peer] != 0 &&
+                 score_many_quota.try_accept(peer, true))
+              : stage2_consumer_fits_physical_scratch(
+                  distinct_remote, physical_reads, score_dispatch_limit) &&
+                quota.try_accept(peer, distinct_remote, false);
+            if (!accepted) continue;
+            state.score_consumers.push_back({
+              search_index,
+              state.continuation.generation(search_index),
+              neighbor.pointer,
+              true,
+              expansion.pointer,
+            });
+            if (!state.score_many_dispatch && distinct_remote) {
+              state.score_selected_remote.insert(neighbor.pointer);
+              ++physical_reads;
+            }
+            lib_assert(
+              neighbor.score_prefetch_issues !=
+                std::numeric_limits<u32>::max(),
+              "Stage2 score prefetch issue counter overflow");
+            ++neighbor.score_prefetch_issues;
+            ++speculative_scores;
+          }
+        }
+      }
+    }
+    if (speculative_scores != 0) {
+      storage_owner_stage2_score_prefetch_issued_.fetch_add(
+        speculative_scores, std::memory_order_relaxed);
     }
     if (selected_any) {
       state.round_robin_search = (last_search + 1) % search_count;
@@ -1462,6 +1616,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
       rpc.complete = false;
       rpc.deadline_ns = 0;
       rpc.request.clear();
+      rpc.score_consumer_indexes.clear();
     }
     thread_local vec<vec<size_t>> consumers_by_shard;
     consumers_by_shard.clear();
@@ -1497,6 +1652,11 @@ MemoryNode::advance_stage2_search_candidates_batched(
         rpc.target_shard = shard;
         rpc.item_count = item_count;
         rpc.request_id = allocate_peer_request_id();
+        rpc.score_consumer_indexes.resize(item_count);
+        for (u32 item = 0; item < item_count; ++item) {
+          rpc.score_consumer_indexes[item] =
+            shard_consumers[begin + item];
+        }
         if (state.score_many_dispatch) {
           score_many_query_searches.clear();
           score_many_query_indexes.assign(
@@ -1796,10 +1956,19 @@ MemoryNode::advance_stage2_search_candidates_batched(
   thread_local vec<byte_t> home_response_payload;
   thread_local vec<RemotePtr> home_neighbors;
   const auto commit_prefetched_graph = [&] {
+    const auto score_issue_count = [](const auto& neighbors) {
+      u64 count = 0;
+      for (const auto& neighbor : neighbors) {
+        count += neighbor.score_prefetch_issues;
+      }
+      return count;
+    };
     u64 hits = 0;
     u64 wasted = 0;
     u64 scored = 0;
     u64 home_scored = 0;
+    u64 score_prefetch_hits = 0;
+    u64 score_prefetch_wasted = 0;
     bool progressed = false;
     for (size_t search_index = 0; search_index < tasks.size();
          ++search_index) {
@@ -1818,6 +1987,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
           disposition !=
             service::storage_owner::Stage2HomeDisposition::terminal) {
         ++wasted;
+        score_prefetch_wasted += score_issue_count(cached->neighbors);
         continue;
       }
       home_neighbors.clear();
@@ -1833,6 +2003,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
             search_index, request->generation, request->pointer,
             span<const RemotePtr>{home_neighbors})) {
         ++wasted;
+        score_prefetch_wasted += score_issue_count(cached->neighbors);
         continue;
       }
       ++hits;
@@ -1858,6 +2029,15 @@ MemoryNode::advance_stage2_search_candidates_batched(
             std::nullopt);
         }
         scored += resolved;
+        if (neighbor.score_prefetch_issues != 0) {
+          if (resolved) {
+            ++score_prefetch_hits;
+            score_prefetch_wasted +=
+              neighbor.score_prefetch_issues - 1;
+          } else {
+            score_prefetch_wasted += neighbor.score_prefetch_issues;
+          }
+        }
       }
     }
     if (hits != 0) {
@@ -1875,6 +2055,14 @@ MemoryNode::advance_stage2_search_candidates_batched(
     if (home_scored != 0) {
       storage_owner_stage2_home_scored_neighbors_.fetch_add(
         home_scored, std::memory_order_relaxed);
+    }
+    if (score_prefetch_hits != 0) {
+      storage_owner_stage2_score_prefetch_hits_.fetch_add(
+        score_prefetch_hits, std::memory_order_relaxed);
+    }
+    if (score_prefetch_wasted != 0) {
+      storage_owner_stage2_score_prefetch_wasted_.fetch_add(
+        score_prefetch_wasted, std::memory_order_relaxed);
     }
     return progressed;
   };
@@ -1909,9 +2097,15 @@ MemoryNode::advance_stage2_search_candidates_batched(
       storage_owner_stage2_search_budget_exhausted_.fetch_add(
         exhausted_count, std::memory_order_relaxed);
       const u64 unused_prefetch = state.graph_prefetch_entry_count();
+      const u64 unused_score_prefetch =
+        state.graph_prefetched_score_count();
       if (unused_prefetch != 0) {
         storage_owner_stage2_graph_prefetch_wasted_.fetch_add(
           unused_prefetch, std::memory_order_relaxed);
+      }
+      if (unused_score_prefetch != 0) {
+        storage_owner_stage2_score_prefetch_wasted_.fetch_add(
+          unused_score_prefetch, std::memory_order_relaxed);
       }
       const size_t retained_capacity = std::max<size_t>(
         1024, static_cast<size_t>(construction_width) * 8);
@@ -1920,6 +2114,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
     }
 
     if (state.phase == Stage2SearchIoPhase::idle &&
+        state.continuation.pending_score_requests().empty() &&
         commit_prefetched_graph()) {
       idle_attempt_mask = 0;
       continue;
@@ -2211,6 +2406,12 @@ MemoryNode::advance_stage2_search_candidates_batched(
         lib_assert(acknowledge_peer_rpc_response(response_lease),
                    "validated Stage2 score response lost its lease");
         for (u32 item = 0; item < rpc.item_count; ++item) {
+          lib_assert(item < rpc.score_consumer_indexes.size() &&
+                       rpc.score_consumer_indexes[item] <
+                         state.score_consumers.size(),
+                     "Stage2 score response lost consumer metadata");
+          const Stage2ScoreConsumer& consumer = state.score_consumers[
+            rpc.score_consumer_indexes[item]];
           const u32 result_search_index =
             state.score_many_dispatch
               ? score_many_results[item].search_index
@@ -2234,6 +2435,22 @@ MemoryNode::advance_stage2_search_candidates_batched(
           const auto disposition = static_cast<
             service::storage_owner::Stage2HomeDisposition>(
               result_disposition);
+          if (consumer.speculative) {
+            if (disposition ==
+                service::storage_owner::Stage2HomeDisposition::stable) {
+              state.resolve_graph_prefetch_score(
+                consumer.search_index, consumer.expansion_pointer,
+                consumer.pointer,
+                std::optional<distance_t>{result_distance},
+                result_disposition);
+            } else if (disposition ==
+                       service::storage_owner::Stage2HomeDisposition::terminal) {
+              state.resolve_graph_prefetch_score(
+                consumer.search_index, consumer.expansion_pointer,
+                consumer.pointer, std::nullopt, result_disposition);
+            }
+            continue;
+          }
           bool resolved = false;
           if (disposition ==
               service::storage_owner::Stage2HomeDisposition::stable) {
@@ -2422,6 +2639,8 @@ MemoryNode::advance_stage2_search_candidates_batched(
                   .pointer = RemotePtr{neighbor.pointer_raw},
                   .distance = neighbor.distance,
                   .disposition = neighbor.disposition,
+                  .score_prefetched = false,
+                  .score_prefetch_issues = 0,
                 });
               }
               retained = state.insert_graph_prefetch(

@@ -211,6 +211,10 @@ void test_recall_and_report_formatting() {
       {"issued", 100}, {"hits", 75}, {"wasted", 20},
       {"promotion_ratio", 75.0 / 95.0},
     }},
+    {"ordered_score_prefetch", {
+      {"issued", 200}, {"hits", 180}, {"wasted", 10},
+      {"promotion_ratio", 180.0 / 190.0},
+    }},
     {"home_rpc_wire", {
       {"graph_batches", 10}, {"graph_items", 80},
       {"avg_graph_items_per_rpc", 8.0},
@@ -229,6 +233,9 @@ void test_recall_and_report_formatting() {
          std::string::npos);
   assert(formatted.text.find(
            "ordered graph issue: issued/hit/wasted=100/75/20") !=
+         std::string::npos);
+  assert(formatted.text.find(
+           "ordered score prefetch: issued/hit/wasted=200/180/10") !=
          std::string::npos);
   assert(formatted.text.find(
            "graph home RPC: batches/items/avg_items=10/80/8") !=
@@ -494,6 +501,9 @@ void test_in_band_maintenance_snapshot_window() {
       .stage2_graph_prefetch_issued = 10,
       .stage2_graph_prefetch_hits = 6,
       .stage2_graph_prefetch_wasted = 2,
+      .stage2_score_prefetch_issued = 20,
+      .stage2_score_prefetch_hits = 12,
+      .stage2_score_prefetch_wasted = 4,
       .stage2_vector_read_waves = 6,
       .stage2_vector_unique_reads = 60,
     };
@@ -553,6 +563,9 @@ void test_in_band_maintenance_snapshot_window() {
     latest.stage2_graph_prefetch_issued += 100;
     latest.stage2_graph_prefetch_hits += 70;
     latest.stage2_graph_prefetch_wasted += 20;
+    latest.stage2_score_prefetch_issued += 200;
+    latest.stage2_score_prefetch_hits += 160;
+    latest.stage2_score_prefetch_wasted += 20;
     latest.stage2_vector_read_waves = 18;
     latest.stage2_vector_unique_reads = 180;
     for (size_t phase = 0;
@@ -618,6 +631,9 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.stage2_graph_prefetch_issued == 200);
   assert(summary.stage2_graph_prefetch_hits == 140);
   assert(summary.stage2_graph_prefetch_wasted == 40);
+  assert(summary.stage2_score_prefetch_issued == 400);
+  assert(summary.stage2_score_prefetch_hits == 320);
+  assert(summary.stage2_score_prefetch_wasted == 40);
   assert(summary.stage2_vector_read_waves == 24);
   assert(summary.stage2_vector_unique_reads == 240);
   assert(summary.home_rpc_wire_counter_delta_available);

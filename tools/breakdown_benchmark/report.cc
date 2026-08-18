@@ -728,6 +728,15 @@ FormattedReport format_report(const nlohmann::json& root,
                << " promotion_ratio="
                << ordered.value("promotion_ratio", 0.0) << '\n';
       }
+      if (stage2.contains("ordered_score_prefetch")) {
+        const auto& ordered = stage2["ordered_score_prefetch"];
+        output << "  ordered score prefetch: issued/hit/wasted="
+               << ordered.value("issued", 0ULL) << "/"
+               << ordered.value("hits", 0ULL) << "/"
+               << ordered.value("wasted", 0ULL)
+               << " promotion_ratio="
+               << ordered.value("promotion_ratio", 0.0) << '\n';
+      }
       if (stage2.contains("home_rpc_wire")) {
         const auto& wire = stage2["home_rpc_wire"];
         output << "  graph home RPC: batches/items/avg_items="
