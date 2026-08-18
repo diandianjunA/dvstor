@@ -104,7 +104,9 @@ struct alignas(64) Snapshot {
   u64 stage2_home_score_rpc_queries{};
   u64 stage2_home_score_rpc_request_bytes{};
   u64 stage2_home_score_rpc_response_bytes{};
-  std::array<u64, 1> reserved{};
+  // Lower bound on notify-before-wait races closed by the maintenance event
+  // epoch. This consumes the existing reserved slot, preserving the v5 ABI.
+  u64 maintenance_lost_wake_avoided{};
 };
 
 static_assert(kSnapshotOffset == 192);

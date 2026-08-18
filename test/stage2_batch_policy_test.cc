@@ -1,11 +1,14 @@
 #include <cassert>
 #include <chrono>
+#include <limits>
 
 #include "memory_node/storage_owner_maintenance/stage2_batch_policy.hh"
 
 namespace {
 
 using memory_node_storage_owner_maintenance_detail::stage2_batch_ready;
+using memory_node_storage_owner_maintenance_detail::
+  stage2_maintenance_event_pending;
 using memory_node_storage_owner_maintenance_detail::
   stage2_partial_batch_deadline;
 using Clock = std::chrono::steady_clock;
@@ -44,6 +47,13 @@ void test_zero_wait_runs_partial_batch_immediately() {
   assert(!stage2_partial_batch_deadline(1, 32, epoch, 0).has_value());
 }
 
+void test_event_epoch_detects_notify_before_wait_and_wraparound() {
+  assert(!stage2_maintenance_event_pending(7, 7));
+  assert(stage2_maintenance_event_pending(7, 8));
+  assert(stage2_maintenance_event_pending(
+    std::numeric_limits<std::uint64_t>::max(), 0));
+}
+
 }  // namespace
 
 int main() {
@@ -51,5 +61,6 @@ int main() {
   test_full_batch_runs_without_waiting();
   test_partial_batch_uses_oldest_task_deadline();
   test_zero_wait_runs_partial_batch_immediately();
+  test_event_epoch_detects_notify_before_wait_and_wraparound();
   return 0;
 }

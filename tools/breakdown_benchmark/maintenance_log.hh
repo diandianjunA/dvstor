@@ -60,6 +60,7 @@ struct MaintenanceObservation {
   std::array<uint64_t, kStage2TimingPhaseCount> stage2_phase_elapsed_ns{};
   uint64_t maintenance_worker_idle_waits{};
   uint64_t maintenance_worker_idle_ns{};
+  uint64_t maintenance_lost_wake_avoided{};
   uint64_t physical_stage1_items{};
   uint64_t physical_stage1_total_ns{};
   uint64_t physical_stage1_search_ns{};
@@ -145,6 +146,7 @@ struct MaintenanceLogSummary {
   std::array<uint64_t, kStage2TimingPhaseCount> stage2_phase_elapsed_ns{};
   uint64_t maintenance_worker_idle_waits{};
   uint64_t maintenance_worker_idle_ns{};
+  uint64_t maintenance_lost_wake_avoided{};
   uint64_t physical_stage1_items{};
   uint64_t physical_stage1_total_ns{};
   uint64_t physical_stage1_search_ns{};

@@ -517,6 +517,7 @@ void test_in_band_maintenance_snapshot_window() {
     }
     begin[shard]->maintenance_worker_idle_waits = 3;
     begin[shard]->maintenance_worker_idle_ns = 4'000;
+    begin[shard]->maintenance_lost_wake_avoided = 5;
     begin[shard]->physical_stage1_items = 2;
     begin[shard]->physical_stage1_total_ns = 2'000;
     begin[shard]->physical_stage1_search_ns = 1'000;
@@ -578,6 +579,7 @@ void test_in_band_maintenance_snapshot_window() {
     }
     latest.maintenance_worker_idle_waits += 30;
     latest.maintenance_worker_idle_ns += 40'000;
+    latest.maintenance_lost_wake_avoided += 50;
     latest.physical_stage1_items += 20;
     latest.physical_stage1_total_ns += 20'000;
     latest.physical_stage1_search_ns += 10'000;
@@ -654,6 +656,7 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.stage2_phase_elapsed_ns[5] == 240'000);
   assert(summary.maintenance_worker_idle_waits == 60);
   assert(summary.maintenance_worker_idle_ns == 80'000);
+  assert(summary.maintenance_lost_wake_avoided == 100);
   assert(summary.physical_stage1_items == 40);
   assert(summary.physical_stage1_total_ns == 40'000);
   assert(summary.physical_stage1_search_ns == 20'000);

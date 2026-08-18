@@ -133,6 +133,10 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     0, std::memory_order_relaxed);
   storage_owner_maintenance_worker_idle_ns_.store(
     0, std::memory_order_relaxed);
+  storage_owner_maintenance_wake_epoch_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_maintenance_lost_wake_avoided_.store(
+    0, std::memory_order_relaxed);
   physical_stage1_items_.store(0, std::memory_order_relaxed);
   physical_stage1_total_ns_.store(0, std::memory_order_relaxed);
   physical_stage1_search_ns_.store(0, std::memory_order_relaxed);
@@ -355,7 +359,7 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
     }
   }
   storage_owner_maintenance_shutdown_.store(true, std::memory_order_release);
-  storage_owner_maintenance_cv_.notify_all();
+  notify_storage_owner_maintenance();
   for (Stage1InflightRequestShard& inflight : stage1_inflight_requests_) {
     inflight.changed.notify_all();
   }
@@ -497,6 +501,9 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   const u64 worker_idle_ns =
     storage_owner_maintenance_worker_idle_ns_.load(
       std::memory_order_relaxed);
+  const u64 lost_wake_avoided =
+    storage_owner_maintenance_lost_wake_avoided_.load(
+      std::memory_order_relaxed);
   const double worker_observed_idle_ratio =
     elapsed_ns == 0 || storage_owner_maintenance_workers_.empty()
       ? 0.0
@@ -537,6 +544,8 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
       std::to_string(worker_idle_waits) +
     " maintenance_worker_idle_ms=" +
       std::to_string(static_cast<double>(worker_idle_ns) / 1e6) +
+    " maintenance_lost_wake_avoided=" +
+      std::to_string(lost_wake_avoided) +
     " maintenance_worker_observed_idle_ratio=" +
       std::to_string(worker_observed_idle_ratio) +
     " maintenance_worker_observed_busy_ratio=" +
@@ -760,6 +769,7 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   }
   telemetry_snapshot.maintenance_worker_idle_waits = worker_idle_waits;
   telemetry_snapshot.maintenance_worker_idle_ns = worker_idle_ns;
+  telemetry_snapshot.maintenance_lost_wake_avoided = lost_wake_avoided;
   telemetry_snapshot.physical_stage1_items =
     physical_stage1_items_.load(std::memory_order_relaxed);
   telemetry_snapshot.physical_stage1_total_ns =

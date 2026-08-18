@@ -46,7 +46,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     vec<vec<RemotePtr>> continued_candidates_by_task;
     // Parent liveness is revalidated immediately before reconciliation.  The
     // resulting exact planner input must survive scheduler yields while the
-    // three ordered remote barriers are in flight.
+    // two ordered remote barriers are in flight.
     vec<vec<RemotePtr>> live_stage2_neighbors_by_task;
     Stage2FinalizeSubphase finalize_subphase{
       Stage2FinalizeSubphase::prepare};
@@ -961,7 +961,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                  result == Stage2ReverseEnqueueResult::duplicate,
                "bounded stage2 reverse outbox capacity/correlation invariant failed");
     if (result == Stage2ReverseEnqueueResult::enqueued) {
-      storage_owner_maintenance_cv_.notify_all();
+      notify_storage_owner_maintenance();
     }
     return result;
   };
@@ -1049,7 +1049,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                        completion.worker_id]->try_push(completion),
                      "bounded stage2 reverse completion capacity invariant failed");
         }
-        storage_owner_maintenance_cv_.notify_all();
+        notify_storage_owner_maintenance();
         progressed = true;
         continue;
       }
@@ -1373,11 +1373,12 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       }
     }
     switch (barrier) {
-      case Stage2ReconcileBarrier::promotion:
+      case Stage2ReconcileBarrier::install:
         selected_ops = std::move(promotion_ops);
-        return true;
-      case Stage2ReconcileBarrier::stable:
-        selected_ops = std::move(stable_ops);
+        selected_ops.insert(
+          selected_ops.end(),
+          std::make_move_iterator(stable_ops.begin()),
+          std::make_move_iterator(stable_ops.end()));
         return true;
       case Stage2ReconcileBarrier::removal:
         selected_ops = std::move(removal_ops);
@@ -1433,14 +1434,18 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                "peer RPC slot cannot hold a reverse reconciliation op");
     context.reconcile_batch.begin(context.handle, barrier);
     for (const auto& [target_shard, peer_ops] : remote_ops) {
-      for (size_t begin = 0; begin < peer_ops.size();
-           begin += wire_capacity) {
-        const size_t count = std::min<size_t>(
-          wire_capacity, peer_ops.size() - begin);
+      const auto packed = pack_stage2_reconcile_target_runs(
+        span<const ReconcileReverseOp>{peer_ops}, wire_capacity);
+      // Each task contributes at most one install op to a given target, so a
+      // target run is bounded by storage_owner_batch_max. Treat an impossible
+      // oversize run as a semantic retry instead of splitting it into RPCs
+      // whose completion order could expose add-before-promotion.
+      if (!packed.has_value()) return false;
+      for (const auto& chunk_ops : *packed) {
+        const size_t count = chunk_ops.size();
         const bool appended = context.reconcile_batch.append_chunk(
           allocate_peer_request_id(), target_shard,
-          std::span<const ReconcileReverseOp>{peer_ops.data() + begin,
-                                              count});
+          std::span<const ReconcileReverseOp>{chunk_ops.data(), count});
         lib_assert(appended,
                    "bounded Stage2 reconcile chunk could not be persisted");
       }
@@ -1572,7 +1577,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   };
 
   // Placement authority and centroid membership remain synchronous in this
-  // patch.  They execute only after the three reconciliation barriers have
+  // patch.  They execute only after the two reconciliation barriers have
   // completed, and may safely reacquire any idle search lane for their local
   // snapshot/control scratch.
   const auto finish_stage2_after_reconcile = [&, this](
@@ -1733,9 +1738,9 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     return true;
   };
 
-  // Drives as many zero-remote barriers as possible, but never waits.  The
-  // only legal phase order is promotion -> ordinary stable additions ->
-  // obsolete Stage1 removals -> placement.
+  // Drives as many zero-remote barriers as possible, but never waits. The
+  // install payload preserves promotion-before-add order for every target;
+  // only after all install ACKs may obsolete Stage1 bridges be removed.
   const auto advance_reconcile_pipeline = [&] (Stage2Context& context) {
     for (;;) {
       const ReconcilePollResult poll = poll_reconcile_barrier(context);
@@ -1749,18 +1754,12 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         context.reconcile_batch.barrier();
       cancel_context_reconcile(context);
       switch (completed) {
-        case Stage2ReconcileBarrier::promotion:
+        case Stage2ReconcileBarrier::install:
           for (StorageOwnerMaintenanceTask& task : context.tasks) {
             if (!task.reverse_reconciled) {
               task.stage2_promotion_committed = true;
             }
           }
-          if (!start_reconcile_barrier(
-                context, Stage2ReconcileBarrier::stable)) {
-            return false;
-          }
-          break;
-        case Stage2ReconcileBarrier::stable:
           if (!start_reconcile_barrier(
                 context, Stage2ReconcileBarrier::removal)) {
             return false;
@@ -2606,9 +2605,9 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     }
 
     // Promotion is the durable reachability certificate. Persist the exact
-    // liveness view before yielding, then start the first context-local
-    // barrier. Stable additions and obsolete Stage1 removals are started only
-    // by advance_reconcile_pipeline after the preceding ACK set is complete.
+    // liveness view before yielding, then install every promotion certificate
+    // and ordinary stable addition in one target-ordered barrier. Obsolete
+    // Stage1 removals start only after the complete install ACK set.
     lib_assert(context.live_stage2_neighbors_by_task.size() >=
                  context.tasks.size(),
                "Stage2 context cannot persist its reconciliation plan");
@@ -2617,7 +2616,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         live_stage2_neighbors_by_task[item];
     }
     if (!start_reconcile_barrier(
-          context, Stage2ReconcileBarrier::promotion)) {
+          context, Stage2ReconcileBarrier::install)) {
       return false;
     }
     (void)advance_reconcile_pipeline(context);
@@ -2985,7 +2984,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                "stage2 context release violated finalized generation");
     storage_owner_maintenance_active_workers_.fetch_sub(
       1, std::memory_order_acq_rel);
-    storage_owner_maintenance_cv_.notify_all();
+    notify_storage_owner_maintenance();
   };
 
   const auto defer_cleanup_context = [&](Stage2Context& context) {
@@ -3010,7 +3009,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                "cleanup deferral retained an asynchronous request");
     storage_owner_maintenance_active_workers_.fetch_sub(
       1, std::memory_order_acq_rel);
-    storage_owner_maintenance_cv_.notify_all();
+    notify_storage_owner_maintenance();
   };
 
   const auto drive_context = [&](Stage2Context& context) {
@@ -3169,7 +3168,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
             context.tasks.push_back(std::move(repair));
             repair = StorageOwnerMaintenanceTask{};
           }
-          storage_owner_maintenance_cv_.notify_all();
+          notify_storage_owner_maintenance();
           return &context;
         }
         lib_assert(storage_owner_repair_tasks_->try_push(std::move(repair)),
@@ -3201,7 +3200,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     if (!choose_stage2 && !cleanup_ready) {
       storage_owner_maintenance_active_workers_.fetch_sub(
         1, std::memory_order_acq_rel);
-      storage_owner_maintenance_cv_.notify_all();
+      notify_storage_owner_maintenance();
       return nullptr;
     }
 
@@ -3239,7 +3238,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     // even when queue capacity, rather than completion credit, was the last
     // exhausted resource.
     wake_peer_stage1_admission_waiters();
-    storage_owner_maintenance_cv_.notify_all();
+    notify_storage_owner_maintenance();
     lib_assert(!context.tasks.empty(),
                "stage2 admitted an empty maintenance context");
     return &context;
@@ -3259,6 +3258,13 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   };
 
   for (;;) {
+    // Snapshot before scanning contexts. Any completion/event published after
+    // this load either becomes visible to the scan or changes the predicate
+    // below. This closes the classic notify-before-wait window without busy
+    // polling and without shortening the batching deadline.
+    const u64 observed_wake_epoch =
+      storage_owner_maintenance_wake_epoch_.load(
+        std::memory_order_acquire);
     if (storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
       flush_idle_timing();
       if (storage_owner_reverse_outbox_ != nullptr) {
@@ -3350,7 +3356,21 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         }
       }
       const u64 idle_started_ns = steady_now_ns();
-      storage_owner_maintenance_cv_.wait_until(lock, wake_at);
+      if (stage2_maintenance_event_pending(
+            observed_wake_epoch,
+            storage_owner_maintenance_wake_epoch_.load(
+              std::memory_order_acquire))) {
+        storage_owner_maintenance_lost_wake_avoided_.fetch_add(
+          1, std::memory_order_relaxed);
+      }
+      storage_owner_maintenance_cv_.wait_until(lock, wake_at, [&]() {
+        return storage_owner_maintenance_shutdown_.load(
+                 std::memory_order_acquire) ||
+          stage2_maintenance_event_pending(
+            observed_wake_epoch,
+            storage_owner_maintenance_wake_epoch_.load(
+              std::memory_order_acquire));
+      });
       unpublished_idle_wait_ns += steady_now_ns() - idle_started_ns;
       ++unpublished_idle_waits;
       // Publishing in small batches avoids an atomic operation on every idle
