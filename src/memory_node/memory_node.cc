@@ -265,9 +265,53 @@ u64 MemoryNode::elapsed_ns_since(const std::chrono::steady_clock::time_point sta
 }
 
 void MemoryNode::notify_storage_owner_maintenance() {
+  // Foreground queue/admission and shutdown waits use this condition variable
+  // directly. Executors wait on a separate channel so their broadcast wakeup
+  // cannot recursively wake every other executor on each context release.
+  storage_owner_maintenance_cv_.notify_all();
+  notify_storage_owner_maintenance_executors();
+}
+
+void MemoryNode::notify_storage_owner_maintenance_capacity() {
+  // The publishing executor continues its own work-conserving loop. This
+  // channel is only for foreground queue/admission and shutdown-drain waits;
+  // it deliberately leaves the executor epoch unchanged.
+  storage_owner_maintenance_cv_.notify_all();
+}
+
+void MemoryNode::notify_storage_owner_maintenance_executors() {
   storage_owner_maintenance_wake_epoch_.fetch_add(
     1, std::memory_order_release);
-  storage_owner_maintenance_cv_.notify_all();
+  if (storage_owner_maintenance_wake_waiters_.load(
+        std::memory_order_acquire) == 0) {
+    return;
+  }
+  // Pair waiter registration with notification through the wake mutex. If an
+  // event lands between an executor's epoch snapshot and registration, its
+  // post-registration epoch recheck observes it; otherwise this acquisition
+  // occurs after wait_until atomically releases the mutex and cannot be lost.
+  {
+    std::lock_guard<std::mutex> lock(
+      storage_owner_maintenance_wake_mutex_);
+  }
+  storage_owner_maintenance_wake_cv_.notify_all();
+}
+
+void MemoryNode::notify_one_storage_owner_maintenance_executor() {
+  storage_owner_maintenance_wake_epoch_.fetch_add(
+    1, std::memory_order_release);
+  if (storage_owner_maintenance_wake_waiters_.load(
+        std::memory_order_acquire) == 0) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(
+      storage_owner_maintenance_wake_mutex_);
+  }
+  // A fresh queue descriptor is not worker-owned; any executor can admit it.
+  // Waking one avoids an eight-way herd. Context/RDMA completions continue to
+  // use notify_all because only their owning worker can make progress.
+  storage_owner_maintenance_wake_cv_.notify_one();
 }
 
 u64 MemoryNode::scale_ns(const u64 value, const u32 part, const u32 total) {

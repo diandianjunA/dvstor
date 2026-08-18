@@ -31,6 +31,13 @@ int main() {
     .stage2_home_rpc_batches = 7,
     .stage2_home_rpc_items = 19,
     .maintenance_lost_wake_avoided = 23,
+    .packing_target_batch = 4,
+    .packing_waited_batches = 11,
+    .packing_rollbacks = 2,
+    .stage2_independent_score_rpc_batches = 5,
+    .stage2_independent_score_issued = 160,
+    .stage2_independent_score_useful = 96,
+    .stage2_independent_score_wasted = 64,
   };
   first.stage2_delay_histogram[6] = 12;
   telemetry::publish(control_page.data(), first);
@@ -52,6 +59,12 @@ int main() {
   assert(copied.stage2_home_rpc_batches == 7);
   assert(copied.stage2_home_rpc_items == 19);
   assert(copied.maintenance_lost_wake_avoided == 23);
+  assert(copied.packing_target_batch == 4);
+  assert(copied.packing_waited_batches == 11);
+  assert(copied.packing_rollbacks == 2);
+  assert(copied.stage2_independent_score_rpc_batches == 5);
+  assert(copied.stage2_independent_score_issued == 160);
+  assert(copied.stage2_independent_score_useful == 96);
 
   telemetry::Snapshot second = first;
   second.published_steady_ns = 200;

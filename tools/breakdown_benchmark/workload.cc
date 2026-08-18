@@ -1591,6 +1591,25 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
      maintenance_summary.stage2_batches == 0 ? 0.0 :
        static_cast<double>(maintenance_summary.stage2_batched_items) /
        static_cast<double>(maintenance_summary.stage2_batches)},
+    {"adaptive_packing", {
+      {"counter_delta_available",
+       maintenance_summary.packing_delta_available},
+      {"target_batch_max", maintenance_summary.packing_target_batch_max},
+      {"arrival_interval_us_max",
+       maintenance_summary.packing_arrival_interval_us_max},
+      {"waited_batches", maintenance_summary.packing_waited_batches},
+      {"wait_ns", maintenance_summary.packing_wait_ns},
+      {"target_flushes", maintenance_summary.packing_target_flushes},
+      {"deadline_flushes", maintenance_summary.packing_deadline_flushes},
+      {"full_flushes", maintenance_summary.packing_full_flushes},
+      {"low_pressure_flushes",
+       maintenance_summary.packing_low_pressure_flushes},
+      {"cleanup_flushes", maintenance_summary.packing_cleanup_flushes},
+      {"promotions", maintenance_summary.packing_promotions},
+      {"rollbacks", maintenance_summary.packing_rollbacks},
+      {"accepted_trial_windows",
+       maintenance_summary.packing_accepted_trial_windows},
+    }},
     {"stage2_graph_read_waves",
      maintenance_summary.stage2_graph_read_waves},
     {"stage2_graph_unique_reads",
@@ -1624,6 +1643,23 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
          static_cast<double>(
            maintenance_summary.stage2_score_prefetch_hits +
            maintenance_summary.stage2_score_prefetch_wasted)},
+    }},
+    {"independent_score_lookahead", {
+      {"available",
+       maintenance_summary.independent_score_delta_available},
+      {"rpc_batches",
+       maintenance_summary.stage2_independent_score_rpc_batches},
+      {"issued", maintenance_summary.stage2_independent_score_issued},
+      {"useful", maintenance_summary.stage2_independent_score_useful},
+      {"wasted", maintenance_summary.stage2_independent_score_wasted},
+      {"useful_ratio",
+       maintenance_summary.stage2_independent_score_useful +
+           maintenance_summary.stage2_independent_score_wasted == 0 ? 0.0 :
+         static_cast<double>(
+           maintenance_summary.stage2_independent_score_useful) /
+         static_cast<double>(
+           maintenance_summary.stage2_independent_score_useful +
+           maintenance_summary.stage2_independent_score_wasted)},
     }},
     {"stage2_vector_read_waves",
      maintenance_summary.stage2_vector_read_waves},

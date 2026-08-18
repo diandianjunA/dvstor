@@ -19,6 +19,8 @@ using memory_node_storage_owner_maintenance_detail::
 using memory_node_storage_owner_maintenance_detail::Stage2SearchIoPhase;
 using memory_node_storage_owner_maintenance_detail::Stage2SearchIoState;
 using memory_node_storage_owner_maintenance_detail::
+  Stage2SpeculativeScoreConsumer;
+using memory_node_storage_owner_maintenance_detail::
   Stage2PrefetchedGraphExpansion;
 using memory_node_storage_owner_maintenance_detail::
   stage2_consumer_fits_physical_scratch;
@@ -264,6 +266,8 @@ void test_prefetched_score_updates_only_the_matching_cached_expansion() {
         .disposition = 3,
         .score_prefetched = false,
         .score_prefetch_issues = 1,
+        .independent_score_prefetched = false,
+        .independent_score_issues = 0,
       }},
     },
     2));
@@ -278,6 +282,60 @@ void test_prefetched_score_updates_only_the_matching_cached_expansion() {
   assert(cached->neighbors[0].score_prefetched);
   assert(cached->neighbors[0].distance == distance_t{7});
   assert(cached->neighbors[0].disposition == 1);
+}
+
+void test_independent_score_ownership_is_generation_fenced_and_releasable() {
+  Stage2SearchIoState state;
+  state.graph_prefetch_cache.resize(1);
+  assert(state.insert_graph_prefetch(
+    0,
+    Stage2PrefetchedGraphExpansion{
+      .pointer = RemotePtr{1, 128},
+      .disposition = 1,
+      .neighbors = {{
+        .pointer = RemotePtr{2, 256},
+        .distance = 0,
+        .disposition = 3,
+        .score_prefetched = false,
+        .score_prefetch_issues = 0,
+        .independent_score_prefetched = false,
+        .independent_score_issues = 1,
+      }},
+    },
+    2));
+
+  // A failed/unposted speculative attempt restores ordinary authoritative
+  // ownership instead of leaving a cache marker that suppresses exact work.
+  assert(state.cancel_graph_prefetch_independent_score_issue(
+    0, RemotePtr{1, 128}, RemotePtr{2, 256}));
+  assert(state.graph_independent_score_count() == 0);
+  assert(!state.cancel_graph_prefetch_independent_score_issue(
+    0, RemotePtr{1, 128}, RemotePtr{2, 256}));
+
+  state.speculative_score_rpcs.resize(3);
+  auto& rpc = state.speculative_score_rpcs[2];
+  rpc.posted = true;
+  rpc.consumers.push_back(Stage2SpeculativeScoreConsumer{
+    .search_index = 0,
+    .expansion_pointer = RemotePtr{1, 128},
+    .pointer = RemotePtr{2, 256},
+  });
+  assert(!state.speculative_score_covers(
+    0, 7, RemotePtr{2, 256}));
+  assert(state.promote_speculative_scores(
+    0, RemotePtr{1, 128}, 7) == 1);
+  assert(state.speculative_score_covers(
+    0, 7, RemotePtr{2, 256}));
+  assert(!state.speculative_score_covers(
+    0, 6, RemotePtr{2, 256}));
+  assert(!state.speculative_score_covers(
+    0, 7, RemotePtr{2, 384}));
+
+  // Clearing/cancelling the transport immediately exposes the still-pending
+  // request to the ordinary collector.
+  rpc.posted = false;
+  assert(!state.speculative_score_covers(
+    0, 7, RemotePtr{2, 256}));
 }
 
 }  // namespace
@@ -296,5 +354,6 @@ int main() {
   test_score_prefetch_fills_one_sided_wave_without_adding_rpc_peers();
   test_prefetch_cache_is_bounded_and_consumed_by_pointer();
   test_prefetched_score_updates_only_the_matching_cached_expansion();
+  test_independent_score_ownership_is_generation_fenced_and_releasable();
   return 0;
 }

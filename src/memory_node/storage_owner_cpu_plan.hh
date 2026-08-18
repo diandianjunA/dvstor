@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 
@@ -75,81 +76,15 @@ inline StorageOwnerCpuPlan derive_storage_owner_cpu_plan(
   // the foreground send/receive CQs, so it needs its own CPU just like the
   // explicit worker threads below.
   plan.foreground_progress_threads = 1;
-  // Stage2 executes several generation-fenced remote dependency waves for every
-  // inserted vector, while reverse updates are coalesced before they reach a
-  // peer worker.  Giving the latter twice as many CPUs as Stage2 therefore
-  // leaves the latency-bearing side unable to keep enough reads in flight on
-  // a colocated shard.  Rebalance the same fixed CPU pool; do not enlarge it:
-  // transfer at most two reverse lanes above a two-worker service floor to
-  // Stage2, up to a conservative one-fifth-of-the-process Stage2 target.  The
-  // transfer cap keeps reverse-heavy upsert/delete workloads provisioned on
-  // larger hosts where the insert-only headroom observation does not justify
-  // draining the full reverse pool.  The configured maintenance value remains
-  // a hard upper bound, and the Stage1 budget below is unchanged.
+
   const std::uint32_t baseline_maintenance_workers = std::min(
     std::max<std::uint32_t>(1, configured_maintenance_workers),
     std::max<std::uint32_t>(1, budget >= 8 ? budget / 10 : 1));
-  const std::uint32_t desired_maintenance_workers = std::min(
-    std::max<std::uint32_t>(1, configured_maintenance_workers),
-    std::max<std::uint32_t>(1, budget >= 8 ? budget / 5 : 1));
   plan.maintenance_admission_workers = baseline_maintenance_workers;
-  if (remote_peer_count == 0) {
-    // There is no reverse pool from which to transfer a lane.  Retain the
-    // baseline split: raising Stage2 here would consume foreground CPUs on
-    // mid-sized local-only deployments and would no longer be a fixed-pool
-    // rebalance.
-    plan.maintenance_workers = baseline_maintenance_workers;
-    plan.peer_reverse_workers = 0;
-  } else {
-    const std::uint32_t baseline_reverse_workers = std::min(
-      std::uint32_t{8},
-      std::max<std::uint32_t>(1, budget >= 8 ? budget / 5 : 1));
-    const std::uint32_t reverse_service_floor = std::min(
-      std::uint32_t{2}, baseline_reverse_workers);
-    const std::uint32_t transferable_reverse_workers =
-      baseline_reverse_workers - reverse_service_floor;
-    const std::uint32_t requested_transfer =
-      desired_maintenance_workers - baseline_maintenance_workers;
-    constexpr std::uint32_t kMaxReverseToMaintenanceTransfer = 2;
-    const std::uint32_t transferred_workers = std::min({
-      transferable_reverse_workers,
-      requested_transfer,
-      kMaxReverseToMaintenanceTransfer});
-    plan.maintenance_workers =
-      baseline_maintenance_workers + transferred_workers;
-    plan.peer_reverse_workers =
-      baseline_reverse_workers - transferred_workers;
-    // The colocated five-shard deployment has 22--24 logical CPUs per
-    // process. Stage2 is the durable-completion critical path there: use the
-    // configured eight-worker ceiling and retain a two-worker reverse floor.
-    // This is a fixed-pool rebalance, not oversubscription.
-    if (budget >= 22 && budget <= 24 &&
-        configured_maintenance_workers >= 8) {
-      plan.maintenance_workers = 8;
-      plan.peer_reverse_workers = 2;
-    }
-  }
-  // Cleanup activation is on every replacement/deletion path and may wait
-  // behind an in-progress same-token retry. Give it a bounded CPU-scaled
-  // pool so an unrelated token is never forced through one process-wide
-  // worker. The fixed 8-CPU quantum and cap keep cheap control work from
-  // stealing the Stage1/foreground data path on either small or large hosts.
-  plan.peer_cleanup_workers = remote_peer_count == 0 ? 0 : std::min({
-    std::uint32_t{8},
-    std::max<std::uint32_t>(1, rpc_parallelism),
-    std::max<std::uint32_t>(1,
-      budget >= 22 && budget <= 24 ? budget / 12 : budget / 8)});
   // Placement and node-control mutate global physical state and deliberately
   // remain in their own serial ordering domain.
   plan.peer_placement_workers = remote_peer_count == 0 ? 0 : 1;
 
-  const std::uint64_t reserved =
-    static_cast<std::uint64_t>(plan.peer_progress_threads) +
-    plan.foreground_progress_threads +
-    plan.maintenance_workers + plan.peer_reverse_workers +
-    plan.peer_cleanup_workers + plan.peer_placement_workers;
-  const std::uint32_t stage1_budget = reserved < budget
-    ? static_cast<std::uint32_t>(budget - reserved) : 0;
   // A foreground coordinator performs authority bookkeeping and local work,
   // while the physical-home executor performs the full graph construction.
   // Do not let adding compute clients continuously transfer CPU lanes from
@@ -181,46 +116,206 @@ inline StorageOwnerCpuPlan derive_storage_owner_cpu_plan(
   };
 
   if (remote_peer_count == 0) {
+    // There is no peer service pool from which to borrow CPUs.  Retain the
+    // conservative admission-sized maintenance pool and spend the remainder
+    // on the continuously-running local foreground executor.
+    plan.maintenance_workers = baseline_maintenance_workers;
+    const std::uint64_t reserved =
+      static_cast<std::uint64_t>(plan.foreground_progress_threads) +
+      plan.maintenance_workers;
+    const std::uint32_t stage1_budget = reserved < budget
+      ? static_cast<std::uint32_t>(budget - reserved) : 0;
     plan.foreground_workers = std::min(
       foreground_limit, std::max<std::uint32_t>(1, stage1_budget));
     finish_foreground_coordinators();
     return plan;
   }
 
-  // One worker on each side is a functional minimum.
-  const std::uint32_t usable_stage1_budget =
-    std::max<std::uint32_t>(2, stage1_budget);
-  if (budget >= 22 && budget <= 24 &&
-      configured_maintenance_workers >= 8) {
-    plan.foreground_workers = std::min<std::uint32_t>(
-      std::min<std::uint32_t>(3, foreground_limit),
-      std::max<std::uint32_t>(1, usable_stage1_budget - 1));
-    plan.peer_stage1_workers = std::max<std::uint32_t>(
-      1, usable_stage1_budget - plan.foreground_workers);
-    finish_foreground_coordinators();
-    return plan;
+  // Nine CPUs are the functional remote-service profile: two progress
+  // threads, one lifecycle poller, one placement authority, and one lane for
+  // each of Stage2, reverse, cleanup, foreground Stage1, and physical-home
+  // Stage1.  Start there and assign every additional CPU exactly once.  This
+  // construction is intentionally incremental: increasing the process CPU
+  // budget can grow or saturate a worker domain, but can never shrink it.
+  plan.maintenance_workers = 1;
+  plan.peer_reverse_workers = 1;
+  plan.peer_cleanup_workers = 1;
+  plan.foreground_workers = 1;
+  plan.peer_stage1_workers = 1;
+  constexpr std::uint32_t kRemoteFunctionalCpuFloor = 9;
+
+  const std::uint32_t maintenance_cap =
+    std::max<std::uint32_t>(1, configured_maintenance_workers);
+  const std::uint32_t cleanup_cap = std::min(
+    std::uint32_t{8}, std::max<std::uint32_t>(1, rpc_parallelism));
+  constexpr std::uint32_t kMaxReverseToMaintenanceTransfer = 2;
+
+  const auto maintenance_admission_target_for =
+      [&](std::uint32_t cpu_budget) {
+    return std::min(
+      maintenance_cap,
+      std::max<std::uint32_t>(1, cpu_budget >= 8 ? cpu_budget / 10 : 1));
+  };
+  const auto maintenance_target_for = [&](std::uint32_t cpu_budget) {
+    const std::uint32_t admission =
+      maintenance_admission_target_for(cpu_budget);
+    return std::min(
+      maintenance_cap,
+      std::max<std::uint32_t>(
+        std::min<std::uint32_t>(maintenance_cap, 8),
+        admission > std::numeric_limits<std::uint32_t>::max() - 2
+          ? std::numeric_limits<std::uint32_t>::max()
+          : admission + 2));
+  };
+  const auto reverse_target_for = [&](std::uint32_t cpu_budget) {
+    const std::uint32_t baseline_reverse = std::min(
+      std::uint32_t{8},
+      std::max<std::uint32_t>(1,
+        cpu_budget >= 8 ? cpu_budget / 5 : 1));
+    const std::uint32_t reverse_floor = std::min(
+      std::uint32_t{2}, baseline_reverse);
+    const std::uint32_t transferable = baseline_reverse - reverse_floor;
+    const std::uint32_t admission =
+      maintenance_admission_target_for(cpu_budget);
+    const std::uint32_t desired_maintenance = std::min(
+      maintenance_cap,
+      std::max<std::uint32_t>(1,
+        cpu_budget >= 8 ? cpu_budget / 5 : 1));
+    const std::uint32_t requested_transfer =
+      desired_maintenance - admission;
+    return baseline_reverse - std::min({
+      transferable,
+      requested_transfer,
+      kMaxReverseToMaintenanceTransfer});
+  };
+
+  enum class WorkerRole : std::uint8_t {
+    kMaintenance,
+    kPeerStage1,
+    kForeground,
+    kCleanup,
+    kReverse,
+  };
+  const auto try_grow = [&](WorkerRole role,
+                            std::uint32_t cpu_budget) {
+    std::uint32_t* workers = nullptr;
+    std::uint32_t cap = 0;
+    switch (role) {
+      case WorkerRole::kMaintenance:
+        workers = &plan.maintenance_workers;
+        cap = maintenance_cap;
+        break;
+      case WorkerRole::kPeerStage1:
+        workers = &plan.peer_stage1_workers;
+        cap = cpu_parallelism;
+        break;
+      case WorkerRole::kForeground:
+        workers = &plan.foreground_workers;
+        cap = foreground_limit;
+        break;
+      case WorkerRole::kCleanup:
+        workers = &plan.peer_cleanup_workers;
+        cap = cleanup_cap;
+        break;
+      case WorkerRole::kReverse:
+        workers = &plan.peer_reverse_workers;
+        cap = reverse_target_for(cpu_budget);
+        break;
+    }
+    if (*workers >= cap) return false;
+    ++*workers;
+    return true;
+  };
+
+  // Establish the full durable-pipeline service profile one CPU at a time.
+  // Interleave Stage1, Stage2, and reverse growth so a small host never spends
+  // all of its first CPUs on one dependency while the other stages remain at
+  // their one-lane liveness minima.  The sequence is a prefix allocation: a
+  // larger CPU budget contains every assignment made by a smaller one.  Once
+  // complete it provides 8 Stage2, 2 reverse, 3 foreground, 5 physical-home,
+  // and 2 cleanup lanes (subject to the operator's concurrency caps).
+  constexpr std::array<WorkerRole, 15> kServiceProfileGrowth{
+    WorkerRole::kForeground,
+    WorkerRole::kPeerStage1,
+    WorkerRole::kReverse,
+    WorkerRole::kMaintenance,
+    WorkerRole::kMaintenance,
+    WorkerRole::kPeerStage1,
+    WorkerRole::kForeground,
+    WorkerRole::kMaintenance,
+    WorkerRole::kPeerStage1,
+    WorkerRole::kMaintenance,
+    WorkerRole::kMaintenance,
+    WorkerRole::kMaintenance,
+    WorkerRole::kMaintenance,
+    WorkerRole::kCleanup,
+    WorkerRole::kPeerStage1,
+  };
+  // Spend the remaining elastic budget on the actual service mix.  Three
+  // quarters goes to the two Stage1 sides in their 1:2 concurrency ratio;
+  // cleanup and reverse receive bounded 15%/10% shares.  Once a bounded role
+  // saturates, skip its slots and continue the same cycle, preserving prefix
+  // monotonicity for every CPU count and retaining reverse capacity on large
+  // hosts.  The cycle is independent of peer count because the queues are
+  // shared, work-conserving domains.
+  constexpr std::array<WorkerRole, 20> kElasticCycle{
+    WorkerRole::kPeerStage1, WorkerRole::kForeground,
+    WorkerRole::kPeerStage1, WorkerRole::kCleanup,
+    WorkerRole::kPeerStage1, WorkerRole::kReverse,
+    WorkerRole::kPeerStage1, WorkerRole::kForeground,
+    WorkerRole::kPeerStage1, WorkerRole::kCleanup,
+    WorkerRole::kPeerStage1, WorkerRole::kForeground,
+    WorkerRole::kPeerStage1, WorkerRole::kReverse,
+    WorkerRole::kPeerStage1, WorkerRole::kCleanup,
+    WorkerRole::kPeerStage1, WorkerRole::kForeground,
+    WorkerRole::kPeerStage1, WorkerRole::kForeground,
+  };
+  // Replay one deterministic assignment for each CPU above the functional
+  // floor.  Replaying the same prefix is what makes the monotonicity guarantee
+  // structural even when an operator cap previously left CPUs unassigned:
+  // newly-raised maintenance and reverse targets can consume at most the one
+  // newly-added CPU, never latent slack from earlier budgets.
+  std::size_t service_index = 0;
+  std::size_t cycle_index = 0;
+  for (std::uint64_t virtual_cpu = kRemoteFunctionalCpuFloor + 1;
+       virtual_cpu <= budget; ++virtual_cpu) {
+    const std::uint32_t cpu_budget =
+      static_cast<std::uint32_t>(virtual_cpu);
+    bool assigned = false;
+
+    while (service_index < kServiceProfileGrowth.size()) {
+      const WorkerRole role = kServiceProfileGrowth[service_index++];
+      if (try_grow(role, cpu_budget)) {
+        assigned = true;
+        break;
+      }
+    }
+    if (assigned) continue;
+
+    // Above the full service profile, admission debt grows at one lane per ten
+    // CPUs. Keep two executor lanes beyond that window when configuration
+    // permits, then preserve the generic reverse curve. Only the old
+    // at-most-two requested maintenance transfers may reduce reverse service.
+    if (plan.maintenance_workers < maintenance_target_for(cpu_budget)) {
+      ++plan.maintenance_workers;
+      continue;
+    }
+    if (plan.peer_reverse_workers < reverse_target_for(cpu_budget)) {
+      ++plan.peer_reverse_workers;
+      continue;
+    }
+
+    for (std::size_t attempt = 0; attempt < kElasticCycle.size();
+         ++attempt) {
+      const WorkerRole role =
+        kElasticCycle[cycle_index++ % kElasticCycle.size()];
+      if (try_grow(role, cpu_budget)) {
+        assigned = true;
+        break;
+      }
+    }
   }
 
-  // With a usable CPU budget, divide the remainder in proportion to each
-  // side's real concurrency ceiling; remote_peer_count is not a divisor.
-  const std::uint64_t combined_limit =
-    static_cast<std::uint64_t>(foreground_limit) + cpu_parallelism;
-  if (usable_stage1_budget >= combined_limit) {
-    plan.foreground_workers = foreground_limit;
-    plan.peer_stage1_workers = cpu_parallelism;
-    finish_foreground_coordinators();
-    return plan;
-  }
-
-  const std::uint32_t foreground_share = static_cast<std::uint32_t>(
-    static_cast<std::uint64_t>(usable_stage1_budget) * foreground_limit /
-    combined_limit);
-  plan.foreground_workers = std::min(
-    foreground_limit, std::max<std::uint32_t>(1, foreground_share));
-  const std::uint32_t peer_stage1_budget =
-    usable_stage1_budget - plan.foreground_workers;
-  plan.peer_stage1_workers = std::min(
-    cpu_parallelism, std::max<std::uint32_t>(1, peer_stage1_budget));
   finish_foreground_coordinators();
   return plan;
 }

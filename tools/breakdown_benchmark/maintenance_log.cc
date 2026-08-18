@@ -187,6 +187,37 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
     parse_double(fields, "maintenance_worker_idle_ms");
   const auto maintenance_lost_wake_avoided =
     parse_u64(fields, "maintenance_lost_wake_avoided");
+  const auto stage2_independent_score_rpc_batches =
+    parse_u64(fields, "stage2_independent_score_rpc_batches");
+  const auto stage2_independent_score_issued =
+    parse_u64(fields, "stage2_independent_score_issued");
+  const auto stage2_independent_score_useful =
+    parse_u64(fields, "stage2_independent_score_useful");
+  const auto stage2_independent_score_wasted =
+    parse_u64(fields, "stage2_independent_score_wasted");
+  const auto packing_target_batch =
+    parse_u64(fields, "packing_target_batch");
+  const auto packing_arrival_interval_us =
+    parse_u64(fields, "packing_arrival_interval_us");
+  const auto packing_waited_batches =
+    parse_u64(fields, "packing_waited_batches");
+  const auto packing_wait_ms = parse_double(fields, "packing_wait_ms");
+  const auto packing_target_flushes =
+    parse_u64(fields, "packing_target_flushes");
+  const auto packing_deadline_flushes =
+    parse_u64(fields, "packing_deadline_flushes");
+  const auto packing_full_flushes =
+    parse_u64(fields, "packing_full_flushes");
+  const auto packing_low_pressure_flushes =
+    parse_u64(fields, "packing_low_pressure_flushes");
+  const auto packing_cleanup_flushes =
+    parse_u64(fields, "packing_cleanup_flushes");
+  const auto packing_promotions =
+    parse_u64(fields, "packing_promotions");
+  const auto packing_rollbacks =
+    parse_u64(fields, "packing_rollbacks");
+  const auto packing_accepted_trial_windows =
+    parse_u64(fields, "packing_accepted_windows");
   const auto physical_stage1_items =
     parse_u64(fields, "physical_stage1_items");
   const auto physical_stage1_total_ns =
@@ -259,6 +290,30 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
       ? static_cast<uint64_t>(*maintenance_worker_idle_ms * 1e6 + 0.5) : 0,
     .maintenance_lost_wake_avoided =
       maintenance_lost_wake_avoided.value_or(0),
+    .stage2_independent_score_rpc_batches =
+      stage2_independent_score_rpc_batches.value_or(0),
+    .stage2_independent_score_issued =
+      stage2_independent_score_issued.value_or(0),
+    .stage2_independent_score_useful =
+      stage2_independent_score_useful.value_or(0),
+    .stage2_independent_score_wasted =
+      stage2_independent_score_wasted.value_or(0),
+    .packing_target_batch = packing_target_batch.value_or(0),
+    .packing_arrival_interval_us =
+      packing_arrival_interval_us.value_or(0),
+    .packing_waited_batches = packing_waited_batches.value_or(0),
+    .packing_wait_ns = packing_wait_ms.has_value()
+      ? static_cast<uint64_t>(*packing_wait_ms * 1e6 + 0.5) : 0,
+    .packing_target_flushes = packing_target_flushes.value_or(0),
+    .packing_deadline_flushes = packing_deadline_flushes.value_or(0),
+    .packing_full_flushes = packing_full_flushes.value_or(0),
+    .packing_low_pressure_flushes =
+      packing_low_pressure_flushes.value_or(0),
+    .packing_cleanup_flushes = packing_cleanup_flushes.value_or(0),
+    .packing_promotions = packing_promotions.value_or(0),
+    .packing_rollbacks = packing_rollbacks.value_or(0),
+    .packing_accepted_trial_windows =
+      packing_accepted_trial_windows.value_or(0),
     .physical_stage1_items = physical_stage1_items.value_or(0),
     .physical_stage1_total_ns = physical_stage1_total_ns.value_or(0),
     .physical_stage1_search_ns = physical_stage1_search_ns.value_or(0),
@@ -293,6 +348,21 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
     .search_budget_counters_available =
       stage1_search_budget_exhausted.has_value() &&
       stage2_search_budget_exhausted.has_value(),
+    .independent_score_counters_available =
+      stage2_independent_score_rpc_batches.has_value() &&
+      stage2_independent_score_issued.has_value() &&
+      stage2_independent_score_useful.has_value() &&
+      stage2_independent_score_wasted.has_value(),
+    .packing_counters_available = packing_target_batch.has_value() &&
+      packing_arrival_interval_us.has_value() &&
+      packing_waited_batches.has_value() && packing_wait_ms.has_value() &&
+      packing_target_flushes.has_value() &&
+      packing_deadline_flushes.has_value() &&
+      packing_full_flushes.has_value() &&
+      packing_low_pressure_flushes.has_value() &&
+      packing_cleanup_flushes.has_value() &&
+      packing_promotions.has_value() && packing_rollbacks.has_value() &&
+      packing_accepted_trial_windows.has_value(),
     .timing_counters_available = timing_counters_available,
   };
 }
@@ -590,6 +660,30 @@ MaintenanceLogSummary summarize_impl(
     }
 
     if (!slice.rotated && cursor.baseline_available &&
+        cursor.baseline.independent_score_counters_available &&
+        latest.independent_score_counters_available) {
+      uint64_t rpc_batches = 0;
+      uint64_t issued = 0;
+      uint64_t useful = 0;
+      uint64_t wasted = 0;
+      if (counter_delta(
+            cursor.baseline.stage2_independent_score_rpc_batches,
+            latest.stage2_independent_score_rpc_batches, &rpc_batches) &&
+          counter_delta(cursor.baseline.stage2_independent_score_issued,
+                        latest.stage2_independent_score_issued, &issued) &&
+          counter_delta(cursor.baseline.stage2_independent_score_useful,
+                        latest.stage2_independent_score_useful, &useful) &&
+          counter_delta(cursor.baseline.stage2_independent_score_wasted,
+                        latest.stage2_independent_score_wasted, &wasted)) {
+        ++summary.logs_with_independent_score_deltas;
+        summary.stage2_independent_score_rpc_batches += rpc_batches;
+        summary.stage2_independent_score_issued += issued;
+        summary.stage2_independent_score_useful += useful;
+        summary.stage2_independent_score_wasted += wasted;
+      }
+    }
+
+    if (!slice.rotated && cursor.baseline_available &&
         cursor.baseline.timing_counters_available &&
         latest.timing_counters_available) {
       std::array<uint64_t, kStage2TimingPhaseCount> phase_attempts{};
@@ -670,6 +764,64 @@ MaintenanceLogSummary summarize_impl(
         summary.physical_stage1_neighbors += stage1_neighbors;
       }
     }
+
+    if (latest.packing_counters_available) {
+      summary.packing_target_batch_max = std::max(
+        summary.packing_target_batch_max, latest.packing_target_batch);
+      summary.packing_arrival_interval_us_max = std::max(
+        summary.packing_arrival_interval_us_max,
+        latest.packing_arrival_interval_us);
+    }
+    if (!slice.rotated && cursor.baseline_available &&
+        cursor.baseline.packing_counters_available &&
+        latest.packing_counters_available) {
+      uint64_t waited_batches = 0;
+      uint64_t wait_ns = 0;
+      uint64_t target_flushes = 0;
+      uint64_t deadline_flushes = 0;
+      uint64_t full_flushes = 0;
+      uint64_t low_pressure_flushes = 0;
+      uint64_t cleanup_flushes = 0;
+      uint64_t promotions = 0;
+      uint64_t rollbacks = 0;
+      uint64_t accepted_trial_windows = 0;
+      if (counter_delta(cursor.baseline.packing_waited_batches,
+                        latest.packing_waited_batches, &waited_batches) &&
+          counter_delta(cursor.baseline.packing_wait_ns,
+                        latest.packing_wait_ns, &wait_ns) &&
+          counter_delta(cursor.baseline.packing_target_flushes,
+                        latest.packing_target_flushes, &target_flushes) &&
+          counter_delta(cursor.baseline.packing_deadline_flushes,
+                        latest.packing_deadline_flushes,
+                        &deadline_flushes) &&
+          counter_delta(cursor.baseline.packing_full_flushes,
+                        latest.packing_full_flushes, &full_flushes) &&
+          counter_delta(cursor.baseline.packing_low_pressure_flushes,
+                        latest.packing_low_pressure_flushes,
+                        &low_pressure_flushes) &&
+          counter_delta(cursor.baseline.packing_cleanup_flushes,
+                        latest.packing_cleanup_flushes, &cleanup_flushes) &&
+          counter_delta(cursor.baseline.packing_promotions,
+                        latest.packing_promotions, &promotions) &&
+          counter_delta(cursor.baseline.packing_rollbacks,
+                        latest.packing_rollbacks, &rollbacks) &&
+          counter_delta(
+            cursor.baseline.packing_accepted_trial_windows,
+            latest.packing_accepted_trial_windows,
+            &accepted_trial_windows)) {
+        ++summary.logs_with_packing_deltas;
+        summary.packing_waited_batches += waited_batches;
+        summary.packing_wait_ns += wait_ns;
+        summary.packing_target_flushes += target_flushes;
+        summary.packing_deadline_flushes += deadline_flushes;
+        summary.packing_full_flushes += full_flushes;
+        summary.packing_low_pressure_flushes += low_pressure_flushes;
+        summary.packing_cleanup_flushes += cleanup_flushes;
+        summary.packing_promotions += promotions;
+        summary.packing_rollbacks += rollbacks;
+        summary.packing_accepted_trial_windows += accepted_trial_windows;
+      }
+    }
   }
   summary.backlog_slope_available = summary.requested_logs != 0 &&
     summary.logs_with_slope_observations == summary.requested_logs;
@@ -683,6 +835,10 @@ MaintenanceLogSummary summarize_impl(
     summary.logs_with_locality_deltas == summary.requested_logs;
   summary.search_budget_delta_available = summary.requested_logs != 0 &&
     summary.logs_with_search_budget_deltas == summary.requested_logs;
+  summary.independent_score_delta_available = summary.requested_logs != 0 &&
+    summary.logs_with_independent_score_deltas == summary.requested_logs;
+  summary.packing_delta_available = summary.requested_logs != 0 &&
+    summary.logs_with_packing_deltas == summary.requested_logs;
   summary.timing_counter_delta_available = summary.requested_logs != 0 &&
     summary.logs_with_timing_counter_deltas == summary.requested_logs;
   summary.p99_stage2_delay_available = summary.requested_logs != 0 &&
@@ -725,6 +881,8 @@ std::vector<MaintenanceLogCursor> snapshot_maintenance_logs(
         cursor.baseline.failure_counters_available = true;
         cursor.baseline.stage2_delay_histogram_available = true;
         cursor.baseline.locality_counters_available = true;
+        cursor.baseline.independent_score_counters_available = true;
+        cursor.baseline.packing_counters_available = true;
         cursor.baseline_available = true;
       }
     }
@@ -885,6 +1043,10 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
     uint64_t score_prefetch_issued = 0;
     uint64_t score_prefetch_hits = 0;
     uint64_t score_prefetch_wasted = 0;
+    uint64_t independent_score_rpc_batches = 0;
+    uint64_t independent_score_issued = 0;
+    uint64_t independent_score_useful = 0;
+    uint64_t independent_score_wasted = 0;
     uint64_t vector_waves = 0;
     uint64_t vector_reads = 0;
     if (counter_delta(first.pressure_yields, latest.pressure_yields,
@@ -916,11 +1078,24 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
         counter_delta(first.stage2_score_prefetch_wasted,
                       latest.stage2_score_prefetch_wasted,
                       &score_prefetch_wasted) &&
+        counter_delta(first.stage2_independent_score_rpc_batches,
+                      latest.stage2_independent_score_rpc_batches,
+                      &independent_score_rpc_batches) &&
+        counter_delta(first.stage2_independent_score_issued,
+                      latest.stage2_independent_score_issued,
+                      &independent_score_issued) &&
+        counter_delta(first.stage2_independent_score_useful,
+                      latest.stage2_independent_score_useful,
+                      &independent_score_useful) &&
+        counter_delta(first.stage2_independent_score_wasted,
+                      latest.stage2_independent_score_wasted,
+                      &independent_score_wasted) &&
         counter_delta(first.stage2_vector_read_waves,
                       latest.stage2_vector_read_waves, &vector_waves) &&
         counter_delta(first.stage2_vector_unique_reads,
                       latest.stage2_vector_unique_reads, &vector_reads)) {
       ++summary.logs_with_execution_counter_deltas;
+      ++summary.logs_with_independent_score_deltas;
       summary.pressure_yields += pressure_yields;
       summary.stage2_batches += stage2_batches;
       summary.stage2_batched_items += stage2_batched_items;
@@ -932,8 +1107,70 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
       summary.stage2_score_prefetch_issued += score_prefetch_issued;
       summary.stage2_score_prefetch_hits += score_prefetch_hits;
       summary.stage2_score_prefetch_wasted += score_prefetch_wasted;
+      summary.stage2_independent_score_rpc_batches +=
+        independent_score_rpc_batches;
+      summary.stage2_independent_score_issued += independent_score_issued;
+      summary.stage2_independent_score_useful += independent_score_useful;
+      summary.stage2_independent_score_wasted += independent_score_wasted;
       summary.stage2_vector_read_waves += vector_waves;
       summary.stage2_vector_unique_reads += vector_reads;
+    }
+
+    summary.packing_target_batch_max = std::max(
+      summary.packing_target_batch_max, latest.packing_target_batch);
+    summary.packing_arrival_interval_us_max = std::max(
+      summary.packing_arrival_interval_us_max,
+      latest.packing_arrival_interval_us);
+    uint64_t packing_waited_batches = 0;
+    uint64_t packing_wait_ns = 0;
+    uint64_t packing_target_flushes = 0;
+    uint64_t packing_deadline_flushes = 0;
+    uint64_t packing_full_flushes = 0;
+    uint64_t packing_low_pressure_flushes = 0;
+    uint64_t packing_cleanup_flushes = 0;
+    uint64_t packing_promotions = 0;
+    uint64_t packing_rollbacks = 0;
+    uint64_t packing_accepted_trial_windows = 0;
+    if (counter_delta(first.packing_waited_batches,
+                      latest.packing_waited_batches,
+                      &packing_waited_batches) &&
+        counter_delta(first.packing_wait_ns, latest.packing_wait_ns,
+                      &packing_wait_ns) &&
+        counter_delta(first.packing_target_flushes,
+                      latest.packing_target_flushes,
+                      &packing_target_flushes) &&
+        counter_delta(first.packing_deadline_flushes,
+                      latest.packing_deadline_flushes,
+                      &packing_deadline_flushes) &&
+        counter_delta(first.packing_full_flushes,
+                      latest.packing_full_flushes,
+                      &packing_full_flushes) &&
+        counter_delta(first.packing_low_pressure_flushes,
+                      latest.packing_low_pressure_flushes,
+                      &packing_low_pressure_flushes) &&
+        counter_delta(first.packing_cleanup_flushes,
+                      latest.packing_cleanup_flushes,
+                      &packing_cleanup_flushes) &&
+        counter_delta(first.packing_promotions, latest.packing_promotions,
+                      &packing_promotions) &&
+        counter_delta(first.packing_rollbacks, latest.packing_rollbacks,
+                      &packing_rollbacks) &&
+        counter_delta(first.packing_accepted_trial_windows,
+                      latest.packing_accepted_trial_windows,
+                      &packing_accepted_trial_windows)) {
+      ++summary.logs_with_packing_deltas;
+      summary.packing_waited_batches += packing_waited_batches;
+      summary.packing_wait_ns += packing_wait_ns;
+      summary.packing_target_flushes += packing_target_flushes;
+      summary.packing_deadline_flushes += packing_deadline_flushes;
+      summary.packing_full_flushes += packing_full_flushes;
+      summary.packing_low_pressure_flushes +=
+        packing_low_pressure_flushes;
+      summary.packing_cleanup_flushes += packing_cleanup_flushes;
+      summary.packing_promotions += packing_promotions;
+      summary.packing_rollbacks += packing_rollbacks;
+      summary.packing_accepted_trial_windows +=
+        packing_accepted_trial_windows;
     }
 
     uint64_t score_rpc_batches = 0;
@@ -1081,6 +1318,11 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
   summary.execution_counter_delta_available =
     summary.requested_logs != 0 &&
     summary.logs_with_execution_counter_deltas == summary.requested_logs;
+  summary.independent_score_delta_available =
+    summary.requested_logs != 0 &&
+    summary.logs_with_independent_score_deltas == summary.requested_logs;
+  summary.packing_delta_available = summary.requested_logs != 0 &&
+    summary.logs_with_packing_deltas == summary.requested_logs;
   summary.score_rpc_wire_counter_delta_available =
     summary.requested_logs != 0 &&
     summary.logs_with_score_rpc_wire_counter_deltas ==

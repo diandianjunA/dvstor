@@ -15,10 +15,10 @@ namespace gpu_search::maintenance_telemetry {
 // unused tail of that page, so adding it neither changes header_bytes/version
 // nor requires rebuilding an existing index.
 inline constexpr u64 kMagic = 0x31544d43565344ULL;  // "DSVCMT1"
-// Versions 2-4 carried earlier Stage2 experiments. Version 5 adds score
-// prefetch promotion feedback and prevents a mixed deployment from silently
-// interpreting a different counter layout.
-inline constexpr u32 kVersion = 5;
+// Versions 2-5 carried earlier Stage2 experiments. Version 6 added adaptive
+// context packing; version 7 separates independent score-RPC work from the
+// near-free in-wave score-prefetch controller.
+inline constexpr u32 kVersion = 7;
 inline constexpr u32 kValidCounters = 1u << 0;
 inline constexpr size_t kLatencyBucketCount = 18;
 inline constexpr size_t kStage2PhaseCount = 6;
@@ -105,8 +105,24 @@ struct alignas(64) Snapshot {
   u64 stage2_home_score_rpc_request_bytes{};
   u64 stage2_home_score_rpc_response_bytes{};
   // Lower bound on notify-before-wait races closed by the maintenance event
-  // epoch. This consumes the existing reserved slot, preserving the v5 ABI.
+  // epoch. Version 6 appends packing feedback after the former v5 tail.
   u64 maintenance_lost_wake_avoided{};
+  u64 packing_target_batch{};
+  u64 packing_arrival_interval_us{};
+  u64 packing_waited_batches{};
+  u64 packing_wait_ns{};
+  u64 packing_target_flushes{};
+  u64 packing_deadline_flushes{};
+  u64 packing_full_flushes{};
+  u64 packing_low_pressure_flushes{};
+  u64 packing_cleanup_flushes{};
+  u64 packing_promotions{};
+  u64 packing_rollbacks{};
+  u64 packing_accepted_trial_windows{};
+  u64 stage2_independent_score_rpc_batches{};
+  u64 stage2_independent_score_issued{};
+  u64 stage2_independent_score_useful{};
+  u64 stage2_independent_score_wasted{};
 };
 
 static_assert(kSnapshotOffset == 192);

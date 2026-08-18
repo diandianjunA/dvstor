@@ -107,6 +107,14 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     0, std::memory_order_relaxed);
   storage_owner_stage2_score_prefetch_wasted_.store(
     0, std::memory_order_relaxed);
+  storage_owner_stage2_independent_score_rpc_batches_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_independent_score_issued_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_independent_score_useful_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_independent_score_wasted_.store(
+    0, std::memory_order_relaxed);
   storage_owner_stage2_score_feedback_base_hits_.store(
     0, std::memory_order_relaxed);
   storage_owner_stage2_score_feedback_base_wasted_.store(
@@ -135,8 +143,21 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     0, std::memory_order_relaxed);
   storage_owner_maintenance_wake_epoch_.store(
     0, std::memory_order_relaxed);
+  storage_owner_maintenance_wake_waiters_.store(
+    0, std::memory_order_relaxed);
   storage_owner_maintenance_lost_wake_avoided_.store(
     0, std::memory_order_relaxed);
+  // Preserve at least two independently runnable contexts per executor at
+  // the adaptive target. A small admission window must not trade away all
+  // context-level concurrency merely because per-context cost looks lower.
+  const size_t adaptive_packing_limit = std::min<size_t>(
+    std::max<u32>(1, config.storage_owner_batch_max),
+    std::max<size_t>(
+      2, storage_owner_maintenance_admission_limit_ /
+           std::max<size_t>(1, static_cast<size_t>(worker_count) * 2)));
+  storage_owner_stage2_packing_.reset(
+    adaptive_packing_limit,
+    config.storage_owner_stage2_batch_max_wait_us);
   physical_stage1_items_.store(0, std::memory_order_relaxed);
   physical_stage1_total_ns_.store(0, std::memory_order_relaxed);
   physical_stage1_search_ns_.store(0, std::memory_order_relaxed);
@@ -321,6 +342,11 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                " (shared per-peer work-conserving aggregation)");
   print_status("storage-owner maintenance tuning: protocol=centroid-home-two-stage"
                " compaction_batch_target=" + std::to_string(config.storage_owner_batch_max) +
+               " adaptive_pack_target=legacy_then_guarded_4"
+               " adaptive_pack_max_wait_us=" +
+               std::to_string(kStage2AdaptivePackingMaxWaitUs) +
+               " adaptive_pack_concurrency_cap=" +
+               std::to_string(adaptive_packing_limit) +
                " backlog_limit=" +
                std::to_string(config.storage_owner_maintenance_queue_depth) +
                " admission_window=" +
@@ -462,6 +488,8 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   const u64 stage2_batches = storage_owner_stage2_batches_.load(std::memory_order_relaxed);
   const u64 stage2_batched_items =
     storage_owner_stage2_batched_items_.load(std::memory_order_relaxed);
+  const Stage2PackingTelemetry stage2_packing =
+    storage_owner_stage2_packing_.telemetry();
   std::array<u64, kStorageOwnerStage2TimingPhaseCount>
     stage2_phase_attempts{};
   std::array<u64, kStorageOwnerStage2TimingPhaseCount>
@@ -586,6 +614,18 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
       std::memory_order_relaxed);
   const u64 stage2_score_prefetch_wasted =
     storage_owner_stage2_score_prefetch_wasted_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_independent_score_rpc_batches =
+    storage_owner_stage2_independent_score_rpc_batches_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_independent_score_issued =
+    storage_owner_stage2_independent_score_issued_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_independent_score_useful =
+    storage_owner_stage2_independent_score_useful_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_independent_score_wasted =
+    storage_owner_stage2_independent_score_wasted_.load(
       std::memory_order_relaxed);
   const u64 stage2_vector_read_waves =
     storage_owner_stage2_vector_read_waves_.load(std::memory_order_relaxed);
@@ -770,6 +810,31 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   telemetry_snapshot.maintenance_worker_idle_waits = worker_idle_waits;
   telemetry_snapshot.maintenance_worker_idle_ns = worker_idle_ns;
   telemetry_snapshot.maintenance_lost_wake_avoided = lost_wake_avoided;
+  telemetry_snapshot.packing_target_batch = stage2_packing.target_batch;
+  telemetry_snapshot.packing_arrival_interval_us =
+    stage2_packing.estimated_arrival_interval_us;
+  telemetry_snapshot.packing_waited_batches = stage2_packing.waited_batches;
+  telemetry_snapshot.packing_wait_ns = stage2_packing.wait_ns;
+  telemetry_snapshot.packing_target_flushes = stage2_packing.target_flushes;
+  telemetry_snapshot.packing_deadline_flushes =
+    stage2_packing.deadline_flushes;
+  telemetry_snapshot.packing_full_flushes = stage2_packing.full_flushes;
+  telemetry_snapshot.packing_low_pressure_flushes =
+    stage2_packing.low_pressure_flushes;
+  telemetry_snapshot.packing_cleanup_flushes =
+    stage2_packing.cleanup_flushes;
+  telemetry_snapshot.packing_promotions = stage2_packing.promotions;
+  telemetry_snapshot.packing_rollbacks = stage2_packing.rollbacks;
+  telemetry_snapshot.packing_accepted_trial_windows =
+    stage2_packing.accepted_trial_windows;
+  telemetry_snapshot.stage2_independent_score_rpc_batches =
+    stage2_independent_score_rpc_batches;
+  telemetry_snapshot.stage2_independent_score_issued =
+    stage2_independent_score_issued;
+  telemetry_snapshot.stage2_independent_score_useful =
+    stage2_independent_score_useful;
+  telemetry_snapshot.stage2_independent_score_wasted =
+    stage2_independent_score_wasted;
   telemetry_snapshot.physical_stage1_items =
     physical_stage1_items_.load(std::memory_order_relaxed);
   telemetry_snapshot.physical_stage1_total_ns =
@@ -905,6 +970,14 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(
                  storage_owner_stage2_score_prefetch_enabled_.load(
                    std::memory_order_relaxed)) +
+               " stage2_independent_score_rpc_batches=" +
+               std::to_string(stage2_independent_score_rpc_batches) +
+               " stage2_independent_score_issued=" +
+               std::to_string(stage2_independent_score_issued) +
+               " stage2_independent_score_useful=" +
+               std::to_string(stage2_independent_score_useful) +
+               " stage2_independent_score_wasted=" +
+               std::to_string(stage2_independent_score_wasted) +
                " stage2_vector_read_waves=" +
                std::to_string(stage2_vector_read_waves) +
                " avg_stage2_scores_per_vector_wave=" +
@@ -987,6 +1060,31 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(stage2_batches) +
                " avg_stage2_batch_size=" +
                std::to_string(ratio_or_zero(stage2_batched_items, stage2_batches)) +
+               " packing_target_batch=" +
+               std::to_string(stage2_packing.target_batch) +
+               " packing_arrival_interval_us=" +
+               std::to_string(stage2_packing.estimated_arrival_interval_us) +
+               " packing_waited_batches=" +
+               std::to_string(stage2_packing.waited_batches) +
+               " packing_wait_ms=" +
+               std::to_string(static_cast<double>(stage2_packing.wait_ns) /
+                              1e6) +
+               " packing_target_flushes=" +
+               std::to_string(stage2_packing.target_flushes) +
+               " packing_deadline_flushes=" +
+               std::to_string(stage2_packing.deadline_flushes) +
+               " packing_full_flushes=" +
+               std::to_string(stage2_packing.full_flushes) +
+               " packing_low_pressure_flushes=" +
+               std::to_string(stage2_packing.low_pressure_flushes) +
+               " packing_cleanup_flushes=" +
+               std::to_string(stage2_packing.cleanup_flushes) +
+               " packing_promotions=" +
+               std::to_string(stage2_packing.promotions) +
+               " packing_rollbacks=" +
+               std::to_string(stage2_packing.rollbacks) +
+               " packing_accepted_windows=" +
+               std::to_string(stage2_packing.accepted_trial_windows) +
                stage2_phase_timing_log +
                " physical_stage1_items=" +
                std::to_string(physical_stage1_items_.load(

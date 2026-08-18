@@ -26,6 +26,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
              "storage-owner maintenance worker state missing");
   StorageOwnerThread& thread = *storage_owner_maintenance_worker_states_[worker_id];
   current_storage_owner_thread_ = &thread;
+  current_storage_owner_maintenance_worker_ = true;
   const Configuration& config = *storage_worker_config_;
   lib_assert(num_storage_nodes_ > 0 && num_storage_nodes_ <= 64,
              "asynchronous stage2 supports at most 64 storage shards");
@@ -46,7 +47,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     vec<vec<RemotePtr>> continued_candidates_by_task;
     // Parent liveness is revalidated immediately before reconciliation.  The
     // resulting exact planner input must survive scheduler yields while the
-    // two ordered remote barriers are in flight.
+    // three ordered remote barriers are in flight.
     vec<vec<RemotePtr>> live_stage2_neighbors_by_task;
     Stage2FinalizeSubphase finalize_subphase{
       Stage2FinalizeSubphase::prepare};
@@ -70,6 +71,13 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     u64 search_started_ns{};
     u64 reverse_prepare_started_ns{};
     bool reverse_prepare_timing_active{};
+    // Admission-only scheduling metadata. It never participates in graph
+    // semantics and exists solely to close the adaptive packing feedback loop.
+    u64 packing_admitted_ns{};
+    u64 packing_wait_ns{};
+    size_t packing_debt_at_admission{};
+    u32 packing_target_batch{1};
+    bool packing_high_pressure{};
   };
 
   // One timer update represents a whole context phase attempt.  In
@@ -273,6 +281,25 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         cancel_peer_rpc_response(rpc.request_id);
       }
     }
+    for (Stage2SpeculativeScoreRpc& rpc :
+         context.search_io.speculative_score_rpcs) {
+      if (rpc.posted && rpc.request_id != 0) {
+        cancel_peer_rpc_response(rpc.request_id);
+      }
+      if (rpc.process_credit_held) {
+        if (rpc.posted) {
+          // The local registry cancellation does not cancel remote execution.
+          // Disable further lookahead to this peer rather than reusing a
+          // request-lifetime credit whose remote work is still unaccounted.
+          fail_closed_peer_rpc_speculative_credit(
+            rpc.target_shard, rpc.request_id);
+        } else {
+          release_peer_rpc_speculative_credit(
+            rpc.target_shard, rpc.request_id);
+        }
+        rpc.process_credit_held = false;
+      }
+    }
     context.search_io.reset();
     context.reconcile_batch.clear();
     context.active = false;
@@ -298,6 +325,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     context.search_started_ns = 0;
     context.reverse_prepare_started_ns = 0;
     context.reverse_prepare_timing_active = false;
+    context.packing_admitted_ns = 0;
+    context.packing_wait_ns = 0;
+    context.packing_debt_at_admission = 0;
+    context.packing_target_batch = 1;
+    context.packing_high_pressure = false;
     context.finalize_subphase = Stage2FinalizeSubphase::prepare;
   };
 
@@ -961,7 +993,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                  result == Stage2ReverseEnqueueResult::duplicate,
                "bounded stage2 reverse outbox capacity/correlation invariant failed");
     if (result == Stage2ReverseEnqueueResult::enqueued) {
-      notify_storage_owner_maintenance();
+      // This worker immediately drives the shared outbox below; no executor
+      // wake is needed for its own publication.
     }
     return result;
   };
@@ -1049,7 +1082,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                        completion.worker_id]->try_push(completion),
                      "bounded stage2 reverse completion capacity invariant failed");
         }
-        notify_storage_owner_maintenance();
+        // One aggregate may contain logical requests owned by several
+        // executors. This is the sole maintenance-worker publication that
+        // must cross the executor wake channel rather than only waking
+        // foreground capacity waiters.
+        notify_storage_owner_maintenance_executors();
         progressed = true;
         continue;
       }
@@ -1264,6 +1301,12 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     // across the complete context batch, eliminating the per-task RDMA RTT
     // chain while preserving each task's private beam and convergence state.
     Stage2SearchIoState& search_io = context.search_io;
+    // Independent score lookahead is part of the same bounded experiment as
+    // larger context packing. Legacy/rollback contexts therefore provide an
+    // exact no-speculation baseline, and a negative combined result disables
+    // both extra waiting and extra receiver work automatically.
+    search_io.independent_score_allowed =
+      context.packing_high_pressure && context.packing_target_batch >= 4;
     const Stage2SearchAdvanceResult search_result =
       advance_stage2_search_candidates_batched(
       span<const StorageOwnerMaintenanceTask>{context.tasks},
@@ -1373,12 +1416,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       }
     }
     switch (barrier) {
-      case Stage2ReconcileBarrier::install:
+      case Stage2ReconcileBarrier::promotion:
         selected_ops = std::move(promotion_ops);
-        selected_ops.insert(
-          selected_ops.end(),
-          std::make_move_iterator(stable_ops.begin()),
-          std::make_move_iterator(stable_ops.end()));
+        return true;
+      case Stage2ReconcileBarrier::stable:
+        selected_ops = std::move(stable_ops);
         return true;
       case Stage2ReconcileBarrier::removal:
         selected_ops = std::move(removal_ops);
@@ -1577,7 +1619,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   };
 
   // Placement authority and centroid membership remain synchronous in this
-  // patch.  They execute only after the two reconciliation barriers have
+  // patch.  They execute only after all three reconciliation barriers have
   // completed, and may safely reacquire any idle search lane for their local
   // snapshot/control scratch.
   const auto finish_stage2_after_reconcile = [&, this](
@@ -1738,9 +1780,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     return true;
   };
 
-  // Drives as many zero-remote barriers as possible, but never waits. The
-  // install payload preserves promotion-before-add order for every target;
-  // only after all install ACKs may obsolete Stage1 bridges be removed.
+  // Drives as many zero-remote barriers as possible, but never waits.
+  // Ordinary stable additions run first because they may RobustPrune a hot
+  // parent shared with another task. Promotion is the final stable-plane
+  // mutation and is audited as a complete mandatory set; only then may
+  // obsolete Stage1 bridges be removed.
   const auto advance_reconcile_pipeline = [&] (Stage2Context& context) {
     for (;;) {
       const ReconcilePollResult poll = poll_reconcile_barrier(context);
@@ -1754,7 +1798,13 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         context.reconcile_batch.barrier();
       cancel_context_reconcile(context);
       switch (completed) {
-        case Stage2ReconcileBarrier::install:
+        case Stage2ReconcileBarrier::stable:
+          if (!start_reconcile_barrier(
+                context, Stage2ReconcileBarrier::promotion)) {
+            return false;
+          }
+          break;
+        case Stage2ReconcileBarrier::promotion:
           for (StorageOwnerMaintenanceTask& task : context.tasks) {
             if (!task.reverse_reconciled) {
               task.stage2_promotion_committed = true;
@@ -2605,9 +2655,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     }
 
     // Promotion is the durable reachability certificate. Persist the exact
-    // liveness view before yielding, then install every promotion certificate
-    // and ordinary stable addition in one target-ordered barrier. Obsolete
-    // Stage1 removals start only after the complete install ACK set.
+    // liveness view before yielding, then apply ordinary stable additions,
+    // promotion, and obsolete Stage1 removals in that order. Making promotion
+    // the last stable-plane barrier prevents a later ordinary RobustPrune from
+    // invalidating its audited certificate before provisional removal.
     lib_assert(context.live_stage2_neighbors_by_task.size() >=
                  context.tasks.size(),
                "Stage2 context cannot persist its reconciliation plan");
@@ -2616,7 +2667,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         live_stage2_neighbors_by_task[item];
     }
     if (!start_reconcile_barrier(
-          context, Stage2ReconcileBarrier::install)) {
+          context, stage2_reconcile_first_barrier())) {
       return false;
     }
     (void)advance_reconcile_pipeline(context);
@@ -2977,6 +3028,25 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       }
     }
 
+    if (context.kind == StorageOwnerMaintenanceKind::finalize_insert &&
+        context.packing_admitted_ns != 0) {
+      const u64 service_ns = steady_now_ns() - context.packing_admitted_ns;
+      const u64 effective_cost_ns = service_ns >
+          std::numeric_limits<u64>::max() - context.packing_wait_ns
+        ? std::numeric_limits<u64>::max()
+        : service_ns + context.packing_wait_ns;
+      const size_t debt_at_completion =
+        storage_owner_maintenance_completion_ring_ == nullptr ? 0 :
+          storage_owner_maintenance_completion_ring_->outstanding();
+      storage_owner_stage2_packing_.observe_completion(
+        context.packing_target_batch,
+        context.packing_high_pressure,
+        context.tasks.size(),
+        effective_cost_ns,
+        context.packing_debt_at_admission,
+        debt_at_completion);
+    }
+
     const Stage2ContextHandle handle = context.handle;
     release_context_lane(context);
     reset_context(context);
@@ -2984,7 +3054,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                "stage2 context release violated finalized generation");
     storage_owner_maintenance_active_workers_.fetch_sub(
       1, std::memory_order_acq_rel);
-    notify_storage_owner_maintenance();
+    notify_storage_owner_maintenance_capacity();
   };
 
   const auto defer_cleanup_context = [&](Stage2Context& context) {
@@ -3009,7 +3079,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                "cleanup deferral retained an asynchronous request");
     storage_owner_maintenance_active_workers_.fetch_sub(
       1, std::memory_order_acq_rel);
-    notify_storage_owner_maintenance();
+    notify_storage_owner_maintenance_capacity();
   };
 
   const auto drive_context = [&](Stage2Context& context) {
@@ -3168,7 +3238,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
             context.tasks.push_back(std::move(repair));
             repair = StorageOwnerMaintenanceTask{};
           }
-          notify_storage_owner_maintenance();
+          notify_storage_owner_maintenance_capacity();
           return &context;
         }
         lib_assert(storage_owner_repair_tasks_->try_push(std::move(repair)),
@@ -3183,16 +3253,35 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         storage_owner_cleanup_tasks_.front().maintenance_sequence) &&
       admission_now >=
         storage_owner_cleanup_tasks_.front().retry_not_before;
-    // A context is the unit across which vector and graph snapshots are
-    // coalesced.  Consuming the first descriptor immediately leaves the
-    // advertised compaction delay unused and turns every insertion into its
-    // own RDMA wave.  Wait only while the oldest descriptor is younger than
-    // the bounded delay; a full batch and an aged tail are always runnable.
-    const bool stage2_ready = !storage_owner_stage2_tasks_.empty() &&
-      stage2_batch_ready(
+    const auto packing_parameters =
+      storage_owner_stage2_packing_.parameters();
+    const size_t completion_outstanding =
+      storage_owner_maintenance_completion_ring_ == nullptr ? 0 :
+        storage_owner_maintenance_completion_ring_->outstanding();
+    // Completion debt is the dataset-independent signal that Stage2, rather
+    // than a sparse low-rate workload, needs more coalescing. A queue already
+    // holding two target batches is independently high pressure. Isolated
+    // arrivals and short bursts therefore retain immediate/legacy latency.
+    const bool completion_pressure =
+      storage_owner_maintenance_admission_limit_ != 0 &&
+      completion_outstanding >=
+        (storage_owner_maintenance_admission_limit_ + 1) / 2;
+    const bool queue_pressure =
+      storage_owner_stage2_tasks_.size() >=
+        std::max<size_t>(2, packing_parameters.target_batch * 2);
+    const bool packing_high_pressure =
+      completion_pressure || queue_pressure;
+    Stage2PackingDecision packing_decision;
+    if (!storage_owner_stage2_tasks_.empty()) {
+      packing_decision = decide_stage2_packing(
         storage_owner_stage2_tasks_.size(), batch_limit,
+        packing_parameters.target_batch,
         storage_owner_stage2_tasks_.front().queued_at, admission_now,
-        config.storage_owner_stage2_batch_max_wait_us);
+        config.storage_owner_stage2_batch_max_wait_us,
+        packing_parameters.estimated_arrival_interval_us,
+        packing_high_pressure);
+    }
+    const bool stage2_ready = packing_decision.ready;
     const bool choose_stage2 =
       stage2_ready &&
       (!cleanup_ready || storage_owner_stage2_tasks_.front().queued_at <=
@@ -3200,7 +3289,6 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     if (!choose_stage2 && !cleanup_ready) {
       storage_owner_maintenance_active_workers_.fetch_sub(
         1, std::memory_order_acq_rel);
-      notify_storage_owner_maintenance();
       return nullptr;
     }
 
@@ -3210,16 +3298,39 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       : StorageOwnerMaintenanceKind::cleanup_deleted_node;
 
     if (choose_stage2) {
+      const auto oldest_queued_at =
+        storage_owner_stage2_tasks_.front().queued_at;
+      const u64 oldest_wait_ns = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::max<std::chrono::steady_clock::duration>(
+            std::chrono::steady_clock::duration::zero(),
+            admission_now - oldest_queued_at)).count());
+      const size_t pop_limit = std::min(
+        batch_limit, std::max<size_t>(1, packing_decision.pop_limit));
       while (!storage_owner_stage2_tasks_.empty() &&
-             context.tasks.size() < batch_limit) {
+             context.tasks.size() < pop_limit) {
         context.tasks.push_back(
           std::move(storage_owner_stage2_tasks_.front()));
         storage_owner_stage2_tasks_.pop_front();
       }
+      context.packing_admitted_ns = steady_now_ns();
+      context.packing_wait_ns = packing_decision.wait_budget_us == 0 ? 0 :
+        std::min<u64>(
+          oldest_wait_ns,
+          static_cast<u64>(packing_decision.wait_budget_us) * 1'000);
+      context.packing_debt_at_admission = completion_outstanding;
+      context.packing_target_batch = static_cast<u32>(
+        packing_decision.target_batch);
+      context.packing_high_pressure = packing_high_pressure;
+      storage_owner_stage2_packing_.observe_admission(
+        packing_decision.reason, context.tasks.size(), oldest_wait_ns,
+        packing_decision.wait_budget_us);
       storage_owner_stage2_batches_.fetch_add(1, std::memory_order_relaxed);
       storage_owner_stage2_batched_items_.fetch_add(
         context.tasks.size(), std::memory_order_relaxed);
     } else {
+      storage_owner_stage2_packing_.observe_admission(
+        Stage2PackingFlushReason::cleanup, 0, 0, 0);
       while (!storage_owner_cleanup_tasks_.empty() &&
              context.tasks.size() < batch_limit) {
         const StorageOwnerMaintenanceTask& next =
@@ -3238,7 +3349,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     // even when queue capacity, rather than completion credit, was the last
     // exhausted resource.
     wake_peer_stage1_admission_waiters();
-    notify_storage_owner_maintenance();
+    notify_storage_owner_maintenance_capacity();
     lib_assert(!context.tasks.empty(),
                "stage2 admitted an empty maintenance context");
     return &context;
@@ -3304,6 +3415,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         storage_owner_maintenance_active_workers_.fetch_sub(
           1, std::memory_order_acq_rel);
       }
+      current_storage_owner_maintenance_worker_ = false;
       current_storage_owner_thread_ = nullptr;
       return;
     }
@@ -3342,35 +3454,67 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
 
     maybe_log_storage_owner_maintenance_observation();
     if (!progressed) {
-      std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
       const auto idle_started = std::chrono::steady_clock::now();
       auto wake_at = idle_started + std::chrono::milliseconds(1);
-      if (!storage_owner_stage2_tasks_.empty()) {
-        const auto batch_deadline = stage2_partial_batch_deadline(
-          storage_owner_stage2_tasks_.size(),
-          std::max<size_t>(1, config.storage_owner_batch_max),
-          storage_owner_stage2_tasks_.front().queued_at,
-          config.storage_owner_stage2_batch_max_wait_us);
-        if (batch_deadline.has_value() && *batch_deadline < wake_at) {
-          wake_at = *batch_deadline;
+      {
+        std::lock_guard<std::mutex> queue_lock(
+          storage_owner_maintenance_mutex_);
+        if (!storage_owner_stage2_tasks_.empty()) {
+          const auto parameters = storage_owner_stage2_packing_.parameters();
+          const size_t outstanding =
+            storage_owner_maintenance_completion_ring_ == nullptr ? 0 :
+              storage_owner_maintenance_completion_ring_->outstanding();
+          const bool completion_pressure =
+            storage_owner_maintenance_admission_limit_ != 0 &&
+            outstanding >=
+              (storage_owner_maintenance_admission_limit_ + 1) / 2;
+          const bool queue_pressure =
+            storage_owner_stage2_tasks_.size() >=
+              std::max<size_t>(2, parameters.target_batch * 2);
+          const Stage2PackingDecision decision = decide_stage2_packing(
+            storage_owner_stage2_tasks_.size(),
+            std::max<size_t>(1, config.storage_owner_batch_max),
+            parameters.target_batch,
+            storage_owner_stage2_tasks_.front().queued_at,
+            idle_started,
+            config.storage_owner_stage2_batch_max_wait_us,
+            parameters.estimated_arrival_interval_us,
+            completion_pressure || queue_pressure);
+          if (decision.deadline.has_value() &&
+              *decision.deadline < wake_at) {
+            wake_at = *decision.deadline;
+          }
         }
       }
       const u64 idle_started_ns = steady_now_ns();
-      if (stage2_maintenance_event_pending(
-            observed_wake_epoch,
-            storage_owner_maintenance_wake_epoch_.load(
-              std::memory_order_acquire))) {
+      std::unique_lock<std::mutex> wake_lock(
+        storage_owner_maintenance_wake_mutex_);
+      storage_owner_maintenance_wake_waiters_.fetch_add(
+        1, std::memory_order_acq_rel);
+      const auto unregister_waiter = [&]() {
+        const u32 previous =
+          storage_owner_maintenance_wake_waiters_.fetch_sub(
+            1, std::memory_order_acq_rel);
+        lib_assert(previous != 0,
+                   "maintenance wake waiter registration underflow");
+      };
+      const bool raced_before_wait =
+        storage_owner_maintenance_wake_epoch_.load(
+          std::memory_order_acquire) != observed_wake_epoch;
+      if (raced_before_wait) {
         storage_owner_maintenance_lost_wake_avoided_.fetch_add(
           1, std::memory_order_relaxed);
+      } else {
+        storage_owner_maintenance_wake_cv_.wait_until(
+          wake_lock, wake_at, [&]() {
+            return storage_owner_maintenance_shutdown_.load(
+                     std::memory_order_acquire) ||
+              storage_owner_maintenance_wake_epoch_.load(
+                std::memory_order_acquire) != observed_wake_epoch;
+          });
       }
-      storage_owner_maintenance_cv_.wait_until(lock, wake_at, [&]() {
-        return storage_owner_maintenance_shutdown_.load(
-                 std::memory_order_acquire) ||
-          stage2_maintenance_event_pending(
-            observed_wake_epoch,
-            storage_owner_maintenance_wake_epoch_.load(
-              std::memory_order_acquire));
-      });
+      unregister_waiter();
+      wake_lock.unlock();
       unpublished_idle_wait_ns += steady_now_ns() - idle_started_ns;
       ++unpublished_idle_waits;
       // Publishing in small batches avoids an atomic operation on every idle

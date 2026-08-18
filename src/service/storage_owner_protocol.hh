@@ -124,8 +124,23 @@ static_assert(sizeof(Stage2ExpandScoreNeighbor) == 16);
 
 struct Stage2ScoreManyHeader {
   u32 query_count{};
-  u32 reserved{};
+  // Legacy/authoritative requests carry zero. Independent exact-score
+  // lookahead sets the speculative bit so receivers can isolate its queue and
+  // response capacity without changing the score payload or wire size.
+  u32 flags{};
 };
+
+inline constexpr u32 kStage2ScoreManyFlagSpeculative = 1u << 0;
+inline constexpr u32 kStage2ScoreManyKnownFlags =
+  kStage2ScoreManyFlagSpeculative;
+
+inline constexpr bool stage2_score_many_flags_valid(u32 flags) noexcept {
+  return (flags & ~kStage2ScoreManyKnownFlags) == 0;
+}
+
+inline constexpr bool stage2_score_many_is_speculative(u32 flags) noexcept {
+  return (flags & kStage2ScoreManyFlagSpeculative) != 0;
+}
 
 struct Stage2ScoreManyItem {
   u64 pointer_raw{};

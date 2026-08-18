@@ -205,9 +205,12 @@ bool MemoryNode::handle_peer_stage2_score_many_request(
   const auto* own_header = stage2_score_many_header(payload);
   if (own_header->query_count == 0 ||
       own_header->query_count > header.item_count ||
-      own_header->reserved != 0) {
+      !stage2_score_many_flags_valid(own_header->flags)) {
     return false;
   }
+  const bool speculative =
+    stage2_score_many_is_speculative(own_header->flags);
+  if (speculative && !peer_stage2_home_speculation_enabled_) return false;
 
   const size_t response_capacity =
     stage2_score_many_response_bytes(header.item_count);
@@ -288,6 +291,7 @@ bool MemoryNode::handle_peer_stage2_score_many_request(
   outbound.header = *response_header;
   outbound.payload = std::move(response);
   outbound.graph_response = true;
+  outbound.speculative = speculative;
   outbound.queued_at = std::chrono::steady_clock::now();
   const bool queued = try_enqueue_peer_reverse_update_response(
     std::move(outbound));
