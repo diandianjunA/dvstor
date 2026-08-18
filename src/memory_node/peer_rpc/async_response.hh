@@ -4,13 +4,17 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "common/types.hh"
+#include "memory_node/storage_owner_maintenance/ready_context_queue.hh"
 #include "service/storage_owner_protocol.hh"
 
 namespace memory_node_detail {
@@ -73,6 +77,26 @@ struct PeerResponseDescriptor {
   u32 receive_slot{};
   size_t bytes{};
   service::storage_owner::PeerRpcHeader header{};
+  bool owned_payload{};
+};
+
+struct PeerResponseCompletionTarget {
+  u32 maintenance_wake_owner{kNoMaintenanceWakeOwner};
+  memory_node_storage_owner_maintenance_detail::Stage2ContextOwnerKey
+    context_owner{};
+
+  [[nodiscard]] bool has_context_owner() const noexcept {
+    return context_owner.runtime_epoch != 0 && context_owner.token != 0;
+  }
+
+  bool operator==(const PeerResponseCompletionTarget&) const = default;
+};
+
+struct PeerOwnedResponse {
+  u32 peer_id{};
+  service::storage_owner::PeerRpcHeader header{};
+  PeerResponseCompletionTarget completion_target{};
+  std::vector<byte_t> payload;
 };
 
 struct PeerHashProbeTelemetry {
@@ -129,7 +153,20 @@ public:
     std::lock_guard<std::mutex> lock(mutex_);
     return register_request_locked(request_id, expected_shard, expected_type,
                                    expected_item_count,
-                                   maintenance_wake_owner);
+                                   PeerResponseCompletionTarget{
+                                     .maintenance_wake_owner =
+                                       maintenance_wake_owner});
+  }
+
+  PeerResponseRegistration register_request_with_target(
+      u64 request_id,
+      u32 expected_shard,
+      service::storage_owner::PeerRpcType expected_type,
+      u32 expected_item_count,
+      PeerResponseCompletionTarget completion_target) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return register_request_locked(request_id, expected_shard, expected_type,
+                                   expected_item_count, completion_target);
   }
 
   PeerResponseRegistration register_send_attempt(
@@ -141,7 +178,20 @@ public:
     std::lock_guard<std::mutex> lock(mutex_);
     return register_request_locked(request_id, expected_shard, expected_type,
                                    expected_item_count,
-                                   maintenance_wake_owner);
+                                   PeerResponseCompletionTarget{
+                                     .maintenance_wake_owner =
+                                       maintenance_wake_owner});
+  }
+
+  PeerResponseRegistration register_send_attempt_with_target(
+      u64 request_id,
+      u32 expected_shard,
+      service::storage_owner::PeerRpcType expected_type,
+      u32 expected_item_count,
+      PeerResponseCompletionTarget completion_target) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return register_request_locked(request_id, expected_shard, expected_type,
+                                   expected_item_count, completion_target);
   }
 
   // Returns true only when ownership of the receive descriptor transfers to
@@ -155,31 +205,84 @@ public:
     if (maintenance_wake_owner != nullptr) {
       *maintenance_wake_owner = kNoMaintenanceWakeOwner;
     }
+    PeerResponseCompletionTarget target;
+    const bool delivered = try_deliver_with_target(
+      peer_id, receive_slot, bytes, header, &target);
+    if (delivered && maintenance_wake_owner != nullptr) {
+      *maintenance_wake_owner = target.maintenance_wake_owner;
+    }
+    return delivered;
+  }
+
+  bool try_deliver_with_target(
+      u32 peer_id,
+      u32 receive_slot,
+      size_t bytes,
+      const service::storage_owner::PeerRpcHeader& header,
+      PeerResponseCompletionTarget* completion_target = nullptr) {
+    if (completion_target != nullptr) *completion_target = {};
     std::lock_guard<std::mutex> lock(mutex_);
     const size_t slot_index = find_slot_locked(header.request_id);
     if (slot_index == npos) return false;
-
     Slot& slot = slots_[slot_index];
-    if (slot.state != State::pending ||
-        !metadata_matches(slot,
-                          peer_id,
-                          static_cast<service::storage_owner::PeerRpcType>(
-                            header.type),
-                          header.item_count) ||
-        header.source_shard != peer_id) {
-      return false;
-    }
-
+    if (!delivery_matches(slot, peer_id, header)) return false;
     slot.response = PeerResponseDescriptor{
       .peer_id = peer_id,
       .receive_slot = receive_slot,
       .bytes = bytes,
       .header = header,
+      .owned_payload = false,
     };
     slot.receive_descriptor_held = true;
+    slot.owned_payload.clear();
     slot.state = State::complete;
-    if (maintenance_wake_owner != nullptr) {
-      *maintenance_wake_owner = slot.maintenance_wake_owner;
+    if (completion_target != nullptr) {
+      *completion_target = slot.completion_target;
+    }
+    return true;
+  }
+
+  // Atomically publishes a demultiplexed aggregate. Validation of every
+  // logical registry cell precedes the first move, so callers never expose a
+  // partial fan-out that could make an exact outer retry unsafe.
+  bool try_deliver_owned_batch(
+      std::span<PeerOwnedResponse> responses,
+      std::vector<PeerResponseCompletionTarget>& completion_targets) {
+    completion_targets.clear();
+    completion_targets.reserve(responses.size());
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++validation_epoch_;
+    if (validation_epoch_ == 0) ++validation_epoch_;
+    for (const PeerOwnedResponse& response : responses) {
+      if (!valid_owned_response(response)) return false;
+      const std::size_t slot_index = find_slot_locked(
+        response.header.request_id);
+      if (slot_index == npos ||
+          !delivery_matches(slots_[slot_index], response.peer_id,
+                            response.header) ||
+          slots_[slot_index].completion_target !=
+            response.completion_target) {
+        return false;
+      }
+      Slot& slot = slots_[slot_index];
+      if (slot.validation_epoch == validation_epoch_) return false;
+      slot.validation_epoch = validation_epoch_;
+    }
+    for (PeerOwnedResponse& response : responses) {
+      const std::size_t slot_index = find_slot_locked(
+        response.header.request_id);
+      Slot& slot = slots_[slot_index];
+      slot.response = PeerResponseDescriptor{
+        .peer_id = response.peer_id,
+        .receive_slot = std::numeric_limits<u32>::max(),
+        .bytes = response.payload.size(),
+        .header = response.header,
+        .owned_payload = true,
+      };
+      slot.receive_descriptor_held = false;
+      slot.owned_payload = std::move(response.payload);
+      slot.state = State::complete;
+      completion_targets.push_back(slot.completion_target);
     }
     return true;
   }
@@ -214,6 +317,19 @@ public:
     const bool success = response.header.status == static_cast<u32>(
       service::storage_owner::InsertStatus::ok);
     return success ? TryPeerResponse::success : TryPeerResponse::failure;
+  }
+
+  bool take_owned_payload(PeerResponseLease lease,
+                          std::vector<byte_t>& payload) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!valid_lease_locked(lease, State::consuming)) return false;
+    Slot& slot = slots_[lease.slot];
+    if (!slot.response.owned_payload || slot.receive_descriptor_held ||
+        slot.owned_payload.size() != slot.response.bytes) {
+      return false;
+    }
+    payload = std::move(slot.owned_payload);
+    return true;
   }
 
   // The consumer calls this immediately after copying the payload and
@@ -252,6 +368,7 @@ public:
     }
     Slot& slot = slots_[lease.slot];
     slot.response = {};
+    std::vector<byte_t>{}.swap(slot.owned_payload);
     slot.state = State::retryable;
     advance_generation(slot);
     return true;
@@ -271,6 +388,7 @@ public:
     }
     Slot& slot = slots_[lease.slot];
     slot.response = {};
+    std::vector<byte_t>{}.swap(slot.owned_payload);
     slot.state = State::pending;
     advance_generation(slot);
     return true;
@@ -287,7 +405,9 @@ public:
     if (slot.state == State::consuming) return std::nullopt;
 
     std::optional<PeerResponseDescriptor> response;
-    if (slot.state == State::complete) response = slot.response;
+    if (slot.state == State::complete && slot.receive_descriptor_held) {
+      response = slot.response;
+    }
     release_slot_locked(slot_index);
     return response;
   }
@@ -306,7 +426,9 @@ public:
     for (Bucket& bucket : buckets_) bucket = {};
     for (Slot& slot : slots_) {
       advance_generation(slot);
-      slot = Slot{.generation = slot.generation};
+      const u64 generation = slot.generation;
+      slot = Slot{};
+      slot.generation = generation;
     }
     size_ = 0;
     initialize_free_list();
@@ -328,10 +450,12 @@ private:
     service::storage_owner::PeerRpcType expected_type{
       service::storage_owner::PeerRpcType::reverse_update_response};
     u32 expected_item_count{};
-    u32 maintenance_wake_owner{kNoMaintenanceWakeOwner};
+    PeerResponseCompletionTarget completion_target{};
     PeerResponseDescriptor response{};
+    std::vector<byte_t> owned_payload;
     bool receive_descriptor_held{};
     u64 generation{};
+    u64 validation_epoch{};
     size_t next_free{npos};
     State state{State::free};
   };
@@ -349,15 +473,18 @@ private:
       u32 expected_shard,
       service::storage_owner::PeerRpcType expected_type,
       u32 expected_item_count,
-      u32 maintenance_wake_owner) {
-    if (request_id == 0) return PeerResponseRegistration::conflict;
+      PeerResponseCompletionTarget completion_target) {
+    if (request_id == 0 ||
+        !valid_completion_target(completion_target)) {
+      return PeerResponseRegistration::conflict;
+    }
 
     const size_t existing = find_slot_locked(request_id);
     if (existing != npos) {
       Slot& slot = slots_[existing];
       if (!metadata_matches(slot, expected_shard, expected_type,
                             expected_item_count) ||
-          slot.maintenance_wake_owner != maintenance_wake_owner) {
+          slot.completion_target != completion_target) {
         return PeerResponseRegistration::conflict;
       }
       if (slot.state == State::pending) {
@@ -380,8 +507,9 @@ private:
     slot.expected_shard = expected_shard;
     slot.expected_type = expected_type;
     slot.expected_item_count = expected_item_count;
-    slot.maintenance_wake_owner = maintenance_wake_owner;
+    slot.completion_target = completion_target;
     slot.response = {};
+    slot.owned_payload.clear();
     slot.receive_descriptor_held = false;
     slot.state = State::pending;
     insert_bucket_locked(request_id, slot_index);
@@ -462,6 +590,48 @@ private:
            slot.expected_item_count == expected_item_count;
   }
 
+  static bool valid_completion_target(
+      const PeerResponseCompletionTarget& target) {
+    const auto& owner = target.context_owner;
+    const bool empty_owner = owner.runtime_epoch == 0 &&
+      owner.worker_id == 0 && owner.slot == 0 && owner.token == 0;
+    const bool valid_owner = owner.runtime_epoch != 0 && owner.token != 0;
+    if (!empty_owner && !valid_owner) return false;
+    return !valid_owner ||
+      target.maintenance_wake_owner == kNoMaintenanceWakeOwner;
+  }
+
+  static bool delivery_matches(
+      const Slot& slot,
+      u32 peer_id,
+      const service::storage_owner::PeerRpcHeader& header) {
+    return slot.state == State::pending &&
+      metadata_matches(
+        slot, peer_id,
+        static_cast<service::storage_owner::PeerRpcType>(header.type),
+        header.item_count) &&
+      header.source_shard == peer_id;
+  }
+
+  static bool valid_owned_response(const PeerOwnedResponse& response) {
+    using namespace service::storage_owner;
+    if (response.peer_id == std::numeric_limits<u32>::max() ||
+        response.payload.size() < sizeof(PeerRpcHeader)) {
+      return false;
+    }
+    PeerRpcHeader embedded{};
+    std::memcpy(&embedded, response.payload.data(), sizeof(embedded));
+    return embedded.magic == kPeerRpcMagic &&
+      embedded.version == kPeerRpcVersion &&
+      embedded.type == response.header.type &&
+      embedded.source_shard == response.header.source_shard &&
+      embedded.item_count == response.header.item_count &&
+      embedded.request_id == response.header.request_id &&
+      embedded.status == response.header.status &&
+      embedded.reserved == response.header.reserved &&
+      embedded.source_shard == response.peer_id;
+  }
+
   size_t allocate_slot_locked() {
     const size_t slot_index = free_head_;
     Slot& slot = slots_[slot_index];
@@ -528,6 +698,7 @@ private:
   size_t free_head_{npos};
   size_t size_{};
   PeerHashProbeTelemetry probe_telemetry_{};
+  u64 validation_epoch_{};
 };
 
 // Bounded receiver-side de-duplication for retries that reuse a request ID.

@@ -39,9 +39,16 @@ bool MemoryNode::try_post_peer_rpc_request_attempt(
                "maintenance RPC registration has no executor state");
     maintenance_wake_owner = current_storage_owner_thread_->id;
   }
-  const auto registration = peer_async_responses_->register_send_attempt(
-    request_id, target_shard, response_type, item_count,
-    maintenance_wake_owner);
+  const auto context_owner =
+    current_storage_owner_maintenance_context_owner();
+  const auto registration = context_owner.runtime_epoch != 0 &&
+      context_owner.token != 0
+    ? peer_async_responses_->register_send_attempt_with_target(
+        request_id, target_shard, response_type, item_count,
+        PeerResponseCompletionTarget{.context_owner = context_owner})
+    : peer_async_responses_->register_send_attempt(
+        request_id, target_shard, response_type, item_count,
+        maintenance_wake_owner);
   if (registration ==
       memory_node_detail::PeerResponseRegistration::already_complete) {
     return true;
@@ -68,6 +75,242 @@ bool MemoryNode::try_post_peer_rpc_request_attempt(
   header->request_id = request_id;
   std::memcpy(message + sizeof(*header), items, item_bytes);
   post_peer_rpc_send_slot(target_shard, slot_id, request_bytes);
+  return true;
+}
+
+MemoryNode::Stage2HomeRpcEnqueueResult
+MemoryNode::try_enqueue_stage2_home_rpc_request(
+    u32 target_shard,
+    service::storage_owner::PeerRpcType request_type,
+    u64 logical_request_id,
+    u32 item_count,
+    span<const byte_t> request,
+    bool speculative,
+    PeerResponseCompletionTarget completion_target) {
+  using namespace service::storage_owner;
+  using Result = Stage2HomeRpcEnqueueResult;
+  if (stage2_home_rpc_outbox_ == nullptr ||
+      peer_async_responses_ == nullptr ||
+      !completion_target.has_context_owner() ||
+      target_shard >= num_storage_nodes_ || target_shard == storage_id_ ||
+      logical_request_id == 0 || item_count == 0 ||
+      (request_type != PeerRpcType::stage2_expand_score_request &&
+       request_type != PeerRpcType::stage2_score_many_request)) {
+    return Result::invalid;
+  }
+  const PeerRpcType response_type = request_type ==
+      PeerRpcType::stage2_score_many_request
+    ? PeerRpcType::stage2_score_many_response
+    : PeerRpcType::stage2_expand_score_response;
+  const auto registration =
+    peer_async_responses_->register_send_attempt_with_target(
+      logical_request_id, target_shard, response_type, item_count,
+      completion_target);
+  if (registration ==
+      memory_node_detail::PeerResponseRegistration::already_complete) {
+    return Result::duplicate;
+  }
+  if (registration !=
+        memory_node_detail::PeerResponseRegistration::registered &&
+      registration != memory_node_detail::PeerResponseRegistration::retry) {
+    return registration == memory_node_detail::PeerResponseRegistration::full
+      ? Result::full : Result::conflict;
+  }
+
+  const Result result = stage2_home_rpc_outbox_->try_enqueue(
+    memory_node_storage_owner_maintenance_detail::Stage2HomeRpcDispatch{
+      .logical_request_id = logical_request_id,
+      .peer_index = target_shard,
+      .request_type = request_type,
+      .item_count = item_count,
+      .speculative = speculative,
+      .completion_owner = completion_target.context_owner,
+      .request = std::span<const byte_t>{request.data(), request.size()},
+    });
+  if (result != Result::enqueued && result != Result::duplicate &&
+      registration ==
+        memory_node_detail::PeerResponseRegistration::registered) {
+    cancel_peer_rpc_response(logical_request_id);
+  }
+  return result;
+}
+
+bool MemoryNode::try_drive_stage2_home_rpc_requests(
+    u32 target_shard,
+    service::storage_owner::PeerRpcType request_type,
+    bool speculative) {
+  if (stage2_home_rpc_outbox_ == nullptr ||
+      target_shard >= num_storage_nodes_ || target_shard == storage_id_ ||
+      !stage2_home_rpc_outbox_->has_ready(
+        target_shard, request_type, speculative)) {
+    return false;
+  }
+  u32 slot_id = 0;
+  const PeerRpcSendClass send_class = speculative
+    ? PeerRpcSendClass::speculative : PeerRpcSendClass::graph_update;
+  if (!try_acquire_peer_rpc_send_slot(
+        target_shard, send_class, slot_id)) {
+    return false;
+  }
+  bool formed_new = false;
+  std::optional<
+    memory_node_storage_owner_maintenance_detail::Stage2HomeRpcAggregate>
+      formed_aggregate;
+  u64 wire_request_id = 0;
+  const auto retry_request_id =
+    stage2_home_rpc_outbox_->next_retry_wire_request(
+      target_shard, request_type, speculative);
+  if (retry_request_id.has_value()) {
+    wire_request_id = *retry_request_id;
+  } else {
+    wire_request_id = allocate_peer_request_id();
+    formed_aggregate = stage2_home_rpc_outbox_->form_aggregate(
+      target_shard, request_type, wire_request_id, storage_id_, speculative);
+    if (!formed_aggregate.has_value()) {
+      release_peer_rpc_send_slot(target_shard, slot_id);
+      return false;
+    }
+    formed_new = true;
+  }
+  const size_t offset = peer_rpc_async_send_offset(target_shard, slot_id);
+  byte_t* destination = peer_rpc_runtime_.buffer.get_full_buffer() + offset;
+  size_t request_bytes = 0;
+  const auto post_lease = stage2_home_rpc_outbox_->claim_ready_for_post(
+    wire_request_id,
+    std::span<byte_t>{destination, peer_rpc_runtime_.message_bytes},
+    request_bytes);
+  if (!post_lease.has_value()) {
+    release_peer_rpc_send_slot(target_shard, slot_id);
+    if (formed_new) {
+      (void)stage2_home_rpc_outbox_->discard_aggregate(wire_request_id);
+    }
+    return false;
+  }
+  post_peer_rpc_send_slot(target_shard, slot_id, request_bytes);
+  if (formed_aggregate.has_value()) {
+    // These counters describe unique outer wire transactions. Logical work
+    // and dependency waves remain counted by candidate_search; retries keep
+    // the same outer ID and therefore do not inflate the batching ratio.
+    const u64 item_count = formed_aggregate->item_count;
+    storage_owner_stage2_home_rpc_batches_.fetch_add(
+      1, std::memory_order_relaxed);
+    storage_owner_stage2_home_rpc_items_.fetch_add(
+      item_count, std::memory_order_relaxed);
+
+    u64 score_items = 0;
+    u64 score_queries = 0;
+    if (request_type ==
+        service::storage_owner::PeerRpcType::stage2_score_many_request) {
+      score_items = item_count;
+      score_queries = service::storage_owner::stage2_score_many_header(
+        destination)->query_count;
+    } else {
+      const auto* items = service::storage_owner::stage2_expand_score_items(
+        destination);
+      for (u32 item = 0; item < formed_aggregate->item_count; ++item) {
+        score_items += items[item].operation == static_cast<u32>(
+          service::storage_owner::Stage2HomeOperation::score_only);
+      }
+      score_queries = score_items;
+    }
+    if (score_items != 0) {
+      storage_owner_stage2_home_score_rpc_batches_.fetch_add(
+        1, std::memory_order_relaxed);
+      storage_owner_stage2_home_score_rpc_items_.fetch_add(
+        score_items, std::memory_order_relaxed);
+      storage_owner_stage2_home_score_rpc_queries_.fetch_add(
+        score_queries, std::memory_order_relaxed);
+      storage_owner_stage2_home_score_rpc_request_bytes_.fetch_add(
+        request_bytes, std::memory_order_relaxed);
+      const u64 response_bytes = request_type ==
+          service::storage_owner::PeerRpcType::stage2_score_many_request
+        ? service::storage_owner::stage2_score_many_response_bytes(
+            formed_aggregate->item_count)
+        : service::storage_owner::stage2_expand_score_response_bytes(
+            formed_aggregate->item_count, 0);
+      storage_owner_stage2_home_score_rpc_response_bytes_.fetch_add(
+        response_bytes, std::memory_order_relaxed);
+    }
+  }
+  // The CQ progress thread may demultiplex and retire a very fast response
+  // before this producer executes the transition. In that case the failed
+  // generation check is expected and no second post is permitted.
+  const u64 timeout_ns = static_cast<u64>(
+    std::max<u32>(1, storage_worker_config_->storage_owner_rpc_timeout_ms)) *
+    1'000'000ull;
+  const u64 now_ns = static_cast<u64>(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+  const u64 deadline_ns = now_ns >
+      std::numeric_limits<u64>::max() - timeout_ns
+    ? std::numeric_limits<u64>::max() : now_ns + timeout_ns;
+  (void)stage2_home_rpc_outbox_->mark_awaiting_response(
+    *post_lease, deadline_ns);
+  return true;
+}
+
+bool MemoryNode::cancel_stage2_home_rpc_request(u64 logical_request_id) {
+  const bool outbox_cancelled = stage2_home_rpc_outbox_ != nullptr &&
+    stage2_home_rpc_outbox_->cancel_logical(logical_request_id);
+  if (peer_async_responses_ != nullptr) {
+    const auto response = peer_async_responses_->cancel(logical_request_id);
+    if (response.has_value() && !response->owned_payload) {
+      repost_peer_rpc_receive(response->peer_id, response->receive_slot);
+    }
+  }
+  return outbox_cancelled;
+}
+
+bool MemoryNode::try_handle_stage2_home_rpc_aggregate_response(
+    u32 peer_id,
+    span<const byte_t> response,
+    std::vector<PeerResponseCompletionTarget>& completion_targets) {
+  completion_targets.clear();
+  if (stage2_home_rpc_outbox_ == nullptr ||
+      peer_async_responses_ == nullptr ||
+      response.size() < sizeof(service::storage_owner::PeerRpcHeader)) {
+    return false;
+  }
+  service::storage_owner::PeerRpcHeader outer_header{};
+  std::memcpy(&outer_header, response.data(), sizeof(outer_header));
+  if (!stage2_home_rpc_outbox_->owns_wire_request(
+        outer_header.request_id)) {
+    return false;
+  }
+  auto demux = stage2_home_rpc_outbox_->demultiplex_response(
+    outer_header.request_id,
+    std::span<const byte_t>{response.data(), response.size()});
+  if (!demux.has_value()) {
+    // This wire ID belongs to the combiner. A malformed/duplicate outer
+    // response is consumed here and the exact retained request is retried by
+    // its owner; it must never fall through to a logical registry cell.
+    (void)stage2_home_rpc_outbox_->retry_after_timeout(
+      outer_header.request_id);
+    return true;
+  }
+
+  std::vector<memory_node_detail::PeerOwnedResponse> logical;
+  logical.reserve(demux->logical_responses.size());
+  for (auto& response_image : demux->logical_responses) {
+    service::storage_owner::PeerRpcHeader header{};
+    std::memcpy(&header, response_image.response.data(), sizeof(header));
+    logical.push_back(memory_node_detail::PeerOwnedResponse{
+      .peer_id = peer_id,
+      .header = header,
+      .completion_target = PeerResponseCompletionTarget{
+        .context_owner = response_image.completion_owner},
+      .payload = std::move(response_image.response),
+    });
+  }
+  if (!peer_async_responses_->try_deliver_owned_batch(
+        logical, completion_targets)) {
+    lib_assert(stage2_home_rpc_outbox_->release_demux(demux->lease),
+               "stage2 home aggregate fan-out lost its retry lease");
+    completion_targets.clear();
+    return true;
+  }
+  lib_assert(stage2_home_rpc_outbox_->finish_success(demux->lease),
+             "stage2 home aggregate fan-out lost its generation lease");
   return true;
 }
 
@@ -129,6 +372,20 @@ MemoryNode::TryPeerResponse MemoryNode::try_consume_peer_rpc_response(
   }
 
   header = response.header;
+  if (response.owned_payload) {
+    const bool valid_owned_descriptor =
+      response.peer_id < num_storage_nodes_ &&
+      response.bytes >= sizeof(service::storage_owner::PeerRpcHeader) &&
+      response.bytes <= peer_rpc_runtime_.message_bytes &&
+      peer_async_responses_->take_owned_payload(lease, payload) &&
+      payload.size() == response.bytes;
+    if (valid_owned_descriptor) return result;
+    payload.clear();
+    lib_assert(peer_async_responses_->retry(lease),
+               "malformed owned peer response could not be rearmed");
+    lease = {};
+    return TryPeerResponse::failure;
+  }
   const bool valid_descriptor =
     response.peer_id < num_storage_nodes_ &&
     response.receive_slot < peer_rpc_runtime_.recv_slots_per_peer &&
@@ -182,9 +439,12 @@ bool MemoryNode::await_late_peer_rpc_response(PeerResponseLease lease) {
 }
 
 void MemoryNode::cancel_peer_rpc_response(u64 request_id) {
+  if (stage2_home_rpc_outbox_ != nullptr) {
+    (void)stage2_home_rpc_outbox_->cancel_logical(request_id);
+  }
   if (peer_async_responses_ == nullptr) return;
   const auto response = peer_async_responses_->cancel(request_id);
-  if (response.has_value()) {
+  if (response.has_value() && !response->owned_payload) {
     repost_peer_rpc_receive(response->peer_id, response->receive_slot);
   }
 }

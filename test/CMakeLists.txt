@@ -440,6 +440,21 @@ target_compile_options(storage_owner_reverse_outbox_test PRIVATE -UNDEBUG)
 add_test(NAME storage_owner_reverse_outbox_test
     COMMAND storage_owner_reverse_outbox_test)
 
+add_executable(storage_owner_home_rpc_outbox_test
+    storage_owner_home_rpc_outbox_test.cc)
+dvstor_target_common_includes(storage_owner_home_rpc_outbox_test)
+target_compile_options(storage_owner_home_rpc_outbox_test PRIVATE -UNDEBUG)
+add_test(NAME storage_owner_home_rpc_outbox_test
+    COMMAND storage_owner_home_rpc_outbox_test)
+
+add_executable(storage_owner_ready_context_queue_test
+    storage_owner_ready_context_queue_test.cc)
+dvstor_target_common_includes(storage_owner_ready_context_queue_test)
+target_link_libraries(storage_owner_ready_context_queue_test PRIVATE Threads::Threads)
+target_compile_options(storage_owner_ready_context_queue_test PRIVATE -UNDEBUG)
+add_test(NAME storage_owner_ready_context_queue_test
+    COMMAND storage_owner_ready_context_queue_test)
+
 add_executable(peer_async_response_registry_test
     peer_async_response_registry_test.cc)
 dvstor_target_common_includes(peer_async_response_registry_test)

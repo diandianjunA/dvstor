@@ -1,6 +1,8 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <vector>
 
 #include "memory_node/peer_rpc/async_response.hh"
@@ -133,6 +135,69 @@ void test_delivery_preserves_exact_maintenance_owner() {
   assert(registry.try_deliver(
     2, 6, sizeof(unowned), unowned, &delivered_owner));
   assert(delivered_owner == detail::kNoMaintenanceWakeOwner);
+}
+
+void test_owned_batch_delivery_is_atomic_and_generation_fenced() {
+  detail::PeerAsyncResponseRegistry registry(4);
+  constexpr auto type = protocol::PeerRpcType::stage2_score_many_response;
+  const memory_node_storage_owner_maintenance_detail::Stage2ContextOwnerKey
+    first_owner{7, 2, 3, 11};
+  const memory_node_storage_owner_maintenance_detail::Stage2ContextOwnerKey
+    second_owner{7, 4, 5, 12};
+  const detail::PeerResponseCompletionTarget first_target{
+    .context_owner = first_owner};
+  const detail::PeerResponseCompletionTarget second_target{
+    .context_owner = second_owner};
+  assert(registry.register_send_attempt_with_target(
+           41, 2, type, 1, first_target) ==
+         detail::PeerResponseRegistration::registered);
+  assert(registry.register_send_attempt_with_target(
+           42, 2, type, 1, second_target) ==
+         detail::PeerResponseRegistration::registered);
+
+  auto first_header = response(41, 2, type, 1);
+  auto second_header = response(42, 2, type, 1);
+  std::vector<detail::PeerOwnedResponse> owned(2);
+  owned[0].peer_id = 2;
+  owned[0].header = first_header;
+  owned[0].completion_target = first_target;
+  owned[0].payload.resize(sizeof(first_header));
+  std::memcpy(owned[0].payload.data(), &first_header, sizeof(first_header));
+  owned[1].peer_id = 2;
+  owned[1].header = second_header;
+  owned[1].completion_target = second_target;
+  owned[1].payload.resize(sizeof(second_header));
+  std::memcpy(owned[1].payload.data(), &second_header, sizeof(second_header));
+
+  // One malformed member rejects the complete aggregate before either
+  // logical request becomes visible.
+  owned[1].header.item_count = 2;
+  std::vector<detail::PeerResponseCompletionTarget> targets;
+  assert(!registry.try_deliver_owned_batch(owned, targets));
+  detail::PeerResponseDescriptor descriptor;
+  detail::PeerResponseLease lease;
+  assert(registry.try_take(41, 2, type, 1, descriptor, lease) ==
+         detail::TryPeerResponse::pending);
+  owned[1].header = second_header;
+  assert(registry.try_deliver_owned_batch(owned, targets));
+  assert(targets.size() == 2 && targets[0] == first_target &&
+         targets[1] == second_target);
+
+  assert(registry.try_take(41, 2, type, 1, descriptor, lease) ==
+         detail::TryPeerResponse::success);
+  assert(descriptor.owned_payload &&
+         descriptor.receive_slot == std::numeric_limits<u32>::max());
+  std::vector<byte_t> payload;
+  assert(registry.take_owned_payload(lease, payload));
+  assert(payload.size() == sizeof(first_header));
+  assert(!registry.mark_receive_reposted(lease));
+  assert(registry.ack_consumed(lease));
+
+  // Cancelling a synthetic completion frees owned bytes but never returns an
+  // RDMA descriptor for repost.
+  assert(!registry.cancel(42).has_value());
+  assert(registry.size() == 0);
+  assert(registry.drain_completed().empty());
 }
 
 void test_shutdown_drain_respects_receive_ownership() {
@@ -421,6 +486,7 @@ void test_dedup_inflight_capacity_and_high_churn_fifo() {
 int main() {
   test_registration_delivery_and_explicit_consumption();
   test_delivery_preserves_exact_maintenance_owner();
+  test_owned_batch_delivery_is_atomic_and_generation_fenced();
   test_retry_generation_and_cancelled_descriptor();
   test_transient_response_keeps_late_same_attempt_delivery_open();
   test_response_slab_aba_and_late_response();

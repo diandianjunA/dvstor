@@ -45,6 +45,7 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     lib_assert(channel.waiters.load(std::memory_order_acquire) == 0,
                "maintenance wake channel retained a waiter across restart");
     channel.epoch.store(0, std::memory_order_relaxed);
+    channel.context_scan_requested.store(false, std::memory_order_relaxed);
   }
   // Every reserved sequence is either already queued/runnable or completed by
   // its synchronous retirement path. Stage1 preparation owns no sequence, so
@@ -164,6 +165,50 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     0, std::memory_order_relaxed);
   storage_owner_maintenance_lost_wake_avoided_.store(
     0, std::memory_order_relaxed);
+  storage_owner_maintenance_ready_notifications_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_maintenance_ready_stale_notifications_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_maintenance_ready_tickets_drained_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_maintenance_ready_overflow_scans_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_maintenance_ready_fallback_scans_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_search_lane_leases_.store(0, std::memory_order_relaxed);
+  storage_owner_search_lane_lease_peak_.store(0, std::memory_order_relaxed);
+  storage_owner_search_lane_lease_blocked_.store(
+    0, std::memory_order_relaxed);
+  for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {
+    storage_owner_search_lane_blocked_contexts_[worker_id].store(
+      0, std::memory_order_relaxed);
+    storage_owner_search_lane_grants_[worker_id].store(
+      0, std::memory_order_relaxed);
+  }
+  reset_storage_owner_maintenance_waiters(
+    storage_owner_search_lane_waiters_);
+  reset_storage_owner_maintenance_waiters(
+    peer_rdma_read_global_waiters_);
+  if (peer_rdma_read_peer_waiters_ != nullptr) {
+    for (u32 peer = 0; peer < num_storage_nodes_; ++peer) {
+      reset_storage_owner_maintenance_waiters(
+        peer_rdma_read_peer_waiters_[peer]);
+    }
+  }
+  if (peer_rdma_read_qp_waiters_ != nullptr) {
+    for (size_t waiter = 0; waiter < peer_rdma_read_qp_waiter_count_;
+         ++waiter) {
+      reset_storage_owner_maintenance_waiters(
+        peer_rdma_read_qp_waiters_[waiter]);
+    }
+  }
+  if (peer_rpc_send_slot_waiters_ != nullptr) {
+    for (size_t waiter = 0; waiter < peer_rpc_send_slot_waiter_count_;
+         ++waiter) {
+      reset_storage_owner_maintenance_waiters(
+        peer_rpc_send_slot_waiters_[waiter]);
+    }
+  }
   // Preserve at least two independently runnable contexts per executor, but
   // keep production on the measured legacy target. Across the ten August 18
   // runs, context-rate * tasks/context predicts throughput within 1.7%, while
@@ -223,6 +268,35 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     });
   const size_t contexts_per_worker =
     std::max<size_t>(1, config.storage_owner_rpc_depth);
+  const u64 previous_runtime_epoch =
+    storage_owner_maintenance_runtime_epoch_counter_.fetch_add(
+      1, std::memory_order_acq_rel);
+  lib_assert(previous_runtime_epoch != std::numeric_limits<u64>::max(),
+             "Stage2 ready-context runtime epoch exhausted");
+  const u64 runtime_epoch = previous_runtime_epoch + 1;
+  lib_assert(storage_owner_maintenance_ready_queue_storage_.size() <=
+               std::numeric_limits<size_t>::max() - worker_count,
+             "Stage2 ready-context queue storage overflow");
+  storage_owner_maintenance_ready_queue_storage_.reserve(
+    storage_owner_maintenance_ready_queue_storage_.size() + worker_count);
+  vec<std::unique_ptr<StorageOwnerReadyContextQueue>> runtime_ready_queues;
+  runtime_ready_queues.reserve(worker_count);
+  for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {
+    lib_assert(storage_owner_maintenance_ready_queue_active_[worker_id].load(
+                 std::memory_order_acquire) == nullptr,
+               "Stage2 ready-context queue is already active");
+    runtime_ready_queues.push_back(
+      std::make_unique<StorageOwnerReadyContextQueue>(
+        runtime_epoch, worker_id, contexts_per_worker));
+  }
+  for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {
+    StorageOwnerReadyContextQueue* queue =
+      runtime_ready_queues[worker_id].get();
+    storage_owner_maintenance_ready_queue_storage_.push_back(
+      std::move(runtime_ready_queues[worker_id]));
+    storage_owner_maintenance_ready_queue_active_[worker_id].store(
+      queue, std::memory_order_release);
+  }
   const size_t remote_peer_count =
     num_storage_nodes_ > 1 ? static_cast<size_t>(num_storage_nodes_ - 1) : 1;
   lib_assert(static_cast<size_t>(worker_count) <=
@@ -292,41 +366,54 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
       worker_count, contexts_per_worker,
       useful_lane_wave_rdma_wrs,
       peer_credit_plan.global);
-  lib_assert(global_search_lane_count >= worker_count,
-             "global Stage2 lane allocation starved a maintenance worker");
-
-  vec<u32> search_lanes_by_worker(worker_count);
-  size_t min_search_lanes_per_worker =
-    std::numeric_limits<size_t>::max();
-  size_t max_search_lanes_per_worker = 0;
+  lib_assert(global_search_lane_count != 0,
+             "global Stage2 lane allocation produced no runnable lane");
+  // Registered scratch is a bounded execution substrate, not a cache. Give
+  // every worker one lane per local context, then admit active lanes through
+  // the node-wide lease above. A hot worker can therefore borrow all useful
+  // dependency chains instead of being pinned to its old two-lane share.
+  constexpr size_t kMaxNodeWideSearchLanes = 16;
+  const size_t physical_lanes_per_worker = std::min<size_t>(
+    contexts_per_worker, kMaxNodeWideSearchLanes);
+  lib_assert(physical_lanes_per_worker != 0 &&
+               physical_lanes_per_worker <=
+                 std::numeric_limits<u32>::max(),
+             "Stage2 per-worker physical lane count exceeds u32 transport index");
+  lib_assert(static_cast<size_t>(worker_count) <=
+               std::numeric_limits<size_t>::max() /
+                 physical_lanes_per_worker,
+             "Stage2 aggregate physical lane count overflow");
+  const size_t total_physical_lanes =
+    static_cast<size_t>(worker_count) * physical_lanes_per_worker;
+  const size_t global_search_lane_lease_limit = std::min({
+    global_search_lane_count,
+    kMaxNodeWideSearchLanes,
+    total_physical_lanes,
+  });
+  lib_assert(global_search_lane_lease_limit != 0 &&
+               global_search_lane_lease_limit <=
+                 std::numeric_limits<u32>::max(),
+             "global Stage2 lane lease is outside its transport range");
+  storage_owner_search_lane_lease_limit_.store(
+    static_cast<u32>(global_search_lane_lease_limit),
+    std::memory_order_release);
   size_t total_scratch_bytes = 0;
   for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {
-    const size_t lane_count = stage2_search_lanes_for_worker(
-      worker_id, worker_count, contexts_per_worker,
-      global_search_lane_count);
-    lib_assert(lane_count != 0 && lane_count <= contexts_per_worker,
-               "Stage2 lane distribution violated worker context capacity");
-    lib_assert(lane_count <= std::numeric_limits<u32>::max(),
-               "Stage2 per-worker lane count exceeds u32 transport index");
     lib_assert(coroutine_scratch_stride <=
-                 std::numeric_limits<size_t>::max() / lane_count,
+                 std::numeric_limits<size_t>::max() /
+                   physical_lanes_per_worker,
                "stage2 search lane scratch size overflow");
     const size_t worker_scratch_bytes =
-      coroutine_scratch_stride * lane_count;
+      coroutine_scratch_stride * physical_lanes_per_worker;
     lib_assert(total_scratch_bytes <=
                  std::numeric_limits<size_t>::max() - worker_scratch_bytes,
                "stage2 aggregate peer scratch size overflow");
     total_scratch_bytes += worker_scratch_bytes;
-    min_search_lanes_per_worker = std::min(
-      min_search_lanes_per_worker, lane_count);
-    max_search_lanes_per_worker = std::max(
-      max_search_lanes_per_worker, lane_count);
-    search_lanes_by_worker[worker_id] = static_cast<u32>(lane_count);
   }
 
   storage_owner_maintenance_worker_states_.reserve(worker_count);
   for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {
-    const u32 search_lanes = search_lanes_by_worker[worker_id];
+    const u32 search_lanes = static_cast<u32>(physical_lanes_per_worker);
     const size_t scratch_bytes =
       coroutine_scratch_stride * static_cast<size_t>(search_lanes);
     auto worker = std::make_unique<StorageOwnerThread>(
@@ -352,10 +439,13 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                " global_read_window=" +
                std::to_string(peer_credit_plan.global) +
                " search_lanes_global=" +
-               std::to_string(global_search_lane_count) +
-               " search_lanes_per_worker_min/max=" +
-               std::to_string(min_search_lanes_per_worker) + "/" +
-               std::to_string(max_search_lanes_per_worker) +
+               std::to_string(global_search_lane_lease_limit) +
+               " search_lane_lease_cap=" +
+               std::to_string(global_search_lane_lease_limit) +
+               " search_lanes_physical_per_worker=" +
+               std::to_string(physical_lanes_per_worker) +
+               " ready_context_runtime_epoch=" +
+               std::to_string(runtime_epoch) +
                " bytes_per_lane=" +
                std::to_string(coroutine_scratch_stride) +
                " bytes_total=" + std::to_string(total_scratch_bytes));
@@ -436,12 +526,36 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
       worker.join();
     }
   }
+  for (auto& queue : storage_owner_maintenance_ready_queue_active_) {
+    queue.store(nullptr, std::memory_order_release);
+  }
   // Peer CQ progress remains alive below this point. Disable routing before
   // worker_states_ is cleared; the channels themselves have stable lifetime
   // and therefore remain safe for a notifier that already observed the old
   // count.
   storage_owner_maintenance_wake_worker_count_.store(
     0, std::memory_order_release);
+  // A releasing executor can observe shutdown=false, be descheduled, and
+  // publish a grant after its selected owner has already retired. All lane
+  // releasers are joined here, so this final sweep closes that handoff race
+  // before checking the node-wide lease invariant.
+  u32 late_grants = 0;
+  for (auto& grants : storage_owner_search_lane_grants_) {
+    const u32 retired = grants.exchange(0, std::memory_order_acq_rel);
+    lib_assert(late_grants <= std::numeric_limits<u32>::max() - retired,
+               "Stage2 late search-lane grant count overflow");
+    late_grants += retired;
+  }
+  if (late_grants != 0) {
+    const u32 previous = storage_owner_search_lane_leases_.fetch_sub(
+      late_grants, std::memory_order_acq_rel);
+    lib_assert(previous >= late_grants,
+               "Stage2 late search-lane grants underflowed leases");
+  }
+  lib_assert(storage_owner_search_lane_leases_.load(
+               std::memory_order_acquire) == 0,
+             "Stage2 executor stopped with a live global search-lane lease");
+  storage_owner_search_lane_lease_limit_.store(0, std::memory_order_release);
 
   size_t stage2_remaining = 0;
   size_t cleanup_remaining = 0;
@@ -647,6 +761,35 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
       std::to_string(broadcast_wakes) +
     " maintenance_context_slots_scanned=" +
       std::to_string(context_slots_scanned) +
+    " maintenance_ready_notifications=" +
+      std::to_string(
+        storage_owner_maintenance_ready_notifications_.load(
+          std::memory_order_relaxed)) +
+    " maintenance_ready_stale_notifications=" +
+      std::to_string(
+        storage_owner_maintenance_ready_stale_notifications_.load(
+          std::memory_order_relaxed)) +
+    " maintenance_ready_tickets_drained=" +
+      std::to_string(
+        storage_owner_maintenance_ready_tickets_drained_.load(
+          std::memory_order_relaxed)) +
+    " maintenance_ready_overflow_scans=" +
+      std::to_string(
+        storage_owner_maintenance_ready_overflow_scans_.load(
+          std::memory_order_relaxed)) +
+    " maintenance_ready_fallback_scans=" +
+      std::to_string(
+        storage_owner_maintenance_ready_fallback_scans_.load(
+          std::memory_order_relaxed)) +
+    " stage2_search_lane_lease_limit=" +
+      std::to_string(storage_owner_search_lane_lease_limit_.load(
+        std::memory_order_relaxed)) +
+    " stage2_search_lane_lease_peak=" +
+      std::to_string(storage_owner_search_lane_lease_peak_.load(
+        std::memory_order_relaxed)) +
+    " stage2_search_lane_lease_blocked=" +
+      std::to_string(storage_owner_search_lane_lease_blocked_.load(
+        std::memory_order_relaxed)) +
     " maintenance_worker_observed_idle_ratio=" +
       std::to_string(worker_observed_idle_ratio) +
     " maintenance_worker_observed_busy_ratio=" +

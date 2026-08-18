@@ -14,6 +14,7 @@
 #include "common/constants.hh"
 #include "common/types.hh"
 #include "memory_node/storage_owner_index/authority_directory_policy.hh"
+#include "memory_node/storage_owner_maintenance/ready_context_queue.hh"
 #include "remote_pointer.hh"
 #include "service/storage_owner_protocol.hh"
 #include "vamana/vamana_node.hh"
@@ -166,6 +167,8 @@ struct PeerPendingSend {
   // maintenance pools.  Record an explicit maintenance owner only when the
   // posting thread belongs to the maintenance executor domain.
   u32 maintenance_wake_owner{std::numeric_limits<u32>::max()};
+  memory_node_storage_owner_maintenance_detail::Stage2ContextOwnerKey
+    maintenance_context_owner{};
 };
 
 struct StorageOwnerInsertTask {
@@ -220,7 +223,12 @@ struct StorageOwnerThread {
     scratch_stride = per_coroutine_stride == 0
                        ? align_to_cacheline(VamanaNode::total_size())
                        : align_to_cacheline(per_coroutine_stride);
-    const size_t required_bytes = static_cast<size_t>(std::max<size_t>(1, post_balances.size())) * scratch_stride;
+    const size_t lane_count = std::max<size_t>(1, post_balances.size());
+    lib_assert(scratch_stride == 0 ||
+                 lane_count <=
+                   std::numeric_limits<size_t>::max() / scratch_stride,
+               "storage-owner registered scratch size overflow");
+    const size_t required_bytes = lane_count * scratch_stride;
     scratch_buffer.allocate(std::max(bytes, required_bytes));
     scratch_buffer.touch_memory();
     scratch_region = std::make_unique<LocalMemoryRegion>(

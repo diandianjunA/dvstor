@@ -1157,7 +1157,7 @@ void test_stage2_generation_rejects_stale_completions() {
 
 void test_stage2_ordered_preview_is_non_mutating_and_pointer_fenced() {
   const RemotePtr a{1, 128};
-  const RemotePtr b{1, 256};
+  const RemotePtr b{3, 256};
   const RemotePtr c{1, 384};
   const vec<detail::PartitionLocalSearchEntry> local_beam{
     {local(0), 10.0F, true}};
@@ -1178,7 +1178,10 @@ void test_stage2_ordered_preview_is_non_mutating_and_pointer_fenced() {
   assert(current.has_value() && current->pointer == a);
 
   vec<RemotePtr> preview;
-  assert(batch.append_expand_prefetch_candidates(0, 1, 2, preview) == 2);
+  assert(batch.append_expand_prefetch_candidates(0, 1, 2, preview) == 1);
+  assert((preview == vec<RemotePtr>{c}));
+  preview.clear();
+  assert(batch.append_expand_prefetch_candidates(0, 2, preview) == 2);
   assert((preview == vec<RemotePtr>{b, c}));
   // Previewing cannot advance generation, mark another candidate expanded,
   // or let a speculative completion satisfy the authoritative dependency.

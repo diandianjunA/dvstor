@@ -31,6 +31,18 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   auto& wake_channel = storage_owner_maintenance_wake_channels_[worker_id];
   current_storage_owner_thread_ = &thread;
   current_storage_owner_maintenance_worker_ = true;
+  current_storage_owner_maintenance_context_owner_ = {};
+  StorageOwnerReadyContextQueue* const ready_context_queue =
+    storage_owner_maintenance_ready_queue_active_[worker_id].load(
+      std::memory_order_acquire);
+  lib_assert(ready_context_queue != nullptr,
+             "storage-owner maintenance ready queue missing");
+  StorageOwnerMaintenanceWaiterRegistrations fallback_waiter_registrations;
+  fallback_waiter_registrations.reserve(
+    5 + static_cast<size_t>(num_storage_nodes_) *
+          (static_cast<size_t>(peer_qps_per_peer_) + 1));
+  current_storage_owner_maintenance_waiter_registrations_ =
+    &fallback_waiter_registrations;
   const Configuration& config = *storage_worker_config_;
   const bool independent_score_experiment_enabled =
     storage_owner_independent_score_experiment_enabled_;
@@ -43,6 +55,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   struct Stage2Context {
     bool active{};
     Stage2ContextHandle handle{};
+    Stage2ContextOwnerKey ready_owner{};
     StorageOwnerMaintenanceKind kind{
       StorageOwnerMaintenanceKind::finalize_insert};
     vec<StorageOwnerMaintenanceTask> tasks;
@@ -72,6 +85,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     // lane without restarting the continuation.
     Stage2SearchIoState search_io;
     std::optional<u32> search_lane;
+    bool search_lane_wait_registered{};
+    // Exact context-owned subscriptions for SEND/RDMA/lane capacity. Release
+    // consumes only a worker runnable bit; success/reset removes this
+    // context's references without hiding sibling contexts on the same worker.
+    StorageOwnerMaintenanceWaiterRegistrations waiter_registrations;
     bool search_input_prepared{};
     bool search_timing_recorded{};
     u64 search_started_ns{};
@@ -161,6 +179,9 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     (reconcile_op_capacity + reconcile_wire_capacity - 1) /
       reconcile_wire_capacity;
   for (Stage2Context& context : contexts) {
+    context.waiter_registrations.reserve(
+      5 + static_cast<size_t>(num_storage_nodes_) *
+            (static_cast<size_t>(peer_qps_per_peer_) + 1));
     context.tasks.reserve(config.storage_owner_batch_max);
     context.targets.reserve(config.storage_owner_batch_max);
     context.continued_candidates_by_task.reserve(
@@ -242,12 +263,24 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     lib_assert(search_lanes.release(lane, context.handle, rdma_ready),
                "stage2 search lane release violated context generation");
     context.search_lane.reset();
+    release_storage_owner_search_lane_lease();
   };
 
   const auto bind_context_lane = [&](Stage2Context& context) {
     if (!context.search_lane.has_value()) {
+      if (!try_acquire_storage_owner_search_lane_lease(
+            context.search_lane_wait_registered)) {
+        return false;
+      }
       const auto lane = search_lanes.try_acquire(context.handle);
-      if (!lane.has_value()) return false;
+      if (!lane.has_value()) {
+        // With one physical lane per bounded local context this is reachable
+        // only if ownership bookkeeping is inconsistent. Keep the release
+        // path defensive so an unexpected retry cannot leak the node-wide
+        // lease and starve every other worker.
+        release_storage_owner_search_lane_lease();
+        return false;
+      }
       context.search_lane = *lane;
     }
     lib_assert(search_lanes.owns(*context.search_lane, context.handle),
@@ -270,8 +303,15 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   };
 
   const auto reset_context = [&](Stage2Context& context) {
+    auto* const previous_waiter_registrations =
+      current_storage_owner_maintenance_waiter_registrations_;
+    current_storage_owner_maintenance_waiter_registrations_ =
+      &context.waiter_registrations;
     lib_assert(!context.search_lane.has_value(),
                "stage2 context reset before releasing its search lane");
+    cancel_storage_owner_search_lane_waiter(
+      context.search_lane_wait_registered);
+    clear_all_current_storage_owner_maintenance_waiters();
     for (const Stage2ReconcileChunk& chunk :
          context.reconcile_batch.chunks()) {
       if (!chunk.complete && chunk.request_id != 0) {
@@ -313,6 +353,14 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         rpc.process_credit_held = false;
       }
     }
+    // Cancel every transport member while its exact OwnerKey is still live.
+    // A concurrent aggregate completion can then either publish to this
+    // context or observe the cancellation; it can never target a reused slot.
+    if (context.ready_owner.token != 0) {
+      lib_assert(ready_context_queue->deactivate(context.ready_owner),
+                 "stage2 context ready owner was stale at reset");
+      context.ready_owner = {};
+    }
     context.search_io.reset();
     context.reconcile_batch.clear();
     context.active = false;
@@ -345,6 +393,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     context.packing_high_pressure = false;
     context.independent_score_sample = {};
     context.finalize_subphase = Stage2FinalizeSubphase::prepare;
+    current_storage_owner_maintenance_waiter_registrations_ =
+      previous_waiter_registrations;
   };
 
   const auto materialize_stable_snapshot_wave = [&](size_t task_count) {
@@ -1232,6 +1282,16 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                    result == Stage2EventResult::ready_to_finalize ||
                    result == Stage2EventResult::duplicate,
                  "stage2 rejected an aggregate reverse-update ACK");
+      lib_assert(completion.context.slot < contexts.size(),
+                 "stage2 reverse completion context slot is out of range");
+      Stage2Context& ready_context = contexts[completion.context.slot];
+      lib_assert(ready_context.active &&
+                   ready_context.handle == completion.context,
+                 "stage2 reverse completion reached a stale context");
+      lib_assert(enqueue_storage_owner_maintenance_context_ready(
+                   ready_context.ready_owner,
+                   Stage2ContextReadyReason::reverse_completion),
+                 "stage2 reverse completion failed ready-queue handoff");
       lib_assert(requests.erase(completion.logical_request_id),
                  "stage2 reverse completion request release failed");
       completion = {};
@@ -3202,6 +3262,69 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     }
   };
 
+  const auto drive_owned_context = [&](Stage2Context& context) {
+    auto* const previous_waiter_registrations =
+      current_storage_owner_maintenance_waiter_registrations_;
+    current_storage_owner_maintenance_waiter_registrations_ =
+      &context.waiter_registrations;
+    const Stage2ContextOwnerKey previous_context_owner =
+      current_storage_owner_maintenance_context_owner_;
+    current_storage_owner_maintenance_context_owner_ = context.ready_owner;
+    const bool progressed = drive_context(context);
+    current_storage_owner_maintenance_context_owner_ =
+      previous_context_owner;
+    current_storage_owner_maintenance_waiter_registrations_ =
+      previous_waiter_registrations;
+    return progressed;
+  };
+
+  vec<Stage2ReadyContextEvent> overflow_ready_events;
+  overflow_ready_events.reserve(context_capacity);
+  const auto drive_ready_event = [&](const Stage2ReadyContextEvent& event) {
+    lib_assert(event.owner.worker_id == worker_id &&
+                 event.owner.slot < contexts.size(),
+               "stage2 ready event targets the wrong executor");
+    Stage2Context& context = contexts[event.owner.slot];
+    if (!context.active || context.ready_owner != event.owner) {
+      return false;
+    }
+    return drive_owned_context(context);
+  };
+  const auto drain_ready_contexts = [&]() {
+    bool progressed = false;
+    size_t drained = 0;
+    Stage2ReadyContextEvent event;
+    // One active generation contributes at most one ordinary queued ticket;
+    // the 2x bound also covers stale prior-generation tickets during reuse.
+    const size_t ticket_budget = context_capacity * 2;
+    while (drained < ticket_budget && ready_context_queue->try_pop(event)) {
+      ++drained;
+      progressed = drive_ready_event(event) || progressed;
+    }
+    if (drained != 0) {
+      storage_owner_maintenance_ready_tickets_drained_.fetch_add(
+        drained, std::memory_order_relaxed);
+    }
+
+    if (ready_context_queue->overflowed()) {
+      overflow_ready_events.clear();
+      const size_t recovered =
+        ready_context_queue->recover_overflow(overflow_ready_events);
+      storage_owner_maintenance_ready_overflow_scans_.fetch_add(
+        1, std::memory_order_relaxed);
+      storage_owner_maintenance_context_slots_scanned_.fetch_add(
+        context_capacity, std::memory_order_relaxed);
+      storage_owner_maintenance_ready_tickets_drained_.fetch_add(
+        recovered, std::memory_order_relaxed);
+      drained += recovered;
+      for (const Stage2ReadyContextEvent& recovered_event :
+           overflow_ready_events) {
+        progressed = drive_ready_event(recovered_event) || progressed;
+      }
+    }
+    return std::pair<bool, size_t>{progressed, drained};
+  };
+
   const auto try_admit_context = [&]() -> Stage2Context* {
     const Stage2AdmissionDecision admission = decide_stage2_admission(
       states.full(),
@@ -3239,8 +3362,9 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                  "stage2 context tracker unexpectedly exhausted");
       Stage2Context& context = contexts[handle->slot];
       reset_context(context);
-      context.active = true;
       context.handle = *handle;
+      context.ready_owner = ready_context_queue->activate(handle->slot);
+      context.active = true;
       return &context;
     };
 
@@ -3397,6 +3521,9 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   u64 unpublished_idle_waits = 0;
   u64 unpublished_context_slots_scanned = 0;
   size_t active_context_cursor = 0;
+  bool fallback_context_scan_requested = false;
+  auto next_fallback_context_scan =
+    std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
   const auto flush_idle_timing = [&]() {
     if (unpublished_idle_waits != 0) {
       storage_owner_maintenance_worker_idle_ns_.fetch_add(
@@ -3414,12 +3541,22 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   };
 
   for (;;) {
+    // Worker-wide producers (currently reverse-outbox posting) rebuild their
+    // resource dependencies on every scheduler pass. Remove subscriptions
+    // whose operation either succeeded or was canceled before retrying; the
+    // failure path registers again under the same slot mutex/counter recheck.
+    current_storage_owner_maintenance_waiter_registrations_ =
+      &fallback_waiter_registrations;
+    clear_all_current_storage_owner_maintenance_waiters();
     // Snapshot before scanning contexts. Any completion/event published after
     // this load either becomes visible to the scan or changes the predicate
     // below. This closes the classic notify-before-wait window without busy
     // polling and without shortening the batching deadline.
     const u64 observed_wake_epoch =
       wake_channel.epoch.load(std::memory_order_acquire);
+    const bool resource_context_scan_requested =
+      wake_channel.context_scan_requested.exchange(
+        false, std::memory_order_acq_rel);
     if (storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
       flush_idle_timing();
       if (storage_owner_reverse_outbox_ != nullptr) {
@@ -3453,6 +3590,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         if (!context.active) {
           continue;
         }
+        current_storage_owner_maintenance_waiter_registrations_ =
+          &context.waiter_registrations;
         finish_reverse_prepare_timing(context);
         cancel_context_reconcile(context);
         // Shutdown abandons active contexts instead of entering the normal
@@ -3463,48 +3602,119 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           storage_owner_independent_score_.observe_completion(
             context.independent_score_sample, 0, 0, 0, 0, 0, 0);
         }
+        cancel_storage_owner_search_lane_waiter(
+          context.search_lane_wait_registered);
+        clear_all_current_storage_owner_maintenance_waiters();
         release_context_lane(context);
+        // Invalidate every logical home-RPC member before invalidating its
+        // OwnerKey. A late aggregate response then suppresses this member
+        // instead of publishing an owned payload to a retired context slot.
+        for (size_t rpc_index = 0;
+             rpc_index < context.search_io.home_expand_rpc_count;
+             ++rpc_index) {
+          const Stage2HomeExpandRpc& rpc =
+            context.search_io.home_expand_rpcs[rpc_index];
+          if (rpc.posted && !rpc.complete && rpc.request_id != 0) {
+            cancel_peer_rpc_response(rpc.request_id);
+          }
+        }
+        for (size_t rpc_index = 0;
+             rpc_index < context.search_io.score_home_rpc_count;
+             ++rpc_index) {
+          const Stage2HomeExpandRpc& rpc =
+            context.search_io.score_home_rpcs[rpc_index];
+          if (rpc.posted && !rpc.complete && rpc.request_id != 0) {
+            cancel_peer_rpc_response(rpc.request_id);
+          }
+        }
+        for (Stage2SpeculativeScoreRpc& rpc :
+             context.search_io.speculative_score_rpcs) {
+          if (rpc.posted && rpc.request_id != 0) {
+            cancel_peer_rpc_response(rpc.request_id);
+          }
+          if (rpc.process_credit_held) {
+            if (rpc.posted) {
+              fail_closed_peer_rpc_speculative_credit(
+                rpc.target_shard, rpc.request_id);
+            } else {
+              release_peer_rpc_speculative_credit(
+                rpc.target_shard, rpc.request_id);
+            }
+            rpc.process_credit_held = false;
+          }
+        }
+        lib_assert(ready_context_queue->deactivate(context.ready_owner),
+                   "stage2 shutdown deactivated a stale ready owner");
+        context.ready_owner = {};
         storage_owner_maintenance_active_workers_.fetch_sub(
           1, std::memory_order_acq_rel);
       }
+      retire_storage_owner_search_lane_grants(worker_id);
+      current_storage_owner_maintenance_waiter_registrations_ =
+        &fallback_waiter_registrations;
+      clear_all_current_storage_owner_maintenance_waiters();
+      current_storage_owner_maintenance_waiter_registrations_ = nullptr;
+      current_storage_owner_maintenance_context_owner_ = {};
       current_storage_owner_maintenance_worker_ = false;
       current_storage_owner_thread_ = nullptr;
       return;
     }
 
-    // Drain every currently sendable per-peer descriptor before polling
-    // contexts. A second pass below catches work produced by pruning in this
-    // iteration; neither pass waits for a timer to form a batch.
-    bool progressed = drive_reverse_outbox();
+    // Completion producers route directly to a generation-fenced context
+    // ticket. Drain those O(1) events before worker-wide producers so a ready
+    // continuation does not wait behind unrelated slot scans or aggregation.
+    auto [ready_progressed, ready_count] = drain_ready_contexts();
+    bool progressed = ready_progressed;
+
+    // Drain every currently sendable per-peer descriptor. A second pass below
+    // catches work produced by pruning in this iteration; neither pass waits
+    // for a timer to form a batch.
+    progressed = drive_reverse_outbox() || progressed;
     progressed = drain_reverse_completions() || progressed;
-    // Visit every active context once, but rotate the first slot on each
-    // worker pass. A low-numbered context that is repeatedly waiting for a
-    // lane or a hot node lock must not always consume the first scheduling
-    // opportunity ahead of otherwise-ready higher slots.
+    auto [late_ready_progressed, late_ready_count] = drain_ready_contexts();
+    progressed = late_ready_progressed || progressed;
+    ready_count += late_ready_count;
+
+    // Resource-credit wakes do not yet carry a context key, and local lock /
+    // retry timers have no external producer. Recover them with a bounded
+    // scan only when an unmatched worker wake requests one or once per 1 ms.
+    // Ordinary RDMA/RPC/reverse completions stay on the ticket path.
     const size_t context_count = contexts.size();
     lib_assert(context_count != 0,
                "maintenance worker has no Stage2 context slots");
-    const size_t scan_begin = active_context_cursor;
-    unpublished_context_slots_scanned += context_count;
-    if (unpublished_context_slots_scanned >= 4096) {
-      storage_owner_maintenance_context_slots_scanned_.fetch_add(
-        unpublished_context_slots_scanned, std::memory_order_relaxed);
-      unpublished_context_slots_scanned = 0;
-    }
-    for (size_t offset = 0; offset < context_count; ++offset) {
-      const size_t context_index = stage2_round_robin_context_index(
-        scan_begin, offset, context_count);
-      Stage2Context& context = contexts[context_index];
-      if (context.active) {
-        progressed = drive_context(context) || progressed;
+    const auto scan_now = std::chrono::steady_clock::now();
+    const bool periodic_scan_due = scan_now >= next_fallback_context_scan;
+    const bool scan_unmatched_wake =
+      resource_context_scan_requested ||
+      (fallback_context_scan_requested && ready_count == 0);
+    fallback_context_scan_requested = false;
+    if (periodic_scan_due || scan_unmatched_wake) {
+      const size_t scan_begin = active_context_cursor;
+      unpublished_context_slots_scanned += context_count;
+      storage_owner_maintenance_ready_fallback_scans_.fetch_add(
+        1, std::memory_order_relaxed);
+      if (unpublished_context_slots_scanned >= 4096) {
+        storage_owner_maintenance_context_slots_scanned_.fetch_add(
+          unpublished_context_slots_scanned, std::memory_order_relaxed);
+        unpublished_context_slots_scanned = 0;
       }
+      for (size_t offset = 0; offset < context_count; ++offset) {
+        const size_t context_index = stage2_round_robin_context_index(
+          scan_begin, offset, context_count);
+        Stage2Context& context = contexts[context_index];
+        if (context.active) {
+          progressed = drive_owned_context(context) || progressed;
+        }
+      }
+      active_context_cursor = scan_begin + 1 == context_count
+        ? 0 : scan_begin + 1;
+      next_fallback_context_scan =
+        scan_now + std::chrono::milliseconds(1);
     }
-    active_context_cursor = scan_begin + 1 == context_count
-      ? 0 : scan_begin + 1;
 
     while (Stage2Context* context = try_admit_context()) {
       progressed = true;
-      (void)drive_context(*context);
+      (void)drive_owned_context(*context);
     }
 
     progressed = drive_reverse_outbox() || progressed;
@@ -3562,7 +3772,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         storage_owner_maintenance_lost_wake_avoided_.fetch_add(
           1, std::memory_order_relaxed);
       } else {
-        wake_channel.cv.wait_until(
+        (void)wake_channel.cv.wait_until(
           wake_lock, wake_at, [&]() {
             return storage_owner_maintenance_shutdown_.load(
                      std::memory_order_acquire) ||
@@ -3570,6 +3780,9 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
                 std::memory_order_acquire) != observed_wake_epoch;
           });
       }
+      fallback_context_scan_requested =
+        wake_channel.epoch.load(std::memory_order_acquire) !=
+          observed_wake_epoch;
       unregister_waiter();
       wake_lock.unlock();
       unpublished_idle_wait_ns += steady_now_ns() - idle_started_ns;
