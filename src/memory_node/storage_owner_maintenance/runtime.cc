@@ -155,8 +155,8 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   // windows. Retrying that experiment cannot remove a dependency round; it
   // only lets its bounded wait leak into measurement. The controller and its
   // fuse remain available to focused policy tests, while the runtime uses the
-  // stable two-item label and still drains every descriptor available at the
-  // original 50 us deadline.
+  // stable two-item label. Sparse arrivals flush immediately; only a measured
+  // pressure interval pays the original bounded 50 us collection delay.
   const size_t concurrency_safe_packing_limit = std::min<size_t>(
     std::max<u32>(1, config.storage_owner_batch_max),
     std::max<size_t>(
@@ -169,6 +169,12 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   storage_owner_stage2_packing_.reset(
     adaptive_packing_limit,
     config.storage_owner_stage2_batch_max_wait_us);
+  // The 185634 production run issued no independent-score RPCs, yet every
+  // admitted context still took the controller mutex, allocated a generation
+  // token, and returned it at completion. Keep the implementation available
+  // for an explicit future experiment, but make the production runtime a
+  // complete controller bypass rather than an always-on no-op A/B cohort.
+  storage_owner_independent_score_experiment_enabled_ = false;
   storage_owner_independent_score_.reset();
   physical_stage1_items_.store(0, std::memory_order_relaxed);
   physical_stage1_total_ns_.store(0, std::memory_order_relaxed);
@@ -361,6 +367,7 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                std::to_string(adaptive_packing_limit) +
                " backlog_limit=" +
                std::to_string(config.storage_owner_maintenance_queue_depth) +
+               " admission_credit=exact_incomplete" +
                " admission_window=" +
                std::to_string(storage_owner_maintenance_admission_limit_) +
                " physical_completion_capacity=" +
@@ -502,8 +509,12 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
     storage_owner_stage2_batched_items_.load(std::memory_order_relaxed);
   const Stage2PackingTelemetry stage2_packing =
     storage_owner_stage2_packing_.telemetry();
-  const IndependentScoreTelemetry independent_score_ab =
-    storage_owner_independent_score_.telemetry();
+  IndependentScoreTelemetry independent_score_ab{};
+  if (storage_owner_independent_score_experiment_enabled_) {
+    independent_score_ab = storage_owner_independent_score_.telemetry();
+  } else {
+    independent_score_ab.mode = IndependentScoreMode::disabled;
+  }
   std::array<u64, kStorageOwnerStage2TimingPhaseCount>
     stage2_phase_attempts{};
   std::array<u64, kStorageOwnerStage2TimingPhaseCount>
@@ -747,6 +758,23 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
       ? 0
       : static_cast<u64>(
           storage_owner_maintenance_completion_ring_->outstanding());
+  const u64 completion_incomplete =
+    storage_owner_maintenance_completion_ring_ == nullptr
+      ? 0
+      : static_cast<u64>(
+          storage_owner_maintenance_completion_ring_->incomplete());
+  const u64 completed_behind_hole = completion_outstanding >
+      completion_incomplete
+    ? completion_outstanding - completion_incomplete
+    : 0;
+  const u64 completion_logical_full_failures =
+    storage_owner_maintenance_completion_ring_ == nullptr
+      ? 0
+      : storage_owner_maintenance_completion_ring_->logical_full_failures();
+  const u64 completion_physical_full_failures =
+    storage_owner_maintenance_completion_ring_ == nullptr
+      ? 0
+      : storage_owner_maintenance_completion_ring_->physical_full_failures();
   // Queue cardinality alone becomes zero as soon as work enters a context,
   // even if that context is still waiting on remote shards. Report the larger
   // raw count so an observation does not hide pending RPC work.
@@ -849,6 +877,11 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
     stage2_independent_score_useful;
   telemetry_snapshot.stage2_independent_score_wasted =
     stage2_independent_score_wasted;
+  telemetry_snapshot.completion_incomplete = completion_incomplete;
+  telemetry_snapshot.completion_logical_full_failures =
+    completion_logical_full_failures;
+  telemetry_snapshot.completion_physical_full_failures =
+    completion_physical_full_failures;
   telemetry_snapshot.physical_stage1_items =
     physical_stage1_items_.load(std::memory_order_relaxed);
   telemetry_snapshot.physical_stage1_total_ns =
@@ -1101,6 +1134,14 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(storage_owner_maintenance_admission_limit_) +
                " completion_outstanding=" +
                std::to_string(completion_outstanding) +
+               " completion_incomplete=" +
+               std::to_string(completion_incomplete) +
+               " completed_behind_hole=" +
+               std::to_string(completed_behind_hole) +
+               " completion_logical_full_failures=" +
+               std::to_string(completion_logical_full_failures) +
+               " completion_physical_full_failures=" +
+               std::to_string(completion_physical_full_failures) +
                " pressure_yields=" +
                std::to_string(storage_owner_maintenance_pressure_yields_.load(std::memory_order_relaxed)) +
                " stage2_batches=" +

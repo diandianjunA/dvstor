@@ -325,6 +325,9 @@ void test_maintenance_log_window() {
            << "peer_reverse_failed=" << peer_failed << ' '
            << "admission_window=512 "
            << "completion_outstanding=" << remaining << ' '
+           << "completion_incomplete=" << remaining / 2 << ' '
+           << "completion_logical_full_failures=" << completed * 5 << ' '
+           << "completion_physical_full_failures=" << completed << ' '
            << "stage2_continuations=" << completed << ' '
            << "stage2_remote_frontier_items=" << completed * 2 << ' '
            << "stage2_remote_expansions=" << completed * 3 << ' '
@@ -429,6 +432,12 @@ void test_maintenance_log_window() {
   assert(summary.admission_window == 512);
   assert(summary.completion_outstanding == 0);
   assert(summary.max_completion_outstanding_per_shard == 10);
+  assert(summary.exact_completion_credit_available);
+  assert(summary.completion_incomplete == 0);
+  assert(summary.max_completion_incomplete_per_shard == 5);
+  assert(summary.completion_admission_failure_delta_available);
+  assert(summary.completion_logical_full_failures == 1'500);
+  assert(summary.completion_physical_full_failures == 300);
   assert(summary.failure_delta_available);
   assert(summary.peer_reverse_retry_delta_available);
   assert(summary.p99_stage2_delay_available);
@@ -485,6 +494,9 @@ void test_maintenance_log_window() {
     tools::breakdown_benchmark::summarize_maintenance_logs(exact_5s_begin);
   assert(exact_5s.p99_stage2_delay_available);
   assert(exact_5s.p99_stage2_delay_upper_ms == 5000.0);
+  assert(exact_5s.completion_admission_failure_delta_available);
+  assert(exact_5s.completion_logical_full_failures == 500);
+  assert(exact_5s.completion_physical_full_failures == 100);
 
   {
     std::ofstream output(path, std::ios::trunc);
@@ -586,6 +598,9 @@ void test_in_band_maintenance_snapshot_window() {
     begin[shard]->stage2_independent_score_issued = 160;
     begin[shard]->stage2_independent_score_useful = 96;
     begin[shard]->stage2_independent_score_wasted = 64;
+    begin[shard]->completion_incomplete = 1;
+    begin[shard]->completion_logical_full_failures = 5;
+    begin[shard]->completion_physical_full_failures = 1;
     begin[shard]->physical_stage1_items = 2;
     begin[shard]->physical_stage1_total_ns = 2'000;
     begin[shard]->physical_stage1_search_ns = 1'000;
@@ -639,6 +654,9 @@ void test_in_band_maintenance_snapshot_window() {
     latest.stage2_independent_score_issued += 320;
     latest.stage2_independent_score_useful += 192;
     latest.stage2_independent_score_wasted += 128;
+    latest.completion_incomplete = 1;
+    latest.completion_logical_full_failures += 11;
+    latest.completion_physical_full_failures += 2;
     latest.stage2_vector_read_waves = 18;
     latest.stage2_vector_unique_reads = 180;
     for (size_t phase = 0;
@@ -695,6 +713,12 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.completion_window_available);
   assert(summary.admission_window == 256);
   assert(summary.completion_outstanding == 4);
+  assert(summary.exact_completion_credit_available);
+  assert(summary.completion_incomplete == 2);
+  assert(summary.max_completion_incomplete_per_shard == 1);
+  assert(summary.completion_admission_failure_delta_available);
+  assert(summary.completion_logical_full_failures == 22);
+  assert(summary.completion_physical_full_failures == 4);
   assert(summary.locality_delta_available);
   assert(summary.stage2_finalized_live == 40);
   assert(summary.stage2_remote_expansions == 120);

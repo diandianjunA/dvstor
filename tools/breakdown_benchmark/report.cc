@@ -677,6 +677,29 @@ FormattedReport format_report(const nlohmann::json& root,
     } else {
       output << "unavailable\n";
     }
+    output << "  completion_incomplete/admission_window: ";
+    if (stage2.value("exact_completion_credit_available", false)) {
+      output << stage2.value("completion_incomplete", 0ULL) << "/"
+             << stage2.value("admission_window", 0ULL)
+             << " (max_per_shard="
+             << stage2.value(
+                  "max_completion_incomplete_per_shard", 0ULL)
+             << ", completed_behind_hole="
+             << stage2.value("completed_behind_hole", 0ULL)
+             << ")\n";
+    } else {
+      output << "unavailable\n";
+    }
+    output << "  completion admission stalls logical/physical: ";
+    if (stage2.value(
+          "completion_admission_failure_delta_available", false)) {
+      output << stage2.value("completion_logical_full_failures", 0ULL)
+             << "/"
+             << stage2.value("completion_physical_full_failures", 0ULL)
+             << "\n";
+    } else {
+      output << "unavailable\n";
+    }
     output << "  backlog_slope_per_sec: "
            << stage2.value("backlog_slope_per_sec", 0.0) << '\n';
     output << "  failures (hard): "

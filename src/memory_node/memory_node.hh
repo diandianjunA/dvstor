@@ -1270,6 +1270,11 @@ private:
     Stage2AdaptivePackingController storage_owner_stage2_packing_;
   memory_node_storage_owner_maintenance_detail::
     IndependentScoreController storage_owner_independent_score_;
+  // Production bypass for the independent-score A/B machinery. This is set
+  // before maintenance workers start and is intentionally false until a
+  // dedicated experiment explicitly opts into paying its per-context
+  // registration/feedback cost.
+  bool storage_owner_independent_score_experiment_enabled_{false};
   // Set before maintenance workers start. A hard runtime cap below four is a
   // verified legacy policy, whereas target two in an adaptive controller can
   // merely be the baseline preceding a target-four trial.

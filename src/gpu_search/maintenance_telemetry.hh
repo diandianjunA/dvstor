@@ -17,8 +17,10 @@ namespace gpu_search::maintenance_telemetry {
 inline constexpr u64 kMagic = 0x31544d43565344ULL;  // "DSVCMT1"
 // Versions 2-5 carried earlier Stage2 experiments. Version 6 added adaptive
 // context packing; version 7 separates independent score-RPC work from the
-// near-free in-wave score-prefetch controller.
-inline constexpr u32 kVersion = 7;
+// near-free in-wave score-prefetch controller; version 8 reports exact
+// unfinished service credit separately from the contiguous physical span and
+// distinguishes logical-credit stalls from physical-ring stalls.
+inline constexpr u32 kVersion = 8;
 inline constexpr u32 kValidCounters = 1u << 0;
 inline constexpr size_t kLatencyBucketCount = 18;
 inline constexpr size_t kStage2PhaseCount = 6;
@@ -123,6 +125,9 @@ struct alignas(64) Snapshot {
   u64 stage2_independent_score_issued{};
   u64 stage2_independent_score_useful{};
   u64 stage2_independent_score_wasted{};
+  u64 completion_incomplete{};
+  u64 completion_logical_full_failures{};
+  u64 completion_physical_full_failures{};
 };
 
 static_assert(kSnapshotOffset == 192);
