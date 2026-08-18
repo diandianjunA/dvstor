@@ -25,6 +25,9 @@ int main() {
     .stage2_graph_prefetch_issued = 12,
     .stage2_graph_prefetch_hits = 8,
     .stage2_graph_prefetch_wasted = 2,
+    .stage2_score_prefetch_issued = 30,
+    .stage2_score_prefetch_hits = 24,
+    .stage2_score_prefetch_wasted = 3,
     .stage2_home_rpc_batches = 7,
     .stage2_home_rpc_items = 19,
   };
@@ -43,6 +46,8 @@ int main() {
   assert(copied.stage2_delay_histogram[6] == 12);
   assert(copied.stage2_graph_prefetch_issued == 12);
   assert(copied.stage2_graph_prefetch_hits == 8);
+  assert(copied.stage2_score_prefetch_issued == 30);
+  assert(copied.stage2_score_prefetch_hits == 24);
   assert(copied.stage2_home_rpc_batches == 7);
   assert(copied.stage2_home_rpc_items == 19);
 

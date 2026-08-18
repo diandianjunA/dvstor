@@ -58,6 +58,8 @@ struct Stage2ScoreConsumer {
   std::size_t search_index{};
   u64 generation{};
   RemotePtr pointer;
+  bool speculative{};
+  RemotePtr expansion_pointer;
 };
 
 struct Stage2GraphConsumer {
@@ -83,12 +85,17 @@ struct Stage2HomeExpandRpc {
   // Graph responses need to distinguish authoritative items from ordered
   // speculative items without changing the wire protocol.
   vec<std::size_t> graph_consumer_indexes;
+  // Score responses use request order on the wire. Keep the corresponding
+  // logical consumer so piggybacked speculative scores never advance a beam.
+  vec<std::size_t> score_consumer_indexes;
 };
 
 struct Stage2PrefetchedGraphNeighbor {
   RemotePtr pointer;
   distance_t distance{};
   u32 disposition{};
+  bool score_prefetched{};
+  u32 score_prefetch_issues{};
 };
 
 struct Stage2PrefetchedGraphExpansion {
@@ -112,6 +119,13 @@ constexpr u32 stage2_ordered_issue_width(
       static_cast<long double>(hits) / static_cast<long double>(outcomes);
   if (promotion_ratio < 0.70L) return 1;
   return maximum;
+}
+
+constexpr bool stage2_score_prefetch_enabled(u64 hits, u64 wasted) {
+  const u64 outcomes = hits + wasted;
+  if (outcomes < 512) return true;
+  return static_cast<long double>(hits) /
+           static_cast<long double>(outcomes) >= 0.70L;
 }
 
 // A score generation may expose more candidates than fit in one transport
@@ -276,6 +290,41 @@ struct Stage2SearchIoState {
     return true;
   }
 
+  bool resolve_graph_prefetch_score(
+      std::size_t search_index, RemotePtr expansion_pointer,
+      RemotePtr neighbor_pointer, std::optional<distance_t> distance,
+      u32 disposition) {
+    if (search_index >= graph_prefetch_cache.size()) return false;
+    auto& cache = graph_prefetch_cache[search_index];
+    const auto expansion = std::find_if(
+      cache.begin(), cache.end(), [&](const auto& entry) {
+        return entry.pointer == expansion_pointer;
+      });
+    if (expansion == cache.end()) return false;
+    const auto neighbor = std::find_if(
+      expansion->neighbors.begin(), expansion->neighbors.end(),
+      [&](const auto& entry) { return entry.pointer == neighbor_pointer; });
+    if (neighbor == expansion->neighbors.end()) return false;
+    neighbor->score_prefetched = true;
+    neighbor->disposition = disposition;
+    if (distance.has_value()) {
+      neighbor->distance = *distance;
+    }
+    return true;
+  }
+
+  [[nodiscard]] u64 graph_prefetched_score_count() const {
+    u64 count = 0;
+    for (const auto& cache : graph_prefetch_cache) {
+      for (const auto& expansion : cache) {
+        for (const auto& neighbor : expansion.neighbors) {
+          count += neighbor.score_prefetch_issues;
+        }
+      }
+    }
+    return count;
+  }
+
   std::optional<Stage2PrefetchedGraphExpansion> take_graph_prefetch(
       std::size_t search_index, RemotePtr pointer) {
     if (search_index >= graph_prefetch_cache.size()) return std::nullopt;
@@ -319,6 +368,7 @@ struct Stage2SearchIoState {
       rpc.posted = false;
       rpc.complete = false;
       rpc.request.clear();
+      rpc.score_consumer_indexes.clear();
     }
     graph_consumers.clear();
     graph_selected_remote.clear();
@@ -335,6 +385,7 @@ struct Stage2SearchIoState {
       rpc.complete = false;
       rpc.request.clear();
       rpc.graph_consumer_indexes.clear();
+      rpc.score_consumer_indexes.clear();
     }
   }
 

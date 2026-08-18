@@ -126,6 +126,9 @@ struct MaintenanceLogSummary {
   uint64_t stage2_graph_prefetch_issued{};
   uint64_t stage2_graph_prefetch_hits{};
   uint64_t stage2_graph_prefetch_wasted{};
+  uint64_t stage2_score_prefetch_issued{};
+  uint64_t stage2_score_prefetch_hits{};
+  uint64_t stage2_score_prefetch_wasted{};
   uint64_t stage2_vector_read_waves{};
   uint64_t stage2_vector_unique_reads{};
   uint64_t stage2_home_rpc_batches{};

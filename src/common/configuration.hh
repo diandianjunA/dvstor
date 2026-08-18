@@ -96,7 +96,7 @@ public:
   // reconstructs the same prune seed before the final global prune, so this
   // changes foreground placement of work, not durable graph quality.
   bool storage_owner_defer_stage1_prune{false};
-  bool storage_owner_stage2_score_many{false};
+  bool storage_owner_stage2_score_many{true};
   // Maximum ordered graph issue width. Width one is the exact legacy path;
   // larger values are promotion-gated and only fill spare items in an RPC
   // that an authoritative expansion already requires.
