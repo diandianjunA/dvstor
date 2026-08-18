@@ -128,6 +128,17 @@ constexpr bool stage2_score_prefetch_enabled(u64 hits, u64 wasted) {
            static_cast<long double>(outcomes) >= 0.70L;
 }
 
+// An ordinary one-sided score wave already owns one CQ dependency.  Adding a
+// different peer to otherwise-unused READ credit does not add another wait;
+// it only fills the same bounded transport wave.  A score-many wave is
+// different: admitting a new peer creates another two-sided RPC whose tail
+// would become part of the barrier, so speculative work stays restricted to
+// destinations already selected by authoritative work.
+constexpr bool stage2_score_prefetch_peer_eligible(
+    bool score_many_dispatch, bool authoritative_peer_selected) {
+  return !score_many_dispatch || authoritative_peer_selected;
+}
+
 // A score generation may expose more candidates than fit in one transport
 // dispatch. Retryable snapshots remain unresolved, so restarting at element
 // zero on every dispatch can repeatedly select the same candidate and starve

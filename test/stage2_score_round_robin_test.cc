@@ -26,6 +26,8 @@ using memory_node_storage_owner_maintenance_detail::
   stage2_ordered_issue_width;
 using memory_node_storage_owner_maintenance_detail::
   stage2_score_prefetch_enabled;
+using memory_node_storage_owner_maintenance_detail::
+  stage2_score_prefetch_peer_eligible;
 
 namespace {
 
@@ -211,6 +213,13 @@ void test_score_prefetch_policy_requires_seventy_percent_promotion() {
   assert(!stage2_score_prefetch_enabled(358, 154));
 }
 
+void test_score_prefetch_fills_one_sided_wave_without_adding_rpc_peers() {
+  assert(stage2_score_prefetch_peer_eligible(false, false));
+  assert(stage2_score_prefetch_peer_eligible(false, true));
+  assert(!stage2_score_prefetch_peer_eligible(true, false));
+  assert(stage2_score_prefetch_peer_eligible(true, true));
+}
+
 void test_prefetch_cache_is_bounded_and_consumed_by_pointer() {
   Stage2SearchIoState state;
   state.graph_prefetch_cache.resize(1);
@@ -284,6 +293,7 @@ int main() {
   test_home_rpc_wait_does_not_pin_registered_rdma_scratch();
   test_ordered_issue_policy_has_bounded_warmup_and_hard_stop();
   test_score_prefetch_policy_requires_seventy_percent_promotion();
+  test_score_prefetch_fills_one_sided_wave_without_adding_rpc_peers();
   test_prefetch_cache_is_bounded_and_consumed_by_pointer();
   test_prefetched_score_updates_only_the_matching_cached_expansion();
   return 0;
