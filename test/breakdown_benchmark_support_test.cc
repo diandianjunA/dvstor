@@ -206,6 +206,15 @@ void test_recall_and_report_formatting() {
     {"failures", 0},
     {"peer_reverse_retry_attempts", 7},
     {"peer_reverse_retry_delta_available", true},
+    {"execution_counter_delta_available", true},
+    {"ordered_graph_issue", {
+      {"issued", 100}, {"hits", 75}, {"wasted", 20},
+      {"promotion_ratio", 75.0 / 95.0},
+    }},
+    {"home_rpc_wire", {
+      {"graph_batches", 10}, {"graph_items", 80},
+      {"avg_graph_items_per_rpc", 8.0},
+    }},
   };
   service::breakdown::Report report;
   report.query.operation = service::breakdown::Operation::query;
@@ -217,6 +226,12 @@ void test_recall_and_report_formatting() {
   assert(formatted.text.find("query breakdown") != std::string::npos);
   assert(formatted.text.find("failures (hard): 0") != std::string::npos);
   assert(formatted.text.find("peer_reverse_retry_attempts: 7") !=
+         std::string::npos);
+  assert(formatted.text.find(
+           "ordered graph issue: issued/hit/wasted=100/75/20") !=
+         std::string::npos);
+  assert(formatted.text.find(
+           "graph home RPC: batches/items/avg_items=10/80/8") !=
          std::string::npos);
   assert(formatted.text.find("GPU Beam merge policy: stable-run") !=
          std::string::npos);
@@ -476,6 +491,9 @@ void test_in_band_maintenance_snapshot_window() {
       .stage2_batched_items = 8,
       .stage2_graph_read_waves = 5,
       .stage2_graph_unique_reads = 40,
+      .stage2_graph_prefetch_issued = 10,
+      .stage2_graph_prefetch_hits = 6,
+      .stage2_graph_prefetch_wasted = 2,
       .stage2_vector_read_waves = 6,
       .stage2_vector_unique_reads = 60,
     };
@@ -532,6 +550,9 @@ void test_in_band_maintenance_snapshot_window() {
     latest.stage2_batched_items = 28;
     latest.stage2_graph_read_waves = 15;
     latest.stage2_graph_unique_reads = 120;
+    latest.stage2_graph_prefetch_issued += 100;
+    latest.stage2_graph_prefetch_hits += 70;
+    latest.stage2_graph_prefetch_wasted += 20;
     latest.stage2_vector_read_waves = 18;
     latest.stage2_vector_unique_reads = 180;
     for (size_t phase = 0;
@@ -594,6 +615,9 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.stage2_batched_items == 40);
   assert(summary.stage2_graph_read_waves == 20);
   assert(summary.stage2_graph_unique_reads == 160);
+  assert(summary.stage2_graph_prefetch_issued == 200);
+  assert(summary.stage2_graph_prefetch_hits == 140);
+  assert(summary.stage2_graph_prefetch_wasted == 40);
   assert(summary.stage2_vector_read_waves == 24);
   assert(summary.stage2_vector_unique_reads == 240);
   assert(summary.home_rpc_wire_counter_delta_available);

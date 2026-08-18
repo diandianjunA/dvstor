@@ -15,10 +15,10 @@ namespace gpu_search::maintenance_telemetry {
 // unused tail of that page, so adding it neither changes header_bytes/version
 // nor requires rebuilding an existing index.
 inline constexpr u64 kMagic = 0x31544d43565344ULL;  // "DSVCMT1"
-// Version 2 was used by the rejected next-adjacency predictor experiment.
-// Version 3 deliberately prevents a mixed deployment from interpreting those
-// fields as the existing home-RPC counters below.
-inline constexpr u32 kVersion = 3;
+// Versions 2/3 carried earlier Stage2 experiments. Version 4 adds ordered
+// issue promotion feedback and prevents mixed deployments from silently
+// interpreting a different counter layout.
+inline constexpr u32 kVersion = 4;
 inline constexpr u32 kValidCounters = 1u << 0;
 inline constexpr size_t kLatencyBucketCount = 18;
 inline constexpr size_t kStage2PhaseCount = 6;
@@ -64,6 +64,9 @@ struct alignas(64) Snapshot {
   u64 stage2_batched_items{};
   u64 stage2_graph_read_waves{};
   u64 stage2_graph_unique_reads{};
+  u64 stage2_graph_prefetch_issued{};
+  u64 stage2_graph_prefetch_hits{};
+  u64 stage2_graph_prefetch_wasted{};
   u64 stage2_vector_read_waves{};
   u64 stage2_vector_unique_reads{};
   std::array<u64, kLatencyBucketCount> stage2_delay_histogram{};

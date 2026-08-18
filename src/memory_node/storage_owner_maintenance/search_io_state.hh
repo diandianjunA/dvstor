@@ -64,6 +64,7 @@ struct Stage2GraphConsumer {
   std::size_t search_index{};
   u64 generation{};
   RemotePtr pointer;
+  bool speculative{};
 };
 
 struct Stage2GraphRetryState {
@@ -79,7 +80,39 @@ struct Stage2HomeExpandRpc {
   bool posted{};
   bool complete{};
   vec<byte_t> request;
+  // Graph responses need to distinguish authoritative items from ordered
+  // speculative items without changing the wire protocol.
+  vec<std::size_t> graph_consumer_indexes;
 };
+
+struct Stage2PrefetchedGraphNeighbor {
+  RemotePtr pointer;
+  distance_t distance{};
+  u32 disposition{};
+};
+
+struct Stage2PrefetchedGraphExpansion {
+  RemotePtr pointer;
+  u32 disposition{};
+  vec<Stage2PrefetchedGraphNeighbor> neighbors;
+};
+
+// Global promotion feedback is intentionally conservative. Width four is a
+// bounded warm-up; only a measured >=70% promotion rate unlocks the configured
+// width. Below that threshold new speculation stops, while already cached
+// records remain eligible for exact ordered commit. At p=0.70, width 16 does
+// only 2.6% more graph work than width 8, but halves its remaining graph RPCs.
+constexpr u32 stage2_ordered_issue_width(
+    u64 hits, u64 wasted, u32 configured_max_width) {
+  const u32 maximum = std::max<u32>(1, configured_max_width);
+  if (maximum == 1) return 1;
+  const u64 outcomes = hits + wasted;
+  if (outcomes < 512) return std::min<u32>(4, maximum);
+  const auto promotion_ratio =
+      static_cast<long double>(hits) / static_cast<long double>(outcomes);
+  if (promotion_ratio < 0.70L) return 1;
+  return maximum;
+}
 
 // A score generation may expose more candidates than fit in one transport
 // dispatch. Retryable snapshots remain unresolved, so restarting at element
@@ -211,6 +244,58 @@ struct Stage2SearchIoState {
   vec<Stage2GraphRetryState> graph_retry_state;
   vec<Stage2HomeExpandRpc> home_expand_rpcs;
   std::size_t home_expand_rpc_count{};
+  vec<vec<Stage2PrefetchedGraphExpansion>> graph_prefetch_cache;
+
+  [[nodiscard]] bool graph_prefetch_contains(
+      std::size_t search_index, RemotePtr pointer) const {
+    if (search_index >= graph_prefetch_cache.size()) return false;
+    const auto& cache = graph_prefetch_cache[search_index];
+    return std::any_of(cache.begin(), cache.end(), [&](const auto& entry) {
+      return entry.pointer == pointer;
+    });
+  }
+
+  [[nodiscard]] std::size_t graph_prefetch_size(
+      std::size_t search_index) const {
+    return search_index < graph_prefetch_cache.size()
+      ? graph_prefetch_cache[search_index].size() : 0;
+  }
+
+  bool insert_graph_prefetch(
+      std::size_t search_index, Stage2PrefetchedGraphExpansion entry,
+      std::size_t capacity) {
+    if (search_index >= graph_prefetch_cache.size() || capacity == 0) {
+      return false;
+    }
+    auto& cache = graph_prefetch_cache[search_index];
+    if (cache.size() >= capacity || graph_prefetch_contains(
+          search_index, entry.pointer)) {
+      return false;
+    }
+    cache.push_back(std::move(entry));
+    return true;
+  }
+
+  std::optional<Stage2PrefetchedGraphExpansion> take_graph_prefetch(
+      std::size_t search_index, RemotePtr pointer) {
+    if (search_index >= graph_prefetch_cache.size()) return std::nullopt;
+    auto& cache = graph_prefetch_cache[search_index];
+    const auto found = std::find_if(
+      cache.begin(), cache.end(), [&](const auto& entry) {
+        return entry.pointer == pointer;
+      });
+    if (found == cache.end()) return std::nullopt;
+    Stage2PrefetchedGraphExpansion result = std::move(*found);
+    if (found != cache.end() - 1) *found = std::move(cache.back());
+    cache.pop_back();
+    return result;
+  }
+
+  [[nodiscard]] u64 graph_prefetch_entry_count() const {
+    u64 count = 0;
+    for (const auto& cache : graph_prefetch_cache) count += cache.size();
+    return count;
+  }
 
   void reset() {
     initialized = false;
@@ -243,11 +328,13 @@ struct Stage2SearchIoState {
     pending_graph.clear();
     for (vec<RemotePtr>& neighbors : graph_neighbors) neighbors.clear();
     graph_retry_state.clear();
+    for (auto& cache : graph_prefetch_cache) cache.clear();
     home_expand_rpc_count = 0;
     for (auto& rpc : home_expand_rpcs) {
       rpc.posted = false;
       rpc.complete = false;
       rpc.request.clear();
+      rpc.graph_consumer_indexes.clear();
     }
   }
 
@@ -289,6 +376,11 @@ struct Stage2SearchIoState {
     // retaining it avoids an allocator round trip for every graph wave.
     trim(home_expand_rpcs);
     trim(graph_retry_state);
+    for (auto& cache : graph_prefetch_cache) {
+      for (auto& entry : cache) trim(entry.neighbors);
+      trim(cache);
+    }
+    trim(graph_prefetch_cache);
   }
 
   [[nodiscard]] bool idle() const {

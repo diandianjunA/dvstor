@@ -487,6 +487,25 @@ public:
     return std::nullopt;
   }
 
+  // Append, without mutating the beam, the closest candidates that could be
+  // selected after the current authoritative expansion. Callers may fetch
+  // their adjacency speculatively, but only take_closest_unexpanded() is
+  // allowed to mark an entry or consume the expansion budget.
+  size_t append_closest_unexpanded(
+      u32 shard, size_t limit, vec<RemotePtr>& output) const {
+    if (limit == 0 || expansion_count_ >= budget_.max_expansions) return 0;
+    const u64 budget_remaining = budget_.max_expansions - expansion_count_;
+    limit = static_cast<size_t>(std::min<u64>(limit, budget_remaining));
+    const size_t before = output.size();
+    for (const PartitionLocalSearchEntry& entry : beam_) {
+      if (output.size() - before == limit) break;
+      if (!entry.expanded && entry.rptr.memory_node() == shard) {
+        output.push_back(entry.rptr);
+      }
+    }
+    return output.size() - before;
+  }
+
   const vec<PartitionLocalSearchEntry>& final_beam() const { return beam_; }
   u64 expansion_count() const { return expansion_count_; }
   bool budget_exhausted() const { return budget_exhausted_; }
@@ -740,6 +759,19 @@ public:
     return state.pending_expand;
   }
 
+  size_t append_expand_prefetch_candidates(
+      size_t search_index, u32 shard, size_t limit,
+      vec<RemotePtr>& output) const {
+    require_search_index(search_index);
+    const SearchState& state = searches_[search_index];
+    if (state.phase != PartitionContinuationWave::expand ||
+        !state.pending_expand.has_value()) {
+      return 0;
+    }
+    return state.search.append_closest_unexpanded(
+      shard, limit, output);
+  }
+
   span<const PartitionContinuationScoreRequest>
   pending_score_requests() const {
     rebuild_request_cache();
@@ -841,12 +873,18 @@ public:
   bool resolve_expand_request(
       size_t search_index,
       u64 generation,
+      RemotePtr expanded_pointer,
       span<const RemotePtr> neighbors) {
     if (!valid_phase_generation(
-          search_index, PartitionContinuationWave::expand, generation)) {
+          search_index, PartitionContinuationWave::expand, generation) ||
+        expanded_pointer.is_null()) {
       return false;
     }
     SearchState& state = searches_[search_index];
+    if (!state.pending_expand.has_value() ||
+        state.pending_expand->pointer != expanded_pointer) {
+      return false;
+    }
     state.pending_expand.reset();
     for (const RemotePtr neighbor : neighbors) {
       if (state.search.try_visit_remote(neighbor)) {
@@ -860,6 +898,20 @@ public:
     }
     request_cache_dirty_ = true;
     return true;
+  }
+
+  bool resolve_expand_request(
+      size_t search_index,
+      u64 generation,
+      span<const RemotePtr> neighbors) {
+    if (!valid_phase_generation(
+          search_index, PartitionContinuationWave::expand, generation)) {
+      return false;
+    }
+    const SearchState& state = searches_[search_index];
+    if (!state.pending_expand.has_value()) return false;
+    return resolve_expand_request(
+      search_index, generation, state.pending_expand->pointer, neighbors);
   }
 
   bool consume_expand_results(
