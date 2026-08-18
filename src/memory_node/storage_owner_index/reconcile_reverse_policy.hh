@@ -57,6 +57,42 @@ inline bool reconcile_reverse_postcondition_holds(
   return false;
 }
 
+// Per-operation results describe the adjacency immediately after that
+// operation. A later operation on the same hot target may RobustPrune a
+// mandatory certificate that an earlier result already reported as accepted.
+// The sender retires its Stage1 bridge only after the complete target
+// transaction is acknowledged, so reachability must be checked against the
+// final adjacency as well.
+inline bool reconcile_reverse_final_reachability_holds(
+    span<const service::storage_owner::ReconcileReverseOp> ops,
+    span<const size_t> op_indices,
+    span<const service::storage_owner::ReconcileReverseResult> results,
+    span<const RemotePtr> stable,
+    span<const RemotePtr> provisional) {
+  using service::storage_owner::ReconcileReverseOpKind;
+  const auto contains = [](span<const RemotePtr> values,
+                           RemotePtr candidate) {
+    return std::find(values.begin(), values.end(), candidate) != values.end();
+  };
+  for (const size_t op_index : op_indices) {
+    if (op_index >= ops.size() || op_index >= results.size()) return false;
+    const auto& op = ops[op_index];
+    const auto& result = results[op_index];
+    const auto kind = static_cast<ReconcileReverseOpKind>(op.kind);
+    if (kind != ReconcileReverseOpKind::ensure_reachable &&
+        kind != ReconcileReverseOpKind::promote_stable_bridge) {
+      continue;
+    }
+    if (!reconcile_reverse_postcondition_holds(op, result)) return false;
+    const RemotePtr candidate{op.new_candidate_raw};
+    const bool present = contains(stable, candidate) ||
+      (kind == ReconcileReverseOpKind::ensure_reachable &&
+       contains(provisional, candidate));
+    if (!present) return false;
+  }
+  return true;
+}
+
 // A tagged target whose physical incarnation has already retired cannot
 // contain any edge owned by that incarnation.  Ordinary reverse additions
 // are only bounded-degree proposals, so losing their target is a completed

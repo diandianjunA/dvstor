@@ -311,6 +311,21 @@ bool MemoryNode::reconcile_local_reverse_ops(
       continue;
     }
 
+    // Do not publish an intermediate accepted bit whose certificate was
+    // displaced by a later operation in this target transaction. The sender
+    // still owns its Stage1 bridge on this failure and can safely replan.
+    if (!reconcile_reverse_final_reachability_holds(
+          ops, span<const size_t>{op_indices},
+          span<const ReconcileReverseResult>{results},
+          span<const RemotePtr>{adjacency.stable},
+          span<const RemotePtr>{adjacency.provisional})) {
+      adjacency.stable = before_stable;
+      adjacency.provisional = before_provisional;
+      structurally_valid = false;
+      unlock_node(target);
+      continue;
+    }
+
     const bool changed =
       !same_reconcile_neighbors(before_stable, adjacency.stable) ||
       !same_reconcile_neighbors(before_provisional,

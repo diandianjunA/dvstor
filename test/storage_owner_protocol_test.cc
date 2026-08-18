@@ -115,8 +115,18 @@ void test_authority_extension_rpc_layouts() {
   constexpr u32 query_count = 1;
   std::vector<byte_t> score_many_request(
     protocol::stage2_score_many_request_bytes(item_count, query_count), 0);
-  protocol::stage2_score_many_header(score_many_request.data())->query_count =
-    query_count;
+  auto* score_many_header =
+    protocol::stage2_score_many_header(score_many_request.data());
+  score_many_header->query_count = query_count;
+  assert(protocol::stage2_score_many_flags_valid(score_many_header->flags));
+  assert(!protocol::stage2_score_many_is_speculative(
+    score_many_header->flags));
+  score_many_header->flags = protocol::kStage2ScoreManyFlagSpeculative;
+  assert(protocol::stage2_score_many_flags_valid(score_many_header->flags));
+  assert(protocol::stage2_score_many_is_speculative(
+    score_many_header->flags));
+  assert(!protocol::stage2_score_many_flags_valid(
+    protocol::kStage2ScoreManyKnownFlags << 1));
   auto* score_many_items = protocol::stage2_score_many_items(
     score_many_request.data());
   score_many_items[0] = {

@@ -39,6 +39,7 @@
 #include "memory_node/storage_owner_index/dynamic_allocation_receipt_policy.hh"
 #include "memory_node/storage_owner_index/incarnation_lock.hh"
 #include "memory_node/storage_owner_maintenance/reverse_outbox.hh"
+#include "memory_node/storage_owner_maintenance/stage2_batch_policy.hh"
 #include "memory_node/storage_owner_state.hh"
 #include "memory_node/peer_rdma_credit_policy.hh"
 #include "service/index_metadata.hh"
@@ -88,6 +89,10 @@ class MemoryNode {
     // here until an asynchronous registered send slot is available.
     vec<byte_t> payload;
     bool graph_response{};
+    // Independent exact-score lookahead uses a separately bounded response
+    // queue and only surplus SEND slots. It must never queue ahead of an
+    // authoritative graph dependency from this or another sender.
+    bool speculative{};
     std::chrono::steady_clock::time_point queued_at{};
   };
 
@@ -101,6 +106,10 @@ class MemoryNode {
     service::storage_owner::PeerRpcHeader header{};
     memory_node_detail::PeerRequestLease dedup_lease{};
     vec<byte_t> payload;
+    // Set only for a score-many request carrying the validated speculative
+    // wire flag. Scheduler and response isolation never infer priority from
+    // request type because authoritative score-many uses the same payload.
+    bool speculative{};
     // Execute/arm/abort tokens tracked by the bounded per-operation in-flight
     // table. Release tokens are deliberately excluded: a release probes this
     // table and returns an explicit retry while an older same-token operation
@@ -408,6 +417,10 @@ private:
     stage1,
     graph_update,
     control,
+    // Borrows only surplus graph-update slots and is never the physical class
+    // of a slot. try_acquire keeps one authoritative slot reserved, while
+    // release classifies the borrowed slot back as graph_update.
+    speculative,
   };
 
   // Lifecycle and commands
@@ -416,11 +429,13 @@ private:
   static InsertBreakdownCounters scale_breakdown(const InsertBreakdownCounters& counters,
                                                  const u32 part,
                                                  const u32 total);
-  // Publish an event epoch before waking maintenance workers.  Their timed
-  // wait uses the epoch as a predicate so a completion delivered after a
-  // context scan but immediately before wait_until() cannot be lost and turn
-  // a microsecond peer RPC into a one-millisecond scheduler bubble.
+  // Publish an event epoch before waking maintenance workers. The executor
+  // uses a separate waiter-registered condition variable; general foreground
+  // capacity waits retain storage_owner_maintenance_cv_.
   void notify_storage_owner_maintenance();
+  void notify_storage_owner_maintenance_capacity();
+  void notify_storage_owner_maintenance_executors();
+  void notify_one_storage_owner_maintenance_executor();
   void allocate_memory();
   void wait_for_start_signal();
   std::pair<bool, str> load_index_file(const str& path);
@@ -500,6 +515,10 @@ private:
                                       u32& slot_id);
   PeerRpcSendClass peer_rpc_send_slot_class(u32 slot_id) const;
   void release_peer_rpc_send_slot(u32 peer_id, u32 slot_id);
+  bool try_reserve_peer_rpc_speculative_credit(u32 peer_id,
+                                               u64 request_id);
+  void release_peer_rpc_speculative_credit(u32 peer_id, u64 request_id);
+  void fail_closed_peer_rpc_speculative_credit(u32 peer_id, u64 request_id);
   void repost_peer_rpc_receive(u32 peer_id, u32 slot_id);
   void post_peer_rpc_send_slot(u32 peer_id, u32 slot_id, size_t bytes);
   void send_peer_rpc_message(u32 peer_id, const void* payload, size_t bytes);
@@ -1081,6 +1100,12 @@ private:
   vec<std::unique_ptr<std::mutex>> peer_rpc_sync_send_mutexes_;
   std::mutex peer_rpc_send_slots_mutex_;
   vec<std::array<std::deque<u32>, 3>> peer_rpc_free_send_slots_;
+  // A SEND slot is released at its local CQE, long before the peer response.
+  // Keep a separate request-lifetime credit so independent lookahead cannot
+  // pile up behind authoritative work at a slow peer. UINT64_MAX is a
+  // fail-closed owner: a posted request was locally abandoned without a
+  // matching response, so speculation to that peer stays disabled.
+  vec<u64> peer_rpc_speculative_credit_owner_;
   // Accessed only while peer_completion_mutex_ is held.  They deliberately
   // wrap; allocation probes past every still-live ID in that namespace.
   u32 peer_sync_wr_id_counter_{1};
@@ -1109,6 +1134,17 @@ private:
   // has its own bound, so an expansion burst cannot reject or starve new
   // mutations before they publish their Stage1 graph.
   std::deque<PeerStage1Task> peer_stage2_home_tasks_;
+  // Independent exact-score requests are bounded separately and dequeued only
+  // after the authoritative home queue. At most one queued/in-flight request
+  // is admitted per source shard, preventing one sender from externalizing
+  // speculative load onto other senders.
+  std::deque<PeerStage1Task> peer_stage2_home_speculative_tasks_;
+  vec<bool> peer_stage2_home_speculative_source_active_;
+  size_t peer_stage2_home_speculative_task_limit_{1};
+  // Claimed while holding peer_stage1_tasks_mutex_ before a low-priority
+  // task leaves its queue. A global credit of one prevents several senders
+  // from occupying every physical-home lane at once.
+  u32 peer_stage2_home_speculative_execution_limit_{1};
   // Execute requests whose ANN artifact is already prepared but whose fused
   // Stage2 admission window is full.  They retain their request-dedup lease
   // and per-token in-flight ownership, so a duplicate wire request can be
@@ -1149,6 +1185,12 @@ private:
   std::deque<PeerPhysicalControlTask> peer_placement_control_tasks_;
   std::unique_ptr<bounded::Queue<PeerReverseUpdateResponse>>
     peer_reverse_responses_;
+  std::unique_ptr<bounded::Queue<PeerReverseUpdateResponse>>
+    peer_speculative_responses_;
+  // Producers take this mutex while publishing either response class, closing
+  // the predicate/notify race for the shared strict-priority dispatcher.
+  std::mutex peer_response_wait_mutex_;
+  std::condition_variable peer_response_wait_cv_;
   std::mutex peer_graph_response_buffers_mutex_;
   std::deque<vec<byte_t>> peer_graph_response_buffers_;
   size_t peer_graph_response_buffer_limit_{1};
@@ -1199,7 +1241,9 @@ private:
   std::atomic<u64> peer_stage1_max_admission_waiters_{0};
   std::atomic<u32> peer_stage1_active_workers_{0};
   std::atomic<u32> peer_stage2_home_active_workers_{0};
+  std::atomic<u32> peer_stage2_home_speculative_active_workers_{0};
   bool peer_stage2_home_dedicated_{};
+  bool peer_stage2_home_speculation_enabled_{};
   std::array<Stage1PreparedResultShard,
              kStage1PreparedShardCount> stage1_prepared_results_;
   std::array<Stage1InflightRequestShard,
@@ -1216,8 +1260,13 @@ private:
   vec<u_ptr<StorageOwnerThread>> storage_owner_maintenance_worker_states_;
   std::mutex storage_owner_maintenance_mutex_;
   std::condition_variable storage_owner_maintenance_cv_;
+  std::mutex storage_owner_maintenance_wake_mutex_;
+  std::condition_variable storage_owner_maintenance_wake_cv_;
   std::atomic<u64> storage_owner_maintenance_wake_epoch_{0};
+  std::atomic<u32> storage_owner_maintenance_wake_waiters_{0};
   std::atomic<u64> storage_owner_maintenance_lost_wake_avoided_{0};
+  memory_node_storage_owner_maintenance_detail::
+    Stage2AdaptivePackingController storage_owner_stage2_packing_;
   std::deque<StorageOwnerMaintenanceTask> storage_owner_stage2_tasks_;
   // Min-heap ordered by maintenance_sequence then retry_not_before. The
   // predecessor durability rule makes its front the only cleanup that can be
@@ -1267,6 +1316,12 @@ private:
   std::atomic<u64> storage_owner_stage2_score_prefetch_issued_{0};
   std::atomic<u64> storage_owner_stage2_score_prefetch_hits_{0};
   std::atomic<u64> storage_owner_stage2_score_prefetch_wasted_{0};
+  // Independent score-many lookahead has non-zero RPC/receiver cost and must
+  // never share the near-free in-wave prefetch controller above.
+  std::atomic<u64> storage_owner_stage2_independent_score_rpc_batches_{0};
+  std::atomic<u64> storage_owner_stage2_independent_score_issued_{0};
+  std::atomic<u64> storage_owner_stage2_independent_score_useful_{0};
+  std::atomic<u64> storage_owner_stage2_independent_score_wasted_{0};
   std::atomic<u64> storage_owner_stage2_score_feedback_base_hits_{0};
   std::atomic<u64> storage_owner_stage2_score_feedback_base_wasted_{0};
   std::atomic<u64> storage_owner_stage2_score_feedback_next_outcome_{512};
@@ -1369,5 +1424,6 @@ private:
     dynamic_freshness_shards_;
 
   inline static thread_local StorageOwnerThread* current_storage_owner_thread_{nullptr};
+  inline static thread_local bool current_storage_owner_maintenance_worker_{false};
   inline static thread_local bool current_peer_rpc_progress_thread_{false};
 };

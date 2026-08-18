@@ -101,8 +101,24 @@ int main() {
            colocated_24.peer_progress_threads +
            colocated_24.foreground_progress_threads == 24);
 
-  // Configuration remains authoritative below the colocated eight-worker
-  // profile, and preserves the combined Stage2/reverse CPU pool.
+  // The generic reverse curve continues smoothly after the production point;
+  // the 24-CPU profile remains unchanged while 25/32/64 CPUs retain the
+  // reverse capacity expected by reverse-heavy update/delete workloads.
+  const auto portable_25 = memory_node_detail::derive_storage_owner_cpu_plan(
+    25, 64, 16, 8, 4);
+  const auto portable_32 = memory_node_detail::derive_storage_owner_cpu_plan(
+    32, 64, 16, 8, 4);
+  const auto portable_64 = memory_node_detail::derive_storage_owner_cpu_plan(
+    64, 64, 16, 8, 4);
+  assert(portable_25.maintenance_workers == 8);
+  assert(portable_25.peer_reverse_workers >= 3);
+  assert(portable_32.maintenance_workers == 8);
+  assert(portable_32.peer_reverse_workers >= 4);
+  assert(portable_64.peer_reverse_workers == 6);
+
+  // Configuration remains authoritative below the full eight-worker Stage2
+  // service profile. CPUs not requested by Stage2 stay with the generic
+  // reverse-service curve, preserving reverse-heavy update/delete capacity.
   const auto maintenance_two =
     memory_node_detail::derive_storage_owner_cpu_plan(22, 64, 16, 2, 4);
   const auto maintenance_three =
@@ -113,10 +129,6 @@ int main() {
   assert(maintenance_three.maintenance_workers == 3);
   assert(maintenance_three.maintenance_admission_workers == 2);
   assert(maintenance_three.peer_reverse_workers == 3);
-  assert(maintenance_two.maintenance_workers +
-           maintenance_two.peer_reverse_workers == 6);
-  assert(maintenance_three.maintenance_workers +
-           maintenance_three.peer_reverse_workers == 6);
   assert(colocated.maintenance_workers + colocated.peer_reverse_workers == 10);
 
   const auto dedicated = memory_node_detail::derive_storage_owner_cpu_plan(
@@ -235,6 +247,55 @@ int main() {
         }
       }
     }
+  }
+
+  // CPU portability is a policy invariant, not a collection of host-size
+  // exceptions. For a fixed operator configuration, adding one CPU may grow
+  // or saturate each independently pinned service domain, but must never take
+  // a worker away from one. Exercise the full range across shallow/deep RPC
+  // windows and small/large configured thread ceilings.
+  for (const std::uint32_t configured_threads : {1u, 8u, 64u, 256u}) {
+    for (const std::uint32_t rpc_parallelism : {1u, 2u, 16u, 4096u}) {
+      for (const std::uint32_t configured_maintenance :
+           {1u, 2u, 3u, 8u, 64u}) {
+        auto previous = memory_node_detail::derive_storage_owner_cpu_plan(
+          9, configured_threads, rpc_parallelism,
+          configured_maintenance, 4);
+        for (std::uint32_t cpus = 10; cpus <= 160; ++cpus) {
+          const auto current =
+            memory_node_detail::derive_storage_owner_cpu_plan(
+              cpus, configured_threads, rpc_parallelism,
+              configured_maintenance, 4);
+          assert(current.maintenance_workers >=
+                 previous.maintenance_workers);
+          assert(current.maintenance_admission_workers >=
+                 previous.maintenance_admission_workers);
+          assert(current.peer_reverse_workers >=
+                 previous.peer_reverse_workers);
+          assert(current.peer_cleanup_workers >=
+                 previous.peer_cleanup_workers);
+          assert(current.foreground_workers >=
+                 previous.foreground_workers);
+          assert(current.foreground_coordinators >=
+                 previous.foreground_coordinators);
+          assert(current.peer_stage1_workers >=
+                 previous.peer_stage1_workers);
+          assert(pinned_cpu_lanes(current) >= pinned_cpu_lanes(previous));
+          assert(pinned_cpu_lanes(current) - pinned_cpu_lanes(previous) <= 1);
+          assert(pinned_cpu_lanes(current) <= cpus);
+          previous = current;
+        }
+      }
+    }
+  }
+
+  // The production concurrency ceilings can consume every CPU through the
+  // colocated and medium-host range; no CPU is hidden by the monotonic
+  // allocator before a configured role actually saturates.
+  for (std::uint32_t cpus = 9; cpus <= 64; ++cpus) {
+    const auto plan = memory_node_detail::derive_storage_owner_cpu_plan(
+      cpus, 64, 16, 8, 4);
+    assert(pinned_cpu_lanes(plan) == cpus);
   }
 
   // Local-only plans have no reverse/control pool to donate.  Their actual

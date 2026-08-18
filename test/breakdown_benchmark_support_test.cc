@@ -314,7 +314,8 @@ void test_maintenance_log_window() {
                                uint64_t remaining,
                                uint64_t failed,
                                uint64_t peer_failed,
-                               const Histogram& histogram) {
+                               const Histogram& histogram,
+                               bool include_packing = true) {
     output << "[STATUS]: storage-owner maintenance observation: "
            << "stage2_enqueued=" << enqueued << ' '
            << "stage2_finalized_live=" << completed << " stale=0 "
@@ -334,6 +335,25 @@ void test_maintenance_log_window() {
            << "stage2_cross_edges_final_home=" << completed * 2 << ' '
            << "stage1_search_budget_exhausted=" << completed / 20 << ' '
            << "stage2_search_budget_exhausted=" << completed / 10 << ' '
+           << "stage2_independent_score_rpc_batches=" << completed << ' '
+           << "stage2_independent_score_issued=" << completed * 32 << ' '
+           << "stage2_independent_score_useful=" << completed * 16 << ' '
+           << "stage2_independent_score_wasted=" << completed * 8 << ' ';
+    if (include_packing) {
+      output << "packing_target_batch=" << (completed == 0 ? 2 : 4) << ' '
+             << "packing_arrival_interval_us=" << completed + 100 << ' '
+             << "packing_waited_batches=" << completed << ' '
+             << "packing_wait_ms=" << completed / 1000.0 << ' '
+             << "packing_target_flushes=" << completed * 2 << ' '
+             << "packing_deadline_flushes=" << completed * 3 << ' '
+             << "packing_full_flushes=" << completed * 4 << ' '
+             << "packing_low_pressure_flushes=" << completed * 5 << ' '
+             << "packing_cleanup_flushes=" << completed * 6 << ' '
+             << "packing_promotions=" << completed / 100 << ' '
+             << "packing_rollbacks=" << completed / 150 << ' '
+             << "packing_accepted_windows=" << completed / 75 << ' ';
+    }
+    output
            // Deliberately stale cumulative p99 fields: the parser must use
            // only the histogram delta from the cursor baseline.
            << "p99_stage2_delay_upper_ms=30000 "
@@ -388,6 +408,24 @@ void test_maintenance_log_window() {
   assert(summary.search_budget_delta_available);
   assert(summary.stage1_search_budget_exhausted == 15);
   assert(summary.stage2_search_budget_exhausted == 30);
+  assert(summary.independent_score_delta_available);
+  assert(summary.stage2_independent_score_rpc_batches == 300);
+  assert(summary.stage2_independent_score_issued == 9'600);
+  assert(summary.stage2_independent_score_useful == 4'800);
+  assert(summary.stage2_independent_score_wasted == 2'400);
+  assert(summary.packing_delta_available);
+  assert(summary.packing_target_batch_max == 4);
+  assert(summary.packing_arrival_interval_us_max == 400);
+  assert(summary.packing_waited_batches == 300);
+  assert(summary.packing_wait_ns == 300'000);
+  assert(summary.packing_target_flushes == 600);
+  assert(summary.packing_deadline_flushes == 900);
+  assert(summary.packing_full_flushes == 1'200);
+  assert(summary.packing_low_pressure_flushes == 1'500);
+  assert(summary.packing_cleanup_flushes == 1'800);
+  assert(summary.packing_promotions == 3);
+  assert(summary.packing_rollbacks == 2);
+  assert(summary.packing_accepted_trial_windows == 4);
   assert(summary.admission_window == 512);
   assert(summary.completion_outstanding == 0);
   assert(summary.max_completion_outstanding_per_shard == 10);
@@ -406,6 +444,7 @@ void test_maintenance_log_window() {
     tools::breakdown_benchmark::summarize_maintenance_logs(post_stop);
   assert(empty_post_stop.logs_with_observations == 0);
   assert(!empty_post_stop.failure_delta_available);
+  assert(!empty_post_stop.packing_delta_available);
   assert(!empty_post_stop.p99_stage2_delay_available);
 
   {
@@ -419,6 +458,7 @@ void test_maintenance_log_window() {
   assert(post_stop_without_completion.failures == 0);
   assert(post_stop_without_completion.peer_reverse_retry_attempts == 0);
   assert(post_stop_without_completion.peer_reverse_retry_delta_available);
+  assert(post_stop_without_completion.packing_delta_available);
   assert(post_stop_without_completion.p99_stage2_delay_samples == 0);
   assert(!post_stop_without_completion.p99_stage2_delay_available);
 
@@ -461,6 +501,24 @@ void test_maintenance_log_window() {
     tools::breakdown_benchmark::summarize_maintenance_logs(over_5s_begin);
   assert(over_5s.p99_stage2_delay_available);
   assert(over_5s.p99_stage2_delay_upper_ms == 8000.0);
+
+  // Older services did not emit adaptive-packing fields.  Their missing
+  // counters must remain distinguishable from a valid all-zero delta.
+  {
+    std::ofstream output(path, std::ios::trunc);
+    write_observation(output, 0, 0, 0, 0, 0, histogram, false);
+  }
+  const auto legacy_begin =
+    tools::breakdown_benchmark::snapshot_maintenance_logs({path.string()});
+  {
+    std::ofstream output(path, std::ios::app);
+    write_observation(output, 1, 1, 0, 0, 0, histogram, false);
+  }
+  const auto legacy_summary =
+    tools::breakdown_benchmark::summarize_maintenance_logs(legacy_begin);
+  assert(!legacy_summary.packing_delta_available);
+  assert(legacy_summary.packing_target_batch_max == 0);
+  assert(legacy_summary.packing_waited_batches == 0);
 
   std::filesystem::remove(path);
 }
@@ -518,6 +576,16 @@ void test_in_band_maintenance_snapshot_window() {
     begin[shard]->maintenance_worker_idle_waits = 3;
     begin[shard]->maintenance_worker_idle_ns = 4'000;
     begin[shard]->maintenance_lost_wake_avoided = 5;
+    begin[shard]->packing_target_batch = 2;
+    begin[shard]->packing_arrival_interval_us = 1'000;
+    begin[shard]->packing_waited_batches = 3;
+    begin[shard]->packing_wait_ns = 4'000;
+    begin[shard]->packing_promotions = 1;
+    begin[shard]->packing_rollbacks = 0;
+    begin[shard]->stage2_independent_score_rpc_batches = 5;
+    begin[shard]->stage2_independent_score_issued = 160;
+    begin[shard]->stage2_independent_score_useful = 96;
+    begin[shard]->stage2_independent_score_wasted = 64;
     begin[shard]->physical_stage1_items = 2;
     begin[shard]->physical_stage1_total_ns = 2'000;
     begin[shard]->physical_stage1_search_ns = 1'000;
@@ -567,6 +635,10 @@ void test_in_band_maintenance_snapshot_window() {
     latest.stage2_score_prefetch_issued += 200;
     latest.stage2_score_prefetch_hits += 160;
     latest.stage2_score_prefetch_wasted += 20;
+    latest.stage2_independent_score_rpc_batches += 10;
+    latest.stage2_independent_score_issued += 320;
+    latest.stage2_independent_score_useful += 192;
+    latest.stage2_independent_score_wasted += 128;
     latest.stage2_vector_read_waves = 18;
     latest.stage2_vector_unique_reads = 180;
     for (size_t phase = 0;
@@ -580,6 +652,15 @@ void test_in_band_maintenance_snapshot_window() {
     latest.maintenance_worker_idle_waits += 30;
     latest.maintenance_worker_idle_ns += 40'000;
     latest.maintenance_lost_wake_avoided += 50;
+    latest.packing_target_batch = 4;
+    latest.packing_arrival_interval_us = 2'000;
+    latest.packing_waited_batches += 10;
+    latest.packing_wait_ns += 20'000;
+    latest.packing_target_flushes += 8;
+    latest.packing_deadline_flushes += 2;
+    latest.packing_promotions += 1;
+    latest.packing_rollbacks += 1;
+    latest.packing_accepted_trial_windows += 2;
     latest.physical_stage1_items += 20;
     latest.physical_stage1_total_ns += 20'000;
     latest.physical_stage1_search_ns += 10'000;
@@ -636,6 +717,11 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.stage2_score_prefetch_issued == 400);
   assert(summary.stage2_score_prefetch_hits == 320);
   assert(summary.stage2_score_prefetch_wasted == 40);
+  assert(summary.independent_score_delta_available);
+  assert(summary.stage2_independent_score_rpc_batches == 20);
+  assert(summary.stage2_independent_score_issued == 640);
+  assert(summary.stage2_independent_score_useful == 384);
+  assert(summary.stage2_independent_score_wasted == 256);
   assert(summary.stage2_vector_read_waves == 24);
   assert(summary.stage2_vector_unique_reads == 240);
   assert(summary.home_rpc_wire_counter_delta_available);
@@ -657,6 +743,16 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.maintenance_worker_idle_waits == 60);
   assert(summary.maintenance_worker_idle_ns == 80'000);
   assert(summary.maintenance_lost_wake_avoided == 100);
+  assert(summary.packing_delta_available);
+  assert(summary.packing_target_batch_max == 4);
+  assert(summary.packing_arrival_interval_us_max == 2'000);
+  assert(summary.packing_waited_batches == 20);
+  assert(summary.packing_wait_ns == 40'000);
+  assert(summary.packing_target_flushes == 16);
+  assert(summary.packing_deadline_flushes == 4);
+  assert(summary.packing_promotions == 2);
+  assert(summary.packing_rollbacks == 2);
+  assert(summary.packing_accepted_trial_windows == 4);
   assert(summary.physical_stage1_items == 40);
   assert(summary.physical_stage1_total_ns == 40'000);
   assert(summary.physical_stage1_search_ns == 20'000);

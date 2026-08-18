@@ -1142,6 +1142,44 @@ void test_stage2_promotion_forces_one_bounded_stable_bridge() {
   assert(prune_calls == 1);
 }
 
+void test_stable_then_promotion_closes_hot_parent_eviction_window() {
+  const RemotePtr parent = pointer(0, 0x1000);
+  const RemotePtr mandatory_child = pointer(1, 0x2000);
+  const RemotePtr ordinary_child = pointer(2, 0x3000);
+  vec<RemotePtr> stable;
+  vec<RemotePtr> provisional{mandatory_child};
+
+  const ReconcileReverseOp ordinary = operation(
+    ReconcileReverseOpKind::add,
+    parent, RemotePtr{}, ordinary_child, 71);
+  const auto prefer_ordinary = [&](const vec<RemotePtr>& candidates) {
+    assert(std::find(candidates.begin(), candidates.end(), ordinary_child) !=
+           candidates.end());
+    return vec<RemotePtr>{ordinary_child};
+  };
+  auto result =
+    memory_node_storage_owner_index_detail::reconcile_reverse_adjacency(
+      ordinary, true, false, true, false, 1, 2,
+      stable, provisional, prefer_ordinary);
+  assert(result.accepted && !result.stale);
+  assert((stable == vec<RemotePtr>{ordinary_child}));
+  assert((provisional == vec<RemotePtr>{mandatory_child}));
+
+  // The mandatory promotion is deliberately the final stable-plane barrier.
+  // Even when RobustPrune prefers the ordinary edge, promotion spends the one
+  // bounded reachability exception on the protected child before removal.
+  const ReconcileReverseOp promotion = operation(
+    ReconcileReverseOpKind::promote_stable_bridge,
+    parent, mandatory_child, mandatory_child, 72);
+  result =
+    memory_node_storage_owner_index_detail::reconcile_reverse_adjacency(
+      promotion, true, true, true, true, 1, 2,
+      stable, provisional, prefer_ordinary);
+  assert(result.accepted && result.removed && !result.stale);
+  assert((stable == vec<RemotePtr>{mandatory_child}));
+  assert(provisional.empty());
+}
+
 void test_ordinary_rejection_cannot_substitute_for_promotion_ack() {
   const RemotePtr parent = pointer(0, 0x1000);
   const RemotePtr stable_neighbor = pointer(0, 0x2000);
@@ -1171,6 +1209,56 @@ void test_ordinary_rejection_cannot_substitute_for_promotion_ack() {
     parent, RemotePtr{}, final_candidate);
   assert(!memory_node_storage_owner_index_detail::
             reconcile_reverse_postcondition_holds(promotion, result));
+}
+
+void test_final_target_audit_rejects_evicted_mandatory_certificate() {
+  using memory_node_storage_owner_index_detail::
+    reconcile_reverse_final_reachability_holds;
+  const RemotePtr target = pointer(0, 0x1000);
+  const RemotePtr first = pointer(1, 0x2000);
+  const RemotePtr second = pointer(1, 0x3000);
+  const vec<ReconcileReverseOp> ops{
+    operation(ReconcileReverseOpKind::promote_stable_bridge,
+              target, first, first, 41),
+    operation(ReconcileReverseOpKind::promote_stable_bridge,
+              target, second, second, 42),
+  };
+  vec<service::storage_owner::ReconcileReverseResult> results(2);
+  results[0].placement_sequence = 41;
+  results[0].accepted = 1;
+  results[0].removed = 1;
+  results[1].placement_sequence = 42;
+  results[1].accepted = 1;
+  results[1].removed = 1;
+  const vec<size_t> indexes{0, 1};
+  const vec<RemotePtr> only_second{second};
+  const vec<RemotePtr> both{first, second};
+  const vec<RemotePtr> empty;
+
+  assert(!reconcile_reverse_final_reachability_holds(
+    span<const ReconcileReverseOp>{ops}, span<const size_t>{indexes},
+    span<const service::storage_owner::ReconcileReverseResult>{results},
+    span<const RemotePtr>{only_second}, span<const RemotePtr>{empty}));
+  assert(reconcile_reverse_final_reachability_holds(
+    span<const ReconcileReverseOp>{ops}, span<const size_t>{indexes},
+    span<const service::storage_owner::ReconcileReverseResult>{results},
+    span<const RemotePtr>{both}, span<const RemotePtr>{empty}));
+
+  vec<ReconcileReverseOp> ensure_ops{
+    operation(ReconcileReverseOpKind::ensure_reachable,
+              target, RemotePtr{}, first, 43),
+  };
+  vec<service::storage_owner::ReconcileReverseResult> ensure_results(1);
+  ensure_results[0].placement_sequence = 43;
+  ensure_results[0].accepted = 1;
+  const vec<size_t> ensure_index{0};
+  const vec<RemotePtr> protected_first{first};
+  assert(reconcile_reverse_final_reachability_holds(
+    span<const ReconcileReverseOp>{ensure_ops},
+    span<const size_t>{ensure_index},
+    span<const service::storage_owner::ReconcileReverseResult>{
+      ensure_results},
+    span<const RemotePtr>{empty}, span<const RemotePtr>{protected_first}));
 }
 
 }  // namespace
@@ -1207,6 +1295,8 @@ int main() {
   test_ensure_reachable_retry_is_idempotent_and_degree_bounded();
   test_ensure_reachable_stale_generation_or_identity_is_non_mutating();
   test_stage2_promotion_forces_one_bounded_stable_bridge();
+  test_stable_then_promotion_closes_hot_parent_eviction_window();
   test_ordinary_rejection_cannot_substitute_for_promotion_ack();
+  test_final_target_audit_rejects_evicted_mandatory_certificate();
   return 0;
 }

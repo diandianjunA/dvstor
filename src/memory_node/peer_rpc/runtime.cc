@@ -1,4 +1,5 @@
 #include "memory_node/peer_rpc/detail.hh"
+#include "memory_node/peer_rpc/stage1_control_fanout_policy.hh"
 #include "memory_node/storage_owner_cpu_plan.hh"
 #include "memory_node/storage_owner_index/graph_pointer_validation.hh"
 
@@ -93,6 +94,7 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
     std::lock_guard<std::mutex> lock(peer_rpc_send_slots_mutex_);
     peer_rpc_free_send_slots_.clear();
     peer_rpc_free_send_slots_.resize(num_storage_nodes_);
+    peer_rpc_speculative_credit_owner_.assign(num_storage_nodes_, 0);
     peer_rpc_sync_send_mutexes_.clear();
     peer_rpc_sync_send_mutexes_.resize(num_storage_nodes_);
     for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
@@ -178,6 +180,14 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   peer_reverse_responses_ =
     std::make_unique<bounded::Queue<PeerReverseUpdateResponse>>(
       peer_reverse_task_queue_limit_);
+  // Healthy senders hold at most one independent request-lifetime credit per
+  // peer. Size the isolated low-priority response queue to one slot per remote
+  // sender (with the queue's two-cell implementation floor), rather than
+  // duplicating the potentially large authoritative response capacity.
+  peer_speculative_responses_ =
+    std::make_unique<bounded::Queue<PeerReverseUpdateResponse>>(
+      std::max<size_t>(2, num_storage_nodes_ > 0
+        ? num_storage_nodes_ - 1 : 1));
   peer_reverse_update_enqueued_.store(0, std::memory_order_relaxed);
   peer_reverse_update_processed_.store(0, std::memory_order_relaxed);
   peer_reverse_update_items_enqueued_.store(0, std::memory_order_relaxed);
@@ -212,10 +222,15 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
     0, std::memory_order_relaxed);
   peer_stage1_active_workers_.store(0, std::memory_order_relaxed);
   peer_stage2_home_active_workers_.store(0, std::memory_order_relaxed);
+  peer_stage2_home_speculative_active_workers_.store(
+    0, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
     peer_stage1_tasks_.clear();
     peer_stage2_home_tasks_.clear();
+    peer_stage2_home_speculative_tasks_.clear();
+    peer_stage2_home_speculative_source_active_.assign(
+      num_storage_nodes_, false);
     peer_stage1_admission_waiters_.clear();
     peer_stage1_admission_waiter_items_ = 0;
     peer_stage1_admission_owned_items_ = 0;
@@ -244,14 +259,30 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
     num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
   const u32 reverse_worker_count = cpu_plan.peer_reverse_workers;
   // Reserve one Stage2-home lane to break dependency cycles. The remaining
-  // lanes keep Stage1 priority but may steal Stage2 work after a bounded
-  // burst, preserving both isolation and work conservation.
+  // lanes keep Stage1 priority and may steal only authoritative Stage2-home
+  // work after a bounded delay. Speculation stays on the reserved lane, so a
+  // later Stage1 publication always has at least one unpolluted shared lane.
   const u32 physical_home_worker_count = cpu_plan.peer_stage1_workers;
   const auto physical_home_split =
     memory_node_detail::split_physical_home_workers(
       physical_home_worker_count);
   const u32 stage2_home_worker_count = physical_home_split.stage2_home;
   const u32 stage1_rpc_worker_count = physical_home_split.stage1;
+  // A single physical-home service lane cannot isolate an in-flight
+  // speculative score from an authoritative dependency. Disable receiver and
+  // local sender speculation in that environment; two or more lanes retain
+  // one-per-source bounded lookahead with strict queue priority.
+  peer_stage2_home_speculation_enabled_ =
+    memory_node_peer_rpc_detail::independent_score_receiver_enabled(
+      physical_home_worker_count,
+      peer_rpc_runtime_.send_slots_per_peer);
+  peer_stage2_home_speculative_task_limit_ =
+    peer_stage2_home_speculation_enabled_
+      ? std::max<size_t>(1, num_storage_nodes_ > 0
+          ? num_storage_nodes_ - 1 : 1)
+      : 0;
+  peer_stage2_home_speculative_execution_limit_ =
+    peer_stage2_home_speculation_enabled_ ? 1 : 0;
   peer_stage2_home_dedicated_ = false;
   peer_graph_response_buffer_limit_ = std::max<size_t>(
     1, static_cast<size_t>(physical_home_worker_count) * 2);
@@ -385,7 +416,14 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
                std::to_string(stage1_rpc_worker_count) +
                "; Stage2-home workers: " +
                std::to_string(stage2_home_worker_count) +
-               " (one reserved + queue-age adaptive shared scheduling)");
+               " (one reserved; shared lanes borrow authoritative work only)");
+  print_status("storage-owner independent exact-score receiver: " +
+               std::string(peer_stage2_home_speculation_enabled_
+                 ? "enabled" : "disabled") +
+               " low_priority_limit=" +
+               std::to_string(peer_stage2_home_speculative_task_limit_) +
+               " (authoritative-first, one outstanding per sender, "
+               "one executing globally)");
   print_status("storage-owner physical control workers: cleanup=" +
                std::to_string(cleanup_worker_count) + " placement=" +
                std::to_string(cpu_plan.peer_placement_workers) +
@@ -437,6 +475,8 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
   peer_cleanup_control_tasks_cv_.notify_all();
   peer_placement_control_tasks_cv_.notify_all();
   if (peer_reverse_responses_) peer_reverse_responses_->notify_all();
+  if (peer_speculative_responses_) peer_speculative_responses_->notify_all();
+  peer_response_wait_cv_.notify_all();
   peer_completion_cv_.notify_all();
   for (auto& worker : peer_reverse_workers_) {
     if (worker.joinable()) {
@@ -459,6 +499,17 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
                "Stage1 shutdown retained runnable waiter coverage");
     lib_assert(peer_stage1_admission_owned_items_ == 0,
                "Stage1 shutdown retained semantic waiter ownership");
+    lib_assert(peer_stage2_home_tasks_.empty() &&
+                 peer_stage2_home_speculative_tasks_.empty(),
+               "Stage2-home shutdown did not drain both priority queues");
+    lib_assert(std::none_of(
+                 peer_stage2_home_speculative_source_active_.begin(),
+                 peer_stage2_home_speculative_source_active_.end(),
+                 [](bool active) { return active; }),
+               "Stage2-home shutdown retained per-source speculative debt");
+    lib_assert(peer_stage2_home_speculative_active_workers_.load(
+                 std::memory_order_acquire) == 0,
+               "Stage2-home shutdown retained speculative execution credit");
   }
   for (auto& worker : peer_cleanup_control_workers_) {
     if (worker.joinable()) {
@@ -468,11 +519,25 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
   if (peer_placement_control_thread_.joinable()) {
     peer_placement_control_thread_.join();
   }
-  peer_reverse_workers_done_.store(true, std::memory_order_release);
+  // Publish the terminal predicate under the same mutex used by the
+  // authoritative/speculative response wait.  Without this handshake the
+  // notify can land after the waiter tests an empty predicate but before it
+  // actually sleeps, leaving shutdown blocked in join().
+  {
+    std::lock_guard<std::mutex> lock(peer_response_wait_mutex_);
+    peer_reverse_workers_done_.store(true, std::memory_order_release);
+  }
   if (peer_reverse_responses_) peer_reverse_responses_->notify_all();
+  if (peer_speculative_responses_) peer_speculative_responses_->notify_all();
+  peer_response_wait_cv_.notify_all();
   if (peer_reverse_response_thread_.joinable()) {
     peer_reverse_response_thread_.join();
   }
+  lib_assert((peer_reverse_responses_ == nullptr ||
+                peer_reverse_responses_->empty()) &&
+               (peer_speculative_responses_ == nullptr ||
+                peer_speculative_responses_->empty()),
+             "peer response shutdown did not drain both priority queues");
   if (peer_rpc_progress_thread_.joinable()) {
     peer_rpc_progress_thread_.join();
   }
@@ -513,11 +578,13 @@ void MemoryNode::stop_peer_reverse_update_runtime() {
   peer_stage1_worker_states_.clear();
   peer_stage2_home_worker_states_.clear();
   peer_stage2_home_dedicated_ = false;
+  peer_stage2_home_speculation_enabled_ = false;
   {
     std::lock_guard<std::mutex> lock(peer_graph_response_buffers_mutex_);
     peer_graph_response_buffers_.clear();
   }
   peer_reverse_responses_.reset();
+  peer_speculative_responses_.reset();
 }
 
 size_t MemoryNode::peer_rpc_receive_offset(u32 peer_id, u32 slot_id) const {
@@ -565,7 +632,22 @@ bool MemoryNode::try_acquire_peer_rpc_send_slot(
   };
 
   if (peer_rpc_runtime_.send_slots_per_peer == 1) {
+    // No surplus lane exists at depth one. Low-priority work must not borrow
+    // the sole correctness/control SEND through the generic fallback.
+    if (send_class == PeerRpcSendClass::speculative) return false;
     return try_lane(PeerRpcSendClass::control);
+  }
+  if (send_class == PeerRpcSendClass::speculative) {
+    auto& free_slots = lanes[static_cast<size_t>(
+      PeerRpcSendClass::graph_update)];
+    // A speculative RPC may use otherwise-idle transport capacity, but it
+    // must never consume the final graph/reverse slot needed by exact Stage2
+    // progress. This also bounds process-wide speculative debt per peer by
+    // the statically provisioned surplus instead of by cache size.
+    if (free_slots.size() <= 1) return false;
+    slot_id = free_slots.front();
+    free_slots.pop_front();
+    return true;
   }
   if (send_class == PeerRpcSendClass::control) {
     return try_lane(PeerRpcSendClass::control) ||
@@ -585,6 +667,47 @@ void MemoryNode::release_peer_rpc_send_slot(u32 peer_id, u32 slot_id) {
       peer_rpc_send_slot_class(slot_id));
     peer_rpc_free_send_slots_[peer_id][send_class].push_back(slot_id);
   }
+}
+
+bool MemoryNode::try_reserve_peer_rpc_speculative_credit(
+    u32 peer_id, u64 request_id) {
+  if (request_id == 0 || peer_id >= num_storage_nodes_ ||
+      peer_id == storage_id_) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(peer_rpc_send_slots_mutex_);
+  if (peer_id >= peer_rpc_speculative_credit_owner_.size() ||
+      peer_rpc_speculative_credit_owner_[peer_id] != 0) {
+    return false;
+  }
+  peer_rpc_speculative_credit_owner_[peer_id] = request_id;
+  return true;
+}
+
+void MemoryNode::release_peer_rpc_speculative_credit(
+    u32 peer_id, u64 request_id) {
+  std::lock_guard<std::mutex> lock(peer_rpc_send_slots_mutex_);
+  lib_assert(request_id != 0 &&
+               peer_id < peer_rpc_speculative_credit_owner_.size() &&
+               peer_rpc_speculative_credit_owner_[peer_id] == request_id,
+             "invalid peer speculative RPC credit release");
+  peer_rpc_speculative_credit_owner_[peer_id] = 0;
+}
+
+void MemoryNode::fail_closed_peer_rpc_speculative_credit(
+    u32 peer_id, u64 request_id) {
+  std::lock_guard<std::mutex> lock(peer_rpc_send_slots_mutex_);
+  lib_assert(request_id != 0 &&
+               peer_id < peer_rpc_speculative_credit_owner_.size() &&
+               peer_rpc_speculative_credit_owner_[peer_id] == request_id,
+             "invalid peer speculative RPC fail-closed transition");
+  // Canceling a local response-registry cell cannot remove an already posted
+  // request from the remote Stage2-home queue. Keep this peer disabled for
+  // the rest of the process unless a real response was observed; otherwise a
+  // slow peer could accumulate an unbounded sequence of orphan lookahead
+  // requests as each local deadline reused the same credit.
+  peer_rpc_speculative_credit_owner_[peer_id] =
+    std::numeric_limits<u64>::max();
 }
 
 void MemoryNode::repost_peer_rpc_receive(u32 peer_id, u32 slot_id) {

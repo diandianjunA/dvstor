@@ -82,6 +82,7 @@ u64 MemoryNode::arm_storage_owner_maintenance_batch(
         tasks[item].queued_at = queued_at;
         storage_owner_stage2_tasks_.push_back(std::move(tasks[item]));
       }
+      storage_owner_stage2_packing_.observe_enqueue(queued_at, task_count);
       backlog = storage_owner_stage2_tasks_.size() +
         storage_owner_cleanup_tasks_.size();
       enqueued = true;
@@ -104,7 +105,7 @@ u64 MemoryNode::arm_storage_owner_maintenance_batch(
     task_count, std::memory_order_relaxed);
   atomic_utils::update_max_relaxed(
     storage_owner_maintenance_max_backlog_, static_cast<u64>(backlog));
-  notify_storage_owner_maintenance();
+  notify_one_storage_owner_maintenance_executor();
   return first_sequence;
 }
 
@@ -197,7 +198,7 @@ u64 MemoryNode::activate_storage_owner_cleanup_batch(
     task_count, std::memory_order_relaxed);
   atomic_utils::update_max_relaxed(
     storage_owner_maintenance_max_backlog_, static_cast<u64>(backlog));
-  notify_storage_owner_maintenance();
+  notify_one_storage_owner_maintenance_executor();
   return first_sequence;
 }
 
@@ -269,7 +270,11 @@ void MemoryNode::complete_storage_owner_maintenance_sequence(
   storage_owner_maintenance_completion_ring_->complete(
     sequence, work_items);
   publish_storage_owner_maintenance_watermarks();
-  notify_storage_owner_maintenance();
+  if (current_storage_owner_maintenance_worker_) {
+    notify_storage_owner_maintenance_capacity();
+  } else {
+    notify_storage_owner_maintenance();
+  }
   wake_peer_stage1_admission_waiters();
 }
 
