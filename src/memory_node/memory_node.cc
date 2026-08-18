@@ -246,7 +246,7 @@ MemoryNode::MemoryNode(Configuration& config)
     shard.changed.notify_all();
   }
   peer_completion_cv_.notify_all();
-  storage_owner_maintenance_cv_.notify_all();
+  notify_storage_owner_maintenance();
   for (auto& worker : storage_insert_workers_) {
     if (worker.joinable()) {
       worker.join();
@@ -262,6 +262,12 @@ MemoryNode::MemoryNode(Configuration& config)
 u64 MemoryNode::elapsed_ns_since(const std::chrono::steady_clock::time_point start) {
   return static_cast<u64>(
     std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+void MemoryNode::notify_storage_owner_maintenance() {
+  storage_owner_maintenance_wake_epoch_.fetch_add(
+    1, std::memory_order_release);
+  storage_owner_maintenance_cv_.notify_all();
 }
 
 u64 MemoryNode::scale_ns(const u64 value, const u32 part, const u32 total) {

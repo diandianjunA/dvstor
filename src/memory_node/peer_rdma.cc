@@ -413,7 +413,7 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
         // A completed chain can make another context credit-runnable before
         // this lane reaches zero.  Notify on every credit release; the same
         // notification also publishes this lane's updated post balance.
-        storage_owner_maintenance_cv_.notify_all();
+        notify_storage_owner_maintenance();
       }
       return;
     }
@@ -421,7 +421,7 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
       // Synchronous reads/atomics share the same credit domains as Stage2.
       // Their caller waits on a different condition variable, so explicitly
       // wake maintenance contexts whose previously rejected wave now fits.
-      storage_owner_maintenance_cv_.notify_all();
+      notify_storage_owner_maintenance();
     }
   }
 
@@ -452,7 +452,7 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
                "peer RDMA completion underflowed legacy global credits");
     // The credit release can unblock a different context even when this
     // particular coroutine still owns more completions.
-    storage_owner_maintenance_cv_.notify_all();
+    notify_storage_owner_maintenance();
   }
 }
 

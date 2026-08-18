@@ -8,6 +8,14 @@
 
 namespace memory_node_storage_owner_maintenance_detail {
 
+// A monotonically published event epoch closes condition-variable's
+// notify-before-wait race. Inequality, rather than ordering, also remains
+// correct across unsigned wraparound.
+inline constexpr bool stage2_maintenance_event_pending(
+    std::uint64_t observed_epoch, std::uint64_t current_epoch) {
+  return current_epoch != observed_epoch;
+}
+
 inline std::optional<std::chrono::steady_clock::time_point>
 stage2_partial_batch_deadline(
     std::size_t queued_tasks,

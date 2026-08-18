@@ -418,7 +418,7 @@ void MemoryNode::peer_rpc_progress_loop() {
               peer_id, slot_id, bytes, *header)) {
           hold_receive_slot = true;
           peer_completion_cv_.notify_all();
-          storage_owner_maintenance_cv_.notify_all();
+          notify_storage_owner_maintenance();
         }
       } else if (header->type == static_cast<u32>(
                    service::storage_owner::PeerRpcType::reconcile_reverse_response)) {
@@ -431,7 +431,7 @@ void MemoryNode::peer_rpc_progress_loop() {
               peer_id, slot_id, bytes, *header)) {
           hold_receive_slot = true;
           peer_completion_cv_.notify_all();
-          storage_owner_maintenance_cv_.notify_all();
+          notify_storage_owner_maintenance();
         }
       } else if (header->type == static_cast<u32>(
                    service::storage_owner::PeerRpcType::stage1_arm_response)) {
@@ -444,7 +444,7 @@ void MemoryNode::peer_rpc_progress_loop() {
               peer_id, slot_id, bytes, *header)) {
           hold_receive_slot = true;
           peer_completion_cv_.notify_all();
-          storage_owner_maintenance_cv_.notify_all();
+          notify_storage_owner_maintenance();
         }
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response) ||
                  header->type == static_cast<u32>(service::storage_owner::PeerRpcType::cleanup_deleted_response) ||
@@ -457,7 +457,7 @@ void MemoryNode::peer_rpc_progress_loop() {
               peer_id, slot_id, bytes, *header)) {
           hold_receive_slot = true;
           peer_completion_cv_.notify_all();
-          storage_owner_maintenance_cv_.notify_all();
+          notify_storage_owner_maintenance();
         }
       } else if (header->type == static_cast<u32>(
                    service::storage_owner::PeerRpcType::cleanup_activate_response) ||
@@ -485,7 +485,7 @@ void MemoryNode::peer_rpc_progress_loop() {
               peer_id, slot_id, bytes, *header)) {
           hold_receive_slot = true;
           peer_completion_cv_.notify_all();
-          storage_owner_maintenance_cv_.notify_all();
+          notify_storage_owner_maintenance();
         }
       } else if (header->type == static_cast<u32>(
                    service::storage_owner::PeerRpcType::stage1_execute_response)) {
@@ -499,7 +499,7 @@ void MemoryNode::peer_rpc_progress_loop() {
               peer_id, slot_id, bytes, *header)) {
           hold_receive_slot = true;
           peer_completion_cv_.notify_all();
-          storage_owner_maintenance_cv_.notify_all();
+          notify_storage_owner_maintenance();
         }
       }
 

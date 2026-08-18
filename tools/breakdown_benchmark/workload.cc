@@ -1686,6 +1686,8 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
      maintenance_summary.maintenance_worker_idle_waits},
     {"maintenance_worker_idle_ns",
      maintenance_summary.maintenance_worker_idle_ns},
+    {"maintenance_lost_wake_avoided",
+     maintenance_summary.maintenance_lost_wake_avoided},
     {"physical_stage1", {
       {"items", maintenance_summary.physical_stage1_items},
       {"total_ns", maintenance_summary.physical_stage1_total_ns},

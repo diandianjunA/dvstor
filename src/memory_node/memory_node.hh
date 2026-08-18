@@ -416,6 +416,11 @@ private:
   static InsertBreakdownCounters scale_breakdown(const InsertBreakdownCounters& counters,
                                                  const u32 part,
                                                  const u32 total);
+  // Publish an event epoch before waking maintenance workers.  Their timed
+  // wait uses the epoch as a predicate so a completion delivered after a
+  // context scan but immediately before wait_until() cannot be lost and turn
+  // a microsecond peer RPC into a one-millisecond scheduler bubble.
+  void notify_storage_owner_maintenance();
   void allocate_memory();
   void wait_for_start_signal();
   std::pair<bool, str> load_index_file(const str& path);
@@ -1211,6 +1216,8 @@ private:
   vec<u_ptr<StorageOwnerThread>> storage_owner_maintenance_worker_states_;
   std::mutex storage_owner_maintenance_mutex_;
   std::condition_variable storage_owner_maintenance_cv_;
+  std::atomic<u64> storage_owner_maintenance_wake_epoch_{0};
+  std::atomic<u64> storage_owner_maintenance_lost_wake_avoided_{0};
   std::deque<StorageOwnerMaintenanceTask> storage_owner_stage2_tasks_;
   // Min-heap ordered by maintenance_sequence then retry_not_before. The
   // predecessor durability rule makes its front the only cleanup that can be

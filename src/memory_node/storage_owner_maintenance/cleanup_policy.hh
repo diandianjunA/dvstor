@@ -107,7 +107,7 @@ inline bool stage2_parent_is_stable(const u64 header, const bool deleted) {
     (header & VamanaNode::HEADER_CENTROID_ACCOUNTED) != 0;
 }
 
-// Produces the three Stage2 backlink barriers without retaining any long-lived
+// Produces the two Stage2 backlink barriers without retaining any long-lived
 // protected edge. Prefer promoting a Stage1 parent that survived final prune;
 // otherwise establish the mandatory stable bridge at the first final parent
 // while an existing Stage1 bridge remains query-visible. Input order is

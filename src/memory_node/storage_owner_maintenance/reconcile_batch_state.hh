@@ -2,8 +2,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
+#include <optional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 #include "memory_node/storage_owner_maintenance/stage2_tracker.hh"
@@ -13,8 +16,7 @@ namespace memory_node_storage_owner_maintenance_detail {
 
 enum class Stage2ReconcileBarrier : std::uint8_t {
   none,
-  promotion,
-  stable,
+  install,
   removal,
 };
 
@@ -24,8 +26,7 @@ enum class Stage2ReconcileBarrier : std::uint8_t {
 // network ACK into a worker-wide blocking wait.
 enum class Stage2FinalizeSubphase : std::uint8_t {
   prepare,
-  promotion_wait,
-  stable_wait,
+  install_wait,
   removal_wait,
   placement_ready,
 };
@@ -33,10 +34,8 @@ enum class Stage2FinalizeSubphase : std::uint8_t {
 [[nodiscard]] constexpr Stage2FinalizeSubphase
 stage2_reconcile_wait_subphase(Stage2ReconcileBarrier barrier) noexcept {
   switch (barrier) {
-    case Stage2ReconcileBarrier::promotion:
-      return Stage2FinalizeSubphase::promotion_wait;
-    case Stage2ReconcileBarrier::stable:
-      return Stage2FinalizeSubphase::stable_wait;
+    case Stage2ReconcileBarrier::install:
+      return Stage2FinalizeSubphase::install_wait;
     case Stage2ReconcileBarrier::removal:
       return Stage2FinalizeSubphase::removal_wait;
     case Stage2ReconcileBarrier::none:
@@ -49,6 +48,44 @@ stage2_reconcile_wait_subphase(Stage2ReconcileBarrier barrier) noexcept {
     Stage2FinalizeSubphase subphase) noexcept {
   return subphase == Stage2FinalizeSubphase::prepare ||
     subphase == Stage2FinalizeSubphase::placement_ready;
+}
+
+// Install combines mandatory promotion certificates and ordinary stable
+// additions into one ACK barrier. RPCs belonging to the same peer may complete
+// out of order, so a target's operation run must never straddle two messages.
+// Grouping retains the original per-target order (all promotions were appended
+// before stable additions), while allowing independent targets to be packed.
+using Stage2ReconcileOp = service::storage_owner::ReconcileReverseOp;
+inline std::optional<std::vector<std::vector<Stage2ReconcileOp>>>
+pack_stage2_reconcile_target_runs(
+    std::span<const Stage2ReconcileOp> ops, std::size_t wire_capacity) {
+  if (wire_capacity == 0) return std::nullopt;
+
+  std::vector<std::vector<Stage2ReconcileOp>> target_runs;
+  target_runs.reserve(ops.size());
+  std::unordered_map<std::uint64_t, std::size_t> target_to_run;
+  target_to_run.reserve(ops.size());
+  for (const Stage2ReconcileOp& op : ops) {
+    auto [position, inserted] =
+      target_to_run.emplace(op.target_raw, target_runs.size());
+    if (inserted) target_runs.emplace_back();
+    target_runs[position->second].push_back(op);
+  }
+
+  std::vector<std::vector<Stage2ReconcileOp>> chunks;
+  for (auto& run : target_runs) {
+    if (run.size() > wire_capacity) return std::nullopt;
+    if (chunks.empty() ||
+        chunks.back().size() + run.size() > wire_capacity) {
+      chunks.emplace_back();
+      chunks.back().reserve(wire_capacity);
+    }
+    chunks.back().insert(
+      chunks.back().end(),
+      std::make_move_iterator(run.begin()),
+      std::make_move_iterator(run.end()));
+  }
+  return chunks;
 }
 
 struct Stage2ReconcileChunk {
@@ -74,7 +111,7 @@ struct Stage2ReconcileChunk {
 // payload remains immutable from the first post through every transport retry.
 // Offsets, rather than pointers, keep chunks valid if the payload vector grows
 // while the barrier is initially assembled. A fresh epoch fences a late ACK
-// from an earlier promotion/stable/removal barrier in the same context slot.
+// from an earlier install/removal barrier in the same context slot.
 class Stage2ReconcileBatchState {
  public:
   using Op = service::storage_owner::ReconcileReverseOp;

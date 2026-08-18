@@ -185,6 +185,8 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
     parse_u64(fields, "maintenance_worker_idle_waits");
   const auto maintenance_worker_idle_ms =
     parse_double(fields, "maintenance_worker_idle_ms");
+  const auto maintenance_lost_wake_avoided =
+    parse_u64(fields, "maintenance_lost_wake_avoided");
   const auto physical_stage1_items =
     parse_u64(fields, "physical_stage1_items");
   const auto physical_stage1_total_ns =
@@ -255,6 +257,8 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
       maintenance_worker_idle_waits.value_or(0),
     .maintenance_worker_idle_ns = maintenance_worker_idle_ms.has_value()
       ? static_cast<uint64_t>(*maintenance_worker_idle_ms * 1e6 + 0.5) : 0,
+    .maintenance_lost_wake_avoided =
+      maintenance_lost_wake_avoided.value_or(0),
     .physical_stage1_items = physical_stage1_items.value_or(0),
     .physical_stage1_total_ns = physical_stage1_total_ns.value_or(0),
     .physical_stage1_search_ns = physical_stage1_search_ns.value_or(0),
@@ -593,6 +597,7 @@ MaintenanceLogSummary summarize_impl(
       std::array<uint64_t, kStage2TimingPhaseCount> phase_elapsed_ns{};
       uint64_t idle_waits = 0;
       uint64_t idle_ns = 0;
+      uint64_t lost_wake_avoided = 0;
       uint64_t stage1_items = 0;
       uint64_t stage1_total_ns = 0;
       uint64_t stage1_search_ns = 0;
@@ -616,6 +621,9 @@ MaintenanceLogSummary summarize_impl(
                       latest.maintenance_worker_idle_waits, &idle_waits) &&
         counter_delta(cursor.baseline.maintenance_worker_idle_ns,
                       latest.maintenance_worker_idle_ns, &idle_ns) &&
+        counter_delta(cursor.baseline.maintenance_lost_wake_avoided,
+                      latest.maintenance_lost_wake_avoided,
+                      &lost_wake_avoided) &&
         counter_delta(cursor.baseline.physical_stage1_items,
                       latest.physical_stage1_items, &stage1_items) &&
         counter_delta(cursor.baseline.physical_stage1_total_ns,
@@ -649,6 +657,7 @@ MaintenanceLogSummary summarize_impl(
         }
         summary.maintenance_worker_idle_waits += idle_waits;
         summary.maintenance_worker_idle_ns += idle_ns;
+        summary.maintenance_lost_wake_avoided += lost_wake_avoided;
         summary.physical_stage1_items += stage1_items;
         summary.physical_stage1_total_ns += stage1_total_ns;
         summary.physical_stage1_search_ns += stage1_search_ns;
@@ -980,6 +989,7 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
     std::array<uint64_t, kStage2TimingPhaseCount> phase_elapsed_ns{};
     uint64_t idle_waits = 0;
     uint64_t idle_ns = 0;
+    uint64_t lost_wake_avoided = 0;
     uint64_t stage1_items = 0;
     uint64_t stage1_total_ns = 0;
     uint64_t stage1_search_ns = 0;
@@ -1002,6 +1012,9 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
                       latest.maintenance_worker_idle_waits, &idle_waits) &&
         counter_delta(first.maintenance_worker_idle_ns,
                       latest.maintenance_worker_idle_ns, &idle_ns) &&
+        counter_delta(first.maintenance_lost_wake_avoided,
+                      latest.maintenance_lost_wake_avoided,
+                      &lost_wake_avoided) &&
         counter_delta(first.physical_stage1_items,
                       latest.physical_stage1_items, &stage1_items) &&
         counter_delta(first.physical_stage1_total_ns,
@@ -1034,6 +1047,7 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
       }
       summary.maintenance_worker_idle_waits += idle_waits;
       summary.maintenance_worker_idle_ns += idle_ns;
+      summary.maintenance_lost_wake_avoided += lost_wake_avoided;
       summary.physical_stage1_items += stage1_items;
       summary.physical_stage1_total_ns += stage1_total_ns;
       summary.physical_stage1_search_ns += stage1_search_ns;

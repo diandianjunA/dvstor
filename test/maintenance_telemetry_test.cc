@@ -30,6 +30,7 @@ int main() {
     .stage2_score_prefetch_wasted = 3,
     .stage2_home_rpc_batches = 7,
     .stage2_home_rpc_items = 19,
+    .maintenance_lost_wake_avoided = 23,
   };
   first.stage2_delay_histogram[6] = 12;
   telemetry::publish(control_page.data(), first);
@@ -50,6 +51,7 @@ int main() {
   assert(copied.stage2_score_prefetch_hits == 24);
   assert(copied.stage2_home_rpc_batches == 7);
   assert(copied.stage2_home_rpc_items == 19);
+  assert(copied.maintenance_lost_wake_avoided == 23);
 
   telemetry::Snapshot second = first;
   second.published_steady_ns = 200;
