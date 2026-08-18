@@ -91,6 +91,12 @@ public:
   // horizon still forms useful waves without adding millisecond-scale queue
   // delay when update load is sparse or uneven across homes.
   u32 storage_owner_stage2_batch_max_wait_us{50};
+  // Fresh inserts may publish the sorted local Beam as their provisional
+  // adjacency and defer the exact local RobustPrune to Stage2. Stage2 then
+  // reconstructs the same prune seed before the final global prune, so this
+  // changes foreground placement of work, not durable graph quality.
+  bool storage_owner_defer_stage1_prune{false};
+  bool storage_owner_stage2_score_many{false};
   u32 storage_owner_peer_qps_per_peer{8};
   u32 storage_owner_peer_rdma_tokens{16};
   u32 storage_owner_rpc_depth{8};
@@ -291,6 +297,16 @@ private:
          ->default_value(storage_owner_stage2_batch_max_wait_us),
        "Maximum background Stage2 compaction wait for a partial batch; zero "
        "runs partial Stage2 batches immediately.")
+      ("storage-owner-defer-stage1-prune",
+       po::value<bool>(&storage_owner_defer_stage1_prune)
+         ->default_value(storage_owner_defer_stage1_prune),
+       "Publish a bounded nearest-first provisional adjacency for fresh "
+       "inserts and execute the exact local RobustPrune in Stage2.")
+      ("storage-owner-stage2-score-many",
+       po::value<bool>(&storage_owner_stage2_score_many)
+         ->default_value(storage_owner_stage2_score_many),
+       "Score remote Stage2 candidates at their physical home using a "
+       "query-deduplicated exact score-many RPC.")
       ("storage-owner-peer-rdma-tokens",
        po::value<u32>(&storage_owner_peer_rdma_tokens)->default_value(storage_owner_peer_rdma_tokens),
        "Outstanding peer reads allowed per storage data QP.")
@@ -491,6 +507,10 @@ public:
              << config.storage_owner_batch_max_wait_us << '\n';
       output << std::setw(width) << "storage Stage2 batch max wait us: "
              << config.storage_owner_stage2_batch_max_wait_us << '\n';
+      output << std::setw(width) << "defer fresh-insert Stage1 prune: "
+             << config.storage_owner_defer_stage1_prune << '\n';
+      output << std::setw(width) << "Stage2 exact score-many: "
+             << config.storage_owner_stage2_score_many << '\n';
       output << std::setw(width) << "storage peer QPs per peer: "
              << config.storage_owner_peer_qps_per_peer << '\n';
       output << std::setw(width) << "storage stage2 maintenance: "

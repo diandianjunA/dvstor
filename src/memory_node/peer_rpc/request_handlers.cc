@@ -184,6 +184,9 @@ bool MemoryNode::enqueue_peer_reverse_update_task(PeerReverseUpdateTask&& task) 
 bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
   using namespace service::storage_owner;
   const auto request_type = static_cast<PeerRpcType>(task.header.type);
+  const bool stage2_home =
+    request_type == PeerRpcType::stage2_expand_score_request ||
+    request_type == PeerRpcType::stage2_score_many_request;
   task.operation_tokens.clear();
   task.operation_tokens.reserve(task.header.item_count);
   if (request_type == PeerRpcType::stage1_execute_request) {
@@ -220,7 +223,7 @@ bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
     // release/mutation message at the trust boundary so its quiescence
     // semantics cannot be ambiguous.
     if (saw_release && saw_non_release) return false;
-  } else if (request_type == PeerRpcType::stage2_expand_score_request) {
+  } else if (stage2_home) {
     // Read-only home work has no Stage1 semantic token.  The request's
     // generation is fenced by the continuation owner when the response is
     // scattered, so a delayed/retried execution is harmless.
@@ -229,8 +232,6 @@ bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
   }
 
   std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
-  const bool stage2_home =
-    request_type == PeerRpcType::stage2_expand_score_request;
   const u32 stage2_home_item_count = stage2_home
     ? task.header.item_count : 0;
   const size_t stage2_home_limit = std::max<size_t>(
@@ -245,7 +246,7 @@ bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
       (stage2_home &&
        peer_stage2_home_tasks_.size() >= stage2_home_limit) ||
       task.source_shard >= peer_stage1_next_source_sequences_.size() ||
-      (request_type != PeerRpcType::stage2_expand_score_request &&
+      (!stage2_home &&
        peer_stage1_next_source_sequences_[task.source_shard] ==
          std::numeric_limits<u64>::max())) {
     return false;
@@ -271,7 +272,7 @@ bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
     }
     tracked_keys.push_back(key);
   }
-  if (request_type != PeerRpcType::stage2_expand_score_request) {
+  if (!stage2_home) {
     task.source_sequence =
       ++peer_stage1_next_source_sequences_[task.source_shard];
   }

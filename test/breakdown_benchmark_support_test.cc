@@ -479,6 +479,30 @@ void test_in_band_maintenance_snapshot_window() {
       .stage2_vector_read_waves = 6,
       .stage2_vector_unique_reads = 60,
     };
+    for (size_t phase = 0;
+         phase < tools::breakdown_benchmark::kStage2TimingPhaseCount;
+         ++phase) {
+      begin[shard]->stage2_phase_attempts[phase] = 1;
+      begin[shard]->stage2_phase_task_attempts[phase] = 2;
+      begin[shard]->stage2_phase_elapsed_ns[phase] =
+        static_cast<uint64_t>(phase + 1) * 2'000;
+    }
+    begin[shard]->maintenance_worker_idle_waits = 3;
+    begin[shard]->maintenance_worker_idle_ns = 4'000;
+    begin[shard]->physical_stage1_items = 2;
+    begin[shard]->physical_stage1_total_ns = 2'000;
+    begin[shard]->physical_stage1_search_ns = 1'000;
+    begin[shard]->physical_stage1_prune_ns = 500;
+    begin[shard]->physical_stage1_allocate_write_ns = 300;
+    begin[shard]->physical_stage1_backlink_ns = 200;
+    begin[shard]->physical_stage1_candidates = 256;
+    begin[shard]->physical_stage1_remote_frontier_items = 1'200;
+    begin[shard]->physical_stage1_neighbors = 96;
+    begin[shard]->stage2_home_score_rpc_batches = 2;
+    begin[shard]->stage2_home_score_rpc_items = 16;
+    begin[shard]->stage2_home_score_rpc_queries = 4;
+    begin[shard]->stage2_home_score_rpc_request_bytes = 2'000;
+    begin[shard]->stage2_home_score_rpc_response_bytes = 1'000;
     end[shard] = *begin[shard];
     auto& latest = *end[shard];
     latest.sequence = 4;
@@ -507,6 +531,30 @@ void test_in_band_maintenance_snapshot_window() {
     latest.stage2_graph_unique_reads = 120;
     latest.stage2_vector_read_waves = 18;
     latest.stage2_vector_unique_reads = 180;
+    for (size_t phase = 0;
+         phase < tools::breakdown_benchmark::kStage2TimingPhaseCount;
+         ++phase) {
+      latest.stage2_phase_attempts[phase] += 10;
+      latest.stage2_phase_task_attempts[phase] += 20;
+      latest.stage2_phase_elapsed_ns[phase] +=
+        static_cast<uint64_t>(phase + 1) * 20'000;
+    }
+    latest.maintenance_worker_idle_waits += 30;
+    latest.maintenance_worker_idle_ns += 40'000;
+    latest.physical_stage1_items += 20;
+    latest.physical_stage1_total_ns += 20'000;
+    latest.physical_stage1_search_ns += 10'000;
+    latest.physical_stage1_prune_ns += 5'000;
+    latest.physical_stage1_allocate_write_ns += 3'000;
+    latest.physical_stage1_backlink_ns += 2'000;
+    latest.physical_stage1_candidates += 2'560;
+    latest.physical_stage1_remote_frontier_items += 12'000;
+    latest.physical_stage1_neighbors += 960;
+    latest.stage2_home_score_rpc_batches += 20;
+    latest.stage2_home_score_rpc_items += 160;
+    latest.stage2_home_score_rpc_queries += 40;
+    latest.stage2_home_score_rpc_request_bytes += 20'000;
+    latest.stage2_home_score_rpc_response_bytes += 10'000;
     latest.stage2_delay_histogram[8] = 20;
   }
   const auto summary = tools::breakdown_benchmark::
@@ -542,6 +590,29 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.stage2_graph_unique_reads == 160);
   assert(summary.stage2_vector_read_waves == 24);
   assert(summary.stage2_vector_unique_reads == 240);
+  assert(summary.score_rpc_wire_counter_delta_available);
+  assert(summary.stage2_home_score_rpc_batches == 40);
+  assert(summary.stage2_home_score_rpc_items == 320);
+  assert(summary.stage2_home_score_rpc_queries == 80);
+  assert(summary.stage2_home_score_rpc_request_bytes == 40'000);
+  assert(summary.stage2_home_score_rpc_response_bytes == 20'000);
+  assert(summary.timing_counter_delta_available);
+  assert(summary.logs_with_timing_counter_deltas == 2);
+  assert(summary.stage2_phase_attempts[0] == 20);
+  assert(summary.stage2_phase_task_attempts[0] == 40);
+  assert(summary.stage2_phase_elapsed_ns[0] == 40'000);
+  assert(summary.stage2_phase_elapsed_ns[5] == 240'000);
+  assert(summary.maintenance_worker_idle_waits == 60);
+  assert(summary.maintenance_worker_idle_ns == 80'000);
+  assert(summary.physical_stage1_items == 40);
+  assert(summary.physical_stage1_total_ns == 40'000);
+  assert(summary.physical_stage1_search_ns == 20'000);
+  assert(summary.physical_stage1_prune_ns == 10'000);
+  assert(summary.physical_stage1_allocate_write_ns == 6'000);
+  assert(summary.physical_stage1_backlink_ns == 4'000);
+  assert(summary.physical_stage1_candidates == 5'120);
+  assert(summary.physical_stage1_remote_frontier_items == 24'000);
+  assert(summary.physical_stage1_neighbors == 1'920);
   assert(summary.p99_stage2_delay_available);
   assert(summary.p99_stage2_delay_samples == 40);
   assert(summary.p99_stage2_delay_upper_ms == 256.0);

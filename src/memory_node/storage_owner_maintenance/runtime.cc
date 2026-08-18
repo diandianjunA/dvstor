@@ -87,6 +87,12 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     0, std::memory_order_relaxed);
   storage_owner_stage2_home_score_rpc_items_.store(
     0, std::memory_order_relaxed);
+  storage_owner_stage2_home_score_rpc_queries_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_home_score_rpc_request_bytes_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_stage2_home_score_rpc_response_bytes_.store(
+    0, std::memory_order_relaxed);
   storage_owner_stage2_home_scored_neighbors_.store(
     0, std::memory_order_relaxed);
   for (auto& timing : storage_owner_stage2_phase_timing_) {
@@ -98,6 +104,15 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     0, std::memory_order_relaxed);
   storage_owner_maintenance_worker_idle_ns_.store(
     0, std::memory_order_relaxed);
+  physical_stage1_items_.store(0, std::memory_order_relaxed);
+  physical_stage1_total_ns_.store(0, std::memory_order_relaxed);
+  physical_stage1_search_ns_.store(0, std::memory_order_relaxed);
+  physical_stage1_prune_ns_.store(0, std::memory_order_relaxed);
+  physical_stage1_allocate_write_ns_.store(0, std::memory_order_relaxed);
+  physical_stage1_backlink_ns_.store(0, std::memory_order_relaxed);
+  physical_stage1_candidates_.store(0, std::memory_order_relaxed);
+  physical_stage1_remote_frontier_items_.store(0, std::memory_order_relaxed);
+  physical_stage1_neighbors_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_active_workers_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_finalize_latency_ns_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_finalize_max_latency_ns_.store(0, std::memory_order_relaxed);
@@ -531,6 +546,15 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   const u64 stage2_home_score_rpc_items =
     storage_owner_stage2_home_score_rpc_items_.load(
       std::memory_order_relaxed);
+  const u64 stage2_home_score_rpc_queries =
+    storage_owner_stage2_home_score_rpc_queries_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_home_score_rpc_request_bytes =
+    storage_owner_stage2_home_score_rpc_request_bytes_.load(
+      std::memory_order_relaxed);
+  const u64 stage2_home_score_rpc_response_bytes =
+    storage_owner_stage2_home_score_rpc_response_bytes_.load(
+      std::memory_order_relaxed);
   const u64 stage2_home_scored_neighbors =
     storage_owner_stage2_home_scored_neighbors_.load(
       std::memory_order_relaxed);
@@ -670,6 +694,47 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
       storage_owner_maintenance_finalize_latency_buckets_[bucket].load(
         std::memory_order_relaxed);
   }
+  static_assert(gpu_search::maintenance_telemetry::kStage2PhaseCount ==
+                kStorageOwnerStage2TimingPhaseCount);
+  for (size_t phase = 0;
+       phase < gpu_search::maintenance_telemetry::kStage2PhaseCount; ++phase) {
+    telemetry_snapshot.stage2_phase_attempts[phase] =
+      stage2_phase_attempts[phase];
+    telemetry_snapshot.stage2_phase_task_attempts[phase] =
+      stage2_phase_task_attempts[phase];
+    telemetry_snapshot.stage2_phase_elapsed_ns[phase] =
+      stage2_phase_elapsed_ns[phase];
+  }
+  telemetry_snapshot.maintenance_worker_idle_waits = worker_idle_waits;
+  telemetry_snapshot.maintenance_worker_idle_ns = worker_idle_ns;
+  telemetry_snapshot.physical_stage1_items =
+    physical_stage1_items_.load(std::memory_order_relaxed);
+  telemetry_snapshot.physical_stage1_total_ns =
+    physical_stage1_total_ns_.load(std::memory_order_relaxed);
+  telemetry_snapshot.physical_stage1_search_ns =
+    physical_stage1_search_ns_.load(std::memory_order_relaxed);
+  telemetry_snapshot.physical_stage1_prune_ns =
+    physical_stage1_prune_ns_.load(std::memory_order_relaxed);
+  telemetry_snapshot.physical_stage1_allocate_write_ns =
+    physical_stage1_allocate_write_ns_.load(std::memory_order_relaxed);
+  telemetry_snapshot.physical_stage1_backlink_ns =
+    physical_stage1_backlink_ns_.load(std::memory_order_relaxed);
+  telemetry_snapshot.physical_stage1_candidates =
+    physical_stage1_candidates_.load(std::memory_order_relaxed);
+  telemetry_snapshot.physical_stage1_remote_frontier_items =
+    physical_stage1_remote_frontier_items_.load(std::memory_order_relaxed);
+  telemetry_snapshot.physical_stage1_neighbors =
+    physical_stage1_neighbors_.load(std::memory_order_relaxed);
+  telemetry_snapshot.stage2_home_score_rpc_batches =
+    stage2_home_score_rpc_batches;
+  telemetry_snapshot.stage2_home_score_rpc_items =
+    stage2_home_score_rpc_items;
+  telemetry_snapshot.stage2_home_score_rpc_queries =
+    stage2_home_score_rpc_queries;
+  telemetry_snapshot.stage2_home_score_rpc_request_bytes =
+    stage2_home_score_rpc_request_bytes;
+  telemetry_snapshot.stage2_home_score_rpc_response_bytes =
+    stage2_home_score_rpc_response_bytes;
   gpu_search::maintenance_telemetry::publish(
     reinterpret_cast<byte_t*>(control), telemetry_snapshot);
 
@@ -761,6 +826,16 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(stage2_home_score_rpc_batches) +
                " stage2_home_score_rpc_items=" +
                std::to_string(stage2_home_score_rpc_items) +
+               " stage2_home_score_rpc_queries=" +
+               std::to_string(stage2_home_score_rpc_queries) +
+               " stage2_home_score_rpc_request_bytes=" +
+               std::to_string(stage2_home_score_rpc_request_bytes) +
+               " stage2_home_score_rpc_response_bytes=" +
+               std::to_string(stage2_home_score_rpc_response_bytes) +
+               " avg_stage2_home_score_queries_per_rpc=" +
+               std::to_string(ratio_or_zero(
+                 stage2_home_score_rpc_queries,
+                 stage2_home_score_rpc_batches)) +
                " avg_stage2_home_score_rpc_batch=" +
                std::to_string(ratio_or_zero(
                  stage2_home_score_rpc_items,
@@ -816,6 +891,33 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                " avg_stage2_batch_size=" +
                std::to_string(ratio_or_zero(stage2_batched_items, stage2_batches)) +
                stage2_phase_timing_log +
+               " physical_stage1_items=" +
+               std::to_string(physical_stage1_items_.load(
+                 std::memory_order_relaxed)) +
+               " physical_stage1_total_ns=" +
+               std::to_string(physical_stage1_total_ns_.load(
+                 std::memory_order_relaxed)) +
+               " physical_stage1_search_ns=" +
+               std::to_string(physical_stage1_search_ns_.load(
+                 std::memory_order_relaxed)) +
+               " physical_stage1_prune_ns=" +
+               std::to_string(physical_stage1_prune_ns_.load(
+                 std::memory_order_relaxed)) +
+               " physical_stage1_allocate_write_ns=" +
+               std::to_string(physical_stage1_allocate_write_ns_.load(
+                 std::memory_order_relaxed)) +
+               " physical_stage1_backlink_ns=" +
+               std::to_string(physical_stage1_backlink_ns_.load(
+                 std::memory_order_relaxed)) +
+               " physical_stage1_candidates=" +
+               std::to_string(physical_stage1_candidates_.load(
+                 std::memory_order_relaxed)) +
+               " physical_stage1_remote_frontier_items=" +
+               std::to_string(physical_stage1_remote_frontier_items_.load(
+                 std::memory_order_relaxed)) +
+               " physical_stage1_neighbors=" +
+               std::to_string(physical_stage1_neighbors_.load(
+                 std::memory_order_relaxed)) +
                " peer_stage1_enqueued=" +
                std::to_string(peer_stage1_enqueued) +
                " peer_stage1_processed=" +

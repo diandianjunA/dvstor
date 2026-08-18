@@ -722,6 +722,28 @@ FormattedReport format_report(const nlohmann::json& root,
     } else {
       output << "unavailable\n";
     }
+    output << "  executor service demand: ";
+    if (stage2.value("timing_counter_delta_available", false)) {
+      const auto& stage1 = stage2["physical_stage1"];
+      const auto& timing = stage2["phase_timing"];
+      output << "stage1_total/search/prune_us="
+             << stage1.value("avg_total_us", 0.0) << "/"
+             << stage1.value("avg_search_us", 0.0) << "/"
+             << stage1.value("avg_prune_us", 0.0)
+             << " stage1_candidates/frontier/neighbors="
+             << stage1.value("avg_candidates", 0.0) << "/"
+             << stage1.value("avg_remote_frontier", 0.0) << "/"
+             << stage1.value("avg_neighbors", 0.0)
+             << " stage2_search/freeze/reverse_us="
+             << timing["search"].value("avg_us_per_task", 0.0) << "/"
+             << timing["freeze_prune"].value("avg_us_per_task", 0.0)
+             << "/"
+             << timing["reverse_prepare"].value(
+                  "avg_us_per_task", 0.0)
+             << '\n';
+    } else {
+      output << "unavailable\n";
+    }
   }
 
   if (root.contains("recall")) {

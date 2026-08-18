@@ -69,6 +69,12 @@ enum class PeerRpcType : u32 {
   // the natural convergence order.
   stage2_expand_score_request = 21,
   stage2_expand_score_response = 22,
+  // Exact vector scoring without graph expansion. A request carries one copy
+  // of each distinct insertion query plus an arbitrary pointer list that
+  // references that query table, avoiding both full-vector RDMA READs and one
+  // repeated query payload per candidate.
+  stage2_score_many_request = 23,
+  stage2_score_many_response = 24,
 };
 
 enum class Stage2HomeDisposition : u32 {
@@ -115,6 +121,31 @@ struct Stage2ExpandScoreNeighbor {
 static_assert(sizeof(Stage2ExpandScoreItem) == 24);
 static_assert(sizeof(Stage2ExpandScoreResult) == 40);
 static_assert(sizeof(Stage2ExpandScoreNeighbor) == 16);
+
+struct Stage2ScoreManyHeader {
+  u32 query_count{};
+  u32 reserved{};
+};
+
+struct Stage2ScoreManyItem {
+  u64 pointer_raw{};
+  u64 generation{};
+  u32 search_index{};
+  u32 query_index{};
+};
+
+struct Stage2ScoreManyResult {
+  u64 pointer_raw{};
+  u64 generation{};
+  u32 search_index{};
+  u32 disposition{static_cast<u32>(Stage2HomeDisposition::retryable)};
+  distance_t distance{};
+  u32 reserved{};
+};
+
+static_assert(sizeof(Stage2ScoreManyHeader) == 8);
+static_assert(sizeof(Stage2ScoreManyItem) == 24);
+static_assert(sizeof(Stage2ScoreManyResult) == 32);
 
 struct InsertBatchRequestHeader {
   u32 magic{kInsertMagic};
@@ -1136,6 +1167,76 @@ inline const Stage2ExpandScoreNeighbor* stage2_expand_score_neighbors(
   return reinterpret_cast<const Stage2ExpandScoreNeighbor*>(
     reinterpret_cast<const byte_t*>(payload) + sizeof(PeerRpcHeader) +
     static_cast<size_t>(item_count) * sizeof(Stage2ExpandScoreResult));
+}
+
+inline size_t stage2_score_many_items_offset() {
+  return align_wire_u64(
+    wire_saturating_add(sizeof(PeerRpcHeader),
+                        sizeof(Stage2ScoreManyHeader)));
+}
+
+inline size_t stage2_score_many_queries_offset(u32 item_count) {
+  return align_wire_u64(wire_saturating_add(
+    stage2_score_many_items_offset(), wire_saturating_multiply(
+      item_count, sizeof(Stage2ScoreManyItem))));
+}
+
+inline size_t stage2_score_many_request_bytes(
+    u32 item_count, u32 query_count) {
+  return wire_saturating_add(
+    stage2_score_many_queries_offset(item_count), wire_saturating_multiply(
+      query_count, VamanaNode::vector_bytes()));
+}
+
+inline size_t stage2_score_many_response_bytes(u32 item_count) {
+  return wire_saturating_add(
+    sizeof(PeerRpcHeader), wire_saturating_multiply(
+      item_count, sizeof(Stage2ScoreManyResult)));
+}
+
+inline Stage2ScoreManyHeader* stage2_score_many_header(void* payload) {
+  return reinterpret_cast<Stage2ScoreManyHeader*>(
+    reinterpret_cast<byte_t*>(payload) + sizeof(PeerRpcHeader));
+}
+
+inline const Stage2ScoreManyHeader* stage2_score_many_header(
+    const void* payload) {
+  return reinterpret_cast<const Stage2ScoreManyHeader*>(
+    reinterpret_cast<const byte_t*>(payload) + sizeof(PeerRpcHeader));
+}
+
+inline Stage2ScoreManyItem* stage2_score_many_items(void* payload) {
+  return reinterpret_cast<Stage2ScoreManyItem*>(
+    reinterpret_cast<byte_t*>(payload) + stage2_score_many_items_offset());
+}
+
+inline const Stage2ScoreManyItem* stage2_score_many_items(
+    const void* payload) {
+  return reinterpret_cast<const Stage2ScoreManyItem*>(
+    reinterpret_cast<const byte_t*>(payload) +
+      stage2_score_many_items_offset());
+}
+
+inline byte_t* stage2_score_many_queries(void* payload, u32 item_count) {
+  return reinterpret_cast<byte_t*>(payload) +
+    stage2_score_many_queries_offset(item_count);
+}
+
+inline const byte_t* stage2_score_many_queries(
+    const void* payload, u32 item_count) {
+  return reinterpret_cast<const byte_t*>(payload) +
+    stage2_score_many_queries_offset(item_count);
+}
+
+inline Stage2ScoreManyResult* stage2_score_many_results(void* payload) {
+  return reinterpret_cast<Stage2ScoreManyResult*>(
+    reinterpret_cast<byte_t*>(payload) + sizeof(PeerRpcHeader));
+}
+
+inline const Stage2ScoreManyResult* stage2_score_many_results(
+    const void* payload) {
+  return reinterpret_cast<const Stage2ScoreManyResult*>(
+    reinterpret_cast<const byte_t*>(payload) + sizeof(PeerRpcHeader));
 }
 
 }  // namespace service::storage_owner

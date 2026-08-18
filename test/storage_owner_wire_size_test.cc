@@ -21,6 +21,10 @@ int main() {
   assert(stage2_expand_score_request_bytes(
            std::numeric_limits<u32>::max()) ==
          std::numeric_limits<size_t>::max());
+  assert(stage2_score_many_request_bytes(
+           std::numeric_limits<u32>::max(),
+           std::numeric_limits<u32>::max()) ==
+         std::numeric_limits<size_t>::max());
 
   VamanaNode::init_static_storage(128, 96, VectorDType::uint8);
   const size_t expected = sizeof(InsertBatchRequestHeader) +
@@ -52,5 +56,12 @@ int main() {
     17 * sizeof(Stage2ExpandScoreNeighbor);
   assert(stage2_expand_score_response_bytes(4, 17) ==
          stage2_response_compact_expected);
+  const size_t score_many_request_expected = align_wire_u64(
+      sizeof(PeerRpcHeader) + sizeof(Stage2ScoreManyHeader)) +
+    4 * sizeof(Stage2ScoreManyItem) + 2 * VamanaNode::vector_bytes();
+  assert(stage2_score_many_request_bytes(4, 2) ==
+         score_many_request_expected);
+  assert(stage2_score_many_response_bytes(4) ==
+         sizeof(PeerRpcHeader) + 4 * sizeof(Stage2ScoreManyResult));
   return 0;
 }
