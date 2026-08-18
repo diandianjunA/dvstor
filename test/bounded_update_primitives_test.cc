@@ -873,51 +873,49 @@ void test_stage1_waiter_wake_coverage_prevents_credit_stampedes() {
   assert(stage1_waiter_head_wake_coverage(32, 0) == 0);
 }
 
-void test_stage2_sequence_window_tracks_bounded_service_capacity() {
+void test_stage2_accepted_window_is_independent_of_execution_capacity() {
   using memory_node_storage_owner_maintenance_detail::
-    saturating_admission_multiply;
+    stage2_accepted_sequence_limit;
   using memory_node_storage_owner_maintenance_detail::
-    stage2_sequence_admission_limit;
+    stage2_context_admission_limit;
 
-  // The colocated deployment keeps exactly four wire batches of bounded debt
-  // regardless of the active search-lane experiment.
-  assert(stage2_sequence_admission_limit(2, 16, 32) == 128);
-  assert(stage2_sequence_admission_limit(4, 16, 32) == 128);
-  assert(stage2_sequence_admission_limit(8, 16, 32) == 128);
-  assert(stage2_sequence_admission_limit(2, 16, 64) == 128);
+  // Production accepts the complete bounded descriptor backlog even though
+  // only a much smaller context/lane set may execute at once. This separation
+  // lets the batcher observe queued work instead of being clocked by Stage2
+  // completions.
+  constexpr std::size_t queue_depth = 65'536;
+  constexpr std::size_t completion_capacity = 65'536;
+  assert(stage2_accepted_sequence_limit(
+           queue_depth, completion_capacity) == queue_depth);
+  assert(stage2_accepted_sequence_limit(128, completion_capacity) == 128);
+  assert(stage2_accepted_sequence_limit(queue_depth, 4096) == 4096);
+  assert(stage2_accepted_sequence_limit(0, completion_capacity) == 0);
+  assert(stage2_accepted_sequence_limit(queue_depth, 0) == 0);
 
-  // Larger executor populations can expose one task per context, while tiny
-  // deployments retain a nonzero, wire-batch-safe bound.
-  assert(stage2_sequence_admission_limit(16, 16, 32) == 256);
-  assert(stage2_sequence_admission_limit(1, 1, 32) == 32);
-  assert(stage2_sequence_admission_limit(4, 16, 1) == 64);
-  assert(stage2_sequence_admission_limit(0, 0, 0) == 4);
+  const std::size_t active_contexts = stage2_context_admission_limit(
+    8, 16, true);
+  assert(active_contexts == 32);
+  assert(stage2_accepted_sequence_limit(
+           queue_depth, completion_capacity) > active_contexts);
 
-  for (std::size_t workers = 0; workers <= 32; ++workers) {
-    for (std::size_t depth = 0; depth <= 32; ++depth) {
-      for (std::size_t batch = 0; batch <= 128; batch += 8) {
-        const std::size_t normalized_workers =
-          std::max<std::size_t>(1, workers);
-        const std::size_t normalized_depth =
-          std::max<std::size_t>(1, depth);
-        const std::size_t normalized_batch =
-          std::max<std::size_t>(1, batch);
-        const std::size_t legacy_limit = std::max(
-          normalized_batch,
-          saturating_admission_multiply(
-            saturating_admission_multiply(
-              normalized_workers, normalized_depth), 4));
-        const std::size_t limit = stage2_sequence_admission_limit(
-          workers, depth, batch);
-        assert(limit >= normalized_batch);
-        assert(limit <= legacy_limit);
-      }
-    }
+  // An occupied execution-sized prefix does not clock later Stage1
+  // acceptance. The remaining descriptors can reserve sequences before any
+  // of the first two tasks completes; only the complete accepted window
+  // applies backpressure.
+  bounded::SlidingCompletionRing accepted_ring(8);
+  const std::array<u32, 2> active_work{1, 1};
+  const std::array<u32, 6> queued_work{1, 1, 1, 1, 1, 1};
+  assert(accepted_ring.try_reserve_batch(
+           span<const u32>{active_work.data(), active_work.size()}, 8) == 1);
+  assert(accepted_ring.try_reserve_batch(
+           span<const u32>{queued_work.data(), queued_work.size()}, 8) == 3);
+  assert(accepted_ring.incomplete() == 8);
+  assert(accepted_ring.try_reserve(1) == 0);
+  for (u64 sequence = 1; sequence <= 8; ++sequence) {
+    accepted_ring.complete(sequence);
   }
-  const std::size_t max_size = std::numeric_limits<std::size_t>::max();
-  assert(stage2_sequence_admission_limit(max_size, max_size, max_size) ==
-         max_size);
-  assert(stage2_sequence_admission_limit(max_size, 2, 1) == max_size);
+  assert(accepted_ring.incomplete() == 0);
+  assert(accepted_ring.finalized() == 8);
 }
 
 void test_stage1_arm_queue_permit_cannot_be_stolen() {
@@ -1184,7 +1182,7 @@ int main() {
   test_stage2_admission_yields_only_for_live_foreground_pressure();
   test_stage2_pressure_retains_a_dedicated_progress_floor();
   test_stage1_waiter_wake_coverage_prevents_credit_stampedes();
-  test_stage2_sequence_window_tracks_bounded_service_capacity();
+  test_stage2_accepted_window_is_independent_of_execution_capacity();
   test_stage1_arm_queue_permit_cannot_be_stolen();
   test_stage1_arm_batch_queue_permit_is_atomic_and_bounded();
   test_reverse_candidate_is_revalidated_at_locked_write_boundary();

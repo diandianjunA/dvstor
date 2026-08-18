@@ -22,24 +22,21 @@ inline std::size_t saturating_admission_multiply(
   return lhs * rhs;
 }
 
-// Bound acknowledged-but-unfinished Stage2 debt independently of speculative
-// search-lane geometry. Four wire batches absorb burst and batch-formation
-// jitter, while the per-worker context term keeps every executor feedable.
-// Keeping this window at the last known-good 128-task production bound avoids
-// turning a synchronous peer wait into cluster-wide head-of-line blocking.
-inline std::size_t stage2_sequence_admission_limit(
-    std::size_t maintenance_workers,
-    std::size_t rpc_depth,
-    std::size_t batch_max) {
-  const std::size_t workers = std::max<std::size_t>(1, maintenance_workers);
-  const std::size_t depth = std::max<std::size_t>(1, rpc_depth);
-  const std::size_t batch = std::max<std::size_t>(1, batch_max);
-  const std::size_t contexts = saturating_admission_multiply(workers, depth);
-  const std::size_t legacy_limit =
-    saturating_admission_multiply(contexts, 4);
-  const std::size_t batch_burst = saturating_admission_multiply(batch, 4);
-  const std::size_t service_demand = std::max(contexts, batch_burst);
-  return std::max(batch, std::min(legacy_limit, service_demand));
+// Bound accepted Stage2 descriptors independently of active execution
+// resources. Stage1 may acknowledge every descriptor in this window after it
+// is assigned a completion sequence and published to the maintenance queue;
+// workers claim their separately bounded context/lane resources only later.
+//
+// The queue bound protects descriptor memory, while the completion-ring bound
+// prevents a modulo cell from being reused before the contiguous durable
+// watermark has crossed it. The accepted window must respect both. Neither
+// maintenance worker count nor RPC depth belongs here: tying acceptance to
+// active contexts recreates a completion-clocked foreground pipeline and
+// prevents the queue from accumulating a useful Stage2 batch.
+inline std::size_t stage2_accepted_sequence_limit(
+    std::size_t maintenance_queue_depth,
+    std::size_t completion_capacity) {
+  return std::min(maintenance_queue_depth, completion_capacity);
 }
 
 // Foreground pressure may reduce asynchronous Stage2 concurrency, but it must

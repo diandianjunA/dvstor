@@ -32,6 +32,53 @@ inline constexpr std::uint64_t kStage2PackingMaxRollbackCooldownTasks =
 inline constexpr std::uint64_t kStage2PackingInitialProbeIntervalWindows = 8;
 inline constexpr std::uint64_t kStage2PackingMaxProbeIntervalWindows = 64;
 
+// Stage2 is a background graph-quality pipeline.  Once Stage1 acceptance is
+// decoupled from active execution, the runnable queue is the authoritative
+// batching signal: do not recreate the old completion-clocked two-item stream
+// by treating every newly visible descriptor as a latency-sensitive tail.
+// Eight is the smallest context that materially amortizes the per-context
+// wave/reconcile machinery; 16 and 32 are backlog tiers, capped by the
+// configured wire/scratch bound.
+inline constexpr std::size_t kStage2BulkMinimumBatch = 8;
+inline constexpr std::size_t kStage2BulkMiddleBatch = 16;
+inline constexpr std::size_t kStage2BulkMaximumBatch = 32;
+// A background tail must remain in the accepted queue long enough for the
+// next arrivals to join it.  The old 50 us execution-credit deadline is far
+// shorter than the measured 1--3 ms per-node arrival interval and therefore
+// lets idle context slots consume descriptors one by one.  Predict the time
+// needed to reach eight from the enqueue EWMA, bounded so sparse workloads
+// still advance their durable watermark.
+inline constexpr std::uint32_t kStage2BulkTailMinWaitUs = 1'000;
+inline constexpr std::uint32_t kStage2BulkTailMaxWaitUs = 25'000;
+
+inline constexpr bool stage2_bulk_packing_enabled(
+    std::size_t configured_batch_limit) {
+  return configured_batch_limit >= kStage2BulkMinimumBatch;
+}
+
+// Select from already-visible work only.  In particular, this helper never
+// predicts or waits for the next arrival.  A queue between tiers is split into
+// independently progressing contexts (for example 24 -> 16 + 8) instead of
+// being collapsed into one oversized context that would reduce executor
+// parallelism.
+inline constexpr std::size_t stage2_visible_backlog_target(
+    std::size_t queued_tasks, std::size_t configured_batch_limit) {
+  const std::size_t batch_limit =
+    std::max<std::size_t>(1, configured_batch_limit);
+  if (!stage2_bulk_packing_enabled(batch_limit)) {
+    return std::min<std::size_t>(2, batch_limit);
+  }
+  if (batch_limit >= kStage2BulkMaximumBatch &&
+      queued_tasks >= kStage2BulkMaximumBatch) {
+    return kStage2BulkMaximumBatch;
+  }
+  if (batch_limit >= kStage2BulkMiddleBatch &&
+      queued_tasks >= kStage2BulkMiddleBatch) {
+    return kStage2BulkMiddleBatch;
+  }
+  return std::min(kStage2BulkMinimumBatch, batch_limit);
+}
+
 // Failed trials are evidence that the current workload does not amortize a
 // larger context. Retrying at a fixed cadence repeatedly pays the same 512-task
 // loss, so consecutive failures back off geometrically. Saturation preserves
@@ -90,12 +137,19 @@ struct Stage2PackingTelemetry {
   std::uint64_t promotions{};
   std::uint64_t rollbacks{};
   std::uint64_t accepted_trial_windows{};
+  std::uint64_t admitted_queue_depth_sum{};
+  std::uint64_t admitted_queue_depth_max{};
+  std::uint64_t batch_1_to_7{};
+  std::uint64_t batch_8_to_15{};
+  std::uint64_t batch_16_to_31{};
+  std::uint64_t batch_32_plus{};
+  std::uint64_t bulk_assembly_batches{};
+  std::uint64_t bulk_assembly_wait_ns{};
 };
 
-// Produce a deadline from observed arrival rate rather than assuming any
-// particular dataset or update distribution.  The oldest descriptor remains
-// the immutable anchor, so later arrivals can shorten the remaining wait but
-// can never extend it beyond 5 ms.
+// Select an immediate batch from visible backlog.  Only a sub-eight tail may
+// retain the configured legacy deadline; small configured batch limits keep
+// the old target-four feedback path for compatibility.
 inline Stage2PackingDecision decide_stage2_packing(
     std::size_t queued_tasks,
     std::size_t configured_batch_limit,
@@ -108,42 +162,53 @@ inline Stage2PackingDecision decide_stage2_packing(
   Stage2PackingDecision decision;
   const std::size_t batch_limit =
     std::max<std::size_t>(1, configured_batch_limit);
-  decision.target_batch = std::clamp<std::size_t>(
-    adaptive_target, 1, batch_limit);
+  const bool bulk_packing = stage2_bulk_packing_enabled(batch_limit);
+  decision.target_batch = bulk_packing
+    ? stage2_visible_backlog_target(queued_tasks, batch_limit)
+    : std::clamp<std::size_t>(adaptive_target, 1, batch_limit);
   // A target-four policy is meaningful only while completion/queue pressure
   // supplies both enough arrivals and a measurable capacity signal. Outside
   // that trial domain select the legacy target and flush immediately: 185634
   // sent 99,009 of 99,028 contexts through the deadline path while both batch
   // size and end-to-end throughput regressed. There is no batching benefit to
   // justify putting isolated arrivals on a timer.
-  if (!high_pressure) {
+  if (!bulk_packing && !high_pressure) {
     decision.target_batch = std::min<std::size_t>(2, batch_limit);
   }
   // Under real pressure, target <=2 is the measured legacy/baseline path:
   // collect until its bounded deadline, then drain up to the wire limit. The
   // low-pressure branch below bypasses that timer, and the rollback path still
   // must not cap an already-available batch at two.
-  decision.pop_limit = decision.target_batch <= 2
-    ? batch_limit : decision.target_batch;
+  decision.pop_limit = bulk_packing
+    ? decision.target_batch
+    : (decision.target_batch <= 2 ? batch_limit : decision.target_batch);
   if (queued_tasks == 0) return decision;
 
   if (queued_tasks >= batch_limit) {
     decision.ready = true;
     decision.pop_limit = batch_limit;
+    decision.target_batch = batch_limit;
     decision.reason = Stage2PackingFlushReason::full;
     return decision;
   }
-  if (!high_pressure) {
+  // A visible bulk tier is ready now.  Do not add an arrival-rate wait: the
+  // accepted backlog already contains everything needed to form this context.
+  if (bulk_packing && queued_tasks >= decision.target_batch) {
+    decision.ready = true;
+    decision.reason = Stage2PackingFlushReason::target;
+    return decision;
+  }
+  if (!bulk_packing && !high_pressure) {
     decision.ready = true;
     decision.reason = Stage2PackingFlushReason::low_pressure;
     return decision;
   }
-  if (legacy_wait_us == 0) {
+  if (!bulk_packing && legacy_wait_us == 0) {
     decision.ready = true;
     decision.reason = Stage2PackingFlushReason::low_pressure;
     return decision;
   }
-  if (decision.target_batch > 2 &&
+  if (!bulk_packing && decision.target_batch > 2 &&
       queued_tasks >= decision.target_batch) {
     decision.ready = true;
     decision.reason = Stage2PackingFlushReason::target;
@@ -155,7 +220,22 @@ inline Stage2PackingDecision decide_stage2_packing(
   // With no estimate yet, use the safety ceiling once; feedback will either
   // validate target four or restore the legacy path within one bounded
   // evaluation window.
-  if (decision.target_batch <= 2) {
+  if (bulk_packing) {
+    std::uint64_t predicted_us = kStage2BulkTailMaxWaitUs;
+    if (estimated_arrival_interval_us != 0) {
+      // The deadline is anchored at the oldest descriptor. Predict the time
+      // from that first descriptor to a complete target, not merely the time
+      // still missing at this observation; otherwise the already elapsed
+      // interval is subtracted twice and a steady stream flushes at five or
+      // six items before it can ever reach eight.
+      predicted_us = static_cast<std::uint64_t>(
+        estimated_arrival_interval_us) * (decision.target_batch - 1);
+    }
+    decision.wait_budget_us = static_cast<std::uint32_t>(std::clamp<
+      std::uint64_t>(predicted_us,
+                    kStage2BulkTailMinWaitUs,
+                    kStage2BulkTailMaxWaitUs));
+  } else if (decision.target_batch <= 2) {
     decision.wait_budget_us = std::min(
       legacy_wait_us, kStage2AdaptivePackingMaxWaitUs);
   } else {
@@ -200,7 +280,9 @@ public:
     configured_batch_limit_ =
       std::max<std::size_t>(1, configured_batch_limit);
     legacy_wait_us_ = legacy_wait_us;
-    target_batch_ = std::min<std::size_t>(2, configured_batch_limit_);
+    target_batch_ = stage2_bulk_packing_enabled(configured_batch_limit_)
+      ? std::min(kStage2BulkMinimumBatch, configured_batch_limit_)
+      : std::min<std::size_t>(2, configured_batch_limit_);
     last_arrival_ = {};
     arrival_interval_us_ = 0;
     baseline_cost_ns_per_task_ = 0.0;
@@ -256,7 +338,9 @@ public:
   void observe_admission(Stage2PackingFlushReason reason,
                          std::size_t actual_batch,
                          std::uint64_t oldest_wait_ns,
-                         std::uint32_t wait_budget_us) {
+                         std::uint32_t wait_budget_us,
+                         std::size_t selected_target = 0,
+                         std::size_t queued_at_admission = 0) {
     std::lock_guard<std::mutex> lock(mutex_);
     switch (reason) {
       case Stage2PackingFlushReason::full:
@@ -277,6 +361,27 @@ public:
       case Stage2PackingFlushReason::none:
         break;
     }
+    if (actual_batch != 0) {
+      telemetry_.target_batch = std::max<std::uint64_t>(
+        telemetry_.target_batch, selected_target);
+      telemetry_.admitted_queue_depth_sum += queued_at_admission;
+      telemetry_.admitted_queue_depth_max = std::max<std::uint64_t>(
+        telemetry_.admitted_queue_depth_max, queued_at_admission);
+      if (actual_batch < kStage2BulkMinimumBatch) {
+        ++telemetry_.batch_1_to_7;
+      } else if (actual_batch < kStage2BulkMiddleBatch) {
+        ++telemetry_.batch_8_to_15;
+      } else if (actual_batch < kStage2BulkMaximumBatch) {
+        ++telemetry_.batch_16_to_31;
+      } else {
+        ++telemetry_.batch_32_plus;
+      }
+      if (stage2_bulk_packing_enabled(configured_batch_limit_) &&
+          oldest_wait_ns != 0) {
+        ++telemetry_.bulk_assembly_batches;
+        telemetry_.bulk_assembly_wait_ns += oldest_wait_ns;
+      }
+    }
     if (wait_budget_us != 0 && actual_batch != 0) {
       const std::uint64_t bounded_wait_ns = std::min<std::uint64_t>(
         oldest_wait_ns,
@@ -296,6 +401,12 @@ public:
                           std::size_t debt_at_completion) {
     if (!high_pressure || actual_batch == 0) return;
     std::lock_guard<std::mutex> lock(mutex_);
+    // The production >=8 path is deterministic and driven by visible queue
+    // depth.  Feeding its 8/16/32 contexts into the legacy target2/target4
+    // A/B controller would either ignore every sample or incorrectly trip the
+    // old process-lifetime fuse.  Resource debt is still bounded elsewhere;
+    // this controller has no execution-credit role.
+    if (stage2_bulk_packing_enabled(configured_batch_limit_)) return;
     // A measured negative larger-batch cohort is a process-lifetime fuse.
     // Continuing to collect feedback cannot change the selected target and
     // would merely recreate the repeated trial tax this fuse removes.
@@ -422,7 +533,6 @@ public:
   [[nodiscard]] Stage2PackingTelemetry telemetry() const {
     std::lock_guard<std::mutex> lock(mutex_);
     Stage2PackingTelemetry result = telemetry_;
-    result.target_batch = target_batch_;
     result.estimated_arrival_interval_us = arrival_interval_us_;
     return result;
   }

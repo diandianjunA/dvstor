@@ -3411,17 +3411,27 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     const size_t completion_incomplete =
       storage_owner_maintenance_completion_ring_ == nullptr ? 0 :
         storage_owner_maintenance_completion_ring_->incomplete();
-    // Completion debt is the dataset-independent signal that Stage2, rather
-    // than a sparse low-rate workload, needs more coalescing. A queue already
-    // holding two target batches is independently high pressure. Isolated
-    // arrivals and short bursts therefore retain immediate/legacy latency.
+    // The accepted window is intentionally much larger than active Stage2
+    // execution. Do not use half of that window as a pressure threshold: with
+    // a 65K accepted backlog it would label every useful 8/16/32 batch as low
+    // pressure. Visible queue depth is authoritative, with two configured
+    // batches of unfinished debt as the bounded tail-coalescing signal once
+    // all descriptors have already moved into active contexts.
+    const bool bulk_packing = stage2_bulk_packing_enabled(batch_limit);
+    const size_t completion_pressure_threshold = bulk_packing
+      ? std::max<size_t>(
+          kStage2BulkMinimumBatch,
+          batch_limit > std::numeric_limits<size_t>::max() / 2
+            ? std::numeric_limits<size_t>::max() : batch_limit * 2)
+      : (storage_owner_maintenance_admission_limit_ + 1) / 2;
     const bool completion_pressure =
-      storage_owner_maintenance_admission_limit_ != 0 &&
-      completion_incomplete >=
-        (storage_owner_maintenance_admission_limit_ + 1) / 2;
+      completion_pressure_threshold != 0 &&
+      completion_incomplete >= completion_pressure_threshold;
+    const size_t queue_pressure_threshold = bulk_packing
+      ? kStage2BulkMinimumBatch
+      : std::max<size_t>(2, packing_parameters.target_batch * 2);
     const bool queue_pressure =
-      storage_owner_stage2_tasks_.size() >=
-        std::max<size_t>(2, packing_parameters.target_batch * 2);
+      storage_owner_stage2_tasks_.size() >= queue_pressure_threshold;
     const bool packing_high_pressure =
       completion_pressure || queue_pressure;
     Stage2PackingDecision packing_decision;
@@ -3451,6 +3461,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       : StorageOwnerMaintenanceKind::cleanup_deleted_node;
 
     if (choose_stage2) {
+      const size_t queued_at_admission =
+        storage_owner_stage2_tasks_.size();
       const auto oldest_queued_at =
         storage_owner_stage2_tasks_.front().queued_at;
       const u64 oldest_wait_ns = static_cast<u64>(
@@ -3486,7 +3498,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       }
       storage_owner_stage2_packing_.observe_admission(
         packing_decision.reason, context.tasks.size(), oldest_wait_ns,
-        packing_decision.wait_budget_us);
+        packing_decision.wait_budget_us,
+        packing_decision.target_batch, queued_at_admission);
       storage_owner_stage2_batches_.fetch_add(1, std::memory_order_relaxed);
       storage_owner_stage2_batched_items_.fetch_add(
         context.tasks.size(), std::memory_order_relaxed);
@@ -3747,16 +3760,28 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           const size_t incomplete =
             storage_owner_maintenance_completion_ring_ == nullptr ? 0 :
               storage_owner_maintenance_completion_ring_->incomplete();
+          const size_t batch_limit =
+            std::max<size_t>(1, config.storage_owner_batch_max);
+          const bool bulk_packing =
+            stage2_bulk_packing_enabled(batch_limit);
+          const size_t completion_pressure_threshold = bulk_packing
+            ? std::max<size_t>(
+                kStage2BulkMinimumBatch,
+                batch_limit > std::numeric_limits<size_t>::max() / 2
+                  ? std::numeric_limits<size_t>::max() : batch_limit * 2)
+            : (storage_owner_maintenance_admission_limit_ + 1) / 2;
           const bool completion_pressure =
-            storage_owner_maintenance_admission_limit_ != 0 &&
-            incomplete >=
-              (storage_owner_maintenance_admission_limit_ + 1) / 2;
+            completion_pressure_threshold != 0 &&
+            incomplete >= completion_pressure_threshold;
+          const size_t queue_pressure_threshold = bulk_packing
+            ? kStage2BulkMinimumBatch
+            : std::max<size_t>(2, parameters.target_batch * 2);
           const bool queue_pressure =
             storage_owner_stage2_tasks_.size() >=
-              std::max<size_t>(2, parameters.target_batch * 2);
+              queue_pressure_threshold;
           const Stage2PackingDecision decision = decide_stage2_packing(
             storage_owner_stage2_tasks_.size(),
-            std::max<size_t>(1, config.storage_owner_batch_max),
+            batch_limit,
             parameters.target_batch,
             storage_owner_stage2_tasks_.front().queued_at,
             idle_started,

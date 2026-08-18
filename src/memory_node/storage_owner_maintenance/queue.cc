@@ -27,6 +27,7 @@ u64 MemoryNode::arm_storage_owner_maintenance_batch(
   if (!storage_owner_maintenance_enabled(config) ||
       storage_owner_maintenance_completion_ring_ == nullptr ||
       storage_owner_maintenance_admission_limit_ == 0 || tasks.empty() ||
+      storage_insert_shutdown_.load(std::memory_order_acquire) ||
       tasks.size() > config.storage_owner_maintenance_queue_depth ||
       tasks.size() > storage_owner_maintenance_admission_limit_) {
     return 0;
@@ -38,18 +39,21 @@ u64 MemoryNode::arm_storage_owner_maintenance_batch(
     }
   }
 
-  // Park the already validated physical-home request on bounded local credit
-  // instead of returning a transient error.  Retrying the whole RPC repeats
+  // Publish the already validated physical-home request into the bounded
+  // accepted backlog before the authority can ACK it. This permit is wholly
+  // independent of active Stage2 contexts/search lanes: a maintenance worker
+  // claims those resources only after it pops a visible descriptor. Parking
+  // here therefore means the complete configured backlog is full, not merely
+  // that the execution window is busy. Retrying the whole RPC would repeat
   // deduplication, graph publication bookkeeping, and response construction
-  // while making no durable progress.  A reserved Stage2-home lane plus the
-  // independent maintenance executor guarantees that completion credit can
-  // continue to return while this Stage1 worker is parked.
+  // while making no durable progress.
   const size_t task_count = tasks.size();
   {
     std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
     storage_owner_maintenance_cv_.wait(lock, [&]() {
       return storage_owner_maintenance_shutdown_.load(
                std::memory_order_acquire) ||
+        storage_insert_shutdown_.load(std::memory_order_acquire) ||
         maintenance_queue_batch_permit_available(
           storage_owner_stage2_tasks_.size() +
             storage_owner_cleanup_tasks_.size(),
@@ -57,15 +61,40 @@ u64 MemoryNode::arm_storage_owner_maintenance_batch(
           config.storage_owner_maintenance_queue_depth);
     });
     if (storage_owner_maintenance_shutdown_.load(
-          std::memory_order_acquire)) {
+          std::memory_order_acquire) ||
+        storage_insert_shutdown_.load(std::memory_order_acquire)) {
       return 0;
     }
     storage_owner_maintenance_reserved_slots_ += task_count;
   }
 
   vec<u32> work_items(task_count, 1);
-  const u64 first_sequence = begin_storage_owner_maintenance_batch(
-    span<const u32>{work_items});
+  // Do not enter SlidingCompletionRing::reserve_batch() here: its atomic wait
+  // has no cancellation channel, while shutdown joins foreground workers
+  // before stopping Stage2.  A full accepted window would otherwise make
+  // graceful shutdown wait forever.  Keep the queue permit while retrying the
+  // all-or-nothing reservation, but periodically recheck both shutdown flags.
+  u64 first_sequence = 0;
+  while (first_sequence == 0 &&
+         !storage_insert_shutdown_.load(std::memory_order_acquire) &&
+         !storage_owner_maintenance_shutdown_.load(
+           std::memory_order_acquire)) {
+    first_sequence = try_begin_storage_owner_maintenance_batch(
+      span<const u32>{work_items});
+    if (first_sequence != 0) break;
+    if (capacity_blocked != nullptr) *capacity_blocked = true;
+    std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+    storage_owner_maintenance_cv_.wait_for(
+      lock, std::chrono::milliseconds(1));
+  }
+  if (first_sequence == 0) {
+    std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
+    lib_assert(storage_owner_maintenance_reserved_slots_ >= task_count,
+               "cancelled Stage1 arm lost its maintenance queue permit");
+    storage_owner_maintenance_reserved_slots_ -= task_count;
+    storage_owner_maintenance_cv_.notify_all();
+    return 0;
+  }
   const auto queued_at = std::chrono::steady_clock::now();
   size_t backlog = 0;
   bool enqueued = false;
@@ -124,6 +153,7 @@ u64 MemoryNode::activate_storage_owner_cleanup_batch(
     vec<StorageOwnerMaintenanceTask>& tasks,
     const Configuration& config) {
   if (!storage_owner_maintenance_enabled(config) || tasks.empty() ||
+      storage_insert_shutdown_.load(std::memory_order_acquire) ||
       tasks.size() > config.storage_owner_maintenance_queue_depth ||
       tasks.size() > storage_owner_maintenance_admission_limit_) {
     return 0;
@@ -141,6 +171,7 @@ u64 MemoryNode::activate_storage_owner_cleanup_batch(
     storage_owner_maintenance_cv_.wait(lock, [&]() {
       return storage_owner_maintenance_shutdown_.load(
                std::memory_order_acquire) ||
+        storage_insert_shutdown_.load(std::memory_order_acquire) ||
         maintenance_queue_batch_permit_available(
           storage_owner_stage2_tasks_.size() +
             storage_owner_cleanup_tasks_.size(),
@@ -149,15 +180,34 @@ u64 MemoryNode::activate_storage_owner_cleanup_batch(
           config.storage_owner_maintenance_queue_depth);
     });
     if (storage_owner_maintenance_shutdown_.load(
-          std::memory_order_acquire)) {
+          std::memory_order_acquire) ||
+        storage_insert_shutdown_.load(std::memory_order_acquire)) {
       return 0;
     }
     storage_owner_maintenance_reserved_slots_ += task_count;
   }
 
   vec<u32> work_items(task_count, 1);
-  const u64 first_sequence = begin_storage_owner_maintenance_batch(
-    span<const u32>{work_items});
+  u64 first_sequence = 0;
+  while (first_sequence == 0 &&
+         !storage_insert_shutdown_.load(std::memory_order_acquire) &&
+         !storage_owner_maintenance_shutdown_.load(
+           std::memory_order_acquire)) {
+    first_sequence = try_begin_storage_owner_maintenance_batch(
+      span<const u32>{work_items});
+    if (first_sequence != 0) break;
+    std::unique_lock<std::mutex> lock(storage_owner_maintenance_mutex_);
+    storage_owner_maintenance_cv_.wait_for(
+      lock, std::chrono::milliseconds(1));
+  }
+  if (first_sequence == 0) {
+    std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
+    lib_assert(storage_owner_maintenance_reserved_slots_ >= task_count,
+               "cancelled cleanup activation lost its queue permit");
+    storage_owner_maintenance_reserved_slots_ -= task_count;
+    storage_owner_maintenance_cv_.notify_all();
+    return 0;
+  }
   const auto queued_at = std::chrono::steady_clock::now();
   size_t backlog = 0;
   bool enqueued = false;
@@ -212,7 +262,10 @@ u64 MemoryNode::begin_storage_owner_maintenance_batch(
   lib_assert(storage_owner_maintenance_completion_ring_ != nullptr,
              "storage-owner completion ring is not initialized");
   lib_assert(storage_owner_maintenance_admission_limit_ != 0,
-             "storage-owner completion admission window is not initialized");
+             "storage-owner accepted descriptor window is not initialized");
+  // This claims bounded accepted-backlog capacity and a durable-watermark
+  // sequence. It deliberately does not claim a context, search lane, RPC slot,
+  // or other active Stage2 execution resource.
   const u64 sequence =
     storage_owner_maintenance_completion_ring_->reserve_batch(
       work_items, storage_owner_maintenance_admission_limit_);
@@ -225,7 +278,7 @@ u64 MemoryNode::try_begin_storage_owner_maintenance_batch(
   lib_assert(storage_owner_maintenance_completion_ring_ != nullptr,
              "storage-owner completion ring is not initialized");
   lib_assert(storage_owner_maintenance_admission_limit_ != 0,
-             "storage-owner completion admission window is not initialized");
+             "storage-owner accepted descriptor window is not initialized");
   const u64 sequence =
     storage_owner_maintenance_completion_ring_->try_reserve_batch(
       work_items, storage_owner_maintenance_admission_limit_);

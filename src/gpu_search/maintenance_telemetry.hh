@@ -50,6 +50,8 @@ struct alignas(64) Snapshot {
   u64 peer_reverse_remaining{};
   u64 failed{};
   u64 peer_reverse_failed{};
+  // Accepted-but-unfinished descriptor bound. Active context/lane limits are
+  // deliberately separate execution resources.
   u64 admission_window{};
   u64 completion_outstanding{};
   u64 max_backlog{};

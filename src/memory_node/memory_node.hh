@@ -1550,6 +1550,9 @@ private:
   std::atomic<u64> storage_owner_foreground_last_active_ns_{0};
   std::unique_ptr<bounded::SlidingCompletionRing>
     storage_owner_maintenance_completion_ring_;
+  // Maximum accepted-but-not-yet-complete Stage2 descriptors. This is the
+  // bounded foreground/queue debt window, not an active context or RPC limit;
+  // execution resources are claimed independently by maintenance workers.
   size_t storage_owner_maintenance_admission_limit_{};
   size_t storage_owner_maintenance_intent_capacity_{};
   std::unique_ptr<StorageOwnerMaintenanceIntent[]>

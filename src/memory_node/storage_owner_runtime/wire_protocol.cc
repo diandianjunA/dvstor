@@ -521,8 +521,9 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
 
   // Authority publication is intentionally per item, not batch-atomic.  In
   // particular, a fresh fused insert must be committed as soon as its own
-  // physical home proves bounded Stage2 admission; retaining that lease while
-  // another home waits for completion credit creates a cross-home cycle.
+  // physical home proves publication into the bounded accepted Stage2
+  // backlog; retaining that lease while another home waits for accepted
+  // capacity creates a cross-home cycle.
   const auto commit_plan = [&](size_t index) {
     MutationPlan& plan = plans[index];
     if (!plan.active || plan.authority_committed) return;
@@ -1196,8 +1197,8 @@ bool MemoryNode::execute_storage_owner_batch_items(const node_t* ids,
   }
 
   // Batch arm by physical home and post every remote batch together. Each
-  // physical home remains an independent atomic admission transaction: when
-  // its ACK arrives, commit exactly that authority subset immediately. No
+  // physical home remains an independent atomic accepted-backlog transaction:
+  // when its ACK arrives, commit exactly that authority subset immediately. No
   // home waits while the coordinator accumulates resources from every other
   // home, and only a still-unresolved home is retried with the same tokens.
   dense_hashmap_t<u32, vec<size_t>> arm_groups;

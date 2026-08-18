@@ -91,26 +91,25 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                global_search_lane_lease_limit <=
                  std::numeric_limits<u32>::max(),
              "global Stage2 lane lease is outside its transport range");
-  // Every reserved sequence is either already queued/runnable or completed by
-  // its synchronous retirement path. Stage1 preparation owns no sequence, so
-  // the full descriptor bound is safe. Keep exact incomplete-task admission
-  // tied to the CPU plan's bounded service baseline instead of inflating it
-  // with search scratch leases: reconcile responses retain receive slots until
-  // their owning context runs, so excess context debt can itself stall peer
-  // progress.
+  // Every accepted sequence is either already visible in the bounded
+  // descriptor queue, owned by an active context, or completed by its
+  // synchronous retirement path. Stage1 preparation owns no sequence. Keep
+  // the accepted window independent of active context/lane geometry: workers
+  // claim those resources only after the descriptor is visible to the batcher.
+  // This lets Stage1 acknowledge a bounded burst and gives Stage2 a real
+  // backlog to coalesce without allowing unbounded in-memory debt.
   const size_t completion_capacity = std::max<size_t>(
     std::max<size_t>(1, config.storage_owner_batch_max),
     config.storage_owner_maintenance_queue_depth);
   storage_owner_maintenance_completion_ring_ =
     std::make_unique<bounded::SlidingCompletionRing>(
       completion_capacity, initial_next, initial_durable);
-  const size_t requested_admission_limit =
-    stage2_sequence_admission_limit(
-      cpu_plan.maintenance_admission_workers,
-      config.storage_owner_rpc_depth,
-      config.storage_owner_batch_max);
-  storage_owner_maintenance_admission_limit_ = static_cast<size_t>(
-    std::min(completion_capacity, requested_admission_limit));
+  storage_owner_maintenance_admission_limit_ =
+    stage2_accepted_sequence_limit(
+      config.storage_owner_maintenance_queue_depth,
+      completion_capacity);
+  lib_assert(storage_owner_maintenance_admission_limit_ != 0,
+             "Stage2 accepted descriptor window is empty");
   storage_owner_maintenance_intent_capacity_ = completion_capacity;
   storage_owner_maintenance_intents_ =
     std::make_unique<StorageOwnerMaintenanceIntent[]>(completion_capacity);
@@ -253,27 +252,21 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
         peer_rpc_send_slot_waiters_[waiter]);
     }
   }
-  // Preserve at least two independently runnable contexts per executor, but
-  // keep production on the measured legacy target. Across the ten August 18
-  // runs, context-rate * tasks/context predicts throughput within 1.7%, while
-  // transport waves grew linearly with target size. The first target-four
-  // deployment then produced 15 promotions, 16 rollbacks, and zero accepted
-  // windows. Retrying that experiment cannot remove a dependency round; it
-  // only lets its bounded wait leak into measurement. The controller and its
-  // fuse remain available to focused policy tests, while the runtime uses the
-  // stable two-item label. Sparse arrivals flush immediately; only a measured
-  // pressure interval pays the original bounded 50 us collection delay.
+  // Bound a context by the registered wire/scratch capacity while leaving
+  // enough accepted descriptors to feed independently runnable executors.
+  // Production must expose the full safe limit to the backlog-driven 8/16/32
+  // policy. Clamping this value to two recreates the completion-clocked stream
+  // even after foreground acceptance has been decoupled from active contexts.
   const size_t concurrency_safe_packing_limit = std::min<size_t>(
     std::max<u32>(1, config.storage_owner_batch_max),
     std::max<size_t>(
       2, storage_owner_maintenance_admission_limit_ /
            std::max<size_t>(1, static_cast<size_t>(worker_count) * 2)));
-  const size_t adaptive_packing_limit = std::min<size_t>(
-    2, concurrency_safe_packing_limit);
+  const size_t production_packing_limit = concurrency_safe_packing_limit;
   storage_owner_stage2_larger_batch_trials_possible_ =
-    adaptive_packing_limit >= 4;
+    production_packing_limit >= kStage2BulkMinimumBatch;
   storage_owner_stage2_packing_.reset(
-    adaptive_packing_limit,
+    production_packing_limit,
     config.storage_owner_stage2_batch_max_wait_us);
   // The 185634 production run issued no independent-score RPCs, yet every
   // admitted context still took the controller mutex, allocated a generation
@@ -472,14 +465,13 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                " (shared per-peer work-conserving aggregation)");
   print_status("storage-owner maintenance tuning: protocol=centroid-home-two-stage"
                " compaction_batch_target=" + std::to_string(config.storage_owner_batch_max) +
-               " adaptive_pack_target=legacy_2_verified"
-               " adaptive_pack_max_wait_us=" +
-               std::to_string(kStage2AdaptivePackingMaxWaitUs) +
-               " adaptive_pack_concurrency_cap=" +
-               std::to_string(adaptive_packing_limit) +
+               " packing_policy=visible_backlog_ladder_8_16_32"
+               " packing_tail_wait_us=arrival_adaptive_1000_25000" +
+               " packing_context_limit=" +
+               std::to_string(production_packing_limit) +
                " backlog_limit=" +
                std::to_string(config.storage_owner_maintenance_queue_depth) +
-               " admission_credit=exact_incomplete" +
+               " admission_credit=bounded_accepted_backlog" +
                " admission_window=" +
                std::to_string(storage_owner_maintenance_admission_limit_) +
                " physical_completion_capacity=" +
@@ -1346,6 +1338,25 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(ratio_or_zero(stage2_batched_items, stage2_batches)) +
                " packing_target_batch=" +
                std::to_string(stage2_packing.target_batch) +
+               " packing_admit_queue_avg=" +
+               std::to_string(ratio_or_zero(
+                 stage2_packing.admitted_queue_depth_sum,
+                 stage2_batches)) +
+               " packing_admit_queue_max=" +
+               std::to_string(stage2_packing.admitted_queue_depth_max) +
+               " packing_batch_1_7=" +
+               std::to_string(stage2_packing.batch_1_to_7) +
+               " packing_batch_8_15=" +
+               std::to_string(stage2_packing.batch_8_to_15) +
+               " packing_batch_16_31=" +
+               std::to_string(stage2_packing.batch_16_to_31) +
+               " packing_batch_32_plus=" +
+               std::to_string(stage2_packing.batch_32_plus) +
+               " packing_bulk_assembly_batches=" +
+               std::to_string(stage2_packing.bulk_assembly_batches) +
+               " packing_bulk_assembly_wait_ms=" +
+               std::to_string(static_cast<double>(
+                 stage2_packing.bulk_assembly_wait_ns) / 1e6) +
                " packing_arrival_interval_us=" +
                std::to_string(stage2_packing.estimated_arrival_interval_us) +
                " packing_waited_batches=" +

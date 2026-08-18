@@ -1095,9 +1095,9 @@ bool MemoryNode::arm_local_stage1_items(
       first_sequence = arm_storage_owner_maintenance_batch(
         tasks, config, &capacity_blocked);
       if (first_sequence == 0) {
-        // Queue/completion admission is try-only. No task was consumed and no
-        // sequence was published, so restore every claimed heavy artifact and
-        // let the bounded Stage1 control retry path back off before rearming.
+        // The cancellable accepted-backlog reservation consumed neither a
+        // task nor a sequence. Restore every claimed heavy artifact and let
+        // the bounded Stage1 control retry path back off before rearming.
         lib_assert(tasks.size() == claimed.size(),
                    "failed atomic Stage1 admission changed batch ownership");
         for (size_t item = 0; item < claimed.size(); ++item) {
