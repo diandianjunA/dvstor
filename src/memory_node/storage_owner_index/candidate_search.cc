@@ -2113,8 +2113,13 @@ MemoryNode::advance_stage2_search_candidates_batched(
       return Stage2SearchAdvanceResult::complete;
     }
 
+    // pending_expand_request() is a per-search dependency fence: a search is
+    // in either score or expand phase, never both. Do not gate cache commit on
+    // every other search in this batched context having no pending scores.
+    // That global gate caused 130809 to refetch an authoritative graph for A
+    // while unrelated B was scoring, wasting every ordered cache entry and
+    // disabling the controller during warm-up.
     if (state.phase == Stage2SearchIoPhase::idle &&
-        state.continuation.pending_score_requests().empty() &&
         commit_prefetched_graph()) {
       idle_attempt_mask = 0;
       continue;
