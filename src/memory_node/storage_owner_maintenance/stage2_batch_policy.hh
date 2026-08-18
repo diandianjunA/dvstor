@@ -42,6 +42,16 @@ inline constexpr std::uint64_t kStage2PackingMaxProbeIntervalWindows = 64;
 inline constexpr std::size_t kStage2BulkMinimumBatch = 8;
 inline constexpr std::size_t kStage2BulkMiddleBatch = 16;
 inline constexpr std::size_t kStage2BulkMaximumBatch = 32;
+// A visible backlog may be collected and scheduled in 16/32-item cohorts,
+// but the current Stage2 state machine is not a per-item pipeline yet.  One
+// Stage2Context crosses authority, freeze/prune, reconcile, placement and
+// membership barriers as a unit; a retryable item therefore stalls every
+// sibling in that context.  Keep the semantic execution slice at eight until
+// those barriers can detach completed/blocked items independently.  This
+// still exposes a 4x larger batch than the old two-item completion clock while
+// allowing a deep accepted queue to become several independently progressing
+// contexts instead of one convoy.
+inline constexpr std::size_t kStage2SemanticExecutionBatch = 8;
 // A background tail must remain in the accepted queue long enough for the
 // next arrivals to join it.  The old 50 us execution-credit deadline is far
 // shorter than the measured 1--3 ms per-node arrival interval and therefore
@@ -54,6 +64,15 @@ inline constexpr std::uint32_t kStage2BulkTailMaxWaitUs = 25'000;
 inline constexpr bool stage2_bulk_packing_enabled(
     std::size_t configured_batch_limit) {
   return configured_batch_limit >= kStage2BulkMinimumBatch;
+}
+
+inline constexpr std::size_t stage2_execution_slice_limit(
+    std::size_t selected_pop_limit,
+    std::size_t configured_batch_limit) {
+  return std::max<std::size_t>(1, std::min({
+    std::max<std::size_t>(1, selected_pop_limit),
+    std::max<std::size_t>(1, configured_batch_limit),
+    kStage2SemanticExecutionBatch}));
 }
 
 // Select from already-visible work only.  In particular, this helper never

@@ -110,6 +110,14 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
       completion_capacity);
   lib_assert(storage_owner_maintenance_admission_limit_ != 0,
              "Stage2 accepted descriptor window is empty");
+  const size_t active_task_limit = stage2_active_task_limit(
+    worker_count, kStage2SemanticExecutionBatch,
+    storage_owner_maintenance_admission_limit_);
+  lib_assert(active_task_limit != 0 &&
+               active_task_limit <= std::numeric_limits<u32>::max(),
+             "Stage2 active-task limit is outside its counter range");
+  storage_owner_maintenance_active_task_limit_ =
+    static_cast<u32>(active_task_limit);
   storage_owner_maintenance_intent_capacity_ = completion_capacity;
   storage_owner_maintenance_intents_ =
     std::make_unique<StorageOwnerMaintenanceIntent[]>(completion_capacity);
@@ -285,6 +293,7 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   physical_stage1_remote_frontier_items_.store(0, std::memory_order_relaxed);
   physical_stage1_neighbors_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_active_workers_.store(0, std::memory_order_relaxed);
+  storage_owner_maintenance_active_tasks_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_finalize_latency_ns_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_finalize_max_latency_ns_.store(0, std::memory_order_relaxed);
   for (auto& bucket : storage_owner_maintenance_finalize_latency_buckets_) {
@@ -302,6 +311,8 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
       .shard_id = storage_id_,
       .published_steady_ns = steady_now_ns(),
       .admission_window = storage_owner_maintenance_admission_limit_,
+      .active_stage2_task_limit =
+        storage_owner_maintenance_active_task_limit_,
     });
   const u64 previous_runtime_epoch =
     storage_owner_maintenance_runtime_epoch_counter_.fetch_add(
@@ -452,10 +463,14 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                " (configured=" + std::to_string(config.storage_owner_maintenance_workers) +
                ", admission_baseline_workers=" +
                std::to_string(cpu_plan.maintenance_admission_workers) +
-               ", pressure_context_limit=" +
+               ", context_limit=" +
                std::to_string(stage2_context_admission_limit(
                  worker_count, contexts_per_worker,
-                 true)) +
+                 false)) +
+               ", active_task_limit=" +
+               std::to_string(storage_owner_maintenance_active_task_limit_) +
+               ", semantic_execution_batch=" +
+               std::to_string(kStage2SemanticExecutionBatch) +
                ", work_conserving=true)");
   print_status("storage-owner stage2 reverse outbox descriptors: " +
                std::to_string(storage_owner_reverse_outbox_->capacity()) +
@@ -518,6 +533,12 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
       worker.join();
     }
   }
+  lib_assert(storage_owner_maintenance_active_workers_.load(
+               std::memory_order_acquire) == 0,
+             "Stage2 executor stopped with a live context");
+  lib_assert(storage_owner_maintenance_active_tasks_.load(
+               std::memory_order_acquire) == 0,
+             "Stage2 executor stopped with a live active-task reservation");
   for (auto& queue : storage_owner_maintenance_ready_queue_active_) {
     queue.store(nullptr, std::memory_order_release);
   }
@@ -925,6 +946,11 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
     : 0.0;
   const u64 active_contexts =
     storage_owner_maintenance_active_workers_.load(std::memory_order_acquire);
+  const u64 active_stage2_tasks =
+    storage_owner_maintenance_active_tasks_.load(std::memory_order_acquire);
+  lib_assert(active_stage2_tasks <=
+               storage_owner_maintenance_active_task_limit_,
+             "Stage2 active-task telemetry exceeded its execution limit");
   const u64 repair_remaining = storage_owner_repair_tasks_ == nullptr
     ? 0
     : static_cast<u64>(storage_owner_repair_tasks_->approximate_size());
@@ -1040,6 +1066,9 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   telemetry_snapshot.maintenance_broadcast_wakes = broadcast_wakes;
   telemetry_snapshot.maintenance_context_slots_scanned =
     context_slots_scanned;
+  telemetry_snapshot.active_stage2_tasks = active_stage2_tasks;
+  telemetry_snapshot.active_stage2_task_limit =
+    storage_owner_maintenance_active_task_limit_;
   telemetry_snapshot.packing_target_batch = stage2_packing.target_batch;
   telemetry_snapshot.packing_arrival_interval_us =
     stage2_packing.estimated_arrival_interval_us;
@@ -1520,6 +1549,10 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(cleanup_remaining) +
                " active_contexts=" +
                std::to_string(active_contexts) +
+               " active_stage2_tasks=" +
+               std::to_string(active_stage2_tasks) +
+               " active_stage2_task_limit=" +
+               std::to_string(storage_owner_maintenance_active_task_limit_) +
                " repair_remaining=" +
                std::to_string(repair_remaining) +
                " remaining=" + std::to_string(remaining));

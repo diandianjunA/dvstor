@@ -1542,6 +1542,11 @@ private:
   std::atomic<u64> storage_owner_maintenance_worker_idle_waits_{0};
   std::atomic<u64> storage_owner_maintenance_worker_idle_ns_{0};
   std::atomic<u32> storage_owner_maintenance_active_workers_{0};
+  // Exact number of finalize-insert descriptors currently owned by active
+  // Stage2 contexts. Accepted descriptors that remain in the queue are not
+  // counted: this is background execution pressure, never Stage1 ACK credit.
+  std::atomic<u32> storage_owner_maintenance_active_tasks_{0};
+  u32 storage_owner_maintenance_active_task_limit_{};
   std::atomic<u64> storage_owner_maintenance_started_ns_{0};
   std::atomic<u64> storage_owner_maintenance_last_observation_ns_{0};
   std::atomic<u64> storage_owner_maintenance_finalize_latency_ns_{0};

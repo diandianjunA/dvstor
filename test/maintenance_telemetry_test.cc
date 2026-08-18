@@ -41,6 +41,8 @@ int main() {
     .completion_incomplete = 6,
     .completion_logical_full_failures = 7,
     .completion_physical_full_failures = 1,
+    .active_stage2_tasks = 17,
+    .active_stage2_task_limit = 256,
   };
   first.stage2_delay_histogram[6] = 12;
   telemetry::publish(control_page.data(), first);
@@ -71,6 +73,8 @@ int main() {
   assert(copied.completion_incomplete == 6);
   assert(copied.completion_logical_full_failures == 7);
   assert(copied.completion_physical_full_failures == 1);
+  assert(copied.active_stage2_tasks == 17);
+  assert(copied.active_stage2_task_limit == 256);
 
   telemetry::Snapshot second = first;
   second.published_steady_ns = 200;

@@ -1076,7 +1076,9 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     drain_storage_maintenance("measure");
 
   MaintenanceLogSummary maintenance_summary;
+  MaintenanceLogSummary maintenance_storage_log_summary;
   bool in_band_maintenance_telemetry = false;
+  bool storage_log_maintenance_telemetry = false;
   if (!maintenance_snapshot_begin.empty()) {
     try {
       const auto maintenance_snapshot_end =
@@ -1095,11 +1097,42 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
                    "unavailable: " << error.what() << std::endl;
     }
   }
-  if (!in_band_maintenance_telemetry && !maintenance_log_cursors.empty()) {
+  if (!maintenance_log_cursors.empty()) {
     const auto measurement_end = snapshot_maintenance_logs(
       args.storage_maintenance_logs);
-    maintenance_summary = summarize_maintenance_log_window(
+    maintenance_storage_log_summary = summarize_maintenance_log_window(
       maintenance_log_cursors, measurement_end);
+    storage_log_maintenance_telemetry = true;
+    if (!in_band_maintenance_telemetry) {
+      maintenance_summary = maintenance_storage_log_summary;
+    }
+  }
+  std::string active_stage2_task_gauge_source = "unavailable";
+  if (storage_log_maintenance_telemetry &&
+      maintenance_storage_log_summary.active_stage2_task_gauge_available) {
+    // The in-band control page is sampled only at the measurement window's
+    // endpoints. Periodic storage-log observations therefore provide the
+    // meaningful high-water mark for these gauges when both are available.
+    maintenance_summary.active_stage2_task_gauge_available = true;
+    maintenance_summary.logs_with_active_stage2_task_gauges =
+      maintenance_storage_log_summary.logs_with_active_stage2_task_gauges;
+    maintenance_summary.active_stage2_tasks_peak_observed_sum =
+      maintenance_storage_log_summary
+        .active_stage2_tasks_peak_observed_sum;
+    maintenance_summary.active_stage2_tasks_latest_sum =
+      maintenance_storage_log_summary.active_stage2_tasks_latest_sum;
+    maintenance_summary.active_stage2_task_limit_sum =
+      maintenance_storage_log_summary.active_stage2_task_limit_sum;
+    maintenance_summary.max_active_stage2_tasks_observed_per_shard =
+      maintenance_storage_log_summary
+        .max_active_stage2_tasks_observed_per_shard;
+    maintenance_summary.max_active_stage2_task_limit_per_shard =
+      maintenance_storage_log_summary
+        .max_active_stage2_task_limit_per_shard;
+    active_stage2_task_gauge_source = "storage_logs";
+  } else if (in_band_maintenance_telemetry &&
+             maintenance_summary.active_stage2_task_gauge_available) {
+    active_stage2_task_gauge_source = "in_band_control_page_endpoints";
   }
 
   const gpu_search::TelemetrySnapshot final_gpu_telemetry =
@@ -1552,6 +1585,20 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
      maintenance_summary.completion_physical_full_failures},
     {"completion_admission_failure_delta_available",
      maintenance_summary.completion_admission_failure_delta_available},
+    {"active_stage2_task_gauge_available",
+     maintenance_summary.active_stage2_task_gauge_available},
+    {"active_stage2_task_gauge_source",
+     active_stage2_task_gauge_source},
+    {"active_stage2_tasks_peak_observed_sum",
+     maintenance_summary.active_stage2_tasks_peak_observed_sum},
+    {"active_stage2_tasks_latest_sum",
+     maintenance_summary.active_stage2_tasks_latest_sum},
+    {"active_stage2_task_limit_sum",
+     maintenance_summary.active_stage2_task_limit_sum},
+    {"max_active_stage2_tasks_observed_per_shard",
+     maintenance_summary.max_active_stage2_tasks_observed_per_shard},
+    {"max_active_stage2_task_limit_per_shard",
+     maintenance_summary.max_active_stage2_task_limit_per_shard},
     {"completion_window_available",
      maintenance_summary.completion_window_available},
     {"locality_delta_available",

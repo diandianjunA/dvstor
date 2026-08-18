@@ -35,6 +35,8 @@ struct MaintenanceObservation {
   uint64_t completion_incomplete{};
   uint64_t completion_logical_full_failures{};
   uint64_t completion_physical_full_failures{};
+  uint64_t active_stage2_tasks{};
+  uint64_t active_stage2_task_limit{};
   uint64_t stage2_continuations{};
   uint64_t stage2_remote_frontier_items{};
   uint64_t stage2_remote_expansions{};
@@ -103,6 +105,7 @@ struct MaintenanceObservation {
   bool completion_window_available{};
   bool exact_completion_credit_available{};
   bool completion_admission_failure_counters_available{};
+  bool active_stage2_task_gauge_available{};
   bool locality_counters_available{};
   bool search_budget_counters_available{};
   bool independent_score_counters_available{};
@@ -140,6 +143,14 @@ struct MaintenanceLogSummary {
   uint64_t max_completion_incomplete_per_shard{};
   uint64_t completion_logical_full_failures{};
   uint64_t completion_physical_full_failures{};
+  // Each storage shard publishes these values as gauges rather than
+  // monotonic counters. Summing each shard's observed peak gives a
+  // conservative cluster-wide high-water mark for the measured window.
+  uint64_t active_stage2_tasks_peak_observed_sum{};
+  uint64_t active_stage2_tasks_latest_sum{};
+  uint64_t active_stage2_task_limit_sum{};
+  uint64_t max_active_stage2_tasks_observed_per_shard{};
+  uint64_t max_active_stage2_task_limit_per_shard{};
   uint64_t stage2_finalized_live{};
   uint64_t stage2_continuations{};
   uint64_t stage2_remote_frontier_items{};
@@ -218,6 +229,7 @@ struct MaintenanceLogSummary {
   size_t logs_with_completion_window{};
   size_t logs_with_exact_completion_credit{};
   size_t logs_with_completion_admission_failure_deltas{};
+  size_t logs_with_active_stage2_task_gauges{};
   size_t logs_with_locality_deltas{};
   size_t logs_with_search_budget_deltas{};
   size_t logs_with_execution_counter_deltas{};
@@ -232,6 +244,7 @@ struct MaintenanceLogSummary {
   bool completion_window_available{};
   bool exact_completion_credit_available{};
   bool completion_admission_failure_delta_available{};
+  bool active_stage2_task_gauge_available{};
   bool locality_delta_available{};
   bool search_budget_delta_available{};
   bool execution_counter_delta_available{};

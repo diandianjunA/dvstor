@@ -21,8 +21,10 @@ inline constexpr u64 kMagic = 0x31544d43565344ULL;  // "DSVCMT1"
 // unfinished service credit separately from the contiguous physical span and
 // distinguishes logical-credit stalls from physical-ring stalls. Version 9
 // reports owner-directed, shared-capacity, and broadcast wake traffic plus
-// the context-slot scans they induce.
-inline constexpr u32 kVersion = 9;
+// the context-slot scans they induce. Version 10 reports the exact number of
+// finalize descriptors currently owned by active Stage2 contexts and its
+// independent execution limit.
+inline constexpr u32 kVersion = 10;
 inline constexpr u32 kValidCounters = 1u << 0;
 inline constexpr size_t kLatencyBucketCount = 18;
 inline constexpr size_t kStage2PhaseCount = 6;
@@ -136,6 +138,8 @@ struct alignas(64) Snapshot {
   u64 maintenance_generic_wakes{};
   u64 maintenance_broadcast_wakes{};
   u64 maintenance_context_slots_scanned{};
+  u64 active_stage2_tasks{};
+  u64 active_stage2_task_limit{};
 };
 
 static_assert(kSnapshotOffset == 192);

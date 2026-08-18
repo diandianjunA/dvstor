@@ -101,6 +101,16 @@ void test_visible_backlog_uses_8_16_32_ladder_without_wait() {
   assert(thirty_two.target_batch == 32);
   assert(thirty_two.pop_limit == 32);
   assert(thirty_two.wait_budget_us == 0);
+
+  // The queue-level ladder is deliberately distinct from the semantic
+  // Stage2Context size.  Current context phases still contain whole-context
+  // barriers, so deep 16/32 cohorts are split into independently progressing
+  // eight-item execution slices.
+  assert(detail::stage2_execution_slice_limit(32, 32) == 8);
+  assert(detail::stage2_execution_slice_limit(16, 32) == 8);
+  assert(detail::stage2_execution_slice_limit(8, 32) == 8);
+  assert(detail::stage2_execution_slice_limit(4, 4) == 4);
+  assert(detail::stage2_execution_slice_limit(1, 32) == 1);
 }
 
 void test_bulk_tail_waits_in_queue_until_eight_or_bounded_deadline() {

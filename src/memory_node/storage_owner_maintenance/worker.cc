@@ -102,6 +102,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     size_t packing_debt_at_admission{};
     u32 packing_target_batch{1};
     bool packing_high_pressure{};
+    // Exact node-wide execution-budget claim made before descriptors leave
+    // storage_owner_stage2_tasks_. It deliberately survives task filtering
+    // inside the context and is returned only when the context is retired.
+    u32 active_task_reservation{};
     IndependentScoreSample independent_score_sample{};
   };
 
@@ -302,6 +306,15 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     return true;
   };
 
+  const auto release_active_task_reservation = [&](Stage2Context& context) {
+    if (context.active_task_reservation == 0) return;
+    const u32 released = context.active_task_reservation;
+    context.active_task_reservation = 0;
+    lib_assert(try_release_stage2_active_tasks(
+                 storage_owner_maintenance_active_tasks_, released),
+               "Stage2 active-task reservation underflow");
+  };
+
   const auto reset_context = [&](Stage2Context& context) {
     auto* const previous_waiter_registrations =
       current_storage_owner_maintenance_waiter_registrations_;
@@ -363,6 +376,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     }
     context.search_io.reset();
     context.reconcile_batch.clear();
+    release_active_task_reservation(context);
     context.active = false;
     context.tasks.clear();
     context.targets.clear();
@@ -391,6 +405,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     context.packing_debt_at_admission = 0;
     context.packing_target_batch = 1;
     context.packing_high_pressure = false;
+    context.active_task_reservation = 0;
     context.independent_score_sample = {};
     context.finalize_subphase = Stage2FinalizeSubphase::prepare;
     current_storage_owner_maintenance_waiter_registrations_ =
@@ -3455,11 +3470,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       return nullptr;
     }
 
-    Stage2Context& context = *acquire_context();
-    context.kind = choose_stage2
-      ? StorageOwnerMaintenanceKind::finalize_insert
-      : StorageOwnerMaintenanceKind::cleanup_deleted_node;
-
+    Stage2Context* admitted_context = nullptr;
     if (choose_stage2) {
       const size_t queued_at_admission =
         storage_owner_stage2_tasks_.size();
@@ -3470,14 +3481,40 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           std::max<std::chrono::steady_clock::duration>(
             std::chrono::steady_clock::duration::zero(),
             admission_now - oldest_queued_at)).count());
-      const size_t pop_limit = std::min(
+      const size_t selected_pop_limit = std::min(
         batch_limit, std::max<size_t>(1, packing_decision.pop_limit));
+      const size_t pop_limit = stage2_execution_slice_limit(
+        selected_pop_limit, batch_limit);
+      const size_t actual_pop_count = std::min(
+        pop_limit, storage_owner_stage2_tasks_.size());
+      lib_assert(actual_pop_count != 0 &&
+                   actual_pop_count <= std::numeric_limits<u32>::max(),
+                 "Stage2 execution slice does not fit its task budget");
+      const u32 task_reservation = static_cast<u32>(actual_pop_count);
+      // Claim the complete semantic slice before removing its descriptors.
+      // A failed claim leaves every task visible and batchable in the queue;
+      // this execution budget never participates in Stage1 ACK admission.
+      if (!try_reserve_stage2_active_tasks(
+            storage_owner_maintenance_active_tasks_, task_reservation,
+            storage_owner_maintenance_active_task_limit_)) {
+        storage_owner_maintenance_active_workers_.fetch_sub(
+          1, std::memory_order_acq_rel);
+        storage_owner_maintenance_pressure_yields_.fetch_add(
+          1, std::memory_order_relaxed);
+        return nullptr;
+      }
+      admitted_context = acquire_context();
+      Stage2Context& context = *admitted_context;
+      context.kind = StorageOwnerMaintenanceKind::finalize_insert;
+      context.active_task_reservation = task_reservation;
       while (!storage_owner_stage2_tasks_.empty() &&
              context.tasks.size() < pop_limit) {
         context.tasks.push_back(
           std::move(storage_owner_stage2_tasks_.front()));
         storage_owner_stage2_tasks_.pop_front();
       }
+      lib_assert(context.tasks.size() == task_reservation,
+                 "Stage2 queue pop diverged from its active-task reservation");
       context.packing_admitted_ns = steady_now_ns();
       context.packing_wait_ns = packing_decision.wait_budget_us == 0 ? 0 :
         std::min<u64>(
@@ -3504,6 +3541,9 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       storage_owner_stage2_batched_items_.fetch_add(
         context.tasks.size(), std::memory_order_relaxed);
     } else {
+      admitted_context = acquire_context();
+      Stage2Context& context = *admitted_context;
+      context.kind = StorageOwnerMaintenanceKind::cleanup_deleted_node;
       storage_owner_stage2_packing_.observe_admission(
         Stage2PackingFlushReason::cleanup, 0, 0, 0);
       while (!storage_owner_cleanup_tasks_.empty() &&
@@ -3518,6 +3558,9 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           cleanup_schedule_pop(storage_owner_cleanup_tasks_));
       }
     }
+    lib_assert(admitted_context != nullptr,
+               "Stage2 admission lost its context");
+    Stage2Context& context = *admitted_context;
     lock.unlock();
     // Removing descriptors from the bounded runnable queue is an admission
     // edge just like completing a Stage2 sequence. Wake a parked Stage1 arm
@@ -3621,6 +3664,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           context.search_lane_wait_registered);
         clear_all_current_storage_owner_maintenance_waiters();
         release_context_lane(context);
+        // Shutdown abandons the context rather than passing through the
+        // normal reset/finalize path, so return its exact execution claim
+        // here before retiring the context owner.
+        release_active_task_reservation(context);
         // Invalidate every logical home-RPC member before invalidating its
         // OwnerKey. A late aggregate response then suppresses this member
         // instead of publishing an owned payload to a retired context slot.

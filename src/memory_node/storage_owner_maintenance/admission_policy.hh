@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -39,23 +40,21 @@ inline std::size_t stage2_accepted_sequence_limit(
   return std::min(maintenance_queue_depth, completion_capacity);
 }
 
-// Foreground pressure may reduce asynchronous Stage2 concurrency, but it must
-// never collapse the pipeline to one context per executor. Logical search
-// state is context-owned, and a context waiting on a home RPC releases its
-// registered RDMA lane. Keep four bounded contexts per worker under foreground
-// pressure: two can run while two wait for home/reverse responses. Restore the
-// full per-worker RPC depth otherwise.
-// The existing global/per-peer RDMA credits still bound posted work, while a
-// depth-one configuration naturally retains the original single-context
-// floor.
+// Stage2 contexts are execution resources, not foreground acceptance credit.
+// Keep their bound stable across foreground and drain: expanding from four to
+// the full RPC depth when the foreground becomes idle moved thousands of
+// tasks out of the visible queue into whole-context barrier chains, precisely
+// when drain needed bounded independent work. The existing global/per-peer
+// RDMA credits still bound posted work, while a depth-one configuration
+// naturally retains the original single-context floor.
 inline std::size_t stage2_context_admission_limit(
     std::size_t maintenance_workers,
     std::size_t rpc_depth,
     bool foreground_pressure) {
+  (void)foreground_pressure;
   const std::size_t workers = std::max<std::size_t>(1, maintenance_workers);
   const std::size_t depth = std::max<std::size_t>(1, rpc_depth);
-  const std::size_t contexts_per_worker = foreground_pressure
-    ? std::min<std::size_t>(depth, 4) : depth;
+  const std::size_t contexts_per_worker = std::min<std::size_t>(depth, 4);
   return saturating_admission_multiply(workers, contexts_per_worker);
 }
 
@@ -69,8 +68,74 @@ inline std::size_t stage2_context_admission_limit(
 inline std::size_t stage2_worker_context_admission_limit(
     std::size_t rpc_depth,
     bool foreground_pressure) {
+  (void)foreground_pressure;
   const std::size_t depth = std::max<std::size_t>(1, rpc_depth);
-  return foreground_pressure ? std::min<std::size_t>(depth, 4) : depth;
+  return std::min<std::size_t>(depth, 4);
+}
+
+// Active Stage2 tasks are a second, node-wide execution bound. Context count
+// alone was insufficient while one context could consume a 16/32-item cohort:
+// even 32 contexts could hide 1024 coupled search/prune chains from the queue.
+// Budget four eight-task semantic slices per executor (256 tasks for the
+// tested 8-worker production geometry) and leave later accepted descriptors
+// visible. This is deliberately unrelated to Stage1 ACK admission; the exact
+// task account also remains correct if later scheduling changes make context
+// sizes non-uniform.
+inline constexpr std::size_t kStage2ActiveTaskContextsPerWorker = 4;
+
+inline std::size_t stage2_active_task_limit(
+    std::size_t maintenance_workers,
+    std::size_t semantic_execution_batch,
+    std::size_t accepted_descriptor_limit) {
+  const std::size_t workers = std::max<std::size_t>(1, maintenance_workers);
+  const std::size_t batch = std::max<std::size_t>(1,
+                                                   semantic_execution_batch);
+  const std::size_t contexts = saturating_admission_multiply(
+    workers, kStage2ActiveTaskContextsPerWorker);
+  return std::min(
+    accepted_descriptor_limit,
+    saturating_admission_multiply(contexts, batch));
+}
+
+inline bool stage2_active_task_reservation_available(
+    std::uint32_t active_tasks,
+    std::uint32_t requested_tasks,
+    std::uint32_t limit) {
+  return requested_tasks != 0 && active_tasks <= limit &&
+    requested_tasks <= limit - active_tasks;
+}
+
+inline bool try_reserve_stage2_active_tasks(
+    std::atomic<std::uint32_t>& active_tasks,
+    std::uint32_t requested_tasks,
+    std::uint32_t limit) {
+  std::uint32_t active = active_tasks.load(std::memory_order_acquire);
+  while (stage2_active_task_reservation_available(
+      active, requested_tasks, limit)) {
+    if (active_tasks.compare_exchange_weak(
+          active, active + requested_tasks,
+          std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool try_release_stage2_active_tasks(
+    std::atomic<std::uint32_t>& active_tasks,
+    std::uint32_t released_tasks) {
+  if (released_tasks == 0) return false;
+  std::uint32_t active = active_tasks.load(std::memory_order_acquire);
+  while (released_tasks <= active) {
+    if (active_tasks.compare_exchange_weak(
+          active, active - released_tasks,
+          std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Credit-return callbacks can race and observe the same completion-ring

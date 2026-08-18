@@ -315,7 +315,10 @@ void test_maintenance_log_window() {
                                uint64_t failed,
                                uint64_t peer_failed,
                                const Histogram& histogram,
-                               bool include_packing = true) {
+                               bool include_packing = true,
+                               uint64_t active_stage2_tasks = 0,
+                               uint64_t active_stage2_task_limit = 256,
+                               bool include_active_stage2_task_gauge = true) {
     output << "[STATUS]: storage-owner maintenance observation: "
            << "stage2_enqueued=" << enqueued << ' '
            << "stage2_finalized_live=" << completed << " stale=0 "
@@ -327,7 +330,13 @@ void test_maintenance_log_window() {
            << "completion_outstanding=" << remaining << ' '
            << "completion_incomplete=" << remaining / 2 << ' '
            << "completion_logical_full_failures=" << completed * 5 << ' '
-           << "completion_physical_full_failures=" << completed << ' '
+           << "completion_physical_full_failures=" << completed << ' ';
+    if (include_active_stage2_task_gauge) {
+      output << "active_stage2_tasks=" << active_stage2_tasks << ' '
+             << "active_stage2_task_limit="
+             << active_stage2_task_limit << ' ';
+    }
+    output
            << "stage2_continuations=" << completed << ' '
            << "stage2_remote_frontier_items=" << completed * 2 << ' '
            << "stage2_remote_expansions=" << completed * 3 << ' '
@@ -382,11 +391,14 @@ void test_maintenance_log_window() {
   {
     std::ofstream output(path, std::ios::app);
     histogram[2] = 20;
-    write_observation(output, 100, 90, 10, 9, 3, histogram);
+    write_observation(output, 100, 90, 10, 9, 3, histogram,
+                      true, 17, 256);
     histogram[2] = 60;
-    write_observation(output, 200, 195, 5, 9, 3, histogram);
+    write_observation(output, 200, 195, 5, 9, 3, histogram,
+                      true, 31, 256);
     histogram[2] = 100;
-    write_observation(output, 300, 300, 0, 10, 7, histogram);
+    write_observation(output, 300, 300, 0, 10, 7, histogram,
+                      true, 0, 256);
   }
 
   const auto post_stop =
@@ -447,6 +459,13 @@ void test_maintenance_log_window() {
   assert(summary.completion_admission_failure_delta_available);
   assert(summary.completion_logical_full_failures == 1'500);
   assert(summary.completion_physical_full_failures == 300);
+  assert(summary.active_stage2_task_gauge_available);
+  assert(summary.logs_with_active_stage2_task_gauges == 1);
+  assert(summary.active_stage2_tasks_peak_observed_sum == 31);
+  assert(summary.active_stage2_tasks_latest_sum == 0);
+  assert(summary.active_stage2_task_limit_sum == 256);
+  assert(summary.max_active_stage2_tasks_observed_per_shard == 31);
+  assert(summary.max_active_stage2_task_limit_per_shard == 256);
   assert(summary.failure_delta_available);
   assert(summary.peer_reverse_retry_delta_available);
   assert(summary.p99_stage2_delay_available);
@@ -527,17 +546,22 @@ void test_maintenance_log_window() {
   // counters must remain distinguishable from a valid all-zero delta.
   {
     std::ofstream output(path, std::ios::trunc);
-    write_observation(output, 0, 0, 0, 0, 0, histogram, false);
+    write_observation(output, 0, 0, 0, 0, 0, histogram,
+                      false, 0, 256, false);
   }
   const auto legacy_begin =
     tools::breakdown_benchmark::snapshot_maintenance_logs({path.string()});
   {
     std::ofstream output(path, std::ios::app);
-    write_observation(output, 1, 1, 0, 0, 0, histogram, false);
+    write_observation(output, 1, 1, 0, 0, 0, histogram,
+                      false, 0, 256, false);
   }
   const auto legacy_summary =
     tools::breakdown_benchmark::summarize_maintenance_logs(legacy_begin);
   assert(!legacy_summary.packing_delta_available);
+  assert(!legacy_summary.active_stage2_task_gauge_available);
+  assert(legacy_summary.active_stage2_tasks_peak_observed_sum == 0);
+  assert(legacy_summary.active_stage2_task_limit_sum == 0);
   assert(legacy_summary.packing_target_batch_max == 0);
   assert(legacy_summary.packing_waited_batches == 0);
 
@@ -631,6 +655,8 @@ void test_in_band_maintenance_snapshot_window() {
     begin[shard]->stage2_home_score_rpc_queries = 4;
     begin[shard]->stage2_home_score_rpc_request_bytes = 2'000;
     begin[shard]->stage2_home_score_rpc_response_bytes = 1'000;
+    begin[shard]->active_stage2_tasks = 3 + shard;
+    begin[shard]->active_stage2_task_limit = 256;
     end[shard] = *begin[shard];
     auto& latest = *end[shard];
     latest.sequence = 4;
@@ -714,6 +740,8 @@ void test_in_band_maintenance_snapshot_window() {
     latest.stage2_home_score_rpc_request_bytes += 20'000;
     latest.stage2_home_score_rpc_response_bytes += 10'000;
     latest.stage2_delay_histogram[8] = 20;
+    latest.active_stage2_tasks = 11 + shard;
+    latest.active_stage2_task_limit = 256;
   }
   const auto summary = tools::breakdown_benchmark::
     summarize_maintenance_snapshot_window(begin, end);
@@ -733,6 +761,13 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.exact_completion_credit_available);
   assert(summary.completion_incomplete == 2);
   assert(summary.max_completion_incomplete_per_shard == 1);
+  assert(summary.active_stage2_task_gauge_available);
+  assert(summary.logs_with_active_stage2_task_gauges == 2);
+  assert(summary.active_stage2_tasks_peak_observed_sum == 23);
+  assert(summary.active_stage2_tasks_latest_sum == 23);
+  assert(summary.active_stage2_task_limit_sum == 512);
+  assert(summary.max_active_stage2_tasks_observed_per_shard == 12);
+  assert(summary.max_active_stage2_task_limit_per_shard == 256);
   assert(summary.completion_admission_failure_delta_available);
   assert(summary.completion_logical_full_failures == 22);
   assert(summary.completion_physical_full_failures == 4);

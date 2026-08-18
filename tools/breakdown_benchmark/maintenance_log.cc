@@ -161,6 +161,10 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
     parse_u64(fields, "completion_logical_full_failures");
   const auto completion_physical_full_failures =
     parse_u64(fields, "completion_physical_full_failures");
+  const auto active_stage2_tasks =
+    parse_u64(fields, "active_stage2_tasks");
+  const auto active_stage2_task_limit =
+    parse_u64(fields, "active_stage2_task_limit");
   const auto stage2_continuations =
     parse_u64(fields, "stage2_continuations");
   const auto stage2_remote_frontier_items =
@@ -282,6 +286,8 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
       completion_logical_full_failures.value_or(0),
     .completion_physical_full_failures =
       completion_physical_full_failures.value_or(0),
+    .active_stage2_tasks = active_stage2_tasks.value_or(0),
+    .active_stage2_task_limit = active_stage2_task_limit.value_or(0),
     .stage2_continuations = stage2_continuations.value_or(0),
     .stage2_remote_frontier_items =
       stage2_remote_frontier_items.value_or(0),
@@ -369,6 +375,9 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
     .completion_admission_failure_counters_available =
       completion_logical_full_failures.has_value() &&
       completion_physical_full_failures.has_value(),
+    .active_stage2_task_gauge_available =
+      active_stage2_tasks.has_value() &&
+      active_stage2_task_limit.has_value(),
     .locality_counters_available = stage2_continuations.has_value() &&
       stage2_remote_frontier_items.has_value() &&
       stage2_remote_expansions.has_value() &&
@@ -605,6 +614,24 @@ MaintenanceLogSummary summarize_impl(
     if (latest.exact_completion_credit_available) {
       ++summary.logs_with_exact_completion_credit;
       summary.completion_incomplete += latest.completion_incomplete;
+    }
+    if (latest.active_stage2_task_gauge_available) {
+      uint64_t shard_peak = 0;
+      uint64_t shard_limit = 0;
+      for (const auto& observation : slice.observations) {
+        if (!observation.active_stage2_task_gauge_available) continue;
+        shard_peak = std::max(shard_peak, observation.active_stage2_tasks);
+        shard_limit = std::max(
+          shard_limit, observation.active_stage2_task_limit);
+      }
+      ++summary.logs_with_active_stage2_task_gauges;
+      summary.active_stage2_tasks_peak_observed_sum += shard_peak;
+      summary.active_stage2_tasks_latest_sum += latest.active_stage2_tasks;
+      summary.active_stage2_task_limit_sum += shard_limit;
+      summary.max_active_stage2_tasks_observed_per_shard = std::max(
+        summary.max_active_stage2_tasks_observed_per_shard, shard_peak);
+      summary.max_active_stage2_task_limit_per_shard = std::max(
+        summary.max_active_stage2_task_limit_per_shard, shard_limit);
     }
 
     if (!slice.rotated && cursor.baseline_available &&
@@ -923,6 +950,9 @@ MaintenanceLogSummary summarize_impl(
     summary.requested_logs != 0 &&
     summary.logs_with_completion_admission_failure_deltas ==
       summary.requested_logs;
+  summary.active_stage2_task_gauge_available =
+    summary.requested_logs != 0 &&
+    summary.logs_with_active_stage2_task_gauges == summary.requested_logs;
   summary.locality_delta_available = summary.requested_logs != 0 &&
     summary.logs_with_locality_deltas == summary.requested_logs;
   summary.search_budget_delta_available = summary.requested_logs != 0 &&
@@ -1056,6 +1086,22 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
     summary.max_completion_incomplete_per_shard = std::max(
       summary.max_completion_incomplete_per_shard,
       latest.completion_incomplete);
+    const uint64_t shard_active_stage2_tasks_peak = std::max(
+      first.active_stage2_tasks, latest.active_stage2_tasks);
+    const uint64_t shard_active_stage2_task_limit = std::max(
+      first.active_stage2_task_limit, latest.active_stage2_task_limit);
+    ++summary.logs_with_active_stage2_task_gauges;
+    summary.active_stage2_tasks_peak_observed_sum +=
+      shard_active_stage2_tasks_peak;
+    summary.active_stage2_tasks_latest_sum += latest.active_stage2_tasks;
+    summary.active_stage2_task_limit_sum +=
+      shard_active_stage2_task_limit;
+    summary.max_active_stage2_tasks_observed_per_shard = std::max(
+      summary.max_active_stage2_tasks_observed_per_shard,
+      shard_active_stage2_tasks_peak);
+    summary.max_active_stage2_task_limit_per_shard = std::max(
+      summary.max_active_stage2_task_limit_per_shard,
+      shard_active_stage2_task_limit);
     uint64_t logical_full = 0;
     uint64_t physical_full = 0;
     if (counter_delta(first.completion_logical_full_failures,
@@ -1447,6 +1493,9 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
     summary.requested_logs != 0 &&
     summary.logs_with_completion_admission_failure_deltas ==
       summary.requested_logs;
+  summary.active_stage2_task_gauge_available =
+    summary.requested_logs != 0 &&
+    summary.logs_with_active_stage2_task_gauges == summary.requested_logs;
   summary.locality_delta_available = summary.requested_logs != 0 &&
     summary.logs_with_locality_deltas == summary.requested_logs;
   summary.search_budget_delta_available = summary.requested_logs != 0 &&
