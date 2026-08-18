@@ -22,9 +22,8 @@ int main() {
     .remaining = 8,
     .stage2_continuations = 12,
     .stage2_remote_expansions = 44,
-    .stage2_graph_prefetch_predictions = 10,
-    .stage2_graph_prefetch_top1_hits = 6,
-    .stage2_graph_prefetch_top2_hits = 8,
+    .stage2_home_rpc_batches = 7,
+    .stage2_home_rpc_items = 19,
   };
   first.stage2_delay_histogram[6] = 12;
   telemetry::publish(control_page.data(), first);
@@ -38,8 +37,9 @@ int main() {
   assert(!telemetry::validate(copied, sequence_after, 2));
   assert(!telemetry::validate(copied, sequence_after + 2, 3));
   assert(copied.stage2_enqueued == 20);
-  assert(copied.stage2_graph_prefetch_top1_hits == 6);
   assert(copied.stage2_delay_histogram[6] == 12);
+  assert(copied.stage2_home_rpc_batches == 7);
+  assert(copied.stage2_home_rpc_items == 19);
 
   telemetry::Snapshot second = first;
   second.published_steady_ns = 200;

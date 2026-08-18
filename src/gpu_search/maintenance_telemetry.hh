@@ -15,7 +15,10 @@ namespace gpu_search::maintenance_telemetry {
 // unused tail of that page, so adding it neither changes header_bytes/version
 // nor requires rebuilding an existing index.
 inline constexpr u64 kMagic = 0x31544d43565344ULL;  // "DSVCMT1"
-inline constexpr u32 kVersion = 2;
+// Version 2 was used by the rejected next-adjacency predictor experiment.
+// Version 3 deliberately prevents a mixed deployment from interpreting those
+// fields as the existing home-RPC counters below.
+inline constexpr u32 kVersion = 3;
 inline constexpr u32 kValidCounters = 1u << 0;
 inline constexpr size_t kLatencyBucketCount = 18;
 inline constexpr size_t kStage2PhaseCount = 6;
@@ -61,9 +64,6 @@ struct alignas(64) Snapshot {
   u64 stage2_batched_items{};
   u64 stage2_graph_read_waves{};
   u64 stage2_graph_unique_reads{};
-  u64 stage2_graph_prefetch_predictions{};
-  u64 stage2_graph_prefetch_top1_hits{};
-  u64 stage2_graph_prefetch_top2_hits{};
   u64 stage2_vector_read_waves{};
   u64 stage2_vector_unique_reads{};
   std::array<u64, kLatencyBucketCount> stage2_delay_histogram{};
@@ -90,6 +90,9 @@ struct alignas(64) Snapshot {
   u64 physical_stage1_candidates{};
   u64 physical_stage1_remote_frontier_items{};
   u64 physical_stage1_neighbors{};
+  u64 stage2_home_rpc_batches{};
+  u64 stage2_home_rpc_items{};
+  u64 stage2_home_scored_neighbors{};
   u64 stage2_home_score_rpc_batches{};
   u64 stage2_home_score_rpc_items{};
   u64 stage2_home_score_rpc_queries{};

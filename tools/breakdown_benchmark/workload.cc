@@ -1487,6 +1487,18 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       static_cast<double>(elapsed_ns) /
       static_cast<double>(maintenance_summary.physical_stage1_items) / 1e3;
   };
+  const uint64_t graph_home_rpc_batches =
+    maintenance_summary.stage2_home_rpc_batches >=
+        maintenance_summary.stage2_home_score_rpc_batches
+      ? maintenance_summary.stage2_home_rpc_batches -
+          maintenance_summary.stage2_home_score_rpc_batches
+      : 0;
+  const uint64_t graph_home_rpc_items =
+    maintenance_summary.stage2_home_rpc_items >=
+        maintenance_summary.stage2_home_score_rpc_items
+      ? maintenance_summary.stage2_home_rpc_items -
+          maintenance_summary.stage2_home_score_rpc_items
+      : 0;
   const auto stage1_average_count = [&](uint64_t count) {
     return maintenance_summary.physical_stage1_items == 0 ? 0.0 :
       static_cast<double>(count) /
@@ -1587,38 +1599,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
      maintenance_summary.stage2_graph_read_waves == 0 ? 0.0 :
        static_cast<double>(maintenance_summary.stage2_graph_unique_reads) /
        static_cast<double>(maintenance_summary.stage2_graph_read_waves)},
-    {"graph_prefetch_prediction", {
-      {"counter_delta_available",
-       maintenance_summary.execution_counter_delta_available},
-      {"opportunities",
-       maintenance_summary.stage2_graph_prefetch_predictions},
-      {"top1_hits",
-       maintenance_summary.stage2_graph_prefetch_top1_hits},
-      {"top2_hits",
-       maintenance_summary.stage2_graph_prefetch_top2_hits},
-      {"top1_hit_ratio",
-       maintenance_summary.stage2_graph_prefetch_predictions == 0 ? 0.0 :
-         static_cast<double>(
-           maintenance_summary.stage2_graph_prefetch_top1_hits) /
-         static_cast<double>(
-           maintenance_summary.stage2_graph_prefetch_predictions)},
-      {"top2_hit_ratio",
-       maintenance_summary.stage2_graph_prefetch_predictions == 0 ? 0.0 :
-         static_cast<double>(
-           maintenance_summary.stage2_graph_prefetch_top2_hits) /
-         static_cast<double>(
-           maintenance_summary.stage2_graph_prefetch_predictions)},
-      {"top1_graph_wave_reduction_upper_bound",
-       maintenance_summary.stage2_graph_read_waves == 0 ? 0.0 :
-         static_cast<double>(
-           maintenance_summary.stage2_graph_prefetch_top1_hits) /
-         static_cast<double>(maintenance_summary.stage2_graph_read_waves)},
-      {"top2_graph_wave_reduction_upper_bound",
-       maintenance_summary.stage2_graph_read_waves == 0 ? 0.0 :
-         static_cast<double>(
-           maintenance_summary.stage2_graph_prefetch_top2_hits) /
-         static_cast<double>(maintenance_summary.stage2_graph_read_waves)},
-    }},
     {"stage2_vector_read_waves",
      maintenance_summary.stage2_vector_read_waves},
     {"stage2_vector_unique_reads",
@@ -1627,6 +1607,29 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
      maintenance_summary.stage2_vector_read_waves == 0 ? 0.0 :
        static_cast<double>(maintenance_summary.stage2_vector_unique_reads) /
        static_cast<double>(maintenance_summary.stage2_vector_read_waves)},
+    {"home_rpc_wire", {
+      {"counter_delta_available",
+       maintenance_summary.home_rpc_wire_counter_delta_available},
+      {"batches", maintenance_summary.stage2_home_rpc_batches},
+      {"items", maintenance_summary.stage2_home_rpc_items},
+      {"avg_items_per_rpc",
+       maintenance_summary.stage2_home_rpc_batches == 0 ? 0.0 :
+         static_cast<double>(maintenance_summary.stage2_home_rpc_items) /
+         static_cast<double>(maintenance_summary.stage2_home_rpc_batches)},
+      {"graph_batches", graph_home_rpc_batches},
+      {"graph_items", graph_home_rpc_items},
+      {"avg_graph_items_per_rpc",
+       graph_home_rpc_batches == 0 ? 0.0 :
+         static_cast<double>(graph_home_rpc_items) /
+         static_cast<double>(graph_home_rpc_batches)},
+      {"scored_neighbors",
+       maintenance_summary.stage2_home_scored_neighbors},
+      {"avg_scored_neighbors_per_home_item",
+       maintenance_summary.stage2_home_rpc_items == 0 ? 0.0 :
+         static_cast<double>(
+           maintenance_summary.stage2_home_scored_neighbors) /
+         static_cast<double>(maintenance_summary.stage2_home_rpc_items)},
+    }},
     {"score_rpc_wire", {
       {"counter_delta_available",
        maintenance_summary.score_rpc_wire_counter_delta_available},

@@ -71,66 +71,6 @@ struct Stage2GraphRetryState {
   u32 attempt{};
 };
 
-// Before paying to return speculative adjacency data with a home expansion,
-// measure the strongest candidates already present in that response.  The
-// predictor is observation-only: it neither resolves a continuation request
-// nor changes beam order.  Keeping the best two distinct pointers lets the
-// benchmark evaluate the wire-cost break-even point for depth one and two.
-struct Stage2GraphPrefetchPrediction {
-  RemotePtr first;
-  RemotePtr second;
-  distance_t first_distance{std::numeric_limits<distance_t>::max()};
-  distance_t second_distance{std::numeric_limits<distance_t>::max()};
-
-  void clear() {
-    first = RemotePtr{};
-    second = RemotePtr{};
-    first_distance = std::numeric_limits<distance_t>::max();
-    second_distance = std::numeric_limits<distance_t>::max();
-  }
-
-  [[nodiscard]] bool empty() const { return first.is_null(); }
-
-  void observe(RemotePtr pointer, distance_t distance) {
-    if (pointer.is_null()) return;
-    distance = memory_node_storage_owner_index_detail::
-      normalize_partition_search_distance(distance);
-    const auto better = [](RemotePtr lhs, distance_t lhs_distance,
-                           RemotePtr rhs, distance_t rhs_distance) {
-      return rhs.is_null() || lhs_distance < rhs_distance ||
-        (lhs_distance == rhs_distance &&
-         lhs.raw_address < rhs.raw_address);
-    };
-    if (pointer == first) {
-      first_distance = std::min(first_distance, distance);
-      return;
-    }
-    if (pointer == second) {
-      second_distance = std::min(second_distance, distance);
-      if (better(second, second_distance, first, first_distance)) {
-        std::swap(first, second);
-        std::swap(first_distance, second_distance);
-      }
-      return;
-    }
-    if (better(pointer, distance, first, first_distance)) {
-      second = first;
-      second_distance = first_distance;
-      first = pointer;
-      first_distance = distance;
-    } else if (better(pointer, distance, second, second_distance)) {
-      second = pointer;
-      second_distance = distance;
-    }
-  }
-
-  [[nodiscard]] u32 rank(RemotePtr pointer) const {
-    if (!pointer.is_null() && pointer == first) return 1;
-    if (!pointer.is_null() && pointer == second) return 2;
-    return 0;
-  }
-};
-
 struct Stage2HomeExpandRpc {
   u32 target_shard{};
   u32 item_count{};
@@ -269,7 +209,6 @@ struct Stage2SearchIoState {
   vec<Stage2PendingGraphRead> pending_graph;
   vec<vec<RemotePtr>> graph_neighbors;
   vec<Stage2GraphRetryState> graph_retry_state;
-  vec<Stage2GraphPrefetchPrediction> graph_prefetch_predictions;
   vec<Stage2HomeExpandRpc> home_expand_rpcs;
   std::size_t home_expand_rpc_count{};
 
@@ -304,7 +243,6 @@ struct Stage2SearchIoState {
     pending_graph.clear();
     for (vec<RemotePtr>& neighbors : graph_neighbors) neighbors.clear();
     graph_retry_state.clear();
-    graph_prefetch_predictions.clear();
     home_expand_rpc_count = 0;
     for (auto& rpc : home_expand_rpcs) {
       rpc.posted = false;
@@ -346,7 +284,6 @@ struct Stage2SearchIoState {
     trim(pending_graph);
     for (auto& neighbors : graph_neighbors) trim(neighbors);
     trim(graph_neighbors);
-    trim(graph_prefetch_predictions);
     // At most one request buffer per peer is retained. Its capacity is
     // bounded by storage_owner_batch_max * (metadata + vector bytes), and
     // retaining it avoids an allocator round trip for every graph wave.
