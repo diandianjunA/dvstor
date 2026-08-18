@@ -476,6 +476,9 @@ void test_in_band_maintenance_snapshot_window() {
       .stage2_batched_items = 8,
       .stage2_graph_read_waves = 5,
       .stage2_graph_unique_reads = 40,
+      .stage2_graph_prefetch_predictions = 4,
+      .stage2_graph_prefetch_top1_hits = 2,
+      .stage2_graph_prefetch_top2_hits = 3,
       .stage2_vector_read_waves = 6,
       .stage2_vector_unique_reads = 60,
     };
@@ -529,6 +532,9 @@ void test_in_band_maintenance_snapshot_window() {
     latest.stage2_batched_items = 28;
     latest.stage2_graph_read_waves = 15;
     latest.stage2_graph_unique_reads = 120;
+    latest.stage2_graph_prefetch_predictions += 40;
+    latest.stage2_graph_prefetch_top1_hits += 20;
+    latest.stage2_graph_prefetch_top2_hits += 30;
     latest.stage2_vector_read_waves = 18;
     latest.stage2_vector_unique_reads = 180;
     for (size_t phase = 0;
@@ -588,6 +594,9 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.stage2_batched_items == 40);
   assert(summary.stage2_graph_read_waves == 20);
   assert(summary.stage2_graph_unique_reads == 160);
+  assert(summary.stage2_graph_prefetch_predictions == 80);
+  assert(summary.stage2_graph_prefetch_top1_hits == 40);
+  assert(summary.stage2_graph_prefetch_top2_hits == 60);
   assert(summary.stage2_vector_read_waves == 24);
   assert(summary.stage2_vector_unique_reads == 240);
   assert(summary.score_rpc_wire_counter_delta_available);

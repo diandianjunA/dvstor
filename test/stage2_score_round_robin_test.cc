@@ -13,6 +13,8 @@ using memory_node_storage_owner_maintenance_detail::
 using memory_node_storage_owner_maintenance_detail::
   Stage2ScoreManyDispatchQuota;
 using memory_node_storage_owner_maintenance_detail::
+  Stage2GraphPrefetchPrediction;
+using memory_node_storage_owner_maintenance_detail::
   stage2_score_many_min_items;
 using memory_node_storage_owner_maintenance_detail::
   stage2_score_many_peer_eligible;
@@ -191,6 +193,30 @@ void test_home_rpc_wait_does_not_pin_registered_rdma_scratch() {
   assert(!state.scratch_rebindable());
 }
 
+void test_graph_prefetch_predictor_keeps_distinct_top_two() {
+  Stage2GraphPrefetchPrediction prediction;
+  const RemotePtr a{11};
+  const RemotePtr b{22};
+  const RemotePtr c{33};
+  assert(prediction.empty());
+
+  prediction.observe(a, 4.0f);
+  prediction.observe(b, 2.0f);
+  prediction.observe(c, 3.0f);
+  assert(prediction.rank(b) == 1);
+  assert(prediction.rank(c) == 2);
+  assert(prediction.rank(a) == 0);
+
+  // A duplicate can improve its score but can never occupy both ranks.
+  prediction.observe(c, 1.0f);
+  assert(prediction.rank(c) == 1);
+  assert(prediction.rank(b) == 2);
+
+  prediction.clear();
+  assert(prediction.empty());
+  assert(prediction.rank(c) == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -202,5 +228,6 @@ int main() {
   test_score_many_uses_wire_capacity_instead_of_read_credits();
   test_score_many_rejects_latency_dominated_sparse_waves();
   test_home_rpc_wait_does_not_pin_registered_rdma_scratch();
+  test_graph_prefetch_predictor_keeps_distinct_top_two();
   return 0;
 }

@@ -15,7 +15,7 @@ namespace gpu_search::maintenance_telemetry {
 // unused tail of that page, so adding it neither changes header_bytes/version
 // nor requires rebuilding an existing index.
 inline constexpr u64 kMagic = 0x31544d43565344ULL;  // "DSVCMT1"
-inline constexpr u32 kVersion = 1;
+inline constexpr u32 kVersion = 2;
 inline constexpr u32 kValidCounters = 1u << 0;
 inline constexpr size_t kLatencyBucketCount = 18;
 inline constexpr size_t kStage2PhaseCount = 6;
@@ -61,6 +61,9 @@ struct alignas(64) Snapshot {
   u64 stage2_batched_items{};
   u64 stage2_graph_read_waves{};
   u64 stage2_graph_unique_reads{};
+  u64 stage2_graph_prefetch_predictions{};
+  u64 stage2_graph_prefetch_top1_hits{};
+  u64 stage2_graph_prefetch_top2_hits{};
   u64 stage2_vector_read_waves{};
   u64 stage2_vector_unique_reads{};
   std::array<u64, kLatencyBucketCount> stage2_delay_histogram{};
