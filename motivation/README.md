@@ -7,16 +7,20 @@
 2. **Live-Extent RDMA**：保留存储侧可更新的定长图记录，只通过 one-sided RDMA
    传输当前有效 extent；并发更新时由 GPU packed high-water 安全修复过期长度档。
 
-正式运行入口只有两个自包含 profile：
+正式运行入口只有一个 full profile：
 
 ```text
-experiment/profiles/04_gpu_persistent_gpunetio_baseline.env
 experiment/profiles/04_gpu_persistent_gpunetio.env
 ```
 
-二者使用相同的 C16、Beam、expansion budget、rerank、QP 和更新配置。baseline 使用
-legacy Beam merge 与 fixed-size graph read；默认 profile 启用 Stable-Run 和
-Live-Extent。这样 A/B 不会通过改变搜索预算或 Recall 口径制造收益。
+查询优化消融均从这个 profile 出发，只覆盖被测开关。比如 Beam merge A/B 只覆盖
+`GPU_QUERY_BEAM_MERGE_POLICY`，Live-Extent A/B 只覆盖
+`GPU_QUERY_GRAPH_READ_POLICY`/`GPU_DYNAMIC_GRAPH_EXTENT`；runner 固定其余 C16、
+Beam、expansion budget、rerank、QP 和更新配置。这里的 feature-off 只用于单项因果
+分析，不是论文的系统 baseline。系统 reference baseline 是
+`baseline/cpu-gpu-exact-safe@f304e99` 的 CPU-driven GPU exact +
+storage-owner exact/sync 版本，契约见
+`experiment/README.md`。
 
 ## Stable-Run Beam Merge
 
@@ -135,7 +139,7 @@ LIVE_EXTENT_CONFIG=motivation/configs/live_extent_rdma.env \
 ## C16 与性能诊断
 
 `results/sweep/prefetch_sweep.csv` 保留固定 batch `1,2,4,8,16,32` 的完整汇总，
-用于说明为什么两个正式 profile 都固定使用 C16。需要重新运行时：
+用于说明为什么 full profile 与对应 feature-off 消融都固定使用 C16。需要重新运行时：
 
 ```bash
 ./motivation/run_prefetch_sweep.sh

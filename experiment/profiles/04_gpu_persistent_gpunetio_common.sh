@@ -1,6 +1,6 @@
-# Shared capacity, quality, and hardware contract for the only two supported
-# SIFT100M profiles. Feature switches intentionally live in the two .env files
-# so their differences remain reviewable at a glance.
+# Shared capacity, quality, and hardware contract for the full SIFT100M system.
+# Full-minus-one experiments override individual switches from the optimized
+# .env; the historical CPU+GPU reference baseline lives on the cpu_gpu branch.
 
 PARTITION_STRATEGY=metis
 PARTITION_MAX_DEGREE="${PARTITION_MAX_DEGREE:-32}"
@@ -23,8 +23,7 @@ GPU_RDMA_QPS="${GPU_RDMA_QPS:-32}"
 GPU_PERSISTENT_BLOCKS_PER_SM="${GPU_PERSISTENT_BLOCKS_PER_SM:-4}"
 
 # The decoupled accepted backlog, deterministic B8 execution, exact durable
-# watermark, and bounded C32 executor are the update-offload architecture, not
-# optional optimizations. Both profiles use the same safety/capacity geometry.
+# watermark, and bounded C32 executor are part of the optimized architecture.
 STORAGE_OWNER_BATCH_MAX="${STORAGE_OWNER_BATCH_MAX:-32}"
 STORAGE_OWNER_BATCH_MAX_WAIT_US="${STORAGE_OWNER_BATCH_MAX_WAIT_US:-10000}"
 STORAGE_OWNER_STAGE2_BATCH_MAX_WAIT_US="${STORAGE_OWNER_STAGE2_BATCH_MAX_WAIT_US:-25000}"
@@ -38,4 +37,7 @@ STORAGE_OWNER_MAINTENANCE_QUEUE_DEPTH="${STORAGE_OWNER_MAINTENANCE_QUEUE_DEPTH:-
 STORAGE_OWNER_REVERSE_QUEUE_DEPTH="${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
 STORAGE_OWNER_REVERSE_COALESCE_MAX="${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}"
 
-ENABLE_BREAKDOWN="${ENABLE_BREAKDOWN:-true}"
+# Publication throughput runs disable per-operation timing samples.  Set this
+# to true only for a separate diagnostic run, and use the same setting on the
+# reference baseline when comparing raw throughput.
+ENABLE_BREAKDOWN="${ENABLE_BREAKDOWN:-false}"

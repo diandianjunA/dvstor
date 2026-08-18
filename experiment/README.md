@@ -1,35 +1,77 @@
 # SIFT100M Experiment
 
-实验目录只保留持久化 GPU OPQ/PQ32 图导航、GPUNetIO 远端读取和
-storage-owner 动态更新这一套系统架构，以及它的 optimized/baseline 两个 profile。
+实验只维护两个可发表的系统版本：
+
+- `baseline/cpu-gpu-exact-safe@f304e999bb9bebff9d0a8d692c0266ba4b8b2855`：由
+  `cpu_gpu@f173352` 固化的上一代 reference baseline，使用 CPU 驱动的图遍历、
+  普通 GPU exact-distance、单 QP RDMA 和 storage-owner exact/sync update。
+- `main`：持久化 GPU OPQ/PQ32 图导航、GPUNetIO 远端读取和两阶段更新卸载的
+  完整 optimized 系统。
+
+这两个版本不是同一二进制上的 profile 切换。reference baseline 使用 schema-13/AoS-v1
+索引和旧 wire/layout，`main` 使用 schema-16/tagged-v2 OPQ/PQ 索引和 PeerRPC v15；
+二者必须使用独立 build、独立 index prefix，并整组重启计算端和所有存储端。
 
 ## 配置
 
-默认路径定义在 `sift100m_common.sh`。实验只保留两个完整的系统 profile：
+`main` 只保留一个完整系统 profile：
 
 ```text
-profiles/04_gpu_persistent_gpunetio.env           # 默认最佳性能
-profiles/04_gpu_persistent_gpunetio_baseline.env  # 严格 A/B baseline
+profiles/04_gpu_persistent_gpunetio.env  # full optimized system
 ```
 
-二者共用 `profiles/04_gpu_persistent_gpunetio_common.sh` 中唯一一份索引、质量、
-线程、QP、显存和更新安全边界配置。baseline 是“存算分离 + persistent GPU /
-GPUNetIO + 两阶段更新卸载”的架构锚点；异步 accepted backlog、B8 Stage2、durable
-watermark、重试去重和有界 executor 属于架构本体，两边完全一致。只有下表中的可选
-性能 feature 不同：
+此前的 `04_gpu_persistent_gpunetio_baseline` 仍包含 persistent GPU/GPUNetIO、
+OPQ/PQ32、METIS、centroid placement、Stage1/Stage2、accepted backlog、B8 和 C32，
+只是关闭七个 refinement。它只能表示 full 的 `no-refinements` 内部消融，不能作为
+论文 headline baseline，因此已删除，避免继续产生错误归因。
 
-| 优化开关 | baseline | optimized |
-| --- | ---: | ---: |
-| GPU graph commit / issue width | 16 / 16 | 16 / 32 |
-| GPU Beam merge | `legacy` | `stable-run` |
-| GPU graph read | `fixed` | `live-extent` |
-| dynamic graph extent hint | off | on |
-| Stage2 exact score-many | off | on |
-| Stage2 ordered graph issue width | 1 | 16 |
-| Stage2 home RPC combining | off | on |
+## Reference baseline 契约
 
-项目不再维护历史实验 profile。做单项消融时直接覆盖 optimized profile 的对应环境
-变量，计算端和存储端必须使用同一组覆盖值。例如关闭 score-many：
+baseline 已固化在上述 `baseline/cpu-gpu-exact-safe` 提交。该分支只允许回移协议校验、
+幂等重试、有界资源、
+shutdown 和 benchmark 成功计数等正确性修复，不得回移 persistent kernel、
+GPUNetIO、OPQ/PQ/RaBitQ、K-way expansion、multi-QP、METIS/centroid placement、
+两阶段更新、accepted backlog 或 Stage2 batching。publication 配置必须锁定为：
+
+```bash
+GPUDIRECT_RDMA=0
+INSERT_EXECUTION=storage_owner
+EXPANSION_BATCH=1
+CREDIT_AWARE_EXPANSION=0
+QUERY_BATCH_SIZE=1
+USE_RABITQ=0
+RDMA_QP_POOL_SIZE=1
+RDMA_READ_BATCH_MODE=legacy
+STORAGE_OWNER_UPDATE_MODE=exact
+STORAGE_OWNER_MAINTENANCE_MODE=off
+STORAGE_OWNER_REVERSE_MODE=sync
+PARTITION_STRATEGY=balanced
+STORAGE_FORMAT=vamana_aos_v1
+WRITE_INSERT_RATIO=1
+WRITE_UPSERT_RATIO=0
+WRITE_DELETE_RATIO=0
+SERVICE_THREADS=64
+CLIENT_THREADS=512
+STORAGE_OWNER_BATCH_MAX=32
+STORAGE_OWNER_BATCH_WAIT_US=100
+STORAGE_OWNER_RPC_DEPTH=16
+ENABLE_BREAKDOWN=0
+```
+
+`STORAGE_OWNER_REVERSE_MODE=sync` 是完成语义要求：旧默认 `async` 在 ACK 时可能只把
+远端反向边放入 outbox。baseline 不存在 Stage2，因此 exact+sync RPC 返回本身就是
+更新完成点。基础线程并发和 RDMA WR/buffer safety credit 仍需保留，它们属于正确性
+边界，不是论文性能优化。
+
+两端使用同一数据、R、构图参数、硬件、CPU 核、客户端并发和测量时长；查询参数应在
+独立 validation queries 上调到相同 recall 后冻结。主表同时报告前台 completion QPS、
+最终/durable QPS、backlog/drain 和 drain 后 recall。任何未在时限内达到 durable
+watermark 的 full 运行只能作为失败诊断，不能作为持续更新吞吐结果。
+
+## Full 消融
+
+做单项消融时直接覆盖 full profile 的对应环境变量，计算端和存储端必须使用同一组
+覆盖值并整组重启。例如关闭 score-many：
 
 ```bash
 export STORAGE_OWNER_STAGE2_SCORE_MANY=false
@@ -186,11 +228,11 @@ placement；基础和动态 ID 的逻辑 authority 都由 `ID % N` 确定，其�
 
 ## 启动
 
-两个 profile 对应的图读取策略：
+full profile 的 Live-Extent 单项消融使用以下两个取值：
 
 ```text
-gpu-query-graph-read-policy = fixed        # baseline：始终读取完整记录
-gpu-query-graph-read-policy = live-extent  # optimized：一次 READ 读取有效前缀
+gpu-query-graph-read-policy = fixed        # feature-off：始终读取完整记录
+gpu-query-graph-read-policy = live-extent  # full：一次 READ 读取有效前缀
 ```
 
 `live-extent` 不改变图记录、Beam/visited、扩展顺序或存储 CPU 路径。静态稳态下，
@@ -221,14 +263,19 @@ workload、更新开关或客户端并发，因此纯查询和混合负载可使
 ./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
 ```
 
-严格 baseline 使用：
+上面的启动命令属于当前 `main` worktree。论文 reference baseline 不由这个二进制
+模拟；请在独立 worktree 中使用锁定的 exact-safe 分支，不要运行已经删除的旧 profile：
 
 ```bash
-./experiment/start_all_memory_nodes.sh 04_gpu_persistent_gpunetio_baseline
-./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio_baseline
+git worktree add /tmp/dvstor-cpu-gpu-baseline \
+  baseline/cpu-gpu-exact-safe
+cd /tmp/dvstor-cpu-gpu-baseline
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDVSTOR_METIS_PARTITION=OFF
+./experiment/start_all_memory_nodes.sh 00_baseline
+./experiment/run_breakdown.sh 00_baseline
 ```
 
-在各存储节点准备对应文件后启动服务：
+在 `main` 各存储节点准备对应 schema-16 文件后启动 full 服务：
 
 ```bash
 ./experiment/start_all_memory_nodes.sh 04_gpu_persistent_gpunetio
@@ -243,7 +290,7 @@ workload、更新开关或客户端并发，因此纯查询和混合负载可使
 启动脚本会验证 schema、分片数、R、dtype、PQ checksum 和角色所需文件，
 不兼容时在申请大块注册内存前退出。
 
-运行格式固定为 schema 16，peer RPC 协议固定为版本 11。所有动态图指针携带
+运行格式固定为 schema 16，peer RPC 协议固定为版本 15。所有动态图指针携带
 `{shard, offset, incarnation}`，记录头在读取和修改前都校验 incarnation；删除地址只在
 对应维护序列 durable 后进入复用流程。查询采用 incarnation-tagged read-committed
 语义，不要求动态加入的计算节点参与全局 ACK；incarnation 耗尽的槽位永久退休而不回绕。

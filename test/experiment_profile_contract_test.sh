@@ -30,21 +30,8 @@ mapfile -t profile_files < <(
   find "$EXPERIMENT_DIR/profiles" -maxdepth 1 -name '*.env' -printf '%f\n' |
     sort
 )
-expected_profiles="04_gpu_persistent_gpunetio.env 04_gpu_persistent_gpunetio_baseline.env"
+expected_profiles="04_gpu_persistent_gpunetio.env"
 [[ "${profile_files[*]}" == "$expected_profiles" ]]
-
-baseline_signature="$({
-  prepare_profile_environment
-  source "$EXPERIMENT_DIR/profiles/04_gpu_persistent_gpunetio_baseline.env"
-  [[ "$GPU_GRAPH_COMMIT_WIDTH/$GPU_GRAPH_ISSUE_WIDTH" == "16/16" ]]
-  [[ "$GPU_QUERY_BEAM_MERGE_POLICY" == legacy ]]
-  [[ "$GPU_QUERY_GRAPH_READ_POLICY" == fixed ]]
-  [[ "$GPU_DYNAMIC_GRAPH_EXTENT" == false ]]
-  [[ "$STORAGE_OWNER_STAGE2_SCORE_MANY" == false ]]
-  [[ "$STORAGE_OWNER_STAGE2_GRAPH_ISSUE_WIDTH" == 1 ]]
-  [[ "$STORAGE_OWNER_STAGE2_HOME_RPC_COMBINING" == false ]]
-  common_signature
-})"
 
 optimized_signature="$({
   prepare_profile_environment
@@ -56,10 +43,11 @@ optimized_signature="$({
   [[ "$STORAGE_OWNER_STAGE2_SCORE_MANY" == true ]]
   [[ "$STORAGE_OWNER_STAGE2_GRAPH_ISSUE_WIDTH" == 16 ]]
   [[ "$STORAGE_OWNER_STAGE2_HOME_RPC_COMBINING" == true ]]
+  [[ "$ENABLE_BREAKDOWN" == false ]]
   common_signature
 })"
 
-[[ "$baseline_signature" == "$optimized_signature" ]]
+[[ -n "$optimized_signature" ]]
 
 # A full-minus-one ablation uses the same profile and only overrides the
 # selected runtime feature; no third profile is needed.
@@ -70,3 +58,13 @@ optimized_signature="$({
   [[ "$STORAGE_OWNER_STAGE2_SCORE_MANY" == false ]]
   [[ "$GPU_QUERY_BEAM_MERGE_POLICY" == stable-run ]]
 )
+
+# The old same-binary profile was not a reference baseline. Keep its name a
+# hard failure so a stale command cannot silently produce a mislabeled run.
+if (
+  prepare_profile_environment
+  source "$EXPERIMENT_DIR/common.sh"
+  load_experiment_profile 04_gpu_persistent_gpunetio_baseline
+); then
+  exit 1
+fi
