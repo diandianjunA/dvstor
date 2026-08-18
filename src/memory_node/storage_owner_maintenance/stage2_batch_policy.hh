@@ -62,6 +62,7 @@ struct Stage2PackingParameters {
   std::uint32_t estimated_arrival_interval_us{};
   std::uint64_t rollback_cooldown_tasks{};
   std::uint32_t consecutive_trial_failures{};
+  bool larger_batch_trials_disabled{};
   bool target2_probe_active{};
   std::uint64_t probe_interval_windows{
     kStage2PackingInitialProbeIntervalWindows};
@@ -111,9 +112,10 @@ inline Stage2PackingDecision decide_stage2_packing(
     adaptive_target, 1, batch_limit);
   // A target-four policy is meaningful only while completion/queue pressure
   // supplies both enough arrivals and a measurable capacity signal. Outside
-  // that trial domain, admit immediately with the legacy target label. This
-  // also prevents low-rate contexts from enabling independent score RPCs
-  // while observe_completion intentionally ignores low-pressure samples.
+  // that trial domain select the legacy target, including its original
+  // oldest-descriptor 50 us deadline. Immediate low-pressure flushes reduced
+  // measured packing from 2.186 to 2.139 tasks/context even after target four
+  // had rolled back, so they were not a faithful rollback path.
   if (!high_pressure) {
     decision.target_batch = std::min<std::size_t>(2, batch_limit);
   }
@@ -130,7 +132,7 @@ inline Stage2PackingDecision decide_stage2_packing(
     decision.reason = Stage2PackingFlushReason::full;
     return decision;
   }
-  if (!high_pressure || legacy_wait_us == 0) {
+  if (legacy_wait_us == 0) {
     decision.ready = true;
     decision.reason = Stage2PackingFlushReason::low_pressure;
     return decision;
@@ -239,6 +241,7 @@ public:
                                 std::numeric_limits<std::uint32_t>::max())),
       .rollback_cooldown_tasks = cooldown_tasks_,
       .consecutive_trial_failures = consecutive_trial_failures_,
+      .larger_batch_trials_disabled = larger_batch_trials_disabled_,
       .target2_probe_active = target2_probe_active_,
       .probe_interval_windows = probe_interval_windows_,
     };
@@ -287,6 +290,10 @@ public:
                           std::size_t debt_at_completion) {
     if (!high_pressure || actual_batch == 0) return;
     std::lock_guard<std::mutex> lock(mutex_);
+    // A measured negative larger-batch cohort is a process-lifetime fuse.
+    // Continuing to collect feedback cannot change the selected target and
+    // would merely recreate the repeated trial tax this fuse removes.
+    if (larger_batch_trials_disabled_) return;
     if (sampled_target != target_batch_) {
       // This context crossed an adaptation boundary. Its work is correct but
       // mixing it into either policy window would bias the rollback decision.
@@ -335,7 +342,8 @@ public:
       // Do not manufacture a target-four trial when arrivals cannot even
       // populate target two, or when the operator explicitly requested zero
       // batching delay.
-      if (legacy_wait_us_ != 0 && configured_batch_limit_ >= 4 &&
+      if (!larger_batch_trials_disabled_ && legacy_wait_us_ != 0 &&
+          configured_batch_limit_ >= 4 &&
           actual_per_context >= 1.5) {
         target_batch_ = 4;
         target4_revalidation_active_ = completed_periodic_probe;
@@ -362,14 +370,18 @@ public:
       target4_revalidation_active_ = false;
       accepted_windows_since_probe_ = 0;
       probe_interval_windows_ = kStage2PackingInitialProbeIntervalWindows;
+      // The production trace showed every target-four promotion rolling back
+      // without one accepted cohort. A negative measured window is therefore
+      // authoritative for this process: do not periodically retry target four
+      // (or any future target above two) and repeatedly pay the same tax.
+      larger_batch_trials_disabled_ = true;
       telemetry_.target_batch = target_batch_;
       ++telemetry_.rollbacks;
       if (consecutive_trial_failures_ !=
           std::numeric_limits<std::uint32_t>::max()) {
         ++consecutive_trial_failures_;
       }
-      cooldown_tasks_ = stage2_packing_rollback_cooldown_tasks(
-        consecutive_trial_failures_);
+      cooldown_tasks_ = 0;
       baseline_cost_ns_per_task_ = 0.0;
       baseline_debt_delta_per_task_ = 0.0;
     } else {
@@ -428,6 +440,10 @@ private:
   std::uint64_t cooldown_tasks_{};
   std::uint32_t consecutive_trial_failures_{};
   std::uint64_t accepted_windows_since_probe_{};
+  // Intentionally not cleared by reset(): reset may be used to reconfigure a
+  // live controller, while a process-lifetime fuse must survive reconfigure.
+  // A fresh process constructs a fresh controller with this value false.
+  bool larger_batch_trials_disabled_{};
   bool target2_probe_active_{};
   bool target4_revalidation_active_{};
   std::uint64_t probe_interval_windows_{

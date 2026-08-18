@@ -15,6 +15,8 @@ using memory_node_storage_owner_maintenance_detail::
 using memory_node_storage_owner_maintenance_detail::
   stage2_score_many_min_items;
 using memory_node_storage_owner_maintenance_detail::
+  stage2_independent_score_min_items;
+using memory_node_storage_owner_maintenance_detail::
   stage2_score_many_peer_eligible;
 using memory_node_storage_owner_maintenance_detail::Stage2SearchIoPhase;
 using memory_node_storage_owner_maintenance_detail::Stage2SearchIoState;
@@ -178,6 +180,36 @@ void test_score_many_rejects_latency_dominated_sparse_waves() {
   assert(stage2_score_many_peer_eligible(128, 256));
   assert(stage2_score_many_peer_eligible(1024, 256));
   assert(!stage2_score_many_peer_eligible(1024, 0));
+}
+
+void test_independent_score_uses_half_context_message_bounded_at_sixteen() {
+  assert(stage2_independent_score_min_items(256, 32) == 16);
+  assert(stage2_independent_score_min_items(256, 64) == 16);
+  assert(stage2_independent_score_min_items(8, 32) == 4);
+  assert(stage2_independent_score_min_items(1, 32) == 1);
+  assert(stage2_independent_score_min_items(0, 32) == 0);
+  assert(stage2_independent_score_min_items(256, 0) == 0);
+}
+
+void test_completed_search_preserves_context_post_count_until_release() {
+  Stage2SearchIoState state;
+  state.continuation.initialize(
+    0, 0, 1,
+    memory_node_storage_owner_index_detail::PartitionSearchBudget::
+      unbounded());
+  state.independent_score_rpcs_posted = 1;
+  state.independent_score_rpcs_started = 1;
+  state.independent_score_useful = 7;
+  state.reset_completed(32);
+  assert(state.independent_score_rpcs_posted == 1);
+  assert(state.independent_score_useful == 7);
+  assert(state.independent_score_rpcs_started == 0);
+
+  // Context release uses the full reset and must not leak a previous sample
+  // into the next context that reuses this state object.
+  state.reset();
+  assert(state.independent_score_rpcs_posted == 0);
+  assert(state.independent_score_useful == 0);
 }
 
 void test_home_rpc_wait_does_not_pin_registered_rdma_scratch() {
@@ -348,6 +380,8 @@ int main() {
   test_scratch_capacity_counts_physical_reads_not_consumers();
   test_score_many_uses_wire_capacity_instead_of_read_credits();
   test_score_many_rejects_latency_dominated_sparse_waves();
+  test_independent_score_uses_half_context_message_bounded_at_sixteen();
+  test_completed_search_preserves_context_post_count_until_release();
   test_home_rpc_wait_does_not_pin_registered_rdma_scratch();
   test_ordered_issue_policy_has_bounded_warmup_and_hard_stop();
   test_score_prefetch_policy_requires_seventy_percent_promotion();

@@ -13,6 +13,7 @@
 #include "memory_node/storage_owner_index/vector_snapshot_policy.hh"
 
 #include <algorithm>
+#include <iterator>
 #include <limits>
 
 using namespace memory_node_storage_owner_maintenance_detail;
@@ -78,6 +79,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     size_t packing_debt_at_admission{};
     u32 packing_target_batch{1};
     bool packing_high_pressure{};
+    IndependentScoreSample independent_score_sample{};
   };
 
   // One timer update represents a whole context phase attempt.  In
@@ -140,7 +142,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   // O(batch * shard_count * L).
   const size_t candidate_capacity_per_item = construction_width;
   const size_t reconcile_op_capacity =
-    static_cast<size_t>(config.R) * config.storage_owner_batch_max;
+    (static_cast<size_t>(config.R) + 1) *
+      config.storage_owner_batch_max;
   lib_assert(peer_rpc_runtime_.message_bytes >
                sizeof(service::storage_owner::PeerRpcHeader),
              "peer RPC slot has no reconciliation payload capacity");
@@ -330,6 +333,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     context.packing_debt_at_admission = 0;
     context.packing_target_batch = 1;
     context.packing_high_pressure = false;
+    context.independent_score_sample = {};
     context.finalize_subphase = Stage2FinalizeSubphase::prepare;
   };
 
@@ -1301,12 +1305,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     // across the complete context batch, eliminating the per-task RDMA RTT
     // chain while preserving each task's private beam and convergence state.
     Stage2SearchIoState& search_io = context.search_io;
-    // Independent score lookahead is part of the same bounded experiment as
-    // larger context packing. Legacy/rollback contexts therefore provide an
-    // exact no-speculation baseline, and a negative combined result disables
-    // both extra waiting and extra receiver work automatically.
     search_io.independent_score_allowed =
-      context.packing_high_pressure && context.packing_target_batch >= 4;
+      context.independent_score_sample.allows_speculation();
     const Stage2SearchAdvanceResult search_result =
       advance_stage2_search_candidates_batched(
       span<const StorageOwnerMaintenanceTask>{context.tasks},
@@ -1416,10 +1416,15 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       }
     }
     switch (barrier) {
-      case Stage2ReconcileBarrier::promotion:
-        selected_ops = std::move(promotion_ops);
-        return true;
-      case Stage2ReconcileBarrier::stable:
+      case Stage2ReconcileBarrier::install:
+        // This ordering is semantic, not merely a packing preference. The
+        // target-run packer below groups a target without reordering its ops,
+        // so every receiver executes all ordinary stable proposals before any
+        // mandatory promotion for that target and audits the mandatory set on
+        // the resulting final adjacency before ACKing the one install barrier.
+        stable_ops.insert(stable_ops.end(),
+                          std::make_move_iterator(promotion_ops.begin()),
+                          std::make_move_iterator(promotion_ops.end()));
         selected_ops = std::move(stable_ops);
         return true;
       case Stage2ReconcileBarrier::removal:
@@ -1478,10 +1483,12 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     for (const auto& [target_shard, peer_ops] : remote_ops) {
       const auto packed = pack_stage2_reconcile_target_runs(
         span<const ReconcileReverseOp>{peer_ops}, wire_capacity);
-      // Each task contributes at most one install op to a given target, so a
-      // target run is bounded by storage_owner_batch_max. Treat an impossible
-      // oversize run as a semantic retry instead of splitting it into RPCs
-      // whose completion order could expose add-before-promotion.
+      // One task can contribute an ordinary install and its mandatory
+      // promotion to the same target, so a target run is bounded by twice the
+      // storage_owner_batch_max. Treat an impossible oversize run as a semantic
+      // retry instead of splitting it into RPCs whose completion order could
+      // expose promotion before ordinary work or ACK only a subset of the
+      // mandatory certificate set.
       if (!packed.has_value()) return false;
       for (const auto& chunk_ops : *packed) {
         const size_t count = chunk_ops.size();
@@ -1619,7 +1626,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   };
 
   // Placement authority and centroid membership remain synchronous in this
-  // patch.  They execute only after all three reconciliation barriers have
+  // patch.  They execute only after both reconciliation barriers have
   // completed, and may safely reacquire any idle search lane for their local
   // snapshot/control scratch.
   const auto finish_stage2_after_reconcile = [&, this](
@@ -1780,11 +1787,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     return true;
   };
 
-  // Drives as many zero-remote barriers as possible, but never waits.
-  // Ordinary stable additions run first because they may RobustPrune a hot
-  // parent shared with another task. Promotion is the final stable-plane
-  // mutation and is audited as a complete mandatory set; only then may
-  // obsolete Stage1 bridges be removed.
+  // Drives as many zero-remote barriers as possible, but never waits. The
+  // install barrier is one receiver-side per-target transaction: ordinary
+  // stable additions run first, mandatory promotions run last, and the final
+  // adjacency is audited before ACK. Only then may obsolete Stage1 bridges be
+  // removed by the second barrier.
   const auto advance_reconcile_pipeline = [&] (Stage2Context& context) {
     for (;;) {
       const ReconcilePollResult poll = poll_reconcile_barrier(context);
@@ -1798,13 +1805,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         context.reconcile_batch.barrier();
       cancel_context_reconcile(context);
       switch (completed) {
-        case Stage2ReconcileBarrier::stable:
-          if (!start_reconcile_barrier(
-                context, Stage2ReconcileBarrier::promotion)) {
-            return false;
-          }
-          break;
-        case Stage2ReconcileBarrier::promotion:
+        case Stage2ReconcileBarrier::install:
           for (StorageOwnerMaintenanceTask& task : context.tasks) {
             if (!task.reverse_reconciled) {
               task.stage2_promotion_committed = true;
@@ -2655,10 +2656,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     }
 
     // Promotion is the durable reachability certificate. Persist the exact
-    // liveness view before yielding, then apply ordinary stable additions,
-    // promotion, and obsolete Stage1 removals in that order. Making promotion
-    // the last stable-plane barrier prevents a later ordinary RobustPrune from
-    // invalidating its audited certificate before provisional removal.
+    // liveness view before yielding, then install ordinary stable additions
+    // followed by promotion in one audited per-target transaction. Obsolete
+    // Stage1 removals remain a second barrier. This retains promotion-last
+    // semantics without paying a separate promotion RTT.
     lib_assert(context.live_stage2_neighbors_by_task.size() >=
                  context.tasks.size(),
                "Stage2 context cannot persist its reconciliation plan");
@@ -3038,6 +3039,14 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       const size_t debt_at_completion =
         storage_owner_maintenance_completion_ring_ == nullptr ? 0 :
           storage_owner_maintenance_completion_ring_->outstanding();
+      storage_owner_independent_score_.observe_completion(
+        context.independent_score_sample,
+        context.tasks.size(),
+        effective_cost_ns,
+        context.packing_debt_at_admission,
+        debt_at_completion,
+        context.search_io.independent_score_rpcs_posted,
+        context.search_io.independent_score_useful);
       storage_owner_stage2_packing_.observe_completion(
         context.packing_target_batch,
         context.packing_high_pressure,
@@ -3322,6 +3331,13 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       context.packing_target_batch = static_cast<u32>(
         packing_decision.target_batch);
       context.packing_high_pressure = packing_high_pressure;
+      const bool stable_legacy_packing =
+        packing_parameters.larger_batch_trials_disabled ||
+        !storage_owner_stage2_larger_batch_trials_possible_;
+      context.independent_score_sample =
+        storage_owner_independent_score_.sample(
+          packing_high_pressure && stable_legacy_packing &&
+          packing_decision.target_batch <= 2);
       storage_owner_stage2_packing_.observe_admission(
         packing_decision.reason, context.tasks.size(), oldest_wait_ns,
         packing_decision.wait_budget_us);
@@ -3411,6 +3427,12 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         }
         finish_reverse_prepare_timing(context);
         cancel_context_reconcile(context);
+        // Shutdown abandons active contexts instead of entering the normal
+        // finalization feedback path. Consume any admission token with a
+        // zero-task sample so an in-process stop/start cannot retain a false
+        // speculative-generation outstanding count.
+        storage_owner_independent_score_.observe_completion(
+          context.independent_score_sample, 0, 0, 0, 0, 0, 0);
         release_context_lane(context);
         storage_owner_maintenance_active_workers_.fetch_sub(
           1, std::memory_order_acq_rel);

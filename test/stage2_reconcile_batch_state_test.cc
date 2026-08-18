@@ -27,7 +27,7 @@ void test_exact_payload_and_out_of_order_completion() {
   detail::Stage2ReconcileBatchState state;
   state.reserve(8, 4);
   const detail::Stage2ContextHandle context{3, 7};
-  state.begin(context, detail::Stage2ReconcileBarrier::promotion);
+  state.begin(context, detail::Stage2ReconcileBarrier::install);
   const std::uint32_t epoch = state.epoch();
 
   protocol::ReconcileReverseOp first[] = {
@@ -58,66 +58,60 @@ void test_exact_payload_and_out_of_order_completion() {
 void test_epoch_and_context_generation_fence_late_ack() {
   detail::Stage2ReconcileBatchState state;
   const detail::Stage2ContextHandle old_context{1, 4};
-  state.begin(old_context, detail::Stage2ReconcileBarrier::promotion);
+  state.begin(old_context, detail::Stage2ReconcileBarrier::install);
   const protocol::ReconcileReverseOp payload[] = {op(10, 1, 2)};
   assert(state.append_chunk(7, 2, payload));
-  const std::uint32_t promotion_epoch = state.epoch();
+  const std::uint32_t install_epoch = state.epoch();
 
   state.clear();
-  state.begin(old_context, detail::Stage2ReconcileBarrier::stable);
+  state.begin(old_context, detail::Stage2ReconcileBarrier::removal);
   assert(state.append_chunk(8, 2, payload));
-  assert(state.epoch() != promotion_epoch);
-  assert(!state.mark_complete(0, old_context, promotion_epoch));
+  assert(state.epoch() != install_epoch);
+  assert(!state.mark_complete(0, old_context, install_epoch));
   assert(state.remaining() == 1);
 
-  const std::uint32_t stable_epoch = state.epoch();
+  const std::uint32_t removal_epoch = state.epoch();
   state.clear();
   const detail::Stage2ContextHandle reused_context{1, 5};
-  state.begin(reused_context, detail::Stage2ReconcileBarrier::removal);
+  state.begin(reused_context, detail::Stage2ReconcileBarrier::install);
   assert(state.append_chunk(9, 2, payload));
-  assert(!state.mark_complete(0, old_context, stable_epoch));
+  assert(!state.mark_complete(0, old_context, removal_epoch));
   assert(state.remaining() == 1);
 }
 
 void test_empty_barrier_completes_without_transport() {
   detail::Stage2ReconcileBatchState state;
   const detail::Stage2ContextHandle context{2, 9};
-  state.begin(context, detail::Stage2ReconcileBarrier::stable);
+  state.begin(context, detail::Stage2ReconcileBarrier::install);
   assert(state.active());
   assert(state.complete());
   assert(state.remaining() == 0);
   assert(state.chunks().empty());
-  assert(state.barrier() == detail::Stage2ReconcileBarrier::stable);
+  assert(state.barrier() == detail::Stage2ReconcileBarrier::install);
 }
 
 void test_barrier_subphases_release_search_lane() {
   using Barrier = detail::Stage2ReconcileBarrier;
   using Subphase = detail::Stage2FinalizeSubphase;
-  assert(detail::stage2_reconcile_wait_subphase(Barrier::promotion) ==
-         Subphase::promotion_wait);
-  assert(detail::stage2_reconcile_wait_subphase(Barrier::stable) ==
-         Subphase::stable_wait);
+  assert(detail::stage2_reconcile_wait_subphase(Barrier::install) ==
+         Subphase::install_wait);
   assert(detail::stage2_reconcile_wait_subphase(Barrier::removal) ==
          Subphase::removal_wait);
   assert(detail::stage2_finalize_subphase_needs_lane(Subphase::prepare));
   assert(detail::stage2_finalize_subphase_needs_lane(
     Subphase::placement_ready));
   assert(!detail::stage2_finalize_subphase_needs_lane(
-    Subphase::promotion_wait));
-  assert(!detail::stage2_finalize_subphase_needs_lane(
-    Subphase::stable_wait));
+    Subphase::install_wait));
   assert(!detail::stage2_finalize_subphase_needs_lane(Subphase::removal_wait));
 }
 
-void test_reconcile_pipeline_keeps_promotion_last_before_removal() {
+void test_reconcile_pipeline_has_one_install_then_removal() {
   using Barrier = detail::Stage2ReconcileBarrier;
   const Barrier first = detail::stage2_reconcile_first_barrier();
-  assert(first == Barrier::stable);
+  assert(first == Barrier::install);
   const Barrier second = detail::stage2_reconcile_next_barrier(first);
-  assert(second == Barrier::promotion);
-  const Barrier third = detail::stage2_reconcile_next_barrier(second);
-  assert(third == Barrier::removal);
-  assert(detail::stage2_reconcile_next_barrier(third) == Barrier::none);
+  assert(second == Barrier::removal);
+  assert(detail::stage2_reconcile_next_barrier(second) == Barrier::none);
 }
 
 void test_barrier_packing_preserves_target_order_and_never_splits_a_target() {
@@ -127,27 +121,32 @@ void test_barrier_packing_preserves_target_order_and_never_splits_a_target() {
     value.kind = static_cast<std::uint32_t>(kind);
     return value;
   };
-  const protocol::ReconcileReverseOp stable[] = {
+  // The install builder emits all ordinary work before promotions. Packing
+  // groups by target without changing that relative order, so one receiver
+  // transaction sees ordinary-before-mandatory and cannot ACK a partial
+  // mandatory set even when unrelated target runs share a wire message.
+  const protocol::ReconcileReverseOp install[] = {
     make_kind(100, Kind::add, 1),
     make_kind(200, Kind::replace_or_add, 2),
-    make_kind(100, Kind::add, 3),
-    make_kind(200, Kind::replace_or_add, 4),
+    make_kind(100, Kind::promote_stable_bridge, 3),
+    make_kind(200, Kind::promote_stable_bridge, 4),
   };
-  const auto packed = detail::pack_stage2_reconcile_target_runs(stable, 2);
+  const auto packed = detail::pack_stage2_reconcile_target_runs(install, 2);
   assert(packed.has_value());
   assert(packed->size() == 2);
   for (const auto& chunk : *packed) assert(chunk.size() == 2);
   assert((*packed)[0][0].target_raw == 100);
   assert((*packed)[0][0].kind == static_cast<std::uint32_t>(Kind::add));
   assert((*packed)[0][1].target_raw == 100);
-  assert((*packed)[0][1].kind == static_cast<std::uint32_t>(Kind::add));
+  assert((*packed)[0][1].kind ==
+         static_cast<std::uint32_t>(Kind::promote_stable_bridge));
   assert((*packed)[1][0].target_raw == 200);
   assert((*packed)[1][0].kind ==
          static_cast<std::uint32_t>(Kind::replace_or_add));
   assert((*packed)[1][1].target_raw == 200);
   assert((*packed)[1][1].kind ==
-         static_cast<std::uint32_t>(Kind::replace_or_add));
-  assert(!detail::pack_stage2_reconcile_target_runs(stable, 1).has_value());
+         static_cast<std::uint32_t>(Kind::promote_stable_bridge));
+  assert(!detail::pack_stage2_reconcile_target_runs(install, 1).has_value());
 }
 
 }  // namespace
@@ -157,7 +156,7 @@ int main() {
   test_epoch_and_context_generation_fence_late_ack();
   test_empty_barrier_completes_without_transport();
   test_barrier_subphases_release_search_lane();
-  test_reconcile_pipeline_keeps_promotion_last_before_removal();
+  test_reconcile_pipeline_has_one_install_then_removal();
   test_barrier_packing_preserves_target_order_and_never_splits_a_target();
   return 0;
 }

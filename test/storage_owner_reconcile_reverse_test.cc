@@ -1165,7 +1165,8 @@ void test_stable_then_promotion_closes_hot_parent_eviction_window() {
   assert((stable == vec<RemotePtr>{ordinary_child}));
   assert((provisional == vec<RemotePtr>{mandatory_child}));
 
-  // The mandatory promotion is deliberately the final stable-plane barrier.
+  // The mandatory promotion is deliberately the final stable-plane operation
+  // in the audited install transaction.
   // Even when RobustPrune prefers the ordinary edge, promotion spends the one
   // bounded reachability exception on the protected child before removal.
   const ReconcileReverseOp promotion = operation(
@@ -1261,6 +1262,52 @@ void test_final_target_audit_rejects_evicted_mandatory_certificate() {
     span<const RemotePtr>{empty}, span<const RemotePtr>{protected_first}));
 }
 
+void test_receiver_orders_install_transaction_before_mandatory_audit() {
+  using memory_node_storage_owner_index_detail::
+    reconcile_reverse_target_execution_order;
+  const RemotePtr target = pointer(0, 0x1000);
+  const RemotePtr first = pointer(1, 0x2000);
+  const RemotePtr second = pointer(1, 0x3000);
+  const vec<ReconcileReverseOp> wire_ops{
+    operation(ReconcileReverseOpKind::promote_stable_bridge,
+              target, first, first, 51),
+    operation(ReconcileReverseOpKind::add,
+              target, RemotePtr{}, second, 52),
+    operation(ReconcileReverseOpKind::replace_or_add,
+              target, first, second, 53),
+    operation(ReconcileReverseOpKind::promote_stable_bridge,
+              target, second, second, 54),
+  };
+  const vec<size_t> wire_order{0, 1, 2, 3};
+  vec<size_t> execution_order;
+  assert(reconcile_reverse_target_execution_order(
+    span<const ReconcileReverseOp>{wire_ops},
+    span<const size_t>{wire_order}, execution_order));
+  assert((execution_order == vec<size_t>{1, 2, 0, 3}));
+
+  // Promotions cannot share a target transaction with the later removal
+  // phase. Rejecting the malformed request before mutation preserves the
+  // install/removal fault boundary.
+  vec<ReconcileReverseOp> malformed{
+    wire_ops[0],
+    operation(ReconcileReverseOpKind::remove_if_present,
+              target, first, RemotePtr{}, 55),
+  };
+  const vec<size_t> malformed_order{0, 1};
+  assert(!reconcile_reverse_target_execution_order(
+    span<const ReconcileReverseOp>{malformed},
+    span<const size_t>{malformed_order}, execution_order));
+
+  // A removal-only target transaction keeps exact wire order and remains
+  // idempotent under the legacy receiver path.
+  const vec<ReconcileReverseOp> removals{malformed[1], malformed[1]};
+  const vec<size_t> reverse_order{1, 0};
+  assert(reconcile_reverse_target_execution_order(
+    span<const ReconcileReverseOp>{removals},
+    span<const size_t>{reverse_order}, execution_order));
+  assert(execution_order == reverse_order);
+}
+
 }  // namespace
 
 int main() {
@@ -1298,5 +1345,6 @@ int main() {
   test_stable_then_promotion_closes_hot_parent_eviction_window();
   test_ordinary_rejection_cannot_substitute_for_promotion_ack();
   test_final_target_audit_rejects_evicted_mandatory_certificate();
+  test_receiver_orders_install_transaction_before_mandatory_audit();
   return 0;
 }

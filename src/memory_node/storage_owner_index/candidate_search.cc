@@ -2171,9 +2171,9 @@ MemoryNode::advance_stage2_search_candidates_batched(
   // Fill one exact score-many message per peer from already-bounded graph
   // lookahead. The minimum payload, one-per-context budget, and per-peer
   // request-lifetime credit prevent sparse or slow deployments from turning
-  // this into RPC amplification. The complete packing+lookahead trial is
-  // retained only by the context-level cost/debt controller; a failed post
-  // rolls back without ever covering a pending authoritative request.
+  // this into RPC amplification. Its independent no-spec/spec controller
+  // retains the path only after an actual posted-RPC cohort reduces complete
+  // context cost without increasing completion debt.
   const auto post_speculative_score_rpcs = [&] {
     if (!peer_stage2_home_speculation_enabled_ ||
         !state.independent_score_allowed ||
@@ -2212,7 +2212,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
     bool posted_any = false;
     const u32 item_limit = std::max<u32>(
       1, config.storage_owner_search_snapshot_batch);
-    const u32 minimum_items = std::min<u32>(
+    const u32 minimum_items = stage2_independent_score_min_items(
       item_limit, std::max<u32>(1, config.storage_owner_batch_max));
     speculative_query_indexes.resize(tasks.size());
     for (u32 peer_offset = 0; peer_offset < num_storage_nodes_;
@@ -2238,7 +2238,9 @@ MemoryNode::advance_stage2_search_candidates_batched(
       // Count the complete build/post opportunity, not only a successful
       // wire request. A sparse cache or unavailable SEND slot must not cause
       // this context to rescan and rebuild on every scheduler pass.
-      ++state.independent_score_rpcs_started;
+      if (state.independent_score_rpcs_started == 0) {
+        ++state.independent_score_rpcs_started;
+      }
       speculative_query_searches.clear();
       std::fill(speculative_query_indexes.begin(),
                 speculative_query_indexes.end(),
@@ -2285,7 +2287,12 @@ MemoryNode::advance_stage2_search_candidates_batched(
       }
       if (rpc.consumers.size() < minimum_items) {
         abandon_speculative_score_rpc(rpc, false, false);
-        return false;
+        // A context may have authoritative work at several peers. Sparse
+        // first-peer placement must not hide a dense later peer, especially
+        // because this bounded build opportunity is attempted only once per
+        // context. Credits are released before moving on and at most one wire
+        // request is still posted below.
+        continue;
       }
 
       rpc.item_count = static_cast<u32>(rpc.consumers.size());
@@ -2357,6 +2364,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
 
       storage_owner_stage2_independent_score_rpc_batches_.fetch_add(
         1, std::memory_order_relaxed);
+      ++state.independent_score_rpcs_posted;
       storage_owner_stage2_independent_score_issued_.fetch_add(
         rpc.item_count, std::memory_order_relaxed);
       storage_owner_stage2_home_rpc_batches_.fetch_add(
@@ -2531,6 +2539,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
         score_prefetch_wasted, std::memory_order_relaxed);
     }
     if (independent_score_useful != 0) {
+      state.independent_score_useful += independent_score_useful;
       storage_owner_stage2_independent_score_useful_.fetch_add(
         independent_score_useful, std::memory_order_relaxed);
     }

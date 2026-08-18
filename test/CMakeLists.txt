@@ -426,6 +426,13 @@ dvstor_target_common_includes(stage2_batch_policy_test)
 target_compile_options(stage2_batch_policy_test PRIVATE -UNDEBUG)
 add_test(NAME stage2_batch_policy_test COMMAND stage2_batch_policy_test)
 
+add_executable(independent_score_policy_test
+    independent_score_policy_test.cc)
+dvstor_target_common_includes(independent_score_policy_test)
+target_compile_options(independent_score_policy_test PRIVATE -UNDEBUG)
+add_test(NAME independent_score_policy_test
+    COMMAND independent_score_policy_test)
+
 add_executable(storage_owner_reverse_outbox_test
     storage_owner_reverse_outbox_test.cc)
 dvstor_target_common_includes(storage_owner_reverse_outbox_test)

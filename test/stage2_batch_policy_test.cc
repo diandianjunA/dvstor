@@ -21,15 +21,23 @@ void test_legacy_helpers_keep_oldest_deadline() {
     7, 32, oldest, oldest + std::chrono::microseconds(50), 50));
 }
 
-void test_low_pressure_never_waits() {
+void test_low_pressure_preserves_legacy_deadline() {
   const Clock::time_point oldest{};
-  const auto decision = detail::decide_stage2_packing(
+  const auto waiting = detail::decide_stage2_packing(
     1, 32, 4, oldest, oldest, 50, 2'000, false);
-  assert(decision.ready);
-  assert(decision.reason == detail::Stage2PackingFlushReason::low_pressure);
-  assert(decision.target_batch == 2);
-  assert(decision.pop_limit == 32);
-  assert(!decision.deadline.has_value());
+  assert(!waiting.ready);
+  assert(waiting.target_batch == 2);
+  assert(waiting.pop_limit == 32);
+  assert(waiting.wait_budget_us == 50);
+  assert(waiting.deadline == oldest + std::chrono::microseconds(50));
+
+  const auto flush = detail::decide_stage2_packing(
+    1, 32, 4, oldest, oldest + std::chrono::microseconds(50),
+    50, 2'000, false);
+  assert(flush.ready);
+  assert(flush.reason == detail::Stage2PackingFlushReason::deadline);
+  assert(flush.target_batch == 2);
+  assert(flush.pop_limit == 32);
 }
 
 void test_legacy_rollback_does_not_cap_context_at_two() {
@@ -125,6 +133,7 @@ void test_validated_four_still_rolls_back_after_workload_drift() {
   assert(telemetry.target_batch == 2);
   assert(telemetry.promotions == 1);
   assert(telemetry.rollbacks == 1);
+  assert(controller.parameters().larger_batch_trials_disabled);
 }
 
 void test_feedback_rolls_back_negative_trial() {
@@ -139,6 +148,7 @@ void test_feedback_rolls_back_negative_trial() {
   assert(telemetry.target_batch == 2);
   assert(telemetry.promotions == 1);
   assert(telemetry.rollbacks == 1);
+  assert(controller.parameters().larger_batch_trials_disabled);
 }
 
 void test_zero_wait_disables_adaptive_trial() {
@@ -160,7 +170,7 @@ void test_rollback_cooldown_is_bounded_exponential() {
   assert(detail::stage2_packing_rollback_cooldown_tasks(100) == 32'768);
 }
 
-void test_repeated_failure_backs_off_and_success_resets_streak() {
+void test_first_negative_trial_permanently_disables_larger_batches() {
   detail::Stage2AdaptivePackingController controller;
   controller.reset(32, 50);
   establish_legacy_baseline(controller);
@@ -169,46 +179,41 @@ void test_repeated_failure_backs_off_and_success_resets_streak() {
   auto parameters = controller.parameters();
   assert(parameters.target_batch == 2);
   assert(parameters.consecutive_trial_failures == 1);
-  assert(parameters.rollback_cooldown_tasks == 2'048);
+  assert(parameters.rollback_cooldown_tasks == 0);
+  assert(parameters.larger_batch_trials_disabled);
+  const auto telemetry_after_failure = controller.telemetry();
+  assert(telemetry_after_failure.promotions == 1);
+  assert(telemetry_after_failure.rollbacks == 1);
 
-  // Low-pressure completions neither consume cooldown nor start another
-  // experiment.
+  // Neither low pressure nor a sustained high-pressure workload may re-arm
+  // target four after the first measured negative cohort. Use far more work
+  // than the former maximum retry cooldown to prove this is a fuse rather
+  // than another backoff interval.
   complete_evaluation_window(
     controller, 2, 2, 2'000'000, 96, false);
-  assert(controller.parameters().rollback_cooldown_tasks == 2'048);
+  for (std::size_t window = 0; window < 128; ++window) {
+    complete_evaluation_window(controller, 2, 2, 2'000'000);
+    assert(controller.parameters().target_batch == 2);
+  }
+  parameters = controller.parameters();
+  assert(parameters.target_batch == 2);
+  assert(parameters.rollback_cooldown_tasks == 0);
+  assert(parameters.larger_batch_trials_disabled);
+  const auto telemetry_after_pressure = controller.telemetry();
+  assert(telemetry_after_pressure.promotions == 1);
+  assert(telemetry_after_pressure.rollbacks == 1);
 
+  // reset() can reconfigure a live controller, but must not clear a
+  // process-lifetime negative-result fuse.
+  controller.reset(64, 50);
+  assert(controller.parameters().larger_batch_trials_disabled);
   for (std::size_t window = 0; window < 4; ++window) {
     complete_evaluation_window(controller, 2, 2, 2'000'000);
   }
   parameters = controller.parameters();
   assert(parameters.target_batch == 2);
-  assert(parameters.rollback_cooldown_tasks == 0);
-  complete_evaluation_window(controller, 2, 2, 2'000'000);
-  assert(controller.parameters().target_batch == 4);
-
-  complete_evaluation_window(controller, 4, 4, 5'000'000, 98);
-  parameters = controller.parameters();
-  assert(parameters.consecutive_trial_failures == 2);
-  assert(parameters.rollback_cooldown_tasks == 4'096);
-
-  for (std::size_t window = 0; window < 8; ++window) {
-    complete_evaluation_window(controller, 2, 2, 2'000'000);
-  }
-  complete_evaluation_window(controller, 2, 2, 2'000'000);
-  assert(controller.parameters().target_batch == 4);
-
-  // A genuinely beneficial trial clears the failure streak immediately.
-  complete_evaluation_window(controller, 4, 4, 2'400'000);
-  parameters = controller.parameters();
-  assert(parameters.target_batch == 4);
-  assert(parameters.consecutive_trial_failures == 0);
-  assert(parameters.rollback_cooldown_tasks == 0);
-
-  complete_evaluation_window(controller, 4, 4, 5'000'000, 98);
-  parameters = controller.parameters();
-  assert(parameters.target_batch == 2);
-  assert(parameters.consecutive_trial_failures == 1);
-  assert(parameters.rollback_cooldown_tasks == 2'048);
+  assert(parameters.larger_batch_trials_disabled);
+  assert(controller.telemetry().promotions == 0);
 }
 
 void test_periodic_legacy_probe_refreshes_stale_baseline() {
@@ -239,7 +244,8 @@ void test_periodic_legacy_probe_refreshes_stale_baseline() {
   parameters = controller.parameters();
   assert(parameters.target_batch == 2);
   assert(parameters.consecutive_trial_failures == 1);
-  assert(parameters.rollback_cooldown_tasks == 2'048);
+  assert(parameters.rollback_cooldown_tasks == 0);
+  assert(parameters.larger_batch_trials_disabled);
   assert(controller.telemetry().rollbacks == 1);
 }
 
@@ -278,7 +284,7 @@ void test_successful_periodic_probe_reduces_probe_tax() {
 
 int main() {
   test_legacy_helpers_keep_oldest_deadline();
-  test_low_pressure_never_waits();
+  test_low_pressure_preserves_legacy_deadline();
   test_legacy_rollback_does_not_cap_context_at_two();
   test_trial_wait_is_arrival_adaptive_and_hard_bounded();
   test_feedback_accepts_real_per_task_gain();
@@ -286,7 +292,7 @@ int main() {
   test_validated_four_still_rolls_back_after_workload_drift();
   test_zero_wait_disables_adaptive_trial();
   test_rollback_cooldown_is_bounded_exponential();
-  test_repeated_failure_backs_off_and_success_resets_streak();
+  test_first_negative_trial_permanently_disables_larger_batches();
   test_periodic_legacy_probe_refreshes_stale_baseline();
   test_successful_periodic_probe_reduces_probe_tax();
   return 0;

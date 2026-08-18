@@ -147,17 +147,29 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     0, std::memory_order_relaxed);
   storage_owner_maintenance_lost_wake_avoided_.store(
     0, std::memory_order_relaxed);
-  // Preserve at least two independently runnable contexts per executor at
-  // the adaptive target. A small admission window must not trade away all
-  // context-level concurrency merely because per-context cost looks lower.
-  const size_t adaptive_packing_limit = std::min<size_t>(
+  // Preserve at least two independently runnable contexts per executor, but
+  // keep production on the measured legacy target. Across the ten August 18
+  // runs, context-rate * tasks/context predicts throughput within 1.7%, while
+  // transport waves grew linearly with target size. The first target-four
+  // deployment then produced 15 promotions, 16 rollbacks, and zero accepted
+  // windows. Retrying that experiment cannot remove a dependency round; it
+  // only lets its bounded wait leak into measurement. The controller and its
+  // fuse remain available to focused policy tests, while the runtime uses the
+  // stable two-item label and still drains every descriptor available at the
+  // original 50 us deadline.
+  const size_t concurrency_safe_packing_limit = std::min<size_t>(
     std::max<u32>(1, config.storage_owner_batch_max),
     std::max<size_t>(
       2, storage_owner_maintenance_admission_limit_ /
            std::max<size_t>(1, static_cast<size_t>(worker_count) * 2)));
+  const size_t adaptive_packing_limit = std::min<size_t>(
+    2, concurrency_safe_packing_limit);
+  storage_owner_stage2_larger_batch_trials_possible_ =
+    adaptive_packing_limit >= 4;
   storage_owner_stage2_packing_.reset(
     adaptive_packing_limit,
     config.storage_owner_stage2_batch_max_wait_us);
+  storage_owner_independent_score_.reset();
   physical_stage1_items_.store(0, std::memory_order_relaxed);
   physical_stage1_total_ns_.store(0, std::memory_order_relaxed);
   physical_stage1_search_ns_.store(0, std::memory_order_relaxed);
@@ -342,7 +354,7 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                " (shared per-peer work-conserving aggregation)");
   print_status("storage-owner maintenance tuning: protocol=centroid-home-two-stage"
                " compaction_batch_target=" + std::to_string(config.storage_owner_batch_max) +
-               " adaptive_pack_target=legacy_then_guarded_4"
+               " adaptive_pack_target=legacy_2_verified"
                " adaptive_pack_max_wait_us=" +
                std::to_string(kStage2AdaptivePackingMaxWaitUs) +
                " adaptive_pack_concurrency_cap=" +
@@ -490,6 +502,8 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
     storage_owner_stage2_batched_items_.load(std::memory_order_relaxed);
   const Stage2PackingTelemetry stage2_packing =
     storage_owner_stage2_packing_.telemetry();
+  const IndependentScoreTelemetry independent_score_ab =
+    storage_owner_independent_score_.telemetry();
   std::array<u64, kStorageOwnerStage2TimingPhaseCount>
     stage2_phase_attempts{};
   std::array<u64, kStorageOwnerStage2TimingPhaseCount>
@@ -978,6 +992,39 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(stage2_independent_score_useful) +
                " stage2_independent_score_wasted=" +
                std::to_string(stage2_independent_score_wasted) +
+               " stage2_independent_score_ab_mode=" +
+               independent_score_mode_name(independent_score_ab.mode) +
+               " stage2_independent_score_ab_generation=" +
+               std::to_string(independent_score_ab.generation) +
+               " stage2_independent_score_ab_window_tasks=" +
+               std::to_string(independent_score_ab.window_tasks) +
+               " stage2_independent_score_ab_window_posted_rpcs=" +
+               std::to_string(independent_score_ab.window_posted_rpcs) +
+               " stage2_independent_score_ab_window_useful=" +
+               std::to_string(independent_score_ab.window_useful) +
+               " stage2_independent_score_ab_drain_outstanding=" +
+               std::to_string(independent_score_ab.drain_outstanding) +
+               " stage2_independent_score_ab_trials_started=" +
+               std::to_string(independent_score_ab.trials_started) +
+               " stage2_independent_score_ab_trials_accepted=" +
+               std::to_string(independent_score_ab.trials_accepted) +
+               " stage2_independent_score_ab_confirmations=" +
+               std::to_string(independent_score_ab.confirmations) +
+               " stage2_independent_score_ab_enabled_windows=" +
+               std::to_string(independent_score_ab.enabled_windows) +
+               " stage2_independent_score_ab_revalidation_controls=" +
+               std::to_string(independent_score_ab.revalidation_controls) +
+               " stage2_independent_score_ab_revalidations_accepted=" +
+               std::to_string(
+                 independent_score_ab.revalidations_accepted) +
+               " stage2_independent_score_ab_rollbacks=" +
+               std::to_string(independent_score_ab.rollbacks) +
+               " stage2_independent_score_ab_baseline_cost_ns_per_task=" +
+               std::to_string(
+                 independent_score_ab.baseline_cost_ns_per_task) +
+               " stage2_independent_score_ab_baseline_debt_per_task=" +
+               std::to_string(
+                 independent_score_ab.baseline_debt_delta_per_task) +
                " stage2_vector_read_waves=" +
                std::to_string(stage2_vector_read_waves) +
                " avg_stage2_scores_per_vector_wave=" +

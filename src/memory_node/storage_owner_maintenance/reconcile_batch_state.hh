@@ -16,27 +16,26 @@ namespace memory_node_storage_owner_maintenance_detail {
 
 enum class Stage2ReconcileBarrier : std::uint8_t {
   none,
-  promotion,
-  stable,
+  install,
   removal,
 };
 
 // Ordinary backlinks may RobustPrune the same hot parent selected as another
-// insertion's mandatory reachability holder. Apply every ordinary mutation
-// first, then make promotion the last stable-plane transaction before
-// provisional removal. The receiver audits all mandatory certificates in the
-// promotion request, so this order closes the cross-barrier eviction window.
+// insertion's mandatory reachability holder. Install ordinary mutations and
+// mandatory promotions in one per-target transaction, with every ordinary op
+// ordered before every promotion op for that target. The receiver audits all
+// mandatory certificates against the transaction's final adjacency before it
+// ACKs. A separate removal barrier can therefore retire provisional bridges
+// without either the old cross-barrier eviction window or a third RTT.
 [[nodiscard]] constexpr Stage2ReconcileBarrier
 stage2_reconcile_first_barrier() noexcept {
-  return Stage2ReconcileBarrier::stable;
+  return Stage2ReconcileBarrier::install;
 }
 
 [[nodiscard]] constexpr Stage2ReconcileBarrier
 stage2_reconcile_next_barrier(Stage2ReconcileBarrier barrier) noexcept {
   switch (barrier) {
-    case Stage2ReconcileBarrier::stable:
-      return Stage2ReconcileBarrier::promotion;
-    case Stage2ReconcileBarrier::promotion:
+    case Stage2ReconcileBarrier::install:
       return Stage2ReconcileBarrier::removal;
     case Stage2ReconcileBarrier::removal:
     case Stage2ReconcileBarrier::none:
@@ -51,8 +50,7 @@ stage2_reconcile_next_barrier(Stage2ReconcileBarrier barrier) noexcept {
 // network ACK into a worker-wide blocking wait.
 enum class Stage2FinalizeSubphase : std::uint8_t {
   prepare,
-  promotion_wait,
-  stable_wait,
+  install_wait,
   removal_wait,
   placement_ready,
 };
@@ -60,10 +58,8 @@ enum class Stage2FinalizeSubphase : std::uint8_t {
 [[nodiscard]] constexpr Stage2FinalizeSubphase
 stage2_reconcile_wait_subphase(Stage2ReconcileBarrier barrier) noexcept {
   switch (barrier) {
-    case Stage2ReconcileBarrier::promotion:
-      return Stage2FinalizeSubphase::promotion_wait;
-    case Stage2ReconcileBarrier::stable:
-      return Stage2FinalizeSubphase::stable_wait;
+    case Stage2ReconcileBarrier::install:
+      return Stage2FinalizeSubphase::install_wait;
     case Stage2ReconcileBarrier::removal:
       return Stage2FinalizeSubphase::removal_wait;
     case Stage2ReconcileBarrier::none:
@@ -80,7 +76,7 @@ stage2_reconcile_wait_subphase(Stage2ReconcileBarrier barrier) noexcept {
 
 // RPCs belonging to the same peer may complete out of order, so a target's
 // operation run must never straddle two messages. Grouping retains the
-// original per-target order within each promotion/stable/removal barrier while
+// original per-target order within each install/removal barrier while
 // allowing independent targets to be packed.
 using Stage2ReconcileOp = service::storage_owner::ReconcileReverseOp;
 inline std::optional<std::vector<std::vector<Stage2ReconcileOp>>>
@@ -138,7 +134,7 @@ struct Stage2ReconcileChunk {
 // payload remains immutable from the first post through every transport retry.
 // Offsets, rather than pointers, keep chunks valid if the payload vector grows
 // while the barrier is initially assembled. A fresh epoch fences a late ACK
-// from an earlier promotion/stable/removal barrier in the same context slot.
+// from an earlier install/removal barrier in the same context slot.
 class Stage2ReconcileBatchState {
  public:
   using Op = service::storage_owner::ReconcileReverseOp;
