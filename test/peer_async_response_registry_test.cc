@@ -99,6 +99,42 @@ void test_registration_delivery_and_explicit_consumption() {
          detail::TryPeerResponse::stale);
 }
 
+void test_delivery_preserves_exact_maintenance_owner() {
+  detail::PeerAsyncResponseRegistry registry(2);
+  constexpr auto type = protocol::PeerRpcType::stage2_score_many_response;
+  constexpr u32 owner = 3;
+  assert(registry.register_send_attempt(14, 2, type, 4, owner) ==
+         detail::PeerResponseRegistration::registered);
+  assert(registry.register_send_attempt(14, 2, type, 4, owner) ==
+         detail::PeerResponseRegistration::retry);
+  // Worker ownership is part of correlation metadata. Shared aggregate wire
+  // requests pin their owner separately; ordinary duplicate request IDs must
+  // never redirect a completion to another executor.
+  assert(registry.register_send_attempt(14, 2, type, 4, owner + 1) ==
+         detail::PeerResponseRegistration::conflict);
+
+  u32 delivered_owner = detail::kNoMaintenanceWakeOwner;
+  const auto ok = response(14, 2, type, 4);
+  assert(registry.try_deliver(
+    2, 5, sizeof(ok), ok, &delivered_owner));
+  assert(delivered_owner == owner);
+
+  detail::PeerResponseDescriptor descriptor;
+  detail::PeerResponseLease lease;
+  assert(registry.try_take(14, 2, type, 4, descriptor, lease) ==
+         detail::TryPeerResponse::success);
+  assert(registry.mark_receive_reposted(lease));
+  assert(registry.ack_consumed(lease));
+
+  assert(registry.register_send_attempt(15, 2, type, 1) ==
+         detail::PeerResponseRegistration::registered);
+  delivered_owner = owner;
+  const auto unowned = response(15, 2, type, 1);
+  assert(registry.try_deliver(
+    2, 6, sizeof(unowned), unowned, &delivered_owner));
+  assert(delivered_owner == detail::kNoMaintenanceWakeOwner);
+}
+
 void test_shutdown_drain_respects_receive_ownership() {
   constexpr auto type = protocol::PeerRpcType::reverse_update_response;
   detail::PeerAsyncResponseRegistry registry(2);
@@ -384,6 +420,7 @@ void test_dedup_inflight_capacity_and_high_churn_fifo() {
 
 int main() {
   test_registration_delivery_and_explicit_consumption();
+  test_delivery_preserves_exact_maintenance_owner();
   test_retry_generation_and_cancelled_descriptor();
   test_transient_response_keeps_late_same_attempt_delivery_open();
   test_response_slab_aba_and_late_response();

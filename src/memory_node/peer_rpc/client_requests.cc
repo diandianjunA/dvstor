@@ -32,8 +32,16 @@ bool MemoryNode::try_post_peer_rpc_request_attempt(
     return false;
   }
 
+  u32 maintenance_wake_owner =
+    memory_node_detail::kNoMaintenanceWakeOwner;
+  if (current_storage_owner_maintenance_worker_) {
+    lib_assert(current_storage_owner_thread_ != nullptr,
+               "maintenance RPC registration has no executor state");
+    maintenance_wake_owner = current_storage_owner_thread_->id;
+  }
   const auto registration = peer_async_responses_->register_send_attempt(
-    request_id, target_shard, response_type, item_count);
+    request_id, target_shard, response_type, item_count,
+    maintenance_wake_owner);
   if (registration ==
       memory_node_detail::PeerResponseRegistration::already_complete) {
     return true;

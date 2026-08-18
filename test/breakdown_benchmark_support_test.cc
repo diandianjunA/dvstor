@@ -341,7 +341,11 @@ void test_maintenance_log_window() {
            << "stage2_independent_score_rpc_batches=" << completed << ' '
            << "stage2_independent_score_issued=" << completed * 32 << ' '
            << "stage2_independent_score_useful=" << completed * 16 << ' '
-           << "stage2_independent_score_wasted=" << completed * 8 << ' ';
+           << "stage2_independent_score_wasted=" << completed * 8 << ' '
+           << "maintenance_targeted_wakes=" << completed * 2 << ' '
+           << "maintenance_generic_wakes=" << completed * 3 << ' '
+           << "maintenance_broadcast_wakes=" << completed / 10 << ' '
+           << "maintenance_context_slots_scanned=" << completed * 16 << ' ';
     if (include_packing) {
       output << "packing_target_batch=" << (completed == 0 ? 2 : 4) << ' '
              << "packing_arrival_interval_us=" << completed + 100 << ' '
@@ -416,6 +420,11 @@ void test_maintenance_log_window() {
   assert(summary.stage2_independent_score_issued == 9'600);
   assert(summary.stage2_independent_score_useful == 4'800);
   assert(summary.stage2_independent_score_wasted == 2'400);
+  assert(summary.wake_counter_delta_available);
+  assert(summary.maintenance_targeted_wakes == 600);
+  assert(summary.maintenance_generic_wakes == 900);
+  assert(summary.maintenance_broadcast_wakes == 30);
+  assert(summary.maintenance_context_slots_scanned == 4'800);
   assert(summary.packing_delta_available);
   assert(summary.packing_target_batch_max == 4);
   assert(summary.packing_arrival_interval_us_max == 400);
@@ -588,6 +597,10 @@ void test_in_band_maintenance_snapshot_window() {
     begin[shard]->maintenance_worker_idle_waits = 3;
     begin[shard]->maintenance_worker_idle_ns = 4'000;
     begin[shard]->maintenance_lost_wake_avoided = 5;
+    begin[shard]->maintenance_targeted_wakes = 6;
+    begin[shard]->maintenance_generic_wakes = 7;
+    begin[shard]->maintenance_broadcast_wakes = 8;
+    begin[shard]->maintenance_context_slots_scanned = 9;
     begin[shard]->packing_target_batch = 2;
     begin[shard]->packing_arrival_interval_us = 1'000;
     begin[shard]->packing_waited_batches = 3;
@@ -670,6 +683,10 @@ void test_in_band_maintenance_snapshot_window() {
     latest.maintenance_worker_idle_waits += 30;
     latest.maintenance_worker_idle_ns += 40'000;
     latest.maintenance_lost_wake_avoided += 50;
+    latest.maintenance_targeted_wakes += 60;
+    latest.maintenance_generic_wakes += 70;
+    latest.maintenance_broadcast_wakes += 80;
+    latest.maintenance_context_slots_scanned += 90;
     latest.packing_target_batch = 4;
     latest.packing_arrival_interval_us = 2'000;
     latest.packing_waited_batches += 10;
@@ -767,6 +784,12 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.maintenance_worker_idle_waits == 60);
   assert(summary.maintenance_worker_idle_ns == 80'000);
   assert(summary.maintenance_lost_wake_avoided == 100);
+  assert(summary.wake_counter_delta_available);
+  assert(summary.logs_with_wake_counter_deltas == 2);
+  assert(summary.maintenance_targeted_wakes == 120);
+  assert(summary.maintenance_generic_wakes == 140);
+  assert(summary.maintenance_broadcast_wakes == 160);
+  assert(summary.maintenance_context_slots_scanned == 180);
   assert(summary.packing_delta_available);
   assert(summary.packing_target_batch_max == 4);
   assert(summary.packing_arrival_interval_us_max == 2'000);

@@ -230,9 +230,9 @@ class Stage2ReverseOutbox {
       Aggregate& aggregate = aggregates_[cursor++];
       if (aggregate.in_use && !aggregate.leased &&
           aggregate.state == AggregateState::ready_to_post &&
+          aggregate.snapshot.owner_worker_id == owner_worker_id &&
           aggregate.snapshot.ready_at_ns <= now_ns) {
         aggregate.leased = true;
-        aggregate.snapshot.owner_worker_id = owner_worker_id;
         return aggregate.snapshot;
       }
     }

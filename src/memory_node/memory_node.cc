@@ -279,39 +279,80 @@ void MemoryNode::notify_storage_owner_maintenance_capacity() {
   storage_owner_maintenance_cv_.notify_all();
 }
 
-void MemoryNode::notify_storage_owner_maintenance_executors() {
-  storage_owner_maintenance_wake_epoch_.fetch_add(
-    1, std::memory_order_release);
-  if (storage_owner_maintenance_wake_waiters_.load(
-        std::memory_order_acquire) == 0) {
+void MemoryNode::notify_storage_owner_maintenance_executor(u32 worker_id) {
+  const u32 worker_count =
+    storage_owner_maintenance_wake_worker_count_.load(
+      std::memory_order_acquire);
+  if (worker_id >= worker_count) {
+    // A stale/foreign registry tag must fail closed to all active executors.
+    // It cannot be silently dropped because its true owner is unknown.
+    notify_storage_owner_maintenance_executors();
     return;
   }
-  // Pair waiter registration with notification through the wake mutex. If an
-  // event lands between an executor's epoch snapshot and registration, its
-  // post-registration epoch recheck observes it; otherwise this acquisition
-  // occurs after wait_until atomically releases the mutex and cannot be lost.
-  {
-    std::lock_guard<std::mutex> lock(
-      storage_owner_maintenance_wake_mutex_);
+  storage_owner_maintenance_targeted_wakes_.fetch_add(
+    1, std::memory_order_relaxed);
+  auto& channel = storage_owner_maintenance_wake_channels_[worker_id];
+  channel.epoch.fetch_add(1, std::memory_order_release);
+  if (channel.waiters.load(std::memory_order_acquire) == 0) {
+    return;
   }
-  storage_owner_maintenance_wake_cv_.notify_all();
+  {
+    std::lock_guard<std::mutex> lock(channel.mutex);
+  }
+  channel.cv.notify_one();
+}
+
+void MemoryNode::notify_storage_owner_maintenance_executors() {
+  const u32 worker_count =
+    storage_owner_maintenance_wake_worker_count_.load(
+      std::memory_order_acquire);
+  if (worker_count == 0) return;
+  storage_owner_maintenance_broadcast_wakes_.fetch_add(
+    1, std::memory_order_relaxed);
+  for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {
+    auto& channel = storage_owner_maintenance_wake_channels_[worker_id];
+    channel.epoch.fetch_add(1, std::memory_order_release);
+    if (channel.waiters.load(std::memory_order_acquire) == 0) {
+      continue;
+    }
+    {
+      std::lock_guard<std::mutex> lock(channel.mutex);
+    }
+    channel.cv.notify_one();
+  }
 }
 
 void MemoryNode::notify_one_storage_owner_maintenance_executor() {
-  storage_owner_maintenance_wake_epoch_.fetch_add(
-    1, std::memory_order_release);
-  if (storage_owner_maintenance_wake_waiters_.load(
-        std::memory_order_acquire) == 0) {
-    return;
+  const u32 worker_count =
+    storage_owner_maintenance_wake_worker_count_.load(
+      std::memory_order_acquire);
+  if (worker_count == 0) return;
+  storage_owner_maintenance_generic_wakes_.fetch_add(
+    1, std::memory_order_relaxed);
+  const u32 ticket = storage_owner_maintenance_generic_wake_cursor_.fetch_add(
+    1, std::memory_order_relaxed);
+  u32 selected = ticket % worker_count;
+  // Shared capacity is not owner-specific. Prefer a sleeping executor so the
+  // sole edge is not assigned to a busy worker while every blocked context
+  // waits for its 1 ms deadline. Rotating the scan start preserves fairness.
+  for (u32 offset = 0; offset < worker_count; ++offset) {
+    const u32 candidate = (selected + offset) % worker_count;
+    if (storage_owner_maintenance_wake_channels_[candidate].waiters.load(
+          std::memory_order_acquire) != 0) {
+      selected = candidate;
+      break;
+    }
   }
+  auto& channel = storage_owner_maintenance_wake_channels_[selected];
+  channel.epoch.fetch_add(1, std::memory_order_release);
+  if (channel.waiters.load(std::memory_order_acquire) == 0) return;
   {
-    std::lock_guard<std::mutex> lock(
-      storage_owner_maintenance_wake_mutex_);
+    std::lock_guard<std::mutex> lock(channel.mutex);
   }
   // A fresh queue descriptor is not worker-owned; any executor can admit it.
   // Waking one avoids an eight-way herd. Context/RDMA completions continue to
-  // use notify_all because only their owning worker can make progress.
-  storage_owner_maintenance_wake_cv_.notify_one();
+  // route to the exact owner recorded by the response registry.
+  channel.cv.notify_one();
 }
 
 u64 MemoryNode::scale_ns(const u64 value, const u32 part, const u32 total) {

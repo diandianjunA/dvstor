@@ -435,6 +435,7 @@ private:
   // capacity waits retain storage_owner_maintenance_cv_.
   void notify_storage_owner_maintenance();
   void notify_storage_owner_maintenance_capacity();
+  void notify_storage_owner_maintenance_executor(u32 worker_id);
   void notify_storage_owner_maintenance_executors();
   void notify_one_storage_owner_maintenance_executor();
   void allocate_memory();
@@ -1261,10 +1262,25 @@ private:
   vec<u_ptr<StorageOwnerThread>> storage_owner_maintenance_worker_states_;
   std::mutex storage_owner_maintenance_mutex_;
   std::condition_variable storage_owner_maintenance_cv_;
-  std::mutex storage_owner_maintenance_wake_mutex_;
-  std::condition_variable storage_owner_maintenance_wake_cv_;
-  std::atomic<u64> storage_owner_maintenance_wake_epoch_{0};
-  std::atomic<u32> storage_owner_maintenance_wake_waiters_{0};
+  // Peer CQ progress intentionally outlives the maintenance runtime during
+  // shutdown.  Keep wake channels in stable MemoryNode storage instead of in
+  // worker_states_, which is cleared while peer progress can still release a
+  // send slot or deliver a late response.  CPU assignment cannot create more
+  // workers than Linux's CPU set can represent.
+  struct alignas(64) StorageOwnerMaintenanceWakeChannel {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<u64> epoch{0};
+    std::atomic<u32> waiters{0};
+  };
+  std::array<StorageOwnerMaintenanceWakeChannel, CPU_SETSIZE>
+    storage_owner_maintenance_wake_channels_;
+  std::atomic<u32> storage_owner_maintenance_wake_worker_count_{0};
+  std::atomic<u32> storage_owner_maintenance_generic_wake_cursor_{0};
+  std::atomic<u64> storage_owner_maintenance_targeted_wakes_{0};
+  std::atomic<u64> storage_owner_maintenance_broadcast_wakes_{0};
+  std::atomic<u64> storage_owner_maintenance_generic_wakes_{0};
+  std::atomic<u64> storage_owner_maintenance_context_slots_scanned_{0};
   std::atomic<u64> storage_owner_maintenance_lost_wake_avoided_{0};
   memory_node_storage_owner_maintenance_detail::
     Stage2AdaptivePackingController storage_owner_stage2_packing_;

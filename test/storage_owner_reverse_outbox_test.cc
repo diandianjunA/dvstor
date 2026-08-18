@@ -53,30 +53,35 @@ void test_two_contexts_share_one_wire_request_and_fan_out_ack() {
   assert(outbox.aggregate_size() == 1);
 
   size_t cursor = 0;
-  const auto ready = outbox.claim_ready_to_post(3, 10, cursor);
+  // The wire request keeps the worker that formed it for its full lifecycle.
+  // This makes the async response-registry owner exact even when a send-slot
+  // miss or timeout returns the aggregate to ready_to_post.
+  assert(!outbox.claim_ready_to_post(3, 10, cursor).has_value());
+  cursor = 0;
+  const auto ready = outbox.claim_ready_to_post(2, 10, cursor);
   assert(ready.has_value());
-  assert(ready->owner_worker_id == 3);
+  assert(ready->owner_worker_id == 2);
   std::array<Op, 8> wire_ops{};
-  assert(outbox.copy_ops(3, 1001, std::span<Op>{wire_ops}));
+  assert(outbox.copy_ops(2, 1001, std::span<Op>{wire_ops}));
   assert(wire_ops[0].target_raw == 1);
   assert(wire_ops[1].target_raw == 2);
   assert(wire_ops[2].target_raw == 3);
   assert(wire_ops[4].candidate_raw == 105);
-  assert(outbox.finish_post(3, 1001, true, 500));
+  assert(outbox.finish_post(2, 1001, true, 500));
 
   cursor = 0;
-  const auto awaiting = outbox.claim_awaiting_response(3, cursor);
+  const auto awaiting = outbox.claim_awaiting_response(2, cursor);
   assert(awaiting.has_value());
-  assert(awaiting->owner_worker_id == 3);
+  assert(awaiting->owner_worker_id == 2);
   std::array<detail::Stage2ReverseCompletion, 8> completions{};
   const auto completion_count = outbox.copy_completions(
-    3, 1001, std::span<detail::Stage2ReverseCompletion>{completions});
+    2, 1001, std::span<detail::Stage2ReverseCompletion>{completions});
   assert(completion_count == 2);
   assert(completions[0].logical_request_id == 11);
   assert(completions[0].worker_id == 0);
   assert(completions[1].logical_request_id == 12);
   assert(completions[1].worker_id == 1);
-  assert(outbox.finish_success(3, 1001));
+  assert(outbox.finish_success(2, 1001));
   assert(outbox.size() == 0);
   assert(outbox.aggregate_size() == 0);
 }
@@ -123,6 +128,8 @@ void test_retry_reuses_wire_id_and_payload() {
   size_t cursor = 0;
   assert(outbox.claim_ready_to_post(0, 0, cursor)->wire_request_id == 3001);
   assert(outbox.finish_post(0, 3001, false, 100));
+  cursor = 0;
+  assert(!outbox.claim_ready_to_post(1, 100, cursor).has_value());
   cursor = 0;
   assert(!outbox.claim_ready_to_post(0, 99, cursor).has_value());
   cursor = 0;

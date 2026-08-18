@@ -91,6 +91,27 @@ void MemoryNode::peer_rpc_progress_loop() {
         continue;
       }
 
+      const auto try_deliver_response = [&]() {
+        if (peer_async_responses_ == nullptr) return false;
+        u32 maintenance_wake_owner =
+          memory_node_detail::kNoMaintenanceWakeOwner;
+        if (!peer_async_responses_->try_deliver(
+              peer_id, slot_id, bytes, *header,
+              &maintenance_wake_owner)) {
+          return false;
+        }
+        // Synchronous/control callers retain their existing completion CV.
+        // A maintenance-tagged response additionally wakes only the executor
+        // that owns the response cell and its context.
+        peer_completion_cv_.notify_all();
+        if (maintenance_wake_owner !=
+            memory_node_detail::kNoMaintenanceWakeOwner) {
+          notify_storage_owner_maintenance_executor(
+            maintenance_wake_owner);
+        }
+        return true;
+      };
+
       if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_request)) {
         const size_t expected_bytes = service::storage_owner::reverse_update_request_bytes(header->item_count);
         if (header->item_count != 0 && header->reserved == 0 &&
@@ -420,12 +441,8 @@ void MemoryNode::peer_rpc_progress_loop() {
             (bytes - minimum_bytes) %
                 sizeof(service::storage_owner::Stage2ExpandScoreNeighbor) == 0;
         }
-        if (valid_response && peer_async_responses_ != nullptr &&
-            peer_async_responses_->try_deliver(
-              peer_id, slot_id, bytes, *header)) {
+        if (valid_response && try_deliver_response()) {
           hold_receive_slot = true;
-          peer_completion_cv_.notify_all();
-          notify_storage_owner_maintenance();
         }
       } else if (header->type == static_cast<u32>(
                    service::storage_owner::PeerRpcType::reconcile_reverse_response)) {
@@ -433,12 +450,8 @@ void MemoryNode::peer_rpc_progress_loop() {
           header->reserved == 0 &&
           bytes == service::storage_owner::reconcile_reverse_response_bytes(
             header->item_count);
-        if (valid_response && peer_async_responses_ != nullptr &&
-            peer_async_responses_->try_deliver(
-              peer_id, slot_id, bytes, *header)) {
+        if (valid_response && try_deliver_response()) {
           hold_receive_slot = true;
-          peer_completion_cv_.notify_all();
-          notify_storage_owner_maintenance();
         }
       } else if (header->type == static_cast<u32>(
                    service::storage_owner::PeerRpcType::stage1_arm_response)) {
@@ -446,12 +459,8 @@ void MemoryNode::peer_rpc_progress_loop() {
           header->reserved == 0 &&
           bytes == service::storage_owner::stage1_arm_response_bytes(
             header->item_count);
-        if (valid_response && peer_async_responses_ != nullptr &&
-            peer_async_responses_->try_deliver(
-              peer_id, slot_id, bytes, *header)) {
+        if (valid_response && try_deliver_response()) {
           hold_receive_slot = true;
-          peer_completion_cv_.notify_all();
-          notify_storage_owner_maintenance();
         }
       } else if (header->type == static_cast<u32>(service::storage_owner::PeerRpcType::reverse_update_response) ||
                  header->type == static_cast<u32>(service::storage_owner::PeerRpcType::cleanup_deleted_response) ||
@@ -459,12 +468,8 @@ void MemoryNode::peer_rpc_progress_loop() {
         const bool valid_response = header->item_count != 0 &&
           header->reserved == 0 &&
           bytes == service::storage_owner::reverse_update_response_bytes();
-        if (valid_response && peer_async_responses_ != nullptr &&
-            peer_async_responses_->try_deliver(
-              peer_id, slot_id, bytes, *header)) {
+        if (valid_response && try_deliver_response()) {
           hold_receive_slot = true;
-          peer_completion_cv_.notify_all();
-          notify_storage_owner_maintenance();
         }
       } else if (header->type == static_cast<u32>(
                    service::storage_owner::PeerRpcType::cleanup_activate_response) ||
@@ -487,12 +492,8 @@ void MemoryNode::peer_rpc_progress_loop() {
         const bool valid_response = header->item_count != 0 &&
           header->item_count <= config.storage_owner_batch_max &&
           header->reserved == 0 && bytes == expected_bytes;
-        if (valid_response && peer_async_responses_ != nullptr &&
-            peer_async_responses_->try_deliver(
-              peer_id, slot_id, bytes, *header)) {
+        if (valid_response && try_deliver_response()) {
           hold_receive_slot = true;
-          peer_completion_cv_.notify_all();
-          notify_storage_owner_maintenance();
         }
       } else if (header->type == static_cast<u32>(
                    service::storage_owner::PeerRpcType::stage1_execute_response)) {
@@ -501,12 +502,8 @@ void MemoryNode::peer_rpc_progress_loop() {
           header->reserved == 0 &&
           bytes == service::storage_owner::stage1_execute_response_bytes(
             header->item_count);
-        if (valid_response && peer_async_responses_ != nullptr &&
-            peer_async_responses_->try_deliver(
-              peer_id, slot_id, bytes, *header)) {
+        if (valid_response && try_deliver_response()) {
           hold_receive_slot = true;
-          peer_completion_cv_.notify_all();
-          notify_storage_owner_maintenance();
         }
       }
 

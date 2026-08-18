@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <limits>
 #include <memory>
 
 #include <library/context.hh>
@@ -161,6 +162,10 @@ struct PeerPendingSend {
   // A linked RC READ chain produces one successful CQE at its signaled tail.
   // Credit counters still account for every WR in that chain.
   u32 rdma_read_count{1};
+  // StorageOwnerThread::id values overlap across foreground, Stage1, and
+  // maintenance pools.  Record an explicit maintenance owner only when the
+  // posting thread belongs to the maintenance executor domain.
+  u32 maintenance_wake_owner{std::numeric_limits<u32>::max()};
 };
 
 struct StorageOwnerInsertTask {
