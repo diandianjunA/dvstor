@@ -38,6 +38,9 @@ int main() {
     .stage2_independent_score_issued = 160,
     .stage2_independent_score_useful = 96,
     .stage2_independent_score_wasted = 64,
+    .completion_incomplete = 6,
+    .completion_logical_full_failures = 7,
+    .completion_physical_full_failures = 1,
   };
   first.stage2_delay_histogram[6] = 12;
   telemetry::publish(control_page.data(), first);
@@ -65,6 +68,9 @@ int main() {
   assert(copied.stage2_independent_score_rpc_batches == 5);
   assert(copied.stage2_independent_score_issued == 160);
   assert(copied.stage2_independent_score_useful == 96);
+  assert(copied.completion_incomplete == 6);
+  assert(copied.completion_logical_full_failures == 7);
+  assert(copied.completion_physical_full_failures == 1);
 
   telemetry::Snapshot second = first;
   second.published_steady_ns = 200;

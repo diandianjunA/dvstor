@@ -1535,6 +1535,23 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"completion_outstanding", maintenance_summary.completion_outstanding},
     {"max_completion_outstanding_per_shard",
      maintenance_summary.max_completion_outstanding_per_shard},
+    {"completion_incomplete", maintenance_summary.completion_incomplete},
+    {"max_completion_incomplete_per_shard",
+     maintenance_summary.max_completion_incomplete_per_shard},
+    {"completed_behind_hole",
+     maintenance_summary.completion_outstanding >=
+         maintenance_summary.completion_incomplete
+       ? maintenance_summary.completion_outstanding -
+           maintenance_summary.completion_incomplete
+       : 0},
+    {"exact_completion_credit_available",
+     maintenance_summary.exact_completion_credit_available},
+    {"completion_logical_full_failures",
+     maintenance_summary.completion_logical_full_failures},
+    {"completion_physical_full_failures",
+     maintenance_summary.completion_physical_full_failures},
+    {"completion_admission_failure_delta_available",
+     maintenance_summary.completion_admission_failure_delta_available},
     {"completion_window_available",
      maintenance_summary.completion_window_available},
     {"locality_delta_available",

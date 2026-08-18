@@ -29,6 +29,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   current_storage_owner_thread_ = &thread;
   current_storage_owner_maintenance_worker_ = true;
   const Configuration& config = *storage_worker_config_;
+  const bool independent_score_experiment_enabled =
+    storage_owner_independent_score_experiment_enabled_;
   lib_assert(num_storage_nodes_ > 0 && num_storage_nodes_ <= 64,
              "asynchronous stage2 supports at most 64 storage shards");
 
@@ -1306,6 +1308,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     // chain while preserving each task's private beam and convergence state.
     Stage2SearchIoState& search_io = context.search_io;
     search_io.independent_score_allowed =
+      independent_score_experiment_enabled &&
       context.independent_score_sample.allows_speculation();
     const Stage2SearchAdvanceResult search_result =
       advance_stage2_search_candidates_batched(
@@ -3038,15 +3041,17 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         : service_ns + context.packing_wait_ns;
       const size_t debt_at_completion =
         storage_owner_maintenance_completion_ring_ == nullptr ? 0 :
-          storage_owner_maintenance_completion_ring_->outstanding();
-      storage_owner_independent_score_.observe_completion(
-        context.independent_score_sample,
-        context.tasks.size(),
-        effective_cost_ns,
-        context.packing_debt_at_admission,
-        debt_at_completion,
-        context.search_io.independent_score_rpcs_posted,
-        context.search_io.independent_score_useful);
+          storage_owner_maintenance_completion_ring_->incomplete();
+      if (independent_score_experiment_enabled) {
+        storage_owner_independent_score_.observe_completion(
+          context.independent_score_sample,
+          context.tasks.size(),
+          effective_cost_ns,
+          context.packing_debt_at_admission,
+          debt_at_completion,
+          context.search_io.independent_score_rpcs_posted,
+          context.search_io.independent_score_useful);
+      }
       storage_owner_stage2_packing_.observe_completion(
         context.packing_target_batch,
         context.packing_high_pressure,
@@ -3264,16 +3269,16 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         storage_owner_cleanup_tasks_.front().retry_not_before;
     const auto packing_parameters =
       storage_owner_stage2_packing_.parameters();
-    const size_t completion_outstanding =
+    const size_t completion_incomplete =
       storage_owner_maintenance_completion_ring_ == nullptr ? 0 :
-        storage_owner_maintenance_completion_ring_->outstanding();
+        storage_owner_maintenance_completion_ring_->incomplete();
     // Completion debt is the dataset-independent signal that Stage2, rather
     // than a sparse low-rate workload, needs more coalescing. A queue already
     // holding two target batches is independently high pressure. Isolated
     // arrivals and short bursts therefore retain immediate/legacy latency.
     const bool completion_pressure =
       storage_owner_maintenance_admission_limit_ != 0 &&
-      completion_outstanding >=
+      completion_incomplete >=
         (storage_owner_maintenance_admission_limit_ + 1) / 2;
     const bool queue_pressure =
       storage_owner_stage2_tasks_.size() >=
@@ -3327,17 +3332,19 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         std::min<u64>(
           oldest_wait_ns,
           static_cast<u64>(packing_decision.wait_budget_us) * 1'000);
-      context.packing_debt_at_admission = completion_outstanding;
+      context.packing_debt_at_admission = completion_incomplete;
       context.packing_target_batch = static_cast<u32>(
         packing_decision.target_batch);
       context.packing_high_pressure = packing_high_pressure;
-      const bool stable_legacy_packing =
-        packing_parameters.larger_batch_trials_disabled ||
-        !storage_owner_stage2_larger_batch_trials_possible_;
-      context.independent_score_sample =
-        storage_owner_independent_score_.sample(
-          packing_high_pressure && stable_legacy_packing &&
-          packing_decision.target_batch <= 2);
+      if (independent_score_experiment_enabled) {
+        const bool stable_legacy_packing =
+          packing_parameters.larger_batch_trials_disabled ||
+          !storage_owner_stage2_larger_batch_trials_possible_;
+        context.independent_score_sample =
+          storage_owner_independent_score_.sample(
+            packing_high_pressure && stable_legacy_packing &&
+            packing_decision.target_batch <= 2);
+      }
       storage_owner_stage2_packing_.observe_admission(
         packing_decision.reason, context.tasks.size(), oldest_wait_ns,
         packing_decision.wait_budget_us);
@@ -3431,8 +3438,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         // finalization feedback path. Consume any admission token with a
         // zero-task sample so an in-process stop/start cannot retain a false
         // speculative-generation outstanding count.
-        storage_owner_independent_score_.observe_completion(
-          context.independent_score_sample, 0, 0, 0, 0, 0, 0);
+        if (independent_score_experiment_enabled) {
+          storage_owner_independent_score_.observe_completion(
+            context.independent_score_sample, 0, 0, 0, 0, 0, 0);
+        }
         release_context_lane(context);
         storage_owner_maintenance_active_workers_.fetch_sub(
           1, std::memory_order_acq_rel);
@@ -3483,12 +3492,12 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           storage_owner_maintenance_mutex_);
         if (!storage_owner_stage2_tasks_.empty()) {
           const auto parameters = storage_owner_stage2_packing_.parameters();
-          const size_t outstanding =
+          const size_t incomplete =
             storage_owner_maintenance_completion_ring_ == nullptr ? 0 :
-              storage_owner_maintenance_completion_ring_->outstanding();
+              storage_owner_maintenance_completion_ring_->incomplete();
           const bool completion_pressure =
             storage_owner_maintenance_admission_limit_ != 0 &&
-            outstanding >=
+            incomplete >=
               (storage_owner_maintenance_admission_limit_ + 1) / 2;
           const bool queue_pressure =
             storage_owner_stage2_tasks_.size() >=

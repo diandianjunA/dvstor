@@ -288,9 +288,9 @@ void MemoryNode::wake_peer_stage1_admission_waiters() {
       storage_worker_config_ == nullptr) {
     return;
   }
-  const size_t outstanding =
-    storage_owner_maintenance_completion_ring_->outstanding();
-  if (outstanding >= storage_owner_maintenance_admission_limit_) return;
+  const size_t incomplete =
+    storage_owner_maintenance_completion_ring_->incomplete();
+  if (incomplete >= storage_owner_maintenance_admission_limit_) return;
   size_t queue_available = 0;
   {
     std::lock_guard<std::mutex> lock(storage_owner_maintenance_mutex_);
@@ -303,7 +303,7 @@ void MemoryNode::wake_peer_stage1_admission_waiters() {
     queue_available = queue_depth - occupied;
   }
   size_t available = std::min(
-    storage_owner_maintenance_admission_limit_ - outstanding,
+    storage_owner_maintenance_admission_limit_ - incomplete,
     queue_available);
   u64 woken = 0;
   {

@@ -112,16 +112,17 @@ inline Stage2PackingDecision decide_stage2_packing(
     adaptive_target, 1, batch_limit);
   // A target-four policy is meaningful only while completion/queue pressure
   // supplies both enough arrivals and a measurable capacity signal. Outside
-  // that trial domain select the legacy target, including its original
-  // oldest-descriptor 50 us deadline. Immediate low-pressure flushes reduced
-  // measured packing from 2.186 to 2.139 tasks/context even after target four
-  // had rolled back, so they were not a faithful rollback path.
+  // that trial domain select the legacy target and flush immediately: 185634
+  // sent 99,009 of 99,028 contexts through the deadline path while both batch
+  // size and end-to-end throughput regressed. There is no batching benefit to
+  // justify putting isolated arrivals on a timer.
   if (!high_pressure) {
     decision.target_batch = std::min<std::size_t>(2, batch_limit);
   }
-  // Target <=2 is the measured legacy/baseline path: keep its original
-  // collect-until-deadline then drain-up-to-wire-limit behavior. Capping the
-  // rollback path at two would make the safety mechanism itself a regression.
+  // Under real pressure, target <=2 is the measured legacy/baseline path:
+  // collect until its bounded deadline, then drain up to the wire limit. The
+  // low-pressure branch below bypasses that timer, and the rollback path still
+  // must not cap an already-available batch at two.
   decision.pop_limit = decision.target_batch <= 2
     ? batch_limit : decision.target_batch;
   if (queued_tasks == 0) return decision;
@@ -130,6 +131,11 @@ inline Stage2PackingDecision decide_stage2_packing(
     decision.ready = true;
     decision.pop_limit = batch_limit;
     decision.reason = Stage2PackingFlushReason::full;
+    return decision;
+  }
+  if (!high_pressure) {
+    decision.ready = true;
+    decision.reason = Stage2PackingFlushReason::low_pressure;
     return decision;
   }
   if (legacy_wait_us == 0) {

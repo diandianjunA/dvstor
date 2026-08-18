@@ -256,18 +256,24 @@ void test_sliding_completion_ring() {
   const u64 three = ring.reserve(1);
   assert(one == 1 && two == 2 && three == 3);
   assert(ring.outstanding() == 3);
+  assert(ring.incomplete() == 3);
 
   ring.complete(two);
+  assert(ring.incomplete() == 3);
   ring.complete(three);
   assert(ring.finalized() == 0);
+  assert(ring.incomplete() == 2);
   ring.complete(one);
   assert(ring.finalized() == 1);
+  assert(ring.incomplete() == 1);
   ring.complete(two);
   assert(ring.finalized() == 3);
+  assert(ring.incomplete() == 0);
 
   const u64 four = ring.reserve(0);
   assert(four == 4);
   assert(ring.finalized() == 4);
+  assert(ring.incomplete() == 0);
 
   const u64 five = ring.reserve(1);
   const u64 six = ring.reserve(1);
@@ -353,21 +359,22 @@ void test_sliding_completion_ring_try_batch_is_atomic_and_nonblocking() {
   assert(ring.finalized() == finalized_before_full_try);
   assert(ring.outstanding() == 3);
 
-  // Out-of-order completions do not release contiguous admission credit.
+  // Out-of-order completions release exact service credit even though the
+  // contiguous physical/durable span remains pinned by sequence one.
   ring.complete(2);
   ring.complete(3);
-  assert(ring.try_reserve_batch(
-           span<const u32>{blocked_work.data(), blocked_work.size()}, 3) == 0);
-  assert(ring.next_sequence() == next_before_full_try);
-
-  ring.complete(1);
+  assert(ring.incomplete() == 1);
+  assert(ring.outstanding() == 3);
   assert(ring.try_reserve_batch(
            span<const u32>{blocked_work.data(), blocked_work.size()}, 3) == 4);
   assert(ring.next_sequence() == 6);
+
+  ring.complete(1);
   ring.complete(5);
   assert(ring.finalized() == 3);
   ring.complete(4);
   assert(ring.finalized() == 5);
+  assert(ring.incomplete() == 0);
 }
 
 void test_sliding_completion_ring_concurrent_try_batches_claim_no_partials() {
@@ -419,13 +426,13 @@ void test_sliding_completion_ring_bounded_smooth_admission() {
     });
     assert(waiter.wait_for(std::chrono::milliseconds(10)) ==
            std::future_status::timeout);
-    // Out-of-order completion does not release admission credit.
+    // Exact service credit returns immediately even though durable order is
+    // still pinned by sequence one.
     ring.complete(2);
-    assert(waiter.wait_for(std::chrono::milliseconds(10)) ==
-           std::future_status::timeout);
-    ring.complete(1);
     assert(waiter.wait_for(std::chrono::seconds(1)) ==
            std::future_status::ready);
+    assert(ring.finalized() == 0);
+    ring.complete(1);
     ring.complete(waiter.get());
   }
 
@@ -467,6 +474,102 @@ void test_sliding_completion_ring_bounded_smooth_admission() {
     ring.complete(admitted);
     ring.complete(remaining_waiter.get());
   }
+}
+
+void test_sliding_completion_ring_exact_credit_keeps_physical_span_bounded() {
+  bounded::SlidingCompletionRing ring(4);
+  const std::array<u32, 2> initial_work{1, 1};
+  assert(ring.reserve_batch(
+           span<const u32>{initial_work.data(), initial_work.size()}, 2) == 1);
+
+  // Keep sequence one unfinished while returning and reusing the second exact
+  // service credit. The durable span grows, but never aliases the four-cell
+  // physical ring.
+  ring.complete(2);
+  assert(ring.finalized() == 0);
+  assert(ring.outstanding() == 2);
+  assert(ring.incomplete() == 1);
+  const std::array<u32, 1> one_work{1};
+  assert(ring.try_reserve_batch(
+           span<const u32>{one_work.data(), one_work.size()}, 2) == 3);
+  ring.complete(3);
+  assert(ring.try_reserve_batch(
+           span<const u32>{one_work.data(), one_work.size()}, 2) == 4);
+  ring.complete(4);
+  assert(ring.outstanding() == 4);
+  assert(ring.incomplete() == 1);
+
+  // Logical credit is available, but the physical sequence span is full.
+  assert(ring.try_reserve_batch(
+           span<const u32>{one_work.data(), one_work.size()}, 2) == 0);
+  assert(ring.next_sequence() == 5);
+  ring.complete(1);
+  assert(ring.finalized() == 4);
+  assert(ring.outstanding() == 0);
+  assert(ring.incomplete() == 0);
+  assert(ring.try_reserve_batch(
+           span<const u32>{one_work.data(), one_work.size()}, 2) == 5);
+  ring.complete(5);
+}
+
+void test_sliding_completion_ring_partial_work_releases_one_credit_once() {
+  bounded::SlidingCompletionRing ring(8);
+  const std::array<u32, 2> work{3, 1};
+  assert(ring.reserve_batch(
+           span<const u32>{work.data(), work.size()}, 2) == 1);
+  assert(ring.incomplete() == 2);
+
+  ring.complete(1, 2);
+  assert(ring.remaining(1) == 1);
+  assert(ring.incomplete() == 2);
+  const std::array<u32, 1> one_work{1};
+  assert(ring.try_reserve_batch(
+           span<const u32>{one_work.data(), one_work.size()}, 2) == 0);
+
+  ring.complete(2);
+  assert(ring.finalized() == 0);
+  assert(ring.incomplete() == 1);
+  assert(ring.try_reserve_batch(
+           span<const u32>{one_work.data(), one_work.size()}, 2) == 3);
+  ring.complete(3);
+  assert(ring.incomplete() == 1);
+  ring.complete(1);
+  assert(ring.finalized() == 3);
+  assert(ring.incomplete() == 0);
+}
+
+void test_sliding_completion_ring_physical_wait_does_not_spin_on_rollback() {
+  bounded::SlidingCompletionRing ring(2);
+  const std::array<u32, 2> initial_work{1, 1};
+  assert(ring.reserve_batch(
+           span<const u32>{initial_work.data(), initial_work.size()}, 2) == 1);
+  ring.complete(2);
+  assert(ring.incomplete() == 1);
+  assert(ring.outstanding() == 2);
+
+  std::atomic<bool> reserve_started{false};
+  auto blocked = std::async(std::launch::async, [&]() {
+    const std::array<u32, 1> one_work{1};
+    reserve_started.store(true, std::memory_order_release);
+    return ring.reserve_batch(
+      span<const u32>{one_work.data(), one_work.size()}, 2);
+  });
+  while (!reserve_started.load(std::memory_order_acquire) ||
+         ring.physical_full_failures() == 0) {
+    std::this_thread::yield();
+  }
+  assert(blocked.wait_for(std::chrono::milliseconds(10)) ==
+         std::future_status::timeout);
+  const u64 failures_while_blocked = ring.physical_full_failures();
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  assert(ring.physical_full_failures() == failures_while_blocked);
+
+  ring.complete(1);
+  assert(blocked.wait_for(std::chrono::seconds(1)) ==
+         std::future_status::ready);
+  assert(blocked.get() == 3);
+  ring.complete(3);
+  assert(ring.finalized() == 3);
 }
 
 void test_sliding_completion_ring_concurrent_batches_never_partially_admit() {
@@ -528,9 +631,9 @@ void test_sliding_completion_ring_concurrent_batches_never_partially_admit() {
              std::future_status::timeout);
     }
 
-    // Completion may arrive out of order, but admission credit is released
-    // only after the complete contiguous pair has finalized.  That release
-    // must wake one of the remaining batches and guarantee forward progress.
+    // One out-of-order completion releases only one exact credit, which is
+    // insufficient for another two-item batch. The second completion returns
+    // the other credit and must wake one whole waiter without partial claims.
     ring.complete(first_sequence + 1);
     assert(ring.finalized() == first_sequence - 1);
     assert(ring.outstanding() == kBatchItems);
@@ -1079,6 +1182,9 @@ int main() {
   test_sliding_completion_ring_try_batch_is_atomic_and_nonblocking();
   test_sliding_completion_ring_concurrent_try_batches_claim_no_partials();
   test_sliding_completion_ring_bounded_smooth_admission();
+  test_sliding_completion_ring_exact_credit_keeps_physical_span_bounded();
+  test_sliding_completion_ring_partial_work_releases_one_credit_once();
+  test_sliding_completion_ring_physical_wait_does_not_spin_on_rollback();
   test_sliding_completion_ring_concurrent_batches_never_partially_admit();
   test_integral_raw_stage2_distance_is_exact();
   test_wide_integral_simd_distance_never_overflows();

@@ -32,6 +32,9 @@ struct MaintenanceObservation {
   uint64_t peer_reverse_retry_attempts{};
   uint64_t admission_window{};
   uint64_t completion_outstanding{};
+  uint64_t completion_incomplete{};
+  uint64_t completion_logical_full_failures{};
+  uint64_t completion_physical_full_failures{};
   uint64_t stage2_continuations{};
   uint64_t stage2_remote_frontier_items{};
   uint64_t stage2_remote_expansions{};
@@ -94,6 +97,8 @@ struct MaintenanceObservation {
   bool peer_reverse_retry_counter_available{};
   bool stage2_delay_histogram_available{};
   bool completion_window_available{};
+  bool exact_completion_credit_available{};
+  bool completion_admission_failure_counters_available{};
   bool locality_counters_available{};
   bool search_budget_counters_available{};
   bool independent_score_counters_available{};
@@ -126,6 +131,10 @@ struct MaintenanceLogSummary {
   uint64_t admission_window{};
   uint64_t completion_outstanding{};
   uint64_t max_completion_outstanding_per_shard{};
+  uint64_t completion_incomplete{};
+  uint64_t max_completion_incomplete_per_shard{};
+  uint64_t completion_logical_full_failures{};
+  uint64_t completion_physical_full_failures{};
   uint64_t stage2_finalized_live{};
   uint64_t stage2_continuations{};
   uint64_t stage2_remote_frontier_items{};
@@ -198,6 +207,8 @@ struct MaintenanceLogSummary {
   size_t logs_with_peer_reverse_retry_deltas{};
   size_t logs_with_histogram_deltas{};
   size_t logs_with_completion_window{};
+  size_t logs_with_exact_completion_credit{};
+  size_t logs_with_completion_admission_failure_deltas{};
   size_t logs_with_locality_deltas{};
   size_t logs_with_search_budget_deltas{};
   size_t logs_with_execution_counter_deltas{};
@@ -209,6 +220,8 @@ struct MaintenanceLogSummary {
   bool failure_delta_available{};
   bool peer_reverse_retry_delta_available{};
   bool completion_window_available{};
+  bool exact_completion_credit_available{};
+  bool completion_admission_failure_delta_available{};
   bool locality_delta_available{};
   bool search_budget_delta_available{};
   bool execution_counter_delta_available{};

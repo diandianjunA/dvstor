@@ -21,23 +21,16 @@ void test_legacy_helpers_keep_oldest_deadline() {
     7, 32, oldest, oldest + std::chrono::microseconds(50), 50));
 }
 
-void test_low_pressure_preserves_legacy_deadline() {
+void test_low_pressure_flushes_immediately() {
   const Clock::time_point oldest{};
-  const auto waiting = detail::decide_stage2_packing(
-    1, 32, 4, oldest, oldest, 50, 2'000, false);
-  assert(!waiting.ready);
-  assert(waiting.target_batch == 2);
-  assert(waiting.pop_limit == 32);
-  assert(waiting.wait_budget_us == 50);
-  assert(waiting.deadline == oldest + std::chrono::microseconds(50));
-
   const auto flush = detail::decide_stage2_packing(
-    1, 32, 4, oldest, oldest + std::chrono::microseconds(50),
-    50, 2'000, false);
+    1, 32, 4, oldest, oldest, 50, 2'000, false);
   assert(flush.ready);
-  assert(flush.reason == detail::Stage2PackingFlushReason::deadline);
+  assert(flush.reason == detail::Stage2PackingFlushReason::low_pressure);
   assert(flush.target_batch == 2);
   assert(flush.pop_limit == 32);
+  assert(flush.wait_budget_us == 0);
+  assert(!flush.deadline.has_value());
 }
 
 void test_legacy_rollback_does_not_cap_context_at_two() {
@@ -284,7 +277,7 @@ void test_successful_periodic_probe_reduces_probe_tax() {
 
 int main() {
   test_legacy_helpers_keep_oldest_deadline();
-  test_low_pressure_preserves_legacy_deadline();
+  test_low_pressure_flushes_immediately();
   test_legacy_rollback_does_not_cap_context_at_two();
   test_trial_wait_is_arrival_adaptive_and_hard_bounded();
   test_feedback_accepts_real_per_task_gain();

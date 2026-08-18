@@ -155,6 +155,12 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
   const auto admission_window = parse_u64(fields, "admission_window");
   const auto completion_outstanding =
     parse_u64(fields, "completion_outstanding");
+  const auto completion_incomplete =
+    parse_u64(fields, "completion_incomplete");
+  const auto completion_logical_full_failures =
+    parse_u64(fields, "completion_logical_full_failures");
+  const auto completion_physical_full_failures =
+    parse_u64(fields, "completion_physical_full_failures");
   const auto stage2_continuations =
     parse_u64(fields, "stage2_continuations");
   const auto stage2_remote_frontier_items =
@@ -263,6 +269,11 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
     .peer_reverse_retry_attempts = peer_reverse_failed.value_or(0),
     .admission_window = admission_window.value_or(0),
     .completion_outstanding = completion_outstanding.value_or(0),
+    .completion_incomplete = completion_incomplete.value_or(0),
+    .completion_logical_full_failures =
+      completion_logical_full_failures.value_or(0),
+    .completion_physical_full_failures =
+      completion_physical_full_failures.value_or(0),
     .stage2_continuations = stage2_continuations.value_or(0),
     .stage2_remote_frontier_items =
       stage2_remote_frontier_items.value_or(0),
@@ -338,6 +349,11 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
     .stage2_delay_histogram_available = histogram.has_value(),
     .completion_window_available = admission_window.has_value() &&
       completion_outstanding.has_value(),
+    .exact_completion_credit_available =
+      completion_incomplete.has_value(),
+    .completion_admission_failure_counters_available =
+      completion_logical_full_failures.has_value() &&
+      completion_physical_full_failures.has_value(),
     .locality_counters_available = stage2_continuations.has_value() &&
       stage2_remote_frontier_items.has_value() &&
       stage2_remote_expansions.has_value() &&
@@ -554,6 +570,11 @@ MaintenanceLogSummary summarize_impl(
           summary.max_completion_outstanding_per_shard,
           observation.completion_outstanding);
       }
+      if (observation.exact_completion_credit_available) {
+        summary.max_completion_incomplete_per_shard = std::max(
+          summary.max_completion_incomplete_per_shard,
+          observation.completion_incomplete);
+      }
     }
     const auto& latest = slice.observations.back();
     summary.remaining += latest.backlog();
@@ -561,6 +582,27 @@ MaintenanceLogSummary summarize_impl(
       ++summary.logs_with_completion_window;
       summary.admission_window += latest.admission_window;
       summary.completion_outstanding += latest.completion_outstanding;
+    }
+    if (latest.exact_completion_credit_available) {
+      ++summary.logs_with_exact_completion_credit;
+      summary.completion_incomplete += latest.completion_incomplete;
+    }
+
+    if (!slice.rotated && cursor.baseline_available &&
+        cursor.baseline.completion_admission_failure_counters_available &&
+        latest.completion_admission_failure_counters_available) {
+      uint64_t logical_full = 0;
+      uint64_t physical_full = 0;
+      if (counter_delta(
+            cursor.baseline.completion_logical_full_failures,
+            latest.completion_logical_full_failures, &logical_full) &&
+          counter_delta(
+            cursor.baseline.completion_physical_full_failures,
+            latest.completion_physical_full_failures, &physical_full)) {
+        ++summary.logs_with_completion_admission_failure_deltas;
+        summary.completion_logical_full_failures += logical_full;
+        summary.completion_physical_full_failures += physical_full;
+      }
     }
 
     if (!slice.rotated && cursor.baseline_available &&
@@ -831,6 +873,12 @@ MaintenanceLogSummary summarize_impl(
     summary.logs_with_peer_reverse_retry_deltas == summary.requested_logs;
   summary.completion_window_available = summary.requested_logs != 0 &&
     summary.logs_with_completion_window == summary.requested_logs;
+  summary.exact_completion_credit_available = summary.requested_logs != 0 &&
+    summary.logs_with_exact_completion_credit == summary.requested_logs;
+  summary.completion_admission_failure_delta_available =
+    summary.requested_logs != 0 &&
+    summary.logs_with_completion_admission_failure_deltas ==
+      summary.requested_logs;
   summary.locality_delta_available = summary.requested_logs != 0 &&
     summary.logs_with_locality_deltas == summary.requested_logs;
   summary.search_budget_delta_available = summary.requested_logs != 0 &&
@@ -879,6 +927,8 @@ std::vector<MaintenanceLogCursor> snapshot_maintenance_logs(
       } else if (cursor.offset == 0) {
         // An empty, readable log represents a fresh zero-counter baseline.
         cursor.baseline.failure_counters_available = true;
+        cursor.baseline.completion_admission_failure_counters_available =
+          true;
         cursor.baseline.stage2_delay_histogram_available = true;
         cursor.baseline.locality_counters_available = true;
         cursor.baseline.independent_score_counters_available = true;
@@ -954,6 +1004,23 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
     summary.max_completion_outstanding_per_shard = std::max(
       summary.max_completion_outstanding_per_shard,
       latest.completion_outstanding);
+    ++summary.logs_with_exact_completion_credit;
+    summary.completion_incomplete += latest.completion_incomplete;
+    summary.max_completion_incomplete_per_shard = std::max(
+      summary.max_completion_incomplete_per_shard,
+      latest.completion_incomplete);
+    uint64_t logical_full = 0;
+    uint64_t physical_full = 0;
+    if (counter_delta(first.completion_logical_full_failures,
+                      latest.completion_logical_full_failures,
+                      &logical_full) &&
+        counter_delta(first.completion_physical_full_failures,
+                      latest.completion_physical_full_failures,
+                      &physical_full)) {
+      ++summary.logs_with_completion_admission_failure_deltas;
+      summary.completion_logical_full_failures += logical_full;
+      summary.completion_physical_full_failures += physical_full;
+    }
 
     uint64_t failed = 0;
     if (counter_delta(first.failed, latest.failed, &failed)) {
@@ -1304,6 +1371,12 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
     summary.logs_with_peer_reverse_retry_deltas == summary.requested_logs;
   summary.completion_window_available = summary.requested_logs != 0 &&
     summary.logs_with_completion_window == summary.requested_logs;
+  summary.exact_completion_credit_available = summary.requested_logs != 0 &&
+    summary.logs_with_exact_completion_credit == summary.requested_logs;
+  summary.completion_admission_failure_delta_available =
+    summary.requested_logs != 0 &&
+    summary.logs_with_completion_admission_failure_deltas ==
+      summary.requested_logs;
   summary.locality_delta_available = summary.requested_logs != 0 &&
     summary.logs_with_locality_deltas == summary.requested_logs;
   summary.search_budget_delta_available = summary.requested_logs != 0 &&
