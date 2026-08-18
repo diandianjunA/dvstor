@@ -476,9 +476,6 @@ void test_in_band_maintenance_snapshot_window() {
       .stage2_batched_items = 8,
       .stage2_graph_read_waves = 5,
       .stage2_graph_unique_reads = 40,
-      .stage2_graph_prefetch_predictions = 4,
-      .stage2_graph_prefetch_top1_hits = 2,
-      .stage2_graph_prefetch_top2_hits = 3,
       .stage2_vector_read_waves = 6,
       .stage2_vector_unique_reads = 60,
     };
@@ -501,6 +498,9 @@ void test_in_band_maintenance_snapshot_window() {
     begin[shard]->physical_stage1_candidates = 256;
     begin[shard]->physical_stage1_remote_frontier_items = 1'200;
     begin[shard]->physical_stage1_neighbors = 96;
+    begin[shard]->stage2_home_rpc_batches = 5;
+    begin[shard]->stage2_home_rpc_items = 24;
+    begin[shard]->stage2_home_scored_neighbors = 12;
     begin[shard]->stage2_home_score_rpc_batches = 2;
     begin[shard]->stage2_home_score_rpc_items = 16;
     begin[shard]->stage2_home_score_rpc_queries = 4;
@@ -532,9 +532,6 @@ void test_in_band_maintenance_snapshot_window() {
     latest.stage2_batched_items = 28;
     latest.stage2_graph_read_waves = 15;
     latest.stage2_graph_unique_reads = 120;
-    latest.stage2_graph_prefetch_predictions += 40;
-    latest.stage2_graph_prefetch_top1_hits += 20;
-    latest.stage2_graph_prefetch_top2_hits += 30;
     latest.stage2_vector_read_waves = 18;
     latest.stage2_vector_unique_reads = 180;
     for (size_t phase = 0;
@@ -556,6 +553,9 @@ void test_in_band_maintenance_snapshot_window() {
     latest.physical_stage1_candidates += 2'560;
     latest.physical_stage1_remote_frontier_items += 12'000;
     latest.physical_stage1_neighbors += 960;
+    latest.stage2_home_rpc_batches += 50;
+    latest.stage2_home_rpc_items += 240;
+    latest.stage2_home_scored_neighbors += 120;
     latest.stage2_home_score_rpc_batches += 20;
     latest.stage2_home_score_rpc_items += 160;
     latest.stage2_home_score_rpc_queries += 40;
@@ -594,11 +594,12 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.stage2_batched_items == 40);
   assert(summary.stage2_graph_read_waves == 20);
   assert(summary.stage2_graph_unique_reads == 160);
-  assert(summary.stage2_graph_prefetch_predictions == 80);
-  assert(summary.stage2_graph_prefetch_top1_hits == 40);
-  assert(summary.stage2_graph_prefetch_top2_hits == 60);
   assert(summary.stage2_vector_read_waves == 24);
   assert(summary.stage2_vector_unique_reads == 240);
+  assert(summary.home_rpc_wire_counter_delta_available);
+  assert(summary.stage2_home_rpc_batches == 100);
+  assert(summary.stage2_home_rpc_items == 480);
+  assert(summary.stage2_home_scored_neighbors == 240);
   assert(summary.score_rpc_wire_counter_delta_available);
   assert(summary.stage2_home_score_rpc_batches == 40);
   assert(summary.stage2_home_score_rpc_items == 320);

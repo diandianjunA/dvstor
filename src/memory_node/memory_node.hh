@@ -1254,9 +1254,6 @@ private:
   std::atomic<u64> storage_owner_stage2_scored_candidates_{0};
   std::atomic<u64> storage_owner_stage2_graph_read_waves_{0};
   std::atomic<u64> storage_owner_stage2_graph_unique_reads_{0};
-  std::atomic<u64> storage_owner_stage2_graph_prefetch_predictions_{0};
-  std::atomic<u64> storage_owner_stage2_graph_prefetch_top1_hits_{0};
-  std::atomic<u64> storage_owner_stage2_graph_prefetch_top2_hits_{0};
   std::atomic<u64> storage_owner_stage2_vector_read_waves_{0};
   std::atomic<u64> storage_owner_stage2_vector_unique_reads_{0};
   std::atomic<u64> storage_owner_stage2_home_rpc_batches_{0};

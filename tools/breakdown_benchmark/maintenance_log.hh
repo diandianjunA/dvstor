@@ -47,9 +47,6 @@ struct MaintenanceObservation {
   uint64_t stage2_batched_items{};
   uint64_t stage2_graph_read_waves{};
   uint64_t stage2_graph_unique_reads{};
-  uint64_t stage2_graph_prefetch_predictions{};
-  uint64_t stage2_graph_prefetch_top1_hits{};
-  uint64_t stage2_graph_prefetch_top2_hits{};
   uint64_t stage2_vector_read_waves{};
   uint64_t stage2_vector_unique_reads{};
   uint64_t stage2_home_score_rpc_batches{};
@@ -126,11 +123,11 @@ struct MaintenanceLogSummary {
   uint64_t stage2_batched_items{};
   uint64_t stage2_graph_read_waves{};
   uint64_t stage2_graph_unique_reads{};
-  uint64_t stage2_graph_prefetch_predictions{};
-  uint64_t stage2_graph_prefetch_top1_hits{};
-  uint64_t stage2_graph_prefetch_top2_hits{};
   uint64_t stage2_vector_read_waves{};
   uint64_t stage2_vector_unique_reads{};
+  uint64_t stage2_home_rpc_batches{};
+  uint64_t stage2_home_rpc_items{};
+  uint64_t stage2_home_scored_neighbors{};
   uint64_t stage2_home_score_rpc_batches{};
   uint64_t stage2_home_score_rpc_items{};
   uint64_t stage2_home_score_rpc_queries{};
@@ -162,6 +159,7 @@ struct MaintenanceLogSummary {
   size_t logs_with_locality_deltas{};
   size_t logs_with_search_budget_deltas{};
   size_t logs_with_execution_counter_deltas{};
+  size_t logs_with_home_rpc_wire_counter_deltas{};
   size_t logs_with_score_rpc_wire_counter_deltas{};
   size_t logs_with_timing_counter_deltas{};
   bool failure_delta_available{};
@@ -170,6 +168,7 @@ struct MaintenanceLogSummary {
   bool locality_delta_available{};
   bool search_budget_delta_available{};
   bool execution_counter_delta_available{};
+  bool home_rpc_wire_counter_delta_available{};
   bool score_rpc_wire_counter_delta_available{};
   bool timing_counter_delta_available{};
   double backlog_slope_per_sec{};

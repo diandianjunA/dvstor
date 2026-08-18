@@ -853,7 +853,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
     state.seeds.resize(tasks.size());
     state.search_seeded.assign(tasks.size(), 0);
     state.score_collect_cursors.assign(tasks.size(), {});
-    state.graph_prefetch_predictions.assign(tasks.size(), {});
     state.continuation.initialize(
       tasks.size(), storage_id_, construction_width, budget);
     state.round_robin_search = 0;
@@ -1216,8 +1215,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
     size_t last_search = state.round_robin_search % search_count;
     size_t physical_reads = 0;
     bool selected_any = false;
-    u64 top1_prediction_hits = 0;
-    u64 top2_prediction_hits = 0;
     for (size_t offset = 0; offset < search_count; ++offset) {
       const size_t search_index =
         (state.round_robin_search + offset) % search_count;
@@ -1225,14 +1222,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
       const auto request =
         state.continuation.pending_expand_request(search_index);
       if (!request.has_value()) continue;
-      Stage2GraphPrefetchPrediction& prediction =
-        state.graph_prefetch_predictions[search_index];
-      if (!prediction.empty()) {
-        const u32 predicted_rank = prediction.rank(request->pointer);
-        top1_prediction_hits += predicted_rank == 1;
-        top2_prediction_hits += predicted_rank == 1 || predicted_rank == 2;
-        prediction.clear();
-      }
       const bool remote = storage_node_pointer_addressable(
         request->pointer) && !local_shard(request->pointer.memory_node());
       const bool duplicate_remote = remote &&
@@ -1254,14 +1243,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
     }
     if (selected_any) {
       state.round_robin_search = (last_search + 1) % search_count;
-    }
-    if (top1_prediction_hits != 0) {
-      storage_owner_stage2_graph_prefetch_top1_hits_.fetch_add(
-        top1_prediction_hits, std::memory_order_relaxed);
-    }
-    if (top2_prediction_hits != 0) {
-      storage_owner_stage2_graph_prefetch_top2_hits_.fetch_add(
-        top2_prediction_hits, std::memory_order_relaxed);
     }
     return selected_any;
   };
@@ -2251,12 +2232,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
             bool resolved = false;
             if (neighbor_disposition ==
                 service::storage_owner::Stage2HomeDisposition::stable) {
-              // Observe exactly what the remote home can choose without
-              // knowing this coordinator's visited set.  Including duplicate
-              // candidates makes the measured hit rate implementable by a
-              // future response-side prefetcher rather than an oracle.
-              state.graph_prefetch_predictions[result.search_index].observe(
-                pointer, neighbor.distance);
               resolved = state.continuation.resolve_score_request(
                 result.search_index, score_generation, pointer,
                 std::optional<distance_t>{neighbor.distance});
@@ -2283,15 +2258,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
         state.home_expand_rpcs.begin() + state.home_expand_rpc_count,
         [](const Stage2HomeExpandRpc& rpc) { return rpc.complete; });
       if (!all_complete) return Stage2SearchAdvanceResult::waiting_rdma;
-      u64 prediction_count = 0;
-      for (const Stage2GraphConsumer& consumer : state.graph_consumers) {
-        prediction_count += !state.graph_prefetch_predictions[
-          consumer.search_index].empty();
-      }
-      if (prediction_count != 0) {
-        storage_owner_stage2_graph_prefetch_predictions_.fetch_add(
-          prediction_count, std::memory_order_relaxed);
-      }
       clear_graph_dispatch();
       state.prefer_graph = false;
       idle_attempt_mask = 0;
