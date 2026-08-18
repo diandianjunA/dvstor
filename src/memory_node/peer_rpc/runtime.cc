@@ -667,6 +667,11 @@ void MemoryNode::release_peer_rpc_send_slot(u32 peer_id, u32 slot_id) {
       peer_rpc_send_slot_class(slot_id));
     peer_rpc_free_send_slots_[peer_id][send_class].push_back(slot_id);
   }
+  // A SEND CQE returns process-wide transport capacity. Maintenance retries
+  // sleep on their owner channels, while synchronous/control callers retain
+  // peer_completion_cv_; publish the same capacity edge to both domains.
+  notify_one_storage_owner_maintenance_executor();
+  peer_completion_cv_.notify_all();
 }
 
 bool MemoryNode::try_reserve_peer_rpc_speculative_credit(

@@ -193,6 +193,14 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
     parse_double(fields, "maintenance_worker_idle_ms");
   const auto maintenance_lost_wake_avoided =
     parse_u64(fields, "maintenance_lost_wake_avoided");
+  const auto maintenance_targeted_wakes =
+    parse_u64(fields, "maintenance_targeted_wakes");
+  const auto maintenance_generic_wakes =
+    parse_u64(fields, "maintenance_generic_wakes");
+  const auto maintenance_broadcast_wakes =
+    parse_u64(fields, "maintenance_broadcast_wakes");
+  const auto maintenance_context_slots_scanned =
+    parse_u64(fields, "maintenance_context_slots_scanned");
   const auto stage2_independent_score_rpc_batches =
     parse_u64(fields, "stage2_independent_score_rpc_batches");
   const auto stage2_independent_score_issued =
@@ -301,6 +309,13 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
       ? static_cast<uint64_t>(*maintenance_worker_idle_ms * 1e6 + 0.5) : 0,
     .maintenance_lost_wake_avoided =
       maintenance_lost_wake_avoided.value_or(0),
+    .maintenance_targeted_wakes =
+      maintenance_targeted_wakes.value_or(0),
+    .maintenance_generic_wakes = maintenance_generic_wakes.value_or(0),
+    .maintenance_broadcast_wakes =
+      maintenance_broadcast_wakes.value_or(0),
+    .maintenance_context_slots_scanned =
+      maintenance_context_slots_scanned.value_or(0),
     .stage2_independent_score_rpc_batches =
       stage2_independent_score_rpc_batches.value_or(0),
     .stage2_independent_score_issued =
@@ -380,6 +395,10 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
       packing_promotions.has_value() && packing_rollbacks.has_value() &&
       packing_accepted_trial_windows.has_value(),
     .timing_counters_available = timing_counters_available,
+    .wake_counters_available = maintenance_targeted_wakes.has_value() &&
+      maintenance_generic_wakes.has_value() &&
+      maintenance_broadcast_wakes.has_value() &&
+      maintenance_context_slots_scanned.has_value(),
   };
 }
 
@@ -807,6 +826,31 @@ MaintenanceLogSummary summarize_impl(
       }
     }
 
+    if (!slice.rotated && cursor.baseline_available &&
+        cursor.baseline.wake_counters_available &&
+        latest.wake_counters_available) {
+      uint64_t targeted = 0;
+      uint64_t generic = 0;
+      uint64_t broadcast = 0;
+      uint64_t context_slots_scanned = 0;
+      if (counter_delta(cursor.baseline.maintenance_targeted_wakes,
+                        latest.maintenance_targeted_wakes, &targeted) &&
+          counter_delta(cursor.baseline.maintenance_generic_wakes,
+                        latest.maintenance_generic_wakes, &generic) &&
+          counter_delta(cursor.baseline.maintenance_broadcast_wakes,
+                        latest.maintenance_broadcast_wakes, &broadcast) &&
+          counter_delta(
+            cursor.baseline.maintenance_context_slots_scanned,
+            latest.maintenance_context_slots_scanned,
+            &context_slots_scanned)) {
+        ++summary.logs_with_wake_counter_deltas;
+        summary.maintenance_targeted_wakes += targeted;
+        summary.maintenance_generic_wakes += generic;
+        summary.maintenance_broadcast_wakes += broadcast;
+        summary.maintenance_context_slots_scanned += context_slots_scanned;
+      }
+    }
+
     if (latest.packing_counters_available) {
       summary.packing_target_batch_max = std::max(
         summary.packing_target_batch_max, latest.packing_target_batch);
@@ -889,6 +933,8 @@ MaintenanceLogSummary summarize_impl(
     summary.logs_with_packing_deltas == summary.requested_logs;
   summary.timing_counter_delta_available = summary.requested_logs != 0 &&
     summary.logs_with_timing_counter_deltas == summary.requested_logs;
+  summary.wake_counter_delta_available = summary.requested_logs != 0 &&
+    summary.logs_with_wake_counter_deltas == summary.requested_logs;
   summary.p99_stage2_delay_available = summary.requested_logs != 0 &&
     summary.logs_with_histogram_deltas == summary.requested_logs &&
     summary.p99_stage2_delay_samples != 0;
@@ -933,6 +979,7 @@ std::vector<MaintenanceLogCursor> snapshot_maintenance_logs(
         cursor.baseline.locality_counters_available = true;
         cursor.baseline.independent_score_counters_available = true;
         cursor.baseline.packing_counters_available = true;
+        cursor.baseline.wake_counters_available = true;
         cursor.baseline_available = true;
       }
     }
@@ -1362,6 +1409,29 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
       summary.physical_stage1_remote_frontier_items += stage1_frontier;
       summary.physical_stage1_neighbors += stage1_neighbors;
     }
+
+    uint64_t targeted_wakes = 0;
+    uint64_t generic_wakes = 0;
+    uint64_t broadcast_wakes = 0;
+    uint64_t context_slots_scanned = 0;
+    if (counter_delta(first.maintenance_targeted_wakes,
+                      latest.maintenance_targeted_wakes,
+                      &targeted_wakes) &&
+        counter_delta(first.maintenance_generic_wakes,
+                      latest.maintenance_generic_wakes,
+                      &generic_wakes) &&
+        counter_delta(first.maintenance_broadcast_wakes,
+                      latest.maintenance_broadcast_wakes,
+                      &broadcast_wakes) &&
+        counter_delta(first.maintenance_context_slots_scanned,
+                      latest.maintenance_context_slots_scanned,
+                      &context_slots_scanned)) {
+      ++summary.logs_with_wake_counter_deltas;
+      summary.maintenance_targeted_wakes += targeted_wakes;
+      summary.maintenance_generic_wakes += generic_wakes;
+      summary.maintenance_broadcast_wakes += broadcast_wakes;
+      summary.maintenance_context_slots_scanned += context_slots_scanned;
+    }
   }
   summary.backlog_slope_available = summary.requested_logs != 0 &&
     summary.logs_with_slope_observations == summary.requested_logs;
@@ -1383,6 +1453,8 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
     summary.logs_with_search_budget_deltas == summary.requested_logs;
   summary.timing_counter_delta_available = summary.requested_logs != 0 &&
     summary.logs_with_timing_counter_deltas == summary.requested_logs;
+  summary.wake_counter_delta_available = summary.requested_logs != 0 &&
+    summary.logs_with_wake_counter_deltas == summary.requested_logs;
   summary.p99_stage2_delay_available = summary.requested_logs != 0 &&
     summary.logs_with_histogram_deltas == summary.requested_logs &&
     summary.p99_stage2_delay_samples != 0;

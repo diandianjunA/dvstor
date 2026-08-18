@@ -35,6 +35,17 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   const u32 worker_count = cpu_plan.maintenance_workers;
   lib_assert(worker_count != 0,
              "two-stage maintenance CPU plan produced no executor");
+  lib_assert(worker_count <= storage_owner_maintenance_wake_channels_.size(),
+             "maintenance worker count exceeds stable wake-channel capacity");
+  lib_assert(storage_owner_maintenance_wake_worker_count_.load(
+               std::memory_order_acquire) == 0,
+             "maintenance wake channels are already active");
+  for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {
+    auto& channel = storage_owner_maintenance_wake_channels_[worker_id];
+    lib_assert(channel.waiters.load(std::memory_order_acquire) == 0,
+               "maintenance wake channel retained a waiter across restart");
+    channel.epoch.store(0, std::memory_order_relaxed);
+  }
   // Every reserved sequence is either already queued/runnable or completed by
   // its synchronous retirement path. Stage1 preparation owns no sequence, so
   // the full descriptor bound is safe. Keep the smaller admission window tied
@@ -141,9 +152,15 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     0, std::memory_order_relaxed);
   storage_owner_maintenance_worker_idle_ns_.store(
     0, std::memory_order_relaxed);
-  storage_owner_maintenance_wake_epoch_.store(
+  storage_owner_maintenance_generic_wake_cursor_.store(
     0, std::memory_order_relaxed);
-  storage_owner_maintenance_wake_waiters_.store(
+  storage_owner_maintenance_targeted_wakes_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_maintenance_broadcast_wakes_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_maintenance_generic_wakes_.store(
+    0, std::memory_order_relaxed);
+  storage_owner_maintenance_context_slots_scanned_.store(
     0, std::memory_order_relaxed);
   storage_owner_maintenance_lost_wake_avoided_.store(
     0, std::memory_order_relaxed);
@@ -319,6 +336,11 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     }
     storage_owner_maintenance_worker_states_.push_back(std::move(worker));
   }
+  // Publish stable channels only after every corresponding worker state is
+  // initialized. Peer progress can run before the executor threads start; an
+  // early epoch increment is harmless and closes that startup race.
+  storage_owner_maintenance_wake_worker_count_.store(
+    worker_count, std::memory_order_release);
 
   print_status("storage-owner peer scratch: snapshot_slot=" +
                std::to_string(snapshot_stride) + " graph_slot=" +
@@ -414,6 +436,12 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
       worker.join();
     }
   }
+  // Peer CQ progress remains alive below this point. Disable routing before
+  // worker_states_ is cleared; the channels themselves have stable lifetime
+  // and therefore remain safe for a notifier that already observed the old
+  // count.
+  storage_owner_maintenance_wake_worker_count_.store(
+    0, std::memory_order_release);
 
   size_t stage2_remaining = 0;
   size_t cleanup_remaining = 0;
@@ -557,6 +585,18 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   const u64 lost_wake_avoided =
     storage_owner_maintenance_lost_wake_avoided_.load(
       std::memory_order_relaxed);
+  const u64 targeted_wakes =
+    storage_owner_maintenance_targeted_wakes_.load(
+      std::memory_order_relaxed);
+  const u64 generic_wakes =
+    storage_owner_maintenance_generic_wakes_.load(
+      std::memory_order_relaxed);
+  const u64 broadcast_wakes =
+    storage_owner_maintenance_broadcast_wakes_.load(
+      std::memory_order_relaxed);
+  const u64 context_slots_scanned =
+    storage_owner_maintenance_context_slots_scanned_.load(
+      std::memory_order_relaxed);
   const double worker_observed_idle_ratio =
     elapsed_ns == 0 || storage_owner_maintenance_workers_.empty()
       ? 0.0
@@ -599,6 +639,14 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
       std::to_string(static_cast<double>(worker_idle_ns) / 1e6) +
     " maintenance_lost_wake_avoided=" +
       std::to_string(lost_wake_avoided) +
+    " maintenance_targeted_wakes=" +
+      std::to_string(targeted_wakes) +
+    " maintenance_generic_wakes=" +
+      std::to_string(generic_wakes) +
+    " maintenance_broadcast_wakes=" +
+      std::to_string(broadcast_wakes) +
+    " maintenance_context_slots_scanned=" +
+      std::to_string(context_slots_scanned) +
     " maintenance_worker_observed_idle_ratio=" +
       std::to_string(worker_observed_idle_ratio) +
     " maintenance_worker_observed_busy_ratio=" +
@@ -852,6 +900,11 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   telemetry_snapshot.maintenance_worker_idle_waits = worker_idle_waits;
   telemetry_snapshot.maintenance_worker_idle_ns = worker_idle_ns;
   telemetry_snapshot.maintenance_lost_wake_avoided = lost_wake_avoided;
+  telemetry_snapshot.maintenance_targeted_wakes = targeted_wakes;
+  telemetry_snapshot.maintenance_generic_wakes = generic_wakes;
+  telemetry_snapshot.maintenance_broadcast_wakes = broadcast_wakes;
+  telemetry_snapshot.maintenance_context_slots_scanned =
+    context_slots_scanned;
   telemetry_snapshot.packing_target_batch = stage2_packing.target_batch;
   telemetry_snapshot.packing_arrival_interval_us =
     stage2_packing.estimated_arrival_interval_us;

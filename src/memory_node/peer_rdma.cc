@@ -409,11 +409,17 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
       const i32 previous = balance.fetch_sub(1, std::memory_order_acq_rel);
       lib_assert(previous > 0,
                  "async peer RDMA completion underflowed its search lane");
-      if (released_read_credit || previous == 1) {
-        // A completed chain can make another context credit-runnable before
-        // this lane reaches zero.  Notify on every credit release; the same
-        // notification also publishes this lane's updated post balance.
-        notify_storage_owner_maintenance();
+      if (previous == 1 && pending.maintenance_wake_owner !=
+            memory_node_detail::kNoMaintenanceWakeOwner) {
+        // The zero transition makes exactly one maintenance-owned lane
+        // runnable. Do not make every executor rescan all of its contexts.
+        notify_storage_owner_maintenance_executor(
+          pending.maintenance_wake_owner);
+      }
+      if (released_read_credit) {
+        // Read credits are shared across contexts, peers, and workers. This
+        // is a separate capacity edge from the owner-lane zero transition.
+        notify_one_storage_owner_maintenance_executor();
       }
       return;
     }
@@ -421,7 +427,7 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
       // Synchronous reads/atomics share the same credit domains as Stage2.
       // Their caller waits on a different condition variable, so explicitly
       // wake maintenance contexts whose previously rejected wave now fits.
-      notify_storage_owner_maintenance();
+      notify_one_storage_owner_maintenance_executor();
     }
   }
 
@@ -452,7 +458,7 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
                "peer RDMA completion underflowed legacy global credits");
     // The credit release can unblock a different context even when this
     // particular coroutine still owns more completions.
-    notify_storage_owner_maintenance();
+    notify_one_storage_owner_maintenance_executor();
   }
 }
 
@@ -537,7 +543,17 @@ void MemoryNode::post_peer_read_async(StorageOwnerThread& thread,
   const u64 wr_id = next_peer_async_wr_id();
   register_peer_pending_send_locked(
     wr_id,
-    PeerPendingSend{shard_id, qp_idx, thread.id, thread.running_coroutine, &thread, true, true});
+    PeerPendingSend{
+      .target_shard = shard_id,
+      .target_qp_idx = qp_idx,
+      .thread_id = thread.id,
+      .coroutine_id = thread.running_coroutine,
+      .thread = &thread,
+      .async = true,
+      .rdma_read_credit = true,
+      .maintenance_wake_owner = current_storage_owner_maintenance_worker_
+        ? thread.id : memory_node_detail::kNoMaintenanceWakeOwner,
+    });
   std::lock_guard<std::mutex> send_lock(*peer_qp_send_mutexes_[shard_id][qp_idx]);
   qp->post_send(reinterpret_cast<u64>(dst),
                 static_cast<u32>(bytes),
@@ -780,6 +796,8 @@ bool MemoryNode::post_peer_reads_async_impl(
           .async = true,
           .rdma_read_credit = true,
           .rdma_read_count = read_count,
+          .maintenance_wake_owner = current_storage_owner_maintenance_worker_
+            ? thread.id : memory_node_detail::kNoMaintenanceWakeOwner,
         });
       ibv_send_wr* bad_work_request = nullptr;
       {
@@ -1048,6 +1066,8 @@ bool MemoryNode::post_peer_read_pairs_async_impl(
           .async = true,
           .rdma_read_credit = true,
           .rdma_read_count = read_count,
+          .maintenance_wake_owner = current_storage_owner_maintenance_worker_
+            ? thread.id : memory_node_detail::kNoMaintenanceWakeOwner,
         });
       ibv_send_wr* bad_work_request = nullptr;
       {
@@ -1305,6 +1325,8 @@ bool MemoryNode::try_post_peer_snapshot_reads_async(
         .async = true,
         .rdma_read_credit = true,
         .rdma_read_count = read_count,
+        .maintenance_wake_owner = current_storage_owner_maintenance_worker_
+          ? thread.id : memory_node_detail::kNoMaintenanceWakeOwner,
       });
     ibv_send_wr* bad_work_request = nullptr;
     {

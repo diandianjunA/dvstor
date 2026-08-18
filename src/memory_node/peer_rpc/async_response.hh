@@ -15,6 +15,9 @@
 
 namespace memory_node_detail {
 
+inline constexpr u32 kNoMaintenanceWakeOwner =
+  std::numeric_limits<u32>::max();
+
 enum class TryPeerResponse : std::uint8_t {
   pending,
   success,
@@ -121,20 +124,24 @@ public:
       u64 request_id,
       u32 expected_shard,
       service::storage_owner::PeerRpcType expected_type,
-      u32 expected_item_count) {
+      u32 expected_item_count,
+      u32 maintenance_wake_owner = kNoMaintenanceWakeOwner) {
     std::lock_guard<std::mutex> lock(mutex_);
     return register_request_locked(request_id, expected_shard, expected_type,
-                                   expected_item_count);
+                                   expected_item_count,
+                                   maintenance_wake_owner);
   }
 
   PeerResponseRegistration register_send_attempt(
       u64 request_id,
       u32 expected_shard,
       service::storage_owner::PeerRpcType expected_type,
-      u32 expected_item_count) {
+      u32 expected_item_count,
+      u32 maintenance_wake_owner = kNoMaintenanceWakeOwner) {
     std::lock_guard<std::mutex> lock(mutex_);
     return register_request_locked(request_id, expected_shard, expected_type,
-                                   expected_item_count);
+                                   expected_item_count,
+                                   maintenance_wake_owner);
   }
 
   // Returns true only when ownership of the receive descriptor transfers to
@@ -143,7 +150,11 @@ public:
   bool try_deliver(u32 peer_id,
                    u32 receive_slot,
                    size_t bytes,
-                   const service::storage_owner::PeerRpcHeader& header) {
+                   const service::storage_owner::PeerRpcHeader& header,
+                   u32* maintenance_wake_owner = nullptr) {
+    if (maintenance_wake_owner != nullptr) {
+      *maintenance_wake_owner = kNoMaintenanceWakeOwner;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     const size_t slot_index = find_slot_locked(header.request_id);
     if (slot_index == npos) return false;
@@ -167,6 +178,9 @@ public:
     };
     slot.receive_descriptor_held = true;
     slot.state = State::complete;
+    if (maintenance_wake_owner != nullptr) {
+      *maintenance_wake_owner = slot.maintenance_wake_owner;
+    }
     return true;
   }
 
@@ -314,6 +328,7 @@ private:
     service::storage_owner::PeerRpcType expected_type{
       service::storage_owner::PeerRpcType::reverse_update_response};
     u32 expected_item_count{};
+    u32 maintenance_wake_owner{kNoMaintenanceWakeOwner};
     PeerResponseDescriptor response{};
     bool receive_descriptor_held{};
     u64 generation{};
@@ -333,14 +348,16 @@ private:
       u64 request_id,
       u32 expected_shard,
       service::storage_owner::PeerRpcType expected_type,
-      u32 expected_item_count) {
+      u32 expected_item_count,
+      u32 maintenance_wake_owner) {
     if (request_id == 0) return PeerResponseRegistration::conflict;
 
     const size_t existing = find_slot_locked(request_id);
     if (existing != npos) {
       Slot& slot = slots_[existing];
       if (!metadata_matches(slot, expected_shard, expected_type,
-                            expected_item_count)) {
+                            expected_item_count) ||
+          slot.maintenance_wake_owner != maintenance_wake_owner) {
         return PeerResponseRegistration::conflict;
       }
       if (slot.state == State::pending) {
@@ -363,6 +380,7 @@ private:
     slot.expected_shard = expected_shard;
     slot.expected_type = expected_type;
     slot.expected_item_count = expected_item_count;
+    slot.maintenance_wake_owner = maintenance_wake_owner;
     slot.response = {};
     slot.receive_descriptor_held = false;
     slot.state = State::pending;

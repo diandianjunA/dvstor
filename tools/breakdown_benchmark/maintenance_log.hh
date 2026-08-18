@@ -64,6 +64,10 @@ struct MaintenanceObservation {
   uint64_t maintenance_worker_idle_waits{};
   uint64_t maintenance_worker_idle_ns{};
   uint64_t maintenance_lost_wake_avoided{};
+  uint64_t maintenance_targeted_wakes{};
+  uint64_t maintenance_generic_wakes{};
+  uint64_t maintenance_broadcast_wakes{};
+  uint64_t maintenance_context_slots_scanned{};
   uint64_t stage2_independent_score_rpc_batches{};
   uint64_t stage2_independent_score_issued{};
   uint64_t stage2_independent_score_useful{};
@@ -104,6 +108,7 @@ struct MaintenanceObservation {
   bool independent_score_counters_available{};
   bool packing_counters_available{};
   bool timing_counters_available{};
+  bool wake_counters_available{};
 
   uint64_t backlog() const;
 };
@@ -178,6 +183,10 @@ struct MaintenanceLogSummary {
   uint64_t maintenance_worker_idle_waits{};
   uint64_t maintenance_worker_idle_ns{};
   uint64_t maintenance_lost_wake_avoided{};
+  uint64_t maintenance_targeted_wakes{};
+  uint64_t maintenance_generic_wakes{};
+  uint64_t maintenance_broadcast_wakes{};
+  uint64_t maintenance_context_slots_scanned{};
   uint64_t packing_target_batch_max{};
   uint64_t packing_arrival_interval_us_max{};
   uint64_t packing_waited_batches{};
@@ -217,6 +226,7 @@ struct MaintenanceLogSummary {
   size_t logs_with_home_rpc_wire_counter_deltas{};
   size_t logs_with_score_rpc_wire_counter_deltas{};
   size_t logs_with_timing_counter_deltas{};
+  size_t logs_with_wake_counter_deltas{};
   bool failure_delta_available{};
   bool peer_reverse_retry_delta_available{};
   bool completion_window_available{};
@@ -230,6 +240,7 @@ struct MaintenanceLogSummary {
   bool home_rpc_wire_counter_delta_available{};
   bool score_rpc_wire_counter_delta_available{};
   bool timing_counter_delta_available{};
+  bool wake_counter_delta_available{};
   double backlog_slope_per_sec{};
   bool backlog_slope_available{};
   std::vector<std::string> unreadable_logs;

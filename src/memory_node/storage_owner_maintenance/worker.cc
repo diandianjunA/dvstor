@@ -26,6 +26,9 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   lib_assert(worker_id < storage_owner_maintenance_worker_states_.size(),
              "storage-owner maintenance worker state missing");
   StorageOwnerThread& thread = *storage_owner_maintenance_worker_states_[worker_id];
+  lib_assert(worker_id < storage_owner_maintenance_wake_channels_.size(),
+             "storage-owner maintenance wake channel missing");
+  auto& wake_channel = storage_owner_maintenance_wake_channels_[worker_id];
   current_storage_owner_thread_ = &thread;
   current_storage_owner_maintenance_worker_ = true;
   const Configuration& config = *storage_worker_config_;
@@ -220,6 +223,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   vec<ReverseUpdateOp> reverse_wire_ops(reverse_wire_max_ops);
   vec<Stage2ReverseCompletion> reverse_completion_scratch(
     reverse_wire_max_ops);
+  vec<u8> reverse_completion_worker_marked(
+    storage_owner_reverse_completions_.size(), u8{0});
+  vec<u32> reverse_completion_wake_owners;
+  reverse_completion_wake_owners.reserve(
+    storage_owner_reverse_completions_.size());
   vec<byte_t> reverse_response_payload;
   reverse_response_payload.reserve(peer_rpc_runtime_.message_bytes);
 
@@ -1076,6 +1084,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         lib_assert(storage_owner_reverse_outbox_->finish_success(
                      worker_id, aggregate->wire_request_id),
                    "stage2 reverse aggregate ACK release failed");
+        reverse_completion_wake_owners.clear();
         for (size_t index = 0; index < *completion_count; ++index) {
           const Stage2ReverseCompletion& completion =
             reverse_completion_scratch[index];
@@ -1087,12 +1096,18 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           lib_assert(storage_owner_reverse_completions_[
                        completion.worker_id]->try_push(completion),
                      "bounded stage2 reverse completion capacity invariant failed");
+          if (reverse_completion_worker_marked[completion.worker_id] == 0) {
+            reverse_completion_worker_marked[completion.worker_id] = 1;
+            reverse_completion_wake_owners.push_back(completion.worker_id);
+          }
         }
         // One aggregate may contain logical requests owned by several
-        // executors. This is the sole maintenance-worker publication that
-        // must cross the executor wake channel rather than only waking
-        // foreground capacity waiters.
-        notify_storage_owner_maintenance_executors();
+        // executors. Wake exactly the distinct owners that received a queue
+        // entry instead of making unrelated executors rescan every context.
+        for (const u32 wake_owner : reverse_completion_wake_owners) {
+          reverse_completion_worker_marked[wake_owner] = 0;
+          notify_storage_owner_maintenance_executor(wake_owner);
+        }
         progressed = true;
         continue;
       }
@@ -3380,15 +3395,22 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
 
   u64 unpublished_idle_wait_ns = 0;
   u64 unpublished_idle_waits = 0;
+  u64 unpublished_context_slots_scanned = 0;
   size_t active_context_cursor = 0;
   const auto flush_idle_timing = [&]() {
-    if (unpublished_idle_waits == 0) return;
-    storage_owner_maintenance_worker_idle_ns_.fetch_add(
-      unpublished_idle_wait_ns, std::memory_order_relaxed);
-    storage_owner_maintenance_worker_idle_waits_.fetch_add(
-      unpublished_idle_waits, std::memory_order_relaxed);
-    unpublished_idle_wait_ns = 0;
-    unpublished_idle_waits = 0;
+    if (unpublished_idle_waits != 0) {
+      storage_owner_maintenance_worker_idle_ns_.fetch_add(
+        unpublished_idle_wait_ns, std::memory_order_relaxed);
+      storage_owner_maintenance_worker_idle_waits_.fetch_add(
+        unpublished_idle_waits, std::memory_order_relaxed);
+      unpublished_idle_wait_ns = 0;
+      unpublished_idle_waits = 0;
+    }
+    if (unpublished_context_slots_scanned != 0) {
+      storage_owner_maintenance_context_slots_scanned_.fetch_add(
+        unpublished_context_slots_scanned, std::memory_order_relaxed);
+      unpublished_context_slots_scanned = 0;
+    }
   };
 
   for (;;) {
@@ -3397,8 +3419,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     // below. This closes the classic notify-before-wait window without busy
     // polling and without shortening the batching deadline.
     const u64 observed_wake_epoch =
-      storage_owner_maintenance_wake_epoch_.load(
-        std::memory_order_acquire);
+      wake_channel.epoch.load(std::memory_order_acquire);
     if (storage_owner_maintenance_shutdown_.load(std::memory_order_acquire)) {
       flush_idle_timing();
       if (storage_owner_reverse_outbox_ != nullptr) {
@@ -3464,6 +3485,12 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     lib_assert(context_count != 0,
                "maintenance worker has no Stage2 context slots");
     const size_t scan_begin = active_context_cursor;
+    unpublished_context_slots_scanned += context_count;
+    if (unpublished_context_slots_scanned >= 4096) {
+      storage_owner_maintenance_context_slots_scanned_.fetch_add(
+        unpublished_context_slots_scanned, std::memory_order_relaxed);
+      unpublished_context_slots_scanned = 0;
+    }
     for (size_t offset = 0; offset < context_count; ++offset) {
       const size_t context_index = stage2_round_robin_context_index(
         scan_begin, offset, context_count);
@@ -3518,29 +3545,28 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         }
       }
       const u64 idle_started_ns = steady_now_ns();
-      std::unique_lock<std::mutex> wake_lock(
-        storage_owner_maintenance_wake_mutex_);
-      storage_owner_maintenance_wake_waiters_.fetch_add(
+      std::unique_lock<std::mutex> wake_lock(wake_channel.mutex);
+      wake_channel.waiters.fetch_add(
         1, std::memory_order_acq_rel);
       const auto unregister_waiter = [&]() {
         const u32 previous =
-          storage_owner_maintenance_wake_waiters_.fetch_sub(
+          wake_channel.waiters.fetch_sub(
             1, std::memory_order_acq_rel);
         lib_assert(previous != 0,
                    "maintenance wake waiter registration underflow");
       };
       const bool raced_before_wait =
-        storage_owner_maintenance_wake_epoch_.load(
+        wake_channel.epoch.load(
           std::memory_order_acquire) != observed_wake_epoch;
       if (raced_before_wait) {
         storage_owner_maintenance_lost_wake_avoided_.fetch_add(
           1, std::memory_order_relaxed);
       } else {
-        storage_owner_maintenance_wake_cv_.wait_until(
+        wake_channel.cv.wait_until(
           wake_lock, wake_at, [&]() {
             return storage_owner_maintenance_shutdown_.load(
                      std::memory_order_acquire) ||
-              storage_owner_maintenance_wake_epoch_.load(
+              wake_channel.epoch.load(
                 std::memory_order_acquire) != observed_wake_epoch;
           });
       }
