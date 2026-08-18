@@ -170,6 +170,13 @@ target_compile_options(stage1_reachability_policy_test PRIVATE -UNDEBUG)
 add_test(NAME stage1_reachability_policy_test
          COMMAND stage1_reachability_policy_test)
 
+add_executable(stage1_prune_handoff_policy_test
+    stage1_prune_handoff_policy_test.cc)
+dvstor_target_common_includes(stage1_prune_handoff_policy_test)
+target_compile_options(stage1_prune_handoff_policy_test PRIVATE -UNDEBUG)
+add_test(NAME stage1_prune_handoff_policy_test
+         COMMAND stage1_prune_handoff_policy_test)
+
 add_executable(configuration_update_protocol_test configuration_update_protocol_test.cc)
 dvstor_target_common_includes(configuration_update_protocol_test)
 target_link_libraries(configuration_update_protocol_test PRIVATE rdma_library)

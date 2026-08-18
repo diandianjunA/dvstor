@@ -72,9 +72,16 @@ void test_authority_extension_rpc_layouts() {
                   protocol::PeerRpcType::stage2_expand_score_request) == 21);
   static_assert(static_cast<u32>(
                   protocol::PeerRpcType::stage2_expand_score_response) == 22);
+  static_assert(static_cast<u32>(
+                  protocol::PeerRpcType::stage2_score_many_request) == 23);
+  static_assert(static_cast<u32>(
+                  protocol::PeerRpcType::stage2_score_many_response) == 24);
   static_assert(sizeof(protocol::Stage2ExpandScoreItem) == 24);
   static_assert(sizeof(protocol::Stage2ExpandScoreResult) == 40);
   static_assert(sizeof(protocol::Stage2ExpandScoreNeighbor) == 16);
+  static_assert(sizeof(protocol::Stage2ScoreManyHeader) == 8);
+  static_assert(sizeof(protocol::Stage2ScoreManyItem) == 24);
+  static_assert(sizeof(protocol::Stage2ScoreManyResult) == 32);
   static_assert(static_cast<u32>(
                   protocol::DynamicNodeControlAction::settle_allocation) == 3);
   static_assert(sizeof(protocol::DynamicNodeControlItem) == 48);
@@ -104,6 +111,54 @@ void test_authority_extension_rpc_layouts() {
                   protocol::AuthorityPlacementStatus::conflict) == 4);
 
   constexpr u32 item_count = 2;
+
+  constexpr u32 query_count = 1;
+  std::vector<byte_t> score_many_request(
+    protocol::stage2_score_many_request_bytes(item_count, query_count), 0);
+  protocol::stage2_score_many_header(score_many_request.data())->query_count =
+    query_count;
+  auto* score_many_items = protocol::stage2_score_many_items(
+    score_many_request.data());
+  score_many_items[0] = {
+    .pointer_raw = 0x100,
+    .generation = 7,
+    .search_index = 3,
+    .query_index = 0,
+  };
+  score_many_items[1] = {
+    .pointer_raw = 0x200,
+    .generation = 8,
+    .search_index = 3,
+    .query_index = 0,
+  };
+  auto* score_many_queries = protocol::stage2_score_many_queries(
+    score_many_request.data(), item_count);
+  score_many_queries[0] = 19;
+  assert(protocol::stage2_score_many_items(
+           static_cast<const void*>(score_many_request.data()))[1].
+         pointer_raw == 0x200);
+  assert(protocol::stage2_score_many_queries(
+           static_cast<const void*>(score_many_request.data()), item_count)[0]
+         == 19);
+  assert(reinterpret_cast<const byte_t*>(score_many_queries) +
+           VamanaNode::vector_bytes() ==
+         score_many_request.data() + score_many_request.size());
+
+  std::vector<byte_t> score_many_response(
+    protocol::stage2_score_many_response_bytes(item_count), 0);
+  auto* score_many_results = protocol::stage2_score_many_results(
+    score_many_response.data());
+  score_many_results[0] = {
+    .pointer_raw = 0x100,
+    .generation = 7,
+    .search_index = 3,
+    .disposition = static_cast<u32>(
+      protocol::Stage2HomeDisposition::stable),
+    .distance = 42,
+  };
+  assert(protocol::stage2_score_many_results(
+           static_cast<const void*>(score_many_response.data()))[0].distance
+         == 42);
 
   std::vector<byte_t> stage1_arm(
     protocol::stage1_arm_request_bytes(item_count), 0);

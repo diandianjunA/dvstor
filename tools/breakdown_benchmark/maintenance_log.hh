@@ -15,6 +15,8 @@ namespace tools::breakdown_benchmark {
 // bucket keeps p99 reporting precise without rounding
 // every latency in (4 s, 8 s] up to 8 s.
 inline constexpr size_t kMaintenanceLatencyBucketCount = 18;
+inline constexpr size_t kStage2TimingPhaseCount =
+  gpu_search::maintenance_telemetry::kStage2PhaseCount;
 
 struct MaintenanceObservation {
   uint64_t stage2_enqueued{};
@@ -47,6 +49,26 @@ struct MaintenanceObservation {
   uint64_t stage2_graph_unique_reads{};
   uint64_t stage2_vector_read_waves{};
   uint64_t stage2_vector_unique_reads{};
+  uint64_t stage2_home_score_rpc_batches{};
+  uint64_t stage2_home_score_rpc_items{};
+  uint64_t stage2_home_score_rpc_queries{};
+  uint64_t stage2_home_score_rpc_request_bytes{};
+  uint64_t stage2_home_score_rpc_response_bytes{};
+  std::array<uint64_t, kStage2TimingPhaseCount> stage2_phase_attempts{};
+  std::array<uint64_t, kStage2TimingPhaseCount>
+    stage2_phase_task_attempts{};
+  std::array<uint64_t, kStage2TimingPhaseCount> stage2_phase_elapsed_ns{};
+  uint64_t maintenance_worker_idle_waits{};
+  uint64_t maintenance_worker_idle_ns{};
+  uint64_t physical_stage1_items{};
+  uint64_t physical_stage1_total_ns{};
+  uint64_t physical_stage1_search_ns{};
+  uint64_t physical_stage1_prune_ns{};
+  uint64_t physical_stage1_allocate_write_ns{};
+  uint64_t physical_stage1_backlink_ns{};
+  uint64_t physical_stage1_candidates{};
+  uint64_t physical_stage1_remote_frontier_items{};
+  uint64_t physical_stage1_neighbors{};
   double p99_stage2_delay_upper_ms{};
   bool p99_stage2_delay_over_30s{};
   std::array<uint64_t, kMaintenanceLatencyBucketCount>
@@ -57,6 +79,7 @@ struct MaintenanceObservation {
   bool completion_window_available{};
   bool locality_counters_available{};
   bool search_budget_counters_available{};
+  bool timing_counters_available{};
 
   uint64_t backlog() const;
 };
@@ -102,6 +125,26 @@ struct MaintenanceLogSummary {
   uint64_t stage2_graph_unique_reads{};
   uint64_t stage2_vector_read_waves{};
   uint64_t stage2_vector_unique_reads{};
+  uint64_t stage2_home_score_rpc_batches{};
+  uint64_t stage2_home_score_rpc_items{};
+  uint64_t stage2_home_score_rpc_queries{};
+  uint64_t stage2_home_score_rpc_request_bytes{};
+  uint64_t stage2_home_score_rpc_response_bytes{};
+  std::array<uint64_t, kStage2TimingPhaseCount> stage2_phase_attempts{};
+  std::array<uint64_t, kStage2TimingPhaseCount>
+    stage2_phase_task_attempts{};
+  std::array<uint64_t, kStage2TimingPhaseCount> stage2_phase_elapsed_ns{};
+  uint64_t maintenance_worker_idle_waits{};
+  uint64_t maintenance_worker_idle_ns{};
+  uint64_t physical_stage1_items{};
+  uint64_t physical_stage1_total_ns{};
+  uint64_t physical_stage1_search_ns{};
+  uint64_t physical_stage1_prune_ns{};
+  uint64_t physical_stage1_allocate_write_ns{};
+  uint64_t physical_stage1_backlink_ns{};
+  uint64_t physical_stage1_candidates{};
+  uint64_t physical_stage1_remote_frontier_items{};
+  uint64_t physical_stage1_neighbors{};
   double p99_stage2_delay_upper_ms{};
   bool p99_stage2_delay_over_30s{};
   uint64_t p99_stage2_delay_samples{};
@@ -113,12 +156,16 @@ struct MaintenanceLogSummary {
   size_t logs_with_locality_deltas{};
   size_t logs_with_search_budget_deltas{};
   size_t logs_with_execution_counter_deltas{};
+  size_t logs_with_score_rpc_wire_counter_deltas{};
+  size_t logs_with_timing_counter_deltas{};
   bool failure_delta_available{};
   bool peer_reverse_retry_delta_available{};
   bool completion_window_available{};
   bool locality_delta_available{};
   bool search_budget_delta_available{};
   bool execution_counter_delta_available{};
+  bool score_rpc_wire_counter_delta_available{};
+  bool timing_counter_delta_available{};
   double backlog_slope_per_sec{};
   bool backlog_slope_available{};
   std::vector<std::string> unreadable_logs;

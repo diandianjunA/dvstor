@@ -1,5 +1,6 @@
 #include "memory_node/peer_rpc/detail.hh"
 #include "memory_node/peer_rpc/stage1_control_fanout_policy.hh"
+#include "memory_node/storage_owner_index/stage1_prune_handoff_policy.hh"
 #include "memory_node/storage_owner_index/vector_snapshot_policy.hh"
 
 namespace authority = memory_node_storage_owner_index_detail;
@@ -187,6 +188,116 @@ bool MemoryNode::handle_peer_stage2_expand_score_request(
   return queued;
 }
 
+bool MemoryNode::handle_peer_stage2_score_many_request(
+    u32 source_shard,
+    const service::storage_owner::PeerRpcHeader& header,
+    const byte_t* payload,
+    const Configuration& config) {
+  using namespace service::storage_owner;
+  using memory_node_storage_owner_index_detail::StableNodeSnapshotState;
+  using memory_node_storage_owner_index_detail::classify_stable_node_snapshot;
+  if (payload == nullptr || source_shard >= num_storage_nodes_ ||
+      source_shard == storage_id_ || header.item_count == 0 ||
+      header.item_count > std::max<u32>(
+        1, config.storage_owner_search_snapshot_batch)) {
+    return false;
+  }
+  const auto* own_header = stage2_score_many_header(payload);
+  if (own_header->query_count == 0 ||
+      own_header->query_count > header.item_count ||
+      own_header->reserved != 0) {
+    return false;
+  }
+
+  const size_t response_capacity =
+    stage2_score_many_response_bytes(header.item_count);
+  if (response_capacity > peer_rpc_runtime_.message_bytes) return false;
+  vec<byte_t> response = acquire_peer_graph_response_buffer(response_capacity);
+  auto* response_header = reinterpret_cast<PeerRpcHeader*>(response.data());
+  response_header->magic = kPeerRpcMagic;
+  response_header->version = kPeerRpcVersion;
+  response_header->type = static_cast<u32>(
+    PeerRpcType::stage2_score_many_response);
+  response_header->source_shard = storage_id_;
+  response_header->item_count = header.item_count;
+  response_header->request_id = header.request_id;
+  response_header->status = static_cast<u32>(InsertStatus::ok);
+  response_header->reserved = 0;
+
+  const auto* items = stage2_score_many_items(payload);
+  const byte_t* queries = stage2_score_many_queries(
+    payload, header.item_count);
+  auto* results = stage2_score_many_results(response.data());
+  const VectorDType dtype = VamanaNode::vector_dtype();
+  constexpr u32 kMaxReadAttempts = 3;
+  for (u32 item_index = 0; item_index < header.item_count; ++item_index) {
+    const Stage2ScoreManyItem& item = items[item_index];
+    Stage2ScoreManyResult& result = results[item_index];
+    result = {};
+    result.pointer_raw = item.pointer_raw;
+    result.generation = item.generation;
+    result.search_index = item.search_index;
+    result.disposition = static_cast<u32>(
+      Stage2HomeDisposition::terminal);
+    const RemotePtr pointer{item.pointer_raw};
+    if (item.query_index >= own_header->query_count ||
+        !valid_local_storage_node_pointer(pointer)) {
+      continue;
+    }
+
+    const byte_t* query = queries +
+      static_cast<size_t>(item.query_index) * VamanaNode::vector_bytes();
+    const byte_t* node = local_node_ptr(pointer);
+    bool classified = false;
+    for (u32 attempt = 0; attempt < kMaxReadAttempts; ++attempt) {
+      const u64 before = load_local_node_header_acquire(pointer);
+      if ((before & VamanaNode::HEADER_NODE_LOCK) != 0 ||
+          VamanaNode::header_incarnation(before) != pointer.incarnation()) {
+        std::this_thread::yield();
+        continue;
+      }
+      const u32 slot_incarnation = *reinterpret_cast<const u32*>(
+        node + VamanaNode::offset_slot_incarnation());
+      const distance_t distance = distance_between_vectors(
+        query, dtype, node + VamanaNode::offset_vector(), dtype, config);
+      std::atomic_thread_fence(std::memory_order_acquire);
+      const u64 after = load_local_node_header_acquire(pointer);
+      const StableNodeSnapshotState state = classify_stable_node_snapshot(
+        pointer, before, after, slot_incarnation);
+      if (state == StableNodeSnapshotState::stable) {
+        result.distance = distance;
+        result.disposition = static_cast<u32>(
+          Stage2HomeDisposition::stable);
+        classified = true;
+        break;
+      }
+      if (state == StableNodeSnapshotState::terminal) {
+        classified = true;
+        break;
+      }
+      std::this_thread::yield();
+    }
+    if (!classified) {
+      result.disposition = static_cast<u32>(
+        Stage2HomeDisposition::retryable);
+    }
+  }
+
+  PeerReverseUpdateResponse outbound;
+  outbound.destination_shard = source_shard;
+  outbound.header = *response_header;
+  outbound.payload = std::move(response);
+  outbound.graph_response = true;
+  outbound.queued_at = std::chrono::steady_clock::now();
+  const bool queued = try_enqueue_peer_reverse_update_response(
+    std::move(outbound));
+  if (!queued) {
+    peer_stage2_home_response_queue_drops_.fetch_add(
+      1, std::memory_order_relaxed);
+  }
+  return queued;
+}
+
 bool MemoryNode::try_send_peer_stage1_retry_response(
     u32 destination_shard,
     const service::storage_owner::PeerRpcHeader& header,
@@ -339,6 +450,37 @@ MemoryNode::prepare_local_stage1_item(
     }
   };
 
+  // From this point onward this semantic token owns a new physical-home
+  // execution. Duplicate/retry receipts returned above must not be charged a
+  // second time. Keep aggregate timing out of the completion packet so remote
+  // and locally coordinated tokens are measured uniformly.
+  const auto physical_stage1_started = std::chrono::steady_clock::now();
+  u64 physical_search_ns = 0;
+  u64 physical_prune_ns = 0;
+  u64 physical_allocate_write_ns = 0;
+  u64 physical_backlink_ns = 0;
+  const auto record_physical_stage1 = [&](size_t candidate_count,
+                                          size_t frontier_count,
+                                          size_t neighbor_count) {
+    physical_stage1_items_.fetch_add(1, std::memory_order_relaxed);
+    physical_stage1_total_ns_.fetch_add(
+      elapsed_ns_since(physical_stage1_started), std::memory_order_relaxed);
+    physical_stage1_search_ns_.fetch_add(
+      physical_search_ns, std::memory_order_relaxed);
+    physical_stage1_prune_ns_.fetch_add(
+      physical_prune_ns, std::memory_order_relaxed);
+    physical_stage1_allocate_write_ns_.fetch_add(
+      physical_allocate_write_ns, std::memory_order_relaxed);
+    physical_stage1_backlink_ns_.fetch_add(
+      physical_backlink_ns, std::memory_order_relaxed);
+    physical_stage1_candidates_.fetch_add(
+      candidate_count, std::memory_order_relaxed);
+    physical_stage1_remote_frontier_items_.fetch_add(
+      frontier_count, std::memory_order_relaxed);
+    physical_stage1_neighbors_.fetch_add(
+      neighbor_count, std::memory_order_relaxed);
+  };
+
   vec<element_t> components(VamanaNode::DIM);
   decode_storage_vector_to_float(
     raw_vector, VamanaNode::vector_dtype(), VamanaNode::DIM,
@@ -347,6 +489,7 @@ MemoryNode::prepare_local_stage1_item(
   if (entries.empty()) {
     result.status = static_cast<u32>(MutationStatus::failed);
     seal_failed_reservation();
+    record_physical_stage1(0, 0, 0);
     return result;
   }
 
@@ -356,8 +499,9 @@ MemoryNode::prepare_local_stage1_item(
   vec<RemotePtr> candidates = partition_local_search_candidates(
     span<const element_t>{components}, entries, config, breakdown,
     raw_vector, &stage1_beam, &remote_frontier);
+  physical_search_ns = elapsed_ns_since(search_started);
   if (breakdown != nullptr) {
-    breakdown->storage_owner_search_ns += elapsed_ns_since(search_started);
+    breakdown->storage_owner_search_ns += physical_search_ns;
   }
   hashset_t<RemotePtr> skip;
   if (kind == MutationKind::upsert && item.old_raw != 0) {
@@ -366,11 +510,18 @@ MemoryNode::prepare_local_stage1_item(
     skip.insert(RemotePtr{item.old_raw});
   }
   const auto prune_started = std::chrono::steady_clock::now();
-  vec<RemotePtr> neighbors = robust_prune_cpu(
-    raw_vector, VamanaNode::vector_dtype(), candidates, skip, config,
-    breakdown, config.R);
+  const bool defer_stage1_prune =
+    config.storage_owner_defer_stage1_prune &&
+    kind == MutationKind::insert;
+  vec<RemotePtr> neighbors = defer_stage1_prune
+    ? authority::deferred_stage1_provisional_neighbors(
+        span<const RemotePtr>{candidates}, config.R)
+    : robust_prune_cpu(
+        raw_vector, VamanaNode::vector_dtype(), candidates, skip, config,
+        breakdown, config.R);
+  physical_prune_ns = elapsed_ns_since(prune_started);
   if (breakdown != nullptr) {
-    breakdown->storage_owner_prune_ns += elapsed_ns_since(prune_started);
+    breakdown->storage_owner_prune_ns += physical_prune_ns;
   }
   const auto allocate_started = std::chrono::steady_clock::now();
   const RemotePtr target = allocate_local_node();
@@ -382,11 +533,14 @@ MemoryNode::prepare_local_stage1_item(
   write_new_node_on_shard(
     target, item.id, span<const element_t>{components}, neighbors,
     item.generation, true);
+  physical_allocate_write_ns = elapsed_ns_since(allocate_started);
   if (breakdown != nullptr) {
     breakdown->storage_owner_write_node_ns += elapsed_ns_since(write_started);
   }
+  const auto backlink_started = std::chrono::steady_clock::now();
   vec<RemotePtr> backlink_targets = install_local_provisional_backlinks(
     target, span<const RemotePtr>{neighbors});
+  physical_backlink_ns = elapsed_ns_since(backlink_started);
   if (backlink_targets.empty()) {
     const u64 retirement_sequence =
       begin_storage_owner_maintenance_sequence(1);
@@ -395,11 +549,16 @@ MemoryNode::prepare_local_stage1_item(
     complete_storage_owner_maintenance_sequence(retirement_sequence);
     result.status = static_cast<u32>(MutationStatus::failed);
     seal_failed_reservation();
+    record_physical_stage1(
+      candidates.size(), remote_frontier.size(), neighbors.size());
     return result;
   }
 
   result.target_raw = target.raw_address;
   result.status = static_cast<u32>(MutationStatus::ok);
+  const size_t physical_candidate_count = candidates.size();
+  const size_t physical_frontier_count = remote_frontier.size();
+  const size_t physical_neighbor_count = neighbors.size();
   {
     std::lock_guard<std::mutex> lock(prepared_shard.mutex);
     const auto position = prepared_records.find(key);
@@ -412,8 +571,12 @@ MemoryNode::prepare_local_stage1_item(
     prepared.beam = std::move(stage1_beam);
     prepared.remote_frontier = std::move(remote_frontier);
     prepared.backlink_targets = std::move(backlink_targets);
+    prepared.stage1_prune_deferred = defer_stage1_prune;
     prepared.prepared = true;
   }
+  record_physical_stage1(
+    physical_candidate_count, physical_frontier_count,
+    physical_neighbor_count);
   return result;
 }
 
@@ -888,6 +1051,7 @@ bool MemoryNode::arm_local_stage1_items(
       task.stage1_remote_frontier = std::move(prepared.remote_frontier);
       task.stage1_backlink_targets = std::move(
         prepared.backlink_targets);
+      task.stage1_prune_deferred = prepared.stage1_prune_deferred;
       claimed.push_back(ClaimedArm{
         .result_index = result_index,
         .key = key,
@@ -1211,6 +1375,7 @@ bool MemoryNode::arm_local_stage1_items(
       task.stage1_remote_frontier = std::move(prepared.remote_frontier);
       task.stage1_backlink_targets = std::move(
         prepared.backlink_targets);
+      task.stage1_prune_deferred = prepared.stage1_prune_deferred;
     }
     const u64 maintenance_sequence =
       arm_storage_owner_maintenance(std::move(task), config);

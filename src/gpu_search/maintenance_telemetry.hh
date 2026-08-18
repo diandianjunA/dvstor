@@ -18,6 +18,7 @@ inline constexpr u64 kMagic = 0x31544d43565344ULL;  // "DSVCMT1"
 inline constexpr u32 kVersion = 1;
 inline constexpr u32 kValidCounters = 1u << 0;
 inline constexpr size_t kLatencyBucketCount = 18;
+inline constexpr size_t kStage2PhaseCount = 6;
 inline constexpr size_t kSnapshotOffset = sizeof(format::StorageControlBlock);
 
 // sequence is a seqlock. A writer publishes odd before replacing the body and
@@ -63,7 +64,35 @@ struct alignas(64) Snapshot {
   u64 stage2_vector_read_waves{};
   u64 stage2_vector_unique_reads{};
   std::array<u64, kLatencyBucketCount> stage2_delay_histogram{};
-  std::array<u64, 6> reserved{};
+  // Cumulative executor service demand.  Keeping this in the control-page
+  // snapshot lets the benchmark take an exact measurement-window delta even
+  // when storage logs are unavailable to the compute node.
+  std::array<u64, kStage2PhaseCount> stage2_phase_attempts{};
+  std::array<u64, kStage2PhaseCount> stage2_phase_task_attempts{};
+  std::array<u64, kStage2PhaseCount> stage2_phase_elapsed_ns{};
+  u64 maintenance_worker_idle_waits{};
+  u64 maintenance_worker_idle_ns{};
+
+  // Physical-home Stage1 work is deliberately independent of the public
+  // completion protocol.  A token may be coordinated by another shard, so
+  // returning these counters in each completion would either lose the remote
+  // work or enlarge the hot-path wire format.  Cumulative control-page
+  // counters account for every first execution without per-token traffic.
+  u64 physical_stage1_items{};
+  u64 physical_stage1_total_ns{};
+  u64 physical_stage1_search_ns{};
+  u64 physical_stage1_prune_ns{};
+  u64 physical_stage1_allocate_write_ns{};
+  u64 physical_stage1_backlink_ns{};
+  u64 physical_stage1_candidates{};
+  u64 physical_stage1_remote_frontier_items{};
+  u64 physical_stage1_neighbors{};
+  u64 stage2_home_score_rpc_batches{};
+  u64 stage2_home_score_rpc_items{};
+  u64 stage2_home_score_rpc_queries{};
+  u64 stage2_home_score_rpc_request_bytes{};
+  u64 stage2_home_score_rpc_response_bytes{};
+  std::array<u64, 1> reserved{};
 };
 
 static_assert(kSnapshotOffset == 192);

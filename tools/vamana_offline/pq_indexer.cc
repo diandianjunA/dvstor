@@ -120,8 +120,14 @@ void validate_shard_fingerprint(std::ifstream& input,
 PersistentLayout make_persistent_layout(const nlohmann::json& metadata,
                                         const Layout& layout,
                                         u32 code_bytes) {
+  // A schema-15 graph is the deliberate pre-PQ intermediate and therefore
+  // advertises pq_bits=0.  Re-indexing an already annotated intermediate may
+  // carry 8.  Reject every other value, but do not make the normal builder ->
+  // PQ-indexer pipeline impossible by requiring the output annotation before
+  // it has been produced.
+  const u32 metadata_pq_bits = metadata.value("pq_bits", 0u);
   if (code_bytes == 0 || code_bytes > layout.dim ||
-      metadata.value("pq_bits", 8u) != 8u) {
+      (metadata_pq_bits != 0 && metadata_pq_bits != 8)) {
     throw std::runtime_error("invalid OPQ/PQ code layout");
   }
   const u32 dynamic_hot_offset = metadata.at("hot_graph_dynamic_hot_offset").get<u32>();

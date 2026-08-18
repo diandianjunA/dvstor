@@ -23,6 +23,12 @@ constexpr std::array<double, kMaintenanceLatencyBucketCount>
     std::numeric_limits<double>::infinity(),
   };
 
+constexpr std::array<const char*, kStage2TimingPhaseCount>
+  kStage2TimingPhaseNames{
+    "search", "freeze_prune", "reverse_prepare", "placement_authority",
+    "completion_handoff", "finalize",
+  };
+
 std::optional<uint64_t> parse_u64(const Fields& fields, const char* key) {
   const auto iterator = fields.find(key);
   if (iterator == fields.end()) return std::nullopt;
@@ -48,6 +54,36 @@ std::optional<double> parse_double(const Fields& fields, const char* key) {
   } catch (...) {
     return std::nullopt;
   }
+}
+
+std::optional<std::array<uint64_t, kStage2TimingPhaseCount>>
+parse_stage2_phase_counters(const Fields& fields, const char* suffix) {
+  std::array<uint64_t, kStage2TimingPhaseCount> values{};
+  for (size_t phase = 0; phase < values.size(); ++phase) {
+    const std::string key = "stage2_phase_" +
+      std::string(kStage2TimingPhaseNames[phase]) + suffix;
+    const auto value = parse_u64(fields, key.c_str());
+    if (!value.has_value()) return std::nullopt;
+    values[phase] = *value;
+  }
+  return values;
+}
+
+std::optional<std::array<uint64_t, kStage2TimingPhaseCount>>
+parse_stage2_phase_elapsed_ns(const Fields& fields) {
+  std::array<uint64_t, kStage2TimingPhaseCount> values{};
+  for (size_t phase = 0; phase < values.size(); ++phase) {
+    const std::string key = "stage2_phase_" +
+      std::string(kStage2TimingPhaseNames[phase]) + "_elapsed_ms";
+    const auto elapsed_ms = parse_double(fields, key.c_str());
+    if (!elapsed_ms.has_value() || *elapsed_ms < 0.0 ||
+        *elapsed_ms > static_cast<double>(
+          std::numeric_limits<uint64_t>::max()) / 1e6) {
+      return std::nullopt;
+    }
+    values[phase] = static_cast<uint64_t>(*elapsed_ms * 1e6 + 0.5);
+  }
+  return values;
 }
 
 std::optional<std::array<uint64_t, kMaintenanceLatencyBucketCount>>
@@ -139,6 +175,49 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
     parse_u64(fields, "stage1_search_budget_exhausted");
   const auto stage2_search_budget_exhausted =
     parse_u64(fields, "stage2_search_budget_exhausted");
+  const auto stage2_phase_attempts =
+    parse_stage2_phase_counters(fields, "_attempts");
+  const auto stage2_phase_task_attempts =
+    parse_stage2_phase_counters(fields, "_task_attempts");
+  const auto stage2_phase_elapsed_ns =
+    parse_stage2_phase_elapsed_ns(fields);
+  const auto maintenance_worker_idle_waits =
+    parse_u64(fields, "maintenance_worker_idle_waits");
+  const auto maintenance_worker_idle_ms =
+    parse_double(fields, "maintenance_worker_idle_ms");
+  const auto physical_stage1_items =
+    parse_u64(fields, "physical_stage1_items");
+  const auto physical_stage1_total_ns =
+    parse_u64(fields, "physical_stage1_total_ns");
+  const auto physical_stage1_search_ns =
+    parse_u64(fields, "physical_stage1_search_ns");
+  const auto physical_stage1_prune_ns =
+    parse_u64(fields, "physical_stage1_prune_ns");
+  const auto physical_stage1_allocate_write_ns =
+    parse_u64(fields, "physical_stage1_allocate_write_ns");
+  const auto physical_stage1_backlink_ns =
+    parse_u64(fields, "physical_stage1_backlink_ns");
+  const auto physical_stage1_candidates =
+    parse_u64(fields, "physical_stage1_candidates");
+  const auto physical_stage1_remote_frontier_items =
+    parse_u64(fields, "physical_stage1_remote_frontier_items");
+  const auto physical_stage1_neighbors =
+    parse_u64(fields, "physical_stage1_neighbors");
+  const bool timing_counters_available =
+    stage2_phase_attempts.has_value() &&
+    stage2_phase_task_attempts.has_value() &&
+    stage2_phase_elapsed_ns.has_value() &&
+    maintenance_worker_idle_waits.has_value() &&
+    maintenance_worker_idle_ms.has_value() &&
+    physical_stage1_items.has_value() &&
+    physical_stage1_total_ns.has_value() &&
+    physical_stage1_search_ns.has_value() &&
+    physical_stage1_prune_ns.has_value() &&
+    physical_stage1_allocate_write_ns.has_value() &&
+    physical_stage1_backlink_ns.has_value() &&
+    physical_stage1_candidates.has_value() &&
+    physical_stage1_remote_frontier_items.has_value() &&
+    physical_stage1_neighbors.has_value();
   const auto histogram = parse_histogram(fields);
   return MaintenanceObservation{
     .stage2_enqueued = *stage2_enqueued,
@@ -166,6 +245,27 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
       stage1_search_budget_exhausted.value_or(0),
     .stage2_search_budget_exhausted =
       stage2_search_budget_exhausted.value_or(0),
+    .stage2_phase_attempts = stage2_phase_attempts.value_or(
+      std::array<uint64_t, kStage2TimingPhaseCount>{}),
+    .stage2_phase_task_attempts = stage2_phase_task_attempts.value_or(
+      std::array<uint64_t, kStage2TimingPhaseCount>{}),
+    .stage2_phase_elapsed_ns = stage2_phase_elapsed_ns.value_or(
+      std::array<uint64_t, kStage2TimingPhaseCount>{}),
+    .maintenance_worker_idle_waits =
+      maintenance_worker_idle_waits.value_or(0),
+    .maintenance_worker_idle_ns = maintenance_worker_idle_ms.has_value()
+      ? static_cast<uint64_t>(*maintenance_worker_idle_ms * 1e6 + 0.5) : 0,
+    .physical_stage1_items = physical_stage1_items.value_or(0),
+    .physical_stage1_total_ns = physical_stage1_total_ns.value_or(0),
+    .physical_stage1_search_ns = physical_stage1_search_ns.value_or(0),
+    .physical_stage1_prune_ns = physical_stage1_prune_ns.value_or(0),
+    .physical_stage1_allocate_write_ns =
+      physical_stage1_allocate_write_ns.value_or(0),
+    .physical_stage1_backlink_ns = physical_stage1_backlink_ns.value_or(0),
+    .physical_stage1_candidates = physical_stage1_candidates.value_or(0),
+    .physical_stage1_remote_frontier_items =
+      physical_stage1_remote_frontier_items.value_or(0),
+    .physical_stage1_neighbors = physical_stage1_neighbors.value_or(0),
     .p99_stage2_delay_upper_ms =
       parse_double(fields, "p99_stage2_delay_upper_ms").value_or(0.0),
     .p99_stage2_delay_over_30s =
@@ -189,6 +289,7 @@ std::optional<MaintenanceObservation> parse_observation(const std::string& line)
     .search_budget_counters_available =
       stage1_search_budget_exhausted.has_value() &&
       stage2_search_budget_exhausted.has_value(),
+    .timing_counters_available = timing_counters_available,
   };
 }
 
@@ -280,6 +381,18 @@ double backlog_slope(const std::vector<MaintenanceObservation>& observations,
 bool counter_delta(uint64_t baseline, uint64_t latest, uint64_t* delta) {
   if (latest < baseline) return false;
   *delta = latest - baseline;
+  return true;
+}
+
+template <size_t Count>
+bool counter_array_delta(const std::array<uint64_t, Count>& baseline,
+                         const std::array<uint64_t, Count>& latest,
+                         std::array<uint64_t, Count>* delta) {
+  for (size_t item = 0; item < Count; ++item) {
+    if (!counter_delta(baseline[item], latest[item], &(*delta)[item])) {
+      return false;
+    }
+  }
   return true;
 }
 
@@ -471,6 +584,83 @@ MaintenanceLogSummary summarize_impl(
         summary.stage2_search_budget_exhausted += stage2_exhausted;
       }
     }
+
+    if (!slice.rotated && cursor.baseline_available &&
+        cursor.baseline.timing_counters_available &&
+        latest.timing_counters_available) {
+      std::array<uint64_t, kStage2TimingPhaseCount> phase_attempts{};
+      std::array<uint64_t, kStage2TimingPhaseCount> phase_task_attempts{};
+      std::array<uint64_t, kStage2TimingPhaseCount> phase_elapsed_ns{};
+      uint64_t idle_waits = 0;
+      uint64_t idle_ns = 0;
+      uint64_t stage1_items = 0;
+      uint64_t stage1_total_ns = 0;
+      uint64_t stage1_search_ns = 0;
+      uint64_t stage1_prune_ns = 0;
+      uint64_t stage1_allocate_write_ns = 0;
+      uint64_t stage1_backlink_ns = 0;
+      uint64_t stage1_candidates = 0;
+      uint64_t stage1_frontier = 0;
+      uint64_t stage1_neighbors = 0;
+      const bool valid =
+        counter_array_delta(cursor.baseline.stage2_phase_attempts,
+                            latest.stage2_phase_attempts,
+                            &phase_attempts) &&
+        counter_array_delta(cursor.baseline.stage2_phase_task_attempts,
+                            latest.stage2_phase_task_attempts,
+                            &phase_task_attempts) &&
+        counter_array_delta(cursor.baseline.stage2_phase_elapsed_ns,
+                            latest.stage2_phase_elapsed_ns,
+                            &phase_elapsed_ns) &&
+        counter_delta(cursor.baseline.maintenance_worker_idle_waits,
+                      latest.maintenance_worker_idle_waits, &idle_waits) &&
+        counter_delta(cursor.baseline.maintenance_worker_idle_ns,
+                      latest.maintenance_worker_idle_ns, &idle_ns) &&
+        counter_delta(cursor.baseline.physical_stage1_items,
+                      latest.physical_stage1_items, &stage1_items) &&
+        counter_delta(cursor.baseline.physical_stage1_total_ns,
+                      latest.physical_stage1_total_ns, &stage1_total_ns) &&
+        counter_delta(cursor.baseline.physical_stage1_search_ns,
+                      latest.physical_stage1_search_ns, &stage1_search_ns) &&
+        counter_delta(cursor.baseline.physical_stage1_prune_ns,
+                      latest.physical_stage1_prune_ns, &stage1_prune_ns) &&
+        counter_delta(cursor.baseline.physical_stage1_allocate_write_ns,
+                      latest.physical_stage1_allocate_write_ns,
+                      &stage1_allocate_write_ns) &&
+        counter_delta(cursor.baseline.physical_stage1_backlink_ns,
+                      latest.physical_stage1_backlink_ns,
+                      &stage1_backlink_ns) &&
+        counter_delta(cursor.baseline.physical_stage1_candidates,
+                      latest.physical_stage1_candidates,
+                      &stage1_candidates) &&
+        counter_delta(
+          cursor.baseline.physical_stage1_remote_frontier_items,
+          latest.physical_stage1_remote_frontier_items,
+          &stage1_frontier) &&
+        counter_delta(cursor.baseline.physical_stage1_neighbors,
+                      latest.physical_stage1_neighbors, &stage1_neighbors);
+      if (valid) {
+        ++summary.logs_with_timing_counter_deltas;
+        for (size_t phase = 0; phase < kStage2TimingPhaseCount; ++phase) {
+          summary.stage2_phase_attempts[phase] += phase_attempts[phase];
+          summary.stage2_phase_task_attempts[phase] +=
+            phase_task_attempts[phase];
+          summary.stage2_phase_elapsed_ns[phase] += phase_elapsed_ns[phase];
+        }
+        summary.maintenance_worker_idle_waits += idle_waits;
+        summary.maintenance_worker_idle_ns += idle_ns;
+        summary.physical_stage1_items += stage1_items;
+        summary.physical_stage1_total_ns += stage1_total_ns;
+        summary.physical_stage1_search_ns += stage1_search_ns;
+        summary.physical_stage1_prune_ns += stage1_prune_ns;
+        summary.physical_stage1_allocate_write_ns +=
+          stage1_allocate_write_ns;
+        summary.physical_stage1_backlink_ns += stage1_backlink_ns;
+        summary.physical_stage1_candidates += stage1_candidates;
+        summary.physical_stage1_remote_frontier_items += stage1_frontier;
+        summary.physical_stage1_neighbors += stage1_neighbors;
+      }
+    }
   }
   summary.backlog_slope_available = summary.requested_logs != 0 &&
     summary.logs_with_slope_observations == summary.requested_logs;
@@ -484,6 +674,8 @@ MaintenanceLogSummary summarize_impl(
     summary.logs_with_locality_deltas == summary.requested_logs;
   summary.search_budget_delta_available = summary.requested_logs != 0 &&
     summary.logs_with_search_budget_deltas == summary.requested_logs;
+  summary.timing_counter_delta_available = summary.requested_logs != 0 &&
+    summary.logs_with_timing_counter_deltas == summary.requested_logs;
   summary.p99_stage2_delay_available = summary.requested_logs != 0 &&
     summary.logs_with_histogram_deltas == summary.requested_logs &&
     summary.p99_stage2_delay_samples != 0;
@@ -704,6 +896,106 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
       summary.stage2_vector_read_waves += vector_waves;
       summary.stage2_vector_unique_reads += vector_reads;
     }
+
+    uint64_t score_rpc_batches = 0;
+    uint64_t score_rpc_items = 0;
+    uint64_t score_rpc_queries = 0;
+    uint64_t score_rpc_request_bytes = 0;
+    uint64_t score_rpc_response_bytes = 0;
+    if (counter_delta(first.stage2_home_score_rpc_batches,
+                      latest.stage2_home_score_rpc_batches,
+                      &score_rpc_batches) &&
+        counter_delta(first.stage2_home_score_rpc_items,
+                      latest.stage2_home_score_rpc_items,
+                      &score_rpc_items) &&
+        counter_delta(first.stage2_home_score_rpc_queries,
+                      latest.stage2_home_score_rpc_queries,
+                      &score_rpc_queries) &&
+        counter_delta(first.stage2_home_score_rpc_request_bytes,
+                      latest.stage2_home_score_rpc_request_bytes,
+                      &score_rpc_request_bytes) &&
+        counter_delta(first.stage2_home_score_rpc_response_bytes,
+                      latest.stage2_home_score_rpc_response_bytes,
+                      &score_rpc_response_bytes)) {
+      ++summary.logs_with_score_rpc_wire_counter_deltas;
+      summary.stage2_home_score_rpc_batches += score_rpc_batches;
+      summary.stage2_home_score_rpc_items += score_rpc_items;
+      summary.stage2_home_score_rpc_queries += score_rpc_queries;
+      summary.stage2_home_score_rpc_request_bytes +=
+        score_rpc_request_bytes;
+      summary.stage2_home_score_rpc_response_bytes +=
+        score_rpc_response_bytes;
+    }
+
+    std::array<uint64_t, kStage2TimingPhaseCount> phase_attempts{};
+    std::array<uint64_t, kStage2TimingPhaseCount> phase_task_attempts{};
+    std::array<uint64_t, kStage2TimingPhaseCount> phase_elapsed_ns{};
+    uint64_t idle_waits = 0;
+    uint64_t idle_ns = 0;
+    uint64_t stage1_items = 0;
+    uint64_t stage1_total_ns = 0;
+    uint64_t stage1_search_ns = 0;
+    uint64_t stage1_prune_ns = 0;
+    uint64_t stage1_allocate_write_ns = 0;
+    uint64_t stage1_backlink_ns = 0;
+    uint64_t stage1_candidates = 0;
+    uint64_t stage1_frontier = 0;
+    uint64_t stage1_neighbors = 0;
+    if (counter_array_delta(first.stage2_phase_attempts,
+                            latest.stage2_phase_attempts,
+                            &phase_attempts) &&
+        counter_array_delta(first.stage2_phase_task_attempts,
+                            latest.stage2_phase_task_attempts,
+                            &phase_task_attempts) &&
+        counter_array_delta(first.stage2_phase_elapsed_ns,
+                            latest.stage2_phase_elapsed_ns,
+                            &phase_elapsed_ns) &&
+        counter_delta(first.maintenance_worker_idle_waits,
+                      latest.maintenance_worker_idle_waits, &idle_waits) &&
+        counter_delta(first.maintenance_worker_idle_ns,
+                      latest.maintenance_worker_idle_ns, &idle_ns) &&
+        counter_delta(first.physical_stage1_items,
+                      latest.physical_stage1_items, &stage1_items) &&
+        counter_delta(first.physical_stage1_total_ns,
+                      latest.physical_stage1_total_ns, &stage1_total_ns) &&
+        counter_delta(first.physical_stage1_search_ns,
+                      latest.physical_stage1_search_ns, &stage1_search_ns) &&
+        counter_delta(first.physical_stage1_prune_ns,
+                      latest.physical_stage1_prune_ns, &stage1_prune_ns) &&
+        counter_delta(first.physical_stage1_allocate_write_ns,
+                      latest.physical_stage1_allocate_write_ns,
+                      &stage1_allocate_write_ns) &&
+        counter_delta(first.physical_stage1_backlink_ns,
+                      latest.physical_stage1_backlink_ns,
+                      &stage1_backlink_ns) &&
+        counter_delta(first.physical_stage1_candidates,
+                      latest.physical_stage1_candidates,
+                      &stage1_candidates) &&
+        counter_delta(first.physical_stage1_remote_frontier_items,
+                      latest.physical_stage1_remote_frontier_items,
+                      &stage1_frontier) &&
+        counter_delta(first.physical_stage1_neighbors,
+                      latest.physical_stage1_neighbors,
+                      &stage1_neighbors)) {
+      ++summary.logs_with_timing_counter_deltas;
+      for (size_t phase = 0; phase < kStage2TimingPhaseCount; ++phase) {
+        summary.stage2_phase_attempts[phase] += phase_attempts[phase];
+        summary.stage2_phase_task_attempts[phase] +=
+          phase_task_attempts[phase];
+        summary.stage2_phase_elapsed_ns[phase] += phase_elapsed_ns[phase];
+      }
+      summary.maintenance_worker_idle_waits += idle_waits;
+      summary.maintenance_worker_idle_ns += idle_ns;
+      summary.physical_stage1_items += stage1_items;
+      summary.physical_stage1_total_ns += stage1_total_ns;
+      summary.physical_stage1_search_ns += stage1_search_ns;
+      summary.physical_stage1_prune_ns += stage1_prune_ns;
+      summary.physical_stage1_allocate_write_ns += stage1_allocate_write_ns;
+      summary.physical_stage1_backlink_ns += stage1_backlink_ns;
+      summary.physical_stage1_candidates += stage1_candidates;
+      summary.physical_stage1_remote_frontier_items += stage1_frontier;
+      summary.physical_stage1_neighbors += stage1_neighbors;
+    }
   }
   summary.backlog_slope_available = summary.requested_logs != 0 &&
     summary.logs_with_slope_observations == summary.requested_logs;
@@ -717,6 +1009,8 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
     summary.logs_with_locality_deltas == summary.requested_logs;
   summary.search_budget_delta_available = summary.requested_logs != 0 &&
     summary.logs_with_search_budget_deltas == summary.requested_logs;
+  summary.timing_counter_delta_available = summary.requested_logs != 0 &&
+    summary.logs_with_timing_counter_deltas == summary.requested_logs;
   summary.p99_stage2_delay_available = summary.requested_logs != 0 &&
     summary.logs_with_histogram_deltas == summary.requested_logs &&
     summary.p99_stage2_delay_samples != 0;
@@ -725,6 +1019,10 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
   summary.execution_counter_delta_available =
     summary.requested_logs != 0 &&
     summary.logs_with_execution_counter_deltas == summary.requested_logs;
+  summary.score_rpc_wire_counter_delta_available =
+    summary.requested_logs != 0 &&
+    summary.logs_with_score_rpc_wire_counter_deltas ==
+      summary.requested_logs;
   return summary;
 }
 

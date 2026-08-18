@@ -1,6 +1,7 @@
 #include "tools/breakdown_benchmark/workload.hh"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <barrier>
 #include <chrono>
@@ -1462,6 +1463,35 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     for (const auto& path : summary.unreadable_logs) paths.push_back(path);
     return paths;
   };
+  constexpr std::array<const char*, kStage2TimingPhaseCount>
+    stage2_phase_names{
+      "search", "freeze_prune", "reverse_prepare", "placement_authority",
+      "completion_handoff", "finalize",
+    };
+  nlohmann::json stage2_phase_timing = nlohmann::json::object();
+  for (size_t phase = 0; phase < stage2_phase_names.size(); ++phase) {
+    const uint64_t tasks =
+      maintenance_summary.stage2_phase_task_attempts[phase];
+    stage2_phase_timing[stage2_phase_names[phase]] = {
+      {"attempts", maintenance_summary.stage2_phase_attempts[phase]},
+      {"task_attempts", tasks},
+      {"elapsed_ns", maintenance_summary.stage2_phase_elapsed_ns[phase]},
+      {"avg_us_per_task", tasks == 0 ? 0.0 :
+        static_cast<double>(
+          maintenance_summary.stage2_phase_elapsed_ns[phase]) /
+        static_cast<double>(tasks) / 1e3},
+    };
+  }
+  const auto stage1_average_us = [&](uint64_t elapsed_ns) {
+    return maintenance_summary.physical_stage1_items == 0 ? 0.0 :
+      static_cast<double>(elapsed_ns) /
+      static_cast<double>(maintenance_summary.physical_stage1_items) / 1e3;
+  };
+  const auto stage1_average_count = [&](uint64_t count) {
+    return maintenance_summary.physical_stage1_items == 0 ? 0.0 :
+      static_cast<double>(count) /
+      static_cast<double>(maintenance_summary.physical_stage1_items);
+  };
   root["stage2"] = {
     {"source", in_band_maintenance_telemetry
       ? "in_band_control_page" : "storage_logs"},
@@ -1565,6 +1595,65 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
      maintenance_summary.stage2_vector_read_waves == 0 ? 0.0 :
        static_cast<double>(maintenance_summary.stage2_vector_unique_reads) /
        static_cast<double>(maintenance_summary.stage2_vector_read_waves)},
+    {"score_rpc_wire", {
+      {"counter_delta_available",
+       maintenance_summary.score_rpc_wire_counter_delta_available},
+      {"batches", maintenance_summary.stage2_home_score_rpc_batches},
+      {"items", maintenance_summary.stage2_home_score_rpc_items},
+      {"query_vectors", maintenance_summary.stage2_home_score_rpc_queries},
+      {"request_bytes",
+       maintenance_summary.stage2_home_score_rpc_request_bytes},
+      {"response_bytes",
+       maintenance_summary.stage2_home_score_rpc_response_bytes},
+      {"avg_items_per_rpc",
+       maintenance_summary.stage2_home_score_rpc_batches == 0 ? 0.0 :
+         static_cast<double>(
+           maintenance_summary.stage2_home_score_rpc_items) /
+         static_cast<double>(
+           maintenance_summary.stage2_home_score_rpc_batches)},
+      {"query_dedup_ratio",
+       maintenance_summary.stage2_home_score_rpc_items == 0 ? 0.0 :
+         1.0 - static_cast<double>(
+           maintenance_summary.stage2_home_score_rpc_queries) /
+         static_cast<double>(
+           maintenance_summary.stage2_home_score_rpc_items)},
+    }},
+    {"timing_counter_delta_available",
+     maintenance_summary.timing_counter_delta_available},
+    {"phase_timing", stage2_phase_timing},
+    {"maintenance_worker_idle_waits",
+     maintenance_summary.maintenance_worker_idle_waits},
+    {"maintenance_worker_idle_ns",
+     maintenance_summary.maintenance_worker_idle_ns},
+    {"physical_stage1", {
+      {"items", maintenance_summary.physical_stage1_items},
+      {"total_ns", maintenance_summary.physical_stage1_total_ns},
+      {"search_ns", maintenance_summary.physical_stage1_search_ns},
+      {"prune_ns", maintenance_summary.physical_stage1_prune_ns},
+      {"allocate_write_ns",
+       maintenance_summary.physical_stage1_allocate_write_ns},
+      {"backlink_ns", maintenance_summary.physical_stage1_backlink_ns},
+      {"candidates", maintenance_summary.physical_stage1_candidates},
+      {"remote_frontier_items",
+       maintenance_summary.physical_stage1_remote_frontier_items},
+      {"neighbors", maintenance_summary.physical_stage1_neighbors},
+      {"avg_total_us", stage1_average_us(
+        maintenance_summary.physical_stage1_total_ns)},
+      {"avg_search_us", stage1_average_us(
+        maintenance_summary.physical_stage1_search_ns)},
+      {"avg_prune_us", stage1_average_us(
+        maintenance_summary.physical_stage1_prune_ns)},
+      {"avg_allocate_write_us", stage1_average_us(
+        maintenance_summary.physical_stage1_allocate_write_ns)},
+      {"avg_backlink_us", stage1_average_us(
+        maintenance_summary.physical_stage1_backlink_ns)},
+      {"avg_candidates", stage1_average_count(
+        maintenance_summary.physical_stage1_candidates)},
+      {"avg_remote_frontier", stage1_average_count(
+        maintenance_summary.physical_stage1_remote_frontier_items)},
+      {"avg_neighbors", stage1_average_count(
+        maintenance_summary.physical_stage1_neighbors)},
+    }},
     {"observation_period_seconds_assumed", 5.0},
   };
 

@@ -9,6 +9,7 @@
 #include "memory_node/storage_owner_maintenance/stage2_tracker.hh"
 #include "memory_node/storage_owner_index/partition_local_search.hh"
 #include "memory_node/storage_owner_index/reconcile_reverse_policy.hh"
+#include "memory_node/storage_owner_index/stage1_prune_handoff_policy.hh"
 #include "memory_node/storage_owner_index/vector_snapshot_policy.hh"
 
 #include <algorithm>
@@ -1224,6 +1225,23 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           task.maintenance_sequence = 0;
           continue;
         }
+        if (task.stage1_prune_deferred &&
+            !task.stage1_prune_materialized) {
+          // Reconstruct the exact local RobustPrune from the converged Stage1
+          // Beam before global continuation. The foreground published only a
+          // nearest-first provisional adjacency; durable finalization still
+          // consumes the same diversity-pruned local seed as the legacy path.
+          vec<RemotePtr> local_candidates;
+          local_candidates.reserve(task.stage1_beam.size());
+          for (const memory_node_detail::BeamEntry& entry : task.stage1_beam) {
+            local_candidates.push_back(entry.rptr);
+          }
+          const hashset_t<RemotePtr> skip;
+          task.stage1_pruned_neighbors = robust_prune_cpu(
+            target_snapshot.vector_data.data(), VamanaNode::vector_dtype(),
+            local_candidates, skip, config, nullptr, config.R);
+          task.stage1_prune_materialized = true;
+        }
         context.targets[item] = std::move(target_snapshot);
       }
 
@@ -2042,11 +2060,29 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         // Build this task's exact ordered candidate set while its source is
         // frozen. The batch-wide wave below reads every shared physical
         // record once, but RobustPrune still receives this task's own order.
+        lib_assert(!task.stage1_prune_deferred ||
+                     task.stage1_prune_materialized,
+                   "deferred Stage1 prune was not materialized");
+        const span<const RemotePtr> local_prune_seed =
+          task.stage1_prune_deferred
+            ? span<const RemotePtr>{task.stage1_pruned_neighbors}
+            : span<const RemotePtr>{task.stage1_base_neighbors};
+        vec<RemotePtr> observed_reverse_delta;
+        const span<const RemotePtr> observed_rebase = [&]() {
+          if (!task.stage1_prune_deferred) {
+            return span<const RemotePtr>{observed_adjacency.stable};
+          }
+          observed_reverse_delta =
+            memory_node_storage_owner_index_detail::
+              stage2_observed_reverse_delta(
+                span<const RemotePtr>{observed_adjacency.stable},
+                span<const RemotePtr>{task.stage1_base_neighbors});
+          return span<const RemotePtr>{observed_reverse_delta};
+        }();
         snapshot_candidates_by_task[item] = merge_stage2_rebase_candidates(
           span<const RemotePtr>{
             context.continued_candidates_by_task[item]},
-          span<const RemotePtr>{task.stage1_base_neighbors},
-          span<const RemotePtr>{observed_adjacency.stable});
+          local_prune_seed, observed_rebase);
         // Preserve one small, current routing backbone in the final prune
         // candidate set.  This is not a static anchor plane: entries are the
         // same versioned live centroid representatives already maintained by

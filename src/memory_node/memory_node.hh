@@ -183,6 +183,7 @@ class MemoryNode {
     bool arming{};
     bool armed{};
     bool aborted{};
+    bool stage1_prune_deferred{};
   };
 
   static constexpr size_t kStage1PreparedShardCount = 64;
@@ -270,6 +271,13 @@ class MemoryNode {
     // then-current adjacency against this captured baseline, so reverse edges
     // added while stage2 was queued/in flight are rebased instead of lost.
     vec<RemotePtr> stage1_base_neighbors;
+    // With deferred Stage1 pruning, base_neighbors is the exact provisional
+    // adjacency that was published at ACK. This separate seed is the exact
+    // RobustPrune result reconstructed from the converged local Beam before
+    // final global pruning.
+    vec<RemotePtr> stage1_pruned_neighbors;
+    bool stage1_prune_deferred{};
+    bool stage1_prune_materialized{};
     vec<RemotePtr> stage2_neighbors;
     // Protected children captured at the same locked boundary that freezes
     // the source graph. They are preserved at an in-place destination and
@@ -506,6 +514,11 @@ private:
       const Configuration& config,
       bool* admission_deferred = nullptr);
   bool handle_peer_stage2_expand_score_request(
+      u32 source_shard,
+      const service::storage_owner::PeerRpcHeader& header,
+      const byte_t* payload,
+      const Configuration& config);
+  bool handle_peer_stage2_score_many_request(
       u32 source_shard,
       const service::storage_owner::PeerRpcHeader& header,
       const byte_t* payload,
@@ -1150,6 +1163,17 @@ private:
   std::atomic<u64> peer_stage1_processed_{0};
   std::atomic<u64> peer_stage1_items_{0};
   std::atomic<u64> peer_stage1_max_queue_{0};
+  // First-execution service demand at the selected physical home. These
+  // include locally coordinated and remotely coordinated inserts alike.
+  std::atomic<u64> physical_stage1_items_{0};
+  std::atomic<u64> physical_stage1_total_ns_{0};
+  std::atomic<u64> physical_stage1_search_ns_{0};
+  std::atomic<u64> physical_stage1_prune_ns_{0};
+  std::atomic<u64> physical_stage1_allocate_write_ns_{0};
+  std::atomic<u64> physical_stage1_backlink_ns_{0};
+  std::atomic<u64> physical_stage1_candidates_{0};
+  std::atomic<u64> physical_stage1_remote_frontier_items_{0};
+  std::atomic<u64> physical_stage1_neighbors_{0};
   std::atomic<u64> peer_stage2_home_enqueued_{0};
   std::atomic<u64> peer_stage2_home_processed_{0};
   std::atomic<u64> peer_stage2_home_items_{0};
@@ -1236,6 +1260,9 @@ private:
   std::atomic<u64> storage_owner_stage2_home_rpc_items_{0};
   std::atomic<u64> storage_owner_stage2_home_score_rpc_batches_{0};
   std::atomic<u64> storage_owner_stage2_home_score_rpc_items_{0};
+  std::atomic<u64> storage_owner_stage2_home_score_rpc_queries_{0};
+  std::atomic<u64> storage_owner_stage2_home_score_rpc_request_bytes_{0};
+  std::atomic<u64> storage_owner_stage2_home_score_rpc_response_bytes_{0};
   std::atomic<u64> storage_owner_stage2_home_scored_neighbors_{0};
   std::atomic<u64> storage_owner_stage2_migrations_{0};
   std::atomic<u64> storage_owner_stage2_final_edges_{0};
