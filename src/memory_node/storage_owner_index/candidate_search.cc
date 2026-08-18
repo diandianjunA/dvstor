@@ -853,6 +853,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
     state.seeds.resize(tasks.size());
     state.search_seeded.assign(tasks.size(), 0);
     state.score_collect_cursors.assign(tasks.size(), {});
+    state.graph_prefetch_cache.resize(tasks.size());
     state.continuation.initialize(
       tasks.size(), storage_id_, construction_width, budget);
     state.round_robin_search = 0;
@@ -990,8 +991,10 @@ MemoryNode::advance_stage2_search_candidates_batched(
          position < state.graph_group_offsets[group_index + 1]; ++position) {
       const Stage2GraphConsumer& consumer =
         state.graph_consumers[state.graph_order[position]];
+      if (consumer.speculative) continue;
       resolved += state.continuation.resolve_expand_request(
-        consumer.search_index, consumer.generation, neighbors);
+        consumer.search_index, consumer.generation, consumer.pointer,
+        neighbors);
     }
     return resolved;
   };
@@ -1205,7 +1208,9 @@ MemoryNode::advance_stage2_search_candidates_batched(
     state.graph_selected_remote.clear();
     state.graph_selected_remote.reserve(graph_dispatch_limit);
     thread_local vec<u32> remote_items_by_peer;
+    thread_local vec<u32> wire_items_by_peer;
     remote_items_by_peer.resize(num_storage_nodes_);
+    wire_items_by_peer.assign(num_storage_nodes_, 0);
     memory_node_detail::PeerRdmaReadDispatchQuota quota;
     quota.reset(
       ordinary_dispatch_limits,
@@ -1233,13 +1238,106 @@ MemoryNode::advance_stage2_search_candidates_batched(
         continue;
       }
       state.graph_consumers.push_back({
-        request->search_index, request->generation, request->pointer});
+        request->search_index, request->generation, request->pointer,
+        false});
+      if (remote) ++wire_items_by_peer[request->pointer.memory_node()];
       if (distinct_remote) {
         state.graph_selected_remote.insert(request->pointer);
         ++physical_reads;
       }
       last_search = search_index;
       selected_any = true;
+    }
+    // Ordered issue is piggyback-only: it may occupy unused items in a peer
+    // RPC selected above, but it can neither create a new destination RPC nor
+    // split the existing one. This bounds the downside to home CPU/bytes.
+    const u64 prefetch_hits =
+      storage_owner_stage2_graph_prefetch_hits_.load(
+        std::memory_order_relaxed);
+    const u64 prefetch_wasted =
+      storage_owner_stage2_graph_prefetch_wasted_.load(
+        std::memory_order_relaxed);
+    const u64 prefetch_outcomes = prefetch_hits + prefetch_wasted;
+    u64 next_feedback_outcome =
+      storage_owner_stage2_graph_feedback_next_outcome_.load(
+        std::memory_order_relaxed);
+    if (prefetch_outcomes >= next_feedback_outcome &&
+        storage_owner_stage2_graph_feedback_next_outcome_
+          .compare_exchange_strong(
+            next_feedback_outcome, prefetch_outcomes + 512,
+            std::memory_order_relaxed, std::memory_order_relaxed)) {
+      const u64 base_hits =
+        storage_owner_stage2_graph_feedback_base_hits_.exchange(
+          prefetch_hits, std::memory_order_relaxed);
+      const u64 base_wasted =
+        storage_owner_stage2_graph_feedback_base_wasted_.exchange(
+          prefetch_wasted, std::memory_order_relaxed);
+      storage_owner_stage2_graph_issue_width_current_.store(
+        stage2_ordered_issue_width(
+          prefetch_hits >= base_hits ? prefetch_hits - base_hits : 0,
+          prefetch_wasted >= base_wasted
+            ? prefetch_wasted - base_wasted : 0,
+          config.storage_owner_stage2_graph_issue_width),
+        std::memory_order_relaxed);
+    }
+    const u32 issue_width = std::min(
+      config.storage_owner_stage2_graph_issue_width,
+      storage_owner_stage2_graph_issue_width_current_.load(
+        std::memory_order_relaxed));
+    const size_t cache_capacity =
+      static_cast<size_t>(config.storage_owner_stage2_graph_issue_width);
+    u64 speculative_added = 0;
+    if (issue_width > 1) {
+      thread_local vec<RemotePtr> prefetch_candidates;
+      const size_t authoritative_count = state.graph_consumers.size();
+      for (size_t consumer_index = 0;
+           consumer_index < authoritative_count; ++consumer_index) {
+        const Stage2GraphConsumer authoritative =
+          state.graph_consumers[consumer_index];
+        if (!storage_node_pointer_addressable(authoritative.pointer) ||
+            local_shard(authoritative.pointer.memory_node())) {
+          continue;
+        }
+        const u32 peer = authoritative.pointer.memory_node();
+        if (wire_items_by_peer[peer] >= config.storage_owner_batch_max) {
+          continue;
+        }
+        const size_t cached =
+          state.graph_prefetch_size(authoritative.search_index);
+        if (cached >= cache_capacity) continue;
+        const size_t per_search_limit = std::min<size_t>({
+          static_cast<size_t>(issue_width - 1),
+          cache_capacity - cached,
+          static_cast<size_t>(config.storage_owner_batch_max -
+                              wire_items_by_peer[peer]),
+        });
+        if (per_search_limit == 0) continue;
+        prefetch_candidates.clear();
+        state.continuation.append_expand_prefetch_candidates(
+          authoritative.search_index, peer, construction_width,
+          prefetch_candidates);
+        size_t admitted = 0;
+        for (const RemotePtr pointer : prefetch_candidates) {
+          if (admitted == per_search_limit ||
+              wire_items_by_peer[peer] >= config.storage_owner_batch_max) {
+            break;
+          }
+          if (state.graph_prefetch_contains(
+                authoritative.search_index, pointer)) {
+            continue;
+          }
+          state.graph_consumers.push_back({
+            authoritative.search_index, authoritative.generation, pointer,
+            true});
+          ++wire_items_by_peer[peer];
+          ++admitted;
+          ++speculative_added;
+        }
+      }
+    }
+    if (speculative_added != 0) {
+      storage_owner_stage2_graph_prefetch_issued_.fetch_add(
+        speculative_added, std::memory_order_relaxed);
     }
     if (selected_any) {
       state.round_robin_search = (last_search + 1) % search_count;
@@ -1617,6 +1715,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
       rpc.complete = false;
       rpc.deadline_ns = 0;
       rpc.request.clear();
+      rpc.graph_consumer_indexes.clear();
     }
     thread_local vec<u32> home_counts;
     thread_local vec<size_t> rpc_by_shard;
@@ -1641,11 +1740,15 @@ MemoryNode::advance_stage2_search_candidates_batched(
       rpc.request.resize(
         service::storage_owner::stage2_expand_score_request_bytes(
           rpc.item_count));
+      rpc.graph_consumer_indexes.resize(rpc.item_count);
       std::fill(rpc.request.begin(), rpc.request.end(), byte_t{0});
       rpc_by_shard[shard] = state.home_expand_rpc_count++;
     }
     home_counts.assign(num_storage_nodes_, 0);
-    for (const Stage2GraphConsumer& consumer : state.graph_consumers) {
+    for (size_t consumer_index = 0;
+         consumer_index < state.graph_consumers.size(); ++consumer_index) {
+      const Stage2GraphConsumer& consumer =
+        state.graph_consumers[consumer_index];
       if (!storage_node_pointer_addressable(consumer.pointer) ||
           local_shard(consumer.pointer.memory_node())) {
         continue;
@@ -1653,6 +1756,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
       const u32 shard = consumer.pointer.memory_node();
       Stage2HomeExpandRpc& rpc = state.home_expand_rpcs[rpc_by_shard[shard]];
       const u32 item_index = home_counts[shard]++;
+      rpc.graph_consumer_indexes[item_index] = consumer_index;
       auto* items = service::storage_owner::stage2_expand_score_items(
         rpc.request.data());
       items[item_index] = service::storage_owner::Stage2ExpandScoreItem{
@@ -1691,6 +1795,89 @@ MemoryNode::advance_stage2_search_candidates_batched(
   thread_local vec<PeerReadSnapshotRequest> snapshot_requests;
   thread_local vec<byte_t> home_response_payload;
   thread_local vec<RemotePtr> home_neighbors;
+  const auto commit_prefetched_graph = [&] {
+    u64 hits = 0;
+    u64 wasted = 0;
+    u64 scored = 0;
+    u64 home_scored = 0;
+    bool progressed = false;
+    for (size_t search_index = 0; search_index < tasks.size();
+         ++search_index) {
+      if (state.search_seeded[search_index] == 0) continue;
+      const auto request =
+        state.continuation.pending_expand_request(search_index);
+      if (!request.has_value()) continue;
+      auto cached = state.take_graph_prefetch(
+        search_index, request->pointer);
+      if (!cached.has_value()) continue;
+      const auto disposition = static_cast<
+        service::storage_owner::Stage2HomeDisposition>(
+          cached->disposition);
+      if (disposition !=
+            service::storage_owner::Stage2HomeDisposition::stable &&
+          disposition !=
+            service::storage_owner::Stage2HomeDisposition::terminal) {
+        ++wasted;
+        continue;
+      }
+      home_neighbors.clear();
+      if (disposition ==
+          service::storage_owner::Stage2HomeDisposition::stable) {
+        home_neighbors.reserve(cached->neighbors.size());
+        for (const Stage2PrefetchedGraphNeighbor& neighbor :
+             cached->neighbors) {
+          home_neighbors.push_back(neighbor.pointer);
+        }
+      }
+      if (!state.continuation.resolve_expand_request(
+            search_index, request->generation, request->pointer,
+            span<const RemotePtr>{home_neighbors})) {
+        ++wasted;
+        continue;
+      }
+      ++hits;
+      progressed = true;
+      const u64 score_generation =
+        state.continuation.generation(search_index);
+      for (const Stage2PrefetchedGraphNeighbor& neighbor :
+           cached->neighbors) {
+        const auto neighbor_disposition = static_cast<
+          service::storage_owner::Stage2HomeDisposition>(
+            neighbor.disposition);
+        bool resolved = false;
+        if (neighbor_disposition ==
+            service::storage_owner::Stage2HomeDisposition::stable) {
+          resolved = state.continuation.resolve_score_request(
+            search_index, score_generation, neighbor.pointer,
+            std::optional<distance_t>{neighbor.distance});
+          home_scored += resolved;
+        } else if (neighbor_disposition ==
+                   service::storage_owner::Stage2HomeDisposition::terminal) {
+          resolved = state.continuation.resolve_score_request(
+            search_index, score_generation, neighbor.pointer,
+            std::nullopt);
+        }
+        scored += resolved;
+      }
+    }
+    if (hits != 0) {
+      storage_owner_stage2_graph_prefetch_hits_.fetch_add(
+        hits, std::memory_order_relaxed);
+    }
+    if (wasted != 0) {
+      storage_owner_stage2_graph_prefetch_wasted_.fetch_add(
+        wasted, std::memory_order_relaxed);
+    }
+    if (scored != 0) {
+      storage_owner_stage2_scored_candidates_.fetch_add(
+        scored, std::memory_order_relaxed);
+    }
+    if (home_scored != 0) {
+      storage_owner_stage2_home_scored_neighbors_.fetch_add(
+        home_scored, std::memory_order_relaxed);
+    }
+    return progressed;
+  };
   u8 idle_attempt_mask = 0;
 
   // Only a bounded transport dispatch is synchronized on one CQ.  Once its
@@ -1721,10 +1908,21 @@ MemoryNode::advance_stage2_search_candidates_batched(
         total_expansions, std::memory_order_relaxed);
       storage_owner_stage2_search_budget_exhausted_.fetch_add(
         exhausted_count, std::memory_order_relaxed);
+      const u64 unused_prefetch = state.graph_prefetch_entry_count();
+      if (unused_prefetch != 0) {
+        storage_owner_stage2_graph_prefetch_wasted_.fetch_add(
+          unused_prefetch, std::memory_order_relaxed);
+      }
       const size_t retained_capacity = std::max<size_t>(
         1024, static_cast<size_t>(construction_width) * 8);
       state.reset_completed(retained_capacity);
       return Stage2SearchAdvanceResult::complete;
+    }
+
+    if (state.phase == Stage2SearchIoPhase::idle &&
+        commit_prefetched_graph()) {
+      idle_attempt_mask = 0;
+      continue;
     }
 
     if (state.phase == Stage2SearchIoPhase::score_body_pending) {
@@ -2195,9 +2393,48 @@ MemoryNode::advance_stage2_search_candidates_batched(
                    "validated Stage2 home response lost its lease");
         for (u32 item_index = 0; item_index < rpc.item_count; ++item_index) {
           const auto& result = results[item_index];
+          lib_assert(item_index < rpc.graph_consumer_indexes.size() &&
+                       rpc.graph_consumer_indexes[item_index] <
+                         state.graph_consumers.size(),
+                     "Stage2 graph response lost consumer metadata");
+          const Stage2GraphConsumer& consumer = state.graph_consumers[
+            rpc.graph_consumer_indexes[item_index]];
           const auto disposition = static_cast<
             service::storage_owner::Stage2HomeDisposition>(
               result.disposition);
+          if (consumer.speculative) {
+            bool retained = false;
+            if (disposition !=
+                service::storage_owner::Stage2HomeDisposition::retryable) {
+              Stage2PrefetchedGraphExpansion cached{
+                .pointer = RemotePtr{result.pointer_raw},
+                .disposition = result.disposition,
+                .neighbors = {},
+              };
+              cached.neighbors.reserve(result.neighbor_count);
+              for (u32 neighbor_index = 0;
+                   neighbor_index < result.neighbor_count;
+                   ++neighbor_index) {
+                const auto& neighbor = neighbors[
+                  static_cast<size_t>(result.neighbor_offset) +
+                  neighbor_index];
+                cached.neighbors.push_back({
+                  .pointer = RemotePtr{neighbor.pointer_raw},
+                  .distance = neighbor.distance,
+                  .disposition = neighbor.disposition,
+                });
+              }
+              retained = state.insert_graph_prefetch(
+                consumer.search_index, std::move(cached),
+                static_cast<size_t>(
+                  config.storage_owner_stage2_graph_issue_width));
+            }
+            if (!retained) {
+              storage_owner_stage2_graph_prefetch_wasted_.fetch_add(
+                1, std::memory_order_relaxed);
+            }
+            continue;
+          }
           if (disposition ==
               service::storage_owner::Stage2HomeDisposition::retryable) {
             continue;
@@ -2215,6 +2452,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
           }
           if (!state.continuation.resolve_expand_request(
                 result.search_index, result.generation,
+                RemotePtr{result.pointer_raw},
                 span<const RemotePtr>{home_neighbors})) {
             continue;
           }

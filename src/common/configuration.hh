@@ -97,6 +97,10 @@ public:
   // changes foreground placement of work, not durable graph quality.
   bool storage_owner_defer_stage1_prune{false};
   bool storage_owner_stage2_score_many{false};
+  // Maximum ordered graph issue width. Width one is the exact legacy path;
+  // larger values are promotion-gated and only fill spare items in an RPC
+  // that an authoritative expansion already requires.
+  u32 storage_owner_stage2_graph_issue_width{16};
   u32 storage_owner_peer_qps_per_peer{8};
   u32 storage_owner_peer_rdma_tokens{16};
   u32 storage_owner_rpc_depth{8};
@@ -307,6 +311,11 @@ private:
          ->default_value(storage_owner_stage2_score_many),
        "Score remote Stage2 candidates at their physical home using a "
        "query-deduplicated exact score-many RPC.")
+      ("storage-owner-stage2-graph-issue-width",
+       po::value<u32>(&storage_owner_stage2_graph_issue_width)
+         ->default_value(storage_owner_stage2_graph_issue_width),
+       "Maximum ordered speculative Stage2 graph issue width; one disables "
+       "speculation and preserves the legacy request path.")
       ("storage-owner-peer-rdma-tokens",
        po::value<u32>(&storage_owner_peer_rdma_tokens)->default_value(storage_owner_peer_rdma_tokens),
        "Outstanding peer reads allowed per storage data QP.")
@@ -424,6 +433,8 @@ private:
         storage_owner_rpc_depth == 0 ||
         storage_owner_rpc_timeout_ms == 0 ||
         storage_owner_search_snapshot_batch == 0 ||
+        storage_owner_stage2_graph_issue_width == 0 ||
+        storage_owner_stage2_graph_issue_width > storage_owner_batch_max ||
         storage_owner_maintenance_workers == 0 ||
         storage_owner_maintenance_queue_depth == 0 ||
         storage_owner_reverse_queue_depth == 0 ||
@@ -511,6 +522,8 @@ public:
              << config.storage_owner_defer_stage1_prune << '\n';
       output << std::setw(width) << "Stage2 exact score-many: "
              << config.storage_owner_stage2_score_many << '\n';
+      output << std::setw(width) << "Stage2 graph issue width: "
+             << config.storage_owner_stage2_graph_issue_width << '\n';
       output << std::setw(width) << "storage peer QPs per peer: "
              << config.storage_owner_peer_qps_per_peer << '\n';
       output << std::setw(width) << "storage stage2 maintenance: "

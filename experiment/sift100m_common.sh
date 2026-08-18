@@ -561,6 +561,7 @@ write_service_config() {
     echo "storage-owner-stage2-batch-max-wait-us = ${STORAGE_OWNER_STAGE2_BATCH_MAX_WAIT_US:-50}"
     echo "storage-owner-defer-stage1-prune = ${STORAGE_OWNER_DEFER_STAGE1_PRUNE:-false}"
     echo "storage-owner-stage2-score-many = ${STORAGE_OWNER_STAGE2_SCORE_MANY:-false}"
+    echo "storage-owner-stage2-graph-issue-width = ${STORAGE_OWNER_STAGE2_GRAPH_ISSUE_WIDTH:-16}"
     echo "storage-owner-peer-qps-per-peer = ${STORAGE_OWNER_PEER_QPS_PER_PEER:-8}"
     echo "storage-owner-peer-rdma-tokens = ${STORAGE_OWNER_PEER_RDMA_TOKENS:-16}"
     echo "storage-owner-rpc-depth = ${STORAGE_OWNER_RPC_DEPTH:-16}"

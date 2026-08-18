@@ -719,6 +719,22 @@ FormattedReport format_report(const nlohmann::json& root,
              << stage2.value("avg_stage2_vector_reads_per_wave", 0.0)
              << " pressure_yields="
              << stage2.value("pressure_yields", 0ULL) << '\n';
+      if (stage2.contains("ordered_graph_issue")) {
+        const auto& ordered = stage2["ordered_graph_issue"];
+        output << "  ordered graph issue: issued/hit/wasted="
+               << ordered.value("issued", 0ULL) << "/"
+               << ordered.value("hits", 0ULL) << "/"
+               << ordered.value("wasted", 0ULL)
+               << " promotion_ratio="
+               << ordered.value("promotion_ratio", 0.0) << '\n';
+      }
+      if (stage2.contains("home_rpc_wire")) {
+        const auto& wire = stage2["home_rpc_wire"];
+        output << "  graph home RPC: batches/items/avg_items="
+               << wire.value("graph_batches", 0ULL) << "/"
+               << wire.value("graph_items", 0ULL) << "/"
+               << wire.value("avg_graph_items_per_rpc", 0.0) << '\n';
+      }
     } else {
       output << "unavailable\n";
     }

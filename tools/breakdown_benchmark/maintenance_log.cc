@@ -870,6 +870,9 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
     uint64_t stage2_batched_items = 0;
     uint64_t graph_waves = 0;
     uint64_t graph_reads = 0;
+    uint64_t graph_prefetch_issued = 0;
+    uint64_t graph_prefetch_hits = 0;
+    uint64_t graph_prefetch_wasted = 0;
     uint64_t vector_waves = 0;
     uint64_t vector_reads = 0;
     if (counter_delta(first.pressure_yields, latest.pressure_yields,
@@ -883,6 +886,15 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
                       latest.stage2_graph_read_waves, &graph_waves) &&
         counter_delta(first.stage2_graph_unique_reads,
                       latest.stage2_graph_unique_reads, &graph_reads) &&
+        counter_delta(first.stage2_graph_prefetch_issued,
+                      latest.stage2_graph_prefetch_issued,
+                      &graph_prefetch_issued) &&
+        counter_delta(first.stage2_graph_prefetch_hits,
+                      latest.stage2_graph_prefetch_hits,
+                      &graph_prefetch_hits) &&
+        counter_delta(first.stage2_graph_prefetch_wasted,
+                      latest.stage2_graph_prefetch_wasted,
+                      &graph_prefetch_wasted) &&
         counter_delta(first.stage2_vector_read_waves,
                       latest.stage2_vector_read_waves, &vector_waves) &&
         counter_delta(first.stage2_vector_unique_reads,
@@ -893,6 +905,9 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
       summary.stage2_batched_items += stage2_batched_items;
       summary.stage2_graph_read_waves += graph_waves;
       summary.stage2_graph_unique_reads += graph_reads;
+      summary.stage2_graph_prefetch_issued += graph_prefetch_issued;
+      summary.stage2_graph_prefetch_hits += graph_prefetch_hits;
+      summary.stage2_graph_prefetch_wasted += graph_prefetch_wasted;
       summary.stage2_vector_read_waves += vector_waves;
       summary.stage2_vector_unique_reads += vector_reads;
     }

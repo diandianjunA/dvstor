@@ -19,7 +19,11 @@ using memory_node_storage_owner_maintenance_detail::
 using memory_node_storage_owner_maintenance_detail::Stage2SearchIoPhase;
 using memory_node_storage_owner_maintenance_detail::Stage2SearchIoState;
 using memory_node_storage_owner_maintenance_detail::
+  Stage2PrefetchedGraphExpansion;
+using memory_node_storage_owner_maintenance_detail::
   stage2_consumer_fits_physical_scratch;
+using memory_node_storage_owner_maintenance_detail::
+  stage2_ordered_issue_width;
 
 namespace {
 
@@ -191,6 +195,44 @@ void test_home_rpc_wait_does_not_pin_registered_rdma_scratch() {
   assert(!state.scratch_rebindable());
 }
 
+void test_ordered_issue_policy_has_bounded_warmup_and_hard_stop() {
+  assert(stage2_ordered_issue_width(0, 0, 16) == 4);
+  assert(stage2_ordered_issue_width(358, 154, 16) == 1);
+  assert(stage2_ordered_issue_width(360, 152, 16) == 16);
+  assert(stage2_ordered_issue_width(230, 282, 16) == 1);
+  assert(stage2_ordered_issue_width(10'000, 0, 1) == 1);
+}
+
+void test_prefetch_cache_is_bounded_and_consumed_by_pointer() {
+  Stage2SearchIoState state;
+  state.graph_prefetch_cache.resize(1);
+  assert(state.insert_graph_prefetch(
+    0,
+    Stage2PrefetchedGraphExpansion{
+      .pointer = RemotePtr{1, 128}, .disposition = 0, .neighbors = {}},
+    2));
+  assert(!state.insert_graph_prefetch(
+    0,
+    Stage2PrefetchedGraphExpansion{
+      .pointer = RemotePtr{1, 128}, .disposition = 0, .neighbors = {}},
+    2));
+  assert(state.insert_graph_prefetch(
+    0,
+    Stage2PrefetchedGraphExpansion{
+      .pointer = RemotePtr{1, 256}, .disposition = 0, .neighbors = {}},
+    2));
+  assert(!state.insert_graph_prefetch(
+    0,
+    Stage2PrefetchedGraphExpansion{
+      .pointer = RemotePtr{1, 384}, .disposition = 0, .neighbors = {}},
+    2));
+  assert(state.graph_prefetch_entry_count() == 2);
+  assert(!state.take_graph_prefetch(0, RemotePtr{1, 384}).has_value());
+  const auto hit = state.take_graph_prefetch(0, RemotePtr{1, 128});
+  assert(hit.has_value() && hit->pointer == RemotePtr(1, 128));
+  assert(state.graph_prefetch_entry_count() == 1);
+}
+
 }  // namespace
 
 int main() {
@@ -202,5 +244,7 @@ int main() {
   test_score_many_uses_wire_capacity_instead_of_read_credits();
   test_score_many_rejects_latency_dominated_sparse_waves();
   test_home_rpc_wait_does_not_pin_registered_rdma_scratch();
+  test_ordered_issue_policy_has_bounded_warmup_and_hard_stop();
+  test_prefetch_cache_is_bounded_and_consumed_by_pointer();
   return 0;
 }

@@ -1599,6 +1599,19 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
      maintenance_summary.stage2_graph_read_waves == 0 ? 0.0 :
        static_cast<double>(maintenance_summary.stage2_graph_unique_reads) /
        static_cast<double>(maintenance_summary.stage2_graph_read_waves)},
+    {"ordered_graph_issue", {
+      {"issued", maintenance_summary.stage2_graph_prefetch_issued},
+      {"hits", maintenance_summary.stage2_graph_prefetch_hits},
+      {"wasted", maintenance_summary.stage2_graph_prefetch_wasted},
+      {"promotion_ratio",
+       maintenance_summary.stage2_graph_prefetch_hits +
+           maintenance_summary.stage2_graph_prefetch_wasted == 0 ? 0.0 :
+         static_cast<double>(
+           maintenance_summary.stage2_graph_prefetch_hits) /
+         static_cast<double>(
+           maintenance_summary.stage2_graph_prefetch_hits +
+           maintenance_summary.stage2_graph_prefetch_wasted)},
+    }},
     {"stage2_vector_read_waves",
      maintenance_summary.stage2_vector_read_waves},
     {"stage2_vector_unique_reads",
