@@ -12,6 +12,7 @@ using memory_node_peer_rpc_detail::Stage1ControlResponseDisposition;
 using memory_node_peer_rpc_detail::Stage1HomeRetryBackoff;
 using memory_node_peer_rpc_detail::classify_stage1_control_response;
 using memory_node_peer_rpc_detail::dequeue_stage2_home_first;
+using memory_node_peer_rpc_detail::is_stage2_home_response;
 using memory_node_peer_rpc_detail::make_fused_stage1_release_item;
 using memory_node_peer_rpc_detail::partition_stage1_control_response;
 using memory_node_peer_rpc_detail::partition_stage1_execute_response;
@@ -79,6 +80,14 @@ void test_dedicated_stage2_queue_never_wakes_stage1_worker() {
   assert(stage1_worker_has_eligible_task(false, false, true));
   assert(stage1_worker_has_eligible_task(false, true, false));
   assert(stage1_worker_has_eligible_task(false, true, true));
+}
+
+void test_stage2_home_response_family_is_complete() {
+  assert(is_stage2_home_response(PeerRpcType::stage2_expand_score_response));
+  assert(is_stage2_home_response(PeerRpcType::stage2_score_many_response));
+  assert(!is_stage2_home_response(PeerRpcType::stage2_expand_score_request));
+  assert(!is_stage2_home_response(PeerRpcType::stage2_score_many_request));
+  assert(!is_stage2_home_response(PeerRpcType::stage1_execute_response));
 }
 
 void test_atomic_home_arm_response() {
@@ -573,6 +582,7 @@ void test_execute_mixed_progress_compacts_only_retry_tokens() {
 int main() {
   test_stage2_home_queue_cannot_starve_behind_stage1();
   test_dedicated_stage2_queue_never_wakes_stage1_worker();
+  test_stage2_home_response_family_is_complete();
   test_atomic_home_arm_response();
   test_release_is_an_idempotent_ordered_watermark();
   test_structural_corruption_never_becomes_retry();

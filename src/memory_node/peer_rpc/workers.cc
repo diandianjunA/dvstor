@@ -387,20 +387,32 @@ void MemoryNode::peer_rpc_progress_loop() {
             }
           }
         }
-      } else if (header->type == static_cast<u32>(
-                   service::storage_owner::PeerRpcType::stage2_expand_score_response)) {
-        const size_t minimum_bytes =
-          service::storage_owner::stage2_expand_score_response_bytes(
-            header->item_count, 0);
-        const size_t maximum_bytes =
-          service::storage_owner::stage2_expand_score_response_bytes(
-            header->item_count);
-        const bool valid_response = header->item_count != 0 &&
-          header->item_count <= config.storage_owner_batch_max &&
-          header->reserved == 0 &&
-          bytes >= minimum_bytes && bytes <= maximum_bytes &&
-          (bytes - minimum_bytes) %
-              sizeof(service::storage_owner::Stage2ExpandScoreNeighbor) == 0;
+      } else if (memory_node_peer_rpc_detail::is_stage2_home_response(
+                   static_cast<service::storage_owner::PeerRpcType>(
+                     header->type))) {
+        const bool score_many = header->type == static_cast<u32>(
+          service::storage_owner::PeerRpcType::stage2_score_many_response);
+        bool valid_response = header->item_count != 0 &&
+          header->reserved == 0;
+        if (score_many) {
+          valid_response = valid_response &&
+            header->item_count <= std::max<u32>(
+              1, config.storage_owner_search_snapshot_batch) &&
+            bytes == service::storage_owner::stage2_score_many_response_bytes(
+              header->item_count);
+        } else {
+          const size_t minimum_bytes =
+            service::storage_owner::stage2_expand_score_response_bytes(
+              header->item_count, 0);
+          const size_t maximum_bytes =
+            service::storage_owner::stage2_expand_score_response_bytes(
+              header->item_count);
+          valid_response = valid_response &&
+            header->item_count <= config.storage_owner_batch_max &&
+            bytes >= minimum_bytes && bytes <= maximum_bytes &&
+            (bytes - minimum_bytes) %
+                sizeof(service::storage_owner::Stage2ExpandScoreNeighbor) == 0;
+        }
         if (valid_response && peer_async_responses_ != nullptr &&
             peer_async_responses_->try_deliver(
               peer_id, slot_id, bytes, *header)) {
