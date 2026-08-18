@@ -506,6 +506,24 @@ public:
     return output.size() - before;
   }
 
+  // Global ordered preview.  The beam is already nearest-first, so callers
+  // that own a cross-peer transport scheduler can choose the best next
+  // expansions without first partitioning the ranking by shard.  Like the
+  // shard-filtered overload this is observational only: it neither marks an
+  // entry expanded nor consumes the expansion budget.
+  size_t append_closest_unexpanded(
+      size_t limit, vec<RemotePtr>& output) const {
+    if (limit == 0 || expansion_count_ >= budget_.max_expansions) return 0;
+    const u64 budget_remaining = budget_.max_expansions - expansion_count_;
+    limit = static_cast<size_t>(std::min<u64>(limit, budget_remaining));
+    const size_t before = output.size();
+    for (const PartitionLocalSearchEntry& entry : beam_) {
+      if (output.size() - before == limit) break;
+      if (!entry.expanded) output.push_back(entry.rptr);
+    }
+    return output.size() - before;
+  }
+
   const vec<PartitionLocalSearchEntry>& final_beam() const { return beam_; }
   u64 expansion_count() const { return expansion_count_; }
   bool budget_exhausted() const { return budget_exhausted_; }
@@ -770,6 +788,17 @@ public:
     }
     return state.search.append_closest_unexpanded(
       shard, limit, output);
+  }
+
+  size_t append_expand_prefetch_candidates(
+      size_t search_index, size_t limit, vec<RemotePtr>& output) const {
+    require_search_index(search_index);
+    const SearchState& state = searches_[search_index];
+    if (state.phase != PartitionContinuationWave::expand ||
+        !state.pending_expand.has_value()) {
+      return 0;
+    }
+    return state.search.append_closest_unexpanded(limit, output);
   }
 
   span<const PartitionContinuationScoreRequest>

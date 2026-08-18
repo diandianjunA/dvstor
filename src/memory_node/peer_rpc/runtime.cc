@@ -94,6 +94,11 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
     std::lock_guard<std::mutex> lock(peer_rpc_send_slots_mutex_);
     peer_rpc_free_send_slots_.clear();
     peer_rpc_free_send_slots_.resize(num_storage_nodes_);
+    peer_rpc_send_slot_waiter_count_ =
+      static_cast<size_t>(num_storage_nodes_) * 3;
+    peer_rpc_send_slot_waiters_ =
+      std::make_unique<StorageOwnerMaintenanceWaiterSet[]>(
+        peer_rpc_send_slot_waiter_count_);
     peer_rpc_speculative_credit_owner_.assign(num_storage_nodes_, 0);
     peer_rpc_sync_send_mutexes_.clear();
     peer_rpc_sync_send_mutexes_.resize(num_storage_nodes_);
@@ -128,6 +133,32 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
     1024, producer_depth * registry_peer_count * 4);
   peer_async_responses_ =
     std::make_unique<PeerAsyncResponseRegistry>(response_capacity);
+  const size_t stage2_home_max_request_bytes = std::max(
+    stage2_expand_score_request_bytes, stage2_score_many_request_bytes);
+  constexpr size_t kStage2HomeMinimumResidentBytes = 8u << 20;
+  constexpr size_t kStage2HomeMaximumResidentBytes = 32u << 20;
+  const size_t stage2_home_typical_request_bytes = std::min<size_t>(
+    stage2_home_max_request_bytes, 4096);
+  const size_t stage2_home_scaled_resident_bytes =
+    response_capacity > std::numeric_limits<size_t>::max() /
+        std::max<size_t>(1, stage2_home_typical_request_bytes)
+      ? kStage2HomeMaximumResidentBytes
+      : response_capacity * stage2_home_typical_request_bytes;
+  const size_t stage2_home_resident_bytes = std::clamp(
+    stage2_home_scaled_resident_bytes,
+    kStage2HomeMinimumResidentBytes,
+    kStage2HomeMaximumResidentBytes);
+  lib_assert(stage2_home_max_request_bytes <=
+               std::numeric_limits<size_t>::max() -
+                 stage2_home_resident_bytes,
+             "stage2 home RPC outbox byte capacity overflow");
+  const size_t stage2_home_aggregate_capacity = std::max<size_t>(
+    64, response_capacity / 4);
+  stage2_home_rpc_outbox_ = std::make_unique<Stage2HomeRpcOutbox>(
+    response_capacity, stage2_home_aggregate_capacity,
+    num_storage_nodes_, config.storage_owner_batch_max,
+    stage2_score_many_items, stage2_score_many_items,
+    stage2_home_resident_bytes + stage2_home_max_request_bytes);
   const size_t dedup_capacity = std::max<size_t>(
     1024,
     static_cast<size_t>(config.storage_owner_reverse_queue_depth) *
@@ -143,6 +174,12 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
                "at depth >= 2; responses use a dedicated sync buffer");
   print_status("storage-owner peer async response capacity: " +
                std::to_string(peer_async_responses_->capacity()));
+  print_status("storage-owner Stage2 home RPC combiner: logical_capacity=" +
+               std::to_string(response_capacity) +
+               " aggregate_capacity=" +
+               std::to_string(stage2_home_aggregate_capacity) +
+               " byte_budget=" +
+               std::to_string(stage2_home_rpc_outbox_->byte_capacity()));
   for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
     if (peer_id == storage_id_) continue;
     for (u32 slot_id = 0; slot_id < peer_rpc_runtime_.recv_slots_per_peer; ++slot_id) {
@@ -621,6 +658,15 @@ bool MemoryNode::try_acquire_peer_rpc_send_slot(
     u32& slot_id) {
   lib_assert(peer_id < peer_rpc_free_send_slots_.size() && peer_id != storage_id_,
              "invalid peer RPC send-slot owner");
+  // Slots 0..N-2 are split stage1/graph and the last slot is control. Fewer
+  // than five slots therefore provide only one graph slot, which must remain
+  // reserved for authoritative work. Speculation can never satisfy its
+  // >1-surplus predicate in that layout, so do not publish an impossible
+  // waiter that could consume future authoritative release edges forever.
+  if (send_class == PeerRpcSendClass::speculative &&
+      peer_rpc_runtime_.send_slots_per_peer < 5) {
+    return false;
+  }
   std::lock_guard<std::mutex> lock(peer_rpc_send_slots_mutex_);
   auto& lanes = peer_rpc_free_send_slots_[peer_id];
   auto try_lane = [&](PeerRpcSendClass lane) {
@@ -631,33 +677,93 @@ bool MemoryNode::try_acquire_peer_rpc_send_slot(
     return true;
   };
 
-  if (peer_rpc_runtime_.send_slots_per_peer == 1) {
-    // No surplus lane exists at depth one. Low-priority work must not borrow
-    // the sole correctness/control SEND through the generic fallback.
-    if (send_class == PeerRpcSendClass::speculative) return false;
-    return try_lane(PeerRpcSendClass::control);
-  }
-  if (send_class == PeerRpcSendClass::speculative) {
-    auto& free_slots = lanes[static_cast<size_t>(
-      PeerRpcSendClass::graph_update)];
-    // A speculative RPC may use otherwise-idle transport capacity, but it
-    // must never consume the final graph/reverse slot needed by exact Stage2
-    // progress. This also bounds process-wide speculative debt per peer by
-    // the statically provisioned surplus instead of by cache size.
-    if (free_slots.size() <= 1) return false;
-    slot_id = free_slots.front();
-    free_slots.pop_front();
+  const auto waiter = [&](PeerRpcSendClass lane)
+      -> StorageOwnerMaintenanceWaiterSet& {
+    const size_t physical_class = static_cast<size_t>(lane);
+    lib_assert(physical_class < 3 &&
+                 peer_rpc_send_slot_waiters_ != nullptr,
+               "peer RPC SEND waiter resource is not initialized");
+    const size_t index = static_cast<size_t>(peer_id) * 3 + physical_class;
+    lib_assert(index < peer_rpc_send_slot_waiter_count_,
+               "peer RPC SEND waiter resource is out of range");
+    return peer_rpc_send_slot_waiters_[index];
+  };
+  const auto mark_lane = [&](PeerRpcSendClass lane) {
+    mark_current_storage_owner_maintenance_waiter(waiter(lane));
+  };
+  const auto mark_request_waiters = [&]() {
+    if (peer_rpc_runtime_.send_slots_per_peer == 1) {
+      if (send_class != PeerRpcSendClass::speculative) {
+        mark_lane(PeerRpcSendClass::control);
+      }
+      return;
+    }
+    if (send_class == PeerRpcSendClass::control) {
+      mark_lane(PeerRpcSendClass::control);
+      mark_lane(PeerRpcSendClass::stage1);
+      mark_lane(PeerRpcSendClass::graph_update);
+    } else if (send_class == PeerRpcSendClass::speculative) {
+      mark_lane(PeerRpcSendClass::graph_update);
+    } else {
+      mark_lane(send_class);
+    }
+  };
+  const auto clear_request_waiters = [&]() {
+    if (peer_rpc_runtime_.send_slots_per_peer == 1) {
+      if (send_class != PeerRpcSendClass::speculative) {
+        clear_current_storage_owner_maintenance_waiter(
+          waiter(PeerRpcSendClass::control));
+      }
+      return;
+    }
+    if (send_class == PeerRpcSendClass::control) {
+      clear_current_storage_owner_maintenance_waiter(
+        waiter(PeerRpcSendClass::control));
+      clear_current_storage_owner_maintenance_waiter(
+        waiter(PeerRpcSendClass::stage1));
+      clear_current_storage_owner_maintenance_waiter(
+        waiter(PeerRpcSendClass::graph_update));
+    } else if (send_class == PeerRpcSendClass::speculative) {
+      clear_current_storage_owner_maintenance_waiter(
+        waiter(PeerRpcSendClass::graph_update));
+    } else {
+      clear_current_storage_owner_maintenance_waiter(waiter(send_class));
+    }
+  };
+
+  const auto try_request = [&]() {
+    if (peer_rpc_runtime_.send_slots_per_peer == 1) {
+      if (send_class == PeerRpcSendClass::speculative) return false;
+      return try_lane(PeerRpcSendClass::control);
+    }
+    if (send_class == PeerRpcSendClass::speculative) {
+      auto& free_slots = lanes[static_cast<size_t>(
+        PeerRpcSendClass::graph_update)];
+      if (free_slots.size() <= 1) return false;
+      slot_id = free_slots.front();
+      free_slots.pop_front();
+      return true;
+    }
+    if (send_class == PeerRpcSendClass::control) {
+      return try_lane(PeerRpcSendClass::control) ||
+             try_lane(PeerRpcSendClass::stage1) ||
+             try_lane(PeerRpcSendClass::graph_update);
+    }
+    return try_lane(send_class);
+  };
+
+  if (try_request()) {
+    clear_request_waiters();
     return true;
   }
-  if (send_class == PeerRpcSendClass::control) {
-    return try_lane(PeerRpcSendClass::control) ||
-           try_lane(PeerRpcSendClass::stage1) ||
-           try_lane(PeerRpcSendClass::graph_update);
-  }
-  return try_lane(send_class);
+  // Failure and waiter publication are serialized with slot release by the
+  // same mutex, so no returned SEND credit can fall between them.
+  mark_request_waiters();
+  return false;
 }
 
 void MemoryNode::release_peer_rpc_send_slot(u32 peer_id, u32 slot_id) {
+  std::optional<u32> wake_owner;
   {
     std::lock_guard<std::mutex> lock(peer_rpc_send_slots_mutex_);
     lib_assert(peer_id < peer_rpc_free_send_slots_.size() &&
@@ -666,11 +772,21 @@ void MemoryNode::release_peer_rpc_send_slot(u32 peer_id, u32 slot_id) {
     const size_t send_class = static_cast<size_t>(
       peer_rpc_send_slot_class(slot_id));
     peer_rpc_free_send_slots_[peer_id][send_class].push_back(slot_id);
+    if (peer_rpc_send_slot_waiters_ != nullptr) {
+      const size_t waiter_index =
+        static_cast<size_t>(peer_id) * 3 + send_class;
+      lib_assert(waiter_index < peer_rpc_send_slot_waiter_count_,
+                 "peer RPC SEND release waiter is out of range");
+      wake_owner = take_one_storage_owner_maintenance_waiter(
+        peer_rpc_send_slot_waiters_[waiter_index]);
+    }
   }
   // A SEND CQE returns process-wide transport capacity. Maintenance retries
   // sleep on their owner channels, while synchronous/control callers retain
   // peer_completion_cv_; publish the same capacity edge to both domains.
-  notify_one_storage_owner_maintenance_executor();
+  if (wake_owner.has_value()) {
+    notify_storage_owner_maintenance_executor_scan(*wake_owner);
+  }
   peer_completion_cv_.notify_all();
 }
 

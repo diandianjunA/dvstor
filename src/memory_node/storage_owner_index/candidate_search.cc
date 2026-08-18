@@ -1428,9 +1428,11 @@ MemoryNode::advance_stage2_search_candidates_batched(
       last_search = search_index;
       selected_any = true;
     }
-    // Ordered issue is piggyback-only: it may occupy unused items in a peer
-    // RPC selected above, but it can neither create a new destination RPC nor
-    // split the existing one. This bounds the downside to home CPU/bytes.
+    // Ordered issue is piggyback-only: it may occupy unused items in any peer
+    // RPC already selected by this context wave, but it can neither create a
+    // new destination RPC nor split an existing one.  Ranking candidates
+    // globally avoids wasting a high-confidence preview slot merely because
+    // the next nearest candidate lives on a different already-active peer.
     const u64 prefetch_hits =
       storage_owner_stage2_graph_prefetch_hits_.load(
         std::memory_order_relaxed);
@@ -1478,29 +1480,29 @@ MemoryNode::advance_stage2_search_candidates_batched(
             local_shard(authoritative.pointer.memory_node())) {
           continue;
         }
-        const u32 peer = authoritative.pointer.memory_node();
-        if (wire_items_by_peer[peer] >= config.storage_owner_batch_max) {
-          continue;
-        }
         const size_t cached =
           state.graph_prefetch_size(authoritative.search_index);
         if (cached >= cache_capacity) continue;
-        const size_t per_search_limit = std::min<size_t>({
+        const size_t per_search_limit = std::min<size_t>(
           static_cast<size_t>(issue_width - 1),
-          cache_capacity - cached,
-          static_cast<size_t>(config.storage_owner_batch_max -
-                              wire_items_by_peer[peer]),
-        });
+          cache_capacity - cached);
         if (per_search_limit == 0) continue;
         prefetch_candidates.clear();
         state.continuation.append_expand_prefetch_candidates(
-          authoritative.search_index, peer, construction_width,
+          authoritative.search_index, construction_width,
           prefetch_candidates);
         size_t admitted = 0;
         for (const RemotePtr pointer : prefetch_candidates) {
-          if (admitted == per_search_limit ||
+          if (admitted == per_search_limit) break;
+          if (!storage_node_pointer_addressable(pointer) ||
+              local_shard(pointer.memory_node())) continue;
+          const u32 peer = pointer.memory_node();
+          // Do not turn previewing into a new transport dependency. The
+          // per-peer exact combiner can relax this restriction later; today
+          // an authoritative item in this wave must already own the RPC.
+          if (wire_items_by_peer[peer] == 0 ||
               wire_items_by_peer[peer] >= config.storage_owner_batch_max) {
-            break;
+            continue;
           }
           if (state.graph_prefetch_contains(
                 authoritative.search_index, pointer)) {
@@ -1767,38 +1769,11 @@ MemoryNode::advance_stage2_search_candidates_batched(
     }
     if (state.score_home_rpc_count != 0) {
       u64 rpc_items = 0;
-      u64 rpc_queries = 0;
-      u64 rpc_request_bytes = 0;
-      u64 rpc_response_bytes = 0;
       for (size_t rpc_index = 0;
            rpc_index < state.score_home_rpc_count; ++rpc_index) {
         const Stage2HomeExpandRpc& rpc = state.score_home_rpcs[rpc_index];
         rpc_items += rpc.item_count;
-        rpc_queries += state.score_many_dispatch
-          ? service::storage_owner::stage2_score_many_header(
-              rpc.request.data())->query_count
-          : rpc.item_count;
-        rpc_request_bytes += rpc.request.size();
-        rpc_response_bytes += state.score_many_dispatch
-          ? service::storage_owner::stage2_score_many_response_bytes(
-              rpc.item_count)
-          : service::storage_owner::stage2_expand_score_response_bytes(
-              rpc.item_count, 0);
       }
-      storage_owner_stage2_home_rpc_batches_.fetch_add(
-        state.score_home_rpc_count, std::memory_order_relaxed);
-      storage_owner_stage2_home_rpc_items_.fetch_add(
-        rpc_items, std::memory_order_relaxed);
-      storage_owner_stage2_home_score_rpc_batches_.fetch_add(
-        state.score_home_rpc_count, std::memory_order_relaxed);
-      storage_owner_stage2_home_score_rpc_items_.fetch_add(
-        rpc_items, std::memory_order_relaxed);
-      storage_owner_stage2_home_score_rpc_queries_.fetch_add(
-        rpc_queries, std::memory_order_relaxed);
-      storage_owner_stage2_home_score_rpc_request_bytes_.fetch_add(
-        rpc_request_bytes, std::memory_order_relaxed);
-      storage_owner_stage2_home_score_rpc_response_bytes_.fetch_add(
-        rpc_response_bytes, std::memory_order_relaxed);
       storage_owner_stage2_vector_read_waves_.fetch_add(
         1, std::memory_order_relaxed);
       storage_owner_stage2_vector_unique_reads_.fetch_add(
@@ -1959,15 +1934,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
         VamanaNode::vector_bytes());
     }
     if (state.home_expand_rpc_count != 0) {
-      storage_owner_stage2_home_rpc_batches_.fetch_add(
-        state.home_expand_rpc_count, std::memory_order_relaxed);
-      u64 home_rpc_items = 0;
-      for (size_t rpc_index = 0;
-           rpc_index < state.home_expand_rpc_count; ++rpc_index) {
-        home_rpc_items += state.home_expand_rpcs[rpc_index].item_count;
-      }
-      storage_owner_stage2_home_rpc_items_.fetch_add(
-        home_rpc_items, std::memory_order_relaxed);
       storage_owner_stage2_graph_read_waves_.fetch_add(
         1, std::memory_order_relaxed);
       storage_owner_stage2_graph_unique_reads_.fetch_add(
@@ -1984,6 +1950,24 @@ MemoryNode::advance_stage2_search_candidates_batched(
   thread_local vec<RemotePtr> home_neighbors;
   thread_local vec<u32> speculative_query_indexes;
   thread_local vec<size_t> speculative_query_searches;
+
+  // Authoritative Stage2-home work is transported through the node-wide
+  // combiner. The context keeps its original logical request ID and consumes
+  // an ordinary logical response; only the wire transaction is shared across
+  // contexts. No timer is introduced here and no search work is added.
+  const auto enqueue_authoritative_home_rpc = [&] (
+      const Stage2HomeExpandRpc& rpc,
+      service::storage_owner::PeerRpcType request_type) {
+    const auto owner = current_storage_owner_maintenance_context_owner();
+    lib_assert(owner.runtime_epoch != 0 && owner.token != 0,
+               "Stage2 home RPC has no generation-fenced context owner");
+    const auto result = try_enqueue_stage2_home_rpc_request(
+      rpc.target_shard, request_type, rpc.request_id, rpc.item_count,
+      span<const byte_t>{rpc.request.data(), rpc.request.size()}, false,
+      PeerResponseCompletionTarget{.context_owner = owner});
+    return result == Stage2HomeRpcEnqueueResult::enqueued ||
+      result == Stage2HomeRpcEnqueueResult::duplicate;
+  };
 
   const auto clear_speculative_score_rpc = [&] (
       Stage2SpeculativeScoreRpc& rpc) {
@@ -2797,20 +2781,10 @@ MemoryNode::advance_stage2_search_candidates_batched(
         if (rpc.complete) continue;
         all_complete = false;
         if (!rpc.posted) {
-          const size_t request_bytes = rpc.request.size();
           const auto request_type = state.score_many_dispatch
             ? service::storage_owner::PeerRpcType::stage2_score_many_request
             : service::storage_owner::PeerRpcType::stage2_expand_score_request;
-          const auto response_type = state.score_many_dispatch
-            ? service::storage_owner::PeerRpcType::stage2_score_many_response
-            : service::storage_owner::PeerRpcType::stage2_expand_score_response;
-          rpc.posted = try_post_peer_rpc_request_attempt(
-            rpc.target_shard,
-            request_type, response_type,
-            rpc.request_id, rpc.item_count,
-            rpc.request.data() + sizeof(service::storage_owner::PeerRpcHeader),
-            request_bytes - sizeof(service::storage_owner::PeerRpcHeader),
-            request_bytes, PeerRpcSendClass::graph_update);
+          rpc.posted = enqueue_authoritative_home_rpc(rpc, request_type);
           if (rpc.posted) {
             rpc.deadline_ns = steady_now_ns() +
               static_cast<u64>(config.storage_owner_rpc_timeout_ms) *
@@ -2830,12 +2804,9 @@ MemoryNode::advance_stage2_search_candidates_batched(
           rpc.item_count, response_header, home_response_payload,
           response_lease);
         if (response == TryPeerResponse::pending) {
-          if (steady_now_ns() >= rpc.deadline_ns) {
-            cancel_peer_rpc_response(rpc.request_id);
-            rpc.posted = false;
-            storage_owner_maintenance_rpc_timeouts_.fetch_add(
-              1, std::memory_order_relaxed);
-          }
+          // The outer aggregate owns same-wire-ID timeout/retry. Cancelling a
+          // logical member here would separate its response-registry cell
+          // from the retained aggregate and defeat exact fan-out.
           continue;
         }
         const size_t expected_bytes = state.score_many_dispatch
@@ -3001,15 +2972,9 @@ MemoryNode::advance_stage2_search_candidates_batched(
         if (rpc.complete) continue;
         all_complete = false;
         if (!rpc.posted) {
-          const size_t request_bytes = rpc.request.size();
-          rpc.posted = try_post_peer_rpc_request_attempt(
-            rpc.target_shard,
-            service::storage_owner::PeerRpcType::stage2_expand_score_request,
-            service::storage_owner::PeerRpcType::stage2_expand_score_response,
-            rpc.request_id, rpc.item_count,
-            rpc.request.data() + sizeof(service::storage_owner::PeerRpcHeader),
-            request_bytes - sizeof(service::storage_owner::PeerRpcHeader),
-            request_bytes, PeerRpcSendClass::graph_update);
+          rpc.posted = enqueue_authoritative_home_rpc(
+            rpc,
+            service::storage_owner::PeerRpcType::stage2_expand_score_request);
           if (rpc.posted) {
             rpc.deadline_ns = steady_now_ns() +
               static_cast<u64>(config.storage_owner_rpc_timeout_ms) *
@@ -3027,12 +2992,8 @@ MemoryNode::advance_stage2_search_candidates_batched(
           rpc.item_count, response_header, home_response_payload,
           response_lease);
         if (response == TryPeerResponse::pending) {
-          if (steady_now_ns() >= rpc.deadline_ns) {
-            cancel_peer_rpc_response(rpc.request_id);
-            rpc.posted = false;
-            storage_owner_maintenance_rpc_timeouts_.fetch_add(
-              1, std::memory_order_relaxed);
-          }
+          // The combined outer request, not an individual logical member,
+          // owns transport retry and its immutable wire image.
           continue;
         }
         const size_t minimum_bytes =

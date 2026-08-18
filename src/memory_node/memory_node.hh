@@ -39,6 +39,8 @@
 #include "memory_node/storage_owner_index/dynamic_allocation_receipt_policy.hh"
 #include "memory_node/storage_owner_index/incarnation_lock.hh"
 #include "memory_node/storage_owner_maintenance/independent_score_policy.hh"
+#include "memory_node/storage_owner_maintenance/home_rpc_outbox.hh"
+#include "memory_node/storage_owner_maintenance/ready_context_queue.hh"
 #include "memory_node/storage_owner_maintenance/reverse_outbox.hh"
 #include "memory_node/storage_owner_maintenance/stage2_batch_policy.hh"
 #include "memory_node/storage_owner_state.hh"
@@ -341,6 +343,13 @@ private:
     memory_node_detail::PeerRequestDeduplicator;
   using TryPeerResponse = memory_node_detail::TryPeerResponse;
   using PeerResponseLease = memory_node_detail::PeerResponseLease;
+  using PeerResponseCompletionTarget =
+    memory_node_detail::PeerResponseCompletionTarget;
+  using Stage2HomeRpcOutbox =
+    memory_node_storage_owner_maintenance_detail::Stage2HomeRpcOutbox;
+  using Stage2HomeRpcEnqueueResult =
+    memory_node_storage_owner_maintenance_detail::
+      Stage2HomeRpcEnqueueResult;
   using Stage2ReverseOutbox =
     memory_node_storage_owner_maintenance_detail::Stage2ReverseOutbox;
   using Stage2ReverseCompletion =
@@ -414,6 +423,39 @@ private:
   static constexpr u32 kPeerAsyncWrOwner = std::numeric_limits<u32>::max() - 1;
   static constexpr u32 kPeerSafeRdAtomic = 8;
 
+  // A returned transport/scratch credit is useful only to executors that
+  // actually failed on that resource.  Keep a bounded owner mask beside each
+  // shared resource so its release can wake the blocked owners without either
+  // losing the edge or selecting an unrelated sleeping worker.  The mask is
+  // stable for the MemoryNode lifetime because peer CQ progress intentionally
+  // outlives the maintenance worker states during shutdown.
+  static constexpr size_t kStorageOwnerMaintenanceWaiterWords =
+    (CPU_SETSIZE + 63) / 64;
+  using StorageOwnerMaintenanceWaiterMask =
+    std::array<u64, kStorageOwnerMaintenanceWaiterWords>;
+  struct alignas(64) StorageOwnerMaintenanceWaiterSet {
+    StorageOwnerMaintenanceWaiterSet() {
+      for (auto& word : words) word.store(0, std::memory_order_relaxed);
+      for (auto& ref : refs) ref.store(0, std::memory_order_relaxed);
+    }
+    StorageOwnerMaintenanceWaiterSet(
+      const StorageOwnerMaintenanceWaiterSet&) = delete;
+    StorageOwnerMaintenanceWaiterSet& operator=(
+      const StorageOwnerMaintenanceWaiterSet&) = delete;
+
+    std::array<std::atomic<u64>, kStorageOwnerMaintenanceWaiterWords> words;
+    // A worker bit is only the release-side runnable hint. Multiple contexts
+    // owned by that worker can independently wait on the same resource, so
+    // retain an exact per-worker subscription count behind the hint. A
+    // release may consume the bit; the next failed retry republishes it while
+    // unregistering one context preserves it for the remaining subscribers.
+    std::array<std::atomic<u32>, CPU_SETSIZE> refs;
+    std::atomic<u32> cursor{0};
+  };
+
+  using StorageOwnerMaintenanceWaiterRegistrations =
+    vec<StorageOwnerMaintenanceWaiterSet*>;
+
   enum class PeerRpcSendClass : u8 {
     stage1,
     graph_update,
@@ -436,8 +478,47 @@ private:
   void notify_storage_owner_maintenance();
   void notify_storage_owner_maintenance_capacity();
   void notify_storage_owner_maintenance_executor(u32 worker_id);
+  void notify_storage_owner_maintenance_executor_scan(u32 worker_id);
   void notify_storage_owner_maintenance_executors();
   void notify_one_storage_owner_maintenance_executor();
+  memory_node_storage_owner_maintenance_detail::Stage2ContextOwnerKey
+  current_storage_owner_maintenance_context_owner() const;
+  bool enqueue_storage_owner_maintenance_context_ready(
+    const memory_node_storage_owner_maintenance_detail::
+      Stage2ContextOwnerKey& owner,
+    memory_node_storage_owner_maintenance_detail::
+      Stage2ContextReadyReason reason);
+  bool notify_storage_owner_maintenance_context_ready(
+    const memory_node_storage_owner_maintenance_detail::
+      Stage2ContextOwnerKey& owner,
+    memory_node_storage_owner_maintenance_detail::
+      Stage2ContextReadyReason reason);
+  bool mark_current_storage_owner_maintenance_waiter(
+    StorageOwnerMaintenanceWaiterSet& waiters);
+  void clear_current_storage_owner_maintenance_waiter(
+    StorageOwnerMaintenanceWaiterSet& waiters);
+  void clear_all_current_storage_owner_maintenance_waiters();
+  void take_storage_owner_maintenance_waiters(
+    StorageOwnerMaintenanceWaiterSet& waiters,
+    StorageOwnerMaintenanceWaiterMask& owners);
+  std::optional<u32> take_one_storage_owner_maintenance_waiter(
+    StorageOwnerMaintenanceWaiterSet& waiters,
+    u32 avoid_worker = std::numeric_limits<u32>::max());
+  void clear_storage_owner_maintenance_waiter(
+    StorageOwnerMaintenanceWaiterSet& waiters, u32 worker_id);
+  void notify_storage_owner_maintenance_waiters(
+    const StorageOwnerMaintenanceWaiterMask& owners);
+  void notify_storage_owner_maintenance_waiters_scan(
+    const StorageOwnerMaintenanceWaiterMask& owners);
+  void reset_storage_owner_maintenance_waiters(
+    StorageOwnerMaintenanceWaiterSet& waiters);
+  bool try_acquire_storage_owner_search_lane_lease(
+    bool& waiter_registered);
+  void cancel_storage_owner_search_lane_waiter(bool& waiter_registered);
+  void return_storage_owner_search_lane_grants(u32 worker_id);
+  void handoff_or_release_storage_owner_search_lane_lease(u32 avoid_worker);
+  void retire_storage_owner_search_lane_grants(u32 worker_id);
+  void release_storage_owner_search_lane_lease();
   void allocate_memory();
   void wait_for_start_signal();
   std::pair<bool, str> load_index_file(const str& path);
@@ -461,6 +542,11 @@ private:
                                         u32 read_count);
   void acquire_peer_rdma_read_group(u32 shard_id, u32 qp_idx,
                                     u32 read_count);
+  void mark_current_peer_rdma_read_waiter(u32 shard_id, u32 qp_idx);
+  void clear_current_peer_rdma_read_waiter(u32 shard_id, u32 qp_idx);
+  void take_peer_rdma_read_waiters(
+    u32 shard_id, u32 qp_idx,
+    StorageOwnerMaintenanceWaiterMask& owners, u32 wake_budget);
   u64 next_peer_sync_wr_id();
   u64 next_peer_async_wr_id();
   void register_peer_pending_send_locked(u64 wr_id, PeerPendingSend pending);
@@ -637,6 +723,23 @@ private:
     size_t item_bytes,
     size_t request_bytes,
     PeerRpcSendClass send_class);
+  Stage2HomeRpcEnqueueResult try_enqueue_stage2_home_rpc_request(
+    u32 target_shard,
+    service::storage_owner::PeerRpcType request_type,
+    u64 logical_request_id,
+    u32 item_count,
+    span<const byte_t> request,
+    bool speculative,
+    PeerResponseCompletionTarget completion_target);
+  bool try_drive_stage2_home_rpc_requests(
+    u32 target_shard,
+    service::storage_owner::PeerRpcType request_type,
+    bool speculative);
+  bool cancel_stage2_home_rpc_request(u64 logical_request_id);
+  bool try_handle_stage2_home_rpc_aggregate_response(
+    u32 peer_id,
+    span<const byte_t> response,
+    std::vector<PeerResponseCompletionTarget>& completion_targets);
   bool post_peer_op_batch_async(
     u32 target_shard,
     const vec<service::storage_owner::ReverseUpdateOp>& ops,
@@ -1083,6 +1186,7 @@ private:
   std::unique_ptr<LocalMemoryRegion> peer_scratch_region_;
   PeerRpcRuntimeState peer_rpc_runtime_;
   std::unique_ptr<PeerAsyncResponseRegistry> peer_async_responses_;
+  std::unique_ptr<Stage2HomeRpcOutbox> stage2_home_rpc_outbox_;
   std::unique_ptr<PeerRequestDeduplicator> peer_request_deduplicator_;
   std::mutex peer_send_cq_mutex_;
   std::mutex peer_completion_mutex_;
@@ -1096,12 +1200,21 @@ private:
   std::unordered_map<u64, PeerPendingSend> peer_pending_sends_;
   vec<std::atomic<u32>> peer_rdma_read_outstanding_;
   vec<vec<std::atomic<u32>>> peer_rdma_read_qp_outstanding_;
+  std::unique_ptr<StorageOwnerMaintenanceWaiterSet[]>
+    peer_rdma_read_peer_waiters_;
+  std::unique_ptr<StorageOwnerMaintenanceWaiterSet[]>
+    peer_rdma_read_qp_waiters_;
+  size_t peer_rdma_read_qp_waiter_count_{};
+  StorageOwnerMaintenanceWaiterSet peer_rdma_read_global_waiters_;
   memory_node_detail::PeerRdmaReadCreditPlan peer_rdma_read_credits_{
     1, 1, 1, 1, 1};
   vec<vec<std::unique_ptr<std::mutex>>> peer_qp_send_mutexes_;
   vec<std::unique_ptr<std::mutex>> peer_rpc_sync_send_mutexes_;
   std::mutex peer_rpc_send_slots_mutex_;
   vec<std::array<std::deque<u32>, 3>> peer_rpc_free_send_slots_;
+  std::unique_ptr<StorageOwnerMaintenanceWaiterSet[]>
+    peer_rpc_send_slot_waiters_;
+  size_t peer_rpc_send_slot_waiter_count_{};
   // A SEND slot is released at its local CQE, long before the peer response.
   // Keep a separate request-lifetime credit so independent lookahead cannot
   // pile up behind authoritative work at a slow peer. UINT64_MAX is a
@@ -1272,9 +1385,21 @@ private:
     std::condition_variable cv;
     std::atomic<u64> epoch{0};
     std::atomic<u32> waiters{0};
+    std::atomic<bool> context_scan_requested{false};
   };
   std::array<StorageOwnerMaintenanceWakeChannel, CPU_SETSIZE>
     storage_owner_maintenance_wake_channels_;
+  using StorageOwnerReadyContextQueue =
+    memory_node_storage_owner_maintenance_detail::Stage2ReadyContextQueue;
+  // Active pointers are published independently of the owning vector. Old
+  // runtime queues remain allocated until MemoryNode destruction so a peer CQ
+  // producer that loaded a pointer just before stop can finish its epoch-
+  // fenced notify without racing queue destruction.
+  std::array<std::atomic<StorageOwnerReadyContextQueue*>, CPU_SETSIZE>
+    storage_owner_maintenance_ready_queue_active_{};
+  vec<std::unique_ptr<StorageOwnerReadyContextQueue>>
+    storage_owner_maintenance_ready_queue_storage_;
+  std::atomic<u64> storage_owner_maintenance_runtime_epoch_counter_{0};
   std::atomic<u32> storage_owner_maintenance_wake_worker_count_{0};
   std::atomic<u32> storage_owner_maintenance_generic_wake_cursor_{0};
   std::atomic<u64> storage_owner_maintenance_targeted_wakes_{0};
@@ -1282,6 +1407,24 @@ private:
   std::atomic<u64> storage_owner_maintenance_generic_wakes_{0};
   std::atomic<u64> storage_owner_maintenance_context_slots_scanned_{0};
   std::atomic<u64> storage_owner_maintenance_lost_wake_avoided_{0};
+  std::atomic<u64> storage_owner_maintenance_ready_notifications_{0};
+  std::atomic<u64> storage_owner_maintenance_ready_stale_notifications_{0};
+  std::atomic<u64> storage_owner_maintenance_ready_tickets_drained_{0};
+  std::atomic<u64> storage_owner_maintenance_ready_overflow_scans_{0};
+  std::atomic<u64> storage_owner_maintenance_ready_fallback_scans_{0};
+  // Every worker owns enough registered scratch for its bounded local context
+  // pool, while this node-wide lease is the authoritative active-lane bound.
+  // This turns a fixed per-worker 2-lane partition into a work-conserving
+  // 0..N allocation without moving context/continuation ownership.
+  std::atomic<u32> storage_owner_search_lane_leases_{0};
+  std::atomic<u32> storage_owner_search_lane_lease_limit_{0};
+  std::atomic<u32> storage_owner_search_lane_lease_peak_{0};
+  std::atomic<u64> storage_owner_search_lane_lease_blocked_{0};
+  StorageOwnerMaintenanceWaiterSet storage_owner_search_lane_waiters_;
+  std::array<std::atomic<u32>, CPU_SETSIZE>
+    storage_owner_search_lane_blocked_contexts_{};
+  std::array<std::atomic<u32>, CPU_SETSIZE>
+    storage_owner_search_lane_grants_{};
   memory_node_storage_owner_maintenance_detail::
     Stage2AdaptivePackingController storage_owner_stage2_packing_;
   memory_node_storage_owner_maintenance_detail::
@@ -1453,5 +1596,9 @@ private:
 
   inline static thread_local StorageOwnerThread* current_storage_owner_thread_{nullptr};
   inline static thread_local bool current_storage_owner_maintenance_worker_{false};
+  inline static thread_local StorageOwnerMaintenanceWaiterRegistrations*
+    current_storage_owner_maintenance_waiter_registrations_{nullptr};
+  inline static thread_local memory_node_storage_owner_maintenance_detail::
+    Stage2ContextOwnerKey current_storage_owner_maintenance_context_owner_{};
   inline static thread_local bool current_peer_rpc_progress_thread_{false};
 };

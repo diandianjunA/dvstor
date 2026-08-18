@@ -1,6 +1,7 @@
 #include "memory_node/memory_node.hh"
 
 #include <algorithm>
+#include <bit>
 
 namespace {
 
@@ -85,6 +86,17 @@ void MemoryNode::setup_storage_peers(Configuration& config) {
   peer_remote_tokens_.resize(num_storage_nodes_);
   peer_rdma_read_qp_outstanding_.clear();
   peer_rdma_read_qp_outstanding_.reserve(num_storage_nodes_);
+  peer_rdma_read_peer_waiters_ =
+    std::make_unique<StorageOwnerMaintenanceWaiterSet[]>(
+      num_storage_nodes_);
+  lib_assert(static_cast<size_t>(num_storage_nodes_) <=
+               std::numeric_limits<size_t>::max() / peer_qps_per_peer_,
+             "peer RDMA waiter resource count overflow");
+  peer_rdma_read_qp_waiter_count_ =
+    static_cast<size_t>(num_storage_nodes_) * peer_qps_per_peer_;
+  peer_rdma_read_qp_waiters_ =
+    std::make_unique<StorageOwnerMaintenanceWaiterSet[]>(
+      peer_rdma_read_qp_waiter_count_);
   for (u32 i = 0; i < num_storage_nodes_; ++i) {
     auto& qp_credits = peer_rdma_read_qp_outstanding_.emplace_back(peer_qps_per_peer_);
     for (auto& credit : qp_credits) {
@@ -258,6 +270,99 @@ u32 MemoryNode::peer_rdma_read_global_credit_limit() const {
   return peer_rdma_read_credits_.global;
 }
 
+void MemoryNode::mark_current_peer_rdma_read_waiter(
+    u32 shard_id, u32 qp_idx) {
+  if (peer_rdma_read_peer_waiters_ == nullptr ||
+      peer_rdma_read_qp_waiters_ == nullptr) {
+    return;
+  }
+  lib_assert(shard_id < num_storage_nodes_ && qp_idx < peer_qps_per_peer_,
+             "invalid peer RDMA waiter resource");
+  const size_t qp_waiter =
+    static_cast<size_t>(shard_id) * peer_qps_per_peer_ + qp_idx;
+  lib_assert(qp_waiter < peer_rdma_read_qp_waiter_count_,
+             "peer RDMA QP waiter resource is out of range");
+  mark_current_storage_owner_maintenance_waiter(
+    peer_rdma_read_global_waiters_);
+  mark_current_storage_owner_maintenance_waiter(
+    peer_rdma_read_peer_waiters_[shard_id]);
+  mark_current_storage_owner_maintenance_waiter(
+    peer_rdma_read_qp_waiters_[qp_waiter]);
+}
+
+void MemoryNode::clear_current_peer_rdma_read_waiter(
+    u32 shard_id, u32 qp_idx) {
+  if (peer_rdma_read_peer_waiters_ == nullptr ||
+      peer_rdma_read_qp_waiters_ == nullptr) {
+    return;
+  }
+  lib_assert(shard_id < num_storage_nodes_ && qp_idx < peer_qps_per_peer_,
+             "invalid peer RDMA waiter resource");
+  const size_t qp_waiter =
+    static_cast<size_t>(shard_id) * peer_qps_per_peer_ + qp_idx;
+  lib_assert(qp_waiter < peer_rdma_read_qp_waiter_count_,
+             "peer RDMA QP waiter resource is out of range");
+  clear_current_storage_owner_maintenance_waiter(
+    peer_rdma_read_global_waiters_);
+  clear_current_storage_owner_maintenance_waiter(
+    peer_rdma_read_peer_waiters_[shard_id]);
+  clear_current_storage_owner_maintenance_waiter(
+    peer_rdma_read_qp_waiters_[qp_waiter]);
+}
+
+void MemoryNode::take_peer_rdma_read_waiters(
+    u32 shard_id, u32 qp_idx,
+    StorageOwnerMaintenanceWaiterMask& owners, u32 wake_budget) {
+  if (peer_rdma_read_peer_waiters_ == nullptr ||
+      peer_rdma_read_qp_waiters_ == nullptr) {
+    return;
+  }
+  lib_assert(shard_id < num_storage_nodes_ && qp_idx < peer_qps_per_peer_,
+             "invalid peer RDMA waiter release resource");
+  const size_t qp_waiter =
+    static_cast<size_t>(shard_id) * peer_qps_per_peer_ + qp_idx;
+  lib_assert(qp_waiter < peer_rdma_read_qp_waiter_count_,
+             "peer RDMA QP waiter release resource is out of range");
+  auto& peer_waiters = peer_rdma_read_peer_waiters_[shard_id];
+  auto& qp_waiters = peer_rdma_read_qp_waiters_[qp_waiter];
+  // The lane-zero owner may also have a context blocked on credits. One wake
+  // scans all of its contexts, so remove that duplicate subscription before
+  // selecting additional owners for the returned credit group.
+  for (size_t word = 0; word < owners.size(); ++word) {
+    u64 existing = owners[word];
+    while (existing != 0) {
+      const u32 bit = static_cast<u32>(std::countr_zero(existing));
+      const u32 owner = static_cast<u32>(word * 64 + bit);
+      existing &= existing - 1;
+      clear_storage_owner_maintenance_waiter(
+        peer_rdma_read_global_waiters_, owner);
+      clear_storage_owner_maintenance_waiter(peer_waiters, owner);
+      clear_storage_owner_maintenance_waiter(qp_waiters, owner);
+    }
+  }
+  const u32 bounded_budget = std::min<u32>(
+    wake_budget,
+    storage_owner_maintenance_wake_worker_count_.load(
+      std::memory_order_acquire));
+  for (u32 wake = 0; wake < bounded_budget; ++wake) {
+    std::optional<u32> owner =
+      take_one_storage_owner_maintenance_waiter(qp_waiters);
+    if (!owner.has_value()) {
+      owner = take_one_storage_owner_maintenance_waiter(peer_waiters);
+    }
+    if (!owner.has_value()) {
+      owner = take_one_storage_owner_maintenance_waiter(
+        peer_rdma_read_global_waiters_);
+    }
+    if (!owner.has_value()) break;
+    clear_storage_owner_maintenance_waiter(
+      peer_rdma_read_global_waiters_, *owner);
+    clear_storage_owner_maintenance_waiter(peer_waiters, *owner);
+    clear_storage_owner_maintenance_waiter(qp_waiters, *owner);
+    owners[*owner / 64] |= u64{1} << (*owner % 64);
+  }
+}
+
 bool MemoryNode::try_acquire_peer_rdma_read_credit(u32 shard_id, u32 qp_idx) {
   lib_assert(shard_id < peer_rdma_read_qp_outstanding_.size(), "invalid peer shard id");
   lib_assert(qp_idx < peer_rdma_read_qp_outstanding_[shard_id].size(), "invalid peer QP index");
@@ -265,10 +370,7 @@ bool MemoryNode::try_acquire_peer_rdma_read_credit(u32 shard_id, u32 qp_idx) {
   // as resumable Stage2 waves.  Reserve all three domains transactionally;
   // otherwise a synchronous caller can overrun the global plan while async
   // searches already occupy it.
-  return memory_node_detail::try_reserve_peer_rdma_read_group(
-    peer_rdma_read_outstanding_[shard_id],
-    peer_rdma_read_qp_outstanding_[shard_id][qp_idx],
-    peer_async_rdma_outstanding_, peer_rdma_read_credit_plan(), 1);
+  return try_acquire_peer_rdma_read_group(shard_id, qp_idx, 1);
 }
 
 void MemoryNode::acquire_peer_rdma_read_credit(u32 shard_id, u32 qp_idx) {
@@ -284,11 +386,26 @@ bool MemoryNode::try_acquire_peer_rdma_read_group(
              "invalid peer shard id");
   lib_assert(qp_idx < peer_rdma_read_qp_outstanding_[shard_id].size(),
              "invalid peer QP index");
-  return memory_node_detail::try_reserve_peer_rdma_read_group(
-    peer_rdma_read_outstanding_[shard_id],
-    peer_rdma_read_qp_outstanding_[shard_id][qp_idx],
-    peer_async_rdma_outstanding_, peer_rdma_read_credit_plan(),
-    read_count);
+  const auto try_once = [&]() {
+    return memory_node_detail::try_reserve_peer_rdma_read_group(
+      peer_rdma_read_outstanding_[shard_id],
+      peer_rdma_read_qp_outstanding_[shard_id][qp_idx],
+      peer_async_rdma_outstanding_, peer_rdma_read_credit_plan(),
+      read_count);
+  };
+  if (try_once()) {
+    clear_current_peer_rdma_read_waiter(shard_id, qp_idx);
+    return true;
+  }
+  mark_current_peer_rdma_read_waiter(shard_id, qp_idx);
+  // Credit counters are lock-free. Register-before-recheck closes the only
+  // lost-edge window: a release before registration leaves free credit for
+  // this retry; a later release observes the published owner bit.
+  if (try_once()) {
+    clear_current_peer_rdma_read_waiter(shard_id, qp_idx);
+    return true;
+  }
+  return false;
 }
 
 void MemoryNode::acquire_peer_rdma_read_group(
@@ -402,6 +519,8 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
       released_read_credit = true;
     }
     if (pending.async) {
+      StorageOwnerMaintenanceWaiterMask exact_owners{};
+      StorageOwnerMaintenanceWaiterMask resource_owners{};
       lib_assert(pending.thread != nullptr, "async peer RDMA completion has no owner thread");
       lib_assert(pending.coroutine_id < pending.thread->post_balances.size(),
                  "async peer RDMA completion has invalid coroutine id");
@@ -409,25 +528,47 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
       const i32 previous = balance.fetch_sub(1, std::memory_order_acq_rel);
       lib_assert(previous > 0,
                  "async peer RDMA completion underflowed its search lane");
-      if (previous == 1 && pending.maintenance_wake_owner !=
-            memory_node_detail::kNoMaintenanceWakeOwner) {
-        // The zero transition makes exactly one maintenance-owned lane
-        // runnable. Do not make every executor rescan all of its contexts.
-        notify_storage_owner_maintenance_executor(
-          pending.maintenance_wake_owner);
+      if (previous == 1) {
+        // The zero transition makes one exact context runnable. Publish its
+        // generation-fenced ticket before the worker epoch; a stale key means
+        // the context was already canceled/reused and needs no execution.
+        bool context_ready = false;
+        if (pending.maintenance_context_owner.token != 0) {
+          lib_assert(pending.maintenance_wake_owner ==
+                       pending.maintenance_context_owner.worker_id,
+                     "peer RDMA pending owner domains disagree");
+          context_ready = enqueue_storage_owner_maintenance_context_ready(
+            pending.maintenance_context_owner,
+            memory_node_storage_owner_maintenance_detail::
+              Stage2ContextReadyReason::rdma_completion);
+        }
+        const u32 owner = context_ready
+          ? pending.maintenance_context_owner.worker_id
+          : pending.maintenance_wake_owner;
+        if (owner != memory_node_detail::kNoMaintenanceWakeOwner &&
+            owner < CPU_SETSIZE) {
+          auto& owner_mask = context_ready
+            ? exact_owners : resource_owners;
+          owner_mask[owner / 64] |= u64{1} << (owner % 64);
+        }
       }
       if (released_read_credit) {
-        // Read credits are shared across contexts, peers, and workers. This
-        // is a separate capacity edge from the owner-lane zero transition.
-        notify_one_storage_owner_maintenance_executor();
+        take_peer_rdma_read_waiters(
+          pending.target_shard, pending.target_qp_idx, resource_owners,
+          read_count);
       }
+      notify_storage_owner_maintenance_waiters(exact_owners);
+      notify_storage_owner_maintenance_waiters_scan(resource_owners);
       return;
     }
     if (released_read_credit) {
       // Synchronous reads/atomics share the same credit domains as Stage2.
       // Their caller waits on a different condition variable, so explicitly
       // wake maintenance contexts whose previously rejected wave now fits.
-      notify_one_storage_owner_maintenance_executor();
+      StorageOwnerMaintenanceWaiterMask owners{};
+      take_peer_rdma_read_waiters(
+        pending.target_shard, pending.target_qp_idx, owners, read_count);
+      notify_storage_owner_maintenance_waiters_scan(owners);
     }
   }
 
@@ -456,9 +597,14 @@ void MemoryNode::handle_peer_send_completion(u64 wr_id) {
       1, std::memory_order_acq_rel);
     lib_assert(previous_global > 0,
                "peer RDMA completion underflowed legacy global credits");
-    // The credit release can unblock a different context even when this
-    // particular coroutine still owns more completions.
-    notify_one_storage_owner_maintenance_executor();
+    // This legacy path has no peer/QP metadata, but it still returns the
+    // process-wide credit. Wake only executors that published a global RDMA
+    // dependency instead of selecting an arbitrary maintenance worker.
+    const auto owner = take_one_storage_owner_maintenance_waiter(
+      peer_rdma_read_global_waiters_);
+    if (owner.has_value()) {
+      notify_storage_owner_maintenance_executor_scan(*owner);
+    }
   }
 }
 
@@ -553,6 +699,8 @@ void MemoryNode::post_peer_read_async(StorageOwnerThread& thread,
       .rdma_read_credit = true,
       .maintenance_wake_owner = current_storage_owner_maintenance_worker_
         ? thread.id : memory_node_detail::kNoMaintenanceWakeOwner,
+      .maintenance_context_owner =
+        current_storage_owner_maintenance_context_owner_,
     });
   std::lock_guard<std::mutex> send_lock(*peer_qp_send_mutexes_[shard_id][qp_idx]);
   qp->post_send(reinterpret_cast<u64>(dst),
@@ -727,14 +875,31 @@ bool MemoryNode::post_peer_reads_async_impl(
                  "nonblocking peer RDMA read wave exceeds QP credit");
     }
 
-    if (!memory_node_detail::try_reserve_peer_rdma_read_wave(
-          span<const memory_node_detail::PeerRdmaReadCreditRequest>{
-            credit_requests},
-          peer_async_rdma_outstanding_, peer_rdma_read_credit_plan())) {
+    const auto try_reserve_wave = [&]() {
+      return memory_node_detail::try_reserve_peer_rdma_read_wave(
+        span<const memory_node_detail::PeerRdmaReadCreditRequest>{
+          credit_requests},
+        peer_async_rdma_outstanding_, peer_rdma_read_credit_plan());
+    };
+    if (!try_reserve_wave()) {
       // The helper rolls back the complete prefix before returning to the
-      // scheduler. A false result therefore owns no partial credit and has
-      // posted no WR.
-      return false;
+      // scheduler. Publish every resource touched by this all-or-nothing wave,
+      // then retry once to close a concurrent release-before-registration.
+      for (size_t group_index = 0;
+           group_index < wave_reads_by_qp.size(); ++group_index) {
+        if (wave_reads_by_qp[group_index] == 0) continue;
+        mark_current_peer_rdma_read_waiter(
+          static_cast<u32>(group_index / peer_qps_per_peer_),
+          static_cast<u32>(group_index % peer_qps_per_peer_));
+      }
+      if (!try_reserve_wave()) return false;
+    }
+    for (size_t group_index = 0;
+         group_index < wave_reads_by_qp.size(); ++group_index) {
+      if (wave_reads_by_qp[group_index] == 0) continue;
+      clear_current_peer_rdma_read_waiter(
+        static_cast<u32>(group_index / peer_qps_per_peer_),
+        static_cast<u32>(group_index % peer_qps_per_peer_));
     }
   }
 
@@ -798,6 +963,8 @@ bool MemoryNode::post_peer_reads_async_impl(
           .rdma_read_count = read_count,
           .maintenance_wake_owner = current_storage_owner_maintenance_worker_
             ? thread.id : memory_node_detail::kNoMaintenanceWakeOwner,
+          .maintenance_context_owner =
+            current_storage_owner_maintenance_context_owner_,
         });
       ibv_send_wr* bad_work_request = nullptr;
       {
@@ -985,11 +1152,28 @@ bool MemoryNode::post_peer_read_pairs_async_impl(
                  "nonblocking ordered snapshot wave exceeds QP credit");
     }
 
-    if (!memory_node_detail::try_reserve_peer_rdma_read_wave(
-          span<const memory_node_detail::PeerRdmaReadCreditRequest>{
-            credit_requests},
-          peer_async_rdma_outstanding_, peer_rdma_read_credit_plan())) {
-      return false;
+    const auto try_reserve_wave = [&]() {
+      return memory_node_detail::try_reserve_peer_rdma_read_wave(
+        span<const memory_node_detail::PeerRdmaReadCreditRequest>{
+          credit_requests},
+        peer_async_rdma_outstanding_, peer_rdma_read_credit_plan());
+    };
+    if (!try_reserve_wave()) {
+      for (size_t group_index = 0;
+           group_index < wave_reads_by_qp.size(); ++group_index) {
+        if (wave_reads_by_qp[group_index] == 0) continue;
+        mark_current_peer_rdma_read_waiter(
+          static_cast<u32>(group_index / peer_qps_per_peer_),
+          static_cast<u32>(group_index % peer_qps_per_peer_));
+      }
+      if (!try_reserve_wave()) return false;
+    }
+    for (size_t group_index = 0;
+         group_index < wave_reads_by_qp.size(); ++group_index) {
+      if (wave_reads_by_qp[group_index] == 0) continue;
+      clear_current_peer_rdma_read_waiter(
+        static_cast<u32>(group_index / peer_qps_per_peer_),
+        static_cast<u32>(group_index % peer_qps_per_peer_));
     }
   }
 
@@ -1068,6 +1252,8 @@ bool MemoryNode::post_peer_read_pairs_async_impl(
           .rdma_read_count = read_count,
           .maintenance_wake_owner = current_storage_owner_maintenance_worker_
             ? thread.id : memory_node_detail::kNoMaintenanceWakeOwner,
+          .maintenance_context_owner =
+            current_storage_owner_maintenance_context_owner_,
         });
       ibv_send_wr* bad_work_request = nullptr;
       {
@@ -1251,11 +1437,28 @@ bool MemoryNode::try_post_peer_snapshot_reads_async(
       .count = read_count,
     });
   }
-  if (!memory_node_detail::try_reserve_peer_rdma_read_wave(
-        span<const memory_node_detail::PeerRdmaReadCreditRequest>{
-          credit_requests},
-        peer_async_rdma_outstanding_, plan)) {
-    return false;
+  const auto try_reserve_wave = [&]() {
+    return memory_node_detail::try_reserve_peer_rdma_read_wave(
+      span<const memory_node_detail::PeerRdmaReadCreditRequest>{
+        credit_requests},
+      peer_async_rdma_outstanding_, plan);
+  };
+  if (!try_reserve_wave()) {
+    for (size_t group_index = 0; group_index < groups.size();
+         ++group_index) {
+      if (groups[group_index].empty()) continue;
+      mark_current_peer_rdma_read_waiter(
+        static_cast<u32>(group_index / peer_qps_per_peer_),
+        static_cast<u32>(group_index % peer_qps_per_peer_));
+    }
+    if (!try_reserve_wave()) return false;
+  }
+  for (size_t group_index = 0; group_index < groups.size();
+       ++group_index) {
+    if (groups[group_index].empty()) continue;
+    clear_current_peer_rdma_read_waiter(
+      static_cast<u32>(group_index / peer_qps_per_peer_),
+      static_cast<u32>(group_index % peer_qps_per_peer_));
   }
 
   thread_local vec<ibv_send_wr> work_requests;
@@ -1327,6 +1530,8 @@ bool MemoryNode::try_post_peer_snapshot_reads_async(
         .rdma_read_count = read_count,
         .maintenance_wake_owner = current_storage_owner_maintenance_worker_
           ? thread.id : memory_node_detail::kNoMaintenanceWakeOwner,
+        .maintenance_context_owner =
+          current_storage_owner_maintenance_context_owner_,
       });
     ibv_send_wr* bad_work_request = nullptr;
     {

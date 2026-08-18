@@ -8,8 +8,53 @@ void MemoryNode::peer_rpc_progress_loop() {
   current_peer_rpc_progress_thread_ = true;
   peer_rpc_progress_running_.store(true, std::memory_order_release);
   vec<ibv_wc> recv_wcs(std::max<i32>(1, peer_context_->get_config().max_recv_queue_wr));
+  std::vector<PeerResponseCompletionTarget> completion_targets;
+  completion_targets.reserve(config.storage_owner_batch_max);
+  u64 next_stage2_home_timeout_scan_ns = 0;
   for (;;) {
     poll_peer_send_cq();
+    const u64 progress_now_ns = static_cast<u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (progress_now_ns >= next_stage2_home_timeout_scan_ns) {
+      if (stage2_home_rpc_outbox_ != nullptr) {
+        (void)stage2_home_rpc_outbox_->promote_expired(progress_now_ns);
+      }
+      constexpr u64 kStage2HomeTimeoutScanIntervalNs = 1'000'000ull;
+      next_stage2_home_timeout_scan_ns = progress_now_ns >
+          std::numeric_limits<u64>::max() -
+            kStage2HomeTimeoutScanIntervalNs
+        ? std::numeric_limits<u64>::max()
+        : progress_now_ns + kStage2HomeTimeoutScanIntervalNs;
+    }
+    // Drain only work that was already visible at this progress tick. There
+    // is no aggregation timer: concurrent producers naturally share one
+    // prefix, while a lone producer is posted immediately on the next tick.
+    const auto drive_ready_class = [&](const auto request_type,
+                                       const bool speculative) {
+      if (stage2_home_rpc_outbox_ == nullptr) return;
+      const u64 ready_peers = stage2_home_rpc_outbox_->ready_peer_mask(
+        request_type, speculative);
+      for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
+        if (peer_id != storage_id_ &&
+            (ready_peers & (u64{1} << peer_id)) != 0) {
+          (void)try_drive_stage2_home_rpc_requests(
+            peer_id, request_type, speculative);
+        }
+      }
+    };
+    drive_ready_class(
+      service::storage_owner::PeerRpcType::stage2_expand_score_request,
+      false);
+    drive_ready_class(
+      service::storage_owner::PeerRpcType::stage2_score_many_request,
+      false);
+    drive_ready_class(
+      service::storage_owner::PeerRpcType::stage2_expand_score_request,
+      true);
+    drive_ready_class(
+      service::storage_owner::PeerRpcType::stage2_score_many_request,
+      true);
     const i32 num_received =
       peer_context_->poll_recv_cq(recv_wcs.data(), static_cast<i32>(recv_wcs.size()));
     if (num_received <= 0) {
@@ -93,21 +138,25 @@ void MemoryNode::peer_rpc_progress_loop() {
 
       const auto try_deliver_response = [&]() {
         if (peer_async_responses_ == nullptr) return false;
-        u32 maintenance_wake_owner =
-          memory_node_detail::kNoMaintenanceWakeOwner;
-        if (!peer_async_responses_->try_deliver(
+        PeerResponseCompletionTarget completion_target;
+        if (!peer_async_responses_->try_deliver_with_target(
               peer_id, slot_id, bytes, *header,
-              &maintenance_wake_owner)) {
+              &completion_target)) {
           return false;
         }
         // Synchronous/control callers retain their existing completion CV.
         // A maintenance-tagged response additionally wakes only the executor
         // that owns the response cell and its context.
         peer_completion_cv_.notify_all();
-        if (maintenance_wake_owner !=
-            memory_node_detail::kNoMaintenanceWakeOwner) {
+        if (completion_target.has_context_owner()) {
+          (void)notify_storage_owner_maintenance_context_ready(
+            completion_target.context_owner,
+            memory_node_storage_owner_maintenance_detail::
+              Stage2ContextReadyReason::rpc_response);
+        } else if (completion_target.maintenance_wake_owner !=
+                   memory_node_detail::kNoMaintenanceWakeOwner) {
           notify_storage_owner_maintenance_executor(
-            maintenance_wake_owner);
+            completion_target.maintenance_wake_owner);
         }
         return true;
       };
@@ -441,8 +490,33 @@ void MemoryNode::peer_rpc_progress_loop() {
             (bytes - minimum_bytes) %
                 sizeof(service::storage_owner::Stage2ExpandScoreNeighbor) == 0;
         }
-        if (valid_response && try_deliver_response()) {
-          hold_receive_slot = true;
+        if (valid_response) {
+          completion_targets.clear();
+          const bool aggregate_response =
+            try_handle_stage2_home_rpc_aggregate_response(
+              peer_id, span<const byte_t>{payload, bytes},
+              completion_targets);
+          if (aggregate_response) {
+            // Owned logical payloads are installed atomically and the outer
+            // receive slot is not retained. Finish the outbox lease happens
+            // before these generation-tagged context notifications.
+            for (const PeerResponseCompletionTarget& target :
+                 completion_targets) {
+              if (target.has_context_owner()) {
+                (void)notify_storage_owner_maintenance_context_ready(
+                  target.context_owner,
+                  memory_node_storage_owner_maintenance_detail::
+                    Stage2ContextReadyReason::rpc_response);
+              } else if (target.maintenance_wake_owner !=
+                         memory_node_detail::kNoMaintenanceWakeOwner) {
+                notify_storage_owner_maintenance_executor(
+                  target.maintenance_wake_owner);
+              }
+            }
+            peer_completion_cv_.notify_all();
+          } else if (try_deliver_response()) {
+            hold_receive_slot = true;
+          }
         }
       } else if (header->type == static_cast<u32>(
                    service::storage_owner::PeerRpcType::reconcile_reverse_response)) {
