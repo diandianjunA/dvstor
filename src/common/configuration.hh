@@ -65,9 +65,6 @@ public:
   u32 gpu_final_rerank_width{64};
   u32 gpu_max_expansions{384};
   u32 gpu_rdma_qps{4};
-  // Deprecated compatibility input. Dynamic PQ now uses a fixed one-to-one
-  // physical-slot arena sized from storage metadata; this value is ignored.
-  u32 gpu_dynamic_code_cache_entries{1u << 20};
   // A CQE can be delayed well beyond ordinary read latency when GPU reads and
   // CPU-posted mutation traffic share the NIC.  This is a liveness bound, not
   // a latency target: transport errors still fail immediately.
@@ -87,16 +84,14 @@ public:
   u32 storage_owner_batch_max_wait_us{2'000};
   // Stage2 is query-invisible background maintenance. Its compaction horizon
   // must not be tied to the foreground Stage1 batching latency.
-  // Stage2 batching is coordinated across already-pending work.  A short
-  // horizon still forms useful waves without adding millisecond-scale queue
-  // delay when update load is sparse or uneven across homes.
-  u32 storage_owner_stage2_batch_max_wait_us{50};
-  // Fresh inserts may publish the sorted local Beam as their provisional
-  // adjacency and defer the exact local RobustPrune to Stage2. Stage2 then
-  // reconstructs the same prune seed before the final global prune, so this
-  // changes foreground placement of work, not durable graph quality.
-  bool storage_owner_defer_stage1_prune{false};
+  // Stage2 batching is coordinated across already-pending work. This bound
+  // caps the arrival-aware tail deadline; a complete B8 runs immediately.
+  u32 storage_owner_stage2_batch_max_wait_us{25'000};
   bool storage_owner_stage2_score_many{true};
+  // Combine ready logical Stage2 home requests that share a peer and wire
+  // class. False preserves the same protocol and retry semantics but sends
+  // each logical request directly, which is the architecture baseline.
+  bool storage_owner_stage2_home_rpc_combining{true};
   // Maximum ordered graph issue width. Width one is the exact legacy path;
   // larger values are promotion-gated and only fill spare items in an RPC
   // that an authoritative expansion already requires.
@@ -279,11 +274,6 @@ private:
       ("enable-updates",
        po::value<bool>(&enable_updates)->default_value(enable_updates),
        "Enable compute-side insert, upsert, and erase submission.")
-      ("gpu-dynamic-code-cache-entries",
-       po::value<u32>(&gpu_dynamic_code_cache_entries)
-         ->default_value(gpu_dynamic_code_cache_entries),
-       "Deprecated compatibility option; the dynamic-PQ arena is metadata-sized.")
-
       ("storage-id", po::value<u32>(&storage_id)->default_value(storage_id),
        "Zero-based storage shard identifier.")
       ("storage-peers", po::value<vec<str>>(&storage_peers)->multitoken(),
@@ -301,16 +291,15 @@ private:
          ->default_value(storage_owner_stage2_batch_max_wait_us),
        "Maximum background Stage2 compaction wait for a partial batch; zero "
        "runs partial Stage2 batches immediately.")
-      ("storage-owner-defer-stage1-prune",
-       po::value<bool>(&storage_owner_defer_stage1_prune)
-         ->default_value(storage_owner_defer_stage1_prune),
-       "Publish a bounded nearest-first provisional adjacency for fresh "
-       "inserts and execute the exact local RobustPrune in Stage2.")
       ("storage-owner-stage2-score-many",
        po::value<bool>(&storage_owner_stage2_score_many)
          ->default_value(storage_owner_stage2_score_many),
        "Score remote Stage2 candidates at their physical home using a "
        "query-deduplicated exact score-many RPC.")
+      ("storage-owner-stage2-home-rpc-combining",
+       po::value<bool>(&storage_owner_stage2_home_rpc_combining)
+         ->default_value(storage_owner_stage2_home_rpc_combining),
+       "Combine compatible logical Stage2 home requests into one wire RPC.")
       ("storage-owner-stage2-graph-issue-width",
        po::value<u32>(&storage_owner_stage2_graph_issue_width)
          ->default_value(storage_owner_stage2_graph_issue_width),
@@ -494,6 +483,8 @@ public:
              << config.gpu_graph_issue_width << '\n';
       output << std::setw(width) << "GPU graph read policy: "
              << config.gpu_query_graph_read_policy << '\n';
+      output << std::setw(width) << "GPU dynamic graph extent: "
+             << config.gpu_dynamic_graph_extent << '\n';
       output << std::setw(width) << "GPU Beam merge policy: "
              << config.gpu_query_beam_merge_policy << '\n';
       output << std::setw(width) << "query RDMA trace mode/rate: "
@@ -518,10 +509,10 @@ public:
              << config.storage_owner_batch_max_wait_us << '\n';
       output << std::setw(width) << "storage Stage2 batch max wait us: "
              << config.storage_owner_stage2_batch_max_wait_us << '\n';
-      output << std::setw(width) << "defer fresh-insert Stage1 prune: "
-             << config.storage_owner_defer_stage1_prune << '\n';
       output << std::setw(width) << "Stage2 exact score-many: "
              << config.storage_owner_stage2_score_many << '\n';
+      output << std::setw(width) << "Stage2 home RPC combining: "
+             << config.storage_owner_stage2_home_rpc_combining << '\n';
       output << std::setw(width) << "Stage2 graph issue width: "
              << config.storage_owner_stage2_graph_issue_width << '\n';
       output << std::setw(width) << "storage peer QPs per peer: "

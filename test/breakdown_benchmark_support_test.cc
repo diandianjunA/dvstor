@@ -188,6 +188,10 @@ void test_recall_and_report_formatting() {
   nlohmann::json root;
   root["meta"] = {
     {"workload", "query"},
+    {"gpu_graph_commit_width", 16},
+    {"gpu_graph_issue_width", 32},
+    {"gpu_query_graph_read_policy", "live-extent"},
+    {"gpu_dynamic_graph_extent", true},
     {"gpu_query_beam_merge_policy", "stable-run"},
     {"recall_query", {{"source", "recall.u8bin"}, {"rows", 1000}}},
     {"performance_query", {
@@ -211,10 +215,6 @@ void test_recall_and_report_formatting() {
       {"issued", 100}, {"hits", 75}, {"wasted", 20},
       {"promotion_ratio", 75.0 / 95.0},
     }},
-    {"ordered_score_prefetch", {
-      {"issued", 200}, {"hits", 180}, {"wasted", 10},
-      {"promotion_ratio", 180.0 / 190.0},
-    }},
     {"home_rpc_wire", {
       {"graph_batches", 10}, {"graph_items", 80},
       {"avg_graph_items_per_rpc", 8.0},
@@ -235,12 +235,14 @@ void test_recall_and_report_formatting() {
            "ordered graph issue: issued/hit/wasted=100/75/20") !=
          std::string::npos);
   assert(formatted.text.find(
-           "ordered score prefetch: issued/hit/wasted=200/180/10") !=
-         std::string::npos);
-  assert(formatted.text.find(
            "graph home RPC: batches/items/avg_items=10/80/8") !=
          std::string::npos);
   assert(formatted.text.find("GPU Beam merge policy: stable-run") !=
+         std::string::npos);
+  assert(formatted.text.find("GPU graph commit/issue width: 16/32") !=
+         std::string::npos);
+  assert(formatted.text.find(
+           "GPU graph read/dynamic extent: live-extent/1") !=
          std::string::npos);
   assert(formatted.text.find(
            "GPU Beam merge total/prepare/sort/materialize us:") !=
@@ -315,10 +317,7 @@ void test_maintenance_log_window() {
                                uint64_t failed,
                                uint64_t peer_failed,
                                const Histogram& histogram,
-                               bool include_packing = true,
-                               uint64_t active_stage2_tasks = 0,
-                               uint64_t active_stage2_task_limit = 256,
-                               bool include_active_stage2_task_gauge = true) {
+                               bool include_packing = true) {
     output << "[STATUS]: storage-owner maintenance observation: "
            << "stage2_enqueued=" << enqueued << ' '
            << "stage2_finalized_live=" << completed << " stale=0 "
@@ -331,11 +330,6 @@ void test_maintenance_log_window() {
            << "completion_incomplete=" << remaining / 2 << ' '
            << "completion_logical_full_failures=" << completed * 5 << ' '
            << "completion_physical_full_failures=" << completed << ' ';
-    if (include_active_stage2_task_gauge) {
-      output << "active_stage2_tasks=" << active_stage2_tasks << ' '
-             << "active_stage2_task_limit="
-             << active_stage2_task_limit << ' ';
-    }
     output
            << "stage2_continuations=" << completed << ' '
            << "stage2_remote_frontier_items=" << completed * 2 << ' '
@@ -347,27 +341,18 @@ void test_maintenance_log_window() {
            << "stage2_cross_edges_final_home=" << completed * 2 << ' '
            << "stage1_search_budget_exhausted=" << completed / 20 << ' '
            << "stage2_search_budget_exhausted=" << completed / 10 << ' '
-           << "stage2_independent_score_rpc_batches=" << completed << ' '
-           << "stage2_independent_score_issued=" << completed * 32 << ' '
-           << "stage2_independent_score_useful=" << completed * 16 << ' '
-           << "stage2_independent_score_wasted=" << completed * 8 << ' '
            << "maintenance_targeted_wakes=" << completed * 2 << ' '
            << "maintenance_generic_wakes=" << completed * 3 << ' '
            << "maintenance_broadcast_wakes=" << completed / 10 << ' '
            << "maintenance_context_slots_scanned=" << completed * 16 << ' ';
     if (include_packing) {
-      output << "packing_target_batch=" << (completed == 0 ? 2 : 4) << ' '
+      output << "packing_target_batch=8 "
              << "packing_arrival_interval_us=" << completed + 100 << ' '
              << "packing_waited_batches=" << completed << ' '
              << "packing_wait_ms=" << completed / 1000.0 << ' '
              << "packing_target_flushes=" << completed * 2 << ' '
              << "packing_deadline_flushes=" << completed * 3 << ' '
-             << "packing_full_flushes=" << completed * 4 << ' '
-             << "packing_low_pressure_flushes=" << completed * 5 << ' '
-             << "packing_cleanup_flushes=" << completed * 6 << ' '
-             << "packing_promotions=" << completed / 100 << ' '
-             << "packing_rollbacks=" << completed / 150 << ' '
-             << "packing_accepted_windows=" << completed / 75 << ' ';
+             << "packing_cleanup_flushes=" << completed * 6 << ' ';
     }
     output
            // Deliberately stale cumulative p99 fields: the parser must use
@@ -391,14 +376,11 @@ void test_maintenance_log_window() {
   {
     std::ofstream output(path, std::ios::app);
     histogram[2] = 20;
-    write_observation(output, 100, 90, 10, 9, 3, histogram,
-                      true, 17, 256);
+    write_observation(output, 100, 90, 10, 9, 3, histogram);
     histogram[2] = 60;
-    write_observation(output, 200, 195, 5, 9, 3, histogram,
-                      true, 31, 256);
+    write_observation(output, 200, 195, 5, 9, 3, histogram);
     histogram[2] = 100;
-    write_observation(output, 300, 300, 0, 10, 7, histogram,
-                      true, 0, 256);
+    write_observation(output, 300, 300, 0, 10, 7, histogram);
   }
 
   const auto post_stop =
@@ -427,29 +409,19 @@ void test_maintenance_log_window() {
   assert(summary.search_budget_delta_available);
   assert(summary.stage1_search_budget_exhausted == 15);
   assert(summary.stage2_search_budget_exhausted == 30);
-  assert(summary.independent_score_delta_available);
-  assert(summary.stage2_independent_score_rpc_batches == 300);
-  assert(summary.stage2_independent_score_issued == 9'600);
-  assert(summary.stage2_independent_score_useful == 4'800);
-  assert(summary.stage2_independent_score_wasted == 2'400);
   assert(summary.wake_counter_delta_available);
   assert(summary.maintenance_targeted_wakes == 600);
   assert(summary.maintenance_generic_wakes == 900);
   assert(summary.maintenance_broadcast_wakes == 30);
   assert(summary.maintenance_context_slots_scanned == 4'800);
   assert(summary.packing_delta_available);
-  assert(summary.packing_target_batch_max == 4);
+  assert(summary.packing_target_batch_max == 8);
   assert(summary.packing_arrival_interval_us_max == 400);
   assert(summary.packing_waited_batches == 300);
   assert(summary.packing_wait_ns == 300'000);
   assert(summary.packing_target_flushes == 600);
   assert(summary.packing_deadline_flushes == 900);
-  assert(summary.packing_full_flushes == 1'200);
-  assert(summary.packing_low_pressure_flushes == 1'500);
   assert(summary.packing_cleanup_flushes == 1'800);
-  assert(summary.packing_promotions == 3);
-  assert(summary.packing_rollbacks == 2);
-  assert(summary.packing_accepted_trial_windows == 4);
   assert(summary.admission_window == 512);
   assert(summary.completion_outstanding == 0);
   assert(summary.max_completion_outstanding_per_shard == 10);
@@ -459,13 +431,6 @@ void test_maintenance_log_window() {
   assert(summary.completion_admission_failure_delta_available);
   assert(summary.completion_logical_full_failures == 1'500);
   assert(summary.completion_physical_full_failures == 300);
-  assert(summary.active_stage2_task_gauge_available);
-  assert(summary.logs_with_active_stage2_task_gauges == 1);
-  assert(summary.active_stage2_tasks_peak_observed_sum == 31);
-  assert(summary.active_stage2_tasks_latest_sum == 0);
-  assert(summary.active_stage2_task_limit_sum == 256);
-  assert(summary.max_active_stage2_tasks_observed_per_shard == 31);
-  assert(summary.max_active_stage2_task_limit_per_shard == 256);
   assert(summary.failure_delta_available);
   assert(summary.peer_reverse_retry_delta_available);
   assert(summary.p99_stage2_delay_available);
@@ -546,22 +511,17 @@ void test_maintenance_log_window() {
   // counters must remain distinguishable from a valid all-zero delta.
   {
     std::ofstream output(path, std::ios::trunc);
-    write_observation(output, 0, 0, 0, 0, 0, histogram,
-                      false, 0, 256, false);
+    write_observation(output, 0, 0, 0, 0, 0, histogram, false);
   }
   const auto legacy_begin =
     tools::breakdown_benchmark::snapshot_maintenance_logs({path.string()});
   {
     std::ofstream output(path, std::ios::app);
-    write_observation(output, 1, 1, 0, 0, 0, histogram,
-                      false, 0, 256, false);
+    write_observation(output, 1, 1, 0, 0, 0, histogram, false);
   }
   const auto legacy_summary =
     tools::breakdown_benchmark::summarize_maintenance_logs(legacy_begin);
   assert(!legacy_summary.packing_delta_available);
-  assert(!legacy_summary.active_stage2_task_gauge_available);
-  assert(legacy_summary.active_stage2_tasks_peak_observed_sum == 0);
-  assert(legacy_summary.active_stage2_task_limit_sum == 0);
   assert(legacy_summary.packing_target_batch_max == 0);
   assert(legacy_summary.packing_waited_batches == 0);
 
@@ -604,9 +564,6 @@ void test_in_band_maintenance_snapshot_window() {
       .stage2_graph_prefetch_issued = 10,
       .stage2_graph_prefetch_hits = 6,
       .stage2_graph_prefetch_wasted = 2,
-      .stage2_score_prefetch_issued = 20,
-      .stage2_score_prefetch_hits = 12,
-      .stage2_score_prefetch_wasted = 4,
       .stage2_vector_read_waves = 6,
       .stage2_vector_unique_reads = 60,
     };
@@ -625,16 +582,10 @@ void test_in_band_maintenance_snapshot_window() {
     begin[shard]->maintenance_generic_wakes = 7;
     begin[shard]->maintenance_broadcast_wakes = 8;
     begin[shard]->maintenance_context_slots_scanned = 9;
-    begin[shard]->packing_target_batch = 2;
+    begin[shard]->packing_target_batch = 8;
     begin[shard]->packing_arrival_interval_us = 1'000;
     begin[shard]->packing_waited_batches = 3;
     begin[shard]->packing_wait_ns = 4'000;
-    begin[shard]->packing_promotions = 1;
-    begin[shard]->packing_rollbacks = 0;
-    begin[shard]->stage2_independent_score_rpc_batches = 5;
-    begin[shard]->stage2_independent_score_issued = 160;
-    begin[shard]->stage2_independent_score_useful = 96;
-    begin[shard]->stage2_independent_score_wasted = 64;
     begin[shard]->completion_incomplete = 1;
     begin[shard]->completion_logical_full_failures = 5;
     begin[shard]->completion_physical_full_failures = 1;
@@ -655,20 +606,8 @@ void test_in_band_maintenance_snapshot_window() {
     begin[shard]->stage2_home_score_rpc_queries = 4;
     begin[shard]->stage2_home_score_rpc_request_bytes = 2'000;
     begin[shard]->stage2_home_score_rpc_response_bytes = 1'000;
-    begin[shard]->active_stage2_tasks = 3 + shard;
-    begin[shard]->active_stage2_task_limit = 256;
     begin[shard]->active_stage2_contexts = 30 + shard;
     begin[shard]->active_stage2_context_limit = 32;
-    begin[shard]->active_stage2_context_limit_baseline = 32;
-    begin[shard]->active_stage2_context_limit_max = 48;
-    begin[shard]->active_stage2_task_limit_baseline = 256;
-    begin[shard]->active_stage2_task_limit_max = 384;
-    begin[shard]->stage2_budget_promotions = 2;
-    begin[shard]->stage2_budget_rollbacks = 1;
-    begin[shard]->stage2_budget_rate_rollbacks = 3;
-    begin[shard]->stage2_budget_rate_trials_accepted = 4;
-    begin[shard]->maintenance_periodic_fallback_audits = 10;
-    begin[shard]->maintenance_periodic_fallback_recoveries = 2;
     end[shard] = *begin[shard];
     auto& latest = *end[shard];
     latest.sequence = 4;
@@ -698,13 +637,6 @@ void test_in_band_maintenance_snapshot_window() {
     latest.stage2_graph_prefetch_issued += 100;
     latest.stage2_graph_prefetch_hits += 70;
     latest.stage2_graph_prefetch_wasted += 20;
-    latest.stage2_score_prefetch_issued += 200;
-    latest.stage2_score_prefetch_hits += 160;
-    latest.stage2_score_prefetch_wasted += 20;
-    latest.stage2_independent_score_rpc_batches += 10;
-    latest.stage2_independent_score_issued += 320;
-    latest.stage2_independent_score_useful += 192;
-    latest.stage2_independent_score_wasted += 128;
     latest.completion_incomplete = 1;
     latest.completion_logical_full_failures += 11;
     latest.completion_physical_full_failures += 2;
@@ -725,15 +657,12 @@ void test_in_band_maintenance_snapshot_window() {
     latest.maintenance_generic_wakes += 70;
     latest.maintenance_broadcast_wakes += 80;
     latest.maintenance_context_slots_scanned += 90;
-    latest.packing_target_batch = 4;
+    latest.packing_target_batch = 8;
     latest.packing_arrival_interval_us = 2'000;
     latest.packing_waited_batches += 10;
     latest.packing_wait_ns += 20'000;
     latest.packing_target_flushes += 8;
     latest.packing_deadline_flushes += 2;
-    latest.packing_promotions += 1;
-    latest.packing_rollbacks += 1;
-    latest.packing_accepted_trial_windows += 2;
     latest.physical_stage1_items += 20;
     latest.physical_stage1_total_ns += 20'000;
     latest.physical_stage1_search_ns += 10'000;
@@ -752,23 +681,8 @@ void test_in_band_maintenance_snapshot_window() {
     latest.stage2_home_score_rpc_request_bytes += 20'000;
     latest.stage2_home_score_rpc_response_bytes += 10'000;
     latest.stage2_delay_histogram[8] = 20;
-    latest.active_stage2_tasks = 11 + shard;
-    latest.active_stage2_task_limit = 320;
-    latest.active_stage2_contexts = 39 + shard;
-    latest.active_stage2_context_limit = 40;
-    latest.stage2_budget_promotions += 2;
-    latest.stage2_budget_rollbacks += 1;
-    latest.stage2_budget_lane_rollbacks += 1;
-    latest.stage2_budget_rate_rollbacks += 1;
-    latest.stage2_budget_rate_trials_accepted += 2;
-    latest.stage2_budget_high_backlog_samples += 7;
-    latest.stage2_budget_lane_headroom_samples += 5;
-    latest.stage2_budget_stable_rate_milli_per_sec = 1'200'000;
-    latest.stage2_budget_trial_baseline_rate_milli_per_sec = 1'100'000;
-    latest.stage2_budget_rate_trial_pending = 1;
-    latest.stage2_budget_promotion_context_limit = 40;
-    latest.maintenance_periodic_fallback_audits += 100;
-    latest.maintenance_periodic_fallback_recoveries += 7;
+    latest.active_stage2_contexts = 30 + shard;
+    latest.active_stage2_context_limit = 32;
   }
   const auto summary = tools::breakdown_benchmark::
     summarize_maintenance_snapshot_window(begin, end);
@@ -788,36 +702,8 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.exact_completion_credit_available);
   assert(summary.completion_incomplete == 2);
   assert(summary.max_completion_incomplete_per_shard == 1);
-  assert(summary.active_stage2_task_gauge_available);
-  assert(summary.logs_with_active_stage2_task_gauges == 2);
-  assert(summary.active_stage2_tasks_peak_observed_sum == 23);
-  assert(summary.active_stage2_tasks_latest_sum == 23);
-  assert(summary.active_stage2_task_limit_sum == 640);
-  assert(summary.max_active_stage2_tasks_observed_per_shard == 12);
-  assert(summary.max_active_stage2_task_limit_per_shard == 320);
-  assert(summary.execution_budget_delta_available);
-  assert(summary.active_stage2_contexts_latest_sum == 79);
-  assert(summary.active_stage2_context_limit_sum == 80);
-  assert(summary.active_stage2_context_limit_baseline_sum == 64);
-  assert(summary.active_stage2_context_limit_max_sum == 96);
-  assert(summary.active_stage2_task_limit_baseline_sum == 512);
-  assert(summary.active_stage2_task_limit_max_sum == 768);
-  assert(summary.stage2_budget_promotions == 4);
-  assert(summary.stage2_budget_rollbacks == 2);
-  assert(summary.stage2_budget_lane_rollbacks == 2);
-  assert(summary.stage2_budget_low_backlog_rollbacks == 0);
-  assert(summary.stage2_budget_rate_rollbacks == 2);
-  assert(summary.stage2_budget_rate_trials_accepted == 4);
-  assert(summary.stage2_budget_high_backlog_samples == 14);
-  assert(summary.stage2_budget_lane_headroom_samples == 10);
-  assert(summary.stage2_budget_stable_rate_milli_per_sec_sum == 2'400'000);
-  assert(summary.stage2_budget_trial_baseline_rate_milli_per_sec_sum ==
-         2'200'000);
-  assert(summary.stage2_budget_rate_trial_pending_sum == 2);
-  assert(summary.stage2_budget_promotion_context_limit_sum == 80);
-  assert(summary.fallback_audit_delta_available);
-  assert(summary.maintenance_periodic_fallback_audits == 200);
-  assert(summary.maintenance_periodic_fallback_recoveries == 14);
+  assert(summary.active_stage2_contexts_latest_sum == 61);
+  assert(summary.active_stage2_context_limit_sum == 64);
   assert(summary.completion_admission_failure_delta_available);
   assert(summary.completion_logical_full_failures == 22);
   assert(summary.completion_physical_full_failures == 4);
@@ -840,14 +726,6 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.stage2_graph_prefetch_issued == 200);
   assert(summary.stage2_graph_prefetch_hits == 140);
   assert(summary.stage2_graph_prefetch_wasted == 40);
-  assert(summary.stage2_score_prefetch_issued == 400);
-  assert(summary.stage2_score_prefetch_hits == 320);
-  assert(summary.stage2_score_prefetch_wasted == 40);
-  assert(summary.independent_score_delta_available);
-  assert(summary.stage2_independent_score_rpc_batches == 20);
-  assert(summary.stage2_independent_score_issued == 640);
-  assert(summary.stage2_independent_score_useful == 384);
-  assert(summary.stage2_independent_score_wasted == 256);
   assert(summary.stage2_vector_read_waves == 24);
   assert(summary.stage2_vector_unique_reads == 240);
   assert(summary.home_rpc_wire_counter_delta_available);
@@ -876,15 +754,12 @@ void test_in_band_maintenance_snapshot_window() {
   assert(summary.maintenance_broadcast_wakes == 160);
   assert(summary.maintenance_context_slots_scanned == 180);
   assert(summary.packing_delta_available);
-  assert(summary.packing_target_batch_max == 4);
+  assert(summary.packing_target_batch_max == 8);
   assert(summary.packing_arrival_interval_us_max == 2'000);
   assert(summary.packing_waited_batches == 20);
   assert(summary.packing_wait_ns == 40'000);
   assert(summary.packing_target_flushes == 16);
   assert(summary.packing_deadline_flushes == 4);
-  assert(summary.packing_promotions == 2);
-  assert(summary.packing_rollbacks == 2);
-  assert(summary.packing_accepted_trial_windows == 4);
   assert(summary.physical_stage1_items == 40);
   assert(summary.physical_stage1_total_ns == 40'000);
   assert(summary.physical_stage1_search_ns == 20'000);

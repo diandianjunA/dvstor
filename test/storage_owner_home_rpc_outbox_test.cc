@@ -44,15 +44,14 @@ std::vector<byte_t> score_request(
     std::span<const std::uint32_t> query_indexes,
     std::uint32_t query_count,
     std::uint64_t pointer_base,
-    byte_t query_base,
-    std::uint32_t flags = 0) {
+    byte_t query_base) {
   const auto item_count = static_cast<std::uint32_t>(query_indexes.size());
   std::vector<byte_t> request(
     protocol::stage2_score_many_request_bytes(item_count, query_count),
     byte_t{0});
   auto* own_header = protocol::stage2_score_many_header(request.data());
   own_header->query_count = query_count;
-  own_header->flags = flags;
+  own_header->reserved = 0;
   auto* items = protocol::stage2_score_many_items(request.data());
   for (std::uint32_t item = 0; item < item_count; ++item) {
     items[item] = protocol::Stage2ScoreManyItem{
@@ -78,14 +77,12 @@ detail::Stage2HomeRpcDispatch dispatch(
     std::uint32_t peer_index,
     protocol::PeerRpcType request_type,
     std::uint32_t item_count,
-    const std::vector<byte_t>& request,
-    bool speculative = false) {
+    const std::vector<byte_t>& request) {
   return detail::Stage2HomeRpcDispatch{
     .logical_request_id = logical_request_id,
     .peer_index = peer_index,
     .request_type = request_type,
     .item_count = item_count,
-    .speculative = speculative,
     .request = std::span<const byte_t>{request},
   };
 }
@@ -248,7 +245,7 @@ void test_score_many_query_rebase_and_exact_demux() {
   std::vector<byte_t> wire = claim_for_response(
     outbox, 9002, aggregate->request_bytes);
   const auto* own_header = protocol::stage2_score_many_header(wire.data());
-  assert(own_header->query_count == 3 && own_header->flags == 0);
+  assert(own_header->query_count == 3 && own_header->reserved == 0);
   const auto* items = protocol::stage2_score_many_items(wire.data());
   assert(items[0].query_index == 0 && items[1].query_index == 0);
   assert(items[2].query_index == 1 && items[3].query_index == 2);
@@ -383,54 +380,11 @@ void test_partition_bounds_retry_and_cancellation() {
   assert(outbox.aggregate_size() == 0);
 
   const std::vector<std::uint32_t> query_index{0};
-  auto authoritative = score_request(query_index, 1, 10000, 81);
-  auto speculative = score_request(
-    query_index, 1, 11000, 91,
-    protocol::kStage2ScoreManyFlagSpeculative);
+  auto invalid_reserved = score_request(query_index, 1, 10000, 81);
+  protocol::stage2_score_many_header(invalid_reserved.data())->reserved = 1;
   assert(outbox.try_enqueue(dispatch(
            41, 1, protocol::PeerRpcType::stage2_score_many_request,
-           1, authoritative)) == detail::Stage2HomeRpcEnqueueResult::enqueued);
-  assert(outbox.try_enqueue(dispatch(
-           42, 1, protocol::PeerRpcType::stage2_score_many_request,
-           1, speculative, true)) ==
-         detail::Stage2HomeRpcEnqueueResult::enqueued);
-  assert(outbox.queued_size(
-           1, protocol::PeerRpcType::stage2_score_many_request, false) == 1);
-  assert(outbox.queued_size(
-           1, protocol::PeerRpcType::stage2_score_many_request, true) == 1);
-  const auto auth_aggregate = outbox.form_aggregate(
-    1, protocol::PeerRpcType::stage2_score_many_request,
-    9004, 0, false);
-  assert(auth_aggregate.has_value() && auth_aggregate->logical_count == 1);
-  const auto spec_aggregate = outbox.form_aggregate(
-    1, protocol::PeerRpcType::stage2_score_many_request,
-    9005, 0, true);
-  assert(spec_aggregate.has_value() && spec_aggregate->logical_count == 1);
-  assert(outbox.discard_aggregate(9004));
-  assert(outbox.discard_aggregate(9005));
-
-  auto auth_expand = expand_request(1, 12000, 101);
-  auto spec_expand = expand_request(1, 13000, 111);
-  assert(outbox.try_enqueue(dispatch(
-           51, 1, protocol::PeerRpcType::stage2_expand_score_request,
-           1, auth_expand, false)) ==
-         detail::Stage2HomeRpcEnqueueResult::enqueued);
-  assert(outbox.try_enqueue(dispatch(
-           52, 1, protocol::PeerRpcType::stage2_expand_score_request,
-           1, spec_expand, true)) ==
-         detail::Stage2HomeRpcEnqueueResult::enqueued);
-  const auto auth_expand_aggregate = outbox.form_aggregate(
-    1, protocol::PeerRpcType::stage2_expand_score_request,
-    9006, 0, false);
-  const auto spec_expand_aggregate = outbox.form_aggregate(
-    1, protocol::PeerRpcType::stage2_expand_score_request,
-    9007, 0, true);
-  assert(auth_expand_aggregate.has_value() &&
-         auth_expand_aggregate->logical_count == 1);
-  assert(spec_expand_aggregate.has_value() &&
-         spec_expand_aggregate->logical_count == 1);
-  assert(outbox.discard_aggregate(9006));
-  assert(outbox.discard_aggregate(9007));
+           1, invalid_reserved)) == detail::Stage2HomeRpcEnqueueResult::invalid);
   assert(outbox.size() == 0);
 }
 
@@ -448,7 +402,7 @@ void test_leased_partial_cancel_retries_only_live_members() {
            1, second)) == detail::Stage2HomeRpcEnqueueResult::enqueued);
   const auto aggregate = outbox.form_aggregate(
     3, protocol::PeerRpcType::stage2_score_many_request,
-    9010, 0, false);
+    9010, 0);
   assert(aggregate.has_value() && aggregate->logical_count == 2);
   const std::vector<byte_t> original_wire = claim_for_response(
     outbox, 9010, aggregate->request_bytes);
@@ -493,7 +447,7 @@ void test_leased_partial_cancel_retries_only_live_members() {
   assert(outbox.cancel_logical(62));
   assert(outbox.release_demux(first_demux->lease));
   const auto retry = outbox.next_retry_wire_request(
-    3, protocol::PeerRpcType::stage2_score_many_request, false);
+    3, protocol::PeerRpcType::stage2_score_many_request);
   assert(retry.has_value() && *retry == 9010);
   const std::vector<byte_t> retry_wire = claim_for_response(
     outbox, 9010, aggregate->request_bytes);
@@ -799,6 +753,38 @@ void test_singleton_direct_and_multi_logical_aggregate_coexist() {
   assert(outbox.size() == 0 && outbox.aggregate_size() == 0);
 }
 
+void test_direct_mode_drains_a_multi_logical_queue_without_combining() {
+  detail::Stage2HomeRpcOutbox outbox(
+    8, 4, 5, 32, 256, 256, 1u << 20);
+  auto first = expand_request(1, 22500, 205);
+  auto second = expand_request(1, 22600, 206);
+  constexpr std::uint32_t peer = 3;
+  assert(outbox.try_enqueue(dispatch(
+           831, peer,
+           protocol::PeerRpcType::stage2_expand_score_request, 1, first)) ==
+         detail::Stage2HomeRpcEnqueueResult::enqueued);
+  assert(outbox.try_enqueue(dispatch(
+           832, peer,
+           protocol::PeerRpcType::stage2_expand_score_request, 1, second)) ==
+         detail::Stage2HomeRpcEnqueueResult::enqueued);
+
+  assert(!outbox.form_singleton_direct(
+    peer, protocol::PeerRpcType::stage2_expand_score_request, 0).has_value());
+  const auto first_direct = outbox.form_singleton_direct(
+    peer, protocol::PeerRpcType::stage2_expand_score_request, 0,
+    false);
+  assert(first_direct.has_value() && first_direct->direct &&
+         first_direct->wire_request_id == 831);
+  assert(outbox.discard_aggregate(831));
+  const auto second_direct = outbox.form_singleton_direct(
+    peer, protocol::PeerRpcType::stage2_expand_score_request, 0,
+    false);
+  assert(second_direct.has_value() && second_direct->direct &&
+         second_direct->wire_request_id == 832);
+  assert(outbox.discard_aggregate(832));
+  assert(outbox.size() == 0 && outbox.aggregate_size() == 0);
+}
+
 void test_singleton_direct_validation_and_semantic_rearm() {
   detail::Stage2HomeRpcOutbox outbox(
     8, 4, 5, 32, 256, 256, 1u << 20);
@@ -1004,6 +990,7 @@ int main() {
   test_deadline_gate_recomputes_after_stale_earliest_owner();
   test_singleton_direct_send_failure_and_cancel();
   test_singleton_direct_and_multi_logical_aggregate_coexist();
+  test_direct_mode_drains_a_multi_logical_queue_without_combining();
   test_singleton_direct_validation_and_semantic_rearm();
   test_singleton_direct_response_cancel_race();
   return 0;

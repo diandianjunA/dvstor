@@ -25,42 +25,16 @@ int main() {
     .stage2_graph_prefetch_issued = 12,
     .stage2_graph_prefetch_hits = 8,
     .stage2_graph_prefetch_wasted = 2,
-    .stage2_score_prefetch_issued = 30,
-    .stage2_score_prefetch_hits = 24,
-    .stage2_score_prefetch_wasted = 3,
     .stage2_home_rpc_batches = 7,
     .stage2_home_rpc_items = 19,
     .maintenance_lost_wake_avoided = 23,
-    .packing_target_batch = 4,
+    .packing_target_batch = 8,
     .packing_waited_batches = 11,
-    .packing_rollbacks = 2,
-    .stage2_independent_score_rpc_batches = 5,
-    .stage2_independent_score_issued = 160,
-    .stage2_independent_score_useful = 96,
-    .stage2_independent_score_wasted = 64,
     .completion_incomplete = 6,
     .completion_logical_full_failures = 7,
     .completion_physical_full_failures = 1,
-    .active_stage2_tasks = 17,
-    .active_stage2_task_limit = 320,
-    .active_stage2_contexts = 39,
-    .active_stage2_context_limit = 40,
-    .active_stage2_context_limit_baseline = 32,
-    .active_stage2_context_limit_max = 48,
-    .active_stage2_task_limit_baseline = 256,
-    .active_stage2_task_limit_max = 384,
-    .stage2_budget_promotions = 1,
-    .stage2_budget_rollbacks = 0,
-    .stage2_budget_rate_rollbacks = 1,
-    .stage2_budget_rate_trials_accepted = 2,
-    .stage2_budget_high_backlog_samples = 7,
-    .stage2_budget_lane_headroom_samples = 5,
-    .stage2_budget_stable_rate_milli_per_sec = 1'200'000,
-    .stage2_budget_trial_baseline_rate_milli_per_sec = 1'100'000,
-    .stage2_budget_rate_trial_pending = 1,
-    .stage2_budget_promotion_context_limit = 40,
-    .maintenance_periodic_fallback_audits = 99,
-    .maintenance_periodic_fallback_recoveries = 7,
+    .active_stage2_contexts = 31,
+    .active_stage2_context_limit = 32,
   };
   first.stage2_delay_histogram[6] = 12;
   telemetry::publish(control_page.data(), first);
@@ -77,41 +51,16 @@ int main() {
   assert(copied.stage2_delay_histogram[6] == 12);
   assert(copied.stage2_graph_prefetch_issued == 12);
   assert(copied.stage2_graph_prefetch_hits == 8);
-  assert(copied.stage2_score_prefetch_issued == 30);
-  assert(copied.stage2_score_prefetch_hits == 24);
   assert(copied.stage2_home_rpc_batches == 7);
   assert(copied.stage2_home_rpc_items == 19);
   assert(copied.maintenance_lost_wake_avoided == 23);
-  assert(copied.packing_target_batch == 4);
+  assert(copied.packing_target_batch == 8);
   assert(copied.packing_waited_batches == 11);
-  assert(copied.packing_rollbacks == 2);
-  assert(copied.stage2_independent_score_rpc_batches == 5);
-  assert(copied.stage2_independent_score_issued == 160);
-  assert(copied.stage2_independent_score_useful == 96);
   assert(copied.completion_incomplete == 6);
   assert(copied.completion_logical_full_failures == 7);
   assert(copied.completion_physical_full_failures == 1);
-  assert(copied.active_stage2_tasks == 17);
-  assert(copied.active_stage2_task_limit == 320);
-  assert(copied.active_stage2_contexts == 39);
-  assert(copied.active_stage2_context_limit == 40);
-  assert(copied.active_stage2_context_limit_baseline == 32);
-  assert(copied.active_stage2_context_limit_max == 48);
-  assert(copied.active_stage2_task_limit_baseline == 256);
-  assert(copied.active_stage2_task_limit_max == 384);
-  assert(copied.stage2_budget_promotions == 1);
-  assert(copied.stage2_budget_rollbacks == 0);
-  assert(copied.stage2_budget_rate_rollbacks == 1);
-  assert(copied.stage2_budget_rate_trials_accepted == 2);
-  assert(copied.stage2_budget_high_backlog_samples == 7);
-  assert(copied.stage2_budget_lane_headroom_samples == 5);
-  assert(copied.stage2_budget_stable_rate_milli_per_sec == 1'200'000);
-  assert(copied.stage2_budget_trial_baseline_rate_milli_per_sec ==
-         1'100'000);
-  assert(copied.stage2_budget_rate_trial_pending == 1);
-  assert(copied.stage2_budget_promotion_context_limit == 40);
-  assert(copied.maintenance_periodic_fallback_audits == 99);
-  assert(copied.maintenance_periodic_fallback_recoveries == 7);
+  assert(copied.active_stage2_contexts == 31);
+  assert(copied.active_stage2_context_limit == 32);
 
   telemetry::Snapshot second = first;
   second.published_steady_ns = 200;

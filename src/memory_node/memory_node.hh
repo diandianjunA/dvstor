@@ -38,7 +38,6 @@
 #include "memory_node/storage_reclaim.hh"
 #include "memory_node/storage_owner_index/dynamic_allocation_receipt_policy.hh"
 #include "memory_node/storage_owner_index/incarnation_lock.hh"
-#include "memory_node/storage_owner_maintenance/independent_score_policy.hh"
 #include "memory_node/storage_owner_maintenance/home_rpc_outbox.hh"
 #include "memory_node/storage_owner_maintenance/ready_context_queue.hh"
 #include "memory_node/storage_owner_maintenance/reverse_outbox.hh"
@@ -92,10 +91,6 @@ class MemoryNode {
     // here until an asynchronous registered send slot is available.
     vec<byte_t> payload;
     bool graph_response{};
-    // Independent exact-score lookahead uses a separately bounded response
-    // queue and only surplus SEND slots. It must never queue ahead of an
-    // authoritative graph dependency from this or another sender.
-    bool speculative{};
     std::chrono::steady_clock::time_point queued_at{};
   };
 
@@ -109,10 +104,6 @@ class MemoryNode {
     service::storage_owner::PeerRpcHeader header{};
     memory_node_detail::PeerRequestLease dedup_lease{};
     vec<byte_t> payload;
-    // Set only for a score-many request carrying the validated speculative
-    // wire flag. Scheduler and response isolation never infer priority from
-    // request type because authoritative score-many uses the same payload.
-    bool speculative{};
     // Execute/arm/abort tokens tracked by the bounded per-operation in-flight
     // table. Release tokens are deliberately excluded: a release probes this
     // table and returns an explicit retry while an older same-token operation
@@ -195,7 +186,6 @@ class MemoryNode {
     bool arming{};
     bool armed{};
     bool aborted{};
-    bool stage1_prune_deferred{};
   };
 
   static constexpr size_t kStage1PreparedShardCount = 64;
@@ -283,13 +273,6 @@ class MemoryNode {
     // then-current adjacency against this captured baseline, so reverse edges
     // added while stage2 was queued/in flight are rebased instead of lost.
     vec<RemotePtr> stage1_base_neighbors;
-    // With deferred Stage1 pruning, base_neighbors is the exact provisional
-    // adjacency that was published at ACK. This separate seed is the exact
-    // RobustPrune result reconstructed from the converged local Beam before
-    // final global pruning.
-    vec<RemotePtr> stage1_pruned_neighbors;
-    bool stage1_prune_deferred{};
-    bool stage1_prune_materialized{};
     vec<RemotePtr> stage2_neighbors;
     // Protected children captured at the same locked boundary that freezes
     // the source graph. They are preserved at an in-place destination and
@@ -460,10 +443,6 @@ private:
     stage1,
     graph_update,
     control,
-    // Borrows only surplus graph-update slots and is never the physical class
-    // of a slot. try_acquire keeps one authoritative slot reserved, while
-    // release classifies the borrowed slot back as graph_update.
-    speculative,
   };
 
   // Lifecycle and commands
@@ -603,10 +582,6 @@ private:
                                       u32& slot_id);
   PeerRpcSendClass peer_rpc_send_slot_class(u32 slot_id) const;
   void release_peer_rpc_send_slot(u32 peer_id, u32 slot_id);
-  bool try_reserve_peer_rpc_speculative_credit(u32 peer_id,
-                                               u64 request_id);
-  void release_peer_rpc_speculative_credit(u32 peer_id, u64 request_id);
-  void fail_closed_peer_rpc_speculative_credit(u32 peer_id, u64 request_id);
   void repost_peer_rpc_receive(u32 peer_id, u32 slot_id);
   void post_peer_rpc_send_slot(u32 peer_id, u32 slot_id, size_t bytes);
   void send_peer_rpc_message(u32 peer_id, const void* payload, size_t bytes);
@@ -729,12 +704,10 @@ private:
     u64 logical_request_id,
     u32 item_count,
     span<const byte_t> request,
-    bool speculative,
     PeerResponseCompletionTarget completion_target);
   bool try_drive_stage2_home_rpc_requests(
     u32 target_shard,
-    service::storage_owner::PeerRpcType request_type,
-    bool speculative);
+    service::storage_owner::PeerRpcType request_type);
   bool cancel_stage2_home_rpc_request(u64 logical_request_id);
   bool try_handle_stage2_home_rpc_aggregate_response(
     u32 peer_id,
@@ -863,16 +836,13 @@ private:
                                                    u32 work_items);
   bool storage_owner_cleanup_ready(u64 sequence) const;
   void publish_storage_owner_maintenance_watermarks();
-  void mark_storage_owner_foreground_activity();
   void log_storage_owner_maintenance_observation(size_t stage2_remaining,
                                                  size_t cleanup_remaining,
                                                  bool final);
   void maybe_log_storage_owner_maintenance_observation();
-  void maybe_adjust_storage_owner_stage2_execution_budget();
   void storage_owner_maintenance_worker_loop(u32 worker_id);
-  bool storage_owner_maintenance_foreground_busy(const Configuration& config);
   bool try_acquire_storage_owner_maintenance_slot(
-      const Configuration& config, bool foreground_pressure);
+      const Configuration& config);
   memory_node_storage_owner_index_detail::IncarnationLockResult
     try_lock_node(RemotePtr rptr);
   bool storage_owner_task_current(node_t id, u32 generation, RemotePtr target);
@@ -1188,6 +1158,7 @@ private:
   PeerRpcRuntimeState peer_rpc_runtime_;
   std::unique_ptr<PeerAsyncResponseRegistry> peer_async_responses_;
   std::unique_ptr<Stage2HomeRpcOutbox> stage2_home_rpc_outbox_;
+  bool stage2_home_rpc_combining_{true};
   std::unique_ptr<PeerRequestDeduplicator> peer_request_deduplicator_;
   std::mutex peer_send_cq_mutex_;
   std::mutex peer_completion_mutex_;
@@ -1216,12 +1187,6 @@ private:
   std::unique_ptr<StorageOwnerMaintenanceWaiterSet[]>
     peer_rpc_send_slot_waiters_;
   size_t peer_rpc_send_slot_waiter_count_{};
-  // A SEND slot is released at its local CQE, long before the peer response.
-  // Keep a separate request-lifetime credit so independent lookahead cannot
-  // pile up behind authoritative work at a slow peer. UINT64_MAX is a
-  // fail-closed owner: a posted request was locally abandoned without a
-  // matching response, so speculation to that peer stays disabled.
-  vec<u64> peer_rpc_speculative_credit_owner_;
   // Accessed only while peer_completion_mutex_ is held.  They deliberately
   // wrap; allocation probes past every still-live ID in that namespace.
   u32 peer_sync_wr_id_counter_{1};
@@ -1250,17 +1215,6 @@ private:
   // has its own bound, so an expansion burst cannot reject or starve new
   // mutations before they publish their Stage1 graph.
   std::deque<PeerStage1Task> peer_stage2_home_tasks_;
-  // Independent exact-score requests are bounded separately and dequeued only
-  // after the authoritative home queue. At most one queued/in-flight request
-  // is admitted per source shard, preventing one sender from externalizing
-  // speculative load onto other senders.
-  std::deque<PeerStage1Task> peer_stage2_home_speculative_tasks_;
-  vec<bool> peer_stage2_home_speculative_source_active_;
-  size_t peer_stage2_home_speculative_task_limit_{1};
-  // Claimed while holding peer_stage1_tasks_mutex_ before a low-priority
-  // task leaves its queue. A global credit of one prevents several senders
-  // from occupying every physical-home lane at once.
-  u32 peer_stage2_home_speculative_execution_limit_{1};
   // Execute requests whose ANN artifact is already prepared but whose fused
   // Stage2 admission window is full.  They retain their request-dedup lease
   // and per-token in-flight ownership, so a duplicate wire request can be
@@ -1301,10 +1255,8 @@ private:
   std::deque<PeerPhysicalControlTask> peer_placement_control_tasks_;
   std::unique_ptr<bounded::Queue<PeerReverseUpdateResponse>>
     peer_reverse_responses_;
-  std::unique_ptr<bounded::Queue<PeerReverseUpdateResponse>>
-    peer_speculative_responses_;
-  // Producers take this mutex while publishing either response class, closing
-  // the predicate/notify race for the shared strict-priority dispatcher.
+  // Producers take this mutex while publishing responses, closing the
+  // predicate/notify race for the dispatcher.
   std::mutex peer_response_wait_mutex_;
   std::condition_variable peer_response_wait_cv_;
   std::mutex peer_graph_response_buffers_mutex_;
@@ -1357,9 +1309,6 @@ private:
   std::atomic<u64> peer_stage1_max_admission_waiters_{0};
   std::atomic<u32> peer_stage1_active_workers_{0};
   std::atomic<u32> peer_stage2_home_active_workers_{0};
-  std::atomic<u32> peer_stage2_home_speculative_active_workers_{0};
-  bool peer_stage2_home_dedicated_{};
-  bool peer_stage2_home_speculation_enabled_{};
   std::array<Stage1PreparedResultShard,
              kStage1PreparedShardCount> stage1_prepared_results_;
   std::array<Stage1InflightRequestShard,
@@ -1413,8 +1362,6 @@ private:
   std::atomic<u64> storage_owner_maintenance_ready_tickets_drained_{0};
   std::atomic<u64> storage_owner_maintenance_ready_overflow_scans_{0};
   std::atomic<u64> storage_owner_maintenance_ready_fallback_scans_{0};
-  std::atomic<u64> storage_owner_maintenance_periodic_fallback_audits_{0};
-  std::atomic<u64> storage_owner_maintenance_periodic_fallback_recoveries_{0};
   // Every worker owns enough registered scratch for its bounded local context
   // pool, while this node-wide lease is the authoritative active-lane bound.
   // This turns a fixed per-worker 2-lane partition into a work-conserving
@@ -1429,18 +1376,7 @@ private:
   std::array<std::atomic<u32>, CPU_SETSIZE>
     storage_owner_search_lane_grants_{};
   memory_node_storage_owner_maintenance_detail::
-    Stage2AdaptivePackingController storage_owner_stage2_packing_;
-  memory_node_storage_owner_maintenance_detail::
-    IndependentScoreController storage_owner_independent_score_;
-  // Production bypass for the independent-score A/B machinery. This is set
-  // before maintenance workers start and is intentionally false until a
-  // dedicated experiment explicitly opts into paying its per-context
-  // registration/feedback cost.
-  bool storage_owner_independent_score_experiment_enabled_{false};
-  // Set before maintenance workers start. A hard runtime cap below four is a
-  // verified legacy policy, whereas target two in an adaptive controller can
-  // merely be the baseline preceding a target-four trial.
-  bool storage_owner_stage2_larger_batch_trials_possible_{};
+    Stage2PackingController storage_owner_stage2_packing_;
   std::deque<StorageOwnerMaintenanceTask> storage_owner_stage2_tasks_;
   // Min-heap ordered by maintenance_sequence then retry_not_before. The
   // predecessor durability rule makes its front the only cleanup that can be
@@ -1487,19 +1423,6 @@ private:
   std::atomic<u64> storage_owner_stage2_graph_prefetch_issued_{0};
   std::atomic<u64> storage_owner_stage2_graph_prefetch_hits_{0};
   std::atomic<u64> storage_owner_stage2_graph_prefetch_wasted_{0};
-  std::atomic<u64> storage_owner_stage2_score_prefetch_issued_{0};
-  std::atomic<u64> storage_owner_stage2_score_prefetch_hits_{0};
-  std::atomic<u64> storage_owner_stage2_score_prefetch_wasted_{0};
-  // Independent score-many lookahead has non-zero RPC/receiver cost and must
-  // never share the near-free in-wave prefetch controller above.
-  std::atomic<u64> storage_owner_stage2_independent_score_rpc_batches_{0};
-  std::atomic<u64> storage_owner_stage2_independent_score_issued_{0};
-  std::atomic<u64> storage_owner_stage2_independent_score_useful_{0};
-  std::atomic<u64> storage_owner_stage2_independent_score_wasted_{0};
-  std::atomic<u64> storage_owner_stage2_score_feedback_base_hits_{0};
-  std::atomic<u64> storage_owner_stage2_score_feedback_base_wasted_{0};
-  std::atomic<u64> storage_owner_stage2_score_feedback_next_outcome_{512};
-  std::atomic<bool> storage_owner_stage2_score_prefetch_enabled_{true};
   // A 512-outcome rolling window bounds adaptation time after workload drift;
   // the cumulative counters above remain the externally reported telemetry.
   std::atomic<u64> storage_owner_stage2_graph_feedback_base_hits_{0};
@@ -1545,48 +1468,11 @@ private:
   std::atomic<u64> storage_owner_maintenance_worker_idle_waits_{0};
   std::atomic<u64> storage_owner_maintenance_worker_idle_ns_{0};
   std::atomic<u32> storage_owner_maintenance_active_workers_{0};
-  // Exact number of finalize-insert descriptors currently owned by active
-  // Stage2 contexts. Accepted descriptors that remain in the queue are not
-  // counted: this is background execution pressure, never Stage1 ACK credit.
-  std::atomic<u32> storage_owner_maintenance_active_tasks_{0};
-  // Current limits are adaptive execution targets. A downward transition can
-  // temporarily leave the live gauges above the new target; admission stops
-  // immediately and existing contexts retire normally under the immutable
-  // hard maxima.
-  std::atomic<u32> storage_owner_maintenance_contexts_per_worker_limit_{1};
-  u32 storage_owner_maintenance_contexts_per_worker_baseline_{1};
-  u32 storage_owner_maintenance_contexts_per_worker_max_{1};
-  std::atomic<u32> storage_owner_stage2_budget_promotion_ceiling_{1};
-  std::atomic<u32> storage_owner_maintenance_active_task_limit_{1};
-  u32 storage_owner_maintenance_active_task_limit_baseline_{1};
-  u32 storage_owner_maintenance_active_task_limit_max_{1};
-  std::atomic<bool> storage_owner_stage2_budget_sample_busy_{false};
-  std::atomic<u64> storage_owner_stage2_budget_last_sample_ns_{0};
-  std::atomic<u64> storage_owner_stage2_budget_last_lane_blocks_{0};
-  std::atomic<u64> storage_owner_stage2_budget_last_processed_{0};
-  std::atomic<u32> storage_owner_stage2_budget_promotion_streak_{0};
-  std::atomic<u32> storage_owner_stage2_budget_lane_pressure_streak_{0};
-  std::atomic<u32> storage_owner_stage2_budget_low_backlog_streak_{0};
-  std::atomic<u32> storage_owner_stage2_budget_cooldown_{0};
-  std::atomic<u64> storage_owner_stage2_budget_stable_rate_milli_{0};
-  std::atomic<u64> storage_owner_stage2_budget_trial_baseline_rate_milli_{0};
-  std::atomic<u32> storage_owner_stage2_budget_trial_regression_streak_{0};
-  std::atomic<u32> storage_owner_stage2_budget_trial_success_streak_{0};
-  std::atomic<bool> storage_owner_stage2_budget_rate_trial_pending_{false};
-  std::atomic<u64> storage_owner_stage2_budget_promotions_{0};
-  std::atomic<u64> storage_owner_stage2_budget_rollbacks_{0};
-  std::atomic<u64> storage_owner_stage2_budget_lane_rollbacks_{0};
-  std::atomic<u64> storage_owner_stage2_budget_low_backlog_rollbacks_{0};
-  std::atomic<u64> storage_owner_stage2_budget_rate_rollbacks_{0};
-  std::atomic<u64> storage_owner_stage2_budget_rate_trials_accepted_{0};
-  std::atomic<u64> storage_owner_stage2_budget_high_backlog_samples_{0};
-  std::atomic<u64> storage_owner_stage2_budget_lane_headroom_samples_{0};
   std::atomic<u64> storage_owner_maintenance_started_ns_{0};
   std::atomic<u64> storage_owner_maintenance_last_observation_ns_{0};
   std::atomic<u64> storage_owner_maintenance_finalize_latency_ns_{0};
   std::atomic<u64> storage_owner_maintenance_finalize_max_latency_ns_{0};
   std::array<std::atomic<u64>, 18> storage_owner_maintenance_finalize_latency_buckets_{};
-  std::atomic<u64> storage_owner_foreground_last_active_ns_{0};
   std::unique_ptr<bounded::SlidingCompletionRing>
     storage_owner_maintenance_completion_ring_;
   // Maximum accepted-but-not-yet-complete Stage2 descriptors. This is the
@@ -1612,7 +1498,6 @@ private:
   vec<u_ptr<StorageOwnerThread>> storage_owner_threads_;
   vec<std::thread> storage_insert_workers_;
   std::atomic<bool> storage_insert_shutdown_{false};
-  std::atomic<u32> storage_owner_insert_active_workers_{0};
   const u64 mn_memory_bytes_;
   timing::Timing timing_;
   filepath_t index_prefix_;

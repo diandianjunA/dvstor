@@ -30,44 +30,31 @@ void MemoryNode::peer_rpc_progress_loop() {
     // Drain only work that was already visible at this progress tick. There
     // is no aggregation timer: concurrent producers naturally share one
     // prefix, while a lone producer is posted immediately on the next tick.
-    const auto drive_ready_class = [&](const auto request_type,
-                                       const bool speculative) {
+    const auto drive_ready_class = [&](const auto request_type) {
       if (stage2_home_rpc_outbox_ == nullptr) return;
       const u64 ready_peers = stage2_home_rpc_outbox_->ready_peer_mask(
-        request_type, speculative);
+        request_type);
       for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
         if (peer_id != storage_id_ &&
             (ready_peers & (u64{1} << peer_id)) != 0) {
           (void)try_drive_stage2_home_rpc_requests(
-            peer_id, request_type, speculative);
+            peer_id, request_type);
         }
       }
     };
     drive_ready_class(
-      service::storage_owner::PeerRpcType::stage2_expand_score_request,
-      false);
+      service::storage_owner::PeerRpcType::stage2_expand_score_request);
     drive_ready_class(
-      service::storage_owner::PeerRpcType::stage2_score_many_request,
-      false);
-    drive_ready_class(
-      service::storage_owner::PeerRpcType::stage2_expand_score_request,
-      true);
-    drive_ready_class(
-      service::storage_owner::PeerRpcType::stage2_score_many_request,
-      true);
+      service::storage_owner::PeerRpcType::stage2_score_many_request);
     const i32 num_received =
       peer_context_->poll_recv_cq(recv_wcs.data(), static_cast<i32>(recv_wcs.size()));
     if (num_received <= 0) {
       bool responses_empty = false;
       bool sends_empty = false;
       if (peer_reverse_response_done_.load(std::memory_order_acquire)) {
-        const bool authoritative_empty =
+        responses_empty =
           peer_reverse_responses_ == nullptr ||
           peer_reverse_responses_->empty();
-        const bool speculative_empty =
-          peer_speculative_responses_ == nullptr ||
-          peer_speculative_responses_->empty();
-        responses_empty = authoritative_empty && speculative_empty;
         {
           std::lock_guard<std::mutex> lock(peer_completion_mutex_);
           sends_empty = peer_pending_sends_.empty();
@@ -244,24 +231,29 @@ void MemoryNode::peer_rpc_progress_loop() {
           // Reconciliation replies contain one postcondition per operation.
           // Re-execute an identical request ID instead of replaying the
           // generic header-only cache; every operation is idempotent.
-          const auto decision = peer_request_deduplicator_->begin(
-            peer_id, *header, false);
-          if (decision.action ==
-              memory_node_detail::PeerRequestAction::execute) {
-            const auto* ops =
-              service::storage_owner::reconcile_reverse_ops(payload);
-            PeerReverseUpdateTask task;
-            task.source_shard = peer_id;
-            task.header = *header;
-            task.dedup_lease = decision.lease;
-            task.received_at = std::chrono::steady_clock::now();
-            task.reconcile_ops.assign(ops, ops + header->item_count);
-            if (!enqueue_peer_reverse_update_task(std::move(task))) {
-              lib_assert(peer_request_deduplicator_->abandon(
-                           decision.lease, peer_id, *header),
-                         "reconcile request lost its dedup lease");
-              enqueue_peer_reverse_update_response(
-                peer_id, *header, false);
+          const auto* ops =
+            service::storage_owner::reconcile_reverse_ops(payload);
+          const bool valid_ops = std::all_of(
+            ops, ops + header->item_count,
+            service::storage_owner::reconcile_reverse_op_valid);
+          if (valid_ops) {
+            const auto decision = peer_request_deduplicator_->begin(
+              peer_id, *header, false);
+            if (decision.action ==
+                memory_node_detail::PeerRequestAction::execute) {
+              PeerReverseUpdateTask task;
+              task.source_shard = peer_id;
+              task.header = *header;
+              task.dedup_lease = decision.lease;
+              task.received_at = std::chrono::steady_clock::now();
+              task.reconcile_ops.assign(ops, ops + header->item_count);
+              if (!enqueue_peer_reverse_update_task(std::move(task))) {
+                lib_assert(peer_request_deduplicator_->abandon(
+                             decision.lease, peer_id, *header),
+                           "reconcile request lost its dedup lease");
+                enqueue_peer_reverse_update_response(
+                  peer_id, *header, false);
+              }
             }
           }
         }
@@ -389,8 +381,7 @@ void MemoryNode::peer_rpc_progress_loop() {
             service::storage_owner::stage2_score_many_request_bytes(
               header->item_count, query_count);
           if (query_count != 0 && query_count <= header->item_count &&
-              service::storage_owner::stage2_score_many_flags_valid(
-                own_header->flags) &&
+              own_header->reserved == 0 &&
               bytes == expected_bytes) {
             const auto decision = peer_request_deduplicator_->begin(
               peer_id, *header, false);
@@ -728,15 +719,13 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
       peer_stage1_tasks_cv_.wait(lock, [&]() {
         return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
           memory_node_peer_rpc_detail::stage1_worker_has_eligible_task(
-            peer_stage2_home_dedicated_, !peer_stage1_tasks_.empty(),
-            !peer_stage2_home_tasks_.empty(),
-            !peer_stage2_home_speculative_tasks_.empty());
+            !peer_stage1_tasks_.empty(),
+            !peer_stage2_home_tasks_.empty());
       });
       if (peer_reverse_shutdown_.load(std::memory_order_acquire) &&
           !memory_node_peer_rpc_detail::stage1_worker_has_eligible_task(
-            peer_stage2_home_dedicated_, !peer_stage1_tasks_.empty(),
-            !peer_stage2_home_tasks_.empty(),
-            !peer_stage2_home_speculative_tasks_.empty())) {
+            !peer_stage1_tasks_.empty(),
+            !peer_stage2_home_tasks_.empty())) {
         current_storage_owner_thread_ = nullptr;
         return;
       }
@@ -749,18 +738,14 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
     PeerStage1Task task;
     {
       std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
-      // Dedicated Stage2-home workers own their queue. A Stage1 worker can be
-      // woken by the shared condition variable while only that foreign queue
-      // is non-empty; in that case it has no eligible task and must go back
-      // to sleep instead of asserting on an empty Stage1 queue.
+      // Stage1 workers share the authoritative-home queue with its reserved
+      // worker, so either queue is eligible after the shared wakeup.
       if (!memory_node_peer_rpc_detail::stage1_worker_has_eligible_task(
-            peer_stage2_home_dedicated_, !peer_stage1_tasks_.empty(),
-            !peer_stage2_home_tasks_.empty(),
-            !peer_stage2_home_speculative_tasks_.empty())) {
+            !peer_stage1_tasks_.empty(),
+            !peer_stage2_home_tasks_.empty())) {
         continue;
       }
       const bool take_authoritative_home =
-        !peer_stage2_home_dedicated_ &&
         memory_node_peer_rpc_detail::dequeue_stage2_home_first(
           !peer_stage1_tasks_.empty(), !peer_stage2_home_tasks_.empty(),
           peer_stage1_tasks_.empty() ? 0 : static_cast<u64>(
@@ -793,8 +778,6 @@ void MemoryNode::peer_stage1_worker_loop(u32 worker_id) {
       request_type ==
         service::storage_owner::PeerRpcType::stage2_score_many_request;
     if (stage2_home) {
-      lib_assert(!task.speculative,
-                 "shared Stage1 worker consumed speculative home work");
       const auto execution_started = std::chrono::steady_clock::now();
       peer_stage2_home_queue_wait_ns_.fetch_add(
         static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1033,49 +1016,16 @@ void MemoryNode::peer_stage2_home_worker_loop(u32 worker_id) {
     {
       std::unique_lock<std::mutex> lock(peer_stage1_tasks_mutex_);
       peer_stage1_tasks_cv_.wait(lock, [&]() {
-        const bool speculative_runnable =
-          !peer_stage2_home_speculative_tasks_.empty() &&
-          memory_node_peer_rpc_detail::
-            speculative_score_execution_admissible(
-              peer_stage2_home_speculation_enabled_,
-              peer_stage2_home_speculative_active_workers_.load(
-                std::memory_order_acquire),
-              peer_stage2_home_speculative_execution_limit_);
         return peer_reverse_shutdown_.load(std::memory_order_acquire) ||
-               !peer_stage2_home_tasks_.empty() ||
-               speculative_runnable;
+               !peer_stage2_home_tasks_.empty();
       });
       if (peer_reverse_shutdown_.load(std::memory_order_acquire) &&
-          peer_stage2_home_tasks_.empty() &&
-          peer_stage2_home_speculative_tasks_.empty()) {
+          peer_stage2_home_tasks_.empty()) {
         current_storage_owner_thread_ = nullptr;
         return;
       }
-      const bool speculative_runnable =
-        !peer_stage2_home_speculative_tasks_.empty() &&
-        memory_node_peer_rpc_detail::
-          speculative_score_execution_admissible(
-            peer_stage2_home_speculation_enabled_,
-            peer_stage2_home_speculative_active_workers_.load(
-              std::memory_order_acquire),
-            peer_stage2_home_speculative_execution_limit_);
-      const auto choice =
-        memory_node_peer_rpc_detail::choose_authoritative_first(
-          !peer_stage2_home_tasks_.empty(),
-          speculative_runnable, true);
-      if (choice == memory_node_peer_rpc_detail::PriorityQueueChoice::none) {
-        continue;
-      }
-      if (choice == memory_node_peer_rpc_detail::PriorityQueueChoice::
-                      authoritative) {
-        task = std::move(peer_stage2_home_tasks_.front());
-        peer_stage2_home_tasks_.pop_front();
-      } else {
-        task = std::move(peer_stage2_home_speculative_tasks_.front());
-        peer_stage2_home_speculative_tasks_.pop_front();
-        peer_stage2_home_speculative_active_workers_.fetch_add(
-          1, std::memory_order_acq_rel);
-      }
+      task = std::move(peer_stage2_home_tasks_.front());
+      peer_stage2_home_tasks_.pop_front();
     }
     peer_stage1_tasks_cv_.notify_all();
 
@@ -1114,21 +1064,6 @@ void MemoryNode::peer_stage2_home_worker_loop(u32 worker_id) {
       static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - execution_started).count()),
       std::memory_order_relaxed);
-    if (task.speculative) {
-      {
-        std::lock_guard<std::mutex> lock(peer_stage1_tasks_mutex_);
-        lib_assert(task.source_shard <
-                     peer_stage2_home_speculative_source_active_.size() &&
-                   peer_stage2_home_speculative_source_active_[
-                     task.source_shard],
-                   "speculative home task lost per-source admission");
-        peer_stage2_home_speculative_source_active_[task.source_shard] =
-          false;
-        peer_stage2_home_speculative_active_workers_.fetch_sub(
-          1, std::memory_order_acq_rel);
-      }
-      peer_stage1_tasks_cv_.notify_all();
-    }
   }
 }
 
@@ -1138,34 +1073,21 @@ void MemoryNode::peer_reverse_response_loop() {
     {
       std::unique_lock<std::mutex> lock(peer_response_wait_mutex_);
       peer_response_wait_cv_.wait(lock, [&]() {
-        const bool authoritative_available =
-          peer_reverse_responses_ != nullptr &&
-          !peer_reverse_responses_->empty();
-        const bool speculative_available =
-          peer_speculative_responses_ != nullptr &&
-          !peer_speculative_responses_->empty();
         return peer_reverse_workers_done_.load(std::memory_order_acquire) ||
-          authoritative_available || speculative_available;
+          (peer_reverse_responses_ != nullptr &&
+           !peer_reverse_responses_->empty());
       });
-      lib_assert(peer_reverse_responses_ != nullptr &&
-                   peer_speculative_responses_ != nullptr,
-                 "peer response queues are not initialized");
-      const auto choice =
-        memory_node_peer_rpc_detail::choose_authoritative_first(
-          !peer_reverse_responses_->empty(),
-          !peer_speculative_responses_->empty());
-      if (choice == memory_node_peer_rpc_detail::PriorityQueueChoice::none) {
+      lib_assert(peer_reverse_responses_ != nullptr,
+                 "peer response queue is not initialized");
+      if (peer_reverse_responses_->empty()) {
         if (peer_reverse_workers_done_.load(std::memory_order_acquire)) {
           peer_reverse_response_done_.store(true, std::memory_order_release);
           return;
         }
         continue;
       }
-      const bool popped = choice ==
-          memory_node_peer_rpc_detail::PriorityQueueChoice::authoritative
-        ? peer_reverse_responses_->try_pop(response)
-        : peer_speculative_responses_->try_pop(response);
-      lib_assert(popped, "peer response priority queue lost its front item");
+      const bool popped = peer_reverse_responses_->try_pop(response);
+      lib_assert(popped, "peer response queue lost its front item");
     }
     send_peer_reverse_update_response(response);
   }

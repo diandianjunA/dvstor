@@ -91,8 +91,6 @@ void test_concurrent_partial_waits_for_the_true_deadline() {
   const auto expired = decide_storage_owner_batch(
     9, 3, 13, 0, 32, 101, 10'101, 10'000);
   assert(expired.max_wait_flush);
-  assert(!expired.occupancy_flush);
-  assert(!expired.adaptive_wait_flush);
   assert(expired.take == 9);
 
   const auto isolated_tail = decide_storage_owner_batch(
@@ -166,17 +164,17 @@ void test_announced_producer_keeps_partial_waiting_until_deadline() {
 
 void test_partial_visible_dequeue_preserves_expired_batch_age() {
   assert(next_storage_owner_batch_observed_ns(
-           100, 2, 1, 3, 1'000) == 100);
+           100, 2, 1'000) == 100);
   assert(next_storage_owner_batch_observed_ns(
-           100, 2, 3, 3, 1'000) == 100);
+           100, 2, 1'000) == 100);
   assert(next_storage_owner_batch_observed_ns(
-           100, 0, 1, 3, 1'000) == 0);
+           100, 0, 1'000) == 0);
 
   // A fully visible large dequeue must not rejuvenate its old remainder.
   // At t=9ms, removing 32 of 44 leaves 12 tasks with the original t=0 age;
   // the next decision at the 10ms hard bound must flush them immediately.
   const u64 inherited = next_storage_owner_batch_observed_ns(
-    100, 12, 32, 32, 9'100);
+    100, 12, 9'100);
   assert(inherited == 100);
   const auto old_tail = decide_storage_owner_batch(
     12, 9, 7, 0, 32, inherited, 10'100, 10'000);

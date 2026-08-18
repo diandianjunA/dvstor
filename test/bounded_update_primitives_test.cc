@@ -797,34 +797,18 @@ void test_stale_stage2_repair_keeps_wire_payload_bound() {
   assert(ring.finalized() == successor_cleanup_sequence);
 }
 
-void test_stage2_admission_yields_only_for_live_foreground_pressure() {
+void test_stage2_admission_depends_only_on_fixed_context_capacity() {
   using memory_node_storage_owner_maintenance_detail::
     Stage2AdmissionDecision;
   using memory_node_storage_owner_maintenance_detail::
     decide_stage2_admission;
 
-  bool pressure_probe_called = false;
-  const auto pressure_probe = [&]() {
-    pressure_probe_called = true;
-    return true;
-  };
-
-  assert(decide_stage2_admission(true, false, pressure_probe) ==
+  assert(decide_stage2_admission(true, false) ==
          Stage2AdmissionDecision::unavailable);
-  assert(!pressure_probe_called);
-  assert(decide_stage2_admission(false, true, pressure_probe) ==
+  assert(decide_stage2_admission(false, true) ==
          Stage2AdmissionDecision::unavailable);
-  assert(!pressure_probe_called);
-  assert(decide_stage2_admission(false, false, pressure_probe) ==
-         Stage2AdmissionDecision::foreground_pressure);
-  assert(pressure_probe_called);
-
-  pressure_probe_called = false;
-  assert(decide_stage2_admission(false, false, [&]() {
-           pressure_probe_called = true;
-           return false;
-         }) == Stage2AdmissionDecision::admit);
-  assert(pressure_probe_called);
+  assert(decide_stage2_admission(false, false) ==
+         Stage2AdmissionDecision::admit);
 }
 
 void test_stage2_pressure_retains_a_dedicated_progress_floor() {
@@ -836,337 +820,18 @@ void test_stage2_pressure_retains_a_dedicated_progress_floor() {
   // Four bounded contexts per worker remain stable across foreground work
   // and drain. Going idle must not expand to the configured depth and move a
   // deep visible queue into hundreds of whole-context barrier chains.
-  assert(stage2_context_admission_limit(2, 16, false) == 8);
-  assert(stage2_context_admission_limit(2, 16, true) == 8);
-  assert(stage2_context_admission_limit(1, 16, true) == 4);
-  assert(stage2_context_admission_limit(3, 1, true) == 3);
-  assert(stage2_context_admission_limit(0, 0, true) == 1);
-  assert(stage2_context_admission_limit(0, 0, false) == 1);
+  assert(stage2_context_admission_limit(2, 16) == 8);
+  assert(stage2_context_admission_limit(1, 16) == 4);
+  assert(stage2_context_admission_limit(3, 1) == 3);
+  assert(stage2_context_admission_limit(0, 0) == 1);
 
   // The global cap alone is not a fair-share policy: a fast worker could
   // otherwise claim all bounded contexts while owning only its own RDMA
   // lanes. Each executor applies the matching local share before the global
   // CAS, so all workers can expose their preallocated lanes.
-  assert(stage2_worker_context_admission_limit(16, true) == 4);
-  assert(stage2_worker_context_admission_limit(1, true) == 1);
-  assert(stage2_worker_context_admission_limit(16, false) == 4);
-  assert(stage2_worker_context_admission_limit(0, false) == 1);
-}
-
-void test_stage2_active_task_budget_is_atomic_and_independent_of_ack() {
-  using memory_node_storage_owner_maintenance_detail::
-    stage2_active_task_limit;
-  using memory_node_storage_owner_maintenance_detail::
-    stage2_active_task_reservation_available;
-  using memory_node_storage_owner_maintenance_detail::
-    try_release_stage2_active_tasks;
-  using memory_node_storage_owner_maintenance_detail::
-    try_reserve_stage2_active_tasks;
-
-  // Production geometry: 8 executors x 4 bounded contexts x the semantic
-  // eight-task execution slice. A smaller accepted window remains the hard
-  // upper bound, but a 65K ACK window does not enlarge active execution.
-  assert(stage2_active_task_limit(8, 8, 65'536) == 256);
-  assert(stage2_active_task_limit(8, 8, 128) == 128);
-  assert(stage2_active_task_limit(1, 1, 65'536) == 4);
-  assert(stage2_active_task_limit(0, 0, 0) == 0);
-
-  assert(stage2_active_task_reservation_available(248, 8, 256));
-  assert(!stage2_active_task_reservation_available(249, 8, 256));
-  assert(!stage2_active_task_reservation_available(0, 0, 256));
-  assert(!stage2_active_task_reservation_available(257, 1, 256));
-
-  std::atomic<u32> active_tasks{0};
-  assert(try_reserve_stage2_active_tasks(active_tasks, 8, 256));
-  assert(try_reserve_stage2_active_tasks(active_tasks, 248, 256));
-  assert(active_tasks.load(std::memory_order_acquire) == 256);
-  assert(!try_reserve_stage2_active_tasks(active_tasks, 1, 256));
-  assert(active_tasks.load(std::memory_order_acquire) == 256);
-  assert(try_release_stage2_active_tasks(active_tasks, 248));
-  assert(try_release_stage2_active_tasks(active_tasks, 8));
-  assert(active_tasks.load(std::memory_order_acquire) == 0);
-  assert(!try_release_stage2_active_tasks(active_tasks, 1));
-
-  // More contenders than the node budget may race at the same admission
-  // edge, but exactly the bounded prefix can own execution debt. Keep every
-  // successful claim live until all contenders have observed the full
-  // counter so an early releaser cannot make the assertion schedule-dependent.
-  constexpr size_t kContenders = 40;
-  std::barrier start(static_cast<std::ptrdiff_t>(kContenders + 1));
-  std::atomic<size_t> attempted{0};
-  std::atomic<size_t> successful{0};
-  std::atomic<bool> release{false};
-  std::array<std::thread, kContenders> contenders;
-  for (std::thread& contender : contenders) {
-    contender = std::thread([&]() {
-      start.arrive_and_wait();
-      const bool reserved = try_reserve_stage2_active_tasks(
-        active_tasks, 8, 256);
-      if (reserved) successful.fetch_add(1, std::memory_order_relaxed);
-      attempted.fetch_add(1, std::memory_order_release);
-      while (!release.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-      }
-      if (reserved) {
-        assert(try_release_stage2_active_tasks(active_tasks, 8));
-      }
-    });
-  }
-  start.arrive_and_wait();
-  while (attempted.load(std::memory_order_acquire) != kContenders) {
-    std::this_thread::yield();
-  }
-  assert(successful.load(std::memory_order_acquire) == 32);
-  assert(active_tasks.load(std::memory_order_acquire) == 256);
-  release.store(true, std::memory_order_release);
-  for (std::thread& contender : contenders) contender.join();
-  assert(active_tasks.load(std::memory_order_acquire) == 0);
-}
-
-void test_stage2_execution_budget_promotes_and_rolls_back_with_hysteresis() {
-  using memory_node_storage_owner_maintenance_detail::
-    Stage2ExecutionBudgetAction;
-  using memory_node_storage_owner_maintenance_detail::
-    Stage2ExecutionBudgetPolicyState;
-  using memory_node_storage_owner_maintenance_detail::
-    Stage2ExecutionBudgetSample;
-  using memory_node_storage_owner_maintenance_detail::
-    decide_stage2_execution_budget;
-  using memory_node_storage_owner_maintenance_detail::
-    stage2_active_task_limit;
-  using memory_node_storage_owner_maintenance_detail::
-    stage2_context_admission_limit;
-  using memory_node_storage_owner_maintenance_detail::
-    stage2_normalized_rate_milli_per_sec;
-
-  // The only production levels are C32/T256, C40/T320, and C48/T384.
-  assert(stage2_context_admission_limit(8, 16, false, 4) == 32);
-  assert(stage2_context_admission_limit(8, 16, true, 5) == 40);
-  assert(stage2_context_admission_limit(8, 16, false, 6) == 48);
-  assert(stage2_context_admission_limit(8, 1, false, 6) == 8);
-  assert(stage2_active_task_limit(8, 8, 65'536, 4) == 256);
-  assert(stage2_active_task_limit(8, 8, 65'536, 5) == 320);
-  assert(stage2_active_task_limit(8, 8, 65'536, 6) == 384);
-
-  // Tiny accepted windows must retain a real hysteresis gap.  A queue of
-  // eight is high debt, never low debt at the same time.
-  const Stage2ExecutionBudgetSample tiny_window_high{
-    .visible_backlog = 8,
-    .accepted_window = 64,
-    .active_search_lanes = 1,
-    .search_lane_limit = 8,
-    .search_lane_blocks_since_last = 0,
-    .finalized_rate_milli_per_sec = 1'000'000,
-    .finalized_rate_available = true,
-  };
-  Stage2ExecutionBudgetPolicyState tiny_state{
-    .contexts_per_worker = 5,
-  };
-  auto tiny_decision = decide_stage2_execution_budget(
-    tiny_state, tiny_window_high, 4, 6);
-  assert(tiny_decision.high_backlog);
-  assert(tiny_decision.state.low_backlog_streak == 0);
-  Stage2ExecutionBudgetSample tiny_window_middle = tiny_window_high;
-  tiny_window_middle.visible_backlog = 7;
-  tiny_decision = decide_stage2_execution_budget(
-    tiny_state, tiny_window_middle, 4, 6);
-  assert(!tiny_decision.high_backlog);
-  assert(tiny_decision.state.low_backlog_streak == 0);
-  Stage2ExecutionBudgetSample tiny_window_low = tiny_window_high;
-  tiny_window_low.visible_backlog = 1;
-  tiny_decision = decide_stage2_execution_budget(
-    tiny_state, tiny_window_low, 4, 6);
-  assert(!tiny_decision.high_backlog);
-  assert(tiny_decision.state.low_backlog_streak == 1);
-
-  const Stage2ExecutionBudgetSample high_with_headroom{
-    .visible_backlog = 16'384,
-    .accepted_window = 65'536,
-    .active_search_lanes = 26,
-    .search_lane_limit = 32,
-    .search_lane_blocks_since_last = 0,
-    .finalized_rate_milli_per_sec = 1'000'000,
-    .finalized_rate_available = true,
-  };
-  Stage2ExecutionBudgetPolicyState state{.contexts_per_worker = 4};
-  auto decision = decide_stage2_execution_budget(
-    state, high_with_headroom, 4, 6);
-  assert(decision.action == Stage2ExecutionBudgetAction::hold);
-  assert(decision.state.promotion_streak == 1);
-  decision = decide_stage2_execution_budget(
-    decision.state, high_with_headroom, 4, 6);
-  assert(decision.action == Stage2ExecutionBudgetAction::promote);
-  assert(decision.state.contexts_per_worker == 5);
-
-  // The promoted tier first consumes two cooldown observations, then must
-  // preserve at least 95% of the prior finalized rate for two windows. Only
-  // after that trial is accepted can two fresh promotion samples enter C48.
-  for (size_t sample = 0; sample < 2; ++sample) {
-    decision = decide_stage2_execution_budget(
-      decision.state, high_with_headroom, 4, 6);
-    assert(decision.action == Stage2ExecutionBudgetAction::hold);
-  }
-  decision = decide_stage2_execution_budget(
-    decision.state, high_with_headroom, 4, 6);
-  assert(decision.state.rate_trial_pending);
-  assert(!decision.rate_trial_accepted);
-  decision = decide_stage2_execution_budget(
-    decision.state, high_with_headroom, 4, 6);
-  assert(decision.action == Stage2ExecutionBudgetAction::hold);
-  assert(decision.rate_trial_accepted);
-  assert(!decision.state.rate_trial_pending);
-  decision = decide_stage2_execution_budget(
-    decision.state, high_with_headroom, 4, 6);
-  assert(decision.action == Stage2ExecutionBudgetAction::hold);
-  decision = decide_stage2_execution_budget(
-    decision.state, high_with_headroom, 4, 6);
-  assert(decision.action == Stage2ExecutionBudgetAction::promote);
-  assert(decision.state.contexts_per_worker == 6);
-  for (size_t sample = 0; sample < 8; ++sample) {
-    decision = decide_stage2_execution_budget(
-      decision.state, high_with_headroom, 4, 6);
-  }
-  assert(decision.state.contexts_per_worker == 6);
-
-  const Stage2ExecutionBudgetSample lane_pressure{
-    .visible_backlog = 16'384,
-    .accepted_window = 65'536,
-    .active_search_lanes = 32,
-    .search_lane_limit = 32,
-    .search_lane_blocks_since_last = 8,
-  };
-  decision = decide_stage2_execution_budget(
-    decision.state, lane_pressure, 4, 6);
-  assert(decision.action == Stage2ExecutionBudgetAction::hold);
-  decision = decide_stage2_execution_budget(
-    decision.state, lane_pressure, 4, 6);
-  assert(decision.action ==
-         Stage2ExecutionBudgetAction::rollback_lane_pressure);
-  assert(decision.state.contexts_per_worker == 5);
-  assert(decision.state.stable_finalized_rate_milli_per_sec == 0);
-  auto relearned = decision;
-  for (size_t sample = 0; sample < 3; ++sample) {
-    relearned = decide_stage2_execution_budget(
-      relearned.state, high_with_headroom, 4, 6);
-  }
-  assert(relearned.state.stable_finalized_rate_milli_per_sec == 1'000'000);
-
-  const Stage2ExecutionBudgetSample drained{
-    .visible_backlog = 0,
-    .accepted_window = 65'536,
-    .active_search_lanes = 0,
-    .search_lane_limit = 32,
-    .search_lane_blocks_since_last = 0,
-  };
-  // Cooldown consumes two samples, then four low-debt samples contract back
-  // to the safe floor. Further low-debt samples can never go below C32.
-  for (size_t sample = 0; sample < 6; ++sample) {
-    decision = decide_stage2_execution_budget(
-      decision.state, drained, 4, 6);
-  }
-  assert(decision.action ==
-         Stage2ExecutionBudgetAction::rollback_low_backlog);
-  assert(decision.state.contexts_per_worker == 4);
-  for (size_t sample = 0; sample < 16; ++sample) {
-    decision = decide_stage2_execution_budget(
-      decision.state, drained, 4, 6);
-  }
-  assert(decision.state.contexts_per_worker == 4);
-
-  // High debt without measured lane headroom is not permission to expand.
-  const Stage2ExecutionBudgetSample no_headroom{
-    .visible_backlog = 65'536,
-    .accepted_window = 65'536,
-    .active_search_lanes = 29,
-    .search_lane_limit = 32,
-    .search_lane_blocks_since_last = 0,
-  };
-  state = Stage2ExecutionBudgetPolicyState{.contexts_per_worker = 4};
-  for (size_t sample = 0; sample < 8; ++sample) {
-    decision = decide_stage2_execution_budget(state, no_headroom, 4, 6);
-    state = decision.state;
-  }
-  assert(state.contexts_per_worker == 4);
-
-  // A tier that reduces normalized finalized throughput by more than 5% for
-  // two high-debt windows is rejected. The unfinished trial blocks C48 and
-  // the rollback installs the longer eight-window cooldown.
-  state = Stage2ExecutionBudgetPolicyState{.contexts_per_worker = 4};
-  decision = decide_stage2_execution_budget(
-    state, high_with_headroom, 4, 6);
-  decision = decide_stage2_execution_budget(
-    decision.state, high_with_headroom, 4, 6);
-  assert(decision.action == Stage2ExecutionBudgetAction::promote);
-  assert(decision.state.contexts_per_worker == 5);
-  for (size_t sample = 0; sample < 2; ++sample) {
-    decision = decide_stage2_execution_budget(
-      decision.state, high_with_headroom, 4, 6);
-  }
-  Stage2ExecutionBudgetSample unavailable_rate = high_with_headroom;
-  unavailable_rate.finalized_rate_milli_per_sec = 0;
-  unavailable_rate.finalized_rate_available = false;
-  decision = decide_stage2_execution_budget(
-    decision.state, unavailable_rate, 4, 6);
-  assert(decision.state.trial_regression_streak == 0);
-  assert(decision.state.trial_success_streak == 0);
-  Stage2ExecutionBudgetSample regressed = high_with_headroom;
-  regressed.finalized_rate_milli_per_sec = 900'000;
-  decision = decide_stage2_execution_budget(
-    decision.state, regressed, 4, 6);
-  assert(decision.action == Stage2ExecutionBudgetAction::hold);
-  assert(decision.state.contexts_per_worker == 5);
-  assert(decision.state.rate_trial_pending);
-  decision = decide_stage2_execution_budget(
-    decision.state, regressed, 4, 6);
-  assert(decision.action ==
-         Stage2ExecutionBudgetAction::rollback_rate_regression);
-  assert(decision.state.contexts_per_worker == 4);
-  assert(!decision.state.rate_trial_pending);
-  assert(decision.state.cooldown == 8);
-  assert(decision.state.promotion_ceiling_contexts_per_worker == 4);
-  for (size_t sample = 0; sample < 64; ++sample) {
-    decision = decide_stage2_execution_budget(
-      decision.state, high_with_headroom, 4, 6);
-    assert(decision.action != Stage2ExecutionBudgetAction::promote);
-    assert(decision.state.contexts_per_worker == 4);
-  }
-
-  assert(stage2_normalized_rate_milli_per_sec(
-           1'000, 2'000'000'000ULL) == 500'000);
-  assert(stage2_normalized_rate_milli_per_sec(1'000, 0) == 0);
-}
-
-void test_stage2_execution_budget_sample_guard_serializes_transaction() {
-  using memory_node_storage_owner_maintenance_detail::
-    Stage2ExecutionBudgetSampleGuard;
-
-  std::atomic<bool> sample_busy{false};
-  std::atomic<size_t> overlapping_owners{0};
-  {
-    Stage2ExecutionBudgetSampleGuard owner(sample_busy);
-    assert(owner.owns_sample());
-    assert(sample_busy.load(std::memory_order_acquire));
-
-    constexpr size_t kContenders = 16;
-    std::array<std::thread, kContenders> contenders;
-    for (std::thread& contender : contenders) {
-      contender = std::thread([&]() {
-        Stage2ExecutionBudgetSampleGuard rejected(sample_busy);
-        if (rejected.owns_sample()) {
-          overlapping_owners.fetch_add(1, std::memory_order_relaxed);
-        }
-      });
-    }
-    for (std::thread& contender : contenders) contender.join();
-    assert(overlapping_owners.load(std::memory_order_acquire) == 0);
-    assert(sample_busy.load(std::memory_order_acquire));
-  }
-  assert(!sample_busy.load(std::memory_order_acquire));
-
-  // Destruction releases the complete-transaction guard on an early-return
-  // path, so a later cadence winner can become the sole sampler.
-  Stage2ExecutionBudgetSampleGuard next(sample_busy);
-  assert(next.owns_sample());
+  assert(stage2_worker_context_admission_limit(16) == 4);
+  assert(stage2_worker_context_admission_limit(1) == 1);
+  assert(stage2_worker_context_admission_limit(0) == 1);
 }
 
 void test_stage1_waiter_wake_coverage_prevents_credit_stampedes() {
@@ -1208,8 +873,7 @@ void test_stage2_accepted_window_is_independent_of_execution_capacity() {
   assert(stage2_accepted_sequence_limit(0, completion_capacity) == 0);
   assert(stage2_accepted_sequence_limit(queue_depth, 0) == 0);
 
-  const std::size_t active_contexts = stage2_context_admission_limit(
-    8, 16, true);
+  const std::size_t active_contexts = stage2_context_admission_limit(8, 16);
   assert(active_contexts == 32);
   assert(stage2_accepted_sequence_limit(
            queue_depth, completion_capacity) > active_contexts);
@@ -1495,11 +1159,8 @@ int main() {
   test_wide_integral_simd_distance_never_overflows();
   test_stale_stage2_sequence_handoff_to_bounded_repair();
   test_stale_stage2_repair_keeps_wire_payload_bound();
-  test_stage2_admission_yields_only_for_live_foreground_pressure();
+  test_stage2_admission_depends_only_on_fixed_context_capacity();
   test_stage2_pressure_retains_a_dedicated_progress_floor();
-  test_stage2_active_task_budget_is_atomic_and_independent_of_ack();
-  test_stage2_execution_budget_promotes_and_rolls_back_with_hysteresis();
-  test_stage2_execution_budget_sample_guard_serializes_transaction();
   test_stage1_waiter_wake_coverage_prevents_credit_stampedes();
   test_stage2_accepted_window_is_independent_of_execution_capacity();
   test_stage1_arm_queue_permit_cannot_be_stolen();

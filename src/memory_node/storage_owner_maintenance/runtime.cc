@@ -48,7 +48,8 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     channel.context_scan_requested.store(false, std::memory_order_relaxed);
   }
   const size_t contexts_per_worker =
-    std::max<size_t>(1, config.storage_owner_rpc_depth);
+    stage2_worker_context_admission_limit(
+      config.storage_owner_rpc_depth);
   const size_t snapshot_batch =
     std::max<u32>(1, config.storage_owner_search_snapshot_batch);
   const auto& peer_credit_plan = peer_rdma_read_credit_plan();
@@ -110,45 +111,11 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
       completion_capacity);
   lib_assert(storage_owner_maintenance_admission_limit_ != 0,
              "Stage2 accepted descriptor window is empty");
-  const size_t baseline_contexts_per_worker =
-    stage2_worker_context_admission_limit(
-      contexts_per_worker, false, kStage2BaselineContextsPerWorker);
-  const size_t maximum_contexts_per_worker =
-    stage2_worker_context_admission_limit(
-      contexts_per_worker, false, kStage2MaximumContextsPerWorker);
-  const size_t baseline_active_task_limit = stage2_active_task_limit(
-    worker_count, kStage2SemanticExecutionBatch,
-    storage_owner_maintenance_admission_limit_,
-    baseline_contexts_per_worker);
-  const size_t maximum_active_task_limit = stage2_active_task_limit(
-    worker_count, kStage2SemanticExecutionBatch,
-    storage_owner_maintenance_admission_limit_,
-    maximum_contexts_per_worker);
-  lib_assert(baseline_contexts_per_worker != 0 &&
-               baseline_contexts_per_worker <= maximum_contexts_per_worker &&
-               maximum_contexts_per_worker <=
-                 std::numeric_limits<u32>::max() &&
-               baseline_active_task_limit != 0 &&
-               baseline_active_task_limit <= maximum_active_task_limit &&
-               maximum_active_task_limit <= std::numeric_limits<u32>::max(),
-             "adaptive Stage2 execution budget is outside its counter range");
-  storage_owner_maintenance_contexts_per_worker_baseline_ =
-    static_cast<u32>(baseline_contexts_per_worker);
-  storage_owner_maintenance_contexts_per_worker_max_ =
-    static_cast<u32>(maximum_contexts_per_worker);
-  storage_owner_stage2_budget_promotion_ceiling_.store(
-    static_cast<u32>(maximum_contexts_per_worker),
-    std::memory_order_relaxed);
-  storage_owner_maintenance_contexts_per_worker_limit_.store(
-    static_cast<u32>(baseline_contexts_per_worker),
-    std::memory_order_relaxed);
-  storage_owner_maintenance_active_task_limit_baseline_ =
-    static_cast<u32>(baseline_active_task_limit);
-  storage_owner_maintenance_active_task_limit_max_ =
-    static_cast<u32>(maximum_active_task_limit);
-  storage_owner_maintenance_active_task_limit_.store(
-    static_cast<u32>(baseline_active_task_limit),
-    std::memory_order_relaxed);
+  const size_t active_context_limit = stage2_context_admission_limit(
+    worker_count, config.storage_owner_rpc_depth);
+  lib_assert(active_context_limit != 0 &&
+               active_context_limit <= std::numeric_limits<u32>::max(),
+             "fixed Stage2 context limit is outside its counter range");
   storage_owner_maintenance_intent_capacity_ = completion_capacity;
   storage_owner_maintenance_intents_ =
     std::make_unique<StorageOwnerMaintenanceIntent[]>(completion_capacity);
@@ -195,28 +162,6 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     0, std::memory_order_relaxed);
   storage_owner_stage2_graph_prefetch_wasted_.store(
     0, std::memory_order_relaxed);
-  storage_owner_stage2_score_prefetch_issued_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_score_prefetch_hits_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_score_prefetch_wasted_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_independent_score_rpc_batches_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_independent_score_issued_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_independent_score_useful_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_independent_score_wasted_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_score_feedback_base_hits_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_score_feedback_base_wasted_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_score_feedback_next_outcome_.store(
-    512, std::memory_order_relaxed);
-  storage_owner_stage2_score_prefetch_enabled_.store(
-    true, std::memory_order_relaxed);
   storage_owner_stage2_graph_feedback_base_hits_.store(
     0, std::memory_order_relaxed);
   storage_owner_stage2_graph_feedback_base_wasted_.store(
@@ -257,10 +202,6 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
     0, std::memory_order_relaxed);
   storage_owner_maintenance_ready_fallback_scans_.store(
     0, std::memory_order_relaxed);
-  storage_owner_maintenance_periodic_fallback_audits_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_maintenance_periodic_fallback_recoveries_.store(
-    0, std::memory_order_relaxed);
   storage_owner_search_lane_leases_.store(0, std::memory_order_relaxed);
   storage_owner_search_lane_lease_peak_.store(0, std::memory_order_relaxed);
   storage_owner_search_lane_lease_blocked_.store(
@@ -295,29 +236,10 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
         peer_rpc_send_slot_waiters_[waiter]);
     }
   }
-  // Bound a context by the registered wire/scratch capacity while leaving
-  // enough accepted descriptors to feed independently runnable executors.
-  // Production must expose the full safe limit to the backlog-driven 8/16/32
-  // policy. Clamping this value to two recreates the completion-clocked stream
-  // even after foreground acceptance has been decoupled from active contexts.
-  const size_t concurrency_safe_packing_limit = std::min<size_t>(
+  const size_t production_packing_limit = std::min<size_t>(
     std::max<u32>(1, config.storage_owner_batch_max),
-    std::max<size_t>(
-      2, storage_owner_maintenance_admission_limit_ /
-           std::max<size_t>(1, static_cast<size_t>(worker_count) * 2)));
-  const size_t production_packing_limit = concurrency_safe_packing_limit;
-  storage_owner_stage2_larger_batch_trials_possible_ =
-    production_packing_limit >= kStage2BulkMinimumBatch;
-  storage_owner_stage2_packing_.reset(
-    production_packing_limit,
-    config.storage_owner_stage2_batch_max_wait_us);
-  // The 185634 production run issued no independent-score RPCs, yet every
-  // admitted context still took the controller mutex, allocated a generation
-  // token, and returned it at completion. Keep the implementation available
-  // for an explicit future experiment, but make the production runtime a
-  // complete controller bypass rather than an always-on no-op A/B cohort.
-  storage_owner_independent_score_experiment_enabled_ = false;
-  storage_owner_independent_score_.reset();
+    kStage2SemanticExecutionBatch);
+  storage_owner_stage2_packing_.reset(production_packing_limit);
   physical_stage1_items_.store(0, std::memory_order_relaxed);
   physical_stage1_total_ns_.store(0, std::memory_order_relaxed);
   physical_stage1_search_ns_.store(0, std::memory_order_relaxed);
@@ -328,49 +250,6 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   physical_stage1_remote_frontier_items_.store(0, std::memory_order_relaxed);
   physical_stage1_neighbors_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_active_workers_.store(0, std::memory_order_relaxed);
-  storage_owner_maintenance_active_tasks_.store(0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_sample_busy_.store(
-    false, std::memory_order_relaxed);
-  storage_owner_stage2_budget_last_sample_ns_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_last_lane_blocks_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_last_processed_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_promotion_streak_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_lane_pressure_streak_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_low_backlog_streak_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_cooldown_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_stable_rate_milli_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_trial_baseline_rate_milli_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_trial_regression_streak_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_trial_success_streak_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_rate_trial_pending_.store(
-    false, std::memory_order_relaxed);
-  storage_owner_stage2_budget_promotions_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_rollbacks_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_lane_rollbacks_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_low_backlog_rollbacks_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_rate_rollbacks_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_rate_trials_accepted_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_high_backlog_samples_.store(
-    0, std::memory_order_relaxed);
-  storage_owner_stage2_budget_lane_headroom_samples_.store(
-    0, std::memory_order_relaxed);
   storage_owner_maintenance_finalize_latency_ns_.store(0, std::memory_order_relaxed);
   storage_owner_maintenance_finalize_max_latency_ns_.store(0, std::memory_order_relaxed);
   for (auto& bucket : storage_owner_maintenance_finalize_latency_buckets_) {
@@ -388,19 +267,7 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
       .shard_id = storage_id_,
       .published_steady_ns = steady_now_ns(),
       .admission_window = storage_owner_maintenance_admission_limit_,
-      .active_stage2_task_limit =
-        storage_owner_maintenance_active_task_limit_.load(
-          std::memory_order_relaxed),
-      .active_stage2_context_limit =
-        static_cast<u64>(worker_count) * baseline_contexts_per_worker,
-      .active_stage2_context_limit_baseline =
-        static_cast<u64>(worker_count) * baseline_contexts_per_worker,
-      .active_stage2_context_limit_max =
-        static_cast<u64>(worker_count) * maximum_contexts_per_worker,
-      .active_stage2_task_limit_baseline = baseline_active_task_limit,
-      .active_stage2_task_limit_max = maximum_active_task_limit,
-      .stage2_budget_promotion_context_limit =
-        static_cast<u64>(worker_count) * maximum_contexts_per_worker,
+      .active_stage2_context_limit = active_context_limit,
     });
   const u64 previous_runtime_epoch =
     storage_owner_maintenance_runtime_epoch_counter_.fetch_add(
@@ -538,19 +405,6 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                std::to_string(coroutine_scratch_stride) +
                " bytes_total=" + std::to_string(total_scratch_bytes));
 
-  // Start the adaptive clock only after every limit, lane, and worker-state
-  // input is published. The first decision therefore observes one complete
-  // second of actual service instead of treating startup's empty queue as a
-  // low-backlog sample.
-  storage_owner_stage2_budget_last_lane_blocks_.store(
-    storage_owner_search_lane_lease_blocked_.load(
-      std::memory_order_relaxed),
-    std::memory_order_relaxed);
-  storage_owner_stage2_budget_last_processed_.store(
-    storage_owner_maintenance_processed_.load(std::memory_order_relaxed),
-    std::memory_order_relaxed);
-  storage_owner_stage2_budget_last_sample_ns_.store(
-    steady_now_ns(), std::memory_order_release);
   for (u32 worker_id = 0; worker_id < worker_count; ++worker_id) {
     storage_owner_maintenance_workers_.emplace_back(
       [this, worker_id]() { storage_owner_maintenance_worker_loop(worker_id); });
@@ -565,16 +419,7 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                ", admission_baseline_workers=" +
                std::to_string(cpu_plan.maintenance_admission_workers) +
                ", context_limit=" +
-               std::to_string(stage2_context_admission_limit(
-                 worker_count, contexts_per_worker,
-                 false)) +
-               ".." +
-               std::to_string(stage2_context_admission_limit(
-                 worker_count, contexts_per_worker, false,
-                 maximum_contexts_per_worker)) +
-               ", active_task_limit=" +
-               std::to_string(baseline_active_task_limit) + ".." +
-               std::to_string(maximum_active_task_limit) +
+               std::to_string(active_context_limit) +
                ", semantic_execution_batch=" +
                std::to_string(kStage2SemanticExecutionBatch) +
                ", work_conserving=true)");
@@ -586,8 +431,10 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                " (shared per-peer work-conserving aggregation)");
   print_status("storage-owner maintenance tuning: protocol=centroid-home-two-stage"
                " compaction_batch_target=" + std::to_string(config.storage_owner_batch_max) +
-               " packing_policy=visible_backlog_ladder_8_16_32"
-               " packing_tail_wait_us=arrival_adaptive_1000_25000" +
+               " packing_policy=deterministic_b8"
+               " packing_tail_wait_us=arrival_adaptive_capped_" +
+               std::to_string(
+                 config.storage_owner_stage2_batch_max_wait_us) +
                " packing_context_limit=" +
                std::to_string(production_packing_limit) +
                " backlog_limit=" +
@@ -642,9 +489,6 @@ void MemoryNode::stop_storage_owner_maintenance_runtime() {
   lib_assert(storage_owner_maintenance_active_workers_.load(
                std::memory_order_acquire) == 0,
              "Stage2 executor stopped with a live context");
-  lib_assert(storage_owner_maintenance_active_tasks_.load(
-               std::memory_order_acquire) == 0,
-             "Stage2 executor stopped with a live active-task reservation");
   for (auto& queue : storage_owner_maintenance_ready_queue_active_) {
     queue.store(nullptr, std::memory_order_release);
   }
@@ -770,12 +614,6 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
     storage_owner_stage2_batched_items_.load(std::memory_order_relaxed);
   const Stage2PackingTelemetry stage2_packing =
     storage_owner_stage2_packing_.telemetry();
-  IndependentScoreTelemetry independent_score_ab{};
-  if (storage_owner_independent_score_experiment_enabled_) {
-    independent_score_ab = storage_owner_independent_score_.telemetry();
-  } else {
-    independent_score_ab.mode = IndependentScoreMode::disabled;
-  }
   std::array<u64, kStorageOwnerStage2TimingPhaseCount>
     stage2_phase_attempts{};
   std::array<u64, kStorageOwnerStage2TimingPhaseCount>
@@ -900,14 +738,6 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
       std::to_string(
         storage_owner_maintenance_ready_fallback_scans_.load(
           std::memory_order_relaxed)) +
-    " maintenance_periodic_fallback_audits=" +
-      std::to_string(
-        storage_owner_maintenance_periodic_fallback_audits_.load(
-          std::memory_order_relaxed)) +
-    " maintenance_periodic_fallback_recoveries=" +
-      std::to_string(
-        storage_owner_maintenance_periodic_fallback_recoveries_.load(
-          std::memory_order_relaxed)) +
     " stage2_search_lane_lease_limit=" +
       std::to_string(storage_owner_search_lane_lease_limit_.load(
         std::memory_order_relaxed)) +
@@ -948,27 +778,6 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
       std::memory_order_relaxed);
   const u64 stage2_graph_prefetch_wasted =
     storage_owner_stage2_graph_prefetch_wasted_.load(
-      std::memory_order_relaxed);
-  const u64 stage2_score_prefetch_issued =
-    storage_owner_stage2_score_prefetch_issued_.load(
-      std::memory_order_relaxed);
-  const u64 stage2_score_prefetch_hits =
-    storage_owner_stage2_score_prefetch_hits_.load(
-      std::memory_order_relaxed);
-  const u64 stage2_score_prefetch_wasted =
-    storage_owner_stage2_score_prefetch_wasted_.load(
-      std::memory_order_relaxed);
-  const u64 stage2_independent_score_rpc_batches =
-    storage_owner_stage2_independent_score_rpc_batches_.load(
-      std::memory_order_relaxed);
-  const u64 stage2_independent_score_issued =
-    storage_owner_stage2_independent_score_issued_.load(
-      std::memory_order_relaxed);
-  const u64 stage2_independent_score_useful =
-    storage_owner_stage2_independent_score_useful_.load(
-      std::memory_order_relaxed);
-  const u64 stage2_independent_score_wasted =
-    storage_owner_stage2_independent_score_wasted_.load(
       std::memory_order_relaxed);
   const u64 stage2_vector_read_waves =
     storage_owner_stage2_vector_read_waves_.load(std::memory_order_relaxed);
@@ -1060,23 +869,10 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
     : 0.0;
   const u64 active_contexts =
     storage_owner_maintenance_active_workers_.load(std::memory_order_acquire);
-  const u64 contexts_per_worker_limit =
-    storage_owner_maintenance_contexts_per_worker_limit_.load(
-      std::memory_order_acquire);
-  const u64 active_context_limit =
-    static_cast<u64>(storage_owner_maintenance_worker_states_.size()) *
-      contexts_per_worker_limit;
-  const u64 active_context_limit_baseline =
-    static_cast<u64>(storage_owner_maintenance_worker_states_.size()) *
-      storage_owner_maintenance_contexts_per_worker_baseline_;
-  const u64 active_context_limit_max =
-    static_cast<u64>(storage_owner_maintenance_worker_states_.size()) *
-      storage_owner_maintenance_contexts_per_worker_max_;
-  const u64 active_stage2_tasks =
-    storage_owner_maintenance_active_tasks_.load(std::memory_order_acquire);
-  lib_assert(active_stage2_tasks <=
-               storage_owner_maintenance_active_task_limit_max_,
-             "Stage2 active-task telemetry exceeded its hard execution maximum");
+  const u64 active_context_limit = stage2_context_admission_limit(
+    storage_owner_maintenance_worker_states_.size(),
+    storage_worker_config_ == nullptr
+      ? 1 : storage_worker_config_->storage_owner_rpc_depth);
   const u64 repair_remaining = storage_owner_repair_tasks_ == nullptr
     ? 0
     : static_cast<u64>(storage_owner_repair_tasks_->approximate_size());
@@ -1161,9 +957,6 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
     .stage2_graph_prefetch_issued = stage2_graph_prefetch_issued,
     .stage2_graph_prefetch_hits = stage2_graph_prefetch_hits,
     .stage2_graph_prefetch_wasted = stage2_graph_prefetch_wasted,
-    .stage2_score_prefetch_issued = stage2_score_prefetch_issued,
-    .stage2_score_prefetch_hits = stage2_score_prefetch_hits,
-    .stage2_score_prefetch_wasted = stage2_score_prefetch_wasted,
     .stage2_vector_read_waves = stage2_vector_read_waves,
     .stage2_vector_unique_reads = stage2_vector_unique_reads,
   };
@@ -1192,61 +985,8 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   telemetry_snapshot.maintenance_broadcast_wakes = broadcast_wakes;
   telemetry_snapshot.maintenance_context_slots_scanned =
     context_slots_scanned;
-  telemetry_snapshot.active_stage2_tasks = active_stage2_tasks;
-  telemetry_snapshot.active_stage2_task_limit =
-    storage_owner_maintenance_active_task_limit_.load(
-      std::memory_order_acquire);
   telemetry_snapshot.active_stage2_contexts = active_contexts;
   telemetry_snapshot.active_stage2_context_limit = active_context_limit;
-  telemetry_snapshot.active_stage2_context_limit_baseline =
-    active_context_limit_baseline;
-  telemetry_snapshot.active_stage2_context_limit_max =
-    active_context_limit_max;
-  telemetry_snapshot.active_stage2_task_limit_baseline =
-    storage_owner_maintenance_active_task_limit_baseline_;
-  telemetry_snapshot.active_stage2_task_limit_max =
-    storage_owner_maintenance_active_task_limit_max_;
-  telemetry_snapshot.stage2_budget_promotions =
-    storage_owner_stage2_budget_promotions_.load(std::memory_order_relaxed);
-  telemetry_snapshot.stage2_budget_rollbacks =
-    storage_owner_stage2_budget_rollbacks_.load(std::memory_order_relaxed);
-  telemetry_snapshot.stage2_budget_lane_rollbacks =
-    storage_owner_stage2_budget_lane_rollbacks_.load(
-      std::memory_order_relaxed);
-  telemetry_snapshot.stage2_budget_low_backlog_rollbacks =
-    storage_owner_stage2_budget_low_backlog_rollbacks_.load(
-      std::memory_order_relaxed);
-  telemetry_snapshot.stage2_budget_rate_rollbacks =
-    storage_owner_stage2_budget_rate_rollbacks_.load(
-      std::memory_order_relaxed);
-  telemetry_snapshot.stage2_budget_rate_trials_accepted =
-    storage_owner_stage2_budget_rate_trials_accepted_.load(
-      std::memory_order_relaxed);
-  telemetry_snapshot.stage2_budget_high_backlog_samples =
-    storage_owner_stage2_budget_high_backlog_samples_.load(
-      std::memory_order_relaxed);
-  telemetry_snapshot.stage2_budget_lane_headroom_samples =
-    storage_owner_stage2_budget_lane_headroom_samples_.load(
-      std::memory_order_relaxed);
-  telemetry_snapshot.stage2_budget_stable_rate_milli_per_sec =
-    storage_owner_stage2_budget_stable_rate_milli_.load(
-      std::memory_order_relaxed);
-  telemetry_snapshot.stage2_budget_trial_baseline_rate_milli_per_sec =
-    storage_owner_stage2_budget_trial_baseline_rate_milli_.load(
-      std::memory_order_relaxed);
-  telemetry_snapshot.stage2_budget_rate_trial_pending =
-    storage_owner_stage2_budget_rate_trial_pending_.load(
-      std::memory_order_relaxed) ? 1 : 0;
-  telemetry_snapshot.stage2_budget_promotion_context_limit =
-    static_cast<u64>(storage_owner_maintenance_worker_states_.size()) *
-      storage_owner_stage2_budget_promotion_ceiling_.load(
-        std::memory_order_relaxed);
-  telemetry_snapshot.maintenance_periodic_fallback_audits =
-    storage_owner_maintenance_periodic_fallback_audits_.load(
-      std::memory_order_relaxed);
-  telemetry_snapshot.maintenance_periodic_fallback_recoveries =
-    storage_owner_maintenance_periodic_fallback_recoveries_.load(
-      std::memory_order_relaxed);
   telemetry_snapshot.packing_target_batch = stage2_packing.target_batch;
   telemetry_snapshot.packing_arrival_interval_us =
     stage2_packing.estimated_arrival_interval_us;
@@ -1255,23 +995,8 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
   telemetry_snapshot.packing_target_flushes = stage2_packing.target_flushes;
   telemetry_snapshot.packing_deadline_flushes =
     stage2_packing.deadline_flushes;
-  telemetry_snapshot.packing_full_flushes = stage2_packing.full_flushes;
-  telemetry_snapshot.packing_low_pressure_flushes =
-    stage2_packing.low_pressure_flushes;
   telemetry_snapshot.packing_cleanup_flushes =
     stage2_packing.cleanup_flushes;
-  telemetry_snapshot.packing_promotions = stage2_packing.promotions;
-  telemetry_snapshot.packing_rollbacks = stage2_packing.rollbacks;
-  telemetry_snapshot.packing_accepted_trial_windows =
-    stage2_packing.accepted_trial_windows;
-  telemetry_snapshot.stage2_independent_score_rpc_batches =
-    stage2_independent_score_rpc_batches;
-  telemetry_snapshot.stage2_independent_score_issued =
-    stage2_independent_score_issued;
-  telemetry_snapshot.stage2_independent_score_useful =
-    stage2_independent_score_useful;
-  telemetry_snapshot.stage2_independent_score_wasted =
-    stage2_independent_score_wasted;
   telemetry_snapshot.completion_incomplete = completion_incomplete;
   telemetry_snapshot.completion_logical_full_failures =
     completion_logical_full_failures;
@@ -1397,62 +1122,6 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(
                  storage_owner_stage2_graph_issue_width_current_.load(
                    std::memory_order_relaxed)) +
-               " stage2_score_prefetch_issued=" +
-               std::to_string(stage2_score_prefetch_issued) +
-               " stage2_score_prefetch_hits=" +
-               std::to_string(stage2_score_prefetch_hits) +
-               " stage2_score_prefetch_wasted=" +
-               std::to_string(stage2_score_prefetch_wasted) +
-               " stage2_score_prefetch_promotion_ratio=" +
-               std::to_string(ratio_or_zero(
-                 stage2_score_prefetch_hits,
-                 stage2_score_prefetch_hits +
-                   stage2_score_prefetch_wasted)) +
-               " stage2_score_prefetch_enabled=" +
-               std::to_string(
-                 storage_owner_stage2_score_prefetch_enabled_.load(
-                   std::memory_order_relaxed)) +
-               " stage2_independent_score_rpc_batches=" +
-               std::to_string(stage2_independent_score_rpc_batches) +
-               " stage2_independent_score_issued=" +
-               std::to_string(stage2_independent_score_issued) +
-               " stage2_independent_score_useful=" +
-               std::to_string(stage2_independent_score_useful) +
-               " stage2_independent_score_wasted=" +
-               std::to_string(stage2_independent_score_wasted) +
-               " stage2_independent_score_ab_mode=" +
-               independent_score_mode_name(independent_score_ab.mode) +
-               " stage2_independent_score_ab_generation=" +
-               std::to_string(independent_score_ab.generation) +
-               " stage2_independent_score_ab_window_tasks=" +
-               std::to_string(independent_score_ab.window_tasks) +
-               " stage2_independent_score_ab_window_posted_rpcs=" +
-               std::to_string(independent_score_ab.window_posted_rpcs) +
-               " stage2_independent_score_ab_window_useful=" +
-               std::to_string(independent_score_ab.window_useful) +
-               " stage2_independent_score_ab_drain_outstanding=" +
-               std::to_string(independent_score_ab.drain_outstanding) +
-               " stage2_independent_score_ab_trials_started=" +
-               std::to_string(independent_score_ab.trials_started) +
-               " stage2_independent_score_ab_trials_accepted=" +
-               std::to_string(independent_score_ab.trials_accepted) +
-               " stage2_independent_score_ab_confirmations=" +
-               std::to_string(independent_score_ab.confirmations) +
-               " stage2_independent_score_ab_enabled_windows=" +
-               std::to_string(independent_score_ab.enabled_windows) +
-               " stage2_independent_score_ab_revalidation_controls=" +
-               std::to_string(independent_score_ab.revalidation_controls) +
-               " stage2_independent_score_ab_revalidations_accepted=" +
-               std::to_string(
-                 independent_score_ab.revalidations_accepted) +
-               " stage2_independent_score_ab_rollbacks=" +
-               std::to_string(independent_score_ab.rollbacks) +
-               " stage2_independent_score_ab_baseline_cost_ns_per_task=" +
-               std::to_string(
-                 independent_score_ab.baseline_cost_ns_per_task) +
-               " stage2_independent_score_ab_baseline_debt_per_task=" +
-               std::to_string(
-                 independent_score_ab.baseline_debt_delta_per_task) +
                " stage2_vector_read_waves=" +
                std::to_string(stage2_vector_read_waves) +
                " avg_stage2_scores_per_vector_wave=" +
@@ -1553,17 +1222,13 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(stage2_packing.admitted_queue_depth_max) +
                " packing_batch_1_7=" +
                std::to_string(stage2_packing.batch_1_to_7) +
-               " packing_batch_8_15=" +
-               std::to_string(stage2_packing.batch_8_to_15) +
-               " packing_batch_16_31=" +
-               std::to_string(stage2_packing.batch_16_to_31) +
-               " packing_batch_32_plus=" +
-               std::to_string(stage2_packing.batch_32_plus) +
-               " packing_bulk_assembly_batches=" +
-               std::to_string(stage2_packing.bulk_assembly_batches) +
-               " packing_bulk_assembly_wait_ms=" +
+               " packing_batch_8=" +
+               std::to_string(stage2_packing.batch_8) +
+               " packing_assembly_batches=" +
+               std::to_string(stage2_packing.assembly_batches) +
+               " packing_assembly_wait_ms=" +
                std::to_string(static_cast<double>(
-                 stage2_packing.bulk_assembly_wait_ns) / 1e6) +
+                 stage2_packing.assembly_wait_ns) / 1e6) +
                " packing_arrival_interval_us=" +
                std::to_string(stage2_packing.estimated_arrival_interval_us) +
                " packing_waited_batches=" +
@@ -1575,18 +1240,8 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(stage2_packing.target_flushes) +
                " packing_deadline_flushes=" +
                std::to_string(stage2_packing.deadline_flushes) +
-               " packing_full_flushes=" +
-               std::to_string(stage2_packing.full_flushes) +
-               " packing_low_pressure_flushes=" +
-               std::to_string(stage2_packing.low_pressure_flushes) +
                " packing_cleanup_flushes=" +
                std::to_string(stage2_packing.cleanup_flushes) +
-               " packing_promotions=" +
-               std::to_string(stage2_packing.promotions) +
-               " packing_rollbacks=" +
-               std::to_string(stage2_packing.rollbacks) +
-               " packing_accepted_windows=" +
-               std::to_string(stage2_packing.accepted_trial_windows) +
                stage2_phase_timing_log +
                " physical_stage1_items=" +
                std::to_string(physical_stage1_items_.load(
@@ -1729,70 +1384,6 @@ void MemoryNode::log_storage_owner_maintenance_observation(size_t stage2_remaini
                std::to_string(active_contexts) +
                " active_context_limit=" +
                std::to_string(active_context_limit) +
-               " active_context_limit_baseline=" +
-               std::to_string(active_context_limit_baseline) +
-               " active_context_limit_max=" +
-               std::to_string(active_context_limit_max) +
-               " active_stage2_tasks=" +
-               std::to_string(active_stage2_tasks) +
-               " active_stage2_task_limit=" +
-               std::to_string(
-                 storage_owner_maintenance_active_task_limit_.load(
-                   std::memory_order_acquire)) +
-               " active_stage2_task_limit_baseline=" +
-               std::to_string(
-                 storage_owner_maintenance_active_task_limit_baseline_) +
-               " active_stage2_task_limit_max=" +
-               std::to_string(
-                 storage_owner_maintenance_active_task_limit_max_) +
-               " stage2_budget_promotions=" +
-               std::to_string(storage_owner_stage2_budget_promotions_.load(
-                 std::memory_order_relaxed)) +
-               " stage2_budget_rollbacks=" +
-               std::to_string(storage_owner_stage2_budget_rollbacks_.load(
-                 std::memory_order_relaxed)) +
-               " stage2_budget_lane_rollbacks=" +
-               std::to_string(
-                 storage_owner_stage2_budget_lane_rollbacks_.load(
-                   std::memory_order_relaxed)) +
-               " stage2_budget_low_backlog_rollbacks=" +
-               std::to_string(
-                 storage_owner_stage2_budget_low_backlog_rollbacks_.load(
-                   std::memory_order_relaxed)) +
-               " stage2_budget_rate_rollbacks=" +
-               std::to_string(
-                 storage_owner_stage2_budget_rate_rollbacks_.load(
-                   std::memory_order_relaxed)) +
-               " stage2_budget_rate_trials_accepted=" +
-               std::to_string(
-                 storage_owner_stage2_budget_rate_trials_accepted_.load(
-                   std::memory_order_relaxed)) +
-               " stage2_budget_high_backlog_samples=" +
-               std::to_string(
-                 storage_owner_stage2_budget_high_backlog_samples_.load(
-                   std::memory_order_relaxed)) +
-               " stage2_budget_lane_headroom_samples=" +
-               std::to_string(
-                 storage_owner_stage2_budget_lane_headroom_samples_.load(
-                   std::memory_order_relaxed)) +
-               " stage2_budget_stable_rate_milli_per_sec=" +
-               std::to_string(
-                 storage_owner_stage2_budget_stable_rate_milli_.load(
-                   std::memory_order_relaxed)) +
-               " stage2_budget_trial_baseline_rate_milli_per_sec=" +
-               std::to_string(
-                 storage_owner_stage2_budget_trial_baseline_rate_milli_.load(
-                   std::memory_order_relaxed)) +
-               " stage2_budget_rate_trial_pending=" +
-               std::to_string(
-                 storage_owner_stage2_budget_rate_trial_pending_.load(
-                   std::memory_order_relaxed) ? 1 : 0) +
-               " stage2_budget_promotion_context_limit=" +
-               std::to_string(
-                 static_cast<u64>(
-                   storage_owner_maintenance_worker_states_.size()) *
-                 storage_owner_stage2_budget_promotion_ceiling_.load(
-                   std::memory_order_relaxed)) +
                " repair_remaining=" +
                std::to_string(repair_remaining) +
                " remaining=" + std::to_string(remaining));

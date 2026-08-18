@@ -122,24 +122,10 @@ void MemoryNode::send_peer_reverse_update_response(PeerReverseUpdateResponse& re
   const size_t bytes = response.payload.empty()
     ? sizeof(response.header) : response.payload.size();
   u32 slot_id = 0;
-  const PeerRpcSendClass send_class = response.speculative
-    ? PeerRpcSendClass::speculative
-    : response.graph_response
-      ? PeerRpcSendClass::graph_update : PeerRpcSendClass::control;
+  const PeerRpcSendClass send_class = response.graph_response
+    ? PeerRpcSendClass::graph_update : PeerRpcSendClass::control;
   bool send_slot_acquired = try_acquire_peer_rpc_send_slot(
     response.destination_shard, send_class, slot_id);
-  if (response.speculative && !send_slot_acquired) {
-    // A low-priority response must never pin the sole dispatcher waiting for
-    // a surplus SEND slot while an authoritative response is queued behind
-    // it. The sender's bounded speculative deadline treats this as a cache
-    // miss; exact authoritative scoring remains unchanged.
-    if (response.graph_response && !response.payload.empty()) {
-      recycle_peer_graph_response_buffer(std::move(response.payload));
-    }
-    peer_stage2_home_response_queue_drops_.fetch_add(
-      1, std::memory_order_relaxed);
-    return;
-  }
   while (!send_slot_acquired) {
     // This is the dedicated response dispatcher, not a graph/search worker.
     // CQ progress returns slots asynchronously, so yielding here preserves a
@@ -205,15 +191,6 @@ bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
   const bool stage2_home =
     request_type == PeerRpcType::stage2_expand_score_request ||
     request_type == PeerRpcType::stage2_score_many_request;
-  const bool speculative =
-    request_type == PeerRpcType::stage2_score_many_request &&
-    task.payload.size() >= stage2_score_many_items_offset() &&
-    stage2_score_many_is_speculative(
-      stage2_score_many_header(task.payload.data())->flags);
-  task.speculative = speculative;
-  if (speculative && !peer_stage2_home_speculation_enabled_) {
-    return false;
-  }
   task.operation_tokens.clear();
   task.operation_tokens.reserve(task.header.item_count);
   if (request_type == PeerRpcType::stage1_execute_request) {
@@ -263,41 +240,24 @@ bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
     ? task.header.item_count : 0;
   const size_t stage2_home_limit = std::max<size_t>(
     1, peer_stage1_task_queue_limit_ / 2);
-  const u32 all_active_workers =
+  const u32 active_workers =
     peer_stage1_active_workers_.load(std::memory_order_acquire) +
     peer_stage2_home_active_workers_.load(std::memory_order_acquire);
-  const u32 speculative_active_workers =
-    peer_stage2_home_speculative_active_workers_.load(
-      std::memory_order_acquire);
-  const u32 authoritative_active_workers =
-    all_active_workers >= speculative_active_workers
-      ? all_active_workers - speculative_active_workers : 0;
   const bool invalid_common =
     peer_reverse_shutdown_.load(std::memory_order_acquire) ||
     task.source_shard >= peer_stage1_next_source_sequences_.size();
-  const bool speculative_source_valid =
-    task.source_shard <
-      peer_stage2_home_speculative_source_active_.size();
-  const bool speculative_full = speculative &&
-    (!speculative_source_valid ||
-     !memory_node_peer_rpc_detail::speculative_score_request_admissible(
-       peer_stage2_home_speculation_enabled_,
-       speculative_source_valid &&
-         peer_stage2_home_speculative_source_active_[task.source_shard],
-       peer_stage2_home_speculative_tasks_.size(),
-       peer_stage2_home_speculative_task_limit_));
-  const bool authoritative_full = !speculative &&
+  const bool queue_full =
     (peer_stage1_tasks_.size() +
          peer_stage2_home_tasks_.size() +
          peer_stage1_admission_waiters_.size() +
-         authoritative_active_workers >= peer_stage1_task_queue_limit_ ||
+         active_workers >= peer_stage1_task_queue_limit_ ||
      (stage2_home &&
       peer_stage2_home_tasks_.size() >= stage2_home_limit) ||
      (!stage2_home && task.source_shard <
         peer_stage1_next_source_sequences_.size() &&
       peer_stage1_next_source_sequences_[task.source_shard] ==
         std::numeric_limits<u64>::max()));
-  if (invalid_common || speculative_full || authoritative_full) {
+  if (invalid_common || queue_full) {
     return false;
   }
   vec<Stage1OperationKey> tracked_keys;
@@ -327,14 +287,8 @@ bool MemoryNode::enqueue_peer_stage1_task(PeerStage1Task&& task) {
   }
   size_t stage2_home_queue_size = 0;
   if (stage2_home) {
-    if (speculative) {
-      peer_stage2_home_speculative_source_active_[task.source_shard] = true;
-      peer_stage2_home_speculative_tasks_.push_back(std::move(task));
-      stage2_home_queue_size = peer_stage2_home_speculative_tasks_.size();
-    } else {
-      peer_stage2_home_tasks_.push_back(std::move(task));
-      stage2_home_queue_size = peer_stage2_home_tasks_.size();
-    }
+    peer_stage2_home_tasks_.push_back(std::move(task));
+    stage2_home_queue_size = peer_stage2_home_tasks_.size();
   } else {
     peer_stage1_tasks_.push_back(std::move(task));
   }
@@ -373,17 +327,16 @@ bool MemoryNode::try_enqueue_peer_reverse_update_response(
   bool queued = false;
   {
     // Pair queue publication with the dispatcher's predicate wait. The MPMC
-    // queues remain independently bounded; this small mutex is only the
-    // cross-queue notification handshake and is never held during SEND wait.
+    // queue remains independently bounded; this small mutex is only the
+    // notification handshake and is never held during SEND wait.
     std::lock_guard<std::mutex> lock(peer_response_wait_mutex_);
     // CQ progress may finish a request that crossed its shutdown check before
     // the response dispatcher observed the terminal producer boundary. Once
     // that boundary is published, reject late responses under the same mutex
     // so none can be stranded after the dispatcher exits on empty queues.
     if (!peer_reverse_workers_done_.load(std::memory_order_acquire)) {
-      auto* queue = response.speculative
-        ? peer_speculative_responses_.get() : peer_reverse_responses_.get();
-      queued = queue != nullptr && queue->try_push(std::move(response));
+      queued = peer_reverse_responses_ != nullptr &&
+        peer_reverse_responses_->try_push(std::move(response));
     }
   }
   if (queued) {
@@ -398,9 +351,8 @@ bool MemoryNode::try_enqueue_peer_reverse_update_response(
   const u32 log_index = dropped_response_logs.fetch_add(
     1, std::memory_order_relaxed);
   if (log_index < 16) {
-    std::cerr << "[storage-peer] bounded "
-              << (response.speculative ? "speculative" : "authoritative")
-              << " response queue full; dropping retry-safe response"
+    std::cerr << "[storage-peer] bounded response queue full; "
+              << "dropping retry-safe response"
               << std::endl;
   }
   return false;

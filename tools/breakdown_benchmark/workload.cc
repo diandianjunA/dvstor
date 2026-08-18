@@ -150,6 +150,14 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"gpu_graph_extent_sidecar_format", "global_ordinal_u8_gextent8_v1"},
     {"gpu_query_beam_merge_policy",
       service.config().gpu_query_beam_merge_policy},
+    {"storage_owner_stage2_score_many",
+      service.config().storage_owner_stage2_score_many},
+    {"storage_owner_stage2_graph_issue_width",
+      service.config().storage_owner_stage2_graph_issue_width},
+    {"storage_owner_stage2_home_rpc_combining",
+      service.config().storage_owner_stage2_home_rpc_combining},
+    {"storage_owner_maintenance_queue_depth",
+      service.config().storage_owner_maintenance_queue_depth},
   };
   const size_t dim = service.config().dim;
   const double write_ratio_sum = args.write_insert_ratio + args.write_upsert_ratio + args.write_delete_ratio;
@@ -1078,7 +1086,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
   MaintenanceLogSummary maintenance_summary;
   MaintenanceLogSummary maintenance_storage_log_summary;
   bool in_band_maintenance_telemetry = false;
-  bool storage_log_maintenance_telemetry = false;
   if (!maintenance_snapshot_begin.empty()) {
     try {
       const auto maintenance_snapshot_end =
@@ -1102,37 +1109,9 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       args.storage_maintenance_logs);
     maintenance_storage_log_summary = summarize_maintenance_log_window(
       maintenance_log_cursors, measurement_end);
-    storage_log_maintenance_telemetry = true;
     if (!in_band_maintenance_telemetry) {
       maintenance_summary = maintenance_storage_log_summary;
     }
-  }
-  std::string active_stage2_task_gauge_source = "unavailable";
-  if (storage_log_maintenance_telemetry &&
-      maintenance_storage_log_summary.active_stage2_task_gauge_available) {
-    // The in-band control page is sampled only at the measurement window's
-    // endpoints. Periodic storage-log observations therefore provide the
-    // meaningful high-water mark for these gauges when both are available.
-    maintenance_summary.active_stage2_task_gauge_available = true;
-    maintenance_summary.logs_with_active_stage2_task_gauges =
-      maintenance_storage_log_summary.logs_with_active_stage2_task_gauges;
-    maintenance_summary.active_stage2_tasks_peak_observed_sum =
-      maintenance_storage_log_summary
-        .active_stage2_tasks_peak_observed_sum;
-    maintenance_summary.active_stage2_tasks_latest_sum =
-      maintenance_storage_log_summary.active_stage2_tasks_latest_sum;
-    maintenance_summary.active_stage2_task_limit_sum =
-      maintenance_storage_log_summary.active_stage2_task_limit_sum;
-    maintenance_summary.max_active_stage2_tasks_observed_per_shard =
-      maintenance_storage_log_summary
-        .max_active_stage2_tasks_observed_per_shard;
-    maintenance_summary.max_active_stage2_task_limit_per_shard =
-      maintenance_storage_log_summary
-        .max_active_stage2_task_limit_per_shard;
-    active_stage2_task_gauge_source = "storage_logs";
-  } else if (in_band_maintenance_telemetry &&
-             maintenance_summary.active_stage2_task_gauge_available) {
-    active_stage2_task_gauge_source = "in_band_control_page_endpoints";
   }
 
   const gpu_search::TelemetrySnapshot final_gpu_telemetry =
@@ -1585,65 +1564,10 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
      maintenance_summary.completion_physical_full_failures},
     {"completion_admission_failure_delta_available",
      maintenance_summary.completion_admission_failure_delta_available},
-    {"active_stage2_task_gauge_available",
-     maintenance_summary.active_stage2_task_gauge_available},
-    {"active_stage2_task_gauge_source",
-     active_stage2_task_gauge_source},
-    {"active_stage2_tasks_peak_observed_sum",
-     maintenance_summary.active_stage2_tasks_peak_observed_sum},
-    {"active_stage2_tasks_latest_sum",
-     maintenance_summary.active_stage2_tasks_latest_sum},
-    {"active_stage2_task_limit_sum",
-     maintenance_summary.active_stage2_task_limit_sum},
-    {"max_active_stage2_tasks_observed_per_shard",
-     maintenance_summary.max_active_stage2_tasks_observed_per_shard},
-    {"max_active_stage2_task_limit_per_shard",
-     maintenance_summary.max_active_stage2_task_limit_per_shard},
-    {"execution_budget_delta_available",
-     maintenance_summary.execution_budget_delta_available},
     {"active_stage2_contexts_latest_sum",
      maintenance_summary.active_stage2_contexts_latest_sum},
     {"active_stage2_context_limit_sum",
      maintenance_summary.active_stage2_context_limit_sum},
-    {"active_stage2_context_limit_baseline_sum",
-     maintenance_summary.active_stage2_context_limit_baseline_sum},
-    {"active_stage2_context_limit_max_sum",
-     maintenance_summary.active_stage2_context_limit_max_sum},
-    {"active_stage2_task_limit_baseline_sum",
-     maintenance_summary.active_stage2_task_limit_baseline_sum},
-    {"active_stage2_task_limit_max_sum",
-     maintenance_summary.active_stage2_task_limit_max_sum},
-    {"stage2_budget_promotions",
-     maintenance_summary.stage2_budget_promotions},
-    {"stage2_budget_rollbacks",
-     maintenance_summary.stage2_budget_rollbacks},
-    {"stage2_budget_lane_rollbacks",
-     maintenance_summary.stage2_budget_lane_rollbacks},
-    {"stage2_budget_low_backlog_rollbacks",
-     maintenance_summary.stage2_budget_low_backlog_rollbacks},
-    {"stage2_budget_rate_rollbacks",
-     maintenance_summary.stage2_budget_rate_rollbacks},
-    {"stage2_budget_rate_trials_accepted",
-     maintenance_summary.stage2_budget_rate_trials_accepted},
-    {"stage2_budget_high_backlog_samples",
-     maintenance_summary.stage2_budget_high_backlog_samples},
-    {"stage2_budget_lane_headroom_samples",
-     maintenance_summary.stage2_budget_lane_headroom_samples},
-    {"stage2_budget_stable_rate_milli_per_sec_sum",
-     maintenance_summary.stage2_budget_stable_rate_milli_per_sec_sum},
-    {"stage2_budget_trial_baseline_rate_milli_per_sec_sum",
-     maintenance_summary
-       .stage2_budget_trial_baseline_rate_milli_per_sec_sum},
-    {"stage2_budget_rate_trial_pending_sum",
-     maintenance_summary.stage2_budget_rate_trial_pending_sum},
-    {"stage2_budget_promotion_context_limit_sum",
-     maintenance_summary.stage2_budget_promotion_context_limit_sum},
-    {"fallback_audit_delta_available",
-     maintenance_summary.fallback_audit_delta_available},
-    {"maintenance_periodic_fallback_audits",
-     maintenance_summary.maintenance_periodic_fallback_audits},
-    {"maintenance_periodic_fallback_recoveries",
-     maintenance_summary.maintenance_periodic_fallback_recoveries},
     {"completion_window_available",
      maintenance_summary.completion_window_available},
     {"locality_delta_available",
@@ -1700,7 +1624,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
      maintenance_summary.stage2_batches == 0 ? 0.0 :
        static_cast<double>(maintenance_summary.stage2_batched_items) /
        static_cast<double>(maintenance_summary.stage2_batches)},
-    {"adaptive_packing", {
+    {"stage2_packing", {
       {"counter_delta_available",
        maintenance_summary.packing_delta_available},
       {"target_batch_max", maintenance_summary.packing_target_batch_max},
@@ -1710,14 +1634,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
       {"wait_ns", maintenance_summary.packing_wait_ns},
       {"target_flushes", maintenance_summary.packing_target_flushes},
       {"deadline_flushes", maintenance_summary.packing_deadline_flushes},
-      {"full_flushes", maintenance_summary.packing_full_flushes},
-      {"low_pressure_flushes",
-       maintenance_summary.packing_low_pressure_flushes},
       {"cleanup_flushes", maintenance_summary.packing_cleanup_flushes},
-      {"promotions", maintenance_summary.packing_promotions},
-      {"rollbacks", maintenance_summary.packing_rollbacks},
-      {"accepted_trial_windows",
-       maintenance_summary.packing_accepted_trial_windows},
     }},
     {"stage2_graph_read_waves",
      maintenance_summary.stage2_graph_read_waves},
@@ -1739,36 +1656,6 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
          static_cast<double>(
            maintenance_summary.stage2_graph_prefetch_hits +
            maintenance_summary.stage2_graph_prefetch_wasted)},
-    }},
-    {"ordered_score_prefetch", {
-      {"issued", maintenance_summary.stage2_score_prefetch_issued},
-      {"hits", maintenance_summary.stage2_score_prefetch_hits},
-      {"wasted", maintenance_summary.stage2_score_prefetch_wasted},
-      {"promotion_ratio",
-       maintenance_summary.stage2_score_prefetch_hits +
-           maintenance_summary.stage2_score_prefetch_wasted == 0 ? 0.0 :
-         static_cast<double>(
-           maintenance_summary.stage2_score_prefetch_hits) /
-         static_cast<double>(
-           maintenance_summary.stage2_score_prefetch_hits +
-           maintenance_summary.stage2_score_prefetch_wasted)},
-    }},
-    {"independent_score_lookahead", {
-      {"available",
-       maintenance_summary.independent_score_delta_available},
-      {"rpc_batches",
-       maintenance_summary.stage2_independent_score_rpc_batches},
-      {"issued", maintenance_summary.stage2_independent_score_issued},
-      {"useful", maintenance_summary.stage2_independent_score_useful},
-      {"wasted", maintenance_summary.stage2_independent_score_wasted},
-      {"useful_ratio",
-       maintenance_summary.stage2_independent_score_useful +
-           maintenance_summary.stage2_independent_score_wasted == 0 ? 0.0 :
-         static_cast<double>(
-           maintenance_summary.stage2_independent_score_useful) /
-         static_cast<double>(
-           maintenance_summary.stage2_independent_score_useful +
-           maintenance_summary.stage2_independent_score_wasted)},
     }},
     {"stage2_vector_read_waves",
      maintenance_summary.stage2_vector_read_waves},

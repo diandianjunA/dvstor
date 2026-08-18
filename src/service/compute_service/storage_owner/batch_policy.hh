@@ -9,8 +9,6 @@ namespace compute_service_detail {
 struct StorageOwnerBatchDecision {
   bool tail_escape{};
   bool max_wait_flush{};
-  bool occupancy_flush{};
-  bool adaptive_wait_flush{};
   u32 take{};
 };
 
@@ -31,12 +29,8 @@ inline bool storage_owner_batch_wait_elapsed(
 inline u64 next_storage_owner_batch_observed_ns(
     u64 previous_observed_ns,
     u32 remaining_tasks,
-    u32 dequeued_tasks,
-    u32 requested_tasks,
     u64 dequeued_at_ns) {
   if (remaining_tasks == 0) return 0;
-  (void)dequeued_tasks;
-  (void)requested_tasks;
   // Every task left behind by this dequeue may already have shared the
   // previous oldest timestamp. Resetting its age merely because the requested
   // prefix was fully visible lets an old tail exceed max_wait repeatedly

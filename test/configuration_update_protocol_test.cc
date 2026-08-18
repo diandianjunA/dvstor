@@ -9,10 +9,10 @@ namespace {
 
 configuration::IndexConfiguration make_config(
     bool explicit_disable, bool explicit_namespace = false,
-    bool bypass_dynamic_cache = false,
     std::string beam_merge_policy = {},
     std::string graph_read_policy = {},
-    std::string dynamic_graph_extent = {}) {
+    std::string dynamic_graph_extent = {},
+    std::string home_rpc_combining = {}) {
   std::vector<std::string> arguments{
     "configuration_update_protocol_test",
     "--servers", "127.0.0.1:1234",
@@ -30,10 +30,6 @@ configuration::IndexConfiguration make_config(
     arguments.emplace_back("--vector-id-namespace-size");
     arguments.emplace_back("2000000");
   }
-  if (bypass_dynamic_cache) {
-    arguments.emplace_back("--gpu-dynamic-code-cache-entries");
-    arguments.emplace_back("0");
-  }
   if (!beam_merge_policy.empty()) {
     arguments.emplace_back("--gpu-query-beam-merge-policy");
     arguments.emplace_back(std::move(beam_merge_policy));
@@ -45,6 +41,10 @@ configuration::IndexConfiguration make_config(
   if (!dynamic_graph_extent.empty()) {
     arguments.emplace_back("--gpu-dynamic-graph-extent");
     arguments.emplace_back(std::move(dynamic_graph_extent));
+  }
+  if (!home_rpc_combining.empty()) {
+    arguments.emplace_back("--storage-owner-stage2-home-rpc-combining");
+    arguments.emplace_back(std::move(home_rpc_combining));
   }
   std::vector<char*> argv;
   argv.reserve(arguments.size());
@@ -67,13 +67,13 @@ int main() {
   assert(default_config.gpu_dynamic_graph_extent);
 
   const auto stable_run_config =
-    make_config(false, false, false, "STABLE-RUN");
+    make_config(false, false, "STABLE-RUN");
   assert(stable_run_config.gpu_query_beam_merge_policy == "stable-run");
   const auto live_extent_config =
-    make_config(false, false, false, {}, "LIVE-EXTENT");
+    make_config(false, false, {}, "LIVE-EXTENT");
   assert(live_extent_config.gpu_query_graph_read_policy == "live-extent");
   const auto static_only_extent_config =
-    make_config(false, false, false, {}, "LIVE-EXTENT", "false");
+    make_config(false, false, {}, "LIVE-EXTENT", "false");
   assert(static_only_extent_config.gpu_query_graph_read_policy ==
          "live-extent");
   assert(!static_only_extent_config.gpu_dynamic_graph_extent);
@@ -85,8 +85,10 @@ int main() {
   const auto query_only_config = make_config(true);
   assert(!query_only_config.enable_updates);
 
-  const auto cache_bypass_config = make_config(false, false, true);
-  assert(cache_bypass_config.gpu_dynamic_code_cache_entries == 0);
+  assert(default_config.storage_owner_stage2_home_rpc_combining);
+  const auto direct_home_rpc_config =
+    make_config(false, false, {}, {}, {}, "false");
+  assert(!direct_home_rpc_config.storage_owner_stage2_home_rpc_combining);
 
   // Stage2 is mandatory for the sole supported update pipeline.
   assert(default_config.storage_owner_maintenance_workers > 0);

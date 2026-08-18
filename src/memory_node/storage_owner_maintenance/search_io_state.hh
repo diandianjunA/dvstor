@@ -58,8 +58,6 @@ struct Stage2ScoreConsumer {
   std::size_t search_index{};
   u64 generation{};
   RemotePtr pointer;
-  bool speculative{};
-  RemotePtr expansion_pointer;
 };
 
 struct Stage2GraphConsumer {
@@ -85,44 +83,12 @@ struct Stage2HomeExpandRpc {
   // Graph responses need to distinguish authoritative items from ordered
   // speculative items without changing the wire protocol.
   vec<std::size_t> graph_consumer_indexes;
-  // Score responses use request order on the wire. Keep the corresponding
-  // logical consumer so piggybacked speculative scores never advance a beam.
-  vec<std::size_t> score_consumer_indexes;
-};
-
-// Ordered graph lookahead can expose exact score work before that expansion
-// becomes authoritative.  Keep this work in a transport channel independent
-// from Stage2SearchIoPhase: it owns no registered RDMA scratch and therefore
-// must not turn the authoritative graph/score state machine into another
-// barrier.  authoritative_generation is installed only when the matching
-// cached expansion is promoted; until then a response may update only the
-// bounded graph-prefetch cache.
-struct Stage2SpeculativeScoreConsumer {
-  std::size_t search_index{};
-  RemotePtr expansion_pointer;
-  RemotePtr pointer;
-  u64 authoritative_generation{};
-};
-
-struct Stage2SpeculativeScoreRpc {
-  u32 target_shard{};
-  u32 item_count{};
-  u64 request_id{};
-  u64 deadline_ns{};
-  bool posted{};
-  bool process_credit_held{};
-  vec<byte_t> request;
-  vec<Stage2SpeculativeScoreConsumer> consumers;
 };
 
 struct Stage2PrefetchedGraphNeighbor {
   RemotePtr pointer;
   distance_t distance{};
   u32 disposition{};
-  bool score_prefetched{};
-  u32 score_prefetch_issues{};
-  bool independent_score_prefetched{};
-  u32 independent_score_issues{};
 };
 
 struct Stage2PrefetchedGraphExpansion {
@@ -152,24 +118,6 @@ constexpr u32 stage2_ordered_issue_width(
       static_cast<long double>(hits) / static_cast<long double>(outcomes);
   if (promotion_ratio < 0.70L) return probe_width;
   return maximum;
-}
-
-constexpr bool stage2_score_prefetch_enabled(u64 hits, u64 wasted) {
-  const u64 outcomes = hits + wasted;
-  if (outcomes < 512) return true;
-  return static_cast<long double>(hits) /
-           static_cast<long double>(outcomes) >= 0.70L;
-}
-
-// An ordinary one-sided score wave already owns one CQ dependency.  Adding a
-// different peer to otherwise-unused READ credit does not add another wait;
-// it only fills the same bounded transport wave.  A score-many wave is
-// different: admitting a new peer creates another two-sided RPC whose tail
-// would become part of the barrier, so speculative work stays restricted to
-// destinations already selected by authoritative work.
-constexpr bool stage2_score_prefetch_peer_eligible(
-    bool score_many_dispatch, bool authoritative_peer_selected) {
-  return !score_many_dispatch || authoritative_peer_selected;
 }
 
 // A score generation may expose more candidates than fit in one transport
@@ -258,23 +206,6 @@ constexpr bool stage2_score_many_peer_eligible(
   return minimum != 0 && pending_items >= minimum;
 }
 
-// Independent score-many already has stricter amortization fences than the
-// authoritative score-many path: at most one message per context, one
-// request-lifetime credit per peer, and an exact context-level A/B stop-loss.
-// Use half of the logical context coalescing unit, capped at 16 items. With
-// the production batch limit of 32 this is a 16-item request (typically one
-// or two query vectors plus 16 compact item descriptors), large enough to
-// amortize a two-sided RPC without requiring the 32 eligible candidates that
-// the measured graph-lookahead cache never exposed.
-constexpr u32 stage2_independent_score_min_items(
-    u32 item_capacity, u32 context_batch_limit) {
-  if (item_capacity == 0 || context_batch_limit == 0) return 0;
-  const u32 logical_message_capacity =
-    std::min(item_capacity, context_batch_limit);
-  return std::min<u32>(
-    16, stage2_score_many_min_items(logical_message_capacity));
-}
-
 struct Stage2SearchIoState {
   bool initialized{};
   Stage2SearchIoPhase phase{Stage2SearchIoPhase::idle};
@@ -320,18 +251,6 @@ struct Stage2SearchIoState {
   vec<Stage2HomeExpandRpc> home_expand_rpcs;
   std::size_t home_expand_rpc_count{};
   vec<vec<Stage2PrefetchedGraphExpansion>> graph_prefetch_cache;
-  // At most one independent score-many RPC per peer.  The vector is indexed
-  // by physical shard, so memory and transport debt are bounded independently
-  // of the number of cached lookahead expansions.
-  vec<Stage2SpeculativeScoreRpc> speculative_score_rpcs;
-  // Independent score lookahead is admitted only by its own no-spec/spec A/B
-  // controller. One RPC total per context bounds receiver work; the
-  // process-wide per-peer credit provides the second overload fence.
-  bool independent_score_allowed{};
-  u32 independent_score_rpcs_started{};
-  u32 independent_score_rpcs_posted{};
-  u64 independent_score_useful{};
-  u32 speculative_peer_cursor{};
 
   [[nodiscard]] bool graph_prefetch_contains(
       std::size_t search_index, RemotePtr pointer) const {
@@ -361,137 +280,6 @@ struct Stage2SearchIoState {
     }
     cache.push_back(std::move(entry));
     return true;
-  }
-
-  bool resolve_graph_prefetch_score(
-      std::size_t search_index, RemotePtr expansion_pointer,
-      RemotePtr neighbor_pointer, std::optional<distance_t> distance,
-      u32 disposition, bool independent = false) {
-    if (search_index >= graph_prefetch_cache.size()) return false;
-    auto& cache = graph_prefetch_cache[search_index];
-    const auto expansion = std::find_if(
-      cache.begin(), cache.end(), [&](const auto& entry) {
-        return entry.pointer == expansion_pointer;
-      });
-    if (expansion == cache.end()) return false;
-    const auto neighbor = std::find_if(
-      expansion->neighbors.begin(), expansion->neighbors.end(),
-      [&](const auto& entry) { return entry.pointer == neighbor_pointer; });
-    if (neighbor == expansion->neighbors.end()) return false;
-    if (independent) {
-      neighbor->independent_score_prefetched = true;
-    } else {
-      neighbor->score_prefetched = true;
-    }
-    neighbor->disposition = disposition;
-    if (distance.has_value()) {
-      neighbor->distance = *distance;
-    }
-    return true;
-  }
-
-  bool cancel_graph_prefetch_score_issue(
-      std::size_t search_index, RemotePtr expansion_pointer,
-      RemotePtr neighbor_pointer) {
-    if (search_index >= graph_prefetch_cache.size()) return false;
-    auto& cache = graph_prefetch_cache[search_index];
-    const auto expansion = std::find_if(
-      cache.begin(), cache.end(), [&](const auto& entry) {
-        return entry.pointer == expansion_pointer;
-      });
-    if (expansion == cache.end()) return false;
-    const auto neighbor = std::find_if(
-      expansion->neighbors.begin(), expansion->neighbors.end(),
-      [&](const auto& entry) { return entry.pointer == neighbor_pointer; });
-    if (neighbor == expansion->neighbors.end() ||
-        neighbor->score_prefetch_issues == 0) {
-      return false;
-    }
-    --neighbor->score_prefetch_issues;
-    return true;
-  }
-
-  bool cancel_graph_prefetch_independent_score_issue(
-      std::size_t search_index, RemotePtr expansion_pointer,
-      RemotePtr neighbor_pointer) {
-    if (search_index >= graph_prefetch_cache.size()) return false;
-    auto& cache = graph_prefetch_cache[search_index];
-    const auto expansion = std::find_if(
-      cache.begin(), cache.end(), [&](const auto& entry) {
-        return entry.pointer == expansion_pointer;
-      });
-    if (expansion == cache.end()) return false;
-    const auto neighbor = std::find_if(
-      expansion->neighbors.begin(), expansion->neighbors.end(),
-      [&](const auto& entry) { return entry.pointer == neighbor_pointer; });
-    if (neighbor == expansion->neighbors.end() ||
-        neighbor->independent_score_issues == 0) {
-      return false;
-    }
-    --neighbor->independent_score_issues;
-    return true;
-  }
-
-  // Transfer an in-flight speculative score from cache ownership to the
-  // exact authoritative score generation created by promotion.  Responses
-  // are still accepted only by resolve_score_request(), whose phase,
-  // generation, and pending-pointer checks form the final fence.
-  std::size_t promote_speculative_scores(
-      std::size_t search_index, RemotePtr expansion_pointer,
-      u64 authoritative_generation) {
-    if (authoritative_generation == 0) return 0;
-    std::size_t promoted = 0;
-    for (Stage2SpeculativeScoreRpc& rpc : speculative_score_rpcs) {
-      if (!rpc.posted) continue;
-      for (Stage2SpeculativeScoreConsumer& consumer : rpc.consumers) {
-        if (consumer.search_index == search_index &&
-            consumer.expansion_pointer == expansion_pointer) {
-          consumer.authoritative_generation = authoritative_generation;
-          ++promoted;
-        }
-      }
-    }
-    return promoted;
-  }
-
-  [[nodiscard]] bool speculative_score_covers(
-      std::size_t search_index, u64 generation, RemotePtr pointer) const {
-    if (generation == 0) return false;
-    for (const Stage2SpeculativeScoreRpc& rpc : speculative_score_rpcs) {
-      if (!rpc.posted) continue;
-      for (const Stage2SpeculativeScoreConsumer& consumer : rpc.consumers) {
-        if (consumer.search_index == search_index &&
-            consumer.authoritative_generation == generation &&
-            consumer.pointer == pointer) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  [[nodiscard]] u64 graph_prefetched_score_count() const {
-    u64 count = 0;
-    for (const auto& cache : graph_prefetch_cache) {
-      for (const auto& expansion : cache) {
-        for (const auto& neighbor : expansion.neighbors) {
-          count += neighbor.score_prefetch_issues;
-        }
-      }
-    }
-    return count;
-  }
-
-  [[nodiscard]] u64 graph_independent_score_count() const {
-    u64 count = 0;
-    for (const auto& cache : graph_prefetch_cache) {
-      for (const auto& expansion : cache) {
-        for (const auto& neighbor : expansion.neighbors) {
-          count += neighbor.independent_score_issues;
-        }
-      }
-    }
-    return count;
   }
 
   std::optional<Stage2PrefetchedGraphExpansion> take_graph_prefetch(
@@ -537,7 +325,6 @@ struct Stage2SearchIoState {
       rpc.posted = false;
       rpc.complete = false;
       rpc.request.clear();
-      rpc.score_consumer_indexes.clear();
     }
     graph_consumers.clear();
     graph_selected_remote.clear();
@@ -548,27 +335,12 @@ struct Stage2SearchIoState {
     for (vec<RemotePtr>& neighbors : graph_neighbors) neighbors.clear();
     graph_retry_state.clear();
     for (auto& cache : graph_prefetch_cache) cache.clear();
-    for (auto& rpc : speculative_score_rpcs) {
-      rpc.posted = false;
-      rpc.process_credit_held = false;
-      rpc.item_count = 0;
-      rpc.request_id = 0;
-      rpc.deadline_ns = 0;
-      rpc.request.clear();
-      rpc.consumers.clear();
-    }
-    independent_score_allowed = false;
-    independent_score_rpcs_started = 0;
-    independent_score_rpcs_posted = 0;
-    independent_score_useful = 0;
-    speculative_peer_cursor = 0;
     home_expand_rpc_count = 0;
     for (auto& rpc : home_expand_rpcs) {
       rpc.posted = false;
       rpc.complete = false;
       rpc.request.clear();
       rpc.graph_consumer_indexes.clear();
-      rpc.score_consumer_indexes.clear();
     }
   }
 
@@ -576,19 +348,8 @@ struct Stage2SearchIoState {
   // bounds only lane-cache retention after an exceptional search; it is not
   // an in-flight candidate/frontier budget.
   void reset_completed(std::size_t max_retained_capacity) {
-    // reset_completed() ends search scratch ownership, not the enclosing
-    // Stage2 context. Preserve successful wire posts and locally consumed
-    // exact scores until worker finalization submits this context's A/B
-    // feedback; reset() at context release starts the next sample at zero.
-    const u32 completed_independent_score_rpcs_posted =
-      independent_score_rpcs_posted;
-    const u64 completed_independent_score_useful =
-      independent_score_useful;
     continuation.trim_oversized_capacity(max_retained_capacity);
     reset();
-    independent_score_rpcs_posted =
-      completed_independent_score_rpcs_posted;
-    independent_score_useful = completed_independent_score_useful;
 
     const auto trim = [max_retained_capacity](auto& values) {
       if (values.capacity() > max_retained_capacity) {
@@ -620,11 +381,6 @@ struct Stage2SearchIoState {
     // bounded by storage_owner_batch_max * (metadata + vector bytes), and
     // retaining it avoids an allocator round trip for every graph wave.
     trim(home_expand_rpcs);
-    for (auto& rpc : speculative_score_rpcs) {
-      trim(rpc.request);
-      trim(rpc.consumers);
-    }
-    trim(speculative_score_rpcs);
     trim(graph_retry_state);
     for (auto& cache : graph_prefetch_cache) {
       for (auto& entry : cache) trim(entry.neighbors);

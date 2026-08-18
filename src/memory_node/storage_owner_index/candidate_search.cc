@@ -854,12 +854,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
     state.search_seeded.assign(tasks.size(), 0);
     state.score_collect_cursors.assign(tasks.size(), {});
     state.graph_prefetch_cache.resize(tasks.size());
-    state.speculative_score_rpcs.resize(num_storage_nodes_);
-    for (u32 peer = 0; peer < num_storage_nodes_; ++peer) {
-      state.speculative_score_rpcs[peer].target_shard = peer;
-    }
-    state.speculative_peer_cursor = static_cast<u32>(
-      tasks[0].maintenance_sequence % num_storage_nodes_);
     state.continuation.initialize(
       tasks.size(), storage_id_, construction_width, budget);
     state.round_robin_search = 0;
@@ -957,17 +951,9 @@ MemoryNode::advance_stage2_search_candidates_batched(
       const distance_t distance = distance_between_vectors(
         targets[consumer.search_index].vector_data.data(), dtype,
         candidate_vector, dtype, config);
-      if (consumer.speculative) {
-        state.resolve_graph_prefetch_score(
-          consumer.search_index, consumer.expansion_pointer,
-          consumer.pointer, std::optional<distance_t>{distance},
-          static_cast<u32>(
-            service::storage_owner::Stage2HomeDisposition::stable));
-      } else {
-        resolved += state.continuation.resolve_score_request(
-          consumer.search_index, consumer.generation, consumer.pointer,
-          std::optional<distance_t>{distance});
-      }
+      resolved += state.continuation.resolve_score_request(
+        consumer.search_index, consumer.generation, consumer.pointer,
+        std::optional<distance_t>{distance});
     }
     if (resolved != 0) {
       storage_owner_stage2_scored_candidates_.fetch_add(
@@ -985,17 +971,9 @@ MemoryNode::advance_stage2_search_candidates_batched(
          position < state.score_group_offsets[group_index + 1]; ++position) {
       const Stage2ScoreConsumer& consumer =
         state.score_consumers[state.score_order[position]];
-      if (consumer.speculative) {
-        state.resolve_graph_prefetch_score(
-          consumer.search_index, consumer.expansion_pointer,
-          consumer.pointer, std::nullopt,
-          static_cast<u32>(
-            service::storage_owner::Stage2HomeDisposition::terminal));
-      } else {
-        resolved += state.continuation.resolve_score_request(
-          consumer.search_index, consumer.generation, consumer.pointer,
-          std::nullopt);
-      }
+      resolved += state.continuation.resolve_score_request(
+        consumer.search_index, consumer.generation, consumer.pointer,
+        std::nullopt);
     }
     if (resolved != 0) {
       storage_owner_stage2_scored_candidates_.fetch_add(
@@ -1116,16 +1094,12 @@ MemoryNode::advance_stage2_search_candidates_batched(
     thread_local vec<u32> remote_pairs_by_peer;
     thread_local vec<u32> score_many_items_by_peer;
     thread_local vec<size_t> score_many_pending_by_peer;
-    thread_local vec<size_t> authoritative_pending_by_peer;
     thread_local vec<u8> score_many_peer_eligible;
-    thread_local vec<u8> authoritative_peer_selected;
     remote_wrs_by_peer.resize(num_storage_nodes_);
     remote_pairs_by_peer.resize(num_storage_nodes_);
     score_many_items_by_peer.resize(num_storage_nodes_);
     score_many_pending_by_peer.assign(num_storage_nodes_, 0);
-    authoritative_pending_by_peer.assign(num_storage_nodes_, 0);
     score_many_peer_eligible.assign(num_storage_nodes_, 0);
-    authoritative_peer_selected.assign(num_storage_nodes_, 0);
     const u32 score_many_item_limit =
       std::max<u32>(1, config.storage_owner_search_snapshot_batch);
     state.score_many_dispatch = false;
@@ -1138,37 +1112,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
           if (storage_node_pointer_addressable(request.pointer) &&
               !local_shard(request.pointer.memory_node())) {
             ++score_many_pending_by_peer[request.pointer.memory_node()];
-          }
-        }
-      }
-      authoritative_pending_by_peer = score_many_pending_by_peer;
-      for (size_t search_index = 0;
-           search_index < state.graph_prefetch_cache.size(); ++search_index) {
-        for (const Stage2PrefetchedGraphExpansion& expansion :
-             state.graph_prefetch_cache[search_index]) {
-          for (const Stage2PrefetchedGraphNeighbor& neighbor :
-               expansion.neighbors) {
-            if (neighbor.score_prefetched ||
-                neighbor.independent_score_prefetched ||
-                neighbor.score_prefetch_issues != 0 ||
-                neighbor.independent_score_issues != 0 ||
-                !storage_node_pointer_addressable(neighbor.pointer) ||
-                local_shard(neighbor.pointer.memory_node())) {
-              continue;
-            }
-            const auto disposition = static_cast<
-              service::storage_owner::Stage2HomeDisposition>(
-                neighbor.disposition);
-            if (disposition ==
-                  service::storage_owner::Stage2HomeDisposition::stable ||
-                disposition ==
-                  service::storage_owner::Stage2HomeDisposition::terminal) {
-              continue;
-            }
-            const u32 peer = neighbor.pointer.memory_node();
-            if (authoritative_pending_by_peer[peer] != 0) {
-              ++score_many_pending_by_peer[peer];
-            }
           }
         }
       }
@@ -1219,12 +1162,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
         examined_this_round = true;
         const PartitionContinuationScoreRequest& request =
           requests[*position];
-        // Independent lookahead scoring is first-completion-wins rather than
-        // an authoritative dependency owner. The ordinary exact request is
-        // always eligible here; whichever response resolves this
-        // generation/pointer first wins and the other is rejected
-        // idempotently by resolve_score_request(). Thus a slow speculative
-        // peer can never add latency to the correctness path.
         const bool remote = storage_node_pointer_addressable(
           request.pointer) && !local_shard(request.pointer.memory_node());
         const bool duplicate_remote = remote &&
@@ -1250,11 +1187,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
           continue;
         }
         state.score_consumers.push_back({
-          request.search_index, request.generation, request.pointer,
-          false, RemotePtr{}});
-        if (remote) {
-          authoritative_peer_selected[request.pointer.memory_node()] = 1;
-        }
+          request.search_index, request.generation, request.pointer});
         if (!state.score_many_dispatch && distinct_remote) {
           state.score_selected_remote.insert(request.pointer);
           ++physical_reads;
@@ -1263,119 +1196,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
         selected_any = true;
       }
       if (!examined_this_round) break;
-    }
-    // Score prefetch consumes only unused capacity in an already-required
-    // score wave.  One-sided READs may use any peer with spare per-peer/global
-    // credit because all of them retire on the same CQ dependency; this is
-    // the key overlap that turns the high-hit ordered graph lookahead into a
-    // score pipeline.  Score-many remains restricted to an authoritative
-    // destination so speculation never creates another two-sided RPC tail.
-    // Cached exact distances are committed only if their expansion later
-    // becomes authoritative.
-    const u64 score_prefetch_hits =
-      storage_owner_stage2_score_prefetch_hits_.load(
-        std::memory_order_relaxed);
-    const u64 score_prefetch_wasted =
-      storage_owner_stage2_score_prefetch_wasted_.load(
-        std::memory_order_relaxed);
-    const u64 score_prefetch_outcomes =
-      score_prefetch_hits + score_prefetch_wasted;
-    u64 next_score_feedback =
-      storage_owner_stage2_score_feedback_next_outcome_.load(
-        std::memory_order_relaxed);
-    if (score_prefetch_outcomes >= next_score_feedback &&
-        storage_owner_stage2_score_feedback_next_outcome_
-          .compare_exchange_strong(
-            next_score_feedback, score_prefetch_outcomes + 512,
-            std::memory_order_relaxed, std::memory_order_relaxed)) {
-      const u64 base_hits =
-        storage_owner_stage2_score_feedback_base_hits_.exchange(
-          score_prefetch_hits, std::memory_order_relaxed);
-      const u64 base_wasted =
-        storage_owner_stage2_score_feedback_base_wasted_.exchange(
-          score_prefetch_wasted, std::memory_order_relaxed);
-      storage_owner_stage2_score_prefetch_enabled_.store(
-        stage2_score_prefetch_enabled(
-          score_prefetch_hits >= base_hits
-            ? score_prefetch_hits - base_hits : 0,
-          score_prefetch_wasted >= base_wasted
-            ? score_prefetch_wasted - base_wasted : 0),
-        std::memory_order_relaxed);
-    }
-    u64 speculative_scores = 0;
-    if (selected_any &&
-        storage_owner_stage2_score_prefetch_enabled_.load(
-          std::memory_order_relaxed)) {
-      for (size_t search_index = 0;
-           search_index < state.graph_prefetch_cache.size(); ++search_index) {
-        if (state.search_seeded[search_index] == 0) continue;
-        for (Stage2PrefetchedGraphExpansion& expansion :
-             state.graph_prefetch_cache[search_index]) {
-          for (Stage2PrefetchedGraphNeighbor& neighbor :
-               expansion.neighbors) {
-            const auto disposition = static_cast<
-              service::storage_owner::Stage2HomeDisposition>(
-                neighbor.disposition);
-            if (neighbor.score_prefetched ||
-                neighbor.independent_score_prefetched ||
-                neighbor.score_prefetch_issues != 0 ||
-                neighbor.independent_score_issues != 0 ||
-                disposition ==
-                  service::storage_owner::Stage2HomeDisposition::stable ||
-                disposition ==
-                  service::storage_owner::Stage2HomeDisposition::terminal ||
-                !storage_node_pointer_addressable(neighbor.pointer) ||
-                local_shard(neighbor.pointer.memory_node())) {
-              continue;
-            }
-            const u32 peer = neighbor.pointer.memory_node();
-            if (!stage2_score_prefetch_peer_eligible(
-                  state.score_many_dispatch,
-                  authoritative_peer_selected[peer] != 0)) {
-              continue;
-            }
-            const bool duplicate_remote = !state.score_many_dispatch &&
-              state.score_selected_remote.contains(neighbor.pointer);
-            const bool distinct_remote = !duplicate_remote;
-            const bool requires_after_header = distinct_remote &&
-              !VamanaNode::immutable_base_record(neighbor.pointer);
-            if (!state.score_many_dispatch && requires_after_header) {
-              // The one-sided dispatcher deliberately retires immutable and
-              // mutable records in separate waves. A mutable speculative item
-              // would be dropped at that boundary, so leave it authoritative.
-              continue;
-            }
-            const bool accepted = state.score_many_dispatch
-              ? (score_many_peer_eligible[peer] != 0 &&
-                 score_many_quota.try_accept(peer, true))
-              : stage2_consumer_fits_physical_scratch(
-                  distinct_remote, physical_reads, score_dispatch_limit) &&
-                quota.try_accept(peer, distinct_remote, false);
-            if (!accepted) continue;
-            state.score_consumers.push_back({
-              search_index,
-              state.continuation.generation(search_index),
-              neighbor.pointer,
-              true,
-              expansion.pointer,
-            });
-            if (!state.score_many_dispatch && distinct_remote) {
-              state.score_selected_remote.insert(neighbor.pointer);
-              ++physical_reads;
-            }
-            lib_assert(
-              neighbor.score_prefetch_issues !=
-                std::numeric_limits<u32>::max(),
-              "Stage2 score prefetch issue counter overflow");
-            ++neighbor.score_prefetch_issues;
-            ++speculative_scores;
-          }
-        }
-      }
-    }
-    if (speculative_scores != 0) {
-      storage_owner_stage2_score_prefetch_issued_.fetch_add(
-        speculative_scores, std::memory_order_relaxed);
     }
     if (selected_any) {
       state.round_robin_search = (last_search + 1) % search_count;
@@ -1644,7 +1464,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
       rpc.complete = false;
       rpc.deadline_ns = 0;
       rpc.request.clear();
-      rpc.score_consumer_indexes.clear();
     }
     thread_local vec<vec<size_t>> consumers_by_shard;
     consumers_by_shard.clear();
@@ -1680,11 +1499,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
         rpc.target_shard = shard;
         rpc.item_count = item_count;
         rpc.request_id = allocate_peer_request_id();
-        rpc.score_consumer_indexes.resize(item_count);
-        for (u32 item = 0; item < item_count; ++item) {
-          rpc.score_consumer_indexes[item] =
-            shard_consumers[begin + item];
-        }
         if (state.score_many_dispatch) {
           score_many_query_searches.clear();
           score_many_query_indexes.assign(
@@ -1946,10 +1760,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
   thread_local vec<PeerReadRequest> read_requests;
   thread_local vec<PeerReadSnapshotRequest> snapshot_requests;
   thread_local vec<byte_t> home_response_payload;
-  thread_local vec<byte_t> speculative_score_response_payload;
   thread_local vec<RemotePtr> home_neighbors;
-  thread_local vec<u32> speculative_query_indexes;
-  thread_local vec<size_t> speculative_query_searches;
 
   // Authoritative Stage2-home work is transported through the node-wide
   // combiner. The context keeps its original logical request ID and consumes
@@ -1963,445 +1774,17 @@ MemoryNode::advance_stage2_search_candidates_batched(
                "Stage2 home RPC has no generation-fenced context owner");
     const auto result = try_enqueue_stage2_home_rpc_request(
       rpc.target_shard, request_type, rpc.request_id, rpc.item_count,
-      span<const byte_t>{rpc.request.data(), rpc.request.size()}, false,
+      span<const byte_t>{rpc.request.data(), rpc.request.size()},
       PeerResponseCompletionTarget{.context_owner = owner});
     return result == Stage2HomeRpcEnqueueResult::enqueued ||
       result == Stage2HomeRpcEnqueueResult::duplicate;
   };
 
-  const auto clear_speculative_score_rpc = [&] (
-      Stage2SpeculativeScoreRpc& rpc) {
-    if (rpc.process_credit_held) {
-      release_peer_rpc_speculative_credit(
-        rpc.target_shard, rpc.request_id);
-    }
-    rpc.posted = false;
-    rpc.process_credit_held = false;
-    rpc.item_count = 0;
-    rpc.request_id = 0;
-    rpc.deadline_ns = 0;
-    rpc.request.clear();
-    rpc.consumers.clear();
-  };
-
-  // Roll back cache ownership for a transport attempt that did not produce
-  // an exact result. If the expansion was already promoted, the cache entry
-  // is intentionally absent and its ordinary pending-score request becomes
-  // selectable as soon as this RPC is cleared.
-  const auto abandon_speculative_score_rpc = [&] (
-      Stage2SpeculativeScoreRpc& rpc, bool cancel_registered,
-      bool count_wasted, bool remote_completion_observed = false) {
-    if (cancel_registered && rpc.request_id != 0) {
-      cancel_peer_rpc_response(rpc.request_id);
-    }
-    for (const Stage2SpeculativeScoreConsumer& consumer : rpc.consumers) {
-      (void)state.cancel_graph_prefetch_independent_score_issue(
-        consumer.search_index, consumer.expansion_pointer,
-        consumer.pointer);
-    }
-    if (count_wasted && !rpc.consumers.empty()) {
-      storage_owner_stage2_independent_score_wasted_.fetch_add(
-        rpc.consumers.size(), std::memory_order_relaxed);
-    }
-    if (rpc.process_credit_held && rpc.posted &&
-        !remote_completion_observed) {
-      fail_closed_peer_rpc_speculative_credit(
-        rpc.target_shard, rpc.request_id);
-      rpc.process_credit_held = false;
-    }
-    clear_speculative_score_rpc(rpc);
-  };
-
-  // Poll independently from state.phase. A completed lookahead score either
-  // fills its still-bounded graph cache entry, or (after that expansion has
-  // been promoted) races the ordinary exact RPC to resolve the same
-  // generation/pointer dependency. The continuation fence makes this
-  // first-completion-wins; every other outcome is a performance miss and
-  // leaves the authoritative path unchanged.
-  const auto poll_speculative_score_rpcs = [&] {
-    bool progressed = false;
-    for (Stage2SpeculativeScoreRpc& rpc :
-         state.speculative_score_rpcs) {
-      if (!rpc.posted) continue;
-      service::storage_owner::PeerRpcHeader response_header{};
-      PeerResponseLease response_lease{};
-      speculative_score_response_payload.clear();
-      const TryPeerResponse response = try_consume_peer_rpc_response(
-        rpc.request_id, rpc.target_shard,
-        service::storage_owner::PeerRpcType::stage2_score_many_response,
-        rpc.item_count, response_header, speculative_score_response_payload,
-        response_lease);
-      if (response == TryPeerResponse::pending) {
-        if (steady_now_ns() >= rpc.deadline_ns) {
-          abandon_speculative_score_rpc(rpc, true, true);
-          progressed = true;
-        }
-        continue;
-      }
-
-      const size_t expected_bytes =
-        service::storage_owner::stage2_score_many_response_bytes(
-          rpc.item_count);
-      bool valid = response == TryPeerResponse::success &&
-        speculative_score_response_payload.size() == expected_bytes &&
-        response_header.magic == service::storage_owner::kPeerRpcMagic &&
-        response_header.version == service::storage_owner::kPeerRpcVersion &&
-        response_header.type == static_cast<u32>(
-          service::storage_owner::PeerRpcType::stage2_score_many_response) &&
-        response_header.source_shard == rpc.target_shard &&
-        response_header.item_count == rpc.item_count &&
-        response_header.request_id == rpc.request_id &&
-        response_header.status == static_cast<u32>(
-          service::storage_owner::InsertStatus::ok) &&
-        response_header.reserved == 0;
-      const auto* request_items = valid
-        ? service::storage_owner::stage2_score_many_items(
-            rpc.request.data())
-        : nullptr;
-      const auto* results = valid
-        ? service::storage_owner::stage2_score_many_results(
-            speculative_score_response_payload.data())
-        : nullptr;
-      for (u32 item = 0; valid && item < rpc.item_count; ++item) {
-        const auto& request = request_items[item];
-        const auto& result = results[item];
-        valid = result.pointer_raw == request.pointer_raw &&
-          result.generation == request.generation &&
-          result.search_index == request.search_index &&
-          result.search_index < tasks.size() && result.reserved == 0 &&
-          result.disposition <= static_cast<u32>(
-            service::storage_owner::Stage2HomeDisposition::terminal);
-      }
-      if (!valid) {
-        const bool remote_completion_observed = response_lease.valid();
-        if (response_lease.valid()) {
-          lib_assert(rearm_peer_rpc_response(response_lease),
-                     "invalid speculative score response lost its lease");
-        }
-        abandon_speculative_score_rpc(
-          rpc, true, true, remote_completion_observed);
-        progressed = true;
-        continue;
-      }
-      lib_assert(acknowledge_peer_rpc_response(response_lease),
-                 "validated speculative score response lost its lease");
-
-      u64 direct_hits = 0;
-      u64 direct_scored = 0;
-      u64 direct_home_scored = 0;
-      u64 wasted = 0;
-      for (u32 item = 0; item < rpc.item_count; ++item) {
-        const Stage2SpeculativeScoreConsumer& consumer =
-          rpc.consumers[item];
-        const auto& result = results[item];
-        const auto disposition = static_cast<
-          service::storage_owner::Stage2HomeDisposition>(
-            result.disposition);
-        const bool stable = disposition ==
-          service::storage_owner::Stage2HomeDisposition::stable;
-        const bool terminal = disposition ==
-          service::storage_owner::Stage2HomeDisposition::terminal;
-        std::optional<distance_t> exact_distance;
-        if (stable) exact_distance.emplace(result.distance);
-
-        bool consumed = false;
-        if (stable || terminal) {
-          consumed = state.resolve_graph_prefetch_score(
-            consumer.search_index, consumer.expansion_pointer,
-            consumer.pointer, exact_distance, result.disposition, true);
-          if (!consumed && consumer.authoritative_generation != 0) {
-            consumed = state.continuation.resolve_score_request(
-              consumer.search_index, consumer.authoritative_generation,
-              consumer.pointer, exact_distance);
-            if (consumed) {
-              ++direct_hits;
-              ++direct_scored;
-              direct_home_scored += stable;
-            }
-          }
-        }
-        if (!consumed) {
-          (void)state.cancel_graph_prefetch_independent_score_issue(
-            consumer.search_index, consumer.expansion_pointer,
-            consumer.pointer);
-          ++wasted;
-        }
-      }
-      if (direct_hits != 0) {
-        // Promotion already created the authoritative dependency. A direct
-        // race win is exact but is not proof that an RPC/wave was avoided, so
-        // classify it conservatively as non-useful independent work.
-        storage_owner_stage2_independent_score_wasted_.fetch_add(
-          direct_hits, std::memory_order_relaxed);
-      }
-      if (wasted != 0) {
-        storage_owner_stage2_independent_score_wasted_.fetch_add(
-          wasted, std::memory_order_relaxed);
-      }
-      if (direct_scored != 0) {
-        storage_owner_stage2_scored_candidates_.fetch_add(
-          direct_scored, std::memory_order_relaxed);
-      }
-      if (direct_home_scored != 0) {
-        storage_owner_stage2_home_scored_neighbors_.fetch_add(
-          direct_home_scored, std::memory_order_relaxed);
-      }
-      clear_speculative_score_rpc(rpc);
-      progressed = true;
-    }
-    return progressed;
-  };
-
-  // Fill one exact score-many message per peer from already-bounded graph
-  // lookahead. The minimum payload, one-per-context budget, and per-peer
-  // request-lifetime credit prevent sparse or slow deployments from turning
-  // this into RPC amplification. Its independent no-spec/spec controller
-  // retains the path only after an actual posted-RPC cohort reduces complete
-  // context cost without increasing completion debt.
-  const auto post_speculative_score_rpcs = [&] {
-    if (!peer_stage2_home_speculation_enabled_ ||
-        !state.independent_score_allowed ||
-        state.independent_score_rpcs_started != 0 ||
-        !config.storage_owner_stage2_score_many) {
-      return false;
-    }
-    // One independent RPC per context is sufficient to overlap useful work
-    // and prevents a large lookahead cache from multiplying transport debt.
-    if (std::any_of(
-          state.speculative_score_rpcs.begin(),
-          state.speculative_score_rpcs.end(),
-          [](const Stage2SpeculativeScoreRpc& rpc) {
-            return rpc.posted;
-          })) {
-      return false;
-    }
-    // Low-priority work is launched only after the correctness path already
-    // owns an in-flight home RPC. Together with the transport's reserved last
-    // graph slot this guarantees speculation cannot get ahead of or block the
-    // authoritative producer.
-    const auto authoritative_rpc_in_flight = [&](u32 peer) {
-      return std::any_of(
-        state.score_home_rpcs.begin(),
-        state.score_home_rpcs.begin() + state.score_home_rpc_count,
-        [&](const Stage2HomeExpandRpc& rpc) {
-          return rpc.target_shard == peer && rpc.posted && !rpc.complete;
-        }) ||
-      std::any_of(
-        state.home_expand_rpcs.begin(),
-        state.home_expand_rpcs.begin() + state.home_expand_rpc_count,
-        [&](const Stage2HomeExpandRpc& rpc) {
-          return rpc.target_shard == peer && rpc.posted && !rpc.complete;
-        });
-    };
-    bool posted_any = false;
-    const u32 item_limit = std::max<u32>(
-      1, config.storage_owner_search_snapshot_batch);
-    const u32 minimum_items = stage2_independent_score_min_items(
-      item_limit, std::max<u32>(1, config.storage_owner_batch_max));
-    speculative_query_indexes.resize(tasks.size());
-    for (u32 peer_offset = 0; peer_offset < num_storage_nodes_;
-         ++peer_offset) {
-      const u32 peer = (state.speculative_peer_cursor + peer_offset) %
-        num_storage_nodes_;
-      if (peer == storage_id_) continue;
-      if (!authoritative_rpc_in_flight(peer)) continue;
-      Stage2SpeculativeScoreRpc& rpc =
-        state.speculative_score_rpcs[peer];
-      if (rpc.posted) continue;
-      lib_assert(rpc.consumers.empty(),
-                 "inactive speculative score RPC retained consumers");
-
-      rpc.target_shard = peer;
-      rpc.request_id = allocate_peer_request_id();
-      if (!try_reserve_peer_rpc_speculative_credit(
-            peer, rpc.request_id)) {
-        rpc.request_id = 0;
-        continue;
-      }
-      rpc.process_credit_held = true;
-      // Count the complete build/post opportunity, not only a successful
-      // wire request. A sparse cache or unavailable SEND slot must not cause
-      // this context to rescan and rebuild on every scheduler pass.
-      if (state.independent_score_rpcs_started == 0) {
-        ++state.independent_score_rpcs_started;
-      }
-      speculative_query_searches.clear();
-      std::fill(speculative_query_indexes.begin(),
-                speculative_query_indexes.end(),
-                std::numeric_limits<u32>::max());
-      for (size_t search_index = 0;
-           search_index < state.graph_prefetch_cache.size() &&
-             rpc.consumers.size() < item_limit;
-           ++search_index) {
-        if (state.search_seeded[search_index] == 0) continue;
-        for (Stage2PrefetchedGraphExpansion& expansion :
-             state.graph_prefetch_cache[search_index]) {
-          for (Stage2PrefetchedGraphNeighbor& neighbor :
-               expansion.neighbors) {
-            if (rpc.consumers.size() == item_limit) break;
-            const auto disposition = static_cast<
-              service::storage_owner::Stage2HomeDisposition>(
-                neighbor.disposition);
-            if (neighbor.score_prefetched ||
-                neighbor.independent_score_prefetched ||
-                neighbor.score_prefetch_issues != 0 ||
-                neighbor.independent_score_issues != 0 ||
-                disposition !=
-                  service::storage_owner::Stage2HomeDisposition::unscored ||
-                !storage_node_pointer_addressable(neighbor.pointer) ||
-                neighbor.pointer.memory_node() != peer) {
-              continue;
-            }
-            u32& query_index = speculative_query_indexes[search_index];
-            if (query_index == std::numeric_limits<u32>::max()) {
-              query_index = static_cast<u32>(
-                speculative_query_searches.size());
-              speculative_query_searches.push_back(search_index);
-            }
-            rpc.consumers.push_back(Stage2SpeculativeScoreConsumer{
-              .search_index = search_index,
-              .expansion_pointer = expansion.pointer,
-              .pointer = neighbor.pointer,
-              .authoritative_generation = 0,
-            });
-            ++neighbor.independent_score_issues;
-          }
-          if (rpc.consumers.size() == item_limit) break;
-        }
-      }
-      if (rpc.consumers.size() < minimum_items) {
-        abandon_speculative_score_rpc(rpc, false, false);
-        // A context may have authoritative work at several peers. Sparse
-        // first-peer placement must not hide a dense later peer, especially
-        // because this bounded build opportunity is attempted only once per
-        // context. Credits are released before moving on and at most one wire
-        // request is still posted below.
-        continue;
-      }
-
-      rpc.item_count = static_cast<u32>(rpc.consumers.size());
-      const u32 query_count = static_cast<u32>(
-        speculative_query_searches.size());
-      rpc.request.resize(
-        service::storage_owner::stage2_score_many_request_bytes(
-          rpc.item_count, query_count));
-      std::fill(rpc.request.begin(), rpc.request.end(), byte_t{0});
-      auto* own_header = service::storage_owner::stage2_score_many_header(
-        rpc.request.data());
-      own_header->query_count = query_count;
-      own_header->flags =
-        service::storage_owner::kStage2ScoreManyFlagSpeculative;
-      auto* items = service::storage_owner::stage2_score_many_items(
-        rpc.request.data());
-      for (u32 item = 0; item < rpc.item_count; ++item) {
-        const Stage2SpeculativeScoreConsumer& consumer =
-          rpc.consumers[item];
-        items[item] = service::storage_owner::Stage2ScoreManyItem{
-          .pointer_raw = consumer.pointer.raw_address,
-          // This is a wire correlation token. The authoritative generation
-          // is installed separately only if the expansion is promoted.
-          .generation = state.continuation.generation(
-            consumer.search_index),
-          .search_index = static_cast<u32>(consumer.search_index),
-          .query_index = speculative_query_indexes[
-            consumer.search_index],
-        };
-      }
-      byte_t* queries = service::storage_owner::stage2_score_many_queries(
-        rpc.request.data(), rpc.item_count);
-      for (u32 query_index = 0; query_index < query_count; ++query_index) {
-        const size_t search_index =
-          speculative_query_searches[query_index];
-        std::memcpy(
-          queries + static_cast<size_t>(query_index) *
-            VamanaNode::vector_bytes(),
-          targets[search_index].vector_data.data(),
-          VamanaNode::vector_bytes());
-      }
-
-      const size_t request_bytes = rpc.request.size();
-      rpc.posted = try_post_peer_rpc_request_attempt(
-        rpc.target_shard,
-        service::storage_owner::PeerRpcType::stage2_score_many_request,
-        service::storage_owner::PeerRpcType::stage2_score_many_response,
-        rpc.request_id, rpc.item_count,
-        rpc.request.data() + sizeof(service::storage_owner::PeerRpcHeader),
-        request_bytes - sizeof(service::storage_owner::PeerRpcHeader),
-        request_bytes, PeerRpcSendClass::speculative);
-      if (!rpc.posted) {
-        // register_send_attempt() precedes send-slot acquisition. A failed
-        // try-post therefore still owns a response-registry cell even though
-        // no wire request exists; cancel it before abandoning this request id.
-        abandon_speculative_score_rpc(rpc, true, false);
-        return false;
-      }
-      // Speculation is never allowed to inherit the 30-second correctness
-      // timeout. Two milliseconds is far above the measured microsecond RPC
-      // service time yet bounds low-priority transport and registry debt in
-      // a slower environment; the authoritative path never waits for it.
-      constexpr u64 kSpeculativeTimeoutNs = 2ull * 1000ull * 1000ull;
-      const u64 configured_timeout_ns =
-        static_cast<u64>(config.storage_owner_rpc_timeout_ms) *
-          1000ull * 1000ull;
-      rpc.deadline_ns = steady_now_ns() +
-        std::min(kSpeculativeTimeoutNs, configured_timeout_ns);
-
-      storage_owner_stage2_independent_score_rpc_batches_.fetch_add(
-        1, std::memory_order_relaxed);
-      ++state.independent_score_rpcs_posted;
-      storage_owner_stage2_independent_score_issued_.fetch_add(
-        rpc.item_count, std::memory_order_relaxed);
-      storage_owner_stage2_home_rpc_batches_.fetch_add(
-        1, std::memory_order_relaxed);
-      storage_owner_stage2_home_rpc_items_.fetch_add(
-        rpc.item_count, std::memory_order_relaxed);
-      storage_owner_stage2_home_score_rpc_batches_.fetch_add(
-        1, std::memory_order_relaxed);
-      storage_owner_stage2_home_score_rpc_items_.fetch_add(
-        rpc.item_count, std::memory_order_relaxed);
-      storage_owner_stage2_home_score_rpc_queries_.fetch_add(
-        query_count, std::memory_order_relaxed);
-      storage_owner_stage2_home_score_rpc_request_bytes_.fetch_add(
-        request_bytes, std::memory_order_relaxed);
-      storage_owner_stage2_home_score_rpc_response_bytes_.fetch_add(
-        service::storage_owner::stage2_score_many_response_bytes(
-          rpc.item_count),
-        std::memory_order_relaxed);
-      state.speculative_peer_cursor = (peer + 1) % num_storage_nodes_;
-      posted_any = true;
-      // One request for the complete context is enough for the guarded first
-      // trial. A later context begins from a different peer cursor, avoiding
-      // a low-shard hotspot without multiplying receiver work.
-      break;
-    }
-    return posted_any;
-  };
-
   const auto commit_prefetched_graph = [&] {
-    const auto score_issue_count = [](const auto& neighbors) {
-      u64 count = 0;
-      for (const auto& neighbor : neighbors) {
-        count += neighbor.score_prefetch_issues;
-      }
-      return count;
-    };
-    const auto independent_issue_count = [](const auto& neighbors) {
-      u64 count = 0;
-      for (const auto& neighbor : neighbors) {
-        if (neighbor.independent_score_prefetched) {
-          count += neighbor.independent_score_issues;
-        }
-      }
-      return count;
-    };
     u64 hits = 0;
     u64 wasted = 0;
     u64 scored = 0;
     u64 home_scored = 0;
-    u64 score_prefetch_hits = 0;
-    u64 score_prefetch_wasted = 0;
-    u64 independent_score_useful = 0;
-    u64 independent_score_wasted = 0;
     bool progressed = false;
     for (size_t search_index = 0; search_index < tasks.size();
          ++search_index) {
@@ -2420,9 +1803,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
           disposition !=
             service::storage_owner::Stage2HomeDisposition::terminal) {
         ++wasted;
-        score_prefetch_wasted += score_issue_count(cached->neighbors);
-        independent_score_wasted +=
-          independent_issue_count(cached->neighbors);
         continue;
       }
       home_neighbors.clear();
@@ -2438,17 +1818,12 @@ MemoryNode::advance_stage2_search_candidates_batched(
             search_index, request->generation, request->pointer,
             span<const RemotePtr>{home_neighbors})) {
         ++wasted;
-        score_prefetch_wasted += score_issue_count(cached->neighbors);
-        independent_score_wasted +=
-          independent_issue_count(cached->neighbors);
         continue;
       }
       ++hits;
       progressed = true;
       const u64 score_generation =
         state.continuation.generation(search_index);
-      (void)state.promote_speculative_scores(
-        search_index, cached->pointer, score_generation);
       for (const Stage2PrefetchedGraphNeighbor& neighbor :
            cached->neighbors) {
         const auto neighbor_disposition = static_cast<
@@ -2468,34 +1843,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
             std::nullopt);
         }
         scored += resolved;
-        // An independent RPC that survived promotion now owns this exact
-        // pending-score dependency. Its completion (or bounded timeout)
-        // accounts the outcome, so do not prematurely classify it as wasted
-        // merely because the cache entry has been consumed.
-        const bool independent_in_flight =
-          state.speculative_score_covers(
-            search_index, score_generation, neighbor.pointer);
-        if (neighbor.score_prefetch_issues != 0 &&
-            !independent_in_flight) {
-          if (resolved) {
-            ++score_prefetch_hits;
-            score_prefetch_wasted +=
-              neighbor.score_prefetch_issues - 1;
-          } else {
-            score_prefetch_wasted += neighbor.score_prefetch_issues;
-          }
-        }
-        if (neighbor.independent_score_issues != 0 &&
-            !independent_in_flight) {
-          if (resolved && neighbor.independent_score_prefetched) {
-            ++independent_score_useful;
-            independent_score_wasted +=
-              neighbor.independent_score_issues - 1;
-          } else {
-            independent_score_wasted +=
-              neighbor.independent_score_issues;
-          }
-        }
       }
     }
     if (hits != 0) {
@@ -2514,23 +1861,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
       storage_owner_stage2_home_scored_neighbors_.fetch_add(
         home_scored, std::memory_order_relaxed);
     }
-    if (score_prefetch_hits != 0) {
-      storage_owner_stage2_score_prefetch_hits_.fetch_add(
-        score_prefetch_hits, std::memory_order_relaxed);
-    }
-    if (score_prefetch_wasted != 0) {
-      storage_owner_stage2_score_prefetch_wasted_.fetch_add(
-        score_prefetch_wasted, std::memory_order_relaxed);
-    }
-    if (independent_score_useful != 0) {
-      state.independent_score_useful += independent_score_useful;
-      storage_owner_stage2_independent_score_useful_.fetch_add(
-        independent_score_useful, std::memory_order_relaxed);
-    }
-    if (independent_score_wasted != 0) {
-      storage_owner_stage2_independent_score_wasted_.fetch_add(
-        independent_score_wasted, std::memory_order_relaxed);
-    }
     return progressed;
   };
   u8 idle_attempt_mask = 0;
@@ -2539,18 +1869,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
   // WRs retire, every stable/terminal consumer is resolved immediately and
   // retryable consumers simply remain in their own search generation.
   for (;;) {
-    const bool speculative_progress = poll_speculative_score_rpcs();
-    if (speculative_progress) idle_attempt_mask = 0;
     if (state.continuation.all_complete()) {
-      // Speculation is never part of durable search completion. Cancel any
-      // late request and let the ordinary unused-cache accounting below
-      // classify completed-but-unpromoted exact results.
-      for (Stage2SpeculativeScoreRpc& rpc :
-           state.speculative_score_rpcs) {
-        if (rpc.posted) {
-          abandon_speculative_score_rpc(rpc, true, true);
-        }
-      }
       const auto& final_beams = state.continuation.results();
       const auto& exhausted =
         state.continuation.budget_exhausted_results();
@@ -2575,29 +1894,15 @@ MemoryNode::advance_stage2_search_candidates_batched(
       storage_owner_stage2_search_budget_exhausted_.fetch_add(
         exhausted_count, std::memory_order_relaxed);
       const u64 unused_prefetch = state.graph_prefetch_entry_count();
-      const u64 unused_score_prefetch =
-        state.graph_prefetched_score_count();
-      const u64 unused_independent_score =
-        state.graph_independent_score_count();
       if (unused_prefetch != 0) {
         storage_owner_stage2_graph_prefetch_wasted_.fetch_add(
           unused_prefetch, std::memory_order_relaxed);
-      }
-      if (unused_score_prefetch != 0) {
-        storage_owner_stage2_score_prefetch_wasted_.fetch_add(
-          unused_score_prefetch, std::memory_order_relaxed);
-      }
-      if (unused_independent_score != 0) {
-        storage_owner_stage2_independent_score_wasted_.fetch_add(
-          unused_independent_score, std::memory_order_relaxed);
       }
       const size_t retained_capacity = std::max<size_t>(
         1024, static_cast<size_t>(construction_width) * 8);
       state.reset_completed(retained_capacity);
       return Stage2SearchAdvanceResult::complete;
     }
-
-    (void)post_speculative_score_rpcs();
 
     // pending_expand_request() is a per-search dependency fence: a search is
     // in either score or expand phase, never both. Do not gate cache commit on
@@ -2884,12 +2189,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
         lib_assert(acknowledge_peer_rpc_response(response_lease),
                    "validated Stage2 score response lost its lease");
         for (u32 item = 0; item < rpc.item_count; ++item) {
-          lib_assert(item < rpc.score_consumer_indexes.size() &&
-                       rpc.score_consumer_indexes[item] <
-                         state.score_consumers.size(),
-                     "Stage2 score response lost consumer metadata");
-          const Stage2ScoreConsumer& consumer = state.score_consumers[
-            rpc.score_consumer_indexes[item]];
           const u32 result_search_index =
             state.score_many_dispatch
               ? score_many_results[item].search_index
@@ -2913,22 +2212,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
           const auto disposition = static_cast<
             service::storage_owner::Stage2HomeDisposition>(
               result_disposition);
-          if (consumer.speculative) {
-            if (disposition ==
-                service::storage_owner::Stage2HomeDisposition::stable) {
-              state.resolve_graph_prefetch_score(
-                consumer.search_index, consumer.expansion_pointer,
-                consumer.pointer,
-                std::optional<distance_t>{result_distance},
-                result_disposition);
-            } else if (disposition ==
-                       service::storage_owner::Stage2HomeDisposition::terminal) {
-              state.resolve_graph_prefetch_score(
-                consumer.search_index, consumer.expansion_pointer,
-                consumer.pointer, std::nullopt, result_disposition);
-            }
-            continue;
-          }
           bool resolved = false;
           if (disposition ==
               service::storage_owner::Stage2HomeDisposition::stable) {
@@ -3107,8 +2390,6 @@ MemoryNode::advance_stage2_search_candidates_batched(
                   .pointer = RemotePtr{neighbor.pointer_raw},
                   .distance = neighbor.distance,
                   .disposition = neighbor.disposition,
-                  .score_prefetched = false,
-                  .score_prefetch_issues = 0,
                 });
               }
               retained = state.insert_graph_prefetch(

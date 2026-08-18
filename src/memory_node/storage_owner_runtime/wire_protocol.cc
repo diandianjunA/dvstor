@@ -147,7 +147,6 @@ void MemoryNode::service_storage_runtime(const Configuration& config) {
               storage_insert_tasks_->try_push(std::move(task))) {
             ack->status = static_cast<u32>(
               service::storage_owner::MutationBatchAckStatus::accepted);
-            mark_storage_owner_foreground_activity();
           } else if (context_reserved) {
             // bounded::Queue does not move its input unless it successfully
             // claims a cell, so the reservation remains available here.
@@ -288,8 +287,6 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id,
   vec<vec<u64>> invalidated_neighbors;
   vec<u32> item_statuses(request->item_count, static_cast<u32>(service::storage_owner::MutationStatus::failed));
   vec<service::storage_owner::MutationResult> mutation_results(request->item_count);
-  mark_storage_owner_foreground_activity();
-  storage_owner_insert_active_workers_.fetch_add(1, std::memory_order_acq_rel);
   const bool ok = execute_storage_owner_batch_items(ids, kinds.data(), raw_vectors,
                                                     stage1_homes,
                                                     operation_ids,
@@ -297,8 +294,6 @@ size_t MemoryNode::handle_storage_insert_request(u32 client_id,
                                                     request->item_count,
                                                     breakdown, config, &invalidated_neighbors,
                                                     &item_statuses, &mutation_results);
-  storage_owner_insert_active_workers_.fetch_sub(1, std::memory_order_acq_rel);
-  mark_storage_owner_foreground_activity();
   const auto response_build_started = std::chrono::steady_clock::now();
   for (u32 i = 0; i < request->item_count; ++i) {
     statuses[i] = ok ? item_statuses[i]

@@ -21,12 +21,11 @@ inline constexpr u64 kMagic = 0x31544d43565344ULL;  // "DSVCMT1"
 // unfinished service credit separately from the contiguous physical span and
 // distinguishes logical-credit stalls from physical-ring stalls. Version 9
 // reports owner-directed, shared-capacity, and broadcast wake traffic plus
-// the context-slot scans they induce. Version 10 reports the exact number of
-// finalize descriptors currently owned by active Stage2 contexts and its
-// independent execution limit. Version 11 adds the bounded C32/C40/C48
-// execution-controller state, throughput-trial/fuse counters, and periodic
-// fallback-audit effectiveness counters.
-inline constexpr u32 kVersion = 11;
+// the context-slot scans they induce. Version 10/11 carried superseded active-
+// task, adaptive C32/C40/C48, and 1 ms fallback experiments. Version 12
+// exposed only the fixed C32 context bound and deterministic B8 packing.
+// Version 13 removes retired speculative score counters.
+inline constexpr u32 kVersion = 13;
 inline constexpr u32 kValidCounters = 1u << 0;
 inline constexpr size_t kLatencyBucketCount = 18;
 inline constexpr size_t kStage2PhaseCount = 6;
@@ -77,9 +76,6 @@ struct alignas(64) Snapshot {
   u64 stage2_graph_prefetch_issued{};
   u64 stage2_graph_prefetch_hits{};
   u64 stage2_graph_prefetch_wasted{};
-  u64 stage2_score_prefetch_issued{};
-  u64 stage2_score_prefetch_hits{};
-  u64 stage2_score_prefetch_wasted{};
   u64 stage2_vector_read_waves{};
   u64 stage2_vector_unique_reads{};
   std::array<u64, kLatencyBucketCount> stage2_delay_histogram{};
@@ -123,16 +119,7 @@ struct alignas(64) Snapshot {
   u64 packing_wait_ns{};
   u64 packing_target_flushes{};
   u64 packing_deadline_flushes{};
-  u64 packing_full_flushes{};
-  u64 packing_low_pressure_flushes{};
   u64 packing_cleanup_flushes{};
-  u64 packing_promotions{};
-  u64 packing_rollbacks{};
-  u64 packing_accepted_trial_windows{};
-  u64 stage2_independent_score_rpc_batches{};
-  u64 stage2_independent_score_issued{};
-  u64 stage2_independent_score_useful{};
-  u64 stage2_independent_score_wasted{};
   u64 completion_incomplete{};
   u64 completion_logical_full_failures{};
   u64 completion_physical_full_failures{};
@@ -140,28 +127,8 @@ struct alignas(64) Snapshot {
   u64 maintenance_generic_wakes{};
   u64 maintenance_broadcast_wakes{};
   u64 maintenance_context_slots_scanned{};
-  u64 active_stage2_tasks{};
-  u64 active_stage2_task_limit{};
   u64 active_stage2_contexts{};
   u64 active_stage2_context_limit{};
-  u64 active_stage2_context_limit_baseline{};
-  u64 active_stage2_context_limit_max{};
-  u64 active_stage2_task_limit_baseline{};
-  u64 active_stage2_task_limit_max{};
-  u64 stage2_budget_promotions{};
-  u64 stage2_budget_rollbacks{};
-  u64 stage2_budget_lane_rollbacks{};
-  u64 stage2_budget_low_backlog_rollbacks{};
-  u64 stage2_budget_rate_rollbacks{};
-  u64 stage2_budget_rate_trials_accepted{};
-  u64 stage2_budget_high_backlog_samples{};
-  u64 stage2_budget_lane_headroom_samples{};
-  u64 stage2_budget_stable_rate_milli_per_sec{};
-  u64 stage2_budget_trial_baseline_rate_milli_per_sec{};
-  u64 stage2_budget_rate_trial_pending{};
-  u64 stage2_budget_promotion_context_limit{};
-  u64 maintenance_periodic_fallback_audits{};
-  u64 maintenance_periodic_fallback_recoveries{};
 };
 
 static_assert(kSnapshotOffset == 192);

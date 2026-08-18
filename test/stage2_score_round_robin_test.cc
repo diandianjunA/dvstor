@@ -15,23 +15,15 @@ using memory_node_storage_owner_maintenance_detail::
 using memory_node_storage_owner_maintenance_detail::
   stage2_score_many_min_items;
 using memory_node_storage_owner_maintenance_detail::
-  stage2_independent_score_min_items;
-using memory_node_storage_owner_maintenance_detail::
   stage2_score_many_peer_eligible;
 using memory_node_storage_owner_maintenance_detail::Stage2SearchIoPhase;
 using memory_node_storage_owner_maintenance_detail::Stage2SearchIoState;
-using memory_node_storage_owner_maintenance_detail::
-  Stage2SpeculativeScoreConsumer;
 using memory_node_storage_owner_maintenance_detail::
   Stage2PrefetchedGraphExpansion;
 using memory_node_storage_owner_maintenance_detail::
   stage2_consumer_fits_physical_scratch;
 using memory_node_storage_owner_maintenance_detail::
   stage2_ordered_issue_width;
-using memory_node_storage_owner_maintenance_detail::
-  stage2_score_prefetch_enabled;
-using memory_node_storage_owner_maintenance_detail::
-  stage2_score_prefetch_peer_eligible;
 
 namespace {
 
@@ -182,36 +174,6 @@ void test_score_many_rejects_latency_dominated_sparse_waves() {
   assert(!stage2_score_many_peer_eligible(1024, 0));
 }
 
-void test_independent_score_uses_half_context_message_bounded_at_sixteen() {
-  assert(stage2_independent_score_min_items(256, 32) == 16);
-  assert(stage2_independent_score_min_items(256, 64) == 16);
-  assert(stage2_independent_score_min_items(8, 32) == 4);
-  assert(stage2_independent_score_min_items(1, 32) == 1);
-  assert(stage2_independent_score_min_items(0, 32) == 0);
-  assert(stage2_independent_score_min_items(256, 0) == 0);
-}
-
-void test_completed_search_preserves_context_post_count_until_release() {
-  Stage2SearchIoState state;
-  state.continuation.initialize(
-    0, 0, 1,
-    memory_node_storage_owner_index_detail::PartitionSearchBudget::
-      unbounded());
-  state.independent_score_rpcs_posted = 1;
-  state.independent_score_rpcs_started = 1;
-  state.independent_score_useful = 7;
-  state.reset_completed(32);
-  assert(state.independent_score_rpcs_posted == 1);
-  assert(state.independent_score_useful == 7);
-  assert(state.independent_score_rpcs_started == 0);
-
-  // Context release uses the full reset and must not leak a previous sample
-  // into the next context that reuses this state object.
-  state.reset();
-  assert(state.independent_score_rpcs_posted == 0);
-  assert(state.independent_score_useful == 0);
-}
-
 void test_home_rpc_wait_does_not_pin_registered_rdma_scratch() {
   Stage2SearchIoState state;
   assert(state.scratch_rebindable());
@@ -240,19 +202,6 @@ void test_ordered_issue_policy_has_bounded_warmup_and_hard_stop() {
   assert(stage2_ordered_issue_width(230, 282, 16) == 4);
   assert(stage2_ordered_issue_width(0, 512, 2) == 2);
   assert(stage2_ordered_issue_width(10'000, 0, 1) == 1);
-}
-
-void test_score_prefetch_policy_requires_seventy_percent_promotion() {
-  assert(stage2_score_prefetch_enabled(0, 0));
-  assert(stage2_score_prefetch_enabled(360, 152));
-  assert(!stage2_score_prefetch_enabled(358, 154));
-}
-
-void test_score_prefetch_fills_one_sided_wave_without_adding_rpc_peers() {
-  assert(stage2_score_prefetch_peer_eligible(false, false));
-  assert(stage2_score_prefetch_peer_eligible(false, true));
-  assert(!stage2_score_prefetch_peer_eligible(true, false));
-  assert(stage2_score_prefetch_peer_eligible(true, true));
 }
 
 void test_prefetch_cache_is_bounded_and_consumed_by_pointer() {
@@ -285,92 +234,6 @@ void test_prefetch_cache_is_bounded_and_consumed_by_pointer() {
   assert(state.graph_prefetch_entry_count() == 1);
 }
 
-void test_prefetched_score_updates_only_the_matching_cached_expansion() {
-  Stage2SearchIoState state;
-  state.graph_prefetch_cache.resize(1);
-  assert(state.insert_graph_prefetch(
-    0,
-    Stage2PrefetchedGraphExpansion{
-      .pointer = RemotePtr{1, 128},
-      .disposition = 1,
-      .neighbors = {{
-        .pointer = RemotePtr{2, 256},
-        .distance = 0,
-        .disposition = 3,
-        .score_prefetched = false,
-        .score_prefetch_issues = 1,
-        .independent_score_prefetched = false,
-        .independent_score_issues = 0,
-      }},
-    },
-    2));
-  assert(!state.resolve_graph_prefetch_score(
-    0, RemotePtr{1, 384}, RemotePtr{2, 256}, distance_t{7}, 1));
-  assert(state.resolve_graph_prefetch_score(
-    0, RemotePtr{1, 128}, RemotePtr{2, 256}, distance_t{7}, 1));
-  assert(state.graph_prefetched_score_count() == 1);
-  const auto cached = state.take_graph_prefetch(0, RemotePtr{1, 128});
-  assert(cached.has_value());
-  assert(cached->neighbors.size() == 1);
-  assert(cached->neighbors[0].score_prefetched);
-  assert(cached->neighbors[0].distance == distance_t{7});
-  assert(cached->neighbors[0].disposition == 1);
-}
-
-void test_independent_score_ownership_is_generation_fenced_and_releasable() {
-  Stage2SearchIoState state;
-  state.graph_prefetch_cache.resize(1);
-  assert(state.insert_graph_prefetch(
-    0,
-    Stage2PrefetchedGraphExpansion{
-      .pointer = RemotePtr{1, 128},
-      .disposition = 1,
-      .neighbors = {{
-        .pointer = RemotePtr{2, 256},
-        .distance = 0,
-        .disposition = 3,
-        .score_prefetched = false,
-        .score_prefetch_issues = 0,
-        .independent_score_prefetched = false,
-        .independent_score_issues = 1,
-      }},
-    },
-    2));
-
-  // A failed/unposted speculative attempt restores ordinary authoritative
-  // ownership instead of leaving a cache marker that suppresses exact work.
-  assert(state.cancel_graph_prefetch_independent_score_issue(
-    0, RemotePtr{1, 128}, RemotePtr{2, 256}));
-  assert(state.graph_independent_score_count() == 0);
-  assert(!state.cancel_graph_prefetch_independent_score_issue(
-    0, RemotePtr{1, 128}, RemotePtr{2, 256}));
-
-  state.speculative_score_rpcs.resize(3);
-  auto& rpc = state.speculative_score_rpcs[2];
-  rpc.posted = true;
-  rpc.consumers.push_back(Stage2SpeculativeScoreConsumer{
-    .search_index = 0,
-    .expansion_pointer = RemotePtr{1, 128},
-    .pointer = RemotePtr{2, 256},
-  });
-  assert(!state.speculative_score_covers(
-    0, 7, RemotePtr{2, 256}));
-  assert(state.promote_speculative_scores(
-    0, RemotePtr{1, 128}, 7) == 1);
-  assert(state.speculative_score_covers(
-    0, 7, RemotePtr{2, 256}));
-  assert(!state.speculative_score_covers(
-    0, 6, RemotePtr{2, 256}));
-  assert(!state.speculative_score_covers(
-    0, 7, RemotePtr{2, 384}));
-
-  // Clearing/cancelling the transport immediately exposes the still-pending
-  // request to the ordinary collector.
-  rpc.posted = false;
-  assert(!state.speculative_score_covers(
-    0, 7, RemotePtr{2, 256}));
-}
-
 }  // namespace
 
 int main() {
@@ -381,14 +244,8 @@ int main() {
   test_scratch_capacity_counts_physical_reads_not_consumers();
   test_score_many_uses_wire_capacity_instead_of_read_credits();
   test_score_many_rejects_latency_dominated_sparse_waves();
-  test_independent_score_uses_half_context_message_bounded_at_sixteen();
-  test_completed_search_preserves_context_post_count_until_release();
   test_home_rpc_wait_does_not_pin_registered_rdma_scratch();
   test_ordered_issue_policy_has_bounded_warmup_and_hard_stop();
-  test_score_prefetch_policy_requires_seventy_percent_promotion();
-  test_score_prefetch_fills_one_sided_wave_without_adding_rpc_peers();
   test_prefetch_cache_is_bounded_and_consumed_by_pointer();
-  test_prefetched_score_updates_only_the_matching_cached_expansion();
-  test_independent_score_ownership_is_generation_fenced_and_releasable();
   return 0;
 }

@@ -31,7 +31,6 @@ struct Stage2HomeRpcDispatch {
   service::storage_owner::PeerRpcType request_type{
     service::storage_owner::PeerRpcType::stage2_expand_score_request};
   std::uint32_t item_count{};
-  bool speculative{};
   Stage2ContextOwnerKey completion_owner{};
   std::span<const byte_t> request;
 };
@@ -46,7 +45,6 @@ struct Stage2HomeRpcAggregate {
   std::uint32_t item_count{};
   std::uint32_t logical_count{};
   std::size_t request_bytes{};
-  bool speculative{};
   // A singleton keeps the original logical wire ID and protocol image.  It
   // still occupies an aggregate slot solely for exact retry/deadline
   // ownership, but its response must use the original borrowed receive-slot
@@ -110,7 +108,7 @@ enum class Stage2HomeRpcDirectResponseResult : std::uint8_t {
 
 // Bounded, process-wide transport combiner for authoritative Stage2-home RPCs.
 // Enqueue never starts a timer. form_aggregate() consumes only descriptors
-// already present in one per-(peer,type,traffic-class) FIFO. Even a one-entry
+// already present in one per-(peer,type) FIFO. Even a one-entry
 // prefix is formed immediately; aggregation never creates a hidden wait.
 //
 // The remote protocol is unchanged. expand_score concatenates its item/query
@@ -217,7 +215,6 @@ class Stage2HomeRpcOutbox {
     entry.response_type = response_type(dispatch.request_type);
     entry.item_count = dispatch.item_count;
     entry.query_count = metadata->query_count;
-    entry.score_flags = metadata->score_flags;
     entry.queue_class = metadata->queue_class;
     entry.completion_owner = dispatch.completion_owner;
     entry.request_digest = request_digest;
@@ -244,14 +241,9 @@ class Stage2HomeRpcOutbox {
       std::uint32_t peer_index,
       service::storage_owner::PeerRpcType request_type,
       std::uint64_t wire_request_id,
-      std::uint32_t source_shard,
-      bool speculative = false) {
+      std::uint32_t source_shard) {
     if (wire_request_id == 0) return std::nullopt;
-    const auto requested_queue_class = queue_class(
-      request_type,
-      speculative
-        ? service::storage_owner::kStage2ScoreManyFlagSpeculative
-        : 0);
+    const auto requested_queue_class = queue_class(request_type);
     if (!requested_queue_class.has_value()) return std::nullopt;
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -307,7 +299,6 @@ class Stage2HomeRpcOutbox {
       .item_count = total_items,
       .logical_count = static_cast<std::uint32_t>(selected_count),
       .request_bytes = 0,
-      .speculative = speculative,
       .direct = false,
     };
     aggregate.members.clear();
@@ -361,23 +352,19 @@ class Stage2HomeRpcOutbox {
     return aggregate.snapshot;
   }
 
-  // Claim a queue only when it contains exactly one logical request.  The
-  // retained protocol image is moved (not rebuilt/copied), and the original
-  // logical request ID remains the wire ID.  Keeping a normal aggregate
-  // lifecycle around the entry provides the same bounded timeout/retry and
-  // cancellation semantics as a combined request without imposing aggregate
-  // request/response construction on the overwhelmingly common singleton.
+  // Move one retained logical protocol image directly to the transport; the
+  // original logical request ID remains the wire ID. Optimized mode requires
+  // a true singleton so a multi-entry queue can be combined. Baseline mode
+  // explicitly allows the queue head to bypass combining. A normal aggregate
+  // lifecycle still provides identical timeout, retry, and cancellation
+  // semantics in both modes.
   [[nodiscard]] std::optional<Stage2HomeRpcAggregate>
   form_singleton_direct(
       std::uint32_t peer_index,
       service::storage_owner::PeerRpcType request_type,
       std::uint32_t source_shard,
-      bool speculative = false) {
-    const auto requested_queue_class = queue_class(
-      request_type,
-      speculative
-        ? service::storage_owner::kStage2ScoreManyFlagSpeculative
-        : 0);
+      bool require_singleton_queue = true) {
+    const auto requested_queue_class = queue_class(request_type);
     if (!requested_queue_class.has_value()) return std::nullopt;
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -386,7 +373,9 @@ class Stage2HomeRpcOutbox {
       return std::nullopt;
     }
     PeerQueue& queue = queues_[peer_index][*requested_queue_class];
-    if (queue.size != 1 || queue.head == npos || queue.tail != queue.head) {
+    if (queue.head == npos ||
+        (require_singleton_queue &&
+         (queue.size != 1 || queue.tail != queue.head))) {
       return std::nullopt;
     }
     const std::uint32_t entry_index = queue.head;
@@ -416,7 +405,6 @@ class Stage2HomeRpcOutbox {
       .item_count = entry.item_count,
       .logical_count = 1,
       .request_bytes = entry.request.size(),
-      .speculative = speculative,
       .direct = true,
     };
     aggregate.members.clear();
@@ -727,13 +715,8 @@ class Stage2HomeRpcOutbox {
 
   [[nodiscard]] std::size_t queued_size(
       std::uint32_t peer_index,
-      service::storage_owner::PeerRpcType request_type,
-      bool speculative = false) const {
-    const auto requested_queue_class = queue_class(
-      request_type,
-      speculative
-        ? service::storage_owner::kStage2ScoreManyFlagSpeculative
-        : 0);
+      service::storage_owner::PeerRpcType request_type) const {
+    const auto requested_queue_class = queue_class(request_type);
     if (!requested_queue_class.has_value()) return 0;
     std::lock_guard<std::mutex> lock(mutex_);
     return peer_index < queues_.size()
@@ -742,21 +725,15 @@ class Stage2HomeRpcOutbox {
 
   [[nodiscard]] bool has_ready(
       std::uint32_t peer_index,
-      service::storage_owner::PeerRpcType request_type,
-      bool speculative = false) const {
+      service::storage_owner::PeerRpcType request_type) const {
     if (peer_index >= queues_.size()) return false;
-    return (ready_peer_mask(request_type, speculative) &
+    return (ready_peer_mask(request_type) &
             (std::uint64_t{1} << peer_index)) != 0;
   }
 
   [[nodiscard]] std::uint64_t ready_peer_mask(
-      service::storage_owner::PeerRpcType request_type,
-      bool speculative = false) const {
-    const auto requested_queue_class = queue_class(
-      request_type,
-      speculative
-        ? service::storage_owner::kStage2ScoreManyFlagSpeculative
-        : 0);
+      service::storage_owner::PeerRpcType request_type) const {
+    const auto requested_queue_class = queue_class(request_type);
     if (!requested_queue_class.has_value()) return 0;
     return ready_peer_masks_[*requested_queue_class].load(
              std::memory_order_acquire) |
@@ -766,14 +743,9 @@ class Stage2HomeRpcOutbox {
 
   [[nodiscard]] std::optional<std::uint64_t> next_retry_wire_request(
       std::uint32_t peer_index,
-      service::storage_owner::PeerRpcType request_type,
-      bool speculative = false) const {
+      service::storage_owner::PeerRpcType request_type) const {
     if (peer_index >= aggregate_ready_queues_.size()) return std::nullopt;
-    const auto requested_queue_class = queue_class(
-      request_type,
-      speculative
-        ? service::storage_owner::kStage2ScoreManyFlagSpeculative
-        : 0);
+    const auto requested_queue_class = queue_class(request_type);
     if (!requested_queue_class.has_value()) return std::nullopt;
     std::lock_guard<std::mutex> lock(mutex_);
     const AggregateQueue& queue =
@@ -829,17 +801,14 @@ class Stage2HomeRpcOutbox {
   }
 
  private:
-  static constexpr std::size_t kQueueClassCount = 4;
-  static constexpr std::size_t kExpandAuthoritativeQueue = 0;
-  static constexpr std::size_t kExpandSpeculativeQueue = 1;
-  static constexpr std::size_t kScoreAuthoritativeQueue = 2;
-  static constexpr std::size_t kScoreSpeculativeQueue = 3;
+  static constexpr std::size_t kQueueClassCount = 2;
+  static constexpr std::size_t kExpandQueue = 0;
+  static constexpr std::size_t kScoreQueue = 1;
   static constexpr std::uint32_t npos =
     std::numeric_limits<std::uint32_t>::max();
 
   struct DispatchMetadata {
     std::uint32_t query_count{};
-    std::uint32_t score_flags{};
     std::size_t queue_class{};
   };
 
@@ -862,7 +831,6 @@ class Stage2HomeRpcOutbox {
       service::storage_owner::PeerRpcType::stage2_expand_score_response};
     std::uint32_t item_count{};
     std::uint32_t query_count{};
-    std::uint32_t score_flags{};
     std::size_t queue_class{};
     Stage2ContextOwnerKey completion_owner{};
     RequestDigest request_digest{};
@@ -948,8 +916,7 @@ class Stage2HomeRpcOutbox {
         }
       }
       return DispatchMetadata{
-        .queue_class = dispatch.speculative
-          ? kExpandSpeculativeQueue : kExpandAuthoritativeQueue,
+        .queue_class = kExpandQueue,
       };
     }
     if (dispatch.request_type !=
@@ -963,7 +930,7 @@ class Stage2HomeRpcOutbox {
     if (own_header->query_count == 0 ||
         own_header->query_count > dispatch.item_count ||
         own_header->query_count > score_wire_max_queries_ ||
-        !stage2_score_many_flags_valid(own_header->flags) ||
+        own_header->reserved != 0 ||
         dispatch.request.size() != stage2_score_many_request_bytes(
           dispatch.item_count, own_header->query_count)) {
       return std::nullopt;
@@ -974,39 +941,24 @@ class Stage2HomeRpcOutbox {
         return std::nullopt;
       }
     }
-    if (dispatch.speculative !=
-        stage2_score_many_is_speculative(own_header->flags)) {
-      return std::nullopt;
-    }
-    const auto selected_queue = queue_class(
-      dispatch.request_type, own_header->flags);
+    const auto selected_queue = queue_class(dispatch.request_type);
     if (!selected_queue.has_value()) return std::nullopt;
     return DispatchMetadata{
       .query_count = own_header->query_count,
-      .score_flags = own_header->flags,
       .queue_class = *selected_queue,
     };
   }
 
   [[nodiscard]] static std::optional<std::size_t> queue_class(
-      service::storage_owner::PeerRpcType request_type,
-      std::uint32_t score_flags) {
+      service::storage_owner::PeerRpcType request_type) {
     using namespace service::storage_owner;
     if (request_type == PeerRpcType::stage2_expand_score_request) {
-      if (score_flags != 0 &&
-          score_flags != kStage2ScoreManyFlagSpeculative) {
-        return std::nullopt;
-      }
-      return score_flags == 0
-        ? std::optional<std::size_t>{kExpandAuthoritativeQueue}
-        : std::optional<std::size_t>{kExpandSpeculativeQueue};
+      return kExpandQueue;
     }
-    if (request_type != PeerRpcType::stage2_score_many_request ||
-        !stage2_score_many_flags_valid(score_flags)) {
+    if (request_type != PeerRpcType::stage2_score_many_request) {
       return std::nullopt;
     }
-    return stage2_score_many_is_speculative(score_flags)
-      ? kScoreSpeculativeQueue : kScoreAuthoritativeQueue;
+    return kScoreQueue;
   }
 
   [[nodiscard]] static service::storage_owner::PeerRpcType response_type(
@@ -1026,7 +978,6 @@ class Stage2HomeRpcOutbox {
         entry.request_type != dispatch.request_type ||
         entry.item_count != dispatch.item_count ||
         entry.query_count != metadata.query_count ||
-        entry.score_flags != metadata.score_flags ||
         entry.queue_class != metadata.queue_class ||
         entry.completion_owner != dispatch.completion_owner ||
         entry.request_digest != request_digest) {
@@ -1125,10 +1076,9 @@ class Stage2HomeRpcOutbox {
       return true;
     }
 
-    const Entry& first = entries_[members.front().entry_index];
     auto* output_own_header = stage2_score_many_header(request.data());
     output_own_header->query_count = total_queries;
-    output_own_header->flags = first.score_flags;
+    output_own_header->reserved = 0;
     auto* output_items = stage2_score_many_items(request.data());
     byte_t* output_queries = stage2_score_many_queries(
       request.data(), total_items);
@@ -1136,7 +1086,6 @@ class Stage2HomeRpcOutbox {
     std::uint32_t query_offset = 0;
     for (const Member& member : members) {
       const Entry& entry = entries_[member.entry_index];
-      if (entry.score_flags != first.score_flags) return false;
       const auto* input_items = stage2_score_many_items(
         entry.request.data());
       for (std::uint32_t item = 0; item < entry.item_count; ++item) {
@@ -1474,7 +1423,6 @@ class Stage2HomeRpcOutbox {
     entry.peer_index = 0;
     entry.item_count = 0;
     entry.query_count = 0;
-    entry.score_flags = 0;
     entry.queue_class = 0;
     entry.completion_owner = {};
     entry.request_digest = {};

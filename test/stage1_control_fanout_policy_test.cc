@@ -10,20 +10,15 @@ using namespace service::storage_owner;
 using memory_node_peer_rpc_detail::Stage1ControlHomeProgress;
 using memory_node_peer_rpc_detail::Stage1ControlResponseDisposition;
 using memory_node_peer_rpc_detail::Stage1HomeRetryBackoff;
-using memory_node_peer_rpc_detail::PriorityQueueChoice;
 using memory_node_peer_rpc_detail::classify_stage1_control_response;
-using memory_node_peer_rpc_detail::choose_authoritative_first;
 using memory_node_peer_rpc_detail::dequeue_stage2_home_first;
 using memory_node_peer_rpc_detail::is_stage2_home_response;
-using memory_node_peer_rpc_detail::independent_score_receiver_enabled;
 using memory_node_peer_rpc_detail::make_fused_stage1_release_item;
 using memory_node_peer_rpc_detail::partition_stage1_control_response;
 using memory_node_peer_rpc_detail::partition_stage1_execute_response;
 using memory_node_peer_rpc_detail::propagate_fused_stage1_arm_result;
 using memory_node_peer_rpc_detail::stage1_peer_attempt_timeout;
 using memory_node_peer_rpc_detail::stage1_worker_has_eligible_task;
-using memory_node_peer_rpc_detail::speculative_score_request_admissible;
-using memory_node_peer_rpc_detail::speculative_score_execution_admissible;
 using memory_node_peer_rpc_detail::write_stage1_retry_response;
 using memory_node_peer_rpc_detail::stage1_execute_success_has_expected_fence;
 using memory_node_peer_rpc_detail::stage1_execute_tokens_unique;
@@ -76,78 +71,11 @@ void test_stage2_home_queue_cannot_starve_behind_stage1() {
   assert(!dequeue_stage2_home_first(true, false, 5'000'000, 0));
 }
 
-void test_speculative_queue_is_strictly_lower_priority() {
-  assert(choose_authoritative_first(false, false) ==
-         PriorityQueueChoice::none);
-  assert(choose_authoritative_first(true, false) ==
-         PriorityQueueChoice::authoritative);
-  assert(choose_authoritative_first(false, true) ==
-         PriorityQueueChoice::speculative);
-  // Used by both the home-work scheduler and response dispatcher: queued
-  // speculative work never wins while any authoritative item is visible.
-  assert(choose_authoritative_first(true, true) ==
-         PriorityQueueChoice::authoritative);
-  // A one-service-lane receiver disables speculation instead of relying on a
-  // preference that cannot preempt an already-running low-priority request.
-  assert(choose_authoritative_first(false, true, false) ==
-         PriorityQueueChoice::none);
-  assert(choose_authoritative_first(true, true, false) ==
-         PriorityQueueChoice::authoritative);
-
-  // With one service lane, strict dequeue priority cannot preempt an already
-  // executing low-priority request, so speculation is disabled completely.
-  assert(!independent_score_receiver_enabled(0, 32));
-  assert(!independent_score_receiver_enabled(1, 32));
-  for (u32 send_depth = 0; send_depth < 5; ++send_depth) {
-    assert(!independent_score_receiver_enabled(2, send_depth));
-    assert(!independent_score_receiver_enabled(32, send_depth));
-  }
-  assert(independent_score_receiver_enabled(2, 5));
-  assert(independent_score_receiver_enabled(32, 32));
-
-  // Admission is independently bounded: neither another source nor idle
-  // authoritative capacity lets one sender hold two low-priority requests.
-  assert(!speculative_score_request_admissible(false, false, 0, 4));
-  assert(!speculative_score_request_admissible(true, true, 0, 4));
-  assert(speculative_score_request_admissible(true, false, 0, 4));
-  assert(speculative_score_request_admissible(true, false, 3, 4));
-  assert(!speculative_score_request_admissible(true, false, 4, 4));
-  assert(!speculative_score_request_admissible(true, false, 0, 0));
-
-  // Multiple senders may queue independently, but only one may consume a
-  // physical-home lane. Once that credit is active, another low-priority
-  // queue is not runnable and cannot win a dequeue choice.
-  assert(speculative_score_execution_admissible(true, 0, 1));
-  assert(!speculative_score_execution_admissible(true, 1, 1));
-  assert(!speculative_score_execution_admissible(false, 0, 1));
-  assert(!speculative_score_execution_admissible(true, 0, 0));
-  assert(choose_authoritative_first(
-           false,
-           speculative_score_execution_admissible(true, 1, 1), true) ==
-         PriorityQueueChoice::none);
-  assert(choose_authoritative_first(
-           true,
-           speculative_score_execution_admissible(true, 1, 1), true) ==
-         PriorityQueueChoice::authoritative);
-}
-
-void test_dedicated_stage2_queue_never_wakes_stage1_worker() {
-  assert(!stage1_worker_has_eligible_task(true, false, false));
-  assert(!stage1_worker_has_eligible_task(true, false, true));
-  assert(stage1_worker_has_eligible_task(true, true, false));
-  assert(stage1_worker_has_eligible_task(true, true, true));
-
-  assert(!stage1_worker_has_eligible_task(false, false, false));
-  assert(stage1_worker_has_eligible_task(false, false, true));
-  assert(stage1_worker_has_eligible_task(false, true, false));
-  assert(stage1_worker_has_eligible_task(false, true, true));
-
-  // Low-priority work is exclusively owned by the reserved home lane. A
-  // shared Stage1 lane remains asleep when speculation is the only queue,
-  // even in the work-conserving (authoritative-home borrowing) profile.
-  assert(!stage1_worker_has_eligible_task(false, false, false, true));
-  assert(stage1_worker_has_eligible_task(false, false, true, true));
-  assert(stage1_worker_has_eligible_task(false, true, false, true));
+void test_stage1_workers_share_authoritative_home_work() {
+  assert(!stage1_worker_has_eligible_task(false, false));
+  assert(stage1_worker_has_eligible_task(false, true));
+  assert(stage1_worker_has_eligible_task(true, false));
+  assert(stage1_worker_has_eligible_task(true, true));
 }
 
 void test_stage2_home_response_family_is_complete() {
@@ -699,8 +627,7 @@ void test_fused_arm_propagation_replays_uncertain_handoffs() {
 
 int main() {
   test_stage2_home_queue_cannot_starve_behind_stage1();
-  test_speculative_queue_is_strictly_lower_priority();
-  test_dedicated_stage2_queue_never_wakes_stage1_worker();
+  test_stage1_workers_share_authoritative_home_work();
   test_stage2_home_response_family_is_complete();
   test_atomic_home_arm_response();
   test_release_is_an_idempotent_ordered_watermark();

@@ -85,7 +85,6 @@ MemoryNode::try_enqueue_stage2_home_rpc_request(
     u64 logical_request_id,
     u32 item_count,
     span<const byte_t> request,
-    bool speculative,
     PeerResponseCompletionTarget completion_target) {
   using namespace service::storage_owner;
   using Result = Stage2HomeRpcEnqueueResult;
@@ -123,7 +122,6 @@ MemoryNode::try_enqueue_stage2_home_rpc_request(
       .peer_index = target_shard,
       .request_type = request_type,
       .item_count = item_count,
-      .speculative = speculative,
       .completion_owner = completion_target.context_owner,
       .request = std::span<const byte_t>{request.data(), request.size()},
     });
@@ -137,19 +135,15 @@ MemoryNode::try_enqueue_stage2_home_rpc_request(
 
 bool MemoryNode::try_drive_stage2_home_rpc_requests(
     u32 target_shard,
-    service::storage_owner::PeerRpcType request_type,
-    bool speculative) {
+    service::storage_owner::PeerRpcType request_type) {
   if (stage2_home_rpc_outbox_ == nullptr ||
       target_shard >= num_storage_nodes_ || target_shard == storage_id_ ||
-      !stage2_home_rpc_outbox_->has_ready(
-        target_shard, request_type, speculative)) {
+      !stage2_home_rpc_outbox_->has_ready(target_shard, request_type)) {
     return false;
   }
   u32 slot_id = 0;
-  const PeerRpcSendClass send_class = speculative
-    ? PeerRpcSendClass::speculative : PeerRpcSendClass::graph_update;
   if (!try_acquire_peer_rpc_send_slot(
-        target_shard, send_class, slot_id)) {
+        target_shard, PeerRpcSendClass::graph_update, slot_id)) {
     return false;
   }
   bool formed_new = false;
@@ -159,19 +153,19 @@ bool MemoryNode::try_drive_stage2_home_rpc_requests(
   u64 wire_request_id = 0;
   const auto retry_request_id =
     stage2_home_rpc_outbox_->next_retry_wire_request(
-      target_shard, request_type, speculative);
+      target_shard, request_type);
   if (retry_request_id.has_value()) {
     wire_request_id = *retry_request_id;
   } else {
     formed_aggregate = stage2_home_rpc_outbox_->form_singleton_direct(
-      target_shard, request_type, storage_id_, speculative);
+      target_shard, request_type, storage_id_,
+      stage2_home_rpc_combining_);
     if (formed_aggregate.has_value()) {
       wire_request_id = formed_aggregate->wire_request_id;
-    } else {
+    } else if (stage2_home_rpc_combining_) {
       wire_request_id = allocate_peer_request_id();
       formed_aggregate = stage2_home_rpc_outbox_->form_aggregate(
-        target_shard, request_type, wire_request_id, storage_id_,
-        speculative);
+        target_shard, request_type, wire_request_id, storage_id_);
     }
     if (!formed_aggregate.has_value()) {
       release_peer_rpc_send_slot(target_shard, slot_id);

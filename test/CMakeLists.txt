@@ -7,6 +7,10 @@ add_test(NAME mn_memory_estimator_test
          COMMAND bash ${CMAKE_SOURCE_DIR}/test/mn_memory_estimator_test.sh
                       ${CMAKE_SOURCE_DIR})
 
+add_test(NAME experiment_profile_contract_test
+         COMMAND bash
+                 ${CMAKE_SOURCE_DIR}/test/experiment_profile_contract_test.sh)
+
 add_executable(breakdown_benchmark_support_test breakdown_benchmark_support_test.cc)
 dvstor_target_tool_includes(breakdown_benchmark_support_test)
 target_link_libraries(breakdown_benchmark_support_test PRIVATE dvstor_breakdown_support)
@@ -169,13 +173,6 @@ dvstor_target_common_includes(stage1_reachability_policy_test)
 target_compile_options(stage1_reachability_policy_test PRIVATE -UNDEBUG)
 add_test(NAME stage1_reachability_policy_test
          COMMAND stage1_reachability_policy_test)
-
-add_executable(stage1_prune_handoff_policy_test
-    stage1_prune_handoff_policy_test.cc)
-dvstor_target_common_includes(stage1_prune_handoff_policy_test)
-target_compile_options(stage1_prune_handoff_policy_test PRIVATE -UNDEBUG)
-add_test(NAME stage1_prune_handoff_policy_test
-         COMMAND stage1_prune_handoff_policy_test)
 
 add_executable(configuration_update_protocol_test configuration_update_protocol_test.cc)
 dvstor_target_common_includes(configuration_update_protocol_test)
@@ -426,13 +423,6 @@ dvstor_target_common_includes(stage2_batch_policy_test)
 target_compile_options(stage2_batch_policy_test PRIVATE -UNDEBUG)
 add_test(NAME stage2_batch_policy_test COMMAND stage2_batch_policy_test)
 
-add_executable(independent_score_policy_test
-    independent_score_policy_test.cc)
-dvstor_target_common_includes(independent_score_policy_test)
-target_compile_options(independent_score_policy_test PRIVATE -UNDEBUG)
-add_test(NAME independent_score_policy_test
-    COMMAND independent_score_policy_test)
-
 add_executable(storage_owner_reverse_outbox_test
     storage_owner_reverse_outbox_test.cc)
 dvstor_target_common_includes(storage_owner_reverse_outbox_test)
@@ -454,13 +444,6 @@ target_link_libraries(storage_owner_ready_context_queue_test PRIVATE Threads::Th
 target_compile_options(storage_owner_ready_context_queue_test PRIVATE -UNDEBUG)
 add_test(NAME storage_owner_ready_context_queue_test
     COMMAND storage_owner_ready_context_queue_test)
-
-add_executable(stage2_fallback_audit_policy_test
-    stage2_fallback_audit_policy_test.cc)
-dvstor_target_common_includes(stage2_fallback_audit_policy_test)
-target_compile_options(stage2_fallback_audit_policy_test PRIVATE -UNDEBUG)
-add_test(NAME stage2_fallback_audit_policy_test
-    COMMAND stage2_fallback_audit_policy_test)
 
 add_executable(peer_async_response_registry_test
     peer_async_response_registry_test.cc)

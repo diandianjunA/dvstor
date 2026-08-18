@@ -53,7 +53,7 @@ void test_authority_extension_rpc_layouts() {
   namespace protocol = service::storage_owner;
 
   static_assert(protocol::kMutationProtocolVersion == 4);
-  static_assert(protocol::kPeerRpcVersion == 14);
+  static_assert(protocol::kPeerRpcVersion == 15);
   static_assert(static_cast<u32>(
                   protocol::PeerRpcType::stage1_arm_response) == 14);
   static_assert(static_cast<u32>(
@@ -118,15 +118,21 @@ void test_authority_extension_rpc_layouts() {
   auto* score_many_header =
     protocol::stage2_score_many_header(score_many_request.data());
   score_many_header->query_count = query_count;
-  assert(protocol::stage2_score_many_flags_valid(score_many_header->flags));
-  assert(!protocol::stage2_score_many_is_speculative(
-    score_many_header->flags));
-  score_many_header->flags = protocol::kStage2ScoreManyFlagSpeculative;
-  assert(protocol::stage2_score_many_flags_valid(score_many_header->flags));
-  assert(protocol::stage2_score_many_is_speculative(
-    score_many_header->flags));
-  assert(!protocol::stage2_score_many_flags_valid(
-    protocol::kStage2ScoreManyKnownFlags << 1));
+  assert(score_many_header->reserved == 0);
+
+  protocol::ReconcileReverseOp reconcile_op{
+    .kind = static_cast<u32>(
+      protocol::ReconcileReverseOpKind::replace_or_add),
+  };
+  assert(protocol::reconcile_reverse_op_valid(reconcile_op));
+  reconcile_op.reserved = 1;
+  assert(!protocol::reconcile_reverse_op_valid(reconcile_op));
+  reconcile_op.reserved = 0;
+  reconcile_op.kind = 0;
+  assert(!protocol::reconcile_reverse_op_valid(reconcile_op));
+  reconcile_op.kind = static_cast<u32>(
+    protocol::ReconcileReverseOpKind::promote_stable_bridge) + 1;
+  assert(!protocol::reconcile_reverse_op_valid(reconcile_op));
   auto* score_many_items = protocol::stage2_score_many_items(
     score_many_request.data());
   score_many_items[0] = {

@@ -17,7 +17,10 @@ constexpr u32 kMutationCompletionMagic = 0x4d434d50;  // "MCMP"
 // replay identities.
 constexpr u32 kMutationProtocolVersion = 4;
 constexpr u32 kPeerRpcMagic = 0x53505250;  // "SPRP"
-constexpr u32 kPeerRpcVersion = 14;
+// Version 15 removes the retired speculative score-many traffic class. Peers
+// from older builds are rejected at the common header check rather than
+// silently interpreting a now-invalid flags bit.
+constexpr u32 kPeerRpcVersion = 15;
 
 enum class InsertStatus : u32 {
   ok = 0,
@@ -124,23 +127,9 @@ static_assert(sizeof(Stage2ExpandScoreNeighbor) == 16);
 
 struct Stage2ScoreManyHeader {
   u32 query_count{};
-  // Legacy/authoritative requests carry zero. Independent exact-score
-  // lookahead sets the speculative bit so receivers can isolate its queue and
-  // response capacity without changing the score payload or wire size.
-  u32 flags{};
+  // Reserved for future protocol versions. Version 15 accepts only zero.
+  u32 reserved{};
 };
-
-inline constexpr u32 kStage2ScoreManyFlagSpeculative = 1u << 0;
-inline constexpr u32 kStage2ScoreManyKnownFlags =
-  kStage2ScoreManyFlagSpeculative;
-
-inline constexpr bool stage2_score_many_flags_valid(u32 flags) noexcept {
-  return (flags & ~kStage2ScoreManyKnownFlags) == 0;
-}
-
-inline constexpr bool stage2_score_many_is_speculative(u32 flags) noexcept {
-  return (flags & kStage2ScoreManyFlagSpeculative) != 0;
-}
 
 struct Stage2ScoreManyItem {
   u64 pointer_raw{};
@@ -383,6 +372,13 @@ struct ReconcileReverseOp {
   u32 kind{};
   u32 reserved{};
 };
+
+inline bool reconcile_reverse_op_valid(const ReconcileReverseOp& op) {
+  return op.reserved == 0 &&
+    op.kind >= static_cast<u32>(ReconcileReverseOpKind::replace_or_add) &&
+    op.kind <= static_cast<u32>(
+      ReconcileReverseOpKind::promote_stable_bridge);
+}
 
 // These fields describe postconditions, except replaced which reports that
 // this invocation consumed an old-pointer slot.  In particular, removed is

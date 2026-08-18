@@ -1,6 +1,5 @@
 #include "memory_node/peer_rpc/detail.hh"
 #include "memory_node/peer_rpc/stage1_control_fanout_policy.hh"
-#include "memory_node/storage_owner_index/stage1_prune_handoff_policy.hh"
 #include "memory_node/storage_owner_index/vector_snapshot_policy.hh"
 
 namespace authority = memory_node_storage_owner_index_detail;
@@ -205,12 +204,9 @@ bool MemoryNode::handle_peer_stage2_score_many_request(
   const auto* own_header = stage2_score_many_header(payload);
   if (own_header->query_count == 0 ||
       own_header->query_count > header.item_count ||
-      !stage2_score_many_flags_valid(own_header->flags)) {
+      own_header->reserved != 0) {
     return false;
   }
-  const bool speculative =
-    stage2_score_many_is_speculative(own_header->flags);
-  if (speculative && !peer_stage2_home_speculation_enabled_) return false;
 
   const size_t response_capacity =
     stage2_score_many_response_bytes(header.item_count);
@@ -291,7 +287,6 @@ bool MemoryNode::handle_peer_stage2_score_many_request(
   outbound.header = *response_header;
   outbound.payload = std::move(response);
   outbound.graph_response = true;
-  outbound.speculative = speculative;
   outbound.queued_at = std::chrono::steady_clock::now();
   const bool queued = try_enqueue_peer_reverse_update_response(
     std::move(outbound));
@@ -524,15 +519,9 @@ MemoryNode::prepare_local_stage1_item(
     skip.insert(RemotePtr{item.old_raw});
   }
   const auto prune_started = std::chrono::steady_clock::now();
-  const bool defer_stage1_prune =
-    config.storage_owner_defer_stage1_prune &&
-    kind == MutationKind::insert;
-  vec<RemotePtr> neighbors = defer_stage1_prune
-    ? authority::deferred_stage1_provisional_neighbors(
-        span<const RemotePtr>{candidates}, config.R)
-    : robust_prune_cpu(
-        raw_vector, VamanaNode::vector_dtype(), candidates, skip, config,
-        breakdown, config.R);
+  vec<RemotePtr> neighbors = robust_prune_cpu(
+    raw_vector, VamanaNode::vector_dtype(), candidates, skip, config,
+    breakdown, config.R);
   physical_prune_ns = elapsed_ns_since(prune_started);
   if (breakdown != nullptr) {
     breakdown->storage_owner_prune_ns += physical_prune_ns;
@@ -597,7 +586,6 @@ MemoryNode::prepare_local_stage1_item(
     prepared.beam = std::move(stage1_beam);
     prepared.remote_frontier = std::move(remote_frontier);
     prepared.backlink_targets = std::move(backlink_targets);
-    prepared.stage1_prune_deferred = defer_stage1_prune;
     prepared.prepared = true;
   }
   record_physical_stage1(
@@ -1059,7 +1047,6 @@ bool MemoryNode::arm_local_stage1_items(
       task.stage1_remote_frontier = std::move(prepared.remote_frontier);
       task.stage1_backlink_targets = std::move(
         prepared.backlink_targets);
-      task.stage1_prune_deferred = prepared.stage1_prune_deferred;
       claimed.push_back(ClaimedArm{
         .result_index = result_index,
         .key = key,
@@ -1383,7 +1370,6 @@ bool MemoryNode::arm_local_stage1_items(
       task.stage1_remote_frontier = std::move(prepared.remote_frontier);
       task.stage1_backlink_targets = std::move(
         prepared.backlink_targets);
-      task.stage1_prune_deferred = prepared.stage1_prune_deferred;
     }
     const u64 maintenance_sequence =
       arm_storage_owner_maintenance(std::move(task), config);

@@ -162,10 +162,6 @@ void MemoryNode::storage_owner_insert_worker_loop(u32 worker_id) {
       return;
     }
 
-    mark_storage_owner_foreground_activity();
-    storage_owner_insert_active_workers_.fetch_add(1, std::memory_order_acq_rel);
     process_storage_owner_insert_task(task);
-    storage_owner_insert_active_workers_.fetch_sub(1, std::memory_order_acq_rel);
-    mark_storage_owner_foreground_activity();
   }
 }

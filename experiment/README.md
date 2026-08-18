@@ -5,16 +5,39 @@ storage-owner 动态更新这一套系统架构，以及它的 optimized/baselin
 
 ## 配置
 
-默认路径定义在 `sift100m_common.sh`。实验只保留两个完整、自包含的系统 profile：
+默认路径定义在 `sift100m_common.sh`。实验只保留两个完整的系统 profile：
 
 ```text
 profiles/04_gpu_persistent_gpunetio.env           # 默认最佳性能
 profiles/04_gpu_persistent_gpunetio_baseline.env  # 严格 A/B baseline
 ```
 
-二者的索引、C16 扩展、Beam 宽度、expansion budget、rerank、QP、显存与更新配置
-完全相同。默认 profile 使用 Stable-Run Beam merge 和 Live-Extent RDMA；baseline
-使用 legacy Beam merge 和 fixed-size graph read。常用机器路径覆盖项：
+二者共用 `profiles/04_gpu_persistent_gpunetio_common.sh` 中唯一一份索引、质量、
+线程、QP、显存和更新安全边界配置。baseline 是“存算分离 + persistent GPU /
+GPUNetIO + 两阶段更新卸载”的架构锚点；异步 accepted backlog、B8 Stage2、durable
+watermark、重试去重和有界 executor 属于架构本体，两边完全一致。只有下表中的可选
+性能 feature 不同：
+
+| 优化开关 | baseline | optimized |
+| --- | ---: | ---: |
+| GPU graph commit / issue width | 16 / 16 | 16 / 32 |
+| GPU Beam merge | `legacy` | `stable-run` |
+| GPU graph read | `fixed` | `live-extent` |
+| dynamic graph extent hint | off | on |
+| Stage2 exact score-many | off | on |
+| Stage2 ordered graph issue width | 1 | 16 |
+| Stage2 home RPC combining | off | on |
+
+项目不再维护历史实验 profile。做单项消融时直接覆盖 optimized profile 的对应环境
+变量，计算端和存储端必须使用同一组覆盖值。例如关闭 score-many：
+
+```bash
+export STORAGE_OWNER_STAGE2_SCORE_MANY=false
+./experiment/start_all_memory_nodes.sh 04_gpu_persistent_gpunetio
+./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio
+```
+
+清除该环境变量即可恢复 full。常用机器路径覆盖项：
 
 ```bash
 export HOSTS="192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202 192.168.6.202"
@@ -23,6 +46,10 @@ export GPU_DEVICE=1
 export GPU_MEMORY_LIMIT_GB=40
 export GPU_MEMORY_RESERVE_GB=4
 ```
+
+本次清理同时把 peer RPC 协议升级到 v15，并删除了已经停用的 speculative
+score-many traffic class。该协议没有独立的能力协商，因此计算节点和全部存储节点
+必须使用同一版本二进制并一起重启，不能混跑 v14/v15。
 
 `MN_MEMORY_GB` 表示每个存储分片的 RDMA 注册区容量，不是进程总 RSS。未显式
 设置时，启动脚本会在 profile 确定最终 `INDEX_PREFIX` 后估算：已有 schema-16

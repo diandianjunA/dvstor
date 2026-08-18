@@ -8,62 +8,6 @@
 
 namespace memory_node_peer_rpc_detail {
 
-// Receiver-side speculative work must never sit in front of a correctness
-// dependency from another sender. Both Stage2-home execution and response
-// dispatch use this same strict two-class policy. Disabling speculation makes
-// a lone service worker authoritative-only instead of merely preferring it.
-enum class PriorityQueueChoice : u8 {
-  none,
-  authoritative,
-  speculative,
-};
-
-inline constexpr PriorityQueueChoice choose_authoritative_first(
-    bool authoritative_available,
-    bool speculative_available,
-    bool speculation_enabled = true) noexcept {
-  if (authoritative_available) return PriorityQueueChoice::authoritative;
-  if (speculation_enabled && speculative_available) {
-    return PriorityQueueChoice::speculative;
-  }
-  return PriorityQueueChoice::none;
-}
-
-// A preference cannot protect an authoritative RPC from a speculative RPC
-// that is already executing on the receiver's only service lane. Keep the
-// feature off unless a second physical-home lane can make real progress and
-// transport has at least two graph-class SEND slots (one remains reserved for
-// authoritative graph/reverse traffic). With the static lane mapping that
-// surplus first exists at a per-peer depth of five.
-inline constexpr bool independent_score_receiver_enabled(
-    u32 physical_home_workers, u32 send_slots_per_peer) noexcept {
-  return physical_home_workers >= 2 && send_slots_per_peer >= 5;
-}
-
-// Speculative request debt is bounded independently of authoritative work:
-// at most one queued-or-running request per remote source and no more than a
-// receiver-wide cap. The caller validates the source index before supplying
-// source_active, keeping this pure predicate usable by policy tests.
-inline constexpr bool speculative_score_request_admissible(
-    bool speculation_enabled,
-    bool source_active,
-    size_t speculative_queued,
-    size_t speculative_queue_limit) noexcept {
-  return speculation_enabled && !source_active &&
-    speculative_queued < speculative_queue_limit;
-}
-
-// Queue priority cannot preempt work that is already running. A distinct
-// execution credit therefore caps concurrent speculative service and leaves
-// every other physical-home lane available to authoritative dependencies.
-inline constexpr bool speculative_score_execution_admissible(
-    bool speculation_enabled,
-    u32 speculative_active,
-    u32 speculative_execution_limit) noexcept {
-  return speculation_enabled &&
-    speculative_active < speculative_execution_limit;
-}
-
 // Stage1 publication and Stage2 home expansion share a CPU pool. Strictly
 // preferring Stage1 creates a dependency cycle under sustained load: every
 // newly published update adds Stage2 work, but that work runs only after the
@@ -80,21 +24,10 @@ inline constexpr bool speculative_score_execution_admissible(
 constexpr u64 kStage2HomeBorrowAgeNs = 250'000;
 constexpr u64 kStage1UrgentAgeNs = 1'000'000;
 
-// Stage1 workers may share a condition variable with an isolated Stage2-home
-// pool. A notification is not proof that this worker owns runnable work: when
-// Stage2-home is dedicated, only the Stage1 queue is eligible here.
 inline bool stage1_worker_has_eligible_task(
-    bool stage2_home_dedicated,
     bool stage1_available,
-    bool authoritative_stage2_home_available,
-    bool speculative_stage2_home_available = false) noexcept {
-  // The speculative argument is deliberately ignored. Even when the
-  // authoritative home queue is work-conserving across the Stage1 pool, a
-  // low-priority request belongs exclusively to the reserved home worker so
-  // it can never delay a later Stage1 publication on the last shared lane.
-  (void)speculative_stage2_home_available;
-  return stage1_available ||
-    (!stage2_home_dedicated && authoritative_stage2_home_available);
+    bool stage2_home_available) noexcept {
+  return stage1_available || stage2_home_available;
 }
 
 // Keep the CQ response router and the Stage2 caller on one definition of the

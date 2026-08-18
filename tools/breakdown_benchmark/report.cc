@@ -751,15 +751,6 @@ FormattedReport format_report(const nlohmann::json& root,
                << " promotion_ratio="
                << ordered.value("promotion_ratio", 0.0) << '\n';
       }
-      if (stage2.contains("ordered_score_prefetch")) {
-        const auto& ordered = stage2["ordered_score_prefetch"];
-        output << "  ordered score prefetch: issued/hit/wasted="
-               << ordered.value("issued", 0ULL) << "/"
-               << ordered.value("hits", 0ULL) << "/"
-               << ordered.value("wasted", 0ULL)
-               << " promotion_ratio="
-               << ordered.value("promotion_ratio", 0.0) << '\n';
-      }
       if (stage2.contains("home_rpc_wire")) {
         const auto& wire = stage2["home_rpc_wire"];
         output << "  graph home RPC: batches/items/avg_items="
@@ -1065,9 +1056,23 @@ FormattedReport format_report(const nlohmann::json& root,
            << gpu.value("exact_snapshot_train_fallbacks", 0ULL) << "/"
            << gpu.value("exact_snapshot_train_success_ratio", 0.0)
            << '\n';
+    output << "  GPU graph commit/issue width: "
+           << root["meta"].value("gpu_graph_commit_width", 0U) << "/"
+           << root["meta"].value("gpu_graph_issue_width", 0U) << '\n';
+    output << "  GPU graph read/dynamic extent: "
+           << root["meta"].value(
+                "gpu_query_graph_read_policy", "fixed") << "/"
+           << root["meta"].value("gpu_dynamic_graph_extent", false) << '\n';
     output << "  GPU Beam merge policy: "
            << root["meta"].value(
                 "gpu_query_beam_merge_policy", "legacy") << '\n';
+    output << "  Stage2 score-many/graph-issue/home-combining: "
+           << root["meta"].value(
+                "storage_owner_stage2_score_many", false) << "/"
+           << root["meta"].value(
+                "storage_owner_stage2_graph_issue_width", 1U) << "/"
+           << root["meta"].value(
+                "storage_owner_stage2_home_rpc_combining", false) << '\n';
     output << "  GPU Beam merge total/prepare/sort/materialize us: "
            << gpu.value("average_gpu_beam_merge_us", 0.0) << "/"
            << gpu.value("average_gpu_beam_merge_prepare_us", 0.0) << "/"
