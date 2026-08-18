@@ -1587,6 +1587,38 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
      maintenance_summary.stage2_graph_read_waves == 0 ? 0.0 :
        static_cast<double>(maintenance_summary.stage2_graph_unique_reads) /
        static_cast<double>(maintenance_summary.stage2_graph_read_waves)},
+    {"graph_prefetch_prediction", {
+      {"counter_delta_available",
+       maintenance_summary.execution_counter_delta_available},
+      {"opportunities",
+       maintenance_summary.stage2_graph_prefetch_predictions},
+      {"top1_hits",
+       maintenance_summary.stage2_graph_prefetch_top1_hits},
+      {"top2_hits",
+       maintenance_summary.stage2_graph_prefetch_top2_hits},
+      {"top1_hit_ratio",
+       maintenance_summary.stage2_graph_prefetch_predictions == 0 ? 0.0 :
+         static_cast<double>(
+           maintenance_summary.stage2_graph_prefetch_top1_hits) /
+         static_cast<double>(
+           maintenance_summary.stage2_graph_prefetch_predictions)},
+      {"top2_hit_ratio",
+       maintenance_summary.stage2_graph_prefetch_predictions == 0 ? 0.0 :
+         static_cast<double>(
+           maintenance_summary.stage2_graph_prefetch_top2_hits) /
+         static_cast<double>(
+           maintenance_summary.stage2_graph_prefetch_predictions)},
+      {"top1_graph_wave_reduction_upper_bound",
+       maintenance_summary.stage2_graph_read_waves == 0 ? 0.0 :
+         static_cast<double>(
+           maintenance_summary.stage2_graph_prefetch_top1_hits) /
+         static_cast<double>(maintenance_summary.stage2_graph_read_waves)},
+      {"top2_graph_wave_reduction_upper_bound",
+       maintenance_summary.stage2_graph_read_waves == 0 ? 0.0 :
+         static_cast<double>(
+           maintenance_summary.stage2_graph_prefetch_top2_hits) /
+         static_cast<double>(maintenance_summary.stage2_graph_read_waves)},
+    }},
     {"stage2_vector_read_waves",
      maintenance_summary.stage2_vector_read_waves},
     {"stage2_vector_unique_reads",

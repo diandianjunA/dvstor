@@ -47,6 +47,9 @@ struct MaintenanceObservation {
   uint64_t stage2_batched_items{};
   uint64_t stage2_graph_read_waves{};
   uint64_t stage2_graph_unique_reads{};
+  uint64_t stage2_graph_prefetch_predictions{};
+  uint64_t stage2_graph_prefetch_top1_hits{};
+  uint64_t stage2_graph_prefetch_top2_hits{};
   uint64_t stage2_vector_read_waves{};
   uint64_t stage2_vector_unique_reads{};
   uint64_t stage2_home_score_rpc_batches{};
@@ -123,6 +126,9 @@ struct MaintenanceLogSummary {
   uint64_t stage2_batched_items{};
   uint64_t stage2_graph_read_waves{};
   uint64_t stage2_graph_unique_reads{};
+  uint64_t stage2_graph_prefetch_predictions{};
+  uint64_t stage2_graph_prefetch_top1_hits{};
+  uint64_t stage2_graph_prefetch_top2_hits{};
   uint64_t stage2_vector_read_waves{};
   uint64_t stage2_vector_unique_reads{};
   uint64_t stage2_home_score_rpc_batches{};
