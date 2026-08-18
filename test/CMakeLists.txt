@@ -455,6 +455,13 @@ target_compile_options(storage_owner_ready_context_queue_test PRIVATE -UNDEBUG)
 add_test(NAME storage_owner_ready_context_queue_test
     COMMAND storage_owner_ready_context_queue_test)
 
+add_executable(stage2_fallback_audit_policy_test
+    stage2_fallback_audit_policy_test.cc)
+dvstor_target_common_includes(stage2_fallback_audit_policy_test)
+target_compile_options(stage2_fallback_audit_policy_test PRIVATE -UNDEBUG)
+add_test(NAME stage2_fallback_audit_policy_test
+    COMMAND stage2_fallback_audit_policy_test)
+
 add_executable(peer_async_response_registry_test
     peer_async_response_registry_test.cc)
 dvstor_target_common_includes(peer_async_response_registry_test)

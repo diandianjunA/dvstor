@@ -23,8 +23,10 @@ inline constexpr u64 kMagic = 0x31544d43565344ULL;  // "DSVCMT1"
 // reports owner-directed, shared-capacity, and broadcast wake traffic plus
 // the context-slot scans they induce. Version 10 reports the exact number of
 // finalize descriptors currently owned by active Stage2 contexts and its
-// independent execution limit.
-inline constexpr u32 kVersion = 10;
+// independent execution limit. Version 11 adds the bounded C32/C40/C48
+// execution-controller state, throughput-trial/fuse counters, and periodic
+// fallback-audit effectiveness counters.
+inline constexpr u32 kVersion = 11;
 inline constexpr u32 kValidCounters = 1u << 0;
 inline constexpr size_t kLatencyBucketCount = 18;
 inline constexpr size_t kStage2PhaseCount = 6;
@@ -140,6 +142,26 @@ struct alignas(64) Snapshot {
   u64 maintenance_context_slots_scanned{};
   u64 active_stage2_tasks{};
   u64 active_stage2_task_limit{};
+  u64 active_stage2_contexts{};
+  u64 active_stage2_context_limit{};
+  u64 active_stage2_context_limit_baseline{};
+  u64 active_stage2_context_limit_max{};
+  u64 active_stage2_task_limit_baseline{};
+  u64 active_stage2_task_limit_max{};
+  u64 stage2_budget_promotions{};
+  u64 stage2_budget_rollbacks{};
+  u64 stage2_budget_lane_rollbacks{};
+  u64 stage2_budget_low_backlog_rollbacks{};
+  u64 stage2_budget_rate_rollbacks{};
+  u64 stage2_budget_rate_trials_accepted{};
+  u64 stage2_budget_high_backlog_samples{};
+  u64 stage2_budget_lane_headroom_samples{};
+  u64 stage2_budget_stable_rate_milli_per_sec{};
+  u64 stage2_budget_trial_baseline_rate_milli_per_sec{};
+  u64 stage2_budget_rate_trial_pending{};
+  u64 stage2_budget_promotion_context_limit{};
+  u64 maintenance_periodic_fallback_audits{};
+  u64 maintenance_periodic_fallback_recoveries{};
 };
 
 static_assert(kSnapshotOffset == 192);

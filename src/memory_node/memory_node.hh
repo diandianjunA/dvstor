@@ -868,6 +868,7 @@ private:
                                                  size_t cleanup_remaining,
                                                  bool final);
   void maybe_log_storage_owner_maintenance_observation();
+  void maybe_adjust_storage_owner_stage2_execution_budget();
   void storage_owner_maintenance_worker_loop(u32 worker_id);
   bool storage_owner_maintenance_foreground_busy(const Configuration& config);
   bool try_acquire_storage_owner_maintenance_slot(
@@ -1412,6 +1413,8 @@ private:
   std::atomic<u64> storage_owner_maintenance_ready_tickets_drained_{0};
   std::atomic<u64> storage_owner_maintenance_ready_overflow_scans_{0};
   std::atomic<u64> storage_owner_maintenance_ready_fallback_scans_{0};
+  std::atomic<u64> storage_owner_maintenance_periodic_fallback_audits_{0};
+  std::atomic<u64> storage_owner_maintenance_periodic_fallback_recoveries_{0};
   // Every worker owns enough registered scratch for its bounded local context
   // pool, while this node-wide lease is the authoritative active-lane bound.
   // This turns a fixed per-worker 2-lane partition into a work-conserving
@@ -1546,7 +1549,38 @@ private:
   // Stage2 contexts. Accepted descriptors that remain in the queue are not
   // counted: this is background execution pressure, never Stage1 ACK credit.
   std::atomic<u32> storage_owner_maintenance_active_tasks_{0};
-  u32 storage_owner_maintenance_active_task_limit_{};
+  // Current limits are adaptive execution targets. A downward transition can
+  // temporarily leave the live gauges above the new target; admission stops
+  // immediately and existing contexts retire normally under the immutable
+  // hard maxima.
+  std::atomic<u32> storage_owner_maintenance_contexts_per_worker_limit_{1};
+  u32 storage_owner_maintenance_contexts_per_worker_baseline_{1};
+  u32 storage_owner_maintenance_contexts_per_worker_max_{1};
+  std::atomic<u32> storage_owner_stage2_budget_promotion_ceiling_{1};
+  std::atomic<u32> storage_owner_maintenance_active_task_limit_{1};
+  u32 storage_owner_maintenance_active_task_limit_baseline_{1};
+  u32 storage_owner_maintenance_active_task_limit_max_{1};
+  std::atomic<bool> storage_owner_stage2_budget_sample_busy_{false};
+  std::atomic<u64> storage_owner_stage2_budget_last_sample_ns_{0};
+  std::atomic<u64> storage_owner_stage2_budget_last_lane_blocks_{0};
+  std::atomic<u64> storage_owner_stage2_budget_last_processed_{0};
+  std::atomic<u32> storage_owner_stage2_budget_promotion_streak_{0};
+  std::atomic<u32> storage_owner_stage2_budget_lane_pressure_streak_{0};
+  std::atomic<u32> storage_owner_stage2_budget_low_backlog_streak_{0};
+  std::atomic<u32> storage_owner_stage2_budget_cooldown_{0};
+  std::atomic<u64> storage_owner_stage2_budget_stable_rate_milli_{0};
+  std::atomic<u64> storage_owner_stage2_budget_trial_baseline_rate_milli_{0};
+  std::atomic<u32> storage_owner_stage2_budget_trial_regression_streak_{0};
+  std::atomic<u32> storage_owner_stage2_budget_trial_success_streak_{0};
+  std::atomic<bool> storage_owner_stage2_budget_rate_trial_pending_{false};
+  std::atomic<u64> storage_owner_stage2_budget_promotions_{0};
+  std::atomic<u64> storage_owner_stage2_budget_rollbacks_{0};
+  std::atomic<u64> storage_owner_stage2_budget_lane_rollbacks_{0};
+  std::atomic<u64> storage_owner_stage2_budget_low_backlog_rollbacks_{0};
+  std::atomic<u64> storage_owner_stage2_budget_rate_rollbacks_{0};
+  std::atomic<u64> storage_owner_stage2_budget_rate_trials_accepted_{0};
+  std::atomic<u64> storage_owner_stage2_budget_high_backlog_samples_{0};
+  std::atomic<u64> storage_owner_stage2_budget_lane_headroom_samples_{0};
   std::atomic<u64> storage_owner_maintenance_started_ns_{0};
   std::atomic<u64> storage_owner_maintenance_last_observation_ns_{0};
   std::atomic<u64> storage_owner_maintenance_finalize_latency_ns_{0};

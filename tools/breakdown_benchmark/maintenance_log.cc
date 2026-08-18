@@ -1102,6 +1102,86 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
     summary.max_active_stage2_task_limit_per_shard = std::max(
       summary.max_active_stage2_task_limit_per_shard,
       shard_active_stage2_task_limit);
+    summary.active_stage2_contexts_latest_sum +=
+      latest.active_stage2_contexts;
+    summary.active_stage2_context_limit_sum += std::max(
+      first.active_stage2_context_limit,
+      latest.active_stage2_context_limit);
+    summary.active_stage2_context_limit_baseline_sum +=
+      latest.active_stage2_context_limit_baseline;
+    summary.active_stage2_context_limit_max_sum +=
+      latest.active_stage2_context_limit_max;
+    summary.active_stage2_task_limit_baseline_sum +=
+      latest.active_stage2_task_limit_baseline;
+    summary.active_stage2_task_limit_max_sum +=
+      latest.active_stage2_task_limit_max;
+    summary.stage2_budget_stable_rate_milli_per_sec_sum +=
+      latest.stage2_budget_stable_rate_milli_per_sec;
+    summary.stage2_budget_trial_baseline_rate_milli_per_sec_sum +=
+      latest.stage2_budget_trial_baseline_rate_milli_per_sec;
+    summary.stage2_budget_rate_trial_pending_sum +=
+      latest.stage2_budget_rate_trial_pending;
+    summary.stage2_budget_promotion_context_limit_sum +=
+      latest.stage2_budget_promotion_context_limit;
+    uint64_t budget_promotions = 0;
+    uint64_t budget_rollbacks = 0;
+    uint64_t budget_lane_rollbacks = 0;
+    uint64_t budget_low_backlog_rollbacks = 0;
+    uint64_t budget_rate_rollbacks = 0;
+    uint64_t budget_rate_trials_accepted = 0;
+    uint64_t budget_high_backlog_samples = 0;
+    uint64_t budget_lane_headroom_samples = 0;
+    if (counter_delta(first.stage2_budget_promotions,
+                      latest.stage2_budget_promotions,
+                      &budget_promotions) &&
+        counter_delta(first.stage2_budget_rollbacks,
+                      latest.stage2_budget_rollbacks,
+                      &budget_rollbacks) &&
+        counter_delta(first.stage2_budget_lane_rollbacks,
+                      latest.stage2_budget_lane_rollbacks,
+                      &budget_lane_rollbacks) &&
+        counter_delta(first.stage2_budget_low_backlog_rollbacks,
+                      latest.stage2_budget_low_backlog_rollbacks,
+                      &budget_low_backlog_rollbacks) &&
+        counter_delta(first.stage2_budget_rate_rollbacks,
+                      latest.stage2_budget_rate_rollbacks,
+                      &budget_rate_rollbacks) &&
+        counter_delta(first.stage2_budget_rate_trials_accepted,
+                      latest.stage2_budget_rate_trials_accepted,
+                      &budget_rate_trials_accepted) &&
+        counter_delta(first.stage2_budget_high_backlog_samples,
+                      latest.stage2_budget_high_backlog_samples,
+                      &budget_high_backlog_samples) &&
+        counter_delta(first.stage2_budget_lane_headroom_samples,
+                      latest.stage2_budget_lane_headroom_samples,
+                      &budget_lane_headroom_samples)) {
+      ++summary.logs_with_execution_budget_deltas;
+      summary.stage2_budget_promotions += budget_promotions;
+      summary.stage2_budget_rollbacks += budget_rollbacks;
+      summary.stage2_budget_lane_rollbacks += budget_lane_rollbacks;
+      summary.stage2_budget_low_backlog_rollbacks +=
+        budget_low_backlog_rollbacks;
+      summary.stage2_budget_rate_rollbacks += budget_rate_rollbacks;
+      summary.stage2_budget_rate_trials_accepted +=
+        budget_rate_trials_accepted;
+      summary.stage2_budget_high_backlog_samples +=
+        budget_high_backlog_samples;
+      summary.stage2_budget_lane_headroom_samples +=
+        budget_lane_headroom_samples;
+    }
+    uint64_t fallback_audits = 0;
+    uint64_t fallback_recoveries = 0;
+    if (counter_delta(first.maintenance_periodic_fallback_audits,
+                      latest.maintenance_periodic_fallback_audits,
+                      &fallback_audits) &&
+        counter_delta(first.maintenance_periodic_fallback_recoveries,
+                      latest.maintenance_periodic_fallback_recoveries,
+                      &fallback_recoveries)) {
+      ++summary.logs_with_fallback_audit_deltas;
+      summary.maintenance_periodic_fallback_audits += fallback_audits;
+      summary.maintenance_periodic_fallback_recoveries +=
+        fallback_recoveries;
+    }
     uint64_t logical_full = 0;
     uint64_t physical_full = 0;
     if (counter_delta(first.completion_logical_full_failures,
@@ -1496,6 +1576,12 @@ MaintenanceLogSummary summarize_maintenance_snapshot_window(
   summary.active_stage2_task_gauge_available =
     summary.requested_logs != 0 &&
     summary.logs_with_active_stage2_task_gauges == summary.requested_logs;
+  summary.execution_budget_delta_available =
+    summary.requested_logs != 0 &&
+    summary.logs_with_execution_budget_deltas == summary.requested_logs;
+  summary.fallback_audit_delta_available =
+    summary.requested_logs != 0 &&
+    summary.logs_with_fallback_audit_deltas == summary.requested_logs;
   summary.locality_delta_available = summary.requested_logs != 0 &&
     summary.logs_with_locality_deltas == summary.requested_logs;
   summary.search_budget_delta_available = summary.requested_logs != 0 &&

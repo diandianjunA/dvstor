@@ -42,7 +42,25 @@ int main() {
     .completion_logical_full_failures = 7,
     .completion_physical_full_failures = 1,
     .active_stage2_tasks = 17,
-    .active_stage2_task_limit = 256,
+    .active_stage2_task_limit = 320,
+    .active_stage2_contexts = 39,
+    .active_stage2_context_limit = 40,
+    .active_stage2_context_limit_baseline = 32,
+    .active_stage2_context_limit_max = 48,
+    .active_stage2_task_limit_baseline = 256,
+    .active_stage2_task_limit_max = 384,
+    .stage2_budget_promotions = 1,
+    .stage2_budget_rollbacks = 0,
+    .stage2_budget_rate_rollbacks = 1,
+    .stage2_budget_rate_trials_accepted = 2,
+    .stage2_budget_high_backlog_samples = 7,
+    .stage2_budget_lane_headroom_samples = 5,
+    .stage2_budget_stable_rate_milli_per_sec = 1'200'000,
+    .stage2_budget_trial_baseline_rate_milli_per_sec = 1'100'000,
+    .stage2_budget_rate_trial_pending = 1,
+    .stage2_budget_promotion_context_limit = 40,
+    .maintenance_periodic_fallback_audits = 99,
+    .maintenance_periodic_fallback_recoveries = 7,
   };
   first.stage2_delay_histogram[6] = 12;
   telemetry::publish(control_page.data(), first);
@@ -74,7 +92,26 @@ int main() {
   assert(copied.completion_logical_full_failures == 7);
   assert(copied.completion_physical_full_failures == 1);
   assert(copied.active_stage2_tasks == 17);
-  assert(copied.active_stage2_task_limit == 256);
+  assert(copied.active_stage2_task_limit == 320);
+  assert(copied.active_stage2_contexts == 39);
+  assert(copied.active_stage2_context_limit == 40);
+  assert(copied.active_stage2_context_limit_baseline == 32);
+  assert(copied.active_stage2_context_limit_max == 48);
+  assert(copied.active_stage2_task_limit_baseline == 256);
+  assert(copied.active_stage2_task_limit_max == 384);
+  assert(copied.stage2_budget_promotions == 1);
+  assert(copied.stage2_budget_rollbacks == 0);
+  assert(copied.stage2_budget_rate_rollbacks == 1);
+  assert(copied.stage2_budget_rate_trials_accepted == 2);
+  assert(copied.stage2_budget_high_backlog_samples == 7);
+  assert(copied.stage2_budget_lane_headroom_samples == 5);
+  assert(copied.stage2_budget_stable_rate_milli_per_sec == 1'200'000);
+  assert(copied.stage2_budget_trial_baseline_rate_milli_per_sec ==
+         1'100'000);
+  assert(copied.stage2_budget_rate_trial_pending == 1);
+  assert(copied.stage2_budget_promotion_context_limit == 40);
+  assert(copied.maintenance_periodic_fallback_audits == 99);
+  assert(copied.maintenance_periodic_fallback_recoveries == 7);
 
   telemetry::Snapshot second = first;
   second.published_steady_ns = 200;

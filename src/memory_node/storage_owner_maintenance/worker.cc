@@ -3,6 +3,7 @@
 #include "memory_node/storage_owner_maintenance/centroid_lifecycle_policy.hh"
 #include "memory_node/storage_owner_maintenance/cleanup_scheduler.hh"
 #include "memory_node/storage_owner_maintenance/cleanup_policy.hh"
+#include "memory_node/storage_owner_maintenance/fallback_audit_policy.hh"
 #include "memory_node/storage_owner_maintenance/reconcile_batch_state.hh"
 #include "memory_node/storage_owner_maintenance/search_io_state.hh"
 #include "memory_node/storage_owner_maintenance/search_lane_pool.hh"
@@ -3341,6 +3342,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   };
 
   const auto try_admit_context = [&]() -> Stage2Context* {
+    // Evaluate the shared adaptive budget before the local-limit fast path.
+    // At the C32 floor every executor can already own four contexts, so
+    // waiting until after that check would prevent the controller from ever
+    // observing enough debt to promote.
+    maybe_adjust_storage_owner_stage2_execution_budget();
     const Stage2AdmissionDecision admission = decide_stage2_admission(
       states.full(),
       storage_owner_maintenance_shutdown_.load(std::memory_order_acquire),
@@ -3350,9 +3356,13 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     }
     const bool foreground_pressure =
       admission == Stage2AdmissionDecision::foreground_pressure;
+    const size_t contexts_per_worker_limit =
+      storage_owner_maintenance_contexts_per_worker_limit_.load(
+        std::memory_order_acquire);
     const size_t local_context_limit =
       stage2_worker_context_admission_limit(
-        config.storage_owner_rpc_depth, foreground_pressure);
+        config.storage_owner_rpc_depth, foreground_pressure,
+        contexts_per_worker_limit);
     if (states.size() >= local_context_limit) {
       // Do not let this worker monopolize the process-wide context allowance.
       // Its contexts can use only this worker's registered search lanes;
@@ -3496,7 +3506,8 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       // this execution budget never participates in Stage1 ACK admission.
       if (!try_reserve_stage2_active_tasks(
             storage_owner_maintenance_active_tasks_, task_reservation,
-            storage_owner_maintenance_active_task_limit_)) {
+            storage_owner_maintenance_active_task_limit_.load(
+              std::memory_order_acquire))) {
         storage_owner_maintenance_active_workers_.fetch_sub(
           1, std::memory_order_acq_rel);
         storage_owner_maintenance_pressure_yields_.fetch_add(
@@ -3578,10 +3589,16 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   u64 unpublished_context_slots_scanned = 0;
   size_t active_context_cursor = 0;
   bool fallback_context_scan_requested = false;
-  constexpr auto kFallbackContextAuditInterval =
-    std::chrono::milliseconds(10);
-  auto next_fallback_context_scan =
-    std::chrono::steady_clock::now() + kFallbackContextAuditInterval;
+  bool fallback_audit_active = false;
+  auto next_fallback_context_scan = stage2_fallback_audit_deadline(
+    std::chrono::steady_clock::now(), states.size());
+  const auto refresh_fallback_audit_deadline = [&](const auto now) {
+    next_fallback_context_scan =
+      refresh_stage2_fallback_audit_deadline(
+        next_fallback_context_scan, fallback_audit_active,
+        states.size(), now);
+    fallback_audit_active = states.size() != 0;
+  };
   const auto flush_idle_timing = [&]() {
     if (unpublished_idle_waits != 0) {
       storage_owner_maintenance_worker_idle_ns_.fetch_add(
@@ -3745,6 +3762,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     lib_assert(context_count != 0,
                "maintenance worker has no Stage2 context slots");
     const auto scan_now = std::chrono::steady_clock::now();
+    // A context admitted on the preceding scheduler pass must not inherit the
+    // 10 ms idle horizon. Conversely, once the final local context retires,
+    // restore the idle cadence instead of scanning empty slots at 1 kHz.
+    refresh_fallback_audit_deadline(scan_now);
     const bool periodic_scan_due = scan_now >= next_fallback_context_scan;
     const bool scan_unmatched_wake =
       resource_context_scan_requested ||
@@ -3752,9 +3773,14 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     fallback_context_scan_requested = false;
     if (periodic_scan_due || scan_unmatched_wake) {
       const size_t scan_begin = active_context_cursor;
+      bool fallback_scan_progressed = false;
       unpublished_context_slots_scanned += context_count;
       storage_owner_maintenance_ready_fallback_scans_.fetch_add(
         1, std::memory_order_relaxed);
+      if (periodic_scan_due) {
+        storage_owner_maintenance_periodic_fallback_audits_.fetch_add(
+          1, std::memory_order_relaxed);
+      }
       if (unpublished_context_slots_scanned >= 4096) {
         storage_owner_maintenance_context_slots_scanned_.fetch_add(
           unpublished_context_slots_scanned, std::memory_order_relaxed);
@@ -3765,13 +3791,21 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
           scan_begin, offset, context_count);
         Stage2Context& context = contexts[context_index];
         if (context.active) {
-          progressed = drive_owned_context(context) || progressed;
+          const bool context_progressed = drive_owned_context(context);
+          fallback_scan_progressed =
+            context_progressed || fallback_scan_progressed;
+          progressed = context_progressed || progressed;
         }
+      }
+      if (periodic_scan_due && fallback_scan_progressed) {
+        storage_owner_maintenance_periodic_fallback_recoveries_.fetch_add(
+          1, std::memory_order_relaxed);
       }
       active_context_cursor = scan_begin + 1 == context_count
         ? 0 : scan_begin + 1;
-      next_fallback_context_scan =
-        scan_now + kFallbackContextAuditInterval;
+      fallback_audit_active = states.size() != 0;
+      next_fallback_context_scan = stage2_fallback_audit_deadline(
+        scan_now, states.size());
     }
 
     // Admission is intentionally a bounded scheduler action.  With a hot
@@ -3789,6 +3823,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       progressed = true;
       (void)drive_owned_context(*context);
     }
+    // Admission occurs after the periodic-scan decision. Clamp here as well
+    // so a newly suspended local-lock/timer retry reaches the 1 ms audit even
+    // when this worker was completely idle at the start of the pass.
+    refresh_fallback_audit_deadline(std::chrono::steady_clock::now());
 
     progressed = drive_reverse_outbox() || progressed;
     progressed = drain_reverse_completions() || progressed;
@@ -3796,9 +3834,11 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     maybe_log_storage_owner_maintenance_observation();
     if (!progressed) {
       const auto idle_started = std::chrono::steady_clock::now();
+      const auto fallback_audit_interval =
+        stage2_fallback_audit_interval(states.size());
       auto wake_at = std::min(
         next_fallback_context_scan,
-        idle_started + kFallbackContextAuditInterval);
+        idle_started + fallback_audit_interval);
       {
         std::lock_guard<std::mutex> queue_lock(
           storage_owner_maintenance_mutex_);
