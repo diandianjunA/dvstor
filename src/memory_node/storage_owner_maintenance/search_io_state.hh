@@ -252,6 +252,23 @@ constexpr bool stage2_score_many_peer_eligible(
   return minimum != 0 && pending_items >= minimum;
 }
 
+// Independent score-many already has stricter amortization fences than the
+// authoritative score-many path: at most one message per context, one
+// request-lifetime credit per peer, and an exact context-level A/B stop-loss.
+// Use half of the logical context coalescing unit, capped at 16 items. With
+// the production batch limit of 32 this is a 16-item request (typically one
+// or two query vectors plus 16 compact item descriptors), large enough to
+// amortize a two-sided RPC without requiring the 32 eligible candidates that
+// the measured graph-lookahead cache never exposed.
+constexpr u32 stage2_independent_score_min_items(
+    u32 item_capacity, u32 context_batch_limit) {
+  if (item_capacity == 0 || context_batch_limit == 0) return 0;
+  const u32 logical_message_capacity =
+    std::min(item_capacity, context_batch_limit);
+  return std::min<u32>(
+    16, stage2_score_many_min_items(logical_message_capacity));
+}
+
 struct Stage2SearchIoState {
   bool initialized{};
   Stage2SearchIoPhase phase{Stage2SearchIoPhase::idle};
@@ -301,11 +318,13 @@ struct Stage2SearchIoState {
   // by physical shard, so memory and transport debt are bounded independently
   // of the number of cached lookahead expansions.
   vec<Stage2SpeculativeScoreRpc> speculative_score_rpcs;
-  // Independent score lookahead is admitted only as part of a guarded
-  // target-four packing trial. One RPC total per context bounds receiver work;
-  // the process-wide per-peer credit provides the second overload fence.
+  // Independent score lookahead is admitted only by its own no-spec/spec A/B
+  // controller. One RPC total per context bounds receiver work; the
+  // process-wide per-peer credit provides the second overload fence.
   bool independent_score_allowed{};
   u32 independent_score_rpcs_started{};
+  u32 independent_score_rpcs_posted{};
+  u64 independent_score_useful{};
   u32 speculative_peer_cursor{};
 
   [[nodiscard]] bool graph_prefetch_contains(
@@ -534,6 +553,8 @@ struct Stage2SearchIoState {
     }
     independent_score_allowed = false;
     independent_score_rpcs_started = 0;
+    independent_score_rpcs_posted = 0;
+    independent_score_useful = 0;
     speculative_peer_cursor = 0;
     home_expand_rpc_count = 0;
     for (auto& rpc : home_expand_rpcs) {
@@ -549,8 +570,19 @@ struct Stage2SearchIoState {
   // bounds only lane-cache retention after an exceptional search; it is not
   // an in-flight candidate/frontier budget.
   void reset_completed(std::size_t max_retained_capacity) {
+    // reset_completed() ends search scratch ownership, not the enclosing
+    // Stage2 context. Preserve successful wire posts and locally consumed
+    // exact scores until worker finalization submits this context's A/B
+    // feedback; reset() at context release starts the next sample at zero.
+    const u32 completed_independent_score_rpcs_posted =
+      independent_score_rpcs_posted;
+    const u64 completed_independent_score_useful =
+      independent_score_useful;
     continuation.trim_oversized_capacity(max_retained_capacity);
     reset();
+    independent_score_rpcs_posted =
+      completed_independent_score_rpcs_posted;
+    independent_score_useful = completed_independent_score_useful;
 
     const auto trim = [max_retained_capacity](auto& values) {
       if (values.capacity() > max_retained_capacity) {

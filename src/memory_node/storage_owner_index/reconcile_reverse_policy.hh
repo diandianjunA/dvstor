@@ -334,10 +334,10 @@ service::storage_owner::ReconcileReverseResult reconcile_reverse_neighbors(
 
 // Reconciles the ordinary Vamana plane and the bounded protected-backlink
 // plane. Stage1 first reserves a small protected certificate to make a new
-// node reachable. Stage2 promotes exactly one final backlink into `stable`,
-// publishes the remaining ordinary proposals, and then removes every
-// temporary protected edge. This makes the certificate bounded in both space
-// and lifetime while leaving only the ordinary R-bounded graph after Stage2.
+// node reachable. Stage2 publishes the ordinary proposals, promotes exactly
+// one final backlink into `stable`, and then removes every temporary protected
+// edge. This makes the certificate bounded in both space and lifetime while
+// leaving only the ordinary R-bounded graph after Stage2.
 template <class RobustPrune>
 service::storage_owner::ReconcileReverseResult reconcile_reverse_adjacency(
     const service::storage_owner::ReconcileReverseOp& op,
@@ -610,6 +610,53 @@ inline size_t reconcile_reverse_add_run_end(
     ++end;
   }
   return end;
+}
+
+// Produces the receiver-side execution order for one locked target. An
+// install transaction can arrive in any wire order (and future senders may be
+// buggy), but ordinary stable-plane work must never run after a mandatory
+// promotion: doing so could evict an ACKed reachability certificate before the
+// provisional-removal barrier. If a promotion is present, accept only the
+// install vocabulary and deterministically partition every ordinary
+// add/replace before every promotion while retaining order inside each class.
+// Transactions without a promotion (cleanup, removal, and Stage1 repair)
+// retain their exact legacy order.
+inline bool reconcile_reverse_target_execution_order(
+    const span<const service::storage_owner::ReconcileReverseOp> ops,
+    const span<const size_t> op_indices,
+    vec<size_t>& execution_order) {
+  using service::storage_owner::ReconcileReverseOpKind;
+  execution_order.clear();
+  execution_order.reserve(op_indices.size());
+  bool has_promotion = false;
+  for (const size_t op_index : op_indices) {
+    if (op_index >= ops.size()) return false;
+    has_promotion = has_promotion ||
+      static_cast<ReconcileReverseOpKind>(ops[op_index].kind) ==
+        ReconcileReverseOpKind::promote_stable_bridge;
+  }
+  if (!has_promotion) {
+    execution_order.insert(
+      execution_order.end(), op_indices.begin(), op_indices.end());
+    return true;
+  }
+
+  for (const size_t op_index : op_indices) {
+    const auto kind = static_cast<ReconcileReverseOpKind>(ops[op_index].kind);
+    if (kind == ReconcileReverseOpKind::add ||
+        kind == ReconcileReverseOpKind::replace_or_add) {
+      execution_order.push_back(op_index);
+    } else if (kind != ReconcileReverseOpKind::promote_stable_bridge) {
+      return false;
+    }
+  }
+  for (const size_t op_index : op_indices) {
+    if (static_cast<ReconcileReverseOpKind>(ops[op_index].kind) ==
+        ReconcileReverseOpKind::promote_stable_bridge) {
+      execution_order.push_back(op_index);
+    }
+  }
+  return execution_order.size() == op_indices.size();
 }
 
 // Applies one compatible run of ordinary reverse-edge proposals to the same

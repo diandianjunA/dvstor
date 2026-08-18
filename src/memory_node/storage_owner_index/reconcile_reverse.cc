@@ -63,6 +63,39 @@ bool MemoryNode::reconcile_local_reverse_ops(
   for (const u64 target_raw : target_order) {
     const RemotePtr target{target_raw};
     const vec<size_t>& op_indices = grouped.find(target_raw)->second;
+    bool has_promotion = false;
+    bool has_non_install_op = false;
+    bool promotion_seen = false;
+    bool needs_reorder = false;
+    for (const size_t op_index : op_indices) {
+      const auto kind = static_cast<ReconcileReverseOpKind>(
+        ops[op_index].kind);
+      if (kind == ReconcileReverseOpKind::promote_stable_bridge) {
+        has_promotion = true;
+        promotion_seen = true;
+      } else if (kind == ReconcileReverseOpKind::add ||
+                 kind == ReconcileReverseOpKind::replace_or_add) {
+        needs_reorder = needs_reorder || promotion_seen;
+      } else {
+        has_non_install_op = true;
+      }
+    }
+    if (has_promotion && has_non_install_op) {
+      // A promotion mixed with removal/repair is not an install transaction.
+      // Reject it before locking or mutating so a malformed sender can never
+      // bypass the ordinary-before-mandatory receiver invariant.
+      structurally_valid = false;
+      continue;
+    }
+    vec<size_t> reordered_indices;
+    span<const size_t> execution_indices{op_indices};
+    if (needs_reorder) {
+      const bool ordered = reconcile_reverse_target_execution_order(
+        ops, span<const size_t>{op_indices}, reordered_indices);
+      lib_assert(ordered,
+                 "validated install transaction could not be reordered");
+      execution_indices = span<const size_t>{reordered_indices};
+    }
     const auto pointer_sane = [&](const RemotePtr candidate) {
       if (candidate.is_null() ||
           candidate.memory_node() >= num_storage_nodes_ ||
@@ -186,8 +219,8 @@ bool MemoryNode::reconcile_local_reverse_ops(
 
     bool publish_allowed = false;
     size_t group_position = 0;
-    while (group_position < op_indices.size()) {
-      const size_t op_index = op_indices[group_position];
+    while (group_position < execution_indices.size()) {
+      const size_t op_index = execution_indices[group_position];
       const auto& op = ops[op_index];
       const auto kind = static_cast<ReconcileReverseOpKind>(op.kind);
 
@@ -202,12 +235,12 @@ bool MemoryNode::reconcile_local_reverse_ops(
         (!mandatory_reachability || target_route_accounted);
 
       if (kind == ReconcileReverseOpKind::add) {
-        // Preserve the original per-target order. Stronger reconciliation
-        // operations delimit compatible ordinary-add runs; this is what
-        // keeps promotion/remove ordering unchanged while collapsing the
-        // common hot-target fan-in case to one RobustPrune invocation.
+        // Preserve the receiver-selected per-target order. Stronger
+        // reconciliation operations delimit compatible ordinary-add runs;
+        // this keeps mandatory/removal operation boundaries intact while
+        // collapsing the common hot-target fan-in case to one RobustPrune.
         const size_t run_end = reconcile_reverse_add_run_end(
-          ops, span<const size_t>{op_indices}, group_position);
+          ops, execution_indices, group_position);
         lib_assert(run_end > group_position,
                    "ordinary reverse add produced an empty compatible run");
         if (run_end == group_position + 1) {
@@ -222,7 +255,7 @@ bool MemoryNode::reconcile_local_reverse_ops(
           new_identity_stable.reserve(run_end - group_position);
           for (size_t run_position = group_position;
                run_position < run_end; ++run_position) {
-            const auto& add_op = ops[op_indices[run_position]];
+            const auto& add_op = ops[execution_indices[run_position]];
             add_ops.push_back(add_op);
             const RemotePtr candidate{add_op.new_candidate_raw};
             NodeSnapshot snapshot;
@@ -245,7 +278,8 @@ bool MemoryNode::reconcile_local_reverse_ops(
             adjacency.provisional, add_results, robust_prune);
           for (size_t run_position = group_position;
                run_position < run_end; ++run_position) {
-            ReconcileReverseResult& result = results[op_indices[run_position]];
+            ReconcileReverseResult& result =
+              results[execution_indices[run_position]];
             result = add_results[run_position - group_position];
             publish_allowed = publish_allowed || result.stale == 0;
           }
@@ -315,7 +349,7 @@ bool MemoryNode::reconcile_local_reverse_ops(
     // displaced by a later operation in this target transaction. The sender
     // still owns its Stage1 bridge on this failure and can safely replan.
     if (!reconcile_reverse_final_reachability_holds(
-          ops, span<const size_t>{op_indices},
+          ops, execution_indices,
           span<const ReconcileReverseResult>{results},
           span<const RemotePtr>{adjacency.stable},
           span<const RemotePtr>{adjacency.provisional})) {

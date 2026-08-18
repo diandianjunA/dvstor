@@ -38,6 +38,7 @@
 #include "memory_node/storage_reclaim.hh"
 #include "memory_node/storage_owner_index/dynamic_allocation_receipt_policy.hh"
 #include "memory_node/storage_owner_index/incarnation_lock.hh"
+#include "memory_node/storage_owner_maintenance/independent_score_policy.hh"
 #include "memory_node/storage_owner_maintenance/reverse_outbox.hh"
 #include "memory_node/storage_owner_maintenance/stage2_batch_policy.hh"
 #include "memory_node/storage_owner_state.hh"
@@ -1267,6 +1268,12 @@ private:
   std::atomic<u64> storage_owner_maintenance_lost_wake_avoided_{0};
   memory_node_storage_owner_maintenance_detail::
     Stage2AdaptivePackingController storage_owner_stage2_packing_;
+  memory_node_storage_owner_maintenance_detail::
+    IndependentScoreController storage_owner_independent_score_;
+  // Set before maintenance workers start. A hard runtime cap below four is a
+  // verified legacy policy, whereas target two in an adaptive controller can
+  // merely be the baseline preceding a target-four trial.
+  bool storage_owner_stage2_larger_batch_trials_possible_{};
   std::deque<StorageOwnerMaintenanceTask> storage_owner_stage2_tasks_;
   // Min-heap ordered by maintenance_sequence then retry_not_before. The
   // predecessor durability rule makes its front the only cleanup that can be
