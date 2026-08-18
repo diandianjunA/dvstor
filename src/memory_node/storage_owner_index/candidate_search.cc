@@ -920,6 +920,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
     state.pending_vectors.clear();
     state.score_home_rpc_count = 0;
     state.ordered_snapshot_pairs = false;
+    state.score_many_dispatch = false;
     state.phase = Stage2SearchIoPhase::idle;
   };
   const auto clear_graph_dispatch = [&] {
@@ -1088,8 +1089,36 @@ MemoryNode::advance_stage2_search_candidates_batched(
     }
     thread_local vec<u32> remote_wrs_by_peer;
     thread_local vec<u32> remote_pairs_by_peer;
+    thread_local vec<u32> score_many_items_by_peer;
+    thread_local vec<size_t> score_many_pending_by_peer;
+    thread_local vec<u8> score_many_peer_eligible;
     remote_wrs_by_peer.resize(num_storage_nodes_);
     remote_pairs_by_peer.resize(num_storage_nodes_);
+    score_many_items_by_peer.resize(num_storage_nodes_);
+    score_many_pending_by_peer.assign(num_storage_nodes_, 0);
+    score_many_peer_eligible.assign(num_storage_nodes_, 0);
+    const u32 score_many_item_limit =
+      std::max<u32>(1, config.storage_owner_search_snapshot_batch);
+    state.score_many_dispatch = false;
+    if (config.storage_owner_stage2_score_many) {
+      for (size_t search_index = 0; search_index < tasks.size();
+           ++search_index) {
+        if (state.search_seeded[search_index] == 0) continue;
+        for (const PartitionContinuationScoreRequest& request :
+             state.continuation.pending_score_requests(search_index)) {
+          if (storage_node_pointer_addressable(request.pointer) &&
+              !local_shard(request.pointer.memory_node())) {
+            ++score_many_pending_by_peer[request.pointer.memory_node()];
+          }
+        }
+      }
+      for (u32 peer = 0; peer < num_storage_nodes_; ++peer) {
+        score_many_peer_eligible[peer] =
+          stage2_score_many_peer_eligible(
+            score_many_pending_by_peer[peer], score_many_item_limit);
+        state.score_many_dispatch |= score_many_peer_eligible[peer] != 0;
+      }
+    }
     memory_node_detail::PeerRdmaVectorSnapshotDispatchQuota quota;
     // This collector prepares a new dispatch, so choose its accounting from
     // the transport capability, not from state.ordered_snapshot_pairs (which
@@ -1103,14 +1132,19 @@ MemoryNode::advance_stage2_search_candidates_batched(
         remote_wrs_by_peer.data(), remote_wrs_by_peer.size()},
       std::span<u32>{
         remote_pairs_by_peer.data(), remote_pairs_by_peer.size()});
+    Stage2ScoreManyDispatchQuota score_many_quota;
+    score_many_quota.reset(
+      std::span<u32>{score_many_items_by_peer.data(),
+                     score_many_items_by_peer.size()},
+      score_many_item_limit);
     const size_t search_count = tasks.size();
     size_t last_search = state.round_robin_search % search_count;
     size_t physical_reads = 0;
     bool selected_any = false;
-    // Visit every logical request at most once. The continuation bounds this
-    // set naturally; only distinct remote records are bounded by lane scratch
-    // and transport credit. This lets local work and duplicate consumers pass
-    // a full remote wave instead of waiting behind its CQ.
+    // Visit every logical request at most once. In the one-sided path only
+    // distinct remote records consume lane scratch/read credit; score-many
+    // instead counts logical wire items per destination RPC. In either mode a
+    // full peer cannot hide local work or a different peer in this pass.
     for (;;) {
       bool examined_this_round = false;
       for (size_t offset = 0; offset < search_count; ++offset) {
@@ -1128,15 +1162,20 @@ MemoryNode::advance_stage2_search_candidates_batched(
         const bool remote = storage_node_pointer_addressable(
           request.pointer) && !local_shard(request.pointer.memory_node());
         const bool duplicate_remote = remote &&
+          !state.score_many_dispatch &&
           state.score_selected_remote.contains(request.pointer);
         const bool distinct_remote = remote && !duplicate_remote;
         const bool requires_after_header = distinct_remote &&
           !VamanaNode::immutable_base_record(request.pointer);
-        const bool accepted =
-          stage2_consumer_fits_physical_scratch(
-            distinct_remote, physical_reads, score_dispatch_limit) &&
-          quota.try_accept(request.pointer.memory_node(), distinct_remote,
-                           requires_after_header);
+        const bool accepted = state.score_many_dispatch
+          ? (!remote ||
+             (score_many_peer_eligible[request.pointer.memory_node()] != 0 &&
+              score_many_quota.try_accept(
+                request.pointer.memory_node(), true)))
+          : stage2_consumer_fits_physical_scratch(
+              distinct_remote, physical_reads, score_dispatch_limit) &&
+            quota.try_accept(request.pointer.memory_node(), distinct_remote,
+                             requires_after_header);
         if (!accepted) {
           // The cursor has advanced, but the continuation request remains
           // unresolved.  This prevents a hot peer at its quota from hiding a
@@ -1146,7 +1185,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
         }
         state.score_consumers.push_back({
           request.search_index, request.generation, request.pointer});
-        if (distinct_remote) {
+        if (!state.score_many_dispatch && distinct_remote) {
           state.score_selected_remote.insert(request.pointer);
           ++physical_reads;
         }
@@ -1284,7 +1323,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
         continue;
       }
 
-      if (!config.storage_owner_stage2_score_many &&
+      if (!state.score_many_dispatch &&
           VamanaNode::immutable_base_record(pointer)) {
         const size_t scratch_offset =
           static_cast<size_t>(remote_slot++) * snapshot_stride;
@@ -1335,13 +1374,13 @@ MemoryNode::advance_stage2_search_candidates_batched(
         state.score_consumers[consumer_index];
       if (storage_node_pointer_addressable(consumer.pointer) &&
           !local_shard(consumer.pointer.memory_node()) &&
-          (config.storage_owner_stage2_score_many ||
+          (state.score_many_dispatch ||
            !VamanaNode::immutable_base_record(consumer.pointer))) {
         consumers_by_shard[consumer.pointer.memory_node()].push_back(
           consumer_index);
       }
     }
-    const size_t rpc_item_limit = config.storage_owner_stage2_score_many
+    const size_t rpc_item_limit = state.score_many_dispatch
       ? std::max<size_t>(1, config.storage_owner_search_snapshot_batch)
       : std::max<size_t>(1, config.storage_owner_batch_max);
     thread_local vec<size_t> score_many_query_searches;
@@ -1360,7 +1399,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
         rpc.target_shard = shard;
         rpc.item_count = item_count;
         rpc.request_id = allocate_peer_request_id();
-        if (config.storage_owner_stage2_score_many) {
+        if (state.score_many_dispatch) {
           score_many_query_searches.clear();
           score_many_query_indexes.assign(
             tasks.size(), std::numeric_limits<u32>::max());
@@ -1451,12 +1490,12 @@ MemoryNode::advance_stage2_search_candidates_batched(
            rpc_index < state.score_home_rpc_count; ++rpc_index) {
         const Stage2HomeExpandRpc& rpc = state.score_home_rpcs[rpc_index];
         rpc_items += rpc.item_count;
-        rpc_queries += config.storage_owner_stage2_score_many
+        rpc_queries += state.score_many_dispatch
           ? service::storage_owner::stage2_score_many_header(
               rpc.request.data())->query_count
           : rpc.item_count;
         rpc_request_bytes += rpc.request.size();
-        rpc_response_bytes += config.storage_owner_stage2_score_many
+        rpc_response_bytes += state.score_many_dispatch
           ? service::storage_owner::stage2_score_many_response_bytes(
               rpc.item_count)
           : service::storage_owner::stage2_expand_score_response_bytes(
@@ -1859,10 +1898,10 @@ MemoryNode::advance_stage2_search_candidates_batched(
         all_complete = false;
         if (!rpc.posted) {
           const size_t request_bytes = rpc.request.size();
-          const auto request_type = config.storage_owner_stage2_score_many
+          const auto request_type = state.score_many_dispatch
             ? service::storage_owner::PeerRpcType::stage2_score_many_request
             : service::storage_owner::PeerRpcType::stage2_expand_score_request;
-          const auto response_type = config.storage_owner_stage2_score_many
+          const auto response_type = state.score_many_dispatch
             ? service::storage_owner::PeerRpcType::stage2_score_many_response
             : service::storage_owner::PeerRpcType::stage2_expand_score_response;
           rpc.posted = try_post_peer_rpc_request_attempt(
@@ -1885,7 +1924,7 @@ MemoryNode::advance_stage2_search_candidates_batched(
         home_response_payload.clear();
         const TryPeerResponse response = try_consume_peer_rpc_response(
           rpc.request_id, rpc.target_shard,
-          config.storage_owner_stage2_score_many
+          state.score_many_dispatch
             ? service::storage_owner::PeerRpcType::stage2_score_many_response
             : service::storage_owner::PeerRpcType::stage2_expand_score_response,
           rpc.item_count, response_header, home_response_payload,
@@ -1899,13 +1938,13 @@ MemoryNode::advance_stage2_search_candidates_batched(
           }
           continue;
         }
-        const size_t expected_bytes = config.storage_owner_stage2_score_many
+        const size_t expected_bytes = state.score_many_dispatch
           ? service::storage_owner::stage2_score_many_response_bytes(
               rpc.item_count)
           : service::storage_owner::stage2_expand_score_response_bytes(
               rpc.item_count, 0);
         const auto expected_response_type =
-          config.storage_owner_stage2_score_many
+          state.score_many_dispatch
             ? service::storage_owner::PeerRpcType::stage2_score_many_response
             : service::storage_owner::PeerRpcType::stage2_expand_score_response;
         bool valid = response == TryPeerResponse::success &&
@@ -1921,16 +1960,16 @@ MemoryNode::advance_stage2_search_candidates_batched(
             service::storage_owner::InsertStatus::ok) &&
           response_header.reserved == 0;
         const auto* legacy_results = valid &&
-            !config.storage_owner_stage2_score_many
+            !state.score_many_dispatch
           ? service::storage_owner::stage2_expand_score_results(
               home_response_payload.data())
           : nullptr;
         const auto* score_many_results = valid &&
-            config.storage_owner_stage2_score_many
+            state.score_many_dispatch
           ? service::storage_owner::stage2_score_many_results(
               home_response_payload.data())
           : nullptr;
-        if (config.storage_owner_stage2_score_many) {
+        if (state.score_many_dispatch) {
           const auto* request_items =
             service::storage_owner::stage2_score_many_items(
               rpc.request.data());
@@ -1975,23 +2014,23 @@ MemoryNode::advance_stage2_search_candidates_batched(
                    "validated Stage2 score response lost its lease");
         for (u32 item = 0; item < rpc.item_count; ++item) {
           const u32 result_search_index =
-            config.storage_owner_stage2_score_many
+            state.score_many_dispatch
               ? score_many_results[item].search_index
               : legacy_results[item].search_index;
           const u64 result_generation =
-            config.storage_owner_stage2_score_many
+            state.score_many_dispatch
               ? score_many_results[item].generation
               : legacy_results[item].generation;
           const u64 result_pointer_raw =
-            config.storage_owner_stage2_score_many
+            state.score_many_dispatch
               ? score_many_results[item].pointer_raw
               : legacy_results[item].pointer_raw;
           const u32 result_disposition =
-            config.storage_owner_stage2_score_many
+            state.score_many_dispatch
               ? score_many_results[item].disposition
               : legacy_results[item].disposition;
           const distance_t result_distance =
-            config.storage_owner_stage2_score_many
+            state.score_many_dispatch
               ? score_many_results[item].distance
               : legacy_results[item].distance;
           const auto disposition = static_cast<

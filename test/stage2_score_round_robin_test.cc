@@ -10,6 +10,12 @@
 
 using memory_node_storage_owner_maintenance_detail::
   Stage2ScoreRoundRobinCursor;
+using memory_node_storage_owner_maintenance_detail::
+  Stage2ScoreManyDispatchQuota;
+using memory_node_storage_owner_maintenance_detail::
+  stage2_score_many_min_items;
+using memory_node_storage_owner_maintenance_detail::
+  stage2_score_many_peer_eligible;
 using memory_node_storage_owner_maintenance_detail::Stage2SearchIoPhase;
 using memory_node_storage_owner_maintenance_detail::Stage2SearchIoState;
 using memory_node_storage_owner_maintenance_detail::
@@ -131,6 +137,39 @@ void test_scratch_capacity_counts_physical_reads_not_consumers() {
   assert(stage2_consumer_fits_physical_scratch(false, 0, 0));
 }
 
+void test_score_many_uses_wire_capacity_instead_of_read_credits() {
+  std::array<u32, 3> used{};
+  Stage2ScoreManyDispatchQuota quota;
+  quota.reset(used, 256);
+
+  for (u32 item = 0; item < 256; ++item) {
+    assert(quota.try_accept(0, true));
+  }
+  assert(!quota.try_accept(0, true));
+
+  // A full hot peer cannot hide an independent peer, and local/terminal work
+  // creates no wire item at all.
+  assert(quota.try_accept(1, true));
+  assert(quota.try_accept(99, false));
+  assert(used[0] == 256 && used[1] == 1 && used[2] == 0);
+
+  quota.reset(used, 0);
+  assert(!quota.try_accept(0, true));
+  assert(quota.try_accept(0, false));
+}
+
+void test_score_many_rejects_latency_dominated_sparse_waves() {
+  assert(stage2_score_many_min_items(256) == 128);
+  assert(stage2_score_many_min_items(255) == 128);
+  assert(stage2_score_many_min_items(1) == 1);
+  assert(stage2_score_many_min_items(0) == 0);
+
+  assert(!stage2_score_many_peer_eligible(127, 256));
+  assert(stage2_score_many_peer_eligible(128, 256));
+  assert(stage2_score_many_peer_eligible(1024, 256));
+  assert(!stage2_score_many_peer_eligible(1024, 0));
+}
+
 void test_home_rpc_wait_does_not_pin_registered_rdma_scratch() {
   Stage2SearchIoState state;
   assert(state.scratch_rebindable());
@@ -160,6 +199,8 @@ int main() {
   test_cursor_normalizes_after_generation_size_change();
   test_full_peer_is_skipped_without_hiding_other_peers_or_local_work();
   test_scratch_capacity_counts_physical_reads_not_consumers();
+  test_score_many_uses_wire_capacity_instead_of_read_credits();
+  test_score_many_rejects_latency_dominated_sparse_waves();
   test_home_rpc_wait_does_not_pin_registered_rdma_scratch();
   return 0;
 }

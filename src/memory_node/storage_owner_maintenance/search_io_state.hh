@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -123,10 +124,54 @@ constexpr bool stage2_consumer_fits_physical_scratch(
   return !distinct_remote || physical_reads < physical_read_capacity;
 }
 
+// score-many carries logical score operations in a bounded two-sided message;
+// it neither consumes one registered snapshot slot per pointer nor posts one
+// RDMA READ WR per pointer.  Reusing the one-sided quota here fragmented a
+// 256-item wire message into roughly 30 items/RPC in production. Admit at most
+// one full RPC per remote peer in a dispatch, while local/terminal work remains
+// unbounded because it creates no outbound message.
+struct Stage2ScoreManyDispatchQuota {
+  std::span<u32> items_by_peer{};
+  u32 items_per_peer{};
+
+  void reset(std::span<u32> new_items_by_peer,
+             u32 new_items_per_peer) {
+    items_by_peer = new_items_by_peer;
+    items_per_peer = new_items_per_peer;
+    std::fill(items_by_peer.begin(), items_by_peer.end(), 0);
+  }
+
+  [[nodiscard]] bool try_accept(u32 peer, bool remote) {
+    if (!remote) return true;
+    if (items_per_peer == 0 || peer >= items_by_peer.size() ||
+        items_by_peer[peer] >= items_per_peer) {
+      return false;
+    }
+    ++items_by_peer[peer];
+    return true;
+  }
+};
+
+// A half-full message is the conservative break-even gate for enabling the
+// two-sided path. Small dependency-generated waves are latency dominated in
+// the SIFT100M result even though their byte count is lower; they remain on
+// the one-sided path. Large frontier waves can use score-many without letting
+// one sparse destination force small RPCs to every peer.
+constexpr u32 stage2_score_many_min_items(u32 message_capacity) {
+  return message_capacity == 0 ? 0 : (message_capacity + 1) / 2;
+}
+
+constexpr bool stage2_score_many_peer_eligible(
+    std::size_t pending_items, u32 message_capacity) {
+  const u32 minimum = stage2_score_many_min_items(message_capacity);
+  return minimum != 0 && pending_items >= minimum;
+}
+
 struct Stage2SearchIoState {
   bool initialized{};
   Stage2SearchIoPhase phase{Stage2SearchIoPhase::idle};
   bool ordered_snapshot_pairs{};
+  bool score_many_dispatch{};
   bool prefer_graph{};
   std::size_t round_robin_search{};
 
@@ -171,6 +216,7 @@ struct Stage2SearchIoState {
     initialized = false;
     phase = Stage2SearchIoPhase::idle;
     ordered_snapshot_pairs = false;
+    score_many_dispatch = false;
     prefer_graph = false;
     round_robin_search = 0;
     for (auto& beam : local_beams) beam.clear();
