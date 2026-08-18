@@ -91,14 +91,13 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                global_search_lane_lease_limit <=
                  std::numeric_limits<u32>::max(),
              "global Stage2 lane lease is outside its transport range");
-  const size_t logical_context_batch_limit = std::min<size_t>(
-    2, std::max<u32>(1, config.storage_owner_batch_max));
   // Every reserved sequence is either already queued/runnable or completed by
   // its synchronous retirement path. Stage1 preparation owns no sequence, so
-  // the full descriptor bound is safe. Tie the exact incomplete-task window to
-  // the workers and active search lanes the runtime actually supplied. This
-  // prevents both an oversized acknowledged burst on a constrained node and
-  // an old worker-only cap from starving newly available continuation lanes.
+  // the full descriptor bound is safe. Keep exact incomplete-task admission
+  // tied to the CPU plan's bounded service baseline instead of inflating it
+  // with search scratch leases: reconcile responses retain receive slots until
+  // their owning context runs, so excess context debt can itself stall peer
+  // progress.
   const size_t completion_capacity = std::max<size_t>(
     std::max<size_t>(1, config.storage_owner_batch_max),
     config.storage_owner_maintenance_queue_depth);
@@ -107,9 +106,8 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
       completion_capacity, initial_next, initial_durable);
   const size_t requested_admission_limit =
     stage2_sequence_admission_limit(
-      worker_count, contexts_per_worker,
-      global_search_lane_lease_limit,
-      logical_context_batch_limit,
+      cpu_plan.maintenance_admission_workers,
+      config.storage_owner_rpc_depth,
       config.storage_owner_batch_max);
   storage_owner_maintenance_admission_limit_ = static_cast<size_t>(
     std::min(completion_capacity, requested_admission_limit));
@@ -464,9 +462,7 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                ", pressure_context_limit=" +
                std::to_string(stage2_context_admission_limit(
                  worker_count, contexts_per_worker,
-                 global_search_lane_lease_limit, true)) +
-               ", logical_context_batch_limit=" +
-               std::to_string(logical_context_batch_limit) +
+                 true)) +
                ", work_conserving=true)");
   print_status("storage-owner stage2 reverse outbox descriptors: " +
                std::to_string(storage_owner_reverse_outbox_->capacity()) +

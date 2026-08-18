@@ -67,18 +67,17 @@ constexpr std::size_t saturating_stage2_lane_product(
 // process-wide credit counters.  The lease therefore exists to bound
 // registered scratch ownership and runnable continuation state, not to model
 // a reservation of each lane's worst-case wave.  Give the lease calculation a
-// floor of eight active continuations per executor when that scratch has
-// already been allocated, and cap the active lease at 64 per node. The
-// production pipeline keeps two contexts per active lane, covering the
-// graph-home, vector-score, and RDMA completion boundaries without making
-// scratch ownership or acknowledged debt grow with a large credit window.
+// floor of four active continuations per executor when that scratch has
+// already been allocated, and cap the active lease at 32 per node.  This
+// preserves enough latency-hiding headroom without allowing synchronous
+// Stage2/reverse waits to occupy every maintenance executor at once.
 constexpr std::size_t stage2_global_search_lane_lease_limit(
     const std::size_t worker_count,
     const std::size_t physical_lanes_per_worker,
     const std::size_t credit_derived_lanes) {
   if (worker_count == 0 || physical_lanes_per_worker == 0) return 0;
-  constexpr std::size_t kPipelineLanesPerWorker = 8;
-  constexpr std::size_t kPipelineLeaseCap = 64;
+  constexpr std::size_t kPipelineLanesPerWorker = 4;
+  constexpr std::size_t kPipelineLeaseCap = 32;
   const std::size_t total_physical_lanes =
     saturating_stage2_lane_product(
       worker_count, physical_lanes_per_worker);
@@ -243,12 +242,12 @@ static_assert(stage2_search_lane_count(16, 8, 96) == 12);
 static_assert(stage2_search_lane_count(16, 0, 0) == 1);
 static_assert(stage2_search_lane_peak_rdma_wrs(32, 96, 48) == 64);
 static_assert(stage2_search_lane_peak_rdma_wrs(32, 24, 0) == 24);
-static_assert(stage2_global_search_lane_lease_limit(8, 16, 16) == 64);
+static_assert(stage2_global_search_lane_lease_limit(8, 16, 16) == 32);
 static_assert(stage2_global_search_lane_lease_limit(8, 2, 16) == 16);
-static_assert(stage2_global_search_lane_lease_limit(4, 16, 8) == 32);
+static_assert(stage2_global_search_lane_lease_limit(4, 16, 8) == 16);
 static_assert(stage2_global_search_lane_lease_limit(1, 2, 1) == 2);
-static_assert(stage2_global_search_lane_lease_limit(64, 1, 1) == 64);
-static_assert(stage2_global_search_lane_lease_limit(8, 16, 128) == 64);
+static_assert(stage2_global_search_lane_lease_limit(64, 1, 1) == 32);
+static_assert(stage2_global_search_lane_lease_limit(8, 16, 128) == 32);
 static_assert(stage2_global_search_lane_count(4, 16, 1, 96) == 64);
 static_assert(stage2_global_search_lane_count(4, 16, 2, 96) == 64);
 static_assert(stage2_global_search_lane_count(4, 16, 56, 224) == 8);

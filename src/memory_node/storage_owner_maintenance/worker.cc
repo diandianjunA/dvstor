@@ -3335,14 +3335,9 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     }
     const bool foreground_pressure =
       admission == Stage2AdmissionDecision::foreground_pressure;
-    const size_t active_search_lanes = std::max<size_t>(
-      1, storage_owner_search_lane_lease_limit_.load(
-           std::memory_order_acquire));
     const size_t local_context_limit =
       stage2_worker_context_admission_limit(
-        worker_id, storage_owner_maintenance_worker_states_.size(),
-        config.storage_owner_rpc_depth, active_search_lanes,
-        foreground_pressure);
+        config.storage_owner_rpc_depth, foreground_pressure);
     if (states.size() >= local_context_limit) {
       // Do not let this worker monopolize the process-wide context allowance.
       // Its contexts can use only this worker's registered search lanes;
@@ -3719,7 +3714,18 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
         scan_now + kFallbackContextAuditInterval;
     }
 
-    while (Stage2Context* context = try_admit_context()) {
+    // Admission is intentionally a bounded scheduler action.  With a hot
+    // shard, an unbounded admit-and-immediately-finish stream can keep every
+    // executor inside this loop indefinitely, starving ready completions,
+    // reverse ACKs, timeout progress, and even the observation heartbeat.
+    // Eight workers still admit up to eight contexts per scheduler pass; each
+    // pass must first service already-owned dependency chains.
+    constexpr size_t kAdmissionBurstPerSchedulerPass = 1;
+    size_t admission_burst = 0;
+    while (admission_burst < kAdmissionBurstPerSchedulerPass) {
+      Stage2Context* context = try_admit_context();
+      if (context == nullptr) break;
+      ++admission_burst;
       progressed = true;
       (void)drive_owned_context(*context);
     }

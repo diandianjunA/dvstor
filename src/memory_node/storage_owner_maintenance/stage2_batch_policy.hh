@@ -119,18 +119,17 @@ inline Stage2PackingDecision decide_stage2_packing(
   if (!high_pressure) {
     decision.target_batch = std::min<std::size_t>(2, batch_limit);
   }
-  // Logical contexts are the latency-hiding unit.  Keep the verified target-2
-  // production path hard-capped at two even after a deadline/full-queue flush;
-  // the shared home/reverse outboxes aggregate these small contexts into wire
-  // batches independently.  Experimental targets above two retain their own
-  // wider context size.
-  decision.pop_limit = decision.target_batch;
+  // Under real pressure, target <=2 is the measured legacy/baseline path:
+  // collect until its bounded deadline, then drain up to the wire limit. The
+  // low-pressure branch below bypasses that timer, and the rollback path still
+  // must not cap an already-available batch at two.
+  decision.pop_limit = decision.target_batch <= 2
+    ? batch_limit : decision.target_batch;
   if (queued_tasks == 0) return decision;
 
   if (queued_tasks >= batch_limit) {
     decision.ready = true;
-    decision.pop_limit = decision.target_batch <= 2
-      ? decision.target_batch : batch_limit;
+    decision.pop_limit = batch_limit;
     decision.reason = Stage2PackingFlushReason::full;
     return decision;
   }
@@ -144,7 +143,8 @@ inline Stage2PackingDecision decide_stage2_packing(
     decision.reason = Stage2PackingFlushReason::low_pressure;
     return decision;
   }
-  if (queued_tasks >= decision.target_batch) {
+  if (decision.target_batch > 2 &&
+      queued_tasks >= decision.target_batch) {
     decision.ready = true;
     decision.reason = Stage2PackingFlushReason::target;
     return decision;

@@ -423,17 +423,11 @@ bool MemoryNode::try_acquire_storage_owner_maintenance_slot(
   // This counter is the global number of live stage2 contexts, not the number
   // of physical workers. Each maintenance executor owns a fixed rpc-depth
   // context pool; peer send credits are independently bounded and try-only.
-  // Under foreground pressure, retain one runnable and one dependency-waiting
-  // context per active lane. A zero-context policy deadlocks when Stage1
-  // producers themselves wait for the ordered maintenance window to advance,
-  // while a one-context-per-lane policy cannot hide RPC/RDMA waits.
-  const size_t active_search_lanes = std::max<size_t>(
-    1, storage_owner_search_lane_lease_limit_.load(
-         std::memory_order_acquire));
+  // Under foreground pressure, retain bounded latency-hiding headroom without
+  // allowing synchronous peer waits to consume the whole executor pool.
   const size_t admitted_contexts = stage2_context_admission_limit(
     storage_owner_maintenance_worker_states_.size(),
-    config.storage_owner_rpc_depth, active_search_lanes,
-    foreground_pressure);
+    config.storage_owner_rpc_depth, foreground_pressure);
   const u32 max_contexts = static_cast<u32>(std::min<u64>(
     admitted_contexts, std::numeric_limits<u32>::max()));
   u32 active = storage_owner_maintenance_active_workers_.load(std::memory_order_acquire);

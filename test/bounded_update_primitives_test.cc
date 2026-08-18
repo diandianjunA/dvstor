@@ -834,27 +834,23 @@ void test_stage2_pressure_retains_a_dedicated_progress_floor() {
     stage2_worker_context_admission_limit;
 
   // The normal path can hide peer latency with the configured RPC depth.
-  assert(stage2_context_admission_limit(2, 16, 1, false) == 32);
-  // Pressure retains two bounded contexts per actual active lane, capped by
-  // the physical worker/context pool.
-  assert(stage2_context_admission_limit(2, 16, 4, true) == 8);
-  assert(stage2_context_admission_limit(8, 16, 64, true) == 128);
-  assert(stage2_context_admission_limit(8, 16, 32, true) == 64);
-  assert(stage2_context_admission_limit(3, 1, 64, true) == 3);
-  assert(stage2_context_admission_limit(0, 0, 0, true) == 1);
-  assert(stage2_context_admission_limit(0, 0, 0, false) == 1);
+  assert(stage2_context_admission_limit(2, 16, false) == 32);
+  // Pressure retains four bounded contexts per worker: two may use the
+  // physical lanes while two wait on context-owned home RPC state.
+  assert(stage2_context_admission_limit(2, 16, true) == 8);
+  assert(stage2_context_admission_limit(1, 16, true) == 4);
+  assert(stage2_context_admission_limit(3, 1, true) == 3);
+  assert(stage2_context_admission_limit(0, 0, true) == 1);
+  assert(stage2_context_admission_limit(0, 0, false) == 1);
 
   // The global cap alone is not a fair-share policy: a fast worker could
   // otherwise claim all bounded contexts while owning only its own RDMA
   // lanes. Each executor applies the matching local share before the global
   // CAS, so all workers can expose their preallocated lanes.
-  assert(stage2_worker_context_admission_limit(0, 8, 16, 64, true) == 16);
-  assert(stage2_worker_context_admission_limit(7, 8, 16, 32, true) == 8);
-  // Remainder lanes are deterministically assigned to the first workers.
-  assert(stage2_worker_context_admission_limit(0, 3, 16, 4, true) == 4);
-  assert(stage2_worker_context_admission_limit(1, 3, 16, 4, true) == 2);
-  assert(stage2_worker_context_admission_limit(0, 8, 16, 1, false) == 16);
-  assert(stage2_worker_context_admission_limit(0, 0, 0, 0, false) == 1);
+  assert(stage2_worker_context_admission_limit(16, true) == 4);
+  assert(stage2_worker_context_admission_limit(1, true) == 1);
+  assert(stage2_worker_context_admission_limit(16, false) == 16);
+  assert(stage2_worker_context_admission_limit(0, false) == 1);
 }
 
 void test_stage1_waiter_wake_coverage_prevents_credit_stampedes() {
@@ -877,62 +873,51 @@ void test_stage1_waiter_wake_coverage_prevents_credit_stampedes() {
   assert(stage1_waiter_head_wake_coverage(32, 0) == 0);
 }
 
-void test_stage2_sequence_window_tracks_runtime_pipeline_geometry() {
+void test_stage2_sequence_window_tracks_bounded_service_capacity() {
   using memory_node_storage_owner_maintenance_detail::
     saturating_admission_multiply;
   using memory_node_storage_owner_maintenance_detail::
     stage2_sequence_admission_limit;
 
-  // Eight workers expose 64 active lanes, two contexts per lane, and two
-  // logical tasks per context: the exact incomplete-task window is 256.
-  assert(stage2_sequence_admission_limit(8, 16, 64, 2, 32) == 256);
-  assert(stage2_sequence_admission_limit(8, 16, 32, 2, 32) == 128);
-  // Physical context capacity remains authoritative on smaller deployments.
-  assert(stage2_sequence_admission_limit(2, 16, 64, 2, 32) == 64);
-  // One complete wire batch is a correctness floor: Stage1 publishes it as
-  // one atomic reservation even when only one context/lane exists.
-  assert(stage2_sequence_admission_limit(1, 1, 1, 2, 32) == 32);
-  assert(stage2_sequence_admission_limit(0, 0, 0, 0, 0) == 1);
+  // The colocated deployment keeps exactly four wire batches of bounded debt
+  // regardless of the active search-lane experiment.
+  assert(stage2_sequence_admission_limit(2, 16, 32) == 128);
+  assert(stage2_sequence_admission_limit(4, 16, 32) == 128);
+  assert(stage2_sequence_admission_limit(8, 16, 32) == 128);
+  assert(stage2_sequence_admission_limit(2, 16, 64) == 128);
 
-  // Every finite policy point is the larger of bounded pipeline geometry and
-  // one wire batch, and hostile arithmetic saturates instead of wrapping.
-  for (std::size_t workers = 0; workers <= 8; ++workers) {
-    for (std::size_t depth = 0; depth <= 8; ++depth) {
-      for (std::size_t lanes = 0; lanes <= 64; lanes += 8) {
-        for (std::size_t logical_batch = 0; logical_batch <= 4;
-             ++logical_batch) {
-          for (std::size_t wire_batch = 0; wire_batch <= 32;
-               wire_batch += 8) {
-            const std::size_t normalized_workers =
-              std::max<std::size_t>(1, workers);
-            const std::size_t normalized_depth =
-              std::max<std::size_t>(1, depth);
-            const std::size_t normalized_lanes =
-              std::max<std::size_t>(1, lanes);
-            const std::size_t normalized_batch =
-              std::max<std::size_t>(1, logical_batch);
-            const std::size_t expected_contexts = std::min(
-              saturating_admission_multiply(
-                normalized_workers, normalized_depth),
-              saturating_admission_multiply(normalized_lanes, 2));
-            const std::size_t expected = saturating_admission_multiply(
-              expected_contexts, normalized_batch);
-            const std::size_t limit = stage2_sequence_admission_limit(
-              workers, depth, lanes, logical_batch, wire_batch);
-            assert(limit == std::max(
-              std::max<std::size_t>(1, wire_batch), expected));
-          }
-        }
+  // Larger executor populations can expose one task per context, while tiny
+  // deployments retain a nonzero, wire-batch-safe bound.
+  assert(stage2_sequence_admission_limit(16, 16, 32) == 256);
+  assert(stage2_sequence_admission_limit(1, 1, 32) == 32);
+  assert(stage2_sequence_admission_limit(4, 16, 1) == 64);
+  assert(stage2_sequence_admission_limit(0, 0, 0) == 4);
+
+  for (std::size_t workers = 0; workers <= 32; ++workers) {
+    for (std::size_t depth = 0; depth <= 32; ++depth) {
+      for (std::size_t batch = 0; batch <= 128; batch += 8) {
+        const std::size_t normalized_workers =
+          std::max<std::size_t>(1, workers);
+        const std::size_t normalized_depth =
+          std::max<std::size_t>(1, depth);
+        const std::size_t normalized_batch =
+          std::max<std::size_t>(1, batch);
+        const std::size_t legacy_limit = std::max(
+          normalized_batch,
+          saturating_admission_multiply(
+            saturating_admission_multiply(
+              normalized_workers, normalized_depth), 4));
+        const std::size_t limit = stage2_sequence_admission_limit(
+          workers, depth, batch);
+        assert(limit >= normalized_batch);
+        assert(limit <= legacy_limit);
       }
     }
   }
   const std::size_t max_size = std::numeric_limits<std::size_t>::max();
-  assert(stage2_sequence_admission_limit(
-           max_size, max_size, max_size, max_size, max_size) ==
+  assert(stage2_sequence_admission_limit(max_size, max_size, max_size) ==
          max_size);
-  assert(stage2_sequence_admission_limit(
-           max_size, 2, 1, max_size, max_size) ==
-         max_size);
+  assert(stage2_sequence_admission_limit(max_size, 2, 1) == max_size);
 }
 
 void test_stage1_arm_queue_permit_cannot_be_stolen() {
@@ -1199,7 +1184,7 @@ int main() {
   test_stage2_admission_yields_only_for_live_foreground_pressure();
   test_stage2_pressure_retains_a_dedicated_progress_floor();
   test_stage1_waiter_wake_coverage_prevents_credit_stampedes();
-  test_stage2_sequence_window_tracks_runtime_pipeline_geometry();
+  test_stage2_sequence_window_tracks_bounded_service_capacity();
   test_stage1_arm_queue_permit_cannot_be_stolen();
   test_stage1_arm_batch_queue_permit_is_atomic_and_bounded();
   test_reverse_candidate_is_revalidated_at_locked_write_boundary();
