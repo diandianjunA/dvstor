@@ -491,6 +491,16 @@ MemoryNode::prepare_local_stage1_item(
     components.data());
   const vec<RemotePtr> entries = local_centroid_route_entries();
   if (entries.empty()) {
+    static std::atomic<u64> empty_route_failures{0};
+    const u64 failure = empty_route_failures.fetch_add(
+      1, std::memory_order_relaxed) + 1;
+    if (failure <= 16 || (failure & (failure - 1)) == 0) {
+      std::cerr << "[storage-owner] Stage1 prepare rejected: no live local "
+                   "centroid route entry"
+                << " id=" << item.id
+                << " generation=" << item.generation
+                << " count=" << failure << '\n';
+    }
     result.status = static_cast<u32>(MutationStatus::failed);
     seal_failed_reservation();
     record_physical_stage1(0, 0, 0);
@@ -546,6 +556,18 @@ MemoryNode::prepare_local_stage1_item(
     target, span<const RemotePtr>{neighbors});
   physical_backlink_ns = elapsed_ns_since(backlink_started);
   if (backlink_targets.empty()) {
+    static std::atomic<u64> bridge_failures{0};
+    const u64 failure = bridge_failures.fetch_add(
+      1, std::memory_order_relaxed) + 1;
+    if (failure <= 16 || (failure & (failure - 1)) == 0) {
+      std::cerr << "[storage-owner] Stage1 prepare rejected: no provisional "
+                   "reachability bridge"
+                << " id=" << item.id
+                << " generation=" << item.generation
+                << " candidate_count=" << candidates.size()
+                << " neighbor_count=" << neighbors.size()
+                << " count=" << failure << '\n';
+    }
     const u64 retirement_sequence =
       begin_storage_owner_maintenance_sequence(1);
     (void)mark_node_deleted(target, item.generation);
@@ -738,11 +760,12 @@ bool MemoryNode::handle_peer_stage1_execute_request(
     // truthful mixed ok/retry response; receipt replay consumes no new credit.
     vec<Stage1ArmResult> arm_results;
     bool batch_admission_blocked = false;
-    (void)arm_local_stage1_items(
+    const bool batch_structurally_valid = arm_local_stage1_items(
       source_shard, span<const Stage1ArmItem>{fused_arm_items},
       arm_results, config, &batch_admission_blocked);
     saw_admission_block |= batch_admission_blocked;
     const bool batch_fast_path =
+      batch_structurally_valid &&
       arm_results.size() == fused_arm_items.size() &&
       std::all_of(
         arm_results.begin(), arm_results.end(), [](const Stage1ArmResult& result) {
@@ -756,38 +779,19 @@ bool MemoryNode::handle_peer_stage1_execute_request(
       Stage1ExecuteResult& execute = output[fused_result_indices[slot]];
       const Stage1ArmItem& arm = fused_arm_items[slot];
       const Stage1ArmResult* result = nullptr;
+      bool arm_structurally_valid = batch_structurally_valid;
       if (batch_fast_path) {
         result = &arm_results[slot];
       } else {
         bool one_admission_blocked = false;
-        (void)arm_local_stage1_items(
+        arm_structurally_valid = arm_local_stage1_items(
           source_shard, span<const Stage1ArmItem>{&arm, 1},
           one_result, config, &one_admission_blocked);
         saw_admission_block |= one_admission_blocked;
         if (one_result.size() == 1) result = &one_result.front();
       }
-      if (result == nullptr) {
-        execute.maintenance_sequence = 0;
-        execute.status = static_cast<u32>(MutationStatus::failed);
-        continue;
-      }
-      const bool same_token =
-        result->token.source_client == arm.token.source_client &&
-        result->token.item_index == arm.token.item_index &&
-        result->token.client_batch_id == arm.token.client_batch_id;
-      if (!same_token || result->target_raw != arm.target_raw ||
-          result->reserved != 0 ||
-          result->status > static_cast<u32>(MutationStatus::retry) ||
-          (result->status == static_cast<u32>(MutationStatus::ok) &&
-           result->maintenance_sequence == 0) ||
-          (result->status != static_cast<u32>(MutationStatus::ok) &&
-           result->maintenance_sequence != 0)) {
-        execute.maintenance_sequence = 0;
-        execute.status = static_cast<u32>(MutationStatus::failed);
-        continue;
-      }
-      execute.maintenance_sequence = result->maintenance_sequence;
-      execute.status = result->status;
+      (void)memory_node_peer_rpc_detail::propagate_fused_stage1_arm_result(
+        arm_structurally_valid, arm, result, execute);
     }
   }
 

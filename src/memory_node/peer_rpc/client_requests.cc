@@ -163,9 +163,16 @@ bool MemoryNode::try_drive_stage2_home_rpc_requests(
   if (retry_request_id.has_value()) {
     wire_request_id = *retry_request_id;
   } else {
-    wire_request_id = allocate_peer_request_id();
-    formed_aggregate = stage2_home_rpc_outbox_->form_aggregate(
-      target_shard, request_type, wire_request_id, storage_id_, speculative);
+    formed_aggregate = stage2_home_rpc_outbox_->form_singleton_direct(
+      target_shard, request_type, storage_id_, speculative);
+    if (formed_aggregate.has_value()) {
+      wire_request_id = formed_aggregate->wire_request_id;
+    } else {
+      wire_request_id = allocate_peer_request_id();
+      formed_aggregate = stage2_home_rpc_outbox_->form_aggregate(
+        target_shard, request_type, wire_request_id, storage_id_,
+        speculative);
+    }
     if (!formed_aggregate.has_value()) {
       release_peer_rpc_send_slot(target_shard, slot_id);
       return false;
@@ -273,6 +280,13 @@ bool MemoryNode::try_handle_stage2_home_rpc_aggregate_response(
   }
   service::storage_owner::PeerRpcHeader outer_header{};
   std::memcpy(&outer_header, response.data(), sizeof(outer_header));
+  // Singleton-direct requests deliberately retain their logical request ID
+  // and must fall through to the original registry/borrowed receive-slot
+  // response path.  Only multi-logical outer IDs are demultiplexed here.
+  if (stage2_home_rpc_outbox_->is_direct_wire_request(
+        outer_header.request_id)) {
+    return false;
+  }
   if (!stage2_home_rpc_outbox_->owns_wire_request(
         outer_header.request_id)) {
     return false;

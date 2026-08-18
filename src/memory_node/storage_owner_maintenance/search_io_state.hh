@@ -132,19 +132,25 @@ struct Stage2PrefetchedGraphExpansion {
 };
 
 // Global promotion feedback is intentionally conservative. Width four is a
-// bounded warm-up; only a measured >=70% promotion rate unlocks the configured
-// width. Below that threshold new speculation stops, while already cached
-// records remain eligible for exact ordered commit. At p=0.70, width 16 does
-// only 2.6% more graph work than width 8, but halves its remaining graph RPCs.
+// bounded warm-up/probe; only a measured >=70% promotion rate unlocks the
+// configured width.  Keep that bounded probe alive after a weak window.  A
+// width of one produces no speculative outcomes, so the previous policy could
+// latch permanently at one after a transient startup window even when the
+// long-run promotion ratio was above 97%.  Ordered issue is piggyback-only and
+// cannot create another peer RPC, which makes width four a bounded,
+// work-conserving feedback floor rather than an open-loop workload increase.
+// At p=0.70, width 16 does only 2.6% more graph work than width 8, but halves
+// its remaining graph RPCs.
 constexpr u32 stage2_ordered_issue_width(
     u64 hits, u64 wasted, u32 configured_max_width) {
   const u32 maximum = std::max<u32>(1, configured_max_width);
   if (maximum == 1) return 1;
+  const u32 probe_width = std::min<u32>(4, maximum);
   const u64 outcomes = hits + wasted;
-  if (outcomes < 512) return std::min<u32>(4, maximum);
+  if (outcomes < 512) return probe_width;
   const auto promotion_ratio =
       static_cast<long double>(hits) / static_cast<long double>(outcomes);
-  if (promotion_ratio < 0.70L) return 1;
+  if (promotion_ratio < 0.70L) return probe_width;
   return maximum;
 }
 

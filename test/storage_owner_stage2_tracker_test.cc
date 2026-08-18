@@ -476,6 +476,21 @@ void test_search_lane_budget_is_global_and_evenly_distributed() {
   assert(detail::stage2_global_search_lane_count(5, 16, 1, 3) == 10);
   assert(detail::stage2_global_search_lane_count(5, 1, 1, 4096) == 5);
 
+  // The active lease is a continuation/scratch bound, not a reservation of a
+  // worst-case RDMA wave. Production's eight workers and sixteen allocated
+  // lanes per worker retain a 32-context pipeline while every actual wave is
+  // still checked by the independent RDMA credit manager.
+  assert(detail::stage2_global_search_lane_lease_limit(
+           8, 16, 16) == 32);
+  assert(detail::stage2_global_search_lane_lease_limit(
+           8, 2, 16) == 16);
+  assert(detail::stage2_global_search_lane_lease_limit(
+           4, 16, 8) == 16);
+  assert(detail::stage2_global_search_lane_lease_limit(
+           1, 2, 1) == 2);
+  assert(detail::stage2_global_search_lane_lease_limit(
+           8, 16, 48) == 48);
+
   // Ceil the number of credit windows before doubling. Six one-WR windows are
   // spread 3/3/2/2/2 rather than silently dropping the non-divisible tail.
   const std::size_t uneven =

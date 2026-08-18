@@ -3522,8 +3522,10 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
   u64 unpublished_context_slots_scanned = 0;
   size_t active_context_cursor = 0;
   bool fallback_context_scan_requested = false;
+  constexpr auto kFallbackContextAuditInterval =
+    std::chrono::milliseconds(10);
   auto next_fallback_context_scan =
-    std::chrono::steady_clock::now() + std::chrono::milliseconds(1);
+    std::chrono::steady_clock::now() + kFallbackContextAuditInterval;
   const auto flush_idle_timing = [&]() {
     if (unpublished_idle_waits != 0) {
       storage_owner_maintenance_worker_idle_ns_.fetch_add(
@@ -3709,7 +3711,7 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
       active_context_cursor = scan_begin + 1 == context_count
         ? 0 : scan_begin + 1;
       next_fallback_context_scan =
-        scan_now + std::chrono::milliseconds(1);
+        scan_now + kFallbackContextAuditInterval;
     }
 
     while (Stage2Context* context = try_admit_context()) {
@@ -3723,7 +3725,9 @@ void MemoryNode::storage_owner_maintenance_worker_loop(u32 worker_id) {
     maybe_log_storage_owner_maintenance_observation();
     if (!progressed) {
       const auto idle_started = std::chrono::steady_clock::now();
-      auto wake_at = idle_started + std::chrono::milliseconds(1);
+      auto wake_at = std::min(
+        next_fallback_context_scan,
+        idle_started + kFallbackContextAuditInterval);
       {
         std::lock_guard<std::mutex> queue_lock(
           storage_owner_maintenance_mutex_);

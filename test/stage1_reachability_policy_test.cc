@@ -134,6 +134,52 @@ void test_duplicates_do_not_consume_attempt_or_certificate_capacity() {
   assert(accepted[0] != accepted[1]);
 }
 
+void test_transient_busy_sweep_retries_without_rejecting_insert() {
+  using memory_node_storage_owner_index_detail::
+    Stage1BridgeInstallDisposition;
+  constexpr size_t record_bytes = 256;
+  const vec<RemotePtr> targets{
+    pointer(0, 0x1000), pointer(0, 0x2000), pointer(0, 0x3000)};
+  u32 callbacks = 0;
+  u32 waits = 0;
+  const vec<RemotePtr> accepted =
+    memory_node_storage_owner_index_detail::
+      select_stage1_reachability_bridges_retry_busy(
+        pointer(0, 0xa000, 2), span<const RemotePtr>{targets}, record_bytes,
+        [&](RemotePtr target) {
+          if (callbacks++ < targets.size()) {
+            return Stage1BridgeInstallDisposition::busy;
+          }
+          return target == targets[1]
+            ? Stage1BridgeInstallDisposition::installed
+            : Stage1BridgeInstallDisposition::rejected;
+        },
+        [&]() {
+          ++waits;
+          return true;
+        });
+  assert(waits == 1);
+  assert((accepted == vec<RemotePtr>{targets[1]}));
+}
+
+void test_permanent_rejection_does_not_retry() {
+  using memory_node_storage_owner_index_detail::
+    Stage1BridgeInstallDisposition;
+  const vec<RemotePtr> targets{pointer(0, 0x1000), pointer(0, 0x2000)};
+  u32 waits = 0;
+  const vec<RemotePtr> accepted =
+    memory_node_storage_owner_index_detail::
+      select_stage1_reachability_bridges_retry_busy(
+        pointer(0, 0xb000, 2), span<const RemotePtr>{targets}, 256,
+        [](RemotePtr) { return Stage1BridgeInstallDisposition::rejected; },
+        [&]() {
+          ++waits;
+          return true;
+        });
+  assert(accepted.empty());
+  assert(waits == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -142,5 +188,7 @@ int main() {
   test_only_successful_ack_targets_are_recorded();
   test_one_bridge_is_a_valid_bounded_certificate();
   test_duplicates_do_not_consume_attempt_or_certificate_capacity();
+  test_transient_busy_sweep_retries_without_rejecting_insert();
+  test_permanent_rejection_does_not_retry();
   return 0;
 }

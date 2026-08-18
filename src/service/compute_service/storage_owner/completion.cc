@@ -166,6 +166,21 @@ void ComputeService::handle_storage_owner_token_completion(
 
   const bool committed = completion.status ==
     static_cast<u32>(service::storage_owner::MutationStatus::ok);
+  if (!committed) {
+    static std::atomic<u64> rejected_completion_logs{0};
+    const u64 log_index = rejected_completion_logs.fetch_add(
+      1, std::memory_order_relaxed);
+    if (log_index < 16 || ((log_index + 1) & log_index) == 0) {
+      std::cerr << "[storage-owner] mutation completion rejected"
+                << " owner=" << owner_storage
+                << " operation_id=" << completion.operation_id
+                << " status=" << completion.status
+                << " generation=" << completion.generation
+                << " new_raw=0x" << std::hex << completion.new_rptr_raw
+                << " old_raw=0x" << completion.old_rptr_raw << std::dec
+                << " count=" << (log_index + 1) << '\n';
+    }
+  }
   if (committed && completion.maintenance_sequence != 0 &&
       storage_maintenance_targets_ != nullptr) {
     const RemotePtr new_pointer{completion.new_rptr_raw};

@@ -19,6 +19,7 @@ using memory_node_peer_rpc_detail::independent_score_receiver_enabled;
 using memory_node_peer_rpc_detail::make_fused_stage1_release_item;
 using memory_node_peer_rpc_detail::partition_stage1_control_response;
 using memory_node_peer_rpc_detail::partition_stage1_execute_response;
+using memory_node_peer_rpc_detail::propagate_fused_stage1_arm_result;
 using memory_node_peer_rpc_detail::stage1_peer_attempt_timeout;
 using memory_node_peer_rpc_detail::stage1_worker_has_eligible_task;
 using memory_node_peer_rpc_detail::speculative_score_request_admissible;
@@ -644,6 +645,56 @@ void test_execute_mixed_progress_compacts_only_retry_tokens() {
     span<const Stage1ExecuteItem>{inputs.data(), inputs.size()}));
 }
 
+void test_fused_arm_propagation_replays_uncertain_handoffs() {
+  const Stage1ArmItem input = arm_item(17, Stage1ArmAction::arm);
+  Stage1ExecuteResult execute{
+    .client_batch_id = input.token.client_batch_id,
+    .target_raw = input.target_raw,
+    .source_client = input.token.source_client,
+    .item_index = input.token.item_index,
+    .status = static_cast<u32>(MutationStatus::ok),
+  };
+
+  // A missing result is not proof that ARM did not linearize. Replaying the
+  // exact token can recover an already-owned maintenance sequence.
+  assert(propagate_fused_stage1_arm_result(
+           true, input, nullptr, execute) == MutationStatus::retry);
+  assert(execute.status == static_cast<u32>(MutationStatus::retry));
+  assert(execute.maintenance_sequence == 0);
+  assert(execute.target_raw == input.target_raw);
+
+  Stage1ArmResult retry = ok_result(input);
+  retry.status = static_cast<u32>(MutationStatus::retry);
+  retry.maintenance_sequence = 0;
+  assert(propagate_fused_stage1_arm_result(
+           true, input, &retry, execute) == MutationStatus::retry);
+
+  // A structurally untrusted result is discarded and replayed under the
+  // immutable input token; it must not become a false public failure.
+  Stage1ArmResult crossed = ok_result(input);
+  ++crossed.token.item_index;
+  assert(propagate_fused_stage1_arm_result(
+           true, input, &crossed, execute) == MutationStatus::retry);
+  assert(execute.maintenance_sequence == 0);
+
+  Stage1ArmResult armed = ok_result(input);
+  assert(propagate_fused_stage1_arm_result(
+           true, input, &armed, execute) == MutationStatus::ok);
+  assert(execute.status == static_cast<u32>(MutationStatus::ok));
+  assert(execute.maintenance_sequence == armed.maintenance_sequence);
+
+  // arm_local_stage1_items() separately proves an identity/generation
+  // conflict. That explicit structural failure remains terminal and cannot
+  // be hidden behind unbounded retry.
+  Stage1ArmResult terminal = ok_result(input);
+  terminal.status = static_cast<u32>(MutationStatus::failed);
+  terminal.maintenance_sequence = 0;
+  assert(propagate_fused_stage1_arm_result(
+           false, input, &terminal, execute) == MutationStatus::failed);
+  assert(execute.status == static_cast<u32>(MutationStatus::failed));
+  assert(execute.maintenance_sequence == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -661,4 +712,5 @@ int main() {
   test_home_commit_releases_credit_before_next_home_arm();
   test_fused_execute_requires_fresh_insert_and_runnable_fence();
   test_execute_mixed_progress_compacts_only_retry_tokens();
+  test_fused_arm_propagation_replays_uncertain_handoffs();
 }

@@ -136,14 +136,8 @@ void MemoryNode::peer_rpc_progress_loop() {
         continue;
       }
 
-      const auto try_deliver_response = [&]() {
-        if (peer_async_responses_ == nullptr) return false;
-        PeerResponseCompletionTarget completion_target;
-        if (!peer_async_responses_->try_deliver_with_target(
-              peer_id, slot_id, bytes, *header,
-              &completion_target)) {
-          return false;
-        }
+      const auto notify_delivered_response = [&] (
+          const PeerResponseCompletionTarget& completion_target) {
         // Synchronous/control callers retain their existing completion CV.
         // A maintenance-tagged response additionally wakes only the executor
         // that owns the response cell and its context.
@@ -158,6 +152,22 @@ void MemoryNode::peer_rpc_progress_loop() {
           notify_storage_owner_maintenance_executor(
             completion_target.maintenance_wake_owner);
         }
+      };
+
+      const auto try_deliver_response = [&, this](
+          PeerResponseCompletionTarget* delivered_target = nullptr,
+          bool notify = true) {
+        if (peer_async_responses_ == nullptr) return false;
+        PeerResponseCompletionTarget completion_target;
+        if (!peer_async_responses_->try_deliver_with_target(
+              peer_id, slot_id, bytes, *header,
+              &completion_target)) {
+          return false;
+        }
+        if (delivered_target != nullptr) {
+          *delivered_target = completion_target;
+        }
+        if (notify) notify_delivered_response(completion_target);
         return true;
       };
 
@@ -514,8 +524,32 @@ void MemoryNode::peer_rpc_progress_loop() {
               }
             }
             peer_completion_cv_.notify_all();
-          } else if (try_deliver_response()) {
-            hold_receive_slot = true;
+          } else {
+            using DirectResponseResult =
+              memory_node_storage_owner_maintenance_detail::
+                Stage2HomeRpcDirectResponseResult;
+            DirectResponseResult direct_result =
+              DirectResponseResult::not_direct;
+            if (stage2_home_rpc_outbox_ != nullptr) {
+              direct_result =
+                stage2_home_rpc_outbox_->finish_direct_response(
+                  peer_id, span<const byte_t>{payload, bytes});
+              if (direct_result == DirectResponseResult::invalid) {
+                // Match the multi-logical path: a structurally invalid or
+                // overloaded response keeps the byte-identical request and
+                // immediately makes its existing wire owner runnable again.
+                // Waiting for the normal RPC deadline here would turn one
+                // recoverable peer response into a 30-second mutation tail.
+                (void)stage2_home_rpc_outbox_->retry_after_timeout(
+                  header->request_id);
+              }
+            }
+            PeerResponseCompletionTarget completion_target;
+            if (direct_result != DirectResponseResult::invalid &&
+                try_deliver_response(&completion_target, false)) {
+              hold_receive_slot = true;
+              notify_delivered_response(completion_target);
+            }
           }
         }
       } else if (header->type == static_cast<u32>(

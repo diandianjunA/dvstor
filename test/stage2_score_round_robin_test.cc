@@ -235,9 +235,10 @@ void test_home_rpc_wait_does_not_pin_registered_rdma_scratch() {
 
 void test_ordered_issue_policy_has_bounded_warmup_and_hard_stop() {
   assert(stage2_ordered_issue_width(0, 0, 16) == 4);
-  assert(stage2_ordered_issue_width(358, 154, 16) == 1);
+  assert(stage2_ordered_issue_width(358, 154, 16) == 4);
   assert(stage2_ordered_issue_width(360, 152, 16) == 16);
-  assert(stage2_ordered_issue_width(230, 282, 16) == 1);
+  assert(stage2_ordered_issue_width(230, 282, 16) == 4);
+  assert(stage2_ordered_issue_width(0, 512, 2) == 2);
   assert(stage2_ordered_issue_width(10'000, 0, 1) == 1);
 }
 

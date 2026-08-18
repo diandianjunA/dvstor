@@ -47,6 +47,11 @@ struct Stage2HomeRpcAggregate {
   std::uint32_t logical_count{};
   std::size_t request_bytes{};
   bool speculative{};
+  // A singleton keeps the original logical wire ID and protocol image.  It
+  // still occupies an aggregate slot solely for exact retry/deadline
+  // ownership, but its response must use the original borrowed receive-slot
+  // registry path rather than owned-payload fan-out.
+  bool direct{};
 };
 
 // A complete protocol image suitable for publishing into a logical response
@@ -95,6 +100,12 @@ enum class Stage2HomeRpcEnqueueResult : std::uint8_t {
   conflict,
   full,
   invalid,
+};
+
+enum class Stage2HomeRpcDirectResponseResult : std::uint8_t {
+  not_direct,
+  invalid,
+  finished,
 };
 
 // Bounded, process-wide transport combiner for authoritative Stage2-home RPCs.
@@ -297,6 +308,7 @@ class Stage2HomeRpcOutbox {
       .logical_count = static_cast<std::uint32_t>(selected_count),
       .request_bytes = 0,
       .speculative = speculative,
+      .direct = false,
     };
     aggregate.members.clear();
     aggregate.request.clear();
@@ -345,6 +357,99 @@ class Stage2HomeRpcOutbox {
       release_entry_request(entry);
     }
     insert_aggregate_bucket(wire_request_id, aggregate_index);
+    ++aggregate_size_;
+    return aggregate.snapshot;
+  }
+
+  // Claim a queue only when it contains exactly one logical request.  The
+  // retained protocol image is moved (not rebuilt/copied), and the original
+  // logical request ID remains the wire ID.  Keeping a normal aggregate
+  // lifecycle around the entry provides the same bounded timeout/retry and
+  // cancellation semantics as a combined request without imposing aggregate
+  // request/response construction on the overwhelmingly common singleton.
+  [[nodiscard]] std::optional<Stage2HomeRpcAggregate>
+  form_singleton_direct(
+      std::uint32_t peer_index,
+      service::storage_owner::PeerRpcType request_type,
+      std::uint32_t source_shard,
+      bool speculative = false) {
+    const auto requested_queue_class = queue_class(
+      request_type,
+      speculative
+        ? service::storage_owner::kStage2ScoreManyFlagSpeculative
+        : 0);
+    if (!requested_queue_class.has_value()) return std::nullopt;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (peer_index >= queues_.size() || source_shard >= queues_.size() ||
+        source_shard == peer_index || free_aggregates_.empty()) {
+      return std::nullopt;
+    }
+    PeerQueue& queue = queues_[peer_index][*requested_queue_class];
+    if (queue.size != 1 || queue.head == npos || queue.tail != queue.head) {
+      return std::nullopt;
+    }
+    const std::uint32_t entry_index = queue.head;
+    Entry& entry = entries_[entry_index];
+    if (!entry.in_use || !entry.queued || entry.cancelled ||
+        entry.request_type != request_type ||
+        entry.peer_index != peer_index ||
+        entry.queue_class != *requested_queue_class ||
+        entry.request.size() <
+          sizeof(service::storage_owner::PeerRpcHeader) ||
+        find_aggregate_index(entry.logical_request_id).has_value()) {
+      return std::nullopt;
+    }
+
+    const std::uint32_t aggregate_index = free_aggregates_.back();
+    free_aggregates_.pop_back();
+    Aggregate& aggregate = aggregates_[aggregate_index];
+    aggregate.in_use = true;
+    aggregate.state = AggregateState::ready;
+    aggregate.queue_class = *requested_queue_class;
+    advance_generation(aggregate.generation);
+    aggregate.snapshot = Stage2HomeRpcAggregate{
+      .wire_request_id = entry.logical_request_id,
+      .peer_index = peer_index,
+      .request_type = request_type,
+      .response_type = response_type(request_type),
+      .item_count = entry.item_count,
+      .logical_count = 1,
+      .request_bytes = entry.request.size(),
+      .speculative = speculative,
+      .direct = true,
+    };
+    aggregate.members.clear();
+    aggregate.members.push_back(Member{
+      .entry_index = entry_index,
+      .item_offset = 0,
+      .query_offset = 0,
+    });
+    aggregate.request.clear();
+    aggregate.request.swap(entry.request);
+
+    // The logical builder already supplied this header, but normalize every
+    // transport-owned field so retries always repost one exact valid image.
+    auto* header = reinterpret_cast<
+      service::storage_owner::PeerRpcHeader*>(aggregate.request.data());
+    header->magic = service::storage_owner::kPeerRpcMagic;
+    header->version = service::storage_owner::kPeerRpcVersion;
+    header->type = static_cast<std::uint32_t>(request_type);
+    header->source_shard = source_shard;
+    header->item_count = entry.item_count;
+    header->request_id = entry.logical_request_id;
+    header->status = static_cast<std::uint32_t>(
+      service::storage_owner::InsertStatus::ok);
+    header->reserved = 0;
+
+    unlink_queued(entry_index);
+    entry.aggregate_slot = aggregate_index;
+    entry.aggregate_generation = aggregate.generation;
+    // Capacity ownership moved to aggregate.request, so resident byte
+    // accounting is intentionally unchanged here.
+    release_entry_request(entry);
+    insert_aggregate_bucket(
+      aggregate.snapshot.wire_request_id, aggregate_index);
     ++aggregate_size_;
     return aggregate.snapshot;
   }
@@ -424,6 +529,7 @@ class Stage2HomeRpcOutbox {
     std::lock_guard<std::mutex> lock(mutex_);
     Aggregate* aggregate = find_aggregate(wire_request_id);
     if (aggregate == nullptr ||
+        aggregate->snapshot.direct ||
         (aggregate->state != AggregateState::posted &&
          aggregate->state != AggregateState::await_response) ||
         !valid_outer_response(*aggregate, response)) {
@@ -460,6 +566,48 @@ class Stage2HomeRpcOutbox {
     release_aggregate(aggregate_index);
     --aggregate_size_;
     return true;
+  }
+
+  // Validate and retire a singleton before its response becomes visible in
+  // the original logical registry.  Publishing first would allow an active
+  // context to consume/rearm the registry cell and enqueue the same logical
+  // ID while the old outbox entry still exists; deleting that old entry
+  // afterwards would strand the new pending registry cell.  The peer/header
+  // validation and retirement therefore share this one outbox critical
+  // section.  A late response remains valid after deadline promotion
+  // (ready), while posting (posted), or while awaiting a response.
+  [[nodiscard]] Stage2HomeRpcDirectResponseResult finish_direct_response(
+      std::uint32_t peer_index,
+      std::span<const byte_t> response) {
+    using service::storage_owner::PeerRpcHeader;
+    if (response.size() < sizeof(PeerRpcHeader)) {
+      return Stage2HomeRpcDirectResponseResult::not_direct;
+    }
+    PeerRpcHeader header{};
+    std::memcpy(&header, response.data(), sizeof(header));
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto aggregate_index = find_aggregate_index(header.request_id);
+    if (!aggregate_index.has_value()) {
+      return Stage2HomeRpcDirectResponseResult::not_direct;
+    }
+    Aggregate& aggregate = aggregates_[*aggregate_index];
+    if (!aggregate.snapshot.direct) {
+      return Stage2HomeRpcDirectResponseResult::not_direct;
+    }
+    if (aggregate.snapshot.peer_index != peer_index ||
+        (aggregate.state != AggregateState::ready &&
+         aggregate.state != AggregateState::posted &&
+         aggregate.state != AggregateState::await_response) ||
+        !valid_outer_response(aggregate, response)) {
+      return Stage2HomeRpcDirectResponseResult::invalid;
+    }
+    for (const Member& member : aggregate.members) {
+      release_entry(member.entry_index);
+    }
+    erase_aggregate_bucket(header.request_id);
+    release_aggregate(*aggregate_index);
+    --aggregate_size_;
+    return Stage2HomeRpcDirectResponseResult::finished;
   }
 
   // Publication failed before any logical completion became visible. Release
@@ -558,6 +706,13 @@ class Stage2HomeRpcOutbox {
       std::uint64_t wire_request_id) const {
     std::lock_guard<std::mutex> lock(mutex_);
     return find_aggregate_index(wire_request_id).has_value();
+  }
+
+  [[nodiscard]] bool is_direct_wire_request(
+      std::uint64_t wire_request_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const Aggregate* aggregate = find_aggregate(wire_request_id);
+    return aggregate != nullptr && aggregate->snapshot.direct;
   }
 
   [[nodiscard]] std::size_t resident_bytes() const {

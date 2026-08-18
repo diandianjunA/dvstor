@@ -396,6 +396,50 @@ inline Stage1ControlResponseDisposition classify_stage1_control_item(
   return Stage1ControlResponseDisposition::resolved;
 }
 
+// Translate the receiver-local fused ARM attempt back into the enclosing
+// Execute result without turning an uncertain handoff into a semantic
+// rejection.  Once prepare has succeeded, an absent or malformed ARM result
+// does not prove that admission failed: the task may already own a durable
+// maintenance sequence and the exact-token replay is the only operation that
+// can recover that sequence safely.  arm_local_stage1_items() reports a
+// separate structural-validity bit; only that explicit identity/generation
+// conflict is terminal.  Ordinary capacity, duplicate-in-progress, and
+// shutdown admission remain retryable.
+inline service::storage_owner::MutationStatus
+propagate_fused_stage1_arm_result(
+    bool structurally_valid,
+    const service::storage_owner::Stage1ArmItem& input,
+    const service::storage_owner::Stage1ArmResult* output,
+    service::storage_owner::Stage1ExecuteResult& execute) noexcept {
+  using namespace service::storage_owner;
+  execute.maintenance_sequence = 0;
+  if (!structurally_valid) {
+    execute.status = static_cast<u32>(MutationStatus::failed);
+    return MutationStatus::failed;
+  }
+  if (output == nullptr) {
+    execute.status = static_cast<u32>(MutationStatus::retry);
+    return MutationStatus::retry;
+  }
+  switch (classify_stage1_control_item(input, *output)) {
+    case Stage1ControlResponseDisposition::resolved:
+      execute.maintenance_sequence = output->maintenance_sequence;
+      execute.status = static_cast<u32>(MutationStatus::ok);
+      return MutationStatus::ok;
+    case Stage1ControlResponseDisposition::retry:
+      execute.status = static_cast<u32>(MutationStatus::retry);
+      return MutationStatus::retry;
+    case Stage1ControlResponseDisposition::malformed:
+      // The semantic receipt is still keyed by input.token.  Discard the
+      // untrusted result and replay that exact token instead of aborting a
+      // task whose ARM may already have linearized.
+      execute.status = static_cast<u32>(MutationStatus::retry);
+      return MutationStatus::retry;
+  }
+  execute.status = static_cast<u32>(MutationStatus::retry);
+  return MutationStatus::retry;
+}
+
 inline bool partition_stage1_control_response(
     span<const service::storage_owner::Stage1ArmItem> inputs,
     span<const service::storage_owner::Stage1ArmResult> outputs,

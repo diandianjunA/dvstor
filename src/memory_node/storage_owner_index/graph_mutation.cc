@@ -345,47 +345,71 @@ vec<RemotePtr> MemoryNode::install_local_provisional_backlinks(
     return {};
   }
 
+  // A fresh insert cannot be reported as a permanent mutation failure merely
+  // because maintenance held every eligible parent lock during one bounded
+  // try_lock sweep.  That became observable once Stage2 was made
+  // work-conserving: foreground Stage1 and maintenance now intentionally
+  // overlap on the same graph.  Keep retrying only while at least one target
+  // is still the same live incarnation but busy.  A sweep containing no busy
+  // target is terminal (all candidates are stale, quiesced, remote, deleted,
+  // or out of protected slots), so this does not spin on an impossible graph.
   const auto try_install = [&](const RemotePtr target) {
-    if (!local_shard(target.memory_node())) return false;
-    if (try_lock_node(target) != IncarnationLockResult::locked) {
-      // Contention lets Stage1 try another bounded bridge; a stale target is
-      // not eligible for an ACK under its old physical identity.
-      return false;
-    }
-    const u64 header = load_local_node_header_acquire(target);
-    if (!VamanaNode::stable_graph_mutation_allowed(header)) {
-      unlock_node(target);
-      return false;
-    }
+      using InstallDisposition =
+        memory_node_storage_owner_index_detail::
+          Stage1BridgeInstallDisposition;
+      if (!local_shard(target.memory_node())) {
+        return InstallDisposition::rejected;
+      }
+      const IncarnationLockResult lock = try_lock_node(target);
+      if (lock == IncarnationLockResult::busy) {
+        return InstallDisposition::busy;
+      }
+      if (lock != IncarnationLockResult::locked) {
+        // A stale target is not eligible for an ACK under its old physical
+        // identity.  Another target in the same sweep may still be usable.
+        return InstallDisposition::rejected;
+      }
+      const u64 header = load_local_node_header_acquire(target);
+      if (!VamanaNode::stable_graph_mutation_allowed(header)) {
+        unlock_node(target);
+        return InstallDisposition::rejected;
+      }
 
-    GraphAdjacency adjacency;
-    if (!read_graph_adjacency(target, adjacency) || adjacency.deleted) {
-      unlock_node(target);
-      return false;
-    }
-    if (std::find(adjacency.stable.begin(), adjacency.stable.end(),
-                  candidate) != adjacency.stable.end() ||
-        std::find(adjacency.provisional.begin(),
-                  adjacency.provisional.end(), candidate) !=
-          adjacency.provisional.end()) {
-      unlock_node(target);
-      return true;
-    }
-    if (adjacency.provisional.size() >=
-        VamanaNode::provisional_slots()) {
-      unlock_node(target);
-      return false;
-    }
+      GraphAdjacency adjacency;
+      if (!read_graph_adjacency(target, adjacency) || adjacency.deleted) {
+        unlock_node(target);
+        return InstallDisposition::rejected;
+      }
+      if (std::find(adjacency.stable.begin(), adjacency.stable.end(),
+                    candidate) != adjacency.stable.end() ||
+          std::find(adjacency.provisional.begin(),
+                    adjacency.provisional.end(), candidate) !=
+            adjacency.provisional.end()) {
+        unlock_node(target);
+        return InstallDisposition::installed;
+      }
+      if (adjacency.provisional.size() >=
+          VamanaNode::provisional_slots()) {
+        unlock_node(target);
+        return InstallDisposition::rejected;
+      }
 
-    adjacency.provisional.push_back(candidate);
-    write_graph_adjacency(target, adjacency.stable,
-                          adjacency.provisional,
-                          adjacency.generation, false);
-    unlock_node(target);
-    return true;
+      adjacency.provisional.push_back(candidate);
+      write_graph_adjacency(target, adjacency.stable,
+                            adjacency.provisional,
+                            adjacency.generation, false);
+      unlock_node(target);
+      return InstallDisposition::installed;
   };
-  return select_stage1_reachability_bridges(
-    candidate, targets, VamanaNode::allocation_size(), try_install);
+  return select_stage1_reachability_bridges_retry_busy(
+    candidate, targets, VamanaNode::allocation_size(), try_install,
+    [&]() {
+      if (storage_insert_shutdown_.load(std::memory_order_acquire)) {
+        return false;
+      }
+      std::this_thread::yield();
+      return true;
+    });
 }
 
 bool MemoryNode::remove_local_provisional_backlinks(

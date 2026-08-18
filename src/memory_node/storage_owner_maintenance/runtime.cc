@@ -372,9 +372,9 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   // every worker one lane per local context, then admit active lanes through
   // the node-wide lease above. A hot worker can therefore borrow all useful
   // dependency chains instead of being pinned to its old two-lane share.
-  constexpr size_t kMaxNodeWideSearchLanes = 16;
+  constexpr size_t kMaxPhysicalSearchLanesPerWorker = 16;
   const size_t physical_lanes_per_worker = std::min<size_t>(
-    contexts_per_worker, kMaxNodeWideSearchLanes);
+    contexts_per_worker, kMaxPhysicalSearchLanesPerWorker);
   lib_assert(physical_lanes_per_worker != 0 &&
                physical_lanes_per_worker <=
                  std::numeric_limits<u32>::max(),
@@ -383,13 +383,10 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                std::numeric_limits<size_t>::max() /
                  physical_lanes_per_worker,
              "Stage2 aggregate physical lane count overflow");
-  const size_t total_physical_lanes =
-    static_cast<size_t>(worker_count) * physical_lanes_per_worker;
-  const size_t global_search_lane_lease_limit = std::min({
-    global_search_lane_count,
-    kMaxNodeWideSearchLanes,
-    total_physical_lanes,
-  });
+  const size_t global_search_lane_lease_limit =
+    stage2_global_search_lane_lease_limit(
+      worker_count, physical_lanes_per_worker,
+      global_search_lane_count);
   lib_assert(global_search_lane_lease_limit != 0 &&
                global_search_lane_lease_limit <=
                  std::numeric_limits<u32>::max(),
@@ -440,6 +437,8 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
                std::to_string(peer_credit_plan.global) +
                " search_lanes_global=" +
                std::to_string(global_search_lane_lease_limit) +
+               " search_lanes_credit_derived=" +
+               std::to_string(global_search_lane_count) +
                " search_lane_lease_cap=" +
                std::to_string(global_search_lane_lease_limit) +
                " search_lanes_physical_per_worker=" +

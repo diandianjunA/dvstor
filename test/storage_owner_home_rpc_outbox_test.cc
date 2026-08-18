@@ -1,8 +1,12 @@
 #include <cassert>
+#include <atomic>
 #include <cstdint>
+#include <optional>
 #include <span>
+#include <thread>
 #include <vector>
 
+#include "memory_node/peer_rpc/async_response.hh"
 #include "memory_node/storage_owner_maintenance/home_rpc_outbox.hh"
 
 namespace detail = memory_node_storage_owner_maintenance_detail;
@@ -502,6 +506,440 @@ void test_leased_partial_cancel_retries_only_live_members() {
   assert(outbox.size() == 0 && outbox.aggregate_size() == 0);
 }
 
+void test_singleton_direct_fast_success_uses_borrowed_registry_slot() {
+  detail::Stage2HomeRpcOutbox outbox(
+    8, 4, 5, 32, 256, 256, 1u << 20);
+  memory_node_detail::PeerAsyncResponseRegistry registry(4);
+  auto request = expand_request(1, 16000, 141);
+  constexpr std::uint64_t logical_id = 71;
+  constexpr std::uint32_t peer = 3;
+  assert(registry.register_request(
+           logical_id, peer,
+           protocol::PeerRpcType::stage2_expand_score_response, 1) ==
+         memory_node_detail::PeerResponseRegistration::registered);
+  assert(outbox.try_enqueue(dispatch(
+           logical_id, peer,
+           protocol::PeerRpcType::stage2_expand_score_request,
+           1, request)) == detail::Stage2HomeRpcEnqueueResult::enqueued);
+
+  const auto direct = outbox.form_singleton_direct(
+    peer, protocol::PeerRpcType::stage2_expand_score_request, 0);
+  assert(direct.has_value() && direct->direct);
+  assert(direct->wire_request_id == logical_id &&
+         direct->logical_count == 1);
+  assert(outbox.is_direct_wire_request(logical_id));
+  assert(outbox.owns_wire_request(logical_id));
+  std::vector<byte_t> wire(direct->request_bytes);
+  std::size_t copied = 0;
+  const auto post = outbox.claim_ready_for_post(logical_id, wire, copied);
+  assert(post.has_value() && copied == wire.size());
+  const auto* wire_header = reinterpret_cast<
+    const protocol::PeerRpcHeader*>(wire.data());
+  assert(wire_header->request_id == logical_id);
+  assert(wire_header->source_shard == 0);
+  assert(wire_header->item_count == 1);
+
+  // Model a response reaching the CQ before the producer advances posted to
+  // await_response. The direct response is installed in the original cell,
+  // and the receive descriptor remains borrowed by that cell.
+  std::vector<byte_t> response(
+    protocol::stage2_expand_score_response_bytes(1, 0), byte_t{0});
+  auto* response_header = reinterpret_cast<protocol::PeerRpcHeader*>(
+    response.data());
+  *response_header = {
+    .magic = protocol::kPeerRpcMagic,
+    .version = protocol::kPeerRpcVersion,
+    .type = static_cast<std::uint32_t>(
+      protocol::PeerRpcType::stage2_expand_score_response),
+    .source_shard = peer,
+    .item_count = 1,
+    .request_id = logical_id,
+    .status = static_cast<std::uint32_t>(protocol::InsertStatus::ok),
+  };
+  memory_node_detail::PeerResponseCompletionTarget completion_target;
+  assert(outbox.finish_direct_response(peer, response) ==
+         detail::Stage2HomeRpcDirectResponseResult::finished);
+  assert(registry.try_deliver_with_target(
+    peer, 17, response.size(), *response_header, &completion_target));
+  assert(!outbox.mark_awaiting_response(*post, 100));
+  assert(!outbox.owns_wire_request(logical_id));
+
+  memory_node_detail::PeerResponseDescriptor descriptor;
+  memory_node_detail::PeerResponseLease response_lease;
+  assert(registry.try_take(
+           logical_id, peer,
+           protocol::PeerRpcType::stage2_expand_score_response, 1,
+           descriptor, response_lease) ==
+         memory_node_detail::TryPeerResponse::success);
+  assert(!descriptor.owned_payload && descriptor.receive_slot == 17);
+  assert(registry.mark_receive_reposted(response_lease));
+  assert(registry.ack_consumed(response_lease));
+  assert(outbox.size() == 0 && outbox.aggregate_size() == 0);
+}
+
+void test_singleton_direct_timeout_retries_exact_wire_image() {
+  detail::Stage2HomeRpcOutbox outbox(
+    8, 4, 5, 32, 256, 256, 1u << 20);
+  const std::vector<std::uint32_t> query_indexes{0, 0};
+  auto request = score_request(query_indexes, 1, 17000, 151);
+  constexpr std::uint64_t logical_id = 72;
+  constexpr std::uint32_t peer = 4;
+  assert(outbox.try_enqueue(dispatch(
+           logical_id, peer,
+           protocol::PeerRpcType::stage2_score_many_request,
+           2, request)) == detail::Stage2HomeRpcEnqueueResult::enqueued);
+  const auto direct = outbox.form_singleton_direct(
+    peer, protocol::PeerRpcType::stage2_score_many_request, 0);
+  assert(direct.has_value() && direct->direct);
+
+  std::vector<byte_t> first_wire(direct->request_bytes);
+  std::size_t first_bytes = 0;
+  const auto first_post = outbox.claim_ready_for_post(
+    logical_id, first_wire, first_bytes);
+  assert(first_post.has_value() && first_bytes == first_wire.size());
+  assert(outbox.mark_awaiting_response(*first_post, 100));
+  assert(outbox.promote_expired(99) == 0);
+  assert(outbox.promote_expired(100) == 1);
+  const auto retry_id = outbox.next_retry_wire_request(
+    peer, protocol::PeerRpcType::stage2_score_many_request);
+  assert(retry_id.has_value() && *retry_id == logical_id);
+
+  std::vector<byte_t> retry_wire(direct->request_bytes);
+  std::size_t retry_bytes = 0;
+  const auto retry_post = outbox.claim_ready_for_post(
+    logical_id, retry_wire, retry_bytes);
+  assert(retry_post.has_value() && retry_bytes == first_bytes);
+  assert(retry_wire == first_wire);
+  assert(outbox.mark_awaiting_response(*retry_post, 200));
+  // A late success from either byte-identical attempt retires the one
+  // transport owner and invalidates any later timeout promotion.
+  std::vector<byte_t> response(
+    protocol::stage2_score_many_response_bytes(2), byte_t{0});
+  auto* response_header = reinterpret_cast<protocol::PeerRpcHeader*>(
+    response.data());
+  *response_header = {
+    .magic = protocol::kPeerRpcMagic,
+    .version = protocol::kPeerRpcVersion,
+    .type = static_cast<std::uint32_t>(
+      protocol::PeerRpcType::stage2_score_many_response),
+    .source_shard = peer,
+    .item_count = 2,
+    .request_id = logical_id,
+    .status = static_cast<std::uint32_t>(protocol::InsertStatus::ok),
+  };
+  assert(outbox.finish_direct_response(peer, response) ==
+         detail::Stage2HomeRpcDirectResponseResult::finished);
+  assert(outbox.promote_expired(200) == 0);
+  assert(outbox.size() == 0 && outbox.aggregate_size() == 0);
+}
+
+void test_singleton_direct_send_failure_and_cancel() {
+  detail::Stage2HomeRpcOutbox outbox(
+    8, 4, 5, 32, 256, 256, 1u << 20);
+  auto failed_send_request = expand_request(1, 18000, 161);
+  constexpr std::uint64_t failed_send_id = 73;
+  constexpr std::uint32_t peer = 2;
+  assert(outbox.try_enqueue(dispatch(
+           failed_send_id, peer,
+           protocol::PeerRpcType::stage2_expand_score_request,
+           1, failed_send_request)) ==
+         detail::Stage2HomeRpcEnqueueResult::enqueued);
+  const auto direct = outbox.form_singleton_direct(
+    peer, protocol::PeerRpcType::stage2_expand_score_request, 0);
+  assert(direct.has_value() && direct->direct);
+  std::vector<byte_t> first_wire(direct->request_bytes);
+  std::size_t first_bytes = 0;
+  const auto failed_post = outbox.claim_ready_for_post(
+    failed_send_id, first_wire, first_bytes);
+  assert(failed_post.has_value());
+  assert(outbox.release_post_claim(*failed_post));
+  const auto retry_id = outbox.next_retry_wire_request(
+    peer, protocol::PeerRpcType::stage2_expand_score_request);
+  assert(retry_id.has_value() && *retry_id == failed_send_id);
+  std::vector<byte_t> retry_wire(direct->request_bytes);
+  std::size_t retry_bytes = 0;
+  const auto retry_post = outbox.claim_ready_for_post(
+    failed_send_id, retry_wire, retry_bytes);
+  assert(retry_post.has_value() && retry_bytes == first_bytes &&
+         retry_wire == first_wire);
+  std::vector<byte_t> response(
+    protocol::stage2_expand_score_response_bytes(1, 0), byte_t{0});
+  auto* response_header = reinterpret_cast<protocol::PeerRpcHeader*>(
+    response.data());
+  *response_header = {
+    .magic = protocol::kPeerRpcMagic,
+    .version = protocol::kPeerRpcVersion,
+    .type = static_cast<std::uint32_t>(
+      protocol::PeerRpcType::stage2_expand_score_response),
+    .source_shard = peer,
+    .item_count = 1,
+    .request_id = failed_send_id,
+    .status = static_cast<std::uint32_t>(protocol::InsertStatus::ok),
+  };
+  assert(outbox.finish_direct_response(peer, response) ==
+         detail::Stage2HomeRpcDirectResponseResult::finished);
+
+  auto cancelled_request = expand_request(1, 19000, 171);
+  constexpr std::uint64_t cancelled_id = 74;
+  assert(outbox.try_enqueue(dispatch(
+           cancelled_id, peer,
+           protocol::PeerRpcType::stage2_expand_score_request,
+           1, cancelled_request)) ==
+         detail::Stage2HomeRpcEnqueueResult::enqueued);
+  const auto cancelled_direct = outbox.form_singleton_direct(
+    peer, protocol::PeerRpcType::stage2_expand_score_request, 0);
+  assert(cancelled_direct.has_value() && cancelled_direct->direct);
+  std::vector<byte_t> cancelled_wire(cancelled_direct->request_bytes);
+  std::size_t cancelled_bytes = 0;
+  const auto cancelled_post = outbox.claim_ready_for_post(
+    cancelled_id, cancelled_wire, cancelled_bytes);
+  assert(cancelled_post.has_value());
+  assert(outbox.mark_awaiting_response(*cancelled_post, 300));
+  assert(outbox.cancel_logical(cancelled_id));
+  response_header->request_id = cancelled_id;
+  assert(outbox.finish_direct_response(peer, response) ==
+         detail::Stage2HomeRpcDirectResponseResult::not_direct);
+  assert(outbox.promote_expired(300) == 0);
+  assert(outbox.size() == 0 && outbox.aggregate_size() == 0);
+}
+
+void test_singleton_direct_and_multi_logical_aggregate_coexist() {
+  detail::Stage2HomeRpcOutbox outbox(
+    12, 6, 5, 32, 256, 256, 1u << 20);
+  auto first = expand_request(1, 20000, 181);
+  auto second = expand_request(1, 21000, 191);
+  auto singleton = expand_request(1, 22000, 201);
+  assert(outbox.try_enqueue(dispatch(
+           81, 3, protocol::PeerRpcType::stage2_expand_score_request,
+           1, first)) == detail::Stage2HomeRpcEnqueueResult::enqueued);
+  assert(outbox.try_enqueue(dispatch(
+           82, 3, protocol::PeerRpcType::stage2_expand_score_request,
+           1, second)) == detail::Stage2HomeRpcEnqueueResult::enqueued);
+  assert(outbox.try_enqueue(dispatch(
+           83, 4, protocol::PeerRpcType::stage2_expand_score_request,
+           1, singleton)) == detail::Stage2HomeRpcEnqueueResult::enqueued);
+
+  // A two-entry prefix can never be accidentally claimed as direct while a
+  // direct request in another peer/class remains independently live.
+  assert(!outbox.form_singleton_direct(
+    3, protocol::PeerRpcType::stage2_expand_score_request, 0).has_value());
+  std::optional<detail::Stage2HomeRpcAggregate> aggregate;
+  std::optional<detail::Stage2HomeRpcAggregate> direct;
+  std::thread aggregate_former([&] {
+    aggregate = outbox.form_aggregate(
+      3, protocol::PeerRpcType::stage2_expand_score_request, 9081, 0);
+  });
+  std::thread direct_former([&] {
+    direct = outbox.form_singleton_direct(
+      4, protocol::PeerRpcType::stage2_expand_score_request, 0);
+  });
+  aggregate_former.join();
+  direct_former.join();
+  assert(aggregate.has_value() && !aggregate->direct &&
+         aggregate->logical_count == 2);
+  assert(direct.has_value() && direct->direct &&
+         direct->wire_request_id == 83);
+  assert(outbox.owns_wire_request(9081));
+  assert(outbox.owns_wire_request(83));
+  assert(!outbox.is_direct_wire_request(9081));
+  assert(outbox.is_direct_wire_request(83));
+  assert(outbox.discard_aggregate(9081));
+  assert(outbox.discard_aggregate(83));
+  assert(outbox.size() == 0 && outbox.aggregate_size() == 0);
+}
+
+void test_singleton_direct_validation_and_semantic_rearm() {
+  detail::Stage2HomeRpcOutbox outbox(
+    8, 4, 5, 32, 256, 256, 1u << 20);
+  memory_node_detail::PeerAsyncResponseRegistry registry(4);
+  constexpr std::uint64_t logical_id = 84;
+  constexpr std::uint32_t peer = 3;
+  auto request = expand_request(1, 23000, 211);
+  assert(registry.register_request(
+           logical_id, peer,
+           protocol::PeerRpcType::stage2_expand_score_response, 1) ==
+         memory_node_detail::PeerResponseRegistration::registered);
+  assert(outbox.try_enqueue(dispatch(
+           logical_id, peer,
+           protocol::PeerRpcType::stage2_expand_score_request,
+           1, request)) == detail::Stage2HomeRpcEnqueueResult::enqueued);
+  const auto first_direct = outbox.form_singleton_direct(
+    peer, protocol::PeerRpcType::stage2_expand_score_request, 0);
+  assert(first_direct.has_value() && first_direct->direct);
+  std::vector<byte_t> first_wire(first_direct->request_bytes);
+  std::size_t first_bytes = 0;
+  const auto first_post = outbox.claim_ready_for_post(
+    logical_id, first_wire, first_bytes);
+  assert(first_post.has_value());
+  assert(outbox.mark_awaiting_response(*first_post, 100));
+
+  std::vector<byte_t> response(
+    protocol::stage2_expand_score_response_bytes(1, 0), byte_t{0});
+  auto* header = reinterpret_cast<protocol::PeerRpcHeader*>(response.data());
+  *header = {
+    .magic = protocol::kPeerRpcMagic,
+    .version = protocol::kPeerRpcVersion,
+    .type = static_cast<std::uint32_t>(
+      protocol::PeerRpcType::stage2_expand_score_response),
+    .source_shard = peer,
+    .item_count = 1,
+    .request_id = logical_id,
+    .status = static_cast<std::uint32_t>(protocol::InsertStatus::ok),
+  };
+  auto* result = protocol::stage2_expand_score_results(response.data());
+  *result = {
+    // Structurally valid to the CQ/outbox, but deliberately invalid to the
+    // logical consumer. This must be rearmable after direct retirement.
+    .pointer_raw = 23001,
+    .generation = 100,
+    .search_index = 10,
+    .disposition = static_cast<std::uint32_t>(
+      protocol::Stage2HomeDisposition::stable),
+  };
+
+  assert(outbox.finish_direct_response(peer + 1, response) ==
+         detail::Stage2HomeRpcDirectResponseResult::invalid);
+  header->source_shard = peer + 1;
+  assert(outbox.finish_direct_response(peer, response) ==
+         detail::Stage2HomeRpcDirectResponseResult::invalid);
+  header->source_shard = peer;
+  header->status = static_cast<std::uint32_t>(
+    protocol::InsertStatus::overloaded);
+  assert(outbox.finish_direct_response(peer, response) ==
+         detail::Stage2HomeRpcDirectResponseResult::invalid);
+  header->status = static_cast<std::uint32_t>(protocol::InsertStatus::ok);
+  assert(outbox.finish_direct_response(
+           peer, std::span<const byte_t>{response.data(),
+                                         response.size() - 1}) ==
+         detail::Stage2HomeRpcDirectResponseResult::invalid);
+  assert(outbox.owns_wire_request(logical_id));
+  assert(outbox.size() == 1 && outbox.aggregate_size() == 1);
+
+  // Retirement precedes registry publication. Therefore a consumer that
+  // rejects the semantic payload can rearm/register/enqueue the same logical
+  // ID without observing the retired request as a duplicate.
+  assert(outbox.finish_direct_response(peer, response) ==
+         detail::Stage2HomeRpcDirectResponseResult::finished);
+  assert(outbox.finish_direct_response(peer, response) ==
+         detail::Stage2HomeRpcDirectResponseResult::not_direct);
+  assert(registry.try_deliver(peer, 18, response.size(), *header));
+  memory_node_detail::PeerResponseDescriptor descriptor;
+  memory_node_detail::PeerResponseLease response_lease;
+  assert(registry.try_take(
+           logical_id, peer,
+           protocol::PeerRpcType::stage2_expand_score_response, 1,
+           descriptor, response_lease) ==
+         memory_node_detail::TryPeerResponse::success);
+  assert(result->pointer_raw !=
+         protocol::stage2_expand_score_items(request.data())[0].pointer_raw);
+  assert(registry.mark_receive_reposted(response_lease));
+  assert(registry.retry(response_lease));
+  assert(registry.register_send_attempt(
+           logical_id, peer,
+           protocol::PeerRpcType::stage2_expand_score_response, 1) ==
+         memory_node_detail::PeerResponseRegistration::retry);
+  assert(outbox.try_enqueue(dispatch(
+           logical_id, peer,
+           protocol::PeerRpcType::stage2_expand_score_request,
+           1, request)) == detail::Stage2HomeRpcEnqueueResult::enqueued);
+
+  const auto second_direct = outbox.form_singleton_direct(
+    peer, protocol::PeerRpcType::stage2_expand_score_request, 0);
+  assert(second_direct.has_value() && second_direct->direct);
+  std::vector<byte_t> second_wire(second_direct->request_bytes);
+  std::size_t second_bytes = 0;
+  const auto second_post = outbox.claim_ready_for_post(
+    logical_id, second_wire, second_bytes);
+  assert(second_post.has_value());
+  assert(outbox.mark_awaiting_response(*second_post, 200));
+  result->pointer_raw = 23000;
+  assert(outbox.finish_direct_response(peer, response) ==
+         detail::Stage2HomeRpcDirectResponseResult::finished);
+  assert(registry.try_deliver(peer, 19, response.size(), *header));
+  assert(registry.try_take(
+           logical_id, peer,
+           protocol::PeerRpcType::stage2_expand_score_response, 1,
+           descriptor, response_lease) ==
+         memory_node_detail::TryPeerResponse::success);
+  assert(!descriptor.owned_payload && descriptor.receive_slot == 19);
+  assert(registry.mark_receive_reposted(response_lease));
+  assert(registry.ack_consumed(response_lease));
+  assert(outbox.size() == 0 && outbox.aggregate_size() == 0);
+}
+
+void test_singleton_direct_response_cancel_race() {
+  detail::Stage2HomeRpcOutbox outbox(
+    8, 4, 5, 32, 256, 256, 1u << 20);
+  constexpr std::uint32_t peer = 2;
+  for (std::uint64_t iteration = 0; iteration < 64; ++iteration) {
+    const std::uint64_t logical_id = 1000 + iteration;
+    auto request = expand_request(1, 24000 + iteration, 221);
+    assert(outbox.try_enqueue(dispatch(
+             logical_id, peer,
+             protocol::PeerRpcType::stage2_expand_score_request,
+             1, request)) == detail::Stage2HomeRpcEnqueueResult::enqueued);
+    const auto direct = outbox.form_singleton_direct(
+      peer, protocol::PeerRpcType::stage2_expand_score_request, 0);
+    assert(direct.has_value() && direct->direct);
+    std::vector<byte_t> wire(direct->request_bytes);
+    std::size_t request_bytes = 0;
+    const auto post = outbox.claim_ready_for_post(
+      logical_id, wire, request_bytes);
+    assert(post.has_value());
+    assert(outbox.mark_awaiting_response(*post, iteration + 1));
+
+    std::vector<byte_t> response(
+      protocol::stage2_expand_score_response_bytes(1, 0), byte_t{0});
+    auto* header = reinterpret_cast<protocol::PeerRpcHeader*>(
+      response.data());
+    *header = {
+      .magic = protocol::kPeerRpcMagic,
+      .version = protocol::kPeerRpcVersion,
+      .type = static_cast<std::uint32_t>(
+        protocol::PeerRpcType::stage2_expand_score_response),
+      .source_shard = peer,
+      .item_count = 1,
+      .request_id = logical_id,
+      .status = static_cast<std::uint32_t>(protocol::InsertStatus::ok),
+    };
+    auto* result = protocol::stage2_expand_score_results(response.data());
+    *result = {
+      .pointer_raw = 24000 + iteration,
+      .generation = 100,
+      .search_index = 10,
+      .disposition = static_cast<std::uint32_t>(
+        protocol::Stage2HomeDisposition::stable),
+    };
+
+    std::atomic<bool> start{false};
+    detail::Stage2HomeRpcDirectResponseResult response_result =
+      detail::Stage2HomeRpcDirectResponseResult::invalid;
+    bool cancelled = false;
+    std::thread response_thread([&] {
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      response_result = outbox.finish_direct_response(peer, response);
+    });
+    std::thread cancel_thread([&] {
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      cancelled = outbox.cancel_logical(logical_id);
+    });
+    start.store(true, std::memory_order_release);
+    response_thread.join();
+    cancel_thread.join();
+    assert((response_result ==
+              detail::Stage2HomeRpcDirectResponseResult::finished &&
+            !cancelled) ||
+           (response_result ==
+              detail::Stage2HomeRpcDirectResponseResult::not_direct &&
+            cancelled));
+    assert(outbox.size() == 0 && outbox.aggregate_size() == 0);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -510,5 +948,11 @@ int main() {
   test_score_many_query_rebase_and_exact_demux();
   test_partition_bounds_retry_and_cancellation();
   test_leased_partial_cancel_retries_only_live_members();
+  test_singleton_direct_fast_success_uses_borrowed_registry_slot();
+  test_singleton_direct_timeout_retries_exact_wire_image();
+  test_singleton_direct_send_failure_and_cancel();
+  test_singleton_direct_and_multi_logical_aggregate_coexist();
+  test_singleton_direct_validation_and_semantic_rearm();
+  test_singleton_direct_response_cancel_race();
   return 0;
 }

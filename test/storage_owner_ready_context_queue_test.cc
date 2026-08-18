@@ -61,6 +61,50 @@ void test_concurrent_notifications_do_not_lose_edges() {
   assert(!queue.try_pop(event));
 }
 
+void test_concurrent_publish_consume_never_loses_a_ready_generation() {
+  constexpr std::uint32_t kSlots = 16;
+  constexpr std::uint32_t kRounds = 50'000;
+  detail::Stage2ReadyContextQueue queue(23, 5, kSlots);
+  std::vector<detail::Stage2ContextOwnerKey> owners;
+  owners.reserve(kSlots);
+  for (std::uint32_t slot = 0; slot < kSlots; ++slot) {
+    owners.push_back(queue.activate(slot));
+  }
+
+  std::atomic<std::uint32_t> published{0};
+  std::atomic<std::uint32_t> consumed{0};
+  std::thread producer([&] {
+    for (std::uint32_t round = 1; round <= kRounds; ++round) {
+      while (consumed.load(std::memory_order_acquire) + 1 != round) {
+        std::this_thread::yield();
+      }
+      const auto& owner = owners[round % kSlots];
+      assert(queue.notify(
+        owner, detail::Stage2ContextReadyReason::rpc_response));
+      assert(queue.notify(
+        owner, detail::Stage2ContextReadyReason::rdma_completion));
+      published.store(round, std::memory_order_release);
+    }
+  });
+
+  for (std::uint32_t round = 1; round <= kRounds; ++round) {
+    while (published.load(std::memory_order_acquire) != round) {
+      std::this_thread::yield();
+    }
+    detail::Stage2ReadyContextEvent event;
+    while (!queue.try_pop(event)) std::this_thread::yield();
+    assert(event.owner == owners[round % kSlots]);
+    assert((event.reasons & detail::stage2_ready_reason_bits(
+              detail::Stage2ContextReadyReason::rpc_response)) != 0);
+    assert((event.reasons & detail::stage2_ready_reason_bits(
+              detail::Stage2ContextReadyReason::rdma_completion)) != 0);
+    consumed.store(round, std::memory_order_release);
+  }
+  producer.join();
+
+  for (const auto& owner : owners) assert(queue.deactivate(owner));
+}
+
 void test_activation_rejects_live_slot_and_geometry_before_allocation() {
   detail::Stage2ReadyContextQueue queue(33, 0, 1);
   const auto owner = queue.activate(0);
@@ -118,6 +162,7 @@ void test_stale_ticket_pressure_recovers_current_generation() {
 int main() {
   test_coalesces_reasons_and_fences_generation();
   test_concurrent_notifications_do_not_lose_edges();
+  test_concurrent_publish_consume_never_loses_a_ready_generation();
   test_activation_rejects_live_slot_and_geometry_before_allocation();
   test_stale_ticket_pressure_recovers_current_generation();
   return 0;

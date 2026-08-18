@@ -16,6 +16,12 @@ namespace memory_node_storage_owner_index_detail {
 // retirement without making that cost grow with R.
 inline constexpr u32 kStage1ReachabilityBridgeGoal = 2;
 
+enum class Stage1BridgeInstallDisposition : u8 {
+  rejected,
+  busy,
+  installed,
+};
+
 // Dynamic records are allocated at a fixed stride.  Dividing the tagged
 // pointer's byte offset by that stride therefore advances by one for adjacent
 // allocations, even when the dynamic arena itself is not stride-aligned.
@@ -67,6 +73,35 @@ vec<RemotePtr> select_stage1_reachability_bridges(
     if (accepted.size() == kStage1ReachabilityBridgeGoal) break;
   }
   return accepted;
+}
+
+// Retry a complete candidate sweep only when at least one target still has a
+// live but busy identity. Permanent rejection cannot improve by spinning, and
+// one installed bridge is already a valid bounded reachability certificate.
+// wait_for_retry() is the caller's shutdown/backoff boundary and returns false
+// when no further sweep should be attempted.
+template <class TryInstall, class WaitForRetry>
+vec<RemotePtr> select_stage1_reachability_bridges_retry_busy(
+    const RemotePtr candidate,
+    const span<const RemotePtr> targets,
+    const size_t dynamic_record_bytes,
+    TryInstall&& try_install,
+    WaitForRetry&& wait_for_retry) {
+  for (;;) {
+    bool saw_busy = false;
+    vec<RemotePtr> accepted = select_stage1_reachability_bridges(
+      candidate, targets, dynamic_record_bytes,
+      [&](const RemotePtr target) {
+        const Stage1BridgeInstallDisposition disposition =
+          try_install(target);
+        saw_busy = saw_busy ||
+          disposition == Stage1BridgeInstallDisposition::busy;
+        return disposition == Stage1BridgeInstallDisposition::installed;
+      });
+    if (!accepted.empty() || !saw_busy || !wait_for_retry()) {
+      return accepted;
+    }
+  }
 }
 
 }  // namespace memory_node_storage_owner_index_detail
