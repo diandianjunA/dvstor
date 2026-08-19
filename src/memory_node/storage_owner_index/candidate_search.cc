@@ -38,7 +38,8 @@ vec<RemotePtr> MemoryNode::partition_local_search_candidates(
     InsertBreakdownCounters* breakdown,
     const byte_t* integral_raw_query,
     vec<BeamEntry>* stage1_beam,
-    vec<RemotePtr>* remote_frontier) {
+    vec<RemotePtr>* remote_frontier,
+    bool record_pipeline_telemetry) {
   StorageOwnerCoroutineScratch* scratch = current_storage_owner_thread_ != nullptr
                                             ? &current_storage_owner_thread_->coroutine_scratch_state()
                                             : nullptr;
@@ -249,7 +250,7 @@ vec<RemotePtr> MemoryNode::partition_local_search_candidates(
     partition_local_construction_search_into(
       reusable_search, span<const RemotePtr>{entry_points}, storage_id_,
       construction_width, search_budget, score, expand);
-  if (reusable_search.budget_exhausted()) {
+  if (record_pipeline_telemetry && reusable_search.budget_exhausted()) {
     storage_owner_stage1_search_budget_exhausted_.fetch_add(
       1, std::memory_order_relaxed);
   }
@@ -312,7 +313,8 @@ vec<RemotePtr> MemoryNode::partition_local_search_candidates(
 const vec<RemotePtr>& MemoryNode::continue_stage2_search_candidates(
     const StorageOwnerMaintenanceTask& task,
     const NodeSnapshot& target,
-    const Configuration& config) {
+    const Configuration& config,
+    bool record_stage2_telemetry) {
   lib_assert(!task.stage1_beam.empty(),
              "stage2 continuation requires the exact Stage1 beam");
   lib_assert(target.vector_data.size() >= VamanaNode::vector_bytes(),
@@ -369,8 +371,10 @@ const vec<RemotePtr>& MemoryNode::continue_stage2_search_candidates(
   const auto score_batch = [&](span<const RemotePtr> pointers, auto&& emit) {
     // Count requested records rather than only live emissions: this is the
     // actual remote snapshot traffic Stage2 paid for under churn.
-    storage_owner_stage2_scored_candidates_.fetch_add(
-      pointers.size(), std::memory_order_relaxed);
+    if (record_stage2_telemetry) {
+      storage_owner_stage2_scored_candidates_.fetch_add(
+        pointers.size(), std::memory_order_relaxed);
+    }
     const vec<BeamEntry>& scores = score_stable_node_vectors_batched(
       pointers, target.vector_data.data(), span<const element_t>{query},
       config);
@@ -387,17 +391,21 @@ const vec<RemotePtr>& MemoryNode::continue_stage2_search_candidates(
       return;
     }
     for (const RemotePtr neighbor : adjacency.stable) visit(neighbor);
-    for (const RemotePtr neighbor : adjacency.provisional) visit(neighbor);
+    if (!config.synchronous_exact_updates_enabled()) {
+      for (const RemotePtr neighbor : adjacency.provisional) visit(neighbor);
+    }
   };
 
   bool budget_exhausted = false;
   u64 remote_expansions = 0;
   const u32 construction_width =
     storage_owner_construction_width(config);
-  storage_owner_stage2_continuations_.fetch_add(
-    1, std::memory_order_relaxed);
-  storage_owner_stage2_remote_frontier_items_.fetch_add(
-    task.stage1_remote_frontier.size(), std::memory_order_relaxed);
+  if (record_stage2_telemetry) {
+    storage_owner_stage2_continuations_.fetch_add(
+      1, std::memory_order_relaxed);
+    storage_owner_stage2_remote_frontier_items_.fetch_add(
+      task.stage1_remote_frontier.size(), std::memory_order_relaxed);
+  }
   const vec<PartitionLocalSearchEntry>& final_beam =
     continue_partition_construction_search_into(
       span<const PartitionLocalSearchEntry>{local_beam},
@@ -406,9 +414,11 @@ const vec<RemotePtr>& MemoryNode::continue_stage2_search_candidates(
       stage2_partition_search_budget(
         construction_width, VamanaNode::graph_entry_capacity()),
       score_batch, expand, &budget_exhausted, &remote_expansions);
-  storage_owner_stage2_remote_expansions_.fetch_add(
-    remote_expansions, std::memory_order_relaxed);
-  if (budget_exhausted) {
+  if (record_stage2_telemetry) {
+    storage_owner_stage2_remote_expansions_.fetch_add(
+      remote_expansions, std::memory_order_relaxed);
+  }
+  if (record_stage2_telemetry && budget_exhausted) {
     storage_owner_stage2_search_budget_exhausted_.fetch_add(
       1, std::memory_order_relaxed);
   }

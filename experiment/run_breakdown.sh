@@ -467,6 +467,8 @@ write_service_config "$RUNTIME_CONFIG"
 
 cmd=("$BUILD_DIR/dvstor_breakdown_benchmark"
   --service-config "$RUNTIME_CONFIG"
+  --profile-name "$PROFILE"
+  --system-variant-label "$SYSTEM_VARIANT_LABEL"
   --workload "$WORKLOAD"
   --warmup-ops "$WARMUP_OPS"
   --measure-ops "$MEASURE_OPS"

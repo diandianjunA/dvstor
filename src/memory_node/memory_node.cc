@@ -22,6 +22,8 @@ MemoryNode::MemoryNode(Configuration& config)
                                                       : static_cast<u32>(config.storage_peers.size())),
       vector_id_namespace_size_(config.vector_id_namespace_size),
       storage_owner_peer_rdma_tokens_(std::max<u32>(1, config.storage_owner_peer_rdma_tokens)),
+      dynamic_graph_extent_publication_enabled_(
+        config.adaptive_dynamic_graph_access_enabled()),
       index_region_(context_),
       peer_rdma_read_outstanding_(num_storage_nodes_),
       mn_memory_bytes_(static_cast<u64>(config.mn_memory_gb) * 1073741824ul) {
@@ -224,7 +226,7 @@ MemoryNode::MemoryNode(Configuration& config)
   // notify compute nodes that we are ready
   cm_.synchronize();
 
-  wait_for_start_signal();
+  wait_for_start_signal(config);
   setup_storage_peers(config);
   setup_insert_runtime(config);
   storage_worker_config_ = std::make_unique<Configuration>(config);
@@ -845,20 +847,39 @@ void MemoryNode::allocate_memory() {
   t_allocate->stop();
 }
 
-void MemoryNode::wait_for_start_signal() {
+void MemoryNode::wait_for_start_signal(const Configuration& config) {
   print_status("waiting for compute-node startup barrier");
   storage_startup::Request request{};
   LocalMemoryRegion region{context_, &request, sizeof(request)};
   cm_.initiator_qp->post_receive(region);
   context_.receive();
-  const storage_startup::Response response{
-    .ready = request.magic == storage_startup::kMagic,
-    .vector_id_namespace_size = vector_id_namespace_size_,
-  };
+  const u32 local_feature_modes = storage_startup::encode_feature_modes(
+    config.storage_owner_update_completion_mode,
+    config.dynamic_graph_access_mode,
+    config.gpu_rdma_search_progression_mode);
+  const storage_startup::Response response =
+    storage_startup::evaluate_request(
+      request, local_feature_modes,
+      gpu_search::format::kMetadataSchemaVersion, storage_id_,
+      num_storage_nodes_, vector_id_namespace_size_,
+      gpu_index_build_fingerprint_, gpu_shard_build_fingerprint_);
   cm_.initiator_qp->post_send_inlined(
     &response, sizeof(response), IBV_WR_SEND);
   context_.poll_send_cq_until_completion();
-  lib_assert(response.ready, "invalid compute-node startup request");
+  lib_assert(response.ready != 0,
+             "compute/storage startup contract mismatch: flags=" +
+               std::to_string(response.mismatch_flags) +
+               " compute_modes=" +
+               std::to_string(request.feature_modes) +
+               " storage_modes=" +
+               std::to_string(response.feature_modes) +
+               " compute_schema=" +
+               std::to_string(request.schema_version) +
+               " storage_schema=" +
+               std::to_string(response.schema_version) +
+               " compute_shard=" +
+               std::to_string(request.expected_shard) +
+               " storage_shard=" + std::to_string(response.shard));
 }
 
 std::pair<bool, str> MemoryNode::load_index_file(const str& path) {

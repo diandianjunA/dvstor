@@ -1210,6 +1210,20 @@ void test_ordinary_rejection_cannot_substitute_for_promotion_ack() {
     parent, RemotePtr{}, final_candidate);
   assert(!memory_node_storage_owner_index_detail::
             reconcile_reverse_postcondition_holds(promotion, result));
+
+  // The synchronous-exact path has no provisional Stage1 edge to promote.
+  // Its old=0 mandatory operation must still install one bounded stable
+  // incoming edge even when the same full target rejects an ordinary add.
+  stable = {stable_neighbor};
+  const auto mandatory_result =
+    memory_node_storage_owner_index_detail::reconcile_reverse_adjacency(
+      promotion, true, true, true, false, 1, 2,
+      stable, provisional, reject_new);
+  assert(mandatory_result.accepted && !mandatory_result.stale);
+  assert((stable == vec<RemotePtr>{final_candidate}));
+  assert(memory_node_storage_owner_index_detail::
+           reconcile_reverse_postcondition_holds(
+             promotion, mandatory_result));
 }
 
 void test_final_target_audit_rejects_evicted_mandatory_certificate() {

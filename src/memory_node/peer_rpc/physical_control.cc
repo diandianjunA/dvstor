@@ -1,5 +1,6 @@
 #include "memory_node/peer_rpc/detail.hh"
 
+#include "memory_node/storage_owner_runtime/exact_update_contract.hh"
 #include "vamana/storage_layout_resolver.hh"
 
 namespace protocol = service::storage_owner;
@@ -478,7 +479,8 @@ bool MemoryNode::apply_local_dynamic_node_control_items(
     const Configuration& config) {
   results.assign(items.size(), {});
   if (source_shard >= num_storage_nodes_ || items.empty()) return false;
-  (void)config;
+  const bool synchronous_exact =
+    config.synchronous_exact_updates_enabled();
 
   bool structurally_valid = true;
   enum class IdentityObservation : u8 {
@@ -565,7 +567,10 @@ bool MemoryNode::apply_local_dynamic_node_control_items(
       item.action);
     const RemotePtr node{item.node_raw};
     const RemotePtr allocated{item.allocated_raw};
-    if (!authority::valid_authority_operation(item.token) ||
+    if ((synchronous_exact &&
+         !memory_node_storage_owner_runtime_detail::
+           exact_dynamic_control_action_allowed(action)) ||
+        !authority::valid_authority_operation(item.token) ||
         item.generation == 0 ||
         item.authority_shard >= num_storage_nodes_ || node.is_null() ||
         !node.is_well_formed() ||
@@ -706,7 +711,8 @@ bool MemoryNode::apply_local_dynamic_node_control_items(
         node.byte_offset() < gpu_dynamic_node_base_ ||
         !authority::local_storage_pointer_addressable(
           node, storage_id_, num_storage_nodes_, mn_memory_bytes_) ||
-        storage_owner_maintenance_completion_ring_ == nullptr) {
+        (!synchronous_exact &&
+         storage_owner_maintenance_completion_ring_ == nullptr)) {
       structurally_valid = false;
       continue;
     }
@@ -746,14 +752,22 @@ bool MemoryNode::apply_local_dynamic_node_control_items(
       continue;
     }
 
-    const u64 sequence = begin_storage_owner_maintenance_sequence(1);
     if (!snapshot.deleted) {
       (void)mark_node_deleted(node, item.generation);
     }
-    retire_local_dynamic_node(node, sequence);
-    complete_storage_owner_maintenance_sequence(sequence);
     output.node_raw = node.raw_address;
-    output.maintenance_sequence = sequence;
+    if (synchronous_exact) {
+      // The authority invokes retire only after it has synchronously removed
+      // membership and every reverse edge. Incarnation-tagged reuse is safe
+      // immediately and must not manufacture public Stage2 debt.
+      retire_local_dynamic_node_ready(node);
+      output.maintenance_sequence = 0;
+    } else {
+      const u64 sequence = begin_storage_owner_maintenance_sequence(1);
+      retire_local_dynamic_node(node, sequence);
+      complete_storage_owner_maintenance_sequence(sequence);
+      output.maintenance_sequence = sequence;
+    }
     output.status = static_cast<u32>(
       protocol::DynamicNodeControlStatus::ok);
   }

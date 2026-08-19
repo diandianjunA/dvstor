@@ -127,6 +127,10 @@ Args parse_args(int argc, char** argv) {
 
     if (flag == "--service-config") {
       args.service_config_path = require_value("--service-config");
+    } else if (flag == "--profile-name") {
+      args.profile_name = require_value("--profile-name");
+    } else if (flag == "--system-variant-label") {
+      args.system_variant_label = require_value("--system-variant-label");
     } else if (flag == "--workload") {
       args.workload = require_value("--workload");
     } else if (flag == "--warmup-ops") {
@@ -207,6 +211,10 @@ Args parse_args(int argc, char** argv) {
   }
   if (args.report_json_path.empty()) {
     throw std::runtime_error("--report-json is required");
+  }
+  if (args.profile_name.empty() || args.system_variant_label.empty()) {
+    throw std::runtime_error(
+      "--profile-name and --system-variant-label must be non-empty");
   }
   if (args.workload != "query" && args.workload != "insert" && args.workload != "both" &&
       args.workload != "mixed") {

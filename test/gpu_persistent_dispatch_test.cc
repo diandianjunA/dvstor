@@ -156,7 +156,8 @@ int main(int argc, char** argv) {
     cudaStream_t stream = nullptr;
     check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
                "cudaStreamCreateWithFlags");
-    gpu_search::launch_persistent_search(stream, params, blocks, threads);
+    gpu_search::launch_persistent_search(
+      stream, params, blocks, threads, false);
     check_cuda(cudaPeekAtLastError(), "launch_persistent_search");
 
     const int timeout_seconds = argc > 2

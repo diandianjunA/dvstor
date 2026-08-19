@@ -150,6 +150,7 @@ set(DVSTOR_MEMORY_NODE_SOURCES
     src/memory_node/storage_owner_maintenance/runtime.cc
     src/memory_node/storage_owner_maintenance/worker.cc
     src/memory_node/storage_owner_runtime/batch_execution.cc
+    src/memory_node/storage_owner_runtime/exact_execution.cc
     src/memory_node/storage_owner_runtime/lifecycle.cc
     src/memory_node/storage_owner_runtime/wire_protocol.cc
     src/memory_node/storage_owner_runtime/workers.cc
@@ -265,9 +266,11 @@ else ()
         set(CMAKE_CUDA_ARCHITECTURES 80 CACHE STRING "CUDA architectures" FORCE)
     endif ()
 
-    # GPU-centric query engine kernels. Keep this list explicit so retired
-    # CPU-driven CUDA paths cannot silently re-enter the runtime.
+    # Query distance kernels. The persistent backend owns RDMA from its
+    # long-lived kernel; the coupled baseline launches only bounded ordinary
+    # scoring kernels from its host-orchestrated RDMA lanes.
     set(DVSTOR_GPU_SOURCES
+        src/gpu_search/host_distance_kernel.cu
         src/gpu_search/persistent_kernel.cu
     )
     if (DVSTOR_HAVE_GPUNETIO)
@@ -296,13 +299,17 @@ else ()
         )
     endif ()
 
-    # Compute-node runtime. This is intentionally explicit: the dev branch has
-    # one query engine, with CPU threads limited to admission and update RPCs.
+    # Compute-node runtime. Both query backends consume the same schema-v16
+    # index and storage control plane; the contribution-level progression mode
+    # selects which execution owner is constructed.
     set(DVSTOR_RUNTIME_SOURCES
         src/common/core_assignment.cc
         src/common/timing.cc
         src/gpu_search/navigation_bootstrapper.cc
         src/gpu_search/index_format.cc
+        src/gpu_search/host_orchestrated_engine.cc
+        src/gpu_search/host_orchestrated_engine/control.cc
+        src/gpu_search/host_orchestrated_engine/query.cc
         src/gpu_search/persistent_engine.cc
         src/gpu_search/persistent_engine/completion.cc
         src/gpu_search/persistent_engine/construction.cc

@@ -36,6 +36,7 @@
 #include "memory_node/peer_rpc/async_response.hh"
 #include "memory_node/startup_protocol.hh"
 #include "memory_node/storage_reclaim.hh"
+#include "memory_node/storage_owner_cpu_plan.hh"
 #include "memory_node/storage_owner_index/dynamic_allocation_receipt_policy.hh"
 #include "memory_node/storage_owner_index/incarnation_lock.hh"
 #include "memory_node/storage_owner_maintenance/home_rpc_outbox.hh"
@@ -499,7 +500,7 @@ private:
   void retire_storage_owner_search_lane_grants(u32 worker_id);
   void release_storage_owner_search_lane_lease();
   void allocate_memory();
-  void wait_for_start_signal();
+  void wait_for_start_signal(const Configuration& config);
   std::pair<bool, str> load_index_file(const str& path);
 
   // Peer RDMA transport
@@ -893,10 +894,24 @@ private:
                                          vec<service::storage_owner::MutationResult>* results = nullptr,
                                          const std::function<void(size_t)>&
                                            on_terminal = {});
+  bool execute_storage_owner_batch_items_exact(
+      const node_t* ids,
+      const service::storage_owner::MutationKind* kinds,
+      const byte_t* raw_vectors,
+      const u64* operation_ids,
+      u32 source_client,
+      size_t item_count,
+      InsertBreakdownCounters& breakdown,
+      const Configuration& config,
+      vec<vec<u64>>* invalidated_neighbors = nullptr,
+      vec<u32>* statuses = nullptr,
+      vec<service::storage_owner::MutationResult>* results = nullptr,
+      const std::function<void(size_t)>& on_terminal = {});
 
   // Storage-owner index operations
   RemotePtr allocate_local_node();
   void retire_local_dynamic_node(RemotePtr pointer, u64 maintenance_sequence);
+  void retire_local_dynamic_node_ready(RemotePtr pointer);
   bool load_owner_idmap(const filepath_t& index_prefix);
   bool mark_node_deleted(RemotePtr rptr, u32 generation);
   AuthorityBeginResult begin_authority_mutation(
@@ -1034,13 +1049,15 @@ private:
       InsertBreakdownCounters* breakdown = nullptr,
       const byte_t* integral_raw_query = nullptr,
       vec<BeamEntry>* stage1_beam = nullptr,
-      vec<RemotePtr>* remote_frontier = nullptr);
+      vec<RemotePtr>* remote_frontier = nullptr,
+      bool record_pipeline_telemetry = true);
   // The returned worker-local buffer is valid until the next Stage2 search
   // on the same OS thread. Callers must consume it synchronously.
   const vec<RemotePtr>& continue_stage2_search_candidates(
       const StorageOwnerMaintenanceTask& task,
       const NodeSnapshot& target,
-      const Configuration& config);
+      const Configuration& config,
+      bool record_stage2_telemetry = true);
   void continue_stage2_search_candidates_batched(
       span<const StorageOwnerMaintenanceTask> tasks,
       span<const NodeSnapshot> targets,
@@ -1090,6 +1107,14 @@ private:
       const dense_hashmap_t<u64, vec<RemotePtr>>& updates,
       const Configuration& config);
   bool reconcile_local_reverse_ops(
+      span<const service::storage_owner::ReconcileReverseOp> ops,
+      const Configuration& config,
+      vec<service::storage_owner::ReconcileReverseResult>& results);
+  // Synchronous-exact coordination executes both local and remote reverse
+  // reconciliation from the authority owner. Remote targets use the same
+  // tagged lock/read/publish protocol through one-sided RDMA and never require
+  // a target-shard worker.
+  bool reconcile_reverse_ops_one_sided(
       span<const service::storage_owner::ReconcileReverseOp> ops,
       const Configuration& config,
       vec<service::storage_owner::ReconcileReverseResult>& results);
@@ -1144,6 +1169,9 @@ private:
   // makes that state capacity-bounded under adversarial update streams.
   const u32 vector_id_namespace_size_;
   const u32 storage_owner_peer_rdma_tokens_;
+  // Fixed and adaptive graph access share the same dynamic record layout.
+  // Fixed mode publishes UNKNOWN in the existing advisory tag byte.
+  const bool dynamic_graph_extent_publication_enabled_;
 
   HugePage<byte_t> index_buffer_;
   MemoryRegion index_region_;
@@ -1495,6 +1523,8 @@ private:
   // consume another client's completion window.
   std::unique_ptr<std::atomic<u32>[]>
     storage_client_batch_context_credits_;
+  memory_node_detail::StorageOwnerCpuPlan storage_owner_exact_cpu_plan_;
+  bool storage_owner_exact_cpu_plan_initialized_{};
   vec<u_ptr<StorageOwnerThread>> storage_owner_threads_;
   vec<std::thread> storage_insert_workers_;
   std::atomic<bool> storage_insert_shutdown_{false};

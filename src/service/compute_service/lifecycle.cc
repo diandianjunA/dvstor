@@ -1,5 +1,8 @@
 #include "service/compute_service/detail.hh"
 
+#include "gpu_search/host_orchestrated_engine.hh"
+#include "gpu_search/persistent_engine.hh"
+
 using namespace compute_service_detail;
 
 ComputeService::ComputeService(const Configuration& config)
@@ -47,13 +50,25 @@ ComputeService::ComputeService(const Configuration& config)
   const cudaError_t cuda_status = cudaSetDevice(static_cast<int>(config_.gpu_device));
   lib_assert(cuda_status == cudaSuccess,
              str{"failed to select GPU: "} + cudaGetErrorString(cuda_status));
-  print_status("search: GPU-persistent OPQ/PQ" +
-               std::to_string(metadata.pq_subquantizers) +
-               " beam + final RDMA exact rerank");
-  persistent_search_ = std::make_unique<gpu_search::PersistentSearchEngine>(
-    config_, context_, cm_, remote_access_tokens_);
-  print_status("query engine: persistent GPU + GPUNetIO slots=" +
-               std::to_string(config_.gpu_query_slots));
+  if (config_.gpu_rdma_search_progression_mode == "coupled") {
+    print_status("search: CPU-orchestrated schema-v16 OPQ/PQ" +
+                 std::to_string(metadata.pq_subquantizers) +
+                 " strict RDMA waves + finite CUDA scoring + exact rerank");
+    search_engine_ =
+      std::make_unique<gpu_search::HostOrchestratedSearchEngine>(
+        config_, context_, cm_, remote_access_tokens_);
+    print_status("query engine: host-orchestrated RDMA lanes=" +
+                 std::to_string(config_.gpu_rdma_qps) +
+                 " persistent-kernel=off GPUNetIO-query=off");
+  } else {
+    print_status("search: GPU-persistent OPQ/PQ" +
+                 std::to_string(metadata.pq_subquantizers) +
+                 " beam + final RDMA exact rerank");
+    search_engine_ = std::make_unique<gpu_search::PersistentSearchEngine>(
+      config_, context_, cm_, remote_access_tokens_);
+    print_status("query engine: persistent GPU + GPUNetIO slots=" +
+                 std::to_string(config_.gpu_query_slots));
+  }
 
   cm_.synchronize();
   start_storage_nodes();
@@ -63,7 +78,7 @@ ComputeService::ComputeService(const Configuration& config)
 
 ComputeService::~ComputeService() {
   if (config_.enable_updates) stop_storage_insert_runtime();
-  persistent_search_.reset();
+  search_engine_.reset();
   cm_.server_qps.clear();
   if (config_.enable_updates) release_storage_insert_runtime();
 }

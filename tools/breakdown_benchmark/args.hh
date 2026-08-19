@@ -13,6 +13,8 @@ using ConfigMap = std::unordered_map<std::string, std::string>;
 
 struct Args {
   std::string service_config_path;
+  std::string profile_name{"unspecified"};
+  std::string system_variant_label{"unspecified"};
   std::string workload{"both"};
   size_t warmup_ops{100};
   size_t measure_ops{1000};

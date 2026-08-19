@@ -50,6 +50,15 @@ inline u32 storage_owner_wr_owner(u32 encoded_owner) {
   return encoded_owner & ~kStorageOwnerCompletionWrBit;
 }
 
+// A successful coupled mutation is already exact and publishes no background
+// maintenance debt. Every successful decoupled mutation, including erase and
+// replay, commits only after obtaining its non-zero runnable Stage2 fence.
+inline constexpr bool valid_success_maintenance_sequence(
+    bool synchronous_exact, u64 maintenance_sequence) {
+  return synchronous_exact
+    ? maintenance_sequence == 0 : maintenance_sequence != 0;
+}
+
 inline void add_storage_owner_breakdown(
     service::breakdown::Sample* sample,
     const service::storage_owner::InsertBreakdownCounters& counters,

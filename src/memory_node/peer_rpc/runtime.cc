@@ -2,12 +2,15 @@
 #include "memory_node/peer_rpc/stage1_control_fanout_policy.hh"
 #include "memory_node/storage_owner_cpu_plan.hh"
 #include "memory_node/storage_owner_index/graph_pointer_validation.hh"
+#include "memory_node/storage_owner_runtime/exact_update_contract.hh"
 
 void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
   if (!peer_context_ || num_storage_nodes_ <= 1) {
     return;
   }
-  stage2_home_rpc_combining_ =
+  const bool synchronous_exact =
+    config.synchronous_exact_updates_enabled();
+  stage2_home_rpc_combining_ = !synchronous_exact &&
     config.storage_owner_stage2_home_rpc_combining;
 
   const u64 max_reverse_update_ops =
@@ -54,23 +57,29 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
   const size_t stage2_score_many_response_bytes =
     service::storage_owner::stage2_score_many_response_bytes(
       stage2_score_many_items);
-  peer_rpc_runtime_.message_bytes = align_up(
-    std::max({reverse_update_bytes,
-              service::storage_owner::reconcile_reverse_request_bytes(1),
-              service::storage_owner::centroid_membership_request_bytes(1),
-              cleanup_activate_request_bytes,
-              cleanup_activate_response_bytes,
-              authority_placement_request_bytes,
-              authority_placement_response_bytes,
-              service::storage_owner::reverse_update_response_bytes(),
-              stage1_request_bytes,
-              stage1_response_bytes,
-              stage1_arm_request_bytes,
-              stage1_arm_response_bytes,
-              stage2_expand_score_request_bytes,
-              stage2_expand_score_response_bytes,
-              stage2_score_many_request_bytes,
-              stage2_score_many_response_bytes}));
+  // Coupled append-only updates use only the data QPs and one-sided RDMA.
+  // Keep one header-sized posted receive on QP0 for lockstep-protocol
+  // rejection, but allocate no payload surface for a remote CPU operation.
+  const size_t exact_message_bytes =
+    sizeof(service::storage_owner::PeerRpcHeader);
+  peer_rpc_runtime_.message_bytes = align_up(synchronous_exact
+    ? exact_message_bytes
+    : std::max({reverse_update_bytes,
+                service::storage_owner::reconcile_reverse_request_bytes(1),
+                service::storage_owner::centroid_membership_request_bytes(1),
+                cleanup_activate_request_bytes,
+                cleanup_activate_response_bytes,
+                authority_placement_request_bytes,
+                authority_placement_response_bytes,
+                service::storage_owner::reverse_update_response_bytes(),
+                stage1_request_bytes,
+                stage1_response_bytes,
+                stage1_arm_request_bytes,
+                stage1_arm_response_bytes,
+                stage2_expand_score_request_bytes,
+                stage2_expand_score_response_bytes,
+                stage2_score_many_request_bytes,
+                stage2_score_many_response_bytes}));
   lib_assert(peer_rpc_runtime_.message_bytes <= std::numeric_limits<u32>::max(),
              "storage-owner peer RPC message is too large for verbs SGEs");
   const u32 remote_peer_count = num_storage_nodes_ - 1;
@@ -134,32 +143,37 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
     1024, producer_depth * registry_peer_count * 4);
   peer_async_responses_ =
     std::make_unique<PeerAsyncResponseRegistry>(response_capacity);
-  const size_t stage2_home_max_request_bytes = std::max(
-    stage2_expand_score_request_bytes, stage2_score_many_request_bytes);
-  constexpr size_t kStage2HomeMinimumResidentBytes = 8u << 20;
-  constexpr size_t kStage2HomeMaximumResidentBytes = 32u << 20;
-  const size_t stage2_home_typical_request_bytes = std::min<size_t>(
-    stage2_home_max_request_bytes, 4096);
-  const size_t stage2_home_scaled_resident_bytes =
-    response_capacity > std::numeric_limits<size_t>::max() /
-        std::max<size_t>(1, stage2_home_typical_request_bytes)
-      ? kStage2HomeMaximumResidentBytes
-      : response_capacity * stage2_home_typical_request_bytes;
-  const size_t stage2_home_resident_bytes = std::clamp(
-    stage2_home_scaled_resident_bytes,
-    kStage2HomeMinimumResidentBytes,
-    kStage2HomeMaximumResidentBytes);
-  lib_assert(stage2_home_max_request_bytes <=
-               std::numeric_limits<size_t>::max() -
-                 stage2_home_resident_bytes,
-             "stage2 home RPC outbox byte capacity overflow");
-  const size_t stage2_home_aggregate_capacity = std::max<size_t>(
-    64, response_capacity / 4);
-  stage2_home_rpc_outbox_ = std::make_unique<Stage2HomeRpcOutbox>(
-    response_capacity, stage2_home_aggregate_capacity,
-    num_storage_nodes_, config.storage_owner_batch_max,
-    stage2_score_many_items, stage2_score_many_items,
-    stage2_home_resident_bytes + stage2_home_max_request_bytes);
+  size_t stage2_home_aggregate_capacity = 0;
+  if (synchronous_exact) {
+    stage2_home_rpc_outbox_.reset();
+  } else {
+    const size_t stage2_home_max_request_bytes = std::max(
+      stage2_expand_score_request_bytes, stage2_score_many_request_bytes);
+    constexpr size_t kStage2HomeMinimumResidentBytes = 8u << 20;
+    constexpr size_t kStage2HomeMaximumResidentBytes = 32u << 20;
+    const size_t stage2_home_typical_request_bytes = std::min<size_t>(
+      stage2_home_max_request_bytes, 4096);
+    const size_t stage2_home_scaled_resident_bytes =
+      response_capacity > std::numeric_limits<size_t>::max() /
+          std::max<size_t>(1, stage2_home_typical_request_bytes)
+        ? kStage2HomeMaximumResidentBytes
+        : response_capacity * stage2_home_typical_request_bytes;
+    const size_t stage2_home_resident_bytes = std::clamp(
+      stage2_home_scaled_resident_bytes,
+      kStage2HomeMinimumResidentBytes,
+      kStage2HomeMaximumResidentBytes);
+    lib_assert(stage2_home_max_request_bytes <=
+                 std::numeric_limits<size_t>::max() -
+                   stage2_home_resident_bytes,
+               "stage2 home RPC outbox byte capacity overflow");
+    stage2_home_aggregate_capacity = std::max<size_t>(
+      64, response_capacity / 4);
+    stage2_home_rpc_outbox_ = std::make_unique<Stage2HomeRpcOutbox>(
+      response_capacity, stage2_home_aggregate_capacity,
+      num_storage_nodes_, config.storage_owner_batch_max,
+      stage2_score_many_items, stage2_score_many_items,
+      stage2_home_resident_bytes + stage2_home_max_request_bytes);
+  }
   const size_t dedup_capacity = std::max<size_t>(
     1024,
     static_cast<size_t>(config.storage_owner_reverse_queue_depth) *
@@ -175,14 +189,20 @@ void MemoryNode::setup_peer_rpc_runtime(const Configuration& config) {
                "at depth >= 2; responses use a dedicated sync buffer");
   print_status("storage-owner peer async response capacity: " +
                std::to_string(peer_async_responses_->capacity()));
-  print_status("storage-owner Stage2 home RPC combining: " +
-               std::string(stage2_home_rpc_combining_ ? "enabled" : "disabled") +
-               " logical_capacity=" +
-               std::to_string(response_capacity) +
-               " aggregate_capacity=" +
-               std::to_string(stage2_home_aggregate_capacity) +
-               " byte_budget=" +
-               std::to_string(stage2_home_rpc_outbox_->byte_capacity()));
+  if (synchronous_exact) {
+    print_status("storage-owner peer update RPC payloads: disabled by "
+                 "append-only synchronous-exact mode");
+  } else {
+    print_status("storage-owner Stage2 home RPC combining: " +
+                 std::string(stage2_home_rpc_combining_
+                   ? "enabled" : "disabled") +
+                 " logical_capacity=" +
+                 std::to_string(response_capacity) +
+                 " aggregate_capacity=" +
+                 std::to_string(stage2_home_aggregate_capacity) +
+                 " byte_budget=" +
+                 std::to_string(stage2_home_rpc_outbox_->byte_capacity()));
+  }
   for (u32 peer_id = 0; peer_id < num_storage_nodes_; ++peer_id) {
     if (peer_id == storage_id_) continue;
     for (u32 slot_id = 0; slot_id < peer_rpc_runtime_.recv_slots_per_peer; ++slot_id) {
@@ -199,6 +219,8 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   if (!peer_context_ || num_storage_nodes_ <= 1) {
     return;
   }
+  const bool synchronous_exact =
+    config.synchronous_exact_updates_enabled();
 
   peer_reverse_shutdown_.store(false, std::memory_order_release);
   peer_reverse_workers_done_.store(false, std::memory_order_release);
@@ -211,7 +233,11 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
   {
     std::lock_guard<std::mutex> lock(peer_cleanup_control_tasks_mutex_);
     peer_cleanup_control_tasks_.clear();
-    peer_cleanup_next_source_sequences_.assign(num_storage_nodes_, 0);
+    if (synchronous_exact) {
+      peer_cleanup_next_source_sequences_.clear();
+    } else {
+      peer_cleanup_next_source_sequences_.assign(num_storage_nodes_, 0);
+    }
   }
   {
     std::lock_guard<std::mutex> lock(peer_placement_control_tasks_mutex_);
@@ -262,36 +288,59 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
     peer_stage1_admission_waiter_items_ = 0;
     peer_stage1_admission_owned_items_ = 0;
     peer_stage1_admission_wake_coverage_ = 0;
-    peer_stage1_next_source_sequences_.assign(num_storage_nodes_, 0);
+    if (synchronous_exact) {
+      peer_stage1_next_source_sequences_.clear();
+    } else {
+      peer_stage1_next_source_sequences_.assign(num_storage_nodes_, 0);
+    }
   }
   peer_stage1_completion_states_.clear();
-  peer_stage1_completion_states_.reserve(num_storage_nodes_);
-  for (u32 shard = 0; shard < num_storage_nodes_; ++shard) {
-    peer_stage1_completion_states_.push_back(
-      std::make_unique<PeerOrderedCompletionState>());
-  }
   peer_cleanup_completion_states_.clear();
-  peer_cleanup_completion_states_.reserve(num_storage_nodes_);
-  for (u32 shard = 0; shard < num_storage_nodes_; ++shard) {
-    peer_cleanup_completion_states_.push_back(
-      std::make_unique<PeerOrderedCompletionState>());
+  if (!synchronous_exact) {
+    peer_stage1_completion_states_.reserve(num_storage_nodes_);
+    peer_cleanup_completion_states_.reserve(num_storage_nodes_);
+    for (u32 shard = 0; shard < num_storage_nodes_; ++shard) {
+      peer_stage1_completion_states_.push_back(
+        std::make_unique<PeerOrderedCompletionState>());
+      peer_cleanup_completion_states_.push_back(
+        std::make_unique<PeerOrderedCompletionState>());
+    }
   }
 
   const u32 rpc_parallelism = std::max<u32>(
     1, static_cast<u32>(num_clients_) *
        std::max<u32>(1, config.storage_owner_rpc_depth));
-  const auto cpu_plan = memory_node_detail::derive_storage_owner_cpu_plan(
-    core_assignment_.available_core_count(), num_compute_threads_,
-    rpc_parallelism, config.storage_owner_maintenance_workers,
-    num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
+  const auto cpu_plan = synchronous_exact
+    ? memory_node_detail::derive_storage_owner_exact_cpu_plan(
+        core_assignment_.available_core_count(), rpc_parallelism,
+        num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0)
+    : memory_node_detail::derive_storage_owner_cpu_plan(
+        core_assignment_.available_core_count(), num_compute_threads_,
+        rpc_parallelism, config.storage_owner_maintenance_workers,
+        num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
+  if (synchronous_exact) {
+    if (num_storage_nodes_ > 1) {
+      lib_assert(core_assignment_.available_core_count() >=
+                   memory_node_detail::exact_update_remote_cpu_floor(),
+                 "distributed synchronous exact updates have an "
+                 "undersized assigned CPU set");
+      lib_assert(memory_node_detail::
+                   exact_update_plan_has_remote_correctness_floor(cpu_plan),
+                 "distributed synchronous exact updates require at least "
+                 "two assigned CPUs per storage owner");
+    }
+    storage_owner_exact_cpu_plan_ = cpu_plan;
+    storage_owner_exact_cpu_plan_initialized_ = true;
+  }
   const u32 reverse_worker_count = cpu_plan.peer_reverse_workers;
   // Reserve one Stage2-home lane to break dependency cycles. The remaining
   // lanes keep Stage1 priority and may steal only authoritative Stage2-home
   // work after a bounded delay.
   const u32 physical_home_worker_count = cpu_plan.peer_stage1_workers;
-  const auto physical_home_split =
-    memory_node_detail::split_physical_home_workers(
-      physical_home_worker_count);
+  const auto physical_home_split = synchronous_exact
+    ? memory_node_detail::PhysicalHomeWorkerSplit{}
+    : memory_node_detail::split_physical_home_workers(
+        physical_home_worker_count);
   const u32 stage2_home_worker_count = physical_home_split.stage2_home;
   const u32 stage1_rpc_worker_count = physical_home_split.stage1;
   peer_graph_response_buffer_limit_ = std::max<size_t>(
@@ -301,49 +350,71 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
     peer_graph_response_buffers_.clear();
   }
   const u32 cleanup_worker_count = cpu_plan.peer_cleanup_workers;
-  const size_t stage1_total_worker_count =
-    static_cast<size_t>(cpu_plan.foreground_coordinators) +
-    static_cast<size_t>(physical_home_worker_count);
-  lib_assert(stage1_total_worker_count <=
-               std::numeric_limits<size_t>::max() /
-                 std::max<size_t>(1, config.storage_owner_batch_max) / 4,
-             "Stage1 artifact table worker capacity overflow");
-  const size_t stage1_active_capacity = stage1_total_worker_count *
-    std::max<size_t>(1, config.storage_owner_batch_max) * 4;
-  lib_assert(static_cast<size_t>(config.storage_owner_maintenance_queue_depth) <=
-               std::numeric_limits<size_t>::max() - stage1_active_capacity,
-             "Stage1 artifact table queue capacity overflow");
-  stage1_prepared_results_limit_ = std::max<size_t>(
-    1024,
-    static_cast<size_t>(config.storage_owner_maintenance_queue_depth) +
-      stage1_active_capacity);
-  stage1_prepared_results_limit_per_shard_ = std::max<size_t>(
-    16, (stage1_prepared_results_limit_ + kStage1PreparedShardCount - 1) /
-      kStage1PreparedShardCount);
-  for (Stage1PreparedResultShard& shard : stage1_prepared_results_) {
-    std::lock_guard<std::mutex> lock(shard.mutex);
-    shard.records.clear();
-    shard.records.reserve(stage1_prepared_results_limit_per_shard_);
+  if (synchronous_exact) {
+    stage1_prepared_results_limit_ = 0;
+    stage1_prepared_results_limit_per_shard_ = 0;
+    cleanup_activation_dedupe_limit_per_shard_ = 0;
+    dynamic_allocation_dedupe_limit_ = 0;
+    for (Stage1PreparedResultShard& shard : stage1_prepared_results_) {
+      std::lock_guard<std::mutex> lock(shard.mutex);
+      shard.records.clear();
+    }
+    for (Stage1InflightRequestShard& shard : stage1_inflight_requests_) {
+      std::lock_guard<std::mutex> lock(shard.mutex);
+      shard.counts.clear();
+    }
+    for (CleanupActivationDedupeShard& shard :
+         cleanup_activation_dedupe_) {
+      std::lock_guard<std::mutex> lock(shard.mutex);
+      shard.records.clear();
+    }
+    dynamic_allocation_receipts_.reset(0);
+  } else {
+    const size_t stage1_total_worker_count =
+      static_cast<size_t>(cpu_plan.foreground_coordinators) +
+      static_cast<size_t>(physical_home_worker_count);
+    lib_assert(stage1_total_worker_count <=
+                 std::numeric_limits<size_t>::max() /
+                   std::max<size_t>(1, config.storage_owner_batch_max) / 4,
+               "Stage1 artifact table worker capacity overflow");
+    const size_t stage1_active_capacity = stage1_total_worker_count *
+      std::max<size_t>(1, config.storage_owner_batch_max) * 4;
+    lib_assert(
+      static_cast<size_t>(config.storage_owner_maintenance_queue_depth) <=
+        std::numeric_limits<size_t>::max() - stage1_active_capacity,
+      "Stage1 artifact table queue capacity overflow");
+    stage1_prepared_results_limit_ = std::max<size_t>(
+      1024,
+      static_cast<size_t>(config.storage_owner_maintenance_queue_depth) +
+        stage1_active_capacity);
+    stage1_prepared_results_limit_per_shard_ = std::max<size_t>(
+      16, (stage1_prepared_results_limit_ + kStage1PreparedShardCount - 1) /
+        kStage1PreparedShardCount);
+    for (Stage1PreparedResultShard& shard : stage1_prepared_results_) {
+      std::lock_guard<std::mutex> lock(shard.mutex);
+      shard.records.clear();
+      shard.records.reserve(stage1_prepared_results_limit_per_shard_);
+    }
+    for (Stage1InflightRequestShard& shard : stage1_inflight_requests_) {
+      std::lock_guard<std::mutex> lock(shard.mutex);
+      shard.counts.clear();
+      shard.counts.reserve(stage1_prepared_results_limit_per_shard_);
+    }
+    const size_t cleanup_dedupe_total = std::max<size_t>(
+      1024,
+      static_cast<size_t>(config.storage_owner_maintenance_queue_depth) * 2);
+    cleanup_activation_dedupe_limit_per_shard_ = std::max<size_t>(
+      16, (cleanup_dedupe_total + kCleanupActivationShardCount - 1) /
+        kCleanupActivationShardCount);
+    for (CleanupActivationDedupeShard& shard :
+         cleanup_activation_dedupe_) {
+      std::lock_guard<std::mutex> lock(shard.mutex);
+      shard.records.clear();
+      shard.records.reserve(cleanup_activation_dedupe_limit_per_shard_);
+    }
+    dynamic_allocation_dedupe_limit_ = cleanup_dedupe_total;
+    dynamic_allocation_receipts_.reset(dynamic_allocation_dedupe_limit_);
   }
-  for (Stage1InflightRequestShard& shard : stage1_inflight_requests_) {
-    std::lock_guard<std::mutex> lock(shard.mutex);
-    shard.counts.clear();
-    shard.counts.reserve(stage1_prepared_results_limit_per_shard_);
-  }
-  const size_t cleanup_dedupe_total = std::max<size_t>(
-    1024,
-    static_cast<size_t>(config.storage_owner_maintenance_queue_depth) * 2);
-  cleanup_activation_dedupe_limit_per_shard_ = std::max<size_t>(
-    16, (cleanup_dedupe_total + kCleanupActivationShardCount - 1) /
-      kCleanupActivationShardCount);
-  for (CleanupActivationDedupeShard& shard :
-       cleanup_activation_dedupe_) {
-    std::lock_guard<std::mutex> lock(shard.mutex);
-    shard.records.clear();
-    shard.records.reserve(cleanup_activation_dedupe_limit_per_shard_);
-  }
-  dynamic_allocation_dedupe_limit_ = cleanup_dedupe_total;
-  dynamic_allocation_receipts_.reset(dynamic_allocation_dedupe_limit_);
   const size_t snapshot_stride = align_up(VamanaNode::vector_bytes());
   const size_t neighbor_stride = align_up(VamanaNode::neighbor_read_size());
   const size_t batched_read_stride =
@@ -375,20 +446,44 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
     peer_stage2_home_worker_states_.push_back(std::move(home_worker));
   }
 
-  peer_rpc_progress_thread_ = std::thread([this]() { peer_rpc_progress_loop(); });
-  peer_reverse_response_thread_ = std::thread([this]() { peer_reverse_response_loop(); });
+  lib_assert(memory_node_detail::peer_runtime_thread_counts_supported(cpu_plan),
+             "storage-owner CPU plan exceeds concrete peer runtime roles");
+  const auto peer_thread_plan =
+    memory_node_detail::derive_peer_runtime_thread_plan(cpu_plan);
+  lib_assert(peer_thread_plan.cq_progress_threads +
+               peer_thread_plan.response_dispatch_threads ==
+               cpu_plan.peer_progress_threads,
+             "storage-owner peer progress thread plan lost a CPU lane");
+  if (peer_thread_plan.cq_progress_threads != 0) {
+    peer_rpc_progress_thread_ =
+      std::thread([this]() { peer_rpc_progress_loop(); });
+  }
+  if (peer_thread_plan.response_dispatch_threads != 0) {
+    peer_reverse_response_thread_ =
+      std::thread([this]() { peer_reverse_response_loop(); });
+  }
   peer_cleanup_control_workers_.reserve(cleanup_worker_count);
   for (u32 i = 0; i < cleanup_worker_count; ++i) {
     peer_cleanup_control_workers_.emplace_back(
       [this]() { peer_cleanup_control_worker_loop(); });
   }
-  peer_placement_control_thread_ =
-    std::thread([this]() { peer_placement_control_worker_loop(); });
+  if (peer_thread_plan.placement_control_threads != 0) {
+    peer_placement_control_thread_ =
+      std::thread([this]() { peer_placement_control_worker_loop(); });
+  }
   if (!config.disable_thread_pinning) {
-    pin_thread(peer_rpc_progress_thread_, core_assignment_.get_available_core());
-    pin_thread(peer_reverse_response_thread_, core_assignment_.get_available_core());
-    pin_thread(peer_placement_control_thread_,
-               core_assignment_.get_available_core());
+    if (peer_rpc_progress_thread_.joinable()) {
+      pin_thread(peer_rpc_progress_thread_,
+                 core_assignment_.get_available_core());
+    }
+    if (peer_reverse_response_thread_.joinable()) {
+      pin_thread(peer_reverse_response_thread_,
+                 core_assignment_.get_available_core());
+    }
+    if (peer_placement_control_thread_.joinable()) {
+      pin_thread(peer_placement_control_thread_,
+                 core_assignment_.get_available_core());
+    }
   }
   for (auto& worker : peer_cleanup_control_workers_) {
     if (!config.disable_thread_pinning) {
@@ -426,19 +521,31 @@ void MemoryNode::start_peer_reverse_update_runtime(const Configuration& config) 
                std::to_string(stage1_rpc_worker_count) +
                "; Stage2-home workers: " +
                std::to_string(stage2_home_worker_count) +
-               " (one reserved; shared lanes borrow authoritative work only)");
+               (synchronous_exact
+                 ? " (disabled by synchronous-exact mode)"
+                 : " (one reserved; shared lanes borrow authoritative work only)"));
   print_status("storage-owner physical control workers: cleanup=" +
                std::to_string(cleanup_worker_count) + " placement=" +
-               std::to_string(cpu_plan.peer_placement_workers) +
+               std::to_string(peer_thread_plan.placement_control_threads) +
                " (separate blocking domains)");
-  print_status("storage-owner Stage1 artifact capacity: " +
-               std::to_string(stage1_prepared_results_limit_) +
-               " (64-way, per shard=" +
-               std::to_string(stage1_prepared_results_limit_per_shard_) + ")" +
-               " cleanup replay per shard=" +
-               std::to_string(cleanup_activation_dedupe_limit_per_shard_) +
-               " active migration receipts=" +
-               std::to_string(dynamic_allocation_dedupe_limit_));
+  print_status("storage-owner peer progress threads: cq=" +
+               std::to_string(peer_thread_plan.cq_progress_threads) +
+               " response_dispatch=" +
+               std::to_string(peer_thread_plan.response_dispatch_threads));
+  if (synchronous_exact) {
+    print_status("storage-owner target-side update workers and "
+                 "Stage1/cleanup/migration artifacts: disabled by "
+                 "append-only synchronous-exact mode");
+  } else {
+    print_status("storage-owner Stage1 artifact capacity: " +
+                 std::to_string(stage1_prepared_results_limit_) +
+                 " (64-way, per shard=" +
+                 std::to_string(stage1_prepared_results_limit_per_shard_) +
+                 ") cleanup replay per shard=" +
+                 std::to_string(cleanup_activation_dedupe_limit_per_shard_) +
+                 " active migration receipts=" +
+                 std::to_string(dynamic_allocation_dedupe_limit_));
+  }
   print_status("storage-owner peer reverse-update tuning: queue_depth=" +
                std::to_string(peer_reverse_task_queue_limit_) +
                " coalesce_max=" + std::to_string(config.storage_owner_reverse_coalesce_max));

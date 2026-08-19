@@ -166,6 +166,47 @@ void MemoryNode::retire_local_dynamic_node(RemotePtr pointer,
     reused, std::memory_order_release);
 }
 
+void MemoryNode::retire_local_dynamic_node_ready(RemotePtr pointer) {
+  if (pointer.is_null() || pointer.memory_node() != storage_id_ ||
+      pointer.byte_offset() < gpu_dynamic_node_base_) {
+    return;
+  }
+  const u64 node_size = dynamic_node_allocation_stride();
+  lib_assert((pointer.byte_offset() - gpu_dynamic_node_base_) % node_size == 0,
+             "cannot retire a misaligned exact-update dynamic node");
+  const u64 allocation_limit = dynamic_allocation_limit_ == 0
+    ? mn_memory_bytes_ : dynamic_allocation_limit_;
+  lib_assert(pointer.byte_offset() <= allocation_limit &&
+               node_size <= allocation_limit - pointer.byte_offset(),
+             "cannot retire an exact-update node outside the allocation region");
+  const byte_t* node = index_buffer_.get_full_buffer() + pointer.byte_offset();
+  const u64 header = std::atomic_ref<const u64>(
+    *reinterpret_cast<const u64*>(node)).load(std::memory_order_acquire);
+  const u32 stored_incarnation = *reinterpret_cast<const u32*>(
+    node + VamanaNode::offset_slot_incarnation());
+  if ((header & VamanaNode::HEADER_DELETED) == 0 ||
+      VamanaNode::header_incarnation(header) != pointer.incarnation() ||
+      stored_incarnation != pointer.incarnation()) {
+    return;
+  }
+  u64 pending = 0;
+  u64 reused = 0;
+  {
+    std::lock_guard<std::mutex> lock(storage_owner_reclaim_mutex_);
+    (void)storage_owner_reclaim_queue_.retire_ready(pointer);
+    pending = storage_owner_reclaim_queue_.size();
+    reused = storage_owner_reclaim_queue_.reused();
+  }
+  storage_owner_reclaim_candidates_.store(
+    pending, std::memory_order_release);
+  auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
+    index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
+  std::atomic_ref<u64>(control->reclaim_pending_nodes).store(
+    pending, std::memory_order_release);
+  std::atomic_ref<u64>(control->reclaim_reused_nodes).store(
+    reused, std::memory_order_release);
+}
+
 bool MemoryNode::load_owner_idmap(const filepath_t& index_prefix) {
   base_idmap_.clear();
   for (DynamicFreshnessShard& shard : dynamic_freshness_shards_) {

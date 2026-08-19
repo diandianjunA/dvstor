@@ -38,12 +38,6 @@ service::QueryResult PersistentSearchEngine::search(
   return impl_->search(query_dtype, query_data, k);
 }
 
-service::QueryResult PersistentSearchEngine::search(
-    std::span<const element_t> query, u32 k) {
-  return search(VectorDType::float32,
-                reinterpret_cast<const byte_t*>(query.data()), k);
-}
-
 std::optional<u32> PersistentSearchEngine::select_centroid_home(
     std::span<const f32> vector) const {
   return impl_->select_centroid_home(vector);

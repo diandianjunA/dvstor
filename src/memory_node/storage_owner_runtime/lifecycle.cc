@@ -1,5 +1,6 @@
 #include "memory_node/storage_owner_runtime/detail.hh"
 #include "memory_node/storage_owner_cpu_plan.hh"
+#include "memory_node/storage_owner_index/graph_pointer_validation.hh"
 
 using namespace memory_node_storage_owner_runtime_detail;
 
@@ -67,6 +68,8 @@ void MemoryNode::setup_insert_runtime(const Configuration& config) {
 }
 
 void MemoryNode::start_storage_owner_insert_workers(const Configuration& config) {
+  const bool synchronous_exact =
+    config.synchronous_exact_updates_enabled();
   const auto peer_read_credits = peer_rdma_read_credit_plan();
   print_status("storage-owner peer RDMA read credits: per_data_qp=" +
                std::to_string(peer_read_credits.per_qp) +
@@ -85,17 +88,46 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
   print_status("storage-owner online insert tuning: construction_beam=" +
                std::to_string(config.resolved_storage_owner_construction_width()) +
                " snapshot_batch=" + std::to_string(config.storage_owner_search_snapshot_batch) +
-               " protocol=centroid-home-two-stage");
-  print_status("storage-owner stage1=physical-home local search and backlinks; "
-               "stage2=generation-fenced home expand+score continuation");
+               " protocol=" +
+               std::string(synchronous_exact
+                 ? "single-owner-synchronous-exact"
+                 : "centroid-home-two-stage"));
+  print_status(synchronous_exact
+    ? "storage-owner exact=append-only global search+prune+stable write+"
+      "one-sided backlinks before token completion; "
+      "upsert/erase/stage1/stage2/migration=disabled"
+    : "storage-owner stage1=physical-home local search and backlinks; "
+      "stage2=generation-fenced home expand+score continuation");
   print_status("storage-owner responses=foreground direct post; "
                "completion=repost by service poller");
   const u32 rpc_parallelism = std::max<u32>(
     1, static_cast<u32>(num_clients_) * insert_runtime_.request_slot_count);
-  const auto cpu_plan = memory_node_detail::derive_storage_owner_cpu_plan(
-    core_assignment_.available_core_count(), num_compute_threads_,
-    rpc_parallelism, config.storage_owner_maintenance_workers,
-    num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
+  memory_node_detail::StorageOwnerCpuPlan cpu_plan;
+  if (synchronous_exact) {
+    if (!storage_owner_exact_cpu_plan_initialized_) {
+      storage_owner_exact_cpu_plan_ =
+        memory_node_detail::derive_storage_owner_exact_cpu_plan(
+          core_assignment_.available_core_count(), rpc_parallelism,
+          num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
+      storage_owner_exact_cpu_plan_initialized_ = true;
+    }
+    cpu_plan = storage_owner_exact_cpu_plan_;
+  } else {
+    cpu_plan = memory_node_detail::derive_storage_owner_cpu_plan(
+      core_assignment_.available_core_count(), num_compute_threads_,
+      rpc_parallelism, config.storage_owner_maintenance_workers,
+      num_storage_nodes_ > 0 ? num_storage_nodes_ - 1 : 0);
+  }
+  if (synchronous_exact) {
+    lib_assert(cpu_plan.foreground_progress_threads != 0,
+               "synchronous exact updates require at least two assigned CPUs");
+    if (num_storage_nodes_ > 1) {
+      lib_assert(memory_node_detail::
+                   exact_update_plan_has_remote_correctness_floor(cpu_plan),
+                 "distributed synchronous exact updates require at least "
+                 "two assigned CPUs per storage owner");
+    }
+  }
   const u32 worker_count = cpu_plan.foreground_coordinators;
   print_status("storage-owner foreground pipeline: coordinators=" +
                std::to_string(worker_count) +
@@ -123,13 +155,30 @@ void MemoryNode::start_storage_owner_insert_workers(const Configuration& config)
                std::to_string(cpu_plan.peer_progress_threads) +
                " foreground_progress=" +
                std::to_string(cpu_plan.foreground_progress_threads));
+  const size_t snapshot_stride =
+    memory_node_detail::storage_owner_snapshot_stride();
+  const size_t batch_slot_stride =
+    memory_node_storage_owner_index_detail::batched_read_slot_stride(
+      snapshot_stride);
+  const size_t snapshot_batch =
+    std::max<u32>(1, config.storage_owner_search_snapshot_batch);
+  lib_assert(batch_slot_stride <=
+               std::numeric_limits<size_t>::max() / snapshot_batch,
+             "exact foreground peer scratch size overflow");
+  const size_t exact_scratch_stride = align_up(
+    batch_slot_stride * snapshot_batch +
+    std::max(VamanaNode::total_size(), VamanaNode::neighbor_read_size()));
   storage_owner_threads_.reserve(worker_count);
   for (u32 i = 0; i < worker_count; ++i) {
-    // Foreground Stage1 is synchronous and partition-local. Cross-shard reads
-    // belong exclusively to the Stage2 executor, so one scratch state per
-    // worker is sufficient and no foreground peer-RDMA scratch is allocated.
     auto thread = std::make_unique<StorageOwnerThread>(
       i, 1, config.max_send_queue_wr);
+    if (synchronous_exact && peer_context_) {
+      // Each exact coordinator owns one coroutine and one registered RDMA
+      // scratch lane.  Never fall back to the process-global scratch buffer:
+      // several synchronous coordinators may search remote shards at once.
+      thread->init_peer_scratch(
+        *peer_context_, exact_scratch_stride, exact_scratch_stride);
+    }
     storage_owner_threads_.push_back(std::move(thread));
   }
   vec<u32> foreground_cpus;

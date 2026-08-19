@@ -23,6 +23,8 @@ void test_rate_limited_args(const std::string& config_path) {
   const auto args = parse({
     "benchmark",
     "--service-config", config_path,
+    "--profile-name", "04_gpu_persistent_gpunetio_baseline",
+    "--system-variant-label", "baseline",
     "--workload", "mixed",
     "--warmup-seconds", "60",
     "--measure-seconds", "900",
@@ -37,6 +39,8 @@ void test_rate_limited_args(const std::string& config_path) {
     "--report-json", "report.json",
   });
   assert(args.client_threads == 64);
+  assert(args.profile_name == "04_gpu_persistent_gpunetio_baseline");
+  assert(args.system_variant_label == "baseline");
   assert(args.mixed_mode == "rate_limited");
   assert(args.target_query_qps == 5000.0);
   assert(args.target_write_qps == 1000.0);

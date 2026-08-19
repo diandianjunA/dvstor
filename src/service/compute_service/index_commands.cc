@@ -15,7 +15,7 @@ void ComputeService::reset_breakdown_state() {
   completed_breakdown_report_.reset();
   breakdown_enabled_.store(config_.enable_breakdown,
                            std::memory_order_release);
-  persistent_search_->reset_telemetry();
+  search_engine_->reset_telemetry();
   storage_insert_late_rpc_completions_.store(0, std::memory_order_relaxed);
   storage_owner_submitted_batches_.store(0, std::memory_order_relaxed);
   storage_owner_submitted_items_.store(0, std::memory_order_relaxed);
@@ -52,8 +52,31 @@ void ComputeService::receive_remote_access_tokens() {
 
 void ComputeService::start_storage_nodes() {
   if (!cm_.is_initiator) return;
+  service::index_metadata::Metadata metadata;
+  str metadata_error;
+  lib_assert(service::index_metadata::load_metadata(
+               config_.resolved_index_prefix(), metadata, &metadata_error),
+             metadata_error);
+  lib_assert(metadata.shard_build_fingerprints.size() ==
+               cm_.server_qps.size(),
+             "storage startup metadata has an invalid shard fingerprint set");
+  const u32 feature_modes = storage_startup::encode_feature_modes(
+    config_.storage_owner_update_completion_mode,
+    config_.dynamic_graph_access_mode,
+    config_.gpu_rdma_search_progression_mode);
+  lib_assert(storage_startup::valid_feature_modes(feature_modes),
+             "compute startup has invalid contribution-level feature modes");
   for (u32 server = 0; server < cm_.server_qps.size(); ++server) {
-    storage_startup::Request request{};
+    const storage_startup::Request request{
+      .feature_modes = feature_modes,
+      .schema_version = metadata.schema_version,
+      .expected_shard = server,
+      .expected_shard_count = num_servers_,
+      .expected_vector_id_namespace_size =
+        config_.vector_id_namespace_size,
+      .index_build_fingerprint = metadata.index_build_fingerprint,
+      .shard_build_fingerprint = metadata.shard_build_fingerprints[server],
+    };
     const QP& qp = cm_.server_qps[server];
     qp->post_send_inlined(&request, sizeof(request), IBV_WR_SEND);
     context_.poll_send_cq_until_completion();
@@ -63,8 +86,29 @@ void ComputeService::start_storage_nodes() {
     LocalMemoryRegion response_region{context_, &response, sizeof(response)};
     cm_.server_qps[server]->post_receive(response_region);
     context_.receive();
-    lib_assert(response.ready,
-               "storage startup failed on node " + std::to_string(server));
+    lib_assert(storage_startup::valid_response_envelope(response),
+               "storage startup returned an invalid protocol envelope on "
+               "node " + std::to_string(server));
+    lib_assert(
+      response.ready != 0 && response.mismatch_flags == 0 &&
+        response.feature_modes == feature_modes &&
+        response.schema_version == metadata.schema_version &&
+        response.shard == server && response.shard_count == num_servers_ &&
+        response.index_build_fingerprint ==
+          metadata.index_build_fingerprint &&
+        response.shard_build_fingerprint ==
+          metadata.shard_build_fingerprints[server],
+      "storage startup contract mismatch on node " +
+        std::to_string(server) + ": flags=" +
+        std::to_string(response.mismatch_flags) + " compute_modes=" +
+        std::to_string(feature_modes) + " storage_modes=" +
+        std::to_string(response.feature_modes) + " compute_schema=" +
+        std::to_string(metadata.schema_version) + " storage_schema=" +
+        std::to_string(response.schema_version) + " storage_shard=" +
+        std::to_string(response.shard) + " compute_index_fingerprint=" +
+        std::to_string(metadata.index_build_fingerprint) +
+        " storage_index_fingerprint=" +
+        std::to_string(response.index_build_fingerprint));
     lib_assert(response.vector_id_namespace_size ==
                  config_.vector_id_namespace_size,
                "vector ID namespace mismatch on storage node " +

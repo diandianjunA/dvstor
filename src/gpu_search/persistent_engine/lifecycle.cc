@@ -113,8 +113,14 @@ void PersistentSearchEngine::Impl::stream_codes_to_gpu(NavigationBootstrapper& s
 
 void PersistentSearchEngine::Impl::start_persistent_kernel() {
   bind_cuda_device("cudaSetDevice(GPU navigation kernel start)");
-  if (kernel_params.issue_width > kernel_params.commit_width) {
-    // The ASFE specialization has an out-of-line Stable-Run/CUB call chain.
+  const bool decoupled_search_progression =
+    config.decoupled_gpu_rdma_search_progression_enabled();
+  if (decoupled_search_progression !=
+      (kernel_params.issue_width > kernel_params.commit_width)) {
+    throw std::logic_error(
+      "GPU-RDMA search progression mode changed before kernel launch");
+  }
+  if (decoupled_search_progression) {
     // The ASFE specialization has an out-of-line Stable-Run/CUB call chain.
     // Its linked device frame is slightly larger than CUDA's common 1-KiB
     // default, so an undersized per-thread stack can corrupt the generic
@@ -199,7 +205,8 @@ void PersistentSearchEngine::Impl::start_persistent_kernel() {
             << " max_threads/block="
             << persistent_kernel_occupancy.max_threads_per_block << '\n';
   launch_persistent_search(kernel_stream, launch_params,
-                           total_blocks, kernel_threads);
+                           total_blocks, kernel_threads,
+                           decoupled_search_progression);
   check_cuda(cudaGetLastError(), "launch_persistent_search(unified navigation)");
 
   const auto ready_deadline = std::chrono::steady_clock::now() +

@@ -13,7 +13,7 @@ ComputeService::search_local_result(const vec<element_t>& query, u32 k) {
   const auto started = std::chrono::steady_clock::now();
   sample->enqueued_at = started;
   sample->mark_started(started, started);
-  service::QueryResult results = persistent_search_->search(
+  service::QueryResult results = search_engine_->search(
     span<const element_t>{query.data(), query.size()}, k);
   sample->mark_finished(std::chrono::steady_clock::now());
   return {.results = std::move(results), .sample = std::move(sample)};
@@ -29,7 +29,7 @@ ComputeService::search_local_raw_result(
   const auto started = std::chrono::steady_clock::now();
   sample->enqueued_at = started;
   sample->mark_started(started, started);
-  service::QueryResult results = persistent_search_->search(query_dtype, query_data, k);
+  service::QueryResult results = search_engine_->search(query_dtype, query_data, k);
   sample->mark_finished(std::chrono::steady_clock::now());
   return {.results = std::move(results), .sample = std::move(sample)};
 }

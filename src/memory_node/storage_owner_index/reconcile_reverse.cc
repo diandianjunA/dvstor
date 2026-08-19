@@ -21,6 +21,25 @@ bool MemoryNode::reconcile_local_reverse_ops(
     const span<const service::storage_owner::ReconcileReverseOp> ops,
     const Configuration& config,
     vec<service::storage_owner::ReconcileReverseResult>& results) {
+  for (const auto& op : ops) {
+    const RemotePtr target{op.target_raw};
+    if (target.is_null() || !target.is_well_formed() ||
+        target.memory_node() != storage_id_) {
+      results.assign(ops.size(), {});
+      for (size_t index = 0; index < ops.size(); ++index) {
+        results[index].placement_sequence = ops[index].placement_sequence;
+        results[index].stale = 1;
+      }
+      return false;
+    }
+  }
+  return reconcile_reverse_ops_one_sided(ops, config, results);
+}
+
+bool MemoryNode::reconcile_reverse_ops_one_sided(
+    const span<const service::storage_owner::ReconcileReverseOp> ops,
+    const Configuration& config,
+    vec<service::storage_owner::ReconcileReverseResult>& results) {
   using service::storage_owner::ReconcileReverseOpKind;
   using service::storage_owner::ReconcileReverseResult;
 
@@ -37,13 +56,14 @@ bool MemoryNode::reconcile_local_reverse_ops(
 
     const RemotePtr target{op.target_raw};
     if (target.is_null() || !target.is_well_formed() ||
-        target.memory_node() != storage_id_ ||
+        target.memory_node() >= num_storage_nodes_ ||
         !VamanaNode::hot_graph_entry_available(target)) {
       result.stale = 1;
       structurally_valid = false;
       continue;
     }
-    if (!valid_local_storage_node_pointer(target)) {
+    if (local_shard(target.memory_node()) &&
+        !valid_local_storage_node_pointer(target)) {
       // The wire pointer is structurally valid, but its tagged physical
       // incarnation is already gone.  Complete only optional/absence
       // postconditions here; mandatory reachability operations remain stale
@@ -127,7 +147,17 @@ bool MemoryNode::reconcile_local_reverse_ops(
       structurally_valid = false;
       continue;
     }
-    const u64 target_header = load_local_node_header_acquire(target);
+    u64 target_header = 0;
+    node_t target_id = 0;
+    u32 target_generation = 0;
+    if (!read_locked_node_identity(
+          target, target_header, target_id, target_generation)) {
+      structurally_valid = false;
+      unlock_node(target);
+      continue;
+    }
+    (void)target_id;
+    (void)target_generation;
     const bool target_stable =
       VamanaNode::stable_graph_mutation_allowed(target_header);
     const bool target_route_accounted =
@@ -186,12 +216,32 @@ bool MemoryNode::reconcile_local_reverse_ops(
         adjacency.provisional.end());
     };
 
+    const auto target_vector =
+      vamana::StorageLayoutResolver::vector(target);
+    lib_assert(target_vector.offset <= mn_memory_bytes_ &&
+                 target_vector.size <= mn_memory_bytes_ -
+                   target_vector.offset &&
+                 target_vector.size == VamanaNode::vector_bytes(),
+               "reconcile reverse target vector exceeds shard bounds");
+    thread_local vec<byte_t> remote_target_vector;
+    const byte_t* target_vector_data = nullptr;
+    if (local_shard(target.memory_node())) {
+      target_vector_data =
+        index_buffer_.get_full_buffer() + target_vector.offset;
+    } else {
+      remote_target_vector.resize(target_vector.size);
+      remote_read_bytes(target.memory_node(), target_vector.offset,
+                        remote_target_vector.data(),
+                        remote_target_vector.size(), 0);
+      target_vector_data = remote_target_vector.data();
+    }
+
     bool robust_prune_retryable = false;
     const auto robust_prune = [&](const vec<RemotePtr>& candidates) {
       vec<StableNodeSnapshotState> snapshot_states;
       vec<NodeSnapshot> snapshots =
         read_node_snapshots_batched(
-          candidates, config, "reconcile_local_reverse_ops",
+          candidates, config, "reconcile_reverse_ops_one_sided",
           &snapshot_states);
       if (std::find(snapshot_states.begin(), snapshot_states.end(),
                     StableNodeSnapshotState::retryable) !=
@@ -204,14 +254,8 @@ bool MemoryNode::reconcile_local_reverse_ops(
       }
       hashset_t<RemotePtr> skip;
       skip.insert(target);
-      const auto target_vector =
-        vamana::StorageLayoutResolver::vector(target);
-      lib_assert(target_vector.offset <= mn_memory_bytes_ &&
-                   target_vector.size <= mn_memory_bytes_ -
-                     target_vector.offset,
-                 "reconcile reverse target vector exceeds shard bounds");
       return robust_prune_snapshots_cpu(
-        index_buffer_.get_full_buffer() + target_vector.offset,
+        target_vector_data,
         VamanaNode::vector_dtype(),
         span<const NodeSnapshot>{snapshots.data(), snapshots.size()},
         skip, config, config.R);

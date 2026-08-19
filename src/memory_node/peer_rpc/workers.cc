@@ -1,10 +1,13 @@
 #include "memory_node/peer_rpc/detail.hh"
 #include "memory_node/peer_rpc/stage1_control_fanout_policy.hh"
+#include "memory_node/storage_owner_runtime/exact_update_contract.hh"
 
 void MemoryNode::peer_rpc_progress_loop() {
   lib_assert(storage_worker_config_ != nullptr,
              "peer RPC progress started without storage configuration");
   const Configuration& config = *storage_worker_config_;
+  const bool synchronous_exact =
+    config.synchronous_exact_updates_enabled();
   current_peer_rpc_progress_thread_ = true;
   peer_rpc_progress_running_.store(true, std::memory_order_release);
   vec<ibv_wc> recv_wcs(std::max<i32>(1, peer_context_->get_config().max_recv_queue_wr));
@@ -89,6 +92,21 @@ void MemoryNode::peer_rpc_progress_loop() {
       if (header->magic != service::storage_owner::kPeerRpcMagic ||
           header->version != service::storage_owner::kPeerRpcVersion ||
           header->source_shard != peer_id) {
+        repost_peer_rpc_receive(peer_id, slot_id);
+        continue;
+      }
+
+      const auto received_type = static_cast<
+        service::storage_owner::PeerRpcType>(header->type);
+      if (synchronous_exact &&
+          !memory_node_storage_owner_runtime_detail::
+            exact_peer_request_allowed(received_type) &&
+          !memory_node_storage_owner_runtime_detail::
+            exact_peer_response_allowed(received_type)) {
+        // A coupled cluster has no Stage1/Stage2/cleanup/placement handlers.
+        // Drop mixed-mode traffic at the receive boundary instead of parking
+        // it in a queue with no worker; startup negotiation should normally
+        // make this path unreachable.
         repost_peer_rpc_receive(peer_id, slot_id);
         continue;
       }
@@ -318,9 +336,24 @@ void MemoryNode::peer_rpc_progress_loop() {
             service::storage_owner::dynamic_node_control_request_bytes(
               header->item_count);
         }
-        if (header->item_count != 0 &&
-            header->item_count <= config.storage_owner_batch_max &&
-            header->reserved == 0 && bytes == expected_bytes) {
+        const bool valid_envelope = header->item_count != 0 &&
+          header->item_count <= config.storage_owner_batch_max &&
+          header->reserved == 0 && bytes == expected_bytes;
+        bool exact_actions_valid = valid_envelope;
+        if (valid_envelope && synchronous_exact && request_type ==
+              service::storage_owner::PeerRpcType::dynamic_node_control_request) {
+          const auto* items =
+            service::storage_owner::dynamic_node_control_items(payload);
+          exact_actions_valid = std::all_of(
+            items, items + header->item_count,
+            [](const service::storage_owner::DynamicNodeControlItem& item) {
+              return memory_node_storage_owner_runtime_detail::
+                exact_dynamic_control_action_allowed(
+                  static_cast<service::storage_owner::
+                    DynamicNodeControlAction>(item.action));
+            });
+        }
+        if (exact_actions_valid) {
           // These replies carry per-item payloads, so the generic header-only
           // replay cache cannot serve them.  The physical cleanup token table
           // and authority CAS make a same-ID re-execution side-effect safe.

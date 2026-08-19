@@ -56,9 +56,15 @@ PersistentKernelOccupancy inspect_persistent_search_kernel(
 
 void launch_persistent_search(cudaStream_t stream,
                               const PersistentKernelParams& params,
-                              u32 blocks, u32 threads) {
+                              u32 blocks, u32 threads,
+                              bool decoupled_search_progression) {
+  if (decoupled_search_progression !=
+      (params.issue_width > params.commit_width)) {
+    throw std::invalid_argument(
+      "GPU-RDMA search progression mode does not match graph widths");
+  }
   if (threads == 128) {
-    if (params.issue_width > params.commit_width) {
+    if (decoupled_search_progression) {
       persistent_search_kernel<128, true>
         <<<blocks, 128, 0, stream>>>(params);
     } else {
@@ -66,7 +72,7 @@ void launch_persistent_search(cudaStream_t stream,
         <<<blocks, 128, 0, stream>>>(params);
     }
   } else if (threads == 256) {
-    if (params.issue_width > params.commit_width) {
+    if (decoupled_search_progression) {
       persistent_search_kernel<256, true>
         <<<blocks, 256, 0, stream>>>(params);
     } else {

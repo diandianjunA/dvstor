@@ -24,6 +24,7 @@
 #include "gpu_search/index_format.hh"
 #include "gpu_search/persistent_kernel.hh"
 #include "service/breakdown.hh"
+#include "service/index_metadata.hh"
 #include "tools/breakdown_benchmark/dataset.hh"
 #include "tools/breakdown_benchmark/maintenance_log.hh"
 #include "tools/breakdown_benchmark/progress.hh"
@@ -76,9 +77,49 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
      (args.workload == "mixed" &&
       (args.mixed_mode == "rate_limited" ? args.target_query_qps > 0.0
                                          : args.read_ratio > 0.0)));
+  const bool mixed_has_writes = args.workload == "mixed" &&
+    (args.mixed_mode == "rate_limited" ? args.target_write_qps > 0.0
+                                       : args.read_ratio < 1.0);
+  if (service.config().synchronous_exact_updates_enabled() &&
+      mixed_has_writes &&
+      (args.write_upsert_ratio > 0.0 || args.write_delete_ratio > 0.0)) {
+    throw std::invalid_argument(
+      "coupled update mode is append-only: mixed workloads must set "
+      "--write-upsert-ratio=0 and --write-delete-ratio=0");
+  }
+
+  const auto index_prefix = service.config().resolved_index_prefix();
+  service::index_metadata::Metadata index_metadata;
+  str index_metadata_error;
+  if (!service::index_metadata::load_metadata(
+        index_prefix, index_metadata, &index_metadata_error)) {
+    throw std::runtime_error(
+      "failed to reload validated index metadata for benchmark report: " +
+      index_metadata_error);
+  }
 
   nlohmann::json root;
   root["meta"] = {
+    {"system_variant", {
+      {"profile_name", args.profile_name},
+      {"label", args.system_variant_label},
+      {"update_mutation_api",
+        service::storage_owner::mutation_api_name_for_completion_mode(
+          service.config().synchronous_exact_updates_enabled())},
+      {"resolved_modes", {
+        {"storage_owner_update_completion_mode",
+          service.config().storage_owner_update_completion_mode},
+        {"gpu_dynamic_graph_access_mode",
+          service.config().dynamic_graph_access_mode},
+        {"gpu_rdma_search_progression_mode",
+          service.config().gpu_rdma_search_progression_mode},
+      }},
+      {"index", {
+        {"prefix", normalize_path(index_prefix.string())},
+        {"schema_version", index_metadata.schema_version},
+        {"build_fingerprint", index_metadata.index_build_fingerprint},
+      }},
+    }},
     {"workload", args.workload},
     {"warmup_ops", args.warmup_ops},
     {"measure_ops", args.measure_ops},
@@ -111,8 +152,7 @@ nlohmann::json run_benchmark(ComputeService& service, const Args& args) {
     {"recall_mode", args.recall_mode},
     {"recall_base_id_limit", args.recall_base_id_limit},
     {"insert_start_id", args.insert_start_id},
-    {"index_prefix", normalize_path(
-       service.config().resolved_index_prefix().string())},
+    {"index_prefix", normalize_path(index_prefix.string())},
     {"dim", service.config().dim},
     {"threads", service.config().num_threads},
     {"fine_grained_breakdown_enabled", service.config().enable_breakdown},

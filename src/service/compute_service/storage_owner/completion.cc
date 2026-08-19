@@ -166,6 +166,13 @@ void ComputeService::handle_storage_owner_token_completion(
 
   const bool committed = completion.status ==
     static_cast<u32>(service::storage_owner::MutationStatus::ok);
+  if (committed && !valid_success_maintenance_sequence(
+        config_.synchronous_exact_updates_enabled(),
+        completion.maintenance_sequence)) {
+    throw std::runtime_error(
+      "storage-owner token completion violated the negotiated update "
+      "maintenance contract");
+  }
   if (!committed) {
     static std::atomic<u64> rejected_completion_logs{0};
     const u64 log_index = rejected_completion_logs.fetch_add(
@@ -344,6 +351,13 @@ void ComputeService::commit_storage_owner_slot(
     auto& task = state.tasks[task_id];
     auto& sample = storage_completion_samples_[task.completion_id];
     const bool committed = response_ok && statuses[i] == 0;
+    if (committed && !valid_success_maintenance_sequence(
+          config_.synchronous_exact_updates_enabled(),
+          mutation_results[i].maintenance_sequence)) {
+      throw std::runtime_error(
+        "storage-owner response violated the negotiated update maintenance "
+        "contract");
+    }
     if (committed && mutation_results[i].maintenance_sequence != 0 &&
         storage_maintenance_targets_ != nullptr) {
       const RemotePtr new_pointer{mutation_results[i].new_rptr_raw};

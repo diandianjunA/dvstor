@@ -34,5 +34,6 @@ using service::storage_owner_client::storage_owner_wr_id;
 using service::storage_owner_client::storage_owner_completion_wr_id;
 using service::storage_owner_client::storage_owner_is_completion_wr;
 using service::storage_owner_client::storage_owner_wr_owner;
+using service::storage_owner_client::valid_success_maintenance_sequence;
 
 }  // namespace compute_service_detail

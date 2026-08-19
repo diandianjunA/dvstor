@@ -187,6 +187,21 @@ void test_recall_and_report_formatting() {
 
   nlohmann::json root;
   root["meta"] = {
+    {"system_variant", {
+      {"profile_name", "04_gpu_persistent_gpunetio_baseline"},
+      {"label", "baseline"},
+      {"update_mutation_api", "append_only"},
+      {"resolved_modes", {
+        {"storage_owner_update_completion_mode", "coupled"},
+        {"gpu_dynamic_graph_access_mode", "fixed"},
+        {"gpu_rdma_search_progression_mode", "coupled"},
+      }},
+      {"index", {
+        {"prefix", "/data/index/shared"},
+        {"schema_version", 16},
+        {"build_fingerprint", 0x123456789abcdef0ULL},
+      }},
+    }},
     {"workload", "query"},
     {"gpu_graph_commit_width", 16},
     {"gpu_graph_issue_width", 32},
@@ -205,6 +220,8 @@ void test_recall_and_report_formatting() {
   };
   root["throughput"] = {{"duration_seconds", 0.0}};
   root["gpu_persistent"] = telemetry_json;
+  assert(root["meta"]["system_variant"]["update_mutation_api"] ==
+         "append_only");
   root["stage2"] = {
     {"requested_logs", 1},
     {"failures", 0},
@@ -226,6 +243,24 @@ void test_recall_and_report_formatting() {
   report.query.end_to_end_latencies_ns.push_back(1'000'000);
   const auto formatted = tools::breakdown_benchmark::format_report(root, report);
   assert(formatted.bottleneck_summary.contains("query"));
+  assert(formatted.text.find(
+           "profile_name: 04_gpu_persistent_gpunetio_baseline") !=
+         std::string::npos);
+  assert(formatted.text.find("update_mutation_api: append_only") !=
+         std::string::npos);
+  assert(formatted.text.find(
+           "storage_owner_update_completion_mode: coupled") !=
+         std::string::npos);
+  assert(formatted.text.find(
+           "gpu_dynamic_graph_access_mode: fixed") !=
+         std::string::npos);
+  assert(formatted.text.find(
+           "gpu_rdma_search_progression_mode: coupled") !=
+         std::string::npos);
+  assert(formatted.text.find("index_prefix: /data/index/shared") !=
+         std::string::npos);
+  assert(formatted.text.find("index_build_fingerprint: 1311768467463790320") !=
+         std::string::npos);
   assert(formatted.text.find("single_pass_no_reuse") != std::string::npos);
   assert(formatted.text.find("query breakdown") != std::string::npos);
   assert(formatted.text.find("failures (hard): 0") != std::string::npos);

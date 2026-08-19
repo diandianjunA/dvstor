@@ -1,26 +1,22 @@
-# GPU 查询优化实验
+# 三项贡献机制的动机与内部实验
 
-当前项目只保留两项已经通过端到端性能和正确性验证、且能够组合使用的查询优化：
-
-1. **Stable-Run Beam Merge**：复用已有有序 Beam，只排序本轮候选 run，再执行稳定
-   top-K merge。
-2. **Live-Extent RDMA**：保留存储侧可更新的定长图记录，只通过 one-sided RDMA
-   传输当前有效 extent；并发更新时由 GPU packed high-water 安全修复过期长度档。
-
-正式运行入口只有一个 full profile：
+正式系统使用 `main` 中两个同二进制、同索引的 profile：
 
 ```text
+experiment/profiles/04_gpu_persistent_gpunetio_baseline.env
 experiment/profiles/04_gpu_persistent_gpunetio.env
 ```
 
-查询优化消融均从这个 profile 出发，只覆盖被测开关。比如 Beam merge A/B 只覆盖
-`GPU_QUERY_BEAM_MERGE_POLICY`，Live-Extent A/B 只覆盖
-`GPU_QUERY_GRAPH_READ_POLICY`/`GPU_DYNAMIC_GRAPH_EXTENT`；runner 固定其余 C16、
-Beam、expansion budget、rerank、QP 和更新配置。这里的 feature-off 只用于单项因果
-分析，不是论文的系统 baseline。系统 reference baseline 是
-`baseline/cpu-gpu-exact-safe@f304e99` 的 CPU-driven GPU exact +
-storage-owner exact/sync 版本，契约见
+baseline 保留存算分离、GPU 和更新卸载基础系统；full 只把更新完成语义、动态图访问
+粒度和 GPU-RDMA 搜索推进三个顶层 mode 从 off 切到 on。完整矩阵与运行契约见
 `experiment/README.md`。
+
+本目录保留 Stable-Run Beam Merge、Live-Extent RDMA 和 C16 等低层设计的历史微实验，
+用于解释 umbrella mechanism 的内部实现选择，不把它们继续包装成额外的系统级贡献
+开关。历史结果目录和原始报告保持原样以便审计；正式 baseline/full 主对照只改变三个
+顶层 mode，其他 Beam、expansion budget、rerank、QP、线程和容量参数完全相同。
+本目录需要直接控制 graph-read 或 Beam-merge child knob 的旧微实验配置会显式选择
+对应的 `manual` umbrella mode；`manual` 不是第三个正式系统 profile。
 
 ## Stable-Run Beam Merge
 
@@ -139,7 +135,7 @@ LIVE_EXTENT_CONFIG=motivation/configs/live_extent_rdma.env \
 ## C16 与性能诊断
 
 `results/sweep/prefetch_sweep.csv` 保留固定 batch `1,2,4,8,16,32` 的完整汇总，
-用于说明为什么 full profile 与对应 feature-off 消融都固定使用 C16。需要重新运行时：
+用于说明为什么 baseline/full 共同参数都固定使用 C16。需要重新运行时：
 
 ```bash
 ./motivation/run_prefetch_sweep.sh

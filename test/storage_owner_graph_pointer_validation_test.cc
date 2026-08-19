@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cassert>
 #include <vector>
 
@@ -148,6 +149,29 @@ int main() {
     dynamic_tail.data(), dynamic_tail.size(), stable_neighbors.data(), 3,
     provisional_neighbors.data(), 2, 14, true, 8));
   verify_publication(3, 2, 8, true);
+
+  // Fixed graph access keeps the identical graph+tag publication layout but
+  // makes the advisory byte inert. The incarnation remains authoritative and
+  // the following PQ payload is still outside the write range.
+  std::fill(dynamic_tail.begin(), dynamic_tail.end(), kPqGuard);
+  assert(VamanaNode::encode_dynamic_graph_publication(
+    dynamic_tail.data(), dynamic_tail.size(), stable_neighbors.data(), 3,
+    provisional_neighbors.data(), 1, 15, false, 9,
+    VamanaNode::HOT_GRAPH_SHARD_BITS, false));
+  const u32 fixed_access_tag = vamana::hot_graph::load_u32_le(
+    dynamic_tail.data() + graph_bytes);
+  assert(VamanaNode::dynamic_navigation_tag_incarnation(fixed_access_tag) ==
+         9);
+  assert(VamanaNode::dynamic_navigation_tag_extent_class(fixed_access_tag) ==
+         VamanaNode::DYNAMIC_CODE_EXTENT_CLASS_UNKNOWN);
+  assert(VamanaNode::decode_hot_graph_entry(
+    dynamic_tail.data(), dynamic_decoded_graph.data(), 9));
+  assert(VamanaNode::decoded_neighbor_count(dynamic_decoded_graph.data()) ==
+         4);
+  for (size_t byte = publication_bytes;
+       byte < dynamic_tail.size(); ++byte) {
+    assert(dynamic_tail[byte] == kPqGuard);
+  }
 
   const RemotePtr immutable_base{
     0, vamana::hot_graph::kNodeBaseOffset, 0};

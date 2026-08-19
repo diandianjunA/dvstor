@@ -91,7 +91,30 @@ void MemoryNode::process_storage_owner_insert_task(const StorageOwnerInsertTask&
       });
   };
 
-  const bool ok = execute_storage_owner_batch_items(
+  const bool synchronous_exact =
+    config.synchronous_exact_updates_enabled();
+  if (synchronous_exact) {
+    for (u32 item = 0; item < request->item_count; ++item) {
+      lib_assert(stage1_homes[item] == storage_id_,
+                 "coupled update was routed to a non-authority home; "
+                 "compute/memory-node completion modes do not match");
+    }
+  }
+  const bool ok = synchronous_exact
+    ? execute_storage_owner_batch_items_exact(
+        ids,
+        scratch.kinds.data(),
+        vectors,
+        operation_ids,
+        request->source_client,
+        request->item_count,
+        breakdown,
+        config,
+        &scratch.invalidated_neighbors,
+        &scratch.statuses,
+        &scratch.results,
+        emit_completion)
+    : execute_storage_owner_batch_items(
         ids,
         scratch.kinds.data(),
         vectors,

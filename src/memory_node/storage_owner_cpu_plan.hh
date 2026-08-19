@@ -35,6 +35,83 @@ struct PhysicalHomeWorkerSplit {
   std::uint32_t stage2_home{};
 };
 
+// The peer runtime currently has one CQ progress loop, one response-dispatch
+// loop, and one serial placement/dynamic-control loop. Convert the aggregate
+// CPU-plan counts to those concrete roles in one testable place so a disabled
+// role can never create or pin an unbudgeted thread.
+struct PeerRuntimeThreadPlan {
+  std::uint32_t cq_progress_threads{};
+  std::uint32_t response_dispatch_threads{};
+  std::uint32_t placement_control_threads{};
+};
+
+inline constexpr bool peer_runtime_thread_counts_supported(
+    const StorageOwnerCpuPlan& plan) {
+  return plan.peer_progress_threads <= 2 &&
+    plan.peer_placement_workers <= 1;
+}
+
+inline constexpr PeerRuntimeThreadPlan derive_peer_runtime_thread_plan(
+    const StorageOwnerCpuPlan& plan) {
+  return {
+    .cq_progress_threads = plan.peer_progress_threads == 0 ? 0u : 1u,
+    .response_dispatch_threads = plan.peer_progress_threads < 2 ? 0u : 1u,
+    .placement_control_threads = plan.peer_placement_workers,
+  };
+}
+
+// The append-only coupled baseline has no physical-home Stage1 executor,
+// Stage2 maintenance domain, or receiver-side storage RPC worker. A logical
+// authority performs the complete fresh insert itself; cross-shard search and
+// backlink mutation use synchronous one-sided RDMA on the authority lane.
+// Keep this plan separate from the two-stage plan so the baseline cannot
+// silently reserve CPUs for a target-side execution domain.
+inline StorageOwnerCpuPlan derive_storage_owner_exact_cpu_plan(
+    std::uint32_t available_cpus,
+    std::uint32_t rpc_parallelism,
+    std::uint32_t remote_peer_count) {
+  (void)remote_peer_count;
+  const std::uint32_t budget = std::max<std::uint32_t>(1, available_cpus);
+  StorageOwnerCpuPlan plan;
+  // Keep one authority lane even on deliberately tiny test/development CPU
+  // sets, then assign every auxiliary role only from the remaining budget.
+  // The production remote path requires the two-lane floor documented by
+  // exact_update_remote_cpu_floor(); deriving a smaller diagnostic plan must
+  // nevertheless never make CoreAssignment consume past its end.
+  plan.foreground_workers = 1;
+  std::uint32_t remaining = budget - 1;
+  const auto take = [&](std::uint32_t& role, std::uint32_t count = 1) {
+    const std::uint32_t assigned = std::min(remaining, count);
+    role += assigned;
+    remaining -= assigned;
+  };
+  take(plan.foreground_progress_threads);
+  const std::uint32_t foreground_cap =
+    std::max<std::uint32_t>(1, rpc_parallelism);
+  take(plan.foreground_workers, foreground_cap - 1);
+  plan.foreground_coordinators = plan.foreground_workers;
+  return plan;
+}
+
+inline constexpr std::uint32_t exact_update_remote_cpu_floor() {
+  // authority + storage lifecycle/compute-facing completion poller. The
+  // authority polls its own one-sided RDMA completions; the remote shard runs
+  // no update handler.
+  return 2;
+}
+
+inline bool exact_update_plan_has_remote_correctness_floor(
+    const StorageOwnerCpuPlan& plan) {
+  return plan.foreground_workers != 0 &&
+    plan.foreground_progress_threads != 0 &&
+    plan.peer_progress_threads == 0 &&
+    plan.peer_placement_workers == 0 &&
+    plan.peer_reverse_workers == 0 &&
+    plan.peer_cleanup_workers == 0 &&
+    plan.peer_stage1_workers == 0 &&
+    plan.maintenance_workers == 0;
+}
+
 // Isolate latency-bearing Stage1 publication from the much more numerous
 // read-only Stage2 home operations without changing the CPU plan's total.
 // Very small deployments keep the legacy shared executor because taking its

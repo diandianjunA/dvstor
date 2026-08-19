@@ -573,6 +573,38 @@ FormattedReport format_report(const nlohmann::json& root,
                               const service::breakdown::Report& report) {
   nlohmann::json summaries = nlohmann::json::object();
   std::ostringstream output;
+  const auto system_variant = root["meta"].value(
+    "system_variant", nlohmann::json::object());
+  const auto resolved_modes = system_variant.value(
+    "resolved_modes", nlohmann::json::object());
+  const auto variant_index = system_variant.value(
+    "index", nlohmann::json::object());
+  output << "system_variant\n";
+  output << "  profile_name: "
+         << system_variant.value("profile_name", "unspecified") << '\n';
+  output << "  label: "
+         << system_variant.value("label", "unspecified") << '\n';
+  output << "  update_mutation_api: "
+         << system_variant.value("update_mutation_api", "unspecified")
+         << '\n';
+  output << "  storage_owner_update_completion_mode: "
+         << resolved_modes.value(
+              "storage_owner_update_completion_mode", "unspecified")
+         << '\n';
+  output << "  gpu_dynamic_graph_access_mode: "
+         << resolved_modes.value("gpu_dynamic_graph_access_mode", "unspecified")
+         << '\n';
+  output << "  gpu_rdma_search_progression_mode: "
+         << resolved_modes.value(
+              "gpu_rdma_search_progression_mode", "unspecified")
+         << '\n';
+  output << "  index_prefix: "
+         << variant_index.value("prefix", "") << '\n';
+  output << "  index_schema_version: "
+         << variant_index.value("schema_version", 0U) << '\n';
+  output << "  index_build_fingerprint: "
+         << variant_index.value("build_fingerprint", 0ULL) << '\n';
+
   const auto& recall_query_meta = root["meta"]["recall_query"];
   const auto& performance_query_meta = root["meta"]["performance_query"];
   output << "query_inputs\n";

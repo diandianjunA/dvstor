@@ -12,6 +12,15 @@ size_t ComputeService::submit_storage_owner_mutations(
   if (storage_insert_owners_.empty()) {
     throw std::runtime_error("storage_owner mutation runtime is not initialized");
   }
+  const bool synchronous_exact =
+    config_.synchronous_exact_updates_enabled();
+  if (!service::storage_owner::mutation_supported_by_completion_mode(
+        synchronous_exact, kind)) {
+    throw std::invalid_argument(
+      "storage_owner_update_completion_mode=coupled is a strict "
+      "single-owner RDMA append-only baseline; upsert and erase require "
+      "the decoupled update mode");
+  }
   for (const auto& item : items) {
     if (item.id >= config_.vector_id_namespace_size) {
       throw std::out_of_range(
@@ -42,9 +51,27 @@ size_t ComputeService::submit_storage_owner_mutations(
   const auto consume_one = [&]() {
     lib_assert(!pending.empty(), "missing storage-owner completion");
     const u32 completion_id = pending.back();
-    const auto result = storage_completion_pool_->wait_for(
+    auto result = storage_completion_pool_->wait_for(
       completion_id,
       std::chrono::milliseconds(config_.storage_owner_rpc_timeout_ms));
+    u64 exact_wait_windows = 0;
+    while (synchronous_exact &&
+           result == bounded::CompletionPool::Result::pending) {
+      ++exact_wait_windows;
+      if (exact_wait_windows <= 8 ||
+          (exact_wait_windows & (exact_wait_windows - 1)) == 0) {
+        std::cerr << "[storage-owner] synchronous exact mutation is still "
+                     "running after "
+                  << (exact_wait_windows *
+                      config_.storage_owner_rpc_timeout_ms)
+                  << " ms; retaining the caller completion until the exact "
+                     "storage operation reaches a terminal result"
+                  << std::endl;
+      }
+      result = storage_completion_pool_->wait_for(
+        completion_id,
+        std::chrono::milliseconds(config_.storage_owner_rpc_timeout_ms));
+    }
     if (result == bounded::CompletionPool::Result::pending) {
       const u64 log_index = storage_insert_late_rpc_completions_.fetch_add(
         1, std::memory_order_relaxed);
@@ -115,25 +142,27 @@ size_t ComputeService::submit_storage_owner_mutations(
     } producer_announcement{state.pending_producers};
     u32 stage1_home = owner_storage;
     if (kind != service::storage_owner::MutationKind::erase) {
-      if (persistent_search_ == nullptr) {
-        throw std::runtime_error(
-          "centroid home selection requires the persistent query engine");
-      }
       canonical_bytes.resize(VamanaNode::vector_bytes());
       encode_float_vector_to_storage(
         item.values.data(), config_.dim, VamanaNode::vector_dtype(),
         canonical_bytes.data());
-      canonical_vector.resize(config_.dim);
-      decode_storage_vector_to_float(
-        canonical_bytes.data(), VamanaNode::vector_dtype(), config_.dim,
-        canonical_vector.data());
-      const auto selected = persistent_search_->select_centroid_home(
-        span<const element_t>{canonical_vector});
-      if (!selected.has_value() || *selected >= num_servers_) {
-        throw std::runtime_error(
-          "no live physical-shard centroid is available for mutation");
+      if (!synchronous_exact) {
+        if (search_engine_ == nullptr) {
+          throw std::runtime_error(
+            "centroid home selection requires an active query engine");
+        }
+        canonical_vector.resize(config_.dim);
+        decode_storage_vector_to_float(
+          canonical_bytes.data(), VamanaNode::vector_dtype(), config_.dim,
+          canonical_vector.data());
+        const auto selected = search_engine_->select_centroid_home(
+          span<const element_t>{canonical_vector});
+        if (!selected.has_value() || *selected >= num_servers_) {
+          throw std::runtime_error(
+            "no live physical-shard centroid is available for mutation");
+        }
+        stage1_home = *selected;
       }
-      stage1_home = *selected;
     }
 
     u32 completion_id = 0;
@@ -230,8 +259,8 @@ bool ComputeService::wait_for_storage_maintenance(
       std::memory_order_acquire);
   }
   vec<u64> effective_targets;
-  const bool complete = persistent_search_ != nullptr &&
-    persistent_search_->wait_for_maintenance(
+  const bool complete = search_engine_ != nullptr &&
+    search_engine_->wait_for_maintenance(
       span<const u64>{targets}, timeout, durable_sequences,
       &effective_targets);
   if (target_sequences != nullptr) {

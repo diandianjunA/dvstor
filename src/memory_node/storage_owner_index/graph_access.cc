@@ -1639,7 +1639,8 @@ void MemoryNode::write_graph_adjacency(
                  entry.data(), entry.size(), bounded_stable.data(),
                  bounded_stable.size(), bounded_provisional.data(),
                  bounded_provisional.size(), generation, deleted,
-                 rptr.incarnation(), VamanaNode::HOT_GRAPH_SHARD_BITS),
+                 rptr.incarnation(), VamanaNode::HOT_GRAPH_SHARD_BITS,
+                 dynamic_graph_extent_publication_enabled_),
                "failed to serialize dynamic graph publication");
   } else {
     VamanaNode::encode_hot_graph_entry(
@@ -1795,7 +1796,8 @@ void MemoryNode::write_new_node_on_shard(
                record.size() - VamanaNode::HOT_GRAPH_DYNAMIC_HOT_OFFSET,
                bounded_neighbors.data(), bounded_neighbors.size(),
                nullptr, 0, generation, false, rptr.incarnation(),
-               VamanaNode::HOT_GRAPH_SHARD_BITS),
+               VamanaNode::HOT_GRAPH_SHARD_BITS,
+               dynamic_graph_extent_publication_enabled_),
              "failed to serialize remote dynamic graph publication");
 
   thread_local vec<f32> transformed;

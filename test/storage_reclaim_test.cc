@@ -33,5 +33,18 @@ int main() {
   assert(queue.size() == 0);
   assert(queue.reused() == 3);
   assert(!queue.acquire(100).has_value());
+
+  // A fully synchronous cleanup has no Stage2/durable-watermark debt. Its
+  // already-tombstoned slot is directly reusable, while physical-address
+  // dedupe still rejects delayed cleanup retries from any incarnation.
+  const RemotePtr exact{2, 16384, 3};
+  assert(queue.retire_ready(exact));
+  assert(!queue.retire_ready(exact));
+  assert(!queue.retire(RemotePtr{2, 16384, 4}, 101));
+  const auto exact_reclaimed = queue.acquire(0);
+  assert(exact_reclaimed.has_value());
+  assert(*exact_reclaimed == exact);
+  assert(queue.size() == 0);
+  assert(queue.reused() == 4);
   return 0;
 }

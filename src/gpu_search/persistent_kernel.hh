@@ -670,7 +670,8 @@ PersistentKernelOccupancy inspect_persistent_search_kernel(
 
 void launch_persistent_search(cudaStream_t stream,
                               const PersistentKernelParams& params,
-                              u32 blocks, u32 threads);
+                              u32 blocks, u32 threads,
+                              bool decoupled_search_progression);
 void launch_direct_read_owners(cudaStream_t stream,
                                const PersistentKernelParams& params,
                                u32 queue_count, u32 threads);

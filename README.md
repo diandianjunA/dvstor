@@ -1,11 +1,14 @@
 # DVSTOR
 
-DVSTOR 是面向动态向量检索的存算分离系统。`dev` 分支只保留一条查询路径：
-GPU 常驻 OPQ/PQ32 导航码，持久化 CUDA kernel 维护查询状态，并通过 DOCA
-GPUNetIO 直接读取存储节点上的紧凑图记录与精确向量。CPU 仅负责请求准入、
-启动阶段批量传输、控制面和动态更新 RPC，不参与稳态图遍历。
+DVSTOR 是面向动态向量检索的存算分离系统。`main` 内的 baseline 与 full 使用同一份
+schema-16 索引和相同的图、PQ、路由、动态 header 与精确向量表示，但由贡献级 mode
+选择不同的查询执行 owner。baseline 的 HostOrchestrated 后端由 CPU 维护 Beam/visited、
+post/poll one-sided RDMA，并按严格波次调用有限生命周期 CUDA PQ/精确距离 kernel；它
+不启动 persistent query kernel，也不使用 GPUNetIO query transport。full 的 Persistent
+后端由 GPU 常驻 OPQ/PQ32 导航码和查询状态，通过 DOCA GPUNetIO 直接读取存储节点数据，
+并执行 ahead-of-commit 流水推进。两者切换的是搜索执行机制，不是索引结构。
 
-## 查询路径
+## Full 查询路径
 
 1. CPU 将请求写入有界提交队列，并按微批分配 GPU 查询槽。
 2. 持久化 GPU block 完成 OPQ 变换并构建 PQ 查找表。
@@ -20,7 +23,9 @@ GPUNetIO 直接读取存储节点上的紧凑图记录与精确向量。CPU 仅�
 
 ## 动态更新
 
-存储节点继续拥有 insert、upsert 和 delete 的图维护协议：
+存储节点继续拥有 insert、upsert 和 delete 的图维护协议；其中完整系统的
+`decoupled` 模式支持三者，严格单-owner baseline 的 `coupled` 模式只接受
+append-only fresh insert，并在任何 authority/物理副作用前明确拒绝 upsert/delete：
 
 - storage owner 负责 idmap、代际、紧凑图记录和反向边维护；
 - Stage1 在物理 home 写入节点、出边和本地反向边，使新节点立即进入权威图；
@@ -79,20 +84,21 @@ frontier、实际远端展开和评分记录数，初选 home 命中率、迁移
 
 运行索引固定为 schema 16、L2、`plain` vector record、tagged compact graph、持久化
 storage control block 和 OPQ/PQ 导航。默认 profile 使用 32 个 8-bit 子空间。
-默认 `fixed` 图读取路径不需要计算节点图 metadata；可选 `live-extent` 路径只额外读取
-一个 1 byte/base-node 的只读长度 sidecar，不保存邻接表。
+`fixed` 图读取路径运行时不消费 extent class；`live-extent` 路径读取一个
+1 byte/base-node 的只读长度 sidecar，不保存邻接表。正式 baseline/full
+为确保物理索引完全相同，两者启动时都校验该 sidecar。
 
 | 文件                              | 计算节点             | 存储节点 X | 作用                     |
 | ------------------------------- | ---------------- | ------ | ---------------------- |
 | `<prefix>.meta.json`            | 必需               | 必需     | 分片、远端 offset 和格式契约     |
 | `<prefix>.pq32`                 | 必需               | 不需要    | OPQ 矩阵与 PQ codebook    |
-| `<prefix>.gextent8`             | live-extent 时必需 | 不需要    | 每个 base node 的 8-edge 读取长度档 |
+| `<prefix>.gextent8`             | 正式 baseline/full 必需 | 不需要    | 每个 base node 的 8-edge 读取长度档 |
 | `<prefix>_nodeX_ofN.dat`        | 不需要              | 必需     | 精确向量、固定记录和紧凑图          |
 | `<prefix>_nodeX_ofN.idmap`      | 不需要              | 必需     | 与构建/owner 强绑定的 ID/代际/物理目录 |
 | `<prefix>_nodeX_ofN.centroid`   | 不需要              | 必需     | 物理分片 FP64 sum/count 与启动入口  |
 | `<prefix>_nodeX_ofN.pq32.codes` | 不需要              | 必需     | 启动时注册到远端内存的 PQ32 码流    |
 
-计算节点本地保存 metadata 和 PQ 模型；启用 `live-extent` 时还保存
+计算节点本地保存 metadata、PQ 模型和正式 profile 共用的
 `.gextent8`。该 sidecar 对 SIFT100M 为约 100 MB，只含全局物理 ordinal 对应的
 长度档和与索引绑定的校验头，不包含 handle、边或向量。metadata 只合成并校验不可变分片布局，
 不读取 medoid 或离线采样 entry-point。METIS 只决定物理 placement；逻辑 authority
@@ -187,8 +193,29 @@ OPQ/PQ32 模型和每分片 PQ32 码流，最后全量校验图记录并生成 `
 
 ## 运行 SIFT100M
 
-先在 `experiment/profiles/04_gpu_persistent_gpunetio.env` 或环境变量中配置
-`HOSTS`、`INDEX_DIR`、GPU 与内存预算。在存储节点启动对应分片后，在计算节点运行：
+正式实验在 `main` 内使用两个同二进制、同 schema-16 索引的 profile：
+`04_gpu_persistent_gpunetio_baseline` 关闭三个贡献级机制，
+`04_gpu_persistent_gpunetio` 全部开启。两者只允许在更新完成语义、动态图访问粒度和
+GPU-RDMA 搜索推进三个 mode 上不同，其他配置来自同一个 common profile。
+baseline 的 coupled update 只接受 append-only fresh insert，由单一 logical storage
+owner 同步完成全局 RDMA 搜索、剪枝、稳定写入和 one-sided RDMA 反向边后再 ACK；
+它没有远端更新 CPU handler、Stage1/Stage2、accepted backlog 或 maintenance
+migration，且 `maintenance_sequence=0`。upsert/delete 在提交给 authority 前 fail-fast，
+不会暗中退回远端 CPU helper。baseline 的 coupled search 使用
+CPU-owned Beam/visited、CPU-posted RDMA 和有限生命周期 CUDA scoring；full 的
+decoupled search 使用 persistent GPU/GPUNetIO 流水。两者始终读取同一份 schema-16
+索引，只改变查询执行 owner 与推进语义。完整语义见实验文档。
+
+先配置 `HOSTS`、`INDEX_DIR`、GPU 与内存预算。baseline 运行：
+
+```bash
+./experiment/start_all_memory_nodes.sh 04_gpu_persistent_gpunetio_baseline
+./experiment/run_recall.sh 04_gpu_persistent_gpunetio_baseline
+./experiment/run_breakdown.sh 04_gpu_persistent_gpunetio_baseline
+./experiment/stop_memory_nodes.sh
+```
+
+full 运行：
 
 ```bash
 ./experiment/start_all_memory_nodes.sh 04_gpu_persistent_gpunetio
@@ -208,7 +235,7 @@ Benchmark 并发使用独立的 `BENCHMARK_CLIENT_THREADS`，不写入索引/系
 `bigann_base.bvecs`。
 
 分布式部署时，每台存储节点只需其自身的 `.dat`、`.idmap`、`.centroid`、
-`.pq32.codes`，再加共享 metadata。计算节点启用 `live-extent` 时还需要
+`.pq32.codes`，再加共享 metadata。计算节点运行正式 baseline/full 时还需要
 `.gextent8`；它不是路由或图副本。详细流程见
 `experiment/README.md`。
 
@@ -231,4 +258,4 @@ bash -n experiment/*.sh experiment/profiles/*.env
 - `src/service/`：计算服务、索引契约和统计；
 - `src/vamana/`：compact graph、CentroidRouter、centroid state 和 idmap 格式；
 - `tools/vamana_offline/`：离线构图与 PQ sidecar 生成；
-- `experiment/`：唯一支持的 SIFT100M profile。
+- `experiment/`：同索引的 SIFT100M baseline/full profiles 与实验脚本。

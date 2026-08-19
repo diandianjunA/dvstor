@@ -8,12 +8,11 @@
 using namespace memory_node_storage_owner_maintenance_detail;
 
 bool MemoryNode::storage_owner_maintenance_enabled(const Configuration& config) {
-  return config.storage_owner_maintenance_workers > 0;
+  return !config.synchronous_exact_updates_enabled() &&
+    config.storage_owner_maintenance_workers > 0;
 }
 
 void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& config) {
-  lib_assert(storage_owner_maintenance_enabled(config),
-             "the two-stage update protocol requires a Stage2 executor");
   auto* control = reinterpret_cast<gpu_search::format::StorageControlBlock*>(
     index_buffer_.get_full_buffer() + gpu_storage_control_offset_);
   lib_assert(control->magic == gpu_search::format::kStorageControlMagic &&
@@ -25,6 +24,42 @@ void MemoryNode::start_storage_owner_maintenance_runtime(const Configuration& co
   const u64 initial_durable = durable.load(std::memory_order_acquire);
   lib_assert(initial_next == initial_durable + 1,
              "storage-owner cannot restart with unfinished in-memory maintenance");
+  if (config.synchronous_exact_updates_enabled()) {
+    // Coupled mode accepts only fresh inserts and owns no Stage1/Stage2
+    // descriptors, completion ring, executor, tombstone cleanup, or reclaim
+    // debt. Its storage-control next/durable watermarks therefore remain
+    // unchanged.
+    storage_owner_maintenance_completion_ring_.reset();
+    storage_owner_maintenance_admission_limit_ = 0;
+    storage_owner_maintenance_shutdown_.store(
+      false, std::memory_order_release);
+    storage_owner_maintenance_active_workers_.store(
+      0, std::memory_order_relaxed);
+    storage_owner_maintenance_enqueued_.store(0, std::memory_order_relaxed);
+    storage_owner_maintenance_finalize_enqueued_.store(
+      0, std::memory_order_relaxed);
+    storage_owner_maintenance_cleanup_enqueued_.store(
+      0, std::memory_order_relaxed);
+    storage_owner_maintenance_wake_worker_count_.store(
+      0, std::memory_order_release);
+    storage_owner_search_lane_lease_limit_.store(
+      0, std::memory_order_release);
+    storage_owner_maintenance_started_ns_.store(0, std::memory_order_release);
+    gpu_search::maintenance_telemetry::publish(
+      reinterpret_cast<byte_t*>(control),
+      gpu_search::maintenance_telemetry::Snapshot{
+        .shard_id = storage_id_,
+        .published_steady_ns = steady_now_ns(),
+        .admission_window = 0,
+        .active_stage2_context_limit = 0,
+      });
+    print_status(
+      "storage-owner Stage2 maintenance executor: disabled "
+      "(synchronous-exact; no descriptor ring or public debt)");
+    return;
+  }
+  lib_assert(storage_owner_maintenance_enabled(config),
+             "the two-stage update protocol requires a Stage2 executor");
   const u32 rpc_parallelism = std::max<u32>(
     1, static_cast<u32>(num_clients_) *
        std::max<u32>(1, config.storage_owner_rpc_depth));

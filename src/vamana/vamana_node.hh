@@ -451,7 +451,8 @@ public:
       u32 generation,
       bool deleted,
       u32 slot_incarnation,
-      u32 shard_bits = HOT_GRAPH_SHARD_BITS) {
+      u32 shard_bits = HOT_GRAPH_SHARD_BITS,
+      bool publish_extent_hint = true) {
     const size_t publication_bytes = dynamic_graph_publication_size();
     if (out == nullptr || out_bytes < publication_bytes ||
         stable_count > R || provisional_count > provisional_slots() ||
@@ -472,10 +473,15 @@ public:
         vamana::hot_graph::checksum16(out, hot_graph_entry_size());
       vamana::hot_graph::store_u16_le(out + 2, checksum);
     }
-    const u8 extent_class = graph_extent_class(
-      static_cast<u32>(stable_count),
-      static_cast<u32>(provisional_count));
-    if (extent_class == DYNAMIC_CODE_EXTENT_CLASS_UNKNOWN) return false;
+    const u8 extent_class = publish_extent_hint
+      ? graph_extent_class(
+          static_cast<u32>(stable_count),
+          static_cast<u32>(provisional_count))
+      : DYNAMIC_CODE_EXTENT_CLASS_UNKNOWN;
+    if (publish_extent_hint &&
+        extent_class == DYNAMIC_CODE_EXTENT_CLASS_UNKNOWN) {
+      return false;
+    }
     vamana::hot_graph::store_u32_le(
       out + hot_graph_entry_size(),
       pack_dynamic_navigation_tag(slot_incarnation, extent_class));

@@ -16,7 +16,7 @@
 #include "common/bounded_queue.hh"
 #include "common/completion_pool.hh"
 #include "common/core_assignment.hh"
-#include "gpu_search/persistent_engine.hh"
+#include "gpu_search/search_engine.hh"
 #include "memory_node/startup_protocol.hh"
 #include "service/breakdown.hh"
 #include "service/storage_owner_protocol.hh"
@@ -76,15 +76,15 @@ public:
   void clear_thread_statistics();
   service::breakdown::Report collect_breakdown_report() const;
   gpu_search::TelemetrySnapshot gpu_search_telemetry() const {
-    return persistent_search_ == nullptr
-      ? gpu_search::TelemetrySnapshot{} : persistent_search_->telemetry();
+    return search_engine_ == nullptr
+      ? gpu_search::TelemetrySnapshot{} : search_engine_->telemetry();
   }
   std::vector<std::optional<gpu_search::maintenance_telemetry::Snapshot>>
     storage_maintenance_telemetry() {
-    return persistent_search_ == nullptr
+    return search_engine_ == nullptr
       ? std::vector<std::optional<
           gpu_search::maintenance_telemetry::Snapshot>>{}
-      : persistent_search_->read_maintenance_telemetry();
+      : search_engine_->read_maintenance_telemetry();
   }
   u64 late_storage_owner_rpc_completions() const {
     return storage_insert_late_rpc_completions_.load(
@@ -273,7 +273,9 @@ private:
 
   std::atomic<size_t> vectors_inserted_{0};
 
-  std::unique_ptr<gpu_search::PersistentSearchEngine> persistent_search_;
+  // Both implementations expose identical query, route, and maintenance-
+  // control semantics through this backend-neutral boundary.
+  std::unique_ptr<gpu_search::SearchEngine> search_engine_;
   std::thread storage_insert_progress_thread_;
   std::thread storage_insert_completion_thread_;
   std::atomic<bool> storage_insert_shutdown_{false};

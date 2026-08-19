@@ -1,6 +1,7 @@
 #include <cassert>
 #include <vector>
 
+#include "memory_node/storage_owner_runtime/exact_update_contract.hh"
 #include "service/storage_owner_protocol.hh"
 
 namespace {
@@ -423,11 +424,68 @@ void test_authority_extension_rpc_layouts() {
          dynamic_response.data() + dynamic_response.size());
 }
 
+void test_exact_peer_runtime_surface() {
+  namespace exact = memory_node_storage_owner_runtime_detail;
+  namespace protocol = service::storage_owner;
+
+  static_assert(exact::kExactUpdateContract.append_only);
+  static_assert(!exact::kExactUpdateContract.supports_upsert);
+  static_assert(!exact::kExactUpdateContract.supports_erase);
+  static_assert(exact::exact_mutation_kind_allowed(
+    protocol::MutationKind::insert));
+  static_assert(!exact::exact_mutation_kind_allowed(
+    protocol::MutationKind::upsert));
+  static_assert(!exact::exact_mutation_kind_allowed(
+    protocol::MutationKind::erase));
+  static_assert(!exact::exact_peer_request_allowed(
+    protocol::PeerRpcType::reconcile_reverse_request));
+  static_assert(!exact::exact_peer_request_allowed(
+    protocol::PeerRpcType::centroid_membership_request));
+  static_assert(!exact::exact_peer_request_allowed(
+    protocol::PeerRpcType::dynamic_node_control_request));
+  static_assert(!exact::exact_peer_request_allowed(
+    protocol::PeerRpcType::stage1_execute_request));
+  static_assert(!exact::exact_peer_request_allowed(
+    protocol::PeerRpcType::stage2_expand_score_request));
+  static_assert(!exact::exact_peer_request_allowed(
+    protocol::PeerRpcType::cleanup_activate_request));
+  static_assert(!exact::exact_peer_request_allowed(
+    protocol::PeerRpcType::authority_placement_request));
+
+  static_assert(!exact::exact_peer_response_allowed(
+    protocol::PeerRpcType::reconcile_reverse_response));
+  static_assert(!exact::exact_peer_response_allowed(
+    protocol::PeerRpcType::centroid_membership_response));
+  static_assert(!exact::exact_peer_response_allowed(
+    protocol::PeerRpcType::dynamic_node_control_response));
+  static_assert(!exact::exact_peer_response_allowed(
+    protocol::PeerRpcType::stage1_execute_response));
+  static_assert(!exact::exact_dynamic_control_action_allowed(
+    protocol::DynamicNodeControlAction::retire));
+  static_assert(!exact::exact_dynamic_control_action_allowed(
+    protocol::DynamicNodeControlAction::allocate));
+  static_assert(!exact::exact_dynamic_control_action_allowed(
+    protocol::DynamicNodeControlAction::settle_allocation));
+
+  std::vector<u64> completed_invalidations;
+  // Failed attempts do not call the recorder. Repeated successful/idempotent
+  // completion of the same parent remains one bounded invalidation.
+  for (u32 retry = 0; retry < 1024; ++retry) {
+    (void)exact::record_exact_completed_invalidation(
+      &completed_invalidations, 0x1234);
+  }
+  assert((completed_invalidations == std::vector<u64>{0x1234}));
+  assert(exact::record_exact_completed_invalidation(
+    &completed_invalidations, 0x5678));
+  assert(completed_invalidations.size() == 2);
+}
+
 }  // namespace
 
 int main() {
   VamanaNode::init_static_storage(128, 96, VectorDType::uint8);
   test_public_mutation_acceptance_and_completion_envelopes();
   test_authority_extension_rpc_layouts();
+  test_exact_peer_runtime_surface();
   return 0;
 }

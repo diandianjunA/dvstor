@@ -1,6 +1,30 @@
-# Shared capacity, quality, and hardware contract for the full SIFT100M system.
-# Full-minus-one experiments override individual switches from the optimized
-# .env; the historical CPU+GPU reference baseline lives on the cpu_gpu branch.
+# Shared index, quality, capacity, and hardware contract for the baseline and
+# full SIFT100M systems.  The two .env files may differ only in their variant
+# label and three contribution-level modes.  The lower-level values below are
+# deliberately identical: the C++ mode resolver decides which bundle is
+# effective, so a profile cannot manufacture a gain by retuning a child knob.
+
+case "${STORAGE_OWNER_UPDATE_COMPLETION_MODE:?profile must select an update-completion mode}" in
+  coupled|decoupled) ;;
+  *)
+    echo "STORAGE_OWNER_UPDATE_COMPLETION_MODE must be coupled or decoupled" >&2
+    return 1
+    ;;
+esac
+case "${GPU_DYNAMIC_GRAPH_ACCESS_MODE:?profile must select a dynamic-graph access mode}" in
+  fixed|adaptive|manual) ;;
+  *)
+    echo "GPU_DYNAMIC_GRAPH_ACCESS_MODE must be fixed, adaptive, or manual" >&2
+    return 1
+    ;;
+esac
+case "${GPU_RDMA_SEARCH_PROGRESSION_MODE:?profile must select a search-progression mode}" in
+  coupled|decoupled|manual) ;;
+  *)
+    echo "GPU_RDMA_SEARCH_PROGRESSION_MODE must be coupled, decoupled, or manual" >&2
+    return 1
+    ;;
+esac
 
 PARTITION_STRATEGY=metis
 PARTITION_MAX_DEGREE="${PARTITION_MAX_DEGREE:-32}"
@@ -15,6 +39,10 @@ GPU_BOOTSTRAP_WINDOW_MB="${GPU_BOOTSTRAP_WINDOW_MB:-64}"
 GPU_BOOTSTRAP_WINDOWS="${GPU_BOOTSTRAP_WINDOWS:-4}"
 GPU_GRAPH_PREFETCH_DEPTH="${GPU_GRAPH_PREFETCH_DEPTH:-16}"
 GPU_GRAPH_COMMIT_WIDTH="${GPU_GRAPH_COMMIT_WIDTH:-16}"
+GPU_GRAPH_ISSUE_WIDTH="${GPU_GRAPH_ISSUE_WIDTH:-32}"
+GPU_QUERY_BEAM_MERGE_POLICY="${GPU_QUERY_BEAM_MERGE_POLICY:-stable-run}"
+GPU_QUERY_GRAPH_READ_POLICY="${GPU_QUERY_GRAPH_READ_POLICY:-live-extent}"
+GPU_DYNAMIC_GRAPH_EXTENT="${GPU_DYNAMIC_GRAPH_EXTENT:-true}"
 QUERY_RDMA_TRACE_MODE="${QUERY_RDMA_TRACE_MODE:-off}"
 GPU_TRAVERSAL_BEAM_WIDTH="${GPU_TRAVERSAL_BEAM_WIDTH:-128}"
 GPU_FINAL_RERANK_WIDTH="${GPU_FINAL_RERANK_WIDTH:-128}"
@@ -22,11 +50,15 @@ GPU_MAX_EXPANSIONS="${GPU_MAX_EXPANSIONS:-384}"
 GPU_RDMA_QPS="${GPU_RDMA_QPS:-32}"
 GPU_PERSISTENT_BLOCKS_PER_SM="${GPU_PERSISTENT_BLOCKS_PER_SM:-4}"
 
-# The decoupled accepted backlog, deterministic B8 execution, exact durable
-# watermark, and bounded C32 executor are part of the optimized architecture.
+# Shared storage-owner capacity ceilings.  The update-completion mode resolver
+# decides whether the baseline coupled path or the full decoupled Stage1/Stage2
+# bundle consumes these resources; the profiles do not retune the ceilings.
 STORAGE_OWNER_BATCH_MAX="${STORAGE_OWNER_BATCH_MAX:-32}"
 STORAGE_OWNER_BATCH_MAX_WAIT_US="${STORAGE_OWNER_BATCH_MAX_WAIT_US:-10000}"
 STORAGE_OWNER_STAGE2_BATCH_MAX_WAIT_US="${STORAGE_OWNER_STAGE2_BATCH_MAX_WAIT_US:-25000}"
+STORAGE_OWNER_STAGE2_SCORE_MANY="${STORAGE_OWNER_STAGE2_SCORE_MANY:-true}"
+STORAGE_OWNER_STAGE2_GRAPH_ISSUE_WIDTH="${STORAGE_OWNER_STAGE2_GRAPH_ISSUE_WIDTH:-16}"
+STORAGE_OWNER_STAGE2_HOME_RPC_COMBINING="${STORAGE_OWNER_STAGE2_HOME_RPC_COMBINING:-true}"
 STORAGE_OWNER_PEER_QPS_PER_PEER="${STORAGE_OWNER_PEER_QPS_PER_PEER:-8}"
 STORAGE_OWNER_PEER_RDMA_TOKENS="${STORAGE_OWNER_PEER_RDMA_TOKENS:-16}"
 STORAGE_OWNER_RPC_DEPTH="${STORAGE_OWNER_RPC_DEPTH:-16}"
@@ -38,6 +70,6 @@ STORAGE_OWNER_REVERSE_QUEUE_DEPTH="${STORAGE_OWNER_REVERSE_QUEUE_DEPTH:-65536}"
 STORAGE_OWNER_REVERSE_COALESCE_MAX="${STORAGE_OWNER_REVERSE_COALESCE_MAX:-256}"
 
 # Publication throughput runs disable per-operation timing samples.  Set this
-# to true only for a separate diagnostic run, and use the same setting on the
-# reference baseline when comparing raw throughput.
+# to true only for a separate diagnostic run, and use the same setting for both
+# formal profiles when comparing raw throughput.
 ENABLE_BREAKDOWN="${ENABLE_BREAKDOWN:-false}"

@@ -220,6 +220,14 @@ target_compile_options(maintenance_telemetry_test PRIVATE -UNDEBUG)
 add_test(NAME maintenance_telemetry_test COMMAND maintenance_telemetry_test)
 
 if (TARGET dvstor_gpu_kernels)
+    add_executable(host_distance_kernel_test host_distance_kernel_test.cu)
+    target_link_libraries(host_distance_kernel_test
+        PRIVATE dvstor_gpu_kernels CUDA::cudart)
+    add_test(NAME host_distance_kernel_test COMMAND host_distance_kernel_test)
+    set_tests_properties(host_distance_kernel_test PROPERTIES
+        TIMEOUT 15
+        SKIP_REGULAR_EXPRESSION "^SKIP:")
+
     add_executable(gpu_centroid_route_ranking_test
         gpu_centroid_route_ranking_test.cu)
     dvstor_target_common_includes(gpu_centroid_route_ranking_test)
@@ -361,6 +369,13 @@ target_link_libraries(gpu_navigation_layout_test PRIVATE dvstor_runtime)
 target_compile_options(gpu_navigation_layout_test PRIVATE -UNDEBUG)
 add_test(NAME gpu_navigation_layout_test COMMAND gpu_navigation_layout_test)
 
+add_executable(host_orchestrated_policy_test
+    host_orchestrated_policy_test.cc)
+target_link_libraries(host_orchestrated_policy_test PRIVATE dvstor_runtime)
+target_compile_options(host_orchestrated_policy_test PRIVATE -UNDEBUG)
+add_test(NAME host_orchestrated_policy_test
+         COMMAND host_orchestrated_policy_test)
+
 add_executable(gpu_pq_index_test gpu_pq_index_test.cc)
 target_link_libraries(gpu_pq_index_test PRIVATE dvstor_runtime)
 target_compile_options(gpu_pq_index_test PRIVATE -UNDEBUG)
@@ -397,6 +412,12 @@ add_executable(storage_owner_protocol_test storage_owner_protocol_test.cc)
 target_link_libraries(storage_owner_protocol_test PRIVATE dvstor_runtime)
 target_compile_options(storage_owner_protocol_test PRIVATE -UNDEBUG)
 add_test(NAME storage_owner_protocol_test COMMAND storage_owner_protocol_test)
+
+add_executable(storage_startup_protocol_test storage_startup_protocol_test.cc)
+dvstor_target_common_includes(storage_startup_protocol_test)
+target_compile_options(storage_startup_protocol_test PRIVATE -UNDEBUG)
+add_test(NAME storage_startup_protocol_test
+         COMMAND storage_startup_protocol_test)
 
 add_executable(explicit_release_replay_test
     explicit_release_replay_test.cc)

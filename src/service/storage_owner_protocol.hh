@@ -34,6 +34,20 @@ enum class MutationKind : u32 {
   erase = 3,
 };
 
+// Coupled completion is the strict one-storage-owner, one-sided-RDMA
+// baseline. Its physical-state boundary is append-only; generic upsert/erase
+// require target-shard host metadata and are therefore available only in the
+// decoupled maintenance protocol.
+inline constexpr bool mutation_supported_by_completion_mode(
+    bool synchronous_exact, MutationKind kind) {
+  return !synchronous_exact || kind == MutationKind::insert;
+}
+
+inline constexpr const char* mutation_api_name_for_completion_mode(
+    bool synchronous_exact) {
+  return synchronous_exact ? "append_only" : "insert_upsert_erase";
+}
+
 enum class MutationStatus : u32 {
   ok = 0,
   not_found = 1,

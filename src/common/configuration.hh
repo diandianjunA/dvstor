@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <string_view>
 
 #include <library/configuration.hh>
 
@@ -52,10 +53,18 @@ public:
   u32 gpu_graph_commit_width{};
   // Zero selects the workspace/beam-limited speculative issue cap.
   u32 gpu_graph_issue_width{};
+  // Contribution-level graph-access mode. "manual" keeps the lower-level
+  // switches available for engineering-only partial ablations; the formal
+  // fixed/adaptive modes resolve them as one indivisible mechanism.
+  str dynamic_graph_access_mode{"manual"};
   str gpu_query_graph_read_policy{"fixed"};
   // Keep dynamic-node extent prediction independently ablatable from the
   // base-node Live-Extent sidecar. Fixed graph reads ignore this switch.
   bool gpu_dynamic_graph_extent{true};
+  // Contribution-level GPU-RDMA search-progression mode. Formal modes own
+  // both the frontier widths and Beam merge implementation so an experiment
+  // cannot accidentally retain a half-enabled ASFE path.
+  str gpu_rdma_search_progression_mode{"manual"};
   str gpu_query_beam_merge_policy{"legacy"};
   str query_rdma_trace_mode{"off"};
   u32 query_rdma_trace_sample_rate{1000};
@@ -74,6 +83,11 @@ public:
   // Keep it enabled by default so existing service configurations preserve
   // their insert/upsert/erase behavior.
   bool enable_updates{true};
+  // Contribution-level update completion contract. Coupled executes one
+  // complete schema-v16 graph mutation on the logical storage owner before
+  // returning its token; decoupled enables the Stage1/Stage2 pipeline and
+  // background placement maintenance.
+  str storage_owner_update_completion_mode{"decoupled"};
 
   u32 storage_id{};
   vec<str> storage_peers;
@@ -112,17 +126,32 @@ public:
 
   IndexConfiguration(int argc, char** argv) {
     add_options();
+    const bool graph_read_policy_explicit = command_line_has_option(
+      argc, argv, "--gpu-query-graph-read-policy");
+    const bool dynamic_graph_extent_explicit = command_line_has_option(
+      argc, argv, "--gpu-dynamic-graph-extent");
+    const bool graph_issue_width_explicit = command_line_has_option(
+      argc, argv, "--gpu-graph-issue-width");
+    const bool beam_merge_policy_explicit = command_line_has_option(
+      argc, argv, "--gpu-query-beam-merge-policy");
     process_program_options(argc, argv);
     if (vector_id_namespace_size == 0) {
       vector_id_namespace_size = max_vectors;
     }
-    resolve_graph_frontier_widths();
     vector_data_type = normalize_mode(vector_data_type);
+    dynamic_graph_access_mode = normalize_mode(dynamic_graph_access_mode);
     gpu_query_graph_read_policy =
       normalize_mode(gpu_query_graph_read_policy);
+    gpu_rdma_search_progression_mode =
+      normalize_mode(gpu_rdma_search_progression_mode);
     gpu_query_beam_merge_policy =
       normalize_mode(gpu_query_beam_merge_policy);
     query_rdma_trace_mode = normalize_mode(query_rdma_trace_mode);
+    storage_owner_update_completion_mode =
+      normalize_mode(storage_owner_update_completion_mode);
+    resolve_feature_bundles(
+      graph_read_policy_explicit, dynamic_graph_extent_explicit,
+      graph_issue_width_explicit, beam_merge_policy_explicit);
     validate(argv);
     operator<<(std::cerr, *this);
   }
@@ -140,22 +169,132 @@ public:
     return beam_width_construction;
   }
 
+  bool adaptive_dynamic_graph_access_enabled() const {
+    return gpu_query_graph_read_policy == "live-extent" &&
+      gpu_dynamic_graph_extent;
+  }
+
+  bool decoupled_gpu_rdma_search_progression_enabled() const {
+    return gpu_rdma_search_progression_mode == "decoupled" ||
+      (gpu_rdma_search_progression_mode == "manual" &&
+       gpu_graph_issue_width > gpu_graph_commit_width);
+  }
+
+  bool synchronous_exact_updates_enabled() const {
+    return storage_owner_update_completion_mode == "coupled";
+  }
+
 private:
-  void resolve_graph_frontier_widths() {
+  str feature_bundle_conflict_;
+
+  static bool command_line_has_option(
+      int argc, char** argv, std::string_view option) {
+    for (int index = 1; index < argc; ++index) {
+      if (argv[index] == nullptr) continue;
+      const std::string_view argument{argv[index]};
+      if (argument == option ||
+          (argument.size() > option.size() &&
+           argument.starts_with(option) &&
+           argument[option.size()] == '=')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void record_feature_bundle_conflict(str message) {
+    if (feature_bundle_conflict_.empty()) {
+      feature_bundle_conflict_ = message;
+    }
+  }
+
+  void resolve_feature_bundles(
+      bool graph_read_policy_explicit,
+      bool dynamic_graph_extent_explicit,
+      bool graph_issue_width_explicit,
+      bool beam_merge_policy_explicit) {
     if (gpu_graph_commit_width == 0) {
       gpu_graph_commit_width = gpu_graph_prefetch_depth;
     }
-    if (gpu_graph_issue_width == 0) {
-      gpu_graph_issue_width =
-        gpu_search::adaptive_frontier::automatic_max_issue_width(
-          gpu_traversal_beam_width);
-      // A historical configuration could legally use a prefetch depth larger
-      // than its traversal beam. Keep that configuration valid and preserve
-      // its authoritative width instead of silently narrowing the search.
-      if (gpu_graph_issue_width < gpu_graph_commit_width) {
-        gpu_graph_issue_width = gpu_graph_commit_width;
+
+    if (dynamic_graph_access_mode == "fixed") {
+      if (graph_read_policy_explicit &&
+          gpu_query_graph_read_policy != "fixed") {
+        record_feature_bundle_conflict(
+          "--gpu-dynamic-graph-access-mode=fixed conflicts with "
+          "--gpu-query-graph-read-policy");
+      }
+      if (dynamic_graph_extent_explicit && gpu_dynamic_graph_extent) {
+        record_feature_bundle_conflict(
+          "--gpu-dynamic-graph-access-mode=fixed conflicts with "
+          "--gpu-dynamic-graph-extent=true");
+      }
+      gpu_query_graph_read_policy = "fixed";
+      gpu_dynamic_graph_extent = false;
+    } else if (dynamic_graph_access_mode == "adaptive") {
+      if (graph_read_policy_explicit &&
+          gpu_query_graph_read_policy != "live-extent") {
+        record_feature_bundle_conflict(
+          "--gpu-dynamic-graph-access-mode=adaptive conflicts with "
+          "--gpu-query-graph-read-policy");
+      }
+      if (dynamic_graph_extent_explicit && !gpu_dynamic_graph_extent) {
+        record_feature_bundle_conflict(
+          "--gpu-dynamic-graph-access-mode=adaptive conflicts with "
+          "--gpu-dynamic-graph-extent=false");
+      }
+      gpu_query_graph_read_policy = "live-extent";
+      gpu_dynamic_graph_extent = true;
+    }
+
+    const bool coupled_progression =
+      gpu_rdma_search_progression_mode == "coupled";
+    const bool decoupled_progression =
+      gpu_rdma_search_progression_mode == "decoupled";
+    if (coupled_progression) {
+      if (graph_issue_width_explicit && gpu_graph_issue_width != 0 &&
+          gpu_graph_issue_width != gpu_graph_commit_width) {
+        record_feature_bundle_conflict(
+          "--gpu-rdma-search-progression-mode=coupled requires "
+          "--gpu-graph-issue-width to equal the commit width");
+      }
+      if (beam_merge_policy_explicit &&
+          gpu_query_beam_merge_policy != "legacy") {
+        record_feature_bundle_conflict(
+          "--gpu-rdma-search-progression-mode=coupled conflicts with "
+          "--gpu-query-beam-merge-policy");
+      }
+      gpu_graph_issue_width = gpu_graph_commit_width;
+      gpu_query_beam_merge_policy = "legacy";
+    } else {
+      if (gpu_graph_issue_width == 0) {
+        gpu_graph_issue_width =
+          gpu_search::adaptive_frontier::automatic_max_issue_width(
+            gpu_traversal_beam_width);
+        // A historical configuration could legally use a prefetch depth
+        // larger than its traversal beam. Keep that manual configuration
+        // valid instead of silently narrowing the authoritative width.
+        if (!decoupled_progression &&
+            gpu_graph_issue_width < gpu_graph_commit_width) {
+          gpu_graph_issue_width = gpu_graph_commit_width;
+        }
+      }
+      if (decoupled_progression) {
+        if (gpu_graph_issue_width <= gpu_graph_commit_width) {
+          record_feature_bundle_conflict(
+            "--gpu-rdma-search-progression-mode=decoupled requires an "
+            "issue width greater than the commit width");
+        }
+        if (beam_merge_policy_explicit &&
+            gpu_query_beam_merge_policy != "stable-run") {
+          record_feature_bundle_conflict(
+            "--gpu-rdma-search-progression-mode=decoupled conflicts with "
+            "--gpu-query-beam-merge-policy");
+        }
+        gpu_query_beam_merge_policy = "stable-run";
       }
     }
+
   }
 
   static str normalize_mode(str value) {
@@ -225,6 +364,10 @@ private:
       ("gpu-graph-issue-width",
        po::value<u32>(&gpu_graph_issue_width)->default_value(gpu_graph_issue_width),
        "Maximum speculative graph read width; zero derives from frontier capacity and traversal beam.")
+      ("gpu-dynamic-graph-access-mode",
+       po::value<str>(&dynamic_graph_access_mode)
+         ->default_value(dynamic_graph_access_mode),
+       "Contribution mode: fixed, adaptive, or manual for lower-level ablations.")
       ("gpu-query-graph-read-policy",
        po::value<str>(&gpu_query_graph_read_policy)
          ->default_value(gpu_query_graph_read_policy),
@@ -234,6 +377,10 @@ private:
          ->default_value(gpu_dynamic_graph_extent),
        "Use incarnation-tagged dynamic-node extent hints when Live-Extent "
        "graph reads are enabled.")
+      ("gpu-rdma-search-progression-mode",
+       po::value<str>(&gpu_rdma_search_progression_mode)
+         ->default_value(gpu_rdma_search_progression_mode),
+       "Contribution mode: coupled, decoupled, or manual for lower-level ablations.")
       ("gpu-query-beam-merge-policy",
        po::value<str>(&gpu_query_beam_merge_policy)
          ->default_value(gpu_query_beam_merge_policy),
@@ -274,6 +421,11 @@ private:
       ("enable-updates",
        po::value<bool>(&enable_updates)->default_value(enable_updates),
        "Enable compute-side insert, upsert, and erase submission.")
+      ("storage-owner-update-completion-mode",
+       po::value<str>(&storage_owner_update_completion_mode)
+         ->default_value(storage_owner_update_completion_mode),
+       "Update completion contract: coupled synchronous-exact or decoupled "
+       "Stage1/Stage2 maintenance.")
       ("storage-id", po::value<u32>(&storage_id)->default_value(storage_id),
        "Zero-based storage shard identifier.")
       ("storage-peers", po::value<vec<str>>(&storage_peers)->multitoken(),
@@ -348,6 +500,10 @@ private:
       exit_with_help_message(argv);
     };
 
+    if (!feature_bundle_conflict_.empty()) {
+      fail(feature_bundle_conflict_);
+    }
+
     if (index_prefix.empty()) fail("--index-prefix is required");
     if (num_threads == 0 || dim == 0 || max_vectors == 0 || k == 0 ||
         R == 0 || beam_width_construction == 0 || mn_memory_gb == 0) {
@@ -381,13 +537,29 @@ private:
     if (query_rdma_trace_mode != "off" && query_rdma_trace_output.empty()) {
       fail("--query-rdma-trace-output is required when tracing is enabled");
     }
+    if (dynamic_graph_access_mode != "manual" &&
+        dynamic_graph_access_mode != "fixed" &&
+        dynamic_graph_access_mode != "adaptive") {
+      fail("--gpu-dynamic-graph-access-mode must be fixed, adaptive, or manual");
+    }
     if (gpu_query_graph_read_policy != "fixed" &&
         gpu_query_graph_read_policy != "live-extent") {
       fail("--gpu-query-graph-read-policy must be fixed or live-extent");
     }
+    if (gpu_rdma_search_progression_mode != "manual" &&
+        gpu_rdma_search_progression_mode != "coupled" &&
+        gpu_rdma_search_progression_mode != "decoupled") {
+      fail("--gpu-rdma-search-progression-mode must be coupled, decoupled, "
+           "or manual");
+    }
     if (gpu_query_beam_merge_policy != "legacy" &&
         gpu_query_beam_merge_policy != "stable-run") {
       fail("--gpu-query-beam-merge-policy must be legacy or stable-run");
+    }
+    if (storage_owner_update_completion_mode != "coupled" &&
+        storage_owner_update_completion_mode != "decoupled") {
+      fail("--storage-owner-update-completion-mode must be coupled or "
+           "decoupled");
     }
     if (gpu_query_slots == 0 || gpu_query_slots > 4096 ||
         gpu_memory_limit_gb == 0 ||
@@ -463,10 +635,18 @@ public:
              << config.vector_data_type << '\n';
       output << std::setfill('-') << std::setw(line_width) << "" << '\n';
       output << std::setfill(' ');
+      const bool gpu_owned_progression =
+        config.decoupled_gpu_rdma_search_progression_enabled();
       output << std::setw(width) << "query engine: "
-             << "persistent_gpu_opq_pq" << '\n';
+             << (gpu_owned_progression
+                   ? "persistent_gpu_opq_pq"
+                   : "host_orchestrated_cpu_rdma_finite_cuda")
+             << '\n';
       output << std::setw(width) << "remote transport: "
-             << "GPU-initiated GPUNetIO" << '\n';
+             << (gpu_owned_progression
+                   ? "GPU-initiated GPUNetIO"
+                   : "CPU-posted one-sided RDMA")
+             << '\n';
       output << std::setw(width) << "GPU device: " << config.gpu_device << '\n';
       output << std::setw(width) << "GPU concurrent query slots: "
              << config.gpu_query_slots << '\n';
@@ -481,10 +661,14 @@ public:
       output << std::setw(width) << "GPU graph commit/issue width: "
              << config.gpu_graph_commit_width << "/"
              << config.gpu_graph_issue_width << '\n';
+      output << std::setw(width) << "dynamic graph access mode: "
+             << config.dynamic_graph_access_mode << '\n';
       output << std::setw(width) << "GPU graph read policy: "
              << config.gpu_query_graph_read_policy << '\n';
       output << std::setw(width) << "GPU dynamic graph extent: "
              << config.gpu_dynamic_graph_extent << '\n';
+      output << std::setw(width) << "GPU-RDMA progression mode: "
+             << config.gpu_rdma_search_progression_mode << '\n';
       output << std::setw(width) << "GPU Beam merge policy: "
              << config.gpu_query_beam_merge_policy << '\n';
       output << std::setw(width) << "query RDMA trace mode/rate: "
@@ -500,8 +684,12 @@ public:
              << config.gpu_persistent_blocks_per_sm << '\n';
       output << std::setw(width) << "compute updates enabled: "
              << std::boolalpha << config.enable_updates << '\n';
+      output << std::setw(width) << "storage update completion mode: "
+             << config.storage_owner_update_completion_mode << '\n';
       output << std::setw(width) << "storage update protocol: "
-             << "centroid-home two-stage" << '\n';
+             << (config.synchronous_exact_updates_enabled()
+                   ? "single-owner synchronous exact"
+                   : "centroid-home two-stage") << '\n';
       output << std::setw(width) << "storage RPC depth/batch: "
              << config.storage_owner_rpc_depth << "/"
              << config.storage_owner_batch_max << '\n';

@@ -437,11 +437,125 @@ PY_VALIDATE
       echo "missing OPQ/PQ${PQ_SUBQUANTIZERS} model: $(model_file)" >&2
       return 1
     fi
-    if [[ "${GPU_QUERY_GRAPH_READ_POLICY:-fixed}" == "live-extent" &&
+    # The two formal profiles deliberately validate one deployable index
+    # artifact set.  Fixed mode does not consume the extent classes while
+    # serving queries, but it must not make an incomplete/mismatched index look
+    # like a valid baseline that would need to be changed before running full.
+    local require_graph_extent=false
+    case "${GPU_DYNAMIC_GRAPH_ACCESS_MODE:-manual}" in
+      fixed|adaptive) require_graph_extent=true ;;
+      manual)
+        [[ "${GPU_QUERY_GRAPH_READ_POLICY:-fixed}" == live-extent ]] &&
+          require_graph_extent=true
+        ;;
+    esac
+    if [[ "$require_graph_extent" == true &&
           ! -s "$(graph_extent_file)" ]]; then
       echo "missing Live-Extent sidecar: $(graph_extent_file)" >&2
       echo "generate it on a host that has every .dat shard, then copy it to the compute index prefix" >&2
       return 1
+    fi
+    if [[ "$require_graph_extent" == true ]]; then
+      python3 - "$(graph_extent_file)" "$metadata" <<'PY_EXTENT_VALIDATE'
+import json
+import os
+import struct
+import sys
+
+sidecar_path, metadata_path = sys.argv[1:]
+with open(metadata_path, 'r', encoding='utf-8') as stream:
+    metadata = json.load(stream)
+
+HEADER_BYTES = 128
+HEADER = struct.Struct('<8s10I10Q')
+FNV_OFFSET = 1469598103934665603
+FNV_PRIME = 1099511628211
+MASK64 = (1 << 64) - 1
+
+
+def checksum64(data, state=FNV_OFFSET):
+    for value in data:
+        state ^= value
+        state = (state * FNV_PRIME) & MASK64
+    return state
+
+
+errors = []
+with open(sidecar_path, 'rb') as stream:
+    raw_header = stream.read(HEADER_BYTES)
+    if len(raw_header) != HEADER_BYTES:
+        errors.append('header is truncated')
+        values = None
+    else:
+        values = HEADER.unpack(raw_header)
+
+    if values is not None:
+        (magic, version, header_bytes, endian_marker, extent_quantum,
+         class_bytes, pointer_bytes, entry_bytes, entry_capacity, shards,
+         reserved0, nodes, payload_bytes, build_fingerprint,
+         payload_checksum, header_checksum, *reserved) = values
+        expected_entry_bytes = int(metadata.get('hot_graph_entry_size', 0))
+        expected_capacity = (
+            (expected_entry_bytes - 16) // 8
+            if expected_entry_bytes >= 16 else 0)
+        expected = {
+            'magic': (magic, b'DVGEXT8\0'),
+            'version': (version, 1),
+            'header_bytes': (header_bytes, HEADER_BYTES),
+            'endian_marker': (endian_marker, 0x01020304),
+            'extent_quantum': (extent_quantum, 8),
+            'class_bytes': (class_bytes, 1),
+            'graph_pointer_bytes': (pointer_bytes, 8),
+            'graph_entry_bytes': (entry_bytes, expected_entry_bytes),
+            'graph_entry_capacity': (entry_capacity, expected_capacity),
+            'num_shards': (shards, int(metadata.get('num_memory_nodes', 0))),
+            'reserved0': (reserved0, 0),
+            'num_nodes': (nodes, int(metadata.get('num_vectors', 0))),
+            'payload_bytes': (payload_bytes, int(metadata.get('num_vectors', 0))),
+            'build_fingerprint': (
+                build_fingerprint,
+                int(metadata.get('index_build_fingerprint', 0))),
+        }
+        for name, (actual, wanted) in expected.items():
+            if actual != wanted:
+                errors.append(f'{name}: sidecar={actual!r}, metadata={wanted!r}')
+        if any(reserved):
+            errors.append('reserved header fields are nonzero')
+
+        checksum_header = bytearray(raw_header)
+        checksum_header[80:88] = b'\0' * 8
+        if checksum64(checksum_header) != header_checksum:
+            errors.append('header checksum mismatch')
+
+        payload_state = FNV_OFFSET
+        remaining = payload_bytes
+        maximum_class = (entry_capacity + 7) // 8
+        while remaining:
+            chunk = stream.read(min(1 << 20, remaining))
+            if not chunk:
+                errors.append('payload is truncated')
+                break
+            if any(value > maximum_class for value in chunk):
+                errors.append('payload contains an invalid extent class')
+                remaining = 0
+                break
+            payload_state = checksum64(chunk, payload_state)
+            remaining -= len(chunk)
+        if remaining == 0 and payload_state != payload_checksum:
+            errors.append('payload checksum mismatch')
+
+        expected_file_bytes = HEADER_BYTES + payload_bytes
+        if os.fstat(stream.fileno()).st_size != expected_file_bytes:
+            errors.append(
+                f'file size is {os.fstat(stream.fileno()).st_size}, '
+                f'expected {expected_file_bytes}')
+
+if errors:
+    print(f'incompatible Live-Extent sidecar: {sidecar_path}', file=sys.stderr)
+    for error in errors:
+        print(f'  - {error}', file=sys.stderr)
+    raise SystemExit(1)
+PY_EXTENT_VALIDATE
     fi
   elif [[ "$role" == "storage" ]]; then
     local first=1 last="$SHARDS"
@@ -531,6 +645,9 @@ write_service_config() {
     echo "gpu-device = $GPU_DEVICE"
     echo "enable-breakdown = ${ENABLE_BREAKDOWN:-true}"
     echo "enable-updates = $enable_updates"
+    echo "storage-owner-update-completion-mode = $STORAGE_OWNER_UPDATE_COMPLETION_MODE"
+    echo "gpu-dynamic-graph-access-mode = $GPU_DYNAMIC_GRAPH_ACCESS_MODE"
+    echo "gpu-rdma-search-progression-mode = $GPU_RDMA_SEARCH_PROGRESSION_MODE"
     echo "gpu-query-slots = ${GPU_QUERY_SLOTS:-256}"
     echo "gpu-memory-limit-gb = ${GPU_MEMORY_LIMIT_GB:-40}"
     echo "gpu-memory-reserve-gb = ${GPU_MEMORY_RESERVE_GB:-4}"
@@ -538,10 +655,14 @@ write_service_config() {
     echo "gpu-bootstrap-windows = ${GPU_BOOTSTRAP_WINDOWS:-4}"
     echo "gpu-graph-prefetch-depth = ${GPU_GRAPH_PREFETCH_DEPTH:-32}"
     echo "gpu-graph-commit-width = ${GPU_GRAPH_COMMIT_WIDTH:-0}"
-    echo "gpu-graph-issue-width = ${GPU_GRAPH_ISSUE_WIDTH:-0}"
-    echo "gpu-query-graph-read-policy = ${GPU_QUERY_GRAPH_READ_POLICY:-fixed}"
-    echo "gpu-dynamic-graph-extent = ${GPU_DYNAMIC_GRAPH_EXTENT:-true}"
-    echo "gpu-query-beam-merge-policy = ${GPU_QUERY_BEAM_MERGE_POLICY:-legacy}"
+    if [[ "$GPU_RDMA_SEARCH_PROGRESSION_MODE" == manual ]]; then
+      echo "gpu-graph-issue-width = ${GPU_GRAPH_ISSUE_WIDTH:-0}"
+      echo "gpu-query-beam-merge-policy = ${GPU_QUERY_BEAM_MERGE_POLICY:-legacy}"
+    fi
+    if [[ "$GPU_DYNAMIC_GRAPH_ACCESS_MODE" == manual ]]; then
+      echo "gpu-query-graph-read-policy = ${GPU_QUERY_GRAPH_READ_POLICY:-fixed}"
+      echo "gpu-dynamic-graph-extent = ${GPU_DYNAMIC_GRAPH_EXTENT:-true}"
+    fi
     echo "query-rdma-trace-mode = ${QUERY_RDMA_TRACE_MODE:-off}"
     echo "query-rdma-trace-sample-rate = ${QUERY_RDMA_TRACE_SAMPLE_RATE:-1000}"
     [[ -z "${QUERY_RDMA_TRACE_OUTPUT:-}" ]] ||

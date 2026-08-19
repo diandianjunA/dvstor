@@ -1,9 +1,11 @@
 #include <cassert>
 #include <deque>
+#include <string_view>
 #include <vector>
 
 #include "service/compute_service/storage_owner/batch_policy.hh"
 #include "service/compute_service/storage_owner/response_validation.hh"
+#include "service/storage_owner_client_helpers.hh"
 
 namespace {
 
@@ -12,6 +14,7 @@ using compute_service_detail::dequeue_storage_owner_visible_prefix;
 using compute_service_detail::decide_storage_owner_batch;
 using compute_service_detail::next_storage_owner_batch_observed_ns;
 using compute_service_detail::validate_storage_owner_response;
+using service::storage_owner_client::valid_success_maintenance_sequence;
 
 struct ScriptedPrefixQueue {
   std::deque<u32> entries;
@@ -252,6 +255,37 @@ void test_expired_batch_still_waits_for_the_visible_fifo_head() {
   assert((output == std::vector<u32>{20}));
 }
 
+void test_update_completion_mode_owns_maintenance_sequence() {
+  assert(valid_success_maintenance_sequence(true, 0));
+  assert(!valid_success_maintenance_sequence(true, 1));
+  assert(!valid_success_maintenance_sequence(false, 0));
+  assert(valid_success_maintenance_sequence(false, 1));
+  assert(valid_success_maintenance_sequence(false, UINT64_MAX));
+}
+
+void test_coupled_update_mode_is_strictly_append_only() {
+  using service::storage_owner::MutationKind;
+  using service::storage_owner::mutation_api_name_for_completion_mode;
+  using service::storage_owner::mutation_supported_by_completion_mode;
+  static_assert(mutation_supported_by_completion_mode(
+    true, MutationKind::insert));
+  static_assert(!mutation_supported_by_completion_mode(
+    true, MutationKind::upsert));
+  static_assert(!mutation_supported_by_completion_mode(
+    true, MutationKind::erase));
+  static_assert(mutation_supported_by_completion_mode(
+    false, MutationKind::insert));
+  static_assert(mutation_supported_by_completion_mode(
+    false, MutationKind::upsert));
+  static_assert(mutation_supported_by_completion_mode(
+    false, MutationKind::erase));
+  static_assert(std::string_view(
+    mutation_api_name_for_completion_mode(true)) == "append_only");
+  static_assert(std::string_view(
+    mutation_api_name_for_completion_mode(false)) ==
+      "insert_upsert_erase");
+}
+
 }  // namespace
 
 int main() {
@@ -266,5 +300,7 @@ int main() {
   test_batch_policy_never_consumes_rpc_slot_without_credit();
   test_sender_consumes_only_the_queue_visible_prefix();
   test_expired_batch_still_waits_for_the_visible_fifo_head();
+  test_update_completion_mode_owns_maintenance_sequence();
+  test_coupled_update_mode_is_strictly_append_only();
   return 0;
 }

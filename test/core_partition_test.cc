@@ -6,6 +6,7 @@
 
 #include "common/core_partition.hh"
 #include "memory_node/storage_owner_cpu_plan.hh"
+#include "memory_node/storage_owner_runtime/exact_update_contract.hh"
 
 int main() {
   const auto pinned_cpu_lanes = [](const auto& plan) {
@@ -315,4 +316,62 @@ int main() {
       assert(plan.peer_progress_threads == 0);
     }
   }
+
+  // Coupled append-only updates have no target-side RPC, Stage1, Stage2, or
+  // cleanup CPU domain. Every diagnostic plan remains in budget; a remote
+  // deployment needs only the authority and lifecycle/completion lanes.
+  for (const std::uint32_t peers : {0u, 4u}) {
+    for (std::uint32_t cpus = 1; cpus <= 64; ++cpus) {
+      const auto exact =
+        memory_node_detail::derive_storage_owner_exact_cpu_plan(
+          cpus, 256, peers);
+      assert(exact.foreground_workers >= 1);
+      assert(exact.maintenance_workers == 0);
+      assert(exact.maintenance_admission_workers == 0);
+      assert(exact.peer_stage1_workers == 0);
+      assert(exact.peer_reverse_workers == 0);
+      assert(exact.peer_cleanup_workers == 0);
+      assert(exact.peer_placement_workers == 0);
+      assert(exact.peer_progress_threads == 0);
+      assert(exact.foreground_workers == exact.foreground_coordinators);
+      assert(pinned_cpu_lanes(exact) <= cpus);
+      if (peers != 0 && cpus >=
+          memory_node_detail::exact_update_remote_cpu_floor()) {
+        assert(memory_node_detail::
+          exact_update_plan_has_remote_correctness_floor(exact));
+      }
+      assert(memory_node_detail::peer_runtime_thread_counts_supported(exact));
+      const auto peer_threads =
+        memory_node_detail::derive_peer_runtime_thread_plan(exact);
+      assert(peer_threads.cq_progress_threads +
+               peer_threads.response_dispatch_threads ==
+             exact.peer_progress_threads);
+      assert(peer_threads.placement_control_threads ==
+             exact.peer_placement_workers);
+    }
+  }
+  const auto local_exact =
+    memory_node_detail::derive_storage_owner_exact_cpu_plan(16, 256, 0);
+  assert(local_exact.foreground_workers == 15);
+  assert(local_exact.peer_reverse_workers == 0);
+  assert(local_exact.peer_placement_workers == 0);
+  assert(local_exact.peer_progress_threads == 0);
+  assert(pinned_cpu_lanes(local_exact) == 16);
+
+  using namespace memory_node_storage_owner_runtime_detail;
+  static_assert(kExactUpdateContract.append_only);
+  static_assert(!kExactUpdateContract.supports_upsert);
+  static_assert(!kExactUpdateContract.supports_erase);
+  static_assert(!kExactUpdateContract.stage2_enabled);
+  static_assert(!kExactUpdateContract.migration_enabled);
+  static_assert(!kExactUpdateContract.publishes_maintenance_debt);
+  static_assert(!kExactUpdateContract.stage1_peer_artifacts_enabled);
+  static_assert(!kExactUpdateContract.cleanup_peer_artifacts_enabled);
+  static_assert(
+    !kExactUpdateContract.migration_allocation_receipts_enabled);
+  static_assert(!kExactUpdateContract.stage2_home_outbox_enabled);
+  static_assert(kExactUpdateContract.public_maintenance_sequence == 0);
+  static_assert(exact_update_mutation_cookie(0, 1, 0, 1) != 0);
+  assert(exact_update_mutation_cookie(7, 99, 123, 2) ==
+         exact_update_mutation_cookie(7, 99, 123, 2));
 }

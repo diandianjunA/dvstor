@@ -25,6 +25,19 @@ public:
     return true;
   }
 
+  // Synchronous-exact cleanup calls this only after centroid withdrawal,
+  // tombstone publication, and every reverse-edge removal have completed.
+  // The slot can therefore enter the reusable set without a public Stage2
+  // watermark. Reuse still increments the incarnation, so a delayed reader
+  // or idempotent graph operation cannot address the replacement occupant.
+  bool retire_ready(RemotePtr pointer) {
+    if (pointer.is_null()) return false;
+    if (!retired_.insert(pointer.physical_address_raw()).second) return false;
+    ready_.push_back(pointer);
+    ++size_;
+    return true;
+  }
+
   std::optional<RemotePtr> acquire(u64 durable_sequence) {
     while (!pending_.empty() && pending_.begin()->first <= durable_sequence) {
       auto nodes = std::move(pending_.begin()->second);

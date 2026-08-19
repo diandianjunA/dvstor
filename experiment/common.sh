@@ -14,12 +14,6 @@ load_experiment_profile() {
   local profile="${1:?profile name is required}"
   local profile_env="$EXPERIMENT_DIR/profiles/${profile}.env"
   if [[ ! -f "$profile_env" ]]; then
-    if [[ "$profile" == "04_gpu_persistent_gpunetio_baseline" ]]; then
-      echo "profile '$profile' was removed: it retained the proposed persistent/two-stage architecture" >&2
-      echo "and was not a valid reference baseline. Use baseline/cpu-gpu-exact-safe@f304e99" >&2
-      echo "with the exact+sync contract documented in experiment/README.md." >&2
-      return 1
-    fi
     echo "unknown experiment profile: $profile" >&2
     echo "available profiles:" >&2
     find "$EXPERIMENT_DIR/profiles" -maxdepth 1 -name '*.env' -printf '  %f\n' \
